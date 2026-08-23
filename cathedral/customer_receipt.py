@@ -95,12 +95,16 @@ _GPU_PROFILE = "gcp-g4-rtx-pro-6000-sev-v1"
 # verifies, so existing receipts are unaffected. Adding one here means it is part of the signed
 # canonical body (Cathedral's signature covers it), which is the whole point of task_policy below.
 _OPTIONAL_TOP_LEVEL_KEYS = frozenset({"task_policy"})
-# task_policy: the enclave's egress firewall config, ATTESTED by riding inside the signed receipt.
-# A consumer (cathedral-distill's agent_enclave verifier, cybergym_attest._verify_agent_egress) reads
-# egress=='restricted' + an EXACT egress_allowlist + tls_pinning from receipt["task_policy"] to prove
-# a reasoning agent ran with network restricted to the approved model hosts and could not fetch a
-# looked-up answer. That is only trustworthy because Cathedral's signature covers it — so the field
-# must exist in the signed body here, or a genuine receipt cannot carry the firewall it attests to.
+# task_policy: Cathedral's SIGNED DECLARATION of the enclave's egress firewall config. A consumer
+# (cathedral-distill's agent_enclave verifier, cybergym_attest._verify_agent_egress) reads
+# egress=='restricted' + an EXACT egress_allowlist + tls_pinning from receipt["task_policy"]. The
+# signature proves Cathedral ASSERTED this policy for the run — not, on its own, that the enclave
+# runtime enforced egress (that is the mint/runtime side) and not that answer-lookup is fully closed
+# (the allowlisted model channel is miner-observable — a documented residual). The field must exist in
+# the signed body here, or a genuine receipt cannot carry the policy it declares. NOTE: cathedral-
+# distill also uses the key "task_policy" for a DIFFERENT shape on the worker receipt
+# (cybergym_cathedral_attest: {hardware_class, reuse, egress='none'}) — a different artifact (not a
+# cathedral_customer_receipt_v1) that never reaches this validator, but the key name is overloaded.
 _TASK_POLICY_KEYS = frozenset({"egress", "egress_allowlist", "tls_pinning"})
 _EGRESS_MODES = frozenset({"none", "restricted", "control_plane_only", "any"})
 MAX_EGRESS_ALLOWLIST = 64
@@ -471,16 +475,19 @@ def _validate_gpu_assertions(document: Mapping[str, object]) -> None:
 def _validate_task_policy(document: Mapping[str, object]) -> None:
     """Validate the OPTIONAL ``task_policy`` block (the enclave egress firewall). Fails closed on any
     malformation; a receipt without ``task_policy`` is valid and returns immediately (backward
-    compatible). Structure only — a consumer still enforces its own policy semantics (e.g. requiring
-    egress=='restricted' for an agent enclave); this guarantees the field, when present and signed, is
-    well-formed and unambiguous."""
+    compatible). Requires AT LEAST the three agent-egress fields and type-checks them, but TOLERATES
+    additional Cathedral-signed sub-fields: the consumer (cathedral-distill
+    cybergym_attest._verify_agent_egress) reads only what it needs via ``.get()``, and this verify
+    runs BEFORE the consumer — so demanding an exact key set here would reject a genuine future receipt
+    (a mint that adds a sub-field) that the consumer would have accepted. Structure only — a consumer
+    still enforces its own policy semantics (e.g. requiring egress=='restricted' for an agent enclave)."""
     if "task_policy" not in document:
         return
     policy = document["task_policy"]
-    if not isinstance(policy, dict) or frozenset(policy) != _TASK_POLICY_KEYS:
+    if not isinstance(policy, dict) or not _TASK_POLICY_KEYS <= frozenset(policy):
         raise CustomerReceiptError(
             "schema",
-            "task_policy must be an object with exactly {egress, egress_allowlist, tls_pinning}",
+            "task_policy must be an object with at least {egress, egress_allowlist, tls_pinning}",
         )
     egress = policy["egress"]
     if not isinstance(egress, str) or egress not in _EGRESS_MODES:
@@ -503,11 +510,14 @@ def _validate_task_policy(document: Mapping[str, object]) -> None:
             raise CustomerReceiptError(
                 "schema", "task_policy.egress_allowlist entries must be non-empty host strings"
             )
-        if host in seen:
+        # Dedup case-insensitively: hostnames are case-insensitive and the consumer lowercases each
+        # host into a set, so a case-variant of the same host is a real duplicate that would make the
+        # list misrepresent the effective (smaller) allowlist the consumer enforces.
+        if host.lower() in seen:
             raise CustomerReceiptError(
                 "schema", f"task_policy.egress_allowlist has a duplicate host {host!r}"
             )
-        seen.add(host)
+        seen.add(host.lower())
     if not isinstance(policy["tls_pinning"], bool):
         raise CustomerReceiptError("schema", "task_policy.tls_pinning must be a boolean")
     if egress == "restricted" and not allowlist:

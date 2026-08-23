@@ -406,9 +406,10 @@ def test_task_policy_is_covered_by_the_signature(trusted_keys):
         {"egress": "restricted", "egress_allowlist": ["h"], "tls_pinning": "yes"},      # tls_pinning not bool
         {"egress": "restricted", "egress_allowlist": "h", "tls_pinning": True},         # allowlist not a list
         {"egress": "restricted", "egress_allowlist": ["h", "h"], "tls_pinning": True},  # duplicate host
+        {"egress": "restricted", "egress_allowlist": ["h", "H"], "tls_pinning": True},  # case-variant dup host
         {"egress": "restricted", "egress_allowlist": ["h"]},                            # missing tls_pinning
-        {"egress": "restricted", "egress_allowlist": ["h"], "tls_pinning": True, "x": 1},  # unknown key
         {"egress": "restricted", "egress_allowlist": ["h"] * 65, "tls_pinning": True},  # over the host cap
+        {"egress_allowlist": ["h"], "tls_pinning": True, "x": 1},                       # extra key, missing egress
     ],
 )
 def test_malformed_task_policy_is_rejected_before_signature(bad, trusted_keys):
@@ -417,3 +418,16 @@ def test_malformed_task_policy_is_rejected_before_signature(bad, trusted_keys):
     with pytest.raises(CustomerReceiptError) as caught:
         verify_customer_receipt(_sign(doc), trusted_keys)
     assert caught.value.category == "schema"
+
+
+def test_task_policy_tolerates_extra_signed_subfields(trusted_keys):
+    # Superset, not exact-match: the consumer (cathedral-distill cybergym_attest._verify_agent_egress)
+    # reads the three fields it needs via .get(), and this verify runs FIRST — so a future Cathedral-
+    # signed sub-field must still verify here, or we would reject a genuine receipt the consumer accepts.
+    doc = _unsigned_cpu_document()
+    policy = _task_policy()
+    policy["egress_evidence_status"] = "PASS"  # a hypothetical future Cathedral-signed sub-field
+    doc["task_policy"] = policy
+    verified = verify_customer_receipt(_sign(doc), trusted_keys)
+    assert verified.document["task_policy"]["egress_evidence_status"] == "PASS"  # preserved + exposed
+    assert verified.document["task_policy"]["egress"] == "restricted"  # the three required fields intact
