@@ -369,3 +369,51 @@ def test_cli_returns_machine_readable_success_and_failure(
     failure = json.loads(capsys.readouterr().out)
     assert failure["valid"] is False
     assert failure["category"] == "signature"
+
+
+# --- task_policy (optional agent-enclave egress firewall, signed) ----------------------------------
+def _task_policy(egress="restricted", allowlist=("api.deepseek.com", "api.openai.com"), tls=True):
+    return {"egress": egress, "egress_allowlist": list(allowlist), "tls_pinning": tls}
+
+
+def test_task_policy_present_verifies_and_is_exposed(trusted_keys):
+    doc = _unsigned_cpu_document()
+    doc["task_policy"] = _task_policy()
+    verified = verify_customer_receipt(_sign(doc), trusted_keys)
+    assert verified.document["task_policy"] == _task_policy()  # consumer reads egress firewall from here
+
+
+def test_receipt_without_task_policy_still_verifies(cpu_receipt: bytes, trusted_keys):
+    verified = verify_customer_receipt(cpu_receipt, trusted_keys)
+    assert "task_policy" not in verified.document  # optional + backward compatible
+
+
+def test_task_policy_is_covered_by_the_signature(trusted_keys):
+    doc = _unsigned_cpu_document()
+    doc["task_policy"] = _task_policy()
+    tampered = parse_customer_receipt_json(_sign(doc))
+    tampered["task_policy"]["egress_allowlist"] = ["evil.example.com"]  # widen the firewall post-sign
+    with pytest.raises(CustomerReceiptError, match="signature is invalid") as caught:
+        verify_customer_receipt(canonical_customer_receipt_json(tampered), trusted_keys)
+    assert caught.value.category == "signature"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"egress": "restricted", "egress_allowlist": [], "tls_pinning": True},          # restricted, no hosts
+        {"egress": "bogus", "egress_allowlist": ["h"], "tls_pinning": True},            # unknown egress mode
+        {"egress": "restricted", "egress_allowlist": ["h"], "tls_pinning": "yes"},      # tls_pinning not bool
+        {"egress": "restricted", "egress_allowlist": "h", "tls_pinning": True},         # allowlist not a list
+        {"egress": "restricted", "egress_allowlist": ["h", "h"], "tls_pinning": True},  # duplicate host
+        {"egress": "restricted", "egress_allowlist": ["h"]},                            # missing tls_pinning
+        {"egress": "restricted", "egress_allowlist": ["h"], "tls_pinning": True, "x": 1},  # unknown key
+        {"egress": "restricted", "egress_allowlist": ["h"] * 65, "tls_pinning": True},  # over the host cap
+    ],
+)
+def test_malformed_task_policy_is_rejected_before_signature(bad, trusted_keys):
+    doc = _unsigned_cpu_document()
+    doc["task_policy"] = bad
+    with pytest.raises(CustomerReceiptError) as caught:
+        verify_customer_receipt(_sign(doc), trusted_keys)
+    assert caught.value.category == "schema"

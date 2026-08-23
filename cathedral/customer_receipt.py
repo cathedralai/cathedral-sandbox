@@ -91,6 +91,21 @@ _KEY_STATUSES = frozenset({"active", "retired", "revoked"})
 _CPU_PROFILE = "attest.v1"
 _GPU_PROFILE = "gcp-g4-rtx-pro-6000-sev-v1"
 
+# OPTIONAL top-level fields. Additive to v1 and backward compatible: a receipt without them still
+# verifies, so existing receipts are unaffected. Adding one here means it is part of the signed
+# canonical body (Cathedral's signature covers it), which is the whole point of task_policy below.
+_OPTIONAL_TOP_LEVEL_KEYS = frozenset({"task_policy"})
+# task_policy: the enclave's egress firewall config, ATTESTED by riding inside the signed receipt.
+# A consumer (cathedral-distill's agent_enclave verifier, cybergym_attest._verify_agent_egress) reads
+# egress=='restricted' + an EXACT egress_allowlist + tls_pinning from receipt["task_policy"] to prove
+# a reasoning agent ran with network restricted to the approved model hosts and could not fetch a
+# looked-up answer. That is only trustworthy because Cathedral's signature covers it — so the field
+# must exist in the signed body here, or a genuine receipt cannot carry the firewall it attests to.
+_TASK_POLICY_KEYS = frozenset({"egress", "egress_allowlist", "tls_pinning"})
+_EGRESS_MODES = frozenset({"none", "restricted", "control_plane_only", "any"})
+MAX_EGRESS_ALLOWLIST = 64
+MAX_EGRESS_HOST_BYTES = 255
+
 
 class CustomerReceiptError(ValueError):
     """Stable customer-receipt failure with a machine-readable category."""
@@ -453,6 +468,56 @@ def _validate_gpu_assertions(document: Mapping[str, object]) -> None:
         raise CustomerReceiptError("binding", "confidential GPU execution binding is incomplete")
 
 
+def _validate_task_policy(document: Mapping[str, object]) -> None:
+    """Validate the OPTIONAL ``task_policy`` block (the enclave egress firewall). Fails closed on any
+    malformation; a receipt without ``task_policy`` is valid and returns immediately (backward
+    compatible). Structure only — a consumer still enforces its own policy semantics (e.g. requiring
+    egress=='restricted' for an agent enclave); this guarantees the field, when present and signed, is
+    well-formed and unambiguous."""
+    if "task_policy" not in document:
+        return
+    policy = document["task_policy"]
+    if not isinstance(policy, dict) or frozenset(policy) != _TASK_POLICY_KEYS:
+        raise CustomerReceiptError(
+            "schema",
+            "task_policy must be an object with exactly {egress, egress_allowlist, tls_pinning}",
+        )
+    egress = policy["egress"]
+    if not isinstance(egress, str) or egress not in _EGRESS_MODES:
+        raise CustomerReceiptError(
+            "schema", f"task_policy.egress must be one of {sorted(_EGRESS_MODES)}"
+        )
+    allowlist = policy["egress_allowlist"]
+    if not isinstance(allowlist, list) or len(allowlist) > MAX_EGRESS_ALLOWLIST:
+        raise CustomerReceiptError(
+            "schema",
+            f"task_policy.egress_allowlist must be a list of at most {MAX_EGRESS_ALLOWLIST} hosts",
+        )
+    seen: set[str] = set()
+    for host in allowlist:
+        if (
+            not isinstance(host, str)
+            or not host
+            or len(host.encode("utf-8")) > MAX_EGRESS_HOST_BYTES
+        ):
+            raise CustomerReceiptError(
+                "schema", "task_policy.egress_allowlist entries must be non-empty host strings"
+            )
+        if host in seen:
+            raise CustomerReceiptError(
+                "schema", f"task_policy.egress_allowlist has a duplicate host {host!r}"
+            )
+        seen.add(host)
+    if not isinstance(policy["tls_pinning"], bool):
+        raise CustomerReceiptError("schema", "task_policy.tls_pinning must be a boolean")
+    if egress == "restricted" and not allowlist:
+        # a 'restricted' firewall that names no host is meaningless — it would fail any consumer's
+        # exact-allowlist match, and silently reads as "restricted" while permitting nothing/anything.
+        raise CustomerReceiptError(
+            "schema", "task_policy.egress='restricted' requires a non-empty egress_allowlist"
+        )
+
+
 def verify_customer_receipt(
     data: bytes | str,
     trusted_keys: Mapping[str, CustomerReceiptVerificationKey],
@@ -472,11 +537,13 @@ def verify_customer_receipt(
     encoded = data if isinstance(data, bytes) else data.encode("utf-8")
     if encoded != canonical_customer_receipt_json(document):
         raise CustomerReceiptError("schema", "customer receipt JSON is not canonical")
-    if frozenset(document) != _TOP_LEVEL_KEYS:
+    keys = frozenset(document)
+    if (_TOP_LEVEL_KEYS - keys) or (keys - _TOP_LEVEL_KEYS - _OPTIONAL_TOP_LEVEL_KEYS):
         raise CustomerReceiptError(
             "schema",
             "customer receipt has missing or unknown fields",
         )
+    _validate_task_policy(document)
     if document["schema"] != CUSTOMER_RECEIPT_SCHEMA:
         raise CustomerReceiptError("schema", "customer receipt schema is unsupported")
     signing_key_id = document["signing_key_id"]
