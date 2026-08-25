@@ -19,11 +19,13 @@ from cathedral.customer_receipt import (
     CUSTOMER_RECEIPT_SCHEMA,
     CUSTOMER_RECEIPT_TRUSTED_KEYS_SCHEMA,
     MAX_CUSTOMER_RECEIPT_BYTES,
+    OFFICIAL_INFERENCE_HOSTS,
     CustomerReceiptError,
     canonical_customer_receipt_json,
     customer_receipt_signed_bytes,
     parse_customer_receipt_json,
     parse_customer_receipt_trusted_keys_json,
+    public_task_policy_from_enforced,
     verify_customer_receipt,
 )
 
@@ -369,3 +371,121 @@ def test_cli_returns_machine_readable_success_and_failure(
     failure = json.loads(capsys.readouterr().out)
     assert failure["valid"] is False
     assert failure["category"] == "signature"
+
+
+def _task_policy(
+    egress="restricted",
+    allowlist=("api.deepseek.com", "api.openai.com"),
+    tls=True,
+):
+    return {"egress": egress, "egress_allowlist": list(allowlist), "tls_pinning": tls}
+
+
+def test_task_policy_present_verifies_and_is_exposed(trusted_keys):
+    document = _unsigned_cpu_document()
+    document["task_policy"] = _task_policy()
+    verified = verify_customer_receipt(_sign(document), trusted_keys)
+    assert verified.document["task_policy"] == _task_policy()
+
+
+def test_receipt_without_task_policy_still_verifies(cpu_receipt: bytes, trusted_keys):
+    verified = verify_customer_receipt(cpu_receipt, trusted_keys)
+    assert "task_policy" not in verified.document
+
+
+def test_task_policy_is_covered_by_the_signature(trusted_keys):
+    document = _unsigned_cpu_document()
+    document["task_policy"] = _task_policy()
+    tampered = parse_customer_receipt_json(_sign(document))
+    tampered["task_policy"]["egress_allowlist"] = ["evil.example.com"]
+    with pytest.raises(CustomerReceiptError, match="signature is invalid") as caught:
+        verify_customer_receipt(canonical_customer_receipt_json(tampered), trusted_keys)
+    assert caught.value.category == "signature"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"egress": "restricted", "egress_allowlist": [], "tls_pinning": True},
+        {"egress": "bogus", "egress_allowlist": ["api.openai.com"], "tls_pinning": True},
+        {"egress": "restricted", "egress_allowlist": ["api.openai.com"], "tls_pinning": "yes"},
+        {"egress": "restricted", "egress_allowlist": "api.openai.com", "tls_pinning": True},
+        {
+            "egress": "restricted",
+            "egress_allowlist": ["api.openai.com", "api.openai.com"],
+            "tls_pinning": True,
+        },
+        {
+            "egress": "restricted",
+            "egress_allowlist": ["api.openai.com", "API.openai.com"],
+            "tls_pinning": True,
+        },
+        {"egress": "restricted", "egress_allowlist": ["api.openai.com"]},
+        {
+            "egress": "restricted",
+            "egress_allowlist": ["api.openai.com"] * 65,
+            "tls_pinning": True,
+        },
+        {"egress_allowlist": ["api.openai.com"], "tls_pinning": True, "x": 1},
+        {"egress": "restricted", "egress_allowlist": ["not a host"], "tls_pinning": True},
+        {"egress": "restricted", "egress_allowlist": ["localhost"], "tls_pinning": True},
+    ],
+)
+def test_malformed_task_policy_is_rejected_before_signature(bad, trusted_keys):
+    document = _unsigned_cpu_document()
+    document["task_policy"] = bad
+    with pytest.raises(CustomerReceiptError) as caught:
+        verify_customer_receipt(_sign(document), trusted_keys)
+    assert caught.value.category == "schema"
+
+
+def test_task_policy_tolerates_extra_signed_subfields(trusted_keys):
+    document = _unsigned_cpu_document()
+    policy = _task_policy()
+    policy["hardware_class"] = "tdx_cpu"
+    policy["reuse"] = "forbidden"
+    policy["version"] = 1
+    document["task_policy"] = policy
+    verified = verify_customer_receipt(_sign(document), trusted_keys)
+    assert verified.document["task_policy"]["hardware_class"] == "tdx_cpu"
+    assert verified.document["task_policy"]["egress"] == "restricted"
+
+
+def test_polaris_allow_egress_maps_to_restricted_sn39_shape():
+    enforced = {
+        "version": 1,
+        "hardware_class": "tdx_cpu",
+        "reuse": "forbidden",
+        "max_runtime_seconds": 600,
+        "egress": "allow:api.openai.com,api.deepseek.com",
+        "secret_scope": "none",
+        "workspace_sha256": "a" * 64,
+        "artifacts": [],
+    }
+    public = public_task_policy_from_enforced(enforced)
+    assert public["egress"] == "restricted"
+    assert public["egress_allowlist"] == ["api.deepseek.com", "api.openai.com"]
+    assert public["tls_pinning"] is True
+    assert public["hardware_class"] == "tdx_cpu"
+    assert public["reuse"] == "forbidden"
+
+    pinned = public_task_policy_from_enforced(
+        {"egress": "allow:" + ",".join(OFFICIAL_INFERENCE_HOSTS)}
+    )
+    assert pinned["egress"] == "restricted"
+    assert pinned["egress_allowlist"] == sorted(OFFICIAL_INFERENCE_HOSTS)
+    assert set(pinned["egress_allowlist"]) == set(OFFICIAL_INFERENCE_HOSTS)
+
+    none = public_task_policy_from_enforced({"egress": "none"})
+    assert none == {"egress": "none", "egress_allowlist": [], "tls_pinning": False}
+
+
+def test_none_task_policy_verifies(trusted_keys):
+    document = _unsigned_cpu_document()
+    document["task_policy"] = {
+        "egress": "none",
+        "egress_allowlist": [],
+        "tls_pinning": False,
+    }
+    verified = verify_customer_receipt(_sign(document), trusted_keys)
+    assert verified.document["task_policy"]["egress"] == "none"

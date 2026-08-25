@@ -85,7 +85,9 @@ The exports are `CUSTOMER_RECEIPT_POLICY_V1` and
 
 ## Flat receipt fields
 
-No top-level extensions are accepted in v1.
+v1 is a closed field set plus one optional signed object, `task_policy`.
+Unknown top-level keys still fail closed. Legacy receipts without
+`task_policy` continue to verify.
 
 Common identity and status fields:
 
@@ -135,6 +137,27 @@ This does not assert an AMD SEV-SNP host attestation.
 
 Both execution classes require a true execution binding and confirmed
 teardown before a `ready` receipt verifies.
+
+## Optional `task_policy` (signed egress firewall)
+
+When present, `task_policy` is inside the signed canonical body. Cathedral's
+signature covers it. Offline verify checks structure only; a consumer such as
+SN39 `agent_enclave` still enforces its own exact-allowlist match.
+
+Required sub-fields:
+
+- `egress`: `none`, `restricted`, `observe`, `control_plane_only`, or `any`
+- `egress_allowlist`: list of DNS hostnames, at most 64, unique after
+  lowercasing. `restricted` requires a non-empty list.
+- `tls_pinning`: boolean. On Cathedral-hosted TDX, `true` means DNS is resolved
+  inside the TDX guest and CONNECT is only to a public IPv4 address on port
+  443. It is not an SPKI pin set.
+
+Additional Cathedral-signed sub-fields are tolerated (`version`,
+`hardware_class`, `reuse`, `max_runtime_seconds`, and PolarIS guest fields).
+PolarIS enforces `allow:h1,h2` inside the TDX guest. The mint maps that string
+onto `egress=restricted` plus `egress_allowlist` before signing. Callers must
+not treat a missing `task_policy` as restricted egress.
 
 ## Locally trusted keys
 
