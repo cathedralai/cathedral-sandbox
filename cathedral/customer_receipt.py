@@ -93,8 +93,16 @@ _GPU_PROFILE = "gcp-g4-rtx-pro-6000-sev-v1"
 
 # Optional top-level keys. Additive to v1: receipts without them still verify.
 # When present they are part of the signed canonical body.
+# cathedral-distill also uses the key "task_policy" for a different shape on
+# the worker receipt ({hardware_class, reuse, egress}) — a different artifact
+# that never reaches this validator. public_task_policy_from_enforced copies
+# hardware_class and reuse into the public policy, so the two shapes can look
+# similar.
 _OPTIONAL_TOP_LEVEL_KEYS = frozenset({"task_policy"})
 # SN39 agent-enclave reads these three fields from the signed receipt.
+# The signature proves Cathedral asserted this policy. It does not prove the
+# guest jail enforced it. A signed egress=restricted does not close
+# answer-lookup: the allowlisted model channel is miner-observable.
 _TASK_POLICY_REQUIRED_KEYS = frozenset({"egress", "egress_allowlist", "tls_pinning"})
 _EGRESS_MODES = frozenset(
     {"none", "restricted", "observe", "control_plane_only", "any"}
@@ -506,6 +514,9 @@ def public_task_policy_from_enforced(
     PolarIS enforces ``none | observe | default | allow:h1,h2``. SN39 consumes
     ``restricted`` plus ``egress_allowlist`` plus ``tls_pinning``. The signature
     covers this object; the guest jail is what actually restricts packets.
+    Copying ``hardware_class`` and ``reuse`` makes this object look similar to
+    the Distill worker-receipt ``task_policy``, which is a different artifact.
+    A signed ``egress=restricted`` does not close answer-lookup.
     """
 
     if not isinstance(enforced, Mapping):

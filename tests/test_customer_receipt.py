@@ -489,3 +489,13 @@ def test_none_task_policy_verifies(trusted_keys):
     }
     verified = verify_customer_receipt(_sign(document), trusted_keys)
     assert verified.document["task_policy"]["egress"] == "none"
+
+
+def test_task_policy_docs_name_soundness_residual_and_key_overload():
+    docs = Path(__file__).resolve().parents[1].joinpath("docs/CUSTOMER_RECEIPTS.md").read_text()
+    source = Path(__file__).resolve().parents[1].joinpath("cathedral/customer_receipt.py").read_text()
+    assert "does **not** close answer-lookup" in docs
+    assert "miner-observable" in docs
+    assert "different artifact" in docs
+    assert "miner-observable" in source
+    assert "different artifact" in source

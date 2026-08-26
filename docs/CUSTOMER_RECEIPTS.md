@@ -159,6 +159,17 @@ PolarIS enforces `allow:h1,h2` inside the TDX guest. The mint maps that string
 onto `egress=restricted` plus `egress_allowlist` before signing. Callers must
 not treat a missing `task_policy` as restricted egress.
 
+A signed `egress=restricted` does **not** close answer-lookup. The allowlisted
+model channel is itself miner-observable. Offline verify checks structure
+only; it does not prove the guest jail matched this object.
+
+`task_policy` on this receipt is not the Distill worker-receipt field of the
+same name. `cathedral-distill` uses `task_policy` for `{hardware_class,
+reuse, egress}` on a different artifact that never reaches this validator.
+`public_task_policy_from_enforced` copies `hardware_class` and `reuse` into
+the public customer-receipt policy, so the two shapes can look similar. Do
+not feed a Distill worker receipt to `cathedral customer-receipt verify`.
+
 ## Locally trusted keys
 
 The verifier takes a local trust file. The file is not fetched from the receipt
