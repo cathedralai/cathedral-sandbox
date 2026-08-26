@@ -87,7 +87,12 @@ The exports are `CUSTOMER_RECEIPT_POLICY_V1` and
 
 v1 is a closed field set plus one optional signed object, `task_policy`.
 Unknown top-level keys still fail closed. Legacy receipts without
-`task_policy` continue to verify.
+`task_policy` continue to verify. Compatibility is one-way: a verifier
+from before this change still rejects any receipt that carries
+`task_policy`. PolarIS#1142 will mint that field on every receipt,
+including deny-all `attest.v1` (`egress=none`, empty allowlist,
+`tls_pinning=false`). Land this verifier first. The mint is a hard
+verifier-version floor. Do not treat an unmerged mint as live.
 
 Common identity and status fields:
 
@@ -155,9 +160,10 @@ Required sub-fields:
 
 Additional Cathedral-signed sub-fields are tolerated (`version`,
 `hardware_class`, `reuse`, `max_runtime_seconds`, and PolarIS guest fields).
-PolarIS enforces `allow:h1,h2` inside the TDX guest. The mint maps that string
-onto `egress=restricted` plus `egress_allowlist` before signing. Callers must
-not treat a missing `task_policy` as restricted egress.
+PolarIS enforces `allow:h1,h2` inside the TDX guest. After this verifier
+is the installed floor, the mint maps that string onto `egress=restricted`
+plus `egress_allowlist` before signing. Callers must not treat a missing
+`task_policy` as restricted egress.
 
 A signed `egress=restricted` does **not** close answer-lookup. The allowlisted
 model channel is itself miner-observable. Offline verify checks structure

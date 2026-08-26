@@ -497,5 +497,7 @@ def test_task_policy_docs_name_soundness_residual_and_key_overload():
     assert "does **not** close answer-lookup" in docs
     assert "miner-observable" in docs
     assert "different artifact" in docs
+    assert "Compatibility is one-way" in docs
+    assert "verifier-version floor" in docs
     assert "miner-observable" in source
     assert "different artifact" in source
