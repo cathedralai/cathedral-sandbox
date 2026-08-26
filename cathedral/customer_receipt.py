@@ -91,6 +91,45 @@ _KEY_STATUSES = frozenset({"active", "retired", "revoked"})
 _CPU_PROFILE = "attest.v1"
 _GPU_PROFILE = "gcp-g4-rtx-pro-6000-sev-v1"
 
+# Optional top-level keys. Additive to v1: receipts without them still verify.
+# When present they are part of the signed canonical body.
+# cathedral-distill also uses the key "task_policy" for a different shape on
+# the worker receipt ({hardware_class, reuse, egress}) — a different artifact
+# that never reaches this validator. public_task_policy_from_enforced copies
+# hardware_class and reuse into the public policy, so the two shapes can look
+# similar.
+_OPTIONAL_TOP_LEVEL_KEYS = frozenset({"task_policy"})
+# SN39 agent-enclave reads these three fields from the signed receipt.
+# The signature proves Cathedral asserted this policy. It does not prove the
+# guest jail enforced it. A signed egress=restricted does not close
+# answer-lookup: the allowlisted model channel is miner-observable.
+_TASK_POLICY_REQUIRED_KEYS = frozenset({"egress", "egress_allowlist", "tls_pinning"})
+_EGRESS_MODES = frozenset(
+    {"none", "restricted", "observe", "control_plane_only", "any"}
+)
+MAX_EGRESS_ALLOWLIST = 64
+MAX_EGRESS_HOST_BYTES = 253
+# PolarIS guest jail and the public receipt share this hostname grammar.
+_EGRESS_HOST_RE = re.compile(
+    r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+    r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$",
+    re.IGNORECASE,
+)
+# Cathedral-pinned inference hosts for the SN39 agent-enclave path. PolarIS
+# mint copies this set when network.pin=official_inference_providers.
+OFFICIAL_INFERENCE_HOSTS: tuple[str, ...] = (
+    "api.anthropic.com",
+    "api.cerebras.ai",
+    "api.deepseek.com",
+    "api.fireworks.ai",
+    "api.groq.com",
+    "api.mistral.ai",
+    "api.openai.com",
+    "api.together.xyz",
+    "api.x.ai",
+    "generativelanguage.googleapis.com",
+)
+
 
 class CustomerReceiptError(ValueError):
     """Stable customer-receipt failure with a machine-readable category."""
@@ -429,6 +468,140 @@ def _validate_cpu_assertions(document: Mapping[str, object]) -> None:
         raise CustomerReceiptError("binding", "TDX CPU execution binding is incomplete")
 
 
+def _normalize_allowlist_hosts(hosts: object) -> list[str]:
+    if not isinstance(hosts, list) or len(hosts) > MAX_EGRESS_ALLOWLIST:
+        raise CustomerReceiptError(
+            "schema",
+            f"task_policy.egress_allowlist must be a list of at most {MAX_EGRESS_ALLOWLIST} hosts",
+        )
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for host in hosts:
+        if (
+            not isinstance(host, str)
+            or not host
+            or len(host.encode("utf-8")) > MAX_EGRESS_HOST_BYTES
+            or _EGRESS_HOST_RE.fullmatch(host) is None
+        ):
+            raise CustomerReceiptError(
+                "schema",
+                "task_policy.egress_allowlist entries must be DNS hostnames",
+            )
+        key = host.lower().rstrip(".")
+        if key in seen:
+            raise CustomerReceiptError(
+                "schema",
+                f"task_policy.egress_allowlist has a duplicate host {host!r}",
+            )
+        seen.add(key)
+        normalized.append(key)
+    return normalized
+
+
+def _hosts_from_allow_egress(egress: str) -> list[str]:
+    raw = egress[len("allow:") :]
+    hosts = [part.strip().lower().rstrip(".") for part in raw.split(",") if part.strip()]
+    return _normalize_allowlist_hosts(hosts)
+
+
+def public_task_policy_from_enforced(
+    enforced: Mapping[str, object],
+    *,
+    tls_pinning: bool | None = None,
+) -> dict[str, object]:
+    """Map PolarIS guest/attestor policy onto the signed public SN39 shape.
+
+    PolarIS enforces ``none | observe | default | allow:h1,h2``. SN39 consumes
+    ``restricted`` plus ``egress_allowlist`` plus ``tls_pinning``. The signature
+    covers this object; the guest jail is what actually restricts packets.
+    Copying ``hardware_class`` and ``reuse`` makes this object look similar to
+    the Distill worker-receipt ``task_policy``, which is a different artifact.
+    A signed ``egress=restricted`` does not close answer-lookup.
+    """
+
+    if not isinstance(enforced, Mapping):
+        raise CustomerReceiptError("schema", "enforced task_policy must be an object")
+    raw_egress = enforced.get("egress", "none")
+    if not isinstance(raw_egress, str) or not raw_egress.strip():
+        raise CustomerReceiptError("schema", "enforced task_policy.egress is required")
+    egress = raw_egress.strip()
+    allowlist: list[str] = []
+    if egress.lower().startswith("allow:"):
+        allowlist = _hosts_from_allow_egress(egress.lower())
+        public_egress = "restricted"
+        pin = True if tls_pinning is None else tls_pinning
+    elif egress == "default":
+        public_egress = "any"
+        pin = False if tls_pinning is None else tls_pinning
+    elif egress in _EGRESS_MODES:
+        public_egress = egress
+        raw_allow = enforced.get("egress_allowlist", [])
+        if raw_allow in (None, []):
+            allowlist = []
+        else:
+            allowlist = _normalize_allowlist_hosts(raw_allow)
+        if public_egress == "restricted":
+            pin = True if tls_pinning is None else tls_pinning
+        else:
+            pin = False if tls_pinning is None else tls_pinning
+    else:
+        raise CustomerReceiptError(
+            "schema",
+            f"unsupported enforced egress {egress!r}",
+        )
+    if public_egress == "restricted" and not allowlist:
+        raise CustomerReceiptError(
+            "schema",
+            "task_policy.egress='restricted' requires a non-empty egress_allowlist",
+        )
+    if not isinstance(pin, bool):
+        raise CustomerReceiptError("schema", "task_policy.tls_pinning must be a boolean")
+    policy: dict[str, object] = {
+        "egress": public_egress,
+        "egress_allowlist": sorted(allowlist),
+        "tls_pinning": pin,
+    }
+    for key in (
+        "version",
+        "hardware_class",
+        "reuse",
+        "max_runtime_seconds",
+        "secret_scope",
+        "workspace_sha256",
+        "artifacts",
+    ):
+        if key in enforced:
+            policy[key] = enforced[key]
+    return policy
+
+
+def _validate_task_policy(document: Mapping[str, object]) -> None:
+    """Validate optional signed ``task_policy``. Absent is valid (legacy receipts)."""
+
+    if "task_policy" not in document:
+        return
+    policy = document["task_policy"]
+    if not isinstance(policy, dict) or not _TASK_POLICY_REQUIRED_KEYS <= frozenset(policy):
+        raise CustomerReceiptError(
+            "schema",
+            "task_policy must be an object with at least {egress, egress_allowlist, tls_pinning}",
+        )
+    egress = policy["egress"]
+    if not isinstance(egress, str) or egress not in _EGRESS_MODES:
+        raise CustomerReceiptError(
+            "schema",
+            f"task_policy.egress must be one of {sorted(_EGRESS_MODES)}",
+        )
+    allowlist = _normalize_allowlist_hosts(policy["egress_allowlist"])
+    if not isinstance(policy["tls_pinning"], bool):
+        raise CustomerReceiptError("schema", "task_policy.tls_pinning must be a boolean")
+    if egress == "restricted" and not allowlist:
+        raise CustomerReceiptError(
+            "schema",
+            "task_policy.egress='restricted' requires a non-empty egress_allowlist",
+        )
+
+
 def _validate_gpu_assertions(document: Mapping[str, object]) -> None:
     gpu_type = document["gpu_type"]
     gpu_count = document["gpu_count"]
@@ -472,11 +645,13 @@ def verify_customer_receipt(
     encoded = data if isinstance(data, bytes) else data.encode("utf-8")
     if encoded != canonical_customer_receipt_json(document):
         raise CustomerReceiptError("schema", "customer receipt JSON is not canonical")
-    if frozenset(document) != _TOP_LEVEL_KEYS:
+    keys = frozenset(document)
+    if (_TOP_LEVEL_KEYS - keys) or (keys - _TOP_LEVEL_KEYS - _OPTIONAL_TOP_LEVEL_KEYS):
         raise CustomerReceiptError(
             "schema",
             "customer receipt has missing or unknown fields",
         )
+    _validate_task_policy(document)
     if document["schema"] != CUSTOMER_RECEIPT_SCHEMA:
         raise CustomerReceiptError("schema", "customer receipt schema is unsupported")
     signing_key_id = document["signing_key_id"]
@@ -539,6 +714,7 @@ __all__ = [
     "CUSTOMER_RECEIPT_POLICY_V1",
     "CUSTOMER_RECEIPT_SCHEMA",
     "CUSTOMER_RECEIPT_TRUSTED_KEYS_SCHEMA",
+    "OFFICIAL_INFERENCE_HOSTS",
     "CustomerReceiptError",
     "CustomerReceiptVerificationKey",
     "VerifiedCustomerReceipt",
@@ -546,5 +722,6 @@ __all__ = [
     "customer_receipt_signed_bytes",
     "parse_customer_receipt_json",
     "parse_customer_receipt_trusted_keys_json",
+    "public_task_policy_from_enforced",
     "verify_customer_receipt",
 ]
