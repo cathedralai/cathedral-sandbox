@@ -231,6 +231,29 @@ def _raw_http_status(port: int, headers: bytes, body: bytes = b"") -> int:
     return int(response.split(b" ", 2)[1])
 
 
+def _raw_post(
+    port: int, path: str, body: bytes, extra_headers: bytes = b""
+) -> tuple[int, bytes]:
+    """POST one path with raw header bytes, including non-ASCII Authorization."""
+    request = (
+        f"POST {path} HTTP/1.0\r\nHost: localhost\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+    ).encode("ascii") + extra_headers + b"\r\n" + body
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+        conn.sendall(request)
+        conn.shutdown(socket.SHUT_WR)
+        chunks: list[bytes] = []
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    response = b"".join(chunks)
+    head, _, payload = response.partition(b"\r\n\r\n")
+    return int(head.split(b" ", 2)[1]), payload
+
+
 # ---------------------------------------------------------------------------
 # Good round trips
 # ---------------------------------------------------------------------------
@@ -1363,6 +1386,52 @@ def test_evidence_challenge_never_sends_or_requires_bearer_token():
         remote = RemoteMiner(srv.base_url, HOTKEY, bearer_token="wrong-on-purpose")
         evidence = remote.fetch_evidence(nonce)
     assert evidence.nonce == nonce
+
+
+def test_non_ascii_authorization_does_not_crash_evidence():
+    """hmac.compare_digest TypeError must not take down /v1/evidence.
+
+    Pool selection used to call _check_auth on every path, including the
+    credential-free quote. A Latin-1 Authorization value then raised
+    TypeError before the request try block, so a public challenge failed
+    hard instead of ignoring the header.
+    """
+    nonce = os.urandom(32)
+    payload = json.dumps(
+        {"nonce_hex": nonce.hex(), "assigned_hotkey": HOTKEY}
+    ).encode()
+    with _WorkerServer(
+        configured_hotkey=HOTKEY,
+        evidence_collector=_fake_evidence,
+        bearer_token="production-worker-token",
+    ) as srv:
+        _start_server(srv)
+        code, body = _raw_post(
+            srv.port,
+            "/v1/evidence",
+            payload,
+            extra_headers="Authorization: Bearer café\r\n".encode("latin-1"),
+        )
+    assert code == 200
+    assert json.loads(body)["nonce_hex"] == nonce.hex()
+
+
+def test_non_ascii_authorization_does_not_crash_canonical_sat():
+    seed = 23
+    with _WorkerServer(
+        configured_hotkey=HOTKEY,
+        evidence_collector=_fake_evidence,
+        bearer_token="production-worker-token",
+    ) as srv:
+        _start_server(srv)
+        code, body = _raw_post(
+            srv.port,
+            "/v1/sat-work",
+            _canonical_sat_payload(seed),
+            extra_headers="Authorization: Bearer café\r\n".encode("latin-1"),
+        )
+    assert code == 200
+    assert json.loads(body)["satisfiable"] is True
 
 
 # ---------------------------------------------------------------------------

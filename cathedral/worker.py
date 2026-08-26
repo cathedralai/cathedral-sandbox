@@ -305,9 +305,15 @@ def _make_handler(
         def _check_auth(self) -> bool:
             if bearer_token is None:
                 return True
-            return hmac.compare_digest(
-                self.headers.get("Authorization", ""), f"Bearer {bearer_token}"
-            )
+            header = self.headers.get("Authorization", "")
+            expected = f"Bearer {bearer_token}"
+            # compare_digest raises TypeError on non-ASCII strings. A junk
+            # Authorization header is unauthenticated, not a crash: evidence
+            # and canonical SAT are public, and customer SAT 401s in the
+            # handler when this returns False.
+            if not isinstance(header, str) or not header.isascii():
+                return False
+            return hmac.compare_digest(header, expected)
 
         def _read_body(self) -> tuple[bytes | None, int, str]:
             if self.headers.get("Transfer-Encoding") is not None:
@@ -346,7 +352,10 @@ def _make_handler(
             # customer work until the body has been parsed, so the bearer for
             # a noncanonical instance is enforced in _handle_sat_work instead.
             credential_free = path in _CREDENTIAL_FREE_PATHS
-            auth_ok = self._check_auth()
+            # Evidence never inspects Authorization. SAT does, only so a valid
+            # bearer can take the work pool; a junk header is unauthenticated
+            # rather than a TypeError before the request try block.
+            auth_ok = False if path == "/v1/evidence" else self._check_auth()
             if not credential_free and not auth_ok:
                 self._send_json(401, {"error": "unauthorized"})
                 return
