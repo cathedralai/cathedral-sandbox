@@ -163,6 +163,27 @@ def _make_sat_item(n_vars: int = 3, seed: int = 0) -> SatWorkItem:
     return SatWorkItem(instance=inst, seed=seed, challenge_id=cid)
 
 
+def _canonical_sat_payload(seed: int) -> bytes:
+    """The public audit instance, framed exactly as the wire expects it."""
+    instance = _canonical_instance(seed)
+    return json.dumps(
+        {
+            "challenge_id": _compute_challenge_id(instance, seed),
+            "assigned_hotkey": HOTKEY,
+            "instance": {"n_vars": instance.n_vars, "clauses": instance.clauses},
+            "seed": seed,
+        }
+    ).encode()
+
+
+def _must_not_solve(_instance):
+    raise AssertionError("unauthorized work reached solve_sat")
+
+
+def _must_not_solve_customer(_instance, _timeout):
+    raise AssertionError("unauthorized work reached the customer solver")
+
+
 def _start_server(server: _WorkerServer) -> threading.Thread:
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -1028,6 +1049,13 @@ def test_a_client_that_stops_reading_cannot_keep_the_challenge_slot():
 
 
 def test_saturated_challenge_pool_does_not_starve_authenticated_work():
+    """Every credential-free path shares one pool, and only that pool.
+
+    /v1/sat-work joined /v1/evidence on the challenge pool when the canonical
+    audit became credential-free, so saturating it costs SAT throughput --
+    that is the point, because the alternative is unauthenticated traffic
+    consuming the slots authenticated callers depend on.
+    """
     hold = threading.Event()
     unblock = threading.Event()
 
@@ -1037,6 +1065,14 @@ def test_saturated_challenge_pool_does_not_starve_authenticated_work():
         return _fake_evidence(nonce, hotkey)
 
     item = _make_sat_item()
+    sat_payload = json.dumps(
+        {
+            "challenge_id": item.challenge_id,
+            "assigned_hotkey": HOTKEY,
+            "instance": {"n_vars": item.instance.n_vars, "clauses": item.instance.clauses},
+            "seed": item.seed,
+        }
+    ).encode()
     with WorkerServer(
         evidence_collector=blocking_collector,
         max_concurrent=1,
@@ -1051,11 +1087,11 @@ def test_saturated_challenge_pool_does_not_starve_authenticated_work():
         holder.start()
         try:
             assert hold.wait(5.0)
-            # The challenge pool is full ...
+            # The challenge pool is full, for evidence and for SAT alike ...
             assert _post_raw(url, payload)[0] == 503
-            # ... but work dispatch keeps its own slot.
-            cert = RemoteMiner(srv.base_url, HOTKEY, timeout=5).do_sat_work(item)
-            assert cert.challenge_id == item.challenge_id
+            assert _post_raw(f"{srv.base_url}/v1/sat-work", sat_payload)[0] == 503
+            # ... but the authenticated pool it cannot reach is untouched.
+            assert RemoteMiner(srv.base_url, HOTKEY, timeout=5).supports_customer_sat() is True
         finally:
             unblock.set()
             holder.join(timeout=5.0)
@@ -1218,8 +1254,12 @@ def test_work_units_not_trusted():
 # ---------------------------------------------------------------------------
 
 
-def test_bearer_token_missing_returns_401():
+def test_bearer_token_missing_returns_401(monkeypatch):
     item = _make_sat_item()
+    monkeypatch.setattr("cathedral.worker.solve_sat", _must_not_solve)
+    monkeypatch.setattr(
+        "cathedral.worker._solve_customer_sat_bounded", _must_not_solve_customer
+    )
     with WorkerServer(evidence_collector=_fake_evidence, bearer_token="tok") as srv:
         _start_server(srv)
         payload = json.dumps(
@@ -1238,8 +1278,12 @@ def test_bearer_token_missing_returns_401():
     assert b"unauthorized" in body.lower()
 
 
-def test_bearer_token_wrong_returns_401():
+def test_bearer_token_wrong_returns_401(monkeypatch):
     item = _make_sat_item()
+    monkeypatch.setattr("cathedral.worker.solve_sat", _must_not_solve)
+    monkeypatch.setattr(
+        "cathedral.worker._solve_customer_sat_bounded", _must_not_solve_customer
+    )
     with WorkerServer(evidence_collector=_fake_evidence, bearer_token="correct") as srv:
         _start_server(srv)
         payload = json.dumps(
@@ -1264,6 +1308,56 @@ def test_bearer_token_correct_accepted():
         remote = RemoteMiner(srv.base_url, HOTKEY, bearer_token="mysecret")
         cert = remote.do_sat_work(item)
     assert cert.assigned_hotkey == HOTKEY
+
+
+def test_canonical_sat_is_answered_without_any_authorization_header():
+    """An independent validator holds no bearer, and must still be audited.
+
+    A production worker configures a bearer for customer work. While the gate
+    rejected every unauthenticated POST to /v1/sat-work, the canonical audit
+    an unenrolled validator sends 401'd, so a worker that serves the protocol
+    correctly could never be shown to be serving it.
+    """
+    seed = 23
+    instance = _canonical_instance(seed)
+    with _WorkerServer(
+        configured_hotkey=HOTKEY,
+        evidence_collector=_fake_evidence,
+        bearer_token="production-worker-token",
+    ) as srv:
+        _start_server(srv)
+        code, body = _post_raw(
+            f"{srv.base_url}/v1/sat-work", _canonical_sat_payload(seed), bearer=None
+        )
+    assert code == 200
+    response = json.loads(body)
+    assert response["satisfiable"] is True
+    assert response["challenge_id"] == _compute_challenge_id(instance, seed)
+    true_literals = set(response["assignment"])
+    for clause in instance.clauses:
+        assert any(literal in true_literals for literal in clause), f"clause {clause} unsatisfied"
+
+
+def test_canonical_sat_is_answered_despite_a_wrong_authorization_header():
+    """A stale or foreign credential must not turn the public audit into a 401."""
+    seed = 41
+    instance = _canonical_instance(seed)
+    with _WorkerServer(
+        configured_hotkey=HOTKEY,
+        evidence_collector=_fake_evidence,
+        bearer_token="production-worker-token",
+    ) as srv:
+        _start_server(srv)
+        code, body = _post_raw(
+            f"{srv.base_url}/v1/sat-work",
+            _canonical_sat_payload(seed),
+            bearer="some-other-subnets-token",
+        )
+    assert code == 200
+    response = json.loads(body)
+    true_literals = set(response["assignment"])
+    for clause in instance.clauses:
+        assert any(literal in true_literals for literal in clause), f"clause {clause} unsatisfied"
 
 
 def test_evidence_challenge_never_sends_or_requires_bearer_token():

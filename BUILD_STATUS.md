@@ -40,8 +40,9 @@ Testnet SN292 remains the non-paying dry-run integration lane.
   `validated_supply_v1`. The validator independently enforces the versioned
   burn contract; miners cannot choose the allocation.
 - The worker serves credential-free, bounded `POST /v1/evidence` collection
-  and authenticated `POST /v1/sat-work`. It returns real Intel TDX hardware
-  quotes (8000-byte quotes in the recorded hardware run, with
+  and `POST /v1/sat-work`, whose canonical audit instance is credential-free
+  too; customer SAT on that path stays authenticated. It returns real Intel
+  TDX hardware quotes (8000-byte quotes in the recorded hardware run, with
   `intel_verified=true` and `report_data_match=true`).
 - The scorer enrolls workers, issues fresh challenges, verifies TDX evidence and
   hotkey binding, runs deterministic validator-dispatched audit work, derives
