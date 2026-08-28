@@ -55,8 +55,13 @@ MAX_RESPONSE_BODY: int = MAX_EVIDENCE_RESPONSE_BODY
 # one unauthenticated canonical audit per miner per epoch plus room for a
 # retry. A SAT POST that already carries the configured bearer uses the
 # authenticated pool instead, so public evidence/audit cannot starve it.
+# Credential-free SAT gets a third pool of its own: it is the only public path
+# that must parse an attacker-chosen instance before it can decide whether the
+# request is the canonical audit, so it must not be able to occupy the slots a
+# validator needs for quote collection.
 MAX_CONCURRENT: int = 4
 MAX_CHALLENGE_CONCURRENT: int = 2
+MAX_SAT_CHALLENGE_CONCURRENT: int = 2
 MAX_HOTKEY_LENGTH: int = 256
 MAX_BEARER_TOKEN_LENGTH: int = 4096
 MAX_CUSTOMER_SAT_SOLVE_SECONDS: float = 30.0
@@ -261,6 +266,7 @@ class _DeadlineWriter(io.BufferedIOBase):
 def _make_handler(
     semaphore: threading.Semaphore,
     challenge_semaphore: threading.Semaphore,
+    sat_challenge_semaphore: threading.Semaphore,
     configured_hotkey: str,
     bearer_token: str | None,
     evidence_collector: Callable[..., Evidence | tuple[Evidence, ...] | list[Evidence]],
@@ -340,10 +346,10 @@ def _make_handler(
             # Fresh evidence is deliberately credential-free: the validator
             # holds no bearer token for a worker it has not attested yet, and
             # work credentials are issued only after the attested channel is
-            # verified.  What protects this public path is its own challenge
-            # pool plus the body limits enforced below, not the shared
-            # concurrency limit -- a caller that declares a body and never
-            # sends it would otherwise hold a slot for the full deadline.
+            # verified. The server-level connection gate and this path's own
+            # challenge pool are both acquired before its body is read, so a
+            # stalled public caller consumes finite capacity for one deadline
+            # rather than creating an unbounded reader thread.
             #
             # Canonical audit SAT is the other half of that same public
             # challenge and is credential-free for the same reason: an
@@ -360,19 +366,22 @@ def _make_handler(
                 self._send_json(401, {"error": "unauthorized"})
                 return
             try:
-                # Read and size-check before taking a slot, so occupying one
-                # costs an attacker a complete, bounded request.
-                raw, error_code, error_message = self._read_body()
-                if raw is None:
-                    self._send_json(error_code, {"error": error_message})
-                    return
                 # A SAT POST with a configured, valid bearer is customer work
                 # (or a validator that already holds the credential). It uses
                 # the authenticated pool so public evidence/audit cannot 503
-                # it. Missing or wrong bearer stays on the challenge pool:
-                # that is the independent validator's canonical audit.
+                # it.
+                #
+                # Unauthenticated SAT gets its OWN pool, not the evidence pool.
+                # Canonical classification needs the parsed instance, so an
+                # unauthenticated noncanonical request necessarily holds a slot
+                # through json.loads and _parse_instance before 401ing. Sharing
+                # the evidence pool would let public SAT traffic 503 a
+                # validator's quote collection, and a validator that cannot
+                # collect a quote scores the miner zero.
                 if path == "/v1/sat-work" and bearer_token is not None and auth_ok:
                     pool = semaphore
+                elif path == "/v1/sat-work":
+                    pool = sat_challenge_semaphore
                 elif credential_free:
                     pool = challenge_semaphore
                 else:
@@ -381,6 +390,15 @@ def _make_handler(
                     self._send_json(503, {"error": "busy"})
                     return
                 try:
+                    # Admission precedes every untrusted body read. A caller
+                    # that declares a body and then stalls therefore consumes
+                    # one bounded class slot, never an unbounded handler
+                    # thread. The server-level connection gate also covers
+                    # clients that stall before their headers identify a path.
+                    raw, error_code, error_message = self._read_body()
+                    if raw is None:
+                        self._send_json(error_code, {"error": error_message})
+                        return
                     self._handle_post(raw)
                 finally:
                     pool.release()
@@ -619,6 +637,83 @@ def _parse_instance(raw: object) -> SatInstance | None:
     return instance
 
 
+class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Start at most ``max_connection_concurrent`` request threads.
+
+    The handler's three semaphores reserve execution capacity by request
+    class. This earlier gate covers the part before a handler knows the path,
+    including a client that never finishes its headers. A refused connection
+    is closed without starting a thread or attempting an HTTP response. At
+    this point the server has not parsed HTTP, and a nonblocking write is not
+    portable when the peer is still sending or a TLS handshake is pending.
+    """
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        request_handler: type[BaseHTTPRequestHandler],
+        *,
+        max_connection_concurrent: int,
+    ) -> None:
+        self._connection_slots = threading.BoundedSemaphore(max_connection_concurrent)
+        self._active_lock = threading.Lock()
+        self._active_requests: set[socket.socket] = set()
+        super().__init__(server_address, request_handler)
+
+    @property
+    def active_connection_count(self) -> int:
+        with self._active_lock:
+            return len(self._active_requests)
+
+    def process_request(
+        self,
+        request: socket.socket,
+        client_address: tuple[str, int],
+    ) -> None:
+        if not self._connection_slots.acquire(blocking=False):
+            # Keep the accept loop nonblocking and the thread ceiling strict.
+            # HTTP status belongs to the later class-pool gates, after a
+            # handler has parsed enough of the request to send one reliably.
+            self.shutdown_request(request)
+            return
+
+        with self._active_lock:
+            self._active_requests.add(request)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            with self._active_lock:
+                self._active_requests.discard(request)
+            self._connection_slots.release()
+            raise
+
+    def process_request_thread(
+        self,
+        request: socket.socket,
+        client_address: tuple[str, int],
+    ) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._active_lock:
+                self._active_requests.discard(request)
+            self._connection_slots.release()
+
+    def server_close(self) -> None:
+        # ThreadingHTTPServer uses daemon handler threads, so its default close
+        # leaves a partial-body read alive until the request timeout. Closing
+        # each tracked socket makes shutdown a cancellation boundary and frees
+        # every connection permit promptly.
+        with self._active_lock:
+            active_requests = tuple(self._active_requests)
+        for request in active_requests:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        super().server_close()
+
+
 def _install_tls_accept(server: ThreadingHTTPServer, tls_context: "ssl.SSLContext",
                         handshake_timeout: float) -> None:
     """Do the TLS handshake in the WORKER thread, never in the accept loop.
@@ -676,7 +771,9 @@ class WorkerServer:
     Unauthenticated ``/v1/evidence`` and canonical ``/v1/sat-work`` run on
     their own pool so public traffic cannot occupy authenticated slots. A
     SAT POST that already carries the configured bearer uses the work pool.
-    Noncanonical SAT still requires that bearer before any solver runs.
+    Noncanonical SAT still requires that bearer before any solver runs. A
+    fourth gate caps every connection before a request handler thread starts,
+    and each request-class gate is acquired before its body is read.
     """
 
     def __init__(
@@ -695,6 +792,8 @@ class WorkerServer:
         max_body: int = MAX_REQUEST_BODY,
         max_concurrent: int = MAX_CONCURRENT,
         max_challenge_concurrent: int = MAX_CHALLENGE_CONCURRENT,
+        max_sat_challenge_concurrent: int = MAX_SAT_CHALLENGE_CONCURRENT,
+        max_connection_concurrent: int | None = None,
         max_response_body: int = MAX_RESPONSE_BODY,
         timeout: float = 10.0,
         allow_noncanonical_sat: bool = False,
@@ -729,10 +828,24 @@ class WorkerServer:
             ("max_body", max_body),
             ("max_concurrent", max_concurrent),
             ("max_challenge_concurrent", max_challenge_concurrent),
+            ("max_sat_challenge_concurrent", max_sat_challenge_concurrent),
             ("max_response_body", max_response_body),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if max_connection_concurrent is None:
+            max_connection_concurrent = (
+                max_concurrent + max_challenge_concurrent + max_sat_challenge_concurrent
+            )
+        if (
+            isinstance(max_connection_concurrent, bool)
+            or not isinstance(max_connection_concurrent, int)
+            or max_connection_concurrent <= 0
+        ):
+            raise ValueError("max_connection_concurrent must be a positive integer")
+        class_capacity = max_concurrent + max_challenge_concurrent + max_sat_challenge_concurrent
+        if max_connection_concurrent < class_capacity:
+            raise ValueError("max_connection_concurrent must cover all request-class capacity")
         if (
             isinstance(timeout, bool)
             or not isinstance(timeout, (int, float))
@@ -759,9 +872,11 @@ class WorkerServer:
 
         semaphore = threading.Semaphore(max_concurrent)
         challenge_semaphore = threading.Semaphore(max_challenge_concurrent)
+        sat_challenge_semaphore = threading.Semaphore(max_sat_challenge_concurrent)
         handler = _make_handler(
             semaphore,
             challenge_semaphore,
+            sat_challenge_semaphore,
             configured_hotkey,
             bearer_token,
             evidence_collector or collect_tdx,
@@ -771,7 +886,11 @@ class WorkerServer:
             float(timeout),
             allow_noncanonical_sat,
         )
-        self._server = ThreadingHTTPServer((host, port), handler)
+        self._server = _BoundedThreadingHTTPServer(
+            (host, port),
+            handler,
+            max_connection_concurrent=max_connection_concurrent,
+        )
         self._tls_enabled = tls_context is not None
         if tls_context is not None:
             _install_tls_accept(self._server, tls_context, float(timeout))

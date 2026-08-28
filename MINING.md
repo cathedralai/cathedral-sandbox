@@ -306,13 +306,31 @@ and the validator sends it after it has verified the attested channel.
 Evidence collection is unauthenticated at every stage, including in
 production.
 
-The worker bounds that public path itself. Evidence requests draw on a
-separate two-slot pool, so unauthenticated traffic cannot occupy the four
-slots reserved for work. A full pool returns `503 busy` immediately instead of
-queueing. Request bodies are capped at 64 KiB, and the request and its
-response each get their own 10-second deadline, so a caller that stalls cannot
-hold a slot. These bounds are fixed in the worker and are sized for the 4 vCPU
-guest it ships in.
+The worker bounds that public path itself. Evidence requests draw on their own
+two-slot pool, the credential-free canonical SAT audit draws on a second
+two-slot pool, and neither can occupy the four slots reserved for
+authenticated work. The two public pools are separate from each other on
+purpose: classifying a SAT request as canonical requires parsing the
+caller-supplied instance first, so public SAT traffic must not be able to
+exhaust the slots a validator needs to collect a quote.
+
+Admission happens before any request-body read. A partial body therefore holds
+one finite class slot rather than creating an unbounded set of reader threads.
+An eight-slot connection gate, equal to the three default pools combined,
+also caps clients that stall before the server has enough headers to select a
+class. A full connection gate closes the new connection without starting a
+handler or attempting an HTTP response. At that pre-HTTP boundary the client
+may observe EOF, reset, or a write error. This keeps refusal nonblocking even
+when a client is still sending or a native TLS handshake is pending. A full
+request-class pool returns `503 busy` after the handler has parsed enough of
+the request to identify its class.
+
+Request bodies are capped at 64 KiB. Request and response each get their own
+10-second deadline. Class-pool saturation takes precedence over detailed body
+framing errors, so an admitted malformed request receives its usual 400, 411,
+or 413 while a class-admitted request refused by its full pool receives 503.
+These bounds are fixed in the worker and are sized for the 4 vCPU guest it
+ships in.
 
 A nonempty local quote proves collection, not vendor verification, policy
 acceptance, or eligibility.
@@ -496,7 +514,8 @@ Neither a provider nor Cathedral can promise a future token amount.
 | Endpoint unreachable | Check in-guest TLS service and the approved firewall allowlist |
 | Channel mismatch | TLS terminates in the wrong place or the SPKI digest changed |
 | `401` on work | Worker and validator bearer credentials differ. Never applies to `/v1/evidence`, which is unauthenticated |
-| `503 busy` | The two-slot evidence pool or the four-slot work pool is full. Requests are rejected, not queued |
+| Connection closes before an HTTP response | The eight-slot pre-handler connection gate is full. Retry with backoff. The refusal is intentionally not an HTTP response |
+| `503 busy` | The two-slot evidence pool, two-slot public SAT pool, or four-slot authenticated work pool is full. Requests are rejected, not queued |
 | `assigned_hotkey mismatch` | Worker was started with a different public address |
 | `admit=N` | Most often a measurement that is not on the approved list. Otherwise quote crypto, TCB status, binding, identity, or the policy window |
 | `score=0` | No verified work, stale evidence, failed work, or explicit revocation |

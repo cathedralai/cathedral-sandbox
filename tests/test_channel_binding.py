@@ -318,12 +318,12 @@ def test_native_tls_server_permits_non_loopback_bind(monkeypatch):
     made: list = []
     original = FakeHttpServer
 
-    def _capture(address, handler):
+    def _capture(address, handler, **_kwargs):
         server = original(address, handler)
         made.append(server)
         return server
 
-    monkeypatch.setattr("cathedral.worker.ThreadingHTTPServer", _capture)
+    monkeypatch.setattr("cathedral.worker._BoundedThreadingHTTPServer", _capture)
 
     with WorkerServer(
         "0.0.0.0",
