@@ -51,9 +51,10 @@ MAX_RESPONSE_BODY: int = MAX_EVIDENCE_RESPONSE_BODY
 # Sized for the 4 vCPU guest the worker ships in. Authenticated work gets one
 # slot per vCPU because canonical SAT is CPU bound and customer SAT runs in a
 # child process, so the slots map onto real parallelism. The credential-free
-# challenge path gets its own smaller pool: a validator needs one quote per
-# miner per epoch plus room for a retry or a lifecycle refresh overlapping it,
-# and because the pool is separate, saturating it cannot consume a work slot.
+# challenge paths get their own smaller pool: a validator needs one quote and
+# one unauthenticated canonical audit per miner per epoch plus room for a
+# retry. A SAT POST that already carries the configured bearer uses the
+# authenticated pool instead, so public evidence/audit cannot starve it.
 MAX_CONCURRENT: int = 4
 MAX_CHALLENGE_CONCURRENT: int = 2
 MAX_HOTKEY_LENGTH: int = 256
@@ -66,6 +67,7 @@ _EVIDENCE_V2_REQUEST_KEYS = _EVIDENCE_REQUEST_KEYS | frozenset(
     {"report_data_version", "channel_binding_type", "channel_binding_digest_hex"}
 )
 _SAT_REQUEST_KEYS = frozenset({"challenge_id", "assigned_hotkey", "instance", "seed"})
+_CREDENTIAL_FREE_PATHS = frozenset({"/v1/evidence", "/v1/sat-work"})
 _CAPABILITIES_REQUEST_KEYS: frozenset[str] = frozenset()
 _INSTANCE_KEYS = frozenset({"n_vars", "clauses"})
 _DECIMAL_RE = re.compile(r"[0-9]+")
@@ -303,9 +305,15 @@ def _make_handler(
         def _check_auth(self) -> bool:
             if bearer_token is None:
                 return True
-            return hmac.compare_digest(
-                self.headers.get("Authorization", ""), f"Bearer {bearer_token}"
-            )
+            header = self.headers.get("Authorization", "")
+            expected = f"Bearer {bearer_token}"
+            # compare_digest raises TypeError on non-ASCII strings. A junk
+            # Authorization header is unauthenticated, not a crash: evidence
+            # and canonical SAT are public, and customer SAT 401s in the
+            # handler when this returns False.
+            if not isinstance(header, str) or not header.isascii():
+                return False
+            return hmac.compare_digest(header, expected)
 
         def _read_body(self) -> tuple[bytes | None, int, str]:
             if self.headers.get("Transfer-Encoding") is not None:
@@ -336,8 +344,19 @@ def _make_handler(
             # pool plus the body limits enforced below, not the shared
             # concurrency limit -- a caller that declares a body and never
             # sends it would otherwise hold a slot for the full deadline.
-            credential_free = path == "/v1/evidence"
-            if not credential_free and not self._check_auth():
+            #
+            # Canonical audit SAT is the other half of that same public
+            # challenge and is credential-free for the same reason: an
+            # independent validator proves a worker serves before it has any
+            # work credential to present.  The gate cannot tell canonical from
+            # customer work until the body has been parsed, so the bearer for
+            # a noncanonical instance is enforced in _handle_sat_work instead.
+            credential_free = path in _CREDENTIAL_FREE_PATHS
+            # Evidence never inspects Authorization. SAT does, only so a valid
+            # bearer can take the work pool; a junk header is unauthenticated
+            # rather than a TypeError before the request try block.
+            auth_ok = False if path == "/v1/evidence" else self._check_auth()
+            if not credential_free and not auth_ok:
                 self._send_json(401, {"error": "unauthorized"})
                 return
             try:
@@ -347,7 +366,17 @@ def _make_handler(
                 if raw is None:
                     self._send_json(error_code, {"error": error_message})
                     return
-                pool = challenge_semaphore if credential_free else semaphore
+                # A SAT POST with a configured, valid bearer is customer work
+                # (or a validator that already holds the credential). It uses
+                # the authenticated pool so public evidence/audit cannot 503
+                # it. Missing or wrong bearer stays on the challenge pool:
+                # that is the independent validator's canonical audit.
+                if path == "/v1/sat-work" and bearer_token is not None and auth_ok:
+                    pool = semaphore
+                elif credential_free:
+                    pool = challenge_semaphore
+                else:
+                    pool = semaphore
                 if not pool.acquire(blocking=False):
                     self._send_json(503, {"error": "busy"})
                     return
@@ -540,6 +569,12 @@ def _make_handler(
                 self._send_json(400, {"error": "invalid instance"})
                 return
             canonical = instance == _canonical_instance(seed)
+            # The gate let this path through unauthenticated so the public
+            # canonical audit works; anything else is customer work and must
+            # present the bearer before a solver is entered.
+            if not canonical and not self._check_auth():
+                self._send_json(401, {"error": "unauthorized"})
+                return
             if not allow_noncanonical_sat and not canonical:
                 self._send_json(400, {"error": "noncanonical SAT instance"})
                 return
@@ -638,9 +673,10 @@ class WorkerServer:
     restricted to deterministic ``SatLane`` canonical backfill by default.
     Customer-submitted SAT is an explicit authenticated deployment mode.
 
-    The credential-free ``/v1/evidence`` challenge runs on its own pool so
-    that unauthenticated traffic cannot occupy the slots authenticated work
-    dispatch needs.
+    Unauthenticated ``/v1/evidence`` and canonical ``/v1/sat-work`` run on
+    their own pool so public traffic cannot occupy authenticated slots. A
+    SAT POST that already carries the configured bearer uses the work pool.
+    Noncanonical SAT still requires that bearer before any solver runs.
     """
 
     def __init__(
