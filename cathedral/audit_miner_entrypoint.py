@@ -29,7 +29,9 @@ from cryptography.x509.oid import NameOID
 
 HOTKEY_ENV = "CATHEDRAL_MINER_HOTKEY"
 WORKER_BEARER_ENV = "CATHEDRAL_WORKER_BEARER_TOKEN"
+TSM_REPORT_ROOT_ENV = "CATHEDRAL_TDX_TSM_REPORT_ROOT"
 TLS_DIRECTORY = Path("/run/cathedral-audit-miner")
+TSM_REPORT_ROOT = "/opt/cathedral-audit-miner/tsm-report"
 TLS_CERTIFICATE = "worker.crt"
 TLS_PRIVATE_KEY = "worker.key"
 WORKER_HOST = "0.0.0.0"
@@ -213,6 +215,11 @@ def worker_command(hotkey: str, material: TLSMaterial) -> list[str]:
 
 def _child_environment() -> dict[str, str]:
     child = {"PATH": _CHILD_PATH}
+    # Docker mounts sysfs over the image's /sys tree, so an image-layer
+    # /sys/kernel/config/tsm/report directory cannot serve as a bind target.
+    # Keep the collector target fixed outside /sys. The operator binds only the
+    # host report subtree here; callers still cannot override the path.
+    child[TSM_REPORT_ROOT_ENV] = TSM_REPORT_ROOT
     # The general worker CLI requires a bearer even when only its public audit
     # routes are used. Keep that guard random, local to this process, and
     # unavailable as a deployment input. Noncanonical SAT remains disabled.

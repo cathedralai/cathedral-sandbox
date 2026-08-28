@@ -12,6 +12,8 @@ from cryptography.hazmat.primitives import serialization
 
 from cathedral.audit_miner_entrypoint import (
     HOTKEY_ENV,
+    TSM_REPORT_ROOT,
+    TSM_REPORT_ROOT_ENV,
     TLS_CERTIFICATE,
     TLS_PRIVATE_KEY,
     WORKER_BEARER_ENV,
@@ -86,7 +88,7 @@ def test_public_hotkey_validation_refuses_valid_non_bittensor_format() -> None:
     "unknown_name",
     [
         WORKER_BEARER_ENV,
-        "CATHEDRAL_TDX_TSM_REPORT_ROOT",
+        TSM_REPORT_ROOT_ENV,
         "CATHEDRAL_WALLET_SEED",
         "CATHEDRAL_GPU_COLLECT_CMD",
     ],
@@ -225,8 +227,13 @@ def test_entrypoint_execs_only_the_fixed_tls_tdx_worker_command(tmp_path: Path) 
     assert "--development-allow-non-loopback" not in argv
     assert "--allow-customer-sat" not in argv
     assert "--gpu-composite" not in argv
-    assert set(child_environment) == {"PATH", WORKER_BEARER_ENV}
+    assert set(child_environment) == {
+        "PATH",
+        TSM_REPORT_ROOT_ENV,
+        WORKER_BEARER_ENV,
+    }
     assert child_environment["PATH"].startswith("/usr/local/bin:")
+    assert child_environment[TSM_REPORT_ROOT_ENV] == TSM_REPORT_ROOT
     assert HOTKEY_ENV not in child_environment
     assert "WALLET_SEED" not in child_environment
     assert re.fullmatch(r"[0-9a-f]{64}", child_environment[WORKER_BEARER_ENV])
@@ -243,12 +250,15 @@ def test_entrypoint_refuses_command_overrides_before_writing_tls(tmp_path: Path)
     assert not tls_directory.exists()
 
 
-def test_entrypoint_refuses_unknown_environment_before_writing_tls(tmp_path: Path) -> None:
+@pytest.mark.parametrize("unknown_name", [WORKER_BEARER_ENV, TSM_REPORT_ROOT_ENV])
+def test_entrypoint_refuses_unknown_environment_before_writing_tls(
+    tmp_path: Path, unknown_name: str
+) -> None:
     tls_directory = tmp_path / "tls"
     with pytest.raises(EntrypointError, match=f"only {HOTKEY_ENV}"):
         main(
             [],
-            environ={HOTKEY_ENV: HOTKEY, WORKER_BEARER_ENV: "override"},
+            environ={HOTKEY_ENV: HOTKEY, unknown_name: "caller-override"},
             tls_directory=tls_directory,
         )
     assert not tls_directory.exists()
@@ -265,6 +275,7 @@ def test_image_pins_amd64_base_fixed_entrypoint_and_one_tls_port() -> None:
     assert re.findall(r"^EXPOSE\s+(.+)$", dockerfile, flags=re.MULTILINE) == ["8081/tcp"]
     assert WORKER_BEARER_ENV not in dockerfile
     assert "WALLET_SEED" not in dockerfile
+    assert f"install -d -o root -g root -m 0755 {TSM_REPORT_ROOT}" in dockerfile
 
 
 def test_runtime_dependency_lock_is_exact_wheel_only_and_hash_checked() -> None:
@@ -328,6 +339,8 @@ def test_operator_doc_keeps_digest_and_tdx_measurement_as_separate_boundaries() 
 
     assert f"{IMAGE_PATH}@sha256:<64-hex>" in documentation
     assert "/sys/kernel/config/tsm/report" in documentation
+    assert f"src=/sys/kernel/config/tsm/report,dst={TSM_REPORT_ROOT}" in documentation
+    assert "--tmpfs /sys/kernel/config" not in documentation
     assert "uses the kernel configfs TSM path" in documentation
     assert "operator-enforced supply-chain pin" in documentation
     assert "does not place the post-boot OCI image digest into MRTD" in documentation
