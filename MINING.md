@@ -306,10 +306,14 @@ and the validator sends it after it has verified the attested channel.
 Evidence collection is unauthenticated at every stage, including in
 production.
 
-The worker bounds that public path itself. Evidence requests draw on a
-separate two-slot pool, so unauthenticated traffic cannot occupy the four
-slots reserved for work. A full pool returns `503 busy` immediately instead of
-queueing. Request bodies are capped at 64 KiB, and the request and its
+The worker bounds that public path itself. Evidence requests draw on their own
+two-slot pool, the credential-free canonical SAT audit draws on a second
+two-slot pool, and neither can occupy the four slots reserved for
+authenticated work. The two public pools are separate from each other on
+purpose: classifying a SAT request as canonical requires parsing the
+caller-supplied instance first, so public SAT traffic must not be able to
+exhaust the slots a validator needs to collect a quote. A full pool returns
+`503 busy` immediately instead of queueing. Request bodies are capped at 64 KiB, and the request and its
 response each get their own 10-second deadline, so a caller that stalls cannot
 hold a slot. These bounds are fixed in the worker and are sized for the 4 vCPU
 guest it ships in.

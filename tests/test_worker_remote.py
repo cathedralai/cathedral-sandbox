@@ -56,6 +56,7 @@ from cathedral.worker import (
 from cathedral.worker import (
     _solve_customer_sat_bounded,
 )
+import cathedral.worker as worker_module
 
 # ---------------------------------------------------------------------------
 # Test fixtures / helpers
@@ -1072,12 +1073,13 @@ def test_a_client_that_stops_reading_cannot_keep_the_challenge_slot():
 
 
 def test_saturated_challenge_pool_does_not_starve_authenticated_work():
-    """Public evidence/audit share one pool; a valid bearer uses the other.
+    """Three pools: evidence, credential-free SAT, and authenticated work.
 
-    Unauthenticated canonical SAT stays on the challenge pool so it cannot
-    occupy a customer-work slot. A SAT POST that already carries the
-    configured bearer is customer work and must still run when that public
-    pool is full.
+    A saturated evidence pool must not starve either of the other two. Since
+    #168 the credential-free SAT path has its own pool rather than sharing the
+    evidence pool, so a blocked evidence request no longer 503s the public
+    canonical audit; a SAT POST carrying the configured bearer is customer
+    work and runs on the authenticated pool as before.
     """
     hold = threading.Event()
     unblock = threading.Event()
@@ -1103,11 +1105,13 @@ def test_saturated_challenge_pool_does_not_starve_authenticated_work():
         try:
             assert hold.wait(5.0)
             assert _post_raw(url, payload)[0] == 503
+            # #168: the public canonical audit is on its own pool now, so a
+            # full evidence pool must NOT refuse it.
             assert _post_raw(
                 f"{srv.base_url}/v1/sat-work",
                 _canonical_sat_payload(23),
                 bearer=None,
-            )[0] == 503
+            )[0] == 200
             cert = RemoteMiner(srv.base_url, HOTKEY, timeout=5).do_sat_work(item)
             assert cert.challenge_id == item.challenge_id
             assert RemoteMiner(srv.base_url, HOTKEY, timeout=5).supports_customer_sat() is True
@@ -1653,3 +1657,117 @@ def test_remote_miner_rejects_invalid_limits(kwargs):
 def test_worker_server_rejects_invalid_limits(kwargs):
     with pytest.raises(ValueError):
         WorkerServer(evidence_collector=_fake_evidence, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Credential-free SAT must not be able to starve evidence collection (#168)
+# ---------------------------------------------------------------------------
+
+
+def test_inflight_unauthenticated_sat_cannot_503_evidence(monkeypatch):
+    """#168: hold the credential-free SAT pool open and prove evidence survives.
+
+    Canonical classification needs the parsed instance, so an unauthenticated
+    noncanonical request holds its slot through json.loads and _parse_instance
+    before it can 401. While it is parked there this test fires BOTH a second
+    SAT request (must 503, proving the SAT pool really is exhausted) and an
+    evidence request (must 200, proving the pools are separate). Sharing one
+    pool would 503 the evidence request, and a validator that cannot collect a
+    quote scores the miner zero.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+    real_parse = worker_module._parse_instance
+
+    def parked_parse(raw):
+        entered.set()
+        release.wait(timeout=10.0)
+        return real_parse(raw)
+
+    monkeypatch.setattr(worker_module, "_parse_instance", parked_parse)
+
+    item = _make_sat_item()
+    sat_payload = json.dumps(
+        {
+            "challenge_id": item.challenge_id,
+            "assigned_hotkey": HOTKEY,
+            "instance": {
+                "n_vars": item.instance.n_vars,
+                "clauses": item.instance.clauses,
+            },
+            "seed": item.seed,
+        }
+    ).encode()
+    evidence_payload = json.dumps(
+        {"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}
+    ).encode()
+
+    with WorkerServer(
+        evidence_collector=_fake_evidence,
+        max_sat_challenge_concurrent=1,
+        max_challenge_concurrent=1,
+    ) as srv:
+        _start_server(srv)
+        held: list[int] = []
+
+        def hold_the_slot():
+            code, _ = _post_raw(f"{srv.base_url}/v1/sat-work", sat_payload, bearer=None)
+            held.append(code)
+
+        parker = threading.Thread(target=hold_the_slot, daemon=True)
+        parker.start()
+        try:
+            assert entered.wait(timeout=10.0), "parked SAT request never reached parse"
+
+            # The SAT pool is genuinely full: a second SAT request is refused.
+            busy_code, _ = _post_raw(
+                f"{srv.base_url}/v1/sat-work", sat_payload, bearer=None
+            )
+            assert busy_code == 503, f"SAT pool not exhausted, got {busy_code}"
+
+            # ...and evidence, on its own pool, is unaffected.
+            code, _ = _post_raw(
+                f"{srv.base_url}/v1/evidence", evidence_payload, bearer=None
+            )
+            assert code == 200, f"evidence was starved by unauthenticated SAT: {code}"
+        finally:
+            release.set()
+            parker.join(timeout=10.0)
+        assert held == [401]
+
+
+def test_near_canonical_mutation_is_rejected_without_a_bearer(monkeypatch):
+    """#168: exact equality, not shape. One flipped literal must still 401.
+
+    A regression from exact SatInstance equality to a shape-only comparison
+    would expose altered 8-variable, 20-clause work to any unauthenticated
+    caller while every accept-direction test still passed.
+    """
+    seed = 11
+    instance = _canonical_instance(seed)
+    clauses = [list(clause) for clause in instance.clauses]
+    clauses[0][0] = -clauses[0][0]
+    mutated = SatInstance(n_vars=instance.n_vars, clauses=clauses)
+    assert mutated != instance
+
+    monkeypatch.setattr("cathedral.worker.solve_sat", _must_not_solve)
+    monkeypatch.setattr(
+        "cathedral.worker._solve_customer_sat_bounded",
+        lambda _i, _t: (_ for _ in ()).throw(
+            AssertionError("mutated work reached the customer solver")
+        ),
+    )
+    payload = json.dumps(
+        {
+            # recomputed, so only the instance differs from canonical
+            "challenge_id": _compute_challenge_id(mutated, seed),
+            "assigned_hotkey": HOTKEY,
+            "instance": {"n_vars": mutated.n_vars, "clauses": mutated.clauses},
+            "seed": seed,
+        }
+    ).encode()
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        for bearer in (None, "wrong-token", "nön-ascii-tökén"):
+            code, _ = _post_raw(f"{srv.base_url}/v1/sat-work", payload, bearer=bearer)
+            assert code == 401, f"bearer={bearer!r} should 401, got {code}"

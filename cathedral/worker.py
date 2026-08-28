@@ -55,8 +55,13 @@ MAX_RESPONSE_BODY: int = MAX_EVIDENCE_RESPONSE_BODY
 # one unauthenticated canonical audit per miner per epoch plus room for a
 # retry. A SAT POST that already carries the configured bearer uses the
 # authenticated pool instead, so public evidence/audit cannot starve it.
+# Credential-free SAT gets a third pool of its own: it is the only public path
+# that must parse an attacker-chosen instance before it can decide whether the
+# request is the canonical audit, so it must not be able to occupy the slots a
+# validator needs for quote collection.
 MAX_CONCURRENT: int = 4
 MAX_CHALLENGE_CONCURRENT: int = 2
+MAX_SAT_CHALLENGE_CONCURRENT: int = 2
 MAX_HOTKEY_LENGTH: int = 256
 MAX_BEARER_TOKEN_LENGTH: int = 4096
 MAX_CUSTOMER_SAT_SOLVE_SECONDS: float = 30.0
@@ -261,6 +266,7 @@ class _DeadlineWriter(io.BufferedIOBase):
 def _make_handler(
     semaphore: threading.Semaphore,
     challenge_semaphore: threading.Semaphore,
+    sat_challenge_semaphore: threading.Semaphore,
     configured_hotkey: str,
     bearer_token: str | None,
     evidence_collector: Callable[..., Evidence | tuple[Evidence, ...] | list[Evidence]],
@@ -369,10 +375,19 @@ def _make_handler(
                 # A SAT POST with a configured, valid bearer is customer work
                 # (or a validator that already holds the credential). It uses
                 # the authenticated pool so public evidence/audit cannot 503
-                # it. Missing or wrong bearer stays on the challenge pool:
-                # that is the independent validator's canonical audit.
+                # it.
+                #
+                # Unauthenticated SAT gets its OWN pool, not the evidence pool.
+                # Canonical classification needs the parsed instance, so an
+                # unauthenticated noncanonical request necessarily holds a slot
+                # through json.loads and _parse_instance before 401ing. Sharing
+                # the evidence pool would let public SAT traffic 503 a
+                # validator's quote collection, and a validator that cannot
+                # collect a quote scores the miner zero.
                 if path == "/v1/sat-work" and bearer_token is not None and auth_ok:
                     pool = semaphore
+                elif path == "/v1/sat-work":
+                    pool = sat_challenge_semaphore
                 elif credential_free:
                     pool = challenge_semaphore
                 else:
@@ -695,6 +710,7 @@ class WorkerServer:
         max_body: int = MAX_REQUEST_BODY,
         max_concurrent: int = MAX_CONCURRENT,
         max_challenge_concurrent: int = MAX_CHALLENGE_CONCURRENT,
+        max_sat_challenge_concurrent: int = MAX_SAT_CHALLENGE_CONCURRENT,
         max_response_body: int = MAX_RESPONSE_BODY,
         timeout: float = 10.0,
         allow_noncanonical_sat: bool = False,
@@ -729,6 +745,7 @@ class WorkerServer:
             ("max_body", max_body),
             ("max_concurrent", max_concurrent),
             ("max_challenge_concurrent", max_challenge_concurrent),
+            ("max_sat_challenge_concurrent", max_sat_challenge_concurrent),
             ("max_response_body", max_response_body),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -759,9 +776,11 @@ class WorkerServer:
 
         semaphore = threading.Semaphore(max_concurrent)
         challenge_semaphore = threading.Semaphore(max_challenge_concurrent)
+        sat_challenge_semaphore = threading.Semaphore(max_sat_challenge_concurrent)
         handler = _make_handler(
             semaphore,
             challenge_semaphore,
+            sat_challenge_semaphore,
             configured_hotkey,
             bearer_token,
             evidence_collector or collect_tdx,
