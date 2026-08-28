@@ -14,8 +14,9 @@ back for the claim **"SN39 mainnet: validated Intel TDX CPU compute."**
 This document is named MRTD for historical reasons and the name is misleading.
 Read this before approving anything.
 
-`ParsedQuote.measurement` (`cathedral/verify/tdx_quote.py`) is a SHA-256 over
-**eight** fields, of which `mr_td` is one:
+`ParsedTdxQuote.measurement` (`cathedral/verify/tdx_quote.py`) is a SHA-256 over
+**ten quote-body fields plus the domain separator**. `mr_td` is one of those
+quote-body fields:
 
     domain ‖ td_attributes ‖ xfam ‖ mr_td ‖ mr_config_id ‖ mr_owner
           ‖ mr_owner_config ‖ rtmr0 ‖ rtmr1 ‖ rtmr2 ‖ rtmr3
