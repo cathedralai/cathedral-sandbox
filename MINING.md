@@ -79,10 +79,13 @@ The active profile is `cpu-tdx-sn39-v2`. It requires TCB status `UpToDate` and
 lists three approved measurements. Its window closes on 2026-10-22, after
 which a rollover publishes a successor profile under a new id.
 
-No reproducible image is published yet, so you cannot build a matching
-measurement yourself. A VM that boots to any other measurement returns
-`admit=N` every epoch, whatever else is configured correctly. Raise this in
-your beta request. The operator reviews the measurement and, if it is
+No reproducible boot image for an approved TDX measurement is published, so
+you cannot build a matching measurement yourself. The separately documented
+[SN39 audit-miner OCI image](docs/SN39_AUDIT_MINER_IMAGE.md) is launched after
+boot and is an operator-enforced supply-chain pin. Its OCI digest is not part
+of MRTD or an RTMR automatically. A VM that boots to any other measurement
+returns `admit=N` every epoch, whatever else is configured correctly. Raise
+this in your beta request. The operator reviews the measurement and, if it is
 accepted, adds it in a signed policy release. Settle it before you pay for a
 machine.
 
