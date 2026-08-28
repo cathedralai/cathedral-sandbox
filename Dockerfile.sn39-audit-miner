@@ -20,9 +20,11 @@ RUN python -m pip install \
 COPY cathedral/ /usr/local/lib/python3.12/site-packages/cathedral/
 
 # Quote collection creates report entries in configfs and therefore runs as
-# guest root. The runtime command must bind-mount the guest's TSM report tree.
+# guest root. The runtime command binds only the guest's TSM report tree at
+# this fixed image mount target, outside Docker's runtime-mounted /sys.
 USER 0:0
-RUN install -d -o root -g root -m 0700 /run/cathedral-audit-miner
+RUN install -d -o root -g root -m 0700 /run/cathedral-audit-miner \
+    && install -d -o root -g root -m 0755 /opt/cathedral-audit-miner/tsm-report
 
 EXPOSE 8081/tcp
 STOPSIGNAL SIGTERM

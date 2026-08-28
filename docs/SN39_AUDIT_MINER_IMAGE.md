@@ -33,10 +33,15 @@ to present the same SPKI. The ordinary production `RemoteMiner` and prober use
 CA and hostname verification and are not compatible with this static SAN. Do
 not substitute that client for the reviewed UID30 attested-SPKI transport.
 
-The fixed command selects `--tee tdx`. With the sanitized child environment,
-the worker uses the kernel configfs TSM path
-`/sys/kernel/config/tsm/report`. It exposes one listener, native TLS on TCP
-`8081`. The image does not configure a plaintext listener.
+The fixed command selects `--tee tdx`. Docker mounts its own read-only sysfs
+over the image's `/sys` tree, so an image-layer
+`/sys/kernel/config/tsm/report` directory is not a usable bind target. The
+sanitized child environment therefore fixes the collector root at
+`/opt/cathedral-audit-miner/tsm-report`. The operator bind-mounts only the
+guest's host `/sys/kernel/config/tsm/report` subtree at that target. The path is
+not a deployment input. The worker still uses the kernel configfs TSM path
+through that narrow host bind. The image exposes one listener, native TLS on
+TCP `8081`. It does not configure a plaintext listener.
 
 The general worker CLI requires a bearer for non-audit routes. The entrypoint
 creates one random, unprinted, process-local guard value before `exec`. It is
@@ -138,7 +143,7 @@ docker run --rm \
   --network host \
   --read-only \
   --tmpfs /run/cathedral-audit-miner:rw,noexec,nosuid,nodev,mode=0700 \
-  --mount type=bind,src=/sys/kernel/config/tsm/report,dst=/sys/kernel/config/tsm/report \
+  --mount type=bind,src=/sys/kernel/config/tsm/report,dst=/opt/cathedral-audit-miner/tsm-report \
   --env CATHEDRAL_MINER_HOTKEY="$MINER_HOTKEY" \
   "$SN39_AUDIT_MINER_IMAGE"
 ```
