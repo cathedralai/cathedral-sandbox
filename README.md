@@ -66,9 +66,9 @@ Deep dive (architecture, deployed-versus-designed status, trust boundary):
 
 1. **Hardware:** an Intel TDX-capable CPU host. Nothing else is admitted today.
 2. **Apply before you provision.** Admission requires your worker's measurement
-   to already be on the signed policy registry, and no reproducible image is
-   published yet, so you cannot build a matching one yourself. Do not buy or
-   rent a machine before approval.
+   to already be on the signed policy registry. No reproducible boot image for
+   an approved TDX measurement is published. The audit-miner OCI image is a
+   separate post-boot supply pin. Do not buy or rent a machine before approval.
 3. **Only verified work pays.** Not registration, not uptime, not a valid
    quote. One miner earns on mainnet today; positive weight and emissions are
    never guaranteed.
@@ -79,6 +79,8 @@ Deep dive (architecture, deployed-versus-designed status, trust boundary):
    identifiers in any issue, ever.
 
 Full onboarding: [MINING.md](MINING.md) ·
+Audit-miner image operations:
+[docs/SN39_AUDIT_MINER_IMAGE.md](docs/SN39_AUDIT_MINER_IMAGE.md) ·
 Enrollment gate: [docs/ENROLLMENT_ALLOWLIST.md](docs/ENROLLMENT_ALLOWLIST.md) ·
 Workload admission: [docs/WORKLOAD_ADMISSION.md](docs/WORKLOAD_ADMISSION.md) ·
 Worker lifecycle: [docs/LIFECYCLE.md](docs/LIFECYCLE.md)
@@ -106,7 +108,7 @@ python -m pip install -e '.[dev]'
 python -m pytest -q
 ```
 
-The suite collects 1943 tests, and `tests/test_documented_counts.py` holds that
+The suite collects 1970 tests, and `tests/test_documented_counts.py` holds that
 number to this file, so it cannot quietly drift. Passing proves software
 behavior against test doubles; it does not prove live hardware, deployment, or
 an on-chain write. Details: [docs/TESTING.md](docs/TESTING.md) and the dated

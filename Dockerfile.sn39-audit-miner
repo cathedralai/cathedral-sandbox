@@ -1,0 +1,30 @@
+# TDX launch supply is x86-64. This is the linux/amd64 manifest digest for
+# python:3.12-slim-bookworm, verified from Docker Hub on 2026-08-26.
+FROM python:3.12-slim-bookworm@sha256:4427763a1ba36f5aa8f656a03e5d00f3b8d61f5dd950c73df6c14f8c7640f8ab
+
+LABEL org.opencontainers.image.title="Cathedral SN39 audit miner" \
+      org.opencontainers.image.description="TDX evidence and canonical SAT worker for the independent SN39 validator" \
+      org.opencontainers.image.source="https://github.com/cathedralai/cathedral-sandbox"
+
+WORKDIR /
+
+COPY requirements/sn39-audit-miner.txt /tmp/sn39-audit-miner-requirements.txt
+RUN python -m pip install \
+      --disable-pip-version-check \
+      --no-cache-dir \
+      --only-binary=:all: \
+      --require-hashes \
+      --requirement /tmp/sn39-audit-miner-requirements.txt \
+    && rm /tmp/sn39-audit-miner-requirements.txt
+
+COPY cathedral/ /usr/local/lib/python3.12/site-packages/cathedral/
+
+# Quote collection creates report entries in configfs and therefore runs as
+# guest root. The runtime command must bind-mount the guest's TSM report tree.
+USER 0:0
+RUN install -d -o root -g root -m 0700 /run/cathedral-audit-miner
+
+EXPOSE 8081/tcp
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["python", "-I", "-u", "-B", "-m", "cathedral.audit_miner_entrypoint"]
