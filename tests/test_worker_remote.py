@@ -208,15 +208,46 @@ def _post_raw(url: str, body: bytes, *, bearer: str | None = TEST_BEARER) -> tup
         return exc.code, exc.read()
 
 
-def _stall_connection(port: int, declared_length: int = 4096) -> socket.socket:
-    """Open a connection whose headers promise a body that never arrives."""
+def _stall_post_connection(
+    port: int,
+    *,
+    path: str = "/v1/evidence",
+    declared_length: int = 4096,
+    bearer: str | None = None,
+) -> socket.socket:
+    """Open a POST whose complete headers promise a body that never arrives."""
     conn = socket.create_connection(("127.0.0.1", port), timeout=10)
-    conn.sendall(
-        b"POST /v1/evidence HTTP/1.1\r\nHost: localhost\r\n"
-        b"Content-Type: application/json\r\n"
-        b"Content-Length: " + str(declared_length).encode("ascii") + b"\r\n\r\n"
+    headers = (
+        f"POST {path} HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {declared_length}\r\n"
     )
+    if bearer is not None:
+        headers += f"Authorization: Bearer {bearer}\r\n"
+    conn.sendall((headers + "\r\n").encode("ascii"))
     return conn
+
+
+def _stall_connection(port: int, declared_length: int = 4096) -> socket.socket:
+    return _stall_post_connection(
+        port,
+        path="/v1/evidence",
+        declared_length=declared_length,
+    )
+
+
+def _wait_for_active_connections(
+    server: _WorkerServer,
+    expected: int,
+    timeout: float = 2.0,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while (
+        server._server.active_connection_count != expected
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+    assert server._server.active_connection_count == expected
 
 
 def _status_of(response: bytes) -> int:
@@ -230,6 +261,30 @@ def _raw_http_status(port: int, headers: bytes, body: bytes = b"") -> int:
         conn.shutdown(socket.SHUT_WR)
         response = conn.recv(4096)
     return int(response.split(b" ", 2)[1])
+
+
+def _connection_gate_response(port: int) -> bytes:
+    """Return bytes observed when the pre-HTTP gate refuses one connection."""
+    request = (
+        b"POST /v1/evidence HTTP/1.0\r\nHost: localhost\r\n"
+        b"Content-Length: 0\r\n\r\n"
+    )
+    chunks: list[bytes] = []
+    with socket.create_connection(("127.0.0.1", port), timeout=2) as conn:
+        try:
+            conn.sendall(request)
+            conn.shutdown(socket.SHUT_WR)
+        except OSError:
+            return b""
+        while True:
+            try:
+                chunk = conn.recv(4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _raw_post(
@@ -936,32 +991,47 @@ def test_busy_returns_503():
 # ---------------------------------------------------------------------------
 
 
-def test_declared_but_unsent_bodies_cannot_block_the_challenge_path():
-    """Two stalled connections must not deny attestation to a real caller."""
-    payload = json.dumps({"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}).encode()
+def test_partial_bodies_are_bounded_before_handler_threads_can_grow():
+    """Every long-lived partial-body thread consumes one finite admission slot."""
+    evidence_payload = json.dumps(
+        {"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}
+    ).encode()
     with WorkerServer(
         evidence_collector=_fake_evidence,
-        max_challenge_concurrent=1,
+        max_concurrent=1,
+        max_challenge_concurrent=2,
+        max_sat_challenge_concurrent=1,
+        max_connection_concurrent=4,
         timeout=30.0,
     ) as srv:
         _start_server(srv)
-        stalled = [_stall_connection(srv.port) for _ in range(2)]
+        stalled = [
+            _stall_post_connection(srv.port, path="/v1/evidence"),
+            _stall_post_connection(srv.port, path="/v1/evidence"),
+            _stall_post_connection(srv.port, path="/v1/sat-work"),
+            _stall_post_connection(
+                srv.port,
+                path="/v1/sat-work",
+                bearer=TEST_BEARER,
+            ),
+        ]
         try:
-            # Let both connections finish their headers and park in the body
-            # read; that is the point at which the old code held the slot.
-            time.sleep(0.25)
-            started = time.monotonic()
-            code, _ = _post_raw(f"{srv.base_url}/v1/evidence", payload)
-            elapsed = time.monotonic() - started
+            _wait_for_active_connections(srv, 4)
+            for _ in range(20):
+                # The pre-handler gate has no parsed HTTP request and closes
+                # immediately. Class-pool saturation, tested separately,
+                # remains the point that returns a deterministic HTTP 503.
+                assert _connection_gate_response(srv.port) == b""
+                assert srv._server.active_connection_count == 4
         finally:
             for conn in stalled:
                 conn.close()
-    assert code == 200
-    assert elapsed < 5.0
+        _wait_for_active_connections(srv, 0)
+        assert _post_raw(f"{srv.base_url}/v1/evidence", evidence_payload)[0] == 200
 
 
-def test_body_is_validated_before_a_slot_is_taken():
-    """A saturated pool still answers framing errors, not 503."""
+def test_saturated_class_pool_returns_503_before_body_framing():
+    """Admission wins over framing detail once the request class is saturated."""
     hold = threading.Event()
     unblock = threading.Event()
 
@@ -983,13 +1053,18 @@ def test_body_is_validated_before_a_slot_is_taken():
         holder.start()
         try:
             assert hold.wait(5.0)
-            assert _raw_http_status(srv.port, b"") == 411
-            assert _raw_http_status(srv.port, b"Content-Length: nope\r\n") == 400
-            assert _raw_http_status(srv.port, b"Content-Length: 999999\r\n") == 413
-            assert _raw_http_status(srv.port, b"Transfer-Encoding: chunked\r\n") == 400
+            assert _raw_http_status(srv.port, b"") == 503
+            assert _raw_http_status(srv.port, b"Content-Length: nope\r\n") == 503
+            assert _raw_http_status(srv.port, b"Content-Length: 999999\r\n") == 503
+            assert _raw_http_status(srv.port, b"Transfer-Encoding: chunked\r\n") == 503
         finally:
             unblock.set()
             holder.join(timeout=5.0)
+
+        assert _raw_http_status(srv.port, b"") == 411
+        assert _raw_http_status(srv.port, b"Content-Length: nope\r\n") == 400
+        assert _raw_http_status(srv.port, b"Content-Length: 999999\r\n") == 413
+        assert _raw_http_status(srv.port, b"Transfer-Encoding: chunked\r\n") == 400
 
 
 def test_total_request_deadline_ends_a_trickled_body():
@@ -1021,6 +1096,37 @@ def test_total_request_deadline_ends_a_trickled_body():
     # Without a total deadline this request never ends: 4096 bytes at one
     # byte per 0.3s outlives any per-recv timeout.
     assert elapsed < 5.0
+
+
+def test_shutdown_cancels_partial_body_and_releases_connection_slot():
+    """Operator shutdown must not wait for the attacker's request deadline."""
+    srv = WorkerServer(
+        evidence_collector=_fake_evidence,
+        max_concurrent=1,
+        max_challenge_concurrent=1,
+        max_sat_challenge_concurrent=1,
+        max_connection_concurrent=3,
+        timeout=30.0,
+    )
+    server_thread = _start_server(srv)
+    stalled = _stall_connection(srv.port)
+    try:
+        _wait_for_active_connections(srv, 1)
+        shutdown_thread = threading.Thread(target=srv.shutdown)
+        started = time.monotonic()
+        shutdown_thread.start()
+        shutdown_thread.join(timeout=2.0)
+        elapsed = time.monotonic() - started
+
+        assert not shutdown_thread.is_alive()
+        assert elapsed < 2.0
+        _wait_for_active_connections(srv, 0)
+        server_thread.join(timeout=1.0)
+        assert not server_thread.is_alive()
+    finally:
+        stalled.close()
+        if server_thread.is_alive():
+            srv.shutdown()
 
 
 def test_a_client_that_stops_reading_cannot_keep_the_challenge_slot():
@@ -1652,6 +1758,11 @@ def test_remote_miner_rejects_invalid_limits(kwargs):
         {"max_response_body": 0},
         {"max_concurrent": 0},
         {"max_challenge_concurrent": 0},
+        {"max_sat_challenge_concurrent": 0},
+        {"max_connection_concurrent": 0},
+        {"max_connection_concurrent": True},
+        {"max_connection_concurrent": 1.5},
+        {"max_connection_concurrent": 7},
     ],
 )
 def test_worker_server_rejects_invalid_limits(kwargs):
@@ -1662,6 +1773,49 @@ def test_worker_server_rejects_invalid_limits(kwargs):
 # ---------------------------------------------------------------------------
 # Credential-free SAT must not be able to starve evidence collection (#168)
 # ---------------------------------------------------------------------------
+
+
+def test_partial_unauthenticated_sat_does_not_starve_valid_bearer_sat(monkeypatch):
+    """A valid bearer routes to work capacity before either body is read."""
+    body_read_started = threading.Event()
+    real_readinto = worker_module._DeadlineReader.readinto
+
+    def observed_readinto(reader, buffer):
+        body_read_started.set()
+        return real_readinto(reader, buffer)
+
+    monkeypatch.setattr(worker_module._DeadlineReader, "readinto", observed_readinto)
+    payload = _canonical_sat_payload(23)
+    with WorkerServer(
+        evidence_collector=_fake_evidence,
+        max_concurrent=1,
+        max_challenge_concurrent=2,
+        max_sat_challenge_concurrent=1,
+        max_connection_concurrent=4,
+        timeout=30.0,
+    ) as srv:
+        _start_server(srv)
+        stalled = _stall_post_connection(srv.port, path="/v1/sat-work")
+        try:
+            assert body_read_started.wait(timeout=2.0)
+
+            public_code, public_body = _post_raw(
+                f"{srv.base_url}/v1/sat-work",
+                payload,
+                bearer=None,
+            )
+            assert public_code == 503
+            assert b"busy" in public_body.lower()
+
+            authenticated_code, authenticated_body = _post_raw(
+                f"{srv.base_url}/v1/sat-work",
+                payload,
+                bearer=TEST_BEARER,
+            )
+            assert authenticated_code == 200
+            assert json.loads(authenticated_body)["satisfiable"] is True
+        finally:
+            stalled.close()
 
 
 def test_inflight_unauthenticated_sat_cannot_503_evidence(monkeypatch):

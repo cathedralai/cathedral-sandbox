@@ -41,8 +41,10 @@ Testnet SN292 remains the non-paying dry-run integration lane.
   burn contract; miners cannot choose the allocation.
 - The worker serves credential-free, bounded `POST /v1/evidence` collection
   and `POST /v1/sat-work`, whose canonical audit instance is credential-free
-  too; customer SAT on that path stays authenticated. It returns real Intel
-  TDX hardware quotes (8000-byte quotes in the recorded hardware run, with
+  too; customer SAT on that path stays authenticated. Connection admission
+  and the three request-class pools are acquired before untrusted body reads,
+  so partial requests cannot grow handler threads without a ceiling. It returns
+  real Intel TDX hardware quotes (8000-byte quotes in the recorded hardware run, with
   `intel_verified=true` and `report_data_match=true`).
 - The scorer enrolls workers, issues fresh challenges, verifies TDX evidence and
   hotkey binding, runs deterministic validator-dispatched audit work, derives
@@ -68,7 +70,7 @@ Testnet SN292 remains the non-paying dry-run integration lane.
 - Hardware epochs run on a 60-second cycle; each verified epoch produces 20
   validator-derived work units at score 1.0.
 - Post-migration foreign-key integrity is clean.
-- Repository test suite: 1936 tests collected. (Collected, not passing: the
+- Repository test suite: 1943 tests collected. (Collected, not passing: the
   TDX and SEV-SNP suites skip unless the hardware and CATHEDRAL_RUN_TDX_HW /
   CATHEDRAL_RUN_SNP_HW are present, so a passing total differs between a laptop
   and the TDX box. tests/test_documented_counts.py holds this number to the suite.)
