@@ -4,6 +4,10 @@ This image runs the hardened worker protocol needed by the independent SN39
 validator. It serves fresh Intel TDX evidence and credential-free canonical SAT
 over native TLS on `0.0.0.0:8081`.
 
+Use [SN39_AUDIT_MINER_OPERATIONS.md](SN39_AUDIT_MINER_OPERATIONS.md) for the
+canonical bounded launch order, one-hotkey-per-listed-machine invariant, dated
+UID124 proof, and stop conditions.
+
 ## Fixed runtime contract
 
 The default entrypoint accepts no command arguments and one Cathedral
@@ -157,9 +161,11 @@ Do not copy `worker.key` out of the guest. The leaf certificate is public, but
 UID30 does not treat it as a pre-shared trust anchor. The entrypoint rotates the
 key and certificate on every container start, so the validator must observe the
 new SPKI and verify a fresh quote before sending audit work. Cross-repository
-tests cover the IP-literal TLS context and SPKI checks. A live container,
-public axon, configfs quote, QVL verdict, and same-SPKI SAT round trip still need
-one joint proof before this path is called live.
+tests cover the IP-literal TLS context and SPKI checks. The bounded UID124 test
+on 2026-08-28 completed one live container, public axon, configfs quote, QVL
+verdict, and same-SPKI SAT round trip. That dated result does not prove a new
+deployment or ongoing availability. See
+[SN39_AUDIT_MINER_OPERATIONS.md](SN39_AUDIT_MINER_OPERATIONS.md#2026-08-28-bounded-proof).
 
 ## Measurement and pin boundary
 
@@ -182,14 +188,14 @@ validator and Polaris configuration, restarting the guest workload, and
 repeating anonymous pull and live TDX/SAT validation. Do not retag, overwrite,
 or delete a published launch digest as a rollback mechanism.
 
-This slice does not:
+Source and publication alone do not:
 
 - register a hotkey on SN39;
 - publish the guest IP and port as an axon;
 - create a cloud firewall rule;
 - make the Workers platform publish container ports or configfs;
-- prove a live anonymous pull, quote, SAT result, validator ingest, weight
-  write, or emission; or
-- prove the intended UID30 IP-literal attested-SPKI transport against a live
-  deployed instance; or
+- prove a new deployment's anonymous pull, quote, SAT result, validator ingest,
+  weight write, or emission;
+- prove the intended UID30 IP-literal attested-SPKI transport for any endpoint
+  other than the dated bounded proof; or
 - prove the application image is included in the admitted TDX measurement.

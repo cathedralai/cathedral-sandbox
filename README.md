@@ -69,9 +69,9 @@ Deep dive (architecture, deployed-versus-designed status, trust boundary):
    to already be on the signed policy registry. No reproducible boot image for
    an approved TDX measurement is published. The audit-miner OCI image is a
    separate post-boot supply pin. Do not buy or rent a machine before approval.
-3. **Only verified work pays.** Not registration, not uptime, not a valid
-   quote. One miner earns on mainnet today; positive weight and emissions are
-   never guaranteed.
+3. **Only verified work can receive weight.** Not registration, not uptime, not
+   a valid quote. A bounded 2026-08-28 test gave UID124 UID30's exact allocation
+   while subnet emission was zero. It proved allocation, not TAO earnings.
 4. **Start:** open a [miner beta issue](https://github.com/cathedralai/cathedral-compute/issues)
    with your public hotkey, intended TDX hardware class, provider, and broad
    region. Then read [MINING.md](MINING.md) in full.
@@ -79,7 +79,9 @@ Deep dive (architecture, deployed-versus-designed status, trust boundary):
    identifiers in any issue, ever.
 
 Full onboarding: [MINING.md](MINING.md) ·
-Audit-miner image operations:
+Audit-miner runbook and dated proof:
+[docs/SN39_AUDIT_MINER_OPERATIONS.md](docs/SN39_AUDIT_MINER_OPERATIONS.md) ·
+Image and trust contract:
 [docs/SN39_AUDIT_MINER_IMAGE.md](docs/SN39_AUDIT_MINER_IMAGE.md) ·
 Enrollment gate: [docs/ENROLLMENT_ALLOWLIST.md](docs/ENROLLMENT_ALLOWLIST.md) ·
 Workload admission: [docs/WORKLOAD_ADMISSION.md](docs/WORKLOAD_ADMISSION.md) ·

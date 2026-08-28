@@ -9,6 +9,12 @@ Cathedral SN39.
 > self-service and positive weight is not guaranteed. Testnet SN292 is
 > non-paying. Apply before registering or provisioning a new paid machine so a
 > maintainer can confirm current capacity and the supported release.
+>
+> On 2026-08-28, one bounded mainnet test registered UID124, finalized its TLS
+> axon, passed fresh QVL and same-SPKI canonical SAT, and received UID30's exact
+> mechanism-0 row `[[124,65535]]` with zero burn destination. SN39 emission was
+> zero. This proved allocation, not TAO earnings or ongoing availability. See
+> the [audit-miner operations record](docs/SN39_AUDIT_MINER_OPERATIONS.md).
 
 ## What a miner actually runs
 
@@ -89,6 +95,10 @@ this in your beta request. The operator reviews the measurement and, if it is
 accepted, adds it in a signed policy release. Settle it before you pay for a
 machine.
 
+The audit image has a separate, fixed operator runbook. Use
+[docs/SN39_AUDIT_MINER_OPERATIONS.md](docs/SN39_AUDIT_MINER_OPERATIONS.md) for
+its reviewed digest, bounded launch order, dated proof, and stop conditions.
+
 ## What a provider contributes
 
 A Cathedral provider runs a measured worker inside an Intel TDX confidential
@@ -115,6 +125,25 @@ self-reported volume alone.
   design. The development plain-HTTP flag is not a production path.
 - Cathedral may have no available beta slot or no positive work in an epoch.
 - A past positive score does not guarantee future weight or emissions.
+
+### One independently scored machine per hotkey
+
+One hotkey maps to one SN39 UID, one active enrollment identity, and one
+canonical axon endpoint at a time. Re-enrollment or a successor axon changes
+the endpoint for that identity. It does not create a second independently
+listed worker.
+
+To list and score a second machine separately, use a second accepted hotkey,
+register it to obtain a second UID, enroll and announce its own endpoint, and
+complete fresh QVL and same-SPKI work verification. The validator must then
+review an explicit vector containing both UIDs. The current UID30 launch tool
+is a consumed one-shot that pins one miner and cannot add a second target. A
+second weighted miner therefore also requires a separately reviewed
+multi-target policy and writer, followed by a new chain submission after the
+weight cooldown. The current axon announcement authorization is also pinned to
+UID124 and its one reviewed successor has been consumed. A second hotkey needs
+its own reviewed announcement policy and tool. Keep both private hotkeys out of
+the worker guests.
 
 ## 1. Request a beta slot
 
@@ -191,7 +220,8 @@ current subnet does not admit.
 ## 3. Register only after acceptance
 
 Registration is a separate Bittensor transaction and may cost funds. Use the
-same hotkey address that the accepted worker will serve.
+same hotkey address that the accepted worker will serve. Do not reuse it to
+represent a second independently listed machine.
 
 ```bash
 # Mainnet live testing. Only after explicit acceptance.
