@@ -2,16 +2,19 @@
 
 ## Status
 
-The general worker and remote client implement this protocol in source. It is
-not active in the published SN39 audit-miner image. The current UID30 launch
-path remains compatible because a worker with no signed-access configuration
-keeps the existing public audit routes, and a configured worker still accepts
-the legacy bearer on SAT and capabilities during migration. A configured
-worker must use `--allow-public-legacy-audit` while the current UID30 collector
-still posts evidence and canonical SAT without either credential.
+The general worker and remote client implement this protocol in merged source.
+The signed-fleet audit-image change now pins its verifier dependency and fixes
+the image entrypoint and host contract in source. It is not yet a published or
+deployed activation image.
+
+The fixed image always uses permit-only qualification with a local minimum
+stake of `0` Rao and always keeps the narrow public evidence and canonical SAT
+bridge for the current UID30 collector. Those are reviewed image constants,
+not operator-selectable modes. Fleet discovery and nontrivial validation work
+stay signed. Customer SAT stays disabled.
 
 Do not describe signed fleet access as deployed or production-ready. The
-[activation gates](#activation-gates) remain open.
+remaining [activation gates](#activation-gates) stay open.
 
 ## Plain-language flow
 
@@ -368,13 +371,14 @@ still shares the pre-header connection gate described above.
 
 ## Activation gates
 
-The source implementation is not a live-image claim. All of these gates remain
-required:
+The image implementation is not a publication or live-deployment claim. These
+gates remain required:
 
-1. Build a separate measured-image change. Pin the Linux amd64
-   `py-sr25519-bindings` wheel by hash, add fixed snapshot, key, fleet, and
-   persistent-state mount contracts, and update the fixed entrypoint.
-2. Publish that image by immutable digest with provenance and anonymous pull,
+1. Review and merge the separate image change. It pins the Linux amd64
+   `py-sr25519-bindings` wheel by hash, runs a build-time known-answer test, and
+   fixes snapshot, key, fleet, persistent-state, entrypoint, configfs, and host
+   nftables contracts.
+2. Publish the merged image by immutable digest with provenance and anonymous pull,
    then record the measurement and application-image assurance boundary.
 3. Merge and configure the validator signer and fleet traversal. Prove UID30
    signs with its existing hotkey and no private key enters the worker guest.
@@ -384,14 +388,18 @@ required:
 5. Keep AMD SEV-SNP fleet scoring disabled until the friend-owned hardware test
    proves stable `CHIP_ID` behavior.
 
-## Current audit image is intentionally unchanged
+## Published image remains legacy until promotion
 
-`Dockerfile.sn39-audit-miner`, its hash-locked requirements, and its fixed
-entrypoint do not install or configure signed validator access. The image
-continues to expose public evidence and canonical SAT for the reviewed UID30
-attested-SPKI test. It has no snapshot mount, pinned access key, persistent
-replay database, fleet manifest, or sr25519 worker dependency.
+The post-merge source-only image digest from the validator-access PR contains
+the Python modules but not the sr25519 wheel or fixed signed-fleet entrypoint.
+It is not an activation digest. The new image source adds those contracts, but
+it becomes deployable only after review, merge, immutable publication,
+provenance, anonymous pull, exact runtime-label verification, edge-control
+exercise, and rollback proof.
 
-Activating this protocol inside that image without the measured-image gates
-above would be an unreviewed TCB and deployment-contract change. This source PR
-therefore leaves the image disabled instead of implying live support.
+The fixed host paths and exact startup are documented in
+[SN39_AUDIT_MINER_IMAGE.md](SN39_AUDIT_MINER_IMAGE.md). The config directory is
+read-only inside the container. Replay state is persistent. The narrow
+configfs TSM report bind is read-write because quote collection creates and
+writes report entries. No wallet, chain RPC, private validator key, snapshot
+signing seed, shared bearer, or broader TDX device mount enters the guest.
