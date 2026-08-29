@@ -66,13 +66,13 @@ It requires one explicit mode:
 
 Migration is fixed to authenticated Intel TDX with native TLS and the complete
 signed-validator access bundle. It does not accept development, SNP, GPU, or
-customer-SAT options. The replacement audit-image source invokes
-`public-legacy-audit` internally. Operators cannot select a different image
-posture through environment variables. The currently published digest predates
-this command split and still invokes `worker serve` with `--tee tdx` and
-`--allow-public-legacy-audit`. It does not emit the new effective-startup
-record. The `worker migrate` image contract remains source-only until a
-replacement digest and provenance are published and recorded.
+customer-SAT options. The published audit image invokes `public-legacy-audit`
+internally. Operators cannot select a different image posture through
+environment variables. Its immutable source, digest, and provenance result are
+recorded in `SN39_AUDIT_MINER_OPERATIONS.md`. The image emits the effective
+startup record. The preserved legacy rollback image still invokes `worker
+serve` with `--tee tdx` and `--allow-public-legacy-audit` and has a different
+launcher contract.
 
 The retained bridge implementation is limited to the two explicit
 `WorkerServer` route controls. It remains for migration compatibility and is

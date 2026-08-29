@@ -18,22 +18,26 @@ submission happen outside the guest.
 The reviewed activation pin published from merged `main` on 2026-08-29 is:
 
 ```text
-Source merge: 8ad7f6e127ad7dcc4dd150f0e1eb47ce72c5ab22
-Image: ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:61a1806fce13d987323e7c418f1260ba1cd8c9ace8e5b9f9be3c193bdba7228a
+Source merge: 78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+Image: ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99
 Platform: linux/amd64
 Listener: native TLS on TCP 8081
 ```
 
-The digest passed anonymous manifest inspection and build-provenance verification.
-The digest remains an operator-enforced supply-chain pin. It is not included in
-TDX MRTD or an RTMR automatically.
+GitHub Actions run `33266307118` published the immutable commit tag and digest.
+The digest passed GitHub/Sigstore build-provenance verification and a separate
+anonymous manifest inspection. Its fixed entrypoint invokes
+`worker migrate --migration-mode public-legacy-audit` and emits the
+`cathedral_effective_startup_v1` posture record. The digest remains an
+operator-enforced supply-chain pin. It is not included in TDX MRTD or an RTMR
+automatically.
 
-This pin predates the production/development/migration command split. Its
-entrypoint invokes `worker serve --tee tdx --allow-public-legacy-audit` and
-does not emit `cathedral_effective_startup_v1`. The current source candidate
-uses `worker migrate --migration-mode public-legacy-audit`, but that command
-must not be attributed to this digest. Record a new source merge, immutable
-digest, and provenance result here before using the replacement contract.
+The preserved legacy rollback pin is source merge
+`8ad7f6e127ad7dcc4dd150f0e1eb47ce72c5ab22` and image
+`ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:61a1806fce13d987323e7c418f1260ba1cd8c9ace8e5b9f9be3c193bdba7228a`.
+That image invokes `worker serve --tee tdx --allow-public-legacy-audit`, does
+not emit `cathedral_effective_startup_v1`, and must not be used with the new
+signed-fleet launcher contract.
 
 Publication is not deployment or live proof. The first-activation rollback was
 captured and exercised on 2026-08-29 using the preserved legacy image. A bounded
