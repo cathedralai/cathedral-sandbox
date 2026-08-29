@@ -46,6 +46,7 @@ from cathedral.runtime import (
 )
 
 CANARY = MinerTarget("canary", "http://127.0.0.1:9000")
+SNP_CANARY = MinerTarget("canary", "https://127.0.0.1:9443")
 
 
 @dataclass
@@ -70,7 +71,11 @@ class FakeClient:
         self.evidence_calls = 0
         self.sat_calls = 0
         self.binding = ChannelBinding(
-            ChannelBindingType.APPLICATION_KEY_SHA256,
+            (
+                ChannelBindingType.TLS_SPKI_SHA256
+                if spec.evidence_kind is EvidenceKind.SEV_SNP
+                else ChannelBindingType.APPLICATION_KEY_SHA256
+            ),
             hashlib.sha256(endpoint.encode("utf-8")).digest(),
         )
 
@@ -154,6 +159,20 @@ def verifier(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | Non
 verifier.production_ready = True
 
 
+def snp_verifier(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | None:
+    assert evidence.kind is EvidenceKind.SEV_SNP
+    assert evidence.nonce == nonce
+    chip = evidence.quote.decode().removeprefix("chip:")
+    return Attested(
+        Tier.CC_CPU_SNP,
+        chip,
+        "measurement",
+        1,
+        "VERIFIED",
+        assurance=attestation_claims(evidence.quote, policy),
+    )
+
+
 def production_policy() -> Policy:
     policy = Policy(
         allowed_measurements={"measurement"},
@@ -182,6 +201,8 @@ def make_runtime(
     registry_clock: Callable[[], datetime] | None = None,
     max_workers: int = 4,
     candidate_snapshot: dict | None = None,
+    expected_tier: Tier = Tier.CC_CPU_TDX,
+    evidence_verifier=verifier,
 ) -> tuple[ConfidentialRuntime, Ledger, FakeFactory]:
     if registry_clock is None:
         registry = RegistryStore(str(tmp_path / "registry.sqlite"))
@@ -199,7 +220,7 @@ def make_runtime(
         actual_ledger,
         policy or Policy(allowed_measurements={"measurement"}),
         poster,  # type: ignore[arg-type]
-        verifier=verifier,
+        verifier=evidence_verifier,
         nonce_factory=nonce_factory or issue_nonce,
         remote_factory=factory,
         config=RuntimeConfig(
@@ -209,6 +230,7 @@ def make_runtime(
             allow_insecure_http_for_tests=True,
             score_network="finney",
             score_netuid=39,
+            expected_tier=expected_tier,
         ),
         receipt_issuer=receipt_issuer,
         candidate_snapshot=candidate_snapshot,
@@ -228,6 +250,122 @@ def test_canary_failure_creates_no_epoch(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="canary attestation failed"):
         runtime.run_epoch(1, CANARY)
     assert ledger.blocking_epoch() is None
+
+
+def test_development_snp_runtime_attests_and_completes_shadow_sat(tmp_path: Path) -> None:
+    specs = {
+        SNP_CANARY.endpoint_url: MinerSpec(
+            "snp-canary", evidence_kind=EvidenceKind.SEV_SNP
+        ),
+    }
+    runtime, ledger, _factory = make_runtime(
+        tmp_path,
+        [],
+        specs,
+        expected_tier=Tier.CC_CPU_SNP,
+        evidence_verifier=snp_verifier,
+    )
+
+    outcome = runtime.check_canary(SNP_CANARY)
+
+    assert outcome.status == "canary_verified"
+    assert outcome.work_units == 20.0
+    assert ledger.blocking_epoch() is None
+
+
+def test_development_snp_runtime_cannot_create_epoch_score_state(tmp_path: Path) -> None:
+    runtime, ledger, _factory = make_runtime(
+        tmp_path,
+        [],
+        {},
+        expected_tier=Tier.CC_CPU_SNP,
+        evidence_verifier=snp_verifier,
+    )
+
+    with pytest.raises(RuntimeError, match="shadow-only"):
+        runtime.run_epoch(1, SNP_CANARY)
+
+    assert ledger.blocking_epoch() is None
+
+
+def test_development_snp_runtime_rejects_tdx_evidence(tmp_path: Path) -> None:
+    endpoint = "https://127.0.0.1:9444"
+    runtime, _ledger, _factory = make_runtime(
+        tmp_path,
+        [("miner", endpoint)],
+        {endpoint: MinerSpec("tdx-chip", evidence_kind=EvidenceKind.TDX)},
+        expected_tier=Tier.CC_CPU_SNP,
+        evidence_verifier=snp_verifier,
+    )
+
+    outcome = runtime.audit_attestation(MinerTarget("miner", endpoint))
+
+    assert outcome.status == "attestation_failed"
+    assert "sev_snp evidence component is required" in (outcome.error or "")
+
+
+def test_development_snp_runtime_rejects_http_before_collection(tmp_path: Path) -> None:
+    endpoint = "http://127.0.0.1:9001"
+    runtime, _ledger, factory = make_runtime(
+        tmp_path,
+        [("miner", endpoint)],
+        {endpoint: MinerSpec("snp-chip", evidence_kind=EvidenceKind.SEV_SNP)},
+        expected_tier=Tier.CC_CPU_SNP,
+        evidence_verifier=snp_verifier,
+    )
+
+    outcome = runtime.audit_attestation(MinerTarget("miner", endpoint))
+
+    assert outcome.status == "attestation_failed"
+    assert outcome.error == "AMD SEV-SNP development evidence requires HTTPS"
+    assert factory.log == {}
+
+
+def test_development_snp_runtime_refuses_remote_unsigned_review(tmp_path: Path) -> None:
+    endpoint = "https://8.8.8.8:9443"
+    runtime, _ledger, factory = make_runtime(
+        tmp_path,
+        [(
+            "miner",
+            endpoint,
+        )],
+        {endpoint: MinerSpec("snp-chip", evidence_kind=EvidenceKind.SEV_SNP)},
+        expected_tier=Tier.CC_CPU_SNP,
+        evidence_verifier=snp_verifier,
+    )
+
+    outcome = runtime.audit_attestation(MinerTarget("miner", endpoint))
+
+    assert outcome.status == "attestation_failed"
+    assert "loopback-only" in (outcome.error or "")
+    assert factory.log == {}
+
+
+def test_development_snp_runtime_rejects_report_data_v1(tmp_path: Path) -> None:
+    endpoint = "https://127.0.0.1:9444"
+    runtime, _ledger, _factory = make_runtime(
+        tmp_path,
+        [("miner", endpoint)],
+        {
+            endpoint: MinerSpec(
+                "snp-chip",
+                evidence_kind=EvidenceKind.SEV_SNP,
+                legacy_evidence=True,
+            )
+        },
+        expected_tier=Tier.CC_CPU_SNP,
+        evidence_verifier=snp_verifier,
+    )
+
+    outcome = runtime.audit_attestation(MinerTarget("miner", endpoint))
+
+    assert outcome.status == "attestation_failed"
+    assert "requires report-data v2" in (outcome.error or "")
+
+
+def test_snp_runtime_is_refused_in_production() -> None:
+    with pytest.raises(ValueError, match="development-only"):
+        RuntimeConfig(production_mode=True, expected_tier=Tier.CC_CPU_SNP)
 
 
 def test_canary_endpoint_claimant_is_excluded_and_the_epoch_completes(tmp_path: Path) -> None:

@@ -367,6 +367,64 @@ def test_runtime_run_epoch_is_dry_by_default_and_publish_is_explicit():
     assert parser.parse_args([*common, "--publish"]).publish is True
 
 
+def test_runtime_cpu_tee_defaults_to_tdx_and_accepts_snp() -> None:
+    parser = build_parser()
+    common = [
+        "runtime",
+        "audit-attestation",
+        "--registry-db",
+        "registry.sqlite",
+        "--ledger-db",
+        "ledger.sqlite",
+        "--measurements-file",
+        "measurements.json",
+        "--canary-hotkey",
+        "canary",
+        "--canary-endpoint",
+        "https://127.0.0.1:8081",
+    ]
+
+    assert parser.parse_args(common).cpu_tee == "tdx"
+    assert parser.parse_args([*common, "--cpu-tee", "snp"]).cpu_tee == "snp"
+
+
+def test_runtime_snp_requires_development_before_file_io() -> None:
+    args = _production_admission_args(Path("/nonexistent"))
+    args.cpu_tee = "snp"
+
+    with pytest.raises(ValueError, match="requires --development"):
+        _build_runtime(args, require_policy=True)
+
+
+def test_runtime_snp_refuses_epoch_creation_before_file_io() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "runtime",
+            "run-epoch",
+            "--registry-db",
+            "registry.sqlite",
+            "--ledger-db",
+            "ledger.sqlite",
+            "--measurements-file",
+            "missing.json",
+            "--canary-hotkey",
+            "canary",
+            "--canary-endpoint",
+            "https://127.0.0.1:8081",
+            "--source-epoch",
+            "1",
+            "--development",
+            "--cpu-tee",
+            "snp",
+            "--publish",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="only for development canary"):
+        _build_runtime(args, require_policy=True)
+
+
 def test_production_run_epoch_requires_explicit_score_audience_before_io():
     args = build_parser().parse_args(
         [
@@ -926,6 +984,43 @@ def test_worker_signed_access_requires_complete_configuration():
     )
 
     with pytest.raises(ValueError, match="snapshot, pinned keys, durable state"):
+        cmd_worker_serve(args)
+
+
+def test_public_snp_worker_refuses_bearer_only_before_serving(monkeypatch):
+    monkeypatch.setenv(DEFAULT_WORKER_BEARER_ENV, "x" * 43)
+    args = build_parser().parse_args(
+        [
+            "worker",
+            "serve",
+            "--hotkey",
+            "miner",
+            "--host",
+            "0.0.0.0",
+            "--tee",
+            "snp",
+            "--development-allow-non-loopback",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="requires signed validator access"):
+        cmd_worker_serve(args)
+
+
+def test_snp_worker_refuses_public_evidence_compatibility_mode_before_file_io():
+    args = build_parser().parse_args(
+        [
+            "worker",
+            "serve",
+            "--hotkey",
+            "miner",
+            "--tee",
+            "snp",
+            "--allow-public-bootstrap-evidence",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="cannot use public compatibility modes"):
         cmd_worker_serve(args)
 
 

@@ -834,6 +834,7 @@ def test_signed_remote_discovers_fleet_and_runs_validation_work(tmp_path: Path, 
         )
         evidence = remote.fetch_evidence(os.urandom(32))
         remote.confirm_channel_binding(evidence)
+        remote.confirm_signed_validator_access_required(evidence)
         assert remote.fetch_fleet() == endpoints
         seed = 7
         instance = _canonical_instance(seed)
@@ -854,6 +855,123 @@ def test_signed_remote_discovers_fleet_and_runs_validation_work(tmp_path: Path, 
             unsigned.do_sat_work(SatWorkItem(instance, seed, _compute_challenge_id(instance, seed)))
         with pytest.raises(RemoteError, match="HTTP 401"):
             unsigned.supports_customer_sat()
+
+
+def test_signed_access_negative_control_rejects_an_unsigned_development_worker(
+    tmp_path: Path,
+):
+    server_context, client_context, binding = _tls_contexts(tmp_path)
+
+    def evidence_collector(nonce, hotkey, **kwargs):
+        return Evidence(
+            kind=EvidenceKind.SEV_SNP,
+            quote=b"quote",
+            nonce=nonce,
+            miner_hotkey=hotkey,
+            report_data_version=kwargs["report_data_version"],
+            channel_binding=kwargs["channel_binding"],
+        )
+
+    with WorkerServer(
+        configured_hotkey=WORKER_HOTKEY,
+        bearer_token=None,
+        evidence_collector=evidence_collector,
+        channel_binding=binding,
+        tls_context=server_context,
+    ) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        remote = RemoteMiner(
+            server.base_url,
+            WORKER_HOTKEY,
+            ssl_context=client_context,
+            validator_hotkey=VALIDATOR_HOTKEY,
+            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
+        )
+        evidence = remote.fetch_evidence(os.urandom(32))
+        remote.confirm_channel_binding(evidence)
+
+        with pytest.raises(RemoteError, match="accepted an invalid validator signature"):
+            remote.confirm_signed_validator_access_required(evidence)
+
+
+def test_signed_access_negative_control_rejects_a_legacy_bearer_worker(
+    tmp_path: Path,
+):
+    server_context, client_context, binding = _tls_contexts(tmp_path)
+
+    def evidence_collector(nonce, hotkey, **kwargs):
+        return Evidence(
+            kind=EvidenceKind.SEV_SNP,
+            quote=b"quote",
+            nonce=nonce,
+            miner_hotkey=hotkey,
+            report_data_version=kwargs["report_data_version"],
+            channel_binding=kwargs["channel_binding"],
+        )
+
+    with WorkerServer(
+        configured_hotkey=WORKER_HOTKEY,
+        bearer_token="legacy-secret",
+        evidence_collector=evidence_collector,
+        channel_binding=binding,
+        tls_context=server_context,
+    ) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        remote = RemoteMiner(
+            server.base_url,
+            WORKER_HOTKEY,
+            ssl_context=client_context,
+            validator_hotkey=VALIDATOR_HOTKEY,
+            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
+        )
+        evidence = remote.fetch_evidence(os.urandom(32))
+        remote.confirm_channel_binding(evidence)
+
+        with pytest.raises(RemoteError, match="HTTP 401"):
+            remote.confirm_signed_validator_access_required(evidence)
+
+
+def test_signed_access_negative_control_rejects_header_presence_without_verification(
+    monkeypatch,
+):
+    binding = ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, b"t" * 32)
+    evidence = Evidence(
+        kind=EvidenceKind.SEV_SNP,
+        quote=b"quote",
+        nonce=b"n" * 32,
+        miner_hotkey=WORKER_HOTKEY,
+        report_data_version=2,
+        channel_binding=binding,
+    )
+    remote = RemoteMiner(
+        "https://1.1.1.1:8081",
+        WORKER_HOTKEY,
+        validator_hotkey=VALIDATOR_HOTKEY,
+        validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
+    )
+    remote._trusted_binding = binding  # noqa: SLF001 - isolated negative control
+
+    def accepts_any_validator_header(
+        _path,
+        _payload_factory,
+        *,
+        expected_binding,
+        include_auth,
+        include_validator_auth=False,
+        validator_signer_override=None,
+        response_body_limit=None,
+    ):
+        assert expected_binding == binding
+        assert response_body_limit == 1024
+        _ = (include_auth, validator_signer_override)
+        if include_validator_auth:
+            return {"customer_sat": False}, binding
+        raise RemoteError("worker returned HTTP 401", status_code=401)
+
+    monkeypatch.setattr(remote, "_post_tls", accepts_any_validator_header)
+
+    with pytest.raises(RemoteError, match="accepted an invalid validator signature"):
+        remote.confirm_signed_validator_access_required(evidence)
 
 
 def test_signed_remote_uses_singleton_only_for_legacy_fleet_404(tmp_path: Path):
@@ -933,6 +1051,17 @@ def test_signed_remote_never_treats_configured_worker_401_as_singleton(tmp_path:
         )
         evidence = public.fetch_evidence(os.urandom(32))
         public.confirm_channel_binding(evidence)
+        qualified = RemoteMiner(
+            server.base_url,
+            WORKER_HOTKEY,
+            ssl_context=client_context,
+            validator_hotkey=VALIDATOR_HOTKEY,
+            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
+        )
+        qualified_evidence = qualified.fetch_evidence(os.urandom(32))
+        qualified.confirm_channel_binding(qualified_evidence)
+        with pytest.raises(RemoteError, match="accepted an unsigned evidence request"):
+            qualified.confirm_signed_validator_access_required(qualified_evidence)
         unqualified = RemoteMiner(
             server.base_url,
             WORKER_HOTKEY,

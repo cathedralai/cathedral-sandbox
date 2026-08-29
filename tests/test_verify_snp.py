@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import struct
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,7 @@ from cathedral.assurance import ClaimStatus
 from cathedral.common import Policy
 import cathedral.verify.snp as snp_module
 from cathedral.verify.snp import (
+    SnpVerifierUnavailable,
     STRUCTURE_OK_CHAIN_UNVERIFIED,
     VERIFIED,
     REPORT_DATA_OFFSET,
@@ -30,14 +33,21 @@ def _policy_for(report: bytes) -> Policy:
 
 
 def _admissible_fixture() -> bytes:
-    """Normalize the historical snpguest-default VMPL 1 fixture to VMPL 0.
+    """Normalize historical fixture fields outside the reviewed policy.
 
     Diagnostic tests do not vendor-verify this modified fixture. The live
-    hardware suite obtains a fresh, signed VMPL 0 report.
+    hardware suite obtains a fresh, signed report with VMPL 0 and every
+    generation-specific reserved bit clear.
     """
 
     report = bytearray(REPORT.read_bytes())
     struct.pack_into("<I", report, 0x30, 0)
+    struct.pack_into(
+        "<Q",
+        report,
+        0x40,
+        struct.unpack_from("<Q", report, 0x40)[0] & ~(1 << 6),
+    )
     return bytes(report)
 
 
@@ -54,6 +64,38 @@ def test_parses_real_report_data_fixture_byte_for_byte():
     assert parsed.measurement
     assert parsed.chip_id
     assert parsed.tcb.reported > 0
+
+
+def test_public_generation_classifier_is_exact_and_fail_closed():
+    parsed = parse_snp_report(REPORT.read_bytes())
+
+    assert snp_module.snp_generation(parsed) == "turin"
+    assert (
+        snp_module.snp_generation(replace(parsed, cpuid_family=0x19, cpuid_model=0x01)) == "milan"
+    )
+    assert (
+        snp_module.snp_generation(replace(parsed, cpuid_family=0x19, cpuid_model=0x11)) == "genoa"
+    )
+    assert (
+        snp_module.snp_generation(replace(parsed, cpuid_family=0x19, cpuid_model=0xAF)) == "genoa"
+    )
+    assert snp_module.snp_generation(replace(parsed, cpuid_family=0xFF, cpuid_model=0xFF)) is None
+    assert snp_module.snp_generation(object()) is None
+
+
+def test_platform_info_sev_tio_bit_is_allowed_only_in_report_v5():
+    report = bytearray(_admissible_fixture())
+    struct.pack_into("<Q", report, 0x40, 1 << 7)
+    version_five = parse_snp_report(bytes(report))
+    assert snp_module._raw_report_reserved_fields_are_zero(  # noqa: SLF001
+        bytes(report), version_five, "turin"
+    )
+
+    struct.pack_into("<I", report, 0x00, 4)
+    version_four = parse_snp_report(bytes(report))
+    assert not snp_module._raw_report_reserved_fields_are_zero(  # noqa: SLF001
+        bytes(report), version_four, "turin"
+    )
 
 
 def test_rejects_tampered_report_data():
@@ -88,6 +130,83 @@ def test_chain_unavailable_rejects_by_default():
     )
 
     assert verdict is None
+
+
+def test_exit_zero_stub_cannot_impersonate_the_pinned_vendor_verifier(
+    monkeypatch, tmp_path: Path
+) -> None:
+    stub = tmp_path / "snpguest"
+    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o500)
+    report = _admissible_fixture()
+
+    def refuse_subprocess(*_args, **_kwargs):
+        pytest.fail("an unpinned verifier must never execute")
+
+    monkeypatch.setattr(snp_module.subprocess, "run", refuse_subprocess)
+
+    verdict = verify_snp_report_data(
+        report,
+        REQUEST_DATA.read_bytes(),
+        _policy_for(report),
+        snpguest_path=stub,
+    )
+
+    assert verdict is None
+
+
+def test_diagnostic_caller_can_distinguish_unavailable_verifier(tmp_path: Path) -> None:
+    missing = tmp_path / "missing-snpguest"
+    report = _admissible_fixture()
+
+    with pytest.raises(SnpVerifierUnavailable, match="verifier is unavailable"):
+        verify_snp_report_data(
+            report,
+            REQUEST_DATA.read_bytes(),
+            _policy_for(report),
+            snpguest_path=missing,
+            raise_on_verifier_unavailable=True,
+        )
+
+
+def test_pinned_verifier_executes_a_private_copy_not_a_replaced_path(
+    monkeypatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "snpguest"
+    original = b"#!/bin/sh\nexit 7\n"
+    source.write_bytes(original)
+    source.chmod(0o500)
+    monkeypatch.setattr(
+        snp_module,
+        "PINNED_SNPGUEST_SHA256",
+        hashlib.sha256(original).hexdigest(),
+    )
+    observed: dict[str, object] = {}
+
+    def verify_private_copy(_report, *, snpguest_path, certs_dir):
+        replacement = tmp_path / "replacement"
+        replacement.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        replacement.chmod(0o500)
+        replacement.replace(source)
+        executed = Path(snpguest_path)
+        observed["path"] = executed
+        observed["bytes"] = executed.read_bytes()
+        observed["certs_dir"] = certs_dir
+        return True
+
+    monkeypatch.setattr(snp_module, "_verify_chain_with_snpguest", verify_private_copy)
+    report = _admissible_fixture()
+
+    verdict = verify_snp_report_data(
+        report,
+        REQUEST_DATA.read_bytes(),
+        _policy_for(report),
+        snpguest_path=source,
+    )
+
+    assert verdict is not None
+    assert observed["path"] != source
+    assert observed["bytes"] == original
 
 
 def test_chain_unavailable_diagnostic_status_via_opt_in():
@@ -136,6 +255,12 @@ def test_chain_unavailable_diagnostic_status_via_opt_in():
             "<Q", report, 0x08, struct.unpack_from("<Q", report, 0x08)[0] | (1 << 26)
         ),
         lambda report: report.__setitem__(0x41, 1),
+        lambda report: struct.pack_into(
+            "<Q", report, 0x40, struct.unpack_from("<Q", report, 0x40)[0] | (1 << 21)
+        ),
+        lambda report: struct.pack_into(
+            "<Q", report, 0x40, struct.unpack_from("<Q", report, 0x40)[0] | (1 << 6)
+        ),
         lambda report: report.__setitem__(0x4C, 1),
         lambda report: report.__setitem__(0x18B, 1),
         lambda report: report.__setitem__(0x1EB, 1),
@@ -145,7 +270,7 @@ def test_chain_unavailable_diagnostic_status_via_opt_in():
         lambda report: report.__setitem__(0x318, 1),
         lambda report: report.__setitem__(0x330, 1),
         lambda report: report.__setitem__(0x3C, 1),
-        lambda report: report.__setitem__(slice(0x188, 0x18A), bytes([0x19, 0xAF])),
+        lambda report: report.__setitem__(slice(0x188, 0x18A), bytes([0x19, 0xB0])),
         lambda report: report.__setitem__(slice(0x1A0, 0x1E0), b"\x00" * 64),
         lambda report: report.__setitem__(slice(0x90, 0xC0), b"\x00" * 48),
         lambda report: struct.pack_into("<Q", report, 0x180, 0),
@@ -188,6 +313,23 @@ def test_diagnostic_path_accepts_only_reviewed_report_versions(version):
     assert verdict.verification_status == STRUCTURE_OK_CHAIN_UNVERIFIED
 
 
+def test_diagnostic_path_accepts_the_amd_single_socket_guest_policy_bit():
+    report = bytearray(_admissible_fixture())
+    struct.pack_into("<Q", report, 0x08, struct.unpack_from("<Q", report, 0x08)[0] | (1 << 20))
+    encoded = bytes(report)
+
+    verdict = verify_snp_report_data(
+        encoded,
+        REQUEST_DATA.read_bytes(),
+        _policy_for(encoded),
+        snpguest_path="/definitely/not/snpguest",
+        require_chain=False,
+    )
+
+    assert verdict is not None
+    assert verdict.verification_status == STRUCTURE_OK_CHAIN_UNVERIFIED
+
+
 def test_tcb_minimum_is_componentwise_not_packed_integer_order():
     report = bytearray(_admissible_fixture())
     assert report[0x188] == 0x1A  # checked-in fixture uses the Turin TCB layout
@@ -213,7 +355,7 @@ def test_tcb_minimum_is_componentwise_not_packed_integer_order():
     )
 
 
-def test_vendor_verifier_commands_are_bounded_and_use_current_ca_order(monkeypatch, tmp_path):
+def test_vendor_verifier_commands_are_bounded_and_use_current_ca_order(monkeypatch):
     calls: list[tuple[list[str], float | None]] = []
 
     def fake_run(command, **kwargs):
@@ -222,25 +364,27 @@ def test_vendor_verifier_commands_are_bounded_and_use_current_ca_order(monkeypat
 
     monkeypatch.setenv("CATHEDRAL_SNPGUEST_TIMEOUT", "17")
     monkeypatch.setattr(snp_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(snp_module, "_amd_ark_is_pinned", lambda *_args: True)
 
     assert snp_module._verify_chain_with_snpguest(
         _admissible_fixture(),
         snpguest_path="/test/snpguest",
-        certs_dir=tmp_path / "certs",
+        certs_dir=None,
     )
     assert calls
     assert all(timeout == 17.0 for _, timeout in calls)
+    certs_path = calls[0][0][4]
     assert calls[1][0][1:] == [
         "fetch",
         "ca",
         "DER",
-        str(tmp_path / "certs"),
+        certs_path,
         "--report",
         calls[1][0][-1],
     ]
 
 
-def test_invalid_attestation_is_a_terminal_rejection_not_a_kds_retry(monkeypatch, tmp_path):
+def test_invalid_attestation_is_a_terminal_rejection_not_a_kds_retry(monkeypatch):
     calls: list[list[str]] = []
 
     def fake_run(command, **_kwargs):
@@ -250,11 +394,69 @@ def test_invalid_attestation_is_a_terminal_rejection_not_a_kds_retry(monkeypatch
             raise snp_module.subprocess.CalledProcessError(1, encoded)
 
     monkeypatch.setattr(snp_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(snp_module, "_amd_ark_is_pinned", lambda *_args: True)
 
     assert not snp_module._verify_chain_with_snpguest(
         _admissible_fixture(),
         snpguest_path="/test/snpguest",
-        certs_dir=tmp_path / "certs",
+        certs_dir=None,
     )
     assert sum(command[1:3] == ["fetch", "vcek"] for command in calls) == 1
     assert sum(command[1:3] == ["verify", "attestation"] for command in calls) == 2
+
+
+def test_external_certificate_directory_is_refused_before_execution(monkeypatch, tmp_path):
+    called = False
+
+    def fake_run(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(snp_module.subprocess, "run", fake_run)
+
+    assert not snp_module._verify_chain_with_snpguest(
+        _admissible_fixture(),
+        snpguest_path="/test/snpguest",
+        certs_dir=tmp_path / "shared-certs",
+    )
+    assert called is False
+
+
+def test_amd_ark_requires_the_reviewed_generation_spki(monkeypatch, tmp_path):
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    from datetime import UTC, datetime, timedelta
+
+    key = ec.generate_private_key(ec.SECP384R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test-ark")])
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(1)
+        .not_valid_before(datetime.now(UTC) - timedelta(days=1))
+        .not_valid_after(datetime.now(UTC) + timedelta(days=1))
+        .sign(key, hashes.SHA384())
+    )
+    encoded = certificate.public_bytes(serialization.Encoding.DER)
+    spki = key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    certs = tmp_path / "certs"
+    certs.mkdir()
+    ark = certs / "ark.der"
+    ark.write_bytes(encoded)
+    ark.chmod(0o600)
+
+    assert not snp_module._amd_ark_is_pinned(certs, "milan")
+
+    monkeypatch.setitem(
+        snp_module.PINNED_AMD_ARK_SPKI_SHA256,
+        "milan",
+        hashlib.sha256(spki).hexdigest(),
+    )
+    assert snp_module._amd_ark_is_pinned(certs, "milan")

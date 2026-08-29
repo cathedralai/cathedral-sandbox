@@ -47,19 +47,21 @@ from cathedral.common import ChannelBinding, Policy, Tier, issue_nonce
 from cathedral.lanes.sat import SatLane
 from cathedral.remote import RemoteMiner
 from cathedral.verify import verify
-from cathedral.verify.snp import parse_snp_report
+from cathedral.verify.snp import (
+    MAX_SNPGUEST_BYTES,
+    PINNED_SNPGUEST_SHA256,
+    PINNED_SNPGUEST_VERSION,
+    parse_snp_report,
+)
 from cathedral.worker import WorkerServer
 
 
 TRANSCRIPT_SCHEMA = "cathedral_amd_sev_snp_friend_transcript_v1"
 HOTKEY = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 SECOND_HOTKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
-PINNED_SNPGUEST_VERSION = "0.10.0"
-PINNED_SNPGUEST_SHA256 = "70e700465e3523e67dd5104583dc36cd11eef630c6f04c5b9ccafd6ba2e76ca0"
 DEFAULT_SEV_GUEST_DEVICE = Path("/dev/sev-guest")
 PROBE_TIMEOUT_SECONDS = 120.0
 FRIEND_SNPGUEST_TIMEOUT_SECONDS = 15.0
-MAX_SNPGUEST_BYTES = 64 * 1024 * 1024
 
 
 class ProbeError(RuntimeError):

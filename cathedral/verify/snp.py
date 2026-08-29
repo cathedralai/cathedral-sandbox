@@ -7,14 +7,21 @@ hand-rolling vendor crypto. See docs/DESIGN.md §6 and docs/history/HANDOFF.md �
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
+import stat
 import struct
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
+
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
 
 from cathedral.assurance import ClaimStatus, ReasonCategory, attestation_claims
 from cathedral.common import Attested, Evidence, Policy, Tier, evidence_report_data
@@ -29,6 +36,15 @@ CHIP_ID_OFFSET = 0x1A0
 CHIP_ID_SIZE = 64
 SIGNATURE_OFFSET = 0x2A0
 SIGNATURE_SIZE = 512
+PINNED_SNPGUEST_VERSION = "0.10.0"
+PINNED_SNPGUEST_SHA256 = "70e700465e3523e67dd5104583dc36cd11eef630c6f04c5b9ccafd6ba2e76ca0"
+MAX_SNPGUEST_BYTES = 64 * 1024 * 1024
+MAX_AMD_ARK_BYTES = 64 * 1024
+PINNED_AMD_ARK_SPKI_SHA256 = {
+    "milan": "9f056bee44377e29308cb5ffa895bdfb62d18881fa6bed8d6f075b0204089cb9",
+    "genoa": "429a69c9422aa258ee4d8db5fcda9c6470ef15f8cd5a9cebd6cbc7d90b863831",
+    "turin": "4f125410563a2ab9a50356f9243f6fe0b6f73de98603f53f90339c70e9d7ad08",
+}
 
 # Keep the friend self-test profile inside the processor auto-detection contract of
 # the pinned snpguest v0.10.0 verifier. It cannot reliably select the AMD CA for
@@ -48,6 +64,10 @@ _GENERATION_TURIN = "turin"
 
 VERIFIED = "VERIFIED"
 STRUCTURE_OK_CHAIN_UNVERIFIED = "STRUCTURE_OK_CHAIN_UNVERIFIED"
+
+
+class SnpVerifierUnavailable(RuntimeError):
+    """The pinned local verifier or its AMD certificate path was unavailable."""
 
 
 @dataclass(frozen=True)
@@ -134,14 +154,93 @@ def parse_snp_report(report: bytes) -> SnpReport:
     )
 
 
-def _resolve_snpguest(snpguest_path: str | os.PathLike[str] | None) -> str | None:
-    if snpguest_path is not None:
-        path = os.fspath(snpguest_path)
-        return path if Path(path).is_file() and os.access(path, os.X_OK) else None
-    env_path = os.environ.get("CATHEDRAL_SNPGUEST")
-    if env_path:
-        return env_path if Path(env_path).is_file() and os.access(env_path, os.X_OK) else None
-    return shutil.which("snpguest")
+@contextmanager
+def _pinned_snpguest(
+    snpguest_path: str | os.PathLike[str] | None,
+) -> Iterator[str | None]:
+    """Copy one pinned verifier inode, then execute only the private copy.
+
+    Hashing a pathname and later executing the pathname leaves a replacement
+    race. Open the configured inode without following a symlink, copy and hash
+    those bytes into an owner-only directory, and keep that directory alive for
+    the complete vendor-chain check.
+    """
+
+    candidate = (
+        os.fspath(snpguest_path)
+        if snpguest_path is not None
+        else (os.environ.get("CATHEDRAL_SNPGUEST") or shutil.which("snpguest"))
+    )
+    if not candidate:
+        yield None
+        return
+    path = Path(os.path.abspath(candidate))
+    if not hasattr(os, "O_NOFOLLOW"):
+        yield None
+        return
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        source_fd = os.open(path, flags)
+    except OSError:
+        yield None
+        return
+    try:
+        try:
+            metadata = os.fstat(source_fd)
+        except OSError:
+            yield None
+            return
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size <= 0
+            or metadata.st_size > MAX_SNPGUEST_BYTES
+            or not metadata.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or metadata.st_uid not in {0, os.geteuid()}
+        ):
+            yield None
+            return
+        with tempfile.TemporaryDirectory(prefix="cathedral-snpguest-") as td:
+            try:
+                private_dir = Path(td)
+                private_dir.chmod(0o700)
+                private_path = private_dir / "snpguest"
+                output_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                if hasattr(os, "O_CLOEXEC"):
+                    output_flags |= os.O_CLOEXEC
+                output_fd = os.open(private_path, output_flags, 0o500)
+                digest = hashlib.sha256()
+                copied = 0
+                try:
+                    while True:
+                        chunk = os.read(source_fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        copied += len(chunk)
+                        if copied > MAX_SNPGUEST_BYTES:
+                            raise OSError("private verifier copy exceeds its bound")
+                        digest.update(chunk)
+                        view = memoryview(chunk)
+                        while view:
+                            written = os.write(output_fd, view)
+                            if written <= 0:
+                                raise OSError("private verifier copy made no progress")
+                            view = view[written:]
+                    os.fsync(output_fd)
+                finally:
+                    os.close(output_fd)
+                private_path.chmod(0o500)
+            except OSError:
+                yield None
+                return
+            if copied != metadata.st_size or digest.hexdigest() != PINNED_SNPGUEST_SHA256:
+                yield None
+                return
+            yield str(private_path)
+    finally:
+        os.close(source_fd)
 
 
 def _snpguest_timeout() -> float:
@@ -159,11 +258,89 @@ def _snp_generation(parsed: SnpReport) -> str | None:
     if parsed.cpuid_family == 0x19:
         if 0x00 <= parsed.cpuid_model <= 0x0F:
             return _GENERATION_MILAN
-        if 0x10 <= parsed.cpuid_model <= 0x1F or 0xA0 <= parsed.cpuid_model < 0xAF:
+        if 0x10 <= parsed.cpuid_model <= 0x1F or 0xA0 <= parsed.cpuid_model <= 0xAF:
             return _GENERATION_GENOA
     if parsed.cpuid_family == 0x1A and 0x00 <= parsed.cpuid_model <= 0x11:
         return _GENERATION_TURIN
     return None
+
+
+def snp_generation(parsed: SnpReport) -> str | None:
+    """Return the reviewed AMD product generation for a parsed SNP report."""
+
+    if not isinstance(parsed, SnpReport):
+        return None
+    return _snp_generation(parsed)
+
+
+def _read_amd_ark(path: Path) -> bytes | None:
+    if not hasattr(os, "O_NOFOLLOW"):
+        return None
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid not in {0, os.geteuid()}
+            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or not 1 <= before.st_size <= MAX_AMD_ARK_BYTES
+        ):
+            return None
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(16 * 1024, MAX_AMD_ARK_BYTES + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_AMD_ARK_BYTES:
+                return None
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_uid,
+            stat.S_IMODE(after.st_mode),
+        ) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_uid,
+            stat.S_IMODE(before.st_mode),
+        ):
+            return None
+        body = b"".join(chunks)
+        return body if len(body) == before.st_size else None
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def _amd_ark_is_pinned(certs_path: Path, generation: str) -> bool:
+    expected = PINNED_AMD_ARK_SPKI_SHA256.get(generation)
+    encoded = _read_amd_ark(certs_path / "ark.der")
+    if expected is None or encoded is None:
+        return False
+    try:
+        certificate = x509.load_der_x509_certificate(encoded)
+        spki = certificate.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    except (TypeError, ValueError):
+        return False
+    return hashlib.sha256(spki).hexdigest() == expected
 
 
 def _all_zero(report: bytes, start: int, end: int) -> bool:
@@ -185,7 +362,10 @@ def _raw_report_reserved_fields_are_zero(
 
     if parsed.guest_policy & ~((1 << 26) - 1):
         return False
-    if parsed.platform_info & ~0xFF:
+    # AMD assigns bits 0..5. SEV-TIO at bit 7 exists only from report v5.
+    # Bit 6 and every other bit remain reserved until a reviewed ABI update.
+    platform_info_mask = 0xBF if parsed.version == 5 else 0x3F
+    if parsed.platform_info & ~platform_info_mask:
         return False
     if parsed.signer_info & ~0x1F:
         return False
@@ -262,11 +442,16 @@ def _verify_chain_with_snpguest(
 ) -> bool:
     """Ask snpguest to fetch AMD certs and verify the report signature chain."""
 
+    # An external directory lets another process swap ARK/ASK/VCEK pathnames
+    # after the root pin check but before snpguest reopens them. Keep the
+    # argument for fail-closed API compatibility, but never verify from it.
+    if certs_dir is not None:
+        return False
     with tempfile.TemporaryDirectory() as td:
         work = Path(td)
         report_path = work / "attestation-report.bin"
         report_path.write_bytes(report)
-        certs_path = Path(certs_dir) if certs_dir is not None else work / "certs"
+        certs_path = work / "certs"
         certs_path.mkdir(parents=True, exist_ok=True)
 
         timeout = _snpguest_timeout()
@@ -308,6 +493,10 @@ def _verify_chain_with_snpguest(
             if last_error is not None:
                 raise last_error
 
+        generation = _snp_generation(parse_snp_report(report))
+        if generation is None or not _amd_ark_is_pinned(certs_path, generation):
+            return False
+
         try:
             subprocess.run(
                 [snpguest_path, "verify", "certs", str(certs_path)],
@@ -346,6 +535,7 @@ def verify_snp_report_data(
     snpguest_path: str | os.PathLike[str] | None = None,
     certs_dir: str | os.PathLike[str] | None = None,
     require_chain: bool = True,
+    raise_on_verifier_unavailable: bool = False,
 ) -> Attested | None:
     """Verify a raw SNP report against explicit 64-byte REPORT_DATA.
 
@@ -354,6 +544,11 @@ def verify_snp_report_data(
     verdict is ``None``. Diagnostic/shadow tooling that wants the parsed report
     with an explicit ``STRUCTURE_OK_CHAIN_UNVERIFIED`` status can opt in with
     ``require_chain=False`` — that verdict must never be used for admission.
+
+    ``certs_dir`` remains in the compatibility signature but any non-``None``
+    value is refused. Vendor certificates must stay in the verifier's private
+    temporary tree so their pathnames cannot be replaced between root pinning
+    and signature verification.
     """
 
     if len(expected_report_data) != REPORT_DATA_SIZE:
@@ -374,21 +569,27 @@ def verify_snp_report_data(
     ):
         return None
 
-    snpguest = _resolve_snpguest(snpguest_path)
     chain_verified = False
-    if snpguest is not None:
-        for attempt in range(3):
-            try:
-                chain_verified = _verify_chain_with_snpguest(
-                    report,
-                    snpguest_path=snpguest,
-                    certs_dir=certs_dir,
-                )
-                break
-            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                if attempt == 2:
-                    return None
-                time.sleep(1)
+    with _pinned_snpguest(snpguest_path) as snpguest:
+        if snpguest is None and raise_on_verifier_unavailable:
+            raise SnpVerifierUnavailable("pinned SNP verifier is unavailable")
+        if snpguest is not None:
+            for attempt in range(3):
+                try:
+                    chain_verified = _verify_chain_with_snpguest(
+                        report,
+                        snpguest_path=snpguest,
+                        certs_dir=certs_dir,
+                    )
+                    break
+                except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                    if attempt == 2:
+                        if raise_on_verifier_unavailable:
+                            raise SnpVerifierUnavailable(
+                                "AMD certificate or verifier infrastructure is unavailable"
+                            ) from exc
+                        return None
+                    time.sleep(1)
 
     if require_chain and not chain_verified:
         return None
@@ -419,6 +620,7 @@ def verify_snp(
     *,
     snpguest_path: str | os.PathLike[str] | None = None,
     certs_dir: str | os.PathLike[str] | None = None,
+    raise_on_verifier_unavailable: bool = False,
 ) -> Attested | None:
     """Verify SNP evidence using the existing Cathedral nonce/hotkey binding."""
 
@@ -429,4 +631,5 @@ def verify_snp(
         policy,
         snpguest_path=snpguest_path,
         certs_dir=certs_dir,
+        raise_on_verifier_unavailable=raise_on_verifier_unavailable,
     )

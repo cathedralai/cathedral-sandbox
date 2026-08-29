@@ -79,6 +79,7 @@ Deep dive (architecture, deployed-versus-designed status, trust boundary):
    identifiers in any issue, ever.
 
 Full onboarding: [MINING.md](MINING.md) ·
+AMD SEV-SNP development review: [docs/AMD_SEV_SNP_DEVELOPMENT.md](docs/AMD_SEV_SNP_DEVELOPMENT.md) ·
 Audit-miner runbook and dated proof:
 [docs/SN39_AUDIT_MINER_OPERATIONS.md](docs/SN39_AUDIT_MINER_OPERATIONS.md) ·
 Image and trust contract:
@@ -110,7 +111,7 @@ python -m pip install -e '.[dev]'
 python -m pytest -q
 ```
 
-The suite collects 2092 tests, and `tests/test_documented_counts.py` holds that
+The suite collects 2117 tests, and `tests/test_documented_counts.py` holds that
 number to this file, so it cannot quietly drift. Passing proves software
 behavior against test doubles; it does not prove live hardware, deployment, or
 an on-chain write. Details: [docs/TESTING.md](docs/TESTING.md) and the dated
