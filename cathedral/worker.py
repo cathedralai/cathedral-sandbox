@@ -45,6 +45,13 @@ from cathedral.lanes.sat import (
     validate_sat_instance,
 )
 from cathedral.lanes.sat_types import SatInstance
+from cathedral.validator_access import (
+    PreauthorizedValidatorRequest,
+    VALIDATOR_REQUEST_HEADER,
+    ValidatorRequestAuthorizer,
+    ValidatorRequestLimiter,
+    fleet_response,
+)
 
 MAX_REQUEST_BODY: int = 64 * 1024
 MAX_RESPONSE_BODY: int = MAX_EVIDENCE_RESPONSE_BODY
@@ -62,6 +69,7 @@ MAX_RESPONSE_BODY: int = MAX_EVIDENCE_RESPONSE_BODY
 MAX_CONCURRENT: int = 4
 MAX_CHALLENGE_CONCURRENT: int = 2
 MAX_SAT_CHALLENGE_CONCURRENT: int = 2
+MAX_VALIDATOR_CHALLENGE_CONCURRENT: int = 2
 MAX_HOTKEY_LENGTH: int = 256
 MAX_BEARER_TOKEN_LENGTH: int = 4096
 MAX_CUSTOMER_SAT_SOLVE_SECONDS: float = 30.0
@@ -73,6 +81,9 @@ _EVIDENCE_V2_REQUEST_KEYS = _EVIDENCE_REQUEST_KEYS | frozenset(
 )
 _SAT_REQUEST_KEYS = frozenset({"challenge_id", "assigned_hotkey", "instance", "seed"})
 _CREDENTIAL_FREE_PATHS = frozenset({"/v1/evidence", "/v1/sat-work"})
+_POST_PATHS = frozenset(
+    {"/v1/evidence", "/v1/capabilities", "/v1/sat-work", "/v1/fleet"}
+)
 _CAPABILITIES_REQUEST_KEYS: frozenset[str] = frozenset()
 _INSTANCE_KEYS = frozenset({"n_vars", "clauses"})
 _DECIMAL_RE = re.compile(r"[0-9]+")
@@ -267,6 +278,7 @@ def _make_handler(
     semaphore: threading.Semaphore,
     challenge_semaphore: threading.Semaphore,
     sat_challenge_semaphore: threading.Semaphore,
+    validator_challenge_semaphore: threading.Semaphore,
     configured_hotkey: str,
     bearer_token: str | None,
     evidence_collector: Callable[..., Evidence | tuple[Evidence, ...] | list[Evidence]],
@@ -275,6 +287,11 @@ def _make_handler(
     max_response_body: int,
     request_timeout: float,
     allow_noncanonical_sat: bool,
+    validator_authorizer: ValidatorRequestAuthorizer | None,
+    fleet_endpoints: tuple[str, ...] | None,
+    allow_public_bootstrap_evidence: bool,
+    allow_public_legacy_audit: bool,
+    validator_request_limiter: ValidatorRequestLimiter | None,
 ) -> type[BaseHTTPRequestHandler]:
     class _Handler(BaseHTTPRequestHandler):
         def setup(self) -> None:
@@ -321,6 +338,24 @@ def _make_handler(
                 return False
             return hmac.compare_digest(header, expected)
 
+        def _validator_request_header(self) -> str | None:
+            values = self.headers.get_all(VALIDATOR_REQUEST_HEADER, failobj=[])
+            if len(values) != 1:
+                return None
+            return values[0]
+
+        def _preauthorize_validator(self, path: str) -> PreauthorizedValidatorRequest | None:
+            if validator_authorizer is None:
+                return None
+            header = self._validator_request_header()
+            if header is None:
+                return None
+            return validator_authorizer.preauthorize(
+                header,
+                method="POST",
+                path=path,
+            )
+
         def _read_body(self) -> tuple[bytes | None, int, str]:
             if self.headers.get("Transfer-Encoding") is not None:
                 return None, 400, "invalid request framing"
@@ -343,6 +378,16 @@ def _make_handler(
 
         def do_POST(self) -> None:
             path = self.path.partition("?")[0]
+            # Header presence is not authentication. Reject unknown routes
+            # before it can influence pool selection or trigger a body read,
+            # otherwise a fake validator header could occupy the small signed
+            # challenge pool while withholding an irrelevant request body.
+            if path not in _POST_PATHS:
+                self._send_json(404, {"error": "not found"})
+                return
+            if path == "/v1/fleet" and validator_authorizer is None:
+                self._send_json(404, {"error": "fleet discovery unavailable"})
+                return
             # Fresh evidence is deliberately credential-free: the validator
             # holds no bearer token for a worker it has not attested yet, and
             # work credentials are issued only after the attested channel is
@@ -357,15 +402,71 @@ def _make_handler(
             # work credential to present.  The gate cannot tell canonical from
             # customer work until the body has been parsed, so the bearer for
             # a noncanonical instance is enforced in _handle_sat_work instead.
-            credential_free = path in _CREDENTIAL_FREE_PATHS
+            legacy_public = validator_authorizer is None and path in _CREDENTIAL_FREE_PATHS
+            public_bootstrap = (
+                path == "/v1/evidence"
+                and validator_authorizer is not None
+                and (allow_public_bootstrap_evidence or allow_public_legacy_audit)
+            )
+            public_legacy_sat = (
+                path == "/v1/sat-work"
+                and validator_authorizer is not None
+                and allow_public_legacy_audit
+            )
+            credential_free = legacy_public or public_bootstrap or public_legacy_sat
             # Evidence never inspects Authorization. SAT does, only so a valid
             # bearer can take the work pool; a junk header is unauthenticated
             # rather than a TypeError before the request try block.
-            auth_ok = False if path == "/v1/evidence" else self._check_auth()
-            if not credential_free and not auth_ok:
+            if path in {"/v1/evidence", "/v1/fleet"}:
+                auth_ok = False
+            elif validator_authorizer is not None and bearer_token is None:
+                # In signed-access mode, an intentionally absent migration
+                # bearer means "signature required", not "authentication
+                # disabled". Preserve the legacy no-authorizer semantics.
+                auth_ok = False
+            else:
+                auth_ok = self._check_auth()
+            signed_candidate = (
+                validator_authorizer is not None and self._validator_request_header() is not None
+            )
+            signed_only = path == "/v1/fleet"
+            if signed_only and not signed_candidate:
                 self._send_json(401, {"error": "unauthorized"})
                 return
+            if not signed_only and not credential_free and not auth_ok and not signed_candidate:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            signed_required = validator_authorizer is not None and (
+                signed_candidate
+                or path == "/v1/fleet"
+                or (
+                    path in {"/v1/sat-work", "/v1/capabilities"}
+                    and not auth_ok
+                    and not public_legacy_sat
+                )
+                or (
+                    path == "/v1/evidence"
+                    and not allow_public_bootstrap_evidence
+                    and not allow_public_legacy_audit
+                )
+            )
+            validator_lease = None
             try:
+                preauthorized_validator = None
+                if signed_required:
+                    preauthorized_validator = self._preauthorize_validator(path)
+                    if preauthorized_validator is None:
+                        self._send_json(401, {"error": "unauthorized"})
+                        return
+                    if validator_request_limiter is None:
+                        self._send_json(503, {"error": "validator limiter unavailable"})
+                        return
+                    validator_lease = validator_request_limiter.acquire(
+                        preauthorized_validator.validator_hotkey
+                    )
+                    if validator_lease is None:
+                        self._send_json(429, {"error": "validator rate limit exceeded"})
+                        return
                 # A SAT POST with a configured, valid bearer is customer work
                 # (or a validator that already holds the credential). It uses
                 # the authenticated pool so public evidence/audit cannot 503
@@ -378,11 +479,18 @@ def _make_handler(
                 # the evidence pool would let public SAT traffic 503 a
                 # validator's quote collection, and a validator that cannot
                 # collect a quote scores the miner zero.
-                if path == "/v1/sat-work" and bearer_token is not None and auth_ok:
+                if preauthorized_validator is not None:
+                    # Signed validator control traffic has reserved
+                    # request-class capacity after headers are parsed and the
+                    # envelope is authenticated. The earlier connection gate
+                    # is shared by every TLS client and must be protected at
+                    # the network edge in a production deployment.
+                    pool = validator_challenge_semaphore
+                elif path == "/v1/sat-work" and bearer_token is not None and auth_ok:
                     pool = semaphore
                 elif path == "/v1/sat-work":
                     pool = sat_challenge_semaphore
-                elif credential_free:
+                elif credential_free or signed_candidate or path == "/v1/fleet":
                     pool = challenge_semaphore
                 else:
                     pool = semaphore
@@ -399,6 +507,17 @@ def _make_handler(
                     if raw is None:
                         self._send_json(error_code, {"error": error_message})
                         return
+                    if preauthorized_validator is not None:
+                        assert validator_authorizer is not None
+                        if (
+                            validator_authorizer.finalize(
+                                preauthorized_validator,
+                                body=raw,
+                            )
+                            is None
+                        ):
+                            self._send_json(401, {"error": "unauthorized"})
+                            return
                     self._handle_post(raw)
                 finally:
                     pool.release()
@@ -412,6 +531,9 @@ def _make_handler(
                     self._send_json(500, {"error": "internal error"})
                 except OSError:
                     pass
+            finally:
+                if validator_lease is not None:
+                    validator_lease.release()
 
         def _handle_post(self, raw: bytes) -> None:
             try:
@@ -433,6 +555,13 @@ def _make_handler(
                     self._send_json(200, {"customer_sat": allow_noncanonical_sat})
             elif path == "/v1/sat-work":
                 self._handle_sat_work(body)
+            elif path == "/v1/fleet":
+                if set(body):
+                    self._send_json(400, {"error": "invalid fleet schema"})
+                elif fleet_endpoints is None:
+                    self._send_json(404, {"error": "fleet discovery unavailable"})
+                else:
+                    self._send_json(200, fleet_response(configured_hotkey, fleet_endpoints))
             else:
                 self._send_json(404, {"error": "not found"})
 
@@ -590,7 +719,10 @@ def _make_handler(
             # The gate let this path through unauthenticated so the public
             # canonical audit works; anything else is customer work and must
             # present the bearer before a solver is entered.
-            if not canonical and not self._check_auth():
+            if not canonical and (
+                (validator_authorizer is not None and bearer_token is None)
+                or not self._check_auth()
+            ):
                 self._send_json(401, {"error": "unauthorized"})
                 return
             if not allow_noncanonical_sat and not canonical:
@@ -769,11 +901,13 @@ class WorkerServer:
     Customer-submitted SAT is an explicit authenticated deployment mode.
 
     Unauthenticated ``/v1/evidence`` and canonical ``/v1/sat-work`` run on
-    their own pool so public traffic cannot occupy authenticated slots. A
-    SAT POST that already carries the configured bearer uses the work pool.
+    their own pools. Verified validator requests have another reserved pool
+    after headers are parsed and authenticated, so the explicit public
+    migration bridge cannot consume signed request-class capacity. A SAT POST
+    that already carries the configured bearer uses the work pool.
     Noncanonical SAT still requires that bearer before any solver runs. A
-    fourth gate caps every connection before a request handler thread starts,
-    and each request-class gate is acquired before its body is read.
+    shared final gate caps every connection before a request handler thread
+    starts, and each request-class gate is acquired before its body is read.
     """
 
     def __init__(
@@ -798,6 +932,14 @@ class WorkerServer:
         timeout: float = 10.0,
         allow_noncanonical_sat: bool = False,
         allow_non_loopback_for_development: bool = False,
+        validator_authorizer: ValidatorRequestAuthorizer | None = None,
+        fleet_endpoints: tuple[str, ...] | None = None,
+        allow_public_bootstrap_evidence: bool = False,
+        allow_public_legacy_audit: bool = False,
+        validator_max_concurrent: int = 1,
+        validator_requests_per_window: int = 120,
+        validator_rate_window_seconds: float = 60.0,
+        max_validator_challenge_concurrent: int = MAX_VALIDATOR_CHALLENGE_CONCURRENT,
     ) -> None:
         try:
             loopback = ipaddress.ip_address(host).is_loopback
@@ -829,13 +971,25 @@ class WorkerServer:
             ("max_concurrent", max_concurrent),
             ("max_challenge_concurrent", max_challenge_concurrent),
             ("max_sat_challenge_concurrent", max_sat_challenge_concurrent),
+            (
+                "max_validator_challenge_concurrent",
+                max_validator_challenge_concurrent,
+            ),
             ("max_response_body", max_response_body),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        validator_class_capacity = (
+            max_validator_challenge_concurrent
+            if validator_authorizer is not None
+            else 0
+        )
         if max_connection_concurrent is None:
             max_connection_concurrent = (
-                max_concurrent + max_challenge_concurrent + max_sat_challenge_concurrent
+                max_concurrent
+                + max_challenge_concurrent
+                + max_sat_challenge_concurrent
+                + validator_class_capacity
             )
         if (
             isinstance(max_connection_concurrent, bool)
@@ -843,7 +997,12 @@ class WorkerServer:
             or max_connection_concurrent <= 0
         ):
             raise ValueError("max_connection_concurrent must be a positive integer")
-        class_capacity = max_concurrent + max_challenge_concurrent + max_sat_challenge_concurrent
+        class_capacity = (
+            max_concurrent
+            + max_challenge_concurrent
+            + max_sat_challenge_concurrent
+            + validator_class_capacity
+        )
         if max_connection_concurrent < class_capacity:
             raise ValueError("max_connection_concurrent must cover all request-class capacity")
         if (
@@ -869,14 +1028,55 @@ class WorkerServer:
             raise ValueError("tls_context must be an SSLContext")
         if tls_context is not None and channel_binding is None:
             raise ValueError("TLS worker requires its configured channel binding")
+        if not isinstance(allow_public_bootstrap_evidence, bool):
+            raise ValueError("allow_public_bootstrap_evidence must be a boolean")
+        if not isinstance(allow_public_legacy_audit, bool):
+            raise ValueError("allow_public_legacy_audit must be a boolean")
+        if validator_authorizer is None:
+            if fleet_endpoints is not None:
+                raise ValueError("fleet discovery requires signed validator access")
+            if allow_public_bootstrap_evidence:
+                raise ValueError("public bootstrap compatibility requires signed validator access")
+            if allow_public_legacy_audit:
+                raise ValueError(
+                    "public legacy audit compatibility requires signed validator access"
+                )
+        else:
+            if not isinstance(validator_authorizer, ValidatorRequestAuthorizer):
+                raise ValueError("validator_authorizer must be a ValidatorRequestAuthorizer")
+            if tls_context is None:
+                raise ValueError("signed validator access requires native worker TLS")
+            if channel_binding is None or validator_authorizer.channel_binding != channel_binding:
+                raise ValueError("validator access must bind the worker TLS key")
+            if validator_authorizer.worker_hotkey != configured_hotkey:
+                raise ValueError("validator access must bind the configured worker hotkey")
+            if (
+                not isinstance(fleet_endpoints, tuple)
+                or not fleet_endpoints
+                or any(not isinstance(endpoint, str) for endpoint in fleet_endpoints)
+            ):
+                raise ValueError("signed validator access requires bounded fleet candidates")
 
         semaphore = threading.Semaphore(max_concurrent)
         challenge_semaphore = threading.Semaphore(max_challenge_concurrent)
         sat_challenge_semaphore = threading.Semaphore(max_sat_challenge_concurrent)
+        validator_challenge_semaphore = threading.Semaphore(
+            max_validator_challenge_concurrent
+        )
+        validator_request_limiter = (
+            None
+            if validator_authorizer is None
+            else ValidatorRequestLimiter(
+                max_concurrent=validator_max_concurrent,
+                requests_per_window=validator_requests_per_window,
+                window_seconds=validator_rate_window_seconds,
+            )
+        )
         handler = _make_handler(
             semaphore,
             challenge_semaphore,
             sat_challenge_semaphore,
+            validator_challenge_semaphore,
             configured_hotkey,
             bearer_token,
             evidence_collector or collect_tdx,
@@ -885,6 +1085,11 @@ class WorkerServer:
             max_response_body,
             float(timeout),
             allow_noncanonical_sat,
+            validator_authorizer,
+            fleet_endpoints,
+            allow_public_bootstrap_evidence,
+            allow_public_legacy_audit,
+            validator_request_limiter,
         )
         self._server = _BoundedThreadingHTTPServer(
             (host, port),

@@ -91,6 +91,16 @@ from cathedral.evidence import (
     MAX_WORK_RESULT_ARTIFACT_BYTES,
     VERIFY_AGGREGATE_BUDGET_BYTES,
 )
+from cathedral.validator_access import (
+    DEFAULT_SNAPSHOT_MAX_AGE_SECONDS,
+    SignedValidatorSnapshotProvider,
+    ValidatorAccessState,
+    ValidatorRequestAuthorizer,
+    load_fleet_manifest,
+    load_sr25519_verifier,
+    preflight_sr25519_verifier,
+    singleton_fleet,
+)
 from cathedral.gpu import (
     GpuIdentityRegistry,
     gpu_profile_from_registry,
@@ -1194,6 +1204,33 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
     except ValueError:
         is_loopback = args.host == "localhost"
     development_no_auth = bool(getattr(args, "development_no_auth", False))
+    access_snapshot_path = getattr(args, "validator_access_snapshot", None)
+    access_keys_path = getattr(args, "validator_access_keys", None)
+    access_keys_digest = getattr(args, "validator_access_keys_digest", None)
+    access_state_path = getattr(args, "validator_access_state", None)
+    minimum_validator_stake_rao = getattr(args, "validator_minimum_stake_rao", None)
+    public_endpoint = getattr(args, "public_endpoint", None)
+    fleet_manifest_path = getattr(args, "fleet_manifest", None)
+    allow_public_bootstrap = bool(getattr(args, "allow_public_bootstrap_evidence", False))
+    allow_public_legacy_audit = bool(getattr(args, "allow_public_legacy_audit", False))
+    access_values = (
+        access_snapshot_path,
+        access_keys_path,
+        access_keys_digest,
+        access_state_path,
+        minimum_validator_stake_rao,
+        public_endpoint,
+    )
+    access_enabled = any(value is not None for value in access_values) or (
+        fleet_manifest_path is not None or allow_public_bootstrap or allow_public_legacy_audit
+    )
+    if access_enabled and any(value is None for value in access_values):
+        raise ValueError(
+            "signed validator access requires snapshot, pinned keys, durable state, "
+            "minimum stake, and public endpoint"
+        )
+    if development_no_auth and access_enabled:
+        raise ValueError("signed validator access cannot use development-no-auth")
     # The locality guard keys off AUTHENTICATION, not TLS.
     #
     # It used to be `not tls_enabled`, so supplying a certificate satisfied it and
@@ -1230,7 +1267,9 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         if not isinstance(bearer_env, str) or not bearer_env:
             raise ValueError("worker bearer environment variable name is required")
         token = os.environ.get(bearer_env)
-        if not _valid_bearer_token(token):
+        if token is not None and not _valid_bearer_token(token):
+            raise ValueError(f"worker bearer token must be valid in {bearer_env}")
+        if token is None and not access_enabled:
             raise ValueError(f"worker bearer token must be set in {bearer_env}")
     binding_type = getattr(args, "channel_binding_type", None)
     binding_digest = getattr(args, "channel_binding_digest", None)
@@ -1290,6 +1329,55 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         raise ValueError("customer SAT cannot use the development non-loopback HTTP bind")
     if allow_customer_sat and getattr(args, "gpu_composite", False):
         raise ValueError("customer SAT is available only on the CPU worker path")
+    validator_authorizer = None
+    fleet_endpoints = None
+    if access_enabled:
+        if tls_context is None or channel_binding is None:
+            raise ValueError("signed validator access requires worker TLS")
+        assert isinstance(access_snapshot_path, str)
+        assert isinstance(access_keys_path, str)
+        assert isinstance(access_keys_digest, str)
+        assert isinstance(access_state_path, str)
+        assert isinstance(minimum_validator_stake_rao, int)
+        assert isinstance(public_endpoint, str)
+        keys = load_policy_keys(
+            access_keys_path,
+            production_mode=True,
+            pinned_digest=access_keys_digest,
+        )
+        access_state = ValidatorAccessState(access_state_path)
+        provider = SignedValidatorSnapshotProvider(
+            access_snapshot_path,
+            keys,
+            network=getattr(args, "validator_network", DEFAULT_ENROLL_NETWORK),
+            netuid=getattr(args, "validator_netuid", DEFAULT_ENROLL_NETUID),
+            minimum_stake_rao=minimum_validator_stake_rao,
+            state=access_state,
+            max_age_seconds=getattr(
+                args,
+                "validator_access_max_age_seconds",
+                DEFAULT_SNAPSHOT_MAX_AGE_SECONDS,
+            ),
+        )
+        if provider.load(now=datetime.datetime.now(datetime.UTC)) is None:
+            raise ValueError("validator access snapshot is absent, stale, or invalid")
+        verifier = load_sr25519_verifier()
+        preflight_sr25519_verifier(verifier)
+        validator_authorizer = ValidatorRequestAuthorizer(
+            provider,
+            worker_hotkey=args.hotkey,
+            channel_binding=channel_binding,
+            state=access_state,
+            signature_verifier=verifier,
+        )
+        if fleet_manifest_path is None:
+            fleet_endpoints = singleton_fleet(public_endpoint=public_endpoint)
+        else:
+            fleet_endpoints = load_fleet_manifest(
+                fleet_manifest_path,
+                worker_hotkey=args.hotkey,
+                public_endpoint=public_endpoint,
+            )
     # Select the CPU TEE evidence collector. Default stays TDX so existing
     # deployments are unchanged; --tee snp serves AMD SEV-SNP evidence, and
     # --gpu-composite (TDX+GPU) is TDX-only by construction.
@@ -1312,6 +1400,10 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         evidence_collector=evidence_collector,
         allow_noncanonical_sat=allow_customer_sat,
         allow_non_loopback_for_development=args.development_allow_non_loopback,
+        validator_authorizer=validator_authorizer,
+        fleet_endpoints=fleet_endpoints,
+        allow_public_bootstrap_evidence=allow_public_bootstrap,
+        allow_public_legacy_audit=allow_public_legacy_audit,
     ) as server:
         print(
             json.dumps(
@@ -1320,6 +1412,8 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
                     "port": server.port,
                     "hotkey": args.hotkey,
                     "tls": tls_context is not None,
+                    "signed_validator_access": validator_authorizer is not None,
+                    "fleet_candidates": 0 if fleet_endpoints is None else len(fleet_endpoints),
                 }
             )
         )
@@ -3950,6 +4044,55 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument(
         "--channel-binding-digest",
         help="32-byte channel public-key digest as 64 lowercase hex characters",
+    )
+    p_serve.add_argument(
+        "--validator-access-snapshot",
+        help="atomically rotated signed finalized validator-qualification snapshot",
+    )
+    p_serve.add_argument(
+        "--validator-access-keys",
+        help="trusted Ed25519 public keys for the validator snapshot",
+    )
+    p_serve.add_argument(
+        "--validator-access-keys-digest",
+        help="required sha256 pin for the trusted validator-access key file",
+    )
+    p_serve.add_argument(
+        "--validator-access-state",
+        help="owner-only persistent SQLite replay and snapshot high-water state",
+    )
+    p_serve.add_argument(
+        "--validator-minimum-stake-rao",
+        type=int,
+        help="operator-configured validator stake floor in exact Rao",
+    )
+    p_serve.add_argument(
+        "--validator-access-max-age-seconds",
+        type=int,
+        default=DEFAULT_SNAPSHOT_MAX_AGE_SECONDS,
+    )
+    p_serve.add_argument("--validator-network", default=DEFAULT_ENROLL_NETWORK)
+    p_serve.add_argument("--validator-netuid", type=int, default=DEFAULT_ENROLL_NETUID)
+    p_serve.add_argument(
+        "--public-endpoint",
+        help="this worker's canonical public HTTPS axon origin",
+    )
+    p_serve.add_argument(
+        "--fleet-manifest",
+        help="optional owner-controlled list of additional machine candidates",
+    )
+    p_serve.add_argument(
+        "--allow-public-bootstrap-evidence",
+        action="store_true",
+        help="migration only: leave evidence public while fleet, work, and capabilities stay signed",
+    )
+    p_serve.add_argument(
+        "--allow-public-legacy-audit",
+        action="store_true",
+        help=(
+            "migration only: leave evidence and canonical audit SAT public; "
+            "customer SAT stays bearer-gated"
+        ),
     )
     p_serve.set_defaults(func=cmd_worker_serve)
 

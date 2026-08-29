@@ -24,39 +24,55 @@ The digest had a successful anonymous pull and build-provenance verification.
 The digest remains an operator-enforced supply-chain pin. It is not included in
 TDX MRTD or an RTMR automatically.
 
-## Identity invariant
+## One-UID bounded fleet invariant
 
-One hotkey has one SN39 UID, one active enrollment identity, and one canonical
-axon endpoint at a time. Re-enrolling or announcing a successor endpoint updates
-that identity. It does not create another independently listed miner.
+One hotkey has one SN39 UID and one canonical chain axon. Under the signed fleet
+contract, that attested axon is the bootstrap candidate and returns up to 32
+controlled endpoint candidates for the same UID. Additional machines do not
+need more hotkeys, registrations, UIDs, axon announcements, or independent
+weight rows.
 
-Do not run two machines as separate supply behind one hotkey. A second axon
-announcement for the same hotkey replaces the endpoint validators resolve for
-the existing UID. The two machines do not receive separate UID mappings, proof
-records, or weights.
+Every counted machine must independently pass fresh vendor evidence, policy,
+hotkey binding, same-SPKI work, and stable hardware-identity checks. Counted
+machines need distinct endpoints, distinct attested TLS SPKIs, and distinct
+attested hardware identities. Repeating one machine at several IPs produces
+one machine of verified compute. Copying one TLS private key between machines
+also fails the distinct-compute gate. Generate each TLS key inside its own
+guest.
 
-A second independently listed and scored machine requires all of the following:
+A UID advertises at most 32 endpoints. Fleet overflow zeros the UID and is
+never truncated. Each verified machine receives one canonical SAT per scoring
+window, capped at 20 raw work units. `raw_uid_units` is the sum across distinct
+verified machines and is capped at 640 raw units per UID per window.
 
-1. a second hotkey whose private material stays outside both guests;
-2. separate acceptance and SN39 registration, producing a second UID;
-3. a separate active enrollment and axon endpoint;
-4. fresh QVL and same-SPKI SAT proof for that endpoint; and
-5. an explicit validator preview that names both UIDs and the intended weights.
+A verified duplicate endpoint, stable hardware identity, or TLS SPKI and
+channel identity zeros every verified claimant in that collision. The
+validator never chooses a winner. An unverified manifest claim does not poison
+a verified claim. Declared machine count, vCPU, RAM, capacity, idle uptime, and
+attestation alone earn zero. Every counted machine needs fresh evidence,
+assigned-hotkey binding, QVL-derived stable hardware identity, TLS SPKI
+binding, global uniqueness, and replayed canonical SAT.
 
-The current UID30 launch command is a consumed one-shot. It pins one miner and
-the exact vector `[124]`, `[65535]`. It cannot be reused or widened for a second
-target. Two weighted miners require a separately reviewed multi-target policy
-and writer plus a new chain submission after the weight cooldown.
+The public miner hotkey value is the same UID identity across the fleet. Its
+private material stays outside every guest. Never copy a miner or validator
+private key into an audit guest.
 
-The current axon announcement authorization is also specific to UID124 and its
-one reviewed successor has been consumed. A second hotkey requires a separately
-reviewed announcement policy and tool. Do not reuse the UID124 journal or treat
-its finalized successor as authorization for another endpoint.
+This policy is implemented in the general worker source, not in the reviewed
+audit image named above. The current image has no signed snapshot, fleet route,
+durable replay state, or sr25519 request verifier. Do not attach a second
+machine to the live UID30 path until the separate measured-image and validator
+activation gates in [WORK_REQUEST_V2.md](WORK_REQUEST_V2.md) complete.
 
-Never copy one hotkey's private key into either audit guest. Each container gets
-only its own public `CATHEDRAL_MINER_HOTKEY` value.
+Intel TDX is the only multi-machine class eligible for scoring. AMD SEV-SNP
+serving and channel binding remain supported in source. AMD multi-machine
+scoring is `NOT_PROVEN` and disabled until a friend-owned hardware test proves
+stable `CHIP_ID` uniqueness and deduplication across distinct machines.
 
-## Launch sequence
+## Historical single-machine launch sequence
+
+The following sequence records the bounded 2026-08-28 UID124 proof. It is not a
+current authorization to register another UID, announce another axon, submit
+another weight row, or attach a fleet endpoint.
 
 1. Confirm the hotkey is accepted. If it is already registered, confirm it maps
    to exactly one finalized SN39 UID owned by the intended coldkey. If it is not
@@ -87,6 +103,13 @@ only its own public `CATHEDRAL_MINER_HOTKEY` value.
 A container restart creates a new TLS key and SPKI. An endpoint change creates a
 new axon claim. Either event requires fresh evidence and SAT verification before
 more work or another weight decision.
+
+The one-shot UID30 launch command and axon authorization used by this sequence
+are consumed historical controls. They pinned UID124 and the exact vector
+`[124]`, `[65535]`. Do not reuse or widen their journals for fleet activation.
+The future fleet keeps one UID and one chain axon. It requires a new reviewed
+image, signed discovery configuration, validator scoring preview, and live
+two-machine proof instead of a second registration.
 
 ## 2026-08-28 bounded proof
 
@@ -122,7 +145,13 @@ ambiguous. Treat each of these as `FAIL` or `NOT_PROVEN`, not as a retry signal:
 - QVL, measurement policy, nonce binding, hotkey binding, or same-SPKI SAT fails;
 - the endpoint differs from the reviewed preview;
 - the chain call outcome or finalized readback is ambiguous;
-- a second machine reuses the first machine's hotkey or UID; or
+- two fleet candidates reuse an endpoint, attested TLS SPKI, or stable hardware
+  identity;
+- the fleet advertises more than 32 endpoints;
+- a TLS private key is copied between machines;
+- AMD SEV-SNP is included in multi-machine scoring before stable `CHIP_ID`
+  uniqueness is proven on friend-owned hardware;
+- the signed-access measured image or validator activation gates remain open; or
 - the intended weight vector, burn outcome, runtime bound, or spend bound is not
   explicit.
 

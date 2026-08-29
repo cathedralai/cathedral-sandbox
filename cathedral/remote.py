@@ -6,6 +6,7 @@ import http.client
 import io
 import json
 import math
+import secrets
 import socket
 import ssl
 import string
@@ -13,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
 from cathedral.channel import ChannelBindingError, tls_spki_binding
@@ -29,6 +31,13 @@ from cathedral.common import (
 )
 from cathedral.lanes.sat import validate_sat_work_item
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
+from cathedral.validator_access import (
+    VALIDATOR_REQUEST_HEADER,
+    WORKER_FLEET_SCHEMA,
+    RequestSigner,
+    build_validator_request_header,
+    validate_public_worker_endpoint,
+)
 
 MAX_RESPONSE_BODY: int = MAX_CPU_EVIDENCE_RESPONSE_BODY
 MAX_SAT_RESPONSE_BODY: int = 64 * 1024
@@ -46,11 +55,16 @@ _SAT_RESPONSE_KEYS = frozenset(
     {"satisfiable", "assignment", "work_units", "challenge_id", "assigned_hotkey"}
 )
 _CAPABILITIES_RESPONSE_KEYS = frozenset({"customer_sat"})
+_FLEET_RESPONSE_KEYS = frozenset({"schema", "worker_hotkey", "endpoints"})
 _HEX_DIGITS = frozenset(string.hexdigits)
 
 
 class RemoteError(Exception):
     """A bounded, caller-safe failure returned by :class:`RemoteMiner`."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class _RejectRedirects(urllib.request.HTTPRedirectHandler):
@@ -148,6 +162,10 @@ class RemoteMiner:
         max_response_body: int = MAX_RESPONSE_BODY,
         allow_insecure_http: bool = False,
         ssl_context: ssl.SSLContext | None = None,
+        validator_hotkey: str | None = None,
+        validator_signer: RequestSigner | None = None,
+        validator_network: str = "finney",
+        validator_netuid: int = 39,
     ) -> None:
         if not isinstance(hotkey, str) or not hotkey or len(hotkey) > MAX_HOTKEY_LENGTH:
             raise ValueError("hotkey must be a non-empty bounded string")
@@ -184,6 +202,10 @@ class RemoteMiner:
             ssl_context.verify_mode != ssl.CERT_REQUIRED or not ssl_context.check_hostname
         ):
             raise ValueError("ssl_context must verify certificates and hostnames")
+        if (validator_hotkey is None) != (validator_signer is None):
+            raise ValueError("validator hotkey and signer must be configured together")
+        if validator_signer is not None and parsed.scheme != "https":
+            raise ValueError("signed validator access requires HTTPS")
 
         self._endpoint = endpoint.rstrip("/")
         self._scheme = parsed.scheme
@@ -196,6 +218,10 @@ class RemoteMiner:
         self._ssl_context = ssl_context
         self._pending_binding: ChannelBinding | None = None
         self._trusted_binding: ChannelBinding | None = None
+        self._validator_hotkey = validator_hotkey
+        self._validator_signer = validator_signer
+        self._validator_network = validator_network
+        self._validator_netuid = validator_netuid
 
     @property
     def uid(self) -> str:
@@ -235,6 +261,7 @@ class RemoteMiner:
                 },
                 expected_binding=None,
                 include_auth=False,
+                include_validator_auth=True,
             )
         else:
             response = self._post_http(
@@ -321,6 +348,7 @@ class RemoteMiner:
                 lambda _binding: payload,
                 expected_binding=self._trusted_binding,
                 include_auth=True,
+                include_validator_auth=True,
                 response_body_limit=MAX_SAT_RESPONSE_BODY,
             )
         else:
@@ -373,6 +401,7 @@ class RemoteMiner:
                 lambda _binding: {},
                 expected_binding=self._trusted_binding,
                 include_auth=True,
+                include_validator_auth=True,
                 response_body_limit=1024,
             )
         else:
@@ -387,6 +416,48 @@ class RemoteMiner:
         if not isinstance(supported, bool):
             raise RemoteError("capabilities response has invalid customer_sat flag")
         return supported
+
+    def fetch_fleet(self) -> tuple[str, ...]:
+        """Discover bounded candidates only after the bootstrap channel is attested."""
+
+        if self._scheme != "https" or self._trusted_binding is None:
+            raise RemoteError("attested channel binding is required before fleet discovery")
+        if self._validator_signer is None or self._validator_hotkey is None:
+            raise RemoteError("signed validator identity is required for fleet discovery")
+        try:
+            response, _ = self._post_tls(
+                "/v1/fleet",
+                lambda _binding: {},
+                expected_binding=self._trusted_binding,
+                include_auth=False,
+                include_validator_auth=True,
+                response_body_limit=16 * 1024,
+            )
+        except RemoteError as exc:
+            if exc.status_code == 404:
+                return (self._endpoint,)
+            raise
+        _check_exact_keys(response, _FLEET_RESPONSE_KEYS, "fleet response")
+        if response["schema"] != WORKER_FLEET_SCHEMA:
+            raise RemoteError("fleet response schema is unsupported")
+        if response["worker_hotkey"] != self._hotkey:
+            raise RemoteError("fleet response hotkey mismatch")
+        endpoints = response["endpoints"]
+        if not isinstance(endpoints, list) or not endpoints or len(endpoints) > 32:
+            raise RemoteError("fleet response endpoints are invalid")
+        try:
+            validated = tuple(validate_public_worker_endpoint(endpoint) for endpoint in endpoints)
+        except ValueError:
+            raise RemoteError("fleet response endpoints are invalid") from None
+        if len(set(validated)) != len(validated):
+            raise RemoteError("fleet response contains duplicate endpoints")
+        try:
+            primary = validate_public_worker_endpoint(self._endpoint)
+        except ValueError:
+            raise RemoteError("chain axon endpoint is not a canonical public origin") from None
+        if validated[0] != primary:
+            raise RemoteError("fleet response must keep the attested chain axon first")
+        return validated
 
     def _post_http(
         self,
@@ -426,7 +497,7 @@ class RemoteMiner:
         except urllib.error.HTTPError as exc:
             if 300 <= exc.code < 400:
                 raise RemoteError("worker redirect rejected") from None
-            raise RemoteError(f"worker returned HTTP {exc.code}") from None
+            raise RemoteError(f"worker returned HTTP {exc.code}", status_code=exc.code) from None
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, (socket.timeout, TimeoutError)):
                 raise RemoteError("worker request timed out") from None
@@ -453,6 +524,7 @@ class RemoteMiner:
         *,
         expected_binding: ChannelBinding | None,
         include_auth: bool,
+        include_validator_auth: bool = False,
         response_body_limit: int | None = None,
     ) -> tuple[dict[str, Any], ChannelBinding]:
         response_body_limit = min(
@@ -485,6 +557,23 @@ class RemoteMiner:
             headers = {"Content-Type": "application/json"}
             if include_auth and self._bearer_token:
                 headers["Authorization"] = f"Bearer {self._bearer_token}"
+            if include_validator_auth and self._validator_signer is not None:
+                assert self._validator_hotkey is not None
+                issued_at = datetime.now(UTC).replace(microsecond=0)
+                headers[VALIDATOR_REQUEST_HEADER] = build_validator_request_header(
+                    validator_hotkey=self._validator_hotkey,
+                    worker_hotkey=self._hotkey,
+                    network=self._validator_network,
+                    netuid=self._validator_netuid,
+                    method="POST",
+                    path=path,
+                    body=body,
+                    channel_binding=observed,
+                    nonce=secrets.token_bytes(32),
+                    issued_at=issued_at,
+                    expires_at=issued_at + timedelta(seconds=60),
+                    signer=self._validator_signer,
+                )
             connection.sock.settimeout(_remaining_request_seconds(deadline))
             connection.request("POST", path, body=body, headers=headers)
             connection.sock.settimeout(_remaining_request_seconds(deadline))
@@ -492,7 +581,9 @@ class RemoteMiner:
             if 300 <= response.status < 400:
                 raise RemoteError("worker redirect rejected")
             if response.status < 200 or response.status >= 300:
-                raise RemoteError(f"worker returned HTTP {response.status}")
+                raise RemoteError(
+                    f"worker returned HTTP {response.status}", status_code=response.status
+                )
             raw = _read_response(response, response_body_limit)
         except RemoteError:
             raise
