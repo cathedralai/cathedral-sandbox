@@ -145,14 +145,14 @@ endpoints, distinct attested TLS SPKIs, and distinct attested hardware
 identities. Repeating one machine at several IPs, or copying one TLS private key
 between machines, does not create additional verified compute.
 
-This multi-machine path is implemented in the general worker and signed-fleet
-image source. It is not active in the published legacy image. The image change
-pins the sr25519 verifier and fixes permit-only access, config, state, host-edge,
-and container contracts. It still needs review, merge, immutable publication,
-provenance, anonymous pull, and a two-machine proof. Live multi-machine scoring
-stays Intel TDX-only. AMD SEV-SNP serving remains supported, but SNP fleet
-scoring stays disabled until the friend-owned hardware test proves stable
-`CHIP_ID` deduplication.
+This multi-machine path is implemented in the general worker and the published
+signed-fleet activation image. The image pins the sr25519 verifier and fixes
+permit-only access, config, state, host-edge, and container contracts. Review,
+merge, immutable publication, provenance, and anonymous inspection are complete.
+The two-machine live proof is not complete. Live multi-machine scoring stays
+Intel TDX-only. AMD SEV-SNP serving remains supported, but SNP fleet scoring
+stays disabled until the friend-owned hardware test proves stable `CHIP_ID`
+deduplication.
 
 ## 1. Request a beta slot
 

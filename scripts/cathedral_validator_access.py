@@ -38,6 +38,7 @@ from cathedral.validator_access import (  # noqa: E402
 )
 
 _KEY_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+_UID_HOTKEY_RE = re.compile(r"^(0|[1-9][0-9]{0,4})=([1-9A-HJ-NP-Za-km-z]{32,128})$")
 
 
 def _now() -> datetime:
@@ -305,6 +306,28 @@ def build_snapshot_document(
 def cmd_capture(args: argparse.Namespace) -> int:
     seed = _read_signing_seed(args.signing_key_file)
     block, block_hash, neurons = _finalized_neurons(args.network, args.netuid)
+    required_rows: dict[int, str] = {}
+    for value in args.require_uid_hotkey:
+        match = _UID_HOTKEY_RE.fullmatch(value)
+        if match is None:
+            raise SystemExit("required UID mapping must use canonical UID=HOTKEY syntax")
+        uid = int(match.group(1))
+        hotkey = match.group(2)
+        if uid > 65_535:
+            raise SystemExit("required UID mapping is outside the u16 range")
+        bittensor_account_id(hotkey)
+        if uid in required_rows and required_rows[uid] != hotkey:
+            raise SystemExit("required UID mapping repeats a UID with another hotkey")
+        required_rows[uid] = hotkey
+    for uid, hotkey in required_rows.items():
+        matches = [
+            neuron
+            for neuron in neurons
+            if type(getattr(neuron, "uid", None)) is int
+            and getattr(neuron, "uid") == uid
+        ]
+        if len(matches) != 1 or getattr(matches[0], "hotkey", None) != hotkey:
+            raise SystemExit(f"required finalized UID mapping changed: {uid}={hotkey}")
     generated_at = _now()
     unsigned = build_snapshot_document(
         neurons,
@@ -398,6 +421,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SNAPSHOT_MAX_AGE_SECONDS,
     )
     capture.add_argument("--require-hotkey", action="append", default=[])
+    capture.add_argument("--require-uid-hotkey", action="append", default=[])
     capture.set_defaults(func=cmd_capture)
 
     verify = sub.add_parser("verify", help="verify a deployed snapshot and pinned keys")
