@@ -119,7 +119,12 @@ self-reported volume alone.
 ## Current limits
 
 - Intel TDX CPU is the only active provider hardware class.
-- AMD SEV-SNP and NVIDIA confidential-GPU scoring are not enabled.
+- AMD SEV-SNP collection, verification, and protected-channel binding are
+  implemented with a bounded report-version 3 through 5 friend-owned hardware
+  test. Production runtime admission, receipts, managed provisioning, and
+  scoring remain disabled. See
+  [the friend test](docs/AMD_SEV_SNP_FRIEND_TEST.md).
+- NVIDIA confidential-GPU scoring is not enabled.
 - Enrollment and secret exchange are operator-assisted.
 - A supported mainnet worker must use the reviewed HTTPS and channel-binding
   design. The development plain-HTTP flag is not a production path.

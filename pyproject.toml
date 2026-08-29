@@ -37,6 +37,7 @@ cathedral-prober = "cathedral.prober:main"
 # subnet validator's public command name reserved for cathedral-scaffold.
 cathedral-compute-validator = "cathedral.neuron.validator:main"
 cathedral-miner = "cathedral.neuron.miner:main"
+cathedral-snp-friend-probe = "cathedral.snp_friend_probe:main"
 
 [build-system]
 requires = ["hatchling"]
