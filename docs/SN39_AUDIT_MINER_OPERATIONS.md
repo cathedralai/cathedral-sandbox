@@ -4,6 +4,8 @@ This page is the canonical operator runbook for the fixed SN39 audit-miner
 image. It covers the independent UID30 path only. General provider onboarding
 stays in [MINING.md](../MINING.md), and the image build and trust contract stays
 in [SN39_AUDIT_MINER_IMAGE.md](SN39_AUDIT_MINER_IMAGE.md).
+The fixed two-guest metadata delivery and publisher procedure is in
+[SN39_GCP_SIGNED_FLEET_DELIVERY.md](SN39_GCP_SIGNED_FLEET_DELIVERY.md).
 
 The signed-fleet image source accepts a public hotkey, public axon endpoint,
 and public-key-file digest. It serves fresh Intel TDX evidence, signed fleet
@@ -13,30 +15,26 @@ submission happen outside the guest.
 
 ## Current reviewed pin
 
-The bounded 2026-08-28 proof used:
+The reviewed activation pin published from merged `main` on 2026-08-29 is:
 
 ```text
-Source merge: 4d9c263f2329a0d5f577f864410025fbd260baec
-Image: ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:b7ca9ff7a24f933a7f04ec4b31f3d1ac5cf6937b1ccc5b3adcc2fdc7f12a3c76
+Source merge: 8ad7f6e127ad7dcc4dd150f0e1eb47ce72c5ab22
+Image: ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:61a1806fce13d987323e7c418f1260ba1cd8c9ace8e5b9f9be3c193bdba7228a
 Platform: linux/amd64
 Listener: native TLS on TCP 8081
 ```
 
-The digest had a successful anonymous pull and build-provenance verification.
+The digest passed anonymous manifest inspection and build-provenance verification.
 The digest remains an operator-enforced supply-chain pin. It is not included in
 TDX MRTD or an RTMR automatically.
 
-This is a legacy-runtime proof digest. It does not contain the locked sr25519
-wheel or the fixed signed-fleet entrypoint and mounts. Do not promote it as the
-activation image. The signed-fleet image source must pass review, merge,
-immutable publication, provenance, anonymous pull, exact runtime-label check,
-and host-edge exercise before it gets a reviewed activation pin in this
-section.
-
-The signed-fleet startup script intentionally rejects this legacy digest. A
-first-activation rollback therefore needs a separately captured and exercised
-legacy runtime restore, not a digest substitution in the new script. That
-restore is currently `NOT_PROVEN`, so it remains an activation stop condition.
+Publication is not deployment or live proof. The first-activation rollback was
+captured and exercised on 2026-08-29 using the preserved legacy image. A bounded
+TDX guest booted, the pinned QVL passed, the TLS SPKI remained bound through
+canonical SAT, and the worker returned 20 SAT units. The sanitized evidence is
+[SN39_UID124_LEGACY_ROLLBACK_PROOF_20260829.json](SN39_UID124_LEGACY_ROLLBACK_PROOF_20260829.json).
+This closes the rollback gate for this activation. It does not prove a future
+restore until the same procedure is repeated.
 
 ## One-UID bounded fleet invariant
 
@@ -71,11 +69,10 @@ The public miner hotkey value is the same UID identity across the fleet. Its
 private material stays outside every guest. Never copy a miner or validator
 private key into an audit guest.
 
-This policy is implemented in the general worker and signed-fleet image source,
-not in the reviewed legacy digest named above. Do not attach a second machine
-to the live UID30 path until the image and validator changes merge, a new
-digest passes publication and edge gates, and the remaining activation gates
-in [WORK_REQUEST_V2.md](WORK_REQUEST_V2.md) complete.
+This policy is implemented in the general worker and the published signed-fleet
+activation image. Do not attach a second machine to the live UID30 path until
+the two-machine edge proof and the remaining activation gates in
+[WORK_REQUEST_V2.md](WORK_REQUEST_V2.md) complete.
 
 Intel TDX is the only multi-machine class eligible for scoring. AMD SEV-SNP
 serving and channel binding remain supported in source. AMD multi-machine
