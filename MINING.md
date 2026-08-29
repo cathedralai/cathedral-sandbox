@@ -51,13 +51,15 @@ cathedral worker serve \
   --channel-binding-digest "$TLS_SPKI_SHA256"
 ```
 
-The validator requests attestation over TLS, verifies the quote binds your
-channel, then sends work and its bearer credential. Credit is proportional to
+The validator authenticates the evidence request with either its signed
+validator identity or the worker bearer over verified TLS. It verifies the
+quote binds that channel before it sends work. Credit is proportional to
 verified work.
 
 See [docs/TDX_LAUNCH.md](docs/TDX_LAUNCH.md) for the full verifier contract and
-the five `CATHEDRAL_TDX_VERIFY_*` variables, and
-[docs/GPU_ATTESTATION.md](docs/GPU_ATTESTATION.md) for the GPU-composite path.
+the five `CATHEDRAL_TDX_VERIFY_*` variables. The GPU-composite path in
+[docs/GPU_ATTESTATION.md](docs/GPU_ATTESTATION.md) is a development audit
+preview, not a production miner path.
 
 ### Develop without TDX hardware
 
@@ -320,14 +322,15 @@ wallet private key.
 For a same-machine smoke test, bind only to loopback:
 
 ```bash
-sudo "$PWD/.venv/bin/cathedral" worker serve \
+sudo "$PWD/.venv/bin/cathedral" worker develop \
   --hotkey "$HOTKEY_ADDRESS" \
   --host 127.0.0.1 \
   --port 8081 \
   --development-no-auth
 ```
 
-`--development-no-auth` is required for this test. Without it the worker
+The separate `worker develop` command and `--development-no-auth` flag are
+required for this test. Without the flag the development worker
 refuses to start unless a channel binding is configured, and a plain loopback
 smoke test has no TLS identity to bind to. Use the flag only here, never on a
 worker anything else can reach.
@@ -344,19 +347,18 @@ curl -fsS http://127.0.0.1:8081/v1/evidence \
   | python3 -c 'import json,sys; r=json.load(sys.stdin); print("kind:", r["kind"]); print("quote bytes:", len(bytes.fromhex(r["quote_hex"]))); print("hotkey:", r["assigned_hotkey"])'
 ```
 
-On the current fixed audit image, that request carries no credential because
-`/v1/evidence` is the public bootstrap path. This is deliberate: the reviewed
-UID30 collector holds no token before attestation. The future signed-access
-profile authenticates evidence with the validator hotkey by default. Its
-explicit legacy-audit migration flag temporarily preserves this public request.
+The loopback development command above carries no credential because
+`--development-no-auth` is explicit. The current published UID30 audit image
+also keeps this request public through its fixed legacy flag. Replacement
+source moves that bridge to the separate `public-legacy-audit` migration mode,
+but no replacement image digest is published yet. Normal `worker serve`
+authenticates evidence with a bearer or signed validator request.
 
-The worker bounds that public path itself. Evidence requests draw on their own
-two-slot pool, the credential-free canonical SAT audit draws on a second
-two-slot pool, and neither can occupy the four slots reserved for
-authenticated work. The two public pools are separate from each other on
-purpose: classifying a SAT request as canonical requires parsing the
-caller-supplied instance first, so public SAT traffic must not be able to
-exhaust the slots a validator needs to collect a quote.
+The worker bounds public development and migration paths. Evidence requests
+draw on their own two-slot pool, public canonical SAT draws on a second
+two-slot pool, and neither can occupy the four slots reserved for authenticated
+work. The two public pools are separate from each other because classifying a
+SAT request as canonical requires parsing the caller-supplied instance first.
 
 Admission happens before any request-body read. A partial body therefore holds
 one finite class slot rather than creating an unbounded set of reader threads.
@@ -391,8 +393,9 @@ In summary:
 - Cathedral never sees a plaintext work request;
 - Cathedral pins the TLS SPKI digest;
 - the fresh quote binds that digest with the challenge and public hotkey;
+- bearer-only validators send the bearer only over certificate-verified TLS;
 - the validator verifies the quote, reconnects, and rechecks the same SPKI
-  before sending a bearer credential or work; and
+  before sending work; and
 - the firewall admits only the approved validator addresses.
 
 Two shapes are supported. Both keep the TLS private key inside the measured
@@ -428,9 +431,10 @@ bearer token from `CATHEDRAL_WORKER_BEARER_TOKEN`.
 The TLS private key must terminate inside the measured environment. A
 certificate on an external load balancer does not establish this claim.
 
-Do not use `--development-allow-non-loopback` for a mainnet worker. That flag
-serves authenticated work over plain HTTP and cannot satisfy the production
-channel claim.
+The production `worker serve` parser does not expose the non-loopback
+development escape. `--development-allow-non-loopback` exists only under
+`worker develop`, serves authenticated work over plain HTTP, and cannot satisfy
+the production channel claim.
 
 Run the accepted command under a restricted supervisor such as systemd. Do not
 leave a long-lived worker attached to an ordinary SSH session.

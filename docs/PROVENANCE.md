@@ -21,12 +21,11 @@ evidence — and exactly what each outcome means.
 > described a v1 vector advertising `verified_gpu_allocation` with no
 > `external_scores.latest_body_sha256`, which is no longer what is deployed.
 >
-> A validator pinned to `validated_supply_v1` accepts v2 evidence
-> (`MECHANISM_ACCEPTED` in the validator scaffold), and the burn contract is
-> always looked up from the operator's own pinned mechanism rather than from
-> the id a manifest claims, so widening acceptance cannot move the burn. New
-> evidence is emitted as v2; v1 is retired only once no live validator pins it
-> and no historical release needs reproducing.
+> New evidence and the current verifier default to `validated_supply_v2`.
+> `validated_supply_v1` remains registered only for explicit historical
+> verification. Never omit `--mechanism validated_supply_v1` when replaying a
+> v1 bundle. The verifier dispatches on the exact manifest pair and refuses a
+> mismatch before recomputation.
 
 ## Reproduction contract
 
@@ -87,7 +86,7 @@ serves. If the release notes do not publish every required pin, stop with
    Cathedral artifacts are never an oracle: an omitted registered hotkey
    or a fabricated anchor fails closed before any replay.
 6. The recomputed vector under the exact frozen mechanism pair
-   `(validated_supply_v1, revision=1)` — the manifest carries both halves
+   `(validated_supply_v2, revision=1)` — the manifest carries both halves
    and verification dispatches on the pair, refusing any other id or
    revision BEFORE recomputation and before any fence reservation
    (units-proportional shares; the fixed 10% burn floor is applied at
@@ -102,8 +101,9 @@ serves. If the release notes do not publish every required pin, stop with
 | `NOT_PROVEN` (`receipts_only`) | Signed chain internally consistent; the epoch was not FULLY replayed: missing controlled package, missing oracle, a zero-positive epoch, or ANY independently anchored candidate carrying a non-verified outcome (`rejected` or `retired`) — those labels are Cathedral-signed assertions and the launch artifact model publishes no independently replayable negative evidence. A departed hotkey is absent from the independent anchored candidate universe; relabelling it does not prove absence. | Never |
 | `FAIL` | A signature, binding, bound, freshness, equivocation, replay, or malformed/inconsistent-evidence check failed (including outcome/receipt inconsistency and reservation conflicts) | Never — fail closed |
 
-Exit code 0 requires `PASS` at `assurance=full` (or the explicit
-`--allow-receipts-only` acknowledgement, which still records NOT_PROVEN).
+Production exit code 0 requires `PASS` at `assurance=full`.
+`--allow-receipts-only` changes the exit code only outside `--production` and
+still records `NOT_PROVEN`.
 The durable anti-rollback fences are reserved atomically BEFORE the
 terminal `PROVENANCE_RESULT` event is emitted and before the audit file
 reports acceptance: a reservation conflict aborts the run with a terminal
@@ -129,7 +129,7 @@ at a time.
 
 `compare_with_vector` reports agreement ONLY when the signed subnet vector
 is bound to the verified evidence epoch, never from matching proportions
-alone. The REAL `validated_supply_v1` wire contract (read from
+alone. The current `validated_supply_v2` wire contract (read from
 `scaffold/publisher/weights.py` and `scaffold/validator_thin.py` in the
 subnet repo) is enforced in full: pre-burn rows (base 0, weight ==
 external, positive supply summing to 1.0), `burn_snapshot == {burn_uid:

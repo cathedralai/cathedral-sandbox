@@ -21,6 +21,7 @@ from cathedral.cli import (
     DEFAULT_WORKER_BEARER_ENV,
     _build_runtime,
     _dict_to_item,
+    _emit_runtime_startup_posture,
     _item_to_dict,
     _load_gpu_identity_key,
     _load_policy,
@@ -42,7 +43,7 @@ from cathedral.gpu import (
 )
 from cathedral.attest import collect_snp
 from cathedral.ledger import Ledger, LedgerError
-from cathedral.runtime import MinerOutcome
+from cathedral.runtime import MinerOutcome, RuntimeConfig
 from cathedral.worker import WorkerServer
 
 
@@ -51,7 +52,8 @@ def test_compute_package_does_not_claim_subnet_validator_command():
     scripts = pyproject["project"]["scripts"]
 
     assert "cathedral-validator" not in scripts
-    assert scripts["cathedral-compute-validator"] == "cathedral.neuron.validator:main"
+    assert "cathedral-compute-validator" not in scripts
+    assert "cathedral-miner" not in scripts
 
 
 def _tls_material(tmp_path: Path) -> tuple[Path, Path]:
@@ -358,7 +360,7 @@ def test_runtime_run_epoch_is_dry_by_default_and_publish_is_explicit():
         "runtime", "run-epoch",
         "--registry-db", "registry.sqlite",
         "--ledger-db", "ledger.sqlite",
-        "--measurements-file", "measurements.json",
+        "--policy-registry", "policy.json",
         "--canary-hotkey", "canary",
         "--canary-endpoint", "https://8.8.8.8",
         "--source-epoch", "9",
@@ -367,11 +369,11 @@ def test_runtime_run_epoch_is_dry_by_default_and_publish_is_explicit():
     assert parser.parse_args([*common, "--publish"]).publish is True
 
 
-def test_runtime_cpu_tee_defaults_to_tdx_and_accepts_snp() -> None:
+def test_runtime_cpu_tee_is_fixed_in_production_and_selectable_in_development() -> None:
     parser = build_parser()
     common = [
         "runtime",
-        "audit-attestation",
+        "develop-audit-attestation",
         "--registry-db",
         "registry.sqlite",
         "--ledger-db",
@@ -386,43 +388,154 @@ def test_runtime_cpu_tee_defaults_to_tdx_and_accepts_snp() -> None:
 
     assert parser.parse_args(common).cpu_tee == "tdx"
     assert parser.parse_args([*common, "--cpu-tee", "snp"]).cpu_tee == "snp"
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "runtime",
+                "audit-attestation",
+                "--registry-db",
+                "registry.sqlite",
+                "--ledger-db",
+                "ledger.sqlite",
+                "--policy-registry",
+                "policy.json",
+                "--canary-hotkey",
+                "canary",
+                "--canary-endpoint",
+                "https://127.0.0.1:8081",
+                "--cpu-tee",
+                "snp",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--development", None),
+        ("--cpu-tee", "snp"),
+        ("--measurements-file", "measurements.json"),
+        ("--gpu-profile-id", "tdx-h100-v1"),
+    ],
+)
+def test_production_runtime_parser_has_no_development_or_gpu_flags(
+    flag: str,
+    value: str | None,
+) -> None:
+    argv = [
+        "runtime",
+        "audit-attestation",
+        "--registry-db",
+        "registry.sqlite",
+        "--ledger-db",
+        "ledger.sqlite",
+        "--policy-registry",
+        "policy.json",
+        "--canary-hotkey",
+        "canary",
+        "--canary-endpoint",
+        "https://8.8.8.8",
+        flag,
+    ]
+    if value is not None:
+        argv.append(value)
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(argv)
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--publisher-endpoint", "https://publisher.example"),
+        ("--receipt-signing-key-id", "receipt-1"),
+        ("--publish", None),
+    ],
+)
+def test_development_runtime_parser_has_no_write_or_receipt_flags(
+    flag: str,
+    value: str | None,
+) -> None:
+    argv = [
+        "runtime",
+        "develop-canary",
+        "--registry-db",
+        "registry.sqlite",
+        "--ledger-db",
+        "ledger.sqlite",
+        "--measurements-file",
+        "measurements.json",
+        "--canary-hotkey",
+        "canary",
+        "--canary-endpoint",
+        "https://127.0.0.1:8081",
+        flag,
+    ]
+    if value is not None:
+        argv.append(value)
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(argv)
+
+
+def test_runtime_effective_startup_config_redacts_values_and_paths(capsys) -> None:
+    secret_path = "/private/operator/receipt-super-secret.seed"
+    secret_endpoint = "https://bearer-secret@publisher.example/v1"
+    args = argparse.Namespace(
+        runtime_command="audit-attestation",
+        runtime_posture="production",
+        policy_registry="/private/operator/policy.json",
+        receipt_signing_key_id="receipt-key-secret-label",
+        receipt_signing_key_file=secret_path,
+        publisher_endpoint=secret_endpoint,
+        tokens_file="/private/operator/tokens.json",
+    )
+    _emit_runtime_startup_posture(
+        args,
+        argparse.Namespace(config=RuntimeConfig()),
+    )
+    rendered = capsys.readouterr().err
+    document = json.loads(rendered)
+    assert document["schema"] == "cathedral_effective_startup_v1"
+    assert document["posture"] == "production"
+    assert document["receipt_issuer_configured"] is True
+    assert document["publisher_configured"] is True
+    assert secret_path not in rendered
+    assert secret_endpoint not in rendered
+    assert "/private/operator" not in rendered
+    assert "receipt-key-secret-label" not in rendered
 
 
 def test_runtime_snp_requires_development_before_file_io() -> None:
     args = _production_admission_args(Path("/nonexistent"))
     args.cpu_tee = "snp"
 
-    with pytest.raises(ValueError, match="requires --development"):
+    with pytest.raises(ValueError, match="development runtime commands"):
         _build_runtime(args, require_policy=True)
 
 
-def test_runtime_snp_refuses_epoch_creation_before_file_io() -> None:
+def test_runtime_epoch_command_refuses_development_snp_flags_at_parse_time() -> None:
     parser = build_parser()
-    args = parser.parse_args(
-        [
-            "runtime",
-            "run-epoch",
-            "--registry-db",
-            "registry.sqlite",
-            "--ledger-db",
-            "ledger.sqlite",
-            "--measurements-file",
-            "missing.json",
-            "--canary-hotkey",
-            "canary",
-            "--canary-endpoint",
-            "https://127.0.0.1:8081",
-            "--source-epoch",
-            "1",
-            "--development",
-            "--cpu-tee",
-            "snp",
-            "--publish",
-        ]
-    )
-
-    with pytest.raises(ValueError, match="only for development canary"):
-        _build_runtime(args, require_policy=True)
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "runtime",
+                "run-epoch",
+                "--registry-db",
+                "registry.sqlite",
+                "--ledger-db",
+                "ledger.sqlite",
+                "--policy-registry",
+                "missing.json",
+                "--canary-hotkey",
+                "canary",
+                "--canary-endpoint",
+                "https://127.0.0.1:8081",
+                "--source-epoch",
+                "1",
+                "--development",
+                "--cpu-tee",
+                "snp",
+            ]
+        )
 
 
 def test_production_run_epoch_requires_explicit_score_audience_before_io():
@@ -509,7 +622,22 @@ def test_non_production_admission_needs_no_receipt_issuer(tmp_path: Path):
     Dev and testnet runtimes legitimately run without an issuer, so the gate
     must key on production_mode rather than simply requiring the flags.
     """
-    args = _production_admission_args(tmp_path, "--development")
+    args = build_parser().parse_args(
+        [
+            "runtime",
+            "develop-audit-attestation",
+            "--registry-db",
+            str(tmp_path / "registry.sqlite"),
+            "--ledger-db",
+            str(tmp_path / "ledger.sqlite"),
+            "--measurements-file",
+            str(tmp_path / "measurements.json"),
+            "--canary-hotkey",
+            "canary",
+            "--canary-endpoint",
+            "https://127.0.0.1:8081",
+        ]
+    )
     with pytest.raises(Exception) as excinfo:
         _build_runtime(args, require_policy=True)
     assert "assurance receipt issuer" not in str(excinfo.value)
@@ -523,45 +651,36 @@ def test_runtime_restart_commands_only_require_ledger_path():
 def test_production_runtime_rejects_legacy_measurements_file(tmp_path: Path):
     measurements = tmp_path / "measurements.json"
     measurements.write_text(json.dumps(["measurement"]))
-    args = build_parser().parse_args(
-        [
-            "runtime",
-            "audit-attestation",
-            "--registry-db",
-            str(tmp_path / "registry.sqlite"),
-            "--ledger-db",
-            str(tmp_path / "ledger.sqlite"),
-            "--measurements-file",
-            str(measurements),
-            "--canary-hotkey",
-            "canary",
-            "--canary-endpoint",
-            "https://8.8.8.8",
-            # Production admission now requires a receipt issuer, refused on
-            # arguments before any file is read. Supplied so this test still
-            # reaches the legacy-measurements rejection it is about; neither
-            # file is opened before that check fires.
-            "--receipt-signing-key-id",
-            "receipt-test-1",
-            "--receipt-signing-key-file",
-            str(tmp_path / "receipt.key"),
-        ]
-    )
-    with pytest.raises(ValueError, match="development-only"):
-        _build_runtime(args, require_policy=True)
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "runtime",
+                "audit-attestation",
+                "--registry-db",
+                str(tmp_path / "registry.sqlite"),
+                "--ledger-db",
+                str(tmp_path / "ledger.sqlite"),
+                "--measurements-file",
+                str(measurements),
+                "--canary-hotkey",
+                "canary",
+                "--canary-endpoint",
+                "https://8.8.8.8",
+            ]
+        )
 
 
 def test_gpu_runtime_and_worker_flags_are_explicit_and_complete(tmp_path: Path):
     parser = build_parser()
     worker = parser.parse_args(
-        ["worker", "serve", "--hotkey", "worker", "--gpu-composite"]
+        ["worker", "develop", "--hotkey", "worker", "--gpu-composite"]
     )
     assert worker.gpu_composite is True
 
     runtime = parser.parse_args(
         [
             "runtime",
-            "audit-attestation",
+            "develop-audit-attestation",
             "--registry-db",
             "registry.sqlite",
             "--ledger-db",
@@ -584,6 +703,30 @@ def test_gpu_runtime_and_worker_flags_are_explicit_and_complete(tmp_path: Path):
     )
     assert runtime.gpu_profile_id == "tdx-h100-v1"
     assert runtime.gpu_identity_db == "gpu-identities.sqlite"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["worker", "serve", "--hotkey", "worker", "--gpu-composite"]
+        )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "runtime",
+                "audit-attestation",
+                "--registry-db",
+                "registry.sqlite",
+                "--ledger-db",
+                "ledger.sqlite",
+                "--policy-registry",
+                "policy.json",
+                "--gpu-profile-id",
+                "tdx-h100-v1",
+                "--canary-hotkey",
+                "canary",
+                "--canary-endpoint",
+                "https://8.8.8.8",
+            ]
+        )
 
 
 def test_gpu_audit_json_keeps_component_record_and_stable_failure_category():
@@ -640,6 +783,8 @@ def test_gpu_runtime_configuration_rejects_partial_identity_settings():
     with pytest.raises(ValueError, match="required together"):
         _build_runtime(
             argparse.Namespace(
+                runtime_posture="development",
+                development=True,
                 gpu_profile_id="tdx-h100-v1",
                 gpu_identity_db=None,
                 gpu_identity_key_file=None,
@@ -969,6 +1114,63 @@ def test_worker_serve_defaults_to_loopback():
     assert args.fleet_manifest is None
     assert args.allow_public_bootstrap_evidence is False
     assert args.allow_public_legacy_audit is False
+    assert args.worker_posture == "production"
+    assert args.tee == "tdx"
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--development-no-auth", None),
+        ("--development-allow-non-loopback", None),
+        ("--tee", "snp"),
+        ("--gpu-composite", None),
+        ("--allow-public-bootstrap-evidence", None),
+        ("--allow-public-legacy-audit", None),
+        ("--migration-mode", "public-legacy-audit"),
+    ],
+)
+def test_production_worker_parser_has_no_development_or_migration_flags(
+    flag: str,
+    value: str | None,
+) -> None:
+    argv = ["worker", "serve", "--hotkey", "miner", flag]
+    if value is not None:
+        argv.append(value)
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(argv)
+
+
+def test_worker_migration_requires_mode_and_complete_signed_access() -> None:
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["worker", "migrate", "--hotkey", "miner"])
+    args = parser.parse_args(
+        [
+            "worker",
+            "migrate",
+            "--hotkey",
+            "miner",
+            "--migration-mode",
+            "public-bootstrap-evidence",
+        ]
+    )
+    with pytest.raises(ValueError, match="snapshot, pinned keys, durable state"):
+        cmd_worker_serve(args)
+
+
+def test_development_worker_parser_has_no_migration_mode() -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "worker",
+                "develop",
+                "--hotkey",
+                "miner",
+                "--migration-mode",
+                "public-bootstrap-evidence",
+            ]
+        )
 
 
 def test_worker_signed_access_requires_complete_configuration():
@@ -992,7 +1194,7 @@ def test_public_snp_worker_refuses_bearer_only_before_serving(monkeypatch):
     args = build_parser().parse_args(
         [
             "worker",
-            "serve",
+            "develop",
             "--hotkey",
             "miner",
             "--host",
@@ -1008,20 +1210,18 @@ def test_public_snp_worker_refuses_bearer_only_before_serving(monkeypatch):
 
 
 def test_snp_worker_refuses_public_evidence_compatibility_mode_before_file_io():
-    args = build_parser().parse_args(
-        [
-            "worker",
-            "serve",
-            "--hotkey",
-            "miner",
-            "--tee",
-            "snp",
-            "--allow-public-bootstrap-evidence",
-        ]
-    )
-
-    with pytest.raises(ValueError, match="cannot use public compatibility modes"):
-        cmd_worker_serve(args)
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "worker",
+                "develop",
+                "--hotkey",
+                "miner",
+                "--tee",
+                "snp",
+                "--allow-public-bootstrap-evidence",
+            ]
+        )
 
 
 def test_worker_signed_access_requires_native_tls():
@@ -1102,7 +1302,7 @@ def test_worker_signed_access_starts_without_bearer_and_wires_legacy_bridge(
     args = build_parser().parse_args(
         [
             "worker",
-            "serve",
+            "migrate",
             "--hotkey",
             "miner",
             "--host",
@@ -1123,7 +1323,8 @@ def test_worker_signed_access_starts_without_bearer_and_wires_legacy_bridge(
             "1000",
             "--public-endpoint",
             "https://8.8.8.8:8081",
-            "--allow-public-legacy-audit",
+            "--migration-mode",
+            "public-legacy-audit",
         ]
     )
 
@@ -1135,6 +1336,7 @@ def test_worker_signed_access_starts_without_bearer_and_wires_legacy_bridge(
 
 def test_worker_serve_refuses_non_loopback_without_development_flag():
     args = argparse.Namespace(
+        worker_posture="development",
         host="0.0.0.0",
         port=8081,
         hotkey="miner",
@@ -1168,7 +1370,7 @@ def test_customer_sat_refuses_unauthenticated_worker() -> None:
     args = build_parser().parse_args(
         [
             "worker",
-            "serve",
+            "develop",
             "--hotkey",
             "miner",
             "--development-no-auth",
@@ -1184,7 +1386,7 @@ def test_customer_sat_refuses_development_network_bind(monkeypatch) -> None:
     args = build_parser().parse_args(
         [
             "worker",
-            "serve",
+            "develop",
             "--hotkey",
             "miner",
             "--allow-customer-sat",
@@ -1199,7 +1401,7 @@ def test_customer_sat_refuses_development_network_bind(monkeypatch) -> None:
         cmd_worker_serve(args)
 
 
-def test_worker_development_no_auth_is_explicit(monkeypatch):
+def test_worker_development_no_auth_is_explicit(monkeypatch, capsys):
     calls = []
 
     class FakeServer:
@@ -1220,19 +1422,26 @@ def test_worker_development_no_auth_is_explicit(monkeypatch):
 
     monkeypatch.setattr("cathedral.cli.WorkerServer", FakeServer)
     args = build_parser().parse_args(
-        ["worker", "serve", "--hotkey", "miner", "--development-no-auth"]
+        ["worker", "develop", "--hotkey", "miner", "--development-no-auth"]
     )
     assert cmd_worker_serve(args) == 0
     assert calls[0]["bearer_token"] is None
+    startup = json.loads(capsys.readouterr().out)
+    assert startup["schema"] == "cathedral_effective_startup_v1"
+    assert startup["posture"] == "development"
+    assert startup["bearer_auth_configured"] is False
+    assert startup["migration_mode"] is None
 
 
-def test_worker_tee_defaults_to_tdx_and_accepts_snp():
+def test_worker_tee_is_fixed_in_production_and_selectable_in_development():
     parser = build_parser()
     assert parser.parse_args(["worker", "serve", "--hotkey", "w"]).tee == "tdx"
     assert (
-        parser.parse_args(["worker", "serve", "--hotkey", "w", "--tee", "snp"]).tee
+        parser.parse_args(["worker", "develop", "--hotkey", "w", "--tee", "snp"]).tee
         == "snp"
     )
+    with pytest.raises(SystemExit):
+        parser.parse_args(["worker", "serve", "--hotkey", "w", "--tee", "snp"])
 
 
 def test_worker_tee_snp_selects_snp_collector(monkeypatch):
@@ -1256,7 +1465,7 @@ def test_worker_tee_snp_selects_snp_collector(monkeypatch):
 
     monkeypatch.setattr("cathedral.cli.WorkerServer", FakeServer)
     args = build_parser().parse_args(
-        ["worker", "serve", "--hotkey", "miner", "--development-no-auth", "--tee", "snp"]
+        ["worker", "develop", "--hotkey", "miner", "--development-no-auth", "--tee", "snp"]
     )
     assert cmd_worker_serve(args) == 0
     assert calls[0]["evidence_collector"] is collect_snp
@@ -1283,7 +1492,7 @@ def test_worker_default_tee_leaves_collector_unset(monkeypatch):
 
     monkeypatch.setattr("cathedral.cli.WorkerServer", FakeServer)
     args = build_parser().parse_args(
-        ["worker", "serve", "--hotkey", "miner", "--development-no-auth"]
+        ["worker", "develop", "--hotkey", "miner", "--development-no-auth"]
     )
     assert cmd_worker_serve(args) == 0
     assert calls[0]["evidence_collector"] is None
@@ -1293,7 +1502,7 @@ def test_worker_tee_snp_conflicts_with_gpu_composite():
     args = build_parser().parse_args(
         [
             "worker",
-            "serve",
+            "develop",
             "--hotkey",
             "miner",
             "--development-no-auth",
@@ -1329,7 +1538,7 @@ def test_worker_cli_builds_typed_channel_binding(monkeypatch):
     args = build_parser().parse_args(
         [
             "worker",
-            "serve",
+            "develop",
             "--hotkey",
             "miner",
             "--development-no-auth",
@@ -1596,6 +1805,7 @@ def test_tls_does_not_excuse_an_unauthenticated_non_loopback_bind(tmp_path):
     """
     crt, key = _tls_pair(tmp_path)
     args = argparse.Namespace(
+        worker_posture="development",
         host="0.0.0.0",
         port=18446,
         hotkey="5DvjTESTHOTKEY",

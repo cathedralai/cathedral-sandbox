@@ -233,6 +233,7 @@ def _stall_connection(port: int, declared_length: int = 4096) -> socket.socket:
         port,
         path="/v1/evidence",
         declared_length=declared_length,
+        bearer=TEST_BEARER,
     )
 
 
@@ -255,7 +256,15 @@ def _status_of(response: bytes) -> int:
 
 
 def _raw_http_status(port: int, headers: bytes, body: bytes = b"") -> int:
-    request = b"POST /v1/evidence HTTP/1.0\r\nHost: localhost\r\n" + headers + b"\r\n" + body
+    request = (
+        b"POST /v1/evidence HTTP/1.0\r\nHost: localhost\r\n"
+        b"Authorization: Bearer "
+        + TEST_BEARER.encode("ascii")
+        + b"\r\n"
+        + headers
+        + b"\r\n"
+        + body
+    )
     with socket.create_connection(("127.0.0.1", port), timeout=2) as conn:
         conn.sendall(request)
         conn.shutdown(socket.SHUT_WR)
@@ -1006,14 +1015,20 @@ def test_partial_bodies_are_bounded_before_handler_threads_can_grow():
     ) as srv:
         _start_server(srv)
         stalled = [
-            _stall_post_connection(srv.port, path="/v1/evidence"),
-            _stall_post_connection(srv.port, path="/v1/evidence"),
-            _stall_post_connection(srv.port, path="/v1/sat-work"),
+            _stall_post_connection(
+                srv.port, path="/v1/evidence", bearer=TEST_BEARER
+            ),
             _stall_post_connection(
                 srv.port,
-                path="/v1/sat-work",
+                path="/v1/evidence",
                 bearer=TEST_BEARER,
             ),
+            _stall_post_connection(
+                srv.port, path="/v1/sat-work", bearer=TEST_BEARER
+            ),
+            # Before headers identify a request class, the fourth connection
+            # consumes the final server-level slot.
+            socket.create_connection(("127.0.0.1", srv.port), timeout=10),
         ]
         try:
             _wait_for_active_connections(srv, 4)
@@ -1159,6 +1174,7 @@ def test_a_client_that_stops_reading_cannot_keep_the_challenge_slot():
             stalled.sendall(
                 b"POST /v1/evidence HTTP/1.1\r\nHost: localhost\r\n"
                 b"Content-Type: application/json\r\n"
+                b"Authorization: Bearer test-worker-token\r\n"
                 b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload
             )
             time.sleep(0.3)
@@ -1178,15 +1194,8 @@ def test_a_client_that_stops_reading_cannot_keep_the_challenge_slot():
             stalled.close()
 
 
-def test_saturated_challenge_pool_does_not_starve_authenticated_work():
-    """Three pools: evidence, credential-free SAT, and authenticated work.
-
-    A saturated evidence pool must not starve either of the other two. Since
-    #168 the credential-free SAT path has its own pool rather than sharing the
-    evidence pool, so a blocked evidence request no longer 503s the public
-    canonical audit; a SAT POST carrying the configured bearer is customer
-    work and runs on the authenticated pool as before.
-    """
+def test_saturated_evidence_pool_does_not_starve_authenticated_work():
+    """Authenticated evidence and work retain separate bounded capacity."""
     hold = threading.Event()
     unblock = threading.Event()
 
@@ -1211,13 +1220,13 @@ def test_saturated_challenge_pool_does_not_starve_authenticated_work():
         try:
             assert hold.wait(5.0)
             assert _post_raw(url, payload)[0] == 503
-            # #168: the public canonical audit is on its own pool now, so a
-            # full evidence pool must NOT refuse it.
+            # Production canonical SAT is protected even while evidence is
+            # saturated.
             assert _post_raw(
                 f"{srv.base_url}/v1/sat-work",
                 _canonical_sat_payload(23),
                 bearer=None,
-            )[0] == 200
+            )[0] == 401
             cert = RemoteMiner(srv.base_url, HOTKEY, timeout=5).do_sat_work(item)
             assert cert.challenge_id == item.challenge_id
             assert RemoteMiner(srv.base_url, HOTKEY, timeout=5).supports_customer_sat() is True
@@ -1439,16 +1448,8 @@ def test_bearer_token_correct_accepted():
     assert cert.assigned_hotkey == HOTKEY
 
 
-def test_canonical_sat_is_answered_without_any_authorization_header():
-    """An independent validator holds no bearer, and must still be audited.
-
-    A production worker configures a bearer for customer work. While the gate
-    rejected every unauthenticated POST to /v1/sat-work, the canonical audit
-    an unenrolled validator sends 401'd, so a worker that serves the protocol
-    correctly could never be shown to be serving it.
-    """
-    seed = 23
-    instance = _canonical_instance(seed)
+def test_bearer_only_worker_rejects_unsigned_canonical_sat():
+    """Canonical SAT is public only in the explicit migration posture."""
     with _WorkerServer(
         configured_hotkey=HOTKEY,
         evidence_collector=_fake_evidence,
@@ -1456,21 +1457,13 @@ def test_canonical_sat_is_answered_without_any_authorization_header():
     ) as srv:
         _start_server(srv)
         code, body = _post_raw(
-            f"{srv.base_url}/v1/sat-work", _canonical_sat_payload(seed), bearer=None
+            f"{srv.base_url}/v1/sat-work", _canonical_sat_payload(23), bearer=None
         )
-    assert code == 200
-    response = json.loads(body)
-    assert response["satisfiable"] is True
-    assert response["challenge_id"] == _compute_challenge_id(instance, seed)
-    true_literals = set(response["assignment"])
-    for clause in instance.clauses:
-        assert any(literal in true_literals for literal in clause), f"clause {clause} unsatisfied"
+    assert code == 401
+    assert b"unauthorized" in body.lower()
 
 
-def test_canonical_sat_is_answered_despite_a_wrong_authorization_header():
-    """A stale or foreign credential must not turn the public audit into a 401."""
-    seed = 41
-    instance = _canonical_instance(seed)
+def test_bearer_only_worker_rejects_wrong_bearer_for_canonical_sat():
     with _WorkerServer(
         configured_hotkey=HOTKEY,
         evidence_collector=_fake_evidence,
@@ -1479,32 +1472,50 @@ def test_canonical_sat_is_answered_despite_a_wrong_authorization_header():
         _start_server(srv)
         code, body = _post_raw(
             f"{srv.base_url}/v1/sat-work",
-            _canonical_sat_payload(seed),
+            _canonical_sat_payload(41),
             bearer="some-other-subnets-token",
         )
-    assert code == 200
-    response = json.loads(body)
-    true_literals = set(response["assignment"])
-    for clause in instance.clauses:
-        assert any(literal in true_literals for literal in clause), f"clause {clause} unsatisfied"
+    assert code == 401
+    assert b"unauthorized" in body.lower()
 
 
-def test_evidence_challenge_never_sends_or_requires_bearer_token():
+def test_evidence_challenge_sends_and_requires_configured_bearer_token():
     nonce = os.urandom(32)
     with WorkerServer(evidence_collector=_fake_evidence, bearer_token="secret") as srv:
         _start_server(srv)
         remote = RemoteMiner(srv.base_url, HOTKEY, bearer_token="wrong-on-purpose")
-        evidence = remote.fetch_evidence(nonce)
-    assert evidence.nonce == nonce
+        with pytest.raises(RemoteError, match="HTTP 401"):
+            remote.fetch_evidence(nonce)
+
+        evidence = RemoteMiner(
+            srv.base_url, HOTKEY, bearer_token="secret"
+        ).fetch_evidence(nonce)
+        assert evidence.nonce == nonce
+
+
+@pytest.mark.parametrize("bearer", [None, "wrong-token"])
+def test_bearer_only_worker_rejects_unprotected_evidence(bearer):
+    payload = json.dumps(
+        {"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}
+    ).encode()
+    with _WorkerServer(
+        configured_hotkey=HOTKEY,
+        evidence_collector=_fake_evidence,
+        bearer_token="production-worker-token",
+    ) as srv:
+        _start_server(srv)
+        code, body = _post_raw(
+            f"{srv.base_url}/v1/evidence", payload, bearer=bearer
+        )
+    assert code == 401
+    assert b"unauthorized" in body.lower()
 
 
 def test_non_ascii_authorization_does_not_crash_evidence():
     """hmac.compare_digest TypeError must not take down /v1/evidence.
 
-    Pool selection used to call _check_auth on every path, including the
-    credential-free quote. A Latin-1 Authorization value then raised
-    TypeError before the request try block, so a public challenge failed
-    hard instead of ignoring the header.
+    A Latin-1 Authorization value is rejected as unauthenticated instead of
+    raising TypeError before the request try block.
     """
     nonce = os.urandom(32)
     payload = json.dumps(
@@ -1522,8 +1533,8 @@ def test_non_ascii_authorization_does_not_crash_evidence():
             payload,
             extra_headers="Authorization: Bearer café\r\n".encode("latin-1"),
         )
-    assert code == 200
-    assert json.loads(body)["nonce_hex"] == nonce.hex()
+    assert code == 401
+    assert b"unauthorized" in body.lower()
 
 
 def test_non_ascii_authorization_does_not_crash_canonical_sat():
@@ -1540,8 +1551,8 @@ def test_non_ascii_authorization_does_not_crash_canonical_sat():
             _canonical_sat_payload(seed),
             extra_headers="Authorization: Bearer café\r\n".encode("latin-1"),
         )
-    assert code == 200
-    assert json.loads(body)["satisfiable"] is True
+    assert code == 401
+    assert b"unauthorized" in body.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -1776,37 +1787,19 @@ def test_worker_server_rejects_invalid_limits(kwargs):
 # ---------------------------------------------------------------------------
 
 
-def test_partial_unauthenticated_sat_does_not_starve_valid_bearer_sat(monkeypatch):
-    """A valid bearer routes to work capacity before either body is read."""
-    body_read_started = threading.Event()
-    real_readinto = worker_module._DeadlineReader.readinto
-
-    def observed_readinto(reader, buffer):
-        body_read_started.set()
-        return real_readinto(reader, buffer)
-
-    monkeypatch.setattr(worker_module._DeadlineReader, "readinto", observed_readinto)
+def test_unauthenticated_sat_is_rejected_without_holding_work_capacity():
+    """Production rejects a missing bearer and valid work still proceeds."""
     payload = _canonical_sat_payload(23)
     with WorkerServer(
         evidence_collector=_fake_evidence,
-        max_concurrent=1,
-        max_challenge_concurrent=2,
-        max_sat_challenge_concurrent=1,
-        max_connection_concurrent=4,
         timeout=30.0,
     ) as srv:
         _start_server(srv)
         stalled = _stall_post_connection(srv.port, path="/v1/sat-work")
         try:
-            assert body_read_started.wait(timeout=2.0)
-
-            public_code, public_body = _post_raw(
-                f"{srv.base_url}/v1/sat-work",
-                payload,
-                bearer=None,
-            )
-            assert public_code == 503
-            assert b"busy" in public_body.lower()
+            stalled.settimeout(2.0)
+            response = stalled.recv(4096)
+            assert _status_of(response) == 401
 
             authenticated_code, authenticated_body = _post_raw(
                 f"{srv.base_url}/v1/sat-work",
@@ -1819,27 +1812,15 @@ def test_partial_unauthenticated_sat_does_not_starve_valid_bearer_sat(monkeypatc
             stalled.close()
 
 
-def test_inflight_unauthenticated_sat_cannot_503_evidence(monkeypatch):
-    """#168: hold the credential-free SAT pool open and prove evidence survives.
+def test_unauthenticated_sat_is_rejected_before_parse_and_evidence_survives(
+    monkeypatch,
+):
+    """Missing SAT auth never reaches parsing or consumes evidence capacity."""
 
-    Canonical classification needs the parsed instance, so an unauthenticated
-    noncanonical request holds its slot through json.loads and _parse_instance
-    before it can 401. While it is parked there this test fires BOTH a second
-    SAT request (must 503, proving the SAT pool really is exhausted) and an
-    evidence request (must 200, proving the pools are separate). Sharing one
-    pool would 503 the evidence request, and a validator that cannot collect a
-    quote scores the miner zero.
-    """
-    entered = threading.Event()
-    release = threading.Event()
-    real_parse = worker_module._parse_instance
+    def must_not_parse(_raw):
+        raise AssertionError("unauthenticated SAT reached instance parsing")
 
-    def parked_parse(raw):
-        entered.set()
-        release.wait(timeout=10.0)
-        return real_parse(raw)
-
-    monkeypatch.setattr(worker_module, "_parse_instance", parked_parse)
+    monkeypatch.setattr(worker_module, "_parse_instance", must_not_parse)
 
     item = _make_sat_item()
     sat_payload = json.dumps(
@@ -1863,32 +1844,15 @@ def test_inflight_unauthenticated_sat_cannot_503_evidence(monkeypatch):
         max_challenge_concurrent=1,
     ) as srv:
         _start_server(srv)
-        held: list[int] = []
+        sat_code, _ = _post_raw(
+            f"{srv.base_url}/v1/sat-work", sat_payload, bearer=None
+        )
+        assert sat_code == 401
 
-        def hold_the_slot():
-            code, _ = _post_raw(f"{srv.base_url}/v1/sat-work", sat_payload, bearer=None)
-            held.append(code)
-
-        parker = threading.Thread(target=hold_the_slot, daemon=True)
-        parker.start()
-        try:
-            assert entered.wait(timeout=10.0), "parked SAT request never reached parse"
-
-            # The SAT pool is genuinely full: a second SAT request is refused.
-            busy_code, _ = _post_raw(
-                f"{srv.base_url}/v1/sat-work", sat_payload, bearer=None
-            )
-            assert busy_code == 503, f"SAT pool not exhausted, got {busy_code}"
-
-            # ...and evidence, on its own pool, is unaffected.
-            code, _ = _post_raw(
-                f"{srv.base_url}/v1/evidence", evidence_payload, bearer=None
-            )
-            assert code == 200, f"evidence was starved by unauthenticated SAT: {code}"
-        finally:
-            release.set()
-            parker.join(timeout=10.0)
-        assert held == [401]
+        evidence_code, _ = _post_raw(
+            f"{srv.base_url}/v1/evidence", evidence_payload, bearer=TEST_BEARER
+        )
+        assert evidence_code == 200
 
 
 def test_near_canonical_mutation_is_rejected_without_a_bearer(monkeypatch):

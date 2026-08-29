@@ -1,19 +1,26 @@
 # SN39 independent audit-miner image
 
-This source change defines the hardened signed-fleet worker image for SN39. It
+This source change defines the next hardened signed-fleet worker image for SN39. It
 serves fresh Intel TDX evidence, signed fleet discovery, and signed validation
 work over native TLS on `0.0.0.0:8081`. The fixed staged bridge also keeps
 public evidence and canonical audit SAT available to the current UID30
 collector. Customer SAT stays disabled.
 
-This is a source and runtime-contract description. It is not evidence of a
-published activation digest, a deployment, or a live two-machine result.
+This page describes a source-only replacement contract. It must not be
+attributed to the published digest recorded in
+`SN39_AUDIT_MINER_OPERATIONS.md`. That digest was built from source merge
+`8ad7f6e127ad7dcc4dd150f0e1eb47ce72c5ab22`. Its entrypoint still invokes
+`worker serve --tee tdx --allow-public-legacy-audit`, and it does not emit the
+new `cathedral_effective_startup_v1` posture record. The replacement contract
+below remains unpublished until a new immutable digest and provenance record
+are captured in the operations runbook. Publication would still not prove
+deployment or a live two-machine result.
 
 Use [SN39_AUDIT_MINER_OPERATIONS.md](SN39_AUDIT_MINER_OPERATIONS.md) for the
 canonical bounded launch order, one-hotkey-per-listed-machine invariant, dated
 UID124 proof, and stop conditions.
 
-## Fixed runtime contract
+## Source-only replacement runtime contract
 
 The default entrypoint accepts no command arguments and exactly three public
 Cathedral environment inputs:
@@ -72,7 +79,9 @@ to present the same SPKI. The ordinary production `RemoteMiner` and prober use
 CA and hostname verification and are not compatible with this static SAN. Do
 not substitute that client for the reviewed UID30 attested-SPKI transport.
 
-The fixed command selects `--tee tdx`. Docker mounts its own read-only sysfs
+The replacement source command invokes
+`worker migrate --migration-mode public-legacy-audit`. That command has no TEE
+selector and is fixed to Intel TDX. Docker mounts its own read-only sysfs
 over the image's `/sys` tree, so an image-layer
 `/sys/kernel/config/tsm/report` directory is not a usable bind target. The
 sanitized child environment therefore fixes the collector root at
@@ -85,7 +94,7 @@ mounted. The image exposes one listener, native TLS on TCP `8081`. It does not
 configure a plaintext listener. The worker uses the kernel configfs TSM path
 through this bounded read-write exception.
 
-The fixed entrypoint always configures the signed validator-access and bounded
+The replacement entrypoint always configures the signed validator-access and bounded
 fleet-discovery role in [WORK_REQUEST_V2.md](WORK_REQUEST_V2.md). It also always
 enables the narrow legacy-audit bridge during staged migration. There is no
 environment flag or command override for signed-only, bearer, customer-SAT,
@@ -94,8 +103,11 @@ later reviewed image change after the signed collector and rollback path are
 live-proven.
 
 An operator with control of the container runtime can replace the entrypoint,
-mount different files, or publish another port. The deployment policy must use
-the reviewed digest and the fixed command described here.
+mount different files, or publish another port. Do not use this source-only
+command description as evidence about the current published digest. A future
+deployment policy must name the newly reviewed digest that contains this
+contract. Until then, the current pin and its prior command remain the only
+published image facts.
 
 ## Base and dependency pins
 

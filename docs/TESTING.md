@@ -78,5 +78,8 @@ print('admitted', r.admitted); print('weights', r.weights); print('burn', r.burn
 
 - `cathedral` — operator CLI, including offline `customer-receipt verify`
 - `cathedral-census` — the CC capability probe
-- `cathedral-compute-validator` — compatibility wrapper for `cathedral runtime ...`
-- `cathedral-miner` — compatibility wrapper for `cathedral worker ...`
+- `cathedral-snp-friend-probe` — bounded AMD SEV-SNP development probe
+
+The former `cathedral-compute-validator` and `cathedral-miner` compatibility
+aliases are not installed. Use the posture-specific `cathedral runtime ...`
+and `cathedral worker ...` commands.

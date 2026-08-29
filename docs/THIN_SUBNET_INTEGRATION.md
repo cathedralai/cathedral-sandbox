@@ -3,7 +3,7 @@
 > **Scope: generic score-class integration, not the current SN39 launch
 > profile.** This document shows how an independent subnet can consume
 > Cathedral facts under validator-local allocation. The current Cathedral SN39
-> launch uses the separately versioned `validated_supply_v1` policy described
+> launch uses the separately versioned `validated_supply_v2` policy described
 > in [`../BUILD_STATUS.md`](../BUILD_STATUS.md) and the public Cathedral
 > validator documentation.
 

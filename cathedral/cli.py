@@ -940,6 +940,9 @@ def _build_runtime(
     require_policy: bool = False,
     require_report_audience: bool = False,
 ) -> tuple[ConfidentialRuntime, Ledger, dict[str, str]]:
+    posture = getattr(args, "runtime_posture", "production")
+    if posture not in {"production", "development"}:
+        raise ValueError("runtime posture must be production or development")
     development = getattr(args, "development", False)
     cpu_tee = getattr(args, "cpu_tee", "tdx")
     gpu_profile_id = getattr(args, "gpu_profile_id", None)
@@ -952,6 +955,40 @@ def _build_runtime(
         gpu_identity_key_file,
         gpu_identity_anchor_file,
     )
+    if posture == "production" and development:
+        raise ValueError("production runtime posture cannot enable development mode")
+    if posture == "development" and not development:
+        raise ValueError("development runtime posture must remain non-production")
+    runtime_command = getattr(args, "runtime_command", None)
+    if require_policy and runtime_command is not None:
+        allowed_commands = (
+            {"canary", "audit-attestation", "run-epoch"}
+            if posture == "production"
+            else {"develop-canary", "develop-audit-attestation"}
+        )
+        if runtime_command not in allowed_commands:
+            raise ValueError(
+                f"{posture} runtime posture cannot execute {runtime_command!r}"
+            )
+    if posture == "production" and any(item is not None for item in gpu_values):
+        raise ValueError(
+            "GPU runtime audit is development-only and is not accepted by production commands"
+        )
+    if posture == "production" and getattr(args, "measurements_file", None) is not None:
+        raise ValueError(
+            "production runtime posture requires the signed policy registry; "
+            "development measurements are not accepted"
+        )
+    if posture == "development" and (
+        getattr(args, "receipt_signing_key_id", None) is not None
+        or getattr(args, "receipt_signing_key_file", None) is not None
+        or getattr(args, "publisher_endpoint", None) is not None
+        or getattr(args, "publish", False)
+    ):
+        raise ValueError(
+            "development runtime posture cannot issue receipts, publish reports, "
+            "or enable score writes"
+        )
     if any(item is not None for item in gpu_values) and any(item is None for item in gpu_values):
         raise ValueError(
             "--gpu-profile-id, --gpu-identity-db, --gpu-identity-key-file, and "
@@ -959,12 +996,12 @@ def _build_runtime(
         )
     if cpu_tee == "snp" and not development:
         raise ValueError(
-            "--cpu-tee snp requires --development; production AMD SEV-SNP "
-            "scoring, receipts, and publishing remain disabled"
+            "--cpu-tee snp is available only from development runtime commands; "
+            "production AMD SEV-SNP scoring, receipts, and publishing remain disabled"
         )
     if cpu_tee == "snp" and getattr(args, "runtime_command", None) not in {
-        "canary",
-        "audit-attestation",
+        "develop-canary",
+        "develop-audit-attestation",
     }:
         raise ValueError(
             "--cpu-tee snp is available only for development canary and "
@@ -1225,7 +1262,55 @@ def _run_json(run: EpochRun) -> dict[str, object]:
 
 
 def cmd_worker_serve(args: argparse.Namespace) -> int:
+    posture = getattr(args, "worker_posture", "production")
+    if posture not in {"production", "development", "migration"}:
+        raise ValueError("worker posture must be production, development, or migration")
     tee = getattr(args, "tee", "tdx")
+    development_no_auth = bool(getattr(args, "development_no_auth", False))
+    development_allow_non_loopback = bool(
+        getattr(args, "development_allow_non_loopback", False)
+    )
+    gpu_composite = bool(getattr(args, "gpu_composite", False))
+    allow_customer_sat = bool(getattr(args, "allow_customer_sat", False))
+    migration_mode = getattr(args, "migration_mode", None)
+    legacy_bootstrap_flag = bool(getattr(args, "allow_public_bootstrap_evidence", False))
+    legacy_audit_flag = bool(getattr(args, "allow_public_legacy_audit", False))
+    if legacy_bootstrap_flag or legacy_audit_flag:
+        raise ValueError(
+            "public compatibility flags are no longer accepted; use the explicit "
+            "worker migrate command"
+        )
+    if posture == "production":
+        if (
+            tee != "tdx"
+            or development_no_auth
+            or development_allow_non_loopback
+            or gpu_composite
+            or migration_mode is not None
+        ):
+            raise ValueError(
+                "production worker posture is fixed to authenticated TDX without "
+                "development, GPU-preview, or migration options"
+            )
+    elif posture == "development":
+        if migration_mode is not None:
+            raise ValueError("development worker posture cannot enable migration modes")
+    else:
+        if migration_mode not in {"public-bootstrap-evidence", "public-legacy-audit"}:
+            raise ValueError("migration worker posture requires one explicit migration mode")
+        if (
+            tee != "tdx"
+            or development_no_auth
+            or development_allow_non_loopback
+            or gpu_composite
+            or allow_customer_sat
+        ):
+            raise ValueError(
+                "migration worker posture is authenticated TDX only and cannot combine "
+                "with development, GPU-preview, or customer SAT options"
+            )
+    allow_public_bootstrap = migration_mode == "public-bootstrap-evidence"
+    allow_public_legacy_audit = migration_mode == "public-legacy-audit"
     tls_certificate = getattr(args, "tls_certificate", None)
     tls_private_key = getattr(args, "tls_private_key", None)
     if (tls_certificate is None) != (tls_private_key is None):
@@ -1235,7 +1320,6 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         is_loopback = ipaddress.ip_address(args.host).is_loopback
     except ValueError:
         is_loopback = args.host == "localhost"
-    development_no_auth = bool(getattr(args, "development_no_auth", False))
     access_snapshot_path = getattr(args, "validator_access_snapshot", None)
     access_keys_path = getattr(args, "validator_access_keys", None)
     access_keys_digest = getattr(args, "validator_access_keys_digest", None)
@@ -1243,8 +1327,6 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
     minimum_validator_stake_rao = getattr(args, "validator_minimum_stake_rao", None)
     public_endpoint = getattr(args, "public_endpoint", None)
     fleet_manifest_path = getattr(args, "fleet_manifest", None)
-    allow_public_bootstrap = bool(getattr(args, "allow_public_bootstrap_evidence", False))
-    allow_public_legacy_audit = bool(getattr(args, "allow_public_legacy_audit", False))
     access_values = (
         access_snapshot_path,
         access_keys_path,
@@ -1261,7 +1343,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
     if tee == "snp" and not is_loopback and not signed_access_configured:
         raise ValueError(
             "a non-loopback AMD SEV-SNP worker requires signed validator access; "
-            "bearer tokens do not protect the evidence endpoint"
+            "bearer-only SNP service is development-only"
         )
     access_enabled = any(value is not None for value in access_values) or (
         fleet_manifest_path is not None or allow_public_bootstrap or allow_public_legacy_audit
@@ -1285,7 +1367,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
     # The plain-HTTP form of exactly the same mistake was already refused, which is
     # what made this asymmetry a trap rather than a policy: adding TLS -- the thing
     # an operator does to make a service MORE secure -- silently removed a control.
-    if not is_loopback and not args.development_allow_non_loopback:
+    if not is_loopback and not development_allow_non_loopback:
         if not tls_enabled:
             raise ValueError(
                 "plain worker HTTP must bind loopback unless development mode is explicit")
@@ -1362,9 +1444,8 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             tls_context.load_cert_chain(certfile=str(certificate_path), keyfile=str(key_path))
         except (OSError, ssl.SSLError) as exc:
             raise ValueError("worker TLS certificate or private key could not be loaded") from exc
-    if not getattr(args, "development_no_auth", False) and channel_binding is None:
-        raise ValueError("production worker requires a configured channel binding")
-    allow_customer_sat = getattr(args, "allow_customer_sat", False)
+    if not development_no_auth and channel_binding is None:
+        raise ValueError("an authenticated worker requires a configured channel binding")
     if allow_customer_sat and (token is None or channel_binding is None):
         raise ValueError("customer SAT requires bearer authentication and channel binding")
     if allow_customer_sat and getattr(args, "development_allow_non_loopback", False):
@@ -1420,14 +1501,14 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
                 worker_hotkey=args.hotkey,
                 public_endpoint=public_endpoint,
             )
-    # Select the CPU TEE evidence collector. Default stays TDX so existing
-    # deployments are unchanged; --tee snp serves AMD SEV-SNP evidence, and
-    # --gpu-composite (TDX+GPU) is TDX-only by construction.
-    if getattr(args, "gpu_composite", False) and tee != "tdx":
+    # Select the development evidence collector. Production and migration are
+    # fixed to TDX before this point; SNP and GPU composition exist only on the
+    # explicit development command surface.
+    if gpu_composite and tee != "tdx":
         raise ValueError("--gpu-composite collects TDX+GPU and cannot combine with --tee snp")
     if tee == "snp":
         evidence_collector = collect_snp
-    elif getattr(args, "gpu_composite", False):
+    elif gpu_composite:
         evidence_collector = collect_tdx_gpu
     else:
         evidence_collector = None
@@ -1440,7 +1521,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         tls_context=tls_context,
         evidence_collector=evidence_collector,
         allow_noncanonical_sat=allow_customer_sat,
-        allow_non_loopback_for_development=args.development_allow_non_loopback,
+        allow_non_loopback_for_development=development_allow_non_loopback,
         validator_authorizer=validator_authorizer,
         fleet_endpoints=fleet_endpoints,
         allow_public_bootstrap_evidence=allow_public_bootstrap,
@@ -1449,13 +1530,24 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         print(
             json.dumps(
                 {
+                    "schema": "cathedral_effective_startup_v1",
+                    "component": "worker",
+                    "posture": posture,
                     "host": server.host,
                     "port": server.port,
                     "hotkey": args.hotkey,
                     "tee": tee,
                     "amd_snp_development_only": tee == "snp",
                     "tls": tls_context is not None,
+                    "bearer_auth_configured": token is not None,
+                    "channel_binding_configured": channel_binding is not None,
                     "development_no_auth": development_no_auth,
+                    "development_non_loopback_escape": development_allow_non_loopback,
+                    "gpu_preview": gpu_composite,
+                    "migration_mode": migration_mode,
+                    "public_bootstrap_evidence": allow_public_bootstrap,
+                    "public_legacy_audit": allow_public_legacy_audit,
+                    "customer_sat": allow_customer_sat,
                     "signed_validator_access": validator_authorizer is not None,
                     "fleet_candidates": 0 if fleet_endpoints is None else len(fleet_endpoints),
                 }
@@ -1471,6 +1563,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
 def cmd_runtime_canary(args: argparse.Namespace) -> int:
     runtime, ledger, tokens = _build_runtime(args, require_policy=True)
     try:
+        _emit_runtime_startup_posture(args, runtime)
         outcome = runtime.check_canary(_target(args, tokens))
         document = _outcome_json(outcome)
         if getattr(args, "cpu_tee", "tdx") == "snp":
@@ -1484,6 +1577,7 @@ def cmd_runtime_canary(args: argparse.Namespace) -> int:
 def cmd_runtime_audit_attestation(args: argparse.Namespace) -> int:
     runtime, ledger, tokens = _build_runtime(args, require_policy=True)
     try:
+        _emit_runtime_startup_posture(args, runtime)
         outcome = runtime.audit_attestation(_target(args, tokens))
         document = _outcome_json(outcome)
         if getattr(args, "cpu_tee", "tdx") == "snp":
@@ -1506,6 +1600,54 @@ def _snp_development_boundary() -> dict[str, object]:
     }
 
 
+def _emit_runtime_startup_posture(
+    args: argparse.Namespace,
+    runtime: ConfidentialRuntime,
+) -> None:
+    """Emit the effective posture without secret values or filesystem paths."""
+
+    config = runtime.config
+    print(
+        json.dumps(
+            {
+                "schema": "cathedral_effective_startup_v1",
+                "component": "runtime",
+                "command": getattr(args, "runtime_command", None),
+                "posture": getattr(args, "runtime_posture", "production"),
+                "production": config.production_mode,
+                "tee": config.expected_tier.value,
+                "policy_source": (
+                    "signed_registry"
+                    if getattr(args, "policy_registry", None) is not None
+                    else (
+                        "development_measurements"
+                        if getattr(args, "measurements_file", None) is not None
+                        else "none"
+                    )
+                ),
+                "receipt_issuer_configured": bool(
+                    getattr(args, "receipt_signing_key_id", None)
+                    and getattr(args, "receipt_signing_key_file", None)
+                ),
+                "publisher_configured": getattr(args, "publisher_endpoint", None) is not None,
+                "gpu_preview": config.expected_tier is Tier.CC_GPU,
+                "tokens_file_configured": getattr(args, "tokens_file", None) is not None,
+                "evidence_retention_configured": config.evidence_retention_dir is not None,
+                "challenge_anchor_configured": bool(
+                    config.challenge_anchor_block is not None
+                    and config.challenge_anchor_hash is not None
+                ),
+                "score_audience_configured": bool(
+                    config.score_network is not None and config.score_netuid is not None
+                ),
+            },
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def cmd_runtime_run_epoch(args: argparse.Namespace) -> int:
     runtime, ledger, tokens = _build_runtime(
         args,
@@ -1513,6 +1655,7 @@ def cmd_runtime_run_epoch(args: argparse.Namespace) -> int:
         require_report_audience=True,
     )
     try:
+        _emit_runtime_startup_posture(args, runtime)
         run = runtime.run_epoch(
             args.source_epoch,
             _target(args, tokens),
@@ -3345,7 +3488,11 @@ def cmd_provenance_verify(args: argparse.Namespace) -> int:
             audit["not_proven_reasons"] = list(result.not_proven_reasons)
         full = result.assurance_level == "full"
         passed = audit["result"] == "PASS"
-        succeeded = passed and (full or bool(getattr(args, "allow_receipts_only", False)))
+        receipts_only_acknowledged = bool(
+            getattr(args, "allow_receipts_only", False)
+            and not getattr(args, "production", False)
+        )
+        succeeded = passed and (full or receipts_only_acknowledged)
         if not passed:
             # A CONCRETE check failed (e.g. the signed vector disagreed with
             # the recomputation). The failure stays FAIL: it is never
@@ -4065,97 +4212,145 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_worker = sub.add_parser("worker", help="run a miner worker")
     worker_sub = p_worker.add_subparsers(dest="worker_command", required=True)
-    p_serve = worker_sub.add_parser("serve", help="serve one configured miner hotkey")
-    p_serve.add_argument("--hotkey", required=True)
-    p_serve.add_argument("--host", default="127.0.0.1")
-    p_serve.add_argument("--port", type=int, default=8081)
-    p_serve.add_argument("--bearer-token-env", default=DEFAULT_WORKER_BEARER_ENV)
-    p_serve.add_argument(
-        "--tls-certificate",
-        help="PEM certificate served directly by the worker",
+
+    def add_worker_base(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--hotkey", required=True)
+        command.add_argument("--host", default="127.0.0.1")
+        command.add_argument("--port", type=int, default=8081)
+        command.add_argument("--bearer-token-env", default=DEFAULT_WORKER_BEARER_ENV)
+        command.add_argument(
+            "--tls-certificate",
+            help="PEM certificate served directly by the worker",
+        )
+        command.add_argument(
+            "--tls-private-key",
+            help="owner-only PEM private key kept inside the worker guest",
+        )
+        command.add_argument(
+            "--channel-binding-type",
+            choices=[binding.value for binding in ChannelBindingType],
+        )
+        command.add_argument(
+            "--channel-binding-digest",
+            help="32-byte channel public-key digest as 64 lowercase hex characters",
+        )
+
+    def add_worker_signed_access(command: argparse.ArgumentParser) -> None:
+        command.add_argument(
+            "--validator-access-snapshot",
+            help="atomically rotated signed finalized validator-qualification snapshot",
+        )
+        command.add_argument(
+            "--validator-access-keys",
+            help="trusted Ed25519 public keys for the validator snapshot",
+        )
+        command.add_argument(
+            "--validator-access-keys-digest",
+            help="required sha256 pin for the trusted validator-access key file",
+        )
+        command.add_argument(
+            "--validator-access-state",
+            help="owner-only persistent SQLite replay and snapshot high-water state",
+        )
+        command.add_argument(
+            "--validator-minimum-stake-rao",
+            type=int,
+            help="operator-configured validator stake floor in exact Rao",
+        )
+        command.add_argument(
+            "--validator-access-max-age-seconds",
+            type=int,
+            default=DEFAULT_SNAPSHOT_MAX_AGE_SECONDS,
+        )
+        command.add_argument("--validator-network", default=DEFAULT_ENROLL_NETWORK)
+        command.add_argument("--validator-netuid", type=int, default=DEFAULT_ENROLL_NETUID)
+        command.add_argument(
+            "--public-endpoint",
+            help="this worker's canonical public HTTPS axon origin",
+        )
+        command.add_argument(
+            "--fleet-manifest",
+            help="optional owner-controlled list of additional machine candidates",
+        )
+
+    p_serve = worker_sub.add_parser(
+        "serve",
+        help="serve the authenticated production TDX worker posture",
     )
-    p_serve.add_argument(
-        "--tls-private-key",
-        help="owner-only PEM private key kept inside the worker guest",
-    )
-    p_serve.add_argument("--development-no-auth", action="store_true")
-    p_serve.add_argument("--development-allow-non-loopback", action="store_true")
+    add_worker_base(p_serve)
+    add_worker_signed_access(p_serve)
     p_serve.add_argument(
         "--allow-customer-sat",
         action="store_true",
         help="accept bounded customer SAT jobs; requires bearer auth and channel binding",
     )
-    p_serve.add_argument(
+    p_serve.set_defaults(
+        func=cmd_worker_serve,
+        worker_posture="production",
+        tee="tdx",
+        development_no_auth=False,
+        development_allow_non_loopback=False,
+        gpu_composite=False,
+        migration_mode=None,
+        allow_public_bootstrap_evidence=False,
+        allow_public_legacy_audit=False,
+    )
+
+    p_worker_develop = worker_sub.add_parser(
+        "develop",
+        help="serve an explicitly non-production worker for local or friend testing",
+    )
+    add_worker_base(p_worker_develop)
+    add_worker_signed_access(p_worker_develop)
+    p_worker_develop.add_argument("--development-no-auth", action="store_true")
+    p_worker_develop.add_argument("--development-allow-non-loopback", action="store_true")
+    p_worker_develop.add_argument(
+        "--allow-customer-sat",
+        action="store_true",
+        help="exercise bounded customer SAT locally; never enables production eligibility",
+    )
+    p_worker_develop.add_argument(
         "--gpu-composite",
         action="store_true",
-        help=(
-            "collect bound TDX plus confidential-GPU evidence; requires CATHEDRAL_GPU_COLLECT_CMD"
-        ),
+        help="development-only TDX plus confidential-GPU evidence preview",
     )
-    p_serve.add_argument(
+    p_worker_develop.add_argument(
         "--tee",
         choices=["tdx", "snp"],
         default="tdx",
-        help="CPU TEE evidence class the worker collects (default: tdx)",
+        help="development CPU evidence class (default: tdx; snp is friend testing only)",
     )
-    p_serve.add_argument(
-        "--channel-binding-type",
-        choices=[binding.value for binding in ChannelBindingType],
+    p_worker_develop.set_defaults(
+        func=cmd_worker_serve,
+        worker_posture="development",
+        migration_mode=None,
+        allow_public_bootstrap_evidence=False,
+        allow_public_legacy_audit=False,
     )
-    p_serve.add_argument(
-        "--channel-binding-digest",
-        help="32-byte channel public-key digest as 64 lowercase hex characters",
+
+    p_worker_migrate = worker_sub.add_parser(
+        "migrate",
+        help="run the authenticated TDX compatibility bridge during a bounded migration",
     )
-    p_serve.add_argument(
-        "--validator-access-snapshot",
-        help="atomically rotated signed finalized validator-qualification snapshot",
+    add_worker_base(p_worker_migrate)
+    add_worker_signed_access(p_worker_migrate)
+    p_worker_migrate.add_argument(
+        "--migration-mode",
+        choices=["public-bootstrap-evidence", "public-legacy-audit"],
+        required=True,
+        help="one explicit legacy route exception; all other protected routes stay signed",
     )
-    p_serve.add_argument(
-        "--validator-access-keys",
-        help="trusted Ed25519 public keys for the validator snapshot",
+    p_worker_migrate.set_defaults(
+        func=cmd_worker_serve,
+        worker_posture="migration",
+        tee="tdx",
+        development_no_auth=False,
+        development_allow_non_loopback=False,
+        gpu_composite=False,
+        allow_customer_sat=False,
+        allow_public_bootstrap_evidence=False,
+        allow_public_legacy_audit=False,
     )
-    p_serve.add_argument(
-        "--validator-access-keys-digest",
-        help="required sha256 pin for the trusted validator-access key file",
-    )
-    p_serve.add_argument(
-        "--validator-access-state",
-        help="owner-only persistent SQLite replay and snapshot high-water state",
-    )
-    p_serve.add_argument(
-        "--validator-minimum-stake-rao",
-        type=int,
-        help="operator-configured validator stake floor in exact Rao",
-    )
-    p_serve.add_argument(
-        "--validator-access-max-age-seconds",
-        type=int,
-        default=DEFAULT_SNAPSHOT_MAX_AGE_SECONDS,
-    )
-    p_serve.add_argument("--validator-network", default=DEFAULT_ENROLL_NETWORK)
-    p_serve.add_argument("--validator-netuid", type=int, default=DEFAULT_ENROLL_NETUID)
-    p_serve.add_argument(
-        "--public-endpoint",
-        help="this worker's canonical public HTTPS axon origin",
-    )
-    p_serve.add_argument(
-        "--fleet-manifest",
-        help="optional owner-controlled list of additional machine candidates",
-    )
-    p_serve.add_argument(
-        "--allow-public-bootstrap-evidence",
-        action="store_true",
-        help="migration only: leave evidence public while fleet, work, and capabilities stay signed",
-    )
-    p_serve.add_argument(
-        "--allow-public-legacy-audit",
-        action="store_true",
-        help=(
-            "migration only: leave evidence and canonical audit SAT public; "
-            "customer SAT stays bearer-gated"
-        ),
-    )
-    p_serve.set_defaults(func=cmd_worker_serve)
 
     p_policy = sub.add_parser("policy-registry", help="verify signed public measurement policy")
     policy_sub = p_policy.add_subparsers(dest="policy_command", required=True)
@@ -4405,19 +4600,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_runtime = sub.add_parser("runtime", help="operate confidential-compute report epochs")
     runtime_sub = p_runtime.add_subparsers(dest="runtime_command", required=True)
 
-    def add_runtime_common(command: argparse.ArgumentParser) -> None:
+    def add_runtime_common(
+        command: argparse.ArgumentParser,
+        *,
+        development_surface: bool,
+    ) -> None:
         command.add_argument("--registry-db", required=True)
         command.add_argument("--ledger-db", required=True)
-        command.add_argument(
-            "--cpu-tee",
-            choices=["tdx", "snp"],
-            default="tdx",
-            help=(
-                "CPU evidence class to admit. SNP requires --development and "
-                "cannot publish or issue receipts"
-            ),
-        )
-        command.add_argument("--measurements-file")
+        if development_surface:
+            command.add_argument(
+                "--cpu-tee",
+                choices=["tdx", "snp"],
+                default="tdx",
+                help="development evidence class; SNP never scores, publishes, or issues receipts",
+            )
+            command.add_argument("--measurements-file")
+        else:
+            command.set_defaults(cpu_tee="tdx", measurements_file=None)
         command.add_argument(
             "--challenge-anchor-block",
             type=int,
@@ -4449,24 +4648,45 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--policy-registry-pinned-release", type=int)
         command.add_argument("--policy-registry-pinned-digest")
         command.add_argument("--policy-registry-max-age-seconds", type=int, default=86400)
-        command.add_argument("--receipt-signing-key-id")
-        command.add_argument("--receipt-signing-key-file")
-        command.add_argument(
-            "--gpu-profile-id",
-            help="active gpu_cc profile id from the verified policy registry",
-        )
-        command.add_argument(
-            "--gpu-identity-db",
-            help="durable pseudonymous GPU identity-claim database",
-        )
-        command.add_argument(
-            "--gpu-identity-key-file",
-            help="owner-only file containing a 32-byte base64 identity key",
-        )
-        command.add_argument(
-            "--gpu-identity-anchor-file",
-            help="external protected monotonic generation anchor",
-        )
+        if development_surface:
+            command.add_argument(
+                "--gpu-profile-id",
+                help="development-only gpu_cc profile id from the verified policy registry",
+            )
+            command.add_argument(
+                "--gpu-identity-db",
+                help="development-only pseudonymous GPU identity-claim database",
+            )
+            command.add_argument(
+                "--gpu-identity-key-file",
+                help="owner-only file containing a 32-byte base64 identity key",
+            )
+            command.add_argument(
+                "--gpu-identity-anchor-file",
+                help="protected monotonic generation anchor",
+            )
+            command.set_defaults(
+                receipt_signing_key_id=None,
+                receipt_signing_key_file=None,
+                publisher_endpoint=None,
+                publisher_bearer_env=DEFAULT_PUBLISHER_BEARER_ENV,
+                publisher_hmac_env=DEFAULT_PUBLISHER_HMAC_ENV,
+                score_network=None,
+                score_netuid=None,
+                development=True,
+                runtime_posture="development",
+            )
+        else:
+            command.add_argument("--receipt-signing-key-id")
+            command.add_argument("--receipt-signing-key-file")
+            command.set_defaults(
+                gpu_profile_id=None,
+                gpu_identity_db=None,
+                gpu_identity_key_file=None,
+                gpu_identity_anchor_file=None,
+                development=False,
+                runtime_posture="production",
+            )
         command.add_argument("--tokens-file", default=None)
         command.add_argument("--miner-timeout-seconds", type=float, default=10.0)
         command.add_argument("--miner-attempts", type=int, default=2)
@@ -4477,41 +4697,57 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--reattestation-retry-jitter-seconds", type=int, default=5)
         command.add_argument("--customer-job-lease-seconds", type=int, default=120)
         command.add_argument("--customer-job-max-attempts", type=int, default=3)
-        command.add_argument("--development", action="store_true")
-        command.add_argument("--publisher-endpoint", default=None)
-        command.add_argument("--publisher-bearer-env", default=DEFAULT_PUBLISHER_BEARER_ENV)
-        command.add_argument("--publisher-hmac-env", default=DEFAULT_PUBLISHER_HMAC_ENV)
-        command.add_argument(
-            "--score-network",
-            help="exact network audience embedded in each frozen score report",
-        )
-        command.add_argument(
-            "--score-netuid",
-            type=int,
-            help="subnet UID audience embedded in each frozen score report",
-        )
+        if not development_surface:
+            command.add_argument("--publisher-endpoint", default=None)
+            command.add_argument("--publisher-bearer-env", default=DEFAULT_PUBLISHER_BEARER_ENV)
+            command.add_argument("--publisher-hmac-env", default=DEFAULT_PUBLISHER_HMAC_ENV)
+            command.add_argument(
+                "--score-network",
+                help="exact network audience embedded in each frozen score report",
+            )
+            command.add_argument(
+                "--score-netuid",
+                type=int,
+                help="subnet UID audience embedded in each frozen score report",
+            )
 
     def add_canary(command: argparse.ArgumentParser) -> None:
         command.add_argument("--canary-hotkey", required=True)
         command.add_argument("--canary-endpoint", required=True)
 
     p_canary = runtime_sub.add_parser(
-        "canary", help="run fresh requested-tier attestation and SAT canary"
+        "canary", help="run the production TDX attestation and SAT canary"
     )
-    add_runtime_common(p_canary)
+    add_runtime_common(p_canary, development_surface=False)
     add_canary(p_canary)
     p_canary.set_defaults(func=cmd_runtime_canary)
 
     p_audit = runtime_sub.add_parser(
         "audit-attestation",
-        help="verify fresh evidence and channel binding without work or scoring",
+        help="verify production TDX evidence and channel binding without scoring",
     )
-    add_runtime_common(p_audit)
+    add_runtime_common(p_audit, development_surface=False)
     add_canary(p_audit)
     p_audit.set_defaults(func=cmd_runtime_audit_attestation)
 
-    p_run = runtime_sub.add_parser("run-epoch", help="freeze one complete report")
-    add_runtime_common(p_run)
+    p_develop_canary = runtime_sub.add_parser(
+        "develop-canary",
+        help="run a non-production TDX, SNP, or GPU-preview canary",
+    )
+    add_runtime_common(p_develop_canary, development_surface=True)
+    add_canary(p_develop_canary)
+    p_develop_canary.set_defaults(func=cmd_runtime_canary)
+
+    p_develop_audit = runtime_sub.add_parser(
+        "develop-audit-attestation",
+        help="verify non-production TDX, SNP, or GPU-preview evidence without scoring",
+    )
+    add_runtime_common(p_develop_audit, development_surface=True)
+    add_canary(p_develop_audit)
+    p_develop_audit.set_defaults(func=cmd_runtime_audit_attestation)
+
+    p_run = runtime_sub.add_parser("run-epoch", help="freeze one production TDX report")
+    add_runtime_common(p_run, development_surface=False)
     add_canary(p_run)
     p_run.add_argument("--source-epoch", type=int, required=True)
     p_run.add_argument(
@@ -4831,8 +5067,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_prov_verify.add_argument(
         "--allow-receipts-only",
         action="store_true",
-        help="exit 0 for a receipts-only chain; the result is still recorded "
-        "and logged as NOT_PROVEN, never as full provenance",
+        help="outside --production only, acknowledge a receipts-only chain with exit 0; "
+        "the result stays NOT_PROVEN. Production always exits nonzero unless FULL",
     )
     p_prov_verify.add_argument(
         "--current-block",

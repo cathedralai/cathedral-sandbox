@@ -894,7 +894,7 @@ def test_signed_access_negative_control_rejects_an_unsigned_development_worker(
             remote.confirm_signed_validator_access_required(evidence)
 
 
-def test_signed_access_negative_control_rejects_a_legacy_bearer_worker(
+def test_signed_client_without_bearer_cannot_bootstrap_bearer_only_worker(
     tmp_path: Path,
 ):
     server_context, client_context, binding = _tls_contexts(tmp_path)
@@ -924,11 +924,8 @@ def test_signed_access_negative_control_rejects_a_legacy_bearer_worker(
             validator_hotkey=VALIDATOR_HOTKEY,
             validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
         )
-        evidence = remote.fetch_evidence(os.urandom(32))
-        remote.confirm_channel_binding(evidence)
-
         with pytest.raises(RemoteError, match="HTTP 401"):
-            remote.confirm_signed_validator_access_required(evidence)
+            remote.fetch_evidence(os.urandom(32))
 
 
 def test_signed_access_negative_control_rejects_header_presence_without_verification(

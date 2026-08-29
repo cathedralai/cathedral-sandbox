@@ -45,11 +45,12 @@ or eligibility.
 | Validator-dispatched bounded SAT work | Current scored-work path |
 | Complete signed score reports with explicit zero revocation | Implemented |
 | Public evidence index | Deployed |
-| Deployed vector vs independent verifier | **Not converged.** The 2026-07-25 comparison recorded `FAIL` on the v1 shape, and as of 2026-08-01 the live payload still mixes `contract_version` v1 and v2 metadata blocks. [BUILD_STATUS.md](../BUILD_STATUS.md) is the dated evidence record |
+| Deployed vector vs independent verifier | **Converged in the 2026-08-07 comparison.** The live vector carried the v2 shape and exact body binding. This dated result is not proof of the current epoch. [BUILD_STATUS.md](../BUILD_STATUS.md) is the evidence record |
 | Mainnet SN39 | Live testing, operator-assisted |
 | Testnet SN292 | Non-paying integration lane |
 | Self-service miner enrollment | Not deployed; onboarding is maintainer-assisted |
-| Reproducible worker image you can build yourself | Not published yet |
+| Fixed signed-fleet TDX audit image | Published at the reviewed digest in [SN39_AUDIT_MINER_OPERATIONS.md](SN39_AUDIT_MINER_OPERATIONS.md); publication is not deployment or live proof |
+| General self-service worker image | Not published |
 | AMD SEV-SNP scoring | Not enabled |
 | NVIDIA confidential-GPU subnet scoring | Not admitted |
 | General customer containers or CVMs through this repository | Not live |
@@ -66,9 +67,10 @@ Cathedral admits a worker only if its TDX measurement is already listed in the
 signed policy registry. The verifier compares the measurement in your quote
 against the active profile's approved list and rejects anything not on it. A
 cryptographically valid TDX quote with an unknown measurement is still rejected.
-Because no reproducible image is published yet, you cannot build a matching
-measurement yourself, so **apply before registering or provisioning a paid
-machine.** Production enrollment is additionally gated by a signed allowlist
+Because no general self-service image is published, the fixed audit-image
+digest does not give a new provider an approved measurement or enrollment.
+**Apply before registering or provisioning a paid machine.** Production
+enrollment is additionally gated by a signed allowlist
 (see [ENROLLMENT_ALLOWLIST.md](ENROLLMENT_ALLOWLIST.md)).
 
 Read [MINING.md](../MINING.md) in full before exposing a worker.
@@ -120,8 +122,11 @@ report that narrower result as `NOT_PROVEN`, not `FULL`.
   or intended Intel TDX hardware class, provider and broad region, and an
   optional public contact handle. Never an IP, instance identifier, or
   credential.
-- Plain HTTP with `--development-allow-non-loopback` is a development exception,
-  not the production security boundary and not a mainnet onboarding recipe.
-- Production evidence uses credential-free collection over HTTPS with the TLS
-  key terminating inside the measured environment; authenticated work follows
-  only after channel verification.
+- Plain HTTP with `worker develop --development-allow-non-loopback` is a
+  development exception, not the production security boundary or a mainnet
+  onboarding recipe.
+- Production evidence and work require bearer or signed-validator
+  authorization over HTTPS with the TLS key terminating inside the measured
+  environment. The fixed UID30 image alone uses the bounded legacy bridge
+  documented in `WORK_REQUEST_V2.md`. Its published digest predates the new
+  `worker migrate` command.

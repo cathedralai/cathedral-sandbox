@@ -1163,6 +1163,7 @@ def test_the_runtime_is_wired_to_the_minted_token(tmp_path: Path) -> None:
     minted = body["worker_token"]
 
     args = argparse.Namespace(
+        runtime_posture="development",
         registry_db=str(registry_db),
         ledger_db=str(tmp_path / "ledger.sqlite"),
         tokens_file=None,  # no operator file at all: the new-miner case

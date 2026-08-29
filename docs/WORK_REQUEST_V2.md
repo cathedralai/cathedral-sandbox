@@ -3,9 +3,10 @@
 ## Status
 
 The general worker and remote client implement this protocol in merged source.
-The signed-fleet audit-image change now pins its verifier dependency and fixes
-the image entrypoint and host contract in source. It is not yet a published or
-deployed activation image.
+The reviewed fixed audit image is published at the digest recorded in
+[`SN39_AUDIT_MINER_OPERATIONS.md`](SN39_AUDIT_MINER_OPERATIONS.md). Publication
+is not deployment or live proof. The two-machine signed-fleet activation and
+production deployment remain open gates.
 
 The fixed image always uses permit-only qualification with a local minimum
 stake of `0` Rao and always keeps the narrow public evidence and canonical SAT
@@ -13,8 +14,8 @@ bridge for the current UID30 collector. Those are reviewed image constants,
 not operator-selectable modes. Fleet discovery and nontrivial validation work
 stay signed. Customer SAT stays disabled.
 
-Do not describe signed fleet access as deployed or production-ready. The
-remaining [activation gates](#activation-gates) stay open.
+Do not describe signed fleet access as deployed or live-proven. The remaining
+[activation gates](#activation-gates) stay open.
 
 ## Plain-language flow
 
@@ -283,7 +284,7 @@ The primary chain axon does not need to be repeated. The worker adds it first.
 Omit the manifest for exact one-machine compatibility.
 
 ```bash
-cathedral worker serve \
+cathedral worker migrate \
   --hotkey <miner-hotkey> \
   --host 0.0.0.0 \
   --port 8081 \
@@ -300,16 +301,17 @@ cathedral worker serve \
   --validator-netuid 39 \
   --public-endpoint https://<primary-public-ip>:8081 \
   --fleet-manifest /srv/cathedral/fleet.json \
-  --allow-public-legacy-audit
+  --migration-mode public-legacy-audit
 ```
 
 Signed-only audit serving does not require a bearer. Keep the enrollment bearer
-configured during migration if customer SAT or a legacy validator still uses
-it. `--allow-public-bootstrap-evidence` is a temporary compatibility flag for
-evidence only. `--allow-public-legacy-audit` is the bounded UID30 bridge. It
-keeps evidence and canonical audit SAT public while fleet discovery,
-capabilities, and noncanonical customer SAT remain protected. Remove the
-legacy bridge only after the signed validator path is live and rollback-tested.
+configured during migration if a legacy validator still uses it. The explicit
+`worker migrate --migration-mode public-bootstrap-evidence` posture opens only
+evidence. `public-legacy-audit` is the bounded UID30 bridge. It keeps evidence
+and canonical audit SAT public while fleet discovery, capabilities, and
+noncanonical customer SAT remain protected. Neither migration mode is accepted
+by production `worker serve` or development `worker develop`. Remove the bridge
+after the signed validator path is live and rollback-tested.
 After headers are parsed and authenticated, public bridge traffic has its own
 bounded pools and cannot occupy the reserved signed-validator request pool. It
 still shares the pre-header connection gate described above.
@@ -341,8 +343,9 @@ still shares the pre-header connection gate described above.
   alone earn zero. Every counted machine needs fresh evidence, assigned-hotkey
   binding, QVL-derived stable hardware identity, TLS SPKI binding, global
   uniqueness, and replayed canonical SAT.
-- The transport is TEE-profile neutral and preserves `--tee snp` serving.
-  Live multi-machine scoring remains Intel TDX-only. AMD SEV-SNP must complete
+- The transport is TEE-profile neutral. `--tee snp` exists only under the
+  explicit `worker develop` posture. Live multi-machine scoring remains Intel
+  TDX-only. AMD SEV-SNP must complete
   the friend-hardware probe and prove stable `CHIP_ID` deduplication before SNP
   fleet rewards are enabled.
 - The miner or host operator is trusted for access-policy accuracy. An operator
@@ -356,46 +359,48 @@ still shares the pre-header connection gate described above.
 
 ## Migration compatibility
 
-- No signed-access flags means the existing worker behavior is unchanged.
+- `worker serve` is the signed/bearer-protected production surface and exposes
+  no public-route compatibility controls.
+- `worker migrate` requires the complete signed-access bundle and exactly one
+  explicit migration mode.
 - Signed access plus no fleet manifest returns exactly the current chain axon.
 - SAT and capabilities accept either a qualified signed validator request or
   the existing valid bearer.
-- Evidence is signed by default. The explicit bootstrap flag preserves its old
-  public behavior while validators migrate.
-- The explicit legacy-audit flag preserves both public evidence and public
-  canonical SAT for the current UID30 collector. It never opens noncanonical
-  customer work.
+- `public-bootstrap-evidence` preserves the old public evidence route while
+  validators migrate.
+- `public-legacy-audit` preserves public evidence and canonical SAT for the
+  current UID30 collector. It never opens noncanonical customer work.
 - Fleet discovery never accepts a bearer and never becomes public.
 - Bearer removal requires a later measured-image change after all active
   validators have moved and rollback evidence exists.
 
 ## Activation gates
 
-The image implementation is not a publication or live-deployment claim. These
-gates remain required:
+Image review, merge, immutable publication, provenance inspection, anonymous
+manifest access, runtime-label verification, and the UID124 rollback exercise
+are complete for the digest in `SN39_AUDIT_MINER_OPERATIONS.md`. Publication is
+not deployment. These activation gates remain:
 
-1. Review and merge the separate image change. It pins the Linux amd64
-   `py-sr25519-bindings` wheel by hash, runs a build-time known-answer test, and
-   fixes snapshot, key, fleet, persistent-state, entrypoint, configfs, and host
-   nftables contracts.
-2. Publish the merged image by immutable digest with provenance and anonymous pull,
-   then record the measurement and application-image assurance boundary.
-3. Merge and configure the validator signer and fleet traversal. Prove UID30
+1. Configure the validator signer and fleet traversal. Prove UID30
    signs with its existing hotkey and no private key enters the worker guest.
-4. Complete a two-endpoint Intel TDX test with fresh QVL, same-SPKI work on
+2. Complete a two-endpoint Intel TDX test with fresh QVL, same-SPKI work on
    each endpoint, distinct endpoint, distinct TLS SPKI, stable distinct-hardware
    deduplication, and deterministic scoring.
-5. Keep AMD SEV-SNP fleet scoring disabled until the friend-owned hardware test
+3. Keep AMD SEV-SNP fleet scoring disabled until the friend-owned hardware test
    proves stable `CHIP_ID` behavior.
 
-## Published image remains legacy until promotion
+## Published image remains in legacy migration posture until replacement
 
-The post-merge source-only image digest from the validator-access PR contains
-the Python modules but not the sr25519 wheel or fixed signed-fleet entrypoint.
-It is not an activation digest. The new image source adds those contracts, but
-it becomes deployable only after review, merge, immutable publication,
-provenance, anonymous pull, exact runtime-label verification, edge-control
-exercise, and rollback proof.
+The reviewed published image was built from source merge
+`8ad7f6e127ad7dcc4dd150f0e1eb47ce72c5ab22`. Its fixed command uses
+`worker serve --tee tdx --allow-public-legacy-audit`, and it does not emit
+`cathedral_effective_startup_v1`. The current source candidate moves the same
+bounded bridge to `worker migrate --migration-mode public-legacy-audit`, but
+that command must not be attributed to the published digest. It remains
+source-only until a replacement image, provenance result, and immutable digest
+are published and recorded. Promotion to signed-only `worker serve` requires a
+later reviewed image change. Do not treat publication as evidence the artifact
+is deployed or serving live traffic.
 
 The fixed host paths and exact startup are documented in
 [SN39_AUDIT_MINER_IMAGE.md](SN39_AUDIT_MINER_IMAGE.md). The config directory is

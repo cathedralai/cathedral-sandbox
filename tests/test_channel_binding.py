@@ -130,8 +130,9 @@ def test_public_launch_docs_require_protected_production_channel():
     launch = Path("docs/TDX_LAUNCH.md").read_text(encoding="utf-8")
     normalized = " ".join(launch.split())
     assert "Production endpoints use HTTPS" in normalized
-    assert "before writing any request bytes" in normalized
-    assert "Plain HTTP is limited to the explicit development loopback" in normalized
+    assert "A bearer is sent only over certificate-verified TLS" in normalized
+    assert "only then sends protected work" in normalized
+    assert "Plain HTTP and authentication relaxations exist only under `worker develop`" in normalized
     assert "A public certificate by itself does not prove" in normalized
 
 

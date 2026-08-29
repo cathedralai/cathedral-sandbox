@@ -25,7 +25,13 @@ from cathedral.cli import (
     build_parser,
     _REDACT_PATTERNS,
 )
-from cathedral.runtime import MAX_BEARER_TOKEN_LENGTH, EpochRun, MinerOutcome, MinerTarget
+from cathedral.runtime import (
+    MAX_BEARER_TOKEN_LENGTH,
+    EpochRun,
+    MinerOutcome,
+    MinerTarget,
+    RuntimeConfig,
+)
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -684,8 +690,8 @@ _RUN_EPOCH_ARGV = [
     "r.sqlite",
     "--ledger-db",
     "l.sqlite",
-    "--measurements-file",
-    "m.json",
+    "--policy-registry",
+    "policy.json",
     "--canary-hotkey",
     "canary",
     "--canary-endpoint",
@@ -749,28 +755,19 @@ def test_json_is_default_mode_for_run_epoch(monkeypatch, capsys, tmp_path):
     import argparse
 
     from cathedral.cli import cmd_runtime_run_epoch
-    from cathedral.runtime import ConfidentialRuntime
-
     fixed_run = _make_run([_ok_outcome()])
     monkeypatch.setattr(
-        ConfidentialRuntime, "run_epoch", lambda *a, **kw: fixed_run
+        "cathedral.cli._build_runtime",
+        lambda *_a, **_kw: (
+            argparse.Namespace(config=RuntimeConfig(), run_epoch=lambda *_a, **_kw: fixed_run),
+            argparse.Namespace(close=lambda: None),
+            {},
+        ),
     )
 
-    measurements = tmp_path / "m.json"
-    measurements.write_text('["measurement"]')
-
     args = argparse.Namespace(
-        registry_db=str(tmp_path / "r.sqlite"),
-        ledger_db=str(tmp_path / "l.sqlite"),
-        measurements_file=str(measurements),
-        tokens_file=None,
-        miner_timeout_seconds=10.0,
-        miner_attempts=2,
-        max_workers=4,
-        development=True,
-        publisher_endpoint=None,
-        publisher_bearer_env="CATHEDRAL_PUBLISHER_BEARER_TOKEN",
-        publisher_hmac_env="CATHEDRAL_PUBLISHER_HMAC_SECRET",
+        runtime_command="run-epoch",
+        runtime_posture="production",
         canary_hotkey="canary",
         canary_endpoint="http://127.0.0.1:9000",
         source_epoch=7,
@@ -790,28 +787,19 @@ def test_pretty_mode_for_run_epoch_produces_no_json(monkeypatch, capsys, tmp_pat
     import argparse
 
     from cathedral.cli import cmd_runtime_run_epoch
-    from cathedral.runtime import ConfidentialRuntime
-
     fixed_run = _make_run([_ok_outcome()])
     monkeypatch.setattr(
-        ConfidentialRuntime, "run_epoch", lambda *a, **kw: fixed_run
+        "cathedral.cli._build_runtime",
+        lambda *_a, **_kw: (
+            argparse.Namespace(config=RuntimeConfig(), run_epoch=lambda *_a, **_kw: fixed_run),
+            argparse.Namespace(close=lambda: None),
+            {},
+        ),
     )
 
-    measurements = tmp_path / "m.json"
-    measurements.write_text('["measurement"]')
-
     args = argparse.Namespace(
-        registry_db=str(tmp_path / "r.sqlite"),
-        ledger_db=str(tmp_path / "l.sqlite"),
-        measurements_file=str(measurements),
-        tokens_file=None,
-        miner_timeout_seconds=10.0,
-        miner_attempts=2,
-        max_workers=4,
-        development=True,
-        publisher_endpoint=None,
-        publisher_bearer_env="CATHEDRAL_PUBLISHER_BEARER_TOKEN",
-        publisher_hmac_env="CATHEDRAL_PUBLISHER_HMAC_SECRET",
+        runtime_command="run-epoch",
+        runtime_posture="production",
         canary_hotkey="canary",
         canary_endpoint="http://127.0.0.1:9000",
         source_epoch=7,
