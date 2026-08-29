@@ -29,7 +29,6 @@ from cathedral.audit_miner_entrypoint import (
     WORKER_BEARER_ENV,
     WORKER_HOST,
     WORKER_PORT,
-    WORKER_TEE,
     EntrypointError,
     generate_tls_material,
     main,
@@ -255,11 +254,11 @@ def test_entrypoint_execs_only_the_fixed_tls_tdx_worker_command(tmp_path: Path) 
 
     argv = captured["argv"]
     child_environment = captured["environ"]
-    assert argv[1:8] == ["-I", "-u", "-B", "-m", "cathedral.cli", "worker", "serve"]
+    assert argv[1:8] == ["-I", "-u", "-B", "-m", "cathedral.cli", "worker", "migrate"]
     assert argv[argv.index("--hotkey") + 1] == HOTKEY
     assert argv[argv.index("--host") + 1] == WORKER_HOST
     assert argv[argv.index("--port") + 1] == str(WORKER_PORT)
-    assert argv[argv.index("--tee") + 1] == WORKER_TEE == "tdx"
+    assert "--tee" not in argv
     assert argv[argv.index("--tls-certificate") + 1].endswith(TLS_CERTIFICATE)
     assert argv[argv.index("--tls-private-key") + 1].endswith(TLS_PRIVATE_KEY)
     assert argv[argv.index("--validator-access-snapshot") + 1] == str(
@@ -275,7 +274,8 @@ def test_entrypoint_execs_only_the_fixed_tls_tdx_worker_command(tmp_path: Path) 
     assert argv[argv.index("--validator-netuid") + 1] == str(VALIDATOR_NETUID) == "39"
     assert argv[argv.index("--public-endpoint") + 1] == PUBLIC_ENDPOINT
     assert argv[argv.index("--fleet-manifest") + 1] == str(FLEET_MANIFEST)
-    assert argv.count("--allow-public-legacy-audit") == 1
+    assert argv[argv.index("--migration-mode") + 1] == "public-legacy-audit"
+    assert "--allow-public-legacy-audit" not in argv
     assert "--allow-public-bootstrap-evidence" not in argv
     assert "--development-no-auth" not in argv
     assert "--development-allow-non-loopback" not in argv
@@ -413,6 +413,31 @@ def test_operator_doc_keeps_digest_and_tdx_measurement_as_separate_boundaries() 
     assert "It cannot launch the reviewed legacy digest" in documentation
     assert "First activation stays blocked" in normalized_documentation
     assert "A digest-only swap is not a rollback plan" in normalized_documentation
+
+
+def test_operator_docs_do_not_attribute_source_only_posture_split_to_published_digest() -> None:
+    image_documentation = (
+        REPOSITORY_ROOT / "docs" / "SN39_AUDIT_MINER_IMAGE.md"
+    ).read_text()
+    operations = (
+        REPOSITORY_ROOT / "docs" / "SN39_AUDIT_MINER_OPERATIONS.md"
+    ).read_text()
+    work_request = (REPOSITORY_ROOT / "docs" / "WORK_REQUEST_V2.md").read_text()
+
+    for documentation in (image_documentation, operations, work_request):
+        normalized = " ".join(documentation.split())
+        assert "8ad7f6e127ad7dcc4dd150f0e1eb47ce72c5ab22" in normalized
+        assert "worker serve" in normalized
+        assert "--allow-public-legacy-audit" in normalized
+        assert "worker migrate --migration-mode public-legacy-audit" in normalized
+        assert "cathedral_effective_startup_v1" in normalized
+        assert "must not be attributed" in normalized
+
+    assert "source-only replacement contract" in image_documentation
+    assert "Record a new source merge, immutable" in operations
+    assert "remains source-only until a replacement image" in " ".join(
+        work_request.split()
+    )
 
 
 def test_host_startup_is_syntax_valid_and_pins_the_exact_pulled_runtime() -> None:

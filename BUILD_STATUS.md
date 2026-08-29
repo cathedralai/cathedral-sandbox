@@ -1,8 +1,8 @@
 # Build and evidence status
 
-Evidence record last updated: 2026-07-24
+Evidence record last updated: 2026-08-07
 
-Documentation and public-surface audit: 2026-07-25
+Documentation and public-surface audit: 2026-08-29
 
 > **Public phase: mainnet live testing.**
 >
@@ -37,11 +37,14 @@ Testnet SN292 remains the non-paying dry-run integration lane.
 ## Implemented and historically proven
 
 - Cathedral Confidential is the primary verified-supply score source under
-  `validated_supply_v1`. The validator independently enforces the versioned
+  `validated_supply_v2`. The validator independently enforces the versioned
   burn contract; miners cannot choose the allocation.
-- The worker serves credential-free, bounded `POST /v1/evidence` collection
-  and `POST /v1/sat-work`, whose canonical audit instance is credential-free
-  too; customer SAT on that path stays authenticated. Connection admission
+- The production worker authenticates its work and evidence routes. Current
+  source has a separate, explicit migration posture for the bounded public
+  evidence/canonical-SAT bridge. The published UID30 image predates that
+  command split and retains the same bridge through its fixed legacy flag.
+  Customer SAT stays authenticated.
+  Connection admission
   and the three request-class pools are acquired before untrusted body reads,
   so partial requests cannot grow handler threads without a ceiling. It returns
   real Intel TDX hardware quotes (8000-byte quotes in the recorded hardware run, with
@@ -60,9 +63,11 @@ Testnet SN292 remains the non-paying dry-run integration lane.
   A historical chain query at that block returns exactly
   `[(163, 65535), (204, 7282)]` for validator UID 30: the admitted Intel TDX
   worker plus the fixed burn destination.
-- The recorded policy is `validated_supply_v1`: up to 90% for validated Intel
-  TDX CPU supply and exactly 10% forced burn. The recorded positive worker had
-  validator-dispatched verified work. Attestation alone still pays nothing.
+- The current policy is `validated_supply_v2`: up to 90% for validated Intel
+  TDX CPU supply and exactly 10% forced burn. The 2026-07-24 historical
+  acceptance used `validated_supply_v1`; replaying it requires that explicit
+  historical mechanism. The recorded positive worker had validator-dispatched
+  verified work. Attestation alone still pays nothing.
 - Controlled positive-worker evidence replays through the pinned Intel TDX
   verifier. Whole-epoch FULL provenance remains `NOT_PROVEN`: zero-scored
   candidates have explicit zero rows but not candidate-specific replayable
@@ -70,7 +75,7 @@ Testnet SN292 remains the non-paying dry-run integration lane.
 - Hardware epochs run on a 60-second cycle; each verified epoch produces 20
   validator-derived work units at score 1.0.
 - Post-migration foreign-key integrity is clean.
-- Repository test suite: 2117 tests collected. (Collected, not passing: the
+- Repository test suite: 2137 tests collected. (Collected, not passing: the
   TDX and SEV-SNP suites skip unless the hardware and CATHEDRAL_RUN_TDX_HW /
   CATHEDRAL_RUN_SNP_HW are present, so a passing total differs between a laptop
   and the TDX box. tests/test_documented_counts.py holds this number to the suite.)
@@ -85,7 +90,16 @@ summary instead of JSON. JSON remains the default.
 cathedral runtime run-epoch \
   --registry-db /data/registry.sqlite \
   --ledger-db /data/ledger.sqlite \
-  --measurements-file /etc/cathedral/measurements.json \
+  --policy-registry /etc/cathedral/policy-registry.json \
+  --policy-registry-keys /etc/cathedral/policy-keys.json \
+  --policy-registry-keys-digest sha256:<pinned-digest> \
+  --policy-registry-state /data/policy-registry-state.json \
+  --receipt-signing-key-id <active-receipt-key-id> \
+  --receipt-signing-key-file /run/secrets/receipt.seed \
+  --evidence-retention-dir /data/retained-evidence \
+  --challenge-anchor-block <finalized-block> \
+  --challenge-anchor-hash <finalized-block-hash> \
+  --score-network finney --score-netuid 39 \
   --canary-hotkey $CANARY_HOTKEY \
   --canary-endpoint $CANARY_ENDPOINT \
   --source-epoch 7 \
@@ -158,7 +172,7 @@ automatically (in place, preserving all rows) the first time they are opened.
 Mainnet broadcast has passed limited historical acceptance tests. The validator
 used for those tests:
 
-1. requires the signed `validated_supply_v1` policy;
+1. required the signed `validated_supply_v1` historical policy;
 2. verifies the `finney` / netuid 39 envelope and freshness;
 3. maps every positive hotkey against the live metagraph; and
 4. submits the complete confidential vector.

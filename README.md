@@ -36,6 +36,10 @@ Three rules keep it honest:
 
 **What pays today: verified work under `validated_supply_v2`.**
 
+Operator command boundaries are defined in
+[`docs/OPERATOR_POSTURES.md`](docs/OPERATOR_POSTURES.md). Production,
+development/preview, and legacy migration use separate command surfaces.
+
 1. The validator derives a fresh challenge from finalized SN39 chain state and
    your hotkey. Your worker answers with an Intel TDX quote bound to that
    challenge; an unknown measurement is rejected no matter how valid the quote.
@@ -111,7 +115,7 @@ python -m pip install -e '.[dev]'
 python -m pytest -q
 ```
 
-The suite collects 2117 tests, and `tests/test_documented_counts.py` holds that
+The suite collects 2137 tests, and `tests/test_documented_counts.py` holds that
 number to this file, so it cannot quietly drift. Passing proves software
 behavior against test doubles; it does not prove live hardware, deployment, or
 an on-chain write. Details: [docs/TESTING.md](docs/TESTING.md) and the dated

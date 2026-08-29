@@ -241,12 +241,17 @@ runtime both revoke it as an identity conflict.
 The verifier receives a fixed credential-free environment. It must not require
 secrets or credentials in its command line, inherited environment, or logs.
 
-## Audit-only runtime path
+## Development audit-only runtime path
+
+GPU composition is a development preview. Production `worker serve`,
+`runtime canary`, `runtime audit-attestation`, and `runtime run-epoch` do not
+accept GPU configuration. The preview does not issue assurance receipts,
+publish score reports, create epochs, or make a GPU miner production-eligible.
 
 The worker enables the two-component wire response explicitly:
 
 ```text
-cathedral worker serve ... --gpu-composite
+cathedral worker develop ... --gpu-composite
 ```
 
 The worker still requires the protected-channel configuration used by TDX v2,
@@ -254,7 +259,7 @@ plus `CATHEDRAL_GPU_COLLECT_CMD`. The validator runtime enables GPU audit mode
 only when all four identity/profile settings are present:
 
 ```text
-cathedral runtime audit-attestation ... \
+cathedral runtime develop-audit-attestation ... \
   --policy-registry policy.json \
   --policy-registry-keys trusted-keys.json \
   --policy-registry-keys-digest sha256:<trusted-key-file-digest> \
@@ -269,20 +274,18 @@ cathedral runtime audit-attestation ... \
 ELF verifier executable and no arguments.
 Every verifier sets `CATHEDRAL_GPU_VERIFY_CMD_ARTIFACTS` to a one-element JSON
 array containing that same executable. The signed profile pins its digest. The
-path must satisfy the root-owned immutable path checks above, and interpreted
-entry points are not accepted. The
-identity-key file is a 32-byte base64 value and must be owner-only in
-production. The HTTPS
+path must satisfy the executable and artifact checks above, and interpreted
+entry points are not accepted. The identity-key file is a 32-byte base64 value.
+The HTTPS
 worker, client, and runtime carry exactly one TDX and one GPU component, verify
 their shared binding, and only then promote the live channel claim. Supplying
 partial GPU configuration, a CPU-only response to a GPU request, an extra
 component, or GPU evidence to a CPU request is rejected without downgrade.
-Both the main runtime and the standalone lifecycle probe enforce the same
-production startup gate before reading enrollments: a currently active signed
-registry profile, a production static external verifier, exact preflight, and
-the authenticated durable GPU identity registry. They pass the profile validity
-window, release, and digest into the lifecycle transaction, which checks them
-again using commit-time UTC before accepting the compare-and-swap.
+The development runtime still requires a currently active signed registry
+profile, exact verifier preflight, and complete GPU identity configuration.
+The standalone lifecycle probe retains its stricter production startup gate
+for identity-state operations. A successful preview audit is not a production
+admission or scoring result.
 
 The standalone probe exposes the same configuration directly:
 

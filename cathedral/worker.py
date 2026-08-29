@@ -57,15 +57,14 @@ MAX_REQUEST_BODY: int = 64 * 1024
 MAX_RESPONSE_BODY: int = MAX_EVIDENCE_RESPONSE_BODY
 # Sized for the 4 vCPU guest the worker ships in. Authenticated work gets one
 # slot per vCPU because canonical SAT is CPU bound and customer SAT runs in a
-# child process, so the slots map onto real parallelism. The credential-free
-# challenge paths get their own smaller pool: a validator needs one quote and
-# one unauthenticated canonical audit per miner per epoch plus room for a
-# retry. A SAT POST that already carries the configured bearer uses the
-# authenticated pool instead, so public evidence/audit cannot starve it.
-# Credential-free SAT gets a third pool of its own: it is the only public path
-# that must parse an attacker-chosen instance before it can decide whether the
-# request is the canonical audit, so it must not be able to occupy the slots a
-# validator needs for quote collection.
+# child process, so the slots map onto real parallelism. Explicit migration
+# and development-no-auth challenge paths get their own smaller pool: a
+# migration validator needs one quote and one canonical audit per miner per
+# epoch plus room for a retry. A POST that carries the configured bearer uses
+# the authenticated pool instead. Public migration SAT gets a third pool of
+# its own: it must parse an attacker-chosen instance before it can decide
+# whether the request is the canonical audit, so it must not be able to occupy
+# the slots a validator needs for quote collection.
 MAX_CONCURRENT: int = 4
 MAX_CHALLENGE_CONCURRENT: int = 2
 MAX_SAT_CHALLENGE_CONCURRENT: int = 2
@@ -80,7 +79,6 @@ _EVIDENCE_V2_REQUEST_KEYS = _EVIDENCE_REQUEST_KEYS | frozenset(
     {"report_data_version", "channel_binding_type", "channel_binding_digest_hex"}
 )
 _SAT_REQUEST_KEYS = frozenset({"challenge_id", "assigned_hotkey", "instance", "seed"})
-_CREDENTIAL_FREE_PATHS = frozenset({"/v1/evidence", "/v1/sat-work"})
 _POST_PATHS = frozenset(
     {"/v1/evidence", "/v1/capabilities", "/v1/sat-work", "/v1/fleet"}
 )
@@ -332,9 +330,7 @@ def _make_handler(
             header = self.headers.get("Authorization", "")
             expected = f"Bearer {bearer_token}"
             # compare_digest raises TypeError on non-ASCII strings. A junk
-            # Authorization header is unauthenticated, not a crash: evidence
-            # and canonical SAT are public, and customer SAT 401s in the
-            # handler when this returns False.
+            # Authorization header is unauthenticated, not a crash.
             if not isinstance(header, str) or not header.isascii():
                 return False
             return hmac.compare_digest(header, expected)
@@ -389,21 +385,11 @@ def _make_handler(
             if path == "/v1/fleet" and validator_authorizer is None:
                 self._send_json(404, {"error": "fleet discovery unavailable"})
                 return
-            # Fresh evidence is deliberately credential-free: the validator
-            # holds no bearer token for a worker it has not attested yet, and
-            # work credentials are issued only after the attested channel is
-            # verified. The server-level connection gate and this path's own
-            # challenge pool are both acquired before its body is read, so a
-            # stalled public caller consumes finite capacity for one deadline
-            # rather than creating an unbounded reader thread.
-            #
-            # Canonical audit SAT is the other half of that same public
-            # challenge and is credential-free for the same reason: an
-            # independent validator proves a worker serves before it has any
-            # work credential to present.  The gate cannot tell canonical from
-            # customer work until the body has been parsed, so the bearer for
-            # a noncanonical instance is enforced in _handle_sat_work instead.
-            legacy_public = validator_authorizer is None and path in _CREDENTIAL_FREE_PATHS
+            # Public evidence and canonical SAT exist only for an explicit
+            # migration bridge or a development worker with authentication
+            # disabled. Normal bearer-only production authenticates every
+            # POST. Signed-access production requires a validator envelope for
+            # evidence even when a fallback bearer is configured.
             public_bootstrap = (
                 path == "/v1/evidence"
                 and validator_authorizer is not None
@@ -414,16 +400,18 @@ def _make_handler(
                 and validator_authorizer is not None
                 and allow_public_legacy_audit
             )
-            credential_free = legacy_public or public_bootstrap or public_legacy_sat
-            # Evidence never inspects Authorization. SAT does, only so a valid
-            # bearer can take the work pool; a junk header is unauthenticated
-            # rather than a TypeError before the request try block.
-            if path in {"/v1/evidence", "/v1/fleet"}:
+            credential_free = public_bootstrap or public_legacy_sat
+            if path == "/v1/fleet":
+                auth_ok = False
+            elif path == "/v1/evidence" and validator_authorizer is not None:
+                # Do not let a bearer bypass signed evidence access. Migration
+                # modes are handled by credential_free above.
                 auth_ok = False
             elif validator_authorizer is not None and bearer_token is None:
                 # In signed-access mode, an intentionally absent migration
                 # bearer means "signature required", not "authentication
-                # disabled". Preserve the legacy no-authorizer semantics.
+                # disabled". Development no-auth has no authorizer and still
+                # follows _check_auth below.
                 auth_ok = False
             else:
                 auth_ok = self._check_auth()
@@ -470,16 +458,13 @@ def _make_handler(
                         return
                 # A SAT POST with a configured, valid bearer is customer work
                 # (or a validator that already holds the credential). It uses
-                # the authenticated pool so public evidence/audit cannot 503
-                # it.
+                # the authenticated pool so public migration traffic cannot
+                # 503 it.
                 #
-                # Unauthenticated SAT gets its OWN pool, not the evidence pool.
-                # Canonical classification needs the parsed instance, so an
-                # unauthenticated noncanonical request necessarily holds a slot
-                # through json.loads and _parse_instance before 401ing. Sharing
-                # the evidence pool would let public SAT traffic 503 a
-                # validator's quote collection, and a validator that cannot
-                # collect a quote scores the miner zero.
+                # Explicit public-migration SAT gets its own pool, not the
+                # evidence pool. Canonical classification needs the parsed
+                # instance. Sharing the evidence pool would let migration SAT
+                # traffic 503 a validator's quote collection.
                 if preauthorized_validator is not None:
                     # Signed validator control traffic has reserved
                     # request-class capacity after headers are parsed and the
@@ -491,6 +476,10 @@ def _make_handler(
                     pool = semaphore
                 elif path == "/v1/sat-work":
                     pool = sat_challenge_semaphore
+                elif path == "/v1/evidence":
+                    # Evidence collection stays isolated from work even when a
+                    # production bearer authenticated the request.
+                    pool = challenge_semaphore
                 elif credential_free or signed_candidate or path == "/v1/fleet":
                     pool = challenge_semaphore
                 else:
@@ -717,9 +706,9 @@ def _make_handler(
                 self._send_json(400, {"error": "invalid instance"})
                 return
             canonical = instance == _canonical_instance(seed)
-            # The gate let this path through unauthenticated so the public
-            # canonical audit works; anything else is customer work and must
-            # present the bearer before a solver is entered.
+            # Explicit migration may let canonical SAT through without
+            # credentials. Anything else is customer work and must present the
+            # bearer before a solver is entered.
             if not canonical and (
                 (validator_authorizer is not None and bearer_token is None)
                 or not self._check_auth()
@@ -901,11 +890,11 @@ class WorkerServer:
     restricted to deterministic ``SatLane`` canonical backfill by default.
     Customer-submitted SAT is an explicit authenticated deployment mode.
 
-    Unauthenticated ``/v1/evidence`` and canonical ``/v1/sat-work`` run on
-    their own pools. Verified validator requests have another reserved pool
-    after headers are parsed and authenticated, so the explicit public
-    migration bridge cannot consume signed request-class capacity. A SAT POST
-    that already carries the configured bearer uses the work pool.
+    Public migration and development-no-auth ``/v1/evidence`` and canonical
+    ``/v1/sat-work`` run on their own pools. Verified validator requests have
+    another reserved pool after headers are parsed and authenticated, so the
+    explicit public migration bridge cannot consume signed request-class
+    capacity. A POST carrying the configured bearer uses the work pool.
     Noncanonical SAT still requires that bearer before any solver runs. A
     shared final gate caps every connection before a request handler thread
     starts, and each request-class gate is acquired before its body is read.

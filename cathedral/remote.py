@@ -260,14 +260,14 @@ class RemoteMiner:
                     "channel_binding_digest_hex": binding.digest.hex(),
                 },
                 expected_binding=None,
-                include_auth=False,
+                include_auth=True,
                 include_validator_auth=True,
             )
         else:
             response = self._post_http(
                 "/v1/evidence",
                 {"nonce_hex": nonce.hex(), "assigned_hotkey": self._hotkey},
-                include_auth=False,
+                include_auth=True,
             )
         if set(response) == _EVIDENCE_BUNDLE_RESPONSE_KEYS:
             if self._scheme != "https" or not isinstance(response["evidence"], list):
@@ -357,9 +357,10 @@ class RemoteMiner:
             or len(evidence.nonce) != 32
         ):
             raise RemoteError("the signed access check requires the confirmed evidence")
-        # This must succeed before the negative control. A legacy bearer-only
-        # worker also returns 401 without a bearer, but it returns 401 here too
-        # because it ignores the validator signature.
+        # This must succeed before the negative control. An endpoint protected
+        # by some other mechanism also returns 401 when that credential is
+        # absent, but it returns 401 here too because it ignores the validator
+        # signature.
         self.supports_customer_sat()
         try:
             self._post_tls(

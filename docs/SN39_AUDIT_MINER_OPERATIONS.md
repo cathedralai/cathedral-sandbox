@@ -28,6 +28,13 @@ The digest passed anonymous manifest inspection and build-provenance verificatio
 The digest remains an operator-enforced supply-chain pin. It is not included in
 TDX MRTD or an RTMR automatically.
 
+This pin predates the production/development/migration command split. Its
+entrypoint invokes `worker serve --tee tdx --allow-public-legacy-audit` and
+does not emit `cathedral_effective_startup_v1`. The current source candidate
+uses `worker migrate --migration-mode public-legacy-audit`, but that command
+must not be attributed to this digest. Record a new source merge, immutable
+digest, and provenance result here before using the replacement contract.
+
 Publication is not deployment or live proof. The first-activation rollback was
 captured and exercised on 2026-08-29 using the preserved legacy image. A bounded
 TDX guest booted, the pinned QVL passed, the TLS SPKI remained bound through

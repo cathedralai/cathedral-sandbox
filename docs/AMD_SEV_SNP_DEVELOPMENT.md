@@ -59,7 +59,7 @@ does not configure the separate runtime process.
 
 ```bash
 export CATHEDRAL_SNPGUEST=/absolute/path/to/reviewed/snpguest
-cathedral worker serve \
+cathedral worker develop \
   --tee snp \
   --hotkey '<public miner hotkey>' \
   --host 127.0.0.1 \
@@ -85,12 +85,12 @@ The runtime selector is:
 --cpu-tee tdx|snp
 ```
 
-`snp` is accepted only with `--development`, a loopback HTTPS endpoint, and
-only by these commands:
+`snp` exists only on the explicit development command surface, uses a loopback
+HTTPS endpoint for local review, and is accepted only by these commands:
 
-- `runtime audit-attestation`, which verifies fresh evidence and the live TLS
+- `runtime develop-audit-attestation`, which verifies fresh evidence and the live TLS
   binding without dispatching work.
-- `runtime canary`, which performs the same check and then verifies one
+- `runtime develop-canary`, which performs the same check and then verifies one
   canonical 20-unit SAT response on the attested channel.
 
 Create an owner-only development policy:
@@ -108,8 +108,7 @@ that process's trust store:
 ```bash
 export CATHEDRAL_SNPGUEST=/absolute/path/to/reviewed/snpguest
 export SSL_CERT_FILE=/absolute/path/to/development-ca.crt
-cathedral runtime canary \
-  --development \
+cathedral runtime develop-canary \
   --cpu-tee snp \
   --registry-db /absolute/path/to/snp-dev-registry.sqlite \
   --ledger-db /absolute/path/to/snp-dev-ledger.sqlite \
@@ -137,7 +136,7 @@ Development SNP refuses:
 - Receipt signing keys.
 - The production signed policy-registry path.
 - GPU composition.
-- Production mode without `--development`.
+- Every production runtime command. Production parsers do not expose an SNP selector.
 
 The runtime keeps raw AMD CHIP_ID transient. It does not write the value to the
 provider registry or a score report. The separate validator development preview

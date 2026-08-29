@@ -186,10 +186,12 @@ Miners cannot choose their own credit. Every work unit's difficulty and credit i
   evidence relay, and the key digest binds the quote to either the live TLS
   SubjectPublicKeyInfo or an application-encryption key. Legacy concatenation
   remains available only to explicit non-production migration and test paths.
-- **Protected dispatch:** the validator observes the TLS key on the evidence
-  connection, verifies the same digest inside fresh quote evidence, and checks
-  the key again on the exact connection before it sends work or bearer
-  credentials. A redirect, downgrade, or certificate rotation fails closed.
+- **Protected dispatch:** the validator authenticates evidence with a signed
+  request or sends the worker bearer only over certificate-verified TLS. It
+  observes the TLS key on that connection, verifies the same digest inside
+  fresh quote evidence, and checks the key again on the exact connection
+  before it sends work. A redirect, downgrade, or certificate rotation fails
+  closed.
 
 **Validator-side verifier** does policy; vendors do the crypto:
 - AMD KDS cert chains, Intel DCAP / Trust Authority, NVIDIA NRAS/nvtrust

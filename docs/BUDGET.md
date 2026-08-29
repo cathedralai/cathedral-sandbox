@@ -13,7 +13,7 @@ decision recorded in the decision log — never a config drift.
 
 ## Burn controls (on-chain emission)
 
-- **Fixed 10% burn floor.** `validated_supply_v1` allocates
+- **Fixed 10% burn floor.** `validated_supply_v2` allocates
   units-proportional shares to verified miners with a FIXED 10% burn to
   the configured burn hotkey (`MECHANISM_BURN_FRACTION = 0.10` in the
   subnet validator; validated again by the thin vector contract). The

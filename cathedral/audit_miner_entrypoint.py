@@ -50,7 +50,6 @@ TLS_CERTIFICATE = "worker.crt"
 TLS_PRIVATE_KEY = "worker.key"
 WORKER_HOST = "0.0.0.0"
 WORKER_PORT = 8081
-WORKER_TEE = "tdx"
 VALIDATOR_NETWORK = "finney"
 VALIDATOR_NETUID = 39
 VALIDATOR_MINIMUM_STAKE_RAO = 0
@@ -252,7 +251,7 @@ def worker_command(inputs: DeploymentInputs, material: TLSMaterial) -> list[str]
         "-m",
         "cathedral.cli",
         "worker",
-        "serve",
+        "migrate",
         "--hotkey",
         inputs.hotkey,
         "--host",
@@ -263,8 +262,6 @@ def worker_command(inputs: DeploymentInputs, material: TLSMaterial) -> list[str]
         str(material.certificate),
         "--tls-private-key",
         str(material.private_key),
-        "--tee",
-        WORKER_TEE,
         "--validator-access-snapshot",
         str(VALIDATOR_ACCESS_SNAPSHOT),
         "--validator-access-keys",
@@ -284,8 +281,10 @@ def worker_command(inputs: DeploymentInputs, material: TLSMaterial) -> list[str]
         "--fleet-manifest",
         str(FLEET_MANIFEST),
         # Fixed staged migration behavior. This is deliberately not a
-        # deployment-selectable mode and never opens customer SAT.
-        "--allow-public-legacy-audit",
+        # deployment-selectable mode and never opens customer SAT. The image
+        # stays TDX-only because the migration command has no TEE selector.
+        "--migration-mode",
+        "public-legacy-audit",
     ]
 
 

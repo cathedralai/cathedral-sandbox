@@ -137,12 +137,13 @@ contradictory typed claims fail closed.
 
 ## Production channel binding
 
-Production endpoints use HTTPS. The evidence request is credential-free and
-names the TLS SPKI digest observed by the validator. The worker accepts that
-request only when the digest equals its configured in-guest key, then binds it
-into the fresh quote. After quote verification, the validator reopens the TLS
-connection, checks the same SPKI before writing any request bytes, and only then
-sends work and its bearer credential.
+Production endpoints use HTTPS. Evidence and work requests require either the
+configured bearer or signed-validator authorization. A bearer is sent only
+over certificate-verified TLS. The evidence request names the TLS SPKI digest
+observed by the validator. The worker accepts it only when the digest equals
+its configured in-guest key, then binds it into the fresh quote. After quote
+verification, the validator reopens the TLS connection, checks the same SPKI,
+and only then sends protected work.
 
 Configure the loopback worker behind the in-guest TLS endpoint with the public
 digest (the digest is not a secret):
@@ -155,9 +156,9 @@ cathedral worker serve \
 ```
 
 The TLS private key must terminate inside the measured environment. A public
-certificate by itself does not prove confidential execution. Plain HTTP is
-limited to the explicit development loopback flag and cannot satisfy the
-production channel claim.
+certificate by itself does not prove confidential execution. Plain HTTP and
+authentication relaxations exist only under `worker develop` and cannot
+satisfy the production channel claim.
 
 ## Customer CPU job routing
 

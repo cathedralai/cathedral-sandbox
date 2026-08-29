@@ -644,7 +644,8 @@ def test_cli_export_then_receipts_only_verify_is_not_proven(
 ):
     """Without the controlled envelopes the chain verifies but the result is
     PARTIAL: NOT_PROVEN, exit 1 by default, exit 0 only with the explicit
-    --allow-receipts-only acknowledgement (still recorded as NOT_PROVEN)."""
+    non-production --allow-receipts-only acknowledgement. Production stays
+    nonzero even when an operator supplies the acknowledgement."""
     evidence_dir, summary = exported_evidence
     assert summary["receipts"] == 1
     audit_path = tmp_path / "audit.json"
@@ -671,6 +672,35 @@ def test_cli_export_then_receipts_only_verify_is_not_proven(
     assert acknowledged == 0
     audit2 = json.loads((tmp_path / "audit2.json").read_text())
     assert audit2["result"] == "NOT_PROVEN"  # never upgraded by the flag
+
+    registry_keys = tmp_path / "registry-keys.json"
+    report_keys = tmp_path / "report-keys.json"
+    index_keys = tmp_path / "index-keys.json"
+    production_audit = tmp_path / "production-audit.json"
+    production = cli_main(
+        _verify_cli_args(tmp_path, evidence_dir)
+        + [
+            "--production",
+            "--allow-receipts-only",
+            "--registry-keys-digest",
+            digest_bytes(registry_keys.read_bytes()),
+            "--report-keys-digest",
+            digest_bytes(report_keys.read_bytes()),
+            "--index-keys-digest",
+            digest_bytes(index_keys.read_bytes()),
+            "--source-revision",
+            "abc1234",
+            "--current-block",
+            "1000",
+            "--state-file",
+            str(tmp_path / "production-fences.json"),
+            "--audit-out",
+            str(production_audit),
+        ]
+    )
+    capsys.readouterr()
+    assert production == 1
+    assert json.loads(production_audit.read_text())["result"] == "NOT_PROVEN"
 
 
 def test_source_epoch_audit_after_a_latest_run_passes_and_leaves_fences(
