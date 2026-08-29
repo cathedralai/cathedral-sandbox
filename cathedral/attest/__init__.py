@@ -48,9 +48,7 @@ def _canonicalize_tdx_configfs_quote(quote: bytes) -> bytes:
     if int.from_bytes(quote[:2], "little") != 4:
         return quote
     signed_size = int.from_bytes(
-        quote[
-            _TDX_QUOTE_V4_SIGNED_SIZE_OFFSET:_TDX_QUOTE_V4_SIGNED_DATA_OFFSET
-        ],
+        quote[_TDX_QUOTE_V4_SIGNED_SIZE_OFFSET:_TDX_QUOTE_V4_SIGNED_DATA_OFFSET],
         "little",
     )
     canonical_end = _TDX_QUOTE_V4_SIGNED_DATA_OFFSET + signed_size
@@ -68,7 +66,7 @@ def _snpguest_timeout() -> float:
     """Wall-clock cap (seconds) for each ``snpguest`` subprocess so a hung binary
     cannot wedge the collector. Override with ``CATHEDRAL_SNPGUEST_TIMEOUT``."""
     try:
-        return max(1.0, float(os.environ.get("CATHEDRAL_SNPGUEST_TIMEOUT", "30")))
+        return min(300.0, max(1.0, float(os.environ.get("CATHEDRAL_SNPGUEST_TIMEOUT", "30"))))
     except (TypeError, ValueError):
         return 30.0
 
@@ -129,8 +127,7 @@ def _resolve_snpguest() -> str:
     found = shutil.which("snpguest")
     if not found:
         raise FileNotFoundError(
-            "snpguest not found — set CATHEDRAL_SNPGUEST or install "
-            "github.com/virtee/snpguest"
+            "snpguest not found. Set CATHEDRAL_SNPGUEST or install github.com/virtee/snpguest"
         )
     return found
 
@@ -146,9 +143,7 @@ def _collect_snpguest_report(report_data_bytes: bytes, *, dev: Path) -> tuple[by
     if len(report_data_bytes) > 64:
         raise ValueError("SNP REPORTDATA must be at most 64 bytes")
     if not dev.exists():
-        raise FileNotFoundError(
-            f"{dev} missing — collect_snp must run inside an SEV-SNP guest"
-        )
+        raise FileNotFoundError(f"{dev} missing. collect_snp must run inside an SEV-SNP guest")
     snpguest = _resolve_snpguest()
 
     with tempfile.TemporaryDirectory() as td:
@@ -157,11 +152,17 @@ def _collect_snpguest_report(report_data_bytes: bytes, *, dev: Path) -> tuple[by
         request.write_bytes(report_data_bytes)
         report_path = work / "attestation-report.bin"
 
-        # `snpguest report <out> <request>`: request bytes become REPORT_DATA.
+        # `snpguest report <out> <request> --vmpl 0`: request bytes become
+        # REPORT_DATA. Pin VMPL 0 explicitly. snpguest otherwise defaults to
+        # VMPL 1, which is not the privilege level Cathedral admits for a
+        # worker identity.
         try:
             subprocess.run(
-                [snpguest, "report", str(report_path), str(request)],
-                check=True, capture_output=True, text=True, timeout=_snpguest_timeout(),
+                [snpguest, "report", str(report_path), str(request), "--vmpl", "0"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=_snpguest_timeout(),
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
@@ -169,9 +170,7 @@ def _collect_snpguest_report(report_data_bytes: bytes, *, dev: Path) -> tuple[by
             ) from exc
         quote = report_path.read_bytes()
         if len(quote) != _SNP_REPORT_SIZE:
-            raise RuntimeError(
-                f"snpguest returned {len(quote)} bytes, expected {_SNP_REPORT_SIZE}"
-            )
+            raise RuntimeError(f"snpguest returned {len(quote)} bytes, expected {_SNP_REPORT_SIZE}")
         return quote, _fetch_snp_cert_chain(snpguest, report_path, work)
 
 
@@ -183,13 +182,17 @@ def _fetch_snp_cert_chain(snpguest: str, report_path: Path, work: Path) -> list[
     try:
         subprocess.run(
             [snpguest, "fetch", "vcek", "DER", str(certs), str(report_path)],
-            check=True, capture_output=True, text=True, timeout=timeout,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
         # `fetch ca` argument order varies across snpguest versions; try the known
         # forms. Both derive the CA generation (Milan / Genoa / Turin) from the
         # report itself — no hardcoded product guess, which would fetch the wrong
         # CA on non-Milan parts.
         for cmd in (
+            [snpguest, "fetch", "ca", "DER", str(certs), "--report", str(report_path)],
             [snpguest, "fetch", "ca", "--report", str(report_path), "DER", str(certs)],
             [snpguest, "fetch", "ca", "DER", str(certs), str(report_path)],
         ):
@@ -243,7 +246,9 @@ def collect_tdx(
     )
 
 
-def _collect_configfs_tsm_quote(report_data_bytes: bytes, *, root: Path) -> tuple[bytes, list[bytes]]:
+def _collect_configfs_tsm_quote(
+    report_data_bytes: bytes, *, root: Path
+) -> tuple[bytes, list[bytes]]:
     """Collect one TSM quote through Linux configfs-tsm.
 
     The kernel ABI accepts up to 64 bytes in ``inblob`` and returns the

@@ -28,9 +28,11 @@ points import cleanly), installs the runtime dependencies declared in
 ```
 
 All hardware-free tests must pass. Hardware-gated coverage includes the TDX
-quote round trip, SAT lane e2e, and non-TDX negative controls; those cases are
-skipped unless `CATHEDRAL_RUN_TDX_HW=1` or `CATHEDRAL_RUN_TDX_NEGATIVE=1` is set
-on the appropriate machine.
+quote round trip, the AMD SEV-SNP friend self-test, SAT lane e2e, and non-TDX
+negative controls. Those cases are skipped unless `CATHEDRAL_RUN_TDX_HW=1`,
+`CATHEDRAL_RUN_SNP_HW=1`, or `CATHEDRAL_RUN_TDX_NEGATIVE=1` is set on the
+appropriate machine. The bounded SEV-SNP procedure is in
+[`AMD_SEV_SNP_FRIEND_TEST.md`](AMD_SEV_SNP_FRIEND_TEST.md).
 
 The plain-HTTP worker path is loopback-only test compatibility and cannot
 satisfy protected work dispatch. Runtime integration tests use injected channel
