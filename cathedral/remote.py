@@ -329,6 +329,109 @@ class RemoteMiner:
         self._pending_binding = None
         return self._trusted_binding
 
+    def confirm_signed_validator_access_required(self, evidence: Evidence) -> None:
+        """Prove the attested endpoint rejects the same request without a signature.
+
+        A successful evidence or canonical SAT request alone does not show that
+        validator authentication was required because legacy workers expose
+        both paths. After the caller verifies and promotes the TLS binding,
+        require the signed capability request to succeed, then repeat both the
+        protected capability route and the confirmed evidence route with an
+        invalid signature and with no validator header. Only signed success
+        plus every refusal is accepted.
+        """
+
+        if self._scheme != "https" or self._trusted_binding is None:
+            raise RemoteError(
+                "attested channel binding is required before the validator access check"
+            )
+        if self._validator_signer is None or self._validator_hotkey is None:
+            raise RemoteError("signed validator identity is required for the access check")
+        if self._bearer_token is not None:
+            raise RemoteError("validator access check requires a validator-only client")
+        if (
+            evidence.report_data_version != 2
+            or evidence.channel_binding != self._trusted_binding
+            or evidence.miner_hotkey != self._hotkey
+            or not isinstance(evidence.nonce, bytes)
+            or len(evidence.nonce) != 32
+        ):
+            raise RemoteError("the signed access check requires the confirmed evidence")
+        # This must succeed before the negative control. A legacy bearer-only
+        # worker also returns 401 without a bearer, but it returns 401 here too
+        # because it ignores the validator signature.
+        self.supports_customer_sat()
+        try:
+            self._post_tls(
+                "/v1/capabilities",
+                lambda _binding: {},
+                expected_binding=self._trusted_binding,
+                include_auth=False,
+                include_validator_auth=True,
+                validator_signer_override=lambda _message: b"\x00" * 64,
+                response_body_limit=1024,
+            )
+        except RemoteError as exc:
+            if exc.status_code not in {401, 403}:
+                raise
+        else:
+            raise RemoteError("worker accepted an invalid validator signature")
+        try:
+            self._post_tls(
+                "/v1/capabilities",
+                lambda _binding: {},
+                expected_binding=self._trusted_binding,
+                include_auth=False,
+                include_validator_auth=False,
+                response_body_limit=1024,
+            )
+        except RemoteError as exc:
+            if exc.status_code in {401, 403}:
+                pass
+            else:
+                raise
+        else:
+            raise RemoteError("worker accepted an unsigned protected request")
+
+        def evidence_payload(binding: ChannelBinding) -> dict[str, Any]:
+            return {
+                "nonce_hex": evidence.nonce.hex(),
+                "assigned_hotkey": self._hotkey,
+                "report_data_version": 2,
+                "channel_binding_type": binding.binding_type.value,
+                "channel_binding_digest_hex": binding.digest.hex(),
+            }
+
+        try:
+            self._post_tls(
+                "/v1/evidence",
+                evidence_payload,
+                expected_binding=self._trusted_binding,
+                include_auth=False,
+                include_validator_auth=True,
+                validator_signer_override=lambda _message: b"\x00" * 64,
+                response_body_limit=1024,
+            )
+        except RemoteError as exc:
+            if exc.status_code not in {401, 403}:
+                raise
+        else:
+            raise RemoteError("worker accepted invalidly signed evidence request")
+        try:
+            self._post_tls(
+                "/v1/evidence",
+                evidence_payload,
+                expected_binding=self._trusted_binding,
+                include_auth=False,
+                include_validator_auth=False,
+                response_body_limit=1024,
+            )
+        except RemoteError as exc:
+            if exc.status_code in {401, 403}:
+                return
+            raise
+        raise RemoteError("worker accepted an unsigned evidence request")
+
     def do_sat_work(self, item: SatWorkItem) -> SatCertificate:
         _validate_work_item(item)
         payload = {
@@ -525,6 +628,7 @@ class RemoteMiner:
         expected_binding: ChannelBinding | None,
         include_auth: bool,
         include_validator_auth: bool = False,
+        validator_signer_override: RequestSigner | None = None,
         response_body_limit: int | None = None,
     ) -> tuple[dict[str, Any], ChannelBinding]:
         response_body_limit = min(
@@ -557,7 +661,12 @@ class RemoteMiner:
             headers = {"Content-Type": "application/json"}
             if include_auth and self._bearer_token:
                 headers["Authorization"] = f"Bearer {self._bearer_token}"
-            if include_validator_auth and self._validator_signer is not None:
+            validator_signer = (
+                self._validator_signer
+                if validator_signer_override is None
+                else validator_signer_override
+            )
+            if include_validator_auth and validator_signer is not None:
                 assert self._validator_hotkey is not None
                 issued_at = datetime.now(UTC).replace(microsecond=0)
                 headers[VALIDATOR_REQUEST_HEADER] = build_validator_request_header(
@@ -572,7 +681,7 @@ class RemoteMiner:
                     nonce=secrets.token_bytes(32),
                     issued_at=issued_at,
                     expires_at=issued_at + timedelta(seconds=60),
-                    signer=self._validator_signer,
+                    signer=validator_signer,
                 )
             connection.sock.settimeout(_remaining_request_seconds(deadline))
             connection.request("POST", path, body=body, headers=headers)

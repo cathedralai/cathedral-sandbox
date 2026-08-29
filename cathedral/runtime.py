@@ -40,6 +40,7 @@ from cathedral.common import (
     MAX_GPU_EVIDENCE_CONCURRENCY,
     Attested,
     ChannelBinding,
+    ChannelBindingType,
     Evidence,
     EvidenceKind,
     Policy,
@@ -187,8 +188,16 @@ class RuntimeConfig:
             raise ValueError("allow_insecure_http_for_tests must be a boolean")  # noqa: TRY004 - ValueError is the stable fail-closed contract
         if self.production_mode and self.allow_insecure_http_for_tests:
             raise ValueError("insecure HTTP is unavailable in production mode")
-        if self.expected_tier not in {Tier.CC_CPU_TDX, Tier.CC_GPU}:
-            raise ValueError("runtime expected tier must be CPU TDX or GPU composite")
+        if self.expected_tier not in {Tier.CC_CPU_TDX, Tier.CC_CPU_SNP, Tier.CC_GPU}:
+            raise ValueError(
+                "runtime expected tier must be CPU TDX, development CPU SNP, "
+                "or GPU composite"
+            )
+        if self.production_mode and self.expected_tier is Tier.CC_CPU_SNP:
+            raise ValueError(
+                "AMD SEV-SNP runtime admission is development-only; production "
+                "scoring, receipts, and publishing remain disabled"
+            )
         if not isinstance(self.admission_enabled, bool):
             raise ValueError("admission_enabled must be a boolean")  # noqa: TRY004 - ValueError is the stable fail-closed contract
         if self.score_network is not None or self.score_netuid is not None:
@@ -346,7 +355,7 @@ class ConfidentialRuntime:
             raise ValueError(
                 "GPU runtime requires profile, verifier, and durable identity registry"
             )
-        if self.config.expected_tier is Tier.CC_CPU_TDX and any(
+        if self.config.expected_tier in {Tier.CC_CPU_TDX, Tier.CC_CPU_SNP} and any(
             item is not None for item in gpu_configuration
         ):
             raise ValueError("CPU runtime cannot carry GPU verifier configuration")
@@ -430,6 +439,14 @@ class ConfidentialRuntime:
         if self.config.expected_tier is Tier.CC_GPU and receipt_issuer is not None:
             raise ValueError(
                 "GPU receipt issuance is disabled until a composite receipt schema is active"
+            )
+        if self.config.expected_tier is Tier.CC_CPU_SNP and receipt_issuer is not None:
+            raise ValueError(
+                "AMD SEV-SNP receipt issuance is disabled in the development runtime"
+            )
+        if self.config.expected_tier is Tier.CC_CPU_SNP and poster is not None:
+            raise ValueError(
+                "AMD SEV-SNP score publishing is disabled in the development runtime"
             )
         self.receipt_issuer = receipt_issuer
         attestation_workers = (
@@ -598,6 +615,11 @@ class ConfidentialRuntime:
         publish: bool = False,
     ) -> EpochRun:
         self._require_admission_enabled()
+        if self.config.expected_tier is Tier.CC_CPU_SNP:
+            raise RuntimeError(
+                "AMD SEV-SNP development is shadow-only: epoch scoring and score "
+                "report creation are disabled"
+            )
         if self.config.production_mode and self.config.score_network is None:
             raise RuntimeError("production epoch requires an explicit score network and netuid")
         if (
@@ -1685,6 +1707,27 @@ class ConfidentialRuntime:
     ) -> _AttestationResult:
         if cancel_event is not None and cancel_event.is_set():
             return _AttestationResult(target, endpoint, error="reattestation cancelled")
+        if self.config.expected_tier is Tier.CC_CPU_SNP:
+            parsed_endpoint = urllib.parse.urlsplit(endpoint)
+            if parsed_endpoint.scheme != "https":
+                return _AttestationResult(
+                    target,
+                    endpoint,
+                    error="AMD SEV-SNP development evidence requires HTTPS",
+                )
+            try:
+                loopback = ipaddress.ip_address(parsed_endpoint.hostname or "").is_loopback
+            except ValueError:
+                loopback = parsed_endpoint.hostname == "localhost"
+            if not loopback:
+                return _AttestationResult(
+                    target,
+                    endpoint,
+                    error=(
+                        "the Compute SNP development runtime is loopback-only; "
+                        "use the Validator SNP preview for signed remote review"
+                    ),
+                )
         try:
             remote_options = {
                 "bearer_token": target.bearer_token,
@@ -1759,12 +1802,29 @@ class ConfidentialRuntime:
                     raise RuntimeError("evidence nonce mismatch")
                 if any(evidence.miner_hotkey != target.hotkey for evidence in evidences):
                     raise RuntimeError("evidence hotkey mismatch")
-                tdx_evidence = next(
-                    (evidence for evidence in evidences if evidence.kind is EvidenceKind.TDX),
+                expected_cpu_kind = (
+                    EvidenceKind.SEV_SNP
+                    if self.config.expected_tier is Tier.CC_CPU_SNP
+                    else EvidenceKind.TDX
+                )
+                cpu_evidence = next(
+                    (evidence for evidence in evidences if evidence.kind is expected_cpu_kind),
                     None,
                 )
-                if tdx_evidence is None:
-                    raise RuntimeError("TDX evidence component is required")
+                if cpu_evidence is None:
+                    raise RuntimeError(
+                        f"{expected_cpu_kind.value} evidence component is required"
+                    )
+                if self.config.expected_tier is Tier.CC_CPU_SNP and (
+                    cpu_evidence.report_data_version != 2
+                    or cpu_evidence.channel_binding is None
+                    or cpu_evidence.channel_binding.binding_type
+                    is not ChannelBindingType.TLS_SPKI_SHA256
+                ):
+                    raise RuntimeError(
+                        "AMD SEV-SNP development evidence requires report-data v2 "
+                        "bound to the live TLS SPKI"
+                    )
                 if self.config.expected_tier is Tier.CC_GPU:
                     from cathedral.gpu import verify_composite_gpu
 
@@ -1773,7 +1833,7 @@ class ConfidentialRuntime:
                         evidence for evidence in evidences if evidence.kind is EvidenceKind.GPU_CC
                     )
                     composite = verify_composite_gpu(
-                        tdx_evidence,
+                        cpu_evidence,
                         gpu_evidence,
                         nonce,
                         self.policy,
@@ -1795,11 +1855,13 @@ class ConfidentialRuntime:
                     gpu_component = composite.gpu_component
                 else:
                     if len(evidences) != 1:
-                        raise RuntimeError("CPU runtime requires one TDX component")
-                    verdict = self.verifier(tdx_evidence, nonce, self.policy)
+                        raise RuntimeError("CPU runtime requires exactly one evidence component")
+                    verdict = self.verifier(cpu_evidence, nonce, self.policy)
                     if verdict is None:
-                        raise RuntimeError("TDX verification rejected")
-                    evidence_digest = _evidence_digest(tdx_evidence)
+                        raise RuntimeError(
+                            f"{expected_cpu_kind.value} verification rejected"
+                        )
+                    evidence_digest = _evidence_digest(cpu_evidence)
                     component_audit = None
                     gpu_component = None
                 if (
@@ -1813,11 +1875,11 @@ class ConfidentialRuntime:
                     raise RuntimeError(
                         "verdict does not satisfy hardware and software admission claims"
                     )
-                if tdx_evidence.report_data_version == 2:
-                    binding = client.confirm_channel_binding(tdx_evidence)
+                if cpu_evidence.report_data_version == 2:
+                    binding = client.confirm_channel_binding(cpu_evidence)
                     if cancel_event is not None and cancel_event.is_set():
                         return _AttestationResult(target, endpoint, error="reattestation cancelled")
-                    if binding != tdx_evidence.channel_binding or any(
+                    if binding != cpu_evidence.channel_binding or any(
                         evidence.channel_binding != binding for evidence in evidences
                     ):
                         raise RuntimeError("live endpoint key does not match attested binding")
@@ -1858,7 +1920,7 @@ class ConfidentialRuntime:
                     # Drop every local raw-evidence reference before another
                     # caller can reserve the validator-wide memory budget.
                     evidences = ()
-                    tdx_evidence = None
+                    cpu_evidence = None
                     gpu_evidence = None
                     self._gpu_evidence_slots.release()
         return _AttestationResult(

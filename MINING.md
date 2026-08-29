@@ -119,11 +119,12 @@ self-reported volume alone.
 ## Current limits
 
 - Intel TDX CPU is the only active provider hardware class.
-- AMD SEV-SNP collection, verification, and protected-channel binding are
-  implemented with a bounded report-version 3 through 5 friend-owned hardware
-  test. Production runtime admission, receipts, managed provisioning, and
-  scoring remain disabled. See
-  [the friend test](docs/AMD_SEV_SNP_FRIEND_TEST.md).
+- AMD SEV-SNP collection, verification, protected-channel binding, and a
+  shadow-only canonical SAT check are enabled in development. No SNP epoch
+  score report is created. Production admission, receipts, managed
+  provisioning, and weights remain disabled. See the
+  [development mode](docs/AMD_SEV_SNP_DEVELOPMENT.md) and
+  [friend hardware test](docs/AMD_SEV_SNP_FRIEND_TEST.md).
 - NVIDIA confidential-GPU scoring is not enabled.
 - Enrollment and secret exchange are operator-assisted.
 - A supported mainnet worker must use the reviewed HTTPS and channel-binding
@@ -150,9 +151,11 @@ signed-fleet activation image. The image pins the sr25519 verifier and fixes
 permit-only access, config, state, host-edge, and container contracts. Review,
 merge, immutable publication, provenance, and anonymous inspection are complete.
 The two-machine live proof is not complete. Live multi-machine scoring stays
-Intel TDX-only. AMD SEV-SNP serving remains supported, but SNP fleet scoring
-stays disabled until the friend-owned hardware test proves stable `CHIP_ID`
-deduplication.
+Intel TDX-only. AMD SEV-SNP serving remains supported, but production SNP fleet
+scoring stays disabled. The friend-owned hardware test produces only a
+review-scoped pseudonym. Matching pseudonyms within one review do not prove a
+durable physical-machine identity, and multi-socket hosts need a separately
+reviewed identity design before production scoring.
 
 ## 1. Request a beta slot
 

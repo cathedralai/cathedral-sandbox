@@ -941,6 +941,7 @@ def _build_runtime(
     require_report_audience: bool = False,
 ) -> tuple[ConfidentialRuntime, Ledger, dict[str, str]]:
     development = getattr(args, "development", False)
+    cpu_tee = getattr(args, "cpu_tee", "tdx")
     gpu_profile_id = getattr(args, "gpu_profile_id", None)
     gpu_identity_db = getattr(args, "gpu_identity_db", None)
     gpu_identity_key_file = getattr(args, "gpu_identity_key_file", None)
@@ -956,6 +957,25 @@ def _build_runtime(
             "--gpu-profile-id, --gpu-identity-db, --gpu-identity-key-file, and "
             "--gpu-identity-anchor-file are required together"
         )
+    if cpu_tee == "snp" and not development:
+        raise ValueError(
+            "--cpu-tee snp requires --development; production AMD SEV-SNP "
+            "scoring, receipts, and publishing remain disabled"
+        )
+    if cpu_tee == "snp" and getattr(args, "runtime_command", None) not in {
+        "canary",
+        "audit-attestation",
+    }:
+        raise ValueError(
+            "--cpu-tee snp is available only for development canary and "
+            "audit-attestation checks"
+        )
+    if cpu_tee == "snp" and gpu_profile_id is not None:
+        raise ValueError("--cpu-tee snp cannot combine with GPU runtime configuration")
+    if cpu_tee == "snp" and getattr(args, "publish", False):
+        raise ValueError("--cpu-tee snp cannot combine with --publish")
+    if cpu_tee == "snp" and getattr(args, "publisher_endpoint", None) is not None:
+        raise ValueError("--cpu-tee snp cannot configure a score publisher")
     config = RuntimeConfig(
         miner_timeout_seconds=getattr(args, "miner_timeout_seconds", 10.0),
         miner_attempts=getattr(args, "miner_attempts", 2),
@@ -972,7 +992,11 @@ def _build_runtime(
         reattestation_retry_jitter_seconds=getattr(args, "reattestation_retry_jitter_seconds", 5),
         customer_job_lease_seconds=getattr(args, "customer_job_lease_seconds", 120),
         customer_job_max_attempts=getattr(args, "customer_job_max_attempts", 3),
-        expected_tier=Tier.CC_GPU if gpu_profile_id is not None else Tier.CC_CPU_TDX,
+        expected_tier=(
+            Tier.CC_GPU
+            if gpu_profile_id is not None
+            else (Tier.CC_CPU_SNP if cpu_tee == "snp" else Tier.CC_CPU_TDX)
+        ),
         admission_enabled=require_policy,
         score_network=getattr(args, "score_network", None),
         score_netuid=getattr(args, "score_netuid", None),
@@ -1023,6 +1047,11 @@ def _build_runtime(
     policy_refresher = None
     if measurements_file and policy_registry:
         raise ValueError("--measurements-file and --policy-registry are mutually exclusive")
+    if cpu_tee == "snp" and policy_registry is not None:
+        raise ValueError(
+            "--cpu-tee snp uses an explicit development --measurements-file; "
+            "the production signed-policy path remains TDX-only"
+        )
     if policy_registry is not None:
         for name in ("policy_registry_keys", "policy_registry_state"):
             if not getattr(args, name, None):
@@ -1079,6 +1108,8 @@ def _build_runtime(
         raise ValueError(
             "--receipt-signing-key-id and --receipt-signing-key-file are required together"
         )
+    if cpu_tee == "snp" and receipt_key_id is not None:
+        raise ValueError("AMD SEV-SNP receipt issuance is disabled in development")
     receipt_issuer = None
     if receipt_key_id is not None:
         if policy_snapshot is None:
@@ -1194,6 +1225,7 @@ def _run_json(run: EpochRun) -> dict[str, object]:
 
 
 def cmd_worker_serve(args: argparse.Namespace) -> int:
+    tee = getattr(args, "tee", "tdx")
     tls_certificate = getattr(args, "tls_certificate", None)
     tls_private_key = getattr(args, "tls_private_key", None)
     if (tls_certificate is None) != (tls_private_key is None):
@@ -1221,6 +1253,16 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         minimum_validator_stake_rao,
         public_endpoint,
     )
+    if tee == "snp" and (allow_public_bootstrap or allow_public_legacy_audit):
+        raise ValueError(
+            "AMD SEV-SNP development evidence cannot use public compatibility modes"
+        )
+    signed_access_configured = all(value is not None for value in access_values)
+    if tee == "snp" and not is_loopback and not signed_access_configured:
+        raise ValueError(
+            "a non-loopback AMD SEV-SNP worker requires signed validator access; "
+            "bearer tokens do not protect the evidence endpoint"
+        )
     access_enabled = any(value is not None for value in access_values) or (
         fleet_manifest_path is not None or allow_public_bootstrap or allow_public_legacy_audit
     )
@@ -1381,7 +1423,6 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
     # Select the CPU TEE evidence collector. Default stays TDX so existing
     # deployments are unchanged; --tee snp serves AMD SEV-SNP evidence, and
     # --gpu-composite (TDX+GPU) is TDX-only by construction.
-    tee = getattr(args, "tee", "tdx")
     if getattr(args, "gpu_composite", False) and tee != "tdx":
         raise ValueError("--gpu-composite collects TDX+GPU and cannot combine with --tee snp")
     if tee == "snp":
@@ -1411,7 +1452,10 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
                     "host": server.host,
                     "port": server.port,
                     "hotkey": args.hotkey,
+                    "tee": tee,
+                    "amd_snp_development_only": tee == "snp",
                     "tls": tls_context is not None,
+                    "development_no_auth": development_no_auth,
                     "signed_validator_access": validator_authorizer is not None,
                     "fleet_candidates": 0 if fleet_endpoints is None else len(fleet_endpoints),
                 }
@@ -1428,7 +1472,10 @@ def cmd_runtime_canary(args: argparse.Namespace) -> int:
     runtime, ledger, tokens = _build_runtime(args, require_policy=True)
     try:
         outcome = runtime.check_canary(_target(args, tokens))
-        print(json.dumps(_outcome_json(outcome), sort_keys=True))
+        document = _outcome_json(outcome)
+        if getattr(args, "cpu_tee", "tdx") == "snp":
+            document.update(_snp_development_boundary())
+        print(json.dumps(document, sort_keys=True))
         return 0
     finally:
         ledger.close()
@@ -1438,11 +1485,25 @@ def cmd_runtime_audit_attestation(args: argparse.Namespace) -> int:
     runtime, ledger, tokens = _build_runtime(args, require_policy=True)
     try:
         outcome = runtime.audit_attestation(_target(args, tokens))
-        print(json.dumps(_outcome_json(outcome), sort_keys=True))
+        document = _outcome_json(outcome)
+        if getattr(args, "cpu_tee", "tdx") == "snp":
+            document.update(_snp_development_boundary())
+        print(json.dumps(document, sort_keys=True))
         return 0 if outcome.status == "attestation_verified" else 1
     finally:
         runtime.close()
         ledger.close()
+
+
+def _snp_development_boundary() -> dict[str, object]:
+    return {
+        "environment": "development",
+        "hardware_class": "amd_sev_snp",
+        "production_eligible": False,
+        "authorized_for_chain_write": False,
+        "score_report_created": False,
+        "receipt_issued": False,
+    }
 
 
 def cmd_runtime_run_epoch(args: argparse.Namespace) -> int:
@@ -4347,6 +4408,15 @@ def build_parser() -> argparse.ArgumentParser:
     def add_runtime_common(command: argparse.ArgumentParser) -> None:
         command.add_argument("--registry-db", required=True)
         command.add_argument("--ledger-db", required=True)
+        command.add_argument(
+            "--cpu-tee",
+            choices=["tdx", "snp"],
+            default="tdx",
+            help=(
+                "CPU evidence class to admit. SNP requires --development and "
+                "cannot publish or issue receipts"
+            ),
+        )
         command.add_argument("--measurements-file")
         command.add_argument(
             "--challenge-anchor-block",

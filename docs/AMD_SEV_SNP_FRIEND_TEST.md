@@ -1,10 +1,12 @@
 # AMD SEV-SNP friend hardware self-test
 
-Status: source-ready, not live-proven on the current release.
+Status: development path enabled, not live-proven on the current release.
 
 This procedure exercises one friend-owned AMD SEV-SNP machine against
-Cathedral's collector, HTTPS worker, verifier, and canonical SAT path. It does
-not turn on production validator weights.
+Cathedral's collector, HTTPS worker, verifier, and canonical SAT path. The same
+source now exposes a shadow-only reviewing runtime described in
+[AMD_SEV_SNP_DEVELOPMENT.md](AMD_SEV_SNP_DEVELOPMENT.md). Neither path turns on
+production validator weights.
 
 Plain AMD SEV is outside this self-test. The guest must expose native SEV-SNP
 attestation through `/dev/sev-guest`.
