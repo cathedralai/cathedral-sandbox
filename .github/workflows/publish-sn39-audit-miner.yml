@@ -10,6 +10,7 @@ on:
       - Dockerfile.sn39-audit-miner
       - cathedral/**
       - requirements/sn39-audit-miner.txt
+      - scripts/run_sn39_signed_fleet_miner.sh
   workflow_dispatch:
     inputs:
       image_digest:

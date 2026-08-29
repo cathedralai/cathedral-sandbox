@@ -1,5 +1,6 @@
 # Runtime-only dependency lock for the linux/amd64 SN39 audit-miner image.
-# Hashes are the matching PyPI wheel digests verified on 2026-08-26.
+# Hashes are the matching PyPI wheel digests. The linux/amd64 CPython 3.12
+# sr25519 wheel was downloaded from PyPI and verified on 2026-08-29.
 cryptography==50.0.1 \
     --hash=sha256:ff838d62ec1bfce4f9ba7fa16f4a7b554cd8d0c299e6be37502161a660c84eef \
     --hash=sha256:51593d180cf6d179bde5c5d065bed81386b1f381656ae7d042b7ffc87a9895ad \
@@ -11,3 +12,5 @@ cffi==2.1.1 \
     --hash=sha256:c1453022f490d2459a11819d83ad1d586e9ff65a12ac3e705ffebd46d3685dcf
 pycparser==2.23 \
     --hash=sha256:e5c6e8d3fbad53479cab09ac03729e0a9faf2bee3db8208a550daf5af81a5934
+py-sr25519-bindings==0.2.2 \
+    --hash=sha256:849f77ab12210e8549e58d444e9199d9aba83a988e99ca8bef04dd53e81f9561

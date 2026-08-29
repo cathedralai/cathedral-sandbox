@@ -3,8 +3,9 @@
 FROM python:3.12-slim-bookworm@sha256:4427763a1ba36f5aa8f656a03e5d00f3b8d61f5dd950c73df6c14f8c7640f8ab
 
 LABEL org.opencontainers.image.title="Cathedral SN39 audit miner" \
-      org.opencontainers.image.description="TDX evidence and canonical SAT worker for the independent SN39 validator" \
-      org.opencontainers.image.source="https://github.com/cathedralai/cathedral-sandbox"
+      org.opencontainers.image.description="TDX evidence and signed validator fleet worker for SN39" \
+      org.opencontainers.image.source="https://github.com/cathedralai/cathedral-sandbox" \
+      org.cathedral.sn39.runtime-contract="signed-validator-fleet-v1"
 
 WORKDIR /
 
@@ -19,12 +20,18 @@ RUN python -m pip install \
 
 COPY cathedral/ /usr/local/lib/python3.12/site-packages/cathedral/
 
+# Refuse the build if the exact sr25519 wheel cannot verify the fixed positive
+# vector or reject its corrupted negative control.
+RUN python -I -c 'import cathedral.audit_miner_entrypoint, cathedral.cli; from cathedral.validator_access import load_sr25519_verifier, preflight_sr25519_verifier; preflight_sr25519_verifier(load_sr25519_verifier())'
+
 # Quote collection creates report entries in configfs and therefore runs as
 # guest root. The runtime command binds only the guest's TSM report tree at
 # this fixed image mount target, outside Docker's runtime-mounted /sys.
 USER 0:0
 RUN install -d -o root -g root -m 0700 /run/cathedral-audit-miner \
-    && install -d -o root -g root -m 0755 /opt/cathedral-audit-miner/tsm-report
+    && install -d -o root -g root -m 0755 /opt/cathedral-audit-miner/tsm-report \
+    && install -d -o root -g root -m 0700 /etc/cathedral/validator-access \
+    && install -d -o root -g root -m 0700 /var/lib/cathedral/validator-access
 
 EXPOSE 8081/tcp
 STOPSIGNAL SIGTERM

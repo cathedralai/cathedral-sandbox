@@ -1,18 +1,20 @@
-"""Fixed entrypoint for the independent SN39 audit-miner image.
+"""Fixed entrypoint for the signed-fleet SN39 audit-miner image.
 
-The container accepts one deployment input: a public Bittensor hotkey. It
-generates its TLS identity inside the guest and supplies an unexported random
-bearer only because the general-purpose worker CLI keeps non-audit routes
-authenticated. The independent evidence and canonical SAT routes remain
-credential-free.
+The container accepts three public deployment values: the miner hotkey, its
+canonical public axon endpoint, and the digest pin for the snapshot-signing
+public keys. Snapshot, key, fleet, replay-state, network, subnet, stake, and
+migration-policy paths and values are fixed by the image contract. The worker
+contains no wallet, chain RPC, signing seed, shared bearer, or selectable auth
+mode.
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import os
-import secrets
+import re
 import stat
 import sys
 import tempfile
@@ -21,25 +23,43 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import NoReturn
+from urllib.parse import urlsplit
 
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.x509.oid import NameOID
 
+from cathedral.validator_access import validate_public_worker_endpoint
+
 HOTKEY_ENV = "CATHEDRAL_MINER_HOTKEY"
+PUBLIC_ENDPOINT_ENV = "CATHEDRAL_PUBLIC_ENDPOINT"
+VALIDATOR_ACCESS_KEYS_DIGEST_ENV = "CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST"
+# Named only so tests and callers can prove this former input stays refused.
 WORKER_BEARER_ENV = "CATHEDRAL_WORKER_BEARER_TOKEN"
 TSM_REPORT_ROOT_ENV = "CATHEDRAL_TDX_TSM_REPORT_ROOT"
 TLS_DIRECTORY = Path("/run/cathedral-audit-miner")
 TSM_REPORT_ROOT = "/opt/cathedral-audit-miner/tsm-report"
+VALIDATOR_ACCESS_CONFIG_DIRECTORY = Path("/etc/cathedral/validator-access")
+VALIDATOR_ACCESS_SNAPSHOT = VALIDATOR_ACCESS_CONFIG_DIRECTORY / "validator-access.json"
+VALIDATOR_ACCESS_KEYS = VALIDATOR_ACCESS_CONFIG_DIRECTORY / "snapshot-keys.json"
+FLEET_MANIFEST = VALIDATOR_ACCESS_CONFIG_DIRECTORY / "fleet.json"
+VALIDATOR_ACCESS_STATE_DIRECTORY = Path("/var/lib/cathedral/validator-access")
+VALIDATOR_ACCESS_STATE = VALIDATOR_ACCESS_STATE_DIRECTORY / "validator-access.sqlite"
 TLS_CERTIFICATE = "worker.crt"
 TLS_PRIVATE_KEY = "worker.key"
 WORKER_HOST = "0.0.0.0"
 WORKER_PORT = 8081
 WORKER_TEE = "tdx"
+VALIDATOR_NETWORK = "finney"
+VALIDATOR_NETUID = 39
+VALIDATOR_MINIMUM_STAKE_RAO = 0
 
-_ALLOWED_CATHEDRAL_INPUTS = frozenset({HOTKEY_ENV})
+_ALLOWED_CATHEDRAL_INPUTS = frozenset(
+    {HOTKEY_ENV, PUBLIC_ENDPOINT_ENV, VALIDATOR_ACCESS_KEYS_DIGEST_ENV}
+)
 _CHILD_PATH = "/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+_SHA256_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _BASE58_INDEX = {character: index for index, character in enumerate(_BASE58_ALPHABET)}
 _SS58_PREFIX = b"SS58PRE"
@@ -56,6 +76,13 @@ class EntrypointError(ValueError):
 class TLSMaterial:
     certificate: Path
     private_key: Path
+
+
+@dataclass(frozen=True)
+class DeploymentInputs:
+    hotkey: str
+    public_endpoint: str
+    validator_access_keys_digest: str
 
 
 def _decode_base58(value: str) -> bytes:
@@ -89,8 +116,8 @@ def validate_public_hotkey(value: object) -> str:
     return value
 
 
-def validate_environment(environ: Mapping[str, str]) -> str:
-    """Read only the public-hotkey input from the Cathedral namespace."""
+def validate_environment(environ: Mapping[str, str]) -> DeploymentInputs:
+    """Read only the three public values admitted by the image contract."""
 
     unknown = {
         name
@@ -98,8 +125,36 @@ def validate_environment(environ: Mapping[str, str]) -> str:
         if name.startswith("CATHEDRAL_") and name not in _ALLOWED_CATHEDRAL_INPUTS
     }
     if unknown:
-        raise EntrypointError(f"only {HOTKEY_ENV} is accepted as a CATHEDRAL_* environment input")
-    return validate_public_hotkey(environ.get(HOTKEY_ENV))
+        raise EntrypointError(
+            "only the miner hotkey, public endpoint, and validator-access "
+            "keys digest are accepted as CATHEDRAL_* environment inputs"
+        )
+    hotkey = validate_public_hotkey(environ.get(HOTKEY_ENV))
+    try:
+        public_endpoint = validate_public_worker_endpoint(environ.get(PUBLIC_ENDPOINT_ENV))
+    except (TypeError, ValueError) as exc:
+        raise EntrypointError(
+            f"{PUBLIC_ENDPOINT_ENV} must be a canonical public HTTPS IP-literal origin"
+        ) from exc
+    parsed_endpoint = urlsplit(public_endpoint)
+    try:
+        endpoint_address = ipaddress.ip_address(parsed_endpoint.hostname or "")
+    except ValueError as exc:  # Defensive: the generic validator already parsed this.
+        raise EntrypointError(f"{PUBLIC_ENDPOINT_ENV} has an invalid public IP") from exc
+    if not isinstance(endpoint_address, ipaddress.IPv4Address) or parsed_endpoint.port != WORKER_PORT:
+        raise EntrypointError(
+            f"{PUBLIC_ENDPOINT_ENV} must use a globally routable IPv4 address on port {WORKER_PORT}"
+        )
+    keys_digest = environ.get(VALIDATOR_ACCESS_KEYS_DIGEST_ENV)
+    if not isinstance(keys_digest, str) or _SHA256_DIGEST.fullmatch(keys_digest) is None:
+        raise EntrypointError(
+            f"{VALIDATOR_ACCESS_KEYS_DIGEST_ENV} must be sha256 plus 64 lowercase hex characters"
+        )
+    return DeploymentInputs(
+        hotkey=hotkey,
+        public_endpoint=public_endpoint,
+        validator_access_keys_digest=keys_digest,
+    )
 
 
 def _secure_directory(directory: Path) -> None:
@@ -186,8 +241,8 @@ def generate_tls_material(
     return TLSMaterial(certificate=certificate_path, private_key=private_key_path)
 
 
-def worker_command(hotkey: str, material: TLSMaterial) -> list[str]:
-    """Return the immutable audit-worker command."""
+def worker_command(inputs: DeploymentInputs, material: TLSMaterial) -> list[str]:
+    """Return the immutable permit-only signed-fleet worker command."""
 
     return [
         sys.executable,
@@ -199,7 +254,7 @@ def worker_command(hotkey: str, material: TLSMaterial) -> list[str]:
         "worker",
         "serve",
         "--hotkey",
-        hotkey,
+        inputs.hotkey,
         "--host",
         WORKER_HOST,
         "--port",
@@ -210,6 +265,27 @@ def worker_command(hotkey: str, material: TLSMaterial) -> list[str]:
         str(material.private_key),
         "--tee",
         WORKER_TEE,
+        "--validator-access-snapshot",
+        str(VALIDATOR_ACCESS_SNAPSHOT),
+        "--validator-access-keys",
+        str(VALIDATOR_ACCESS_KEYS),
+        "--validator-access-keys-digest",
+        inputs.validator_access_keys_digest,
+        "--validator-access-state",
+        str(VALIDATOR_ACCESS_STATE),
+        "--validator-minimum-stake-rao",
+        str(VALIDATOR_MINIMUM_STAKE_RAO),
+        "--validator-network",
+        VALIDATOR_NETWORK,
+        "--validator-netuid",
+        str(VALIDATOR_NETUID),
+        "--public-endpoint",
+        inputs.public_endpoint,
+        "--fleet-manifest",
+        str(FLEET_MANIFEST),
+        # Fixed staged migration behavior. This is deliberately not a
+        # deployment-selectable mode and never opens customer SAT.
+        "--allow-public-legacy-audit",
     ]
 
 
@@ -220,10 +296,6 @@ def _child_environment() -> dict[str, str]:
     # Keep the collector target fixed outside /sys. The operator binds only the
     # host report subtree here; callers still cannot override the path.
     child[TSM_REPORT_ROOT_ENV] = TSM_REPORT_ROOT
-    # The general worker CLI requires a bearer even when only its public audit
-    # routes are used. Keep that guard random, local to this process, and
-    # unavailable as a deployment input. Noncanonical SAT remains disabled.
-    child[WORKER_BEARER_ENV] = secrets.token_hex(32)
     return child
 
 
@@ -238,9 +310,9 @@ def main(
     if arguments:
         raise EntrypointError("the audit-miner image accepts no command arguments")
     source_environment = os.environ if environ is None else environ
-    hotkey = validate_environment(source_environment)
+    inputs = validate_environment(source_environment)
     material = generate_tls_material(tls_directory)
-    command = worker_command(hotkey, material)
+    command = worker_command(inputs, material)
     execvpe(command[0], command, _child_environment())
     raise EntrypointError("worker exec returned unexpectedly")
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import stat
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -11,11 +12,20 @@ from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
 from cathedral.audit_miner_entrypoint import (
+    FLEET_MANIFEST,
     HOTKEY_ENV,
+    PUBLIC_ENDPOINT_ENV,
     TSM_REPORT_ROOT,
     TSM_REPORT_ROOT_ENV,
     TLS_CERTIFICATE,
     TLS_PRIVATE_KEY,
+    VALIDATOR_ACCESS_KEYS,
+    VALIDATOR_ACCESS_KEYS_DIGEST_ENV,
+    VALIDATOR_ACCESS_SNAPSHOT,
+    VALIDATOR_ACCESS_STATE,
+    VALIDATOR_MINIMUM_STAKE_RAO,
+    VALIDATOR_NETWORK,
+    VALIDATOR_NETUID,
     WORKER_BEARER_ENV,
     WORKER_HOST,
     WORKER_PORT,
@@ -28,6 +38,13 @@ from cathedral.audit_miner_entrypoint import (
 )
 
 HOTKEY = "5CtobNq2yNmUKaaR9HL5eSY2jN4j43iz1GLXNeNp2tbkwawK"
+PUBLIC_ENDPOINT = "https://8.8.8.8:8081"
+KEYS_DIGEST = "sha256:" + "ab" * 32
+DEPLOYMENT_ENVIRONMENT = {
+    HOTKEY_ENV: HOTKEY,
+    PUBLIC_ENDPOINT_ENV: PUBLIC_ENDPOINT,
+    VALIDATOR_ACCESS_KEYS_DIGEST_ENV: KEYS_DIGEST,
+}
 REPOSITORY_ROOT = Path(__file__).parents[1]
 BASE_MANIFEST_DIGEST = "sha256:4427763a1ba36f5aa8f656a03e5d00f3b8d61f5dd950c73df6c14f8c7640f8ab"
 IMAGE_PATH = "ghcr.io/cathedralai/cathedral-sn39-audit-miner"
@@ -93,10 +110,32 @@ def test_public_hotkey_validation_refuses_valid_non_bittensor_format() -> None:
         "CATHEDRAL_GPU_COLLECT_CMD",
     ],
 )
-def test_environment_accepts_only_the_public_hotkey_input(unknown_name: str) -> None:
-    assert validate_environment({HOTKEY_ENV: HOTKEY, "PATH": "/usr/bin"}) == HOTKEY
-    with pytest.raises(EntrypointError, match=f"only {HOTKEY_ENV}"):
-        validate_environment({HOTKEY_ENV: HOTKEY, unknown_name: "caller-controlled"})
+def test_environment_accepts_only_the_three_public_deployment_inputs(unknown_name: str) -> None:
+    inputs = validate_environment({**DEPLOYMENT_ENVIRONMENT, "PATH": "/usr/bin"})
+    assert inputs.hotkey == HOTKEY
+    assert inputs.public_endpoint == PUBLIC_ENDPOINT
+    assert inputs.validator_access_keys_digest == KEYS_DIGEST
+    with pytest.raises(EntrypointError, match="only the miner hotkey"):
+        validate_environment(
+            {**DEPLOYMENT_ENVIRONMENT, unknown_name: "caller-controlled"}
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        (PUBLIC_ENDPOINT_ENV, "http://8.8.8.8:8081"),
+        (PUBLIC_ENDPOINT_ENV, "https://example.com:8081"),
+        (PUBLIC_ENDPOINT_ENV, "https://127.0.0.1:8081"),
+        (PUBLIC_ENDPOINT_ENV, "https://8.8.8.8:443"),
+        (PUBLIC_ENDPOINT_ENV, "https://[2606:4700:4700::1111]:8081"),
+        (VALIDATOR_ACCESS_KEYS_DIGEST_ENV, "ab" * 32),
+        (VALIDATOR_ACCESS_KEYS_DIGEST_ENV, "sha256:" + "AB" * 32),
+    ],
+)
+def test_environment_refuses_invalid_public_inputs(name: str, value: str) -> None:
+    with pytest.raises(EntrypointError):
+        validate_environment({**DEPLOYMENT_ENVIRONMENT, name: value})
 
 
 def test_tls_material_is_fresh_self_signed_matching_and_owner_only(tmp_path: Path) -> None:
@@ -206,7 +245,7 @@ def test_entrypoint_execs_only_the_fixed_tls_tdx_worker_command(tmp_path: Path) 
         main(
             [],
             environ={
-                HOTKEY_ENV: HOTKEY,
+                **DEPLOYMENT_ENVIRONMENT,
                 "PATH": "/usr/bin",
                 "WALLET_SEED": "must-not-reach-worker",
             },
@@ -223,6 +262,21 @@ def test_entrypoint_execs_only_the_fixed_tls_tdx_worker_command(tmp_path: Path) 
     assert argv[argv.index("--tee") + 1] == WORKER_TEE == "tdx"
     assert argv[argv.index("--tls-certificate") + 1].endswith(TLS_CERTIFICATE)
     assert argv[argv.index("--tls-private-key") + 1].endswith(TLS_PRIVATE_KEY)
+    assert argv[argv.index("--validator-access-snapshot") + 1] == str(
+        VALIDATOR_ACCESS_SNAPSHOT
+    )
+    assert argv[argv.index("--validator-access-keys") + 1] == str(VALIDATOR_ACCESS_KEYS)
+    assert argv[argv.index("--validator-access-keys-digest") + 1] == KEYS_DIGEST
+    assert argv[argv.index("--validator-access-state") + 1] == str(VALIDATOR_ACCESS_STATE)
+    assert argv[argv.index("--validator-minimum-stake-rao") + 1] == str(
+        VALIDATOR_MINIMUM_STAKE_RAO
+    ) == "0"
+    assert argv[argv.index("--validator-network") + 1] == VALIDATOR_NETWORK == "finney"
+    assert argv[argv.index("--validator-netuid") + 1] == str(VALIDATOR_NETUID) == "39"
+    assert argv[argv.index("--public-endpoint") + 1] == PUBLIC_ENDPOINT
+    assert argv[argv.index("--fleet-manifest") + 1] == str(FLEET_MANIFEST)
+    assert argv.count("--allow-public-legacy-audit") == 1
+    assert "--allow-public-bootstrap-evidence" not in argv
     assert "--development-no-auth" not in argv
     assert "--development-allow-non-loopback" not in argv
     assert "--allow-customer-sat" not in argv
@@ -230,13 +284,12 @@ def test_entrypoint_execs_only_the_fixed_tls_tdx_worker_command(tmp_path: Path) 
     assert set(child_environment) == {
         "PATH",
         TSM_REPORT_ROOT_ENV,
-        WORKER_BEARER_ENV,
     }
     assert child_environment["PATH"].startswith("/usr/local/bin:")
     assert child_environment[TSM_REPORT_ROOT_ENV] == TSM_REPORT_ROOT
     assert HOTKEY_ENV not in child_environment
     assert "WALLET_SEED" not in child_environment
-    assert re.fullmatch(r"[0-9a-f]{64}", child_environment[WORKER_BEARER_ENV])
+    assert WORKER_BEARER_ENV not in child_environment
 
 
 def test_entrypoint_refuses_command_overrides_before_writing_tls(tmp_path: Path) -> None:
@@ -244,7 +297,7 @@ def test_entrypoint_refuses_command_overrides_before_writing_tls(tmp_path: Path)
     with pytest.raises(EntrypointError, match="no command arguments"):
         main(
             ["sh"],
-            environ={HOTKEY_ENV: HOTKEY},
+            environ=DEPLOYMENT_ENVIRONMENT,
             tls_directory=tls_directory,
         )
     assert not tls_directory.exists()
@@ -255,10 +308,10 @@ def test_entrypoint_refuses_unknown_environment_before_writing_tls(
     tmp_path: Path, unknown_name: str
 ) -> None:
     tls_directory = tmp_path / "tls"
-    with pytest.raises(EntrypointError, match=f"only {HOTKEY_ENV}"):
+    with pytest.raises(EntrypointError, match="only the miner hotkey"):
         main(
             [],
-            environ={HOTKEY_ENV: HOTKEY, unknown_name: "caller-override"},
+            environ={**DEPLOYMENT_ENVIRONMENT, unknown_name: "caller-override"},
             tls_directory=tls_directory,
         )
     assert not tls_directory.exists()
@@ -276,13 +329,18 @@ def test_image_pins_amd64_base_fixed_entrypoint_and_one_tls_port() -> None:
     assert WORKER_BEARER_ENV not in dockerfile
     assert "WALLET_SEED" not in dockerfile
     assert f"install -d -o root -g root -m 0755 {TSM_REPORT_ROOT}" in dockerfile
+    assert 'org.cathedral.sn39.runtime-contract="signed-validator-fleet-v1"' in dockerfile
+    assert "import cathedral.audit_miner_entrypoint, cathedral.cli" in dockerfile
+    assert "preflight_sr25519_verifier(load_sr25519_verifier())" in dockerfile
 
 
 def test_runtime_dependency_lock_is_exact_wheel_only_and_hash_checked() -> None:
     requirements = (REPOSITORY_ROOT / "requirements" / "sn39-audit-miner.txt").read_text()
 
-    assert requirements.count("==") == 3
-    assert requirements.count("--hash=sha256:") == 8
+    assert requirements.count("==") == 4
+    assert requirements.count("--hash=sha256:") == 9
+    assert "py-sr25519-bindings==0.2.2" in requirements
+    assert "849f77ab12210e8549e58d444e9199d9aba83a988e99ca8bef04dd53e81f9561" in requirements
     assert "git+" not in requirements
     assert "http://" not in requirements
     assert "https://" not in requirements
@@ -297,6 +355,7 @@ def test_publisher_is_least_privilege_commit_tagged_and_digest_pinned() -> None:
     ).read_text()
 
     assert "branches:\n      - main" in workflow
+    assert "- scripts/run_sn39_signed_fleet_miner.sh" in workflow
     assert "permissions: {}" in workflow
     assert workflow.count("packages: write") == 1
     assert workflow.count("contents: read") == 1
@@ -336,6 +395,7 @@ def test_publisher_is_least_privilege_commit_tagged_and_digest_pinned() -> None:
 
 def test_operator_doc_keeps_digest_and_tdx_measurement_as_separate_boundaries() -> None:
     documentation = (REPOSITORY_ROOT / "docs" / "SN39_AUDIT_MINER_IMAGE.md").read_text()
+    normalized_documentation = " ".join(documentation.split())
 
     assert f"{IMAGE_PATH}@sha256:<64-hex>" in documentation
     assert "/sys/kernel/config/tsm/report" in documentation
@@ -350,3 +410,118 @@ def test_operator_doc_keeps_digest_and_tdx_measurement_as_separate_boundaries() 
     assert "ordinary production `RemoteMiner`" in documentation
     assert "same-SPKI SAT round trip" in documentation
     assert "wallet seed" in documentation.lower()
+    assert "It cannot launch the reviewed legacy digest" in documentation
+    assert "First activation stays blocked" in normalized_documentation
+    assert "A digest-only swap is not a rollback plan" in normalized_documentation
+
+
+def test_host_startup_is_syntax_valid_and_pins_the_exact_pulled_runtime() -> None:
+    script_path = REPOSITORY_ROOT / "scripts" / "run_sn39_signed_fleet_miner.sh"
+    script = script_path.read_text()
+
+    result = subprocess.run(
+        ["bash", "-n", str(script_path)], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    assert 'IMAGE_PREFIX="${IMAGE_PATH}@sha256:"' in script
+    assert '${SN39_AUDIT_MINER_IMAGE}" == "${IMAGE_PREFIX}"*' in script
+    assert 'image_digest="${SN39_AUDIT_MINER_IMAGE#"${IMAGE_PREFIX}"}"' in script
+    assert '"${image_digest}" =~ ^[0-9a-f]{64}$' in script
+    assert 'docker pull --platform linux/amd64 "${SN39_AUDIT_MINER_IMAGE}"' in script
+    assert ".RepoDigests" in script
+    assert 'grep -Fx -- "${SN39_AUDIT_MINER_IMAGE}"' in script
+    assert "{{.Os}}/{{.Architecture}}" in script
+    assert "org.cathedral.sn39.runtime-contract" in script
+    assert "--pull never" in script
+
+
+def test_host_startup_installs_only_the_fixed_tcp_8081_nftables_boundary() -> None:
+    script = (
+        REPOSITORY_ROOT / "scripts" / "run_sn39_signed_fleet_miner.sh"
+    ).read_text()
+
+    assert "NFT_FAMILY='inet'" in script
+    assert "NFT_TABLE='cathedral_sn39'" in script
+    assert "table inet cathedral_sn39" in script
+    assert "counter tcp_8081_accept" in script
+    assert "counter tcp_8081_drop" in script
+    assert "policy accept" in script
+    assert "ip saddr timeout 1m limit rate over 4/second burst 8 packets" in script
+    assert "ip saddr ct count over 2" in script
+    assert "meta nfproto ipv6 tcp dport 8081" in script
+    assert "ct state established,related counter name tcp_8081_accept accept" in script
+    assert "meta nfproto ipv4 tcp dport 8081 counter name tcp_8081_drop drop" in script
+    assert 'nft --check --file "${nft_rules}"' in script
+    assert 'nft --file "${nft_rules}"' in script
+    assert 'nft delete table "${NFT_FAMILY}" "${NFT_TABLE}"' in script
+    nft_rule_lines = [line for line in script.splitlines() if " tcp dport " in line]
+    assert nft_rule_lines
+    assert all("tcp dport 8081" in line for line in nft_rule_lines)
+    assert "CATHEDRAL_NFT" not in script
+    assert "CATHEDRAL_RATE" not in script
+    assert "CATHEDRAL_CONNECTION" not in script
+
+
+def test_host_startup_serializes_table_ownership_through_signal_cleanup() -> None:
+    script = (
+        REPOSITORY_ROOT / "scripts" / "run_sn39_signed_fleet_miner.sh"
+    ).read_text()
+
+    lock = script.index('flock --nonblock 9')
+    trap = script.index('trap cleanup EXIT')
+    first_docker = script.index('docker container inspect')
+    first_nft = script.index('nft list table')
+    delete_table = script.index('nft delete table "${NFT_FAMILY}" "${NFT_TABLE}"')
+    unlock = script.index('flock --unlock 9')
+    close_lock = script.index('exec 9>&-')
+    first_remove = script.index('docker rm --force "${CONTAINER_NAME}"')
+    kill_client = script.index('kill "${docker_client_pid}"')
+    reap_client = script.index('wait "${docker_client_pid}"', kill_client)
+    second_remove = script.index('docker rm --force "${CONTAINER_NAME}"', first_remove + 1)
+    assert "STARTUP_LOCK='/run/cathedral-sn39-startup.lock'" in script
+    assert lock < trap < first_docker
+    assert lock < first_nft
+    assert delete_table < unlock < close_lock
+    assert first_remove < kill_client < reap_client < second_remove < delete_table
+    assert "kill %%" in script
+    assert "wait >/dev/null 2>&1 || true" in script
+    assert "trap 'exit 130' INT" in script
+    assert "trap 'exit 143' TERM" in script
+    assert "trap 'exit 129' HUP" in script
+    assert '"${SN39_AUDIT_MINER_IMAGE}" &' in script
+    assert "docker_client_pid=$!" in script
+    assert 'wait "${docker_client_pid}"' in script
+
+
+def test_host_startup_uses_fixed_owner_checked_mounts_and_container_limits() -> None:
+    script = (
+        REPOSITORY_ROOT / "scripts" / "run_sn39_signed_fleet_miner.sh"
+    ).read_text()
+
+    assert "0:0:700:directory" in script
+    assert "0:0:${mode}:regular file" in script
+    assert 'validator-access.json" 644' in script
+    assert 'snapshot-keys.json" 644' in script
+    assert 'fleet.json" 644' in script
+    assert 'validator-access.sqlite" 600' in script
+    assert "${CONFIG_DIRECTORY},dst=/etc/cathedral/validator-access,readonly" in script
+    assert "${STATE_DIRECTORY},dst=/var/lib/cathedral/validator-access" in script
+    tsm_mount = next(
+        line for line in script.splitlines() if "dst=/opt/cathedral-audit-miner/tsm-report" in line
+    )
+    assert "readonly" not in tsm_mount
+    assert "--read-only" in script
+    assert "--tmpfs /run/cathedral-audit-miner:rw,noexec,nosuid,nodev,mode=0700,size=16m" in script
+    assert "--cap-drop ALL" in script
+    assert "--init" in script
+    assert "--security-opt no-new-privileges=true" in script
+    assert "--pids-limit 128" in script
+    assert "--memory 1g" in script
+    assert "--memory-swap 1g" in script
+    assert "--ulimit nofile=1024:1024" in script
+    assert "--network host" in script
+    assert "/dev/tdx_guest" not in script
+    assert "WALLET" not in script
+    assert "BEARER" not in script
+    assert "SEED" not in script
+    assert "RPC" not in script

@@ -5,9 +5,11 @@ image. It covers the independent UID30 path only. General provider onboarding
 stays in [MINING.md](../MINING.md), and the image build and trust contract stays
 in [SN39_AUDIT_MINER_IMAGE.md](SN39_AUDIT_MINER_IMAGE.md).
 
-The audit image accepts a public hotkey, serves fresh Intel TDX evidence and
-canonical SAT over native TLS on TCP `8081`, and contains no wallet. Registration,
-axon signing, verification, and weight submission happen outside the guest.
+The signed-fleet image source accepts a public hotkey, public axon endpoint,
+and public-key-file digest. It serves fresh Intel TDX evidence, signed fleet
+discovery, and validation work over native TLS on TCP `8081`, and contains no
+wallet. Registration, axon signing, snapshot signing, verification, and weight
+submission happen outside the guest.
 
 ## Current reviewed pin
 
@@ -23,6 +25,18 @@ Listener: native TLS on TCP 8081
 The digest had a successful anonymous pull and build-provenance verification.
 The digest remains an operator-enforced supply-chain pin. It is not included in
 TDX MRTD or an RTMR automatically.
+
+This is a legacy-runtime proof digest. It does not contain the locked sr25519
+wheel or the fixed signed-fleet entrypoint and mounts. Do not promote it as the
+activation image. The signed-fleet image source must pass review, merge,
+immutable publication, provenance, anonymous pull, exact runtime-label check,
+and host-edge exercise before it gets a reviewed activation pin in this
+section.
+
+The signed-fleet startup script intentionally rejects this legacy digest. A
+first-activation rollback therefore needs a separately captured and exercised
+legacy runtime restore, not a digest substitution in the new script. That
+restore is currently `NOT_PROVEN`, so it remains an activation stop condition.
 
 ## One-UID bounded fleet invariant
 
@@ -57,11 +71,11 @@ The public miner hotkey value is the same UID identity across the fleet. Its
 private material stays outside every guest. Never copy a miner or validator
 private key into an audit guest.
 
-This policy is implemented in the general worker source, not in the reviewed
-audit image named above. The current image has no signed snapshot, fleet route,
-durable replay state, or sr25519 request verifier. Do not attach a second
-machine to the live UID30 path until the separate measured-image and validator
-activation gates in [WORK_REQUEST_V2.md](WORK_REQUEST_V2.md) complete.
+This policy is implemented in the general worker and signed-fleet image source,
+not in the reviewed legacy digest named above. Do not attach a second machine
+to the live UID30 path until the image and validator changes merge, a new
+digest passes publication and edge gates, and the remaining activation gates
+in [WORK_REQUEST_V2.md](WORK_REQUEST_V2.md) complete.
 
 Intel TDX is the only multi-machine class eligible for scoring. AMD SEV-SNP
 serving and channel binding remain supported in source. AMD multi-machine
@@ -82,8 +96,8 @@ another weight row, or attach a fleet endpoint.
    limit, spend limit, endpoint, and intended validator outcome.
 3. Provision one Intel TDX guest with only the required TLS ingress. Keep wallet
    files, cloud credentials, SSH credentials, and validator secrets off the VM.
-4. Pull the exact digest anonymously and start the container with the narrow
-   configfs TSM report bind documented in
+4. Pull the exact digest anonymously and start the container with the reviewed
+   host script and narrow read-write configfs TSM report bind documented in
    [SN39_AUDIT_MINER_IMAGE.md](SN39_AUDIT_MINER_IMAGE.md#run-inside-the-tdx-guest).
 5. Before registration or any chain announcement, prove fresh QVL acceptance,
    canonical SAT, and

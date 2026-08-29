@@ -145,13 +145,14 @@ endpoints, distinct attested TLS SPKIs, and distinct attested hardware
 identities. Repeating one machine at several IPs, or copying one TLS private key
 between machines, does not create additional verified compute.
 
-This multi-machine path is implemented in the general worker source but is not
-active in the published SN39 audit-miner image. That fixed image still serves
-one public evidence and canonical-SAT endpoint for the reviewed UID30 path.
-Live multi-machine scoring stays Intel TDX-only until a separate measured-image
-rollout and two-machine proof complete. AMD SEV-SNP serving remains supported,
-but SNP fleet scoring stays disabled until the friend-owned hardware test proves
-stable `CHIP_ID` deduplication.
+This multi-machine path is implemented in the general worker and signed-fleet
+image source. It is not active in the published legacy image. The image change
+pins the sr25519 verifier and fixes permit-only access, config, state, host-edge,
+and container contracts. It still needs review, merge, immutable publication,
+provenance, anonymous pull, and a two-machine proof. Live multi-machine scoring
+stays Intel TDX-only. AMD SEV-SNP serving remains supported, but SNP fleet
+scoring stays disabled until the friend-owned hardware test proves stable
+`CHIP_ID` deduplication.
 
 ## 1. Request a beta slot
 
