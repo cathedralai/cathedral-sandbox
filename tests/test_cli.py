@@ -907,6 +907,135 @@ def test_worker_serve_defaults_to_loopback():
     assert args.channel_binding_digest is None
     assert args.tls_certificate is None
     assert args.tls_private_key is None
+    assert args.validator_access_snapshot is None
+    assert args.fleet_manifest is None
+    assert args.allow_public_bootstrap_evidence is False
+    assert args.allow_public_legacy_audit is False
+
+
+def test_worker_signed_access_requires_complete_configuration():
+    args = build_parser().parse_args(
+        [
+            "worker",
+            "serve",
+            "--hotkey",
+            "miner",
+            "--validator-access-snapshot",
+            "/srv/cathedral/validator-access.json",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="snapshot, pinned keys, durable state"):
+        cmd_worker_serve(args)
+
+
+def test_worker_signed_access_requires_native_tls():
+    args = build_parser().parse_args(
+        [
+            "worker",
+            "serve",
+            "--hotkey",
+            "miner",
+            "--channel-binding-type",
+            "tls_spki_sha256",
+            "--channel-binding-digest",
+            "ab" * 32,
+            "--validator-access-snapshot",
+            "/srv/cathedral/validator-access.json",
+            "--validator-access-keys",
+            "/srv/cathedral/keys.json",
+            "--validator-access-keys-digest",
+            "sha256:" + "cd" * 32,
+            "--validator-access-state",
+            "/var/lib/cathedral/validator-access.sqlite",
+            "--validator-minimum-stake-rao",
+            "1000",
+            "--public-endpoint",
+            "https://8.8.8.8:8081",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="requires worker TLS"):
+        cmd_worker_serve(args)
+
+
+def test_worker_signed_access_starts_without_bearer_and_wires_legacy_bridge(
+    tmp_path: Path, monkeypatch
+):
+    certificate, private_key = _tls_material(tmp_path)
+    calls: list[dict[str, object]] = []
+
+    class FakeProvider:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def load(self, *, now):
+            return object()
+
+    class FakeAuthorizer:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class FakeServer:
+        host = "0.0.0.0"
+        port = 8081
+
+        def __init__(self, *_args, **kwargs):
+            calls.append(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def serve_forever(self):
+            return None
+
+    monkeypatch.delenv(DEFAULT_WORKER_BEARER_ENV, raising=False)
+    monkeypatch.setattr("cathedral.cli.load_policy_keys", lambda *_args, **_kwargs: {"k": b"p" * 32})
+    monkeypatch.setattr("cathedral.cli.ValidatorAccessState", lambda _path: object())
+    monkeypatch.setattr("cathedral.cli.SignedValidatorSnapshotProvider", FakeProvider)
+    monkeypatch.setattr("cathedral.cli.load_sr25519_verifier", lambda: object())
+    monkeypatch.setattr("cathedral.cli.preflight_sr25519_verifier", lambda _verifier: None)
+    monkeypatch.setattr("cathedral.cli.ValidatorRequestAuthorizer", FakeAuthorizer)
+    monkeypatch.setattr(
+        "cathedral.cli.singleton_fleet",
+        lambda *, public_endpoint: (public_endpoint,),
+    )
+    monkeypatch.setattr("cathedral.cli.WorkerServer", FakeServer)
+    args = build_parser().parse_args(
+        [
+            "worker",
+            "serve",
+            "--hotkey",
+            "miner",
+            "--host",
+            "0.0.0.0",
+            "--tls-certificate",
+            str(certificate),
+            "--tls-private-key",
+            str(private_key),
+            "--validator-access-snapshot",
+            "/srv/cathedral/validator-access.json",
+            "--validator-access-keys",
+            "/srv/cathedral/keys.json",
+            "--validator-access-keys-digest",
+            "sha256:" + "cd" * 32,
+            "--validator-access-state",
+            "/var/lib/cathedral/validator-access.sqlite",
+            "--validator-minimum-stake-rao",
+            "1000",
+            "--public-endpoint",
+            "https://8.8.8.8:8081",
+            "--allow-public-legacy-audit",
+        ]
+    )
+
+    assert cmd_worker_serve(args) == 0
+    assert calls[0]["bearer_token"] is None
+    assert calls[0]["allow_public_legacy_audit"] is True
+    assert calls[0]["fleet_endpoints"] == ("https://8.8.8.8:8081",)
 
 
 def test_worker_serve_refuses_non_loopback_without_development_flag():
@@ -1332,7 +1461,7 @@ def test_miner_wrapper_help_uses_worker_parser(capsys):
 def _tls_pair(tmp_path):
     """A throwaway self-signed cert so tls_enabled is genuinely true."""
     from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ed25519
     from cryptography.x509.oid import NameOID
     from datetime import datetime, timedelta, UTC

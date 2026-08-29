@@ -18,6 +18,9 @@ dependencies = [
 # key implementation they execute.
 enrollment-service = ["substrate-interface>=1.7.0,<2"]
 enrollment-miner = ["bittensor-wallet>=4.0.1,<5"]
+# The measured worker verifies Bittensor hotkey signatures but never imports a
+# chain client or wallet. Keep the one cryptographic primitive explicit.
+validator-access-worker = ["py-sr25519-bindings==0.2.2"]
 # Install this role in its own producer environment. Bittensor 10 uses cyscale,
 # while substrate-interface uses py-scale-codec under the same module name.
 enrollment-operator = ["bittensor>=10.3.1,<11"]

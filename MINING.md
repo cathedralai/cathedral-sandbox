@@ -131,24 +131,27 @@ self-reported volume alone.
 - Cathedral may have no available beta slot or no positive work in an epoch.
 - A past positive score does not guarantee future weight or emissions.
 
-### One independently scored machine per hotkey
+### One UID, bounded fleet candidates
 
-One hotkey maps to one SN39 UID, one active enrollment identity, and one
-canonical axon endpoint at a time. Re-enrollment or a successor axon changes
-the endpoint for that identity. It does not create a second independently
-listed worker.
+One hotkey maps to one SN39 UID and one canonical chain axon endpoint. The
+signed fleet design lets that attested axon return a bounded list of additional
+machine candidates for the same UID. Read
+[the signed validator access contract](docs/WORK_REQUEST_V2.md).
 
-To list and score a second machine separately, use a second accepted hotkey,
-register it to obtain a second UID, enroll and announce its own endpoint, and
-complete fresh QVL and same-SPKI work verification. The validator must then
-review an explicit vector containing both UIDs. The current UID30 launch tool
-is a consumed one-shot that pins one miner and cannot add a second target. A
-second weighted miner therefore also requires a separately reviewed
-multi-target policy and writer, followed by a new chain submission after the
-weight cooldown. The current axon announcement authorization is also pinned to
-UID124 and its one reviewed successor has been consumed. A second hotkey needs
-its own reviewed announcement policy and tool. Keep both private hotkeys out of
-the worker guests.
+An endpoint is not a scored machine. The validator must independently verify
+fresh vendor evidence, the worker hotkey, the TLS SPKI, canonical work, and a
+stable hardware identity for every candidate. Counted machines need distinct
+endpoints, distinct attested TLS SPKIs, and distinct attested hardware
+identities. Repeating one machine at several IPs, or copying one TLS private key
+between machines, does not create additional verified compute.
+
+This multi-machine path is implemented in the general worker source but is not
+active in the published SN39 audit-miner image. That fixed image still serves
+one public evidence and canonical-SAT endpoint for the reviewed UID30 path.
+Live multi-machine scoring stays Intel TDX-only until a separate measured-image
+rollout and two-machine proof complete. AMD SEV-SNP serving remains supported,
+but SNP fleet scoring stays disabled until the friend-owned hardware test proves
+stable `CHIP_ID` deduplication.
 
 ## 1. Request a beta slot
 
@@ -337,12 +340,11 @@ curl -fsS http://127.0.0.1:8081/v1/evidence \
   | python3 -c 'import json,sys; r=json.load(sys.stdin); print("kind:", r["kind"]); print("quote bytes:", len(bytes.fromhex(r["quote_hex"]))); print("hotkey:", r["assigned_hotkey"])'
 ```
 
-That request carries no credential because `/v1/evidence` never checks one.
-This is deliberate: a validator holds no token for a worker it has not
-attested yet. The token you created in step 4 gates the work endpoints only,
-and the validator sends it after it has verified the attested channel.
-Evidence collection is unauthenticated at every stage, including in
-production.
+On the current fixed audit image, that request carries no credential because
+`/v1/evidence` is the public bootstrap path. This is deliberate: the reviewed
+UID30 collector holds no token before attestation. The future signed-access
+profile authenticates evidence with the validator hotkey by default. Its
+explicit legacy-audit migration flag temporarily preserves this public request.
 
 The worker bounds that public path itself. Evidence requests draw on their own
 two-slot pool, the credential-free canonical SAT audit draws on a second
@@ -551,9 +553,9 @@ Neither a provider nor Cathedral can promise a future token amount.
 | Local evidence is empty | Check TDX availability and report-directory permission |
 | Endpoint unreachable | Check in-guest TLS service and the approved firewall allowlist |
 | Channel mismatch | TLS terminates in the wrong place or the SPKI digest changed |
-| `401` on work | Worker and validator bearer credentials differ. Never applies to `/v1/evidence`, which is unauthenticated |
+| `401` on evidence or work | On the current audit image, work bearer credentials differ. In a signed-access source deployment, the validator signature, snapshot qualification, freshness, replay, body, subnet, or TLS channel check failed |
 | Connection closes before an HTTP response | The eight-slot pre-handler connection gate is full. Retry with backoff. The refusal is intentionally not an HTTP response |
-| `503 busy` | The two-slot evidence pool, two-slot public SAT pool, or four-slot authenticated work pool is full. Requests are rejected, not queued |
+| `503 busy` | The two-slot evidence pool, two-slot public SAT pool, four-slot authenticated work pool, or signed-access reserved validator pool is full. Requests are rejected, not queued |
 | `assigned_hotkey mismatch` | Worker was started with a different public address |
 | `admit=N` | Most often a measurement that is not on the approved list. Otherwise quote crypto, TCB status, binding, identity, or the policy window |
 | `score=0` | No verified work, stale evidence, failed work, or explicit revocation |

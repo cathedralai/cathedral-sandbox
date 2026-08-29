@@ -1759,6 +1759,7 @@ def test_remote_miner_rejects_invalid_limits(kwargs):
         {"max_concurrent": 0},
         {"max_challenge_concurrent": 0},
         {"max_sat_challenge_concurrent": 0},
+        {"max_validator_challenge_concurrent": 0},
         {"max_connection_concurrent": 0},
         {"max_connection_concurrent": True},
         {"max_connection_concurrent": 1.5},

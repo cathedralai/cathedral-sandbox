@@ -53,6 +53,14 @@ not an image secret or deployment input. Customer SAT and noncanonical SAT stay
 disabled. The independent validator sends no bearer to the public evidence and
 canonical SAT routes.
 
+This exact image does not install or configure the signed validator-access and
+fleet-discovery role in [WORK_REQUEST_V2.md](WORK_REQUEST_V2.md). It has no
+validator snapshot, pinned snapshot key, persistent replay database, fleet
+manifest, or `py-sr25519-bindings` dependency. Source support does not change
+this image's measured runtime contract. Activation requires a separate image,
+entrypoint, dependency-pin, provenance, measurement-boundary, and live-test
+review.
+
 An operator with control of the container runtime can replace the entrypoint,
 mount different files, or publish another port. The deployment policy must use
 the reviewed digest and the fixed command described here.
