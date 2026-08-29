@@ -1388,7 +1388,7 @@ def test_public_legacy_bridge_cannot_starve_signed_validator_control(
                     self._condition.wait(remaining)
                 return True
 
-    monkeypatch.setattr(worker_module.threading, "Semaphore", TrackingSemaphore)
+    monkeypatch.setattr(worker_module, "_Semaphore", TrackingSemaphore)
 
     def evidence_collector(nonce, hotkey, **kwargs):
         return Evidence(

@@ -84,6 +84,7 @@ _CREDENTIAL_FREE_PATHS = frozenset({"/v1/evidence", "/v1/sat-work"})
 _POST_PATHS = frozenset(
     {"/v1/evidence", "/v1/capabilities", "/v1/sat-work", "/v1/fleet"}
 )
+_Semaphore = threading.Semaphore
 _CAPABILITIES_REQUEST_KEYS: frozenset[str] = frozenset()
 _INSTANCE_KEYS = frozenset({"n_vars", "clauses"})
 _DECIMAL_RE = re.compile(r"[0-9]+")
@@ -1057,10 +1058,10 @@ class WorkerServer:
             ):
                 raise ValueError("signed validator access requires bounded fleet candidates")
 
-        semaphore = threading.Semaphore(max_concurrent)
-        challenge_semaphore = threading.Semaphore(max_challenge_concurrent)
-        sat_challenge_semaphore = threading.Semaphore(max_sat_challenge_concurrent)
-        validator_challenge_semaphore = threading.Semaphore(
+        semaphore = _Semaphore(max_concurrent)
+        challenge_semaphore = _Semaphore(max_challenge_concurrent)
+        sat_challenge_semaphore = _Semaphore(max_sat_challenge_concurrent)
+        validator_challenge_semaphore = _Semaphore(
             max_validator_challenge_concurrent
         )
         validator_request_limiter = (
