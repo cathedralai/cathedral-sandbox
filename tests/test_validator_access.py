@@ -4,6 +4,7 @@ import base64
 import hashlib
 import ipaddress
 import os
+import sqlite3
 import socket
 import ssl
 import threading
@@ -597,6 +598,81 @@ def test_snapshot_provider_rejects_durable_block_rollback(tmp_path: Path):
         state=ValidatorAccessState(state_path),
     )
     assert restarted.load(now=NOW + timedelta(seconds=10)) is None
+
+
+def test_snapshot_state_accepts_only_semantically_identical_same_height_resign(
+    tmp_path: Path,
+):
+    state = ValidatorAccessState(str(tmp_path / "validator-access.sqlite"))
+    first = _snapshot()
+    resigned = _snapshot(
+        generated_at=NOW + timedelta(minutes=1),
+        expires_at=NOW + timedelta(minutes=11),
+        verify_at=NOW + timedelta(minutes=1),
+    )
+    changed_authorization = _snapshot(
+        stake_rao=3_000,
+        generated_at=NOW + timedelta(minutes=2),
+        expires_at=NOW + timedelta(minutes=12),
+        verify_at=NOW + timedelta(minutes=2),
+    )
+    changed_hash = _snapshot(
+        block_hash="0x" + "b" * 64,
+        generated_at=NOW + timedelta(minutes=2),
+        expires_at=NOW + timedelta(minutes=12),
+        verify_at=NOW + timedelta(minutes=2),
+    )
+
+    assert first.digest != resigned.digest
+    assert first.authorization_digest == resigned.authorization_digest
+    assert changed_authorization.authorization_digest != first.authorization_digest
+    assert state.accept_snapshot(first)
+    assert state.accept_snapshot(resigned)
+    assert not state.accept_snapshot(changed_authorization)
+    assert not state.accept_snapshot(changed_hash)
+
+
+def test_snapshot_state_migrates_legacy_row_without_weakening_same_height_gate(
+    tmp_path: Path,
+):
+    path = tmp_path / "validator-access.sqlite"
+    first = _snapshot()
+    resigned = _snapshot(
+        generated_at=NOW + timedelta(minutes=1),
+        expires_at=NOW + timedelta(minutes=11),
+        verify_at=NOW + timedelta(minutes=1),
+    )
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE validator_snapshot_high_water (
+                network TEXT NOT NULL,
+                netuid INTEGER NOT NULL,
+                block INTEGER NOT NULL,
+                block_hash TEXT NOT NULL,
+                snapshot_digest TEXT NOT NULL,
+                PRIMARY KEY(network, netuid)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO validator_snapshot_high_water(
+                network, netuid, block, block_hash, snapshot_digest
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (first.network, first.netuid, first.block, first.block_hash, first.digest),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    path.chmod(0o600)
+
+    state = ValidatorAccessState(str(path))
+    assert not state.accept_snapshot(resigned)
+    assert state.accept_snapshot(first)
+    assert state.accept_snapshot(resigned)
 
 
 def test_fleet_manifest_keeps_axon_as_exact_singleton_then_adds_candidates():

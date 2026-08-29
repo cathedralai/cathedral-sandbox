@@ -243,10 +243,23 @@ class ValidatorAccessState:
                     block INTEGER NOT NULL,
                     block_hash TEXT NOT NULL,
                     snapshot_digest TEXT NOT NULL,
+                    authorization_digest TEXT NOT NULL,
                     PRIMARY KEY(network, netuid)
                 )
                 """
             )
+            high_water_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(validator_snapshot_high_water)")
+            }
+            if "authorization_digest" not in high_water_columns:
+                # An older row proves only the full signed document digest.
+                # Leave its semantic digest unknown until that exact document
+                # is observed again. A changed same-height document remains
+                # fail-closed until the semantic authorization is known.
+                connection.execute(
+                    "ALTER TABLE validator_snapshot_high_water ADD COLUMN authorization_digest TEXT"
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS validator_request_replays (
@@ -270,7 +283,7 @@ class ValidatorAccessState:
             connection.close()
 
     def accept_snapshot(self, snapshot: "ValidatorAccessSnapshot") -> bool:
-        """Durably reject finalized-block rollback and same-height equivocation."""
+        """Accept freshness-only re-signs while rejecting rollback or equivocation."""
 
         try:
             connection = self._connect()
@@ -278,31 +291,48 @@ class ValidatorAccessState:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
                     """
-                    SELECT block, block_hash, snapshot_digest
+                    SELECT block, block_hash, snapshot_digest, authorization_digest
                     FROM validator_snapshot_high_water
                     WHERE network = ? AND netuid = ?
                     """,
                     (snapshot.network, snapshot.netuid),
                 ).fetchone()
                 if row is not None:
-                    current_block, current_hash, current_digest = row
+                    (
+                        current_block,
+                        current_hash,
+                        current_digest,
+                        current_authorization_digest,
+                    ) = row
                     if snapshot.block < current_block:
                         connection.rollback()
                         return False
-                    if snapshot.block == current_block and (
-                        snapshot.block_hash != current_hash or snapshot.digest != current_digest
-                    ):
-                        connection.rollback()
-                        return False
+                    if snapshot.block == current_block:
+                        if snapshot.block_hash != current_hash:
+                            connection.rollback()
+                            return False
+                        if current_authorization_digest is None:
+                            # A pre-migration row has no independently stored
+                            # semantic authorization. Re-observing its exact
+                            # signed document safely backfills that digest, but
+                            # a changed same-height document stays fail-closed.
+                            if snapshot.digest != current_digest:
+                                connection.rollback()
+                                return False
+                        elif snapshot.authorization_digest != current_authorization_digest:
+                            connection.rollback()
+                            return False
                 connection.execute(
                     """
                     INSERT INTO validator_snapshot_high_water(
-                        network, netuid, block, block_hash, snapshot_digest
-                    ) VALUES (?, ?, ?, ?, ?)
+                        network, netuid, block, block_hash, snapshot_digest,
+                        authorization_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(network, netuid) DO UPDATE SET
                         block = excluded.block,
                         block_hash = excluded.block_hash,
-                        snapshot_digest = excluded.snapshot_digest
+                        snapshot_digest = excluded.snapshot_digest,
+                        authorization_digest = excluded.authorization_digest
                     """,
                     (
                         snapshot.network,
@@ -310,6 +340,7 @@ class ValidatorAccessState:
                         snapshot.block,
                         snapshot.block_hash,
                         snapshot.digest,
+                        snapshot.authorization_digest,
                     ),
                 )
                 connection.commit()
@@ -607,6 +638,37 @@ class QualifiedValidator:
     stake_rao: int
 
 
+def _snapshot_authorization_digest(
+    *,
+    network: str,
+    netuid: int,
+    block: int,
+    block_hash: str,
+    minimum_stake_rao: int,
+    signing_key_id: str,
+    validators: Mapping[str, QualifiedValidator],
+) -> str:
+    """Digest the stable authorization semantics, excluding freshness fields."""
+
+    authorization = {
+        "network": network,
+        "netuid": netuid,
+        "block": block,
+        "block_hash": block_hash,
+        "minimum_stake_rao": minimum_stake_rao,
+        "signing_key_id": signing_key_id,
+        "validators": [
+            {
+                "hotkey": row.hotkey,
+                "uid": row.uid,
+                "stake_rao": row.stake_rao,
+            }
+            for row in sorted(validators.values(), key=lambda row: row.hotkey)
+        ],
+    }
+    return "sha256:" + hashlib.sha256(canonical_json(authorization)).hexdigest()
+
+
 @dataclass(frozen=True)
 class ValidatorAccessSnapshot:
     network: str
@@ -618,6 +680,7 @@ class ValidatorAccessSnapshot:
     minimum_stake_rao: int
     validators: Mapping[str, QualifiedValidator]
     signing_key_id: str
+    authorization_digest: str
     digest: str
 
     def qualifies(self, hotkey: str, *, at: datetime) -> bool:
@@ -933,6 +996,15 @@ def verify_validator_access_snapshot(
         minimum_stake_rao=minimum_stake_rao,
         validators=MappingProxyType(validators),
         signing_key_id=key_id,
+        authorization_digest=_snapshot_authorization_digest(
+            network=network,
+            netuid=netuid,
+            block=block,
+            block_hash=block_hash,
+            minimum_stake_rao=minimum_stake_rao,
+            signing_key_id=key_id,
+            validators=validators,
+        ),
         digest="sha256:" + hashlib.sha256(canonical_json(document)).hexdigest(),
     )
 
