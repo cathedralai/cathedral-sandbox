@@ -77,7 +77,7 @@ launch is a stop condition.
 The activation image is fixed to this reviewed, immutable reference:
 
 ```text
-ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:61a1806fce13d987323e7c418f1260ba1cd8c9ace8e5b9f9be3c193bdba7228a
+ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99
 ```
 
 After anonymous pull and provenance verification, run:
@@ -86,7 +86,7 @@ After anonymous pull and provenance verification, run:
 python scripts/sn39_gcp_snapshot_publisher.py provision \
   --signing-key-file /absolute/owner-only/validator-access.seed \
   --keys-file /absolute/public/validator-access-keys.json \
-  --image ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:61a1806fce13d987323e7c418f1260ba1cd8c9ace8e5b9f9be3c193bdba7228a \
+  --image ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99 \
   --acknowledge CREATE_TWO_UID124_TDX_GUESTS_FOR_FOUR_HOURS
 ```
 
@@ -105,7 +105,7 @@ foreground:
 python scripts/sn39_gcp_snapshot_publisher.py publish-loop \
   --signing-key-file /absolute/owner-only/validator-access.seed \
   --keys-file /absolute/public/validator-access-keys.json \
-  --image ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:61a1806fce13d987323e7c418f1260ba1cd8c9ace8e5b9f9be3c193bdba7228a \
+  --image ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99 \
   --acknowledge PUBLISH_PUBLIC_UID30_PERMIT_SNAPSHOT_TO_TWO_GUESTS
 ```
 

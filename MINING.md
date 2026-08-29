@@ -348,11 +348,11 @@ curl -fsS http://127.0.0.1:8081/v1/evidence \
 ```
 
 The loopback development command above carries no credential because
-`--development-no-auth` is explicit. The current published UID30 audit image
-also keeps this request public through its fixed legacy flag. Replacement
-source moves that bridge to the separate `public-legacy-audit` migration mode,
-but no replacement image digest is published yet. Normal `worker serve`
-authenticates evidence with a bearer or signed validator request.
+`--development-no-auth` is explicit. The published UID30 audit image keeps this
+request public through its fixed `public-legacy-audit` migration posture. Its
+immutable source and digest are recorded in
+`docs/SN39_AUDIT_MINER_OPERATIONS.md`. Normal `worker serve` authenticates
+evidence with a bearer or signed validator request.
 
 The worker bounds public development and migration paths. Evidence requests
 draw on their own two-slot pool, public canonical SAT draws on a second
@@ -561,7 +561,7 @@ Neither a provider nor Cathedral can promise a future token amount.
 | Local evidence is empty | Check TDX availability and report-directory permission |
 | Endpoint unreachable | Check in-guest TLS service and the approved firewall allowlist |
 | Channel mismatch | TLS terminates in the wrong place or the SPKI digest changed |
-| `401` on evidence or work | On the current audit image, work bearer credentials differ. In a signed-access source deployment, the validator signature, snapshot qualification, freshness, replay, body, subnet, or TLS channel check failed |
+| `401` on evidence or work | A protected request failed bearer or signed-validator authentication. For signed access, check the validator signature, snapshot permit and freshness, replay state, exact body, subnet, and TLS channel. The public migration bridge covers only evidence and canonical audit SAT |
 | Connection closes before an HTTP response | The eight-slot pre-handler connection gate is full. Retry with backoff. The refusal is intentionally not an HTTP response |
 | `503 busy` | The two-slot evidence pool, two-slot public SAT pool, four-slot authenticated work pool, or signed-access reserved validator pool is full. Requests are rejected, not queued |
 | `assigned_hotkey mismatch` | Worker was started with a different public address |

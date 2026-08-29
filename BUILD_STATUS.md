@@ -41,9 +41,9 @@ Testnet SN292 remains the non-paying dry-run integration lane.
   burn contract; miners cannot choose the allocation.
 - The production worker authenticates its work and evidence routes. Current
   source has a separate, explicit migration posture for the bounded public
-  evidence/canonical-SAT bridge. The published UID30 image predates that
-  command split and retains the same bridge through its fixed legacy flag.
-  Customer SAT stays authenticated.
+  evidence/canonical-SAT bridge. The published UID30 image uses that fixed
+  migration posture and emits its effective-startup record. It disables
+  customer SAT. Normal production customer SAT stays authenticated.
   Connection admission
   and the three request-class pools are acquired before untrusted body reads,
   so partial requests cannot grow handler threads without a ceiling. It returns

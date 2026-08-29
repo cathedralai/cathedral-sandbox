@@ -1,26 +1,28 @@
 # SN39 independent audit-miner image
 
-This source change defines the next hardened signed-fleet worker image for SN39. It
+This page defines the hardened signed-fleet worker image for SN39. It
 serves fresh Intel TDX evidence, signed fleet discovery, and signed validation
 work over native TLS on `0.0.0.0:8081`. The fixed staged bridge also keeps
 public evidence and canonical audit SAT available to the current UID30
 collector. Customer SAT stays disabled.
 
-This page describes a source-only replacement contract. It must not be
-attributed to the published digest recorded in
-`SN39_AUDIT_MINER_OPERATIONS.md`. That digest was built from source merge
-`8ad7f6e127ad7dcc4dd150f0e1eb47ce72c5ab22`. Its entrypoint still invokes
-`worker serve --tee tdx --allow-public-legacy-audit`, and it does not emit the
-new `cathedral_effective_startup_v1` posture record. The replacement contract
-below remains unpublished until a new immutable digest and provenance record
-are captured in the operations runbook. Publication would still not prove
-deployment or a live two-machine result.
+The published replacement contract is source merge
+`78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8` and image
+`ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99`.
+GitHub Actions run `33266307118` published and attested the digest. A separate
+no-permission job proved anonymous registry access. Publication is not
+deployment and does not prove a live two-machine result.
+
+The preserved legacy rollback image was built from source merge
+`8ad7f6e127ad7dcc4dd150f0e1eb47ce72c5ab22`. It invokes
+`worker serve --tee tdx --allow-public-legacy-audit`, does not emit
+`cathedral_effective_startup_v1`, and has a different launcher contract.
 
 Use [SN39_AUDIT_MINER_OPERATIONS.md](SN39_AUDIT_MINER_OPERATIONS.md) for the
 canonical bounded launch order, one-hotkey-per-listed-machine invariant, dated
 UID124 proof, and stop conditions.
 
-## Source-only replacement runtime contract
+## Published replacement runtime contract
 
 The default entrypoint accepts no command arguments and exactly three public
 Cathedral environment inputs:
@@ -79,7 +81,7 @@ to present the same SPKI. The ordinary production `RemoteMiner` and prober use
 CA and hostname verification and are not compatible with this static SAN. Do
 not substitute that client for the reviewed UID30 attested-SPKI transport.
 
-The replacement source command invokes
+The published command invokes
 `worker migrate --migration-mode public-legacy-audit`. That command has no TEE
 selector and is fixed to Intel TDX. Docker mounts its own read-only sysfs
 over the image's `/sys` tree, so an image-layer
@@ -94,7 +96,7 @@ mounted. The image exposes one listener, native TLS on TCP `8081`. It does not
 configure a plaintext listener. The worker uses the kernel configfs TSM path
 through this bounded read-write exception.
 
-The replacement entrypoint always configures the signed validator-access and bounded
+The entrypoint always configures the signed validator-access and bounded
 fleet-discovery role in [WORK_REQUEST_V2.md](WORK_REQUEST_V2.md). It also always
 enables the narrow legacy-audit bridge during staged migration. There is no
 environment flag or command override for signed-only, bearer, customer-SAT,
@@ -103,11 +105,9 @@ later reviewed image change after the signed collector and rollback path are
 live-proven.
 
 An operator with control of the container runtime can replace the entrypoint,
-mount different files, or publish another port. Do not use this source-only
-command description as evidence about the current published digest. A future
-deployment policy must name the newly reviewed digest that contains this
-contract. Until then, the current pin and its prior command remain the only
-published image facts.
+mount different files, or publish another port. Deployment policy must name the
+exact reviewed digest above. The source description and registry publication
+do not prove which image a live guest runs.
 
 ## Base and dependency pins
 
@@ -195,8 +195,8 @@ install -o root -g root -m 0644 fleet.json \
   /etc/cathedral/validator-access/fleet.json
 ```
 
-Set the reviewed public values and exact unpublished or published activation
-digest. The script requires the digest suffix to match
+Set the reviewed public values and exact published activation digest. The
+script requires the digest suffix to match
 `sha256:[0-9a-f]{64}`. Then run the reviewed host script as root:
 
 ```bash
@@ -300,11 +300,11 @@ anonymous pull and live TDX/SAT validation. Do not retag, overwrite, or delete
 a published launch digest as a rollback mechanism.
 
 For the first signed-fleet activation, no previously proven signed-fleet digest
-exists. A full legacy-runtime restore is a different command and configuration
-transition and is not specified or tested by this source change. First
-activation stays blocked until the operator captures and exercises that exact
-legacy restore or proves a signed-fleet fallback digest. A digest-only swap is
-not a rollback plan.
+exists. The full legacy-runtime restore is a different command and
+configuration transition. That restore was captured and exercised on
+2026-08-29 using the preserved legacy image and the sanitized proof named in
+`SN39_AUDIT_MINER_OPERATIONS.md`. Repeat the procedure before relying on it for
+a future activation. A digest-only swap is not a rollback plan.
 
 Stop the signed-fleet container before changing its config. The startup script
 removes only `inet cathedral_sn39`; remove that exact table manually if an
@@ -322,10 +322,10 @@ Source and publication alone do not:
   other than the dated bounded proof; or
 - prove the application image is included in the admitted TDX measurement.
 
-The source change is ready for review only after its image tests, startup-script
-contract tests, full repository suite, and independent security review pass.
-Deployment remains blocked until a merge publishes a new immutable digest,
-provenance and anonymous pull pass for that digest, the matching validator
-source is merged, the fixed nftables boundary and monitoring are exercised, and
-two distinct TDX machines for one UID pass fresh signed access, fleet discovery,
-QVL, same-SPKI SAT, hardware deduplication, and no-write weight preview.
+Source review, image tests, startup-script contract tests, repository CI,
+immutable publication, provenance verification, and anonymous registry access
+are complete for the reviewed digest. Deployment remains blocked until the
+matching validator configuration is confirmed, the fixed nftables boundary and
+monitoring are exercised, and two distinct TDX machines for one UID pass fresh
+signed access, fleet discovery, QVL, same-SPKI SAT, hardware deduplication, and
+no-write weight preview.

@@ -389,18 +389,18 @@ not deployment. These activation gates remain:
 3. Keep AMD SEV-SNP fleet scoring disabled until the friend-owned hardware test
    proves stable `CHIP_ID` behavior.
 
-## Published image remains in legacy migration posture until replacement
+## Replacement image is published in fixed migration posture
 
-The reviewed published image was built from source merge
-`8ad7f6e127ad7dcc4dd150f0e1eb47ce72c5ab22`. Its fixed command uses
-`worker serve --tee tdx --allow-public-legacy-audit`, and it does not emit
-`cathedral_effective_startup_v1`. The current source candidate moves the same
-bounded bridge to `worker migrate --migration-mode public-legacy-audit`, but
-that command must not be attributed to the published digest. It remains
-source-only until a replacement image, provenance result, and immutable digest
-are published and recorded. Promotion to signed-only `worker serve` requires a
-later reviewed image change. Do not treat publication as evidence the artifact
-is deployed or serving live traffic.
+The reviewed replacement was built from source merge
+`78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8` and published as
+`ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99`.
+Its fixed command uses `worker migrate --migration-mode public-legacy-audit`
+and emits `cathedral_effective_startup_v1`. The preserved legacy rollback image
+was built from source merge `8ad7f6e127ad7dcc4dd150f0e1eb47ce72c5ab22`.
+It uses `worker serve --tee tdx --allow-public-legacy-audit` and must not be
+substituted into the new launcher. Promotion to signed-only `worker serve`
+requires a later reviewed image change. Do not treat publication as evidence
+the artifact is deployed or serving live traffic.
 
 The fixed host paths and exact startup are documented in
 [SN39_AUDIT_MINER_IMAGE.md](SN39_AUDIT_MINER_IMAGE.md). The config directory is

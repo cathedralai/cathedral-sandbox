@@ -411,11 +411,11 @@ def test_operator_doc_keeps_digest_and_tdx_measurement_as_separate_boundaries() 
     assert "same-SPKI SAT round trip" in documentation
     assert "wallet seed" in documentation.lower()
     assert "It cannot launch the reviewed legacy digest" in documentation
-    assert "First activation stays blocked" in normalized_documentation
+    assert "That restore was captured and exercised" in normalized_documentation
     assert "A digest-only swap is not a rollback plan" in normalized_documentation
 
 
-def test_operator_docs_do_not_attribute_source_only_posture_split_to_published_digest() -> None:
+def test_operator_docs_bind_the_published_replacement_and_preserve_legacy_boundary() -> None:
     image_documentation = (
         REPOSITORY_ROOT / "docs" / "SN39_AUDIT_MINER_IMAGE.md"
     ).read_text()
@@ -423,21 +423,33 @@ def test_operator_docs_do_not_attribute_source_only_posture_split_to_published_d
         REPOSITORY_ROOT / "docs" / "SN39_AUDIT_MINER_OPERATIONS.md"
     ).read_text()
     work_request = (REPOSITORY_ROOT / "docs" / "WORK_REQUEST_V2.md").read_text()
+    mining = (REPOSITORY_ROOT / "MINING.md").read_text()
+    build_status = (REPOSITORY_ROOT / "BUILD_STATUS.md").read_text()
+    postures = (REPOSITORY_ROOT / "docs" / "OPERATOR_POSTURES.md").read_text()
+    evidence_lane = (REPOSITORY_ROOT / "docs" / "EVIDENCE_LANE.md").read_text()
 
     for documentation in (image_documentation, operations, work_request):
         normalized = " ".join(documentation.split())
+        assert "78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8" in normalized
+        assert "c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99" in normalized
         assert "8ad7f6e127ad7dcc4dd150f0e1eb47ce72c5ab22" in normalized
         assert "worker serve" in normalized
         assert "--allow-public-legacy-audit" in normalized
         assert "worker migrate --migration-mode public-legacy-audit" in normalized
         assert "cathedral_effective_startup_v1" in normalized
-        assert "must not be attributed" in normalized
+        assert "not deployment" in normalized.lower()
 
-    assert "source-only replacement contract" in image_documentation
-    assert "Record a new source merge, immutable" in operations
-    assert "remains source-only until a replacement image" in " ".join(
-        work_request.split()
-    )
+    assert "Published replacement runtime contract" in image_documentation
+    assert "Current reviewed pin" in operations
+    assert "Replacement image is published" in work_request
+    assert "no replacement image digest is published yet" not in mining
+    assert "published UID30 image predates" not in build_status
+    assert "remains source-only" not in postures
+    assert "published digest predates" not in evidence_lane
+    assert "public-legacy-audit" in mining
+    assert "published UID30 image uses that fixed" in " ".join(build_status.split())
+    assert "worker migrate" in " ".join(postures.split())
+    assert "worker migrate" in evidence_lane
 
 
 def test_host_startup_is_syntax_valid_and_pins_the_exact_pulled_runtime() -> None:

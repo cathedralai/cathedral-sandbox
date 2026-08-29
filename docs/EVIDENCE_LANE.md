@@ -128,5 +128,5 @@ report that narrower result as `NOT_PROVEN`, not `FULL`.
 - Production evidence and work require bearer or signed-validator
   authorization over HTTPS with the TLS key terminating inside the measured
   environment. The fixed UID30 image alone uses the bounded legacy bridge
-  documented in `WORK_REQUEST_V2.md`. Its published digest predates the new
-  `worker migrate` command.
+  documented in `WORK_REQUEST_V2.md`. Its reviewed published digest uses the
+  fixed `worker migrate --migration-mode public-legacy-audit` command.
