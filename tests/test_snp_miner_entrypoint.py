@@ -28,6 +28,8 @@ ENVIRONMENT = {
 }
 REPOSITORY_ROOT = Path(__file__).parents[1]
 SNP_IMAGE_PATH = "ghcr.io/cathedralai/cathedral-sn39-snp-miner"
+SNP_IMAGE_DIGEST = "0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255"
+SNP_SOURCE_COMMIT = "8dde6eaca27116eed53386a1fa33ec70b74a01fb"
 SNPGUEST_DIGEST = "70e700465e3523e67dd5104583dc36cd11eef630c6f04c5b9ccafd6ba2e76ca0"
 
 
@@ -105,9 +107,11 @@ def test_snp_host_launcher_is_syntax_valid_and_exposes_only_sev_guest_hardware()
     assert hashlib.sha256(script_path.read_bytes()).hexdigest() != ""
 
 
-def test_snp_doc_does_not_claim_a_published_or_live_machine() -> None:
-    document = (REPOSITORY_ROOT / "docs" / "SN39_SNP_MINER_IMAGE.md").read_text().lower()
-    assert "no digest is listed" in document
-    assert "a source change and a green test suite" in document
-    assert "receiving weight" not in document
+def test_snp_doc_pins_the_published_image_without_claiming_a_live_machine() -> None:
+    document = (REPOSITORY_ROOT / "docs" / "SN39_SNP_MINER_IMAGE.md").read_text()
+
+    assert f"{SNP_IMAGE_PATH}@sha256:{SNP_IMAGE_DIGEST}" in document
+    assert SNP_SOURCE_COMMIT in document
+    assert "snp-signed-validator-fleet-v1" in document
+    assert "It does not prove a running SNP machine" in document
     assert str(TLS_DIRECTORY) not in document

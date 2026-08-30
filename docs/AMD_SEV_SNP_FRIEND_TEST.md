@@ -10,8 +10,9 @@ earn weight by themselves.
 
 The current TDX audit-miner image is not an SNP image. Use only the separate
 immutable SNP image and launcher described in
-[SN39 SNP miner image](SN39_SNP_MINER_IMAGE.md) after a published digest is
-available.
+[SN39 SNP miner image](SN39_SNP_MINER_IMAGE.md). The current published pin is
+fixed below. It remains ineligible for weight until the separate validator
+release and exact SNP admission policy are published.
 
 ## Supported hardware
 
@@ -145,12 +146,17 @@ Do not install a launcher from a different source revision. Start with the
 published immutable image reference:
 
 ```bash
-SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:REPLACE_WITH_PUBLISHED_DIGEST'
+SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255'
 docker pull --platform linux/amd64 "$SNP_IMAGE"
+test "$(docker image inspect "$SNP_IMAGE" \
+  --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
+test "$(docker image inspect "$SNP_IMAGE" \
+  --format '{{index .Config.Labels "org.cathedral.sn39.runtime-contract"}}')" = \
+  snp-signed-validator-fleet-v1
 SOURCE_COMMIT="$(docker image inspect \
   --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
   "$SNP_IMAGE")"
-printf '%s\n' "$SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+test "$SOURCE_COMMIT" = 8dde6eaca27116eed53386a1fa33ec70b74a01fb
 
 git clone https://github.com/cathedralai/cathedral-sandbox.git cathedral-snp-runtime
 git -C cathedral-snp-runtime checkout --detach "$SOURCE_COMMIT"

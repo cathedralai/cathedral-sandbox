@@ -34,6 +34,7 @@ def test_readme_is_the_single_current_mining_guide() -> None:
         "AMD SEV-SNP",
         "Source-ready, validator release pending",
         "c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99",
+        "0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255",
         "current migration bridge",
         "btcli axon set",
         "/usr/local/libexec/cathedral/run-sn39-miner",
@@ -144,6 +145,31 @@ def test_amd_friend_test_creates_exact_launcher_directories() -> None:
     assert "sudo install -d -o root -g root -m 0700" in guide
     assert "/etc/cathedral/validator-access" in guide
     assert "/var/lib/cathedral/validator-access" in guide
+
+
+def test_snp_operator_surfaces_pin_the_published_image_without_placeholders() -> None:
+    image_ref = (
+        "ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:"
+        "0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255"
+    )
+    source_commit = "8dde6eaca27116eed53386a1fa33ec70b74a01fb"
+    placeholder = "REPLACE_WITH_" + "PUBLISHED_DIGEST"
+    surfaces = (
+        "README.md",
+        "docs/AMD_SEV_SNP_FRIEND_TEST.md",
+        "docs/SN39_SNP_MINER_IMAGE.md",
+        "examples/systemd/sn39-snp-miner.env.example",
+    )
+
+    for path in surfaces:
+        document = (REPO_ROOT / path).read_text()
+        assert image_ref in document, path
+        assert placeholder not in document, path
+
+    for path in ("docs/AMD_SEV_SNP_FRIEND_TEST.md", "docs/SN39_SNP_MINER_IMAGE.md"):
+        document = (REPO_ROOT / path).read_text()
+        assert source_commit in document, path
+        assert "no digest is listed" not in document.lower(), path
 
 
 def test_current_docs_state_direct_validator_security_contracts() -> None:

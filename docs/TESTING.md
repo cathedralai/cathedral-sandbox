@@ -35,6 +35,22 @@ PASS
 This proves local SAT dispatch, solving, and certificate verification. It does
 not prove a remote miner or validator scoring cycle.
 
+## Miner onboarding rehearsal
+
+Run the public, hardware-free miner rehearsal from an installed checkout:
+
+```bash
+.venv/bin/python scripts/rehearse_sn39_miner.py
+```
+
+It starts an ephemeral loopback worker with explicitly synthetic Intel TDX and
+AMD SEV-SNP evidence. It checks the exact health response, evidence transport,
+capabilities, canonical SAT, extra-machine fleet parsing, and duplicate fleet
+rejection. It creates and removes fresh temporary state on every run. It does
+not contact the example fleet endpoints, a chain, a wallet, Docker, or TEE
+hardware. A pass is not production evidence. The public README requires three
+fresh runs as the onboarding preflight.
+
 ## Intel TDX hardware tests
 
 Run inside an Intel TDX guest:
