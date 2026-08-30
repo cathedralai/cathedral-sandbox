@@ -1,4 +1,6 @@
-"""Raw-evidence replay: the positive half of full provenance.
+"""Retained raw-evidence replay for the legacy provenance path.
+
+The current direct SN39 validator does not use this replay or its signed vector.
 
 Receipt/report recomputation alone proves only that Cathedral's *signed
 statements* are internally consistent — it is PARTIAL provenance and can

@@ -1,5 +1,8 @@
 # Signed workload admission
 
+> Product-library reference. This is not an SN39 miner setup guide. Start at the
+> repository [README](../README.md).
+
 Cathedral has a provider-neutral contract for admitting future customer
 workloads by immutable image digest. This contract is CPU-first control-plane
 infrastructure. It does **not** mean that customer container execution is live

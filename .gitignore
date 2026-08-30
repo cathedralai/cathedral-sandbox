@@ -22,6 +22,9 @@ attestation.json
 *.jwt
 *.pem
 *.key
+*.seed
+operator-state/
+validator-access-state/
 
 # Generated proto
 *_pb2.py

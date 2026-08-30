@@ -1,4 +1,7 @@
-"""Exact-body publisher for Cathedral external score snapshots."""
+"""Retained exact-body publisher for legacy external score snapshots.
+
+The current direct SN39 validator has no Cathedral publisher dependency.
+"""
 
 from __future__ import annotations
 

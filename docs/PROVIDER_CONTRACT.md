@@ -1,5 +1,8 @@
 # Provider-neutral capacity contract
 
+> Product-library reference. This contract is not an alternate SN39 mining
+> path. Start at the repository [README](../README.md).
+
 This document defines Cathedral's versioned control-plane records for future
 prepared confidential-compute capacity. The implementation is in
 `cathedral/provider_contract.py`. It is a contract layer only.

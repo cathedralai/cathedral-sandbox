@@ -176,18 +176,11 @@ def test_allowlist_preimage_is_domain_and_audience_bound() -> None:
     )
 
 
-def test_mining_signing_example_matches_the_canonical_preimage() -> None:
-    text = (REPO_ROOT / "MINING.md").read_text()
-    sample = text.split("<!-- enroll-preimage-example -->", 1)[1]
-    document = json.loads(sample.split("```json", 1)[1].split("```", 1)[0])
-    assert canonical_enroll_payload(
-        document["hotkey"],
-        document["endpoint_url"],
-        document["nonce"],
-        document["timestamp"],
-        network=document["network"],
-        netuid=document["netuid"],
-    ) == json.dumps(document, separators=(",", ":"), sort_keys=True).encode()
+def test_current_mining_guide_does_not_teach_legacy_enrollment() -> None:
+    text = (REPO_ROOT / "README.md").read_text()
+    assert "enroll submit" not in text
+    assert "enroll-preimage-example" not in text
+    assert "/v1/enroll" not in text
 
 
 def _snapshot(**overrides: object) -> dict[str, object]:

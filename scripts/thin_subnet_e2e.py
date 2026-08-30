@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Local Cathedral Confidential -> thin validator end-to-end proof."""
+"""Retained local test for the retired thin-validator path.
+
+This is not a current direct-validator end-to-end proof.
+"""
 
 from __future__ import annotations
 
@@ -388,7 +391,10 @@ def run_proof(validator_repo: Path) -> dict[str, Any]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Run Cathedral Confidential through the thin local validator"
+        description=(
+            "Retained thin-validator compatibility test. "
+            "Not a current direct-validator SN39 proof."
+        )
     )
     parser.add_argument(
         "--validator-repo",

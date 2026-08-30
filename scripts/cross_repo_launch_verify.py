@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Fail-closed local launch proof for confidential scoring and Cathedral weights."""
+"""Retained cross-repository test for the legacy signed-vector path.
+
+This is not a current SN39 launch proof. The direct validator does not consume
+the publisher or signed vector exercised here.
+"""
 
 from __future__ import annotations
 

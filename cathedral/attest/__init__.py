@@ -3,8 +3,8 @@
 Each collector produces an `Evidence` with the validator's challenge bound into
 REPORT_DATA. Vendors do the crypto; we orchestrate. See docs/DESIGN.md §6.
 
-Development requires real hardware. Launch path is TDX CPU first because the
-live Cathedral box is a GCP TDX CVM; SNP and GPU-CC follow the same interface.
+Development requires real hardware. Current scored CPU support is Intel TDX;
+SNP is friend testing and GPU-CC remains outside production scoring.
 """
 
 from __future__ import annotations

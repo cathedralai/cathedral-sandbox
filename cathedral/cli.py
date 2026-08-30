@@ -2325,8 +2325,12 @@ def _verify_wire_vector(
     network: str,
     netuid: int,
 ) -> None:
-    """Verify Cathedral's signed weight vector exactly as the thin validator
-    does: ed25519 over sorted compact JSON minus ``signature``."""
+    """Verify a retained legacy signed vector.
+
+    This matches the retired thin-validator signature contract: Ed25519 over
+    sorted compact JSON minus ``signature``. The current direct SN39 validator
+    does not call this path.
+    """
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -2355,7 +2359,7 @@ def _verify_wire_vector(
 
 # Legacy default for miscellaneous evidence fetches; every named artifact
 # class in the verify pipeline uses its per-kind cap from cathedral.evidence
-# (docs/BUDGET.md "Evidence byte budget"), so the worst-case maximal valid
+# (defined in cathedral.evidence), so the worst-case maximal valid
 # epoch provably fits the aggregate command budget.
 MAX_EVIDENCE_FETCH_BYTES = 4 * 1024 * 1024
 MAX_VERIFIER_FETCH_BYTES = MAX_VERIFIER_ARTIFACT_BYTES
@@ -3763,9 +3767,8 @@ def cmd_enroll_reconcile(args: argparse.Namespace) -> int:
     is an explicit operator action.
 
     Accepts either approval artifact, because it is the only way to free
-    enrollment capacity and a service running an admission policy could
-    otherwise not run it at all (docs/ADMISSION_POLICY.md names this command
-    as the remedy).
+    enrollment capacity and a service running the retained admission-policy
+    library could otherwise not run it at all.
 
     Under open mode there is no approved-coldkey set, so coldkey approval is
     not a criterion. Applying one anyway would flag every row and, with
@@ -4352,7 +4355,14 @@ def build_parser() -> argparse.ArgumentParser:
         allow_public_legacy_audit=False,
     )
 
-    p_policy = sub.add_parser("policy-registry", help="verify signed public measurement policy")
+    p_policy = sub.add_parser(
+        "policy-registry",
+        help="retained policy-library verifier; not current SN39 mining",
+        description=(
+            "Verify retained signed policy-registry artifacts. The current "
+            "direct SN39 validator does not consume this registry."
+        ),
+    )
     policy_sub = p_policy.add_subparsers(dest="policy_command", required=True)
     p_policy_verify = policy_sub.add_parser("verify", help="verify and inspect a registry")
     p_policy_verify.add_argument("--registry", required=True)
@@ -4401,7 +4411,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_customer_receipt_verify.set_defaults(func=cmd_customer_receipt_verify)
 
-    p_lifecycle = sub.add_parser("lifecycle", help="inspect worker attestation lifecycle state")
+    p_lifecycle = sub.add_parser(
+        "lifecycle",
+        help="retained central-registry lifecycle; not current SN39 mining",
+        description=(
+            "Inspect the retained central enrollment lifecycle. Current SN39 "
+            "miners and the direct validator do not use this command group."
+        ),
+    )
     lifecycle_sub = p_lifecycle.add_subparsers(dest="lifecycle_command", required=True)
     p_lifecycle_status = lifecycle_sub.add_parser(
         "status", help="show the current customer-safe worker state"
@@ -4448,7 +4465,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_lifecycle_retire.set_defaults(func=cmd_lifecycle_retire)
 
     p_enroll = sub.add_parser(
-        "enroll", help="reconcile the enrollment registry against approvals"
+        "enroll",
+        help="retained legacy central-enrollment library; not current SN39 mining",
+        description=(
+            "Operate the retained legacy central-enrollment registry. "
+            "Current miners register on chain and do not use this command group."
+        ),
     )
     enroll_sub = p_enroll.add_subparsers(dest="enroll_command", required=True)
     p_enroll_reconcile = enroll_sub.add_parser(
@@ -4572,7 +4594,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_enroll_journal.set_defaults(func=cmd_enroll_journal_mode)
 
     p_enroll_submit = enroll_sub.add_parser(
-        "submit", help="sign and submit this miner's allowlist enrollment"
+        "submit", help="legacy: sign and submit a central allowlist enrollment"
     )
     p_enroll_submit.add_argument("--registry-url", required=True, metavar="https://HOST")
     p_enroll_submit.add_argument(
@@ -4597,7 +4619,14 @@ def build_parser() -> argparse.ArgumentParser:
         func=cmd_enroll_submit, transport=_post_json, keypair_factory=None
     )
 
-    p_runtime = sub.add_parser("runtime", help="operate confidential-compute report epochs")
+    p_runtime = sub.add_parser(
+        "runtime",
+        help="retained legacy receipt and publisher library; not current SN39 mining",
+        description=(
+            "Retained legacy receipt, report-epoch, and publisher library. "
+            "The current direct SN39 validator does not use this command group."
+        ),
+    )
     runtime_sub = p_runtime.add_subparsers(dest="runtime_command", required=True)
 
     def add_runtime_common(
@@ -4698,9 +4727,21 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--customer-job-lease-seconds", type=int, default=120)
         command.add_argument("--customer-job-max-attempts", type=int, default=3)
         if not development_surface:
-            command.add_argument("--publisher-endpoint", default=None)
-            command.add_argument("--publisher-bearer-env", default=DEFAULT_PUBLISHER_BEARER_ENV)
-            command.add_argument("--publisher-hmac-env", default=DEFAULT_PUBLISHER_HMAC_ENV)
+            command.add_argument(
+                "--publisher-endpoint",
+                default=None,
+                help="legacy report-publisher endpoint; not used by the direct validator",
+            )
+            command.add_argument(
+                "--publisher-bearer-env",
+                default=DEFAULT_PUBLISHER_BEARER_ENV,
+                help="legacy report-publisher bearer environment variable",
+            )
+            command.add_argument(
+                "--publisher-hmac-env",
+                default=DEFAULT_PUBLISHER_HMAC_ENV,
+                help="legacy report-publisher HMAC environment variable",
+            )
             command.add_argument(
                 "--score-network",
                 help="exact network audience embedded in each frozen score report",
@@ -4746,7 +4787,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_canary(p_develop_audit)
     p_develop_audit.set_defaults(func=cmd_runtime_audit_attestation)
 
-    p_run = runtime_sub.add_parser("run-epoch", help="freeze one production TDX report")
+    p_run = runtime_sub.add_parser(
+        "run-epoch",
+        help="legacy: freeze one receipt-backed TDX report",
+    )
     add_runtime_common(p_run, development_surface=False)
     add_canary(p_run)
     p_run.add_argument("--source-epoch", type=int, required=True)
@@ -4774,7 +4818,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_export_class = runtime_sub.add_parser(
         "export-score-class",
-        help="export a frozen receipt-backed report for an independent validator",
+        help="legacy: export a frozen receipt-backed score report",
     )
     p_export_class.add_argument("--ledger-db", required=True)
     p_export_class.add_argument(
@@ -4814,7 +4858,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_export_evidence = runtime_sub.add_parser(
         "export-evidence",
-        help="publish one epoch's content-addressed public evidence bundle",
+        help="legacy: publish one epoch's content-addressed evidence bundle",
     )
     p_export_evidence.add_argument("--ledger-db", required=True)
     p_export_evidence.add_argument(
@@ -4844,12 +4888,9 @@ def build_parser() -> argparse.ArgumentParser:
         "(published so external validators can recompute the "
         "implementation digest from the binary blob)",
     )
-    # New evidence is emitted as validated_supply_v2, which is what README.md
-    # documents and what cathedral.provenance already defaults to. The default
-    # here named the retired v1 id, so an operator running the documented
-    # command stamped a mechanism the docs call historical, and every test had
-    # to pin v2 explicitly to work around it. v1 stays registered and can still
-    # be pinned by hand so already-signed historical evidence keeps verifying.
+    # The retained evidence library emits validated_supply_v2 by default.
+    # v1 stays registered so already-signed historical evidence keeps
+    # verifying. Neither mechanism is used by the current direct validator.
     p_export_evidence.add_argument("--mechanism", default="validated_supply_v2")
     p_export_evidence.add_argument("--mechanism-revision", type=int, default=1)
     p_export_evidence.add_argument("--source-revision")
@@ -4869,7 +4910,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_export_evidence.set_defaults(func=cmd_runtime_export_evidence)
 
-    p_retry = runtime_sub.add_parser("retry-publish", help="publish frozen report bytes")
+    p_retry = runtime_sub.add_parser(
+        "retry-publish",
+        help="legacy: retry publication of frozen report bytes",
+    )
     p_retry.add_argument("--ledger-db", required=True)
     p_retry.add_argument("--publisher-endpoint", required=True)
     p_retry.add_argument("--publisher-bearer-env", default=DEFAULT_PUBLISHER_BEARER_ENV)
@@ -4959,17 +5003,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_provenance = sub.add_parser(
         "provenance",
-        help="independently verify published evidence and recompute weights",
+        help="retained legacy signed-vector audit library; not current SN39 mining",
+        description=(
+            "Audit retained legacy receipt, evidence, and signed-vector artifacts. "
+            "The current direct SN39 validator does not use this command group."
+        ),
     )
     provenance_sub = p_provenance.add_subparsers(dest="provenance_command", required=True)
     p_prov_verify = provenance_sub.add_parser(
         "verify",
-        help="verify the full evidence chain for one epoch and recompute the vector",
+        help="legacy: verify one epoch's evidence chain and recompute its vector",
     )
     source = p_prov_verify.add_mutually_exclusive_group(required=True)
     source.add_argument(
         "--evidence-url",
-        help="public evidence base URL, e.g. https://api.cathedral.computer/v1/evidence",
+        help="legacy public evidence-store base URL",
     )
     source.add_argument("--evidence-dir", help="local evidence store directory")
     p_prov_verify.add_argument("--network", default="finney")
@@ -5023,12 +5071,13 @@ def build_parser() -> argparse.ArgumentParser:
         "than this many seconds (default 24 hours, fail closed)",
     )
     p_prov_verify.add_argument(
-        "--publisher-url", help="also fetch Cathedral's signed vector and compare"
+        "--publisher-url",
+        help="legacy signed-vector URL to fetch and compare",
     )
     p_prov_verify.add_argument(
         "--weight-policy-public-key-hex",
         default=os.environ.get("CATHEDRAL_WEIGHT_POLICY_PUBLIC_KEY", ""),
-        help="pinned weight-vector signing key (hex) for --publisher-url comparison",
+        help="legacy pinned weight-vector signing key for --publisher-url comparison",
     )
     p_prov_verify.add_argument("--weight-policy-key-id", default="cathedral-weight-policy")
     p_prov_verify.add_argument("--jsonl", help="append JSONL events to this file")

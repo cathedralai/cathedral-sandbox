@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install only the digest-pinned metadata poller for the bounded UID124 fleet.
+# Retired GCP-specific UID124 bootstrap. Not a current mining instruction.
 
 set -Eeuo pipefail
 IFS=$'\n\t'

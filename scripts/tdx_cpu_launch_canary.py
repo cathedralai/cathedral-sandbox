@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Run the production CPU launch contract against two disposable TDX workers.
+"""Exercise the retained registry, receipt, and epoch library on TDX workers.
+
+This is not the current direct-validator launch test and does not prove current
+SN39 mining, weight, or emission.
 
 The dedicated canary and enrolled worker must be different TDX platforms with
 public-IP HTTPS endpoints.  Each endpoint must terminate its TLS private key
@@ -491,7 +494,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Prove the signed, TLS-bound, durable Cathedral CPU launch path"
+        description=(
+            "Retained registry and receipt canary. Not a current direct-validator "
+            "SN39 launch proof."
+        )
     )
     parser.add_argument("--canary-hotkey", required=True)
     parser.add_argument("--canary-endpoint", required=True)

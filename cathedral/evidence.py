@@ -1,4 +1,7 @@
-"""Public evidence bundles: content-addressed artifacts plus a signed index.
+"""Retained legacy evidence bundles and signed index.
+
+The current direct SN39 validator verifies miners itself. It does not fetch
+these bundles or reproduce a Cathedral-signed weight vector from them.
 
 The launch evidence model has two tiers:
 
@@ -60,7 +63,7 @@ INDEX_DOMAIN = b"cathedral-evidence-index-v1\x00"
 MAX_INDEX_RECENT = 96
 
 # ---------------------------------------------------------------------------
-# Launch byte/cardinality budget (docs/BUDGET.md, "Evidence byte budget")
+# Legacy evidence-export byte and cardinality budget.
 #
 # The manifest grammar and the verifier's aggregate command budget are ONE
 # coherent contract: every per-kind artifact cap below is enforced at export

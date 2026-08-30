@@ -1,4 +1,8 @@
-"""Miner enrollment registry and public attestation board.
+"""Retained legacy enrollment registry and public attestation board.
+
+The current direct SN39 validator discovers miners from the chain and does
+not use this central registry. This module remains for compatibility tests and
+historical artifact handling.
 
 Small stdlib HTTP service:
 
@@ -3868,7 +3872,12 @@ class _QuietRequestHandler(WSGIRequestHandler):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Cathedral miner enrollment registry")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Retained legacy miner enrollment registry. Current SN39 mining "
+            "discovers miners directly from chain state."
+        )
+    )
     parser.add_argument("--db", default="cathedral-enroll.sqlite")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
@@ -3881,7 +3890,7 @@ def main() -> None:
         "--production-mode",
         action="store_true",
         help=(
-            "launch policy: requires --registered-hotkeys-file and rejects "
+            "legacy-library policy: requires --registered-hotkeys-file and rejects "
             "hostname (non-IP-literal) endpoint_url values at enrollment"
         ),
     )
@@ -3905,8 +3914,9 @@ def main() -> None:
         "--enroll-allowlist",
         metavar="PATH",
         help=(
-            "path to the signed approved-coldkey allowlist artifact "
-            "(docs/ENROLLMENT_ALLOWLIST.md). Mandatory when --production-mode "
+            "path to the legacy signed approved-coldkey allowlist artifact "
+            "(docs/ENROLLMENT_ALLOWLIST.md). Mandatory for this retired "
+            "enrollment service when --production-mode "
             "is set; enrollment fails closed without it."
         ),
     )
@@ -3948,8 +3958,8 @@ def main() -> None:
         "--admission-policy",
         metavar="PATH",
         help=(
-            "path to the signed admission policy artifact "
-            "(docs/ADMISSION_POLICY.md). Replaces --enroll-allowlist and "
+            "path to the legacy signed admission policy artifact for this "
+            "retired enrollment service. Replaces --enroll-allowlist and "
             "requires v2 enrollment requests; the two cannot be combined. "
             "Either this or --enroll-allowlist is mandatory in production."
         ),

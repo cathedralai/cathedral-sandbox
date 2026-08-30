@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Provision and refresh a bounded UID124 signed-access operator mode.
+"""Retired GCP-specific UID124 launch tool, retained for audited history.
+
+This is not part of the current direct-validator mining path. Use the
+repository README for current operator instructions.
 
 Cloud-changing modes require an exact acknowledgement. The policy has no flags
 for project, zone, VM shape, subnet, miner, stake floor, validity, interval, or
@@ -1154,32 +1157,36 @@ def _add_artifact_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="sn39-gcp-snapshot-publisher", allow_abbrev=False
+        prog="sn39-gcp-snapshot-publisher",
+        description=(
+            "RETIRED UID124 GCP launch tool. Not part of current direct SN39 mining."
+        ),
+        allow_abbrev=False,
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("plan", help="print the fixed no-write policy")
+    commands.add_parser("plan", help="retired: print the fixed no-write policy")
     commands.add_parser(
-        "plan-primary-only", help="print the fixed no-write UID124 primary policy"
+        "plan-primary-only", help="retired: print the fixed no-write UID124 primary policy"
     )
     provision_parser = commands.add_parser(
-        "provision", help="create exactly two bounded TDX guests"
+        "provision", help="retired: create exactly two bounded UID124 TDX guests"
     )
     _add_artifact_arguments(provision_parser)
     provision_parser.add_argument("--acknowledge", required=True)
     primary_provision_parser = commands.add_parser(
         "provision-primary-only",
-        help="create only the bounded UID124 primary TDX guest",
+        help="retired: create only the bounded UID124 primary TDX guest",
     )
     _add_artifact_arguments(primary_provision_parser)
     primary_provision_parser.add_argument("--acknowledge", required=True)
     publish_parser = commands.add_parser(
-        "publish-loop", help="refresh public signed snapshots every five minutes"
+        "publish-loop", help="retired: refresh UID124 snapshots every five minutes"
     )
     _add_artifact_arguments(publish_parser)
     publish_parser.add_argument("--acknowledge", required=True)
     primary_publish_parser = commands.add_parser(
         "publish-loop-primary-only",
-        help="refresh public signed snapshots only on the UID124 primary",
+        help="retired: refresh snapshots only on the UID124 primary",
     )
     _add_artifact_arguments(primary_publish_parser)
     primary_publish_parser.add_argument("--acknowledge", required=True)

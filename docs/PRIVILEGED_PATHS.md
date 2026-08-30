@@ -1,5 +1,11 @@
 # Privileged path trust
 
+> Host-hardening reference. This is not an SN39 miner setup guide. Start at the
+> repository [README](../README.md).
+
+The policy republisher example below belongs to a retained legacy library. The
+current direct validator and miner do not deploy it.
+
 A root process that sources an environment file, imports an interpreter, or
 runs a script from a directory an unprivileged user can write is not running
 the operator's code. It is running whatever that user last put there, as

@@ -1,131 +1,322 @@
-<div align="center">
-  <h1>⚡ Cathedral</h1>
-  <p><strong>Bittensor SN39 · Racing to build the fastest sandbox fleet on earth, from machines that prove what they run.</strong></p>
-  <p><a href="https://cathedral.computer">cathedral.computer</a> · <a href="MINING.md">Mine</a> · <a href="https://github.com/cathedralai/cathedral/blob/main/VALIDATOR.md">Validate</a> · <a href="https://github.com/cathedralai/cathedral-distill">Distill track</a></p>
-</div>
+# Cathedral Sandbox
 
-<!-- VIDEO SLOT -----------------------------------------------------------
-Walkthrough video goes here, matching cathedral-distill's README.
-To publish: drag the file into any GitHub issue comment, copy the
-user-attachments URL it produces, paste it as `src` below, then delete
-these comment markers.
+**Bittensor SN39**
 
-<div align="center">
-  <video controls width="800" src="PASTE_GITHUB_USER_ATTACHMENTS_URL_HERE"></video>
-  <p><a href="PASTE_YOUTUBE_URL_HERE">Watch on YouTube</a></p>
-</div>
------------------------------------------------------------------------- -->
+**Racing to build the fastest sandbox fleet on earth**
 
-## Intro
+**With machines that prove what they run**
 
-AI agents need sandboxes: isolated machines they can spawn in milliseconds,
-use, and throw away. Every provider selling them buys its fleet with capital.
-This subnet recruits one with incentives: a miner who keeps a hot, attested
-Intel TDX worker standing by becomes an edge node of a single distributed
-machine that hands an agent a sandbox that already exists before it asks.
+[cathedral.computer](https://cathedral.computer/) · [Run a validator](https://github.com/cathedralai/cathedral-validator)
 
-Three rules keep it honest:
+This repository contains the Cathedral compute worker, its Intel TDX verifier,
+and the protocol used by validators to test miner machines.
 
-| Rule | Meaning |
-|---|---|
-| Attestation is admission, not payment | Registration, uptime, a valid quote, hardware ownership, or self-reported volume never earns weight. Only verified work does. |
-| Supply follows demand | The network does not pay for capacity nobody uses. Miners onboard through an approval gate that opens as real demand arrives: the distill track, subnet partnerships that need attested sandboxes in their stack, and paying customers. |
-| Nothing is advertised before it pays | Every future mechanism phase is labeled with whether it pays, and none arms without a versioned contract re-pin. |
+## How mining works
 
-## Incentive mechanism
+Cathedral's validator reads every serving non-validator miner from SN39. It
+does not download weights from Cathedral and it does not use a weight relay.
 
-**What pays today: verified work under `validated_supply_v2`.**
+For each UID, the validator:
 
-Operator command boundaries are defined in
-[`docs/OPERATOR_POSTURES.md`](docs/OPERATOR_POSTURES.md). Production,
-development/preview, and legacy migration use separate command surfaces.
+1. reads the miner's on-chain HTTPS endpoint;
+2. verifies fresh Intel TDX evidence and the live TLS key for that machine;
+3. reads its fleet list through the verified channel;
+4. verifies fresh evidence and the live TLS key for each added machine;
+5. zeroes every claimant involved in a duplicate endpoint, hardware identity,
+   or TLS key;
+6. sends one bounded SAT task to each remaining machine; and
+7. assigns weight from the verified work those machines returned.
 
-1. The validator derives a fresh challenge from finalized SN39 chain state and
-   your hotkey. Your worker answers with an Intel TDX quote bound to that
-   challenge; an unknown measurement is rejected no matter how valid the quote.
-2. Admitted workers receive bounded work. The validator verifies the returned
-   result and derives work units from the task itself, never from your claimed
-   score.
-3. Every epoch produces a signed, complete score report: verified credit or an
-   explicit zero for every candidate. An independent validator re-verifies the
-   report before any weight reaches the chain.
+The Cathedral validator uses zero burn. Registration, uptime, a quote, or a
+self-reported machine count earns nothing by itself. Weight also does not
+guarantee TAO. The subnet must have positive emission.
 
-**Where it is going: [docs/WARM_SUPPLY.md](docs/WARM_SUPPLY.md).** The
-mechanism's next revisions pay for being fast and warm: producer-clocked
-latency scoring on probes indistinguishable from customer work, capacity from
-your attested profile, grades instead of cliffs. Shadow measurement is designed
-and under review, not running: it lands with M0. Nothing in it pays until
-validators adopt the re-pinned contract, and the phase table says exactly which
-phase pays.
+## Current support
 
-Deep dive (architecture, deployed-versus-designed status, trust boundary):
-[docs/EVIDENCE_LANE.md](docs/EVIDENCE_LANE.md). Live state: the
-[signed vector](https://api.cathedral.computer/v1/validator/weights/next) and
-[public evidence index](https://api.cathedral.computer/v1/evidence/index.json).
+| Path | Status | Weight |
+|---|---|---|
+| Intel TDX on Linux | Mainnet live testing | Eligible after fresh TDX and SAT verification |
+| More Intel TDX machines on one UID | Mainnet live testing | Each distinct verified machine adds to that UID's score |
+| AMD SEV-SNP | Friend hardware test | No production score or weight |
+| Confidential GPU | Development reference | No production score or weight |
 
-## Miner setup
+## What you need
 
-<details>
-<summary><strong>The five things to know, then the full guide</strong></summary>
+- A Linux Intel TDX confidential VM with `/sys/kernel/config/tsm/report`.
+- Git, Python 3.12 with `venv`, Docker, `nft`, and `curl` inside the guest.
+- A public IPv4 address with TCP `8081` open.
+- One public Bittensor hotkey which you will register on Finney SN39 only after
+  the worker passes its local startup check.
+- Bittensor CLI `11.1.0` on the separate wallet machine.
+- The ability to announce that public IP and port `8081` as the hotkey's axon.
+- A miner-owned control host which refreshes and delivers the list of current
+  validator-permit hotkeys. It also needs Git and Python 3.12 with `venv`.
 
-1. **Hardware:** an Intel TDX-capable CPU host. Nothing else is admitted today.
-2. **Apply before you provision.** Admission requires your worker's measurement
-   to already be on the signed policy registry. No reproducible boot image for
-   an approved TDX measurement is published. The audit-miner OCI image is a
-   separate post-boot supply pin. Do not buy or rent a machine before approval.
-3. **Only verified work can receive weight.** Not registration, not uptime, not
-   a valid quote. A bounded 2026-08-28 test gave UID124 UID30's exact allocation
-   while subnet emission was zero. It proved allocation, not TAO earnings.
-4. **Start:** open a [miner beta issue](https://github.com/cathedralai/cathedral-compute/issues)
-   with your public hotkey, intended TDX hardware class, provider, and broad
-   region. Then read [MINING.md](MINING.md) in full.
-5. **Never post credentials.** No seeds, keys, tokens, IPs, or instance
-   identifiers in any issue, ever.
+Keep the coldkey and wallet off every worker. The worker needs only its public
+hotkey. Each machine creates its own TLS private key inside its TDX guest.
 
-Full onboarding: [MINING.md](MINING.md) ·
-AMD SEV-SNP development review: [docs/AMD_SEV_SNP_DEVELOPMENT.md](docs/AMD_SEV_SNP_DEVELOPMENT.md) ·
-Audit-miner runbook and dated proof:
-[docs/SN39_AUDIT_MINER_OPERATIONS.md](docs/SN39_AUDIT_MINER_OPERATIONS.md) ·
-Image and trust contract:
-[docs/SN39_AUDIT_MINER_IMAGE.md](docs/SN39_AUDIT_MINER_IMAGE.md) ·
-Enrollment gate: [docs/ENROLLMENT_ALLOWLIST.md](docs/ENROLLMENT_ALLOWLIST.md) ·
-Workload admission: [docs/WORKLOAD_ADMISSION.md](docs/WORKLOAD_ADMISSION.md) ·
-Worker lifecycle: [docs/LIFECYCLE.md](docs/LIFECYCLE.md)
+## Run one Intel TDX machine
 
-</details>
+This is not yet a one-command unattended installation. You must supply two
+ordinary operations pieces outside this repository: a recurring secure
+transfer for the signed validator-access snapshot, and a process supervisor
+which restarts the fixed root-owned launcher. If you do not have both, stop
+before registration. The commands below install and run one foreground worker.
 
-## Validator setup
+### 1. Check the host
 
-Validators verify the signed epoch report and independently map hotkeys to UIDs
-before any chain decision; the producer can never pay itself unchecked.
-
-Start at [`cathedral/VALIDATOR.md`](https://github.com/cathedralai/cathedral/blob/main/VALIDATOR.md),
-then this repo's [provenance contract](docs/PROVENANCE.md),
-[policy registry](docs/POLICY_REGISTRY.md), and
-[receipts](docs/RECEIPTS.md). Assurance claims and their limits:
-[docs/ASSURANCE.md](docs/ASSURANCE.md).
-
-Verify the software yourself (Python 3.11+):
+The pinned checkout below supplies reviewed runtime code only. Its local
+README and MINING files predate the direct validator and are obsolete. Keep
+following this current GitHub README after the checkout.
 
 ```bash
-git clone https://github.com/cathedralai/cathedral-compute.git
-cd cathedral-compute
-python3.11 -m venv .venv && . .venv/bin/activate
-python -m pip install -e '.[dev]'
-python -m pytest -q
+git clone https://github.com/cathedralai/cathedral-sandbox.git cathedral-runtime
+git -C cathedral-runtime checkout --detach 78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+test "$(git -C cathedral-runtime rev-parse HEAD)" = \
+  78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+test -z "$(git -C cathedral-runtime status --porcelain)"
+
+python3.12 -m venv cathedral-runtime/.venv
+cathedral-runtime/.venv/bin/pip install -e \
+  'cathedral-runtime[validator-access-worker]'
+cathedral-runtime/.venv/bin/cathedral census
+sudo test -r /sys/kernel/config/tsm/report \
+  -a -w /sys/kernel/config/tsm/report
+
+sudo install -d -o root -g root -m 0755 /usr/local/libexec/cathedral
+sudo install -o root -g root -m 0755 \
+  cathedral-runtime/scripts/run_sn39_signed_fleet_miner.sh \
+  /usr/local/libexec/cathedral/run-sn39-miner
+printf '%s  %s\n' \
+  d56a82bb76eb2d976edfcd4574ff6ed19a41532ffa50d01a2411df51a002b615 \
+  /usr/local/libexec/cathedral/run-sn39-miner | sudo sha256sum --check
 ```
 
-The suite collects 2148 tests, and `tests/test_documented_counts.py` holds that
-number to this file, so it cannot quietly drift. Passing proves software
-behavior against test doubles; it does not prove live hardware, deployment, or
-an on-chain write. Details: [docs/TESTING.md](docs/TESTING.md) and the dated
-evidence record in [BUILD_STATUS.md](BUILD_STATUS.md).
+Stop if the census does not report Intel TDX or the TSM report path is not
+readable and writable.
 
----
+### 2. Refresh validator access from a control host
 
-<sub>Previously named `cathedralconfidential`; old links redirect and
-validator commit pins stay valid. Design docs
-([DESIGN.md](docs/DESIGN.md), [GPU_ATTESTATION.md](docs/GPU_ATTESTATION.md),
-[KEY_RELEASE.md](docs/KEY_RELEASE.md)) describe intended capability, not
-deployed availability. [docs/history/](docs/history/) is provenance, not
-onboarding. License: [MIT](LICENSE).</sub>
+The worker admits any hotkey with a current SN39 validator permit. You create
+and keep the small Ed25519 key used to sign that chain snapshot. Cathedral does
+not issue a credential and no Cathedral API is involved.
+
+On a separate miner-controlled machine, use the same exact source revision.
+This checkout also supplies code only. Ignore its local README and MINING
+files and keep following this current GitHub README.
+
+```bash
+git clone https://github.com/cathedralai/cathedral-sandbox.git cathedral-access
+git -C cathedral-access checkout --detach 78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+test "$(git -C cathedral-access rev-parse HEAD)" = \
+  78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+test -z "$(git -C cathedral-access status --porcelain)"
+
+python3.12 -m venv cathedral-access/.venv
+cathedral-access/.venv/bin/pip install -e \
+  'cathedral-access[enrollment-operator]'
+install -d -m 0700 cathedral-validator-access-state
+
+cathedral-access/.venv/bin/python \
+  cathedral-access/scripts/cathedral_validator_access.py init-key \
+  --signing-key-id cathedral-validator-access-1 \
+  --signing-key-out cathedral-validator-access-state/snapshot.seed \
+  --keys-out cathedral-validator-access-state/snapshot-keys.json
+
+cathedral-access/.venv/bin/python \
+  cathedral-access/scripts/cathedral_validator_access.py capture \
+  --network finney \
+  --netuid 39 \
+  --minimum-stake-rao 0 \
+  --signing-key-id cathedral-validator-access-1 \
+  --signing-key-file cathedral-validator-access-state/snapshot.seed \
+  --out cathedral-validator-access-state/validator-access.json \
+  --valid-seconds 900
+```
+
+`cathedral-validator-access-state` is beside the Git clone, not inside it.
+Keep `snapshot.seed` on this control host. Transfer only
+`snapshot-keys.json` and `validator-access.json` to a private staging directory
+on each worker. Then install them on that worker:
+
+```bash
+sudo install -d -o root -g root -m 0700 \
+  /etc/cathedral/validator-access \
+  /var/lib/cathedral/validator-access
+sudo install -o root -g root -m 0644 \
+  /path/to/staging/snapshot-keys.json \
+  /etc/cathedral/validator-access/snapshot-keys.json
+sudo install -o root -g root -m 0644 \
+  /path/to/staging/validator-access.json \
+  /etc/cathedral/validator-access/.validator-access.json.new
+sudo mv \
+  /etc/cathedral/validator-access/.validator-access.json.new \
+  /etc/cathedral/validator-access/validator-access.json
+```
+
+Repeat capture, transfer, and the final atomic install every five minutes. A
+failed refresh leaves the last valid file in place. An expired snapshot closes
+protected routes. The repository does not ship a provider-neutral transfer
+service, so use your existing secure provisioning channel.
+
+The `init-key` command prints `keys_digest sha256:...`. Keep the value after
+`keys_digest` for step 3.
+
+For one machine, install this as
+`/etc/cathedral/validator-access/fleet.json` with owner `root`, group `root`,
+and mode `0644`:
+
+```json
+{
+  "schema": "cathedral_worker_fleet_v1",
+  "worker_hotkey": "YOUR_PUBLIC_HOTKEY",
+  "endpoints": []
+}
+```
+
+### 3. Start the reviewed image
+
+The current live-testing image is immutable:
+
+```text
+ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99
+```
+
+```bash
+export SN39_AUDIT_MINER_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99'
+export CATHEDRAL_MINER_HOTKEY='YOUR_PUBLIC_HOTKEY'
+export CATHEDRAL_PUBLIC_ENDPOINT='https://YOUR_PUBLIC_IPV4:8081'
+export CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST='PASTE_KEYS_DIGEST_VALUE'
+
+sudo --preserve-env=SN39_AUDIT_MINER_IMAGE,CATHEDRAL_MINER_HOTKEY,CATHEDRAL_PUBLIC_ENDPOINT,CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST \
+  /usr/local/libexec/cathedral/run-sn39-miner
+```
+
+This image is the current migration bridge. Fleet discovery and non-public
+routes require signed validator requests. Fresh evidence and canonical audit
+SAT remain public temporarily for compatibility. The worker contains no wallet
+and no Cathedral API credential.
+
+From a second terminal, prove the TLS worker is reachable before paying to
+register. The deliberate invalid request must return the exact safe error:
+
+```bash
+HEALTH_BODY="$(mktemp)"
+HEALTH_STATUS="$(curl --insecure --silent --show-error \
+  --connect-timeout 5 \
+  --output "$HEALTH_BODY" \
+  --write-out '%{http_code}' \
+  --header 'Content-Type: application/json' \
+  --data '{}' \
+  https://YOUR_PUBLIC_IPV4:8081/v1/evidence)"
+test "$HEALTH_STATUS" = 400
+grep -Fx '{"error":"invalid evidence schema"}' "$HEALTH_BODY"
+rm -f "$HEALTH_BODY"
+```
+
+This proves only that the intended HTTPS worker answers. It does not prove TDX,
+channel binding, SAT, weight, or emission.
+
+### 4. Register and announce the hotkey
+
+Only after the worker stays running and the reachability check passes, use the
+separate wallet machine:
+
+```bash
+btcli --network finney \
+  --wallet YOUR_WALLET \
+  --wallet-hotkey YOUR_HOTKEY \
+  subnet register --netuid 39
+
+btcli --network finney \
+  --wallet YOUR_WALLET \
+  --wallet-hotkey YOUR_HOTKEY \
+  axon set --netuid 39 --ip YOUR_PUBLIC_IPV4 --port 8081
+```
+
+`btcli axon set` records the endpoint on chain. It does not start the server.
+Never copy the wallet into the TDX guest.
+
+### 5. Confirm chain state
+
+These read-only Bittensor CLI 11.1.0 commands show the assigned miner UID and
+all validator weight rows:
+
+```bash
+btcli --network finney query uid \
+  --netuid 39 --hotkey YOUR_PUBLIC_HOTKEY
+btcli --network finney --json query weights --netuid 39
+```
+
+After UID 30 submits and any commit-reveal delay completes, row `"30"` must
+contain your miner UID with a positive fraction.
+
+All of these must also be true:
+
+- the process stays running and logs `cathedral_effective_startup_v1`;
+- the access snapshot refreshes before its 15-minute expiry;
+- SN39 shows your hotkey at the expected public IP and port `8081`;
+- a validator reports fresh TDX verification, same-SPKI binding, and SAT pass;
+- the on-chain weight row changes only after the validator submits it.
+
+There is not yet a public validator-result feed for the TDX, SPKI, and SAT
+checks. Until the private telemetry projection reaches the Cathedral
+leaderboard, a miner must ask the validator operator for that final result.
+This is an open self-service gap.
+
+A healthy server is not proof of weight. A weight is not proof of emission.
+
+## Add more machines to one UID
+
+On every additional TDX guest, repeat step 1. Use the existing control host to
+capture a fresh snapshot, then transfer the existing public-key file and that
+snapshot to the new guest as described in step 2. Do not create a second
+signing key. Give the new guest an empty local `fleet.json`, then run step 3 and
+the reachability check with the same public miner hotkey and the new guest's
+own public endpoint. Each guest keeps its own access files, replay-state
+directory, running image, TDX evidence, and in-guest TLS key. Do not register a
+second hotkey or axon for those guests.
+
+Keep the chain axon as the first machine. On that primary only, replace
+`/etc/cathedral/validator-access/fleet.json` with the additional origins:
+
+```json
+{
+  "schema": "cathedral_worker_fleet_v1",
+  "worker_hotkey": "YOUR_PUBLIC_HOTKEY",
+  "endpoints": [
+    "https://SECOND_MACHINE_PUBLIC_IPV4:8081"
+  ]
+}
+```
+
+Save that JSON as `/path/to/staging/fleet.json`, then install it on the primary:
+
+```bash
+sudo install -o root -g root -m 0644 \
+  /path/to/staging/fleet.json \
+  /etc/cathedral/validator-access/.fleet.json.new
+sudo mv \
+  /etc/cathedral/validator-access/.fleet.json.new \
+  /etc/cathedral/validator-access/fleet.json
+```
+
+Restart the primary worker through your supervisor, or stop its
+foreground launcher and rerun step 3. The worker reads `fleet.json` only at
+startup. Add up to 31 secondary origins. Reusing an endpoint, hardware
+identity, or TLS key causes every verified claimant in that collision to score
+zero for the round.
+
+## AMD SEV-SNP
+
+AMD support is enabled for bounded development testing, not production
+scoring. Use [the friend hardware test](docs/AMD_SEV_SNP_FRIEND_TEST.md). Do
+not register, announce, or promise weight from that result.
+
+## Reference
+
+Start with the [documentation map](docs/README.md). It separates current miner
+instructions from protocol, release, product-library, and retained compatibility
+material.
+
+License: [MIT](LICENSE).

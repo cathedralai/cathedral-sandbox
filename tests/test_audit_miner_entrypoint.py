@@ -397,25 +397,22 @@ def test_operator_doc_keeps_digest_and_tdx_measurement_as_separate_boundaries() 
     documentation = (REPOSITORY_ROOT / "docs" / "SN39_AUDIT_MINER_IMAGE.md").read_text()
     normalized_documentation = " ".join(documentation.split())
 
-    assert f"{IMAGE_PATH}@sha256:<64-hex>" in documentation
+    assert (
+        f"{IMAGE_PATH}@sha256:"
+        "c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99"
+        in documentation
+    )
     assert "/sys/kernel/config/tsm/report" in documentation
-    assert f"src=/sys/kernel/config/tsm/report,dst={TSM_REPORT_ROOT}" in documentation
-    assert "--tmpfs /sys/kernel/config" not in documentation
-    assert "uses the kernel configfs TSM path" in documentation
-    assert "operator-enforced supply-chain pin" in documentation
-    assert "does not place the post-boot OCI image digest into MRTD" in documentation
-    assert "sha256:[0-9a-f]{64}" in documentation
-    assert "Do not copy `worker.key`" in documentation
-    assert "UID30 IP-literal attested-SPKI transport" in documentation
-    assert "ordinary production `RemoteMiner`" in documentation
-    assert "same-SPKI SAT round trip" in documentation
-    assert "wallet seed" in documentation.lower()
-    assert "It cannot launch the reviewed legacy digest" in documentation
-    assert "That restore was captured and exercised" in normalized_documentation
-    assert "A digest-only swap is not a rollback plan" in normalized_documentation
+    assert "read-only container filesystem" in documentation
+    assert "Fresh attestation is the remote proof" in normalized_documentation
+    assert "fresh Ed25519 TLS key" in documentation
+    assert "same SPKI" in normalized_documentation
+    assert "vendor-verified quote" in documentation
+    assert "public-legacy-audit" in documentation
+    assert "wallet directory" in documentation.lower()
 
 
-def test_operator_docs_bind_the_published_replacement_and_preserve_legacy_boundary() -> None:
+def test_operator_docs_bind_the_current_image_and_one_migration_boundary() -> None:
     image_documentation = (
         REPOSITORY_ROOT / "docs" / "SN39_AUDIT_MINER_IMAGE.md"
     ).read_text()
@@ -423,38 +420,43 @@ def test_operator_docs_bind_the_published_replacement_and_preserve_legacy_bounda
         REPOSITORY_ROOT / "docs" / "SN39_AUDIT_MINER_OPERATIONS.md"
     ).read_text()
     work_request = (REPOSITORY_ROOT / "docs" / "WORK_REQUEST_V2.md").read_text()
-    mining = (REPOSITORY_ROOT / "MINING.md").read_text()
-    build_status = (REPOSITORY_ROOT / "BUILD_STATUS.md").read_text()
-    postures = (REPOSITORY_ROOT / "docs" / "OPERATOR_POSTURES.md").read_text()
-    evidence_lane = (REPOSITORY_ROOT / "docs" / "EVIDENCE_LANE.md").read_text()
+    mining = (REPOSITORY_ROOT / "README.md").read_text()
 
+    for documentation in (image_documentation, operations):
+        assert "78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8" in " ".join(
+            documentation.split()
+        )
     for documentation in (image_documentation, operations, work_request):
-        normalized = " ".join(documentation.split())
-        assert "78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8" in normalized
-        assert "c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99" in normalized
-        assert "8ad7f6e127ad7dcc4dd150f0e1eb47ce72c5ab22" in normalized
-        assert "worker serve" in normalized
-        assert "--allow-public-legacy-audit" in normalized
-        assert "worker migrate --migration-mode public-legacy-audit" in normalized
-        assert "cathedral_effective_startup_v1" in normalized
-        assert "not deployment" in normalized.lower()
+        assert "c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99" in (
+            " ".join(documentation.split())
+        )
 
-    assert "Published replacement runtime contract" in image_documentation
-    assert "Current reviewed pin" in operations
-    assert "Replacement image is published" in work_request
-    assert "no replacement image digest is published yet" not in mining
-    assert "published UID30 image predates" not in build_status
-    assert "remains source-only" not in postures
-    assert "published digest predates" not in evidence_lane
-    assert "public-legacy-audit" in mining
-    assert "published UID30 image uses that fixed" in " ".join(build_status.split())
-    assert "worker migrate" in " ".join(postures.split())
-    assert "worker migrate" in evidence_lane
+    assert "worker serve" in work_request
+    assert "signed-only" in image_documentation
+    assert "public-legacy-audit" in image_documentation
+    assert "public-legacy-audit" in work_request
+    assert "compatibility bridge" in image_documentation
+    assert "migration bridge" in operations
+    assert "compatibility bridge" in work_request
+    assert "publication proves" in operations.lower()
+    assert "current migration bridge" in mining
+
+    for retired_path in (
+        "BUILD_STATUS.md",
+        "docs/BUDGET.md",
+        "docs/EVIDENCE_LANE.md",
+        "docs/LAUNCH_CANDIDATE.md",
+        "docs/OPERATOR_POSTURES.md",
+        "docs/PROVENANCE.md",
+        "docs/THIN_SUBNET_INTEGRATION.md",
+    ):
+        assert not (REPOSITORY_ROOT / retired_path).exists()
 
 
 def test_host_startup_is_syntax_valid_and_pins_the_exact_pulled_runtime() -> None:
     script_path = REPOSITORY_ROOT / "scripts" / "run_sn39_signed_fleet_miner.sh"
     script = script_path.read_text()
+    readme = (REPOSITORY_ROOT / "README.md").read_text()
 
     result = subprocess.run(
         ["bash", "-n", str(script_path)], capture_output=True, text=True, check=False
@@ -468,6 +470,8 @@ def test_host_startup_is_syntax_valid_and_pins_the_exact_pulled_runtime() -> Non
     assert ".RepoDigests" in script
     assert 'grep -Fx -- "${SN39_AUDIT_MINER_IMAGE}"' in script
     assert "{{.Os}}/{{.Architecture}}" in script
+    assert hashlib.sha256(script_path.read_bytes()).hexdigest() in readme
+    assert "/usr/local/libexec/cathedral/run-sn39-miner" in readme
     assert "org.cathedral.sn39.runtime-contract" in script
     assert "--pull never" in script
 

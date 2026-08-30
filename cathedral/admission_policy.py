@@ -24,7 +24,7 @@ attestation stays at zero exactly like a miner that was never listed. The
 strict measurement, TCB, channel-binding, and uniqueness gates are unchanged
 in both modes: ``all_registered`` widens who may ask, never what is accepted.
 
-See docs/ADMISSION_POLICY.md for the operator workflow.
+This retained library is not used by the current direct validator.
 """
 
 from __future__ import annotations

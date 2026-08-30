@@ -1,6 +1,9 @@
-"""Validator compatibility entrypoint plus hardware-free epoch helpers.
+"""Retained legacy validator wrapper and hardware-free epoch helpers.
 
-Epoch loop: challenge every miner, verify attestation, gate admission, run the
+The current direct SN39 validator lives in ``cathedral-validator`` and does
+not import this module, consume its signed stream, or apply its router.
+
+Legacy epoch loop: challenge every miner, verify attestation, gate admission, run the
 lanes, score verified work through the routing vector, burn the remainder, set
 weights. Sybil defense is free — one attested chip_id backs one UID.
 See docs/DESIGN.md §4, §5, §6.
@@ -9,8 +12,8 @@ This is the hardware-free *testable core*: the epoch below composes the real
 admission contract (verify) + control plane (Inventory) + SAT lane + emission
 routing, driven against MOCKED attestation. The MOCK boundary is the only
 substitution — everything downstream of an ``Attested`` verdict is the real
-Phase-2 code path. This runtime publishes the complete signed compute stream;
-the existing Cathedral validator maps it to SN39 and submits weights.
+Phase-2 code path. This compatibility runtime can publish the old signed
+compute stream. It is not the current Cathedral weight path.
 
 Fault isolation in ``attested_epoch``:
   Each miner’s collection + verification phase is wrapped in its own try/except
@@ -188,10 +191,9 @@ def attested_epoch(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Operator wrapper for ``cathedral runtime ...``.
+    """Compatibility wrapper for the retained ``cathedral runtime`` library.
 
-    The runtime produces Cathedral's signed compute stream. The existing thin
-    validator consumes that stream and owns on-chain weight submission.
+    The current direct validator does not consume this signed stream.
     """
 
     from cathedral import cli as operator_cli

@@ -43,17 +43,16 @@ def test_clean_install_extras_supply_each_enrollment_role() -> None:
     assert SIGNATURE_VERIFIER_MODULES == ("substrateinterface", "bittensor_wallet")
 
 
-def test_install_instructions_select_the_role_specific_extras() -> None:
-    mining = (ROOT / "MINING.md").read_text()
-    enrollment = (ROOT / "docs" / "ENROLLMENT_ALLOWLIST.md").read_text()
-    release = (ROOT / "docs" / "RELEASE_CHECKLIST.md").read_text()
+def test_current_guide_selects_validator_access_roles_not_legacy_enrollment() -> None:
+    mining = (ROOT / "README.md").read_text()
+    legacy_note = (ROOT / "docs" / "ENROLLMENT_ALLOWLIST.md").read_text()
     producer = (ROOT / "scripts" / "cathedral_enroll_allowlist.py").read_text()
 
-    assert "pip install -e '.[enrollment-miner]'" in mining
-    assert "pip install '.[enrollment-service]'" in enrollment
-    assert "pip install '.[enrollment-service]'" in release
-    assert "pip install '.[enrollment-operator]'" in enrollment
-    assert "pip install '.[enrollment-operator]'" in release
+    assert "validator-access-worker" in mining
+    assert "enrollment-operator" in mining
+    assert "enrollment-miner" not in mining
+    assert "/v1/enroll" not in mining
+    assert "pip install -e '.[enrollment-service]'" in legacy_note
+    assert "pip install -e '.[enrollment-operator]'" in legacy_note
     assert "import bittensor" in producer
-    assert "preflight_signature_verifier" in enrollment
-    assert "preflight_signature_verifier" in release
+    assert "preflight_signature_verifier" in legacy_note

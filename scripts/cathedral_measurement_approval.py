@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Auditable measurement-approval flow for the SN39 CPU policy registry.
+"""Retained measurement approval for the legacy signed policy registry.
 
-The launch measurement changes far more easily than "different guest firmware"
+The current direct SN39 validator does not consume this registry or require
+this signer and republisher. Do not deploy this tool for current mining.
+
+The retained library measurement changes far more easily than "different guest firmware"
 suggests, and this is the tool you run when it does.
 
 It is NOT a bare MRTD: it is a SHA-256 over eight fields, of which `mr_td` is
@@ -19,8 +22,8 @@ new measurement. Whether routine patching SHOULD be an approvable event, and at
 what cadence, is an open policy question (cathedral-compute#88) -- the mechanics
 below are ready either way.
 
-This tool is the only sanctioned way to add a new measurement: it never trusts
-a measurement blindly. It
+Within that retained library, this is the only supported way to add a new
+measurement. It
 
   1. captures the candidate measurement live from a named worker, through the
      pinned production verifier, proving intel_verified + report_data_match +
@@ -1245,7 +1248,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     republish = sub.add_parser(
         "republish-install",
-        help="atomically install a locked same-policy freshness reissue",
+        help="legacy library: install a locked same-policy freshness reissue",
     )
     republish.add_argument("--registry", required=True)
     republish.add_argument("--signing-key-file", required=True)

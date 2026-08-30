@@ -1,4 +1,6 @@
-"""Frozen SN39 Intel TDX launch cardinality contract.
+"""Retained publisher/evidence-library cardinality contract.
+
+The current direct SN39 validator does not consume these publisher limits.
 
 These limits are shared by the score producer, evidence exporter, and
 independent verifier. A report that the producer can publish must remain

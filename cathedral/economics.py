@@ -1,8 +1,7 @@
-"""Routing-weighted work, an optional compatibility floor, and burn.
+"""Retained legacy lane router with an optional floor and burn.
 
-Cathedral calls this router with ``floor=0.0``: attestation grants admission,
-while only verified work earns weight. The parameter remains to keep the
-low-level routing primitive explicit and testable.
+The current direct SN39 validator does not call this router and uses zero burn.
+This module remains as a low-level compatibility primitive and test surface.
 
 Three layers, sum-conserving to exactly 1.0:
 

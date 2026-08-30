@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Fail-closed GCP metadata delivery for the bounded UID124 signed fleet.
+"""Retired GCP-specific UID124 guest poller, retained for audited history.
+
+This is not part of the current direct-validator mining path. Use the
+repository README for current operator instructions.
 
 This process runs as root on one or two reviewed Intel TDX guests. It accepts
 only public deployment material from instance metadata. Snapshot signatures
@@ -827,11 +830,15 @@ def run_forever(metadata: MetadataClient | None = None) -> int:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="sn39-gcp-guest-poller", allow_abbrev=False)
+    parser = argparse.ArgumentParser(
+        prog="sn39-gcp-guest-poller",
+        description="RETIRED UID124 GCP guest poller. Not current SN39 mining.",
+        allow_abbrev=False,
+    )
     parser.add_argument(
         "--print-policy",
         action="store_true",
-        help="print the fixed public guest policy without contacting metadata",
+        help="retired: print the fixed guest policy without contacting metadata",
     )
     return parser
 

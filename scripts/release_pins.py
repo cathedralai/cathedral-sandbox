@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Emit every pin a supported release must publish, in paste-ready form.
+"""Emit pins for the repository's legacy provenance-verification library.
 
-`docs/PROVENANCE.md` requires an external validator to take the key digests,
-the verifier implementation digest and the source revision from the RELEASE
-NOTES, never from the evidence surface being verified. Copying a trust root
-from the service under audit proves nothing, so that rule is what makes the
-one-command reproduction meaningful.
+An external verifier must take key digests, the verifier implementation
+digest, and the source revision from an independently reviewed release. It
+must never copy a trust root from the service under audit.
 
 Every pin below is therefore host-specific and cannot be produced from a clone:
 
@@ -16,7 +14,7 @@ Every pin below is therefore host-specific and cannot be produced from a clone:
 * the source revision is the commit the release is cut from.
 
 Run this on the production host, check the output against what is deployed, and
-paste the block into the release notes.
+paste the block into the release record used by that library.
 
     python3 scripts/release_pins.py \\
       --registry-keys /etc/cathedral/pins/registry-keys.json \\

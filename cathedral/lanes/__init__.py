@@ -1,4 +1,8 @@
-"""The five-lane verified-work engine (Phase 2).
+"""Retained five-lane product-library interface.
+
+Current SN39 scoring uses the direct validator's bounded SAT challenge, not
+this routing vector or the unimplemented inference, training, RL, and agent
+hosting lanes.
 
 A miner is attested hardware + lane subscriptions. A lane is a work queue with
 four functions; miner weight = Σ over lanes (routing_vector[lane] × lane_score).

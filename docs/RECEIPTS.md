@@ -1,5 +1,8 @@
 # Assurance receipts
 
+> Product-library reference. Receipts do not replace the current direct SN39
+> validator path. Mining starts in the repository [README](../README.md).
+
 Cathedral assurance receipts are small, signed records for one worker and one
 validator-issued work challenge. They preserve the exact assurance result at
 the time it was produced without publishing raw attestation evidence, customer
@@ -7,9 +10,10 @@ payloads, credentials, endpoints, or a reusable physical-machine identifier.
 
 A receipt is evidence for the claims it contains. It is not a general promise
 that an application is bug-free, that arbitrary output is correct, or that a
-customer handled its own keys securely. The signed epoch score vector remains
-the accounting source used by score-stream consumers; receipts do not replace
-or change that contract.
+customer handled its own keys securely. In the retained legacy epoch library,
+the signed score vector is the accounting source for its old score-stream
+consumers. The current direct SN39 validator consumes neither that vector nor
+these receipts.
 
 ## What each claim means
 
@@ -28,7 +32,7 @@ single overall-verification flag.
 
 ## Version 2 schema
 
-The schema identifier issued by the current runtime is
+The schema identifier issued by the retained receipt runtime is
 `cathedral_assurance_receipt_v2`.
 
 | Field | Meaning |

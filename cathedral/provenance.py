@@ -1,10 +1,9 @@
-"""Full-provenance verification and recomputation for the SN39 weight vector.
+"""Retained full-provenance verification for the legacy signed-vector path.
 
-The thin validator (in the subnet repo) fetches Cathedral's signed weight
-vector and checks its signature, key identity, network/netuid, freshness,
-policy identity, hotkey mapping, and forced-burn policy before submitting. It
-trusts that the numbers inside the signed vector were themselves derived
-correctly.
+The retired thin validator fetched Cathedral's signed weight vector and
+checked its signature, key identity, network/netuid, freshness, policy
+identity, hotkey mapping, and burn policy before submitting. The current
+direct SN39 validator does not fetch a Cathedral vector or call this module.
 
 Full-provenance mode does not take that on trust. Given the public, signed,
 content-addressed evidence for an epoch, it independently:
@@ -26,9 +25,8 @@ a stale artifact as provenance. Every positive weight it would assign traces to
 a verified receipt whose measurement is in the signed registry and whose work
 status is "passed".
 
-This module is transport-agnostic: callers supply already-fetched bytes. The
-evidence store/CLI and the two-mode validator handle fetching and
-content-addressing.
+This compatibility module is transport-agnostic: callers supply
+already-fetched bytes. It remains so historical artifacts can be audited.
 """
 
 from __future__ import annotations
@@ -723,10 +721,9 @@ _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 # repeated floating-point normalization is part of the wire path.
 _FIXED_POLICY_ABS_TOL = 1e-12
 
-# The validated_supply_v2 burn contract (docs/BUDGET.md): a FIXED 10% burn to
-# the configured burn destination. The floor is part of the versioned
-# mechanism id; changing it requires a new mechanism version pinned
-# everywhere. The subnet validator enforces the same 10.0 exactly.
+# Historical validated_supply_v2 compatibility contract. It is retained for
+# parsing old evidence, not used by the current direct validator. The direct
+# validator has zero burn.
 VALIDATED_SUPPLY_V2_BURN_FRACTION = 0.10
 VALIDATED_SUPPLY_V2_BURN_PERCENTAGE = 10.0
 VALIDATED_SUPPLY_V2_TDX_ALLOCATION = 0.90
