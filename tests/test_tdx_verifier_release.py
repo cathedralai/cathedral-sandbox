@@ -31,14 +31,25 @@ def test_verifier_release_requires_an_explicit_exact_semver_tag():
     assert "persist-credentials: false" in workflow
     assert "fetch-depth: 0" in workflow
     assert 'git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main' in workflow
-    assert "CATHEDRAL_RELEASE_ADMIN_READ_TOKEN" in workflow
-    assert "CATHEDRAL_TDX_RELEASE_TAG_RULESET_ID" in workflow
-    assert '"repos/${GITHUB_REPOSITORY}/immutable-releases"' in workflow
-    assert '"repos/${GITHUB_REPOSITORY}/rulesets/${TAG_RULESET_ID}"' in workflow
-    assert '.target == "tag"' in workflow
-    assert 'index("update") != null' in workflow
-    assert 'index("deletion") != null' in workflow
-    assert "((.bypass_actors // []) | length == 0)" in workflow
+    assert "CATHEDRAL_RELEASE_ADMIN_READ_TOKEN" not in workflow
+    assert "CATHEDRAL_TDX_RELEASE_TAG_RULESET_ID" not in workflow
+    assert re.findall(r"secrets\.([A-Z0-9_]+)", workflow) == ["GITHUB_TOKEN"]
+    assert "${{ vars." not in workflow
+
+    ruleset_step = workflow.split(
+        "- name: Require the public protected tag ruleset", 1
+    )[1].split("- name: Create, fill, and publish the tagged release draft", 1)[0]
+    assert "Protect Cathedral TDX verifier release tags" in workflow
+    assert "GH_TOKEN" not in ruleset_step
+    assert "secrets." not in ruleset_step
+    assert "Authorization:" not in ruleset_step
+    assert "gh api" not in ruleset_step
+    assert ruleset_step.count('curl "${curl_args[@]}"') == 2
+    assert 'api="https://api.github.com/repos/${GITHUB_REPOSITORY}/rulesets"' in ruleset_step
+    assert '.name == $name' in ruleset_step
+    assert '.target == "tag"' in ruleset_step
+    assert '([.rules[].type] | sort) == ["deletion", "update"]' in ruleset_step
+    assert "bypass_actors" not in ruleset_step
 
     actions = re.findall(r"uses: ([^\s]+)", workflow)
     assert actions == [
@@ -78,18 +89,39 @@ def test_verifier_release_build_and_two_asset_contract_are_fixed():
         assert expected in normalized or expected in workflow
 
     release_step = workflow.split(
-        "- name: Create the tagged release with two assets", 1
-    )[1]
+        "- name: Create, fill, and publish the tagged release draft", 1
+    )[1].split("\n  verify-anonymous-download:", 1)[0]
     assert release_step.count('"$GITHUB_WORKSPACE/dist/$') == 2
     assert 'test "${#assets[@]}" -eq 2' in release_step
-    assert 'gh release create "$RELEASE_TAG" "${assets[@]}"' in release_step
-    assert "--verify-tag" in release_step
-    assert "--latest=false" in release_step
-    assert release_step.count("verify_remote_tag_target") == 3
-    assert "--json isImmutable" in release_step
-    assert 'test "$(gh release view' in release_step
+    assert 'gh release create "$RELEASE_TAG" \\' in release_step
+    assert 'gh release upload "$RELEASE_TAG" "${assets[@]}"' in release_step
+    assert 'gh release edit "$RELEASE_TAG"' in release_step
+    create_block = release_step.split("gh release create", 1)[1].split(
+        "gh release upload", 1
+    )[0]
+    assert '"${assets[@]}"' not in create_block
+    assert "--draft \\" in create_block
+    assert release_step.count("gh release upload") == 1
+    assert release_step.count("--verify-tag") == 2
+    assert release_step.count("--latest=false") == 2
+    assert release_step.count("verify_remote_tag_target") == 4
+    assert "--draft" in release_step
+    assert "--draft=false" in release_step
+    assert ".isDraft == true" in release_step
+    assert ".isDraft == false" in release_step
+    assert ".isImmutable == true" in release_step
+    assert release_step.count("(.assets | length) == 2") == 2
+    assert release_step.count(".digest == $digest") == 2
+    assert release_step.count(".size == $size") == 2
+    assert release_step.count('.state == "uploaded"') == 2
+    assert 'artifact_digest "sha256:$EXPECTED_SHA256"' in release_step
+    assert 'checksum_digest="sha256:$(sha256sum' in release_step
+    assert "--clobber" not in release_step
+    assert release_step.index("gh release create") < release_step.index("gh release upload")
+    assert release_step.index("gh release upload") < release_step.index(".isDraft == true")
+    assert release_step.index(".isDraft == true") < release_step.index("gh release edit")
+    assert release_step.index("gh release edit") < release_step.index(".isImmutable == true")
     assert "dist/*" not in workflow
-    assert "gh release upload" not in workflow
     assert workflow.count('GOCACHE="$build_') == 2
 
     anonymous_step = workflow.split(
@@ -149,8 +181,13 @@ def test_release_notes_template_binds_provenance_and_states_trust_limits():
     assert "does not change GitHub's latest-release marker" in normalized_guide
     assert "not use the raw asset SHA" in normalized_guide
     assert "before any publishing command" in normalized_guide
-    assert "requires GitHub to report the published release as immutable" in normalized_guide
+    assert "confirm GitHub immutable releases are enabled" in normalized_guide
+    assert "Protect Cathedral TDX verifier release tags" in normalized_guide
+    assert "public rulesets API without credentials" in normalized_guide
     assert "no bypass actors" in normalized_guide
+    assert "does not claim to prove the no-bypass operator preflight" in normalized_guide
+    assert "An upload failure or byte mismatch cannot publish a partial release" in normalized_guide
+    assert "require `isImmutable=true`" in normalized_guide
     assert "separate empty Go build caches" in normalized_guide
     assert "live anonymous-download proof" in normalized_guide
     assert "Do not download the verifier from a Cathedral API" in normalized_guide

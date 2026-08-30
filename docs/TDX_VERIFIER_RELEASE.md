@@ -12,19 +12,27 @@ manual-dispatch trigger. The job revalidates the exact tag shape before any
 publishing command. It also refuses a tag whose commit is not reachable from the
 current `origin/main`.
 
-Immediately before release creation, the workflow requires:
+Before pushing a release tag, the operator must confirm GitHub immutable
+releases are enabled for this repository and, through an authenticated
+administrator view, confirm the release-tag ruleset has no bypass actors. Those
+administrator-only facts are not read by the workflow. After publication, the
+workflow requires GitHub to report the release as immutable.
 
-- GitHub immutable releases enabled for this repository.
-- One active tag ruleset whose only include is
-  `refs/tags/cathedral-tdx-verifier-v*`, with update and deletion restricted and
-  no bypass actors.
-- A fine-grained `CATHEDRAL_RELEASE_ADMIN_READ_TOKEN` secret with read-only
-  repository Administration permission, plus the verified ruleset id in the
-  `CATHEDRAL_TDX_RELEASE_TAG_RULESET_ID` repository variable.
+Immediately before draft creation, the workflow anonymously requires:
 
-The workflow reads those controls through GitHub's API and fails closed if the
-secret or variable is absent or either control differs. It never changes the
-controls. Configuring them is separate administrator authorization.
+- One active tag ruleset named
+  `Protect Cathedral TDX verifier release tags`, whose only include is
+  `refs/tags/cathedral-tdx-verifier-v*`, whose only rules restrict update and
+  deletion, and which has no excluded refs.
+
+The workflow reads the public rulesets API without credentials and fails closed
+if the exact control is absent or differs. It never changes repository controls
+and does not add a persistent GitHub credential. Publication uses only GitHub
+Actions' ephemeral `GITHUB_TOKEN`. Configuring the controls is separate
+administrator authorization.
+
+GitHub omits bypass actors from anonymous ruleset responses. The public check
+therefore does not claim to prove the no-bypass operator preflight.
 
 ## Fixed artifact contract
 
@@ -95,10 +103,14 @@ binary at its reviewed path.
 
 The workflow passes `--verify-tag` and `--latest=false`, so it refuses a missing
 remote tag and does not change GitHub's latest-release marker. It also re-fetches
-and dereferences the protected remote tag immediately before release creation,
-then requires GitHub to report the published release as immutable and rechecks
-the tag target. A green release job therefore binds the immutable release to the
-same source commit used for the build. These checks do not enable the repository
+and dereferences the protected remote tag immediately before draft creation.
+It creates the release as a draft, uploads only the binary and checksum, and
+verifies both assets' names, SHA-256 digests, byte sizes, and `uploaded` state
+while the release remains a draft. An upload failure or byte mismatch cannot
+publish a partial release. Only then does the workflow recheck the tag, publish
+the draft, require `isImmutable=true`, revalidate the two assets, and recheck the
+tag again. A green release job therefore binds the immutable release to the same
+source commit used for the build. These checks do not enable the repository
 controls.
 
 After release creation, a separate job with no repository permissions or token

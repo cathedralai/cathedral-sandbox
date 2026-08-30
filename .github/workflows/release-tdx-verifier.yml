@@ -12,6 +12,7 @@ env:
   ARTIFACT_NAME: cathedral-tdx-verifier-linux-amd64
   CHECKSUM_NAME: cathedral-tdx-verifier-linux-amd64.sha256
   EXPECTED_SHA256: 4b6fbaf12def5e4284b54f557c5c29e472d7666f0160a11a5472fdcf462db148
+  TAG_RULESET_NAME: Protect Cathedral TDX verifier release tags
 
 jobs:
   release:
@@ -152,35 +153,36 @@ jobs:
           Path(os.environ["RUNNER_TEMP"], "tdx-verifier-release-notes.md").write_text(notes)
           PY
 
-      - name: Require immutable releases and a non-bypassable tag ruleset
+      - name: Require the public protected tag ruleset
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.CATHEDRAL_RELEASE_ADMIN_READ_TOKEN }}
-          TAG_RULESET_ID: ${{ vars.CATHEDRAL_TDX_RELEASE_TAG_RULESET_ID }}
         run: |
           set -euo pipefail
-          test -n "${GH_TOKEN:-}"
-          [[ "${TAG_RULESET_ID:-}" =~ ^[1-9][0-9]*$ ]]
-          test "$(gh api \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/${GITHUB_REPOSITORY}/immutable-releases" \
-            --jq .enabled)" = true
-          ruleset="$(gh api \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/${GITHUB_REPOSITORY}/rulesets/${TAG_RULESET_ID}")"
-          jq -e '
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/rulesets"
+          curl_args=(
+            --fail --location --silent --show-error --retry 4 --retry-all-errors
+            --proto '=https' --tlsv1.2
+            --header 'Accept: application/vnd.github+json'
+            --header 'X-GitHub-Api-Version: 2026-03-10'
+          )
+          rulesets="$(curl "${curl_args[@]}" "${api}?includes_parents=true")"
+          ruleset_id="$(jq -r --arg name "$TAG_RULESET_NAME" '
+            [.[] | select(
+              .name == $name and .target == "tag" and .enforcement == "active"
+            )] | if length == 1 then .[0].id else empty end
+          ' <<< "$rulesets")"
+          [[ "$ruleset_id" =~ ^[1-9][0-9]*$ ]]
+          ruleset="$(curl "${curl_args[@]}" \
+            "${api}/${ruleset_id}?includes_parents=true")"
+          jq -e --arg name "$TAG_RULESET_NAME" '
+            .name == $name and
             .target == "tag" and
             .enforcement == "active" and
             .conditions.ref_name.include == ["refs/tags/cathedral-tdx-verifier-v*"] and
             .conditions.ref_name.exclude == [] and
-            ((.bypass_actors // []) | length == 0) and
-            ([.rules[].type] | index("update") != null) and
-            ([.rules[].type] | index("deletion") != null)
+            ([.rules[].type] | sort) == ["deletion", "update"]
           ' <<< "$ruleset" >/dev/null
 
-      - name: Create the tagged release with two assets
+      - name: Create, fill, and publish the tagged release draft
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -198,17 +200,69 @@ jobs:
             "$GITHUB_WORKSPACE/dist/$CHECKSUM_NAME"
           )
           test "${#assets[@]}" -eq 2
+          artifact_size="$(stat -c '%s' "${assets[0]}")"
+          checksum_size="$(stat -c '%s' "${assets[1]}")"
+          checksum_digest="sha256:$(sha256sum "${assets[1]}" | cut -d ' ' -f 1)"
+          [[ "$artifact_size" =~ ^[1-9][0-9]*$ ]]
+          [[ "$checksum_size" =~ ^[1-9][0-9]*$ ]]
+          [[ "$checksum_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           verify_remote_tag_target
-          gh release create "$RELEASE_TAG" "${assets[@]}" \
+          gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
+            --draft \
             --latest=false \
             --title "Cathedral static TDX verifier ${RELEASE_TAG}" \
             --notes-file "$RUNNER_TEMP/tdx-verifier-release-notes.md"
-          test "$(gh release view "$RELEASE_TAG" \
+          gh release upload "$RELEASE_TAG" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY"
+          draft="$(gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --json isImmutable \
-            --jq .isImmutable)" = true
+            --json assets,isDraft)"
+          jq -e \
+            --arg artifact "$ARTIFACT_NAME" \
+            --arg checksum "$CHECKSUM_NAME" \
+            --arg artifact_digest "sha256:$EXPECTED_SHA256" \
+            --arg checksum_digest "$checksum_digest" \
+            --argjson artifact_size "$artifact_size" \
+            --argjson checksum_size "$checksum_size" '
+            def exact_asset($name; $digest; $size):
+              [.assets[] | select(
+                .name == $name and .digest == $digest and
+                .size == $size and .state == "uploaded"
+              )] | length == 1;
+            .isDraft == true and
+            (.assets | length) == 2 and
+            exact_asset($artifact; $artifact_digest; $artifact_size) and
+            exact_asset($checksum; $checksum_digest; $checksum_size)
+          ' <<< "$draft" >/dev/null
+          verify_remote_tag_target
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft=false \
+            --latest=false
+          published="$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets,isDraft,isImmutable)"
+          jq -e \
+            --arg artifact "$ARTIFACT_NAME" \
+            --arg checksum "$CHECKSUM_NAME" \
+            --arg artifact_digest "sha256:$EXPECTED_SHA256" \
+            --arg checksum_digest "$checksum_digest" \
+            --argjson artifact_size "$artifact_size" \
+            --argjson checksum_size "$checksum_size" '
+            def exact_asset($name; $digest; $size):
+              [.assets[] | select(
+                .name == $name and .digest == $digest and
+                .size == $size and .state == "uploaded"
+              )] | length == 1;
+            .isDraft == false and
+            .isImmutable == true and
+            (.assets | length) == 2 and
+            exact_asset($artifact; $artifact_digest; $artifact_size) and
+            exact_asset($checksum; $checksum_digest; $checksum_size)
+          ' <<< "$published" >/dev/null
           verify_remote_tag_target
 
   verify-anonymous-download:
