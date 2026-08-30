@@ -192,6 +192,57 @@ def test_plan_is_no_write_and_fully_bounded(capsys, monkeypatch):
     ]
 
 
+def test_primary_only_plan_is_no_write_and_names_only_uid124_primary(
+    capsys, monkeypatch
+):
+    monkeypatch.setattr(
+        publisher.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("plan contacted an external command"),
+    )
+
+    assert publisher.main(["plan-primary-only"]) == 0
+    document = json.loads(capsys.readouterr().out)
+
+    assert document["cloud_writes"] is False
+    assert document["operator_mode"] == "primary_only"
+    assert document["cost_estimate"] == {
+        "as_of": "2026-08-30",
+        "currency": "USD",
+        "kind": "conservative_planning_estimate_not_a_spend_cap",
+        "per_selected_guest_four_hours_usd": 1.0,
+        "selected_guest_count": 1,
+        "selected_guests_four_hours_usd": 1.0,
+        "includes": [
+            "on_demand_c3_standard_4",
+            "intel_tdx_surcharge",
+            "20_gib_pd_balanced_boot_disk",
+            "in_use_external_ipv4",
+        ],
+        "excludes": [
+            "network_egress",
+            "taxes",
+            "reserved_address_time_outside_the_vm_window",
+        ],
+        "operator_hard_cap_usd": 20.0,
+        "operator_hard_cap_enforced_by_script": False,
+    }
+    assert document["machine"]["confidential_compute"] == "TDX"
+    assert document["machine"]["max_run_seconds"] == 14_400
+    assert document["machine"]["termination_action"] == "DELETE"
+    assert document["activation_image"] == IMAGE
+    assert document["vms"] == [
+        {
+            "name": publisher.PRIMARY_NAME,
+            "static_ip": "35.222.166.235",
+            "public_endpoint": "https://35.222.166.235:8081",
+            "fleet_candidates_beyond_self": [],
+        }
+    ]
+    assert publisher.SECONDARY_NAME not in json.dumps(document)
+    assert publisher.SECONDARY_IP not in json.dumps(document)
+
+
 def test_fleet_manifests_pin_exact_uid124_topology():
     primary = json.loads(publisher.fleet_bytes(publisher.VMS[0]))
     secondary = json.loads(publisher.fleet_bytes(publisher.VMS[1]))
@@ -206,6 +257,19 @@ def test_fleet_manifests_pin_exact_uid124_topology():
         "worker_hotkey": publisher.MINER_HOTKEY,
         "endpoints": [],
     }
+
+
+def test_primary_only_fleet_bytes_are_canonical_and_singleton():
+    payload = publisher.fleet_bytes(publisher.PRIMARY_ONLY_VMS[0])
+
+    assert payload == (
+        b'{"endpoints":[],"schema":"cathedral_worker_fleet_v1",'
+        b'"worker_hotkey":"'
+        + publisher.MINER_HOTKEY.encode("ascii")
+        + b'"}'
+    )
+    assert publisher.SECONDARY_IP.encode("ascii") not in payload
+    assert payload != publisher.fleet_bytes(publisher.VMS[0])
 
 
 def test_capture_command_is_fixed_to_finalized_uid30_policy(tmp_path):
@@ -490,9 +554,37 @@ def test_guest_fleet_policy_is_exact_for_both_machines():
     poller._validate_fleet(publisher.fleet_bytes(publisher.VMS[1]), secondary)
 
     wrong = json.loads(publisher.fleet_bytes(publisher.VMS[0]))
-    wrong["endpoints"] = []
+    wrong["endpoints"] = ["https://203.0.113.20:8081"]
     with pytest.raises(poller.GuestDeliveryError, match="two-machine policy"):
         poller._validate_fleet(json.dumps(wrong).encode(), primary)
+
+
+def test_primary_only_producer_manifest_matches_guest_consumer_exactly():
+    primary = poller.VMPolicy(poller.PRIMARY_NAME, poller.PRIMARY_IP)
+    payload = publisher.fleet_bytes(publisher.PRIMARY_ONLY_VMS[0])
+
+    poller._validate_fleet(payload, primary)
+
+    document = json.loads(payload)
+    refused = [
+        {**document, "endpoints": ["https://203.0.113.20:8081"]},
+        {
+            **document,
+            "endpoints": [
+                f"https://{poller.SECONDARY_IP}:8081",
+                f"https://{poller.SECONDARY_IP}:8081",
+            ],
+        },
+        {**document, "unexpected": True},
+    ]
+    for candidate in refused:
+        with pytest.raises(poller.GuestDeliveryError, match="primary-only"):
+            poller._validate_fleet(json.dumps(candidate).encode(), primary)
+
+    with pytest.raises(poller.GuestDeliveryError, match="fixed guest identity"):
+        poller._validate_fleet(
+            payload, poller.VMPolicy(poller.PRIMARY_NAME, poller.SECONDARY_IP)
+        )
 
 
 def test_snapshot_freshness_has_exact_900_second_bounds():
@@ -1132,6 +1224,256 @@ def test_partial_cloud_write_error_reports_confirmed_and_ambiguous_state(
     )
     assert refused.value.ambiguous_cloud_write is None
     assert observed == [["gcloud", "update", publisher.PRIMARY_NAME]]
+
+
+def test_primary_only_commands_select_only_the_singleton_policy(monkeypatch):
+    provision_calls = []
+    publish_calls = []
+    monkeypatch.setattr(
+        publisher, "provision", lambda **kwargs: provision_calls.append(kwargs)
+    )
+    monkeypatch.setattr(
+        publisher, "publish_loop", lambda **kwargs: publish_calls.append(kwargs)
+    )
+    common = [
+        "--signing-key-file",
+        "/not-opened.seed",
+        "--keys-file",
+        "/not-opened.json",
+        "--image",
+        IMAGE,
+    ]
+
+    assert (
+        publisher.main(
+            [
+                "provision-primary-only",
+                *common,
+                "--acknowledge",
+                publisher.PRIMARY_ONLY_PROVISION_ACK,
+            ]
+        )
+        == 0
+    )
+    assert (
+        publisher.main(
+            [
+                "publish-loop-primary-only",
+                *common,
+                "--acknowledge",
+                publisher.PRIMARY_ONLY_PUBLISH_ACK,
+            ]
+        )
+        == 0
+    )
+
+    assert provision_calls[0]["vms"] == publisher.PRIMARY_ONLY_VMS
+    assert publish_calls[0]["vms"] == publisher.PRIMARY_ONLY_VMS
+    assert publisher.SECONDARY_NAME not in repr(provision_calls + publish_calls)
+
+
+def test_primary_only_mode_refuses_cross_mode_acknowledgements(capsys, monkeypatch):
+    monkeypatch.setattr(
+        publisher,
+        "provision",
+        lambda **_kwargs: pytest.fail("refused mode reached provision"),
+    )
+    monkeypatch.setattr(
+        publisher,
+        "publish_loop",
+        lambda **_kwargs: pytest.fail("refused mode reached publisher"),
+    )
+    common = [
+        "--signing-key-file",
+        "/secret/not-opened.seed",
+        "--keys-file",
+        "/public/not-opened.json",
+        "--image",
+        IMAGE,
+    ]
+
+    refused_commands = [
+        [
+            "provision-primary-only",
+            *common,
+            "--acknowledge",
+            publisher.PROVISION_ACK,
+        ],
+        [
+            "provision",
+            *common,
+            "--acknowledge",
+            publisher.PRIMARY_ONLY_PROVISION_ACK,
+        ],
+        [
+            "publish-loop-primary-only",
+            *common,
+            "--acknowledge",
+            publisher.PUBLISH_ACK,
+        ],
+        [
+            "publish-loop",
+            *common,
+            "--acknowledge",
+            publisher.PRIMARY_ONLY_PUBLISH_ACK,
+        ],
+    ]
+    for command in refused_commands:
+        assert publisher.main(command) == 2
+        report = json.loads(capsys.readouterr().err)
+        assert report["status"] == "REFUSED"
+        assert report["cloud_write_state"] == "NONE_CONFIRMED"
+        assert "acknowledgement does not match" in report["error"]
+
+    with pytest.raises(publisher.PublisherError, match="fixed operator mode"):
+        publisher.plan_document(vms=(publisher.VMS[0],))
+
+
+def test_primary_only_create_ambiguity_names_only_the_primary(capsys, monkeypatch):
+    def ambiguous(**_kwargs):
+        raise publisher.PublisherError(
+            "primary create returned failure",
+            ambiguous_cloud_write=f"create instance {publisher.PRIMARY_NAME}",
+        )
+
+    monkeypatch.setattr(publisher, "provision", ambiguous)
+    code = publisher.main(
+        [
+            "provision-primary-only",
+            "--signing-key-file",
+            "/not-opened.seed",
+            "--keys-file",
+            "/not-opened.json",
+            "--image",
+            IMAGE,
+            "--acknowledge",
+            publisher.PRIMARY_ONLY_PROVISION_ACK,
+        ]
+    )
+
+    assert code == 2
+    report = json.loads(capsys.readouterr().err)
+    assert report["cloud_write_state"] == "AMBIGUOUS"
+    assert report["completed_cloud_writes"] == []
+    assert report["ambiguous_cloud_write"] == (
+        f"create instance {publisher.PRIMARY_NAME}"
+    )
+    assert publisher.SECONDARY_NAME not in json.dumps(report)
+
+
+def test_primary_only_provision_refuses_the_fixed_secondary(monkeypatch):
+    observed = []
+
+    def list_instances(arguments, **_kwargs):
+        observed.append(arguments)
+        return [{"name": publisher.SECONDARY_NAME}]
+
+    monkeypatch.setattr(publisher, "_gcloud_json", list_instances)
+    monkeypatch.setattr(publisher, "validate_inputs", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        publisher, "verify_shared_infrastructure", lambda **_kwargs: None
+    )
+    monkeypatch.setattr(
+        publisher,
+        "capture_snapshot",
+        lambda **_kwargs: pytest.fail("secondary guard reached snapshot capture"),
+    )
+    monkeypatch.setattr(
+        publisher.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("secondary guard reached a cloud write"),
+    )
+
+    with pytest.raises(publisher.PublisherError, match="fixed UID124 VM name"):
+        publisher.provision(
+            signing_key=Path("/not-opened.seed"),
+            signing_key_id="cathedral-validator-access-1",
+            keys_file=Path("/not-opened.json"),
+            image=IMAGE,
+            vms=publisher.PRIMARY_ONLY_VMS,
+        )
+
+    assert len(observed) == 1
+    assert _flag_value(observed[0], "--filter") == (
+        f"name=({publisher.PRIMARY_NAME} {publisher.SECONDARY_NAME})"
+    )
+    assert "unrelated" not in " ".join(observed[0])
+
+
+def test_primary_only_core_never_creates_or_updates_the_secondary(tmp_path, monkeypatch):
+    selected = []
+    cloud_commands = []
+    singleton_fleets = []
+    primary = publisher.PRIMARY_ONLY_VMS[0]
+    pins = {
+        "keys_digest": "sha256:" + "1" * 64,
+        "launcher_digest": "sha256:" + "2" * 64,
+        "poller_digest": "sha256:" + "3" * 64,
+    }
+
+    monkeypatch.setattr(publisher, "validate_inputs", lambda **_kwargs: pins)
+    monkeypatch.setattr(
+        publisher,
+        "verify_shared_infrastructure",
+        lambda **kwargs: selected.append(("infrastructure", tuple(kwargs["vms"]))),
+    )
+    monkeypatch.setattr(
+        publisher,
+        "_desired_instances_absent",
+        lambda **kwargs: selected.append(("absence", tuple(kwargs["vms"]))),
+    )
+    monkeypatch.setattr(publisher, "capture_snapshot", lambda **_kwargs: None)
+
+    def create_command(vm, **kwargs):
+        singleton_fleets.append(kwargs["fleet_file"].read_bytes())
+        return ["gcloud", "create", vm.name]
+
+    monkeypatch.setattr(publisher, "create_instance_command", create_command)
+    monkeypatch.setattr(
+        publisher,
+        "verify_running_instances",
+        lambda **kwargs: selected.append(("running", tuple(kwargs["vms"])))
+        or {primary.name: _instance(primary)},
+    )
+    monkeypatch.setattr(
+        publisher,
+        "wait_for_guest_tls",
+        lambda **kwargs: selected.append(("tls", tuple(kwargs["vms"]))),
+    )
+    monkeypatch.setattr(
+        publisher.subprocess,
+        "run",
+        lambda command, **_kwargs: cloud_commands.append(command),
+    )
+
+    publisher.provision(
+        signing_key=tmp_path / "not-opened.seed",
+        signing_key_id="cathedral-validator-access-1",
+        keys_file=tmp_path / "not-opened.json",
+        image=IMAGE,
+        vms=publisher.PRIMARY_ONLY_VMS,
+    )
+    assert cloud_commands == [["gcloud", "create", publisher.PRIMARY_NAME]]
+    assert singleton_fleets == [publisher.fleet_bytes(primary)]
+    assert all(vms == publisher.PRIMARY_ONLY_VMS for _stage, vms in selected)
+
+    cloud_commands.clear()
+    monkeypatch.setattr(
+        publisher,
+        "snapshot_update_command",
+        lambda vm, _snapshot, *, instance: ["gcloud", "update", vm.name],
+    )
+    publisher.publish_once(
+        signing_key=tmp_path / "not-opened.seed",
+        signing_key_id="cathedral-validator-access-1",
+        keys_file=tmp_path / "not-opened.json",
+        snapshot=tmp_path / "not-opened-snapshot.json",
+        image=IMAGE,
+        vms=publisher.PRIMARY_ONLY_VMS,
+    )
+
+    assert cloud_commands == [["gcloud", "update", publisher.PRIMARY_NAME]]
+    assert publisher.SECONDARY_NAME not in repr(cloud_commands)
 
 
 def test_mutating_modes_require_exact_acknowledgements(capsys):

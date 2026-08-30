@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fail-closed GCP metadata delivery for the bounded UID124 signed fleet.
 
-This process runs as root on exactly two reviewed Intel TDX guests. It accepts
+This process runs as root on one or two reviewed Intel TDX guests. It accepts
 only public deployment material from instance metadata. Snapshot signatures
 are verified inside the immutable audit-miner image before atomic installation.
 No wallet, chain client, RPC endpoint, bearer, or private artifact seed enters
@@ -380,14 +380,24 @@ def _validate_fleet(payload: bytes, vm: VMPolicy) -> None:
         document = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise GuestDeliveryError("fleet metadata is not JSON") from exc
-    expected_endpoints = [f"https://{SECONDARY_IP}:8081"] if vm.name == PRIMARY_NAME else []
-    expected = {
-        "schema": "cathedral_worker_fleet_v1",
-        "worker_hotkey": MINER_HOTKEY,
-        "endpoints": expected_endpoints,
-    }
-    if document != expected:
-        raise GuestDeliveryError("fleet metadata differs from the fixed two-machine policy")
+    if vm == VMPolicy(PRIMARY_NAME, PRIMARY_IP):
+        allowed_endpoints = ([], [f"https://{SECONDARY_IP}:8081"])
+    elif vm == VMPolicy(SECONDARY_NAME, SECONDARY_IP):
+        allowed_endpoints = ([],)
+    else:
+        raise GuestDeliveryError("fleet metadata has no fixed guest identity")
+    allowed = [
+        {
+            "schema": "cathedral_worker_fleet_v1",
+            "worker_hotkey": MINER_HOTKEY,
+            "endpoints": endpoints,
+        }
+        for endpoints in allowed_endpoints
+    ]
+    if document not in allowed:
+        raise GuestDeliveryError(
+            "fleet metadata differs from the fixed primary-only or two-machine policy"
+        )
 
 
 def install_static_artifacts(metadata: MetadataClient, deployment: Deployment) -> None:

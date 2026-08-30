@@ -5,11 +5,17 @@
 This is a source-reviewed activation bridge. It is not evidence of a deployment.
 It creates no chain authority and it never submits weights.
 
-The bridge is fixed to:
+The bridge has two explicit operator modes. The one-machine-first mode creates
+only the UID124 primary at `35.222.166.235:8081` and gives it an empty fleet
+candidate list. The retained two-machine mode creates the primary and secondary
+at `35.222.166.235:8081` and `34.46.19.69:8081`. The acknowledgement strings are
+different, so one mode does not authorize the other.
+
+Both modes are fixed to:
 
 - GCP project `polaris-tdx-attest`, zone `us-central1-b`.
-- Two named `c3-standard-4` Intel TDX guests with 20 GB NVMe boot disks.
-- Static endpoints `35.222.166.235:8081` and `34.46.19.69:8081`.
+- Named `c3-standard-4` Intel TDX guests with 20 GB NVMe boot disks.
+- The selected static endpoint or endpoints from the two fixed addresses.
 - UID124 hotkey `5CJTD6znKPfsQFjPQtTvRiHHcLtpXJr7P16dF4VuEtx9qn7G`.
 - UID30 validator hotkey `5FF6FtDUhn7XdPYmEdH5XjLAmLfmwLTCNVBgcrj3A4sstwaw`.
 - Finney, netuid 39, minimum validator stake 0 Rao.
@@ -19,8 +25,10 @@ The bridge is fixed to:
   SSH keys blocked.
 - A five-minute snapshot refresh and a maximum 900-second signed snapshot.
 
-The old guests must finish deleting and both static addresses must return to
-`RESERVED` before the provisioner proceeds.
+Both fixed UID124 VM names must be absent before either provisioner proceeds.
+Each selected static address must also be `RESERVED`. Primary-only mode neither
+creates nor updates the secondary, and it refuses if the fixed secondary name
+already exists so its one-guest plan and cost estimate remain truthful.
 
 ## Trust and secret boundary
 
@@ -63,14 +71,41 @@ metadata, a guest, a shell argument log, or a repository.
 
 ## No-write plan
 
-This command contacts neither GCP nor the chain:
+The one-machine-first plan contacts neither GCP nor the chain:
+
+```bash
+python scripts/sn39_gcp_snapshot_publisher.py plan-primary-only
+```
+
+It must list only `cathedral-sn39-uid124-fleet-primary-20260829`, static IP
+`35.222.166.235`, and an empty `fleet_candidates_beyond_self` value.
+
+The plan prints a conservative four-hour estimate of `$1.00` for the selected
+primary. This is a planning estimate, not the `$20.00` operator hard cap, and the
+script does not enforce billing limits. The estimate uses the August 30, 2026
+Iowa on-demand list prices:
+
+- C3 standard-4: `4 * $0.201608 = $0.806432`.
+- Intel TDX: `4 * (4 * $0.0033982 + 16 * $0.0004555) = $0.0835232`.
+- 20 GiB balanced persistent disk:
+  `4 * 20 * $0.000136986 = $0.01095888`.
+- One in-use external IPv4: `4 * $0.005 = $0.02`.
+
+The listed total is `$0.92091408`, rounded up to `$1.00`. It excludes network
+egress, taxes, and reserved-address time outside the four-hour VM window. Verify
+rates before execution against the official [C3 price table](https://cloud.google.com/products/compute/pricing/general-purpose),
+[Confidential VM price table](https://cloud.google.com/confidential-computing/confidential-vm/pricing),
+[disk price table](https://cloud.google.com/compute/disks-image-pricing), and
+[external IP price table](https://cloud.google.com/vpc/pricing).
+
+The retained two-machine plan is:
 
 ```bash
 python scripts/sn39_gcp_snapshot_publisher.py plan
 ```
 
-Review every fixed field. Any difference from the intended UID124 two-machine
-launch is a stop condition.
+Review every fixed field. Any difference from the selected UID124 operator mode
+is a stop condition.
 
 ## Bounded provision
 
@@ -80,7 +115,23 @@ The activation image is fixed to this reviewed, immutable reference:
 ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99
 ```
 
-After anonymous pull and provenance verification, run:
+After anonymous pull and provenance verification, run the one-machine-first
+provisioner:
+
+```bash
+python scripts/sn39_gcp_snapshot_publisher.py provision-primary-only \
+  --signing-key-file /absolute/owner-only/validator-access.seed \
+  --keys-file /absolute/public/validator-access-keys.json \
+  --image ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99 \
+  --acknowledge CREATE_ONLY_UID124_PRIMARY_TDX_GUEST_35_222_166_235_FOR_FOUR_HOURS
+```
+
+This command creates only the fixed UID124 primary. Its fleet bytes contain no
+additional endpoint. It retains the same TDX, immutable image, 20 GB disk,
+four-hour automatic deletion, VPC, TCP 8081, no-service-account, and blocked-SSH
+contract.
+
+The retained two-machine provisioner is:
 
 ```bash
 python scripts/sn39_gcp_snapshot_publisher.py provision \
@@ -90,16 +141,28 @@ python scripts/sn39_gcp_snapshot_publisher.py provision \
   --acknowledge CREATE_TWO_UID124_TDX_GUESTS_FOR_FOUR_HOURS
 ```
 
-The command refuses while either fixed VM name already exists, either static
-address remains in use, shared network policy differs, an artifact pin is
-invalid, or finalized UID30 no longer has a permit. If one create succeeds and
-the other fails, it performs no destructive rollback. The created guest still
-has its four-hour automatic deletion bound.
+Each command refuses while either fixed UID124 VM name already exists, a selected
+static address remains in use, shared network policy differs, an artifact pin is
+invalid, or finalized UID30 no longer has a permit. It ignores unrelated VM
+names. In two-machine mode, if one create succeeds and the other fails, it
+performs no destructive rollback. Every created guest retains its four-hour
+automatic deletion bound.
 
 ## Public snapshot refresh
 
-Start the refresher immediately after provisioning and keep the process in the
-foreground:
+For one-machine-first operation, start this refresher immediately after
+provisioning and keep the process in the foreground:
+
+```bash
+python scripts/sn39_gcp_snapshot_publisher.py publish-loop-primary-only \
+  --signing-key-file /absolute/owner-only/validator-access.seed \
+  --keys-file /absolute/public/validator-access-keys.json \
+  --image ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99 \
+  --acknowledge PUBLISH_PUBLIC_UID30_PERMIT_SNAPSHOT_ONLY_TO_UID124_PRIMARY_35_222_166_235
+```
+
+This mode verifies and updates only the UID124 primary. The retained two-machine
+refresher is:
 
 ```bash
 python scripts/sn39_gcp_snapshot_publisher.py publish-loop \
@@ -109,14 +172,14 @@ python scripts/sn39_gcp_snapshot_publisher.py publish-loop \
   --acknowledge PUBLISH_PUBLIC_UID30_PERMIT_SNAPSHOT_TO_TWO_GUESTS
 ```
 
-Each cycle rechecks both live instance contracts, captures one finalized chain
-view, verifies the signature locally, and updates only the public signed
-snapshot metadata value. A refused refresh is reported as structured JSON and
-the next bounded cycle retries it. The loop schedules at most 48 cycles, five
-minutes apart. It also reads both instance creation timestamps and exits with
-`INSTANCE_WINDOW_COMPLETE` before another refresh would reach the earliest
-four-hour deletion deadline. A guest polls every 15 seconds and stops its miner
-when its last accepted snapshot becomes stale.
+Each cycle rechecks every selected live instance contract, captures one finalized
+chain view, verifies the signature locally, and updates only the public signed
+snapshot metadata value on the selected instance or instances. A refused refresh
+is reported as structured JSON and the next bounded cycle retries it. The loop
+schedules at most 48 cycles, five minutes apart. It reads the selected instance
+creation timestamps and exits with `INSTANCE_WINDOW_COMPLETE` before another
+refresh would reach the earliest four-hour deletion deadline. A guest polls every
+15 seconds and stops its miner when its last accepted snapshot becomes stale.
 
 Snapshot rollback and same-height equivocation are refused durably. Both the
 metadata installer and the worker's in-process provider accept a fresh
@@ -135,8 +198,11 @@ or command-line option.
 
 ## Required live proof
 
-Provisioning success is not a fleet proof. Use validator `main` and the pinned
-QVL binary to run the exact no-write command documented in the validator repo:
+Primary-only provisioning and snapshot publication are not live compute proof.
+They establish one bounded delivery target, not the two-machine result below.
+
+For the retained two-machine path, use validator `main` and the pinned QVL binary
+to run the exact no-write command documented in the validator repo:
 
 ```bash
 cathedral-uid30-fleet-preview \

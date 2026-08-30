@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provision and refresh the bounded two-guest UID124 signed-access view.
+"""Provision and refresh a bounded UID124 signed-access operator mode.
 
 Cloud-changing modes require an exact acknowledgement. The policy has no flags
 for project, zone, VM shape, subnet, miner, stake floor, validity, interval, or
@@ -71,6 +71,15 @@ ACTIVATION_IMAGE = (
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 PROVISION_ACK = "CREATE_TWO_UID124_TDX_GUESTS_FOR_FOUR_HOURS"
 PUBLISH_ACK = "PUBLISH_PUBLIC_UID30_PERMIT_SNAPSHOT_TO_TWO_GUESTS"
+PRIMARY_ONLY_PROVISION_ACK = (
+    "CREATE_ONLY_UID124_PRIMARY_TDX_GUEST_35_222_166_235_FOR_FOUR_HOURS"
+)
+PRIMARY_ONLY_PUBLISH_ACK = (
+    "PUBLISH_PUBLIC_UID30_PERMIT_SNAPSHOT_ONLY_TO_UID124_PRIMARY_35_222_166_235"
+)
+FOUR_HOUR_COST_ESTIMATE_AS_OF = "2026-08-30"
+FOUR_HOUR_COST_ESTIMATE_PER_GUEST_USD = 1.00
+OPERATOR_HARD_CAP_USD = 20.00
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PRODUCER = REPOSITORY_ROOT / "scripts" / "cathedral_validator_access.py"
@@ -134,6 +143,26 @@ VMS = (
         fleet_endpoints=(),
     ),
 )
+
+PRIMARY_ONLY_VMS = (
+    VMPolicy(
+        name=PRIMARY_NAME,
+        address_name=PRIMARY_ADDRESS,
+        public_ip=PRIMARY_IP,
+        fleet_endpoints=(),
+    ),
+)
+
+
+def _operator_mode(vms: Sequence[VMPolicy]) -> str:
+    if not isinstance(vms, tuple):
+        raise PublisherError("guest selection must be an exact fixed tuple")
+    selected = vms
+    if selected == VMS:
+        return "two_guest"
+    if selected == PRIMARY_ONLY_VMS:
+        return "primary_only"
+    raise PublisherError("guest selection differs from a fixed operator mode")
 
 
 def _sha256(payload: bytes) -> str:
@@ -289,7 +318,10 @@ def _require_suffix(value: Any, suffix: str, *, label: str) -> None:
         raise PublisherError(f"{label} differs from the fixed policy")
 
 
-def verify_shared_infrastructure(*, addresses_must_be_reserved: bool) -> None:
+def verify_shared_infrastructure(
+    *, addresses_must_be_reserved: bool, vms: Sequence[VMPolicy] = VMS
+) -> None:
+    _operator_mode(vms)
     image = _gcloud_json(
         ["compute", "images", "describe", BASE_IMAGE, "--project", PROJECT_ID]
     )
@@ -350,7 +382,7 @@ def verify_shared_infrastructure(*, addresses_must_be_reserved: bool) -> None:
         or allowed != [{"IPProtocol": "tcp", "ports": ["8081"]}]
     ):
         raise PublisherError("launch VPC ingress is not exact TCP 8081 only")
-    for vm in VMS:
+    for vm in vms:
         address = _gcloud_json(
             [
                 "compute",
@@ -428,10 +460,16 @@ def verify_instance(document: Any, vm: VMPolicy, *, image: str) -> None:
         raise PublisherError(f"instance {vm.name} has deletion protection")
 
 
-def verify_running_instances(*, image: str) -> dict[str, Any]:
-    verify_shared_infrastructure(addresses_must_be_reserved=False)
+def verify_running_instances(
+    *, image: str, vms: Sequence[VMPolicy] = VMS
+) -> dict[str, Any]:
+    mode = _operator_mode(vms)
+    if mode == "two_guest":
+        verify_shared_infrastructure(addresses_must_be_reserved=False)
+    else:
+        verify_shared_infrastructure(addresses_must_be_reserved=False, vms=vms)
     documents: dict[str, Any] = {}
-    for vm in VMS:
+    for vm in vms:
         document = _gcloud_json(
             [
                 "compute",
@@ -463,26 +501,42 @@ def _parse_creation_timestamp(value: Any, *, vm_name: str) -> datetime:
     return created.astimezone(UTC)
 
 
-def instance_window_deadline(instances: dict[str, Any]) -> datetime:
+def instance_window_deadline(
+    instances: dict[str, Any], *, vms: Sequence[VMPolicy] = VMS
+) -> datetime:
     """Return the earliest fixed four-hour deletion deadline."""
 
-    if set(instances) != {vm.name for vm in VMS}:
-        raise PublisherError("running instance set differs from the fixed two-guest fleet")
+    mode = _operator_mode(vms)
+    if set(instances) != {vm.name for vm in vms}:
+        if mode == "two_guest":
+            raise PublisherError(
+                "running instance set differs from the fixed two-guest fleet"
+            )
+        raise PublisherError(
+            f"running instance set differs from the fixed {mode} operator mode"
+        )
     return min(
         _parse_creation_timestamp(
             instances[vm.name].get("creationTimestamp"), vm_name=vm.name
         )
         + timedelta(seconds=MAX_RUN_SECONDS)
-        for vm in VMS
+        for vm in vms
     )
 
 
-def discover_instance_window_deadline(*, image: str) -> datetime:
+def discover_instance_window_deadline(
+    *, image: str, vms: Sequence[VMPolicy] = VMS
+) -> datetime:
     """Tolerate one short read outage before entering the bounded publish loop."""
 
+    mode = _operator_mode(vms)
     for attempt in range(1, WINDOW_DISCOVERY_ATTEMPTS + 1):
         try:
-            return instance_window_deadline(verify_running_instances(image=image))
+            if mode == "two_guest":
+                return instance_window_deadline(verify_running_instances(image=image))
+            return instance_window_deadline(
+                verify_running_instances(image=image, vms=vms), vms=vms
+            )
         except PublisherError as exc:
             will_retry = attempt < WINDOW_DISCOVERY_ATTEMPTS
             print(
@@ -740,13 +794,14 @@ def _guest_tls_ready(vm: VMPolicy, context: ssl.SSLContext) -> bool:
         return False
 
 
-def wait_for_guest_tls() -> None:
-    """Require both newly created guests to expose their signed-fleet TLS worker."""
+def wait_for_guest_tls(*, vms: Sequence[VMPolicy] = VMS) -> None:
+    """Require every selected guest to expose its signed-fleet TLS worker."""
 
+    _operator_mode(vms)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
-    pending = {vm.name: vm for vm in VMS}
+    pending = {vm.name: vm for vm in vms}
     deadline = time.monotonic() + GUEST_READY_TIMEOUT_SECONDS
     while pending and time.monotonic() < deadline:
         for name, vm in list(pending.items()):
@@ -761,7 +816,10 @@ def wait_for_guest_tls() -> None:
         )
 
 
-def _desired_instances_absent() -> None:
+def _desired_instances_absent(*, vms: Sequence[VMPolicy] = VMS) -> None:
+    mode = _operator_mode(vms)
+    guarded_vms = VMS if mode == "primary_only" else vms
+    names = " ".join(vm.name for vm in guarded_vms)
     rows = _gcloud_json(
         [
             "compute",
@@ -770,19 +828,31 @@ def _desired_instances_absent() -> None:
             "--project",
             PROJECT_ID,
             "--filter",
-            f"name=({PRIMARY_NAME} {SECONDARY_NAME})",
+            f"name=({names})",
         ]
     )
     if rows:
-        raise PublisherError("one or both bounded fleet VM names already exist")
+        if mode == "two_guest":
+            raise PublisherError("one or both bounded fleet VM names already exist")
+        raise PublisherError("a fixed UID124 VM name already exists")
 
 
 def provision(
-    *, signing_key: Path, signing_key_id: str, keys_file: Path, image: str
+    *,
+    signing_key: Path,
+    signing_key_id: str,
+    keys_file: Path,
+    image: str,
+    vms: Sequence[VMPolicy] = VMS,
 ) -> None:
+    mode = _operator_mode(vms)
     pins = validate_inputs(signing_key=signing_key, keys_file=keys_file, image=image)
-    verify_shared_infrastructure(addresses_must_be_reserved=True)
-    _desired_instances_absent()
+    if mode == "two_guest":
+        verify_shared_infrastructure(addresses_must_be_reserved=True)
+        _desired_instances_absent()
+    else:
+        verify_shared_infrastructure(addresses_must_be_reserved=True, vms=vms)
+        _desired_instances_absent(vms=vms)
     with tempfile.TemporaryDirectory(prefix="cathedral-sn39-provision-") as temporary:
         root = Path(temporary)
         snapshot = root / "validator-access.json"
@@ -793,7 +863,7 @@ def provision(
             output=snapshot,
         )
         completed: list[str] = []
-        for vm in VMS:
+        for vm in vms:
             fleet = root / f"{vm.name}-fleet.json"
             fleet.write_bytes(fleet_bytes(vm))
             command = create_instance_command(
@@ -814,8 +884,12 @@ def provision(
                 ) from exc
             completed.append(f"created instance {vm.name}")
     try:
-        verify_running_instances(image=image)
-        wait_for_guest_tls()
+        if mode == "two_guest":
+            verify_running_instances(image=image)
+            wait_for_guest_tls()
+        else:
+            verify_running_instances(image=image, vms=vms)
+            wait_for_guest_tls(vms=vms)
     except PublisherError as exc:
         raise PublisherError(
             str(exc), completed_cloud_writes=completed
@@ -850,8 +924,14 @@ def publish_once(
     keys_file: Path,
     snapshot: Path,
     image: str,
+    vms: Sequence[VMPolicy] = VMS,
 ) -> None:
-    instances = verify_running_instances(image=image)
+    mode = _operator_mode(vms)
+    instances = (
+        verify_running_instances(image=image)
+        if mode == "two_guest"
+        else verify_running_instances(image=image, vms=vms)
+    )
     capture_snapshot(
         signing_key=signing_key,
         signing_key_id=signing_key_id,
@@ -859,7 +939,7 @@ def publish_once(
         output=snapshot,
     )
     completed: list[str] = []
-    for vm in VMS:
+    for vm in vms:
         try:
             command = snapshot_update_command(
                 vm, snapshot, instance=instances[vm.name]
@@ -880,10 +960,20 @@ def publish_once(
 
 
 def publish_loop(
-    *, signing_key: Path, signing_key_id: str, keys_file: Path, image: str
+    *,
+    signing_key: Path,
+    signing_key_id: str,
+    keys_file: Path,
+    image: str,
+    vms: Sequence[VMPolicy] = VMS,
 ) -> None:
+    mode = _operator_mode(vms)
     validate_inputs(signing_key=signing_key, keys_file=keys_file, image=image)
-    deadline = discover_instance_window_deadline(image=image)
+    deadline = (
+        discover_instance_window_deadline(image=image)
+        if mode == "two_guest"
+        else discover_instance_window_deadline(image=image, vms=vms)
+    )
     consecutive_failures = 0
     with tempfile.TemporaryDirectory(prefix="cathedral-sn39-snapshot-") as temporary:
         snapshot = Path(temporary) / "validator-access.json"
@@ -905,13 +995,17 @@ def publish_loop(
 
             refusal: PublisherError | None = None
             try:
-                publish_once(
-                    signing_key=signing_key,
-                    signing_key_id=signing_key_id,
-                    keys_file=keys_file,
-                    snapshot=snapshot,
-                    image=image,
-                )
+                publish_arguments = {
+                    "signing_key": signing_key,
+                    "signing_key_id": signing_key_id,
+                    "keys_file": keys_file,
+                    "snapshot": snapshot,
+                    "image": image,
+                }
+                if mode == "two_guest":
+                    publish_once(**publish_arguments)
+                else:
+                    publish_once(**publish_arguments, vms=vms)
             except PublisherError as exc:
                 consecutive_failures += 1
                 refusal = exc
@@ -948,7 +1042,7 @@ def publish_loop(
                             "status": "PUBLISHED",
                             "cycle": cycle + 1,
                             "of": SNAPSHOT_REFRESH_CYCLES,
-                            "published_to": [vm.name for vm in VMS],
+                            "published_to": [vm.name for vm in vms],
                             "valid_seconds": SNAPSHOT_VALID_SECONDS,
                             "instance_window_deadline": deadline.strftime(
                                 "%Y-%m-%dT%H:%M:%SZ"
@@ -981,9 +1075,34 @@ def publish_loop(
             time.sleep(retry_seconds)
 
 
-def plan_document() -> dict[str, Any]:
+def plan_document(*, vms: Sequence[VMPolicy] = VMS) -> dict[str, Any]:
+    mode = _operator_mode(vms)
     return {
         "cloud_writes": False,
+        "operator_mode": mode,
+        "cost_estimate": {
+            "as_of": FOUR_HOUR_COST_ESTIMATE_AS_OF,
+            "currency": "USD",
+            "kind": "conservative_planning_estimate_not_a_spend_cap",
+            "per_selected_guest_four_hours_usd": FOUR_HOUR_COST_ESTIMATE_PER_GUEST_USD,
+            "selected_guest_count": len(vms),
+            "selected_guests_four_hours_usd": (
+                FOUR_HOUR_COST_ESTIMATE_PER_GUEST_USD * len(vms)
+            ),
+            "includes": [
+                "on_demand_c3_standard_4",
+                "intel_tdx_surcharge",
+                "20_gib_pd_balanced_boot_disk",
+                "in_use_external_ipv4",
+            ],
+            "excludes": [
+                "network_egress",
+                "taxes",
+                "reserved_address_time_outside_the_vm_window",
+            ],
+            "operator_hard_cap_usd": OPERATOR_HARD_CAP_USD,
+            "operator_hard_cap_enforced_by_script": False,
+        },
         "project": PROJECT_ID,
         "zone": ZONE,
         "network": NETWORK,
@@ -1018,7 +1137,7 @@ def plan_document() -> dict[str, Any]:
                 "public_endpoint": vm.public_endpoint,
                 "fleet_candidates_beyond_self": list(vm.fleet_endpoints),
             }
-            for vm in VMS
+            for vm in vms
         ],
         "guest_secrets": [],
         "guest_wallet": False,
@@ -1039,16 +1158,31 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("plan", help="print the fixed no-write policy")
+    commands.add_parser(
+        "plan-primary-only", help="print the fixed no-write UID124 primary policy"
+    )
     provision_parser = commands.add_parser(
         "provision", help="create exactly two bounded TDX guests"
     )
     _add_artifact_arguments(provision_parser)
     provision_parser.add_argument("--acknowledge", required=True)
+    primary_provision_parser = commands.add_parser(
+        "provision-primary-only",
+        help="create only the bounded UID124 primary TDX guest",
+    )
+    _add_artifact_arguments(primary_provision_parser)
+    primary_provision_parser.add_argument("--acknowledge", required=True)
     publish_parser = commands.add_parser(
         "publish-loop", help="refresh public signed snapshots every five minutes"
     )
     _add_artifact_arguments(publish_parser)
     publish_parser.add_argument("--acknowledge", required=True)
+    primary_publish_parser = commands.add_parser(
+        "publish-loop-primary-only",
+        help="refresh public signed snapshots only on the UID124 primary",
+    )
+    _add_artifact_arguments(primary_publish_parser)
+    primary_publish_parser.add_argument("--acknowledge", required=True)
     return parser
 
 
@@ -1058,24 +1192,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         if options.command == "plan":
             print(json.dumps(plan_document(), indent=2, sort_keys=True))
             return 0
-        if options.command == "provision":
-            if options.acknowledge != PROVISION_ACK:
-                raise PublisherError("provision acknowledgement does not match")
-            provision(
-                signing_key=options.signing_key_file,
-                signing_key_id=options.signing_key_id,
-                keys_file=options.keys_file,
-                image=options.image,
+        if options.command == "plan-primary-only":
+            print(
+                json.dumps(
+                    plan_document(vms=PRIMARY_ONLY_VMS), indent=2, sort_keys=True
+                )
             )
             return 0
-        if options.acknowledge != PUBLISH_ACK:
+        if options.command in {"provision", "provision-primary-only"}:
+            primary_only = options.command == "provision-primary-only"
+            expected_ack = PRIMARY_ONLY_PROVISION_ACK if primary_only else PROVISION_ACK
+            if options.acknowledge != expected_ack:
+                raise PublisherError("provision acknowledgement does not match")
+            provision_arguments = {
+                "signing_key": options.signing_key_file,
+                "signing_key_id": options.signing_key_id,
+                "keys_file": options.keys_file,
+                "image": options.image,
+            }
+            if primary_only:
+                provision(**provision_arguments, vms=PRIMARY_ONLY_VMS)
+            else:
+                provision(**provision_arguments)
+            return 0
+        primary_only = options.command == "publish-loop-primary-only"
+        expected_ack = PRIMARY_ONLY_PUBLISH_ACK if primary_only else PUBLISH_ACK
+        if options.acknowledge != expected_ack:
             raise PublisherError("publisher acknowledgement does not match")
-        publish_loop(
-            signing_key=options.signing_key_file,
-            signing_key_id=options.signing_key_id,
-            keys_file=options.keys_file,
-            image=options.image,
-        )
+        publish_arguments = {
+            "signing_key": options.signing_key_file,
+            "signing_key_id": options.signing_key_id,
+            "keys_file": options.keys_file,
+            "image": options.image,
+        }
+        if primary_only:
+            publish_loop(**publish_arguments, vms=PRIMARY_ONLY_VMS)
+        else:
+            publish_loop(**publish_arguments)
         return 0
     except PublisherError as exc:
         completed = list(exc.completed_cloud_writes)
