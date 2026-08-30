@@ -54,6 +54,7 @@ def test_current_operator_docs_exclude_retired_launch_paths() -> None:
         "README.md",
         "MINING.md",
         "docs/README.md",
+        "docs/DESIGN.md",
         "docs/SN39_AUDIT_MINER_IMAGE.md",
         "docs/SN39_AUDIT_MINER_OPERATIONS.md",
         "docs/WORK_REQUEST_V2.md",
@@ -77,6 +78,8 @@ def test_current_operator_docs_exclude_retired_launch_paths() -> None:
         "matching validator release",
         "separate cathedral validator releases a pin",
         "exact snp admission policy are published",
+        "released snp policy",
+        "released snp admission policy",
     ):
         assert retired not in normalized, retired
 

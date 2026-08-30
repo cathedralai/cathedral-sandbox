@@ -37,7 +37,7 @@ guarantee TAO. The subnet must have positive emission.
 |---|---|---|
 | Intel TDX on Linux | Mainnet live testing | Eligible after fresh TDX and SAT verification |
 | More Intel TDX machines on one UID | Mainnet live testing | Each distinct verified machine adds to that UID's score |
-| AMD SEV-SNP on Linux | Validator path merged, live hardware policy pending | Eligible after that validator's SNP policy admits fresh evidence and SAT |
+| AMD SEV-SNP on Linux | Validator path merged, live hardware policy pending | Eligible after that validator's policy admits the measurement and TCB, then fresh evidence and SAT pass |
 
 The current direct validator source supports Intel TDX and AMD SEV-SNP. Each
 validator owns its SNP measurement and TCB allowlist. An AMD machine earns zero
@@ -134,8 +134,8 @@ the machine's live measurement and TCB, and verifies fresh evidence and SAT.
 
 AMD SEV-SNP uses its own fixed image and launcher. It needs native
 `/dev/sev-guest`, not ordinary AMD SEV or a vTPM. The validator will count it
-only after its released SNP policy admits the exact measurement and TCB, then
-verifies fresh HTTPS-bound evidence and canonical SAT. Follow
+only after its configured owner-controlled SNP policy admits the exact
+measurement and TCB, then verifies fresh HTTPS-bound evidence and canonical SAT. Follow
 [AMD SEV-SNP miner](docs/AMD_SEV_SNP_FRIEND_TEST.md). The published image pin
 does not prove that a specific SNP host is online or receiving weight.
 
