@@ -37,12 +37,13 @@ guarantee TAO. The subnet must have positive emission.
 |---|---|---|
 | Intel TDX on Linux | Mainnet live testing | Eligible after fresh TDX and SAT verification |
 | More Intel TDX machines on one UID | Mainnet live testing | Each distinct verified machine adds to that UID's score |
-| AMD SEV-SNP on Linux | Source-ready, validator release pending | Eligible only after a released validator pins this contract and its SNP policy admits fresh evidence and SAT |
+| AMD SEV-SNP on Linux | Validator path merged, live hardware policy pending | Eligible after that validator's policy admits the measurement and TCB, then fresh evidence and SAT pass |
 
-The current mainnet validator release supports Intel TDX. The SNP miner surface
-in this repository is source-ready. It does not become weight-eligible until a
-Cathedral validator release pins this exact contract and publishes its SNP
-policy.
+The current direct validator source supports Intel TDX and AMD SEV-SNP. Each
+validator owns its SNP measurement and TCB allowlist. An AMD machine earns zero
+from that validator until its live hardware run is admitted by the policy and
+fresh evidence and SAT pass. UID30's first live AMD policy still waits for the
+friend-hardware run.
 
 For AMD, the validator proves an admitted guest measurement, distinct hardware,
 the live HTTPS key, and returned SAT work. It does not remotely attest the OCI
@@ -125,15 +126,16 @@ test "$(docker image inspect "$SNP_IMAGE" --format \
 
 These checks prove only the pinned Intel and AMD image metadata in the local
 Docker store. They do not start a worker or prove TDX or SEV-SNP. The published
-SNP image remains source-ready and not weight-eligible until a matching
-validator release pins its contract and policy.
+image digest does not receive weight. A machine started from the SNP image
+contributes to its UID only when a validator runs the matching contract, admits
+the machine's live measurement and TCB, and verifies fresh evidence and SAT.
 
 ## Run one AMD SEV-SNP machine
 
 AMD SEV-SNP uses its own fixed image and launcher. It needs native
 `/dev/sev-guest`, not ordinary AMD SEV or a vTPM. The validator will count it
-only after its released SNP policy admits the exact measurement and TCB, then
-verifies fresh HTTPS-bound evidence and canonical SAT. Follow
+only after its configured owner-controlled SNP policy admits the exact
+measurement and TCB, then verifies fresh HTTPS-bound evidence and canonical SAT. Follow
 [AMD SEV-SNP miner](docs/AMD_SEV_SNP_FRIEND_TEST.md). The published image pin
 does not prove that a specific SNP host is online or receiving weight.
 
@@ -394,12 +396,12 @@ zero for the round.
 
 ## AMD SEV-SNP
 
-AMD SEV-SNP is a source-ready scored path. It becomes production-eligible only
-after a released validator pins this exact contract and its policy admits the
-observed measurement and TCB. Start with the hardware proof in
+AMD SEV-SNP is a scored path in the current direct validator source. Each
+validator owns its measurement and TCB policy. Start with the hardware proof in
 [AMD SEV-SNP miner](docs/AMD_SEV_SNP_FRIEND_TEST.md). Do not register or
-announce the hotkey until the matching validator release exists and both local
-and validator evidence pass. Neither result proves a finalized weight row.
+announce the hotkey until the local proof passes and the validators you expect
+to score the machine confirm their policies admit the observed measurement and
+TCB. Registration and admission do not prove a finalized weight row.
 
 ## Reference
 

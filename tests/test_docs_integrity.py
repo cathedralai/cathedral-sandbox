@@ -32,7 +32,7 @@ def test_readme_is_the_single_current_mining_guide() -> None:
         "each distinct verified machine",
         "Intel TDX",
         "AMD SEV-SNP",
-        "Source-ready, validator release pending",
+        "Validator path merged, live hardware policy pending",
         "c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99",
         "0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255",
         "current migration bridge",
@@ -54,6 +54,7 @@ def test_current_operator_docs_exclude_retired_launch_paths() -> None:
         "README.md",
         "MINING.md",
         "docs/README.md",
+        "docs/DESIGN.md",
         "docs/SN39_AUDIT_MINER_IMAGE.md",
         "docs/SN39_AUDIT_MINER_OPERATIONS.md",
         "docs/WORK_REQUEST_V2.md",
@@ -72,6 +73,15 @@ def test_current_operator_docs_exclude_retired_launch_paths() -> None:
         "validated_supply_v2",
         "uid124",
         "/v1/enroll",
+        "source-ready scored path",
+        "source-ready sn39 cpu path",
+        "matching validator release",
+        "separate cathedral validator releases a pin",
+        "exact snp admission policy are published",
+        "released snp policy",
+        "released snp admission policy",
+        "released validator policy",
+        "released measurement and tcb policy",
     ):
         assert retired not in normalized, retired
 

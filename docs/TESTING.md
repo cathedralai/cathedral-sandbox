@@ -84,7 +84,8 @@ CATHEDRAL_RUN_SNP_HW=1 \
 Follow [AMD_SEV_SNP_FRIEND_TEST.md](AMD_SEV_SNP_FRIEND_TEST.md) for the bounded
 probe and evidence capture. Passing this test does not prove the end-to-end
 validator path, a registered miner, or a finalized weight row. Production
-weight also requires the validator's released SNP admission policy.
+weight also requires the scoring validator's owner-controlled policy to admit
+the measurement and TCB, followed by fresh evidence and SAT verification.
 
 ## Installed commands
 

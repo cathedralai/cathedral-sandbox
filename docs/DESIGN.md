@@ -11,9 +11,9 @@ or burn mechanism.
 ## 3. Hardware profiles
 
 Intel TDX and AMD SEV-SNP are confidential CPU profiles. The direct validator
-counts an SNP machine only after its released SNP policy accepts the exact
-measurement and TCB, then fresh evidence, TLS binding, and SAT pass. This code
-map does not define a GPU mining path.
+counts an SNP machine only after its owner-controlled policy accepts the exact
+measurement and TCB, then fresh evidence, TLS binding, and SAT pass. This code map
+does not define a GPU mining path.
 
 ## 4. Work lane
 
