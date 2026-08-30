@@ -4,7 +4,7 @@
 
 **Racing to build the fastest sandbox fleet on earth**
 
-**With machines that prove what they run**
+**With machines that prove their hardware and work**
 
 [cathedral.computer](https://cathedral.computer/) · [Run a validator](https://github.com/cathedralai/cathedral-validator)
 
@@ -19,7 +19,7 @@ does not download weights from Cathedral and it does not use a weight relay.
 For each UID, the validator:
 
 1. reads the miner's on-chain HTTPS endpoint;
-2. verifies fresh Intel TDX evidence and the live TLS key for that machine;
+2. verifies fresh evidence and the live TLS key for a CPU path enabled in that validator release;
 3. reads its fleet list through the verified channel;
 4. verifies fresh evidence and the live TLS key for each added machine;
 5. zeroes every claimant involved in a duplicate endpoint, hardware identity,
@@ -37,12 +37,26 @@ guarantee TAO. The subnet must have positive emission.
 |---|---|---|
 | Intel TDX on Linux | Mainnet live testing | Eligible after fresh TDX and SAT verification |
 | More Intel TDX machines on one UID | Mainnet live testing | Each distinct verified machine adds to that UID's score |
-| AMD SEV-SNP | Friend hardware test | No production score or weight |
-| Confidential GPU | Development reference | No production score or weight |
+| AMD SEV-SNP on Linux | Source-ready, validator release pending | Eligible only after a released validator pins this contract and its SNP policy admits fresh evidence and SAT |
+
+The current mainnet validator release supports Intel TDX. The SNP miner surface
+in this repository is source-ready. It does not become weight-eligible until a
+Cathedral validator release pins this exact contract and publishes its SNP
+policy.
+
+For AMD, the validator proves an admitted guest measurement, distinct hardware,
+the live HTTPS key, and returned SAT work. It does not remotely attest the OCI
+image digest or continuous runtime integrity after boot.
+
+This repository serves SNP evidence and SAT work. The separate
+[Cathedral validator](https://github.com/cathedralai/cathedral-validator)
+performs the deadline-bounded verification and scoring. The retained legacy
+runtime in this repository is not the SN39 weight-writing path.
 
 ## What you need
 
-- A Linux Intel TDX confidential VM with `/sys/kernel/config/tsm/report`.
+- A Linux Intel TDX confidential VM with `/sys/kernel/config/tsm/report`, or an
+  AMD SEV-SNP guest with `/dev/sev-guest`.
 - Git, Python 3.12 with `venv`, Docker, `nft`, and `curl` inside the guest.
 - A public IPv4 address with TCP `8081` open.
 - One public Bittensor hotkey which you will register on Finney SN39 only after
@@ -53,7 +67,19 @@ guarantee TAO. The subnet must have positive emission.
   validator-permit hotkeys. It also needs Git and Python 3.12 with `venv`.
 
 Keep the coldkey and wallet off every worker. The worker needs only its public
-hotkey. Each machine creates its own TLS private key inside its TDX guest.
+hotkey. Each machine creates its own TLS private key inside its confidential guest.
+
+## Run one AMD SEV-SNP machine
+
+AMD SEV-SNP uses its own fixed image and launcher. It needs native
+`/dev/sev-guest`, not ordinary AMD SEV or a vTPM. The validator will count it
+only after its released SNP policy admits the exact measurement and TCB, then
+verifies fresh HTTPS-bound evidence and canonical SAT. Follow
+[AMD SEV-SNP miner](docs/AMD_SEV_SNP_FRIEND_TEST.md). No current document or
+image pin proves that a specific SNP host is online or receiving weight.
+
+The launcher checks the immutable image locally. That image digest is not a
+field in the remote SNP report.
 
 ## Run one Intel TDX machine
 
@@ -309,9 +335,12 @@ zero for the round.
 
 ## AMD SEV-SNP
 
-AMD support is enabled for bounded development testing, not production
-scoring. Use [the friend hardware test](docs/AMD_SEV_SNP_FRIEND_TEST.md). Do
-not register, announce, or promise weight from that result.
+AMD SEV-SNP is a source-ready scored path. It becomes production-eligible only
+after a released validator pins this exact contract and its policy admits the
+observed measurement and TCB. Start with the hardware proof in
+[AMD SEV-SNP miner](docs/AMD_SEV_SNP_FRIEND_TEST.md). Do not register or
+announce the hotkey until the matching validator release exists and both local
+and validator evidence pass. Neither result proves a finalized weight row.
 
 ## Reference
 

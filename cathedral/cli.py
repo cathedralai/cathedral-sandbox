@@ -46,7 +46,7 @@ from cathedral.admission_policy import (
     verify_admission_policy,
 )
 from cathedral.assurance import AssuranceDimension
-from cathedral.attest import collect_snp, collect_tdx_gpu
+from cathedral.attest import collect_snp, collect_snp_report_only, collect_tdx_gpu
 from cathedral.channel import ChannelBindingError, tls_spki_binding
 from cathedral.coldkey_allowlist import (
     DEFAULT_ALLOWLIST_MAX_AGE_SECONDS,
@@ -1263,8 +1263,10 @@ def _run_json(run: EpochRun) -> dict[str, object]:
 
 def cmd_worker_serve(args: argparse.Namespace) -> int:
     posture = getattr(args, "worker_posture", "production")
-    if posture not in {"production", "development", "migration"}:
-        raise ValueError("worker posture must be production, development, or migration")
+    if posture not in {"production", "snp-production", "development", "migration"}:
+        raise ValueError(
+            "worker posture must be production, SNP production, development, or migration"
+        )
     tee = getattr(args, "tee", "tdx")
     development_no_auth = bool(getattr(args, "development_no_auth", False))
     development_allow_non_loopback = bool(
@@ -1291,6 +1293,19 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             raise ValueError(
                 "production worker posture is fixed to authenticated TDX without "
                 "development, GPU-preview, or migration options"
+            )
+    elif posture == "snp-production":
+        if (
+            tee != "snp"
+            or development_no_auth
+            or development_allow_non_loopback
+            or gpu_composite
+            or allow_customer_sat
+            or migration_mode is not None
+        ):
+            raise ValueError(
+                "SNP production worker posture is fixed to authenticated AMD SEV-SNP "
+                "without development, customer-SAT, GPU-preview, or migration options"
             )
     elif posture == "development":
         if migration_mode is not None:
@@ -1340,6 +1355,10 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             "AMD SEV-SNP development evidence cannot use public compatibility modes"
         )
     signed_access_configured = all(value is not None for value in access_values)
+    if posture == "snp-production" and not signed_access_configured:
+        raise ValueError(
+            "SNP production requires the complete signed validator-access configuration"
+        )
     if tee == "snp" and not is_loopback and not signed_access_configured:
         raise ValueError(
             "a non-loopback AMD SEV-SNP worker requires signed validator access; "
@@ -1501,13 +1520,16 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
                 worker_hotkey=args.hotkey,
                 public_endpoint=public_endpoint,
             )
-    # Select the development evidence collector. Production and migration are
-    # fixed to TDX before this point; SNP and GPU composition exist only on the
-    # explicit development command surface.
+    # The two production entrypoints select a fixed evidence class before this
+    # point. The development command remains the only selectable surface.
     if gpu_composite and tee != "tdx":
         raise ValueError("--gpu-composite collects TDX+GPU and cannot combine with --tee snp")
     if tee == "snp":
-        evidence_collector = collect_snp
+        evidence_collector = (
+            collect_snp_report_only
+            if posture == "snp-production"
+            else collect_snp
+        )
     elif gpu_composite:
         evidence_collector = collect_tdx_gpu
     else:
@@ -1537,7 +1559,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
                     "port": server.port,
                     "hotkey": args.hotkey,
                     "tee": tee,
-                    "amd_snp_development_only": tee == "snp",
+                    "amd_snp_development_only": tee == "snp" and posture == "development",
                     "tls": tls_context is not None,
                     "bearer_auth_configured": token is not None,
                     "channel_binding_configured": channel_binding is not None,
@@ -4294,6 +4316,25 @@ def build_parser() -> argparse.ArgumentParser:
         development_no_auth=False,
         development_allow_non_loopback=False,
         gpu_composite=False,
+        migration_mode=None,
+        allow_public_bootstrap_evidence=False,
+        allow_public_legacy_audit=False,
+    )
+
+    p_serve_snp = worker_sub.add_parser(
+        "serve-snp",
+        help="serve the authenticated production AMD SEV-SNP worker posture",
+    )
+    add_worker_base(p_serve_snp)
+    add_worker_signed_access(p_serve_snp)
+    p_serve_snp.set_defaults(
+        func=cmd_worker_serve,
+        worker_posture="snp-production",
+        tee="snp",
+        development_no_auth=False,
+        development_allow_non_loopback=False,
+        gpu_composite=False,
+        allow_customer_sat=False,
         migration_mode=None,
         allow_public_bootstrap_evidence=False,
         allow_public_legacy_audit=False,

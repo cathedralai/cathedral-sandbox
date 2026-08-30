@@ -3,8 +3,9 @@
 Each collector produces an `Evidence` with the validator's challenge bound into
 REPORT_DATA. Vendors do the crypto; we orchestrate. See docs/DESIGN.md §6.
 
-Development requires real hardware. Current scored CPU support is Intel TDX;
-SNP is friend testing and GPU-CC remains outside production scoring.
+Real attestation requires matching hardware. Current scored CPU support is
+Intel TDX and policy-admitted AMD SEV-SNP. GPU-CC remains outside production
+scoring.
 """
 
 from __future__ import annotations
@@ -95,6 +96,50 @@ def collect_snp(
     Must run inside an SEV-SNP guest (needs ``/dev/sev-guest``). Uses ``snpguest``
     (github.com/virtee/snpguest); override the binary with ``CATHEDRAL_SNPGUEST``.
     """
+    return _collect_snp_evidence(
+        nonce,
+        hotkey,
+        ssh_host_key,
+        channel_binding=channel_binding,
+        report_data_version=report_data_version,
+        include_cert_chain=True,
+    )
+
+
+def collect_snp_report_only(
+    nonce: bytes,
+    hotkey: str,
+    ssh_host_key: bytes | None = None,
+    *,
+    channel_binding: ChannelBinding | None = None,
+    report_data_version: int = 1,
+) -> Evidence:
+    """Collect the bounded SNP report used by the production SN39 worker.
+
+    The validator independently obtains and verifies AMD collateral. Keeping
+    KDS access out of the request path prevents a miner-side network fetch from
+    consuming the validator's response deadline or becoming a serving
+    dependency.
+    """
+    return _collect_snp_evidence(
+        nonce,
+        hotkey,
+        ssh_host_key,
+        channel_binding=channel_binding,
+        report_data_version=report_data_version,
+        include_cert_chain=False,
+    )
+
+
+def _collect_snp_evidence(
+    nonce: bytes,
+    hotkey: str,
+    ssh_host_key: bytes | None,
+    *,
+    channel_binding: ChannelBinding | None,
+    report_data_version: int,
+    include_cert_chain: bool,
+) -> Evidence:
     if report_data_version == 2:
         if channel_binding is None:
             raise ValueError("report data v2 requires a channel binding")
@@ -104,7 +149,11 @@ def collect_snp(
     else:
         raise ValueError("unsupported report data version")
     dev = Path(os.environ.get("CATHEDRAL_SEV_GUEST_DEV", _DEFAULT_SEV_GUEST_DEV))
-    quote, cert_chain = _collect_snpguest_report(rd, dev=dev)
+    quote, cert_chain = _collect_snpguest_report(
+        rd,
+        dev=dev,
+        include_cert_chain=include_cert_chain,
+    )
     return Evidence(
         kind=EvidenceKind.SEV_SNP,
         quote=quote,
@@ -132,7 +181,12 @@ def _resolve_snpguest() -> str:
     return found
 
 
-def _collect_snpguest_report(report_data_bytes: bytes, *, dev: Path) -> tuple[bytes, list[bytes]]:
+def _collect_snpguest_report(
+    report_data_bytes: bytes,
+    *,
+    dev: Path,
+    include_cert_chain: bool = True,
+) -> tuple[bytes, list[bytes]]:
     """Request one SEV-SNP report via ``snpguest`` and best-effort VCEK/CA chain.
 
     ``report_data_bytes`` (<=64 bytes) is written to a request file and becomes
@@ -171,7 +225,12 @@ def _collect_snpguest_report(report_data_bytes: bytes, *, dev: Path) -> tuple[by
         quote = report_path.read_bytes()
         if len(quote) != _SNP_REPORT_SIZE:
             raise RuntimeError(f"snpguest returned {len(quote)} bytes, expected {_SNP_REPORT_SIZE}")
-        return quote, _fetch_snp_cert_chain(snpguest, report_path, work)
+        cert_chain = (
+            _fetch_snp_cert_chain(snpguest, report_path, work)
+            if include_cert_chain
+            else []
+        )
+        return quote, cert_chain
 
 
 def _fetch_snp_cert_chain(snpguest: str, report_path: Path, work: Path) -> list[bytes]:
@@ -187,20 +246,15 @@ def _fetch_snp_cert_chain(snpguest: str, report_path: Path, work: Path) -> list[
             text=True,
             timeout=timeout,
         )
-        # `fetch ca` argument order varies across snpguest versions; try the known
-        # forms. Both derive the CA generation (Milan / Genoa / Turin) from the
-        # report itself — no hardcoded product guess, which would fetch the wrong
-        # CA on non-Milan parts.
-        for cmd in (
+        # Exact pinned snpguest v0.10.0 interface. Derive the processor generation
+        # from the report rather than guessing Milan on newer hosts.
+        subprocess.run(
             [snpguest, "fetch", "ca", "DER", str(certs), "--report", str(report_path)],
-            [snpguest, "fetch", "ca", "--report", str(report_path), "DER", str(certs)],
-            [snpguest, "fetch", "ca", "DER", str(certs), str(report_path)],
-        ):
-            try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
-                break
-            except subprocess.CalledProcessError:
-                continue
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return []
     return [

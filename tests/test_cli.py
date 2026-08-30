@@ -41,7 +41,7 @@ from cathedral.gpu import (
     GpuDeviceClaim,
     GpuIdentityRegistry,
 )
-from cathedral.attest import collect_snp
+from cathedral.attest import collect_snp, collect_snp_report_only
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.runtime import MinerOutcome, RuntimeConfig
 from cathedral.worker import WorkerServer
@@ -1118,6 +1118,47 @@ def test_worker_serve_defaults_to_loopback():
     assert args.tee == "tdx"
 
 
+def test_worker_serve_snp_is_a_fixed_production_posture():
+    args = build_parser().parse_args(["worker", "serve-snp", "--hotkey", "miner"])
+
+    assert args.worker_posture == "snp-production"
+    assert args.tee == "snp"
+    assert args.allow_customer_sat is False
+    assert args.development_no_auth is False
+    assert args.development_allow_non_loopback is False
+    assert args.gpu_composite is False
+    assert args.migration_mode is None
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--tee", "tdx"),
+        ("--development-no-auth", None),
+        ("--development-allow-non-loopback", None),
+        ("--allow-customer-sat", None),
+        ("--gpu-composite", None),
+        ("--migration-mode", "public-legacy-audit"),
+    ],
+)
+def test_worker_serve_snp_parser_has_no_selectable_mode_or_compatibility_flags(
+    flag: str,
+    value: str | None,
+) -> None:
+    argv = ["worker", "serve-snp", "--hotkey", "miner", flag]
+    if value is not None:
+        argv.append(value)
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(argv)
+
+
+def test_worker_serve_snp_requires_complete_signed_access_before_serving() -> None:
+    args = build_parser().parse_args(["worker", "serve-snp", "--hotkey", "miner"])
+
+    with pytest.raises(ValueError, match="complete signed validator-access"):
+        cmd_worker_serve(args)
+
+
 @pytest.mark.parametrize(
     ("flag", "value"),
     [
@@ -1469,6 +1510,80 @@ def test_worker_tee_snp_selects_snp_collector(monkeypatch):
     )
     assert cmd_worker_serve(args) == 0
     assert calls[0]["evidence_collector"] is collect_snp
+
+
+def test_worker_serve_snp_selects_snp_collector_with_signed_access(
+    tmp_path: Path, monkeypatch
+):
+    calls = []
+    certificate, private_key = _tls_material(tmp_path)
+
+    class FakeProvider:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def load(self, *, now):
+            return object()
+
+    class FakeAuthorizer:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class FakeServer:
+        host = "0.0.0.0"
+        port = 8081
+
+        def __init__(self, *_args, **kwargs):
+            calls.append(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def serve_forever(self):
+            return None
+
+    monkeypatch.setattr("cathedral.cli.load_policy_keys", lambda *_args, **_kwargs: {"k": b"p" * 32})
+    monkeypatch.setattr("cathedral.cli.ValidatorAccessState", lambda _path: object())
+    monkeypatch.setattr("cathedral.cli.SignedValidatorSnapshotProvider", FakeProvider)
+    monkeypatch.setattr("cathedral.cli.load_sr25519_verifier", lambda: object())
+    monkeypatch.setattr("cathedral.cli.preflight_sr25519_verifier", lambda _verifier: None)
+    monkeypatch.setattr("cathedral.cli.ValidatorRequestAuthorizer", FakeAuthorizer)
+    monkeypatch.setattr("cathedral.cli.singleton_fleet", lambda *, public_endpoint: (public_endpoint,))
+    monkeypatch.setattr("cathedral.cli.WorkerServer", FakeServer)
+    args = build_parser().parse_args(
+        [
+            "worker",
+            "serve-snp",
+            "--hotkey",
+            "miner",
+            "--host",
+            "0.0.0.0",
+            "--tls-certificate",
+            str(certificate),
+            "--tls-private-key",
+            str(private_key),
+            "--validator-access-snapshot",
+            "/srv/cathedral/validator-access.json",
+            "--validator-access-keys",
+            "/srv/cathedral/keys.json",
+            "--validator-access-keys-digest",
+            "sha256:" + "cd" * 32,
+            "--validator-access-state",
+            "/var/lib/cathedral/validator-access.sqlite",
+            "--validator-minimum-stake-rao",
+            "1000",
+            "--public-endpoint",
+            "https://8.8.8.8:8081",
+        ]
+    )
+
+    assert cmd_worker_serve(args) == 0
+    assert calls[0]["evidence_collector"] is collect_snp_report_only
+    assert calls[0]["validator_authorizer"].__class__ is FakeAuthorizer
+    assert calls[0]["allow_public_legacy_audit"] is False
 
 
 def test_worker_default_tee_leaves_collector_unset(monkeypatch):

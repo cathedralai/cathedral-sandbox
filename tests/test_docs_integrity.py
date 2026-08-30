@@ -32,7 +32,7 @@ def test_readme_is_the_single_current_mining_guide() -> None:
         "each distinct verified machine",
         "Intel TDX",
         "AMD SEV-SNP",
-        "Friend hardware test",
+        "Source-ready, validator release pending",
         "c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99",
         "current migration bridge",
         "btcli axon set",
@@ -59,6 +59,7 @@ def test_current_operator_docs_exclude_retired_launch_paths() -> None:
         "docs/TDX_LAUNCH.md",
         "docs/TDX_VERIFIER_RELEASE.md",
         "docs/AMD_SEV_SNP_FRIEND_TEST.md",
+        "docs/SN39_SNP_MINER_IMAGE.md",
         "docs/TESTING.md",
     )
     text = "\n".join((REPO_ROOT / path).read_text() for path in current_paths)
@@ -128,9 +129,21 @@ def test_public_repo_has_no_invite_only_miner_form() -> None:
 def test_amd_friend_test_never_runs_the_checkout_or_download_as_root() -> None:
     guide = (REPO_ROOT / "docs" / "AMD_SEV_SNP_FRIEND_TEST.md").read_text()
 
-    assert "sudo" not in guide
+    assert "sudo .venv" not in guide
+    assert 'sudo "$SNP_GUEST_DOWNLOAD"' not in guide
+    assert "sudo git" not in guide
     assert 'CATHEDRAL_SNPGUEST="$SNP_GUEST_DOWNLOAD"' in guide
     assert "test -r /dev/sev-guest -a -w /dev/sev-guest" in guide
+    assert 'org.opencontainers.image.revision' in guide
+    assert "steps 1 and 2" not in guide
+
+
+def test_amd_friend_test_creates_exact_launcher_directories() -> None:
+    guide = (REPO_ROOT / "docs" / "AMD_SEV_SNP_FRIEND_TEST.md").read_text()
+
+    assert "sudo install -d -o root -g root -m 0700" in guide
+    assert "/etc/cathedral/validator-access" in guide
+    assert "/var/lib/cathedral/validator-access" in guide
 
 
 def test_current_docs_state_direct_validator_security_contracts() -> None:

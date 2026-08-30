@@ -1,15 +1,17 @@
-# AMD SEV-SNP friend test
+# AMD SEV-SNP miner
 
-Status: friend testing only. Intel TDX is the production CPU path.
+AMD SEV-SNP is a source-ready SN39 CPU path. It becomes scored only after the
+separate Cathedral validator releases a pin to this exact contract and its SNP
+admission policy accepts the machine. This repository serves the evidence and
+work but does not write SN39 weights. The validator still requires fresh
+vendor-verified evidence, the live TLS key bound into the report, a distinct
+hardware identity, and canonical SAT. Registration and a local probe do not
+earn weight by themselves.
 
-The recurring SN39 validator does not admit AMD SEV-SNP machines or assign
-them weight. These checks create local development evidence only. They never
-publish a score, issue a receipt, write weights, assign burn, or prove subnet
-emissions.
-
-The current audit-miner image at
-`sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99`
-is an Intel TDX compatibility bridge. It cannot be used for this AMD test.
+The current TDX audit-miner image is not an SNP image. Use only the separate
+immutable SNP image and launcher described in
+[SN39 SNP miner image](SN39_SNP_MINER_IMAGE.md) after a published digest is
+available.
 
 ## Supported hardware
 
@@ -27,17 +29,17 @@ Report version 2, report version 6, an unknown processor family, a changed AMD
 root, or a different `snpguest` binary fails closed. Supporting any of them
 requires a reviewed source update.
 
-## Requirements
+## Requirements and first hardware proof
 
-- An x86-64 Linux SEV-SNP guest where the unprivileged test account can read
-  and write the `/dev/sev-guest` character device.
+- An x86-64 Linux SEV-SNP guest where root can read and write the native
+  `/dev/sev-guest` character device.
 - Python 3.11 or newer.
 - Outbound HTTPS to AMD KDS, GitHub, and PyPI during setup.
-- A reviewer who supplies a new challenge and watches the command run inside
-  the native guest.
+- A fresh observed run before the validator policy is published for that
+  machine measurement and TCB.
 
-No Cathedral wallet, cloud credential, API key, or private hotkey is required
-for the local test.
+No coldkey, cloud credential, API key, or private hotkey is required for this
+first hardware check.
 
 ## Install the reviewed source and verifier
 
@@ -116,34 +118,123 @@ CATHEDRAL_RUN_SNP_HW=1 \
 
 All six hardware tests must pass with no skip.
 
-## Remote friend review
+## Production worker
 
-A public SNP worker must use HTTPS and the complete signed-validator access
-bundle described in [Validator access and fleet protocol](WORK_REQUEST_V2.md).
-Bearer authentication alone is not sufficient. The worker refuses non-loopback
-SNP service without a fresh signed snapshot, pinned snapshot keys and digest,
-owner-only replay state, a validator stake floor, and its canonical public
-endpoint. SNP also refuses both public compatibility modes.
+A public SNP worker uses HTTPS and the complete signed-validator access bundle
+in [Validator access and fleet protocol](WORK_REQUEST_V2.md). It starts only
+through the fixed `worker serve-snp` command. It has no `--tee`, development,
+customer-SAT, composite-evidence, migration, public-evidence, or bearer-only
+option.
 
-The worker development selector is `cathedral worker develop --tee snp`.
-Unauthenticated development is restricted to loopback. The reviewing validator
-uses
-[`cathedral-amd-sev-snp-dev-preview`](https://github.com/cathedralai/cathedral-validator/blob/main/docs/AMD_SEV_SNP_DEV_PREVIEW.md).
-That command signs protected requests with the validator hotkey and remains a
-local, no-write preview.
+The separate root-owned launcher mounts only `/dev/sev-guest` as hardware
+access. It keeps the container filesystem read-only, drops capabilities, blocks
+privilege escalation, and fixes its image repository, image digest, and runtime
+contract. It does not mount a wallet, coldkey, chain RPC credential, or
+snapshot-signing seed.
 
-The Compute repository also exposes `runtime develop-audit-attestation` and
-`runtime develop-canary` with `--cpu-tee snp` for local development. Production
-runtime commands do not expose the SNP selector. SNP development refuses
-publishing, receipts, the production policy registry, GPU composition, and
-every chain-write path.
+The validator's SNP policy remains a strict allowlist. Before a friend's
+machine is registered, capture the observed transcript above and add the exact
+measurement, processor generation, and minimum reported TCB to the reviewed
+validator policy. The same component-wise floor applies to current, reported,
+committed, and launch TCB. Do not use a wildcard policy to make a new machine
+pass.
 
-## Proof boundary
+### Start the miner
+
+Do not install a launcher from a different source revision. Start with the
+published immutable image reference:
+
+```bash
+SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:REPLACE_WITH_PUBLISHED_DIGEST'
+docker pull --platform linux/amd64 "$SNP_IMAGE"
+SOURCE_COMMIT="$(docker image inspect \
+  --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+  "$SNP_IMAGE")"
+printf '%s\n' "$SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+
+git clone https://github.com/cathedralai/cathedral-sandbox.git cathedral-snp-runtime
+git -C cathedral-snp-runtime checkout --detach "$SOURCE_COMMIT"
+test "$(git -C cathedral-snp-runtime rev-parse HEAD)" = "$SOURCE_COMMIT"
+test -z "$(git -C cathedral-snp-runtime status --porcelain)"
+```
+
+On the separate miner-controlled host, use this same `SOURCE_COMMIT` with only
+the [Refresh validator access from a control host](../README.md#2-refresh-validator-access-from-a-control-host)
+procedure. Replace the revision shown in that TDX example with
+`$SOURCE_COMMIT`. Do not run its TDX host or image steps. Keep the snapshot
+signing seed on the control host. Transfer only `snapshot-keys.json` and the
+fresh `validator-access.json` to the SNP guest.
+
+On the guest, create both private destinations first. The launcher refuses
+linked, non-root-owned, or group/world-accessible access state:
+
+```bash
+sudo install -d -o root -g root -m 0700 \
+  /etc/cathedral/validator-access \
+  /var/lib/cathedral/validator-access
+```
+
+Then save this as
+`/etc/cathedral/validator-access/fleet.json`, owner `root`, group `root`, mode
+`0644`:
+
+```json
+{
+  "schema": "cathedral_worker_fleet_v1",
+  "worker_hotkey": "YOUR_PUBLIC_HOTKEY",
+  "endpoints": []
+}
+```
+
+Install the two transferred access files at the same location and permissions
+shown in that access procedure. Then install the fixed launcher from the exact
+image-labelled source revision:
+
+On the SNP guest:
+
+```bash
+sudo install -o root -g root -m 0700 \
+  cathedral-snp-runtime/scripts/run_sn39_snp_miner.sh \
+  /usr/local/sbin/cathedral-run-sn39-snp-miner
+sudo install -o root -g root -m 0644 \
+  cathedral-snp-runtime/examples/systemd/cathedral-sn39-snp-miner.service \
+  /etc/systemd/system/cathedral-sn39-snp-miner.service
+sudo install -d -o root -g root -m 0700 /etc/cathedral
+sudo install -o root -g root -m 0600 \
+  cathedral-snp-runtime/examples/systemd/sn39-snp-miner.env.example \
+  /etc/cathedral/sn39-snp-miner.env
+```
+
+Edit `/etc/cathedral/sn39-snp-miner.env`. Set the published immutable image
+reference to the same value as `SNP_IMAGE`, public miner hotkey, public HTTPS
+endpoint, and SHA-256 of
+`/etc/cathedral/validator-access/snapshot-keys.json`. A mutable image tag is
+refused.
+
+Then start and inspect the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now cathedral-sn39-snp-miner.service
+sudo systemctl status cathedral-sn39-snp-miner.service
+sudo journalctl -u cathedral-sn39-snp-miner.service -n 100 --no-pager
+```
+
+Do not register or announce the hotkey yet. Give the validator operator the
+hardware-proof transcript. Registration follows only after the released
+validator policy contains the exact observed generation, measurement, and TCB
+floor and a fresh signed validator request passes end to end.
+
+## What the two checks prove
 
 A successful observed run proves fresh vendor-backed SNP evidence and one SAT
-round trip for the tested guest, source commit, verifier, and challenge.
+round trip for the tested guest, verifier, and challenge. The recorded source
+commit and image digest are local audit context. They are not fields in the SNP
+report. A successful validator round additionally proves that its policy
+admitted the machine and that its endpoint, TLS key, and hardware identity did
+not collide.
 
-It does not prove production eligibility, durable physical-machine identity,
-customer receipt support, SN39 registration or weight, subnet emission, or TAO
-earnings. Those gates remain closed until the production validator explicitly
-adds AMD SEV-SNP admission.
+Neither check proves SN39 registration, a finalized UID30 weight row, subnet
+emission, or TAO earnings. Those require the separate live chain test.
+Neither check remotely proves the OCI image digest or continuous runtime
+integrity after boot.
