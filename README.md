@@ -37,12 +37,13 @@ guarantee TAO. The subnet must have positive emission.
 |---|---|---|
 | Intel TDX on Linux | Mainnet live testing | Eligible after fresh TDX and SAT verification |
 | More Intel TDX machines on one UID | Mainnet live testing | Each distinct verified machine adds to that UID's score |
-| AMD SEV-SNP on Linux | Source-ready, validator release pending | Eligible only after a released validator pins this contract and its SNP policy admits fresh evidence and SAT |
+| AMD SEV-SNP on Linux | Validator path merged, live hardware policy pending | Eligible after that validator's SNP policy admits fresh evidence and SAT |
 
-The current mainnet validator release supports Intel TDX. The SNP miner surface
-in this repository is source-ready. It does not become weight-eligible until a
-Cathedral validator release pins this exact contract and publishes its SNP
-policy.
+The current direct validator source supports Intel TDX and AMD SEV-SNP. Each
+validator owns its SNP measurement and TCB allowlist. An AMD machine earns zero
+from that validator until its live hardware run is admitted by the policy and
+fresh evidence and SAT pass. UID30's first live AMD policy still waits for the
+friend-hardware run.
 
 For AMD, the validator proves an admitted guest measurement, distinct hardware,
 the live HTTPS key, and returned SAT work. It does not remotely attest the OCI
@@ -125,8 +126,8 @@ test "$(docker image inspect "$SNP_IMAGE" --format \
 
 These checks prove only the pinned Intel and AMD image metadata in the local
 Docker store. They do not start a worker or prove TDX or SEV-SNP. The published
-SNP image remains source-ready and not weight-eligible until a matching
-validator release pins its contract and policy.
+SNP image receives weight only from validators which run the matching contract,
+admit its live measurement and TCB, and verify fresh evidence and SAT.
 
 ## Run one AMD SEV-SNP machine
 

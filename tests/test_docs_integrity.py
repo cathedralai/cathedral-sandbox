@@ -32,7 +32,7 @@ def test_readme_is_the_single_current_mining_guide() -> None:
         "each distinct verified machine",
         "Intel TDX",
         "AMD SEV-SNP",
-        "Source-ready, validator release pending",
+        "Validator path merged, live hardware policy pending",
         "c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99",
         "0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255",
         "current migration bridge",
