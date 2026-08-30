@@ -350,6 +350,9 @@ X.509, or HTTP advisories. CI uses `GOTOOLCHAIN=local`, checks the exact compile
 version, and fails if the artifact contains either an ELF interpreter or
 dynamic segment. `go mod verify` also rejects changed module-cache contents
 before tests or release builds run.
+The tag-only release workflow, exact artifact digest, reproduction steps, and
+trust boundary are documented in
+[Static TDX verifier release](TDX_VERIFIER_RELEASE.md).
 Quote v5 remains rejected until Cathedral versions its measurement contract to
 include the additional v5 identity fields.
 

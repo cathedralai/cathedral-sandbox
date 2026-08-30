@@ -1,0 +1,291 @@
+name: Release static TDX verifier
+
+on:
+  push:
+    tags:
+      - "cathedral-tdx-verifier-v*"
+
+permissions: {}
+
+env:
+  GO_VERSION: "1.25.13"
+  ARTIFACT_NAME: cathedral-tdx-verifier-linux-amd64
+  CHECKSUM_NAME: cathedral-tdx-verifier-linux-amd64.sha256
+  EXPECTED_SHA256: 4b6fbaf12def5e4284b54f557c5c29e472d7666f0160a11a5472fdcf462db148
+  TAG_RULESET_NAME: Protect Cathedral TDX verifier release tags
+
+jobs:
+  release:
+    if: startsWith(github.ref, 'refs/tags/cathedral-tdx-verifier-v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: tdx-verifier-release-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out the tagged source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Refuse every non-release ref
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REF_TYPE" = tag
+          test "$GITHUB_REF" = "refs/tags/${RELEASE_TAG}"
+          [[ "$RELEASE_TAG" =~ ^cathedral-tdx-verifier-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --force --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+
+      - name: Set up the exact Go toolchain
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: cmd/cathedral-tdx-verifier/go.sum
+
+      - name: Verify dependencies and tests
+        working-directory: cmd/cathedral-tdx-verifier
+        shell: bash
+        env:
+          GOENV: "off"
+          GOAMD64: v1
+          GOTOOLCHAIN: local
+          GOWORK: "off"
+        run: |
+          set -euo pipefail
+          test "$(go env GOVERSION)" = "go${GO_VERSION}"
+          go mod verify
+          go vet ./...
+          go test -race ./...
+
+      - name: Run the pinned vulnerability scan
+        working-directory: cmd/cathedral-tdx-verifier
+        shell: bash
+        env:
+          GOENV: "off"
+          GOAMD64: v1
+          GOTOOLCHAIN: local
+          GOWORK: "off"
+        run: |
+          set -euo pipefail
+          go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+      - name: Build the reproducible linux/amd64 binary
+        working-directory: cmd/cathedral-tdx-verifier
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+          GOAMD64: v1
+          GOENV: "off"
+          GOTOOLCHAIN: local
+          GOWORK: "off"
+        run: |
+          set -euo pipefail
+          install -d -m 0755 -- "$GITHUB_WORKSPACE/dist"
+          build_one="$(mktemp -d "$RUNNER_TEMP/tdx-verifier-build-one.XXXXXX")"
+          build_two="$(mktemp -d "$RUNNER_TEMP/tdx-verifier-build-two.XXXXXX")"
+          GOCACHE="$build_one/cache" \
+            go build -mod=readonly -trimpath -buildvcs=false -ldflags='-s -w' \
+              -o "$build_one/$ARTIFACT_NAME" .
+          GOCACHE="$build_two/cache" \
+            go build -mod=readonly -trimpath -buildvcs=false -ldflags='-s -w' \
+              -o "$build_two/$ARTIFACT_NAME" .
+          cmp -- "$build_one/$ARTIFACT_NAME" "$build_two/$ARTIFACT_NAME"
+          install -m 0755 -- "$build_one/$ARTIFACT_NAME" \
+            "$GITHUB_WORKSPACE/dist/$ARTIFACT_NAME"
+
+      - name: Prove the binary and emit its checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/dist"
+          test "$(sha256sum "$ARTIFACT_NAME" | cut -d ' ' -f 1)" = "$EXPECTED_SHA256"
+          printf '%s  %s\n' "$EXPECTED_SHA256" "$ARTIFACT_NAME" > "$CHECKSUM_NAME"
+          sha256sum --check --strict "$CHECKSUM_NAME"
+          file "$ARTIFACT_NAME" | grep -q 'ELF 64-bit LSB executable, x86-64'
+          file "$ARTIFACT_NAME" | grep -q 'statically linked'
+          file "$ARTIFACT_NAME" | grep -q 'stripped'
+          if readelf -l "$ARTIFACT_NAME" | grep -q ' INTERP '; then
+            echo "::error::Verifier has a dynamic interpreter"
+            exit 1
+          fi
+          if readelf -l "$ARTIFACT_NAME" | grep -q ' DYNAMIC '; then
+            echo "::error::Verifier has a dynamic segment"
+            exit 1
+          fi
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 2
+
+      - name: Render provenance and trust release notes
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          export GO_MOD_SHA256
+          GO_MOD_SHA256="$(sha256sum cmd/cathedral-tdx-verifier/go.mod | cut -d ' ' -f 1)"
+          export GO_SUM_SHA256
+          GO_SUM_SHA256="$(sha256sum cmd/cathedral-tdx-verifier/go.sum | cut -d ' ' -f 1)"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          source = Path("docs/TDX_VERIFIER_RELEASE_NOTES_TEMPLATE.md").read_text()
+          notes = source.replace("{{TAG}}", os.environ["RELEASE_TAG"])
+          notes = notes.replace("{{SOURCE_REVISION}}", os.environ["GITHUB_SHA"])
+          notes = notes.replace("{{GO_MOD_SHA256}}", os.environ["GO_MOD_SHA256"])
+          notes = notes.replace("{{GO_SUM_SHA256}}", os.environ["GO_SUM_SHA256"])
+          if "{{" in notes or "}}" in notes:
+              raise SystemExit("release-note template contains an unresolved placeholder")
+          Path(os.environ["RUNNER_TEMP"], "tdx-verifier-release-notes.md").write_text(notes)
+          PY
+
+      - name: Require the public protected tag ruleset
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/rulesets"
+          curl_args=(
+            --fail --location --silent --show-error --retry 4 --retry-all-errors
+            --proto '=https' --tlsv1.2
+            --header 'Accept: application/vnd.github+json'
+            --header 'X-GitHub-Api-Version: 2026-03-10'
+          )
+          rulesets="$(curl "${curl_args[@]}" "${api}?includes_parents=true")"
+          ruleset_id="$(jq -r --arg name "$TAG_RULESET_NAME" '
+            [.[] | select(
+              .name == $name and .target == "tag" and .enforcement == "active"
+            )] | if length == 1 then .[0].id else empty end
+          ' <<< "$rulesets")"
+          [[ "$ruleset_id" =~ ^[1-9][0-9]*$ ]]
+          ruleset="$(curl "${curl_args[@]}" \
+            "${api}/${ruleset_id}?includes_parents=true")"
+          jq -e --arg name "$TAG_RULESET_NAME" '
+            .name == $name and
+            .target == "tag" and
+            .enforcement == "active" and
+            .conditions.ref_name.include == ["refs/tags/cathedral-tdx-verifier-v*"] and
+            .conditions.ref_name.exclude == [] and
+            ([.rules[].type] | sort) == ["deletion", "update"]
+          ' <<< "$ruleset" >/dev/null
+
+      - name: Create, fill, and publish the tagged release draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          verify_remote_tag_target() {
+            git fetch --force --no-tags origin \
+              "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            test "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")" = \
+              "$GITHUB_SHA"
+          }
+          assets=(
+            "$GITHUB_WORKSPACE/dist/$ARTIFACT_NAME"
+            "$GITHUB_WORKSPACE/dist/$CHECKSUM_NAME"
+          )
+          test "${#assets[@]}" -eq 2
+          artifact_size="$(stat -c '%s' "${assets[0]}")"
+          checksum_size="$(stat -c '%s' "${assets[1]}")"
+          checksum_digest="sha256:$(sha256sum "${assets[1]}" | cut -d ' ' -f 1)"
+          [[ "$artifact_size" =~ ^[1-9][0-9]*$ ]]
+          [[ "$checksum_size" =~ ^[1-9][0-9]*$ ]]
+          [[ "$checksum_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          verify_remote_tag_target
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --latest=false \
+            --title "Cathedral static TDX verifier ${RELEASE_TAG}" \
+            --notes-file "$RUNNER_TEMP/tdx-verifier-release-notes.md"
+          gh release upload "$RELEASE_TAG" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY"
+          draft="$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets,isDraft)"
+          jq -e \
+            --arg artifact "$ARTIFACT_NAME" \
+            --arg checksum "$CHECKSUM_NAME" \
+            --arg artifact_digest "sha256:$EXPECTED_SHA256" \
+            --arg checksum_digest "$checksum_digest" \
+            --argjson artifact_size "$artifact_size" \
+            --argjson checksum_size "$checksum_size" '
+            def exact_asset($name; $digest; $size):
+              [.assets[] | select(
+                .name == $name and .digest == $digest and
+                .size == $size and .state == "uploaded"
+              )] | length == 1;
+            .isDraft == true and
+            (.assets | length) == 2 and
+            exact_asset($artifact; $artifact_digest; $artifact_size) and
+            exact_asset($checksum; $checksum_digest; $checksum_size)
+          ' <<< "$draft" >/dev/null
+          verify_remote_tag_target
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft=false \
+            --latest=false
+          published="$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets,isDraft,isImmutable)"
+          jq -e \
+            --arg artifact "$ARTIFACT_NAME" \
+            --arg checksum "$CHECKSUM_NAME" \
+            --arg artifact_digest "sha256:$EXPECTED_SHA256" \
+            --arg checksum_digest "$checksum_digest" \
+            --argjson artifact_size "$artifact_size" \
+            --argjson checksum_size "$checksum_size" '
+            def exact_asset($name; $digest; $size):
+              [.assets[] | select(
+                .name == $name and .digest == $digest and
+                .size == $size and .state == "uploaded"
+              )] | length == 1;
+            .isDraft == false and
+            .isImmutable == true and
+            (.assets | length) == 2 and
+            exact_asset($artifact; $artifact_digest; $artifact_size) and
+            exact_asset($checksum; $checksum_digest; $checksum_size)
+          ' <<< "$published" >/dev/null
+          verify_remote_tag_target
+
+  verify-anonymous-download:
+    needs: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Download both release assets without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          download_dir="$(mktemp -d "$RUNNER_TEMP/tdx-verifier-download.XXXXXX")"
+          release_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          curl --fail --location --silent --show-error --retry 4 --retry-all-errors \
+            --proto '=https' --tlsv1.2 \
+            --output "$download_dir/$ARTIFACT_NAME" \
+            "$release_url/$ARTIFACT_NAME"
+          curl --fail --location --silent --show-error --retry 4 --retry-all-errors \
+            --proto '=https' --tlsv1.2 \
+            --output "$download_dir/$CHECKSUM_NAME" \
+            "$release_url/$CHECKSUM_NAME"
+          cd "$download_dir"
+          test "$(sha256sum "$ARTIFACT_NAME" | cut -d ' ' -f 1)" = "$EXPECTED_SHA256"
+          sha256sum --check --strict "$CHECKSUM_NAME"
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 2
