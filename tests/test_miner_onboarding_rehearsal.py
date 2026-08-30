@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -35,6 +36,32 @@ def test_public_miner_rehearsal_runs_from_an_installed_checkout():
         assert check["synthetic_evidence_round_trip"] == "PASS"
         assert check["capabilities"] == "PASS"
         assert check["canonical_sat"] == "PASS"
+
+
+def test_public_miner_rehearsal_ignores_ambient_network_proxies():
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "HTTP_PROXY": "http://127.0.0.1:9",
+            "HTTPS_PROXY": "http://127.0.0.1:9",
+            "http_proxy": "http://127.0.0.1:9",
+            "https_proxy": "http://127.0.0.1:9",
+            "NO_PROXY": "",
+            "no_proxy": "",
+        }
+    )
+    completed = subprocess.run(
+        [sys.executable, "scripts/rehearse_sn39_miner.py"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    assert json.loads(completed.stdout)["status"] == "PASS"
 
 
 def test_public_readme_scopes_the_rehearsal_and_help_path():

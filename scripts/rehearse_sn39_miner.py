@@ -15,7 +15,8 @@ import tempfile
 import threading
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -28,10 +29,39 @@ from cathedral.worker import WorkerServer
 REHEARSAL_HOTKEY = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 REHEARSAL_PRIMARY = "https://8.8.8.8:8081"
 REHEARSAL_SECONDARY = "https://1.1.1.1:8081"
+_PROXY_ENVIRONMENT = (
+    "ALL_PROXY",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "all_proxy",
+    "https_proxy",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+)
 
 
 class RehearsalFailure(RuntimeError):
     """Raised when one of the bounded rehearsal assertions fails."""
+
+
+@contextmanager
+def _without_ambient_proxies() -> Iterator[None]:
+    """Keep every rehearsal request inside this process and on loopback."""
+
+    previous = {name: os.environ.get(name) for name in _PROXY_ENVIRONMENT}
+    try:
+        for name in _PROXY_ENVIRONMENT:
+            os.environ.pop(name, None)
+        os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
+        os.environ["no_proxy"] = "127.0.0.1,localhost,::1"
+        yield
+    finally:
+        for name in _PROXY_ENVIRONMENT:
+            os.environ.pop(name, None)
+        for name, value in previous.items():
+            if value is not None:
+                os.environ[name] = value
 
 
 def _require(condition: bool, message: str) -> None:
@@ -47,8 +77,11 @@ def _post_json(url: str, document: dict[str, object]) -> tuple[int, bytes]:
         method="POST",
         headers={"Content-Type": "application/json"},
     )
+    # This rehearsal is loopback-only. Ignore ambient proxy configuration so a
+    # corporate HTTP(S)_PROXY cannot receive or break its synthetic requests.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with opener.open(request, timeout=5) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
@@ -134,7 +167,10 @@ def _write_manifest(path: Path, endpoints: list[str]) -> None:
 
 
 def run_rehearsal() -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="cathedral-miner-rehearsal-") as directory:
+    with (
+        _without_ambient_proxies(),
+        tempfile.TemporaryDirectory(prefix="cathedral-miner-rehearsal-") as directory,
+    ):
         state_root = Path(directory)
         _require(not any(state_root.iterdir()), "temporary rehearsal state was not fresh")
 
