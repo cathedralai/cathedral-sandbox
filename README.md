@@ -126,8 +126,9 @@ test "$(docker image inspect "$SNP_IMAGE" --format \
 
 These checks prove only the pinned Intel and AMD image metadata in the local
 Docker store. They do not start a worker or prove TDX or SEV-SNP. The published
-SNP image receives weight only from validators which run the matching contract,
-admit its live measurement and TCB, and verify fresh evidence and SAT.
+image digest does not receive weight. A machine started from the SNP image
+contributes to its UID only when a validator runs the matching contract, admits
+the machine's live measurement and TCB, and verifies fresh evidence and SAT.
 
 ## Run one AMD SEV-SNP machine
 
@@ -395,12 +396,12 @@ zero for the round.
 
 ## AMD SEV-SNP
 
-AMD SEV-SNP is a source-ready scored path. It becomes production-eligible only
-after a released validator pins this exact contract and its policy admits the
-observed measurement and TCB. Start with the hardware proof in
+AMD SEV-SNP is a scored path in the current direct validator source. Each
+validator owns its measurement and TCB policy. Start with the hardware proof in
 [AMD SEV-SNP miner](docs/AMD_SEV_SNP_FRIEND_TEST.md). Do not register or
-announce the hotkey until the matching validator release exists and both local
-and validator evidence pass. Neither result proves a finalized weight row.
+announce the hotkey until the local proof passes and the validators you expect
+to score the machine confirm their policies admit the observed measurement and
+TCB. Registration and admission do not prove a finalized weight row.
 
 ## Reference
 

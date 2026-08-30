@@ -72,6 +72,11 @@ def test_current_operator_docs_exclude_retired_launch_paths() -> None:
         "validated_supply_v2",
         "uid124",
         "/v1/enroll",
+        "source-ready scored path",
+        "source-ready sn39 cpu path",
+        "matching validator release",
+        "separate cathedral validator releases a pin",
+        "exact snp admission policy are published",
     ):
         assert retired not in normalized, retired
 

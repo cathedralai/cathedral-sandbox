@@ -1,18 +1,19 @@
 # AMD SEV-SNP miner
 
-AMD SEV-SNP is a source-ready SN39 CPU path. It becomes scored only after the
-separate Cathedral validator releases a pin to this exact contract and its SNP
-admission policy accepts the machine. This repository serves the evidence and
-work but does not write SN39 weights. The validator still requires fresh
-vendor-verified evidence, the live TLS key bound into the report, a distinct
-hardware identity, and canonical SAT. Registration and a local probe do not
-earn weight by themselves.
+AMD SEV-SNP is a scored SN39 CPU path in the current direct validator source.
+Each validator owns its SNP admission policy and accepts a machine only after
+adding its observed measurement, processor generation, and minimum TCB. This
+repository serves the evidence and work but does not write SN39 weights. The
+validator still requires fresh vendor-verified evidence, the live TLS key bound
+into the report, a distinct hardware identity, and canonical SAT. Registration,
+policy admission, and a local probe do not earn weight by themselves.
 
 The current TDX audit-miner image is not an SNP image. Use only the separate
 immutable SNP image and launcher described in
 [SN39 SNP miner image](SN39_SNP_MINER_IMAGE.md). The current published pin is
-fixed below. It remains ineligible for weight until the separate validator
-release and exact SNP admission policy are published.
+fixed below. The image digest does not receive weight. A machine started from
+that image contributes to its UID only after the scoring validator admits its
+live measurement and TCB and verifies fresh evidence and SAT.
 
 ## Supported hardware
 
@@ -36,8 +37,8 @@ requires a reviewed source update.
   `/dev/sev-guest` character device.
 - Python 3.11 or newer.
 - Outbound HTTPS to AMD KDS, GitHub, and PyPI during setup.
-- A fresh observed run before the validator policy is published for that
-  machine measurement and TCB.
+- A fresh observed run before the scoring validator adds that machine's
+  measurement and TCB to its policy.
 
 No coldkey, cloud credential, API key, or private hotkey is required for this
 first hardware check.
