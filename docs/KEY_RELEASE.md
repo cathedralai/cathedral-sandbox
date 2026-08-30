@@ -1,5 +1,8 @@
 # Attestation-gated data-key release
 
+> Product-library reference. This is not part of the current SN39 miner launch
+> path. Start at the repository [README](../README.md).
+
 Cathedral defines a disabled-by-default protocol for releasing an encrypted
 per-workload data key only to a fresh, policy-approved CPU worker. This is a
 control-plane and broker contract. No production broker or customer container

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Operator tooling for the SN39 approved-coldkey enrollment allowlist.
+"""Legacy tooling for the approved-coldkey enrollment library.
 
-docs/ENROLLMENT_ALLOWLIST.md defines the artifact and operator sequence. This
-tool is the sanctioned way to produce and check the two files the enrollment
+docs/ENROLLMENT_ALLOWLIST.md records the retired boundary. This tool produces
+and checks the two files the retained enrollment
 registry trusts, plus the extended registration snapshot the coldkey gate
 needs:
 
@@ -18,7 +18,8 @@ needs:
 
 Signing keys never leave the operator host and are never printed. The tool
 does not install anything: it writes files the operator reviews and moves
-into place deliberately, exactly like cathedral_measurement_approval.py.
+into place deliberately, exactly like cathedral_measurement_approval.py. The
+current direct validator path does not use this tool.
 """
 from __future__ import annotations
 
@@ -444,7 +445,10 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cathedral_enroll_allowlist.py",
-        description="Produce and check SN39 enrollment allowlist artifacts",
+        description=(
+            "Retained legacy central-enrollment allowlist tooling. Not used "
+            "by current direct SN39 mining."
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

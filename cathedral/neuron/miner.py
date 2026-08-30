@@ -1,4 +1,4 @@
-"""Miner compatibility entrypoint plus local worker adapters.
+"""Miner worker entrypoint plus local test adapters.
 
 Inverted trust topology: the miner *serves* attestation on request and runs
 lane work; the validator never SSHes in.
@@ -8,9 +8,9 @@ See docs/DESIGN.md §4, §9.
 
 Hardware-free testable core: ``MockMiner`` serves MOCK evidence (the real
 REPORT_DATA binding + policy check, no vendor crypto) and does real SAT work.
-The MOCK boundary is the only substitution — the SAT solve/certify path is the
-real Phase-2 code. SN39 registration is proven by the miner's signed hotkey;
-this console entrypoint forwards into the worker operator CLI.
+The MOCK boundary is the only substitution. It is not production evidence.
+The direct validator establishes SN39 registration from finalized chain state,
+not from a worker claim. This entrypoint forwards into the worker operator CLI.
 """
 
 from __future__ import annotations

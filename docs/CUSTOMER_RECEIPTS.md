@@ -1,5 +1,8 @@
 # Cathedral Computer customer receipts
 
+> Product-library reference. Customer receipts are not the current SN39 weight
+> path. Mining starts in the repository [README](../README.md).
+
 `cathedral_customer_receipt_v1` is a public, offline-verifiable contract for
 receipts issued by the Cathedral Computer customer API. It is separate from
 the subnet assurance receipt contract in `cathedral/receipt.py`.

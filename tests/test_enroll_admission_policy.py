@@ -1044,12 +1044,7 @@ def _policy_reconcile_args(
 
 
 def test_reconcile_runs_under_an_admission_policy(tmp_path: Path, capsys):
-    """The documented way to free capacity must be runnable.
-
-    docs/ADMISSION_POLICY.md names `enroll reconcile` as the remedy, but its
-    allowlist arguments were required, so a policy-configured operator could
-    not run the one command that frees a slot.
-    """
+    """The retained enrollment library's reconciliation path remains runnable."""
     from cathedral.cli import cmd_enroll_reconcile
 
     app, store, policy_path = build_app(tmp_path, policy=policy_bytes(coldkeys=[COLDKEY]))

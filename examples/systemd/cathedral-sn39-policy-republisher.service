@@ -1,6 +1,6 @@
 [Unit]
-Description=Cathedral SN39 signed policy freshness republisher
-Documentation=https://github.com/cathedralai/cathedralconfidential/blob/main/docs/POLICY_REGISTRY.md
+Description=Legacy Cathedral policy-library freshness republisher, not current SN39 mining
+Documentation=https://github.com/cathedralai/cathedral-sandbox/blob/main/docs/POLICY_REGISTRY.md
 After=local-fs.target
 ConditionPathExists=/etc/cathedral/policy-registry-sn39.json
 ConditionPathExists=/etc/cathedral/policy-signing-sn39.key

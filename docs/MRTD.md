@@ -1,196 +1,100 @@
-# Measurement and TCB policy (MRTD)
+# Intel TDX launch measurement
 
-How Intel TDX measurements are approved, pinned, verified, and rolled
-back for the claim **"SN39 mainnet: validated Intel TDX CPU compute."**
+This file keeps its historical name, but Cathedral's approved value is not a
+bare Intel MRTD.
 
-> **Status honesty.** The policy machinery is implemented, adversarially tested,
-> and has been exercised in a historical live-hardware acceptance run. A
-> policy entry or old receipt is not proof of current eligibility. Verify the
-> current signed registry, freshness, revocation state, and supported release;
-> otherwise report `NOT_PROVEN`.
+The released verifier emits:
 
-## The approved measurement is NOT an MRTD
-
-This document is named MRTD for historical reasons and the name is misleading.
-Read this before approving anything.
-
-`ParsedTdxQuote.measurement` (`cathedral/verify/tdx_quote.py`) is a SHA-256 over
-**ten quote-body fields plus the domain separator**. `mr_td` is one of those
-quote-body fields:
-
-    domain ‖ td_attributes ‖ xfam ‖ mr_td ‖ mr_config_id ‖ mr_owner
-          ‖ mr_owner_config ‖ rtmr0 ‖ rtmr1 ‖ rtmr2 ‖ rtmr3
-
-**All four RTMRs are inside it.** RTMR1 conventionally measures the kernel and
-initrd, so **anything that regenerates initramfs changes the approved
-measurement** — a kernel upgrade, yes, but also installing a single package that
-triggers an initramfs rebuild.
-
-A true MRTD would not behave this way: it is the static initial-TD measurement
-and does not move when you install software. That difference is exactly what
-makes the old name dangerous, because it invites the assumption that an approval
-survives routine patching. It does not.
-
-Measured on a real Intel TDX CVM (GCP `c3-standard-4`, stock Ubuntu 24.04),
-across three boots:
-
-| Boot | Measurement | `mr_td` / `rtmr0` |
-|---|---|---|
-| fresh image | `4574b60b…` | constant |
-| after `apt full-upgrade` + install Docker | **`f81c672a…`** | **constant** |
-| two further reboots, no changes | `f81c672a…` (byte-identical) | constant |
-
-So the value IS deterministic — same machine, same software, same measurement
-across reboots. It is simply sensitive to far more than the boot image. `mr_td`
-and `rtmr0` never moved, which is what proves the change came from RTMR1 and not
-from the image or the GCP virtual firmware.
-
-### What moves it, and what does not
-
-Measured on the same real TDX CVM. The distinction matters more than the list,
-because the two triggers behave differently for an operator:
-
-| Event | Measurement | Controllable by the provider? |
-|---|---|---|
-| `apt full-upgrade` + install Docker (initramfs regenerated) | **changes** | yes — freeze the image |
-| reboot, no changes | unchanged (byte-identical) | — |
-| **full stop + cold start** of the GCP instance | **unchanged** (`mr_td`, `rtmr0`, `rtmr1`, `rtmr2` and TCB SVN all constant) | — |
-| landing on a host with *different* guest firmware (TDVF) | changes | **no** |
-
-The stop/start result is worth stating explicitly because it is easy to assume
-otherwise: on GCP, cycling an instance does **not** by itself move the
-measurement.
-
-**Two independent stop/starts now**, both byte-identical, with `mr_td`, `rtmr0`
-and the TCB SVN constant across all three boots.
-
-A caution on how much that proves, because the obvious reading is wrong. Each
-boot came up with a **different external IP**, which looks like evidence of
-landing on different hosts — it is not. A GCP *ephemeral* external IP is
-released and reallocated on every full stop/start regardless of placement (this
-is the same mechanism as cathedral-compute#61, where it invalidated a worker's
-single-SAN certificate on every restart). So the IP changing is guaranteed by
-the stop/start itself and carries no information about the host or its firmware.
-
-What the two samples establish is narrower and still useful: **a stop/start does
-not itself move the measurement.** Neither sample demonstrates surviving an
-actual TDVF change, because none was observed — and a TDVF roll cannot be
-triggered on demand, so that case stays unexercised.
-
-That leaves exactly one uncontrollable trigger — a TDVF rollout underneath you —
-and it is occasional rather than routine. So a frozen image plus re-approval on
-the rare firmware change is a workable posture, and the operational load is far
-lower than "any restart might de-approve you" would suggest.
-
-**The gap that follows from this, and it is not more sampling.** Because no TDVF
-roll has been observed, the re-approval path has never actually been run against
-a genuinely changed measurement — only reasoned about. The useful next step is to
-exercise `scripts/cathedral_measurement_approval.py approve` deliberately, before
-an incident needs it, rather than accumulating more stop/start samples that all
-test the same benign case. A second thing worth doing is recording the
-measurement plus `mr_td` and `rtmr0` on each boot, so that when a roll does
-happen it is *detected* rather than inferred from a provider dropping out.
-
-Freezing is the provider's half of it: mask `unattended-upgrades` and hold the
-boot-critical packages, so nothing regenerates initramfs without a decision.
-
-`runtime_measurements` is a separate registry field, and its existence does NOT
-mean the runtime-varying part is held separately: the runtime registers are
-already folded into the value above.
-
-### What a provider sees when it drifts
-
-`cathedral verify` reports `{"valid": false, "category": "policy", "error": …}`
-with a message saying the measurement is well-formed but not approved. It used
-to report `category: "schema"` / "receipt measurement is invalid", which read as
-a malformed receipt and sent operators to inspect the wrong artifact entirely.
-
-### Open: freeze, or re-approve?
-
-**The mechanics already exist; the policy does not.**
-
-`scripts/cathedral_measurement_approval.py approve` is a working re-approval
-path: it captures the candidate measurement live from the named worker through
-the pinned production verifier, records provenance to an append-only approval
-log, and emits the next monotonic signed registry release. It is operator-gated
-— it needs the registry signing key, an `--operator` and a `--reason`, and it
-does not deploy — so a provider can never re-approve itself.
-
-What is undecided is whether routine patching SHOULD be an approvable event, and
-at what cadence. Every patched machine currently requires an operator to run an
-approval and ship a signed registry release, which is an operational load
-question at fleet scale rather than a security one. Tracked in
-cathedral-compute#88. Until it is settled, do not assume an approval outlives an
-`apt upgrade`.
-
-## Policy source of truth
-
-The signed policy registry (`cathedral_policy_registry_v1`, see
-`docs/POLICY_REGISTRY.md`) is the ONLY measurement authority:
-
-- Per-profile `measurements` (launch measurement values — see above, these are
-  NOT bare MRTDs) and `runtime_measurements`, each with `status`, validity
-  windows, and `retire_at`.
-- TCB gates: `min_tcb`, `tdx_allowed_tcb_statuses` (production strict
-  mode accepts `UpToDate`-class statuses only), `tdx_allowed_advisories`.
-- Ed25519-signed, monotonic `release`, `generated_at` monotonicity
-  (`PolicyRegistryState` durable anti-rollback), and a HARD 86400-second
-  freshness ceiling: staleness is repaired by same-policy reissues at
-  higher releases, never by widening the ceiling.
-
-Production runtimes require a strict signed CPU policy and a live
-registry refresher; a mid-epoch authority or policy change aborts the
-epoch. Compatibility mode never scores production work.
-
-## Approving a new measurement
-
-Use the auditable approval tool — never hand-edit the registry:
-
-```bash
-python scripts/cathedral_measurement_approval.py --help
+```text
+tdx-measurement-sha256:<64 lowercase hex characters>
 ```
 
-It records who approved which MRTD from which quote evidence, and emits
-the registry change for signing. Every approval lands as a NEW registry
-release; the receipt chain records the release+digest each verdict was
-issued under, so any later dispute replays against the exact policy that
-was in force.
+It is SHA-256 over the domain separator
+`cathedral-tdx-measurement-v1\0` followed by these quote-body fields, in order:
 
-`approve` requires `--profile-id` and applies the measurement to exactly
-that profile. A registry retains every prior profile after a rollover
-(`rollover` appends the successor), so the approval target is never
-inferred from list position: naming a profile that is absent, duplicated,
-not `cpu_tdx`, or not `active` fails before the live capture runs, and the
-emitted release is refused if any other profile changed. `show` prints
-every profile with its status rather than one positional entry.
+```text
+TD_ATTRIBUTES || XFAM || MRTD || MRCONFIGID || MROWNER || MROWNERCONFIG
+              || RTMR0 || RTMR1 || RTMR2 || RTMR3
+```
 
-## Verification path
+Both `cmd/cathedral-tdx-verifier/main.go` and
+`cathedral/verify/tdx_quote.py` implement this exact contract.
 
-Admission and replay verify quotes through the pinned external verifier:
-content-digest AND implementation-digest pinned
-(`cathedral-tdx-verifier-implementation-v1` domain over command,
-artifacts, environment, and the exact binary bytes), static x86-64 ELF
-enforced, executed under bounded subprocess limits. The measurement in
-the receipt must be inside the signed registry profile that was active at
-receipt time — at admission and again at independent replay.
+## Why this is not MRTD
 
-## Rollback
+MRTD measures the initial trust domain. Cathedral's value also includes all
+four runtime measurement registers. RTMR1 commonly includes the kernel and
+initrd. A package install or upgrade that rebuilds initramfs can therefore
+change Cathedral's value while MRTD stays unchanged.
 
-- **Compromised/withdrawn measurement:** publish a new registry release
-  with the entry revoked (`status`/`revoked_at`). Monotonicity means the
-  old release can never verify again once any consumer has seen the new
-  one (durable fences in both the confidential verifier state and the
-  subnet validator state file).
-- **Bad policy release:** publish a corrected HIGHER release. Lower
-  releases are refused by every durable high-water fence; there is no
-  in-place mutation path, and `generated_at` can never move backwards.
-- **Bad code release:** the subnet consumes cathedral-compute only
-  through an immutable full-sha pin (`docs/BUDGET.md`); rolling back
-  means pinning the previous reviewed sha — an explicit, reviewed commit.
+Historical GCP TDX testing observed:
 
-## Acceptance
+- `apt full-upgrade` plus Docker installation changed the Cathedral value;
+- ordinary reboots without software changes kept it byte-identical; and
+- two stop/start cycles also kept it byte-identical.
 
-Measurement checks report through the same PASS / FAIL / NOT_PROVEN
-semantics as `docs/PROVENANCE.md`: an unknown MRTD, revoked entry, stale
-registry, or TCB status outside the allowlist is FAIL (fail closed);
-missing evidence is NOT_PROVEN, never a silent pass.
+Those observations do not prove stability across a provider TDVF rollout.
+Treat every changed value as unapproved until it is investigated. Do not infer
+host placement from an ephemeral public IP change.
+
+A matching value also does not, by itself, prove a particular OCI image. That
+claim needs the image loader to extend the image identity into quoted measured
+state or a separate reviewed binding.
+
+## Policy use
+
+The released QVL verifies the quote and emits the measurement. The sandbox
+library's strict policy path then checks it against `Policy.allowed_measurements`
+derived from a verified signed policy registry. An empty or missing allowlist
+admits nothing.
+
+The current direct SN39 validator does not consult this registry, retain the
+emitted measurement, or use it as a weight gate. It consumes the QVL verdict
+and verified stable platform identity. This section documents only the retained
+sandbox strict-policy library.
+
+Strict Intel TDX admission uses the typed `tcb_status` and advisory claims from
+the same verified quote. Raw `tee_tcb_svn` is retained for audit and is not
+numerically ordered. `min_tcb` remains a compatibility field, not the strict
+Intel TDX production decision.
+
+Within this policy path, the narrow claim is:
+
+> SN39 mainnet: validated Intel TDX CPU compute.
+
+The claim still requires fresh evidence, current collateral, allowed TCB
+status, no unapproved advisories, debug disabled, exact REPORTDATA and TLS-SPKI
+binding, and the expected work result. A registry entry or an old receipt is
+not current eligibility.
+
+## Approving a changed measurement
+
+Never hand-edit a signed registry. Capture and propose a candidate with:
+
+```bash
+python scripts/cathedral_measurement_approval.py approve --help
+```
+
+The command requires the exact active `cpu_tdx` profile, an operator identity,
+a reason, live evidence through the pinned verifier, and the registry signing
+key. It writes an append-only approval record and emits a new monotonic signed
+registry release. It does not deploy the release.
+
+Before approval, determine whether the change came from an intended guest
+update, an unexpected initramfs change, or provider firmware. A provider must
+never approve its own machine automatically. Freeze boot-critical packages if
+your operating policy requires a stable measurement.
+
+## Rollback and revocation
+
+- To withdraw a measurement, publish a higher signed registry release that
+  marks it revoked.
+- To correct a bad policy release, publish a corrected higher release.
+- Never edit a signed release in place or move a release number or timestamp
+  backwards.
+- Durable high-water state rejects an older release after a newer one has been
+  observed.
+
+If fresh evidence has an unknown or revoked measurement, strict policy returns
+failure. If current evidence is unavailable, report `NOT_PROVEN`; do not reuse
+an earlier pass.

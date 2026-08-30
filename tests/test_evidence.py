@@ -828,12 +828,10 @@ def test_cli_verify_rejects_wrong_mechanism_pin(tmp_path: Path, exported_evidenc
 
 # --- the mechanism identity the CLI standardizes on (#102) -----------------
 #
-# README.md states that new evidence is emitted as validated_supply_v2 and that
-# validated_supply_v1 stays registered only so already-signed historical
-# evidence keeps verifying. Both CLI defaults named v1, so the documented
-# command produced evidence the docs call historical, and an operator following
-# the README pinned v2 and was rejected. The pin is fail-closed on mismatch, so
-# that disagreement rejects the bundle rather than merely reading oddly.
+# The retained evidence library emits validated_supply_v2. Version 1 stays
+# registered only so already-signed historical evidence keeps verifying. Both
+# CLI defaults once named v1. The pin is fail-closed on mismatch, so a default
+# disagreement rejects the bundle rather than merely reading oddly.
 #
 # These assert the identity itself rather than a flag being accepted, so a
 # revert of either default fails here instead of passing quietly.
@@ -864,7 +862,7 @@ def test_both_cli_mechanism_defaults_name_v2(argv):
     }
     assert defaults["mechanism"] == "validated_supply_v2", (
         f"`cathedral {' '.join(argv)}` defaults to {defaults['mechanism']!r}; "
-        "README.md says new evidence is validated_supply_v2 and calls v1 historical"
+        "the retained evidence library requires validated_supply_v2 by default"
     )
     assert defaults["mechanism_revision"] == 1
 

@@ -41,8 +41,9 @@ release run.
 
 This raw binary SHA-256 is not Cathedral's runtime verifier implementation
 digest. After installation, operators must compute the absolute-path-and-argv
-bound digest described by `scripts/release_pins.py` and
-`docs/RELEASE_CHECKLIST.md`.
+bound digest described by `scripts/release_pins.py`. This digest belongs to
+the legacy provenance-verification library. It is not required by the current
+direct validator.
 
 ## Provenance and trust boundary
 

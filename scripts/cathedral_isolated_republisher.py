@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Run the privileged policy republisher without Python site initialization.
+"""Retained bootstrap for the legacy privileged policy republisher.
+
+Current direct SN39 mining does not deploy this service.
 
 The systemd unit executes this bootstrap with ``-I -S``. It adds the checked
 venv package root without processing site hooks, loads the checked Cathedral

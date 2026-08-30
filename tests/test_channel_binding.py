@@ -130,10 +130,10 @@ def test_public_launch_docs_require_protected_production_channel():
     launch = Path("docs/TDX_LAUNCH.md").read_text(encoding="utf-8")
     normalized = " ".join(launch.split())
     assert "Production endpoints use HTTPS" in normalized
-    assert "A bearer is sent only over certificate-verified TLS" in normalized
-    assert "only then sends protected work" in normalized
+    assert "does not trust the self-signed certificate through a public CA" in normalized
+    assert "QVL-verified REPORTDATA binds it" in normalized
+    assert "carry the validator's signed request" in normalized
     assert "Plain HTTP and authentication relaxations exist only under `worker develop`" in normalized
-    assert "A public certificate by itself does not prove" in normalized
 
 
 def test_remote_rejects_insecure_custom_tls_context():

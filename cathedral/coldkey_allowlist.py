@@ -8,7 +8,7 @@ publication-age staleness ceiling, and a sha256 digest over the canonical
 document for pinning. Verification reuses the policy registry's parsing and
 canonicalization primitives rather than introducing a second implementation.
 
-See docs/ENROLLMENT_ALLOWLIST.md for the operator workflow.
+See docs/ENROLLMENT_ALLOWLIST.md for the retired-library boundary.
 """
 
 from __future__ import annotations

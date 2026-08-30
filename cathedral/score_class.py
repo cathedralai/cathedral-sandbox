@@ -1,4 +1,6 @@
-"""Signed score-class reports for validator-owned Bittensor weight assignment.
+"""Retained signed score-class report library.
+
+The current direct SN39 validator does not consume these reports.
 
 Cathedral Confidential exports bounded, receipt-backed facts.  It never sees a
 validator wallet, chooses an emissions allocation, or submits weights.

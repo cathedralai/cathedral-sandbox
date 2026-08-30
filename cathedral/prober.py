@@ -1,4 +1,8 @@
-"""Attestation probe loop for enrolled Cathedral miners."""
+"""Retained probe loop for the legacy central enrollment registry.
+
+The current direct SN39 validator probes chain-discovered miners itself and
+does not run ``cathedral-prober``.
+"""
 
 from __future__ import annotations
 
@@ -377,7 +381,7 @@ def _verify_tdx_evidence(
     nonce: bytes,
     policy: Policy,
 ) -> Attested | None:
-    """TDX-CPU launch path: a single verified TDX evidence is sufficient.
+    """Retained TDX-CPU probe: one verified TDX evidence is sufficient.
 
     Returns an ``Attested(CC_CPU_TDX)`` verdict only when the verifier returns
     an ``Attested`` with ``verification_status == "VERIFIED"`` and
@@ -985,7 +989,12 @@ def probe_once(
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    parser = argparse.ArgumentParser(description="Probe enrolled Cathedral miners for TEE evidence")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Retained legacy central-registry probe. Not used by the current "
+            "direct SN39 validator."
+        )
+    )
     parser.add_argument("--db", default="cathedral-enroll.sqlite")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--interval", type=int, default=60)
@@ -1067,7 +1076,7 @@ def main() -> None:
         "--production-mode",
         action="store_true",
         help=(
-            "launch policy: reject enrollments whose endpoint host is not a "
+            "legacy-library policy: reject enrollments whose endpoint host is not a "
             "public IP literal, before any network access (no DNS check/use gap)"
         ),
     )

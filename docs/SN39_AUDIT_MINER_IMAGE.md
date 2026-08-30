@@ -1,31 +1,26 @@
-# SN39 independent audit-miner image
+# Intel TDX miner image
 
-This page defines the hardened signed-fleet worker image for SN39. It
-serves fresh Intel TDX evidence, signed fleet discovery, and signed validation
-work over native TLS on `0.0.0.0:8081`. The fixed staged bridge also keeps
-public evidence and canonical audit SAT available to the current UID30
-collector. Customer SAT stays disabled.
+This page records the immutable image contract. Use the repository
+[README](../README.md) for the mining sequence.
 
-The published replacement contract is source merge
-`78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8` and image
-`ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99`.
-GitHub Actions run `33266307118` published and attested the digest. A separate
-no-permission job proved anonymous registry access. Publication is not
-deployment and does not prove a live two-machine result.
+## Current release
 
-The preserved legacy rollback image was built from source merge
-`8ad7f6e127ad7dcc4dd150f0e1eb47ce72c5ab22`. It invokes
-`worker serve --tee tdx --allow-public-legacy-audit`, does not emit
-`cathedral_effective_startup_v1`, and has a different launcher contract.
+```text
+Source: 78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+Image: ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99
+Platform: linux/amd64
+Runtime contract: signed-validator-fleet-v1
+```
 
-Use [SN39_AUDIT_MINER_OPERATIONS.md](SN39_AUDIT_MINER_OPERATIONS.md) for the
-canonical bounded launch order, one-hotkey-per-listed-machine invariant, dated
-UID124 proof, and stop conditions.
+The digest was published by GitHub Actions run
+[`33266307118`](https://github.com/cathedralai/cathedral-sandbox/actions/runs/33266307118)
+with build provenance and anonymous registry access. This proves the published
+artifact, not a live deployment.
 
-## Published replacement runtime contract
+## Inputs
 
-The default entrypoint accepts no command arguments and exactly three public
-Cathedral environment inputs:
+The default entrypoint accepts no arguments and exactly three Cathedral
+environment values:
 
 ```text
 CATHEDRAL_MINER_HOTKEY=<public Bittensor SS58 hotkey>
@@ -33,299 +28,75 @@ CATHEDRAL_PUBLIC_ENDPOINT=https://<public-ip>:8081
 CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST=sha256:<64-lowercase-hex>
 ```
 
-These values are public identity and integrity pins, not wallet material. The
-entrypoint requires a canonical AccountId32 SS58 hotkey in Bittensor format
-`42`, a globally routable canonical HTTPS IP-literal origin, and an exact
-lowercase SHA-256 key-file digest. It rejects every other `CATHEDRAL_*` input,
-including wallet material, a worker bearer, an artifact signing seed, chain RPC
-configuration, and evidence-collector overrides.
+They are public identity and integrity values. The entrypoint rejects every
+other `CATHEDRAL_*` environment value.
 
-Relative to the legacy image, the public endpoint and public-key digest are the
-only new scalar deployment inputs. The hotkey and immutable image digest were
-already required. Config and state locations, network, subnet, stake floor,
-port, TEE, migration behavior, and limits are fixed.
-
-Everything else is fixed:
+The image fixes the remaining runtime contract:
 
 ```text
 Snapshot: /etc/cathedral/validator-access/validator-access.json
 Public keys: /etc/cathedral/validator-access/snapshot-keys.json
-Fleet manifest: /etc/cathedral/validator-access/fleet.json
-Replay and snapshot high-water state:
-  /var/lib/cathedral/validator-access/validator-access.sqlite
-Network and subnet: finney, SN39
-Validator stake floor: 0 Rao
-Migration behavior: public evidence and canonical audit SAT only
+Fleet: /etc/cathedral/validator-access/fleet.json
+Replay state: /var/lib/cathedral/validator-access/validator-access.sqlite
+Network: finney
+Subnet: 39
+Validator stake floor: 0 Rao plus validator permit
+Listener: native TLS on 0.0.0.0:8081
+TEE: Intel TDX
 ```
 
-The signed snapshot still requires `validator_permit: true`. A zero stake
-floor therefore means permit-only access. It does not mean open access. The
-snapshot producer and its private Ed25519 seed stay outside the guest. The
-read-only guest config contains only the signed public snapshot, public keys,
-and fleet candidates. The persistent state mount contains replay and
-finalized-block high-water state. The worker has no Bittensor wallet or RPC
-client.
+The snapshot signer and its private Ed25519 seed stay outside the guest. The
+worker receives only the signed snapshot, its public keys, the key-file digest,
+and public fleet candidates.
 
-At every start, the entrypoint creates a fresh Ed25519 TLS key and self-signed
-leaf certificate under `/run/cathedral-audit-miner`. The directory is owner-only
-mode `0700`. The key and certificate are owner-only mode `0600`. The worker
-derives its TLS SPKI channel binding from this certificate. The certificate is
-transport identity for attestation binding, not public-CA identity.
+## Attested channel
 
-The generated leaf has the DNS SAN `cathedral-sn39-audit-miner`. The intended
-UID30 launch path advertises an IP-literal axon and does not use this SAN as its
-peer identity. Its independent `HttpsEvidenceTransport` observes the
-self-signed leaf's SPKI, asks the guest to bind that SPKI with the nonce and
-hotkey in REPORT_DATA, verifies the quote with QVL, and requires the SAT POST
-to present the same SPKI. The ordinary production `RemoteMiner` and prober use
-CA and hostname verification and are not compatible with this static SAN. Do
-not substitute that client for the reviewed UID30 attested-SPKI transport.
+At each start, the entrypoint creates a fresh Ed25519 TLS key and self-signed
+certificate inside the guest. A validator observes that TLS SPKI and requires
+the fresh TDX quote to bind the same SPKI, challenge, and miner hotkey. It then
+requires SAT to use the same TLS key.
 
-The published command invokes
-`worker migrate --migration-mode public-legacy-audit`. That command has no TEE
-selector and is fixed to Intel TDX. Docker mounts its own read-only sysfs
-over the image's `/sys` tree, so an image-layer
-`/sys/kernel/config/tsm/report` directory is not a usable bind target. The
-sanitized child environment therefore fixes the collector root at
-`/opt/cathedral-audit-miner/tsm-report`. The operator bind-mounts only the
-guest's host `/sys/kernel/config/tsm/report` subtree at that target. The path is
-not a deployment input. This narrow bind is read-write because quote collection
-creates one report directory, writes `inblob`, and reads `outblob`. Making it
-read-only breaks evidence collection. No broader sysfs tree or TDX device is
-mounted. The image exposes one listener, native TLS on TCP `8081`. It does not
-configure a plaintext listener. The worker uses the kernel configfs TSM path
-through this bounded read-write exception.
+The validator does not trust the self-signed certificate as a public CA
+identity. It trusts the vendor-verified quote binding the live key.
 
-The entrypoint always configures the signed validator-access and bounded
-fleet-discovery role in [WORK_REQUEST_V2.md](WORK_REQUEST_V2.md). It also always
-enables the narrow legacy-audit bridge during staged migration. There is no
-environment flag or command override for signed-only, bearer, customer-SAT,
-SNP, GPU, development, wallet, or RPC modes. Removing the bridge requires a
-later reviewed image change after the signed collector and rollback path are
-live-proven.
+The only writable host hardware mount is the guest's
+`/sys/kernel/config/tsm/report` subtree. Quote collection needs to create a
+report directory and write its challenge. Do not mount broader sysfs or a
+wallet directory.
 
-An operator with control of the container runtime can replace the entrypoint,
-mount different files, or publish another port. Deployment policy must name the
-exact reviewed digest above. The source description and registry publication
-do not prove which image a live guest runs.
+## Host boundary
 
-## Base and dependency pins
+`scripts/run_sn39_signed_fleet_miner.sh` requires the immutable digest and:
 
-The Dockerfile is restricted to Linux amd64 because the launch TDX supply is
-x86-64. Its base is the Docker Hub amd64 manifest:
+- verifies the pulled repository digest, platform, and runtime label;
+- mounts config read-only and replay state separately;
+- uses a read-only container filesystem and a bounded TLS tmpfs;
+- drops Linux capabilities and blocks privilege escalation;
+- applies process, memory, swap, file-descriptor, and shutdown limits;
+- installs one dedicated nftables table for TCP `8081`; and
+- removes only its container and dedicated table on exit.
 
-```text
-python:3.12-slim-bookworm@sha256:4427763a1ba36f5aa8f656a03e5d00f3b8d61f5dd950c73df6c14f8c7640f8ab
-```
+These controls limit ordinary misuse and connection pressure. They do not
+prove DDoS resistance or which image a remote host runs. Fresh attestation is
+the remote proof.
 
-`docker buildx imagetools inspect` resolved this digest from the registry on
-2026-08-26. The manifest identified Python `3.12.14-slim-bookworm` and Docker
-Library revision `f2c5d1b8a6adecb5b00b3c9331d4f863beade6b3`.
-Runtime Python dependencies are exact-version, wheel-only, and hash checked in
-`requirements/sn39-audit-miner.txt`. The Linux amd64 CPython 3.12
-`py-sr25519-bindings==0.2.2` wheel has SHA-256
-`849f77ab12210e8549e58d444e9199d9aba83a988e99ca8bef04dd53e81f9561`.
-The Docker build runs the fixed sr25519 known-answer test and its corrupted
-negative control after installing the wheel. The built image declares runtime
-contract label `org.cathedral.sn39.runtime-contract=signed-validator-fleet-v1`.
+## Temporary compatibility bridge
 
-## Reviewed GHCR publication
+The current image invokes the bounded `public-legacy-audit` migration posture.
+It keeps fresh evidence and canonical audit SAT public while fleet discovery
+and all non-public routes require signed validator requests. Operators cannot
+change this posture through environment variables.
 
-`.github/workflows/publish-sn39-audit-miner.yml` runs only after a reviewed
-change reaches `main` in one of the image inputs. The publisher:
+Moving to signed-only `worker serve` requires a new reviewed image. Do not
+describe the current digest as signed-only.
 
-- grants the publishing job only `contents: read`, `packages: write`,
-  `id-token: write`, `attestations: write`, and `artifact-metadata: write`;
-- checks out the exact event commit without retaining Git credentials;
-- pins the Buildx client and BuildKit builder image used for the build;
-- builds only `linux/amd64` from `Dockerfile.sn39-audit-miner`;
-- publishes one full-commit tag, `sha-<40-lowercase-hex-commit>`, and refuses to
-  overwrite it or continue when the registry lookup is inconclusive;
-- enables maximum BuildKit provenance and records a GitHub build-provenance
-  attestation against the resulting digest; and
-- writes the launch pin to the job summary as
-  `ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:<64-hex>`.
+## Build contract
 
-The workflow publishes no `latest`, branch, or other mutable convenience tag.
-The commit tag is for source lookup. The `image@sha256:...` reference is the
-only launch identity accepted by the validator and Polaris deployment records.
-Runs for the same source commit are serialized. If a run pushes its tag but
-fails before provenance completes, do not overwrite or promote the partial
-publication. Repair through a new reviewed source commit or an explicit package
-version recovery, then capture and verify the new digest.
+- Dockerfile: `Dockerfile.sn39-audit-miner`
+- Entrypoint: `cathedral/audit_miner_entrypoint.py`
+- Host launcher: `scripts/run_sn39_signed_fleet_miner.sh`
+- Exact Python wheels and hashes: `requirements/sn39-audit-miner.txt`
+- Publication workflow: `.github/workflows/publish-sn39-audit-miner.yml`
 
-New GitHub Container Registry packages are private by default. A package admin
-must make the package public in GitHub package settings after its first
-publication. GitHub documents this as an irreversible visibility change. The
-workflow performs an unauthenticated digest inspection in a separate job. That
-job stays red until the package is public. After the visibility change, run the
-workflow's `verify-existing-public-digest` manual path with the captured
-`sha256:...` digest. The manual verification job has no repository or package
-permissions.
-
-Do not promote a digest until all of these are true:
-
-1. The publishing job succeeded.
-2. The provenance attestation succeeded for the same digest.
-3. Anonymous digest inspection succeeded.
-4. The validator and Polaris configuration both name the exact same digest.
-
-GitHub references:
-
-- [Container registry authentication and image publication](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
-- [Package access control and public visibility](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)
-- [Build provenance attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds)
-
-## Run inside the TDX guest
-
-Prepare the fixed host directories. The snapshot producer atomically refreshes
-`validator-access.json` with `minimum_stake_rao: 0`. The fleet file uses the
-schema in [WORK_REQUEST_V2.md](WORK_REQUEST_V2.md), including an empty
-`endpoints` list for a one-machine UID. The private snapshot signing seed stays
-outside these directories.
-
-```bash
-install -d -o root -g root -m 0700 /etc/cathedral/validator-access
-install -d -o root -g root -m 0700 /var/lib/cathedral/validator-access
-install -o root -g root -m 0644 validator-access.json \
-  /etc/cathedral/validator-access/validator-access.json
-install -o root -g root -m 0644 snapshot-keys.json \
-  /etc/cathedral/validator-access/snapshot-keys.json
-install -o root -g root -m 0644 fleet.json \
-  /etc/cathedral/validator-access/fleet.json
-```
-
-Set the reviewed public values and exact published activation digest. The
-script requires the digest suffix to match
-`sha256:[0-9a-f]{64}`. Then run the reviewed host script as root:
-
-```bash
-export SN39_AUDIT_MINER_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:<64-hex>'
-export CATHEDRAL_MINER_HOTKEY='<public-miner-hotkey>'
-export CATHEDRAL_PUBLIC_ENDPOINT='https://<public-ip>:8081'
-export CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST='sha256:<snapshot-keys-json-digest>'
-
-sudo --preserve-env=SN39_AUDIT_MINER_IMAGE,CATHEDRAL_MINER_HOTKEY,CATHEDRAL_PUBLIC_ENDPOINT,CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST \
-  scripts/run_sn39_signed_fleet_miner.sh
-```
-
-The script refuses tags, checks the pulled image's exact RepoDigest,
-`linux/amd64` platform, and runtime-contract label, and then starts Docker with
-the host network. The container root filesystem and config mount are read-only.
-The TLS directory is a bounded tmpfs. Replay state uses the persistent writable
-state mount. Capabilities are dropped, privilege escalation is disabled, and
-process, memory, swap, file-descriptor, and stop-time limits are fixed.
-
-Docker's fixed init process forwards termination to the worker and reaps any
-orphaned descendants. The host keeps the Docker client in the background and
-waits through Bash's signal-aware builtin, so `TERM`, `HUP`, and `INT` run the
-same container and edge-table cleanup before the startup lock is released.
-
-The only write exception outside the state and TLS mounts is the bounded
-configfs path
-`src=/sys/kernel/config/tsm/report,dst=/opt/cathedral-audit-miner/tsm-report`.
-It must remain read-write for the kernel TSM quote protocol. The script does
-not mount `/dev/tdx_guest` or a broader sysfs path.
-
-Before Docker starts, the script syntax-checks and atomically installs the
-dedicated `inet cathedral_sn39` nftables table. It affects only TCP destination
-port `8081`. For IPv4 it permits at most two tracked connections per source and
-limits new SYN packets to four per second with a burst of eight. IPv6 traffic
-to this fixed IPv4 launch listener is dropped. Named accept and drop counters
-are visible with `nft list table inet cathedral_sn39`. Accepted TCP is passed
-through unchanged, so TLS still terminates inside the container. Other host
-traffic retains the existing default behavior.
-
-A nonblocking host lock at `/run/cathedral-sn39-startup.lock` serializes the
-container name, nftables installation, and cleanup for the process lifetime.
-A second start fails before its first Docker or nftables action. Signal and
-failure cleanup retain the lock until this process's container and dedicated
-table are gone. This prevents a failed contender from deleting the active
-worker's edge table.
-
-These limits are bounded functional protection for the source finding about
-pre-header stalls. They are not distributed-DDoS proof. The cloud firewall
-still limits ingress to the intended validator path. Monitoring must alert on
-the named drop counter, container exit, stale snapshot, replay-state failure,
-and quote or SAT failure.
-
-On normal exit or failed startup, the script removes only its dedicated
-`inet cathedral_sn39` table. If the process is killed without cleanup, the
-manual network-edge rollback is exactly:
-
-```bash
-sudo nft delete table inet cathedral_sn39
-```
-
-Do not flush another nftables table. Do not pass a wallet seed, wallet JSON,
-validator private key, snapshot signing seed, bearer, RPC URL, or TDX collector
-override. Registration and the signed Bittensor axon advertisement happen
-outside this image.
-
-Do not copy `worker.key` out of the guest. The leaf certificate is public, but
-UID30 does not treat it as a pre-shared trust anchor. The entrypoint rotates the
-key and certificate on every container start, so the validator must observe the
-new SPKI and verify a fresh quote before sending audit work. Cross-repository
-tests cover the IP-literal TLS context and SPKI checks. The bounded UID124 test
-on 2026-08-28 completed one live container, public axon, configfs quote, QVL
-verdict, and same-SPKI SAT round trip. That dated result does not prove a new
-deployment or ongoing availability. See
-[SN39_AUDIT_MINER_OPERATIONS.md](SN39_AUDIT_MINER_OPERATIONS.md#2026-08-28-bounded-proof).
-
-## Measurement and pin boundary
-
-The fresh TDX quote binds the validator nonce, public hotkey, and runtime TLS
-SPKI. It proves the verified guest produced that binding under the admitted TDX
-policy. It does not place the post-boot OCI image digest into MRTD, an RTMR, or
-another TDX launch measurement automatically.
-
-The OCI digest is therefore an operator-enforced supply-chain pin. The
-validator and Polaris deployment configuration must record and compare it
-separately. Build provenance connects the digest to source and build metadata.
-It does not convert the digest into TDX measurement evidence. A measured image
-loader or an explicit in-guest measurement extension remains a separate
-assurance gate.
-
-## Rollback and remaining launch gates
-
-The fixed startup script accepts only a digest carrying
-`signed-validator-fleet-v1`. It cannot launch the reviewed legacy digest, which
-has a different entrypoint, environment, and mount contract. Do not substitute
-the legacy digest into this script.
-
-After one signed-fleet digest has passed live proof, rollback means restoring
-that previously proven signed-fleet `image@sha256:...` value in validator and
-Polaris configuration, restarting through the same fixed script, and repeating
-anonymous pull and live TDX/SAT validation. Do not retag, overwrite, or delete
-a published launch digest as a rollback mechanism.
-
-For the first signed-fleet activation, no previously proven signed-fleet digest
-exists. The full legacy-runtime restore is a different command and
-configuration transition. That restore was captured and exercised on
-2026-08-29 using the preserved legacy image and the sanitized proof named in
-`SN39_AUDIT_MINER_OPERATIONS.md`. Repeat the procedure before relying on it for
-a future activation. A digest-only swap is not a rollback plan.
-
-Stop the signed-fleet container before changing its config. The startup script
-removes only `inet cathedral_sn39`; remove that exact table manually if an
-unclean stop left it behind. Never flush the host firewall.
-
-Source and publication alone do not:
-
-- register a hotkey on SN39;
-- publish the guest IP and port as an axon;
-- create a cloud firewall rule;
-- make the Workers platform publish container ports or configfs;
-- prove a new deployment's anonymous pull, quote, SAT result, validator ingest,
-  weight write, or emission;
-- prove the intended UID30 IP-literal attested-SPKI transport for any endpoint
-  other than the dated bounded proof; or
-- prove the application image is included in the admitted TDX measurement.
-
-Source review, image tests, startup-script contract tests, repository CI,
-immutable publication, provenance verification, and anonymous registry access
-are complete for the reviewed digest. Deployment remains blocked until the
-matching validator configuration is confirmed, the fixed nftables boundary and
-monitoring are exercised, and two distinct TDX machines for one UID pass fresh
-signed access, fleet discovery, QVL, same-SPKI SAT, hardware deduplication, and
-no-write weight preview.
+Use [SN39 miner image operations](SN39_AUDIT_MINER_OPERATIONS.md) for the
+current pin, fleet rules, and stop conditions.

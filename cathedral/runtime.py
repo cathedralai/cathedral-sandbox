@@ -1,8 +1,7 @@
-"""Confidential CPU-TDX and audit-only composite-GPU report runtime.
+"""Retained receipt-epoch and publisher runtime.
 
-This module only freezes and optionally publishes Cathedral confidential-compute
-reports. The existing validator remains the sole owner of score composition,
-signing, and chain publication.
+The current direct SN39 validator does not use this module. It remains for
+compatibility tests and historical receipt and report artifacts.
 """
 
 from __future__ import annotations

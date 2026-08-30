@@ -1,4 +1,7 @@
-"""Publicly derivable TDX challenge nonces anchored to finalized chain state.
+"""Retained epoch-library TDX challenge derivation.
+
+The current direct SN39 validator issues its own fresh challenges and does not
+consume this public epoch nonce.
 
 A random issuer nonce is not a public freshness proof: nothing ties it to
 the scoring epoch, so an issuer could reuse it and a bounded replay cache

@@ -1,5 +1,5 @@
 [Unit]
-Description=Refresh Cathedral SN39 signed policy publication before its 24-hour ceiling
+Description=Legacy policy-library republisher timer, not current SN39 mining
 
 [Timer]
 OnBootSec=5min
@@ -11,4 +11,3 @@ Unit=cathedral-sn39-policy-republisher.service
 
 [Install]
 WantedBy=timers.target
-

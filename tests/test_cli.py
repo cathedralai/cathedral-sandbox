@@ -1747,6 +1747,8 @@ def test_validator_wrapper_help_uses_runtime_parser(capsys):
 
     help_text = capsys.readouterr().out
     assert "usage: cathedral runtime" in help_text
+    assert "Retained legacy" in help_text
+    assert "not use this command group" in help_text
     assert "retry-publish" in help_text
     assert "run-epoch" in help_text
 

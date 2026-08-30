@@ -175,21 +175,14 @@ def test_release_notes_template_binds_provenance_and_states_trust_limits():
     assert "cathedral-tdx-verifier-v1.2.3" in rendered
     assert "a" * 40 in rendered
 
-    assert "does not claim that a tag or GitHub release exists" in normalized_guide
-    assert "exactly two explicit assets" in normalized_guide
-    assert "not reachable from the current `origin/main`" in normalized_guide
-    assert "does not change GitHub's latest-release marker" in normalized_guide
-    assert "not use the raw asset SHA" in normalized_guide
-    assert "before any publishing command" in normalized_guide
-    assert "confirm GitHub immutable releases are enabled" in normalized_guide
-    assert "Protect Cathedral TDX verifier release tags" in normalized_guide
-    assert "public rulesets API without credentials" in normalized_guide
-    assert "no bypass actors" in normalized_guide
-    assert "does not claim to prove the no-bypass operator preflight" in normalized_guide
-    assert "An upload failure or byte mismatch cannot publish a partial release" in normalized_guide
-    assert "require `isImmutable=true`" in normalized_guide
-    assert "separate empty Go build caches" in normalized_guide
-    assert "live anonymous-download proof" in normalized_guide
+    assert "cathedral-tdx-verifier-v1.0.0" in guide
+    assert "065852443ef423e16b77289086321807f226a50d" in guide
+    assert EXPECTED_SHA256 in guide
+    assert "exactly the binary and checksum" in normalized_guide
+    assert "downloads both anonymously" in normalized_guide
+    assert "two separate empty build caches" in normalized_guide
     assert "Do not download the verifier from a Cathedral API" in normalized_guide
-    assert "docs/RELEASE_CHECKLIST.md" in guide
+    assert "--qvl" in guide
+    assert "UpToDate" in guide
+    assert "prove a live deployment" in normalized_guide
     assert "TDX_VERIFIER_RELEASE_NOTES_TEMPLATE.md" in workflow

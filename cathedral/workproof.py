@@ -1,4 +1,7 @@
-"""Independent SAT work replay: the workload half of full provenance.
+"""Retained SAT replay for the legacy provenance path.
+
+The current direct SN39 validator verifies SAT responses directly and does not
+consume this published work-proof chain.
 
 A hardware quote proves *where* work ran; it says nothing about *what* work
 was done. A signed receipt asserts work digests and units, but a signer-only

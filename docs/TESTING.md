@@ -1,85 +1,82 @@
-# RUNTEST — Cathedral test suite
+# Test Cathedral sandbox
 
-The default suite is hardware-free and uses test doubles behind the real
-`verify()` interface. The package has runtime dependencies declared in
-`pyproject.toml`; `pytest` and other tooling are installed through the `dev`
-extra. A green local suite proves software behavior, not live TDX hardware,
-deployment, current evidence freshness, miner eligibility, or chain state.
+The default suite runs without confidential-compute hardware. It tests the
+real software interfaces with local fixtures and test doubles. A green run does
+not prove live hardware, deployment, miner eligibility, chain state, weights,
+or emissions.
 
-## 1. Create the venv and install
+## Install and run
 
-Requires Python 3.11+.
+Requires Python 3.11 or newer.
 
 ```bash
-cd /home/user/cathedral
-python3.11 -m venv .venv
+cd /path/to/cathedral-sandbox
+python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -e '.[dev]'   # installs the package + pytest
-```
-
-`-e '.[dev]'` puts `cathedral` on the path (so `scripts/` and console entry
-points import cleanly), installs the runtime dependencies declared in
-`pyproject.toml`, and pulls in the development tools.
-
-## 2. Run the test suite
-
-```bash
+.venv/bin/python -m pip install -e '.[dev]'
 .venv/bin/python -m pytest -q
 ```
 
-All hardware-free tests must pass. Hardware-gated coverage includes the TDX
-quote round trip, the AMD SEV-SNP friend self-test, SAT lane e2e, and non-TDX
-negative controls. Those cases are skipped unless `CATHEDRAL_RUN_TDX_HW=1`,
-`CATHEDRAL_RUN_SNP_HW=1`, or `CATHEDRAL_RUN_TDX_NEGATIVE=1` is set on the
-appropriate machine. The bounded SEV-SNP procedure is in
-[`AMD_SEV_SNP_FRIEND_TEST.md`](AMD_SEV_SNP_FRIEND_TEST.md).
+The full suite must pass before publication. Do not publish a fixed passing
+count. Hardware-gated tests skip on machines without the required TEE.
 
-The plain-HTTP worker path is loopback-only test compatibility and cannot
-satisfy protected work dispatch. Runtime integration tests use injected channel
-clients; a real worker/runtime exercise requires the TLS-SPKI setup in
-[`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md).
-
-## 3. Run the SAT demo
-
-Dispatches a SAT instance, solves it, verifies the self-certifying certificate,
-and prints `PASS`:
+## SAT smoke test
 
 ```bash
 .venv/bin/python scripts/demo_sat.py
 ```
 
-Expected output (assignment varies with the canonical seed):
+Success ends with:
 
-```
-dispatched SAT instance: seed=0 n_vars=8 n_clauses=20
-miner returned: satisfiable=True assignment=[...] work_units=20.0
-certificate verified; lane score=20.0
+```text
 PASS
 ```
 
-## 4. Optional: one full mock epoch
+This proves local SAT dispatch, solving, and certificate verification. It does
+not prove a remote miner or validator scoring cycle.
 
-The validator neuron composes the whole path (MOCK-attest → sybil-dedup by
-`chip_id` → SAT lane → emission routing) hardware-free:
+## Intel TDX hardware tests
+
+Run inside an Intel TDX guest:
 
 ```bash
-.venv/bin/python -c "
-from cathedral.neuron.validator import epoch
-from cathedral.neuron.miner import MockMiner
-from cathedral.common import Policy
-miners = [MockMiner('uid-1','hk-1',chip_id='chip-1'),
-          MockMiner('uid-2','hk-2',chip_id='chip-2')]
-r = epoch(miners, Policy(allowed_measurements={'mock-measurement-0'}))
-print('admitted', r.admitted); print('weights', r.weights); print('burn', r.burn)
-"
+CATHEDRAL_RUN_TDX_HW=1 \
+  .venv/bin/python -m pytest -q \
+  tests/test_attest_tdx_hw.py tests/test_tdx_sat_e2e_hw.py
 ```
 
-## Console entry points (installed by step 1)
+Run the negative control on a non-TDX Linux host:
 
-- `cathedral` — operator CLI, including offline `customer-receipt verify`
-- `cathedral-census` — the CC capability probe
-- `cathedral-snp-friend-probe` — bounded AMD SEV-SNP development probe
+```bash
+CATHEDRAL_RUN_TDX_NEGATIVE=1 \
+  .venv/bin/python -m pytest -q tests/test_attest_tdx_negative.py
+```
 
-The former `cathedral-compute-validator` and `cathedral-miner` compatibility
-aliases are not installed. Use the posture-specific `cathedral runtime ...`
-and `cathedral worker ...` commands.
+The remote worker contract also requires native TLS and verified SPKI binding.
+Follow [TDX_LAUNCH.md](TDX_LAUNCH.md). Plain HTTP is loopback-only test
+compatibility and is not a production validator path.
+
+## AMD SEV-SNP friend test
+
+Run only on a friend-owned SEV-SNP guest:
+
+```bash
+CATHEDRAL_RUN_SNP_HW=1 \
+  .venv/bin/python -m pytest -q tests/test_attest_snp_hw.py
+```
+
+Follow [AMD_SEV_SNP_FRIEND_TEST.md](AMD_SEV_SNP_FRIEND_TEST.md) for the bounded
+probe and evidence capture. Passing this test does not enable production
+scoring or prove the end-to-end validator path.
+
+## Installed commands
+
+- `cathedral` runs the operator and worker CLI.
+- `cathedral-census` reports confidential-compute capability.
+- `cathedral-prober` is the retained central-registry probe. Current mining
+  does not use it.
+- `cathedral-snp-friend-probe` runs the bounded AMD SEV-SNP friend probe.
+
+Use `cathedral worker serve` for the production signed-access worker. The
+published c730 image still uses a temporary `public-legacy-audit` migration
+bridge. See [WORK_REQUEST_V2.md](WORK_REQUEST_V2.md) for the exact boundary.
