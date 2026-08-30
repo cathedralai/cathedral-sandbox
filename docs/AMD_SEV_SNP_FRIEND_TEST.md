@@ -1,8 +1,9 @@
 # AMD SEV-SNP miner
 
-AMD SEV-SNP is a scored SN39 CPU path through the separate Cathedral validator
-after its released SNP admission policy accepts the machine. This repository
-serves the evidence and work but does not write SN39 weights. The validator still requires fresh
+AMD SEV-SNP is a source-ready SN39 CPU path. It becomes scored only after the
+separate Cathedral validator releases a pin to this exact contract and its SNP
+admission policy accepts the machine. This repository serves the evidence and
+work but does not write SN39 weights. The validator still requires fresh
 vendor-verified evidence, the live TLS key bound into the report, a distinct
 hardware identity, and canonical SAT. Registration and a local probe do not
 earn weight by themselves.

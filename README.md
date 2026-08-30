@@ -19,7 +19,7 @@ does not download weights from Cathedral and it does not use a weight relay.
 For each UID, the validator:
 
 1. reads the miner's on-chain HTTPS endpoint;
-2. verifies fresh Intel TDX or AMD SEV-SNP evidence and the live TLS key for that machine;
+2. verifies fresh evidence and the live TLS key for a CPU path enabled in that validator release;
 3. reads its fleet list through the verified channel;
 4. verifies fresh evidence and the live TLS key for each added machine;
 5. zeroes every claimant involved in a duplicate endpoint, hardware identity,
@@ -37,7 +37,12 @@ guarantee TAO. The subnet must have positive emission.
 |---|---|---|
 | Intel TDX on Linux | Mainnet live testing | Eligible after fresh TDX and SAT verification |
 | More Intel TDX machines on one UID | Mainnet live testing | Each distinct verified machine adds to that UID's score |
-| AMD SEV-SNP on Linux | Validator-supported production admission | Eligible after the validator's pinned SNP policy, fresh evidence, and SAT verification |
+| AMD SEV-SNP on Linux | Source-ready, validator release pending | Eligible only after a released validator pins this contract and its SNP policy admits fresh evidence and SAT |
+
+The current mainnet validator release supports Intel TDX. The SNP miner surface
+in this repository is source-ready. It does not become weight-eligible until a
+Cathedral validator release pins this exact contract and publishes its SNP
+policy.
 
 For AMD, the validator proves an admitted guest measurement, distinct hardware,
 the live HTTPS key, and returned SAT work. It does not remotely attest the OCI
@@ -330,11 +335,12 @@ zero for the round.
 
 ## AMD SEV-SNP
 
-AMD SEV-SNP is a production admission path. Start with the observed hardware
-proof in [AMD SEV-SNP miner](docs/AMD_SEV_SNP_FRIEND_TEST.md), then use the
-separate immutable image only after the validator policy admits the exact
-measurement and TCB. Do not register or announce the hotkey until that local
-and validator evidence passes. Neither result proves a finalized weight row.
+AMD SEV-SNP is a source-ready scored path. It becomes production-eligible only
+after a released validator pins this exact contract and its policy admits the
+observed measurement and TCB. Start with the hardware proof in
+[AMD SEV-SNP miner](docs/AMD_SEV_SNP_FRIEND_TEST.md). Do not register or
+announce the hotkey until the matching validator release exists and both local
+and validator evidence pass. Neither result proves a finalized weight row.
 
 ## Reference
 

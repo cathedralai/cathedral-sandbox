@@ -32,7 +32,7 @@ def test_readme_is_the_single_current_mining_guide() -> None:
         "each distinct verified machine",
         "Intel TDX",
         "AMD SEV-SNP",
-        "Validator-supported production admission",
+        "Source-ready, validator release pending",
         "c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99",
         "current migration bridge",
         "btcli axon set",
