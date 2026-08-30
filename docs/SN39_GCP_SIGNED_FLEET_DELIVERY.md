@@ -25,9 +25,10 @@ Both modes are fixed to:
   SSH keys blocked.
 - A five-minute snapshot refresh and a maximum 900-second signed snapshot.
 
-Each selected old guest must finish deleting and its static address must return
-to `RESERVED` before the provisioner proceeds. Primary-only mode neither creates
-nor updates the secondary.
+Both fixed UID124 VM names must be absent before either provisioner proceeds.
+Each selected static address must also be `RESERVED`. Primary-only mode neither
+creates nor updates the secondary, and it refuses if the fixed secondary name
+already exists so its one-guest plan and cost estimate remain truthful.
 
 ## Trust and secret boundary
 
@@ -140,11 +141,12 @@ python scripts/sn39_gcp_snapshot_publisher.py provision \
   --acknowledge CREATE_TWO_UID124_TDX_GUESTS_FOR_FOUR_HOURS
 ```
 
-Each command refuses while a selected fixed VM name already exists, a selected
+Each command refuses while either fixed UID124 VM name already exists, a selected
 static address remains in use, shared network policy differs, an artifact pin is
-invalid, or finalized UID30 no longer has a permit. In two-machine mode, if one
-create succeeds and the other fails, it performs no destructive rollback. Every
-created guest retains its four-hour automatic deletion bound.
+invalid, or finalized UID30 no longer has a permit. It ignores unrelated VM
+names. In two-machine mode, if one create succeeds and the other fails, it
+performs no destructive rollback. Every created guest retains its four-hour
+automatic deletion bound.
 
 ## Public snapshot refresh
 

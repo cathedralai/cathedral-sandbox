@@ -818,7 +818,8 @@ def wait_for_guest_tls(*, vms: Sequence[VMPolicy] = VMS) -> None:
 
 def _desired_instances_absent(*, vms: Sequence[VMPolicy] = VMS) -> None:
     mode = _operator_mode(vms)
-    names = " ".join(vm.name for vm in vms)
+    guarded_vms = VMS if mode == "primary_only" else vms
+    names = " ".join(vm.name for vm in guarded_vms)
     rows = _gcloud_json(
         [
             "compute",
@@ -833,7 +834,7 @@ def _desired_instances_absent(*, vms: Sequence[VMPolicy] = VMS) -> None:
     if rows:
         if mode == "two_guest":
             raise PublisherError("one or both bounded fleet VM names already exist")
-        raise PublisherError("a selected bounded VM name already exists")
+        raise PublisherError("a fixed UID124 VM name already exists")
 
 
 def provision(

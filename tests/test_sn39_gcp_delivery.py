@@ -554,9 +554,37 @@ def test_guest_fleet_policy_is_exact_for_both_machines():
     poller._validate_fleet(publisher.fleet_bytes(publisher.VMS[1]), secondary)
 
     wrong = json.loads(publisher.fleet_bytes(publisher.VMS[0]))
-    wrong["endpoints"] = []
+    wrong["endpoints"] = ["https://203.0.113.20:8081"]
     with pytest.raises(poller.GuestDeliveryError, match="two-machine policy"):
         poller._validate_fleet(json.dumps(wrong).encode(), primary)
+
+
+def test_primary_only_producer_manifest_matches_guest_consumer_exactly():
+    primary = poller.VMPolicy(poller.PRIMARY_NAME, poller.PRIMARY_IP)
+    payload = publisher.fleet_bytes(publisher.PRIMARY_ONLY_VMS[0])
+
+    poller._validate_fleet(payload, primary)
+
+    document = json.loads(payload)
+    refused = [
+        {**document, "endpoints": ["https://203.0.113.20:8081"]},
+        {
+            **document,
+            "endpoints": [
+                f"https://{poller.SECONDARY_IP}:8081",
+                f"https://{poller.SECONDARY_IP}:8081",
+            ],
+        },
+        {**document, "unexpected": True},
+    ]
+    for candidate in refused:
+        with pytest.raises(poller.GuestDeliveryError, match="primary-only"):
+            poller._validate_fleet(json.dumps(candidate).encode(), primary)
+
+    with pytest.raises(poller.GuestDeliveryError, match="fixed guest identity"):
+        poller._validate_fleet(
+            payload, poller.VMPolicy(poller.PRIMARY_NAME, poller.SECONDARY_IP)
+        )
 
 
 def test_snapshot_freshness_has_exact_900_second_bounds():
@@ -1331,6 +1359,45 @@ def test_primary_only_create_ambiguity_names_only_the_primary(capsys, monkeypatc
         f"create instance {publisher.PRIMARY_NAME}"
     )
     assert publisher.SECONDARY_NAME not in json.dumps(report)
+
+
+def test_primary_only_provision_refuses_the_fixed_secondary(monkeypatch):
+    observed = []
+
+    def list_instances(arguments, **_kwargs):
+        observed.append(arguments)
+        return [{"name": publisher.SECONDARY_NAME}]
+
+    monkeypatch.setattr(publisher, "_gcloud_json", list_instances)
+    monkeypatch.setattr(publisher, "validate_inputs", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        publisher, "verify_shared_infrastructure", lambda **_kwargs: None
+    )
+    monkeypatch.setattr(
+        publisher,
+        "capture_snapshot",
+        lambda **_kwargs: pytest.fail("secondary guard reached snapshot capture"),
+    )
+    monkeypatch.setattr(
+        publisher.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("secondary guard reached a cloud write"),
+    )
+
+    with pytest.raises(publisher.PublisherError, match="fixed UID124 VM name"):
+        publisher.provision(
+            signing_key=Path("/not-opened.seed"),
+            signing_key_id="cathedral-validator-access-1",
+            keys_file=Path("/not-opened.json"),
+            image=IMAGE,
+            vms=publisher.PRIMARY_ONLY_VMS,
+        )
+
+    assert len(observed) == 1
+    assert _flag_value(observed[0], "--filter") == (
+        f"name=({publisher.PRIMARY_NAME} {publisher.SECONDARY_NAME})"
+    )
+    assert "unrelated" not in " ".join(observed[0])
 
 
 def test_primary_only_core_never_creates_or_updates_the_secondary(tmp_path, monkeypatch):
