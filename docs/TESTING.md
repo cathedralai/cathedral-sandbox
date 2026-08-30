@@ -56,7 +56,7 @@ The remote worker contract also requires native TLS and verified SPKI binding.
 Follow [TDX_LAUNCH.md](TDX_LAUNCH.md). Plain HTTP is loopback-only test
 compatibility and is not a production validator path.
 
-## AMD SEV-SNP friend test
+## AMD SEV-SNP hardware test
 
 Run only on a friend-owned SEV-SNP guest:
 
@@ -66,8 +66,9 @@ CATHEDRAL_RUN_SNP_HW=1 \
 ```
 
 Follow [AMD_SEV_SNP_FRIEND_TEST.md](AMD_SEV_SNP_FRIEND_TEST.md) for the bounded
-probe and evidence capture. Passing this test does not enable production
-scoring or prove the end-to-end validator path.
+probe and evidence capture. Passing this test does not prove the end-to-end
+validator path, a registered miner, or a finalized weight row. Production
+weight also requires the validator's released SNP admission policy.
 
 ## Installed commands
 
@@ -77,6 +78,8 @@ scoring or prove the end-to-end validator path.
   does not use it.
 - `cathedral-snp-friend-probe` runs the bounded AMD SEV-SNP friend probe.
 
-Use `cathedral worker serve` for the production signed-access worker. The
-published c730 image still uses a temporary `public-legacy-audit` migration
-bridge. See [WORK_REQUEST_V2.md](WORK_REQUEST_V2.md) for the exact boundary.
+Use `cathedral worker serve` for the Intel TDX production signed-access worker
+and `cathedral worker serve-snp` for the AMD SEV-SNP production worker. The
+published c730 Intel image still uses a temporary `public-legacy-audit`
+migration bridge. See [WORK_REQUEST_V2.md](WORK_REQUEST_V2.md) for the exact
+access boundary.

@@ -10,8 +10,10 @@ or burn mechanism.
 
 ## 3. Hardware profiles
 
-Intel TDX is the only profile eligible for current SN39 scoring. AMD SEV-SNP
-has a friend-hardware test. Confidential GPU support remains development work.
+Intel TDX and AMD SEV-SNP are confidential CPU profiles. The direct validator
+counts an SNP machine only after its released SNP policy accepts the exact
+measurement and TCB, then fresh evidence, TLS binding, and SAT pass. This code
+map does not define a GPU mining path.
 
 ## 4. Work lane
 

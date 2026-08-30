@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import struct
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -25,6 +26,10 @@ from cathedral.verify.snp import (
 FIXTURES = Path(__file__).parent / "fixtures" / "snp"
 REPORT = FIXTURES / "attestation-report.bin"
 REQUEST_DATA = FIXTURES / "request-data.bin"
+
+
+def test_verifier_unavailable_has_stable_infrastructure_category():
+    assert SnpVerifierUnavailable.category == "verifier_infrastructure_unavailable"
 
 
 def _policy_for(report: bytes) -> Policy:
@@ -405,6 +410,214 @@ def test_invalid_attestation_is_a_terminal_rejection_not_a_kds_retry(monkeypatch
     assert sum(command[1:3] == ["verify", "attestation"] for command in calls) == 2
 
 
+def test_kds_4xx_is_invalid_evidence_not_a_validator_outage(monkeypatch):
+    attempts = 0
+
+    def reject_certificate_request(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        command = ["/test/snpguest", "fetch", "vcek"]
+        raise snp_module.subprocess.CalledProcessError(
+            1,
+            command,
+            stderr="ERROR: Unable to fetch VCEK from URL: 400 Bad Request",
+        )
+
+    monkeypatch.setattr(
+        snp_module,
+        "_pinned_snpguest",
+        lambda _path: nullcontext("/test/snpguest"),
+    )
+    monkeypatch.setattr(snp_module, "_verify_chain_with_snpguest", reject_certificate_request)
+
+    report = _admissible_fixture()
+    assert (
+        verify_snp_report_data(
+            report,
+            REQUEST_DATA.read_bytes(),
+            _policy_for(report),
+            snpguest_path="/test/snpguest",
+            raise_on_verifier_unavailable=True,
+        )
+        is None
+    )
+    assert attempts == 1
+
+
+def test_malformed_report_rejected_by_snpguest_is_invalid_evidence(monkeypatch):
+    attempts = 0
+
+    def reject_malformed_report(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        command = ["/test/snpguest", "fetch", "vcek"]
+        raise snp_module.subprocess.CalledProcessError(
+            1,
+            command,
+            stderr=(
+                "ERROR: Could not open attestation report\n"
+                "because: Failed to build report from the raw bytes. "
+                "Report could be malformed."
+            ),
+        )
+
+    monkeypatch.setattr(
+        snp_module,
+        "_pinned_snpguest",
+        lambda _path: nullcontext("/test/snpguest"),
+    )
+    monkeypatch.setattr(snp_module, "_verify_chain_with_snpguest", reject_malformed_report)
+
+    report = _admissible_fixture()
+    assert (
+        verify_snp_report_data(
+            report,
+            REQUEST_DATA.read_bytes(),
+            _policy_for(report),
+            snpguest_path="/test/snpguest",
+            raise_on_verifier_unavailable=True,
+        )
+        is None
+    )
+    assert attempts == 1
+
+
+def test_unknown_fetch_failure_is_not_misreported_as_amd_outage(monkeypatch):
+    attempts = 0
+
+    def reject_bad_local_command(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        command = ["/test/snpguest", "fetch", "ca"]
+        raise snp_module.subprocess.CalledProcessError(
+            2,
+            command,
+            stderr="error: unexpected argument '--wrong-flag' found\nUsage: snpguest fetch ca",
+        )
+
+    monkeypatch.setattr(
+        snp_module,
+        "_pinned_snpguest",
+        lambda _path: nullcontext("/test/snpguest"),
+    )
+    monkeypatch.setattr(snp_module, "_verify_chain_with_snpguest", reject_bad_local_command)
+
+    report = _admissible_fixture()
+    assert (
+        verify_snp_report_data(
+            report,
+            REQUEST_DATA.read_bytes(),
+            _policy_for(report),
+            snpguest_path="/test/snpguest",
+            raise_on_verifier_unavailable=True,
+        )
+        is None
+    )
+    assert attempts == 1
+
+
+def test_kds_5xx_blocks_the_validator_write_as_infrastructure(monkeypatch):
+    attempts = 0
+
+    def fail_during_kds_outage(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        command = ["/test/snpguest", "fetch", "ca"]
+        raise snp_module.subprocess.CalledProcessError(
+            1,
+            command,
+            stderr="ERROR: Unable to fetch certificate: 503 Service Unavailable",
+        )
+
+    monkeypatch.setattr(
+        snp_module,
+        "_pinned_snpguest",
+        lambda _path: nullcontext("/test/snpguest"),
+    )
+    monkeypatch.setattr(snp_module, "_verify_chain_with_snpguest", fail_during_kds_outage)
+    monkeypatch.setattr(snp_module.time, "sleep", lambda _seconds: None)
+
+    report = _admissible_fixture()
+    with pytest.raises(SnpVerifierUnavailable, match="infrastructure is unavailable") as error:
+        verify_snp_report_data(
+            report,
+            REQUEST_DATA.read_bytes(),
+            _policy_for(report),
+            snpguest_path="/test/snpguest",
+            raise_on_verifier_unavailable=True,
+        )
+
+    assert attempts == 3
+    assert isinstance(error.value.__cause__, snp_module.subprocess.CalledProcessError)
+
+
+def test_kds_transport_failure_blocks_the_validator_write(monkeypatch):
+    attempts = 0
+
+    def fail_to_reach_kds(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        command = ["/test/snpguest", "fetch", "vcek"]
+        raise snp_module.subprocess.CalledProcessError(
+            1,
+            command,
+            stderr=(
+                "ERROR: Unable to send request for VCEK\n"
+                "because: error sending request for url\n"
+                "because: connection refused"
+            ),
+        )
+
+    monkeypatch.setattr(
+        snp_module,
+        "_pinned_snpguest",
+        lambda _path: nullcontext("/test/snpguest"),
+    )
+    monkeypatch.setattr(snp_module, "_verify_chain_with_snpguest", fail_to_reach_kds)
+    monkeypatch.setattr(snp_module.time, "sleep", lambda _seconds: None)
+
+    report = _admissible_fixture()
+    with pytest.raises(SnpVerifierUnavailable, match="infrastructure is unavailable"):
+        verify_snp_report_data(
+            report,
+            REQUEST_DATA.read_bytes(),
+            _policy_for(report),
+            snpguest_path="/test/snpguest",
+            raise_on_verifier_unavailable=True,
+        )
+
+    assert attempts == 3
+
+
+def test_snpguest_timeout_blocks_the_validator_write(monkeypatch):
+    attempts = 0
+
+    def time_out(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise snp_module.subprocess.TimeoutExpired("snpguest", 5)
+
+    monkeypatch.setattr(
+        snp_module,
+        "_pinned_snpguest",
+        lambda _path: nullcontext("/test/snpguest"),
+    )
+    monkeypatch.setattr(snp_module, "_verify_chain_with_snpguest", time_out)
+    monkeypatch.setattr(snp_module.time, "sleep", lambda _seconds: None)
+
+    report = _admissible_fixture()
+    with pytest.raises(SnpVerifierUnavailable, match="infrastructure is unavailable"):
+        verify_snp_report_data(
+            report,
+            REQUEST_DATA.read_bytes(),
+            _policy_for(report),
+            snpguest_path="/test/snpguest",
+            raise_on_verifier_unavailable=True,
+        )
+
+    assert attempts == 3
+
+
 def test_external_certificate_directory_is_refused_before_execution(monkeypatch, tmp_path):
     called = False
 
@@ -420,6 +633,16 @@ def test_external_certificate_directory_is_refused_before_execution(monkeypatch,
         certs_dir=tmp_path / "shared-certs",
     )
     assert called is False
+
+
+def test_snpguest_subprocess_timeout_never_exceeds_the_validator_deadline(
+    monkeypatch,
+):
+    monkeypatch.setenv("CATHEDRAL_SNPGUEST_TIMEOUT", "30")
+    monkeypatch.setattr(snp_module.time, "monotonic", lambda: 100.0)
+    assert snp_module._snpguest_command_timeout(105.0) == 5.0
+    with pytest.raises(snp_module.subprocess.TimeoutExpired):
+        snp_module._snpguest_command_timeout(100.0)
 
 
 def test_amd_ark_requires_the_reviewed_generation_spki(monkeypatch, tmp_path):

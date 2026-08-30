@@ -64,6 +64,9 @@ from cathedral.lifecycle import (
 from cathedral.poster import Poster
 from cathedral.receipt import ReceiptIssuer
 from cathedral.remote import RemoteMiner
+from cathedral.score_audience import validate_score_audience
+from cathedral.score_class import validate_candidate_snapshot
+from cathedral.verify import preflight_tdx_verifier, verify
 
 _BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 _process_boot_id: str | None = None
@@ -88,10 +91,6 @@ def _producer_boot_id() -> str:
             if not _process_boot_id:
                 _process_boot_id = f"process:{uuid.uuid4().hex}"
         return _process_boot_id
-
-from cathedral.score_audience import validate_score_audience
-from cathedral.score_class import validate_candidate_snapshot
-from cathedral.verify import preflight_tdx_verifier, verify
 
 MAX_BEARER_TOKEN_LENGTH = 4096
 SAT_WORK_POLICY_DIGEST = sha256_digest(b"cathedral-sat-work-verification-policy-v1")
@@ -1704,6 +1703,9 @@ class ConfidentialRuntime:
         *,
         cancel_event: threading.Event | None = None,
     ) -> _AttestationResult:
+        verification_deadline = time.monotonic() + (
+            self.config.miner_timeout_seconds * self.config.miner_attempts * 2
+        )
         if cancel_event is not None and cancel_event.is_set():
             return _AttestationResult(target, endpoint, error="reattestation cancelled")
         if self.config.expected_tier is Tier.CC_CPU_SNP:
@@ -1855,7 +1857,19 @@ class ConfidentialRuntime:
                 else:
                     if len(evidences) != 1:
                         raise RuntimeError("CPU runtime requires exactly one evidence component")
-                    verdict = self.verifier(cpu_evidence, nonce, self.policy)
+                    if (
+                        self.config.expected_tier is Tier.CC_CPU_SNP
+                        and self.verifier is verify
+                    ):
+                        verdict = verify(
+                            cpu_evidence,
+                            nonce,
+                            self.policy,
+                            raise_on_verifier_unavailable=True,
+                            deadline_monotonic=verification_deadline,
+                        )
+                    else:
+                        verdict = self.verifier(cpu_evidence, nonce, self.policy)
                     if verdict is None:
                         raise RuntimeError(
                             f"{expected_cpu_kind.value} verification rejected"

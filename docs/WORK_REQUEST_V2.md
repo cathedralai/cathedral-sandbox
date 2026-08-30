@@ -294,9 +294,10 @@ The image digest proves publication, not deployment or live service.
 ## Security and scoring boundaries
 
 - Signed access grants permission to ask. It does not grant score.
-- The direct validator counts only machines that pass fresh evidence, pinned
-  Intel TDX verification, same-SPKI binding, canonical SAT, and global endpoint,
-  channel, and hardware deduplication.
+- The direct validator counts only machines that pass fresh vendor evidence,
+  same-SPKI binding, canonical SAT, and global endpoint, channel, and hardware
+  deduplication. Intel TDX uses the pinned QVL verifier. AMD SEV-SNP uses its
+  released measurement and TCB policy plus the pinned SNP verifier.
 - Repeating one machine at several addresses zeroes every verified claimant in
   that hardware collision for the round.
 - Reusing a TLS private key across machines zeroes every verified claimant in
@@ -309,6 +310,7 @@ The image digest proves publication, not deployment or live service.
   capped at 4,096 live entries and fails closed.
 - Every TLS client shares the finite pre-header connection gate. A deployment
   still needs edge connection limits and monitoring.
-- Intel TDX is the production scoring path. AMD SEV-SNP remains friend-test
-  only until its hardware identity and full validator path are live-proven.
-  See [AMD_SEV_SNP_FRIEND_TEST.md](AMD_SEV_SNP_FRIEND_TEST.md).
+- AMD SEV-SNP is eligible only after the validator policy accepts the exact
+  measurement and TCB. A local hardware test does not prove a registered miner
+  or a finalized weight row. See
+  [AMD_SEV_SNP_FRIEND_TEST.md](AMD_SEV_SNP_FRIEND_TEST.md).

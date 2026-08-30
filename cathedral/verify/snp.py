@@ -8,7 +8,9 @@ hand-rolling vendor crypto. See docs/DESIGN.md §6 and the AMD friend-test guide
 from __future__ import annotations
 
 import hashlib
+import math
 import os
+import re
 import shutil
 import stat
 import struct
@@ -46,10 +48,11 @@ PINNED_AMD_ARK_SPKI_SHA256 = {
     "turin": "4f125410563a2ab9a50356f9243f6fe0b6f73de98603f53f90339c70e9d7ad08",
 }
 
-# Keep the friend self-test profile inside the processor auto-detection contract of
-# the pinned snpguest v0.10.0 verifier. It cannot reliably select the AMD CA for
-# report versions below 3, and it predates the current version 6 ABI. Expanding
-# this set requires a separately reviewed verifier/toolchain update.
+# Keep the production admission profile inside the processor auto-detection
+# contract of the pinned snpguest v0.10.0 verifier. It cannot reliably select
+# the AMD CA for report versions below 3, and it predates the current version 6
+# ABI. Expanding this set requires a separately reviewed verifier/toolchain
+# update.
 _SUPPORTED_REPORT_VERSIONS = frozenset({3, 4, 5})
 _ECDSA_P384_SHA384 = 1
 _GUEST_POLICY_RESERVED_ONE = 1 << 17
@@ -62,12 +65,45 @@ _GENERATION_MILAN = "milan"
 _GENERATION_GENOA = "genoa"
 _GENERATION_TURIN = "turin"
 
+# snpguest v0.10.0 prints KDS response codes in these two exact error
+# messages. Keep the patterns narrow so digits in a URL, CHIP_ID, or TCB value
+# cannot be mistaken for an HTTP status.
+_KDS_HTTP_STATUS_PATTERNS = (
+    re.compile(r"Unable to fetch VCEK from URL:\s*([45][0-9]{2})\b", re.IGNORECASE),
+    re.compile(r"Unable to fetch certificate:\s*([45][0-9]{2})\b", re.IGNORECASE),
+)
+_TRANSIENT_KDS_CLIENT_STATUSES = frozenset({408, 425, 429})
+_INVALID_REPORT_ERROR_MARKERS = (
+    "failed to build report from the raw bytes",
+    "report could be malformed",
+    "hardware id is 0s on attestation report",
+    "processor family not supported",
+    "processor model not supported",
+    "missing cpu family id",
+    "missing cpu model id",
+    "a turin processor must have a fmc value",
+)
+_KDS_TRANSPORT_ERROR_MARKERS = (
+    "error sending request for url",
+    "connection refused",
+    "connection reset",
+    "connection timed out",
+    "operation timed out",
+    "dns error",
+    "failed to lookup address information",
+    "temporary failure in name resolution",
+    "tls error",
+    "certificate verify failed",
+)
+
 VERIFIED = "VERIFIED"
 STRUCTURE_OK_CHAIN_UNVERIFIED = "STRUCTURE_OK_CHAIN_UNVERIFIED"
 
 
 class SnpVerifierUnavailable(RuntimeError):
     """The pinned local verifier or its AMD certificate path was unavailable."""
+
+    category = "verifier_infrastructure_unavailable"
 
 
 @dataclass(frozen=True)
@@ -252,6 +288,24 @@ def _snpguest_timeout() -> float:
         return 30.0
 
 
+def _snpguest_command_timeout(deadline_monotonic: float | None) -> float:
+    """Bound one subprocess by both the local cap and the caller's cycle."""
+
+    maximum = _snpguest_timeout()
+    if deadline_monotonic is None:
+        return maximum
+    if (
+        isinstance(deadline_monotonic, bool)
+        or not isinstance(deadline_monotonic, (int, float))
+        or not math.isfinite(float(deadline_monotonic))
+    ):
+        raise ValueError("SNP verifier deadline must be a finite monotonic time")
+    remaining = float(deadline_monotonic) - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired("snpguest", 0)
+    return min(maximum, remaining)
+
+
 def _snp_generation(parsed: SnpReport) -> str | None:
     """Match the processor families understood by pinned snpguest v0.10.0."""
 
@@ -406,11 +460,10 @@ def _tcb_meets_minimum(candidate: int, required: int, generation: str) -> bool:
 
 
 def _snp_report_is_admissible(report: bytes, parsed: SnpReport) -> bool:
-    """Apply Cathedral's fail-closed SEV-SNP friend self-test profile.
+    """Apply Cathedral's fail-closed SEV-SNP production profile.
 
     The vendor signature check proves report authenticity. These checks decide
     whether the authentic report satisfies this bounded verifier contract.
-    Production admission and durable one-machine deduplication remain disabled.
     """
 
     generation = _snp_generation(parsed)
@@ -434,11 +487,64 @@ def _snp_report_is_admissible(report: bytes, parsed: SnpReport) -> bool:
     )
 
 
+def _called_process_output(exc: subprocess.CalledProcessError) -> str:
+    """Return bounded diagnostic text emitted by one pinned snpguest command."""
+
+    chunks: list[str] = []
+    for value in (exc.stderr, exc.output):
+        if value is None:
+            continue
+        if isinstance(value, bytes):
+            chunks.append(value[:16_384].decode("utf-8", errors="replace"))
+        else:
+            chunks.append(str(value)[:16_384])
+    return "\n".join(chunks)
+
+
+def _snpguest_fetch_failure_is_unavailable(
+    exc: subprocess.CalledProcessError,
+) -> bool:
+    """Classify a failed KDS fetch without turning outages into miner faults.
+
+    snpguest v0.10.0 reports both KDS HTTP failures and local report parsing as
+    a non-zero exit. A deterministic 4xx response (other than request timeout,
+    Too Early, or rate limiting) is a terminal rejection of this certificate
+    request. A 5xx response, transient 4xx response, or recognized network
+    client error is verifier infrastructure and must suspend a write when the
+    caller requests outage reporting. An unknown failure is never labelled an
+    AMD outage because it can be a local verifier or command defect.
+
+    Non-fetch failures are cryptographic or certificate verification failures
+    and therefore invalid evidence.
+    """
+
+    command = tuple(os.fspath(part) for part in exc.cmd) if not isinstance(exc.cmd, str) else ()
+    if len(command) < 3 or command[1] != "fetch" or command[2] not in {"vcek", "ca"}:
+        return False
+
+    diagnostic = _called_process_output(exc)
+    for pattern in _KDS_HTTP_STATUS_PATTERNS:
+        match = pattern.search(diagnostic)
+        if match is None:
+            continue
+        status = int(match.group(1))
+        if 500 <= status <= 599 or status in _TRANSIENT_KDS_CLIENT_STATUSES:
+            return True
+        return False
+
+    lowered = diagnostic.casefold()
+    if any(marker in lowered for marker in _INVALID_REPORT_ERROR_MARKERS):
+        return False
+
+    return any(marker in lowered for marker in _KDS_TRANSPORT_ERROR_MARKERS)
+
+
 def _verify_chain_with_snpguest(
     report: bytes,
     *,
     snpguest_path: str,
     certs_dir: str | os.PathLike[str] | None,
+    deadline_monotonic: float | None = None,
 ) -> bool:
     """Ask snpguest to fetch AMD certs and verify the report signature chain."""
 
@@ -454,16 +560,22 @@ def _verify_chain_with_snpguest(
         certs_path = work / "certs"
         certs_path.mkdir(parents=True, exist_ok=True)
 
-        timeout = _snpguest_timeout()
-        subprocess.run(
-            [snpguest_path, "fetch", "vcek", "DER", str(certs_path), str(report_path)],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        def run(command: list[str]) -> None:
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=_snpguest_command_timeout(deadline_monotonic),
+            )
 
-        ca_fetch_orders = [
+        run([snpguest_path, "fetch", "vcek", "DER", str(certs_path), str(report_path)])
+
+        # This is the exact v0.10.0 interface documented at
+        # https://github.com/virtee/snpguest/blob/v0.10.0/README.md#4-fetch.
+        # Trying legacy orders after a real KDS 5xx would replace the outage
+        # diagnostic with a local CLI parse error and incorrectly blame the miner.
+        run(
             [
                 snpguest_path,
                 "fetch",
@@ -472,39 +584,15 @@ def _verify_chain_with_snpguest(
                 str(certs_path),
                 "--report",
                 str(report_path),
-            ],
-            [snpguest_path, "fetch", "ca", "--report", str(report_path), "DER", str(certs_path)],
-            [snpguest_path, "fetch", "ca", "DER", str(certs_path), str(report_path)],
-        ]
-        last_error: subprocess.CalledProcessError | subprocess.TimeoutExpired | None = None
-        for cmd in ca_fetch_orders:
-            try:
-                subprocess.run(
-                    cmd,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                )
-                break
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-                last_error = exc
-        else:
-            if last_error is not None:
-                raise last_error
+            ]
+        )
 
         generation = _snp_generation(parse_snp_report(report))
         if generation is None or not _amd_ark_is_pinned(certs_path, generation):
             return False
 
         try:
-            subprocess.run(
-                [snpguest_path, "verify", "certs", str(certs_path)],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
+            run([snpguest_path, "verify", "certs", str(certs_path)])
         except subprocess.CalledProcessError:
             return False
 
@@ -514,13 +602,7 @@ def _verify_chain_with_snpguest(
         ]
         for cmd in verify_orders:
             try:
-                subprocess.run(
-                    cmd,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                )
+                run(cmd)
                 return True
             except subprocess.CalledProcessError:
                 continue
@@ -536,6 +618,7 @@ def verify_snp_report_data(
     certs_dir: str | os.PathLike[str] | None = None,
     require_chain: bool = True,
     raise_on_verifier_unavailable: bool = False,
+    deadline_monotonic: float | None = None,
 ) -> Attested | None:
     """Verify a raw SNP report against explicit 64-byte REPORT_DATA.
 
@@ -575,20 +658,41 @@ def verify_snp_report_data(
             raise SnpVerifierUnavailable("pinned SNP verifier is unavailable")
         if snpguest is not None:
             for attempt in range(3):
+                unavailable_error: BaseException | None = None
                 try:
-                    chain_verified = _verify_chain_with_snpguest(
-                        report,
-                        snpguest_path=snpguest,
-                        certs_dir=certs_dir,
-                    )
+                    verify_kwargs = {
+                        "snpguest_path": snpguest,
+                        "certs_dir": certs_dir,
+                    }
+                    if deadline_monotonic is not None:
+                        verify_kwargs["deadline_monotonic"] = deadline_monotonic
+                    chain_verified = _verify_chain_with_snpguest(report, **verify_kwargs)
                     break
-                except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-                    if attempt == 2:
+                except subprocess.CalledProcessError as exc:
+                    if not _snpguest_fetch_failure_is_unavailable(exc):
+                        return None
+                    unavailable_error = exc
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    unavailable_error = exc
+
+                if unavailable_error is None:
+                    continue
+                if attempt == 2:
+                    if raise_on_verifier_unavailable:
+                        raise SnpVerifierUnavailable(
+                            "AMD certificate or verifier infrastructure is unavailable"
+                        ) from unavailable_error
+                    return None
+                if deadline_monotonic is not None:
+                    remaining = float(deadline_monotonic) - time.monotonic()
+                    if remaining <= 0:
                         if raise_on_verifier_unavailable:
                             raise SnpVerifierUnavailable(
-                                "AMD certificate or verifier infrastructure is unavailable"
-                            ) from exc
+                                "AMD verifier deadline expired"
+                            ) from unavailable_error
                         return None
+                    time.sleep(min(1.0, remaining))
+                else:
                     time.sleep(1)
 
     if require_chain and not chain_verified:
@@ -621,6 +725,7 @@ def verify_snp(
     snpguest_path: str | os.PathLike[str] | None = None,
     certs_dir: str | os.PathLike[str] | None = None,
     raise_on_verifier_unavailable: bool = False,
+    deadline_monotonic: float | None = None,
 ) -> Attested | None:
     """Verify SNP evidence using the existing Cathedral nonce/hotkey binding."""
 
@@ -632,4 +737,5 @@ def verify_snp(
         snpguest_path=snpguest_path,
         certs_dir=certs_dir,
         raise_on_verifier_unavailable=raise_on_verifier_unavailable,
+        deadline_monotonic=deadline_monotonic,
     )

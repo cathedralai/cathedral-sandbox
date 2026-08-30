@@ -1,8 +1,8 @@
 # Intel TDX machine contract
 
-Intel TDX is Cathedral's current scored confidential-CPU path. AMD
-SEV-SNP remains a friend-hardware test and confidential GPU remains outside
-production scoring.
+Intel TDX is Cathedral's scored confidential-CPU path. AMD SEV-SNP has its
+own fixed worker and validator admission policy. This page is only the Intel
+TDX contract.
 
 This page defines the machine and quote contract. The repository README is the
 operator run order. Cathedral Validator derives weights directly from miner

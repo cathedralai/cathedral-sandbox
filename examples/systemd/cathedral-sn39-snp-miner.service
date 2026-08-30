@@ -1,0 +1,31 @@
+[Unit]
+Description=Cathedral SN39 AMD SEV-SNP miner
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+ConditionPathExists=/dev/sev-guest
+ConditionPathExists=/etc/cathedral/sn39-snp-miner.env
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/cathedral/sn39-snp-miner.env
+ExecStart=/usr/local/sbin/cathedral-run-sn39-snp-miner
+Restart=on-failure
+RestartSec=15s
+SuccessExitStatus=129 130 143
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/cathedral/validator-access
+ReadWritePaths=/var/lib/cathedral/validator-access /run
+LockPersonality=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

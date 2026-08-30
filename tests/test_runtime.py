@@ -31,7 +31,6 @@ from cathedral.lifecycle import NETWORK_ELIGIBLE_STATES, WorkerLifecycleState
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 from cathedral.launch_limits import MAX_LAUNCH_VERIFIED_CANDIDATES
 from cathedral.ledger import Ledger, LedgerError
-from cathedral.lifecycle import WorkerLifecycleState
 from cathedral.receipt import ReceiptIssuer, verify_receipt
 from cathedral.remote import RemoteError
 from cathedral.runtime import (
@@ -361,6 +360,41 @@ def test_development_snp_runtime_rejects_report_data_v1(tmp_path: Path) -> None:
 
     assert outcome.status == "attestation_failed"
     assert "requires report-data v2" in (outcome.error or "")
+
+
+def test_snp_runtime_forwards_one_overall_verifier_deadline(
+    tmp_path: Path, monkeypatch
+) -> None:
+    endpoint = "https://127.0.0.1:9444"
+    captured: dict[str, object] = {}
+
+    def deadline_verifier(
+        evidence: Evidence,
+        nonce: bytes,
+        policy: Policy,
+        *,
+        raise_on_verifier_unavailable: bool = False,
+        deadline_monotonic: float | None = None,
+    ) -> Attested | None:
+        captured["raise_on_unavailable"] = raise_on_verifier_unavailable
+        captured["deadline"] = deadline_monotonic
+        return snp_verifier(evidence, nonce, policy)
+
+    monkeypatch.setattr(runtime_module, "verify", deadline_verifier)
+    runtime, _ledger, _factory = make_runtime(
+        tmp_path,
+        [],
+        {endpoint: MinerSpec("snp-chip", evidence_kind=EvidenceKind.SEV_SNP)},
+        attempts=2,
+        expected_tier=Tier.CC_CPU_SNP,
+        evidence_verifier=deadline_verifier,
+    )
+
+    outcome = runtime.audit_attestation(MinerTarget("miner", endpoint))
+
+    assert outcome.status == "attestation_verified"
+    assert captured["raise_on_unavailable"] is True
+    assert isinstance(captured["deadline"], float)
 
 
 def test_snp_runtime_is_refused_in_production() -> None:

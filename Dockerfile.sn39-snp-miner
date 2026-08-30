@@ -1,0 +1,41 @@
+# SN39 SNP supply is x86-64. This is the linux/amd64 manifest digest for
+# python:3.12-slim-bookworm, verified from Docker Hub on 2026-08-26.
+FROM python:3.12-slim-bookworm@sha256:4427763a1ba36f5aa8f656a03e5d00f3b8d61f5dd950c73df6c14f8c7640f8ab
+
+LABEL org.opencontainers.image.title="Cathedral SN39 SNP miner" \
+      org.opencontainers.image.description="AMD SEV-SNP evidence and signed validator fleet worker for SN39" \
+      org.opencontainers.image.source="https://github.com/cathedralai/cathedral-sandbox" \
+      org.cathedral.sn39.runtime-contract="snp-signed-validator-fleet-v1"
+
+WORKDIR /
+
+COPY requirements/sn39-audit-miner.txt /tmp/sn39-snp-miner-requirements.txt
+RUN python -m pip install \
+      --disable-pip-version-check \
+      --no-cache-dir \
+      --only-binary=:all: \
+      --require-hashes \
+      --requirement /tmp/sn39-snp-miner-requirements.txt \
+    && rm /tmp/sn39-snp-miner-requirements.txt
+
+# Pin the official virtee release by both URL and content digest. The worker
+# only invokes this image-layer copy through its fixed SNP entrypoint.
+RUN python -c "import hashlib,pathlib,urllib.request; url='https://github.com/virtee/snpguest/releases/download/v0.10.0/snpguest'; path=pathlib.Path('/usr/local/bin/snpguest'); expected='70e700465e3523e67dd5104583dc36cd11eef630c6f04c5b9ccafd6ba2e76ca0'; urllib.request.urlretrieve(url, path); actual=hashlib.sha256(path.read_bytes()).hexdigest(); assert actual == expected, 'pinned snpguest digest mismatch'; path.chmod(0o500)"
+
+COPY cathedral/ /usr/local/lib/python3.12/site-packages/cathedral/
+
+# Refuse the build if the exact sr25519 wheel cannot verify the fixed positive
+# vector or reject its corrupted negative control.
+RUN python -I -c 'import cathedral.snp_miner_entrypoint, cathedral.cli; from cathedral.validator_access import load_sr25519_verifier, preflight_sr25519_verifier; preflight_sr25519_verifier(load_sr25519_verifier())'
+
+# SNP collection runs as guest root only to access the precisely mounted guest
+# device. The immutable image keeps all runtime state on a bounded tmpfs.
+USER 0:0
+RUN install -d -o root -g root -m 0700 /run/cathedral-snp-miner \
+    && install -d -o root -g root -m 0700 /etc/cathedral/validator-access \
+    && install -d -o root -g root -m 0700 /var/lib/cathedral/validator-access
+
+EXPOSE 8081/tcp
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["python", "-I", "-u", "-B", "-m", "cathedral.snp_miner_entrypoint"]
