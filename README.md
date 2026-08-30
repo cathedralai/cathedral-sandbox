@@ -69,14 +69,73 @@ runtime in this repository is not the SN39 weight-writing path.
 Keep the coldkey and wallet off every worker. The worker needs only its public
 hotkey. Each machine creates its own TLS private key inside its confidential guest.
 
+## Rehearse before renting or registering
+
+Run the local rehearsal on any machine with Python 3.11 or newer. It uses a
+fresh temporary directory and an OS-assigned loopback port on every run. It
+does not open a wallet, query a chain, contact the example fleet IPs, use
+Docker, or read a TEE device.
+
+```bash
+git clone https://github.com/cathedralai/cathedral-sandbox.git cathedral-rehearsal
+cd cathedral-rehearsal
+python3 -m venv .venv-rehearsal
+.venv-rehearsal/bin/python -m pip install -e .
+
+for run in 1 2 3; do
+  .venv-rehearsal/bin/python scripts/rehearse_sn39_miner.py
+done
+```
+
+Each run must end with `"status": "PASS"`. The script starts the real worker
+protocol on loopback with clearly synthetic TDX and SEV-SNP evidence. It checks
+the exact invalid-evidence health response, evidence identity and nonce
+binding, capabilities, canonical SAT, a primary-plus-secondary fleet, and
+duplicate fleet rejection. A pass proves local package and protocol wiring
+only. It does not prove hardware, vendor evidence, measurement, TCB, guest
+policy, native TLS, signed validator access, public reachability, registration,
+weight, or emission.
+
+If Docker and registry access are available, inspect the published Intel image
+without starting it:
+
+```bash
+TDX_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99'
+docker pull --platform linux/amd64 "$TDX_IMAGE"
+test "$(docker image inspect "$TDX_IMAGE" --format '{{.Os}}/{{.Architecture}}')" = \
+  linux/amd64
+test "$(docker image inspect "$TDX_IMAGE" --format \
+  '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
+  78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+test "$(docker image inspect "$TDX_IMAGE" --format \
+  '{{index .Config.Labels "org.cathedral.sn39.runtime-contract"}}')" = \
+  signed-validator-fleet-v1
+
+SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255'
+docker pull --platform linux/amd64 "$SNP_IMAGE"
+test "$(docker image inspect "$SNP_IMAGE" --format '{{.Os}}/{{.Architecture}}')" = \
+  linux/amd64
+test "$(docker image inspect "$SNP_IMAGE" --format \
+  '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
+  8dde6eaca27116eed53386a1fa33ec70b74a01fb
+test "$(docker image inspect "$SNP_IMAGE" --format \
+  '{{index .Config.Labels "org.cathedral.sn39.runtime-contract"}}')" = \
+  snp-signed-validator-fleet-v1
+```
+
+These checks prove only the pinned Intel and AMD image metadata in the local
+Docker store. They do not start a worker or prove TDX or SEV-SNP. The published
+SNP image remains source-ready and not weight-eligible until a matching
+validator release pins its contract and policy.
+
 ## Run one AMD SEV-SNP machine
 
 AMD SEV-SNP uses its own fixed image and launcher. It needs native
 `/dev/sev-guest`, not ordinary AMD SEV or a vTPM. The validator will count it
 only after its released SNP policy admits the exact measurement and TCB, then
 verifies fresh HTTPS-bound evidence and canonical SAT. Follow
-[AMD SEV-SNP miner](docs/AMD_SEV_SNP_FRIEND_TEST.md). No current document or
-image pin proves that a specific SNP host is online or receiving weight.
+[AMD SEV-SNP miner](docs/AMD_SEV_SNP_FRIEND_TEST.md). The published image pin
+does not prove that a specific SNP host is online or receiving weight.
 
 The launcher checks the immutable image locally. That image digest is not a
 field in the remote SNP report.
@@ -347,5 +406,16 @@ and validator evidence pass. Neither result proves a finalized weight row.
 Start with the [documentation map](docs/README.md). It separates current miner
 instructions from protocol, release, product-library, and retained compatibility
 material.
+
+## Stop and get help
+
+Stop before registration if a checksum, image label, census result, TEE device
+check, exact health response, snapshot refresh, or local rehearsal differs from
+this guide. Open a
+[cathedral-sandbox issue](https://github.com/cathedralai/cathedral-sandbox/issues)
+with the repository commit, image digest, CPU and TEE type, the exact failing
+step, and redacted output. Do not paste a coldkey, seed phrase, wallet file,
+snapshot signing seed, TLS private key, bearer token, raw attestation report,
+or unredacted environment.
 
 License: [MIT](LICENSE).

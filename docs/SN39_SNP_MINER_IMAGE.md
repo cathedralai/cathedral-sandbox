@@ -4,11 +4,19 @@ This is the separate immutable image contract for an AMD SEV-SNP miner. It is
 not the Intel TDX audit-miner image and it has no fallback or compatibility
 mode.
 
-## Release state
+## Published release pin
 
-No digest is listed here until GitHub Actions publishes, attests, and proves
-anonymous access to one. A source change and a green test suite do not prove a
-published image, a running machine, or an on-chain weight.
+The current anonymous `linux/amd64` image is:
+
+```text
+ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255
+```
+
+Its OCI revision label is
+`8dde6eaca27116eed53386a1fa33ec70b74a01fb` and its fixed runtime-contract
+label is `snp-signed-validator-fleet-v1`. The immutable digest proves the
+published bytes available from GHCR. It does not prove a running SNP machine,
+vendor evidence, validator admission, or an on-chain weight.
 
 ## Fixed behavior
 
