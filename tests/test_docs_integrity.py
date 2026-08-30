@@ -80,6 +80,8 @@ def test_current_operator_docs_exclude_retired_launch_paths() -> None:
         "exact snp admission policy are published",
         "released snp policy",
         "released snp admission policy",
+        "released validator policy",
+        "released measurement and tcb policy",
     ):
         assert retired not in normalized, retired
 

@@ -228,9 +228,10 @@ sudo journalctl -u cathedral-sn39-snp-miner.service -n 100 --no-pager
 ```
 
 Do not register or announce the hotkey yet. Give the validator operator the
-hardware-proof transcript. Registration follows only after the released
-validator policy contains the exact observed generation, measurement, and TCB
-floor and a fresh signed validator request passes end to end.
+hardware-proof transcript. Registration follows only after the scoring
+validator's owner-controlled policy contains the exact observed generation,
+measurement, and TCB floor and a fresh signed validator request passes end to
+end.
 
 ## What the two checks prove
 

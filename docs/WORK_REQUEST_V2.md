@@ -297,7 +297,8 @@ The image digest proves publication, not deployment or live service.
 - The direct validator counts only machines that pass fresh vendor evidence,
   same-SPKI binding, canonical SAT, and global endpoint, channel, and hardware
   deduplication. Intel TDX uses the pinned QVL verifier. AMD SEV-SNP uses its
-  released measurement and TCB policy plus the pinned SNP verifier.
+  scoring validator's owner-controlled measurement and TCB policy plus the
+  pinned SNP verifier.
 - Repeating one machine at several addresses zeroes every verified claimant in
   that hardware collision for the round.
 - Reusing a TLS private key across machines zeroes every verified claimant in
