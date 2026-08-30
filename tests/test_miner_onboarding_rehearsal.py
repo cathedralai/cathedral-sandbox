@@ -8,6 +8,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from cathedral.remote import RemoteError
+from scripts import rehearse_sn39_miner as rehearsal
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -62,6 +65,20 @@ def test_public_miner_rehearsal_ignores_ambient_network_proxies():
 
     assert completed.returncode == 0, completed.stderr or completed.stdout
     assert json.loads(completed.stdout)["status"] == "PASS"
+
+
+def test_public_miner_rehearsal_reports_protocol_failure_as_json(monkeypatch, capsys) -> None:
+    def fail_rehearsal():
+        raise RemoteError("protocol response changed")
+
+    monkeypatch.setattr(rehearsal, "run_rehearsal", fail_rehearsal)
+
+    assert rehearsal.main() == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "schema": "cathedral_miner_onboarding_rehearsal_v1",
+        "status": "FAIL",
+        "error": "protocol response changed",
+    }
 
 
 def test_public_readme_scopes_the_rehearsal_and_help_path():

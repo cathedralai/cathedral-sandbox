@@ -22,7 +22,7 @@ from typing import Any
 
 from cathedral.common import Evidence, EvidenceKind
 from cathedral.lanes.sat import SatLane
-from cathedral.remote import RemoteMiner
+from cathedral.remote import RemoteError, RemoteMiner
 from cathedral.validator_access import ValidatorAccessError, load_fleet_manifest
 from cathedral.worker import WorkerServer
 
@@ -233,7 +233,7 @@ def run_rehearsal() -> dict[str, Any]:
 def main() -> int:
     try:
         result = run_rehearsal()
-    except (OSError, RehearsalFailure, ValueError) as exc:
+    except (OSError, RehearsalFailure, RemoteError, ValueError) as exc:
         print(
             json.dumps(
                 {
