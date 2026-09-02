@@ -329,8 +329,20 @@ Request bodies are capped at 64 KiB. Request and response each get their own
 10-second deadline. Class-pool saturation takes precedence over detailed body
 framing errors, so an admitted malformed request receives its usual 400, 411,
 or 413 while a class-admitted request refused by its full pool receives 503.
-These bounds are fixed in the worker and are sized for the 4 vCPU guest it
-ships in.
+These bounds are fixed in the worker. They are chosen for the 4 vCPU guest it
+ships in, but that sizing has not been measured on the production guest: with
+the public SAT pool separated from the evidence pool, admitted public
+concurrency is four (two evidence, two SAT) and eight including authenticated
+work, and there is no aggregate CPU semaphore across the three pools.
+
+What is established is narrower and is what actually bounds the public path:
+the credential-free canonical audit is a fixed 8-variable, 20-clause instance
+for every caller-supplied seed, so no seed can enlarge the work an
+unauthenticated caller triggers. `tests/test_worker_remote.py` pins that shape
+across the signed-i64 extremes. A one-off measurement on a 10-core developer
+host put `solve_sat` at a median of 119us and a p99 of 192us over 2000
+distinct seeds; treat that as indicative of the order of magnitude, not as a
+production figure.
 
 A nonempty local quote proves collection, not vendor verification, policy
 acceptance, or eligibility.
