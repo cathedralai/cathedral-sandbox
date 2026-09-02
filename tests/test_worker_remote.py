@@ -1925,3 +1925,129 @@ def test_near_canonical_mutation_is_rejected_without_a_bearer(monkeypatch):
         for bearer in (None, "wrong-token", "nön-ascii-tökén"):
             code, _ = _post_raw(f"{srv.base_url}/v1/sat-work", payload, bearer=bearer)
             assert code == 401, f"bearer={bearer!r} should 401, got {code}"
+
+
+def test_oversized_integer_literal_is_a_client_error_not_a_server_error():
+    """A JSON integer past CPython's 4300-digit limit must 400, not 500.
+
+    json.loads raises a BARE ValueError for this, not a JSONDecodeError, so
+    the decode guard misses it and the request falls through to the generic
+    500 handler. That reports a malformed client request as a worker fault:
+    an operator watching 5xx sees a worker bug, and any 5xx alerting fires on
+    traffic the worker actually rejected correctly.
+    """
+    body = b'{"challenge_id": "' + b"0" * 64 + b'", "assigned_hotkey": "' \
+        + HOTKEY.encode() + b'", "instance": {"n_vars": 1, "clauses": [[1]]}, "seed": ' \
+        + b"1" * 5000 + b"}"
+    assert len(body) < worker_module.MAX_REQUEST_BODY
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        code, payload = _post_raw(f"{srv.base_url}/v1/sat-work", body)
+    assert code == 400, f"expected 400 for an unparseable integer, got {code}"
+    assert b"invalid JSON" in payload
+
+
+# ---------------------------------------------------------------------------
+# /v1/capabilities is a protected path and had no auth coverage at all
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bearer",
+    [None, "wrong-token", "nön-ascii-tökén", "", TEST_BEARER + "x"],
+)
+def test_capabilities_requires_the_bearer_when_one_is_configured(bearer):
+    """#170 review: /v1/capabilities is NOT in _CREDENTIAL_FREE_PATHS.
+
+    It leaks the worker's customer_sat posture, which tells an unauthenticated
+    caller whether this worker will accept noncanonical instances at all. The
+    code rejects correctly today but nothing pinned it, so moving the path into
+    the credential-free set would have shipped green.
+    """
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        code, _ = _post_raw(f"{srv.base_url}/v1/capabilities", b"{}", bearer=bearer)
+    assert code == 401, f"bearer={bearer!r} should 401, got {code}"
+
+
+def test_capabilities_answers_a_valid_bearer_and_reports_the_real_posture():
+    """The reject direction above is only meaningful with the accept direction."""
+    # _WorkerServer, not the test wrapper: the wrapper defaults
+    # allow_noncanonical_sat=True, which is the opposite of the production
+    # default this case exists to pin.
+    with _WorkerServer(
+        configured_hotkey=HOTKEY,
+        evidence_collector=_fake_evidence,
+        bearer_token=TEST_BEARER,
+        channel_binding=TEST_BINDING,
+    ) as default_srv:
+        _start_server(default_srv)
+        code, payload = _post_raw(
+            f"{default_srv.base_url}/v1/capabilities", b"{}", bearer=TEST_BEARER
+        )
+        assert code == 200
+        assert json.loads(payload) == {"customer_sat": False}
+
+    with WorkerServer(
+        evidence_collector=_fake_evidence, allow_noncanonical_sat=True
+    ) as customer_srv:
+        _start_server(customer_srv)
+        code, payload = _post_raw(
+            f"{customer_srv.base_url}/v1/capabilities", b"{}", bearer=TEST_BEARER
+        )
+        assert code == 200
+        assert json.loads(payload) == {"customer_sat": True}
+
+
+def test_capabilities_rejects_a_nonempty_body_before_reporting_posture():
+    """An unknown key must 400, not be silently ignored."""
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        code, body = _post_raw(
+            f"{srv.base_url}/v1/capabilities", b'{"probe": 1}', bearer=TEST_BEARER
+        )
+    assert code == 400
+    assert b"capabilities schema" in body
+
+
+# ---------------------------------------------------------------------------
+# The public audit's cost must not depend on caller-chosen seed (#170 review)
+# ---------------------------------------------------------------------------
+
+
+def test_no_seed_can_make_the_public_canonical_audit_expensive():
+    from cathedral.lanes.sat import MAX_SEED as _MAX_SEED, MIN_SEED as _MIN_SEED
+    """The credential-free SAT pool is only safe if the work behind it is fixed.
+
+    `seed` is caller-supplied and the canonical audit runs WITHOUT a bearer, so
+    if any seed could grow the instance, an unauthenticated caller could choose
+    the worker's CPU cost. Pin the shape across the signed-i64 extremes and a
+    spread of ordinary values: same variable count, same clause count, same
+    literals per clause, every literal in range.
+
+    Shape, not wall-clock: a timing assertion would flake on a loaded CI box
+    and would not say WHY the cost moved. Measured separately on a 10-core
+    host, solve_sat over 2000 distinct seeds ran median 119us / p99 192us /
+    max 2.28ms -- bounded, but that is one host and is not asserted here.
+    """
+    reference = _canonical_instance(0)
+    assert reference.n_vars == 8
+    assert len(reference.clauses) == 20
+
+    seeds = [
+        _MIN_SEED, _MIN_SEED + 1, -(2**62), -1, 0, 1, 2**62, _MAX_SEED - 1, _MAX_SEED,
+        7, 23, 1729, 2**31, 2**32 + 1,
+    ]
+    for seed in seeds:
+        instance = _canonical_instance(seed)
+        assert instance.n_vars == reference.n_vars, f"seed {seed} changed n_vars"
+        assert len(instance.clauses) == len(reference.clauses), (
+            f"seed {seed} changed the clause count"
+        )
+        for clause in instance.clauses:
+            assert len(clause) == 3, f"seed {seed} produced a {len(clause)}-literal clause"
+            for literal in clause:
+                assert literal != 0
+                assert abs(literal) <= instance.n_vars, (
+                    f"seed {seed} produced out-of-range literal {literal}"
+                )

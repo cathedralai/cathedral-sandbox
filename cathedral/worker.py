@@ -416,7 +416,13 @@ def _make_handler(
         def _handle_post(self, raw: bytes) -> None:
             try:
                 body = json.loads(raw)
-            except (UnicodeDecodeError, json.JSONDecodeError):
+            except (UnicodeDecodeError, ValueError):
+                # ValueError, not just JSONDecodeError: an integer literal past
+                # CPython's 4300-digit conversion limit raises a BARE ValueError
+                # from int(), which JSONDecodeError does not cover. Without this
+                # the request 500s, reporting a malformed client body as a
+                # worker fault. JSONDecodeError subclasses ValueError, so the
+                # ordinary malformed-JSON case is unchanged.
                 self._send_json(400, {"error": "invalid JSON"})
                 return
             if not isinstance(body, dict):
