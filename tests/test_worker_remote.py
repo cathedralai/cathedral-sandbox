@@ -1925,3 +1925,23 @@ def test_near_canonical_mutation_is_rejected_without_a_bearer(monkeypatch):
         for bearer in (None, "wrong-token", "nön-ascii-tökén"):
             code, _ = _post_raw(f"{srv.base_url}/v1/sat-work", payload, bearer=bearer)
             assert code == 401, f"bearer={bearer!r} should 401, got {code}"
+
+
+def test_oversized_integer_literal_is_a_client_error_not_a_server_error():
+    """A JSON integer past CPython's 4300-digit limit must 400, not 500.
+
+    json.loads raises a BARE ValueError for this, not a JSONDecodeError, so
+    the decode guard misses it and the request falls through to the generic
+    500 handler. That reports a malformed client request as a worker fault:
+    an operator watching 5xx sees a worker bug, and any 5xx alerting fires on
+    traffic the worker actually rejected correctly.
+    """
+    body = b'{"challenge_id": "' + b"0" * 64 + b'", "assigned_hotkey": "' \
+        + HOTKEY.encode() + b'", "instance": {"n_vars": 1, "clauses": [[1]]}, "seed": ' \
+        + b"1" * 5000 + b"}"
+    assert len(body) < worker_module.MAX_REQUEST_BODY
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        code, payload = _post_raw(f"{srv.base_url}/v1/sat-work", body)
+    assert code == 400, f"expected 400 for an unparseable integer, got {code}"
+    assert b"invalid JSON" in payload
