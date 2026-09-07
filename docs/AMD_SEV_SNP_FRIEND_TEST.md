@@ -31,6 +31,32 @@ Report version 2, report version 6, an unknown processor family, a changed AMD
 root, or a different `snpguest` binary fails closed. Supporting any of them
 requires a reviewed source update.
 
+### Socket requirement
+
+The direct validator requires the guest launch policy bit `SINGLE_SOCKET`
+(bit 20, `POLICY.SINGLE_SOCKET` in AMD publication 56860) before it uses the
+report's CHIP_ID as the machine identity. A report without that bit is refused
+with `snp_single_socket_required`, whatever the measurement and TCB.
+
+What that means for the host:
+
+- On a host with one populated socket, set the bit in the guest policy
+  (QEMU: `-object sev-snp-guest,...,policy=0x130000`). Nothing else changes.
+- On a host with two or more populated sockets, AMD firmware refuses to
+  activate a `SINGLE_SOCKET` guest through `SNP_ACTIVATE`; only
+  `SNP_ACTIVATE_EX` can pin the guest to one socket (56860 section 4.4).
+  Upstream Linux KVM issues `SNP_ACTIVATE` only, so a multi-socket Linux
+  KVM host cannot launch a guest that passes this check today.
+- Linux routes every SNP command, including the guest's attestation
+  request, through one PSP on the host. Two guests on the same host may
+  therefore report the same CHIP_ID. The validator scores every machine
+  that shares a CHIP_ID with another machine in the same fleet as zero, so
+  run one SNP guest per host unless you have confirmed that a second guest
+  reports a different CHIP_ID.
+
+This requirement is under review (cathedral-validator issue #234). Until a
+validator release changes it, plan on a single-socket host.
+
 ## Requirements and first hardware proof
 
 - An x86-64 Linux SEV-SNP guest where root can read and write the native

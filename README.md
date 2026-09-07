@@ -37,7 +37,7 @@ guarantee TAO. The subnet must have positive emission.
 |---|---|---|
 | Intel TDX on Linux | Mainnet live testing | Eligible after fresh TDX and SAT verification |
 | More Intel TDX machines on one UID | Mainnet live testing | Each distinct verified machine adds to that UID's score |
-| AMD SEV-SNP on Linux | Validator path merged, live hardware policy pending | Eligible after that validator's policy admits the measurement and TCB, then fresh evidence and SAT pass |
+| AMD SEV-SNP on Linux | Validator path merged, live hardware policy pending | Eligible after that validator's policy admits the measurement and TCB, then fresh evidence and SAT pass. The guest must be launched with `POLICY.SINGLE_SOCKET`, which a multi-socket Linux KVM host cannot do; see the [socket requirement](docs/AMD_SEV_SNP_FRIEND_TEST.md#socket-requirement) |
 
 The current direct validator source supports Intel TDX and AMD SEV-SNP. Each
 validator owns its SNP measurement and TCB allowlist. An AMD machine earns zero
@@ -57,7 +57,9 @@ runtime in this repository is not the SN39 weight-writing path.
 ## What you need
 
 - A Linux Intel TDX confidential VM with `/sys/kernel/config/tsm/report`, or an
-  AMD SEV-SNP guest with `/dev/sev-guest`.
+  AMD SEV-SNP guest with `/dev/sev-guest` launched with the `SINGLE_SOCKET`
+  policy bit, which today means a host with one populated socket. See the
+  [socket requirement](docs/AMD_SEV_SNP_FRIEND_TEST.md#socket-requirement).
 - Git, Python 3.12 with `venv`, Docker, `nft`, and `curl` inside the guest.
 - A public IPv4 address with TCP `8081` open.
 - One public Bittensor hotkey which you will register on Finney SN39 only after
