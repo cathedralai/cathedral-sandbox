@@ -30,6 +30,11 @@ CUSTOMER_RECEIPT_POLICY_DIGEST = (
     "sha256:" + hashlib.sha256(CUSTOMER_RECEIPT_POLICY_V1).hexdigest()
 )
 
+CUSTOMER_ATTESTATION_RECEIPT_SCHEMA = "cathedral_customer_attestation_receipt_v1"
+CUSTOMER_ATTESTATION_POLICY_DIGEST = "sha256:" + hashlib.sha256(
+    b"cathedral.customer-attestation-receipt.policy.v1"
+).hexdigest()
+
 MAX_CUSTOMER_RECEIPT_BYTES = 256 * 1024
 MAX_CUSTOMER_RECEIPT_TRUSTED_KEYS_BYTES = 256 * 1024
 MAX_CUSTOMER_RECEIPT_DEPTH = 16
@@ -402,11 +407,14 @@ def _validate_signature_shape(document: Mapping[str, object]) -> bytes:
 
 
 def _validate_common_assertions(document: Mapping[str, object]) -> datetime:
-    if document["schema"] != CUSTOMER_RECEIPT_SCHEMA:
+    if document["schema"] not in (CUSTOMER_RECEIPT_SCHEMA, CUSTOMER_ATTESTATION_RECEIPT_SCHEMA):
         raise CustomerReceiptError("schema", "customer receipt schema is unsupported")
     _validate_uuid(document["receipt_id"])
     issued_at = _timestamp(document["issued_at"], "receipt issued_at")
-    if document["policy_digest"] != CUSTOMER_RECEIPT_POLICY_DIGEST:
+    expected_policy = (CUSTOMER_ATTESTATION_POLICY_DIGEST
+                       if document["schema"] == CUSTOMER_ATTESTATION_RECEIPT_SCHEMA
+                       else CUSTOMER_RECEIPT_POLICY_DIGEST)
+    if document["policy_digest"] != expected_policy:
         raise CustomerReceiptError("policy", "customer receipt policy digest is unsupported")
     if document["receipt_status"] != "ready":
         raise CustomerReceiptError("status", "customer receipt status is not ready")
@@ -602,6 +610,37 @@ def _validate_task_policy(document: Mapping[str, object]) -> None:
         )
 
 
+def _validate_snp_assertions(document: Mapping[str, object]) -> None:
+    if (
+        document["profile_id"] != "attest.snp.v1"
+        or document["cpu_tee"] != "amd_sev_snp"
+        or document["gpu_type"] is not None
+        or type(document["gpu_count"]) is not int
+        or document["gpu_count"] != 0
+        or document["report_data_match"] is not True
+        or any(document[name] is not None for name in (
+            "intel_verified", "gpu_attestation_verified",
+            "guest_binding_verified", "runtime_execution_verified",
+        ))
+    ):
+        raise CustomerReceiptError("binding", "SNP CPU profile assertions are inconsistent")
+
+
+def _validate_hardware_binding(document: Mapping[str, object]) -> None:
+    binding = document["hardware_binding"]
+    if not isinstance(binding, dict) or set(binding) != {"box_id", "quote_sha256", "report_data_hex"}:
+        raise CustomerReceiptError("binding", "hardware binding fields are invalid")
+    box = binding["box_id"]
+    if not isinstance(box, str) or re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}", box) is None:
+        raise CustomerReceiptError("binding", "hardware box identity is invalid")
+    _require_digest(binding["quote_sha256"], "hardware quote digest")
+    expected = binding["report_data_hex"]
+    if not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{128}", expected) is None:
+        raise CustomerReceiptError("binding", "hardware report data must be 64 lowercase-hex bytes")
+    if document["execution_class"] not in {"tdx_cpu", "snp_cpu"}:
+        raise CustomerReceiptError("binding", "hardware replay requires a supported CPU receipt")
+
+
 def _validate_gpu_assertions(document: Mapping[str, object]) -> None:
     gpu_type = document["gpu_type"]
     gpu_count = document["gpu_count"]
@@ -645,14 +684,17 @@ def verify_customer_receipt(
     encoded = data if isinstance(data, bytes) else data.encode("utf-8")
     if encoded != canonical_customer_receipt_json(document):
         raise CustomerReceiptError("schema", "customer receipt JSON is not canonical")
+    expected_fields = _TOP_LEVEL_KEYS
+    if document.get("schema") == CUSTOMER_ATTESTATION_RECEIPT_SCHEMA:
+        expected_fields = expected_fields | {"hardware_binding"}
     keys = frozenset(document)
-    if (_TOP_LEVEL_KEYS - keys) or (keys - _TOP_LEVEL_KEYS - _OPTIONAL_TOP_LEVEL_KEYS):
+    if (expected_fields - keys) or (keys - expected_fields - _OPTIONAL_TOP_LEVEL_KEYS):
         raise CustomerReceiptError(
             "schema",
             "customer receipt has missing or unknown fields",
         )
     _validate_task_policy(document)
-    if document["schema"] != CUSTOMER_RECEIPT_SCHEMA:
+    if document["schema"] not in (CUSTOMER_RECEIPT_SCHEMA, CUSTOMER_ATTESTATION_RECEIPT_SCHEMA):
         raise CustomerReceiptError("schema", "customer receipt schema is unsupported")
     signing_key_id = document["signing_key_id"]
     if not isinstance(signing_key_id, str) or _KEY_ID_RE.fullmatch(signing_key_id) is None:
@@ -675,10 +717,14 @@ def verify_customer_receipt(
     execution_class = document["execution_class"]
     if execution_class == "tdx_cpu":
         _validate_cpu_assertions(document)
+    elif execution_class == "snp_cpu" and document["schema"] == CUSTOMER_ATTESTATION_RECEIPT_SCHEMA:
+        _validate_snp_assertions(document)
     elif execution_class == "cc_gpu":
         _validate_gpu_assertions(document)
     else:
         raise CustomerReceiptError("binding", "customer receipt execution class is unsupported")
+    if document["schema"] == CUSTOMER_ATTESTATION_RECEIPT_SCHEMA:
+        _validate_hardware_binding(document)
     if not key.verifies_at(issued_at):
         raise CustomerReceiptError(
             "key",
