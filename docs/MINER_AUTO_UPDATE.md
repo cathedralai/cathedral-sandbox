@@ -1,8 +1,15 @@
 # Miner auto-update
 
-Status: implemented and covered by local tests. Not yet exercised on a live
-miner, and no signed miner release has been published. Where this page names a
-digest or a channel URL, treat it as pending until a release exists.
+Status: exercised end to end on a live Intel TDX miner on 2026-09-09.
+
+A confidential `c3-standard-4` TDX guest on GCP was registered on SN39 as UID
+213, installed at image `c73070da`, enrolled into this channel, and moved to
+`d50ebe66` by a signed stable release. The updater reported `activated` and the
+running container really did change.
+
+That run also found two defects that local tests could not, both now fixed and
+described under "What counts as success" and "When a restart is unsafe". Read
+those two sections before enabling the timer anywhere.
 
 An installed SN39 SNP miner pins its version in one line of
 `/etc/cathedral/sn39-snp-miner.env`:
@@ -80,12 +87,39 @@ leaves a miner running neither version.
 
 ## What counts as success
 
-The released image is what the running container reports.
+The released image is what the running container reports, **and it has been up
+long enough to count as running**, and the unit is `active`.
 
-Not "the unit is active". After an interrupted activation the *previous*
-container is often still active and perfectly healthy, and treating that as
-success would commit a release that never started, then report it as current
-for ever, so the upgrade would silently never happen.
+Not "the unit is active" on its own. After an interrupted activation the
+*previous* container is often still active and perfectly healthy, and treating
+that as success would commit a release that never started.
+
+The dwell is not theoretical caution. On the first live run the upgraded image
+could not start and crash-looped. A container that starts and exits immediately
+still reports `Running=true` in between, so a check without a dwell sampled one
+of those windows, called the release healthy, and committed an update to a miner
+that was in fact failing. systemd then hit its start limit and nothing was
+serving at all. The check now requires the container to have been up for
+`SETTLE_DWELL_SECONDS`, and refuses a unit that is `activating` or `failed`.
+
+## When a restart is unsafe
+
+A restart makes the miner re-read its validator-access snapshot. That snapshot
+is short-lived and refreshed out of band. Restarting close to its expiry can
+leave the miner unable to start at all.
+
+This is what actually broke the live run: the snapshot lapsed between install
+and update, the upgraded image refused to start five times with
+`validator access snapshot is absent, stale, or invalid`, and the unit gave up.
+The fix was a fresh snapshot, not a rollback.
+
+So `safe_to_activate` now refuses to restart unless the snapshot has at least
+`MINIMUM_ACCESS_REMAINING_SECONDS` left, and treats an unreadable snapshot as
+unsafe. An unknown answer is not a licence to stop a working miner.
+
+This is the same fragility as cathedral-validator#236. An updater that restarts
+miners makes a short-lived, out-of-band credential considerably more dangerous
+than it already was.
 
 ## If an update fails
 

@@ -44,6 +44,19 @@ FETCH_TOTAL_DEADLINE_SECONDS = 60
 # generates TLS material and binds. Measured starts are a few seconds.
 SETTLE_TIMEOUT_SECONDS = 120
 SETTLE_POLL_SECONDS = 3
+# How long the container must have been up before it counts as running.
+#
+# Learned the hard way on a live TDX box: a container that starts and then
+# exits immediately still reports Running=true in the window between. Without a
+# dwell the updater samples one of those windows, calls the release healthy, and
+# commits an update to a miner that is in fact crash-looping until systemd's
+# start limit stops it altogether.
+SETTLE_DWELL_SECONDS = 20
+# A restart makes the miner re-read its validator-access snapshot. If that has
+# expired the new container refuses to start, so a restart is only safe with
+# comfortable margin left.
+VALIDATOR_ACCESS_PATH = Path("/etc/cathedral/validator-access/validator-access.json")
+MINIMUM_ACCESS_REMAINING_SECONDS = 300
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
@@ -244,52 +257,109 @@ def restart_service(product: MinerProduct) -> None:
 
 
 def running_image(product: MinerProduct) -> str | None:
-    """The image the running miner container actually reports.
+    """The image the running miner container reports, once it has settled.
 
-    Waits for the container to settle, then answers with its immutable image
-    reference, or None when nothing is running. Deliberately not "is the unit
-    active": after an interrupted activation the previous container is still
-    active, and treating that as success commits a release that never started.
+    Two things this deliberately does NOT accept as running:
+
+    A container observed up for less than ``SETTLE_DWELL_SECONDS``. A
+    crash-looping miner is up for a fraction of a second at a time, and
+    sampling one of those windows would report a broken release as healthy.
+
+    A unit that is not ``active``. systemd reports ``activating`` while it is
+    restarting a failing service, and ``failed`` once the start limit trips.
     """
 
     deadline = time.monotonic() + SETTLE_TIMEOUT_SECONDS
     while True:
-        # Config.Image is the reference the container was created from, which
-        # is the digest-pinned string the launcher was given, so it compares
-        # directly against the release's image.
+        unit = run(["systemctl", "is-active", product.unit], timeout=30)
         inspect = run(
             [
                 "docker",
                 "container",
                 "inspect",
                 "--format",
-                "{{.State.Running}} {{.Config.Image}}",
+                "{{.State.Running}} {{.State.StartedAt}} {{.Config.Image}}",
                 product.container,
             ],
             timeout=30,
         )
-        if inspect.returncode == 0:
-            parts = inspect.stdout.strip().split(None, 1)
-            if len(parts) == 2 and parts[0] == "true":
-                return parts[1]
+        if unit.stdout.strip() == "active" and inspect.returncode == 0:
+            parts = inspect.stdout.strip().split(None, 2)
+            if len(parts) == 3 and parts[0] == "true":
+                started, image = parts[1], parts[2]
+                if _uptime_seconds(started) >= SETTLE_DWELL_SECONDS:
+                    return image
         if time.monotonic() >= deadline:
             return None
         time.sleep(SETTLE_POLL_SECONDS)
 
 
+def _uptime_seconds(started_at: str) -> float:
+    """Seconds since the container started, or 0 if it cannot be read.
+
+    Unparseable means "assume it just started", which fails safe: the caller
+    keeps waiting rather than accepting an unsettled container.
+    """
+
+    from datetime import datetime, timezone
+
+    text = started_at.strip()
+    # Docker emits nanosecond precision, which fromisoformat cannot take.
+    if "." in text:
+        head, _, tail = text.partition(".")
+        digits = "".join(c for c in tail if c.isdigit())[:6]
+        suffix = tail[len(tail.rstrip("Z")) :] or ""
+        text = f"{head}.{digits}{'Z' if text.endswith('Z') else suffix}"
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+
+
+def validator_access_remaining_seconds() -> float | None:
+    """Seconds of validator-access validity left, or None if unreadable."""
+
+    from datetime import datetime, timezone
+
+    try:
+        document = json.loads(VALIDATOR_ACCESS_PATH.read_text(encoding="utf-8"))
+        expires = str(document["expires_at"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+    try:
+        parsed = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (parsed - datetime.now(timezone.utc)).total_seconds()
+
+
 def safe_to_activate() -> bool:
     """Whether the miner may be restarted right now.
 
-    Today the miner serves only signed validator requests, each bounded and
-    retried by the validator on its next cycle, so a restart costs at most one
-    cycle and there is nothing to wait for.
+    A restart makes the miner re-read its validator-access snapshot. That
+    snapshot is short-lived and refreshed out of band, so restarting close to
+    its expiry can leave the miner unable to start at all: it crash-loops until
+    systemd's start limit stops it, and then nothing is serving.
 
-    This is the hook that changes when the host carries customer work. It must
-    then return False while a customer command is in flight. It is injected
-    rather than called inline precisely so that is one edit in one place.
+    That is not hypothetical. It happened on the live TDX box during the first
+    end-to-end update: the snapshot lapsed, the upgraded image refused to start
+    five times, and the unit gave up.
+
+    So the miner is only restarted with comfortable validity remaining. An
+    unreadable snapshot is treated as unsafe, because an unknown answer is not
+    a licence to stop a working miner.
+
+    This is also the hook that grows a customer-work condition later, which is
+    why it is injected rather than called inline.
     """
 
-    return True
+    remaining = validator_access_remaining_seconds()
+    if remaining is None:
+        return False
+    return remaining >= MINIMUM_ACCESS_REMAINING_SECONDS
 
 
 def build_host(arguments: argparse.Namespace, product: MinerProduct) -> MinerUpdaterHost:
