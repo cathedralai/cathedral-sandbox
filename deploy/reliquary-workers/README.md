@@ -64,7 +64,7 @@ These steps are not executed by preparation.
     python3 deploy/reliquary-workers/admission.py install --store /path/to/workers-grants.json --package /private/path/new-deployment/api/grants.json
 
 8. Deploy the coordinated API, CLI and site candidates through the normal repository release paths. The site needs exactly the Workers execute, capacity and health routes plus CLI login start/poll. Newly minted keys need workers:submit. Existing keys need reissue. Keep the static Workers routes before /v1/workers/{worker_id}.
-9. Configure every reverse proxy and process manager for the full batch deadline. Reliquary accepts batches up to 120 seconds. The API uses a 130-second total bound and ctcli uses 135 seconds. The default origin timeout of a proxy in between must not truncate valid batches. Resolve this before the long-deadline acceptance case. No receipt or attestation service is added.
+9. Configure every reverse proxy and process manager for the full batch deadline. Reliquary accepts batches up to 120 seconds. The unchanged customer client waits batch_timeout_s plus five seconds. ctcli caps a submission at batch plus four seconds. The API uses batch plus 3.5 seconds from route entry, including authentication, and refuses dispatch without batch plus 2.25 seconds remaining. Execution health preflight is capped at 0.75 seconds. The API retains a shielded backend request for up to 130 seconds after dispatch so caller cancellation does not erase accounting. The default origin timeout of a proxy in between must not truncate valid batches. Resolve this before the long-deadline acceptance case. No receipt or attestation service is added.
 
 The API reports degraded process health during normal worker replacement. Its execution path still validates runtime, pool size and retirement policy but leaves bounded physical admission to the executor. Persistent loss of workers remains an operational fault, visible through health and metrics. No mechanism silently reduces the promised allocation to 32 slots.
 
@@ -80,14 +80,42 @@ Complete the installed-client login, one known result, 32/50 load rows, observed
 
     python3 deploy/reliquary-workers/admission.py disable --store /path/to/workers-grants.json --allocation-id reliquary-trial
 
-Disabling is allocation-specific and preserves the grant history. Apply the same snapshot to all serving API replicas. Requests already dispatched continue until their physical execution finishes. API reservation counters are not a drain authority.
+Disabling is allocation-specific and preserves the grant history. Apply the same snapshot to all serving API replicas. Requests already dispatched continue until their physical execution finishes. The executor counter alone is insufficient for drain. API dispatch fences also account for requests still being uploaded and preserve uncertain outcomes.
 
-After confirming admission is disabled on every API replica, use the trusted operator client certificate against the executor:
+After disabling admission on every inventoried API process, use the operator token plus trusted executor client certificate:
 
-    python3 deploy/reliquary-workers/drain.py --endpoint https://EXECUTOR_HOST:8443 --pki /private/path/new-pki/api --runtime-id RUNTIME_ID
+    python3 deploy/reliquary-workers/drain.py --endpoint https://EXECUTOR_HOST:8443 --pki /private/path/new-pki/api --runtime-id RUNTIME_ID --allocation-id reliquary-trial --replicas /private/path/trial-replicas.json --operator-token-file /private/path/operator.token
 
-The helper waits for zero actual inflight over a ten-second quiet period. It fails if health is unavailable or the runtime differs. This reports HTTP execution drained, not completed security or cleanup qualification. Record final cleanup counters separately, then stop the systemd instance. Preserve logs and the previous deployment package. Do not force-stop a busy executor and label it a successful drain.
+The helper closes admission on every inventoried API process, requires the boot identities recorded before the trial, waits for zero pending dispatches with zero unknown outcomes, then checks zero physical executor inflight. It refuses changed process identities, stale enabled configuration, ambiguous dispatches and wrong executor identity. There is no quiet-period heuristic. This reports HTTP execution drained, not completed security or cleanup qualification. Record final cleanup counters separately, then stop the systemd instance. Preserve logs and the previous deployment package. Do not force-stop a busy executor and label it a successful drain.
 
 For rollback, restore the previous tested host package and coordinated API/site release, keeping admission disabled until its identity is confirmed. Do not restore an old grants file over unrelated customers. Re-enable only the intended allocation. Rotate/revoke the affected TLS and customer credential separately if required.
 
 This trial package does not create Google resources, change subnet registration or validator weights, buy bundles, or enable paid billing.
+
+
+## Record the complete API topology before first admission
+
+Set POLARIS_WORKERS_REPLICA_ID to a unique process identifier and POLARIS_WORKERS_OPERATOR_TOKEN_FILE to a private file holding a dedicated random operator token of 32-512 printable characters on each API process. Keep this token out of the customer package. The operator fence endpoint is not exposed by the site's public route allowlist and does not accept customer keys. Restrict access at the API network boundary too.
+
+Use one API process per direct HTTPS origin. A load-balanced address, multiple Uvicorn workers behind one address, autoscaling during a trial, or an omitted replica invalidates the inventory. The operator must reconcile the origins file against the actual serving topology. The script has no cloud-inventory authority.
+
+While every allocation remains disabled, record a JSON array of direct API origins in a private origins.json, then run:
+
+    python3 deploy/reliquary-workers/record-replicas.py --origins /private/path/origins.json --allocation-id reliquary-trial --runtime-id RUNTIME_ID --operator-token-file /private/path/operator.token --output /private/path/trial-replicas.json
+
+Keep this inventory unchanged throughout the trial. Do not regenerate it after a process crash to erase unknown execution. Fences stay closed for the lifetime of that API process. After successful drain, stop the executor before retiring the API processes. For another trial, start clean processes with admission disabled, reconcile the serving inventory, record new boot identities, and then enable the allocation.
+
+If drain reports an uncertain dispatch, stop admitting work and preserve the logs. An operator must observe executor completion or stop/recover the executor and its sandboxes. Treat any lost response as unknown. A process restart is not proof of graceful drain.
+
+## Trusted shadow grader integration
+
+The upstream normal grader entry point hardcodes the constructor default of four shadow threads and eight outstanding requests. Use the supplied shadow-grader.py in the pinned customer's Python environment to expose the existing constructor setting. This does not modify their executor image or reward authority.
+
+    . /private/path/reliquary.env
+    python3 deploy/reliquary-workers/shadow-grader.py --socket EXISTING_GRADER_SOCKET --bundle EXISTING_LOCAL_RUNSC_BUNDLE --pool-size EXISTING_LOCAL_POOL_SIZE --shadow-workers 50 --timeout 5 --health-path PRIVATE_HEALTH_FILE
+
+Preserve the existing local pool size, bundle, socket, metrics port and workload settings. The launcher requires local runsc and shadow mode. It never enables authoritative remote scoring. Fifty shadow threads have at most 100 outstanding mirrored jobs in the unchanged constructor. This remains a bounded queue, so representative-peak acceptance still requires zero dropped jobs. Record matched, mismatched, failed, dropped and inflight counters alongside the trusted caller's submitted count. The local grader path remains authoritative.
+
+## Final regression execution, deferred
+
+Local source tests are in tests/reliquary_workers/test_customer_edges.py. They cover a recorded twelve-second dispatch barrier, missing/stale replica fences and trusted constructor settings. They do not establish host isolation, actual physical concurrency or zero shadow drops. The dedicated-host acceptance must exercise the pinned customer's load and attack scripts plus the real trusted grader entry point.
