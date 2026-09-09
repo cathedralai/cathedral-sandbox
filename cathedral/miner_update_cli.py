@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from cathedral.miner_release import MAX_RELEASE_DOCUMENT_BYTES
+from cathedral.miner_release import MAX_RELEASE_DOCUMENT_BYTES, MinerRelease
 from cathedral.miner_updater import (
     DEFAULT_ENV_PATH,
     DEFAULT_PAUSE_PATH,
@@ -102,12 +102,18 @@ def run(argv: list[str], *, timeout: int = 300) -> subprocess.CompletedProcess[s
     )
 
 
-def prepare_image(image: str) -> None:
-    """Pull the image and confirm the registry returned that exact digest.
+def prepare_image(release: MinerRelease) -> None:
+    """Pull the image and confirm it is the exact artifact the record names.
 
-    Done while the previous image is still pinned, so an unreachable registry
-    or a digest mismatch costs nothing.
+    Done while the previous image is still pinned, so an unreachable registry,
+    a digest mismatch or a wrong runtime contract costs nothing.
+
+    The launcher checks the runtime-contract label too, and refuses to start on
+    a mismatch. Checking it here as well turns that from a failed restart and a
+    rollback into a refusal that never touches the running miner.
     """
+
+    image = release.image
 
     pull = run(["docker", "pull", "--platform", "linux/amd64", image], timeout=900)
     if pull.returncode != 0:
@@ -126,6 +132,20 @@ def prepare_image(image: str) -> None:
         raise MinerUpdateError("docker image inspect failed after pull")
     if image not in inspect.stdout.split():
         raise MinerUpdateError("the pulled image does not report the requested digest")
+    label = run(
+        [
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            '{{index .Config.Labels "org.cathedral.sn39.runtime-contract"}}',
+            image,
+        ]
+    )
+    if label.returncode != 0 or label.stdout.strip() != release.runtime_contract:
+        raise MinerUpdateError(
+            "the pulled image does not declare the runtime contract the release names"
+        )
 
 
 def restart_service() -> None:

@@ -13,7 +13,7 @@ was tested. Promotion re-signs the same image; it never rebuilds it.
       --private-key /secure/offline/sn39-miner-release-private-key.pem \\
       --signing-key-id sn39-miner-release-1 \\
       --image ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:<64hex> \\
-      --runtime-contract cathedral.sn39.snp.v1 \\
+      --runtime-contract snp-signed-validator-fleet-v1 \\
       --launcher /reviewed/scripts/run_sn39_snp_miner.sh \\
       --version 2026.09.09 --sequence 5 --lifetime-seconds 604800 \\
       --out /secure/signed/miner-canary.json

@@ -28,7 +28,7 @@ from cathedral.policy_registry import canonical_signed_bytes
 KEY_ID = "sn39-miner-release-1"
 IMAGE_DIGEST = "0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255"
 LAUNCHER_DIGEST = "a" * 64
-RUNTIME_CONTRACT = "cathedral.sn39.snp.v1"
+RUNTIME_CONTRACT = "snp-signed-validator-fleet-v1"
 
 
 @pytest.fixture()

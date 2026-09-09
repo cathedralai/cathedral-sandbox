@@ -26,6 +26,8 @@ the updater stops and says so rather than guessing.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -46,6 +48,7 @@ UPDATE_STATE_SCHEMA = "cathedral_sn39_miner_updater_state_v1"
 DEFAULT_ENV_PATH = Path("/etc/cathedral/sn39-snp-miner.env")
 DEFAULT_STATE_PATH = Path("/var/lib/cathedral-sn39-miner-update/state.json")
 DEFAULT_PAUSE_PATH = Path("/etc/cathedral/sn39-snp-miner-update.paused")
+DEFAULT_LOCK_PATH = Path("/var/lib/cathedral-sn39-miner-update/updater.lock")
 
 IMAGE_VARIABLE = "SN39_SNP_MINER_IMAGE"
 
@@ -103,13 +106,17 @@ class MinerUpdaterHost:
     restart_service: Callable[[], None]
     is_healthy: Callable[[], bool]
     # Pull and verify the image before the pin is swapped. This is what the
-    # prepared stage covers: an unreachable registry or a digest that does not
-    # match is caught while the previous version is still the one pinned.
-    prepare_image: Callable[[str], None] = lambda image: None
+    # prepared stage covers: an unreachable registry, a digest that does not
+    # match, or an image whose runtime-contract label disagrees with the record
+    # is caught while the previous version is still the one pinned. It receives
+    # the whole release because the label check needs runtime_contract, not just
+    # the image reference.
+    prepare_image: Callable[[MinerRelease], None] = lambda release: None
     safe_to_activate: Callable[[], bool] = lambda: True
     env_path: Path = DEFAULT_ENV_PATH
     state_path: Path = DEFAULT_STATE_PATH
     pause_path: Path = DEFAULT_PAUSE_PATH
+    lock_path: Path = DEFAULT_LOCK_PATH
     trusted_keys: Mapping[str, bytes] = field(default_factory=dict)
     now_unix: Callable[[], int] = lambda: 0
 
@@ -319,12 +326,44 @@ def reconcile_interrupted_activation(host: MinerUpdaterHost, state: dict[str, ob
     )
 
 
+@contextlib.contextmanager
+def _exclusive(path: Path):
+    """Hold an exclusive lock for the whole check.
+
+    The systemd timer will not run two copies of one oneshot unit, but an
+    operator running a manual check while the timer fires absolutely can race,
+    and two processes rewriting the pin and restarting the unit is exactly the
+    interleaving that produces a miner running neither version cleanly.
+    Non-blocking: a second run reports contention rather than queueing behind a
+    twenty-minute pull.
+    """
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        raise MinerUpdateError("updater lock is unavailable") from exc
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise MinerUpdateError("another update check is already running") from exc
+        yield
+    finally:
+        os.close(handle)
+
+
 def update_once(host: MinerUpdaterHost, *, channel: str) -> UpdateOutcome:
     """Run one update check. Returns what happened, raises only on real faults."""
 
+    # Checked before the lock so a paused miner never contends for it.
     if host.pause_path.exists():
         return UpdateOutcome("paused", f"operator pause file present: {host.pause_path}")
+    with _exclusive(host.lock_path):
+        return _update_once_locked(host, channel=channel)
 
+
+def _update_once_locked(host: MinerUpdaterHost, *, channel: str) -> UpdateOutcome:
     state = read_state(host.state_path)
     reconcile_interrupted_activation(host, state)
 
@@ -394,7 +433,7 @@ def update_once(host: MinerUpdaterHost, *, channel: str) -> UpdateOutcome:
     write_state(host.state_path, state)
 
     try:
-        host.prepare_image(release.image)
+        host.prepare_image(release)
     except Exception as exc:  # noqa: BLE001 - any pull or verify failure is the same case
         state["stage"] = None
         state.pop("pending", None)

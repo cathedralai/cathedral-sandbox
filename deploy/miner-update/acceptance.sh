@@ -53,7 +53,7 @@ pass "generated an encrypted release key"
 export CATHEDRAL_MINER_RELEASE_PASSPHRASE=acceptance
 PYTHONPATH="${ROOT}" "${PY}" "${ROOT}/deploy/miner-update/build_signed_miner_release.py" canary \
   --private-key "${WORK}/key.pem" --signing-key-id sn39-miner-release-1 \
-  --image "${NEW}" --runtime-contract cathedral.sn39.snp.v1 \
+  --image "${NEW}" --runtime-contract snp-signed-validator-fleet-v1 \
   --launcher "${ROOT}/scripts/run_sn39_snp_miner.sh" \
   --version 2026.09.09 --sequence 5 --lifetime-seconds 604800 \
   --out "${WORK}/canary.json" >/dev/null
@@ -100,11 +100,12 @@ def host(healthy=True, safe=True):
         fetch_metadata=lambda: metadata,
         restart_service=lambda: restarts.append(1),
         is_healthy=lambda: healthy,
-        prepare_image=pulled.append,
+        prepare_image=lambda r: pulled.append(r.image),
         safe_to_activate=lambda: safe,
         env_path=work / "miner.env",
         state_path=work / "state" / "state.json",
         pause_path=work / "paused",
+        lock_path=work / "state" / "updater.lock",
         trusted_keys=trusted,
         now_unix=lambda: 1_500_000_000,
     )

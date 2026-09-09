@@ -77,7 +77,7 @@ def signed_release(key: Ed25519PrivateKey, *, sequence: int = 5, image: str = NE
         "release": {
             "version": "2026.09.09",
             "image": image,
-            "runtime_contract": "cathedral.sn39.snp.v1",
+            "runtime_contract": "snp-signed-validator-fleet-v1",
             "launcher_sha256": "4" * 64,
             "promoted_canary": {"sequence": sequence + 1, "signed_sha256": "5" * 64},
         },
@@ -99,6 +99,7 @@ class Recorder:
         self.env_path.write_text(ENV_BODY, encoding="utf-8")
         self.state_path = tmp / "state" / "state.json"
         self.pause_path = tmp / "paused"
+        self.lock_path = tmp / "state" / "updater.lock"
         self.metadata = metadata
         self.trusted = trusted
         self.restarts = 0
@@ -117,11 +118,12 @@ class Recorder:
             fetch_metadata=lambda: self.metadata,
             restart_service=restart,
             is_healthy=lambda: self.healthy,
-            prepare_image=self.prepared.append,
+            prepare_image=lambda release: self.prepared.append(release.image),
             safe_to_activate=lambda: self.safe,
             env_path=self.env_path,
             state_path=self.state_path,
             pause_path=self.pause_path,
+            lock_path=self.lock_path,
             trusted_keys=self.trusted,
             now_unix=lambda: 1_500_000,
         )
@@ -247,7 +249,7 @@ def test_an_unsafe_moment_defers_instead_of_restarting(tmp_path, key, trusted):
 def test_a_failed_pull_changes_nothing(tmp_path, key, trusted):
     recorder = Recorder(tmp_path, signed_release(key), trusted)
     host = recorder.host()
-    def boom(image: str) -> None:
+    def boom(release) -> None:
         raise RuntimeError("registry unreachable")
     host.prepare_image = boom
     with pytest.raises(MinerUpdateError, match="could not be prepared"):
@@ -441,3 +443,63 @@ def test_status_reports_version_without_secrets(tmp_path, key, trusted):
     rendered = json.dumps(status)
     assert "5ERBws" not in rendered
     assert "ACCESS_KEYS_DIGEST" not in rendered
+
+
+# --- concurrency -------------------------------------------------------
+
+
+def test_a_second_concurrent_check_is_refused(tmp_path, key, trusted):
+    """The timer and a manual run can overlap.
+
+    Two processes rewriting the pin and restarting the unit is the interleaving
+    that leaves a miner running neither version cleanly, so the second one is
+    refused rather than queued.
+    """
+
+    import fcntl
+    import os
+
+    recorder = Recorder(tmp_path, signed_release(key), trusted)
+    recorder.lock_path.parent.mkdir(parents=True, exist_ok=True)
+    held = os.open(recorder.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with pytest.raises(MinerUpdateError, match="already running"):
+            update_once(recorder.host(), channel="stable")
+        assert recorder.pinned() == OLD_IMAGE
+        assert recorder.restarts == 0
+    finally:
+        os.close(held)
+    # Once the other run finishes, the update proceeds normally.
+    assert update_once(recorder.host(), channel="stable").action == "activated"
+
+
+def test_a_paused_miner_does_not_contend_for_the_lock(tmp_path, key, trusted):
+    import fcntl
+    import os
+
+    recorder = Recorder(tmp_path, signed_release(key), trusted)
+    recorder.pause_path.write_text("x")
+    recorder.lock_path.parent.mkdir(parents=True, exist_ok=True)
+    held = os.open(recorder.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        assert update_once(recorder.host(), channel="stable").action == "paused"
+    finally:
+        os.close(held)
+
+
+def test_the_pulled_image_carries_the_release_runtime_contract(tmp_path, key, trusted):
+    """prepare_image receives the whole release so it can check the label.
+
+    The launcher refuses a wrong runtime-contract label at startup. Catching it
+    here turns a failed restart plus rollback into a refusal that never touches
+    the running miner.
+    """
+
+    recorder = Recorder(tmp_path, signed_release(key), trusted)
+    seen: list[str] = []
+    host = recorder.host()
+    host.prepare_image = lambda release: seen.append(release.runtime_contract)
+    update_once(host, channel="stable")
+    assert seen == ["snp-signed-validator-fleet-v1"]

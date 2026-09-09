@@ -60,8 +60,15 @@ In order, stopping at the first failure and leaving the running miner alone:
 6. The sequence does not go backwards, and an existing sequence is not reused
    for different signed bytes.
 7. The image is digest-pinned to the canonical repository. No mutable tags.
-8. The image is pulled and the registry is confirmed to return that exact
-   digest, all while the previous image is still the one pinned.
+8. The image is pulled, the registry is confirmed to return that exact digest,
+   and the image's `org.cathedral.sn39.runtime-contract` label is confirmed to
+   match the one the record names. All while the previous image is still the
+   one pinned, so any of these failing costs nothing.
+
+Only one check runs at a time. An operator running a manual check while the
+timer fires is refused with "another update check is already running" rather
+than queued, because two processes rewriting the pin is the interleaving that
+leaves a miner running neither version cleanly.
 
 Only after all of that is the pin rewritten and the unit restarted. The rewrite
 replaces one assignment and leaves every other line, including comments,
@@ -139,7 +146,7 @@ python deploy/miner-update/build_signed_miner_release.py canary \
   --private-key /secure/offline/sn39-miner-release-private-key.pem \
   --signing-key-id sn39-miner-release-1 \
   --image ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:<64hex> \
-  --runtime-contract cathedral.sn39.snp.v1 \
+  --runtime-contract snp-signed-validator-fleet-v1 \
   --launcher scripts/run_sn39_snp_miner.sh \
   --version 2026.09.09 --sequence <next> --lifetime-seconds 604800 \
   --out /secure/signed/miner-canary.json
