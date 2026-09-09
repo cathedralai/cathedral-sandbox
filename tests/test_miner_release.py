@@ -324,3 +324,56 @@ def test_reserialising_with_different_whitespace_keeps_the_same_signed_digest(
         json.dumps(json.loads(raw), indent=2).encode("utf-8"), trusted_keys=trusted
     )
     assert compact.signed_sha256 == spaced.signed_sha256
+
+
+# --- product separation ------------------------------------------------
+
+
+def test_a_record_for_the_other_miner_product_is_refused(signing_key, trusted):
+    """The two shipped miners must not be able to install each other.
+
+    The TDX audit miner and the SNP miner have different repositories,
+    contracts and pin variables. A host expecting one must refuse a record for
+    the other on identity, not on a downstream accident.
+    """
+
+    from cathedral.miner_products import SN39_AUDIT_MINER, SN39_SNP_MINER
+
+    document = canary_document()
+    document["product"] = SN39_AUDIT_MINER.product
+    document["release"]["image"] = f"{SN39_AUDIT_MINER.image_repository}@sha256:{IMAGE_DIGEST}"
+    document["release"]["runtime_contract"] = SN39_AUDIT_MINER.runtime_contract
+    raw = sign(document, signing_key)
+
+    # An SNP host refuses it.
+    with pytest.raises(MinerReleaseError, match="different product"):
+        parse_miner_release(
+            raw,
+            trusted_keys=trusted,
+            expected_product=SN39_SNP_MINER.product,
+            expected_image_repository=SN39_SNP_MINER.image_repository,
+        )
+
+    # A TDX host accepts exactly the same bytes.
+    release = parse_miner_release(
+        raw,
+        trusted_keys=trusted,
+        expected_product=SN39_AUDIT_MINER.product,
+        expected_image_repository=SN39_AUDIT_MINER.image_repository,
+    )
+    assert release.runtime_contract == SN39_AUDIT_MINER.runtime_contract
+
+
+def test_the_right_product_with_the_wrong_repository_is_refused(signing_key, trusted):
+    from cathedral.miner_products import SN39_AUDIT_MINER
+
+    document = canary_document()
+    document["product"] = SN39_AUDIT_MINER.product
+    # Correct product, but the SNP repository.
+    with pytest.raises(MinerReleaseError, match="canonical repository"):
+        parse_miner_release(
+            sign(document, signing_key),
+            trusted_keys=trusted,
+            expected_product=SN39_AUDIT_MINER.product,
+            expected_image_repository=SN39_AUDIT_MINER.image_repository,
+        )

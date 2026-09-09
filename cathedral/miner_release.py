@@ -150,6 +150,7 @@ def parse_miner_release(
     *,
     trusted_keys: Mapping[str, bytes],
     expected_product: str = SN39_SNP_MINER_PRODUCT,
+    expected_image_repository: str = CANONICAL_IMAGE_REPOSITORY,
 ) -> MinerRelease:
     """Verify one signed release record and return it.
 
@@ -238,7 +239,7 @@ def parse_miner_release(
     image = release["image"]
     if not isinstance(image, str):
         raise MinerReleaseError("release image is invalid")
-    prefix = CANONICAL_IMAGE_REPOSITORY + "@sha256:"
+    prefix = expected_image_repository + "@sha256:"
     if not image.startswith(prefix):
         raise MinerReleaseError("release image is not pinned to the canonical repository")
     image_digest = image[len(prefix) :]

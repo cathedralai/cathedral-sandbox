@@ -46,11 +46,10 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from cathedral.miner_release import (  # noqa: E402
-    CANONICAL_IMAGE_REPOSITORY,
     MINER_RELEASE_SCHEMA,
-    SN39_SNP_MINER_PRODUCT,
     parse_miner_release,
 )
+from cathedral.miner_products import PRODUCTS, product_by_name  # noqa: E402
 from cathedral.policy_registry import canonical_signed_bytes  # noqa: E402
 
 PASSPHRASE_ENV = "CATHEDRAL_MINER_RELEASE_PASSPHRASE"
@@ -113,13 +112,14 @@ def _write(path: Path, payload: bytes) -> None:
 
 
 def build(arguments: argparse.Namespace) -> int:
+    product = product_by_name(arguments.product)
     key = _load_private_key(Path(arguments.private_key))
     issued = int(arguments.issued_unix or time.time())
     expires = issued + int(arguments.lifetime_seconds)
 
     if arguments.channel == "canary":
         image = arguments.image
-        if not image.startswith(CANONICAL_IMAGE_REPOSITORY + "@sha256:"):
+        if not image.startswith(product.image_repository + "@sha256:"):
             _fail("the image must be digest-pinned to the canonical repository")
         if _SHA256_RE.fullmatch(image.split("@sha256:", 1)[1]) is None:
             _fail("the image must use one immutable lowercase sha256 digest")
@@ -135,7 +135,12 @@ def build(arguments: argparse.Namespace) -> int:
         # Verify the canary against its own public key before promoting it, so
         # a corrupted or foreign file can never become stable.
         trusted = {arguments.signing_key_id: bytes.fromhex(_public_key_hex(key))}
-        canary = parse_miner_release(promoted_raw, trusted_keys=trusted)
+        canary = parse_miner_release(
+            promoted_raw,
+            trusted_keys=trusted,
+            expected_product=product.product,
+            expected_image_repository=product.image_repository,
+        )
         if canary.channel != "canary":
             _fail("the promoted record is not a canary")
         release = {
@@ -151,7 +156,7 @@ def build(arguments: argparse.Namespace) -> int:
 
     body = {
         "schema": MINER_RELEASE_SCHEMA,
-        "product": SN39_SNP_MINER_PRODUCT,
+        "product": product.product,
         "channel": arguments.channel,
         "sequence": int(arguments.sequence),
         "issued_unix": issued,
@@ -163,12 +168,16 @@ def build(arguments: argparse.Namespace) -> int:
 
     # Verify what we just produced, with the same parser a miner will use.
     verified = parse_miner_release(
-        payload, trusted_keys={arguments.signing_key_id: bytes.fromhex(_public_key_hex(key))}
+        payload,
+        trusted_keys={arguments.signing_key_id: bytes.fromhex(_public_key_hex(key))},
+        expected_product=product.product,
+        expected_image_repository=product.image_repository,
     )
     _write(Path(arguments.out), payload)
     print(
         json.dumps(
             {
+                "product": verified.product,
                 "channel": verified.channel,
                 "sequence": verified.sequence,
                 "version": verified.version,
@@ -190,6 +199,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("channel", choices=["canary", "stable"])
     parser.add_argument("--private-key", required=True)
     parser.add_argument("--signing-key-id", required=True)
+    parser.add_argument("--product", default="sn39-snp-miner", choices=sorted(PRODUCTS))
     parser.add_argument("--sequence", required=True, type=int)
     parser.add_argument("--lifetime-seconds", required=True, type=int)
     parser.add_argument("--out", required=True)

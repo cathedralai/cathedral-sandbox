@@ -22,6 +22,7 @@ REVISION=""
 KEYS_FILE=""
 CHANNEL="stable"
 CHANNEL_URL=""
+PRODUCT="sn39-snp-miner"
 PREFIX=/opt/cathedral-sn39-miner-update
 REPOSITORY="https://github.com/cathedralai/cathedral-sandbox.git"
 
@@ -32,6 +33,7 @@ while [[ $# -gt 0 ]]; do
     --revision) REVISION="${2:-}"; shift 2 ;;
     --keys) KEYS_FILE="${2:-}"; shift 2 ;;
     --channel) CHANNEL="${2:-}"; shift 2 ;;
+    --product) PRODUCT="${2:-}"; shift 2 ;;
     --channel-url) CHANNEL_URL="${2:-}"; shift 2 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -41,21 +43,26 @@ done
 [[ "${REVISION}" =~ ^[0-9a-f]{40}$ ]] || die "--revision must be one 40-character commit"
 [[ -f "${KEYS_FILE}" ]] || die "--keys must name the miner release public key file"
 [[ "${CHANNEL}" == "stable" || "${CHANNEL}" == "canary" ]] || die "--channel must be stable or canary"
+[[ "${PRODUCT}" == "sn39-snp-miner" || "${PRODUCT}" == "sn39-audit-miner" ]] \
+  || die "--product must be sn39-snp-miner or sn39-audit-miner"
 [[ -n "${CHANNEL_URL}" ]] || die "--channel-url is required"
 [[ "${CHANNEL_URL}" == https://* ]] || die "--channel-url must be https"
 
 # --- report what is installed now, before changing anything ----------------
 echo "== current state =="
-if [[ -f /etc/cathedral/sn39-snp-miner.env ]]; then
+case "${PRODUCT}" in
+  sn39-audit-miner) PIN_FILE=/etc/cathedral/sn39-audit-miner.env; PIN_VAR=SN39_AUDIT_MINER_IMAGE; UNIT=cathedral-sn39-audit-miner.service ;;
+  *)                PIN_FILE=/etc/cathedral/sn39-snp-miner.env;   PIN_VAR=SN39_SNP_MINER_IMAGE;   UNIT=cathedral-sn39-snp-miner.service ;;
+esac
+if [[ -f "${PIN_FILE}" ]]; then
   # Print only the image pin. The same file holds the hotkey and the
   # validator-access digest, which are not ours to echo.
-  grep -E '^SN39_SNP_MINER_IMAGE=' /etc/cathedral/sn39-snp-miner.env \
-    || echo "SN39_SNP_MINER_IMAGE is not set"
+  grep -E "^${PIN_VAR}=" "${PIN_FILE}" || echo "${PIN_VAR} is not set"
 else
-  die "/etc/cathedral/sn39-snp-miner.env is missing; this host has no installed miner"
+  die "${PIN_FILE} is missing; this host has no installed ${PRODUCT}"
 fi
-systemctl is-active cathedral-sn39-snp-miner.service || true
-systemctl is-enabled cathedral-sn39-snp-miner.service || true
+systemctl is-active "${UNIT}" || true
+systemctl is-enabled "${UNIT}" || true
 if systemctl list-unit-files 'cathedral-sn39-miner-update*' --no-legend | grep -q .; then
   echo "note: an updater is already installed; this run will replace it in place"
 fi
@@ -98,6 +105,7 @@ install -d -o root -g root -m 0700 /var/lib/cathedral-sn39-miner-update
 # keeps a URL containing & or ? from being read as shell syntax by anything
 # that sources this file.
 cat >/etc/cathedral/sn39-miner-update.env <<EOF
+CATHEDRAL_MINER_UPDATE_PRODUCT="${PRODUCT}"
 CATHEDRAL_MINER_UPDATE_CHANNEL="${CHANNEL}"
 CATHEDRAL_MINER_UPDATE_URL="${CHANNEL_URL}"
 EOF
@@ -113,12 +121,12 @@ systemctl daemon-reload
 
 # --- verify without changing the miner -------------------------------------
 echo "== installed. reporting status =="
-/usr/local/sbin/cathedral-sn39-miner-update status
+/usr/local/sbin/cathedral-sn39-miner-update status --product "${PRODUCT}"
 
 printf '\n%s\n\n' "The timer is deliberately NOT enabled yet."
 printf '%s\n' "Run one check by hand first and read what it says:"
-printf '\n  cathedral-sn39-miner-update check --channel %s --channel-url %s\n\n' \
-  "$(printf '%q' "${CHANNEL}")" "$(printf '%q' "${CHANNEL_URL}")"
+printf '\n  cathedral-sn39-miner-update check --product %s --channel %s --channel-url %s\n\n' \
+  "$(printf '%q' "${PRODUCT}")" "$(printf '%q' "${CHANNEL}")" "$(printf '%q' "${CHANNEL_URL}")"
 cat <<'NEXT'
 "current" means the pinned image already matches the release and nothing
 happened. "activated" means it upgraded and the released image is running.

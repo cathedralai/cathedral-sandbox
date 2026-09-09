@@ -2,7 +2,6 @@
 Description=Cathedral SN39 miner signed update check
 After=network-online.target docker.service
 Wants=network-online.target
-ConditionPathExists=/etc/cathedral/sn39-snp-miner.env
 ConditionPathExists=/etc/cathedral/sn39-miner-update-keys.json
 
 [Service]
@@ -11,6 +10,7 @@ User=root
 Group=root
 EnvironmentFile=/etc/cathedral/sn39-miner-update.env
 ExecStart=/usr/local/sbin/cathedral-sn39-miner-update check \
+  --product ${CATHEDRAL_MINER_UPDATE_PRODUCT} \
   --channel ${CATHEDRAL_MINER_UPDATE_CHANNEL} \
   --channel-url ${CATHEDRAL_MINER_UPDATE_URL}
 # The updater rewrites one pin file and restarts one unit. It never needs the

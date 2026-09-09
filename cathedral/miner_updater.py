@@ -56,6 +56,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from cathedral.miner_release import (
+    CANONICAL_IMAGE_REPOSITORY,
+    SN39_SNP_MINER_PRODUCT,
     MinerRelease,
     MinerReleaseError,
     enforce_monotonic_release,
@@ -142,6 +144,12 @@ class MinerUpdaterHost:
     state_path: Path = DEFAULT_STATE_PATH
     pause_path: Path = DEFAULT_PAUSE_PATH
     lock_path: Path = DEFAULT_LOCK_PATH
+    # Which assignment in the pin file names this product's image.
+    image_variable: str = IMAGE_VARIABLE
+    # What this host will accept a release for. Both are caller-supplied so
+    # a record for another product fails on identity, not on luck.
+    expected_product: str = SN39_SNP_MINER_PRODUCT
+    expected_image_repository: str = CANONICAL_IMAGE_REPOSITORY
     trusted_keys: Mapping[str, bytes] = field(default_factory=dict)
     now_unix: Callable[[], int] = lambda: 0
 
@@ -213,7 +221,7 @@ def _atomic_write(path: Path, body: bytes, *, mode: int) -> None:
                 os.unlink(temporary)
 
 
-def rewrite_pin(path: Path, image: str) -> None:
+def rewrite_pin(path: Path, image: str, *, variable: str = IMAGE_VARIABLE) -> None:
     """Replace only the image assignment, preserving every other line."""
 
     try:
@@ -225,17 +233,17 @@ def rewrite_pin(path: Path, image: str) -> None:
     output: list[str] = []
     for line in original.splitlines():
         match = _ASSIGNMENT_RE.match(line)
-        if match is not None and match.group(1) == IMAGE_VARIABLE:
+        if match is not None and match.group(1) == variable:
             if replaced:
                 # A duplicate assignment means the file disagrees with itself
                 # and systemd takes the last one. Collapse to one.
                 continue
-            output.append(f"{IMAGE_VARIABLE}={image}")
+            output.append(f"{variable}={image}")
             replaced = True
         else:
             output.append(line)
     if not replaced:
-        output.append(f"{IMAGE_VARIABLE}={image}")
+        output.append(f"{variable}={image}")
     _atomic_write(path, ("\n".join(output) + "\n").encode("utf-8"), mode=0o600)
 
 
@@ -339,8 +347,8 @@ def _durable_unchanged(host: MinerUpdaterHost, pending: Mapping[str, object]) ->
 def _restore_pin_if_needed(host: MinerUpdaterHost, previous: object) -> None:
     if not isinstance(previous, str) or not previous:
         return
-    if read_env_assignments(host.env_path).get(IMAGE_VARIABLE) != previous:
-        rewrite_pin(host.env_path, previous)
+    if read_env_assignments(host.env_path).get(host.image_variable) != previous:
+        rewrite_pin(host.env_path, previous, variable=host.image_variable)
 
 
 def reconcile_interrupted_activation(host: MinerUpdaterHost, state: dict[str, object]) -> None:
@@ -425,7 +433,12 @@ def _update_once_locked(host: MinerUpdaterHost, *, channel: str) -> UpdateOutcom
     if not isinstance(raw, (bytes, bytearray)) or len(raw) > MAX_METADATA_BYTES:
         raise MinerUpdateError("release metadata size is out of range")
     try:
-        release = parse_miner_release(bytes(raw), trusted_keys=host.trusted_keys)
+        release = parse_miner_release(
+            bytes(raw),
+            trusted_keys=host.trusted_keys,
+            expected_product=host.expected_product,
+            expected_image_repository=host.expected_image_repository,
+        )
     except MinerReleaseError as exc:
         raise MinerUpdateError(f"release metadata refused: {exc}") from exc
 
@@ -447,7 +460,7 @@ def _update_once_locked(host: MinerUpdaterHost, *, channel: str) -> UpdateOutcom
     floors[channel] = {"sequence": release.sequence, "signed_sha256": release.signed_sha256}
     write_state(host.state_path, state)
 
-    current_image = read_env_assignments(host.env_path).get(IMAGE_VARIABLE)
+    current_image = read_env_assignments(host.env_path).get(host.image_variable)
     if current_image == release.image:
         state.setdefault("channels", {})[channel] = _channel_record(release)
         write_state(host.state_path, state)
@@ -508,7 +521,7 @@ def _update_once_locked(host: MinerUpdaterHost, *, channel: str) -> UpdateOutcom
     state["stage"] = STAGE_MAY_HAVE_RUN
     write_state(host.state_path, state)
 
-    rewrite_pin(host.env_path, release.image)
+    rewrite_pin(host.env_path, release.image, variable=host.image_variable)
     restart_error: Exception | None = None
     try:
         host.restart_service()
@@ -572,7 +585,7 @@ def _rollback(
     """
 
     try:
-        rewrite_pin(host.env_path, previous_image)
+        rewrite_pin(host.env_path, previous_image, variable=host.image_variable)
         host.restart_service()
     except Exception as exc:  # noqa: BLE001
         write_state(host.state_path, state)
@@ -601,7 +614,7 @@ def describe_status(host: MinerUpdaterHost) -> dict[str, object]:
     state = read_state(host.state_path)
     return {
         "schema": "cathedral_sn39_miner_update_status_v1",
-        "pinned_image": assignments.get(IMAGE_VARIABLE),
+        "pinned_image": assignments.get(host.image_variable),
         "paused": host.pause_path.exists(),
         "stage": state.get("stage"),
         "needs_operator": state.get("stage") == STAGE_MAY_HAVE_RUN,

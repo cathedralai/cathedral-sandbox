@@ -22,6 +22,7 @@ import urllib.request
 from pathlib import Path
 
 from cathedral.miner_release import MAX_RELEASE_DOCUMENT_BYTES, MinerRelease
+from cathedral.miner_products import PRODUCTS, MinerProduct, product_by_name
 from cathedral.miner_updater import (
     DEFAULT_ENV_PATH,
     DEFAULT_LOCK_PATH,
@@ -33,12 +34,6 @@ from cathedral.miner_updater import (
     update_once,
 )
 
-MINER_UNIT = "cathedral-sn39-snp-miner.service"
-CONTAINER_NAME = "cathedral-sn39-snp-miner"
-# The launcher the release is built against, and the state it bind-mounts
-# read-write. Both are fixed by scripts/run_sn39_snp_miner.sh.
-LAUNCHER_PATH = Path("/usr/local/sbin/cathedral-run-sn39-snp-miner")
-DURABLE_STATE_DIRECTORY = Path("/var/lib/cathedral/validator-access")
 DEFAULT_KEYS_PATH = Path("/etc/cathedral/sn39-miner-update-keys.json")
 MAX_KEYS_BYTES = 64 * 1024
 MAX_LAUNCHER_BYTES = 4 * 1024 * 1024
@@ -140,7 +135,7 @@ def run(argv: list[str], *, timeout: int = 300) -> subprocess.CompletedProcess[s
     )
 
 
-def verify_launcher(release: MinerRelease) -> None:
+def verify_launcher(product: MinerProduct, release: MinerRelease) -> None:
     """Confirm this host runs the launcher the release was built against.
 
     The launcher hard-codes the runtime contract it accepts and refuses to
@@ -150,10 +145,10 @@ def verify_launcher(release: MinerRelease) -> None:
     """
 
     try:
-        with LAUNCHER_PATH.open("rb") as handle:
+        with product.launcher_path.open("rb") as handle:
             body = handle.read(MAX_LAUNCHER_BYTES + 1)
     except OSError as exc:
-        raise MinerUpdateError(f"installed launcher cannot be read: {LAUNCHER_PATH}") from exc
+        raise MinerUpdateError(f"installed launcher cannot be read: {product.launcher_path}") from exc
     if len(body) > MAX_LAUNCHER_BYTES:
         raise MinerUpdateError("installed launcher is unexpectedly large")
     digest = hashlib.sha256(body).hexdigest()
@@ -171,7 +166,7 @@ def verify_launcher(release: MinerRelease) -> None:
         )
 
 
-def durable_digest() -> str:
+def durable_digest(product: MinerProduct) -> str:
     """Fingerprint the state the miner may mutate.
 
     The launcher bind-mounts this directory read-write, so it is where a
@@ -185,7 +180,7 @@ def durable_digest() -> str:
     """
 
     accumulator = hashlib.sha256()
-    root = DURABLE_STATE_DIRECTORY
+    root = product.durable_state_directory
     if not root.is_dir():
         return "absent"
     for path in sorted(root.rglob("*")):
@@ -206,7 +201,7 @@ def durable_digest() -> str:
     return accumulator.hexdigest()
 
 
-def prepare_image(release: MinerRelease) -> None:
+def prepare_image(product: MinerProduct, release: MinerRelease) -> None:
     """Pull the image and confirm it is the exact artifact the record names.
 
     Done while the previous image is still pinned, so an unreachable registry,
@@ -242,13 +237,13 @@ def prepare_image(release: MinerRelease) -> None:
         )
 
 
-def restart_service() -> None:
-    result = run(["systemctl", "restart", MINER_UNIT], timeout=180)
+def restart_service(product: MinerProduct) -> None:
+    result = run(["systemctl", "restart", product.unit], timeout=180)
     if result.returncode != 0:
         raise MinerUpdateError(f"systemctl restart failed: {result.stderr.strip()[:200]}")
 
 
-def running_image() -> str | None:
+def running_image(product: MinerProduct) -> str | None:
     """The image the running miner container actually reports.
 
     Waits for the container to settle, then answers with its immutable image
@@ -269,7 +264,7 @@ def running_image() -> str | None:
                 "inspect",
                 "--format",
                 "{{.State.Running}} {{.Config.Image}}",
-                CONTAINER_NAME,
+                product.container,
             ],
             timeout=30,
         )
@@ -297,21 +292,28 @@ def safe_to_activate() -> bool:
     return True
 
 
-def build_host(arguments: argparse.Namespace) -> MinerUpdaterHost:
+def build_host(arguments: argparse.Namespace, product: MinerProduct) -> MinerUpdaterHost:
     url = arguments.channel_url
+    keys = load_trusted_keys(Path(arguments.keys_path))
+
     return MinerUpdaterHost(
         fetch_metadata=lambda: fetch(url),
-        restart_service=restart_service,
-        running_image=running_image,
-        durable_digest=durable_digest,
-        prepare_image=prepare_image,
-        verify_launcher=verify_launcher,
+        restart_service=lambda: restart_service(product),
+        running_image=lambda: running_image(product),
+        durable_digest=lambda: durable_digest(product),
+        prepare_image=lambda release: prepare_image(product, release),
+        verify_launcher=lambda release: verify_launcher(product, release),
         safe_to_activate=safe_to_activate,
-        env_path=Path(arguments.env_path),
+        image_variable=product.image_variable,
+        # Bound to this product, so a record naming the other one is
+        # refused on both its product field and its image repository.
+        expected_product=product.product,
+        expected_image_repository=product.image_repository,
+        env_path=Path(arguments.env_path or product.env_path),
         state_path=Path(arguments.state_path),
         pause_path=Path(arguments.pause_path),
         lock_path=Path(arguments.lock_path),
-        trusted_keys=load_trusted_keys(Path(arguments.keys_path)),
+        trusted_keys=keys,
         now_unix=lambda: int(time.time()),
     )
 
@@ -321,12 +323,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", choices=["check", "status"])
     parser.add_argument("--channel", default="stable", choices=["canary", "stable"])
     parser.add_argument("--channel-url", default=None)
-    parser.add_argument("--env-path", default=str(DEFAULT_ENV_PATH))
+    parser.add_argument("--product", default="sn39-snp-miner", choices=sorted(PRODUCTS))
+    parser.add_argument("--env-path", default=None)
     parser.add_argument("--state-path", default=str(DEFAULT_STATE_PATH))
     parser.add_argument("--pause-path", default=str(DEFAULT_PAUSE_PATH))
     parser.add_argument("--lock-path", default=str(DEFAULT_LOCK_PATH))
     parser.add_argument("--keys-path", default=str(DEFAULT_KEYS_PATH))
     arguments = parser.parse_args(argv)
+
+    product = product_by_name(arguments.product)
 
     if arguments.command == "status":
         # Status must work without a channel URL, so an operator can always ask
@@ -335,7 +340,8 @@ def main(argv: list[str] | None = None) -> int:
             fetch_metadata=lambda: b"",
             restart_service=lambda: None,
             running_image=lambda: None,
-            env_path=Path(arguments.env_path),
+            env_path=Path(arguments.env_path or product.env_path),
+            image_variable=product.image_variable,
             state_path=Path(arguments.state_path),
             pause_path=Path(arguments.pause_path),
             lock_path=Path(arguments.lock_path),
@@ -350,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
     if not arguments.channel_url:
         parser.error("check requires --channel-url")
     try:
-        outcome = update_once(build_host(arguments), channel=arguments.channel)
+        outcome = update_once(build_host(arguments, product), channel=arguments.channel)
     except MinerUpdateError as exc:
         print(json.dumps({"action": "failed", "reason": str(exc)}, sort_keys=True), file=sys.stderr)
         return 1
