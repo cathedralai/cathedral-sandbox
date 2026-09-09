@@ -94,9 +94,12 @@ install -d -o root -g root -m 0755 /etc/cathedral
 install -o root -g root -m 0644 "${KEYS_FILE}" /etc/cathedral/sn39-miner-update-keys.json
 install -d -o root -g root -m 0700 /var/lib/cathedral-sn39-miner-update
 
+# systemd strips one layer of matching quotes, so quoting is safe for it and
+# keeps a URL containing & or ? from being read as shell syntax by anything
+# that sources this file.
 cat >/etc/cathedral/sn39-miner-update.env <<EOF
-CATHEDRAL_MINER_UPDATE_CHANNEL=${CHANNEL}
-CATHEDRAL_MINER_UPDATE_URL=${CHANNEL_URL}
+CATHEDRAL_MINER_UPDATE_CHANNEL="${CHANNEL}"
+CATHEDRAL_MINER_UPDATE_URL="${CHANNEL_URL}"
 EOF
 chmod 0644 /etc/cathedral/sn39-miner-update.env
 
@@ -112,18 +115,15 @@ systemctl daemon-reload
 echo "== installed. reporting status =="
 /usr/local/sbin/cathedral-sn39-miner-update status
 
+printf '\n%s\n\n' "The timer is deliberately NOT enabled yet."
+printf '%s\n' "Run one check by hand first and read what it says:"
+printf '\n  cathedral-sn39-miner-update check --channel %s --channel-url %s\n\n' \
+  "$(printf '%q' "${CHANNEL}")" "$(printf '%q' "${CHANNEL_URL}")"
 cat <<'NEXT'
-
-The timer is deliberately NOT enabled yet.
-
-Run one check by hand first and read what it says:
-
-  cathedral-sn39-miner-update check \
-    --channel "$(. /etc/cathedral/sn39-miner-update.env; echo "$CATHEDRAL_MINER_UPDATE_CHANNEL")" \
-    --channel-url "$(. /etc/cathedral/sn39-miner-update.env; echo "$CATHEDRAL_MINER_UPDATE_URL")"
-
 "current" means the pinned image already matches the release and nothing
-happened. "activated" means it upgraded and the miner came back healthy.
+happened. "activated" means it upgraded and the released image is running.
+A "needs_operator" status means an activation was interrupted and must be
+resolved by hand; the updater will not guess.
 
 Once you are happy, turn on unattended updates:
 

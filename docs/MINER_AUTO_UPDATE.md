@@ -55,38 +55,69 @@ In order, stopping at the first failure and leaving the running miner alone:
 4. The `schema` is the miner record schema and the `product` is this product.
    A perfectly valid validator release fails both, and a host holding only
    miner keys cannot verify one at all.
-5. The channel matches the one this miner follows, and the record has not
-   expired.
+5. The channel matches, and the record has not expired.
 6. The sequence does not go backwards, and an existing sequence is not reused
-   for different signed bytes.
-7. The image is digest-pinned to the canonical repository. No mutable tags.
-8. The image is pulled, the registry is confirmed to return that exact digest,
-   and the image's `org.cathedral.sn39.runtime-contract` label is confirmed to
-   match the one the record names. All while the previous image is still the
-   one pinned, so any of these failing costs nothing.
+   for different signed bytes. The sequence is recorded **before** the attempt,
+   so a release that fails still consumes it. Otherwise a second, different
+   record could reuse that sequence and slip past the equivocation check.
+7. The pin file names a current image. Without one there would be nothing to
+   roll back to, so the update is refused rather than started.
+8. The installed launcher matches the `launcher_sha256` the release names and
+   accepts its runtime contract. The launcher hard-codes the contract it will
+   run, so an incompatible release would otherwise stop a working miner and
+   only then fail.
+9. The image is digest-pinned to the canonical repository. No mutable tags.
+10. The image is pulled, and the registry is confirmed to return that exact
+    digest, that platform, and that runtime-contract label.
+
+All of it happens while the previous image is still pinned and serving, so any
+of these failing costs nothing.
 
 Only one check runs at a time. An operator running a manual check while the
 timer fires is refused with "another update check is already running" rather
 than queued, because two processes rewriting the pin is the interleaving that
-leaves a miner running neither version cleanly.
+leaves a miner running neither version.
 
-Only after all of that is the pin rewritten and the unit restarted. The rewrite
-replaces one assignment and leaves every other line, including comments,
-untouched.
+## What counts as success
+
+The released image is what the running container reports.
+
+Not "the unit is active". After an interrupted activation the *previous*
+container is often still active and perfectly healthy, and treating that as
+success would commit a release that never started, then report it as current
+for ever, so the upgrade would silently never happen.
 
 ## If an update fails
 
-- Registry unreachable, or the digest does not match: nothing changed.
-- The restart fails, or the miner does not come back: the previous image is
-  restored and the miner is restarted onto it.
-- Power lost mid-activation: on the next run the updater compares the pin
-  against its durable record. If the swap never landed it retries. If the new
-  image is running and healthy it commits. If the new image is running and is
-  not healthy, it **stops and asks for an operator** rather than reverting,
-  because reverting could discard state the new version already migrated.
+The updater will not guess about one thing: whether the released image ever
+ran. It matters because the launcher bind-mounts durable state read-write, so
+an image that started, wrote, and then died leaves state the previous image may
+not understand. Starting the old image against it is corruption, not a
+rollback.
 
-That last case prints a clear reason and exits non-zero. It is the one case
-that needs a human, and it is deliberately not automated.
+So the outcome depends on evidence, not on what the pin file says:
+
+- **Registry unreachable, digest mismatch, wrong contract, incompatible
+  launcher.** Nothing changed, and nothing could have run.
+- **The release did not come up, and durable state is byte-for-byte unchanged.**
+  That is positive evidence it wrote nothing, so the previous image is restored
+  and *verified to be running again* before the restoration is reported.
+- **The release did not come up, and durable state changed.** It may already
+  have written. The updater stops, leaves the pin naming the release, and asks
+  for an operator.
+- **The restore itself fails, or the previous image does not come back.** Said
+  plainly, including that the miner may be running nothing. This is a real
+  case: the miner unit allows five starts per 300 seconds, so a release that
+  fails repeatedly can exhaust the allowance and the rollback start is refused
+  too. It is never reported as a successful restoration.
+- **Power lost mid-activation.** The next run decides on what is actually
+  running plus whether durable state moved. Released image running: commit.
+  Previous image running and nothing written: restore the pin and retry.
+  Anything else, including nothing running: stop and ask.
+
+A host in that state reports `"needs_operator": true` from `status`, and every
+halt prints what it saw: what was running, what was expected, and whether
+durable state changed.
 
 ## Pause
 

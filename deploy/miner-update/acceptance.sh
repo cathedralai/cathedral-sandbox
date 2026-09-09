@@ -81,28 +81,41 @@ CATHEDRAL_MINER_HOTKEY=5ERBwsMBUrvjCVcXu1B73m7Ne693DwKEi68q2ionAkWtdALT
 CATHEDRAL_PUBLIC_ENDPOINT=https://167.150.153.139:8081
 EOF
 
-PYTHONPATH="${ROOT}" "${PY}" - "${WORK}" "${NEW}" <<'PY'
+PYTHONPATH="${ROOT}" "${PY}" - "${WORK}" "${NEW}" "${OLD}" <<'PY'
 import json, sys
 from pathlib import Path
 from cathedral.miner_updater import (
-    IMAGE_VARIABLE, MinerUpdateError, MinerUpdaterHost,
-    describe_status, read_env_assignments, update_once,
+    IMAGE_VARIABLE, MinerUpdateError, MinerUpdateHalted, MinerUpdaterHost,
+    describe_status, read_env_assignments, read_state, update_once,
 )
 from cathedral.miner_update_cli import load_trusted_keys
 
-work, new_image = Path(sys.argv[1]), sys.argv[2]
+work, new_image, old_image = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 metadata = (work / "stable.json").read_bytes()
 trusted = load_trusted_keys(work / "keys.json")
-restarts, pulled = [], []
 
-def host(healthy=True, safe=True):
+state = {"restarts": 0, "pulled": [], "running": old_image,
+         "durable": "before", "follow": True, "safe": True}
+
+def restart():
+    state["restarts"] += 1
+    if state["follow"]:
+        state["running"] = read_env_assignments(env_path()).get(IMAGE_VARIABLE)
+
+current_env = {"path": work / "miner.env"}
+def env_path():
+    return current_env["path"]
+
+def host():
     return MinerUpdaterHost(
         fetch_metadata=lambda: metadata,
-        restart_service=lambda: restarts.append(1),
-        is_healthy=lambda: healthy,
-        prepare_image=lambda r: pulled.append(r.image),
-        safe_to_activate=lambda: safe,
-        env_path=work / "miner.env",
+        restart_service=restart,
+        running_image=lambda: state["running"],
+        durable_digest=lambda: state["durable"],
+        prepare_image=lambda r: state["pulled"].append(r.image),
+        verify_launcher=lambda r: None,
+        safe_to_activate=lambda: state["safe"],
+        env_path=env_path(),
         state_path=work / "state" / "state.json",
         pause_path=work / "paused",
         lock_path=work / "state" / "updater.lock",
@@ -111,35 +124,29 @@ def host(healthy=True, safe=True):
     )
 
 def check(label, condition):
-    print(f"  {'PASS' if condition else 'FAIL'}  {label}")
+    print("  " + ("PASS" if condition else "FAIL") + "  " + label)
     if not condition:
         sys.exit(1)
 
 before = read_env_assignments(work / "miner.env")
 
-# deferral
-outcome = update_once(host(safe=False), channel="stable")
+state["safe"] = False
 check("an unsafe moment defers without restarting",
-      outcome.action == "deferred" and not restarts)
+      update_once(host(), channel="stable").action == "deferred" and state["restarts"] == 0)
+state["safe"] = True
 
-# activation
 outcome = update_once(host(), channel="stable")
 after = read_env_assignments(work / "miner.env")
 check("a valid signed release activates", outcome.action == "activated")
 check("the pin moved to the released digest", after[IMAGE_VARIABLE] == new_image)
-check("the miner hotkey survived the update",
-      after["CATHEDRAL_MINER_HOTKEY"] == before["CATHEDRAL_MINER_HOTKEY"])
-check("the endpoint survived the update",
-      after["CATHEDRAL_PUBLIC_ENDPOINT"] == before["CATHEDRAL_PUBLIC_ENDPOINT"])
-check("operator comments survived the update",
-      "# Cathedral SN39 SNP miner" in (work / "miner.env").read_text())
-check("the image was pulled before the pin was swapped", pulled == [new_image])
+check("the released image is what is running", state["running"] == new_image)
+check("the miner hotkey survived", after["CATHEDRAL_MINER_HOTKEY"] == before["CATHEDRAL_MINER_HOTKEY"])
+check("the endpoint survived", after["CATHEDRAL_PUBLIC_ENDPOINT"] == before["CATHEDRAL_PUBLIC_ENDPOINT"])
+check("operator comments survived", "# Cathedral SN39 SNP miner" in (work / "miner.env").read_text())
+check("the image was pulled before the pin was swapped", state["pulled"] == [new_image])
+check("re-running the same release is a no-op",
+      update_once(host(), channel="stable").action == "current")
 
-# idempotence
-outcome = update_once(host(), channel="stable")
-check("re-running the same release is a no-op", outcome.action == "current")
-
-# tamper
 tampered = json.loads(metadata)
 tampered["release"]["image"] = "ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:" + "3" * 64
 bad = host()
@@ -152,16 +159,44 @@ except MinerUpdateError as exc:
 check("the pin is unchanged after a refusal",
       read_env_assignments(work / "miner.env")[IMAGE_VARIABLE] == new_image)
 
-# pause
 (work / "paused").write_text("x")
 check("the operator pause stops the check",
       update_once(host(), channel="stable").action == "paused")
 (work / "paused").unlink()
 
-# status hides secrets
 status = json.dumps(describe_status(host()))
 check("status reports the version without leaking the hotkey",
       new_image in status and "5ERBws" not in status)
+
+work2 = work / "recovery"
+work2.mkdir()
+(work2 / "miner.env").write_text(IMAGE_VARIABLE + "=" + old_image + "\nX=1\n")
+current_env["path"] = work2 / "miner.env"
+state.update(restarts=0, running=old_image, durable="before", follow=True)
+
+def host2():
+    h = host()
+    h.state_path = work2 / "state.json"
+    h.lock_path = work2 / "updater.lock"
+    return h
+
+def restart_then_write():
+    state["restarts"] += 1
+    state["durable"] = "after"
+    state["running"] = None
+
+h = host2()
+h.restart_service = restart_then_write
+try:
+    update_once(h, channel="stable")
+    check("a release that may have written is never rolled back", False)
+except MinerUpdateHalted as exc:
+    check("a release that may have written is never rolled back",
+          "durable state changed" in str(exc))
+check("the halt leaves the latch set for an operator",
+      read_state(work2 / "state.json")["stage"] == "may_have_run")
+check("status flags that the host needs an operator",
+      describe_status(host2())["needs_operator"] is True)
 PY
 
 echo "== 3. unit tests =="
