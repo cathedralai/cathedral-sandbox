@@ -1,23 +1,23 @@
 {
   "channel": "stable",
-  "expires_unix": 1789551423,
-  "issued_unix": 1788946623,
+  "expires_unix": 1789551689,
+  "issued_unix": 1788946889,
   "product": "sn39-audit-miner",
   "release": {
-    "image": "ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99",
+    "image": "ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:d50ebe6602e23f85eee07b918b13629c74fa42ccd9674d39efe820b4ad1b8bec",
     "launcher_sha256": "d56a82bb76eb2d976edfcd4574ff6ed19a41532ffa50d01a2411df51a002b615",
     "promoted_canary": {
-      "sequence": 1,
-      "signed_sha256": "21e0ed33d298c0246dc359484210bda8662e6445c27657c5550155ad102bee12"
+      "sequence": 2,
+      "signed_sha256": "55c8b8c61ccead3fec1fd9101e528ec1991bab46ac9ec81a89604d2d60e6d116"
     },
     "runtime_contract": "signed-validator-fleet-v1",
-    "version": "2026.09.09-1"
+    "version": "2026.09.09-2"
   },
   "schema": "cathedral_sn39_miner_release_v1",
-  "sequence": 1,
+  "sequence": 2,
   "signature": {
     "algorithm": "ed25519",
-    "value_base64": "gQqpWieFXcAMvFEbZ1SQER0k7tEaGCaVP+q0WgvX4rGu9g9mNlVdHLoN/36pXoUviZywDsYXhlsmoUffI9A+BQ=="
+    "value_base64": "rE8o7kkUDrv2C+WYRmbNjBGgeSckgIRQxr+gJRiNA4UWK+vwoUDHKIPngoNpMqwJ5GGkMnr6woLP/f91xVkjBQ=="
   },
   "signing_key_id": "sn39-miner-release-1"
 }
