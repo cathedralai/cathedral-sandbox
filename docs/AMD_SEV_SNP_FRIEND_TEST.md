@@ -31,6 +31,49 @@ Report version 2, report version 6, an unknown processor family, a changed AMD
 root, or a different `snpguest` binary fails closed. Supporting any of them
 requires a reviewed source update.
 
+### Socket policy and hardware identity
+
+Two separate rules are easy to confuse. One is a validator option. The other is
+not optional and is now confirmed on real hardware.
+
+**The socket bit is the validator owner's choice.** The guest launch policy bit
+`SINGLE_SOCKET` (bit 20, `POLICY.SINGLE_SOCKET` in AMD publication 56860) gates
+whether the validator will use the report's CHIP_ID as the machine identity.
+Since cathedral-validator #235 that gate is an owner policy field,
+`require_single_socket`, which defaults to `true`. A validator that leaves the
+default refuses a report without the bit as `snp_single_socket_required`,
+whatever the measurement and TCB.
+
+Why the default matters on a multi-socket host: AMD firmware refuses to activate
+a `SINGLE_SOCKET` guest through `SNP_ACTIVATE`, and only `SNP_ACTIVATE_EX` can
+pin a guest to one socket (56860 section 4.4). Upstream Linux KVM issues
+`SNP_ACTIVATE` only. So on a host with two or more populated sockets you cannot
+launch a guest that satisfies the default, and your operator must decide whether
+to set `require_single_socket` to `false` for your generation.
+
+UID30 set `require_single_socket` to `false` for `milan` on 2026-09-08 and
+admitted a two-socket host that same day. That is one validator's decision. Ask
+your target validator's operator rather than assuming.
+
+**Hardware identity dedup is not optional.** Linux routes every SNP command,
+including the guest's attestation request, through one PSP on the host. On
+2026-09-08 we ran the direct test: two guests on one confirmed shared physical
+host both verified against the AMD chain and returned the identical chip
+pseudonym `5a8e82885be3a995`, identical measurement, and identical reported TCB.
+
+The validator scores every machine that shares a CHIP_ID with another machine in
+the same fleet as zero, under `duplicate_hardware_indexes`. Two guests on one
+host therefore cancel each other out rather than doubling anything. Run one SNP
+guest per physical host for scoring purposes.
+
+That experiment used one host and did not establish the socket placement of the
+two guests, so it confirms same-host CHIP_ID collision and does not by itself
+prove the general cross-socket case.
+
+Additional customer capacity offered from one host is accounted separately and
+is not a second scoring machine. Adding customer slots never multiplies reward
+claims for one chip.
+
 ## Requirements and first hardware proof
 
 - An x86-64 Linux SEV-SNP guest where root can read and write the native
