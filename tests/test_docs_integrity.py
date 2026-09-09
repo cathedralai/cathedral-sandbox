@@ -32,7 +32,11 @@ def test_readme_is_the_single_current_mining_guide() -> None:
         "each distinct verified machine",
         "Intel TDX",
         "AMD SEV-SNP",
-        "Validator path merged, live hardware policy pending",
+        # Updated 2026-09-09. UID30 admitted its first live AMD machine on
+        # 2026-09-08, so the previous "live hardware policy pending" wording
+        # became false. This guard is what kept it in place, so it moves with
+        # the claim rather than pinning a stale one.
+        "Mainnet live, first hardware admitted 2026-09-08",
         "c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99",
         "0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255",
         "current migration bridge",
