@@ -34,6 +34,27 @@ def runtime_id(source: Path) -> str:
     return "grader-sha256:" + digest.hexdigest()
 
 
+
+def portable_image_id(archive: Path) -> str:
+    """Docker Engine loads the config digest, not BuildKit's OCI index digest."""
+    with tarfile.open(archive) as tar:
+        def read(name: str) -> bytes:
+            matches = [member for member in tar.getmembers() if member.name == name]
+            if len(matches) != 1 or not matches[0].isreg() or matches[0].size > 1024 * 1024:
+                raise ValueError("invalid executor image metadata")
+            return tar.extractfile(matches[0]).read()
+
+        images = json.loads(read("manifest.json"))
+        if not isinstance(images, list) or len(images) != 1:
+            raise ValueError("executor archive must contain one image")
+        raw = read(images[0]["Config"])
+        config = json.loads(raw)
+        if (config.get("architecture") != "amd64" or config.get("os") != "linux"
+                or config.get("config", {}).get("Labels", {}).get("org.opencontainers.image.revision") != REVISION):
+            raise ValueError("executor image platform or source revision differs")
+        return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
@@ -69,16 +90,18 @@ def main() -> int:
             tar.extractall(context, members=members)
         subprocess.run([
             *docker, "buildx", "build", "--platform", "linux/amd64", "--load",
-            "--iidfile", str(output / "image-id.txt"), "--build-arg", f"RELIQUARY_BUILD_REVISION={REVISION}",
+            "--iidfile", str(output / "builder-image-id.txt"), "--build-arg", f"RELIQUARY_BUILD_REVISION={REVISION}",
             "-f", str(context / "docker/Dockerfile.cpu-executor"), str(context),
         ], check=True)
-        image_id = (output / "image-id.txt").read_text().strip()
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        builder_image_id = (output / "builder-image-id.txt").read_text().strip()
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", builder_image_id):
             raise SystemExit("builder did not return an immutable image ID")
-        subprocess.run([*docker, "image", "save", "--output", str(output / "executor-image.tar"), image_id], check=True)
+        subprocess.run([*docker, "image", "save", "--output", str(output / "executor-image.tar"), builder_image_id], check=True)
+        image_id = portable_image_id(output / "executor-image.tar")
+        (output / "image-id.txt").write_text(image_id + "\n")
         manifest = {
             "schema": "cathedral_reliquary_build_v1", "source_revision": REVISION,
-            "platform": "linux/amd64", "image_id": image_id, "runtime_id": runtime_id(context),
+            "platform": "linux/amd64", "image_id": image_id, "builder_image_id": builder_image_id, "runtime_id": runtime_id(context),
             "archive": "executor-image.tar", "archive_sha256": sha256_file(output / "executor-image.tar"),
             "dockerfile_sha256": sha256_file(context / "docker/Dockerfile.cpu-executor"),
             "dependencies_sha256": sha256_file(context / "docker/cpu-executor-requirements.lock"),
