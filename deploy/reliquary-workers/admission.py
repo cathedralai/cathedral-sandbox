@@ -6,12 +6,76 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import stat
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 MAX_BYTES = 1024 * 1024
+IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$")
+
+
+def validate_configuration(document: dict) -> None:
+    """Keep the shared file readable by workers_capacity_store, even disabled rows.
+
+    The API parses the complete snapshot before selecting a customer. Validate
+    every field at the producer boundary so one prepared package cannot break
+    unrelated assignments. Unknown fields remain preserved for compatibility.
+    """
+    def text(row, name, identifier=False):
+        value = row.get(name)
+        if (not isinstance(value, str) or not value or len(value) > 2048
+                or (identifier and not IDENTIFIER.fullmatch(value))):
+            raise ValueError("invalid configuration field")
+        return value
+
+    def limit(row):
+        value = row.get("concurrent_limit")
+        if type(value) is not int or not 1 <= value <= 512:
+            raise ValueError("invalid allocation capacity")
+        return value
+
+    allocations = {}
+    endpoints = set()
+    for row in document["allocations"]:
+        for key in ("allocation_id", "owner_id"):
+            text(row, key, True)
+        endpoint = text(row, "endpoint").rstrip("/")
+        url = urlsplit(endpoint)
+        if (url.scheme != "https" or not url.hostname or url.username or url.password
+                or url.query or url.fragment or url.path not in ("", "/")):
+            raise ValueError("executor requires an HTTPS origin")
+        _ = url.port
+        for key in ("ca_cert", "client_cert", "client_key"):
+            if not Path(text(row, key)).is_absolute():
+                raise ValueError("TLS paths must be absolute")
+        if (not re.fullmatch(r"grader-sha256:[0-9a-f]{64}", text(row, "runtime_id"))
+                or type(row.get("enabled")) is not bool):
+            raise ValueError("invalid runtime or enabled flag")
+        limit(row)
+        if row["enabled"]:
+            if endpoint.lower() in endpoints:
+                raise ValueError("executor origin already enabled")
+            endpoints.add(endpoint.lower())
+        allocations[row["allocation_id"]] = row
+    owners = set()
+    now = datetime.now(timezone.utc)
+    for row in document["grants"]:
+        for key in ("grant_id", "owner_id", "allocation_id", "source"):
+            text(row, key, True)
+        expiry = datetime.fromisoformat(text(row, "expires_at").replace("Z", "+00:00"))
+        if expiry.tzinfo is None or expiry.utcoffset() is None:
+            raise ValueError("expiry requires a timezone")
+        limit(row)
+        if expiry > now:
+            allocation = allocations.get(row["allocation_id"])
+            if (row["owner_id"] in owners or allocation is None
+                    or allocation["owner_id"] != row["owner_id"]
+                    or allocation["concurrent_limit"] != row["concurrent_limit"]):
+                raise ValueError("invalid or overlapping active owner assignment")
+            owners.add(row["owner_id"])
 
 
 def read_document(path: Path) -> tuple[dict, bytes]:
@@ -87,6 +151,14 @@ def main() -> int:
             if (any(a["allocation_id"] == allocation["allocation_id"] for a in document["allocations"])
                     or any(g["grant_id"] == grant["grant_id"] for g in document["grants"])):
                 raise ValueError("allocation or grant already exists; refusing to replace it")
+            # The API resolves unexpired owner grants before checking the
+            # allocation's enabled flag. A disabled second allocation must not
+            # add an overlapping grant and interrupt the existing customer.
+            now = datetime.now(timezone.utc)
+            if any(g.get("owner_id") == grant.get("owner_id")
+                   and datetime.fromisoformat(g["expires_at"].replace("Z", "+00:00")) > now
+                   for g in document["grants"]):
+                raise ValueError("owner already has an unexpired grant; refusing an overlapping installation")
             document["allocations"].append(allocation)
             document["grants"].append(grant)
             changed_id = allocation["allocation_id"]
@@ -110,6 +182,7 @@ def main() -> int:
             changed_id = args.allocation_id
         if len(document["allocations"]) > 64 or len(document["grants"]) > 256:
             raise ValueError("configuration record limit exceeded")
+        validate_configuration(document)
         encoded = (json.dumps(document, indent=2, allow_nan=False) + "\n").encode()
         if len(encoded) > MAX_BYTES:
             raise ValueError("configuration exceeds 1 MiB")

@@ -1,6 +1,6 @@
 # Reliquary exclusive Workers deployment
 
-Status: implementation candidate. Do not infer a tested release from these files. Test suites, live deployment and qualification are deferred at Fred's request. No host is selected and no customer allocation is enabled by this package.
+Status: operator implementation with local regression checks. No host is selected and no customer allocation is enabled by this package. Local tests and the client qualification command do not establish dedicated-host or customer delivery acceptance.
 
 The trial uses one dedicated machine running the unchanged Reliquary executor at revision 0be0cda0c9a73dc3f08e3af2a07dda9407635aa7. Its pool and physical admission ceiling are both 50. Every completed candidate batch retires its runsc sandbox. This package does not deploy the separate persistent Box product or the experimental multi-host dispatcher.
 
@@ -59,11 +59,11 @@ These steps are not executed by preparation.
 4. Run systemctl daemon-reload, then enable and start cathedral-reliquary@ALLOCATION_ID. The unit supervises Compose, restarts the service after failure, and waits up to 140 seconds for container shutdown. The container has one executor process, pool size 50, max inflight 50, reuse disabled, an immutable root filesystem, private PID/IPC namespaces and explicit CPU, RAM, PID and temporary-space budgets. It needs privileged runsc access on the dedicated host. Do not mount a Docker socket or trusted grader credentials into it.
 5. Copy only api/pki/ to /etc/polaris/workers/ALLOCATION_ID/pki on each serving API instance. The API service user needs read access to the client material. Do not send it to the customer. Mount the whole directory if the API runs in a container, so atomic credential rotation is visible.
 6. Set POLARIS_WORKERS_GRANTS_FILE to the durable API grant file. Use a shared or consistently replicated configuration directory for every API replica. A process-local file with diverging contents does not revoke access on another replica. Mount the directory, not a single inode replaced by atomic writes. Missing configuration grants no access. Malformed configuration fails closed.
-7. Run the admission tool as the grant-file owner to merge the prepared disabled allocation. It preserves unrelated entries, refuses to replace existing IDs, takes a writer lock, keeps a private backup and replaces the file atomically.
+7. Run the admission tool as the grant-file owner to merge the prepared disabled allocation. It preserves unrelated entries, refuses existing IDs or an overlapping unexpired owner grant, takes a writer lock, keeps a private backup and replaces the file atomically. A disabled duplicate owner allocation must not interrupt the owner's existing service.
 
     python3 deploy/reliquary-workers/admission.py install --store /path/to/workers-grants.json --package /private/path/new-deployment/api/grants.json
 
-8. Deploy the coordinated API, CLI and site candidates through the normal repository release paths. The site needs exactly the Workers execute, capacity and health routes plus CLI login start/poll. Newly minted keys need workers:submit. Existing keys need reissue. Keep the static Workers routes before /v1/workers/{worker_id}.
+8. Deploy the coordinated API, CLI and site candidates through the normal repository release paths. The site needs shared Workers run/status, legacy execute/health, capacity and CLI login start/poll routes. Newly minted keys need workers:submit. Existing keys need reissue. Keep the static Workers routes before /v1/workers/{worker_id}. Customers use the standard `ctcli workers` client and a separate `cathedral-reliquary-adapter`, not the earlier bundled relay command.
 9. Configure every reverse proxy and process manager for the full batch deadline. Reliquary accepts batches up to 120 seconds. The unchanged customer client waits batch_timeout_s plus five seconds. ctcli caps a submission at batch plus four seconds. The API uses batch plus 3.5 seconds from route entry, including authentication, and refuses dispatch without batch plus 2.25 seconds remaining. Execution health preflight is capped at 0.75 seconds. The API retains a shielded backend request for up to 130 seconds after dispatch so caller cancellation does not erase accounting. The default origin timeout of a proxy in between must not truncate valid batches. Resolve this before the long-deadline acceptance case. No receipt or attestation service is added.
 
 The API reports degraded process health during normal worker replacement. Its execution path still validates runtime, pool size and retirement policy but leaves bounded physical admission to the executor. Persistent loss of workers remains an operational fault, visible through health and metrics. No mechanism silently reduces the promised allocation to 32 slots.
@@ -116,6 +116,23 @@ The upstream normal grader entry point hardcodes the constructor default of four
 
 Preserve the existing local pool size, bundle, socket, metrics port and workload settings. The launcher requires local runsc and shadow mode. It never enables authoritative remote scoring. Fifty shadow threads have at most 100 outstanding mirrored jobs in the unchanged constructor. This remains a bounded queue, so representative-peak acceptance still requires zero dropped jobs. Record matched, mismatched, failed, dropped and inflight counters alongside the trusted caller's submitted count. The local grader path remains authoritative.
 
-## Final regression execution, deferred
+## Client qualification through the installed adapter
 
-Local source tests are in tests/reliquary_workers/test_customer_edges.py. They cover a recorded twelve-second dispatch barrier, missing/stale replica fences and trusted constructor settings. They do not establish host isolation, actual physical concurrency or zero shadow drops. The dedicated-host acceptance must exercise the pinned customer's load and attack scripts plus the real trusted grader entry point.
+Run this on the trusted client machine with the pinned Reliquary dependencies installed. Start the separately installed adapter using the trial account's standard `ctcli login`, and source its emitted environment. Confirm the allocation identity and runtime from `ctcli workers health --json` and the operator allocation record. The adapter must point through the deployed public Workers route to the isolated dedicated test machine.
+
+    . /private/path/reliquary.env
+    python3 deploy/reliquary-workers/qualify-client.py \
+      --source /path/to/clean-pinned-reliquary \
+      --output /private/path/new-client-evidence \
+      --allocation-id ALLOCATION_ID --runtime-id RUNTIME_ID \
+      --confirm-dedicated-host
+
+This executes the unchanged upstream load script with 3,000 requests each at 32 and 50 callers, then 10,000 requests at 50 callers, and the unchanged attack corpus. The p95 ceiling stays at or below the customer's one-second threshold. It requires the correct runtime and executor, exactly 50 healthy configured slots, runsc retirement and zero reported delete/reap failures. Reports record the pinned source and script hashes. A command timeout, lost report, short request count or unhealthy pool fails the client check. No submission retry is added.
+
+The output directory is new and private. `summary.json` records client-path status separately from `trial_delivery: NOT_PROVEN`. Passing this command is not permission to erase the remaining host checks. The attack corpus tests Python restrictions, timeout and subsequent recovery. It does not independently prove network or kernel isolation. The 10,000-request run is a synthetic load soak, not the customer's real-grader shadow corpus.
+
+Complete the remaining checks on this same machine and build: exclusive inventory, CPU/RAM and 50 actual occupied slots, overload at 64, filesystem/process cleanup during saturated replacement, network and metadata denial below the Python import policy, memory/output limits, near-120-second batches, disconnected callers, executor/API restart, replica-fenced drain and complete actual-grader shadow accounting. Archive those results beside the client evidence and record any failure or missing result explicitly.
+
+## Local regression execution
+
+Run `python3 -m pytest tests/reliquary_workers -q`. These tests cover a recorded twelve-second dispatch barrier, missing/stale replica fences, trusted constructor settings and refusal of incomplete/wrong-pool qualification reports. They do not establish host isolation, actual physical concurrency or zero shadow drops. The dedicated-host acceptance must exercise the pinned customer's load and attack scripts plus the real trusted grader entry point.
