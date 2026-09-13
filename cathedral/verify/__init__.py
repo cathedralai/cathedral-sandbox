@@ -606,6 +606,11 @@ def _run_tdx_verifier(
         verifier_args.append(str(quote_path))
         if production_mode:
             verifier_args.append(production_expected_hex)
+        capture_directory = (os.environ.get("CATHEDRAL_TDX_CAPTURE_DIR")
+                             if production_mode and pinned_command is None else None)
+        capture_path = Path(td) / "collateral.json"
+        if capture_directory:
+            verifier_args.extend(["--capture-collateral", str(capture_path)])
         try:
             stdout_str, _stderr_str, returncode = _read_bounded_subprocess(
                 verifier_args,
@@ -615,6 +620,14 @@ def _run_tdx_verifier(
             )
         except (OSError, UnicodeDecodeError, subprocess.TimeoutExpired):
             return {}  # reject: verifier exceeded time budget
+        if returncode == 0 and capture_directory:
+            from cathedral.verify.tdx_offline import persist_tdx_capture
+            try:
+                with capture_path.open("rb") as captured:
+                    collateral_bytes = captured.read(24 * 1024 * 1024 + 1)
+                persist_tdx_capture(quote, collateral_bytes, Path(capture_directory))
+            except (OSError, ValueError):
+                return {}  # configured admission capture must be durable
 
     if returncode != 0:
         return {}  # reject: verifier signalled failure

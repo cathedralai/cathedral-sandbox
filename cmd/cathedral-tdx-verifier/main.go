@@ -53,6 +53,7 @@ type claims struct {
 	AdvisoryIDs              []string `json:"advisory_ids"`
 	DebugEnabled             bool     `json:"debug_enabled"`
 	CollateralCurrent        bool     `json:"collateral_current"`
+	CollateralCurrentReason  string   `json:"collateral_current_reason,omitempty"`
 	StablePlatformID         string   `json:"stable_platform_id"`
 	PlatformID               string   `json:"platform_id"`
 	PlatformIdentityKind     string   `json:"platform_identity_kind"`
@@ -80,6 +81,7 @@ type intelHTTPSGetter struct {
 	client      *http.Client
 	mu          sync.Mutex
 	tcbInfoBody []byte
+	responses   map[string]collateralResponse
 }
 
 func newIntelHTTPSGetter() *intelHTTPSGetter {
@@ -219,6 +221,12 @@ func (g *intelHTTPSGetter) GetContext(
 		g.tcbInfoBody = bytes.Clone(body)
 		g.mu.Unlock()
 	}
+	g.mu.Lock()
+	if g.responses == nil {
+		g.responses = make(map[string]collateralResponse)
+	}
+	g.responses[parsed.String()] = collateralResponse{resp.Header.Clone(), bytes.Clone(body)}
+	g.mu.Unlock()
 	return resp.Header.Clone(), body, nil
 }
 
@@ -332,11 +340,20 @@ func verifyAndBuildClaims(
 	if err := validateLaunchQuote(quote); err != nil {
 		return nil, errors.New("quote uses launch-disallowed TDX attributes")
 	}
-	return buildVerifiedClaims(quote, body, expectedReportData)
+	result, err := buildVerifiedClaims(quote, body, expectedReportData)
+	if err == nil {
+		if _, offline := options.Getter.(*offlineGetter); offline {
+			result.CollateralCurrent = false
+			result.CollateralCurrentReason = "offline replay validates supplied collateral at the local clock time; latest Intel publication was not checked"
+		}
+	}
+	return result, err
 }
 
 func requireCurrentCollateralLevels(quote *tdxpb.QuoteV4, options *verify.Options) error {
-	getter, ok := options.Getter.(*intelHTTPSGetter)
+	getter, ok := options.Getter.(interface {
+		tcbInfoSnapshot() (pcs.TdxTcbInfo, error)
+	})
 	if !ok {
 		return errors.New("production collateral recorder is not configured")
 	}
@@ -524,9 +541,9 @@ func parseExpectedReportData(raw string) ([]byte, error) {
 }
 
 func run(args []string, output io.Writer) error {
-	if len(args) != 2 {
+	if len(args) != 2 && len(args) != 4 {
 		return errors.New(
-			"usage: cathedral-tdx-verifier /absolute/path/to/quote <expected-report-data-hex>",
+			"usage: cathedral-tdx-verifier /absolute/path/to/quote <expected-report-data-hex> [--collateral-bundle /absolute/bundle.json | --capture-collateral /absolute/bundle.json]",
 		)
 	}
 	raw, err := readQuote(args[0])
@@ -537,11 +554,36 @@ func run(args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
+	options := productionVerifyOptions()
+	if len(args) == 4 {
+		switch args[2] {
+		case "--collateral-bundle":
+			encoded, err := readCollateralBundle(args[3])
+			if err != nil {
+				return err
+			}
+			options, err = offlineVerifyOptions(encoded, raw)
+			if err != nil {
+				return err
+			}
+		case "--capture-collateral":
+			if !filepath.IsAbs(args[3]) {
+				return errors.New("capture path must be absolute")
+			}
+		default:
+			return errors.New("unknown collateral option")
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), verificationBudget)
 	defer cancel()
-	result, err := verifyAndBuildClaims(ctx, raw, expectedReportData, productionVerifyOptions())
+	result, err := verifyAndBuildClaims(ctx, raw, expectedReportData, options)
 	if err != nil {
 		return err
+	}
+	if len(args) == 4 && args[2] == "--capture-collateral" {
+		if err := writeCollateralBundle(args[3], raw, options.Getter.(*intelHTTPSGetter)); err != nil {
+			return err
+		}
 	}
 	encoder := json.NewEncoder(output)
 	encoder.SetEscapeHTML(false)
