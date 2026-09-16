@@ -5,6 +5,10 @@ not prove a live confidential-GPU run or reward. The native composite vendor
 collector/verifier remains an external integration requirement; see
 [GPU attestation](GPU_ATTESTATION.md) for its exact trust contract.
 
+The separate [G4 operator-controlled path](G4_OPERATOR_TRUST.md) uses explicit
+operator trust and per-instance signatures. Its plain SEV CPU is unattested;
+it does not use the native TDX composite evidence format described below.
+
 ## Wire contract
 
 All three GPU paths require the existing signed validator request, bound to

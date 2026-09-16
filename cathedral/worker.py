@@ -636,6 +636,11 @@ def _make_handler(
             except Exception:
                 self._send_json(500, {"error": "evidence collection failed"})
                 return
+            if gpu:
+                from cathedral.gpu_provider import G4ProviderCollector, PROVIDER_EVIDENCE_SCHEMA
+                if isinstance(gpu_evidence_collector, G4ProviderCollector):
+                    self._send_json(200, {"schema": PROVIDER_EVIDENCE_SCHEMA, "evidence": collected})
+                    return
             if isinstance(collected, Evidence):
                 evidences = (collected,)
             elif isinstance(collected, (tuple, list)) and all(
@@ -718,15 +723,19 @@ def _make_handler(
                 self._send_json(403, {"error": "assigned_hotkey mismatch"})
                 return
             try:
-                output_digest = gpu_executor.execute(body)
-                nonce = completion_nonce(body, output_digest)
-                evidence = gpu_evidence_collector(
-                    nonce, configured_hotkey, channel_binding=configured_channel_binding,
-                    report_data_version=2,
-                )
-                completion = serialize_composite(
-                    evidence, nonce, configured_hotkey, configured_channel_binding
-                )
+                from cathedral.gpu_provider import G4ProviderCollector
+                if isinstance(gpu_evidence_collector, G4ProviderCollector):
+                    output_digest, completion = gpu_evidence_collector.execute(gpu_executor, body)
+                else:
+                    output_digest = gpu_executor.execute(body)
+                    nonce = completion_nonce(body, output_digest)
+                    evidence = gpu_evidence_collector(
+                        nonce, configured_hotkey, channel_binding=configured_channel_binding,
+                        report_data_version=2,
+                    )
+                    completion = serialize_composite(
+                        evidence, nonce, configured_hotkey, configured_channel_binding
+                    )
             except Exception:
                 self._send_json(503, {"error": "GPU execution or completion unavailable"})
                 return
@@ -1113,9 +1122,13 @@ class WorkerServer:
         if (gpu_executor is None) != (gpu_evidence_collector is None):
             raise ValueError("GPU execution and composite collector are required together")
         if gpu_executor is not None:
-            from cathedral.gpu_work import CudaWorkExecutor
+            from cathedral.gpu_work import CudaWorkExecutor, G4_WORKER_PROFILE_ID
+            from cathedral.gpu_provider import G4ProviderCollector
             if not isinstance(gpu_executor, CudaWorkExecutor) or not callable(gpu_evidence_collector):
                 raise ValueError("GPU service requires the fixed CUDA executor and collector")
+            if ((gpu_executor.profile_id == G4_WORKER_PROFILE_ID)
+                    != isinstance(gpu_evidence_collector, G4ProviderCollector)):
+                raise ValueError("G4 requires its distinct provider collector")
 
         semaphore = _Semaphore(max_concurrent)
         challenge_semaphore = _Semaphore(max_challenge_concurrent)

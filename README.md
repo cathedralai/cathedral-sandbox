@@ -405,13 +405,23 @@ TCB. Registration and admission do not prove a finalized weight row.
 
 ## GPU miners
 
+The first planned G4 miner fleet is eight Google Spot `g4-standard-48` VMs,
+each with one RTX PRO 6000 Blackwell Server Edition GPU and AMD SEV. G4
+Confidential VM support does not extend to the eight-GPU machine shape. See
+the [bounded, dry-run fleet plan](docs/G4_FLEET_PLAN.md) and
+[G4 operator trust proposal](docs/G4_OPERATOR_TRUST.md). No hardware is rented
+by these commands. G4 is a distinct provider-trusted guest path with no CPU
+attestation and no private customer work; it cannot use the native TDX command
+below. Its explicit `serve-g4` startup and trust requirements are in the
+[G4 operator guide](docs/G4_OPERATOR_TRUST.md#start-one-worker).
+
 `cathedral worker serve-gpu` enables authenticated GPU capability listing,
 composite evidence collection and fixed CUDA work. It reuses the signed
 validator-access snapshot, native TLS key and fleet configuration above. CPU
 endpoints retain their existing formats. GPU registration is not verified
 admission or an earning claim.
 
-The first worker contract requires Intel TDX plus NVIDIA confidential-GPU
+The separate native worker contract requires Intel TDX plus NVIDIA confidential-GPU
 evidence. It runs a fixed integer-vector kernel through the CUDA driver on the
 exact configured GPU UUID set, with a 30-second child-process deadline and no
 CPU fallback. Validators must independently verify both vendor evidence and

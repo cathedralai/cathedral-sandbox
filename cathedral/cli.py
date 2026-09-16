@@ -1263,7 +1263,7 @@ def _run_json(run: EpochRun) -> dict[str, object]:
 
 def cmd_worker_serve(args: argparse.Namespace) -> int:
     posture = getattr(args, "worker_posture", "production")
-    if posture not in {"production", "snp-production", "gpu-production", "development", "migration"}:
+    if posture not in {"production", "snp-production", "gpu-production", "g4-prelaunch", "development", "migration"}:
         raise ValueError(
             "worker posture must be production, SNP production, development, or migration"
         )
@@ -1298,6 +1298,13 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         if (tee != "tdx" or development_no_auth or development_allow_non_loopback
                 or gpu_composite or allow_customer_sat or migration_mode is not None):
             raise ValueError("GPU production requires authenticated TDX and fixed CUDA work")
+        from cathedral.gpu_work import G4_BUNDLE_PROFILE_ID, G4_WORKER_PROFILE_ID
+        if args.gpu_profile_id in {G4_WORKER_PROFILE_ID, G4_BUNDLE_PROFILE_ID}:
+            raise ValueError("G4 uses a distinct provider-trusted guest path, never TDX evidence")
+    elif posture == "g4-prelaunch":
+        if (tee != "unattested" or development_no_auth or development_allow_non_loopback
+                or gpu_composite or allow_customer_sat or migration_mode is not None):
+            raise ValueError("G4 requires an approved operator guest; CPU attestation and customer work disabled")
     elif posture == "snp-production":
         if (
             tee != "snp"
@@ -1363,7 +1370,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         raise ValueError(
             "SNP production requires the complete signed validator-access configuration"
         )
-    if posture == "gpu-production" and not signed_access_configured:
+    if posture in {"gpu-production", "g4-prelaunch"} and not signed_access_configured:
         raise ValueError("GPU production requires complete signed validator-access configuration")
     if tee == "snp" and not is_loopback and not signed_access_configured:
         raise ValueError(
@@ -1550,6 +1557,15 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         ExternalGpuCollector(_config_from_env("CATHEDRAL_GPU_COLLECT_CMD"))
         gpu_executor = CudaWorkExecutor(args.gpu_profile_id, tuple(args.gpu_device_uuid))
         gpu_evidence_collector = collect_tdx_gpu
+    elif posture == "g4-prelaunch":
+        from cathedral.gpu_provider import G4ProviderCollector, cpu_evidence_unavailable
+        from cathedral.gpu_work import CudaWorkExecutor, G4_WORKER_PROFILE_ID
+        gpu_evidence_collector = G4ProviderCollector.from_files(
+            args.gpu_operator_endorsement, args.gpu_worker_private_key,
+            args.gpu_operator_keys, args.hotkey, channel_binding,
+        )
+        gpu_executor = CudaWorkExecutor(G4_WORKER_PROFILE_ID, (gpu_evidence_collector.gpu_uuid,))
+        evidence_collector = cpu_evidence_unavailable
     with WorkerServer(
         args.host,
         args.port,
@@ -1585,6 +1601,8 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
                     "development_non_loopback_escape": development_allow_non_loopback,
                     "gpu_preview": gpu_composite,
                     "gpu_work": gpu_executor is not None,
+                    "cpu_attestation": "unattested" if posture == "g4-prelaunch" else tee,
+                    "private_customer_work": False,
                     "migration_mode": migration_mode,
                     "public_bootstrap_evidence": allow_public_bootstrap,
                     "public_legacy_audit": allow_public_legacy_audit,
@@ -4369,6 +4387,23 @@ def build_parser() -> argparse.ArgumentParser:
                              help="exact NVIDIA GPU UUID; repeat once per admitted device")
     p_serve_gpu.set_defaults(
         func=cmd_worker_serve, worker_posture="gpu-production", tee="tdx",
+        development_no_auth=False, development_allow_non_loopback=False,
+        gpu_composite=False, allow_customer_sat=False, migration_mode=None,
+        allow_public_bootstrap_evidence=False, allow_public_legacy_audit=False,
+    )
+
+    p_serve_g4 = worker_sub.add_parser(
+        "serve-g4", help="serve prelaunch operator-controlled G4 GPU work; no CPU attestation",
+    )
+    add_worker_base(p_serve_g4)
+    add_worker_signed_access(p_serve_g4)
+    p_serve_g4.add_argument("--gpu-operator-endorsement", required=True)
+    p_serve_g4.add_argument("--gpu-operator-keys", required=True,
+                            help="approved operator public-key map, provisioned locally")
+    p_serve_g4.add_argument("--gpu-worker-private-key", required=True,
+                            help="owner-only unique per-instance Ed25519 PEM; never shared")
+    p_serve_g4.set_defaults(
+        func=cmd_worker_serve, worker_posture="g4-prelaunch", tee="unattested",
         development_no_auth=False, development_allow_non_loopback=False,
         gpu_composite=False, allow_customer_sat=False, migration_mode=None,
         allow_public_bootstrap_evidence=False, allow_public_legacy_audit=False,

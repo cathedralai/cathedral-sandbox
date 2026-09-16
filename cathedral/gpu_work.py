@@ -27,6 +27,8 @@ WORKLOAD_ID = "cuda_i32_vector_v1"
 ELEMENTS = 4096
 MAX_DEVICES = 8
 MAX_EXECUTION_SECONDS = 30
+G4_WORKER_PROFILE_ID = "gcp-g4-rtx-pro-6000-sev-v1"
+G4_BUNDLE_PROFILE_ID = "gcp-g4-rtx-pro-6000-8gpu-v1"
 _HEX = re.compile(r"[0-9a-f]{64}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _PROFILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
@@ -69,6 +71,8 @@ def validate_request(request: object) -> dict[str, object]:
             or any(not isinstance(v, str) or not _DIGEST.fullmatch(v) for v in identities)
             or identities != sorted(set(identities))):
         raise GpuWorkError("invalid GPU device set")
+    if profile == G4_BUNDLE_PROFILE_ID or (profile == G4_WORKER_PROFILE_ID and len(identities) != 1):
+        raise GpuWorkError("G4 requires one device per worker; eight workers form a fleet")
     if request["challenge_id"] != challenge_id(request):
         raise GpuWorkError("GPU challenge digest mismatch")
     return request
@@ -237,6 +241,8 @@ class CudaWorkExecutor:
         identities = tuple(sorted(gpu_identity_policy_digest(v) for v in device_uuids))
         if not 1 <= len(identities) <= MAX_DEVICES or len(set(identities)) != len(identities):
             raise GpuWorkError("invalid configured GPU set")
+        if profile_id == G4_BUNDLE_PROFILE_ID or (profile_id == G4_WORKER_PROFILE_ID and len(identities) != 1):
+            raise GpuWorkError("G4 requires one device per worker; eight workers form a fleet")
         self.profile_id = profile_id
         self.device_identity_digests = identities
         self._slot = threading.Lock()
