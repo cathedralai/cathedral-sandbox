@@ -3,8 +3,9 @@
 > Development reference. GPU scoring is not enabled on SN39. Mining starts in
 > the repository [README](../README.md).
 
-Status: hardware-free foundation complete; live hardware acceptance and all GPU
-scoring remain disabled.
+Status: hardware-free foundation and explicit signed GPU worker endpoints
+implemented; live hardware acceptance and GPU earning remain unproven.
+The production worker implementation is documented in [GPU work](GPU_WORK.md).
 
 Cathedral treats a confidential GPU as a composite trust boundary. A GPU model
 string, a driver report, or an independent CPU quote is not enough. The first
@@ -246,10 +247,14 @@ secrets or credentials in its command line, inherited environment, or logs.
 
 ## Development audit-only runtime path
 
-GPU composition is a development preview. Production `worker serve`,
+The legacy GPU audit runtime is a development preview. Production `worker serve`,
 `runtime canary`, `runtime audit-attestation`, and `runtime run-epoch` do not
 accept GPU configuration. The preview does not issue assurance receipts,
 publish score reports, create epochs, or make a GPU miner production-eligible.
+The separate explicit `worker serve-gpu` posture adds signed-validator-only
+GPU capability, evidence and fixed CUDA work endpoints. It still requires a
+real external vendor adapter and does not enable the legacy runtime's scoring
+or receipt flags. See [GPU work](GPU_WORK.md).
 
 The worker enables the two-component wire response explicitly:
 
