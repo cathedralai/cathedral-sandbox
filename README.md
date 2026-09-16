@@ -403,6 +403,65 @@ announce the hotkey until the local proof passes and the validators you expect
 to score the machine confirm their policies admit the observed measurement and
 TCB. Registration and admission do not prove a finalized weight row.
 
+## GPU miners
+
+`cathedral worker serve-gpu` enables authenticated GPU capability listing,
+composite evidence collection and fixed CUDA work. It reuses the signed
+validator-access snapshot, native TLS key and fleet configuration above. CPU
+endpoints retain their existing formats. GPU registration is not verified
+admission or an earning claim.
+
+The first worker contract requires Intel TDX plus NVIDIA confidential-GPU
+evidence. It runs a fixed integer-vector kernel through the CUDA driver on the
+exact configured GPU UUID set, with a 30-second child-process deadline and no
+CPU fallback. Validators must independently verify both vendor evidence and
+the approved worker measurement before trusting completion.
+
+Install this checkout and the signed-access dependency into the worker image:
+
+```sh
+python3 -m pip install -e '.[validator-access-worker]'
+```
+
+With the real composite collector installed, native CUDA driver present, and
+the existing signed-access/TLS files provisioned, launch the explicit posture:
+
+```sh
+export CATHEDRAL_GPU_COLLECT_CMD=/opt/cathedral/bin/gpu-collector
+cathedral worker serve-gpu \
+  --hotkey "$CATHEDRAL_MINER_HOTKEY" --host 0.0.0.0 --port 8081 \
+  --gpu-profile-id "$CATHEDRAL_GPU_PROFILE_ID" \
+  --gpu-device-uuid "$CATHEDRAL_GPU_UUID" \
+  --tls-certificate /run/cathedral/worker.crt \
+  --tls-private-key /run/cathedral/worker.key \
+  --validator-access-snapshot /etc/cathedral/validator-access/validator-access.json \
+  --validator-access-keys /etc/cathedral/validator-access/snapshot-keys.json \
+  --validator-access-keys-digest "$CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST" \
+  --validator-access-state /var/lib/cathedral/validator-access.sqlite \
+  --validator-minimum-stake-rao 0 \
+  --validator-network "$CATHEDRAL_NETWORK" --validator-netuid "$CATHEDRAL_NETUID" \
+  --public-endpoint "$CATHEDRAL_PUBLIC_ENDPOINT"
+```
+
+Repeat `--gpu-device-uuid` for each device. Add `--fleet-manifest` to the same
+command for additional machine candidates. The network and subnet must match
+the signed access snapshot. A signed validator discovers machines through
+`POST /v1/fleet`, reads each machine's declared GPU capability through
+`POST /v1/gpu-capabilities` with `{}`, and uses `/v1/gpu-evidence` and
+`/v1/gpu-work` for verification. These GPU routes reject unsigned and bearer-only
+requests. Capability output says `registered` and `verified: false`; only the
+validator can establish qualification.
+
+**Current hardware blocker:** this repository does not yet ship a working
+vendor adapter for the native composite collector/verifier contract. The path
+above is the installation location for an actual adapter, not a provided
+binary. The historical Google Confidential Space implementation in
+[PR #42](https://github.com/cathedralai/cathedral-sandbox/pull/42) uses a different
+Google token protocol and cannot be installed under that name as a substitute.
+Until a matching adapter, signed profile and real hardware run are available,
+listing can establish registration but cannot establish GPU qualification.
+See [GPU work contract](docs/GPU_WORK.md) and [#73](https://github.com/cathedralai/cathedral-sandbox/issues/73).
+
 ## Reference
 
 Start with the [documentation map](docs/README.md). It separates current miner

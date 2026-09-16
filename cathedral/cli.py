@@ -1263,7 +1263,7 @@ def _run_json(run: EpochRun) -> dict[str, object]:
 
 def cmd_worker_serve(args: argparse.Namespace) -> int:
     posture = getattr(args, "worker_posture", "production")
-    if posture not in {"production", "snp-production", "development", "migration"}:
+    if posture not in {"production", "snp-production", "gpu-production", "development", "migration"}:
         raise ValueError(
             "worker posture must be production, SNP production, development, or migration"
         )
@@ -1294,6 +1294,10 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
                 "production worker posture is fixed to authenticated TDX without "
                 "development, GPU-preview, or migration options"
             )
+    elif posture == "gpu-production":
+        if (tee != "tdx" or development_no_auth or development_allow_non_loopback
+                or gpu_composite or allow_customer_sat or migration_mode is not None):
+            raise ValueError("GPU production requires authenticated TDX and fixed CUDA work")
     elif posture == "snp-production":
         if (
             tee != "snp"
@@ -1359,6 +1363,8 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         raise ValueError(
             "SNP production requires the complete signed validator-access configuration"
         )
+    if posture == "gpu-production" and not signed_access_configured:
+        raise ValueError("GPU production requires complete signed validator-access configuration")
     if tee == "snp" and not is_loopback and not signed_access_configured:
         raise ValueError(
             "a non-loopback AMD SEV-SNP worker requires signed validator access; "
@@ -1534,6 +1540,16 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         evidence_collector = collect_tdx_gpu
     else:
         evidence_collector = None
+    gpu_executor = None
+    gpu_evidence_collector = None
+    if posture == "gpu-production":
+        from cathedral.gpu import ExternalGpuCollector, _config_from_env
+        from cathedral.gpu_work import CudaWorkExecutor
+        # Fail on missing/invalid collector configuration before opening a port.
+        # A configured collector is not a verified or reward-eligible machine.
+        ExternalGpuCollector(_config_from_env("CATHEDRAL_GPU_COLLECT_CMD"))
+        gpu_executor = CudaWorkExecutor(args.gpu_profile_id, tuple(args.gpu_device_uuid))
+        gpu_evidence_collector = collect_tdx_gpu
     with WorkerServer(
         args.host,
         args.port,
@@ -1548,6 +1564,8 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         fleet_endpoints=fleet_endpoints,
         allow_public_bootstrap_evidence=allow_public_bootstrap,
         allow_public_legacy_audit=allow_public_legacy_audit,
+        gpu_executor=gpu_executor,
+        gpu_evidence_collector=gpu_evidence_collector,
     ) as server:
         print(
             json.dumps(
@@ -1566,6 +1584,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
                     "development_no_auth": development_no_auth,
                     "development_non_loopback_escape": development_allow_non_loopback,
                     "gpu_preview": gpu_composite,
+                    "gpu_work": gpu_executor is not None,
                     "migration_mode": migration_mode,
                     "public_bootstrap_evidence": allow_public_bootstrap,
                     "public_legacy_audit": allow_public_legacy_audit,
@@ -4338,6 +4357,21 @@ def build_parser() -> argparse.ArgumentParser:
         migration_mode=None,
         allow_public_bootstrap_evidence=False,
         allow_public_legacy_audit=False,
+    )
+
+    p_serve_gpu = worker_sub.add_parser(
+        "serve-gpu", help="serve signed-validator TDX plus confidential-GPU CUDA work",
+    )
+    add_worker_base(p_serve_gpu)
+    add_worker_signed_access(p_serve_gpu)
+    p_serve_gpu.add_argument("--gpu-profile-id", required=True)
+    p_serve_gpu.add_argument("--gpu-device-uuid", action="append", required=True,
+                             help="exact NVIDIA GPU UUID; repeat once per admitted device")
+    p_serve_gpu.set_defaults(
+        func=cmd_worker_serve, worker_posture="gpu-production", tee="tdx",
+        development_no_auth=False, development_allow_non_loopback=False,
+        gpu_composite=False, allow_customer_sat=False, migration_mode=None,
+        allow_public_bootstrap_evidence=False, allow_public_legacy_audit=False,
     )
 
     p_worker_develop = worker_sub.add_parser(
