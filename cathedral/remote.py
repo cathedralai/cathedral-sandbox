@@ -29,7 +29,7 @@ from cathedral.common import (
     MAX_EVIDENCE_CERTIFICATES,
     MAX_EVIDENCE_QUOTE_BYTES,
 )
-from cathedral.lanes.sat import validate_sat_work_item
+from cathedral.lanes.sat import derived_work_units, validate_sat_work_item
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 from cathedral.validator_access import (
     VALIDATOR_REQUEST_HEADER,
@@ -489,7 +489,7 @@ class RemoteMiner:
         return SatCertificate(
             satisfiable=satisfiable,
             assignment=assignment,
-            work_units=float(len(item.instance.clauses)),
+            work_units=derived_work_units(item),
             challenge_id=item.challenge_id,
             assigned_hotkey=self._hotkey,
         )

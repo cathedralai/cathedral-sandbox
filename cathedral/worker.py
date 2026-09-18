@@ -41,6 +41,7 @@ from cathedral.lanes.sat import (
     MIN_SEED,
     _canonical_instance,
     _compute_challenge_id,
+    derived_work_units_for,
     solve_sat,
     validate_sat_instance,
 )
@@ -806,7 +807,7 @@ def _make_handler(
                 {
                     "satisfiable": assignment is not None,
                     "assignment": assignment,
-                    "work_units": float(len(instance.clauses)),
+                    "work_units": derived_work_units_for(instance, seed),
                     "challenge_id": challenge_id,
                     "assigned_hotkey": configured_hotkey,
                 },
