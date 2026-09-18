@@ -96,9 +96,21 @@ def admits_customer_work(
     # the real payload is something else. isinstance cannot see that.
     if type(attested) is not Attested:
         return False
-    if not attested.chain_verified:
+    # `is True` and an exact str check, not truthiness or a bare set lookup: a
+    # truthy string such as "false" passes a bare test, and an unhashable status
+    # raises from membership instead of refusing.
+    if attested.chain_verified is not True:
+        return False
+    if not isinstance(attested.verification_status, str):
         return False
     if attested.verification_status not in ADMISSIBLE_VERIFICATION_STATUSES:
+        return False
+    # The compatibility TDX path skips the debug and collateral gates and
+    # returns a verdict carrying dataclass defaults, so a debug-enabled platform
+    # would otherwise be admitted. Refuse rather than infer.
+    if attested.debug_enabled is not False:
+        return False
+    if attested.collateral_current is False:
         return False
     if not policy.allowed_measurements:
         # An empty allowlist denies everything. It must never mean "any".

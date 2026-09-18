@@ -228,3 +228,35 @@ def test_attested_subclass_with_shadowed_fields_is_refused() -> None:
     assert shadowed.tier is Tier.CC_CPU_TDX  # the lie the gate must not believe
     assert shadowed.__dict__["tier"] is real_tier
     assert not admits_customer_work(_policy(), shadowed)
+
+
+# --- round 1: three more bypasses, found by fuzzing ---------------------------
+
+
+def test_truthy_non_boolean_chain_verified_is_refused() -> None:
+    from dataclasses import replace
+
+    for value in ("false", "no", 1, [1], float("nan")):
+        assert not admits_customer_work(_policy(), replace(_attested(), chain_verified=value))
+
+
+@pytest.mark.parametrize("bad", [["VERIFIED"], {"VERIFIED"}, bytearray(b"x")])
+def test_unhashable_verification_status_refuses_instead_of_raising(bad: object) -> None:
+    from dataclasses import replace
+
+    assert not admits_customer_work(_policy(), replace(_attested(), verification_status=bad))
+
+
+def test_debug_enabled_verdict_is_refused() -> None:
+    """The compatibility path skips the debug gate and returns defaults."""
+
+    from dataclasses import replace
+
+    assert not admits_customer_work(_policy(), replace(_attested(), debug_enabled=True))
+    assert not admits_customer_work(_policy(), replace(_attested(), debug_enabled=None))
+
+
+def test_known_stale_collateral_is_refused() -> None:
+    from dataclasses import replace
+
+    assert not admits_customer_work(_policy(), replace(_attested(), collateral_current=False))
