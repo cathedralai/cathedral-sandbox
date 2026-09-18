@@ -84,6 +84,36 @@ TCB and advisory claims. The direct SN39 validator uses the released QVL, live
 TLS binding, canonical SAT result, and global hardware/TLS deduplication. It
 does not consume the retired publisher or epoch path.
 
+## What this path does and does not establish
+
+Intel TDX encrypts guest memory and CPU register state, so a host operator
+cannot read a running guest. That is the confidentiality this path buys, and it
+is real.
+
+The following are **not** established by the checks above. Operator-facing and
+customer-facing material must not imply otherwise:
+
+- **The guest's boot state, on this validator.** The verifier computes
+  Cathedral's launch measurement, and the direct validator does not retain it
+  or apply an allowlist to it. Any TDX guest that satisfies the contract above
+  is accepted regardless of what it booted. This is a missing code path rather
+  than an operator setting: the direct validator accepts no TDX measurement
+  policy as input, while the verifier library accepts one and the
+  reward-receipt lane requires one.
+- **A particular disk image.** Even where a measurement policy is applied, the
+  value describes measured boot state. Image identity can be extended into
+  measured state, but a matching measurement does not by itself prove a
+  particular OCI image, and no path here attests a container digest.
+- **Disk confidentiality.** TDX does not encrypt the guest's persistent disk.
+  The guest owns disk encryption and any key management.
+- **Rollback resistance.** A host operator can restore an earlier valid disk
+  image. Nothing in this path detects that.
+- **Availability.** A host operator can stop or decline to run a guest. This
+  path cannot prevent it.
+
+A claim that a machine is confidential should name which of the above it
+covers, and by what mechanism.
+
 ## Sandbox subprocess controls
 
 These variables configure the sandbox library's production QVL subprocess:
