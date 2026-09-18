@@ -237,6 +237,10 @@ def _verify_tdx(
         chip_id=chip_id,
         measurement=measurement,
         tcb=tcb,
+        # Declared, not inherited. This function returns None above unless the
+        # QVL reported intel_verified and report_data_match, so both hold here.
+        verification_status="VERIFIED",
+        chain_verified=True,
         tcb_status=tcb_status,
         advisory_ids=advisory_ids or (),
         debug_enabled=debug_enabled,
