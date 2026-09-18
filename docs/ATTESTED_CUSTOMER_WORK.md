@@ -90,66 +90,50 @@ Options 1 and 2 are configuration and integration against code that is
 already written and tested. Options 3 and 4 are new systems. They should not
 be presented as four peers.
 
-## What this change implements
+## What this document records
 
-`cathedral/customer_work_admission.py` — a small decision that is missing
-today:
+This is a findings document, not a change. An earlier version of this branch
+also carried a caller-side admission module,
+`customer_work_admission.py`. Review recommended removing it, and it has been removed. The reasons
+are worth recording, because the same module will otherwise be rebuilt:
 
-```python
-admits_customer_work(policy, attested, required_tier=None) -> bool
-```
+- **It is not a security boundary.** `Attested` is a plain dataclass whose
+  `verification_status` defaults to `"VERIFIED"` and whose `chain_verified`
+  defaults to `True`. A hand-built or defaulted verdict is therefore admitted.
+  The module's own docstring said so.
+- **It has no callers.** Nothing in the dispatcher or the worker imports it.
+- **A security-shaped object that is not a security boundary is a net
+  negative.** A future engineer grepping for it finds a plausible control,
+  whose existence substitutes for its function.
+- **It was bypassed seven times** by adversarial review, every time through the
+  same class of defect: the gate read a field the verifier does not guarantee.
 
-It refuses unless the machine's tier is a confidential CPU profile, the
-caller's policy names at least one measurement, and the verified measurement is
-listed. Every path fails closed, and an empty allowlist denies everything —
-it never means "any".
+### The field class, in full
 
-It deliberately is **not** a new policy type. `Policy` already carries
-`allowed_measurements` and the registry binding; the verifier already returns
-the measurement, TCB and advisory state on `Attested`. TCB floors, advisory
-rejection and `tdx_strict` stay the verifier's job rather than being
-reimplemented here.
+Fields of `Attested` whose **default is the admitted value**:
 
-An earlier draft of this change added a 180-line workload-agnostic policy
-schema. Review correctly identified it as a duplicate of `Policy` with a
-pretence of enforcement, and it was removed.
+| Field | Default | Consequence |
+|---|---|---|
+| `verification_status` | `"VERIFIED"` | the admitted value itself |
+| `chain_verified` | `True` | the admitted value itself |
+| `advisory_ids` | `()` | `set(()).issubset(allowed)` passes vacuously |
+| `policy_mode` | `None` | coerced to "compatibility", the weaker mode |
 
-`tests/test_customer_work_admission.py` — 17 cases, including that nothing a
-worker reports about itself appears in the decision, and that an empty
-allowlist denies everything.
+The TDX, mock and GPU builders never set the first two. Every bypass found
+across four review rounds was an instance of this one class.
 
-### What this gate cannot do
+### Where the decision belongs instead
 
-The type check is not provenance, and two review passes demonstrated it.
-:class:`Attested` is a plain dataclass that defaults `chain_verified=True` and
-`verification_status="VERIFIED"`. A caller holding a real unverified verdict
-can recompute those fields and be admitted. The TDX path never sets them at
-all, so on that path the check is vacuous. A process that can construct an
-:class:`Attested` can satisfy this gate.
+The worker never verifies anything. It collects and serialises quotes; the
+caller verifies them. So a worker-side gate cannot exist in this topology, and
+an admission decision must live in the process that runs the verifier.
 
-So this module is **a refusal for an honest caller and a second pair of eyes
-on a mistaken one. It is not a defence against a caller that wants to lie.**
-
-The real control has to be one of:
-
-- keep the decision in the process that runs the verifier, so a forged verdict
-  cannot be constructed in the first place;
-- make the verdict carry provenance that cannot be recomputed (a verifier
-  signature over the verdict, bound to the challenge nonce).
-
-Until one of those exists, wiring this gate in is a readability improvement,
-not a security boundary, and should not be described as one to a customer.
-
-Correction to the first version of the module: an adversarial review
-demonstrated two real bypasses, both now closed and covered by tests.
-
-- It accepted any object with the right attributes. :class:`Attested` is a
-  plain frozen dataclass carrying no provenance, so a hand-built or
-  duck-typed value was admitted. Inputs are now type checked.
-- It ignored the verdict's own verification fields. The SNP verifier can
-  return ``STRUCTURE_OK_CHAIN_UNVERIFIED``, and its own docstring states that
-  verdict *"must never be used for admission."* ``chain_verified`` and
-  ``verification_status`` are now part of the decision.
+The durable fix is to make the verdict carry provenance: a required field with
+no default, assigned only by the verifier, so a defaulted or hand-built verdict
+fails everywhere at once. Cost: `proto/evidence.proto`, four construction
+sites, gate reads, and the receipt and ledger schema. A cheaper partial is to
+delete the two permissive verdict defaults and use an explicit sentinel for
+`advisory_ids`.
 
 ## What this change does not do
 
