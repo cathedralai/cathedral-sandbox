@@ -20,7 +20,7 @@ ExecStart=/usr/local/lib/cathedral-miner-update/bin/cathedral-miner-update check
 SuccessExitStatus=10
 # Longer than the worst case in miner_update_cli.worst_case_seconds(), so
 # systemd never kills a check between two durable steps. A test holds this.
-TimeoutStartSec=6600s
+TimeoutStartSec=7800s
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

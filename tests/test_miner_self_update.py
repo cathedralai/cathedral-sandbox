@@ -210,16 +210,23 @@ def test_a_revoked_key_is_refused_even_by_the_previous_updater(h):
         key_id="stable-1",
         bundle={"trust": ROTATED, "launcher_suffix": b"# evil\n"},
     )
-    assert h.check().action == "refused"
+    refused = h.check()
+    assert refused.action == "refused" and refused.verified is False
+    # The previous updater judges the same revoked-key record, against the host trust set.
+    judged = fallback_to_previous(h.host(running_tree=previous), refused.exit_status)
+    assert "not trusted" in judged.reason and "the current updater stays" in judged.reason
     # 1. The channel serves a body that used to crash the updater. Now it is a refusal.
     h.metadata = b"[" + b"1" * 5000 + b"]"
     crashed = update_once(h.host())
     assert crashed.action == "refused" and crashed.exit_status == EXIT_REFUSED
-    # 2. Even if the previous updater is asked to judge, it verifies against the
-    #    host trust set, so the revoked key's record is refused there too.
+    # 2. The reviewer's scenario: the current updater dies before it fetches
+    #    anything, and the channel then serves the revoked-key record to the
+    #    previous updater, which fetches for itself. It is still refused.
+    h.now += 3600
     h.metadata = evil
     outcome = fallback_to_previous(h.host(running_tree=previous), EXIT_FAULT)
-    assert outcome.action == "refused" and "cannot verify the channel" in outcome.reason
+    assert outcome.action == "refused" and "not trusted" in outcome.reason
+    assert outcome.exit_status == EXIT_FAULT
     assert h.updater_current() == current
     assert h.running_image() == h.image("3")
     assert not h.state()["updater_strikes"]
@@ -237,9 +244,13 @@ def test_a_bundle_cannot_re_add_a_revoked_key(h):
         key_id="stable-2",
         bundle={"trust": ROTATED, "launcher_suffix": b"# re-add\n"},
     )
+    re_add = _tree_of(h.metadata)
     outcome = h.check()
     assert outcome.action == "refused" and "revoked key" in outcome.reason
     assert "stable-1" not in load_trust_state(h.paths.trust_file, expected_uid=os.getuid()).keys
+    # The root is part of that tree, so the tree is retired, not probed again.
+    assert re_add in h.state()["failed_updaters"]
+    assert "updater in this release already failed" in h.check().reason
 
 
 def test_a_rotation_that_would_lock_the_host_out_is_refused(h):
@@ -320,6 +331,122 @@ def test_a_regression_that_appears_later_is_recovered_by_the_fallback(h):
     assert h.updater_current() == fixed
 
 
+def test_an_updater_that_verifies_but_cannot_self_update_is_replaced(h):
+    """Trust re-review P1: it verifies every check, so its refusals were final.
+    Now the fallback probes the tree it could not install, and when that tree
+    is sound the strike goes to the current updater instead."""
+
+    good = _tree_of(h.release(sequence=5, bundle=V2))
+    h.commit()
+    assert h.updater_current() == good
+
+    def stuck(tree: str):
+        # This updater's handoff never works: every self-update fails.
+        return h.host(running_tree=tree, handoff=lambda release_dir, fd: (1, None))
+
+    fixed = _tree_of(h.release(sequence=6, bundle=V3))  # the signer publishes a newer updater
+    for strike in range(1, STRIKES_TO_DEMOTE + 1):
+        h.now += 3600
+        refused = update_once(stuck(good))
+        assert refused.action == "refused" and refused.verified is True, refused.reason
+        assert refused.updater_offered == fixed and refused.updater_blame == "ambiguous"
+        judged = fallback_to_previous(h.host(running_tree=h.tree_a), refused.exit_status)
+        if strike < STRIKES_TO_DEMOTE:
+            assert f"strike {strike}" in judged.reason and "probe accepts" in judged.reason
+            assert h.state()["updater_strikes"].get(fixed) is None, "the new tree's strike is taken back"
+    assert judged.action == "demoted" and h.updater_current() == h.tree_a
+    assert fixed not in h.state()["failed_updaters"]
+    # The previous updater installs the newer one itself.
+    h.now += 3600
+    outcome = update_once(h.host())
+    assert outcome.action == "activated", outcome.reason
+    assert h.updater_current() == fixed
+
+
+def test_a_new_tree_that_fails_for_both_updaters_is_not_blamed_on_the_current_one(h):
+    good = _tree_of(h.release(sequence=5, bundle=V2))
+    h.commit()
+    broken = _tree_of(h.release(sequence=6, bundle={"replace_modules": {"miner_updater.py": b"not python\n"}}))
+
+    def real_probe(release_dir, record):
+        return cli.probe_updater(h.paths, release_dir, record)
+
+    _real_clock(h)
+    h.release(sequence=7, bundle={"replace_modules": {"miner_updater.py": b"not python\n"}})
+    refused = update_once(h.host(probe_updater=real_probe))
+    assert refused.updater_offered == broken and "probe" in refused.reason
+    judged = fallback_to_previous(h.host(running_tree=h.tree_a, probe_updater=real_probe), refused.exit_status)
+    assert "fails for this updater too" in judged.reason
+    assert good not in h.state()["updater_strikes"]
+    assert h.updater_current() == good
+
+
+def test_a_new_tree_that_reports_its_own_failure_is_not_judged_again(h):
+    """The brick scenario seen from the fallback: the new tree ran and said it
+    could not verify, so the fault is its own and the refusal stands."""
+
+    good = _tree_of(h.release(sequence=5, bundle=V2))
+    h.commit()
+    bad = _tree_of(h.release(sequence=6, bundle=V3))
+    host_for, handoff = _broken_fetch_for(h, bad)
+    refused = update_once(host_for(good, handoff=handoff))
+    assert refused.updater_offered == bad and refused.updater_blame == "new"
+    judged = fallback_to_previous(h.host(running_tree=h.tree_a), refused.exit_status)
+    assert "its refusal stands" in judged.reason
+    assert good not in h.state()["updater_strikes"]
+
+
+def test_a_channel_that_shows_each_updater_other_bytes_demotes_nothing(h):
+    """Trust re-review P2, the reviewer's split-serving PoC: garbage to the
+    current updater, the good record to the fallback. The fallback now judges
+    the bytes the current updater saw."""
+
+    good_record = h.release(sequence=5, bundle=V2)
+    assert h.check().action == "activated"
+    current = h.updater_current()
+    for _ in range(STRIKES_TO_DEMOTE + 1):
+        h.now += 3600
+        h.metadata = b"not json"  # served to the current updater
+        refused = update_once(h.host(running_tree=current))
+        h.metadata = good_record  # served to the fallback
+        judged = fallback_to_previous(h.host(running_tree=h.tree_a), refused.exit_status)
+        assert "cannot verify what the current updater saw" in judged.reason
+    assert h.updater_current() == current
+    assert not h.state()["updater_strikes"] and not h.state()["failed_updaters"]
+
+
+def test_the_fallback_passes_the_current_status_through_when_it_cannot_run(h):
+    """Trust re-review P3: a fault must still page when the fallback refuses
+    its own preconditions."""
+
+    good = _tree_of(h.release(sequence=5, bundle=V2))
+    h.commit()
+    # previous == current
+    same = fallback_to_previous(h.host(running_tree=good), EXIT_FAULT)
+    assert same.exit_status == EXIT_FAULT and "is the current updater" in same.reason
+    # the lock is busy
+    import fcntl
+
+    fd = os.open(h.paths.lock_file, os.O_CREAT | os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        busy = fallback_to_previous(h.host(running_tree=h.tree_a), 1)
+    finally:
+        os.close(fd)
+    assert busy.exit_status == EXIT_FAULT and "already running" in busy.reason
+    # the state is unreadable
+    h.paths.state_file.write_text("not json")
+    unreadable = fallback_to_previous(h.host(running_tree=h.tree_a), EXIT_FAULT)
+    assert unreadable.exit_status == EXIT_FAULT
+
+
+def test_the_fallback_command_passes_the_status_through_when_it_cannot_start(monkeypatch, tmp_path):
+    monkeypatch.setenv(cli.ROOT_ENV, str(tmp_path))  # no config here, so it refuses at once
+    assert cli.main(["fallback", "--current-status", "13"]) == EXIT_FAULT
+    assert cli.main(["fallback", "--current-status", "1"]) == EXIT_FAULT
+    assert cli.main(["fallback", "--current-status", "10"]) == EXIT_REFUSED
+
+
 def test_a_first_run_crash_is_reverted_with_a_strike(h):
     h.release(sequence=5, bundle=V2)
     outcome = h.check(handoff=lambda release_dir, fd: (1, None))
@@ -376,7 +503,14 @@ def test_a_first_run_during_a_channel_outage_is_reverted_without_a_strike(h):
             raise MinerUpdateError("the download failed: outage")
         return record
 
-    outcome = h.check(fetch_metadata=flaky, handoff=lambda release_dir, fd: (EXIT_REFUSED, {"action": "refused", "verified": False}))
+    def child_in_the_outage(release_dir, fd):
+        child = h.host(running_tree=release_dir.name, fetch_metadata=flaky)
+        child.handoff_depth = 1
+        child.lock_fd = fd
+        result = update_once(child)
+        return result.exit_status, result.as_dict()
+
+    outcome = h.check(fetch_metadata=flaky, handoff=child_in_the_outage)
     assert "no strike" in outcome.reason
     assert not h.state()["updater_strikes"]
     assert not h.state()["failed_updaters"]
@@ -390,7 +524,7 @@ def test_an_induced_failure_the_previous_updater_shares_blames_nothing(h):
     h.metadata = b"[" + b"1" * 5000 + b"]"
     refused = update_once(h.host())
     judged = fallback_to_previous(h.host(running_tree=h.tree_a), refused.exit_status)
-    assert "cannot verify the channel either" in judged.reason
+    assert "cannot verify what the current updater saw either" in judged.reason
     assert h.updater_current() == good
     assert not h.state()["updater_strikes"] and not h.state()["failed_updaters"]
 
@@ -426,10 +560,10 @@ def test_a_stale_verified_record_does_not_excuse_a_new_failure(h):
 
 
 def test_a_record_of_another_exit_status_does_not_excuse_a_refusal(h):
-    good = _verified_refusal(h)
-    state = h.state()
-    state["last_check"]["exit_status"] = 0
-    write_state(h.paths.state_file, state)
+    good = _tree_of(h.release(sequence=5, bundle=V2))
+    h.commit()
+    assert h.state()["last_check"]["exit_status"] == 0 and h.state()["last_check"]["verified"]
+    # The shim saw 10, but the record says 0: it is not this run's record.
     judged = fallback_to_previous(h.host(running_tree=h.tree_a), EXIT_REFUSED)
     assert "stands" not in judged.reason and "strike 1" in judged.reason
     assert good in h.state()["updater_strikes"]
@@ -589,6 +723,18 @@ def _shim_copy(h: Harness, tmp_path: Path, *, extra_env: str = "") -> Path:
         "LANG=C.UTF-8 PYTHONSAFEPATH=1",
         f"LANG=C.UTF-8 PYTHONSAFEPATH=1 CATHEDRAL_MINER_UPDATE_ROOT={h.paths.root} {extra_env}".rstrip(),
     )
+    # A miner that is up, as systemctl and docker would report it, so the
+    # health check that closes every check sees a running miner.
+    fake = tmp_path / "fake-bin"
+    fake.mkdir(exist_ok=True)
+    (fake / "systemctl").write_text(
+        "#!/bin/sh\ncase \"$*\" in\n  *--value*) echo active ;;\n"
+        "  show*) printf 'ActiveState=active\\nNRestarts=0\\n' ;;\nesac\nexit 0\n"
+    )
+    (fake / "docker").write_text("#!/bin/sh\necho 'true 2020-01-01T00:00:00Z legacy@sha256:0'\n")
+    for tool in ("systemctl", "docker"):
+        os.chmod(fake / tool, 0o755)
+    text = text.replace("PATH=/usr/sbin:/usr/bin:/sbin:/bin", f"PATH={fake}:/usr/sbin:/usr/bin:/sbin:/bin")
     copy = tmp_path / "shim"
     copy.write_text(text)
     return copy
@@ -722,7 +868,7 @@ def test_the_shim_asks_the_previous_updater_and_nothing_changes_when_it_cannot_v
         timeout=120,
     )
     document = json.loads(result.stdout.strip().splitlines()[-1])
-    assert "cannot verify the channel either" in document["reason"], result.stderr[-2000:]
+    assert "cannot verify what the current updater saw either" in document["reason"], result.stderr[-2000:]
     assert result.returncode == EXIT_FAULT
     assert h.updater_current() == tree_b
     assert not h.state()["updater_strikes"]

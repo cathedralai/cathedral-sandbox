@@ -466,7 +466,7 @@ def test_host_startup_is_syntax_valid_and_pins_the_exact_pulled_runtime() -> Non
     assert '${SN39_AUDIT_MINER_IMAGE}" == "${IMAGE_PREFIX}"*' in script
     assert 'image_digest="${SN39_AUDIT_MINER_IMAGE#"${IMAGE_PREFIX}"}"' in script
     assert '"${image_digest}" =~ ^[0-9a-f]{64}$' in script
-    assert 'docker pull --platform linux/amd64 "${SN39_AUDIT_MINER_IMAGE}"' in script
+    assert 'docker pull --platform linux/amd64 "${IMAGE_PREFIX}${image_digest}"' in script
     assert ".RepoDigests" in script
     assert 'grep -Fx -- "${SN39_AUDIT_MINER_IMAGE}"' in script
     assert "{{.Os}}/{{.Architecture}}" in script

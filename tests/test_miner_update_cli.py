@@ -96,9 +96,24 @@ def test_a_gate_that_can_never_pass_is_reported(tmp_path):
 
 
 def test_the_margin_fits_the_refreshed_snapshot_of_211():
-    """#211 signs 900 s snapshots and refreshes and fetches every two minutes."""
+    """#211 signs 900 s snapshots, and a healthy host's copy is at most 340 s old:
+    two timer gaps of 120 + 15 + 5 s, the 30 s generated_at backdate and the
+    30 s fetch deadline."""
 
+    refresh_gap = 120 + 15 + 5
+    assert cli.SNAPSHOT_REFRESH_ALLOWANCE_SECONDS == (refresh_gap + 30) + (refresh_gap + 30)
     assert cli.MINIMUM_ACCESS_REMAINING_SECONDS + cli.SNAPSHOT_REFRESH_ALLOWANCE_SECONDS <= 900
+
+
+def test_a_snapshot_at_its_oldest_on_a_healthy_host_still_passes(tmp_path):
+    assert cli.safe_to_activate(_snapshot(tmp_path, age=cli.SNAPSHOT_REFRESH_ALLOWANCE_SECONDS - 1)) is True
+
+
+def test_the_restart_timeout_covers_a_stop_and_the_snapshot_fetch():
+    """Activation re-review P3: TimeoutStopSec=30s, then #211's fetch unit
+    (TimeoutStartSec=2min) that the TDX unit Wants= and is ordered After=."""
+
+    assert cli.RESTART_TIMEOUT_SECONDS >= 30 + 120 + 30
 
 
 def test_an_unreadable_snapshot_is_unsafe(tmp_path):

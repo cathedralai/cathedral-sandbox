@@ -25,7 +25,8 @@ One check, in order:
    identity (product, network, netuid, channel), key role, freshness, and the
    per-channel sequence floor, which is burned before anything else happens.
    Everything up to here handles untrusted bytes, so any exception is a
-   refusal, never a crash.
+   refusal, never a crash. The fetched bytes are kept, so the fallback judges
+   the same bytes.
 3. Take any trust rotation the release's bundle carries. The trust set lives
    in host state and only moves forward; a key it drops is revoked for good.
 4. Self-update first. If the record's bundle is not the tree this updater runs
@@ -35,8 +36,12 @@ One check, in order:
    image and its state-schema label, re-check that a restart is safe, set the
    latch, flip ``miner/current`` with one rename, and restart. A container that
    started after the flip, settled, and stayed up through a second sample
-   enters probation; the next check commits it if the same container is still
-   up with no new restarts.
+   enters probation. A check at least 30 minutes later commits it if the same
+   container is still up with no new restarts; one restart, or a reboot,
+   restarts probation instead.
+6. Escalate. A check with no activation in progress also looks at the miner,
+   and alerts if it is inactive, down or restarting, even when the check itself
+   only refused or held. Six checks in a row without a verified record alert.
 
 Rollback rule (review finding F2)
 ---------------------------------
@@ -126,6 +131,25 @@ DEFERRAL_ALERT_AFTER = 6
 whether the restart gate would pass, and resetting on every channel blip could
 hide a gate that never opens."""
 
+UNVERIFIED_ALERT_AFTER = 6
+"""Consecutive checks without a verified channel record (about six hours)
+before the check exits with ``EXIT_ALERT``: a withheld or expired channel must
+not be silent just because refusals do not fail the unit."""
+
+PROBATION_MINIMUM_SECONDS = 1800
+"""How long a release stays on probation before a check may commit it, so a
+second ``check`` run by hand right after the first cannot commit it."""
+
+PROBATION_RESTARTS_FORGIVEN = 1
+"""Container restarts during probation that restart probation instead of
+failing the release, as a reboot does. One covers a docker daemon restart."""
+
+INACTIVE_UNIT_STATES = ("inactive", "deactivating")
+"""Unit states that mean nothing runs and systemd will not start it again.
+The shipped drop-in sets ``Restart=always``, so on a managed release only
+``systemctl stop`` leaves the unit here. ``pause`` is how an operator says a
+stop is intended; an inactive miner on a host that is not paused alerts."""
+
 STRIKES_TO_DEMOTE = 2
 """Failed checks an updater tree may have, each while the other updater
 verified the channel, before the host stops using that tree. One induced or
@@ -176,6 +200,10 @@ class MinerUpdateRolledBack(MinerUpdateError):
 
 class GateImpossible(MinerUpdateError):
     """The safe-restart gate can never pass with this host's snapshot lifetime."""
+
+
+class TrustSetUnavailable(MinerUpdateError):
+    """The host trust set cannot be read. It alerts, since it will not heal."""
 
 
 @dataclass(frozen=True)
@@ -350,6 +378,19 @@ class HostPaths:
         return self.state_dir / "trust.json"
 
     @property
+    def trust_backup(self) -> Path:
+        """A verified copy of the last good trust set. Only a bootstrap run with
+        ``--repair-trust-set`` reads it, and only to move forward from it."""
+
+        return self.state_dir / "trust.json.backup"
+
+    @property
+    def fetched_record(self) -> Path:
+        """The bytes the last check fetched from the channel, for the fallback."""
+
+        return self.state_dir / "fetched-record"
+
+    @property
     def lock_file(self) -> Path:
         return self.state_dir / "lock"
 
@@ -413,6 +454,11 @@ class MinerUpdaterHost:
     lock_fd: int | None = None
     # Set once this run has fetched and verified a channel record.
     verified: bool = False
+    # Set when this run tried to install a newer updater tree and failed in a
+    # way that could be this updater's fault ("ambiguous") or was reported by
+    # the new tree itself ("new"). The fallback judges the ambiguous ones.
+    offered_updater: str | None = None
+    updater_blame: str | None = None
 
 
 @dataclass(frozen=True)
@@ -429,6 +475,9 @@ class UpdateOutcome:
     verified: bool = False
     # True when a handed-off child already recorded this outcome in state.
     recorded: bool = False
+    # A newer updater this run could not install, and whose fault that looked.
+    updater_offered: str | None = None
+    updater_blame: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -490,6 +539,15 @@ def empty_state() -> dict[str, object]:
         "last_refusal": None,
         "last_fallback": None,
         "consecutive_deferrals": 0,
+        "consecutive_unverified": 0,
+        # What the last check fetched from the channel, kept so the fallback
+        # judges the same bytes rather than fetching its own (trust re-review).
+        "last_fetch": None,
+        # The highest verified state schema of any release that reached
+        # may_have_run, and its image. No other image may declare less.
+        "schema_high_water": None,
+        # The miner's restart count at the last check, per selected release.
+        "miner_health": None,
     }
 
 
@@ -533,9 +591,10 @@ def read_state(path: Path) -> dict[str, object]:
         miner.setdefault(key, None)
     if miner["stage"] is not None and not isinstance(miner["stage"], str):
         raise MinerUpdateError("updater state stage is malformed")
-    deferrals = merged["consecutive_deferrals"]
-    if isinstance(deferrals, bool) or not isinstance(deferrals, int) or deferrals < 0:
-        raise MinerUpdateError("updater state deferral count is malformed")
+    for counter in ("consecutive_deferrals", "consecutive_unverified"):
+        value = merged[counter]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise MinerUpdateError(f"updater state {counter} is malformed")
     return merged
 
 
@@ -767,12 +826,39 @@ def load_trust_state(path: Path, *, expected_uid: int = 0) -> TrustState:
         raise MinerUpdateError(f"the host trust set is invalid: {exc}") from exc
 
 
+def trust_backup_path(path: Path) -> Path:
+    return path.with_name(path.name + ".backup")
+
+
 def write_trust_state(path: Path, state: TrustState) -> None:
-    _atomic_write(path, canonical_json(state.as_document()) + b"\n", mode=0o600)
+    """Write the trust set, then its verified backup, each atomically."""
+
+    body = canonical_json(state.as_document()) + b"\n"
+    _atomic_write(path, body, mode=0o600)
+    _atomic_write(trust_backup_path(path), body, mode=0o600)
 
 
 def _trust(host: MinerUpdaterHost) -> TrustState:
-    return load_trust_state(host.paths.trust_file, expected_uid=host.expected_uid)
+    """The host trust set. A problem with it alerts at once: it will not heal."""
+
+    path = host.paths.trust_file
+    try:
+        trust = load_trust_state(path, expected_uid=host.expected_uid)
+    except MinerUpdateError as exc:
+        raise TrustSetUnavailable(
+            f"{exc}. Nothing can be verified until it is repaired: run the bootstrap again "
+            "with --repair-trust-set (docs/MINER_AUTO_UPDATE.md, \"Repairing the trust set\")"
+        ) from exc
+    # Keep the backup current, so a repair never starts from an older set.
+    backup = trust_backup_path(path)
+    try:
+        good = load_trust_state(backup, expected_uid=host.expected_uid).as_document() == trust.as_document()
+    except MinerUpdateError:
+        good = False
+    if not good:
+        with contextlib.suppress(MinerUpdateError):
+            _atomic_write(backup, canonical_json(trust.as_document()) + b"\n", mode=0o600)
+    return trust
 
 
 # --- decisions -------------------------------------------------------------------------
@@ -885,17 +971,22 @@ def update_once(host: MinerUpdaterHost) -> UpdateOutcome:
 
     if host.paths.pause_file.exists():
         return UpdateOutcome("paused", f"operator pause file present: {host.paths.pause_file}")
-    return _locked(host, _check_locked)
+    return _locked(host, _check_locked, after=_after_check)
 
 
 def _locked(
-    host: MinerUpdaterHost, body: Callable[[MinerUpdaterHost, dict[str, object]], UpdateOutcome]
+    host: MinerUpdaterHost,
+    body: Callable[[MinerUpdaterHost, dict[str, object]], UpdateOutcome],
+    *,
+    after: Callable[[MinerUpdaterHost, UpdateOutcome], UpdateOutcome] | None = None,
 ) -> UpdateOutcome:
     inherited = host.lock_fd
     try:
         with exclusive(host.paths.lock_file, inherited_fd=inherited) as fd:
             host.lock_fd = fd
             host.verified = False
+            host.offered_updater = None
+            host.updater_blame = None
             try:
                 state = read_state(host.paths.state_file)
             except MinerUpdateError as exc:
@@ -908,6 +999,8 @@ def _locked(
                 outcome = UpdateOutcome("rolled_back", str(exc), EXIT_REFUSED, release=exc.release)
             except GateImpossible as exc:
                 outcome = UpdateOutcome("deferred", str(exc), EXIT_ALERT, alert=True)
+            except TrustSetUnavailable as exc:
+                outcome = UpdateOutcome("refused", str(exc), EXIT_ALERT, alert=True)
             except (MinerUpdateError, MinerReleaseError, BundleError, LauncherProfileError) as exc:
                 outcome = UpdateOutcome("refused", str(exc), EXIT_REFUSED)
             except OSError as exc:
@@ -917,6 +1010,18 @@ def _locked(
                 outcome = UpdateOutcome("fault", f"updater fault: {type(exc).__name__}: {exc}", EXIT_FAULT)
             if host.verified and not outcome.verified:
                 outcome = dataclasses.replace(outcome, verified=True)
+            if host.offered_updater is not None and not outcome.recorded:
+                outcome = dataclasses.replace(
+                    outcome, updater_offered=host.offered_updater, updater_blame=host.updater_blame
+                )
+            if after is not None:
+                try:
+                    outcome = after(host, outcome)
+                except Exception as exc:  # noqa: BLE001 - the updater's own logic failed
+                    traceback.print_exc(file=sys.stderr)
+                    outcome = UpdateOutcome(
+                        "fault", f"updater fault: {type(exc).__name__}: {exc}", EXIT_FAULT, verified=outcome.verified
+                    )
             return _record(host, outcome)
     except MinerUpdateError as exc:
         return UpdateOutcome("refused", str(exc), EXIT_REFUSED)
@@ -943,6 +1048,8 @@ def _record(host: MinerUpdaterHost, outcome: UpdateOutcome) -> UpdateOutcome:
         "verified": outcome.verified,
         "sequence": release.get("sequence"),
         "version": release.get("version"),
+        "updater_offered": outcome.updater_offered,
+        "updater_blame": outcome.updater_blame,
     }
     if outcome.action == "deferred":
         count = int(state.get("consecutive_deferrals") or 0) + 1
@@ -955,16 +1062,82 @@ def _record(host: MinerUpdaterHost, outcome: UpdateOutcome) -> UpdateOutcome:
                 reason=f"{outcome.reason}; deferred {count} checks in a row",
             )
             entry.update(reason=outcome.reason[:500], exit_status=EXIT_ALERT)
-    elif outcome.action in ("activated", "current", "held"):
+    elif outcome.action in ("activated", "probation", "current", "held"):
         state["consecutive_deferrals"] = 0
     state["last_check"] = entry
-    if outcome.exit_status in (EXIT_REFUSED, EXIT_HALTED, EXIT_FAULT):
+    if outcome.exit_status in (EXIT_REFUSED, EXIT_HALTED, EXIT_FAULT) or outcome.action == "refused":
         state["last_refusal"] = entry
     try:
         write_state(host.paths.state_file, state)
     except MinerUpdateError:
         pass
     return outcome
+
+
+def _after_check(host: MinerUpdaterHost, outcome: UpdateOutcome) -> UpdateOutcome:
+    """Count checks without a verified record, then escalate what must page.
+
+    When this updater could not verify the channel and a previous updater
+    exists, the shim runs that updater's ``fallback`` next, and the fallback
+    escalates; escalating here would make the shim skip it.
+    """
+
+    if outcome.recorded:
+        return outcome  # a handed-off child counted and escalated its own run
+    try:
+        state = read_state(host.paths.state_file)
+    except MinerUpdateError:
+        return outcome
+    state["consecutive_unverified"] = 0 if outcome.verified else int(state["consecutive_unverified"]) + 1
+    write_state(host.paths.state_file, state)
+    if (
+        not outcome.verified
+        and outcome.exit_status == EXIT_REFUSED
+        and link_target(host.paths.updater_previous) is not None
+    ):
+        return outcome
+    return _escalate(host, outcome)
+
+
+def _escalate(host: MinerUpdaterHost, outcome: UpdateOutcome) -> UpdateOutcome:
+    """Turn a quiet outcome into an alert when the host needs a person.
+
+    Two things page even though the check itself only refused, held or
+    deferred: no verified record for ``UNVERIFIED_ALERT_AFTER`` checks (a
+    withheld or expired channel), and a miner that is not running steadily.
+    The miner is checked on every check with no activation in progress, so a
+    dead miner after a rollback, or on a pinned host, is never silent.
+    """
+
+    if outcome.exit_status not in (EXIT_OK, EXIT_REFUSED):
+        return outcome
+    try:
+        state = read_state(host.paths.state_file)
+    except MinerUpdateError:
+        return outcome
+    unverified = int(state["consecutive_unverified"])
+    if not outcome.verified and unverified >= UNVERIFIED_ALERT_AFTER:
+        return dataclasses.replace(
+            outcome,
+            exit_status=EXIT_ALERT,
+            alert=True,
+            reason=f"{outcome.reason}; no verified channel record for {unverified} checks in a row",
+        )
+    miner = state["miner"]
+    assert isinstance(miner, dict)
+    if miner.get("stage") is not None or outcome.action == "current":
+        return outcome  # an activation is in progress, or `current` just looked
+    problem = _miner_health(host, state)
+    write_state(host.paths.state_file, state)
+    if problem is None:
+        return outcome
+    return dataclasses.replace(
+        outcome,
+        action="unhealthy",
+        exit_status=EXIT_ALERT,
+        alert=True,
+        reason=f"{problem}. This check: {outcome.action}: {outcome.reason}",
+    )
 
 
 def _fetch(host: MinerUpdaterHost) -> bytes:
@@ -1013,12 +1186,55 @@ def _floor_check(host: MinerUpdaterHost, state: Mapping[str, object], release: M
         raise MinerUpdateError(str(exc)) from exc
 
 
-def _dry_run(host: MinerUpdaterHost, state: Mapping[str, object]) -> MinerRelease:
-    """Fetch and verify the channel record, changing nothing."""
+def _fetch_kept(host: MinerUpdaterHost, state: dict[str, object]) -> bytes:
+    """Fetch the channel record and keep the bytes, or the failure, for the fallback.
 
-    release = _verify(host, _fetch(host))
+    The fallback then judges exactly what this updater saw, so a channel that
+    shows each updater something different cannot blame this one.
+    """
+
+    paths = host.paths
+    try:
+        raw = _fetch(host)
+    except MinerUpdateError as exc:
+        state["last_fetch"] = {"at": host.now_unix(), "error": str(exc)[:300]}
+        with contextlib.suppress(MinerUpdateError):
+            write_state(paths.state_file, state)
+        raise
+    _atomic_write(paths.fetched_record, raw, mode=0o600)
+    state["last_fetch"] = {"at": host.now_unix(), "sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw)}
+    write_state(paths.state_file, state)
+    return raw
+
+
+def _judge(host: MinerUpdaterHost, state: Mapping[str, object]) -> tuple[MinerRelease, bytes]:
+    """Verify, changing nothing, what the other updater saw on this run.
+
+    If it fetched bytes, those bytes are judged, not a fresh fetch. Only if
+    it fetched nothing this run (its fetch failed, or it crashed first) does
+    this updater fetch the channel itself.
+    """
+
+    last = state.get("last_fetch")
+    at = last.get("at") if isinstance(last, dict) else None
+    fresh = (
+        isinstance(at, int)
+        and not isinstance(at, bool)
+        and 0 <= host.now_unix() - at <= FALLBACK_RECORD_MAX_AGE_SECONDS
+    )
+    if fresh and isinstance(last, dict) and isinstance(last.get("sha256"), str):
+        try:
+            with host.paths.fetched_record.open("rb") as handle:
+                raw = handle.read(MAX_RELEASE_DOCUMENT_BYTES + 1)
+        except OSError as exc:
+            raise MinerUpdateError(f"the record the other updater fetched is unreadable: {exc}") from exc
+        if hashlib.sha256(raw).hexdigest() != last["sha256"]:
+            raise MinerUpdateError("the record the other updater fetched was changed since")
+    else:
+        raw = _fetch(host)
+    release = _verify(host, raw)
     _floor_check(host, state, release)
-    return release
+    return release, raw
 
 
 def _bundle_dir(host: MinerUpdaterHost, release: MinerRelease) -> Path:
@@ -1057,6 +1273,10 @@ def _rotate_trust(
             trust, proposed, signing_key_id=release.signing_key_id, channel=release.channel
         )
     except (OSError, MinerReleaseError) as exc:
+        # The trust root is part of the tree, so that tree can never be used
+        # here: retire it, and remember the release.
+        if release.bundle.tree_sha256 != host.running_tree:
+            _retire_updater(host, state, release.bundle.tree_sha256, f"its trust root was refused: {exc}")
         _remember_failure(host, state, release.summary(), reason=f"its trust root was refused: {exc}")
         raise MinerUpdateError(f"the release's trust root was refused: {exc}") from exc
     if rotated is not trust:
@@ -1098,7 +1318,7 @@ def _check_channel(
     early: UpdateOutcome | None,
 ) -> UpdateOutcome:
     assert host.running_tree is not None
-    raw = _fetch(host)
+    raw = _fetch_kept(host, state)
     release = _verify(host, raw)
     # From here the channel was fetched and its record verified; any refusal
     # below is about the record's content, not the updater's ability to check.
@@ -1109,13 +1329,19 @@ def _check_channel(
     floors = state["floors"]
     assert isinstance(floors, dict)
     floors[host.config.channel] = {"sequence": release.sequence, "signed_sha256": release.signed_sha256}
-    strikes = state["updater_strikes"]
-    assert isinstance(strikes, dict)
-    strikes.pop(host.running_tree, None)
-    write_state(host.paths.state_file, state)
-
     tree = release.bundle.tree_sha256
     new_updater = tree != host.running_tree
+    failed_updaters = state["failed_updaters"]
+    assert isinstance(failed_updaters, dict)
+    if not new_updater or tree in failed_updaters:
+        # This updater verified, and no newer tree is waiting on it, so its
+        # earlier strikes were not consecutive. While a newer tree waits, they
+        # stay: an updater that verifies but cannot install one is judged too.
+        strikes = state["updater_strikes"]
+        assert isinstance(strikes, dict)
+        strikes.pop(host.running_tree, None)
+    write_state(host.paths.state_file, state)
+
     if new_updater:
         _refuse_updater(state, tree)
     bundle_dir = _bundle_dir(host, release)
@@ -1156,6 +1382,21 @@ def _save_record(paths: HostPaths, release: MinerRelease, raw: bytes) -> Path:
     return path
 
 
+def _check_probe(probe: object, release: MinerRelease) -> None:
+    """A probe must confirm the record, the tree, and the schemas this updater reads."""
+
+    expected = {
+        "probe": "ok",
+        "signed_sha256": release.signed_sha256,
+        "tree_sha256": release.bundle.tree_sha256,
+        "state_schema": STATE_SCHEMA,
+        "trust_schema": TRUST_STATE_SCHEMA,
+    }
+    for key, value in expected.items():
+        if not isinstance(probe, Mapping) or probe.get(key) != value:
+            raise MinerUpdateError(f"its probe did not confirm {key}")
+
+
 def _self_update(
     host: MinerUpdaterHost,
     state: dict[str, object],
@@ -1186,19 +1427,13 @@ def _self_update(
         raise MinerUpdateError(
             "the channel moved to another updater during a handoff; the next check applies it"
         )
+    # Until the new tree reports a verdict of its own, a failure here could
+    # be this updater's: the fallback may judge it (trust re-review P1).
+    host.offered_updater = tree
+    host.updater_blame = "ambiguous"
     record_path = _save_record(paths, release, raw)
-    expected = {
-        "probe": "ok",
-        "signed_sha256": release.signed_sha256,
-        "tree_sha256": tree,
-        "state_schema": STATE_SCHEMA,
-        "trust_schema": TRUST_STATE_SCHEMA,
-    }
     try:
-        probe = host.probe_updater(release_dir, record_path)
-        for key, value in expected.items():
-            if not isinstance(probe, Mapping) or probe.get(key) != value:
-                raise MinerUpdateError(f"its probe did not confirm {key}")
+        _check_probe(host.probe_updater(release_dir, record_path), release)
     except (MinerUpdateError, MinerReleaseError, BundleError, OSError) as exc:
         # A strike, not a verdict: a probe can also fail for a reason that is
         # not the new tree's (a timeout on a loaded host), and one failure
@@ -1226,6 +1461,13 @@ def _self_update(
         and isinstance(reported.get("action"), str)
     ):
         relayed = reported.get("release")
+        # This updater handed over, so its own strikes no longer count.
+        taken = read_state(paths.state_file)
+        strikes = taken["updater_strikes"]
+        assert isinstance(strikes, dict)
+        if strikes.pop(str(host.running_tree), None) is not None:
+            write_state(paths.state_file, taken)
+        host.offered_updater = None
         return UpdateOutcome(
             action=str(reported["action"]),
             reason=f"updater {tree[:12]} took over: {reported.get('reason', '')}",
@@ -1238,6 +1480,9 @@ def _self_update(
 
     # The new updater did not prove a verified check. Put this one back, with
     # the fallback it had before.
+    if isinstance(reported.get("action"), str) or status == 124:
+        # It ran and gave its own verdict, or hung: the failure is its own.
+        host.updater_blame = "new"
     if previous is not None:
         atomic_symlink(paths.updater_current, previous)
     if fallback_before is not None and fallback_before != previous:
@@ -1248,7 +1493,8 @@ def _self_update(
     note = ""
     if reported.get("action") != "paused":
         try:
-            _dry_run(host, fresh)
+            # Judge what the new updater itself fetched on its first run.
+            _judge(host, fresh)
         except MinerUpdateError as exc:
             note = f"; this updater cannot verify the channel either ({exc}), so no strike"
         else:
@@ -1264,16 +1510,53 @@ def _self_update(
     )
 
 
+def _probe_as_fallback(host: MinerUpdaterHost, release: MinerRelease, raw: bytes) -> None:
+    """Probe the tree the current updater could not install, from this updater."""
+
+    tree = release.bundle.tree_sha256
+    release_dir = host.paths.updater_releases / tree
+    try:
+        require_root_controlled_tree(release_dir, expected_uid=host.expected_uid)
+        if release_tree_sha256(release_dir) != tree:
+            raise MinerUpdateError("its installed tree does not match its digest")
+        record = _save_record(host.paths, release, raw)
+        _check_probe(host.probe_updater(release_dir, record), release)
+    except (BundleError, OSError, MinerReleaseError) as exc:
+        raise MinerUpdateError(str(exc)) from exc
+
+
+def _forgive(state: dict[str, object], tree: str) -> None:
+    strikes = state["updater_strikes"]
+    assert isinstance(strikes, dict)
+    count = int(strikes.get(tree, 0)) - 1
+    if count > 0:
+        strikes[tree] = count
+    else:
+        strikes.pop(tree, None)
+
+
 def fallback_to_previous(host: MinerUpdaterHost, current_status: int) -> UpdateOutcome:
     """Run by the previous updater when the current one refused or faulted.
 
-    Acts only when the current updater could not fetch and verify the channel,
-    or faulted. It then fetches and verifies the channel itself, against the
-    host trust set, never its own bundled keys. If it cannot, the channel is at
-    fault and nothing changes. If it can, that is a strike against the current
-    updater; at ``STRIKES_TO_DEMOTE`` this updater becomes current again and the
-    other tree is not used until a release with another updater arrives.
+    It judges two kinds of failure, against the host trust set, never its own
+    bundled keys, and changing nothing but strikes and the updater link:
+
+    - The current updater could not verify the channel, or faulted. This
+      updater verifies the same bytes the current one fetched on that run (or,
+      if it fetched none, the channel). If it can, that is a strike against
+      the current updater. If it cannot, the channel is at fault.
+    - The current updater verified the channel but could not install the
+      newer updater the record names, in a way that could be its own fault.
+      This updater probes that tree itself. If the probe passes, the failure
+      was the current updater's: a strike against it, and the strike it gave
+      the new tree is taken back. If not, the refusal stands.
+
+    At ``STRIKES_TO_DEMOTE`` this updater becomes current again, and the other
+    tree is not used until a release with another updater arrives. Any other
+    verified refusal stands.
     """
+
+    passthrough = current_status if current_status in DOCUMENTED_EXIT_STATUSES else EXIT_FAULT
 
     def body(host: MinerUpdaterHost, state: dict[str, object]) -> UpdateOutcome:
         paths = host.paths
@@ -1283,7 +1566,6 @@ def fallback_to_previous(host: MinerUpdaterHost, current_status: int) -> UpdateO
             raise MinerUpdateError("the fallback updater is the current updater")
         if link_target(paths.updater_previous) != f"releases/{host.running_tree}":
             raise MinerUpdateError("the fallback updater is not the previous updater")
-        passthrough = current_status if current_status in DOCUMENTED_EXIT_STATUSES else EXIT_FAULT
         last = state.get("last_check")
         # Only the entry the current updater wrote for the run the shim just
         # saw counts: it must carry the same exit status and be recent. An
@@ -1295,6 +1577,7 @@ def fallback_to_previous(host: MinerUpdaterHost, current_status: int) -> UpdateO
             and not isinstance(at, bool)
             and 0 <= host.now_unix() - at <= FALLBACK_RECORD_MAX_AGE_SECONDS
         )
+        stalled: str | None = None
         if (
             current_status == EXIT_REFUSED
             and fresh
@@ -1302,60 +1585,102 @@ def fallback_to_previous(host: MinerUpdaterHost, current_status: int) -> UpdateO
             and last.get("exit_status") == current_status
             and last.get("verified") is True
         ):
-            return UpdateOutcome(
-                "refused",
-                "the current updater verified the channel, so its refusal stands",
-                EXIT_REFUSED,
-                verified=True,
-                recorded=True,
-            )
+            offered = last.get("updater_offered")
+            failed = state["failed_updaters"]
+            assert isinstance(failed, dict)
+            if (
+                last.get("updater_blame") == "ambiguous"
+                and isinstance(offered, str)
+                and _TREE_RE.fullmatch(offered) is not None
+                and offered != current_tree
+                and offered not in failed
+            ):
+                stalled = offered
+            else:
+                return UpdateOutcome(
+                    "refused",
+                    "the current updater verified the channel, so its refusal stands",
+                    EXIT_REFUSED,
+                    verified=True,
+                    recorded=True,
+                )
         entry: dict[str, object] = {
             "at": host.now_unix(),
             "current_tree": current_tree,
             "current_status": current_status,
         }
         try:
-            release = _dry_run(host, state)
+            release, raw = _judge(host, state)
+            if stalled is not None:
+                if release.bundle.tree_sha256 != stalled:
+                    raise MinerUpdateError("the record names another updater than the one it could not install")
+                _probe_as_fallback(host, release, raw)
         except MinerUpdateError as exc:
+            if stalled is not None:
+                state["last_fallback"] = dict(entry, result="the new updater fails here too", reason=str(exc)[:300])
+                write_state(paths.state_file, state)
+                return UpdateOutcome(
+                    "refused",
+                    f"updater {stalled[:12]} fails for this updater too ({exc}); the current "
+                    "updater's refusal stands",
+                    EXIT_REFUSED,
+                    verified=True,
+                    recorded=True,
+                )
             state["last_fallback"] = dict(entry, result="the channel could not be verified", reason=str(exc)[:300])
             write_state(paths.state_file, state)
-            return UpdateOutcome(
-                "refused",
-                f"the previous updater cannot verify the channel either ({exc}); "
-                "the current updater stays",
-                passthrough,
-                recorded=True,
+            return _escalate(
+                host,
+                UpdateOutcome(
+                    "refused",
+                    f"the previous updater cannot verify what the current updater saw either ({exc}); "
+                    "the current updater stays",
+                    passthrough,
+                    recorded=True,
+                ),
             )
-        count = (
-            _strike(host, state, current_tree, f"exit status {current_status} while the previous updater verified the channel")
-            if current_tree
-            else STRIKES_TO_DEMOTE
+        failure = (
+            f"it could not install updater {stalled[:12]}, which this updater's probe accepts"
+            if stalled is not None
+            else f"exit status {current_status} while the previous updater verified the channel"
         )
+        if stalled is not None:
+            _forgive(state, stalled)
+        count = _strike(host, state, current_tree, failure) if current_tree else STRIKES_TO_DEMOTE
         if count < STRIKES_TO_DEMOTE:
-            state["last_fallback"] = dict(entry, result=f"strike {count} of {STRIKES_TO_DEMOTE}")
+            state["last_fallback"] = dict(entry, result=f"strike {count} of {STRIKES_TO_DEMOTE}", reason=failure)
             write_state(paths.state_file, state)
-            return UpdateOutcome(
-                "refused",
-                f"the current updater failed (exit status {current_status}) while the previous "
-                f"updater verified sequence {release.sequence}; strike {count} of {STRIKES_TO_DEMOTE}",
-                passthrough,
-                verified=True,
-                recorded=True,
+            return _escalate(
+                host,
+                UpdateOutcome(
+                    "refused",
+                    f"the current updater failed ({failure}; sequence {release.sequence}); "
+                    f"strike {count} of {STRIKES_TO_DEMOTE}",
+                    passthrough,
+                    verified=True,
+                    recorded=True,
+                ),
             )
         atomic_symlink(paths.updater_current, f"releases/{host.running_tree}")
         remove_link(paths.updater_previous)
-        state["last_fallback"] = dict(entry, result="switched back to the previous updater")
+        state["last_fallback"] = dict(entry, result="switched back to the previous updater", reason=failure)
         write_state(paths.state_file, state)
         host.verified = True
         return UpdateOutcome(
             "demoted",
-            f"updater {str(current_tree)[:12]} failed {STRIKES_TO_DEMOTE} checks while this updater "
-            f"verified the channel; switched back to updater {host.running_tree[:12]}",
+            f"updater {str(current_tree)[:12]} failed {STRIKES_TO_DEMOTE} checks ({failure}); "
+            f"switched back to updater {host.running_tree[:12]}",
             EXIT_ALERT,
             alert=True,
         )
 
-    return _locked(host, body)
+    outcome = _locked(host, body)
+    if outcome.exit_status == EXIT_REFUSED and passthrough != EXIT_REFUSED:
+        # The fallback could not run (the lock is busy, the links moved, the
+        # state is unreadable): the current updater's own status stands, so a
+        # fault still pages.
+        outcome = dataclasses.replace(outcome, exit_status=passthrough)
+    return outcome
 
 
 def probe_release(host: MinerUpdaterHost, raw: bytes) -> dict[str, object]:
@@ -1455,11 +1780,10 @@ def _commit(
     target: str,
     *,
     schema_verified: bool,
-    restarts: int | None,
 ) -> None:
     miner = state["miner"]
     assert isinstance(miner, dict)
-    miner["current"] = dict(summary, target=target, schema_verified=schema_verified, restarts=restarts)
+    miner["current"] = dict(summary, target=target, schema_verified=schema_verified)
     miner["stage"] = None
     miner["pending"] = None
     state["failed"] = None
@@ -1474,8 +1798,56 @@ def _clear_stage(host: MinerUpdaterHost, state: dict[str, object]) -> None:
     write_state(host.paths.state_file, state)
 
 
-def _operator_stopped(host: MinerUpdaterHost) -> bool:
-    return host.unit_state() in ("inactive", "deactivating")
+def _unit_inactive(host: MinerUpdaterHost) -> bool:
+    return host.unit_state() in INACTIVE_UNIT_STATES
+
+
+INACTIVE_REASON = (
+    "the miner unit is inactive: stopped by hand without `pause`, or exited cleanly "
+    "under a unit without Restart=always. Start it, or run `cathedral-miner-update pause` "
+    "if the stop is meant"
+)
+
+
+def _miner_health(host: MinerUpdaterHost, state: dict[str, object]) -> str | None:
+    """What is wrong with the miner that ``miner/current`` selects, or None.
+
+    Inactive, not running steadily, running another image, or restarted since
+    the last check. The restart baseline is kept in ``state`` (not written).
+    """
+
+    active = link_target(host.paths.miner_current)
+    if active is None:
+        return "miner/current is missing"
+    try:
+        profile = read_activation_profile(host.paths, active)
+    except MinerUpdateError as exc:
+        return str(exc)
+    unit = host.unit_state()
+    if unit in INACTIVE_UNIT_STATES:
+        return INACTIVE_REASON
+    container = str(profile["container"])
+    # Wait for the dwell only when the miner may be coming up; a unit that has
+    # failed, with no container, is plainly down.
+    seen = host.observe(container)
+    if seen is None and unit not in ("active", "activating", "reloading"):
+        return f"the miner is not running (unit {unit})"
+    seen = host.settle(container)
+    if seen is None or not seen.active:
+        return f"the miner is not running steadily (unit {host.unit_state()})"
+    expected = profile.get("image")
+    if isinstance(expected, str) and seen.image != expected:
+        return f"the miner runs {seen.image}, not the selected release's {expected}"
+    baseline = state.get("miner_health")
+    state["miner_health"] = {"target": active, "restarts": seen.restarts}
+    if (
+        isinstance(baseline, dict)
+        and baseline.get("target") == active
+        and isinstance(baseline.get("restarts"), int)
+        and seen.restarts > baseline["restarts"]
+    ):
+        return f"the miner restarted {seen.restarts - baseline['restarts']} times since the last check"
+    return None
 
 
 def _confirm_current(
@@ -1487,38 +1859,52 @@ def _confirm_current(
 ) -> UpdateOutcome:
     """The miner already selects this release. Say so only if it is running it steadily."""
 
+    del profile
     summary = release.summary()
     miner = state["miner"]
     assert isinstance(miner, dict)
     committed = miner.get("current") if isinstance(miner.get("current"), dict) else {}
     same = committed.get("target") == target
     schema_verified = bool(committed.get("schema_verified")) if same else False
-    baseline = committed.get("restarts") if same else None
-    if _operator_stopped(host):
-        _commit(host, state, summary, target, schema_verified=schema_verified, restarts=baseline)
+    problem = _miner_health(host, state)
+    _commit(host, state, summary, target, schema_verified=schema_verified)
+    if problem is not None:
         return UpdateOutcome(
-            "current", "the miner selects this release; its unit is stopped by its operator", release=summary
-        )
-    seen = host.settle(profile.container)
-    if seen is None or not seen.active or seen.image != release.image:
-        _commit(host, state, summary, target, schema_verified=schema_verified, restarts=baseline)
-        return UpdateOutcome(
-            "unhealthy",
-            f"the miner selects this release but is not running it steadily (unit {host.unit_state()})",
-            EXIT_ALERT,
-            release=summary,
-            alert=True,
-        )
-    _commit(host, state, summary, target, schema_verified=schema_verified, restarts=seen.restarts)
-    if isinstance(baseline, int) and seen.restarts > baseline:
-        return UpdateOutcome(
-            "unhealthy",
-            f"the miner restarted {seen.restarts - baseline} times since the last check",
-            EXIT_ALERT,
-            release=summary,
-            alert=True,
+            "unhealthy", f"the miner selects this release, but {problem}", EXIT_ALERT, release=summary, alert=True
         )
     return UpdateOutcome("current", "the miner runs this release's image and launcher", release=summary)
+
+
+def _refuse_schema_decrease(host: MinerUpdaterHost, state: dict[str, object], release: MinerRelease, active: str) -> None:
+    """Schemas never go down, not even after `resolve --abandon` (activation re-review P2).
+
+    The floor is the highest verified schema of any release that reached
+    ``may_have_run`` here, since that image may have migrated the state. Only
+    that same image may declare less.
+    """
+
+    floors: list[tuple[int, object]] = []
+    high_water = state.get("schema_high_water")
+    if isinstance(high_water, dict) and isinstance(high_water.get("schema"), int):
+        floors.append((high_water["schema"], high_water.get("image")))
+    miner = state["miner"]
+    assert isinstance(miner, dict)
+    committed = miner.get("current")
+    if (
+        isinstance(committed, dict)
+        and committed.get("target") == active
+        and committed.get("schema_verified") is True
+        and isinstance(committed.get("state_schema"), int)
+    ):
+        floors.append((committed["state_schema"], committed.get("image")))
+    for schema, image in floors:
+        if release.state_schema < schema and release.image != image:
+            # Not remembered as a failure: this is checked before any pull,
+            # and the same image may come back declaring the right schema.
+            raise MinerUpdateError(
+                f"the release declares state schema {release.state_schema}, lower than {schema}, "
+                f"which {image} may already have written here; schemas never go down"
+            )
 
 
 def _activate(host: MinerUpdaterHost, state: dict[str, object], release: MinerRelease) -> UpdateOutcome:
@@ -1536,26 +1922,16 @@ def _activate(host: MinerUpdaterHost, state: dict[str, object], release: MinerRe
 
     miner = state["miner"]
     assert isinstance(miner, dict)
-    committed = miner.get("current")
-    if (
-        isinstance(committed, dict)
-        and committed.get("target") == active
-        and committed.get("schema_verified") is True
-        and isinstance(committed.get("state_schema"), int)
-        and release.state_schema < committed["state_schema"]
-        and release.image != committed.get("image")
-    ):
-        _remember_failure(host, state, summary, reason="it lowers the durable-state schema")
-        raise MinerUpdateError(
-            f"the release declares state schema {release.state_schema}, lower than the running "
-            f"release's {committed['state_schema']}; schemas never go down"
-        )
+    _refuse_schema_decrease(host, state, release, active)
 
-    if _operator_stopped(host):
+    if _unit_inactive(host):
+        # Never start a miner that is not running: defer, and page.
         return UpdateOutcome(
             "deferred",
-            "the miner unit is stopped; an update does not start a miner its operator stopped",
+            f"{INACTIVE_REASON}; an update never starts a stopped miner",
+            EXIT_ALERT,
             release=summary,
+            alert=True,
         )
     if not host.safe_to_activate():
         return UpdateOutcome("deferred", "the miner is not at a safe point to restart", release=summary)
@@ -1612,6 +1988,10 @@ def _activate(host: MinerUpdaterHost, state: dict[str, object], release: MinerRe
     # including by systemd's own restart policy or a reboot.
     miner["stage"] = STAGE_MAY_HAVE_RUN
     pending["flip_unix"] = host.now_unix()
+    if pending["schema_verified"] is True:
+        high_water = state.get("schema_high_water")
+        if not isinstance(high_water, dict) or release.state_schema > int(high_water.get("schema") or 0):
+            state["schema_high_water"] = {"schema": release.state_schema, "image": release.image}
     write_state(paths.state_file, state)
     atomic_symlink(paths.miner_current, target)
     return _prove_start(host, state, pending, _start(host))
@@ -1658,11 +2038,7 @@ def _prove_start(
             and again.started_at == seen.started_at
             and again.restarts == seen.restarts
         ):
-            pending["probation"] = {
-                "started_at": seen.started_at,
-                "restarts": seen.restarts,
-                "boot_id": host.boot_id(),
-            }
+            pending["probation"] = _new_probation(host, seen, None)
             miner = state["miner"]
             assert isinstance(miner, dict)
             miner["stage"] = STAGE_PROBATION
@@ -1670,8 +2046,8 @@ def _prove_start(
             write_state(host.paths.state_file, state)
             return UpdateOutcome(
                 "activated",
-                "the released image is running; it is on probation until the next check "
-                "sees the same container still up",
+                "the released image is running; it is on probation until a check at least "
+                f"{PROBATION_MINIMUM_SECONDS // 60} minutes later sees the same container still up",
                 release=release,
             )
         detail = "the released image did not stay up through a second look"
@@ -1755,10 +2131,32 @@ def _valid_pending(pending: object) -> bool:
     )
 
 
+def _new_probation(
+    host: MinerUpdaterHost, seen: Observation, previous: Mapping[str, object] | None
+) -> dict[str, object]:
+    forgiven = previous.get("restarts_forgiven") if previous is not None else 0
+    return {
+        "started_at": seen.started_at,
+        "restarts": seen.restarts,
+        "boot_id": host.boot_id(),
+        "entered_unix": host.now_unix(),
+        "restarts_forgiven": forgiven if isinstance(forgiven, int) else 0,
+    }
+
+
 def _confirm_probation(
     host: MinerUpdaterHost, state: dict[str, object], pending: dict[str, object]
 ) -> UpdateOutcome | None:
-    """Commit a release that stayed up since the last check, or roll it back."""
+    """Commit a release that stayed up long enough, restart probation, or roll it back.
+
+    - Committed only when the same container (StartedAt and NRestarts) is
+      still up, and probation began at least ``PROBATION_MINIMUM_SECONDS`` ago.
+    - A reboot, or one container restart (a docker daemon restart, say),
+      restarts probation instead of failing a good release.
+    - An inactive unit alerts and leaves probation as it is: a rollback would
+      start a miner that is not running.
+    - Anything else goes to the rollback rule.
+    """
 
     probation = pending.get("probation")
     release = pending["release"]
@@ -1771,22 +2169,22 @@ def _confirm_probation(
         raise MinerUpdateHalted(
             f"miner/current changed during probation ({active!r}); resolve it explicitly"
         )
+    if _unit_inactive(host):
+        return UpdateOutcome(
+            "unhealthy",
+            f"{INACTIVE_REASON}. The release stays on probation: rolling it back would start the miner",
+            EXIT_ALERT,
+            release=release,
+            alert=True,
+        )
     if host.boot_id() != probation.get("boot_id"):
         # The host rebooted, so the container restarted legitimately. Look
         # again and restart probation rather than judge a new container.
         seen = host.settle(container)
         if seen is not None and seen.active and seen.image == release.get("image"):
-            pending["probation"] = {
-                "started_at": seen.started_at,
-                "restarts": seen.restarts,
-                "boot_id": host.boot_id(),
-            }
+            pending["probation"] = _new_probation(host, seen, probation)
             write_state(host.paths.state_file, state)
-            return UpdateOutcome(
-                "activated",
-                "the host rebooted during probation; probation restarted",
-                release=release,
-            )
+            return UpdateOutcome("probation", "the host rebooted during probation; probation restarted", release=release)
         return _fail(host, state, pending, "the release did not come back after a reboot")
     seen = host.observe(container)
     if (
@@ -1796,20 +2194,36 @@ def _confirm_probation(
         and seen.started_at == probation.get("started_at")
         and seen.restarts == probation.get("restarts")
     ):
-        _commit(
-            host,
-            state,
-            release,
-            str(pending["target"]),
-            schema_verified=pending.get("schema_verified") is True,
-            restarts=seen.restarts,
-        )
+        entered = probation.get("entered_unix")
+        age = host.now_unix() - (entered if isinstance(entered, int) else 0)
+        if age < PROBATION_MINIMUM_SECONDS:
+            return UpdateOutcome(
+                "probation",
+                f"on probation for {age} s of {PROBATION_MINIMUM_SECONDS} s; a later check commits it",
+                release=release,
+            )
+        _commit(host, state, release, str(pending["target"]), schema_verified=pending.get("schema_verified") is True)
         return None
-    if _operator_stopped(host):
+    # The container changed. One restart restarts probation, as a reboot does.
+    forgiven = probation.get("restarts_forgiven")
+    forgiven = forgiven if isinstance(forgiven, int) else 0
+    baseline = probation.get("restarts")
+    again = host.settle(container)
+    if (
+        forgiven < PROBATION_RESTARTS_FORGIVEN
+        and again is not None
+        and again.active
+        and again.image == release.get("image")
+        # One automatic restart at most; a restart by hand resets the count.
+        and isinstance(baseline, int)
+        and again.restarts - baseline <= 1
+    ):
+        renewed = _new_probation(host, again, probation)
+        renewed["restarts_forgiven"] = forgiven + 1
+        pending["probation"] = renewed
+        write_state(host.paths.state_file, state)
         return UpdateOutcome(
-            "deferred",
-            "the miner was stopped by its operator during probation; the release is not yet committed",
-            release=release,
+            "probation", "the miner restarted once during probation; probation restarted", release=release
         )
     return _fail(host, state, pending, "the release did not stay up through probation")
 
@@ -1942,7 +2356,6 @@ def resolve(host: MinerUpdaterHost, action: str) -> UpdateOutcome:
                 release,
                 str(pending["target"]),
                 schema_verified=pending.get("schema_verified") is True,
-                restarts=seen.restarts,
             )
             return UpdateOutcome("resolved", "the running release was accepted as current")
         if action == "restore-previous":
@@ -2001,6 +2414,9 @@ def describe_status(paths: HostPaths, config: HostConfig | None, *, expected_uid
         "last_check": last,
         "last_refusal": state.get("last_refusal"),
         "consecutive_deferrals": state.get("consecutive_deferrals"),
+        "consecutive_unverified": state.get("consecutive_unverified"),
+        "schema_high_water": state.get("schema_high_water"),
+        "last_fetch": state.get("last_fetch"),
         "failed": state.get("failed"),
         "floors": state.get("floors"),
     }
@@ -2009,6 +2425,8 @@ def describe_status(paths: HostPaths, config: HostConfig | None, *, expected_uid
 __all__ = [
     "CONFIG_SCHEMA",
     "DEFERRAL_ALERT_AFTER",
+    "PROBATION_MINIMUM_SECONDS",
+    "UNVERIFIED_ALERT_AFTER",
     "DOCUMENTED_EXIT_STATUSES",
     "DROPIN_NAME",
     "EXIT_ALERT",
@@ -2025,6 +2443,7 @@ __all__ = [
     "STATE_SCHEMA_LABEL",
     "STRIKES_TO_DEMOTE",
     "GateImpossible",
+    "TrustSetUnavailable",
     "HostConfig",
     "HostPaths",
     "MinerUpdateError",
@@ -2050,6 +2469,7 @@ __all__ = [
     "resolve",
     "rollback_allowed",
     "stage_activation",
+    "trust_backup_path",
     "update_once",
     "write_state",
     "write_trust_state",

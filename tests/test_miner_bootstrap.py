@@ -68,7 +68,9 @@ def _keys_sha256(source: Path) -> str:
     return hashlib.sha256((source / "deploy/miner-update/release-keys.json").read_bytes()).hexdigest()
 
 
-def _install(source: Path, root: Path, *, exec_start: Path | None = None, **config):
+def _install(
+    source: Path, root: Path, *, exec_start: Path | None = None, repair_trust_set: bool = False, **config
+):
     calls: list[tuple[str, ...]] = []
     launcher = exec_start or find_launcher(REPO_ROOT, SNP_MINER)
     report = install(
@@ -78,6 +80,7 @@ def _install(source: Path, root: Path, *, exec_start: Path | None = None, **conf
         config=HostConfig.from_document(config_document(**config)),
         unit_exec_start=lambda unit: launcher,
         systemctl=lambda arguments: calls.append(tuple(arguments)),
+        repair_trust_set=repair_trust_set,
     )
     return report, calls
 
@@ -204,6 +207,48 @@ def test_a_revocation_holds_even_if_the_rest_of_the_bootstrap_fails(source, tmp_
     with pytest.raises(OSError):
         _install(source, root)
     assert "stable-1" not in load_trust_state(paths.trust_file, expected_uid=os.getuid()).keys
+
+
+def _compromise_and_rebootstrap(source, root):
+    _install(source, root)
+    replaced = {"canary-1": DEFAULT_TRUST["canary-1"], "stable-2": (OTHER_KEY, ["stable"])}
+    (source / "deploy/miner-update/release-keys.json").write_bytes(trust_root_bytes(replaced))
+    _install(source, root)
+
+
+def test_a_corrupt_trust_set_is_repaired_only_forward_from_its_backup(source, tmp_path):
+    """Trust re-review P3: deleting a corrupt trust.json was the only way out,
+    and it forgot every revocation."""
+
+    from cathedral.miner_updater import load_trust_state, trust_backup_path
+
+    root = tmp_path / "root"
+    _compromise_and_rebootstrap(source, root)
+    paths = HostPaths(root=root)
+    assert "stable-1" not in load_trust_state(trust_backup_path(paths.trust_file), expected_uid=os.getuid()).keys
+    paths.trust_file.write_text("corrupt")
+    with pytest.raises(BootstrapError, match="--repair-trust-set"):
+        _install(source, root)
+    # The repair moves forward from the backup, so the revoked key stays revoked...
+    (source / "deploy/miner-update/release-keys.json").write_bytes(trust_root_bytes())
+    with pytest.raises(BootstrapError, match="revoked key"):
+        _install(source, root, repair_trust_set=True)
+    # ...and a root without it repairs the host, keeping the revocation.
+    replaced = {"canary-1": DEFAULT_TRUST["canary-1"], "stable-2": (OTHER_KEY, ["stable"])}
+    (source / "deploy/miner-update/release-keys.json").write_bytes(trust_root_bytes(replaced))
+    report, _ = _install(source, root, repair_trust_set=True)
+    assert report["revoked_keys"] == ["stable-1"]
+    assert "stable-1" not in load_trust_state(paths.trust_file, expected_uid=os.getuid()).keys
+
+
+def test_a_deleted_trust_set_does_not_start_over_while_a_backup_exists(source, tmp_path):
+    root = tmp_path / "root"
+    _compromise_and_rebootstrap(source, root)
+    paths = HostPaths(root=root)
+    paths.trust_file.unlink()
+    (source / "deploy/miner-update/release-keys.json").write_bytes(trust_root_bytes())
+    with pytest.raises(BootstrapError, match="--repair-trust-set"):
+        _install(source, root)
 
 
 def test_the_minimum_sequence_has_no_default():

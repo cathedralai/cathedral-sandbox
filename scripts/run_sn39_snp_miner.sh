@@ -120,7 +120,7 @@ docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1 \
 if ! docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
     "${IMAGE_PREFIX}${image_digest}" 2>/dev/null \
   | grep -Fx -- "${IMAGE_PREFIX}${image_digest}" >/dev/null; then
-  docker pull --platform linux/amd64 "${SN39_SNP_MINER_IMAGE}"
+  docker pull --platform linux/amd64 "${IMAGE_PREFIX}${image_digest}"
 fi
 repo_digests="$(
   docker image inspect \

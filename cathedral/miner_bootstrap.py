@@ -54,6 +54,7 @@ from cathedral.miner_products import (
 from cathedral.miner_release import (
     MinerReleaseError,
     canonical_json,
+    TrustState,
     initial_trust_state,
     load_trust_root,
     rotate_trust,
@@ -67,6 +68,7 @@ from cathedral.miner_updater import (
     _atomic_write,
     load_trust_state,
     read_activation_profile,
+    trust_backup_path,
     write_trust_state,
 )
 
@@ -96,6 +98,39 @@ def _write_readonly(path: Path, body: bytes) -> None:
     os.chmod(path, 0o444)
 
 
+def _forward_trust(paths: HostPaths, trust_bytes: bytes, *, uid: int, repair: bool) -> TrustState:
+    """The host trust set, moved forward to the pinned root, or a refusal.
+
+    A host that has a trust set, or a backup of one, never starts over: that
+    would forget its revocations. If ``trust.json`` is unreadable, only
+    ``--repair-trust-set`` goes on, and only forward from the verified backup.
+    """
+
+    backup = trust_backup_path(paths.trust_file)
+    if not paths.trust_file.exists() and not backup.exists():
+        return initial_trust_state(trust_bytes)
+    try:
+        start = load_trust_state(paths.trust_file, expected_uid=uid)
+    except MinerUpdateError as exc:
+        if not repair:
+            raise BootstrapError(
+                f"this host's trust set is unreadable ({exc}). Run again with --repair-trust-set "
+                f"to move forward from its verified backup, {backup}. Deleting it would forget "
+                "every revoked key"
+            ) from exc
+        try:
+            start = load_trust_state(backup, expected_uid=uid)
+        except MinerUpdateError as backup_exc:
+            raise BootstrapError(
+                f"neither the trust set nor its backup can be read ({backup_exc}); see "
+                "docs/MINER_AUTO_UPDATE.md, \"Repairing the trust set\""
+            ) from backup_exc
+    try:
+        return rotate_trust(start, trust_bytes)
+    except MinerReleaseError as exc:
+        raise BootstrapError(f"the pinned trust root cannot replace this host's trust set: {exc}") from exc
+
+
 def install(
     source: Path,
     *,
@@ -104,6 +139,7 @@ def install(
     config: HostConfig,
     unit_exec_start: Callable[[str], Path],
     systemctl: Callable[[Sequence[str]], None],
+    repair_trust_set: bool = False,
 ) -> dict[str, object]:
     product = product_by_name(config.product)
 
@@ -131,13 +167,7 @@ def install(
     # the pinned root drops, and refuses a root that lists a revoked key, so a
     # key removed after a compromise is never trusted again on this host.
     uid = os.getuid()
-    if paths.trust_file.exists():
-        try:
-            trust = rotate_trust(load_trust_state(paths.trust_file, expected_uid=uid), trust_bytes)
-        except (MinerReleaseError, MinerUpdateError) as exc:
-            raise BootstrapError(f"the pinned trust root cannot replace this host's trust set: {exc}") from exc
-    else:
-        trust = initial_trust_state(trust_bytes)
+    trust = _forward_trust(paths, trust_bytes, uid=uid, repair=repair_trust_set)
 
     # 2. The launcher the miner unit runs today becomes the legacy release. A
     #    unit that already runs the managed launcher (the shipped example units
@@ -274,6 +304,11 @@ def main(argv: list[str] | None = None) -> int:
     install_parser.add_argument("--channel-url", required=True)
     install_parser.add_argument("--miner-unit", required=True)
     install_parser.add_argument("--minimum-sequence", required=True, type=int)
+    install_parser.add_argument(
+        "--repair-trust-set",
+        action="store_true",
+        help="rebuild an unreadable trust.json from its verified backup, moving only forward",
+    )
     arguments = parser.parse_args(argv)
     if re.fullmatch(r"[0-9a-f]{64}", arguments.keys_sha256) is None:
         parser.error("--keys-sha256 must be 64 lowercase hex characters")
@@ -299,6 +334,7 @@ def main(argv: list[str] | None = None) -> int:
             config=config,
             unit_exec_start=unit_exec_start,
             systemctl=lambda args: _systemctl(list(args)) and None,
+            repair_trust_set=arguments.repair_trust_set,
         )
     except (BootstrapError, MinerUpdateError, LauncherProfileError, OSError) as exc:
         print(f"refusing to install: {exc}", file=sys.stderr)

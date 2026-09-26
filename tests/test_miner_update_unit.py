@@ -175,6 +175,9 @@ def test_the_miner_dropin_selects_the_active_release():
     current = HostPaths().miner_current
     assert dropin["ExecStart"] == ["", str(current / "launcher")]
     assert dropin["EnvironmentFile"] == [str(current / "release.env")]
+    # Activation re-review P1: a clean exit (143) must not leave the miner
+    # stopped, so only `systemctl stop` makes the unit inactive.
+    assert dropin["Restart"] == ["always"]
 
 
 # --- the sandbox, emulated ----------------------------------------------------------------

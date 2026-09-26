@@ -23,6 +23,8 @@ import pytest
 from cathedral.miner_update_cli import MINIMUM_ACCESS_REMAINING_SECONDS, safe_to_activate
 from cathedral.miner_updater import (
     DEFERRAL_ALERT_AFTER,
+    PROBATION_MINIMUM_SECONDS,
+    UNVERIFIED_ALERT_AFTER,
     EXIT_ALERT,
     EXIT_HALTED,
     EXIT_REFUSED,
@@ -314,9 +316,101 @@ def test_a_miner_its_operator_stopped_is_not_started(h):
     h.running[h.profile.container] = None
     h.release(sequence=5)
     outcome = h.check()
-    assert outcome.action == "deferred" and "operator stopped" in outcome.reason
+    assert outcome.action == "deferred" and "never starts a stopped miner" in outcome.reason
+    # An inactive miner on a host that is not paused pages (activation re-review P1).
+    assert outcome.exit_status == EXIT_ALERT
     assert h.restarts() == 0
     assert h.running_image() is None
+
+
+# --- nothing fails silently (activation re-review P2) --------------------------------------
+
+
+def test_a_dead_miner_after_a_rollback_alerts_although_the_check_only_refuses(h):
+    """Probe A9: the channel still offers the failed release; the refusal is quiet,
+    the dead miner is not."""
+
+    _activate_first(h)
+    bad = h.image("3")
+    h.broken_images.add(bad)
+    h.release(sequence=6, image=bad)
+    assert h.check().action == "rolled_back"
+    h.running[h.profile.container] = None
+    h.now += 86400
+    h.release(sequence=7, image=bad)
+    outcome = h.check()
+    assert outcome.action == "unhealthy" and outcome.exit_status == EXIT_ALERT
+    assert "already failed" in outcome.reason
+
+
+def test_a_dead_miner_on_a_pinned_host_alerts(h):
+    _activate_first(h)
+    h.paths.pin_file.write_bytes(pin_document(h.state()["miner"]["current"]))
+    h.release(sequence=6, image=h.image("5"))
+    assert h.check().action == "held"
+    h.running[h.profile.container] = None
+    h.now += 3600
+    outcome = h.check()
+    assert outcome.action == "unhealthy" and outcome.exit_status == EXIT_ALERT and "held" in outcome.reason
+
+
+def test_a_restart_on_a_quiet_host_alerts_once(h):
+    _activate_first(h)
+    h.paths.pin_file.write_bytes(pin_document(h.state()["miner"]["current"]))
+    h.release(sequence=6, image=h.image("5"))
+    assert h.check().action == "held"
+    h.nrestarts += 1
+    assert h.check().action == "unhealthy"
+    assert h.check().action == "held"
+
+
+def test_an_expired_channel_alerts_after_six_checks(h):
+    """Probe A11: the signer stopped re-signing. Refusals succeed, but not forever."""
+
+    _activate_first(h)
+    h.now += 30 * DAY
+    statuses = []
+    for _ in range(UNVERIFIED_ALERT_AFTER):
+        h.now += 3600
+        statuses.append(h.check().exit_status)
+    assert statuses[:-1] == [EXIT_REFUSED] * (UNVERIFIED_ALERT_AFTER - 1)
+    assert statuses[-1] == EXIT_ALERT
+    assert h.state()["consecutive_unverified"] == UNVERIFIED_ALERT_AFTER
+    h.release(sequence=6)
+    assert h.check().verified is True
+    assert h.state()["consecutive_unverified"] == 0
+
+
+def test_a_withheld_channel_alerts_after_six_checks(h):
+    _activate_first(h)
+
+    def withheld():
+        raise MinerUpdateError("the server answered 404")
+
+    outcomes = [h.check(fetch_metadata=withheld) for _ in range(UNVERIFIED_ALERT_AFTER)]
+    assert outcomes[-1].exit_status == EXIT_ALERT and "no verified channel record" in outcomes[-1].reason
+
+
+def test_a_lost_or_corrupt_trust_set_alerts_at_once(h):
+    _activate_first(h)
+    h.paths.trust_file.write_text("{}")
+    h.release(sequence=6)
+    outcome = h.check()
+    assert outcome.exit_status == EXIT_ALERT and "--repair-trust-set" in outcome.reason
+    h.paths.trust_file.unlink()
+    assert h.check().exit_status == EXIT_ALERT
+
+
+def test_every_check_keeps_a_current_backup_of_the_trust_set(h):
+    from cathedral.miner_updater import load_trust_state, trust_backup_path
+
+    backup = trust_backup_path(h.paths.trust_file)
+    backup.unlink()
+    h.release(sequence=5)
+    h.check()
+    assert load_trust_state(backup, expected_uid=os.getuid()).as_document() == load_trust_state(
+        h.paths.trust_file, expected_uid=os.getuid()
+    ).as_document()
 
 
 # --- pause and pin --------------------------------------------------------------------------
@@ -423,17 +517,98 @@ def test_a_release_that_dies_before_the_next_check_is_rolled_back_not_committed(
     assert h.running_image() == h.new_image
 
 
-def test_a_new_container_during_probation_is_not_committed(h):
-    """Same restart count, but a different container: something restarted it."""
+def test_a_new_container_during_probation_restarts_probation_once(h):
+    """Activation re-review P2 (probes A1, A1b): one restart, a docker daemon
+    restart say, restarts probation; a second one fails the release."""
 
     _activate_first(h)
     h.release(sequence=6, image=h.image("3"))
     assert h.check().action == "activated"
     h.started[h.profile.container] += 1800
+    h.nrestarts += 1
+    h.now += 3600
+    outcome = h.check()
+    assert outcome.action == "probation" and "restarted once" in outcome.reason
+    assert stage(h) == STAGE_PROBATION and h.state()["failed"] is None
+    h.started[h.profile.container] += 1800
     h.now += 3600
     outcome = h.check()
     assert outcome.action == "rolled_back", outcome.reason
     assert h.state()["miner"]["current"]["image"] == h.new_image
+
+
+def test_a_restarted_schema_bump_is_not_halted(h):
+    """Probe A1b: the same restart during a schema-bump probation must not halt."""
+
+    _activate_first(h)
+    h.release(sequence=6, image=h.image("3"), state_schema=2)
+    assert h.check().action == "activated"
+    h.started[h.profile.container] += 900
+    h.nrestarts += 1
+    h.now += 3600
+    assert h.check().action == "probation"
+    h.now += 3600
+    assert h.check().action == "current"
+    assert h.state()["miner"]["current"]["image"] == h.image("3")
+
+
+def test_probation_commits_only_after_its_minimum_age(h):
+    """Probe A12: a second `check` right after the first cannot commit."""
+
+    _activate_first(h)
+    h.release(sequence=6, image=h.image("3"))
+    assert h.check().action == "activated"
+    h.now += 5
+    outcome = h.check()
+    assert outcome.action == "probation" and stage(h) == STAGE_PROBATION
+    assert h.state()["miner"]["current"]["image"] == h.new_image
+    h.now += PROBATION_MINIMUM_SECONDS
+    assert h.check().action == "current"
+    assert h.state()["miner"]["current"]["image"] == h.image("3")
+
+
+def test_an_inactive_miner_during_probation_alerts_and_is_not_rolled_back(h):
+    """Probe A10: a clean exit, or a stop without `pause`, pages at once."""
+
+    _activate_first(h)
+    h.release(sequence=6, image=h.image("3"))
+    assert h.check().action == "activated"
+    h.running[h.profile.container] = None
+    h.operator_stopped = True
+    restarts = h.restarts()
+    h.now += 3600
+    outcome = h.check()
+    assert outcome.action == "unhealthy" and outcome.exit_status == EXIT_ALERT
+    assert "without `pause`" in outcome.reason
+    assert stage(h) == STAGE_PROBATION and h.restarts() == restarts
+
+
+def test_an_inactive_committed_miner_alerts(h):
+    """Probe A10b: `current` with an inactive unit is not success."""
+
+    _activate_first(h)
+    h.running[h.profile.container] = None
+    h.operator_stopped = True
+    h.now += 3600
+    outcome = h.check()
+    assert outcome.action == "unhealthy" and outcome.exit_status == EXIT_ALERT
+    assert "without `pause`" in outcome.reason
+
+
+def test_a_committed_release_running_another_image_alerts(h):
+    _activate_first(h)
+    h.running[h.profile.container] = h.image("9")  # started by hand, outside the updater
+    outcome = h.check()
+    assert outcome.action == "unhealthy" and h.image("9") in outcome.reason
+
+
+def test_a_paused_host_does_not_alert_on_a_stopped_miner(h):
+    _activate_first(h)
+    h.running[h.profile.container] = None
+    h.operator_stopped = True
+    h.paths.pause_file.write_text("maintenance\n")
+    outcome = h.check()
+    assert outcome.action == "paused" and outcome.exit_status == 0
 
 
 def test_a_committed_release_that_later_dies_alerts(h):
@@ -461,7 +636,7 @@ def test_a_reboot_during_probation_restarts_probation(h):
     h.boot = "boot-2"
     h.started[h.profile.container] += 5000
     outcome = h.check()
-    assert outcome.action == "activated" and "rebooted" in outcome.reason
+    assert outcome.action == "probation" and "rebooted" in outcome.reason
     assert stage(h) == STAGE_PROBATION
     h.now += 3600
     assert h.check().action == "current"
@@ -913,6 +1088,38 @@ def test_a_halted_host_still_takes_a_newer_updater(h):
     h.release(sequence=7, image=h.image("3"), state_schema=2, bundle={"launcher_suffix": b"# fix\n"})
     h.check()
     assert h.updater_current() != before
+
+
+def test_abandon_remembers_the_release_as_failed(h):
+    """Kills the re-review's surviving mutant: a re-signed copy of an abandoned
+    release is not tried again."""
+
+    _halt_on_schema_bump(h)
+    resolve(h.host(), "abandon")
+    assert h.state()["failed"]["image"] == h.image("3")
+    h.release(sequence=7, image=h.image("3"), state_schema=2)
+    outcome = h.check()
+    assert "already failed" in outcome.reason and "abandoned" in outcome.reason
+
+
+def test_abandon_does_not_lower_the_schema_floor(h):
+    """Probe A4: the abandoned release may have migrated the state."""
+
+    h.release(sequence=5, state_schema=2)
+    h.commit()
+    bad = h.image("3")
+    h.broken_images.add(bad)
+    h.release(sequence=6, image=bad, state_schema=3)
+    assert h.check().action == "halted"
+    assert h.state()["schema_high_water"] == {"schema": 3, "image": bad}
+    resolve(h.host(), "abandon")
+    h.release(sequence=7, image=h.image("4"), state_schema=2)
+    outcome = h.check()
+    assert "schemas never go down" in outcome.reason
+    # Nothing runs since the abandon, so the refusal pages too (probe A5).
+    assert outcome.action == "unhealthy" and outcome.exit_status == EXIT_ALERT
+    h.release(sequence=8, image=h.image("4"), state_schema=3)
+    assert h.commit().action == "current"
 
 
 def test_resolve_restore_previous_puts_the_previous_release_back(h):

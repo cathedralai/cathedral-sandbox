@@ -321,6 +321,8 @@ class Harness:
 
     def _systemctl(self, arguments) -> None:
         self.systemctl_calls.append(tuple(arguments))
+        if arguments[0] == "reset-failed":
+            self.nrestarts = 0  # systemd's reset-failed zeroes NRestarts
         if arguments[0] != "restart":
             return
         if self.restart_raises:

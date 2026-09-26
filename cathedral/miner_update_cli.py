@@ -83,21 +83,35 @@ PULL_TIMEOUT_SECONDS = 480
 INSPECT_TIMEOUT_SECONDS = 30
 DAEMON_RELOAD_TIMEOUT_SECONDS = 30
 RESET_FAILED_TIMEOUT_SECONDS = 30
-RESTART_TIMEOUT_SECONDS = 120
+# `systemctl restart` of the miner waits for the stop and the start. The stop
+# is at most the miner unit's TimeoutStopSec=30s. The start first runs what the
+# unit Wants= and is ordered After=, which on a TDX host is #211's
+# cathedral-validator-access-fetch.service: its fetch has a 30 s deadline and
+# the unit a 2 min TimeoutStartSec. 30 + 120 = 150 s, so 180 s leaves 30 s for
+# systemd itself and a normal restart never times out. A restart error is
+# final (activation review P2), so this must not be tight.
+RESTART_TIMEOUT_SECONDS = 180
 SETTLE_TIMEOUT_SECONDS = 90
 SETTLE_POLL_SECONDS = 3
 # How long the container must have been up before it counts as running. A
 # crash-looping container reports Running=true between restarts.
 SETTLE_DWELL_SECONDS = 20
+# How old the snapshot a healthy host holds can be, from #211's numbers:
+#   - the control host signs a snapshot on a timer every 120 s, with up to
+#     15 s of random delay and 5 s of timer accuracy: a new one at least every
+#     140 s, whose generated_at is backdated by 30 s. At publication it is at
+#     most 140 + 30 = 170 s old;
+#   - the worker fetches on the same timer, and each fetch may take its full
+#     30 s deadline: a completed fetch at least every 140 + 30 = 170 s.
+# So the snapshot a worker holds is at most 170 + 170 = 340 s old.
+SNAPSHOT_REFRESH_ALLOWANCE_SECONDS = 340
 # A restart makes the miner re-read its validator-access snapshot, and a
 # rollback may need another restart. So a restart is only started with enough
 # validity left for the restart, the settle, the second look and a rollback
-# restart (review finding F3).
-MINIMUM_ACCESS_REMAINING_SECONDS = 600
-# How stale a healthy host's snapshot can be: the validator-access refresher
-# and the worker fetch each run every two minutes (#211). A snapshot whose
-# whole lifetime cannot cover the margin plus this can never pass the gate.
-SNAPSHOT_REFRESH_ALLOWANCE_SECONDS = 240
+# restart (review finding F3): (30 + 30 + 180) + 90 + 45 + 180 = 555 s, which
+# a test holds. 560 s is that, rounded up, and still leaves #211's default
+# 900 s snapshot passing the gate at its oldest: 900 - 340 = 560.
+MINIMUM_ACCESS_REMAINING_SECONDS = 560
 SYSTEMD_MARGIN_SECONDS = 120
 
 
@@ -122,7 +136,8 @@ def _prove_start_budget() -> int:
 
 def child_budget_seconds() -> int:
     """One check with no self-update: a reconcile that restarts and rolls back,
-    then an activation that pulls, restarts twice, and rolls back."""
+    then an activation that pulls, restarts twice, and rolls back, then the
+    miner health check that closes a check with no activation in progress."""
 
     reconcile = _observe_budget() + _restart_budget() + _prove_start_budget()
     activation = (
@@ -132,7 +147,14 @@ def child_budget_seconds() -> int:
         + _observe_budget()
         + _prove_start_budget()
     )
-    return reconcile + activation
+    return reconcile + activation + _settle_budget()
+
+
+def fallback_budget_seconds() -> int:
+    """The shim's fallback: a fetch (when the current updater fetched nothing),
+    a probe of a tree the current updater could not install, and the health check."""
+
+    return FETCH_METADATA_DEADLINE_SECONDS + PROBE_TIMEOUT_SECONDS + _settle_budget()
 
 
 HANDOFF_TIMEOUT_SECONDS = child_budget_seconds() + 60
@@ -141,13 +163,13 @@ HANDOFF_TIMEOUT_SECONDS = child_budget_seconds() + 60
 
 def worst_case_seconds() -> int:
     """The longest one unit run can take: a reconcile, a self-update whose
-    first run uses its whole budget, the dry run that judges it, and the
-    shim's fallback dry run."""
+    first run uses its whole budget, the fetch that judges it, and the
+    shim's fallback."""
 
     reconcile = _observe_budget() + _restart_budget() + _prove_start_budget()
     parent = reconcile + FETCH_METADATA_DEADLINE_SECONDS + FETCH_BUNDLE_DEADLINE_SECONDS
     parent += PROBE_TIMEOUT_SECONDS + HANDOFF_TIMEOUT_SECONDS + FETCH_METADATA_DEADLINE_SECONDS
-    return parent + FETCH_METADATA_DEADLINE_SECONDS
+    return parent + fallback_budget_seconds()
 
 
 # --- network ----------------------------------------------------------------------------
@@ -410,9 +432,10 @@ def safe_to_activate(snapshot: Path) -> bool:
     left, and an unreadable snapshot is unsafe. The updater's unit must leave
     this file visible; review finding F1 was a unit that hid it.
 
-    If the snapshot's whole lifetime cannot cover the margin plus the refresh
-    allowance, the gate can never pass; that raises ``GateImpossible`` so the
-    check alerts at once instead of deferring forever.
+    If the snapshot's whole lifetime cannot cover the margin plus the oldest
+    a healthy host's snapshot can be, the gate cannot pass reliably; that
+    raises ``GateImpossible`` so the check alerts at once instead of deferring
+    for hours.
     """
 
     times = _snapshot_times(snapshot)
@@ -423,8 +446,10 @@ def safe_to_activate(snapshot: Path) -> bool:
     if lifetime < MINIMUM_ACCESS_REMAINING_SECONDS + SNAPSHOT_REFRESH_ALLOWANCE_SECONDS:
         raise GateImpossible(
             f"the validator-access snapshot lives {int(lifetime)} s, but a safe restart needs "
-            f"{MINIMUM_ACCESS_REMAINING_SECONDS} s left plus {SNAPSHOT_REFRESH_ALLOWANCE_SECONDS} s "
-            "for refresh; lengthen the snapshot lifetime, or no update can ever activate"
+            f"{MINIMUM_ACCESS_REMAINING_SECONDS} s left on a snapshot that may be "
+            f"{SNAPSHOT_REFRESH_ALLOWANCE_SECONDS} s old; lengthen the snapshot lifetime to at least "
+            f"{MINIMUM_ACCESS_REMAINING_SECONDS + SNAPSHOT_REFRESH_ALLOWANCE_SECONDS} s, or updates "
+            "will not activate reliably"
         )
     return expires - time.time() >= MINIMUM_ACCESS_REMAINING_SECONDS
 
@@ -664,6 +689,16 @@ def _dispatch(arguments: argparse.Namespace, paths: HostPaths) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
+    status = _main(arguments)
+    if arguments.command == "fallback" and status == EXIT_REFUSED:
+        # A fallback that could not run passes the current updater's own
+        # status through, so a crash or a fault still pages.
+        current = arguments.current_status
+        return current if current in DOCUMENTED_EXIT_STATUSES else EXIT_FAULT
+    return status
+
+
+def _main(arguments: argparse.Namespace) -> int:
     paths = host_paths()
     try:
         return _dispatch(arguments, paths)

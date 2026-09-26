@@ -11,12 +11,16 @@
 #     --revision <40-hex commit> --keys-sha256 <64-hex> \
 #     --product snp-miner|audit-miner --network <network> --netuid <netuid> \
 #     --channel stable|canary --channel-url https://.../<product>/<channel>.json \
-#     --miner-unit <the miner's systemd unit> --minimum-sequence <n>
+#     --miner-unit <the miner's systemd unit> --minimum-sequence <n> \
+#     [--repair-trust-set]
 #
 # --network, --netuid, --miner-unit and --minimum-sequence have no defaults.
 # --minimum-sequence is the lowest channel sequence this host may accept; take
 # it from the release announcement. The keys digest comes
 # from the release announcement, not from this repository.
+# --repair-trust-set: only when a re-run refuses because this host's trust set
+# is unreadable. It moves forward from the verified backup, keeping every
+# revocation.
 set -euo pipefail
 
 REPOSITORY="https://github.com/cathedralai/cathedral-sandbox.git"
@@ -34,6 +38,7 @@ while [[ $# -gt 0 ]]; do
     --product|--network|--netuid|--channel|--channel-url|--miner-unit|--minimum-sequence)
       [[ $# -ge 2 ]] || die "$1 needs a value"
       PASSTHROUGH+=("$1" "$2"); shift 2 ;;
+    --repair-trust-set) PASSTHROUGH+=("$1"); shift ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -82,8 +87,9 @@ Installed. The timer is NOT enabled yet, and the miner has not changed.
      cathedral-miner-update status
 
    "current" or "activated" is success. "deferred" means a restart is not
-   safe yet: the validator-access snapshot has too little validity left, or
-   the miner unit is stopped (an update never starts a stopped miner).
+   safe yet: the validator-access snapshot has too little validity left.
+   If the miner unit is not running, the check pages and starts nothing:
+   start the miner first.
 4. Turn on unattended updates:
 
      systemctl enable --now cathedral-miner-update.timer

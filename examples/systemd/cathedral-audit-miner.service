@@ -20,7 +20,9 @@ EnvironmentFile=/etc/cathedral/audit-miner.env
 # See docs/MINER_AUTO_UPDATE.md.
 ExecStart=/usr/local/lib/cathedral-miner-update/miner/current/launcher
 EnvironmentFile=-/usr/local/lib/cathedral-miner-update/miner/current/release.env
-Restart=on-failure
+# Always: a clean exit (143 after a docker daemon restart) must not leave the
+# miner stopped. Only `systemctl stop` does.
+Restart=always
 RestartSec=15s
 SuccessExitStatus=129 130 143
 TimeoutStopSec=30s

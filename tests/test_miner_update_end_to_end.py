@@ -203,6 +203,7 @@ def test_a_signed_release_installs_on_a_bootstrapped_host(world):
     )
     outcome = update_once(host)
     assert outcome.action == "activated", outcome.reason
+    clock[0] += 3600
     confirmed = update_once(host)
     assert confirmed.action == "current", confirmed.reason
     assert link_target(paths.miner_current) != LEGACY
