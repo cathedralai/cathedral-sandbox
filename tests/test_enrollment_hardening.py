@@ -68,6 +68,8 @@ def _attested(chip_id: str, measurement: str = "measurement") -> Attested:
         chip_id,
         measurement,
         1,
+        verification_status="VERIFIED",
+        chain_verified=True,
         assurance=attestation_claims(chip_id.encode(), policy),
     )
 
@@ -188,6 +190,8 @@ def _fake_tdx_verify(evidence, nonce, policy):
             chip_id=TDX_CHIP_ID,
             measurement=TDX_MEASUREMENT,
             tcb=3,
+            verification_status="VERIFIED",
+            chain_verified=True,
             assurance=attestation_claims(evidence.quote, policy),
         )
     return None
@@ -318,8 +322,10 @@ def test_registry_chip_rotation_conflict_does_not_publish_rejected_identity(
     for hotkey in (owner, claimant):
         store.enroll(hotkey, f"http://127.0.0.1:{9001 if hotkey == owner else 9002}")
 
-    store.record_verdict(owner, _attested("shared-chip"))
-    store.record_verdict(claimant, _attested("shared-chip"))
+    assert store.record_verdict(owner, _attested("shared-chip")) == "VERIFIED"
+    # The refusal is reported to the caller, which must not act on the
+    # verdict it passed in.
+    assert store.record_verdict(claimant, _attested("shared-chip")) == "FAILED"
     miners = {miner["hotkey"]: miner for miner in store.board()["miners"]}
 
     assert miners[owner]["verification_status"] == "VERIFIED"

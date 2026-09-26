@@ -1263,7 +1263,7 @@ class ConfidentialRuntime:
                         "gpu_profile_registry_release": self.gpu_profile.registry_release,
                         "gpu_profile_registry_digest": self.gpu_profile.registry_digest,
                     }
-                self.registry.record_verdict(
+                stored_status = self.registry.record_verdict(
                     result.target.hotkey,
                     result.attested,
                     expected_generation=result.lifecycle_generation,
@@ -1286,6 +1286,21 @@ class ConfidentialRuntime:
                 if pending_gpu_claim is not None:
                     self.gpu_identity_registry.rollback_claim(pending_gpu_claim)
                 raise
+            if stored_status != "VERIFIED":
+                # The registry refused the verdict without raising. The checks
+                # above already passed, so the likely cause is another hotkey
+                # binding this chip_id in between. Release the GPU identity
+                # and do not admit.
+                if pending_gpu_claim is not None:
+                    self.gpu_identity_registry.rollback_claim(pending_gpu_claim)
+                outcomes[result.target.hotkey] = MinerOutcome(
+                    result.target.hotkey,
+                    result.endpoint,
+                    "attestation_failed",
+                    error="registry refused the verdict",
+                    error_category="attestation_rejected",
+                )
+                continue
             if pending_gpu_claim is not None:
                 # The lifecycle compare-and-swap is now accepted. Finalize the
                 # durable GPU claim only at this last admission boundary.
@@ -1877,11 +1892,14 @@ class ConfidentialRuntime:
                     evidence_digest = _evidence_digest(cpu_evidence)
                     component_audit = None
                     gpu_component = None
-                if (
-                    verdict.verification_status != "VERIFIED"
-                    or verdict.tier is not self.config.expected_tier
-                ):
+                if verdict.tier is not self.config.expected_tier:
                     raise RuntimeError("verdict does not match the requested hardware tier")
+                if verdict.verification_status != "VERIFIED":
+                    if verdict.tier is Tier.CC_GPU:
+                        from cathedral.gpu import GPU_VERDICT_UNDECLARED
+
+                        raise RuntimeError(GPU_VERDICT_UNDECLARED)
+                    raise RuntimeError("verdict is not verified")
                 if not verdict.chip_id:
                     raise RuntimeError("verified evidence must identify the hardware")
                 if not ATTESTATION_ADMISSION_POLICY.allows(verdict.assurance):

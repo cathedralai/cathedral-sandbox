@@ -61,6 +61,8 @@ def _attested(at: datetime = START, measurement: str = "measurement") -> Atteste
         chip_id="chip-1",
         measurement=measurement,
         tcb=1,
+        verification_status="VERIFIED",
+        chain_verified=True,
         assurance=attestation_claims(
             b"quote",
             policy,
@@ -86,6 +88,58 @@ def _record_attested(store: RegistryStore, at: datetime = START) -> None:
         policy_registry_release=1,
         policy_registry_digest=REGISTRY_DIGEST,
     )
+
+
+def test_attested_defaults_to_an_unverified_verdict():
+    attested = Attested(Tier.CC_CPU_TDX, "chip-1", "measurement", 1)
+
+    assert attested.verification_status == "UNVERIFIED"
+    assert attested.chain_verified is False
+
+
+def test_registry_refuses_verdict_that_does_not_declare_itself_verified(tmp_path: Path):
+    # Built without verification_status and chain_verified, so it takes the
+    # fail-closed defaults. Its typed claims pass, so the refusal comes from
+    # the verdict alone.
+    clock = MutableClock()
+    store = _store(tmp_path, clock)
+    declared = _attested()
+    undeclared = Attested(
+        declared.tier,
+        declared.chip_id,
+        declared.measurement,
+        declared.tcb,
+        assurance=declared.assurance,
+    )
+
+    stored = store.record_verdict(
+        "worker",
+        undeclared,
+        policy_registry_release=1,
+        policy_registry_digest=REGISTRY_DIGEST,
+    )
+
+    assert stored == "UNVERIFIED"
+    lifecycle = store.lifecycle_snapshot("worker")
+    assert lifecycle.state is WorkerLifecycleState.FAILED
+    assert lifecycle.reason is LifecycleReason.VERIFICATION_FAILED
+    assert store.board()["count"] == 0
+    assert store.board()["miners"][0]["verification_status"] != "VERIFIED"
+    with pytest.raises(LifecycleError):
+        store.verified_attestation_record("worker")
+    # The refused verdict does not hold the chip: another worker can bind it.
+    assert store.chip_rotation_owner(declared.chip_id, "other-worker") is None
+    store.enroll("other-worker", "https://other.example")
+    assert (
+        store.record_verdict(
+            "other-worker",
+            declared,
+            policy_registry_release=1,
+            policy_registry_digest=REGISTRY_DIGEST,
+        )
+        == "VERIFIED"
+    )
+    assert store.lifecycle_snapshot("other-worker").state is WorkerLifecycleState.ATTESTED
 
 
 def test_closed_transition_table_accepts_every_declared_edge_and_rejects_all_others():

@@ -2477,6 +2477,11 @@ class CompositeGpuResult:
     gpu_component: GpuComponentVerdict = field(repr=False)
 
 
+# The refusal reason for a composite verdict that keeps the fail-closed
+# defaults, which verify_composite_gpu does until the GPU lane is qualified.
+GPU_VERDICT_UNDECLARED = "composite verdict undeclared (GPU lane not qualified)"
+
+
 def verify_composite_gpu(
     cpu_evidence: Evidence,
     gpu_evidence: Evidence,
@@ -2582,6 +2587,10 @@ def verify_composite_gpu(
         channel=not_evaluated_claim(),
         work=not_evaluated_claim(),
     )
+    # verification_status and chain_verified are deliberately left at their
+    # fail-closed defaults. This path is a development preview that no customer
+    # admission accepts, and it does not yet compute a vendor-chain verdict.
+    # Declare one here when the GPU lane is qualified.
     attested = Attested(
         tier=Tier.CC_GPU,
         chip_id=chip_id,

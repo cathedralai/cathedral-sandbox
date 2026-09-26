@@ -272,6 +272,8 @@ def _fake_tdx_verify(evidence, nonce, policy):
             chip_id=TDX_CHIP_ID,
             measurement=TDX_MEASUREMENT,
             tcb=3,
+            verification_status="VERIFIED",
+            chain_verified=True,
             assurance=attestation_claims(evidence.quote, policy),
         )
     return None
@@ -371,6 +373,38 @@ def test_prober_rejects_verified_flag_without_typed_assurance(monkeypatch, tmp_p
     server.shutdown()
 
     assert store.board()["miners"][0]["verification_status"] == "FAILED"
+
+
+def test_prober_refuses_verdict_that_does_not_declare_itself_verified(monkeypatch, tmp_path):
+    # Built without verification_status and chain_verified, so it takes the
+    # fail-closed defaults. Everything else matches _fake_tdx_verify, so the
+    # refusal comes from the verdict alone.
+    server = _serve(TdxMiner)
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    hotkey = TdxMiner.hotkey
+    store.enroll(hotkey, f"http://127.0.0.1:{server.server_port}")
+
+    def undeclared_verifier(evidence, nonce, policy):
+        attested = Attested(
+            tier=Tier.CC_CPU_TDX,
+            chip_id=TDX_CHIP_ID,
+            measurement=TDX_MEASUREMENT,
+            tcb=3,
+            assurance=attestation_claims(evidence.quote, policy),
+        )
+        assert attested.verification_status == "UNVERIFIED"
+        assert attested.chain_verified is False
+        return attested
+
+    monkeypatch.setattr("cathedral.prober.verifier.verify", undeclared_verifier)
+    probe_once(store, Policy())
+    server.shutdown()
+
+    board = store.board()
+    assert board["count"] == 0
+    assert board["miners"][0]["verification_status"] == "FAILED"
+    assert board["miners"][0]["chip_id_prefix"] is None
+    assert store.lifecycle_snapshot(hotkey).state is not WorkerLifecycleState.ATTESTED
 
 
 # ---------------------------------------------------------------------------

@@ -817,8 +817,10 @@ def probe_once(
                     production_mode=False,
                 )
             composite = None
+            failure_reason = "verification failed"
             if expected_tier is Tier.CC_GPU:
                 from cathedral.gpu import (
+                    GPU_VERDICT_UNDECLARED,
                     GpuAttestationError,
                     gpu_error_is_evidence_denial,
                     verify_composite_gpu,
@@ -843,6 +845,15 @@ def probe_once(
                         if production_mode and not gpu_profile.production_ready_for(policy):
                             raise ValueError("production GPU profile expired during probe")
                         attested = composite.attested
+                        # Refuse an undeclared verdict here, before the GPU
+                        # identity claim below touches durable state. The
+                        # composite verifier does not declare one until the
+                        # GPU lane is qualified.
+                        if attested.verification_status != "VERIFIED":
+                            LOGGER.info(GPU_VERDICT_UNDECLARED)
+                            failure_reason = GPU_VERDICT_UNDECLARED
+                            composite = None
+                            attested = None
                     except GpuAttestationError as exc:
                         if not gpu_error_is_evidence_denial(exc):
                             raise
@@ -855,7 +866,7 @@ def probe_once(
                 store.record_verdict(
                     enrollment.hotkey,
                     None,
-                    error="verification failed",
+                    error=failure_reason,
                     expected_generation=lifecycle.generation,
                     expected_revision=lifecycle.revision,
                     policy_registry_release=policy.registry_release,
@@ -907,7 +918,7 @@ def probe_once(
                             "gpu_profile_registry_release": gpu_profile.registry_release,
                             "gpu_profile_registry_digest": gpu_profile.registry_digest,
                         }
-                    store.record_verdict(
+                    stored_status = store.record_verdict(
                         enrollment.hotkey,
                         attested,
                         expected_generation=lifecycle.generation,
@@ -920,6 +931,14 @@ def probe_once(
                     if pending_gpu_claim is not None:
                         gpu_identity_registry.rollback_claim(pending_gpu_claim)
                     raise
+                if stored_status != "VERIFIED":
+                    # The registry refused the verdict without raising, for
+                    # example because its chip_id is still bound to another
+                    # hotkey. Release the GPU identity instead of committing
+                    # it for a worker the registry did not admit.
+                    if pending_gpu_claim is not None:
+                        gpu_identity_registry.rollback_claim(pending_gpu_claim)
+                    return False
                 if pending_gpu_claim is not None:
                     gpu_identity_registry.commit_claim(pending_gpu_claim)
                 return True

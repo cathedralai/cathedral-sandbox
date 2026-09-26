@@ -207,8 +207,12 @@ class Attested:
     chip_id: str  # SNP CHIP_ID / TDX platform id / certified GPU UUID
     measurement: str  # the attested measurement, matched against policy
     tcb: int  # trusted computing base version
-    verification_status: str = "VERIFIED"
-    chain_verified: bool = True
+    # Fail-closed by default. These two are the verdict, so a verifier that
+    # forgets to declare one must produce an unusable Attested rather than a
+    # verified-looking one. The previous defaults were the admitted values,
+    # which let any construction site inherit "verified" without checking.
+    verification_status: str = "UNVERIFIED"
+    chain_verified: bool = False
     tcb_status: str | None = None
     advisory_ids: tuple[str, ...] = ()
     debug_enabled: bool | None = None
