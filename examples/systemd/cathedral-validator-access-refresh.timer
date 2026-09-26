@@ -1,0 +1,15 @@
+[Unit]
+Description=Sign and publish a fresh Cathedral validator-access snapshot every two minutes
+
+[Timer]
+# Two minutes keeps the published snapshot young. A worker that fetches it
+# then has most of its lifetime left, so one missed run does not raise the
+# worker's expiry alarm.
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=5s
+RandomizedDelaySec=15s
+Unit=cathedral-validator-access-refresh.service
+
+[Install]
+WantedBy=timers.target
