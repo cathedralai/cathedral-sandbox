@@ -99,6 +99,7 @@ from cathedral.validator_access import (
     ValidatorRequestAuthorizer,
     load_sr25519_verifier,
     preflight_sr25519_verifier,
+    reset_request_clock_high_water,
     singleton_fleet,
 )
 from cathedral.gpu import (
@@ -1259,6 +1260,45 @@ def _run_json(run: EpochRun) -> dict[str, object]:
         "scores": dict(run.scores),
         "outcomes": [_outcome_json(outcome) for outcome in run.outcomes],
     }
+
+
+def cmd_worker_reset_replay_clock(args: argparse.Namespace) -> int:
+    """Lower the signed-request clock high-water after a backward clock step.
+
+    It refuses while a worker holds the state and keeps every replay record.
+    It never lowers the replay floor, so it reports when requests resume.
+    """
+
+    result = reset_request_clock_high_water(
+        args.validator_access_state,
+        now=datetime.datetime.now(datetime.UTC),
+    )
+
+    def utc(epoch: int | None) -> str | None:
+        if epoch is None:
+            return None
+        return datetime.datetime.fromtimestamp(epoch, datetime.UTC).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+    before = result.clock_high_water_before
+    after = result.clock_high_water_after
+    print(
+        json.dumps(
+            {
+                "backward_step_seconds": (
+                    0 if before is None or after is None else before - after
+                ),
+                "clock_high_water_after": utc(after),
+                "clock_high_water_before": utc(before),
+                "replay_floor": utc(result.replay_floor or None),
+                "requests_resume_at": utc(result.requests_resume_at),
+                "retained_replay_records": result.retained_replay_records,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
 
 
 def cmd_worker_serve(args: argparse.Namespace) -> int:
@@ -4470,6 +4510,17 @@ def build_parser() -> argparse.ArgumentParser:
         allow_public_bootstrap_evidence=False,
         allow_public_legacy_audit=False,
     )
+
+    p_worker_reset_clock = worker_sub.add_parser(
+        "reset-replay-clock",
+        help="with the worker stopped, accept requests again after a backward clock step",
+    )
+    p_worker_reset_clock.add_argument(
+        "--validator-access-state",
+        required=True,
+        help="the worker's existing validator-access SQLite state",
+    )
+    p_worker_reset_clock.set_defaults(func=cmd_worker_reset_replay_clock)
 
     p_policy = sub.add_parser(
         "policy-registry",

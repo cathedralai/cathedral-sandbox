@@ -246,6 +246,38 @@ install the two timers described at the end of this step. A failed refresh
 leaves the last valid file in place. An expired snapshot closes protected
 routes.
 
+The worker keeps its signed-request replay records in
+`/var/lib/cathedral/validator-access/validator-access.sqlite`. While it runs it
+holds a lock on `validator-access.sqlite.lock` beside that file. It tolerates a
+backward clock step of up to 135 seconds: one request lifetime plus the
+allowed validator clock skew. After a larger step it refuses every signed
+request and logs the step size. Correct the host clock first. Then stop the
+worker, reset the replay clock with the reviewed image, and start the worker
+again:
+
+```bash
+sudo docker run --rm --pull never --network none --read-only \
+  --cap-drop ALL --security-opt no-new-privileges=true \
+  --mount type=bind,src=/var/lib/cathedral/validator-access,dst=/var/lib/cathedral/validator-access \
+  --entrypoint python REVIEWED_WORKER_IMAGE -I -m cathedral.cli \
+  worker reset-replay-clock \
+  --validator-access-state /var/lib/cathedral/validator-access/validator-access.sqlite
+```
+
+The reset refuses while a worker holds the state. It fixes one thing: a
+replay clock high-water that is ahead of the host clock. It does not always
+restore service. The worker also keeps a replay floor, the latest expiry of
+any replay record it has deleted. Only requests that expire after the floor
+are accepted. The reset cannot and must not lower the floor, and it keeps
+every replay record, so an accepted request is still refused if it is sent
+again. If the clock ran far ahead before it was corrected, the floor can be
+far ahead too. Requests then stay refused until about `requests_resume_at`,
+which is the floor minus the 120-second maximum request lifetime. The reset
+prints `replay_floor` and `requests_resume_at`, and the worker logs both,
+at most once a minute, while it refuses. Only images built from a revision
+that includes `cathedral worker reset-replay-clock` have this command. The
+image pinned in step 3 predates it.
+
 The `init-key` command prints `keys_digest sha256:...`. Keep the value after
 `keys_digest` for step 3.
 
