@@ -704,7 +704,9 @@ def test_a_first_run_that_hangs_is_killed_with_everything_it_started(h, monkeypa
     while time.monotonic() < deadline:
         try:
             state = Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0]
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
+            # Gone, including when it is reaped between opening the file and
+            # reading it, which the kernel reports as ESRCH.
             break
         if state == "Z":
             break
