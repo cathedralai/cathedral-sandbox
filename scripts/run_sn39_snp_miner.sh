@@ -112,7 +112,16 @@ fi
 docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1 \
   && die "container name is already active: ${CONTAINER_NAME}"
 
-docker pull --platform linux/amd64 "${SN39_SNP_MINER_IMAGE}"
+# Start from the locally verified digest when it is already present, and pull
+# only when it is not. The signed updater pulls and verifies each release
+# before it switches to it, so a registry outage cannot stop a restart or a
+# rollback (activation review P1-4, S-07). The checks below verify the local
+# image either way.
+if ! docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+    "${IMAGE_PREFIX}${image_digest}" 2>/dev/null \
+  | grep -Fx -- "${IMAGE_PREFIX}${image_digest}" >/dev/null; then
+  docker pull --platform linux/amd64 "${IMAGE_PREFIX}${image_digest}"
+fi
 repo_digests="$(
   docker image inspect \
     --format '{{range .RepoDigests}}{{println .}}{{end}}' \

@@ -48,7 +48,9 @@ zero for the round.
 
 Do not start or keep the worker online when any of these are true:
 
-- the image is not the exact immutable digest above;
+- the image is not the exact immutable digest above, or on a host enrolled in
+  signed updates, the digest the active signed release names
+  (`docs/MINER_AUTO_UPDATE.md`);
 - the host is not an Intel TDX guest with a usable configfs TSM report path;
 - the validator snapshot is missing, invalid, or expired;
 - the public-key file no longer matches its pinned digest;
@@ -59,5 +61,8 @@ Do not start or keep the worker online when any of these are true:
 - native TLS on port `8081` is not reachable; or
 - the process stops refreshing evidence or answering canonical SAT.
 
-There is no supported instruction to fall back to an older public image. Fix or
-publish a reviewed replacement instead of reviving an obsolete launch mode.
+Do not fall back to an older public image by hand. On a host enrolled in signed
+updates, the updater's own rollback and `cathedral-miner-update resolve` are the
+supported way back to the previous release (`docs/MINER_AUTO_UPDATE.md`).
+Otherwise, fix or publish a reviewed replacement instead of reviving an obsolete
+launch mode.
