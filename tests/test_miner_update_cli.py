@@ -21,12 +21,16 @@ UNIT = "cathedral-test-miner.service"
 CONTAINER = "cathedral-test-miner"
 
 
-def _fake_run(unit_state: str, started: str):
+def _fake_run(unit_state: str, started: str, restarts: int = 0):
     def fake_run(argv, timeout=300):
         class Result:
             returncode = 0
             stderr = ""
-            stdout = unit_state if argv[0] == "systemctl" else f"true {started} img@sha256:x"
+            stdout = (
+                f"ActiveState={unit_state}\nNRestarts={restarts}\n"
+                if argv[0] == "systemctl"
+                else f"true {started} img@sha256:x"
+            )
 
         return Result()
 
@@ -44,19 +48,20 @@ def test_a_container_that_just_started_is_not_yet_running(monkeypatch):
     monkeypatch.setattr(cli, "run", _fake_run("active", _iso(0)))
     monkeypatch.setattr(cli, "SETTLE_TIMEOUT_SECONDS", 0)
     monkeypatch.setattr(cli, "SETTLE_POLL_SECONDS", 0)
-    assert cli.settled_image(UNIT, CONTAINER) is None
+    assert cli.settle(UNIT, CONTAINER) is None
 
 
 def test_a_container_up_past_the_dwell_is_running(monkeypatch):
-    monkeypatch.setattr(cli, "run", _fake_run("active", _iso(-120)))
-    assert cli.settled_image(UNIT, CONTAINER) == "img@sha256:x"
+    monkeypatch.setattr(cli, "run", _fake_run("active", _iso(-120), restarts=4))
+    seen = cli.settle(UNIT, CONTAINER)
+    assert seen is not None and seen.image == "img@sha256:x" and seen.restarts == 4 and seen.active
 
 
 def test_an_activating_unit_is_not_running(monkeypatch):
     monkeypatch.setattr(cli, "run", _fake_run("activating", _iso(-120)))
     monkeypatch.setattr(cli, "SETTLE_TIMEOUT_SECONDS", 0)
     monkeypatch.setattr(cli, "SETTLE_POLL_SECONDS", 0)
-    assert cli.settled_image(UNIT, CONTAINER) is None
+    assert cli.settle(UNIT, CONTAINER) is None
 
 
 def test_docker_nanosecond_timestamps_parse():
@@ -67,28 +72,48 @@ def test_an_unparseable_start_time_fails_safe():
     assert cli._uptime_seconds("not-a-time") == 0.0
 
 
-def test_restart_is_refused_near_snapshot_expiry(tmp_path):
+def _snapshot(tmp_path, *, age: float, lifetime: float = 900):
     path = tmp_path / "validator-access.json"
-    path.write_text(json.dumps({"expires_at": _iso(cli.MINIMUM_ACCESS_REMAINING_SECONDS - 30)}))
-    assert cli.safe_to_activate(path) is False
+    path.write_text(json.dumps({"generated_at": _iso(-age), "expires_at": _iso(lifetime - age)}))
+    return path
+
+
+def test_restart_is_refused_near_snapshot_expiry(tmp_path):
+    assert cli.safe_to_activate(_snapshot(tmp_path, age=400)) is False
 
 
 def test_restart_is_allowed_with_margin(tmp_path):
-    path = tmp_path / "validator-access.json"
-    path.write_text(json.dumps({"expires_at": _iso(cli.MINIMUM_ACCESS_REMAINING_SECONDS + 60)}))
-    assert cli.safe_to_activate(path) is True
+    assert cli.safe_to_activate(_snapshot(tmp_path, age=60)) is True
+
+
+def test_a_gate_that_can_never_pass_is_reported(tmp_path):
+    """Activation review P2 (#211): a snapshot too short for the margin."""
+
+    from cathedral.miner_updater import GateImpossible
+
+    with pytest.raises(GateImpossible, match="lengthen"):
+        cli.safe_to_activate(_snapshot(tmp_path, age=0, lifetime=700))
+
+
+def test_the_margin_fits_the_refreshed_snapshot_of_211():
+    """#211 signs 900 s snapshots and refreshes and fetches every two minutes."""
+
+    assert cli.MINIMUM_ACCESS_REMAINING_SECONDS + cli.SNAPSHOT_REFRESH_ALLOWANCE_SECONDS <= 900
 
 
 def test_an_unreadable_snapshot_is_unsafe(tmp_path):
     assert cli.safe_to_activate(tmp_path / "missing.json") is False
 
 
-def test_the_margin_covers_a_restart_settle_and_rollback():
-    """F3: the swap's restart, the settle wait and the rollback restart all
-    finish before the snapshot the margin was checked against can lapse."""
+def test_the_margin_covers_a_restart_settle_second_look_and_rollback():
+    """F3: the swap's restart, the settle wait, the second look and the
+    rollback restart all finish before the snapshot can lapse."""
+
+    from cathedral.miner_updater import PROBATION_SAMPLE_SECONDS
 
     swap = cli.DAEMON_RELOAD_TIMEOUT_SECONDS + cli.RESET_FAILED_TIMEOUT_SECONDS + cli.RESTART_TIMEOUT_SECONDS
-    assert cli.MINIMUM_ACCESS_REMAINING_SECONDS >= swap + cli.SETTLE_TIMEOUT_SECONDS + cli.RESTART_TIMEOUT_SECONDS
+    needed = swap + cli.SETTLE_TIMEOUT_SECONDS + PROBATION_SAMPLE_SECONDS + cli.RESTART_TIMEOUT_SECONDS
+    assert cli.MINIMUM_ACCESS_REMAINING_SECONDS >= needed
 
 
 # --- host effects never escape as tracebacks (F16) ------------------------------------------
@@ -186,35 +211,90 @@ def test_fetch_returns_a_bounded_body(monkeypatch):
     assert cli.fetch("https://updates.example.test/x.json", maximum_bytes=10, deadline_seconds=5) == b"abcde"
 
 
-# --- the trust root on disk (F7) ------------------------------------------------------------------
+# --- the host trust set on disk (F7, trust review P0-1) -----------------------------------------
 
 
-def _release_with_trust(tmp_path):
-    release = tmp_path / "release"
-    (release / "trust").mkdir(parents=True)
-    path = release / "trust" / "release-keys.json"
-    path.write_bytes(trust_root_bytes())
-    os.chmod(path, 0o444)
-    return release, path
+def _trust_file(tmp_path):
+    from cathedral.miner_release import initial_trust_state
+    from cathedral.miner_updater import write_trust_state
+
+    path = tmp_path / "trust.json"
+    write_trust_state(path, initial_trust_state(trust_root_bytes()))
+    return path
 
 
-def test_the_trust_root_loads_from_the_running_release(tmp_path):
-    release, _path = _release_with_trust(tmp_path)
-    keys = cli.load_own_trust_root(release, os.getuid())
-    assert set(keys) == {"canary-1", "stable-1"}
+def test_the_host_trust_set_loads(tmp_path):
+    from cathedral.miner_updater import load_trust_state
+
+    trust = load_trust_state(_trust_file(tmp_path), expected_uid=os.getuid())
+    assert set(trust.keys) == {"canary-1", "stable-1"} and trust.generation == 1
 
 
-def test_a_trust_root_another_user_could_write_is_refused(tmp_path):
-    release, path = _release_with_trust(tmp_path)
+def test_a_trust_set_another_user_could_write_is_refused(tmp_path):
+    from cathedral.miner_updater import load_trust_state
+
+    path = _trust_file(tmp_path)
     os.chmod(path, 0o666)
-    with pytest.raises(MinerUpdateError, match="unusable"):
-        cli.load_own_trust_root(release, os.getuid())
+    with pytest.raises(MinerUpdateError, match="unavailable"):
+        load_trust_state(path, expected_uid=os.getuid())
 
 
-def test_a_trust_root_owned_by_someone_else_is_refused(tmp_path):
-    release, _path = _release_with_trust(tmp_path)
-    with pytest.raises(MinerUpdateError, match="unusable"):
-        cli.load_own_trust_root(release, os.getuid() + 1)
+def test_a_trust_set_owned_by_someone_else_is_refused(tmp_path):
+    from cathedral.miner_updater import load_trust_state
+
+    with pytest.raises(MinerUpdateError, match="unavailable"):
+        load_trust_state(_trust_file(tmp_path), expected_uid=os.getuid() + 1)
+
+
+# --- untrusted responses and faults (trust review P0-1) -----------------------------------------
+
+
+@pytest.mark.parametrize("error", ["incomplete", "http", "value"])
+def test_a_malformed_response_is_a_refusal(monkeypatch, error):
+    import http.client
+
+    class Broken(_Response):
+        def read1(self, size):
+            if error == "incomplete":
+                raise http.client.IncompleteRead(b"x", 10)
+            if error == "http":
+                raise http.client.BadStatusLine("garbage")
+            raise ValueError("invalid literal for int() with base 16")
+
+    monkeypatch.setattr(cli.urllib.request, "build_opener", _opener(Broken([b"x"])))
+    with pytest.raises(MinerUpdateError, match="download failed"):
+        cli.fetch("https://updates.example.test/x.json", maximum_bytes=10, deadline_seconds=5)
+
+
+def test_main_turns_an_unexpected_exception_into_the_fault_status(monkeypatch, capsys):
+    def explode(arguments, paths):
+        raise KeyError("a bug")
+
+    monkeypatch.setattr(cli, "_dispatch", explode)
+    assert cli.main(["check"]) == 13
+    assert json.loads(capsys.readouterr().out)["action"] == "fault"
+
+
+def test_prepare_reads_the_state_schema_label(monkeypatch):
+    from types import SimpleNamespace
+
+    outputs = iter(
+        [
+            ("", 0),
+            ("img@sha256:x\n", 0),
+            ("linux/amd64\n", 0),
+            ("snp-contract|2\n", 0),
+        ]
+    )
+
+    def fake_run(argv, timeout=300):
+        stdout, code = next(outputs)
+        return SimpleNamespace(returncode=code, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(cli, "run", fake_run)
+    release = SimpleNamespace(image="img@sha256:x", runtime_contract="snp-contract")
+    profile = SimpleNamespace(contract_label="org.cathedral.test.runtime-contract")
+    assert cli.prepare_image(release, profile) == 2
 
 
 def test_the_running_release_must_be_an_installed_tree(tmp_path, monkeypatch):

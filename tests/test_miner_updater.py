@@ -2,12 +2,12 @@
 
 docker and systemd are faked (``tests/miner_update_support.Harness``); every
 file effect is real under a temporary root. Kept from #197: the floor is
-burned before an attempt, the ``may_have_run`` latch, health means the running
-container reports the released image, the lock, pause and status. Added: the
-schema-based rollback rule on a live-like miner (F2), the snapshot re-check
-before the swap (F3), ``reset-failed`` before a rollback start (F4), atomic
-launcher delivery (F5), failed-release memory (F11), deferral alerting (F1),
-pin, and ``resolve``.
+burned before an attempt, the ``may_have_run`` latch, the lock, pause and
+status. Added: the schema-based rollback rule on a live-like miner (F2), the
+snapshot re-check before the swap (F3), ``reset-failed`` before every start
+(F4), atomic launcher delivery (F5), and every probe of the activation review
+(P1 to P8): probation, the flip time, retrying the previous release, the
+registry-independent launcher, schema labels, operator stops, ``resolve --abandon``.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from cathedral.miner_bundle import link_target
 from cathedral.miner_update_cli import MINIMUM_ACCESS_REMAINING_SECONDS, safe_to_activate
 from cathedral.miner_updater import (
     DEFERRAL_ALERT_AFTER,
@@ -30,12 +29,15 @@ from cathedral.miner_updater import (
     LEGACY,
     STAGE_MAY_HAVE_RUN,
     STAGE_PREPARED,
+    STAGE_PROBATION,
+    MinerUpdateError,
     describe_status,
+    pin_document,
     resolve,
     write_state,
 )
 from cathedral.validator_access import ValidatorAccessState
-from tests.miner_update_support import DAY, NOW, OTHER_NETUID, Harness
+from tests.miner_update_support import DAY, NETUID, NOW, OTHER_KEY, OTHER_NETUID, Harness
 
 
 @pytest.fixture()
@@ -47,15 +49,25 @@ def activation_dir(h: Harness):
     return h.paths.miner_dir / str(h.active())
 
 
+def stage(h: Harness):
+    return h.state()["miner"]["stage"]
+
+
+def _activate_first(h: Harness) -> None:
+    h.release(sequence=5)
+    assert h.commit().action == "current"
+
+
 # --- adoption ----------------------------------------------------------------------------
 
 
-def test_a_new_signed_digest_is_adopted(h):
+def test_a_new_signed_digest_is_adopted_and_committed_after_probation(h):
     h.release(sequence=5)
     outcome = h.check()
     assert outcome.action == "activated", outcome.reason
+    assert outcome.verified is True
+    assert stage(h) == STAGE_PROBATION
     assert h.running_image() == h.new_image
-    assert h.active().startswith("releases/")
     env = (activation_dir(h) / "release.env").read_text()
     assert f"{h.profile.image_variable}={h.new_image}\n" in env
     assert f"CATHEDRAL_NETUID={h.config.netuid}\n" in env
@@ -65,9 +77,12 @@ def test_a_new_signed_digest_is_adopted(h):
         ("reset-failed", h.config.miner_unit),
         ("restart", h.config.miner_unit),
     ]
+    h.now += 3600
+    confirmed = h.check()
+    assert confirmed.action == "current", confirmed.reason
     current = h.state()["miner"]["current"]
-    assert current["image"] == h.new_image and current["sequence"] == 5
-    assert h.state()["last_check"]["action"] == "activated"
+    assert current["image"] == h.new_image and current["schema_verified"] is True
+    assert stage(h) is None
 
 
 def test_the_timer_path_adopts_a_release_with_the_real_gate(h):
@@ -77,39 +92,41 @@ def test_the_timer_path_adopts_a_release_with_the_real_gate(h):
     emulation of the unit's mount sandbox.
     """
 
+    now = datetime.now(timezone.utc)
     h.paths.snapshot.parent.mkdir(parents=True)
-    later = datetime.now(timezone.utc) + timedelta(seconds=MINIMUM_ACCESS_REMAINING_SECONDS + 600)
-    h.paths.snapshot.write_text(json.dumps({"expires_at": later.isoformat().replace("+00:00", "Z")}))
+    h.paths.snapshot.write_text(
+        json.dumps(
+            {
+                "generated_at": now.isoformat().replace("+00:00", "Z"),
+                "expires_at": (now + timedelta(seconds=900)).isoformat().replace("+00:00", "Z"),
+            }
+        )
+    )
     h.release(sequence=5)
     outcome = h.check(safe_to_activate=lambda: safe_to_activate(h.paths.snapshot))
     assert outcome.action == "activated", outcome.reason
 
 
 def test_running_the_same_release_twice_is_a_no_op(h):
-    h.release(sequence=5)
-    h.check()
-    outcome = h.check()
-    assert outcome.action == "current"
-    assert h.restarts() == 1
+    _activate_first(h)
+    restarts = h.restarts()
+    assert h.check().action == "current"
+    assert h.restarts() == restarts
 
 
 def test_a_fresh_signature_of_the_same_release_does_not_restart(h):
     """Weekly re-signing for freshness bumps the sequence but changes nothing."""
 
-    h.release(sequence=5)
-    h.check()
+    _activate_first(h)
+    restarts = h.restarts()
     h.release(sequence=6)
-    outcome = h.check()
-    assert outcome.action == "current"
-    assert h.restarts() == 1
+    assert h.check().action == "current"
+    assert h.restarts() == restarts
     assert h.state()["miner"]["current"]["sequence"] == 6
 
 
-def test_the_operator_env_file_is_never_rewritten(h, tmp_path):
-    """The pin moves through release.env; the operator's file is not the updater's."""
-
-    h.release(sequence=5)
-    h.check()
+def test_the_operator_env_file_is_never_rewritten(h):
+    _activate_first(h)
     assert not list(h.paths.root.glob("etc/cathedral/*.env"))
 
 
@@ -129,13 +146,13 @@ def test_an_unsigned_record_is_refused(h):
     record = json.loads(h.release(sequence=5))
     del record["signature"]
     h.metadata = json.dumps(record).encode()
-    _refused_and_untouched(h, h.check())
+    outcome = h.check()
+    _refused_and_untouched(h, outcome)
+    assert outcome.verified is False
     assert h.state()["floors"] == {}
 
 
 def test_a_record_signed_by_an_untrusted_key_is_refused(h):
-    from tests.miner_update_support import OTHER_KEY
-
     h.release(sequence=5, key=OTHER_KEY, key_id="stable-1")
     _refused_and_untouched(h, h.check())
 
@@ -154,9 +171,37 @@ def test_stale_or_premature_records_are_refused(h, timing):
     _refused_and_untouched(h, h.check())
 
 
-def test_a_rolled_back_sequence_is_refused(h):
+def test_hostile_channel_bytes_are_a_refusal_not_a_crash(h):
+    """Trust review P0-1: an integer past Python's digit limit crashed the updater."""
+
+    h.metadata = b"[" + b"1" * 5000 + b"]"
+    outcome = h.check()
+    _refused_and_untouched(h, outcome)
+    assert outcome.verified is False
+
+
+def test_a_fetch_that_raises_anything_is_a_refusal(h):
+    import http.client
+
+    def truncated():
+        raise http.client.IncompleteRead(b"par", 10)
+
+    outcome = h.check(fetch_metadata=truncated)
+    _refused_and_untouched(h, outcome)
+
+
+def test_an_unexpected_exception_in_the_updater_is_a_documented_fault(h):
     h.release(sequence=5)
-    h.check()
+
+    def broken_gate():
+        raise KeyError("a bug")
+
+    outcome = h.check(safe_to_activate=broken_gate)
+    assert outcome.action == "fault" and outcome.exit_status == 13
+
+
+def test_a_rolled_back_sequence_is_refused(h):
+    _activate_first(h)
     h.release(sequence=4, image=h.image("3"))
     outcome = h.check()
     assert outcome.action == "refused" and "rolls back" in outcome.reason
@@ -164,11 +209,9 @@ def test_a_rolled_back_sequence_is_refused(h):
 
 
 def test_equivocation_at_the_same_sequence_is_refused(h):
-    h.release(sequence=5)
-    h.check()
+    _activate_first(h)
     h.release(sequence=5, image=h.image("3"))
-    outcome = h.check()
-    assert "equivocates" in outcome.reason
+    assert "equivocates" in h.check().reason
 
 
 def test_a_record_for_another_netuid_is_refused(h):
@@ -187,15 +230,14 @@ def test_the_bootstrap_floor_refuses_old_records(tmp_path):
 def test_a_failed_preparation_burns_its_sequence_and_changes_nothing(h):
     h.prepare_raises = True
     h.release(sequence=5)
-    outcome = h.check()
-    _refused_and_untouched(h, outcome)
+    _refused_and_untouched(h, h.check())
     assert h.state()["floors"]["stable"]["sequence"] == 5
-    assert h.state()["miner"]["stage"] is None
+    assert stage(h) is None
     h.release(sequence=5, image=h.image("3"))
     assert "equivocates" in h.check().reason
 
 
-# --- deferral (F1 reporting, F3) -----------------------------------------------------------
+# --- deferral and the gate (F1 reporting, F3, #211) -----------------------------------------
 
 
 def test_an_unsafe_moment_defers_without_restarting(h):
@@ -214,10 +256,43 @@ def test_repeated_deferral_raises_an_alert(h):
         assert h.check().exit_status == 0
     outcome = h.check()
     assert outcome.exit_status == EXIT_ALERT and outcome.alert
-    assert h.state()["consecutive_deferrals"] == DEFERRAL_ALERT_AFTER
     h.safe = [True]
     assert h.check().action == "activated"
     assert h.state()["consecutive_deferrals"] == 0
+
+
+def test_a_refusal_does_not_reset_the_deferral_count(h):
+    """Documented: a channel blip must not hide a gate that never opens."""
+
+    h.safe = [False]
+    h.release(sequence=5)
+    h.check()
+    good = h.metadata
+    h.metadata = b"not json"
+    h.check()
+    h.metadata = good
+    h.check()
+    assert h.state()["consecutive_deferrals"] == 2
+
+
+def test_a_gate_that_can_never_pass_alerts_at_once(h):
+    """Activation review P2: a snapshot shorter than the margin plus refresh."""
+
+    now = datetime.now(timezone.utc)
+    h.paths.snapshot.parent.mkdir(parents=True)
+    h.paths.snapshot.write_text(
+        json.dumps(
+            {
+                "generated_at": now.isoformat().replace("+00:00", "Z"),
+                "expires_at": (now + timedelta(seconds=600)).isoformat().replace("+00:00", "Z"),
+            }
+        )
+    )
+    h.release(sequence=5)
+    outcome = h.check(safe_to_activate=lambda: safe_to_activate(h.paths.snapshot))
+    assert outcome.action == "deferred" and outcome.exit_status == EXIT_ALERT
+    assert "lengthen the snapshot lifetime" in outcome.reason
+    assert MINIMUM_ACCESS_REMAINING_SECONDS < 900
 
 
 def test_the_snapshot_is_checked_again_after_the_pull(h):
@@ -226,11 +301,22 @@ def test_the_snapshot_is_checked_again_after_the_pull(h):
     h.safe = [True, False]
     h.release(sequence=5)
     outcome = h.check()
-    assert outcome.action == "deferred"
-    assert "during the pull" in outcome.reason
+    assert outcome.action == "deferred" and "during the pull" in outcome.reason
     assert h.prepared == [h.new_image]
     assert h.restarts() == 0 and h.active() == LEGACY
-    assert h.state()["miner"]["stage"] is None
+    assert stage(h) is None
+
+
+def test_a_miner_its_operator_stopped_is_not_started(h):
+    """Activation review P8."""
+
+    h.operator_stopped = True
+    h.running[h.profile.container] = None
+    h.release(sequence=5)
+    outcome = h.check()
+    assert outcome.action == "deferred" and "operator stopped" in outcome.reason
+    assert h.restarts() == 0
+    assert h.running_image() is None
 
 
 # --- pause and pin --------------------------------------------------------------------------
@@ -239,14 +325,12 @@ def test_the_snapshot_is_checked_again_after_the_pull(h):
 def test_pause_stops_everything(h):
     h.paths.pause_file.write_text("maintenance\n")
     h.release(sequence=5)
-    outcome = h.check()
-    assert outcome.action == "paused"
+    assert h.check().action == "paused"
     assert h.fetches == 0 and h.restarts() == 0
 
 
 def test_a_paused_miner_does_not_contend_for_the_lock(h):
     h.paths.pause_file.write_text("")
-    h.paths.state_dir.mkdir(parents=True, exist_ok=True)
     fd = os.open(h.paths.lock_file, os.O_CREAT | os.O_RDWR)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -255,29 +339,32 @@ def test_a_paused_miner_does_not_contend_for_the_lock(h):
         os.close(fd)
 
 
-def test_a_pin_holds_the_miner_at_its_version(h):
+def test_a_pin_holds_the_release_by_content_not_by_version(h):
+    """Trust review P2: a same-version re-sign with other content is still held."""
+
     h.release(sequence=5, version="2026.09.01")
-    h.check()
-    h.paths.pin_file.write_text("2026.09.01\n")
-    h.release(sequence=6, image=h.image("3"), version="2026.09.20")
+    h.commit()
+    h.paths.pin_file.write_bytes(pin_document(h.state()["miner"]["current"]))
+    h.release(sequence=6, image=h.image("3"), version="2026.09.01")
     outcome = h.check()
     assert outcome.action == "held"
     assert h.running_image() == h.new_image
     assert h.state()["floors"]["stable"]["sequence"] == 6
+    h.release(sequence=7, version="2026.09.01")
+    assert h.check().action == "current"
     h.paths.pin_file.unlink()
-    h.release(sequence=7, image=h.image("3"), version="2026.09.20")
+    h.release(sequence=8, image=h.image("3"), version="2026.09.20")
     assert h.check().action == "activated"
 
 
 def test_an_unreadable_pin_refuses_rather_than_guesses(h):
-    h.paths.pin_file.write_text("not a version at all\n")
+    h.paths.pin_file.write_text("not a pin\n")
     h.release(sequence=5)
     assert h.check().action == "refused"
 
 
 def test_a_second_concurrent_check_is_refused(h):
     h.release(sequence=5)
-    h.paths.state_dir.mkdir(parents=True, exist_ok=True)
     fd = os.open(h.paths.lock_file, os.O_CREAT | os.O_RDWR)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -288,12 +375,99 @@ def test_a_second_concurrent_check_is_refused(h):
     assert h.restarts() == 0
 
 
-# --- rollback (F2, F4, F11) -------------------------------------------------------------------
+# --- probation (activation review P0) --------------------------------------------------------
 
 
-def _activate_first(h: Harness) -> None:
-    h.release(sequence=5)
+def test_a_release_that_dies_during_the_second_look_is_rolled_back(h):
+    _activate_first(h)
+    h.release(sequence=6, image=h.image("3"))
+
+    def crash():
+        if h.running_image() == h.image("3"):
+            h.running[h.profile.container] = None
+
+    h.after_sleep = crash
+    outcome = h.check()
+    assert outcome.action == "rolled_back", outcome.reason
+    assert h.running_image() == h.new_image
+
+
+def test_a_release_that_restarts_during_the_second_look_is_rolled_back(h):
+    """Up at both looks is not enough: it must be the same container, with no restart."""
+
+    _activate_first(h)
+    h.release(sequence=6, image=h.image("3"))
+
+    def restart():
+        if h.running_image() == h.image("3"):
+            h.nrestarts += 1
+            h.started[h.profile.container] = float(h.now)
+
+    h.after_sleep = restart
+    outcome = h.check()
+    assert outcome.action == "rolled_back", outcome.reason
+    assert "second look" in outcome.reason
+
+
+def test_a_release_that_dies_before_the_next_check_is_rolled_back_not_committed(h):
+    """P1: a crash after the 20 s dwell used to be committed and reported current."""
+
+    _activate_first(h)
+    h.release(sequence=6, image=h.image("3"))
     assert h.check().action == "activated"
+    h.nrestarts += 3  # crash-looped since
+    h.now += 3600
+    outcome = h.check()
+    assert outcome.action == "rolled_back", outcome.reason
+    assert h.state()["miner"]["current"]["image"] == h.new_image
+    assert h.running_image() == h.new_image
+
+
+def test_a_new_container_during_probation_is_not_committed(h):
+    """Same restart count, but a different container: something restarted it."""
+
+    _activate_first(h)
+    h.release(sequence=6, image=h.image("3"))
+    assert h.check().action == "activated"
+    h.started[h.profile.container] += 1800
+    h.now += 3600
+    outcome = h.check()
+    assert outcome.action == "rolled_back", outcome.reason
+    assert h.state()["miner"]["current"]["image"] == h.new_image
+
+
+def test_a_committed_release_that_later_dies_alerts(h):
+    """P1: the `current` shortcut checks the miner and alerts when it is down."""
+
+    _activate_first(h)
+    h.running[h.profile.container] = None
+    h.release(sequence=6)
+    outcome = h.check()
+    assert outcome.action == "unhealthy" and outcome.exit_status == EXIT_ALERT
+
+
+def test_restarts_since_the_last_check_alert_once(h):
+    _activate_first(h)
+    h.nrestarts += 2
+    outcome = h.check()
+    assert outcome.action == "unhealthy" and "restarted 2 times" in outcome.reason
+    assert h.check().action == "current"
+
+
+def test_a_reboot_during_probation_restarts_probation(h):
+    _activate_first(h)
+    h.release(sequence=6, image=h.image("3"))
+    h.check()
+    h.boot = "boot-2"
+    h.started[h.profile.container] += 5000
+    outcome = h.check()
+    assert outcome.action == "activated" and "rebooted" in outcome.reason
+    assert stage(h) == STAGE_PROBATION
+    h.now += 3600
+    assert h.check().action == "current"
+
+
+# --- rollback (F2, F4, F11) and failure memory ----------------------------------------------
 
 
 def test_a_schema_compatible_failure_rolls_back_and_is_remembered(h):
@@ -305,20 +479,27 @@ def test_a_schema_compatible_failure_rolls_back_and_is_remembered(h):
     assert outcome.action == "rolled_back", outcome.reason
     assert outcome.exit_status == EXIT_REFUSED
     assert h.running_image() == h.new_image
-    assert h.state()["failed"]["sequence"] == 6
     restarts = h.restarts()
     again = h.check()
     assert again.action == "refused" and "already failed" in again.reason
     assert h.restarts() == restarts, "a failed release is not retried every hour (F11)"
 
 
-def test_rollback_works_on_a_live_miner_that_writes_its_database(h):
-    """F2: the old image writes its replay database during the attempt.
+def test_failure_memory_holds_across_a_re_signature(h):
+    """Activation review P3: failure memory is keyed by content."""
 
-    #197 fingerprinted this directory and halted whenever it changed, which on
-    a live miner is almost every time (review probe B). The schema rule does
-    not look at it, so the host rolls back and keeps serving.
-    """
+    _activate_first(h)
+    bad = h.image("3")
+    h.broken_images.add(bad)
+    h.release(sequence=6, image=bad)
+    h.check()
+    h.release(sequence=7, image=bad)
+    outcome = h.check()
+    assert outcome.action == "refused" and "already failed" in outcome.reason
+
+
+def test_rollback_works_on_a_live_miner_that_writes_its_database(h):
+    """F2: the old image writes its replay database during the attempt."""
 
     _activate_first(h)
     state_dir = h.paths.root / "var/lib/cathedral/validator-access"
@@ -345,20 +526,13 @@ def test_rollback_works_on_a_live_miner_that_writes_its_database(h):
     assert len(served) == 2
     assert outcome.action == "rolled_back", outcome.reason
     assert h.running_image() == h.new_image
-    assert h.state()["miner"]["stage"] is None
     with sqlite3.connect(state_dir / "validator-access.sqlite") as connection:
         assert connection.execute("SELECT COUNT(*) FROM validator_request_replays").fetchone()[0] == 2
 
 
 def test_a_launcher_only_change_rolls_back_to_the_legacy_launcher(h):
-    """Same image, new launcher: the previous image trivially reads its own state.
-
-    This is also the rollout's first step: sign the image hosts already run, so
-    every host moves from its own launcher to the managed one with a rollback
-    that is always allowed.
-    """
-
     h.managed_fails = True
+    h.labels[h.old_image] = None  # the image already running needs no label to be taken over
     h.release(sequence=5, image=h.old_image)
     outcome = h.check()
     assert outcome.action == "rolled_back", outcome.reason
@@ -375,46 +549,411 @@ def test_a_schema_bump_that_fails_halts_for_an_operator(h):
     outcome = h.check()
     assert outcome.action == "halted" and outcome.exit_status == EXIT_HALTED
     assert "state schema 2" in outcome.reason
-    assert h.state()["miner"]["stage"] == STAGE_MAY_HAVE_RUN
-    again = h.check()
-    assert again.action == "halted"
-    status = describe_status(h.paths, h.config)
-    assert status["needs_operator"] is True
+    assert stage(h) == STAGE_MAY_HAVE_RUN
+    assert h.check().action == "halted"
+    assert describe_status(h.paths, h.config, expected_uid=os.getuid())["needs_operator"] is True
 
 
-def test_a_first_activation_with_an_unknown_previous_schema_halts(h):
-    """From the legacy launcher with a different image, the old schema is unknown."""
-
-    bad = h.new_image
-    h.broken_images.add(bad)
+def test_a_first_activation_with_an_unverified_previous_schema_halts(h):
+    h.broken_images.add(h.new_image)
     h.release(sequence=5)
     assert h.check().action == "halted"
 
 
-def test_resolve_restore_previous_puts_the_previous_release_back(h):
+def test_reset_failed_runs_before_the_rollback_start(h):
+    _activate_first(h)
+    h.systemctl_calls.clear()
+    h.broken_images.add(h.image("3"))
+    h.release(sequence=6, image=h.image("3"))
+    h.check()
+    unit = h.config.miner_unit
+    assert h.systemctl_calls[-3:] == [("daemon-reload",), ("reset-failed", unit), ("restart", unit)]
+
+
+def test_a_rollback_whose_restarts_fail_halts(h):
+    _activate_first(h)
+    h.broken_images.add(h.image("3"))
+    h.on_restart = lambda image: setattr(h, "restart_raises", True)
+    h.release(sequence=6, image=h.image("3"))
+    outcome = h.check()
+    assert outcome.action == "halted" and "two starts" in outcome.reason
+
+
+def test_the_previous_release_gets_a_second_start(h):
+    """P1-4: one failed start of the previous release no longer strands the host."""
+
+    _activate_first(h)
+    bad = h.image("3")
+    h.broken_images.add(bad)
+    attempts = {"previous": 0}
+
+    def flaky(image):
+        if image == h.new_image:
+            attempts["previous"] += 1
+            if attempts["previous"] == 1:
+                h.running[h.profile.container] = None
+
+    h.on_restart = flaky
+    h.release(sequence=6, image=bad)
+    assert h.check().action == "rolled_back"
+    assert attempts["previous"] == 2
+
+
+def test_a_registry_outage_after_the_pull_does_not_block_the_rollback(h):
+    """P7: the managed launcher starts from the local digest, so GHCR is not needed."""
+
+    _activate_first(h)
+    bad = h.image("3")
+    h.broken_images.add(bad)
+    h.on_prepare = lambda: None
+    h.release(sequence=6, image=bad)
+
+    def registry_drops(image):
+        h.registry_up = False
+
+    h.on_restart = registry_drops
+    outcome = h.check()
+    assert outcome.action == "rolled_back", outcome.reason
+    assert h.running_image() == h.new_image
+
+
+def test_the_launchers_start_from_a_local_verified_digest():
+    from cathedral.miner_products import PRODUCTS, find_launcher
+    from tests.miner_update_support import REPO_ROOT
+
+    for product in PRODUCTS.values():
+        text = find_launcher(REPO_ROOT, product).read_text()
+        guard = text.index("if ! docker image inspect")
+        pull = text.index("docker pull --platform linux/amd64")
+        close = text.index("\nfi\n", pull)
+        assert guard < pull < close
+        assert text.count("docker pull") == 1
+        assert '"${IMAGE_PREFIX}${image_digest}"' in text[guard:pull]
+
+
+# --- the flip time (activation review P2, P3, P4) ------------------------------------------------
+
+
+def _die_after_flip(h: Harness) -> None:
+    real = h._systemctl
+
+    def die(arguments):
+        raise KeyboardInterrupt("killed after the flip")
+
+    h._systemctl = die
+    with pytest.raises(KeyboardInterrupt):
+        h.check()
+    h._systemctl = real
+    assert stage(h) == STAGE_MAY_HAVE_RUN
+
+
+def test_a_launcher_that_never_ran_is_started_before_it_is_judged(h):
+    """P2: same image, crash between the flip and the restart."""
+
+    h.labels[h.old_image] = None
+    h.release(sequence=5, image=h.old_image, bundle={"launcher_suffix": b"# broken v2\n"})
+    _die_after_flip(h)
+    h.managed_fails = True
+    before = h.restarts()
+    outcome = h.check()
+    assert h.restarts() > before, "the new launcher is started, not assumed"
+    assert outcome.action == "rolled_back", outcome.reason
+    assert h.active() == LEGACY
+
+
+def test_a_failed_daemon_reload_is_never_reported_activated(h):
+    """P3: the old container runs the same image, but nothing restarted."""
+
+    h.labels[h.old_image] = None
+    h.release(sequence=5, image=h.old_image, bundle={"launcher_suffix": b"# v2\n"})
+    real = h._systemctl
+
+    def reload_fails(arguments):
+        if arguments[0] == "daemon-reload":
+            h.systemctl_calls.append(tuple(arguments))
+            raise MinerUpdateError("systemctl daemon-reload timed out")
+        real(arguments)
+
+    h._systemctl = reload_fails
+    outcome = h.check()
+    assert outcome.action != "activated"
+    assert h.state()["miner"]["current"] is None
+
+
+def test_a_restart_that_did_not_take_effect_is_retried_before_judging(h):
+    """P2/P4: an old container, whatever its image, means the release has not run yet."""
+
+    _activate_first(h)
+    h.release(sequence=6, image=h.image("3"))
+    before = h.restarts()
+    real = h._systemctl
+    ignored = {"restarts": 0}
+
+    def first_restart_is_lost(arguments):
+        if arguments[0] == "restart" and ignored["restarts"] == 0:
+            ignored["restarts"] += 1
+            h.systemctl_calls.append(tuple(arguments))
+            return  # systemctl said yes, but the old container keeps running
+        real(arguments)
+
+    h._systemctl = first_restart_is_lost
+    outcome = h.check()
+    assert outcome.action == "activated", outcome.reason
+    assert h.running_image() == h.image("3")
+    assert h.restarts() - before == 2
+    assert h.state()["failed"] is None
+
+
+def test_the_old_container_never_passes_for_a_same_image_release(h):
+    """P2: when no restart takes effect, the old container runs the same image,
+    and it still is not the release."""
+
+    h.labels[h.old_image] = None
+    h.release(sequence=5, image=h.old_image, bundle={"launcher_suffix": b"# v2\n"})
+    real = h._systemctl
+
+    def restarts_do_nothing(arguments):
+        if arguments[0] == "restart":
+            h.systemctl_calls.append(tuple(arguments))
+            return
+        real(arguments)
+
+    h._systemctl = restarts_do_nothing
+    outcome = h.check()
+    assert outcome.action == "rolled_back", outcome.reason
+    assert h.state()["miner"]["stage"] is None and h.active() == LEGACY
+
+
+def test_a_restart_error_is_never_ignored_even_when_the_release_runs(h):
+    """P2: `systemctl restart` reported a failure; what then runs is not trusted."""
+
+    _activate_first(h)
+    h.release(sequence=6, image=h.image("3"))
+    real = h._systemctl
+    calls = {"restart": 0}
+
+    def first_restart_errors_after_it_ran(arguments):
+        real(arguments)
+        if arguments[0] == "restart":
+            calls["restart"] += 1
+            if calls["restart"] == 1:
+                raise MinerUpdateError("systemctl restart timed out")
+
+    h._systemctl = first_restart_errors_after_it_ran
+    outcome = h.check()
+    assert outcome.action == "rolled_back" and "restart failed" in outcome.reason, outcome.reason
+    assert h.running_image() == h.new_image
+
+
+def test_a_crash_after_the_flip_starts_the_release_instead_of_failing_it(h):
+    """P4: the next check starts the release rather than remembering it as failed."""
+
+    _activate_first(h)
+    h.release(sequence=6, image=h.image("3"))
+    _die_after_flip(h)
+    outcome = h.check()
+    assert outcome.action == "activated", outcome.reason
+    assert h.state()["failed"] is None
+    assert h.running_image() == h.image("3")
+
+
+# --- state schema (activation review P2, P5) ---------------------------------------------------
+
+
+def test_a_label_that_differs_from_the_record_is_refused(h):
+    h.labels[h.new_image] = 3
+    h.release(sequence=5, state_schema=2)
+    outcome = h.check()
+    assert outcome.action == "refused" and "label is 3" in outcome.reason
+    assert h.restarts() == 0
+
+
+def test_an_unlabelled_image_is_taken_over_only_if_it_already_runs(h):
+    h.labels[h.new_image] = None
+    h.release(sequence=5)
+    outcome = h.check()
+    assert outcome.action == "refused" and "no org.cathedral.state-schema label" in outcome.reason
+
+
+def test_a_schema_decrease_is_refused(h):
+    """P5."""
+
+    h.release(sequence=5, state_schema=2)
+    h.commit()
+    h.release(sequence=6, image=h.image("3"), state_schema=1)
+    outcome = h.check()
+    assert outcome.action == "refused" and "schemas never go down" in outcome.reason
+    assert h.running_image() == h.new_image
+
+
+def test_a_schema_decrease_with_the_same_image_is_allowed(h):
+    """Only a different image can write another format; a launcher-only change may relabel."""
+
+    h.release(sequence=5, state_schema=2)
+    h.commit()
+    h.labels[h.new_image] = 2
+    h.release(sequence=6, state_schema=2, bundle={"launcher_suffix": b"# v2\n"})
+    assert h.commit().action == "current"
+
+
+def test_the_miner_images_carry_the_durable_state_schema_label():
+    from cathedral.validator_access import DURABLE_STATE_SCHEMA
+    from tests.miner_update_support import REPO_ROOT
+
+    dockerfiles = sorted(REPO_ROOT.glob("Dockerfile.*-miner"))
+    assert len(dockerfiles) == 2
+    for dockerfile in dockerfiles:
+        assert f'LABEL org.cathedral.state-schema="{DURABLE_STATE_SCHEMA}"' in dockerfile.read_text()
+
+
+# The durable-state tables of schema 2, as (declared type, required). Required
+# means NOT NULL with no default: every writer must fill it. An image of schema
+# 2 writes exactly these columns. So state that newer code creates stays
+# writable by every schema-2 image while no pinned table or column is dropped
+# or changed and every new column is optional. A nullable column added by a
+# migration (for example #212's clock high-water) keeps schema 2. Anything else
+# raises DURABLE_STATE_SCHEMA and the Dockerfile labels, and so does any change
+# in what a column means, which no structural test can see.
+_SCHEMA_2_TABLES = {
+    "validator_request_clock_high_water": {
+        "singleton": ("INTEGER", False),
+        "observed_at_epoch": ("INTEGER", True),
+    },
+    "validator_request_replays": {
+        "validator_hotkey": ("TEXT", True),
+        "nonce_hex": ("TEXT", True),
+        "expires_at_epoch": ("INTEGER", True),
+    },
+    "validator_snapshot_high_water": {
+        "network": ("TEXT", True),
+        "netuid": ("INTEGER", True),
+        "block": ("INTEGER", True),
+        "block_hash": ("TEXT", True),
+        "snapshot_digest": ("TEXT", True),
+        "authorization_digest": ("TEXT", True),
+    },
+}
+
+
+def _durable_state(tmp_path):
+    directory = tmp_path / "state"
+    directory.mkdir(mode=0o700)
+    ValidatorAccessState(str(directory / "validator-access.sqlite"))
+    return directory / "validator-access.sqlite"
+
+
+def test_state_this_code_creates_stays_writable_by_every_schema_2_image(tmp_path):
+    from cathedral.validator_access import DURABLE_STATE_SCHEMA
+
+    with sqlite3.connect(_durable_state(tmp_path)) as connection:
+        tables = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+        actual = {
+            table: {
+                name: (declared, bool(notnull) and default is None)
+                for _cid, name, declared, notnull, default, _pk in connection.execute(
+                    f"PRAGMA table_info({table})"
+                )
+            }
+            for table in tables
+        }
+    assert DURABLE_STATE_SCHEMA == 2
+    assert set(actual) == set(_SCHEMA_2_TABLES), "a table was added or dropped: decide the schema number"
+    for table, pinned in _SCHEMA_2_TABLES.items():
+        for column, spec in pinned.items():
+            assert actual[table].get(column) == spec, f"{table}.{column} changed: raise the schema"
+        added = [name for name, (_, required) in actual[table].items() if name not in pinned and required]
+        assert added == [], f"{table} gained required columns {added}: raise the schema"
+
+
+def test_schema_1_code_cannot_write_state_created_since_179(tmp_path):
+    """Why "existing images are schema 1" was false: #179 made a column NOT NULL
+    in the tables it creates, and code from before #179 does not fill it."""
+
+    with sqlite3.connect(_durable_state(tmp_path)) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+            # The insert the code before #179 (8ad7f6e) ran.
+            connection.execute(
+                "INSERT INTO validator_snapshot_high_water "
+                "(network, netuid, block, block_hash, snapshot_digest) VALUES (?, ?, ?, ?, ?)",
+                ("testnet", NETUID, 1, "0x" + "0" * 64, "0" * 64),
+            )
+
+
+# --- halts and resolve (activation review P1-3, P6) ----------------------------------------------
+
+
+def _halt_on_schema_bump(h: Harness) -> None:
     _activate_first(h)
     bad = h.image("3")
     h.broken_images.add(bad)
     h.release(sequence=6, image=bad, state_schema=2)
+    assert h.check().action == "halted"
+
+
+def test_abandon_lets_a_newer_release_recover_a_halted_host(h):
+    """P6: neither image runs, restore and accept both refuse; abandon then N+1 works."""
+
+    _halt_on_schema_bump(h)
+    h.broken_images.add(h.new_image)
+    assert resolve(h.host(), "restore-previous").action == "halted"
+    assert resolve(h.host(), "accept-release").action == "refused"
+    outcome = resolve(h.host(), "abandon")
+    assert outcome.action == "resolved", outcome.reason
+    assert stage(h) is None
+    h.release(sequence=7, image=h.image("4"), state_schema=2)
+    assert h.commit().action == "current"
+    assert h.running_image() == h.image("4")
+
+
+def test_a_halted_host_still_takes_a_newer_updater(h):
+    """P1-3: a halt blocks activation, not the channel."""
+
+    _halt_on_schema_bump(h)
+    before = h.updater_current()
+    h.release(sequence=7, image=h.image("3"), state_schema=2, bundle={"launcher_suffix": b"# fix\n"})
     h.check()
+    assert h.updater_current() != before
+
+
+def test_resolve_restore_previous_puts_the_previous_release_back(h):
+    _halt_on_schema_bump(h)
     outcome = resolve(h.host(), "restore-previous")
     assert outcome.action == "resolved", outcome.reason
     assert h.running_image() == h.new_image
-    assert h.state()["miner"]["stage"] is None
+    assert stage(h) is None
     assert h.state()["failed"]["sequence"] == 6
 
 
-def test_resolve_accept_release_commits_a_running_release(h):
-    _activate_first(h)
-    bad = h.image("3")
-    h.broken_images.add(bad)
-    h.release(sequence=6, image=bad, state_schema=2)
-    h.check()
-    h.broken_images.discard(bad)
-    h.running[h.profile.container] = bad  # the operator fixed and started it
+def test_resolve_accept_release_requires_the_release_to_run(h):
+    """Kills the reviewer's surviving mutant that skipped the running check."""
+
+    _halt_on_schema_bump(h)
+    outcome = resolve(h.host(), "accept-release")
+    assert outcome.action == "refused" and "not running" in outcome.reason
+    assert stage(h) == STAGE_MAY_HAVE_RUN
+    # The previous image running is not the release running.
+    h.running[h.profile.container] = h.new_image
+    outcome = resolve(h.host(), "accept-release")
+    assert outcome.action == "refused" and "not running" in outcome.reason
+    assert stage(h) == STAGE_MAY_HAVE_RUN
+
+
+def test_resolve_accept_release_selects_the_release_and_reloads_units(h):
+    """Kills the reviewer's surviving mutant that did not flip miner/current."""
+
+    _halt_on_schema_bump(h)
+    pending = h.state()["miner"]["pending"]
+    from cathedral.miner_bundle import atomic_symlink
+
+    atomic_symlink(h.paths.miner_current, pending["previous_target"])
+    h.broken_images.discard(h.image("3"))
+    h.running[h.profile.container] = h.image("3")  # the operator fixed and started it
+    h.systemctl_calls.clear()
     outcome = resolve(h.host(), "accept-release")
     assert outcome.action == "resolved", outcome.reason
-    assert h.state()["miner"]["current"]["image"] == bad
+    assert h.active() == pending["target"]
+    assert ("daemon-reload",) in h.systemctl_calls
+    assert h.state()["miner"]["current"]["image"] == h.image("3")
 
 
 def test_resolve_retry_clears_failure_memory(h):
@@ -428,43 +967,6 @@ def test_resolve_retry_clears_failure_memory(h):
     assert h.check().action == "activated"
 
 
-def test_reset_failed_runs_before_the_rollback_start(h):
-    """F4: a crash-looping release can trip the start limit, refusing the rollback start."""
-
-    _activate_first(h)
-    h.systemctl_calls.clear()
-    bad = h.image("3")
-    h.broken_images.add(bad)
-    h.release(sequence=6, image=bad)
-    h.check()
-    unit = h.config.miner_unit
-    assert h.systemctl_calls[-3:] == [("daemon-reload",), ("reset-failed", unit), ("restart", unit)]
-
-
-def test_a_rollback_whose_restart_fails_halts(h):
-    _activate_first(h)
-    bad = h.image("3")
-    h.broken_images.add(bad)
-
-    def fail_after_first(image):
-        h.restart_raises = True
-
-    h.on_restart = fail_after_first
-    h.release(sequence=6, image=bad)
-    outcome = h.check()
-    assert outcome.action == "halted"
-    assert "may be running nothing" in outcome.reason
-
-
-def test_a_rollback_that_does_not_bring_the_old_image_back_halts(h):
-    _activate_first(h)
-    bad = h.image("3")
-    h.broken_images.update({bad, h.new_image})
-    h.release(sequence=6, image=bad)
-    outcome = h.check()
-    assert outcome.action == "halted" and "did not come back" in outcome.reason
-
-
 # --- atomic launcher delivery (F5) ---------------------------------------------------------------
 
 
@@ -473,50 +975,29 @@ def test_a_launcher_update_is_applied_atomically(h):
     first = h.active()
     old_launcher = (activation_dir(h) / "launcher").read_bytes()
     h.release(sequence=6, image=h.image("3"), bundle={"launcher_suffix": b"# launcher v2\n"})
-    assert h.check().action == "activated"
+    assert h.commit().action == "current"
     second = h.active()
     assert second != first
     new_dir = activation_dir(h)
     assert (new_dir / "launcher").read_bytes() == old_launcher + b"# launcher v2\n"
     assert h.image("3") in (new_dir / "release.env").read_text()
-    # One symlink selects launcher, pin and unit drop-in together.
     assert h.paths.miner_current.is_symlink()
     for name in ("launcher", "release.env", "unit.conf"):
         assert (h.paths.miner_current / name).resolve().parent == new_dir.resolve()
-    # The previous activation is untouched, so a rollback is one rename back.
     assert (h.paths.miner_dir / first / "launcher").read_bytes() == old_launcher
     assert os.stat(new_dir / "launcher").st_mode & 0o777 == 0o555
-
-
-def test_a_crash_after_the_flip_is_resolved_on_the_next_run(h):
-    """The latch survives a crash between the flip and the health check."""
-
-    _activate_first(h)
-    h.release(sequence=6, image=h.image("3"))
-
-    def die(image):
-        raise KeyboardInterrupt("power lost")
-
-    h.on_restart = die
-    with pytest.raises(KeyboardInterrupt):
-        h.check()
-    assert h.state()["miner"]["stage"] == STAGE_MAY_HAVE_RUN
-    h.on_restart = None
-    outcome = h.check()
-    assert outcome.action == "current", outcome.reason
-    assert h.state()["miner"]["current"]["image"] == h.image("3")
 
 
 def test_a_tampered_activation_directory_is_refused(h):
     _activate_first(h)
     first = activation_dir(h)
     h.release(sequence=6, image=h.image("3"))
-    assert h.check().action == "activated"
+    h.commit()
     launcher = first / "launcher"
     os.chmod(launcher, 0o755)
     launcher.write_bytes(b"#!/bin/sh\necho tampered\n")
     os.chmod(launcher, 0o555)
-    h.release(sequence=7)  # the first release's image and bundle again
+    h.release(sequence=7)
     outcome = h.check()
     assert outcome.action == "refused" and "modified" in outcome.reason
     assert h.running_image() == h.image("3")
@@ -525,9 +1006,9 @@ def test_a_tampered_activation_directory_is_refused(h):
 # --- reconcile -----------------------------------------------------------------------------------
 
 
-def _write_stage(h: Harness, stage, pending) -> None:
+def _write_stage(h: Harness, value, pending) -> None:
     state = h.state()
-    state["miner"]["stage"] = stage
+    state["miner"]["stage"] = value
     state["miner"]["pending"] = pending
     write_state(h.paths.state_file, state)
 
@@ -544,43 +1025,79 @@ def test_an_interrupted_activation_without_a_pending_record_halts(h):
     assert h.check().action == "halted"
 
 
+def _pending_before_flip(h: Harness) -> dict:
+    return {
+        "release": {"image": h.image("3"), "state_schema": 1, "tree_sha256": "0" * 64},
+        "target": "releases/" + "0" * 64,
+        "container": h.profile.container,
+        "previous_target": h.active(),
+        "previous_container": h.profile.container,
+        "previous_image": h.new_image,
+        "previous_state_schema": 1,
+        "schema_verified": True,
+        "flip_unix": h.now,
+        "probation": None,
+    }
+
+
 def test_an_interrupted_activation_before_the_flip_is_cleared(h):
     _activate_first(h)
-    active = h.active()
-    _write_stage(
-        h,
-        STAGE_MAY_HAVE_RUN,
-        {
-            "release": {"image": h.image("3"), "state_schema": 1},
-            "target": "releases/" + "0" * 64,
-            "container": h.profile.container,
-            "previous_target": active,
-            "previous_container": h.profile.container,
-            "previous_image": h.new_image,
-            "previous_state_schema": 1,
-        },
-    )
+    _write_stage(h, STAGE_MAY_HAVE_RUN, _pending_before_flip(h))
     assert h.check().action == "current"
-    assert h.state()["miner"]["stage"] is None
+    assert stage(h) is None
 
 
-def test_an_interrupted_activation_with_nothing_running_halts(h):
+def test_the_previous_release_is_started_again_before_a_halt(h):
+    """P1-4 / P7: reconcile retries the known-good previous release."""
+
     _activate_first(h)
-    active = h.active()
     h.running[h.profile.container] = None
-    _write_stage(
-        h,
-        STAGE_MAY_HAVE_RUN,
-        {
-            "release": {"image": h.image("3"), "state_schema": 1},
-            "target": "releases/" + "0" * 64,
-            "container": h.profile.container,
-            "previous_target": active,
-            "previous_container": h.profile.container,
-            "previous_image": h.new_image,
-            "previous_state_schema": 1,
-        },
-    )
+    _write_stage(h, STAGE_MAY_HAVE_RUN, _pending_before_flip(h))
+    outcome = h.check()
+    assert outcome.action == "current", outcome.reason
+    assert h.running_image() == h.new_image
+
+
+def test_a_rollback_that_halted_and_later_completes_remembers_the_release(h):
+    _activate_first(h)
+    bad = h.image("3")
+    h.broken_images.add(bad)
+    h.broken_images.add(h.new_image)  # the previous release does not come back at first
+    h.release(sequence=6, image=bad)
+    assert h.check().action == "halted"
+    h.broken_images.discard(h.new_image)
+    assert h.check().action == "refused"  # recovered, and the failed release is not retried
+    assert h.running_image() == h.new_image and stage(h) is None
+    assert h.state()["failed"]["image"] == bad
+
+
+def test_abandon_clears_a_stage_with_no_pending_record(h):
+    """P1-3: every halt has an exit."""
+
+    _write_stage(h, STAGE_MAY_HAVE_RUN, None)
+    h.release(sequence=5)
+    assert h.check().action == "halted"
+    assert resolve(h.host(), "abandon").action == "resolved"
+    assert h.check().action == "activated"
+
+
+def test_a_probation_whose_selection_changed_halts(h):
+    _activate_first(h)
+    h.release(sequence=6, image=h.image("3"))
+    assert h.check().action == "activated"
+    from cathedral.miner_bundle import atomic_symlink
+
+    atomic_symlink(h.paths.miner_current, LEGACY)
+    h.now += 3600
+    outcome = h.check()
+    assert outcome.action == "halted" and "changed during probation" in outcome.reason
+
+
+def test_an_interrupted_activation_that_cannot_restart_halts(h):
+    _activate_first(h)
+    h.running[h.profile.container] = None
+    h.broken_images.add(h.new_image)
+    _write_stage(h, STAGE_MAY_HAVE_RUN, _pending_before_flip(h))
     assert h.check().action == "halted"
 
 
@@ -592,21 +1109,21 @@ def test_status_shows_the_release_the_last_check_and_the_last_refusal(h):
     h.release(sequence=4, image=h.image("3"))
     h.check()
     h.paths.pause_file.write_text("")
-    h.paths.pin_file.write_text("2026.09.26\n")
-    status = describe_status(h.paths, h.config)
+    h.paths.pin_file.write_bytes(pin_document(h.state()["miner"]["current"]))
+    status = describe_status(h.paths, h.config, expected_uid=os.getuid())
     assert status["miner"]["current_release"]["image"] == h.new_image
     assert status["miner"]["active"] == h.active()
     assert status["last_check"]["action"] == "refused"
     assert "rolls back" in status["last_refusal"]["reason"]
     assert status["paused"] is True
-    assert status["pinned_version"] == "2026.09.26"
+    assert status["pinned"]["image"] == h.new_image
     assert status["updater"]["current"] == f"releases/{h.tree_a}"
+    assert status["trust"]["generation"] == 1
     assert status["config"]["netuid"] == h.config.netuid
     assert status["needs_operator"] is False
 
 
 def test_status_works_with_no_state_yet(h):
-    status = describe_status(h.paths, None)
+    status = describe_status(h.paths, None, expected_uid=os.getuid())
     assert status["miner"]["current_release"] is None
     assert status["last_check"] is None
-    assert link_target(h.paths.miner_current) == LEGACY

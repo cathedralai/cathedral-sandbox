@@ -24,7 +24,6 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from cathedral.miner_bundle import (
     TREE_LAUNCHER,
-    TREE_TRUST_ROOT,
     assemble_tree,
     atomic_symlink,
     build_archive,
@@ -37,21 +36,25 @@ from cathedral.miner_products import SNP_MINER, MinerProduct, read_launcher_prof
 from cathedral.miner_release import (
     MINER_RELEASE_SCHEMA,
     TRUST_ROOT_SCHEMA,
+    initial_trust_state,
     load_trust_root,
     signed_bytes,
 )
 from cathedral.miner_updater import (
     CONFIG_SCHEMA,
     LEGACY,
+    STAGE_PROBATION,
     HostConfig,
     HostPaths,
     MinerUpdateError,
     MinerUpdaterHost,
+    Observation,
     UpdateOutcome,
     probe_release,
     read_activation_profile,
     read_state,
     update_once,
+    write_trust_state,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -216,7 +219,16 @@ def config_document(**overrides) -> dict[str, object]:
 
 
 class Harness:
-    """A miner host under a temporary root, with docker and systemd faked."""
+    """A miner host under a temporary root, with docker and systemd faked.
+
+    The fake miner keeps, per container, the image it runs (None when down),
+    when it started, and the unit's restart count. A restart starts whatever
+    ``miner/current`` selects. It fails to come up when the image is broken,
+    when ``managed_fails`` is set and a release (not legacy) is selected, or
+    when its launcher needs the registry and the registry is down. The legacy
+    launcher pulls on every start; a release's launcher pulls only when the
+    image is not already local, as the repository's launchers now do.
+    """
 
     def __init__(self, tmp_path: Path, *, channel: str = "stable", minimum_sequence: int = 0) -> None:
         self.work = tmp_path / "work"
@@ -227,9 +239,11 @@ class Harness:
         )
         self.now = NOW
 
-        # The updater the bootstrap installed.
+        # The updater the bootstrap installed, and the host trust set it wrote.
         self.tree_a = self.install_updater_tree()
         atomic_symlink(self.paths.updater_current, f"releases/{self.tree_a}")
+        self.paths.state_dir.mkdir(parents=True, exist_ok=True)
+        write_trust_state(self.paths.trust_file, initial_trust_state(trust_root_bytes()))
         self.profile = read_launcher_profile(
             self.paths.updater_releases / self.tree_a / TREE_LAUNCHER
         )
@@ -247,11 +261,17 @@ class Harness:
         self.paths.config_dir.mkdir(parents=True)
         self.paths.config_file.write_text(json.dumps(self.config.as_document()))
 
-        self.running: dict[str, str | None] = {self.profile.container: self.old_image}
+        container = self.profile.container
+        self.running: dict[str, str | None] = {container: self.old_image}
+        self.started: dict[str, float] = {container: float(NOW - 86_400)}
+        self.nrestarts = 0
+        self.operator_stopped = False
         self.broken_images: set[str] = set()
-        # When set, anything started from a release (not legacy) fails to come
-        # up: a broken launcher rather than a broken image.
         self.managed_fails = False
+        self.registry_up = True
+        self.local_images: set[str] = {self.old_image}
+        self.labels: dict[str, int | None] = {}
+        self.boot = "boot-1"
         self.systemctl_calls: list[tuple[str, ...]] = []
         self.restart_raises = False
         self.prepare_raises = False
@@ -262,6 +282,7 @@ class Harness:
         self.fetches = 0
         self.on_prepare: Callable[[], None] | None = None
         self.on_restart: Callable[[str | None], None] | None = None
+        self.after_sleep: Callable[[], None] | None = None
 
     # --- building releases -------------------------------------------------------
 
@@ -291,26 +312,66 @@ class Harness:
 
     # --- fake host effects -----------------------------------------------------
 
+    def _launcher_needs_registry(self, target: str, image: str) -> bool:
+        if target == LEGACY:
+            return True  # the operator's own launcher pulls on every start
+        text = (self.paths.miner_dir / target / "launcher").read_text()
+        guarded = "if ! docker image inspect" in text
+        return not guarded or image not in self.local_images
+
     def _systemctl(self, arguments) -> None:
         self.systemctl_calls.append(tuple(arguments))
         if arguments[0] != "restart":
             return
         if self.restart_raises:
             raise MinerUpdateError("systemctl restart failed")
+        self.operator_stopped = False
+        self.now += 1
         target = link_target(self.paths.miner_current)
         profile = read_activation_profile(self.paths, target)
-        image = self.legacy_image if target == LEGACY else profile["image"]
-        failed = image in self.broken_images or (self.managed_fails and target != LEGACY)
-        self.running[str(profile["container"])] = None if failed else image
+        image = self.legacy_image if target == LEGACY else str(profile["image"])
+        failed = (
+            image in self.broken_images
+            or (self.managed_fails and target != LEGACY)
+            or (self._launcher_needs_registry(target, image) and not self.registry_up)
+        )
+        container = str(profile["container"])
+        self.running[container] = None if failed else image
+        self.started[container] = float(self.now)
         if self.on_restart is not None:
             self.on_restart(image)
 
-    def _prepare(self, release, profile) -> None:
+    def _prepare(self, release, profile):
         if self.on_prepare is not None:
             self.on_prepare()
-        if self.prepare_raises:
+        if self.prepare_raises or not self.registry_up:
             raise MinerUpdateError("docker pull failed")
         self.prepared.append(release.image)
+        self.local_images.add(release.image)
+        return self.labels.get(release.image, release.state_schema)
+
+    def _unit_state(self) -> str:
+        if self.operator_stopped:
+            return "inactive"
+        target = link_target(self.paths.miner_current)
+        container = str(read_activation_profile(self.paths, target)["container"])
+        return "active" if self.running.get(container) else "failed"
+
+    def _observe(self, container: str) -> Observation | None:
+        image = self.running.get(container)
+        if image is None or self.operator_stopped:
+            return None
+        return Observation(
+            image=image,
+            started_at=self.started.get(container, 0.0),
+            restarts=self.nrestarts,
+            active=True,
+        )
+
+    def _sleep(self, seconds: float) -> None:
+        self.now += int(seconds)
+        if self.after_sleep is not None:
+            self.after_sleep()
 
     def _safe(self) -> bool:
         return self.safe.pop(0) if len(self.safe) > 1 else self.safe[0]
@@ -332,13 +393,9 @@ class Harness:
     def host(self, *, running_tree: str | None = None, **overrides) -> MinerUpdaterHost:
         if running_tree is None:
             running_tree = str(link_target(self.paths.updater_current)).split("/")[-1]
-        keys = load_trust_root(
-            (self.paths.updater_releases / running_tree / TREE_TRUST_ROOT).read_bytes()
-        )
         fields = dict(
             config=self.config,
             paths=self.paths,
-            trusted_keys=keys,
             running_tree=running_tree,
             fetch_metadata=self._fetch_metadata,
             fetch_bundle=lambda bundle: self.bundles[bundle.archive_sha256],
@@ -346,10 +403,13 @@ class Harness:
             handoff=self._handoff,
             prepare_image=self._prepare,
             systemctl=self._systemctl,
-            current_image=lambda container: self.running.get(container),
-            settled_image=lambda container: self.running.get(container),
+            unit_state=self._unit_state,
+            observe=self._observe,
+            settle=self._observe,
             safe_to_activate=self._safe,
             now_unix=lambda: self.now,
+            sleep=self._sleep,
+            boot_id=lambda: self.boot,
             expected_uid=os.getuid(),
         )
         fields.update(overrides)
@@ -359,6 +419,15 @@ class Harness:
 
     def check(self, **overrides) -> UpdateOutcome:
         return update_once(self.host(**overrides))
+
+    def commit(self, **overrides) -> UpdateOutcome:
+        """One check, then the next check that confirms probation."""
+
+        first = self.check(**overrides)
+        if self.state()["miner"]["stage"] == STAGE_PROBATION:
+            self.now += 3600
+            return self.check(**overrides)
+        return first
 
     def state(self) -> dict:
         return read_state(self.paths.state_file)

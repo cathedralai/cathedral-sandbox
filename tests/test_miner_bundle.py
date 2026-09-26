@@ -236,6 +236,16 @@ def test_every_product_has_a_shipped_unit():
     assert _unit(snp[0])["ExecStart"][0].startswith("/usr/local/sbin/")
 
 
+def test_the_tdx_unit_waits_for_a_fresh_snapshot():
+    """Activation review P2: start after #211's fetch installs a fresh snapshot."""
+
+    unit = _unit(REPO_ROOT / "examples" / "systemd" / "cathedral-audit-miner.service")
+    fetch = "cathedral-validator-access-fetch.service"
+    assert fetch in " ".join(unit["Wants"]).split()
+    assert fetch in " ".join(unit["After"]).split()
+    assert fetch not in " ".join(unit.get("Requires", [])).split(), "a failed fetch must not block the miner"
+
+
 def test_the_audit_env_example_does_not_pin_an_image():
     text = (REPO_ROOT / "examples" / "systemd" / "audit-miner.env.example").read_text()
     assert "_IMAGE=" not in text
@@ -263,3 +273,54 @@ def test_install_renames_within_one_directory(tmp_path, monkeypatch):
         expected_uid=os.getuid(),
     )
     assert renames and all(source == destination for source, destination in renames)
+
+
+# --- extraction caps (trust review P3) -----------------------------------------------------------
+
+
+def _directory(name: str) -> tuple[tarfile.TarInfo, None]:
+    info = tarfile.TarInfo(name)
+    info.type = tarfile.DIRTYPE
+    info.mode = 0o755
+    return info, None
+
+
+def test_directories_count_toward_the_member_cap(tmp_path, monkeypatch):
+    from cathedral import miner_bundle
+
+    monkeypatch.setattr(miner_bundle, "MAX_TREE_FILES", 3)
+    members = [_directory(f"d{index}") for index in range(4)]
+    with pytest.raises(BundleError, match="limits"):
+        extract_archive(_archive(members), tmp_path / "out")
+
+
+def test_pax_headers_count_toward_the_byte_cap(tmp_path, monkeypatch):
+    from cathedral import miner_bundle
+
+    monkeypatch.setattr(miner_bundle, "MAX_TREE_BYTES", 1024)
+    info, body = _file("small", b"x")
+    info.pax_headers = {"comment": "p" * 4096}
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            archive.addfile(info, io.BytesIO(body))
+    with pytest.raises(BundleError, match="limits"):
+        extract_archive(buffer.getvalue(), tmp_path / "out")
+
+
+def test_decompression_is_bounded(tmp_path, monkeypatch):
+    from cathedral import miner_bundle
+
+    monkeypatch.setattr(miner_bundle, "MAX_DECOMPRESSED_BYTES", 64 * 1024)
+    bomb = gzip.compress(b"\0" * (1024 * 1024), mtime=0)
+    with pytest.raises(BundleError, match="expands past"):
+        extract_archive(bomb, tmp_path / "out")
+
+
+def test_a_corrupt_deflate_stream_is_a_bundle_error(tmp_path):
+    """gzip is read directly now, so zlib's own error must not escape."""
+
+    archive = _archive([_file("a", b"x" * 100_000)])
+    corrupt = archive[:20] + bytes([archive[20] ^ 0xFF]) + archive[21:]
+    with pytest.raises(BundleError, match="extraction failed"):
+        extract_archive(corrupt, tmp_path / "out")

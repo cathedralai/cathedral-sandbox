@@ -2,68 +2,67 @@
 
 This is the only module that talks to systemd, docker and the network. The
 state machine in ``miner_updater`` stays free of them so its crash paths stay
-testable. Every host effect turns its failures (a timeout, a missing binary)
-into ``MinerUpdateError``, so they come out as documented refusals rather than
-tracebacks (review finding F16).
+testable. Every host effect turns its failures (a timeout, a missing binary, a
+truncated response) into ``MinerUpdateError``, so they come out as documented
+refusals rather than tracebacks (review finding F16, trust review P0-1), and
+``main`` turns anything else into the documented fault status 13.
 
 It runs through the frozen shim ``bin/cathedral-miner-update``, which sets
 ``CATHEDRAL_MINER_UPDATE_RELEASE`` to the release directory it started. The
-trust root is read from that directory, never from the network.
+trust set comes from the host's state (``/var/lib/cathedral-miner-update/trust.json``),
+never from that directory and never from the network.
 
     cathedral-miner-update check
     cathedral-miner-update status
     cathedral-miner-update pause [--reason TEXT] | resume
-    cathedral-miner-update pin --version V | --current ; unpin
-    cathedral-miner-update resolve --accept-release | --restore-previous | --retry
+    cathedral-miner-update pin --current | unpin
+    cathedral-miner-update resolve --accept-release | --restore-previous | --abandon | --retry
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import http.client
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
-from cathedral.miner_bundle import (
-    MAX_ARCHIVE_BYTES,
-    TREE_TRUST_ROOT,
-    BundleError,
-    require_root_controlled,
-)
+from cathedral.miner_bundle import MAX_ARCHIVE_BYTES, BundleError
 from cathedral.miner_products import LauncherProfile
-from cathedral.miner_release import (
-    MAX_RELEASE_DOCUMENT_BYTES,
-    MinerRelease,
-    MinerReleaseError,
-    TrustedKey,
-    https_url,
-    load_trust_root,
-)
+from cathedral.miner_release import MAX_RELEASE_DOCUMENT_BYTES, MinerRelease, MinerReleaseError, https_url
 from cathedral.miner_updater import (
     DOCUMENTED_EXIT_STATUSES,
+    EXIT_FAULT,
     EXIT_HALTED,
     EXIT_OK,
     EXIT_REFUSED,
+    PROBATION_SAMPLE_SECONDS,
+    STATE_SCHEMA_LABEL,
+    GateImpossible,
     HostConfig,
     HostPaths,
     MinerUpdateError,
     MinerUpdateHalted,
     MinerUpdaterHost,
+    Observation,
     UpdateOutcome,
     _atomic_write,
     describe_status,
+    fallback_to_previous,
     load_config,
+    pin_document,
     probe_release,
-    read_pin,
     read_state,
-    recover_crashed_updater,
     resolve,
     update_once,
 )
@@ -73,41 +72,82 @@ RELEASE_ENV = "CATHEDRAL_MINER_UPDATE_RELEASE"
 LOCK_FD_ENV = "CATHEDRAL_MINER_UPDATE_LOCK_FD"
 HANDOFF_DEPTH_ENV = "CATHEDRAL_MINER_UPDATE_HANDOFF_DEPTH"
 
-# Time budgets. The unit's TimeoutStartSec must exceed their worst-case sum
-# (``worst_case_seconds``) so systemd never kills a check between two durable
-# steps (review finding F15). A test holds the unit to that.
+# Time budgets. The unit's TimeoutStartSec must exceed ``worst_case_seconds``
+# so systemd never kills a check between two durable steps (review finding
+# F15). A test holds the unit to that.
 FETCH_METADATA_DEADLINE_SECONDS = 60
 FETCH_BUNDLE_DEADLINE_SECONDS = 180
 FETCH_READ_TIMEOUT_SECONDS = 20
 PROBE_TIMEOUT_SECONDS = 60
-PULL_TIMEOUT_SECONDS = 600
+PULL_TIMEOUT_SECONDS = 480
 INSPECT_TIMEOUT_SECONDS = 30
-DAEMON_RELOAD_TIMEOUT_SECONDS = 60
+DAEMON_RELOAD_TIMEOUT_SECONDS = 30
 RESET_FAILED_TIMEOUT_SECONDS = 30
-RESTART_TIMEOUT_SECONDS = 180
-SETTLE_TIMEOUT_SECONDS = 120
+RESTART_TIMEOUT_SECONDS = 120
+SETTLE_TIMEOUT_SECONDS = 90
 SETTLE_POLL_SECONDS = 3
-# How long the container must have been up before it counts as running.
-# A crash-looping container reports Running=true between restarts; without a
-# dwell the updater can sample one of those windows and commit a broken release.
+# How long the container must have been up before it counts as running. A
+# crash-looping container reports Running=true between restarts.
 SETTLE_DWELL_SECONDS = 20
 # A restart makes the miner re-read its validator-access snapshot, and a
-# rollback may need a second restart. So a restart is only started with enough
-# validity left for the restart, the settle and a rollback (review finding F3).
+# rollback may need another restart. So a restart is only started with enough
+# validity left for the restart, the settle, the second look and a rollback
+# restart (review finding F3).
 MINIMUM_ACCESS_REMAINING_SECONDS = 600
+# How stale a healthy host's snapshot can be: the validator-access refresher
+# and the worker fetch each run every two minutes (#211). A snapshot whose
+# whole lifetime cannot cover the margin plus this can never pass the gate.
+SNAPSHOT_REFRESH_ALLOWANCE_SECONDS = 240
 SYSTEMD_MARGIN_SECONDS = 120
 
 
-def worst_case_seconds() -> int:
-    """The longest one ``check`` can take: a self-update handoff wrapping an
-    activation that fails and rolls back."""
+def _restart_budget() -> int:
+    return DAEMON_RELOAD_TIMEOUT_SECONDS + RESET_FAILED_TIMEOUT_SECONDS + RESTART_TIMEOUT_SECONDS
 
-    restart = DAEMON_RELOAD_TIMEOUT_SECONDS + RESET_FAILED_TIMEOUT_SECONDS + RESTART_TIMEOUT_SECONDS
-    settle = SETTLE_TIMEOUT_SECONDS + SETTLE_POLL_SECONDS + 2 * INSPECT_TIMEOUT_SECONDS
-    activation = FETCH_METADATA_DEADLINE_SECONDS + PULL_TIMEOUT_SECONDS + 4 * INSPECT_TIMEOUT_SECONDS
-    activation += 2 * (restart + settle)
-    parent = FETCH_METADATA_DEADLINE_SECONDS + FETCH_BUNDLE_DEADLINE_SECONDS + PROBE_TIMEOUT_SECONDS
-    return parent + activation
+
+def _settle_budget() -> int:
+    return SETTLE_TIMEOUT_SECONDS + SETTLE_POLL_SECONDS + 3 * INSPECT_TIMEOUT_SECONDS
+
+
+def _observe_budget() -> int:
+    return 2 * INSPECT_TIMEOUT_SECONDS
+
+
+def _prove_start_budget() -> int:
+    start = _restart_budget() + _settle_budget()
+    second_look = PROBATION_SAMPLE_SECONDS + _observe_budget()
+    rollback = 2 * start
+    return start + start + second_look + rollback
+
+
+def child_budget_seconds() -> int:
+    """One check with no self-update: a reconcile that restarts and rolls back,
+    then an activation that pulls, restarts twice, and rolls back."""
+
+    reconcile = _observe_budget() + _restart_budget() + _prove_start_budget()
+    activation = (
+        FETCH_METADATA_DEADLINE_SECONDS
+        + PULL_TIMEOUT_SECONDS
+        + 4 * INSPECT_TIMEOUT_SECONDS
+        + _observe_budget()
+        + _prove_start_budget()
+    )
+    return reconcile + activation
+
+
+HANDOFF_TIMEOUT_SECONDS = child_budget_seconds() + 60
+"""The new updater's first run is killed after this long and not kept."""
+
+
+def worst_case_seconds() -> int:
+    """The longest one unit run can take: a reconcile, a self-update whose
+    first run uses its whole budget, the dry run that judges it, and the
+    shim's fallback dry run."""
+
+    reconcile = _observe_budget() + _restart_budget() + _prove_start_budget()
+    parent = reconcile + FETCH_METADATA_DEADLINE_SECONDS + FETCH_BUNDLE_DEADLINE_SECONDS
+    parent += PROBE_TIMEOUT_SECONDS + HANDOFF_TIMEOUT_SECONDS + FETCH_METADATA_DEADLINE_SECONDS
+    return parent + FETCH_METADATA_DEADLINE_SECONDS
 
 
 # --- network ----------------------------------------------------------------------------
@@ -124,9 +164,8 @@ def fetch(url: str, *, maximum_bytes: int, deadline_seconds: float) -> bytes:
     """Fetch bounded bytes over https, enforcing the deadline while reading.
 
     Reads with ``read1`` so each wait is one socket read, bounded by the read
-    timeout, and the total deadline is checked between reads. A server that
-    drips bytes cannot hold the lock past the deadline (review finding F15).
-    Follows the validator's ``fetch_bounded_https``.
+    timeout, and the total deadline is checked between reads (review finding
+    F15). A truncated or malformed response is a refusal (trust review P0-1).
     """
 
     try:
@@ -156,8 +195,10 @@ def fetch(url: str, *, maximum_bytes: int, deadline_seconds: float) -> bytes:
                 if total > maximum_bytes:
                     raise MinerUpdateError("the response exceeds its size limit")
                 chunks.append(chunk)
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise MinerUpdateError(f"the download failed: {exc}") from exc
+    except MinerUpdateError:
+        raise
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, ValueError) as exc:
+        raise MinerUpdateError(f"the download failed: {type(exc).__name__}: {exc}") from exc
     return b"".join(chunks)
 
 
@@ -180,8 +221,9 @@ def run(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[s
         raise MinerUpdateError(f"{argv[0]} could not be run: {exc}") from exc
 
 
-def prepare_image(release: MinerRelease, profile: LauncherProfile) -> None:
-    """Pull the image and confirm it is the exact artifact the record names.
+def prepare_image(release: MinerRelease, profile: LauncherProfile) -> int | None:
+    """Pull the image, confirm it is the exact artifact the record names, and
+    return its state-schema label (None if it has none).
 
     Done while the previous release is still selected, so an unreachable
     registry, a digest mismatch, a wrong platform or a wrong contract label
@@ -204,19 +246,27 @@ def prepare_image(release: MinerRelease, profile: LauncherProfile) -> None:
     )
     if platform.returncode != 0 or platform.stdout.strip() != "linux/amd64":
         raise MinerUpdateError("the pulled image is not linux/amd64")
-    label = run(
+    labels = run(
         [
             "docker",
             "image",
             "inspect",
             "--format",
-            f'{{{{index .Config.Labels "{profile.contract_label}"}}}}',
+            f'{{{{index .Config.Labels "{profile.contract_label}"}}}}|'
+            f'{{{{index .Config.Labels "{STATE_SCHEMA_LABEL}"}}}}',
             image,
         ],
         timeout=INSPECT_TIMEOUT_SECONDS,
     )
-    if label.returncode != 0 or label.stdout.strip() != release.runtime_contract:
+    contract, _, schema = labels.stdout.strip().partition("|")
+    if labels.returncode != 0 or contract != release.runtime_contract:
         raise MinerUpdateError("the pulled image does not declare the runtime contract the release names")
+    schema = schema.strip()
+    if schema in ("", "<no value>"):
+        return None
+    if not schema.isdecimal() or not 0 < int(schema) <= 1_000_000:
+        raise MinerUpdateError(f"the pulled image's {STATE_SCHEMA_LABEL} label is malformed")
+    return int(schema)
 
 
 _SYSTEMCTL_TIMEOUTS = {
@@ -235,66 +285,16 @@ def systemctl(arguments: Sequence[str]) -> None:
         raise MinerUpdateError(f"systemctl {verb} failed: {result.stderr.strip()[:200]}")
 
 
-def _inspect(container: str) -> tuple[bool, str, str] | None:
-    result = run(
-        [
-            "docker",
-            "container",
-            "inspect",
-            "--format",
-            "{{.State.Running}} {{.State.StartedAt}} {{.Config.Image}}",
-            container,
-        ],
-        timeout=INSPECT_TIMEOUT_SECONDS,
-    )
-    if result.returncode != 0:
-        return None
-    parts = result.stdout.strip().split(None, 2)
-    if len(parts) != 3:
-        return None
-    return parts[0] == "true", parts[1], parts[2]
-
-
-def current_image(container: str) -> str | None:
-    """The image a container reports right now, without waiting."""
-
+def unit_state(unit: str) -> str:
     try:
-        inspected = _inspect(container)
+        result = run(["systemctl", "show", "--property=ActiveState", "--value", unit], timeout=INSPECT_TIMEOUT_SECONDS)
     except MinerUpdateError:
-        return None
-    if inspected is None or not inspected[0]:
-        return None
-    return inspected[2]
+        return "unknown"
+    return result.stdout.strip() or "unknown"
 
 
-def settled_image(unit: str, container: str) -> str | None:
-    """The image the miner container reports once it has settled.
-
-    Not accepted as running: a container up for less than
-    ``SETTLE_DWELL_SECONDS``, or a unit that is not ``active`` (systemd reports
-    ``activating`` while restarting a failing service and ``failed`` once the
-    start limit trips).
-    """
-
-    deadline = time.monotonic() + SETTLE_TIMEOUT_SECONDS
-    while True:
-        try:
-            state = run(["systemctl", "is-active", unit], timeout=INSPECT_TIMEOUT_SECONDS)
-            inspected = _inspect(container)
-        except MinerUpdateError:
-            inspected = None
-            state = None
-        if state is not None and state.stdout.strip() == "active" and inspected is not None:
-            running, started, image = inspected
-            if running and _uptime_seconds(started) >= SETTLE_DWELL_SECONDS:
-                return image
-        if time.monotonic() >= deadline:
-            return None
-        time.sleep(SETTLE_POLL_SECONDS)
-
-
-def _uptime_seconds(started_at: str) -> float:
-    """Seconds since the container started, or 0 if unreadable (fails safe)."""
+def _parse_started_at(started_at: str) -> float | None:
+    """Unix seconds from Docker's StartedAt, or None if unreadable."""
 
     text = started_at.strip()
     if "." in text:
@@ -305,39 +305,128 @@ def _uptime_seconds(started_at: str) -> float:
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
-        return 0.0
+        return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+    return parsed.timestamp()
+
+
+def _uptime_seconds(started_at: str) -> float:
+    """Seconds since the container started, or 0 if it cannot be read (fails safe)."""
+
+    started = _parse_started_at(started_at)
+    if started is None:
+        return 0.0
+    return max(0.0, time.time() - started)
+
+
+def observe(unit: str, container: str) -> Observation | None:
+    """One look at the container and the unit, without waiting."""
+
+    try:
+        show = run(
+            ["systemctl", "show", "--property=ActiveState", "--property=NRestarts", unit],
+            timeout=INSPECT_TIMEOUT_SECONDS,
+        )
+        inspect = run(
+            [
+                "docker",
+                "container",
+                "inspect",
+                "--format",
+                "{{.State.Running}} {{.State.StartedAt}} {{.Config.Image}}",
+                container,
+            ],
+            timeout=INSPECT_TIMEOUT_SECONDS,
+        )
+    except MinerUpdateError:
+        return None
+    if inspect.returncode != 0:
+        return None
+    parts = inspect.stdout.strip().split(None, 2)
+    if len(parts) != 3:
+        return None
+    started = _parse_started_at(parts[1])
+    if started is None:
+        return None
+    properties = dict(line.partition("=")[::2] for line in show.stdout.splitlines() if "=" in line)
+    restarts = properties.get("NRestarts", "0")
+    return Observation(
+        image=parts[2],
+        started_at=started,
+        restarts=int(restarts) if restarts.isdecimal() else 0,
+        active=parts[0] == "true" and properties.get("ActiveState") == "active",
+    )
+
+
+def settle(unit: str, container: str) -> Observation | None:
+    """A look once the unit is active and the container has been up for the dwell."""
+
+    deadline = time.monotonic() + SETTLE_TIMEOUT_SECONDS
+    while True:
+        seen = observe(unit, container)
+        if seen is not None and seen.active and time.time() - seen.started_at >= SETTLE_DWELL_SECONDS:
+            return seen
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(SETTLE_POLL_SECONDS)
+
+
+def boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return "unknown"
+
+
+def _snapshot_times(snapshot: Path) -> tuple[float, float] | None:
+    try:
+        document = json.loads(snapshot.read_text(encoding="utf-8"))
+        generated = datetime.fromisoformat(str(document["generated_at"]).replace("Z", "+00:00"))
+        expires = datetime.fromisoformat(str(document["expires_at"]).replace("Z", "+00:00"))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if generated.tzinfo is None:
+        generated = generated.replace(tzinfo=timezone.utc)
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    return generated.timestamp(), expires.timestamp()
 
 
 def validator_access_remaining_seconds(snapshot: Path) -> float | None:
     """Seconds of validator-access validity left, or None if unreadable."""
 
-    try:
-        document = json.loads(snapshot.read_text(encoding="utf-8"))
-        expires = str(document["expires_at"])
-        parsed = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-    except (OSError, ValueError, KeyError, TypeError):
+    times = _snapshot_times(snapshot)
+    if times is None:
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return (parsed - datetime.now(timezone.utc)).total_seconds()
+    return times[1] - time.time()
 
 
 def safe_to_activate(snapshot: Path) -> bool:
     """Whether the miner may be restarted now.
 
     A restart makes the miner re-read its validator-access snapshot, and the
-    snapshot is short-lived. The first live run of the previous version
-    restarted into a lapsed snapshot and crash-looped. So a restart needs
-    ``MINIMUM_ACCESS_REMAINING_SECONDS`` left, and an unreadable snapshot is
-    unsafe. The updater's unit must leave this file visible; review finding
-    F1 was a unit that hid it, so every unattended check deferred.
+    snapshot is short-lived. So a restart needs ``MINIMUM_ACCESS_REMAINING_SECONDS``
+    left, and an unreadable snapshot is unsafe. The updater's unit must leave
+    this file visible; review finding F1 was a unit that hid it.
+
+    If the snapshot's whole lifetime cannot cover the margin plus the refresh
+    allowance, the gate can never pass; that raises ``GateImpossible`` so the
+    check alerts at once instead of deferring forever.
     """
 
-    remaining = validator_access_remaining_seconds(snapshot)
-    return remaining is not None and remaining >= MINIMUM_ACCESS_REMAINING_SECONDS
+    times = _snapshot_times(snapshot)
+    if times is None:
+        return False
+    generated, expires = times
+    lifetime = expires - generated
+    if lifetime < MINIMUM_ACCESS_REMAINING_SECONDS + SNAPSHOT_REFRESH_ALLOWANCE_SECONDS:
+        raise GateImpossible(
+            f"the validator-access snapshot lives {int(lifetime)} s, but a safe restart needs "
+            f"{MINIMUM_ACCESS_REMAINING_SECONDS} s left plus {SNAPSHOT_REFRESH_ALLOWANCE_SECONDS} s "
+            "for refresh; lengthen the snapshot lifetime, or no update can ever activate"
+        )
+    return expires - time.time() >= MINIMUM_ACCESS_REMAINING_SECONDS
 
 
 # --- the updater's own processes ----------------------------------------------------------
@@ -396,13 +485,17 @@ def probe_updater(paths: HostPaths, release_dir: Path, record: Path) -> Mapping[
 def handoff(
     paths: HostPaths, release_dir: Path, lock_fd: int, depth: int
 ) -> tuple[int, Mapping[str, object] | None]:
-    """Run the rest of this check under the new updater, holding our lock."""
+    """Run the rest of this check under the new updater, holding our lock.
+
+    Killed after ``HANDOFF_TIMEOUT_SECONDS``, well inside the unit's
+    TimeoutStartSec, so this updater always survives to judge the new one.
+    """
 
     environment = _child_environment(paths, release_dir)
     environment[LOCK_FD_ENV] = str(lock_fd)
     environment[HANDOFF_DEPTH_ENV] = str(depth + 1)
     try:
-        result = subprocess.run(  # noqa: S603
+        child = subprocess.Popen(  # noqa: S603
             [sys.executable, "-s", "-B", "-m", "cathedral.miner_update_cli", "check"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -410,12 +503,20 @@ def handoff(
             env=environment,
             cwd=release_dir / "updater",
             pass_fds=(lock_fd,),
-            check=False,
+            # Its own process group, so a timeout also ends any docker or
+            # systemctl client it started.
+            start_new_session=True,
         )
     except OSError as exc:
         return 127, {"error": str(exc)}
-    sys.stderr.flush()
-    return result.returncode, _last_json(result.stdout)
+    try:
+        stdout, _ = child.communicate(timeout=HANDOFF_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            os.killpg(child.pid, signal.SIGKILL)
+        child.communicate()
+        return 124, {"error": "the new updater's first run timed out"}
+    return child.returncode, _last_json(stdout or "")
 
 
 # --- wiring ----------------------------------------------------------------------------------
@@ -441,30 +542,15 @@ def running_release(paths: HostPaths) -> Path | None:
     return release
 
 
-def load_own_trust_root(release: Path, uid: int) -> dict[str, TrustedKey]:
-    """The trust root shipped in the tree this updater runs from."""
-
-    path = release / TREE_TRUST_ROOT
-    try:
-        require_root_controlled(path, expected_uid=uid)
-        require_root_controlled(path.parent, expected_uid=uid)
-        with path.open("rb") as handle:
-            raw = handle.read(64 * 1024 + 1)
-        return load_trust_root(raw)
-    except (OSError, BundleError, MinerReleaseError) as exc:
-        raise MinerUpdateError(f"trust root is unusable: {exc}") from exc
-
-
 def build_host(paths: HostPaths, config: HostConfig) -> MinerUpdaterHost:
     uid = expected_uid(paths)
     release = running_release(paths)
-    trusted = load_own_trust_root(release, uid) if release is not None else {}
     lock_fd = os.environ.get(LOCK_FD_ENV)
     depth = int(os.environ.get(HANDOFF_DEPTH_ENV, "0") or 0)
+    unit = config.miner_unit
     return MinerUpdaterHost(
         config=config,
         paths=paths,
-        trusted_keys=trusted,
         running_tree=release.name if release is not None else None,
         fetch_metadata=lambda: fetch(
             config.channel_url,
@@ -478,10 +564,13 @@ def build_host(paths: HostPaths, config: HostConfig) -> MinerUpdaterHost:
         handoff=lambda release_dir, fd: handoff(paths, release_dir, fd, depth),
         prepare_image=prepare_image,
         systemctl=systemctl,
-        current_image=current_image,
-        settled_image=lambda container: settled_image(config.miner_unit, container),
+        unit_state=lambda: unit_state(unit),
+        observe=lambda container: observe(unit, container),
+        settle=lambda container: settle(unit, container),
         safe_to_activate=lambda: safe_to_activate(paths.snapshot),
         now_unix=lambda: int(time.time()),
+        sleep=time.sleep,
+        boot_id=boot_id,
         expected_uid=uid,
         handoff_depth=depth,
         lock_fd=int(lock_fd) if lock_fd else None,
@@ -493,99 +582,105 @@ def _emit(outcome: UpdateOutcome) -> int:
     return outcome.exit_status
 
 
-def _write_operator_file(path: Path, body: str) -> None:
+def _write_operator_file(path: Path, body: bytes) -> None:
     path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    _atomic_write(path, body.encode("ascii"), mode=0o644)
+    _atomic_write(path, body, mode=0o644)
 
 
-def main(argv: list[str] | None = None) -> int:
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cathedral-miner-update", description="Cathedral miner updater")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("check", help="verify the channel and apply a newer signed release")
     commands.add_parser("status", help="print what is installed and what happened last")
     probe = commands.add_parser("probe", help="internal: verify a saved record from this tree")
     probe.add_argument("--record", required=True)
-    recover = commands.add_parser("recover", help="internal: take over from a crashed updater")
-    recover.add_argument("--crashed-release", required=True)
+    fallback = commands.add_parser("fallback", help="internal: judge the current updater after it failed")
+    fallback.add_argument("--current-status", required=True, type=int)
     pause = commands.add_parser("pause", help="stop checking until resumed")
     pause.add_argument("--reason", default="")
     commands.add_parser("resume", help="undo pause")
-    pin = commands.add_parser("pin", help="hold the miner at one version")
-    pin_target = pin.add_mutually_exclusive_group(required=True)
-    pin_target.add_argument("--version")
-    pin_target.add_argument("--current", action="store_true")
+    pin = commands.add_parser("pin", help="hold the miner at the release it runs now")
+    pin.add_argument("--current", action="store_true", required=True)
     commands.add_parser("unpin", help="undo pin")
-    resolve_parser = commands.add_parser("resolve", help="decide a halted activation")
-    resolve_action = resolve_parser.add_mutually_exclusive_group(required=True)
-    resolve_action.add_argument("--accept-release", action="store_true")
-    resolve_action.add_argument("--restore-previous", action="store_true")
-    resolve_action.add_argument("--retry", action="store_true")
-    arguments = parser.parse_args(argv)
+    resolve_parser = commands.add_parser("resolve", help="decide a halted or unfinished activation")
+    action = resolve_parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--accept-release", action="store_true")
+    action.add_argument("--restore-previous", action="store_true")
+    action.add_argument("--abandon", action="store_true")
+    action.add_argument("--retry", action="store_true")
+    return parser
 
-    paths = host_paths()
+
+def _dispatch(arguments: argparse.Namespace, paths: HostPaths) -> int:
     uid = expected_uid(paths)
+    if arguments.command == "pause":
+        _write_operator_file(paths.pause_file, ((arguments.reason or "paused by operator") + "\n").encode("utf-8"))
+        print(json.dumps({"action": "paused", "file": str(paths.pause_file)}))
+        return EXIT_OK
+    if arguments.command == "resume":
+        paths.pause_file.unlink(missing_ok=True)
+        print(json.dumps({"action": "resumed"}))
+        return EXIT_OK
+    if arguments.command == "unpin":
+        paths.pin_file.unlink(missing_ok=True)
+        print(json.dumps({"action": "unpinned"}))
+        return EXIT_OK
+    if arguments.command == "pin":
+        current = read_state(paths.state_file)["miner"].get("current")  # type: ignore[union-attr]
+        if not isinstance(current, dict) or not all(
+            isinstance(current.get(key), str) for key in ("image", "tree_sha256", "version")
+        ):
+            raise MinerUpdateError("no release is committed yet, so there is nothing to pin")
+        _write_operator_file(paths.pin_file, pin_document(current))
+        print(json.dumps({"action": "pinned", "version": current["version"], "image": current["image"]}))
+        return EXIT_OK
+    if arguments.command == "status":
+        try:
+            config: HostConfig | None = load_config(paths.config_file, expected_uid=uid)
+        except MinerUpdateError:
+            config = None
+        print(json.dumps(describe_status(paths, config, expected_uid=uid), indent=2, sort_keys=True))
+        return EXIT_OK
+
+    config = load_config(paths.config_file, expected_uid=uid)
+    host = build_host(paths, config)
+    if arguments.command == "check":
+        return _emit(update_once(host))
+    if arguments.command == "fallback":
+        return _emit(fallback_to_previous(host, arguments.current_status))
+    if arguments.command == "resolve":
+        name = next(
+            flag
+            for flag in ("accept_release", "restore_previous", "abandon", "retry")
+            if getattr(arguments, flag)
+        )
+        return _emit(resolve(host, name.replace("_", "-")))
+    if arguments.command == "probe":
+        raw = Path(arguments.record).read_bytes()
+        print(json.dumps(probe_release(host, raw), sort_keys=True))
+        return EXIT_OK
+    raise MinerUpdateError(f"unhandled command {arguments.command}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = _parser().parse_args(argv)
+    paths = host_paths()
     try:
-        if arguments.command == "pause":
-            _write_operator_file(paths.pause_file, (arguments.reason or "paused by operator") + "\n")
-            print(json.dumps({"action": "paused", "file": str(paths.pause_file)}))
-            return EXIT_OK
-        if arguments.command == "resume":
-            paths.pause_file.unlink(missing_ok=True)
-            print(json.dumps({"action": "resumed"}))
-            return EXIT_OK
-        if arguments.command == "unpin":
-            paths.pin_file.unlink(missing_ok=True)
-            print(json.dumps({"action": "unpinned"}))
-            return EXIT_OK
-        if arguments.command == "pin":
-            version = arguments.version
-            if arguments.current:
-                current = read_state(paths.state_file)["miner"].get("current")  # type: ignore[union-attr]
-                if not isinstance(current, dict) or not isinstance(current.get("version"), str):
-                    raise MinerUpdateError("no release is active yet, so there is no current version to pin")
-                version = current["version"]
-            _write_operator_file(paths.pin_file, f"{version}\n")
-            read_pin(paths.pin_file)
-            print(json.dumps({"action": "pinned", "version": version}))
-            return EXIT_OK
-
-        if arguments.command == "status":
-            try:
-                config: HostConfig | None = load_config(paths.config_file, expected_uid=uid)
-            except MinerUpdateError:
-                config = None
-            print(json.dumps(describe_status(paths, config), indent=2, sort_keys=True))
-            return EXIT_OK
-
-        config = load_config(paths.config_file, expected_uid=uid)
-        host = build_host(paths, config)
-        if arguments.command == "check":
-            return _emit(update_once(host))
-        if arguments.command == "resolve":
-            action = (
-                "accept-release"
-                if arguments.accept_release
-                else "restore-previous" if arguments.restore_previous else "retry"
-            )
-            return _emit(resolve(host, action))
-        if arguments.command == "recover":
-            return _emit(recover_crashed_updater(host, Path(arguments.crashed_release)))
-        if arguments.command == "probe":
-            raw = Path(arguments.record).read_bytes()
-            print(json.dumps(probe_release(host, raw), sort_keys=True))
-            return EXIT_OK
+        return _dispatch(arguments, paths)
     except MinerUpdateHalted as exc:
         print(json.dumps({"action": "halted", "reason": str(exc)}, sort_keys=True))
         return EXIT_HALTED
     except (MinerUpdateError, MinerReleaseError, BundleError, OSError) as exc:
         print(json.dumps({"action": "refused", "reason": str(exc)}, sort_keys=True))
         return EXIT_REFUSED
-    parser.error(f"unhandled command {arguments.command}")
-    return EXIT_REFUSED
+    except Exception as exc:  # noqa: BLE001 - never Python's bare exit status 1
+        traceback.print_exc(file=sys.stderr)
+        print(json.dumps({"action": "fault", "reason": f"{type(exc).__name__}: {exc}"}, sort_keys=True))
+        return EXIT_FAULT
 
 
 if __name__ == "__main__":
     status = main()
     if status not in DOCUMENTED_EXIT_STATUSES:
-        status = EXIT_REFUSED
+        status = EXIT_FAULT
     raise SystemExit(status)

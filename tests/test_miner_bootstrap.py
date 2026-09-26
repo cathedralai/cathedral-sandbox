@@ -24,6 +24,8 @@ from cathedral.miner_updater import (
 )
 from tests.miner_update_support import (
     CANARY_KEY,
+    DEFAULT_TRUST,
+    OTHER_KEY,
     REPO_ROOT,
     config_document,
     trust_root_bytes,
@@ -42,6 +44,7 @@ MANAGED_FILES = [
     "deploy/miner-update/cathedral-miner-update",
     "deploy/miner-update/cathedral-miner-update.service",
     "deploy/miner-update/cathedral-miner-update.timer",
+    "deploy/miner-update/cathedral-miner-update-alert@.service",
 ]
 
 
@@ -97,6 +100,13 @@ def test_the_bootstrap_enrols_without_changing_the_miner(source, tmp_path):
     # The timer is installed but not enabled: only daemon-reload ran.
     assert calls == [("daemon-reload",)]
     assert (paths.systemd_dir / "cathedral-miner-update.timer").is_file()
+    assert (paths.systemd_dir / "cathedral-miner-update-alert@.service").is_file()
+    # The host trust set is the pinned root, in state, outside every bundle.
+    from cathedral.miner_updater import load_trust_state
+
+    trust = load_trust_state(paths.trust_file, expected_uid=os.getuid())
+    assert trust.generation == 1 and set(trust.keys) == {"canary-1", "stable-1"}
+    assert link_target(paths.updater_previous) is None
     assert os.access(paths.shim, os.X_OK)
     config = load_config(paths.config_file, expected_uid=os.getuid())
     assert config.netuid == config_document()["netuid"]
@@ -145,16 +155,76 @@ def test_a_fresh_host_with_the_shipped_unit_is_enrolled(source, tmp_path):
     assert report["config"]["product"] == "audit-miner"
 
 
-def test_a_second_bootstrap_keeps_the_legacy_release_and_the_previous_updater(source, tmp_path):
+def test_a_second_bootstrap_leaves_no_fallback_to_the_tree_it_replaces(source, tmp_path):
+    """Trust review P0-1(c): a re-bootstrap removes `previous` rather than pointing it
+    at the tree the operator is replacing."""
+
     root = tmp_path / "root"
     first, _ = _install(source, root)
     paths = HostPaths(root=root)
+    from cathedral.miner_bundle import atomic_symlink
+
+    atomic_symlink(paths.updater_previous, f"releases/{first['installed_tree']}")
     module = source / "cathedral" / "miner_updater.py"
     module.write_text(module.read_text() + "\n# a later revision\n")
     second, _ = _install(source, root)
     assert second["installed_tree"] != first["installed_tree"]
-    assert link_target(paths.updater_previous) == f"releases/{first['installed_tree']}"
+    assert link_target(paths.updater_previous) is None
     assert link_target(paths.miner_current) == LEGACY
+
+
+def test_a_re_bootstrap_after_a_compromise_leaves_the_old_key_untrusted(source, tmp_path):
+    root = tmp_path / "root"
+    _install(source, root)
+    paths = HostPaths(root=root)
+    from cathedral.miner_updater import load_trust_state
+
+    # The stable key is compromised: the operator re-bootstraps with a new stable key.
+    replaced = {"canary-1": DEFAULT_TRUST["canary-1"], "stable-2": (OTHER_KEY, ["stable"])}
+    (source / "deploy/miner-update/release-keys.json").write_bytes(trust_root_bytes(replaced))
+    report, _ = _install(source, root)
+    trust = load_trust_state(paths.trust_file, expected_uid=os.getuid())
+    assert "stable-1" not in trust.keys and report["revoked_keys"] == ["stable-1"]
+    # A later bootstrap from an old revision cannot bring it back.
+    (source / "deploy/miner-update/release-keys.json").write_bytes(trust_root_bytes())
+    with pytest.raises(BootstrapError, match="revoked key"):
+        _install(source, root)
+    assert "stable-1" not in load_trust_state(paths.trust_file, expected_uid=os.getuid()).keys
+
+
+def test_a_revocation_holds_even_if_the_rest_of_the_bootstrap_fails(source, tmp_path):
+    root = tmp_path / "root"
+    _install(source, root)
+    paths = HostPaths(root=root)
+    from cathedral.miner_updater import load_trust_state
+
+    replaced = {"canary-1": DEFAULT_TRUST["canary-1"], "stable-2": (OTHER_KEY, ["stable"])}
+    (source / "deploy/miner-update/release-keys.json").write_bytes(trust_root_bytes(replaced))
+    (source / "deploy/miner-update/miner-unit.conf").unlink()  # the tree cannot be assembled
+    with pytest.raises(OSError):
+        _install(source, root)
+    assert "stable-1" not in load_trust_state(paths.trust_file, expected_uid=os.getuid()).keys
+
+
+def test_the_minimum_sequence_has_no_default():
+    """Trust review P3."""
+
+    from cathedral import miner_bootstrap
+
+    with pytest.raises(SystemExit):
+        miner_bootstrap.main(
+            [
+                "install",
+                "--source", "/nonexistent",
+                "--keys-sha256", "0" * 64,
+                "--product", "snp-miner",
+                "--network", "testnet",
+                "--netuid", str(config_document()["netuid"]),
+                "--channel", "stable",
+                "--channel-url", "https://updates.example.test/x.json",
+                "--miner-unit", "cathedral-test-miner.service",
+            ]
+        )
 
 
 @pytest.mark.parametrize("missing", ["network", "netuid", "miner_unit", "channel_url", "product"])

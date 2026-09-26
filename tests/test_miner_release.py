@@ -376,3 +376,30 @@ def test_a_trust_root_reports_fingerprints():
     keys = load_trust_root(_root({"k": {"public_key_hex": public_hex(STABLE_KEY), "channels": ["stable"]}}))
     assert keys["k"].fingerprint.startswith("sha256:")
     assert keys["k"].channels == frozenset({"stable"})
+
+
+# --- hostile input and the host trust set (trust review P0-1) --------------------------------------
+
+
+def test_an_integer_past_the_digit_limit_is_a_refusal_not_a_crash():
+    with pytest.raises(MinerReleaseError, match="not strict JSON"):
+        parse(b"[" + b"1" * 5000 + b"]")
+
+
+def test_a_trust_state_round_trips_and_refuses_a_revoked_key_it_still_trusts():
+    from cathedral.miner_release import (
+        initial_trust_state,
+        parse_trust_state,
+        rotate_trust,
+    )
+    from tests.miner_update_support import DEFAULT_TRUST, trust_root_bytes
+
+    state = initial_trust_state(trust_root_bytes())
+    retired = {"canary-1": DEFAULT_TRUST["canary-1"], "stable-2": (OTHER_KEY, ["stable"])}
+    moved = rotate_trust(state, trust_root_bytes(retired), signing_key_id="stable-2", channel="stable")
+    again = parse_trust_state(canonical_json(moved.as_document()))
+    assert again.generation == 2 and set(again.revoked) == {public_hex(STABLE_KEY)}
+    document = moved.as_document()
+    document["keys"]["stable-1"] = {"public_key_hex": public_hex(STABLE_KEY), "channels": ["stable"]}
+    with pytest.raises(MinerReleaseError, match="revoked key"):
+        parse_trust_state(canonical_json(document))

@@ -211,7 +211,12 @@ def strict_json(raw: bytes, *, label: str) -> Any:
 
     try:
         return json.loads(raw.decode("utf-8"), object_pairs_hook=no_duplicates)
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+    except MinerReleaseError:
+        raise
+    except (ValueError, RecursionError, TypeError) as exc:
+        # ValueError covers UnicodeDecodeError, JSONDecodeError and an integer
+        # longer than Python's digit limit. Hostile input must come out as a
+        # refusal, never as a crash (trust review P0-1).
         raise MinerReleaseError(f"{label} is not strict JSON") from exc
 
 
@@ -309,6 +314,132 @@ def load_trust_root(raw: bytes) -> dict[str, TrustedKey]:
             raise MinerReleaseError("trust root public key is not Ed25519") from exc
         resolved[key_id] = TrustedKey(public_key=public_key, channels=frozenset(channels))
     return resolved
+
+
+# --- the host's trust set -------------------------------------------------------------
+
+TRUST_STATE_SCHEMA = "cathedral_miner_trust_state_v1"
+"""Schema of the trust set a host keeps in its own state, outside every bundle."""
+
+
+@dataclass(frozen=True)
+class TrustState:
+    """The keys one host trusts, and every key it has ever stopped trusting.
+
+    It lives in the updater's root-owned state, not in any bundle, and every
+    updater on the host (current, previous, a fallback, a probe) verifies
+    against it. It only moves forward: each change raises ``generation``, and a
+    public key removed by a change is revoked for good, so no old updater tree,
+    old bundle or re-bootstrap can make the host trust it again.
+    """
+
+    generation: int
+    trust_root_sha256: str
+    keys: Mapping[str, TrustedKey]
+    revoked: Mapping[str, Mapping[str, object]]
+
+    def as_document(self) -> dict[str, object]:
+        return {
+            "schema": TRUST_STATE_SCHEMA,
+            "generation": self.generation,
+            "trust_root_sha256": self.trust_root_sha256,
+            "keys": {
+                key_id: {"public_key_hex": key.public_key.hex(), "channels": sorted(key.channels)}
+                for key_id, key in sorted(self.keys.items())
+            },
+            "revoked": {public: dict(entry) for public, entry in sorted(self.revoked.items())},
+        }
+
+
+def initial_trust_state(root: bytes) -> TrustState:
+    return TrustState(
+        generation=1,
+        trust_root_sha256=hashlib.sha256(root).hexdigest(),
+        keys=load_trust_root(root),
+        revoked={},
+    )
+
+
+def _same_keys(left: Mapping[str, TrustedKey], right: Mapping[str, TrustedKey]) -> bool:
+    return {k: (v.public_key, v.channels) for k, v in left.items()} == {
+        k: (v.public_key, v.channels) for k, v in right.items()
+    }
+
+
+def rotate_trust(
+    state: TrustState,
+    root: bytes,
+    *,
+    signing_key_id: str | None = None,
+    channel: str | None = None,
+) -> TrustState:
+    """Move the trust set forward to ``root``, or refuse.
+
+    Refused: a root that lists any revoked public key, and (for a rotation a
+    release delivers) a root that would not trust the key that signed it for
+    its channel, which would lock the host out. Every key the current set has
+    and ``root`` lacks is revoked. An identical root changes nothing.
+    """
+
+    keys = load_trust_root(root)
+    for key_id, key in keys.items():
+        if key.public_key.hex() in state.revoked:
+            raise MinerReleaseError(f"the trust root lists a revoked key ({key_id})")
+    if signing_key_id is not None:
+        signer = keys.get(signing_key_id)
+        if signer is None or channel not in signer.channels:
+            raise MinerReleaseError(
+                "the trust root in this release would not trust the key that signed it"
+            )
+    if _same_keys(keys, state.keys):
+        return state
+    generation = state.generation + 1
+    kept = {key.public_key for key in keys.values()}
+    revoked = dict(state.revoked)
+    for key_id, key in state.keys.items():
+        if key.public_key not in kept:
+            revoked[key.public_key.hex()] = {"key_id": key_id, "generation": generation}
+    return TrustState(
+        generation=generation,
+        trust_root_sha256=hashlib.sha256(root).hexdigest(),
+        keys=keys,
+        revoked=revoked,
+    )
+
+
+def parse_trust_state(raw: bytes) -> TrustState:
+    document = strict_json(raw, label="trust state")
+    if not isinstance(document, dict) or set(document) != {
+        "schema",
+        "generation",
+        "trust_root_sha256",
+        "keys",
+        "revoked",
+    }:
+        raise MinerReleaseError("trust state fields are invalid")
+    if document["schema"] != TRUST_STATE_SCHEMA:
+        raise MinerReleaseError("trust state schema is unsupported")
+    generation = _bounded_int(document["generation"], "trust generation", maximum=MAX_SEQUENCE)
+    root_sha = _matched_string(document["trust_root_sha256"], "trust root digest", _SHA256_RE)
+    keys = load_trust_root(canonical_json({"schema": TRUST_ROOT_SCHEMA, "keys": document["keys"]}))
+    revoked_value = document["revoked"]
+    if not isinstance(revoked_value, dict):
+        raise MinerReleaseError("trust state revocations are invalid")
+    revoked: dict[str, Mapping[str, object]] = {}
+    for public, entry in revoked_value.items():
+        _matched_string(public, "revoked key", _SHA256_RE)
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"key_id", "generation"}
+            or not isinstance(entry["key_id"], str)
+        ):
+            raise MinerReleaseError("trust state revocation is malformed")
+        _bounded_int(entry["generation"], "revocation generation", maximum=MAX_SEQUENCE)
+        revoked[public] = dict(entry)
+    for key_id, key in keys.items():
+        if key.public_key.hex() in revoked:
+            raise MinerReleaseError(f"trust state trusts a revoked key ({key_id})")
+    return TrustState(generation=generation, trust_root_sha256=root_sha, keys=keys, revoked=revoked)
 
 
 def parse_miner_release(
@@ -483,17 +614,22 @@ __all__ = [
     "MINER_RELEASE_SCHEMA",
     "NOT_BEFORE_SKEW_SECONDS",
     "TRUST_ROOT_SCHEMA",
+    "TRUST_STATE_SCHEMA",
     "BundleRef",
     "MinerRelease",
     "MinerReleaseError",
     "PromotedCanary",
+    "TrustState",
     "TrustedKey",
     "canonical_json",
     "check_validity_window",
     "enforce_monotonic_release",
     "https_url",
+    "initial_trust_state",
     "load_trust_root",
     "parse_miner_release",
+    "parse_trust_state",
+    "rotate_trust",
     "signed_bytes",
     "split_image",
     "strict_json",

@@ -175,7 +175,7 @@ sudo install -o root -g root -m 0755 \
   cathedral-runtime/scripts/run_sn39_signed_fleet_miner.sh \
   /usr/local/libexec/cathedral/run-sn39-miner
 printf '%s  %s\n' \
-  d56a82bb76eb2d976edfcd4574ff6ed19a41532ffa50d01a2411df51a002b615 \
+  8eb0ccf6a99562915f3c2b29dd5578d08a3a0f81b0dd904c4a81a2fd67fe3320 \
   /usr/local/libexec/cathedral/run-sn39-miner | sudo sha256sum --check
 ```
 

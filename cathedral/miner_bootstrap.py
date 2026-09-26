@@ -44,13 +44,20 @@ from cathedral.miner_bundle import (
     install_directory,
     link_target,
     release_tree_sha256,
+    remove_link,
 )
 from cathedral.miner_products import (
     LauncherProfileError,
     product_by_name,
     read_launcher_profile,
 )
-from cathedral.miner_release import MinerReleaseError, canonical_json, load_trust_root
+from cathedral.miner_release import (
+    MinerReleaseError,
+    canonical_json,
+    initial_trust_state,
+    load_trust_root,
+    rotate_trust,
+)
 from cathedral.miner_updater import (
     CONFIG_SCHEMA,
     LEGACY,
@@ -58,13 +65,16 @@ from cathedral.miner_updater import (
     HostPaths,
     MinerUpdateError,
     _atomic_write,
+    load_trust_state,
     read_activation_profile,
+    write_trust_state,
 )
 
 SHIM_SOURCE = "deploy/miner-update/cathedral-miner-update"
 UNIT_SOURCES = (
     "deploy/miner-update/cathedral-miner-update.service",
     "deploy/miner-update/cathedral-miner-update.timer",
+    "deploy/miner-update/cathedral-miner-update-alert@.service",
 )
 
 
@@ -117,6 +127,17 @@ def install(
         raise BootstrapError(f"the trust root is invalid: {exc}") from exc
     if not any(config.channel in key.channels for key in keys.values()):
         raise BootstrapError(f"no key in the trust root may sign the {config.channel} channel")
+    # The host's trust set only moves forward. A re-bootstrap revokes every key
+    # the pinned root drops, and refuses a root that lists a revoked key, so a
+    # key removed after a compromise is never trusted again on this host.
+    uid = os.getuid()
+    if paths.trust_file.exists():
+        try:
+            trust = rotate_trust(load_trust_state(paths.trust_file, expected_uid=uid), trust_bytes)
+        except (MinerReleaseError, MinerUpdateError) as exc:
+            raise BootstrapError(f"the pinned trust root cannot replace this host's trust set: {exc}") from exc
+    else:
+        trust = initial_trust_state(trust_bytes)
 
     # 2. The launcher the miner unit runs today becomes the legacy release. A
     #    unit that already runs the managed launcher (the shipped example units
@@ -141,9 +162,13 @@ def install(
             )
         container = profile.container
 
-    # 3. The updater tree, built exactly as the offline builder builds it.
+    # The trust set moves forward first, so a key this bootstrap revokes stays
+    # revoked even if a later step fails.
     paths.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(paths.state_dir, 0o700)
+    write_trust_state(paths.trust_file, trust)
+
+    # 3. The updater tree, built exactly as the offline builder builds it.
     # Assemble beside the releases, so the final rename stays on one filesystem.
     paths.updater_releases.mkdir(mode=0o755, parents=True, exist_ok=True)
     staging = paths.updater_releases / f".bootstrap-{os.getpid()}"
@@ -159,9 +184,9 @@ def install(
     finally:
         if staging.exists():
             shutil.rmtree(staging)
-    previous = link_target(paths.updater_current)
-    if previous is not None and previous != f"releases/{tree}":
-        atomic_symlink(paths.updater_previous, previous)
+    # No fallback to whatever was installed before the bootstrap: that tree
+    # may be the one the operator is replacing (trust review P0-1).
+    remove_link(paths.updater_previous)
     atomic_symlink(paths.updater_current, f"releases/{tree}")
 
     # 4. The frozen shim, and the operator's command.
@@ -193,6 +218,8 @@ def install(
     return {
         "installed_tree": tree,
         "trust_root_sha256": actual,
+        "trust_generation": trust.generation,
+        "revoked_keys": sorted(entry["key_id"] for entry in trust.revoked.values()),
         "trusted_keys": {
             key_id: {"fingerprint": key.fingerprint, "channels": sorted(key.channels)}
             for key_id, key in sorted(keys.items())
@@ -246,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     install_parser.add_argument("--channel", required=True, choices=["canary", "stable"])
     install_parser.add_argument("--channel-url", required=True)
     install_parser.add_argument("--miner-unit", required=True)
-    install_parser.add_argument("--minimum-sequence", type=int, default=0)
+    install_parser.add_argument("--minimum-sequence", required=True, type=int)
     arguments = parser.parse_args(argv)
     if re.fullmatch(r"[0-9a-f]{64}", arguments.keys_sha256) is None:
         parser.error("--keys-sha256 must be 64 lowercase hex characters")

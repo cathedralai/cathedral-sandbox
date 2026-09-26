@@ -7,6 +7,11 @@ LABEL org.opencontainers.image.title="Cathedral SN39 SNP miner" \
       org.opencontainers.image.source="https://github.com/cathedralai/cathedral-sandbox" \
       org.cathedral.sn39.runtime-contract="snp-signed-validator-fleet-v1"
 
+# The durable-state format this image writes under /var/lib/cathedral/validator-access.
+# It must equal cathedral.validator_access.DURABLE_STATE_SCHEMA, and a signed miner
+# release must declare the same number (docs/MINER_AUTO_UPDATE.md, "Rollback").
+LABEL org.cathedral.state-schema="2"
+
 WORKDIR /
 
 COPY requirements/sn39-audit-miner.txt /tmp/sn39-snp-miner-requirements.txt

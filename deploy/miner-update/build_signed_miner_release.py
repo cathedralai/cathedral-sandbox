@@ -14,14 +14,18 @@ on a miner host. It reads no network.
     # 2. sign a canary that names the image and that bundle
     build_signed_miner_release.py canary --private-key K --signing-key-id ID \\
       --product snp-miner --network NETWORK --netuid NETUID \\
-      --image ghcr.io/cathedralai/<repository>@sha256:<64hex> --state-schema 1 \\
+      --image ghcr.io/cathedralai/<repository>@sha256:<64hex> --state-schema 2 \\
       --bundle-archive DIR/<archive> --bundle-url https://.../<archive> \\
       --version V --sequence S --lifetime-seconds 604800 --out canary.json
 
-    # 3. promote that exact canary to stable, signed with the stable key
+    # 3. promote that exact canary to stable, signed with the stable key. It
+    #    rebuilds the tree from this checkout and refuses unless it matches.
     build_signed_miner_release.py stable --private-key K2 --signing-key-id ID2 \\
       --promote canary.json --bundle-archive DIR/<archive> \\
       --sequence S2 --lifetime-seconds 604800 --out stable.json
+
+The state schema is the image's org.cathedral.state-schema label, which is
+cathedral.validator_access.DURABLE_STATE_SCHEMA at the commit it was built from.
 
 Private keys must be encrypted PEM (the passphrase is read from
 CATHEDRAL_MINER_RELEASE_PASSPHRASE). Records live at most 14 days and may not
@@ -256,6 +260,7 @@ def command_canary(arguments: argparse.Namespace) -> int:
     if repository != bundle.profile.image_repository:
         _fail("the image is not in the repository the bundle's launcher requires")
     bundle.require_key(arguments.signing_key_id, _public_hex(key), "canary")
+    _announce_trust("canary hosts will trust", (bundle.tree / TREE_TRUST_ROOT).read_bytes(), bundle.trust)
     issued, expires = _window(arguments)
     body = {
         "schema": MINER_RELEASE_SCHEMA,
@@ -282,13 +287,45 @@ def command_canary(arguments: argparse.Namespace) -> int:
     return _emit(_sign(body, key), arguments, key, bundle.trust)
 
 
+def _announce_trust(label: str, trust_bytes: bytes, trust) -> None:
+    """Print what the stable hosts will trust, before anything is signed."""
+
+    print(f"{label}: trust root sha256 {sha256_bytes(trust_bytes)}", file=sys.stderr)
+    for key_id, entry in sorted(trust.items()):
+        print(
+            f"  {key_id}: {entry.fingerprint} may sign {', '.join(sorted(entry.channels))}",
+            file=sys.stderr,
+        )
+
+
+def _rebuild(product_name: str, trust_path: Path) -> str:
+    """The tree this signer's own checkout builds for a product."""
+
+    with tempfile.TemporaryDirectory() as work:
+        tree = Path(work) / "tree"
+        assemble_tree(REPOSITORY_ROOT, product_by_name(product_name), tree, trust_root=trust_path)
+        return release_tree_sha256(tree)
+
+
 def command_stable(arguments: argparse.Namespace) -> int:
     key = _load_private_key(Path(arguments.private_key))
     bundle = _Bundle(Path(arguments.bundle_archive))
     raw = Path(arguments.promote).read_bytes()
     document = strict_json(raw, label="canary record")
-    # Verify the canary against the bundle's own trust root before promoting it,
-    # so a corrupted or foreign file can never become stable.
+    trust_path = Path(arguments.trust_root) if arguments.trust_root else REPOSITORY_ROOT / REPOSITORY_TRUST_ROOT
+    # A canary key must never put code or a stable key onto stable hosts. So
+    # the stable signer rebuilds the tree from its own reviewed checkout and
+    # trust root, and promotes only a canary whose bundle is exactly that tree
+    # (trust review P1-2). Only then is the canary verified, against that root.
+    if not isinstance(document, dict) or not isinstance(document.get("product"), str):
+        _fail("the canary record names no product")
+    rebuilt = _rebuild(document["product"], trust_path)
+    if rebuilt != bundle.tree_sha256:
+        _fail(
+            f"the canary's bundle tree {bundle.tree_sha256} does not match this checkout's "
+            f"rebuild {rebuilt}; promote only what this checkout builds"
+        )
+    _announce_trust("stable hosts will trust", trust_path.read_bytes(), bundle.trust)
     try:
         canary = parse_miner_release(
             raw,
@@ -372,6 +409,7 @@ def main(argv: list[str] | None = None) -> int:
             signer.add_argument("--version", required=True)
         else:
             signer.add_argument("--promote", required=True)
+            signer.add_argument("--trust-root", default=None)
 
     arguments = parser.parse_args(argv)
     handlers = {

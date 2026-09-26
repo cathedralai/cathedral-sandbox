@@ -53,6 +53,20 @@ from cathedral.policy_registry import (
     parse_registry_json,
 )
 
+DURABLE_STATE_SCHEMA = 2
+"""The format of the durable state this code writes (``ValidatorAccessState``).
+
+1: before #179. 2: #179 added ``authorization_digest`` to
+``validator_snapshot_high_water``, NOT NULL in tables it creates, so code that
+writes 1 cannot insert into a table created by 2. Every image reads every
+earlier format. Raise this number when code of the current number could no
+longer read or write state this code creates: a new required column, a
+dropped or changed table or column, or a column whose meaning changes. A new
+optional column does not raise it. A test pins the tables of each number, and
+the miner images carry it as the ``org.cathedral.state-schema`` label that the
+signed miner updater checks before it lets a failed release roll back.
+"""
+
 VALIDATOR_ACCESS_SNAPSHOT_SCHEMA = "cathedral_validator_access_snapshot_v1"
 VALIDATOR_REQUEST_SCHEMA = "cathedral_validator_request_v1"
 WORKER_FLEET_SCHEMA = "cathedral_worker_fleet_v1"

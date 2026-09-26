@@ -27,6 +27,7 @@ import shutil
 import stat
 import tarfile
 import time
+import zlib
 from pathlib import Path, PurePosixPath
 
 from cathedral.miner_products import MinerProduct, find_launcher, read_launcher_profile
@@ -185,8 +186,28 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+MAX_DECOMPRESSED_BYTES = MAX_TREE_BYTES + 4 * 1024 * 1024
+"""Everything the gzip stream may expand to: file bodies plus tar and PAX headers."""
+
+
+def _gunzip_bounded(archive: bytes) -> bytes:
+    """Decompress with a hard cap, so a small archive cannot expand without bound."""
+
+    output = io.BytesIO()
+    with gzip.GzipFile(fileobj=io.BytesIO(archive), mode="rb") as stream:
+        while chunk := stream.read(65_536):
+            if output.tell() + len(chunk) > MAX_DECOMPRESSED_BYTES:
+                raise BundleError("bundle archive expands past its size limit")
+            output.write(chunk)
+    return output.getvalue()
+
+
 def extract_archive(archive: bytes, destination: Path, *, deadline: float | None = None) -> None:
-    """Extract a bounded, regular-file-only archive into a new directory."""
+    """Extract a bounded, regular-file-only archive into a new directory.
+
+    Every member counts toward the file cap, directories included, and every
+    PAX header counts toward the byte cap (trust review P3).
+    """
 
     if destination.exists() or destination.is_symlink():
         raise BundleError("bundle extraction destination already exists")
@@ -194,19 +215,23 @@ def extract_archive(archive: bytes, destination: Path, *, deadline: float | None
     total = 0
     count = 0
     try:
-        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as bundle:
+        raw = _gunzip_bounded(archive)
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as bundle:
             for member in bundle:
                 if deadline is not None and time.monotonic() > deadline:
                     raise BundleError("bundle extraction exceeded its deadline")
+                count += 1
+                total += sum(len(key) + len(value) for key, value in member.pax_headers.items())
+                if count > MAX_TREE_FILES or total > MAX_TREE_BYTES:
+                    raise BundleError("bundle archive exceeds extraction limits")
                 path = _safe_member_path(member.name)
                 if member.isdir():
                     (destination / path).mkdir(mode=0o755, parents=True, exist_ok=True)
                     continue
                 if not member.isfile() or member.size < 0:
                     raise BundleError("bundle archive contains a non-regular member")
-                count += 1
                 total += member.size
-                if count > MAX_TREE_FILES or total > MAX_TREE_BYTES:
+                if total > MAX_TREE_BYTES:
                     raise BundleError("bundle archive exceeds extraction limits")
                 target = destination / path
                 target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
@@ -222,7 +247,10 @@ def extract_archive(archive: bytes, destination: Path, *, deadline: float | None
         for root, _directories, _files in os.walk(destination, topdown=False):
             os.chmod(root, 0o755)
             _fsync_directory(Path(root))
-    except (tarfile.TarError, OSError, EOFError, gzip.BadGzipFile) as exc:
+    except BundleError:
+        raise
+    except (tarfile.TarError, OSError, EOFError, ValueError, zlib.error) as exc:
+        # zlib.error: a corrupt deflate stream, now that gzip is read directly.
         raise BundleError(f"bundle archive extraction failed: {exc}") from exc
 
 

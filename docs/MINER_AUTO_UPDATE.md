@@ -14,6 +14,38 @@ A miner follows one signed channel. When the channel names a newer release,
 the host installs it without anyone logging in. The miner's hotkey, endpoint,
 env file and validator-access material are never touched.
 
+## Trust model
+
+**The release signing key is root on every enrolled miner.** A release carries
+the launcher, which the miner unit runs as root, and the updater's own code,
+which runs as root. Whoever holds a key trusted for a channel can run any code
+as root on every host that follows that channel, within about an hour.
+
+What limits that:
+
+- Keys are held offline, encrypted, and never on a miner or in CI.
+- Canary and stable are separate roles. A key trusted only for canary cannot
+  sign anything a stable host accepts. A stable release carries only the tree
+  the stable signer rebuilt from its own reviewed checkout, so a canary key
+  cannot put code or keys onto stable hosts.
+- The trust set is host state (`/var/lib/cathedral-miner-update/trust.json`),
+  not part of any bundle. The bootstrap pins it by SHA-256. It changes only
+  forward, through a signed release. A key a change removes is revoked on that
+  host for good. No old updater tree, old bundle or later bootstrap can bring
+  it back.
+- Records live at most 14 days, cannot be issued more than 300 s ahead, and
+  never go below a host's sequence floor.
+
+What does not limit it: there is no threshold or quorum. With a single stable
+key, a compromise means a new bootstrap on every host, as for the validator.
+
+A network attacker cannot forge a record or make an updater crash. It can deny
+updates. If it can make the current updater's fetch fail while letting the
+previous updater's succeed, on two checks in a row, it can move the host back
+to the previous updater. That updater is still bound by the host trust set and
+floors. The host stays there until a release with another updater arrives, or
+an operator runs `resolve --retry`.
+
 ## What a release carries
 
 A release is one signed record (`cathedral/miner_release.py`). It names:
@@ -25,18 +57,15 @@ A release is one signed record (`cathedral/miner_release.py`). It names:
   backwards on a host;
 - the container **image**, by digest, in a `ghcr.io/cathedralai/` repository;
 - the **host bundle**, by archive and tree digest (`cathedral/miner_bundle.py`):
-  - the updater's own code;
-  - the product launcher;
-  - a drop-in for the miner's systemd unit;
-  - the release keys the next check will trust;
-- the **state schema**: the durable-state format the image writes. It decides
-  whether a failed release may roll back on its own. See "Rollback" below;
-- an issue time and an expiry. The lifetime is at most 14 days, and a record
-  is refused if it is issued more than 300 seconds in the future. These are
-  the validator updater's rules.
+  the updater's own code, the product launcher, a drop-in for the miner's
+  systemd unit, and a proposed trust root;
+- the **state schema**: the durable-state format the image writes. The image
+  must carry the same number as its `org.cathedral.state-schema` label. It
+  decides whether a failed release may roll back on its own;
+- an issue time and an expiry.
 
 So a launcher change, a unit change, a new required input such as the netuid,
-a new trust root, and a fix to the updater itself all arrive the same way as a
+a key rotation, and a fix to the updater itself all arrive the same way as a
 new image.
 
 ## Install (once per host)
@@ -48,14 +77,21 @@ Prerequisites:
 - the distribution's `python3` (3.10 or newer) and its `python3-cryptography`
   package. The updater installs nothing from a package index;
 - `git`, `docker` and `systemd`;
-- the miner already installed as a systemd unit. For the SNP miner that is
-  `examples/systemd/cathedral-sn<N>-snp-miner.service`. For a new TDX host,
-  use `examples/systemd/cathedral-audit-miner.service` and
-  `examples/systemd/audit-miner.env.example`. That unit runs whichever
-  launcher the active signed release installs.
+- the miner installed as a systemd unit. For the SNP miner that is
+  `examples/systemd/cathedral-sn<N>-snp-miner.service`. For a new TDX host, use
+  `examples/systemd/cathedral-audit-miner.service` and
+  `examples/systemd/audit-miner.env.example`;
+- a page hook at `/usr/local/sbin/cathedral-miner-update-page`: a root-owned
+  executable that takes a unit name and reaches a person. A minimal one:
 
-Take the commit and the trust-root digest from the release announcement, not
-from this repository. Then, as root:
+  ```bash
+  #!/bin/sh
+  # Replace with your pager, webhook or mail command.
+  logger -p user.crit "cathedral miner update needs attention: $1"
+  ```
+
+Take the commit, the trust-root digest and the minimum sequence from the
+release announcement, not from this repository. Then, as root:
 
 ```bash
 sudo ./deploy/miner-update/install-miner-update.sh \
@@ -65,26 +101,28 @@ sudo ./deploy/miner-update/install-miner-update.sh \
   --network <network> --netuid <netuid> \
   --channel stable \
   --channel-url https://<channel host>/snp-miner/stable.json \
-  --miner-unit <the miner's unit name>
+  --miner-unit <the miner's unit name> \
+  --minimum-sequence <from the announcement>
 ```
 
 The installer clones that exact commit and checks that `HEAD` is the commit
 asked for. It then runs `cathedral/miner_bootstrap.py`, which:
 
 1. refuses unless the committed trust root's SHA-256 equals `--keys-sha256`.
-   It prints each key's fingerprint and channels;
+   It writes the host trust set, or moves an existing one forward and revokes
+   every key the pinned root drops. It refuses a root that lists a revoked key;
 2. reads the launcher the miner unit runs today, and refuses if it is not a
    launcher for this product;
-3. installs the updater tree under
-   `/usr/local/lib/cathedral-miner-update/updater/releases/<tree>`. It is the
-   same tree a release of this commit would ship;
-4. records the unit's own launcher as the `legacy` release. It links
+3. installs the updater tree built from the checkout and makes it current. It
+   removes any `previous` updater, so nothing falls back to what the bootstrap
+   replaced;
+4. records the unit's own launcher as the `legacy` release, and links
    `/etc/systemd/system/<unit>.d/50-cathedral-miner-update.conf` to
-   `miner/current/unit.conf`, which is empty while `legacy` is current. So
+   `miner/current/unit.conf`. That file is empty while `legacy` is current, so
    the miner unit is unchanged;
-5. writes `/etc/cathedral/miner-update/config.json`, installs the frozen shim
-   and `cathedral-miner-update.service` and `.timer`, and runs
-   `systemctl daemon-reload`.
+5. writes `/etc/cathedral/miner-update/config.json`, and installs the frozen
+   shim, `cathedral-miner-update.service`, its timer and
+   `cathedral-miner-update-alert@.service`.
 
 It does not enable the timer. Run one check by hand first:
 
@@ -101,115 +139,202 @@ minutes of jitter.
 
 | Command | Effect |
 |---|---|
-| `cathedral-miner-update status` | Config, the active release, the updater tree, the last check, the last refusal, consecutive deferrals, remembered failures, floors. Works without the channel. |
-| `cathedral-miner-update pause [--reason TEXT]` / `resume` | Stop and restart checking. A paused check fetches nothing. |
-| `cathedral-miner-update pin --version V` or `pin --current` / `unpin` | Hold the miner at one version. Checks still verify the channel and advance the floor, and report `held`. Nothing is installed, including updater updates. |
-| `cathedral-miner-update resolve --restore-previous` | After a halt: put the previous release back and verify it runs. |
-| `cathedral-miner-update resolve --accept-release` | After a halt: accept the new release, if it is running. |
-| `cathedral-miner-update resolve --retry` | Forget a remembered failure, so the next check retries it. |
+| `cathedral-miner-update status` | Config, the trust set (generation, keys, revoked), the active release, the stage, the updater trees and their strikes, the last check, the last refusal, the last fallback, deferrals, remembered failures, floors. Works without the channel. |
+| `pause [--reason TEXT]` / `resume` | Stop and restart checking. A paused check fetches nothing. |
+| `pin --current` / `unpin` | Hold the release that runs now, by image and tree digest. Checks still verify the channel, advance the floor and take trust rotations, and report `held`. Nothing else is installed. |
+| `resolve --restore-previous` | After a halt: put the previous release back and verify it runs. |
+| `resolve --accept-release` | After a halt: accept the new release, if it is running. |
+| `resolve --abandon` | After any halt, including one where neither release can run: record the pending release as failed and clear the stage, so a newer release can activate. It leaves `miner/current` as it is and restarts nothing. |
+| `resolve --retry` | Forget remembered failures, of releases and of updater trees. |
 
 `check` prints one JSON line and exits with:
 
 | Exit | Meaning | Unit |
 |---|---|---|
 | 0 | `current`, `activated`, `held`, `paused` or `deferred` | succeeds |
-| 10 | `refused` or `rolled_back`. The reason says why, and the miner still runs what it ran before | fails |
-| 11 | `halted`. An operator must choose a `resolve` action | fails |
-| 12 | `deferred` six checks in a row: the safe-restart gate keeps saying no | fails |
+| 10 | `refused` or `rolled_back`. The reason says why, and the miner still runs what it ran before | succeeds (`SuccessExitStatus=10`); logged |
+| 11 | `halted`. An operator must choose a `resolve` action | fails and pages |
+| 12 | an alert: deferred six checks in a row, a gate that can never pass, an `unhealthy` miner, or a `demoted` updater | fails and pages |
+| 13 | `fault`: the updater's own logic failed | fails and pages |
 
-A non-zero exit fails the oneshot unit, so `systemctl --failed` shows a miner
-that is not updating.
+The unit's `OnFailure=` starts `cathedral-miner-update-alert@<unit>.service`,
+which runs the page hook.
 
 ## What one check does
 
-1. **Recover.** An activation a previous run left unfinished is resolved first
-   (see "Rollback").
-2. **Verify.** Fetch the record over https, with no redirects and a size cap,
-   and a total deadline enforced while reading. Check the signature and the
-   key's channel role. Then check product, network, netuid, channel,
-   lifetime, not-yet-valid and expiry. Then check the sequence floor and
-   equivocation. The sequence is recorded **before** anything else, so a
-   failed release still consumes it.
-3. **Self-update first.** If the record's bundle is not the tree this updater
-   runs from, install it, probe it, make it current, and hand the rest of the
-   check to it (see "Self-update").
-4. **Activate.**
+1. **Recover.** Finish whatever a previous run left behind (see step 6
+   and "Rollback"). A halt blocks activation, not the channel: the check still
+   verifies the record and installs a newer updater. It still exits 11, even
+   when the channel is down.
+2. **Verify.** Fetch the record over https, with no redirects, a size cap, and
+   a total deadline enforced while reading. Verify it against the host trust
+   set: signature, key role, product, network, netuid, channel, lifetime,
+   not-yet-valid and expiry. Any exception while handling channel bytes is a
+   refusal, never a crash. Then check the sequence floor and burn it.
+3. **Trust.** If the release's bundle proposes another trust root, move the
+   host trust set forward. It must still trust the key that signed this
+   release, and must not list a revoked key.
+4. **Self-update.** If the record's bundle is not the tree this updater runs
+   from, install it, probe it, make it current, and hand the rest of the check
+   to it (see "Self-update").
+5. **Activate.**
+   - If the miner unit was stopped by its operator, defer and report. An
+     update never starts a stopped miner. These deferrals count toward the
+     six-in-a-row alert, so `pause` the updater when a stop is meant to last.
    - Build `miner/releases/<activation>/`: the launcher, `release.env` (the
      image pin, `CATHEDRAL_NETWORK` and `CATHEDRAL_NETUID`), the unit drop-in
      and a profile.
-   - Pull the image and verify its digest, platform and runtime-contract
-     label.
+   - Pull the image. Verify its digest, platform, runtime-contract label and
+     state-schema label.
    - Check again that a restart is safe.
-   - Set the `may_have_run` latch.
+   - Set the `may_have_run` latch and record the flip time.
    - Point `miner/current` at the new directory with one `rename(2)`.
    - Run `systemctl daemon-reload`, `reset-failed` and `restart`.
-   - Commit only when the container reports the released image and has been
-     up for 20 seconds.
+6. **Probation.**
+   - The release enters probation only if all of these hold:
+     - a container of the released image started after the flip;
+     - the unit is active;
+     - the container stayed up for the 20 s dwell;
+     - a second look 45 s later sees the same container, with no new restarts.
+   - If the old container is still there, meaning the restart never happened,
+     the check starts the release once more. A failed restart is never ignored.
+   - The next check commits the release if the same container is still up with
+     the same restart count. A reboot restarts probation.
+   - Anything else goes to "Rollback". That includes a restart by hand during
+     probation: the check cannot tell it from a crash. `resolve --retry` then
+     lets the release try again.
 
-The operator's env file keeps its old image line. systemd loads `release.env`
-after it, and the later assignment wins.
+A committed release is checked on every run. If the miner is down, or has
+restarted since the last check, the check alerts (`unhealthy`, exit 12).
 
 **Safe to restart.** A restart makes the miner re-read its validator-access
 snapshot, and the snapshot is short-lived. So the check restarts only when
-`/etc/cathedral/validator-access/validator-access.json` has at least 600
-seconds left. That is enough for the restart, the settle wait and a rollback
-restart. It checks again right after the pull, because a slow pull can use up
-the margin. The updater's unit keeps that file readable. #197's unit hid it,
-so every unattended check deferred.
+`/etc/cathedral/validator-access/validator-access.json` has at least 600 s
+left. That covers the restart, the settle wait, the second look and a rollback
+restart. It checks again right after the pull. If the snapshot's whole
+lifetime is shorter than 600 s plus 240 s for refresh, the gate can never pass;
+the check alerts at once. The 900 s snapshots of the validator-access
+refresher (#211) pass.
+
+**Deferrals.** Six deferred checks in a row alert. Refusals do not reset the
+count: a refusal says nothing about the gate, and resetting on every channel
+blip could hide a gate that never opens.
 
 ## Rollback
 
-#197 allowed a rollback only if a fingerprint of the miner's durable state was
-unchanged. The running miner writes that database on every validator request.
-So on a live miner, rollback was almost never allowed.
+The rollback rule never reads the miner's database, which the running miner
+writes on every validator request. #197 fingerprinted that database, so on a
+live miner rollback was almost never allowed.
 
-Now each record declares `state_schema`, and every image reads every schema up
-to its own. When a release fails to come up, the updater rolls back on its
-own in two cases:
+A failed release rolls back on its own when:
 
-- the previous release's schema is at least the new one's. The previous image
-  can read anything the new image wrote;
-- the image is unchanged, and only the launcher or the unit changed.
+- the image is unchanged, and only the launcher or unit changed; or
+- the previous release's verified state schema is at least the new one's.
+  Every image reads every schema up to its own, so the previous image can read
+  whatever the new image wrote.
 
-Rolling back points `miner/current` back at the previous directory and runs
-`daemon-reload`, `reset-failed` and `restart`. `reset-failed` is there
-because a crash-looping release can exhaust the unit's start limit. The
-rollback is reported only once the previous image is running again. The
-failed release is remembered and not retried until a newer record arrives or
-an operator runs `resolve --retry`.
+Rolling back points `miner/current` back at the previous release and starts
+it, up to twice, so a registry or systemd blip during the first start does not
+strand the host. The launchers in this repository start from the locally
+verified image digest when it is present, so a registry outage does not block
+a rollback to a managed release. The `legacy` launcher a host ran before it
+enrolled may still pull on every start; that is one more reason for the first
+managed release to name the image the host already runs (rollout step 2). The
+rollback is reported only once the previous image runs again. If it does not
+come back, the check halts; a later check starts the previous release once
+more, and if it then runs, clears the halt and remembers the failed release.
+
+A failed release is remembered by its image and tree digests, so a re-signed
+copy is not retried. A newer release with other content, or `resolve --retry`,
+clears it.
 
 Otherwise the updater halts and waits for `resolve`:
 
 - the release raises the schema;
-- the previous schema is unknown. This happens on the first move from the
-  `legacy` launcher to a different image;
-- the previous image does not come back.
+- the previous release's schema is not verified. This covers the first move
+  from the `legacy` launcher to a different image;
+- the previous release does not come back after two starts.
+
+**State schemas.** The number is `DURABLE_STATE_SCHEMA` in
+`cathedral/validator_access.py`, and the miner images carry it as the
+`org.cathedral.state-schema` label. `prepare_image` reads the label, and a
+label that differs from the record's number is refused.
+
+- Schema 1 is the format before #179 (`8ad7f6e`). Schema 2 is the format
+  since #179, which creates `authorization_digest` as a NOT NULL column that
+  code from before #179 does not fill. So "all existing images are schema 1"
+  is false, and no release may declare 1 for an image built since #179.
+- Images built before this change carry no label. The updater takes one over
+  only as the image the miner already runs, and its schema then counts as
+  unverified. So the first labelled release after such a takeover halts,
+  rather than rolls back, if it fails. The same holds for any image from
+  before #179: nothing rolls back to it on its own.
+- A release may never lower the schema unless the image is unchanged.
+- The number rises only when code of the current number could no longer read
+  or write state that newer code creates: a new required column, a dropped or
+  changed table or column, or a column whose meaning changes. A new optional
+  column keeps the number. A test pins the tables of schema 2 on that rule.
+  Draft #212 adds an optional column and so stays schema 2.
 
 ## Self-update
 
-Every release ships the updater's code, and a check installs it before it does
-anything else. So the rest of each release runs under the code that release
-ships. Three guards stop a bad updater from stranding a host:
+Every release ships the updater's code, and a check installs it before it
+activates anything. The trust set is host state, so every updater, current or
+previous, verifies against the same keys and revocations. Three guards stop a
+bad updater from stranding a host:
 
 1. **Probe.** Before the new tree becomes current, the new code runs `probe`
-   from its own directory. It verifies the record that delivered it, with the
-   trust root it ships and this host's config. It also reads this host's state
-   and hashes its own tree. An import error, a broken verifier, or a trust
-   root that would lock the host out all fail here, and nothing changes.
+   from its own directory. It verifies the record that delivered it, reads
+   this host's state, and hashes its own tree. It must report the same state
+   and trust schemas this updater reads. An import error, a broken verifier or
+   a state-format change all fail here, and nothing changes. A failed probe is
+   a strike against the new tree.
 2. **First run.** The new updater then runs the rest of the check as a child
-   that inherits the lock. If it crashes, meaning any exit status other than
-   0, 10, 11 or 12, the old updater is put back.
-3. **Shim.** `bin/cathedral-miner-update` is installed once by the bootstrap
-   and never replaced. If the current updater crashes on a later run, the
-   shim runs the previous updater. That updater makes itself current and
-   remembers the crashed release.
+   that inherits the lock. It runs in its own process group and is killed,
+   with anything it started, after a timeout well inside the unit's. It stays
+   current only if it fetched and verified the channel and did not fault.
+   Otherwise the old updater is put back. It records a strike against the new
+   tree only if it can verify the channel itself right then.
+3. **Fallback.** On a later run, if the current updater exits with anything
+   but 0, 11 or 12, the frozen shim asks the previous updater to judge. A
+   refusal stands if the current updater recorded, for that same run and exit
+   status, that it verified the channel. Otherwise the previous updater
+   fetches and verifies the channel itself, changing nothing. If it can, that
+   is a strike against the current tree; if it cannot, the channel is at
+   fault and nothing changes.
 
-A failed updater release is remembered and not retried.
+A tree with two strikes is not used again on that host until a release with
+another updater arrives. One induced or transient failure demotes nothing.
+When the current updater is demoted, the check alerts (`demoted`, exit 12).
 
-Not updated through the channel: the shim, the updater's own service and
-timer, and the host's Python. They are the recovery path. A signed but wrong
-sandbox in the updater's own unit would disable the channel that could fix it.
-Changing them needs a new bootstrap.
+A later updater never changes the state's schema string; the probe refuses
+one that does. It may add fields and activation stages. An older updater keeps
+fields it does not know. A stage it does not know halts activation, but not
+verification, self-update or the fallback, so a demoted updater still works.
+`resolve --abandon` clears such a stage.
+
+Not updated through the channel: the shim, the updater's own service, timer
+and alert units, and the host's Python. The shim's directory is read-only to
+the updater. Changing any of them needs a new bootstrap.
+
+## When something fails
+
+| What fails | What the check does | Exit | Operator |
+|---|---|---|---|
+| The channel is down, or serves garbage | Refuses. Nothing changes. The fallback cannot verify either, so no strike | 10 | Nothing, unless it lasts |
+| A record is unsigned, expired, premature, for another host, or below the floor | Refuses. Nothing changes | 10 | Nothing |
+| The bundle's trust root lists a revoked key, or drops the key that signed it | Refuses, and remembers the release | 10 | Tell the signer |
+| The image cannot be pulled, or its digest, platform, contract or schema label is wrong | Refuses before anything is selected. The sequence is still burned | 10 | Tell the signer |
+| The restart gate is closed | Defers. Six in a row alert | 0, then 12 | Check the validator-access refresher |
+| The snapshot's lifetime can never pass the gate | Alerts at once | 12 | Lengthen the snapshot lifetime |
+| The miner unit is stopped | Defers, and never starts it | 0, then 12 | `pause` if intended |
+| A new release does not come up, or dies before the next check | Rolls back if the schema rule allows, and remembers the release | 10 | Nothing |
+| The same, when the schema rule does not allow it | Halts | 11 | `resolve` |
+| The previous release does not come back | Halts. The next check starts it once more | 11 | `resolve` if it stays |
+| A committed release is down, or restarted since the last check | Alerts | 12 | Look at the miner |
+| A new updater fails its probe or its first run | Keeps the old updater; a strike when the old one can verify | 10 | Nothing; two strikes retire the tree |
+| The current updater crashes or cannot verify, and the previous one can | A strike; at two the previous updater becomes current again | 13 or 10, then 12 | Tell the signer |
+| The updater's own logic raises | A documented fault, never a bare traceback | 13 | Tell the signer |
 
 ## Signer flow (offline)
 
@@ -242,77 +367,68 @@ python deploy/miner-update/build_signed_miner_release.py bundle \
 python deploy/miner-update/build_signed_miner_release.py canary \
   --private-key canary-1.pem --signing-key-id canary-1 \
   --product snp-miner --network <network> --netuid <netuid> \
-  --image ghcr.io/cathedralai/<repository>@sha256:<64 hex> --state-schema 1 \
+  --image ghcr.io/cathedralai/<repository>@sha256:<64 hex> --state-schema 2 \
   --bundle-archive out/<archive> --bundle-url https://<host>/<archive> \
   --version 2026.10.01 --sequence <next canary sequence> \
   --lifetime-seconds 604800 --out canary.json
 
-# 3. Publish canary.json at the canary channel URL, watch canary hosts,
-#    then promote exactly that canary with the stable key.
+# 3. Publish canary.json at the canary channel URL and watch canary hosts.
+#    The stable signer then promotes exactly that canary, from their own
+#    checkout of the same commit.
 python deploy/miner-update/build_signed_miner_release.py stable \
   --private-key stable-1.pem --signing-key-id stable-1 \
   --promote canary.json --bundle-archive out/<archive> \
   --sequence <next stable sequence> --lifetime-seconds 604800 --out stable.json
 ```
 
-The signer refuses in these cases:
+The stable command rebuilds the bundle tree from the signer's own checkout and
+committed trust root. It refuses unless that equals the canary's tree. It
+prints the trust root's digest and every key's role before it signs.
+
+The signer also refuses in these cases:
 
 - the lifetime is longer than 14 days, or the record is issued in the future;
 - the image is not in the repository the bundle's launcher requires;
-- the bundle's trust root would not let the signing key sign that channel,
-  because every host's probe would then refuse the release;
+- the bundle's trust root would not let the signing key sign that channel;
 - the output file already exists.
 
-**Freshness.** A record expires after at most 14 days. A host with an expired
-record keeps running what it has and reports `refused`. Re-sign the same
-release weekly with the next sequence. Hosts see the same image and bundle and
-do not restart.
+**Freshness.** Re-sign the same release weekly with the next sequence. Hosts
+see the same image and bundle and do not restart. A host with an expired
+record keeps running what it has and reports `refused`.
 
-**State schema.** `1` is the durable-state format of `cathedral/validator_access.py`
-on main when this PR was written. Raise it in any release whose image writes
-something an older image cannot read. Never lower it. A release that raises it
-halts on failure instead of rolling back.
-
-## Trust root and key rotation
-
-The trust root is `trust/release-keys.json` inside the running updater's tree.
-The bootstrap pins it by digest. After that, it changes only through a signed
-bundle.
+## Key rotation and revocation
 
 - **Planned rotation.**
-  1. Add the new key in a release signed by the current key.
-  2. Hosts adopt it through self-update. The probe proves the new trust root
-     still accepts the record that delivered it.
+  1. Add the new key to `release-keys.json` in a release signed by the current
+     key.
+  2. Hosts move their trust set forward.
   3. Sign from the new key.
-  4. Remove the old key in a later release.
-- **Revocation.** Ship a trust root without the compromised key, signed by
-  another key trusted for that channel. With a single stable key, a
-  compromise means a new bootstrap on every host, as for the validator.
-
-Because the release key signs the launcher and the updater, it is
-root-equivalent on every enrolled miner. Keep it offline.
+  4. Remove the old key in a later release. Hosts then revoke it for good.
+- **Revocation after a compromise.** Ship a trust root without the
+  compromised key, signed by another key trusted for that channel. With only
+  one stable key, re-bootstrap every host from a revision whose committed root
+  drops it. The bootstrap revokes it, and refuses any later root that lists it
+  again.
 
 ## Rollout
 
 1. The key holders generate the canary and stable keys and commit
    `deploy/miner-update/release-keys.json`. No key is committed yet.
-2. Sign and publish a record naming the image each host already runs. Hosts
-   move from their own launcher to the managed one with one restart. The
-   image is unchanged, so rollback is always allowed.
-3. Bootstrap one TDX host and one SNP host. Enable the timer. Record the
-   signed record, the key fingerprints, `status` before and after, and the
-   journal.
-4. Then canary, then stable, for real releases.
+2. Build and publish images from this commit, so they carry the state-schema
+   label. Or sign the image each host already runs: the updater takes that
+   over unlabelled, with one restart, and the rollback is always allowed.
+3. Bootstrap one TDX host and one SNP host, install the page hook, and enable
+   the timer. Record the signed record, the key fingerprints, `status` before
+   and after, and the journal.
+4. Real releases then go canary first, then stable.
 
 ## Limits
 
 - **Measured SNP guest.** On the planned SNP guest, the root filesystem is
-  measured and read-only, and the validator admits the image. There the
-  update unit should be the guest image, ordered after validator policy
-  (review F10). This updater covers the container lane only.
+  measured and read-only, and the validator admits the image. There the update
+  unit should be the guest image, ordered after validator policy (review
+  F10). This updater covers the container lane only.
 - **No staged rollout yet.** Every stable host restarts within about an hour
   of publication (review F12).
-- **The launchers still `docker pull` on every start** (S-07). A release can
-  now ship the launcher split, but this PR does not make it.
 - **The G4 GPU miners** update by VM boot image. This record does not describe
   them (review F21).

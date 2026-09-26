@@ -28,6 +28,7 @@ DEPLOY = REPO_ROOT / "deploy" / "miner-update"
 SERVICE = DEPLOY / "cathedral-miner-update.service"
 TIMER = DEPLOY / "cathedral-miner-update.timer"
 DROPIN = DEPLOY / "miner-unit.conf"
+ALERT = DEPLOY / "cathedral-miner-update-alert@.service"
 REVIEWED_MASK = "-/etc/cathedral/validator-access"  # what #197 shipped
 
 
@@ -69,7 +70,23 @@ def _host_paths() -> dict[str, PurePosixPath]:
 
 
 # Written only by the bootstrap or by an operator command, never by `check`.
-NOT_WRITTEN_BY_CHECK = {"config_dir", "config_file", "pause_file", "pin_file", "systemd_dir", "operator_command", "snapshot"}
+NOT_WRITTEN_BY_CHECK = {
+    "config_dir",
+    "config_file",
+    "pause_file",
+    "pin_file",
+    "systemd_dir",
+    "operator_command",
+    "snapshot",
+    "shim",
+}
+
+
+def writable_paths(unit: dict[str, list[str]]) -> list[str]:
+    """ReadWritePaths, plus what StateDirectory= makes writable under /var/lib."""
+
+    state = [f"/var/lib/{name}" for name in listed(unit.get("StateDirectory", []))]
+    return listed(unit.get("ReadWritePaths", [])) + state
 
 
 def test_every_path_the_updater_reads_is_visible_in_the_unit():
@@ -83,18 +100,41 @@ def test_every_path_the_updater_reads_is_visible_in_the_unit():
 def test_every_path_check_writes_is_writable_in_the_unit():
     unit = directives(SERVICE.read_text())
     assert unit["ProtectSystem"] == ["strict"]
-    writable = listed(unit.get("ReadWritePaths", []))
+    writable = writable_paths(unit)
+    read_only = listed(unit.get("ReadOnlyPaths", []))
     for name, path in _host_paths().items():
         if name in NOT_WRITTEN_BY_CHECK:
             continue
         assert _under(path, writable), f"check writes {name} ({path}) but the unit makes it read-only"
+        assert not _under(path, read_only), f"check writes {name} ({path}) but it is read-only"
+
+
+def test_the_shim_is_read_only_to_the_updater():
+    """Trust review P2: no release may change the recovery path."""
+
+    unit = directives(SERVICE.read_text())
+    assert _under(PurePosixPath(str(HostPaths().shim)), listed(unit["ReadOnlyPaths"]))
+    assert unit["StateDirectory"] == ["cathedral-miner-update"]
+    assert unit["StateDirectoryMode"] == ["0700"]
+    assert f"/var/lib/{unit['StateDirectory'][0]}" == str(HostPaths().state_dir)
+
+
+def test_refusals_succeed_and_halts_alerts_and_faults_page():
+    """Activation review P1-2."""
+
+    unit = directives(SERVICE.read_text())
+    assert unit["SuccessExitStatus"] == ["10"]
+    assert unit["OnFailure"] == ["cathedral-miner-update-alert@%n.service"]
+    alert = directives(ALERT.read_text())
+    assert alert["ExecStart"] == ["/usr/local/sbin/cathedral-miner-update-page %i"]
+    assert alert["Type"] == ["oneshot"]
 
 
 def test_the_unit_keeps_the_trust_root_and_config_read_only():
     """F17: the updater cannot rewrite its own config, and its keys live in immutable trees."""
 
     unit = directives(SERVICE.read_text())
-    writable = listed(unit.get("ReadWritePaths", []))
+    writable = writable_paths(unit)
     assert not _under(PurePosixPath(str(HostPaths().config_file)), writable)
     assert "/etc/cathedral" not in writable
 
@@ -118,6 +158,10 @@ def test_the_unit_timeout_covers_the_worst_case():
     (timeout,) = unit["TimeoutStartSec"]
     assert timeout.endswith("s")
     assert int(timeout[:-1]) >= cli.worst_case_seconds() + cli.SYSTEMD_MARGIN_SECONDS
+    # The first run of a new updater is killed well before systemd would kill
+    # the parent that must judge it (trust review P0-2).
+    assert cli.HANDOFF_TIMEOUT_SECONDS < int(timeout[:-1]) - cli.SYSTEMD_MARGIN_SECONDS
+    assert cli.HANDOFF_TIMEOUT_SECONDS >= cli.child_budget_seconds()
 
 
 def test_the_timer_triggers_the_service():
@@ -136,66 +180,96 @@ def test_the_miner_dropin_selects_the_active_release():
 # --- the sandbox, emulated ----------------------------------------------------------------
 
 _CHILD = r"""
-import json, sys, time
+import json, os, sys, time
 from pathlib import Path
-from cathedral.miner_bundle import TREE_TRUST_ROOT, link_target
-from cathedral.miner_release import load_trust_root
+from cathedral.miner_bundle import link_target
 from cathedral.miner_update_cli import safe_to_activate
-from cathedral.miner_updater import HostPaths, LEGACY, MinerUpdaterHost, load_config, read_activation_profile, update_once
-import os
+from cathedral.miner_updater import (
+    HostPaths, LEGACY, MinerUpdaterHost, Observation, load_config, read_activation_profile, update_once,
+)
 
 root, record = Path(sys.argv[1]), Path(sys.argv[2])
 paths = HostPaths(root=root)
 tree = str(link_target(paths.updater_current)).split("/")[-1]
 running = {}
+clock = [int(time.time())]
 
 def systemctl(arguments):
     if arguments[0] == "restart":
+        clock[0] += 1
         target = link_target(paths.miner_current)
         profile = read_activation_profile(paths, target)
-        running[profile["container"]] = profile.get("image")
+        running[profile["container"]] = (profile.get("image") or "legacy-image", float(clock[0]))
 
-readonly_etc = True
-try:
-    (root / "etc" / "cathedral" / "probe-write").write_text("x")
-    readonly_etc = False
-except OSError:
-    pass
+def observe(container):
+    image, started = running.get(container, ("legacy-image", 0.0))
+    return Observation(image=image, started_at=started, restarts=0, active=True)
+
+def writable(path):
+    try:
+        with open(path, "a"):
+            pass
+        return True
+    except OSError:
+        return False
 
 host = MinerUpdaterHost(
     config=load_config(paths.config_file, expected_uid=os.getuid()),
     paths=paths,
-    trusted_keys=load_trust_root((paths.updater_releases / tree / TREE_TRUST_ROOT).read_bytes()),
     running_tree=tree,
     fetch_metadata=lambda: record.read_bytes(),
     fetch_bundle=lambda bundle: b"",
     probe_updater=lambda release, saved: {},
     handoff=lambda release, fd: (1, None),
-    prepare_image=lambda release, profile: None,
+    prepare_image=lambda release, profile: release.state_schema,
     systemctl=systemctl,
-    current_image=lambda container: running.get(container, "legacy-image"),
-    settled_image=lambda container: running.get(container),
+    unit_state=lambda: "active",
+    observe=observe,
+    settle=observe,
     safe_to_activate=lambda: safe_to_activate(paths.snapshot),
-    now_unix=lambda: int(time.time()),
+    now_unix=lambda: clock[0],
+    sleep=lambda seconds: None,
+    boot_id=lambda: "boot",
     expected_uid=os.getuid(),
 )
-gate = safe_to_activate(paths.snapshot)
-outcome = update_once(host)
-print(json.dumps({"gate": gate, "readonly_etc": readonly_etc, "outcome": outcome.as_dict()}))
+report = {
+    "readonly_etc": not writable(root / "etc" / "cathedral" / "probe-write"),
+    "readonly_shim": not writable(paths.shim),
+    "gate": safe_to_activate(paths.snapshot),
+}
+report["outcome"] = update_once(host).as_dict()
+print(json.dumps(report))
 """
 
 
 def _mounts_for(unit_text: str, root: Path) -> list[str]:
-    """Shell commands that apply the unit's mount sandbox under ``root``."""
+    """Shell commands that apply the unit's mount sandbox under ``root``.
+
+    A path the unit makes writable but that does not exist fails the test
+    (activation review P3); only ``-`` prefixed paths may be absent.
+    """
 
     unit = directives(unit_text)
     commands = []
     if unit.get("ProtectSystem") == ["strict"]:
         commands += [f"mount --bind {root} {root}", f"mount -o remount,bind,ro {root}"]
-    for entry in listed(unit.get("ReadWritePaths", [])):
+    # systemd creates a StateDirectory= before the service starts.
+    for name in listed(unit.get("StateDirectory", [])):
+        (root / "var" / "lib" / name).mkdir(mode=0o700, parents=True, exist_ok=True)
+    writable = listed(unit.get("ReadWritePaths", []))
+    writable += [f"/var/lib/{name}" for name in listed(unit.get("StateDirectory", []))]
+    for entry in writable:
         target = root / entry.lstrip("-").lstrip("/")
-        if target.exists():
-            commands += [f"mount --bind {target} {target}", f"mount -o remount,bind,rw {target}"]
+        if not target.exists():
+            assert entry.startswith("-"), f"the unit makes {entry} writable, but it does not exist"
+            continue
+        commands += [f"mount --bind {target} {target}", f"mount -o remount,bind,rw {target}"]
+    for entry in listed(unit.get("ReadOnlyPaths", [])):
+        target = root / entry.lstrip("-").lstrip("/")
+        if not target.exists():
+            assert entry.startswith("-"), f"the unit makes {entry} read-only, but it does not exist"
+            continue
+        commands += [f"mount --bind {target} {target}", f"mount -o remount,bind,ro {target}"]
     for entry in listed(unit.get("InaccessiblePaths", [])):
         target = root / entry.lstrip("-").lstrip("/")
         if target.is_dir():
@@ -222,12 +296,20 @@ def _run_sandboxed(tmp_path: Path, unit_text: str) -> dict:
     (tmp_path / "record.json").write_bytes(record)
     snapshot = h.paths.snapshot
     snapshot.parent.mkdir(parents=True)
-    expires = datetime.now(timezone.utc) + timedelta(hours=1)
-    snapshot.write_text(json.dumps({"expires_at": expires.isoformat().replace("+00:00", "Z")}))
+    now = datetime.now(timezone.utc)
+    snapshot.write_text(
+        json.dumps(
+            {
+                "generated_at": now.isoformat().replace("+00:00", "Z"),
+                "expires_at": (now + timedelta(seconds=900)).isoformat().replace("+00:00", "Z"),
+            }
+        )
+    )
     miner_db = h.paths.root / "var/lib/cathedral/validator-access"
     miner_db.mkdir(parents=True)
     (miner_db / "validator-access.sqlite").write_bytes(b"live")
-    h.paths.state_dir.mkdir(parents=True, exist_ok=True)
+    h.paths.shim.parent.mkdir(parents=True, exist_ok=True)
+    h.paths.shim.write_text("#!/bin/sh\n")
     (tmp_path / "child.py").write_text(_CHILD)
 
     script = " && ".join(
@@ -252,8 +334,16 @@ def test_a_check_under_the_units_sandbox_activates_a_release(tmp_path):
 
     report = _run_sandboxed(tmp_path, SERVICE.read_text())
     assert report["readonly_etc"] is True, "the emulation did not apply ProtectSystem=strict"
+    assert report["readonly_shim"] is True, "the shim must be read-only to the updater"
     assert report["gate"] is True
     assert report["outcome"]["action"] == "activated", report["outcome"]["reason"]
+
+
+def test_a_missing_writable_path_fails_the_emulation(tmp_path):
+    """Activation review P3: the emulation must fail, not skip, on a missing path."""
+
+    with pytest.raises(AssertionError, match="does not exist"):
+        _mounts_for("[Service]\nReadWritePaths=/nonexistent/for/this/test\n", tmp_path)
 
 
 @pytest.mark.skipif(not _can_emulate(), reason="needs root and a mount namespace")
@@ -276,18 +366,29 @@ def test_the_reviewed_mask_would_defer_every_check(tmp_path):
 def test_systemd_analyze_accepts_the_units(tmp_path):
     units = tmp_path / "units"
     units.mkdir()
-    for source in (SERVICE, TIMER):
+    for source in (SERVICE, TIMER, ALERT):
         shutil.copy(source, units / source.name)
+    alert_instance = units / "cathedral-miner-update-alert@cathedral-miner-update.service.service"
+    alert_instance.symlink_to(units / ALERT.name)
     result = subprocess.run(
-        ["systemd-analyze", "verify", "--man=no", str(units / SERVICE.name), str(units / TIMER.name)],
+        [
+            "systemd-analyze",
+            "verify",
+            "--man=no",
+            str(units / SERVICE.name),
+            str(units / TIMER.name),
+            str(alert_instance),
+        ],
         capture_output=True,
         text=True,
         env={**os.environ, "SYSTEMD_UNIT_PATH": f"{units}:"},
         timeout=60,
     )
     complaints = [line for line in (result.stdout + result.stderr).splitlines() if line.strip()]
-    # The shim is installed by the bootstrap, so on a build machine it is absent.
-    unexpected = [line for line in complaints if str(HostPaths().shim) not in line]
+    # The bootstrap installs the shim, and the operator supplies the page hook,
+    # so on a build machine both are absent.
+    absent = (str(HostPaths().shim), "/usr/local/sbin/cathedral-miner-update-page")
+    unexpected = [line for line in complaints if not any(path in line for path in absent)]
     assert unexpected == [], complaints
 
 

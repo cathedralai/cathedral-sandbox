@@ -1,27 +1,47 @@
-"""The updater updates itself through the channel, and cannot strand itself doing so.
+"""Self-update, the host trust set, and the fallback between updaters.
 
-Review finding F5: the first updater a host installed was permanent, so every
-defect in it (F1 included) needed hands on every host. Now each release ships
-the updater's code, and a check installs it first. Three guards keep a bad
-updater from stranding a host: the pre-flip probe, the first-run handoff, and
-the frozen shim's fallback. The in-process tests drive the state machine; the
-subprocess tests run the real CLI and the real shell shim.
+Review finding F5: the first updater a host installed was permanent. Now each
+release ships the updater, and a check installs it first. The trust review
+then found two ways that went wrong, and these tests hold the fixes:
+
+- P0-1: the fallback ran the previous updater against its own bundled keys,
+  so a key revoked by a rotation became trusted again, and the untrusted
+  channel could force that fallback by crashing the current updater. The
+  trust set now lives in host state and only moves forward, channel bytes can
+  no longer crash an updater, and the bootstrap leaves no stale fallback.
+- P0-2: a buggy-but-signed updater that refused everything was kept forever.
+  Now a new updater stays current only if its first run verified the channel,
+  and the previous updater takes over after two failures that it did not share.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from cathedral import miner_update_cli as cli
 from cathedral.miner_bundle import atomic_symlink, install_directory, link_target
-from cathedral.miner_updater import EXIT_REFUSED, update_once
+from cathedral.miner_release import MinerReleaseError, initial_trust_state, rotate_trust
+from cathedral.miner_updater import (
+    EXIT_ALERT,
+    EXIT_FAULT,
+    EXIT_HALTED,
+    EXIT_REFUSED,
+    STRIKES_TO_DEMOTE,
+    MinerUpdateError,
+    fallback_to_previous,
+    load_trust_state,
+    update_once,
+    write_state,
+)
 from tests.miner_update_support import (
     DEFAULT_TRUST,
     OTHER_KEY,
@@ -29,10 +49,14 @@ from tests.miner_update_support import (
     STABLE_KEY,
     Harness,
     build_tree,
+    trust_root_bytes,
 )
 
 SHIM = REPO_ROOT / "deploy" / "miner-update" / "cathedral-miner-update"
-NEW_LAUNCHER = {"launcher_suffix": b"# launcher v2\n"}
+V2 = {"launcher_suffix": b"# launcher v2\n"}
+V3 = {"launcher_suffix": b"# launcher v3\n"}
+ROTATED = {**DEFAULT_TRUST, "stable-2": (OTHER_KEY, ["stable"])}
+RETIRED = {"canary-1": DEFAULT_TRUST["canary-1"], "stable-2": (OTHER_KEY, ["stable"])}
 
 
 @pytest.fixture()
@@ -40,42 +64,59 @@ def h(tmp_path) -> Harness:
     return Harness(tmp_path)
 
 
-def _releases(h: Harness) -> set[str]:
-    return {path.name for path in h.paths.updater_releases.iterdir()}
+def _tree_of(record: bytes) -> str:
+    return json.loads(record)["release"]["bundle"]["tree_sha256"]
 
 
-# --- in process ------------------------------------------------------------------------
+def _broken_fetch_for(h: Harness, bad_tree: str):
+    """A host factory whose updater `bad_tree` has a fetch regression."""
+
+    def host_for(tree: str, **overrides):
+        host = h.host(running_tree=tree, **overrides)
+        if tree == bad_tree:
+
+            def broken():
+                raise MinerUpdateError("the download failed: a regression in this updater")
+
+            host.fetch_metadata = broken
+        return host
+
+    def handoff(release_dir, fd):
+        child = host_for(release_dir.name)
+        child.handoff_depth = 1
+        child.lock_fd = fd
+        outcome = update_once(child)
+        return outcome.exit_status, outcome.as_dict()
+
+    return host_for, handoff
+
+
+# --- adoption --------------------------------------------------------------------------------
 
 
 def test_a_new_updater_is_adopted_first_and_applies_the_release(h):
-    h.release(sequence=5, bundle=NEW_LAUNCHER)
+    h.release(sequence=5, bundle=V2)
     outcome = h.check()
     assert outcome.action == "activated", outcome.reason
-    assert "took over" in outcome.reason
-    new_tree = h.updater_current()
-    assert new_tree != h.tree_a
+    assert outcome.verified is True and "took over" in outcome.reason
+    assert h.updater_current() != h.tree_a
     assert link_target(h.paths.updater_previous) == f"releases/{h.tree_a}"
     assert h.running_image() == h.new_image
-    # The child recorded its own outcome; the parent did not overwrite it.
     assert h.state()["last_check"]["action"] == "activated"
 
 
 def test_an_unsigned_record_never_reaches_the_bundle(h):
-    record = json.loads(h.release(sequence=5, bundle=NEW_LAUNCHER))
+    record = json.loads(h.release(sequence=5, bundle=V2))
     record["signature"]["value_base64"] = record["signature"]["value_base64"][::-1]
     h.metadata = json.dumps(record).encode()
-    before = _releases(h)
-    outcome = h.check()
-    assert outcome.action == "refused"
+    before = set(os.listdir(h.paths.updater_releases))
+    assert h.check().action == "refused"
     assert h.updater_current() == h.tree_a
-    assert _releases(h) == before
-    # The old updater still works.
-    h.release(sequence=5)
-    assert h.check().action == "activated"
+    assert set(os.listdir(h.paths.updater_releases)) == before
 
 
 def test_a_bundle_that_does_not_match_its_digest_is_refused(h):
-    h.release(sequence=5, bundle=NEW_LAUNCHER)
+    h.release(sequence=5, bundle=V2)
     (digest,) = h.bundles
     original = h.bundles[digest]
     h.bundles[digest] = original[:100] + bytes([original[100] ^ 1]) + original[101:]
@@ -84,68 +125,341 @@ def test_a_bundle_that_does_not_match_its_digest_is_refused(h):
     assert h.updater_current() == h.tree_a
 
 
-def test_a_bundle_whose_trust_root_would_lock_the_host_out_fails_its_probe(h):
-    """A new trust root that drops the key which signed it would strand the host."""
+def test_a_probe_that_does_not_confirm_the_release_is_refused(h):
+    """Kills the surviving mutant that skipped the probe's confirmation."""
 
-    lockout = {"canary-1": DEFAULT_TRUST["canary-1"], "other-1": (OTHER_KEY, ["stable"])}
-    h.release(sequence=5, bundle={"trust": lockout, **NEW_LAUNCHER})
+    h.release(sequence=5, bundle=V2)
+    outcome = h.check(
+        probe_updater=lambda release_dir, record: {"probe": "ok", "signed_sha256": "0" * 64}
+    )
+    assert outcome.action == "refused" and "did not confirm" in outcome.reason
+    assert h.updater_current() == h.tree_a
+
+
+def test_a_probe_reporting_another_state_schema_is_refused(h):
+    """Trust review P2: a state-schema bump must not strand the fallback."""
+
+    record = h.release(sequence=5, bundle=V2)
+
+    def probe(release_dir, saved):
+        document = h._probe(release_dir, saved)
+        return dict(document, state_schema="cathedral_miner_update_state_v2")
+
+    outcome = h.check(probe_updater=probe)
+    assert outcome.action == "refused" and "state_schema" in outcome.reason
+    assert "strike 1" in outcome.reason
+    assert h.updater_current() == h.tree_a
+    # A failed probe is a strike, not a verdict (P1-1); the second one retires the tree.
+    assert "no longer uses" in h.check(probe_updater=probe).reason
+    assert _tree_of(record) in h.state()["failed_updaters"]
+    assert "already failed" in h.check(probe_updater=probe).reason
+
+
+def test_one_probe_timeout_does_not_blacklist_a_good_updater(h):
+    """Trust review P1-1: a transient probe failure must not retire a good tree."""
+
+    good = _tree_of(h.release(sequence=5, bundle=V2))
+
+    def slow(release_dir, saved):
+        raise MinerUpdateError("the probe did not complete: timed out")
+
+    assert "strike 1" in h.check(probe_updater=slow).reason
+    assert good not in h.state()["failed_updaters"]
     outcome = h.check()
-    assert outcome.action == "refused" and "probe" in outcome.reason
-    assert h.updater_current() == h.tree_a
-    assert h.state()["failed"]["updater_tree"] is not None
-    assert h.check().action == "refused"  # remembered, not retried hourly
-    # A newer release with a sound bundle is still accepted by the old updater.
-    h.release(sequence=6, bundle={"launcher_suffix": b"# launcher v3\n"})
-    assert h.check().action == "activated"
-
-
-def test_a_new_updater_that_crashes_on_its_first_run_is_reverted(h):
-    h.release(sequence=5, bundle=NEW_LAUNCHER)
-    outcome = h.check(handoff=lambda release_dir, fd: (1, None))
-    assert outcome.action == "refused" and "crashed" in outcome.reason
-    assert h.updater_current() == h.tree_a
-    assert link_target(h.paths.updater_previous) is None
-    assert h.state()["failed"]["updater_tree"] is not None
-    assert h.active() == "legacy"
+    assert outcome.action == "activated", outcome.reason
+    assert h.updater_current() == good
+    assert not h.state()["updater_strikes"]
 
 
 def test_a_second_self_update_inside_a_handoff_waits_for_the_next_run(h):
-    h.release(sequence=5, bundle=NEW_LAUNCHER)
+    h.release(sequence=5, bundle=V2)
     host = h.host()
     host.handoff_depth = 1
     outcome = update_once(host)
     assert outcome.action == "refused" and "next check" in outcome.reason
 
 
-def test_key_rotation_arrives_through_the_channel(h):
-    """A bundle can add a key; the next record signed by it is then trusted."""
+# --- the host trust set (trust review P0-1) ----------------------------------------------------
 
-    rotated = {**DEFAULT_TRUST, "stable-2": (OTHER_KEY, ["stable"])}
-    h.release(sequence=5, bundle={"trust": rotated, **NEW_LAUNCHER})
-    assert h.check().action == "activated"
-    h.release(
-        sequence=6,
-        image=h.image("3"),
-        key=OTHER_KEY,
-        key_id="stable-2",
-        bundle={"trust": rotated, **NEW_LAUNCHER},
+
+def test_rotation_moves_the_host_trust_set_forward(h):
+    h.release(sequence=5, bundle={"trust": ROTATED, **V2})
+    assert h.commit().action == "current"
+    trust = load_trust_state(h.paths.trust_file, expected_uid=os.getuid())
+    assert trust.generation == 2 and set(trust.keys) == {"canary-1", "stable-1", "stable-2"}
+    h.release(sequence=6, image=h.image("3"), key=OTHER_KEY, key_id="stable-2", bundle={"trust": RETIRED, **V3})
+    assert h.commit().action == "current"
+    trust = load_trust_state(h.paths.trust_file, expected_uid=os.getuid())
+    assert trust.generation == 3 and "stable-1" not in trust.keys
+    assert [entry["key_id"] for entry in trust.revoked.values()] == ["stable-1"]
+
+
+def test_a_revoked_key_is_refused_even_by_the_previous_updater(h):
+    """The reviewer's scenario: crash the current updater, then serve a revoked-key record."""
+
+    h.release(sequence=5, bundle={"trust": ROTATED, **V2})
+    h.commit()
+    h.release(sequence=6, image=h.image("3"), key=OTHER_KEY, key_id="stable-2", bundle={"trust": RETIRED, **V3})
+    h.commit()
+    current = h.updater_current()
+    previous = link_target(h.paths.updater_previous).split("/")[-1]
+    evil = h.release(
+        sequence=7,
+        image=h.image("4"),
+        key=STABLE_KEY,
+        key_id="stable-1",
+        bundle={"trust": ROTATED, "launcher_suffix": b"# evil\n"},
     )
-    assert h.check().action == "activated"
-    # And a key the rotated root no longer lists is refused.
-    retired = {"canary-1": DEFAULT_TRUST["canary-1"], "stable-2": (OTHER_KEY, ["stable"])}
+    assert h.check().action == "refused"
+    # 1. The channel serves a body that used to crash the updater. Now it is a refusal.
+    h.metadata = b"[" + b"1" * 5000 + b"]"
+    crashed = update_once(h.host())
+    assert crashed.action == "refused" and crashed.exit_status == EXIT_REFUSED
+    # 2. Even if the previous updater is asked to judge, it verifies against the
+    #    host trust set, so the revoked key's record is refused there too.
+    h.metadata = evil
+    outcome = fallback_to_previous(h.host(running_tree=previous), EXIT_FAULT)
+    assert outcome.action == "refused" and "cannot verify the channel" in outcome.reason
+    assert h.updater_current() == current
+    assert h.running_image() == h.image("3")
+    assert not h.state()["updater_strikes"]
+
+
+def test_a_bundle_cannot_re_add_a_revoked_key(h):
+    h.release(sequence=5, bundle={"trust": ROTATED, **V2})
+    h.commit()
+    h.release(sequence=6, image=h.image("3"), key=OTHER_KEY, key_id="stable-2", bundle={"trust": RETIRED, **V3})
+    h.commit()
     h.release(
         sequence=7,
         image=h.image("4"),
         key=OTHER_KEY,
         key_id="stable-2",
-        bundle={"trust": retired, **NEW_LAUNCHER},
+        bundle={"trust": ROTATED, "launcher_suffix": b"# re-add\n"},
     )
-    assert h.check().action == "activated"
-    h.release(sequence=8, image=h.image("5"), key=STABLE_KEY, key_id="stable-1", bundle={"trust": retired, **NEW_LAUNCHER})
-    assert h.check().action == "refused"
+    outcome = h.check()
+    assert outcome.action == "refused" and "revoked key" in outcome.reason
+    assert "stable-1" not in load_trust_state(h.paths.trust_file, expected_uid=os.getuid()).keys
 
 
-# --- real processes ----------------------------------------------------------------------
+def test_a_rotation_that_would_lock_the_host_out_is_refused(h):
+    lockout = {"canary-1": DEFAULT_TRUST["canary-1"], "other-1": (OTHER_KEY, ["stable"])}
+    h.release(sequence=5, bundle={"trust": lockout, **V2})
+    outcome = h.check()
+    assert outcome.action == "refused" and "would not trust the key that signed it" in outcome.reason
+    assert load_trust_state(h.paths.trust_file, expected_uid=os.getuid()).generation == 1
+    assert h.updater_current() == h.tree_a
+
+
+def test_rotation_rules_in_isolation():
+    state = initial_trust_state(trust_root_bytes())
+    same = rotate_trust(state, trust_root_bytes())
+    assert same is state
+    moved = rotate_trust(state, trust_root_bytes(RETIRED), signing_key_id="stable-2", channel="stable")
+    assert moved.generation == 2 and len(moved.revoked) == 1
+    with pytest.raises(MinerReleaseError, match="revoked"):
+        rotate_trust(moved, trust_root_bytes())
+
+
+def test_a_pinned_host_still_takes_trust_rotations(h):
+    """Trust review P2."""
+
+    from cathedral.miner_updater import pin_document
+
+    h.release(sequence=5)
+    h.commit()
+    h.paths.pin_file.write_bytes(pin_document(h.state()["miner"]["current"]))
+    h.release(sequence=6, image=h.image("3"), bundle={"trust": RETIRED, **V2}, key=STABLE_KEY, key_id="stable-1")
+    # The signer's key is dropped by this root, so it is refused; use a rotation that keeps it.
+    h.release(sequence=7, image=h.image("3"), bundle={"trust": ROTATED, **V2})
+    assert h.check().action == "held"
+    assert "stable-2" in load_trust_state(h.paths.trust_file, expected_uid=os.getuid()).keys
+    assert h.updater_current() == h.tree_a
+
+
+# --- the first run must prove a verified check (trust review P0-2) -----------------------------
+
+
+def test_a_fetch_regression_in_a_new_updater_is_caught_and_recovered(h):
+    """The reviewer's P0-2 scenario, and recovery once a fixed release is published."""
+
+    bad = _tree_of(h.release(sequence=5, bundle={"launcher_suffix": b"# v2 with a fetch regression\n"}))
+    host_for, handoff = _broken_fetch_for(h, bad)
+    first = update_once(host_for(h.tree_a, handoff=handoff))
+    assert first.action == "refused" and "strike 1" in first.reason
+    assert h.updater_current() == h.tree_a
+    second = update_once(host_for(h.tree_a, handoff=handoff))
+    assert "no longer uses that updater" in second.reason
+    assert bad in h.state()["failed_updaters"]
+    third = update_once(host_for(h.tree_a, handoff=handoff))
+    assert third.action == "refused" and "already failed" in third.reason
+    # The signer publishes a fixed updater. The host takes it without hands.
+    fixed = _tree_of(h.release(sequence=6, bundle={"launcher_suffix": b"# v3 fixes the fetch\n"}))
+    outcome = update_once(host_for(h.tree_a, handoff=handoff))
+    assert outcome.action == "activated", outcome.reason
+    assert h.updater_current() == fixed
+
+
+def test_a_regression_that_appears_later_is_recovered_by_the_fallback(h):
+    good = _tree_of(h.release(sequence=5, bundle=V2))
+    assert h.commit().action == "current"
+    assert h.updater_current() == good
+    host_for, _ = _broken_fetch_for(h, good)
+    for strike in range(1, STRIKES_TO_DEMOTE + 1):
+        refused = update_once(host_for(good))
+        assert refused.action == "refused" and refused.verified is False
+        judged = fallback_to_previous(host_for(h.tree_a), refused.exit_status)
+        if strike < STRIKES_TO_DEMOTE:
+            assert judged.exit_status == EXIT_REFUSED and f"strike {strike}" in judged.reason
+            assert h.updater_current() == good
+    assert judged.action == "demoted" and judged.exit_status == EXIT_ALERT
+    assert h.updater_current() == h.tree_a
+    assert link_target(h.paths.updater_previous) is None
+    fixed = _tree_of(h.release(sequence=6, bundle=V3))
+    assert update_once(h.host()).action == "activated"
+    assert h.updater_current() == fixed
+
+
+def test_a_first_run_crash_is_reverted_with_a_strike(h):
+    h.release(sequence=5, bundle=V2)
+    outcome = h.check(handoff=lambda release_dir, fd: (1, None))
+    assert outcome.action == "refused" and "strike 1" in outcome.reason
+    assert h.updater_current() == h.tree_a
+    assert link_target(h.paths.updater_previous) is None
+    assert h.active() == "legacy"
+
+
+def test_a_first_run_that_faults_after_verifying_is_not_kept(h):
+    h.release(sequence=5, bundle=V2)
+    outcome = h.check(
+        handoff=lambda release_dir, fd: (EXIT_FAULT, {"action": "fault", "verified": True, "reason": "a bug"})
+    )
+    assert outcome.action == "refused" and "strike 1" in outcome.reason
+    assert h.updater_current() == h.tree_a
+
+
+def test_reverting_a_new_updater_keeps_the_fallback_the_host_had(h):
+    good = _tree_of(h.release(sequence=5, bundle=V2))
+    h.commit()
+    assert link_target(h.paths.updater_previous) == f"releases/{h.tree_a}"
+    h.release(sequence=6, bundle=V3)
+    outcome = h.check(handoff=lambda release_dir, fd: (1, None))
+    assert "strike 1" in outcome.reason
+    assert h.updater_current() == good
+    assert link_target(h.paths.updater_previous) == f"releases/{h.tree_a}"
+
+
+def test_a_halt_keeps_paging_while_the_channel_is_down(h):
+    """A refusal later in the check must not turn exit 11 into a quiet exit 10."""
+
+    h.release(sequence=5)
+    h.commit()
+    h.broken_images.add(h.image("3"))
+    h.release(sequence=6, image=h.image("3"), state_schema=2)
+    assert h.check().action == "halted"
+
+    def down():
+        raise MinerUpdateError("the download failed: outage")
+
+    outcome = h.check(fetch_metadata=down)
+    assert outcome.action == "halted" and outcome.exit_status == EXIT_HALTED
+    assert "outage" in outcome.reason
+
+
+def test_a_first_run_during_a_channel_outage_is_reverted_without_a_strike(h):
+    record = h.release(sequence=5, bundle=V2)
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise MinerUpdateError("the download failed: outage")
+        return record
+
+    outcome = h.check(fetch_metadata=flaky, handoff=lambda release_dir, fd: (EXIT_REFUSED, {"action": "refused", "verified": False}))
+    assert "no strike" in outcome.reason
+    assert not h.state()["updater_strikes"]
+    assert not h.state()["failed_updaters"]
+
+
+def test_an_induced_failure_the_previous_updater_shares_blames_nothing(h):
+    """Trust review P1-1: channel garbage must not retire a good updater."""
+
+    good = _tree_of(h.release(sequence=5, bundle=V2))
+    h.commit()
+    h.metadata = b"[" + b"1" * 5000 + b"]"
+    refused = update_once(h.host())
+    judged = fallback_to_previous(h.host(running_tree=h.tree_a), refused.exit_status)
+    assert "cannot verify the channel either" in judged.reason
+    assert h.updater_current() == good
+    assert not h.state()["updater_strikes"] and not h.state()["failed_updaters"]
+
+
+def _verified_refusal(h: Harness) -> str:
+    """A verified refusal, recorded; then the channel serves a good record again."""
+
+    valid = h.release(sequence=5, bundle=V2)
+    h.commit()
+    h.release(sequence=4, bundle=V2)  # a rollback: refused after a verified fetch
+    refused = update_once(h.host())
+    assert refused.exit_status == EXIT_REFUSED and refused.verified is True
+    h.metadata = valid
+    return _tree_of(valid)
+
+
+def test_a_verified_refusal_is_not_second_guessed(h):
+    _verified_refusal(h)
+    judged = fallback_to_previous(h.host(running_tree=h.tree_a), EXIT_REFUSED)
+    assert "its refusal stands" in judged.reason
+    assert not h.state()["updater_strikes"]
+
+
+def test_a_stale_verified_record_does_not_excuse_a_new_failure(h):
+    """The fallback trusts `verified` only from the run the shim just saw."""
+
+    good = _verified_refusal(h)
+    h.now += 3600
+    # An hour later the current updater crashes before it records anything.
+    judged = fallback_to_previous(h.host(running_tree=h.tree_a), EXIT_REFUSED)
+    assert "stands" not in judged.reason and "strike 1" in judged.reason
+    assert good in h.state()["updater_strikes"]
+
+
+def test_a_record_of_another_exit_status_does_not_excuse_a_refusal(h):
+    good = _verified_refusal(h)
+    state = h.state()
+    state["last_check"]["exit_status"] = 0
+    write_state(h.paths.state_file, state)
+    judged = fallback_to_previous(h.host(running_tree=h.tree_a), EXIT_REFUSED)
+    assert "stands" not in judged.reason and "strike 1" in judged.reason
+    assert good in h.state()["updater_strikes"]
+
+
+def test_a_stage_a_newer_updater_wrote_stops_activation_but_not_the_fallback(h):
+    """Trust review P2: newer state must never make an older updater refuse it."""
+
+    from cathedral.miner_updater import resolve
+
+    good = _tree_of(h.release(sequence=5, bundle=V2))
+    h.commit()
+    state = h.state()
+    state["miner"]["stage"] = "a_stage_from_the_future"
+    state["a_field_from_the_future"] = {"kept": True}
+    write_state(h.paths.state_file, state)
+    host_for, _ = _broken_fetch_for(h, good)
+    refused = update_once(host_for(good))
+    judged = fallback_to_previous(host_for(h.tree_a), refused.exit_status)
+    assert "strike 1" in judged.reason, judged.reason
+    # The older updater, as current, halts activation but still verifies.
+    halted = update_once(h.host(running_tree=h.tree_a))
+    assert halted.action == "halted" and halted.verified is True
+    assert "a_stage_from_the_future" in halted.reason
+    assert h.state()["a_field_from_the_future"] == {"kept": True}
+    assert resolve(h.host(), "abandon").action == "resolved"
+    assert h.state()["miner"]["stage"] is None
+
+
+# --- real processes ----------------------------------------------------------------------------
 
 
 def _real_clock(h: Harness) -> Harness:
@@ -155,102 +469,302 @@ def _real_clock(h: Harness) -> Harness:
     return h
 
 
-def _root_env(h: Harness) -> dict[str, str]:
-    return {
-        "PATH": os.environ["PATH"],
-        "CATHEDRAL_MINER_UPDATE_ROOT": str(h.paths.root),
-        "CATHEDRAL_MINER_UPDATE_PYTHON": sys.executable,
-    }
-
-
 def test_the_real_probe_accepts_a_sound_updater(h):
     _real_clock(h)
-    h.release(sequence=5, bundle=NEW_LAUNCHER)
-    outcome = h.check(
-        probe_updater=lambda release_dir, record: cli.probe_updater(h.paths, release_dir, record)
-    )
+    h.release(sequence=5, bundle=V2)
+    outcome = h.check(probe_updater=lambda release_dir, record: cli.probe_updater(h.paths, release_dir, record))
     assert outcome.action == "activated", outcome.reason
 
 
 def test_the_real_probe_refuses_a_broken_updater_and_the_old_one_keeps_working(h):
     _real_clock(h)
-    broken = {"replace_modules": {"miner_updater.py": b"this is not python\n"}}
-    h.release(sequence=5, bundle=broken)
-    outcome = h.check(
-        probe_updater=lambda release_dir, record: cli.probe_updater(h.paths, release_dir, record)
-    )
+    h.release(sequence=5, bundle={"replace_modules": {"miner_updater.py": b"this is not python\n"}})
+    outcome = h.check(probe_updater=lambda release_dir, record: cli.probe_updater(h.paths, release_dir, record))
     assert outcome.action == "refused" and "probe exited" in outcome.reason
     assert h.updater_current() == h.tree_a
     h.release(sequence=6)
     assert h.check().action == "activated"
 
 
-def test_the_real_handoff_passes_the_lock_to_the_new_updater(h):
-    """The child runs a full check holding the parent's lock.
-
-    The child cannot reach the channel (a closed local port), so it refuses
-    with a documented status. What matters: it did not report lock contention,
-    and a documented refusal keeps the new updater current.
-    """
+def test_the_real_handoff_passes_the_lock_and_an_unverified_first_run_is_not_kept(h):
     _real_clock(h)
+    h.release(sequence=5, bundle=V2)
+    seen = {}
 
-    h.release(sequence=5, bundle=NEW_LAUNCHER)
+    def handoff(release_dir, fd):
+        status, document = cli.handoff(h.paths, release_dir, fd, 0)
+        seen["status"], seen["document"] = status, document
+        return status, document
+
     outcome = h.check(
         probe_updater=lambda release_dir, record: cli.probe_updater(h.paths, release_dir, record),
-        handoff=lambda release_dir, fd: cli.handoff(h.paths, release_dir, fd, 0),
+        handoff=handoff,
     )
-    assert outcome.exit_status == EXIT_REFUSED
-    assert "took over" in outcome.reason
-    assert "download failed" in outcome.reason
-    assert "already running" not in outcome.reason
-    assert h.updater_current() != h.tree_a
+    assert seen["status"] == EXIT_REFUSED
+    assert "download failed" in seen["document"]["reason"]
+    assert "already running" not in seen["document"]["reason"]
+    assert seen["document"]["verified"] is False
+    # The child could not reach the channel (a closed local port) while this
+    # updater could, so the new tree is not kept and gets a strike.
+    assert outcome.action == "refused" and "strike 1" in outcome.reason
+    assert h.updater_current() == h.tree_a
 
 
-def test_the_shim_hands_over_to_the_previous_updater_when_the_current_one_crashes(h, tmp_path):
+def test_the_probe_and_handoff_run_from_the_release_directory(h, monkeypatch):
+    """Kills the surviving mutant that dropped the probe's cwd=."""
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(kwargs)
+
+        class Result:
+            returncode = 0
+            stdout = '{"probe": "ok"}'
+            stderr = ""
+
+        return Result()
+
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            calls.append(kwargs)
+            self.returncode = 0
+            self.pid = -1
+
+        def communicate(self, timeout=None):
+            calls[-1]["timeout"] = timeout
+            return '{"action": "current"}', None
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli.subprocess, "Popen", FakePopen)
+    release = h.paths.updater_releases / h.tree_a
+    cli.probe_updater(h.paths, release, Path("/nonexistent"))
+    cli.handoff(h.paths, release, 0, 0)
+    assert [call["cwd"] for call in calls] == [release / "updater", release / "updater"]
+    assert all(call["env"]["PYTHONSAFEPATH"] == "1" for call in calls)
+    assert calls[1]["timeout"] == cli.HANDOFF_TIMEOUT_SECONDS
+    assert calls[1]["start_new_session"] is True
+
+
+def test_a_first_run_that_hangs_is_killed_with_everything_it_started(h, monkeypatch, tmp_path):
+    """Trust review P0-2: the handoff has a timeout, and it ends the child's whole group."""
+
+    release = tmp_path / "hanging-release"
+    package = release / "updater" / "cathedral"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    marker = tmp_path / "grandchild.pid"
+    (package / "miner_update_cli.py").write_text(
+        "import pathlib, subprocess, time\n"
+        "child = subprocess.Popen(['sleep', '300'])\n"
+        f"pathlib.Path({str(marker)!r}).write_text(str(child.pid))\n"
+        "time.sleep(300)\n"
+    )
+    monkeypatch.setattr(cli, "HANDOFF_TIMEOUT_SECONDS", 3)
+    started = time.monotonic()
+    status, document = cli.handoff(h.paths, release, 0, 0)
+    assert status == 124 and "timed out" in document["error"]
+    assert time.monotonic() - started < 60
+    pid = int(marker.read_text())
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0]
+        except FileNotFoundError:
+            break
+        if state == "Z":
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail("the first run's own child outlived the timeout")
+
+
+def _shim_copy(h: Harness, tmp_path: Path, *, extra_env: str = "") -> Path:
+    """The shim reads nothing from the environment, so tests run a relocated copy."""
+
+    text = SHIM.read_text()
+    text = text.replace("INSTALL=/usr/local/lib/cathedral-miner-update", f"INSTALL={h.paths.install_root}")
+    text = text.replace("PYTHON=/usr/bin/python3", f"PYTHON={sys.executable}")
+    text = text.replace(
+        "LANG=C.UTF-8 PYTHONSAFEPATH=1",
+        f"LANG=C.UTF-8 PYTHONSAFEPATH=1 CATHEDRAL_MINER_UPDATE_ROOT={h.paths.root} {extra_env}".rstrip(),
+    )
+    copy = tmp_path / "shim"
+    copy.write_text(text)
+    return copy
+
+
+@contextlib.contextmanager
+def _local_channel(tmp_path: Path, body: Callable[[], bytes]):
+    """An https channel on 127.0.0.1 with a throwaway certificate. It contacts no other host."""
+
+    import datetime
+    import http.server
+    import ipaddress
+    import ssl
+    import threading
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(hours=1))
+        .not_valid_after(now + datetime.timedelta(hours=1))
+        .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), False)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+        .sign(key, hashes.SHA256())
+    )
+    cert_file = tmp_path / "channel-cert.pem"
+    key_file = tmp_path / "channel-key.pem"
+    cert_file.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_file.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+        )
+    )
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            payload = body()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_file, key_file)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"https://127.0.0.1:{server.server_address[1]}/miner/stable.json", cert_file
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_the_real_shim_demotes_a_crashing_updater_the_previous_one_can_stand_in_for(h, tmp_path):
+    """Trust review P0-2 end to end: shim, fallback, strikes and demotion, over a real fetch."""
+
+    _real_clock(h)
+    h.release(sequence=5)
     crashing = tmp_path / "crashing-tree"
-    tree_b = build_tree(
-        crashing,
-        replace_modules={"miner_update_cli.py": b"raise RuntimeError('a broken updater')\n"},
-    )
+    tree_b = build_tree(crashing, replace_modules={"miner_update_cli.py": b"raise RuntimeError('broken')\n"})
     install_directory(crashing, tree_sha256=tree_b, releases=h.paths.updater_releases)
     atomic_symlink(h.paths.updater_previous, f"releases/{h.tree_a}")
     atomic_symlink(h.paths.updater_current, f"releases/{tree_b}")
+    with _local_channel(tmp_path, lambda: h.metadata) as (url, cert):
+        config = json.loads(h.paths.config_file.read_text())
+        config["channel_url"] = url
+        h.paths.config_file.write_text(json.dumps(config))
+        shim = _shim_copy(h, tmp_path, extra_env=f"SSL_CERT_FILE={cert}")
 
-    result = subprocess.run(
-        ["sh", str(SHIM), "check"], env=_root_env(h), capture_output=True, text=True, timeout=120
-    )
-    assert "previous updater takes over" in result.stderr
-    assert result.returncode == EXIT_REFUSED, result.stderr[-2000:]
+        def run():
+            return subprocess.run(
+                ["sh", str(shim), "check"], env={"PATH": os.environ["PATH"]}, capture_output=True, text=True, timeout=120
+            )
+
+        first = run()
+        assert first.returncode == EXIT_FAULT, first.stdout + first.stderr[-2000:]
+        assert "strike 1" in first.stdout
+        assert h.updater_current() == tree_b
+        second = run()
+        assert second.returncode == EXIT_ALERT, second.stdout + second.stderr[-2000:]
+        assert json.loads(second.stdout.strip().splitlines()[-1])["action"] == "demoted"
     assert h.updater_current() == h.tree_a
     assert link_target(h.paths.updater_previous) is None
-    assert h.state()["failed"]["updater_tree"] == tree_b
+    assert tree_b in h.state()["failed_updaters"]
 
 
-def test_the_shim_does_not_fall_back_on_a_documented_refusal(h):
+def test_the_shim_reads_no_settings_from_the_environment():
+    import re
+
+    text = SHIM.read_text()
+    # No ${NAME:-default} or ${NAME-default} expansions, apart from the argument $1.
+    assert re.search(r"\$\{(?!1:-)[A-Za-z_][A-Za-z0-9_]*:?-", text) is None
+    assert "CATHEDRAL_MINER_UPDATE_ROOT" not in text
+    assert 'PYTHON=/usr/bin/python3' in text
+    assert 'READLINK=/usr/bin/readlink' in text and 'ENV=/usr/bin/env' in text
+    for line in text.splitlines():
+        stripped = line.strip()
+        assert not stripped.startswith(("readlink ", "env ")), line
+
+
+def test_the_shim_asks_the_previous_updater_and_nothing_changes_when_it_cannot_verify(h, tmp_path):
+    """A crashing current updater, and a channel nobody can reach: no strike, no switch."""
+
+    _real_clock(h)
+    crashing = tmp_path / "crashing-tree"
+    tree_b = build_tree(crashing, replace_modules={"miner_update_cli.py": b"raise RuntimeError('broken')\n"})
+    install_directory(crashing, tree_sha256=tree_b, releases=h.paths.updater_releases)
     atomic_symlink(h.paths.updater_previous, f"releases/{h.tree_a}")
+    atomic_symlink(h.paths.updater_current, f"releases/{tree_b}")
+    assert tree_b != h.tree_a
     result = subprocess.run(
-        ["sh", str(SHIM), "check"], env=_root_env(h), capture_output=True, text=True, timeout=120
+        ["sh", str(_shim_copy(h, tmp_path)), "check"],
+        env={"PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
-    assert result.returncode == EXIT_REFUSED
-    assert "takes over" not in result.stderr
     document = json.loads(result.stdout.strip().splitlines()[-1])
-    assert document["action"] == "refused" and "download failed" in document["reason"]
-    assert link_target(h.paths.updater_previous) == f"releases/{h.tree_a}"
+    assert "cannot verify the channel either" in document["reason"], result.stderr[-2000:]
+    assert result.returncode == EXIT_FAULT
+    assert h.updater_current() == tree_b
+    assert not h.state()["updater_strikes"]
+    assert h.state()["last_fallback"]["current_status"] == 1
 
 
-def test_the_shim_reports_status_without_the_channel(h):
+def test_the_shim_passes_a_refusal_through_when_nobody_can_verify(h, tmp_path):
+    _real_clock(h)
+    other = tmp_path / "other-tree"
+    tree_b = build_tree(other, launcher_suffix=b"# b\n")
+    install_directory(other, tree_sha256=tree_b, releases=h.paths.updater_releases)
+    atomic_symlink(h.paths.updater_previous, f"releases/{h.tree_a}")
+    atomic_symlink(h.paths.updater_current, f"releases/{tree_b}")
     result = subprocess.run(
-        ["sh", str(SHIM), "status"], env=_root_env(h), capture_output=True, text=True, timeout=120
+        ["sh", str(_shim_copy(h, tmp_path)), "check"],
+        env={"PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == EXIT_REFUSED, result.stderr[-2000:]
+    assert h.updater_current() == tree_b
+    assert link_target(h.paths.updater_previous) == f"releases/{h.tree_a}"
+    # The shim asked the previous updater, which could not verify the channel either.
+    assert h.state()["last_fallback"]["current_status"] == EXIT_REFUSED
+
+
+def test_the_shim_reports_status_without_the_channel(h, tmp_path):
+    result = subprocess.run(
+        ["sh", str(_shim_copy(h, tmp_path)), "status"],
+        env={"PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
     assert result.returncode == 0, result.stderr
     status = json.loads(result.stdout)
     assert status["updater"]["current"] == f"releases/{h.tree_a}"
-    assert status["config"]["miner_unit"] == h.config.miner_unit
+    assert status["trust"]["generation"] == 1
 
 
 def test_the_bundle_updater_imports_nothing_outside_the_bundle(tmp_path):
-    """The updater runs from the bundle alone, on the host's Python and cryptography."""
-
     tree = tmp_path / "tree"
     build_tree(tree)
     script = (
@@ -258,10 +772,7 @@ def test_the_bundle_updater_imports_nothing_outside_the_bundle(tmp_path):
         "print(sorted(m for m in sys.modules if m.startswith('cathedral')))"
     )
     result = subprocess.run(
-        [sys.executable, "-I", "-c", script, str(tree / "updater")],
-        capture_output=True,
-        text=True,
-        timeout=60,
+        [sys.executable, "-I", "-c", script, str(tree / "updater")], capture_output=True, text=True, timeout=60
     )
     assert result.returncode == 0, result.stderr
     loaded = set(json.loads(result.stdout.replace("'", '"')))
@@ -273,6 +784,3 @@ def test_the_bundle_updater_imports_nothing_outside_the_bundle(tmp_path):
         "cathedral.miner_update_cli",
         "cathedral.miner_updater",
     }
-    for module in loaded - {"cathedral"}:
-        path = tree / "updater" / Path(*module.split(".")).with_suffix(".py")
-        assert path.is_file()

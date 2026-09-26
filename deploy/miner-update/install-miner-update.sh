@@ -11,9 +11,11 @@
 #     --revision <40-hex commit> --keys-sha256 <64-hex> \
 #     --product snp-miner|audit-miner --network <network> --netuid <netuid> \
 #     --channel stable|canary --channel-url https://.../<product>/<channel>.json \
-#     --miner-unit <the miner's systemd unit> [--minimum-sequence <n>]
+#     --miner-unit <the miner's systemd unit> --minimum-sequence <n>
 #
-# --network, --netuid and --miner-unit have no defaults. The keys digest comes
+# --network, --netuid, --miner-unit and --minimum-sequence have no defaults.
+# --minimum-sequence is the lowest channel sequence this host may accept; take
+# it from the release announcement. The keys digest comes
 # from the release announcement, not from this repository.
 set -euo pipefail
 
@@ -71,14 +73,18 @@ cat <<'NEXT'
 Installed. The timer is NOT enabled yet, and the miner has not changed.
 
 1. Read the trust-root fingerprints above against the release announcement.
-2. Run one check by hand and read what it says:
+2. Install the page hook, /usr/local/sbin/cathedral-miner-update-page: a
+   root-owned executable that takes a unit name and reaches a person. Halts,
+   alerts and faults run it (docs/MINER_AUTO_UPDATE.md, "Install").
+3. Run one check by hand and read what it says:
 
      cathedral-miner-update check
      cathedral-miner-update status
 
-   "current" or "activated" is success. "deferred" means the validator-access
-   snapshot has too little validity left for a safe restart.
-3. Turn on unattended updates:
+   "current" or "activated" is success. "deferred" means a restart is not
+   safe yet: the validator-access snapshot has too little validity left, or
+   the miner unit is stopped (an update never starts a stopped miner).
+4. Turn on unattended updates:
 
      systemctl enable --now cathedral-miner-update.timer
 
