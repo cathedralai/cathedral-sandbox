@@ -221,7 +221,8 @@ The miner unit's drop-in sets `Restart=always`. The launchers exit 143 on
 SIGTERM, a docker daemon restart for one, and the miner units count 143 as
 success, so `Restart=on-failure` left the miner stopped. Now only
 `systemctl stop` leaves the unit inactive, and `pause` is how an operator says
-that is meant.
+that is meant. It also sets `RestartSec=15s`, so a docker daemon restart does
+not trip systemd's default start limit and fail the unit.
 
 **Safe to restart.** A restart makes the miner re-read its validator-access
 snapshot, and the snapshot is short-lived. So the check restarts only when

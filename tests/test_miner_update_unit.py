@@ -178,6 +178,7 @@ def test_the_miner_dropin_selects_the_active_release():
     # Activation re-review P1: a clean exit (143) must not leave the miner
     # stopped, so only `systemctl stop` makes the unit inactive.
     assert dropin["Restart"] == ["always"]
+    assert dropin["RestartSec"] == ["15s"]
 
 
 # --- the sandbox, emulated ----------------------------------------------------------------
