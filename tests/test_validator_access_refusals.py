@@ -463,7 +463,6 @@ def test_header_signed_for_another_worker_is_refused(tmp_path: Path):
         pytest.param(NETWORK.upper(), None, id="network-case"),
         pytest.param(NETWORK, OTHER_NETUID, id="other-netuid"),
         pytest.param("testnet", OTHER_NETUID, id="both"),
-        pytest.param(NETWORK, str(NETUID), id="netuid-as-string"),
     ],
 )
 def test_header_signed_for_another_subnet_is_refused(tmp_path: Path, network: str, netuid: object):
@@ -472,6 +471,14 @@ def test_header_signed_for_another_subnet_is_refused(tmp_path: Path, network: st
     header = _header(network=network, netuid=netuid)
 
     _assert_refused(_authorizer(tmp_path), header, "subnet does not match")
+
+
+def test_header_with_a_string_netuid_is_refused_before_the_subnet_check(tmp_path: Path):
+    # A string that spells the right netuid never reaches the subnet
+    # comparison: the netuid type check refuses it first.
+    header = _header(netuid=str(NETUID))
+
+    _assert_refused(_authorizer(tmp_path), header, "request netuid must be an integer")
 
 
 @pytest.mark.parametrize(
@@ -1081,7 +1088,7 @@ def _without(field: str) -> dict[str, object]:
         ),
         pytest.param(
             lambda: {**_snapshot_doc(), "netuid": str(NETUID)},
-            "different network or netuid",
+            "snapshot netuid must be an integer",
             id="string-netuid",
         ),
         pytest.param(
