@@ -388,9 +388,15 @@ sudo mv \
   /etc/cathedral/validator-access/fleet.json
 ```
 
-Restart the primary worker through your supervisor, or stop its
-foreground launcher and rerun step 3. The worker reads `fleet.json` only at
-startup. Add up to 31 secondary origins. Reusing an endpoint, hardware
+No restart is needed. The running worker checks `fleet.json` on each fleet
+request and loads it again when the file changes. It prints
+`fleet manifest ... loaded` to stderr when it serves the new list. If the new
+file fails a check (symlink, group- or world-writable, wrong owner, over
+64 KiB, or bad JSON or fields), the worker keeps serving the last good list and
+prints one `WARNING` line for that change. It does the same if the file is
+removed. To go back to one machine, write `"endpoints": []`; do not delete the
+file. A worker still refuses to start with a bad or missing `fleet.json`.
+Add up to 31 secondary origins. Reusing an endpoint, hardware
 identity, or TLS key causes every verified claimant in that collision to score
 zero for the round.
 

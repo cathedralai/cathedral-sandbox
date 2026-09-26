@@ -93,10 +93,10 @@ from cathedral.evidence import (
 )
 from cathedral.validator_access import (
     DEFAULT_SNAPSHOT_MAX_AGE_SECONDS,
+    FleetManifest,
     SignedValidatorSnapshotProvider,
     ValidatorAccessState,
     ValidatorRequestAuthorizer,
-    load_fleet_manifest,
     load_sr25519_verifier,
     preflight_sr25519_verifier,
     singleton_fleet,
@@ -1486,6 +1486,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         raise ValueError("customer SAT is available only on the CPU worker path")
     validator_authorizer = None
     fleet_endpoints = None
+    fleet_candidates = 0
     if access_enabled:
         if tls_context is None or channel_binding is None:
             raise ValueError("signed validator access requires worker TLS")
@@ -1527,12 +1528,17 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         )
         if fleet_manifest_path is None:
             fleet_endpoints = singleton_fleet(public_endpoint=public_endpoint)
+            fleet_candidates = len(fleet_endpoints)
         else:
-            fleet_endpoints = load_fleet_manifest(
+            # Loads now and refuses startup on a bad file, as before. After
+            # that, /v1/fleet reloads the file when it changes and keeps the
+            # last good manifest if a replacement is refused.
+            fleet_endpoints = FleetManifest(
                 fleet_manifest_path,
                 worker_hotkey=args.hotkey,
                 public_endpoint=public_endpoint,
             )
+            fleet_candidates = len(fleet_endpoints.endpoints())
     # The two production entrypoints select a fixed evidence class before this
     # point. The development command remains the only selectable surface.
     if gpu_composite and tee != "tdx":
@@ -1608,7 +1614,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
                     "public_legacy_audit": allow_public_legacy_audit,
                     "customer_sat": allow_customer_sat,
                     "signed_validator_access": validator_authorizer is not None,
-                    "fleet_candidates": 0 if fleet_endpoints is None else len(fleet_endpoints),
+                    "fleet_candidates": fleet_candidates,
                 }
             )
         )

@@ -48,6 +48,7 @@ from cathedral.lanes.sat_types import SatInstance
 from cathedral.validator_access import (
     PreauthorizedValidatorRequest,
     VALIDATOR_REQUEST_HEADER,
+    FleetManifest,
     ValidatorRequestAuthorizer,
     ValidatorRequestLimiter,
     fleet_response,
@@ -289,7 +290,7 @@ def _make_handler(
     request_timeout: float,
     allow_noncanonical_sat: bool,
     validator_authorizer: ValidatorRequestAuthorizer | None,
-    fleet_endpoints: tuple[str, ...] | None,
+    fleet_endpoints: Callable[[], tuple[str, ...]] | None,
     allow_public_bootstrap_evidence: bool,
     allow_public_legacy_audit: bool,
     validator_request_limiter: ValidatorRequestLimiter | None,
@@ -567,7 +568,9 @@ def _make_handler(
                 elif fleet_endpoints is None:
                     self._send_json(404, {"error": "fleet discovery unavailable"})
                 else:
-                    self._send_json(200, fleet_response(configured_hotkey, fleet_endpoints))
+                    # Read the manifest per request so a changed fleet.json is
+                    # served without a restart.
+                    self._send_json(200, fleet_response(configured_hotkey, fleet_endpoints()))
             else:
                 self._send_json(404, {"error": "not found"})
 
@@ -992,7 +995,7 @@ class WorkerServer:
         allow_noncanonical_sat: bool = False,
         allow_non_loopback_for_development: bool = False,
         validator_authorizer: ValidatorRequestAuthorizer | None = None,
-        fleet_endpoints: tuple[str, ...] | None = None,
+        fleet_endpoints: tuple[str, ...] | FleetManifest | None = None,
         allow_public_bootstrap_evidence: bool = False,
         allow_public_legacy_audit: bool = False,
         validator_max_concurrent: int = 1,
@@ -1113,7 +1116,10 @@ class WorkerServer:
                 raise ValueError("validator access must bind the worker TLS key")
             if validator_authorizer.worker_hotkey != configured_hotkey:
                 raise ValueError("validator access must bind the configured worker hotkey")
-            if (
+            if isinstance(fleet_endpoints, FleetManifest):
+                if fleet_endpoints.worker_hotkey != configured_hotkey:
+                    raise ValueError("fleet manifest must bind the configured worker hotkey")
+            elif (
                 not isinstance(fleet_endpoints, tuple)
                 or not fleet_endpoints
                 or any(not isinstance(endpoint, str) for endpoint in fleet_endpoints)
@@ -1136,6 +1142,13 @@ class WorkerServer:
         validator_challenge_semaphore = _Semaphore(
             max_validator_challenge_concurrent
         )
+        if isinstance(fleet_endpoints, FleetManifest):
+            fleet_source = fleet_endpoints.endpoints
+        elif fleet_endpoints is not None:
+            static_fleet = fleet_endpoints
+            fleet_source = lambda: static_fleet  # noqa: E731
+        else:
+            fleet_source = None
         validator_request_limiter = (
             None
             if validator_authorizer is None
@@ -1159,7 +1172,7 @@ class WorkerServer:
             float(timeout),
             allow_noncanonical_sat,
             validator_authorizer,
-            fleet_endpoints,
+            fleet_source,
             allow_public_bootstrap_evidence,
             allow_public_legacy_audit,
             validator_request_limiter,
