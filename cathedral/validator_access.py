@@ -25,12 +25,14 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import re
 import sqlite3
 import stat
 import threading
 import time
+import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -65,6 +67,19 @@ MAX_SNAPSHOT_BYTES = 256 * 1024
 MAX_REQUEST_HEADER_BYTES = 8 * 1024
 MAX_REQUEST_LIFETIME_SECONDS = 120
 MAX_REQUEST_FUTURE_SKEW_SECONDS = 15
+# The largest backward wall-clock step the replay store tolerates. It is the
+# sum of the two request windows above, not a new policy number. The worker
+# records its clock only when it accepts a request, and only before that
+# request's expires_at. A validator whose clock is at most the future skew
+# ahead of true time signs an expires_at at most this far ahead of true time.
+# Correcting a worker clock that ran ahead therefore steps it back by at most
+# this much. A larger step means the clock was wrong by more than the request
+# rules allow, so the store fails closed until an operator resets it. Replay
+# safety does not depend on this bound; see check_and_record_request.
+MAX_REQUEST_CLOCK_STEP_BACK_SECONDS = (
+    MAX_REQUEST_LIFETIME_SECONDS + MAX_REQUEST_FUTURE_SKEW_SECONDS
+)
+REQUEST_CLOCK_RESET_COMMAND = "cathedral worker reset-replay-clock --validator-access-state"
 MAX_REPLAY_ENTRIES = 4096
 DEFAULT_SNAPSHOT_MAX_AGE_SECONDS = 3600
 MAX_SNAPSHOT_VALIDITY_SECONDS = 3600
@@ -136,6 +151,8 @@ _PREFLIGHT_SIGNATURE_B64 = (
     "ThgZ+GzZKIBrOALGgrh3pVkAi84HnQrjp7b6mq1aIWpGWW0DtEUFymbyQJhYpZRD+OaS6UDE9VBPHcqSeRcDjw=="
 )
 
+LOGGER = logging.getLogger(__name__)
+
 
 class ValidatorAccessError(ValueError):
     """A validator snapshot, request, or fleet manifest is not trustworthy."""
@@ -162,10 +179,32 @@ class ValidatorSnapshotProvider(Protocol):
     def load(self, *, now: datetime) -> "ValidatorAccessSnapshot | None": ...
 
 
-class ValidatorAccessState:
-    """Durable snapshot high-water and accepted-request replay state."""
+@dataclass(frozen=True)
+class RequestClockReset:
+    """What an operator reset of the request clock high-water changed."""
 
-    def __init__(self, path: str, *, max_replay_entries: int = MAX_REPLAY_ENTRIES) -> None:
+    clock_high_water_before: int | None
+    clock_high_water_after: int | None
+    replay_floor: int
+    retained_replay_records: int
+
+
+class ValidatorAccessState:
+    """Durable snapshot high-water and accepted-request replay state.
+
+    Every instance holds a lock on ``<path>.lock`` until it is closed or
+    collected: shared for the worker, exclusive for an operator reset. A reset
+    therefore cannot run while a worker holds the state, and a worker cannot
+    start during a reset.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        max_replay_entries: int = MAX_REPLAY_ENTRIES,
+        exclusive: bool = False,
+    ) -> None:
         if not isinstance(path, str) or not path or path == ":memory:":
             raise ValidatorAccessError("validator access requires a durable state path")
         if (
@@ -176,8 +215,61 @@ class ValidatorAccessState:
             raise ValidatorAccessError("replay cache size is invalid")
         self.path = os.path.abspath(path)
         self.max_replay_entries = max_replay_entries
+        self.exclusive = exclusive is True
         self._prepare_path()
-        self._initialize()
+        self._release_lock = weakref.finalize(self, os.close, self._acquire_lock())
+        try:
+            self._initialize()
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Release the state lock. The worker keeps it for its lifetime."""
+
+        self._release_lock()
+
+    def _acquire_lock(self) -> int:
+        import fcntl  # noqa: PLC0415 - POSIX-only, as is the worker
+
+        refusal = "validator access state lock must be an owner-only file"
+        try:
+            descriptor = os.open(
+                self.path + ".lock",
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+        except OSError as exc:
+            raise ValidatorAccessError(refusal) from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & 0o077
+            ):
+                raise ValidatorAccessError(refusal)
+            try:
+                fcntl.flock(
+                    descriptor,
+                    (fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB,
+                )
+            except BlockingIOError:
+                if self.exclusive:
+                    raise ValidatorAccessError(
+                        "validator access state is held by a running worker; "
+                        "stop the worker first"
+                    ) from None
+                raise ValidatorAccessError(
+                    "validator access state is locked by an operator reset"
+                ) from None
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
 
     def _prepare_path(self) -> None:
         target = Path(self.path)
@@ -271,6 +363,13 @@ class ValidatorAccessState:
                 )
                 """
             )
+            # observed_at_epoch is the replay floor: no replay row that expires
+            # after it has ever been pruned. Older releases stored their clock
+            # ratchet here and pruned only rows expiring at or before it, so
+            # their value is a valid floor, and an older release that reopens
+            # this state still ratchets safely on the floor.
+            # wall_clock_high_water_epoch is the latest clock at which a
+            # request was accepted. It only detects a backward clock step.
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS validator_request_clock_high_water (
@@ -279,6 +378,17 @@ class ValidatorAccessState:
                 )
                 """
             )
+            clock_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(validator_request_clock_high_water)"
+                )
+            }
+            if "wall_clock_high_water_epoch" not in clock_columns:
+                connection.execute(
+                    "ALTER TABLE validator_request_clock_high_water "
+                    "ADD COLUMN wall_clock_high_water_epoch INTEGER"
+                )
             connection.commit()
         finally:
             connection.close()
@@ -359,7 +469,17 @@ class ValidatorAccessState:
         now: datetime,
         expires_at: datetime,
     ) -> bool:
-        """Atomically refuse replay and retain the nonce through its validity."""
+        """Atomically refuse replay and retain the nonce through its validity.
+
+        Replay safety rests on the replay floor, not on the clock. A row is
+        pruned only after it expires, and the floor records the latest expiry
+        ever pruned. A request that expires after the floor either carries a
+        new nonce or collides with a retained row, whatever the wall clock
+        says. Expired rows therefore never become reusable when the clock
+        steps backward. The clock high-water only detects such a step: up to
+        MAX_REQUEST_CLOCK_STEP_BACK_SECONDS is tolerated, and a larger step
+        fails closed until an operator resets it.
+        """
 
         now_epoch = int(now.timestamp())
         expires_epoch = int(expires_at.timestamp())
@@ -371,29 +491,61 @@ class ValidatorAccessState:
                 connection.execute("BEGIN IMMEDIATE")
                 clock_row = connection.execute(
                     """
-                    SELECT observed_at_epoch
+                    SELECT observed_at_epoch, wall_clock_high_water_epoch
                     FROM validator_request_clock_high_water
                     WHERE singleton = 1
                     """
                 ).fetchone()
-                if clock_row is not None and now_epoch < int(clock_row[0]):
-                    # Expired replay rows must never become reusable because
-                    # the host wall clock stepped backward after pruning.
+                replay_floor = 0
+                clock_high_water = now_epoch
+                if clock_row is not None:
+                    replay_floor = int(clock_row[0])
+                    # A row from an older release has no separate clock; its
+                    # ratchet value is both the floor and the high-water.
+                    clock_high_water = int(
+                        clock_row[1] if clock_row[1] is not None else clock_row[0]
+                    )
+                step_back = clock_high_water - now_epoch
+                if step_back > MAX_REQUEST_CLOCK_STEP_BACK_SECONDS:
+                    connection.rollback()
+                    LOGGER.warning(
+                        "validator request refused: the wall clock is %d s behind the "
+                        "replay clock high-water %s, beyond the %d s tolerance. Correct "
+                        "the clock, stop the worker, then run: %s %s",
+                        step_back,
+                        datetime.fromtimestamp(clock_high_water, UTC).isoformat(),
+                        MAX_REQUEST_CLOCK_STEP_BACK_SECONDS,
+                        REQUEST_CLOCK_RESET_COMMAND,
+                        self.path,
+                    )
+                    return False
+                if expires_epoch <= replay_floor:
+                    # A pruned row may have held this nonce.
                     connection.rollback()
                     return False
-                connection.execute(
+                pruned_through = connection.execute(
                     """
-                    INSERT INTO validator_request_clock_high_water(
-                        singleton, observed_at_epoch
-                    ) VALUES (1, ?)
-                    ON CONFLICT(singleton) DO UPDATE SET
-                        observed_at_epoch = excluded.observed_at_epoch
+                    SELECT MAX(expires_at_epoch) FROM validator_request_replays
+                    WHERE expires_at_epoch <= ?
                     """,
                     (now_epoch,),
-                )
+                ).fetchone()[0]
+                if pruned_through is not None:
+                    replay_floor = max(replay_floor, int(pruned_through))
                 connection.execute(
                     "DELETE FROM validator_request_replays WHERE expires_at_epoch <= ?",
                     (now_epoch,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO validator_request_clock_high_water(
+                        singleton, observed_at_epoch, wall_clock_high_water_epoch
+                    ) VALUES (1, ?, ?)
+                    ON CONFLICT(singleton) DO UPDATE SET
+                        observed_at_epoch = excluded.observed_at_epoch,
+                        wall_clock_high_water_epoch = excluded.wall_clock_high_water_epoch
+                    """,
+                    (replay_floor, max(clock_high_water, now_epoch)),
                 )
                 count = int(
                     connection.execute("SELECT COUNT(*) FROM validator_request_replays").fetchone()[
@@ -421,6 +573,66 @@ class ValidatorAccessState:
                 connection.close()
         except sqlite3.Error:
             return False
+
+    def reset_request_clock(self, *, now: datetime) -> RequestClockReset:
+        """Lower the clock high-water to ``now`` after a backward clock step.
+
+        Only the exclusive holder may reset, so no worker holds the state. The
+        reset keeps every replay row and the replay floor, so a request that
+        could repeat a pruned nonce stays refused. It changes nothing when
+        ``now`` is not behind the high-water.
+        """
+
+        if not self.exclusive:
+            raise ValidatorAccessError("a request clock reset requires the exclusive state lock")
+        if now.tzinfo is None or now.utcoffset() != timedelta(0):
+            raise ValidatorAccessError("request clock reset time must be UTC")
+        now_epoch = int(now.timestamp())
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT observed_at_epoch, wall_clock_high_water_epoch
+                FROM validator_request_clock_high_water
+                WHERE singleton = 1
+                """
+            ).fetchone()
+            retained = int(
+                connection.execute("SELECT COUNT(*) FROM validator_request_replays").fetchone()[0]
+            )
+            if row is None:
+                connection.rollback()
+                return RequestClockReset(None, None, 0, retained)
+            replay_floor = int(row[0])
+            before = int(row[1] if row[1] is not None else row[0])
+            after = before
+            if now_epoch < before:
+                connection.execute(
+                    """
+                    UPDATE validator_request_clock_high_water
+                    SET wall_clock_high_water_epoch = ?
+                    WHERE singleton = 1
+                    """,
+                    (now_epoch,),
+                )
+                after = now_epoch
+            connection.commit()
+            return RequestClockReset(before, after, replay_floor, retained)
+        finally:
+            connection.close()
+
+
+def reset_request_clock_high_water(path: str, *, now: datetime) -> RequestClockReset:
+    """Lock existing state exclusively and lower its request clock high-water."""
+
+    if not isinstance(path, str) or not path or not os.path.lexists(path):
+        raise ValidatorAccessError("validator access state does not exist")
+    state = ValidatorAccessState(path, exclusive=True)
+    try:
+        return state.reset_request_clock(now=now)
+    finally:
+        state.close()
 
 
 @dataclass

@@ -246,6 +246,30 @@ failed refresh leaves the last valid file in place. An expired snapshot closes
 protected routes. The repository does not ship a provider-neutral transfer
 service, so use your existing secure provisioning channel.
 
+The worker keeps its signed-request replay records in
+`/var/lib/cathedral/validator-access/validator-access.sqlite`. While it runs it
+holds a lock on `validator-access.sqlite.lock` beside that file. It tolerates a
+backward clock step of up to 135 seconds: one request lifetime plus the
+allowed validator clock skew. After a larger step it refuses every signed
+request and logs the step size. Correct the host clock first. Then stop the
+worker, reset the replay clock with the reviewed image, and start the worker
+again:
+
+```bash
+sudo docker run --rm --pull never --network none --read-only \
+  --cap-drop ALL --security-opt no-new-privileges=true \
+  --mount type=bind,src=/var/lib/cathedral/validator-access,dst=/var/lib/cathedral/validator-access \
+  --entrypoint python REVIEWED_WORKER_IMAGE -I -m cathedral.cli \
+  worker reset-replay-clock \
+  --validator-access-state /var/lib/cathedral/validator-access/validator-access.sqlite
+```
+
+The reset refuses while a worker holds the state. It keeps every replay
+record, so an accepted request is still refused if it is sent again. Requests
+that expire at or before the printed `replay_floor` also stay refused. Only
+images built from a revision that includes `cathedral worker
+reset-replay-clock` have this command. The image pinned in step 3 predates it.
+
 The `init-key` command prints `keys_digest sha256:...`. Keep the value after
 `keys_digest` for step 3.
 
