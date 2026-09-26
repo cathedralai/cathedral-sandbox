@@ -1,0 +1,22 @@
+[Unit]
+Description=Exclusive Reliquary executor for %i
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/etc/cathedral-workers/%i
+ExecStart=/usr/bin/docker compose --project-name cathedral-workers-%i -f compose.yaml up --no-build --pull never --abort-on-container-exit
+ExecStop=/usr/bin/docker compose --project-name cathedral-workers-%i -f compose.yaml stop --timeout 140
+Restart=always
+RestartSec=5
+TimeoutStopSec=160
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

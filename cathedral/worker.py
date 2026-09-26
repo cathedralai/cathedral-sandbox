@@ -80,8 +80,10 @@ _EVIDENCE_V2_REQUEST_KEYS = _EVIDENCE_REQUEST_KEYS | frozenset(
 )
 _SAT_REQUEST_KEYS = frozenset({"challenge_id", "assigned_hotkey", "instance", "seed"})
 _POST_PATHS = frozenset(
-    {"/v1/evidence", "/v1/capabilities", "/v1/sat-work", "/v1/fleet"}
+    {"/v1/evidence", "/v1/capabilities", "/v1/sat-work", "/v1/fleet",
+     "/v1/gpu-evidence", "/v1/gpu-work", "/v1/gpu-capabilities"}
 )
+_GPU_PATHS = frozenset({"/v1/gpu-evidence", "/v1/gpu-work", "/v1/gpu-capabilities"})
 _Semaphore = threading.Semaphore
 _CAPABILITIES_REQUEST_KEYS: frozenset[str] = frozenset()
 _INSTANCE_KEYS = frozenset({"n_vars", "clauses"})
@@ -291,6 +293,8 @@ def _make_handler(
     allow_public_bootstrap_evidence: bool,
     allow_public_legacy_audit: bool,
     validator_request_limiter: ValidatorRequestLimiter | None,
+    gpu_executor,
+    gpu_evidence_collector,
 ) -> type[BaseHTTPRequestHandler]:
     class _Handler(BaseHTTPRequestHandler):
         def setup(self) -> None:
@@ -382,6 +386,9 @@ def _make_handler(
             if path not in _POST_PATHS:
                 self._send_json(404, {"error": "not found"})
                 return
+            if path in _GPU_PATHS and gpu_executor is None:
+                self._send_json(404, {"error": "GPU capability unavailable"})
+                return
             if path == "/v1/fleet" and validator_authorizer is None:
                 self._send_json(404, {"error": "fleet discovery unavailable"})
                 return
@@ -418,7 +425,7 @@ def _make_handler(
             signed_candidate = (
                 validator_authorizer is not None and self._validator_request_header() is not None
             )
-            signed_only = path == "/v1/fleet"
+            signed_only = path == "/v1/fleet" or path in _GPU_PATHS
             if signed_only and not signed_candidate:
                 self._send_json(401, {"error": "unauthorized"})
                 return
@@ -538,6 +545,15 @@ def _make_handler(
             path = self.path.partition("?")[0]
             if path == "/v1/evidence":
                 self._handle_evidence(body)
+            elif path == "/v1/gpu-evidence":
+                self._handle_evidence(body, gpu=True)
+            elif path == "/v1/gpu-work":
+                self._handle_gpu_work(body)
+            elif path == "/v1/gpu-capabilities":
+                if body:
+                    self._send_json(400, {"error": "invalid GPU capabilities schema"})
+                else:
+                    self._send_json(200, gpu_executor.capabilities())
             elif path == "/v1/capabilities":
                 if set(body) != _CAPABILITIES_REQUEST_KEYS:
                     self._send_json(400, {"error": "invalid capabilities schema"})
@@ -555,9 +571,10 @@ def _make_handler(
             else:
                 self._send_json(404, {"error": "not found"})
 
-        def _handle_evidence(self, body: dict[str, object]) -> None:
+        def _handle_evidence(self, body: dict[str, object], *, gpu: bool = False) -> None:
             keys = frozenset(body)
-            if keys not in {_EVIDENCE_REQUEST_KEYS, _EVIDENCE_V2_REQUEST_KEYS}:
+            if (keys not in {_EVIDENCE_REQUEST_KEYS, _EVIDENCE_V2_REQUEST_KEYS}
+                    or (gpu and keys != _EVIDENCE_V2_REQUEST_KEYS)):
                 self._send_json(400, {"error": "invalid evidence schema"})
                 return
             nonce_hex = body["nonce_hex"]
@@ -607,7 +624,8 @@ def _make_handler(
 
             try:
                 if report_data_version == 2:
-                    collected = evidence_collector(
+                    collector = gpu_evidence_collector if gpu else evidence_collector
+                    collected = collector(
                         nonce,
                         configured_hotkey,
                         channel_binding=configured_channel_binding,
@@ -618,6 +636,11 @@ def _make_handler(
             except Exception:
                 self._send_json(500, {"error": "evidence collection failed"})
                 return
+            if gpu:
+                from cathedral.gpu_provider import G4ProviderCollector, PROVIDER_EVIDENCE_SCHEMA
+                if isinstance(gpu_evidence_collector, G4ProviderCollector):
+                    self._send_json(200, {"schema": PROVIDER_EVIDENCE_SCHEMA, "evidence": collected})
+                    return
             if isinstance(collected, Evidence):
                 evidences = (collected,)
             elif isinstance(collected, (tuple, list)) and all(
@@ -671,10 +694,56 @@ def _make_handler(
                     })
                     if len(evidences) > 1:
                         item["composite_jwt"] = evidence.composite_jwt
-            if len(response_items) == 1:
+            if gpu:
+                from cathedral.gpu_work import EVIDENCE_SCHEMA, serialize_composite
+                try:
+                    response_items = serialize_composite(
+                        evidences, nonce, configured_hotkey, configured_channel_binding
+                    )
+                except ValueError:
+                    self._send_json(503, {"error": "GPU composite evidence unavailable"})
+                    return
+                self._send_json(200, {"schema": EVIDENCE_SCHEMA, "evidence": response_items})
+            elif len(response_items) == 1:
                 self._send_json(200, response_items[0])
             else:
                 self._send_json(200, {"evidence": response_items})
+
+        def _handle_gpu_work(self, body: dict[str, object]) -> None:
+            from cathedral.gpu_work import (
+                RESULT_SCHEMA, completion_nonce, request_digest, serialize_composite,
+                validate_request,
+            )
+            try:
+                validate_request(body)
+            except ValueError:
+                self._send_json(400, {"error": "invalid GPU work request"})
+                return
+            if body["assigned_hotkey"] != configured_hotkey:
+                self._send_json(403, {"error": "assigned_hotkey mismatch"})
+                return
+            try:
+                from cathedral.gpu_provider import G4ProviderCollector
+                if isinstance(gpu_evidence_collector, G4ProviderCollector):
+                    output_digest, completion = gpu_evidence_collector.execute(gpu_executor, body)
+                else:
+                    output_digest = gpu_executor.execute(body)
+                    nonce = completion_nonce(body, output_digest)
+                    evidence = gpu_evidence_collector(
+                        nonce, configured_hotkey, channel_binding=configured_channel_binding,
+                        report_data_version=2,
+                    )
+                    completion = serialize_composite(
+                        evidence, nonce, configured_hotkey, configured_channel_binding
+                    )
+            except Exception:
+                self._send_json(503, {"error": "GPU execution or completion unavailable"})
+                return
+            self._send_json(200, {"schema": RESULT_SCHEMA,
+                                 "request_digest": request_digest(body),
+                                 "output_digest": output_digest,
+                                 "device_identity_digests": body["device_identity_digests"],
+                                 "completion_evidence": completion})
 
         def _handle_sat_work(self, body: dict[str, object]) -> None:
             if set(body) != _SAT_REQUEST_KEYS:
@@ -930,6 +999,8 @@ class WorkerServer:
         validator_requests_per_window: int = 120,
         validator_rate_window_seconds: float = 60.0,
         max_validator_challenge_concurrent: int = MAX_VALIDATOR_CHALLENGE_CONCURRENT,
+        gpu_executor=None,
+        gpu_evidence_collector=None,
     ) -> None:
         try:
             loopback = ipaddress.ip_address(host).is_loopback
@@ -1023,6 +1094,8 @@ class WorkerServer:
         if not isinstance(allow_public_legacy_audit, bool):
             raise ValueError("allow_public_legacy_audit must be a boolean")
         if validator_authorizer is None:
+            if gpu_executor is not None or gpu_evidence_collector is not None:
+                raise ValueError("GPU service requires signed validator access and native TLS")
             if fleet_endpoints is not None:
                 raise ValueError("fleet discovery requires signed validator access")
             if allow_public_bootstrap_evidence:
@@ -1046,6 +1119,16 @@ class WorkerServer:
                 or any(not isinstance(endpoint, str) for endpoint in fleet_endpoints)
             ):
                 raise ValueError("signed validator access requires bounded fleet candidates")
+        if (gpu_executor is None) != (gpu_evidence_collector is None):
+            raise ValueError("GPU execution and composite collector are required together")
+        if gpu_executor is not None:
+            from cathedral.gpu_work import CudaWorkExecutor, G4_WORKER_PROFILE_ID
+            from cathedral.gpu_provider import G4ProviderCollector
+            if not isinstance(gpu_executor, CudaWorkExecutor) or not callable(gpu_evidence_collector):
+                raise ValueError("GPU service requires the fixed CUDA executor and collector")
+            if ((gpu_executor.profile_id == G4_WORKER_PROFILE_ID)
+                    != isinstance(gpu_evidence_collector, G4ProviderCollector)):
+                raise ValueError("G4 requires its distinct provider collector")
 
         semaphore = _Semaphore(max_concurrent)
         challenge_semaphore = _Semaphore(max_challenge_concurrent)
@@ -1080,6 +1163,8 @@ class WorkerServer:
             allow_public_bootstrap_evidence,
             allow_public_legacy_audit,
             validator_request_limiter,
+            gpu_executor,
+            gpu_evidence_collector,
         )
         self._server = _BoundedThreadingHTTPServer(
             (host, port),

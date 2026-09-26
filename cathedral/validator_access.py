@@ -122,7 +122,8 @@ _REQUEST_KEYS = frozenset(
         "signature",
     }
 )
-_PROTECTED_PATHS = frozenset({"/v1/fleet", "/v1/evidence", "/v1/sat-work", "/v1/capabilities"})
+_PROTECTED_PATHS = frozenset({"/v1/fleet", "/v1/evidence", "/v1/sat-work", "/v1/capabilities",
+                              "/v1/gpu-evidence", "/v1/gpu-work", "/v1/gpu-capabilities"})
 _FLEET_KEYS = frozenset({"schema", "worker_hotkey", "endpoints"})
 
 _BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
