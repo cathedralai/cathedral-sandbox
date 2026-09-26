@@ -890,7 +890,10 @@ def verify_validator_access_snapshot(
         raise ValidatorAccessError("snapshot contains missing or unknown critical fields")
     if document["schema"] != VALIDATOR_ACCESS_SNAPSHOT_SCHEMA:
         raise ValidatorAccessError("snapshot schema is unsupported")
-    if document["network"] != network or document["netuid"] != netuid:
+    document_netuid = document["netuid"]
+    if isinstance(document_netuid, bool) or not isinstance(document_netuid, int):
+        raise ValidatorAccessError("snapshot netuid must be an integer")
+    if document["network"] != network or document_netuid != netuid:
         raise ValidatorAccessError("snapshot is bound to a different network or netuid")
     if document["block_is_finalized"] is not True:
         raise ValidatorAccessError("snapshot block is not finalized")
@@ -1248,9 +1251,12 @@ class ValidatorRequestAuthorizer:
             raise ValidatorAccessError("validator request target does not match")
         if document["worker_hotkey"] != self.worker_hotkey:
             raise ValidatorAccessError("validator request worker does not match")
+        request_netuid = document["netuid"]
+        if isinstance(request_netuid, bool) or not isinstance(request_netuid, int):
+            raise ValidatorAccessError("validator request netuid must be an integer")
         if (
             document["network"] != self.snapshot_provider.network
-            or document["netuid"] != self.snapshot_provider.netuid
+            or request_netuid != self.snapshot_provider.netuid
         ):
             raise ValidatorAccessError("validator request subnet does not match")
         body_sha256 = document["body_sha256"]
