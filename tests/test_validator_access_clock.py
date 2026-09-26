@@ -7,11 +7,13 @@ any step, while fresh nonces keep working after a small step or a reset.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
 import secrets
 import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -28,6 +30,7 @@ from cathedral.validator_access import (
     MAX_REQUEST_CLOCK_STEP_BACK_SECONDS,
     MAX_REQUEST_FUTURE_SKEW_SECONDS,
     MAX_REQUEST_LIFETIME_SECONDS,
+    REQUEST_CLOCK_LOG_INTERVAL_SECONDS,
     REQUEST_CLOCK_RESET_COMMAND,
     VALIDATOR_ACCESS_SNAPSHOT_SCHEMA,
     ValidatorAccessError,
@@ -84,7 +87,7 @@ class SteppedClock:
 
 
 def _snapshot():
-    generated_at = T0 - timedelta(minutes=1)
+    generated_at = T0 - timedelta(minutes=10)
     document = {
         "schema": VALIDATOR_ACCESS_SNAPSHOT_SCHEMA,
         "network": NETWORK,
@@ -93,7 +96,7 @@ def _snapshot():
         "block_hash": "0x" + "b" * 64,
         "block_is_finalized": True,
         "generated_at": generated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "expires_at": (generated_at + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": (generated_at + timedelta(minutes=60)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "minimum_stake_rao": 0,
         "validators": [
             {"hotkey": VALIDATOR_HOTKEY, "uid": 1, "validator_permit": True, "stake_rao": 1}
@@ -118,9 +121,12 @@ def _snapshot():
 class Worker:
     """One worker process: it holds the state and authorizes signed requests."""
 
-    def __init__(self, state_path: Path, clock: SteppedClock) -> None:
+    def __init__(self, state_path: Path, clock: SteppedClock, *, log_clock=None) -> None:
         self.clock = clock
-        self.state = ValidatorAccessState(str(state_path))
+        if log_clock is None:
+            self.state = ValidatorAccessState(str(state_path))
+        else:
+            self.state = ValidatorAccessState(str(state_path), log_clock=log_clock)
         self.authorizer = ValidatorRequestAuthorizer(
             _snapshot(),
             worker_hotkey=WORKER_HOTKEY,
@@ -348,31 +354,7 @@ def test_reset_refuses_to_create_missing_state(tmp_path: Path, capsys):
     assert not missing.exists()
 
 
-def test_reset_command_lowers_the_high_water_to_the_wall_clock(tmp_path: Path, capsys):
-    state_path = tmp_path / "access.sqlite"
-    ahead = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=1_000)
-    state = ValidatorAccessState(str(state_path))
-    assert state.check_and_record_request(
-        VALIDATOR_HOTKEY, "0a" * 32, now=ahead, expires_at=ahead + timedelta(seconds=60)
-    )
-    state.close()
-
-    assert (
-        cathedral_main(
-            ["worker", "reset-replay-clock", "--validator-access-state", str(state_path)]
-        )
-        == 0
-    )
-    output = json.loads(capsys.readouterr().out)
-    assert output["clock_high_water_before"] == ahead.strftime("%Y-%m-%dT%H:%M:%SZ")
-    assert 990 <= output["backward_step_seconds"] <= 1_000
-    assert output["retained_replay_records"] == 1
-    assert output["replay_floor"] == "1970-01-01T00:00:00Z"
-
-
-def test_state_from_an_older_release_keeps_its_ratchet_as_the_floor(tmp_path: Path):
-    state_path = tmp_path / "access.sqlite"
-    high_water = int((T0 + timedelta(seconds=100)).timestamp())
+def _write_previous_release_state(state_path: Path, *, observed_at_epoch: int) -> None:
     connection = sqlite3.connect(state_path)
     connection.execute(
         """
@@ -383,11 +365,17 @@ def test_state_from_an_older_release_keeps_its_ratchet_as_the_floor(tmp_path: Pa
         """
     )
     connection.execute(
-        "INSERT INTO validator_request_clock_high_water VALUES (1, ?)", (high_water,)
+        "INSERT INTO validator_request_clock_high_water VALUES (1, ?)", (observed_at_epoch,)
     )
     connection.commit()
     connection.close()
     state_path.chmod(0o600)
+
+
+def test_state_from_an_older_release_keeps_its_ratchet_as_the_floor(tmp_path: Path):
+    state_path = tmp_path / "access.sqlite"
+    high_water = int((T0 + timedelta(seconds=100)).timestamp())
+    _write_previous_release_state(state_path, observed_at_epoch=high_water)
 
     clock = SteppedClock(T0 + timedelta(seconds=70))
     worker = Worker(state_path, clock)
@@ -400,3 +388,296 @@ def test_state_from_an_older_release_keeps_its_ratchet_as_the_floor(tmp_path: Pa
         "FROM validator_request_clock_high_water"
     ).fetchone()
     assert row == (high_water, high_water)
+
+
+def _utc(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _run_reset_command(state_path: Path, capsys, caplog) -> tuple[dict, str]:
+    with caplog.at_level(logging.WARNING, logger="cathedral.validator_access"):
+        assert (
+            cathedral_main(
+                ["worker", "reset-replay-clock", "--validator-access-state", str(state_path)]
+            )
+            == 0
+        )
+    return json.loads(capsys.readouterr().out), caplog.text
+
+
+def test_reset_command_reports_the_floor_and_when_requests_resume(
+    tmp_path: Path, capsys, caplog
+):
+    state_path = tmp_path / "access.sqlite"
+    ahead = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=1_000)
+    later = ahead + timedelta(seconds=100)
+    state = ValidatorAccessState(str(state_path))
+    assert state.check_and_record_request(
+        VALIDATOR_HOTKEY, "0a" * 32, now=ahead, expires_at=ahead + timedelta(seconds=60)
+    )
+    assert state.check_and_record_request(
+        VALIDATOR_HOTKEY, "0b" * 32, now=later, expires_at=later + timedelta(seconds=60)
+    )
+    state.close()
+
+    output, log = _run_reset_command(state_path, capsys, caplog)
+    floor = ahead + timedelta(seconds=60)
+    resume = floor - timedelta(seconds=MAX_REQUEST_LIFETIME_SECONDS)
+    assert output["clock_high_water_before"] == _utc(later)
+    assert 1_090 <= output["backward_step_seconds"] <= 1_100
+    assert output["retained_replay_records"] == 1
+    assert output["replay_floor"] == _utc(floor)
+    assert output["requests_resume_at"] == _utc(resume)
+    assert f"replay floor {_utc(floor)} kept, never lowered" in log
+    assert f"accepted from about {_utc(resume)}" in log
+
+
+def test_reset_command_on_state_that_never_pruned(tmp_path: Path, capsys, caplog):
+    state_path = tmp_path / "access.sqlite"
+    ahead = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=1_000)
+    state = ValidatorAccessState(str(state_path))
+    assert state.check_and_record_request(
+        VALIDATOR_HOTKEY, "0a" * 32, now=ahead, expires_at=ahead + timedelta(seconds=60)
+    )
+    state.close()
+
+    output, log = _run_reset_command(state_path, capsys, caplog)
+    assert output["clock_high_water_before"] == _utc(ahead)
+    assert output["replay_floor"] is None
+    assert output["requests_resume_at"] is None
+    assert "no request waits on the floor" in log
+
+
+def test_long_forward_excursion_waits_for_the_floor_and_says_so(tmp_path: Path, caplog):
+    """Worker and validator clocks both run 20 min fast, then are corrected."""
+
+    state_path = tmp_path / "access.sqlite"
+    excursion = 1_200
+    clock = SteppedClock(T0 + timedelta(seconds=excursion))
+    worker = Worker(state_path, clock)
+    fast_pruned = worker.sign(lifetime=120)
+    assert worker.accepts(fast_pruned)
+    clock.advance(130)
+    fast_retained = worker.sign(lifetime=120)
+    assert worker.accepts(fast_retained)  # prunes the first; floor = its expiry
+    floor = T0 + timedelta(seconds=excursion + 120)
+    resume = floor - timedelta(seconds=MAX_REQUEST_LIFETIME_SECONDS)
+
+    clock.step_back(excursion)  # both clocks are now correct
+    assert not worker.accepts(worker.sign(lifetime=120))
+    worker.stop()
+
+    with caplog.at_level(logging.WARNING, logger="cathedral.validator_access"):
+        result = reset_request_clock_high_water(str(state_path), now=clock())
+    assert result.clock_high_water_after == int(clock().timestamp())
+    assert result.replay_floor == int(floor.timestamp())
+    assert result.requests_resume_at == int(resume.timestamp())
+    assert f"replay floor {_utc(floor)} kept, never lowered" in caplog.text
+    assert f"accepted from about {_utc(resume)}" in caplog.text
+    caplog.clear()
+
+    # The reset fixed the high-water, but the floor still refuses, and says so.
+    restarted = Worker(state_path, clock)
+    with caplog.at_level(logging.WARNING, logger="cathedral.validator_access"):
+        assert not restarted.accepts(restarted.sign(lifetime=120))
+    ahead = int((floor - clock()).total_seconds())
+    assert f"replay floor {_utc(floor)}, which is {ahead} s ahead" in caplog.text
+    assert f"accepted from about {_utc(resume)}" in caplog.text
+
+    clock.current = resume - timedelta(seconds=1)
+    assert not restarted.accepts(restarted.sign(lifetime=120))
+    clock.current = resume + timedelta(seconds=1)
+    assert restarted.accepts(restarted.sign(lifetime=120))
+    assert not restarted.accepts(fast_pruned)
+    assert not restarted.accepts(fast_retained)
+
+
+def test_row_pruned_exactly_at_its_expiry_stays_refused(tmp_path: Path):
+    clock = SteppedClock(T0)
+    worker = Worker(tmp_path / "access.sqlite", clock)
+    captured = worker.sign(lifetime=60)
+    assert worker.accepts(captured)
+    clock.advance(60)  # now == the captured request's expiry
+    assert worker.accepts(worker.sign(lifetime=60))  # prunes it at exactly now == exp
+
+    clock.step_back(30)
+    assert not worker.accepts(captured)
+
+
+def _replay_rows_and_floor(state_path: Path) -> tuple[list[str], list[str]]:
+    connection = sqlite3.connect(state_path)
+    try:
+        rows = [line for line in connection.iterdump() if "validator_request_replays" in line]
+        floor = [
+            repr(row)
+            for row in connection.execute(
+                "SELECT observed_at_epoch FROM validator_request_clock_high_water"
+            )
+        ]
+    finally:
+        connection.close()
+    return rows, floor
+
+
+def test_reset_leaves_every_replay_row_and_the_floor_unchanged(tmp_path: Path):
+    state_path = tmp_path / "access.sqlite"
+    state = ValidatorAccessState(str(state_path))
+
+    def record(nonce: str, at: int, lifetime: int) -> bool:
+        moment = T0 + timedelta(seconds=at)
+        return state.check_and_record_request(
+            VALIDATOR_HOTKEY, nonce, now=moment, expires_at=moment + timedelta(seconds=lifetime)
+        )
+
+    assert record("a1" * 32, 0, 30)
+    assert record("b2" * 32, 40, 120)  # prunes a1: floor T0+30
+    assert record("c3" * 32, 100, 120)  # high-water T0+100
+    assert record("d4" * 32, 35, 10)  # a tolerated 65 s step back; expires T0+45
+    state.close()
+    before_rows, before_floor = _replay_rows_and_floor(state_path)
+    for nonce in ("b2", "c3", "d4"):
+        assert sum(nonce * 32 in line for line in before_rows) == 1
+    assert before_floor == [repr((int((T0 + timedelta(seconds=30)).timestamp()),))]
+
+    # The reset's clock is past d4's expiry and behind the high-water.
+    result = reset_request_clock_high_water(str(state_path), now=T0 + timedelta(seconds=60))
+    assert result.clock_high_water_after == int((T0 + timedelta(seconds=60)).timestamp())
+    assert _replay_rows_and_floor(state_path) == (before_rows, before_floor)
+
+
+def test_clock_refusal_logs_are_rate_limited(tmp_path: Path, caplog):
+    log_now = [1_000.0]
+    clock = SteppedClock(T0)
+    worker = Worker(tmp_path / "access.sqlite", clock, log_clock=lambda: log_now[0])
+    assert worker.accepts(worker.sign(lifetime=60))
+    clock.advance(100)
+    assert worker.accepts(worker.sign(lifetime=60))  # floor T0+60, high-water T0+100
+
+    def lines(fragment: str) -> list[str]:
+        return [r.getMessage() for r in caplog.records if fragment in r.getMessage()]
+
+    with caplog.at_level(logging.WARNING, logger="cathedral.validator_access"):
+        clock.step_back(60)  # T0+40: a 10 s request expires at or before the floor
+        for _ in range(3):
+            assert not worker.accepts(worker.sign(lifetime=10))
+        clock.step_back(TOLERANCE)  # now beyond the tolerance
+        for _ in range(3):
+            assert not worker.accepts(worker.sign(lifetime=60))
+        assert len(lines("replay floor")) == 1
+        assert len(lines("behind the replay clock high-water")) == 1
+
+        log_now[0] += REQUEST_CLOCK_LOG_INTERVAL_SECONDS - 1
+        assert not worker.accepts(worker.sign(lifetime=60))
+        assert len(lines("behind the replay clock high-water")) == 1
+
+        log_now[0] += 1
+        assert not worker.accepts(worker.sign(lifetime=60))
+        step_lines = lines("behind the replay clock high-water")
+        assert len(step_lines) == 2
+        assert step_lines[0].endswith("(0 more refused since the last line)")
+        assert step_lines[1].endswith("(3 more refused since the last line)")
+
+        clock.advance(TOLERANCE)
+        assert not worker.accepts(worker.sign(lifetime=10))
+        floor_lines = lines("replay floor")
+        assert len(floor_lines) == 2
+        assert floor_lines[1].endswith("(2 more refused since the last line)")
+
+
+def test_closed_state_refuses_to_authorize(tmp_path: Path):
+    state_path = tmp_path / "access.sqlite"
+    clock = SteppedClock(T0)
+    worker = Worker(state_path, clock)
+    assert worker.accepts(worker.sign())
+    worker.stop()
+    assert worker.state.closed
+    assert not worker.accepts(worker.sign())
+    assert not worker.state.check_and_record_request(
+        VALIDATOR_HOTKEY, "0c" * 32, now=clock(), expires_at=clock() + timedelta(seconds=60)
+    )
+
+    resetting = ValidatorAccessState(str(state_path), exclusive=True)
+    resetting.close()
+    with pytest.raises(ValidatorAccessError, match="exclusive state lock"):
+        resetting.reset_request_clock(now=clock())
+
+
+def test_lock_file_replaced_while_locking_is_refused(tmp_path: Path, monkeypatch):
+    state_path = tmp_path / "access.sqlite"
+    ValidatorAccessState(str(state_path)).close()
+    lock_path = tmp_path / "access.sqlite.lock"
+    real_flock = fcntl.flock
+
+    def flock_then_replace(descriptor, operation):
+        real_flock(descriptor, operation)
+        lock_path.unlink()
+        lock_path.touch(mode=0o600)
+
+    monkeypatch.setattr(fcntl, "flock", flock_then_replace)
+    with pytest.raises(ValidatorAccessError, match="replaced while locking"):
+        ValidatorAccessState(str(state_path), exclusive=True)
+    monkeypatch.setattr(fcntl, "flock", real_flock)
+    ValidatorAccessState(str(state_path), exclusive=True).close()
+
+
+def test_two_processes_migrating_older_state_at_once(tmp_path: Path, monkeypatch):
+    """A second opener migrates while the first sits between check and add."""
+
+    state_path = tmp_path / "access.sqlite"
+    _write_previous_release_state(state_path, observed_at_epoch=int(T0.timestamp()))
+    first_checked = threading.Event()
+    second_done = threading.Event()
+    guard = threading.Lock()
+    pauses: list[bool] = []
+    real_connect = sqlite3.connect
+
+    class PausingConnection(sqlite3.Connection):
+        def execute(self, sql, *args):
+            result = super().execute(sql, *args)
+            if "table_info(validator_request_clock_high_water)" not in sql:
+                return result
+            rows = result.fetchall()
+            with guard:
+                pause = not pauses
+                pauses.append(True)
+            if pause:
+                first_checked.set()
+                second_done.wait(timeout=0.5)
+            return rows
+
+    monkeypatch.setattr(
+        sqlite3,
+        "connect",
+        lambda *args, **kwargs: real_connect(*args, factory=PausingConnection, **kwargs),
+    )
+    errors: list[BaseException] = []
+    states: list[ValidatorAccessState] = []
+
+    def open_state(done: threading.Event | None) -> None:
+        try:
+            states.append(ValidatorAccessState(str(state_path)))
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+        finally:
+            if done is not None:
+                done.set()
+
+    first = threading.Thread(target=open_state, args=(None,))
+    first.start()
+    assert first_checked.wait(timeout=5)
+    second = threading.Thread(target=open_state, args=(second_done,))
+    second.start()
+    first.join(timeout=10)
+    second.join(timeout=10)
+    monkeypatch.setattr(sqlite3, "connect", real_connect)
+    assert errors == []
+    assert len(states) == 2 and len(pauses) == 2
+    for state in states:
+        state.close()
+    connection = sqlite3.connect(state_path)
+    columns = [
+        row[1]
+        for row in connection.execute("PRAGMA table_info(validator_request_clock_high_water)")
+    ]
+    connection.close()
+    assert columns.count("wall_clock_high_water_epoch") == 1

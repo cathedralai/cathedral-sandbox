@@ -1266,6 +1266,7 @@ def cmd_worker_reset_replay_clock(args: argparse.Namespace) -> int:
     """Lower the signed-request clock high-water after a backward clock step.
 
     It refuses while a worker holds the state and keeps every replay record.
+    It never lowers the replay floor, so it reports when requests resume.
     """
 
     result = reset_request_clock_high_water(
@@ -1290,7 +1291,8 @@ def cmd_worker_reset_replay_clock(args: argparse.Namespace) -> int:
                 ),
                 "clock_high_water_after": utc(after),
                 "clock_high_water_before": utc(before),
-                "replay_floor": utc(result.replay_floor),
+                "replay_floor": utc(result.replay_floor or None),
+                "requests_resume_at": utc(result.requests_resume_at),
                 "retained_replay_records": result.retained_replay_records,
             },
             sort_keys=True,

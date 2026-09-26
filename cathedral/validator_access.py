@@ -86,6 +86,10 @@ MAX_SNAPSHOT_VALIDITY_SECONDS = 3600
 DEFAULT_VALIDATOR_MAX_CONCURRENT = 1
 DEFAULT_VALIDATOR_REQUESTS_PER_WINDOW = 120
 DEFAULT_VALIDATOR_RATE_WINDOW_SECONDS = 60.0
+# A clock refusal is logged at most once per validator rate window per kind,
+# with a count of the refusals not logged. The line keeps an outage visible
+# without letting a stream of refused requests flood the log.
+REQUEST_CLOCK_LOG_INTERVAL_SECONDS = DEFAULT_VALIDATOR_RATE_WINDOW_SECONDS
 MAX_NETUID = 65_535
 MAX_UID = 65_535
 MAX_STAKE_RAO = MAX_SQLITE_INTEGER
@@ -179,6 +183,23 @@ class ValidatorSnapshotProvider(Protocol):
     def load(self, *, now: datetime) -> "ValidatorAccessSnapshot | None": ...
 
 
+def _epoch_utc(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def requests_resume_at(replay_floor: int) -> int | None:
+    """When a correct validator clock can sign a request above the floor.
+
+    Only a request that expires after the floor is accepted. A validator that
+    signs the maximum lifetime reaches that from about floor - lifetime; a
+    shorter lifetime reaches it later. None means nothing was ever pruned.
+    """
+
+    if replay_floor <= 0:
+        return None
+    return replay_floor - MAX_REQUEST_LIFETIME_SECONDS
+
+
 @dataclass(frozen=True)
 class RequestClockReset:
     """What an operator reset of the request clock high-water changed."""
@@ -188,6 +209,34 @@ class RequestClockReset:
     replay_floor: int
     retained_replay_records: int
 
+    @property
+    def requests_resume_at(self) -> int | None:
+        return requests_resume_at(self.replay_floor)
+
+
+class _RateLimitedWarning:
+    """Log at most one line per kind per interval and count the rest."""
+
+    def __init__(self, interval_seconds: float, clock) -> None:
+        self._interval = float(interval_seconds)
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._last: dict[str, float] = {}
+        self._suppressed: dict[str, int] = {}
+
+    def warning(self, kind: str, message: str, *args: object) -> None:
+        now = float(self._clock())
+        with self._lock:
+            last = self._last.get(kind)
+            if last is not None and now - last < self._interval:
+                self._suppressed[kind] = self._suppressed.get(kind, 0) + 1
+                return
+            self._last[kind] = now
+            suppressed = self._suppressed.pop(kind, 0)
+        LOGGER.warning(
+            message + " (%d more refused since the last line)", *args, suppressed
+        )
+
 
 class ValidatorAccessState:
     """Durable snapshot high-water and accepted-request replay state.
@@ -195,7 +244,7 @@ class ValidatorAccessState:
     Every instance holds a lock on ``<path>.lock`` until it is closed or
     collected: shared for the worker, exclusive for an operator reset. A reset
     therefore cannot run while a worker holds the state, and a worker cannot
-    start during a reset.
+    start during a reset. A closed instance refuses every request.
     """
 
     def __init__(
@@ -204,6 +253,7 @@ class ValidatorAccessState:
         *,
         max_replay_entries: int = MAX_REPLAY_ENTRIES,
         exclusive: bool = False,
+        log_clock=time.monotonic,
     ) -> None:
         if not isinstance(path, str) or not path or path == ":memory:":
             raise ValidatorAccessError("validator access requires a durable state path")
@@ -213,9 +263,12 @@ class ValidatorAccessState:
             or not 0 < max_replay_entries <= MAX_REPLAY_ENTRIES
         ):
             raise ValidatorAccessError("replay cache size is invalid")
+        if not callable(log_clock):
+            raise ValidatorAccessError("validator access log clock is invalid")
         self.path = os.path.abspath(path)
         self.max_replay_entries = max_replay_entries
         self.exclusive = exclusive is True
+        self._clock_log = _RateLimitedWarning(REQUEST_CLOCK_LOG_INTERVAL_SECONDS, log_clock)
         self._prepare_path()
         self._release_lock = weakref.finalize(self, os.close, self._acquire_lock())
         try:
@@ -223,6 +276,10 @@ class ValidatorAccessState:
         except BaseException:
             self.close()
             raise
+
+    @property
+    def closed(self) -> bool:
+        return not self._release_lock.alive
 
     def close(self) -> None:
         """Release the state lock. The worker keeps it for its lifetime."""
@@ -266,6 +323,19 @@ class ValidatorAccessState:
                 raise ValidatorAccessError(
                     "validator access state is locked by an operator reset"
                 ) from None
+            # The lock only excludes holders of the same file. Refuse if the
+            # path was replaced between open and flock.
+            try:
+                current = os.lstat(self.path + ".lock")
+            except OSError:
+                current = None
+            if current is None or (current.st_dev, current.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                raise ValidatorAccessError(
+                    "validator access state lock was replaced while locking; retry"
+                )
         except BaseException:
             os.close(descriptor)
             raise
@@ -328,6 +398,9 @@ class ValidatorAccessState:
             os.chmod(self.path, 0o600)
             connection.execute("PRAGMA journal_mode = DELETE")
             connection.execute("PRAGMA synchronous = FULL")
+            # Each column check and add runs under the write lock, so two
+            # processes that open older state at once cannot both add it.
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS validator_snapshot_high_water (
@@ -479,8 +552,15 @@ class ValidatorAccessState:
         steps backward. The clock high-water only detects such a step: up to
         MAX_REQUEST_CLOCK_STEP_BACK_SECONDS is tolerated, and a larger step
         fails closed until an operator resets it.
+
+        Nothing lowers the floor. After a long forward clock excursion it can
+        sit far ahead of the corrected clock, and requests stay refused until
+        they can expire after it, about floor - lifetime. Both refusals are
+        logged, rate-limited.
         """
 
+        if self.closed:
+            return False
         now_epoch = int(now.timestamp())
         expires_epoch = int(expires_at.timestamp())
         if expires_epoch <= now_epoch:
@@ -508,20 +588,36 @@ class ValidatorAccessState:
                 step_back = clock_high_water - now_epoch
                 if step_back > MAX_REQUEST_CLOCK_STEP_BACK_SECONDS:
                     connection.rollback()
-                    LOGGER.warning(
+                    self._clock_log.warning(
+                        "step",
                         "validator request refused: the wall clock is %d s behind the "
                         "replay clock high-water %s, beyond the %d s tolerance. Correct "
                         "the clock, stop the worker, then run: %s %s",
                         step_back,
-                        datetime.fromtimestamp(clock_high_water, UTC).isoformat(),
+                        _epoch_utc(clock_high_water),
                         MAX_REQUEST_CLOCK_STEP_BACK_SECONDS,
                         REQUEST_CLOCK_RESET_COMMAND,
                         self.path,
                     )
                     return False
                 if expires_epoch <= replay_floor:
-                    # A pruned row may have held this nonce.
+                    # A pruned row may have held this nonce. The floor is
+                    # ahead of the clock here, since expires_epoch > now_epoch.
                     connection.rollback()
+                    resume = requests_resume_at(replay_floor)
+                    assert resume is not None
+                    self._clock_log.warning(
+                        "floor",
+                        "validator request refused: it expires at %s, at or before the "
+                        "replay floor %s, which is %d s ahead of the wall clock. No reset "
+                        "lowers the floor. With a correct validator clock, requests "
+                        "signed with the maximum %d s lifetime are accepted from about %s",
+                        _epoch_utc(expires_epoch),
+                        _epoch_utc(replay_floor),
+                        replay_floor - now_epoch,
+                        MAX_REQUEST_LIFETIME_SECONDS,
+                        _epoch_utc(resume),
+                    )
                     return False
                 pruned_through = connection.execute(
                     """
@@ -578,12 +674,14 @@ class ValidatorAccessState:
         """Lower the clock high-water to ``now`` after a backward clock step.
 
         Only the exclusive holder may reset, so no worker holds the state. The
-        reset keeps every replay row and the replay floor, so a request that
-        could repeat a pruned nonce stays refused. It changes nothing when
-        ``now`` is not behind the high-water.
+        reset fixes a high-water that is ahead of the clock. It cannot and must
+        not lower the replay floor, and it keeps every replay row, so a request
+        that could repeat a pruned nonce stays refused. When the floor is ahead
+        of the clock, requests stay refused until about floor - lifetime. It
+        changes nothing when ``now`` is not behind the high-water.
         """
 
-        if not self.exclusive:
+        if self.closed or not self.exclusive:
             raise ValidatorAccessError("a request clock reset requires the exclusive state lock")
         if now.tzinfo is None or now.utcoffset() != timedelta(0):
             raise ValidatorAccessError("request clock reset time must be UTC")
@@ -603,24 +701,42 @@ class ValidatorAccessState:
             )
             if row is None:
                 connection.rollback()
-                return RequestClockReset(None, None, 0, retained)
-            replay_floor = int(row[0])
-            before = int(row[1] if row[1] is not None else row[0])
-            after = before
-            if now_epoch < before:
-                connection.execute(
-                    """
-                    UPDATE validator_request_clock_high_water
-                    SET wall_clock_high_water_epoch = ?
-                    WHERE singleton = 1
-                    """,
-                    (now_epoch,),
-                )
-                after = now_epoch
-            connection.commit()
-            return RequestClockReset(before, after, replay_floor, retained)
+                result = RequestClockReset(None, None, 0, retained)
+            else:
+                replay_floor = int(row[0])
+                before = int(row[1] if row[1] is not None else row[0])
+                after = before
+                if now_epoch < before:
+                    connection.execute(
+                        """
+                        UPDATE validator_request_clock_high_water
+                        SET wall_clock_high_water_epoch = ?
+                        WHERE singleton = 1
+                        """,
+                        (now_epoch,),
+                    )
+                    after = now_epoch
+                connection.commit()
+                result = RequestClockReset(before, after, replay_floor, retained)
         finally:
             connection.close()
+        resume = result.requests_resume_at
+        LOGGER.warning(
+            "request clock reset: high-water %s -> %s; replay floor %s kept, never "
+            "lowered; %d replay records kept. %s",
+            "none" if result.clock_high_water_before is None
+            else _epoch_utc(result.clock_high_water_before),
+            "none" if result.clock_high_water_after is None
+            else _epoch_utc(result.clock_high_water_after),
+            "none" if resume is None else _epoch_utc(result.replay_floor),
+            retained,
+            "Nothing was ever pruned, so no request waits on the floor."
+            if resume is None
+            else "With a correct validator clock, requests signed with the maximum "
+            f"{MAX_REQUEST_LIFETIME_SECONDS} s lifetime are accepted from about "
+            f"{_epoch_utc(resume)}.",
+        )
+        return result
 
 
 def reset_request_clock_high_water(path: str, *, now: datetime) -> RequestClockReset:

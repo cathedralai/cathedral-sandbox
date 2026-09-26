@@ -264,11 +264,19 @@ sudo docker run --rm --pull never --network none --read-only \
   --validator-access-state /var/lib/cathedral/validator-access/validator-access.sqlite
 ```
 
-The reset refuses while a worker holds the state. It keeps every replay
-record, so an accepted request is still refused if it is sent again. Requests
-that expire at or before the printed `replay_floor` also stay refused. Only
-images built from a revision that includes `cathedral worker
-reset-replay-clock` have this command. The image pinned in step 3 predates it.
+The reset refuses while a worker holds the state. It fixes one thing: a
+replay clock high-water that is ahead of the host clock. It does not always
+restore service. The worker also keeps a replay floor, the latest expiry of
+any replay record it has deleted. Only requests that expire after the floor
+are accepted. The reset cannot and must not lower the floor, and it keeps
+every replay record, so an accepted request is still refused if it is sent
+again. If the clock ran far ahead before it was corrected, the floor can be
+far ahead too. Requests then stay refused until about `requests_resume_at`,
+which is the floor minus the 120-second maximum request lifetime. The reset
+prints `replay_floor` and `requests_resume_at`, and the worker logs both,
+at most once a minute, while it refuses. Only images built from a revision
+that includes `cathedral worker reset-replay-clock` have this command. The
+image pinned in step 3 predates it.
 
 The `init-key` command prints `keys_digest sha256:...`. Keep the value after
 `keys_digest` for step 3.
