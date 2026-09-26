@@ -21,7 +21,8 @@ def test_accepts_well_formed_evidence():
     assert att.tier == Tier.CC_CPU_SNP
     assert att.measurement == ev.measurement
     assert att.verification_status == "VERIFIED"
-    assert att.chain_verified is True
+    # MOCK skips vendor crypto, so it never claims a verified chain.
+    assert att.chain_verified is False
 
 
 def test_rejects_wrong_report_data_binding():

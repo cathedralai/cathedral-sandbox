@@ -292,8 +292,10 @@ component, or GPU evidence to a CPU request is rejected without downgrade.
 The development runtime still requires a currently active signed registry
 profile, exact verifier preflight, and complete GPU identity configuration.
 The standalone lifecycle probe retains its stricter production startup gate
-for identity-state operations. A successful preview audit is not a production
-admission or scoring result.
+for identity-state operations. Until the GPU lane is qualified, neither the
+preview audit nor the probe can succeed (see below). When they can, a
+successful preview audit will still not be a production admission or scoring
+result.
 
 The standalone probe exposes the same configuration directly:
 
@@ -311,16 +313,25 @@ cathedral-prober --production-mode --once \
 ```
 
 The audit command returns privacy-safe CPU/GPU component summaries, the bundle
-digest, and a stable failure category. Successful output reports
-`verified: true` and `admitted: false`, because no lifecycle admission occurs.
-It never claims a GPU identity, dispatches SAT work, writes an epoch, or scores
-the worker.
+digest, and a stable failure category. It never claims a GPU identity,
+dispatches SAT work, writes an epoch, or scores the worker.
 
-Until the GPU lane is qualified, the composite verifier does not declare a
-verdict. Its result keeps the fail-closed defaults (`verification_status`
-`UNVERIFIED`, `chain_verified` false), so this audit, the epoch runtime and the
-standalone probe all refuse it. The probe refuses it before any GPU identity
-claim.
+Until the GPU lane is qualified, neither command can succeed, even on valid
+hardware. The composite verifier does not declare a verdict: its result keeps
+the fail-closed defaults (`verification_status` `UNVERIFIED`, `chain_verified`
+false).
+
+- `runtime develop-audit-attestation` exits nonzero with
+  `status: attestation_failed`, `verified: false` and the error
+  `composite verdict undeclared (GPU lane not qualified)`.
+- The GPU epoch runtime refuses the canary with the same reason.
+- `cathedral-prober --gpu-profile-id ...` records that reason as a failed
+  verification before any GPU identity claim. A GPU worker that is already
+  `ATTESTED` becomes `FAILED` at its next probe refresh.
+
+Once the lane is qualified and the verifier declares its verdict, a successful
+audit reports `verified: true` and `admitted: false`, because no lifecycle
+admission occurs.
 
 ## Scoring and rollout gates
 

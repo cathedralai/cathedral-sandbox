@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -1413,10 +1413,31 @@ def test_runtime_refuses_verdict_that_does_not_declare_itself_verified(tmp_path:
     outcome = next(item for item in run.outcomes if item.hotkey == "miner")
 
     assert outcome.status == "attestation_failed"
-    assert outcome.error == "verdict does not match the requested hardware tier"
+    assert outcome.error == "verdict is not verified"
     assert outcome.score == 0.0
     assert "sat:miner" not in factory.log
     assert "sat:canary" in factory.log
+
+
+def test_runtime_reports_wrong_tier_separately_from_an_unverified_verdict(
+    tmp_path: Path,
+) -> None:
+    specs = default_specs(**{"9001": MinerSpec("snp-shaped-chip")})
+    runtime, _, factory = make_runtime(tmp_path, [("miner", "http://127.0.0.1:9001")], specs)
+
+    def mixed_verifier(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested:
+        declared = verifier(evidence, nonce, policy)
+        if declared.chip_id != "snp-shaped-chip":
+            return declared
+        return replace(declared, tier=Tier.CC_CPU_SNP)
+
+    runtime.verifier = mixed_verifier
+    run = runtime.run_epoch(1, CANARY)
+    outcome = next(item for item in run.outcomes if item.hotkey == "miner")
+
+    assert outcome.status == "attestation_failed"
+    assert outcome.error == "verdict does not match the requested hardware tier"
+    assert "sat:miner" not in factory.log
 
 
 def test_channel_mismatch_never_dispatches_work_or_admits(tmp_path: Path) -> None:
@@ -1658,6 +1679,40 @@ def test_chip_rotation_to_new_hotkey_is_blocked_within_ttl(tmp_path: Path) -> No
     lifecycle = registry.lifecycle_snapshot("b")
     assert lifecycle.state is not WorkerLifecycleState.REVOKED
     assert lifecycle.state in NETWORK_ELIGIBLE_STATES
+
+
+def test_runtime_does_not_admit_a_verdict_the_registry_refused(tmp_path: Path) -> None:
+    """record_verdict can store FAILED without raising, for example when the
+    chip_id became bound to another hotkey after the runtime's own rotation
+    check. The runtime must follow the stored status, not the verdict it
+    passed in: no admission, no dispatch, no score.
+    """
+
+    specs = default_specs(**{"9001": MinerSpec("shared-chip")})
+    runtime, ledger, factory = make_runtime(
+        tmp_path, [("a", "http://127.0.0.1:9001")], specs, poster=RecordingPoster()
+    )
+    first = runtime.run_epoch(1, CANARY, publish=True)
+    assert dict(first.scores) == {"a": 1.0}
+
+    runtime.registry.enroll("b", "http://127.0.0.1:9002")
+    specs["http://127.0.0.1:9002"] = MinerSpec("shared-chip")
+    del specs["http://127.0.0.1:9001"]
+    # Hide the incumbent binding from the pre-check only, as if "a" had been
+    # bound between that check and the registry write.
+    runtime.registry.chip_rotation_owner = lambda _chip_id, _hotkey: None
+    factory.log.clear()
+
+    second = runtime.run_epoch(2, CANARY)
+
+    outcome = next(item for item in second.outcomes if item.hotkey == "b")
+    assert outcome.status == "attestation_failed"
+    assert outcome.error == "registry refused the verdict"
+    assert outcome.admitted is False
+    assert dict(second.scores)["b"] == 0.0
+    assert "sat:b" not in factory.log
+    assert "b" not in ledger.attested_hotkeys(second.epoch_id)
+    assert runtime.registry.lifecycle_snapshot("b").state is WorkerLifecycleState.FAILED
 
 
 def test_invalid_miner_is_zero_while_peer_succeeds(tmp_path: Path) -> None:

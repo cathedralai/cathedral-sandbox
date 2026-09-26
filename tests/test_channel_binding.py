@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import hashlib
+import re
 import shutil
 import sqlite3
 import socket
@@ -37,6 +38,7 @@ from cathedral.common import (
 )
 from cathedral.enroll import RegistryStore
 from cathedral.gpu import (
+    GPU_VERDICT_UNDECLARED,
     ExternalGpuVerifier,
     GpuAttestationError,
     GpuComponentVerdict,
@@ -613,7 +615,7 @@ def test_worker_remote_runtime_audits_bound_composite_only_with_declared_verdict
         # The composite verifier's own verdict is the fail-closed default, so
         # the audit refuses it rather than reporting a verified preview.
         assert outcome.status == "attestation_failed"
-        assert outcome.error == "verdict does not match the requested hardware tier"
+        assert outcome.error == GPU_VERDICT_UNDECLARED
         assert outcome.assurance is None
         assert outcome.component_audit is None
         with sqlite3.connect(identity_registry.path) as connection:
@@ -772,7 +774,7 @@ def test_scored_gpu_epoch_rejects_same_gpu_on_different_tdx_host(
         expected = (
             "shares the dedicated canary GPU identity"
             if declared
-            else "canary attestation failed: verdict does not match the requested hardware tier"
+            else re.escape(f"canary attestation failed: {GPU_VERDICT_UNDECLARED}")
         )
         with pytest.raises(CathedralRuntimeError, match=expected):
             runtime.run_epoch(1, MinerTarget("gpu-canary", canary_server.base_url))

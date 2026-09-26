@@ -112,13 +112,14 @@ def test_registry_refuses_verdict_that_does_not_declare_itself_verified(tmp_path
         assurance=declared.assurance,
     )
 
-    store.record_verdict(
+    stored = store.record_verdict(
         "worker",
         undeclared,
         policy_registry_release=1,
         policy_registry_digest=REGISTRY_DIGEST,
     )
 
+    assert stored == "UNVERIFIED"
     lifecycle = store.lifecycle_snapshot("worker")
     assert lifecycle.state is WorkerLifecycleState.FAILED
     assert lifecycle.reason is LifecycleReason.VERIFICATION_FAILED
@@ -129,11 +130,14 @@ def test_registry_refuses_verdict_that_does_not_declare_itself_verified(tmp_path
     # The refused verdict does not hold the chip: another worker can bind it.
     assert store.chip_rotation_owner(declared.chip_id, "other-worker") is None
     store.enroll("other-worker", "https://other.example")
-    store.record_verdict(
-        "other-worker",
-        declared,
-        policy_registry_release=1,
-        policy_registry_digest=REGISTRY_DIGEST,
+    assert (
+        store.record_verdict(
+            "other-worker",
+            declared,
+            policy_registry_release=1,
+            policy_registry_digest=REGISTRY_DIGEST,
+        )
+        == "VERIFIED"
     )
     assert store.lifecycle_snapshot("other-worker").state is WorkerLifecycleState.ATTESTED
 

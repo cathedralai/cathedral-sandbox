@@ -200,7 +200,6 @@ def test_mock_epoch_admits_declared_mock_verdict_and_refuses_an_undeclared_one()
             declared = super().serve_evidence(nonce, policy)
             assert declared is not None
             assert declared.verification_status == "VERIFIED"
-            assert declared.chain_verified is True
             return Attested(
                 declared.tier,
                 declared.chip_id,
