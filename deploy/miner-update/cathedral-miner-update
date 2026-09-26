@@ -1,0 +1,43 @@
+#!/bin/sh
+# Frozen entry point for the Cathedral miner updater.
+#
+# The bootstrap installs this file once, and no release ever replaces it. It
+# runs the current updater. If that updater crashes (an exit status the
+# updater never uses on purpose, such as a Python traceback), it runs the
+# previous updater with `recover`, which puts itself back as current and
+# remembers the crashed release. So a broken self-update cannot strand a host.
+#
+# Documented exit statuses: 0 done, 10 refused, 11 halted, 12 alert.
+set -u
+
+ROOT="${CATHEDRAL_MINER_UPDATE_ROOT:-/}"
+INSTALL="${ROOT%/}/usr/local/lib/cathedral-miner-update"
+PYTHON="${CATHEDRAL_MINER_UPDATE_PYTHON:-/usr/bin/python3}"
+
+run() {
+  release=$(readlink -e -- "$INSTALL/updater/$1") || return 127
+  shift
+  # `python -m` puts the working directory first on sys.path, so run from the
+  # release's own code directory: a caller's directory can never shadow it.
+  (cd -- "$release/updater" || exit 127
+  exec env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 PYTHONSAFEPATH=1 \
+    PYTHONPATH="$release/updater" \
+    CATHEDRAL_MINER_UPDATE_RELEASE="$release" \
+    CATHEDRAL_MINER_UPDATE_ROOT="$ROOT" \
+    "$PYTHON" -s -B -m cathedral.miner_update_cli "$@")
+}
+
+run current "$@"
+status=$?
+case "$status" in
+  0|10|11|12) exit "$status" ;;
+esac
+# Killed by a signal, for example a systemd timeout: not a fault in the code.
+[ "$status" -gt 128 ] && exit "$status"
+[ "${1:-}" = check ] || exit "$status"
+[ -L "$INSTALL/updater/previous" ] || exit "$status"
+crashed=$(readlink -e -- "$INSTALL/updater/current") || exit "$status"
+previous=$(readlink -e -- "$INSTALL/updater/previous") || exit "$status"
+[ "$crashed" = "$previous" ] && exit "$status"
+echo "cathedral-miner-update: the current updater exited $status; the previous updater takes over" >&2
+run previous recover --crashed-release "$crashed"

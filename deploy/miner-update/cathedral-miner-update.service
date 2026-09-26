@@ -1,0 +1,40 @@
+[Unit]
+Description=Cathedral miner signed update check
+After=network-online.target docker.service
+Wants=network-online.target
+ConditionPathExists=/etc/cathedral/miner-update/config.json
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+# The frozen shim runs the current updater, or the previous one if the
+# current one crashes. Exit statuses: 0 done, 10 refused, 11 halted for an
+# operator, 12 deferred too many times in a row. Anything but 0 fails the
+# unit, so `systemctl --failed` shows a miner that is not updating.
+ExecStart=/usr/local/lib/cathedral-miner-update/bin/cathedral-miner-update check
+# Longer than the worst case in miner_update_cli.worst_case_seconds(), so
+# systemd never kills a check between two durable steps. A test holds this.
+TimeoutStartSec=2160s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+# Everything is read-only except the updater's own install and state
+# directories. That keeps /etc/cathedral/validator-access/validator-access.json
+# readable, which the safe-restart gate needs: hiding it made every
+# unattended check defer (review finding F1). A test parses this file and
+# checks every path the updater reads and writes against it.
+ProtectSystem=strict
+ReadWritePaths=/usr/local/lib/cathedral-miner-update /var/lib/cathedral-miner-update
+# The miner's own durable state. The updater never reads it: rollback is
+# decided by the signed state schema, not by fingerprinting this database.
+InaccessiblePaths=-/var/lib/cathedral/validator-access
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

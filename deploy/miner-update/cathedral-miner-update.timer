@@ -1,5 +1,5 @@
 [Unit]
-Description=Cathedral SN39 miner update check, 15 minutes after boot then hourly
+Description=Cathedral miner update check, 15 minutes after boot then hourly
 
 [Timer]
 # Matches the validator's published cadence so operators learn one number.
@@ -8,7 +8,7 @@ OnBootSec=15min
 OnUnitActiveSec=1h
 RandomizedDelaySec=5min
 Persistent=true
-Unit=cathedral-sn39-miner-update.service
+Unit=cathedral-miner-update.service
 
 [Install]
 WantedBy=timers.target
