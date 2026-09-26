@@ -175,7 +175,7 @@ sudo install -o root -g root -m 0755 \
   cathedral-runtime/scripts/run_sn39_signed_fleet_miner.sh \
   /usr/local/libexec/cathedral/run-sn39-miner
 printf '%s  %s\n' \
-  d56a82bb76eb2d976edfcd4574ff6ed19a41532ffa50d01a2411df51a002b615 \
+  2ba50ed1342406759aa2b78d5e019caa347c4db1dfa5e8c66d2e8452498032b1 \
   /usr/local/libexec/cathedral/run-sn39-miner | sudo sha256sum --check
 ```
 
@@ -241,10 +241,42 @@ sudo mv \
   /etc/cathedral/validator-access/validator-access.json
 ```
 
-Repeat capture, transfer, and the final atomic install every five minutes. A
-failed refresh leaves the last valid file in place. An expired snapshot closes
-protected routes. The repository does not ship a provider-neutral transfer
-service, so use your existing secure provisioning channel.
+Repeat capture, transfer, and the final atomic install every five minutes, or
+install the two timers described at the end of this step. A failed refresh
+leaves the last valid file in place. An expired snapshot closes protected
+routes.
+
+The worker keeps its signed-request replay records in
+`/var/lib/cathedral/validator-access/validator-access.sqlite`. While it runs it
+holds a lock on `validator-access.sqlite.lock` beside that file. It tolerates a
+backward clock step of up to 135 seconds: one request lifetime plus the
+allowed validator clock skew. After a larger step it refuses every signed
+request and logs the step size. Correct the host clock first. Then stop the
+worker, reset the replay clock with the reviewed image, and start the worker
+again:
+
+```bash
+sudo docker run --rm --pull never --network none --read-only \
+  --cap-drop ALL --security-opt no-new-privileges=true \
+  --mount type=bind,src=/var/lib/cathedral/validator-access,dst=/var/lib/cathedral/validator-access \
+  --entrypoint python REVIEWED_WORKER_IMAGE -I -m cathedral.cli \
+  worker reset-replay-clock \
+  --validator-access-state /var/lib/cathedral/validator-access/validator-access.sqlite
+```
+
+The reset refuses while a worker holds the state. It fixes one thing: a
+replay clock high-water that is ahead of the host clock. It does not always
+restore service. The worker also keeps a replay floor, the latest expiry of
+any replay record it has deleted. Only requests that expire after the floor
+are accepted. The reset cannot and must not lower the floor, and it keeps
+every replay record, so an accepted request is still refused if it is sent
+again. If the clock ran far ahead before it was corrected, the floor can be
+far ahead too. Requests then stay refused until about `requests_resume_at`,
+which is the floor minus the 120-second maximum request lifetime. The reset
+prints `replay_floor` and `requests_resume_at`, and the worker logs both,
+at most once a minute, while it refuses. Only images built from a revision
+that includes `cathedral worker reset-replay-clock` have this command. The
+image pinned in step 3 predates it.
 
 The `init-key` command prints `keys_digest sha256:...`. Keep the value after
 `keys_digest` for step 3.
@@ -260,6 +292,153 @@ and mode `0644`:
   "endpoints": []
 }
 ```
+
+#### Keep the snapshot fresh with two timers
+
+The snapshot proves itself: it carries your signature, so it may cross any
+channel, and the seed never has to leave the control host. Two example units in
+`examples/systemd` automate the loop above.
+
+- **Control host, `cathedral-validator-access-refresh.timer`**, every two
+  minutes. It runs `scripts/cathedral_validator_access.py refresh` as a
+  dedicated `cathedral-access` account that owns the seed. Each run signs a
+  fresh finalized view and verifies it against `snapshot-keys.json` and its
+  pinned digest. It then atomically replaces the published
+  `validator-access.json`. The lifetime must be at least 600 seconds.
+  `generated_at` is set 30 seconds in the past, so workers still accept it
+  when the control host's clock runs up to 30 seconds fast.
+- **Each worker, `cathedral-validator-access-fetch.timer`**, every two minutes.
+  It runs `scripts/cathedral_validator_access.py fetch` as `root` with no
+  capabilities and no Unix-domain sockets. It holds no seed and reads no
+  chain. It pulls the published file from an `https://` URL or from a local
+  path that your own transfer writes, reading at most 256 KiB. It verifies the
+  file against the pinned `snapshot-keys.json` and the configured network,
+  subnet, and stake floor. It then installs it as `root:root` mode `0644` by an
+  atomic rename. The running worker picks it up without a restart.
+
+Both commands refuse a snapshot for another network, subnet, or stake floor,
+an older block, or a changed validator set at the same block. At the same block
+they also refuse one that expires sooner than the file it would replace. A
+newer block always wins once it verifies, even if it expires sooner. Both leave
+the file untouched on any failure. The key and the decision stay yours:
+Cathedral still does not issue a credential.
+
+On the control host, give the seed to the service account, publish the output
+directory, and enable the refresh timer. Install the path checker from
+[docs/PRIVILEGED_PATHS.md](docs/PRIVILEGED_PATHS.md) and a root-owned checkout
+at `/opt/cathedral-validator-access` first, as shown for the worker below, but
+with `'/opt/cathedral-validator-access[enrollment-operator]'`. The service
+account then holds the only copy of the seed:
+
+```bash
+sudo useradd --system --home-dir /var/lib/cathedral-validator-access \
+  --shell /usr/sbin/nologin cathedral-access
+sudo install -d -o cathedral-access -g cathedral-access -m 0755 \
+  /var/lib/cathedral-validator-access \
+  /var/lib/cathedral-validator-access/publish
+sudo install -d -o cathedral-access -g cathedral-access -m 0700 \
+  /var/lib/cathedral-validator-access/signer
+sudo install -o cathedral-access -g cathedral-access -m 0600 \
+  cathedral-validator-access-state/snapshot.seed \
+  /var/lib/cathedral-validator-access/signer/snapshot.seed
+sudo install -o cathedral-access -g cathedral-access -m 0644 \
+  cathedral-validator-access-state/snapshot-keys.json \
+  /var/lib/cathedral-validator-access/snapshot-keys.json
+shred --remove cathedral-validator-access-state/snapshot.seed
+```
+
+`shred` cannot guarantee erasure on a copy-on-write or flash-backed
+filesystem. There, keep `cathedral-validator-access-state` on encrypted
+storage. From now on, run any manual `capture` as `cathedral-access` with the
+new seed path.
+
+Copy `validator-access-refresh.env.example` to
+`/etc/cathedral/validator-access-refresh.env` as `root:root` mode `0600` and
+fill it in. Install the refresh service and timer in `/etc/systemd/system`,
+run the service once, then enable the timer. Serve
+`/var/lib/cathedral-validator-access/publish` over HTTPS, or push its one file
+to each worker yourself.
+
+On each worker, install the refresher checkout, the path checker, and the fetch
+units. The worker needs only the base package, not the chain client:
+
+```bash
+REFRESHER_REVISION='REVIEWED_REVISION_THAT_SHIPS_THE_REFRESHER'
+sudo git clone https://github.com/cathedralai/cathedral-sandbox.git \
+  /opt/cathedral-validator-access
+sudo git -C /opt/cathedral-validator-access checkout --detach "$REFRESHER_REVISION"
+sudo python3.12 -m venv /opt/cathedral-validator-access/.venv
+sudo /opt/cathedral-validator-access/.venv/bin/pip install \
+  /opt/cathedral-validator-access
+sudo install -o root -g root -m 0755 \
+  /opt/cathedral-validator-access/cathedral/privileged_paths.py \
+  /usr/local/libexec/cathedral-privileged-paths.py
+
+sudo install -o root -g root -m 0600 \
+  /opt/cathedral-validator-access/examples/systemd/validator-access-fetch.env.example \
+  /etc/cathedral/validator-access-fetch.env
+sudoedit /etc/cathedral/validator-access-fetch.env
+sudo install -o root -g root -m 0644 \
+  /opt/cathedral-validator-access/examples/systemd/cathedral-validator-access-fetch.service \
+  /opt/cathedral-validator-access/examples/systemd/cathedral-validator-access-fetch.timer \
+  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start cathedral-validator-access-fetch.service
+sudo systemctl enable --now cathedral-validator-access-fetch.timer
+```
+
+In both env files, replace the `<NETWORK>` and `<NETUID>` placeholders for
+`CATHEDRAL_VALIDATOR_ACCESS_NETWORK` and `CATHEDRAL_VALIDATOR_ACCESS_NETUID`
+with the chain network and subnet the worker image checks. Neither has a
+default, and both commands refuse the placeholders. Set
+`CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST` to the `keys_digest` value. On the
+worker, set `CATHEDRAL_VALIDATOR_ACCESS_SOURCE` to the published URL or path. A
+local-path source must be world-readable and outside `/home`. The fetch service
+cannot use `nss-resolve`, which needs a Unix-domain socket. Its lookups
+therefore go through the classic `dns` module, so `hosts:` in
+`/etc/nsswitch.conf` must list `dns`, as in the usual
+`files resolve [!UNAVAIL=return] dns`. Otherwise use an IP-literal URL or a
+local path. The first `systemctl start` creates `validator-access.json`, so run
+it before step 3. The example SNP miner unit in `examples/systemd` already
+starts after the fetch service at boot.
+
+Install the alarm hook on the control host and on every worker. This step is
+required: without it the alarm is only a journal line. Both units start
+`cathedral-validator-access-alert@.service` through `OnFailure=`, and that
+template runs `/usr/local/sbin/cathedral-validator-access-page` with the failed
+unit's name. Replace the `sendmail` line with your own pager, webhook, or mail
+command:
+
+```bash
+sudo install -o root -g root -m 0644 \
+  /opt/cathedral-validator-access/examples/systemd/cathedral-validator-access-alert@.service \
+  /etc/systemd/system/
+sudo install -o root -g root -m 0755 /dev/stdin \
+  /usr/local/sbin/cathedral-validator-access-page <<'EOF'
+#!/bin/sh
+printf 'Subject: %s raised the validator-access expiry alarm\n\njournalctl -u %s\n' \
+  "$1" "$1" | /usr/sbin/sendmail YOUR_ALERT_ADDRESS
+EOF
+sudo systemctl daemon-reload
+sudo systemctl start cathedral-validator-access-alert@test.service
+```
+
+The last command must reach you. Each service logs to the journal. Exit status
+1 logs an error-priority `ERROR validator_access_refresh_failed` or
+`ERROR validator_access_fetch_failed` line. It means one run failed, for
+example an unreachable chain or source, or a refused rollback. The file still
+has time left and the next run retries. It does not fail the unit and does not
+page. Exit status 3, with an `ERROR validator_access_expiry_alarm` line, is the
+expiry alarm. It fails the unit and pages. The file's own `expires_at` is less
+than the alarm threshold away, or the file is missing, expired, bound to
+another subnet, or does not verify. On a worker this can fire after a
+successful fetch, when the control host has stopped publishing anything newer.
+
+The default threshold is one third of the snapshot's lifetime, 300 seconds for
+a 900-second snapshot. With the two-minute fetch timer, the first alarm leaves
+at least about 130 seconds before expiry; raise
+`CATHEDRAL_VALIDATOR_ACCESS_ALARM_BELOW_SECONDS` for more. At expiry every
+protected route closes until a fresh snapshot arrives.
 
 ### 3. Start the reviewed image
 
@@ -358,9 +537,10 @@ A healthy server is not proof of weight. A weight is not proof of emission.
 On every additional TDX guest, repeat step 1. Use the existing control host to
 capture a fresh snapshot, then transfer the existing public-key file and that
 snapshot to the new guest as described in step 2. Do not create a second
-signing key. Give the new guest an empty local `fleet.json`, then run step 3 and
-the reachability check with the same public miner hotkey and the new guest's
-own public endpoint. Each guest keeps its own access files, replay-state
+signing key. With the timers, install only the fetch timer on the new guest,
+pointed at the same published source. Give the new guest an empty local
+`fleet.json`, then run step 3 and the reachability check with the same public
+miner hotkey and the new guest's own public endpoint. Each guest keeps its own access files, replay-state
 directory, running image, TDX evidence, and in-guest TLS key. Do not register a
 second hotkey or axon for those guests.
 
@@ -388,9 +568,15 @@ sudo mv \
   /etc/cathedral/validator-access/fleet.json
 ```
 
-Restart the primary worker through your supervisor, or stop its
-foreground launcher and rerun step 3. The worker reads `fleet.json` only at
-startup. Add up to 31 secondary origins. Reusing an endpoint, hardware
+No restart is needed. The running worker checks `fleet.json` on each fleet
+request and loads it again when the file changes. It prints
+`fleet manifest ... loaded` to stderr when it serves the new list. If the new
+file fails a check (symlink, group- or world-writable, wrong owner, over
+64 KiB, or bad JSON or fields), the worker keeps serving the last good list and
+prints one `WARNING` line for that change. It does the same if the file is
+removed. To go back to one machine, write `"endpoints": []`; do not delete the
+file. A worker still refuses to start with a bad or missing `fleet.json`.
+Add up to 31 secondary origins. Reusing an endpoint, hardware
 identity, or TLS key causes every verified claimant in that collision to score
 zero for the round.
 

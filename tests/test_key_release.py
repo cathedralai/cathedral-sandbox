@@ -163,6 +163,8 @@ def _harness(tmp_path: Path, *, enabled: bool = True) -> Harness:
         "chip-1",
         "measurement",
         1,
+        verification_status="VERIFIED",
+        chain_verified=True,
         assurance=claims,
     )
     registry.record_verdict(
@@ -1069,6 +1071,67 @@ def test_wrong_application_key_cannot_receive_grant(tmp_path: Path):
         )
 
     assert raised.value.category == "channel_denied"
+
+
+def test_verdict_that_does_not_declare_itself_verified_cannot_receive_grant(tmp_path: Path):
+    # Built without verification_status and chain_verified, so it takes the
+    # fail-closed defaults. Tier, chip, measurement and typed claims match the
+    # recorded worker exactly, so the refusal comes from the verdict alone.
+    harness = _harness(tmp_path)
+    undeclared = Attested(
+        harness.attested.tier,
+        harness.attested.chip_id,
+        harness.attested.measurement,
+        harness.attested.tcb,
+        assurance=harness.attested.assurance,
+    )
+    assert undeclared.verification_status == "UNVERIFIED"
+    assert undeclared.chain_verified is False
+
+    with pytest.raises(KeyReleaseError) as raised:
+        harness.service.issue_grant(
+            harness.assignment,
+            undeclared,
+            harness.application_public_key,
+        )
+
+    assert raised.value.category == "attestation_denied"
+    assert harness.broker.unwrap_count == 0
+    with sqlite3.connect(harness.store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM key_release_grants").fetchone()[0] == 0
+
+
+def test_worker_recorded_with_an_undeclared_verdict_cannot_receive_grant(tmp_path: Path):
+    # The registry refuses to admit a verdict that did not declare itself
+    # verified, so key release has no verified record to issue against even
+    # when the caller presents a declared verdict.
+    harness = _harness(tmp_path)
+    undeclared = Attested(
+        harness.attested.tier,
+        harness.attested.chip_id,
+        harness.attested.measurement,
+        harness.attested.tcb,
+        assurance=harness.attested.assurance,
+    )
+    harness.registry.record_verdict(
+        HOTKEY,
+        undeclared,
+        policy_registry_release=7,
+        policy_registry_digest=REGISTRY_DIGEST,
+    )
+    assert harness.registry.lifecycle_snapshot(HOTKEY).state is not WorkerLifecycleState.ATTESTED
+
+    with pytest.raises(KeyReleaseError) as raised:
+        harness.service.issue_grant(
+            harness.assignment,
+            harness.attested,
+            harness.application_public_key,
+        )
+
+    assert raised.value.category == "attestation_unavailable"
+    assert harness.broker.unwrap_count == 0
+    with sqlite3.connect(harness.store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM key_release_grants").fetchone()[0] == 0
 
 
 def test_caller_cannot_forge_channel_claim_around_persisted_verifier_record(

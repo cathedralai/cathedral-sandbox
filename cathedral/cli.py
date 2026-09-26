@@ -93,12 +93,13 @@ from cathedral.evidence import (
 )
 from cathedral.validator_access import (
     DEFAULT_SNAPSHOT_MAX_AGE_SECONDS,
+    FleetManifest,
     SignedValidatorSnapshotProvider,
     ValidatorAccessState,
     ValidatorRequestAuthorizer,
-    load_fleet_manifest,
     load_sr25519_verifier,
     preflight_sr25519_verifier,
+    reset_request_clock_high_water,
     singleton_fleet,
 )
 from cathedral.gpu import (
@@ -1261,6 +1262,45 @@ def _run_json(run: EpochRun) -> dict[str, object]:
     }
 
 
+def cmd_worker_reset_replay_clock(args: argparse.Namespace) -> int:
+    """Lower the signed-request clock high-water after a backward clock step.
+
+    It refuses while a worker holds the state and keeps every replay record.
+    It never lowers the replay floor, so it reports when requests resume.
+    """
+
+    result = reset_request_clock_high_water(
+        args.validator_access_state,
+        now=datetime.datetime.now(datetime.UTC),
+    )
+
+    def utc(epoch: int | None) -> str | None:
+        if epoch is None:
+            return None
+        return datetime.datetime.fromtimestamp(epoch, datetime.UTC).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+    before = result.clock_high_water_before
+    after = result.clock_high_water_after
+    print(
+        json.dumps(
+            {
+                "backward_step_seconds": (
+                    0 if before is None or after is None else before - after
+                ),
+                "clock_high_water_after": utc(after),
+                "clock_high_water_before": utc(before),
+                "replay_floor": utc(result.replay_floor or None),
+                "requests_resume_at": utc(result.requests_resume_at),
+                "retained_replay_records": result.retained_replay_records,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def cmd_worker_serve(args: argparse.Namespace) -> int:
     posture = getattr(args, "worker_posture", "production")
     if posture not in {"production", "snp-production", "gpu-production", "g4-prelaunch", "development", "migration"}:
@@ -1486,6 +1526,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         raise ValueError("customer SAT is available only on the CPU worker path")
     validator_authorizer = None
     fleet_endpoints = None
+    fleet_candidates = 0
     if access_enabled:
         if tls_context is None or channel_binding is None:
             raise ValueError("signed validator access requires worker TLS")
@@ -1527,12 +1568,17 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         )
         if fleet_manifest_path is None:
             fleet_endpoints = singleton_fleet(public_endpoint=public_endpoint)
+            fleet_candidates = len(fleet_endpoints)
         else:
-            fleet_endpoints = load_fleet_manifest(
+            # Loads now and refuses startup on a bad file, as before. After
+            # that, /v1/fleet reloads the file when it changes and keeps the
+            # last good manifest if a replacement is refused.
+            fleet_endpoints = FleetManifest(
                 fleet_manifest_path,
                 worker_hotkey=args.hotkey,
                 public_endpoint=public_endpoint,
             )
+            fleet_candidates = len(fleet_endpoints.endpoints())
     # The two production entrypoints select a fixed evidence class before this
     # point. The development command remains the only selectable surface.
     if gpu_composite and tee != "tdx":
@@ -1608,7 +1654,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
                     "public_legacy_audit": allow_public_legacy_audit,
                     "customer_sat": allow_customer_sat,
                     "signed_validator_access": validator_authorizer is not None,
-                    "fleet_candidates": 0 if fleet_endpoints is None else len(fleet_endpoints),
+                    "fleet_candidates": fleet_candidates,
                 }
             )
         )
@@ -4464,6 +4510,17 @@ def build_parser() -> argparse.ArgumentParser:
         allow_public_bootstrap_evidence=False,
         allow_public_legacy_audit=False,
     )
+
+    p_worker_reset_clock = worker_sub.add_parser(
+        "reset-replay-clock",
+        help="with the worker stopped, accept requests again after a backward clock step",
+    )
+    p_worker_reset_clock.add_argument(
+        "--validator-access-state",
+        required=True,
+        help="the worker's existing validator-access SQLite state",
+    )
+    p_worker_reset_clock.set_defaults(func=cmd_worker_reset_replay_clock)
 
     p_policy = sub.add_parser(
         "policy-registry",

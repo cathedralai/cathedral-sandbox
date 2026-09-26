@@ -32,8 +32,11 @@ Authorization code must name the claims it requires:
 
 The compatibility field `verification_status` remains available while callers
 migrate, but it is not an authorization policy and it cannot set any of the
-four claims. Attestation grants admission; validator-verified work determines
-credit. Neither statement claims universal application correctness.
+four claims. Admission still requires it to read `VERIFIED` in addition to the
+claims above. It defaults to `UNVERIFIED`, and `chain_verified` to false, so a
+verifier must declare its verdict rather than inherit one. Attestation grants
+admission; validator-verified work determines credit. Neither statement claims
+universal application correctness.
 
 New work lanes must document which evidence sets the `work` claim to `passed`,
 how the validator independently checks it, and which failure category is safe

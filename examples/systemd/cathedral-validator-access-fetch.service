@@ -1,0 +1,101 @@
+[Unit]
+Description=Fetch and install the Cathedral validator-access snapshot (worker)
+Documentation=https://github.com/cathedralai/cathedral-sandbox/blob/main/README.md
+Wants=network-online.target
+After=network-online.target
+# Install this on each worker. It holds no signing seed and reads no chain: it
+# pulls the control host's signed snapshot, verifies it against the pinned
+# public keys, and installs it only if it is not older than the live file.
+# Exit 1: this fetch failed, logged at error priority, and the live snapshot
+# still has time left; the next run retries, so it does not fail the unit.
+# Exit 3: the expiry alarm. The live snapshot's own expires_at is under the
+# threshold, even after this run, or it is missing, expired, bound elsewhere,
+# or does not verify. Only exit 3 fails the unit and starts OnFailure=.
+OnFailure=cathedral-validator-access-alert@%n.service
+
+[Service]
+Type=oneshot
+SuccessExitStatus=1
+# Why root: the launcher refuses a validator-access.json that is not a root:root
+# mode-0644 file in a root:root mode-0700 directory. A dedicated account could
+# produce that file only with CAP_CHOWN and CAP_DAC_OVERRIDE, which is root in
+# all but name. This unit keeps uid 0 so owner permission bits reach those
+# root-owned paths, and then contains it:
+# - no capabilities, so it cannot override a file's permissions or give a
+#   file away;
+# - ProtectSystem=strict, so the directory below is the only writable path;
+# - no AF_UNIX sockets and the D-Bus, systemd, and Docker sockets hidden, so it
+#   cannot ask a local daemon to act for uid 0.
+# It can still read root-owned files the sandbox leaves visible.
+User=root
+Group=root
+CapabilityBoundingSet=
+AmbientCapabilities=
+EnvironmentFile=/etc/cathedral/validator-access-fetch.env
+UMask=0077
+TimeoutStartSec=2min
+
+# Uid 0 runs this code, so every file it executes or reads must be root-owned
+# all the way up (docs/PRIVILEGED_PATHS.md). Adjust python3.12 to match the venv.
+ExecStartPre=/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py --resolve-symlinks \
+    /usr/bin/python3 \
+    /usr/local/libexec/cathedral-privileged-paths.py \
+    /opt/cathedral-validator-access/.venv/bin/python
+ExecStartPre=/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py \
+    /opt/cathedral-validator-access/.venv/pyvenv.cfg \
+    /opt/cathedral-validator-access/scripts/cathedral_validator_access.py \
+    /etc/cathedral/validator-access-fetch.env \
+    ${CATHEDRAL_VALIDATOR_ACCESS_KEYS}
+ExecStartPre=/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py --creatable-file \
+    ${CATHEDRAL_VALIDATOR_ACCESS_OUT}
+ExecStartPre=/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py --tree \
+    /opt/cathedral-validator-access/cathedral \
+    /opt/cathedral-validator-access/.venv/lib/python3.12/site-packages
+# The source is untrusted transport: fetch caps the read and installs nothing
+# that does not verify. A local-path source must be world-readable and outside
+# /home, because this service has no capabilities and cannot see /home.
+ExecStart=/opt/cathedral-validator-access/.venv/bin/python -I \
+    /opt/cathedral-validator-access/scripts/cathedral_validator_access.py fetch \
+    --source ${CATHEDRAL_VALIDATOR_ACCESS_SOURCE} \
+    --network ${CATHEDRAL_VALIDATOR_ACCESS_NETWORK} \
+    --netuid ${CATHEDRAL_VALIDATOR_ACCESS_NETUID} \
+    --minimum-stake-rao ${CATHEDRAL_VALIDATOR_ACCESS_MINIMUM_STAKE_RAO} \
+    --keys ${CATHEDRAL_VALIDATOR_ACCESS_KEYS} \
+    --keys-digest ${CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST} \
+    --out ${CATHEDRAL_VALIDATOR_ACCESS_OUT} \
+    --alarm-below-seconds ${CATHEDRAL_VALIDATOR_ACCESS_ALARM_BELOW_SECONDS}
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/cathedral/validator-access
+# Without capabilities uid 0 still reads root-owned files through owner bits,
+# and local daemons still trust it by peer uid. Hide what this service never
+# needs; the leading "-" skips a path this host does not have.
+InaccessiblePaths=-/var/lib/cathedral -/etc/shadow -/etc/gshadow -/etc/ssh
+InaccessiblePaths=-/run/dbus -/run/systemd/private -/var/run/docker.sock -/run/docker.sock
+# Journal output is unaffected: systemd connects stdout and stderr before the
+# program starts, and this setting limits only new sockets. Name lookups
+# skip nss-resolve, which needs AF_UNIX, and use the classic "dns" module
+# through /etc/resolv.conf, so /etc/nsswitch.conf must list dns after
+# resolve, as in "hosts: files resolve [!UNAVAIL=return] dns". If it does not,
+# use an IP-literal URL, a local-path source, or add AF_UNIX back here; the
+# daemon sockets above stay hidden either way.
+RestrictAddressFamilies=AF_INET AF_INET6
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

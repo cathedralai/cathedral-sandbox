@@ -1,7 +1,10 @@
 [Unit]
 Description=Cathedral SN39 AMD SEV-SNP miner
-After=network-online.target docker.service
-Wants=network-online.target docker.service
+After=network-online.target docker.service cathedral-validator-access-fetch.service
+Wants=network-online.target docker.service cathedral-validator-access-fetch.service
+# Install a fresh validator-access snapshot before the launcher checks it, so a
+# boot after expiry does not spend the restart budget below on a stale file.
+# Wants= does not block the miner if the fetch fails.
 ConditionPathExists=/dev/sev-guest
 ConditionPathExists=/etc/cathedral/sn39-snp-miner.env
 StartLimitIntervalSec=300

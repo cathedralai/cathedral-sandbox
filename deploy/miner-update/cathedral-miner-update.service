@@ -1,0 +1,49 @@
+[Unit]
+Description=Cathedral miner signed update check
+After=network-online.target docker.service
+Wants=network-online.target
+ConditionPathExists=/etc/cathedral/miner-update/config.json
+# Exits 11 (halted for an operator), 12 (alert: deferring too long, an
+# unhealthy miner, or a demoted updater) and 13 (updater fault) fail the unit
+# and page through the alert unit. Exit 10 (refused: a channel blip, a release
+# that failed before) is logged but is not a failure.
+OnFailure=cathedral-miner-update-alert@%n.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+# The frozen shim runs the current updater, and asks the previous one to judge
+# it when it fails. Exit statuses: 0 done, 10 refused, 11 halted, 12 alert,
+# 13 updater fault.
+ExecStart=/usr/local/lib/cathedral-miner-update/bin/cathedral-miner-update check
+SuccessExitStatus=10
+# Longer than the worst case in miner_update_cli.worst_case_seconds(), so
+# systemd never kills a check between two durable steps. A test holds this.
+TimeoutStartSec=7800s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+# Everything is read-only except the updater's install and state directories.
+# That keeps /etc/cathedral/validator-access/validator-access.json readable,
+# which the safe-restart gate needs: hiding it made every unattended check
+# defer (review finding F1). A test parses this file and checks every path the
+# updater reads and writes against it.
+ProtectSystem=strict
+StateDirectory=cathedral-miner-update
+StateDirectoryMode=0700
+ReadWritePaths=/usr/local/lib/cathedral-miner-update
+# The shim is the recovery path; no release may change it.
+ReadOnlyPaths=/usr/local/lib/cathedral-miner-update/bin
+# The miner's own durable state. The updater never reads it: rollback is
+# decided by the signed, image-labelled state schema.
+InaccessiblePaths=-/var/lib/cathedral/validator-access
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

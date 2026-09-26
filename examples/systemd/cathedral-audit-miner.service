@@ -1,0 +1,40 @@
+[Unit]
+Description=Cathedral Intel TDX audit miner (signed updates)
+After=network-online.target docker.service cathedral-validator-access-fetch.service
+Wants=network-online.target docker.service cathedral-validator-access-fetch.service
+# Install a fresh validator-access snapshot before the launcher checks it (#211).
+# Wants= does not block the miner if the fetch unit is absent or fails.
+ConditionPathIsDirectory=/sys/kernel/config/tsm/report
+ConditionPathExists=/etc/cathedral/audit-miner.env
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/cathedral/audit-miner.env
+# The launcher, image pin, network and netuid of the active signed release.
+# cathedral-miner-update installs them and switches them together. Until the
+# first release activates, this path does not exist and the unit waits.
+# See docs/MINER_AUTO_UPDATE.md.
+ExecStart=/usr/local/lib/cathedral-miner-update/miner/current/launcher
+EnvironmentFile=-/usr/local/lib/cathedral-miner-update/miner/current/release.env
+# Always: a clean exit (143 after a docker daemon restart) must not leave the
+# miner stopped. Only `systemctl stop` does.
+Restart=always
+RestartSec=15s
+SuccessExitStatus=129 130 143
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/cathedral/validator-access
+ReadWritePaths=/var/lib/cathedral/validator-access /run
+LockPersonality=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

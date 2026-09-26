@@ -1,0 +1,14 @@
+[Unit]
+Description=Page an operator: %i needs attention
+# cathedral-miner-update.service starts this through OnFailure= when a check
+# halts for an operator (11), alerts (12) or faults (13). %i is the failed
+# unit's name. Same pattern as cathedral-validator-access-alert@.service.
+
+[Service]
+Type=oneshot
+# You must supply the hook: a root-owned executable that takes the failed
+# unit's name and reaches a person, by pager, webhook or mail.
+# docs/MINER_AUTO_UPDATE.md shows a minimal one. Without it the page is only a
+# journal line.
+ExecStart=/usr/local/sbin/cathedral-miner-update-page %i
+TimeoutStartSec=1min

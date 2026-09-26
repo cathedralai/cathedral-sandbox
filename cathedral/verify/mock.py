@@ -139,6 +139,12 @@ def verify_mock(evidence: MockEvidence, nonce: bytes, policy: Policy) -> Atteste
         chip_id=evidence.chip_id,
         measurement=evidence.measurement,
         tcb=evidence.tcb,
+        # Declared, not inherited. The mock stands in for a verifier that
+        # accepted the evidence, and it returns None above unless the binding
+        # and policy checks pass. It checks no vendor certificate chain, so it
+        # does not claim one.
+        verification_status="VERIFIED",
+        chain_verified=False,
         assurance=attestation_claims(
             b"\0".join(
                 (

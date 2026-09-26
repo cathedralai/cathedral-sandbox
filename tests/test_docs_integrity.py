@@ -94,7 +94,7 @@ def test_current_guide_never_runs_user_writable_code_as_root() -> None:
     assert "sudo cathedral-access/" not in readme
     assert "sudo --preserve-env" in readme
     assert "/usr/local/libexec/cathedral/run-sn39-miner" in readme
-    assert "d56a82bb76eb2d976edfcd4574ff6ed19a41532ffa50d01a2411df51a002b615" in readme
+    assert "2ba50ed1342406759aa2b78d5e019caa347c4db1dfa5e8c66d2e8452498032b1" in readme
 
 
 def test_validator_access_signing_seed_stays_outside_the_checkout() -> None:
@@ -108,7 +108,7 @@ def test_validator_access_signing_seed_stays_outside_the_checkout() -> None:
     assert "*.seed" in gitignore
 
 
-def test_additional_machine_flow_reuses_the_signer_and_restarts_the_primary() -> None:
+def test_additional_machine_flow_reuses_the_signer_and_reloads_without_restart() -> None:
     readme = (REPO_ROOT / "README.md").read_text()
     section = " ".join(
         readme.split("## Add more machines to one UID", maxsplit=1)[1].split()
@@ -116,7 +116,9 @@ def test_additional_machine_flow_reuses_the_signer_and_restarts_the_primary() ->
 
     assert "Do not create a second signing key" in section
     assert "/etc/cathedral/validator-access/.fleet.json.new" in section
-    assert "The worker reads `fleet.json` only at startup" in section
+    assert "only at startup" not in section
+    assert "No restart is needed" in section
+    assert "keeps serving the last good list" in section
 
 
 def test_current_guide_proves_reachability_before_paid_registration() -> None:

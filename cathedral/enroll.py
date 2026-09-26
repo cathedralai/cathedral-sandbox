@@ -2948,7 +2948,17 @@ class RegistryStore:
         gpu_profile_valid_until: datetime | None = None,
         gpu_profile_registry_release: int | None = None,
         gpu_profile_registry_digest: str | None = None,
-    ) -> None:
+    ) -> str:
+        """Record a verdict and return the status actually stored.
+
+        Only a stored VERIFIED admits the worker. A verdict that does not
+        declare itself verified is stored with its own status, and a verified
+        one without typed claims, or whose chip_id is still bound to another
+        hotkey, is stored as FAILED, all without raising. Callers that commit
+        anything else on admission must check the returned status, not the
+        verdict they passed in.
+        """
+
         gpu_profile_values = (
             gpu_profile_valid_from,
             gpu_profile_valid_until,
@@ -3086,6 +3096,7 @@ class RegistryStore:
                         else expected_revision
                     ),
                 )
+        return status
 
     def chip_rotation_owner(self, chip_id: str, hotkey: str) -> str | None:
         """Return the other hotkey currently holding an effective VERIFIED

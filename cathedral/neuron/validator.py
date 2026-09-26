@@ -96,6 +96,10 @@ def epoch(
         attested = miner.serve_evidence(nonce, policy)
         if attested is None:
             continue  # invalid quote -> weight 0 -> no emission (DESIGN §8)
+        # Check the verdict before the chip_id dedup below, so an undeclared
+        # verdict cannot reserve a physical identity for its UID.
+        if attested.verification_status != "VERIFIED":
+            continue
         if not ATTESTATION_ADMISSION_POLICY.allows(attested.assurance):
             continue
 
@@ -159,6 +163,8 @@ def attested_epoch(
 
             attested = verifier(evidence, nonce, policy)
             if attested is None:
+                continue
+            if attested.verification_status != "VERIFIED":
                 continue
             if not ATTESTATION_ADMISSION_POLICY.allows(attested.assurance):
                 continue

@@ -91,12 +91,13 @@ def _snapshot_document(
     block_hash: str = "0x" + "a" * 64,
     generated_at: datetime = NOW,
     expires_at: datetime | None = None,
+    netuid: int = NETUID,
 ) -> dict[str, object]:
     expires_at = expires_at or generated_at + timedelta(minutes=10)
     return {
         "schema": VALIDATOR_ACCESS_SNAPSHOT_SCHEMA,
         "network": NETWORK,
-        "netuid": NETUID,
+        "netuid": netuid,
         "block": block,
         "block_hash": block_hash,
         "block_is_finalized": True,
@@ -124,6 +125,8 @@ def _signed_snapshot(**kwargs: object) -> bytes:
 def _snapshot(**kwargs: object):
     verify_at = kwargs.pop("verify_at", NOW)
     assert isinstance(verify_at, datetime)
+    expected_netuid = kwargs.pop("expected_netuid", NETUID)
+    assert isinstance(expected_netuid, int)
     signing_public = (
         ed25519.Ed25519PrivateKey.from_private_bytes(SNAPSHOT_SEED)
         .public_key()
@@ -133,7 +136,7 @@ def _snapshot(**kwargs: object):
         _signed_snapshot(**kwargs),
         {"cathedral-validator-access": signing_public},
         network=NETWORK,
-        netuid=NETUID,
+        netuid=expected_netuid,
         required_minimum_stake_rao=1_000,
         now=verify_at,
     )
@@ -185,12 +188,13 @@ def _header(
     nonce: bytes = b"n" * 32,
     validator_hotkey: str = VALIDATOR_HOTKEY,
     pair=VALIDATOR_PAIR,
+    netuid: int = NETUID,
 ) -> str:
     return build_validator_request_header(
         validator_hotkey=validator_hotkey,
         worker_hotkey=WORKER_HOTKEY,
         network=NETWORK,
-        netuid=NETUID,
+        netuid=netuid,
         method="POST",
         path=path,
         body=body,
@@ -238,6 +242,18 @@ def test_snapshot_rejects_unqualified_rows(change, match):
             required_minimum_stake_rao=1_000,
             now=NOW,
         )
+
+
+@pytest.mark.parametrize("boolean_netuid", [True, False])
+def test_snapshot_refuses_boolean_netuid_equal_to_expected_integer(boolean_netuid: bool):
+    expected_netuid = int(boolean_netuid)
+
+    with pytest.raises(ValidatorAccessError, match="snapshot netuid must be an integer"):
+        _snapshot(netuid=boolean_netuid, expected_netuid=expected_netuid)
+
+    snapshot = _snapshot(netuid=expected_netuid, expected_netuid=expected_netuid)
+    assert type(snapshot.netuid) is int
+    assert snapshot.netuid == expected_netuid
 
 
 def test_snapshot_stake_floor_comes_from_worker_configuration():
@@ -387,6 +403,40 @@ def test_unqualified_validator_signature_is_rejected(tmp_path: Path):
             validator_hotkey=OTHER_VALIDATOR_HOTKEY,
             pair=OTHER_VALIDATOR_PAIR,
         ),
+        method="POST",
+        path="/v1/fleet",
+        body=b"{}",
+        now=NOW,
+    )
+
+
+@pytest.mark.parametrize("boolean_netuid", [True, False])
+def test_signed_request_refuses_boolean_netuid_equal_to_worker_netuid(
+    tmp_path: Path, boolean_netuid: bool
+):
+    worker_netuid = int(boolean_netuid)
+    authorizer = ValidatorRequestAuthorizer(
+        _snapshot(netuid=worker_netuid, expected_netuid=worker_netuid),
+        worker_hotkey=WORKER_HOTKEY,
+        channel_binding=_binding(),
+        state=ValidatorAccessState(str(tmp_path / "validator-access.sqlite")),
+        signature_verifier=load_sr25519_verifier(),
+    )
+    assert authorizer.snapshot_provider.netuid == boolean_netuid
+    boolean_header = _header(netuid=boolean_netuid)
+
+    assert authorizer.preauthorize(boolean_header, method="POST", path="/v1/fleet", now=NOW) is None
+    assert not authorizer.authorize(
+        boolean_header,
+        method="POST",
+        path="/v1/fleet",
+        body=b"{}",
+        now=NOW,
+    )
+    # The refusal happens before replay state, so the same nonce with an
+    # integer netuid is the only change needed for the request to pass.
+    assert authorizer.authorize(
+        _header(netuid=worker_netuid),
         method="POST",
         path="/v1/fleet",
         body=b"{}",
