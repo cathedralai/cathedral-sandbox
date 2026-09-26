@@ -238,7 +238,9 @@ sudo mv \
 
 Refresh, verify, transfer, and atomically install the snapshot well before
 expiry. A failed chain read, signature, transfer, or verification must leave
-the last valid file in place.
+the last valid file in place. `scripts/cathedral_validator_access.py refresh`
+does the producer half on this host. Its `fetch` command does the install half
+on each VM without the seed. The repository README gives the timers for both.
 
 ## Signed-only worker target
 

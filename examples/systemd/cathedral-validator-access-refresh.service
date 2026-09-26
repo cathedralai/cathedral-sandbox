@@ -1,0 +1,86 @@
+[Unit]
+Description=Sign and publish a fresh Cathedral validator-access snapshot (control host)
+Documentation=https://github.com/cathedralai/cathedral-sandbox/blob/main/README.md
+Wants=network-online.target
+After=network-online.target
+# Install this on the miner's control host only. The snapshot signing seed
+# never leaves that host; workers pull the signed file with the fetch unit.
+# Exit 1: this refresh failed, logged at error priority, and the published
+# snapshot still has time left; the next run retries, so it does not fail the
+# unit. Exit 3: the expiry alarm; the published snapshot's own expires_at is
+# under the threshold, or it is missing, expired, bound elsewhere, or does not
+# verify. Only exit 3 fails the unit and starts OnFailure=.
+OnFailure=cathedral-validator-access-alert@%n.service
+
+[Service]
+Type=oneshot
+SuccessExitStatus=1
+# Why this account: it owns the seed, and the refresher refuses a seed owned by
+# anyone else. It needs no privilege: it writes only its own publish directory,
+# so it runs with no capabilities at all.
+User=cathedral-access
+Group=cathedral-access
+CapabilityBoundingSet=
+AmbientCapabilities=
+EnvironmentFile=/etc/cathedral/validator-access-refresh.env
+UMask=0077
+TimeoutStartSec=5min
+# The seed is in this process's memory; never write it into a core dump.
+LimitCORE=0
+# The chain client creates ~/.bittensor/wallets and ~/.bittensor/miners at
+# import unless READ_ONLY=1. ProtectSystem=strict makes the account's home under
+# /var/lib read-only, so that mkdir would fail. READ_ONLY=1 skips it, and a
+# private, empty runtime home that systemd removes afterwards catches any other
+# write. The refresher opens no wallet.
+RuntimeDirectory=cathedral-validator-access-refresh
+RuntimeDirectoryMode=0700
+Environment=HOME=/run/cathedral-validator-access-refresh READ_ONLY=1
+
+# The seed is only as safe as the code that reads it, so every file this
+# service executes must be root-owned all the way up (docs/PRIVILEGED_PATHS.md).
+# Adjust python3.12 to match the venv.
+ExecStartPre=/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py --resolve-symlinks \
+    /usr/bin/python3 \
+    /usr/local/libexec/cathedral-privileged-paths.py \
+    /opt/cathedral-validator-access/.venv/bin/python
+ExecStartPre=/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py \
+    /opt/cathedral-validator-access/.venv/pyvenv.cfg \
+    /opt/cathedral-validator-access/scripts/cathedral_validator_access.py \
+    /etc/cathedral/validator-access-refresh.env
+ExecStartPre=/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py --tree \
+    /opt/cathedral-validator-access/cathedral \
+    /opt/cathedral-validator-access/.venv/lib/python3.12/site-packages
+ExecStart=/opt/cathedral-validator-access/.venv/bin/python -I \
+    /opt/cathedral-validator-access/scripts/cathedral_validator_access.py refresh \
+    --network ${CATHEDRAL_VALIDATOR_ACCESS_NETWORK} \
+    --netuid ${CATHEDRAL_VALIDATOR_ACCESS_NETUID} \
+    --minimum-stake-rao ${CATHEDRAL_VALIDATOR_ACCESS_MINIMUM_STAKE_RAO} \
+    --signing-key-id ${CATHEDRAL_VALIDATOR_ACCESS_SIGNING_KEY_ID} \
+    --signing-key-file ${CATHEDRAL_VALIDATOR_ACCESS_SIGNING_KEY_FILE} \
+    --keys ${CATHEDRAL_VALIDATOR_ACCESS_KEYS} \
+    --keys-digest ${CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST} \
+    --out ${CATHEDRAL_VALIDATOR_ACCESS_OUT} \
+    --valid-seconds ${CATHEDRAL_VALIDATOR_ACCESS_VALID_SECONDS} \
+    --alarm-below-seconds ${CATHEDRAL_VALIDATOR_ACCESS_ALARM_BELOW_SECONDS}
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/cathedral-validator-access/publish
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

@@ -1,0 +1,17 @@
+[Unit]
+Description=Fetch the Cathedral validator-access snapshot every two minutes
+
+[Timer]
+# Two alarm checks are at most about 170 seconds apart: the 120-second interval,
+# a 15-second random delay, 5 seconds of timer accuracy, and a 30-second fetch
+# timeout. With a 900-second snapshot and the default 300-second threshold, the
+# first alarm therefore leaves at least about 130 seconds before expiry. Raise
+# CATHEDRAL_VALIDATOR_ACCESS_ALARM_BELOW_SECONDS for more lead time.
+OnBootSec=30s
+OnUnitActiveSec=2min
+AccuracySec=5s
+RandomizedDelaySec=15s
+Unit=cathedral-validator-access-fetch.service
+
+[Install]
+WantedBy=timers.target

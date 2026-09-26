@@ -1,0 +1,13 @@
+[Unit]
+Description=Page an operator: %i raised the validator-access expiry alarm
+Documentation=https://github.com/cathedralai/cathedral-sandbox/blob/main/README.md
+# The refresh and fetch units start this through OnFailure= only on exit 3, the
+# expiry alarm. %i is the failed unit's name.
+
+[Service]
+Type=oneshot
+# You must supply the hook: a root-owned executable that takes the failed
+# unit's name and reaches a person, by pager, webhook, or mail. The README shows
+# a minimal one. Without it the alarm is only a journal line.
+ExecStart=/usr/local/sbin/cathedral-validator-access-page %i
+TimeoutStartSec=1min
