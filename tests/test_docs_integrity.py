@@ -108,7 +108,7 @@ def test_validator_access_signing_seed_stays_outside_the_checkout() -> None:
     assert "*.seed" in gitignore
 
 
-def test_additional_machine_flow_reuses_the_signer_and_restarts_the_primary() -> None:
+def test_additional_machine_flow_reuses_the_signer_and_reloads_without_restart() -> None:
     readme = (REPO_ROOT / "README.md").read_text()
     section = " ".join(
         readme.split("## Add more machines to one UID", maxsplit=1)[1].split()
@@ -116,7 +116,9 @@ def test_additional_machine_flow_reuses_the_signer_and_restarts_the_primary() ->
 
     assert "Do not create a second signing key" in section
     assert "/etc/cathedral/validator-access/.fleet.json.new" in section
-    assert "The worker reads `fleet.json` only at startup" in section
+    assert "only at startup" not in section
+    assert "No restart is needed" in section
+    assert "keeps serving the last good list" in section
 
 
 def test_current_guide_proves_reachability_before_paid_registration() -> None:

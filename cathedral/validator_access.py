@@ -29,9 +29,10 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1467,6 +1468,122 @@ def load_fleet_manifest(
         worker_hotkey=worker_hotkey,
         public_endpoint=public_endpoint,
     )
+
+
+def _log_to_stderr(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+class FleetManifest:
+    """Serve the last good fleet manifest and reload it when the file changes.
+
+    Construction runs ``load_fleet_manifest`` once and raises exactly as it
+    does, so a bad file still refuses worker startup. After that, each call to
+    ``endpoints`` pays one ``lstat``. The loader runs again, with all of its
+    refusals, only when the file identity (device, inode, size, mtime or ctime)
+    changes. A chmod or chown changes ctime, so those are re-checked too.
+
+    A refused replacement or a missing file keeps the last good manifest. The
+    new identity is remembered, so the refusal is logged once per change and
+    the same bad file is not read again on every request.
+
+    Readers never wait. At most one thread reloads; the others return the
+    current tuple. A reload builds the complete immutable tuple first and then
+    publishes it with one attribute store, so a reader holds either the whole
+    old manifest or the whole new one.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        worker_hotkey: str,
+        public_endpoint: str,
+        expected_uid: int | None = None,
+        log: Callable[[str], None] | None = None,
+    ) -> None:
+        self.path = path
+        self.worker_hotkey = worker_hotkey
+        self._public_endpoint = public_endpoint
+        self._expected_uid = expected_uid
+        self._log = _log_to_stderr if log is None else log
+        self._reload_lock = threading.Lock()
+        # Observe before loading. If the file changes during the load, the
+        # recorded identity is the older one and the next call loads again.
+        observed: object = self._identity(os.lstat(path))
+        self._endpoints = self._load()
+        self._observed = observed
+        self._serving_last_good = False
+
+    @staticmethod
+    def _identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    def _load(self) -> tuple[str, ...]:
+        return load_fleet_manifest(
+            self.path,
+            worker_hotkey=self.worker_hotkey,
+            public_endpoint=self._public_endpoint,
+            expected_uid=self._expected_uid,
+        )
+
+    def endpoints(self) -> tuple[str, ...]:
+        if self._reload_lock.acquire(blocking=False):
+            try:
+                self._reload_if_changed()
+            finally:
+                self._reload_lock.release()
+        return self._endpoints
+
+    def _reload_if_changed(self) -> None:
+        try:
+            observed: object = self._identity(os.lstat(self.path))
+        except OSError as exc:
+            # Keep the last good manifest. A missing configured file refuses
+            # startup; it never means an empty or a singleton fleet.
+            observed = ("unreadable", exc.errno)
+            if observed != self._observed:
+                self._observed = observed
+                self._serving_last_good = True
+                self._log(
+                    f"WARNING: fleet manifest {self.path} is missing or unreadable "
+                    f"({exc.strerror}); still serving the last good manifest "
+                    f"({len(self._endpoints)} candidates)"
+                )
+            return
+        if observed == self._observed:
+            return
+        self._observed = observed
+        try:
+            candidate = self._load()
+        except Exception as exc:  # noqa: BLE001 - any failure refuses only the new file
+            # The loader raises ValidatorAccessError or OSError, and json can
+            # raise RecursionError on deeply nested input. None of them may
+            # fail the request or replace the last good manifest.
+            self._serving_last_good = True
+            self._log(
+                f"WARNING: fleet manifest {self.path} was refused "
+                f"({type(exc).__name__}: {exc}); still serving the last good "
+                f"manifest ({len(self._endpoints)} candidates)"
+            )
+            return
+        recovered = self._serving_last_good
+        self._serving_last_good = False
+        if candidate == self._endpoints:
+            if recovered:
+                self._log(
+                    f"fleet manifest {self.path} is accepted again, content "
+                    f"unchanged ({len(candidate)} candidates)"
+                )
+            return
+        self._endpoints = candidate
+        self._log(f"fleet manifest {self.path} loaded ({len(candidate)} candidates)")
 
 
 def fleet_response(worker_hotkey: str, endpoints: Sequence[str]) -> dict[str, object]:
