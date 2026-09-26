@@ -401,6 +401,39 @@ def test_a_lost_or_corrupt_trust_set_alerts_at_once(h):
     assert h.check().exit_status == EXIT_ALERT
 
 
+def test_a_trust_write_interrupted_between_its_two_files_is_finished_forward(h, monkeypatch):
+    """Trust re-review P3: the backup is written first, so a crash leaves it
+    ahead, never behind, and the next check completes the write."""
+
+    from cathedral import miner_updater
+    from cathedral.miner_release import rotate_trust
+    from cathedral.miner_updater import load_trust_state, trust_backup_path, write_trust_state
+    from tests.miner_update_support import DEFAULT_TRUST, trust_root_bytes
+
+    uid = os.getuid()
+    old = load_trust_state(h.paths.trust_file, expected_uid=uid)
+    retired = {"canary-1": DEFAULT_TRUST["canary-1"], "stable-2": (OTHER_KEY, ["stable"])}
+    new = rotate_trust(old, trust_root_bytes(retired), signing_key_id="stable-2", channel="stable")
+    real = miner_updater._atomic_write
+
+    def crash_on_the_live_file(path, body, *, mode):
+        if path == h.paths.trust_file:
+            raise KeyboardInterrupt("power lost")
+        real(path, body, mode=mode)
+
+    monkeypatch.setattr(miner_updater, "_atomic_write", crash_on_the_live_file)
+    with pytest.raises(KeyboardInterrupt):
+        write_trust_state(h.paths.trust_file, new)
+    monkeypatch.setattr(miner_updater, "_atomic_write", real)
+    assert load_trust_state(trust_backup_path(h.paths.trust_file), expected_uid=uid).generation == 2
+    assert load_trust_state(h.paths.trust_file, expected_uid=uid).generation == 1
+    h.release(sequence=5, key=OTHER_KEY, key_id="stable-2", bundle={"trust": retired})
+    h.check()
+    assert load_trust_state(h.paths.trust_file, expected_uid=uid).generation == 2
+    assert load_trust_state(trust_backup_path(h.paths.trust_file), expected_uid=uid).generation == 2
+    assert h.state()["trust_generation"] == 2
+
+
 def test_every_check_keeps_a_current_backup_of_the_trust_set(h):
     from cathedral.miner_updater import load_trust_state, trust_backup_path
 

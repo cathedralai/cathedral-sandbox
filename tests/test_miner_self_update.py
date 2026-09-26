@@ -285,6 +285,8 @@ def test_a_pinned_host_still_takes_trust_rotations(h):
     h.release(sequence=7, image=h.image("3"), bundle={"trust": ROTATED, **V2})
     assert h.check().action == "held"
     assert "stable-2" in load_trust_state(h.paths.trust_file, expected_uid=os.getuid()).keys
+    # The generation a later repair may not go below is recorded at once.
+    assert h.state()["trust_generation"] == 2
     assert h.updater_current() == h.tree_a
 
 
@@ -296,14 +298,14 @@ def test_a_fetch_regression_in_a_new_updater_is_caught_and_recovered(h):
 
     bad = _tree_of(h.release(sequence=5, bundle={"launcher_suffix": b"# v2 with a fetch regression\n"}))
     host_for, handoff = _broken_fetch_for(h, bad)
-    first = update_once(host_for(h.tree_a, handoff=handoff))
-    assert first.action == "refused" and "strike 1" in first.reason
-    assert h.updater_current() == h.tree_a
-    second = update_once(host_for(h.tree_a, handoff=handoff))
-    assert "no longer uses that updater" in second.reason
-    assert bad in h.state()["failed_updaters"]
-    third = update_once(host_for(h.tree_a, handoff=handoff))
-    assert third.action == "refused" and "already failed" in third.reason
+    for _ in range(STRIKES_TO_DEMOTE + 1):
+        refused = update_once(host_for(h.tree_a, handoff=handoff))
+        assert refused.action == "refused" and "did not prove a verified check" in refused.reason
+        assert h.updater_current() == h.tree_a
+    # It is never kept. It is not retired either: a fetch that fails looks the
+    # same as an outage, so it cannot blame a tree (trust re-review P2).
+    assert "no strike" in refused.reason
+    assert bad not in h.state()["failed_updaters"] and not h.state()["updater_strikes"]
     # The signer publishes a fixed updater. The host takes it without hands.
     fixed = _tree_of(h.release(sequence=6, bundle={"launcher_suffix": b"# v3 fixes the fetch\n"}))
     outcome = update_once(host_for(h.tree_a, handoff=handoff))
@@ -326,6 +328,8 @@ def test_a_regression_that_appears_later_is_recovered_by_the_fallback(h):
     assert judged.action == "demoted" and judged.exit_status == EXIT_ALERT
     assert h.updater_current() == h.tree_a
     assert link_target(h.paths.updater_previous) is None
+    # Only its fetch failed, so the tree is switched away from but not retired.
+    assert good not in h.state()["failed_updaters"] and "not retired" in judged.reason
     fixed = _tree_of(h.release(sequence=6, bundle=V3))
     assert update_once(h.host()).action == "activated"
     assert h.updater_current() == fixed
@@ -413,6 +417,68 @@ def test_a_channel_that_shows_each_updater_other_bytes_demotes_nothing(h):
         assert "cannot verify what the current updater saw" in judged.reason
     assert h.updater_current() == current
     assert not h.state()["updater_strikes"] and not h.state()["failed_updaters"]
+
+
+def test_a_channel_that_resets_only_the_current_updaters_fetch_retires_nothing(h):
+    """Trust re-review P2, the reviewer's reset-first-request PoC. Fetch
+    failures may switch updaters, but never retire or blame the good tree, and
+    the previous updater installs it again once the channel lets it through."""
+
+    good_record = h.release(sequence=5, bundle=V2)
+    assert h.check().action == "activated"
+    good = h.updater_current()
+    for _ in range(STRIKES_TO_DEMOTE):
+        h.now += 3600
+        host = h.host(running_tree=good)
+
+        def reset():
+            raise MinerUpdateError("the download failed: connection reset")
+
+        host.fetch_metadata = reset
+        refused = update_once(host)
+        h.metadata = good_record
+        judged = fallback_to_previous(h.host(running_tree=h.tree_a), refused.exit_status)
+    assert judged.action == "demoted" and "not retired" in judged.reason
+    assert h.updater_current() == h.tree_a
+    assert good not in h.state()["failed_updaters"] and not h.state()["updater_strikes"]
+    assert h.state()["failed"] is None
+    h.now += 3600
+    outcome = h.check()
+    assert "took over" in outcome.reason, outcome.reason
+    assert h.updater_current() == good
+
+
+def test_the_saved_record_must_be_the_bytes_the_current_updater_fetched(h):
+    """Kills the surviving mutant that skipped the saved record's hash."""
+
+    good_record = h.release(sequence=5, bundle=V2)
+    assert h.check().action == "activated"
+    current = h.updater_current()
+    h.now += 3600
+    h.metadata = b"not json"
+    refused = update_once(h.host(running_tree=current))
+    h.paths.fetched_record.write_bytes(good_record)  # changed after it was fetched
+    judged = fallback_to_previous(h.host(running_tree=h.tree_a), refused.exit_status)
+    assert "changed since" in judged.reason
+    assert not h.state()["updater_strikes"]
+
+
+def test_a_stalled_update_is_judged_only_for_the_tree_the_record_names(h):
+    """Kills the surviving mutant that skipped binding the record's tree to the
+    tree the current updater said it could not install."""
+
+    good = _tree_of(h.release(sequence=5, bundle=V2))
+    h.commit()
+    _tree_of(h.release(sequence=6, bundle=V3))
+    h.now += 3600
+    refused = update_once(h.host(running_tree=good, handoff=lambda release_dir, fd: (1, None)))
+    assert refused.updater_blame == "ambiguous"
+    state = h.state()
+    state["last_check"]["updater_offered"] = "e" * 64  # a tree the record does not name
+    write_state(h.paths.state_file, state)
+    judged = fallback_to_previous(h.host(running_tree=h.tree_a), refused.exit_status)
+    assert "names another updater" in judged.reason
+    assert good not in h.state()["updater_strikes"]
 
 
 def test_the_fallback_passes_the_current_status_through_when_it_cannot_run(h):
@@ -639,8 +705,9 @@ def test_the_real_handoff_passes_the_lock_and_an_unverified_first_run_is_not_kep
     assert "already running" not in seen["document"]["reason"]
     assert seen["document"]["verified"] is False
     # The child could not reach the channel (a closed local port) while this
-    # updater could, so the new tree is not kept and gets a strike.
-    assert outcome.action == "refused" and "strike 1" in outcome.reason
+    # updater could. The new tree is not kept, and since a failed fetch looks
+    # like an outage, it gets no strike.
+    assert outcome.action == "refused" and "no strike" in outcome.reason
     assert h.updater_current() == h.tree_a
 
 

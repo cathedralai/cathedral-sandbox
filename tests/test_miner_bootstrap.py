@@ -241,6 +241,46 @@ def test_a_corrupt_trust_set_is_repaired_only_forward_from_its_backup(source, tm
     assert "stable-1" not in load_trust_state(paths.trust_file, expected_uid=os.getuid()).keys
 
 
+def test_a_repair_refuses_a_backup_older_than_the_generation_the_host_used(source, tmp_path):
+    """Trust re-review P3: a stale backup must never move trust backward."""
+
+    from cathedral.miner_release import initial_trust_state
+    from cathedral.miner_updater import empty_state, trust_backup_path, write_state
+
+    root = tmp_path / "root"
+    _compromise_and_rebootstrap(source, root)  # the host is at generation 2
+    paths = HostPaths(root=root)
+    state = empty_state()
+    state["trust_generation"] = 2
+    write_state(paths.state_file, state)
+    # A backup from before the revocation, and a corrupt trust.json.
+    stale = initial_trust_state(trust_root_bytes())
+    from cathedral.miner_updater import _atomic_write
+    from cathedral.miner_release import canonical_json
+
+    _atomic_write(trust_backup_path(paths.trust_file), canonical_json(stale.as_document()) + b"\n", mode=0o600)
+    paths.trust_file.write_text("corrupt")
+    with pytest.raises(BootstrapError, match="older than generation 2"):
+        _install(source, root, repair_trust_set=True)
+
+
+def test_a_bootstrap_starts_from_a_backup_left_ahead_by_a_crash(source, tmp_path):
+    from cathedral.miner_release import rotate_trust
+    from cathedral.miner_updater import _atomic_write, load_trust_state, trust_backup_path
+    from cathedral.miner_release import canonical_json
+
+    root = tmp_path / "root"
+    _install(source, root)
+    paths = HostPaths(root=root)
+    uid = os.getuid()
+    replaced = {"canary-1": DEFAULT_TRUST["canary-1"], "stable-2": (OTHER_KEY, ["stable"])}
+    ahead = rotate_trust(load_trust_state(paths.trust_file, expected_uid=uid), trust_root_bytes(replaced))
+    _atomic_write(trust_backup_path(paths.trust_file), canonical_json(ahead.as_document()) + b"\n", mode=0o600)
+    # The operator bootstraps again from the old root: the backup's revocation holds.
+    with pytest.raises(BootstrapError, match="revoked key"):
+        _install(source, root)
+
+
 def test_a_deleted_trust_set_does_not_start_over_while_a_backup_exists(source, tmp_path):
     root = tmp_path / "root"
     _compromise_and_rebootstrap(source, root)

@@ -162,6 +162,10 @@ FALLBACK_RECORD_MAX_AGE_SECONDS = 600
 trust its ``verified`` flag. The shim runs the fallback as soon as the current
 updater exits, so the entry for that run is seconds old."""
 
+FALLBACK_RECORD_SKEW_SECONDS = 60
+"""How far ahead of this process's clock such an entry may be: another process
+stamped it, and a clock step or a second boundary must not make it stale."""
+
 STAGE_PREPARED = "prepared"
 STAGE_MAY_HAVE_RUN = "may_have_run"
 STAGE_PROBATION = "probation"
@@ -831,11 +835,15 @@ def trust_backup_path(path: Path) -> Path:
 
 
 def write_trust_state(path: Path, state: TrustState) -> None:
-    """Write the trust set, then its verified backup, each atomically."""
+    """Write the verified backup, then the trust set, each atomically.
+
+    Backup first: a crash between the two leaves the backup one step ahead,
+    never behind, so a repair from it can only move forward.
+    """
 
     body = canonical_json(state.as_document()) + b"\n"
-    _atomic_write(path, body, mode=0o600)
     _atomic_write(trust_backup_path(path), body, mode=0o600)
+    _atomic_write(path, body, mode=0o600)
 
 
 def _trust(host: MinerUpdaterHost) -> TrustState:
@@ -849,13 +857,21 @@ def _trust(host: MinerUpdaterHost) -> TrustState:
             f"{exc}. Nothing can be verified until it is repaired: run the bootstrap again "
             "with --repair-trust-set (docs/MINER_AUTO_UPDATE.md, \"Repairing the trust set\")"
         ) from exc
-    # Keep the backup current, so a repair never starts from an older set.
+    # Keep the backup current, so a repair never starts from an older set. A
+    # backup one generation ahead is a write that a crash interrupted: finish it.
     backup = trust_backup_path(path)
     try:
-        good = load_trust_state(backup, expected_uid=host.expected_uid).as_document() == trust.as_document()
+        spare: TrustState | None = load_trust_state(backup, expected_uid=host.expected_uid)
     except MinerUpdateError:
-        good = False
-    if not good:
+        spare = None
+    if (
+        spare is not None
+        and spare.generation > trust.generation
+        and set(spare.revoked) >= set(trust.revoked)
+    ):
+        write_trust_state(path, spare)
+        return spare
+    if spare is None or spare.as_document() != trust.as_document():
         with contextlib.suppress(MinerUpdateError):
             _atomic_write(backup, canonical_json(trust.as_document()) + b"\n", mode=0o600)
     return trust
@@ -951,16 +967,45 @@ def _retire_updater(host: MinerUpdaterHost, state: dict[str, object], tree: str,
     strikes.pop(tree, None)
 
 
-def _strike(host: MinerUpdaterHost, state: dict[str, object], tree: str, reason: str) -> int:
-    """Count one failure of an updater tree that the other updater did not share."""
+def _strike(
+    host: MinerUpdaterHost, state: dict[str, object], tree: str, reason: str, *, retire: bool = True
+) -> int:
+    """Count one failure of an updater tree that the other updater did not share.
+
+    With ``retire=False`` the count still moves, but reaching the limit does
+    not retire the tree: the caller switches updaters without blaming it.
+    """
 
     strikes = state.setdefault("updater_strikes", {})
     assert isinstance(strikes, dict)
     count = int(strikes.get(tree, 0)) + 1
     strikes[tree] = count
-    if count >= STRIKES_TO_DEMOTE:
+    if count >= STRIKES_TO_DEMOTE and retire:
         _retire_updater(host, state, tree, reason)
     return count
+
+
+def _recent(host: MinerUpdaterHost, at: object) -> bool:
+    """Whether a timestamp another updater wrote belongs to this run."""
+
+    return (
+        isinstance(at, int)
+        and not isinstance(at, bool)
+        and -FALLBACK_RECORD_SKEW_SECONDS <= host.now_unix() - at <= FALLBACK_RECORD_MAX_AGE_SECONDS
+    )
+
+
+def _fetch_failed_this_run(host: MinerUpdaterHost, state: Mapping[str, object]) -> bool:
+    """Whether the last fetch, on this run, failed before any bytes arrived.
+
+    An outage and a channel that resets one updater's connection look the same
+    from here, so such a failure never retires a tree (trust re-review P2).
+    """
+
+    last = state.get("last_fetch")
+    if not isinstance(last, dict) or "error" not in last or "sha256" in last:
+        return False
+    return _recent(host, last.get("at"))
 
 
 # --- the check ------------------------------------------------------------------------
@@ -1217,11 +1262,7 @@ def _judge(host: MinerUpdaterHost, state: Mapping[str, object]) -> tuple[MinerRe
 
     last = state.get("last_fetch")
     at = last.get("at") if isinstance(last, dict) else None
-    fresh = (
-        isinstance(at, int)
-        and not isinstance(at, bool)
-        and 0 <= host.now_unix() - at <= FALLBACK_RECORD_MAX_AGE_SECONDS
-    )
+    fresh = _recent(host, at)
     if fresh and isinstance(last, dict) and isinstance(last.get("sha256"), str):
         try:
             with host.paths.fetched_record.open("rb") as handle:
@@ -1267,6 +1308,11 @@ def _rotate_trust(
     """Take the trust set the release's bundle carries, if it moves forward."""
 
     trust = _trust(host)
+    # The highest generation this host has used. A repair refuses a backup
+    # older than this, so a lost trust.json can never move trust backward.
+    seen = state.get("trust_generation")
+    if not isinstance(seen, int) or isinstance(seen, bool) or trust.generation > seen:
+        state["trust_generation"] = trust.generation
     try:
         proposed = (bundle_dir / TREE_TRUST_ROOT).read_bytes()
         rotated = rotate_trust(
@@ -1281,6 +1327,8 @@ def _rotate_trust(
         raise MinerUpdateError(f"the release's trust root was refused: {exc}") from exc
     if rotated is not trust:
         write_trust_state(host.paths.trust_file, rotated)
+        state["trust_generation"] = rotated.generation
+    write_state(host.paths.state_file, state)
 
 
 def _check_locked(host: MinerUpdaterHost, state: dict[str, object]) -> UpdateOutcome:
@@ -1491,7 +1539,13 @@ def _self_update(
         remove_link(paths.updater_previous)
     fresh = read_state(paths.state_file)
     note = ""
-    if reported.get("action") != "paused":
+    if reported.get("action") == "paused":
+        pass
+    elif _fetch_failed_this_run(host, fresh):
+        # The new updater got no bytes to verify. Not keeping it already
+        # protects the host; blaming it could retire a good tree for an outage.
+        note = "; the new updater could not fetch the channel, which an outage also explains, so no strike"
+    else:
         try:
             # Judge what the new updater itself fetched on its first run.
             _judge(host, fresh)
@@ -1572,11 +1626,7 @@ def fallback_to_previous(host: MinerUpdaterHost, current_status: int) -> UpdateO
         # older entry (say the current updater crashed before recording) says
         # nothing about this run.
         at = last.get("at") if isinstance(last, dict) else None
-        fresh = (
-            isinstance(at, int)
-            and not isinstance(at, bool)
-            and 0 <= host.now_unix() - at <= FALLBACK_RECORD_MAX_AGE_SECONDS
-        )
+        fresh = _recent(host, at)
         stalled: str | None = None
         if (
             current_status == EXIT_REFUSED
@@ -1609,6 +1659,10 @@ def fallback_to_previous(host: MinerUpdaterHost, current_status: int) -> UpdateO
             "current_tree": current_tree,
             "current_status": current_status,
         }
+        # Only a fetch failure stands against the current updater: it never
+        # had bytes to verify. That may switch updaters, so a fetch that broke
+        # after adoption cannot strand the host, but never retires the tree.
+        fetch_only = current_status == EXIT_REFUSED and stalled is None and _fetch_failed_this_run(host, state)
         try:
             release, raw = _judge(host, state)
             if stalled is not None:
@@ -1639,14 +1693,19 @@ def fallback_to_previous(host: MinerUpdaterHost, current_status: int) -> UpdateO
                     recorded=True,
                 ),
             )
-        failure = (
-            f"it could not install updater {stalled[:12]}, which this updater's probe accepts"
-            if stalled is not None
-            else f"exit status {current_status} while the previous updater verified the channel"
-        )
+        if stalled is not None:
+            failure = f"it could not install updater {stalled[:12]}, which this updater's probe accepts"
+        elif fetch_only:
+            failure = "its fetch failed while this updater fetched and verified the channel"
+        else:
+            failure = f"exit status {current_status} while the previous updater verified the channel"
         if stalled is not None:
             _forgive(state, stalled)
-        count = _strike(host, state, current_tree, failure) if current_tree else STRIKES_TO_DEMOTE
+        count = (
+            _strike(host, state, current_tree, failure, retire=not fetch_only)
+            if current_tree
+            else STRIKES_TO_DEMOTE
+        )
         if count < STRIKES_TO_DEMOTE:
             state["last_fallback"] = dict(entry, result=f"strike {count} of {STRIKES_TO_DEMOTE}", reason=failure)
             write_state(paths.state_file, state)
@@ -1663,13 +1722,21 @@ def fallback_to_previous(host: MinerUpdaterHost, current_status: int) -> UpdateO
             )
         atomic_symlink(paths.updater_current, f"releases/{host.running_tree}")
         remove_link(paths.updater_previous)
-        state["last_fallback"] = dict(entry, result="switched back to the previous updater", reason=failure)
+        kept = ""
+        if fetch_only and current_tree:
+            # Not retired and not remembered as failed: this updater installs
+            # it again as soon as the channel lets it through.
+            strikes = state["updater_strikes"]
+            assert isinstance(strikes, dict)
+            strikes.pop(current_tree, None)
+            kept = "; it is not retired, since only its fetch failed, and is installed again once the channel allows"
+        state["last_fallback"] = dict(entry, result=f"switched back to the previous updater{kept}", reason=failure)
         write_state(paths.state_file, state)
         host.verified = True
         return UpdateOutcome(
             "demoted",
             f"updater {str(current_tree)[:12]} failed {STRIKES_TO_DEMOTE} checks ({failure}); "
-            f"switched back to updater {host.running_tree[:12]}",
+            f"switched back to updater {host.running_tree[:12]}{kept}",
             EXIT_ALERT,
             alert=True,
         )

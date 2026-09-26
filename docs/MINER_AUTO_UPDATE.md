@@ -45,9 +45,9 @@ the bytes the current updater fetched, so serving each updater different
 bytes demotes nothing. What remains: an attacker that breaks the current
 updater's connections outright, while letting the previous updater's through,
 on two checks in a row, can move the host back to the previous updater. That
-updater is still bound by the host trust set and floors. The host stays there
-until a release with another updater arrives, or an operator runs
-`resolve --retry`.
+updater is still bound by the host trust set and floors. The good tree is not
+retired or remembered as failed, since only its fetch failed, so the previous
+updater installs it again on the first check the channel lets through.
 
 ## What a release carries
 
@@ -321,14 +321,19 @@ bad updater from stranding a host:
    with anything it started, after a timeout well inside the unit's. It stays
    current only if it fetched and verified the channel and did not fault.
    Otherwise the old updater is put back. It records a strike against the new
-   tree only if it can verify the channel itself right then.
+   tree only if it can verify what the new tree fetched. A new tree whose fetch
+   failed outright gets no strike: not keeping it already protects the host.
 3. **Fallback.** On a later run, if the current updater exits with anything
    but 0, 11 or 12, the frozen shim asks the previous updater to judge. A
    refusal stands if the current updater recorded, for that same run and exit
    status, that it verified the channel. Otherwise the previous updater
-   fetches and verifies the channel itself, changing nothing. If it can, that
-   is a strike against the current tree; if it cannot, the channel is at
-   fault and nothing changes.
+   verifies the bytes the current updater fetched on that run, changing
+   nothing. If it can, that is a strike against the current tree; if it
+   cannot, the channel is at fault and nothing changes. When the current
+   updater's fetch failed outright, so it had no bytes to judge, the previous
+   updater fetches for itself: two such strikes switch back, so a fetch that
+   broke after adoption cannot strand the host, but they never retire the tree,
+   since an outage looks the same.
 
 A tree with two strikes is not used again on that host until a release with
 another updater arrives. One induced or transient failure demotes nothing.
@@ -372,17 +377,21 @@ the updater. Changing any of them needs a new bootstrap.
 | A release restarts once during probation | Restarts probation | 0 | Nothing |
 | A new updater fails its probe or its first run | Keeps the old updater; a strike when the old one can verify | 10 | Nothing; two strikes retire the tree |
 | The current updater crashes or cannot verify, and the previous one can verify what it saw | A strike; at two the previous updater becomes current again | 13 or 10, then 12 | Tell the signer |
+| The current updater's fetch fails outright, twice, while the previous one can fetch and verify | Switches back to the previous updater, without retiring the current tree; it is installed again once the channel allows | 10, then 12 | Check the network |
 | The current updater verifies but cannot install a newer updater that the previous one's probe accepts | A strike; at two the previous updater becomes current and installs it | 10, then 12 | Tell the signer |
 | The updater's own logic raises | A documented fault, never a bare traceback | 13 | Tell the signer |
 
 ## Repairing the trust set
 
-Every change to `trust.json` also writes `trust.json.backup`, and every check
-refreshes the backup when it differs. If `trust.json` becomes unreadable,
+Every change to `trust.json` writes `trust.json.backup` first, then
+`trust.json`, so a crash between the two leaves the backup ahead, never behind;
+the next check finishes the write. Every check refreshes the backup when it
+differs, and records the trust generation in its state. If `trust.json` becomes unreadable,
 checks page and verify nothing, and a new bootstrap refuses. Run the
 bootstrap again with `--repair-trust-set`. It moves forward from the backup
 to the pinned root: every revocation is kept, and a root that lists a revoked
-key is refused, as always. A host with a trust set or a backup never starts
+key is refused, as always. It refuses a backup older than the generation the
+host last used. A host with a trust set or a backup never starts
 over on its own. If neither can be read, deleting both is the only way out,
 and it forgets every revocation: bootstrap then only from a root that drops
 every key you revoked.

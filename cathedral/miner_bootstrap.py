@@ -68,6 +68,7 @@ from cathedral.miner_updater import (
     _atomic_write,
     load_trust_state,
     read_activation_profile,
+    read_state,
     trust_backup_path,
     write_trust_state,
 )
@@ -110,6 +111,10 @@ def _forward_trust(paths: HostPaths, trust_bytes: bytes, *, uid: int, repair: bo
     if not paths.trust_file.exists() and not backup.exists():
         return initial_trust_state(trust_bytes)
     try:
+        spare: TrustState | None = load_trust_state(backup, expected_uid=uid)
+    except MinerUpdateError:
+        spare = None
+    try:
         start = load_trust_state(paths.trust_file, expected_uid=uid)
     except MinerUpdateError as exc:
         if not repair:
@@ -118,13 +123,27 @@ def _forward_trust(paths: HostPaths, trust_bytes: bytes, *, uid: int, repair: bo
                 f"to move forward from its verified backup, {backup}. Deleting it would forget "
                 "every revoked key"
             ) from exc
-        try:
-            start = load_trust_state(backup, expected_uid=uid)
-        except MinerUpdateError as backup_exc:
+        if spare is None:
             raise BootstrapError(
-                f"neither the trust set nor its backup can be read ({backup_exc}); see "
+                "neither the trust set nor its backup can be read; see "
                 "docs/MINER_AUTO_UPDATE.md, \"Repairing the trust set\""
-            ) from backup_exc
+            ) from exc
+        # The updater records the highest trust generation it used. A backup
+        # older than that would move trust backward, so it is refused.
+        try:
+            seen = read_state(paths.state_file).get("trust_generation")
+        except MinerUpdateError:
+            seen = None
+        if isinstance(seen, int) and not isinstance(seen, bool) and spare.generation < seen:
+            raise BootstrapError(
+                f"the backup is trust generation {spare.generation}, older than generation {seen}, "
+                "which this host has already used; it cannot repair the trust set"
+            ) from exc
+        start = spare
+    else:
+        # A backup ahead of trust.json is a write that a crash interrupted.
+        if spare is not None and spare.generation > start.generation and set(spare.revoked) >= set(start.revoked):
+            start = spare
     try:
         return rotate_trust(start, trust_bytes)
     except MinerReleaseError as exc:
