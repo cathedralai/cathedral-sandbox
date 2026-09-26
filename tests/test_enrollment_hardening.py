@@ -68,6 +68,8 @@ def _attested(chip_id: str, measurement: str = "measurement") -> Attested:
         chip_id,
         measurement,
         1,
+        verification_status="VERIFIED",
+        chain_verified=True,
         assurance=attestation_claims(chip_id.encode(), policy),
     )
 
@@ -188,6 +190,8 @@ def _fake_tdx_verify(evidence, nonce, policy):
             chip_id=TDX_CHIP_ID,
             measurement=TDX_MEASUREMENT,
             tcb=3,
+            verification_status="VERIFIED",
+            chain_verified=True,
             assurance=attestation_claims(evidence.quote, policy),
         )
     return None

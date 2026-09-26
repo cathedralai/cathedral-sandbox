@@ -266,7 +266,27 @@ def _cpu_attested(policy: Policy, binding=None) -> Attested:
         "tdx-platform-sha256:" + "1" * 64,
         "cpu-measurement",
         7,
+        verification_status="VERIFIED",
+        chain_verified=True,
         assurance=claims,
+    )
+
+
+def _declared(composite):
+    """Stand in for a qualified GPU lane whose verifier declares its verdict.
+
+    verify_composite_gpu leaves the verdict at the fail-closed default on
+    purpose, so every admission path refuses it. Tests of what happens after
+    admission must say explicitly that they assume a declared verdict.
+    """
+
+    return replace(
+        composite,
+        attested=replace(
+            composite.attested,
+            verification_status="VERIFIED",
+            chain_verified=True,
+        ),
     )
 
 
@@ -918,6 +938,10 @@ def test_composite_requires_same_nonce_hotkey_channel_and_tdx(monkeypatch):
     assert result.attested.measurement == gpu_lifecycle_measurement("cpu-measurement", _profile())
     assert result.attested.assurance is not None
     assert result.attested.assurance.channel.status is ClaimStatus.NOT_EVALUATED
+    # The composite verdict is a development preview and deliberately keeps
+    # the fail-closed defaults until the GPU lane is qualified.
+    assert result.attested.verification_status == "UNVERIFIED"
+    assert result.attested.chain_verified is False
 
     for mismatched in (
         _gpu_evidence(nonce=b"x" * 32),
@@ -927,6 +951,42 @@ def test_composite_requires_same_nonce_hotkey_channel_and_tdx(monkeypatch):
         with pytest.raises(GpuAttestationError) as raised:
             verify_composite_gpu(cpu, mismatched, NONCE, policy, _profile(), verifier)
         assert raised.value.category == "composite_binding_denied"
+
+
+def test_composite_refuses_tdx_verdict_that_does_not_declare_itself_verified(monkeypatch):
+    # Built without verification_status and chain_verified, so it takes the
+    # fail-closed defaults. Everything else matches _cpu_attested, so the
+    # refusal comes from the verdict alone.
+    policy = Policy(allowed_measurements=frozenset({"cpu-measurement"}))
+    cpu = _tdx_evidence()
+    gpu = _gpu_evidence()
+    declared = _cpu_attested(policy)
+    undeclared = Attested(
+        declared.tier,
+        declared.chip_id,
+        declared.measurement,
+        declared.tcb,
+        assurance=declared.assurance,
+    )
+    assert undeclared.verification_status == "UNVERIFIED"
+    assert undeclared.chain_verified is False
+    monkeypatch.setattr("cathedral.verify.verify", lambda *_args: undeclared)
+
+    with pytest.raises(GpuAttestationError) as raised:
+        verify_composite_gpu(
+            cpu,
+            gpu,
+            NONCE,
+            policy,
+            _profile(),
+            _verifier(_verifier_result(gpu, _profile())),
+        )
+    assert raised.value.category == "cpu_component_denied"
+
+    assert tdx_component_binding_digest(cpu, declared).startswith("sha256:")
+    with pytest.raises(GpuAttestationError) as raised:
+        tdx_component_binding_digest(cpu, undeclared)
+    assert raised.value.category == "cpu_component_denied"
 
 
 def test_gpu_lifecycle_policy_is_stable_across_two_fresh_epochs(monkeypatch, tmp_path):
@@ -960,8 +1020,13 @@ def test_gpu_lifecycle_policy_is_stable_across_two_fresh_epochs(monkeypatch, tmp
     assert allowed == frozenset({first.attested.measurement})
 
     store = RegistryStore(str(tmp_path / "gpu-lifecycle.sqlite"))
+    store.enroll("preview-worker", "http://127.0.0.1:2")
+    store.record_verdict("preview-worker", first.attested)
+    assert first.attested.verification_status == "UNVERIFIED"
+    assert store.lifecycle_snapshot("preview-worker").state is WorkerLifecycleState.FAILED
+
     store.enroll(HOTKEY, "http://127.0.0.1:1")
-    store.record_verdict(HOTKEY, first.attested)
+    store.record_verdict(HOTKEY, _declared(first).attested)
     assert store.apply_lifecycle_policy(allowed) == ()
     assert store.apply_lifecycle_policy(allowed) == ()
     assert store.lifecycle_snapshot(HOTKEY).state is WorkerLifecycleState.ATTESTED
@@ -1102,13 +1167,15 @@ def test_gpu_probe_rolls_back_claim_when_endpoint_generation_changes(tmp_path: P
     cpu_evidence = _tdx_evidence()
     gpu_evidence = _gpu_evidence()
     monkeypatch.setattr("cathedral.verify.verify", lambda *_args: _cpu_attested(policy))
-    composite = verify_composite_gpu(
-        cpu_evidence,
-        gpu_evidence,
-        NONCE,
-        policy,
-        profile,
-        _verifier(_verifier_result(gpu_evidence, profile), profile),
+    composite = _declared(
+        verify_composite_gpu(
+            cpu_evidence,
+            gpu_evidence,
+            NONCE,
+            policy,
+            profile,
+            _verifier(_verifier_result(gpu_evidence, profile), profile),
+        )
     )
     monkeypatch.setattr("cathedral.gpu.verify_composite_gpu", lambda *_args: composite)
 
@@ -1168,7 +1235,10 @@ def test_gpu_probe_rolls_back_claim_when_endpoint_generation_changes(tmp_path: P
     identity_registry.assert_unclaimed(composite.gpu_component)
 
 
-def test_gpu_prober_revokes_cross_worker_identity_reuse(tmp_path: Path, monkeypatch):
+def test_gpu_prober_refuses_preview_verdict_before_identity_claim(tmp_path: Path, monkeypatch):
+    # verify_composite_gpu leaves its verdict at the fail-closed default until
+    # the GPU lane is qualified. The prober must refuse that verdict before it
+    # touches durable GPU identity state, not record it and commit the claim.
     policy = Policy(allowed_measurements=frozenset({"cpu-measurement"}))
     profile = _profile()
     cpu_evidence = _tdx_evidence()
@@ -1181,6 +1251,58 @@ def test_gpu_prober_revokes_cross_worker_identity_reuse(tmp_path: Path, monkeypa
         policy,
         profile,
         _verifier(_verifier_result(gpu_evidence, profile), profile),
+    )
+    assert composite.attested.verification_status == "UNVERIFIED"
+    assert composite.attested.chain_verified is False
+    monkeypatch.setattr("cathedral.gpu.verify_composite_gpu", lambda *_args: composite)
+    monkeypatch.setattr(
+        "cathedral.prober._request_evidence",
+        lambda *_args, **_kwargs: [cpu_evidence, gpu_evidence],
+    )
+    identity_registry = GpuIdentityRegistry(
+        tmp_path / "preview-identities.sqlite", identity_digest_key=b"i" * 32
+    )
+    claim_events = []
+    monkeypatch.setattr(
+        identity_registry,
+        "begin_claim",
+        lambda *_args, **_kwargs: claim_events.append("begin"),
+    )
+    store = RegistryStore(str(tmp_path / "preview-registry.sqlite"))
+    store.enroll(HOTKEY, "http://127.0.0.1:1")
+
+    assert not probe_once(
+        store,
+        policy,
+        gpu_profile=profile,
+        gpu_verifier=object(),
+        gpu_identity_registry=identity_registry,
+        expected_tier=Tier.CC_GPU,
+    )
+
+    assert claim_events == []
+    identity_registry.assert_unclaimed(composite.gpu_component)
+    lifecycle = store.lifecycle_snapshot(HOTKEY, materialize_freshness=False)
+    assert lifecycle.state is WorkerLifecycleState.FAILED
+    assert store.board()["miners"][0]["verification_status"] == "FAILED"
+    assert store.board()["count"] == 0
+
+
+def test_gpu_prober_revokes_cross_worker_identity_reuse(tmp_path: Path, monkeypatch):
+    policy = Policy(allowed_measurements=frozenset({"cpu-measurement"}))
+    profile = _profile()
+    cpu_evidence = _tdx_evidence()
+    gpu_evidence = _gpu_evidence()
+    monkeypatch.setattr("cathedral.verify.verify", lambda *_args: _cpu_attested(policy))
+    composite = _declared(
+        verify_composite_gpu(
+            cpu_evidence,
+            gpu_evidence,
+            NONCE,
+            policy,
+            profile,
+            _verifier(_verifier_result(gpu_evidence, profile), profile),
+        )
     )
     monkeypatch.setattr("cathedral.gpu.verify_composite_gpu", lambda *_args: composite)
     monkeypatch.setattr(

@@ -316,6 +316,12 @@ digest, and a stable failure category. Successful output reports
 It never claims a GPU identity, dispatches SAT work, writes an epoch, or scores
 the worker.
 
+Until the GPU lane is qualified, the composite verifier does not declare a
+verdict. Its result keeps the fail-closed defaults (`verification_status`
+`UNVERIFIED`, `chain_verified` false), so this audit, the epoch runtime and the
+standalone probe all refuse it. The probe refuses it before any GPU identity
+claim.
+
 ## Scoring and rollout gates
 
 Evidence collection and an audit verdict do not make a GPU worker eligible to

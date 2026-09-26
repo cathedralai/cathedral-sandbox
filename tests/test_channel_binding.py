@@ -227,6 +227,32 @@ def _bound_composite_evidence(
     return tdx, gpu
 
 
+def _declare_composite_verdicts(monkeypatch) -> None:
+    """Stand in for a qualified GPU lane whose verifier declares its verdict.
+
+    verify_composite_gpu leaves the verdict at the fail-closed default on
+    purpose, so every admission path refuses it. Tests of what happens after
+    admission must say explicitly that they assume a declared verdict.
+    """
+
+    import cathedral.gpu
+
+    preview = cathedral.gpu.verify_composite_gpu
+
+    def declared(*args, **kwargs):
+        composite = preview(*args, **kwargs)
+        return replace(
+            composite,
+            attested=replace(
+                composite.attested,
+                verification_status="VERIFIED",
+                chain_verified=True,
+            ),
+        )
+
+    monkeypatch.setattr("cathedral.gpu.verify_composite_gpu", declared)
+
+
 def _sat_item() -> SatWorkItem:
     instance = SatInstance(2, [[1, 2], [-1, 2]])
     seed = 7
@@ -463,7 +489,10 @@ def test_composite_wire_contract_carries_evidence_above_legacy_body_caps(
     assert gpu.quote == b"g" * (192 * 1024)
 
 
-def test_worker_remote_runtime_accepts_bound_composite_in_audit_mode(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("declared", [False, True], ids=["preview", "declared"])
+def test_worker_remote_runtime_audits_bound_composite_only_with_declared_verdict(
+    tmp_path: Path, monkeypatch, declared
+):
     cert, key, certificate_der = _certificate_pair(tmp_path, "gpu-runtime")
     binding = tls_spki_binding(certificate_der)
     server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -492,6 +521,8 @@ def test_worker_remote_runtime_accepts_bound_composite_in_audit_mode(tmp_path: P
             "tdx-platform-sha256:" + "1" * 64,
             "cpu-measurement",
             1,
+            verification_status="VERIFIED",
+            chain_verified=True,
             assurance=attestation_claims(evidence.quote, selected_policy),
         )
 
@@ -536,6 +567,8 @@ def test_worker_remote_runtime_accepts_bound_composite_in_audit_mode(tmp_path: P
             )
 
     monkeypatch.setattr("cathedral.verify.verify", cpu_verify)
+    if declared:
+        _declare_composite_verdicts(monkeypatch)
     identity_registry = GpuIdentityRegistry(
         tmp_path / "gpu-identities.sqlite", identity_digest_key=b"i" * 32
     )
@@ -576,6 +609,20 @@ def test_worker_remote_runtime_accepts_bound_composite_in_audit_mode(tmp_path: P
         outcome = runtime.audit_attestation(MinerTarget(HOTKEY, server.base_url))
         runtime.close()
 
+    if not declared:
+        # The composite verifier's own verdict is the fail-closed default, so
+        # the audit refuses it rather than reporting a verified preview.
+        assert outcome.status == "attestation_failed"
+        assert outcome.error == "verdict does not match the requested hardware tier"
+        assert outcome.assurance is None
+        assert outcome.component_audit is None
+        with sqlite3.connect(identity_registry.path) as connection:
+            assert (
+                connection.execute("SELECT COUNT(*) FROM gpu_identity_claims_v3").fetchone()[0]
+                == 0
+            )
+        return
+
     assert outcome.status == "attestation_verified"
     assert outcome.admitted is False
     assert outcome.assurance is not None
@@ -588,7 +635,10 @@ def test_worker_remote_runtime_accepts_bound_composite_in_audit_mode(tmp_path: P
         assert connection.execute("SELECT COUNT(*) FROM gpu_identity_claims_v3").fetchone()[0] == 0
 
 
-def test_scored_gpu_epoch_rejects_same_gpu_on_different_tdx_host(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("declared", [False, True], ids=["preview", "declared"])
+def test_scored_gpu_epoch_rejects_same_gpu_on_different_tdx_host(
+    tmp_path: Path, monkeypatch, declared
+):
     cert, key, certificate_der = _certificate_pair(tmp_path, "shared-gpu-hosts")
     binding = tls_spki_binding(certificate_der)
     server_context_one = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -618,6 +668,8 @@ def test_scored_gpu_epoch_rejects_same_gpu_on_different_tdx_host(tmp_path: Path,
             "tdx-platform-sha256:" + hashlib.sha256(evidence.miner_hotkey.encode()).hexdigest(),
             "cpu-measurement",
             1,
+            verification_status="VERIFIED",
+            chain_verified=True,
             assurance=attestation_claims(evidence.quote, selected_policy),
         )
 
@@ -661,6 +713,8 @@ def test_scored_gpu_epoch_rejects_same_gpu_on_different_tdx_host(tmp_path: Path,
             )
 
     monkeypatch.setattr("cathedral.verify.verify", cpu_verify)
+    if declared:
+        _declare_composite_verdicts(monkeypatch)
     monkeypatch.setenv("CATHEDRAL_ENABLE_GPU_SCORING", "true")
     monkeypatch.setenv(
         "CATHEDRAL_ACTIVE_GPU_PROFILE_AUTHORITIES",
@@ -713,7 +767,14 @@ def test_scored_gpu_epoch_rejects_same_gpu_on_different_tdx_host(tmp_path: Path,
             gpu_verifier=SharedGpuVerifier(),
             gpu_identity_registry=identity_registry,
         )
-        with pytest.raises(CathedralRuntimeError, match="shares the dedicated canary GPU identity"):
+        # An undeclared composite verdict is refused at the canary, before
+        # the shared-identity check is reached. A declared one reaches it.
+        expected = (
+            "shares the dedicated canary GPU identity"
+            if declared
+            else "canary attestation failed: verdict does not match the requested hardware tier"
+        )
+        with pytest.raises(CathedralRuntimeError, match=expected):
             runtime.run_epoch(1, MinerTarget("gpu-canary", canary_server.base_url))
         runtime.close()
 

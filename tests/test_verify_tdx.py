@@ -121,6 +121,8 @@ def test_tdx_verify_accepts_verified_claims(tmp_path, monkeypatch, caplog):
     assert attested.chip_id == "tdx-platform-1"
     assert attested.measurement == "tdx-measurement-1"
     assert attested.tcb == 7
+    assert attested.verification_status == "VERIFIED"
+    assert attested.chain_verified is True
     assert attested.policy_mode == "compatibility"
     assert "compatibility policy mode" in caplog.text
 

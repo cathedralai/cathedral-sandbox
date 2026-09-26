@@ -975,6 +975,8 @@ def test_runtime_atomically_persists_offline_verifiable_receipt(
             evidence.quote.decode().removeprefix("chip:"),
             "tdx-measurement-sha256:sample-v1",
             1,
+            verification_status="VERIFIED",
+            chain_verified=True,
             tcb_status="UpToDate",
             advisory_ids=(),
             debug_enabled=False,
@@ -1071,6 +1073,8 @@ def test_epoch_survives_a_mid_epoch_reenrollment_after_receipt_issuance(
             evidence.quote.decode().removeprefix("chip:"),
             "tdx-measurement-sha256:sample-v1",
             1,
+            verification_status="VERIFIED",
+            chain_verified=True,
             tcb_status="UpToDate",
             advisory_ids=(),
             debug_enabled=False,
@@ -1173,6 +1177,8 @@ def test_deregistered_enrolled_miner_is_excluded_and_the_export_still_signs(
             evidence.quote.decode().removeprefix("chip:"),
             "tdx-measurement-sha256:sample-v1",
             1,
+            verification_status="VERIFIED",
+            chain_verified=True,
             tcb_status="UpToDate",
             advisory_ids=(),
             debug_enabled=False,
@@ -1378,6 +1384,41 @@ def test_runtime_rejects_legacy_verified_flag_without_typed_claims(tmp_path: Pat
     assert "sat:canary" not in factory.log
 
 
+def test_runtime_refuses_verdict_that_does_not_declare_itself_verified(tmp_path: Path) -> None:
+    # The miner's verdict is built without verification_status and
+    # chain_verified, so it takes the fail-closed defaults. It carries passed
+    # typed claims, so the refusal comes from the verdict alone.
+    specs = default_specs(**{"9001": MinerSpec("undeclared-chip")})
+    runtime, ledger, factory = make_runtime(
+        tmp_path, [("miner", "http://127.0.0.1:9001")], specs
+    )
+
+    def mixed_verifier(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested:
+        declared = verifier(evidence, nonce, policy)
+        if declared.chip_id != "undeclared-chip":
+            return declared
+        undeclared = Attested(
+            declared.tier,
+            declared.chip_id,
+            declared.measurement,
+            declared.tcb,
+            assurance=declared.assurance,
+        )
+        assert undeclared.verification_status == "UNVERIFIED"
+        assert undeclared.chain_verified is False
+        return undeclared
+
+    runtime.verifier = mixed_verifier
+    run = runtime.run_epoch(1, CANARY)
+    outcome = next(item for item in run.outcomes if item.hotkey == "miner")
+
+    assert outcome.status == "attestation_failed"
+    assert outcome.error == "verdict does not match the requested hardware tier"
+    assert outcome.score == 0.0
+    assert "sat:miner" not in factory.log
+    assert "sat:canary" in factory.log
+
+
 def test_channel_mismatch_never_dispatches_work_or_admits(tmp_path: Path) -> None:
     specs = default_specs(**{"9001": MinerSpec("a", channel_mismatch=True)})
     runtime, _, factory = make_runtime(tmp_path, [("miner", "http://127.0.0.1:9001")], specs)
@@ -1488,6 +1529,8 @@ def test_runtime_persists_strict_attestation_policy_mode(tmp_path: Path) -> None
             chip,
             "measurement",
             1,
+            verification_status="VERIFIED",
+            chain_verified=True,
             policy_mode="strict",
             assurance=attestation_claims(evidence.quote, policy),
         )

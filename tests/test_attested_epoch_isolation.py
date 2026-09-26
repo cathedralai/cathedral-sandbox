@@ -120,6 +120,8 @@ def _verifier(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | No
         chip_id=chip_id,
         measurement=GOOD_MEASUREMENT,
         tcb=GOOD_TCB,
+        verification_status="VERIFIED",
+        chain_verified=True,
         assurance=attestation_claims(evidence.quote, policy),
     )
 
@@ -139,6 +141,8 @@ def _verifier_raises_for(bad_uid: str):
             chip_id=chip_id,
             measurement=GOOD_MEASUREMENT,
             tcb=GOOD_TCB,
+            verification_status="VERIFIED",
+            chain_verified=True,
             assurance=attestation_claims(evidence.quote, policy),
         )
 

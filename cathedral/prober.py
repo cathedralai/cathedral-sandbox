@@ -843,6 +843,14 @@ def probe_once(
                         if production_mode and not gpu_profile.production_ready_for(policy):
                             raise ValueError("production GPU profile expired during probe")
                         attested = composite.attested
+                        # Refuse an undeclared verdict here, before the GPU
+                        # identity claim below touches durable state. The
+                        # composite verifier does not declare one until the
+                        # GPU lane is qualified.
+                        if attested.verification_status != "VERIFIED":
+                            LOGGER.info("GPU composite verdict is not verified")
+                            composite = None
+                            attested = None
                     except GpuAttestationError as exc:
                         if not gpu_error_is_evidence_denial(exc):
                             raise
