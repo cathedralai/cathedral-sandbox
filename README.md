@@ -1,6 +1,6 @@
 # Cathedral Sandbox
 
-**Bittensor SN39**
+**Bittensor SN94**
 
 **Racing to build the fastest sandbox fleet on earth**
 
@@ -13,7 +13,7 @@ and the protocol used by validators to test miner machines.
 
 ## How mining works
 
-Cathedral's validator reads every serving non-validator miner from SN39. It
+Cathedral's validator reads every serving non-validator miner from SN94. It
 does not download weights from Cathedral and it does not use a weight relay.
 
 For each UID, the validator:
@@ -52,7 +52,7 @@ image digest or continuous runtime integrity after boot.
 This repository serves SNP evidence and SAT work. The separate
 [Cathedral validator](https://github.com/cathedralai/cathedral-validator)
 performs the deadline-bounded verification and scoring. The retained legacy
-runtime in this repository is not the SN39 weight-writing path.
+runtime in this repository is not the SN94 weight-writing path.
 
 ## What you need
 
@@ -60,7 +60,7 @@ runtime in this repository is not the SN39 weight-writing path.
   AMD SEV-SNP guest with `/dev/sev-guest`.
 - Git, Python 3.12 with `venv`, Docker, `nft`, and `curl` inside the guest.
 - A public IPv4 address with TCP `8081` open.
-- One public Bittensor hotkey which you will register on Finney SN39 only after
+- One public Bittensor hotkey which you will register on Finney SN94 only after
   the worker passes its local startup check.
 - Bittensor CLI `11.1.0` on the separate wallet machine.
 - The ability to announce that public IP and port `8081` as the hotkey's axon.
@@ -84,7 +84,7 @@ python3 -m venv .venv-rehearsal
 .venv-rehearsal/bin/python -m pip install -e .
 
 for run in 1 2 3; do
-  .venv-rehearsal/bin/python scripts/rehearse_sn39_miner.py
+  .venv-rehearsal/bin/python scripts/rehearse_sn94_miner.py
 done
 ```
 
@@ -109,7 +109,7 @@ test "$(docker image inspect "$TDX_IMAGE" --format \
   '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
   78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
 test "$(docker image inspect "$TDX_IMAGE" --format \
-  '{{index .Config.Labels "org.cathedral.sn39.runtime-contract"}}')" = \
+  '{{index .Config.Labels "org.cathedral.sn94.runtime-contract"}}')" = \
   signed-validator-fleet-v1
 
 SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255'
@@ -120,7 +120,7 @@ test "$(docker image inspect "$SNP_IMAGE" --format \
   '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
   8dde6eaca27116eed53386a1fa33ec70b74a01fb
 test "$(docker image inspect "$SNP_IMAGE" --format \
-  '{{index .Config.Labels "org.cathedral.sn39.runtime-contract"}}')" = \
+  '{{index .Config.Labels "org.cathedral.sn94.runtime-contract"}}')" = \
   snp-signed-validator-fleet-v1
 ```
 
@@ -172,11 +172,11 @@ sudo test -r /sys/kernel/config/tsm/report \
 
 sudo install -d -o root -g root -m 0755 /usr/local/libexec/cathedral
 sudo install -o root -g root -m 0755 \
-  cathedral-runtime/scripts/run_sn39_signed_fleet_miner.sh \
-  /usr/local/libexec/cathedral/run-sn39-miner
+  cathedral-runtime/scripts/run_sn94_signed_fleet_miner.sh \
+  /usr/local/libexec/cathedral/run-sn94-miner
 printf '%s  %s\n' \
-  2ba50ed1342406759aa2b78d5e019caa347c4db1dfa5e8c66d2e8452498032b1 \
-  /usr/local/libexec/cathedral/run-sn39-miner | sudo sha256sum --check
+  bad027acb1a46915723fc51ec2fa537bd632148b5715477223e2eddb6ab67c25 \
+  /usr/local/libexec/cathedral/run-sn94-miner | sudo sha256sum --check
 ```
 
 Stop if the census does not report Intel TDX or the TSM report path is not
@@ -184,7 +184,7 @@ readable and writable.
 
 ### 2. Refresh validator access from a control host
 
-The worker admits any hotkey with a current SN39 validator permit. You create
+The worker admits any hotkey with a current SN94 validator permit. You create
 and keep the small Ed25519 key used to sign that chain snapshot. Cathedral does
 not issue a credential and no Cathedral API is involved.
 
@@ -213,7 +213,7 @@ cathedral-access/.venv/bin/python \
 cathedral-access/.venv/bin/python \
   cathedral-access/scripts/cathedral_validator_access.py capture \
   --network finney \
-  --netuid 39 \
+  --netuid 94 \
   --minimum-stake-rao 0 \
   --signing-key-id cathedral-validator-access-1 \
   --signing-key-file cathedral-validator-access-state/snapshot.seed \
@@ -449,13 +449,13 @@ ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f
 ```
 
 ```bash
-export SN39_AUDIT_MINER_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99'
+export SN94_AUDIT_MINER_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99'
 export CATHEDRAL_MINER_HOTKEY='YOUR_PUBLIC_HOTKEY'
 export CATHEDRAL_PUBLIC_ENDPOINT='https://YOUR_PUBLIC_IPV4:8081'
 export CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST='PASTE_KEYS_DIGEST_VALUE'
 
-sudo --preserve-env=SN39_AUDIT_MINER_IMAGE,CATHEDRAL_MINER_HOTKEY,CATHEDRAL_PUBLIC_ENDPOINT,CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST \
-  /usr/local/libexec/cathedral/run-sn39-miner
+sudo --preserve-env=SN94_AUDIT_MINER_IMAGE,CATHEDRAL_MINER_HOTKEY,CATHEDRAL_PUBLIC_ENDPOINT,CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST \
+  /usr/local/libexec/cathedral/run-sn94-miner
 ```
 
 This image is the current migration bridge. Fleet discovery and non-public
@@ -492,12 +492,12 @@ separate wallet machine:
 btcli --network finney \
   --wallet YOUR_WALLET \
   --wallet-hotkey YOUR_HOTKEY \
-  subnet register --netuid 39
+  subnet register --netuid 94
 
 btcli --network finney \
   --wallet YOUR_WALLET \
   --wallet-hotkey YOUR_HOTKEY \
-  axon set --netuid 39 --ip YOUR_PUBLIC_IPV4 --port 8081
+  axon set --netuid 94 --ip YOUR_PUBLIC_IPV4 --port 8081
 ```
 
 `btcli axon set` records the endpoint on chain. It does not start the server.
@@ -510,8 +510,8 @@ all validator weight rows:
 
 ```bash
 btcli --network finney query uid \
-  --netuid 39 --hotkey YOUR_PUBLIC_HOTKEY
-btcli --network finney --json query weights --netuid 39
+  --netuid 94 --hotkey YOUR_PUBLIC_HOTKEY
+btcli --network finney --json query weights --netuid 94
 ```
 
 After UID 30 submits and any commit-reveal delay completes, row `"30"` must
@@ -521,7 +521,7 @@ All of these must also be true:
 
 - the process stays running and logs `cathedral_effective_startup_v1`;
 - the access snapshot refreshes before its 15-minute expiry;
-- SN39 shows your hotkey at the expected public IP and port `8081`;
+- SN94 shows your hotkey at the expected public IP and port `8081`;
 - a validator reports fresh TDX verification, same-SPKI binding, and SAT pass;
 - the on-chain weight row changes only after the validator submits it.
 

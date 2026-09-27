@@ -1,4 +1,4 @@
-name: Publish SN39 audit-miner image
+name: Publish SN94 SNP miner image
 
 on:
   push:
@@ -6,11 +6,11 @@ on:
       - main
     paths:
       - .dockerignore
-      - .github/workflows/publish-sn39-audit-miner.yml
-      - Dockerfile.sn39-audit-miner
+      - .github/workflows/publish-sn94-snp-miner.yml
+      - Dockerfile.sn94-snp-miner
       - cathedral/**
-      - requirements/sn39-audit-miner.txt
-      - scripts/run_sn39_signed_fleet_miner.sh
+      - requirements/sn94-audit-miner.txt
+      - scripts/run_sn94_snp_miner.sh
   workflow_dispatch:
     inputs:
       image_digest:
@@ -21,7 +21,7 @@ on:
 permissions: {}
 
 env:
-  IMAGE_PATH: ghcr.io/cathedralai/cathedral-sn39-audit-miner
+  IMAGE_PATH: ghcr.io/cathedralai/cathedral-sn39-snp-miner
 
 jobs:
   publish:
@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     concurrency:
-      group: sn39-audit-miner-${{ github.sha }}
+      group: sn94-snp-miner-${{ github.sha }}
       cancel-in-progress: false
     permissions:
       contents: read
@@ -38,7 +38,6 @@ jobs:
       attestations: write
       artifact-metadata: write
     outputs:
-      commit_tag: ${{ steps.image.outputs.commit_tag }}
       digest: ${{ steps.pin.outputs.digest }}
       image_ref: ${{ steps.pin.outputs.image_ref }}
     steps:
@@ -70,43 +69,34 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve the commit tag
+      - name: Refuse to overwrite the commit tag
         id: image
         shell: bash
         run: |
           set -euo pipefail
           commit_tag="sha-${GITHUB_SHA}"
           tag_ref="${IMAGE_PATH}:${commit_tag}"
-          echo "commit_tag=${commit_tag}" >> "$GITHUB_OUTPUT"
-          echo "tag_ref=${tag_ref}" >> "$GITHUB_OUTPUT"
-
-      - name: Refuse to overwrite the commit tag
-        shell: bash
-        env:
-          TAG_REF: ${{ steps.image.outputs.tag_ref }}
-        run: |
-          set -euo pipefail
           set +e
-          inspection="$(docker buildx imagetools inspect "$TAG_REF" 2>&1)"
+          inspection="$(docker buildx imagetools inspect "$tag_ref" 2>&1)"
           inspection_status=$?
           set -e
           if [[ $inspection_status -eq 0 ]]; then
-            echo "::error::Immutable image tag already exists: $TAG_REF"
+            echo "::error::Immutable image tag already exists: $tag_ref"
             exit 1
           fi
-          if grep -Eiq 'manifest unknown|not found' <<< "$inspection"; then
-            exit 0
+          if ! grep -Eiq 'manifest unknown|not found' <<< "$inspection"; then
+            echo "::error::Could not prove the immutable image tag is unused"
+            printf '%s\n' "$inspection"
+            exit 1
           fi
-          echo "::error::Could not prove the immutable image tag is unused"
-          printf '%s\n' "$inspection"
-          exit 1
+          echo "tag_ref=${tag_ref}" >> "$GITHUB_OUTPUT"
 
       - name: Build and publish linux/amd64 image
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          file: ./Dockerfile.sn39-audit-miner
+          file: ./Dockerfile.sn94-snp-miner
           platforms: linux/amd64
           pull: true
           push: true
@@ -121,20 +111,12 @@ jobs:
         shell: bash
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-          TAG_REF: ${{ steps.image.outputs.tag_ref }}
         run: |
           set -euo pipefail
           [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           image_ref="${IMAGE_PATH}@${DIGEST}"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "image_ref=${image_ref}" >> "$GITHUB_OUTPUT"
-          {
-            echo "### SN39 audit-miner publication"
-            echo
-            echo "Commit tag: \`${TAG_REF}\`"
-            echo
-            echo "Validator and Polaris pin: \`${image_ref}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Attest the published digest
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2

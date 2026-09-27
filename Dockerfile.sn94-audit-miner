@@ -2,10 +2,10 @@
 # python:3.12-slim-bookworm, verified from Docker Hub on 2026-08-26.
 FROM python:3.12-slim-bookworm@sha256:4427763a1ba36f5aa8f656a03e5d00f3b8d61f5dd950c73df6c14f8c7640f8ab
 
-LABEL org.opencontainers.image.title="Cathedral SN39 audit miner" \
-      org.opencontainers.image.description="TDX evidence and signed validator fleet worker for SN39" \
+LABEL org.opencontainers.image.title="Cathedral SN94 audit miner" \
+      org.opencontainers.image.description="TDX evidence and signed validator fleet worker for SN94" \
       org.opencontainers.image.source="https://github.com/cathedralai/cathedral-sandbox" \
-      org.cathedral.sn39.runtime-contract="signed-validator-fleet-v1"
+      org.cathedral.sn94.runtime-contract="signed-validator-fleet-v1"
 
 # The durable-state format this image writes under /var/lib/cathedral/validator-access.
 # It must equal cathedral.validator_access.DURABLE_STATE_SCHEMA, and a signed miner
@@ -14,14 +14,14 @@ LABEL org.cathedral.state-schema="2"
 
 WORKDIR /
 
-COPY requirements/sn39-audit-miner.txt /tmp/sn39-audit-miner-requirements.txt
+COPY requirements/sn94-audit-miner.txt /tmp/sn94-audit-miner-requirements.txt
 RUN python -m pip install \
       --disable-pip-version-check \
       --no-cache-dir \
       --only-binary=:all: \
       --require-hashes \
-      --requirement /tmp/sn39-audit-miner-requirements.txt \
-    && rm /tmp/sn39-audit-miner-requirements.txt
+      --requirement /tmp/sn94-audit-miner-requirements.txt \
+    && rm /tmp/sn94-audit-miner-requirements.txt
 
 COPY cathedral/ /usr/local/lib/python3.12/site-packages/cathedral/
 

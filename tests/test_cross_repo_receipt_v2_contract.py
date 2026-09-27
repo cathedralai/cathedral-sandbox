@@ -350,15 +350,18 @@ def _validator_preview(document, snapshot, *, lane_receipts=None):
     # the policy would fail here rather than silently pass.
     ledger_dir = tempfile.mkdtemp(prefix="cathedral-cross-repo-ledger-")
     _LEDGER_TMPDIRS.append(ledger_dir)
+    # The pinned distill fixtures sign the burn and allocation configs for one
+    # netuid; the preview must ask for that same netuid, whichever it is.
+    burn_config = fixtures.burn_config()
     return thin_integration.preview_integrated_vector(
-        burn_config=fixtures.burn_config(),
+        burn_config=burn_config,
         allocation_config=fixtures.allocation_config(
             [{"lane": LANE_CPU, "allocation": "0.90", "enabled": True}]
         ),
         key_registry=_CompositeResolver(_resolver(snapshot), fixtures.registry),
         receipts=receipts,
         network="finney",
-        netuid=39,
+        netuid=json.loads(burn_config)["netuid"],
         source_epoch=SOURCE_EPOCH,
         now=NOW,
         now_iso=NOW_ISO,

@@ -165,7 +165,7 @@ class RemoteMiner:
         validator_hotkey: str | None = None,
         validator_signer: RequestSigner | None = None,
         validator_network: str = "finney",
-        validator_netuid: int = 39,
+        validator_netuid: int = 94,
     ) -> None:
         if not isinstance(hotkey, str) or not hotkey or len(hotkey) > MAX_HOTKEY_LENGTH:
             raise ValueError("hotkey must be a non-empty bounded string")

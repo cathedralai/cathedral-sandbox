@@ -1,6 +1,6 @@
 # Assurance receipts
 
-> Product-library reference. Receipts do not replace the current direct SN39
+> Product-library reference. Receipts do not replace the current direct SN94
 > validator path. Mining starts in the repository [README](../README.md).
 
 Cathedral assurance receipts are small, signed records for one worker and one
@@ -12,7 +12,7 @@ A receipt is evidence for the claims it contains. It is not a general promise
 that an application is bug-free, that arbitrary output is correct, or that a
 customer handled its own keys securely. In the retained legacy epoch library,
 the signed score vector is the accounting source for its old score-stream
-consumers. The current direct SN39 validator consumes neither that vector nor
+consumers. The current direct SN94 validator consumes neither that vector nor
 these receipts.
 
 ## What each claim means

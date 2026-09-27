@@ -51,7 +51,7 @@ from cathedral.worker import WorkerServer
 NOW = datetime(2026, 8, 29, 5, 0, 0, tzinfo=UTC)
 SNAPSHOT_SEED = b"s" * 32
 NETWORK = "finney"
-NETUID = 39
+NETUID = 94
 FROZEN_WALLET_SIGNATURE = (
     "0DDT6KLO2IU3A4/D7kiWOdP16JSmXtHLkcFMSI/J1SL0qCLNS+zOo50oGylZTgQiECQ5vG4HxL8oCxyjs/4+iw=="
 )

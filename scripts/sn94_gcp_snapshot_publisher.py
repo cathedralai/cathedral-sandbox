@@ -33,7 +33,7 @@ REGION = "us-central1"
 ZONE = "us-central1-b"
 NETWORK = "cathedral-sn39-e2e-f6d91c2a"
 SUBNET = "cathedral-sn39-e2e-f6d91c2a"
-FIREWALL_RULE = "cathedral-sn39-e2e-tls-f6d91c2a"
+FIREWALL_RULE = "cathedral-sn94-e2e-tls-f6d91c2a"
 NETWORK_TAG = "cathedral-sn39-e2e-f6d91c2a"
 BASE_IMAGE = "polaris-attest-base"
 BASE_IMAGE_ID = "3355993504309639309"
@@ -52,7 +52,7 @@ GUEST_READY_POLL_SECONDS = 5
 METADATA_VALUE_LIMIT_BYTES = 256 * 1024
 METADATA_TOTAL_LIMIT_BYTES = 512 * 1024
 NETWORK_NAME = "finney"
-NETUID = 39
+NETUID = 94
 MINIMUM_STAKE_RAO = 0
 UID30 = 30
 UID30_HOTKEY = "5FF6FtDUhn7XdPYmEdH5XjLAmLfmwLTCNVBgcrj3A4sstwaw"
@@ -86,22 +86,22 @@ OPERATOR_HARD_CAP_USD = 20.00
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PRODUCER = REPOSITORY_ROOT / "scripts" / "cathedral_validator_access.py"
-BOOTSTRAP = REPOSITORY_ROOT / "scripts" / "sn39_gcp_guest_bootstrap.sh"
-POLLER = REPOSITORY_ROOT / "scripts" / "sn39_gcp_guest_poller.py"
-LAUNCHER = REPOSITORY_ROOT / "scripts" / "run_sn39_signed_fleet_miner.sh"
+BOOTSTRAP = REPOSITORY_ROOT / "scripts" / "sn94_gcp_guest_bootstrap.sh"
+POLLER = REPOSITORY_ROOT / "scripts" / "sn94_gcp_guest_poller.py"
+LAUNCHER = REPOSITORY_ROOT / "scripts" / "run_sn94_signed_fleet_miner.sh"
 
-ATTR_IMAGE = "cathedral-sn39-image"
-ATTR_MINER_HOTKEY = "cathedral-sn39-miner-hotkey"
-ATTR_PUBLIC_ENDPOINT = "cathedral-sn39-public-endpoint"
-ATTR_KEYS = "cathedral-sn39-snapshot-keys"
-ATTR_KEYS_DIGEST = "cathedral-sn39-snapshot-keys-digest"
-ATTR_FLEET = "cathedral-sn39-fleet"
-ATTR_FLEET_DIGEST = "cathedral-sn39-fleet-digest"
-ATTR_LAUNCHER = "cathedral-sn39-launcher"
-ATTR_LAUNCHER_DIGEST = "cathedral-sn39-launcher-digest"
-ATTR_POLLER = "cathedral-sn39-poller"
-ATTR_POLLER_DIGEST = "cathedral-sn39-poller-digest"
-ATTR_SNAPSHOT = "cathedral-sn39-validator-access-snapshot"
+ATTR_IMAGE = "cathedral-sn94-image"
+ATTR_MINER_HOTKEY = "cathedral-sn94-miner-hotkey"
+ATTR_PUBLIC_ENDPOINT = "cathedral-sn94-public-endpoint"
+ATTR_KEYS = "cathedral-sn94-snapshot-keys"
+ATTR_KEYS_DIGEST = "cathedral-sn94-snapshot-keys-digest"
+ATTR_FLEET = "cathedral-sn94-fleet"
+ATTR_FLEET_DIGEST = "cathedral-sn94-fleet-digest"
+ATTR_LAUNCHER = "cathedral-sn94-launcher"
+ATTR_LAUNCHER_DIGEST = "cathedral-sn94-launcher-digest"
+ATTR_POLLER = "cathedral-sn94-poller"
+ATTR_POLLER_DIGEST = "cathedral-sn94-poller-digest"
+ATTR_SNAPSHOT = "cathedral-sn94-validator-access-snapshot"
 ATTR_BLOCK_PROJECT_SSH_KEYS = "block-project-ssh-keys"
 
 
@@ -856,7 +856,7 @@ def provision(
     else:
         verify_shared_infrastructure(addresses_must_be_reserved=True, vms=vms)
         _desired_instances_absent(vms=vms)
-    with tempfile.TemporaryDirectory(prefix="cathedral-sn39-provision-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="cathedral-sn94-provision-") as temporary:
         root = Path(temporary)
         snapshot = root / "validator-access.json"
         capture_snapshot(
@@ -978,7 +978,7 @@ def publish_loop(
         else discover_instance_window_deadline(image=image, vms=vms)
     )
     consecutive_failures = 0
-    with tempfile.TemporaryDirectory(prefix="cathedral-sn39-snapshot-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="cathedral-sn94-snapshot-") as temporary:
         snapshot = Path(temporary) / "validator-access.json"
         for cycle in range(SNAPSHOT_REFRESH_CYCLES):
             now = _utc_now()
@@ -1157,9 +1157,9 @@ def _add_artifact_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="sn39-gcp-snapshot-publisher",
+        prog="sn94-gcp-snapshot-publisher",
         description=(
-            "RETIRED UID124 GCP launch tool. Not part of current direct SN39 mining."
+            "RETIRED UID124 GCP launch tool. Not part of current direct SN94 mining."
         ),
         allow_abbrev=False,
     )

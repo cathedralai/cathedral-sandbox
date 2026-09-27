@@ -40,7 +40,7 @@ not prove a remote miner or validator scoring cycle.
 Run the public, hardware-free miner rehearsal from an installed checkout:
 
 ```bash
-.venv/bin/python scripts/rehearse_sn39_miner.py
+.venv/bin/python scripts/rehearse_sn94_miner.py
 ```
 
 It starts an ephemeral loopback worker with explicitly synthetic Intel TDX and

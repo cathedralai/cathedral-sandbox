@@ -1,4 +1,4 @@
-# SN39 AMD SEV-SNP miner image
+# SN94 AMD SEV-SNP miner image
 
 This is the separate immutable image contract for an AMD SEV-SNP miner. It is
 not the Intel TDX audit-miner image and it has no fallback or compatibility
@@ -32,7 +32,7 @@ It fixes these properties:
 - Official `snpguest` v0.10.0, SHA-256
   `70e700465e3523e67dd5104583dc36cd11eef630c6f04c5b9ccafd6ba2e76ca0`.
 - Native TLS on TCP `8081` with a new guest-owned private key at each start.
-- Finney SN39 and signed validator requests only.
+- Finney SN94 and signed validator requests only.
 - The miner's public hotkey, public HTTPS endpoint, and a digest pin for the
   validator-access public-key file as its only Cathedral environment inputs.
 

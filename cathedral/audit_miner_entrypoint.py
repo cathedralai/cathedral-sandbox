@@ -1,4 +1,4 @@
-"""Fixed entrypoint for the signed-fleet SN39 audit-miner image.
+"""Fixed entrypoint for the signed-fleet SN94 audit-miner image.
 
 The container accepts three public deployment values: the miner hotkey, its
 canonical public axon endpoint, and the digest pin for the snapshot-signing
@@ -51,7 +51,7 @@ TLS_PRIVATE_KEY = "worker.key"
 WORKER_HOST = "0.0.0.0"
 WORKER_PORT = 8081
 VALIDATOR_NETWORK = "finney"
-VALIDATOR_NETUID = 39
+VALIDATOR_NETUID = 94
 VALIDATOR_MINIMUM_STAKE_RAO = 0
 
 _ALLOWED_CATHEDRAL_INPUTS = frozenset(
@@ -200,7 +200,7 @@ def generate_tls_material(
     try:
         _secure_directory(directory)
         private_key = Ed25519PrivateKey.generate()
-        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "cathedral-sn39-audit-miner")])
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "cathedral-sn94-audit-miner")])
         current = now or datetime.now(UTC)
         if current.tzinfo is None:
             current = current.replace(tzinfo=UTC)
@@ -214,7 +214,7 @@ def generate_tls_material(
             .not_valid_after(current + timedelta(days=30))
             .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
             .add_extension(
-                x509.SubjectAlternativeName([x509.DNSName("cathedral-sn39-audit-miner")]),
+                x509.SubjectAlternativeName([x509.DNSName("cathedral-sn94-audit-miner")]),
                 critical=False,
             )
             .sign(private_key, algorithm=None)

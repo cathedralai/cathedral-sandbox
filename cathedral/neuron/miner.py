@@ -9,7 +9,7 @@ See docs/DESIGN.md §4, §9.
 Hardware-free testable core: ``MockMiner`` serves MOCK evidence (the real
 REPORT_DATA binding + policy check, no vendor crypto) and does real SAT work.
 The MOCK boundary is the only substitution. It is not production evidence.
-The direct validator establishes SN39 registration from finalized chain state,
+The direct validator establishes SN94 registration from finalized chain state,
 not from a worker claim. This entrypoint forwards into the worker operator CLI.
 """
 

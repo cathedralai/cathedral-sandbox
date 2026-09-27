@@ -451,7 +451,7 @@ def test_task_policy_tolerates_extra_signed_subfields(trusted_keys):
     assert verified.document["task_policy"]["egress"] == "restricted"
 
 
-def test_polaris_allow_egress_maps_to_restricted_sn39_shape():
+def test_polaris_allow_egress_maps_to_restricted_sn94_shape():
     enforced = {
         "version": 1,
         "hardware_class": "tdx_cpu",

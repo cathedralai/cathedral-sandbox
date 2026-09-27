@@ -393,7 +393,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Retained thin-validator compatibility test. "
-            "Not a current direct-validator SN39 proof."
+            "Not a current direct-validator SN94 proof."
         )
     )
     parser.add_argument(

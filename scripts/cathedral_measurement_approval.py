@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Retained measurement approval for the legacy signed policy registry.
 
-The current direct SN39 validator does not consume this registry or require
+The current direct SN94 validator does not consume this registry or require
 this signer and republisher. Do not deploy this tool for current mining.
 
 The retained library measurement changes far more easily than "different guest firmware"

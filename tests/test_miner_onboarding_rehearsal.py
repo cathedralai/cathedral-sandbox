@@ -9,14 +9,14 @@ import sys
 from pathlib import Path
 
 from cathedral.remote import RemoteError
-from scripts import rehearse_sn39_miner as rehearsal
+from scripts import rehearse_sn94_miner as rehearsal
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_public_miner_rehearsal_runs_from_an_installed_checkout():
     completed = subprocess.run(
-        [sys.executable, "scripts/rehearse_sn39_miner.py"],
+        [sys.executable, "scripts/rehearse_sn94_miner.py"],
         cwd=ROOT,
         check=False,
         capture_output=True,
@@ -54,7 +54,7 @@ def test_public_miner_rehearsal_ignores_ambient_network_proxies():
         }
     )
     completed = subprocess.run(
-        [sys.executable, "scripts/rehearse_sn39_miner.py"],
+        [sys.executable, "scripts/rehearse_sn94_miner.py"],
         cwd=ROOT,
         check=False,
         capture_output=True,
@@ -84,7 +84,7 @@ def test_public_miner_rehearsal_reports_protocol_failure_as_json(monkeypatch, ca
 def test_public_readme_scopes_the_rehearsal_and_help_path():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "scripts/rehearse_sn39_miner.py" in readme
+    assert "scripts/rehearse_sn94_miner.py" in readme
     assert "for run in 1 2 3" in readme
     assert "loopback with clearly synthetic TDX and SEV-SNP evidence" in readme
     assert "0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255" in readme

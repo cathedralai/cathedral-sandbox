@@ -228,7 +228,7 @@ def make_runtime(
             production_mode=False,
             allow_insecure_http_for_tests=True,
             score_network="finney",
-            score_netuid=39,
+            score_netuid=94,
             expected_tier=expected_tier,
         ),
         receipt_issuer=receipt_issuer,
@@ -529,7 +529,7 @@ def _production_runtime(
         candidate_snapshot = {
             "schema": "cathedral_candidate_snapshot_v1",
             "network": "finney",
-            "netuid": 39,
+            "netuid": 94,
             "block": 100,
             "block_hash": "0x" + "ab" * 32,
             "hotkeys": hotkeys,
@@ -545,7 +545,7 @@ def _production_runtime(
         config=RuntimeConfig(
             production_mode=True,
             score_network="finney",
-            score_netuid=39,
+            score_netuid=94,
             # Production CPU scoring requires durable raw-evidence retention.
             evidence_retention_dir=str(tmp_path / "retained-evidence"),
             challenge_anchor_block=100,
@@ -620,7 +620,7 @@ def test_candidate_snapshot_must_match_the_configured_challenge_anchor(
     mismatched_snapshot = {
         "schema": "cathedral_candidate_snapshot_v1",
         "network": "finney",
-        "netuid": 39,
+        "netuid": 94,
         "block": 101,
         "block_hash": "0x" + "ab" * 32,
         "hotkeys": [],
@@ -635,7 +635,7 @@ def test_candidate_snapshot_must_match_the_configured_challenge_anchor(
             config=RuntimeConfig(
                 production_mode=True,
                 score_network="finney",
-                score_netuid=39,
+                score_netuid=94,
                 evidence_retention_dir=str(tmp_path / "retained-evidence"),
                 challenge_anchor_block=100,
                 challenge_anchor_hash="0x" + "ab" * 32,
@@ -1153,7 +1153,7 @@ def test_deregistered_enrolled_miner_is_excluded_and_the_export_still_signs(
     candidate_snapshot = {
         "schema": "cathedral_candidate_snapshot_v1",
         "network": "finney",
-        "netuid": 39,
+        "netuid": 94,
         "block": 100,
         "block_hash": "0x" + "ab" * 32,
         # miner-a is enrolled but the chain has deregistered it: it is
@@ -1212,7 +1212,7 @@ def test_deregistered_enrolled_miner_is_excluded_and_the_export_still_signs(
             ledger,
             run.epoch_id,
             network="finney",
-            netuid=39,
+            netuid=94,
             class_id="confidential_compute",
             source_id="cathedralconfidential",
             signing_key_id="score-test-1",
@@ -1651,7 +1651,7 @@ def test_chip_rotation_to_new_hotkey_is_blocked_within_ttl(tmp_path: Path) -> No
             production_mode=False,
             allow_insecure_http_for_tests=True,
             score_network="finney",
-            score_netuid=39,
+            score_netuid=94,
         ),
     )
 

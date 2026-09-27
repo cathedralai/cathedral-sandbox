@@ -1,6 +1,6 @@
 """Retained legacy evidence bundles and signed index.
 
-The current direct SN39 validator verifies miners itself. It does not fetch
+The current direct SN94 validator verifies miners itself. It does not fetch
 these bundles or reproduce a Cathedral-signed weight vector from them.
 
 The launch evidence model has two tiers:
@@ -115,7 +115,7 @@ PER_VERIFIED_CANDIDATE_BYTES = (
 )
 # The supported candidate-set cardinality is shared with the score producer.
 # Candidate rows cost manifest bytes only; the 2 MiB manifest cap covers the
-# complete 4,096-hotkey SN39 metagraph contract.
+# complete 4,096-hotkey SN94 metagraph contract.
 MAX_MANIFEST_CANDIDATES = MAX_LAUNCH_CANDIDATES
 # The aggregate byte budget derives the maximum supported VERIFIED
 # cardinality. Keep the shared launch constant asserted against the derivation
@@ -621,7 +621,7 @@ def validate_manifest(document: Mapping[str, Any]) -> None:
         not isinstance(candidate_set, Mapping)
         or set(candidate_set)
         != {"source", "network", "netuid", "block", "block_hash", "candidates"}
-        or candidate_set["source"] != "sn39_metagraph"
+        or candidate_set["source"] != "sn94_metagraph"
         or candidate_set["network"] != document["network"]
         or candidate_set["netuid"] != document["netuid"]
     ):

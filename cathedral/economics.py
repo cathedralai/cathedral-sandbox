@@ -1,6 +1,6 @@
 """Retained legacy lane router with an optional floor and burn.
 
-The current direct SN39 validator does not call this router and uses zero burn.
+The current direct SN94 validator does not call this router and uses zero burn.
 This module remains as a low-level compatibility primitive and test surface.
 
 Three layers, sum-conserving to exactly 1.0:

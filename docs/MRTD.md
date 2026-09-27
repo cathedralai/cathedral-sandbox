@@ -48,7 +48,7 @@ library's strict policy path then checks it against `Policy.allowed_measurements
 derived from a verified signed policy registry. An empty or missing allowlist
 admits nothing.
 
-The current direct SN39 validator does not consult this registry, retain the
+The current direct SN94 validator does not consult this registry, retain the
 emitted measurement, or use it as a weight gate. It consumes the QVL verdict
 and verified stable platform identity. This section documents only the retained
 sandbox strict-policy library.
@@ -60,7 +60,7 @@ Intel TDX production decision.
 
 Within this policy path, the narrow claim is:
 
-> SN39 mainnet: validated Intel TDX CPU compute.
+> SN94 mainnet: validated Intel TDX CPU compute.
 
 The claim still requires fresh evidence, current collateral, allowed TCB
 status, no unapproved advisories, debug disabled, exact REPORTDATA and TLS-SPKI

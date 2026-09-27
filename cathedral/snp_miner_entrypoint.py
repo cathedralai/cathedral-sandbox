@@ -1,4 +1,4 @@
-"""Fixed entrypoint for the SN39 AMD SEV-SNP signed-fleet miner image.
+"""Fixed entrypoint for the SN94 AMD SEV-SNP signed-fleet miner image.
 
 The image has the same public deployment inputs as the TDX miner. It fixes the
 SNP collector, the pinned ``snpguest`` verifier, signed validator access, and

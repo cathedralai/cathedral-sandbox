@@ -3,7 +3,7 @@
 The retired thin validator fetched Cathedral's signed weight vector and
 checked its signature, key identity, network/netuid, freshness, policy
 identity, hotkey mapping, and burn policy before submitting. The current
-direct SN39 validator does not fetch a Cathedral vector or call this module.
+direct SN94 validator does not fetch a Cathedral vector or call this module.
 
 Full-provenance mode does not take that on trust. Given the public, signed,
 content-addressed evidence for an epoch, it independently:
@@ -1184,7 +1184,7 @@ def replay_positive_miners(
     """Upgrade a receipts-only result to FULL assurance via raw replay.
 
     FULL additionally REQUIRES an independent historical candidate oracle:
-    ``independent_candidates`` (the exact hotkey set registered on the SN39
+    ``independent_candidates`` (the exact hotkey set registered on the SN94
     metagraph AT the anchored block, captured by the VERIFIER's own chain
     access) and ``independent_block_hash`` (get_block_hash(block) from the
     same access). Two mutually consistent Cathedral-produced artifacts -

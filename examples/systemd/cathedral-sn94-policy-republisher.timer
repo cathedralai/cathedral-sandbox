@@ -1,5 +1,5 @@
 [Unit]
-Description=Legacy policy-library republisher timer, not current SN39 mining
+Description=Legacy policy-library republisher timer, not current SN94 mining
 
 [Timer]
 OnBootSec=5min
@@ -7,7 +7,7 @@ OnUnitActiveSec=12h
 AccuracySec=1min
 RandomizedDelaySec=10min
 Persistent=true
-Unit=cathedral-sn39-policy-republisher.service
+Unit=cathedral-sn94-policy-republisher.service
 
 [Install]
 WantedBy=timers.target

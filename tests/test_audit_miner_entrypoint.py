@@ -271,7 +271,7 @@ def test_entrypoint_execs_only_the_fixed_tls_tdx_worker_command(tmp_path: Path) 
         VALIDATOR_MINIMUM_STAKE_RAO
     ) == "0"
     assert argv[argv.index("--validator-network") + 1] == VALIDATOR_NETWORK == "finney"
-    assert argv[argv.index("--validator-netuid") + 1] == str(VALIDATOR_NETUID) == "39"
+    assert argv[argv.index("--validator-netuid") + 1] == str(VALIDATOR_NETUID) == "94"
     assert argv[argv.index("--public-endpoint") + 1] == PUBLIC_ENDPOINT
     assert argv[argv.index("--fleet-manifest") + 1] == str(FLEET_MANIFEST)
     assert argv[argv.index("--migration-mode") + 1] == "public-legacy-audit"
@@ -318,7 +318,7 @@ def test_entrypoint_refuses_unknown_environment_before_writing_tls(
 
 
 def test_image_pins_amd64_base_fixed_entrypoint_and_one_tls_port() -> None:
-    dockerfile = (REPOSITORY_ROOT / "Dockerfile.sn39-audit-miner").read_text()
+    dockerfile = (REPOSITORY_ROOT / "Dockerfile.sn94-audit-miner").read_text()
 
     assert f"FROM python:3.12-slim-bookworm@{BASE_MANIFEST_DIGEST}" in dockerfile
     assert (
@@ -329,13 +329,13 @@ def test_image_pins_amd64_base_fixed_entrypoint_and_one_tls_port() -> None:
     assert WORKER_BEARER_ENV not in dockerfile
     assert "WALLET_SEED" not in dockerfile
     assert f"install -d -o root -g root -m 0755 {TSM_REPORT_ROOT}" in dockerfile
-    assert 'org.cathedral.sn39.runtime-contract="signed-validator-fleet-v1"' in dockerfile
+    assert 'org.cathedral.sn94.runtime-contract="signed-validator-fleet-v1"' in dockerfile
     assert "import cathedral.audit_miner_entrypoint, cathedral.cli" in dockerfile
     assert "preflight_sr25519_verifier(load_sr25519_verifier())" in dockerfile
 
 
 def test_runtime_dependency_lock_is_exact_wheel_only_and_hash_checked() -> None:
-    requirements = (REPOSITORY_ROOT / "requirements" / "sn39-audit-miner.txt").read_text()
+    requirements = (REPOSITORY_ROOT / "requirements" / "sn94-audit-miner.txt").read_text()
 
     assert requirements.count("==") == 4
     assert requirements.count("--hash=sha256:") == 9
@@ -344,18 +344,18 @@ def test_runtime_dependency_lock_is_exact_wheel_only_and_hash_checked() -> None:
     assert "git+" not in requirements
     assert "http://" not in requirements
     assert "https://" not in requirements
-    dockerfile = (REPOSITORY_ROOT / "Dockerfile.sn39-audit-miner").read_text()
+    dockerfile = (REPOSITORY_ROOT / "Dockerfile.sn94-audit-miner").read_text()
     assert "--only-binary=:all:" in dockerfile
     assert "--require-hashes" in dockerfile
 
 
 def test_publisher_is_least_privilege_commit_tagged_and_digest_pinned() -> None:
     workflow = (
-        REPOSITORY_ROOT / ".github" / "workflows" / "publish-sn39-audit-miner.yml"
+        REPOSITORY_ROOT / ".github" / "workflows" / "publish-sn94-audit-miner.yml"
     ).read_text()
 
     assert "branches:\n      - main" in workflow
-    assert "- scripts/run_sn39_signed_fleet_miner.sh" in workflow
+    assert "- scripts/run_sn94_signed_fleet_miner.sh" in workflow
     assert "permissions: {}" in workflow
     assert workflow.count("packages: write") == 1
     assert workflow.count("contents: read") == 1
@@ -378,7 +378,7 @@ def test_publisher_is_least_privilege_commit_tagged_and_digest_pinned() -> None:
     assert 'commit_tag="sha-${GITHUB_SHA}"' in workflow
     assert "Refuse to overwrite the commit tag" in workflow
     assert "Could not prove the immutable image tag is unused" in workflow
-    assert "group: sn39-audit-miner-${{ github.sha }}" in workflow
+    assert "group: sn94-audit-miner-${{ github.sha }}" in workflow
     assert "cancel-in-progress: false" in workflow
     assert "provenance: mode=max" in workflow
     assert "subject-digest: ${{ steps.pin.outputs.digest }}" in workflow
@@ -394,7 +394,7 @@ def test_publisher_is_least_privilege_commit_tagged_and_digest_pinned() -> None:
 
 
 def test_operator_doc_keeps_digest_and_tdx_measurement_as_separate_boundaries() -> None:
-    documentation = (REPOSITORY_ROOT / "docs" / "SN39_AUDIT_MINER_IMAGE.md").read_text()
+    documentation = (REPOSITORY_ROOT / "docs" / "SN94_AUDIT_MINER_IMAGE.md").read_text()
     normalized_documentation = " ".join(documentation.split())
 
     assert (
@@ -414,10 +414,10 @@ def test_operator_doc_keeps_digest_and_tdx_measurement_as_separate_boundaries() 
 
 def test_operator_docs_bind_the_current_image_and_one_migration_boundary() -> None:
     image_documentation = (
-        REPOSITORY_ROOT / "docs" / "SN39_AUDIT_MINER_IMAGE.md"
+        REPOSITORY_ROOT / "docs" / "SN94_AUDIT_MINER_IMAGE.md"
     ).read_text()
     operations = (
-        REPOSITORY_ROOT / "docs" / "SN39_AUDIT_MINER_OPERATIONS.md"
+        REPOSITORY_ROOT / "docs" / "SN94_AUDIT_MINER_OPERATIONS.md"
     ).read_text()
     work_request = (REPOSITORY_ROOT / "docs" / "WORK_REQUEST_V2.md").read_text()
     mining = (REPOSITORY_ROOT / "README.md").read_text()
@@ -454,7 +454,7 @@ def test_operator_docs_bind_the_current_image_and_one_migration_boundary() -> No
 
 
 def test_host_startup_is_syntax_valid_and_pins_the_exact_pulled_runtime() -> None:
-    script_path = REPOSITORY_ROOT / "scripts" / "run_sn39_signed_fleet_miner.sh"
+    script_path = REPOSITORY_ROOT / "scripts" / "run_sn94_signed_fleet_miner.sh"
     script = script_path.read_text()
     readme = (REPOSITORY_ROOT / "README.md").read_text()
 
@@ -463,27 +463,27 @@ def test_host_startup_is_syntax_valid_and_pins_the_exact_pulled_runtime() -> Non
     )
     assert result.returncode == 0, result.stderr
     assert 'IMAGE_PREFIX="${IMAGE_PATH}@sha256:"' in script
-    assert '${SN39_AUDIT_MINER_IMAGE}" == "${IMAGE_PREFIX}"*' in script
-    assert 'image_digest="${SN39_AUDIT_MINER_IMAGE#"${IMAGE_PREFIX}"}"' in script
+    assert '${SN94_AUDIT_MINER_IMAGE}" == "${IMAGE_PREFIX}"*' in script
+    assert 'image_digest="${SN94_AUDIT_MINER_IMAGE#"${IMAGE_PREFIX}"}"' in script
     assert '"${image_digest}" =~ ^[0-9a-f]{64}$' in script
     assert 'docker pull --platform linux/amd64 "${IMAGE_PREFIX}${image_digest}"' in script
     assert ".RepoDigests" in script
-    assert 'grep -Fx -- "${SN39_AUDIT_MINER_IMAGE}"' in script
+    assert 'grep -Fx -- "${SN94_AUDIT_MINER_IMAGE}"' in script
     assert "{{.Os}}/{{.Architecture}}" in script
     assert hashlib.sha256(script_path.read_bytes()).hexdigest() in readme
-    assert "/usr/local/libexec/cathedral/run-sn39-miner" in readme
-    assert "org.cathedral.sn39.runtime-contract" in script
+    assert "/usr/local/libexec/cathedral/run-sn94-miner" in readme
+    assert "org.cathedral.sn94.runtime-contract" in script
     assert "--pull never" in script
 
 
 def test_host_startup_installs_only_the_fixed_tcp_8081_nftables_boundary() -> None:
     script = (
-        REPOSITORY_ROOT / "scripts" / "run_sn39_signed_fleet_miner.sh"
+        REPOSITORY_ROOT / "scripts" / "run_sn94_signed_fleet_miner.sh"
     ).read_text()
 
     assert "NFT_FAMILY='inet'" in script
-    assert "NFT_TABLE='cathedral_sn39'" in script
-    assert "table inet cathedral_sn39" in script
+    assert "NFT_TABLE='cathedral_sn94'" in script
+    assert "table inet cathedral_sn94" in script
     assert "counter tcp_8081_accept" in script
     assert "counter tcp_8081_drop" in script
     assert "policy accept" in script
@@ -505,7 +505,7 @@ def test_host_startup_installs_only_the_fixed_tcp_8081_nftables_boundary() -> No
 
 def test_host_startup_serializes_table_ownership_through_signal_cleanup() -> None:
     script = (
-        REPOSITORY_ROOT / "scripts" / "run_sn39_signed_fleet_miner.sh"
+        REPOSITORY_ROOT / "scripts" / "run_sn94_signed_fleet_miner.sh"
     ).read_text()
 
     lock = script.index('flock --nonblock 9')
@@ -519,7 +519,7 @@ def test_host_startup_serializes_table_ownership_through_signal_cleanup() -> Non
     kill_client = script.index('kill "${docker_client_pid}"')
     reap_client = script.index('wait "${docker_client_pid}"', kill_client)
     second_remove = script.index('docker rm --force "${CONTAINER_NAME}"', first_remove + 1)
-    assert "STARTUP_LOCK='/run/cathedral-sn39-startup.lock'" in script
+    assert "STARTUP_LOCK='/run/cathedral-sn94-startup.lock'" in script
     assert lock < trap < first_docker
     assert lock < first_nft
     assert delete_table < unlock < close_lock
@@ -529,14 +529,14 @@ def test_host_startup_serializes_table_ownership_through_signal_cleanup() -> Non
     assert "trap 'exit 130' INT" in script
     assert "trap 'exit 143' TERM" in script
     assert "trap 'exit 129' HUP" in script
-    assert '"${SN39_AUDIT_MINER_IMAGE}" &' in script
+    assert '"${SN94_AUDIT_MINER_IMAGE}" &' in script
     assert "docker_client_pid=$!" in script
     assert 'wait "${docker_client_pid}"' in script
 
 
 def test_host_startup_uses_fixed_owner_checked_mounts_and_container_limits() -> None:
     script = (
-        REPOSITORY_ROOT / "scripts" / "run_sn39_signed_fleet_miner.sh"
+        REPOSITORY_ROOT / "scripts" / "run_sn94_signed_fleet_miner.sh"
     ).read_text()
 
     assert "0:0:700:directory" in script

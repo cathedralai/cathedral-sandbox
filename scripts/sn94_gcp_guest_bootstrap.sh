@@ -9,13 +9,13 @@ unset DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG HTTP_PROXY HTTPS_PROXY ALL_PROXY
 unset http_proxy https_proxy all_proxy
 
 readonly METADATA_BASE='http://metadata.google.internal/computeMetadata/v1/instance/attributes'
-readonly POLLER_ATTRIBUTE='cathedral-sn39-poller'
-readonly POLLER_DIGEST_ATTRIBUTE='cathedral-sn39-poller-digest'
-readonly POLLER_PATH='/usr/local/libexec/cathedral-sn39-gcp-poller'
-readonly SERVICE_PATH='/etc/systemd/system/cathedral-sn39-signed-fleet.service'
+readonly POLLER_ATTRIBUTE='cathedral-sn94-poller'
+readonly POLLER_DIGEST_ATTRIBUTE='cathedral-sn94-poller-digest'
+readonly POLLER_PATH='/usr/local/libexec/cathedral-sn94-gcp-poller'
+readonly SERVICE_PATH='/etc/systemd/system/cathedral-sn94-signed-fleet.service'
 
 die() {
-  printf 'refusing SN39 GCP guest bootstrap: %s\n' "$*" >&2
+  printf 'refusing SN94 GCP guest bootstrap: %s\n' "$*" >&2
   exit 1
 }
 
@@ -42,11 +42,11 @@ fetch_metadata() {
 install -d -o root -g root -m 0700 /usr/local/libexec
 install -d -o root -g root -m 0700 /etc/cathedral/validator-access
 install -d -o root -g root -m 0700 /var/lib/cathedral/validator-access
-install -d -o root -g root -m 0700 /run/cathedral-sn39
+install -d -o root -g root -m 0700 /run/cathedral-sn94
 
-poller_candidate=$(mktemp /run/cathedral-sn39/poller.XXXXXX)
-digest_candidate=$(mktemp /run/cathedral-sn39/poller-digest.XXXXXX)
-service_candidate=$(mktemp /run/cathedral-sn39/service.XXXXXX)
+poller_candidate=$(mktemp /run/cathedral-sn94/poller.XXXXXX)
+digest_candidate=$(mktemp /run/cathedral-sn94/poller-digest.XXXXXX)
+service_candidate=$(mktemp /run/cathedral-sn94/service.XXXXXX)
 
 cleanup() {
   local status=$?
@@ -80,7 +80,7 @@ install -o root -g root -m 0700 "${poller_candidate}" "${POLLER_PATH}"
 
 printf '%s\n' \
   '[Unit]' \
-  'Description=Cathedral SN39 bounded signed-fleet metadata poller' \
+  'Description=Cathedral SN94 bounded signed-fleet metadata poller' \
   'After=docker.service network-online.target' \
   'Wants=docker.service network-online.target' \
   '' \
@@ -89,7 +89,7 @@ printf '%s\n' \
   'User=root' \
   'Group=root' \
   'UMask=0077' \
-  'ExecStart=/usr/local/libexec/cathedral-sn39-gcp-poller' \
+  'ExecStart=/usr/local/libexec/cathedral-sn94-gcp-poller' \
   'Restart=on-failure' \
   'RestartSec=10s' \
   'TimeoutStartSec=8min' \
@@ -104,6 +104,6 @@ printf '%s\n' \
 
 install -o root -g root -m 0644 "${service_candidate}" "${SERVICE_PATH}"
 systemctl daemon-reload
-systemctl enable --now cathedral-sn39-signed-fleet.service
-systemctl is-active --quiet cathedral-sn39-signed-fleet.service \
+systemctl enable --now cathedral-sn94-signed-fleet.service
+systemctl is-active --quiet cathedral-sn94-signed-fleet.service \
   || die 'signed-fleet poller service did not stay active'

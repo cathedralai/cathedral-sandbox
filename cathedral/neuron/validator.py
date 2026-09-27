@@ -1,6 +1,6 @@
 """Retained legacy validator wrapper and hardware-free epoch helpers.
 
-The current direct SN39 validator lives in ``cathedral-validator`` and does
+The current direct SN94 validator lives in ``cathedral-validator`` and does
 not import this module, consume its signed stream, or apply its router.
 
 Legacy epoch loop: challenge every miner, verify attestation, gate admission, run the

@@ -1,4 +1,4 @@
-"""Signed, versioned coldkey allowlist gating SN39 enrollment approval.
+"""Signed, versioned coldkey allowlist gating SN94 enrollment approval.
 
 The enrollment registry (cathedral/enroll.py) admits only miners whose owning
 coldkey appears in an operator-signed allowlist artifact. The artifact follows

@@ -535,24 +535,24 @@ def test_cli_defaults_to_root_only(tmp_path: Path, capsys):
 def test_example_unit_uses_a_standalone_checker_and_complete_import_trees():
     unit = (
         Path(__file__).resolve().parents[1]
-        / "examples/systemd/cathedral-sn39-policy-republisher.service"
+        / "examples/systemd/cathedral-sn94-policy-republisher.service"
     ).read_text()
 
     assert "/usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py" in unit
     assert "-m cathedral.privileged_paths" not in unit
     assert "--resolve-symlinks" in unit
-    assert "/opt/cathedral-sn39/.venv/pyvenv.cfg" in unit
-    assert "/opt/cathedral-sn39/scripts/cathedral_isolated_republisher.py" in unit
+    assert "/opt/cathedral-sn94/.venv/pyvenv.cfg" in unit
+    assert "/opt/cathedral-sn94/scripts/cathedral_isolated_republisher.py" in unit
     assert "--tree" in unit
-    assert "/opt/cathedral-sn39/cathedral" in unit
-    assert "/opt/cathedral-sn39/.venv/lib/python3.11/site-packages" in unit
-    assert "/var/lib/cathedral-confidential-sn39/policy-state.sqlite" in unit
-    assert "/var/lib/cathedral-confidential-sn39/policy-republication.jsonl" in unit
-    assert "/var/lib/cathedral-confidential-sn39/policy-writer.lock" in unit
+    assert "/opt/cathedral-sn94/cathedral" in unit
+    assert "/opt/cathedral-sn94/.venv/lib/python3.11/site-packages" in unit
+    assert "/var/lib/cathedral-confidential-sn94/policy-state.sqlite" in unit
+    assert "/var/lib/cathedral-confidential-sn94/policy-republication.jsonl" in unit
+    assert "/var/lib/cathedral-confidential-sn94/policy-writer.lock" in unit
     assert "--creatable-file" in unit
     assert "--directory" in unit
-    assert "/var/lib/cathedral-confidential-sn39/policy-history" in unit
-    assert "ExecStart=/opt/cathedral-sn39/.venv/bin/python -I -S " in unit
+    assert "/var/lib/cathedral-confidential-sn94/policy-history" in unit
+    assert "ExecStart=/opt/cathedral-sn94/.venv/bin/python -I -S " in unit
 
 
 def test_isolated_bootstrap_imports_checked_packages_without_running_pth(tmp_path: Path):

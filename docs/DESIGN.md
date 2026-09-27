@@ -3,7 +3,7 @@
 This is a code map, not a mining guide. Use the repository
 [README](../README.md) to run a miner.
 
-The repository contains both the current SN39 worker and reusable or retired
+The repository contains both the current SN94 worker and reusable or retired
 library components. The current validator reads miners directly. It does not
 use the older enrollment service, signed weight publisher, provenance bundle,
 or burn mechanism.

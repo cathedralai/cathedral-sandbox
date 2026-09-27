@@ -1,6 +1,6 @@
 """Retained probe loop for the legacy central enrollment registry.
 
-The current direct SN39 validator probes chain-discovered miners itself and
+The current direct SN94 validator probes chain-discovered miners itself and
 does not run ``cathedral-prober``.
 """
 
@@ -1011,7 +1011,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Retained legacy central-registry probe. Not used by the current "
-            "direct SN39 validator."
+            "direct SN94 validator."
         )
     )
     parser.add_argument("--db", default="cathedral-enroll.sqlite")

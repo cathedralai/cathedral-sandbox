@@ -2270,7 +2270,7 @@ def cmd_runtime_export_evidence(args: argparse.Namespace) -> int:
             receipts=manifest_receipts,
             attestations=attestations,
             candidate_set={
-                "source": "sn39_metagraph",
+                "source": "sn94_metagraph",
                 "network": args.score_network,
                 "netuid": args.score_netuid,
                 "block": int(snapshot_document["block"]),
@@ -2433,7 +2433,7 @@ def _verify_wire_vector(
     """Verify a retained legacy signed vector.
 
     This matches the retired thin-validator signature contract: Ed25519 over
-    sorted compact JSON minus ``signature``. The current direct SN39 validator
+    sorted compact JSON minus ``signature``. The current direct SN94 validator
     does not call this path.
     """
     from cryptography.exceptions import InvalidSignature
@@ -4524,10 +4524,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_policy = sub.add_parser(
         "policy-registry",
-        help="retained policy-library verifier; not current SN39 mining",
+        help="retained policy-library verifier; not current SN94 mining",
         description=(
             "Verify retained signed policy-registry artifacts. The current "
-            "direct SN39 validator does not consume this registry."
+            "direct SN94 validator does not consume this registry."
         ),
     )
     policy_sub = p_policy.add_subparsers(dest="policy_command", required=True)
@@ -4580,9 +4580,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_lifecycle = sub.add_parser(
         "lifecycle",
-        help="retained central-registry lifecycle; not current SN39 mining",
+        help="retained central-registry lifecycle; not current SN94 mining",
         description=(
-            "Inspect the retained central enrollment lifecycle. Current SN39 "
+            "Inspect the retained central enrollment lifecycle. Current SN94 "
             "miners and the direct validator do not use this command group."
         ),
     )
@@ -4633,7 +4633,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_enroll = sub.add_parser(
         "enroll",
-        help="retained legacy central-enrollment library; not current SN39 mining",
+        help="retained legacy central-enrollment library; not current SN94 mining",
         description=(
             "Operate the retained legacy central-enrollment registry. "
             "Current miners register on chain and do not use this command group."
@@ -4686,7 +4686,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--network", default="finney", help="network the policy must be bound to"
     )
     p_enroll_reconcile.add_argument(
-        "--netuid", type=int, default=39, help="netuid the policy must be bound to"
+        "--netuid", type=int, default=94, help="netuid the policy must be bound to"
     )
     p_enroll_reconcile.add_argument(
         "--allowlist-keys-digest",
@@ -4788,10 +4788,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_runtime = sub.add_parser(
         "runtime",
-        help="retained legacy receipt and publisher library; not current SN39 mining",
+        help="retained legacy receipt and publisher library; not current SN94 mining",
         description=(
             "Retained legacy receipt, report-epoch, and publisher library. "
-            "The current direct SN39 validator does not use this command group."
+            "The current direct SN94 validator does not use this command group."
         ),
     )
     runtime_sub = p_runtime.add_subparsers(dest="runtime_command", required=True)
@@ -4817,7 +4817,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--challenge-anchor-block",
             type=int,
             default=None,
-            help="finalized SN39 block number anchoring this epoch's derived "
+            help="finalized SN94 block number anchoring this epoch's derived "
             "challenge nonces (REQUIRED for production CPU scoring)",
         )
         command.add_argument(
@@ -5064,7 +5064,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_export_evidence.add_argument(
         "--candidate-snapshot",
         required=True,
-        help="cathedral_candidate_snapshot_v1 JSON: the anchored SN39 "
+        help="cathedral_candidate_snapshot_v1 JSON: the anchored SN94 "
         "metagraph (network/netuid/block/block_hash/hotkeys) the epoch "
         "loop observed; every registered hotkey is accounted for",
     )
@@ -5170,10 +5170,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_provenance = sub.add_parser(
         "provenance",
-        help="retained legacy signed-vector audit library; not current SN39 mining",
+        help="retained legacy signed-vector audit library; not current SN94 mining",
         description=(
             "Audit retained legacy receipt, evidence, and signed-vector artifacts. "
-            "The current direct SN39 validator does not use this command group."
+            "The current direct SN94 validator does not use this command group."
         ),
     )
     provenance_sub = p_provenance.add_subparsers(dest="provenance_command", required=True)
@@ -5188,7 +5188,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     source.add_argument("--evidence-dir", help="local evidence store directory")
     p_prov_verify.add_argument("--network", default="finney")
-    p_prov_verify.add_argument("--netuid", type=int, default=39)
+    p_prov_verify.add_argument("--netuid", type=int, default=94)
     p_prov_verify.add_argument(
         "--registry-keys", required=True, help="trusted policy-registry key file (key_id -> base64)"
     )
@@ -5289,7 +5289,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_prov_verify.add_argument(
         "--current-block",
         type=int,
-        help="trusted current finalized SN39 block (REQUIRED in production); "
+        help="trusted current finalized SN94 block (REQUIRED in production); "
         "the report's valid_from_block..valid_until_block window is "
         "enforced against it",
     )

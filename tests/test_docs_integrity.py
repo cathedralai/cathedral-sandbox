@@ -37,7 +37,7 @@ def test_readme_is_the_single_current_mining_guide() -> None:
         "0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255",
         "current migration bridge",
         "btcli axon set",
-        "/usr/local/libexec/cathedral/run-sn39-miner",
+        "/usr/local/libexec/cathedral/run-sn94-miner",
         "separate miner-controlled machine",
         "not yet a one-command unattended installation",
         "process supervisor",
@@ -55,13 +55,13 @@ def test_current_operator_docs_exclude_retired_launch_paths() -> None:
         "MINING.md",
         "docs/README.md",
         "docs/DESIGN.md",
-        "docs/SN39_AUDIT_MINER_IMAGE.md",
-        "docs/SN39_AUDIT_MINER_OPERATIONS.md",
+        "docs/SN94_AUDIT_MINER_IMAGE.md",
+        "docs/SN94_AUDIT_MINER_OPERATIONS.md",
         "docs/WORK_REQUEST_V2.md",
         "docs/TDX_LAUNCH.md",
         "docs/TDX_VERIFIER_RELEASE.md",
         "docs/AMD_SEV_SNP_FRIEND_TEST.md",
-        "docs/SN39_SNP_MINER_IMAGE.md",
+        "docs/SN94_SNP_MINER_IMAGE.md",
         "docs/TESTING.md",
     )
     text = "\n".join((REPO_ROOT / path).read_text() for path in current_paths)
@@ -74,7 +74,7 @@ def test_current_operator_docs_exclude_retired_launch_paths() -> None:
         "uid124",
         "/v1/enroll",
         "source-ready scored path",
-        "source-ready sn39 cpu path",
+        "source-ready sn94 cpu path",
         "matching validator release",
         "separate cathedral validator releases a pin",
         "exact snp admission policy are published",
@@ -93,8 +93,8 @@ def test_current_guide_never_runs_user_writable_code_as_root() -> None:
     assert "sudo cathedral-runtime/" not in readme
     assert "sudo cathedral-access/" not in readme
     assert "sudo --preserve-env" in readme
-    assert "/usr/local/libexec/cathedral/run-sn39-miner" in readme
-    assert "2ba50ed1342406759aa2b78d5e019caa347c4db1dfa5e8c66d2e8452498032b1" in readme
+    assert "/usr/local/libexec/cathedral/run-sn94-miner" in readme
+    assert "bad027acb1a46915723fc51ec2fa537bd632148b5715477223e2eddb6ab67c25" in readme
 
 
 def test_validator_access_signing_seed_stays_outside_the_checkout() -> None:
@@ -128,10 +128,10 @@ def test_current_guide_proves_reachability_before_paid_registration() -> None:
         "### 4. Register and announce the hotkey"
     )
     assert readme.index('test "$HEALTH_STATUS" = 400') < readme.index(
-        "subnet register --netuid 39"
+        "subnet register --netuid 94"
     )
     assert "btcli --network finney query uid" in readme
-    assert "btcli --network finney --json query weights --netuid 39" in readme
+    assert "btcli --network finney --json query weights --netuid 94" in readme
     assert "There is not yet a public validator-result feed" in readme
 
 
@@ -169,8 +169,8 @@ def test_snp_operator_surfaces_pin_the_published_image_without_placeholders() ->
     surfaces = (
         "README.md",
         "docs/AMD_SEV_SNP_FRIEND_TEST.md",
-        "docs/SN39_SNP_MINER_IMAGE.md",
-        "examples/systemd/sn39-snp-miner.env.example",
+        "docs/SN94_SNP_MINER_IMAGE.md",
+        "examples/systemd/sn94-snp-miner.env.example",
     )
 
     for path in surfaces:
@@ -178,7 +178,7 @@ def test_snp_operator_surfaces_pin_the_published_image_without_placeholders() ->
         assert image_ref in document, path
         assert placeholder not in document, path
 
-    for path in ("docs/AMD_SEV_SNP_FRIEND_TEST.md", "docs/SN39_SNP_MINER_IMAGE.md"):
+    for path in ("docs/AMD_SEV_SNP_FRIEND_TEST.md", "docs/SN94_SNP_MINER_IMAGE.md"):
         document = (REPO_ROOT / path).read_text()
         assert source_commit in document, path
         assert "no digest is listed" not in document.lower(), path
@@ -188,7 +188,7 @@ def test_current_docs_state_direct_validator_security_contracts() -> None:
     launch = (REPO_ROOT / "docs" / "TDX_LAUNCH.md").read_text()
     measurement = " ".join((REPO_ROOT / "docs" / "MRTD.md").read_text().split())
     operations = " ".join(
-        (REPO_ROOT / "docs" / "SN39_AUDIT_MINER_OPERATIONS.md").read_text().split()
+        (REPO_ROOT / "docs" / "SN94_AUDIT_MINER_OPERATIONS.md").read_text().split()
     )
 
     assert "does not trust the self-signed certificate through a public CA" in launch
@@ -242,12 +242,12 @@ def test_retained_executables_do_not_claim_current_launch_proof() -> None:
         assert "current" in opening and "not" in opening, relative
 
     for relative in (
-        "scripts/sn39_gcp_guest_poller.py",
-        "scripts/sn39_gcp_snapshot_publisher.py",
+        "scripts/sn94_gcp_guest_poller.py",
+        "scripts/sn94_gcp_snapshot_publisher.py",
     ):
         text = (REPO_ROOT / relative).read_text().lower()
         assert "retired" in text, relative
-        assert "not part of current direct sn39 mining" in text or "not current sn39 mining" in text
+        assert "not part of current direct sn94 mining" in text or "not current sn94 mining" in text
 
 
 def test_runtime_help_does_not_point_at_deleted_documents() -> None:
@@ -256,7 +256,7 @@ def test_runtime_help_does_not_point_at_deleted_documents() -> None:
         "docs/BUDGET.md",
         "docs/PROVENANCE.md",
         "docs/RELEASE_CHECKLIST.md",
-        "docs/SN39_GCP_SIGNED_FLEET_DELIVERY.md",
+        "docs/SN94_GCP_SIGNED_FLEET_DELIVERY.md",
     )
     source = "\n".join(
         path.read_text()

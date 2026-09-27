@@ -1,4 +1,4 @@
-"""Cathedral — confidential compute subnet (SN39).
+"""Cathedral — confidential compute subnet (SN94).
 
 Attestation is admission; verified work is currency. See docs/DESIGN.md.
 """

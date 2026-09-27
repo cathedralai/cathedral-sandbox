@@ -1,11 +1,11 @@
 # Retired enrollment library
 
 This is a developer note for code which remains covered by tests. It is not a
-current SN39 mining step.
+current SN94 mining step.
 
 The old enrollment service accepted signed miner submissions and restricted
 them with an operator-signed coldkey allowlist. The current direct validator
-does not call that service. It discovers serving miner axons from SN39 and
+does not call that service. It discovers serving miner axons from SN94 and
 authenticates worker requests with the validator-access protocol described in
 the repository [README](../README.md).
 

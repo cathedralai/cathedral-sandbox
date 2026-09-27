@@ -114,7 +114,7 @@ def collect_snp_report_only(
     channel_binding: ChannelBinding | None = None,
     report_data_version: int = 1,
 ) -> Evidence:
-    """Collect the bounded SNP report used by the production SN39 worker.
+    """Collect the bounded SNP report used by the production SN94 worker.
 
     The validator independently obtains and verifies AMD collateral. Keeping
     KDS access out of the request path prevents a miner-side network fetch from

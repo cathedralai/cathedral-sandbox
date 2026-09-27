@@ -239,7 +239,7 @@ def test_snapshot_is_the_extended_format_the_gate_resolves(tmp_path, monkeypatch
                 "--network",
                 "finney",
                 "--netuid",
-                "39",
+                "94",
                 "--output",
                 str(output),
                 "--require-hotkey",
@@ -254,7 +254,7 @@ def test_snapshot_is_the_extended_format_the_gate_resolves(tmp_path, monkeypatch
         max_age_seconds=3600,
         strict=True,
         network="finney",
-        netuid=39,
+        netuid=94,
         expected_uid=os.getuid(),
         high_water_store=RegistryStore(str(tmp_path / "registry.sqlite")),
         advance_high_water_on_use=True,
@@ -270,7 +270,7 @@ def test_snapshot_is_the_extended_format_the_gate_resolves(tmp_path, monkeypatch
 
 @pytest.mark.parametrize(
     "network,netuid,block",
-    [("FINNEY", 39, 42), ("finney", -1, 42), ("finney", 39, 2**53 + 1)],
+    [("FINNEY", 94, 42), ("finney", -1, 42), ("finney", 94, 2**53 + 1)],
 )
 def test_snapshot_builder_rejects_an_invalid_audience_or_block(
     network, netuid, block
@@ -300,7 +300,7 @@ def test_snapshot_aborts_when_a_required_hotkey_is_missing(tmp_path, monkeypatch
                 "--network",
                 "finney",
                 "--netuid",
-                "39",
+                "94",
                 "--output",
                 str(output),
                 "--require-hotkey",

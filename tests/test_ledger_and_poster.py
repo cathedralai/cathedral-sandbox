@@ -639,7 +639,7 @@ class TestReportSnapshot:
             {"hk"},
             generated_at="2026-01-07T12:00:00Z",
             score_network="finney",
-            score_netuid=39,
+            score_netuid=94,
         )
         first_body = ledger.report_bytes(epoch_id)
         first_digest = ledger.report_digest(epoch_id)
@@ -658,7 +658,7 @@ class TestReportSnapshot:
         assert payload["epoch"] == 7
         assert payload["complete"] is True
         assert payload["network"] == "finney"
-        assert payload["netuid"] == 39
+        assert payload["netuid"] == 94
         assert payload["generated_at"] == "2026-01-07T12:00:00Z"
         assert payload["scores"] == [{"miner_hotkey": "hk", "score": 1.0}]
         assert (
@@ -669,9 +669,9 @@ class TestReportSnapshot:
     @pytest.mark.parametrize(
         ("network", "netuid"),
         [
-            (None, 39),
+            (None, 94),
             ("finney", None),
-            (" finney", 39),
+            (" finney", 94),
             ("finney", True),
             ("finney", -1),
             ("finney", 65536),
@@ -1246,12 +1246,12 @@ class FakeResponse:
         pass
 
 
-VALID_REPORT = b'{"network":"finney","netuid":39}'
+VALID_REPORT = b'{"network":"finney","netuid":94}'
 
 
 def make_poster(**kwargs) -> Poster:
     kwargs.setdefault("network", "finney")
-    kwargs.setdefault("netuid", 39)
+    kwargs.setdefault("netuid", 94)
     return Poster(
         "https://publisher.example/v1/external-scores/violet",
         "bearer-token",
@@ -1325,14 +1325,14 @@ class TestPoster:
                 "token",
                 "secret",
                 network="finney",
-                netuid=39,
+                netuid=94,
             )
         Poster(
             "http://localhost/v1/external-scores/violet",
             "token",
             "secret",
             network="finney",
-            netuid=39,
+            netuid=94,
             allow_http_for_tests=True,
         )
         with pytest.raises(PosterError, match="endpoint path"):
@@ -1341,7 +1341,7 @@ class TestPoster:
                 "token",
                 "secret",
                 network="finney",
-                netuid=39,
+                netuid=94,
             )
 
     @pytest.mark.parametrize("secret", ["", b""])
@@ -1352,12 +1352,12 @@ class TestPoster:
                 "token",
                 secret,
                 network="finney",
-                netuid=39,
+                netuid=94,
             )
 
     def test_posts_exact_body_with_required_headers_and_signature(self) -> None:
         poster = make_poster()
-        body = b'{"complete":true,"epoch":1,"network":"finney","netuid":39}'
+        body = b'{"complete":true,"epoch":1,"network":"finney","netuid":94}'
         response = FakeResponse([b'{"status":"accepted"}', b""])
         captured = {}
 
@@ -1380,7 +1380,7 @@ class TestPoster:
 
     def test_retry_posts_same_bytes_without_mutation(self) -> None:
         poster = make_poster()
-        body = b'{"network":"finney","netuid":39,"scores":[{"miner_hotkey":"hk","score":1.0}]}'
+        body = b'{"network":"finney","netuid":94,"scores":[{"miner_hotkey":"hk","score":1.0}]}'
         seen: list[bytes] = []
 
         def open_request(request, *, timeout):
@@ -1462,7 +1462,7 @@ class TestPoster:
         [
             b'{"network":"finney"}',
             b'{"network":"finney","netuid":true}',
-            b'{"network":"test","netuid":39}',
+            b'{"network":"test","netuid":94}',
             b'{"network":"finney","netuid":40}',
         ],
     )
@@ -1506,7 +1506,7 @@ class TestPoster:
                 "bearer-token",
                 "hmac-secret",
                 network="finney",
-                netuid=39,
+                netuid=94,
                 allow_http_for_tests=True,
                 connect_timeout=5.0,
                 read_timeout=5.0,
@@ -1538,7 +1538,7 @@ class TestPoster:
                 "bearer-token",
                 "hmac-secret",
                 network="finney",
-                netuid=39,
+                netuid=94,
                 allow_http_for_tests=True,
                 connect_timeout=5.0,
                 read_timeout=5.0,
@@ -1560,7 +1560,7 @@ def test_ledger_report_is_posted_byte_for_byte_and_then_marked() -> None:
     epoch_id = ledger.begin_epoch(1)
     verified_work(ledger, epoch_id, "challenge", "hk", 1)
     attest(ledger, epoch_id, "hk")
-    ledger.complete_epoch(epoch_id, {"hk"}, score_network="finney", score_netuid=39)
+    ledger.complete_epoch(epoch_id, {"hk"}, score_network="finney", score_netuid=94)
     body = ledger.report_bytes(epoch_id)
 
     poster = make_poster()
@@ -1591,7 +1591,7 @@ def test_complete_epoch_refuses_more_verified_miners_than_evidence_can_export() 
             epoch_id,
             hotkeys,
             score_network="finney",
-            score_netuid=39,
+            score_netuid=94,
         )
     assert ledger.get_epoch(epoch_id)["status"] == "running"
 
@@ -1608,7 +1608,7 @@ def test_complete_epoch_refuses_hotkey_the_subnet_ingest_cannot_accept() -> None
             epoch_id,
             {oversized},
             score_network="finney",
-            score_netuid=39,
+            score_netuid=94,
         )
     assert ledger.get_epoch(epoch_id)["status"] == "running"
 
@@ -1624,7 +1624,7 @@ def test_complete_epoch_refuses_json_escape_amplifying_unicode_hotkey() -> None:
             epoch_id,
             {unicode_hotkey},
             score_network="finney",
-            score_netuid=39,
+            score_netuid=94,
         )
     assert ledger.get_epoch(epoch_id)["status"] == "running"
 
@@ -1638,7 +1638,7 @@ def test_legacy_oversized_wire_body_is_refused_before_publication_network() -> N
         epoch_id,
         set(),
         score_network="finney",
-        score_netuid=39,
+        score_netuid=94,
     )
     document = json.loads(ledger.report_bytes(epoch_id))
     document["metadata"]["legacy_padding"] = "x" * MAX_LAUNCH_WIRE_REPORT_BYTES
@@ -1670,7 +1670,7 @@ def test_legacy_completed_over_cap_is_refused_before_publication_network() -> No
         epoch_id,
         set(),
         score_network="finney",
-        score_netuid=39,
+        score_netuid=94,
     )
     document = json.loads(ledger.report_bytes(epoch_id))
     document["scores"] = [
@@ -1703,7 +1703,7 @@ def test_retry_with_wrong_audience_never_opens_network_or_marks_published() -> N
         epoch_id,
         set(),
         score_network="finney",
-        score_netuid=39,
+        score_netuid=94,
     )
     poster = make_poster(netuid=40)
     called = False
@@ -1727,9 +1727,9 @@ def test_corrupt_frozen_body_is_rejected_before_publication_network() -> None:
         epoch_id,
         set(),
         score_network="finney",
-        score_netuid=39,
+        score_netuid=94,
     )
-    tampered = b'{"complete":true,"network":"finney","netuid":39}'
+    tampered = b'{"complete":true,"network":"finney","netuid":94}'
     ledger._connection.execute(
         "UPDATE epochs SET report_body = ? WHERE epoch_id = ?",
         (tampered, epoch_id),

@@ -1,6 +1,6 @@
 """Retained legacy enrollment registry and public attestation board.
 
-The current direct SN39 validator discovers miners from the chain and does
+The current direct SN94 validator discovers miners from the chain and does
 not use this central registry. This module remains for compatibility tests and
 historical artifact handling.
 
@@ -115,7 +115,7 @@ _DEFAULT_REGISTRATION_MAX_AGE_SECONDS = 3600
 # production admission artifact is configured.
 ENROLL_DOMAIN_TAG = "cathedral-enroll-v1"
 DEFAULT_ENROLL_NETWORK = "finney"
-DEFAULT_ENROLL_NETUID = 39
+DEFAULT_ENROLL_NETUID = 94
 
 # RegistryStore is shared by enrollment and the epoch loop. Keep the existing
 # sqlite3 default at five seconds unless one caller explicitly chooses a lower
@@ -3885,7 +3885,7 @@ class _QuietRequestHandler(WSGIRequestHandler):
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Retained legacy miner enrollment registry. Current SN39 mining "
+            "Retained legacy miner enrollment registry. Current SN94 mining "
             "discovers miners directly from chain state."
         )
     )

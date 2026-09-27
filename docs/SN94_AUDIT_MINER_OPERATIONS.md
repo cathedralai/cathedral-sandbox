@@ -1,4 +1,4 @@
-# SN39 miner image operations
+# SN94 miner image operations
 
 This is a release reference, not a second mining guide. Start with the
 repository [README](../README.md).
@@ -20,7 +20,7 @@ artifact exists. It does not prove a miner is online or receiving weight.
 ## Fixed behavior
 
 - Intel TDX only.
-- Finney SN39 only.
+- Finney SN94 only.
 - One public hotkey and one public HTTPS axon origin.
 - A miner-owned, short-lived snapshot of current validator-permit hotkeys.
 - A persistent replay and snapshot high-water database.

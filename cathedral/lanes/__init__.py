@@ -1,6 +1,6 @@
 """Retained five-lane product-library interface.
 
-Current SN39 scoring uses the direct validator's bounded SAT challenge, not
+Current SN94 scoring uses the direct validator's bounded SAT challenge, not
 this routing vector or the unimplemented inference, training, RL, and agent
 hosting lanes.
 

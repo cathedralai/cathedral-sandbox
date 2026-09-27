@@ -1,6 +1,6 @@
 """Contract: the frozen launch cardinality is actually frozen.
 
-`cathedral/launch_limits.py` calls itself a "Frozen SN39 Intel TDX launch
+`cathedral/launch_limits.py` calls itself a "Frozen SN94 Intel TDX launch
 cardinality contract" and says its limits are "shared by the score producer,
 evidence exporter, and independent verifier". Nothing froze them. Four of the
 six could be changed with the whole suite still green:
@@ -54,7 +54,7 @@ def test_launch_cardinality_is_frozen():
 def test_subnet_intake_ceilings_are_frozen():
     """Exact ceilings owned by the subnet publisher, not by this repository.
 
-    `MAX_LAUNCH_HOTKEY_BYTES` is "the exact upper bound accepted by the SN39
+    `MAX_LAUNCH_HOTKEY_BYTES` is "the exact upper bound accepted by the SN94
     confidential-score intake", and `MAX_LAUNCH_WIRE_REPORT_BYTES` is the
     "exact authenticated intake ceiling on the subnet publisher". Raising
     either lets the producer publish something the publisher must reject, which
