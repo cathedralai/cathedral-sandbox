@@ -33,8 +33,8 @@ def test_readme_is_the_single_current_mining_guide() -> None:
         "Intel TDX",
         "AMD SEV-SNP",
         "Validator path merged, live hardware policy pending",
-        "c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99",
-        "0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255",
+        "e7f8b1b2d8ffb3f7a3a2f006e39d036c7631ae0fb01e7e30d56f483f25dd8503",
+        "d477a68dffe1213ef31c86248dbc12bd1c10508cf3cf0d591694cff1ce16eda0",
         "current migration bridge",
         "btcli axon set",
         "/usr/local/libexec/cathedral/run-sn94-miner",
@@ -162,9 +162,9 @@ def test_amd_friend_test_creates_exact_launcher_directories() -> None:
 def test_snp_operator_surfaces_pin_the_published_image_without_placeholders() -> None:
     image_ref = (
         "ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:"
-        "0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255"
+        "d477a68dffe1213ef31c86248dbc12bd1c10508cf3cf0d591694cff1ce16eda0"
     )
-    source_commit = "8dde6eaca27116eed53386a1fa33ec70b74a01fb"
+    source_commit = "a66d7c4ca970487026c130610ee9efefa0416a07"
     placeholder = "REPLACE_WITH_" + "PUBLISHED_DIGEST"
     surfaces = (
         "README.md",

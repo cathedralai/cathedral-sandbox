@@ -101,24 +101,24 @@ If Docker and registry access are available, inspect the published Intel image
 without starting it:
 
 ```bash
-TDX_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99'
+TDX_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:e7f8b1b2d8ffb3f7a3a2f006e39d036c7631ae0fb01e7e30d56f483f25dd8503'
 docker pull --platform linux/amd64 "$TDX_IMAGE"
 test "$(docker image inspect "$TDX_IMAGE" --format '{{.Os}}/{{.Architecture}}')" = \
   linux/amd64
 test "$(docker image inspect "$TDX_IMAGE" --format \
   '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
-  78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+  a66d7c4ca970487026c130610ee9efefa0416a07
 test "$(docker image inspect "$TDX_IMAGE" --format \
   '{{index .Config.Labels "org.cathedral.sn94.runtime-contract"}}')" = \
   signed-validator-fleet-v1
 
-SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255'
+SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:d477a68dffe1213ef31c86248dbc12bd1c10508cf3cf0d591694cff1ce16eda0'
 docker pull --platform linux/amd64 "$SNP_IMAGE"
 test "$(docker image inspect "$SNP_IMAGE" --format '{{.Os}}/{{.Architecture}}')" = \
   linux/amd64
 test "$(docker image inspect "$SNP_IMAGE" --format \
   '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
-  8dde6eaca27116eed53386a1fa33ec70b74a01fb
+  a66d7c4ca970487026c130610ee9efefa0416a07
 test "$(docker image inspect "$SNP_IMAGE" --format \
   '{{index .Config.Labels "org.cathedral.sn94.runtime-contract"}}')" = \
   snp-signed-validator-fleet-v1
@@ -158,9 +158,9 @@ following this current GitHub README after the checkout.
 
 ```bash
 git clone https://github.com/cathedralai/cathedral-sandbox.git cathedral-runtime
-git -C cathedral-runtime checkout --detach 78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+git -C cathedral-runtime checkout --detach a66d7c4ca970487026c130610ee9efefa0416a07
 test "$(git -C cathedral-runtime rev-parse HEAD)" = \
-  78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+  a66d7c4ca970487026c130610ee9efefa0416a07
 test -z "$(git -C cathedral-runtime status --porcelain)"
 
 python3.12 -m venv cathedral-runtime/.venv
@@ -194,9 +194,9 @@ files and keep following this current GitHub README.
 
 ```bash
 git clone https://github.com/cathedralai/cathedral-sandbox.git cathedral-access
-git -C cathedral-access checkout --detach 78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+git -C cathedral-access checkout --detach a66d7c4ca970487026c130610ee9efefa0416a07
 test "$(git -C cathedral-access rev-parse HEAD)" = \
-  78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+  a66d7c4ca970487026c130610ee9efefa0416a07
 test -z "$(git -C cathedral-access status --porcelain)"
 
 python3.12 -m venv cathedral-access/.venv
@@ -445,11 +445,11 @@ protected route closes until a fresh snapshot arrives.
 The current live-testing image is immutable:
 
 ```text
-ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99
+ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:e7f8b1b2d8ffb3f7a3a2f006e39d036c7631ae0fb01e7e30d56f483f25dd8503
 ```
 
 ```bash
-export SN94_AUDIT_MINER_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99'
+export SN94_AUDIT_MINER_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:e7f8b1b2d8ffb3f7a3a2f006e39d036c7631ae0fb01e7e30d56f483f25dd8503'
 export CATHEDRAL_MINER_HOTKEY='YOUR_PUBLIC_HOTKEY'
 export CATHEDRAL_PUBLIC_ENDPOINT='https://YOUR_PUBLIC_IPV4:8081'
 export CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST='PASTE_KEYS_DIGEST_VALUE'

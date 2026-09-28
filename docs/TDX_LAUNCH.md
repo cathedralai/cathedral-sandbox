@@ -14,7 +14,7 @@ that path.
 The current live-testing image is:
 
 ```text
-ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99
+ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:e7f8b1b2d8ffb3f7a3a2f006e39d036c7631ae0fb01e7e30d56f483f25dd8503
 ```
 
 That image starts `worker migrate --migration-mode public-legacy-audit`. It is
