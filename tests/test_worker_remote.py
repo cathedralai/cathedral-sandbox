@@ -1001,7 +1001,10 @@ def test_busy_returns_503():
 
 
 def test_partial_bodies_are_bounded_before_handler_threads_can_grow():
-    """Every long-lived partial-body thread consumes one finite admission slot."""
+    """Every long-lived partial-body thread consumes one finite admission slot.
+
+    Parsed requests are protected; only an idle connection that has not shown a
+    request yields its permit to a newcomer, so the thread count never grows."""
     evidence_payload = json.dumps(
         {"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}
     ).encode()
@@ -1015,34 +1018,83 @@ def test_partial_bodies_are_bounded_before_handler_threads_can_grow():
     ) as srv:
         _start_server(srv)
         stalled = [
-            _stall_post_connection(
-                srv.port, path="/v1/evidence", bearer=TEST_BEARER
-            ),
-            _stall_post_connection(
-                srv.port,
-                path="/v1/evidence",
-                bearer=TEST_BEARER,
-            ),
-            _stall_post_connection(
-                srv.port, path="/v1/sat-work", bearer=TEST_BEARER
-            ),
-            # Before headers identify a request class, the fourth connection
-            # consumes the final server-level slot.
-            socket.create_connection(("127.0.0.1", srv.port), timeout=10),
+            _stall_post_connection(srv.port, path="/v1/evidence", bearer=TEST_BEARER),
+            _stall_post_connection(srv.port, path="/v1/evidence", bearer=TEST_BEARER),
+            _stall_post_connection(srv.port, path="/v1/sat-work", bearer=TEST_BEARER),
         ]
+        # Before headers identify a request class, the fourth connection
+        # consumes the final server-level slot.
+        idle = socket.create_connection(("127.0.0.1", srv.port), timeout=10)
         try:
             _wait_for_active_connections(srv, 4)
-            for _ in range(20):
-                # The pre-handler gate has no parsed HTTP request and closes
-                # immediately. Class-pool saturation, tested separately,
-                # remains the point that returns a deterministic HTTP 503.
-                assert _connection_gate_response(srv.port) == b""
-                assert srv._server.active_connection_count == 4
+            for _ in range(5):
+                # A newcomer takes the idle connection's permit; the three
+                # parsed, stalled requests keep theirs.
+                assert _connection_gate_response(srv.port) != b""
+            # Evicted records linger until their threads clean up.
+            _wait_for_active_connections(srv, 3)
+            assert srv._server.evicted_connection_count >= 1
+            idle.settimeout(2.0)
+            assert idle.recv(1) == b""  # the server closed the evicted socket
         finally:
             for conn in stalled:
                 conn.close()
+            idle.close()
         _wait_for_active_connections(srv, 0)
         assert _post_raw(f"{srv.base_url}/v1/evidence", evidence_payload)[0] == 200
+
+
+def test_idle_sockets_cannot_lock_out_a_real_request():
+    """Review finding W1: holding every permit with idle sockets used to make the
+    miner look offline to every validator."""
+    payload = json.dumps({"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}).encode()
+    with WorkerServer(evidence_collector=_fake_evidence, max_connection_concurrent=10) as srv:
+        _start_server(srv)
+        idle = [socket.create_connection(("127.0.0.1", srv.port), timeout=10) for _ in range(10)]
+        try:
+            _wait_for_active_connections(srv, 10)
+            for _ in range(3):
+                assert _post_raw(f"{srv.base_url}/v1/evidence", payload)[0] == 200
+            # The first request takes an idle socket's permit; it releases it when
+            # done, so later requests find it free.
+            assert srv._server.evicted_connection_count >= 1
+            assert srv._server.active_connection_count <= 10
+        finally:
+            for conn in idle:
+                conn.close()
+
+
+def test_a_newcomer_is_refused_only_when_every_permit_shows_a_request():
+    with WorkerServer(evidence_collector=_fake_evidence, max_connection_concurrent=10) as srv:
+        _start_server(srv)
+        held = [socket.create_connection(("127.0.0.1", srv.port), timeout=10) for _ in range(10)]
+        try:
+            _wait_for_active_connections(srv, 10)
+            # Stand in for ten parsed, in-flight requests.
+            with srv._server._active_lock:
+                requests = list(srv._server._active_requests)
+            for request in requests:
+                srv._server.protect_connection(request)
+            for _ in range(5):
+                assert _connection_gate_response(srv.port) == b""
+            assert srv._server.evicted_connection_count == 0
+            assert srv._server.active_connection_count == 10
+        finally:
+            for conn in held:
+                conn.close()
+
+
+def test_the_default_ceiling_leaves_room_before_authentication():
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        slots = srv._server._connection_slots
+        expected = (
+            worker_module.MAX_CONCURRENT
+            + worker_module.MAX_CHALLENGE_CONCURRENT
+            + worker_module.MAX_SAT_CHALLENGE_CONCURRENT
+            + worker_module.PREAUTH_CONNECTION_HEADROOM
+        )
+        assert slots._initial_value == expected
 
 
 def test_saturated_class_pool_returns_503_before_body_framing():
