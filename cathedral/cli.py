@@ -1301,6 +1301,15 @@ def cmd_worker_reset_replay_clock(args: argparse.Namespace) -> int:
     return 0
 
 
+def _same_file(first: str, second: str) -> bool:
+    """True when two paths name one file, whether or not it exists yet."""
+
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return os.path.realpath(first) == os.path.realpath(second)
+
+
 def cmd_worker_serve(args: argparse.Namespace) -> int:
     posture = getattr(args, "worker_posture", "production")
     if posture not in {"production", "snp-production", "gpu-production", "g4-prelaunch", "development", "migration"}:
@@ -1440,7 +1449,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             )
         if not signed_access_configured:
             raise ValueError("central access requires signed validator access and native TLS")
-        if central_values[2] == access_state_path:
+        if _same_file(central_values[2], access_state_path):
             raise ValueError("central access state must be separate from validator access state")
     # The locality guard keys off AUTHENTICATION, not TLS.
     #
@@ -1612,7 +1621,11 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
     if central_enabled:
         if validator_authorizer is None or channel_binding is None:
             raise ValueError("central access requires signed validator access and native TLS")
-        from cathedral.central_access import CentralAccessAuthorizer, load_central_root_keys
+        from cathedral.central_access import (
+            CentralAccessAuthorizer,
+            load_central_root_keys,
+            open_central_access_state,
+        )
 
         central_authorizer = CentralAccessAuthorizer(
             load_central_root_keys(central_values[0], pinned_digest=central_values[1]),
@@ -1620,7 +1633,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             network=provider.network,
             netuid=provider.netuid,
             channel_binding=channel_binding,
-            state=ValidatorAccessState(central_values[2]),
+            state=open_central_access_state(central_values[2]),
         )
     gpu_executor = None
     gpu_evidence_collector = None
