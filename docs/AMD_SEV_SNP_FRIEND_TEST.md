@@ -51,11 +51,22 @@ pin a guest to one socket (56860 section 4.4). Upstream Linux KVM issues
 launch a guest that satisfies the default, and your validator's operator must
 decide whether to set `require_single_socket` to `false`. The flag is
 policy-wide: it applies to every admitted processor generation, not to one
-(cathedral-validator `snp_production.py` lines 54-58 and 131-138).
+(cathedral-validator `cathedral_thin/independent_runtime/snp_production.py`
+lines 54-58 and 129-138).
 
-UID30 set `require_single_socket` to `false` on 2026-09-08 and admitted a
-two-socket `milan` host that same day. That is one validator's decision. Ask
-your target validator's operator rather than assuming.
+The runtime accepts the key, but `cathedral-validator-setup` currently refuses
+a policy containing it: its `_validate_policy` requires the policy's keys to be
+exactly `schema` and `generations` and otherwise fails with "SNP policy has an
+unsupported production shape" (cathedral-validator
+`deploy/validator-update/cathedral-validator-setup` lines 291-298). So an
+operator who wants `false` cannot install that policy through the supported
+setup path today; it takes a manual policy install.
+
+By operator report (unverified in-repo), UID30 set `require_single_socket` to
+`false` on 2026-09-08 and admitted a two-socket `milan` host that same day,
+which would have needed such a manual install. The date matches the merge of
+cathedral-validator #235, which added the flag. That is one validator's
+decision. Ask your target validator's operator rather than assuming.
 
 **Hardware identity dedup is not optional.** Linux routes every SNP command,
 including the guest's attestation request, through one PSP on the host. On
@@ -73,10 +84,13 @@ two guests, so it confirms same-host CHIP_ID collision and does not by itself
 prove the general cross-socket case.
 
 Customer capacity offered from one host is not a second scoring machine. The
-direct validator pays one unit per distinct verified hardware identity per UID
-and zeroes every row that repeats one (cathedral-validator
-`cathedral_thin/independent_runtime/direct_validator.py` lines 444-448 and
-`multicompute.py` lines 165-187), so adding customer slots cannot multiply
+direct validator pays one unit per surviving verified machine row per UID. In
+cathedral-validator, `cathedral_thin/independent_runtime/fleet_score.py` lines
+1040-1068 set every claimant of a repeated hardware identity to zero (the
+repeats are found by `duplicate_hardware_indexes`,
+`cathedral_thin/independent_runtime/multicompute.py` lines 165-187), and
+`cathedral_thin/independent_runtime/direct_validator.py` lines 444-448 then
+count the rows that remain per UID. So adding customer slots cannot multiply
 reward claims for one chip. The scoring path (`direct_validator.py`,
 `fleet_score.py`, `multicompute.py`) never reads customer capacity, so this
 document makes no claim about how customer capacity itself is accounted.
