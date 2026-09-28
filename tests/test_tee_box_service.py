@@ -938,3 +938,49 @@ def test_the_box_reports_egress_enforcement_and_refuses_internet_without_it(tmp_
     )
     assert (status, refusal["reason"]) == (409, "network_unavailable")
     assert fake.list() == ()
+
+
+class _LapsedExecutor(FakeExecutor):
+    def exec(self, sandbox_id, request):
+        from cathedral.tee_box.executor import NetworkLapsed
+
+        raise NetworkLapsed("lapsed")
+
+
+def test_a_lapsed_sandbox_call_is_refused_with_its_reason(tmp_path: Path):
+    api, fake = _api(tmp_path, _binding(), executor=_LapsedExecutor())
+    fake.import_image(DIGEST, "registry.example/tasks/base")
+    sid = _one_sandbox(api)
+    status, refusal = _handle(api, "POST", f"/v1/sandboxes/{sid}/exec", body={"command": "true"})
+    assert (status, refusal["reason"]) == (409, "sandbox_network_lapsed")
+
+
+class _SlowReapExecutor(FakeExecutor):
+    """A docker-bound reaper stuck on a slow daemon; the egress check still runs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = threading.Event()
+        self.checks = 0
+
+    def sweep(self) -> int:
+        self.release.wait(30)
+        return 0
+
+    def check_egress(self) -> int:
+        self.checks += 1
+        return 0
+
+
+def test_the_egress_check_runs_on_its_own_thread(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("cathedral.worker.TEE_BOX_EGRESS_CHECK_INTERVAL_SECONDS", 0.05)
+    executor = _SlowReapExecutor()
+    box = _Box(tmp_path, executor=executor)
+    try:
+        deadline = time.monotonic() + 10
+        while executor.checks < 5 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert executor.checks >= 5, "the egress check waited behind the reaper"
+    finally:
+        executor.release.set()
+        box.close()

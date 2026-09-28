@@ -489,12 +489,13 @@ class EgressEnforcer:
             self._error = None
         return True
 
-    def maintain(self) -> None:
-        """Re-check the table on every reaper tick, and re-apply it when it is not active.
+    def maintain(self, on_lapse: Callable[[], object] | None = None) -> None:
+        """Re-check the table on every egress tick, and re-apply it when it is not active.
 
         An active table is read back each tick. When that fails, enforcement
-        turns off (``lapses`` grows, so the executor ends its ``internet``
-        sandboxes) and the table is re-applied at once. A table that stays
+        turns off (``lapses`` grows), ``on_lapse`` runs so the executor can
+        start ending its ``internet`` sandboxes, and the table is re-applied at
+        once. A table that stays
         inactive is re-applied at most every ``retry_seconds``.
         """
 
@@ -503,6 +504,9 @@ class EgressEnforcer:
             last = self._last_attempt
         if active:
             if not self.verify():
+                # Act on the lapse before the re-apply, which may wait on docker.
+                if on_lapse is not None:
+                    on_lapse()
                 self.apply()
             return
         if last is None or self._clock() - last >= self._retry_seconds:

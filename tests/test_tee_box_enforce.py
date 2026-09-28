@@ -610,6 +610,13 @@ def _internet(sid_digit: str = "1"):
     return _spec("internet", sid="sbx-" + sid_digit * 24)
 
 
+def _tick(executor):
+    """One egress-thread tick, then wait for the lapse removals it started."""
+
+    executor.check_egress()
+    executor.end_lapsed_sandboxes(wait=True)
+
+
 def _tc_deletes(box):
     return [argv for argv, _ in box.calls if argv[1:3] == ["qdisc", "del"]]
 
@@ -623,7 +630,7 @@ def test_a_flushed_table_cuts_off_running_internet_sandboxes_on_the_next_tick():
     # nftables.service reload: "nft flush ruleset". The re-apply fails too.
     box.table = None
     box.fail.add("nft:-f")
-    executor.sweep()
+    _tick(executor)
     assert executor.get(running.sandbox_id) is None
     assert name not in docker.containers
     status = executor.egress_status()
@@ -639,7 +646,7 @@ def test_a_flushed_table_cuts_off_running_internet_sandboxes_on_the_next_tick():
     # The reaper's re-apply restores new creates; the ended sandbox stays gone.
     box.fail.clear()
     clock.value += 60
-    executor.sweep()
+    _tick(executor)
     assert executor.egress_status()["enforced"] is True
     assert executor.network_modes == ("internet", "deny_all")
     executor.create(_internet("2"))
@@ -654,7 +661,7 @@ def test_a_tampered_table_ends_running_sandboxes_even_when_re_apply_succeeds():
     deny_all = replace(deny_all, network="deny_all")
     executor.create(deny_all)
     box.table = _listing(box.policy, extra_rule=[{"accept": None}])
-    executor.sweep()
+    _tick(executor)
     # Re-applied at once, but the sandbox ran unprotected for an unknown time.
     assert enforcer.active and enforcer.lapses == 1
     assert executor.get(_internet().sandbox_id) is None
@@ -670,14 +677,14 @@ def test_a_lapse_whose_removal_fails_keeps_the_cap_and_retries():
     box.table = None
     box.fail.add("nft:-f")
     docker.rm_failures = 10**6
-    executor.sweep()
+    _tick(executor)
     assert executor.get(running.sandbox_id) is not None
     status = executor.egress_status()
     assert status["lapse_removals_pending"] == 1
     assert "could not be removed" in status["error"]
     assert _tc_deletes(box) == [] and enforcer.status()["capped_sandboxes"] == 1
     docker.rm_failures = 0
-    executor.sweep()
+    _tick(executor)
     assert executor.get(running.sandbox_id) is None and name not in docker.containers
     assert len(_tc_deletes(box)) == 2
     assert executor.egress_status()["lapse_removals_pending"] == 0
@@ -711,10 +718,29 @@ def test_the_sweep_detaches_an_orphan_only_once_it_is_gone():
     assert len(_tc_deletes(box)) == 2
 
 
-def test_the_reaper_reads_the_table_back_every_tick():
+def test_the_egress_check_reads_the_table_back_every_tick():
     executor, enforcer, box, docker, _clock = _wired()
     lists = lambda: sum(1 for argv, _ in box.calls if argv[1] == "--json")  # noqa: E731
     before = lists()
-    executor.sweep()
-    executor.sweep()
+    _tick(executor)
+    _tick(executor)
     assert lists() == before + 2
+
+
+def test_a_lapse_starts_removals_before_the_slow_re_apply():
+    executor, enforcer, box, docker, _clock = _wired()
+    executor.create(_internet())
+    box.table = None
+    order = []
+    original = box._docker
+
+    def docker_during_reapply(argv, stdin):
+        if argv[1:3] == ["network", "inspect"]:
+            order.append(("re-apply", executor.egress_status()["lapse_removals_pending"]))
+        return original(argv, stdin)
+
+    box._docker = docker_during_reapply
+    real_end = executor.end_lapsed_sandboxes
+    executor.end_lapsed_sandboxes = lambda **kw: order.append(("end",)) or real_end(**kw)
+    executor.check_egress()
+    assert order[0] == ("end",) and order[1][0] == "re-apply"

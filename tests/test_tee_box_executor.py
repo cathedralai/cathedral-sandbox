@@ -333,7 +333,7 @@ class _Enforcer:
             self.attached.remove(container)
         return True
 
-    def maintain(self) -> None:
+    def maintain(self, on_lapse=None) -> None:
         self.maintained += 1
 
     def status(self):
@@ -382,8 +382,10 @@ def test_internet_is_refused_while_the_table_is_not_active():
     assert [call[0][1] for call in runner.calls] == ["pull"]  # no docker run
     executor.create(_spec("deny_all"))  # deny_all never needs the enforcer
     assert enforcer.attached == []
-    # The reaper's sweep retries a failed apply.
+    # The egress thread's check retries a failed apply; the sweep does not.
     executor.sweep()
+    assert enforcer.maintained == 0
+    executor.check_egress()
     assert enforcer.maintained == 1
 
 
@@ -1067,3 +1069,136 @@ def _alive(pids: set[int]) -> set[int]:
         if "Z" not in state.split()[1]:
             alive.add(pid)
     return alive
+
+
+def _wait_gone(executor, sandbox_id, seconds=10.0):
+    deadline = time.monotonic() + seconds
+    while executor.get(sandbox_id) is not None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return executor.get(sandbox_id) is None
+
+
+class _LapsingEnforcer(_Enforcer):
+    """The egress thread records a lapse while a create is attaching."""
+
+    def attach(self, container):
+        super().attach(container)
+        self.lapses += 1
+
+
+def test_a_lapse_during_create_ends_the_new_sandbox():
+    docker, clock = _Docker(), _Clock()
+    enforcer = _LapsingEnforcer()
+    executor = _executor(docker, clock=clock, egress_enforcer=enforcer)
+    executor.import_image(DIGEST, IMAGE.reference)
+    with pytest.raises(ExecutorError, match="egress"):
+        executor.create(_spec("internet"))
+    assert _wait_gone(executor, _spec().sandbox_id)
+    assert NAME not in docker.containers
+    assert enforcer.detached == [NAME]  # after the container was removed
+
+
+def test_a_failed_create_keeps_the_cap_until_its_container_is_gone():
+    docker, clock = _Docker(), _Clock()
+    enforcer = _Enforcer()
+    enforcer.report_enforced = False
+    executor = _executor(docker, clock=clock, egress_enforcer=enforcer)
+    executor.import_image(DIGEST, IMAGE.reference)
+    docker.rm_failures = 10**6
+    with pytest.raises(ExecutorError, match="egress"):
+        executor.create(_spec("internet"))
+    assert NAME in docker.containers and enforcer.detached == []
+    docker.rm_failures = 0
+    assert executor.sweep() == 0 and NAME not in docker.containers
+    assert enforcer.detached == [NAME]
+
+
+def test_a_refused_create_ends_sandboxes_left_from_a_lapse():
+    docker, clock = _Docker(), _Clock()
+    enforcer = _Enforcer()
+    executor = _executor(docker, clock=clock, egress_enforcer=enforcer)
+    executor.import_image(DIGEST, IMAGE.reference)
+    running = _spec("internet")
+    executor.create(running)
+    # The table lapses; no egress tick has run yet. The next internet create
+    # finds it, is refused, and ends the running sandbox.
+    enforcer.table_active = False
+    enforcer.lapses += 1
+    with pytest.raises(ExecutorRefused):
+        executor.create(_spec("internet", sid="sbx-" + "2" * 24))
+    assert _wait_gone(executor, running.sandbox_id)
+    assert NAME not in docker.containers
+
+
+def test_a_sandbox_waiting_for_lapse_removal_refuses_every_call():
+    docker, clock = _Docker(), _Clock()
+    enforcer = _Enforcer()
+    executor = _executor(docker, clock=clock, egress_enforcer=enforcer)
+    executor.import_image(DIGEST, IMAGE.reference)
+    executor._job_factory = _FakeJob
+    running = _spec("internet")
+    executor.create(running)
+    sid = running.sandbox_id
+    exec_id = executor.start_exec(sid, REQUEST)
+    docker.rm_failures = 10**6
+    enforcer.table_active = False
+    enforcer.lapses += 1
+    assert executor.end_lapsed_sandboxes(wait=True) == 1
+    assert executor.get(sid) is not None
+    for call in (
+        lambda: executor.exec(sid, REQUEST),
+        lambda: executor.start_exec(sid, REQUEST),
+        lambda: executor.poll_exec(sid, exec_id, 0),
+        lambda: executor.stop_exec(sid, exec_id),
+        lambda: executor.write_file(sid, "/f", b"x", 0o644),
+        lambda: executor.read_file(sid, "/f"),
+        lambda: executor.stat(sid, "/f"),
+        lambda: executor.put_tar(sid, "/d", b""),
+        lambda: executor.get_tar(sid, "/d", []),
+        lambda: executor.set_expiry(sid, 0.0),
+    ):
+        with pytest.raises(executor_module.NetworkLapsed):
+            call()
+    docker.rm_failures = 0
+    assert executor.end_lapsed_sandboxes(wait=True) == 0
+    assert executor.get(sid) is None
+
+
+class _SlowRemoveDocker(_Docker):
+    """rm of one container hangs until its call timeout; the others are quick."""
+
+    def __init__(self, slow: str) -> None:
+        super().__init__()
+        self.slow = slow
+        self.timeouts: list[float] = []
+
+    def __call__(self, argv, **kwargs):
+        if argv[1] in ("rm", "kill", "container") and argv[-1] == self.slow:
+            self.timeouts.append(kwargs["timeout"])
+            time.sleep(0.3)
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return super().__call__(argv, **kwargs)
+
+
+def test_lapse_removals_run_concurrently_with_a_bounded_timeout():
+    slow = "cathsbx-sbx-" + "1" * 24
+    docker, clock = _SlowRemoveDocker(slow), _Clock()
+    enforcer = _Enforcer()
+    executor = _executor(docker, clock=clock, egress_enforcer=enforcer)
+    executor.import_image(DIGEST, IMAGE.reference)
+    specs = [_spec("internet", sid="sbx-" + digit * 24) for digit in "1234"]
+    for spec in specs:
+        executor.create(spec)
+    enforcer.table_active = False
+    enforcer.lapses += 1
+    started = time.monotonic()
+    assert executor.check_egress() >= 1  # returns without waiting for removals
+    assert time.monotonic() - started < 0.25
+    for spec in specs[1:]:
+        assert _wait_gone(executor, spec.sandbox_id, 1.0), "a quick removal waited on the slow one"
+    executor.end_lapsed_sandboxes(wait=True)
+    assert executor.get(specs[0].sandbox_id) is not None
+    assert docker.timeouts and set(docker.timeouts) == {
+        executor_module.LAPSE_REMOVAL_CALL_TIMEOUT_SECONDS
+    }
+    assert len(docker.timeouts) <= 4 * 2  # at most four calls per attempt

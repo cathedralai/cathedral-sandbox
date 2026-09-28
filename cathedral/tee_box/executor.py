@@ -54,6 +54,11 @@ KILL_TIMEOUT_SECONDS = 30.0
 # Storage drivers that honour ``docker run --storage-opt size=``. overlay2
 # does so only on xfs mounted with project quotas (pquota).
 QUOTA_DRIVERS = frozenset({"btrfs", "zfs", "devicemapper"})
+# After an egress lapse, running internet sandboxes are removed on their own
+# threads, at most this many at once, each docker call bounded by this
+# timeout (a removal makes at most four calls).
+LAPSE_REMOVAL_WORKERS = 4
+LAPSE_REMOVAL_CALL_TIMEOUT_SECONDS = 15.0
 
 
 class ExecutorError(Exception):
@@ -62,6 +67,10 @@ class ExecutorError(Exception):
 
 class ExecutorRefused(ExecutorError):
     """The executor refuses this request on this box (for example, no egress control)."""
+
+
+class NetworkLapsed(ExecutorError):
+    """The sandbox ran while the egress rules lapsed and is being removed."""
 
 
 class NotFound(ExecutorError):
@@ -204,7 +213,7 @@ class EgressControl(Protocol):
     def attach(self, container: str) -> object: ...
     def is_enforced(self, container: str) -> bool: ...
     def detach(self, container: str) -> bool: ...
-    def maintain(self) -> None: ...
+    def maintain(self, on_lapse: Callable[[], object] | None = None) -> None: ...
     def status(self) -> dict[str, object]: ...
 
 
@@ -627,6 +636,9 @@ class RunscExecutor(_Table):
         # because the rules lapsed while they ran.
         self._seen_lapses = 0 if egress_enforcer is None else egress_enforcer.lapses
         self._lapse_cut: set[str] = set()
+        self._lapse_inflight: dict[str, threading.Thread] = {}
+        self._lapse_slots = threading.BoundedSemaphore(LAPSE_REMOVAL_WORKERS)
+        self._lapse_call_timeout = LAPSE_REMOVAL_CALL_TIMEOUT_SECONDS
         self._ended_on_lapse = 0
 
     @property
@@ -870,26 +882,30 @@ class RunscExecutor(_Table):
             self._images[digest] = image
         return image
 
-    def _exists(self, name: str) -> bool:
+    def _exists(self, name: str, timeout: float | None = None) -> bool:
         """False only when the daemon says the container does not exist."""
 
         try:
-            result = self._control(self.inspect_argv(name), self._control_timeout)
+            result = self._control(self.inspect_argv(name), timeout or self._control_timeout)
         except ExecutorError:
             return True
         return result.returncode == 0 or b"No such" not in (result.stderr or b"")
 
-    def _remove(self, name: str) -> bool:
-        """Force-remove ``name``; true once it is confirmed gone."""
+    def _remove(self, name: str, timeout: float | None = None) -> bool:
+        """Force-remove ``name``; true once it is confirmed gone.
+
+        At most four docker calls, each bounded by ``timeout`` (default: the
+        control timeout).
+        """
 
         for argv in (self.remove_argv(name), self.kill_argv(name), self.remove_argv(name)):
             try:
-                result = self._control(argv, self._control_timeout)
+                result = self._control(argv, timeout or self._control_timeout)
             except ExecutorError:
                 continue
             if argv[1] == "rm" and result.returncode == 0:
                 return True
-        return not self._exists(name)
+        return not self._exists(name, timeout)
 
     def _abandon(self, name: str, *, timed_out: bool) -> bool:
         """Remove a container whose create failed; keep it pending if unsure."""
@@ -948,6 +964,9 @@ class RunscExecutor(_Table):
                 self._creating.discard(spec.sandbox_id)
 
     def delete(self, sandbox_id: str) -> bool:
+        return self._delete(sandbox_id, None)
+
+    def _delete(self, sandbox_id: str, timeout: float | None) -> bool:
         with self._lock:
             keys = [key for key in self._jobs if key[0] == sandbox_id]
             stale = [self._jobs.pop(key) for key in keys]
@@ -960,27 +979,51 @@ class RunscExecutor(_Table):
         name = self.container_name(sandbox_id)
         # The cap stays until the container is confirmed gone: a failed
         # remove leaves a running sandbox that must stay capped.
-        if not self._remove(name):
+        if not self._remove(name, timeout):
             raise ExecutorError("sandbox delete failed")
         self._detach(name)
         with self._lock:
             self._lapse_cut.discard(sandbox_id)
         return self._forget(sandbox_id)
 
-    def end_lapsed_sandboxes(self) -> int:
+    def check_egress(self) -> int:
+        """Re-check the egress table and end lapsed sandboxes (the egress thread).
+
+        Runs apart from the docker-bound reaper, so the nft read-back is never
+        queued behind slow deletes. Returns how many lapse removals remain.
+        """
+
+        enforcer = self.egress_enforcer
+        if enforcer is None:
+            return 0
+        try:
+            enforcer.maintain(on_lapse=self.end_lapsed_sandboxes)
+        except Exception:
+            pass
+        return self.end_lapsed_sandboxes()
+
+    def end_lapsed_sandboxes(self, *, wait: bool = False) -> int:
         """End every ``internet`` sandbox that ran while the egress rules lapsed.
 
         When the enforcer reports a new lapse (its table failed a read-back),
         every ``internet`` sandbox running at that moment is removed, as a
         delete would, rather than disconnected: removal does not depend on how
         runsc treats a vanished interface. Re-applying the table does not bring
-        them back. Removals that fail are retried on every call. Returns how
-        many are still waiting.
+        them back. Until its removal succeeds, every call on such a sandbox is
+        refused (``NetworkLapsed``).
+
+        Removals run on their own threads, at most ``LAPSE_REMOVAL_WORKERS``
+        at once, each docker call bounded by the lapse call timeout, so one
+        slow removal does not hold up the others or the caller. A failed
+        removal is retried on the next call. Returns how many are still
+        waiting; ``wait`` joins this call's removals first (tests).
         """
 
         enforcer = self.egress_enforcer
         if enforcer is None:
             return 0
+        started: list[threading.Thread] = []
+        joined: list[threading.Thread] = []
         with self._lock:
             lapses = enforcer.lapses
             if lapses != self._seen_lapses:
@@ -988,17 +1031,49 @@ class RunscExecutor(_Table):
                 self._lapse_cut.update(
                     sid for sid, info in self._sandboxes.items() if info.spec.network == "internet"
                 )
-            pending = sorted(self._lapse_cut)
-        for sandbox_id in pending:
-            try:
-                ended = self.delete(sandbox_id)
-            except ExecutorError:
-                continue
-            with self._lock:
-                self._lapse_cut.discard(sandbox_id)
-                self._ended_on_lapse += int(ended)
+            for sandbox_id in sorted(self._lapse_cut):
+                thread = self._lapse_inflight.get(sandbox_id)
+                if thread is None:
+                    thread = threading.Thread(
+                        target=self._end_lapsed_one, args=(sandbox_id,), daemon=True
+                    )
+                    self._lapse_inflight[sandbox_id] = thread
+                    started.append(thread)
+                joined.append(thread)
+        for thread in started:
+            thread.start()
+        if wait:
+            for thread in joined:
+                thread.join(4 * self._lapse_call_timeout + 5)
         with self._lock:
             return len(self._lapse_cut)
+
+    def _end_lapsed_one(self, sandbox_id: str) -> None:
+        ended = None
+        with self._lapse_slots:
+            try:
+                ended = self._delete(sandbox_id, self._lapse_call_timeout)
+            except ExecutorError:
+                pass
+            except Exception:
+                pass
+        with self._lock:
+            self._lapse_inflight.pop(sandbox_id, None)
+            if ended is not None:
+                self._lapse_cut.discard(sandbox_id)
+                self._ended_on_lapse += int(ended)
+
+    def _require(self, sandbox_id: str) -> SandboxInfo:
+        info = super()._require(sandbox_id)
+        with self._lock:
+            lapsed = sandbox_id in self._lapse_cut
+        if lapsed:
+            raise NetworkLapsed("the sandbox ran while egress rules lapsed and is being removed")
+        return info
+
+    def set_expiry(self, sandbox_id: str, expires_at: float) -> SandboxInfo:
+        self._require(sandbox_id)
+        return super().set_expiry(sandbox_id, expires_at)
 
     def _detach(self, name: str) -> None:
         """Drop the sandbox's tc cap, once its container is gone."""
@@ -1017,12 +1092,6 @@ class RunscExecutor(_Table):
         grace window. Raises ``ExecutorError`` if the daemon cannot list.
         """
 
-        if self.egress_enforcer is not None:
-            try:
-                self.egress_enforcer.maintain()
-            except Exception:
-                pass
-            self.end_lapsed_sandboxes()
         result = self._control(self.list_argv(), self._control_timeout)
         if result.returncode != 0:
             raise ExecutorError("container listing failed")
@@ -1168,6 +1237,7 @@ class RunscExecutor(_Table):
         return ExecStatus(exec_id, state, job.result())
 
     def _record_for(self, sandbox_id: str, exec_id: str) -> "_JobRecord":
+        self._require(sandbox_id)
         with self._lock:
             self._prune_jobs_locked(self._clock())
             record = self._jobs.get((sandbox_id, exec_id))

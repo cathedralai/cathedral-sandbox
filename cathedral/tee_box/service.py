@@ -32,6 +32,7 @@ from cathedral.tee_box.executor import (
     Executor,
     ExecutorError,
     ExecutorRefused,
+    NetworkLapsed,
     NotFound,
     SandboxInfo,
     SandboxSpec,
@@ -361,6 +362,16 @@ class TeeBoxSandboxApi:
         except ExecutorError:
             return False
 
+    def check_egress(self) -> None:
+        """Re-check egress enforcement (the worker's own egress thread, not the reaper)."""
+
+        check = getattr(self.executor, "check_egress", None)
+        if callable(check):
+            try:
+                check()
+            except Exception:
+                pass
+
     def sweep(self) -> None:
         """Remove labelled containers the executor does not track (reaper thread)."""
 
@@ -454,6 +465,14 @@ class TeeBoxSandboxApi:
                 {
                     "error": "the previous customer's sandboxes are still being removed",
                     "reason": "box_draining",
+                },
+            )
+        except NetworkLapsed:
+            return _json(
+                409,
+                {
+                    "error": "the sandbox ran while the egress rules lapsed; it is being removed",
+                    "reason": "sandbox_network_lapsed",
                 },
             )
         except NotFound:

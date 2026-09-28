@@ -11,21 +11,21 @@ Citations are `file:line` in this repository.
 
 `cathedral/tee_box/` holds four parts.
 
-- **Executor protocol** (`cathedral/tee_box/executor.py:170-193`): image
+- **Executor protocol** (`cathedral/tee_box/executor.py:179-202`): image
   import by digest, create from an image with a shape, get, list, expiry,
   delete, sync exec, background exec with poll and stop, and file read,
   write, stat and tar.
-  - `FakeExecutor` (`cathedral/tee_box/executor.py:258`) keeps everything in
+  - `FakeExecutor` (`cathedral/tee_box/executor.py:267`) keeps everything in
     memory for tests.
-  - `RunscExecutor` (`cathedral/tee_box/executor.py:552`) drives
+  - `RunscExecutor` (`cathedral/tee_box/executor.py:561`) drives
     `docker run --runtime=runsc`. It builds argv lists only, with no host
-    shell (`_check_argv`, `cathedral/tee_box/executor.py:401`), and caps every
+    shell (`_check_argv`, `cathedral/tee_box/executor.py:410`), and caps every
     captured output. The Docker daemon must register runsc with
-    `--platform=systrap` (`cathedral/tee_box/executor.py:659-669`).
+    `--platform=systrap` (`cathedral/tee_box/executor.py:671-681`).
   - Each sandbox is one container that runs `sleep infinity`
-    (`cathedral/tee_box/executor.py:710`). Exec, files and tar run inside it
+    (`cathedral/tee_box/executor.py:722`). Exec, files and tar run inside it
     through `/bin/sh` scripts that take paths as positional arguments
-    (`cathedral/tee_box/executor.py:520-527`). They run inside because
+    (`cathedral/tee_box/executor.py:529-536`). They run inside because
     gVisor's in-sandbox overlay hides writes from the host. Images therefore
     need `sh`, `sleep`, `cat`, `stat` and `tar`, as Harbor's own upload
     fallback already assumes.
@@ -35,8 +35,8 @@ Citations are `file:line` in this repository.
     (`cathedral/tee_box/executor.py:39-41`).
     - A create that fails is removed by name. A create that times out is
       also kept pending cleanup for 300 s, since the daemon may still start
-      it (`cathedral/tee_box/executor.py:894`).
-    - `sweep` (`cathedral/tee_box/executor.py:1012`) lists the box's
+      it (`cathedral/tee_box/executor.py:910`).
+    - `sweep` (`cathedral/tee_box/executor.py:1087`) lists the box's
       containers with `docker ps --filter label=...`. It removes every one
       the table does not track, except creates still in flight, and
       reports what it could not confirm gone.
@@ -51,12 +51,12 @@ Citations are `file:line` in this repository.
     - The cap check and the slot reservation are one step under the lock.
     - A finished record is evicted 60 s after its result is first read, or
       600 s after it finished if never read. At a cap, the oldest finished
-      record goes first (`cathedral/tee_box/executor.py:1095`).
+      record goes first (`cathedral/tee_box/executor.py:1164`).
   - **Uploads.** An upload's stdin is written from its own thread
-    (`cathedral/tee_box/executor.py:423`). A target that never reads, such
+    (`cathedral/tee_box/executor.py:432`). A target that never reads, such
     as a FIFO, times out and is killed under the transfer timeout. The
     write script also refuses an existing target that is not a regular file
-    with `409` (`cathedral/tee_box/executor.py:1198`).
+    with `409` (`cathedral/tee_box/executor.py:1268`).
 - **Egress policy** (`cathedral/tee_box/egress.py`). `build_egress_policy`
   (`cathedral/tee_box/egress.py:208`) returns the deny list and a
   per-sandbox bandwidth cap (default 100 Mbit/s). The deny list has three
@@ -90,7 +90,7 @@ Citations are `file:line` in this repository.
     lease gets `409` with reason `lease_required`.
   - **Drain guarantee.** Release or expiry
     (`cathedral/tee_box/lease.py:95`) ends the lease and drains it
-    (`cathedral/tee_box/service.py:341`). The drain deletes the customer's
+    (`cathedral/tee_box/service.py:342`). The drain deletes the customer's
     sandboxes and then sweeps every untracked box container. It succeeds
     only when none of the customer's sandboxes is still listed and the sweep
     reports nothing left.
@@ -101,7 +101,7 @@ Citations are `file:line` in this repository.
     marked draining (`cathedral/tee_box/lease.py:102`). A slow container
     daemon therefore holds up only the call that runs the drain.
   - Ordinary calls retry the drain at most every 2 s. The reaper retries it
-    on every tick (`cathedral/tee_box/service.py:372`).
+    on every tick (`cathedral/tee_box/service.py:383`).
   - **A worker starts draining** (`cathedral/tee_box/lease.py:91`). A new
     process does not know what an earlier one left running. So no customer
     is leased the box until the first sweep reports that none of the box's
@@ -119,15 +119,15 @@ Citations are `file:line` in this repository.
   - A delete in `RunscExecutor` runs `docker rm --force`, then
     `docker kill --signal KILL`, then `rm` again. It counts as done only
     when `rm` succeeds or the daemon reports the container missing
-    (`cathedral/tee_box/executor.py:882`).
+    (`cathedral/tee_box/executor.py:894`).
   - A create holds the lease lock, so a drain cannot miss it
-    (`cathedral/tee_box/service.py:619-620`).
+    (`cathedral/tee_box/service.py:638-639`).
   - A worker thread runs every 5 s, and once at start
-    (`cathedral/worker.py:1339`). It checks expiry, retries the drain, and
+    (`cathedral/worker.py:1342`). It checks expiry, retries the drain, and
     sweeps orphans.
-- **API** (`cathedral/tee_box/service.py:307`). The routes are listed in
-  `cathedral/tee_box/service.py:76`. Only `GET /v1/box` and the lease routes
-  run without a lease (`cathedral/tee_box/service.py:437`).
+- **API** (`cathedral/tee_box/service.py:308`). The routes are listed in
+  `cathedral/tee_box/service.py:77`. Only `GET /v1/box` and the lease routes
+  run without a lease (`cathedral/tee_box/service.py:448`).
 
 | Call | Route |
 |---|---|
@@ -143,17 +143,17 @@ Citations are `file:line` in this repository.
 v1 has no snapshot, fork, port or Docker-in-Docker routes.
 
 Every sandbox reports `"hardware": "standard"`
-(`cathedral/tee_box/service.py:407`). Exec takes `env`, `user`, `cwd` and
+(`cathedral/tee_box/service.py:418`). Exec takes `env`, `user`, `cwd` and
 `timeout_seconds`. Background execs may run up to 14,400 s
-(`cathedral/tee_box/service.py:59-60`).
+(`cathedral/tee_box/service.py:60-61`).
 
 A create is admitted only while the sum of sandbox shapes fits the configured
 capacity. Otherwise it gets `409` with reason `box_capacity_full`
-(`cathedral/tee_box/service.py:625`), the reason Harbor already waits on.
+(`cathedral/tee_box/service.py:644`), the reason Harbor already waits on.
 
 `GET /v1/box` lists the network modes the box offers now, and its `egress`
 object says whether the egress rules are enforced, with the last error
-(`cathedral/tee_box/service.py:490`).
+(`cathedral/tee_box/service.py:509`).
 
 ## Caller authorization
 
@@ -163,21 +163,21 @@ Callers use the validator-access code, with no new cryptography.
   `cathedral_validator_access_snapshot_v1`. Its rows are the control-plane
   hotkeys, with permit `true` and stake 0. It carries the network label
   `cathedral-control-plane` and a zero stake floor. It is loaded by
-  `caller_snapshot_provider` (`cathedral/tee_box/service.py:151`) through
+  `caller_snapshot_provider` (`cathedral/tee_box/service.py:152`) through
   `SignedValidatorSnapshotProvider`. A validator snapshot cannot stand in for
   it, and the reverse holds too: the authorizer refuses any other network
-  label (`cathedral/tee_box/service.py:195`).
+  label (`cathedral/tee_box/service.py:196`).
 - **Requests.** Requests carry the validator request envelope in
   `X-Cathedral-Validator-Request`.
   - `ValidatorRequestAuthorizer` and `build_validator_request_header` gained
     a `target_allowed` check (`cathedral/validator_access.py:164`, `:1609`).
     It defaults to the validator routes.
   - The sandbox API passes `sandbox_target_allowed`
-    (`cathedral/tee_box/service.py:132`). The signed `path` is the full
+    (`cathedral/tee_box/service.py:133`). The signed `path` is the full
     target, query included, so the signature covers file paths.
 - **Worker.** The worker verifies the envelope before it reserves a slot or
-  reads the body (`cathedral/worker.py:439`). After the body is read, it
-  checks the body digest and replay (`cathedral/worker.py:455`).
+  reads the body (`cathedral/worker.py:442`). After the body is read, it
+  checks the body digest and replay (`cathedral/worker.py:458`).
 - **Refusals.** Each of these gets `401`: a request with no header, a key not
   in the snapshot, a stale snapshot, an expired or replayed request, another
   network label, a signature over a different target or body, and an unknown
@@ -214,7 +214,7 @@ commands do not offer them.
 - **Attested TLS only.** The flags need `--tls-certificate` and
   `--tls-private-key` (`cathedral/cli.py:1388`). The API then binds the
   worker's TLS key and hotkey, the key REPORT_DATA binds (design section 3);
-  `WorkerServer` checks this again (`cathedral/worker.py:1246-1258`).
+  `WorkerServer` checks this again (`cathedral/worker.py:1249-1261`).
 - **Detected addresses** are every address in `ip -json address show`,
   plus the `--public-endpoint` host when it is an IP literal. On a cloud
   guest behind 1:1 NAT the public address is not on an interface, so pass
@@ -226,11 +226,11 @@ commands do not offer them.
   (`:317`).
 - **Startup does not refuse** when the egress rules fail to apply
   (`:326`). The box then serves `deny_all` only, and the startup line's
-  `tee_box.egress` field reports the error. The reaper retries the apply
+  `tee_box.egress` field reports the error. The egress thread re-applies
   every 60 s, and reads an applied table back every 5 s.
 
 The guest must also provide: a Docker daemon with the runsc runtime entry
-(`daemon_runtime_config`, `cathedral/tee_box/executor.py:659`), the docker
+(`daemon_runtime_config`, `cathedral/tee_box/executor.py:671`), the docker
 CLI, `nft`, `tc`, `ip` and `nsenter` at `/usr/sbin/nft`, `/usr/sbin/tc`,
 `/usr/sbin/ip` and `/usr/bin/nsenter`, and the privileges to use them. No
 shipped image provides all of that yet (see "Packaging").
@@ -259,44 +259,63 @@ a 15 s timeout.
   with the policy: the same collapsed deny ranges, hooks, priorities and
   rules, and nothing else (`table_matches`,
   `cathedral/tee_box/enforce.py:220`). The executor verifies again before
-  every `internet` create (`cathedral/tee_box/executor.py:907`).
-- **Per-sandbox cap.** `attach` (`cathedral/tee_box/enforce.py:579`) finds
+  every `internet` create (`cathedral/tee_box/executor.py:923`).
+- **Per-sandbox cap.** `attach` (`cathedral/tee_box/enforce.py:583`) finds
   the sandbox's host-side veth from its network namespace: Docker's
   `SandboxKey`, then `eth0@ifN` inside it through `nsenter`, then the
   `cathsbx0` port with index N (`find_veth`,
-  `cathedral/tee_box/enforce.py:513`). It applies the `tc` commands and
+  `cathedral/tee_box/enforce.py:517`). It applies the `tc` commands and
   reads them back: the root `tbf` rate, the ingress qdisc, and the matchall
   policer's rate and drop action. `detach`
-  (`cathedral/tee_box/enforce.py:598`) deletes both qdiscs, and runs only
+  (`cathedral/tee_box/enforce.py:602`) deletes both qdiscs, and runs only
   after `docker rm` has confirmed the container gone
-  (`cathedral/tee_box/executor.py:963`). A remove that fails or times out
+  (`cathedral/tee_box/executor.py:982`). A remove that fails or times out
   leaves the sandbox running with its cap in place; the orphan sweep also
   detaches only what it confirmed removed. It treats a veth already gone as
   removed.
-- **Re-checked every tick.** The worker's reaper thread (every 5 s) runs
-  `maintain` (`cathedral/tee_box/enforce.py:492`), which reads the table
-  back even while it is active, not only when a sandbox is created.
+- **Re-checked on its own thread.** The worker runs the egress check on a
+  thread of its own (`cathedral/worker.py:1356`), apart from the reaper, whose
+  expiry deletes and drain wait on docker. It starts a check every 5 s
+  (`cathedral/worker.py:84`), or at once if the last one overran. Each
+  check runs `check_egress` (`cathedral/tee_box/executor.py:989`), which
+  calls `maintain` (`cathedral/tee_box/enforce.py:492`): one
+  `nft --json list table` read-back while the table is active, bounded by
+  the enforcer's 15 s command timeout, with no docker call.
 - **A lapse ends running internet sandboxes.** When a read-back fails (for
   example after `nft flush ruleset` from an nftables reload), enforcement
-  turns off at once and the enforcer counts a lapse. The same tick tries
-  to re-apply the table, and `end_lapsed_sandboxes`
-  (`cathedral/tee_box/executor.py:970`) removes every `internet` sandbox
-  that was running, as a delete does, even when the re-apply succeeds:
-  those sandboxes ran unprotected for an unknown time. Removal was chosen
-  over `docker network disconnect` because it does not depend on how runsc
-  treats an interface that disappears under it. A successful re-apply lets
-  new `internet` sandboxes start; it never brings back the removed ones,
-  whose callers get `404`. A removal that fails is retried every tick, and
-  `/v1/box` reports it as the egress error. So an `internet` sandbox keeps
-  running only while its cap verified at create and every read-back of the
-  table since has matched; the exposure after a change to the table is at
-  most one reaper tick.
+  turns off at once and the enforcer counts a lapse. Before it tries to
+  re-apply the table (which calls docker), `end_lapsed_sandboxes`
+  (`cathedral/tee_box/executor.py:1005`) marks every `internet` sandbox
+  that was running and starts removing it, as a delete does, even when the
+  re-apply then succeeds: those sandboxes ran unprotected for an unknown
+  time.
+  - From that moment every call on a marked sandbox (exec, processes,
+    files, tar, stat, lifetime) gets `409` with reason
+    `sandbox_network_lapsed` (`cathedral/tee_box/executor.py:1066`). Get,
+    list and delete still work.
+  - Removals run on their own threads, at most 4 at once, and each docker
+    call in a removal has a 15 s timeout, so a removal takes at most about
+    60 s (four calls) and one slow container does not hold up the others.
+    A removal that fails is retried on the next check, and `/v1/box`
+    reports it as the egress error.
+  - Removal was chosen over `docker network disconnect` because it does
+    not depend on how runsc treats an interface that disappears under it.
+    A successful re-apply lets new `internet` sandboxes start; it never
+    brings back the removed ones, whose callers then get `404`.
+  - **Bound.** A change to the table is detected within one check interval
+    plus two read-back timeouts (5 s + 2 x 15 s = 35 s) when nft hangs; when
+    nft answers promptly, within about 5 s. From detection, calls on the
+    affected sandboxes are refused, but processes already running in them
+    keep the network until their container is removed (at most about 60 s
+    each, longer only if docker keeps failing, which `/v1/box` then
+    reports). So an `internet` sandbox serves calls only while its cap
+    verified at create and every read-back of the table since has matched.
 - **Fail closed.** Until apply and verify succeed, and after any later
   verify fails, `active` is false and `status()` carries the error.
   `RunscExecutor` then offers `deny_all` only
-  (`cathedral/tee_box/executor.py:633`) and refuses `internet` with `409`
+  (`cathedral/tee_box/executor.py:645`) and refuses `internet` with `409`
   before `docker run`. After `docker run`, a sandbox whose cap fails to
-  apply or verify is removed at once (`cathedral/tee_box/executor.py:928`).
+  apply or verify is removed at once (`cathedral/tee_box/executor.py:944`).
 - **Injection safety.** Box addresses reach nft only as `ipaddress`
   objects. Detection parses every value with `ipaddress` and refuses the
   whole listing on any other value (`cathedral/tee_box/enforce.py:104`).
@@ -313,10 +332,10 @@ a 15 s timeout.
 
 A customer exec runs through a wrapper that writes its pid to
 `/tmp/.cathedral-exec-<random>.pid` inside the sandbox and then execs the
-command in place (`cathedral/tee_box/executor.py:531`). When a sync or
+command in place (`cathedral/tee_box/executor.py:540`). When a sync or
 background exec times out, or a background exec is stopped, the executor
 first runs a kill script as root in the sandbox
-(`cathedral/tee_box/executor.py:536`, `:1061`). The script stops the
+(`cathedral/tee_box/executor.py:545`, `:1130`). The script stops the
 recorded process and every descendant it finds in `/proc`, repeating until
 no new one appears, and then kills them all. Only then is the host-side
 `docker exec` client killed. The kill has its own 30 s timeout.
@@ -328,10 +347,10 @@ double-forks) survives until the sandbox is deleted.
 ## Disk quota (T6b1)
 
 Each container gets `--storage-opt size=<disk_mib>m`
-(`cathedral/tee_box/executor.py:699`). Docker supports this on btrfs, zfs,
+(`cathedral/tee_box/executor.py:711`). Docker supports this on btrfs, zfs,
 devicemapper, and overlay2 on xfs mounted with `pquota`. At startup the
 worker reads the storage driver from `docker info`
-(`cathedral/tee_box/executor.py:839`) and refuses to start on any other
+(`cathedral/tee_box/executor.py:851`) and refuses to start on any other
 driver unless the operator passes `--tee-box-no-disk-quota`. Docker checks
 `pquota` only when a container starts, so on xfs without it every create
 fails; creates never run unbounded.
