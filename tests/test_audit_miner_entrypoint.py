@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import random
 import re
 import stat
 import subprocess
@@ -14,6 +15,8 @@ from cryptography.hazmat.primitives import serialization
 from cathedral.audit_miner_entrypoint import (
     FLEET_MANIFEST,
     HOTKEY_ENV,
+    NETUID_ENV,
+    NETWORK_ENV,
     PUBLIC_ENDPOINT_ENV,
     TSM_REPORT_ROOT,
     TSM_REPORT_ROOT_ENV,
@@ -24,8 +27,6 @@ from cathedral.audit_miner_entrypoint import (
     VALIDATOR_ACCESS_SNAPSHOT,
     VALIDATOR_ACCESS_STATE,
     VALIDATOR_MINIMUM_STAKE_RAO,
-    VALIDATOR_NETWORK,
-    VALIDATOR_NETUID,
     WORKER_BEARER_ENV,
     WORKER_HOST,
     WORKER_PORT,
@@ -39,10 +40,15 @@ from cathedral.audit_miner_entrypoint import (
 HOTKEY = "5CtobNq2yNmUKaaR9HL5eSY2jN4j43iz1GLXNeNp2tbkwawK"
 PUBLIC_ENDPOINT = "https://8.8.8.8:8081"
 KEYS_DIGEST = "sha256:" + "ab" * 32
+# The subnet is deploy-time config with no default; draw one per run.
+NETWORK = "finney"
+NETUID = random.SystemRandom().randrange(1, 65_536)
 DEPLOYMENT_ENVIRONMENT = {
     HOTKEY_ENV: HOTKEY,
     PUBLIC_ENDPOINT_ENV: PUBLIC_ENDPOINT,
     VALIDATOR_ACCESS_KEYS_DIGEST_ENV: KEYS_DIGEST,
+    NETWORK_ENV: NETWORK,
+    NETUID_ENV: str(NETUID),
 }
 REPOSITORY_ROOT = Path(__file__).parents[1]
 BASE_MANIFEST_DIGEST = "sha256:4427763a1ba36f5aa8f656a03e5d00f3b8d61f5dd950c73df6c14f8c7640f8ab"
@@ -109,11 +115,13 @@ def test_public_hotkey_validation_refuses_valid_non_bittensor_format() -> None:
         "CATHEDRAL_GPU_COLLECT_CMD",
     ],
 )
-def test_environment_accepts_only_the_three_public_deployment_inputs(unknown_name: str) -> None:
+def test_environment_accepts_only_the_five_public_deployment_inputs(unknown_name: str) -> None:
     inputs = validate_environment({**DEPLOYMENT_ENVIRONMENT, "PATH": "/usr/bin"})
     assert inputs.hotkey == HOTKEY
     assert inputs.public_endpoint == PUBLIC_ENDPOINT
     assert inputs.validator_access_keys_digest == KEYS_DIGEST
+    assert inputs.network == NETWORK
+    assert inputs.netuid == NETUID
     with pytest.raises(EntrypointError, match="only the miner hotkey"):
         validate_environment(
             {**DEPLOYMENT_ENVIRONMENT, unknown_name: "caller-controlled"}
@@ -130,11 +138,39 @@ def test_environment_accepts_only_the_three_public_deployment_inputs(unknown_nam
         (PUBLIC_ENDPOINT_ENV, "https://[2606:4700:4700::1111]:8081"),
         (VALIDATOR_ACCESS_KEYS_DIGEST_ENV, "ab" * 32),
         (VALIDATOR_ACCESS_KEYS_DIGEST_ENV, "sha256:" + "AB" * 32),
+        (NETWORK_ENV, "<NETWORK>"),
+        (NETWORK_ENV, ""),
+        (NETWORK_ENV, "Finney"),
+        (NETWORK_ENV, "finney "),
+        (NETUID_ENV, "<NETUID>"),
+        (NETUID_ENV, ""),
+        (NETUID_ENV, "007"),
+        (NETUID_ENV, "+7"),
+        (NETUID_ENV, "-1"),
+        (NETUID_ENV, " 7"),
+        (NETUID_ENV, "7.0"),
+        (NETUID_ENV, "true"),
+        (NETUID_ENV, "65536"),
+        (NETUID_ENV, "\u0667"),
     ],
 )
 def test_environment_refuses_invalid_public_inputs(name: str, value: str) -> None:
     with pytest.raises(EntrypointError):
         validate_environment({**DEPLOYMENT_ENVIRONMENT, name: value})
+
+
+@pytest.mark.parametrize("name", [NETWORK_ENV, NETUID_ENV])
+def test_environment_has_no_default_network_or_netuid(name: str) -> None:
+    environment = dict(DEPLOYMENT_ENVIRONMENT)
+    del environment[name]
+    with pytest.raises(EntrypointError, match=name):
+        validate_environment(environment)
+
+
+@pytest.mark.parametrize("netuid", ["0", "65535"])
+def test_environment_accepts_the_netuid_range_bounds(netuid: str) -> None:
+    inputs = validate_environment({**DEPLOYMENT_ENVIRONMENT, NETUID_ENV: netuid})
+    assert inputs.netuid == int(netuid)
 
 
 def test_tls_material_is_fresh_self_signed_matching_and_owner_only(tmp_path: Path) -> None:
@@ -270,8 +306,8 @@ def test_entrypoint_execs_only_the_fixed_tls_tdx_worker_command(tmp_path: Path) 
     assert argv[argv.index("--validator-minimum-stake-rao") + 1] == str(
         VALIDATOR_MINIMUM_STAKE_RAO
     ) == "0"
-    assert argv[argv.index("--validator-network") + 1] == VALIDATOR_NETWORK == "finney"
-    assert argv[argv.index("--validator-netuid") + 1] == str(VALIDATOR_NETUID) == "94"
+    assert argv[argv.index("--validator-network") + 1] == NETWORK
+    assert argv[argv.index("--validator-netuid") + 1] == str(NETUID)
     assert argv[argv.index("--public-endpoint") + 1] == PUBLIC_ENDPOINT
     assert argv[argv.index("--fleet-manifest") + 1] == str(FLEET_MANIFEST)
     assert argv[argv.index("--migration-mode") + 1] == "public-legacy-audit"
@@ -474,6 +510,10 @@ def test_host_startup_is_syntax_valid_and_pins_the_exact_pulled_runtime() -> Non
     assert "/usr/local/libexec/cathedral/run-sn94-miner" in readme
     assert "org.cathedral.sn94.runtime-contract" in script
     assert "--pull never" in script
+    assert ': "${CATHEDRAL_NETWORK:?CATHEDRAL_NETWORK is required}"' in script
+    assert ': "${CATHEDRAL_NETUID:?CATHEDRAL_NETUID is required}"' in script
+    assert '--env "CATHEDRAL_NETWORK=${CATHEDRAL_NETWORK}"' in script
+    assert '--env "CATHEDRAL_NETUID=${CATHEDRAL_NETUID}"' in script
 
 
 def test_host_startup_installs_only_the_fixed_tcp_8081_nftables_boundary() -> None:

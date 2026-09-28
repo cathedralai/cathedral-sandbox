@@ -19,16 +19,22 @@ artifact, not a live deployment.
 
 ## Inputs
 
-The default entrypoint accepts no arguments and exactly three Cathedral
+The default entrypoint accepts no arguments and exactly five Cathedral
 environment values:
 
 ```text
 CATHEDRAL_MINER_HOTKEY=<public Bittensor SS58 hotkey>
 CATHEDRAL_PUBLIC_ENDPOINT=https://<public-ip>:8081
 CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST=sha256:<64-lowercase-hex>
+CATHEDRAL_NETWORK=<chain network name>
+CATHEDRAL_NETUID=<canonical decimal netuid>
 ```
 
-They are public identity and integrity values. The entrypoint rejects every
+They are public identity, integrity and deployment values. The network and
+netuid have no default: the entrypoint refuses to start without them, and
+refuses a netuid that is not one canonical decimal number from 0 to 65535. They
+must equal the network and netuid the control host signs validator-access
+snapshots for. The entrypoint rejects every
 other `CATHEDRAL_*` environment value.
 
 The image fixes the remaining runtime contract:
@@ -38,8 +44,6 @@ Snapshot: /etc/cathedral/validator-access/validator-access.json
 Public keys: /etc/cathedral/validator-access/snapshot-keys.json
 Fleet: /etc/cathedral/validator-access/fleet.json
 Replay state: /var/lib/cathedral/validator-access/validator-access.sqlite
-Network: finney
-Subnet: 94
 Validator stake floor: 0 Rao plus validator permit
 Listener: native TLS on 0.0.0.0:8081
 TEE: Intel TDX

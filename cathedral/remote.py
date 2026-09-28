@@ -164,8 +164,8 @@ class RemoteMiner:
         ssl_context: ssl.SSLContext | None = None,
         validator_hotkey: str | None = None,
         validator_signer: RequestSigner | None = None,
-        validator_network: str = "finney",
-        validator_netuid: int = 94,
+        validator_network: str | None = None,
+        validator_netuid: int | None = None,
     ) -> None:
         if not isinstance(hotkey, str) or not hotkey or len(hotkey) > MAX_HOTKEY_LENGTH:
             raise ValueError("hotkey must be a non-empty bounded string")
@@ -206,6 +206,8 @@ class RemoteMiner:
             raise ValueError("validator hotkey and signer must be configured together")
         if validator_signer is not None and parsed.scheme != "https":
             raise ValueError("signed validator access requires HTTPS")
+        if validator_signer is not None and (validator_network is None or validator_netuid is None):
+            raise ValueError("signed validator access requires a network and netuid")
 
         self._endpoint = endpoint.rstrip("/")
         self._scheme = parsed.scheme
@@ -669,6 +671,8 @@ class RemoteMiner:
             )
             if include_validator_auth and validator_signer is not None:
                 assert self._validator_hotkey is not None
+                if self._validator_network is None or self._validator_netuid is None:
+                    raise ValueError("a signed validator request requires a network and netuid")
                 issued_at = datetime.now(UTC).replace(microsecond=0)
                 headers[VALIDATOR_REQUEST_HEADER] = build_validator_request_header(
                     validator_hotkey=self._validator_hotkey,

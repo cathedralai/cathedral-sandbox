@@ -70,6 +70,8 @@ trap 'exit 129' HUP
 : "${CATHEDRAL_MINER_HOTKEY:?CATHEDRAL_MINER_HOTKEY is required}"
 : "${CATHEDRAL_PUBLIC_ENDPOINT:?CATHEDRAL_PUBLIC_ENDPOINT is required}"
 : "${CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST:?CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST is required}"
+: "${CATHEDRAL_NETWORK:?CATHEDRAL_NETWORK is required}"
+: "${CATHEDRAL_NETUID:?CATHEDRAL_NETUID is required}"
 
 readonly IMAGE_PREFIX="${IMAGE_PATH}@sha256:"
 [[ "${SN94_SNP_MINER_IMAGE}" == "${IMAGE_PREFIX}"* ]] \
@@ -79,6 +81,10 @@ image_digest="${SN94_SNP_MINER_IMAGE#"${IMAGE_PREFIX}"}"
   || die 'the image must use one immutable lowercase sha256 digest'
 [[ "${CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] \
   || die 'the validator-access public-key file needs an exact lowercase sha256 pin'
+[[ "${CATHEDRAL_NETWORK}" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] \
+  || die 'the network must be a bounded lowercase name'
+[[ "${CATHEDRAL_NETUID}" =~ ^(0|[1-9][0-9]{0,4})$ ]] && (( CATHEDRAL_NETUID <= 65535 )) \
+  || die 'the netuid must be one canonical decimal subnet number'
 
 require_root_directory() {
   local path=$1
@@ -187,6 +193,8 @@ docker run --rm \
   --env "CATHEDRAL_MINER_HOTKEY=${CATHEDRAL_MINER_HOTKEY}" \
   --env "CATHEDRAL_PUBLIC_ENDPOINT=${CATHEDRAL_PUBLIC_ENDPOINT}" \
   --env "CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST=${CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST}" \
+  --env "CATHEDRAL_NETWORK=${CATHEDRAL_NETWORK}" \
+  --env "CATHEDRAL_NETUID=${CATHEDRAL_NETUID}" \
   "${SN94_SNP_MINER_IMAGE}" &
 docker_client_pid=$!
 

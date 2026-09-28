@@ -94,7 +94,7 @@ def test_current_guide_never_runs_user_writable_code_as_root() -> None:
     assert "sudo cathedral-access/" not in readme
     assert "sudo --preserve-env" in readme
     assert "/usr/local/libexec/cathedral/run-sn94-miner" in readme
-    assert "bad027acb1a46915723fc51ec2fa537bd632148b5715477223e2eddb6ab67c25" in readme
+    assert "0346c1c160690f53bef570278a5d5cea2645b9141a7a13ad643e80463afa7e27" in readme
 
 
 def test_validator_access_signing_seed_stays_outside_the_checkout() -> None:

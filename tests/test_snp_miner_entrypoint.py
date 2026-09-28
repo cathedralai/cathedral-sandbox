@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import random
 import subprocess
 from pathlib import Path
 
@@ -8,6 +9,8 @@ import pytest
 
 from cathedral.audit_miner_entrypoint import (
     HOTKEY_ENV,
+    NETUID_ENV,
+    NETWORK_ENV,
     PUBLIC_ENDPOINT_ENV,
     VALIDATOR_ACCESS_KEYS_DIGEST_ENV,
     EntrypointError,
@@ -21,10 +24,15 @@ from cathedral.snp_miner_entrypoint import (
 )
 
 HOTKEY = "5CtobNq2yNmUKaaR9HL5eSY2jN4j43iz1GLXNeNp2tbkwawK"
+# The subnet is deploy-time config with no default; draw one per run.
+NETWORK = "finney"
+NETUID = random.SystemRandom().randrange(1, 65_536)
 ENVIRONMENT = {
     HOTKEY_ENV: HOTKEY,
     PUBLIC_ENDPOINT_ENV: "https://8.8.8.8:8081",
     VALIDATOR_ACCESS_KEYS_DIGEST_ENV: "sha256:" + "ab" * 32,
+    NETWORK_ENV: NETWORK,
+    NETUID_ENV: str(NETUID),
 }
 REPOSITORY_ROOT = Path(__file__).parents[1]
 SNP_IMAGE_PATH = "ghcr.io/cathedralai/cathedral-sn39-snp-miner"
@@ -51,6 +59,8 @@ def test_snp_entrypoint_execs_only_the_fixed_signed_snp_command(tmp_path: Path) 
     argv = captured["argv"]
     child_environment = captured["environ"]
     assert argv[1:8] == ["-I", "-u", "-B", "-m", "cathedral.cli", "worker", "serve-snp"]
+    assert argv[argv.index("--validator-network") + 1] == NETWORK
+    assert argv[argv.index("--validator-netuid") + 1] == str(NETUID)
     assert "--tee" not in argv
     assert "--migration-mode" not in argv
     assert "--allow-customer-sat" not in argv
