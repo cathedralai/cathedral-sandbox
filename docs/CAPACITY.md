@@ -327,6 +327,71 @@ hotkeys, probed at different times. The full fix is to start every box's challen
 short window per round; until the prober does that, validators should treat bare-metal capacity
 as at most as trustworthy as one box per address.
 
+## Admission (`admission.py`)
+
+Before a TEE box is routed sandboxes or probed for receipts, the control plane (or the prober)
+admits it. `admit` (`admission.py:272-387`) is a pure function: no network, clock or files. The
+caller first verifies the box's quote itself with the pinned verifier (`cathedral/verify/__init__.py`
+in strict mode for TDX, `cathedral/verify/snp.py` for SEV-SNP), on the TLS connection that serves
+the sandbox API, then passes what it established as a `VerifiedAttestation`
+(`admission.py:103-119`): the kind (`tdx` or `sev_snp`), the raw PPID or CHIP_ID (bytes or
+lowercase hex), the measurement, the verifier digest, the SHA-256 of the raw quote or report, the
+quote's 64-byte REPORT_DATA and, for TDX, the verifier's `stable_platform_id`. With it go the
+certificate (or SPKI) from the caller's own handshake, the miner hotkey, the caller's 32-byte
+nonce, the box id, a measurement policy and the already-admitted hardware ids.
+
+It checks, and reports every failure together (`admission.py:354-373`):
+
+- **REPORT_DATA** must equal `report_data_v2(nonce, miner_hotkey, binding)`
+  (`admission.py:356-360`), the worker's existing v2 construction (`cathedral/common.py:260-295`,
+  byte for byte cathedral-validator's `cathedral_thin/independent/collect.py` `report_data_v2`).
+  It is SHA-512 over a domain tag, version 2, and four tagged, length-prefixed fields: the nonce,
+  the hotkey (UTF-8), the binding type `tls_spki_sha256`, and SHA-256 of the SPKI of the
+  certificate the caller saw (`cathedral/channel.py:78-82`). So a quote made for another nonce,
+  hotkey or TLS key, or with an `application_key_sha256` binding, is refused
+  (`report_data_mismatch`). No new format is added.
+- **TDX platform id.** The raw PPID must hash to the `stable_platform_id` the strict verifier
+  emitted (`admission.py:361-367`; `stablePlatformID` in `cmd/cathedral-tdx-verifier/main.go`),
+  so the PPID is the one in the verified quote's PCK certificate
+  (`hardware_id_not_in_verified_quote`). SEV-SNP's CHIP_ID is read from the report itself
+  (`cathedral/verify/snp.py:163`).
+- **Measurement** against the policy (`admission.py:368-370`): in `enforce` an unlisted
+  measurement is refused (`measurement_not_allowed`); in `shadow` the box is admitted with
+  `measurement_allowed: false` recorded, so operators collect the fleet's measurements first.
+- **One box per host, first claim wins** (`admission.py:371-373`). TEE boxes are whole hosts: a
+  PPID or CHIP_ID names the physical machine, so co-resident guests share it. The hardware id is
+  `derive_hardware_id` over the raw id (`admission.py:325`), exactly as receipts name the machine.
+  If it is already admitted to a different box (another `box_id`, or the same `box_id` under
+  another hotkey) the new claim is refused (`hardware_id_admitted_to_another_box`); the first box
+  keeps it until the caller removes its entry. The same box presenting the same host again is
+  re-admitted. Every key of the registry must be a canonical hardware id
+  (`admission.py:251-269`), so a registry keyed another way cannot let a duplicate slip past.
+
+The result is an `Admission` (`admission.py:130-142`): `admitted`, `reasons`, `hardware_id`,
+`hardware_id_kind`, `measurement`, `measurement_allowed`, `mode`, the policy digest and, only
+when admitted, the `ReceiptEvidence` for the box's receipts (`admission.py:386`). That evidence
+goes through the receipt's own evidence check (`admission.py:328-337`), with `tls_spki_sha256`
+taken from the caller's handshake, never from the box.
+
+**Policy.** `parse_policy(raw)` (`admission.py:154-210`) takes the file's bytes. The TDX policy
+is cathedral-validator #256's file unchanged: `{"schema": "cathedral_tdx_measurement_policy_v1",
+"mode": "shadow" | "enforce", "allowed_measurements": ["tdx-measurement-sha256:<64 hex>", ...]}`.
+The SEV-SNP policy has the same shape with schema `cathedral_snp_measurement_policy_v1` and
+96-hex measurements (`admission.py:62-70`). Exactly those three keys, no repeated key
+(`admission.py:145-151`), a sorted, unique list (`admission.py:198-199`), and a non-empty list when
+enforcing (`admission.py:203-204`); at most 128 KiB of UTF-8 JSON. Reading the file safely (owner,
+mode) stays with the caller, as #256's loader does. A policy of the other kind is an error.
+
+**Errors.** Any malformed input, of any type, raises `AdmissionError` (`admission.py:88-89`),
+never a bare exception (`test_fuzzed_input_is_an_admission_error_or_a_decision_never_another_exception`).
+
+**Not bound, and why.** The strict TDX verifier outputs `stable_platform_id`, a hash of the PPID,
+not the raw 16-byte PPID that `derive_hardware_id("ppid", ...)` needs. The caller must take the
+raw PPID from the verified quote's PCK certificate; admission then checks it against
+`stable_platform_id`, but no code here extracts it yet. Admission trusts the caller to have run
+the verifier on the same connection whose certificate it passes; the library cannot see the
+connection.
+
 ## Pricing (`pricing.py`)
 
 Schema `cathedral_capacity_price_table_v1`, signed by an SN94 owner key that validators pin.
@@ -364,5 +429,6 @@ changes.
 
 ## Not here yet
 
-The prober service, box registration and routing live in the Cathedral control plane. The
+The prober service, box registration and routing live in the Cathedral control plane; it calls
+`admit` but keeps the registry of admitted hardware ids itself. The
 validator-side scoring (dedup, then value) lands in cathedral-validator.
