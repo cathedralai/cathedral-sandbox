@@ -21,7 +21,7 @@ on:
 permissions: {}
 
 env:
-  IMAGE_PATH: ghcr.io/cathedralai/cathedral-sn39-snp-miner
+  IMAGE_PATH: ghcr.io/cathedralai/cathedral-sn94-snp-miner
 
 jobs:
   publish:
