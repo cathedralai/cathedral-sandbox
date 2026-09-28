@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import gc
 import hashlib
 import hmac
 import json
@@ -46,6 +47,17 @@ from cathedral.runtime import (
 )
 
 CANARY = MinerTarget("canary", "http://127.0.0.1:9000")
+
+
+
+@pytest.fixture(autouse=True)
+def _free_runtime_cycles():
+    """Free runtimes left in reference cycles (a patched method closing over its
+    runtime) at teardown, on the main thread. Left to the cycle collector,
+    ConfidentialRuntime.__del__ can run close() inside a later test's thread
+    start and deadlock the suite."""
+    yield
+    gc.collect()
 
 
 @dataclass
@@ -1090,7 +1102,14 @@ def test_epoch_survives_a_reenrollment_after_lifecycle_snapshot(
         return real_issue(*args, **kwargs)
 
     issuer.issue = issue_after_reenrollment  # type: ignore[method-assign]
-    run = runtime.run_epoch(11, CANARY)
+    try:
+        run = runtime.run_epoch(11, CANARY)
+    finally:
+        # The patch closes over runtime, which holds issuer: break the cycle and
+        # close now, or the cycle collector runs ConfidentialRuntime.__del__ at a
+        # random later point and its close() can deadlock another test's threads.
+        issuer.issue = real_issue  # type: ignore[method-assign]
+        runtime.close()
     assert run.status == "complete"
     outcome = next(item for item in run.outcomes if item.hotkey == "miner")
     assert outcome.status == "receipt_failed"
@@ -1161,8 +1180,12 @@ def test_lifecycle_receipt_failure_for_every_verified_miner_aborts_the_epoch(
         return real_issue(*args, **kwargs)
 
     issuer.issue = issue_after_reenrollment  # type: ignore[method-assign]
-    with pytest.raises(ReceiptError, match="all 2 verified miner") as caught:
-        runtime.run_epoch(11, CANARY, publish=True)
+    try:
+        with pytest.raises(ReceiptError, match="all 2 verified miner") as caught:
+            runtime.run_epoch(11, CANARY, publish=True)
+    finally:
+        issuer.issue = real_issue  # type: ignore[method-assign]  # see the test above
+        runtime.close()
     assert caught.value.category == "lifecycle"
     assert poster.bodies == []
     assert ledger.blocking_epoch() is None
