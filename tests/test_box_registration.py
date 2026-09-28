@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import json
+import os
+import random
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 import sr25519
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 
 from cathedral import box_registration as reg
 
+# netuid is deploy config: draw one per run, as the other suites do.
+NETUID = random.SystemRandom().randrange(1, 65536)
+OTHER_NETUID = NETUID % 65535 + 1
 NOW = datetime(2026, 9, 28, 12, 0, 0, tzinfo=UTC)
 CERT = "c3" * 32
 REVISION = "bd143ad8a18569351ffabf28c84e282f7c55b41b"
@@ -77,7 +83,7 @@ def _registration(**changes):
         host_values_text=_host_values(),
         runtime_key=RUNTIME_KEY,
         prober_public_key=PROBER.public_key(),
-        netuid=94,
+        netuid=NETUID,
         kind="bare_metal",
         keypair=MINER,
         now=NOW,
@@ -87,7 +93,7 @@ def _registration(**changes):
 
 
 def _verify(signed, **changes):
-    args = dict(netuid=94, now=NOW + timedelta(minutes=1))
+    args = dict(netuid=NETUID, now=NOW + timedelta(minutes=1))
     args.update(changes)
     return reg.verify_registration(signed, **args)
 
@@ -135,11 +141,104 @@ def test_tampering_or_another_hotkey_is_refused():
     with pytest.raises(reg.RegistrationError, match="does not verify"):
         _verify(stolen)
     with pytest.raises(reg.RegistrationError, match="another netuid"):
-        _verify(signed, netuid=39)
+        _verify(signed, netuid=OTHER_NETUID)
     with pytest.raises(reg.RegistrationError, match="not currently valid"):
         _verify(signed, now=NOW + timedelta(days=2))
     with pytest.raises(reg.RegistrationError, match="not a signed object"):
         _verify({k: v for k, v in signed.items() if k != "signature"})
+
+
+def _body(signed):
+    return copy.deepcopy({k: v for k, v in signed.items() if k != "signature"})
+
+
+def _hand_signed(body, *, algorithm="sr25519", raw=None):
+    """Sign a hand-edited body directly, past sign_registration's own checks, so
+    that verify_registration is the only thing that can refuse it."""
+    raw = MINER.sign(reg.canonical_bytes(body)) if raw is None else raw
+    return {
+        **body,
+        "signature": {"algorithm": algorithm, "value_b64": base64.b64encode(raw).decode()},
+    }
+
+
+def test_the_box_key_is_the_same_under_every_hotkey():
+    mine, theirs = _verify(_registration()), _verify(_registration(keypair=OTHER))
+    assert mine.box_key == theirs.box_key == reg.box_key_for(CERT)
+    assert mine.box_id != theirs.box_id  # box_id stays per hotkey
+    assert mine.box_key.startswith("boxkey-") and len(mine.box_key) == len("boxkey-") + 32
+    assert reg.box_key_for(CERT) != reg.box_key_for("d4" * 32)  # a reinstall is a new box
+
+
+def test_a_registration_issued_in_the_future_is_refused():
+    body = _body(_registration())
+    body["issued_at"] = reg._iso(NOW + reg.ISSUED_AT_SKEW)
+    assert _verify(_hand_signed(body), now=NOW).issued_at == NOW + reg.ISSUED_AT_SKEW
+    body["issued_at"] = reg._iso(NOW + reg.ISSUED_AT_SKEW + timedelta(seconds=1))
+    with pytest.raises(reg.RegistrationError, match="not currently valid"):
+        _verify(_hand_signed(body), now=NOW)
+
+
+@pytest.mark.parametrize("form", ["extra key", "json string"])
+def test_templates_must_be_signed_in_canonical_form(form):
+    body = _body(_registration())
+    if form == "extra key":
+        body["templates"][0]["gpu"] = 1
+    else:
+        body["templates"] = json.dumps(body["templates"])
+    with pytest.raises(reg.RegistrationError, match="canonical form"):
+        _verify(_hand_signed(body))
+
+
+def test_only_an_sr25519_signature_is_accepted():
+    body = _body(_registration())
+    assert _verify(_hand_signed(body)).box_id == body["box_id"]
+    with pytest.raises(reg.RegistrationError, match="sr25519 object"):
+        _verify(_hand_signed(body, algorithm="ed25519"))
+
+
+def test_a_signature_that_is_not_64_bytes_never_reaches_the_verifier():
+    body = _body(_registration())
+    good = MINER.sign(reg.canonical_bytes(body))
+    seen = []
+
+    def permissive(raw, message, public_key):
+        seen.append(raw)
+        return True
+
+    for raw in (good + b"\x00", good[:63], b""):
+        with pytest.raises(reg.RegistrationError, match="does not verify"):
+            _verify(_hand_signed(body, raw=raw), verifier=permissive)
+    assert seen == []
+
+
+def test_only_the_seal_algorithm_is_accepted():
+    body = _body(_registration())
+    body["sealed_runtime_key"]["algorithm"] = "x25519-hkdf-sha256-aes256gcm"
+    with pytest.raises(reg.RegistrationError, match="sealed_runtime_key is malformed"):
+        _verify(_hand_signed(body))
+    with pytest.raises(reg.RegistrationError, match="sealed_runtime_key is malformed"):
+        reg.sign_registration(body, MINER.sign)
+
+
+def test_the_seal_derivation_binds_both_public_keys():
+    shared, aad, ephemeral, recipient = (os.urandom(32) for _ in range(4))
+    key = reg._seal_key(shared, aad, ephemeral, recipient)
+    assert key != reg._seal_key(shared, aad, os.urandom(32), recipient)
+    assert key != reg._seal_key(shared, aad, ephemeral, os.urandom(32))
+    # X25519 ignores the top bit of a public key, so a second spelling of the
+    # ephemeral key gives the same shared secret. Binding the key bytes in the
+    # derivation is what makes the edited registration fail to open.
+    body = _body(_registration())
+    original = base64.b64decode(body["sealed_runtime_key"]["ephemeral_public_b64"])
+    twin = original[:31] + bytes([original[31] ^ 0x80])
+    assert PROBER.exchange(X25519PublicKey.from_public_bytes(twin)) == PROBER.exchange(
+        X25519PublicKey.from_public_bytes(original)
+    )
+    body["sealed_runtime_key"]["ephemeral_public_b64"] = base64.b64encode(twin).decode()
+    verified = _verify(reg.sign_registration(body, MINER.sign))
+    with pytest.raises(reg.RegistrationError, match="does not open"):
+        reg.open_runtime_key(verified, PROBER)
 
 
 def test_the_box_id_is_bound_to_certificate_and_hotkey():
@@ -184,10 +283,22 @@ def test_the_box_id_is_bound_to_certificate_and_hotkey():
             },
             "public IPv4 address",
         ),
+        *(
+            (
+                {
+                    "CATHEDRAL_E2B_API_URL": f"https://{address}",
+                    "CATHEDRAL_E2B_SANDBOX_URL": f"https://{address}:8443",
+                },
+                "public IPv4 address",
+            )
+            for address in ("239.1.1.1", "224.0.1.1", "192.88.99.1", "240.0.0.1")
+        ),
         ({"CATHEDRAL_E2B_SANDBOX_URL": "https://34.9.9.9:8443"}, "same IPv4"),
         ({"CATHEDRAL_E2B_SANDBOX_URL": "https://34.1.2.3:9443"}, "same IPv4"),
         ({"CATHEDRAL_CAPACITY_VCPU": "0"}, "positive integer"),
         ({"CATHEDRAL_CAPACITY_VCPU": "016"}, "positive integer"),
+        ({"CATHEDRAL_CAPACITY_VCPU": "\u00b2"}, "positive integer"),  # "²".isdigit()
+        ({"CATHEDRAL_CAPACITY_MEMORY_GIB": "\u0664"}, "positive integer"),  # Arabic-Indic 4
         ({"CATHEDRAL_TEMPLATES_JSON": "[]"}, "1 to 32"),
         (
             {"CATHEDRAL_TEMPLATES_JSON": json.dumps([{"name": "big", "cpu": 64, "memory_gib": 4}])},
@@ -239,54 +350,50 @@ def test_the_command_writes_a_verifiable_registration(tmp_path, capsys):
     host_values.write_text(_host_values())
     key_file = tmp_path / "runtime.key"
     key_file.write_bytes(RUNTIME_KEY + b"\n")
+    key_file.chmod(0o600)
+    host_values.chmod(0o644)  # host values are not secret: no warning
     prober_hex = (
         PROBER.public_key()
         .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         .hex()
     )
-    code = reg.main(
-        [
-            "--host-values",
-            str(host_values),
-            "--runtime-key-file",
-            str(key_file),
-            "--prober-key",
-            prober_hex,
-            "--netuid",
-            "94",
-            "--kind",
-            "bare_metal",
-            "--wallet-name",
-            "miner",
-            "--hotkey-name",
-            "default",
-        ],
-        keypair_factory=lambda *_args: MINER,
-    )
+    argv = [
+        "--host-values",
+        str(host_values),
+        "--runtime-key-file",
+        str(key_file),
+        "--prober-key",
+        prober_hex,
+        "--netuid",
+        str(NETUID),
+        "--kind",
+        "bare_metal",
+        "--wallet-name",
+        "miner",
+        "--hotkey-name",
+        "default",
+    ]
+    code = reg.main(argv, keypair_factory=lambda *_args: MINER)
     assert code == 0
-    signed = json.loads(capsys.readouterr().out)
-    verified = reg.verify_registration(signed, netuid=94, now=datetime.now(UTC))
+    captured = capsys.readouterr()
+    assert "warning" not in captured.err
+    signed = json.loads(captured.out)
+    verified = reg.verify_registration(signed, netuid=NETUID, now=datetime.now(UTC))
     assert reg.open_runtime_key(verified, PROBER) == RUNTIME_KEY  # trailing newline stripped
-    bad = reg.main(
-        [
-            "--host-values",
-            str(host_values),
-            "--runtime-key-file",
-            str(key_file),
-            "--prober-key",
-            "zz",
-            "--netuid",
-            "94",
-            "--kind",
-            "bare_metal",
-            "--wallet-name",
-            "miner",
-            "--hotkey-name",
-            "default",
-        ],
-        keypair_factory=lambda *_args: MINER,
-    )
+    bad_argv = ["zz" if arg == prober_hex else arg for arg in argv]
+    bad = reg.main(bad_argv, keypair_factory=lambda *_args: MINER)
     assert bad == 2 and "refused" in capsys.readouterr().err
+    # A key file the group or others can read still works, with a warning.
+    for mode in (0o640, 0o604):
+        key_file.chmod(mode)
+        assert reg.main(argv, keypair_factory=lambda *_args: MINER) == 0
+        captured = capsys.readouterr()
+        assert f"runtime key file {key_file} is readable by group or others" in captured.err
+        assert "host values" not in captured.err
+        verified = reg.verify_registration(
+            json.loads(captured.out), netuid=NETUID, now=datetime.now(UTC)
+        )
+        assert reg.open_runtime_key(verified, PROBER) == RUNTIME_KEY
 
 
 def test_real_installer_output_registers_and_tunnel_mode_is_refused():

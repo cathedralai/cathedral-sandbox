@@ -21,6 +21,30 @@ other tenant's sandboxes on a registered box.
 The prober verifies the registration, probes the box through its front door,
 and only then admits it (docs/MINER_BOX_RUNBOOK.md).
 
+One box, one hotkey. The certificate pin and IP are public, so a registration
+proves only that its signer holds the key it seals. ``box_id`` is per hotkey;
+``box_key`` (``box_key_for``) depends only on the certificate pin, so it is the
+same under every hotkey. ``verify_registration`` checks one document; the
+prober's endpoint then dedupes on ``box_key`` and on the control IP: the first
+claim that verifies and passes a probe wins, and a later claim for the same
+``box_key`` or IP under another hotkey is refused, never zeroing the first
+claimant. A claim lapses when its registration expires unrenewed or its key
+stops passing the probe. Moving a box to another hotkey means reinstalling it,
+which makes a new certificate and so a new ``box_key``, and registering once
+the old hotkey's claim on the IP has lapsed. Binding the box to its hotkey
+from the box side (the installer records the miner hotkey and the ingress
+serves it over the pinned TLS, so the prober checks box to hotkey too) is a
+follow-up in the runtime repo; until then whoever holds the key and registers
+first holds the box.
+
+Replay. A registration has no nonce, so anyone who saw a still-valid one can
+resubmit it. The endpoint keeps only the newest ``issued_at`` per ``box_key``
+and refuses an older one, or a different one with the same ``issued_at``, so a
+superseded registration cannot displace its successor. The document names no
+network: the prober keeps one X25519 key per network, so a registration
+replayed to another network's prober verifies there but its key does not open,
+and it is refused.
+
 Run ``python -m cathedral.box_registration --help`` on the machine that ran the
 installer and holds the miner hotkey.
 """
@@ -38,7 +62,6 @@ import re
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from cryptography.exceptions import InvalidTag
@@ -56,6 +79,7 @@ from cathedral.validator_access import (
 SCHEMA = "cathedral_box_registration_v1"
 SEAL_ALGORITHM = "x25519-hkdf-sha256-chacha20poly1305"
 SEAL_INFO = b"cathedral.box-registration.runtime-key.v1"
+ISSUED_AT_SKEW = timedelta(minutes=5)
 BOX_KINDS = ("tee", "bare_metal")
 MAX_VALIDITY = timedelta(days=7)
 MAX_HOST_VALUES_BYTES = 64 * 1024
@@ -66,6 +90,8 @@ _TEMPLATE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _TEMPLATE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _REVISION = re.compile(r"[0-9a-f]{40}")
 _HOST_KEY = re.compile(r"CATHEDRAL_[A-Z0-9_]+")
+# 6to4 relay anycast (RFC 7526): global by ipaddress, but shared by many hosts.
+_ANYCAST_6TO4 = ipaddress.IPv4Network("192.88.99.0/24")
 _BODY_KEYS = frozenset(
     {
         "schema",
@@ -91,6 +117,7 @@ class RegistrationError(ValueError):
 @dataclass(frozen=True)
 class VerifiedRegistration:
     box_id: str
+    box_key: str
     miner_hotkey: str
     netuid: int
     kind: str
@@ -125,7 +152,11 @@ def _front_door(control: object, guest: object) -> tuple[str, str]:
     """Exactly what the installer's direct mode writes: ``https://<IP>`` and
     ``https://<IP>:8443``, one public IPv4 address. A DNS name, a private,
     loopback or metadata address, another port or any other spelling is refused,
-    so a registration cannot point the prober anywhere but a public box."""
+    so a registration cannot point the prober anywhere but a public box. A
+    multicast, reserved or anycast address is refused too: ``is_global`` alone
+    admits multicast and 6to4 anycast. (Every reserved IPv4 address is already
+    non-global in Python 3.12; ``is_reserved`` keeps that true whatever
+    ``is_global`` becomes.)"""
 
     if not isinstance(control, str) or not control.startswith("https://"):
         raise RegistrationError("control_url must be https://<public IPv4>")
@@ -134,7 +165,13 @@ def _front_door(control: object, guest: object) -> tuple[str, str]:
         address = ipaddress.IPv4Address(host)
     except ValueError as exc:
         raise RegistrationError("control_url must be https://<public IPv4>") from exc
-    if str(address) != host or not address.is_global:
+    if (
+        str(address) != host
+        or not address.is_global
+        or address.is_multicast
+        or address.is_reserved
+        or address in _ANYCAST_6TO4
+    ):
         raise RegistrationError("control_url must name one public IPv4 address")
     if guest != f"https://{host}:8443":
         raise RegistrationError("guest_url must be https://<the same IPv4>:8443")
@@ -170,6 +207,12 @@ def box_id_for(cert_sha256: str, miner_hotkey: str) -> str:
     return f"box-{digest[:32]}"
 
 
+def box_key_for(cert_sha256: str) -> str:
+    """Stable per box whatever the hotkey: the prober's dedupe key, so one box
+    is admitted under one hotkey only (see the module docstring)."""
+    return f"boxkey-{hashlib.sha256(cert_sha256.encode()).hexdigest()[:32]}"
+
+
 def _templates(value: object) -> list[dict[str, Any]]:
     try:
         parsed = json.loads(value) if isinstance(value, str) else value
@@ -198,7 +241,8 @@ def _templates(value: object) -> list[dict[str, Any]]:
 
 
 def _positive(value: object, name: str) -> int:
-    if isinstance(value, str) and value.isdigit() and value == str(int(value)):
+    # isdigit() alone admits digits such as "²" that int() refuses.
+    if isinstance(value, str) and value.isascii() and value.isdigit() and value == str(int(value)):
         value = int(value)
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 1 << 20:
         raise RegistrationError(f"{name} must be a positive integer")
@@ -359,7 +403,7 @@ def verify_registration(
         raise RegistrationError("registration signature does not verify")
     if parsed.netuid != netuid:
         raise RegistrationError("registration is for another netuid")
-    if not parsed.issued_at - timedelta(minutes=5) <= now < parsed.expires_at:
+    if not parsed.issued_at - ISSUED_AT_SKEW <= now < parsed.expires_at:
         raise RegistrationError("registration is not currently valid")
     return parsed
 
@@ -428,6 +472,7 @@ def _fields(body: Mapping[str, Any]) -> VerifiedRegistration:
         raise RegistrationError("registration validity must be positive and at most 7 days")
     return VerifiedRegistration(
         box_id=body["box_id"],
+        box_key=box_key_for(cert),
         miner_hotkey=hotkey,
         netuid=netuid,
         kind=body["kind"],
@@ -470,10 +515,21 @@ def register(
     return sign_registration(body, keypair.sign)
 
 
-def _read_private_file(path: str, name: str, limit: int) -> bytes:
-    data = Path(path).read_bytes()
+def _read_file(path: str, name: str, limit: int, *, private: bool = False) -> bytes:
+    """Read a bounded file. A ``private`` (key) file that the group or others
+    can read still works, but draws a warning on stderr."""
+
+    with open(path, "rb") as handle:
+        mode = os.fstat(handle.fileno()).st_mode
+        data = handle.read(limit + 1)
     if not 1 <= len(data) <= limit:
         raise RegistrationError(f"{name} is empty or too large")
+    if private and mode & 0o077:
+        print(
+            f"warning: {name} file {path} is readable by group or others "
+            f"(mode {mode & 0o777:o}); chmod 600 it",
+            file=sys.stderr,
+        )
     return data
 
 
@@ -510,11 +566,11 @@ def main(
             keypair_factory = _wallet_hotkey_keypair
         keypair = keypair_factory(options.wallet_name, options.hotkey_name, options.wallet_path)
         registration = register(
-            host_values_text=_read_private_file(
+            host_values_text=_read_file(
                 options.host_values, "host values", MAX_HOST_VALUES_BYTES
             ).decode(),
-            runtime_key=_read_private_file(
-                options.runtime_key_file, "runtime key", MAX_RUNTIME_KEY_BYTES
+            runtime_key=_read_file(
+                options.runtime_key_file, "runtime key", MAX_RUNTIME_KEY_BYTES, private=True
             ).strip(),
             prober_public_key=prober,
             netuid=options.netuid,

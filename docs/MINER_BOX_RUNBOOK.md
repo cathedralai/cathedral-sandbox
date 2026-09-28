@@ -1,9 +1,9 @@
 # Supply a Cathedral runtime box
 
 From "I have a server" to a box that validators pay for. The design is in
-[`CAPACITY.md`](CAPACITY.md): the SN94 owner's prober creates sandboxes on your box each
-round, checks its CPU and memory with a challenge, and signs receipts that validators pay by
-market value. You never talk to validators directly.
+[`CAPACITY.md`](CAPACITY.md) (from #217): the SN94 owner's prober creates sandboxes on your
+box each round, checks its CPU and memory with a challenge, and signs receipts that validators
+pay by market value. You never talk to validators directly.
 
 ## 1. The server
 
@@ -47,10 +47,12 @@ python -m cathedral.box_registration \
   --host-values cathedral-runtime-LABEL.values \
   --runtime-key-file cathedral-runtime-LABEL.key \
   --prober-key "$SN94_PROBER_X25519_PUBLIC_KEY_HEX" \
-  --netuid 94 --kind bare_metal \
+  --netuid "$NETUID" --kind bare_metal \
   --wallet-name YOUR_WALLET --hotkey-name YOUR_HOTKEY \
   > registration.json
 ```
+
+`NETUID` is the subnet the SN94 owner publishes with the prober key.
 
 The registration names your hotkey, the box's front door and certificate pin, its capacity and
 templates, and carries the runtime API key **sealed to the prober**: only the prober can open
@@ -76,10 +78,32 @@ key). The prober verifies the signature, opens the key, probes the box through i
 and admits it once a probe passes. From then on each round's receipt carries your box's
 verified capacity, and validators pay your hotkey its market value.
 
+**One box, one hotkey.** The prober admits each box under one hotkey. It knows a box by its
+`box_key`, which comes from the certificate pin alone, and by its control IP. The first
+registration for a box or an IP that verifies and passes a probe wins; a later one for the
+same box or IP under another hotkey is refused, and the first hotkey keeps earning.
+Registering again under the same hotkey keeps the claim; it lapses when its registration
+expires unrenewed or its key stops passing the probe. To move a box to another hotkey,
+reinstall it (a new certificate is a new `box_key`), let the old registration expire, then
+register under the new hotkey.
+
+The certificate pin and IP are public, so what shows the box is yours is holding its key:
+anyone who has it and registers first holds the box. Keep the key file at mode 600 (the command
+warns when the group or others can read it). A box-side binding is planned in the runtime: the
+installer records your hotkey and the front door serves it over the pinned TLS, so the prober
+also checks box to hotkey.
+
+**Replays.** A registration has no nonce, so anyone who saw one could resubmit it while it is
+valid. The endpoint keeps only the newest `issued_at` per `box_key` and refuses an older one,
+or a different one with the same `issued_at`, so an old registration can't replace your
+current one. Each network's prober has its own key, so a registration replayed to another
+network's prober doesn't open there.
+
 ## Keep it paid
 
 - Keep the box reachable on 443 and 8443 from the prober, and the runtime healthy.
 - The prober's sandboxes are ordinary customer-shaped sandboxes: a box that treats them
   differently from customer traffic fails the same checks customers would.
-- A failed challenge, a missed deadline, or a box claimed under two hotkeys earns nothing for
-  that round.
+- A failed challenge or a missed deadline earns nothing for that round.
+- A registration for a box or IP that another hotkey holds is refused (see "One box, one
+  hotkey" above).
