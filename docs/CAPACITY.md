@@ -59,9 +59,10 @@ A box that returns garbage for `f` of its `n` lanes passes a `k`-lane sample wit
 can compute `n - 1` lanes honestly and fake one, and passes the floor sample about half the
 time. In expectation that does not pay while value is linear in vCPUs (half of `n` lanes' pay
 is less than `n - 1` lanes' pay for `n > 2`), but it does pay at a consumer-profile threshold,
-where `n - 1` vCPUs earn zero. The deadline carries that case: to fake nothing, the short box
-must run `n` lanes on `n - 1` cores, which takes about twice as long, and misses a deadline set
-for `n` cores. That works only once the deadline is tight (see Timing), so until then:
+where `n - 1` vCPUs earn zero. The deadline cannot fully carry that case either: a short box
+that fakes nothing runs `n` lanes on `n - 1` cores by time-slicing, which takes only `n / (n - 1)`
+as long (about 1.6% longer at 64 lanes), well inside any deadline that tolerates normal CPU
+variance. Timing can separate large shortfalls, not one missing core. So:
 
 - a prober that needs certainty for a box at a profile threshold sets `sample_count = lanes`
   (it recomputes the whole answer);
@@ -96,8 +97,14 @@ This bound only stops a receipt from carrying an absurd deadline (a receipt with
 `deadline_ms = 10^15` was accepted before). It is deliberately generous, so an honest box
 running the pure-Python reference is not refused, and it is far looser than a native worker
 needs. **Validators must not treat the timing check as a capacity signal until the formula is
-benchmarked** on native workers across real CPUs and tightened; until then the sample is the
-only capacity evidence in a receipt, with the limits above.
+benchmarked** on native workers across real CPUs and tightened.
+
+**What a receipt proves today.** The sample proves the lanes were computed correctly. Under this
+bound it proves neither the core count nor the total memory. One core running a native worker
+can compute every lane one after another well inside `max_deadline_ms`, holding one lane's memory
+(`M / C`) at a time rather than all `M` at once. Until the deadline is benchmarked and tightened
+so the lanes must run in parallel, treat a receipt as evidence that the box computed the
+challenge for the claimed shape, not as proof that it has that many cores or that much memory.
 
 ### Cost
 
@@ -178,24 +185,24 @@ treat bare-metal capacity as at most as trustworthy as one box per address.
 Schema `cathedral_capacity_price_table_v1`, signed by an SN94 owner key that validators pin.
 
 - `rates`: `vcpu_hour` and `gib_hour` for `tee` and for `bare_metal`, in integer micro-units
-  of `currency` per hour from 0 to 10^12, set from market prices (`pricing.py:91-94`,
-  `pricing.py:122-132`).
+  of `currency` per hour from 0 to 10^12, set from market prices (`pricing.py:92-95`,
+  `pricing.py:123-133`).
 - `consumer_profiles`: the minimum shape each consuming subnet needs (for example `sn120`,
   `sn81`); `min_vcpus` is at most 1024, what the challenge can prove, and `min_memory_gib` at
-  most 4096 (`pricing.py:142-149`).
+  most 4096 (`pricing.py:143-150`).
 - `effective_from` must be a real date and time, and `key_id` well formed
-  (`pricing.py:151-162`).
+  (`pricing.py:152-163`).
 
 `value(kind=, vcpus=, memory_gib=)` = `vcpus × vcpu_hour + memory_gib × gib_hour` at the rate
 for the box's kind, or zero when the box is below every consumer profile; a non-positive or
-non-integer shape is a `PriceTableError` (`pricing.py:77-88`).
+non-integer shape is a `PriceTableError` (`pricing.py:78-89`).
 
-`load_price_table` (`pricing.py:185-237`) requires a timezone-aware `now` and a
+`load_price_table` (`pricing.py:190-244`) requires a timezone-aware `now` and a
 `minimum_sequence`: the highest sequence this validator has verified, so whoever serves tables
-cannot roll it back to an older signed one (`pricing.py:229-230`). A validator should also
-keep that table's `digest` (`table_digest`, `pricing.py:97-103`) and pass it as
+cannot roll it back to an older signed one (`pricing.py:236-237`). A validator should also
+keep that table's `digest` (`table_digest`, `pricing.py:98-104`) and pass it as
 `pinned_digest`, so a different table signed at the same sequence is refused
-(`pricing.py:231-236`).
+(`pricing.py:238-243`).
 
 ## Not here yet
 

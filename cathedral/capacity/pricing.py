@@ -39,6 +39,7 @@ _PROFILE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 _KEY_ID = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 MAX_MICRO = 10**12
+MAX_SEQUENCE = 2**63 - 1
 MAX_PROFILE_MEMORY_GIB = 4096
 
 
@@ -161,8 +162,12 @@ def _body(table: Mapping[str, Any]) -> PriceTable:
     if not isinstance(key_id, str) or _KEY_ID.fullmatch(key_id) is None:
         raise PriceTableError("key_id is malformed")
     sequence = table["sequence"]
-    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
-        raise PriceTableError("sequence must be a positive integer")
+    if (
+        not isinstance(sequence, int)
+        or isinstance(sequence, bool)
+        or not 1 <= sequence <= MAX_SEQUENCE
+    ):
+        raise PriceTableError(f"sequence must be an integer from 1 to {MAX_SEQUENCE}")
     return PriceTable(
         currency=currency,
         rates=rates,
@@ -211,7 +216,9 @@ def load_price_table(
     if isinstance(signed, (str, bytes)):
         try:
             signed = json.loads(signed)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        except (ValueError, RecursionError) as exc:
+            # JSONDecodeError and UnicodeDecodeError are ValueErrors; so is an
+            # integer past Python's digit limit. Deep nesting recurses.
             raise PriceTableError("price table is not JSON") from exc
     if not isinstance(signed, Mapping) or "signature" not in signed:
         raise PriceTableError("price table is not a signed object")

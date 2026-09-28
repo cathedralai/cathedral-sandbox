@@ -756,3 +756,25 @@ def test_malformed_tables_are_refused(owner, changes):
     key, _keys = owner
     with pytest.raises(pricing.PriceTableError):
         pricing.sign_price_table(_table(**changes), key)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"sequence": ' + "1" * 5000 + "}",
+        "[" * 100_000,
+        b"\xff\xfe",
+    ],
+)
+def test_unsigned_table_bytes_never_escape_as_other_errors(owner, raw):
+    _key, keys = owner
+    with pytest.raises(pricing.PriceTableError, match="not JSON"):
+        _load(raw, keys, minimum_sequence=1)
+
+
+def test_a_huge_sequence_is_refused_before_the_signature_check(owner):
+    key, keys = owner
+    signed = pricing.sign_price_table(_table(), key)
+    signed["sequence"] = 10**5000
+    with pytest.raises(pricing.PriceTableError, match="sequence"):
+        _load(signed, keys, minimum_sequence=1)
