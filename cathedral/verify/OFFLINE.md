@@ -49,7 +49,9 @@ Both capture directories use the same layout, with mode 0700 directories and 060
   the caller passes `capture_box_id=` to `verify()`, `verify_snp()` or
   `verify_snp_report_data()`, and is `null` otherwise. The sidecar records the first
   capture of those bytes; an identical later capture leaves it unchanged. It is
-  context for audits, not signed evidence.
+  context for audits, not signed evidence. It is written after the evidence file,
+  and a failure to write it is logged and never changes the verdict, so a capture
+  can exist without a sidecar.
 
 `tdx_offline.verify_tdx_offline` reuses the static Linux ELF implementation-digest
 contract and executes only a private copy of the authenticated bytes. Its digest

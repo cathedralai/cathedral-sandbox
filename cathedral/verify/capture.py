@@ -66,6 +66,33 @@ def _write_private(directory: Path, prefix: str, encoded: bytes) -> str:
     return temporary
 
 
+def _write_sidecar(path: Path, encoded: bytes) -> None:
+    # Context only, like the metadata values: any failure here is logged and
+    # never raised, so it can't reject evidence that is already written.
+    # O_EXCL keeps the first writer's record; O_NOFOLLOW refuses a planted link.
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return
+    except OSError as exc:
+        _LOG.warning("capture metadata: sidecar %s not created: %s", path.name, exc)
+        return
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+    except OSError as exc:
+        _LOG.warning("capture metadata: sidecar %s not written: %s", path.name, exc)
+        try:
+            # This call created the file, so a partial record is ours to remove
+            # rather than left to block a later complete one.
+            path.unlink()
+        except OSError:
+            pass
+
+
 def write_private_capture(
     document: dict[str, object],
     directory: Path,
@@ -77,10 +104,13 @@ def write_private_capture(
 ) -> Path:
     """Write ``document`` as ``<sha256>.json`` plus a ``.meta.json`` sidecar.
 
-    Both files are mode 0600 in a 0700 directory and appear atomically. The
-    sidecar records the first capture of those exact bytes; a later identical
-    capture leaves the original record in place. Raises ``OSError`` for write
-    failures and ``ValueError`` for invalid metadata, before anything is written.
+    Both files are mode 0600 in a 0700 directory. The evidence file appears
+    atomically, and a failure to write it raises ``OSError``. Malformed metadata
+    values are dropped with a warning, never raised. The sidecar is written
+    after the evidence file and records the first capture of those exact bytes;
+    a later identical capture leaves the original record in place. A sidecar
+    write failure is logged and never raised, so the evidence file is kept
+    without a sidecar.
     """
     encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("ascii")
     digest = hashlib.sha256(encoded).hexdigest()
@@ -99,11 +129,5 @@ def write_private_capture(
         os.replace(temporary, destination)
     finally:
         Path(temporary).unlink(missing_ok=True)
-    temporary = _write_private(directory, temporary_prefix + "meta-", metadata_encoded)
-    try:
-        os.link(temporary, directory / (digest + ".meta.json"))
-    except FileExistsError:
-        pass
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+    _write_sidecar(directory / (digest + ".meta.json"), metadata_encoded)
     return destination

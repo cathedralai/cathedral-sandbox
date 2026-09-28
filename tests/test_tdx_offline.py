@@ -245,3 +245,50 @@ def test_online_capture_hook_retains_pair_only_after_success(monkeypatch, tmp_pa
         == {}
     )
     assert _capture_files(tmp_path / "captures") == (captures, sidecars)
+
+
+@pytest.mark.parametrize("stage", ["create", "write"])
+def test_sidecar_failure_keeps_the_tdx_verdict_and_the_capture(
+    monkeypatch, tmp_path, caplog, stage
+):
+    # The sidecar is context: failing to create it (EPERM/ENOTSUP) or to write it
+    # (ENOSPC) must not reject a vendor-verified quote or drop its evidence file.
+    verifier = importlib.import_module("cathedral.verify")
+    capture = importlib.import_module("cathedral.verify.capture")
+    monkeypatch.setenv("CATHEDRAL_TDX_CAPTURE_DIR", str(tmp_path / "captures"))
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", "/test/verifier")
+    monkeypatch.setattr(verifier, "_production_tdx_command", lambda _: ["/test/verifier"])
+
+    def child(argv, *args, **kwargs):
+        Path(argv[-1]).write_bytes(b"vendor collateral")
+        return '{"intel_verified":true}', "", 0
+
+    monkeypatch.setattr(verifier, "_read_bounded_subprocess", child)
+    real_open, real_fsync, sidecar_fds = capture.os.open, capture.os.fsync, set()
+
+    def sidecar_open(path, *args, **kwargs):
+        if str(path).endswith(".meta.json"):
+            if stage == "create":
+                raise PermissionError(1, "Operation not permitted")
+            fd = real_open(path, *args, **kwargs)
+            sidecar_fds.add(fd)
+            return fd
+        return real_open(path, *args, **kwargs)
+
+    def sidecar_fsync(fd):
+        if fd in sidecar_fds:
+            raise OSError(28, "No space left on device")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(capture.os, "open", sidecar_open)
+    monkeypatch.setattr(capture.os, "fsync", sidecar_fsync)
+    with caplog.at_level("WARNING", logger="cathedral.verify.capture"):
+        claims = verifier._run_tdx_verifier(
+            b"quote", production_mode=True, expected_report_data=b"x" * 64
+        )
+    assert claims["intel_verified"] is True
+    captures, sidecars = _capture_files(tmp_path / "captures")
+    assert len(captures) == 1 and sidecars == []
+    assert json.loads(captures[0].read_bytes())["schema"] == "cathedral_tdx_capture_v1"
+    assert "sidecar" in caplog.text
+    assert (stage == "write") == bool(sidecar_fds)
