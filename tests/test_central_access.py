@@ -419,5 +419,70 @@ def test_central_replay_state_has_its_own_smaller_cap(tmp_path):
             network=NETWORK,
             netuid=NETUID,
             channel_binding=BINDING,
-            state=ValidatorAccessState(str(tmp_path / "validator-sized.sqlite")),
+            state=ca.CentralAccessState(
+                str(tmp_path / "validator-sized.sqlite"), max_replay_entries=4096
+            ),
         )
+    with pytest.raises(ca.CentralAccessError, match="durable replay state"):
+        ca.CentralAccessAuthorizer(
+            ROOT_KEYS,
+            worker_hotkey=WORKER,
+            network=NETWORK,
+            netuid=NETUID,
+            channel_binding=BINDING,
+            state=ValidatorAccessState(str(tmp_path / "validator-state.sqlite")),
+        )
+
+
+def _authorizer_on(path: Path) -> ca.CentralAccessAuthorizer:
+    return ca.CentralAccessAuthorizer(
+        ROOT_KEYS,
+        worker_hotkey=WORKER,
+        network=NETWORK,
+        netuid=NETUID,
+        channel_binding=BINDING,
+        state=ca.open_central_access_state(str(path)),
+    )
+
+
+def test_a_restarted_authorizer_still_refuses_an_older_delegation(tmp_path):
+    path = tmp_path / "central-access.sqlite"
+    first = _authorizer_on(path)
+    _accept(first, _header(_delegation(sequence=7)))
+    first.state.close()
+
+    restarted = _authorizer_on(path)
+    with pytest.raises(ca.CentralAccessError, match="older than one already accepted"):
+        restarted.preauthorize(
+            _header(_delegation(sequence=6), nonce=b"m" * 32), method="POST", path=PATH, now=NOW
+        )
+    _accept(restarted, _header(_delegation(sequence=7), nonce=b"m" * 32))
+    assert restarted.state.delegation_high_water() == 7
+
+
+def test_a_newer_delegation_is_refused_when_its_high_water_cannot_be_stored(authorizer):
+    authorizer.state.raise_delegation_high_water = lambda _sequence: None
+    with pytest.raises(ca.CentralAccessError, match="could not be recorded"):
+        authorizer.preauthorize(_header(), method="POST", path=PATH, now=NOW)
+
+
+def test_an_unreadable_high_water_refuses_to_start(tmp_path):
+    state = ca.open_central_access_state(str(tmp_path / "central-access.sqlite"))
+    state.close()
+    with pytest.raises(ca.CentralAccessError, match="high-water is unreadable"):
+        ca.CentralAccessAuthorizer(
+            ROOT_KEYS,
+            worker_hotkey=WORKER,
+            network=NETWORK,
+            netuid=NETUID,
+            channel_binding=BINDING,
+            state=state,
+        )
+
+
+def test_the_stored_high_water_only_rises(tmp_path):
+    state = ca.open_central_access_state(str(tmp_path / "central-access.sqlite"))
+    assert state.delegation_high_water() == 0
+    assert state.raise_delegation_high_water(9) == 9
+    assert state.raise_delegation_high_water(4) == 9
+    assert state.delegation_high_water() == 9
