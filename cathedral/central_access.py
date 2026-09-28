@@ -509,8 +509,15 @@ class CentralAccessAuthorizer:
     ``state`` must be a CentralAccessState on its own path, so central
     requests never share the validator replay budget, holding at most
     MAX_CENTRAL_REPLAY_ENTRIES nonces; open_central_access_state builds one.
-    The delegation high-water is read from it at start and raised in it before
-    a newer delegation is accepted.
+    The delegation high-water is read from it at start, and every request is
+    checked against the stored value, raised in the same transaction, so
+    workers that share one state file honour each other's newer delegations.
+
+    Revocations and the revocation-list sequence are held in memory only.
+    Nothing installs a revocation list yet, so that is not exploitable today.
+    When the revocation fetch lands, the list and its sequence must be
+    persisted in ``state`` too, or a restart drops them and an older list (or
+    no list) could be accepted again.
     """
 
     def __init__(
@@ -633,11 +640,13 @@ class CentralAccessAuthorizer:
 
         _verify_ed25519(document, delegation.central_key, "central request")
         with self._lock:
-            if delegation.sequence > self._delegation_high_water:
-                stored = self.state.raise_delegation_high_water(delegation.sequence)
-                if stored is None:
-                    raise CentralAccessError("central delegation high-water could not be recorded")
-                self._delegation_high_water = stored
+            # Another worker may share this state file and have accepted a
+            # newer delegation, so the stored high-water is read in the same
+            # transaction that raises it, and never trusted from memory alone.
+            stored = self.state.raise_delegation_high_water(delegation.sequence)
+            if stored is None:
+                raise CentralAccessError("central delegation high-water could not be recorded")
+            self._delegation_high_water = max(self._delegation_high_water, stored)
             if delegation.sequence < self._delegation_high_water:
                 raise CentralAccessError("central delegation is older than one already accepted")
         return PreauthorizedCentralRequest(
@@ -665,6 +674,10 @@ class CentralAccessAuthorizer:
         with self._lock:
             if request.delegation_digest in self._revoked:
                 raise CentralAccessError("central delegation has been revoked")
+            stored = self.state.delegation_high_water()
+            if stored is None:
+                raise CentralAccessError("central delegation high-water is unreadable")
+            self._delegation_high_water = max(self._delegation_high_water, stored)
             if request.delegation_sequence < self._delegation_high_water:
                 raise CentralAccessError("central delegation is older than one already accepted")
         if not self.state.check_and_record_request(

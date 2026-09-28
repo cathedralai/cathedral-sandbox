@@ -486,3 +486,37 @@ def test_the_stored_high_water_only_rises(tmp_path):
     assert state.raise_delegation_high_water(9) == 9
     assert state.raise_delegation_high_water(4) == 9
     assert state.delegation_high_water() == 9
+
+
+def test_workers_sharing_one_state_file_honour_each_others_high_water(tmp_path):
+    path = tmp_path / "central-access.sqlite"
+    first = _authorizer_on(path)
+    second = _authorizer_on(path)
+    _accept(second, _header(_delegation(sequence=5)))
+    _accept(first, _header(_delegation(sequence=7), nonce=b"m" * 32))
+    assert second.state.delegation_high_water() == 7
+
+    with pytest.raises(ca.CentralAccessError, match="older than one already accepted"):
+        second.preauthorize(
+            _header(_delegation(sequence=5), nonce=b"k" * 32), method="POST", path=PATH, now=NOW
+        )
+    _accept(second, _header(_delegation(sequence=7), nonce=b"q" * 32))
+
+
+def test_finalize_honours_a_high_water_another_worker_raised_mid_request(tmp_path):
+    path = tmp_path / "central-access.sqlite"
+    first = _authorizer_on(path)
+    second = _authorizer_on(path)
+    pending = second.preauthorize(
+        _header(_delegation(sequence=5)), method="POST", path=PATH, now=NOW
+    )
+    _accept(first, _header(_delegation(sequence=7), nonce=b"m" * 32))
+    with pytest.raises(ca.CentralAccessError, match="older than one already accepted"):
+        second.finalize(pending, body=BODY, now=NOW)
+
+
+def test_finalize_refuses_when_the_high_water_cannot_be_read(authorizer):
+    request = authorizer.preauthorize(_header(), method="POST", path=PATH, now=NOW)
+    authorizer.state.delegation_high_water = lambda: None
+    with pytest.raises(ca.CentralAccessError, match="high-water is unreadable"):
+        authorizer.finalize(request, body=BODY, now=NOW)
