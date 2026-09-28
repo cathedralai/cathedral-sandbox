@@ -487,6 +487,15 @@ class TeeBoxSandboxApi:
 
     # -- box and lease ---------------------------------------------------
 
+    def _egress_view(self) -> dict[str, object]:
+        view = self.egress.describe()
+        status = getattr(self.executor, "egress_status", None)
+        if callable(status):
+            state = status()
+            view["enforced"] = state.get("enforced") is True
+            view["enforcement_error"] = state.get("error")
+        return view
+
     def _box(self, caller, body, fields) -> Response:  # noqa: ANN001
         lease = self.lease.current()
         return _json(
@@ -505,7 +514,7 @@ class TeeBoxSandboxApi:
                 "capacity": self.capacity.view(),
                 "allocated": self._allocated().view(),
                 "default_shape": self.default_shape.view(),
-                "egress": self.egress.describe(),
+                "egress": self._egress_view(),
                 "lease": {
                     "held": lease is not None,
                     "held_by_caller": lease is not None and lease.holder == caller,

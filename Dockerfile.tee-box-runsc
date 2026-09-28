@@ -1,0 +1,28 @@
+# Opt-in TEE box layer (T6b1). NOT a production image and not published.
+#
+# It adds a pinned, checksum-verified gVisor runsc to an SN39 miner image that
+# was already built from Dockerfile.sn39-audit-miner (TDX) or
+# Dockerfile.sn39-snp-miner (SNP). The production images stay unchanged until
+# T6b2 qualifies runsc under real TDX and SNP guests (docs/TEE_BOX_SERVICE.md).
+#
+#   docker build -f Dockerfile.tee-box-runsc \
+#     --build-arg MINER_IMAGE=<miner image>@sha256:<digest> .
+#
+# MINER_IMAGE has no default and must name a digest, so the base is explicit.
+ARG MINER_IMAGE
+
+# The fetch stage uses the same pinned linux/amd64 base as the miner images.
+FROM python:3.12-slim-bookworm@sha256:4427763a1ba36f5aa8f656a03e5d00f3b8d61f5dd950c73df6c14f8c7640f8ab AS runsc
+ARG MINER_IMAGE
+RUN case "${MINER_IMAGE}" in *@sha256:????????????????????????????????????????????????????????????????) ;; *) echo "MINER_IMAGE must be pinned by sha256 digest" >&2; exit 1;; esac
+
+# gVisor release-20260817.0, the last weekly release that publishes runsc as
+# a single binary. Google publishes a sha512 next to it; the sha256 below was
+# computed from that file after checking the sha512, and the build refuses
+# any other content.
+RUN python -c "import hashlib,pathlib,urllib.request; url='https://storage.googleapis.com/gvisor/releases/release/20260817.0/x86_64/runsc'; path=pathlib.Path('/usr/local/bin/runsc'); expected='048b89aada69dc3333422e139d6e9d02f8ab06bda52398060e0fbdacca00074c'; urllib.request.urlretrieve(url, path); digest=hashlib.sha256(); f=path.open('rb'); [digest.update(chunk) for chunk in iter(lambda: f.read(1 << 20), b'')]; f.close(); assert digest.hexdigest() == expected, 'pinned runsc digest mismatch'; path.chmod(0o555)"
+
+FROM ${MINER_IMAGE}
+LABEL org.cathedral.tee-box.runsc="release-20260817.0" \
+      org.cathedral.tee-box.runsc-sha256="048b89aada69dc3333422e139d6e9d02f8ab06bda52398060e0fbdacca00074c"
+COPY --from=runsc /usr/local/bin/runsc /usr/local/bin/runsc

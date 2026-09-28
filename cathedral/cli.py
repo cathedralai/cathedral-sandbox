@@ -135,6 +135,7 @@ from cathedral.runtime import (
     RuntimeConfig,
 )
 from cathedral.score_class import export_score_class_report
+from cathedral.tee_box.configure import add_tee_box_arguments, build_tee_box_api, tee_box_config
 from cathedral.worker import WorkerServer
 
 DEFAULT_PUBLISHER_BEARER_ENV = "CATHEDRAL_PUBLISHER_BEARER_TOKEN"
@@ -1386,11 +1387,15 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             )
     allow_public_bootstrap = migration_mode == "public-bootstrap-evidence"
     allow_public_legacy_audit = migration_mode == "public-legacy-audit"
+    # All TEE box flags or none; a partial set refuses before anything starts.
+    tee_box = tee_box_config(args)
     tls_certificate = getattr(args, "tls_certificate", None)
     tls_private_key = getattr(args, "tls_private_key", None)
     if (tls_certificate is None) != (tls_private_key is None):
         raise ValueError("worker TLS certificate and private key must be supplied together")
     tls_enabled = tls_certificate is not None
+    if tee_box is not None and not tls_enabled:
+        raise ValueError("the TEE box sandbox API requires the attested worker TLS listener")
     try:
         is_loopback = ipaddress.ip_address(args.host).is_loopback
     except ValueError:
@@ -1550,6 +1555,8 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         raise ValueError("customer SAT cannot use the development non-loopback HTTP bind")
     if allow_customer_sat and getattr(args, "gpu_composite", False):
         raise ValueError("customer SAT is available only on the CPU worker path")
+    if tee_box is not None and (tls_context is None or channel_binding is None):
+        raise ValueError("the TEE box sandbox API requires the attested worker TLS listener")
     validator_authorizer = None
     fleet_endpoints = None
     fleet_candidates = 0
@@ -1657,6 +1664,17 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         )
         gpu_executor = CudaWorkExecutor(G4_WORKER_PROFILE_ID, (gpu_evidence_collector.gpu_uuid,))
         evidence_collector = cpu_evidence_unavailable
+    tee_box_api = None
+    tee_box_facts = None
+    if tee_box is not None:
+        assert channel_binding is not None
+        tee_box_api, tee_box_facts = build_tee_box_api(
+            tee_box,
+            hotkey=args.hotkey,
+            channel_binding=channel_binding,
+            netuid=getattr(args, "validator_netuid", DEFAULT_ENROLL_NETUID),
+            public_endpoint=public_endpoint,
+        )
     with WorkerServer(
         args.host,
         args.port,
@@ -1674,6 +1692,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         gpu_executor=gpu_executor,
         gpu_evidence_collector=gpu_evidence_collector,
         central_authorizer=central_authorizer,
+        tee_box_api=tee_box_api,
     ) as server:
         print(
             json.dumps(
@@ -1702,6 +1721,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
                     "customer_sat": allow_customer_sat,
                     "signed_validator_access": validator_authorizer is not None,
                     "fleet_candidates": fleet_candidates,
+                    "tee_box": tee_box_facts,
                 }
             )
         )
@@ -4453,6 +4473,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_worker_base(p_serve)
     add_worker_signed_access(p_serve)
+    add_tee_box_arguments(p_serve)
     p_serve.add_argument(
         "--allow-customer-sat",
         action="store_true",
@@ -4476,6 +4497,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_worker_base(p_serve_snp)
     add_worker_signed_access(p_serve_snp)
+    add_tee_box_arguments(p_serve_snp)
     p_serve_snp.set_defaults(
         func=cmd_worker_serve,
         worker_posture="snp-production",

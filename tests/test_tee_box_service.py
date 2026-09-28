@@ -908,3 +908,33 @@ def test_an_expiry_found_under_the_create_lock_never_runs_the_drain_there():
     assert lease.draining
     lease.retry_drain()  # the drain runs later, outside the lock
     assert drains == ["customer-a"] and not lease.draining
+
+
+class _DenyAllExecutor(FakeExecutor):
+    """An executor whose egress table is down: deny_all only, with the error reported."""
+
+    @property
+    def network_modes(self) -> tuple[str, ...]:
+        return ("deny_all",)
+
+    def egress_status(self):
+        return {"enforced": False, "error": "nft apply failed"}
+
+
+def test_the_box_reports_egress_enforcement_and_refuses_internet_without_it(tmp_path: Path):
+    api, fake = _api(tmp_path, _binding(), executor=_DenyAllExecutor())
+    status, contract = _handle(api, "GET", "/v1/box")
+    assert status == 200
+    assert contract["network_modes"] == ["deny_all"]
+    assert contract["egress"]["enforced"] is False
+    assert contract["egress"]["enforcement_error"] == "nft apply failed"
+    assert _handle(api, "POST", "/v1/lease", body={"ttl_seconds": 60})[0] == 200
+    fake.import_image(DIGEST, "registry.example/tasks/base")
+    status, refusal = _handle(
+        api,
+        "POST",
+        "/v1/sandboxes",
+        body={"image_id": DIGEST, "network": "internet", "lifetime_seconds": 600},
+    )
+    assert (status, refusal["reason"]) == (409, "network_unavailable")
+    assert fake.list() == ()
