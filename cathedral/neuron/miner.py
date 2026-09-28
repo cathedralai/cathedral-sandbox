@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 from cathedral.attest import collect_tdx
 from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier
-from cathedral.lanes.sat import solve_sat
+from cathedral.lanes.sat import derived_work_units, solve_sat
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 from cathedral.verify.mock import mock_evidence, verify_mock
 
@@ -38,7 +38,7 @@ def _solve_sat_work(item: SatWorkItem, assigned_hotkey: str) -> SatCertificate:
     return SatCertificate(
         satisfiable=True,
         assignment=assignment,
-        work_units=float(len(item.instance.clauses)),
+        work_units=derived_work_units(item),
         challenge_id=item.challenge_id,
         assigned_hotkey=assigned_hotkey,
     )

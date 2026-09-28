@@ -35,10 +35,13 @@ from cathedral.common import (
     EvidenceKind,
 )
 from cathedral.lanes.sat import (
+    CUSTOMER_SAT_WORK_UNITS,
     MAX_N_VARS,
     SatLane,
     _canonical_instance,
     _compute_challenge_id,
+    derived_work_units,
+    derived_work_units_for,
     solve_sat,
 )
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
@@ -1347,9 +1350,19 @@ def test_one_failure_does_not_affect_next_request():
 
 
 def test_work_units_not_trusted():
-    """RemoteMiner discards server work_units and recomputes from the instance."""
+    """RemoteMiner discards server work_units and recomputes from the item.
+
+    The recomputed value comes from the shared derivation, so it cannot
+disagree with what the lane and the customer ledger expect. This fixture is a
+non-canonical (customer) instance with three clauses, so a client that
+recomputed from the clause count would report 3.0 while every other component
+expects CUSTOMER_SAT_WORK_UNITS.
+    """
     item = _make_sat_item()
-    expected_wu = float(len(item.instance.clauses))
+    assert item.instance != _canonical_instance(item.seed)
+    expected_wu = derived_work_units(item)
+    assert expected_wu == CUSTOMER_SAT_WORK_UNITS
+    assert expected_wu != float(len(item.instance.clauses))
 
     # Fake server that returns an inflated work_units.
     class _InflatedHandler(BaseHTTPRequestHandler):
@@ -1890,3 +1903,59 @@ def test_near_canonical_mutation_is_rejected_without_a_bearer(monkeypatch):
         for bearer in (None, "wrong-token", "nön-ascii-tökén"):
             code, _ = _post_raw(f"{srv.base_url}/v1/sat-work", payload, bearer=bearer)
             assert code == 401, f"bearer={bearer!r} should 401, got {code}"
+
+
+# ---------------------------------------------------------------------------
+# the worker's own response reports the derived work units
+# ---------------------------------------------------------------------------
+
+
+def test_worker_wire_reports_derived_units_for_canonical_work():
+    """The canonical branch still serialises a numeric clause count.
+
+    Not a regression guard for the derivation: a canonical instance is always
+    20 clauses and CUSTOMER_SAT_WORK_UNITS is 20.0, so this passes under the
+    clause-count implementation too. It checks the wire shape only. The
+    discriminating test is the customer-work one below.
+    """
+
+    seed = 0
+    instance = _canonical_instance(seed)
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        code, body = _post_raw(f"{srv.base_url}/v1/sat-work", _canonical_sat_payload(seed))
+
+    assert code == 200
+    reported = json.loads(body)["work_units"]
+    assert reported == derived_work_units_for(instance, seed)
+    assert reported == float(len(instance.clauses))
+
+
+def test_worker_wire_reports_derived_units_for_customer_work():
+    """A non-canonical instance is worth CUSTOMER_SAT_WORK_UNITS, not its size.
+
+    Regression guard for the producer side. Reverting cathedral/worker.py to
+    ``float(len(instance.clauses))`` leaves the rest of the suite green, because
+    every other test observes the client, which derives its own value. This is
+    the only test that reads the worker's own response body.
+    """
+
+    item = _make_sat_item()
+    assert item.instance != _canonical_instance(item.seed), "fixture must be customer work"
+    clause_count = float(len(item.instance.clauses))
+    assert clause_count != CUSTOMER_SAT_WORK_UNITS, "fixture must discriminate"
+
+    payload = json.dumps(
+        {
+            "challenge_id": item.challenge_id,
+            "assigned_hotkey": HOTKEY,
+            "instance": {"n_vars": item.instance.n_vars, "clauses": item.instance.clauses},
+            "seed": item.seed,
+        }
+    ).encode()
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        code, body = _post_raw(f"{srv.base_url}/v1/sat-work", payload)
+
+    assert code == 200
+    assert json.loads(body)["work_units"] == CUSTOMER_SAT_WORK_UNITS

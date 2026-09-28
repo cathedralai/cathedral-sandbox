@@ -17,7 +17,7 @@ from types import MappingProxyType
 from typing import Any, Protocol, Self
 
 from cathedral.lanes.sat import (
-    CUSTOMER_SAT_WORK_UNITS,
+    derived_work_units,
     _compute_challenge_id,
     validate_sat_work_item,
 )
@@ -420,7 +420,10 @@ def _validate_customer_result(
         or isinstance(work_units, bool)
         or not isinstance(work_units, (int, float))
         or not math.isfinite(float(work_units))
-        or float(work_units) != CUSTOMER_SAT_WORK_UNITS
+        # Route through the shared derivation rather than restating the rule.
+        # A second copy drifts the moment the constant or the canonical clause
+        # count changes.
+        or float(work_units) != derived_work_units(lease.item)
     ):
         raise LedgerError("customer job result does not match its dispatch")
     if not satisfiable:
