@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import time
@@ -19,6 +20,7 @@ from pathlib import Path
 CAPTURE_METADATA_SCHEMA = "cathedral_capture_metadata_v1"
 MAX_ADMISSION_NONCE_BYTES = 1024
 MAX_BOX_ID_CHARS = 256
+_LOG = logging.getLogger(__name__)
 
 
 def _metadata_document(
@@ -29,17 +31,21 @@ def _metadata_document(
     box_id: str | None,
     captured_at: float | None,
 ) -> dict[str, object]:
+    # Context only: a malformed value is dropped with a warning, never raised, so
+    # it can neither reject a verified quote nor skip the capture itself.
     if admission_nonce is not None and (
         not isinstance(admission_nonce, bytes)
         or not 0 < len(admission_nonce) <= MAX_ADMISSION_NONCE_BYTES
     ):
-        raise ValueError("capture admission nonce must be bounded non-empty bytes")
+        _LOG.warning("capture metadata: dropping a malformed admission nonce")
+        admission_nonce = None
     if box_id is not None and (
         not isinstance(box_id, str)
         or not 0 < len(box_id) <= MAX_BOX_ID_CHARS
         or not box_id.isprintable()
     ):
-        raise ValueError("capture box ID must be a bounded printable string")
+        _LOG.warning("capture metadata: dropping a malformed box ID")
+        box_id = None
     moment = time.time() if captured_at is None else float(captured_at)
     return {
         "schema": CAPTURE_METADATA_SCHEMA,

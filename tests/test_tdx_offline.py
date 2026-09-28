@@ -187,16 +187,28 @@ def test_capture_metadata_is_optional(tmp_path):
     assert metadata["box_id"] is None
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [{"collateral": b""}, {"box_id": "box\n1"}, {"box_id": ""}, {"admission_nonce": b""}],
-)
-def test_invalid_capture_is_not_written(tmp_path, kwargs):
-    arguments = {"collateral": b"collateral", **kwargs}
-    collateral = arguments.pop("collateral")
+def test_empty_collateral_is_not_written(tmp_path):
     with pytest.raises(ValueError):
-        persist_tdx_capture(b"quote", collateral, tmp_path, **arguments)
+        persist_tdx_capture(b"quote", b"", tmp_path)
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "kwargs, dropped",
+    [
+        ({"box_id": "box\n1"}, "box_id"),
+        ({"box_id": ""}, "box_id"),
+        ({"box_id": "b" * 257}, "box_id"),
+        ({"admission_nonce": b""}, "admission_nonce_hex"),
+        ({"admission_nonce": b"n" * 1025}, "admission_nonce_hex"),
+    ],
+)
+def test_malformed_capture_metadata_is_dropped_and_the_capture_kept(tmp_path, kwargs, dropped):
+    # Metadata is context: a bad value must never reject a verified quote or skip
+    # its capture (cathedral/verify/__init__.py documents capture_box_id so).
+    path = persist_tdx_capture(b"quote", b"collateral", tmp_path, **kwargs)
+    metadata = json.loads(path.with_name(path.stem + ".meta.json").read_bytes())
+    assert metadata[dropped] is None
 
 
 def test_online_capture_hook_retains_pair_only_after_success(monkeypatch, tmp_path):
