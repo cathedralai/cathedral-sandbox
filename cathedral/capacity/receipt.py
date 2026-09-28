@@ -10,15 +10,17 @@ What a receipt binds, and what ``verify_receipt`` checks:
 - audience: the netuid, the round and the requesting validator's nonce, so a
   validator must fetch its own receipts (copying another validator's weights
   gains nothing);
-- the box: its id, the miner's hotkey, its kind and a hardware identity for
-  dedup (PPID or chip id for a TEE box, a probe-derived fingerprint for bare
-  metal);
+- the box: its id, the miner's hotkey, its kind and one canonical hardware
+  identity for dedup, fixed by the kind (``derive_hardware_id`` over the TDX
+  PPID, the SEV-SNP chip id, or, for bare metal, ``probe_fingerprint``);
 - the capacity paid for, which must be exactly what the challenge proved: the
   spec must equal ``spec_for(seed, vcpus=, memory_gib=)``;
-- the proof: the committed result digest, the post-commitment sample nonce, and
-  the outputs of exactly the lanes that nonce samples (at least MIN_SAMPLES), so
-  anyone can recompute which lanes were checked and re-check them;
-- timing: the exec time must fit the deadline the prober set.
+- the proof: the committed result digest, the post-commitment sample nonce, the
+  sample count (at least ``required_samples(lanes)``) and the outputs of exactly
+  the lanes that nonce and count sample, so anyone can recompute which lanes
+  were checked and re-check them;
+- timing: the exec time must fit the deadline the prober set, and the deadline
+  may be no looser than ``max_deadline_ms(spec)``.
 
 Wire form: canonical JSON (sorted keys, no whitespace, UTF-8) of the body, and
 ``signature`` = base64 Ed25519 over those bytes with the key named by
@@ -29,6 +31,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import ipaddress
 import json
 import re
 from dataclasses import dataclass
@@ -42,16 +46,24 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 from cathedral.capacity.challenge import (
-    MIN_SAMPLES,
     ChallengeError,
     ChallengeSpec,
+    max_deadline_ms,
+    required_samples,
     sample_lanes,
     spec_for,
 )
 
 SCHEMA = "cathedral_capacity_receipt_v1"
 BOX_KINDS = ("tee", "bare_metal")
-HARDWARE_ID_KINDS = {"tee": ("ppid", "chip_id"), "bare_metal": ("probe_fingerprint",)}
+# The one hardware identity each kind of box is deduplicated by: (kind, tee_kind) -> id kind.
+HARDWARE_ID_KINDS = {
+    ("tee", "tdx"): "ppid",
+    ("tee", "sev_snp"): "chip_id",
+    ("bare_metal", None): "probe_fingerprint",
+}
+_RAW_ID_BYTES = {"ppid": 16, "chip_id": 64, "probe_fingerprint": 18}
+HARDWARE_ID_DOMAIN = b"cathedral.capacity.hardware_id.v1\x00"
 MAX_VALIDITY = timedelta(hours=2)
 CLOCK_SKEW = timedelta(minutes=5)
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -75,7 +87,9 @@ _BODY_KEYS = frozenset(
         "prober_key_id",
     }
 )
-_BOX_KEYS = frozenset({"box_id", "miner_hotkey", "kind", "hardware_id", "hardware_id_kind"})
+_BOX_KEYS = frozenset(
+    {"box_id", "miner_hotkey", "kind", "tee_kind", "hardware_id", "hardware_id_kind"}
+)
 _CHALLENGE_KEYS = frozenset(
     {
         "seed",
@@ -84,6 +98,7 @@ _CHALLENGE_KEYS = frozenset(
         "steps",
         "result_digest",
         "sample_nonce",
+        "sample_count",
         "sampled_outputs",
         "deadline_ms",
     }
@@ -99,6 +114,7 @@ class VerifiedReceipt:
     box_id: str
     miner_hotkey: str
     kind: str
+    tee_kind: str | None
     hardware_id: str
     hardware_id_kind: str
     vcpus: int
@@ -106,6 +122,7 @@ class VerifiedReceipt:
     challenge: ChallengeSpec
     result_digest: bytes
     sample_nonce: bytes
+    sample_count: int
     sampled_outputs: Mapping[int, bytes]
     deadline_ms: int
     timings_ms: Mapping[str, int]
@@ -124,7 +141,17 @@ def _iso(value: datetime) -> str:
 def _parse_time(value: object, name: str) -> datetime:
     if not isinstance(value, str) or _TIME.fullmatch(value) is None:
         raise ReceiptError(f"{name} must be YYYY-MM-DDTHH:MM:SSZ")
-    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as exc:  # the right shape, but no such date or time
+        raise ReceiptError(f"{name} is not a real date and time") from exc
+    return parsed.replace(tzinfo=timezone.utc)
+
+
+def _aware(now: object) -> datetime:
+    if not isinstance(now, datetime) or now.utcoffset() is None:
+        raise ReceiptError("now must be a timezone-aware datetime")
+    return now
 
 
 def _count(value: object, name: str, *, minimum: int = 0) -> int:
@@ -139,6 +166,42 @@ def _hex64(value: object, name: str) -> str:
     return value
 
 
+def derive_hardware_id(hardware_id_kind: str, raw: bytes) -> str:
+    """The receipt's ``hardware_id``: SHA-256 over the id kind and the raw id
+    the prober took from evidence it verified itself (the 16-byte PPID from the
+    TDX quote's PCK certificate, the 64-byte CHIP_ID from the SEV-SNP report), or
+    ``probe_fingerprint``'s 18 bytes for bare metal. One machine therefore has
+    exactly one hardware id per kind of box."""
+
+    size = _RAW_ID_BYTES.get(hardware_id_kind)
+    if size is None:
+        raise ReceiptError("hardware_id_kind must be ppid, chip_id or probe_fingerprint")
+    if not isinstance(raw, bytes) or len(raw) != size:
+        raise ReceiptError(f"a raw {hardware_id_kind} is {size} bytes")
+    if not any(raw):
+        raise ReceiptError(f"the {hardware_id_kind} is all zeros (masked or missing)")
+    return hashlib.sha256(
+        HARDWARE_ID_DOMAIN + hardware_id_kind.encode() + b"\x00" + raw
+    ).hexdigest()
+
+
+def probe_fingerprint(address: str, port: int) -> str:
+    """A bare-metal box's ``hardware_id``: the address and port the prober
+    itself connected to and ran the challenge through, never anything the box
+    reports. An IPv4 address is taken in its IPv6-mapped form, so each endpoint
+    has one fingerprint. It names an endpoint, not a machine (docs/CAPACITY.md)."""
+
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError as exc:
+        raise ReceiptError("probe address must be an IP address") from exc
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise ReceiptError("probe port must be an integer from 1 to 65535")
+    if isinstance(ip, ipaddress.IPv4Address):
+        ip = ipaddress.IPv6Address(b"\x00" * 10 + b"\xff\xff" + ip.packed)
+    return derive_hardware_id("probe_fingerprint", ip.packed + port.to_bytes(2, "big"))
+
+
 def make_body(
     *,
     netuid: int,
@@ -147,13 +210,14 @@ def make_body(
     box_id: str,
     miner_hotkey: str,
     kind: str,
+    tee_kind: str | None,
     hardware_id: str,
-    hardware_id_kind: str,
     vcpus: int,
     memory_gib: int,
     challenge: ChallengeSpec,
     result_digest: bytes,
     sample_nonce: bytes,
+    sample_count: int,
     sampled_outputs: Mapping[int, bytes],
     deadline_ms: int,
     timings_ms: Mapping[str, int],
@@ -170,14 +234,17 @@ def make_body(
             "box_id": box_id,
             "miner_hotkey": miner_hotkey,
             "kind": kind,
+            "tee_kind": tee_kind,
             "hardware_id": hardware_id,
-            "hardware_id_kind": hardware_id_kind,
+            # fixed by the kind; None for a combination _check_body refuses
+            "hardware_id_kind": HARDWARE_ID_KINDS.get((kind, tee_kind)),
         },
         "capacity": {"vcpus": vcpus, "memory_gib": memory_gib},
         "challenge": {
             **challenge.to_json(),
             "result_digest": result_digest.hex(),
             "sample_nonce": sample_nonce.hex(),
+            "sample_count": sample_count,
             "sampled_outputs": {str(k): v.hex() for k, v in sorted(sampled_outputs.items())},
             "deadline_ms": deadline_ms,
         },
@@ -205,11 +272,13 @@ def verify_receipt(
     netuid: int,
     validator_nonce: str,
     now: datetime,
-    expected_round: int | None = None,
+    expected_round: int,
 ) -> VerifiedReceipt:
-    """A validator's side: signature, audience, freshness and shape, or raise.
-    Pass ``expected_round`` to refuse a receipt from another round."""
+    """A validator's side: signature, audience (netuid, nonce and round),
+    freshness and shape, or raise."""
 
+    now = _aware(now)
+    _count(expected_round, "expected_round")
     if not isinstance(receipt, Mapping) or "signature" not in receipt:
         raise ReceiptError("receipt is not a signed object")
     body = {key: value for key, value in receipt.items() if key != "signature"}
@@ -226,10 +295,10 @@ def verify_receipt(
         raise ReceiptError("receipt is for another netuid")
     if body["validator_nonce"] != validator_nonce:
         raise ReceiptError("receipt answers another validator's nonce")
-    if expected_round is not None and parsed.round != expected_round:
+    if parsed.round != expected_round:
         raise ReceiptError("receipt is from another round")
     expires_at = _parse_time(body["expires_at"], "expires_at")
-    if not parsed.issued_at - CLOCK_SKEW <= now < expires_at:
+    if not (parsed.issued_at <= now + CLOCK_SKEW and now < expires_at):
         raise ReceiptError("receipt is not currently valid")
     return parsed
 
@@ -255,9 +324,15 @@ def _check_body(body: Mapping[str, Any]) -> VerifiedReceipt:
         raise ReceiptError("miner_hotkey is not an SS58 address")
     if box["kind"] not in BOX_KINDS:
         raise ReceiptError("box kind must be tee or bare_metal")
-    if box["hardware_id_kind"] not in HARDWARE_ID_KINDS[box["kind"]]:
+    tee_kind = box["tee_kind"]
+    if not (tee_kind is None or isinstance(tee_kind, str)) or (
+        (box["kind"], tee_kind) not in HARDWARE_ID_KINDS
+    ):
+        raise ReceiptError("tee_kind must be tdx or sev_snp for a tee box, and null for bare metal")
+    if box["hardware_id_kind"] != HARDWARE_ID_KINDS[(box["kind"], tee_kind)]:
         raise ReceiptError(
-            "hardware_id_kind must be ppid or chip_id for a tee box, probe_fingerprint for bare metal"
+            "hardware_id_kind must be ppid for tdx, chip_id for sev_snp and"
+            " probe_fingerprint for bare metal"
         )
     hardware_id = _hex64(box["hardware_id"], "hardware_id")
 
@@ -289,10 +364,18 @@ def _check_body(body: Mapping[str, Any]) -> VerifiedReceipt:
         if not isinstance(lane, str) or _LANE.fullmatch(lane) is None:
             raise ReceiptError("sampled lane keys must be plain decimal lane numbers")
         outputs[int(lane)] = bytes.fromhex(_hex64(value, "sampled output"))
-    wanted = sample_lanes(spec, digest, sample_nonce, MIN_SAMPLES)
+    sample_count = _count(challenge["sample_count"], "sample_count", minimum=1)
+    if not required_samples(spec.lanes) <= sample_count <= spec.lanes:
+        raise ReceiptError(
+            f"sample_count must be from {required_samples(spec.lanes)} to {spec.lanes}"
+            f" for {spec.lanes} lanes"
+        )
+    wanted = sample_lanes(spec, digest, sample_nonce, sample_count)
     if sorted(outputs) != wanted:
         raise ReceiptError("sampled_outputs must be exactly the lanes the sample nonce picks")
     deadline_ms = _count(challenge["deadline_ms"], "deadline_ms", minimum=1)
+    if deadline_ms > max_deadline_ms(spec):
+        raise ReceiptError(f"deadline_ms is looser than {max_deadline_ms(spec)} for this challenge")
 
     timings = body["timings_ms"]
     if not isinstance(timings, Mapping) or set(timings) != {"create", "exec", "delete"}:
@@ -304,12 +387,13 @@ def _check_body(body: Mapping[str, Any]) -> VerifiedReceipt:
 
     issued_at = _parse_time(body["issued_at"], "issued_at")
     expires_at = _parse_time(body["expires_at"], "expires_at")
-    if not issued_at < expires_at <= issued_at + MAX_VALIDITY:
+    if not timedelta(0) < expires_at - issued_at <= MAX_VALIDITY:
         raise ReceiptError("receipt validity must be positive and at most 2 hours")
     return VerifiedReceipt(
         box_id=box["box_id"],
         miner_hotkey=box["miner_hotkey"],
         kind=box["kind"],
+        tee_kind=tee_kind,
         hardware_id=hardware_id,
         hardware_id_kind=box["hardware_id_kind"],
         vcpus=vcpus,
@@ -317,6 +401,7 @@ def _check_body(body: Mapping[str, Any]) -> VerifiedReceipt:
         challenge=spec,
         result_digest=digest,
         sample_nonce=sample_nonce,
+        sample_count=sample_count,
         sampled_outputs=outputs,
         deadline_ms=deadline_ms,
         timings_ms=dict(timings),

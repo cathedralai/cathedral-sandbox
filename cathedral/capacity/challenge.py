@@ -11,9 +11,10 @@ Protocol (commit, then sample):
 2. the box returns every lane's 32-byte output, which commits it
    (``result_digest``);
 3. only then does the prober draw a fresh 32-byte ``nonce`` and recompute the
-   lanes ``sample_lanes(spec, digest, nonce)`` picks. Because the nonce comes
-   after the commitment, a box cannot steer the sample onto the few lanes it
-   computed honestly, however it arranges the rest.
+   ``count`` lanes ``sample_lanes(spec, digest, nonce, count)`` picks, with
+   ``count`` at least ``required_samples(lanes)``. Because the nonce comes after
+   the commitment, a box cannot steer the sample onto the few lanes it computed
+   honestly, however it arranges the rest.
 
 A lane is scrypt-like over SHA-256: fill ``blocks`` 32-byte blocks, then take
 ``steps`` (two per block) data-dependent reads, each writing back, so it cannot
@@ -29,6 +30,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 from concurrent.futures import ProcessPoolExecutor
@@ -43,6 +45,12 @@ MAX_STEPS = 1 << 29
 MEMORY_NUMERATOR, MEMORY_DENOMINATOR = 4, 5  # the lanes hold 80% of the claimed memory
 STEPS_PER_BLOCK = 2
 MIN_SAMPLES = 4
+# The most time a prober may allow for the challenge (max_deadline_ms): a fixed
+# base for creating the sandbox and starting the worker, plus a per-step budget
+# about three times the pure-Python reference on a slow core. Deliberately loose
+# until it is benchmarked (docs/CAPACITY.md).
+DEADLINE_BASE_MS = 120_000
+DEADLINE_NS_PER_STEP = 5_000
 
 
 class ChallengeError(ValueError):
@@ -119,6 +127,23 @@ def provable_memory_gib(vcpus: int, memory_gib: int) -> int:
     return max(0, min(memory_gib, limit))
 
 
+def required_samples(lanes: int) -> int:
+    """The fewest lanes a prober may recompute for a ``lanes``-lane challenge:
+    every lane up to MIN_SAMPLES, then at least half of them."""
+
+    if not isinstance(lanes, int) or isinstance(lanes, bool) or not 1 <= lanes <= MAX_LANES:
+        raise ChallengeError(f"lanes must be an integer from 1 to {MAX_LANES}")
+    return min(lanes, max(MIN_SAMPLES, math.ceil(lanes / 2)))
+
+
+def max_deadline_ms(spec: ChallengeSpec) -> int:
+    """The loosest deadline a receipt may carry for ``spec``. Lanes run in
+    parallel, so the bound follows one lane's steps (the fill is half as many
+    hashes again, and is covered by the per-step budget)."""
+
+    return DEADLINE_BASE_MS + math.ceil(spec.steps * DEADLINE_NS_PER_STEP / 1_000_000)
+
+
 def lane_output(spec: ChallengeSpec, lane: int) -> bytes:
     """The one 32-byte answer of ``lane``."""
 
@@ -182,13 +207,17 @@ def sample_lanes(spec: ChallengeSpec, digest: bytes, nonce: bytes, count: int) -
 
 
 def verify(
-    spec: ChallengeSpec, outputs: list[bytes], *, nonce: bytes, sample: int = MIN_SAMPLES
+    spec: ChallengeSpec, outputs: list[bytes], *, nonce: bytes, sample: int | None = None
 ) -> bool:
     """True when every lane the post-commitment ``nonce`` samples recomputes to
-    the committed answer."""
+    the committed answer. ``sample`` defaults to ``required_samples(lanes)``; a
+    smaller count is refused."""
 
     try:
-        lanes = sample_lanes(spec, result_digest(spec, outputs), nonce, sample)
+        count = required_samples(spec.lanes) if sample is None else sample
+        if not isinstance(count, int) or count < required_samples(spec.lanes):
+            return False
+        lanes = sample_lanes(spec, result_digest(spec, outputs), nonce, count)
     except ChallengeError:
         return False
     return all(lane_output(spec, lane) == outputs[lane] for lane in lanes)

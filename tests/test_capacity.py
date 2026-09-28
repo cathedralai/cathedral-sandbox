@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import random
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -21,6 +24,8 @@ NOW = datetime(2026, 9, 28, 12, 0, 0, tzinfo=timezone.utc)
 HOTKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 VALIDATOR_NONCE = "ab" * 32
 FINGERPRINT = "f0" * 32
+NETUID = random.SystemRandom().randrange(1, 65536)
+OTHER_NETUID = NETUID % 65535 + 1
 
 
 # -- challenge -------------------------------------------------------------------
@@ -55,20 +60,69 @@ def test_a_correct_answer_verifies_and_every_faked_lane_is_caught_when_sampled()
 
 
 def test_a_box_cannot_steer_the_sample_onto_its_honest_lanes():
-    # 4 honest lanes of 16, the rest garbage: with the nonce drawn after the
-    # commitment, a pass needs all 4 sampled lanes to be honest, 1 in 1820.
+    # 12 honest lanes of 16, the rest garbage: with the nonce drawn after the
+    # commitment, a pass needs all 8 sampled lanes to be honest, 495 in 12870.
     spec = ch.ChallengeSpec(SEED, lanes=16, blocks=8, steps=16)
     honest = ch.run(spec, workers=1)
-    outputs = [honest[i] if i < 4 else bytes([i]) * 32 for i in range(16)]
+    outputs = [honest[i] if i < 12 else bytes([i]) * 32 for i in range(16)]
     digest = ch.result_digest(spec, outputs)
     passes = 0
     samples = set()
     for i in range(300):
         nonce = os.urandom(32)
-        samples.add(tuple(ch.sample_lanes(spec, digest, nonce, ch.MIN_SAMPLES)))
+        samples.add(tuple(ch.sample_lanes(spec, digest, nonce, ch.required_samples(16))))
         passes += ch.verify(spec, outputs, nonce=nonce)
-    assert passes <= 2
+    assert passes <= 40  # 11.5 expected
     assert len(samples) > 100  # the nonce, not the box, decides the sample
+
+
+@pytest.mark.parametrize(
+    "lanes, required", [(1, 1), (3, 3), (4, 4), (5, 4), (8, 4), (9, 5), (16, 8), (1024, 512)]
+)
+def test_the_sample_floor_covers_small_boxes_and_half_of_large_ones(lanes, required):
+    assert ch.required_samples(lanes) == required
+
+
+def test_the_documented_pass_probabilities_hold():
+    # docs/CAPACITY.md: faking f of n lanes passes a k-lane sample with
+    # C(n - f, k) / C(n, k), at most (1 - k / n) ** f, so at most 2 ** -f.
+    def passes(n, f):
+        k = ch.required_samples(n)
+        return math.comb(n - f, k) / math.comb(n, k)
+
+    assert passes(8, 1) == 0.5 and passes(8, 2) == 15 / 70 and passes(4, 1) == 0
+    assert passes(5, 1) == 0.2 and passes(9, 1) == 4 / 9 and passes(64, 1) == 0.5
+    for n in range(1, 129):
+        for f in range(1, n + 1):
+            k = ch.required_samples(n)
+            assert passes(n, f) <= (1 - k / n) ** f + 1e-12 <= 2.0**-f + 2e-12
+
+
+def test_a_box_one_lane_short_passes_about_half_the_time_at_the_floor():
+    spec = ch.ChallengeSpec(SEED, lanes=8, blocks=8, steps=16)
+    outputs = ch.run(spec, workers=1)
+    outputs[5] = bytes(32)
+    passes = sum(ch.verify(spec, outputs, nonce=os.urandom(32)) for _ in range(400))
+    assert 140 <= passes <= 260  # 200 expected
+    assert not any(
+        ch.verify(spec, outputs, nonce=os.urandom(32), sample=spec.lanes) for _ in range(20)
+    )
+
+
+def test_verify_refuses_a_sample_below_the_floor():
+    outputs = ch.run(SMALL, workers=1)
+    assert ch.verify(SMALL, outputs, nonce=NONCE_A, sample=ch.required_samples(SMALL.lanes))
+    assert not ch.verify(SMALL, outputs, nonce=NONCE_A, sample=ch.required_samples(SMALL.lanes) - 1)
+
+
+def test_the_deadline_bound_follows_the_spec():
+    small = ch.ChallengeSpec(SEED, 1, 1, 1)
+    assert ch.max_deadline_ms(small) == ch.DEADLINE_BASE_MS + 1
+    big = ch.spec_for(SEED, vcpus=8, memory_gib=32)
+    assert ch.max_deadline_ms(big) == ch.DEADLINE_BASE_MS + math.ceil(
+        big.steps * ch.DEADLINE_NS_PER_STEP / 1_000_000
+    )
+    assert ch.max_deadline_ms(big) == 1_193_742  # a 32 GiB, 8 vCPU box: about 20 minutes
 
 
 def test_the_sample_is_recomputable_from_the_receipt_fields():
@@ -172,21 +226,23 @@ def _body(**changes):
     vcpus = changes.pop("vcpus", 6)
     memory_gib = changes.pop("memory_gib", 24)
     spec = changes.pop("challenge", ch.spec_for(SEED, vcpus=vcpus, memory_gib=memory_gib))
-    lanes = ch.sample_lanes(spec, DIGEST, NONCE_A, ch.MIN_SAMPLES)
+    sample_count = changes.pop("sample_count", ch.required_samples(spec.lanes))
+    lanes = ch.sample_lanes(spec, DIGEST, NONCE_A, sample_count)
     fields = dict(
-        netuid=94,
+        netuid=NETUID,
         round=7,
         validator_nonce=VALIDATOR_NONCE,
         box_id="box-1",
         miner_hotkey=HOTKEY,
         kind="bare_metal",
+        tee_kind=None,
         hardware_id=FINGERPRINT,
-        hardware_id_kind="probe_fingerprint",
         vcpus=vcpus,
         memory_gib=memory_gib,
         challenge=spec,
         result_digest=DIGEST,
         sample_nonce=NONCE_A,
+        sample_count=sample_count,
         sampled_outputs={lane: bytes([lane % 256]) * 32 for lane in lanes},
         deadline_ms=60_000,
         timings_ms={"create": 900, "exec": 40_000, "delete": 300},
@@ -207,9 +263,10 @@ def prober():
 def _verify(signed, keys, **changes):
     args = dict(
         prober_keys=keys,
-        netuid=94,
+        netuid=NETUID,
         validator_nonce=VALIDATOR_NONCE,
         now=NOW + timedelta(minutes=1),
+        expected_round=7,
     )
     args.update(changes)
     return receipt.verify_receipt(signed, **args)
@@ -217,13 +274,31 @@ def _verify(signed, keys, **changes):
 
 def test_a_signed_receipt_verifies_on_any_netuid(prober):
     key, keys = prober
-    verified = _verify(receipt.sign_receipt(_body(), key), keys, expected_round=7)
+    verified = _verify(receipt.sign_receipt(_body(), key), keys)
     assert (verified.box_id, verified.vcpus, verified.memory_gib) == ("box-1", 6, 24)
-    assert (verified.kind, verified.hardware_id_kind) == ("bare_metal", "probe_fingerprint")
-    assert sorted(verified.sampled_outputs) == ch.sample_lanes(
-        verified.challenge, DIGEST, NONCE_A, ch.MIN_SAMPLES
+    assert (verified.kind, verified.tee_kind, verified.hardware_id_kind) == (
+        "bare_metal",
+        None,
+        "probe_fingerprint",
     )
-    assert _verify(receipt.sign_receipt(_body(netuid=39), key), keys, netuid=39).round == 7
+    assert verified.sample_count == ch.required_samples(6) == 4
+    assert sorted(verified.sampled_outputs) == ch.sample_lanes(
+        verified.challenge, DIGEST, NONCE_A, verified.sample_count
+    )
+    other = receipt.sign_receipt(_body(netuid=OTHER_NETUID), key)
+    assert _verify(other, keys, netuid=OTHER_NETUID).round == 7
+
+
+def test_verify_receipt_requires_the_round(prober):
+    key, keys = prober
+    signed = receipt.sign_receipt(_body(), key)
+    with pytest.raises(TypeError):
+        receipt.verify_receipt(
+            signed, prober_keys=keys, netuid=NETUID, validator_nonce=VALIDATOR_NONCE, now=NOW
+        )
+    for bad in (None, -1, True, "7"):
+        with pytest.raises(receipt.ReceiptError, match="expected_round"):
+            _verify(signed, keys, expected_round=bad)
 
 
 def test_a_validator_can_recompute_the_sampled_lanes(prober):
@@ -235,7 +310,7 @@ def test_a_validator_can_recompute_the_sampled_lanes(prober):
     digest = ch.result_digest(small, outputs)
     assert all(
         ch.lane_output(small, lane) == outputs[lane]
-        for lane in ch.sample_lanes(small, digest, NONCE_A, ch.MIN_SAMPLES)
+        for lane in ch.sample_lanes(small, digest, NONCE_A, ch.required_samples(small.lanes))
     )
 
 
@@ -244,7 +319,7 @@ def test_receipts_for_someone_else_or_another_round_are_refused(prober):
     signed = receipt.sign_receipt(_body(), key)
     for changes, message in (
         ({"validator_nonce": "cd" * 32}, "another validator"),
-        ({"netuid": 39}, "another netuid"),
+        ({"netuid": OTHER_NETUID}, "another netuid"),
         ({"expected_round": 8}, "another round"),
         ({"now": NOW + timedelta(hours=1)}, "not currently valid"),
         ({"now": NOW - timedelta(hours=1)}, "not currently valid"),
@@ -322,11 +397,124 @@ def test_a_late_answer_is_refused(prober):
         )
 
 
+def test_a_loose_deadline_is_refused(prober):
+    key, keys = prober
+    spec = ch.spec_for(SEED, vcpus=6, memory_gib=24)
+    top = ch.max_deadline_ms(spec)
+    assert _verify(receipt.sign_receipt(_body(deadline_ms=top), key), keys).deadline_ms == top
+    for loose in (top + 1, 10**15):
+        with pytest.raises(receipt.ReceiptError, match="looser than"):
+            receipt.sign_receipt(
+                _body(deadline_ms=loose, timings_ms={"create": 1, "exec": 10**14, "delete": 1}),
+                key,
+            )
+
+
+def test_the_sample_count_is_bound_to_the_lane_count(prober):
+    key, keys = prober
+    everything = receipt.sign_receipt(_body(sample_count=6), key)
+    assert sorted(_verify(everything, keys).sampled_outputs) == list(range(6))
+    for bad in (3, 7):  # below required_samples(6) == 4, or above the lanes
+        with pytest.raises(receipt.ReceiptError, match="sample_count must be from 4 to 6"):
+            receipt.sign_receipt(_body(sample_count=bad), key)
+    for bad in (0, True, 4.0, "4"):
+        body = _body()
+        body["challenge"]["sample_count"] = bad
+        with pytest.raises(receipt.ReceiptError, match="sample_count"):
+            receipt.sign_receipt(body, key)
+    # A count the outputs do not match: 5 lanes' outputs, but a count of 4.
+    body = _body(sample_count=5)
+    body["challenge"]["sample_count"] = 4
+    with pytest.raises(receipt.ReceiptError, match="exactly the lanes"):
+        receipt.sign_receipt(body, key)
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("issued_at", "2026-02-30T00:00:00Z"),
+        ("issued_at", "2026-09-28T24:00:00Z"),
+        ("expires_at", "2026-13-01T00:00:00Z"),
+        ("expires_at", "0000-01-01T00:00:00Z"),
+    ],
+)
+def test_an_impossible_date_is_a_receipt_error_before_the_signature(prober, field, value):
+    key, keys = prober
+    body = _body()
+    body[field] = value
+    with pytest.raises(receipt.ReceiptError, match="not a real date"):
+        receipt.sign_receipt(body, key)
+    with pytest.raises(receipt.ReceiptError, match="not a real date"):
+        _verify({**body, "signature": "AAAA"}, keys)
+
+
+def test_extreme_dates_do_not_overflow(prober):
+    key, keys = prober
+    body = _body()
+    body["issued_at"], body["expires_at"] = "9999-12-31T23:00:00Z", "9999-12-31T23:30:00Z"
+    signed = receipt.sign_receipt(body, key)
+    with pytest.raises(receipt.ReceiptError, match="not currently valid"):
+        _verify(signed, keys)
+    body["issued_at"], body["expires_at"] = "0001-01-01T00:00:00Z", "0001-01-01T00:30:00Z"
+    with pytest.raises(receipt.ReceiptError, match="not currently valid"):
+        _verify(receipt.sign_receipt(body, key), keys)
+
+
+def test_a_naive_now_is_refused(prober):
+    key, keys = prober
+    signed = receipt.sign_receipt(_body(), key)
+    for bad in (NOW.replace(tzinfo=None), NOW.timestamp(), None):
+        with pytest.raises(receipt.ReceiptError, match="timezone-aware"):
+            _verify(signed, keys, now=bad)
+
+
+def test_the_prober_never_signs_twice(prober):
+    key, _keys = prober
+    signed = receipt.sign_receipt(_body(), key)
+    with pytest.raises(receipt.ReceiptError, match="already carries a signature"):
+        receipt.sign_receipt(signed, key)
+
+
+@pytest.mark.parametrize(
+    "path, value, message",
+    [
+        (("schema",), "cathedral_capacity_receipt_v0", "wrong fields or schema"),
+        (("netuid",), "1", "netuid"),
+        (("netuid",), -1, "netuid"),
+        (("netuid",), True, "netuid"),
+        (("round",), -1, "round"),
+        (("prober_key_id",), "bad key id", "prober_key_id"),
+        (("prober_key_id",), 7, "prober_key_id"),
+        (("challenge", "sampled_outputs"), [], "sampled_outputs must be an object"),
+        (("capacity", "memory_gib"), 0, "^memory_gib must be an integer"),
+        (("capacity", "memory_gib"), 24.0, "^memory_gib must be an integer"),
+        (("capacity", "vcpus"), 0, "^vcpus must be an integer"),
+        (("timings_ms", "create"), -1, "timings_ms.create"),
+        (("timings_ms", "delete"), 1.5, "timings_ms.delete"),
+        (("timings_ms", "exec"), -1, "timings_ms.exec"),
+        (("timings_ms", "exec"), True, "timings_ms.exec"),
+        (("box", "tee_kind"), "tdx", "tee_kind"),
+        (("box", "tee_kind"), ["tdx"], "tee_kind"),
+        (("box", "hardware_id_kind"), "chip_id", "hardware_id_kind"),
+    ],
+)
+def test_each_field_check_refuses_its_bad_input(prober, path, value, message):
+    key, _keys = prober
+    body = _body()
+    target = body
+    for name in path[:-1]:
+        target = target[name]
+    target[path[-1]] = value
+    with pytest.raises(receipt.ReceiptError, match=message):
+        receipt.sign_receipt(body, key)
+
+
 @pytest.mark.parametrize(
     "changes",
     [
-        {"kind": "tee"},  # a tee box names a ppid or chip_id, not a probe fingerprint
-        {"hardware_id_kind": "ppid"},  # and bare metal a probe fingerprint
+        {"kind": "tee"},  # a tee box names its tee kind
+        {"kind": "tee", "tee_kind": "sgx"},
+        {"tee_kind": "tdx"},  # and bare metal has none
         {"hardware_id": "short"},
         {"miner_hotkey": "not-an-address"},
         {"box_id": "bad box id"},
@@ -343,14 +531,54 @@ def test_the_prober_never_signs_a_malformed_body(prober, changes):
         receipt.sign_receipt(_body(**changes), key)
 
 
-@pytest.mark.parametrize("hardware_id_kind", ["ppid", "chip_id"])
-def test_a_tee_receipt_carries_its_hardware_identity(prober, hardware_id_kind):
+@pytest.mark.parametrize("tee_kind, hardware_id_kind", [("tdx", "ppid"), ("sev_snp", "chip_id")])
+def test_a_tee_receipt_carries_its_one_hardware_identity(prober, tee_kind, hardware_id_kind):
     key, keys = prober
-    signed = receipt.sign_receipt(
-        _body(kind="tee", hardware_id="aa" * 32, hardware_id_kind=hardware_id_kind), key
-    )
+    signed = receipt.sign_receipt(_body(kind="tee", tee_kind=tee_kind, hardware_id="aa" * 32), key)
     verified = _verify(signed, keys)
-    assert (verified.hardware_id, verified.hardware_id_kind) == ("aa" * 32, hardware_id_kind)
+    assert (verified.tee_kind, verified.hardware_id, verified.hardware_id_kind) == (
+        tee_kind,
+        "aa" * 32,
+        hardware_id_kind,
+    )
+    # The other TEE's id kind is refused: one machine, one hardware id.
+    other = "chip_id" if hardware_id_kind == "ppid" else "ppid"
+    body = _body(kind="tee", tee_kind=tee_kind, hardware_id="aa" * 32)
+    body["box"]["hardware_id_kind"] = other
+    with pytest.raises(receipt.ReceiptError, match="hardware_id_kind"):
+        receipt.sign_receipt(body, key)
+
+
+def test_hardware_ids_are_derived_one_way_per_kind():
+    ppid = bytes(range(1, 17))
+    assert receipt.derive_hardware_id("ppid", ppid) == receipt.derive_hardware_id("ppid", ppid)
+    assert receipt.derive_hardware_id("ppid", ppid) != receipt.derive_hardware_id(
+        "chip_id", ppid * 4
+    )
+    for kind, raw in (
+        ("ppid", bytes(15)),
+        ("ppid", bytes(16)),  # all zeros: missing
+        ("chip_id", bytes(64)),  # all zeros: SEV-SNP's MASK_CHIP_ID
+        ("chip_id", ppid),
+        ("probe_fingerprint", b"x" * 17),
+        ("serial", ppid),
+    ):
+        with pytest.raises(receipt.ReceiptError):
+            receipt.derive_hardware_id(kind, raw)
+
+
+def test_a_probe_fingerprint_names_the_endpoint_the_prober_reached():
+    v4 = receipt.probe_fingerprint("203.0.113.7", 8443)
+    assert v4 == receipt.probe_fingerprint("::ffff:203.0.113.7", 8443)
+    assert v4 != receipt.probe_fingerprint("203.0.113.7", 8444)
+    assert v4 != receipt.probe_fingerprint("203.0.113.8", 8443)
+    assert receipt.probe_fingerprint("2001:db8::1", 443) == receipt.probe_fingerprint(
+        "2001:0db8:0:0::1", 443
+    )
+    assert re.fullmatch(r"[0-9a-f]{64}", v4)
+    for address, port in (("box.example", 443), ("203.0.113.7", 0), ("203.0.113.7", True)):
+        with pytest.raises(receipt.ReceiptError):
+            receipt.probe_fingerprint(address, port)
 
 
 # -- pricing -----------------------------------------------------------------------
@@ -383,7 +611,9 @@ def owner():
 
 
 def _load(signed, keys, **changes):
-    return pricing.load_price_table(signed, owner_keys=keys, now=NOW, **changes)
+    args = dict(owner_keys=keys, now=NOW, minimum_sequence=3)
+    args.update(changes)
+    return pricing.load_price_table(signed, **args)
 
 
 def test_value_follows_the_market_rates_for_each_kind(owner):
@@ -424,6 +654,69 @@ def test_a_table_must_be_signed_pinned_effective_and_not_rolled_back(owner):
     assert _load(json.dumps(signed), keys, minimum_sequence=3).currency == "usd"
 
 
+def test_load_price_table_requires_the_minimum_sequence(owner):
+    key, keys = owner
+    signed = pricing.sign_price_table(_table(), key)
+    with pytest.raises(TypeError):
+        pricing.load_price_table(signed, owner_keys=keys, now=NOW)
+    for bad in (None, 0, True, "3"):
+        with pytest.raises(pricing.PriceTableError, match="minimum_sequence"):
+            _load(signed, keys, minimum_sequence=bad)
+
+
+def test_a_different_table_at_the_pinned_sequence_is_refused(owner):
+    key, keys = owner
+    pinned = pricing.sign_price_table(_table(), key)
+    digest = _load(pinned, keys).digest
+    assert digest == pricing.table_digest(pinned) == pricing.table_digest(_table())
+    assert _load(pinned, keys, pinned_digest=digest).sequence == 3
+    rates = {
+        "tee": {"vcpu_hour": 30_000, "gib_hour": 4_000},
+        "bare_metal": {"vcpu_hour": 90_000, "gib_hour": 2_500},
+    }
+    swapped = pricing.sign_price_table(_table(rates=rates), key)
+    assert _load(swapped, keys).sequence == 3  # without the digest, only the sequence is pinned
+    with pytest.raises(pricing.PriceTableError, match="differs from the one pinned"):
+        _load(swapped, keys, pinned_digest=digest)
+    newer = pricing.sign_price_table(_table(rates=rates, sequence=4), key)
+    assert _load(newer, keys, pinned_digest=digest).sequence == 4  # a newer table moves on
+    for bad in ("AB" * 32, "ab", 7):
+        with pytest.raises(pricing.PriceTableError, match="pinned_digest"):
+            _load(pinned, keys, pinned_digest=bad)
+
+
+def test_a_table_with_an_impossible_date_or_a_naive_now_is_a_table_error(owner):
+    key, keys = owner
+    with pytest.raises(pricing.PriceTableError, match="not a real date"):
+        pricing.sign_price_table(_table(effective_from="2026-02-30T00:00:00Z"), key)
+    unsigned = {**_table(effective_from="2026-02-30T00:00:00Z"), "signature": "AAAA"}
+    with pytest.raises(pricing.PriceTableError, match="not a real date"):
+        _load(unsigned, keys)
+    signed = pricing.sign_price_table(_table(), key)
+    for bad in (NOW.replace(tzinfo=None), NOW.timestamp()):
+        with pytest.raises(pricing.PriceTableError, match="timezone-aware"):
+            _load(signed, keys, now=bad)
+
+
+def test_value_refuses_a_non_positive_shape(owner):
+    key, keys = owner
+    table = _load(pricing.sign_price_table(_table(), key), keys)
+    for vcpus, memory_gib in ((0, 32), (8, 0), (-8, 32), (True, 32), (8, 32.0)):
+        with pytest.raises(pricing.PriceTableError, match="positive integer"):
+            table.value(kind="tee", vcpus=vcpus, memory_gib=memory_gib)
+    with pytest.raises(pricing.PriceTableError, match="no rate"):
+        table.value(kind="gpu", vcpus=8, memory_gib=32)
+
+
+def test_a_profile_may_not_ask_for_more_vcpus_than_can_be_proven(owner):
+    key, _keys = owner
+    top = {"sn81": {"min_vcpus": ch.MAX_LANES, "min_memory_gib": 4096}}
+    pricing.sign_price_table(_table(consumer_profiles=top), key)
+    over = {"sn81": {"min_vcpus": ch.MAX_LANES + 1, "min_memory_gib": 32}}
+    with pytest.raises(pricing.PriceTableError, match=f"from 1 to {ch.MAX_LANES}"):
+        pricing.sign_price_table(_table(consumer_profiles=over), key)
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -448,6 +741,15 @@ def test_a_table_must_be_signed_pinned_effective_and_not_rolled_back(owner):
         {"effective_from": "tomorrow"},
         {"sequence": 0},
         {"sequence": True},
+        {"key_id": "bad key id"},
+        {"key_id": 7},
+        {
+            "rates": {
+                "tee": {"vcpu_hour": pricing.MAX_MICRO + 1, "gib_hour": 1},
+                "bare_metal": {"vcpu_hour": 1, "gib_hour": 1},
+            }
+        },
+        {"consumer_profiles": {"sn81": {"min_vcpus": 8, "min_memory_gib": 4097}}},
     ],
 )
 def test_malformed_tables_are_refused(owner, changes):
