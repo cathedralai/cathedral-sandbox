@@ -1857,6 +1857,96 @@ def test_cross_tier_relabel_cannot_reuse_grant_broker_cache_or_store(tmp_path: P
     assert envelope_relabel.value.category == "invalid_envelope"
 
 
+def _relabel_verified_record_tier(harness: Harness, tier: Tier) -> None:
+    """Rewrite only the stored verifier-result tier.
+
+    The lifecycle row (generation, revision, event id, evidence digest) is left
+    untouched, so every lifecycle binding still matches and only the record
+    tier checks can refuse.
+    """
+    with sqlite3.connect(harness.registry.path) as connection:
+        updated = connection.execute(
+            "UPDATE attestations SET tier = ? WHERE hotkey = ?",
+            (tier.value, HOTKEY),
+        ).rowcount
+    assert updated == 1
+    assert harness.registry.verified_attestation_record(HOTKEY).tier == tier.value
+
+
+def test_issue_grant_refuses_a_verified_record_whose_tier_differs_from_the_verdict(
+    tmp_path: Path,
+):
+    harness = _harness(tmp_path)
+    _relabel_verified_record_tier(harness, Tier.CC_CPU_SNP)
+
+    with pytest.raises(KeyReleaseError) as raised:
+        harness.service.issue_grant(
+            harness.assignment,
+            harness.attested,
+            harness.application_public_key,
+        )
+
+    assert raised.value.category == "attestation_denied"
+    assert harness.broker.call_count == 0
+    with sqlite3.connect(harness.store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM key_release_grants").fetchone()[0] == 0
+
+
+def test_redeem_refuses_when_the_verified_record_tier_no_longer_matches_the_grant(
+    tmp_path: Path,
+):
+    policy = KeyReleasePolicy(allowed_cpu_tiers=frozenset({Tier.CC_CPU_TDX, Tier.CC_CPU_SNP}))
+    harness = _harness(tmp_path, policy=policy)
+    grant = harness.service.issue_grant(
+        harness.assignment,
+        harness.attested,
+        harness.application_public_key,
+    )
+    _relabel_verified_record_tier(harness, Tier.CC_CPU_SNP)
+
+    with pytest.raises(KeyReleaseError) as raised:
+        harness.service.redeem(
+            grant.grant_id,
+            harness.assignment,
+            harness.application_public_key,
+        )
+
+    assert raised.value.category == "attestation_revoked"
+    assert harness.broker.call_count == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        # record tier TDX, grant tier forced to SNP: only the tier check refuses.
+        ("cpu_tier", Tier.CC_CPU_SNP),
+        # record tier TDX, grant kind forced to SEV-SNP: only the kind check refuses.
+        ("evidence_kind", EvidenceKind.SEV_SNP),
+    ],
+)
+def test_redeem_time_record_tier_checks_each_refuse_on_their_own(
+    tmp_path: Path, field: str, value: object
+):
+    """AttestationGrant validation keeps (cpu_tier, evidence_kind) paired, so a
+    real grant makes the two redeem-time record checks equivalent. Bypass that
+    invariant to prove each check refuses without relying on the other."""
+    policy = KeyReleasePolicy(allowed_cpu_tiers=frozenset({Tier.CC_CPU_TDX, Tier.CC_CPU_SNP}))
+    harness = _harness(tmp_path, policy=policy)
+    grant = harness.service.issue_grant(
+        harness.assignment,
+        harness.attested,
+        harness.application_public_key,
+    )
+    harness.service._validate_current(grant, at=harness.clock.now)
+    forged = dataclasses.replace(grant)
+    object.__setattr__(forged, field, value)
+
+    with pytest.raises(KeyReleaseError) as raised:
+        harness.service._validate_current(forged, at=harness.clock.now)
+
+    assert raised.value.category == "attestation_revoked"
+
+
 def test_legacy_v1_digest_vectors_remain_frozen_for_audit():
     grant = AttestationGrant(
         grant_id="grant-" + "a" * 64,
