@@ -381,24 +381,32 @@ SNP guest per host, not several small ones.
    with the same image layout.
 8. Later: port exposure, snapshots, Docker-in-Docker, and bare-metal supply.
 
-## Open questions for the owner
+## Owner decisions for v1 (2026-09-28)
 
-1. **Shared-guest risk.** Is one shared TD per box acceptable, given that a
-   gVisor escape exposes the box key and other tenants? Or do some customers
-   need one TD per tenant?
-2. **Caller keys.** Should control-plane keys be pinned in the measured image,
-   or delivered as a signed snapshot like validator access?
-3. **Cloud guests.** Co-resident cloud TDs share a PPID, and co-resident
-   SNP guests share a CHIP_ID, so they score zero. Do we admit only
-   whole-host boxes, or cloud guests as well?
-4. **Measurement approval.** Who builds and signs the appliance image? Should
-   the allowlist be the #256 policy file, or the signed registry flow
-   (`docs/MRTD.md:70-86`)?
-5. **Consumer needs.** Do SN120/Affine or SN81 need snapshots, fork, port
-   exposure or Docker-in-Docker in the first version?
-6. **Paid shape.** Is the paid shape the proven shape minus the guest and
-   gVisor reserve? How large is that reserve?
-7. **SAT.** Does SAT work continue on TEE boxes, or do capacity receipts
-   replace it for box pay?
-8. **Egress.** What egress policy applies to `internet` sandboxes leaving a
-   TD, such as blocked ranges and rate limits?
+The owner answered six of the eight open questions:
+
+1. **Shared guest.** One shared confidential VM per box, serving one customer
+   at a time, as the Reliquary exclusive executor does. This keeps a gVisor
+   escape from reaching another customer, without a VM per sandbox.
+   One VM per tenant can come later for customers who need it.
+2. **Caller keys.** Control-plane keys arrive as a signed snapshot, like
+   validator access, not pinned in the measured image. Keys can rotate
+   without rebuilding and re-measuring the image.
+3. **Cloud guests.** Whole-host boxes only. One physical host is one box, and
+   a miner runs one large confidential VM per host. Cloud guests that share a
+   PPID or CHIP_ID with a co-tenant are not admitted in v1.
+4. **Measurement approval.** The allowlist is the cathedral-validator #256
+   policy file, shadow first. The signed registry flow (`docs/MRTD.md:70-86`)
+   follows once the image build is reproducible.
+5. **Consumer needs.** No snapshots, fork, port exposure or Docker-in-Docker
+   in v1. The adapters use none of them (section 2).
+6. **Egress.** `internet` sandboxes may not reach private, link-local or
+   cloud metadata ranges, or the box's own addresses. The public internet is
+   allowed, with a per-sandbox bandwidth cap.
+
+Still open:
+
+- **Paid shape.** Is the paid shape the proven shape minus the guest and
+  gVisor reserve? How large is that reserve?
+- **SAT.** Does SAT work continue on TEE boxes, or do capacity receipts
+  replace it for box pay?
