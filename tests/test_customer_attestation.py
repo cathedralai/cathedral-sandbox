@@ -16,6 +16,7 @@ from cathedral.customer_receipt import (
     CUSTOMER_ATTESTATION_POLICY_DIGEST,
     CUSTOMER_ATTESTATION_RECEIPT_SCHEMA,
     SNP_MACHINE_ID_PREFIX,
+    TDX_MACHINE_ID_PREFIX,
     CustomerReceiptError,
     canonical_customer_receipt_json,
     customer_attestation_report_data,
@@ -23,7 +24,13 @@ from cathedral.customer_receipt import (
     verify_customer_receipt,
 )
 from cathedral.verify.snp import REPORT_DATA_OFFSET, REPORT_DATA_SIZE
-from test_customer_receipt import ISSUED_AT, _sign, _trusted_keys_bytes, _unsigned_cpu_document
+from test_customer_receipt import (
+    ISSUED_AT,
+    _sign,
+    _trusted_keys_bytes,
+    _unsigned_cpu_document,
+    _unsigned_gpu_document,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 REPORT = (FIXTURES / "snp" / "attestation-report.bin").read_bytes()
@@ -31,7 +38,7 @@ BOX = "box-fixture-snp"
 RECEIPT_ID = "6de10d88-e554-4b68-a334-377e81744ee4"
 OTHER_RECEIPT_ID = "0b6f3f55-2f55-4d1e-9d8e-2f7b8b2b9c11"
 NONCE_SHA256 = "1" * 64
-TDX_MACHINE = "tdx-platform-sha256:" + "ab" * 32
+TDX_MACHINE = TDX_MACHINE_ID_PREFIX + "ab" * 32
 NOW = ISSUED_AT + timedelta(minutes=5)
 
 
@@ -184,7 +191,7 @@ def test_checked_in_real_fixture_bundle_is_rejected():
     policy = attestation.parse_attestation_policy(
         (FIXTURES / "attestation" / "fixture-policy.json").read_bytes()
     )
-    with pytest.raises(CustomerReceiptError) as error:
+    with pytest.raises(CustomerReceiptError, match="SNP REPORT_DATA does not commit") as error:
         attestation.verify_attestation_bundle(
             data, trusted, policy, expected_box_id=BOX, max_age_seconds=3600, now=NOW
         )
@@ -234,7 +241,8 @@ def test_snp_chip_identity_must_match_the_signed_machine(vendor_accepts):
 def test_snp_evidence_cannot_satisfy_a_tdx_receipt(vendor_accepts):
     report = bound_report()
     document = tdx_receipt_document(report, machine_id=snp_machine(report))
-    assert verify_customer_receipt(_sign(document), keys()).document["execution_class"] == "tdx_cpu"
+    with pytest.raises(CustomerReceiptError, match="does not match the execution class"):
+        verify_customer_receipt(_sign(document), keys())
     assert rejection(bundle(report, document)) == "binding"
     assert vendor_accepts == []
 
@@ -397,6 +405,68 @@ def test_signed_hardware_binding_is_validated(binding):
     with pytest.raises(CustomerReceiptError) as error:
         verify_customer_receipt(_sign(document), keys())
     assert error.value.category == "binding"
+
+
+def _hardware_bound(document, machine_id):
+    document.update(
+        schema=CUSTOMER_ATTESTATION_RECEIPT_SCHEMA,
+        policy_digest=CUSTOMER_ATTESTATION_POLICY_DIGEST,
+        hardware_binding={
+            "box_id": BOX,
+            "machine_id": machine_id,
+            "quote_sha256": "0" * 64,
+            "report_data_hex": customer_attestation_report_data(
+                document["receipt_id"], BOX, document["nonce_sha256"]
+            ).hex(),
+        },
+    )
+    return document
+
+
+SNP_MACHINE = SNP_MACHINE_ID_PREFIX + "cd" * 64
+
+
+@pytest.mark.parametrize(
+    "document, machine_id, reason",
+    [
+        (receipt_document, SNP_MACHINE, None),
+        (receipt_document, TDX_MACHINE, "does not match the execution class"),
+        (_unsigned_cpu_document, TDX_MACHINE, None),
+        (_unsigned_cpu_document, SNP_MACHINE, "does not match the execution class"),
+        (_unsigned_gpu_document, SNP_MACHINE, "requires a supported CPU receipt"),
+        (_unsigned_gpu_document, TDX_MACHINE, "requires a supported CPU receipt"),
+    ],
+    ids=["snp-snp", "snp-tdx", "tdx-tdx", "tdx-snp", "gpu-snp", "gpu-tdx"],
+)
+def test_machine_id_kind_must_match_the_execution_class(document, machine_id, reason):
+    signed = _sign(_hardware_bound(document(), machine_id))
+    if reason is None:
+        verify_customer_receipt(signed, keys())
+        return
+    with pytest.raises(CustomerReceiptError, match=reason) as error:
+        verify_customer_receipt(signed, keys())
+    assert error.value.category == "binding"
+
+
+def test_report_data_preimage_known_answer():
+    # External contract: the producer must build these exact bytes. The value is
+    # the one derived from the ATTESTATION_BUNDLE.md preimage, and the checked-in
+    # fixture receipt carries it too, so it is not derived from the function under
+    # test.
+    expected = (
+        "2a19159bcb50cd972fda644d0015f70eb33f9f072da9d00d104783ca7a3d1b2e"
+        "85e86ba5c47fffd9f1054ed28b1cfabab3cfaa33af7a16fb42c5562566333a0a"
+    )
+    receipt_id = "6de10d88-e554-4b68-a334-377e81744ee4"
+    assert (
+        customer_attestation_report_data(receipt_id, "box-fixture-snp", "1" * 64).hex() == expected
+    )
+    fixture = json.loads((FIXTURES / "attestation" / "snp-real-rejected-bundle.json").read_bytes())
+    receipt = json.loads(base64.b64decode(fixture["receipt_base64"]))
+    assert receipt["receipt_id"] == receipt_id
+    assert receipt["hardware_binding"]["box_id"] == "box-fixture-snp"
+    assert receipt["nonce_sha256"] == "1" * 64
+    assert receipt["hardware_binding"]["report_data_hex"] == expected
 
 
 def test_report_data_commitment_is_unambiguous():

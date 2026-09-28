@@ -30,7 +30,9 @@ bytes, following `report_data_v2`.
 
 `machine_id` names the physical machine and is compared with the vendor-verified
 report: `amd-sev-snp-chip:<128 lowercase hex CHIP_ID>` for SNP, or the verifier's
-`stable_platform_id` (`tdx-platform-sha256:<64 lowercase hex>`) for TDX. The offline
+`stable_platform_id` (`tdx-platform-sha256:<64 lowercase hex>`) for TDX. The receipt
+verifier rejects a `machine_id` whose kind does not match `execution_class`
+(`snp_cpu` needs the SNP form, `tdx_cpu` the TDX form). The offline
 TDX gate already requires `platform_identity_verified=true`, so a TDX bundle whose
 verifier output lacks a matching stable platform ID is rejected.
 

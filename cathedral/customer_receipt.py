@@ -38,6 +38,7 @@ CUSTOMER_ATTESTATION_REPORT_DATA_DOMAIN = b"cathedral.customer-attestation.repor
 CUSTOMER_ATTESTATION_REPORT_DATA_VERSION = 1
 SNP_MACHINE_ID_PREFIX = "amd-sev-snp-chip:"
 TDX_MACHINE_ID_PREFIX = "tdx-platform-sha256:"
+_MACHINE_ID_PREFIX_BY_CLASS = {"snp_cpu": SNP_MACHINE_ID_PREFIX, "tdx_cpu": TDX_MACHINE_ID_PREFIX}
 _HARDWARE_BINDING_KEYS = frozenset({"box_id", "machine_id", "quote_sha256", "report_data_hex"})
 _BOX_ID_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}")
 _MACHINE_ID_RE = re.compile(
@@ -684,8 +685,13 @@ def _validate_hardware_binding(document: Mapping[str, object]) -> None:
         raise CustomerReceiptError(
             "binding", "hardware report data does not commit to this receipt, box and nonce"
         )
-    if document["execution_class"] not in {"tdx_cpu", "snp_cpu"}:
+    prefix = _MACHINE_ID_PREFIX_BY_CLASS.get(str(document["execution_class"]))
+    if prefix is None:
         raise CustomerReceiptError("binding", "hardware replay requires a supported CPU receipt")
+    if not machine.startswith(prefix):
+        raise CustomerReceiptError(
+            "binding", "hardware machine identity does not match the execution class"
+        )
 
 
 def _validate_gpu_assertions(document: Mapping[str, object]) -> None:
