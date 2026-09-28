@@ -254,6 +254,7 @@ class FakeExecutor(_Table):
         self.delete_fails = False
         self.orphans: set[str] = set()
         self.orphans_stuck = False
+        self.sweep_fails = False
 
     @property
     def network_modes(self) -> tuple[str, ...]:
@@ -281,6 +282,8 @@ class FakeExecutor(_Table):
         return removed
 
     def sweep(self) -> int:
+        if self.sweep_fails:
+            raise ExecutorError("container listing failed")
         if not self.delete_fails and not self.orphans_stuck:
             self.orphans.clear()
         return len(self.orphans)

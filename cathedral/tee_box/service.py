@@ -369,9 +369,15 @@ class TeeBoxSandboxApi:
         except ExecutorError:
             pass
 
-    def reap(self) -> None:
-        """Expire the lease, retry an unfinished drain, and end expired sandboxes."""
+    def reap(self, *, force_drain: bool = True) -> None:
+        """Expire the lease, retry an unfinished drain, and end expired sandboxes.
 
+        The reaper forces a drain attempt each tick; an ordinary call leaves
+        the lease to space its retries.
+        """
+
+        if force_drain:
+            self.lease.retry_drain()
         self.lease.current()
         now = self._clock()
         for info in self.executor.list():
@@ -427,7 +433,7 @@ class TeeBoxSandboxApi:
         except ValueError:
             return _json(400, {"error": "invalid query"})
         try:
-            self.reap()
+            self.reap(force_drain=False)
             if name not in _NO_LEASE_ROUTES:
                 self.lease.require(caller)
             return getattr(self, "_" + name)(caller, body, fields, **params)

@@ -772,6 +772,9 @@ def test_an_expired_lease_with_a_stuck_sandbox_stays_draining(tmp_path: Path):
     api.reap()
     assert api.lease.current() is None and _draining(api)
     fake.delete_fails = False
+    # Ordinary calls space their retries; the next one after the gap drains.
+    assert _draining(api)
+    clock.value += 2
     assert _handle(api, "POST", "/v1/lease", OTHER, {"ttl_seconds": 60})[0] == 200
     assert fake.deleted == [stuck]
 
@@ -787,8 +790,54 @@ def test_an_untracked_container_blocks_the_hand_over(tmp_path: Path):
     assert _handle(api, "DELETE", "/v1/lease")[1] == {"released": True, "draining": True}
     assert fake.deleted == [sid] and _draining(api)
     fake.orphans_stuck = False
+    api.reap()  # the reaper's tick
     assert _handle(api, "POST", "/v1/lease", OTHER, {"ttl_seconds": 60})[0] == 200
     assert fake.orphans == set()
+
+
+def _fresh(tmp_path: Path, fake: FakeExecutor):
+    clock = _Clock()
+    api, _ = _api(tmp_path, _binding(), clock=clock, executor=fake)
+    return api, clock
+
+
+def test_a_restarted_box_refuses_leases_until_a_sweep_removes_leftovers(tmp_path: Path):
+    # A container an earlier process left running (its table is gone).
+    fake = FakeExecutor()
+    fake.orphans.add("cathsbx-sbx-" + "5" * 24)
+    fake.orphans_stuck = True
+    api, clock = _fresh(tmp_path, fake)
+    assert api.lease.draining
+    assert _draining(api, CALLER) and _draining(api, OTHER)
+    assert _handle(api, "GET", "/v1/sandboxes")[1]["reason"] == "box_draining"
+    for _ in range(3):
+        api.reap()
+        clock.value += 5
+        assert _draining(api)
+    fake.orphans_stuck = False
+    api.reap()
+    assert fake.orphans == set() and not api.lease.draining
+    assert _handle(api, "POST", "/v1/lease", OTHER, {"ttl_seconds": 60})[0] == 200
+
+
+def test_a_restarted_box_with_a_clean_daemon_is_leasable_after_the_first_sweep(tmp_path: Path):
+    fake = FakeExecutor()
+    api, _clock = _fresh(tmp_path, fake)
+    assert api.lease.draining  # nothing is known until the first sweep
+    assert _handle(api, "POST", "/v1/lease", body={"ttl_seconds": 60})[0] == 200
+
+
+def test_a_sweep_that_fails_keeps_the_box_draining(tmp_path: Path):
+    fake = FakeExecutor()
+    fake.sweep_fails = True  # the container daemon is down
+    api, clock = _fresh(tmp_path, fake)
+    for _ in range(3):
+        api.reap()
+        clock.value += 5
+        assert _draining(api) and api.lease.draining
+    fake.sweep_fails = False
+    clock.value += 5
+    assert _handle(api, "POST", "/v1/lease", body={"ttl_seconds": 60})[0] == 200
 
 
 def test_an_unsigned_caller_gets_no_body_read(box: _Box):
