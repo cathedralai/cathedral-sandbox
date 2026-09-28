@@ -145,13 +145,25 @@ The transcript's `validator_policy_entry` is that entry, in the validator's
 from the report's CPUID, the observed measurement, and a `minimum_tcb` that is
 the per-component minimum of the current, reported, committed, and launch TCB,
 with the generation's reserved bytes left at zero. `report` also carries all
-four TCB values for review. The validator operator merges the generation entry
-into their own policy file; the probe never edits a validator policy.
+four TCB values for review. The probe never edits a validator policy; the
+validator operator merges the entry into their own policy file:
 
-`require_single_socket` in that entry reports the guest's SINGLE_SOCKET policy
-bit. A validator policy requires the bit unless it sets
-`require_single_socket` to `false`, so a guest launched without it is refused
-until the operator makes that choice explicitly.
+- Add the measurement to that generation's `allowed_measurements`.
+- `minimum_tcb` is one floor per generation, shared by every miner of that
+  generation. If the generation already has a floor, keep the stricter
+  (higher) value of each TCB component from the existing floor and the new
+  entry. Never lower an existing floor to admit a new machine. If the kept
+  floor is above what this machine reports, update the machine instead.
+
+`require_single_socket` is a global policy setting, not a per-machine one.
+The validator requires the guest's SINGLE_SOCKET policy bit unless the policy
+sets `require_single_socket` to `false`, which turns the check off for every
+SNP miner. The entry therefore carries `require_single_socket: true` when the
+guest has the bit and omits the field otherwise; it never emits `false`. For a
+guest without the bit, the transcript's `validator_policy_warnings` and the
+probe's stderr say that this guest will be refused. Relaunch the guest with
+the bit set. Changing the global flag is a separate decision the validator
+operator makes explicitly, never a side effect of merging an entry.
 
 ## Host facts this repository does not establish
 
@@ -191,18 +203,27 @@ test -z "$(git -C cathedral-snp-runtime status --porcelain)"
 
 On the separate miner-controlled host, follow only the
 [Refresh validator access from a control host](../README.md#2-refresh-validator-access-from-a-control-host)
-procedure, at the reviewed revision that ships its `refresh` and `fetch`
-commands. Do not substitute `$SOURCE_COMMIT` there: at that revision
-`scripts/cathedral_validator_access.py` has only `init-key`, `capture`, and
-`verify`, so the refresh and fetch timers cannot run. Both revisions sign and
-verify the same `cathedral_validator_access_snapshot_v1` document, so this
-image accepts what the newer refresher publishes. Do not run the README's TDX
-host or image steps. Keep the snapshot signing seed on the control host.
-Transfer only `snapshot-keys.json` and the fresh `validator-access.json` to the
-SNP guest.
+procedure, at a reviewed revision that ships its `refresh` and `fetch`
+commands. Do not run the README's TDX host or image steps. Keep the snapshot
+signing seed on the control host. Transfer only `snapshot-keys.json` and the
+fresh `validator-access.json` to the SNP guest.
 
-This image's worker predates live `fleet.json` reloading. Restart the miner
-unit after changing `fleet.json`.
+Two notes apply only while the pinned image's `SOURCE_COMMIT` is
+`8dde6eaca27116eed53386a1fa33ec70b74a01fb`, which predates #210 and #211:
+
+- Do not use `$SOURCE_COMMIT` for the control-host procedure. At `8dde6ea`,
+  `scripts/cathedral_validator_access.py` has only `init-key`, `capture`, and
+  `verify`, so the refresh and fetch timers cannot run. Use a later reviewed
+  revision instead. Both revisions sign and verify the same
+  `cathedral_validator_access_snapshot_v1` document, so the `8dde6ea` image
+  accepts what the newer refresher publishes.
+- The `8dde6ea` worker predates live `fleet.json` reloading (#210). Restart the
+  miner unit after changing `fleet.json`.
+
+Once the SNP pin moves to a source commit that includes #210 and #211 (#226
+moves it to `a66d7c4ca970487026c130610ee9efefa0416a07`), neither note applies:
+run the control-host procedure at `$SOURCE_COMMIT` itself, and the worker
+reloads `fleet.json` without a restart.
 
 On the guest, create both private destinations first. The launcher refuses
 linked, non-root-owned, or group/world-accessible access state:

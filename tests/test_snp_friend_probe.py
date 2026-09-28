@@ -197,7 +197,9 @@ def test_cli_success_prints_only_a_minimal_transcript_pointer(monkeypatch, tmp_p
 
     assert probe.main(["--challenge", "01" * 32, "--output", str(output)]) == 0
 
-    printed = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    printed = json.loads(captured.out)
     assert printed == {
         "schema": probe.TRANSCRIPT_SCHEMA,
         "status": "LOCAL_PASS",
@@ -269,14 +271,83 @@ def test_policy_entry_floor_admits_all_four_tcbs_and_nothing_lower(
         assert not _tcb_meets_minimum(tcbs[3], int.from_bytes(raised, "little"), generation)
 
 
-def test_policy_entry_carries_the_single_socket_bit():
+_GENERATIONS = [
+    (0x19, 0x01, "milan", (0, 1, 6, 7)),
+    (0x19, 0x11, "genoa", (0, 1, 6, 7)),
+    (0x1A, 0x02, "turin", (0, 1, 2, 3, 7)),
+]
+
+
+@pytest.mark.parametrize(("family", "model", "generation", "components"), _GENERATIONS)
+def test_policy_entry_floor_is_per_component_when_no_tcb_is_lowest_everywhere(
+    family, model, generation, components
+):
+    # TCB k is the lowest only on the component at position k (mod 4) and higher
+    # elsewhere, so no single value is lowest on every component. A floor taken
+    # from any one TCB (the smallest 64-bit value, or the reported one) keeps a
+    # 30 somewhere and refuses at least one of the four.
+    tcbs = tuple(
+        _tcb(
+            {
+                index: 20 if position % 4 == which else 30 + which
+                for position, index in enumerate(components)
+            }
+        )
+        for which in range(4)
+    )
+    entry = probe.validator_policy_entry(_report(family, model, tcbs, 0x130000))
+
+    floor = int(entry["generations"][generation]["minimum_tcb"], 16)
+    floor_bytes = floor.to_bytes(8, "little")
+    assert [floor_bytes[index] for index in components] == [20] * len(components)
+    assert floor not in tcbs
+    assert all(_tcb_meets_minimum(value, floor, generation) for value in tcbs)
+    for index in components:
+        raised = bytearray(floor_bytes)
+        raised[index] += 1
+        assert not all(
+            _tcb_meets_minimum(value, int.from_bytes(raised, "little"), generation)
+            for value in tcbs
+        )
+
+
+def test_policy_entry_requires_single_socket_only_as_true():
     tcbs = (_tcb({0: 1, 7: 1}),) * 4
-    assert probe.validator_policy_entry(_report(0x19, 0x01, tcbs, 0x30000))[
-        "require_single_socket"
-    ] is False
-    assert probe.validator_policy_entry(_report(0x19, 0x01, tcbs, 0x130000))[
-        "require_single_socket"
-    ] is True
+    with_bit = probe.validator_policy_entry(_report(0x19, 0x01, tcbs, 0x130000))
+    assert set(with_bit) == {"schema", "generations", "require_single_socket"}
+    assert with_bit["require_single_socket"] is True
+    assert probe.validator_policy_warnings(_report(0x19, 0x01, tcbs, 0x130000)) == []
+
+
+def test_policy_entry_never_turns_the_global_single_socket_check_off():
+    # require_single_socket is global to the validator policy. Emitting false for
+    # one guest would switch the check off for every SNP miner once pasted.
+    tcbs = (_tcb({0: 1, 7: 1}),) * 4
+    report = _report(0x19, 0x01, tcbs, 0x30000)
+    without_bit = probe.validator_policy_entry(report)
+    assert set(without_bit) == {"schema", "generations"}
+    assert "require_single_socket" not in json.dumps(without_bit)
+    assert probe.validator_policy_warnings(report) == [probe.SINGLE_SOCKET_WARNING]
+    assert "will be refused" in probe.SINGLE_SOCKET_WARNING
+    assert "every SNP miner" in probe.SINGLE_SOCKET_WARNING
+
+
+def test_cli_prints_the_single_socket_warning_to_stderr(monkeypatch, tmp_path, capsys):
+    output = tmp_path / "transcript.json"
+    result = {
+        "schema": probe.TRANSCRIPT_SCHEMA,
+        "status": "LOCAL_PASS",
+        "source_commit": "a" * 40,
+        "validator_policy_warnings": [probe.SINGLE_SOCKET_WARNING],
+    }
+    monkeypatch.setattr(probe, "run_probe", lambda _challenge: result)
+
+    assert probe.main(["--challenge", "01" * 32, "--output", str(output)]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.err == f"WARNING: {probe.SINGLE_SOCKET_WARNING}\n"
+    assert json.loads(captured.out)["status"] == "LOCAL_PASS"
+    assert json.loads(output.read_text(encoding="utf-8")) == result
 
 
 def test_policy_entry_refuses_an_unknown_generation_or_a_zero_floor():

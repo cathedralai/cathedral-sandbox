@@ -66,6 +66,13 @@ PROBE_TIMEOUT_SECONDS = 120.0
 FRIEND_SNPGUEST_TIMEOUT_SECONDS = 15.0
 VALIDATOR_POLICY_SCHEMA = "cathedral_amd_sev_snp_policy_v1"
 GUEST_POLICY_SINGLE_SOCKET = 1 << 20
+SINGLE_SOCKET_WARNING = (
+    "this guest was launched without the SINGLE_SOCKET policy bit; the validator "
+    "requires that bit for every SNP miner by default, so this guest will be refused. "
+    "Relaunch it with the bit set. validator_policy_entry deliberately omits "
+    "require_single_socket: setting it to false is a global policy change that turns "
+    "the socket check off for every SNP miner, and must be a separate, explicit decision."
+)
 # TCB bytes the validator compares per generation; every other byte is reserved.
 _TCB_COMPONENT_BYTES = {
     "milan": (0, 1, 6, 7),
@@ -462,6 +469,7 @@ def run_probe(review_challenge: bytes) -> dict[str, Any]:
             "launch_tcb_hex": f"0x{parsed.tcb.launch:016x}",
         },
         "validator_policy_entry": validator_policy_entry(parsed),
+        "validator_policy_warnings": validator_policy_warnings(parsed),
         "channel": {
             "binding_type": binding.binding_type.value,
             "binding_digest": "sha256:" + binding.digest.hex(),
@@ -482,6 +490,12 @@ def validator_policy_entry(parsed: SnpReport) -> dict[str, Any]:
     The validator applies one component-wise floor to the current, reported,
     committed and launch TCB, so the floor is the per-component minimum of all
     four, with the generation's reserved bytes left at zero.
+
+    ``require_single_socket`` is global to the validator policy, so the entry
+    only ever carries it as ``true``. A guest without the SINGLE_SOCKET bit
+    gets no such field, never ``false``: pasting ``false`` would switch the
+    socket check off for every SNP miner. :func:`validator_policy_warnings`
+    says why such a guest stays refused.
     """
 
     generation = snp_generation(parsed)
@@ -495,9 +509,8 @@ def validator_policy_entry(parsed: SnpReport) -> dict[str, Any]:
     minimum_tcb = int.from_bytes(floor, "little")
     if minimum_tcb == 0:
         raise ProbeError("every TCB component is zero; the validator refuses a zero floor")
-    return {
+    entry: dict[str, Any] = {
         "schema": VALIDATOR_POLICY_SCHEMA,
-        "require_single_socket": bool(parsed.guest_policy & GUEST_POLICY_SINGLE_SOCKET),
         "generations": {
             generation: {
                 "allowed_measurements": [parsed.measurement],
@@ -505,6 +518,21 @@ def validator_policy_entry(parsed: SnpReport) -> dict[str, Any]:
             }
         },
     }
+    if _has_single_socket_bit(parsed):
+        entry["require_single_socket"] = True
+    return entry
+
+
+def validator_policy_warnings(parsed: SnpReport) -> list[str]:
+    """Return what the operator must know before merging the policy entry."""
+
+    if _has_single_socket_bit(parsed):
+        return []
+    return [SINGLE_SOCKET_WARNING]
+
+
+def _has_single_socket_bit(parsed: SnpReport) -> bool:
+    return bool(parsed.guest_policy & GUEST_POLICY_SINGLE_SOCKET)
 
 
 def _write_new(path: Path, document: dict[str, Any]) -> None:
@@ -545,6 +573,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         print(json.dumps(failure, sort_keys=True), file=sys.stderr)
         return 1
+    for warning in result.get("validator_policy_warnings", ()):
+        print(f"WARNING: {warning}", file=sys.stderr)
     print(
         json.dumps(
             {
