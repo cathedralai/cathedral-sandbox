@@ -97,7 +97,7 @@ def _edit_request(header: str, seed: bytes = CENTRAL_SEED, **changes) -> str:
 
 @pytest.fixture
 def authorizer(tmp_path: Path) -> ca.CentralAccessAuthorizer:
-    state = ValidatorAccessState(str(tmp_path / "central-access.sqlite"))
+    state = ca.open_central_access_state(str(tmp_path / "central-access.sqlite"))
     return ca.CentralAccessAuthorizer(
         ROOT_KEYS,
         worker_hotkey=WORKER,
@@ -126,10 +126,26 @@ def test_a_delegated_signed_request_is_accepted_once(authorizer):
     ("delegation", "match"),
     [
         (lambda: _resign(_delegation(), OTHER_ROOT_SEED), "signature verification failed"),
-        (lambda: _resign({**_delegation(), "root_key_id": "someone-else"}, ROOT_SEED), "untrusted root"),
-        (lambda: _delegation(issued_at=NOW - timedelta(hours=3), expires_at=NOW - timedelta(hours=2)), "expired"),
-        (lambda: _delegation(issued_at=NOW + timedelta(minutes=5), expires_at=NOW + timedelta(hours=1)), "future"),
-        (lambda: _resign({**_delegation(), "expires_at": "2026-09-29T12:00:01Z"}, ROOT_SEED), "too long"),
+        (
+            lambda: _resign({**_delegation(), "root_key_id": "someone-else"}, ROOT_SEED),
+            "untrusted root",
+        ),
+        (
+            lambda: _delegation(
+                issued_at=NOW - timedelta(hours=3), expires_at=NOW - timedelta(hours=2)
+            ),
+            "expired",
+        ),
+        (
+            lambda: _delegation(
+                issued_at=NOW + timedelta(minutes=5), expires_at=NOW + timedelta(hours=1)
+            ),
+            "future",
+        ),
+        (
+            lambda: _resign({**_delegation(), "expires_at": "2026-09-29T12:00:01Z"}, ROOT_SEED),
+            "too long",
+        ),
         (lambda: _delegation(netuid=OTHER_NETUID), "subnet does not match"),
         (lambda: _delegation(network="test"), "subnet does not match"),
         (lambda: _resign({**_delegation(), "routes": ["/v1/sat-work"]}, ROOT_SEED), "routes"),
@@ -137,7 +153,10 @@ def test_a_delegated_signed_request_is_accepted_once(authorizer):
         (lambda: _resign({**_delegation(), "extra": 1}, ROOT_SEED), "fields are invalid"),
         (lambda: _resign({**_delegation(), "netuid": True}, ROOT_SEED), "netuid"),
         (lambda: _resign({**_delegation(), "sequence": 0}, ROOT_SEED), "sequence"),
-        (lambda: _resign({**_delegation(), "central_key_base64": "AA=="}, ROOT_SEED), "central key"),
+        (
+            lambda: _resign({**_delegation(), "central_key_base64": "AA=="}, ROOT_SEED),
+            "central key",
+        ),
     ],
 )
 def test_a_bad_delegation_is_refused(authorizer, delegation, match):
@@ -233,8 +252,11 @@ def test_a_revoked_delegation_is_refused_before_and_after_the_body(authorizer):
     request = authorizer.preauthorize(_header(delegation), method="POST", path=PATH, now=NOW)
     authorizer.install_revocations(
         ca.sign_revocations(
-            root_key_id="cathedral-root-1", root_seed=ROOT_SEED, sequence=1,
-            issued_at=NOW, revoked=[digest],
+            root_key_id="cathedral-root-1",
+            root_seed=ROOT_SEED,
+            sequence=1,
+            issued_at=NOW,
+            revoked=[digest],
         )
     )
     with pytest.raises(ca.CentralAccessError, match="revoked"):
@@ -248,8 +270,11 @@ def test_a_revoked_delegation_is_refused_before_and_after_the_body(authorizer):
 def test_revocation_lists_only_move_forward(authorizer):
     def revocations(sequence, revoked, seed=ROOT_SEED):
         return ca.sign_revocations(
-            root_key_id="cathedral-root-1", root_seed=seed, sequence=sequence,
-            issued_at=NOW, revoked=revoked,
+            root_key_id="cathedral-root-1",
+            root_seed=seed,
+            sequence=sequence,
+            issued_at=NOW,
+            revoked=revoked,
         )
 
     authorizer.install_revocations(revocations(3, []))
@@ -279,12 +304,120 @@ def test_root_keys_load_only_under_the_miner_pin(tmp_path):
 def test_central_replay_state_is_separate_from_validator_state(tmp_path):
     with pytest.raises(ca.CentralAccessError, match="durable replay state"):
         ca.CentralAccessAuthorizer(
-            ROOT_KEYS, worker_hotkey=WORKER, network=NETWORK, netuid=NETUID,
-            channel_binding=BINDING, state=object(),
+            ROOT_KEYS,
+            worker_hotkey=WORKER,
+            network=NETWORK,
+            netuid=NETUID,
+            channel_binding=BINDING,
+            state=object(),
         )
     with pytest.raises(ca.CentralAccessError, match="pinned root key"):
         ca.CentralAccessAuthorizer(
-            {}, worker_hotkey=WORKER, network=NETWORK, netuid=NETUID,
+            {},
+            worker_hotkey=WORKER,
+            network=NETWORK,
+            netuid=NETUID,
             channel_binding=BINDING,
             state=ValidatorAccessState(str(tmp_path / "state.sqlite")),
+        )
+
+
+def _revocations(sequence, revoked, seed=ROOT_SEED):
+    return ca.sign_revocations(
+        root_key_id="cathedral-root-1",
+        root_seed=seed,
+        sequence=sequence,
+        issued_at=NOW,
+        revoked=revoked,
+    )
+
+
+@pytest.mark.parametrize("routes", [[{"a": 1}], [1, "x"], [None]])
+def test_non_string_delegation_routes_are_refused_not_raised(authorizer, routes):
+    document = _resign({**_delegation(), "routes": routes}, ROOT_SEED)
+    header = _edit_request(_header(), delegation=document)
+    with pytest.raises(ca.CentralAccessError, match="routes"):
+        authorizer.preauthorize(header, method="POST", path=PATH, now=NOW)
+
+
+@pytest.mark.parametrize("revoked", [[{"a": 1}], [1, "x"], [None]])
+def test_non_string_revocations_are_refused_not_raised(authorizer, revoked):
+    document = _resign({**_revocations(1, []), "revoked": revoked}, ROOT_SEED)
+    with pytest.raises(ca.CentralAccessError, match="sorted delegation digests"):
+        authorizer.install_revocations(document)
+
+
+def test_only_post_is_served_even_when_the_request_signs_another_method(authorizer):
+    header = _header(method="GET")
+    with pytest.raises(ca.CentralAccessError, match="target does not match"):
+        authorizer.preauthorize(header, method="GET", path=PATH, now=NOW)
+
+
+def test_a_request_expires_at_exactly_its_expiry(authorizer):
+    expires_at = NOW + timedelta(seconds=60)
+    with pytest.raises(ca.CentralAccessError, match="request has expired"):
+        authorizer.preauthorize(_header(), method="POST", path=PATH, now=expires_at)
+    assert authorizer.preauthorize(
+        _header(), method="POST", path=PATH, now=expires_at - timedelta(seconds=1)
+    )
+
+
+def test_a_delegation_expires_at_exactly_its_expiry():
+    delegation = _delegation()
+    expires_at = NOW + timedelta(hours=1)
+    with pytest.raises(ca.CentralAccessError, match="delegation has expired"):
+        ca.verify_delegation(delegation, ROOT_KEYS, network=NETWORK, netuid=NETUID, now=expires_at)
+    assert ca.verify_delegation(
+        delegation,
+        ROOT_KEYS,
+        network=NETWORK,
+        netuid=NETUID,
+        now=expires_at - timedelta(seconds=1),
+    )
+
+
+@pytest.mark.parametrize("delay", [60, 61])
+def test_finalize_refuses_a_request_that_expired_while_its_body_was_read(authorizer, delay):
+    request = authorizer.preauthorize(_header(), method="POST", path=PATH, now=NOW)
+    with pytest.raises(ca.CentralAccessError, match="request has expired"):
+        authorizer.finalize(request, body=BODY, now=NOW + timedelta(seconds=delay))
+
+
+def test_finalize_refuses_a_delegation_superseded_while_its_body_was_read(authorizer):
+    stale = authorizer.preauthorize(
+        _header(_delegation(sequence=5)), method="POST", path=PATH, now=NOW
+    )
+    _accept(authorizer, _header(_delegation(sequence=7), nonce=b"m" * 32))
+    with pytest.raises(ca.CentralAccessError, match="older than one already accepted"):
+        authorizer.finalize(stale, body=BODY, now=NOW)
+
+
+def test_a_revocation_list_is_capped(authorizer):
+    digests = sorted("sha256:" + hashlib.sha256(str(i).encode()).hexdigest() for i in range(4097))
+    with pytest.raises(ca.CentralAccessError, match="sorted delegation digests"):
+        authorizer.install_revocations(_revocations(1, digests))
+    authorizer.install_revocations(_revocations(1, digests[: ca.MAX_REVOKED_DELEGATIONS]))
+
+
+def test_root_key_ids_must_be_canonical(tmp_path):
+    path = tmp_path / "central-root-keys.json"
+    path.write_bytes(
+        canonical_json({"Cathedral Root": base64.b64encode(_public(ROOT_SEED)).decode("ascii")})
+    )
+    pin = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(ca.CentralAccessError, match="root key id is not canonical"):
+        ca.load_central_root_keys(str(path), pinned_digest=pin)
+
+
+def test_central_replay_state_has_its_own_smaller_cap(tmp_path):
+    state = ca.open_central_access_state(str(tmp_path / "central.sqlite"))
+    assert state.max_replay_entries == ca.MAX_CENTRAL_REPLAY_ENTRIES
+    with pytest.raises(ca.CentralAccessError, match="central replay cap"):
+        ca.CentralAccessAuthorizer(
+            ROOT_KEYS,
+            worker_hotkey=WORKER,
+            network=NETWORK,
+            netuid=NETUID,
+            channel_binding=BINDING,
+            state=ValidatorAccessState(str(tmp_path / "validator-sized.sqlite")),
         )

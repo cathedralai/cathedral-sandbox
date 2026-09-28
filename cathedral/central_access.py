@@ -116,10 +116,20 @@ class CentralDelegation:
 @dataclass(frozen=True)
 class PreauthorizedCentralRequest:
     delegation_digest: str
+    delegation_sequence: int
     caller: str
     nonce_hex: str
     body_sha256: str
     expires_at: datetime
+
+
+def open_central_access_state(path: str) -> ValidatorAccessState:
+    """Open the central replay store on its own path, with the central cap."""
+
+    try:
+        return ValidatorAccessState(path, max_replay_entries=MAX_CENTRAL_REPLAY_ENTRIES)
+    except ValidatorAccessError as exc:
+        raise CentralAccessError(f"central access state is unusable: {exc}") from exc
 
 
 def load_central_root_keys(path: str, *, pinned_digest: str) -> dict[str, bytes]:
@@ -245,7 +255,9 @@ def sign_delegation(
     return _sign_ed25519(document, root_seed)
 
 
-def _check_delegation_fields(document: Mapping[str, object]) -> tuple[bytes, frozenset[str], int, datetime, datetime]:
+def _check_delegation_fields(
+    document: Mapping[str, object],
+) -> tuple[bytes, frozenset[str], int, datetime, datetime]:
     if document.get("schema") != CENTRAL_DELEGATION_SCHEMA:
         raise CentralAccessError("central delegation schema is unsupported")
     key_id = document.get("root_key_id")
@@ -256,10 +268,13 @@ def _check_delegation_fields(document: Mapping[str, object]) -> tuple[bytes, fro
     if (
         not isinstance(routes, list)
         or not routes
+        or any(not isinstance(route, str) for route in routes)
         or routes != sorted(set(routes))
         or any(route not in CENTRAL_ROUTES for route in routes)
     ):
-        raise CentralAccessError("central delegation routes must be a sorted subset of central routes")
+        raise CentralAccessError(
+            "central delegation routes must be a sorted subset of central routes"
+        )
     _check_subnet(document.get("network"), document.get("netuid"))
     sequence = document.get("sequence")
     if isinstance(sequence, bool) or not isinstance(sequence, int) or not 1 <= sequence < 1 << 63:
@@ -289,7 +304,9 @@ def verify_delegation(
     central_key, routes, sequence, issued_at, expires_at = _check_delegation_fields(document)
     if (document["network"], document["netuid"]) != (network, netuid):
         raise CentralAccessError("central delegation subnet does not match")
-    _verify_ed25519(document, _root_key(document, root_keys, "central delegation"), "central delegation")
+    _verify_ed25519(
+        document, _root_key(document, root_keys, "central delegation"), "central delegation"
+    )
     if issued_at > now + timedelta(seconds=MAX_REQUEST_FUTURE_SKEW_SECONDS):
         raise CentralAccessError("central delegation was issued too far in the future")
     if not now < expires_at:
@@ -346,12 +363,16 @@ def verify_revocations(
     if (
         not isinstance(revoked, list)
         or len(revoked) > MAX_REVOKED_DELEGATIONS
-        or revoked != sorted(set(revoked))
         or any(not isinstance(item, str) or _DIGEST_RE.fullmatch(item) is None for item in revoked)
+        or revoked != sorted(set(revoked))
     ):
-        raise CentralAccessError("central revocation list entries must be sorted delegation digests")
+        raise CentralAccessError(
+            "central revocation list entries must be sorted delegation digests"
+        )
     _verify_ed25519(
-        document, _root_key(document, root_keys, "central revocation list"), "central revocation list"
+        document,
+        _root_key(document, root_keys, "central revocation list"),
+        "central revocation list",
     )
     return sequence, frozenset(revoked)
 
@@ -402,7 +423,8 @@ class CentralAccessAuthorizer:
     """Worker-side verifier for central requests, with its own replay state.
 
     ``state`` must be a ValidatorAccessState on its own path, so central
-    requests never share the validator replay budget.
+    requests never share the validator replay budget, holding at most
+    MAX_CENTRAL_REPLAY_ENTRIES nonces; open_central_access_state builds one.
     """
 
     def __init__(
@@ -423,6 +445,8 @@ class CentralAccessAuthorizer:
             raise CentralAccessError("central access requires the worker channel binding")
         if not isinstance(state, ValidatorAccessState):
             raise CentralAccessError("central access requires durable replay state")
+        if state.max_replay_entries > MAX_CENTRAL_REPLAY_ENTRIES:
+            raise CentralAccessError("central replay state exceeds the central replay cap")
         self.root_keys = dict(root_keys)
         self.worker_hotkey = worker_hotkey
         self.channel_binding = channel_binding
@@ -523,15 +547,14 @@ class CentralAccessAuthorizer:
             self._delegation_high_water = max(self._delegation_high_water, delegation.sequence)
         return PreauthorizedCentralRequest(
             delegation_digest=delegation.digest,
+            delegation_sequence=delegation.sequence,
             caller="central:" + hashlib.sha256(delegation.central_key).hexdigest(),
             nonce_hex=nonce_hex,
             body_sha256=body_sha256,
             expires_at=expires_at,
         )
 
-    def finalize(
-        self, request: PreauthorizedCentralRequest, *, body: bytes, now: datetime
-    ) -> str:
+    def finalize(self, request: PreauthorizedCentralRequest, *, body: bytes, now: datetime) -> str:
         """Check the body and record the nonce; return the caller identity."""
 
         now = _check_now(now)
@@ -547,6 +570,8 @@ class CentralAccessAuthorizer:
         with self._lock:
             if request.delegation_digest in self._revoked:
                 raise CentralAccessError("central delegation has been revoked")
+            if request.delegation_sequence < self._delegation_high_water:
+                raise CentralAccessError("central delegation is older than one already accepted")
         if not self.state.check_and_record_request(
             request.caller, request.nonce_hex, now=now, expires_at=request.expires_at
         ):
