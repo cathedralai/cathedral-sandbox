@@ -12,7 +12,8 @@ What a receipt binds, and what ``verify_receipt`` checks:
   gains nothing);
 - the box: its id, the miner's hotkey, its kind and one canonical hardware
   identity for dedup, fixed by the kind (``derive_hardware_id`` over the TDX
-  PPID, the SEV-SNP chip id, or, for bare metal, ``probe_fingerprint``);
+  PPID, the SEV-SNP chip id, or, for bare metal, ``probe_fingerprint`` of the
+  probed address);
 - the capacity paid for, which must be exactly what the challenge proved: the
   spec must equal ``spec_for(seed, vcpus=, memory_gib=)``;
 - the proof: the committed result digest, the post-commitment sample nonce, the
@@ -62,7 +63,7 @@ HARDWARE_ID_KINDS = {
     ("tee", "sev_snp"): "chip_id",
     ("bare_metal", None): "probe_fingerprint",
 }
-_RAW_ID_BYTES = {"ppid": 16, "chip_id": 64, "probe_fingerprint": 18}
+_RAW_ID_BYTES = {"ppid": 16, "chip_id": 64, "probe_fingerprint": 9}
 HARDWARE_ID_DOMAIN = b"cathedral.capacity.hardware_id.v1\x00"
 MAX_VALIDITY = timedelta(hours=2)
 CLOCK_SKEW = timedelta(minutes=5)
@@ -170,7 +171,7 @@ def derive_hardware_id(hardware_id_kind: str, raw: bytes) -> str:
     """The receipt's ``hardware_id``: SHA-256 over the id kind and the raw id
     the prober took from evidence it verified itself (the 16-byte PPID from the
     TDX quote's PCK certificate, the 64-byte CHIP_ID from the SEV-SNP report), or
-    ``probe_fingerprint``'s 18 bytes for bare metal. One machine therefore has
+    ``probe_fingerprint``'s 9 bytes for bare metal. One machine therefore has
     exactly one hardware id per kind of box."""
 
     size = _RAW_ID_BYTES.get(hardware_id_kind)
@@ -185,21 +186,28 @@ def derive_hardware_id(hardware_id_kind: str, raw: bytes) -> str:
     ).hexdigest()
 
 
-def probe_fingerprint(address: str, port: int) -> str:
-    """A bare-metal box's ``hardware_id``: the address and port the prober
-    itself connected to and ran the challenge through, never anything the box
-    reports. An IPv4 address is taken in its IPv6-mapped form, so each endpoint
-    has one fingerprint. It names an endpoint, not a machine (docs/CAPACITY.md)."""
+def probe_fingerprint(address: str) -> str:
+    """A bare-metal box's ``hardware_id``: the address the prober itself
+    connected to and ran the challenge through, never anything the box reports.
+    It keeps the IPv4 address, or only the /64 of an IPv6 address, and never the
+    port, so one host behind one address is one id however many ports or IPv6
+    interface ids it registers. An IPv4-mapped IPv6 address counts as its IPv4
+    address. Honest boxes sharing one address (behind one NAT) therefore count
+    as one box: the conservative choice (docs/CAPACITY.md)."""
 
+    if not isinstance(address, str):
+        raise ReceiptError("probe address must be an IP address string")
     try:
         ip = ipaddress.ip_address(address)
     except ValueError as exc:
         raise ReceiptError("probe address must be an IP address") from exc
-    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
-        raise ReceiptError("probe port must be an integer from 1 to 65535")
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
     if isinstance(ip, ipaddress.IPv4Address):
-        ip = ipaddress.IPv6Address(b"\x00" * 10 + b"\xff\xff" + ip.packed)
-    return derive_hardware_id("probe_fingerprint", ip.packed + port.to_bytes(2, "big"))
+        raw = b"\x04" + ip.packed + bytes(4)  # the whole IPv4 address
+    else:
+        raw = b"\x06" + ip.packed[:8]  # the IPv6 /64
+    return derive_hardware_id("probe_fingerprint", raw)
 
 
 def make_body(

@@ -19,25 +19,28 @@ The prober, the sandbox it probes and every validator use the same code. Citatio
 
 One lane per claimed vCPU, together holding 80% of the claimed memory. Each lane is
 scrypt-like over SHA-256: fill `blocks` 32-byte blocks, then take two data-dependent reads per
-block, writing each back. A box with fewer cores or less memory cannot finish within the
-prober's deadline.
+block, writing each back. What this proves today is narrower than "the box has these cores and
+this memory": the sampled lanes were computed correctly, and the deadline keeps a vCPU claim
+within about 2.6 times what the box's cores can compute at the assumed native speed (see
+Timing and "What a receipt proves today").
 
 Commit, then sample:
 
 1. the prober sends `spec_for(seed, vcpus=, memory_gib=)` with a fresh seed. The parameters
-   are fixed by the protocol, and a claim the challenge cannot prove (over 1024 vCPUs, or over
-   10 GiB per vCPU) is refused, not proven in part (`challenge.py:104-119`);
+   are fixed by the protocol, and a claim the challenge cannot prove (over 1024 vCPUs, over
+   10 GiB per vCPU, or under 0.625 GiB per vCPU, the 512 MiB lane floor) is refused, not proven
+   in part (`challenge.py:124-145`);
 2. the box returns every lane's output (`python -m cathedral.capacity.challenge`, or a native
    worker computing the same function), which commits it: `result_digest`;
 3. only then does the prober draw a fresh 32-byte nonce and recompute the `sample_count` lanes
-   `sample_lanes(spec, digest, nonce, sample_count)` picks (`verify`, `challenge.py:209-223`).
+   `sample_lanes(spec, digest, nonce, sample_count)` picks (`verify`, `challenge.py:247-261`).
    Since the nonce comes after the commitment, a box cannot steer the sample onto the lanes it
    computed honestly.
 
 ### How many lanes are sampled
 
 `sample_count` must be at least `required_samples(lanes) = min(lanes, max(4, ceil(lanes / 2)))`
-(`challenge.py:130-136`) and at most `lanes`. So a box of 4 vCPUs or fewer has **every** lane
+(`challenge.py:165-171`) and at most `lanes`. So a box of 4 vCPUs or fewer has **every** lane
 recomputed (not "at least 4": a 2-vCPU box has 2 lanes, both checked), a box of 5 to 8 vCPUs has
 4, and a larger box at least half. The prober may sample more, up to every lane; the receipt
 records the count it used.
@@ -78,41 +81,73 @@ The library cannot enforce the order of events:
 - one attempt per seed, and a capped number of attempts per box per round; a retry with the
   same seed and a new nonce gives a dishonest box another chance;
 - probe a memory-heavy box (over 10 GiB per vCPU) at `provable_memory_gib(vcpus, memory_gib)`
-  (`challenge.py:122-127`), which is also what it is paid for;
+  (`challenge.py:148-153`), and a CPU-heavy box (under 0.625 GiB per vCPU) at
+  `provable_vcpus(vcpus, memory_gib)` (`challenge.py:156-162`); that is also what it is paid
+  for;
 - probe boxes that may share a host **at the same time** (see Hardware identity);
 - the lanes hold 80% of the claimed memory; watch shadow mode for honest boxes failing for
   lack of headroom.
 
 ### Timing
 
-`deadline_ms` must be at least 1 and at most `max_deadline_ms(spec) = 120 000 +
-ceil(steps × 5 000 ns / 1e6)` (`challenge.py:139-144`, constants `challenge.py:48-53`,
-enforced at `receipt.py:376-378`), and the exec time must fit it (`receipt.py:385-386`). Lanes
-run in parallel, so the bound follows one lane's `steps`: a 120 s base for creating the sandbox
-and starting the worker, plus about three times the pure-Python reference's per-step time
-(1.8 µs per step measured on a 4-core development VM). For an 8 vCPU, 32 GiB box that is
-about 20 minutes.
+`deadline_ms` must be at least 1 and at most `max_deadline_ms(spec) = 10 000 +
+ceil(steps × 2 000 ns / 1e6)` (`challenge.py:174-182`, constants `challenge.py:57-73`,
+enforced at `receipt.py:384-386`), and the exec time must fit it (`receipt.py:393-394`). So the
+bound is on `exec` alone; creating the sandbox is timed separately (`timings_ms.create`). Lanes
+are meant to run in parallel, so it follows one lane's `steps`:
 
-This bound only stops a receipt from carrying an absurd deadline (a receipt with
-`deadline_ms = 10^15` was accepted before). It is deliberately generous, so an honest box
-running the pure-Python reference is not refused, and it is far looser than a native worker
-needs. **Validators must not treat the timing check as a capacity signal until the formula is
-benchmarked** on native workers across real CPUs and tightened.
+- **startup allowance, 10 s** (`DEADLINE_STARTUP_MS`): the exec round trip, starting the worker
+  and first-touching the lane memory, each about a second or less on a native worker. It adds
+  at most about 15% to the smallest lane's 67 s per-step budget.
+- **per-step budget, 2 µs** (`DEADLINE_NS_PER_STEP`). The assumed native speed is 1.69M
+  SHA-256 per second per core (`ASSUMED_NATIVE_HASHES_PER_SECOND`, about 0.6 µs per hash, as
+  measured in review). A lane's fill adds half as many hashes again as its steps, so a
+  native lane costs about 0.89 µs per step in all, and 2 µs gives an honest box about 2.25
+  times that as headroom for slower cores and noisy hosts. An 8 vCPU, 16 GiB box computes its
+  challenge in about 95 s against a 225 s bound; an 8 vCPU, 32 GiB box has about 7.3 minutes.
+- **lane floor, 512 MiB** (`MIN_LANE_BYTES`, `challenge.py:52-56`): `spec_for` refuses a claim
+  of less than 0.625 GiB per vCPU. Without it, many vCPUs over little memory make lanes so
+  short that the bound is almost all startup allowance. The SN120 profile shapes of 1 vCPU x
+  4 GiB and 2 vCPU x 4 GiB (3.2 and 1.6 GiB lanes) are well above it
+  (`test_the_lane_floor_admits_the_consumer_shapes_and_refuses_thin_claims`).
 
-**What a receipt proves today.** The sample proves the lanes were computed correctly. Under this
-bound it proves neither the core count nor the total memory. One core running a native worker
-can compute every lane one after another well inside `max_deadline_ms`, holding one lane's memory
-(`M / C`) at a time rather than all `M` at once. Until the deadline is benchmarked and tightened
-so the lanes must run in parallel, treat a receipt as evidence that the box computed the
-challenge for the claimed shape, not as proof that it has that many cores or that much memory.
+**Why the old bound failed.** A challenge's total work is fixed by the claimed memory, whatever
+the vCPU count, while one lane's steps shrink as vCPUs grow. The old bound was a flat 120 s
+base plus 5 µs per step, so it fell to about 120 s for a large vCPU claim: 8 cores claiming
+1024 vCPUs over 16 GiB finished in the same 95 s as the honest 8 vCPU claim, under a 124 s
+cap, and the receipt verified. That claim is now refused by the lane floor, and its old spec's
+bound would be under 12 s (`tests/test_capacity.py`,
+`test_the_reviewers_inflated_receipt_is_refused`).
+
+**Residual inflation factor.** A box with `C` cores computing `V > C` lanes takes `V / C` times
+as long as one lane, so it meets the bound only while `V / C` is at most the per-step budget over
+the native per-step time: 2 µs / 0.89 µs ≈ 2.3 for large lanes, up to about 2.6 at the lane
+floor, where the startup allowance counts most (checked by brute force in
+`test_a_vcpu_claim_inflates_at_most_the_documented_factor`). That is down from 128 times, but
+it is not 1, and it holds only at the assumed speed: a worker faster than 1.69M hashes per second
+per core raises it in proportion. (OpenSSL hashes 64-byte messages at about 5.7M per second on
+one core of the development VM, though a real lane step also waits on a random memory read.)
+**Validator #257 must stay shadow-only, and must not let receipts affect weights, until the
+per-step budget is calibrated on native workers across real CPUs** and set just above the
+fastest honest one.
+
+**What a receipt proves today.** The sample proves the lanes were computed correctly for the
+claimed shape. The deadline proves the box computed them at no less than about 1 / 2.6 of the
+claimed vCPUs' native throughput, and so held at least about 1 / 2.6 of the lane memory at once
+(a box with `C` cores needs only `C` lanes in memory at a time). It does not prove the exact
+core count or the total memory: one core short of the claim is invisible to timing (see How
+many lanes are sampled), and both bounds rest on the uncalibrated native-speed assumption. Treat
+a receipt as evidence that the box computed the challenge for the claimed shape within that
+factor, not as proof that it has that many cores or that much memory.
 
 ### Cost
 
 Proving a box holds `M` of memory across `C` cores needs lanes of `M / C` each, and checking a
 lane means recomputing it. The pure-Python reference computes about 9 MiB of lane per second on
 a 4-core development VM (a full 3.2 GiB lane for an 8 vCPU, 32 GiB box takes about six
-minutes), so the prober and the sandbox should run a native implementation of the same
-function. With half the lanes sampled, the prober spends about half the box's CPU time per
+minutes), so the prober and the sandbox must run a native implementation of the same
+function: at about 1.8 µs per step (measured on that VM) the reference would use nearly all of the 2 µs budget, and
+miss it on a slower core. With half the lanes sampled, the prober spends about half the box's CPU time per
 probe. Validators check receipt signatures; recomputing a sampled lane is an optional audit,
 sensibly done for a few boxes per round.
 
@@ -120,65 +155,73 @@ sensibly done for a few boxes per round.
 
 Schema `cathedral_capacity_receipt_v1`: canonical JSON plus a base64 Ed25519 signature by the
 key named in `prober_key_id`. The prober signs only a body that passes the same checks
-(`sign_receipt`, `receipt.py:258-265`; it refuses a body that already carries a signature).
+(`sign_receipt`, `receipt.py:266-273`; it refuses a body that already carries a signature).
 `verify_receipt` checks, and every date, time and `now` error is a `ReceiptError`
-(`receipt.py:141-154`), never a bare `ValueError` or `TypeError`:
+(`receipt.py:142-155`), never a bare `ValueError` or `TypeError`:
 
-- **shape:** exactly the known fields and schema (`receipt.py:307-308`), non-negative integer
-  netuid and round (`receipt.py:309-310`), a well-formed `prober_key_id`
-  (`receipt.py:312-316`);
-- **signature:** by a pinned prober key (`receipt.py:286-293`);
+- **shape:** exactly the known fields and schema (`receipt.py:315-316`), non-negative integer
+  netuid and round (`receipt.py:317-318`), a well-formed `prober_key_id`
+  (`receipt.py:320-324`);
+- **signature:** by a pinned prober key (`receipt.py:294-301`);
 - **audience:** the netuid, the requesting validator's nonce and the round, all required
-  (`receipt.py:280-281`, `receipt.py:294-299`); anything else is refused, so copying another
+  (`receipt.py:288-289`, `receipt.py:302-307`); anything else is refused, so copying another
   validator's weights gains nothing and a receipt from an earlier round cannot be replayed;
 - **box:** `box_id`, the miner's hotkey, its kind, and one hardware identity fixed by the kind
-  (`receipt.py:318-337`, below);
+  (`receipt.py:326-345`, below);
 - **capacity equals proof:** the spec must be exactly `spec_for(seed, vcpus=, memory_gib=)`
-  for the positive vCPUs and memory the receipt pays for (`receipt.py:340-356`);
+  for the positive vCPUs and memory the receipt pays for (`receipt.py:348-364`);
 - **sample:** the committed digest, the post-commitment `sample_nonce`, a `sample_count` from
   `required_samples(lanes)` to `lanes`, and the outputs of exactly the lanes that nonce and
-  count pick (`receipt.py:359-375`), so anyone can recompute which lanes were checked and
+  count pick (`receipt.py:367-383`), so anyone can recompute which lanes were checked and
   re-check them with `lane_output`;
 - **timing:** `deadline_ms` within `max_deadline_ms(spec)`, non-negative integer
-  `timings_ms`, and the exec time within the deadline (`receipt.py:376-386`); see Timing for
+  `timings_ms`, and the exec time within the deadline (`receipt.py:384-394`); see Timing for
   what this does and does not prove;
-- **validity:** a window of more than zero and at most two hours (`receipt.py:388-391`),
-  containing `now` within five minutes of clock skew (`receipt.py:300-302`).
+- **validity:** a window of more than zero and at most two hours (`receipt.py:396-399`),
+  containing `now` within five minutes of clock skew (`receipt.py:308-310`).
 
 ### Hardware identity
 
 Validators pay one unit per distinct machine, so each kind of box has exactly one identity
-kind (`HARDWARE_ID_KINDS`, `receipt.py:60-64`; checked at `receipt.py:327-336`):
+kind (`HARDWARE_ID_KINDS`, `receipt.py:61-65`; checked at `receipt.py:335-344`):
 
 | `kind` | `tee_kind` | `hardware_id_kind` | raw id |
 |---|---|---|---|
 | `tee` | `tdx` | `ppid` | the 16-byte PPID from the PCK certificate in the TDX quote |
 | `tee` | `sev_snp` | `chip_id` | the 64-byte `CHIP_ID` from the SEV-SNP attestation report |
-| `bare_metal` | null | `probe_fingerprint` | `probe_fingerprint(address, port)`, below |
+| `bare_metal` | null | `probe_fingerprint` | 9 bytes: the probed IPv4 address, or IPv6 `/64`, tagged with its family (`probe_fingerprint(address)`, below) |
 
 `hardware_id = derive_hardware_id(hardware_id_kind, raw)`: SHA-256 over a domain tag, the id
-kind and the raw id (`receipt.py:169-185`). The prober takes the raw id from attestation
+kind and the raw id (`receipt.py:170-186`). The prober takes the raw id from attestation
 evidence it has verified itself, never from a field the box reports. An all-zero id (SEV-SNP
 with `MASK_CHIP_ID` set, or a missing PPID) is refused, since every such machine would share
 it. A receipt cannot name a TDX machine by chip id or the other way round, so one machine
 cannot appear under two identities.
 
 **Bare metal has no hardware root of trust**, so its identity is weaker. `probe_fingerprint`
-(`receipt.py:188-202`) hashes the IP address and TCP port the prober itself connected to and
-ran the challenge through (an IPv4 address in its IPv6-mapped form, so each endpoint has one
-fingerprint). The box does not choose it independently of where it is reached, and the same
-endpoint registered twice, under two box ids or two hotkeys, collapses to one identity. Its
-residual weakness: it names an endpoint, not a machine. One host behind two addresses, or two
-ports, has two fingerprints.
+(`receipt.py:189-210`) is derived from the address the prober itself connected to and ran the
+challenge through, never from anything the box reports: the whole IPv4 address, or only the
+`/64` of an IPv6 address, and never the port. An IPv4-mapped IPv6 address counts as its IPv4
+address, and the address family is part of the raw id, so an IPv4 address cannot collide with a
+`/64`. One host behind one address is therefore one identity however many ports, box ids,
+hotkeys or IPv6 interface ids it registers under
+(`test_one_host_on_many_ports_is_one_bare_metal_box`).
 
-**Two endpoints, one host.** Boxes are probed one at a time by default, so one host behind two
-registered endpoints can pass both probes at different times, each with the host's whole
-capacity. Mitigation, a rule for the prober: probe boxes that share an IP address (an IPv6
-`/64`) **concurrently**, so the host must prove the sum of the capacity it claims at once, and
-preferably also every box of one hotkey. What remains: a host reachable at two unrelated
-addresses under two hotkeys, probed at different times. The full fix is to start every box's
-challenge within one short window per round; until the prober does that, validators should
-treat bare-metal capacity as at most as trustworthy as one box per address.
+**It fails closed.** Honest boxes behind one address, such as several machines behind one NAT
+address or in one IPv6 `/64`, count as **one** box, and only one of them is paid. That is the
+conservative choice: a miner with several machines gives each its own public address (or its
+own `/64`). The residual weakness runs the other way: the id names an address, not a machine,
+so one host reachable at two unrelated addresses has two identities.
+
+**Two addresses, one host.** Boxes are probed one at a time by default, so one host behind two
+registered addresses can pass both probes at different times, each with the host's whole
+capacity. Mitigation, a rule for the prober: probe every box of one hotkey **concurrently**, so
+the host must prove the sum of the capacity it claims at once. That only works as far as the
+deadline forces the lanes to run in parallel, which today is within the residual inflation
+factor (see Timing). What remains: a host reachable at two unrelated addresses under two
+hotkeys, probed at different times. The full fix is to start every box's challenge within one
+short window per round; until the prober does that, validators should treat bare-metal capacity
+as at most as trustworthy as one box per address.
 
 ## Pricing (`pricing.py`)
 
@@ -197,12 +240,15 @@ Schema `cathedral_capacity_price_table_v1`, signed by an SN94 owner key that val
 for the box's kind, or zero when the box is below every consumer profile; a non-positive or
 non-integer shape is a `PriceTableError` (`pricing.py:78-89`).
 
-`load_price_table` (`pricing.py:190-244`) requires a timezone-aware `now` and a
-`minimum_sequence`: the highest sequence this validator has verified, so whoever serves tables
-cannot roll it back to an older signed one (`pricing.py:236-237`). A validator should also
-keep that table's `digest` (`table_digest`, `pricing.py:98-104`) and pass it as
-`pinned_digest`, so a different table signed at the same sequence is refused
-(`pricing.py:238-243`).
+`load_price_table` (`pricing.py:190-248`) requires a timezone-aware `now`, a
+`minimum_sequence` and a `pinned_digest`, all keyword-only with no default. `minimum_sequence`
+is the highest sequence this validator has verified, so whoever serves tables cannot roll it
+back to an older signed one (`pricing.py:240-241`). `pinned_digest` is that table's `digest`
+(`table_digest`, `pricing.py:98-104`), so a different table signed at the same sequence is
+refused (`pricing.py:242-247`). A validator passes an explicit `pinned_digest=None` only on its
+very first load, when it has verified no table yet; after that it keeps the sequence and digest
+of every table it accepts and passes both. Omitting the keyword is a `TypeError`, so the
+same-sequence check is never skipped by accident.
 
 ## Not here yet
 

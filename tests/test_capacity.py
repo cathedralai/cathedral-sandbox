@@ -117,12 +117,62 @@ def test_verify_refuses_a_sample_below_the_floor():
 
 def test_the_deadline_bound_follows_the_spec():
     small = ch.ChallengeSpec(SEED, 1, 1, 1)
-    assert ch.max_deadline_ms(small) == ch.DEADLINE_BASE_MS + 1
+    assert ch.max_deadline_ms(small) == ch.DEADLINE_STARTUP_MS + 1 == 10_001
     big = ch.spec_for(SEED, vcpus=8, memory_gib=32)
-    assert ch.max_deadline_ms(big) == ch.DEADLINE_BASE_MS + math.ceil(
+    assert ch.max_deadline_ms(big) == ch.DEADLINE_STARTUP_MS + math.ceil(
         big.steps * ch.DEADLINE_NS_PER_STEP / 1_000_000
     )
-    assert ch.max_deadline_ms(big) == 1_193_742  # a 32 GiB, 8 vCPU box: about 20 minutes
+    assert ch.max_deadline_ms(big) == 439_497  # a 32 GiB, 8 vCPU box: about 7.3 minutes
+
+
+def _native_exec_ms(spec, cores):
+    # The exec time of a native worker at the assumed speed on ``cores`` cores:
+    # blocks fill hashes plus steps hashes per lane, lanes time-sliced over the
+    # cores (never faster than one lane alone). Startup is left out, in the
+    # box's favour.
+    hashes = spec.lanes * (spec.blocks + spec.steps)
+    per_core = max(hashes / min(cores, spec.lanes), spec.blocks + spec.steps)
+    return per_core / ch.ASSUMED_NATIVE_HASHES_PER_SECOND * 1000
+
+
+def test_the_reviewers_inflated_vcpu_claim_no_longer_fits():
+    # 8 cores claiming 1024 vCPUs over 16 GiB finished in 95 s under the old
+    # 124 s cap. The lane floor now refuses the claim, and even the old spec's
+    # deadline bound is far below the 95 s the fake needs.
+    honest = ch.spec_for(SEED, vcpus=8, memory_gib=16)
+    assert 94_000 < _native_exec_ms(honest, 8) < 96_000
+    assert ch.max_deadline_ms(honest) > 2 * _native_exec_ms(honest, 8)  # honest fits, 2x spare
+    with pytest.raises(ch.ChallengeError, match="512 MiB of lane"):
+        ch.spec_for(SEED, vcpus=1024, memory_gib=16)
+    old_blocks = 16 * (1 << 30) * 4 // (5 * 1024) // ch.BLOCK_BYTES
+    old = ch.ChallengeSpec(SEED, 1024, old_blocks, 2 * old_blocks)
+    assert 94_000 < _native_exec_ms(old, 8) < 96_000
+    assert ch.max_deadline_ms(old) < 12_000  # was 124 194
+
+
+@pytest.mark.parametrize("cores, memory_gib", [(8, 16), (8, 64), (16, 64), (32, 128)])
+def test_a_vcpu_claim_inflates_at_most_the_documented_factor(cores, memory_gib):
+    # docs/CAPACITY.md, Timing: at the assumed native speed a box meets the
+    # deadline only while it claims at most about 2.6 times its cores.
+    fitting = [
+        vcpus
+        for vcpus in range(cores, min(ch.MAX_LANES, memory_gib * 2) + 1)
+        if vcpus <= ch.provable_vcpus(vcpus, memory_gib)
+        and _native_exec_ms(ch.spec_for(SEED, vcpus=vcpus, memory_gib=memory_gib), cores)
+        <= ch.max_deadline_ms(ch.spec_for(SEED, vcpus=vcpus, memory_gib=memory_gib))
+    ]
+    assert fitting[0] == cores  # the honest claim fits
+    assert fitting == list(range(cores, fitting[-1] + 1))
+    assert 2.2 * cores <= fitting[-1] <= 2.6 * cores
+
+
+def test_the_residual_inflation_factor_matches_the_constants():
+    native_ns_per_step = 1.5e9 / ch.ASSUMED_NATIVE_HASHES_PER_SECOND  # fill + steps, per step
+    assert 880 < native_ns_per_step < 890
+    assert 2.2 < ch.DEADLINE_NS_PER_STEP / native_ns_per_step < 2.3
+    smallest = ch.ChallengeSpec(SEED, 1, ch.MIN_LANE_BYTES // 32, ch.MIN_LANE_BYTES // 16)
+    assert 67_000 < ch.max_deadline_ms(smallest) - ch.DEADLINE_STARTUP_MS < 67_200
+    assert ch.max_deadline_ms(smallest) / _native_exec_ms(smallest, 1) < 2.6
 
 
 def test_the_sample_is_recomputable_from_the_receipt_fields():
@@ -154,9 +204,31 @@ def test_the_spec_proves_the_whole_claim_or_refuses_it():
         ch.spec_for(SEED, vcpus=1025, memory_gib=4096)
     with pytest.raises(ch.ChallengeError, match="per vCPU"):
         ch.spec_for(SEED, vcpus=1, memory_gib=11)  # more than one lane can hold
+    with pytest.raises(ch.ChallengeError, match="0.625 GiB"):
+        ch.spec_for(SEED, vcpus=2, memory_gib=1)  # less than the smallest lane
     for bad in (0, -1, True, 1.5):
         with pytest.raises(ch.ChallengeError):
             ch.spec_for(SEED, vcpus=bad, memory_gib=8)
+
+
+def test_the_lane_floor_admits_the_consumer_shapes_and_refuses_thin_claims():
+    # 0.625 GiB claimed per vCPU is exactly a 512 MiB lane.
+    assert ch.spec_for(SEED, vcpus=8, memory_gib=5).blocks * ch.BLOCK_BYTES == ch.MIN_LANE_BYTES
+    for vcpus, memory_gib in ((1, 4), (2, 4), (8, 32), (6, 24), (1024, 640)):  # SN120, SN81, tests
+        assert ch.spec_for(SEED, vcpus=vcpus, memory_gib=memory_gib).lanes == vcpus
+    for vcpus, memory_gib in ((9, 5), (1024, 639), (1024, 16), (1024, 2), (7, 4)):
+        with pytest.raises(ch.ChallengeError, match="512 MiB of lane"):
+            ch.spec_for(SEED, vcpus=vcpus, memory_gib=memory_gib)
+
+
+def test_a_cpu_heavy_claim_is_probed_at_what_can_be_proven():
+    assert ch.provable_vcpus(64, 32) == 51
+    assert ch.provable_vcpus(8, 32) == 8
+    assert ch.provable_vcpus(2048, 4096) == ch.MAX_LANES
+    assert ch.provable_vcpus(4, 1) == 1
+    ch.spec_for(SEED, vcpus=ch.provable_vcpus(64, 32), memory_gib=32)  # does not raise
+    with pytest.raises(ch.ChallengeError):
+        ch.spec_for(SEED, vcpus=ch.provable_vcpus(64, 32) + 1, memory_gib=32)
 
 
 def test_a_memory_heavy_claim_is_probed_at_what_can_be_proven():
@@ -225,7 +297,7 @@ DIGEST = bytes([3]) * 32
 def _body(**changes):
     vcpus = changes.pop("vcpus", 6)
     memory_gib = changes.pop("memory_gib", 24)
-    spec = changes.pop("challenge", ch.spec_for(SEED, vcpus=vcpus, memory_gib=memory_gib))
+    spec = changes.pop("challenge", None) or ch.spec_for(SEED, vcpus=vcpus, memory_gib=memory_gib)
     sample_count = changes.pop("sample_count", ch.required_samples(spec.lanes))
     lanes = ch.sample_lanes(spec, DIGEST, NONCE_A, sample_count)
     fields = dict(
@@ -304,7 +376,7 @@ def test_verify_receipt_requires_the_round(prober):
 def test_a_validator_can_recompute_the_sampled_lanes(prober):
     # A small real run standing in for a probe: the receipt's samples recompute.
     key, keys = prober
-    spec = ch.spec_for(SEED, vcpus=2, memory_gib=1)
+    spec = ch.spec_for(SEED, vcpus=2, memory_gib=4)
     small = ch.ChallengeSpec(spec.seed, spec.lanes, 64, 128)
     outputs = ch.run(small, workers=1)
     digest = ch.result_digest(small, outputs)
@@ -408,6 +480,34 @@ def test_a_loose_deadline_is_refused(prober):
                 _body(deadline_ms=loose, timings_ms={"create": 1, "exec": 10**14, "delete": 1}),
                 key,
             )
+
+
+def test_the_reviewers_inflated_receipt_is_refused(prober):
+    # The receipt round 2 signed and verified: 1024 vCPUs over 16 GiB, exec
+    # 95 000 ms. Honest 8 vCPUs over 16 GiB in the same 95 s still fits.
+    key, keys = prober
+    blocks = 16 * (1 << 30) * 4 // (5 * 1024) // ch.BLOCK_BYTES
+    old = ch.ChallengeSpec(SEED, 1024, blocks, 2 * blocks)
+    timings = {"create": 900, "exec": 95_000, "delete": 300}
+    with pytest.raises(receipt.ReceiptError, match="512 MiB of lane"):
+        receipt.sign_receipt(
+            _body(
+                vcpus=1024, memory_gib=16, challenge=old, deadline_ms=124_194, timings_ms=timings
+            ),
+            key,
+        )
+    with pytest.raises(receipt.ReceiptError, match="looser than|after its deadline"):
+        _check_deadline_only(old, 95_000, timings)
+    honest = _body(vcpus=8, memory_gib=16, deadline_ms=100_000, timings_ms=timings)
+    assert _verify(receipt.sign_receipt(honest, key), keys).vcpus == 8
+
+
+def _check_deadline_only(spec, deadline_ms, timings):
+    # The receipt's timing rule by itself, for a spec spec_for now refuses.
+    if deadline_ms > ch.max_deadline_ms(spec):
+        raise receipt.ReceiptError(f"deadline_ms is looser than {ch.max_deadline_ms(spec)}")
+    if timings["exec"] > deadline_ms:
+        raise receipt.ReceiptError("the challenge finished after its deadline")
 
 
 def test_the_sample_count_is_bound_to_the_lane_count(prober):
@@ -567,18 +667,33 @@ def test_hardware_ids_are_derived_one_way_per_kind():
             receipt.derive_hardware_id(kind, raw)
 
 
-def test_a_probe_fingerprint_names_the_endpoint_the_prober_reached():
-    v4 = receipt.probe_fingerprint("203.0.113.7", 8443)
-    assert v4 == receipt.probe_fingerprint("::ffff:203.0.113.7", 8443)
-    assert v4 != receipt.probe_fingerprint("203.0.113.7", 8444)
-    assert v4 != receipt.probe_fingerprint("203.0.113.8", 8443)
-    assert receipt.probe_fingerprint("2001:db8::1", 443) == receipt.probe_fingerprint(
-        "2001:0db8:0:0::1", 443
-    )
+def test_a_probe_fingerprint_names_the_address_the_prober_reached_not_the_port():
+    v4 = receipt.probe_fingerprint("203.0.113.5")
     assert re.fullmatch(r"[0-9a-f]{64}", v4)
-    for address, port in (("box.example", 443), ("203.0.113.7", 0), ("203.0.113.7", True)):
-        with pytest.raises(receipt.ReceiptError):
-            receipt.probe_fingerprint(address, port)
+    assert v4 == receipt.probe_fingerprint("::ffff:203.0.113.5")
+    assert v4 != receipt.probe_fingerprint("203.0.113.6")
+    # One IPv6 /64 is one id, whatever the interface id; another /64 is another.
+    v6 = receipt.probe_fingerprint("2001:db8:1:2::1")
+    assert v6 == receipt.probe_fingerprint("2001:0db8:0001:0002:ffff:ffff:ffff:ffff")
+    assert v6 != receipt.probe_fingerprint("2001:db8:1:3::1")
+    assert v6 != v4
+    # The family is part of the id: an IPv4 address never collides with a /64
+    # holding the same bytes, and ::/64 (all zeros) is still an id.
+    assert receipt.probe_fingerprint("203.0.113.5") != receipt.probe_fingerprint("cb00:7105::")
+    assert re.fullmatch(r"[0-9a-f]{64}", receipt.probe_fingerprint("::1"))
+    for bad in ("box.example", "203.0.113.5:8000", "", 3405803781, None, b"\xcb\x00qu"):
+        with pytest.raises(receipt.ReceiptError, match="probe address"):
+            receipt.probe_fingerprint(bad)
+
+
+def test_one_host_on_many_ports_is_one_bare_metal_box():
+    # Round 2: probe_fingerprint("203.0.113.5", 8000) != (..., 8001) gave one host
+    # N ids. The port is no longer an input, so N registrations collapse.
+    with pytest.raises(TypeError):
+        receipt.probe_fingerprint("203.0.113.5", 8000)
+    ids = {receipt.probe_fingerprint(address) for address in ("203.0.113.5",) * 8}
+    ids |= {receipt.probe_fingerprint(f"2001:db8:1:2::{n:x}") for n in range(1, 9)}
+    assert len(ids) == 2
 
 
 # -- pricing -----------------------------------------------------------------------
@@ -611,7 +726,7 @@ def owner():
 
 
 def _load(signed, keys, **changes):
-    args = dict(owner_keys=keys, now=NOW, minimum_sequence=3)
+    args = dict(owner_keys=keys, now=NOW, minimum_sequence=3, pinned_digest=None)
     args.update(changes)
     return pricing.load_price_table(signed, **args)
 
@@ -658,7 +773,7 @@ def test_load_price_table_requires_the_minimum_sequence(owner):
     key, keys = owner
     signed = pricing.sign_price_table(_table(), key)
     with pytest.raises(TypeError):
-        pricing.load_price_table(signed, owner_keys=keys, now=NOW)
+        pricing.load_price_table(signed, owner_keys=keys, now=NOW, pinned_digest=None)
     for bad in (None, 0, True, "3"):
         with pytest.raises(pricing.PriceTableError, match="minimum_sequence"):
             _load(signed, keys, minimum_sequence=bad)
@@ -675,7 +790,8 @@ def test_a_different_table_at_the_pinned_sequence_is_refused(owner):
         "bare_metal": {"vcpu_hour": 90_000, "gib_hour": 2_500},
     }
     swapped = pricing.sign_price_table(_table(rates=rates), key)
-    assert _load(swapped, keys).sequence == 3  # without the digest, only the sequence is pinned
+    # an explicit None (the very first load) pins only the sequence
+    assert _load(swapped, keys, pinned_digest=None).sequence == 3
     with pytest.raises(pricing.PriceTableError, match="differs from the one pinned"):
         _load(swapped, keys, pinned_digest=digest)
     newer = pricing.sign_price_table(_table(rates=rates, sequence=4), key)
@@ -683,6 +799,19 @@ def test_a_different_table_at_the_pinned_sequence_is_refused(owner):
     for bad in ("AB" * 32, "ab", 7):
         with pytest.raises(pricing.PriceTableError, match="pinned_digest"):
             _load(pinned, keys, pinned_digest=bad)
+
+
+def test_load_price_table_requires_the_pinned_digest(owner):
+    # Round 2: a default of None made the same-sequence check opt-in. The caller
+    # must now say which table it pinned, or None on the very first load.
+    key, keys = owner
+    signed = pricing.sign_price_table(_table(), key)
+    with pytest.raises(TypeError, match="pinned_digest"):
+        pricing.load_price_table(signed, owner_keys=keys, now=NOW, minimum_sequence=3)
+    first = pricing.load_price_table(
+        signed, owner_keys=keys, now=NOW, minimum_sequence=1, pinned_digest=None
+    )
+    assert first.digest == pricing.table_digest(signed)
 
 
 def test_a_table_with_an_impossible_date_or_a_naive_now_is_a_table_error(owner):

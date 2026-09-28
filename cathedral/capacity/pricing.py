@@ -193,13 +193,17 @@ def load_price_table(
     owner_keys: Mapping[str, Ed25519PublicKey],
     now: datetime,
     minimum_sequence: int,
-    pinned_digest: str | None = None,
+    pinned_digest: str | None,
 ) -> PriceTable:
     """Verify a signed table against the pinned owner keys and parse it. A table
     that is not yet effective, or older than ``minimum_sequence`` (the highest
-    this validator has already verified), is refused. With ``pinned_digest``
-    (that table's ``digest``), a table at ``minimum_sequence`` must be that same
-    table."""
+    this validator has already verified), is refused.
+
+    ``pinned_digest`` is required: the ``digest`` of the table this validator
+    verified at ``minimum_sequence``, so a different table signed at that same
+    sequence is refused. Pass ``None`` only on the very first load, when no
+    table has been verified yet; after that, keep and pass the digest of every
+    table accepted."""
 
     if not isinstance(now, datetime) or now.utcoffset() is None:
         raise PriceTableError("now must be a timezone-aware datetime")

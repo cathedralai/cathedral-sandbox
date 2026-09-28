@@ -1,9 +1,13 @@
 """Verifiable parallel-work challenge for a box's claimed CPU and memory.
 
-The prober runs this inside a sandbox it creates on a miner's box. It proves
-real parallel capacity: one memory-hard hash chain ("lane") per claimed vCPU,
-together holding 80% of the claimed memory, answered within a deadline the
-prober sets. A box with fewer cores or less memory cannot finish in time.
+The prober runs this inside a sandbox it creates on a miner's box: one
+memory-hard hash chain ("lane") per claimed vCPU, together holding 80% of the
+claimed memory, answered within a deadline the prober sets. What that proves
+today (docs/CAPACITY.md, "What a receipt proves today"): the sampled lanes were
+computed correctly for the claimed shape, and the deadline, which follows one
+lane's work, keeps a box from claiming more than about 2.6 times the vCPUs its
+cores can compute at the assumed native speed. It does not prove the exact
+core count, nor that all the memory was held at once.
 
 Protocol (commit, then sample):
 
@@ -45,12 +49,28 @@ MAX_STEPS = 1 << 29
 MEMORY_NUMERATOR, MEMORY_DENOMINATOR = 4, 5  # the lanes hold 80% of the claimed memory
 STEPS_PER_BLOCK = 2
 MIN_SAMPLES = 4
-# The most time a prober may allow for the challenge (max_deadline_ms): a fixed
-# base for creating the sandbox and starting the worker, plus a per-step budget
-# about three times the pure-Python reference on a slow core. Deliberately loose
-# until it is benchmarked (docs/CAPACITY.md).
-DEADLINE_BASE_MS = 120_000
-DEADLINE_NS_PER_STEP = 5_000
+# The smallest lane: spec_for refuses a claim of less memory per vCPU (512 MiB
+# of lane, 0.625 GiB claimed per vCPU). Otherwise a claim of many vCPUs over
+# little memory gets lanes so short that the per-lane deadline cannot tell them
+# from startup time.
+MIN_LANE_BYTES = 512 << 20
+# The most time the challenge's exec may take (max_deadline_ms). Creating the
+# sandbox is timed separately (timings_ms.create), so exec only gets:
+# - a startup allowance for the exec round trip, starting the worker and
+#   first-touching the lane memory, each about a second or less on a native
+#   worker. 10 s covers them several times over, and adds at most about 15% to
+#   the 67 s per-step budget of the smallest lane;
+# - a per-step budget. Assumed native speed: ASSUMED_NATIVE_HASHES_PER_SECOND
+#   SHA-256 per core (about 0.6 us per hash), with a lane's fill adding half as
+#   many hashes again as its steps, so about 0.89 us per step in all. 2 us per
+#   step is about 2.25 times that, headroom for slower cores and noisy hosts.
+# Because a box with fewer cores than lanes needs lanes / cores times as long,
+# the budget over the native per-step time is also how far a vCPU claim can be
+# inflated (about 2.3, up to 2.6 at the smallest lane). Not yet calibrated on
+# real CPUs (docs/CAPACITY.md, Timing).
+DEADLINE_STARTUP_MS = 10_000
+DEADLINE_NS_PER_STEP = 2_000
+ASSUMED_NATIVE_HASHES_PER_SECOND = 1_690_000
 
 
 class ChallengeError(ValueError):
@@ -104,8 +124,9 @@ class ChallengeSpec:
 def spec_for(seed: bytes, *, vcpus: int, memory_gib: int) -> ChallengeSpec:
     """The challenge for a claim: one lane per vCPU, together holding 80% of the
     claimed memory (the rest is left for the guest and the runtime). A claim the
-    challenge cannot prove (more than MAX_LANES vCPUs, or more memory per vCPU
-    than one lane can hold) is refused rather than proven only in part."""
+    challenge cannot prove (more than MAX_LANES vCPUs, more memory per vCPU than
+    one lane can hold, or less than MIN_LANE_BYTES of lane per vCPU) is refused
+    rather than proven only in part."""
 
     for name, value in (("vcpus", vcpus), ("memory_gib", memory_gib)):
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -113,8 +134,13 @@ def spec_for(seed: bytes, *, vcpus: int, memory_gib: int) -> ChallengeSpec:
     if vcpus > MAX_LANES:
         raise ChallengeError(f"a claim of more than {MAX_LANES} vCPUs cannot be proven")
     per_lane = memory_gib * (1 << 30) * MEMORY_NUMERATOR // (MEMORY_DENOMINATOR * vcpus)
+    if per_lane < MIN_LANE_BYTES:
+        raise ChallengeError(
+            f"a claim needs at least {MIN_LANE_BYTES >> 20} MiB of lane"
+            " (0.625 GiB of claimed memory) per vCPU"
+        )
     blocks = per_lane // BLOCK_BYTES
-    if blocks < 1 or blocks > MAX_BLOCKS:
+    if blocks > MAX_BLOCKS:
         raise ChallengeError("the claimed memory per vCPU is outside what one lane can prove")
     return ChallengeSpec(seed, vcpus, blocks, blocks * STEPS_PER_BLOCK)
 
@@ -127,6 +153,15 @@ def provable_memory_gib(vcpus: int, memory_gib: int) -> int:
     return max(0, min(memory_gib, limit))
 
 
+def provable_vcpus(vcpus: int, memory_gib: int) -> int:
+    """The most vCPUs ``spec_for`` can prove over ``memory_gib``: a box with
+    less than 0.625 GiB per vCPU is probed, and paid, for this many rather than
+    refused outright."""
+
+    limit = memory_gib * (1 << 30) * MEMORY_NUMERATOR // (MEMORY_DENOMINATOR * MIN_LANE_BYTES)
+    return max(0, min(vcpus, MAX_LANES, limit))
+
+
 def required_samples(lanes: int) -> int:
     """The fewest lanes a prober may recompute for a ``lanes``-lane challenge:
     every lane up to MIN_SAMPLES, then at least half of them."""
@@ -137,11 +172,14 @@ def required_samples(lanes: int) -> int:
 
 
 def max_deadline_ms(spec: ChallengeSpec) -> int:
-    """The loosest deadline a receipt may carry for ``spec``. Lanes run in
-    parallel, so the bound follows one lane's steps (the fill is half as many
-    hashes again, and is covered by the per-step budget)."""
+    """The loosest deadline a receipt may carry for ``spec``, and so the longest
+    its exec may take: a small startup allowance plus one lane's steps at the
+    per-step budget (the fill is half as many hashes again, and is covered by
+    the budget). Lanes are meant to run in parallel, so the bound follows one
+    lane; a box computing more lanes than it has cores takes proportionally
+    longer and misses it once the ratio passes the budget's headroom."""
 
-    return DEADLINE_BASE_MS + math.ceil(spec.steps * DEADLINE_NS_PER_STEP / 1_000_000)
+    return DEADLINE_STARTUP_MS + math.ceil(spec.steps * DEADLINE_NS_PER_STEP / 1_000_000)
 
 
 def lane_output(spec: ChallengeSpec, lane: int) -> bytes:
