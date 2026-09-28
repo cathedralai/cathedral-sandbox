@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import random
 import hashlib
 from unittest import mock
 import io
@@ -79,7 +80,9 @@ PUBLIC = (
 TRUSTED = {KEY_ID: PUBLIC}
 
 NETWORK = "finney"
-NETUID = 94
+# The subnet is deploy-time config with no default; draw one per run.
+NETUID = random.SystemRandom().randrange(1, 65_536)
+OTHER_NETUID = (NETUID % 65_535) + 1
 PROFILE = "cpu-tdx-sn94-v2"
 ENDPOINT = "https://8.8.8.8:8443"
 ENDPOINT_TWO = "https://9.9.9.9:8443"
@@ -169,6 +172,8 @@ def build_app(
         ),
         production_mode=production_mode,
         hotkey_enroll_limit=1000,
+        network=NETWORK,
+        netuid=NETUID,
     )
     return app, store, policy_path
 
@@ -459,8 +464,8 @@ def test_a_profile_outside_the_policy_is_refused(tmp_path: Path):
 
 def test_a_request_aimed_at_another_subnet_is_refused(tmp_path: Path):
     app, store, _ = build_app(tmp_path)
-    # Correctly signed, but for netuid 292.
-    status, body = call(app, v2_payload(netuid=292))
+    # Correctly signed, but for another netuid.
+    status, body = call(app, v2_payload(netuid=OTHER_NETUID))
     assert status == 403
     assert body["error"] == "request is bound to a different network or netuid"
     assert row(store, HOTKEY) is None
@@ -475,7 +480,9 @@ def test_a_v1_request_cannot_satisfy_a_policy_gated_service(tmp_path: Path):
     app, store, _ = build_app(tmp_path)
     ts = now_iso()
     nonce = "f6" * 16
-    message = canonical_enroll_payload(HOTKEY, ENDPOINT, nonce, ts)
+    message = canonical_enroll_payload(
+        HOTKEY, ENDPOINT, nonce, ts, network=NETWORK, netuid=NETUID
+    )
     status, _ = call(
         app,
         {
@@ -840,7 +847,13 @@ def test_a_pinned_policy_cannot_be_swapped_at_runtime(tmp_path: Path):
 def test_a_policy_and_an_allowlist_cannot_both_be_configured(tmp_path: Path):
     store = RegistryStore(str(tmp_path / "registry.sqlite"))
     with pytest.raises(ValueError, match="not both"):
-        RegistryApp(store, admission_policy=object(), coldkey_allowlist=object())
+        RegistryApp(
+            store,
+            admission_policy=object(),
+            coldkey_allowlist=object(),
+            network=NETWORK,
+            netuid=NETUID,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -992,6 +1005,8 @@ def test_production_allowlist_launch_still_requires_the_artifact_digest(
     argv = [
         "cathedral-enroll",
         "--production-mode",
+        "--network", NETWORK,
+        "--netuid", str(NETUID),
         "--registered-hotkeys-file", str(tmp_path / "registered.json"),
         "--enroll-allowlist", str(tmp_path / "allowlist.json"),
         "--enroll-allowlist-keys", str(tmp_path / "allowlist-keys.json"),
@@ -1209,6 +1224,8 @@ def test_production_refuses_a_non_loopback_bind_at_launch(
             "--db", str(tmp_path / "registry.sqlite"),
             "--production-mode",
             "--host", host,
+            "--network", NETWORK,
+            "--netuid", str(NETUID),
             "--registered-hotkeys-file", str(tmp_path / "registered.json"),
             "--enroll-allowlist", str(tmp_path / "allowlist.json"),
             "--enroll-allowlist-keys", str(tmp_path / "allowlist-keys.json"),

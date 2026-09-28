@@ -1,4 +1,4 @@
-"""Fixed entrypoint for the SN94 AMD SEV-SNP signed-fleet miner image.
+"""Fixed entrypoint for the AMD SEV-SNP signed-fleet miner image.
 
 The image has the same public deployment inputs as the TDX miner. It fixes the
 SNP collector, the pinned ``snpguest`` verifier, signed validator access, and
@@ -21,8 +21,6 @@ from cathedral.audit_miner_entrypoint import (
     VALIDATOR_ACCESS_SNAPSHOT,
     VALIDATOR_ACCESS_STATE,
     VALIDATOR_MINIMUM_STAKE_RAO,
-    VALIDATOR_NETUID,
-    VALIDATOR_NETWORK,
     WORKER_HOST,
     WORKER_PORT,
     DeploymentInputs,
@@ -71,9 +69,9 @@ def worker_command(inputs: DeploymentInputs, material: TLSMaterial) -> list[str]
         "--validator-minimum-stake-rao",
         str(VALIDATOR_MINIMUM_STAKE_RAO),
         "--validator-network",
-        VALIDATOR_NETWORK,
+        inputs.network,
         "--validator-netuid",
-        str(VALIDATOR_NETUID),
+        str(inputs.netuid),
         "--public-endpoint",
         inputs.public_endpoint,
         "--fleet-manifest",

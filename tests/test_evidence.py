@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import random
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -1260,6 +1261,10 @@ def test_production_refuses_the_private_host_bypass(tmp_path, capsys):
             "i.json",
             "--verifier-digest",
             "sha256:" + "d" * 64,
+            "--network",
+            "finney",
+            "--netuid",
+            str(random.SystemRandom().randrange(1, 65_536)),
             "--production",
             "--allow-private-evidence-host",
         ]

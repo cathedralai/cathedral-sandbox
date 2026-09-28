@@ -4,6 +4,7 @@ import base64
 import hashlib
 import ipaddress
 import os
+import random
 import sqlite3
 import socket
 import ssl
@@ -51,7 +52,8 @@ from cathedral.worker import WorkerServer
 NOW = datetime(2026, 8, 29, 5, 0, 0, tzinfo=UTC)
 SNAPSHOT_SEED = b"s" * 32
 NETWORK = "finney"
-NETUID = 94
+# The subnet is deploy-time config with no default; draw one per run.
+NETUID = random.SystemRandom().randrange(1, 65_536)
 FROZEN_WALLET_SIGNATURE = (
     "0DDT6KLO2IU3A4/D7kiWOdP16JSmXtHLkcFMSI/J1SL0qCLNS+zOo50oGylZTgQiECQ5vG4HxL8oCxyjs/4+iw=="
 )
@@ -771,7 +773,7 @@ def test_remote_fleet_parser_requires_attested_chain_axon_first(monkeypatch):
         "https://8.8.8.8:8081",
         WORKER_HOTKEY,
         validator_hotkey=VALIDATOR_HOTKEY,
-        validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
+        validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message), validator_network=NETWORK, validator_netuid=NETUID,
     )
     remote._trusted_binding = _binding()  # noqa: SLF001 - parser boundary fixture
     monkeypatch.setattr(
@@ -880,7 +882,7 @@ def test_signed_remote_discovers_fleet_and_runs_validation_work(tmp_path: Path, 
             WORKER_HOTKEY,
             ssl_context=client_context,
             validator_hotkey=VALIDATOR_HOTKEY,
-            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
+            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message), validator_network=NETWORK, validator_netuid=NETUID,
         )
         evidence = remote.fetch_evidence(os.urandom(32))
         remote.confirm_channel_binding(evidence)
@@ -935,7 +937,7 @@ def test_signed_access_negative_control_rejects_an_unsigned_development_worker(
             WORKER_HOTKEY,
             ssl_context=client_context,
             validator_hotkey=VALIDATOR_HOTKEY,
-            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
+            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message), validator_network=NETWORK, validator_netuid=NETUID,
         )
         evidence = remote.fetch_evidence(os.urandom(32))
         remote.confirm_channel_binding(evidence)
@@ -972,7 +974,7 @@ def test_signed_client_without_bearer_cannot_bootstrap_bearer_only_worker(
             WORKER_HOTKEY,
             ssl_context=client_context,
             validator_hotkey=VALIDATOR_HOTKEY,
-            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
+            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message), validator_network=NETWORK, validator_netuid=NETUID,
         )
         with pytest.raises(RemoteError, match="HTTP 401"):
             remote.fetch_evidence(os.urandom(32))
@@ -994,7 +996,7 @@ def test_signed_access_negative_control_rejects_header_presence_without_verifica
         "https://1.1.1.1:8081",
         WORKER_HOTKEY,
         validator_hotkey=VALIDATOR_HOTKEY,
-        validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
+        validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message), validator_network=NETWORK, validator_netuid=NETUID,
     )
     remote._trusted_binding = binding  # noqa: SLF001 - isolated negative control
 
@@ -1047,7 +1049,7 @@ def test_signed_remote_uses_singleton_only_for_legacy_fleet_404(tmp_path: Path):
             WORKER_HOTKEY,
             ssl_context=client_context,
             validator_hotkey=VALIDATOR_HOTKEY,
-            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
+            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message), validator_network=NETWORK, validator_netuid=NETUID,
         )
         evidence = remote.fetch_evidence(os.urandom(32))
         remote.confirm_channel_binding(evidence)
@@ -1103,7 +1105,7 @@ def test_signed_remote_never_treats_configured_worker_401_as_singleton(tmp_path:
             WORKER_HOTKEY,
             ssl_context=client_context,
             validator_hotkey=VALIDATOR_HOTKEY,
-            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
+            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message), validator_network=NETWORK, validator_netuid=NETUID,
         )
         qualified_evidence = qualified.fetch_evidence(os.urandom(32))
         qualified.confirm_channel_binding(qualified_evidence)
@@ -1114,7 +1116,7 @@ def test_signed_remote_never_treats_configured_worker_401_as_singleton(tmp_path:
             WORKER_HOTKEY,
             ssl_context=client_context,
             validator_hotkey=OTHER_VALIDATOR_HOTKEY,
-            validator_signer=lambda message: sr25519.sign(OTHER_VALIDATOR_PAIR, message),
+            validator_signer=lambda message: sr25519.sign(OTHER_VALIDATOR_PAIR, message), validator_network=NETWORK, validator_netuid=NETUID,
         )
         unqualified._trusted_binding = public._trusted_binding  # noqa: SLF001
 
@@ -1273,7 +1275,7 @@ def test_global_pool_still_bounds_signed_body_admission(
                 WORKER_HOTKEY,
                 ssl_context=client_context,
                 validator_hotkey=hotkey,
-                validator_signer=lambda message: sr25519.sign(pair, message),
+                validator_signer=lambda message: sr25519.sign(pair, message), validator_network=NETWORK, validator_netuid=NETUID,
             )
 
         def first_request() -> None:
@@ -1351,7 +1353,7 @@ def test_one_verified_validator_cannot_consume_every_signed_challenge_slot(
                 WORKER_HOTKEY,
                 ssl_context=client_context,
                 validator_hotkey=hotkey,
-                validator_signer=lambda message: sr25519.sign(pair, message),
+                validator_signer=lambda message: sr25519.sign(pair, message), validator_network=NETWORK, validator_netuid=NETUID,
             )
 
         first_validator = remote(VALIDATOR_HOTKEY, VALIDATOR_PAIR)
@@ -1499,7 +1501,7 @@ def test_signed_body_stall_is_limited_before_global_challenge_admission(
                 WORKER_HOTKEY,
                 ssl_context=client_context,
                 validator_hotkey=OTHER_VALIDATOR_HOTKEY,
-                validator_signer=lambda message: sr25519.sign(OTHER_VALIDATOR_PAIR, message),
+                validator_signer=lambda message: sr25519.sign(OTHER_VALIDATOR_PAIR, message), validator_network=NETWORK, validator_netuid=NETUID,
             )
             evidence = other.fetch_evidence(os.urandom(32))
             assert evidence.miner_hotkey == WORKER_HOTKEY
@@ -1578,7 +1580,7 @@ def test_fake_signed_header_on_unknown_path_never_occupies_validator_pool(
                 WORKER_HOTKEY,
                 ssl_context=client_context,
                 validator_hotkey=VALIDATOR_HOTKEY,
-                validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
+                validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message), validator_network=NETWORK, validator_netuid=NETUID,
             )
             evidence = validator.fetch_evidence(os.urandom(32))
             assert evidence.miner_hotkey == WORKER_HOTKEY
@@ -1681,7 +1683,7 @@ def test_public_legacy_bridge_cannot_starve_signed_validator_control(
             WORKER_HOTKEY,
             ssl_context=client_context,
             validator_hotkey=VALIDATOR_HOTKEY,
-            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
+            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message), validator_network=NETWORK, validator_netuid=NETUID,
         )
         evidence = validator.fetch_evidence(os.urandom(32))
         validator.confirm_channel_binding(evidence)
@@ -2571,3 +2573,17 @@ def test_two_slow_fresh_validators_do_not_lock_out_a_third(tmp_path: Path):
         assert not pool.penalized(VALIDATOR_HOTKEY)
         assert not pool.penalized(OTHER_VALIDATOR_HOTKEY)
         assert not pool.penalized(THIRD_VALIDATOR_HOTKEY)
+
+
+@pytest.mark.parametrize("missing", ["validator_network", "validator_netuid"])
+def test_remote_signed_access_has_no_default_network_or_netuid(missing: str) -> None:
+    subnet = {"validator_network": NETWORK, "validator_netuid": NETUID}
+    del subnet[missing]
+    with pytest.raises(ValueError, match="network and netuid"):
+        RemoteMiner(
+            "https://8.8.8.8:8081",
+            WORKER_HOTKEY,
+            validator_hotkey=VALIDATOR_HOTKEY,
+            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
+            **subnet,
+        )
