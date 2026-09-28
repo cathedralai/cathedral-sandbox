@@ -327,6 +327,7 @@ class EgressEnforcer:
         self._active = False
         self._error: str | None = "egress rules not applied yet"
         self._last_attempt: float | None = None
+        self._lapses = 0
         self._sandboxes: dict[str, SandboxEgress] = {}
 
     # -- state -----------------------------------------------------------
@@ -336,11 +337,19 @@ class EgressEnforcer:
         with self._lock:
             return self._active
 
+    @property
+    def lapses(self) -> int:
+        """How many times enforcement went from active to inactive."""
+
+        with self._lock:
+            return self._lapses
+
     def status(self) -> dict[str, object]:
         with self._lock:
             return {
                 "enforced": self._active,
                 "error": self._error,
+                "lapses": self._lapses,
                 "bridge": self.policy.bridge,
                 "nft_table": f"{NFT_FAMILY} {NFT_TABLE}",
                 "capped_sandboxes": len(self._sandboxes),
@@ -348,6 +357,8 @@ class EgressEnforcer:
 
     def _fail(self, message: str) -> bool:
         with self._lock:
+            if self._active:
+                self._lapses += 1
             self._active = False
             self._error = message
         return False
@@ -479,12 +490,21 @@ class EgressEnforcer:
         return True
 
     def maintain(self) -> None:
-        """Retry a failed apply at most every ``retry_seconds`` (reaper thread)."""
+        """Re-check the table on every reaper tick, and re-apply it when it is not active.
+
+        An active table is read back each tick. When that fails, enforcement
+        turns off (``lapses`` grows, so the executor ends its ``internet``
+        sandboxes) and the table is re-applied at once. A table that stays
+        inactive is re-applied at most every ``retry_seconds``.
+        """
 
         with self._lock:
-            if self._active:
-                return
+            active = self._active
             last = self._last_attempt
+        if active:
+            if not self.verify():
+                self.apply()
+            return
         if last is None or self._clock() - last >= self._retry_seconds:
             self.apply()
 

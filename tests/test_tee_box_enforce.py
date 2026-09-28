@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from cathedral.tee_box.egress import build_egress_policy
+from cathedral.tee_box.executor import ExecutorError, ExecutorRefused
 from cathedral.tee_box.enforce import (
     NFT_TABLE,
     EgressEnforcementError,
@@ -258,6 +259,7 @@ def test_apply_creates_the_bridge_network_applies_and_reads_back_the_table():
         "bridge": "cathsbx0",
         "nft_table": f"inet {NFT_TABLE}",
         "capped_sandboxes": 0,
+        "lapses": 0,
     }
     argvs = [argv for argv, _stdin in box.calls]
     assert argvs[1] == [
@@ -570,3 +572,149 @@ def test_real_nft_tc_and_ip_in_an_unprivileged_namespace(tmp_path: Path):
         "qdiscs_left": [],
         "verify_after_tamper": False,
     }
+
+
+# -- the executor and the real enforcer together ---------------------------
+
+
+def _wired(box_policy=None):
+    """A RunscExecutor using a real EgressEnforcer; docker and the tools are scripted."""
+
+    from tests.test_tee_box_executor import DIGEST, IMAGE, _Clock as _WallClock, _Docker
+
+    policy = box_policy or _policy()
+    box, docker, clock = _Box(policy), _Docker(), _Clock()
+    box.order = []  # every command, docker and tools, in order
+
+    def runner(argv, **kwargs):
+        box.order.append(argv)
+        tool = argv[0].rsplit("/", 1)[-1]
+        if tool != "docker" or argv[1] == "network" or "{{.NetworkSettings.SandboxKey}}" in argv:
+            return box(argv, **kwargs)
+        return docker(argv, **kwargs)
+
+    enforcer = EgressEnforcer(policy, runner=runner, clock=clock, retry_seconds=60)
+    from cathedral.tee_box.executor import RunscExecutor
+
+    executor = RunscExecutor(
+        policy, docker="docker", runner=runner, egress_enforcer=enforcer, clock=_WallClock()
+    )
+    executor.import_image(DIGEST, IMAGE.reference)
+    assert enforcer.apply()
+    return executor, enforcer, box, docker, clock
+
+
+def _internet(sid_digit: str = "1"):
+    from tests.test_tee_box_executor import _spec
+
+    return _spec("internet", sid="sbx-" + sid_digit * 24)
+
+
+def _tc_deletes(box):
+    return [argv for argv, _ in box.calls if argv[1:3] == ["qdisc", "del"]]
+
+
+def test_a_flushed_table_cuts_off_running_internet_sandboxes_on_the_next_tick():
+    executor, enforcer, box, docker, clock = _wired()
+    running = _internet()
+    executor.create(running)
+    name = "cathsbx-" + running.sandbox_id
+    assert name in docker.containers and enforcer.is_enforced(name)
+    # nftables.service reload: "nft flush ruleset". The re-apply fails too.
+    box.table = None
+    box.fail.add("nft:-f")
+    executor.sweep()
+    assert executor.get(running.sandbox_id) is None
+    assert name not in docker.containers
+    status = executor.egress_status()
+    assert status["enforced"] is False and status["error"]
+    assert (status["lapses"], status["ended_on_lapse"]) == (1, 1)
+    assert executor.network_modes == ("deny_all",)
+    with pytest.raises(ExecutorRefused):
+        executor.create(_internet("2"))
+    # The cap went only after the container was gone.
+    rm_at = box.order.index(["docker", "rm", "--force", name])
+    tc_at = box.order.index(_tc_deletes(box)[0])
+    assert rm_at < tc_at
+    # The reaper's re-apply restores new creates; the ended sandbox stays gone.
+    box.fail.clear()
+    clock.value += 60
+    executor.sweep()
+    assert executor.egress_status()["enforced"] is True
+    assert executor.network_modes == ("internet", "deny_all")
+    executor.create(_internet("2"))
+    assert executor.get(running.sandbox_id) is None
+    assert name not in docker.containers
+
+
+def test_a_tampered_table_ends_running_sandboxes_even_when_re_apply_succeeds():
+    executor, enforcer, box, docker, _clock = _wired()
+    executor.create(_internet())
+    deny_all = _internet("3")
+    deny_all = replace(deny_all, network="deny_all")
+    executor.create(deny_all)
+    box.table = _listing(box.policy, extra_rule=[{"accept": None}])
+    executor.sweep()
+    # Re-applied at once, but the sandbox ran unprotected for an unknown time.
+    assert enforcer.active and enforcer.lapses == 1
+    assert executor.get(_internet().sandbox_id) is None
+    assert executor.get(deny_all.sandbox_id) is not None  # no network, untouched
+    assert executor.egress_status()["ended_on_lapse"] == 1
+
+
+def test_a_lapse_whose_removal_fails_keeps_the_cap_and_retries():
+    executor, enforcer, box, docker, _clock = _wired()
+    running = _internet()
+    executor.create(running)
+    name = "cathsbx-" + running.sandbox_id
+    box.table = None
+    box.fail.add("nft:-f")
+    docker.rm_failures = 10**6
+    executor.sweep()
+    assert executor.get(running.sandbox_id) is not None
+    status = executor.egress_status()
+    assert status["lapse_removals_pending"] == 1
+    assert "could not be removed" in status["error"]
+    assert _tc_deletes(box) == [] and enforcer.status()["capped_sandboxes"] == 1
+    docker.rm_failures = 0
+    executor.sweep()
+    assert executor.get(running.sandbox_id) is None and name not in docker.containers
+    assert len(_tc_deletes(box)) == 2
+    assert executor.egress_status()["lapse_removals_pending"] == 0
+
+
+def test_a_delete_whose_remove_fails_keeps_the_bandwidth_cap():
+    executor, enforcer, box, docker, _clock = _wired()
+    running = _internet()
+    executor.create(running)
+    docker.rm_failures = 3  # rm, kill, rm all fail; the daemon still lists it
+    with pytest.raises(ExecutorError):
+        executor.delete(running.sandbox_id)
+    assert _tc_deletes(box) == []
+    assert enforcer.is_enforced("cathsbx-" + running.sandbox_id)
+    assert executor.delete(running.sandbox_id)
+    assert len(_tc_deletes(box)) == 2
+    assert not enforcer.is_enforced("cathsbx-" + running.sandbox_id)
+
+
+def test_the_sweep_detaches_an_orphan_only_once_it_is_gone():
+    executor, enforcer, box, docker, _clock = _wired()
+    running = _internet()
+    executor.create(running)
+    name = "cathsbx-" + running.sandbox_id
+    executor._forget(running.sandbox_id)  # the table lost it: now an orphan
+    docker.rm_failures = 10**6
+    assert executor.sweep() == 1
+    assert _tc_deletes(box) == [] and enforcer.status()["capped_sandboxes"] == 1
+    docker.rm_failures = 0
+    assert executor.sweep() == 0 and name not in docker.containers
+    assert len(_tc_deletes(box)) == 2
+
+
+def test_the_reaper_reads_the_table_back_every_tick():
+    executor, enforcer, box, docker, _clock = _wired()
+    lists = lambda: sum(1 for argv, _ in box.calls if argv[1] == "--json")  # noqa: E731
+    before = lists()
+    executor.sweep()
+    executor.sweep()
+    assert lists() == before + 2

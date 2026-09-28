@@ -310,6 +310,7 @@ class _Enforcer:
         self.attached: list[str] = []
         self.detached: list[str] = []
         self.maintained = 0
+        self.lapses = 0
 
     @property
     def active(self) -> bool:
@@ -355,7 +356,7 @@ def test_internet_needs_live_egress_enforcement():
     enforced.create(_spec("internet"))
     assert enforcer.attached == ["cathsbx-sbx-" + "1" * 24]
     assert enforced.network_modes == ("internet", "deny_all")
-    # Delete removes the sandbox's cap before the container.
+    # Delete removes the sandbox's cap once the container is gone.
     enforced.delete(_spec().sandbox_id)
     assert enforcer.detached == ["cathsbx-sbx-" + "1" * 24]
     assert runner.calls[-1][0][:3] == ["docker", "rm", "--force"]
@@ -374,7 +375,8 @@ def test_internet_is_refused_while_the_table_is_not_active():
     executor = _executor(runner, egress_enforcer=enforcer)
     executor.import_image(DIGEST, IMAGE.reference)
     assert executor.network_modes == ("deny_all",)
-    assert executor.egress_status() == {"enforced": False, "error": "down"}
+    status = executor.egress_status()
+    assert (status["enforced"], status["error"]) == (False, "down")
     with pytest.raises(ExecutorRefused):
         executor.create(_spec("internet"))
     assert [call[0][1] for call in runner.calls] == ["pull"]  # no docker run

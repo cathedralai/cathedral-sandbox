@@ -198,6 +198,8 @@ class EgressControl(Protocol):
 
     @property
     def active(self) -> bool: ...
+    @property
+    def lapses(self) -> int: ...
     def verify(self) -> bool: ...
     def attach(self, container: str) -> object: ...
     def is_enforced(self, container: str) -> bool: ...
@@ -621,6 +623,11 @@ class RunscExecutor(_Table):
         self._creating: set[str] = set()
         # Container name -> time before which it stays pending even if absent.
         self._pending_cleanup: dict[str, float] = {}
+        # Egress lapses already acted on, and internet sandboxes still to end
+        # because the rules lapsed while they ran.
+        self._seen_lapses = 0 if egress_enforcer is None else egress_enforcer.lapses
+        self._lapse_cut: set[str] = set()
+        self._ended_on_lapse = 0
 
     @property
     def network_modes(self) -> tuple[str, ...]:
@@ -632,7 +639,16 @@ class RunscExecutor(_Table):
     def egress_status(self) -> dict[str, object]:
         if self.egress_enforcer is None:
             return {"enforced": False, "error": "no egress enforcer is configured"}
-        return self.egress_enforcer.status()
+        status = dict(self.egress_enforcer.status())
+        with self._lock:
+            pending = len(self._lapse_cut)
+            status["ended_on_lapse"] = self._ended_on_lapse
+        status["lapse_removals_pending"] = pending
+        if pending:
+            status["error"] = (
+                f"{pending} internet sandbox(es) could not be removed after the egress rules lapsed"
+            )
+        return status
 
     # -- argv construction (pure, unit-tested) ---------------------------
 
@@ -875,7 +891,7 @@ class RunscExecutor(_Table):
                 return True
         return not self._exists(name)
 
-    def _abandon(self, name: str, *, timed_out: bool) -> None:
+    def _abandon(self, name: str, *, timed_out: bool) -> bool:
         """Remove a container whose create failed; keep it pending if unsure."""
 
         removed = self._remove(name)
@@ -883,10 +899,13 @@ class RunscExecutor(_Table):
             grace = PENDING_CLEANUP_GRACE_SECONDS if timed_out else 0.0
             with self._lock:
                 self._pending_cleanup[name] = self._clock() + grace
+        return removed
 
     def create(self, spec: SandboxSpec) -> SandboxInfo:
         enforcer = self.egress_enforcer
+        lapses = None if enforcer is None else enforcer.lapses
         if spec.network == "internet" and (enforcer is None or not enforcer.verify()):
+            self.end_lapsed_sandboxes()
             raise ExecutorRefused("internet egress is not enforced on this box")
         if self.get_image(spec.image.digest) is None:
             raise NotFound
@@ -911,14 +930,19 @@ class RunscExecutor(_Table):
                 except Exception:
                     enforced = False
                 if not enforced:
-                    # Remove the cap record (if any) before the container.
-                    try:
-                        enforcer.detach(name)
-                    except Exception:
-                        pass
-                    self._abandon(name, timed_out=False)
+                    # The cap goes only once the container is gone; a container
+                    # left pending is removed, then detached, by the sweep.
+                    if self._abandon(name, timed_out=False):
+                        self._detach(name)
                     raise ExecutorError("egress enforcement failed")
-            return self._record(spec)
+            info = self._record(spec)
+            if spec.network == "internet" and enforcer is not None and enforcer.lapses != lapses:
+                # The rules lapsed while this sandbox started: end it too.
+                with self._lock:
+                    self._lapse_cut.add(spec.sandbox_id)
+                self.end_lapsed_sandboxes()
+                raise ExecutorError("egress enforcement failed")
+            return info
         finally:
             with self._lock:
                 self._creating.discard(spec.sandbox_id)
@@ -934,13 +958,50 @@ class RunscExecutor(_Table):
         if self.get(sandbox_id) is None:
             return False
         name = self.container_name(sandbox_id)
-        self._detach(name)
+        # The cap stays until the container is confirmed gone: a failed
+        # remove leaves a running sandbox that must stay capped.
         if not self._remove(name):
             raise ExecutorError("sandbox delete failed")
+        self._detach(name)
+        with self._lock:
+            self._lapse_cut.discard(sandbox_id)
         return self._forget(sandbox_id)
 
+    def end_lapsed_sandboxes(self) -> int:
+        """End every ``internet`` sandbox that ran while the egress rules lapsed.
+
+        When the enforcer reports a new lapse (its table failed a read-back),
+        every ``internet`` sandbox running at that moment is removed, as a
+        delete would, rather than disconnected: removal does not depend on how
+        runsc treats a vanished interface. Re-applying the table does not bring
+        them back. Removals that fail are retried on every call. Returns how
+        many are still waiting.
+        """
+
+        enforcer = self.egress_enforcer
+        if enforcer is None:
+            return 0
+        with self._lock:
+            lapses = enforcer.lapses
+            if lapses != self._seen_lapses:
+                self._seen_lapses = lapses
+                self._lapse_cut.update(
+                    sid for sid, info in self._sandboxes.items() if info.spec.network == "internet"
+                )
+            pending = sorted(self._lapse_cut)
+        for sandbox_id in pending:
+            try:
+                ended = self.delete(sandbox_id)
+            except ExecutorError:
+                continue
+            with self._lock:
+                self._lapse_cut.discard(sandbox_id)
+                self._ended_on_lapse += int(ended)
+        with self._lock:
+            return len(self._lapse_cut)
+
     def _detach(self, name: str) -> None:
-        """Drop the sandbox's tc cap. Removing the container removes its veth anyway."""
+        """Drop the sandbox's tc cap, once its container is gone."""
 
         if self.egress_enforcer is not None:
             try:
@@ -961,6 +1022,7 @@ class RunscExecutor(_Table):
                 self.egress_enforcer.maintain()
             except Exception:
                 pass
+            self.end_lapsed_sandboxes()
         result = self._control(self.list_argv(), self._control_timeout)
         if result.returncode != 0:
             raise ExecutorError("container listing failed")
@@ -975,8 +1037,9 @@ class RunscExecutor(_Table):
         remaining = 0
         now = self._clock()
         for name in sorted((listed | set(pending)) - keep):
-            self._detach(name)
             gone = self._remove(name) if name in listed else not self._exists(name)
+            if gone:
+                self._detach(name)
             if gone and now >= pending.get(name, 0.0):
                 with self._lock:
                     self._pending_cleanup.pop(name, None)
