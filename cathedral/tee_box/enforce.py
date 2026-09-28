@@ -40,6 +40,10 @@ from cathedral.tee_box.egress import EgressPolicy, EgressPolicyError, _check_int
 
 NFT_FAMILY = "inet"
 NFT_TABLE = "cathedral_tee_box_egress"
+# While sandboxes from a lapse are being removed, this separate table drops
+# every packet to or from the sandbox bridge. It does not depend on the
+# egress table that just lapsed, and it is one nft call with no docker.
+NFT_QUARANTINE_TABLE = "cathedral_tee_box_lapse"
 NETWORK_LABEL = "org.cathedral.tee-box.network"
 COMMAND_TIMEOUT_SECONDS = 15.0
 RETRY_SECONDS = 60.0
@@ -328,14 +332,23 @@ class EgressEnforcer:
         self._error: str | None = "egress rules not applied yet"
         self._last_attempt: float | None = None
         self._lapses = 0
+        self._quarantined = False
+        self._quarantine_error: str | None = None
         self._sandboxes: dict[str, SandboxEgress] = {}
 
     # -- state -----------------------------------------------------------
 
     @property
     def active(self) -> bool:
+        """The egress table verified, and the bridge is not quarantined."""
+
         with self._lock:
-            return self._active
+            return self._active and not self._quarantined
+
+    @property
+    def quarantined(self) -> bool:
+        with self._lock:
+            return self._quarantined
 
     @property
     def lapses(self) -> int:
@@ -346,10 +359,15 @@ class EgressEnforcer:
 
     def status(self) -> dict[str, object]:
         with self._lock:
+            error = self._error
+            if error is None and self._quarantined:
+                error = "the sandbox bridge is cut off while lapsed sandboxes are removed"
             return {
-                "enforced": self._active,
-                "error": self._error,
+                "enforced": self._active and not self._quarantined,
+                "error": error,
                 "lapses": self._lapses,
+                "quarantined": self._quarantined,
+                "quarantine_error": self._quarantine_error,
                 "bridge": self.policy.bridge,
                 "nft_table": f"{NFT_FAMILY} {NFT_TABLE}",
                 "capped_sandboxes": len(self._sandboxes),
@@ -365,7 +383,7 @@ class EgressEnforcer:
 
     def is_enforced(self, container: str) -> bool:
         with self._lock:
-            return self._active and container in self._sandboxes
+            return self._active and not self._quarantined and container in self._sandboxes
 
     # -- commands --------------------------------------------------------
 
@@ -476,6 +494,11 @@ class EgressEnforcer:
         return self.verify()
 
     def verify(self) -> bool:
+        """Read the table back; true only when it matches and the bridge is not quarantined."""
+
+        return self._verify_table() and not self.quarantined
+
+    def _verify_table(self) -> bool:
         """Read the table back and compare it; any difference turns enforcement off."""
 
         try:
@@ -503,7 +526,7 @@ class EgressEnforcer:
             active = self._active
             last = self._last_attempt
         if active:
-            if not self.verify():
+            if not self._verify_table():
                 # Act on the lapse before the re-apply, which may wait on docker.
                 if on_lapse is not None:
                     on_lapse()
@@ -511,6 +534,64 @@ class EgressEnforcer:
             return
         if last is None or self._clock() - last >= self._retry_seconds:
             self.apply()
+
+    # -- quarantine --------------------------------------------------------
+
+    def quarantine_ruleset(self) -> bytes:
+        bridge = self.policy.bridge
+        table = f"{NFT_FAMILY} {NFT_QUARANTINE_TABLE}"
+        return (
+            f"table {table}\n"
+            f"delete table {table}\n"
+            f"table {table} {{\n"
+            "  chain forward {\n"
+            "    type filter hook forward priority -2; policy accept;\n"
+            f'    iifname "{bridge}" counter drop\n'
+            f'    oifname "{bridge}" counter drop\n'
+            "  }\n"
+            "  chain input {\n"
+            "    type filter hook input priority -2; policy accept;\n"
+            f'    iifname "{bridge}" counter drop\n'
+            "  }\n"
+            "}\n"
+        ).encode("ascii")
+
+    def quarantine(self) -> bool:
+        """Drop all traffic to and from the sandbox bridge; idempotent. True when applied.
+
+        While quarantined, ``active`` is false: no ``internet`` sandbox is
+        created or counted as enforced until ``lift_quarantine``.
+        """
+
+        with self._lock:
+            self._quarantined = True
+        try:
+            self._ok(self.nft_apply_argv(), "nft quarantine", stdin=self.quarantine_ruleset())
+        except EgressEnforcementError as exc:
+            with self._lock:
+                self._quarantine_error = str(exc)
+            return False
+        with self._lock:
+            self._quarantine_error = None
+        return True
+
+    def lift_quarantine(self) -> bool:
+        """Remove the quarantine table. True when it is gone."""
+
+        try:
+            result = self._run([self.nft, "delete", "table", NFT_FAMILY, NFT_QUARANTINE_TABLE])
+        except EgressEnforcementError as exc:
+            with self._lock:
+                self._quarantine_error = str(exc)
+            return False
+        if result.returncode != 0 and b"No such file" not in (result.stderr or b""):
+            with self._lock:
+                self._quarantine_error = "nft could not remove the quarantine"
+            return False
+        with self._lock:
+            self._quarantined = False
+            self._quarantine_error = None
+        return True
 
     # -- per-sandbox caps ------------------------------------------------
 

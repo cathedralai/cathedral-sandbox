@@ -19,8 +19,9 @@ from pathlib import Path
 import pytest
 
 from cathedral.tee_box.egress import build_egress_policy
-from cathedral.tee_box.executor import ExecutorError, ExecutorRefused
+from cathedral.tee_box.executor import ExecRequest, ExecutorError, ExecutorRefused, NetworkLapsed
 from cathedral.tee_box.enforce import (
+    NFT_QUARANTINE_TABLE,
     NFT_TABLE,
     EgressEnforcementError,
     EgressEnforcer,
@@ -141,6 +142,7 @@ class _Box:
         self.raise_on: set[str] = set()  # verbs whose command times out
         self.tamper_after_apply = False
         self.police_rate = f"{policy.bandwidth_mbit}Mbit"
+        self.quarantine_table = False
 
     def __call__(self, argv, **kwargs):
         assert kwargs["shell"] is False and kwargs["check"] is False
@@ -174,6 +176,18 @@ class _Box:
         raise AssertionError(argv)
 
     def _nft(self, argv, stdin):
+        quarantine = (
+            f"table inet {NFT_QUARANTINE_TABLE}\ndelete table inet {NFT_QUARANTINE_TABLE}\n"
+        )
+        if argv[1:] == ["-f", "-"] and stdin.decode().startswith(quarantine):
+            assert 'iifname "cathsbx0" counter drop' in stdin.decode()
+            self.quarantine_table = True
+            return self._done(argv)
+        if argv[1:] == ["delete", "table", "inet", NFT_QUARANTINE_TABLE]:
+            if not self.quarantine_table:
+                return self._done(argv, code=1, stderr=b"Error: No such file or directory")
+            self.quarantine_table = False
+            return self._done(argv)
         if argv[1:] == ["-f", "-"]:
             text = stdin.decode()
             assert text.startswith(f"table inet {NFT_TABLE}\ndelete table inet {NFT_TABLE}\n")
@@ -260,6 +274,8 @@ def test_apply_creates_the_bridge_network_applies_and_reads_back_the_table():
         "nft_table": f"inet {NFT_TABLE}",
         "capped_sandboxes": 0,
         "lapses": 0,
+        "quarantined": False,
+        "quarantine_error": None,
     }
     argvs = [argv for argv, _stdin in box.calls]
     assert argvs[1] == [
@@ -537,6 +553,14 @@ _REAL_SCRIPT = textwrap.dedent(
         capture_output=True, check=True).stdout) if q["kind"] in ("tbf", "ingress")]
     sh(tools["nft"] + " add rule inet cathedral_tee_box_egress forward accept")
     out["verify_after_tamper"] = enforcer.verify()
+    out["quarantined"] = enforcer.quarantine()
+    out["quarantine_listed"] = subprocess.run(
+        [tools["nft"], "list", "table", "inet", "cathedral_tee_box_lapse"],
+        capture_output=True).returncode == 0
+    out["lifted"] = enforcer.lift_quarantine()
+    out["quarantine_gone"] = subprocess.run(
+        [tools["nft"], "list", "table", "inet", "cathedral_tee_box_lapse"],
+        capture_output=True).returncode != 0
     print(json.dumps(out))
     """
 )
@@ -571,6 +595,10 @@ def test_real_nft_tc_and_ip_in_an_unprivileged_namespace(tmp_path: Path):
         "detached": True,
         "qdiscs_left": [],
         "verify_after_tamper": False,
+        "quarantined": True,
+        "quarantine_listed": True,
+        "lifted": True,
+        "quarantine_gone": True,
     }
 
 
@@ -663,7 +691,14 @@ def test_a_tampered_table_ends_running_sandboxes_even_when_re_apply_succeeds():
     box.table = _listing(box.policy, extra_rule=[{"accept": None}])
     _tick(executor)
     # Re-applied at once, but the sandbox ran unprotected for an unknown time.
-    assert enforcer.active and enforcer.lapses == 1
+    assert enforcer.lapses == 1 and enforcer._verify_table()
+    # The bridge was quarantined, and lifted once nothing lapsed was left.
+    assert any(
+        argv[1:] == ["-f", "-"] and stdin.startswith(b"table inet " + NFT_QUARANTINE_TABLE.encode())
+        for argv, stdin in box.calls
+    )
+    executor.check_egress()
+    assert not box.quarantine_table and enforcer.active
     assert executor.get(_internet().sandbox_id) is None
     assert executor.get(deny_all.sandbox_id) is not None  # no network, untouched
     assert executor.egress_status()["ended_on_lapse"] == 1
@@ -729,18 +764,136 @@ def test_the_egress_check_reads_the_table_back_every_tick():
 
 def test_a_lapse_starts_removals_before_the_slow_re_apply():
     executor, enforcer, box, docker, _clock = _wired()
+    sid = _internet().sandbox_id
     executor.create(_internet())
     box.table = None
-    order = []
+    marked_at_reapply = []
     original = box._docker
 
     def docker_during_reapply(argv, stdin):
         if argv[1:3] == ["network", "inspect"]:
-            order.append(("re-apply", executor.egress_status()["lapse_removals_pending"]))
+            marked_at_reapply.append(
+                (sid in executor._lapse_cut or executor.get(sid) is None, box.quarantine_table)
+            )
         return original(argv, stdin)
 
     box._docker = docker_during_reapply
-    real_end = executor.end_lapsed_sandboxes
-    executor.end_lapsed_sandboxes = lambda **kw: order.append(("end",)) or real_end(**kw)
     executor.check_egress()
-    assert order[0] == ("end",) and order[1][0] == "re-apply"
+    assert marked_at_reapply and marked_at_reapply[0] == (True, True)
+
+
+def test_a_flush_found_by_a_create_marks_running_sandboxes_before_any_re_apply(monkeypatch):
+    executor, enforcer, box, docker, _clock = _wired()
+    running = _internet()
+    executor.create(running)
+    starting = _internet("2")
+    original = type(docker).__call__
+
+    def flush_during_run(self, argv, **kwargs):
+        result = original(self, argv, **kwargs)
+        if argv[1] == "run" and argv[argv.index("--name") + 1] == "cathsbx-" + starting.sandbox_id:
+            box.table = None  # nft flush ruleset while this create's docker run is in flight
+            self.rm_failures = 10**6  # removals stay pending, to observe the refusal
+        return result
+
+    monkeypatch.setattr(type(docker), "__call__", flush_during_run)
+    box.order.clear()
+    with pytest.raises(ExecutorError, match="egress"):
+        executor.create(starting)
+    # Found by attach's read-back: the running sandbox is refused and the bridge
+    # quarantined at once, without waiting for an egress tick or a re-apply.
+    with pytest.raises(NetworkLapsed):
+        executor.exec(running.sandbox_id, ExecRequest(("true",), timeout_seconds=5))
+    assert box.quarantine_table
+    assert not any(argv[1:3] == ["network", "inspect"] for argv in box.order)
+    docker.rm_failures = 0
+    executor.end_lapsed_sandboxes(wait=True)
+    assert executor.get(running.sandbox_id) is None
+
+
+def test_the_quarantine_holds_until_every_lapsed_sandbox_is_gone():
+    executor, enforcer, box, docker, clock = _wired()
+    running = _internet()
+    executor.create(running)
+    box.table = None
+    docker.rm_failures = 10**6
+    _tick(executor)
+    assert box.quarantine_table and executor.get(running.sandbox_id) is not None
+    # The table is re-applied, but the bridge stays cut and internet refused.
+    clock.value += 60
+    _tick(executor)
+    assert enforcer._verify_table() and executor.network_modes == ("deny_all",)
+    with pytest.raises(ExecutorRefused):
+        executor.create(_internet("2"))
+    status = executor.egress_status()
+    assert status["enforced"] is False and status["quarantined"] is True
+    # Someone flushes the quarantine too: the next check puts it back.
+    box.quarantine_table = False
+    _tick(executor)
+    assert box.quarantine_table
+    docker.rm_failures = 0
+    _tick(executor)
+    assert executor.get(running.sandbox_id) is None
+    executor.check_egress()
+    assert not box.quarantine_table and executor.network_modes == ("internet", "deny_all")
+    executor.create(_internet("2"))
+
+
+def test_a_quarantine_that_fails_is_reported_and_removal_still_runs():
+    executor, enforcer, box, docker, _clock = _wired()
+    running = _internet()
+    executor.create(running)
+    box.table = None
+    box.fail.add("nft:-f")  # quarantine and re-apply both fail
+    docker.rm_failures = 10**6
+    _tick(executor)
+    status = executor.egress_status()
+    assert status["quarantine_error"] == "nft quarantine failed"
+    assert status["lapse_removals_pending"] == 1
+    with pytest.raises(NetworkLapsed):
+        executor.stat(running.sandbox_id, "/")
+    docker.rm_failures = 0
+    _tick(executor)
+    assert executor.get(running.sandbox_id) is None
+
+
+def test_the_quarantine_drops_everything_on_the_bridge():
+    enforcer, _box = _enforcer()
+    assert enforcer.quarantine_ruleset().decode() == (
+        f"table inet {NFT_QUARANTINE_TABLE}\n"
+        f"delete table inet {NFT_QUARANTINE_TABLE}\n"
+        f"table inet {NFT_QUARANTINE_TABLE} {{\n"
+        "  chain forward {\n"
+        "    type filter hook forward priority -2; policy accept;\n"
+        '    iifname "cathsbx0" counter drop\n'
+        '    oifname "cathsbx0" counter drop\n'
+        "  }\n"
+        "  chain input {\n"
+        "    type filter hook input priority -2; policy accept;\n"
+        '    iifname "cathsbx0" counter drop\n'
+        "  }\n"
+        "}\n"
+    )
+
+
+def test_a_lapse_recorded_elsewhere_is_marked_before_the_check_re_applies():
+    executor, enforcer, box, docker, _clock = _wired()
+    sid = _internet().sandbox_id
+    executor.create(_internet())
+    box.table = None
+    assert enforcer.verify() is False  # another caller's read-back records the lapse
+    marked_at_reapply = []
+    original = box._docker
+
+    def docker_during_reapply(argv, stdin):
+        if argv[1:3] == ["network", "inspect"]:
+            marked_at_reapply.append(sid in executor._lapse_cut or executor.get(sid) is None)
+        return original(argv, stdin)
+
+    box._docker = docker_during_reapply
+    docker.rm_failures = 10**6
+    _clock.value += 60  # the re-apply is due on this check
+    executor.check_egress()
+    assert marked_at_reapply == [True]
+    docker.rm_failures = 0
+    executor.end_lapsed_sandboxes(wait=True)

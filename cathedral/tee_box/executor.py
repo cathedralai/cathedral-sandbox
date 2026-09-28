@@ -209,6 +209,10 @@ class EgressControl(Protocol):
     def active(self) -> bool: ...
     @property
     def lapses(self) -> int: ...
+    @property
+    def quarantined(self) -> bool: ...
+    def quarantine(self) -> bool: ...
+    def lift_quarantine(self) -> bool: ...
     def verify(self) -> bool: ...
     def attach(self, container: str) -> object: ...
     def is_enforced(self, container: str) -> bool: ...
@@ -950,6 +954,8 @@ class RunscExecutor(_Table):
                     # left pending is removed, then detached, by the sweep.
                     if self._abandon(name, timed_out=False):
                         self._detach(name)
+                    # attach's own read-back may have found a lapse.
+                    self.end_lapsed_sandboxes()
                     raise ExecutorError("egress enforcement failed")
             info = self._record(spec)
             if spec.network == "internet" and enforcer is not None and enforcer.lapses != lapses:
@@ -996,6 +1002,9 @@ class RunscExecutor(_Table):
         enforcer = self.egress_enforcer
         if enforcer is None:
             return 0
+        # A lapse may already be recorded (a create's attach or verify found
+        # it): mark and cut those sandboxes before any re-apply waits on docker.
+        self.end_lapsed_sandboxes()
         try:
             enforcer.maintain(on_lapse=self.end_lapsed_sandboxes)
         except Exception:
@@ -1011,6 +1020,12 @@ class RunscExecutor(_Table):
         runsc treats a vanished interface. Re-applying the table does not bring
         them back. Until its removal succeeds, every call on such a sandbox is
         refused (``NetworkLapsed``).
+
+        While any is waiting, the enforcer's quarantine table drops all
+        traffic on the sandbox bridge (one nft call, no docker), so a lapsed
+        sandbox loses its network before its container is removed; the
+        quarantine is lifted once none is left, and ``internet`` creates are
+        refused until then.
 
         Removals run on their own threads, at most ``LAPSE_REMOVAL_WORKERS``
         at once, each docker call bounded by the lapse call timeout, so one
@@ -1031,6 +1046,18 @@ class RunscExecutor(_Table):
                 self._lapse_cut.update(
                     sid for sid, info in self._sandboxes.items() if info.spec.network == "internet"
                 )
+            waiting = bool(self._lapse_cut or self._lapse_inflight)
+        # Cut the bridge off while any lapsed sandbox still runs (re-applied
+        # each call, in case it was flushed too), and lift the cut once none is
+        # left.
+        try:
+            if waiting:
+                enforcer.quarantine()
+            elif enforcer.quarantined:
+                enforcer.lift_quarantine()
+        except Exception:
+            pass
+        with self._lock:
             for sandbox_id in sorted(self._lapse_cut):
                 thread = self._lapse_inflight.get(sandbox_id)
                 if thread is None:

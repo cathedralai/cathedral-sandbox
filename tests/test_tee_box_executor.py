@@ -311,6 +311,17 @@ class _Enforcer:
         self.detached: list[str] = []
         self.maintained = 0
         self.lapses = 0
+        self.quarantined = False
+        self.quarantines = 0
+
+    def quarantine(self) -> bool:
+        self.quarantined = True
+        self.quarantines += 1
+        return True
+
+    def lift_quarantine(self) -> bool:
+        self.quarantined = False
+        return True
 
     @property
     def active(self) -> bool:
