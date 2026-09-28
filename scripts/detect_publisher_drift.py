@@ -354,7 +354,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None, *, fetch: Fetcher | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    fetch: Fetcher | None = None,
+    now: datetime | None = None,
+) -> int:
+    """Run the drift check. `now` pins the clock for tests (default: UTC now)."""
     args = build_parser().parse_args(argv)
     if args.require_release and args.release is None:
         raise DriftError("scheduled drift check requires --release")
@@ -377,6 +383,7 @@ def main(argv: list[str] | None = None, *, fetch: Fetcher | None = None) -> int:
         network=args.network,
         netuid=int(args.netuid),
         require_signed_index=bool(args.require_signed_index),
+        now=now,
     )
     compare_manifest(
         digest,
@@ -384,6 +391,7 @@ def main(argv: list[str] | None = None, *, fetch: Fetcher | None = None) -> int:
         git_dir=args.git_dir,
         release=release,
         max_age=timedelta(minutes=int(args.max_age_minutes)),
+        now=now,
         git_ref=str(args.git_ref),
     )
     print(

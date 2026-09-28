@@ -955,7 +955,8 @@ def test_epoch_survives_a_lifecycle_change_before_receipt_issuance(
     """#144: the #145 cache does not cover the window between admit and
     issue. A re-enrollment that lands on record_work_artifacts (just before
     the _resolve_work lifecycle read) used to raise ReceiptError out of
-    run_epoch and abort the epoch. It must zero that miner only."""
+    run_epoch and abort the epoch. It must zero that miner only, while the
+    other verified miner keeps its receipt and score."""
     from tests.test_receipt import ISSUED, ISSUED_TEXT, RECEIPT_SEED_1, _snapshot
 
     snapshot = _snapshot()
@@ -980,10 +981,10 @@ def test_epoch_survives_a_lifecycle_change_before_receipt_issuance(
                 hook()
 
     ledger = HookLedger(tmp_path / "ledger.sqlite")
-    specs = default_specs(**{"9001": MinerSpec("a")})
+    specs = default_specs(**{"9001": MinerSpec("a"), "9002": MinerSpec("b")})
     runtime, ledger, _ = make_runtime(
         tmp_path,
-        [("miner", "http://127.0.0.1:9001")],
+        [("miner", "http://127.0.0.1:9001"), ("other", "http://127.0.0.1:9002")],
         specs,
         policy=policy,
         receipt_issuer=issuer,
@@ -1004,6 +1005,7 @@ def test_epoch_survives_a_lifecycle_change_before_receipt_issuance(
             collateral_current=True,
             tcb_svn="01" * 16,
             policy_mode="strict",
+            verification_status="VERIFIED",
             assurance=attestation_claims(
                 evidence.quote,
                 active,
@@ -1022,6 +1024,9 @@ def test_epoch_survives_a_lifecycle_change_before_receipt_issuance(
     outcome = next(item for item in run.outcomes if item.hotkey == "miner")
     assert outcome.status == "receipt_failed"
     assert run.scores["miner"] == 0.0
+    other = next(item for item in run.outcomes if item.hotkey == "other")
+    assert other.status == "verified"
+    assert run.scores["other"] > 0.0
     blocking = ledger.blocking_epoch()
     assert blocking is not None
     assert blocking["status"] == "complete"
@@ -1049,8 +1054,8 @@ def test_epoch_survives_a_reenrollment_after_lifecycle_snapshot(
     monkeypatch.setattr("cathedral.assurance.verified_at_now", lambda: ISSUED_TEXT)
     runtime, ledger, _ = make_runtime(
         tmp_path,
-        [("miner", "http://127.0.0.1:9001")],
-        default_specs(**{"9001": MinerSpec("a")}),
+        [("miner", "http://127.0.0.1:9001"), ("other", "http://127.0.0.1:9002")],
+        default_specs(**{"9001": MinerSpec("a"), "9002": MinerSpec("b")}),
         policy=policy,
         receipt_issuer=issuer,
         registry_clock=lambda: ISSUED,
@@ -1068,6 +1073,7 @@ def test_epoch_survives_a_reenrollment_after_lifecycle_snapshot(
             collateral_current=True,
             tcb_svn="01" * 16,
             policy_mode="strict",
+            verification_status="VERIFIED",
             assurance=attestation_claims(
                 evidence.quote,
                 active,
@@ -1079,7 +1085,8 @@ def test_epoch_survives_a_reenrollment_after_lifecycle_snapshot(
     real_issue = issuer.issue
 
     def issue_after_reenrollment(*args: object, **kwargs: object):
-        runtime.registry.enroll("miner", "http://127.0.0.1:9003")
+        if kwargs["subject_hotkey"] == "miner":
+            runtime.registry.enroll("miner", "http://127.0.0.1:9003")
         return real_issue(*args, **kwargs)
 
     issuer.issue = issue_after_reenrollment  # type: ignore[method-assign]
@@ -1088,6 +1095,80 @@ def test_epoch_survives_a_reenrollment_after_lifecycle_snapshot(
     outcome = next(item for item in run.outcomes if item.hotkey == "miner")
     assert outcome.status == "receipt_failed"
     assert run.scores["miner"] == 0.0
+    other = next(item for item in run.outcomes if item.hotkey == "other")
+    assert other.status == "verified"
+    assert run.scores["other"] > 0.0
+
+
+def test_lifecycle_receipt_failure_for_every_verified_miner_aborts_the_epoch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-miner containment must not turn a fleet-wide lifecycle race into a
+    published all-zero vector. When every verified miner's receipt is refused
+    for a lifecycle reason (e.g. a standalone prober sweeping verdicts through
+    the work window), the epoch aborts and retries, as it did before #144."""
+    from tests.test_receipt import ISSUED, ISSUED_TEXT, RECEIPT_SEED_1, _snapshot
+
+    snapshot = _snapshot()
+    policy = snapshot.to_policy(at=ISSUED)
+    issuer = ReceiptIssuer(
+        snapshot,
+        "receipt-test-1",
+        RECEIPT_SEED_1,
+        clock=lambda: ISSUED,
+    )
+    monkeypatch.setattr("cathedral.assurance.verified_at_now", lambda: ISSUED_TEXT)
+    poster = RecordingPoster()
+    runtime, ledger, _ = make_runtime(
+        tmp_path,
+        [("miner", "http://127.0.0.1:9001"), ("other", "http://127.0.0.1:9002")],
+        default_specs(**{"9001": MinerSpec("a"), "9002": MinerSpec("b")}),
+        policy=policy,
+        receipt_issuer=issuer,
+        registry_clock=lambda: ISSUED,
+        poster=poster,
+    )
+
+    def registry_verifier(evidence: Evidence, nonce: bytes, active: Policy) -> Attested:
+        return Attested(
+            Tier.CC_CPU_TDX,
+            evidence.quote.decode().removeprefix("chip:"),
+            "tdx-measurement-sha256:sample-v1",
+            1,
+            tcb_status="UpToDate",
+            advisory_ids=(),
+            debug_enabled=False,
+            collateral_current=True,
+            tcb_svn="01" * 16,
+            policy_mode="strict",
+            verification_status="VERIFIED",
+            assurance=attestation_claims(
+                evidence.quote,
+                active,
+                verified_at=ISSUED_TEXT,
+            ),
+        )
+
+    runtime.verifier = registry_verifier
+    real_issue = issuer.issue
+    ports = {"miner": 9003, "other": 9004}
+
+    def issue_after_reenrollment(*args: object, **kwargs: object):
+        hotkey = kwargs["subject_hotkey"]
+        assert isinstance(hotkey, str)
+        runtime.registry.enroll(hotkey, f"http://127.0.0.1:{ports[hotkey]}")
+        return real_issue(*args, **kwargs)
+
+    issuer.issue = issue_after_reenrollment  # type: ignore[method-assign]
+    with pytest.raises(ReceiptError, match="all 2 verified miner") as caught:
+        runtime.run_epoch(11, CANARY, publish=True)
+    assert caught.value.category == "lifecycle"
+    assert poster.bodies == []
+    assert ledger.blocking_epoch() is None
+    aborted = ledger.get_epoch(1)
+    assert aborted is not None
+    assert aborted["status"] == "aborted"
 
 
 def test_inactive_receipt_key_aborts_the_epoch_instead_of_publishing_zeros(
@@ -1129,6 +1210,7 @@ def test_inactive_receipt_key_aborts_the_epoch_instead_of_publishing_zeros(
             collateral_current=True,
             tcb_svn="01" * 16,
             policy_mode="strict",
+            verification_status="VERIFIED",
             assurance=attestation_claims(
                 evidence.quote,
                 active,

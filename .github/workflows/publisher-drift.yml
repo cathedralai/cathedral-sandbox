@@ -1,8 +1,11 @@
 name: Publisher drift
 
+# The hourly schedule stays off until pins/publisher-release.json and
+# pins/evidence-index-keys.json are committed. Without them every scheduled
+# run fails closed (by design), which is an hourly false alarm, while a
+# skip-with-notice run would show green without checking anything. Restore
+# `schedule: - cron: "17 * * * *"` in the same PR that adds the pins.
 on:
-  schedule:
-    - cron: "17 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -27,11 +30,17 @@ jobs:
           python -m pip install -e .
 
       - name: Detect publisher drift
+        env:
+          CATHEDRAL_NETUID: ${{ vars.CATHEDRAL_NETUID }}
         run: |
+          if [ -z "$CATHEDRAL_NETUID" ]; then
+            echo "::error::repository variable CATHEDRAL_NETUID is not set"
+            exit 1
+          fi
           python scripts/detect_publisher_drift.py \
             --evidence-url https://api.cathedral.computer/v1/evidence \
             --network finney \
-            --netuid 39 \
+            --netuid "$CATHEDRAL_NETUID" \
             --git-dir . \
             --git-ref origin/main \
             --max-age-minutes 180 \

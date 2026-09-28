@@ -207,11 +207,28 @@ def test_main_prints_ok_for_a_matching_surface(tmp_path: Path, capsys: pytest.Ca
                 "180",
             ],
             fetch=lambda url: files[url],
+            now=NOW,
         )
         == 0
     )
     assert json.loads(capsys.readouterr().out)["result"] == "ok"
     assert digest.startswith("sha256:")
+
+
+def test_main_freshness_reads_the_injected_clock() -> None:
+    """A tip fresh by the wall clock is stale under the injected clock, so the
+    freshness gate provably reads `now` and the fixed-date fixtures above
+    never age out."""
+    wall = datetime.now(UTC).replace(microsecond=0)
+    _digest, files = _files_for_manifest(
+        _manifest(generated_at=wall.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    )
+    with pytest.raises(DriftError, match="generated_at"):
+        main(
+            ["--evidence-url", "https://evidence.test", "--max-age-minutes", "180"],
+            fetch=lambda url: files[url],
+            now=wall + timedelta(hours=4),
+        )
 
 
 def test_main_requires_release_when_asked() -> None:

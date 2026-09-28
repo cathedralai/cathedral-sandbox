@@ -1443,6 +1443,14 @@ class ConfidentialRuntime:
                         # worker still receives safe canonical audit work.
                         pass
 
+        # Receipt outcomes for miners whose SAT work verified. A lifecycle
+        # refusal zeroes only that miner, but if it hits every verified miner
+        # the cause is fleet-wide (e.g. a standalone prober sweeping verdicts
+        # through the work window), and completing would publish a zero
+        # vector. The epoch aborts and retries instead (see below).
+        receipts_issued = 0
+        receipt_failures: list[str] = []
+
         # Claim only one executor-sized batch at a time. A job lease therefore
         # starts immediately before its network request instead of aging while
         # earlier waves occupy the worker pool.
@@ -1559,6 +1567,7 @@ class ConfidentialRuntime:
                         ),
                     )
                     if receipt_error:
+                        receipt_failures.append(receipt_error)
                         outcomes[result.target.hotkey] = MinerOutcome(
                             result.target.hotkey,
                             result.endpoint,
@@ -1570,6 +1579,7 @@ class ConfidentialRuntime:
                             assurance=assurance,
                         )
                         continue
+                    receipts_issued += 1
                     outcomes[result.target.hotkey] = MinerOutcome(
                         result.target.hotkey,
                         result.endpoint,
@@ -1579,6 +1589,13 @@ class ConfidentialRuntime:
                         work_units=units,
                         assurance=assurance,
                     )
+        if receipt_failures and receipts_issued == 0:
+            raise ReceiptError(
+                "lifecycle",
+                f"receipt issuance was refused for all {len(receipt_failures)} "
+                "verified miner(s); aborting the epoch instead of publishing "
+                f"an all-zero vector (first: {receipt_failures[0]})",
+            )
 
     def _record_work_timing(
         self,
