@@ -168,9 +168,9 @@ def sign_record(
     release: dict[str, object] = {
         "version": version,
         "image": image,
-        "runtime_contract": "snp-signed-validator-fleet-v1"
+        "runtime_contract": "snp-signed-validator-fleet-v2"
         if product == "snp-miner"
-        else "signed-validator-fleet-v1",
+        else "signed-validator-fleet-v2",
         "state_schema": state_schema,
         "bundle": {"url": bundle_url, "archive_sha256": archive_sha256, "tree_sha256": tree_sha256},
     }

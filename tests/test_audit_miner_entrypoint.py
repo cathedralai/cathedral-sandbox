@@ -12,6 +12,7 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
+from cathedral.miner_products import PRODUCTS, read_launcher_profile
 from cathedral.audit_miner_entrypoint import (
     FLEET_MANIFEST,
     HOTKEY_ENV,
@@ -365,7 +366,7 @@ def test_image_pins_amd64_base_fixed_entrypoint_and_one_tls_port() -> None:
     assert WORKER_BEARER_ENV not in dockerfile
     assert "WALLET_SEED" not in dockerfile
     assert f"install -d -o root -g root -m 0755 {TSM_REPORT_ROOT}" in dockerfile
-    assert 'org.cathedral.sn94.runtime-contract="signed-validator-fleet-v1"' in dockerfile
+    assert 'org.cathedral.sn94.runtime-contract="signed-validator-fleet-v2"' in dockerfile
     assert "import cathedral.audit_miner_entrypoint, cathedral.cli" in dockerfile
     assert "preflight_sr25519_verifier(load_sr25519_verifier())" in dockerfile
 
@@ -606,3 +607,85 @@ def test_host_startup_uses_fixed_owner_checked_mounts_and_container_limits() -> 
     assert "BEARER" not in script
     assert "SEED" not in script
     assert "RPC" not in script
+
+
+_LAUNCHERS = [
+    (
+        "run_sn94_signed_fleet_miner.sh",
+        "Dockerfile.sn94-audit-miner",
+        "audit-miner",
+        "SN94_AUDIT_MINER_IMAGE",
+    ),
+    ("run_sn94_snp_miner.sh", "Dockerfile.sn94-snp-miner", "snp-miner", "SN94_SNP_MINER_IMAGE"),
+]
+
+
+@pytest.mark.parametrize(("launcher", "dockerfile", "product", "_variable"), _LAUNCHERS)
+def test_launcher_image_and_updater_agree_on_the_v2_runtime_contract(
+    launcher, dockerfile, product, _variable
+) -> None:
+    # v2: the image takes CATHEDRAL_NETWORK and CATHEDRAL_NETUID. The launcher,
+    # the image label and the updater's product must all name it, so a v1 image
+    # (which refuses those inputs) never passes the launcher's label check.
+    profile = read_launcher_profile(REPOSITORY_ROOT / "scripts" / launcher)
+    labels = re.findall(
+        r'(org\.cathedral\.[a-z0-9.]+\.runtime-contract)="([^"]+)"',
+        (REPOSITORY_ROOT / dockerfile).read_text(),
+    )
+
+    assert labels == [(profile.contract_label, profile.runtime_contract)]
+    assert PRODUCTS[product].runtime_contract == profile.runtime_contract
+    assert profile.runtime_contract.endswith("-v2")
+
+
+def _run_launcher_contract_check(launcher: str, variable: str, label: str | None):
+    script = (REPOSITORY_ROOT / "scripts" / launcher).read_text()
+    contract = re.search(r"^readonly RUNTIME_CONTRACT=.*$", script, re.M)
+    check = re.search(r'^image_contract="\$\(docker (?:.*\n){3}  \|\| die .*$', script, re.M)
+    assert contract is not None and check is not None
+    harness = "\n".join(
+        [
+            "set -Eeuo pipefail",
+            "die() { printf 'refusing: %s\\n' \"$*\" >&2; exit 1; }",
+            'docker() { [[ -n "${FAKE_LABEL+set}" ]] || return 1; printf \'%s\\n\' "$FAKE_LABEL"; }',
+            f"{variable}=ghcr.io/cathedralai/example@sha256:{'0' * 64}",
+            contract.group(0),
+            check.group(0),
+            "echo accepted",
+        ]
+    )
+    return subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={"PATH": "/usr/bin:/bin", **({} if label is None else {"FAKE_LABEL": label})},
+    )
+
+
+@pytest.mark.parametrize(("launcher", "_dockerfile", "_product", "variable"), _LAUNCHERS)
+def test_launcher_refuses_an_image_from_another_release_by_name(
+    launcher, _dockerfile, _product, variable
+) -> None:
+    contract = read_launcher_profile(REPOSITORY_ROOT / "scripts" / launcher).runtime_contract
+    old = contract.removesuffix("-v2") + "-v1"
+
+    accepted = _run_launcher_contract_check(launcher, variable, contract)
+    assert accepted.returncode == 0, accepted.stderr
+    assert accepted.stdout == "accepted\n"
+
+    refused = _run_launcher_contract_check(launcher, variable, old)
+    assert refused.returncode == 1
+    assert "accepted" not in refused.stdout
+    assert f"declares runtime contract '{old}'" in refused.stderr
+    assert f"requires '{contract}'" in refused.stderr
+    assert "from the same release" in refused.stderr
+
+    hostile = _run_launcher_contract_check(launcher, variable, "x\x1b[2Jy z")
+    assert hostile.returncode == 1
+    assert "\x1b" not in hostile.stderr
+    assert "declares runtime contract 'x??2Jy?z'" in hostile.stderr
+
+    unreadable = _run_launcher_contract_check(launcher, variable, None)
+    assert unreadable.returncode == 1
+    assert "the pulled image labels cannot be read" in unreadable.stderr

@@ -175,12 +175,20 @@ sudo install -o root -g root -m 0755 \
   cathedral-runtime/scripts/run_sn94_signed_fleet_miner.sh \
   /usr/local/libexec/cathedral/run-sn94-miner
 printf '%s  %s\n' \
-  0346c1c160690f53bef570278a5d5cea2645b9141a7a13ad643e80463afa7e27 \
+  29b86abf29ff0acb50fffa7931ea980adf731f1225689918f2c1bad93fd599cc \
   /usr/local/libexec/cathedral/run-sn94-miner | sudo sha256sum --check
 ```
 
 Stop if the census does not report Intel TDX or the TSM report path is not
 readable and writable.
+
+The launcher digest above is the launcher in this repository revision. It
+requires runtime contract `signed-validator-fleet-v2` and refuses the `-v1`
+images pinned on this page before starting them. The two come from one release
+only after the `-v2` images built from this revision are published and pinned,
+replacing the #226 pins; follow the
+[pin order](docs/SN94_AUDIT_MINER_IMAGE.md#pin-order-for-the-v2-runtime-contract)
+before relying on this pin.
 
 ### 2. Refresh validator access from a control host
 

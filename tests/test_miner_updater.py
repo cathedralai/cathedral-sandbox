@@ -221,6 +221,21 @@ def test_a_record_for_another_netuid_is_refused(h):
     _refused_and_untouched(h, h.check())
 
 
+def test_a_record_naming_the_v1_runtime_contract_is_refused_before_any_pull(h):
+    # The launcher now requires the -v2 contract (network and netuid from deploy
+    # config). A record that pairs it with a -v1 contract is refused up front.
+    h.release(
+        sequence=5,
+        mutate=lambda body: body["release"].__setitem__(
+            "runtime_contract", "snp-signed-validator-fleet-v1"
+        ),
+    )
+    outcome = h.check()
+    _refused_and_untouched(h, outcome)
+    assert "different runtime contracts" in outcome.reason
+    assert h.prepared == []
+
+
 def test_the_bootstrap_floor_refuses_old_records(tmp_path):
     h = Harness(tmp_path, minimum_sequence=5)
     h.release(sequence=5)

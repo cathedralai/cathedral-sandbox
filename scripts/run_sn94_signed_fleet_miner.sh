@@ -8,7 +8,9 @@ export PATH='/usr/sbin:/usr/bin:/sbin:/bin'
 unset DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG
 
 readonly IMAGE_PATH='ghcr.io/cathedralai/cathedral-sn39-audit-miner'
-readonly RUNTIME_CONTRACT='signed-validator-fleet-v1'
+# v2: the image takes CATHEDRAL_NETWORK and CATHEDRAL_NETUID from this launcher.
+# A v1 image refuses them, so a v1 image is refused here, before any start.
+readonly RUNTIME_CONTRACT='signed-validator-fleet-v2'
 readonly CONTAINER_NAME='cathedral-sn94-audit-miner'
 readonly CONFIG_DIRECTORY='/etc/cathedral/validator-access'
 readonly STATE_DIRECTORY='/var/lib/cathedral/validator-access'
@@ -146,8 +148,10 @@ grep -Fx -- "${SN94_AUDIT_MINER_IMAGE}" <<<"${repo_digests}" >/dev/null \
   || die 'the pulled image does not report the exact requested RepoDigest'
 [[ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "${SN94_AUDIT_MINER_IMAGE}")" == 'linux/amd64' ]] \
   || die 'the pulled image is not linux/amd64'
-[[ "$(docker image inspect --format '{{index .Config.Labels "org.cathedral.sn94.runtime-contract"}}' "${SN94_AUDIT_MINER_IMAGE}")" == "${RUNTIME_CONTRACT}" ]] \
-  || die 'the pulled image does not declare the reviewed runtime contract'
+image_contract="$(docker image inspect --format '{{index .Config.Labels "org.cathedral.sn94.runtime-contract"}}' "${SN94_AUDIT_MINER_IMAGE}")" \
+  || die 'the pulled image labels cannot be read'
+[[ "${image_contract}" == "${RUNTIME_CONTRACT}" ]] \
+  || die "the image declares runtime contract '${image_contract//[^[:alnum:]._-]/?}', but this launcher requires '${RUNTIME_CONTRACT}'; install the launcher and the image from the same release"
 
 nft_rules="$(mktemp /run/cathedral-sn94-nft.XXXXXX)"
 

@@ -89,7 +89,7 @@ def test_snp_image_pins_official_snpguest_and_fixed_entrypoint() -> None:
     assert "https://github.com/virtee/snpguest/releases/download/v0.10.0/snpguest" in dockerfile
     assert SNPGUEST_DIGEST in dockerfile
     assert 'ENTRYPOINT ["python", "-I", "-u", "-B", "-m", "cathedral.snp_miner_entrypoint"]' in dockerfile
-    assert 'org.cathedral.sn94.runtime-contract="snp-signed-validator-fleet-v1"' in dockerfile
+    assert 'org.cathedral.sn94.runtime-contract="snp-signed-validator-fleet-v2"' in dockerfile
     assert "TSM_REPORT_ROOT" not in dockerfile
     assert "WALLET_SEED" not in dockerfile
 

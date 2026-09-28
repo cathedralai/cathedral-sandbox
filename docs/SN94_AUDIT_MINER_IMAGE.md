@@ -17,6 +17,43 @@ The digest was published by GitHub Actions run
 with build provenance and anonymous registry access. This proves the published
 artifact, not a live deployment.
 
+## Pin order for the v2 runtime contract
+
+Images built from this source declare runtime contract
+`signed-validator-fleet-v2` (TDX) or `snp-signed-validator-fleet-v2` (SNP).
+A `-v2` image takes `CATHEDRAL_NETWORK` and `CATHEDRAL_NETUID` from the
+launcher. Every image pinned today, including the `a66d7c4` images that #226
+pins, declares `-v1` and refuses those inputs. The launchers in this source,
+and the signed updater that checks a release's launcher against its image,
+require `-v2` and refuse a `-v1` image before starting it, with an error that
+names both contracts.
+
+The README's launcher digest always follows the launcher in the tree (a test
+checks it), so it changes in the same commit as the launcher. The image pins
+cannot, because the images are published from `main` after the merge. The
+README's pins form one release only after these steps, in this order:
+
+1. Merge the `-v2` launcher and entrypoint change (#216). The publish
+   workflows build `-v2` images from that commit.
+2. Repin in one change: every image digest (README, the image docs,
+   `docs/AMD_SEV_SNP_FRIEND_TEST.md`, the SNP env example, the tests), the
+   revision-label and runtime-contract checks, and the README's
+   `cathedral-runtime` and `cathedral-access` checkouts move to those `-v2`
+   images and their source commit. This replaces the #226 pins; do not merge
+   #226's `-v1` pins after #216.
+3. Only then direct operators to the README's launcher digest. Between steps 1
+   and 2 the launcher digest and the image pins come from different releases,
+   and the launcher refuses the pinned image.
+
+The image path must also match. #227 moves the publish workflows to the
+`cathedral-sn94-*` packages only, while the launchers' `IMAGE_PATH` and the
+updater's check that a release image is in its launcher's repository
+(`cathedral/miner_updater.py`, `_check_launcher`) still require
+`cathedral-sn39-*`. If #227 merges before the step 1 images are published,
+those images exist only at the sn94 path, where these launchers refuse them.
+Either publish the `-v2` images before #227 merges, or move the launchers,
+docs and tests to the sn94 path in the step 2 repin.
+
 ## Inputs
 
 The default entrypoint accepts no arguments and exactly five Cathedral

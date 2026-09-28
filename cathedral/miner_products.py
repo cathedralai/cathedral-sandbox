@@ -32,13 +32,13 @@ class MinerProduct:
 
 AUDIT_MINER = MinerProduct(
     product="audit-miner",
-    runtime_contract="signed-validator-fleet-v1",
+    runtime_contract="signed-validator-fleet-v2",
     description="Intel TDX audit miner",
 )
 
 SNP_MINER = MinerProduct(
     product="snp-miner",
-    runtime_contract="snp-signed-validator-fleet-v1",
+    runtime_contract="snp-signed-validator-fleet-v2",
     description="AMD SEV-SNP miner",
 )
 
