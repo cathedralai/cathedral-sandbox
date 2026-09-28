@@ -449,6 +449,44 @@ def test_the_probe_template_must_be_one_of_the_boxs_templates():
         _registration(host_values_text=_host_values(CATHEDRAL_TEMPLATES_JSON=no_id))
 
 
+def test_the_box_is_paid_at_the_probe_templates_shape():
+    # The challenge runs in one probe sandbox, so this is all the prober can prove.
+    small = _verify(_registration())
+    assert small.probe_capacity == {"cpu": 1, "memory_gib": 4}
+    assert (small.vcpus, small.memory_gib) == (16, 52)  # measured, not paid
+    two = json.dumps(
+        [
+            {"name": "small", "cpu": 1, "memory_gib": 4, "template_id": "t1"},
+            {"name": "box", "cpu": 16, "memory_gib": 52, "template_id": "t2"},
+        ]
+    )
+    for probe, shape in (("t1", (1, 4)), ("t2", (16, 52))):
+        verified = _verify(
+            _registration(
+                host_values_text=_host_values(
+                    CATHEDRAL_TEMPLATES_JSON=two, CATHEDRAL_PROBE_TEMPLATE_ID=probe
+                )
+            )
+        )
+        template = next(t for t in verified.templates if t["template_id"] == probe)
+        assert verified.probe_capacity == {
+            "cpu": template["cpu"],
+            "memory_gib": template["memory_gib"],
+        }
+        assert (verified.probe_capacity["cpu"], verified.probe_capacity["memory_gib"]) == shape
+
+
+def test_the_probe_template_id_must_name_one_shape():
+    twice = json.dumps(
+        [
+            {"name": "small", "cpu": 1, "memory_gib": 4, "template_id": "t1"},
+            {"name": "box", "cpu": 16, "memory_gib": 52, "template_id": "t1"},
+        ]
+    )
+    with pytest.raises(reg.RegistrationError, match="more than one template"):
+        _registration(host_values_text=_host_values(CATHEDRAL_TEMPLATES_JSON=twice))
+
+
 def test_the_probe_template_is_signed_and_bound_to_the_seal():
     two = json.dumps(
         [
@@ -613,8 +651,8 @@ def test_deeply_nested_templates_are_a_registration_error(tmp_path, capsys):
     # And through the command: a refusal, not a traceback.
     host_values = tmp_path / "host-values.env"
     host_values.write_text(_host_values(CATHEDRAL_TEMPLATES_JSON="[" * 60_000))
-    key_file = tmp_path / "runtime.key"
-    key_file.write_bytes(RUNTIME_KEY)
+    key_file = tmp_path / "cathedral-runtime-box.probe-key"
+    key_file.write_bytes(PROBE_KEY)
     key_file.chmod(0o600)
     prober_hex = (
         PROBER.public_key()
@@ -625,7 +663,7 @@ def test_deeply_nested_templates_are_a_registration_error(tmp_path, capsys):
         [
             "--host-values",
             str(host_values),
-            "--runtime-key-file",
+            "--probe-key-file",
             str(key_file),
             "--prober-key",
             prober_hex,
@@ -641,3 +679,33 @@ def test_deeply_nested_templates_are_a_registration_error(tmp_path, capsys):
         keypair_factory=lambda *_args: MINER,
     )
     assert code == 2 and "not JSON" in capsys.readouterr().err
+
+
+def test_the_probe_key_file_is_small(tmp_path, capsys):
+    # 64 hex characters and a newline fit; a 129-byte file is refused.
+    host_values = tmp_path / "host-values.env"
+    host_values.write_text(_host_values())
+    key_file = tmp_path / "cathedral-runtime-box.probe-key"
+    key_file.write_bytes(PROBE_KEY + b"\n" * 64)
+    key_file.chmod(0o600)
+    argv = [
+        "--host-values",
+        str(host_values),
+        "--probe-key-file",
+        str(key_file),
+        "--prober-key",
+        reg._raw(PROBER.public_key()).hex(),
+        "--netuid",
+        str(NETUID),
+        "--kind",
+        "bare_metal",
+        "--wallet-name",
+        "miner",
+        "--hotkey-name",
+        "default",
+    ]
+    assert reg.main(argv, keypair_factory=lambda *_args: MINER) == 0
+    capsys.readouterr()
+    key_file.write_bytes(PROBE_KEY + b"\n" * 65)
+    assert reg.main(argv, keypair_factory=lambda *_args: MINER) == 2
+    assert "probe key is empty or too large" in capsys.readouterr().err

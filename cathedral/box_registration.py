@@ -16,8 +16,24 @@ document:
 
 The probe key is not the team key. The box's front door lets it create only
 short, offline sandboxes from the probe template, look up and delete its own,
-and hold at most a few at once; it cannot see or touch any other sandbox. The
-team key never leaves the box's operator.
+and hold at most 8 at once; it cannot see or touch any other sandbox. The team
+key never leaves the box's operator. Runtime team keys carry the ``e2b_``
+prefix (the runtime's ``packages/auth/pkg/auth/consts.go``, ``PrefixAPIKey``)
+and a probe key is exactly 64 hex characters, so the format check at seal and
+at open tells the two apart.
+
+A leaked probe key lets its holder register the box under another hotkey,
+which the first-claim rule below refuses while the owner's claim holds, and
+keep the 8-sandbox cap full so the prober's challenge cannot start. The
+runbook gives the rotation: delete the key on the box, rerun the installer
+with ``--probe-template``, register again.
+
+Capacity. The prober's challenge runs in one probe sandbox, so the prober
+probes, and pays, the box at the probe template's shape
+(``VerifiedRegistration.probe_capacity``) and never more. ``capacity`` is the
+host as the installer measured it; it bounds the templates, and host vCPUs or
+memory outside the probe template earn nothing. A miner makes the probe
+template its largest shape, ideally the whole box.
 
 The prober verifies the registration, probes the box through its front door,
 and only then admits it (docs/MINER_BOX_RUNBOOK.md).
@@ -161,6 +177,7 @@ class VerifiedRegistration:
     issued_at: datetime
     expires_at: datetime
     probe_template_id: str
+    probe_capacity: Mapping[str, int]  # the probe template's cpu and memory_gib
     sealed_probe_key: Mapping[str, str]
     digest: bytes
 
@@ -380,7 +397,8 @@ def seal_probe_key(
 ) -> dict[str, str]:
     """Seal the box's probe key to the prober, bound to this registration."""
 
-    # Exactly what the installer writes, so a team key passed by mistake is refused.
+    # Exactly what the installer writes. A team key starts with "e2b_", so one
+    # passed by mistake is refused.
     if not isinstance(probe_key, bytes) or _HEX64.fullmatch(probe_key.decode("latin-1")) is None:
         raise RegistrationError(
             "probe key must be the installer's cathedral-runtime-LABEL.probe-key (64 hex characters)"
@@ -424,7 +442,8 @@ def open_probe_key(
         opened = ChaCha20Poly1305(key).decrypt(nonce, ciphertext, aad)
     except (InvalidTag, KeyError, TypeError, ValueError, binascii.Error) as exc:
         raise RegistrationError("the sealed probe key does not open for this prober") from exc
-    # A registration built without this module could seal the team key instead.
+    # A registration built without this module could seal the team key
+    # instead; a team key starts with "e2b_", so it is never 64 hex.
     if _HEX64.fullmatch(opened.decode("latin-1")) is None:
         raise RegistrationError("the sealed key is not a probe key")
     return opened
@@ -539,8 +558,17 @@ def _fields(body: Mapping[str, Any]) -> VerifiedRegistration:
     probe_template = body["probe_template_id"]
     if not isinstance(probe_template, str) or _TEMPLATE_ID.fullmatch(probe_template) is None:
         raise RegistrationError("probe_template_id is malformed")
-    if probe_template not in {t.get("template_id") for t in templates}:
+    probe_shapes = [t for t in templates if t.get("template_id") == probe_template]
+    if not probe_shapes:
         raise RegistrationError("probe_template_id is not one of the box's templates")
+    if len(probe_shapes) > 1:
+        raise RegistrationError("probe_template_id names more than one template")
+    # The one shape the prober can prove, and so pay: its challenge runs in one
+    # probe sandbox.
+    probe_capacity = {
+        "cpu": probe_shapes[0]["cpu"],
+        "memory_gib": probe_shapes[0]["memory_gib"],
+    }
     revision = body["runtime_revision"]
     if not isinstance(revision, str) or _REVISION.fullmatch(revision) is None:
         raise RegistrationError("runtime_revision must be a 40-hex git revision")
@@ -564,6 +592,7 @@ def _fields(body: Mapping[str, Any]) -> VerifiedRegistration:
         issued_at=issued,
         expires_at=expires,
         probe_template_id=probe_template,
+        probe_capacity=probe_capacity,
         sealed_probe_key=dict(body.get("sealed_probe_key") or {}),
         digest=_unsealed_digest(body),
     )

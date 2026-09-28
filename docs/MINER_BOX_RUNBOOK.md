@@ -12,15 +12,21 @@ pay by market value. You never talk to validators directly.
 - At least the smallest consumer shape the current price table lists (for example SN120's);
   a smaller box earns nothing.
 - More than 10 GiB of memory per vCPU is proven, and paid, only up to 10 GiB per vCPU.
+- The box is proven, and paid, at its probe template's shape and no more (step 2), so make
+  that template the whole box.
 
 ## 2. Install the runtime
 
 From a machine that can SSH to the server, with a checkout of `cathedralai/runtime`:
 
 ```bash
+# Your largest template shape, here the whole box: a 16 vCPU, 64 GiB server keeps 12 GiB
+# for the host (the default reserve), leaving 16 vCPU and 52 GiB for sandboxes.
+PROBE_SHAPE=cathedral-box-16x52
 deploy/cathedral/install-runtime-host.sh \
   --bundle "$BUNDLE_URL" --sha256 "$BUNDLE_SHA256" \
   --direct-ip "$PUBLIC_IP" --ssh-from "$YOUR_CIDR" \
+  --templates '[{"name":"cathedral-box-16x52","cpu":16,"memory_gib":52}]' \
   --probe-template "$PROBE_SHAPE" \
   SSH_TARGET
 ```
@@ -34,9 +40,13 @@ files in `CATHEDRAL_CREDENTIALS_DIR`:
 - `cathedral-runtime-LABEL.probe-key` (mode 600): the probe key, which is what you register;
 - `cathedral-runtime-LABEL.key` (mode 600): the box's team key. Keep it; it never leaves you.
 
-`PROBE_SHAPE` is one of the template shapes the installer builds (for example
-`cathedral-standard-1x4`); the prober's sandboxes are made from it, so use the shape the SN94
-owner publishes with the prober key.
+**Choose the probe template.** `PROBE_SHAPE` is one of the template shapes the installer
+builds. The prober's challenge runs in one sandbox made from it, so the prober probes and pays
+your box at that shape and no more: vCPUs and memory outside it earn nothing. Choose your
+largest shape, ideally the whole box as above. A shape may use at most the box's vCPUs and its
+installed RAM less the host reserve (`--host-reserve-gib`, default 12 GiB); the installer
+refuses a larger one. The registration also records the box's measured capacity, but the
+prober pays the probe template's shape.
 
 `LABEL` is `CATHEDRAL_HOST_LABEL`, which defaults to the SSH target. Registration needs the
 direct front door (`--direct-ip`) and `--probe-template`: a tunnel install has no certificate
@@ -71,9 +81,30 @@ of its 7 days remain), since the registration pins the certificate.
 **What you hand over.** The probe key, not the team key. Through the front door it can only
 create short, offline sandboxes from the probe template (at most 8 at once), look up and delete
 its own, and nothing else: it cannot see, change or delete any other sandbox on the box. The
-command refuses a file that isn't the installer's probe key, so the team key can't be sealed by
-mistake. If you rerun the installer without `--probe-template`, the probe key stops working;
-register again after reinstalling with it.
+command refuses a file that isn't the installer's 64-hex probe key, and the team key always
+starts with `e2b_`, so the team key can't be sealed by mistake. If you rerun the installer
+without `--probe-template`, the probe key stops working; register again after reinstalling
+with it.
+
+**If the probe key leaks.** It sits in your credentials directory, on the box
+(`/var/lib/cathedral/probe-key`) and with the prober. Whoever holds it can:
+
+- register your box under their own hotkey. While your claim holds, the prober refuses that
+  (see "One box, one hotkey" in step 4); if they claim first, they hold the box until their
+  claim lapses;
+- keep the probe key's 8-sandbox cap full, so the prober's challenge can't start and your box
+  fails its rounds.
+
+To rotate it: the installer keeps the key across reruns, so delete it on the box first, then
+rerun the installer with the same `--probe-template`, which makes a new key, restarts the
+front door with it and copies it out, then register again (step 3) and submit:
+
+```bash
+ssh SSH_TARGET sudo rm /var/lib/cathedral/probe-key
+deploy/cathedral/install-runtime-host.sh ... --probe-template "$PROBE_SHAPE" SSH_TARGET
+```
+
+The old key stops working at once, so a claim made with it stops passing the probe and lapses.
 
 **Check the prober key.** Take `--prober-key` only from the SN94 owner's published prober
 attestation, whose quote binds that key; a key from anywhere else could hand your box to
@@ -86,7 +117,8 @@ Use `--kind tee` on a TDX or SEV-SNP host; the prober verifies that claim separa
 Send `registration.json` to the SN94 owner's registration endpoint (published with the prober
 key). The prober verifies the signature, opens the key, probes the box through its front door,
 and admits it once a probe passes. From then on each round's receipt carries your box's
-verified capacity, and validators pay your hotkey its market value.
+verified capacity (the probe template's shape), and validators pay your hotkey its market
+value.
 
 **One box, one hotkey.** The prober admits each box under one hotkey, keyed on its control
 IP. (`box_key` comes from the certificate pin alone, so it names the current certificate and
