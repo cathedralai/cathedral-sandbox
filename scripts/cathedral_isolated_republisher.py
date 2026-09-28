@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Retained bootstrap for the legacy privileged policy republisher.
 
-Current direct SN39 mining does not deploy this service.
+Current direct SN94 mining does not deploy this service.
 
 The systemd unit executes this bootstrap with ``-I -S``. It adds the checked
 venv package root without processing site hooks, loads the checked Cathedral

@@ -1,6 +1,6 @@
 # Attestation-gated data-key release
 
-> Product-library reference. This is not part of the current SN39 miner launch
+> Product-library reference. This is not part of the current SN94 miner launch
 > path. Start at the repository [README](../README.md).
 
 Cathedral defines a disabled-by-default protocol for releasing an encrypted

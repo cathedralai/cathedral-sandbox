@@ -710,7 +710,7 @@ _RETRY_PUBLISH_ARGV = [
     "--score-network",
     "finney",
     "--score-netuid",
-    "39",
+    "94",
     "--epoch-id",
     "1",
 ]

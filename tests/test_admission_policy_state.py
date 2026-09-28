@@ -39,7 +39,7 @@ PUBLIC = (
 )
 TRUSTED = {KEY_ID: PUBLIC}
 NETWORK = "finney"
-NETUID = 39
+NETUID = 94
 COLDKEY = "5FghSHp7DXzhoiCaBQ9qmz6QRb6C94KehEKDHZ8vq6QyE29C"
 
 
@@ -53,7 +53,7 @@ def policy_bytes(config_version: int, *, coldkeys: list[str] | None = None) -> b
                 "coldkeys": [COLDKEY] if coldkeys is None else coldkeys,
                 "network": NETWORK,
                 "netuid": NETUID,
-                "required_profile_ids": ["cpu-tdx-sn39-v2"],
+                "required_profile_ids": ["cpu-tdx-sn94-v2"],
                 "max_enrolled_endpoints_per_coldkey": 2,
                 "max_admitted_workers_total": 16,
                 "config_version": config_version,

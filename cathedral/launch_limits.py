@@ -1,6 +1,6 @@
 """Retained publisher/evidence-library cardinality contract.
 
-The current direct SN39 validator does not consume these publisher limits.
+The current direct SN94 validator does not consume these publisher limits.
 
 These limits are shared by the score producer, evidence exporter, and
 independent verifier. A report that the producer can publish must remain
@@ -9,7 +9,7 @@ exportable and verifiable under the same launch grammar.
 
 MAX_LAUNCH_CANDIDATES = 4096
 MAX_LAUNCH_VERIFIED_CANDIDATES = 28
-# This is the exact upper bound accepted by the SN39 confidential-score
+# This is the exact upper bound accepted by the SN94 confidential-score
 # intake. Keeping it here prevents the producer from publishing an identity
 # that the public publisher must later reject.
 MAX_LAUNCH_HOTKEY_BYTES = 128
@@ -27,7 +27,7 @@ MAX_LAUNCH_EVIDENCE_BASE_URI_BYTES = 2048
 def is_launch_hotkey(value: object) -> bool:
     """Return whether an identity is stable across JSON and subnet intake.
 
-    SN39 identities are SS58 text. Requiring non-whitespace printable ASCII
+    SN94 identities are SS58 text. Requiring non-whitespace printable ASCII
     prevents JSON escape amplification and normalization drift while retaining
     the subnet's deliberately generous 128-character launch bound.
     """

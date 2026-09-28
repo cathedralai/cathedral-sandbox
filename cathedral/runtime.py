@@ -1,6 +1,6 @@
 """Retained receipt-epoch and publisher runtime.
 
-The current direct SN39 validator does not use this module. It remains for
+The current direct SN94 validator does not use this module. It remains for
 compatibility tests and historical receipt and report artifacts.
 """
 
@@ -146,7 +146,7 @@ class RuntimeConfig:
     customer_job_max_attempts: int = 3
     score_network: str | None = None
     score_netuid: int | None = None
-    # Publicly derivable challenge anchor: the finalized SN39 block (and its
+    # Publicly derivable challenge anchor: the finalized SN94 block (and its
     # hash) each epoch's TDX challenge nonces are derived from. REQUIRED for
     # production CPU scoring - a random issuer nonce is not a public
     # freshness proof.

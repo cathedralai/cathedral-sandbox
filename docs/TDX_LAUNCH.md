@@ -80,7 +80,7 @@ validator does not retain it or use it as a weight gate. See
 
 The sandbox library's strict policy path additionally requires the emitted
 measurement to be in its verified policy and rejects malformed or unapproved
-TCB and advisory claims. The direct SN39 validator uses the released QVL, live
+TCB and advisory claims. The direct SN94 validator uses the released QVL, live
 TLS binding, canonical SAT result, and global hardware/TLS deduplication. It
 does not consume the retired publisher or epoch path.
 

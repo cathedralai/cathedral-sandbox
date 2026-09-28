@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Retained cross-repository test for the legacy signed-vector path.
 
-This is not a current SN39 launch proof. The direct validator does not consume
+This is not a current SN94 launch proof. The direct validator does not consume
 the publisher or signed vector exercised here.
 """
 
@@ -36,7 +36,7 @@ CAP = 0.10
 SIGNED_FRACTION_TOLERANCE = 1e-12
 QUANTIZED_FRACTION_TOLERANCE = 1e-4
 NETWORK = "finney"
-NETUID = 39
+NETUID = 94
 KEY_ID = "cathedral-weight-policy"
 SIGNING_KEY_HEX = "42" * 32
 BEARER_TOKEN = "cross-repo-launch-token"

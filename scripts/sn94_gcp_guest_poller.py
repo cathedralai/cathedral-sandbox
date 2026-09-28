@@ -35,7 +35,7 @@ PROJECT_ID = "polaris-tdx-attest"
 ZONE = "us-central1-b"
 MACHINE_TYPE = "c3-standard-4"
 NETWORK = "finney"
-NETUID = 39
+NETUID = 94
 MINIMUM_STAKE_RAO = 0
 UID30 = 30
 UID30_HOTKEY = "5FF6FtDUhn7XdPYmEdH5XjLAmLfmwLTCNVBgcrj3A4sstwaw"
@@ -68,27 +68,27 @@ IMAGE_PULL_TIMEOUT_SECONDS = 300
 CHILD_STOP_TIMEOUT_SECONDS = 30
 CHILD_KILL_TIMEOUT_SECONDS = 10
 CONTAINER_REMOVE_TIMEOUT_SECONDS = 15
-CONTAINER_NAME = "cathedral-sn39-audit-miner"
+CONTAINER_NAME = "cathedral-sn94-audit-miner"
 
 CONFIG_DIRECTORY = Path("/etc/cathedral/validator-access")
 STATE_DIRECTORY = Path("/var/lib/cathedral/validator-access")
-RUNTIME_DIRECTORY = Path("/run/cathedral-sn39")
+RUNTIME_DIRECTORY = Path("/run/cathedral-sn94")
 SNAPSHOT_PATH = CONFIG_DIRECTORY / "validator-access.json"
 KEYS_PATH = CONFIG_DIRECTORY / "snapshot-keys.json"
 FLEET_PATH = CONFIG_DIRECTORY / "fleet.json"
-LAUNCHER_PATH = Path("/usr/local/libexec/cathedral-sn39-signed-fleet-launcher")
+LAUNCHER_PATH = Path("/usr/local/libexec/cathedral-sn94-signed-fleet-launcher")
 HIGH_WATER_PATH = STATE_DIRECTORY / "metadata-snapshot-high-water.json"
 
-ATTR_IMAGE = "cathedral-sn39-image"
-ATTR_MINER_HOTKEY = "cathedral-sn39-miner-hotkey"
-ATTR_PUBLIC_ENDPOINT = "cathedral-sn39-public-endpoint"
-ATTR_KEYS = "cathedral-sn39-snapshot-keys"
-ATTR_KEYS_DIGEST = "cathedral-sn39-snapshot-keys-digest"
-ATTR_FLEET = "cathedral-sn39-fleet"
-ATTR_FLEET_DIGEST = "cathedral-sn39-fleet-digest"
-ATTR_LAUNCHER = "cathedral-sn39-launcher"
-ATTR_LAUNCHER_DIGEST = "cathedral-sn39-launcher-digest"
-ATTR_SNAPSHOT = "cathedral-sn39-validator-access-snapshot"
+ATTR_IMAGE = "cathedral-sn94-image"
+ATTR_MINER_HOTKEY = "cathedral-sn94-miner-hotkey"
+ATTR_PUBLIC_ENDPOINT = "cathedral-sn94-public-endpoint"
+ATTR_KEYS = "cathedral-sn94-snapshot-keys"
+ATTR_KEYS_DIGEST = "cathedral-sn94-snapshot-keys-digest"
+ATTR_FLEET = "cathedral-sn94-fleet"
+ATTR_FLEET_DIGEST = "cathedral-sn94-fleet-digest"
+ATTR_LAUNCHER = "cathedral-sn94-launcher"
+ATTR_LAUNCHER_DIGEST = "cathedral-sn94-launcher-digest"
+ATTR_SNAPSHOT = "cathedral-sn94-validator-access-snapshot"
 
 SNAPSHOT_VALIDATOR_CODE = r"""
 import hashlib
@@ -112,7 +112,7 @@ snapshot = verify_validator_access_snapshot(
     Path("/input/validator-access.json").read_bytes(),
     keys,
     network="finney",
-    netuid=39,
+    netuid=94,
     required_minimum_stake_rao=0,
     max_age_seconds=900,
 )
@@ -442,7 +442,7 @@ def ensure_image(image: str) -> None:
         document = json.loads(inspected.stdout)
         repo_digests = document["RepoDigests"]
         platform = f"{document['Os']}/{document['Architecture']}"
-        label = document["Config"]["Labels"]["org.cathedral.sn39.runtime-contract"]
+        label = document["Config"]["Labels"]["org.cathedral.sn94.runtime-contract"]
     except (KeyError, TypeError, json.JSONDecodeError) as exc:
         raise GuestDeliveryError("pulled image inspection is incomplete") from exc
     if image not in repo_digests:
@@ -661,7 +661,7 @@ def install_snapshot(payload: bytes, *, deployment: Deployment) -> SnapshotStatu
 def _launcher_environment(deployment: Deployment) -> dict[str, str]:
     return {
         "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
-        "SN39_AUDIT_MINER_IMAGE": deployment.image,
+        "SN94_AUDIT_MINER_IMAGE": deployment.image,
         "CATHEDRAL_MINER_HOTKEY": MINER_HOTKEY,
         "CATHEDRAL_PUBLIC_ENDPOINT": deployment.vm.public_endpoint,
         "CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST": deployment.keys_digest,
@@ -750,7 +750,7 @@ def prepare_directories() -> None:
 
 
 def _log(message: str) -> None:
-    print(f"sn39-gcp-poller: {message}", file=sys.stderr, flush=True)
+    print(f"sn94-gcp-poller: {message}", file=sys.stderr, flush=True)
 
 
 def run_forever(metadata: MetadataClient | None = None) -> int:
@@ -831,8 +831,8 @@ def run_forever(metadata: MetadataClient | None = None) -> int:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="sn39-gcp-guest-poller",
-        description="RETIRED UID124 GCP guest poller. Not current SN39 mining.",
+        prog="sn94-gcp-guest-poller",
+        description="RETIRED UID124 GCP guest poller. Not current SN94 mining.",
         allow_abbrev=False,
     )
     parser.add_argument(

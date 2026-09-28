@@ -99,7 +99,7 @@ _GPU_PROFILE = "gcp-g4-rtx-pro-6000-sev-v1"
 # hardware_class and reuse into the public policy, so the two shapes can look
 # similar.
 _OPTIONAL_TOP_LEVEL_KEYS = frozenset({"task_policy"})
-# SN39 agent-enclave reads these three fields from the signed receipt.
+# SN94 agent-enclave reads these three fields from the signed receipt.
 # The signature proves Cathedral asserted this policy. It does not prove the
 # guest jail enforced it. A signed egress=restricted does not close
 # answer-lookup: the allowlisted model channel is miner-observable.
@@ -115,7 +115,7 @@ _EGRESS_HOST_RE = re.compile(
     r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$",
     re.IGNORECASE,
 )
-# Cathedral-pinned inference hosts for the SN39 agent-enclave path. PolarIS
+# Cathedral-pinned inference hosts for the SN94 agent-enclave path. PolarIS
 # mint copies this set when network.pin=official_inference_providers.
 OFFICIAL_INFERENCE_HOSTS: tuple[str, ...] = (
     "api.anthropic.com",
@@ -509,9 +509,9 @@ def public_task_policy_from_enforced(
     *,
     tls_pinning: bool | None = None,
 ) -> dict[str, object]:
-    """Map PolarIS guest/attestor policy onto the signed public SN39 shape.
+    """Map PolarIS guest/attestor policy onto the signed public SN94 shape.
 
-    PolarIS enforces ``none | observe | default | allow:h1,h2``. SN39 consumes
+    PolarIS enforces ``none | observe | default | allow:h1,h2``. SN94 consumes
     ``restricted`` plus ``egress_allowlist`` plus ``tls_pinning``. The signature
     covers this object; the guest jail is what actually restricts packets.
     Copying ``hardware_class`` and ``reuse`` makes this object look similar to

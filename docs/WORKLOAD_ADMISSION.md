@@ -1,6 +1,6 @@
 # Signed workload admission
 
-> Product-library reference. This is not an SN39 miner setup guide. Start at the
+> Product-library reference. This is not an SN94 miner setup guide. Start at the
 > repository [README](../README.md).
 
 Cathedral has a provider-neutral contract for admitting future customer

@@ -39,7 +39,7 @@ Public keys: /etc/cathedral/validator-access/snapshot-keys.json
 Fleet: /etc/cathedral/validator-access/fleet.json
 Replay state: /var/lib/cathedral/validator-access/validator-access.sqlite
 Network: finney
-Subnet: 39
+Subnet: 94
 Validator stake floor: 0 Rao plus validator permit
 Listener: native TLS on 0.0.0.0:8081
 TEE: Intel TDX
@@ -66,7 +66,7 @@ wallet directory.
 
 ## Host boundary
 
-`scripts/run_sn39_signed_fleet_miner.sh` requires the immutable digest and:
+`scripts/run_sn94_signed_fleet_miner.sh` requires the immutable digest and:
 
 - verifies the pulled repository digest, platform, and runtime label;
 - mounts config read-only and replay state separately;
@@ -92,11 +92,11 @@ describe the current digest as signed-only.
 
 ## Build contract
 
-- Dockerfile: `Dockerfile.sn39-audit-miner`
+- Dockerfile: `Dockerfile.sn94-audit-miner`
 - Entrypoint: `cathedral/audit_miner_entrypoint.py`
-- Host launcher: `scripts/run_sn39_signed_fleet_miner.sh`
-- Exact Python wheels and hashes: `requirements/sn39-audit-miner.txt`
-- Publication workflow: `.github/workflows/publish-sn39-audit-miner.yml`
+- Host launcher: `scripts/run_sn94_signed_fleet_miner.sh`
+- Exact Python wheels and hashes: `requirements/sn94-audit-miner.txt`
+- Publication workflow: `.github/workflows/publish-sn94-audit-miner.yml`
 
-Use [SN39 miner image operations](SN39_AUDIT_MINER_OPERATIONS.md) for the
+Use [SN94 miner image operations](SN94_AUDIT_MINER_OPERATIONS.md) for the
 current pin, fleet rules, and stop conditions.

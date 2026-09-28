@@ -53,8 +53,8 @@ OTHER_PUBLIC = (
 TRUSTED = {KEY_ID: PUBLIC}
 
 NETWORK = "finney"
-NETUID = 39
-PROFILE = "cpu-tdx-sn39-v2"
+NETUID = 94
+PROFILE = "cpu-tdx-sn94-v2"
 COLDKEY = "5FghSHp7DXzhoiCaBQ9qmz6QRb6C94KehEKDHZ8vq6QyE29C"
 OTHER_COLDKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 
@@ -127,7 +127,7 @@ def test_selected_mode_verifies_and_reports_its_terms():
     assert snapshot.admits_coldkey(COLDKEY) is True
     assert snapshot.admits_coldkey(OTHER_COLDKEY) is False
     assert snapshot.admits_profile(PROFILE) is True
-    assert snapshot.admits_profile("cpu-tdx-sn39-v1") is False
+    assert snapshot.admits_profile("cpu-tdx-sn94-v1") is False
 
 
 def test_open_mode_admits_any_coldkey_but_still_binds_profile_and_caps():
@@ -136,7 +136,7 @@ def test_open_mode_admits_any_coldkey_but_still_binds_profile_and_caps():
     assert snapshot.coldkeys == frozenset()
     assert snapshot.admits_coldkey(OTHER_COLDKEY) is True
     # Open mode widens who may ask; it never widens what is accepted.
-    assert snapshot.admits_profile("cpu-tdx-sn39-v1") is False
+    assert snapshot.admits_profile("cpu-tdx-sn94-v1") is False
     assert snapshot.max_admitted_workers_total == 16
 
 

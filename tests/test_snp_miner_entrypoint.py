@@ -74,25 +74,25 @@ def test_snp_entrypoint_refuses_caller_snpguest_override_before_writing_tls(tmp_
 
 
 def test_snp_image_pins_official_snpguest_and_fixed_entrypoint() -> None:
-    dockerfile = (REPOSITORY_ROOT / "Dockerfile.sn39-snp-miner").read_text()
+    dockerfile = (REPOSITORY_ROOT / "Dockerfile.sn94-snp-miner").read_text()
 
     assert "https://github.com/virtee/snpguest/releases/download/v0.10.0/snpguest" in dockerfile
     assert SNPGUEST_DIGEST in dockerfile
     assert 'ENTRYPOINT ["python", "-I", "-u", "-B", "-m", "cathedral.snp_miner_entrypoint"]' in dockerfile
-    assert 'org.cathedral.sn39.runtime-contract="snp-signed-validator-fleet-v1"' in dockerfile
+    assert 'org.cathedral.sn94.runtime-contract="snp-signed-validator-fleet-v1"' in dockerfile
     assert "TSM_REPORT_ROOT" not in dockerfile
     assert "WALLET_SEED" not in dockerfile
 
 
 def test_snp_host_launcher_is_syntax_valid_and_exposes_only_sev_guest_hardware() -> None:
-    script_path = REPOSITORY_ROOT / "scripts" / "run_sn39_snp_miner.sh"
+    script_path = REPOSITORY_ROOT / "scripts" / "run_sn94_snp_miner.sh"
     script = script_path.read_text()
 
     result = subprocess.run(
         ["bash", "-n", str(script_path)], capture_output=True, text=True, check=False
     )
     assert result.returncode == 0, result.stderr
-    assert "SN39_SNP_MINER_IMAGE" in script
+    assert "SN94_SNP_MINER_IMAGE" in script
     assert SNP_IMAGE_PATH in script
     assert "--device \"${SEV_GUEST_DEVICE}:${SEV_GUEST_DEVICE}:rwm\"" in script
     assert "/dev/sev-guest" in script
@@ -108,7 +108,7 @@ def test_snp_host_launcher_is_syntax_valid_and_exposes_only_sev_guest_hardware()
 
 
 def test_snp_doc_pins_the_published_image_without_claiming_a_live_machine() -> None:
-    document = (REPOSITORY_ROOT / "docs" / "SN39_SNP_MINER_IMAGE.md").read_text()
+    document = (REPOSITORY_ROOT / "docs" / "SN94_SNP_MINER_IMAGE.md").read_text()
 
     assert f"{SNP_IMAGE_PATH}@sha256:{SNP_IMAGE_DIGEST}" in document
     assert SNP_SOURCE_COMMIT in document

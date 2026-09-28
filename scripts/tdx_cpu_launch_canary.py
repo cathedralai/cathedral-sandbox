@@ -2,7 +2,7 @@
 """Exercise the retained registry, receipt, and epoch library on TDX workers.
 
 This is not the current direct-validator launch test and does not prove current
-SN39 mining, weight, or emission.
+SN94 mining, weight, or emission.
 
 The dedicated canary and enrolled worker must be different TDX platforms with
 public-IP HTTPS endpoints.  Each endpoint must terminate its TLS private key
@@ -496,7 +496,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Retained registry and receipt canary. Not a current direct-validator "
-            "SN39 launch proof."
+            "SN94 launch proof."
         )
     )
     parser.add_argument("--canary-hotkey", required=True)

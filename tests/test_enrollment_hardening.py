@@ -110,7 +110,7 @@ def _signed_payload(
         "signature_b64": sig,
     }
     if domain_bound:
-        payload.update(network="finney", netuid=39)
+        payload.update(network="finney", netuid=94)
     return payload
 
 

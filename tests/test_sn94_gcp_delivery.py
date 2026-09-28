@@ -1,4 +1,4 @@
-"""Fixed-policy tests for the bounded SN39 GCP snapshot delivery bridge."""
+"""Fixed-policy tests for the bounded SN94 GCP snapshot delivery bridge."""
 
 from __future__ import annotations
 
@@ -36,9 +36,9 @@ def _load_script(name: str, filename: str) -> ModuleType:
     return module
 
 
-poller = _load_script("sn39_gcp_guest_poller_test", "sn39_gcp_guest_poller.py")
+poller = _load_script("sn94_gcp_guest_poller_test", "sn94_gcp_guest_poller.py")
 publisher = _load_script(
-    "sn39_gcp_snapshot_publisher_test", "sn39_gcp_snapshot_publisher.py"
+    "sn94_gcp_snapshot_publisher_test", "sn94_gcp_snapshot_publisher.py"
 )
 producer = _load_script(
     "cathedral_validator_access_delivery_test", "cathedral_validator_access.py"
@@ -72,7 +72,7 @@ def _signed_snapshot(*, generated_at: datetime, expires_at: datetime) -> bytes:
     unsigned = {
         "schema": VALIDATOR_ACCESS_SNAPSHOT_SCHEMA,
         "network": "finney",
-        "netuid": 39,
+        "netuid": 94,
         "block": 8_948_557,
         "block_hash": "0x" + "1" * 64,
         "block_is_finalized": True,
@@ -168,14 +168,14 @@ def test_plan_is_no_write_and_fully_bounded(capsys, monkeypatch):
     operations = (
         Path(__file__).resolve().parents[1]
         / "docs"
-        / "SN39_AUDIT_MINER_OPERATIONS.md"
+        / "SN94_AUDIT_MINER_OPERATIONS.md"
     ).read_text()
     assert "Source: 78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8" in operations
     assert IMAGE in operations
     assert "9fa697989089ba87c0aa798f2c4f3f525d428958" not in operations
     assert document["validator_access"] == {
         "network": "finney",
-        "netuid": 39,
+        "netuid": 94,
         "minimum_stake_rao": 0,
         "required_uid": 30,
         "required_hotkey": publisher.UID30_HOTKEY,
@@ -280,7 +280,7 @@ def test_capture_command_is_fixed_to_finalized_uid30_policy(tmp_path):
     )
 
     assert _flag_value(command, "--network") == "finney"
-    assert _flag_value(command, "--netuid") == "39"
+    assert _flag_value(command, "--netuid") == "94"
     assert _flag_value(command, "--minimum-stake-rao") == "0"
     assert _flag_value(command, "--valid-seconds") == "900"
     assert _flag_value(command, "--max-age-seconds") == "900"
@@ -326,7 +326,7 @@ def test_snapshot_producer_refuses_changed_uid30_or_uid124_mapping(tmp_path, mon
         "--network",
         "finney",
         "--netuid",
-        "39",
+        "94",
         "--minimum-stake-rao",
         "0",
         "--signing-key-id",
@@ -761,7 +761,7 @@ def test_same_height_resign_remains_served_after_prior_snapshot_expires(
             path.read_bytes(),
             trusted_keys,
             network="finney",
-            netuid=39,
+            netuid=94,
             required_minimum_stake_rao=0,
             now=verification_time[0],
             max_age_seconds=900,
@@ -799,7 +799,7 @@ def test_same_height_resign_remains_served_after_prior_snapshot_expires(
         str(installed_path),
         trusted_keys,
         network="finney",
-        netuid=39,
+        netuid=94,
         minimum_stake_rao=0,
         state=ValidatorAccessState(str(provider_state_path)),
         max_age_seconds=900,

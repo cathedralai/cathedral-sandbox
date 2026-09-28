@@ -1,7 +1,7 @@
 [project]
 name = "cathedral"
 version = "0.0.0"
-description = "Confidential compute subnet (SN39): attestation is admission, verified work is currency"
+description = "Confidential compute subnet (SN94): attestation is admission, verified work is currency"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

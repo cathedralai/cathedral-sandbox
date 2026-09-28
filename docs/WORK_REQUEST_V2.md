@@ -1,7 +1,7 @@
 # Validator access and fleet protocol
 
 This document defines the machine-facing contract between a Cathedral miner
-worker and a direct SN39 validator.
+worker and a direct SN94 validator.
 
 It is not a weight relay. The access snapshot only tells the worker which
 validator hotkeys may call protected routes. The validator verifies machines,
@@ -41,7 +41,7 @@ The decoded JSON has this exact schema:
   "validator_hotkey": "<validator SS58 hotkey>",
   "worker_hotkey": "<miner SS58 hotkey>",
   "network": "finney",
-  "netuid": 39,
+  "netuid": 94,
   "method": "POST",
   "path": "/v1/fleet",
   "body_sha256": "sha256:<64 lowercase hex>",
@@ -132,7 +132,7 @@ The worker consumes this exact signed document:
 {
   "schema": "cathedral_validator_access_snapshot_v1",
   "network": "finney",
-  "netuid": 39,
+  "netuid": 94,
   "block": 12345678,
   "block_hash": "0x<64 lowercase hex>",
   "block_is_finalized": true,
@@ -196,7 +196,7 @@ Capture and atomically publish a 15-minute finalized view:
 ```bash
 python scripts/cathedral_validator_access.py capture \
   --network finney \
-  --netuid 39 \
+  --netuid 94 \
   --minimum-stake-rao 0 \
   --signing-key-id cathedral-validator-access-1 \
   --signing-key-file ../cathedral-validator-access-state/snapshot.seed \
@@ -213,7 +213,7 @@ python scripts/cathedral_validator_access.py verify \
   --keys ../cathedral-validator-access-state/snapshot-keys.json \
   --keys-digest "$KEYS_DIGEST" \
   --network finney \
-  --netuid 39 \
+  --netuid 94 \
   --minimum-stake-rao 0
 ```
 
@@ -263,7 +263,7 @@ cathedral worker serve \
   --validator-access-state /var/lib/cathedral/validator-access.sqlite \
   --validator-minimum-stake-rao 0 \
   --validator-network finney \
-  --validator-netuid 39 \
+  --validator-netuid 94 \
   --public-endpoint https://<primary-public-ip>:8081 \
   --fleet-manifest /srv/cathedral/fleet.json
 ```

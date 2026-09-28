@@ -425,7 +425,7 @@ def test_manifest_roundtrip_and_validation(tmp_path: Path):
             }
         ],
         candidate_set={
-            "source": "sn39_metagraph",
+            "source": "sn94_metagraph",
             "network": NETWORK,
             "netuid": NETUID,
             "block": 100,
@@ -491,7 +491,7 @@ def test_signed_index_verification_and_tampering(tmp_path: Path):
             expected_netuid=NETUID,
         )
     with pytest.raises(EvidenceError, match="network/netuid"):
-        verify_index(index, keys, expected_network="finney", expected_netuid=39)
+        verify_index(index, keys, expected_network="finney", expected_netuid=94)
     with pytest.raises(EvidenceError, match="stale"):
         verify_index(
             index,
@@ -2075,7 +2075,7 @@ def test_manifest_candidate_and_receipt_cardinality_boundaries():
                 for index in range(receipt_count)
             ],
             candidate_set={
-                "source": "sn39_metagraph",
+                "source": "sn94_metagraph",
                 "network": NETWORK,
                 "netuid": NETUID,
                 "block": 100,
@@ -2185,7 +2185,7 @@ def test_maximum_launch_manifest_fits_the_public_fetch_ceiling():
             for hotkey in verified
         ],
         candidate_set={
-            "source": "sn39_metagraph",
+            "source": "sn94_metagraph",
             "network": NETWORK,
             "netuid": NETUID,
             "block": 100,
@@ -2231,7 +2231,7 @@ def test_manifest_builder_rejects_escape_amplification_before_publication():
             receipts=[],
             attestations=[],
             candidate_set={
-                "source": "sn39_metagraph",
+                "source": "sn94_metagraph",
                 "network": NETWORK,
                 "netuid": NETUID,
                 "block": 100,

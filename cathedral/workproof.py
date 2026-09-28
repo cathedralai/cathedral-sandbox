@@ -1,6 +1,6 @@
 """Retained SAT replay for the legacy provenance path.
 
-The current direct SN39 validator verifies SAT responses directly and does not
+The current direct SN94 validator verifies SAT responses directly and does not
 consume this published work-proof chain.
 
 A hardware quote proves *where* work ran; it says nothing about *what* work

@@ -5,8 +5,8 @@ operator guide.
 
 ## Current operator references
 
-- [Intel TDX image contract](SN39_AUDIT_MINER_IMAGE.md)
-- [AMD SEV-SNP image contract](SN39_SNP_MINER_IMAGE.md)
+- [Intel TDX image contract](SN94_AUDIT_MINER_IMAGE.md)
+- [AMD SEV-SNP image contract](SN94_SNP_MINER_IMAGE.md)
 - [Validator access and multi-machine fleet protocol](WORK_REQUEST_V2.md)
 - [Intel TDX verifier release](TDX_VERIFIER_RELEASE.md)
 - [AMD SEV-SNP miner and first hardware proof](AMD_SEV_SNP_FRIEND_TEST.md)
@@ -19,7 +19,7 @@ order.
 
 The remaining documents specify library behavior such as receipts, workload
 admission, key release, lifecycle state, provider contracts, and policy
-registries. They are for developers and reviewers. They are not alternate SN39
+registries. They are for developers and reviewers. They are not alternate SN94
 mining paths.
 
 The current Cathedral validator derives weights directly from miner evidence.

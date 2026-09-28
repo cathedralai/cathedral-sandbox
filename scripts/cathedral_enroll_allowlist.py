@@ -447,7 +447,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cathedral_enroll_allowlist.py",
         description=(
             "Retained legacy central-enrollment allowlist tooling. Not used "
-            "by current direct SN39 mining."
+            "by current direct SN94 mining."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)

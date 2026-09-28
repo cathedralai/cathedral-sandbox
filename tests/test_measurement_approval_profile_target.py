@@ -2,7 +2,7 @@
 
 A registry keeps every prior profile after a rollover, so the profile a
 measurement lands in can never be inferred from list position: after
-``rollover`` appends ``cpu-tdx-sn39-v2``, ``profiles[0]`` is still the legacy
+``rollover`` appends ``cpu-tdx-sn94-v2``, ``profiles[0]`` is still the legacy
 ``v1`` profile. These tests prove that an approval aimed at v2 mutates only
 v2, that the v1 profile is byte-identical afterwards, and that every way of
 naming the wrong profile fails before any live capture or write happens.
@@ -34,7 +34,7 @@ assert _SPEC.loader is not None
 _SPEC.loader.exec_module(approval_tool)
 
 V1 = "cpu-tdx-sample-v1"
-V2 = "cpu-tdx-sn39-v2"
+V2 = "cpu-tdx-sn94-v2"
 NEW_MEASUREMENT = "tdx-measurement-sha256:" + "ab" * 32
 RECEIPT_SEED_V2 = bytes(range(96, 128))
 
@@ -203,7 +203,7 @@ def test_unknown_profile_id_is_refused_before_any_capture(tmp_path: Path, stub_c
     with pytest.raises(SystemExit, match="not in the registry"):
         approval_tool.main(
             _approve_argv(
-                tmp_path, registry_path, signing_key, profile_id="cpu-tdx-sn39-v9"
+                tmp_path, registry_path, signing_key, profile_id="cpu-tdx-sn94-v9"
             )
         )
     assert stub_capture == []  # no live probe was spent

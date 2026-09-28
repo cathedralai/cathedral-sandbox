@@ -1,6 +1,6 @@
 # Cathedral Computer customer receipts
 
-> Product-library reference. Customer receipts are not the current SN39 weight
+> Product-library reference. Customer receipts are not the current SN94 weight
 > path. Mining starts in the repository [README](../README.md).
 
 `cathedral_customer_receipt_v1` is a public, offline-verifiable contract for
@@ -150,7 +150,7 @@ teardown before a `ready` receipt verifies.
 
 When present, `task_policy` is inside the signed canonical body. Cathedral's
 signature covers it. Offline verify checks structure only; a consumer such as
-SN39 `agent_enclave` still enforces its own exact-allowlist match.
+SN94 `agent_enclave` still enforces its own exact-allowlist match.
 
 Required sub-fields:
 

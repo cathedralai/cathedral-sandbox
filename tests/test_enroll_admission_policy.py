@@ -79,8 +79,8 @@ PUBLIC = (
 TRUSTED = {KEY_ID: PUBLIC}
 
 NETWORK = "finney"
-NETUID = 39
-PROFILE = "cpu-tdx-sn39-v2"
+NETUID = 94
+PROFILE = "cpu-tdx-sn94-v2"
 ENDPOINT = "https://8.8.8.8:8443"
 ENDPOINT_TWO = "https://9.9.9.9:8443"
 
@@ -441,9 +441,9 @@ def test_endpoint_substitution_after_signing_is_refused(tmp_path: Path):
 
 
 def test_a_profile_swap_after_signing_is_refused(tmp_path: Path):
-    app, _, _ = build_app(tmp_path, policy=policy_bytes(profiles=[PROFILE, "cpu-tdx-sn39-v3"]))
+    app, _, _ = build_app(tmp_path, policy=policy_bytes(profiles=[PROFILE, "cpu-tdx-sn94-v3"]))
     payload = v2_payload()
-    payload["requested_profile_id"] = "cpu-tdx-sn39-v3"
+    payload["requested_profile_id"] = "cpu-tdx-sn94-v3"
     status, body = call(app, payload)
     assert status == 400
     assert body["error"] == "invalid enroll signature"
@@ -451,7 +451,7 @@ def test_a_profile_swap_after_signing_is_refused(tmp_path: Path):
 
 def test_a_profile_outside_the_policy_is_refused(tmp_path: Path):
     app, store, _ = build_app(tmp_path)
-    status, body = call(app, v2_payload(profile="cpu-tdx-sn39-v1"))
+    status, body = call(app, v2_payload(profile="cpu-tdx-sn94-v1"))
     assert status == 403
     assert body["error"] == "requested profile is not offered by the current policy"
     assert row(store, HOTKEY) is None
@@ -548,7 +548,7 @@ def test_v2_cannot_collide_with_the_domain_tagged_v1_payload(tmp_path: Path):
     "mutation",
     [
         {"hotkey": "not-a-key"},
-        {"netuid": "39"},
+        {"netuid": "94"},
         {"netuid": 99999},
         {"network": "FINNEY"},
         {"requested_profile_id": "../../etc/passwd"},

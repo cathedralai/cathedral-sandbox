@@ -1,6 +1,6 @@
 """Retained epoch-library TDX challenge derivation.
 
-The current direct SN39 validator issues its own fresh challenges and does not
+The current direct SN94 validator issues its own fresh challenges and does not
 consume this public epoch nonce.
 
 A random issuer nonce is not a public freshness proof: nothing ties it to

@@ -39,7 +39,7 @@ from cathedral.cli import _verify_wire_vector
 from cathedral.provenance import ProvenanceResult, compare_with_vector
 
 NETWORK = "finney"
-NETUID = 39
+NETUID = 94
 SOURCE_EPOCH = 11
 BURN_HOTKEY = "5FburnDestinationColdStorage11111111111111111111"
 MINERS = {

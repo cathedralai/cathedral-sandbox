@@ -1,6 +1,6 @@
 # Assurance claims
 
-> Developer reference. This is not an SN39 miner setup guide. Start at the
+> Developer reference. This is not an SN94 miner setup guide. Start at the
 > repository [README](../README.md).
 
 Cathedral reports four independent assurance claims. A claim has one status:

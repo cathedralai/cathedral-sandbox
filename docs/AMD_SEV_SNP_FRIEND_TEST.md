@@ -1,16 +1,16 @@
 # AMD SEV-SNP miner
 
-AMD SEV-SNP is a scored SN39 CPU path in the current direct validator source.
+AMD SEV-SNP is a scored SN94 CPU path in the current direct validator source.
 Each validator owns its SNP admission policy and accepts a machine only after
 adding its observed measurement, processor generation, and minimum TCB. This
-repository serves the evidence and work but does not write SN39 weights. The
+repository serves the evidence and work but does not write SN94 weights. The
 validator still requires fresh vendor-verified evidence, the live TLS key bound
 into the report, a distinct hardware identity, and canonical SAT. Registration,
 policy admission, and a local probe do not earn weight by themselves.
 
 The current TDX audit-miner image is not an SNP image. Use only the separate
 immutable SNP image and launcher described in
-[SN39 SNP miner image](SN39_SNP_MINER_IMAGE.md). The current published pin is
+[SN94 SNP miner image](SN94_SNP_MINER_IMAGE.md). The current published pin is
 fixed below. The image digest does not receive weight. A machine started from
 that image contributes to its UID only after the scoring validator admits its
 live measurement and TCB and verifies fresh evidence and SAT.
@@ -152,7 +152,7 @@ docker pull --platform linux/amd64 "$SNP_IMAGE"
 test "$(docker image inspect "$SNP_IMAGE" \
   --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
 test "$(docker image inspect "$SNP_IMAGE" \
-  --format '{{index .Config.Labels "org.cathedral.sn39.runtime-contract"}}')" = \
+  --format '{{index .Config.Labels "org.cathedral.sn94.runtime-contract"}}')" = \
   snp-signed-validator-fleet-v1
 SOURCE_COMMIT="$(docker image inspect \
   --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
@@ -201,18 +201,18 @@ On the SNP guest:
 
 ```bash
 sudo install -o root -g root -m 0700 \
-  cathedral-snp-runtime/scripts/run_sn39_snp_miner.sh \
-  /usr/local/sbin/cathedral-run-sn39-snp-miner
+  cathedral-snp-runtime/scripts/run_sn94_snp_miner.sh \
+  /usr/local/sbin/cathedral-run-sn94-snp-miner
 sudo install -o root -g root -m 0644 \
-  cathedral-snp-runtime/examples/systemd/cathedral-sn39-snp-miner.service \
-  /etc/systemd/system/cathedral-sn39-snp-miner.service
+  cathedral-snp-runtime/examples/systemd/cathedral-sn94-snp-miner.service \
+  /etc/systemd/system/cathedral-sn94-snp-miner.service
 sudo install -d -o root -g root -m 0700 /etc/cathedral
 sudo install -o root -g root -m 0600 \
-  cathedral-snp-runtime/examples/systemd/sn39-snp-miner.env.example \
-  /etc/cathedral/sn39-snp-miner.env
+  cathedral-snp-runtime/examples/systemd/sn94-snp-miner.env.example \
+  /etc/cathedral/sn94-snp-miner.env
 ```
 
-Edit `/etc/cathedral/sn39-snp-miner.env`. Set the published immutable image
+Edit `/etc/cathedral/sn94-snp-miner.env`. Set the published immutable image
 reference to the same value as `SNP_IMAGE`, public miner hotkey, public HTTPS
 endpoint, and SHA-256 of
 `/etc/cathedral/validator-access/snapshot-keys.json`. A mutable image tag is
@@ -222,9 +222,9 @@ Then start and inspect the service:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now cathedral-sn39-snp-miner.service
-sudo systemctl status cathedral-sn39-snp-miner.service
-sudo journalctl -u cathedral-sn39-snp-miner.service -n 100 --no-pager
+sudo systemctl enable --now cathedral-sn94-snp-miner.service
+sudo systemctl status cathedral-sn94-snp-miner.service
+sudo journalctl -u cathedral-sn94-snp-miner.service -n 100 --no-pager
 ```
 
 Do not register or announce the hotkey yet. Give the validator operator the
@@ -242,7 +242,7 @@ report. A successful validator round additionally proves that its policy
 admitted the machine and that its endpoint, TLS key, and hardware identity did
 not collide.
 
-Neither check proves SN39 registration, a finalized UID30 weight row, subnet
+Neither check proves SN94 registration, a finalized UID30 weight row, subnet
 emission, or TAO earnings. Those require the separate live chain test.
 Neither check remotely proves the OCI image digest or continuous runtime
 integrity after boot.

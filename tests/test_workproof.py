@@ -224,7 +224,7 @@ def test_challenge_derivation_is_deterministic_and_slot_unique():
         "block": 100,
         "block_hash": "0x" + "ab" * 32,
         "network": "finney",
-        "netuid": 39,
+        "netuid": 94,
         "source_epoch": 11,
         "miner_hotkey": "tdx-miner",
     }

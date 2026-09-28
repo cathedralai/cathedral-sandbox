@@ -1,4 +1,4 @@
-"""Signed, versioned admission policy governing SN39 miner enrollment.
+"""Signed, versioned admission policy governing SN94 miner enrollment.
 
 One artifact answers every question the enrollment door asks that is not
 "does this key control this request":
@@ -172,7 +172,7 @@ def verify_admission_policy(
 
     The expected network and netuid are caller-supplied and mandatory: a
     policy signed for a testnet, or for a different subnet, must never gate
-    a mainnet SN39 service even when the same operator key signed it. Both
+    a mainnet SN94 service even when the same operator key signed it. Both
     the artifact and the service must agree.
 
     Raises AdmissionPolicyError (or PolicyRegistryError from the shared

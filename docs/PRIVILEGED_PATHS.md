@@ -1,6 +1,6 @@
 # Privileged path trust
 
-> Host-hardening reference. This is not an SN39 miner setup guide. Start at the
+> Host-hardening reference. This is not an SN94 miner setup guide. Start at the
 > repository [README](../README.md).
 
 The policy republisher example below belongs to a retained legacy library. The
@@ -21,8 +21,8 @@ owner. When the owner is the untrusted party, 0600 is exactly as dangerous as
 0666 and considerably more reassuring to read.
 
 The same shape shipped in this repository:
-`examples/systemd/cathedral-sn39-policy-republisher.service` ran `User=root`
-with `ExecStart=/home/polaris/cathedral-sn39/.venv/bin/python`. `ProtectHome=`
+`examples/systemd/cathedral-sn94-policy-republisher.service` ran `User=root`
+with `ExecStart=/home/polaris/cathedral-sn94/.venv/bin/python`. `ProtectHome=`
 `read-only` does not help — it stops the *service* writing `/home`, not the
 owner of `/home` writing it first.
 
@@ -102,7 +102,7 @@ chain rather than rejecting the layout or following it blindly:
 
 ```bash
 /usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py \
-  --resolve-symlinks /opt/cathedral-sn39/.venv/bin/python
+  --resolve-symlinks /opt/cathedral-sn94/.venv/bin/python
 ```
 
 Check every file below the two import roots used by the republisher:
@@ -110,8 +110,8 @@ Check every file below the two import roots used by the republisher:
 ```bash
 /usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py \
   --tree \
-  /opt/cathedral-sn39/cathedral \
-  /opt/cathedral-sn39/.venv/lib/python3.11/site-packages
+  /opt/cathedral-sn94/cathedral \
+  /opt/cathedral-sn94/.venv/lib/python3.11/site-packages
 ```
 
 For a file that the program securely creates on first use, check the existing
@@ -120,8 +120,8 @@ leaf when present or its complete parent chain when absent:
 ```bash
 /usr/bin/python3 -I -S /usr/local/libexec/cathedral-privileged-paths.py \
   --creatable-file \
-  /var/lib/cathedral-confidential-sn39/policy-republication.jsonl \
-  /var/lib/cathedral-confidential-sn39/policy-writer.lock
+  /var/lib/cathedral-confidential-sn94/policy-republication.jsonl \
+  /var/lib/cathedral-confidential-sn94/policy-writer.lock
 ```
 
 The actual service runs Python with `-I -S`. `-I` ignores Python environment

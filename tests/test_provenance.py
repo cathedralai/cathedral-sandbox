@@ -346,7 +346,7 @@ def test_wrong_network_and_netuid_are_rejected(exported):
     with pytest.raises(ProvenanceError, match="network/netuid"):
         _verify(report, receipts, expected_network="finney")
     with pytest.raises(ProvenanceError, match="network/netuid"):
-        _verify(report, receipts, expected_netuid=39)
+        _verify(report, receipts, expected_netuid=94)
 
 
 def test_wrong_pinned_verifier_digest_is_rejected(exported):
@@ -663,7 +663,7 @@ def test_candidate_omission_cannot_inflate_a_survivor(exported):
     report that drops an entry for an anchored candidate."""
     report, receipts = exported
     candidate_set = {
-        "source": "sn39_metagraph",
+        "source": "sn94_metagraph",
         "network": "local",
         "netuid": 1,
         "block": 100,

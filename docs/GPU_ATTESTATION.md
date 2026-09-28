@@ -1,6 +1,6 @@
 # Composite confidential-GPU attestation
 
-> Development reference. GPU scoring is not enabled on SN39. Mining starts in
+> Development reference. GPU scoring is not enabled on SN94. Mining starts in
 > the repository [README](../README.md).
 
 Status: hardware-free foundation and explicit signed GPU worker endpoints
