@@ -26,7 +26,11 @@ A leaked probe key lets its holder register the box under another hotkey,
 which the first-claim rule below refuses while the owner's claim holds, and
 keep the 8-sandbox cap full so the prober's challenge cannot start. The
 runbook gives the rotation: delete the key on the box, rerun the installer
-with ``--probe-template``, register again.
+with ``--probe-template``, register again. Rotating ends every claim made with
+the old key, the owner's too until the new registration passes a probe; while
+a squatter's claim holds, the owner's new registration is refused as another
+hotkey's until the prober sees the squatter's probe fail, so the owner retries
+after the next probe round.
 
 Capacity. The prober's challenge runs in one probe sandbox, so the prober
 probes, and pays, the box at the probe template's shape

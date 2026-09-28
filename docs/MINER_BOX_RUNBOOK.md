@@ -104,7 +104,11 @@ ssh SSH_TARGET sudo rm /var/lib/cathedral/probe-key
 deploy/cathedral/install-runtime-host.sh ... --probe-template "$PROBE_SHAPE" SSH_TARGET
 ```
 
-The old key stops working at once, so a claim made with it stops passing the probe and lapses.
+The old key stops working at once, so every claim made with it stops passing the probe and
+lapses: a squatter's, and your own until your new registration passes a probe. While a
+squatter's claim still holds the box, the endpoint refuses your new registration as held by
+another hotkey, until the prober sees the squatter's probe fail; if it is refused, submit it
+again after the next probe round.
 
 **Check the prober key.** Take `--prober-key` only from the SN94 owner's published prober
 attestation, whose quote binds that key; a key from anywhere else could hand your box to

@@ -211,10 +211,10 @@ def test_replays_are_ordered_per_ip_and_hotkey_by_the_signed_issued_at():
     # verifies and opens (only the probe fails), but it is ordered in its own
     # scope, so it never outranks or refuses the owner's renewal.
     squatter = _verify(
-        _registration(keypair=OTHER, runtime_key=b"f" * 64, now=NOW + reg.ISSUED_AT_SKEW), now=NOW
+        _registration(keypair=OTHER, probe_key=b"f" * 64, now=NOW + reg.ISSUED_AT_SKEW), now=NOW
     )
     assert (squatter.control_url, squatter.box_key) == (owner.control_url, owner.box_key)
-    assert reg.open_runtime_key(squatter, PROBER) == b"f" * 64
+    assert reg.open_probe_key(squatter, PROBER) == b"f" * 64
     owner_scope, owner_order = reg.replay_order(owner)
     squatter_scope, squatter_order = reg.replay_order(squatter)
     assert owner_scope == ("34.1.2.3", MINER.ss58_address)
@@ -250,13 +250,13 @@ def test_a_proxy_on_a_second_ip_seals_the_same_key_digest():
         )
     )
     assert (direct.control_url, direct.box_key) != (proxied.control_url, proxied.box_key)
-    digest = reg.opened_key_digest(reg.open_runtime_key(direct, PROBER))
-    assert digest == reg.opened_key_digest(reg.open_runtime_key(proxied, PROBER))
-    assert digest != reg.opened_key_digest(RUNTIME_KEY + b"x")
+    digest = reg.opened_key_digest(reg.open_probe_key(direct, PROBER))
+    assert digest == reg.opened_key_digest(reg.open_probe_key(proxied, PROBER))
+    assert digest != reg.opened_key_digest(PROBE_KEY + b"x")
     assert len(digest) == 64 and int(digest, 16) >= 0
-    assert digest != hashlib.sha256(RUNTIME_KEY).hexdigest()  # domain-separated
+    assert digest != hashlib.sha256(PROBE_KEY).hexdigest()  # domain-separated
     with pytest.raises(reg.RegistrationError, match="must be bytes"):
-        reg.opened_key_digest(RUNTIME_KEY.decode())
+        reg.opened_key_digest(PROBE_KEY.decode())
 
 
 @pytest.mark.parametrize("form", ["extra key", "json string"])
