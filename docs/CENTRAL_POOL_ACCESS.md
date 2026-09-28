@@ -67,24 +67,47 @@ points:
   certificate, so the listener could at most use optional client
   authentication. A per-request signature also carries what a TLS session
   cannot: the route, the body hash, a nonce, and the worker's own TLS key.
-  That is the same binding validators already use, so the worker verifies both
-  with one reviewed code path.
+  That is the same binding validators already use. The code path is not
+  shared: #225 (open) adds a separate Ed25519 verifier, the new `central_access`
+  module. It reuses the validator replay store (`ValidatorAccessState`, on its
+  own file), the root-key loader `load_policy_keys`, and the registry's
+  `parse_registry_json` and `canonical_json` encoding; the verification logic
+  itself is new.
 
 ### Miner opt-in
 
-The miner sets one value, `CATHEDRAL_CENTRAL_ROOT_DIGEST`: the SHA-256 of the
-root public-key file it trusts. The image admits it as an optional input
-alongside its current inputs. Unset, the worker refuses every central request.
-The root public key itself ships in the release bundle. Pinning its digest in
-the miner's own env file means a release cannot switch central access on by
-itself.
+The miner opts in with three worker flags, proposed in #228 (open), all of them or
+none:
+
+- `--central-root-keys`: the Cathedral root public-key file;
+- `--central-root-keys-digest`: the `sha256:` pin that the whole key file
+  must match;
+- `--central-access-state`: an owner-only SQLite file for the central replay
+  table and delegation high-water, which must not be the validator access
+  state file.
+
+Setting only some of them refuses to start, and central access also requires
+signed validator access and native TLS. With none set, the worker serves no
+central request. The root public key itself ships in the release bundle.
+Because the miner supplies the digest pin, shipping a root key in a release
+does not by itself switch central access on. Passing these flags through the
+shipped images' admitted inputs is not part of #228.
+
+That consent holds only against an honest release. The release-signing key
+runs arbitrary code as root on every enrolled miner
+([MINER_AUTO_UPDATE.md](MINER_AUTO_UPDATE.md) lines 19-22). A malicious release
+can therefore set these flags itself, replace the worker, or bypass the check
+altogether. The pin records the miner's choice; it does not protect
+that choice from whoever holds the release key.
 
 ### Delegation
 
 The root signs a delegation containing:
 
 - `schema`: `cathedral_central_delegation_v1`;
-- `central_key`: the online Ed25519 public key;
+- `root_key_id`: which key in the pinned root file signed it;
+- `central_key_base64`: the online Ed25519 public key, 32 bytes in canonical
+  base64;
 - `routes`: an explicit list, initially `POST /v1/capabilities` only;
 - `network` and `netuid`: the subnet it is valid for;
 - `sequence`: a monotonic integer;
@@ -109,7 +132,7 @@ checks, before reading the body:
 3. the route is in the delegation's list;
 4. the worker hotkey, network, netuid and channel binding are this worker's;
 5. the request window is at most 120 seconds and current;
-6. the request signature verifies under `central_key`.
+6. the request signature verifies under the delegation's `central_key_base64`.
 
 After reading the body it checks the body hash and records the nonce in a
 central replay table, separate from the validator table and its 4096-entry cap
@@ -130,10 +153,21 @@ Central gets its own pool, limiter and replay table:
 - Delegations expire within 24 hours, so a lost online key is useful for at
   most a day.
 - For faster revocation, the root signs a `cathedral_central_revocations_v1`
-  list with a monotonic sequence. Workers fetch it with the validator-access
-  fetch timer and refuse any listed delegation.
+  list with a monotonic sequence, and a worker refuses any listed delegation.
+  The format and its verifier exist, but fetching the list is not implemented
+  in implementation-plan item 2 (#228): nothing installs a list, and the worker holds revocations
+  only in memory. Until fetching lands, the 24-hour delegation expiry is the
+  only bound on a compromised delegation.
+- When fetching lands, the worker must persist the list and its sequence in
+  the central access state. Otherwise a restart drops them, and an older list
+  could be accepted again.
+- A revocation list has no freshness bound. Its `issued_at` is parsed but not
+  checked against a maximum age, so withholding a newer list delays revocation
+  without failing closed. The 24-hour delegation expiry remains the real bound;
+  revocation can only shorten it.
 - Rotating the root means shipping a new root file in a release and each miner
-  updating `CATHEDRAL_CENTRAL_ROOT_DIGEST`. That is consent again, by design.
+  updating `--central-root-keys-digest`. That is consent again, by design,
+  with the same limit as above: it binds honest releases only.
 
 ### Scope
 
@@ -160,10 +194,13 @@ into the validator's evidence. Central access cannot raise a miner's weight.
 | A delegation without its key | Nothing; every request must be signed by the delegated key |
 | The root key | Central access on opted-in miners until they change their pinned digest |
 | A miner machine | No central credential is stored on it |
+| The release-signing key | Root on every host that follows its channel, within about an hour; it can enable or bypass central access whatever digest the miner pinned |
 
 The release-signing key is already root on every enrolled miner
-([MINER_AUTO_UPDATE.md](MINER_AUTO_UPDATE.md)). Keep the central root separate
-from it, so compromising one does not grant the other.
+([MINER_AUTO_UPDATE.md](MINER_AUTO_UPDATE.md) lines 19-22). Keep the central
+root separate from it, so that compromising the central root does not grant
+code execution on miners. The reverse does not hold: on enrolled miners, a
+release-key compromise includes everything a central-root compromise gives.
 
 ## Implementation plan
 
@@ -172,10 +209,10 @@ from it, so compromising one does not grant the other.
    table.
 2. `cathedral/worker.py`: the central pool, and route admission for a verified
    central request.
-3. `cathedral/cli.py` and the image entrypoints: the optional root-digest
-   input and its all-or-none checks.
+3. `cathedral/cli.py` and the image entrypoints: the optional central flags
+   and their all-or-none checks.
 4. `scripts/`: offline tooling to sign delegations and revocation lists.
 5. Tests: every refusal above, with a mutation check for each.
 
-Items 1-3 ship switched off. A miner enables them only by setting the root
-digest.
+Items 1-3 ship switched off. A miner enables them only by setting all three
+central flags.
