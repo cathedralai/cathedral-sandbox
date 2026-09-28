@@ -1,8 +1,11 @@
 """The miner products a signed release can describe, and what their launchers say.
 
 Two miners share the updater: the Intel TDX audit miner and the AMD SEV-SNP
-miner. Each is identified here only by a neutral product id and the runtime
-contract its launcher enforces.
+miner. Each is identified here only by a neutral product id, the runtime
+contract its launcher enforces, and the contracts its earlier releases
+enforced. The earlier contracts let the bootstrap recognise a host that still
+runs an older launcher of the same product; they never let the updater
+activate one.
 
 Every other product-specific name (image repository, container, the variable
 that pins the image, the image label that declares the contract) is read from
@@ -28,21 +31,40 @@ class MinerProduct:
     product: str
     runtime_contract: str
     description: str
+    previous_contracts: tuple[str, ...] = ()
+    """Contracts earlier releases of this product enforced, oldest first.
+
+    Listed explicitly rather than guessed from the contract's spelling. Only
+    the bootstrap reads them, to adopt a running older launcher as the legacy
+    release; a signed release must still name ``runtime_contract``.
+    """
+
+    @property
+    def contracts(self) -> tuple[str, ...]:
+        """Every contract this product has enforced, the current one last."""
+
+        return (*self.previous_contracts, self.runtime_contract)
 
 
 AUDIT_MINER = MinerProduct(
     product="audit-miner",
     runtime_contract="signed-validator-fleet-v2",
     description="Intel TDX audit miner",
+    previous_contracts=("signed-validator-fleet-v1",),
 )
 
 SNP_MINER = MinerProduct(
     product="snp-miner",
     runtime_contract="snp-signed-validator-fleet-v2",
     description="AMD SEV-SNP miner",
+    previous_contracts=("snp-signed-validator-fleet-v1",),
 )
 
 PRODUCTS = {p.product: p for p in (AUDIT_MINER, SNP_MINER)}
+
+_PRODUCT_BY_CONTRACT = {c: p for p in PRODUCTS.values() for c in p.contracts}
+if len(_PRODUCT_BY_CONTRACT) != sum(len(p.contracts) for p in PRODUCTS.values()):
+    raise AssertionError("a runtime contract belongs to more than one miner product")
 
 
 def product_by_name(name: str) -> MinerProduct:
@@ -50,6 +72,12 @@ def product_by_name(name: str) -> MinerProduct:
         return PRODUCTS[name]
     except KeyError:
         raise ValueError(f"unknown miner product: {name}") from None
+
+
+def product_for_contract(contract: str) -> MinerProduct | None:
+    """The product whose current or earlier releases enforce this contract."""
+
+    return _PRODUCT_BY_CONTRACT.get(contract)
 
 
 class LauncherProfileError(ValueError):
@@ -165,5 +193,6 @@ __all__ = [
     "find_launcher",
     "parse_launcher_profile",
     "product_by_name",
+    "product_for_contract",
     "read_launcher_profile",
 ]
