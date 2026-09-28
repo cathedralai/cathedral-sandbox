@@ -21,7 +21,18 @@ What a receipt binds, and what ``verify_receipt`` checks:
   the lanes that nonce and count sample, so anyone can recompute which lanes
   were checked and re-check them;
 - timing: the exec time must fit the deadline the prober set, and the deadline
-  may be no looser than ``max_deadline_ms(spec)``.
+  may be no looser than ``max_deadline_ms(spec)``;
+- evidence (TEE boxes only, ``null`` for bare metal): which attestation the
+  prober verified before it took the hardware id, as the SHA-256 of the raw
+  quote or report, its launch measurement, the digest of the verifier that
+  checked it and the attested TLS key's SPKI hash. The digest lets a validator
+  audit a quote later against the prober's archive; it cannot re-verify the
+  quote from the receipt alone.
+
+The prober signs bare-metal receipts only when told to (``sign_receipt(...,
+allow_bare_metal=True)``): TEE boxes come first. ``verify_receipt`` accepts a
+correctly signed bare-metal receipt; whether to pay for it is the validator's
+own policy.
 
 Wire form: canonical JSON (sorted keys, no whitespace, UTF-8) of the body, and
 ``signature`` = base64 Ed25519 over those bytes with the key named by
@@ -55,7 +66,7 @@ from cathedral.capacity.challenge import (
     spec_for,
 )
 
-SCHEMA = "cathedral_capacity_receipt_v1"
+SCHEMA = "cathedral_capacity_receipt_v2"
 BOX_KINDS = ("tee", "bare_metal")
 # The one hardware identity each kind of box is deduplicated by: (kind, tee_kind) -> id kind.
 HARDWARE_ID_KINDS = {
@@ -76,6 +87,19 @@ _SS58 = re.compile(r"[1-9A-HJ-NP-Za-km-z]{46,48}")
 _BOX_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _LANE = re.compile(r"0|[1-9][0-9]{0,3}")
 _TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
+# The verifier digest, as cathedral/verify/__init__.py's implementation digest
+# and cathedral-validator's SNP verifier digest write it; a bare 64-hex digest
+# (the QVL binary's SHA-256) is written with the prefix.
+_VERIFIER_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+# The launch measurement each verifier reports: TDX as cathedral/verify/tdx_quote.py
+# computes it, SNP as the report's 48-byte MEASUREMENT in hex (cathedral/verify/snp.py).
+_MEASUREMENT = {
+    "tdx": re.compile(r"tdx-measurement-sha256:[0-9a-f]{64}"),
+    "sev_snp": re.compile(r"[0-9a-f]{96}"),
+}
+_EVIDENCE_KEYS = frozenset(
+    {"evidence_kind", "evidence_sha256", "measurement", "verifier_digest", "tls_spki_sha256"}
+)
 _BODY_KEYS = frozenset(
     {
         "schema",
@@ -89,6 +113,7 @@ _BODY_KEYS = frozenset(
         "issued_at",
         "expires_at",
         "prober_key_id",
+        "evidence",
     }
 )
 _BOX_KEYS = frozenset(
@@ -114,6 +139,17 @@ class ReceiptError(ValueError):
 
 
 @dataclass(frozen=True)
+class ReceiptEvidence:
+    """The attestation a TEE box's receipt rests on (docs/CAPACITY.md)."""
+
+    evidence_kind: str  # the box's tee_kind: tdx or sev_snp
+    evidence_sha256: str  # SHA-256 of the raw quote or report the prober verified
+    measurement: str  # tdx-measurement-sha256:<64 hex>, or the SNP MEASUREMENT's 96 hex
+    verifier_digest: str  # sha256:<64 hex>
+    tls_spki_sha256: str  # SHA-256 of the SPKI of the TLS key the evidence attests
+
+
+@dataclass(frozen=True)
 class VerifiedReceipt:
     box_id: str
     miner_hotkey: str
@@ -132,6 +168,7 @@ class VerifiedReceipt:
     timings_ms: Mapping[str, int]
     round: int
     issued_at: datetime
+    evidence: ReceiptEvidence | None  # None for bare metal
 
 
 def canonical_bytes(body: Mapping[str, Any]) -> bytes:
@@ -253,7 +290,12 @@ def make_body(
     issued_at: datetime,
     valid_for: timedelta,
     prober_key_id: str,
+    evidence: Mapping[str, str] | None,
 ) -> dict[str, Any]:
+    """The body the prober signs. ``evidence`` is required for a TEE box (the
+    five ``_EVIDENCE_KEYS``) and must be None for bare metal; ``sign_receipt``
+    checks it."""
+
     return {
         "schema": SCHEMA,
         "netuid": netuid,
@@ -281,15 +323,30 @@ def make_body(
         "issued_at": _iso(issued_at),
         "expires_at": _iso(issued_at + valid_for),
         "prober_key_id": prober_key_id,
+        # copied if it is a mapping; anything else is left for _check_body to refuse
+        "evidence": dict(evidence) if isinstance(evidence, Mapping) else evidence,
     }
 
 
-def sign_receipt(body: Mapping[str, Any], private_key: Ed25519PrivateKey) -> dict[str, Any]:
-    """The prober's side: sign a body (checked first, so it never signs junk)."""
+def sign_receipt(
+    body: Mapping[str, Any],
+    private_key: Ed25519PrivateKey,
+    *,
+    allow_bare_metal: bool = False,
+) -> dict[str, Any]:
+    """The prober's side: sign a body (checked first, so it never signs junk).
+    A bare-metal body is refused unless ``allow_bare_metal`` is True: TEE boxes
+    come first, and bare metal is deferred."""
 
+    if not isinstance(body, Mapping):
+        raise ReceiptError("body must be an object")
     if "signature" in body:
         raise ReceiptError("body already carries a signature")
-    _check_body(body)
+    if _check_body(body).kind == "bare_metal" and allow_bare_metal is not True:
+        raise ReceiptError(
+            "refusing to sign a bare-metal receipt: TEE boxes come first;"
+            " pass allow_bare_metal=True to sign one"
+        )
     signature = private_key.sign(canonical_bytes(body))
     return {**body, "signature": base64.b64encode(signature).decode()}
 
@@ -418,6 +475,7 @@ def _check_body(body: Mapping[str, Any]) -> VerifiedReceipt:
     expires_at = _parse_time(body["expires_at"], "expires_at")
     if not timedelta(0) < expires_at - issued_at <= MAX_VALIDITY:
         raise ReceiptError("receipt validity must be positive and at most 2 hours")
+    evidence = _check_evidence(body["evidence"], tee_kind)
     return VerifiedReceipt(
         box_id=box["box_id"],
         miner_hotkey=box["miner_hotkey"],
@@ -436,4 +494,36 @@ def _check_body(body: Mapping[str, Any]) -> VerifiedReceipt:
         timings_ms=dict(timings),
         round=round_,
         issued_at=issued_at,
+        evidence=evidence,
+    )
+
+
+def _check_evidence(evidence: object, tee_kind: str | None) -> ReceiptEvidence | None:
+    """Required for a TEE box and null for bare metal; ``tee_kind`` is already checked."""
+
+    if tee_kind is None:
+        if evidence is not None:
+            raise ReceiptError("a bare-metal receipt carries no evidence (null)")
+        return None
+    if not isinstance(evidence, Mapping) or set(evidence) != _EVIDENCE_KEYS:
+        raise ReceiptError(f"a tee receipt's evidence must have exactly {sorted(_EVIDENCE_KEYS)}")
+    if not isinstance(evidence["evidence_kind"], str) or evidence["evidence_kind"] != tee_kind:
+        raise ReceiptError("evidence_kind must equal the box's tee_kind")
+    measurement = evidence["measurement"]
+    if not isinstance(measurement, str) or _MEASUREMENT[tee_kind].fullmatch(measurement) is None:
+        raise ReceiptError(
+            "measurement must be tdx-measurement-sha256:<64 hex> for tdx"
+            " and 96 lowercase hex for sev_snp"
+        )
+    if not any(bytes.fromhex(measurement.rpartition(":")[2])):
+        raise ReceiptError("measurement is all zeros")
+    verifier_digest = evidence["verifier_digest"]
+    if not isinstance(verifier_digest, str) or _VERIFIER_DIGEST.fullmatch(verifier_digest) is None:
+        raise ReceiptError("verifier_digest must be sha256:<64 lowercase hex>")
+    return ReceiptEvidence(
+        evidence_kind=tee_kind,
+        evidence_sha256=_hex64(evidence["evidence_sha256"], "evidence_sha256"),
+        measurement=measurement,
+        verifier_digest=verifier_digest,
+        tls_spki_sha256=_hex64(evidence["tls_spki_sha256"], "tls_spki_sha256"),
     )

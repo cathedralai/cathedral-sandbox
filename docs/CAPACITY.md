@@ -2,7 +2,7 @@
 
 `cathedral.capacity` is the shared library for paying miners by real, reachable CPU capacity.
 The prober, the sandbox it probes and every validator use the same code. Citations are
-`file:line` in `cathedral/capacity/`.
+`file:line` in `cathedral/capacity/` unless they give a full path.
 
 ## Roles
 
@@ -94,7 +94,7 @@ The library cannot enforce the order of events:
 
 `deadline_ms` must be at least 1 and at most `max_deadline_ms(spec) = 5 000 +
 ceil(steps × 1 000 ns / 1e6)` (`challenge.py:181-189`, constants `challenge.py:59-80`,
-enforced at `receipt.py:405-407`), and the exec time must fit it (`receipt.py:414-415`). So the
+enforced at `receipt.py:462-464`), and the exec time must fit it (`receipt.py:471-472`). So the
 bound is on `exec` alone; creating the sandbox is timed separately (`timings_ms.create`). Lanes
 are meant to run in parallel, so it follows one lane's `steps`:
 
@@ -176,37 +176,75 @@ boxes per round.
 
 ## Receipts (`receipt.py`)
 
-Schema `cathedral_capacity_receipt_v1`: canonical JSON plus a base64 Ed25519 signature by the
-key named in `prober_key_id`. The prober signs only a body that passes the same checks
-(`sign_receipt`, `receipt.py:287-294`; it refuses a body that already carries a signature).
-`verify_receipt` checks, and every date, time and `now` error is a `ReceiptError`
-(`receipt.py:145-158`), never a bare `ValueError` or `TypeError`:
+Schema `cathedral_capacity_receipt_v2` (`receipt.py:69`; a v1 receipt, which has no evidence,
+is refused): canonical JSON plus a base64 Ed25519 signature by the key named in
+`prober_key_id`. The prober signs only a body that passes the same checks (`sign_receipt`,
+`receipt.py:331-351`; it refuses a body that already carries a signature, and a bare-metal body
+unless allowed, below). `verify_receipt` checks, and every date, time and `now` error is a
+`ReceiptError` (`receipt.py:182-195`), never a bare `ValueError` or `TypeError`:
 
-- **shape:** exactly the known fields and schema (`receipt.py:336-337`), non-negative integer
-  netuid and round (`receipt.py:338-339`), a well-formed `prober_key_id`
-  (`receipt.py:341-345`);
-- **signature:** by a pinned prober key (`receipt.py:315-322`);
+- **shape:** exactly the known fields and schema (`receipt.py:393-394`), non-negative integer
+  netuid and round (`receipt.py:395-396`), a well-formed `prober_key_id`
+  (`receipt.py:398-402`);
+- **signature:** by a pinned prober key (`receipt.py:372-379`);
 - **audience:** the netuid, the requesting validator's nonce and the round, all required
-  (`receipt.py:309-310`, `receipt.py:323-328`); anything else is refused, so copying another
+  (`receipt.py:366-367`, `receipt.py:380-385`); anything else is refused, so copying another
   validator's weights gains nothing and a receipt from an earlier round cannot be replayed;
 - **box:** `box_id`, the miner's hotkey, its kind, and one hardware identity fixed by the kind
-  (`receipt.py:347-366`, below);
+  (`receipt.py:404-423`, below);
 - **capacity equals proof:** the spec must be exactly `spec_for(seed, vcpus=, memory_gib=)`
-  for the positive vCPUs and memory the receipt pays for (`receipt.py:369-385`);
+  for the positive vCPUs and memory the receipt pays for (`receipt.py:426-442`);
 - **sample:** the committed digest, the post-commitment `sample_nonce`, a `sample_count` from
   `required_samples(lanes)` to `lanes`, and the outputs of exactly the lanes that nonce and
-  count pick (`receipt.py:388-404`), so anyone can recompute which lanes were checked and
+  count pick (`receipt.py:445-461`), so anyone can recompute which lanes were checked and
   re-check them with `lane_output`;
 - **timing:** `deadline_ms` within `max_deadline_ms(spec)`, non-negative integer
-  `timings_ms`, and the exec time within the deadline (`receipt.py:405-415`); see Timing for
+  `timings_ms`, and the exec time within the deadline (`receipt.py:462-472`); see Timing for
   what this does and does not prove;
-- **validity:** a window of more than zero and at most two hours (`receipt.py:417-420`),
-  containing `now` within five minutes of clock skew (`receipt.py:329-331`).
+- **validity:** a window of more than zero and at most two hours (`receipt.py:474-477`),
+  containing `now` within five minutes of clock skew (`receipt.py:386-388`);
+- **evidence:** required for a TEE box and `null` for bare metal (`receipt.py:478`,
+  `receipt.py:501-529`, below).
+
+### Evidence
+
+A TEE box's receipt names the attestation the prober verified before it took the hardware id.
+`make_body(..., evidence=)` has no default: the prober passes the five fields for a TEE box and
+`None` for bare metal (serialised as `"evidence": null`). `VerifiedReceipt.evidence` is a frozen
+`ReceiptEvidence` (`receipt.py:141-149`), or `None` for bare metal. Each field has exactly one
+format (`receipt.py:90-102`), and any other value, type or key set is a `ReceiptError`:
+
+| field | format |
+|---|---|
+| `evidence_kind` | the box's `tee_kind`: `tdx` or `sev_snp` |
+| `evidence_sha256` | 64 lowercase hex: SHA-256 of the raw TDX quote or SEV-SNP report bytes |
+| `measurement` | TDX: `tdx-measurement-sha256:<64 hex>`, the launch measurement `cathedral/verify/tdx_quote.py:91-104` computes (and cathedral-validator's TDX measurement allowlist uses). SEV-SNP: 96 lowercase hex, the report's 48-byte `MEASUREMENT` as `cathedral/verify/snp.py:162` reads it. All zeros is refused, as `cathedral/verify/snp.py:485` does. |
+| `verifier_digest` | `sha256:<64 lowercase hex>`, the form of the TDX verifier implementation digest (`cathedral/verify/__init__.py:262`, `cathedral/verify/__init__.py:459`) and of cathedral-validator's SNP verifier digest. A verifier known by a bare SHA-256 (cathedral-validator's `qvl_digest`) is written with the prefix, so one verifier has one spelling. |
+| `tls_spki_sha256` | 64 lowercase hex: SHA-256 of the DER SubjectPublicKeyInfo of the TLS key the evidence attests, as `tls_spki_binding` computes it (`cathedral/channel.py:76-80`) |
+
+**What it proves.** The prober's signature binds the hardware id, the measurement, the verifier
+and the TLS key the prober pinned to one piece of evidence, named by its hash. A validator can
+check that the receipt's measurement is one it allows and that the verifier is one it trusts,
+and can see which quote the prober relied on.
+
+**What it does not.** The receipt carries the quote's hash, not the quote. A validator cannot
+re-verify the quote, or check that the hardware id really came out of it, from the receipt
+alone; it trusts the prober for that, as it does for the challenge. With the quote (from an
+archive the prober keeps, or from the box itself) anyone can later audit a receipt: hash it,
+compare `evidence_sha256`, verify it, and recompute the hardware id and measurement.
+
+### TEE first: the bare-metal gate
+
+TEE boxes come first and bare metal is deferred. `sign_receipt` refuses a bare-metal body unless
+the prober passes the keyword-only `allow_bare_metal=True` (exactly `True`; any other value is a
+refusal) (`receipt.py:345-349`). `verify_receipt` still accepts a correctly signed bare-metal
+receipt: whether to pay for bare-metal capacity is each validator's own policy flag, not the
+library's.
 
 ### Hardware identity
 
 Validators pay one unit per distinct machine, so each kind of box has exactly one identity
-kind (`HARDWARE_ID_KINDS`, `receipt.py:61-65`; checked at `receipt.py:356-365`):
+kind (`HARDWARE_ID_KINDS`, `receipt.py:72-76`; checked at `receipt.py:413-422`):
 
 | `kind` | `tee_kind` | `hardware_id_kind` | raw id |
 |---|---|---|---|
@@ -215,7 +253,7 @@ kind (`HARDWARE_ID_KINDS`, `receipt.py:61-65`; checked at `receipt.py:356-365`):
 | `bare_metal` | null | `probe_fingerprint` | 9 bytes: the probed IPv4 address, or IPv6 `/64`, tagged with its family (`probe_fingerprint(address)`, below) |
 
 `hardware_id = derive_hardware_id(hardware_id_kind, raw)`: SHA-256 over a domain tag, the id
-kind and the raw id (`receipt.py:173-190`). The prober takes the raw id from attestation
+kind and the raw id (`receipt.py:210-227`). The prober takes the raw id from attestation
 evidence it has verified itself, never from a field the box reports. An all-zero id (SEV-SNP
 with `MASK_CHIP_ID` set) is refused, since every such machine would share it. A receipt cannot
 name a TDX machine by chip id or the other way round, so one machine cannot appear under two
@@ -228,7 +266,7 @@ hex(SHA-256("cathedral-tdx-platform-v1\0" + lowercase hex PPID))`
 when `platform_identity_verified` and `claims_bound_to_quote` are true
 (`cathedral/verify/__init__.py:200-206`). cathedral-validator dedupes on the same value
 (`machine_id_from_stable_platform_id` in `cathedral_thin/independent/compute.py`).
-`tdx_hardware_id(stable_platform_id)` (`receipt.py:193-207`) checks that format, takes the
+`tdx_hardware_id(stable_platform_id)` (`receipt.py:230-244`) checks that format, takes the
 32-byte digest as the raw `tdx_platform` id and passes it through `derive_hardware_id`. It is
 as unique as the PPID: one platform per value unless SHA-256 collides.
 
@@ -239,7 +277,7 @@ hardware id, for the same platform. A prober must take TDX hardware ids from the
 verifier only.
 
 **Bare metal has no hardware root of trust**, so its identity is weaker. `probe_fingerprint`
-(`receipt.py:210-231`) is derived from the address the prober itself connected to and ran the
+(`receipt.py:247-268`) is derived from the address the prober itself connected to and ran the
 challenge through, never from anything the box reports: the whole IPv4 address, or only the
 `/64` of an IPv6 address, and never the port. An IPv4-mapped IPv6 address counts as its IPv4
 address, and the address family is part of the raw id, so an IPv4 address cannot collide with a
