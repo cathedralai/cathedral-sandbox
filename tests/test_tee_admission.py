@@ -80,15 +80,18 @@ def _stable_platform_id(ppid: bytes) -> str:
     return "tdx-platform-sha256:" + digest
 
 
+STABLE_ID = _stable_platform_id(PPID)
+OTHER_STABLE_ID = _stable_platform_id(bytes(reversed(PPID)))  # another platform
+
+
 def _tdx(**changes) -> adm.VerifiedAttestation:
     base = adm.VerifiedAttestation(
         kind="tdx",
-        hardware_id=PPID,
         measurement=TDX_MEASUREMENT,
         verifier_digest=VERIFIER,
         evidence_sha256=EVIDENCE_SHA,
         report_data=_v2_by_hand(NONCE, HOTKEY, CERT),
-        stable_platform_id=_stable_platform_id(PPID),
+        stable_platform_id=STABLE_ID,
     )
     return dataclasses.replace(base, **changes)
 
@@ -96,11 +99,11 @@ def _tdx(**changes) -> adm.VerifiedAttestation:
 def _snp(**changes) -> adm.VerifiedAttestation:
     base = adm.VerifiedAttestation(
         kind="sev_snp",
-        hardware_id=CHIP_ID.hex(),  # as cathedral/verify/snp.py reports chip_id
         measurement=SNP_MEASUREMENT,
         verifier_digest=VERIFIER,
         evidence_sha256=EVIDENCE_SHA,
         report_data=_v2_by_hand(NONCE, HOTKEY, CERT),
+        chip_id=CHIP_ID.hex(),  # as cathedral/verify/snp.py reports chip_id
     )
     return dataclasses.replace(base, **changes)
 
@@ -142,8 +145,12 @@ def test_report_data_check_is_the_existing_v2_channel_binding():
 def test_a_tdx_box_is_admitted_with_receipt_evidence():
     result = _admit(_tdx())
     assert result.admitted and result.reasons == ()
-    assert result.hardware_id_kind == "ppid"
-    assert result.hardware_id == receipt.derive_hardware_id("ppid", PPID)
+    assert result.hardware_id_kind == "tdx_platform"
+    # the receipt's TDX hardware id: the digest in the verifier's stable_platform_id
+    assert result.hardware_id == receipt.tdx_hardware_id(STABLE_ID)
+    assert result.hardware_id == receipt.derive_hardware_id(
+        "tdx_platform", bytes.fromhex(STABLE_ID.removeprefix("tdx-platform-sha256:"))
+    )
     assert (result.measurement_allowed, result.mode) == (True, "enforce")
     assert result.policy_digest.startswith("sha256:")
     spki = hashlib.sha256(extract_spki_der(CERT)).hexdigest()
@@ -170,9 +177,15 @@ def test_a_snp_box_is_admitted_with_receipt_evidence():
     )
 
 
-def test_raw_bytes_and_hex_hardware_ids_are_one_machine():
-    assert _admit(_tdx(hardware_id=PPID.hex())).hardware_id == _admit(_tdx()).hardware_id
-    assert _admit(_snp(hardware_id=CHIP_ID)).hardware_id == _admit(_snp()).hardware_id
+def test_raw_bytes_and_hex_chip_ids_are_one_machine():
+    assert _admit(_snp(chip_id=CHIP_ID)).hardware_id == _admit(_snp()).hardware_id
+
+
+def test_there_is_no_raw_ppid_input():
+    # No TDX verifier outputs the raw PPID; the hardware id is the stable_platform_id's.
+    names = {f.name for f in dataclasses.fields(adm.VerifiedAttestation)}
+    assert "hardware_id" not in names and "ppid" not in names
+    assert not hasattr(adm, "PLATFORM_ID_MISMATCH")
 
 
 def test_certificate_and_its_spki_give_the_same_decision():
@@ -208,11 +221,19 @@ def test_an_application_key_binding_of_the_same_digest_is_not_a_tls_binding():
     assert result.reasons == (adm.REPORT_DATA_MISMATCH,)
 
 
-def test_a_tdx_ppid_that_is_not_the_verified_quotes_is_refused():
-    other_ppid = bytes(reversed(PPID))
-    result = _admit(_tdx(hardware_id=other_ppid))
-    assert result.reasons == (adm.PLATFORM_ID_MISMATCH,)
-    assert not result.admitted and result.evidence is None
+def test_a_tdx_hardware_id_follows_the_stable_platform_id():
+    here = _admit(_tdx())
+    other = _admit(_tdx(stable_platform_id=OTHER_STABLE_ID))
+    assert other.admitted and other.hardware_id == receipt.tdx_hardware_id(OTHER_STABLE_ID)
+    assert other.hardware_id != here.hardware_id
+    # A box whose stable_platform_id is not the one admitted is another machine,
+    # and one presenting an admitted platform's id is that machine.
+    admitted = {here.hardware_id: adm.AdmittedBox("box-1", HOTKEY)}
+    assert _admit(
+        _tdx(stable_platform_id=OTHER_STABLE_ID), box_id="box-2", admitted=admitted
+    ).admitted
+    claimed = _admit(_tdx(), box_id="box-2", admitted=admitted)
+    assert claimed.reasons == (adm.HARDWARE_ID_CLAIMED,)
 
 
 # -- measurement policy -----------------------------------------------------------------
@@ -328,7 +349,7 @@ def test_policy_bytes_must_be_bounded_utf8_json(raw):
 
 
 def test_a_hardware_id_already_admitted_to_another_box_is_refused():
-    hardware_id = receipt.derive_hardware_id("ppid", PPID)
+    hardware_id = receipt.tdx_hardware_id(STABLE_ID)
     first = {hardware_id: adm.AdmittedBox("box-1", HOTKEY)}
     other_box = _admit(_tdx(), box_id="box-2", admitted=first)
     assert other_box.reasons == (adm.HARDWARE_ID_CLAIMED,)
@@ -358,23 +379,22 @@ def test_the_same_box_is_readmitted_and_other_hosts_are_independent():
 
 def test_a_tdx_and_a_snp_id_never_collide():
     # the id kind is inside the hash, as for receipts
-    raw = CHIP_ID[:16]
-    assert receipt.derive_hardware_id("ppid", raw) != receipt.derive_hardware_id(
-        "chip_id", raw + bytes(48)
+    raw = CHIP_ID[:32]
+    assert receipt.derive_hardware_id("tdx_platform", raw) != receipt.derive_hardware_id(
+        "chip_id", raw + bytes(32)
     )
 
 
 def test_every_refusal_is_reported_together():
-    hardware_id = receipt.derive_hardware_id("ppid", PPID)
+    hardware_id = receipt.tdx_hardware_id(STABLE_ID)
     result = _admit(
-        _tdx(measurement=TDX_OTHER, stable_platform_id=_stable_platform_id(bytes(reversed(PPID)))),
+        _tdx(measurement=TDX_OTHER),
         nonce=bytes(reversed(NONCE)),
         box_id="box-9",
         admitted={hardware_id: adm.AdmittedBox("box-1", HOTKEY)},
     )
     assert result.reasons == (
         adm.REPORT_DATA_MISMATCH,
-        adm.PLATFORM_ID_MISMATCH,
         adm.MEASUREMENT_NOT_ALLOWED,
         adm.HARDWARE_ID_CLAIMED,
     )
@@ -386,12 +406,7 @@ def test_every_refusal_is_reported_together():
 _BAD_ATTESTATION = {
     "kind_unknown": {"kind": "gpu_cc"},
     "kind_not_str": {"kind": ["tdx"]},
-    "ppid_short": {"hardware_id": PPID[:15]},
-    "ppid_upper_hex": {"hardware_id": PPID.hex().upper()},
-    "ppid_odd_hex": {"hardware_id": PPID.hex()[:-1]},
-    "ppid_zero": {"hardware_id": bytes(16), "stable_platform_id": _stable_platform_id(bytes(16))},
-    "ppid_int": {"hardware_id": 7},
-    "ppid_bytearray": {"hardware_id": bytearray(PPID)},
+    "chip_id_set": {"chip_id": CHIP_ID},
     "measurement_bare_hex": {"measurement": "11" * 32},
     "measurement_zero": {"measurement": "tdx-measurement-sha256:" + "00" * 32},
     "measurement_snp_shape": {"measurement": SNP_MEASUREMENT},
@@ -402,7 +417,15 @@ _BAD_ATTESTATION = {
     "report_data_short": {"report_data": bytes(63)},
     "report_data_str": {"report_data": "00" * 64},
     "stable_id_missing": {"stable_platform_id": None},
-    "stable_id_bare": {"stable_platform_id": _stable_platform_id(PPID).split(":")[1]},
+    "stable_id_bare": {"stable_platform_id": STABLE_ID.split(":")[1]},
+    "stable_id_upper": {"stable_platform_id": STABLE_ID.upper()},
+    "stable_id_short": {"stable_platform_id": STABLE_ID[:-2]},
+    "stable_id_long": {"stable_platform_id": STABLE_ID + "00"},
+    "stable_id_newline": {"stable_platform_id": STABLE_ID + "\n"},
+    "stable_id_pck_prefix": {"stable_platform_id": STABLE_ID.replace("platform", "pck-cert")},
+    "stable_id_zero": {"stable_platform_id": "tdx-platform-sha256:" + "0" * 64},
+    "stable_id_bytes": {"stable_platform_id": STABLE_ID.encode()},
+    "stable_id_int": {"stable_platform_id": 7},
 }
 
 
@@ -415,16 +438,26 @@ def test_a_malformed_tdx_attestation_is_an_error(name):
 @pytest.mark.parametrize(
     "changes",
     [
-        {"hardware_id": CHIP_ID[:63]},
-        {"hardware_id": bytes(64)},
+        {"chip_id": CHIP_ID[:63]},
+        {"chip_id": bytes(64)},
+        {"chip_id": None},
+        {"chip_id": CHIP_ID.hex().upper()},
+        {"chip_id": CHIP_ID.hex()[:-1]},
+        {"chip_id": 7},
+        {"chip_id": bytearray(CHIP_ID)},
         {"measurement": "33" * 47},
         {"measurement": TDX_MEASUREMENT},
         {"measurement": SNP_MEASUREMENT.upper()},
-        {"stable_platform_id": _stable_platform_id(PPID)},
+        {"stable_platform_id": STABLE_ID},
     ],
     ids=[
         "chip_short",
         "chip_zero",
+        "chip_missing",
+        "chip_upper_hex",
+        "chip_odd_hex",
+        "chip_int",
+        "chip_bytearray",
         "measurement_short",
         "measurement_tdx",
         "measurement_upper",
@@ -468,7 +501,7 @@ _BAD_CALL = {
     "box_id_long": {"box_id": "b" * 129},
     "admitted_list": {"admitted": []},
     "admitted_upper_key": {
-        "admitted": {receipt.derive_hardware_id("ppid", PPID).upper(): adm.AdmittedBox("b", HOTKEY)}
+        "admitted": {receipt.tdx_hardware_id(STABLE_ID).upper(): adm.AdmittedBox("b", HOTKEY)}
     },
     "admitted_tuple_value": {"admitted": {"ab" * 32: ("box-1", HOTKEY)}},
     "admitted_bad_hotkey": {"admitted": {"ab" * 32: adm.AdmittedBox("box-1", "x")}},

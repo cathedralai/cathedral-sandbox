@@ -15,12 +15,12 @@ sandbox API. :func:`admit` then decides, from values the caller observed:
   no new format. It binds the prober's 32-byte nonce, the miner hotkey and the
   TLS key, so a quote made for another prober round, another hotkey or another
   TLS endpoint is refused.
-- **Hardware identity.** The raw PPID (TDX) or CHIP_ID (SEV-SNP) becomes the
-  receipt's ``hardware_id`` through ``receipt.derive_hardware_id``, so an
-  admission and the box's capacity receipts name one machine the same way. For
-  TDX the raw PPID must also hash to the ``stable_platform_id`` the strict
-  verifier emitted (``cmd/cathedral-tdx-verifier``), so the PPID is the one in
-  the verified quote's PCK certificate.
+- **Hardware identity.** For TDX, the ``stable_platform_id`` the pinned strict
+  verifier emitted (``cmd/cathedral-tdx-verifier``; no verifier outputs the raw
+  PPID) becomes the receipt's ``hardware_id`` through
+  ``receipt.tdx_hardware_id``; for SEV-SNP, the raw CHIP_ID through
+  ``receipt.derive_hardware_id``. An admission and the box's capacity receipts
+  therefore name one machine the same way.
 - **Measurement policy.** cathedral-validator #256's policy file for TDX, and
   the same shape with a 96-hex allowlist for SEV-SNP (:func:`parse_policy`). In
   ``enforce`` an unlisted measurement is refused; in ``shadow`` it is admitted
@@ -52,6 +52,7 @@ from cathedral.capacity.receipt import (
     ReceiptEvidence,
     _check_evidence,
     derive_hardware_id,
+    tdx_hardware_id,
 )
 from cathedral.channel import ChannelBindingError, _der_tlv, tls_spki_binding
 from cathedral.common import ChannelBinding, ChannelBindingType, report_data_v2
@@ -71,16 +72,12 @@ _POLICY_MEASUREMENT = {
 MAX_POLICY_BYTES = 128 * 1024  # as #256
 NONCE_BYTES = 32  # report_data_v2's nonce
 REPORT_DATA_BYTES = 64
-# cmd/cathedral-tdx-verifier/main.go: stable_platform_id =
-# "tdx-platform-sha256:" + hex(SHA-256(platformDomain + lowercase hex PPID)).
-TDX_PLATFORM_DOMAIN = b"cathedral-tdx-platform-v1\x00"
-_STABLE_PLATFORM_ID = re.compile(r"tdx-platform-sha256:[0-9a-f]{64}")
+CHIP_ID_BYTES = 64  # SEV-SNP
 _HEX = re.compile(r"(?:[0-9a-f]{2})+")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 
 # Refusal reasons, in the order they are checked.
 REPORT_DATA_MISMATCH = "report_data_mismatch"
-PLATFORM_ID_MISMATCH = "hardware_id_not_in_verified_quote"
 MEASUREMENT_NOT_ALLOWED = "measurement_not_allowed"
 HARDWARE_ID_CLAIMED = "hardware_id_admitted_to_another_box"
 
@@ -104,19 +101,24 @@ class MeasurementPolicy:
 class VerifiedAttestation:
     """What the caller's own verifier run established about one quote.
 
-    ``hardware_id`` is the raw 16-byte PPID (TDX) or 64-byte CHIP_ID (SEV-SNP),
-    as bytes or lowercase hex. ``report_data`` is the 64 bytes in the verified
-    quote. ``stable_platform_id`` is required for TDX (the strict verifier's
-    claim, ``Attested.chip_id``) and must be None for SEV-SNP.
+    ``report_data`` is the 64 bytes in the verified quote. Exactly one hardware
+    identity, fixed by the kind:
+
+    - TDX: ``stable_platform_id``, the pinned strict verifier's
+      ``tdx-platform-sha256:<64 hex>`` claim (``Attested.chip_id``), which strict
+      mode accepts only with ``platform_identity_verified`` and
+      ``claims_bound_to_quote`` true. ``chip_id`` must be None.
+    - SEV-SNP: ``chip_id``, the raw 64-byte CHIP_ID from the verified report, as
+      bytes or lowercase hex. ``stable_platform_id`` must be None.
     """
 
     kind: str
-    hardware_id: bytes | str
     measurement: str
     verifier_digest: str
     evidence_sha256: str
     report_data: bytes
     stable_platform_id: str | None = None
+    chip_id: bytes | str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,7 +136,7 @@ class Admission:
     box_id: str
     miner_hotkey: str
     hardware_id: str  # derive_hardware_id(hardware_id_kind, raw): the receipt's hardware_id
-    hardware_id_kind: str  # ppid or chip_id
+    hardware_id_kind: str  # tdx_platform or chip_id
     measurement: str
     measurement_allowed: bool
     mode: str  # the policy's mode
@@ -210,15 +212,15 @@ def parse_policy(raw: bytes) -> MeasurementPolicy:
     )
 
 
-def _raw_hardware_id(value: object, size: int, name: str) -> bytes:
+def _raw_chip_id(value: object) -> bytes:
     if isinstance(value, bytes):
         raw = value
     elif isinstance(value, str) and _HEX.fullmatch(value) is not None:
         raw = bytes.fromhex(value)
     else:
-        raise AdmissionError(f"the raw {name} must be bytes or lowercase hex")
-    if len(raw) != size:
-        raise AdmissionError(f"a raw {name} is {size} bytes")
+        raise AdmissionError("a sev_snp attestation needs its chip_id as bytes or lowercase hex")
+    if len(raw) != CHIP_ID_BYTES:
+        raise AdmissionError(f"a raw chip_id is {CHIP_ID_BYTES} bytes")
     return raw
 
 
@@ -318,11 +320,20 @@ def admit(
     binding = _tls_binding(tls_certificate_der, tls_spki_der)
 
     hardware_id_kind = HARDWARE_ID_KINDS[("tee", kind)]
-    raw_id = _raw_hardware_id(
-        attestation.hardware_id, 16 if hardware_id_kind == "ppid" else 64, hardware_id_kind
-    )
+    stable_platform_id = attestation.stable_platform_id
+    chip_id = attestation.chip_id
     try:
-        hardware_id = derive_hardware_id(hardware_id_kind, raw_id)
+        # One hardware identity per kind, derived as receipts derive it.
+        if kind == "tdx":
+            if not isinstance(stable_platform_id, str):
+                raise AdmissionError("a tdx attestation needs the verifier's stable_platform_id")
+            if chip_id is not None:
+                raise AdmissionError("a tdx attestation has no chip_id")
+            hardware_id = tdx_hardware_id(stable_platform_id)
+        else:
+            if stable_platform_id is not None:
+                raise AdmissionError("a sev_snp attestation has no stable_platform_id")
+            hardware_id = derive_hardware_id(hardware_id_kind, _raw_chip_id(chip_id))
         # The receipt's own evidence checks, so what admission hands T4 is a
         # value verify_receipt accepts.
         evidence = _check_evidence(
@@ -341,16 +352,6 @@ def admit(
     if not any(bytes.fromhex(evidence.evidence_sha256)):
         raise AdmissionError("evidence_sha256 is all zeros")
 
-    stable_platform_id = attestation.stable_platform_id
-    if kind == "tdx":
-        if (
-            not isinstance(stable_platform_id, str)
-            or _STABLE_PLATFORM_ID.fullmatch(stable_platform_id) is None
-        ):
-            raise AdmissionError("a tdx attestation needs the verifier's stable_platform_id")
-    elif stable_platform_id is not None:
-        raise AdmissionError("a sev_snp attestation has no stable_platform_id")
-
     reasons: list[str] = []
     try:
         expected = report_data_v2(nonce, miner_hotkey, binding)
@@ -358,13 +359,6 @@ def admit(
         raise AdmissionError(str(exc)) from exc
     if not hmac.compare_digest(expected, report_data):
         reasons.append(REPORT_DATA_MISMATCH)
-    if kind == "tdx":
-        derived = (
-            "tdx-platform-sha256:"
-            + hashlib.sha256(TDX_PLATFORM_DOMAIN + raw_id.hex().encode()).hexdigest()
-        )
-        if not hmac.compare_digest(derived, stable_platform_id):
-            reasons.append(PLATFORM_ID_MISMATCH)
     measurement_allowed = policy.allows(evidence.measurement)
     if not measurement_allowed and policy.mode == "enforce":
         reasons.append(MEASUREMENT_NOT_ALLOWED)
