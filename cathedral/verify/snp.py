@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
+import logging
 import math
 import os
 import re
@@ -22,13 +22,16 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Iterator
 
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
 from cathedral.assurance import ClaimStatus, ReasonCategory, attestation_claims
 from cathedral.common import Attested, Evidence, Policy, Tier, evidence_report_data
+from cathedral.verify.capture import write_private_capture
+
+LOGGER = logging.getLogger(__name__)
 
 
 SNP_REPORT_SIZE = 1184
@@ -125,31 +128,67 @@ class SnpCertificateChain:
                 raise ValueError("SNP certificate must contain exactly one DER certificate")
 
 
-def persist_snp_capture(report: bytes, chain: SnpCertificateChain, directory: Path) -> Path:
+class SnpCaptureError(RuntimeError):
+    """An admitted report could not be captured. Never an admission verdict."""
+
+    category = "evidence_capture_failed"
+
+
+def persist_snp_capture(
+    report: bytes,
+    chain: SnpCertificateChain,
+    directory: Path,
+    *,
+    admission_nonce: bytes | None = None,
+    box_id: str | None = None,
+) -> Path:
     """Persist the admitted report and its verified chain in one private file.
 
     The content-addressed snapshot survives KDS outages. The directory is an
     output sink only, and none of its paths are passed to the vendor verifier.
+    A ``<sha256>.meta.json`` sidecar records the capture time and, when the
+    caller knows them, the admission nonce and box ID. Any failure is raised
+    as :class:`SnpCaptureError`.
     """
-    document = {
-        "schema": "cathedral_snp_capture_v1",
-        "report_base64": base64.b64encode(report).decode("ascii"),
-        "certificates": {name + "_base64": base64.b64encode(getattr(chain, name)).decode("ascii")
-                         for name in ("vcek", "ask", "ark")},
-    }
-    encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("ascii")
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    destination = directory / (hashlib.sha256(encoded).hexdigest() + ".json")
-    fd, temporary = tempfile.mkstemp(prefix=".snp-capture-", dir=directory)
     try:
-        with os.fdopen(fd, "wb") as output:
-            output.write(encoded)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, destination)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
-    return destination
+        if not isinstance(chain, SnpCertificateChain):
+            raise ValueError("SNP capture requires a parsed certificate chain")
+        document = {
+            "schema": "cathedral_snp_capture_v1",
+            "report_base64": base64.b64encode(report).decode("ascii"),
+            "certificates": {
+                name + "_base64": base64.b64encode(getattr(chain, name)).decode("ascii")
+                for name in ("vcek", "ask", "ark")
+            },
+        }
+        return write_private_capture(
+            document,
+            directory,
+            temporary_prefix=".snp-capture-",
+            admission_nonce=admission_nonce,
+            box_id=box_id,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise SnpCaptureError("SNP evidence capture failed") from exc
+
+
+def _capture_verified_snp(
+    report: bytes,
+    chain_der: dict[str, bytes],
+    directory: Path,
+    *,
+    admission_nonce: bytes | None,
+    box_id: str | None,
+) -> Path:
+    """Parse the verifier's DER files and persist them. Raises SnpCaptureError."""
+
+    try:
+        chain = SnpCertificateChain(**chain_der)
+    except (TypeError, ValueError) as exc:
+        raise SnpCaptureError("verified SNP certificate chain could not be parsed") from exc
+    return persist_snp_capture(
+        report, chain, directory, admission_nonce=admission_nonce, box_id=box_id
+    )
 
 
 @dataclass(frozen=True)
@@ -592,9 +631,14 @@ def _verify_chain_with_snpguest(
     certs_dir: str | os.PathLike[str] | None,
     deadline_monotonic: float | None = None,
     certificate_chain: SnpCertificateChain | None = None,
-    capture: Callable[[bytes, SnpCertificateChain], None] | None = None,
+    verified_chain_out: list[dict[str, bytes]] | None = None,
 ) -> bool:
-    """Ask snpguest to fetch AMD certs and verify the report signature chain."""
+    """Ask snpguest to fetch AMD certs and verify the report signature chain.
+
+    When ``verified_chain_out`` is a list, the raw DER bytes of the chain that
+    snpguest accepted are appended to it after success. Reading them never
+    changes the verdict: a read failure is logged and nothing is appended.
+    """
 
     # An external directory lets another process swap ARK/ASK/VCEK pathnames
     # after the root pin check but before snpguest reopens them. Keep the
@@ -659,15 +703,21 @@ def _verify_chain_with_snpguest(
         for cmd in verify_orders:
             try:
                 run(cmd)
-                if capture is not None:
-                    captured = SnpCertificateChain(**{
-                        name: (certs_path / (name + ".der")).read_bytes()
-                        for name in ("vcek", "ask", "ark")
-                    })
-                    capture(report, captured)
-                return True
             except subprocess.CalledProcessError:
                 continue
+            if verified_chain_out is not None:
+                try:
+                    verified_chain_out.append(
+                        {
+                            name: (certs_path / (name + ".der")).read_bytes()
+                            for name in ("vcek", "ask", "ark")
+                        }
+                    )
+                except OSError:
+                    LOGGER.warning(
+                        "verified SNP chain could not be read for capture", exc_info=True
+                    )
+            return True
     return False
 
 
@@ -682,6 +732,8 @@ def verify_snp_report_data(
     raise_on_verifier_unavailable: bool = False,
     deadline_monotonic: float | None = None,
     certificate_chain: SnpCertificateChain | None = None,
+    capture_nonce: bytes | None = None,
+    capture_box_id: str | None = None,
 ) -> Attested | None:
     """Verify a raw SNP report against explicit 64-byte REPORT_DATA.
 
@@ -695,6 +747,12 @@ def verify_snp_report_data(
     value is refused. Vendor certificates must stay in the verifier's private
     temporary tree so their pathnames cannot be replaced between root pinning
     and signature verification.
+
+    With ``CATHEDRAL_SNP_CAPTURE_DIR`` set, an online (KDS-fetched) verdict that
+    passed every policy check and the vendor chain is captured exactly once,
+    after verification. ``capture_nonce`` and ``capture_box_id`` go into the
+    capture's metadata sidecar. A capture failure is logged and never changes
+    or repeats the verdict.
     """
 
     if len(expected_report_data) != REPORT_DATA_SIZE:
@@ -716,6 +774,10 @@ def verify_snp_report_data(
         return None
 
     chain_verified = False
+    capture_directory = (
+        os.environ.get("CATHEDRAL_SNP_CAPTURE_DIR") if certificate_chain is None else None
+    )
+    verified_chain: list[dict[str, bytes]] = []
     with _pinned_snpguest(snpguest_path) as snpguest:
         if snpguest is None and raise_on_verifier_unavailable:
             raise SnpVerifierUnavailable("pinned SNP verifier is unavailable")
@@ -731,11 +793,8 @@ def verify_snp_report_data(
                         verify_kwargs["deadline_monotonic"] = deadline_monotonic
                     if certificate_chain is not None:
                         verify_kwargs["certificate_chain"] = certificate_chain
-                    capture_directory = os.environ.get("CATHEDRAL_SNP_CAPTURE_DIR")
-                    if capture_directory and certificate_chain is None:
-                        verify_kwargs["capture"] = lambda raw, chain: persist_snp_capture(
-                            raw, chain, Path(capture_directory)
-                        )
+                    if capture_directory:
+                        verify_kwargs["verified_chain_out"] = verified_chain
                     chain_verified = _verify_chain_with_snpguest(report, **verify_kwargs)
                     break
                 except subprocess.CalledProcessError as exc:
@@ -776,7 +835,7 @@ def verify_snp_report_data(
         hardware_reason=None if chain_verified else ReasonCategory.EVIDENCE_INVALID,
         software_status=(ClaimStatus.PASSED if chain_verified else ClaimStatus.NOT_EVALUATED),
     )
-    return Attested(
+    verdict = Attested(
         tier=Tier.CC_CPU_SNP,
         chip_id=parsed.chip_id,
         measurement=parsed.measurement,
@@ -785,6 +844,18 @@ def verify_snp_report_data(
         chain_verified=chain_verified,
         assurance=assurance,
     )
+    if chain_verified and capture_directory and verified_chain:
+        try:
+            _capture_verified_snp(
+                report,
+                verified_chain[0],
+                Path(capture_directory),
+                admission_nonce=capture_nonce,
+                box_id=capture_box_id,
+            )
+        except SnpCaptureError:
+            LOGGER.warning("SNP evidence capture failed; verdict unchanged", exc_info=True)
+    return verdict
 
 
 def verify_snp(
@@ -796,6 +867,7 @@ def verify_snp(
     certs_dir: str | os.PathLike[str] | None = None,
     raise_on_verifier_unavailable: bool = False,
     deadline_monotonic: float | None = None,
+    capture_box_id: str | None = None,
 ) -> Attested | None:
     """Verify SNP evidence using the existing Cathedral nonce/hotkey binding."""
 
@@ -808,6 +880,8 @@ def verify_snp(
         certs_dir=certs_dir,
         raise_on_verifier_unavailable=raise_on_verifier_unavailable,
         deadline_monotonic=deadline_monotonic,
+        capture_nonce=nonce or None,
+        capture_box_id=capture_box_id,
     )
 
 
@@ -830,7 +904,9 @@ def verify_snp_offline(
     try:
         chain = SnpCertificateChain(vcek_der, ask_der, ark_der)
         return verify_snp_report_data(
-            report, expected_report_data, policy,
+            report,
+            expected_report_data,
+            policy,
             certificate_chain=chain,
             snpguest_path=snpguest_path,
             raise_on_verifier_unavailable=raise_on_verifier_unavailable,

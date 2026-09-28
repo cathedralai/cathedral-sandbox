@@ -7,8 +7,11 @@ unchanged. The external `certs_dir` guard remains in place.
 
 Set `CATHEDRAL_SNP_CAPTURE_DIR` in an online admission process to retain successful
 verification snapshots. Each private JSON file contains the report and its chain.
-No capture occurs after a failed chain check. A configured capture write failure
-fails verification closed. This change does not configure or restart a service.
+Capture happens exactly once, after the report passed every admission-policy check
+and the vendor chain verified, and outside the KDS retry loop. Rejected reports and
+offline replays are never captured. A capture failure (unreadable or unparseable
+chain, unwritable directory) is logged as a warning and never changes or repeats the
+verdict. This change does not configure or restart a service.
 
 TDX: build `cmd/cathedral-tdx-verifier` and use:
 
@@ -28,7 +31,25 @@ This is separate from production admission, which still requires current collate
 
 Set `CATHEDRAL_TDX_CAPTURE_DIR` in an online admission process to retain quote and
 collateral together. Captures attest to vendor verification, not the later parent
-measurement-policy result. Capture is opt-in and no live admission wiring was tested.
+measurement-policy result. A configured TDX capture write failure still fails
+verification closed. Capture is opt-in and no live admission wiring was tested.
+
+## Capture files
+
+Both capture directories use the same layout, with mode 0700 directories and 0600 files:
+
+- `<sha256>.json` is the evidence itself (SNP report and chain, or TDX quote and
+  collateral). It is named by the SHA-256 of its exact bytes, so identical evidence
+  is stored once.
+- `<sha256>.meta.json` is a sidecar record kept out of the evidence bytes:
+  `{"schema": "cathedral_capture_metadata_v1", "capture": "<sha256>.json",
+  "capture_sha256": "<sha256>", "captured_at": "<UTC ISO-8601>",
+  "admission_nonce_hex": <hex or null>, "box_id": <string or null>}`.
+  The nonce is the admission nonce passed to `verify()`. The box ID is filled when
+  the caller passes `capture_box_id=` to `verify()`, `verify_snp()` or
+  `verify_snp_report_data()`, and is `null` otherwise. The sidecar records the first
+  capture of those bytes; an identical later capture leaves it unchanged. It is
+  context for audits, not signed evidence.
 
 `tdx_offline.verify_tdx_offline` reuses the static Linux ELF implementation-digest
 contract and executes only a private copy of the authenticated bytes. Its digest
