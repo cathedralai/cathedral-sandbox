@@ -60,9 +60,12 @@ opens; only the probe fails. So the endpoint orders registrations by
 and counts a registration only after its key opens and it passes a probe; a
 counted registration then refuses an older one in its scope, or a different
 one with the same order, so a superseded registration cannot displace its
-successor, and a document that fails the probe never enters the order. For
-ordering, a future ``issued_at`` is clamped to the time the endpoint received
-it, so a document dated ahead cannot outrank one signed after it. Conflicts
+successor, and a document that fails the probe never enters the order. The
+order is the signed ``issued_at`` itself, never the arrival time, so a replayed
+copy always ranks where the original did and cannot displace a document signed
+after it. (A miner whose clock runs ahead can outrank their own later renewal
+until real time passes the early ``issued_at``; keep the clock synchronised.)
+Conflicts
 between hotkeys are left to the first-claim rule: a document under another
 hotkey never refuses the owner's renewal, whatever its ``issued_at``. The
 document names no network: the prober keeps one X25519 key per network, so a
@@ -252,20 +255,18 @@ def opened_key_digest(key: bytes) -> str:
     return hashlib.sha256(b"cathedral.box-registration.opened-key.v1\x00" + key).hexdigest()
 
 
-def replay_order(
-    registration: VerifiedRegistration, *, now: datetime
-) -> tuple[tuple[str, str], datetime]:
+def replay_order(registration: VerifiedRegistration) -> tuple[tuple[str, str], datetime]:
     """Where and how the endpoint orders a registration against replays: the
-    scope is (control IP, hotkey), never the IP alone, and the order is
-    ``issued_at`` clamped to ``now`` (when the endpoint received it), so a
-    document dated into the skew window cannot outrank one signed after it.
-    The endpoint records the order only once the registration's key opens and
-    passes a probe, and then refuses an older one in the same scope, or a
-    different one with the same order (see the module docstring)."""
+    scope is (control IP, hotkey), never the IP alone, and the order is the
+    signed ``issued_at``. It never depends on when a copy arrives, so a replayed
+    document ranks exactly where the original did. The endpoint records the
+    order only once the registration's key opens and passes a probe, and then
+    refuses an older one in the same scope, or a different one with the same
+    order (see the module docstring)."""
     if not isinstance(registration, VerifiedRegistration):
         raise RegistrationError("verify the registration before ordering it")
     control_ip = registration.control_url[len("https://") :]
-    return (control_ip, registration.miner_hotkey), min(registration.issued_at, now)
+    return (control_ip, registration.miner_hotkey), registration.issued_at
 
 
 def _templates(value: object) -> list[dict[str, Any]]:

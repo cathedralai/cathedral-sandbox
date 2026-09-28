@@ -105,8 +105,9 @@ valid, and anyone can sign one naming your box's public IP and certificate pin u
 hotkey. The endpoint orders registrations by `issued_at` per control IP and hotkey, and counts
 one only after its key opens and it passes a probe. It then refuses an older registration from
 that hotkey for that IP, or a different one with the same `issued_at`, so an old registration
-can't replace your current one. An `issued_at` in the future counts as the time the endpoint
-received it, so a registration dated ahead can't outrank a later one. A registration under
+can't replace your current one. The order is the signed `issued_at`, so a replayed copy ranks
+where the original did; keep your clock synchronised, because a registration you date ahead
+outranks your own later renewals until real time passes it. A registration under
 another hotkey never refuses your renewal, whatever its date: conflicts between hotkeys follow
 "One box, one hotkey" above. Each network's prober has its own key, so a registration replayed
 to another network's prober doesn't open there.
