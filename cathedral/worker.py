@@ -73,7 +73,8 @@ MAX_VALIDATOR_CHALLENGE_CONCURRENT: int = 2
 # Connections allowed beyond the request-class slots while a handshake or the
 # headers are still arriving. Such a connection costs an idle thread, and the
 # oldest is evicted when a new one needs its permit, so a few idle sockets can
-# no longer lock validators out (review finding W1).
+# no longer lock validators out (review finding W1). Permits stay strict;
+# evicted threads exit on their next read.
 PREAUTH_CONNECTION_HEADROOM: int = 22
 MAX_HOTKEY_LENGTH: int = 256
 MAX_BEARER_TOKEN_LENGTH: int = 4096
@@ -860,7 +861,7 @@ def _shutdown_transport(request: socket.socket) -> None:
 class _Connection:
     """One accepted connection's place at the server-level gate."""
 
-    __slots__ = ("request", "accepted_at", "protected", "owns_permit")
+    __slots__ = ("request", "accepted_at", "protected", "owns_permit", "closed")
 
     def __init__(self, request: socket.socket, accepted_at: float) -> None:
         self.request = request
@@ -869,17 +870,24 @@ class _Connection:
         # the connection has shown nothing, and it may be evicted.
         self.protected = False
         self.owns_permit = True
+        # Set under the server's _active_lock just before the socket is closed.
+        # Another thread may shut the socket down only while holding that lock
+        # and seeing this False, so it never touches a descriptor that has been
+        # closed and possibly reused.
+        self.closed = False
 
 
 class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
-    """Start at most ``max_connection_concurrent`` request threads, and never let
-    idle connections lock out real requests.
+    """Hand out at most ``max_connection_concurrent`` connection permits, and
+    never let idle connections lock out real requests.
 
     The handler's semaphores reserve execution capacity by request class. This
     earlier gate covers the part before a handler knows the path: the TLS
     handshake and the headers. When every permit is taken, a new connection
     evicts the oldest connection that has not yet produced a parsed request,
-    and takes over its permit, so the thread ceiling stays strict. A connection
+    and takes over its permit. Permits stay strict; evicted threads exit on
+    their next read, so until then live handler threads and
+    ``active_connection_count`` can briefly exceed the permit count. A connection
     becomes protected as soon as its headers parse, so an honest client, which
     sends its headers within one round trip, is not evicted by idle sockets,
     while an attacker's idle sockets are the first to go (review finding W1).
@@ -931,9 +939,13 @@ class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
             newcomer.owns_permit = True
             self._active_requests[newcomer.request] = newcomer
             self.evicted_connection_count += 1
-        # The victim's thread fails its next read and exits without releasing
-        # the permit it no longer owns.
-        _shutdown_transport(victim.request)
+            # The victim's thread fails its next read and exits without
+            # releasing the permit it no longer owns. Under the lock, and only
+            # while its record is open: its thread marks the record closed under
+            # this lock before closing the socket (shutdown_request), so the
+            # descriptor cannot have been closed and reused by now.
+            if not victim.closed:
+                _shutdown_transport(victim.request)
         return True
 
     def process_request(
@@ -947,7 +959,7 @@ class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
                 self._active_requests[request] = record
         elif not self._evict_oldest_unprotected(record):
             # Every permit belongs to a connection that has shown a request.
-            # Keep the accept loop nonblocking and the thread ceiling strict.
+            # Keep the accept loop nonblocking and the permits strict.
             self.shutdown_request(request)
             return
 
@@ -970,6 +982,13 @@ class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
             if record is not None:
                 self._forget(record)
 
+    def shutdown_request(self, request: socket.socket) -> None:
+        with self._active_lock:
+            record = self._active_requests.get(request)
+            if record is not None:
+                record.closed = True
+        super().shutdown_request(request)
+
     def _forget(self, record: _Connection) -> None:
         with self._active_lock:
             if self._active_requests.get(record.request) is record:
@@ -985,9 +1004,9 @@ class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
         # each tracked socket makes shutdown a cancellation boundary and frees
         # every connection permit promptly.
         with self._active_lock:
-            active_requests = tuple(self._active_requests)
-        for request in active_requests:
-            _shutdown_transport(request)
+            for record in self._active_requests.values():
+                if not record.closed:
+                    _shutdown_transport(record.request)
         super().server_close()
 
 

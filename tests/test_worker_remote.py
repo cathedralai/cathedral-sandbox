@@ -251,6 +251,25 @@ def _wait_for_active_connections(
     assert server._server.active_connection_count == expected
 
 
+def _wait_for_protected_permits(
+    server: _WorkerServer,
+    expected: int,
+    timeout: float = 2.0,
+) -> None:
+    def protected() -> int:
+        with server._server._active_lock:
+            return sum(
+                1
+                for record in server._server._active_requests.values()
+                if record.protected and record.owns_permit
+            )
+
+    deadline = time.monotonic() + timeout
+    while protected() != expected and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert protected() == expected
+
+
 def _status_of(response: bytes) -> int:
     return int(response.split(b"\r\n", 1)[0].split(b" ")[1])
 
@@ -1028,6 +1047,10 @@ def test_partial_bodies_are_bounded_before_handler_threads_can_grow():
         try:
             _wait_for_active_connections(srv, 4)
             for _ in range(5):
+                # Only the three stalled requests hold protected permits: their
+                # headers have parsed, and the previous newcomer, whose client
+                # sees EOF just before its thread releases the permit, is gone.
+                _wait_for_protected_permits(srv, 3)
                 # A newcomer takes the idle connection's permit; the three
                 # parsed, stalled requests keep theirs.
                 assert _connection_gate_response(srv.port) != b""
@@ -1082,6 +1105,48 @@ def test_a_newcomer_is_refused_only_when_every_permit_shows_a_request():
         finally:
             for conn in held:
                 conn.close()
+
+
+def test_eviction_never_shuts_down_a_socket_its_thread_has_closed(monkeypatch):
+    """An evicted connection's thread may be closing its socket at the moment
+    of eviction; its descriptor could then be reused by an unrelated file or
+    socket. The thread marks its record closed under the server lock before
+    closing, and eviction shuts a victim down only under that lock and only
+    while its record is open."""
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        server = srv._server
+        shut: list[tuple[socket.socket, bool]] = []
+        monkeypatch.setattr(
+            worker_module,
+            "_shutdown_transport",
+            lambda request: shut.append((request, server._active_lock.locked())),
+        )
+        open_victim, open_peer = socket.socketpair()
+        closing_victim, closing_peer = socket.socketpair()
+        newcomers = [socket.socketpair() for _ in range(2)]
+        try:
+            with server._active_lock:
+                server._active_requests[open_victim] = worker_module._Connection(open_victim, 1.0)
+                server._active_requests[closing_victim] = worker_module._Connection(
+                    closing_victim, 0.0
+                )
+            # The older victim's thread finishes: shutdown_request closes it.
+            server.shutdown_request(closing_victim)
+            assert closing_victim.fileno() == -1
+            assert server._evict_oldest_unprotected(worker_module._Connection(newcomers[0][0], 2.0))
+            assert shut == []  # its permit moved, but its socket was left alone
+            # An open victim is shut down, and under the lock.
+            assert server._evict_oldest_unprotected(worker_module._Connection(newcomers[1][0], 3.0))
+            assert shut == [(open_victim, True)]
+        finally:
+            with server._active_lock:
+                server._active_requests.clear()
+            for sock in (open_victim, open_peer, closing_victim, closing_peer):
+                sock.close()
+            for a, b in newcomers:
+                a.close()
+                b.close()
 
 
 def test_the_default_ceiling_leaves_room_before_authentication():
