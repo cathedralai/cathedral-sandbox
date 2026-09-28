@@ -312,7 +312,9 @@ class _Enforcer:
         self.maintained = 0
         self.lapses = 0
         self.quarantined = False
+        self.quarantine_leftover = False
         self.quarantines = 0
+        self.lift_hook = None
 
     def quarantine(self) -> bool:
         self.quarantined = True
@@ -320,7 +322,10 @@ class _Enforcer:
         return True
 
     def lift_quarantine(self) -> bool:
+        if self.lift_hook is not None:
+            self.lift_hook()
         self.quarantined = False
+        self.quarantine_leftover = False
         return True
 
     @property
@@ -1213,3 +1218,56 @@ def test_lapse_removals_run_concurrently_with_a_bounded_timeout():
         executor_module.LAPSE_REMOVAL_CALL_TIMEOUT_SECONDS
     }
     assert len(docker.timeouts) <= 4 * 2  # at most four calls per attempt
+
+
+def test_a_mark_during_a_lift_leaves_the_bridge_quarantined():
+    """A concurrent lapse between the lift decision and the lift must not be undone."""
+
+    docker, clock = _Docker(), _Clock()
+    enforcer = _Enforcer()
+    executor = _executor(docker, clock=clock, egress_enforcer=enforcer)
+    executor.import_image(DIGEST, IMAGE.reference)
+    running = _spec("internet")
+    executor.create(running)
+    docker.rm_failures = 10**6  # the new lapse's removal stays pending
+    enforcer.quarantined = True  # left from an earlier lapse, now fully cleaned up
+    racer_done = threading.Event()
+
+    def concurrent_lapse():
+        enforcer.lapses += 1  # another thread's read-back finds a new lapse
+        executor.end_lapsed_sandboxes()
+        racer_done.set()
+
+    def during_lift():
+        enforcer.lift_hook = None
+        threading.Thread(target=concurrent_lapse, daemon=True).start()
+        # Give the racer every chance to mark and quarantine before the lift.
+        racer_done.wait(0.5)
+
+    enforcer.lift_hook = during_lift
+    executor.end_lapsed_sandboxes()  # decides to lift: nothing is waiting yet
+    assert racer_done.wait(10)
+    assert enforcer.quarantined, "the lift undid a quarantine installed for a new lapse"
+    with pytest.raises(executor_module.NetworkLapsed):
+        executor.stat(running.sandbox_id, "/")
+    docker.rm_failures = 0
+    executor.end_lapsed_sandboxes(wait=True)
+
+
+def test_a_leftover_quarantine_is_lifted_only_after_a_clean_sweep():
+    docker, clock = _Docker(), _Clock()
+    enforcer = _Enforcer()
+    enforcer.quarantined = enforcer.quarantine_leftover = True  # found in the kernel at start
+    executor = _executor(docker, clock=clock, egress_enforcer=enforcer)
+    executor.import_image(DIGEST, IMAGE.reference)
+    docker.containers.add("cathsbx-sbx-left-by-a-crash")
+    docker.rm_failures = 10**6
+    executor.check_egress()
+    assert enforcer.quarantined  # no sweep yet: the earlier run's sandbox may be running
+    assert executor.sweep() == 1
+    executor.check_egress()
+    assert enforcer.quarantined
+    docker.rm_failures = 0
+    assert executor.sweep() == 0
+    executor.check_egress()
+    assert not enforcer.quarantined

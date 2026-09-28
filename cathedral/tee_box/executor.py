@@ -211,6 +211,8 @@ class EgressControl(Protocol):
     def lapses(self) -> int: ...
     @property
     def quarantined(self) -> bool: ...
+    @property
+    def quarantine_leftover(self) -> bool: ...
     def quarantine(self) -> bool: ...
     def lift_quarantine(self) -> bool: ...
     def verify(self) -> bool: ...
@@ -642,6 +644,11 @@ class RunscExecutor(_Table):
         self._lapse_cut: set[str] = set()
         self._lapse_inflight: dict[str, threading.Thread] = {}
         self._lapse_slots = threading.BoundedSemaphore(LAPSE_REMOVAL_WORKERS)
+        # Serialises marking lapsed sandboxes with the quarantine decision and
+        # its nft install or lift. Lock order: quarantine lock, then the
+        # executor lock, then the enforcer's own lock.
+        self._quarantine_lock = threading.Lock()
+        self._swept_clean = False
         self._lapse_call_timeout = LAPSE_REMOVAL_CALL_TIMEOUT_SECONDS
         self._ended_on_lapse = 0
 
@@ -960,7 +967,7 @@ class RunscExecutor(_Table):
             info = self._record(spec)
             if spec.network == "internet" and enforcer is not None and enforcer.lapses != lapses:
                 # The rules lapsed while this sandbox started: end it too.
-                with self._lock:
+                with self._quarantine_lock, self._lock:
                     self._lapse_cut.add(spec.sandbox_id)
                 self.end_lapsed_sandboxes()
                 raise ExecutorError("egress enforcement failed")
@@ -1039,24 +1046,32 @@ class RunscExecutor(_Table):
             return 0
         started: list[threading.Thread] = []
         joined: list[threading.Thread] = []
-        with self._lock:
-            lapses = enforcer.lapses
-            if lapses != self._seen_lapses:
-                self._seen_lapses = lapses
-                self._lapse_cut.update(
-                    sid for sid, info in self._sandboxes.items() if info.spec.network == "internet"
-                )
-            waiting = bool(self._lapse_cut or self._lapse_inflight)
-        # Cut the bridge off while any lapsed sandbox still runs (re-applied
-        # each call, in case it was flushed too), and lift the cut once none is
-        # left.
-        try:
-            if waiting:
-                enforcer.quarantine()
-            elif enforcer.quarantined:
-                enforcer.lift_quarantine()
-        except Exception:
-            pass
+        # The mark, the decision and the nft install or lift happen under one
+        # lock, so a concurrent mark cannot fall between a decision to lift and
+        # the lift.
+        with self._quarantine_lock:
+            with self._lock:
+                lapses = enforcer.lapses
+                if lapses != self._seen_lapses:
+                    self._seen_lapses = lapses
+                    self._lapse_cut.update(
+                        sid
+                        for sid, info in self._sandboxes.items()
+                        if info.spec.network == "internet"
+                    )
+                waiting = bool(self._lapse_cut or self._lapse_inflight)
+                swept_clean = self._swept_clean
+            # Cut the bridge off while any lapsed sandbox still runs (re-applied
+            # each call, in case it was flushed too), and lift the cut once none
+            # is left. A table left by an earlier run waits for a clean orphan
+            # sweep, since that run's sandboxes may still be running.
+            try:
+                if waiting:
+                    enforcer.quarantine()
+                elif enforcer.quarantined and (swept_clean or not enforcer.quarantine_leftover):
+                    enforcer.lift_quarantine()
+            except Exception:
+                pass
         with self._lock:
             for sandbox_id in sorted(self._lapse_cut):
                 thread = self._lapse_inflight.get(sandbox_id)
@@ -1141,6 +1156,9 @@ class RunscExecutor(_Table):
                     self._pending_cleanup.pop(name, None)
             else:
                 remaining += 1
+        if remaining == 0:
+            with self._lock:
+                self._swept_clean = True
         return remaining
 
     def _kill_in_sandbox(self, sandbox_id: str, pid_file: str | None) -> bool:

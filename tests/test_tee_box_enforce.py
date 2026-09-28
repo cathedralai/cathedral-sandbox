@@ -183,6 +183,10 @@ class _Box:
             assert 'iifname "cathsbx0" counter drop' in stdin.decode()
             self.quarantine_table = True
             return self._done(argv)
+        if argv[1:] == ["list", "table", "inet", NFT_QUARANTINE_TABLE]:
+            if not self.quarantine_table:
+                return self._done(argv, code=1, stderr=b"Error: No such file or directory")
+            return self._done(argv, b"table inet cathedral_tee_box_lapse {}\n")
         if argv[1:] == ["delete", "table", "inet", NFT_QUARANTINE_TABLE]:
             if not self.quarantine_table:
                 return self._done(argv, code=1, stderr=b"Error: No such file or directory")
@@ -275,6 +279,7 @@ def test_apply_creates_the_bridge_network_applies_and_reads_back_the_table():
         "capped_sandboxes": 0,
         "lapses": 0,
         "quarantined": False,
+        "quarantine_leftover": False,
         "quarantine_error": None,
     }
     argvs = [argv for argv, _stdin in box.calls]
@@ -295,7 +300,9 @@ def test_apply_creates_the_bridge_network_applies_and_reads_back_the_table():
     assert argvs[3] == ["/usr/sbin/nft", "-f", "-"]
     assert box.calls[3][1] == enforcer.nft_ruleset()
     assert enforcer.nft_ruleset().decode().endswith(enforcer.policy.render_nft())
-    assert argvs[4] == ["/usr/sbin/nft", "--json", "list", "table", "inet", NFT_TABLE]
+    # A quarantine table left by an earlier run would be adopted here.
+    assert argvs[4] == ["/usr/sbin/nft", "list", "table", "inet", NFT_QUARANTINE_TABLE]
+    assert argvs[5] == ["/usr/sbin/nft", "--json", "list", "table", "inet", NFT_TABLE]
 
 
 @pytest.mark.parametrize(
@@ -542,7 +549,13 @@ _REAL_SCRIPT = textwrap.dedent(
 
     tools = {name: sys.argv[i] for i, name in enumerate(("nft", "tc", "ip", "nsenter"), 2)}
     enforcer = EgressEnforcer(policy, runner=runner, **tools)
-    out = {"applied": enforcer.apply(), "error": enforcer.status()["error"]}
+    # A crash during a lapse left the quarantine table behind.
+    sh(tools["nft"] + " add table inet cathedral_tee_box_lapse")
+    out = {"leftover_applied": enforcer.apply()}
+    out["leftover_status"] = [enforcer.status()[k] for k in ("enforced", "quarantine_leftover")]
+    out["leftover_lifted"] = enforcer.lift_quarantine()
+    out["applied"] = enforcer.apply()
+    out["error"] = enforcer.status()["error"]
     out["reapplied"] = enforcer.apply()
     attached = enforcer.attach("cathsbx-sbx-1")
     out["veth"] = attached.veth
@@ -587,6 +600,9 @@ def test_real_nft_tc_and_ip_in_an_unprivileged_namespace(tmp_path: Path):
     assert result.returncode == 0, result.stderr.decode()[-2000:]
     out = json.loads(result.stdout.decode().strip().splitlines()[-1])
     assert out == {
+        "leftover_applied": False,
+        "leftover_status": [False, True],
+        "leftover_lifted": True,
         "applied": True,
         "error": None,
         "reapplied": True,
@@ -897,3 +913,24 @@ def test_a_lapse_recorded_elsewhere_is_marked_before_the_check_re_applies():
     assert marked_at_reapply == [True]
     docker.rm_failures = 0
     executor.end_lapsed_sandboxes(wait=True)
+
+
+def test_a_leftover_quarantine_table_is_adopted_and_never_reported_enforced():
+    enforcer, box = _enforcer()
+    box.quarantine_table = True  # the worker crashed during a lapse
+    assert enforcer.apply() is False
+    status = enforcer.status()
+    assert status["enforced"] is False and status["quarantine_leftover"] is True
+    assert "earlier run" in status["error"]
+    assert not enforcer.active
+    with pytest.raises(EgressEnforcementError):
+        enforcer.attach(CONTAINER)
+    assert enforcer.lift_quarantine() and not box.quarantine_table
+    assert enforcer.apply() is True and enforcer.active
+
+
+def test_an_unreadable_quarantine_state_fails_the_apply():
+    enforcer, box = _enforcer()
+    box.fail.add("nft:list")
+    assert enforcer.apply() is False
+    assert enforcer.status()["error"] == "nft could not list the quarantine table"

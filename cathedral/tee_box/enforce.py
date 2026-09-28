@@ -333,6 +333,7 @@ class EgressEnforcer:
         self._last_attempt: float | None = None
         self._lapses = 0
         self._quarantined = False
+        self._quarantine_leftover = False
         self._quarantine_error: str | None = None
         self._sandboxes: dict[str, SandboxEgress] = {}
 
@@ -351,6 +352,13 @@ class EgressEnforcer:
             return self._quarantined
 
     @property
+    def quarantine_leftover(self) -> bool:
+        """The quarantine table was found in the kernel, not installed by this process."""
+
+        with self._lock:
+            return self._quarantine_leftover
+
+    @property
     def lapses(self) -> int:
         """How many times enforcement went from active to inactive."""
 
@@ -360,13 +368,19 @@ class EgressEnforcer:
     def status(self) -> dict[str, object]:
         with self._lock:
             error = self._error
-            if error is None and self._quarantined:
+            if error is None and self._quarantine_leftover:
+                error = (
+                    "a quarantine table from an earlier run cuts the sandbox bridge off "
+                    "until the orphan sweep comes back clean"
+                )
+            elif error is None and self._quarantined:
                 error = "the sandbox bridge is cut off while lapsed sandboxes are removed"
             return {
                 "enforced": self._active and not self._quarantined,
                 "error": error,
                 "lapses": self._lapses,
                 "quarantined": self._quarantined,
+                "quarantine_leftover": self._quarantine_leftover,
                 "quarantine_error": self._quarantine_error,
                 "bridge": self.policy.bridge,
                 "nft_table": f"{NFT_FAMILY} {NFT_TABLE}",
@@ -489,9 +503,28 @@ class EgressEnforcer:
         try:
             self._ensure_network()
             self._ok(self.nft_apply_argv(), "nft apply", stdin=self.nft_ruleset())
+            self._reconcile_quarantine()
         except EgressEnforcementError as exc:
             return self._fail(str(exc))
         return self.verify()
+
+    def _reconcile_quarantine(self) -> None:
+        """Adopt a quarantine table already in the kernel (an earlier run's lapse).
+
+        It stays, and enforcement is not reported, until the executor lifts
+        it: its sandboxes may still be running until the orphan sweep removes
+        them. A table this process installed is already tracked.
+        """
+
+        result = self._run([self.nft, "list", "table", NFT_FAMILY, NFT_QUARANTINE_TABLE])
+        if result.returncode == 0:
+            with self._lock:
+                if not self._quarantined:
+                    self._quarantined = True
+                    self._quarantine_leftover = True
+            return
+        if b"No such file" not in (result.stderr or b""):
+            raise EgressEnforcementError("nft could not list the quarantine table")
 
     def verify(self) -> bool:
         """Read the table back; true only when it matches and the bridge is not quarantined."""
@@ -590,6 +623,7 @@ class EgressEnforcer:
             return False
         with self._lock:
             self._quarantined = False
+            self._quarantine_leftover = False
             self._quarantine_error = None
         return True
 

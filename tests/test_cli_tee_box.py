@@ -67,6 +67,8 @@ class _Guest:
                 return subprocess.CompletedProcess(argv, 1, b"", b"Error: permission denied")
             if argv[1] == "-f":
                 return subprocess.CompletedProcess(argv, 0, b"", b"")
+            if argv[1] == "list":  # no quarantine table left from an earlier run
+                return subprocess.CompletedProcess(argv, 1, b"", b"Error: No such file")
             from tests.test_tee_box_enforce import _listing
 
             policy = configure_module.build_egress_policy(["34.120.1.2"])
