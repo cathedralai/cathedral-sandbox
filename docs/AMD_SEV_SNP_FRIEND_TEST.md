@@ -48,11 +48,13 @@ Why the default matters on a multi-socket host: AMD firmware refuses to activate
 a `SINGLE_SOCKET` guest through `SNP_ACTIVATE`, and only `SNP_ACTIVATE_EX` can
 pin a guest to one socket (56860 section 4.4). Upstream Linux KVM issues
 `SNP_ACTIVATE` only. So on a host with two or more populated sockets you cannot
-launch a guest that satisfies the default, and your operator must decide whether
-to set `require_single_socket` to `false` for your generation.
+launch a guest that satisfies the default, and your validator's operator must
+decide whether to set `require_single_socket` to `false`. The flag is
+policy-wide: it applies to every admitted processor generation, not to one
+(cathedral-validator `snp_production.py` lines 54-58 and 131-138).
 
-UID30 set `require_single_socket` to `false` for `milan` on 2026-09-08 and
-admitted a two-socket host that same day. That is one validator's decision. Ask
+UID30 set `require_single_socket` to `false` on 2026-09-08 and admitted a
+two-socket `milan` host that same day. That is one validator's decision. Ask
 your target validator's operator rather than assuming.
 
 **Hardware identity dedup is not optional.** Linux routes every SNP command,
@@ -70,9 +72,14 @@ That experiment used one host and did not establish the socket placement of the
 two guests, so it confirms same-host CHIP_ID collision and does not by itself
 prove the general cross-socket case.
 
-Additional customer capacity offered from one host is accounted separately and
-is not a second scoring machine. Adding customer slots never multiplies reward
-claims for one chip.
+Customer capacity offered from one host is not a second scoring machine. The
+direct validator pays one unit per distinct verified hardware identity per UID
+and zeroes every row that repeats one (cathedral-validator
+`cathedral_thin/independent_runtime/direct_validator.py` lines 444-448 and
+`multicompute.py` lines 165-187), so adding customer slots cannot multiply
+reward claims for one chip. The scoring path (`direct_validator.py`,
+`fleet_score.py`, `multicompute.py`) never reads customer capacity, so this
+document makes no claim about how customer capacity itself is accounted.
 
 ## Requirements and first hardware proof
 

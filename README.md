@@ -37,16 +37,18 @@ guarantee TAO. The subnet must have positive emission.
 |---|---|---|
 | Intel TDX on Linux | Mainnet live testing | Eligible after fresh TDX and SAT verification |
 | More Intel TDX machines on one UID | Mainnet live testing | Each distinct verified machine adds to that UID's score |
-| AMD SEV-SNP on Linux | Mainnet live, first hardware admitted 2026-09-08 | Eligible after that validator's policy admits the measurement and TCB, then fresh evidence and SAT pass |
+| AMD SEV-SNP on Linux | Was live on SN39 at block 9025398 (first hardware admitted 2026-09-08); SN94 status pending verification | Eligible after that validator's policy admits the measurement and TCB, then fresh evidence and SAT pass |
 
 The current direct validator source supports Intel TDX and AMD SEV-SNP. Each
 validator owns its SNP measurement and TCB allowlist. An AMD machine earns zero
 from that validator until its live hardware run is admitted by the policy and
 fresh evidence and SAT pass.
 
-UID30 admitted its first live AMD machine on 2026-09-08 and recorded the weight
-row `[(68, 1.0)]` at block 9025398. That is one observed cycle on one validator,
-not a standing payout and not a promise about any other validator. Every
+On SN39, UID30 admitted its first live AMD machine on 2026-09-08 and recorded
+the weight row `[(68, 1.0)]` at block 9025398. That was one observed cycle on
+one validator, not a standing payout and not a promise about any other
+validator. Cathedral moved to SN94 on 2026-09-28, and no SN94 AMD admission has
+been verified yet, so the SN94 AMD status is pending verification. Every
 validator still owns its own policy, so admission by UID30 says nothing about
 whether another validator will admit the same machine.
 
