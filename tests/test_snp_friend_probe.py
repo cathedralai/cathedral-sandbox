@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import ssl
 import subprocess
 import threading
@@ -15,6 +16,7 @@ import cathedral.snp_friend_probe as probe
 from cathedral.channel import tls_spki_binding
 from cathedral.common import Evidence, EvidenceKind
 from cathedral.remote import RemoteMiner
+from cathedral.verify.snp import SnpReport, SnpTcb, _tcb_meets_minimum
 from cathedral.worker import WorkerServer
 
 
@@ -203,3 +205,83 @@ def test_cli_success_prints_only_a_minimal_transcript_pointer(monkeypatch, tmp_p
         "output": str(output),
     }
     assert json.loads(output.read_text(encoding="utf-8")) == result
+
+
+def _report(family: int, model: int, tcbs: tuple[int, int, int, int], policy: int) -> SnpReport:
+    return SnpReport(
+        version=3,
+        guest_svn=0,
+        guest_policy=policy,
+        vmpl=0,
+        signature_algo=1,
+        platform_info=0,
+        signer_info=0,
+        cpuid_family=family,
+        cpuid_model=model,
+        cpuid_step=1,
+        report_data=b"\x00" * 64,
+        measurement="ab" * 48,
+        chip_id="cd" * 64,
+        tcb=SnpTcb(current=tcbs[0], reported=tcbs[1], committed=tcbs[2], launch=tcbs[3]),
+        signature=b"",
+    )
+
+
+def _tcb(components: dict[int, int]) -> int:
+    encoded = bytearray(8)
+    for index, value in components.items():
+        encoded[index] = value
+    return int.from_bytes(encoded, "little")
+
+
+@pytest.mark.parametrize(
+    ("family", "model", "generation", "components", "reserved"),
+    [
+        (0x19, 0x01, "milan", (0, 1, 6, 7), range(2, 6)),
+        (0x19, 0x11, "genoa", (0, 1, 6, 7), range(2, 6)),
+        (0x1A, 0x02, "turin", (0, 1, 2, 3, 7), range(4, 7)),
+    ],
+)
+def test_policy_entry_floor_admits_all_four_tcbs_and_nothing_lower(
+    family, model, generation, components, reserved
+):
+    tcbs = tuple(
+        _tcb({index: 10 + offset + position for position, index in enumerate(components)})
+        | _tcb({index: 0xEE for index in reserved})
+        for offset in (3, 2, 5, 0)
+    )
+    entry = probe.validator_policy_entry(_report(family, model, tcbs, 0x30000))
+
+    assert entry["schema"] == "cathedral_amd_sev_snp_policy_v1"
+    assert list(entry["generations"]) == [generation]
+    admitted = entry["generations"][generation]
+    assert set(admitted) == {"allowed_measurements", "minimum_tcb"}
+    assert admitted["allowed_measurements"] == ["ab" * 48]
+    assert re.fullmatch(r"0x[0-9a-f]{16}", admitted["minimum_tcb"])
+    floor = int(admitted["minimum_tcb"], 16)
+    floor_bytes = floor.to_bytes(8, "little")
+    assert all(floor_bytes[index] == 0 for index in reserved)
+    assert all(floor_bytes[index] == 10 + position for position, index in enumerate(components))
+    assert all(_tcb_meets_minimum(value, floor, generation) for value in tcbs)
+    for index in components:
+        raised = bytearray(floor_bytes)
+        raised[index] += 1
+        assert not _tcb_meets_minimum(tcbs[3], int.from_bytes(raised, "little"), generation)
+
+
+def test_policy_entry_carries_the_single_socket_bit():
+    tcbs = (_tcb({0: 1, 7: 1}),) * 4
+    assert probe.validator_policy_entry(_report(0x19, 0x01, tcbs, 0x30000))[
+        "require_single_socket"
+    ] is False
+    assert probe.validator_policy_entry(_report(0x19, 0x01, tcbs, 0x130000))[
+        "require_single_socket"
+    ] is True
+
+
+def test_policy_entry_refuses_an_unknown_generation_or_a_zero_floor():
+    tcbs = (_tcb({0: 1, 7: 1}),) * 4
+    with pytest.raises(probe.ProbeError, match="generation"):
+        probe.validator_policy_entry(_report(0x17, 0x01, tcbs, 0x30000))
+    with pytest.raises(probe.ProbeError, match="zero floor"):
+        probe.validator_policy_entry(_report(0x19, 0x01, (_tcb({2: 9}),) * 4, 0x30000))

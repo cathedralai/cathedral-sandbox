@@ -51,7 +51,9 @@ from cathedral.verify.snp import (
     MAX_SNPGUEST_BYTES,
     PINNED_SNPGUEST_SHA256,
     PINNED_SNPGUEST_VERSION,
+    SnpReport,
     parse_snp_report,
+    snp_generation,
 )
 from cathedral.worker import WorkerServer
 
@@ -62,6 +64,14 @@ SECOND_HOTKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 DEFAULT_SEV_GUEST_DEVICE = Path("/dev/sev-guest")
 PROBE_TIMEOUT_SECONDS = 120.0
 FRIEND_SNPGUEST_TIMEOUT_SECONDS = 15.0
+VALIDATOR_POLICY_SCHEMA = "cathedral_amd_sev_snp_policy_v1"
+GUEST_POLICY_SINGLE_SOCKET = 1 << 20
+# TCB bytes the validator compares per generation; every other byte is reserved.
+_TCB_COMPONENT_BYTES = {
+    "milan": (0, 1, 6, 7),
+    "genoa": (0, 1, 6, 7),
+    "turin": (0, 1, 2, 3, 7),
+}
 
 
 class ProbeError(RuntimeError):
@@ -445,8 +455,13 @@ def run_probe(review_challenge: bytes) -> dict[str, Any]:
                 b"cathedral.amd-sev-snp.platform.v1\x00" + bytes.fromhex(parsed.chip_id),
                 hashlib.sha256,
             ).hexdigest(),
+            "processor_generation": snp_generation(parsed),
+            "current_tcb_hex": f"0x{parsed.tcb.current:016x}",
             "reported_tcb_hex": f"0x{parsed.tcb.reported:016x}",
+            "committed_tcb_hex": f"0x{parsed.tcb.committed:016x}",
+            "launch_tcb_hex": f"0x{parsed.tcb.launch:016x}",
         },
+        "validator_policy_entry": validator_policy_entry(parsed),
         "channel": {
             "binding_type": binding.binding_type.value,
             "binding_digest": "sha256:" + binding.digest.hex(),
@@ -457,6 +472,37 @@ def run_probe(review_challenge: bytes) -> dict[str, Any]:
             "customer_receipts_enabled": False,
             "managed_provisioning_enabled": False,
             "durable_machine_dedup_proven": False,
+        },
+    }
+
+
+def validator_policy_entry(parsed: SnpReport) -> dict[str, Any]:
+    """Return the exact validator SNP policy entry this observed guest needs.
+
+    The validator applies one component-wise floor to the current, reported,
+    committed and launch TCB, so the floor is the per-component minimum of all
+    four, with the generation's reserved bytes left at zero.
+    """
+
+    generation = snp_generation(parsed)
+    if generation not in _TCB_COMPONENT_BYTES:
+        raise ProbeError("the processor generation is not one the validator admits")
+    values = (parsed.tcb.current, parsed.tcb.reported, parsed.tcb.committed, parsed.tcb.launch)
+    encoded = [value.to_bytes(8, "little") for value in values]
+    floor = bytearray(8)
+    for index in _TCB_COMPONENT_BYTES[generation]:
+        floor[index] = min(value[index] for value in encoded)
+    minimum_tcb = int.from_bytes(floor, "little")
+    if minimum_tcb == 0:
+        raise ProbeError("every TCB component is zero; the validator refuses a zero floor")
+    return {
+        "schema": VALIDATOR_POLICY_SCHEMA,
+        "require_single_socket": bool(parsed.guest_policy & GUEST_POLICY_SINGLE_SOCKET),
+        "generations": {
+            generation: {
+                "allowed_measurements": [parsed.measurement],
+                "minimum_tcb": f"0x{minimum_tcb:016x}",
+            }
         },
     }
 

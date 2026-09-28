@@ -136,10 +136,34 @@ snapshot-signing seed.
 
 The validator's SNP policy remains a strict allowlist. Before a friend's
 machine is registered, capture the observed transcript above and add the exact
-measurement, processor generation, and minimum reported TCB to the reviewed
-validator policy. The same component-wise floor applies to current, reported,
-committed, and launch TCB. Do not use a wildcard policy to make a new machine
-pass.
+measurement, processor generation, and minimum TCB to the reviewed validator
+policy. The same component-wise floor applies to current, reported, committed,
+and launch TCB. Do not use a wildcard policy to make a new machine pass.
+
+The transcript's `validator_policy_entry` is that entry, in the validator's
+`cathedral_amd_sev_snp_policy_v1` format. It names the processor generation
+from the report's CPUID, the observed measurement, and a `minimum_tcb` that is
+the per-component minimum of the current, reported, committed, and launch TCB,
+with the generation's reserved bytes left at zero. `report` also carries all
+four TCB values for review. The validator operator merges the generation entry
+into their own policy file; the probe never edits a validator policy.
+
+`require_single_socket` in that entry reports the guest's SINGLE_SOCKET policy
+bit. A validator policy requires the bit unless it sets
+`require_single_socket` to `false`, so a guest launched without it is refused
+until the operator makes that choice explicitly.
+
+## Host facts this repository does not establish
+
+The verifier checks what the guest reports. It does not prescribe or check the
+host. Nothing in this repository fixes an EPYC SKU, BIOS settings, SEV firmware
+version, host kernel, QEMU, or OVMF build, or publishes a reference guest image
+or launch measurement. Record those in the admission request so the validator
+operator can review them.
+
+Run one SNP guest per physical host. Every guest on a host reports the same
+CHIP_ID, and the validator zeroes every claimant that shares a hardware
+identity, so a second guest on the same host costs the first one its weight.
 
 ### Start the miner
 
@@ -165,12 +189,20 @@ test "$(git -C cathedral-snp-runtime rev-parse HEAD)" = "$SOURCE_COMMIT"
 test -z "$(git -C cathedral-snp-runtime status --porcelain)"
 ```
 
-On the separate miner-controlled host, use this same `SOURCE_COMMIT` with only
-the [Refresh validator access from a control host](../README.md#2-refresh-validator-access-from-a-control-host)
-procedure. Replace the revision shown in that TDX example with
-`$SOURCE_COMMIT`. Do not run its TDX host or image steps. Keep the snapshot
-signing seed on the control host. Transfer only `snapshot-keys.json` and the
-fresh `validator-access.json` to the SNP guest.
+On the separate miner-controlled host, follow only the
+[Refresh validator access from a control host](../README.md#2-refresh-validator-access-from-a-control-host)
+procedure, at the reviewed revision that ships its `refresh` and `fetch`
+commands. Do not substitute `$SOURCE_COMMIT` there: at that revision
+`scripts/cathedral_validator_access.py` has only `init-key`, `capture`, and
+`verify`, so the refresh and fetch timers cannot run. Both revisions sign and
+verify the same `cathedral_validator_access_snapshot_v1` document, so this
+image accepts what the newer refresher publishes. Do not run the README's TDX
+host or image steps. Keep the snapshot signing seed on the control host.
+Transfer only `snapshot-keys.json` and the fresh `validator-access.json` to the
+SNP guest.
+
+This image's worker predates live `fleet.json` reloading. Restart the miner
+unit after changing `fleet.json`.
 
 On the guest, create both private destinations first. The launcher refuses
 linked, non-root-owned, or group/world-accessible access state:
