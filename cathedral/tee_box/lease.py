@@ -200,6 +200,23 @@ class CustomerLease:
                 raise LeaseBusy
             return lease
 
+    def require_locked(self, caller: str) -> Lease:
+        """``require`` for a caller already holding ``locked()``: it never runs a
+        drain. An expiry found here marks the box draining and refuses; the
+        drain then runs on a later call, outside the lock, so a slow container
+        daemon cannot block every other caller behind this one."""
+
+        now = self._clock()
+        self._expire_locked(now)
+        if self._draining is not None:
+            raise LeaseDraining
+        lease = self._lease
+        if lease is None:
+            raise LeaseRequired
+        if lease.holder != caller:
+            raise LeaseBusy
+        return lease
+
     def locked(self):  # noqa: ANN201 - context manager
         """Hold the lease lock so a call cannot race a hand-over."""
 

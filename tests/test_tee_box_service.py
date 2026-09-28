@@ -880,3 +880,31 @@ def test_the_worker_sweeps_leftover_containers_when_it_starts(tmp_path: Path):
         assert fake.orphans == set()
     finally:
         box.close()
+
+
+def test_an_expiry_found_under_the_create_lock_never_runs_the_drain_there():
+    # Review of 5b1f5ea: a lease expiring between the route's require and the
+    # create's locked require ran the drain while holding the lease lock, so a
+    # hung daemon blocked every caller instead of refusing them as draining.
+    from cathedral.tee_box.lease import CustomerLease, LeaseDraining
+
+    now = [1000.0]
+    drains: list[str] = []
+
+    def drain(holder: str) -> bool:
+        drains.append(holder)
+        return True
+
+    lease = CustomerLease(drain, clock=lambda: now[0])
+    lease.retry_drain()  # a fresh box starts draining until its first clean sweep
+    assert not lease.draining
+    lease.acquire("customer-a", 60)
+    drains.clear()
+    now[0] += 61  # the lease expires
+    with lease.locked():
+        with pytest.raises(LeaseDraining):
+            lease.require_locked("customer-a")
+    assert drains == []  # nothing drained while the lock was held
+    assert lease.draining
+    lease.retry_drain()  # the drain runs later, outside the lock
+    assert drains == ["customer-a"] and not lease.draining

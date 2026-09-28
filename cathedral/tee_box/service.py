@@ -608,7 +608,7 @@ class TeeBoxSandboxApi:
         env = _env(document.get("env"))
         # Hold the lease lock so a drain cannot miss this sandbox.
         with self.lease.locked():
-            self.lease.require(caller)
+            self.lease.require_locked(caller)
             sandboxes = self.executor.list()
             if len(sandboxes) >= MAX_SANDBOXES or not self._allocated().plus(shape).fits_within(
                 self.capacity
