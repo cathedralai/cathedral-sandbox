@@ -22,6 +22,10 @@ admission, key release, lifecycle state, provider contracts, and policy
 registries. They are for developers and reviewers. They are not alternate SN39
 mining paths.
 
+[Compute pool integrity](COMPUTE_POOL_INTEGRITY.md) records what the direct
+validator checks before it pays a machine, where that protection ends, and the
+proposed enclave-policy and signed-receipt changes.
+
 The current Cathedral validator derives weights directly from miner evidence.
 It does not consume the repository's older signed-vector publisher,
 central-enrollment, burn, or provenance flows.
