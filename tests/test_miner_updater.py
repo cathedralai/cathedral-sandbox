@@ -17,29 +17,42 @@ import json
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
+from cathedral.miner_products import SNP_MINER, read_launcher_profile
 from cathedral.miner_update_cli import MINIMUM_ACCESS_REMAINING_SECONDS, safe_to_activate
 from cathedral.miner_updater import (
     DEFERRAL_ALERT_AFTER,
-    PROBATION_MINIMUM_SECONDS,
-    UNVERIFIED_ALERT_AFTER,
     EXIT_ALERT,
     EXIT_HALTED,
     EXIT_REFUSED,
     LEGACY,
+    PROBATION_MINIMUM_SECONDS,
     STAGE_MAY_HAVE_RUN,
     STAGE_PREPARED,
     STAGE_PROBATION,
+    TREE_LAUNCHER,
+    UNVERIFIED_ALERT_AFTER,
     MinerUpdateError,
+    _check_launcher,
     describe_status,
     pin_document,
     resolve,
     write_state,
 )
 from cathedral.validator_access import ValidatorAccessState
-from tests.miner_update_support import DAY, NETUID, NOW, OTHER_KEY, OTHER_NETUID, Harness
+from tests.miner_update_support import (
+    DAY,
+    NETUID,
+    NOW,
+    OTHER_KEY,
+    OTHER_NETUID,
+    Harness,
+    _writable,
+    build_tree,
+)
 
 
 @pytest.fixture()
@@ -219,6 +232,44 @@ def test_equivocation_at_the_same_sequence_is_refused(h):
 def test_a_record_for_another_netuid_is_refused(h):
     h.release(sequence=5, netuid=OTHER_NETUID)
     _refused_and_untouched(h, h.check())
+
+
+def test_a_record_naming_the_v1_runtime_contract_is_refused_before_any_pull(h):
+    # The launcher now requires the -v2 contract (network and netuid from deploy
+    # config). A record that pairs it with a -v1 contract is refused up front.
+    h.release(
+        sequence=5,
+        mutate=lambda body: body["release"].__setitem__(
+            "runtime_contract", "snp-signed-validator-fleet-v1"
+        ),
+    )
+    outcome = h.check()
+    _refused_and_untouched(h, outcome)
+    assert "different runtime contracts" in outcome.reason
+    assert h.prepared == []
+
+
+def test_a_v1_launcher_with_a_matching_v1_record_is_never_activated(tmp_path):
+    # previous_contracts let the bootstrap adopt a v1 host, but the updater must
+    # never activate a v1 launcher, even when the record names the same v1
+    # contract: only the product's current contract passes _check_launcher.
+    tree = tmp_path / "bundle"
+    build_tree(tree)
+    launcher = tree / TREE_LAUNCHER
+    _writable(launcher)
+    text = launcher.read_text()
+    current = f"readonly RUNTIME_CONTRACT='{SNP_MINER.runtime_contract}'"
+    assert text.count(current) == 1
+    previous = SNP_MINER.previous_contracts[0]
+    launcher.write_text(text.replace(current, f"readonly RUNTIME_CONTRACT='{previous}'"))
+    profile = read_launcher_profile(launcher)
+    assert profile.runtime_contract == previous
+    host = SimpleNamespace(config=SimpleNamespace(product=SNP_MINER.product))
+    release = SimpleNamespace(
+        runtime_contract=previous, image_repository=profile.image_repository
+    )
+    with pytest.raises(MinerUpdateError, match="different product"):
+        _check_launcher(host, tree, release)
 
 
 def test_the_bootstrap_floor_refuses_old_records(tmp_path):

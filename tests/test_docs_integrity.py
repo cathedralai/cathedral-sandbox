@@ -94,7 +94,27 @@ def test_current_guide_never_runs_user_writable_code_as_root() -> None:
     assert "sudo cathedral-access/" not in readme
     assert "sudo --preserve-env" in readme
     assert "/usr/local/libexec/cathedral/run-sn94-miner" in readme
-    assert "0346c1c160690f53bef570278a5d5cea2645b9141a7a13ad643e80463afa7e27" in readme
+    assert "29b86abf29ff0acb50fffa7931ea980adf731f1225689918f2c1bad93fd599cc" in readme
+
+
+def test_readme_checkouts_come_from_the_pinned_tdx_image_release() -> None:
+    # The launcher is installed from the cathedral-runtime checkout, so the
+    # checkouts and the TDX image pin must name one source commit. A repin that
+    # moves the image but not the checkouts (or back) fails here. The launcher
+    # digest itself follows the in-tree launcher (test_audit_miner_entrypoint),
+    # so it cannot be tied to the image here; docs/SN94_AUDIT_MINER_IMAGE.md
+    # records the pin order that keeps them one release.
+    readme = (REPO_ROOT / "README.md").read_text()
+    tdx = re.search(r"^TDX_IMAGE='[^']+'$(?P<block>.*?)^SNP_IMAGE=", readme, re.M | re.S)
+    assert tdx is not None
+    revision = re.search(r"image\.revision\"\}\}'\)\" = \\\n\s+([0-9a-f]{40})", tdx["block"])
+    assert revision is not None
+    checkouts = re.findall(r"checkout --detach ([0-9a-f]{40})", readme)
+    assert set(re.findall(r"git -C (cathedral-[a-z]+) checkout --detach [0-9a-f]{40}", readme)) == {
+        "cathedral-runtime",
+        "cathedral-access",
+    }
+    assert checkouts and set(checkouts) == {revision.group(1)}
 
 
 def test_validator_access_signing_seed_stays_outside_the_checkout() -> None:

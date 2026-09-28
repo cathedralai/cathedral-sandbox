@@ -18,6 +18,11 @@ label is `snp-signed-validator-fleet-v1`. The immutable digest proves the
 published bytes available from GHCR. It does not prove a running SNP machine,
 vendor evidence, validator admission, or an on-chain weight.
 
+Images built from this source declare `snp-signed-validator-fleet-v2`, and
+the SNP launcher in this source requires it. Follow the
+[pin order](SN94_AUDIT_MINER_IMAGE.md#pin-order-for-the-v2-runtime-contract)
+before pairing them.
+
 ## Fixed behavior
 
 The image starts this exact command:
@@ -32,9 +37,11 @@ It fixes these properties:
 - Official `snpguest` v0.10.0, SHA-256
   `70e700465e3523e67dd5104583dc36cd11eef630c6f04c5b9ccafd6ba2e76ca0`.
 - Native TLS on TCP `8081` with a new guest-owned private key at each start.
-- Finney SN94 and signed validator requests only.
-- The miner's public hotkey, public HTTPS endpoint, and a digest pin for the
-  validator-access public-key file as its only Cathedral environment inputs.
+- Signed validator requests only, for the network and netuid set at deploy
+  time.
+- The miner's public hotkey, public HTTPS endpoint, a digest pin for the
+  validator-access public-key file, and the network and netuid as its only
+  Cathedral environment inputs.
 
 The launcher requires an immutable image digest. It verifies the pulled
 repository digest, architecture, and runtime label before start. It passes only
