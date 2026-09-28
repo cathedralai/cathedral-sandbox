@@ -1427,6 +1427,21 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         )
     if development_no_auth and access_enabled:
         raise ValueError("signed validator access cannot use development-no-auth")
+    central_values = (
+        getattr(args, "central_root_keys", None),
+        getattr(args, "central_root_keys_digest", None),
+        getattr(args, "central_access_state", None),
+    )
+    central_enabled = any(value is not None for value in central_values)
+    if central_enabled:
+        if any(value is None for value in central_values):
+            raise ValueError(
+                "central access requires root keys, their pinned digest, and its own state"
+            )
+        if not signed_access_configured:
+            raise ValueError("central access requires signed validator access and native TLS")
+        if central_values[2] == access_state_path:
+            raise ValueError("central access state must be separate from validator access state")
     # The locality guard keys off AUTHENTICATION, not TLS.
     #
     # It used to be `not tls_enabled`, so supplying a certificate satisfied it and
@@ -1593,6 +1608,20 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         evidence_collector = collect_tdx_gpu
     else:
         evidence_collector = None
+    central_authorizer = None
+    if central_enabled:
+        if validator_authorizer is None or channel_binding is None:
+            raise ValueError("central access requires signed validator access and native TLS")
+        from cathedral.central_access import CentralAccessAuthorizer, load_central_root_keys
+
+        central_authorizer = CentralAccessAuthorizer(
+            load_central_root_keys(central_values[0], pinned_digest=central_values[1]),
+            worker_hotkey=args.hotkey,
+            network=provider.network,
+            netuid=provider.netuid,
+            channel_binding=channel_binding,
+            state=ValidatorAccessState(central_values[2]),
+        )
     gpu_executor = None
     gpu_evidence_collector = None
     if posture == "gpu-production":
@@ -1628,6 +1657,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         allow_public_legacy_audit=allow_public_legacy_audit,
         gpu_executor=gpu_executor,
         gpu_evidence_collector=gpu_evidence_collector,
+        central_authorizer=central_authorizer,
     ) as server:
         print(
             json.dumps(
@@ -1647,6 +1677,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
                     "development_non_loopback_escape": development_allow_non_loopback,
                     "gpu_preview": gpu_composite,
                     "gpu_work": gpu_executor is not None,
+                    "central_access": central_authorizer is not None,
                     "cpu_attestation": "unattested" if posture == "g4-prelaunch" else tee,
                     "private_customer_work": False,
                     "migration_mode": migration_mode,
@@ -4369,6 +4400,18 @@ def build_parser() -> argparse.ArgumentParser:
             "--validator-access-max-age-seconds",
             type=int,
             default=DEFAULT_SNAPSHOT_MAX_AGE_SECONDS,
+        )
+        command.add_argument(
+            "--central-root-keys",
+            help="Cathedral central root public keys; enables central access with the two below",
+        )
+        command.add_argument(
+            "--central-root-keys-digest",
+            help="required sha256 pin for the central root key file",
+        )
+        command.add_argument(
+            "--central-access-state",
+            help="owner-only SQLite replay state for central requests, apart from validator state",
         )
         command.add_argument("--validator-network", default=DEFAULT_ENROLL_NETWORK)
         command.add_argument("--validator-netuid", type=int, default=DEFAULT_ENROLL_NETUID)
