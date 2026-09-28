@@ -24,22 +24,26 @@ and only then admits it (docs/MINER_BOX_RUNBOOK.md).
 One box, one hotkey. The certificate pin and IP are public, so a registration
 proves only that its signer holds the key it seals. ``box_id`` is per hotkey;
 ``box_key`` (``box_key_for``) depends only on the certificate pin, so it is the
-same under every hotkey. ``verify_registration`` checks one document; the
-prober's endpoint then dedupes on ``box_key`` and on the control IP: the first
-claim that verifies and passes a probe wins, and a later claim for the same
-``box_key`` or IP under another hotkey is refused, never zeroing the first
-claimant. A claim lapses when its registration expires unrenewed or its key
-stops passing the probe. Moving a box to another hotkey means reinstalling it,
-which makes a new certificate and so a new ``box_key``, and registering once
-the old hotkey's claim on the IP has lapsed. Binding the box to its hotkey
+same under every hotkey, but only for one certificate: the installer keeps the
+certificate across reruns while at least 48 hours of its 7-day life remain,
+and renews it after that, which changes ``box_key``. ``verify_registration``
+checks one document; the prober's endpoint then applies the first-claim rule
+keyed on the control IP, the identity that survives a renewal: the first
+claim for an IP that verifies and passes a probe wins, and a later claim for
+the same IP (or the same ``box_key``) under another hotkey is refused, never
+zeroing the first claimant. The same hotkey registering again, including with
+a renewed certificate, keeps the claim. A claim lapses when its registration
+expires unrenewed or its key stops passing the probe. Moving a box to another
+hotkey means letting the old hotkey's claim lapse, then registering under the
+new one. Binding the box to its hotkey
 from the box side (the installer records the miner hotkey and the ingress
 serves it over the pinned TLS, so the prober checks box to hotkey too) is a
 follow-up in the runtime repo; until then whoever holds the key and registers
 first holds the box.
 
 Replay. A registration has no nonce, so anyone who saw a still-valid one can
-resubmit it. The endpoint keeps only the newest ``issued_at`` per ``box_key``
-and refuses an older one, or a different one with the same ``issued_at``, so a
+resubmit it. The endpoint keeps only the newest ``issued_at`` per control IP
+(and per ``box_key``) and refuses an older one, or a different one with the same ``issued_at``, so a
 superseded registration cannot displace its successor. The document names no
 network: the prober keeps one X25519 key per network, so a registration
 replayed to another network's prober verifies there but its key does not open,
@@ -145,7 +149,10 @@ def _iso(value: datetime) -> str:
 def _parse_time(value: object, name: str) -> datetime:
     if not isinstance(value, str) or _TIME.fullmatch(value) is None:
         raise RegistrationError(f"{name} must be YYYY-MM-DDTHH:MM:SSZ")
-    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except ValueError as exc:  # an impossible date, such as February 30 or year 0
+        raise RegistrationError(f"{name} is not a real date") from exc
 
 
 def _front_door(control: object, guest: object) -> tuple[str, str]:
@@ -202,7 +209,7 @@ def parse_host_values(text: str) -> dict[str, str]:
 
 
 def box_id_for(cert_sha256: str, miner_hotkey: str) -> str:
-    """Stable per box and hotkey: a reinstall with a new certificate is a new box."""
+    """Stable per certificate and hotkey: a renewed certificate is a new box_id."""
     digest = hashlib.sha256(f"{cert_sha256}\x00{miner_hotkey}".encode()).hexdigest()
     return f"box-{digest[:32]}"
 
@@ -216,7 +223,7 @@ def box_key_for(cert_sha256: str) -> str:
 def _templates(value: object) -> list[dict[str, Any]]:
     try:
         parsed = json.loads(value) if isinstance(value, str) else value
-    except json.JSONDecodeError as exc:
+    except (ValueError, RecursionError) as exc:  # JSONDecodeError is a ValueError
         raise RegistrationError("templates are not JSON") from exc
     if not isinstance(parsed, list) or not 1 <= len(parsed) <= 32:
         raise RegistrationError("templates must be a list of 1 to 32 shapes")
@@ -403,7 +410,8 @@ def verify_registration(
         raise RegistrationError("registration signature does not verify")
     if parsed.netuid != netuid:
         raise RegistrationError("registration is for another netuid")
-    if not parsed.issued_at - ISSUED_AT_SKEW <= now < parsed.expires_at:
+    # Compared as differences, so dates near year 1 or 9999 cannot overflow.
+    if now - parsed.issued_at < -ISSUED_AT_SKEW or now >= parsed.expires_at:
         raise RegistrationError("registration is not currently valid")
     return parsed
 
@@ -468,7 +476,7 @@ def _fields(body: Mapping[str, Any]) -> VerifiedRegistration:
         raise RegistrationError("runtime_revision must be a 40-hex git revision")
     issued = _parse_time(body["issued_at"], "issued_at")
     expires = _parse_time(body["expires_at"], "expires_at")
-    if not issued < expires <= issued + MAX_VALIDITY:
+    if not (issued < expires and expires - issued <= MAX_VALIDITY):
         raise RegistrationError("registration validity must be positive and at most 7 days")
     return VerifiedRegistration(
         box_id=body["box_id"],

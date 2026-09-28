@@ -57,8 +57,9 @@ python -m cathedral.box_registration \
 The registration names your hotkey, the box's front door and certificate pin, its capacity and
 templates, and carries the runtime API key **sealed to the prober**: only the prober can open
 it, and only for this registration. Your hotkey signs all of it. It is valid for 24 hours by
-default (`--valid-hours`, at most 168); register again before it expires, or after a
-reinstall (a new certificate is a new box).
+default (`--valid-hours`, at most 168); register again before it expires, and after the
+front door's certificate is renewed (the installer renews it when less than 48 hours of its
+7 days remain), since the registration pins the certificate.
 
 **What you hand over.** The key is the runtime's team key for this box; the runtime has no
 narrower key yet. Through the front door it reaches only the routes the ingress allowlists
@@ -78,14 +79,14 @@ key). The prober verifies the signature, opens the key, probes the box through i
 and admits it once a probe passes. From then on each round's receipt carries your box's
 verified capacity, and validators pay your hotkey its market value.
 
-**One box, one hotkey.** The prober admits each box under one hotkey. It knows a box by its
-`box_key`, which comes from the certificate pin alone, and by its control IP. The first
-registration for a box or an IP that verifies and passes a probe wins; a later one for the
-same box or IP under another hotkey is refused, and the first hotkey keeps earning.
-Registering again under the same hotkey keeps the claim; it lapses when its registration
-expires unrenewed or its key stops passing the probe. To move a box to another hotkey,
-reinstall it (a new certificate is a new `box_key`), let the old registration expire, then
-register under the new hotkey.
+**One box, one hotkey.** The prober admits each box under one hotkey, keyed on its control
+IP. (`box_key` comes from the certificate pin alone, so it names the current certificate and
+changes when the certificate is renewed; the IP does not.) The first registration for an IP
+that verifies and passes a probe wins; a later one for the same IP under another hotkey is
+refused, and the first hotkey keeps earning. Registering again under the same hotkey, including
+after a certificate renewal, keeps the claim; it lapses when its registration expires unrenewed
+or its key stops passing the probe. To move a box to another hotkey, let the old registration
+expire, then register under the new hotkey.
 
 The certificate pin and IP are public, so what shows the box is yours is holding its key:
 anyone who has it and registers first holds the box. Keep the key file at mode 600 (the command
@@ -94,7 +95,7 @@ installer records your hotkey and the front door serves it over the pinned TLS, 
 also checks box to hotkey.
 
 **Replays.** A registration has no nonce, so anyone who saw one could resubmit it while it is
-valid. The endpoint keeps only the newest `issued_at` per `box_key` and refuses an older one,
+valid. The endpoint keeps only the newest `issued_at` per control IP and refuses an older one,
 or a different one with the same `issued_at`, so an old registration can't replace your
 current one. Each network's prober has its own key, so a registration replayed to another
 network's prober doesn't open there.

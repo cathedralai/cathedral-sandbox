@@ -167,7 +167,7 @@ def test_the_box_key_is_the_same_under_every_hotkey():
     assert mine.box_key == theirs.box_key == reg.box_key_for(CERT)
     assert mine.box_id != theirs.box_id  # box_id stays per hotkey
     assert mine.box_key.startswith("boxkey-") and len(mine.box_key) == len("boxkey-") + 32
-    assert reg.box_key_for(CERT) != reg.box_key_for("d4" * 32)  # a reinstall is a new box
+    assert reg.box_key_for(CERT) != reg.box_key_for("d4" * 32)  # a renewed certificate is a new box_key
 
 
 def test_a_registration_issued_in_the_future_is_refused():
@@ -429,3 +429,70 @@ def test_template_ids_are_plain_ascii():
     bad = json.dumps([{"name": "t", "cpu": 1, "memory_gib": 4, "template_id": "caf\u00e9"}])
     with pytest.raises(reg.RegistrationError, match="template_id"):
         _registration(host_values_text=_host_values(CATHEDRAL_TEMPLATES_JSON=bad))
+
+
+def _signed_directly(body):
+    # Signed by the hotkey itself, past sign_registration's own checks, as a hostile
+    # or buggy client could.
+    return {
+        **body,
+        "signature": {
+            "algorithm": "sr25519",
+            "value_b64": base64.b64encode(MINER.sign(reg.canonical_bytes(body))).decode(),
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "issued_at, expires_at",
+    [
+        ("2026-02-30T00:00:00Z", "2026-03-01T00:00:00Z"),  # no such day
+        ("0000-01-01T00:00:00Z", "0000-01-01T01:00:00Z"),  # no year 0
+        ("9999-12-31T00:00:00Z", "9999-12-31T01:00:00Z"),  # adding the window overflows
+        ("0001-01-01T00:00:00Z", "0001-01-01T01:00:00Z"),  # subtracting the skew overflows
+    ],
+)
+def test_unsigned_dates_never_escape_as_other_errors(issued_at, expires_at):
+    body = {k: v for k, v in _registration().items() if k != "signature"}
+    body.update(issued_at=issued_at, expires_at=expires_at)
+    with pytest.raises(reg.RegistrationError):
+        _verify(_signed_directly(body))
+
+
+def test_deeply_nested_templates_are_a_registration_error(tmp_path, capsys):
+    # A signed document's templates field, and a host value under the 64 KiB file cap.
+    with pytest.raises(reg.RegistrationError, match="not JSON"):
+        reg._templates("[" * 200_000)
+    with pytest.raises(reg.RegistrationError, match="not JSON"):
+        _registration(host_values_text=_host_values(CATHEDRAL_TEMPLATES_JSON="[" * 60_000))
+    # And through the command: a refusal, not a traceback.
+    host_values = tmp_path / "host-values.env"
+    host_values.write_text(_host_values(CATHEDRAL_TEMPLATES_JSON="[" * 60_000))
+    key_file = tmp_path / "runtime.key"
+    key_file.write_bytes(RUNTIME_KEY)
+    key_file.chmod(0o600)
+    prober_hex = (
+        PROBER.public_key()
+        .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        .hex()
+    )
+    code = reg.main(
+        [
+            "--host-values",
+            str(host_values),
+            "--runtime-key-file",
+            str(key_file),
+            "--prober-key",
+            prober_hex,
+            "--netuid",
+            str(NETUID),
+            "--kind",
+            "bare_metal",
+            "--wallet-name",
+            "miner",
+            "--hotkey-name",
+            "default",
+        ],
+        keypair_factory=lambda *_args: MINER,
+    )
+    assert code == 2 and "not JSON" in capsys.readouterr().err
