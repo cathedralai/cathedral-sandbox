@@ -21,19 +21,26 @@ From a machine that can SSH to the server, with a checkout of `cathedralai/runti
 deploy/cathedral/install-runtime-host.sh \
   --bundle "$BUNDLE_URL" --sha256 "$BUNDLE_SHA256" \
   --direct-ip "$PUBLIC_IP" --ssh-from "$YOUR_CIDR" \
+  --probe-template "$PROBE_SHAPE" \
   SSH_TARGET
 ```
 
 The installer checks the host, installs the runtime and its front door (a pinned TLS
-certificate on 443 and 8443), builds the templates, and runs the preflight. It leaves two
+certificate on 443 and 8443), builds the templates, and runs the preflight. It leaves three
 files in `CATHEDRAL_CREDENTIALS_DIR`:
 
 - `cathedral-runtime-LABEL.values`: the box's host values (front door, certificate pin,
-  measured capacity, templates);
-- `cathedral-runtime-LABEL.key` (mode 600): the box's runtime API key.
+  measured capacity, templates, and the probe template's ID);
+- `cathedral-runtime-LABEL.probe-key` (mode 600): the probe key, which is what you register;
+- `cathedral-runtime-LABEL.key` (mode 600): the box's team key. Keep it; it never leaves you.
+
+`PROBE_SHAPE` is one of the template shapes the installer builds (for example
+`cathedral-standard-1x4`); the prober's sandboxes are made from it, so use the shape the SN94
+owner publishes with the prober key.
 
 `LABEL` is `CATHEDRAL_HOST_LABEL`, which defaults to the SSH target. Registration needs the
-direct front door (`--direct-ip`): a tunnel install has no certificate pin and is refused.
+direct front door (`--direct-ip`) and `--probe-template`: a tunnel install has no certificate
+pin, and an install without a probe key has nothing to register, so both are refused.
 
 See the runtime's `deploy/cathedral/README.md` for every option.
 
@@ -45,7 +52,7 @@ on the command line):
 ```bash
 python -m cathedral.box_registration \
   --host-values cathedral-runtime-LABEL.values \
-  --runtime-key-file cathedral-runtime-LABEL.key \
+  --probe-key-file cathedral-runtime-LABEL.probe-key \
   --prober-key "$SN94_PROBER_X25519_PUBLIC_KEY_HEX" \
   --netuid "$NETUID" --kind bare_metal \
   --wallet-name YOUR_WALLET --hotkey-name YOUR_HOTKEY \
@@ -55,16 +62,18 @@ python -m cathedral.box_registration \
 `NETUID` is the subnet the SN94 owner publishes with the prober key.
 
 The registration names your hotkey, the box's front door and certificate pin, its capacity and
-templates, and carries the runtime API key **sealed to the prober**: only the prober can open
-it, and only for this registration. Your hotkey signs all of it. It is valid for 24 hours by
-default (`--valid-hours`, at most 168); register again before it expires, and after the
-front door's certificate is renewed (the installer renews it when less than 48 hours of its
-7 days remain), since the registration pins the certificate.
+templates and the probe template, and carries the probe key **sealed to the prober**: only the
+prober can open it, and only for this registration. Your hotkey signs all of it. It is valid
+for 24 hours by default (`--valid-hours`, at most 168); register again before it expires, and
+after the front door's certificate is renewed (the installer renews it when less than 48 hours
+of its 7 days remain), since the registration pins the certificate.
 
-**What you hand over.** The key is the runtime's team key for this box; the runtime has no
-narrower key yet. Through the front door it reaches only the routes the ingress allowlists
-(create, look up, time out and delete sandboxes, snapshots, template builds), but it controls
-every sandbox on the box. Run nothing else on a registered box.
+**What you hand over.** The probe key, not the team key. Through the front door it can only
+create short, offline sandboxes from the probe template (at most 8 at once), look up and delete
+its own, and nothing else: it cannot see, change or delete any other sandbox on the box. The
+command refuses a file that isn't the installer's probe key, so the team key can't be sealed by
+mistake. If you rerun the installer without `--probe-template`, the probe key stops working;
+register again after reinstalling with it.
 
 **Check the prober key.** Take `--prober-key` only from the SN94 owner's published prober
 attestation, whose quote binds that key; a key from anywhere else could hand your box to
