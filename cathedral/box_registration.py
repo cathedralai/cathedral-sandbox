@@ -29,7 +29,7 @@ certificate across reruns while at least 48 hours of its 7-day life remain,
 and renews it after that, which changes ``box_key``. ``verify_registration``
 checks one document; the prober's endpoint then applies the first-claim rule
 keyed on the control IP, the identity that survives a renewal: the first
-claim for an IP that verifies and passes a probe wins, and a later claim for
+claim for an IP whose key opens and passes a probe wins, and a later claim for
 the same IP (or the same ``box_key``) under another hotkey is refused, never
 zeroing the first claimant. The same hotkey registering again, including with
 a renewed certificate, keeps the claim. A claim lapses when its registration
@@ -41,13 +41,33 @@ serves it over the pinned TLS, so the prober checks box to hotkey too) is a
 follow-up in the runtime repo; until then whoever holds the key and registers
 first holds the box.
 
+Neither the IP nor the certificate stops one box being registered twice: a
+TLS-terminating proxy on a second public IP, with its own certificate and
+forwarding to the box, gives a new IP and a new ``box_key`` but seals the same
+key. So the prober also dedupes on the opened key (``opened_key_digest``): a
+claim for another IP whose key matches a held claim's is refused, under any
+hotkey, the same hotkey included. And because one box might still answer under
+more than one claim, the prober must challenge all admitted boxes
+concurrently in each round, so two claims backed by one box share its CPU and
+memory and cannot both pass.
+
 Replay. A registration has no nonce, so anyone who saw a still-valid one can
-resubmit it. The endpoint keeps only the newest ``issued_at`` per control IP
-(and per ``box_key``) and refuses an older one, or a different one with the same ``issued_at``, so a
-superseded registration cannot displace its successor. The document names no
-network: the prober keeps one X25519 key per network, so a registration
-replayed to another network's prober verifies there but its key does not open,
-and it is refused.
+resubmit it. And anyone can sign a document with a box's public front door and
+certificate pin under their own hotkey, sealing a key they made up, with
+``issued_at`` up to 5 minutes ahead (the allowed skew): it verifies and its key
+opens; only the probe fails. So the endpoint orders registrations by
+``issued_at`` per (control IP, hotkey), never per IP alone (``replay_order``),
+and counts a registration only after its key opens and it passes a probe; a
+counted registration then refuses an older one in its scope, or a different
+one with the same order, so a superseded registration cannot displace its
+successor, and a document that fails the probe never enters the order. For
+ordering, a future ``issued_at`` is clamped to the time the endpoint received
+it, so a document dated ahead cannot outrank one signed after it. Conflicts
+between hotkeys are left to the first-claim rule: a document under another
+hotkey never refuses the owner's renewal, whatever its ``issued_at``. The
+document names no network: the prober keeps one X25519 key per network, so a
+registration replayed to another network's prober verifies there but its key
+does not open, and it is refused.
 
 Run ``python -m cathedral.box_registration --help`` on the machine that ran the
 installer and holds the miner hotkey.
@@ -215,9 +235,37 @@ def box_id_for(cert_sha256: str, miner_hotkey: str) -> str:
 
 
 def box_key_for(cert_sha256: str) -> str:
-    """Stable per box whatever the hotkey: the prober's dedupe key, so one box
-    is admitted under one hotkey only (see the module docstring)."""
+    """The same under every hotkey, but only for one certificate: it changes
+    when the installer renews the certificate (weekly). One of the prober's
+    dedupe keys, beside the control IP and ``opened_key_digest``; none of them
+    alone stops a box being registered twice (see the module docstring)."""
     return f"boxkey-{hashlib.sha256(cert_sha256.encode()).hexdigest()[:32]}"
+
+
+def opened_key_digest(key: bytes) -> str:
+    """The prober's dedupe key for an opened key: a domain-separated SHA-256,
+    so the prober can compare keys across claims without keeping them. Two
+    claims with the same digest are backed by one box, whatever their IPs and
+    certificates (see the module docstring)."""
+    if not isinstance(key, bytes):
+        raise RegistrationError("the opened key must be bytes")
+    return hashlib.sha256(b"cathedral.box-registration.opened-key.v1\x00" + key).hexdigest()
+
+
+def replay_order(
+    registration: VerifiedRegistration, *, now: datetime
+) -> tuple[tuple[str, str], datetime]:
+    """Where and how the endpoint orders a registration against replays: the
+    scope is (control IP, hotkey), never the IP alone, and the order is
+    ``issued_at`` clamped to ``now`` (when the endpoint received it), so a
+    document dated into the skew window cannot outrank one signed after it.
+    The endpoint records the order only once the registration's key opens and
+    passes a probe, and then refuses an older one in the same scope, or a
+    different one with the same order (see the module docstring)."""
+    if not isinstance(registration, VerifiedRegistration):
+        raise RegistrationError("verify the registration before ordering it")
+    control_ip = registration.control_url[len("https://") :]
+    return (control_ip, registration.miner_hotkey), min(registration.issued_at, now)
 
 
 def _templates(value: object) -> list[dict[str, Any]]:

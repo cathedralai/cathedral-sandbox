@@ -82,11 +82,17 @@ verified capacity, and validators pay your hotkey its market value.
 **One box, one hotkey.** The prober admits each box under one hotkey, keyed on its control
 IP. (`box_key` comes from the certificate pin alone, so it names the current certificate and
 changes when the certificate is renewed; the IP does not.) The first registration for an IP
-that verifies and passes a probe wins; a later one for the same IP under another hotkey is
+whose key opens and passes a probe wins; a later one for the same IP under another hotkey is
 refused, and the first hotkey keeps earning. Registering again under the same hotkey, including
 after a certificate renewal, keeps the claim; it lapses when its registration expires unrenewed
 or its key stops passing the probe. To move a box to another hotkey, let the old registration
 expire, then register under the new hotkey.
+
+A second IP doesn't make a second box. The prober also compares the keys it opens and refuses a
+registration for another IP whose key it already holds, under any hotkey, yours included, so a
+proxy on a second IP forwarding to the same box is refused. It also challenges every admitted
+box at the same time, so two registrations served by one box share its CPU and memory and
+can't both pass.
 
 The certificate pin and IP are public, so what shows the box is yours is holding its key:
 anyone who has it and registers first holds the box. Keep the key file at mode 600 (the command
@@ -95,10 +101,15 @@ installer records your hotkey and the front door serves it over the pinned TLS, 
 also checks box to hotkey.
 
 **Replays.** A registration has no nonce, so anyone who saw one could resubmit it while it is
-valid. The endpoint keeps only the newest `issued_at` per control IP and refuses an older one,
-or a different one with the same `issued_at`, so an old registration can't replace your
-current one. Each network's prober has its own key, so a registration replayed to another
-network's prober doesn't open there.
+valid, and anyone can sign one naming your box's public IP and certificate pin under their own
+hotkey. The endpoint orders registrations by `issued_at` per control IP and hotkey, and counts
+one only after its key opens and it passes a probe. It then refuses an older registration from
+that hotkey for that IP, or a different one with the same `issued_at`, so an old registration
+can't replace your current one. An `issued_at` in the future counts as the time the endpoint
+received it, so a registration dated ahead can't outrank a later one. A registration under
+another hotkey never refuses your renewal, whatever its date: conflicts between hotkeys follow
+"One box, one hotkey" above. Each network's prober has its own key, so a registration replayed
+to another network's prober doesn't open there.
 
 ## Keep it paid
 

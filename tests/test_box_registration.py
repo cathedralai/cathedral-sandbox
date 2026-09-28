@@ -167,7 +167,9 @@ def test_the_box_key_is_the_same_under_every_hotkey():
     assert mine.box_key == theirs.box_key == reg.box_key_for(CERT)
     assert mine.box_id != theirs.box_id  # box_id stays per hotkey
     assert mine.box_key.startswith("boxkey-") and len(mine.box_key) == len("boxkey-") + 32
-    assert reg.box_key_for(CERT) != reg.box_key_for("d4" * 32)  # a renewed certificate is a new box_key
+    assert reg.box_key_for(CERT) != reg.box_key_for(
+        "d4" * 32
+    )  # a renewed certificate is a new box_key
 
 
 def test_a_registration_issued_in_the_future_is_refused():
@@ -177,6 +179,82 @@ def test_a_registration_issued_in_the_future_is_refused():
     body["issued_at"] = reg._iso(NOW + reg.ISSUED_AT_SKEW + timedelta(seconds=1))
     with pytest.raises(reg.RegistrationError, match="not currently valid"):
         _verify(_hand_signed(body), now=NOW)
+
+
+@pytest.mark.parametrize("expires_offset", [timedelta(seconds=-1), timedelta(0)])
+def test_a_registration_that_expires_before_it_is_issued_is_refused(expires_offset):
+    # now sits inside the skew window before issued_at, so the time check alone
+    # (now >= expires_at) would accept it.
+    body = _body(_registration())
+    body["issued_at"] = reg._iso(NOW)
+    body["expires_at"] = reg._iso(NOW + expires_offset)
+    with pytest.raises(reg.RegistrationError, match="validity must be positive"):
+        _verify(_hand_signed(body), now=NOW - timedelta(minutes=2))
+
+
+def test_a_registration_is_refused_from_the_second_it_expires():
+    signed = _registration()
+    expires = NOW + timedelta(days=1)
+    assert _verify(signed, now=expires - timedelta(seconds=1)).expires_at == expires
+    with pytest.raises(reg.RegistrationError, match="not currently valid"):
+        _verify(signed, now=expires)
+
+
+def test_replays_are_ordered_per_ip_and_hotkey_with_a_future_issued_at_clamped():
+    owner = _verify(_registration(), now=NOW)
+    # Anyone can sign the owner's public host values under their own hotkey,
+    # sealing a key they made up, dated to the end of the skew window. It
+    # verifies and opens (only the probe fails), but it is ordered in its own
+    # scope, so it never outranks or refuses the owner's renewal.
+    squatter = _verify(
+        _registration(keypair=OTHER, runtime_key=b"f" * 64, now=NOW + reg.ISSUED_AT_SKEW), now=NOW
+    )
+    assert (squatter.control_url, squatter.box_key) == (owner.control_url, owner.box_key)
+    assert reg.open_runtime_key(squatter, PROBER) == b"f" * 64
+    owner_scope, owner_order = reg.replay_order(owner, now=NOW)
+    squatter_scope, squatter_order = reg.replay_order(squatter, now=NOW)
+    assert owner_scope == ("34.1.2.3", MINER.ss58_address)
+    assert squatter_scope == ("34.1.2.3", OTHER.ss58_address)
+    assert squatter_order == NOW  # clamped from NOW + 5 minutes
+    # A renewal after a certificate renewal stays in the owner's scope.
+    renewed = _verify(
+        _registration(host_values_text=_host_values(CATHEDRAL_TLS_CERT_SHA256="d4" * 32)), now=NOW
+    )
+    assert reg.replay_order(renewed, now=NOW)[0] == owner_scope
+    # The owner's own document dated ahead cannot outrank one signed after it.
+    ahead = _verify(_registration(now=NOW + timedelta(minutes=4)), now=NOW)
+    later = _verify(_registration(now=NOW + timedelta(minutes=1)), now=NOW + timedelta(minutes=1))
+    assert (
+        reg.replay_order(ahead, now=NOW)[1]
+        < reg.replay_order(later, now=NOW + timedelta(minutes=1))[1]
+    )
+    # A past issued_at is kept as it is.
+    assert owner_order == NOW
+    assert reg.replay_order(owner, now=NOW + timedelta(hours=1))[1] == NOW
+    with pytest.raises(reg.RegistrationError, match="verify the registration"):
+        reg.replay_order(_registration(), now=NOW)
+
+
+def test_a_proxy_on_a_second_ip_seals_the_same_key_digest():
+    direct = _verify(_registration())
+    # A TLS proxy on another IP with its own certificate, forwarding to the box.
+    proxied = _verify(
+        _registration(
+            host_values_text=_host_values(
+                CATHEDRAL_E2B_API_URL="https://34.9.9.9",
+                CATHEDRAL_E2B_SANDBOX_URL="https://34.9.9.9:8443",
+                CATHEDRAL_TLS_CERT_SHA256="d4" * 32,
+            )
+        )
+    )
+    assert (direct.control_url, direct.box_key) != (proxied.control_url, proxied.box_key)
+    digest = reg.opened_key_digest(reg.open_runtime_key(direct, PROBER))
+    assert digest == reg.opened_key_digest(reg.open_runtime_key(proxied, PROBER))
+    assert digest != reg.opened_key_digest(RUNTIME_KEY + b"x")
+    assert len(digest) == 64 and int(digest, 16) >= 0
+    assert digest != hashlib.sha256(RUNTIME_KEY).hexdigest()  # domain-separated
+    with pytest.raises(reg.RegistrationError, match="must be bytes"):
+        reg.opened_key_digest(RUNTIME_KEY.decode())
 
 
 @pytest.mark.parametrize("form", ["extra key", "json string"])
