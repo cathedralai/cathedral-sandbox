@@ -8,6 +8,25 @@ an operator guide; the repository [README](../README.md) is.
 Paths prefixed `cathedral-validator/` are in the validator repository at
 `7533d9d`. Other paths are in this repository at `e4f8e92`.
 
+## Scope: the direct TEE path, not the capacity path
+
+This document covers only the direct validator's TEE path: Intel TDX and AMD
+SEV-SNP evidence, one unit per verified machine, and receipts authenticated by
+the validator hotkey. That path admits no bare-metal evidence
+(`snp_production.py` lines 3-6).
+
+PR #217 proposes a separate capacity path (its `CAPACITY.md` and the
+`cathedral.capacity` package, not yet merged). There an SN94-owner prober
+challenges each box and signs a `cathedral_capacity_receipt_v1` with an
+Ed25519 prober key; validators
+pay each box the market value of its proven vCPUs and memory from a signed
+price table; and a bare-metal box is deduplicated by a `probe_fingerprint`
+rather than a vendor-verified identity. The two paths differ in who signs the
+receipt, what a receipt pays for, and what identifies a machine. The
+`cathedral_machine_receipt_v1` proposed below and #217's
+`cathedral_capacity_receipt_v1` must be reconciled into one schema, or one made
+explicitly subordinate to the other, before either feeds payment.
+
 ## What a paid machine must prove
 
 The validator pays one unit per distinct verified machine per UID
@@ -61,6 +80,7 @@ a blocked feature, or a missing identity adapter stops the whole cycle
 | One TLS key on several endpoints | Channel dedupe zeroes every claimant |
 | Copy another miner's SAT answer | The seed includes the hotkey and TLS key, so the challenge differs |
 | Inflate claimed work | The validator derives the units; the miner's figure is ignored |
+| Present one bare-metal box as several (#217 capacity path) | **Not stopped.** The direct validator admits no bare metal, but #217 deduplicates bare metal on a `probe_fingerprint` the box reports itself, so one machine can claim several fingerprints and pass challenges run at different times. Needs concurrent challenges for boxes that may share hardware, or no bare-metal pay until an unspoofable identity exists |
 
 ## Where protection ends today
 
@@ -78,9 +98,10 @@ physical TDX platform.
 
 **AMD SEV-SNP boot state is checked.** Each validator's owner policy admits an
 exact measurement per processor generation and applies a component-wise TCB
-floor to the current, reported, committed and launch TCB, with VMPL0, debug
-and migration refused and SINGLE_SOCKET required by default
-(`snp_production.py` lines 122-182 and 305-452).
+floor to the current, reported, committed and launch TCB. It requires the
+report to come from VMPL0, refuses debug and migration-agent guests, and
+requires SINGLE_SOCKET by default (`snp_production.py` lines 122-182 and
+305-452; VMPL0 at lines 352-359).
 
 **Neither path proves the container image.** A measurement describes measured
 boot state. The OCI image digest is checked only by the local launcher
@@ -121,8 +142,23 @@ scoring is enabled.
   (`scripts/cathedral_measurement_approval.py`): live capture through the
   pinned verifier, an operator identity and reason, and a new policy release.
 
-Roll out in shadow first: log the reason for one release without changing
-weights, publish the observed measurements, then enforce.
+**Operator cost.** The measurement covers MRTD and RTMR0-3. RTMR1 commonly
+includes the kernel and initrd, so an OS package upgrade that rebuilds the
+initramfs changes it, and stability across a provider firmware (TDVF) rollout
+is unproven ([MRTD.md](MRTD.md) lines 24-38); new firmware changes MRTD.
+Enforcing the policy therefore means every TDX miner must boot a reproducible
+Cathedral guest image whose measurement is admitted, and may not patch that
+guest itself. A provider firmware rollout would FAIL every TDX machine on that
+provider at once, in the same round, until the new value is approved.
+
+Roll out in shadow first:
+
+- log `tdx_measurement_not_admitted` for at least one release without changing
+  weights, and publish the observed measurements;
+- publish the reproducible guest image and its expected measurement before
+  enforcing;
+- admit a provider's new firmware measurement through the approval path before
+  enforcing against it, and keep shadow logging on to catch a rollout early.
 
 ### 2. Keep an Intel outage out of miner scores
 
@@ -133,21 +169,35 @@ zeroing every TDX machine.
 
 ### 3. Sign a per-machine receipt each cycle
 
-After the weight write is confirmed, the validator signs one
-`cathedral_machine_receipt_v1` per probed machine with its hotkey (sr25519,
-the key that already signs telemetry). The receipt carries:
+Today the evidence digest is a flat SHA-256 over the whole evidence document
+(`direct_validator.py` lines 467-469), and that document lists only paid rows
+(lines 401-406 and 456). A receipt plus the digest cannot prove membership; a
+verifier would need the full document. Commit to the machines with a Merkle
+root instead.
 
-- the anchor block and the validator's evidence digest;
-- the UID, miner hotkey, endpoint and TLS SPKI digest;
-- the hardware identity and measurement that were checked;
-- the SAT challenge id and the units the validator derived;
-- the outcome: `paid`, or the exclusion reason already recorded internally
-  (for example `duplicate_hardware_identity` or `snp_tcb_floor_not_met`).
+- **Leaf.** One per probed machine, paid or not: the canonical JSON
+  (`canonical_document_bytes`) of the machine's receipt body, holding the
+  anchor block, UID, miner hotkey, endpoint, TLS SPKI digest, hardware identity
+  and measurement checked, SAT challenge id, derived units, and the outcome
+  (`paid`, or the exclusion reason already recorded internally, for example
+  `duplicate_hardware_identity` or `snp_tcb_floor_not_met`). A leaf never
+  contains the root or the evidence digest.
+- **Root.** The RFC 6962 Merkle Tree Hash with SHA-256 (leaf hash
+  `SHA-256(0x00 || leaf)`, node hash `SHA-256(0x01 || left || right)`) over the
+  leaves sorted by their bytes. The validator writes it as
+  `machine_receipt_root`, with the leaf count, into the evidence document and
+  the telemetry event, which its hotkey already signs (sr25519, `telemetry.py`
+  lines 52-95 and 283).
+- **Receipt.** `cathedral_machine_receipt_v1` carries the leaf, its index, the
+  leaf count, the inclusion proof (the sibling hashes), and the telemetry
+  `event_id`. It is published only after the weight write is confirmed, and
+  needs no signature of its own: the signed root authenticates it.
 
-Each receipt is a leaf of the evidence document, so anyone holding the
-receipt, the telemetry event and the validator's public key can check that it
-belongs to the round that set weights. This gives miners a verifiable reason
-per machine, and gives central tracking a signed per-machine record to count.
+Anyone holding a receipt, the signed telemetry event and the validator's
+public key can recompute the root from the leaf and proof, compare it with
+`machine_receipt_root`, and check the event signature. This gives miners a
+verifiable reason per machine without the full document, and gives central
+tracking a signed per-machine record to count.
 
 ### 4. Bind the image into measured state
 
@@ -164,5 +214,8 @@ resulting measurement under design item 1.
 3. Per-machine signed receipts.
 4. Image binding, SNP then TDX.
 
-Items 1-3 change only the validator. Item 4 changes the miner images and the
-launch procedure.
+Item 1 changes the validator, but once enforced it also fixes what every TDX
+miner may boot (see its operator cost). Item 2 changes the released verifier's
+exit codes, so the validator's pinned verifier digest (`qvl.py` lines 33-35)
+changes with it. Item 3 changes only the validator. Item 4 changes the miner
+images and the launch procedure.
