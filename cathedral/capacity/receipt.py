@@ -11,9 +11,9 @@ What a receipt binds, and what ``verify_receipt`` checks:
   validator must fetch its own receipts (copying another validator's weights
   gains nothing);
 - the box: its id, the miner's hotkey, its kind and one canonical hardware
-  identity for dedup, fixed by the kind (``derive_hardware_id`` over the TDX
-  PPID, the SEV-SNP chip id, or, for bare metal, ``probe_fingerprint`` of the
-  probed address);
+  identity for dedup, fixed by the kind (``derive_hardware_id`` over the
+  digest in the TDX verifier's ``stable_platform_id``, the SEV-SNP chip id, or,
+  for bare metal, ``probe_fingerprint`` of the probed address);
 - the capacity paid for, which must be exactly what the challenge proved: the
   spec must equal ``spec_for(seed, vcpus=, memory_gib=)``;
 - the proof: the committed result digest, the post-commitment sample nonce, the
@@ -59,11 +59,14 @@ SCHEMA = "cathedral_capacity_receipt_v1"
 BOX_KINDS = ("tee", "bare_metal")
 # The one hardware identity each kind of box is deduplicated by: (kind, tee_kind) -> id kind.
 HARDWARE_ID_KINDS = {
-    ("tee", "tdx"): "ppid",
+    ("tee", "tdx"): "tdx_platform",
     ("tee", "sev_snp"): "chip_id",
     ("bare_metal", None): "probe_fingerprint",
 }
-_RAW_ID_BYTES = {"ppid": 16, "chip_id": 64, "probe_fingerprint": 9}
+_RAW_ID_BYTES = {"tdx_platform": 32, "chip_id": 64, "probe_fingerprint": 9}
+# The strict TDX verifier's stable_platform_id (cmd/cathedral-tdx-verifier/main.go
+# stablePlatformID): "tdx-platform-sha256:" + hex(SHA-256(domain + PPID hex)).
+_STABLE_PLATFORM_ID = re.compile(r"tdx-platform-sha256:([0-9a-f]{64})")
 HARDWARE_ID_DOMAIN = b"cathedral.capacity.hardware_id.v1\x00"
 MAX_VALIDITY = timedelta(hours=2)
 CLOCK_SKEW = timedelta(minutes=5)
@@ -169,14 +172,15 @@ def _hex64(value: object, name: str) -> str:
 
 def derive_hardware_id(hardware_id_kind: str, raw: bytes) -> str:
     """The receipt's ``hardware_id``: SHA-256 over the id kind and the raw id
-    the prober took from evidence it verified itself (the 16-byte PPID from the
-    TDX quote's PCK certificate, the 64-byte CHIP_ID from the SEV-SNP report), or
-    ``probe_fingerprint``'s 9 bytes for bare metal. One machine therefore has
-    exactly one hardware id per kind of box."""
+    the prober took from evidence it verified itself (for TDX the 32-byte digest
+    in the strict verifier's ``stable_platform_id``, see :func:`tdx_hardware_id`;
+    the 64-byte CHIP_ID from the SEV-SNP report), or ``probe_fingerprint``'s 9
+    bytes for bare metal. One machine therefore has exactly one hardware id per
+    kind of box."""
 
     size = _RAW_ID_BYTES.get(hardware_id_kind)
     if size is None:
-        raise ReceiptError("hardware_id_kind must be ppid, chip_id or probe_fingerprint")
+        raise ReceiptError("hardware_id_kind must be tdx_platform, chip_id or probe_fingerprint")
     if not isinstance(raw, bytes) or len(raw) != size:
         raise ReceiptError(f"a raw {hardware_id_kind} is {size} bytes")
     if not any(raw):
@@ -184,6 +188,23 @@ def derive_hardware_id(hardware_id_kind: str, raw: bytes) -> str:
     return hashlib.sha256(
         HARDWARE_ID_DOMAIN + hardware_id_kind.encode() + b"\x00" + raw
     ).hexdigest()
+
+
+def tdx_hardware_id(stable_platform_id: str) -> str:
+    """A TDX box's ``hardware_id``, from the ``stable_platform_id`` the pinned
+    strict verifier emitted for a quote the prober verified itself (with
+    ``platform_identity_verified`` and ``claims_bound_to_quote`` true). The raw
+    ``tdx_platform`` id is the 32-byte digest after ``tdx-platform-sha256:``;
+    the verifier never outputs the PPID itself. The value is stable only under
+    the pinned Go verifier: the Polaris wrapper derives a different
+    ``stable_platform_id`` for the same platform (docs/CAPACITY.md)."""
+
+    if not isinstance(stable_platform_id, str):
+        raise ReceiptError("stable_platform_id must be a string")
+    match = _STABLE_PLATFORM_ID.fullmatch(stable_platform_id)
+    if match is None:
+        raise ReceiptError("stable_platform_id must be tdx-platform-sha256:<64 lowercase hex>")
+    return derive_hardware_id("tdx_platform", bytes.fromhex(match.group(1)))
 
 
 def probe_fingerprint(address: str) -> str:
@@ -339,7 +360,7 @@ def _check_body(body: Mapping[str, Any]) -> VerifiedReceipt:
         raise ReceiptError("tee_kind must be tdx or sev_snp for a tee box, and null for bare metal")
     if box["hardware_id_kind"] != HARDWARE_ID_KINDS[(box["kind"], tee_kind)]:
         raise ReceiptError(
-            "hardware_id_kind must be ppid for tdx, chip_id for sev_snp and"
+            "hardware_id_kind must be tdx_platform for tdx, chip_id for sev_snp and"
             " probe_fingerprint for bare metal"
         )
     hardware_id = _hex64(box["hardware_id"], "hardware_id")

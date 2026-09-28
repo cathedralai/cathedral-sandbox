@@ -93,7 +93,7 @@ The library cannot enforce the order of events:
 
 `deadline_ms` must be at least 1 and at most `max_deadline_ms(spec) = 5 000 +
 ceil(steps × 1 000 ns / 1e6)` (`challenge.py:177-185`, constants `challenge.py:59-76`,
-enforced at `receipt.py:384-386`), and the exec time must fit it (`receipt.py:393-394`). So the
+enforced at `receipt.py:405-407`), and the exec time must fit it (`receipt.py:414-415`). So the
 bound is on `exec` alone; creating the sandbox is timed separately (`timings_ms.create`). Lanes
 are meant to run in parallel, so it follows one lane's `steps`:
 
@@ -161,51 +161,68 @@ boxes per round.
 
 Schema `cathedral_capacity_receipt_v1`: canonical JSON plus a base64 Ed25519 signature by the
 key named in `prober_key_id`. The prober signs only a body that passes the same checks
-(`sign_receipt`, `receipt.py:266-273`; it refuses a body that already carries a signature).
+(`sign_receipt`, `receipt.py:287-294`; it refuses a body that already carries a signature).
 `verify_receipt` checks, and every date, time and `now` error is a `ReceiptError`
-(`receipt.py:142-155`), never a bare `ValueError` or `TypeError`:
+(`receipt.py:145-158`), never a bare `ValueError` or `TypeError`:
 
-- **shape:** exactly the known fields and schema (`receipt.py:315-316`), non-negative integer
-  netuid and round (`receipt.py:317-318`), a well-formed `prober_key_id`
-  (`receipt.py:320-324`);
-- **signature:** by a pinned prober key (`receipt.py:294-301`);
+- **shape:** exactly the known fields and schema (`receipt.py:336-337`), non-negative integer
+  netuid and round (`receipt.py:338-339`), a well-formed `prober_key_id`
+  (`receipt.py:341-345`);
+- **signature:** by a pinned prober key (`receipt.py:315-322`);
 - **audience:** the netuid, the requesting validator's nonce and the round, all required
-  (`receipt.py:288-289`, `receipt.py:302-307`); anything else is refused, so copying another
+  (`receipt.py:309-310`, `receipt.py:323-328`); anything else is refused, so copying another
   validator's weights gains nothing and a receipt from an earlier round cannot be replayed;
 - **box:** `box_id`, the miner's hotkey, its kind, and one hardware identity fixed by the kind
-  (`receipt.py:326-345`, below);
+  (`receipt.py:347-366`, below);
 - **capacity equals proof:** the spec must be exactly `spec_for(seed, vcpus=, memory_gib=)`
-  for the positive vCPUs and memory the receipt pays for (`receipt.py:348-364`);
+  for the positive vCPUs and memory the receipt pays for (`receipt.py:369-385`);
 - **sample:** the committed digest, the post-commitment `sample_nonce`, a `sample_count` from
   `required_samples(lanes)` to `lanes`, and the outputs of exactly the lanes that nonce and
-  count pick (`receipt.py:367-383`), so anyone can recompute which lanes were checked and
+  count pick (`receipt.py:388-404`), so anyone can recompute which lanes were checked and
   re-check them with `lane_output`;
 - **timing:** `deadline_ms` within `max_deadline_ms(spec)`, non-negative integer
-  `timings_ms`, and the exec time within the deadline (`receipt.py:384-394`); see Timing for
+  `timings_ms`, and the exec time within the deadline (`receipt.py:405-415`); see Timing for
   what this does and does not prove;
-- **validity:** a window of more than zero and at most two hours (`receipt.py:396-399`),
-  containing `now` within five minutes of clock skew (`receipt.py:308-310`).
+- **validity:** a window of more than zero and at most two hours (`receipt.py:417-420`),
+  containing `now` within five minutes of clock skew (`receipt.py:329-331`).
 
 ### Hardware identity
 
 Validators pay one unit per distinct machine, so each kind of box has exactly one identity
-kind (`HARDWARE_ID_KINDS`, `receipt.py:61-65`; checked at `receipt.py:335-344`):
+kind (`HARDWARE_ID_KINDS`, `receipt.py:61-65`; checked at `receipt.py:356-365`):
 
 | `kind` | `tee_kind` | `hardware_id_kind` | raw id |
 |---|---|---|---|
-| `tee` | `tdx` | `ppid` | the 16-byte PPID from the PCK certificate in the TDX quote |
+| `tee` | `tdx` | `tdx_platform` | the 32-byte digest in the strict TDX verifier's `stable_platform_id`, `tdx-platform-sha256:<64 hex>` (`tdx_hardware_id(stable_platform_id)`, below) |
 | `tee` | `sev_snp` | `chip_id` | the 64-byte `CHIP_ID` from the SEV-SNP attestation report |
 | `bare_metal` | null | `probe_fingerprint` | 9 bytes: the probed IPv4 address, or IPv6 `/64`, tagged with its family (`probe_fingerprint(address)`, below) |
 
 `hardware_id = derive_hardware_id(hardware_id_kind, raw)`: SHA-256 over a domain tag, the id
-kind and the raw id (`receipt.py:170-186`). The prober takes the raw id from attestation
+kind and the raw id (`receipt.py:173-190`). The prober takes the raw id from attestation
 evidence it has verified itself, never from a field the box reports. An all-zero id (SEV-SNP
-with `MASK_CHIP_ID` set, or a missing PPID) is refused, since every such machine would share
-it. A receipt cannot name a TDX machine by chip id or the other way round, so one machine
-cannot appear under two identities.
+with `MASK_CHIP_ID` set) is refused, since every such machine would share it. A receipt cannot
+name a TDX machine by chip id or the other way round, so one machine cannot appear under two
+identities.
+
+**TDX: from `stable_platform_id`, not the raw PPID.** No TDX verifier outputs the raw PPID.
+The pinned Go verifier emits only `stable_platform_id = "tdx-platform-sha256:" +
+hex(SHA-256("cathedral-tdx-platform-v1\0" + lowercase hex PPID))`
+(`cmd/cathedral-tdx-verifier/main.go:430`, `main.go:472-481`), and strict mode accepts it only
+when `platform_identity_verified` and `claims_bound_to_quote` are true
+(`cathedral/verify/__init__.py:200-206`). cathedral-validator dedupes on the same value
+(`machine_id_from_stable_platform_id` in `cathedral_thin/independent/compute.py`).
+`tdx_hardware_id(stable_platform_id)` (`receipt.py:193-207`) checks that format, takes the
+32-byte digest as the raw `tdx_platform` id and passes it through `derive_hardware_id`. It is
+as unique as the PPID: one platform per value unless SHA-256 collides.
+
+The TDX hardware id is stable only under the pinned Go verifier. The Polaris wrapper
+(`scripts/tdx_verify_json.py:150-154`) hashes Polaris's own `stable_platform_id` under the
+same domain and prefix, so it emits a different `stable_platform_id`, and so a different
+hardware id, for the same platform. A prober must take TDX hardware ids from the pinned Go
+verifier only.
 
 **Bare metal has no hardware root of trust**, so its identity is weaker. `probe_fingerprint`
-(`receipt.py:189-210`) is derived from the address the prober itself connected to and ran the
+(`receipt.py:210-231`) is derived from the address the prober itself connected to and ran the
 challenge through, never from anything the box reports: the whole IPv4 address, or only the
 `/64` of an IPv6 address, and never the port. An IPv4-mapped IPv6 address counts as its IPv4
 address, and the address family is part of the raw id, so an IPv4 address cannot collide with a

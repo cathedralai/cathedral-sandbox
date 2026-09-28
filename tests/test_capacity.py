@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import os
@@ -658,7 +659,9 @@ def test_the_prober_never_signs_a_malformed_body(prober, changes):
         receipt.sign_receipt(_body(**changes), key)
 
 
-@pytest.mark.parametrize("tee_kind, hardware_id_kind", [("tdx", "ppid"), ("sev_snp", "chip_id")])
+@pytest.mark.parametrize(
+    "tee_kind, hardware_id_kind", [("tdx", "tdx_platform"), ("sev_snp", "chip_id")]
+)
 def test_a_tee_receipt_carries_its_one_hardware_identity(prober, tee_kind, hardware_id_kind):
     key, keys = prober
     signed = receipt.sign_receipt(_body(kind="tee", tee_kind=tee_kind, hardware_id="aa" * 32), key)
@@ -669,7 +672,7 @@ def test_a_tee_receipt_carries_its_one_hardware_identity(prober, tee_kind, hardw
         hardware_id_kind,
     )
     # The other TEE's id kind is refused: one machine, one hardware id.
-    other = "chip_id" if hardware_id_kind == "ppid" else "ppid"
+    other = "chip_id" if hardware_id_kind == "tdx_platform" else "tdx_platform"
     body = _body(kind="tee", tee_kind=tee_kind, hardware_id="aa" * 32)
     body["box"]["hardware_id_kind"] = other
     with pytest.raises(receipt.ReceiptError, match="hardware_id_kind"):
@@ -677,21 +680,59 @@ def test_a_tee_receipt_carries_its_one_hardware_identity(prober, tee_kind, hardw
 
 
 def test_hardware_ids_are_derived_one_way_per_kind():
-    ppid = bytes(range(1, 17))
-    assert receipt.derive_hardware_id("ppid", ppid) == receipt.derive_hardware_id("ppid", ppid)
-    assert receipt.derive_hardware_id("ppid", ppid) != receipt.derive_hardware_id(
-        "chip_id", ppid * 4
+    platform = bytes(range(1, 33))
+    assert receipt.derive_hardware_id("tdx_platform", platform) == receipt.derive_hardware_id(
+        "tdx_platform", platform
+    )
+    assert receipt.derive_hardware_id("tdx_platform", platform) != receipt.derive_hardware_id(
+        "chip_id", platform * 2
     )
     for kind, raw in (
-        ("ppid", bytes(15)),
-        ("ppid", bytes(16)),  # all zeros: missing
+        ("tdx_platform", bytes(range(1, 17))),  # a raw 16-byte PPID is not the input
+        ("tdx_platform", bytes(32)),  # all zeros
+        ("ppid", bytes(range(1, 17))),  # the old kind name is gone
         ("chip_id", bytes(64)),  # all zeros: SEV-SNP's MASK_CHIP_ID
-        ("chip_id", ppid),
+        ("chip_id", platform),
         ("probe_fingerprint", b"x" * 17),
-        ("serial", ppid),
+        ("serial", platform),
     ):
         with pytest.raises(receipt.ReceiptError):
             receipt.derive_hardware_id(kind, raw)
+
+
+def _stable_platform_id(ppid_hex: str) -> str:
+    # cmd/cathedral-tdx-verifier/main.go stablePlatformID
+    digest = hashlib.sha256(b"cathedral-tdx-platform-v1\x00" + ppid_hex.encode()).hexdigest()
+    return "tdx-platform-sha256:" + digest
+
+
+def test_a_tdx_hardware_id_comes_from_the_verifiers_stable_platform_id():
+    stable = _stable_platform_id("0123456789abcdef0123456789abcdef")
+    hardware_id = receipt.tdx_hardware_id(stable)
+    assert hardware_id == receipt.derive_hardware_id(
+        "tdx_platform", bytes.fromhex(stable.removeprefix("tdx-platform-sha256:"))
+    )
+    # Another platform's stable_platform_id names another machine.
+    assert hardware_id != receipt.tdx_hardware_id(
+        _stable_platform_id("0123456789abcdef0123456789abcdee")
+    )
+    # The tdx_platform kind keeps it apart from a chip id over the same bytes.
+    assert hardware_id != receipt.derive_hardware_id("chip_id", bytes.fromhex(stable[-64:]) * 2)
+    digest = stable.removeprefix("tdx-platform-sha256:")
+    for bad in (
+        digest,  # no prefix
+        "tdx-platform-sha256:" + digest.upper(),
+        "tdx-platform-sha256:" + digest[:-2],
+        "tdx-platform-sha256:" + digest + "00",
+        "tdx-pck-cert-sha256:" + digest,
+        "tdx-platform-sha256:" + "0" * 64,  # all zeros
+        " " + stable,
+        stable + "\n",
+        bytes.fromhex(digest),
+        None,
+    ):
+        with pytest.raises(receipt.ReceiptError):
+            receipt.tdx_hardware_id(bad)
 
 
 def test_a_probe_fingerprint_names_the_address_the_prober_reached_not_the_port():
