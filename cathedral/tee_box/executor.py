@@ -9,6 +9,7 @@ operator configures it.
 from __future__ import annotations
 
 import io
+import re
 import secrets
 import subprocess
 import tarfile
@@ -23,8 +24,25 @@ from cathedral.tee_box.egress import EgressPolicy
 MAX_OUTPUT_BYTES = 1024 * 1024
 MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_ARG_BYTES = 64 * 1024
-MAX_BACKGROUND_EXECS = 64
+# Background exec records, running or finished, are bounded per sandbox and
+# per box. Each record holds at most MAX_OUTPUT_BYTES per stream, so the box
+# retains at most MAX_RETAINED_OUTPUT_BYTES of exec output in total. Finished
+# records are evicted once their result has been read and a short retention
+# has passed (a caller that lost an answer may ask again), after a longer
+# retention if never read, and oldest first when a cap is reached.
+MAX_JOBS_PER_BOX = 32
+MAX_JOBS_PER_SANDBOX = 16
+MAX_RETAINED_OUTPUT_BYTES = MAX_JOBS_PER_BOX * 2 * MAX_OUTPUT_BYTES
+DELIVERED_RETENTION_SECONDS = 60.0
+FINISHED_RETENTION_SECONDS = 600.0
 SANDBOX_PREFIX = "cathsbx-"
+BOX_LABEL = "org.cathedral.tee-box.box"
+SANDBOX_LABEL = "org.cathedral.tee-box.sandbox"
+# How long a container name from a create that timed out stays pending
+# cleanup: the daemon may still create it after the CLI was killed.
+PENDING_CLEANUP_GRACE_SECONDS = 300.0
+_BOX_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+_CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 DEFAULT_DNS: tuple[str, ...] = ("1.1.1.1", "8.8.8.8")
 DEFAULT_PIDS_PER_SANDBOX = 4096
 
@@ -161,6 +179,9 @@ class Executor(Protocol):
     def stat(self, sandbox_id: str, path: str) -> FileStat | None: ...
     def put_tar(self, sandbox_id: str, path: str, data: bytes) -> None: ...
     def get_tar(self, sandbox_id: str, path: str, excludes: Sequence[str]) -> bytes: ...
+    def sweep(self) -> int:
+        """Remove sandboxes the table does not track; return how many remain."""
+        ...
 
 
 class _Table:
@@ -229,6 +250,10 @@ class FakeExecutor(_Table):
         self.execs: dict[tuple[str, str], ExecStatus] = {}
         self.requests: list[tuple[str, ExecRequest]] = []
         self.deleted: list[str] = []
+        # Test levers: a delete that fails, and containers the table forgot.
+        self.delete_fails = False
+        self.orphans: set[str] = set()
+        self.orphans_stuck = False
 
     @property
     def network_modes(self) -> tuple[str, ...]:
@@ -247,11 +272,18 @@ class FakeExecutor(_Table):
         return self._record(spec)
 
     def delete(self, sandbox_id: str) -> bool:
+        if self.delete_fails and self.get(sandbox_id) is not None:
+            raise ExecutorError("sandbox delete failed")
         self.files.pop(sandbox_id, None)
         removed = self._forget(sandbox_id)
         if removed:
             self.deleted.append(sandbox_id)
         return removed
+
+    def sweep(self) -> int:
+        if not self.delete_fails and not self.orphans_stuck:
+            self.orphans.clear()
+        return len(self.orphans)
 
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
         self._require(sandbox_id)
@@ -361,6 +393,18 @@ def _drain(stream, sink: bytearray, cap: int, flags: list[bool], index: int) -> 
             flags[index] = True
 
 
+def _feed(stream, data: bytes) -> None:  # noqa: ANN001
+    try:
+        stream.write(data)
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+
+
 class _Job:
     """One running subprocess whose output is captured up to a cap."""
 
@@ -389,19 +433,15 @@ class _Job:
                 daemon=True,
             ),
         ]
+        if stdin is not None:
+            # The upload is written from its own thread, so a target that
+            # never reads (a FIFO, say) cannot hold the caller past the
+            # transfer timeout: wait() times out and kill() breaks the pipe.
+            self._readers.append(
+                threading.Thread(target=_feed, args=(self.process.stdin, stdin), daemon=True)
+            )
         for reader in self._readers:
             reader.start()
-        if stdin is not None:
-            try:
-                assert self.process.stdin is not None
-                self.process.stdin.write(stdin)
-            except OSError:
-                pass
-            finally:
-                try:
-                    self.process.stdin.close()
-                except OSError:
-                    pass
 
     def wait(self, timeout: float | None) -> bool:
         try:
@@ -430,9 +470,29 @@ class _Job:
         )
 
 
+@dataclass
+class _JobRecord:
+    """A background exec slot: reserved (no job yet), running, or finished."""
+
+    job: _Job | None = None
+    finished_at: float | None = None
+    delivered_at: float | None = None
+
+    def running(self) -> bool:
+        return self.job is None or self.job.process.poll() is None
+
+    def output_bytes(self) -> int:
+        if self.job is None:
+            return 0
+        return len(self.job.stdout) + len(self.job.stderr)
+
+
 # In-sandbox helper scripts. Paths and modes arrive as positional arguments
 # ("$1", "$2"), never interpolated into the script text.
-_WRITE_SCRIPT = 'mkdir -p -- "$(dirname -- "$1")" && cat > "$1" && chmod "$2" "$1"'
+_WRITE_SCRIPT = (
+    '{ test ! -e "$1" || test -f "$1"; } || exit 4; '
+    'mkdir -p -- "$(dirname -- "$1")" && cat > "$1" && chmod "$2" "$1"'
+)
 _READ_SCRIPT = 'test -f "$1" || exit 3; exec cat -- "$1"'
 _STAT_SCRIPT = 'test -e "$1" || exit 3; exec stat -c "%F|%s|%a" -- "$1"'
 _PUT_TAR_SCRIPT = 'mkdir -p -- "$1" && exec tar --no-same-owner -xzf - -C "$1"'
@@ -451,6 +511,12 @@ class RunscExecutor(_Table):
     ``EgressPolicy.render_nft`` and a per-sandbox bandwidth cap. Until an
     ``egress_enforcer`` is supplied that applies both for a new container,
     ``internet`` is refused and only ``deny_all`` runs.
+
+    Every container carries the box label and its sandbox id, and has a
+    deterministic name, before ``docker run`` starts. A create that fails or
+    times out is removed by name, and stays pending cleanup while the daemon
+    might still start it. ``sweep`` removes every box-labelled container the
+    table does not track, so nothing outlives a hand-over or a restart.
     """
 
     def __init__(
@@ -466,10 +532,13 @@ class RunscExecutor(_Table):
         clock: Callable[[], float] = time.time,
         pull_timeout: float = 1800.0,
         control_timeout: float = 120.0,
+        box_id: str = "default",
     ) -> None:
         super().__init__(clock)
         if not isinstance(egress, EgressPolicy):
             raise ValueError("RunscExecutor requires an EgressPolicy")
+        if not isinstance(box_id, str) or _BOX_ID_RE.fullmatch(box_id) is None:
+            raise ValueError("box id must be a short lowercase identifier")
         for name in (docker, runtime, *dns):
             _check_argv([name])
         self.egress = egress
@@ -481,7 +550,12 @@ class RunscExecutor(_Table):
         self._runner = runner
         self._pull_timeout = pull_timeout
         self._control_timeout = control_timeout
-        self._jobs: dict[tuple[str, str], _Job] = {}
+        self.box_id = box_id
+        self._job_factory: Callable[[list[str], int, bytes | None], _Job] = _Job
+        self._jobs: dict[tuple[str, str], _JobRecord] = {}
+        self._creating: set[str] = set()
+        # Container name -> time before which it stays pending even if absent.
+        self._pending_cleanup: dict[str, float] = {}
 
     @property
     def network_modes(self) -> tuple[str, ...]:
@@ -518,7 +592,9 @@ class RunscExecutor(_Table):
             "--name",
             self.container_name(spec.sandbox_id),
             "--label",
-            f"org.cathedral.tee-box.sandbox={spec.sandbox_id}",
+            f"{BOX_LABEL}={self.box_id}",
+            "--label",
+            f"{SANDBOX_LABEL}={spec.sandbox_id}",
             "--cpus",
             str(shape.vcpus),
             "--memory",
@@ -565,7 +641,29 @@ class RunscExecutor(_Table):
         return _check_argv(argv)
 
     def delete_argv(self, sandbox_id: str) -> list[str]:
-        return _check_argv([self.docker, "rm", "--force", self.container_name(sandbox_id)])
+        return self.remove_argv(self.container_name(sandbox_id))
+
+    def remove_argv(self, name: str) -> list[str]:
+        return _check_argv([self.docker, "rm", "--force", name])
+
+    def kill_argv(self, name: str) -> list[str]:
+        return _check_argv([self.docker, "kill", "--signal", "KILL", name])
+
+    def inspect_argv(self, name: str) -> list[str]:
+        return _check_argv([self.docker, "container", "inspect", "--format", "{{.Id}}", name])
+
+    def list_argv(self) -> list[str]:
+        return _check_argv(
+            [
+                self.docker,
+                "ps",
+                "--all",
+                "--filter",
+                f"label={BOX_LABEL}={self.box_id}",
+                "--format",
+                "{{.Names}}",
+            ]
+        )
 
     def _script(
         self, sandbox_id: str, script: str, *args: str, stdin: bool = False, root: bool = False
@@ -609,35 +707,109 @@ class RunscExecutor(_Table):
             self._images[digest] = image
         return image
 
+    def _exists(self, name: str) -> bool:
+        """False only when the daemon says the container does not exist."""
+
+        try:
+            result = self._control(self.inspect_argv(name), self._control_timeout)
+        except ExecutorError:
+            return True
+        return result.returncode == 0 or b"No such" not in (result.stderr or b"")
+
+    def _remove(self, name: str) -> bool:
+        """Force-remove ``name``; true once it is confirmed gone."""
+
+        for argv in (self.remove_argv(name), self.kill_argv(name), self.remove_argv(name)):
+            try:
+                result = self._control(argv, self._control_timeout)
+            except ExecutorError:
+                continue
+            if argv[1] == "rm" and result.returncode == 0:
+                return True
+        return not self._exists(name)
+
+    def _abandon(self, name: str, *, timed_out: bool) -> None:
+        """Remove a container whose create failed; keep it pending if unsure."""
+
+        removed = self._remove(name)
+        if timed_out or not removed:
+            grace = PENDING_CLEANUP_GRACE_SECONDS if timed_out else 0.0
+            with self._lock:
+                self._pending_cleanup[name] = self._clock() + grace
+
     def create(self, spec: SandboxSpec) -> SandboxInfo:
         if spec.network == "internet" and self.egress_enforcer is None:
             raise ExecutorRefused("internet egress is not enforced on this box yet")
         if self.get_image(spec.image.digest) is None:
             raise NotFound
-        if self._control(self.create_argv(spec), self._control_timeout).returncode != 0:
-            raise ExecutorError("sandbox start failed")
-        if spec.network == "internet":
-            assert self.egress_enforcer is not None
+        name = self.container_name(spec.sandbox_id)
+        argv = self.create_argv(spec)
+        with self._lock:
+            self._creating.add(spec.sandbox_id)
+        try:
             try:
-                self.egress_enforcer(self.container_name(spec.sandbox_id), self.egress)
-            except Exception as exc:
-                self._control(self.delete_argv(spec.sandbox_id), self._control_timeout)
-                raise ExecutorError("egress enforcement failed") from exc
-        return self._record(spec)
+                started = self._control(argv, self._control_timeout).returncode == 0
+                timed_out = False
+            except ExecutorError:
+                started, timed_out = False, True
+            if not started:
+                self._abandon(name, timed_out=timed_out)
+                raise ExecutorError("sandbox start failed")
+            if spec.network == "internet":
+                assert self.egress_enforcer is not None
+                try:
+                    self.egress_enforcer(name, self.egress)
+                except Exception as exc:
+                    self._abandon(name, timed_out=False)
+                    raise ExecutorError("egress enforcement failed") from exc
+            return self._record(spec)
+        finally:
+            with self._lock:
+                self._creating.discard(spec.sandbox_id)
 
     def delete(self, sandbox_id: str) -> bool:
         with self._lock:
-            jobs = [key for key in self._jobs if key[0] == sandbox_id]
-            stale = [self._jobs.pop(key) for key in jobs]
-        for job in stale:
-            job.killed = True
-            job.kill()
+            keys = [key for key in self._jobs if key[0] == sandbox_id]
+            stale = [self._jobs.pop(key) for key in keys]
+        for record in stale:
+            if record.job is not None:
+                record.job.killed = True
+                record.job.kill()
         if self.get(sandbox_id) is None:
             return False
-        result = self._control(self.delete_argv(sandbox_id), self._control_timeout)
-        if result.returncode != 0:
+        if not self._remove(self.container_name(sandbox_id)):
             raise ExecutorError("sandbox delete failed")
         return self._forget(sandbox_id)
+
+    def sweep(self) -> int:
+        """Remove box-labelled containers the table does not track.
+
+        Returns how many untracked containers may still exist: ones whose
+        removal failed, and names from a timed-out create still in their
+        grace window. Raises ``ExecutorError`` if the daemon cannot list.
+        """
+
+        result = self._control(self.list_argv(), self._control_timeout)
+        if result.returncode != 0:
+            raise ExecutorError("container listing failed")
+        listed = {
+            line.strip()
+            for line in (result.stdout or b"").decode("utf-8", "replace").splitlines()
+            if _CONTAINER_NAME_RE.fullmatch(line.strip())
+        }
+        with self._lock:
+            keep = {self.container_name(sid) for sid in (*self._sandboxes, *self._creating)}
+            pending = dict(self._pending_cleanup)
+        remaining = 0
+        now = self._clock()
+        for name in sorted((listed | set(pending)) - keep):
+            gone = self._remove(name) if name in listed else not self._exists(name)
+            if gone and now >= pending.get(name, 0.0):
+                with self._lock:
+                    self._pending_cleanup.pop(name, None)
+            else:
+                remaining += 1
+        return remaining
 
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
         self._require(sandbox_id)
@@ -646,57 +818,123 @@ class RunscExecutor(_Table):
         # with a pid file and runsc kill instead.
         return self._run(self.exec_argv(sandbox_id, request), timeout=request.timeout_seconds)
 
+    def _prune_jobs_locked(self, now: float) -> None:
+        for key, record in list(self._jobs.items()):
+            if record.running():
+                continue
+            if record.finished_at is None:
+                record.finished_at = now
+            read = record.delivered_at
+            if (read is not None and now - read >= DELIVERED_RETENTION_SECONDS) or (
+                now - record.finished_at >= FINISHED_RETENTION_SECONDS
+            ):
+                del self._jobs[key]
+
+    def _make_room_locked(self, sandbox_id: str, now: float) -> None:
+        """Evict finished records, oldest read ones first, until both caps allow one more."""
+
+        self._prune_jobs_locked(now)
+        for scope, cap in ((sandbox_id, MAX_JOBS_PER_SANDBOX), (None, MAX_JOBS_PER_BOX)):
+            while True:
+                keys = [key for key in self._jobs if scope is None or key[0] == scope]
+                if len(keys) < cap:
+                    break
+                finished = [key for key in keys if not self._jobs[key].running()]
+                if not finished:
+                    raise ExecutorRefused("too many background execs")
+                oldest = min(
+                    finished,
+                    key=lambda key: (
+                        self._jobs[key].delivered_at is None,
+                        self._jobs[key].finished_at or now,
+                    ),
+                )
+                del self._jobs[oldest]
+
+    def retained_output_bytes(self) -> int:
+        with self._lock:
+            return sum(record.output_bytes() for record in self._jobs.values())
+
     def start_exec(self, sandbox_id: str, request: ExecRequest) -> str:
         self._require(sandbox_id)
-        with self._lock:
-            running = sum(1 for job in self._jobs.values() if job.process.poll() is None)
-            if running >= MAX_BACKGROUND_EXECS:
-                raise ExecutorRefused("too many background execs")
+        argv = self.exec_argv(sandbox_id, request)
         exec_id = "exec-" + secrets.token_hex(8)
-        job = _Job(self.exec_argv(sandbox_id, request), MAX_OUTPUT_BYTES, None)
+        key = (sandbox_id, exec_id)
+        record = _JobRecord()
+        # The cap check and the slot reservation are one atomic step.
+        with self._lock:
+            self._make_room_locked(sandbox_id, self._clock())
+            self._jobs[key] = record
+        try:
+            job = self._job_factory(argv, MAX_OUTPUT_BYTES, None)
+        except OSError as exc:
+            with self._lock:
+                self._jobs.pop(key, None)
+            raise ExecutorError("exec start failed") from exc
+        with self._lock:
+            record.job = job
+            orphaned = self._jobs.get(key) is not record
+        if orphaned:  # the sandbox was deleted while the exec started
+            job.killed = True
+            job.kill()
+            raise NotFound
         deadline = self._clock() + request.timeout_seconds
 
         def watchdog() -> None:
             if not job.wait(max(0.0, deadline - self._clock())):
                 job.timed_out = True
                 job.kill()
+            with self._lock:
+                if record.finished_at is None:
+                    record.finished_at = self._clock()
 
         threading.Thread(target=watchdog, daemon=True).start()
-        with self._lock:
-            self._jobs[(sandbox_id, exec_id)] = job
         return exec_id
 
-    def _status(self, exec_id: str, job: _Job) -> ExecStatus:
-        if job.process.poll() is None:
+    def _status(self, exec_id: str, record: "_JobRecord") -> ExecStatus:
+        job = record.job
+        if job is None or job.process.poll() is None:
             return ExecStatus(exec_id, "running")
         state = "killed" if job.killed else "timed_out" if job.timed_out else "exited"
+        with self._lock:
+            now = self._clock()
+            if record.finished_at is None:
+                record.finished_at = now
+            if record.delivered_at is None:
+                record.delivered_at = now
         return ExecStatus(exec_id, state, job.result())
 
-    def poll_exec(self, sandbox_id: str, exec_id: str, wait_seconds: float) -> ExecStatus:
+    def _record_for(self, sandbox_id: str, exec_id: str) -> "_JobRecord":
         with self._lock:
-            job = self._jobs.get((sandbox_id, exec_id))
-        if job is None:
+            self._prune_jobs_locked(self._clock())
+            record = self._jobs.get((sandbox_id, exec_id))
+        if record is None:
             raise NotFound
-        if wait_seconds > 0:
-            job.wait(wait_seconds)
-        return self._status(exec_id, job)
+        return record
+
+    def poll_exec(self, sandbox_id: str, exec_id: str, wait_seconds: float) -> ExecStatus:
+        record = self._record_for(sandbox_id, exec_id)
+        if wait_seconds > 0 and record.job is not None:
+            record.job.wait(wait_seconds)
+        return self._status(exec_id, record)
 
     def stop_exec(self, sandbox_id: str, exec_id: str) -> ExecStatus:
-        with self._lock:
-            job = self._jobs.get((sandbox_id, exec_id))
-        if job is None:
-            raise NotFound
-        if job.process.poll() is None:
+        record = self._record_for(sandbox_id, exec_id)
+        job = record.job
+        if job is not None and job.process.poll() is None:
             job.killed = True
             job.kill()
-        return self._status(exec_id, job)
+        return self._status(exec_id, record)
 
     def write_file(self, sandbox_id: str, path: str, data: bytes, mode: int) -> None:
         self._require(sandbox_id)
         argv = self._script(
             sandbox_id, _WRITE_SCRIPT, path, format(mode, "o"), stdin=True, root=True
         )
-        if self._run(argv, timeout=self._control_timeout, stdin=data).exit_code != 0:
+        result = self._run(argv, timeout=self._control_timeout, stdin=data)
+        if result.exit_code == 4:
+            raise ExecutorRefused("the target exists and is not a regular file")
+        if result.exit_code != 0:
             raise ExecutorError("file write failed")
 
     def read_file(self, sandbox_id: str, path: str) -> bytes:

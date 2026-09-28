@@ -1842,13 +1842,18 @@ class WorkerServer:
         return f"{scheme}://{self.host}:{self.port}"
 
     def _reap_tee_box(self) -> None:
-        # Lease and sandbox expiry also run on every sandbox call; this loop
-        # ends an expired customer's sandboxes when no call arrives.
-        while not self._reaper_stop.wait(TEE_BOX_REAP_INTERVAL_SECONDS):
-            try:
-                self._tee_box_api.reap()
-            except Exception:
-                pass
+        # Lease and sandbox expiry also run on every sandbox call. This loop
+        # ends an expired customer's sandboxes when no call arrives, retries a
+        # drain whose deletes failed, and removes box-labelled containers the
+        # executor does not track, starting with any a previous process left.
+        while True:
+            for step in (self._tee_box_api.reap, self._tee_box_api.sweep):
+                try:
+                    step()
+                except Exception:
+                    pass
+            if self._reaper_stop.wait(TEE_BOX_REAP_INTERVAL_SECONDS):
+                return
 
     def serve_forever(self) -> None:
         if self._tee_box_api is not None:

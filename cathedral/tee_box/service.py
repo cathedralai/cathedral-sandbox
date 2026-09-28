@@ -42,6 +42,7 @@ from cathedral.tee_box.lease import (
     DEFAULT_MAX_LEASE_SECONDS,
     CustomerLease,
     LeaseBusy,
+    LeaseDraining,
     LeaseRequired,
 )
 from cathedral.validator_access import (
@@ -225,6 +226,14 @@ def _int(value: object, low: int, high: int, label: str) -> int:
     return value
 
 
+def _decimal(value: str, label: str) -> int:
+    """Parse a short ASCII decimal query value; anything else is a 400."""
+
+    if not value.isascii() or not value.isdigit() or len(value) > 6:
+        raise _bad(f"{label} must be a small decimal number")
+    return int(value)
+
+
 def _text(value: object, limit: int, label: str) -> str:
     if not isinstance(value, str) or len(value.encode()) > limit or "\x00" in value:
         raise _bad(f"{label} is invalid")
@@ -329,19 +338,39 @@ class TeeBoxSandboxApi:
 
     # -- lifecycle helpers -----------------------------------------------
 
-    def _drain_owner(self, owner: str) -> list[str]:
-        drained = []
+    def _drain_owner(self, owner: str) -> bool:
+        """Delete ``owner``'s sandboxes; true only when none is left anywhere.
+
+        Deletes that fail leave the sandbox listed, so the drain reports false
+        and the lease stays draining. The executor sweep then removes any
+        labelled container the table does not know (a create that timed out,
+        or one left by an earlier worker process); a leftover of unknown
+        owner also blocks the hand-over.
+        """
+
         for info in self.executor.list():
             if info.spec.owner == owner:
                 try:
                     self.executor.delete(info.sandbox_id)
                 except ExecutorError:
-                    continue
-                drained.append(info.sandbox_id)
-        return drained
+                    pass
+        if any(info.spec.owner == owner for info in self.executor.list()):
+            return False
+        try:
+            return self.executor.sweep() == 0
+        except ExecutorError:
+            return False
+
+    def sweep(self) -> None:
+        """Remove labelled containers the executor does not track (reaper thread)."""
+
+        try:
+            self.executor.sweep()
+        except ExecutorError:
+            pass
 
     def reap(self) -> None:
-        """Expire the lease (draining it) and delete sandboxes past their lifetime."""
+        """Expire the lease, retry an unfinished drain, and end expired sandboxes."""
 
         self.lease.current()
         now = self._clock()
@@ -413,6 +442,14 @@ class TeeBoxSandboxApi:
             )
         except LeaseRequired:
             return _json(409, {"error": "take the box lease first", "reason": "lease_required"})
+        except LeaseDraining:
+            return _json(
+                409,
+                {
+                    "error": "the previous customer's sandboxes are still being removed",
+                    "reason": "box_draining",
+                },
+            )
         except NotFound:
             return _json(404, {"error": "not found"})
         except TooLarge:
@@ -467,6 +504,7 @@ class TeeBoxSandboxApi:
                     "held": lease is not None,
                     "held_by_caller": lease is not None and lease.holder == caller,
                     "expires_at": None if lease is None else int(lease.expires_at),
+                    "draining": self.lease.draining,
                 },
             },
         )
@@ -483,7 +521,8 @@ class TeeBoxSandboxApi:
         return _json(200, {"lease": self.lease.acquire(caller, ttl).view()})
 
     def _lease_release(self, caller, body, fields) -> Response:  # noqa: ANN001
-        return _json(200, {"released": self.lease.release(caller)})
+        released = self.lease.release(caller)
+        return _json(200, {"released": released, "draining": self.lease.draining})
 
     # -- images ----------------------------------------------------------
 
@@ -688,9 +727,7 @@ class TeeBoxSandboxApi:
         if len(values) > 1:
             raise _bad("wait may appear once")
         if values:
-            if not values[0].isdigit():
-                raise _bad("wait must be whole seconds")
-            wait = _int(int(values[0]), 0, MAX_POLL_WAIT_SECONDS, "wait")
+            wait = _int(_decimal(values[0], "wait"), 0, MAX_POLL_WAIT_SECONDS, "wait")
         return _json(200, _status_view(self.executor.poll_exec(sid, eid, wait)))
 
     def _exec_stop(self, caller, body, fields, sid: str, eid: str) -> Response:  # noqa: ANN001
@@ -708,10 +745,10 @@ class TeeBoxSandboxApi:
         self._owned(caller, sid)
         query = self._query(fields, frozenset({"path", "mode"}))
         paths, modes = query.get("path", []), query.get("mode", ["420"])
-        if len(paths) != 1 or len(modes) != 1 or not modes[0].isdigit():
+        if len(paths) != 1 or len(modes) != 1:
             raise _bad("send one path and at most one decimal mode")
         path = _abs_path(paths[0])
-        mode = _int(int(modes[0]), 0, 0o7777, "mode")
+        mode = _int(_decimal(modes[0], "mode"), 0, 0o7777, "mode")
         self.executor.write_file(sid, path, body, mode)
         return _json(200, {"path": path, "size": len(body)})
 

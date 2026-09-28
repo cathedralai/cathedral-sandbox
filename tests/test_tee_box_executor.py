@@ -5,6 +5,8 @@ from __future__ import annotations
 import ipaddress
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -16,7 +18,13 @@ from cathedral.tee_box.egress import (
     EgressPolicyError,
     build_egress_policy,
 )
+from cathedral.tee_box import executor as executor_module
 from cathedral.tee_box.executor import (
+    MAX_JOBS_PER_BOX,
+    MAX_JOBS_PER_SANDBOX,
+    MAX_OUTPUT_BYTES,
+    MAX_RETAINED_OUTPUT_BYTES,
+    PENDING_CLEANUP_GRACE_SECONDS,
     ExecRequest,
     ExecResult,
     ExecutorError,
@@ -224,6 +232,8 @@ def test_create_argv_uses_runsc_limits_and_the_policy_network():
         "--name",
         "cathsbx-sbx-" + "1" * 24,
         "--label",
+        "org.cathedral.tee-box.box=default",
+        "--label",
         "org.cathedral.tee-box.sandbox=sbx-" + "1" * 24,
         "--cpus",
         "2",
@@ -391,3 +401,325 @@ def test_captured_output_is_capped_and_timeouts_kill():
     assert (result.exit_code, len(result.stdout), result.stdout_truncated) == (0, 1000, True)
     slow = executor._run([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.5)
     assert slow.timed_out and slow.exit_code is None
+
+
+class _Docker:
+    """A scripted docker CLI: containers appear on run and vanish on rm."""
+
+    def __init__(self) -> None:
+        self.containers: set[str] = set()
+        self.calls: list[list[str]] = []
+        self.run_mode = "ok"  # ok, timeout (the daemon starts it anyway), fail
+        self.rm_failures = 0  # how many rm calls fail before one succeeds
+        self.ps_fails = False
+
+    def __call__(self, argv, **kwargs):
+        assert kwargs["shell"] is False
+        self.calls.append(argv)
+        verb = argv[1]
+        if verb == "run":
+            name = argv[argv.index("--name") + 1]
+            if self.run_mode == "timeout":
+                self.containers.add(name)
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            if self.run_mode == "fail":
+                return subprocess.CompletedProcess(argv, 125, b"", b"error")
+            self.containers.add(name)
+        elif verb == "rm":
+            if self.rm_failures:
+                self.rm_failures -= 1
+                return subprocess.CompletedProcess(argv, 1, b"", b"daemon busy")
+            self.containers.discard(argv[-1])
+        elif verb == "container":
+            if argv[-1] not in self.containers:
+                return subprocess.CompletedProcess(argv, 1, b"", b"Error: No such container")
+        elif verb == "ps":
+            assert argv[argv.index("--filter") + 1] == "label=org.cathedral.tee-box.box=default"
+            if self.ps_fails:
+                return subprocess.CompletedProcess(argv, 1, b"", b"daemon down")
+            listing = "".join(name + "\n" for name in sorted(self.containers))
+            return subprocess.CompletedProcess(argv, 0, listing.encode(), b"")
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.value = 1_900_000_000.0
+
+    def __call__(self) -> float:
+        return self.value
+
+
+def _docker_executor():
+    docker, clock = _Docker(), _Clock()
+    executor = _executor(docker, clock=clock)
+    executor.import_image(DIGEST, IMAGE.reference)
+    return executor, docker, clock
+
+
+NAME = "cathsbx-sbx-" + "1" * 24
+
+
+def test_a_timed_out_create_is_removed_by_name_and_stays_pending():
+    executor, docker, clock = _docker_executor()
+    docker.run_mode = "timeout"
+    with pytest.raises(ExecutorError):
+        executor.create(_spec())
+    assert executor.get(_spec().sandbox_id) is None
+    assert NAME not in docker.containers
+    assert ["docker", "rm", "--force", NAME] in docker.calls
+    # The daemon may still start it after the CLI was killed: the name stays
+    # pending, and the sweep removes it when it appears.
+    assert executor.sweep() == 1
+    docker.containers.add(NAME)
+    assert executor.sweep() == 1 and NAME not in docker.containers
+    clock.value += PENDING_CLEANUP_GRACE_SECONDS
+    assert executor.sweep() == 0
+
+
+def test_a_failed_create_whose_removal_fails_is_swept_later():
+    executor, docker, _clock = _docker_executor()
+    docker.run_mode = "fail"
+    docker.containers.add(NAME)  # a half-created container
+    docker.rm_failures = 2
+    with pytest.raises(ExecutorError):
+        executor.create(_spec())
+    assert NAME in docker.containers
+    docker.rm_failures = 2
+    assert executor.sweep() == 1
+    assert executor.sweep() == 0 and NAME not in docker.containers
+
+
+def test_the_sweep_removes_only_untracked_box_containers():
+    executor, docker, _clock = _docker_executor()
+    executor.create(_spec())
+    other = _spec(sid="sbx-" + "2" * 24)
+    docker.containers |= {"cathsbx-sbx-left-by-a-restart", "cathsbx-" + other.sandbox_id}
+    executor._creating.add(other.sandbox_id)  # a create in flight is not an orphan
+    assert executor.sweep() == 0
+    assert docker.containers == {NAME, "cathsbx-" + other.sandbox_id}
+    docker.ps_fails = True
+    with pytest.raises(ExecutorError):
+        executor.sweep()
+
+
+def test_delete_force_kills_and_confirms_the_container_is_gone():
+    executor, docker, _clock = _docker_executor()
+    executor.create(_spec())
+    docker.rm_failures = 1
+    assert executor.delete(_spec().sandbox_id)
+    assert docker.calls[-2:] == [
+        ["docker", "kill", "--signal", "KILL", NAME],
+        ["docker", "rm", "--force", NAME],
+    ]
+    executor.create(_spec())
+    docker.rm_failures = 2
+    with pytest.raises(ExecutorError):
+        executor.delete(_spec().sandbox_id)
+    assert executor.get(_spec().sandbox_id) is not None
+    docker.rm_failures = 2
+    docker.containers.discard(NAME)  # rm failed, but the daemon says it is gone
+    assert executor.delete(_spec().sandbox_id)
+
+
+class _FakeProcess:
+    def __init__(self, done: threading.Event) -> None:
+        self._done = done
+
+    def poll(self):
+        return 0 if self._done.is_set() else None
+
+
+_SHARED_OUTPUT = b"x" * MAX_OUTPUT_BYTES
+
+
+class _FakeJob:
+    """A background exec: finished at once, or running until killed."""
+
+    finished = True
+    start_delay = 0.0
+
+    def __init__(self, argv, cap, stdin) -> None:
+        time.sleep(self.start_delay)
+        self.done = threading.Event()
+        if self.finished:
+            self.done.set()
+        self.process = _FakeProcess(self.done)
+        self.stdout = _SHARED_OUTPUT
+        self.stderr = _SHARED_OUTPUT
+        self.killed = self.timed_out = False
+
+    def wait(self, timeout):
+        return self.done.wait(timeout)
+
+    def kill(self):
+        self.done.set()
+
+    def result(self):
+        return ExecResult(0, b"done")
+
+
+def _job_executor(job_class):
+    executor, docker, clock = _docker_executor()
+    executor._job_factory = job_class
+    sids = []
+    for digit in "123":
+        spec = _spec(sid="sbx-" + digit * 24)
+        executor.create(spec)
+        sids.append(spec.sandbox_id)
+    return executor, clock, sids
+
+
+REQUEST = ExecRequest(("true",), timeout_seconds=60)
+
+
+def test_a_loop_of_short_execs_keeps_retained_output_bounded():
+    executor, _clock, sids = _job_executor(_FakeJob)
+    for index in range(300):
+        executor.start_exec(sids[index % 3], REQUEST)
+        assert len(executor._jobs) <= MAX_JOBS_PER_BOX
+        assert executor.retained_output_bytes() <= MAX_RETAINED_OUTPUT_BYTES
+    for sid in sids:
+        assert sum(1 for key in executor._jobs if key[0] == sid) <= MAX_JOBS_PER_SANDBOX
+    assert MAX_RETAINED_OUTPUT_BYTES == 64 * 1024 * 1024
+
+
+def test_finished_execs_are_evicted_after_their_output_is_read():
+    executor, clock, sids = _job_executor(_FakeJob)
+    read = executor.start_exec(sids[0], REQUEST)
+    unread = executor.start_exec(sids[0], REQUEST)
+    assert executor.poll_exec(sids[0], read, 0).state == "exited"
+    # A caller that lost the answer may ask again inside the retention.
+    assert executor.poll_exec(sids[0], read, 0).state == "exited"
+    clock.value += 61
+    with pytest.raises(NotFound):
+        executor.poll_exec(sids[0], read, 0)
+    assert executor.poll_exec(sids[0], unread, 0).state == "exited"
+    clock.value += 30
+    executor.poll_exec(sids[0], unread, 0)
+    # An answer never read is kept for the longer retention only.
+    other = executor.start_exec(sids[0], REQUEST)
+    deadline = time.monotonic() + 5
+    while executor._jobs[(sids[0], other)].finished_at is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    clock.value += 599
+    executor._record_for(sids[0], other)
+    clock.value += 1
+    with pytest.raises(NotFound):
+        executor.poll_exec(sids[0], other, 0)
+
+
+class _RunningJob(_FakeJob):
+    finished = False
+
+
+def test_running_execs_hit_the_cap():
+    executor, _clock, sids = _job_executor(_RunningJob)
+    for _ in range(MAX_JOBS_PER_SANDBOX):
+        executor.start_exec(sids[0], REQUEST)
+    with pytest.raises(ExecutorRefused):
+        executor.start_exec(sids[0], REQUEST)
+    for _ in range(MAX_JOBS_PER_BOX - MAX_JOBS_PER_SANDBOX):
+        executor.start_exec(sids[1], REQUEST)
+    with pytest.raises(ExecutorRefused):
+        executor.start_exec(sids[2], REQUEST)
+
+
+class _SlowRunningJob(_RunningJob):
+    start_delay = 0.02
+
+
+def test_concurrent_starts_cannot_exceed_the_caps():
+    executor, _clock, sids = _job_executor(_SlowRunningJob)
+    results: list[str] = []
+    barrier = threading.Barrier(60)
+
+    def start(index: int) -> None:
+        barrier.wait()
+        try:
+            executor.start_exec(sids[index % 3], REQUEST)
+            results.append("ok")
+        except ExecutorRefused:
+            results.append("refused")
+
+    threads = [threading.Thread(target=start, args=(index,)) for index in range(60)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert results.count("ok") == MAX_JOBS_PER_BOX == len(executor._jobs)
+    for sid in sids:
+        assert sum(1 for key in executor._jobs if key[0] == sid) <= MAX_JOBS_PER_SANDBOX
+
+
+class _BlockingPipe:
+    """A stdin whose reader never reads: write blocks until the process dies."""
+
+    def __init__(self, dead: threading.Event) -> None:
+        self._dead = dead
+
+    def write(self, data):
+        self._dead.wait()
+        raise BrokenPipeError
+
+    def read(self, _size):
+        self._dead.wait()
+        return b""
+
+    def close(self):
+        pass
+
+
+class _StuckPopen:
+    def __init__(self, argv, **kwargs) -> None:
+        assert kwargs["shell"] is False
+        self._dead = threading.Event()
+        self.stdin = _BlockingPipe(self._dead)
+        self.stdout = _BlockingPipe(self._dead)
+        self.stderr = _BlockingPipe(self._dead)
+        self.returncode = None
+
+    def wait(self, timeout=None):
+        if not self._dead.wait(timeout):
+            raise subprocess.TimeoutExpired("docker", timeout)
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+        self._dead.set()
+
+
+def test_the_transfer_timeout_covers_the_upload(monkeypatch):
+    monkeypatch.setattr(executor_module.subprocess, "Popen", _StuckPopen)
+    executor = _executor()
+    outcome: list[ExecResult] = []
+    worker = threading.Thread(
+        target=lambda: outcome.append(
+            executor._run(["docker", "exec"], timeout=0.3, stdin=b"x" * (8 * 1024 * 1024))
+        ),
+        daemon=True,
+    )
+    started = time.monotonic()
+    worker.start()
+    worker.join(10)
+    assert not worker.is_alive(), "an upload to a reader that never reads blocked the caller"
+    assert outcome[0].timed_out and time.monotonic() - started < 10
+
+
+def test_file_uploads_refuse_a_target_that_is_not_a_regular_file(monkeypatch):
+    executor, _docker, _clock = _docker_executor()
+    executor.create(_spec())
+    seen = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(argv)
+        return ExecResult(4)
+
+    monkeypatch.setattr(executor, "_run", fake_run)
+    with pytest.raises(ExecutorRefused, match="regular file"):
+        executor.write_file(_spec().sandbox_id, "/tmp/fifo", b"data", 0o644)
+    script = seen[0][seen[0].index("-c") + 1]
+    assert script.index('test -f "$1"') < script.index('cat > "$1"')

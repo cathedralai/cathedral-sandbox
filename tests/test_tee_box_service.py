@@ -9,6 +9,7 @@ import os
 import random
 import tarfile
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -256,7 +257,12 @@ def test_every_v1_route_maps_to_the_executor(box: _Box):
     assert contract["hardware"] == "standard"
     assert contract["max_exec_timeout_seconds"] == 14_400
     assert contract["exec_options"] == ["env", "user", "cwd", "timeout_seconds"]
-    assert contract["lease"] == {"held": False, "held_by_caller": False, "expires_at": None}
+    assert contract["lease"] == {
+        "held": False,
+        "held_by_caller": False,
+        "expires_at": None,
+        "draining": False,
+    }
 
     _lease_and_image(box)
     assert box.json("GET", "/v1/lease")[1]["lease"]["holder"] == CALLER
@@ -365,7 +371,7 @@ def test_every_v1_route_maps_to_the_executor(box: _Box):
 
     assert box.json("DELETE", f"/v1/sandboxes/{sid}")[1] == {"id": sid, "deleted": True}
     assert box.json("GET", f"/v1/sandboxes/{sid}")[0] == 404
-    assert box.json("DELETE", "/v1/lease")[1] == {"released": True}
+    assert box.json("DELETE", "/v1/lease")[1] == {"released": True, "draining": False}
     assert other["id"] in box.fake.deleted
 
 
@@ -426,7 +432,7 @@ def test_one_customer_at_a_time_and_release_drains(box: _Box):
     assert box.json("GET", "/v1/box", hotkey=OTHER, pair=OTHER_PAIR)[1]["lease"]["held"] is True
     assert box.fake.deleted == []
 
-    assert box.json("DELETE", "/v1/lease")[1] == {"released": True}
+    assert box.json("DELETE", "/v1/lease")[1] == {"released": True, "draining": False}
     assert sorted(box.fake.deleted) == sorted([first, second])
     status, lease = box.json(
         "POST", "/v1/lease", {"ttl_seconds": 600}, hotkey=OTHER, pair=OTHER_PAIR
@@ -717,30 +723,72 @@ def test_the_sandbox_api_requires_the_attested_listener(tmp_path: Path):
         )
 
 
-def test_a_sandbox_left_by_another_owner_stays_invisible(tmp_path: Path):
-    # A drain that failed to delete must not hand the old sandbox to the next customer.
-    clock = _Clock()
-    api, fake = _api(tmp_path, _binding(), clock=clock)
-    fake.import_image(DIGEST, "registry.example/tasks/base")
-    _handle(api, "POST", "/v1/lease", body={"ttl_seconds": 60})
-    leftover = _handle(
+def _one_sandbox(api, caller=CALLER, ttl=60):
+    assert _handle(api, "POST", "/v1/lease", caller, {"ttl_seconds": ttl})[0] == 200
+    return _handle(
         api,
         "POST",
         "/v1/sandboxes",
-        body={"image_id": DIGEST, "network": "deny_all", "lifetime_seconds": 3600},
+        caller,
+        {"image_id": DIGEST, "network": "deny_all", "lifetime_seconds": 3600},
     )[1]["id"]
-    fake.delete = lambda _sid: False
-    assert _handle(api, "DELETE", "/v1/lease")[1] == {"released": True}
-    _handle(api, "POST", "/v1/lease", OTHER, {"ttl_seconds": 60})
+
+
+def _draining(api, caller=OTHER):
+    status, body = _handle(api, "POST", "/v1/lease", caller, {"ttl_seconds": 60})
+    return status == 409 and body["reason"] == "box_draining"
+
+
+def test_a_failed_drain_keeps_the_box_unleasable_until_the_delete_succeeds(tmp_path: Path):
+    clock = _Clock()
+    api, fake = _api(tmp_path, _binding(), clock=clock)
+    fake.import_image(DIGEST, "registry.example/tasks/base")
+    leftover = _one_sandbox(api)
+    fake.delete_fails = True
+    assert _handle(api, "DELETE", "/v1/lease")[1] == {"released": True, "draining": True}
+    # Nobody gets the box while the old customer's sandbox may still run:
+    # not another customer, not the old one again.
+    for _ in range(3):
+        assert _draining(api) and _draining(api, CALLER)
+        api.reap()
+    assert _handle(api, "GET", "/v1/sandboxes", CALLER)[1]["reason"] == "box_draining"
+    assert _handle(api, "GET", "/v1/box", OTHER)[1]["lease"]["draining"] is True
+    assert fake.get(leftover) is not None and fake.deleted == []
+    # The reaper retries; once the delete works the box can change hands.
+    fake.delete_fails = False
+    api.reap()
+    assert fake.deleted == [leftover] and not api.lease.draining
+    assert _handle(api, "POST", "/v1/lease", OTHER, {"ttl_seconds": 60})[0] == 200
     assert _handle(api, "GET", "/v1/sandboxes", OTHER)[1] == {"sandboxes": []}
-    for method, target in (
-        ("GET", f"/v1/sandboxes/{leftover}"),
-        ("DELETE", f"/v1/sandboxes/{leftover}"),
-    ):
-        assert _handle(api, method, target, OTHER)[0] == 404
-    assert (
-        _handle(api, "POST", f"/v1/sandboxes/{leftover}/exec", OTHER, {"command": "id"})[0] == 404
-    )
+
+
+def test_an_expired_lease_with_a_stuck_sandbox_stays_draining(tmp_path: Path):
+    clock = _Clock()
+    api, fake = _api(tmp_path, _binding(), clock=clock)
+    fake.import_image(DIGEST, "registry.example/tasks/base")
+    stuck = _one_sandbox(api)
+    fake.delete_fails = True
+    clock.value += 61
+    api.reap()
+    assert api.lease.current() is None and _draining(api)
+    fake.delete_fails = False
+    assert _handle(api, "POST", "/v1/lease", OTHER, {"ttl_seconds": 60})[0] == 200
+    assert fake.deleted == [stuck]
+
+
+def test_an_untracked_container_blocks_the_hand_over(tmp_path: Path):
+    # A container the table lost (a timed-out create, an earlier process)
+    # may belong to the old customer, so the sweep must clear it first.
+    api, fake = _api(tmp_path, _binding(), clock=_Clock())
+    fake.import_image(DIGEST, "registry.example/tasks/base")
+    sid = _one_sandbox(api)
+    fake.orphans.add("cathsbx-sbx-" + "9" * 24)
+    fake.orphans_stuck = True
+    assert _handle(api, "DELETE", "/v1/lease")[1] == {"released": True, "draining": True}
+    assert fake.deleted == [sid] and _draining(api)
+    fake.orphans_stuck = False
+    assert _handle(api, "POST", "/v1/lease", OTHER, {"ttl_seconds": 60})[0] == 200
+    assert fake.orphans == set()
 
 
 def test_an_unsigned_caller_gets_no_body_read(box: _Box):
@@ -755,3 +803,31 @@ def test_an_unsigned_caller_gets_no_body_read(box: _Box):
         assert connection.getresponse().status == 401
     finally:
         connection.close()
+
+
+def test_numeric_query_values_must_be_short_ascii_decimals(tmp_path: Path):
+    api, fake = _api(tmp_path, _binding(), clock=_Clock())
+    fake.import_image(DIGEST, "registry.example/tasks/base")
+    sid = _one_sandbox(api, ttl=600)
+    eid = _handle(api, "POST", f"/v1/sandboxes/{sid}/execs", body={"command": "x"})[1]["exec_id"]
+    for value in (quote("\u00b2"), quote("\u0663"), "9" * 4301, "-1", "99999"):
+        status = api.handle("GET", f"/v1/sandboxes/{sid}/execs/{eid}?wait={value}", CALLER, b"")
+        assert status.status == 400, value
+        status = api.handle("PUT", f"/v1/sandboxes/{sid}/files?path=/a&mode={value}", CALLER, b"")
+        assert status.status == 400, value
+    assert api.handle("GET", f"/v1/sandboxes/{sid}/execs/{eid}?wait=25", CALLER, b"").status == 200
+
+
+def test_the_worker_sweeps_leftover_containers_when_it_starts(tmp_path: Path):
+    # Containers a previous worker process left behind are removed without
+    # waiting for a call.
+    fake = FakeExecutor()
+    fake.orphans.add("cathsbx-sbx-" + "7" * 24)
+    box = _Box(tmp_path, executor=fake)
+    try:
+        deadline = time.monotonic() + 5
+        while fake.orphans and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert fake.orphans == set()
+    finally:
+        box.close()
