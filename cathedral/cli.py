@@ -1451,6 +1451,8 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             raise ValueError("central access requires signed validator access and native TLS")
         if _same_file(central_values[2], access_state_path):
             raise ValueError("central access state must be separate from validator access state")
+    elif getattr(args, "central_revocations", None) is not None:
+        raise ValueError("--central-revocations requires central access")
     # The locality guard keys off AUTHENTICATION, not TLS.
     #
     # It used to be `not tls_enabled`, so supplying a certificate satisfied it and
@@ -1634,6 +1636,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             netuid=provider.netuid,
             channel_binding=channel_binding,
             state=open_central_access_state(central_values[2]),
+            revocations_path=getattr(args, "central_revocations", None),
         )
     gpu_executor = None
     gpu_evidence_collector = None
@@ -4425,6 +4428,13 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--central-access-state",
             help="owner-only SQLite replay state for central requests, apart from validator state",
+        )
+        command.add_argument(
+            "--central-revocations",
+            help=(
+                "root-signed central revocation list, re-read when it changes; "
+                "central requests are refused while it is missing or unusable"
+            ),
         )
         command.add_argument("--validator-network", default=DEFAULT_ENROLL_NETWORK)
         command.add_argument("--validator-netuid", type=int, default=DEFAULT_ENROLL_NETUID)
