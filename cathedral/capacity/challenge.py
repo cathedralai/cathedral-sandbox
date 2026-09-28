@@ -5,9 +5,10 @@ memory-hard hash chain ("lane") per claimed vCPU, together holding 80% of the
 claimed memory, answered within a deadline the prober sets. What that proves
 today (docs/CAPACITY.md, "What a receipt proves today"): the sampled lanes were
 computed correctly for the claimed shape, and the deadline, which follows one
-lane's work, keeps a box from claiming more than about 2.6 times the vCPUs its
-cores can compute at the assumed native speed. It does not prove the exact
-core count, nor that all the memory was held at once.
+lane's work, keeps a box from claiming more than about 2.5 times (up to 2.9 at
+the smallest lane) the vCPUs its cores can compute at the measured native
+speed. It does not prove the exact core count, nor that all the memory was
+held at once.
 
 Protocol (commit, then sample):
 
@@ -24,9 +25,10 @@ A lane is scrypt-like over SHA-256: fill ``blocks`` 32-byte blocks, then take
 ``steps`` (two per block) data-dependent reads, each writing back, so it cannot
 be computed with much less memory or skipped ahead.
 
-The pure-Python reference defines the outputs exactly. The prober and the
-sandbox should run a native implementation of the same function (see
-docs/CAPACITY.md for cost).
+The pure-Python reference defines the outputs exactly and can check sampled
+lanes, slowly (the prober should check with a native build). It is too slow to
+meet the deadline (about 1.5 us per step against a 1 us budget), so the box
+must run a native worker computing the same function (docs/CAPACITY.md, Cost).
 """
 
 from __future__ import annotations
@@ -56,21 +58,22 @@ MIN_SAMPLES = 4
 MIN_LANE_BYTES = 512 << 20
 # The most time the challenge's exec may take (max_deadline_ms). Creating the
 # sandbox is timed separately (timings_ms.create), so exec only gets:
-# - a startup allowance for the exec round trip, starting the worker and
-#   first-touching the lane memory, each about a second or less on a native
-#   worker. 10 s covers them several times over, and adds at most about 15% to
-#   the 67 s per-step budget of the smallest lane;
-# - a per-step budget. Assumed native speed: ASSUMED_NATIVE_HASHES_PER_SECOND
-#   SHA-256 per core (about 0.6 us per hash), with a lane's fill adding half as
-#   many hashes again as its steps, so about 0.89 us per step in all. 2 us per
-#   step is about 2.25 times that, headroom for slower cores and noisy hosts.
+# - a startup allowance for the exec round trip, starting the native worker and
+#   first-touching the lane memory, each about a second or less. 5 s covers them
+#   several times over, and adds 15% to the 34 s per-step budget of the smallest
+#   lane;
+# - a per-step budget. ASSUMED_NATIVE_NS_PER_STEP is a plain C lane over
+#   OpenSSL's SHA-256 (the fill included, 4 KiB pages) measured on one EPYC
+#   9354P VM core: 0.38 us per step alone, 0.40 to 0.46 us with all four cores
+#   busy. 1 us per step is 2.5 times 0.4 us, headroom for slower cores and
+#   noisy hosts.
 # Because a box with fewer cores than lanes needs lanes / cores times as long,
 # the budget over the native per-step time is also how far a vCPU claim can be
-# inflated (about 2.3, up to 2.6 at the smallest lane). Not yet calibrated on
-# real CPUs (docs/CAPACITY.md, Timing).
-DEADLINE_STARTUP_MS = 10_000
-DEADLINE_NS_PER_STEP = 2_000
-ASSUMED_NATIVE_HASHES_PER_SECOND = 1_690_000
+# inflated: about 2.5, up to 2.9 at the smallest lane. One VM's measurement, to
+# be calibrated across real CPUs (docs/CAPACITY.md, Timing).
+DEADLINE_STARTUP_MS = 5_000
+DEADLINE_NS_PER_STEP = 1_000
+ASSUMED_NATIVE_NS_PER_STEP = 400
 
 
 class ChallengeError(ValueError):
@@ -206,7 +209,8 @@ def _lane(args: tuple[ChallengeSpec, int]) -> bytes:
 
 
 def run(spec: ChallengeSpec, *, workers: int | None = None) -> list[bytes]:
-    """Every lane's answer, computed in parallel (the sandbox side)."""
+    """Every lane's answer, computed in parallel by the reference (for tests and
+    audits; too slow for a box to meet the deadline with)."""
 
     workers = max(1, min(spec.lanes, workers or os.cpu_count() or 1))
     if workers == 1:
@@ -271,7 +275,8 @@ def _check_outputs(spec: ChallengeSpec, outputs: list[bytes]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Sandbox side: read a spec as JSON on stdin, print the answer as JSON."""
+    """Reference answer: read a spec as JSON on stdin, print the answer as JSON.
+    For checking a native worker's output; too slow to answer a probe."""
 
     parser = argparse.ArgumentParser(prog="python -m cathedral.capacity.challenge")
     parser.add_argument("--workers", type=int, default=None)

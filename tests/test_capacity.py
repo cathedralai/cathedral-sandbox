@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import os
@@ -117,43 +118,45 @@ def test_verify_refuses_a_sample_below_the_floor():
 
 def test_the_deadline_bound_follows_the_spec():
     small = ch.ChallengeSpec(SEED, 1, 1, 1)
-    assert ch.max_deadline_ms(small) == ch.DEADLINE_STARTUP_MS + 1 == 10_001
+    assert ch.max_deadline_ms(small) == ch.DEADLINE_STARTUP_MS + 1 == 5_001
     big = ch.spec_for(SEED, vcpus=8, memory_gib=32)
     assert ch.max_deadline_ms(big) == ch.DEADLINE_STARTUP_MS + math.ceil(
         big.steps * ch.DEADLINE_NS_PER_STEP / 1_000_000
     )
-    assert ch.max_deadline_ms(big) == 439_497  # a 32 GiB, 8 vCPU box: about 7.3 minutes
+    assert ch.max_deadline_ms(big) == 219_749  # a 32 GiB, 8 vCPU box: about 3.7 minutes
 
 
 def _native_exec_ms(spec, cores):
-    # The exec time of a native worker at the assumed speed on ``cores`` cores:
-    # blocks fill hashes plus steps hashes per lane, lanes time-sliced over the
-    # cores (never faster than one lane alone). Startup is left out, in the
-    # box's favour.
-    hashes = spec.lanes * (spec.blocks + spec.steps)
-    per_core = max(hashes / min(cores, spec.lanes), spec.blocks + spec.steps)
-    return per_core / ch.ASSUMED_NATIVE_HASHES_PER_SECOND * 1000
+    # The exec time of the measured native worker (ASSUMED_NATIVE_NS_PER_STEP,
+    # fill included) on ``cores`` cores, lanes time-sliced over the cores and
+    # never faster than one lane alone. Startup is left out, in the box's favour.
+    lane_ms = spec.steps * ch.ASSUMED_NATIVE_NS_PER_STEP / 1_000_000
+    return lane_ms * max(1, spec.lanes / cores)
 
 
-def test_the_reviewers_inflated_vcpu_claim_no_longer_fits():
-    # 8 cores claiming 1024 vCPUs over 16 GiB finished in 95 s under the old
-    # 124 s cap. The lane floor now refuses the claim, and even the old spec's
-    # deadline bound is far below the 95 s the fake needs.
+def test_the_reviewers_inflated_vcpu_claims_no_longer_fit():
+    # Round 2: 8 cores claiming 1024 vCPUs over 16 GiB fitted a 124 s cap.
+    # Re-review: 4 cores ran all 20 lanes of a 20 vCPU / 13 GiB claim in 77.2 s
+    # under a 79.8 s cap. The first is refused by the lane floor; the second
+    # needs about 70 s at the measured speed against a 39.9 s bound now.
     honest = ch.spec_for(SEED, vcpus=8, memory_gib=16)
-    assert 94_000 < _native_exec_ms(honest, 8) < 96_000
-    assert ch.max_deadline_ms(honest) > 2 * _native_exec_ms(honest, 8)  # honest fits, 2x spare
+    assert 42_000 < _native_exec_ms(honest, 8) < 44_000
+    assert ch.max_deadline_ms(honest) > 2.5 * _native_exec_ms(honest, 8)  # honest fits
     with pytest.raises(ch.ChallengeError, match="512 MiB of lane"):
         ch.spec_for(SEED, vcpus=1024, memory_gib=16)
-    old_blocks = 16 * (1 << 30) * 4 // (5 * 1024) // ch.BLOCK_BYTES
-    old = ch.ChallengeSpec(SEED, 1024, old_blocks, 2 * old_blocks)
-    assert 94_000 < _native_exec_ms(old, 8) < 96_000
-    assert ch.max_deadline_ms(old) < 12_000  # was 124 194
+    twenty = ch.spec_for(SEED, vcpus=20, memory_gib=13)
+    assert ch.max_deadline_ms(twenty) == 39_897  # was 79 794
+    assert _native_exec_ms(twenty, 4) > 1.7 * ch.max_deadline_ms(twenty)
+    assert 77_200 > ch.max_deadline_ms(twenty)
 
 
-@pytest.mark.parametrize("cores, memory_gib", [(8, 16), (8, 64), (16, 64), (32, 128)])
+@pytest.mark.parametrize(
+    "cores, memory_gib", [(4, 13), (8, 16), (8, 64), (16, 64), (32, 128), (8, 5)]
+)
 def test_a_vcpu_claim_inflates_at_most_the_documented_factor(cores, memory_gib):
-    # docs/CAPACITY.md, Timing: at the assumed native speed a box meets the
-    # deadline only while it claims at most about 2.6 times its cores.
+    # docs/CAPACITY.md, Timing: at the measured native speed a box meets the
+    # deadline only while it claims at most about 2.5 times its cores (up to
+    # 2.9 at the smallest lane).
     fitting = [
         vcpus
         for vcpus in range(cores, min(ch.MAX_LANES, memory_gib * 2) + 1)
@@ -163,16 +166,18 @@ def test_a_vcpu_claim_inflates_at_most_the_documented_factor(cores, memory_gib):
     ]
     assert fitting[0] == cores  # the honest claim fits
     assert fitting == list(range(cores, fitting[-1] + 1))
-    assert 2.2 * cores <= fitting[-1] <= 2.6 * cores
+    assert fitting[-1] <= 2.9 * cores
+    if ch.provable_vcpus(ch.MAX_LANES, memory_gib) >= 2.5 * cores:
+        assert fitting[-1] >= 2.4 * cores  # the factor is real, not a bound that fits nobody
 
 
 def test_the_residual_inflation_factor_matches_the_constants():
-    native_ns_per_step = 1.5e9 / ch.ASSUMED_NATIVE_HASHES_PER_SECOND  # fill + steps, per step
-    assert 880 < native_ns_per_step < 890
-    assert 2.2 < ch.DEADLINE_NS_PER_STEP / native_ns_per_step < 2.3
+    assert ch.DEADLINE_NS_PER_STEP / ch.ASSUMED_NATIVE_NS_PER_STEP == 2.5
     smallest = ch.ChallengeSpec(SEED, 1, ch.MIN_LANE_BYTES // 32, ch.MIN_LANE_BYTES // 16)
-    assert 67_000 < ch.max_deadline_ms(smallest) - ch.DEADLINE_STARTUP_MS < 67_200
-    assert ch.max_deadline_ms(smallest) / _native_exec_ms(smallest, 1) < 2.6
+    budget = ch.max_deadline_ms(smallest) - ch.DEADLINE_STARTUP_MS
+    assert 33_500 < budget < 33_600
+    assert 0.14 < ch.DEADLINE_STARTUP_MS / budget < 0.15
+    assert 2.8 < ch.max_deadline_ms(smallest) / _native_exec_ms(smallest, 1) < 2.9
 
 
 def test_the_sample_is_recomputable_from_the_receipt_fields():
@@ -482,32 +487,54 @@ def test_a_loose_deadline_is_refused(prober):
             )
 
 
+def _sign_unchecked(body, key):
+    # A signed receipt the prober's own checks would have refused: what a
+    # buggy or compromised prober could serve, which verify_receipt must catch.
+    return {**body, "signature": base64.b64encode(key.sign(receipt.canonical_bytes(body))).decode()}
+
+
 def test_the_reviewers_inflated_receipt_is_refused(prober):
-    # The receipt round 2 signed and verified: 1024 vCPUs over 16 GiB, exec
-    # 95 000 ms. Honest 8 vCPUs over 16 GiB in the same 95 s still fits.
     key, keys = prober
+    # Round 2: 1024 vCPUs over 16 GiB, exec 95 000 ms under a 124 194 ms cap.
     blocks = 16 * (1 << 30) * 4 // (5 * 1024) // ch.BLOCK_BYTES
     old = ch.ChallengeSpec(SEED, 1024, blocks, 2 * blocks)
     timings = {"create": 900, "exec": 95_000, "delete": 300}
+    body = _body(vcpus=1024, memory_gib=16, challenge=old, deadline_ms=124_194, timings_ms=timings)
     with pytest.raises(receipt.ReceiptError, match="512 MiB of lane"):
-        receipt.sign_receipt(
-            _body(
-                vcpus=1024, memory_gib=16, challenge=old, deadline_ms=124_194, timings_ms=timings
-            ),
-            key,
+        _verify(_sign_unchecked(body, key), keys)
+    # Re-review: 4 cores, all 20 lanes of 20 vCPU / 13 GiB in 77.2 s under the old
+    # 79 794 ms cap. Signed with the old cap, or with the new one, it is refused.
+    timings = {"create": 900, "exec": 77_200, "delete": 300}
+    for deadline_ms, message in ((79_794, "looser than 39897"), (39_897, "after its deadline")):
+        body = _body(vcpus=20, memory_gib=13, deadline_ms=deadline_ms, timings_ms=timings)
+        with pytest.raises(receipt.ReceiptError, match=message):
+            _verify(_sign_unchecked(body, key), keys)
+        with pytest.raises(receipt.ReceiptError, match=message):
+            receipt.sign_receipt(body, key)
+    # Honest 8 vCPUs over 16 GiB: about 43 s against a 112 375 ms bound.
+    timings = {"create": 900, "exec": 43_000, "delete": 300}
+    honest = _body(vcpus=8, memory_gib=16, deadline_ms=112_375, timings_ms=timings)
+    assert _verify(_sign_unchecked(honest, key), keys).vcpus == 8
+
+
+@pytest.mark.parametrize("vcpus, memory_gib", [(6, 24), (20, 13), (8, 16), (8, 5)])
+def test_verify_receipt_refuses_an_exec_over_the_bound(prober, vcpus, memory_gib):
+    # The bound as verify_receipt applies it (receipt.py), one millisecond either side.
+    key, keys = prober
+    top = ch.max_deadline_ms(ch.spec_for(SEED, vcpus=vcpus, memory_gib=memory_gib))
+
+    def signed(deadline_ms, exec_ms):
+        timings = {"create": 900, "exec": exec_ms, "delete": 300}
+        body = _body(
+            vcpus=vcpus, memory_gib=memory_gib, deadline_ms=deadline_ms, timings_ms=timings
         )
-    with pytest.raises(receipt.ReceiptError, match="looser than|after its deadline"):
-        _check_deadline_only(old, 95_000, timings)
-    honest = _body(vcpus=8, memory_gib=16, deadline_ms=100_000, timings_ms=timings)
-    assert _verify(receipt.sign_receipt(honest, key), keys).vcpus == 8
+        return _sign_unchecked(body, key)
 
-
-def _check_deadline_only(spec, deadline_ms, timings):
-    # The receipt's timing rule by itself, for a spec spec_for now refuses.
-    if deadline_ms > ch.max_deadline_ms(spec):
-        raise receipt.ReceiptError(f"deadline_ms is looser than {ch.max_deadline_ms(spec)}")
-    if timings["exec"] > deadline_ms:
-        raise receipt.ReceiptError("the challenge finished after its deadline")
+    assert _verify(signed(top, top), keys).deadline_ms == top  # just fits
+    with pytest.raises(receipt.ReceiptError, match="after its deadline"):
+        _verify(signed(top, top + 1), keys)
+    with pytest.raises(receipt.ReceiptError, match="looser than"):
+        _verify(signed(top + 1, top), keys)
 
 
 def test_the_sample_count_is_bound_to_the_lane_count(prober):
