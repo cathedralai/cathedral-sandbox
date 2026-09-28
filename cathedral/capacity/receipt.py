@@ -1,0 +1,325 @@
+"""Signed capacity receipts: what the prober saw on one box in one round.
+
+The SN94 owner's prober creates a sandbox on a miner's box through its front
+door, runs the capacity challenge, checks it, deletes the sandbox, and signs a
+receipt. Validators on any netuid verify receipts with the prober keys they
+pin; they never contact miner boxes themselves.
+
+What a receipt binds, and what ``verify_receipt`` checks:
+
+- audience: the netuid, the round and the requesting validator's nonce, so a
+  validator must fetch its own receipts (copying another validator's weights
+  gains nothing);
+- the box: its id, the miner's hotkey, its kind and a hardware identity for
+  dedup (PPID or chip id for a TEE box, a probe-derived fingerprint for bare
+  metal);
+- the capacity paid for, which must be exactly what the challenge proved: the
+  spec must equal ``spec_for(seed, vcpus=, memory_gib=)``;
+- the proof: the committed result digest, the post-commitment sample nonce, and
+  the outputs of exactly the lanes that nonce samples (at least MIN_SAMPLES), so
+  anyone can recompute which lanes were checked and re-check them;
+- timing: the exec time must fit the deadline the prober set.
+
+Wire form: canonical JSON (sorted keys, no whitespace, UTF-8) of the body, and
+``signature`` = base64 Ed25519 over those bytes with the key named by
+``prober_key_id``.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import json
+import re
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Mapping
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+
+from cathedral.capacity.challenge import (
+    MIN_SAMPLES,
+    ChallengeError,
+    ChallengeSpec,
+    sample_lanes,
+    spec_for,
+)
+
+SCHEMA = "cathedral_capacity_receipt_v1"
+BOX_KINDS = ("tee", "bare_metal")
+HARDWARE_ID_KINDS = {"tee": ("ppid", "chip_id"), "bare_metal": ("probe_fingerprint",)}
+MAX_VALIDITY = timedelta(hours=2)
+CLOCK_SKEW = timedelta(minutes=5)
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_KEY_ID = re.compile(r"[A-Za-z0-9._:-]{1,64}")
+_SS58 = re.compile(r"[1-9A-HJ-NP-Za-km-z]{46,48}")
+_BOX_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+_LANE = re.compile(r"0|[1-9][0-9]{0,3}")
+_TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
+_BODY_KEYS = frozenset(
+    {
+        "schema",
+        "netuid",
+        "round",
+        "validator_nonce",
+        "box",
+        "capacity",
+        "challenge",
+        "timings_ms",
+        "issued_at",
+        "expires_at",
+        "prober_key_id",
+    }
+)
+_BOX_KEYS = frozenset({"box_id", "miner_hotkey", "kind", "hardware_id", "hardware_id_kind"})
+_CHALLENGE_KEYS = frozenset(
+    {
+        "seed",
+        "lanes",
+        "blocks",
+        "steps",
+        "result_digest",
+        "sample_nonce",
+        "sampled_outputs",
+        "deadline_ms",
+    }
+)
+
+
+class ReceiptError(ValueError):
+    """A receipt is malformed, unsigned, stale, or not for this validator."""
+
+
+@dataclass(frozen=True)
+class VerifiedReceipt:
+    box_id: str
+    miner_hotkey: str
+    kind: str
+    hardware_id: str
+    hardware_id_kind: str
+    vcpus: int
+    memory_gib: int
+    challenge: ChallengeSpec
+    result_digest: bytes
+    sample_nonce: bytes
+    sampled_outputs: Mapping[int, bytes]
+    deadline_ms: int
+    timings_ms: Mapping[str, int]
+    round: int
+    issued_at: datetime
+
+
+def canonical_bytes(body: Mapping[str, Any]) -> bytes:
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def _iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_time(value: object, name: str) -> datetime:
+    if not isinstance(value, str) or _TIME.fullmatch(value) is None:
+        raise ReceiptError(f"{name} must be YYYY-MM-DDTHH:MM:SSZ")
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def _count(value: object, name: str, *, minimum: int = 0) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise ReceiptError(f"{name} must be an integer of at least {minimum}")
+    return value
+
+
+def _hex64(value: object, name: str) -> str:
+    if not isinstance(value, str) or _HEX64.fullmatch(value) is None:
+        raise ReceiptError(f"{name} must be 64 lowercase hex characters")
+    return value
+
+
+def make_body(
+    *,
+    netuid: int,
+    round: int,
+    validator_nonce: str,
+    box_id: str,
+    miner_hotkey: str,
+    kind: str,
+    hardware_id: str,
+    hardware_id_kind: str,
+    vcpus: int,
+    memory_gib: int,
+    challenge: ChallengeSpec,
+    result_digest: bytes,
+    sample_nonce: bytes,
+    sampled_outputs: Mapping[int, bytes],
+    deadline_ms: int,
+    timings_ms: Mapping[str, int],
+    issued_at: datetime,
+    valid_for: timedelta,
+    prober_key_id: str,
+) -> dict[str, Any]:
+    return {
+        "schema": SCHEMA,
+        "netuid": netuid,
+        "round": round,
+        "validator_nonce": validator_nonce,
+        "box": {
+            "box_id": box_id,
+            "miner_hotkey": miner_hotkey,
+            "kind": kind,
+            "hardware_id": hardware_id,
+            "hardware_id_kind": hardware_id_kind,
+        },
+        "capacity": {"vcpus": vcpus, "memory_gib": memory_gib},
+        "challenge": {
+            **challenge.to_json(),
+            "result_digest": result_digest.hex(),
+            "sample_nonce": sample_nonce.hex(),
+            "sampled_outputs": {str(k): v.hex() for k, v in sorted(sampled_outputs.items())},
+            "deadline_ms": deadline_ms,
+        },
+        "timings_ms": dict(timings_ms),
+        "issued_at": _iso(issued_at),
+        "expires_at": _iso(issued_at + valid_for),
+        "prober_key_id": prober_key_id,
+    }
+
+
+def sign_receipt(body: Mapping[str, Any], private_key: Ed25519PrivateKey) -> dict[str, Any]:
+    """The prober's side: sign a body (checked first, so it never signs junk)."""
+
+    if "signature" in body:
+        raise ReceiptError("body already carries a signature")
+    _check_body(body)
+    signature = private_key.sign(canonical_bytes(body))
+    return {**body, "signature": base64.b64encode(signature).decode()}
+
+
+def verify_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    prober_keys: Mapping[str, Ed25519PublicKey],
+    netuid: int,
+    validator_nonce: str,
+    now: datetime,
+    expected_round: int | None = None,
+) -> VerifiedReceipt:
+    """A validator's side: signature, audience, freshness and shape, or raise.
+    Pass ``expected_round`` to refuse a receipt from another round."""
+
+    if not isinstance(receipt, Mapping) or "signature" not in receipt:
+        raise ReceiptError("receipt is not a signed object")
+    body = {key: value for key, value in receipt.items() if key != "signature"}
+    parsed = _check_body(body)
+    key = prober_keys.get(body["prober_key_id"])
+    if key is None:
+        raise ReceiptError("receipt is signed by an unknown prober key")
+    try:
+        signature = base64.b64decode(receipt["signature"], validate=True)
+        key.verify(signature, canonical_bytes(body))
+    except (InvalidSignature, binascii.Error, TypeError, ValueError) as exc:
+        raise ReceiptError("receipt signature does not verify") from exc
+    if body["netuid"] != netuid:
+        raise ReceiptError("receipt is for another netuid")
+    if body["validator_nonce"] != validator_nonce:
+        raise ReceiptError("receipt answers another validator's nonce")
+    if expected_round is not None and parsed.round != expected_round:
+        raise ReceiptError("receipt is from another round")
+    expires_at = _parse_time(body["expires_at"], "expires_at")
+    if not parsed.issued_at - CLOCK_SKEW <= now < expires_at:
+        raise ReceiptError("receipt is not currently valid")
+    return parsed
+
+
+def _check_body(body: Mapping[str, Any]) -> VerifiedReceipt:
+    if set(body) != _BODY_KEYS or body.get("schema") != SCHEMA:
+        raise ReceiptError("receipt body has the wrong fields or schema")
+    _count(body["netuid"], "netuid")
+    round_ = _count(body["round"], "round")
+    _hex64(body["validator_nonce"], "validator_nonce")
+    if (
+        not isinstance(body["prober_key_id"], str)
+        or _KEY_ID.fullmatch(body["prober_key_id"]) is None
+    ):
+        raise ReceiptError("prober_key_id is malformed")
+
+    box = body["box"]
+    if not isinstance(box, Mapping) or set(box) != _BOX_KEYS:
+        raise ReceiptError(f"box must have exactly {sorted(_BOX_KEYS)}")
+    if not isinstance(box["box_id"], str) or _BOX_ID.fullmatch(box["box_id"]) is None:
+        raise ReceiptError("box_id is malformed")
+    if not isinstance(box["miner_hotkey"], str) or _SS58.fullmatch(box["miner_hotkey"]) is None:
+        raise ReceiptError("miner_hotkey is not an SS58 address")
+    if box["kind"] not in BOX_KINDS:
+        raise ReceiptError("box kind must be tee or bare_metal")
+    if box["hardware_id_kind"] not in HARDWARE_ID_KINDS[box["kind"]]:
+        raise ReceiptError(
+            "hardware_id_kind must be ppid or chip_id for a tee box, probe_fingerprint for bare metal"
+        )
+    hardware_id = _hex64(box["hardware_id"], "hardware_id")
+
+    capacity = body["capacity"]
+    if not isinstance(capacity, Mapping) or set(capacity) != {"vcpus", "memory_gib"}:
+        raise ReceiptError("capacity must have vcpus and memory_gib")
+    vcpus = _count(capacity["vcpus"], "vcpus", minimum=1)
+    memory_gib = _count(capacity["memory_gib"], "memory_gib", minimum=1)
+
+    challenge = body["challenge"]
+    if not isinstance(challenge, Mapping) or set(challenge) != _CHALLENGE_KEYS:
+        raise ReceiptError(f"challenge must have exactly {sorted(_CHALLENGE_KEYS)}")
+    try:
+        spec = ChallengeSpec.from_json(
+            {name: challenge[name] for name in ("seed", "lanes", "blocks", "steps")}
+        )
+        expected = spec_for(spec.seed, vcpus=vcpus, memory_gib=memory_gib)
+    except ChallengeError as exc:
+        raise ReceiptError(f"challenge: {exc}") from exc
+    if spec != expected:
+        raise ReceiptError("the challenge does not prove the capacity the receipt pays for")
+    digest = bytes.fromhex(_hex64(challenge["result_digest"], "result_digest"))
+    sample_nonce = bytes.fromhex(_hex64(challenge["sample_nonce"], "sample_nonce"))
+    sampled = challenge["sampled_outputs"]
+    if not isinstance(sampled, Mapping):
+        raise ReceiptError("sampled_outputs must be an object")
+    outputs: dict[int, bytes] = {}
+    for lane, value in sampled.items():
+        if not isinstance(lane, str) or _LANE.fullmatch(lane) is None:
+            raise ReceiptError("sampled lane keys must be plain decimal lane numbers")
+        outputs[int(lane)] = bytes.fromhex(_hex64(value, "sampled output"))
+    wanted = sample_lanes(spec, digest, sample_nonce, MIN_SAMPLES)
+    if sorted(outputs) != wanted:
+        raise ReceiptError("sampled_outputs must be exactly the lanes the sample nonce picks")
+    deadline_ms = _count(challenge["deadline_ms"], "deadline_ms", minimum=1)
+
+    timings = body["timings_ms"]
+    if not isinstance(timings, Mapping) or set(timings) != {"create", "exec", "delete"}:
+        raise ReceiptError("timings_ms must have create, exec and delete")
+    for name, value in timings.items():
+        _count(value, f"timings_ms.{name}")
+    if timings["exec"] > deadline_ms:
+        raise ReceiptError("the challenge finished after its deadline")
+
+    issued_at = _parse_time(body["issued_at"], "issued_at")
+    expires_at = _parse_time(body["expires_at"], "expires_at")
+    if not issued_at < expires_at <= issued_at + MAX_VALIDITY:
+        raise ReceiptError("receipt validity must be positive and at most 2 hours")
+    return VerifiedReceipt(
+        box_id=box["box_id"],
+        miner_hotkey=box["miner_hotkey"],
+        kind=box["kind"],
+        hardware_id=hardware_id,
+        hardware_id_kind=box["hardware_id_kind"],
+        vcpus=vcpus,
+        memory_gib=memory_gib,
+        challenge=spec,
+        result_digest=digest,
+        sample_nonce=sample_nonce,
+        sampled_outputs=outputs,
+        deadline_ms=deadline_ms,
+        timings_ms=dict(timings),
+        round=round_,
+        issued_at=issued_at,
+    )
