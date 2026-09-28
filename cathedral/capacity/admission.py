@@ -172,6 +172,8 @@ def parse_policy(raw: bytes) -> MeasurementPolicy:
     # ValueError json.loads raises for an integer past Python's digit limit.
     try:
         document = json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_object)
+    except AdmissionError:
+        raise  # a repeated key, with its own message (AdmissionError is a ValueError)
     except (ValueError, RecursionError) as exc:
         raise AdmissionError("measurement policy is not strict UTF-8 JSON") from exc
     if not isinstance(document, dict) or set(document) != _POLICY_KEYS:

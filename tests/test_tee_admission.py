@@ -621,3 +621,12 @@ def test_admission_takes_no_netuid():
     # Nothing about admission is subnet specific: no netuid parameter to vary.
     assert not any("netuid" in name for name in inspect.signature(adm.admit).parameters)
     assert not any("netuid" in f.name for f in dataclasses.fields(adm.Admission))
+
+
+def test_a_repeated_policy_key_keeps_its_own_message():
+    raw = (
+        b'{"schema":"cathedral_tdx_measurement_policy_v1","mode":"shadow",'
+        b'"mode":"enforce","allowed_measurements":[]}'
+    )
+    with pytest.raises(adm.AdmissionError, match="repeats a JSON key"):
+        adm.parse_policy(raw)
