@@ -319,6 +319,10 @@ _BAD_POLICIES = {
     "empty": "",
     "deep": "[" * 60000 + "]" * 60000,
     "deep_object": '{"a":' * 20000 + "1" + "}" * 20000,
+    # past Python's 4300-digit int limit: json.loads raises a plain ValueError
+    "huge_int_entry": '{"schema":"%s","mode":"shadow","allowed_measurements":[%s]}'
+    % (TDX_SCHEMA, "1" * 5000),
+    "huge_int": "1" * 5000,
 }
 
 
