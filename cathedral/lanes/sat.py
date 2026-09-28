@@ -55,19 +55,25 @@ def _compute_challenge_id(instance: SatInstance, seed: int) -> str:
     return h.hexdigest()
 
 
-def derived_work_units(item: SatWorkItem) -> float:
-    """``sat_work_units_v1``: the ONLY work-unit derivation, computed purely
-    from committed work-item bytes — never from a signer or miner claim.
+def derived_work_units_for(instance: SatInstance, seed: int) -> float:
+    """``sat_work_units_v1`` for raw instance bytes, computed purely from
+    committed input — never from a signer or miner claim.
 
-    An item whose instance is EXACTLY the canonical derivation from its own
-    seed is validator-derived audit work worth its clause count; anything
-    else is a bounded customer job worth the fixed CUSTOMER_SAT_WORK_UNITS.
-    Both the producer and the independent replayer call this same function,
-    so a receipt the producer signs is exactly what a full validator
-    re-derives."""
-    if item.instance == _canonical_instance(item.seed):
-        return float(len(item.instance.clauses))
+    An instance that is EXACTLY the canonical derivation from its own seed is
+    validator-derived audit work worth its clause count; anything else is a
+    bounded customer job worth the fixed CUSTOMER_SAT_WORK_UNITS.
+
+    :func:`derived_work_units` delegates here. Every producer and consumer
+    routes through this rule: the worker wire response, the client
+    certificate, the mock miner, the lane, and the customer ledger."""
+    if instance == _canonical_instance(seed):
+        return float(len(instance.clauses))
     return CUSTOMER_SAT_WORK_UNITS
+
+
+def derived_work_units(item: SatWorkItem) -> float:
+    """Work units for a committed item. See :func:`derived_work_units_for`."""
+    return derived_work_units_for(item.instance, item.seed)
 
 
 def validate_sat_instance(instance: SatInstance) -> None:
