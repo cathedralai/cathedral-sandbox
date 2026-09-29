@@ -7,8 +7,9 @@ SAT admission lane, staged with the published SN94 image pins.
 
 ## Implemented contract
 
-`cathedral/delivery.py` is the source of `cathedral-delivery`, a standalone
-package under `packages/delivery-contract`. The validator pins that distribution
+`packages/delivery-contract/cathedral_delivery/__init__.py` is the canonical
+source of `cathedral-delivery`. `cathedral/delivery.py` re-exports it for the
+existing CLI; both wheels include that same source. The validator pins that distribution
 by immutable commit without replacing its existing SNP verifier dependency.
 
 A receipt has one canonical body and two Ed25519 signatures. The body binds the
