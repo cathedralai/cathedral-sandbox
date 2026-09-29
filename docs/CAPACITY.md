@@ -21,27 +21,28 @@ One lane per claimed vCPU, together holding 80% of the claimed memory. Each lane
 scrypt-like over SHA-256: fill `blocks` 32-byte blocks, then take two data-dependent reads per
 block, writing each back. What this proves today is narrower than "the box has these cores and
 this memory": the sampled lanes were computed correctly, and the deadline keeps a vCPU claim
-within about 2.5 times (up to 2.9 at the smallest lane) what the box's cores can compute at the
-measured native speed (see Timing and "What a receipt proves today").
+within about 4 times (up to 4.6 at the smallest lane) what the box's cores can compute at the
+fastest measured native speed, huge pages included (see Timing and "What a receipt proves
+today").
 
 Commit, then sample:
 
 1. the prober sends `spec_for(seed, vcpus=, memory_gib=)` with a fresh seed. The parameters
    are fixed by the protocol, and a claim the challenge cannot prove (over 1024 vCPUs, over
    10 GiB per vCPU, or under 0.625 GiB per vCPU, the 512 MiB lane floor) is refused, not proven
-   in part (`challenge.py:127-148`);
+   in part (`challenge.py:131-152`);
 2. the box returns every lane's output, computed by a native worker (the pure-Python
    `python -m cathedral.capacity.challenge` is the reference and a checker only: it cannot meet
    the deadline, see Cost), which commits it: `result_digest`;
 3. only then does the prober draw a fresh 32-byte nonce and recompute the `sample_count` lanes
-   `sample_lanes(spec, digest, nonce, sample_count)` picks (`verify`, `challenge.py:251-265`).
+   `sample_lanes(spec, digest, nonce, sample_count)` picks (`verify`, `challenge.py:255-269`).
    Since the nonce comes after the commitment, a box cannot steer the sample onto the lanes it
    computed honestly.
 
 ### How many lanes are sampled
 
 `sample_count` must be at least `required_samples(lanes) = min(lanes, max(4, ceil(lanes / 2)))`
-(`challenge.py:168-174`) and at most `lanes`. So a box of 4 vCPUs or fewer has **every** lane
+(`challenge.py:172-178`) and at most `lanes`. So a box of 4 vCPUs or fewer has **every** lane
 recomputed (not "at least 4": a 2-vCPU box has 2 lanes, both checked), a box of 5 to 8 vCPUs has
 4, and a larger box at least half. The prober may sample more, up to every lane; the receipt
 records the count it used.
@@ -82,8 +83,8 @@ The library cannot enforce the order of events:
 - one attempt per seed, and a capped number of attempts per box per round; a retry with the
   same seed and a new nonce gives a dishonest box another chance;
 - probe a memory-heavy box (over 10 GiB per vCPU) at `provable_memory_gib(vcpus, memory_gib)`
-  (`challenge.py:151-156`), and a CPU-heavy box (under 0.625 GiB per vCPU) at
-  `provable_vcpus(vcpus, memory_gib)` (`challenge.py:159-165`); that is also what it is paid
+  (`challenge.py:155-160`), and a CPU-heavy box (under 0.625 GiB per vCPU) at
+  `provable_vcpus(vcpus, memory_gib)` (`challenge.py:163-169`); that is also what it is paid
   for;
 - probe boxes that may share a host **at the same time** (see Hardware identity);
 - the lanes hold 80% of the claimed memory; watch shadow mode for honest boxes failing for
@@ -92,7 +93,7 @@ The library cannot enforce the order of events:
 ### Timing
 
 `deadline_ms` must be at least 1 and at most `max_deadline_ms(spec) = 5 000 +
-ceil(steps × 1 000 ns / 1e6)` (`challenge.py:177-185`, constants `challenge.py:59-76`,
+ceil(steps × 1 000 ns / 1e6)` (`challenge.py:181-189`, constants `challenge.py:59-80`,
 enforced at `receipt.py:405-407`), and the exec time must fit it (`receipt.py:414-415`). So the
 bound is on `exec` alone; creating the sandbox is timed separately (`timings_ms.create`). Lanes
 are meant to run in parallel, so it follows one lane's `steps`:
@@ -100,12 +101,28 @@ are meant to run in parallel, so it follows one lane's `steps`:
 - **startup allowance, 5 s** (`DEADLINE_STARTUP_MS`): the exec round trip, starting the native
   worker and first-touching the lane memory, each about a second or less. It adds 15% to the
   smallest lane's 34 s per-step budget.
-- **per-step budget, 1 µs** (`DEADLINE_NS_PER_STEP`), 2.5 times the measured native speed.
-  `ASSUMED_NATIVE_NS_PER_STEP = 400` comes from a plain C lane over OpenSSL's SHA-256 (the same
-  function, fill included, 4 KiB pages) on one EPYC 9354P development VM with 4 cores: about
-  0.38 µs per step on one core, 0.40 to 0.46 µs with all four busy, on 512 MiB lanes. This is
-  **one measurement on one VM**, not a calibration. An 8 vCPU, 16 GiB box computes its challenge
-  in about 43 s against a 112 s bound; an 8 vCPU, 32 GiB box has about 3.7 minutes.
+- **per-step budget, 1 µs** (`DEADLINE_NS_PER_STEP`), 4 times the assumed native speed.
+  `ASSUMED_NATIVE_NS_PER_STEP = 250` is the fastest native lane measured, rounded down. The
+  box picks its own page size, and a cheater would use huge pages from day one, so the bound
+  assumes them. Measured with a plain C lane over OpenSSL's SHA-256 (the same function, checked
+  byte for byte against `lane_output`, fill included), pinned to one core of a 4-core EPYC 9354P
+  development VM, in CPU time:
+
+  | lane | pages | µs per step |
+  |---|---|---|
+  | 256 or 512 MiB | 4 KiB | 0.38 to 0.41 |
+  | 256 MiB | 2 MiB, the whole lane (`madvise(MADV_HUGEPAGE)`) | 0.29 to 0.32 |
+  | 512 MiB | 2 MiB, about half the lane (the host's free memory was too fragmented for more) | 0.38 to 0.41 |
+
+  On that VM huge pages gain about 1.3 times. A reviewer's run of the same C lane on a shared
+  12-core EPYC VM gained 2.8 to 2.9 times (0.97 to 1.19 µs per step with 4 KiB pages, 0.35 to
+  0.41 µs with huge pages, on a 512 MiB lane). 1 GiB pages could not be tested: the VM has no
+  hugetlb pool, and making one needs root. So 0.25 µs is taken, about 15% below the fastest
+  0.29 µs anyone measured, to cover 1 GiB pages and run-to-run spread. These are
+  **measurements on two VMs**, not a calibration. An honest native worker should put its lanes
+  on huge pages too, which costs it nothing. An 8 vCPU, 16 GiB box computes its challenge in
+  about 27 s at the assumed speed (43 s with 4 KiB pages) against a 112 s bound; an 8 vCPU,
+  32 GiB box has about 3.7 minutes.
 - **lane floor, 512 MiB** (`MIN_LANE_BYTES`, `challenge.py:54-58`): `spec_for` refuses a
   claim of less than 0.625 GiB per vCPU. Without it, many vCPUs over little memory make lanes so
   short that the bound is almost all startup allowance. The SN120 profile shapes of 1 vCPU x
@@ -126,22 +143,22 @@ are signed (`test_the_reviewers_inflated_receipt_is_refused`,
 
 **Residual inflation factor.** A box with `C` cores computing `V > C` lanes takes `V / C` times
 as long as one lane, so it meets the bound only while `V / C` is at most the per-step budget over
-the native per-step time: 1 µs / 0.4 µs = 2.5 for large lanes, up to about 2.9 at the lane
+the native per-step time: 1 µs / 0.25 µs = 4 for large lanes, up to about 4.6 at the lane
 floor, where the startup allowance counts most (checked by brute force in
 `test_a_vcpu_claim_inflates_at_most_the_documented_factor`). That is down from 128 times, but
-it is not 1, and it holds only for workers no faster than the measured C lane: a faster worker
-(huge pages, a tighter SHA-256, a faster CPU) raises it in proportion.
+it is not 1, and it holds only for workers no faster than the assumed 0.25 µs per step: huge
+pages are already counted, but a tighter SHA-256 or a faster CPU raises it in proportion.
 **Validator #257 must stay shadow-only, and must not let receipts affect weights, until the
 per-step budget is calibrated on native workers across real CPUs** and set just above the
 fastest honest one.
 
 **What a receipt proves today.** The sample proves the lanes were computed correctly for the
-claimed shape. The deadline proves the box computed them at no less than about 1 / 2.5 (1 / 2.9
+claimed shape. The deadline proves the box computed them at no less than about 1 / 4 (1 / 4.6
 at the lane floor) of the claimed vCPUs' native throughput, and so held at least about that
 fraction of the lane memory at once (a box with `C` cores needs only `C` lanes in memory at a
 time). It does not prove the exact core count or the total memory: one core short of the claim
-is invisible to timing (see How many lanes are sampled), and both bounds rest on one VM's
-native-speed measurement. Treat a receipt as evidence that the box computed the challenge for
+is invisible to timing (see How many lanes are sampled), and both bounds rest on native-speed
+measurements from two VMs. Treat a receipt as evidence that the box computed the challenge for
 the claimed shape within that factor, not as proof that it has that many cores or that much
 memory.
 
@@ -272,6 +289,14 @@ refused (`pricing.py:242-247`). A validator passes an explicit `pinned_digest=No
 very first load, when it has verified no table yet; after that it keeps the sequence and digest
 of every table it accepts and passes both. Omitting the keyword is a `TypeError`, so the
 same-sequence check is never skipped by accident.
+
+**Merge order with cathedral-validator.** Validator #257 still calls
+`load_price_table(document["price_table"], owner_keys=, now=)` without `minimum_sequence` and
+`pinned_digest`. Against this library that raises `TypeError`, which its
+`except pricing.PriceTableError` does not catch, and its test still uses
+`hardware_id_kind="ppid"`, which is refused now (TDX is `tdx_platform`). Validator #265, stacked
+on it, passes both keywords and uses `tdx_platform`, so #257 must not land without #265's
+changes.
 
 ## Not here yet
 

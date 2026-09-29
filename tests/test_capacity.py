@@ -128,8 +128,8 @@ def test_the_deadline_bound_follows_the_spec():
 
 
 def _native_exec_ms(spec, cores):
-    # The exec time of the measured native worker (ASSUMED_NATIVE_NS_PER_STEP,
-    # fill included) on ``cores`` cores, lanes time-sliced over the cores and
+    # The exec time of the fastest native worker assumed (ASSUMED_NATIVE_NS_PER_STEP,
+    # huge pages, fill included) on ``cores`` cores, lanes time-sliced over the cores and
     # never faster than one lane alone. Startup is left out, in the box's favour.
     lane_ms = spec.steps * ch.ASSUMED_NATIVE_NS_PER_STEP / 1_000_000
     return lane_ms * max(1, spec.lanes / cores)
@@ -139,15 +139,16 @@ def test_the_reviewers_inflated_vcpu_claims_no_longer_fit():
     # Round 2: 8 cores claiming 1024 vCPUs over 16 GiB fitted a 124 s cap.
     # Re-review: 4 cores ran all 20 lanes of a 20 vCPU / 13 GiB claim in 77.2 s
     # under a 79.8 s cap. The first is refused by the lane floor; the second
-    # needs about 70 s at the measured speed against a 39.9 s bound now.
+    # needs about 44 s even at the fastest assumed speed (huge pages) against a
+    # 39.9 s bound now.
     honest = ch.spec_for(SEED, vcpus=8, memory_gib=16)
-    assert 42_000 < _native_exec_ms(honest, 8) < 44_000
-    assert ch.max_deadline_ms(honest) > 2.5 * _native_exec_ms(honest, 8)  # honest fits
+    assert 26_000 < _native_exec_ms(honest, 8) < 28_000  # about 43 s with 4 KiB pages
+    assert ch.max_deadline_ms(honest) > 4 * _native_exec_ms(honest, 8)  # honest fits
     with pytest.raises(ch.ChallengeError, match="512 MiB of lane"):
         ch.spec_for(SEED, vcpus=1024, memory_gib=16)
     twenty = ch.spec_for(SEED, vcpus=20, memory_gib=13)
     assert ch.max_deadline_ms(twenty) == 39_897  # was 79 794
-    assert _native_exec_ms(twenty, 4) > 1.7 * ch.max_deadline_ms(twenty)
+    assert _native_exec_ms(twenty, 4) > 1.09 * ch.max_deadline_ms(twenty)
     assert 77_200 > ch.max_deadline_ms(twenty)
 
 
@@ -155,9 +156,9 @@ def test_the_reviewers_inflated_vcpu_claims_no_longer_fit():
     "cores, memory_gib", [(4, 13), (8, 16), (8, 64), (16, 64), (32, 128), (8, 5)]
 )
 def test_a_vcpu_claim_inflates_at_most_the_documented_factor(cores, memory_gib):
-    # docs/CAPACITY.md, Timing: at the measured native speed a box meets the
-    # deadline only while it claims at most about 2.5 times its cores (up to
-    # 2.9 at the smallest lane).
+    # docs/CAPACITY.md, Timing: at the fastest assumed native speed (huge
+    # pages) a box meets the deadline only while it claims at most about 4
+    # times its cores (up to 4.6 at the smallest lane).
     fitting = [
         vcpus
         for vcpus in range(cores, min(ch.MAX_LANES, memory_gib * 2) + 1)
@@ -167,18 +168,21 @@ def test_a_vcpu_claim_inflates_at_most_the_documented_factor(cores, memory_gib):
     ]
     assert fitting[0] == cores  # the honest claim fits
     assert fitting == list(range(cores, fitting[-1] + 1))
-    assert fitting[-1] <= 2.9 * cores
-    if ch.provable_vcpus(ch.MAX_LANES, memory_gib) >= 2.5 * cores:
-        assert fitting[-1] >= 2.4 * cores  # the factor is real, not a bound that fits nobody
+    assert fitting[-1] <= 4.6 * cores
+    if ch.provable_vcpus(ch.MAX_LANES, memory_gib) >= 4 * cores:
+        assert fitting[-1] >= 3.9 * cores  # the factor is real, not a bound that fits nobody
 
 
 def test_the_residual_inflation_factor_matches_the_constants():
-    assert ch.DEADLINE_NS_PER_STEP / ch.ASSUMED_NATIVE_NS_PER_STEP == 2.5
+    # The fastest native lane measured was 0.29 us per step (2 MiB pages); the
+    # assumption must stay at or below it (docs/CAPACITY.md, Timing).
+    assert ch.ASSUMED_NATIVE_NS_PER_STEP <= 290
+    assert ch.DEADLINE_NS_PER_STEP / ch.ASSUMED_NATIVE_NS_PER_STEP == 4
     smallest = ch.ChallengeSpec(SEED, 1, ch.MIN_LANE_BYTES // 32, ch.MIN_LANE_BYTES // 16)
     budget = ch.max_deadline_ms(smallest) - ch.DEADLINE_STARTUP_MS
     assert 33_500 < budget < 33_600
     assert 0.14 < ch.DEADLINE_STARTUP_MS / budget < 0.15
-    assert 2.8 < ch.max_deadline_ms(smallest) / _native_exec_ms(smallest, 1) < 2.9
+    assert 4.5 < ch.max_deadline_ms(smallest) / _native_exec_ms(smallest, 1) < 4.6
 
 
 def test_the_sample_is_recomputable_from_the_receipt_fields():
@@ -512,7 +516,7 @@ def test_the_reviewers_inflated_receipt_is_refused(prober):
             _verify(_sign_unchecked(body, key), keys)
         with pytest.raises(receipt.ReceiptError, match=message):
             receipt.sign_receipt(body, key)
-    # Honest 8 vCPUs over 16 GiB: about 43 s against a 112 375 ms bound.
+    # Honest 8 vCPUs over 16 GiB: about 43 s with 4 KiB pages against a 112 375 ms bound.
     timings = {"create": 900, "exec": 43_000, "delete": 300}
     honest = _body(vcpus=8, memory_gib=16, deadline_ms=112_375, timings_ms=timings)
     assert _verify(_sign_unchecked(honest, key), keys).vcpus == 8
@@ -762,6 +766,29 @@ def test_one_host_on_many_ports_is_one_bare_metal_box():
     ids = {receipt.probe_fingerprint(address) for address in ("203.0.113.5",) * 8}
     ids |= {receipt.probe_fingerprint(f"2001:db8:1:2::{n:x}") for n in range(1, 9)}
     assert len(ids) == 2
+
+
+def test_hardware_ids_match_the_known_answers():
+    # Fixed vectors: the prober, the validator-side inventory and any native
+    # port must derive these bytes exactly, so a change to the padding, the
+    # family tag, the /64 cut or the domain shows up here, not only as ids that
+    # still agree with each other.
+    assert receipt.probe_fingerprint("203.0.113.5") == (
+        "f8e8cfdfcc7a80073883ce2ad4bb00bbcaa3724911c618459ec0355d7c596356"
+    )
+    assert receipt.probe_fingerprint("2001:db8:1:2::1") == (
+        "7c8ed29056ca4f59ee68662fa1c6f64685064c8cce7d5023dbf88f500961c5f2"
+    )
+    stable = _stable_platform_id("0123456789abcdef0123456789abcdef")
+    assert stable == (
+        "tdx-platform-sha256:1bfd8131b4b52971d146d568b956f4528b9dd299351f72671b246c2445e6c05c"
+    )
+    assert receipt.tdx_hardware_id(stable) == (
+        "3452cf9d0d342e3f9352d44824cdd57fd282ea0796b468d12f47dd74d4e28f58"
+    )
+    assert receipt.derive_hardware_id("chip_id", bytes(range(1, 65))) == (
+        "dddae87349494831c2da7fb46f557eae10d414efa70460f7289f64a745f20834"
+    )
 
 
 # -- pricing -----------------------------------------------------------------------

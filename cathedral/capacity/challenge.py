@@ -5,10 +5,10 @@ memory-hard hash chain ("lane") per claimed vCPU, together holding 80% of the
 claimed memory, answered within a deadline the prober sets. What that proves
 today (docs/CAPACITY.md, "What a receipt proves today"): the sampled lanes were
 computed correctly for the claimed shape, and the deadline, which follows one
-lane's work, keeps a box from claiming more than about 2.5 times (up to 2.9 at
-the smallest lane) the vCPUs its cores can compute at the measured native
-speed. It does not prove the exact core count, nor that all the memory was
-held at once.
+lane's work, keeps a box from claiming more than about 4 times (up to 4.6 at
+the smallest lane) the vCPUs its cores can compute at the fastest measured
+native speed (huge pages included). It does not prove the exact core count, nor
+that all the memory was held at once.
 
 Protocol (commit, then sample):
 
@@ -62,18 +62,22 @@ MIN_LANE_BYTES = 512 << 20
 #   first-touching the lane memory, each about a second or less. 5 s covers them
 #   several times over, and adds 15% to the 34 s per-step budget of the smallest
 #   lane;
-# - a per-step budget. ASSUMED_NATIVE_NS_PER_STEP is a plain C lane over
-#   OpenSSL's SHA-256 (the fill included, 4 KiB pages) measured on one EPYC
-#   9354P VM core: 0.38 us per step alone, 0.40 to 0.46 us with all four cores
-#   busy. 1 us per step is 2.5 times 0.4 us, headroom for slower cores and
-#   noisy hosts.
+# - a per-step budget. ASSUMED_NATIVE_NS_PER_STEP is the fastest native lane
+#   measured, rounded down: a plain C lane over OpenSSL's SHA-256 (the fill
+#   included), one pinned EPYC 9354P VM core, CPU time. With 4 KiB pages it took
+#   0.38 to 0.41 us per step on 256 and 512 MiB lanes; with the lane fully on
+#   2 MiB pages (madvise(MADV_HUGEPAGE)) 0.29 to 0.32 us on a 256 MiB lane. The
+#   box picks its own page size, so the bound assumes huge pages. 1 GiB pages
+#   could not be tested there (no hugetlb pool), and another VM saw huge pages
+#   run 2.8 times faster than 4 KiB ones, so 0.25 us is taken, below the fastest
+#   0.29 us. 1 us per step is 4 times that.
 # Because a box with fewer cores than lanes needs lanes / cores times as long,
 # the budget over the native per-step time is also how far a vCPU claim can be
-# inflated: about 2.5, up to 2.9 at the smallest lane. One VM's measurement, to
-# be calibrated across real CPUs (docs/CAPACITY.md, Timing).
+# inflated: about 4, up to 4.6 at the smallest lane. Measurements on two VMs,
+# to be calibrated across real CPUs (docs/CAPACITY.md, Timing).
 DEADLINE_STARTUP_MS = 5_000
 DEADLINE_NS_PER_STEP = 1_000
-ASSUMED_NATIVE_NS_PER_STEP = 400
+ASSUMED_NATIVE_NS_PER_STEP = 250
 
 
 class ChallengeError(ValueError):
