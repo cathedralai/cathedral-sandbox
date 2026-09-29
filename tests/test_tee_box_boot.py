@@ -229,7 +229,8 @@ def test_needs_relaunch_is_reported_with_the_boot_and_the_release(box):
     assert _lease(api)[0] == 200
     again = _boot_view(api)
     assert again["needs_relaunch"] is False
-    assert again["last_released_at"] == math.ceil(released_at)
+    # A live lease again: the earlier release no longer describes the box.
+    assert again["last_released_at"] is None
 
 
 def test_an_expired_lease_records_the_release(box):
@@ -412,3 +413,51 @@ def test_the_create_path_under_the_lease_lock_refuses_the_same_way(box):
             api.lease.require_locked(OTHER)
     with pytest.raises(RelaunchRequired):
         api.lease.require(OTHER)
+
+
+def test_a_restart_after_a_same_customer_re_lease_reports_the_later_release(box, tmp_path: Path):
+    # The review's sequence: lease, release, the same caller leases again, and
+    # the worker restarts during that second lease.
+    api, _fake, clock, boot_ids, marker = box
+    assert _lease(api)[0] == 200
+    clock.value += 10
+    first_release = clock.value
+    assert _handle(api, "DELETE", "/v1/lease")[0] == 200
+    clock.value += 100
+    assert _lease(api)[0] == 200
+    assert json.loads(marker.read_bytes())["released_at"] is None
+    assert _boot_view(api)["last_released_at"] is None
+    clock.value += 500
+    restarted = _restart(tmp_path, clock, boot_ids, marker)
+    reported = _boot_view(restarted, OTHER)["last_released_at"]
+    assert reported == math.ceil(clock.value) and reported > math.ceil(first_release)
+
+
+def test_a_re_lease_whose_record_cannot_be_written_is_refused(box):
+    api, _fake, clock, _boot_ids, marker = box
+    assert _lease(api)[0] == 200
+    assert _handle(api, "DELETE", "/v1/lease")[0] == 200
+    released_at = json.loads(marker.read_bytes())["released_at"]
+    marker.unlink()
+    marker.mkdir()  # os.replace onto a directory fails
+    clock.value += 5
+    status, body = _lease(api)
+    assert (status, body["reason"]) == (503, "boot_record_unavailable")
+    assert api.lease.current() is None
+    assert api.boot.record.released_at == released_at
+    marker.rmdir()
+    assert _lease(api)[0] == 200
+
+
+def test_a_release_whose_record_cannot_be_written_needs_a_relaunch(box):
+    api, _fake, clock, _boot_ids, marker = box
+    assert _lease(api)[0] == 200
+    marker.unlink()
+    marker.mkdir()
+    clock.value += 3
+    assert _handle(api, "DELETE", "/v1/lease")[0] == 200
+    # Fail closed: not even the same customer, until the next boot.
+    assert _relaunch_required(api, CALLER) and _relaunch_required(api, OTHER)
+    view = _boot_view(api)
+    assert view["needs_relaunch"] is True
+    assert view["last_released_at"] == math.ceil(clock.value)

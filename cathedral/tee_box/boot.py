@@ -162,7 +162,7 @@ class BootGuard:
             self._record = BootRecord(
                 boot_id, self._record.consumed_by, self._record.consumed_at, self._clock()
             )
-            self._store_quietly()
+            self._store_or_close()
 
     # -- readers -----------------------------------------------------------
 
@@ -237,11 +237,21 @@ class BootGuard:
             os.close(fd)
         os.replace(temporary, self.marker_path)
 
-    def _store_quietly(self) -> None:
+    def _store_or_close(self) -> None:
+        """Store the record; if that fails, refuse every caller until the next boot.
+
+        A record on tmpfs that disagrees with memory would mislead the next
+        worker of this boot (a stale release time, or a live lease it cannot
+        see), so a failed write closes the box instead.
+        """
+
         try:
             self._store()
         except OSError:
-            pass
+            record = self._record
+            self._record = BootRecord(
+                record.boot_id, UNKNOWN_CONSUMER, record.consumed_at, record.released_at
+            )
 
     def _current(self) -> BootRecord | None:
         """The record for the running boot, or None when the boot id is unreadable."""
@@ -274,13 +284,18 @@ class BootGuard:
 
         The record is written before the lease is granted; if the write
         fails, :class:`BootError` is raised and the lease must not be granted.
+        The same customer leasing again clears the last release time, so a
+        worker restarted during that lease does not report the earlier one.
         """
 
         self.check(caller)
-        if self._record.consumed_by is not None:
-            return
         previous = self._record
-        self._record = BootRecord(previous.boot_id, caller, now, None)
+        if previous.consumed_by is not None:
+            if previous.released_at is None:
+                return
+            self._record = BootRecord(previous.boot_id, caller, previous.consumed_at, None)
+        else:
+            self._record = BootRecord(previous.boot_id, caller, now, None)
         try:
             self._store()
         except OSError as exc:
@@ -294,7 +309,7 @@ class BootGuard:
         if record is None or record.consumed_by is None:
             return
         self._record = BootRecord(record.boot_id, record.consumed_by, record.consumed_at, now)
-        self._store_quietly()
+        self._store_or_close()
 
     # -- reporting -----------------------------------------------------------
 

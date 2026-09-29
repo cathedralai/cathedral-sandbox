@@ -366,13 +366,16 @@ and the control plane.
   read again on every check (`cathedral/tee_box/boot.py:246`), so a file that
   somehow survived a relaunch does not carry over.
 - **Written first.** The customer is recorded (owner-only, written to a
-  temporary file and renamed) before its first lease is granted. If the
-  write fails, the lease is refused with `503` and reason
-  `boot_record_unavailable`, and nothing is recorded
+  temporary file and renamed) before its first lease is granted. When the
+  same customer leases again, the record's release time is cleared, and
+  written, before that lease is granted too. If a write fails, the lease is
+  refused with `503` and reason `boot_record_unavailable`, and nothing
+  changes
   (`cathedral/tee_box/boot.py:272`).
 - **Fails closed.** A record that cannot be read or parsed, or a symlink,
   counts as consumed by an unknown caller: every caller gets
-  `relaunch_required` until the next boot. So does a boot id that can no
+  `relaunch_required` until the next boot. So does a release (or a restart)
+  whose write fails, since the file would then disagree with memory. So does a boot id that can no
   longer be read. The worker refuses to start if the boot id or the boot
   time cannot be read at all.
 - **Restart with a live lease.** A worker that restarts loses its lease
