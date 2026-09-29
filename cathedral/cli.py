@@ -47,6 +47,11 @@ from cathedral.admission_policy import (
 )
 from cathedral.assurance import AssuranceDimension
 from cathedral.attest import collect_snp, collect_snp_report_only, collect_tdx_gpu
+from cathedral.attest.localnet_stub import (
+    collect_localnet_stub_tdx,
+    localnet_stub_requested,
+    require_localnet_stub_context,
+)
 from cathedral.channel import ChannelBindingError, tls_spki_binding
 from cathedral.coldkey_allowlist import (
     DEFAULT_ALLOWLIST_MAX_AGE_SECONDS,
@@ -97,6 +102,7 @@ from cathedral.validator_access import (
     SignedValidatorSnapshotProvider,
     ValidatorAccessState,
     ValidatorRequestAuthorizer,
+    allow_localnet_private_endpoints,
     load_sr25519_verifier,
     preflight_sr25519_verifier,
     reset_request_clock_high_water,
@@ -1406,6 +1412,25 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             "AMD SEV-SNP development evidence cannot use public compatibility modes"
         )
     signed_access_configured = all(value is not None for value in access_values)
+    # Development-only localnet stub evidence. Off unless the operator sets
+    # CATHEDRAL_LOCALNET_STUB_EVIDENCE=1, and then only for the signed
+    # `worker serve` posture on the `local` network. See
+    # cathedral/attest/localnet_stub.py.
+    localnet_stub = localnet_stub_requested()
+    if localnet_stub:
+        localnet_network = getattr(args, "validator_network", DEFAULT_ENROLL_NETWORK)
+        require_localnet_stub_context(
+            posture=posture,
+            network=localnet_network,
+            signed_access=signed_access_configured,
+        )
+        allow_localnet_private_endpoints(network=localnet_network)
+        print(
+            "WARNING: localnet stub evidence is ON. This worker serves stub TDX "
+            "quotes that prove nothing about the machine. Local chain only.",
+            file=sys.stderr,
+            flush=True,
+        )
     if posture == "snp-production" and not signed_access_configured:
         raise ValueError(
             "SNP production requires the complete signed validator-access configuration"
@@ -1591,6 +1616,8 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         )
     elif gpu_composite:
         evidence_collector = collect_tdx_gpu
+    elif localnet_stub:
+        evidence_collector = collect_localnet_stub_tdx
     else:
         evidence_collector = None
     gpu_executor = None
@@ -1655,6 +1682,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
                     "customer_sat": allow_customer_sat,
                     "signed_validator_access": validator_authorizer is not None,
                     "fleet_candidates": fleet_candidates,
+                    "localnet_stub_evidence": localnet_stub,
                 }
             )
         )

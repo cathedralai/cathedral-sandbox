@@ -1685,6 +1685,48 @@ class ValidatorRequestAuthorizer:
         return request.validator_hotkey
 
 
+# Development-only: set once by ``allow_localnet_private_endpoints`` when the
+# worker starts with localnet stub evidence on the ``local`` network. Never set
+# on any other path, so production endpoints stay globally routable only.
+_LOCALNET_PRIVATE_ENDPOINTS = False
+
+
+def allow_localnet_private_endpoints(*, network: str) -> None:
+    """Let a localnet worker advertise a private or loopback IP literal.
+
+    A laptop on a local subtensor chain has no public address. This accepts
+    RFC 1918, CGNAT, and loopback literals, and only after the localnet stub
+    gate (``CATHEDRAL_LOCALNET_STUB_EVIDENCE=1``) passed for the ``local``
+    network. It refuses every other network.
+    """
+
+    from cathedral.attest.localnet_stub import (  # noqa: PLC0415
+        LOCALNET_NETWORK,
+        LocalnetStubRefused,
+        localnet_stub_requested,
+    )
+
+    if network != LOCALNET_NETWORK or not localnet_stub_requested():
+        raise LocalnetStubRefused(
+            "private worker endpoints are allowed only for localnet stub evidence"
+        )
+    global _LOCALNET_PRIVATE_ENDPOINTS
+    _LOCALNET_PRIVATE_ENDPOINTS = True
+
+
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _localnet_private_endpoint(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        _LOCALNET_PRIVATE_ENDPOINTS
+        and isinstance(address, ipaddress.IPv4Address)
+        and (address.is_private or address.is_loopback or address in _CGNAT)
+        and not address.is_unspecified
+        and not address.is_multicast
+    )
+
+
 def validate_public_worker_endpoint(value: object) -> str:
     """Accept one explicit HTTPS endpoint on a globally routable IP literal."""
 
@@ -1717,7 +1759,9 @@ def validate_public_worker_endpoint(value: object) -> str:
         address = ipaddress.ip_address(parsed.hostname or "")
     except ValueError as exc:
         raise ValidatorAccessError("fleet endpoint must use an IP literal") from exc
-    if not is_globally_routable(address) or (
+    if _localnet_private_endpoint(address):
+        pass
+    elif not is_globally_routable(address) or (
         isinstance(address, ipaddress.IPv6Address)
         and (
             address.ipv4_mapped is not None
