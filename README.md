@@ -11,6 +11,10 @@
 This repository contains the Cathedral compute worker, its Intel TDX verifier,
 and the protocol used by validators to test miner machines.
 
+**New SN94 miner?** Follow the [SN94 miner quickstart](docs/SN94_MINER_QUICKSTART.md).
+It runs this guide's Intel TDX and AMD SEV-SNP steps in one order, with every
+SN94 value filled in, and lists what validators must do before any miner earns.
+
 ## How mining works
 
 Cathedral's validator reads every serving non-validator miner from SN94. It
@@ -35,15 +39,15 @@ guarantee TAO. The subnet must have positive emission.
 
 | Path | Status | Weight |
 |---|---|---|
-| Intel TDX on Linux | Mainnet live testing | Eligible after fresh TDX and SAT verification |
-| More Intel TDX machines on one UID | Mainnet live testing | Each distinct verified machine adds to that UID's score |
+| Intel TDX on Linux | Miner side ready; SN94 scoring starts at the validator cutover | Eligible after fresh TDX and SAT verification |
+| More Intel TDX machines on one UID | Miner side ready; SN94 scoring starts at the validator cutover | Each distinct verified machine adds to that UID's score |
 | AMD SEV-SNP on Linux | Validator path merged, live hardware policy pending | Eligible after that validator's policy admits the measurement and TCB, then fresh evidence and SAT pass |
 
 The current direct validator source supports Intel TDX and AMD SEV-SNP. Each
 validator owns its SNP measurement and TCB allowlist. An AMD machine earns zero
 from that validator until its live hardware run is admitted by the policy and
-fresh evidence and SAT pass. UID30's first live AMD policy still waits for the
-friend-hardware run.
+fresh evidence and SAT pass. No SN94 validator scores Cathedral miners yet; see
+[Validator-side dependencies](docs/SN94_MINER_QUICKSTART.md#validator-side-dependencies-not-live-until-the-validator-cutover).
 
 For AMD, the validator proves an admitted guest measurement, distinct hardware,
 the live HTTPS key, and returned SAT work. It does not remotely attest the OCI
@@ -275,8 +279,9 @@ far ahead too. Requests then stay refused until about `requests_resume_at`,
 which is the floor minus the 120-second maximum request lifetime. The reset
 prints `replay_floor` and `requests_resume_at`, and the worker logs both,
 at most once a minute, while it refuses. Only images built from a revision
-that includes `cathedral worker reset-replay-clock` have this command. The
-image pinned in step 3 predates it.
+that includes `cathedral worker reset-replay-clock` have this command. Both
+images pinned in this guide are built from `a66d7c4` and include it; use the
+one your launcher runs as `REVIEWED_WORKER_IMAGE`.
 
 The `init-key` command prints `keys_digest sha256:...`. Keep the value after
 `keys_digest` for step 3.
@@ -363,13 +368,14 @@ On each worker, install the refresher checkout, the path checker, and the fetch
 units. The worker needs only the base package, not the chain client:
 
 ```bash
-REFRESHER_REVISION='REVIEWED_REVISION_THAT_SHIPS_THE_REFRESHER'
+REFRESHER_REVISION='a66d7c4ca970487026c130610ee9efefa0416a07'
 sudo git clone https://github.com/cathedralai/cathedral-sandbox.git \
   /opt/cathedral-validator-access
 sudo git -C /opt/cathedral-validator-access checkout --detach "$REFRESHER_REVISION"
 sudo python3.12 -m venv /opt/cathedral-validator-access/.venv
 sudo /opt/cathedral-validator-access/.venv/bin/pip install \
   /opt/cathedral-validator-access
+sudo install -d -o root -g root -m 0755 /usr/local/libexec
 sudo install -o root -g root -m 0755 \
   /opt/cathedral-validator-access/cathedral/privileged_paths.py \
   /usr/local/libexec/cathedral-privileged-paths.py
@@ -514,8 +520,9 @@ btcli --network finney query uid \
 btcli --network finney --json query weights --netuid 94
 ```
 
-After UID 30 submits and any commit-reveal delay completes, row `"30"` must
-contain your miner UID with a positive fraction.
+SN94 uses commit-reveal. After a validator that scores Cathedral miners submits,
+and its commit reveals one epoch later, that validator's row must contain your
+miner UID with a positive fraction.
 
 All of these must also be true:
 
@@ -662,7 +669,8 @@ See [GPU work contract](docs/GPU_WORK.md) and [#73](https://github.com/cathedral
 
 Start with the [documentation map](docs/README.md). It separates current miner
 instructions from protocol, release, product-library, and retained compatibility
-material.
+material. The [SN94 miner quickstart](docs/SN94_MINER_QUICKSTART.md) is this
+guide in one ordered run.
 
 ## Stop and get help
 

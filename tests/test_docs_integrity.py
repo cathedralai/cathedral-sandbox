@@ -62,6 +62,7 @@ def test_current_operator_docs_exclude_retired_launch_paths() -> None:
         "docs/TDX_VERIFIER_RELEASE.md",
         "docs/AMD_SEV_SNP_FRIEND_TEST.md",
         "docs/SN94_SNP_MINER_IMAGE.md",
+        "docs/SN94_MINER_QUICKSTART.md",
         "docs/TESTING.md",
     )
     text = "\n".join((REPO_ROOT / path).read_text() for path in current_paths)
