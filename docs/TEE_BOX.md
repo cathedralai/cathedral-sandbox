@@ -354,8 +354,9 @@ Proposal: ship the box as a measured appliance image:
   as above.
 - **RTMR3.** The owner asked for the RTMR3 extends to be defined; proposed
   answer: none. *Proposal:* the appliance extends nothing into RTMR3, and
-  enables nothing that extends it at runtime. The kernel, initrd, command
-  line and dm-verity root are already in RTMR1 and RTMR2, and customer images
+  enables nothing that extends it at runtime. In the proposed direct boot
+  (bullet above), the kernel, initrd, command line and dm-verity root are
+  measured into RTMR1 and RTMR2 (today's image has no dm-verity), and customer images
   are data, not extended. RTMR3 therefore keeps its initial all-zero value.
   #256 notes that RTMR3 follows what the guest extends at runtime (its
   `tdx_measurement.py:24-25`), so this keeps one entry per image and VM
@@ -725,8 +726,8 @@ review round. Decisions 1, 2 and 4 changed; 7 and 8 are new.
    images, rootfs overlays, `files` and `tar` uploads and scratch, and replay
    and high-water state) lives in guest memory, or on dm-crypt with integrity
    (AEAD) under a key made inside the TD at boot. Images are verified on read,
-   with no time-of-check gap between import and `runsc run`. State files
-   cannot be rolled back by the host. *Proposal (section 4), which is which:*
+   with no time-of-check gap between import and `runsc run`. *Proposal
+   (section 4), which is which, so the host cannot roll state back:*
    images are read through dm-verity; overlays, uploads and bulk scratch are
    on dm-crypt with integrity; the replay, high-water and revocation state
    stays in guest memory only, because dm-crypt with integrity does not stop
@@ -742,7 +743,6 @@ Still open:
   Docker-in-Docker in v1) now excludes Harbor's docker-compose tasks, which
   run `dockerd` inside the sandbox (section 2). Does the owner want
   Docker-in-Docker under gVisor in a later version?
-
 - **Image build and approval.** Who builds and approves the appliance image
   and its measurement list entries? This was the original question 4.
 - **Paid shape.** Is the paid shape the proven shape minus the guest and
