@@ -24,7 +24,7 @@ from cathedral.validator_access import (
     ValidatorRequestAuthorizer,
     load_sr25519_verifier,
 )
-from cathedral.worker import WorkerServer
+from cathedral.worker import PREAUTH_CONNECTION_HEADROOM, WorkerServer
 from tests.test_validator_access import WORKER_HOTKEY, _snapshot, _tls_contexts
 
 ROOT_SEED = b"r" * 32
@@ -464,15 +464,25 @@ def test_central_access_adds_its_pool_to_the_connection_cap(tmp_path, monkeypatc
         max_central_concurrent=3,
     )
     assert with_central == validator_only + 3
-    # An explicit cap must also cover the central pool.
+    # An explicit cap must also cover the central pool: one short of every
+    # request class, central included, is refused; exactly enough is accepted.
+    class_capacity = with_central - PREAUTH_CONNECTION_HEADROOM
     with pytest.raises(ValueError, match="cover all request-class capacity"):
         WorkerServer(
             port=0,
             central_authorizer=_central_authorizer(tmp_path, validator, binding),
             max_central_concurrent=3,
-            max_connection_concurrent=validator_only,
+            max_connection_concurrent=class_capacity - 1,
             **options,
         )
+    assert (
+        connection_cap(
+            central_authorizer=_central_authorizer(tmp_path, validator, binding),
+            max_central_concurrent=3,
+            max_connection_concurrent=class_capacity,
+        )
+        == class_capacity
+    )
 
 
 def _cli_args(validator_state: str, central_state: str) -> list[str]:
