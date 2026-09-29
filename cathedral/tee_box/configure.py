@@ -8,6 +8,11 @@ flags do. The API also requires the worker's attested TLS listener.
 No flag names the callers. They use central access under the Cathedral root
 keys the launch measured (cathedral/tee_box/measured_root.py); the worker
 refuses to start when those are unavailable or do not match.
+
+The TEE box runs only in TEE mode, so its storage rules always apply
+(cathedral/tee_box/storage.py): the central state on tmpfs or ramfs, no
+disk swap, and Docker's data root in memory or on dm-crypt with integrity.
+No flag relaxes them.
 """
 
 from __future__ import annotations
@@ -33,7 +38,20 @@ from cathedral.tee_box.enforce import (
     EgressEnforcer,
     detect_box_addresses,
 )
-from cathedral.tee_box.executor import DEFAULT_RUNTIME_PATH, RunscExecutor, Shape
+from cathedral.tee_box.executor import (
+    DEFAULT_RUNTIME_PATH,
+    ExecutorError,
+    RunscExecutor,
+    Shape,
+)
+from cathedral.tee_box.storage import (
+    StorageError,
+    StorageProbe,
+    default_storage_probe,
+    require_memory_backed,
+    require_no_disk_swap,
+    require_protected_scratch,
+)
 
 EXECUTORS = ("runsc",)
 DEFAULT_DOCKER_PATH = "/usr/bin/docker"
@@ -85,7 +103,8 @@ def add_tee_box_arguments(command: argparse.ArgumentParser) -> None:
         "--tee-box-central-state",
         help=(
             "owner-only SQLite replay state for central callers, apart from validator "
-            "and --central-access state (the root keys are measured, not a flag)"
+            "and --central-access state, in a directory on tmpfs or ramfs (the root "
+            "keys are measured, not a flag)"
         ),
     )
     group.add_argument("--tee-box-executor", choices=EXECUTORS, help="sandbox executor")
@@ -246,17 +265,22 @@ def build_tee_box_api(
     public_endpoint: str | None,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     read_binding: measured_root.MeasuredBindingReader | None = None,
+    storage_probe: StorageProbe | None = None,
 ):  # noqa: ANN201 - returns (TeeBoxSandboxApi, startup facts)
     """Build the sandbox API or refuse to start.
 
     Refuses first when the central root keys at the fixed image path do not
     hash to the launch's measured binding (MRCONFIGID on TDX; SNP has none
-    yet), then when the central state is unusable, the runsc runtime is not
-    registered, or disk quotas are unsupported without the opt-out. An egress
-    table that fails to apply does not refuse: the box starts with
-    ``deny_all`` only and reports the error, and the reaper retries.
+    yet), then when the central state is not on tmpfs or ramfs, any swap
+    outside guest memory is on, the central state is unusable, the runsc
+    runtime is not registered, Docker's data root is neither in memory nor
+    on dm-crypt with integrity, or disk quotas are unsupported without the
+    opt-out. An egress table that fails to apply does not refuse: the box
+    starts with ``deny_all`` only and reports the error, and the reaper
+    retries.
 
-    ``read_binding`` replaces the TD report reader in tests only.
+    ``read_binding`` and ``storage_probe`` replace the TD report reader and
+    the storage probes in tests only.
     """
 
     from cathedral.central_access import (
@@ -274,6 +298,13 @@ def build_tee_box_api(
         )
     except measured_root.MeasuredRootError as exc:
         raise ValueError(f"TEE box central root: {exc}") from exc
+    probe = default_storage_probe(runner) if storage_probe is None else storage_probe
+    # Checked before the state is opened, which would create it.
+    try:
+        state_storage = require_memory_backed(config.central_state, fs_type=probe.fs_type)
+        swap = require_no_disk_swap(probe)
+    except (StorageError, OSError) as exc:
+        raise ValueError(f"TEE box storage: {exc}") from exc
     try:
         authorizer = CentralAccessAuthorizer(
             root_keys,
@@ -303,6 +334,11 @@ def build_tee_box_api(
     registered, runtime_detail = executor.runtime_check()
     if not registered:
         raise ValueError(f"TEE box runtime: {runtime_detail}")
+    try:
+        docker_root, _driver, driver_status = executor.storage_root()
+        scratch = require_protected_scratch(docker_root, probe, driver_status=driver_status)
+    except (ExecutorError, StorageError, OSError) as exc:
+        raise ValueError(f"TEE box storage: {exc}") from exc
     if config.disk_quota:
         supported, quota_detail = executor.storage_quota_support()
         if not supported:
@@ -331,6 +367,12 @@ def build_tee_box_api(
         "box_addresses": [str(net) for net in policy.box_addresses],
         "bandwidth_mbit": policy.bandwidth_mbit,
         "disk_quota": quota_detail,
+        "storage": {
+            "central_state": state_storage,
+            "swap": swap,
+            "docker_root": docker_root,
+            "scratch": scratch,
+        },
         "capacity": config.capacity.view(),
         "default_shape": config.default_shape.view(),
     }
