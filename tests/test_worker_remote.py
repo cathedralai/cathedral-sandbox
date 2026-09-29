@@ -1149,6 +1149,38 @@ def test_eviction_never_shuts_down_a_socket_its_thread_has_closed(monkeypatch):
                 b.close()
 
 
+def test_server_close_never_shuts_down_a_socket_its_thread_has_closed(monkeypatch):
+    """server_close has the same race as eviction: it shuts each tracked socket
+    down under the server lock, and skips one whose thread already closed it."""
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        server = srv._server
+        server.shutdown()  # stop serve_forever before closing its socket below
+        shut: list[tuple[socket.socket, bool]] = []
+        monkeypatch.setattr(
+            worker_module,
+            "_shutdown_transport",
+            lambda request: shut.append((request, server._active_lock.locked())),
+        )
+        open_victim, open_peer = socket.socketpair()
+        closing_victim, closing_peer = socket.socketpair()
+        try:
+            with server._active_lock:
+                server._active_requests[open_victim] = worker_module._Connection(open_victim, 1.0)
+                server._active_requests[closing_victim] = worker_module._Connection(
+                    closing_victim, 0.0
+                )
+            server.shutdown_request(closing_victim)
+            assert closing_victim.fileno() == -1
+            server.server_close()
+            assert shut == [(open_victim, True)]
+        finally:
+            with server._active_lock:
+                server._active_requests.clear()
+            for sock in (open_victim, open_peer, closing_victim, closing_peer):
+                sock.close()
+
+
 def test_the_default_ceiling_leaves_room_before_authentication():
     with WorkerServer(evidence_collector=_fake_evidence) as srv:
         _start_server(srv)
