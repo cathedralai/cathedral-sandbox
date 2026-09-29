@@ -13,9 +13,10 @@ import json
 import re
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
@@ -329,7 +330,9 @@ def admit_delivery(
     No JSON `verified` flag or capacity-probe receipt can skip this check.
     """
     from pathlib import Path
+
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
     from cathedral.common import (
         ChannelBinding,
         ChannelBindingType,

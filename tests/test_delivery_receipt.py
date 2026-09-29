@@ -1,48 +1,49 @@
-from copy import deepcopy
 import hashlib
+from copy import deepcopy
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 from cathedral.delivery import (
+    MIN_RETENTION_SECONDS,
     DeliveryError,
+    canonical_bytes,
     sign_receipt,
     verify_receipt,
-    canonical_bytes,
-    MIN_RETENTION_SECONDS,
 )
 
 NOW = 1_790_640_100
 
 
 def body():
-    return dict(
-        schema="cathedral_delivery_receipt_v1",
-        netuid=94,
-        receipt_id="receipt-1",
-        attempt_id="attempt-1",
-        sandbox_id="sandbox-1",
-        miner_hotkey="miner-1",
-        admission_nonce="44" * 32,
-        admitted_at=1_790_640_000,
-        admission_expires_at=1_790_643_600,
-        hardware_id="11" * 32,
-        executor_key_id="executor-1",
-        control_plane_key_id="central-1",
-        evidence_sha256="22" * 32,
-        measurement="tdx-measurement-sha256:" + "33" * 32,
-        window_start=1_790_640_000,
-        window_end=1_790_643_600,
-        started_at=1_790_640_001,
-        ended_at=1_790_640_061,
-        vcpu=1,
-        memory_gib=4,
-        vcpu_seconds=60,
-        gib_seconds=240,
-        issued_at=NOW,
-        retention_until=NOW + MIN_RETENTION_SECONDS,
-        execution_class="attested",
-        outcome="completed",
-    )
+    return {
+        "schema": "cathedral_delivery_receipt_v1",
+        "netuid": 94,
+        "receipt_id": "receipt-1",
+        "attempt_id": "attempt-1",
+        "sandbox_id": "sandbox-1",
+        "miner_hotkey": "miner-1",
+        "admission_nonce": "44" * 32,
+        "admitted_at": 1_790_640_000,
+        "admission_expires_at": 1_790_643_600,
+        "hardware_id": "11" * 32,
+        "executor_key_id": "executor-1",
+        "control_plane_key_id": "central-1",
+        "evidence_sha256": "22" * 32,
+        "measurement": "tdx-measurement-sha256:" + "33" * 32,
+        "window_start": 1_790_640_000,
+        "window_end": 1_790_643_600,
+        "started_at": 1_790_640_001,
+        "ended_at": 1_790_640_061,
+        "vcpu": 1,
+        "memory_gib": 4,
+        "vcpu_seconds": 60,
+        "gib_seconds": 240,
+        "issued_at": NOW,
+        "retention_until": NOW + MIN_RETENTION_SECONDS,
+        "execution_class": "attested",
+        "outcome": "completed",
+    }
 
 
 def test_two_signatures_bind_same_body():
@@ -155,7 +156,7 @@ def test_admission_without_quote_or_approved_measurement_refuses(tmp_path):
 
 
 def test_authority_countersigns_only_exact_executor_body():
-    from cathedral.delivery import sign_executor, countersign_receipt
+    from cathedral.delivery import countersign_receipt, sign_executor
 
     executor, central = Ed25519PrivateKey.generate(), Ed25519PrivateKey.generate()
     value = body()
@@ -188,11 +189,13 @@ def test_authority_countersigns_only_exact_executor_body():
 def admitted_fixture(tmp_path, monkeypatch):
     """Synthetic quote plus substituted vendor result; never hardware proof."""
     from types import SimpleNamespace
+
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    import cathedral.verify
     from cathedral.common import ChannelBinding, ChannelBindingType, Tier, report_data_v2
     from cathedral.verify.tdx_quote import parse_tdx_quote
     from tests.tdx_quote_fixtures import synthetic_tdx_quote
-    import cathedral.verify
 
     executor, central = Ed25519PrivateKey.generate(), Ed25519PrivateKey.generate()
     value = body()
@@ -226,13 +229,13 @@ def admitted_fixture(tmp_path, monkeypatch):
         chip_id="tdx-platform-sha256:" + (b"h" * 32).hex(),
     )
     monkeypatch.setattr(cathedral.verify, "replay_verify_tdx", lambda *a, **k: verdict)
-    kwargs = dict(
-        quote=quote,
-        executor_key=executor.public_key(),
-        allowed_measurements=frozenset([measurement]),
-        verifier_path=str(verifier),
-        verifier_sha256=hashlib.sha256(verifier.read_bytes()).hexdigest(),
-    )
+    kwargs = {
+        "quote": quote,
+        "executor_key": executor.public_key(),
+        "allowed_measurements": frozenset([measurement]),
+        "verifier_path": str(verifier),
+        "verifier_sha256": hashlib.sha256(verifier.read_bytes()).hexdigest(),
+    }
 
     def receipt(changes=None):
         candidate = dict(value)
@@ -250,7 +253,7 @@ def admitted_fixture(tmp_path, monkeypatch):
 def test_admission_binds_raw_quote_key_nonce_hardware(tmp_path, monkeypatch):
     from cathedral.delivery import admit_delivery
 
-    receipt, kwargs, verdict = admitted_fixture(tmp_path, monkeypatch)
+    receipt, kwargs, _verdict = admitted_fixture(tmp_path, monkeypatch)
     admitted = admit_delivery(receipt(), **kwargs)
     assert admitted.receipt.resource_seconds == 300
     for change in (
