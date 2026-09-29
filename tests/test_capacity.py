@@ -310,6 +310,8 @@ TDX_EVIDENCE = {
     "measurement": "tdx-measurement-sha256:" + "4d" * 32,
     "verifier_digest": "sha256:" + "7e" * 32,
     "tls_spki_sha256": "5b" * 32,
+    "attestation_nonce": "a7" * 32,
+    "attested_at": "2026-09-28T11:00:00Z",  # an hour before the receipt (NOW)
 }
 SNP_EVIDENCE = {**TDX_EVIDENCE, "evidence_kind": "sev_snp", "measurement": "6c" * 48}
 EVIDENCE_FOR = {"tdx": TDX_EVIDENCE, "sev_snp": SNP_EVIDENCE, None: None}
@@ -604,8 +606,15 @@ def test_extreme_dates_do_not_overflow(prober):
     with pytest.raises(receipt.ReceiptError, match="not currently valid"):
         _verify(signed, keys)
     body["issued_at"], body["expires_at"] = "0001-01-01T00:00:00Z", "0001-01-01T00:30:00Z"
+    body["evidence"]["attested_at"] = "0001-01-01T00:00:00Z"
     with pytest.raises(receipt.ReceiptError, match="not currently valid"):
         _verify(receipt.sign_receipt(body, key), keys)
+    # The evidence age bound, from the earliest attested_at to a late now.
+    signed = receipt.sign_receipt({**body, "expires_at": "0001-01-01T02:00:00Z"}, key)
+    late = datetime(1, 1, 1, 1, tzinfo=timezone.utc)
+    assert _verify(signed, keys, now=late, max_evidence_age=timedelta(hours=1)).kind == "tee"
+    with pytest.raises(receipt.ReceiptError, match="older than max_evidence_age"):
+        _verify(signed, keys, now=late, max_evidence_age=timedelta(minutes=59))
 
 
 def test_a_naive_now_is_refused(prober):
@@ -756,6 +765,17 @@ BAD_HEX64 = ["ab" * 31, "ab" * 33, "AB" * 32, "g" + "a" * 63, "sha256:" + "ab" *
         ("sev_snp", "measurement", "ab" * 49, False),
         ("sev_snp", "measurement", "AB" * 48, False),
         ("sev_snp", "measurement", "tdx-measurement-sha256:" + GOOD_HEX, False),
+        *[(t, "attestation_nonce", GOOD_HEX, True) for t in ("tdx", "sev_snp")],
+        *[("tdx", "attestation_nonce", bad, False) for bad in BAD_HEX64],
+        ("sev_snp", "attestation_nonce", "00" * 32, False),  # as admission refuses
+        ("tdx", "attested_at", "2026-09-28T12:00:00Z", True),  # the same second as issued_at
+        ("sev_snp", "attested_at", "2025-01-01T00:00:00Z", True),
+        ("tdx", "attested_at", "2026-09-28T12:00:01Z", False),  # after the receipt was issued
+        ("tdx", "attested_at", "2026-02-30T00:00:00Z", False),
+        ("tdx", "attested_at", "2026-09-28 11:00:00Z", False),
+        ("tdx", "attested_at", "2026-09-28T11:00:00+00:00", False),
+        ("sev_snp", "attested_at", 1790000000, False),
+        ("sev_snp", "attested_at", None, False),
     ],
 )
 def test_each_evidence_field_has_one_format(prober, tee_kind, field, value, ok):
@@ -825,9 +845,60 @@ def test_a_tampered_evidence_field_fails_the_signature(prober, field):
     key, keys = prober
     signed = json.loads(json.dumps(receipt.sign_receipt(_body(), key)))
     value = signed["evidence"][field]
-    signed["evidence"][field] = value[:-1] + ("0" if value[-1] != "0" else "1")
+    if field == "attested_at":  # one second earlier: still well formed
+        signed["evidence"][field] = value[:-2] + ("0" if value[-2] != "0" else "1") + "Z"
+    else:
+        signed["evidence"][field] = value[:-1] + ("0" if value[-1] != "0" else "1")
     with pytest.raises(receipt.ReceiptError, match="does not verify"):
         _verify(signed, keys)
+
+
+def test_verify_receipt_can_bound_the_evidence_age(prober):
+    # The evidence (an hour old at NOW) is reused across rounds; a validator
+    # bounds its age with max_evidence_age, measured from now.
+    key, keys = prober
+    signed = receipt.sign_receipt(_body(), key)
+    now = NOW + timedelta(minutes=1)  # the evidence is 61 minutes old
+    assert _verify(signed, keys).evidence.attested_at == "2026-09-28T11:00:00Z"  # no limit
+    assert _verify(signed, keys, max_evidence_age=timedelta(minutes=61)).kind == "tee"
+    with pytest.raises(receipt.ReceiptError, match="older than max_evidence_age"):
+        _verify(signed, keys, max_evidence_age=timedelta(minutes=61) - timedelta(seconds=1))
+    assert now - datetime(2026, 9, 28, 11, tzinfo=timezone.utc) == timedelta(minutes=61)
+    for bad in (timedelta(0), timedelta(seconds=-1), 3600, "1h", True):
+        with pytest.raises(receipt.ReceiptError, match="must be a positive timedelta"):
+            _verify(signed, keys, max_evidence_age=bad)
+    # Bare metal has no evidence, so the bound does not apply to it.
+    bare = receipt.sign_receipt(_body(kind="bare_metal"), key, allow_bare_metal=True)
+    assert _verify(bare, keys, max_evidence_age=timedelta(seconds=1)).evidence is None
+
+
+def test_the_evidence_report_data_is_auditable_from_the_receipt(prober):
+    # REPORT_DATA is report_data_v2(nonce, hotkey, tls_spki_sha256): with the
+    # nonce in the receipt, an auditor holding the archived quote can check
+    # that it was made for this hotkey, this TLS key and the prober's nonce.
+    from cathedral.common import ChannelBinding, ChannelBindingType, report_data_v2
+
+    key, keys = prober
+    verified = _verify(receipt.sign_receipt(_body(), key), keys)
+    expected = report_data_v2(
+        bytes.fromhex("a7" * 32),
+        HOTKEY,
+        ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, bytes.fromhex("5b" * 32)),
+    )
+    assert receipt.expected_report_data(verified) == expected
+    assert len(expected) == 64
+    # Another nonce or another TLS key gives other REPORT_DATA, so a quote made
+    # for either does not audit against this receipt.
+    for change in ({"attestation_nonce": "a8" * 32}, {"tls_spki_sha256": "5c" * 32}):
+        other = _verify(receipt.sign_receipt(_body(evidence={**TDX_EVIDENCE, **change}), key), keys)
+        assert receipt.expected_report_data(other) != expected
+    other_hotkey = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+    other = _verify(receipt.sign_receipt(_body(miner_hotkey=other_hotkey), key), keys)
+    assert receipt.expected_report_data(other) != expected
+    bare = _verify(receipt.sign_receipt(_body(kind="bare_metal"), key, allow_bare_metal=True), keys)
+    for junk in (bare, None, TDX_EVIDENCE):
+        with pytest.raises(receipt.ReceiptError, match="only a verified TEE receipt"):
+            receipt.expected_report_data(junk)
 
 
 def test_a_v1_receipt_is_refused(prober):
