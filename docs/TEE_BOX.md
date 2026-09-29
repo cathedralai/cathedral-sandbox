@@ -352,16 +352,22 @@ Proposal: ship the box as a measured appliance image:
   for a read-only root holding the worker, `runsc` and the executor.
 - The central-access root key digest is in MRCONFIGID or the dm-verity root,
   as above.
-- **RTMR3.** The owner asked for the RTMR3 extends to be defined; proposed
-  answer: none. *Proposal:* the appliance extends nothing into RTMR3, and
-  enables nothing that extends it at runtime. In the proposed direct boot
-  (bullet above), the kernel, initrd, command line and dm-verity root are
-  measured into RTMR1 and RTMR2 (today's image has no dm-verity), and customer images
-  are data, not extended. RTMR3 therefore keeps its initial all-zero value.
+- **RTMR3.** The owner asked for the RTMR3 extends to be defined. *Proposal
+  (implemented in draft PR #246):* the appliance extends RTMR3 exactly once
+  per boot, with the fixed event `cathedral tee-box lease granted v1`, just
+  before the boot's first lease is granted, and never otherwise. In the
+  proposed direct boot (bullet above), the kernel, initrd, command line and
+  dm-verity root are measured into RTMR1 and RTMR2 (today's image has no
+  dm-verity), and customer images are data, not extended. So RTMR3 has two
+  values: all zero on a fresh boot, and
+  `SHA-384(0^48 || SHA-384(event))` once the boot has served a customer.
+  Guest root can extend RTMR3 but only a relaunch resets it, so this is what
+  proves a relaunch between customers (decision 1): admission with
+  `require_fresh_boot` refuses a nonzero RTMR3 before each new customer.
   #256 notes that RTMR3 follows what the guest extends at runtime (its
-  `tdx_measurement.py:24-25`), so this keeps one entry per image and VM
-  shape. An image that later extends RTMR3 needs entries for the values it
-  produces.
+  `tdx_measurement.py:24-25`), so the list carries two entries per image and
+  VM shape, fresh and consumed, so that mid-lease re-attestations still pay.
+  SNP has no RTMR; its equivalent is open.
 - **Provider-dependent assumption, to verify:** this needs a provider that lets
   the miner supply the kernel and command line, and measures them into the
   RTMRs or the SNP launch digest. Clouds that boot through a paravisor or vTPM
@@ -383,9 +389,11 @@ time (decision 1):
 - **Customer from customer:** the VM is relaunched and re-attested between
   allocations (decision 1). The relaunch gives a fresh TLS key, a clean
   dm-verity root, a fresh storage key and fresh evidence. The control plane
-  routes the next customer only after admission (section 6) passes on the new
-  SPKI. So a gVisor escape during one allocation does not persist into the
-  next.
+  routes the next customer only after admission with `require_fresh_boot`
+  (section 6) sees RTMR3 at zero and pins the new SPKI. A new SPKI or boot_id
+  alone proves nothing against guest root (section 3, RTMR3). So a gVisor
+  escape during one allocation does not persist into the next. SNP has no
+  equivalent yet.
 - **All sandboxes from the host:** the TEE encrypts and integrity-protects
   guest memory. The host still controls scheduling, I/O and availability.
   Guest egress is visible to the host, so customers must encrypt their own
@@ -548,9 +556,10 @@ This repository already extracts the needed identities:
 1. **Probe only when idle (decision 4).** The prober probes a box only
    between allocations, with the box drained: no customer sandbox, and no
    cleanup pending. So the probe never shares the guest with a customer, and
-   the prober is never a second tenant. The natural slot is right after the
-   relaunch between customers, before the next allocation. That relaunch's
-   fresh attestation is then the receipt's evidence.
+   the prober is never a second tenant. Attesting needs no lease, but the
+   probe sandbox takes one, so it extends RTMR3 and consumes the boot (#246).
+   A probe right after a relaunch therefore costs a second relaunch before
+   the next customer.
 2. The prober attests the box as in section 3. It takes the TDX
    `stable_platform_id` or the SNP CHIP_ID from the quote it verified itself,
    never from a box field.
@@ -601,6 +610,8 @@ relaunch, only when all of these hold, on one connection:
 - REPORT_DATA v2 binds a fresh nonce, the miner hotkey and the SPKI of the TLS
   key serving the sandbox API;
 - the measurement is on the owner's published measurement list (decision 5);
+- before each new customer, RTMR3 is all zero (`require_fresh_boot`, TDX
+  only), so the boot has served no lease;
 - the central-access root digest is in measured state. On TDX the list entry
   fixes MRCONFIGID, which the appliance has checked against its root key
   file. Otherwise the root key file is inside the listed dm-verity root. A
@@ -640,7 +651,8 @@ not several small ones.
   images verified on read with dm-verity; Standard-box behavior (exec env,
   user, cwd, 14,400 s execs); image import into the TD by digest; the egress
   enforcer (#243); measured appliance image builds for TDX and SNP, with
-  no RTMR3 extends (proposal, section 3); receipt v2 with the evidence
+  one RTMR3 extend per boot on the first lease (proposal, section 3;
+  #246); receipt v2 with the evidence
   object (#237), on top of #217, plus the change to #237 that a carried
   receipt needs (section 5, step 4).
 - **cathedral-validator:** land #256, with its local file mirroring the
@@ -710,7 +722,8 @@ review round. Decisions 1, 2 and 4 changed; 7 and 8 are new.
    existing signed registry format and approval flow
    (`cathedral/policy_registry.py`, `docs/MRTD.md:70-86`) are candidates for
    it. The owner asked for the RTMR3 extends to be defined; proposed answer:
-   none (section 3). Who builds and approves the image is still open.
+   one lease event per boot, so the list has a fresh and a consumed entry
+   per image (section 3, #246). Who builds and approves the image is still open.
 5. **Consumer needs.** No snapshots, fork, port exposure or Docker-in-Docker
    in v1. When this was decided, the adapters used none of them. Since
    2026-09-28, Harbor runs its docker-compose tasks in Docker-in-Docker
