@@ -147,7 +147,7 @@ Do not install a launcher from a different source revision. Start with the
 published immutable image reference:
 
 ```bash
-SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255'
+SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:d477a68dffe1213ef31c86248dbc12bd1c10508cf3cf0d591694cff1ce16eda0'
 docker pull --platform linux/amd64 "$SNP_IMAGE"
 test "$(docker image inspect "$SNP_IMAGE" \
   --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
@@ -157,7 +157,7 @@ test "$(docker image inspect "$SNP_IMAGE" \
 SOURCE_COMMIT="$(docker image inspect \
   --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
   "$SNP_IMAGE")"
-test "$SOURCE_COMMIT" = 8dde6eaca27116eed53386a1fa33ec70b74a01fb
+test "$SOURCE_COMMIT" = a66d7c4ca970487026c130610ee9efefa0416a07
 
 git clone https://github.com/cathedralai/cathedral-sandbox.git cathedral-snp-runtime
 git -C cathedral-snp-runtime checkout --detach "$SOURCE_COMMIT"
