@@ -93,7 +93,7 @@ Citations are `file:line` in this repository.
     lease gets `409` with reason `lease_required`.
   - **Drain guarantee.** Release or expiry
     (`cathedral/tee_box/lease.py:95`) ends the lease and drains it
-    (`cathedral/tee_box/service.py:326`). The drain deletes the customer's
+    (`cathedral/tee_box/service.py:342`). The drain deletes the customer's
     sandboxes and then sweeps every untracked box container. It succeeds
     only when none of the customer's sandboxes is still listed and the sweep
     reports nothing left.
@@ -104,7 +104,7 @@ Citations are `file:line` in this repository.
     marked draining (`cathedral/tee_box/lease.py:102`). A slow container
     daemon therefore holds up only the call that runs the drain.
   - Ordinary calls retry the drain at most every 2 s. The reaper retries it
-    on every tick (`cathedral/tee_box/service.py:367`).
+    on every tick (`cathedral/tee_box/service.py:383`).
   - **A worker starts draining** (`cathedral/tee_box/lease.py:91`). A new
     process does not know what an earlier one left running. So no customer
     is leased the box until the first sweep reports that none of the box's
@@ -124,15 +124,15 @@ Citations are `file:line` in this repository.
     when `rm` succeeds or the daemon reports the container missing
     (`cathedral/tee_box/executor.py:905`).
   - A create holds the lease lock, so a drain cannot miss it
-    (`cathedral/tee_box/service.py:656-657`).
+    (`cathedral/tee_box/service.py:720-721`).
   - A worker thread runs every 5 s, and once at start
     (`cathedral/worker.py:1462`). It checks expiry, retries the drain, and
     sweeps orphans.
-- **API** (`cathedral/tee_box/service.py:293`). The routes are listed in
-  `cathedral/tee_box/service.py:75`, and the central-access scope each needs
-  in `cathedral/tee_box/service.py:110`. Only `GET /v1/box`, the revocation
+- **API** (`cathedral/tee_box/service.py:308`). The routes are listed in
+  `cathedral/tee_box/service.py:82`, and the central-access scope each needs
+  in `cathedral/tee_box/service.py:117`. Only `GET /v1/box`, the revocation
   push and the lease routes run without a lease
-  (`cathedral/tee_box/service.py:438`).
+  (`cathedral/tee_box/service.py:461`).
 
 | Call | Route | Scope |
 |---|---|---|
@@ -151,17 +151,17 @@ Citations are `file:line` in this repository.
 v1 has no snapshot, fork, port or Docker-in-Docker routes.
 
 Every sandbox reports `"hardware": "standard"`
-(`cathedral/tee_box/service.py:402`). Exec takes `env`, `user`, `cwd` and
+(`cathedral/tee_box/service.py:418`). Exec takes `env`, `user`, `cwd` and
 `timeout_seconds`. Background execs may run up to 14,400 s
-(`cathedral/tee_box/service.py:58-59`).
+(`cathedral/tee_box/service.py:65-66`).
 
 A create is admitted only while the sum of sandbox shapes fits the configured
 capacity. Otherwise it gets `409` with reason `box_capacity_full`
-(`cathedral/tee_box/service.py:662`), the reason Harbor already waits on.
+(`cathedral/tee_box/service.py:726`), the reason Harbor already waits on.
 
 `GET /v1/box` lists the network modes the box offers now, and its `egress`
 object says whether the egress rules are enforced, with the last error
-(`cathedral/tee_box/service.py:499`).
+(`cathedral/tee_box/service.py:522`).
 
 ## Caller authorization
 
@@ -214,7 +214,7 @@ state".
   target (query included, so file paths are covered), the body digest, a
   nonce, the worker hotkey, the subnet and the worker's TLS key.
 - **Worker.** The worker maps the method and target to a scope with
-  `route_scope` (`cathedral/tee_box/service.py:159`). Before it reserves a
+  `route_scope` (`cathedral/tee_box/service.py:174`). Before it reserves a
   slot or reads the body, it verifies the delegation against the measured
   root, its expiry, its scope and the revocation list, then the request's
   signature and expiry (`cathedral/worker.py:511`). After the body is read,
@@ -228,12 +228,49 @@ state".
   (`cathedral/worker.py:1357-1364`).
 - **Revocation list.** State starts empty on a fresh box, so the control
   plane pushes the root-signed revocation list to `POST /v1/box/revocations`
-  after every start (`cathedral/tee_box/service.py:540`). Until it has, only
+  after every start (`cathedral/tee_box/service.py:578`). Until it has, only
   `GET /v1/box` and the push are served; every other route gets `409` with
   reason `revocation_list_required`. A list older than the one in force, a
   different list under the same sequence, or one the root did not sign is
-  refused. Pushing the list in force again is accepted. `GET /v1/box`
-  reports `revocations.pushed` and `revocations.sequence`.
+  refused (`revocations_refused`). Pushing the list in force again is
+  accepted.
+  - **Freshness.** The push accepts only a list whose signed `issued_at` is
+    at most 24 h old (`MAX_REVOCATIONS_AGE_SECONDS`, the longest a
+    delegation lives) and at most 15 s ahead of the box clock; any other
+    gets `409` with reason `revocations_stale` and is not installed. The gate
+    re-checks on every call: once the pushed list is older than 24 h, every
+    route but `GET /v1/box` and the push gets `409` with reason
+    `revocation_list_stale` until a freshly signed list is pushed. The
+    offline root therefore signs a new list (a higher sequence) at least
+    every 24 h, as it already re-signs delegations.
+  - **Why.** After a relaunch or a wipe of the state file, the sequence check
+    compares against nothing. Without freshness, a stolen delegation revoked
+    under list 2 could push the older list 1 and open every route until the
+    delegation expired, since the miner controls the network and can drop
+    the control plane's own push.
+  - **What the control plane must do.** Push the current list right after
+    every relaunch, and whenever it changes. Do not trust
+    `revocations.pushed` alone: compare `GET /v1/box` `revocations.sequence`
+    and `revocations.issued_at` with the current list, and check
+    `revocations.fresh`. Route no customer to a box that reports an older
+    list, and push again.
+  - **Residual risk: lists that are still fresh.** A list signed less than
+    24 h ago is accepted even if a newer one exists. A delegation revoked by
+    list N can still reopen a relaunched box with list N-1 while N-1 is
+    fresh, until the control plane's push of N lands or the delegation
+    expires. Keeping the interval between list issues short narrows this.
+  - **Residual risk: the delegation high-water resets.** The high-water that
+    refuses a delegation older than one already accepted lives in the same
+    state, so after a relaunch a superseded but unexpired, unrevoked
+    delegation works again, for at most its remaining lifetime (24 h). A
+    revoked one is still refused once the current list is pushed. Closing
+    this needs a signed floor. **Proposed follow-up for #241:** a
+    `min_delegation_sequence` field in the root-signed revocation list, which
+    the worker applies as its high-water floor when it installs the list.
+    Until then, the root should revoke, not merely supersede, a delegation
+    that must stop working.
+- `GET /v1/box` reports `revocations.pushed`, `sequence`, `issued_at` (epoch
+  seconds) and `fresh`.
 - **Refusals.** Each of these gets `401`: no header or two, a validator
   header beside it, a delegation the pinned root did not sign, an expired
   delegation or request, a revoked delegation, one older than a delegation
@@ -474,7 +511,10 @@ belong.
   sitting inside the listed dm-verity root (design section 3).
 - **Admission.** Admission (T3) must check that the listed measurement fixes
   MRCONFIGID to the Cathedral root, and the control plane must push the
-  revocation list after every start.
+  current revocation list after every start and check what the box reports
+  (see "Revocation list").
+- **Signed high-water floor.** See the proposed `min_delegation_sequence`
+  follow-up for #241 under "Revocation list".
 
 - **Hardware qualification.** Nothing has run on real TDX or SNP guests:
   not runsc with systrap under a TD or an SNP guest, not gVisor's
