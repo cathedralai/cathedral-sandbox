@@ -1838,7 +1838,7 @@ def test_two_validators_stalling_bodies_cannot_lock_out_a_third(tmp_path: Path):
                 WORKER_HOTKEY,
                 ssl_context=client_context,
                 validator_hotkey=THIRD_VALIDATOR_HOTKEY,
-                validator_signer=lambda message: sr25519.sign(THIRD_VALIDATOR_PAIR, message),
+                validator_signer=lambda message: sr25519.sign(THIRD_VALIDATOR_PAIR, message), validator_network=NETWORK, validator_netuid=NETUID,
             )
             evidence = third.fetch_evidence(os.urandom(32))
             assert evidence.miner_hotkey == WORKER_HOTKEY
@@ -2173,7 +2173,7 @@ def test_a_slow_finalize_does_not_displace_a_validator_that_sent_its_body(tmp_pa
                 WORKER_HOTKEY,
                 ssl_context=client_context,
                 validator_hotkey=hotkey,
-                validator_signer=lambda message: sr25519.sign(pair, message),
+                validator_signer=lambda message: sr25519.sign(pair, message), validator_network=NETWORK, validator_netuid=NETUID,
             )
             try:
                 results[name] = miner.fetch_evidence(os.urandom(32))
@@ -2266,7 +2266,7 @@ def test_a_refusal_on_the_worker_side_does_not_bench_the_validator(tmp_path: Pat
                 WORKER_HOTKEY,
                 ssl_context=client_context,
                 validator_hotkey=hotkey,
-                validator_signer=lambda message: sr25519.sign(pair, message),
+                validator_signer=lambda message: sr25519.sign(pair, message), validator_network=NETWORK, validator_netuid=NETUID,
             )
 
         if refusal == "replay-store-full":
