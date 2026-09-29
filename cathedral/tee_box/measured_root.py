@@ -33,8 +33,8 @@ from collections.abc import Callable
 from cathedral.central_access import CentralAccessError, load_central_root_keys
 
 # Inside the image. The TEE box image build installs the Cathedral root key
-# file here (the key file ``scripts/cathedral_central_access.py keygen
-# --keys-out`` writes, #239), owned by root and read-only.
+# file here (the key file the offline root tool's ``keygen --keys-out``
+# writes, PR #239), owned by root and read-only.
 CENTRAL_ROOT_KEYS_PATH = "/usr/share/cathedral/central-root-keys.json"
 
 TDX_GUEST_DEVICE = "/dev/tdx_guest"

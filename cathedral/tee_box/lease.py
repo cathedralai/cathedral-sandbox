@@ -1,6 +1,6 @@
 """One customer at a time on a TEE box (owner decision 1, v1).
 
-A customer is one control-plane caller key. It takes the box with an explicit
+A customer is one central caller key (central access, docs/TEE_BOX_SERVICE.md). It takes the box with an explicit
 lease that has an expiry. While the lease is live every other caller is
 refused with a busy error. Releasing the lease, or letting it expire, drains
 every sandbox the customer still holds before the next customer can take the
