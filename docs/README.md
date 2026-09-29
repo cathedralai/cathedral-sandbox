@@ -9,6 +9,7 @@ operator guide.
 - [AMD SEV-SNP image contract](SN94_SNP_MINER_IMAGE.md)
 - [Validator access and multi-machine fleet protocol](WORK_REQUEST_V2.md)
 - [Intel TDX verifier release](TDX_VERIFIER_RELEASE.md)
+- [Live Intel TDX check](LIVE_TDX_CHECK.md)
 - [AMD SEV-SNP miner and first hardware proof](AMD_SEV_SNP_FRIEND_TEST.md)
 - [Development tests](TESTING.md)
 
