@@ -216,7 +216,9 @@ Edit `/etc/cathedral/sn94-snp-miner.env`. Set the published immutable image
 reference to the same value as `SNP_IMAGE`, public miner hotkey, public HTTPS
 endpoint, and SHA-256 of
 `/etc/cathedral/validator-access/snapshot-keys.json`. A mutable image tag is
-refused.
+refused. At `a66d7c4ca970487026c130610ee9efefa0416a07` the example file still
+names an older image digest, so replace its whole `SN94_SNP_MINER_IMAGE` line
+with the `SNP_IMAGE` value.
 
 Then start and inspect the service:
 
@@ -242,7 +244,7 @@ report. A successful validator round additionally proves that its policy
 admitted the machine and that its endpoint, TLS key, and hardware identity did
 not collide.
 
-Neither check proves SN94 registration, a finalized UID30 weight row, subnet
-emission, or TAO earnings. Those require the separate live chain test.
+Neither check proves SN94 registration, a finalized validator weight row,
+subnet emission, or TAO earnings. Those require the separate live chain test.
 Neither check remotely proves the OCI image digest or continuous runtime
 integrity after boot.
