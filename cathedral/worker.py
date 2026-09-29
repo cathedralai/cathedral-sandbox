@@ -20,10 +20,19 @@ import ssl
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 
 from cathedral.attest import collect_tdx
+from cathedral.central_access import (
+    CENTRAL_REQUEST_HEADER,
+    CENTRAL_ROUTES,
+    MAX_CENTRAL_CONCURRENT,
+    CentralAccessAuthorizer,
+    CentralAccessError,
+    CentralRequestLimiter,
+)
 from cathedral.common import (
     ChannelBinding,
     ChannelBindingType,
@@ -573,6 +582,9 @@ def _make_handler(
     validator_request_limiter: ValidatorRequestLimiter | None,
     gpu_executor,
     gpu_evidence_collector,
+    central_authorizer: CentralAccessAuthorizer | None = None,
+    central_request_limiter: CentralRequestLimiter | None = None,
+    central_semaphore: threading.Semaphore | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     class _Handler(BaseHTTPRequestHandler):
         def setup(self) -> None:
@@ -631,6 +643,52 @@ def _make_handler(
                 return None
             return values[0]
 
+        def _serve_central(self, path: str) -> None:
+            # A central caller never shares the validator header, limiter,
+            # replay state, or pool. Every refusal is the same 401, before any
+            # body is read, and only granted routes are served.
+            headers = self.headers.get_all(CENTRAL_REQUEST_HEADER, failobj=[])
+            if (
+                len(headers) != 1
+                or self.headers.get_all(VALIDATOR_REQUEST_HEADER, failobj=[])
+                or path not in CENTRAL_ROUTES
+            ):
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            assert central_authorizer is not None
+            assert central_request_limiter is not None
+            assert central_semaphore is not None
+            try:
+                request = central_authorizer.preauthorize(
+                    headers[0], method="POST", path=path, now=datetime.now(UTC)
+                )
+            except CentralAccessError:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            lease = central_request_limiter.acquire(request.caller)
+            if lease is None:
+                self._send_json(429, {"error": "central rate limit exceeded"})
+                return
+            try:
+                if not central_semaphore.acquire(blocking=False):
+                    self._send_json(503, {"error": "busy"})
+                    return
+                try:
+                    raw, error_code, error_message = self._read_body()
+                    if raw is None:
+                        self._send_json(error_code, {"error": error_message})
+                        return
+                    try:
+                        central_authorizer.finalize(request, body=raw, now=datetime.now(UTC))
+                    except CentralAccessError:
+                        self._send_json(401, {"error": "unauthorized"})
+                        return
+                    self._handle_post(raw)
+                finally:
+                    central_semaphore.release()
+            finally:
+                lease.release()
+
         def _preauthorize_validator(self, path: str) -> PreauthorizedValidatorRequest | None:
             if validator_authorizer is None:
                 return None
@@ -677,6 +735,22 @@ def _make_handler(
                 return
             if path == "/v1/fleet" and validator_authorizer is None:
                 self._send_json(404, {"error": "fleet discovery unavailable"})
+                return
+            if central_authorizer is not None and self.headers.get_all(
+                CENTRAL_REQUEST_HEADER, failobj=[]
+            ):
+                try:
+                    self._serve_central(path)
+                except (socket.timeout, TimeoutError, OSError):
+                    try:
+                        self._send_json(400, {"error": "request failed"})
+                    except OSError:
+                        pass
+                except Exception:
+                    try:
+                        self._send_json(500, {"error": "internal error"})
+                    except OSError:
+                        pass
                 return
             # Public evidence and canonical SAT exist only for an explicit
             # migration bridge or a development worker with authentication
@@ -1413,6 +1487,10 @@ class WorkerServer:
         max_validator_challenge_concurrent: int = MAX_VALIDATOR_CHALLENGE_CONCURRENT,
         gpu_executor=None,
         gpu_evidence_collector=None,
+        central_authorizer: CentralAccessAuthorizer | None = None,
+        max_central_concurrent: int = MAX_CENTRAL_CONCURRENT,
+        central_requests_per_window: int = 60,
+        central_rate_window_seconds: float = 60.0,
     ) -> None:
         try:
             loopback = ipaddress.ip_address(host).is_loopback
@@ -1449,6 +1527,7 @@ class WorkerServer:
                 max_validator_challenge_concurrent,
             ),
             ("max_response_body", max_response_body),
+            ("max_central_concurrent", max_central_concurrent),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
@@ -1456,7 +1535,7 @@ class WorkerServer:
             max_validator_challenge_concurrent
             if validator_authorizer is not None
             else 0
-        )
+        ) + (max_central_concurrent if central_authorizer is not None else 0)
         if max_connection_concurrent is None:
             max_connection_concurrent = (
                 max_concurrent
@@ -1535,6 +1614,15 @@ class WorkerServer:
                 or any(not isinstance(endpoint, str) for endpoint in fleet_endpoints)
             ):
                 raise ValueError("signed validator access requires bounded fleet candidates")
+        if central_authorizer is not None:
+            if not isinstance(central_authorizer, CentralAccessAuthorizer):
+                raise ValueError("central_authorizer must be a CentralAccessAuthorizer")
+            if validator_authorizer is None or tls_context is None:
+                raise ValueError("central access requires signed validator access and native TLS")
+            if central_authorizer.channel_binding != channel_binding:
+                raise ValueError("central access must bind the worker TLS key")
+            if central_authorizer.worker_hotkey != configured_hotkey:
+                raise ValueError("central access must bind the configured worker hotkey")
         if (gpu_executor is None) != (gpu_evidence_collector is None):
             raise ValueError("GPU execution and composite collector are required together")
         if gpu_executor is not None:
@@ -1587,6 +1675,14 @@ class WorkerServer:
             validator_request_limiter,
             gpu_executor,
             gpu_evidence_collector,
+            central_authorizer,
+            None
+            if central_authorizer is None
+            else CentralRequestLimiter(
+                requests_per_window=central_requests_per_window,
+                window_seconds=central_rate_window_seconds,
+            ),
+            None if central_authorizer is None else _Semaphore(max_central_concurrent),
         )
         self._server = _BoundedThreadingHTTPServer(
             (host, port),

@@ -1,13 +1,19 @@
 """Signed central access to an opted-in miner worker.
 
-This implements step 1 of docs/CENTRAL_POOL_ACCESS.md. An offline Ed25519 root
+This implements steps 1 and 2 of docs/CENTRAL_POOL_ACCESS.md. An offline Ed25519 root
 signs a short-lived delegation naming one online central key and the routes it
 may call. The central key signs each request over the route, the body hash, a
 nonce, and the worker's own TLS channel binding, as validator requests are
 bound. The worker verifies the chain against root keys it pinned by digest and
 records the nonce in its own replay state, separate from validator requests.
+The highest delegation sequence accepted is kept in that same state file, so a
+restarted worker still refuses an older delegation.
 
-Nothing here is wired into the worker yet, so no miner admits a central caller.
+The worker admits a central caller only when the miner passes the three
+--central-* flags (worker serve, serve-snp, serve-gpu, serve-g4, develop and
+migrate). Step 2 has no revocation-list fetch yet: nothing calls
+install_revocations, so a compromised delegation is bounded only by its expiry,
+at most MAX_DELEGATION_SECONDS (24 hours), until the fetch lands.
 """
 
 from __future__ import annotations
@@ -17,7 +23,10 @@ import binascii
 import hashlib
 import hmac
 import re
+import sqlite3
 import threading
+import time
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -54,6 +63,10 @@ CENTRAL_REQUEST_HEADER = "X-Cathedral-Central-Request"
 MAX_DELEGATION_SECONDS = 24 * 60 * 60
 MAX_CENTRAL_REPLAY_ENTRIES = 1024
 MAX_REVOKED_DELEGATIONS = 4096
+MAX_CENTRAL_CONCURRENT = 2
+DEFAULT_CENTRAL_REQUESTS_PER_WINDOW = 60
+DEFAULT_CENTRAL_RATE_WINDOW_SECONDS = 60.0
+MAX_CENTRAL_CALLERS = 16
 CENTRAL_ROUTES = frozenset({"/v1/capabilities"})
 
 _DELEGATION_KEYS = frozenset(
@@ -123,11 +136,82 @@ class PreauthorizedCentralRequest:
     expires_at: datetime
 
 
-def open_central_access_state(path: str) -> ValidatorAccessState:
+class CentralAccessState(ValidatorAccessState):
+    """The central replay store, plus the durable delegation high-water.
+
+    It is a ValidatorAccessState on its own file, so the replay floor, clock
+    and lock rules are the validator store's, and the file also records the
+    highest delegation sequence ever accepted.
+    """
+
+    def _initialize(self) -> None:
+        super()._initialize()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS central_delegation_high_water (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    sequence INTEGER NOT NULL
+                )
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def delegation_high_water(self) -> int | None:
+        """The highest accepted delegation sequence, 0 if none, None on failure."""
+
+        if self.closed:
+            return None
+        try:
+            connection = self._connect()
+            try:
+                row = connection.execute(
+                    "SELECT sequence FROM central_delegation_high_water WHERE singleton = 1"
+                ).fetchone()
+            finally:
+                connection.close()
+        except (sqlite3.Error, ValidatorAccessError):
+            return None
+        return 0 if row is None else int(row[0])
+
+    def raise_delegation_high_water(self, sequence: int) -> int | None:
+        """Durably raise the high-water to ``sequence``; return it, None on failure."""
+
+        if self.closed:
+            return None
+        try:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO central_delegation_high_water(singleton, sequence)
+                    VALUES (1, ?)
+                    ON CONFLICT(singleton) DO UPDATE SET
+                        sequence = MAX(sequence, excluded.sequence)
+                    """,
+                    (sequence,),
+                )
+                row = connection.execute(
+                    "SELECT sequence FROM central_delegation_high_water WHERE singleton = 1"
+                ).fetchone()
+                connection.commit()
+            finally:
+                connection.close()
+        except (sqlite3.Error, ValidatorAccessError):
+            return None
+        return int(row[0])
+
+
+def open_central_access_state(path: str) -> CentralAccessState:
     """Open the central replay store on its own path, with the central cap."""
 
     try:
-        return ValidatorAccessState(path, max_replay_entries=MAX_CENTRAL_REPLAY_ENTRIES)
+        return CentralAccessState(path, max_replay_entries=MAX_CENTRAL_REPLAY_ENTRIES)
     except ValidatorAccessError as exc:
         raise CentralAccessError(f"central access state is unusable: {exc}") from exc
 
@@ -422,9 +506,18 @@ def build_central_request_header(
 class CentralAccessAuthorizer:
     """Worker-side verifier for central requests, with its own replay state.
 
-    ``state`` must be a ValidatorAccessState on its own path, so central
+    ``state`` must be a CentralAccessState on its own path, so central
     requests never share the validator replay budget, holding at most
     MAX_CENTRAL_REPLAY_ENTRIES nonces; open_central_access_state builds one.
+    The delegation high-water is read from it at start, and every request is
+    checked against the stored value, raised in the same transaction, so
+    workers that share one state file honour each other's newer delegations.
+
+    Revocations and the revocation-list sequence are held in memory only.
+    Nothing installs a revocation list yet, so that is not exploitable today.
+    When the revocation fetch lands, the list and its sequence must be
+    persisted in ``state`` too, or a restart drops them and an older list (or
+    no list) could be accepted again.
     """
 
     def __init__(
@@ -435,7 +528,7 @@ class CentralAccessAuthorizer:
         network: str,
         netuid: int,
         channel_binding: ChannelBinding,
-        state: ValidatorAccessState,
+        state: CentralAccessState,
     ) -> None:
         if not root_keys:
             raise CentralAccessError("central access requires at least one pinned root key")
@@ -443,7 +536,7 @@ class CentralAccessAuthorizer:
         self.network, self.netuid = _check_subnet(network, netuid)
         if not isinstance(channel_binding, ChannelBinding):
             raise CentralAccessError("central access requires the worker channel binding")
-        if not isinstance(state, ValidatorAccessState):
+        if not isinstance(state, CentralAccessState):
             raise CentralAccessError("central access requires durable replay state")
         if state.max_replay_entries > MAX_CENTRAL_REPLAY_ENTRIES:
             raise CentralAccessError("central replay state exceeds the central replay cap")
@@ -454,7 +547,10 @@ class CentralAccessAuthorizer:
         self._lock = threading.Lock()
         self._revoked: frozenset[str] = frozenset()
         self._revocations_sequence = 0
-        self._delegation_high_water = 0
+        high_water = state.delegation_high_water()
+        if high_water is None:
+            raise CentralAccessError("central delegation high-water is unreadable")
+        self._delegation_high_water = high_water
 
     def install_revocations(self, document: object) -> None:
         """Replace the revocation set with a newer or equal signed list."""
@@ -544,7 +640,15 @@ class CentralAccessAuthorizer:
 
         _verify_ed25519(document, delegation.central_key, "central request")
         with self._lock:
-            self._delegation_high_water = max(self._delegation_high_water, delegation.sequence)
+            # Another worker may share this state file and have accepted a
+            # newer delegation, so the stored high-water is read in the same
+            # transaction that raises it, and never trusted from memory alone.
+            stored = self.state.raise_delegation_high_water(delegation.sequence)
+            if stored is None:
+                raise CentralAccessError("central delegation high-water could not be recorded")
+            self._delegation_high_water = max(self._delegation_high_water, stored)
+            if delegation.sequence < self._delegation_high_water:
+                raise CentralAccessError("central delegation is older than one already accepted")
         return PreauthorizedCentralRequest(
             delegation_digest=delegation.digest,
             delegation_sequence=delegation.sequence,
@@ -570,6 +674,10 @@ class CentralAccessAuthorizer:
         with self._lock:
             if request.delegation_digest in self._revoked:
                 raise CentralAccessError("central delegation has been revoked")
+            stored = self.state.delegation_high_water()
+            if stored is None:
+                raise CentralAccessError("central delegation high-water is unreadable")
+            self._delegation_high_water = max(self._delegation_high_water, stored)
             if request.delegation_sequence < self._delegation_high_water:
                 raise CentralAccessError("central delegation is older than one already accepted")
         if not self.state.check_and_record_request(
@@ -577,3 +685,94 @@ class CentralAccessAuthorizer:
         ):
             raise CentralAccessError("central request was replayed or replay state failed")
         return request.caller
+
+
+class CentralRequestLease:
+    """One admitted central request, released exactly once by the worker."""
+
+    def __init__(self, limiter: CentralRequestLimiter, caller: str) -> None:
+        self._limiter = limiter
+        self._caller = caller
+        self._released = False
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._limiter._release(self._caller)
+
+
+class CentralRequestLimiter:
+    """Per central key: one request in flight and a bounded rate, few keys."""
+
+    def __init__(
+        self,
+        *,
+        requests_per_window: int = DEFAULT_CENTRAL_REQUESTS_PER_WINDOW,
+        window_seconds: float = DEFAULT_CENTRAL_RATE_WINDOW_SECONDS,
+        max_callers: int = MAX_CENTRAL_CALLERS,
+        clock=time.monotonic,
+    ) -> None:
+        if (
+            isinstance(requests_per_window, bool)
+            or not isinstance(requests_per_window, int)
+            or not 1 <= requests_per_window <= 10_000
+        ):
+            raise CentralAccessError("central request rate is out of range")
+        if (
+            isinstance(window_seconds, bool)
+            or not isinstance(window_seconds, (int, float))
+            or not 0 < window_seconds <= 3600
+        ):
+            raise CentralAccessError("central rate window is out of range")
+        if (
+            isinstance(max_callers, bool)
+            or not isinstance(max_callers, int)
+            or not 1 <= max_callers <= 256
+        ):
+            raise CentralAccessError("central caller count is out of range")
+        self.requests_per_window = requests_per_window
+        self.window_seconds = float(window_seconds)
+        self.max_callers = max_callers
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._in_flight: dict[str, int] = {}
+        self._recent: dict[str, deque[float]] = {}
+
+    def acquire(self, caller: str) -> CentralRequestLease | None:
+        if not isinstance(caller, str) or not caller.startswith("central:"):
+            raise CentralAccessError("central limiter needs a central caller identity")
+        now = self._clock()
+        with self._lock:
+            recent = self._recent.get(caller)
+            if recent is None:
+                if len(self._recent) >= self.max_callers:
+                    idle = [
+                        key
+                        for key, times in self._recent.items()
+                        if not self._in_flight.get(key)
+                        and (not times or now - times[-1] >= self.window_seconds)
+                    ]
+                    if not idle:
+                        return None
+                    for key in idle:
+                        self._recent.pop(key, None)
+                        self._in_flight.pop(key, None)
+                recent = self._recent.setdefault(caller, deque())
+            while recent and now - recent[0] >= self.window_seconds:
+                recent.popleft()
+            if self._in_flight.get(caller, 0) >= 1 or len(recent) >= self.requests_per_window:
+                return None
+            recent.append(now)
+            self._in_flight[caller] = self._in_flight.get(caller, 0) + 1
+        return CentralRequestLease(self, caller)
+
+    def _release(self, caller: str) -> None:
+        with self._lock:
+            count = self._in_flight.get(caller, 0)
+            if count <= 1:
+                self._in_flight.pop(caller, None)
+            else:
+                self._in_flight[caller] = count - 1
