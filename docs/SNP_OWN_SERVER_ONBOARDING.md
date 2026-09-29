@@ -1,12 +1,16 @@
-# Bare-metal onboarding: from a server to a scored machine
+# Run an SNP miner on your own server: from a server to a scored machine
 
-This page puts the bare-metal miner path in order, from "I have a server" to a
-machine the validator scores. It adds no new commands: each step links to the
+This page puts the path for running the AMD SEV-SNP miner on your own server
+in order, from "I have a server" to a machine the validator scores. It adds no new commands: each step links to the
 section that owns them. The repository [README](../README.md) remains the only
 active operator guide; where this page and the README differ, the README wins.
 
-Bare-metal mining today means AMD SEV-SNP: your own EPYC host runs an SNP
-guest, and the miner runs inside that guest. Intel TDX mining runs in a TDX
+Here your own EPYC host runs an SNP guest, and the miner runs inside that guest.
+The machine is a TEE box: its evidence comes from the AMD hardware. That is not
+what the capacity documents call "bare metal", which is a host with no TEE at
+all, a path that is currently deferred ([CAPACITY.md](CAPACITY.md)). When a
+registration asks for the kind of box, an SNP host is `--kind tee`
+([MINER_BOX_RUNBOOK.md](MINER_BOX_RUNBOOK.md)). Intel TDX mining runs in a TDX
 confidential VM, usually rented; see
 [Run one Intel TDX machine](../README.md#run-one-intel-tdx-machine).
 
@@ -66,8 +70,9 @@ observed measurement and a TCB floor for its processor generation
 ([Production worker](AMD_SEV_SNP_FRIEND_TEST.md#production-worker)). Send each
 validator operator you expect to score you:
 
-- the transcript's measurement, processor generation and TCB values, or its
-  ready-made policy entry when the transcript carries one;
+- the transcript's measurement and reported TCB. Once #222 lands, the
+  transcript also carries the processor generation and a ready-made policy
+  entry in the validator's format; until then, name the generation yourself;
 - whether your guest sets SINGLE_SOCKET;
 - the host facts from step 1.
 
