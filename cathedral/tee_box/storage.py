@@ -46,8 +46,9 @@ VIEW_FSTYPES = frozenset({"nsfs"})
 # lowerdir paths, to fit the mount data into one page.
 OVERLAY2_HOME = "overlay2"
 _OVERLAY_DIR_KEYS = frozenset({"lowerdir", "lowerdir+", "datadir+", "upperdir", "workdir"})
-# SQLite and ValidatorAccessState files beside the state database.
-STATE_SIDE_SUFFIXES = (".lock", "-journal", "-wal", "-shm")
+# SQLite and ValidatorAccessState files beside the state database, and the
+# boot record (cathedral/tee_box/boot.py).
+STATE_SIDE_SUFFIXES = (".lock", "-journal", "-wal", "-shm", ".boot")
 DMSETUP_PATH = "/usr/sbin/dmsetup"
 SYSFS_DEV_BLOCK = "/sys/dev/block"
 MOUNTINFO_PATH = "/proc/self/mountinfo"

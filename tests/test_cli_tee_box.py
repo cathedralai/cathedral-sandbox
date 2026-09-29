@@ -19,10 +19,18 @@ from cathedral.cli import DEFAULT_WORKER_BEARER_ENV, build_parser, cmd_worker_se
 from cathedral.policy_registry import canonical_json
 from cathedral.tee_box import TeeBoxSandboxApi, measured_root
 from cathedral.tee_box import configure as configure_module
+from cathedral.tee_box.boot import BootError, BootGuard, RelaunchRequired
 from cathedral.tee_box.configure import OPTIONAL, REQUIRED, tee_box_config
 from cathedral.tee_box.storage import TMPFS_MAGIC, StorageProbe
 from tests.test_cli import _tls_material
-from tests.test_tee_box_service import NETUID, OTHER_ROOT_SEED, ROOT_KEYS, ROOT_SEED, _public
+from tests.test_tee_box_service import (
+    BOOTED_AT,
+    NETUID,
+    OTHER_ROOT_SEED,
+    ROOT_KEYS,
+    ROOT_SEED,
+    _public,
+)
 from tests.test_validator_access import WORKER_HOTKEY
 
 RUNSC = '{"runsc":{"path":"/usr/local/bin/runsc","runtimeArgs":["--platform=systrap"]}}'
@@ -192,6 +200,7 @@ def guest(monkeypatch, tmp_path: Path):
     docker_root.mkdir()
     box.docker_root = str(docker_root.resolve())
     box.disk = _Storage(docker_root.resolve())
+    box.boot_id = "0f2d6c5e-1b7a-4c8e-9d3f-2a6b8c0e4f11"
     real_build = configure_module.build_tee_box_api
 
     def build(config, **kwargs):
@@ -200,11 +209,17 @@ def guest(monkeypatch, tmp_path: Path):
                 raise box.mrconfigid
             return box.mrconfigid
 
+        def read_boot_id():
+            if isinstance(box.boot_id, Exception):
+                raise box.boot_id
+            return box.boot_id
+
         return real_build(
             config,
             runner=box,
             read_binding=read_binding,
             storage_probe=box.disk.probe(),
+            boot_readers={"read_boot_id": read_boot_id, "read_booted_at": lambda: BOOTED_AT},
             **kwargs,
         )
 
@@ -483,6 +498,40 @@ def test_central_state_off_tmpfs_refuses_before_the_state_is_created(tmp_path: P
     assert not (tmp_path / "tee-box-central.sqlite.lock").exists()
     # Refused before any docker call.
     assert not any(call[0].endswith("docker") for call in guest.calls)
+
+
+def test_the_startup_line_reports_the_boot_and_its_record(tmp_path: Path, guest, capsys):
+    assert cmd_worker_serve(_args(tmp_path, *_full_flags(tmp_path))) == 0
+    startup = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert startup["tee_box"]["boot"] == {
+        "boot_id": guest.boot_id,
+        "booted_at": BOOTED_AT,
+        "consumed": False,
+        "record": str(tmp_path / "tee-box-central.sqlite.boot"),
+    }
+    api = _FakeServer.calls[0]["tee_box_api"]
+    assert api.boot.marker_path == str(tmp_path / "tee-box-central.sqlite.boot")
+
+
+def test_an_unreadable_boot_id_refuses_to_start(tmp_path: Path, guest):
+    guest.boot_id = BootError("cannot read the boot id")
+    _refused(tmp_path, r"^TEE box boot identity: cannot read the boot id$")
+
+
+def test_a_restarted_worker_keeps_this_boots_customer(tmp_path: Path, guest, capsys):
+    # The first worker of this boot leased the box to one customer.
+    marker = tmp_path / "tee-box-central.sqlite.boot"
+    first = BootGuard(
+        str(marker), read_boot_id=lambda: guest.boot_id, read_booted_at=lambda: BOOTED_AT
+    )
+    first.consume("central:" + "a" * 64, 1_900_000_000.0)
+    assert cmd_worker_serve(_args(tmp_path, *_full_flags(tmp_path))) == 0
+    startup = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert startup["tee_box"]["boot"]["consumed"] is True
+    api = _FakeServer.calls[0]["tee_box_api"]
+    with pytest.raises(RelaunchRequired):
+        api.boot.check("central:" + "b" * 64)
+    api.boot.check("central:" + "a" * 64)
 
 
 def test_central_state_on_tmpfs_is_accepted_and_reported(tmp_path: Path, guest, capsys):

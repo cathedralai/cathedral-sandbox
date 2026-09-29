@@ -9,6 +9,12 @@ then the box is "draining" and refuses every lease, and later calls (and the
 worker's reaper) retry the drain. A new process starts draining too. This mirrors the Reliquary grant rules: an expiring grant, no
 overlapping owners, and a drain before the executor changes hands
 (deploy/reliquary-workers/admission.py).
+
+With a ``BootGuard`` (cathedral/tee_box/boot.py), the hand-over to a
+different customer also needs a relaunch of the VM (decision 1, amended
+2026-09-29): once a lease is granted in a boot, every other caller is refused
+with ``RelaunchRequired`` until the boot id changes. The same caller may lease
+again.
 """
 
 from __future__ import annotations
@@ -17,6 +23,18 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+
+from cathedral.tee_box.boot import BootGuard, RelaunchRequired
+
+__all__ = [
+    "BOX_START",
+    "CustomerLease",
+    "Lease",
+    "LeaseBusy",
+    "LeaseDraining",
+    "LeaseRequired",
+    "RelaunchRequired",
+]
 
 DEFAULT_MAX_LEASE_SECONDS = 24 * 3600
 MIN_LEASE_SECONDS = 60
@@ -71,9 +89,12 @@ class CustomerLease:
         *,
         max_seconds: int = DEFAULT_MAX_LEASE_SECONDS,
         clock: Callable[[], float] = time.time,
+        boot: BootGuard | None = None,
     ) -> None:
         if not callable(drain) or not callable(clock):
             raise ValueError("lease drain and clock must be callable")
+        if boot is not None and not isinstance(boot, BootGuard):
+            raise ValueError("boot must be a BootGuard")
         if (
             isinstance(max_seconds, bool)
             or not isinstance(max_seconds, int)
@@ -82,6 +103,7 @@ class CustomerLease:
             raise ValueError("maximum lease must be 60 s to 24 h")
         self._drain = drain
         self._clock = clock
+        self._boot = boot
         self.max_seconds = max_seconds
         self._lock = threading.RLock()
         self._lease: Lease | None = None
@@ -98,6 +120,14 @@ class CustomerLease:
             self._lease = None
             self._draining = lease.holder
             self._retry_at = 0.0
+            if self._boot is not None:
+                self._boot.released(now)
+
+    def _refuse_other_customer_locked(self, caller: str) -> None:
+        """No live lease: refuse ``caller`` if another customer used this boot."""
+
+        if self._lease is None and self._boot is not None:
+            self._boot.check(caller)
 
     def _settle(self, *, force: bool = False) -> None:
         """End an expired lease and run an unfinished drain.
@@ -155,11 +185,16 @@ class CustomerLease:
         with self._lock:
             now = self._clock()
             self._expire_locked(now)
+            # A relaunch, not the drain, is what this caller waits for.
+            self._refuse_other_customer_locked(caller)
             if self._draining is not None:
                 raise LeaseDraining
             lease = self._lease
             if lease is not None and lease.holder != caller:
                 raise LeaseBusy
+            if lease is None and self._boot is not None:
+                # Recorded before the grant; a failed write refuses it.
+                self._boot.consume(caller, now)
             acquired_at = now if lease is None else lease.acquired_at
             self._lease = Lease(caller, acquired_at, now + ttl_seconds)
             return self._lease
@@ -182,15 +217,19 @@ class CustomerLease:
             self._lease = None
             self._draining = caller
             self._retry_at = 0.0
+            if self._boot is not None:
+                self._boot.released(self._clock())
         self._settle(force=True)
         return True
 
     def require(self, caller: str) -> Lease:
-        """Return the caller's live lease, or raise draining, busy or lease-required."""
+        """Return the caller's live lease, or raise relaunch-required, draining,
+        busy or lease-required."""
 
         self._settle()
         with self._lock:
             self._expire_locked(self._clock())
+            self._refuse_other_customer_locked(caller)
             if self._draining is not None:
                 raise LeaseDraining
             lease = self._lease
@@ -208,6 +247,7 @@ class CustomerLease:
 
         now = self._clock()
         self._expire_locked(now)
+        self._refuse_other_customer_locked(caller)
         if self._draining is not None:
             raise LeaseDraining
         lease = self._lease
@@ -216,6 +256,16 @@ class CustomerLease:
         if lease.holder != caller:
             raise LeaseBusy
         return lease
+
+    def boot_view(self, caller: str) -> dict[str, object] | None:
+        """The boot guard's report for ``caller``, or None without a guard."""
+
+        self._settle()
+        with self._lock:
+            self._expire_locked(self._clock())
+            if self._boot is None:
+                return None
+            return self._boot.view(caller, leased=self._lease is not None)
 
     def locked(self):  # noqa: ANN201 - context manager
         """Hold the lease lock so a call cannot race a hand-over."""

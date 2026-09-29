@@ -12,6 +12,7 @@ import random
 import tarfile
 import threading
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -29,6 +30,7 @@ from cathedral.tee_box import (
     build_egress_policy,
     route_scope,
 )
+from cathedral.tee_box.boot import BootGuard
 from cathedral.tee_box.executor import ExecResult
 from cathedral.worker import WorkerServer
 from tests.test_validator_access import WORKER_HOTKEY, _tls_contexts
@@ -140,7 +142,35 @@ def _push_revocations(api: TeeBoxSandboxApi, document=None) -> None:
     assert response.status == 200, response.body
 
 
-def _api(tmp_path: Path, binding, *, clock=None, executor=None, ready=True):
+BOOTED_AT = 1_899_990_000
+
+
+class _BootIds:
+    """An injectable kernel boot id; ``relaunch`` stands for a new boot."""
+
+    def __init__(self) -> None:
+        self.value = str(uuid.uuid4())
+
+    def __call__(self) -> str:
+        return self.value
+
+    def relaunch(self) -> None:
+        self.value = str(uuid.uuid4())
+
+
+def _boot(boot_ids=None, marker=None, clock=None) -> BootGuard:
+    kwargs = {} if clock is None else {"clock": clock}
+    return BootGuard(
+        None if marker is None else str(marker),
+        read_boot_id=boot_ids or _BootIds(),
+        read_booted_at=lambda: BOOTED_AT,
+        **kwargs,
+    )
+
+
+def _api(
+    tmp_path: Path, binding, *, clock=None, executor=None, ready=True, boot_ids=None, marker=None
+):
     fake = executor or FakeExecutor()
     kwargs = {} if clock is None else {"clock": clock}
     api = TeeBoxSandboxApi(
@@ -149,6 +179,7 @@ def _api(tmp_path: Path, binding, *, clock=None, executor=None, ready=True):
         egress=build_egress_policy([BOX_IP]),
         capacity=CAPACITY,
         default_shape=DEFAULT_SHAPE,
+        boot=_boot(boot_ids, marker, clock),
         **kwargs,
     )
     if ready:
@@ -191,6 +222,7 @@ class _Box:
 
     def __init__(self, tmp_path: Path, *, ready: bool = True, **api_kwargs) -> None:
         server_context, self.client_context, self.binding = _tls_contexts(tmp_path)
+        self.boot_ids = api_kwargs.setdefault("boot_ids", _BootIds())
         self.api, self.fake = _api(tmp_path, self.binding, ready=False, **api_kwargs)
         self.server = WorkerServer(
             configured_hotkey=WORKER_HOTKEY,
@@ -283,6 +315,14 @@ def test_every_v1_route_maps_to_the_executor(box: _Box):
         "held_by_caller": False,
         "expires_at": None,
         "draining": False,
+    }
+    assert contract["boot"] == {
+        "boot_id": box.boot_ids.value,
+        "booted_at": BOOTED_AT,
+        "consumed": False,
+        "consumed_by_caller": False,
+        "needs_relaunch": False,
+        "last_released_at": None,
     }
 
     _lease_and_image(box)
@@ -392,7 +432,11 @@ def test_every_v1_route_maps_to_the_executor(box: _Box):
 
     assert box.json("DELETE", f"/v1/sandboxes/{sid}")[1] == {"id": sid, "deleted": True}
     assert box.json("GET", f"/v1/sandboxes/{sid}")[0] == 404
-    assert box.json("DELETE", "/v1/lease")[1] == {"released": True, "draining": False}
+    assert box.json("DELETE", "/v1/lease")[1] == {
+        "released": True,
+        "draining": False,
+        "needs_relaunch": True,
+    }
     assert other["id"] in box.fake.deleted
 
 
@@ -452,8 +496,22 @@ def test_one_customer_at_a_time_and_release_drains(box: _Box):
     assert box.json("GET", "/v1/box", central_seed=OTHER_CENTRAL_SEED)[1]["lease"]["held"] is True
     assert box.fake.deleted == []
 
-    assert box.json("DELETE", "/v1/lease")[1] == {"released": True, "draining": False}
+    assert box.json("DELETE", "/v1/lease")[1] == {
+        "released": True,
+        "draining": False,
+        "needs_relaunch": True,
+    }
     assert sorted(box.fake.deleted) == sorted([first, second])
+    # The next customer waits for the VM to be relaunched (decision 1).
+    refused = box.json("POST", "/v1/lease", {"ttl_seconds": 600}, central_seed=OTHER_CENTRAL_SEED)
+    assert refused == (
+        409,
+        {
+            "error": "another customer used this boot; the VM must be relaunched first",
+            "reason": "relaunch_required",
+        },
+    )
+    box.boot_ids.relaunch()
     status, lease = box.json(
         "POST", "/v1/lease", {"ttl_seconds": 600}, central_seed=OTHER_CENTRAL_SEED
     )
@@ -482,7 +540,8 @@ def _handle(api, method, target, caller=CALLER, body=None):
 
 def test_lease_expiry_drains_and_frees_the_box(tmp_path: Path):
     clock = _Clock()
-    api, fake = _api(tmp_path, _binding(), clock=clock)
+    boot_ids = _BootIds()
+    api, fake = _api(tmp_path, _binding(), clock=clock, boot_ids=boot_ids)
     assert _handle(api, "POST", "/v1/lease", body={"ttl_seconds": 60})[0] == 200
     fake.import_image(DIGEST, "registry.example/tasks/base")
     status, view = _handle(
@@ -499,9 +558,13 @@ def test_lease_expiry_drains_and_frees_the_box(tmp_path: Path):
     clock.value += 59
     assert fake.deleted == []
     clock.value += 2
+    # Expired and drained, but another customer still needs a relaunch.
+    status, refused = _handle(api, "POST", "/v1/lease", OTHER, {"ttl_seconds": 120})
+    assert (status, refused["reason"]) == (409, "relaunch_required")
+    assert fake.deleted == [view["id"]]
+    boot_ids.relaunch()
     status, lease = _handle(api, "POST", "/v1/lease", OTHER, {"ttl_seconds": 120})
     assert status == 200 and lease["lease"]["holder"] == OTHER
-    assert fake.deleted == [view["id"]]
     assert _handle(api, "GET", "/v1/sandboxes")[1]["reason"] == "box_busy"
 
 
@@ -813,6 +876,7 @@ def test_the_sandbox_api_needs_a_central_authorizer(tmp_path: Path):
             egress=build_egress_policy([BOX_IP]),
             capacity=CAPACITY,
             default_shape=DEFAULT_SHAPE,
+            boot=_boot(),
         )
 
 
@@ -891,11 +955,21 @@ def _draining(api, caller=OTHER):
 
 def test_a_failed_drain_keeps_the_box_unleasable_until_the_delete_succeeds(tmp_path: Path):
     clock = _Clock()
-    api, fake = _api(tmp_path, _binding(), clock=clock)
+    boot_ids = _BootIds()
+    api, fake = _api(tmp_path, _binding(), clock=clock, boot_ids=boot_ids)
     fake.import_image(DIGEST, "registry.example/tasks/base")
     leftover = _one_sandbox(api)
     fake.delete_fails = True
-    assert _handle(api, "DELETE", "/v1/lease")[1] == {"released": True, "draining": True}
+    assert _handle(api, "DELETE", "/v1/lease")[1] == {
+        "released": True,
+        "draining": True,
+        "needs_relaunch": True,
+    }
+    assert _handle(api, "POST", "/v1/lease", OTHER, {"ttl_seconds": 60})[1]["reason"] == (
+        "relaunch_required"
+    )
+    # Even after a relaunch (simulated in process), the drain still gates.
+    boot_ids.relaunch()
     # Nobody gets the box while the old customer's sandbox may still run:
     # not another customer, not the old one again.
     for _ in range(3):
@@ -914,13 +988,16 @@ def test_a_failed_drain_keeps_the_box_unleasable_until_the_delete_succeeds(tmp_p
 
 def test_an_expired_lease_with_a_stuck_sandbox_stays_draining(tmp_path: Path):
     clock = _Clock()
-    api, fake = _api(tmp_path, _binding(), clock=clock)
+    boot_ids = _BootIds()
+    api, fake = _api(tmp_path, _binding(), clock=clock, boot_ids=boot_ids)
     fake.import_image(DIGEST, "registry.example/tasks/base")
     stuck = _one_sandbox(api)
     fake.delete_fails = True
     clock.value += 61
     api.reap()
-    assert api.lease.current() is None and _draining(api)
+    assert api.lease.current() is None and _draining(api, CALLER)
+    boot_ids.relaunch()
+    assert _draining(api)
     fake.delete_fails = False
     # Ordinary calls space their retries; the next one after the gap drains.
     assert _draining(api)
@@ -932,13 +1009,19 @@ def test_an_expired_lease_with_a_stuck_sandbox_stays_draining(tmp_path: Path):
 def test_an_untracked_container_blocks_the_hand_over(tmp_path: Path):
     # A container the table lost (a timed-out create, an earlier process)
     # may belong to the old customer, so the sweep must clear it first.
-    api, fake = _api(tmp_path, _binding(), clock=_Clock())
+    boot_ids = _BootIds()
+    api, fake = _api(tmp_path, _binding(), clock=_Clock(), boot_ids=boot_ids)
     fake.import_image(DIGEST, "registry.example/tasks/base")
     sid = _one_sandbox(api)
     fake.orphans.add("cathsbx-sbx-" + "9" * 24)
     fake.orphans_stuck = True
-    assert _handle(api, "DELETE", "/v1/lease")[1] == {"released": True, "draining": True}
-    assert fake.deleted == [sid] and _draining(api)
+    assert _handle(api, "DELETE", "/v1/lease")[1] == {
+        "released": True,
+        "draining": True,
+        "needs_relaunch": True,
+    }
+    boot_ids.relaunch()
+    assert fake.deleted == [sid] and _draining(api) and _draining(api, CALLER)
     fake.orphans_stuck = False
     api.reap()  # the reaper's tick
     assert _handle(api, "POST", "/v1/lease", OTHER, {"ttl_seconds": 60})[0] == 200

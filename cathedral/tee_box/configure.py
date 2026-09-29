@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 from cathedral.common import ChannelBinding
 from cathedral.tee_box import measured_root
+from cathedral.tee_box.boot import BootError, BootGuard, marker_path_for
 from cathedral.tee_box.egress import (
     DEFAULT_BANDWIDTH_MBIT,
     EgressPolicy,
@@ -266,6 +267,7 @@ def build_tee_box_api(
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     read_binding: measured_root.MeasuredBindingReader | None = None,
     storage_probe: StorageProbe | None = None,
+    boot_readers: dict | None = None,
 ):  # noqa: ANN201 - returns (TeeBoxSandboxApi, startup facts)
     """Build the sandbox API or refuse to start.
 
@@ -279,8 +281,13 @@ def build_tee_box_api(
     starts with ``deny_all`` only and reports the error, and the reaper
     retries.
 
-    ``read_binding`` and ``storage_probe`` replace the TD report reader and
-    the storage probes in tests only.
+    It also refuses when the kernel's boot id or boot time cannot be read:
+    the box records the one customer each boot may serve next to the central
+    state (cathedral/tee_box/boot.py).
+
+    ``read_binding``, ``storage_probe`` and ``boot_readers`` (``read_boot_id``
+    and ``read_booted_at`` keyword arguments for ``BootGuard``) replace the TD
+    report reader, the storage probes and the boot readers in tests only.
     """
 
     from cathedral.central_access import (
@@ -305,6 +312,10 @@ def build_tee_box_api(
         swap = require_no_swap(probe)
     except (StorageError, OSError) as exc:
         raise ValueError(f"TEE box storage: {exc}") from exc
+    try:
+        boot = BootGuard(marker_path_for(config.central_state), **(boot_readers or {}))
+    except BootError as exc:
+        raise ValueError(f"TEE box boot identity: {exc}") from exc
     try:
         authorizer = CentralAccessAuthorizer(
             root_keys,
@@ -355,6 +366,7 @@ def build_tee_box_api(
         egress=policy,
         capacity=config.capacity,
         default_shape=config.default_shape,
+        boot=boot,
     )
     facts = {
         "central_root_keys": measured_root.CENTRAL_ROOT_KEYS_PATH,
@@ -375,5 +387,11 @@ def build_tee_box_api(
         },
         "capacity": config.capacity.view(),
         "default_shape": config.default_shape.view(),
+        "boot": {
+            "boot_id": boot.record.boot_id,
+            "booted_at": boot.booted_at,
+            "consumed": boot.record.consumed_by is not None,
+            "record": boot.marker_path,
+        },
     }
     return api, facts

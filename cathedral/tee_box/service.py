@@ -15,6 +15,11 @@ revocation list to ``POST /v1/box/revocations`` after every start, and the
 box serves no other route but ``GET /v1/box`` until it has one that is fresh:
 signed (its ``issued_at``) at most ``MAX_REVOCATIONS_AGE_SECONDS`` ago. When
 that list goes stale, the other routes close again until a fresh one arrives.
+
+One customer per boot (cathedral/tee_box/boot.py): once a lease is granted in
+a boot, every other caller gets ``409`` ``relaunch_required`` until the VM is
+relaunched. ``GET /v1/box`` reports the boot id, the boot time, whether the
+box needs a relaunch, and when the last lease ended, for re-attestation.
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ from cathedral.central_access import (
     CentralAccessError,
 )
 from cathedral.policy_registry import canonical_json, parse_registry_json
+from cathedral.tee_box.boot import BootError, BootGuard, RelaunchRequired
 from cathedral.tee_box.egress import EgressPolicy
 from cathedral.tee_box.executor import (
     MAX_FILE_BYTES,
@@ -316,6 +322,7 @@ class TeeBoxSandboxApi:
         egress: EgressPolicy,
         capacity: Shape,
         default_shape: Shape,
+        boot: BootGuard,
         max_lease_seconds: int = DEFAULT_MAX_LEASE_SECONDS,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -325,6 +332,8 @@ class TeeBoxSandboxApi:
             raise ValueError("the sandbox API requires an egress policy")
         if not default_shape.fits_within(capacity):
             raise ValueError("the default shape must fit the box capacity")
+        if not isinstance(boot, BootGuard):
+            raise ValueError("the sandbox API requires a boot guard (one customer per boot)")
         self.executor = executor
         self.authorizer = authorizer
         self.egress = egress
@@ -335,7 +344,10 @@ class TeeBoxSandboxApi:
         # process. Only GET /v1/box and the push are served until one is
         # pushed, and again whenever it is no longer fresh.
         self._revocations_issued_at: float | None = None
-        self.lease = CustomerLease(self._drain_owner, max_seconds=max_lease_seconds, clock=clock)
+        self.boot = boot
+        self.lease = CustomerLease(
+            self._drain_owner, max_seconds=max_lease_seconds, clock=clock, boot=boot
+        )
 
     # -- lifecycle helpers -----------------------------------------------
 
@@ -472,6 +484,22 @@ class TeeBoxSandboxApi:
             )
         except LeaseRequired:
             return _json(409, {"error": "take the box lease first", "reason": "lease_required"})
+        except RelaunchRequired:
+            return _json(
+                409,
+                {
+                    "error": "another customer used this boot; the VM must be relaunched first",
+                    "reason": "relaunch_required",
+                },
+            )
+        except BootError:
+            return _json(
+                503,
+                {
+                    "error": "the box cannot record this boot's customer",
+                    "reason": "boot_record_unavailable",
+                },
+            )
         except LeaseDraining:
             return _json(
                 409,
@@ -564,6 +592,7 @@ class TeeBoxSandboxApi:
                     "expires_at": None if lease is None else int(lease.expires_at),
                     "draining": self.lease.draining,
                 },
+                "boot": self.lease.boot_view(caller),
             },
         )
 
@@ -638,7 +667,15 @@ class TeeBoxSandboxApi:
 
     def _lease_release(self, caller, body, fields) -> Response:  # noqa: ANN001
         released = self.lease.release(caller)
-        return _json(200, {"released": released, "draining": self.lease.draining})
+        boot = self.lease.boot_view(caller)
+        return _json(
+            200,
+            {
+                "released": released,
+                "draining": self.lease.draining,
+                "needs_relaunch": boot is not None and boot["needs_relaunch"] is True,
+            },
+        )
 
     # -- images ----------------------------------------------------------
 

@@ -90,7 +90,7 @@ def test_a_disk_directory_linking_into_tmpfs_refuses(tmp_path: Path):
         require_memory_backed(str(disk / "central.sqlite"), fs_type=fs_type)
 
 
-@pytest.mark.parametrize("suffix", ["", ".lock", "-journal", "-wal", "-shm"])
+@pytest.mark.parametrize("suffix", ["", ".lock", "-journal", "-wal", "-shm", ".boot"])
 def test_a_state_side_file_mounted_from_disk_refuses(tmp_path: Path, suffix):
     state = tmp_path / "central.sqlite"
     side = Path(str(state) + suffix)
