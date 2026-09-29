@@ -11,7 +11,27 @@
 This repository contains the Cathedral compute worker, its Intel TDX verifier,
 and the protocol used by validators to test miner machines.
 
-## How mining works
+**New SN94 miner?** Follow the [SN94 miner quickstart](docs/SN94_MINER_QUICKSTART.md).
+It runs this guide's Intel TDX and AMD SEV-SNP steps in one order, with every
+SN94 value filled in, and lists what validators must do before any miner earns.
+
+## Customer-delivery V1 scope
+
+The [customer delivery contract](docs/SN94_DELIVERY_CONTRACT.md) defines signed
+allocation grants, dual-signed receipts and strict TDX admission checks. The
+[measured customer appliance source](https://github.com/cathedralai/cathedral-pool/blob/8266eea61789aaf502b05fce788711ebaddca753/ops/attested_appliance/README.md)
+connects grants to the Node's actual lifecycle and signed receipt windows. Its
+first offer is ten fixed-image, no-egress 1 vCPU / 4 GiB slots inside one TD per
+project/job. Local tests cover the source; a qualified appliance release,
+measured hardware launch and customer control-plane enrollment remain gates.
+
+**Customer-delivery miner onboarding is not complete.** Start with the
+[release and enrollment gaps](docs/SN94_DELIVERY_CONTRACT.md#customer-miner-onboarding-gates).
+The quickstart below describes the existing SAT miner lane. It does not establish
+Affine sandbox compatibility or delivered-resource rewards, and its published
+images are not the new measured customer appliance.
+
+## Existing SAT mining path
 
 Cathedral's validator reads every serving non-validator miner from SN94. It
 does not download weights from Cathedral and it does not use a weight relay.
@@ -35,15 +55,16 @@ guarantee TAO. The subnet must have positive emission.
 
 | Path | Status | Weight |
 |---|---|---|
-| Intel TDX on Linux | Mainnet live testing | Eligible after fresh TDX and SAT verification |
-| More Intel TDX machines on one UID | Mainnet live testing | Each distinct verified machine adds to that UID's score |
+| Intel TDX on Linux | Miner side ready; SN94 scoring starts at the validator cutover | Eligible after fresh TDX and SAT verification |
+| More Intel TDX machines on one UID | Miner side ready; SN94 scoring starts at the validator cutover | Each distinct verified machine adds to that UID's score |
 | AMD SEV-SNP on Linux | Validator path merged, live hardware policy pending | Eligible after that validator's policy admits the measurement and TCB, then fresh evidence and SAT pass |
 
 The current direct validator source supports Intel TDX and AMD SEV-SNP. Each
 validator owns its SNP measurement and TCB allowlist. An AMD machine earns zero
 from that validator until its live hardware run is admitted by the policy and
-fresh evidence and SAT pass. UID30's first live AMD policy still waits for the
-friend-hardware run.
+fresh evidence and SAT pass. This source does not prove a deployed SN94
+validator or finalized weights; see
+[Validator-side dependencies](docs/SN94_MINER_QUICKSTART.md#validator-side-dependencies-not-live-until-the-validator-cutover).
 
 For AMD, the validator proves an admitted guest measurement, distinct hardware,
 the live HTTPS key, and returned SAT work. It does not remotely attest the OCI
@@ -101,24 +122,24 @@ If Docker and registry access are available, inspect the published Intel image
 without starting it:
 
 ```bash
-TDX_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99'
+TDX_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:e7f8b1b2d8ffb3f7a3a2f006e39d036c7631ae0fb01e7e30d56f483f25dd8503'
 docker pull --platform linux/amd64 "$TDX_IMAGE"
 test "$(docker image inspect "$TDX_IMAGE" --format '{{.Os}}/{{.Architecture}}')" = \
   linux/amd64
 test "$(docker image inspect "$TDX_IMAGE" --format \
   '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
-  78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+  a66d7c4ca970487026c130610ee9efefa0416a07
 test "$(docker image inspect "$TDX_IMAGE" --format \
   '{{index .Config.Labels "org.cathedral.sn94.runtime-contract"}}')" = \
   signed-validator-fleet-v1
 
-SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255'
+SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:d477a68dffe1213ef31c86248dbc12bd1c10508cf3cf0d591694cff1ce16eda0'
 docker pull --platform linux/amd64 "$SNP_IMAGE"
 test "$(docker image inspect "$SNP_IMAGE" --format '{{.Os}}/{{.Architecture}}')" = \
   linux/amd64
 test "$(docker image inspect "$SNP_IMAGE" --format \
   '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
-  8dde6eaca27116eed53386a1fa33ec70b74a01fb
+  a66d7c4ca970487026c130610ee9efefa0416a07
 test "$(docker image inspect "$SNP_IMAGE" --format \
   '{{index .Config.Labels "org.cathedral.sn94.runtime-contract"}}')" = \
   snp-signed-validator-fleet-v1
@@ -144,11 +165,16 @@ field in the remote SNP report.
 
 ## Run one Intel TDX machine
 
-This is not yet a one-command unattended installation. You must supply two
-ordinary operations pieces outside this repository: a recurring secure
-transfer for the signed validator-access snapshot, and a process supervisor
-which restarts the fixed root-owned launcher. If you do not have both, stop
-before registration. The commands below install and run one foreground worker.
+This is not yet a one-command unattended installation. For the ordered
+installation, follow the quickstart's
+[systemd steps](docs/SN94_MINER_QUICKSTART.md#24-start-the-miner-under-systemd).
+They provide a systemd process supervisor and its one miner configuration file,
+`/etc/cathedral/sn94-tdx-miner.env`, around the fixed root-owned launcher.
+The separate validator-access refresh and fetch timers must also be running,
+and you must supply the signed snapshot's secure publication/transfer path.
+Stop before registration if either supervision or snapshot refresh is missing.
+The reference commands below install and run one foreground SAT worker; they
+do not install a customer sandbox executor.
 
 ### 1. Check the host
 
@@ -158,9 +184,9 @@ following this current GitHub README after the checkout.
 
 ```bash
 git clone https://github.com/cathedralai/cathedral-sandbox.git cathedral-runtime
-git -C cathedral-runtime checkout --detach 78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+git -C cathedral-runtime checkout --detach a66d7c4ca970487026c130610ee9efefa0416a07
 test "$(git -C cathedral-runtime rev-parse HEAD)" = \
-  78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+  a66d7c4ca970487026c130610ee9efefa0416a07
 test -z "$(git -C cathedral-runtime status --porcelain)"
 
 python3.12 -m venv cathedral-runtime/.venv
@@ -194,9 +220,9 @@ files and keep following this current GitHub README.
 
 ```bash
 git clone https://github.com/cathedralai/cathedral-sandbox.git cathedral-access
-git -C cathedral-access checkout --detach 78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+git -C cathedral-access checkout --detach a66d7c4ca970487026c130610ee9efefa0416a07
 test "$(git -C cathedral-access rev-parse HEAD)" = \
-  78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+  a66d7c4ca970487026c130610ee9efefa0416a07
 test -z "$(git -C cathedral-access status --porcelain)"
 
 python3.12 -m venv cathedral-access/.venv
@@ -275,8 +301,9 @@ far ahead too. Requests then stay refused until about `requests_resume_at`,
 which is the floor minus the 120-second maximum request lifetime. The reset
 prints `replay_floor` and `requests_resume_at`, and the worker logs both,
 at most once a minute, while it refuses. Only images built from a revision
-that includes `cathedral worker reset-replay-clock` have this command. The
-image pinned in step 3 predates it.
+that includes `cathedral worker reset-replay-clock` have this command. Both
+images pinned in this guide are built from `a66d7c4` and include it; use the
+one your launcher runs as `REVIEWED_WORKER_IMAGE`.
 
 The `init-key` command prints `keys_digest sha256:...`. Keep the value after
 `keys_digest` for step 3.
@@ -363,13 +390,14 @@ On each worker, install the refresher checkout, the path checker, and the fetch
 units. The worker needs only the base package, not the chain client:
 
 ```bash
-REFRESHER_REVISION='REVIEWED_REVISION_THAT_SHIPS_THE_REFRESHER'
+REFRESHER_REVISION='a66d7c4ca970487026c130610ee9efefa0416a07'
 sudo git clone https://github.com/cathedralai/cathedral-sandbox.git \
   /opt/cathedral-validator-access
 sudo git -C /opt/cathedral-validator-access checkout --detach "$REFRESHER_REVISION"
 sudo python3.12 -m venv /opt/cathedral-validator-access/.venv
 sudo /opt/cathedral-validator-access/.venv/bin/pip install \
   /opt/cathedral-validator-access
+sudo install -d -o root -g root -m 0755 /usr/local/libexec
 sudo install -o root -g root -m 0755 \
   /opt/cathedral-validator-access/cathedral/privileged_paths.py \
   /usr/local/libexec/cathedral-privileged-paths.py
@@ -445,11 +473,11 @@ protected route closes until a fresh snapshot arrives.
 The current live-testing image is immutable:
 
 ```text
-ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99
+ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:e7f8b1b2d8ffb3f7a3a2f006e39d036c7631ae0fb01e7e30d56f483f25dd8503
 ```
 
 ```bash
-export SN94_AUDIT_MINER_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99'
+export SN94_AUDIT_MINER_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:e7f8b1b2d8ffb3f7a3a2f006e39d036c7631ae0fb01e7e30d56f483f25dd8503'
 export CATHEDRAL_MINER_HOTKEY='YOUR_PUBLIC_HOTKEY'
 export CATHEDRAL_PUBLIC_ENDPOINT='https://YOUR_PUBLIC_IPV4:8081'
 export CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST='PASTE_KEYS_DIGEST_VALUE'
@@ -514,8 +542,9 @@ btcli --network finney query uid \
 btcli --network finney --json query weights --netuid 94
 ```
 
-After UID 30 submits and any commit-reveal delay completes, row `"30"` must
-contain your miner UID with a positive fraction.
+Check the current SN94 commit-reveal settings before registration. After a
+validator that scores Cathedral miners submits and any configured reveal delay
+completes, that validator's row must contain your miner UID with a positive fraction.
 
 All of these must also be true:
 
@@ -662,7 +691,8 @@ See [GPU work contract](docs/GPU_WORK.md) and [#73](https://github.com/cathedral
 
 Start with the [documentation map](docs/README.md). It separates current miner
 instructions from protocol, release, product-library, and retained compatibility
-material.
+material. The [SN94 miner quickstart](docs/SN94_MINER_QUICKSTART.md) is this
+guide in one ordered run.
 
 ## Stop and get help
 

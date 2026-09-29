@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cathedral-delivery"
+version = "0.1.0"
+description = "Canonical Cathedral SN94 dual-signed delivery receipt contract"
+requires-python = ">=3.11"
+dependencies = ["cryptography>=42"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["cathedral_delivery"]

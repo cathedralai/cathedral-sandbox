@@ -5382,6 +5382,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_controlled.add_argument("--out-dir", required=True)
     p_controlled.set_defaults(func=cmd_runtime_export_controlled)
 
+    # Delivery signature inspection does not grant TEE or reward admission.
+    from cathedral.delivery import cmd_check as delivery_check
+    p_delivery = sub.add_parser("delivery-receipt", help="inspect signed delivery metadata")
+    delivery_sub = p_delivery.add_subparsers(dest="delivery_command", required=True)
+    p_delivery_check = delivery_sub.add_parser("check", help="check dual signatures from stdin; never grants eligibility")
+    p_delivery_check.set_defaults(func=delivery_check)
+
+    from cathedral_delivery.grants import cmd_check as grant_check
+    p_executor = sub.add_parser("executor", help="inspect bounded executor allocation authority")
+    executor_sub = p_executor.add_subparsers(dest="executor_command", required=True)
+    p_grant_check = executor_sub.add_parser("check-grant", help="check a grant from stdin; never grants eligibility")
+    p_grant_check.set_defaults(func=grant_check)
+
     return parser
 
 

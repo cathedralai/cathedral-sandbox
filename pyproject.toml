@@ -45,3 +45,12 @@ build-backend = "hatchling.build"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.hatch.build]
+dev-mode-dirs = [".", "packages/delivery-contract"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["cathedral"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"packages/delivery-contract/cathedral_delivery" = "cathedral_delivery"

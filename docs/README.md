@@ -11,6 +11,8 @@ operator guide.
 - [Intel TDX verifier release](TDX_VERIFIER_RELEASE.md)
 - [AMD SEV-SNP miner and first hardware proof](AMD_SEV_SNP_FRIEND_TEST.md)
 - [Development tests](TESTING.md)
+- [SN94 miner quickstart](SN94_MINER_QUICKSTART.md): the README's SN94 steps in
+  one ordered run, with the validator-side dependencies
 
 These pages explain a narrow contract. They do not replace the README's launch
 order.

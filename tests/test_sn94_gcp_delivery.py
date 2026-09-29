@@ -170,7 +170,7 @@ def test_plan_is_no_write_and_fully_bounded(capsys, monkeypatch):
         / "docs"
         / "SN94_AUDIT_MINER_OPERATIONS.md"
     ).read_text()
-    assert "Source: 78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8" in operations
+    assert "Source: a66d7c4ca970487026c130610ee9efefa0416a07" in operations
     assert IMAGE in operations
     assert "9fa697989089ba87c0aa798f2c4f3f525d428958" not in operations
     assert document["validator_access"] == {
