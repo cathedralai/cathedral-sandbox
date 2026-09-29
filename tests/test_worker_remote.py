@@ -254,6 +254,25 @@ def _wait_for_active_connections(
     assert server._server.active_connection_count == expected
 
 
+def _wait_for_protected_permits(
+    server: _WorkerServer,
+    expected: int,
+    timeout: float = 2.0,
+) -> None:
+    def protected() -> int:
+        with server._server._active_lock:
+            return sum(
+                1
+                for record in server._server._active_requests.values()
+                if record.protected and record.owns_permit
+            )
+
+    deadline = time.monotonic() + timeout
+    while protected() != expected and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert protected() == expected
+
+
 def _status_of(response: bytes) -> int:
     return int(response.split(b"\r\n", 1)[0].split(b" ")[1])
 
@@ -1004,7 +1023,10 @@ def test_busy_returns_503():
 
 
 def test_partial_bodies_are_bounded_before_handler_threads_can_grow():
-    """Every long-lived partial-body thread consumes one finite admission slot."""
+    """Every long-lived partial-body thread consumes one finite admission slot.
+
+    Parsed requests are protected; only an idle connection that has not shown a
+    request yields its permit to a newcomer, so the thread count never grows."""
     evidence_payload = json.dumps(
         {"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}
     ).encode()
@@ -1018,34 +1040,161 @@ def test_partial_bodies_are_bounded_before_handler_threads_can_grow():
     ) as srv:
         _start_server(srv)
         stalled = [
-            _stall_post_connection(
-                srv.port, path="/v1/evidence", bearer=TEST_BEARER
-            ),
-            _stall_post_connection(
-                srv.port,
-                path="/v1/evidence",
-                bearer=TEST_BEARER,
-            ),
-            _stall_post_connection(
-                srv.port, path="/v1/sat-work", bearer=TEST_BEARER
-            ),
-            # Before headers identify a request class, the fourth connection
-            # consumes the final server-level slot.
-            socket.create_connection(("127.0.0.1", srv.port), timeout=10),
+            _stall_post_connection(srv.port, path="/v1/evidence", bearer=TEST_BEARER),
+            _stall_post_connection(srv.port, path="/v1/evidence", bearer=TEST_BEARER),
+            _stall_post_connection(srv.port, path="/v1/sat-work", bearer=TEST_BEARER),
         ]
+        # Before headers identify a request class, the fourth connection
+        # consumes the final server-level slot.
+        idle = socket.create_connection(("127.0.0.1", srv.port), timeout=10)
         try:
             _wait_for_active_connections(srv, 4)
-            for _ in range(20):
-                # The pre-handler gate has no parsed HTTP request and closes
-                # immediately. Class-pool saturation, tested separately,
-                # remains the point that returns a deterministic HTTP 503.
-                assert _connection_gate_response(srv.port) == b""
-                assert srv._server.active_connection_count == 4
+            for _ in range(5):
+                # Only the three stalled requests hold protected permits: their
+                # headers have parsed, and the previous newcomer, whose client
+                # sees EOF just before its thread releases the permit, is gone.
+                _wait_for_protected_permits(srv, 3)
+                # A newcomer takes the idle connection's permit; the three
+                # parsed, stalled requests keep theirs.
+                assert _connection_gate_response(srv.port) != b""
+            # Evicted records linger until their threads clean up.
+            _wait_for_active_connections(srv, 3)
+            assert srv._server.evicted_connection_count >= 1
+            idle.settimeout(2.0)
+            assert idle.recv(1) == b""  # the server closed the evicted socket
         finally:
             for conn in stalled:
                 conn.close()
+            idle.close()
         _wait_for_active_connections(srv, 0)
         assert _post_raw(f"{srv.base_url}/v1/evidence", evidence_payload)[0] == 200
+
+
+def test_idle_sockets_cannot_lock_out_a_real_request():
+    """Review finding W1: holding every permit with idle sockets used to make the
+    miner look offline to every validator."""
+    payload = json.dumps({"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}).encode()
+    with WorkerServer(evidence_collector=_fake_evidence, max_connection_concurrent=10) as srv:
+        _start_server(srv)
+        idle = [socket.create_connection(("127.0.0.1", srv.port), timeout=10) for _ in range(10)]
+        try:
+            _wait_for_active_connections(srv, 10)
+            for _ in range(3):
+                assert _post_raw(f"{srv.base_url}/v1/evidence", payload)[0] == 200
+            # The first request takes an idle socket's permit; it releases it when
+            # done, so later requests find it free.
+            assert srv._server.evicted_connection_count >= 1
+            assert srv._server.active_connection_count <= 10
+        finally:
+            for conn in idle:
+                conn.close()
+
+
+def test_a_newcomer_is_refused_only_when_every_permit_shows_a_request():
+    with WorkerServer(evidence_collector=_fake_evidence, max_connection_concurrent=10) as srv:
+        _start_server(srv)
+        held = [socket.create_connection(("127.0.0.1", srv.port), timeout=10) for _ in range(10)]
+        try:
+            _wait_for_active_connections(srv, 10)
+            # Stand in for ten parsed, in-flight requests.
+            with srv._server._active_lock:
+                requests = list(srv._server._active_requests)
+            for request in requests:
+                srv._server.protect_connection(request)
+            for _ in range(5):
+                assert _connection_gate_response(srv.port) == b""
+            assert srv._server.evicted_connection_count == 0
+            assert srv._server.active_connection_count == 10
+        finally:
+            for conn in held:
+                conn.close()
+
+
+def test_eviction_never_shuts_down_a_socket_its_thread_has_closed(monkeypatch):
+    """An evicted connection's thread may be closing its socket at the moment
+    of eviction; its descriptor could then be reused by an unrelated file or
+    socket. The thread marks its record closed under the server lock before
+    closing, and eviction shuts a victim down only under that lock and only
+    while its record is open."""
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        server = srv._server
+        shut: list[tuple[socket.socket, bool]] = []
+        monkeypatch.setattr(
+            worker_module,
+            "_shutdown_transport",
+            lambda request: shut.append((request, server._active_lock.locked())),
+        )
+        open_victim, open_peer = socket.socketpair()
+        closing_victim, closing_peer = socket.socketpair()
+        newcomers = [socket.socketpair() for _ in range(2)]
+        try:
+            with server._active_lock:
+                server._active_requests[open_victim] = worker_module._Connection(open_victim, 1.0)
+                server._active_requests[closing_victim] = worker_module._Connection(
+                    closing_victim, 0.0
+                )
+            # The older victim's thread finishes: shutdown_request closes it.
+            server.shutdown_request(closing_victim)
+            assert closing_victim.fileno() == -1
+            assert server._evict_oldest_unprotected(worker_module._Connection(newcomers[0][0], 2.0))
+            assert shut == []  # its permit moved, but its socket was left alone
+            # An open victim is shut down, and under the lock.
+            assert server._evict_oldest_unprotected(worker_module._Connection(newcomers[1][0], 3.0))
+            assert shut == [(open_victim, True)]
+        finally:
+            with server._active_lock:
+                server._active_requests.clear()
+            for sock in (open_victim, open_peer, closing_victim, closing_peer):
+                sock.close()
+            for a, b in newcomers:
+                a.close()
+                b.close()
+
+
+def test_server_close_never_shuts_down_a_socket_its_thread_has_closed(monkeypatch):
+    """server_close has the same race as eviction: it shuts each tracked socket
+    down under the server lock, and skips one whose thread already closed it."""
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        server = srv._server
+        server.shutdown()  # stop serve_forever before closing its socket below
+        shut: list[tuple[socket.socket, bool]] = []
+        monkeypatch.setattr(
+            worker_module,
+            "_shutdown_transport",
+            lambda request: shut.append((request, server._active_lock.locked())),
+        )
+        open_victim, open_peer = socket.socketpair()
+        closing_victim, closing_peer = socket.socketpair()
+        try:
+            with server._active_lock:
+                server._active_requests[open_victim] = worker_module._Connection(open_victim, 1.0)
+                server._active_requests[closing_victim] = worker_module._Connection(
+                    closing_victim, 0.0
+                )
+            server.shutdown_request(closing_victim)
+            assert closing_victim.fileno() == -1
+            server.server_close()
+            assert shut == [(open_victim, True)]
+        finally:
+            with server._active_lock:
+                server._active_requests.clear()
+            for sock in (open_victim, open_peer, closing_victim, closing_peer):
+                sock.close()
+
+
+def test_the_default_ceiling_leaves_room_before_authentication():
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        slots = srv._server._connection_slots
+        expected = (
+            worker_module.MAX_CONCURRENT
+            + worker_module.MAX_CHALLENGE_CONCURRENT
+            + worker_module.MAX_SAT_CHALLENGE_CONCURRENT
+            + worker_module.PREAUTH_CONNECTION_HEADROOM
+        )
+        assert slots._initial_value == expected
 
 
 def test_saturated_class_pool_returns_503_before_body_framing():
