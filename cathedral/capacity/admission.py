@@ -1,34 +1,50 @@
 """TEE box admission: may this whole-host confidential VM serve sandboxes?
 
 A pure library: no network, no clock, no files. The control plane or the
-prober calls :func:`admit` after it has itself verified the box's quote with
-the pinned verifier (``cathedral.verify``: the TDX verifier in strict mode, or
-``cathedral.verify.snp``), on the same TLS connection that serves the box's
-sandbox API. :func:`admit` then decides, from values the caller observed:
+prober first verifies the box's quote itself with the pinned verifier
+(``cathedral.verify``: the TDX verifier in strict mode, or
+``cathedral.verify.snp.verify_snp`` with its default ``require_chain=True``), on
+the same TLS connection that serves the box's sandbox API, and passes
+:func:`admit` the verifier's own ``Attested`` verdict together with the raw
+quote (or SEV-SNP report) bytes it verified. :func:`admit` then decides:
 
-- **REPORT_DATA binding.** The quote's REPORT_DATA must equal
-  ``cathedral.common.report_data_v2(nonce, miner_hotkey, binding)``, where the
-  binding is ``tls_spki_sha256`` over the SPKI of the certificate the caller saw
-  in its own TLS handshake. That is the worker's existing v2 channel binding,
-  byte for byte the same as cathedral-validator's
+- **Complete verification.** The verdict must be ``VERIFIED`` with the vendor
+  chain verified; for TDX also strict policy mode, current collateral and debug
+  off. A partial verdict (``STRUCTURE_OK_CHAIN_UNVERIFIED``, compatibility-mode
+  TDX) is refused. The verdict must be for these quote bytes: its measurement
+  (and, for SEV-SNP, its chip id) must match the quote's own.
+- **REPORT_DATA binding.** The quote's REPORT_DATA, read from the quote itself,
+  must equal ``cathedral.common.report_data_v2(nonce, miner_hotkey, binding)``,
+  where the binding is ``tls_spki_sha256`` over the SPKI of the certificate the
+  caller saw in its own TLS handshake. That is the worker's existing v2 channel
+  binding, byte for byte the same as cathedral-validator's
   ``cathedral_thin/independent/collect.py`` ``report_data_v2``; this module adds
   no new format. It binds the prober's 32-byte nonce, the miner hotkey and the
   TLS key, so a quote made for another prober round, another hotkey or another
   TLS endpoint is refused.
 - **Hardware identity.** For TDX, the ``stable_platform_id`` the pinned strict
-  verifier emitted (``cmd/cathedral-tdx-verifier``; no verifier outputs the raw
-  PPID) becomes the receipt's ``hardware_id`` through
-  ``receipt.tdx_hardware_id``; for SEV-SNP, the raw CHIP_ID through
-  ``receipt.derive_hardware_id``. An admission and the box's capacity receipts
-  therefore name one machine the same way.
+  verifier emitted (``Attested.chip_id``; no verifier outputs the raw PPID)
+  becomes the receipt's ``hardware_id`` through ``receipt.tdx_hardware_id``; for
+  SEV-SNP, the report's CHIP_ID through ``receipt.derive_hardware_id``. An
+  admission and the box's capacity receipts therefore name one machine the same
+  way.
 - **Measurement policy.** cathedral-validator #256's policy file for TDX, and
-  the same shape with a 96-hex allowlist for SEV-SNP (:func:`parse_policy`). In
-  ``enforce`` an unlisted measurement is refused; in ``shadow`` it is admitted
-  with ``measurement_allowed=False`` recorded.
+  the same shape with a 96-hex allowlist for SEV-SNP (:func:`parse_policy`).
+  This policy decides whether the box's receipts pay. In ``enforce`` an
+  unlisted measurement is refused; in ``shadow`` it is admitted and recorded
+  (``measurement_allowed=False``) but gets no receipt evidence, so it cannot be
+  paid. The verifier's own ``Policy.allowed_measurements`` is checked first and
+  refuses anything it does not list (docs/CAPACITY.md, "Which allowlist gates").
 - **One box per host, first claim wins.** Boxes are whole hosts. A hardware id
   already admitted to a different box (a different ``box_id`` or hotkey) is
   refused; the box that claimed it first keeps it until the caller removes that
-  entry. The same box presenting the same host again is re-admitted.
+  entry. The same box presenting the same host again is re-admitted. The
+  caller must check and record the claim atomically (one lock or transaction),
+  or two concurrent admissions of one host can both pass.
+
+The evidence :func:`admit` returns for the box's receipts carries the SHA-256
+of the quote bytes (computed here, never taken from the caller), the nonce, the
+TLS key's SPKI hash from the caller's handshake, and ``attested_at``.
 
 Malformed input of any kind raises :class:`AdmissionError`. A well-formed
 attestation that fails a check returns ``Admission(admitted=False, reasons=...)``.
@@ -42,6 +58,7 @@ import hmac
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Mapping
 
 from cathedral.capacity.receipt import (
@@ -51,13 +68,24 @@ from cathedral.capacity.receipt import (
     ReceiptError,
     ReceiptEvidence,
     _check_evidence,
+    _iso,
     derive_hardware_id,
     tdx_hardware_id,
 )
 from cathedral.channel import ChannelBindingError, _der_tlv, tls_spki_binding
-from cathedral.common import ChannelBinding, ChannelBindingType, report_data_v2
+from cathedral.common import (
+    Attested,
+    ChannelBinding,
+    ChannelBindingType,
+    Tier,
+    report_data_v2,
+)
+from cathedral.verify.snp import VERIFIED, parse_snp_report
+from cathedral.verify.tdx_quote import TdxQuoteParseError, parse_tdx_quote
 
 TEE_KINDS = ("tdx", "sev_snp")
+# The verifier verdict's tier names the kind.
+_TIER_KINDS = {Tier.CC_CPU_TDX: "tdx", Tier.CC_CPU_SNP: "sev_snp"}
 MODES = ("shadow", "enforce")
 # The TDX schema is cathedral-validator #256's, so its policy file loads here unchanged.
 POLICY_SCHEMAS = {
@@ -71,12 +99,11 @@ _POLICY_MEASUREMENT = {
 }
 MAX_POLICY_BYTES = 128 * 1024  # as #256
 NONCE_BYTES = 32  # report_data_v2's nonce
-REPORT_DATA_BYTES = 64
-CHIP_ID_BYTES = 64  # SEV-SNP
-_HEX = re.compile(r"(?:[0-9a-f]{2})+")
+MAX_QUOTE_BYTES = 64 * 1024  # a TDX quote with its PCK chain is a few KiB; an SNP report 1184 B
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 
 # Refusal reasons, in the order they are checked.
+VERIFICATION_INCOMPLETE = "verification_incomplete"
 REPORT_DATA_MISMATCH = "report_data_mismatch"
 MEASUREMENT_NOT_ALLOWED = "measurement_not_allowed"
 HARDWARE_ID_CLAIMED = "hardware_id_admitted_to_another_box"
@@ -95,30 +122,6 @@ class MeasurementPolicy:
 
     def allows(self, measurement: str) -> bool:
         return measurement in self.allowed_measurements
-
-
-@dataclass(frozen=True)
-class VerifiedAttestation:
-    """What the caller's own verifier run established about one quote.
-
-    ``report_data`` is the 64 bytes in the verified quote. Exactly one hardware
-    identity, fixed by the kind:
-
-    - TDX: ``stable_platform_id``, the pinned strict verifier's
-      ``tdx-platform-sha256:<64 hex>`` claim (``Attested.chip_id``), which strict
-      mode accepts only with ``platform_identity_verified`` and
-      ``claims_bound_to_quote`` true. ``chip_id`` must be None.
-    - SEV-SNP: ``chip_id``, the raw 64-byte CHIP_ID from the verified report, as
-      bytes or lowercase hex. ``stable_platform_id`` must be None.
-    """
-
-    kind: str
-    measurement: str
-    verifier_digest: str
-    evidence_sha256: str
-    report_data: bytes
-    stable_platform_id: str | None = None
-    chip_id: bytes | str | None = None
 
 
 @dataclass(frozen=True)
@@ -141,7 +144,9 @@ class Admission:
     measurement_allowed: bool
     mode: str  # the policy's mode
     policy_digest: str
-    evidence: ReceiptEvidence | None  # for T4 receipts; None unless admitted
+    # For T4 receipts: None unless admitted with an allowed measurement, so a
+    # shadow admission of an unlisted measurement is recorded but never paid.
+    evidence: ReceiptEvidence | None
 
 
 def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -216,16 +221,34 @@ def parse_policy(raw: bytes) -> MeasurementPolicy:
     )
 
 
-def _raw_chip_id(value: object) -> bytes:
-    if isinstance(value, bytes):
-        raw = value
-    elif isinstance(value, str) and _HEX.fullmatch(value) is not None:
-        raw = bytes.fromhex(value)
-    else:
-        raise AdmissionError("a sev_snp attestation needs its chip_id as bytes or lowercase hex")
-    if len(raw) != CHIP_ID_BYTES:
-        raise AdmissionError(f"a raw chip_id is {CHIP_ID_BYTES} bytes")
-    return raw
+def _complete(attested: Attested, kind: str) -> bool:
+    """Whether the verdict is a complete, strict verification (not a partial
+    one some verifier modes return): VERIFIED with the vendor chain checked,
+    and for TDX strict policy mode, current collateral and debug off."""
+
+    if attested.verification_status != VERIFIED or attested.chain_verified is not True:
+        return False
+    if kind == "tdx":
+        return (
+            attested.policy_mode == "strict"
+            and attested.collateral_current is True
+            and attested.debug_enabled is False
+        )
+    return True
+
+
+def _parse_quote(quote: bytes, kind: str) -> tuple[bytes, str, bool, bytes | None]:
+    """REPORT_DATA, measurement, debug bit and (SEV-SNP) raw chip id, read from
+    the quote bytes themselves."""
+
+    try:
+        if kind == "tdx":
+            parsed = parse_tdx_quote(quote)
+            return parsed.report_data, parsed.measurement, parsed.debug_enabled, None
+        report = parse_snp_report(quote)
+        return report.report_data, report.measurement, False, bytes.fromhex(report.chip_id)
+    except (TdxQuoteParseError, ValueError) as exc:
+        raise AdmissionError(f"quote: {exc}") from exc
 
 
 def _tls_binding(certificate_der: object, spki_der: object) -> ChannelBinding:
@@ -276,24 +299,33 @@ def _check_admitted(admitted: object) -> Mapping[str, AdmittedBox]:
 
 
 def admit(
-    attestation: VerifiedAttestation,
+    attested: Attested,
+    quote: bytes,
     *,
+    verifier_digest: str,
     box_id: str,
     miner_hotkey: str,
     nonce: bytes,
+    attested_at: datetime,
     policy: MeasurementPolicy,
     admitted: Mapping[str, AdmittedBox],
     tls_certificate_der: bytes | None = None,
     tls_spki_der: bytes | None = None,
 ) -> Admission:
-    """Decide one TEE box's admission. ``nonce`` is the 32-byte nonce the caller
-    sent with its evidence request; ``tls_certificate_der`` (or its
-    ``tls_spki_der``) is from the caller's own handshake on the connection that
-    serves the sandbox API; ``admitted`` maps each already-admitted hardware id
-    to its box. Raises :class:`AdmissionError` on malformed input."""
+    """Decide one TEE box's admission.
 
-    if not isinstance(attestation, VerifiedAttestation):
-        raise AdmissionError("attestation must be a VerifiedAttestation")
+    ``attested`` is the pinned verifier's own verdict (``cathedral.common.Attested``)
+    for ``quote``, the raw TDX quote or SEV-SNP report bytes it verified;
+    ``verifier_digest`` names that verifier (``sha256:<64 hex>``). ``nonce`` is
+    the 32-byte nonce the caller sent with its evidence request and
+    ``attested_at`` (timezone-aware) when it verified the quote.
+    ``tls_certificate_der`` (or its ``tls_spki_der``) is from the caller's own
+    handshake on the connection that serves the sandbox API; ``admitted`` maps
+    each already-admitted hardware id to its box. Raises
+    :class:`AdmissionError` on malformed input."""
+
+    if not isinstance(attested, Attested):
+        raise AdmissionError("attested must be the verifier's cathedral.common.Attested")
     if (
         not isinstance(policy, MeasurementPolicy)
         or not isinstance(policy.kind, str)
@@ -304,11 +336,13 @@ def admit(
         or not isinstance(policy.digest, str)
     ):
         raise AdmissionError("policy must be a MeasurementPolicy from parse_policy")
-    kind = attestation.kind
-    if not isinstance(kind, str) or kind not in TEE_KINDS:
-        raise AdmissionError("attestation kind must be tdx or sev_snp")
+    kind = _TIER_KINDS.get(attested.tier) if isinstance(attested.tier, Tier) else None
+    if kind is None:
+        raise AdmissionError("attested tier must be cc_cpu_tdx or cc_cpu_snp")
     if policy.kind != kind:
         raise AdmissionError(f"a {kind} attestation needs a {kind} measurement policy")
+    if not isinstance(quote, bytes) or not 1 <= len(quote) <= MAX_QUOTE_BYTES:
+        raise AdmissionError("quote must be the raw quote or report, 1 byte to 64 KiB")
     if not isinstance(box_id, str) or _BOX_ID.fullmatch(box_id) is None:
         raise AdmissionError("box_id must be 1-128 of A-Z a-z 0-9 . _ : -")
     if not isinstance(miner_hotkey, str) or _SS58.fullmatch(miner_hotkey) is None:
@@ -317,46 +351,53 @@ def admit(
         raise AdmissionError(f"nonce must be exactly {NONCE_BYTES} bytes")
     if not any(nonce):
         raise AdmissionError("nonce is all zeros")
-    report_data = attestation.report_data
-    if not isinstance(report_data, bytes) or len(report_data) != REPORT_DATA_BYTES:
-        raise AdmissionError(f"report_data must be exactly {REPORT_DATA_BYTES} bytes")
+    if not isinstance(attested_at, datetime) or attested_at.utcoffset() is None:
+        raise AdmissionError("attested_at must be a timezone-aware datetime")
+    try:
+        attested_iso = _iso(attested_at)
+    except (OverflowError, ValueError) as exc:  # outside what UTC can represent
+        raise AdmissionError("attested_at is out of range") from exc
     registry = _check_admitted(admitted)
     binding = _tls_binding(tls_certificate_der, tls_spki_der)
 
+    report_data, quote_measurement, quote_debug, quote_chip_id = _parse_quote(quote, kind)
+    # The verdict must be for these bytes, so the hash in the evidence names the
+    # quote that was actually verified.
+    if attested.measurement != quote_measurement:
+        raise AdmissionError("the verdict's measurement is not the quote's")
     hardware_id_kind = HARDWARE_ID_KINDS[("tee", kind)]
-    stable_platform_id = attestation.stable_platform_id
-    chip_id = attestation.chip_id
     try:
         # One hardware identity per kind, derived as receipts derive it.
         if kind == "tdx":
-            if not isinstance(stable_platform_id, str):
-                raise AdmissionError("a tdx attestation needs the verifier's stable_platform_id")
-            if chip_id is not None:
-                raise AdmissionError("a tdx attestation has no chip_id")
-            hardware_id = tdx_hardware_id(stable_platform_id)
+            if not isinstance(attested.chip_id, str):
+                raise AdmissionError("a tdx verdict needs the verifier's stable_platform_id")
+            hardware_id = tdx_hardware_id(attested.chip_id)
         else:
-            if stable_platform_id is not None:
-                raise AdmissionError("a sev_snp attestation has no stable_platform_id")
-            hardware_id = derive_hardware_id(hardware_id_kind, _raw_chip_id(chip_id))
+            assert quote_chip_id is not None
+            if attested.chip_id != quote_chip_id.hex():
+                raise AdmissionError("the verdict's chip_id is not the report's")
+            hardware_id = derive_hardware_id(hardware_id_kind, quote_chip_id)
         # The receipt's own evidence checks, so what admission hands T4 is a
         # value verify_receipt accepts.
         evidence = _check_evidence(
             {
                 "evidence_kind": kind,
-                "evidence_sha256": attestation.evidence_sha256,
-                "measurement": attestation.measurement,
-                "verifier_digest": attestation.verifier_digest,
+                "evidence_sha256": hashlib.sha256(quote).hexdigest(),
+                "measurement": quote_measurement,
+                "verifier_digest": verifier_digest,
                 "tls_spki_sha256": binding.digest.hex(),
+                "attestation_nonce": nonce.hex(),
+                "attested_at": attested_iso,
             },
             kind,
         )
     except ReceiptError as exc:
         raise AdmissionError(str(exc)) from exc
     assert evidence is not None  # a TEE kind always yields evidence
-    if not any(bytes.fromhex(evidence.evidence_sha256)):
-        raise AdmissionError("evidence_sha256 is all zeros")
 
     reasons: list[str] = []
+    if not _complete(attested, kind) or quote_debug:
+        reasons.append(VERIFICATION_INCOMPLETE)
     try:
         expected = report_data_v2(nonce, miner_hotkey, binding)
     except ValueError as exc:  # inputs are checked above; kept for a bare-exception-free API
@@ -381,5 +422,6 @@ def admit(
         measurement_allowed=measurement_allowed,
         mode=policy.mode,
         policy_digest=policy.digest,
-        evidence=None if reasons else evidence,
+        # Record-only in shadow: an unlisted measurement is never paid.
+        evidence=evidence if not reasons and measurement_allowed else None,
     )

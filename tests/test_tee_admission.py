@@ -19,19 +19,22 @@ from cryptography.x509.oid import NameOID
 from cathedral.capacity import admission as adm
 from cathedral.capacity import receipt
 from cathedral.channel import extract_spki_der
-from cathedral.common import ChannelBinding, ChannelBindingType, report_data_v2
+from cathedral.common import Attested, ChannelBinding, ChannelBindingType, Tier, report_data_v2
+from cathedral.verify import snp
+from cathedral.verify.tdx_quote import parse_tdx_quote
+from tests.tdx_quote_fixtures import synthetic_tdx_quote
 
 HOTKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 OTHER_HOTKEY = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 NONCE = bytes(range(1, 33))
 PPID = bytes.fromhex("0123456789abcdef0123456789abcdef")
 CHIP_ID = bytes(range(1, 65))
-TDX_MEASUREMENT = "tdx-measurement-sha256:" + "a1" * 32
-TDX_OTHER = "tdx-measurement-sha256:" + "b2" * 32
+MR_TD = b"M" * 48
+OTHER_MR_TD = b"N" * 48  # another image
 SNP_MEASUREMENT = "c3" * 48
 SNP_OTHER = "d4" * 48
 VERIFIER = "sha256:" + "5e" * 32
-EVIDENCE_SHA = "ab" * 32
+ATTESTED_AT = datetime(2026, 9, 28, 11, 0, 0, tzinfo=timezone.utc)
 _RNG = random.SystemRandom()
 
 
@@ -82,30 +85,68 @@ def _stable_platform_id(ppid: bytes) -> str:
 
 STABLE_ID = _stable_platform_id(PPID)
 OTHER_STABLE_ID = _stable_platform_id(bytes(reversed(PPID)))  # another platform
+REPORT_DATA = _v2_by_hand(NONCE, HOTKEY, CERT)
 
 
-def _tdx(**changes) -> adm.VerifiedAttestation:
-    base = adm.VerifiedAttestation(
-        kind="tdx",
-        measurement=TDX_MEASUREMENT,
-        verifier_digest=VERIFIER,
-        evidence_sha256=EVIDENCE_SHA,
-        report_data=_v2_by_hand(NONCE, HOTKEY, CERT),
-        stable_platform_id=STABLE_ID,
+def _tdx_quote(report_data: bytes = REPORT_DATA, mr_td: bytes = MR_TD, **changes) -> bytes:
+    return synthetic_tdx_quote(report_data=report_data, mr_td=mr_td, **changes)
+
+
+TDX_MEASUREMENT = parse_tdx_quote(_tdx_quote()).measurement
+TDX_OTHER = parse_tdx_quote(_tdx_quote(mr_td=OTHER_MR_TD)).measurement
+
+
+def _snp_report(
+    report_data: bytes = REPORT_DATA, measurement: str = SNP_MEASUREMENT, chip_id: bytes = CHIP_ID
+) -> bytes:
+    """A raw 1184-byte SEV-SNP report at cathedral/verify/snp.py's offsets."""
+
+    report = bytearray(snp.SNP_REPORT_SIZE)
+    report[snp.REPORT_DATA_OFFSET : snp.REPORT_DATA_OFFSET + 64] = report_data
+    report[snp.MEASUREMENT_OFFSET : snp.MEASUREMENT_OFFSET + 48] = bytes.fromhex(measurement)
+    report[snp.CHIP_ID_OFFSET : snp.CHIP_ID_OFFSET + 64] = chip_id
+    report[snp.SIGNATURE_OFFSET : snp.SIGNATURE_OFFSET + snp.SIGNATURE_SIZE] = b"\x5a" * 512
+    return bytes(report)
+
+
+def _tdx(quote: bytes | None = None, **changes) -> tuple[Attested, bytes]:
+    """A strict TDX verdict, as cathedral/verify/__init__.py returns it, and its quote."""
+
+    quote = _tdx_quote() if quote is None else quote
+    base = Attested(
+        tier=Tier.CC_CPU_TDX,
+        chip_id=STABLE_ID,
+        measurement=parse_tdx_quote(quote).measurement,
+        tcb=0,
+        verification_status="VERIFIED",
+        chain_verified=True,
+        tcb_status="UpToDate",
+        debug_enabled=False,
+        collateral_current=True,
+        platform_identity_kind="stable",
+        policy_mode="strict",
     )
-    return dataclasses.replace(base, **changes)
+    return dataclasses.replace(base, **changes), quote
 
 
-def _snp(**changes) -> adm.VerifiedAttestation:
-    base = adm.VerifiedAttestation(
-        kind="sev_snp",
-        measurement=SNP_MEASUREMENT,
-        verifier_digest=VERIFIER,
-        evidence_sha256=EVIDENCE_SHA,
-        report_data=_v2_by_hand(NONCE, HOTKEY, CERT),
-        chip_id=CHIP_ID.hex(),  # as cathedral/verify/snp.py reports chip_id
+def _snp(report: bytes | None = None, **changes) -> tuple[Attested, bytes]:
+    """A chain-verified SEV-SNP verdict, as verify_snp returns it, and its report."""
+
+    report = _snp_report() if report is None else report
+    parsed = snp.parse_snp_report(report)
+    base = Attested(
+        tier=Tier.CC_CPU_SNP,
+        chip_id=parsed.chip_id,  # hex, as cathedral/verify/snp.py reports it
+        measurement=parsed.measurement,
+        tcb=1,
+        verification_status="VERIFIED",
+        chain_verified=True,
     )
-    return dataclasses.replace(base, **changes)
+    return dataclasses.replace(base, **changes), report
+
+
+def _kind(pair) -> str:
+    return "tdx" if getattr(pair[0], "tier", None) == Tier.CC_CPU_TDX else "sev_snp"
 
 
 def _policy(kind: str = "tdx", mode: str = "enforce", allowed=None) -> adm.MeasurementPolicy:
@@ -119,17 +160,20 @@ def _policy_bytes(kind: str, mode: str, allowed) -> bytes:
     return json.dumps(document).encode()
 
 
-def _admit(attestation, **changes) -> adm.Admission:
+def _admit(pair, **changes) -> adm.Admission:
+    attested, quote = pair
     arguments = {
+        "verifier_digest": VERIFIER,
         "box_id": "box-1",
         "miner_hotkey": HOTKEY,
         "nonce": NONCE,
-        "policy": _policy(attestation.kind if attestation.kind in adm.TEE_KINDS else "tdx"),
+        "attested_at": ATTESTED_AT,
+        "policy": _policy(_kind(pair)),
         "admitted": {},
         "tls_certificate_der": CERT,
     }
     arguments.update(changes)
-    return adm.admit(attestation, **arguments)
+    return adm.admit(attested, quote, **arguments)
 
 
 # -- happy path ----------------------------------------------------------------------
@@ -156,10 +200,12 @@ def test_a_tdx_box_is_admitted_with_receipt_evidence():
     spki = hashlib.sha256(extract_spki_der(CERT)).hexdigest()
     assert result.evidence == receipt.ReceiptEvidence(
         evidence_kind="tdx",
-        evidence_sha256=EVIDENCE_SHA,
+        evidence_sha256=hashlib.sha256(_tdx_quote()).hexdigest(),  # hashed here, not passed in
         measurement=TDX_MEASUREMENT,
         verifier_digest=VERIFIER,
         tls_spki_sha256=spki,
+        attestation_nonce=NONCE.hex(),
+        attested_at="2026-09-28T11:00:00Z",
     )
     # what admission hands T4 is exactly what a receipt's evidence check accepts
     assert receipt._check_evidence(dataclasses.asdict(result.evidence), "tdx") == result.evidence
@@ -172,19 +218,35 @@ def test_a_snp_box_is_admitted_with_receipt_evidence():
     assert result.hardware_id == receipt.derive_hardware_id("chip_id", CHIP_ID)
     assert result.evidence.evidence_kind == "sev_snp"
     assert result.evidence.measurement == SNP_MEASUREMENT
+    assert result.evidence.evidence_sha256 == hashlib.sha256(_snp_report()).hexdigest()
     assert (
         receipt._check_evidence(dataclasses.asdict(result.evidence), "sev_snp") == result.evidence
     )
 
 
-def test_raw_bytes_and_hex_chip_ids_are_one_machine():
-    assert _admit(_snp(chip_id=CHIP_ID)).hardware_id == _admit(_snp()).hardware_id
+def test_admission_evidence_audits_against_the_quote():
+    # The evidence carries the nonce, so a receipt signed over it lets an auditor
+    # recompute the quote's REPORT_DATA (receipt.expected_report_data).
+    result = _admit(_tdx())
+    assert result.evidence.attestation_nonce == NONCE.hex()
+    assert (
+        bytes.fromhex(result.evidence.tls_spki_sha256)
+        == hashlib.sha256(extract_spki_der(CERT)).digest()
+    )
+    binding = ChannelBinding(
+        ChannelBindingType.TLS_SPKI_SHA256, bytes.fromhex(result.evidence.tls_spki_sha256)
+    )
+    expected = report_data_v2(bytes.fromhex(result.evidence.attestation_nonce), HOTKEY, binding)
+    assert parse_tdx_quote(_tdx_quote()).report_data == expected
 
 
-def test_there_is_no_raw_ppid_input():
+def test_there_is_no_raw_ppid_or_caller_hash_input():
     # No TDX verifier outputs the raw PPID; the hardware id is the stable_platform_id's.
-    names = {f.name for f in dataclasses.fields(adm.VerifiedAttestation)}
-    assert "hardware_id" not in names and "ppid" not in names
+    # The quote's hash and REPORT_DATA come from the quote bytes, never from the caller.
+    names = set(inspect.signature(adm.admit).parameters)
+    for absent in ("hardware_id", "ppid", "evidence_sha256", "report_data", "measurement"):
+        assert absent not in names
+    assert not hasattr(adm, "VerifiedAttestation")
     assert not hasattr(adm, "PLATFORM_ID_MISMATCH")
 
 
@@ -217,21 +279,27 @@ def test_report_data_for_another_nonce_key_or_hotkey_is_refused(make, changes):
 def test_an_application_key_binding_of_the_same_digest_is_not_a_tls_binding():
     spki = hashlib.sha256(extract_spki_der(CERT)).digest()
     other_type = ChannelBinding(ChannelBindingType.APPLICATION_KEY_SHA256, spki)
-    result = _admit(_tdx(report_data=report_data_v2(NONCE, HOTKEY, other_type)))
+    result = _admit(_tdx(_tdx_quote(report_data=report_data_v2(NONCE, HOTKEY, other_type))))
     assert result.reasons == (adm.REPORT_DATA_MISMATCH,)
+
+
+@pytest.mark.parametrize("make", ["tdx", "sev_snp"])
+def test_report_data_is_read_from_the_quote_itself(make):
+    # A quote made over another nonce is refused even though its verdict is complete.
+    other = _v2_by_hand(bytes(reversed(NONCE)), HOTKEY, CERT)
+    pair = _tdx(_tdx_quote(report_data=other)) if make == "tdx" else _snp(_snp_report(other))
+    assert _admit(pair).reasons == (adm.REPORT_DATA_MISMATCH,)
 
 
 def test_a_tdx_hardware_id_follows_the_stable_platform_id():
     here = _admit(_tdx())
-    other = _admit(_tdx(stable_platform_id=OTHER_STABLE_ID))
+    other = _admit(_tdx(chip_id=OTHER_STABLE_ID))
     assert other.admitted and other.hardware_id == receipt.tdx_hardware_id(OTHER_STABLE_ID)
     assert other.hardware_id != here.hardware_id
     # A box whose stable_platform_id is not the one admitted is another machine,
     # and one presenting an admitted platform's id is that machine.
     admitted = {here.hardware_id: adm.AdmittedBox("box-1", HOTKEY)}
-    assert _admit(
-        _tdx(stable_platform_id=OTHER_STABLE_ID), box_id="box-2", admitted=admitted
-    ).admitted
+    assert _admit(_tdx(chip_id=OTHER_STABLE_ID), box_id="box-2", admitted=admitted).admitted
     claimed = _admit(_tdx(), box_id="box-2", admitted=admitted)
     assert claimed.reasons == (adm.HARDWARE_ID_CLAIMED,)
 
@@ -239,27 +307,118 @@ def test_a_tdx_hardware_id_follows_the_stable_platform_id():
 # -- measurement policy -----------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "make, other, kind", [(_tdx, TDX_OTHER, "tdx"), (_snp, SNP_OTHER, "sev_snp")]
-)
-def test_enforce_refuses_an_unlisted_measurement_and_shadow_records_it(make, other, kind):
-    enforce = _admit(make(measurement=other), policy=_policy(kind, "enforce"))
+def _unlisted(kind: str):
+    if kind == "tdx":
+        return _tdx(_tdx_quote(mr_td=OTHER_MR_TD)), TDX_OTHER
+    return _snp(_snp_report(measurement=SNP_OTHER)), SNP_OTHER
+
+
+@pytest.mark.parametrize("kind", ["tdx", "sev_snp"])
+def test_enforce_refuses_an_unlisted_measurement_and_shadow_records_it_unpaid(kind):
+    pair, other = _unlisted(kind)
+    enforce = _admit(pair, policy=_policy(kind, "enforce"))
     assert not enforce.admitted
     assert enforce.reasons == (adm.MEASUREMENT_NOT_ALLOWED,)
     assert (enforce.measurement_allowed, enforce.mode) == (False, "enforce")
+    assert enforce.evidence is None
 
-    shadow = _admit(make(measurement=other), policy=_policy(kind, "shadow"))
+    # Shadow records the box and its measurement but hands out no receipt
+    # evidence: an unvetted image could attest a relay's TLS key, so its
+    # capacity must not be paid at TEE rates.
+    shadow = _admit(pair, policy=_policy(kind, "shadow"))
     assert shadow.admitted and shadow.reasons == ()
     assert (shadow.measurement_allowed, shadow.mode) == (False, "shadow")
-    assert shadow.evidence.measurement == other
+    assert shadow.measurement == other
+    assert shadow.evidence is None
 
-    listed = _admit(make(), policy=_policy(kind, "shadow"))
+    listed = _admit(_tdx() if kind == "tdx" else _snp(), policy=_policy(kind, "shadow"))
     assert listed.admitted and listed.measurement_allowed
+    assert listed.evidence is not None  # a listed measurement pays in shadow too
 
 
-def test_an_empty_shadow_policy_admits_everything_and_allows_nothing():
+def test_an_empty_shadow_policy_admits_everything_and_pays_nothing():
     result = _admit(_tdx(), policy=_policy("tdx", "shadow", []))
     assert result.admitted and not result.measurement_allowed
+    assert result.evidence is None
+
+
+# -- verification completeness ------------------------------------------------------------
+
+
+_INCOMPLETE_TDX = {
+    # a compatibility-mode TDX verdict skips the strict collateral and identity gates
+    "compatibility_mode": {"policy_mode": "compatibility"},
+    "no_policy_mode": {"policy_mode": None},
+    "collateral_stale": {"collateral_current": False},
+    "collateral_unknown": {"collateral_current": None},
+    "debug_on": {"debug_enabled": True},
+    "debug_unknown": {"debug_enabled": None},
+    "unverified": {"verification_status": "UNVERIFIED"},
+    "chain_unverified": {"chain_verified": False},
+    "chain_truthy": {"chain_verified": 1},
+}
+_INCOMPLETE_SNP = {
+    # verify_snp_report_data(require_chain=False): "must never be used for admission"
+    "structure_only": {
+        "verification_status": snp.STRUCTURE_OK_CHAIN_UNVERIFIED,
+        "chain_verified": False,
+    },
+    "status_only": {"verification_status": snp.STRUCTURE_OK_CHAIN_UNVERIFIED},
+    "chain_only": {"chain_verified": False},
+    "default_verdict": {"verification_status": "UNVERIFIED", "chain_verified": False},
+}
+
+
+@pytest.mark.parametrize(
+    "kind, changes",
+    [("tdx", c) for c in _INCOMPLETE_TDX.values()]
+    + [("sev_snp", c) for c in _INCOMPLETE_SNP.values()],
+    ids=[f"tdx-{n}" for n in _INCOMPLETE_TDX] + [f"snp-{n}" for n in _INCOMPLETE_SNP],
+)
+def test_a_partial_verification_is_refused(kind, changes):
+    pair = _tdx(**changes) if kind == "tdx" else _snp(**changes)
+    result = _admit(pair)
+    assert not result.admitted
+    assert result.reasons == (adm.VERIFICATION_INCOMPLETE,)
+    assert result.evidence is None
+    # in shadow too: the policy mode never relaxes the verification
+    assert _admit(pair, policy=_policy(kind, "shadow")).reasons == (adm.VERIFICATION_INCOMPLETE,)
+
+
+def test_a_debug_quote_is_refused_even_under_a_debug_off_verdict():
+    quote = _tdx_quote(td_attributes=(1).to_bytes(8, "little"))
+    result = _admit(_tdx(quote), policy=_policy("tdx", "shadow"))
+    assert result.reasons == (adm.VERIFICATION_INCOMPLETE,)
+
+
+def test_the_snp_verdict_needs_no_tdx_fields():
+    # verify_snp leaves policy_mode, collateral_current and debug_enabled unset;
+    # the report's own debug bit is checked by the verifier.
+    attested, _ = _snp()
+    assert (attested.policy_mode, attested.collateral_current, attested.debug_enabled) == (
+        None,
+        None,
+        None,
+    )
+    assert _admit(_snp()).admitted
+
+
+@pytest.mark.parametrize("kind", ["tdx", "sev_snp"])
+def test_the_verdict_must_be_for_the_quote(kind):
+    # A verdict for one quote with another quote's bytes: the evidence hash
+    # would name bytes nobody verified.
+    if kind == "tdx":
+        attested, _ = _tdx()
+        pair = (attested, _tdx_quote(mr_td=OTHER_MR_TD))
+    else:
+        attested, _ = _snp()
+        pair = (attested, _snp_report(measurement=SNP_OTHER))
+    with pytest.raises(adm.AdmissionError, match="measurement is not the quote's"):
+        _admit(pair)
+    if kind == "sev_snp":
+        other_chip = (attested, _snp_report(chip_id=bytes(reversed(CHIP_ID))))
+        with pytest.raises(adm.AdmissionError, match="chip_id is not the report's"):
+            _admit(other_chip)
 
 
 def test_the_validator_256_policy_file_loads_unchanged():
@@ -299,7 +458,7 @@ _BAD_POLICIES = {
     "mixed_entries": '{"schema":"%s","mode":"shadow","allowed_measurements":["%s",1]}'
     % (TDX_SCHEMA, TDX_MEASUREMENT),
     "unsorted": '{"schema":"%s","mode":"shadow","allowed_measurements":["%s","%s"]}'
-    % (TDX_SCHEMA, TDX_OTHER, TDX_MEASUREMENT),
+    % (TDX_SCHEMA, *sorted([TDX_OTHER, TDX_MEASUREMENT], reverse=True)),
     "repeated": '{"schema":"%s","mode":"shadow","allowed_measurements":["%s","%s"]}'
     % (TDX_SCHEMA, TDX_MEASUREMENT, TDX_MEASUREMENT),
     "upper_hex": '{"schema":"%s","mode":"shadow","allowed_measurements":["%s"]}'
@@ -349,6 +508,16 @@ def test_policy_bytes_must_be_bounded_utf8_json(raw):
         adm.parse_policy(raw)
 
 
+def test_the_policy_size_cap_is_128_kib_of_otherwise_valid_json():
+    # Trailing whitespace keeps the JSON valid, so only the size cap can refuse it.
+    raw = _policy_bytes("tdx", "enforce", [TDX_MEASUREMENT])
+    at_cap = raw + b" " * (adm.MAX_POLICY_BYTES - len(raw))
+    assert len(at_cap) == adm.MAX_POLICY_BYTES == 128 * 1024
+    assert adm.parse_policy(at_cap).allowed_measurements == frozenset({TDX_MEASUREMENT})
+    with pytest.raises(adm.AdmissionError, match="128 KiB"):
+        adm.parse_policy(at_cap + b" ")
+
+
 # -- one box per host -------------------------------------------------------------------
 
 
@@ -359,14 +528,10 @@ def test_a_hardware_id_already_admitted_to_another_box_is_refused():
     assert other_box.reasons == (adm.HARDWARE_ID_CLAIMED,)
     assert not other_box.admitted and other_box.evidence is None
     # the same box id under another hotkey is another box too
-    moved = adm.admit(
-        _tdx(report_data=_v2_by_hand(NONCE, OTHER_HOTKEY, CERT)),
-        box_id="box-1",
+    moved = _admit(
+        _tdx(_tdx_quote(report_data=_v2_by_hand(NONCE, OTHER_HOTKEY, CERT))),
         miner_hotkey=OTHER_HOTKEY,
-        nonce=NONCE,
-        policy=_policy(),
         admitted=first,
-        tls_certificate_der=CERT,
     )
     assert moved.reasons == (adm.HARDWARE_ID_CLAIMED,)
 
@@ -392,12 +557,13 @@ def test_a_tdx_and_a_snp_id_never_collide():
 def test_every_refusal_is_reported_together():
     hardware_id = receipt.tdx_hardware_id(STABLE_ID)
     result = _admit(
-        _tdx(measurement=TDX_OTHER),
+        _tdx(_tdx_quote(mr_td=OTHER_MR_TD), collateral_current=False),
         nonce=bytes(reversed(NONCE)),
         box_id="box-9",
         admitted={hardware_id: adm.AdmittedBox("box-1", HOTKEY)},
     )
     assert result.reasons == (
+        adm.VERIFICATION_INCOMPLETE,
         adm.REPORT_DATA_MISMATCH,
         adm.MEASUREMENT_NOT_ALLOWED,
         adm.HARDWARE_ID_CLAIMED,
@@ -407,70 +573,69 @@ def test_every_refusal_is_reported_together():
 # -- malformed input -----------------------------------------------------------------------
 
 
-_BAD_ATTESTATION = {
-    "kind_unknown": {"kind": "gpu_cc"},
-    "kind_not_str": {"kind": ["tdx"]},
-    "chip_id_set": {"chip_id": CHIP_ID},
-    "measurement_bare_hex": {"measurement": "11" * 32},
-    "measurement_zero": {"measurement": "tdx-measurement-sha256:" + "00" * 32},
-    "measurement_snp_shape": {"measurement": SNP_MEASUREMENT},
+_BAD_TDX = {
+    "tier_gpu": {"tier": Tier.CC_GPU},
+    "tier_str": {"tier": "cc_cpu_tdx"},
+    "measurement_other": {"measurement": TDX_OTHER},
     "measurement_none": {"measurement": None},
-    "verifier_bare_hex": {"verifier_digest": "55" * 32},
-    "evidence_upper": {"evidence_sha256": EVIDENCE_SHA.upper()},
-    "evidence_zero": {"evidence_sha256": "00" * 32},
-    "report_data_short": {"report_data": bytes(63)},
-    "report_data_str": {"report_data": "00" * 64},
-    "stable_id_missing": {"stable_platform_id": None},
-    "stable_id_bare": {"stable_platform_id": STABLE_ID.split(":")[1]},
-    "stable_id_upper": {"stable_platform_id": STABLE_ID.upper()},
-    "stable_id_short": {"stable_platform_id": STABLE_ID[:-2]},
-    "stable_id_long": {"stable_platform_id": STABLE_ID + "00"},
-    "stable_id_newline": {"stable_platform_id": STABLE_ID + "\n"},
-    "stable_id_pck_prefix": {"stable_platform_id": STABLE_ID.replace("platform", "pck-cert")},
-    "stable_id_zero": {"stable_platform_id": "tdx-platform-sha256:" + "0" * 64},
-    "stable_id_bytes": {"stable_platform_id": STABLE_ID.encode()},
-    "stable_id_int": {"stable_platform_id": 7},
+    "stable_id_missing": {"chip_id": None},
+    "stable_id_bare": {"chip_id": STABLE_ID.split(":")[1]},
+    "stable_id_upper": {"chip_id": STABLE_ID.upper()},
+    "stable_id_short": {"chip_id": STABLE_ID[:-2]},
+    "stable_id_long": {"chip_id": STABLE_ID + "00"},
+    "stable_id_newline": {"chip_id": STABLE_ID + "\n"},
+    "stable_id_pck_prefix": {"chip_id": STABLE_ID.replace("platform", "pck-cert")},
+    "stable_id_zero": {"chip_id": "tdx-platform-sha256:" + "0" * 64},
+    "stable_id_bytes": {"chip_id": STABLE_ID.encode()},
+    "stable_id_int": {"chip_id": 7},
+}
+_BAD_TDX_QUOTE = {
+    "empty": b"",
+    "truncated": _tdx_quote()[:600],
+    "version_5": b"\x05\x00" + _tdx_quote()[2:],
+    "str": _tdx_quote().hex(),
+    "bytearray": bytearray(_tdx_quote()),
+    "too_big": _tdx_quote() + bytes(adm.MAX_QUOTE_BYTES),
+    "snp_report": _snp_report(),
 }
 
 
-@pytest.mark.parametrize("name", sorted(_BAD_ATTESTATION))
-def test_a_malformed_tdx_attestation_is_an_error(name):
+@pytest.mark.parametrize("name", sorted(_BAD_TDX))
+def test_a_malformed_tdx_verdict_is_an_error(name):
     with pytest.raises(adm.AdmissionError):
-        _admit(_tdx(**_BAD_ATTESTATION[name]), policy=_policy("tdx"))
+        _admit(_tdx(**_BAD_TDX[name]), policy=_policy("tdx"))
 
 
-@pytest.mark.parametrize(
-    "changes",
-    [
-        {"chip_id": CHIP_ID[:63]},
-        {"chip_id": bytes(64)},
-        {"chip_id": None},
-        {"chip_id": CHIP_ID.hex().upper()},
-        {"chip_id": CHIP_ID.hex()[:-1]},
-        {"chip_id": 7},
-        {"chip_id": bytearray(CHIP_ID)},
-        {"measurement": "33" * 47},
-        {"measurement": TDX_MEASUREMENT},
-        {"measurement": SNP_MEASUREMENT.upper()},
-        {"stable_platform_id": STABLE_ID},
-    ],
-    ids=[
-        "chip_short",
-        "chip_zero",
-        "chip_missing",
-        "chip_upper_hex",
-        "chip_odd_hex",
-        "chip_int",
-        "chip_bytearray",
-        "measurement_short",
-        "measurement_tdx",
-        "measurement_upper",
-        "stable_id_set",
-    ],
-)
-def test_a_malformed_snp_attestation_is_an_error(changes):
+@pytest.mark.parametrize("name", sorted(_BAD_TDX_QUOTE))
+def test_a_malformed_tdx_quote_is_an_error(name):
+    attested, _ = _tdx()
     with pytest.raises(adm.AdmissionError):
-        _admit(_snp(**changes), policy=_policy("sev_snp"))
+        _admit((attested, _BAD_TDX_QUOTE[name]), policy=_policy("tdx"))
+
+
+_BAD_SNP = {
+    "chip_bytes": ({"chip_id": CHIP_ID}, None),
+    "chip_upper_hex": ({"chip_id": CHIP_ID.hex().upper()}, None),
+    "chip_missing": ({"chip_id": None}, None),
+    "chip_other": ({"chip_id": bytes(reversed(CHIP_ID)).hex()}, None),
+    "chip_zero": ({"chip_id": "00" * 64}, _snp_report(chip_id=bytes(64))),
+    "measurement_tdx": ({"measurement": TDX_MEASUREMENT}, None),
+    "measurement_upper": ({"measurement": SNP_MEASUREMENT.upper()}, None),
+    "measurement_zero": ({"measurement": "00" * 48}, _snp_report(measurement="00" * 48)),
+    "report_short": ({}, _snp_report()[:-1]),
+    "report_long": ({}, _snp_report() + b"\x00"),
+    "report_unsigned": ({}, _snp_report()[: snp.SIGNATURE_OFFSET] + bytes(512) + b"\x00" * 160),
+    "report_is_tdx_quote": ({}, _tdx_quote()),
+    "tier_tdx": ({"tier": Tier.CC_CPU_TDX}, None),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_BAD_SNP))
+def test_a_malformed_snp_verdict_or_report_is_an_error(name):
+    changes, report = _BAD_SNP[name]
+    attested, good = _snp(**changes)
+    with pytest.raises(adm.AdmissionError):
+        _admit((attested, good if report is None else report), policy=_policy("sev_snp"))
 
 
 def _der_sequence(content: bytes) -> bytes:
@@ -496,6 +661,13 @@ _BAD_CALL = {
     "spki_trailing": {"tls_certificate_der": None, "tls_spki_der": extract_spki_der(CERT) + b"\0"},
     "spki_extra_field": {"tls_certificate_der": None, "tls_spki_der": _spki_with_extra_field()},
     "spki_is_cert": {"tls_certificate_der": None, "tls_spki_der": CERT},
+    "verifier_bare_hex": {"verifier_digest": "55" * 32},
+    "verifier_none": {"verifier_digest": None},
+    "attested_at_naive": {"attested_at": ATTESTED_AT.replace(tzinfo=None)},
+    "attested_at_str": {"attested_at": "2026-09-28T11:00:00Z"},
+    "attested_at_epoch": {"attested_at": ATTESTED_AT.timestamp()},
+    "attested_at_overflow": {"attested_at": datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=5)))},
+    "attested_at_year_5": {"attested_at": datetime(5, 1, 1, tzinfo=timezone.utc)},
     "nonce_short": {"nonce": NONCE[:31]},
     "nonce_zero": {"nonce": bytes(32)},
     "nonce_str": {"nonce": NONCE.hex()},
@@ -525,17 +697,11 @@ def test_malformed_call_arguments_are_an_error(name):
         _admit(_tdx(), **_BAD_CALL[name])
 
 
-def test_an_attestation_of_the_wrong_type_is_an_error():
-    with pytest.raises(adm.AdmissionError):
-        adm.admit(
-            {"kind": "tdx"},
-            box_id="box-1",
-            miner_hotkey=HOTKEY,
-            nonce=NONCE,
-            policy=_policy(),
-            admitted={},
-            tls_certificate_der=CERT,
-        )
+def test_a_verdict_of_the_wrong_type_is_an_error():
+    attested, quote = _tdx()
+    for junk in ({"tier": "cc_cpu_tdx"}, dataclasses.asdict(attested), None):
+        with pytest.raises(adm.AdmissionError, match="cathedral.common.Attested"):
+            _admit((junk, quote))
 
 
 _JUNK = [
@@ -562,13 +728,17 @@ _JUNK = [
 def _mutations():
     rng = random.Random(_RNG.randrange(2**32))
     for _ in range(400):
-        attestation = rng.choice([_tdx, _snp])()
-        fields = {f.name: getattr(attestation, f.name) for f in dataclasses.fields(attestation)}
+        pair = rng.choice([_tdx, _snp])()
+        attested, quote = pair
+        fields = {f.name: getattr(attested, f.name) for f in dataclasses.fields(attested)}
         call = {
+            "quote": quote,
+            "verifier_digest": VERIFIER,
             "box_id": "box-1",
             "miner_hotkey": HOTKEY,
             "nonce": NONCE,
-            "policy": _policy(attestation.kind),
+            "attested_at": ATTESTED_AT,
+            "policy": _policy(_kind(pair)),
             "admitted": {},
             "tls_certificate_der": CERT,
             "tls_spki_der": None,
@@ -585,21 +755,23 @@ def _mutations():
         else:
             value = rng.choice(_JUNK)
         target[name] = value
-        yield adm.VerifiedAttestation(**fields), call
+        yield Attested(**fields), call
 
 
 def test_fuzzed_input_is_an_admission_error_or_a_decision_never_another_exception():
     decisions = errors = 0
-    for attestation, call in _mutations():
+    for attested, call in _mutations():
         try:
-            result = adm.admit(attestation, **call)
+            result = adm.admit(attested, call.pop("quote"), **call)
         except adm.AdmissionError:
             errors += 1
         else:
             decisions += 1
             assert isinstance(result, adm.Admission)
             assert result.admitted == (not result.reasons)
-            assert (result.evidence is None) == (not result.admitted)
+            assert (result.evidence is None) == (
+                not result.admitted or not result.measurement_allowed
+            )
     assert errors and decisions
 
 
