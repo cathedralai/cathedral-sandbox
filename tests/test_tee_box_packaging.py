@@ -28,7 +28,7 @@ def test_the_opt_in_layer_pins_runsc_by_release_and_sha256():
     assert "# syntax=" not in dockerfile
     # The fetch stage uses the miner images' own pinned base.
     assert f"FROM {BASE} AS runsc" in dockerfile
-    for name in ("Dockerfile.sn39-audit-miner", "Dockerfile.sn39-snp-miner"):
+    for name in ("Dockerfile.sn94-audit-miner", "Dockerfile.sn94-snp-miner"):
         assert f"FROM {BASE}" in _read(name)
 
 
@@ -45,10 +45,10 @@ def test_the_opt_in_layer_needs_an_explicit_digest_pinned_miner_image():
 
 def test_production_miner_images_and_publishers_do_not_ship_runsc():
     for name in (
-        "Dockerfile.sn39-audit-miner",
-        "Dockerfile.sn39-snp-miner",
-        ".github/workflows/publish-sn39-audit-miner.yml",
-        ".github/workflows/publish-sn39-snp-miner.yml",
+        "Dockerfile.sn94-audit-miner",
+        "Dockerfile.sn94-snp-miner",
+        ".github/workflows/publish-sn94-audit-miner.yml",
+        ".github/workflows/publish-sn94-snp-miner.yml",
     ):
         text = _read(name)
         assert "runsc" not in text and "gvisor" not in text.lower(), name

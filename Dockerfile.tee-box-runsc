@@ -1,8 +1,8 @@
 # Opt-in TEE box layer (T6b1). NOT a production image and not published.
 #
-# It adds a pinned, checksum-verified gVisor runsc to an SN39 miner image that
-# was already built from Dockerfile.sn39-audit-miner (TDX) or
-# Dockerfile.sn39-snp-miner (SNP). The production images stay unchanged until
+# It adds a pinned, checksum-verified gVisor runsc to an SN94 miner image that
+# was already built from Dockerfile.sn94-audit-miner (TDX) or
+# Dockerfile.sn94-snp-miner (SNP). The production images stay unchanged until
 # T6b2 qualifies runsc under real TDX and SNP guests (docs/TEE_BOX_SERVICE.md).
 #
 #   docker build -f Dockerfile.tee-box-runsc \

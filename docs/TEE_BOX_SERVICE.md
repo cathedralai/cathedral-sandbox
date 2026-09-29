@@ -383,14 +383,14 @@ fails; creates never run unbounded.
 
 ## Packaging (T6b1)
 
-`Dockerfile.tee-box-runsc` is a separate, opt-in build. It takes an SN39
+`Dockerfile.tee-box-runsc` is a separate, opt-in build. It takes an SN94
 TDX or SNP miner image pinned by digest (`MINER_IMAGE`, no default) and adds
 gVisor `runsc` from release `20260817.0`, the last weekly release that
 publishes runsc as a single binary. The build fetches it from Google's
 release bucket and refuses any file whose sha256 differs from the pinned
 one. `tests/test_tee_box_packaging.py` checks the pins.
 
-The production `Dockerfile.sn39-audit-miner` and `Dockerfile.sn39-snp-miner`,
+The production `Dockerfile.sn94-audit-miner` and `Dockerfile.sn94-snp-miner`,
 their publishers and their runtime contracts are unchanged. Adding runsc to
 them before T6b2 qualification would change every miner's measured image for
 a feature no miner can use yet. The runtime also has to sit with the Docker
