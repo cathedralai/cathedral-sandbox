@@ -22,8 +22,10 @@ import base64
 import binascii
 import hashlib
 import hmac
+import os
 import re
 import sqlite3
+import stat
 import threading
 import time
 from collections import deque
@@ -63,6 +65,7 @@ CENTRAL_REQUEST_HEADER = "X-Cathedral-Central-Request"
 MAX_DELEGATION_SECONDS = 24 * 60 * 60
 MAX_CENTRAL_REPLAY_ENTRIES = 1024
 MAX_REVOKED_DELEGATIONS = 4096
+MAX_REVOCATIONS_FILE_BYTES = 512 * 1024
 MAX_CENTRAL_CONCURRENT = 2
 DEFAULT_CENTRAL_REQUESTS_PER_WINDOW = 60
 DEFAULT_CENTRAL_RATE_WINDOW_SECONDS = 60.0
@@ -157,6 +160,15 @@ class CentralAccessState(ValidatorAccessState):
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS central_revocations (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    sequence INTEGER NOT NULL,
+                    document BLOB NOT NULL
+                )
+                """
+            )
             connection.commit()
         finally:
             connection.close()
@@ -205,6 +217,60 @@ class CentralAccessState(ValidatorAccessState):
         except (sqlite3.Error, ValidatorAccessError):
             return None
         return int(row[0])
+
+    def stored_revocations(self) -> tuple[int, bytes] | None:
+        """The revocation list in force as (sequence, canonical JSON).
+
+        ``(0, b"")`` means none was ever installed; None means the store failed.
+        """
+
+        if self.closed:
+            return None
+        try:
+            connection = self._connect()
+            try:
+                row = connection.execute(
+                    "SELECT sequence, document FROM central_revocations WHERE singleton = 1"
+                ).fetchone()
+            finally:
+                connection.close()
+        except (sqlite3.Error, ValidatorAccessError):
+            return None
+        return (0, b"") if row is None else (int(row[0]), bytes(row[1]))
+
+    def store_revocations(self, sequence: int, document: bytes) -> tuple[int, bytes] | None:
+        """Keep ``document`` only if its sequence is higher; return what is stored.
+
+        A list with the same sequence as the stored one never replaces it, so
+        the caller compares what comes back. None means the store failed.
+        """
+
+        if self.closed:
+            return None
+        try:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO central_revocations(singleton, sequence, document)
+                    VALUES (1, ?, ?)
+                    ON CONFLICT(singleton) DO UPDATE SET
+                        sequence = excluded.sequence,
+                        document = excluded.document
+                    WHERE excluded.sequence > central_revocations.sequence
+                    """,
+                    (sequence, document),
+                )
+                row = connection.execute(
+                    "SELECT sequence, document FROM central_revocations WHERE singleton = 1"
+                ).fetchone()
+                connection.commit()
+            finally:
+                connection.close()
+        except (sqlite3.Error, ValidatorAccessError):
+            return None
+        return int(row[0]), bytes(row[1])
 
 
 def open_central_access_state(path: str) -> CentralAccessState:
@@ -513,11 +579,12 @@ class CentralAccessAuthorizer:
     checked against the stored value, raised in the same transaction, so
     workers that share one state file honour each other's newer delegations.
 
-    Revocations and the revocation-list sequence are held in memory only.
-    Nothing installs a revocation list yet, so that is not exploitable today.
-    When the revocation fetch lands, the list and its sequence must be
-    persisted in ``state`` too, or a restart drops them and an older list (or
-    no list) could be accepted again.
+    The revocation list in force is persisted in ``state`` and restored at
+    start, so a restart never drops it, and a list older than it, or a
+    different list under the same sequence, is refused. ``revocations_path``
+    names a local file the operator keeps current; it is re-read before a
+    request whenever it changes, and while it is missing or unusable every
+    central request is refused.
     """
 
     def __init__(
@@ -529,6 +596,7 @@ class CentralAccessAuthorizer:
         netuid: int,
         channel_binding: ChannelBinding,
         state: CentralAccessState,
+        revocations_path: str | None = None,
     ) -> None:
         if not root_keys:
             raise CentralAccessError("central access requires at least one pinned root key")
@@ -551,18 +619,105 @@ class CentralAccessAuthorizer:
         if high_water is None:
             raise CentralAccessError("central delegation high-water is unreadable")
         self._delegation_high_water = high_water
+        stored = state.stored_revocations()
+        if stored is None:
+            raise CentralAccessError("central revocation list in force is unreadable")
+        if stored[0]:
+            try:
+                document = parse_registry_json(stored[1])
+            except ValueError as exc:
+                raise CentralAccessError("stored central revocation list is invalid") from exc
+            self._revocations_sequence, self._revoked = verify_revocations(
+                document, self.root_keys, minimum_sequence=stored[0]
+            )
+        self._revocations_path = revocations_path
+        self._revocations_file: tuple[int, int, int, int] | None = None
+        self._revocations_file_error: str | None = None
+        if revocations_path is not None:
+            with self._lock:
+                self._refresh_revocations_locked()
+            if self._revocations_file_error is not None:
+                raise CentralAccessError(self._revocations_file_error)
 
     def install_revocations(self, document: object) -> None:
         """Replace the revocation set with a newer or equal signed list."""
 
         with self._lock:
-            sequence, revoked = verify_revocations(
-                document, self.root_keys, minimum_sequence=self._revocations_sequence
+            self._install_revocations_locked(document)
+
+    def _install_revocations_locked(self, document: object) -> None:
+        sequence, revoked = verify_revocations(
+            document, self.root_keys, minimum_sequence=self._revocations_sequence
+        )
+        if sequence == self._revocations_sequence and revoked != self._revoked:
+            raise CentralAccessError("central revocation list changed without a new sequence")
+        stored = self.state.store_revocations(sequence, canonical_json(document))
+        if stored is None:
+            raise CentralAccessError("central revocation list could not be persisted")
+        if stored[0] != sequence:
+            raise CentralAccessError("central revocation list is older than the one in force")
+        try:
+            stored_sequence, stored_revoked = verify_revocations(
+                parse_registry_json(stored[1]), self.root_keys, minimum_sequence=sequence
             )
-            if sequence == self._revocations_sequence and revoked != self._revoked:
-                raise CentralAccessError("central revocation list changed without a new sequence")
-            self._revocations_sequence = sequence
-            self._revoked = revoked
+        except ValueError as exc:
+            raise CentralAccessError("stored central revocation list is invalid") from exc
+        if (stored_sequence, stored_revoked) != (sequence, revoked):
+            raise CentralAccessError("central revocation list changed without a new sequence")
+        self._revocations_sequence = sequence
+        self._revoked = revoked
+
+    def _refresh_revocations_locked(self) -> None:
+        """Install the operator's revocation file if it changed since last read.
+
+        Any failure is remembered for that exact file, so requests are refused
+        until the file is replaced, without re-parsing it on every request.
+        """
+
+        path = self._revocations_path
+        if path is None:
+            return
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        except OSError:
+            self._revocations_file = None
+            self._revocations_file_error = "central revocation list file is unavailable"
+            return
+        try:
+            metadata = os.fstat(descriptor)
+            identity = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            )
+            if identity == self._revocations_file:
+                return
+            self._revocations_file = identity
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid not in {0, os.geteuid()}
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+                or not 1 <= metadata.st_size <= MAX_REVOCATIONS_FILE_BYTES
+            ):
+                self._revocations_file_error = (
+                    "central revocation list file must be a bounded regular file "
+                    "that only its owner can write"
+                )
+                return
+            with os.fdopen(os.dup(descriptor), "rb") as handle:
+                raw = handle.read(MAX_REVOCATIONS_FILE_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        try:
+            document = parse_registry_json(raw)
+            if raw.rstrip(b"\n") != canonical_json(document):
+                raise ValueError("not canonical")
+            self._install_revocations_locked(document)
+        except (ValueError, CentralAccessError) as exc:
+            self._revocations_file_error = f"central revocation list file is unusable: {exc}"
+            return
+        self._revocations_file_error = None
 
     def preauthorize(
         self, header: object, *, method: str, path: str, now: datetime
@@ -570,6 +725,10 @@ class CentralAccessAuthorizer:
         """Check everything but the body, before the body is read."""
 
         now = _check_now(now)
+        with self._lock:
+            self._refresh_revocations_locked()
+            if self._revocations_file_error is not None:
+                raise CentralAccessError(self._revocations_file_error)
         if (
             not isinstance(header, str)
             or not header
