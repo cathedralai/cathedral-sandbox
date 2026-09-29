@@ -11,6 +11,11 @@ at the cited blocks. Recheck them before registration; they are not current
 quotes or launch evidence. This guide is the existing SAT lane, not the
 [customer sandbox delivery executor](SN94_DELIVERY_CONTRACT.md).
 
+For customer-delivery mining, use the
+[appliance release and enrollment gates](SN94_DELIVERY_CONTRACT.md#customer-miner-onboarding-gates).
+That path requires an approved measured appliance and control-plane allocation
+grants. The SAT images and systemd commands on this page do not install it.
+
 ## Status: what works today
 
 - **Miner side: ready.** The pinned images compile Finney netuid 94

@@ -17,13 +17,21 @@ SN94 value filled in, and lists what validators must do before any miner earns.
 
 ## Customer-delivery V1 scope
 
-The [customer delivery contract](docs/SN94_DELIVERY_CONTRACT.md) adds dual-signed
-receipts and strict TDX admission checks. Its lifecycle producer and control-plane
-allocation bridge are not connected. This codec is not a running executor.
-The quickstart below describes the existing SAT miner lane; it does not establish
-Affine sandbox compatibility or delivered-resource rewards.
+The [customer delivery contract](docs/SN94_DELIVERY_CONTRACT.md) defines signed
+allocation grants, dual-signed receipts and strict TDX admission checks. The
+[measured customer appliance source](https://github.com/cathedralai/cathedral-pool/blob/8266eea61789aaf502b05fce788711ebaddca753/ops/attested_appliance/README.md)
+connects grants to the Node's actual lifecycle and signed receipt windows. Its
+first offer is ten fixed-image, no-egress 1 vCPU / 4 GiB slots inside one TD per
+project/job. Local tests cover the source; a qualified appliance release,
+measured hardware launch and customer control-plane enrollment remain gates.
 
-## How mining works
+**Customer-delivery miner onboarding is not complete.** Start with the
+[release and enrollment gaps](docs/SN94_DELIVERY_CONTRACT.md#customer-miner-onboarding-gates).
+The quickstart below describes the existing SAT miner lane. It does not establish
+Affine sandbox compatibility or delivered-resource rewards, and its published
+images are not the new measured customer appliance.
+
+## Existing SAT mining path
 
 Cathedral's validator reads every serving non-validator miner from SN94. It
 does not download weights from Cathedral and it does not use a weight relay.
