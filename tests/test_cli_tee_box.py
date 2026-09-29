@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from cathedral.policy_registry import canonical_json
 from cathedral.tee_box import TeeBoxSandboxApi, measured_root
 from cathedral.tee_box import configure as configure_module
 from cathedral.tee_box.configure import OPTIONAL, REQUIRED, tee_box_config
+from cathedral.tee_box.storage import TMPFS_MAGIC, StorageProbe
 from tests.test_cli import _tls_material
 from tests.test_tee_box_service import NETUID, OTHER_ROOT_SEED, ROOT_KEYS, ROOT_SEED, _public
 from tests.test_validator_access import WORKER_HOTKEY
@@ -49,6 +51,8 @@ class _Guest:
 
     def __init__(self, *, storage: bytes = b'"overlay2" [["Backing Filesystem","xfs"]]'):
         self.storage = storage
+        self.docker_root = "/var/lib/docker"
+        self.driver_status = [["Backing Filesystem", "xfs"]]
         self.nft_fails = False
         self.calls: list[list[str]] = []
 
@@ -58,6 +62,9 @@ class _Guest:
         tool = argv[0].rsplit("/", 1)[-1]
         if tool == "docker" and argv[1] == "info":
             out = RUNSC.encode() if "Runtimes" in argv[-1] else self.storage
+            if "DockerRootDir" in argv[-1]:
+                parts = (self.docker_root, "overlay2", self.driver_status)
+                out = " ".join(json.dumps(part) for part in parts).encode()
             return subprocess.CompletedProcess(argv, 0, out, b"")
         if tool == "docker" and argv[1:3] == ["network", "inspect"]:
             network = {
@@ -83,6 +90,62 @@ class _Guest:
             listing = [{"ifname": "eth0", "addr_info": [{"local": "10.128.0.5"}]}]
             return subprocess.CompletedProcess(argv, 0, json.dumps(listing).encode(), b"")
         raise AssertionError(argv)
+
+
+EXT4_MAGIC = 0xEF53
+SWAPS_HEADER = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n"
+
+
+class _Storage:
+    """The guest's storage as the TEE box checks read it; each part is a lever.
+
+    By default the state directory is tmpfs, there is no swap, and Docker's
+    data root is an ext4 filesystem on dm-crypt with AEAD integrity.
+    """
+
+    def __init__(self, docker_root: Path) -> None:
+        self.docker_root = docker_root
+        self.disk_paths: set[str] = set()  # statfs says ext4 for these
+        self.root_fstype = "ext4"
+        self.extra_mounts: list[str] = []
+        self.root_device = (253, 3)
+        self.crypt_devices = {
+            "253:3": (True, "cathedral-scratch: dm-crypt capi:authenc integrity aead")
+        }
+        self.swap_lines: list[str] = []
+        self.probed: list[str] = []
+
+    def fs_type(self, path: str) -> int:
+        self.probed.append(path)
+        return EXT4_MAGIC if path in self.disk_paths else TMPFS_MAGIC
+
+    def mountinfo(self) -> str:
+        self.probed.append("mountinfo")
+        lines = [
+            "22 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw",
+            f"90 22 253:3 / {self.docker_root} rw,relatime - {self.root_fstype} "
+            "/dev/mapper/cathedral-scratch rw",
+            *self.extra_mounts,
+        ]
+        return "\n".join(lines) + "\n"
+
+    def swaps(self) -> str:
+        self.probed.append("swaps")
+        return SWAPS_HEADER + "".join(line + "\n" for line in self.swap_lines)
+
+    def crypt_integrity(self, major: int, minor: int):
+        self.probed.append(f"crypt {major}:{minor}")
+        device = f"{major}:{minor}"
+        return self.crypt_devices.get(device, (False, f"{device} is not a device-mapper device"))
+
+    def device_of(self, path: str):
+        self.probed.append(f"stat {path}")
+        return self.root_device
+
+    def probe(self) -> StorageProbe:
+        return StorageProbe(
+            self.fs_type, self.mountinfo, self.swaps, self.crypt_integrity, self.device_of
+        )
 
 
 def _root_key_file(seed: bytes = ROOT_SEED) -> bytes:
@@ -125,6 +188,10 @@ def guest(monkeypatch, tmp_path: Path):
     box = _Guest()
     box.mrconfigid = measured_root.mrconfigid_for_root_keys(_root_key_file())
     box.image_root = image_root
+    docker_root = tmp_path / "docker-root"
+    docker_root.mkdir()
+    box.docker_root = str(docker_root.resolve())
+    box.disk = _Storage(docker_root.resolve())
     real_build = configure_module.build_tee_box_api
 
     def build(config, **kwargs):
@@ -133,7 +200,13 @@ def guest(monkeypatch, tmp_path: Path):
                 raise box.mrconfigid
             return box.mrconfigid
 
-        return real_build(config, runner=box, read_binding=read_binding, **kwargs)
+        return real_build(
+            config,
+            runner=box,
+            read_binding=read_binding,
+            storage_probe=box.disk.probe(),
+            **kwargs,
+        )
 
     monkeypatch.setattr(cli, "build_tee_box_api", build)
     return box
@@ -143,6 +216,7 @@ def test_no_tee_box_flags_mean_no_sandbox_api(tmp_path: Path, guest, capsys):
     assert cmd_worker_serve(_args(tmp_path)) == 0
     assert _FakeServer.calls[0]["tee_box_api"] is None
     assert guest.calls == []
+    assert guest.disk.probed == []  # no TEE box, no storage rules
     startup = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert startup["tee_box"] is None
 
@@ -177,6 +251,13 @@ def test_the_full_flag_set_serves_the_sandbox_api(tmp_path: Path, guest, capsys)
         guest.mrconfigid
     )
     assert startup["tee_box"]["central_root_key_ids"] == ["cathedral-root-1"]
+    assert startup["tee_box"]["storage"] == {
+        "central_state": "central state on tmpfs",
+        "swap": "no swap",
+        "docker_root": guest.docker_root,
+        "scratch": f"{guest.docker_root}: cathedral-scratch: dm-crypt capi:authenc integrity aead",
+    }
+    assert "crypt 253:3" in guest.disk.probed
 
 
 def test_serve_snp_takes_the_same_flags(tmp_path: Path, guest):
@@ -383,3 +464,93 @@ def test_the_central_state_must_be_separate(tmp_path: Path, guest, other):
     args = _args(tmp_path, *flags, other, flags[1])
     with pytest.raises(ValueError, match="separate"):
         tee_box_config(args)
+
+
+def _refused(tmp_path: Path, match: str, *flags: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        cmd_worker_serve(_args(tmp_path, *(flags or _full_flags(tmp_path))))
+    assert _FakeServer.calls == []
+
+
+def test_central_state_off_tmpfs_refuses_before_the_state_is_created(tmp_path: Path, guest):
+    guest.disk.disk_paths |= {str(tmp_path), str(tmp_path.resolve())}
+    _refused(
+        tmp_path,
+        r"^TEE box storage: the TEE box central state must be on tmpfs or ramfs \(guest "
+        r"memory\); .* is on filesystem type 0xef53$",
+    )
+    assert not (tmp_path / "tee-box-central.sqlite").exists()
+    assert not (tmp_path / "tee-box-central.sqlite.lock").exists()
+    # Refused before any docker call.
+    assert not any(call[0].endswith("docker") for call in guest.calls)
+
+
+def test_central_state_on_tmpfs_is_accepted_and_reported(tmp_path: Path, guest, capsys):
+    assert cmd_worker_serve(_args(tmp_path, *_full_flags(tmp_path))) == 0
+    assert str(tmp_path.resolve()) in guest.disk.probed
+    startup = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert startup["tee_box"]["storage"]["central_state"] == "central state on tmpfs"
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "253:3 is not a device-mapper device",
+        "cathedral-scratch: crypt cipher aes-xts-plain64 has no integrity (no AEAD or HMAC tags)",
+    ],
+)
+def test_scratch_that_is_not_encrypted_with_integrity_refuses(tmp_path: Path, guest, detail):
+    guest.disk.crypt_devices["253:3"] = (False, detail)
+    _refused(
+        tmp_path,
+        "^TEE box storage: TEE box scratch must be in guest memory or on dm-crypt with "
+        rf"integrity; {guest.docker_root} \(ext4 on 253:3\) under the Docker data root is "
+        rf"not: {re.escape(detail)}$",
+    )
+
+
+def test_a_plain_disk_mounted_below_the_docker_root_refuses(tmp_path: Path, guest):
+    guest.disk.extra_mounts.append(
+        f"91 90 8:2 / {guest.docker_root}/overlay2 rw - xfs /dev/sda2 rw,pquota"
+    )
+    _refused(tmp_path, rf"{guest.docker_root}/overlay2 \(xfs on 8:2\)")
+
+
+def test_a_docker_root_in_guest_memory_needs_no_device(tmp_path: Path, guest, capsys):
+    guest.disk.root_fstype = "tmpfs"
+    guest.disk.crypt_devices.clear()
+    assert cmd_worker_serve(_args(tmp_path, *_full_flags(tmp_path))) == 0
+    assert not any(item.startswith("crypt") for item in guest.disk.probed)
+    startup = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert startup["tee_box"]["storage"]["scratch"] == f"{guest.docker_root}: tmpfs"
+
+
+def test_a_docker_root_shadowed_by_a_plain_disk_refuses(tmp_path: Path, guest):
+    # The dm-crypt mount on the data root is hidden by a disk mounted later
+    # over its parent; stat reports the disk.
+    parent = str(Path(guest.docker_root).parent)
+    guest.disk.extra_mounts.append(f"95 22 8:2 / {parent} rw - xfs /dev/sda2 rw")
+    guest.disk.root_device = (8, 2)
+    _refused(tmp_path, rf"{re.escape(parent)} \(xfs on 8:2\)")
+
+
+def test_the_containerd_image_store_refuses(tmp_path: Path, guest):
+    guest.driver_status = [["driver-type", "io.containerd.snapshotter.v1"]]
+    _refused(tmp_path, "containerd image store")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "/dev/sda2                               partition\t8388604\t0\t-2",
+        "/swapfile                               file\t\t2097148\t0\t-3",
+        "/dev/dm-4                               partition\t8388604\t0\t-2",
+        # zram too: a backing_dev writes its pages to a disk in the clear.
+        "/dev/zram0                              partition\t4194300\t0\t100",
+        "/var/zram.img                           file\t\t2097148\t0\t-3",
+    ],
+)
+def test_any_swap_refuses(tmp_path: Path, guest, line):
+    guest.disk.swap_lines = [line]
+    _refused(tmp_path, r"^TEE box storage: swap is on \(/\S+\); swap can write guest memory")
+    assert not (tmp_path / "tee-box-central.sqlite").exists()

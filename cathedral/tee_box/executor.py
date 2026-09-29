@@ -43,6 +43,9 @@ SANDBOX_LABEL = "org.cathedral.tee-box.sandbox"
 # cleanup: the daemon may still create it after the CLI was killed.
 PENDING_CLEANUP_GRACE_SECONDS = 300.0
 _BOX_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+# A local image id: the sha256 of the image config, which Docker's classic
+# image store re-hashes each time it reads the config.
+_IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 DEFAULT_DNS: tuple[str, ...] = ("1.1.1.1", "8.8.8.8")
 DEFAULT_PIDS_PER_SANDBOX = 4096
@@ -107,8 +110,16 @@ class Shape:
 
 @dataclass(frozen=True)
 class ImageInfo:
+    """An imported image: the registry digest asked for and, once pulled, its local id.
+
+    ``image_id`` is the content address the runtime runs (the config digest),
+    recorded in memory at import. ``RunscExecutor`` never starts a sandbox
+    from the mutable ``reference@digest`` mapping in Docker's store.
+    """
+
     digest: str
     reference: str
+    image_id: str = ""
 
     def view(self) -> dict[str, object]:
         return {
@@ -413,6 +424,23 @@ class FakeExecutor(_Table):
         return buffer.getvalue()
 
 
+def _familiar_name(reference: str) -> str:
+    """Docker's short form of a repository name, as ``RepoDigests`` prints it."""
+
+    for prefix in ("docker.io/", "index.docker.io/"):
+        if reference.startswith(prefix):
+            reference = reference[len(prefix) :]
+            if reference.startswith("library/") and reference.count("/") == 1:
+                reference = reference[len("library/") :]
+            break
+    return reference
+
+
+def _familiar_digest(item: str) -> str:
+    name, sep, digest = item.rpartition("@")
+    return _familiar_name(name) + sep + digest if sep else item
+
+
 def _check_argv(argv: Sequence[str]) -> list[str]:
     checked = list(argv)
     if not checked or any(
@@ -694,7 +722,41 @@ class RunscExecutor(_Table):
     def pull_argv(self, image: ImageInfo) -> list[str]:
         return _check_argv([self.docker, "pull", "--quiet", f"{image.reference}@{image.digest}"])
 
+    def image_inspect_argv(self, image: ImageInfo) -> list[str]:
+        """Resolve ``reference@digest`` in Docker's store to its local id and repo digests."""
+
+        return _check_argv(
+            [
+                self.docker,
+                "image",
+                "inspect",
+                "--format",
+                "{{json .Id}} {{json .RepoDigests}}",
+                f"{image.reference}@{image.digest}",
+            ]
+        )
+
+    def storage_root_argv(self) -> list[str]:
+        return _check_argv(
+            [
+                self.docker,
+                "info",
+                "--format",
+                "{{json .DockerRootDir}} {{json .Driver}} {{json .DriverStatus}}",
+            ]
+        )
+
     def create_argv(self, spec: SandboxSpec) -> list[str]:
+        """``docker run`` for ``spec``, started from the image's local id only.
+
+        The image argument is the content address recorded at import
+        (``spec.image.image_id``), never a tag or ``reference@digest``, and
+        ``--pull never`` stops Docker fetching anything in its place.
+        """
+
+        image_id = spec.image.image_id
+        if not isinstance(image_id, str) or _IMAGE_ID_RE.fullmatch(image_id) is None:
+            raise ExecutorError("the image has no local id recorded at import")
         shape = spec.shape
         argv = [
             self.docker,
@@ -726,12 +788,7 @@ class RunscExecutor(_Table):
                 argv += ["--dns", server]
         for key, value in sorted(spec.env.items()):
             argv += ["--env", f"{key}={value}"]
-        argv += [
-            "--entrypoint",
-            "sleep",
-            f"{spec.image.reference}@{spec.image.digest}",
-            "infinity",
-        ]
+        argv += ["--pull", "never", "--entrypoint", "sleep", image_id, "infinity"]
         return _check_argv(argv)
 
     def exec_argv(
@@ -886,12 +943,97 @@ class RunscExecutor(_Table):
         return False, f"storage driver {driver!s:.64} does not support per-container size"
 
     def import_image(self, digest: str, reference: str) -> ImageInfo:
+        """Pull ``reference@digest`` and record the local id it resolved to.
+
+        Docker verifies the manifest and every layer against ``digest`` while
+        it pulls. The id recorded here, in memory, is what every later create
+        runs and re-checks (``verified_image``).
+        """
+
         image = ImageInfo(digest, reference)
         if self._control(self.pull_argv(image), self._pull_timeout).returncode != 0:
             raise ExecutorError("image pull failed")
+        image = replace(image, image_id=self._resolve_image(image))
         with self._lock:
             self._images[digest] = image
         return image
+
+    def _resolve_image(self, image: ImageInfo) -> str:
+        """The local id Docker's store gives ``reference@digest`` now.
+
+        Refuses unless the id is a sha256 content address and the image's
+        repo digests name exactly this reference and digest.
+        """
+
+        result = self._control(self.image_inspect_argv(image), self._control_timeout)
+        if result.returncode != 0:
+            raise ExecutorError("image inspect failed")
+        try:
+            text = (result.stdout or b"").decode().strip()
+            decoder = json.JSONDecoder()
+            image_id, end = decoder.raw_decode(text)
+            repo_digests, end = decoder.raw_decode(text, end + 1)
+            if text[end:].strip():
+                raise ValueError("trailing output")
+        except (UnicodeDecodeError, ValueError, IndexError) as exc:
+            raise ExecutorError("image inspect output is invalid") from exc
+        if not isinstance(image_id, str) or _IMAGE_ID_RE.fullmatch(image_id) is None:
+            raise ExecutorError("image inspect gave no sha256 image id")
+        wanted = _familiar_name(image.reference) + "@" + image.digest
+        if not isinstance(repo_digests, list) or not any(
+            isinstance(item, str) and _familiar_digest(item) == wanted for item in repo_digests
+        ):
+            raise ExecutorRefused("the imported image does not carry the requested digest")
+        return image_id
+
+    def verified_image(self, digest: str) -> ImageInfo:
+        """The imported image, re-checked against its import right before a start.
+
+        ``reference@digest`` must still resolve to the id recorded at import;
+        otherwise the image is forgotten (import it again) and the start is
+        refused. The start then runs that recorded id, so nothing that changes
+        the store's mapping after this check can change what runs.
+        """
+
+        image = self.get_image(digest)
+        if image is None:
+            raise NotFound
+        try:
+            current = self._resolve_image(image)
+        except ExecutorRefused:
+            current = None
+        if current != image.image_id:
+            with self._lock:
+                if self._images.get(digest) is image:
+                    del self._images[digest]
+            raise ExecutorRefused(
+                "the image no longer matches the digest recorded at import; import it again"
+            )
+        return image
+
+    def storage_root(self) -> tuple[str, str, dict[str, str]]:
+        """Docker's data root, storage driver and driver status (``docker info``)."""
+
+        try:
+            result = self._control(self.storage_root_argv(), self._control_timeout)
+        except ExecutorError as exc:
+            raise ExecutorError("docker info failed") from exc
+        if result.returncode != 0:
+            raise ExecutorError("docker info failed")
+        try:
+            text = (result.stdout or b"").decode().strip()
+            decoder = json.JSONDecoder()
+            root, end = decoder.raw_decode(text)
+            driver, end = decoder.raw_decode(text, end + 1)
+            status, end = decoder.raw_decode(text, end + 1)
+            if text[end:].strip():
+                raise ValueError("trailing output")
+            status = {str(key): str(value) for key, value in (status or [])}
+        except (UnicodeDecodeError, ValueError, TypeError, IndexError) as exc:
+            raise ExecutorError("docker info output is invalid") from exc
+        if not isinstance(root, str) or not root.startswith("/") or not isinstance(driver, str):
+            raise ExecutorError("docker info output is invalid")
+        return root, driver, status
 
     def _exists(self, name: str, timeout: float | None = None) -> bool:
         """False only when the daemon says the container does not exist."""
@@ -934,8 +1076,9 @@ class RunscExecutor(_Table):
         if spec.network == "internet" and (enforcer is None or not enforcer.verify()):
             self.end_lapsed_sandboxes()
             raise ExecutorRefused("internet egress is not enforced on this box")
-        if self.get_image(spec.image.digest) is None:
-            raise NotFound
+        # Run the image recorded at import, re-checked now, whatever the
+        # caller's spec carries.
+        spec = replace(spec, image=self.verified_image(spec.image.digest))
         name = self.container_name(spec.sandbox_id)
         argv = self.create_argv(spec)
         with self._lock:

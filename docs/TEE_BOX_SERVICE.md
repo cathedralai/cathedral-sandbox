@@ -1,9 +1,11 @@
-# TEE box sandbox service (T6a, T6b1, T7)
+# TEE box sandbox service (T6a, T6b1, T7, T8)
 
 Status: **off by default**. T6a added the library, and T6b1 adds the worker
 flags, the egress enforcer, in-sandbox exec kills, disk quotas and an opt-in
 runsc image layer. T7 moves caller authorization to central access, with the
-root keys in measured state (see "Caller authorization"). Nothing here has
+root keys in measured state (see "Caller authorization"). T8 keeps writable
+storage in guest memory or on dm-crypt with integrity, and starts images by
+content address (see "Storage (T8)"). Nothing here has
 run on TDX or SEV-SNP hardware yet; that is T6b2 (see "Not done" below). The design is `TEE_BOX.md` on PR #236, branch
 `docs/tee-box-design` (sections 2 to 4 and "Owner decisions for v1").
 Citations are `file:line` in this repository.
@@ -12,21 +14,21 @@ Citations are `file:line` in this repository.
 
 `cathedral/tee_box/` holds four parts.
 
-- **Executor protocol** (`cathedral/tee_box/executor.py:179-202`): image
+- **Executor protocol** (`cathedral/tee_box/executor.py:190-213`): image
   import by digest, create from an image with a shape, get, list, expiry,
   delete, sync exec, background exec with poll and stop, and file read,
   write, stat and tar.
-  - `FakeExecutor` (`cathedral/tee_box/executor.py:273`) keeps everything in
+  - `FakeExecutor` (`cathedral/tee_box/executor.py:284`) keeps everything in
     memory for tests.
-  - `RunscExecutor` (`cathedral/tee_box/executor.py:567`) drives
+  - `RunscExecutor` (`cathedral/tee_box/executor.py:595`) drives
     `docker run --runtime=runsc`. It builds argv lists only, with no host
-    shell (`_check_argv`, `cathedral/tee_box/executor.py:416`), and caps every
+    shell (`_check_argv`, `cathedral/tee_box/executor.py:444`), and caps every
     captured output. The Docker daemon must register runsc with
-    `--platform=systrap` (`cathedral/tee_box/executor.py:682-692`).
+    `--platform=systrap` (`cathedral/tee_box/executor.py:710-720`).
   - Each sandbox is one container that runs `sleep infinity`
-    (`cathedral/tee_box/executor.py:733`). Exec, files and tar run inside it
+    (`cathedral/tee_box/executor.py:791`). Exec, files and tar run inside it
     through `/bin/sh` scripts that take paths as positional arguments
-    (`cathedral/tee_box/executor.py:535-542`). They run inside because
+    (`cathedral/tee_box/executor.py:563-570`). They run inside because
     gVisor's in-sandbox overlay hides writes from the host. Images therefore
     need `sh`, `sleep`, `cat`, `stat` and `tar`, as Harbor's own upload
     fallback already assumes.
@@ -36,8 +38,8 @@ Citations are `file:line` in this repository.
     (`cathedral/tee_box/executor.py:39-41`).
     - A create that fails is removed by name. A create that times out is
       also kept pending cleanup for 300 s, since the daemon may still start
-      it (`cathedral/tee_box/executor.py:921`).
-    - `sweep` (`cathedral/tee_box/executor.py:1129`) lists the box's
+      it (`cathedral/tee_box/executor.py:1063`).
+    - `sweep` (`cathedral/tee_box/executor.py:1272`) lists the box's
       containers with `docker ps --filter label=...`. It removes every one
       the table does not track, except creates still in flight, and
       reports what it could not confirm gone.
@@ -52,12 +54,12 @@ Citations are `file:line` in this repository.
     - The cap check and the slot reservation are one step under the lock.
     - A finished record is evicted 60 s after its result is first read, or
       600 s after it finished if never read. At a cap, the oldest finished
-      record goes first (`cathedral/tee_box/executor.py:1209`).
+      record goes first (`cathedral/tee_box/executor.py:1352`).
   - **Uploads.** An upload's stdin is written from its own thread
-    (`cathedral/tee_box/executor.py:438`). A target that never reads, such
+    (`cathedral/tee_box/executor.py:466`). A target that never reads, such
     as a FIFO, times out and is killed under the transfer timeout. The
     write script also refuses an existing target that is not a regular file
-    with `409` (`cathedral/tee_box/executor.py:1313`).
+    with `409` (`cathedral/tee_box/executor.py:1456`).
 - **Egress policy** (`cathedral/tee_box/egress.py`). `build_egress_policy`
   (`cathedral/tee_box/egress.py:208`) returns the deny list and a
   per-sandbox bandwidth cap (default 100 Mbit/s). The deny list has three
@@ -122,7 +124,7 @@ Citations are `file:line` in this repository.
   - A delete in `RunscExecutor` runs `docker rm --force`, then
     `docker kill --signal KILL`, then `rm` again. It counts as done only
     when `rm` succeeds or the daemon reports the container missing
-    (`cathedral/tee_box/executor.py:905`).
+    (`cathedral/tee_box/executor.py:1047`).
   - A create holds the lease lock, so a drain cannot miss it
     (`cathedral/tee_box/service.py:720-721`).
   - A worker thread runs every 5 s, and once at start
@@ -201,7 +203,7 @@ state".
   - Nothing reads the root, its digest or MRCONFIGID from a flag, an
     environment variable or a writable config file. A missing device, a
     zero or malformed MRCONFIGID, or a file that does not match refuses
-    startup (`cathedral/tee_box/configure.py:272`). The startup line reports
+    startup (`cathedral/tee_box/configure.py:296`). The startup line reports
     the root digest and key ids.
 - **Delegations and scopes.** The offline root signs a delegation of at most
   24 h naming one central key, the subnet (`--validator-network` and
@@ -290,13 +292,13 @@ state".
 ## How to enable it (T6b1)
 
 `cathedral worker serve` (TDX) and `cathedral worker serve-snp` take the TEE
-box flags (`cathedral/tee_box/configure.py:80`, registered at
+box flags (`cathedral/tee_box/configure.py:98`, registered at
 `cathedral/cli.py:4479` and `:4503`). The development, migration and GPU
 commands do not offer them.
 
 | Flag | Required | Meaning |
 |---|---|---|
-| `--tee-box-central-state` | yes | owner-only SQLite replay state for central callers, separate from the validator-access and `--central-access-state` files |
+| `--tee-box-central-state` | yes | owner-only SQLite replay state for central callers, separate from the validator-access and `--central-access-state` files, in a directory on tmpfs or ramfs (see "Storage (T8)") |
 | `--tee-box-executor runsc` | yes | the only executor |
 | `--tee-box-capacity V,M,D` | yes | vCPUs, memory MiB and disk MiB for all sandboxes together |
 | `--tee-box-default-shape V,M,D` | yes | shape of a sandbox created without one; must fit the capacity |
@@ -312,7 +314,7 @@ No flag names the callers or their root keys; see "Caller authorization".
 - **All or nothing.** With no TEE box flag, the worker passes no API and
   serves no sandbox routes. Giving any flag, even an optional one, requires
   every required flag and one address source, or the worker refuses to
-  start (`cathedral/tee_box/configure.py:152`, called at
+  start (`cathedral/tee_box/configure.py:171`, called at
   `cathedral/cli.py:1391`).
 - **Attested TLS only.** The flags need `--tls-certificate` and
   `--tls-private-key` (`cathedral/cli.py:1397`). The API then binds the
@@ -322,19 +324,21 @@ No flag names the callers or their root keys; see "Caller authorization".
   plus the `--public-endpoint` host when it is an IP literal. On a cloud
   guest behind 1:1 NAT the public address is not on an interface, so pass
   it with `--tee-box-address` instead.
-- **Startup refuses** (`cathedral/tee_box/configure.py:238`) when the root
-  key file does not match the measured binding, or on SEV-SNP (`:272`),
-  when the central state is unusable, when the daemon does not register
-  the runtime at the runtime path with `--platform=systrap` (`:303`), or
-  when disk quotas are unsupported without `--tee-box-no-disk-quota`
-  (`:306`).
+- **Startup refuses** (`cathedral/tee_box/configure.py:257`) when the root
+  key file does not match the measured binding, or on SEV-SNP (`:300`);
+  when the central state is not on tmpfs or ramfs, or any swap is on (`:301-307`); when the central state is unusable (`:308-318`); when
+  the daemon does not register the runtime at the runtime path with
+  `--platform=systrap` (`:336`); when Docker's data root is neither in guest
+  memory nor on dm-crypt with integrity (`:337-341`); or when disk quotas
+  are unsupported without `--tee-box-no-disk-quota` (`:342-350`). No flag
+  relaxes the storage checks (see "Storage (T8)").
 - **Startup does not refuse** when the egress rules fail to apply
-  (`:315`). The box then serves `deny_all` only, and the startup line's
+  (`:351`). The box then serves `deny_all` only, and the startup line's
   `tee_box.egress` field reports the error. The egress thread re-applies
   every 60 s, and reads an applied table back every 5 s.
 
 The guest must also provide: a Docker daemon with the runsc runtime entry
-(`daemon_runtime_config`, `cathedral/tee_box/executor.py:682`), the docker
+(`daemon_runtime_config`, `cathedral/tee_box/executor.py:710`), the docker
 CLI, `nft`, `tc`, `ip` and `nsenter` at `/usr/sbin/nft`, `/usr/sbin/tc`,
 `/usr/sbin/ip` and `/usr/bin/nsenter`, and the privileges to use them. No
 shipped image provides all of that yet (see "Packaging").
@@ -363,7 +367,7 @@ a 15 s timeout.
   with the policy: the same collapsed deny ranges, hooks, priorities and
   rules, and nothing else (`table_matches`,
   `cathedral/tee_box/enforce.py:224`). The executor verifies again before
-  every `internet` create (`cathedral/tee_box/executor.py:934`).
+  every `internet` create (`cathedral/tee_box/executor.py:1076`).
 - **Per-sandbox cap.** `attach` (`cathedral/tee_box/enforce.py:698`) finds
   the sandbox's host-side veth from its network namespace: Docker's
   `SandboxKey`, then `eth0@ifN` inside it through `nsenter`, then the
@@ -373,7 +377,7 @@ a 15 s timeout.
   policer's rate and drop action. `detach`
   (`cathedral/tee_box/enforce.py:717`) deletes both qdiscs, and runs only
   after `docker rm` has confirmed the container gone
-  (`cathedral/tee_box/executor.py:995`). A remove that fails or times out
+  (`cathedral/tee_box/executor.py:1138`). A remove that fails or times out
   leaves the sandbox running with its cap in place; the orphan sweep also
   detaches only what it confirmed removed. It treats a veth already gone as
   removed.
@@ -381,7 +385,7 @@ a 15 s timeout.
   thread of its own (`cathedral/worker.py:1476`), apart from the reaper, whose
   expiry deletes and drain wait on docker. It starts a check every 5 s
   (`cathedral/worker.py:93`), or at once if the last one overran. Each
-  check runs `check_egress` (`cathedral/tee_box/executor.py:1002`), which
+  check runs `check_egress` (`cathedral/tee_box/executor.py:1145`), which
   calls `maintain` (`cathedral/tee_box/enforce.py:548`): one
   `nft --json list table` read-back while the table is active, bounded by
   the enforcer's 15 s command timeout, with no docker call.
@@ -390,16 +394,16 @@ a 15 s timeout.
   turns off at once and the enforcer counts a lapse. A lapse can be found
   by the egress check, by a create's read-back before `docker run`, or by
   `attach`'s read-back after it. In every case `end_lapsed_sandboxes`
-  (`cathedral/tee_box/executor.py:1021`) runs before any re-apply (which
+  (`cathedral/tee_box/executor.py:1164`) runs before any re-apply (which
   calls docker): the egress check calls it first on every tick
-  (`cathedral/tee_box/executor.py:1002`), and both create paths call it
+  (`cathedral/tee_box/executor.py:1145`), and both create paths call it
   when they refuse. It marks every `internet` sandbox that was running,
   cuts the bridge off, and starts removing those sandboxes, as a delete
   does, even when the re-apply then succeeds: they ran unprotected for an
   unknown time.
   - **Calls refused.** From that moment every call on a marked sandbox
     (exec, processes, files, tar, stat, lifetime) gets `409` with reason
-    `sandbox_network_lapsed` (`cathedral/tee_box/executor.py:1108`). Get,
+    `sandbox_network_lapsed` (`cathedral/tee_box/executor.py:1251`). Get,
     list and delete still work.
   - **Bridge quarantined.** `quarantine`
     (`cathedral/tee_box/enforce.py:592`) installs a separate nft table,
@@ -443,9 +447,9 @@ a 15 s timeout.
 - **Fail closed.** Until apply and verify succeed, and after any later
   verify fails, `active` is false and `status()` carries the error.
   `RunscExecutor` then offers `deny_all` only
-  (`cathedral/tee_box/executor.py:656`) and refuses `internet` with `409`
+  (`cathedral/tee_box/executor.py:684`) and refuses `internet` with `409`
   before `docker run`. After `docker run`, a sandbox whose cap fails to
-  apply or verify is removed at once (`cathedral/tee_box/executor.py:955`).
+  apply or verify is removed at once (`cathedral/tee_box/executor.py:1098`).
 - **Injection safety.** Box addresses reach nft only as `ipaddress`
   objects. Detection parses every value with `ipaddress` and refuses the
   whole listing on any other value (`cathedral/tee_box/enforce.py:108`).
@@ -462,10 +466,10 @@ a 15 s timeout.
 
 A customer exec runs through a wrapper that writes its pid to
 `/tmp/.cathedral-exec-<random>.pid` inside the sandbox and then execs the
-command in place (`cathedral/tee_box/executor.py:546`). When a sync or
+command in place (`cathedral/tee_box/executor.py:574`). When a sync or
 background exec times out, or a background exec is stopped, the executor
 first runs a kill script as root in the sandbox
-(`cathedral/tee_box/executor.py:551`, `:1175`). The script stops the
+(`cathedral/tee_box/executor.py:579`, `:1318`). The script stops the
 recorded process and every descendant it finds in `/proc`, repeating until
 no new one appears, and then kills them all. Only then is the host-side
 `docker exec` client killed. The kill has its own 30 s timeout.
@@ -477,10 +481,10 @@ double-forks) survives until the sandbox is deleted.
 ## Disk quota (T6b1)
 
 Each container gets `--storage-opt size=<disk_mib>m`
-(`cathedral/tee_box/executor.py:722`). Docker supports this on btrfs, zfs,
+(`cathedral/tee_box/executor.py:784`). Docker supports this on btrfs, zfs,
 devicemapper, and overlay2 on xfs mounted with `pquota`. At startup the
 worker reads the storage driver from `docker info`
-(`cathedral/tee_box/executor.py:862`) and refuses to start on any other
+(`cathedral/tee_box/executor.py:919`) and refuses to start on any other
 driver unless the operator passes `--tee-box-no-disk-quota`. Docker checks
 `pquota` only when a container starts, so on xfs without it every create
 fails; creates never run unbounded.
@@ -502,6 +506,197 @@ daemon that runs it, which the miner container does not hold, so the layer
 does not yet make a miner container a working box. The measured appliance
 image (design plan step 2) is where runsc, the daemon and the host tools
 belong.
+
+## Storage (T8)
+
+Owner decision 7 (design, "Owner decisions for v1", 2026-09-29): all
+writable storage lives in guest memory, or on dm-crypt with integrity (AEAD)
+under a key made inside the TD at boot; images are verified on read, with no
+time-of-check gap between import and `runsc run`; and the host cannot roll
+state back. The design's split (section 4, "Storage"): images read through
+dm-verity; overlays, uploads and scratch on dm-crypt with integrity; the
+replay, high-water and revocation state in guest memory only.
+
+The TEE box runs only in TEE mode (the flags exist only on `worker serve`
+and `serve-snp`), so every check below applies whenever the box is enabled,
+and no flag relaxes it. `FakeExecutor`, the library API used directly, and
+every worker without the TEE box flags are unaffected. The checks are in
+`cathedral/tee_box/storage.py`, each probe injectable (`StorageProbe`,
+`:118`) for tests; startup reports what it found in `tee_box.storage`.
+
+### Images: started by content address
+
+- **Import** (`cathedral/tee_box/executor.py:945`) runs
+  `docker pull reference@digest`; Docker checks the manifest and every
+  layer blob against the digest while it pulls. It then runs
+  `docker image inspect reference@digest` (`:961`) for the local image id,
+  the sha256 of the image config, and refuses unless that is a sha256 id
+  and the image's `RepoDigests` name this reference at this digest (Docker
+  Hub names are compared in Docker's short form). The id is kept in the
+  executor's memory.
+- **Create** re-checks right before `docker run` (`verified_image`,
+  `:989`, called at `:1081`): `reference@digest` must still resolve to the
+  recorded id and still be in `RepoDigests`. Otherwise the create gets
+  `409` (`executor_refused`) and the image is forgotten, so it must be
+  imported, and verified, again. A failed inspect gets `502` and keeps the
+  image.
+- **Start.** `docker run` takes the recorded id (`sha256:<config digest>`)
+  with `--pull never` (`:749`, `:791`), and the create uses the image
+  recorded at import whatever the caller's spec carries. No tag, path or
+  `reference@digest` mapping sits between the check and the start, so a
+  re-tag or a rewritten reference store after the check changes nothing.
+- **The gap that remains.** The id pins the image config: Docker's classic
+  image store re-hashes the config file against its id on every read, and
+  the config lists the layers' diff ids. Docker does not re-hash layer
+  contents when it builds a container's root filesystem. It maps diff ids
+  to directories under its data root (`image/<driver>/layerdb`,
+  `<driver>/<cache id>/diff`), and runsc reads files from them. So layer
+  bytes are checked when pulled, not when read. What keeps the host from
+  changing them after import is the storage under them: the data root is
+  in guest memory or on dm-crypt with integrity (below). On dm-crypt the
+  host can neither read nor forge a sector, but it can replay an older
+  sector written under the same boot key: here, data the guest itself wrote
+  to that sector earlier in the same boot, such as blocks of an image
+  deleted earlier in the allocation. The design's dm-verity images close
+  this, since every block is checked against a root hash when read. They
+  need the central builder to emit verity images, which does not exist
+  yet, so v1 still imports from a registry.
+- The containerd image store (`driver-type io.containerd.snapshotter.v1`)
+  keeps content outside the data root, so the worker refuses it
+  (`cathedral/tee_box/storage.py:406`). The reasoning above is for the
+  classic graphdriver store. Recent Docker releases enable the containerd
+  store by default on new installs, so the appliance sets
+  `"features": {"containerd-snapshotter": false}` in `daemon.json`.
+
+### State: guest memory only
+
+The central state (`--tee-box-central-state`) holds the replay cache, the
+delegation high-water and the pushed revocation list
+(`cathedral/central_access.py:168`). The lease and executor tables are
+process memory already.
+
+- **Decision: keep the file, require it on tmpfs or ramfs.** Relaunch
+  between customers already empties it, and #244's freshness gate handles
+  the empty state. Dropping the file in TEE mode would also empty it on a
+  worker restart within one boot, while the worker's TLS key, which each
+  central request is bound to, comes from a file and survives the restart:
+  a request captured before the restart could then be replayed until it
+  expires. On tmpfs the state survives a worker restart and is gone at
+  relaunch, and the host cannot roll back guest memory. The state class
+  also refuses `:memory:` by design: its lock file keeps an operator reset
+  and a running worker apart.
+- **Check** (`cathedral/tee_box/storage.py:153`, called at
+  `cathedral/tee_box/configure.py:304` before the state is opened, since
+  opening creates it): statfs(2) must report tmpfs (`0x01021994`) or ramfs
+  (`0x858458f6`) for the state's directory, before and after resolving
+  symlinks, and for every existing state file, its `.lock` and its SQLite
+  `-journal`, `-wal` and `-shm` files. A missing directory refuses: mount
+  the tmpfs before the worker starts.
+- **Why not dm-crypt for state.** Its sector tags do not stop the host
+  replaying an older version of a sector written under the same key, which
+  would roll the file back within one boot.
+- **Swap.** tmpfs pages can be swapped out, so the worker refuses while
+  any swap is on (`require_no_swap`, `cathedral/tee_box/configure.py:305`):
+  `/proc/swaps` must hold only its header line. That includes swap on
+  dm-crypt, which would bring the sector replay back, and zram, whose
+  `backing_dev` writes idle pages to a disk in the clear. No device or file
+  name is trusted to mean memory.
+
+### Scratch: Docker's data root
+
+Everything a sandbox writes lands under Docker's data root: container
+layers, gVisor's root overlay (runsc's default `--overlay2=root:self` keeps
+the upper layer in a file in the container's root directory), and `files`
+and `tar` uploads, which go through `docker exec` into that overlay; so do
+the imported layers. The worker asks the daemon for `DockerRootDir`
+(`cathedral/tee_box/executor.py:1014`) and refuses
+(`cathedral/tee_box/storage.py:390`) unless the mount serving it, and every
+mount below it in `/proc/self/mountinfo`, is either of the two kinds below.
+The serving mount is found by device, not by path: the last listed mount
+whose major:minor is the `st_dev` that stat(2) reports for the data root,
+and whose mount point contains it. A filesystem mounted later over a parent
+of the data root hides a deeper mount, which then no longer serves the path,
+so the longest matching mount point would be the wrong answer. The two
+kinds:
+
+- tmpfs or ramfs; or
+- a device-mapper device whose sysfs `dm/uuid` starts with `CRYPT-`
+  (cryptsetup's mapping; `CRYPT-SUBDEV-`, the dm-integrity device under a
+  LUKS2 volume, does not count) and whose `dmsetup table` is all `crypt`
+  segments carrying `integrity:<tag bytes>:aead`, or `:hmac(sha256)` or
+  `:hmac(sha512)` (`parse_crypt_table`, `dm_crypt_integrity_check`), and
+  whose cipher is allowed for that type. With `aead`:
+  `capi:authenc(hmac(sha256|sha512),xts(aes))` with a `-random` or
+  `-plain64` IV, or `capi:gcm(aes)` or `capi:rfc7539(chacha20,poly1305)`
+  with `-random` only (with `-plain64` their nonce is the sector number, so
+  a rewritten sector repeats it and the host could forge sectors); with an
+  HMAC type: `aes-xts` or `capi:xts(aes)`, `-random` or `-plain64`. Any cipher
+  containing `null` or `ecb` (`digest_null`, `cipher_null`) refuses, as
+  does any other cipher, a table with no integrity parameter, an unkeyed
+  one (`crc32c`, `none`), or any other target. With `--integrity hmac-sha256` and aes-xts,
+  cryptsetup builds an `authenc(hmac(sha256),xts(aes))` AEAD cipher, which
+  the table shows as `integrity:48:aead`.
+
+Below the root, nsfs mounts hold no data and are skipped. An overlay mount
+below the root (a running container's root filesystem) passes only when its
+`upperdir`, `workdir` and every `lowerdir` (including `lowerdir+` and
+`datadir+`) resolve, symlinks followed, under the data root, whose mounts
+are all checked; relative layer paths, as Docker's overlay2 driver passes
+them, are resolved from `<data root>/overlay2`. A layer anywhere else, such
+as an upper directory on an unencrypted disk, refuses, and so does an
+overlay with no lower layer. An overlay serving the root itself (a worker
+inside a container) refuses: the worker must see the data root in the daemon's mount
+namespace, as the appliance runs both. sysfs gives the dm uuid and name to
+anyone but not the table, and `dmsetup table` needs CAP_SYS_ADMIN (the
+device-mapper ioctl). The worker already runs as guest root for docker, nft
+and tc; one that cannot read the table refuses. It runs
+`/usr/sbin/dmsetup table <name>` as an argv list with a 15 s timeout, the
+name read from sysfs and checked against a strict pattern.
+
+The checks run once, at startup. The appliance must not change these mounts
+or turn swap on afterwards. Checking only at startup is accepted for v1.
+
+### The appliance boot step
+
+No boot script in this repository sets up a TEE box guest. The SN94 miner
+images are containers started by `scripts/run_sn94_signed_fleet_miner.sh`,
+and the measured appliance image (design plan step 2) does not exist yet.
+Before its Docker daemon and worker start, the appliance boot must:
+
+1. Mount a tmpfs for the central state, for example
+   `mount -t tmpfs -o mode=0700,size=64m tmpfs /run/cathedral-tee-box`, and
+   pass `--tee-box-central-state /run/cathedral-tee-box/central.sqlite`.
+2. Leave all swap off, zram included.
+3. Make a random key inside the TD, never written out, and open the scratch
+   disk with integrity (`/dev/urandom` in a TD is seeded by the guest
+   kernel from RDRAND and RDSEED, not by the host):
+
+   ```sh
+   key_dir=$(mktemp -d /run/cathedral-key.XXXXXX)
+   mount -t ramfs -o mode=0700 ramfs "$key_dir"     # never swapped
+   head -c 64 /dev/urandom > "$key_dir/key"
+   cryptsetup luksFormat --batch-mode --type luks2 \
+     --cipher aes-xts-plain64 --key-size 512 --integrity hmac-sha256 \
+     --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
+     --key-file "$key_dir/key" /dev/<scratch disk>
+   cryptsetup open --type luks2 --key-file "$key_dir/key" \
+     /dev/<scratch disk> cathedral-scratch
+   shred -u "$key_dir/key"; umount "$key_dir"; rmdir "$key_dir"
+   mkfs.xfs -f /dev/mapper/cathedral-scratch
+   mount -o pquota /dev/mapper/cathedral-scratch /var/lib/docker
+   ```
+
+   The LUKS2 header on the host's disk holds the volume key wrapped under a
+   random passphrase that exists only in guest memory during boot, and
+   every boot formats the disk again. A weak key derivation is enough for a
+   random 64-byte passphrase. By default `luksFormat --integrity` writes the
+   whole device to initialise the tags, which takes a while on a large disk;
+   `--integrity-no-wipe` skips that, and sectors never written then fail to
+   read, which T6b2 must qualify with the filesystem. xfs with `pquota`
+   keeps the per-sandbox `--storage-opt size=` quota working. A data root on
+   tmpfs also passes, sized from the box's memory reserve.
+4. Set `"features": {"containerd-snapshotter": false}` in the Docker
+   daemon's `daemon.json` (see "Images" above).
 
 ## Not done (T6b2 and later)
 
@@ -543,6 +738,19 @@ belong.
   entry, the host tools and the worker together. The opt-in layer is not
   measured or published. Measurement approval follows the design's plan
   steps 2 to 7.
+- **Storage on hardware (T8).** The appliance boot step above does not
+  exist yet. On a TD, T6b2 must show that the pinned cryptsetup's LUKS2
+  mapping with `--integrity hmac-sha256` has the `CRYPT-` uuid and the
+  `integrity:48:aead` table the parser expects, that mountinfo gives the
+  mapping's major:minor, that statfs from the worker sees the tmpfs, that
+  the pinned Docker runs `--pull never sha256:<id>` and prints
+  `RepoDigests` as expected for the registries used, and what integrity
+  costs in write throughput (the dm-integrity journal doubles writes;
+  `--integrity-no-journal` avoids that, at the cost of crash consistency,
+  which a one-boot scratch disk may not need).
+- **dm-verity images.** Images come from a registry and are checked when
+  pulled, not on every read (see "The gap that remains"). The central
+  builder's verity images would close that.
 - **Disk quota under runsc.** Confirm that runsc's root overlay counts
   against the `--storage-opt` quota on the qualified storage driver.
 - **State across restarts.** The executor tables live in memory. A
