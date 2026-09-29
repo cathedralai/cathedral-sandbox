@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import re
 import shutil
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -43,7 +45,8 @@ from cathedral.tee_box.executor import (
 
 BOX_IPS = ("34.120.1.2", "2600:1900:4000::7/128")
 DIGEST = "sha256:" + "ab" * 32
-IMAGE = ImageInfo(DIGEST, "registry.example/tasks/base")
+IMAGE_ID = "sha256:" + "cd" * 32
+IMAGE = ImageInfo(DIGEST, "registry.example/tasks/base", IMAGE_ID)
 
 
 def _policy(**kwargs):
@@ -211,6 +214,14 @@ def test_tc_refuses_a_hostile_interface():
         _policy().bandwidth_commands("eth0 root")
 
 
+def _inspect_answer(argv, image_id: str = IMAGE_ID, returncode: int = 0):
+    """Docker's store resolving ``reference@digest`` to ``image_id``."""
+
+    assert argv[1:5] == ["image", "inspect", "--format", "{{json .Id}} {{json .RepoDigests}}"]
+    out = f'"{image_id}" ["{argv[-1]}"]\n'.encode()
+    return subprocess.CompletedProcess(argv, returncode, out, b"")
+
+
 class _Runner:
     def __init__(self, returncode: int = 0) -> None:
         self.calls: list[tuple[list[str], dict]] = []
@@ -218,6 +229,8 @@ class _Runner:
 
     def __call__(self, argv, **kwargs):
         self.calls.append((argv, kwargs))
+        if argv[1] == "image":
+            return _inspect_answer(argv, returncode=self.returncode)
         return subprocess.CompletedProcess(argv, self.returncode, b"", b"")
 
 
@@ -256,9 +269,11 @@ def test_create_argv_uses_runsc_limits_and_the_policy_network():
         "A=1",
         "--env",
         "B=2",
+        "--pull",
+        "never",
         "--entrypoint",
         "sleep",
-        f"registry.example/tasks/base@{DIGEST}",
+        IMAGE_ID,
         "infinity",
     ]
     internet = executor.create_argv(_spec("internet"))
@@ -282,9 +297,19 @@ def test_import_and_create_call_docker_without_a_shell():
     executor = _executor(runner)
     executor.import_image(DIGEST, IMAGE.reference)
     executor.create(_spec())
-    (pull, pull_kwargs), (run, run_kwargs) = runner.calls
+    (pull, pull_kwargs), (inspect, _), (check, _), (run, run_kwargs) = runner.calls
     assert pull == ["docker", "pull", "--quiet", f"registry.example/tasks/base@{DIGEST}"]
-    assert run[:2] == ["docker", "run"]
+    # Import resolves the pulled digest to its local id; create re-checks it.
+    assert inspect == [
+        "docker",
+        "image",
+        "inspect",
+        "--format",
+        "{{json .Id}} {{json .RepoDigests}}",
+        f"registry.example/tasks/base@{DIGEST}",
+    ]
+    assert check == inspect
+    assert run[:2] == ["docker", "run"] and run[-2:] == [IMAGE_ID, "infinity"]
     assert pull_kwargs["shell"] is False and run_kwargs["shell"] is False
     assert executor.get(_spec().sandbox_id) is not None
     executor.delete(_spec().sandbox_id)
@@ -298,6 +323,159 @@ def test_failed_docker_calls_raise():
         executor.import_image(DIGEST, IMAGE.reference)
     with pytest.raises(NotFound):
         executor.create(_spec())
+
+
+class _Store(_Runner):
+    """Docker's image store: what each ``reference@digest`` resolves to is a lever."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.resolves_to = IMAGE_ID
+        self.repo_digests: list[str] | None = None
+        self.inspect_fails = False
+
+    def __call__(self, argv, **kwargs):
+        if argv[1] != "image":
+            return super().__call__(argv, **kwargs)
+        self.calls.append((argv, kwargs))
+        if self.inspect_fails:
+            return subprocess.CompletedProcess(argv, 1, b"", b"Error: No such image")
+        digests = [argv[-1]] if self.repo_digests is None else self.repo_digests
+        out = (json.dumps(self.resolves_to) + " " + json.dumps(digests) + "\n").encode()
+        return subprocess.CompletedProcess(argv, 0, out, b"")
+
+
+def _verbs(runner) -> list[str]:
+    return [call[0][1] for call in runner.calls]
+
+
+def test_import_records_the_local_id_the_digest_resolved_to():
+    store = _Store()
+    image = _executor(store).import_image(DIGEST, IMAGE.reference)
+    assert image == IMAGE
+    assert image.view() == {
+        "id": DIGEST,
+        "digest": DIGEST,
+        "reference": IMAGE.reference,
+        "state": "ready",
+    }
+
+
+@pytest.mark.parametrize(
+    ("resolves_to", "repo_digests", "error"),
+    [
+        # The store's repo digests must name this reference at this digest.
+        (IMAGE_ID, [f"registry.example/tasks/base@sha256:{'ef' * 32}"], ExecutorRefused),
+        (IMAGE_ID, [f"registry.example/tasks/other@{DIGEST}"], ExecutorRefused),
+        (IMAGE_ID, [], ExecutorRefused),
+        # Only a sha256 content address is an image id.
+        ("registry.example/tasks/base:latest", None, ExecutorError),
+        ("sha256:" + "cd" * 31, None, ExecutorError),
+        (None, None, ExecutorError),
+    ],
+)
+def test_import_refuses_an_image_that_does_not_carry_its_digest(resolves_to, repo_digests, error):
+    store = _Store()
+    store.resolves_to, store.repo_digests = resolves_to, repo_digests
+    executor = _executor(store)
+    with pytest.raises(error):
+        executor.import_image(DIGEST, IMAGE.reference)
+    assert executor.get_image(DIGEST) is None
+
+
+def test_docker_hub_names_match_their_short_repo_digests():
+    store = _Store()
+    store.repo_digests = [f"python@{DIGEST}"]
+    executor = _executor(store)
+    assert executor.import_image(DIGEST, "docker.io/library/python").image_id == IMAGE_ID
+    store.repo_digests = [f"acme/tool@{DIGEST}"]
+    assert executor.import_image(DIGEST, "docker.io/acme/tool").image_id == IMAGE_ID
+    store.repo_digests = [f"python@{DIGEST}"]
+    with pytest.raises(ExecutorRefused):
+        executor.import_image(DIGEST, "ghcr.io/library/python")
+
+
+def test_a_digest_that_resolves_elsewhere_at_start_refuses_before_docker_run():
+    store = _Store()
+    executor = _executor(store)
+    executor.import_image(DIGEST, IMAGE.reference)
+    # After import, the store maps reference@digest to other content (a
+    # rewritten reference store, or a re-tag): the start is refused.
+    store.resolves_to = "sha256:" + "ee" * 32
+    with pytest.raises(ExecutorRefused, match="no longer matches the digest"):
+        executor.create(_spec())
+    assert _verbs(store) == ["pull", "image", "image"]
+    assert "run" not in _verbs(store)
+    assert executor.get(_spec().sandbox_id) is None
+    # The image is forgotten: it must be imported (and verified) again.
+    assert executor.get_image(DIGEST) is None
+    with pytest.raises(NotFound):
+        executor.create(_spec())
+    store.resolves_to = IMAGE_ID
+    executor.import_image(DIGEST, IMAGE.reference)
+    executor.create(_spec())
+    assert store.calls[-1][0][-2:] == [IMAGE_ID, "infinity"]
+
+
+@pytest.mark.parametrize("change", ["repo_digests", "inspect_fails"])
+def test_a_digest_the_store_no_longer_carries_refuses_the_start(change):
+    store = _Store()
+    executor = _executor(store)
+    executor.import_image(DIGEST, IMAGE.reference)
+    if change == "repo_digests":
+        store.repo_digests = [f"registry.example/tasks/base@sha256:{'ef' * 32}"]
+    else:
+        store.inspect_fails = True
+    with pytest.raises(ExecutorError):
+        executor.create(_spec())
+    assert "run" not in _verbs(store)
+    assert executor.get(_spec().sandbox_id) is None
+
+
+def test_the_start_runs_the_recorded_id_not_the_callers_image():
+    store = _Store()
+    executor = _executor(store)
+    executor.import_image(DIGEST, IMAGE.reference)
+    # A spec carrying another local id (or none) for the same digest still
+    # runs what import recorded, by content address, with no pull.
+    for carried in ("sha256:" + "ee" * 32, ""):
+        sid = "sbx-" + ("3" if carried else "4") * 24
+        spec = replace(_spec(sid=sid), image=ImageInfo(DIGEST, IMAGE.reference, carried))
+        info = executor.create(spec)
+        run = store.calls[-1][0]
+        assert run[1] == "run"
+        assert run[-5:] == ["never", "--entrypoint", "sleep", IMAGE_ID, "infinity"]
+        assert run[run.index("--pull") + 1] == "never"
+        assert not any("@" in item or item.endswith(":latest") for item in run)
+        assert info.spec.image == IMAGE
+
+
+@pytest.mark.parametrize("image_id", ["", "registry.example/tasks/base@" + DIGEST, "sha256:xyz"])
+def test_create_argv_needs_a_content_addressed_image_id(image_id):
+    spec = replace(_spec(), image=ImageInfo(DIGEST, IMAGE.reference, image_id))
+    with pytest.raises(ExecutorError, match="local id"):
+        _executor().create_argv(spec)
+
+
+def test_docker_info_gives_the_storage_root():
+    class Info(_Runner):
+        def __call__(self, argv, **kwargs):
+            self.calls.append((argv, kwargs))
+            out = b'"/var/lib/docker" "overlay2" [["Backing Filesystem","xfs"]]\n'
+            return subprocess.CompletedProcess(argv, 0, out, b"")
+
+    runner = Info()
+    assert _executor(runner).storage_root() == (
+        "/var/lib/docker",
+        "overlay2",
+        {"Backing Filesystem": "xfs"},
+    )
+    assert runner.calls[0][0] == [
+        "docker",
+        "info",
+        "--format",
+        "{{json .DockerRootDir}} {{json .Driver}} {{json .DriverStatus}}",
+    ]
 
 
 class _Enforcer:
@@ -364,7 +542,7 @@ def test_internet_needs_live_egress_enforcement():
     assert executor.egress_status()["enforced"] is False
     with pytest.raises(ExecutorRefused):
         executor.create(_spec("internet"))
-    assert len(runner.calls) == 1  # only the pull
+    assert [call[0][1] for call in runner.calls] == ["pull", "image"]  # only the import
 
     enforcer = _Enforcer()
     enforced = _executor(runner, egress_enforcer=enforcer)
@@ -395,7 +573,7 @@ def test_internet_is_refused_while_the_table_is_not_active():
     assert (status["enforced"], status["error"]) == (False, "down")
     with pytest.raises(ExecutorRefused):
         executor.create(_spec("internet"))
-    assert [call[0][1] for call in runner.calls] == ["pull"]  # no docker run
+    assert [call[0][1] for call in runner.calls] == ["pull", "image"]  # no docker run
     executor.create(_spec("deny_all"))  # deny_all never needs the enforcer
     assert enforcer.attached == []
     # The egress thread's check retries a failed apply; the sweep does not.
@@ -582,6 +760,8 @@ class _Docker:
                 self.rm_failures -= 1
                 return subprocess.CompletedProcess(argv, 1, b"", b"daemon busy")
             self.containers.discard(argv[-1])
+        elif verb == "image":
+            return _inspect_answer(argv)
         elif verb == "container":
             if argv[-1] not in self.containers:
                 return subprocess.CompletedProcess(argv, 1, b"", b"Error: No such container")
