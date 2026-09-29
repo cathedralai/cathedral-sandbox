@@ -69,7 +69,10 @@ def _write_private(directory: Path, prefix: str, encoded: bytes) -> str:
 def _write_sidecar(path: Path, encoded: bytes) -> None:
     # Context only, like the metadata values: any failure here is logged and
     # never raised, so it can't reject evidence that is already written.
-    # O_EXCL keeps the first writer's record; O_NOFOLLOW refuses a planted link.
+    # O_CREAT|O_EXCL keeps the first writer's record, and it also refuses a
+    # planted link, dangling or not: open fails with EEXIST on any existing
+    # name, which the FileExistsError branch below treats as that record.
+    # O_NOFOLLOW adds nothing on top of O_EXCL; it stays as belt and braces.
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
         fd = os.open(path, flags, 0o600)
