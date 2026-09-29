@@ -5323,6 +5323,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_delivery_check = delivery_sub.add_parser("check", help="check dual signatures from stdin; never grants eligibility")
     p_delivery_check.set_defaults(func=delivery_check)
 
+    from cathedral_delivery.grants import cmd_check as grant_check
+    p_executor = sub.add_parser("executor", help="inspect bounded executor allocation authority")
+    executor_sub = p_executor.add_subparsers(dest="executor_command", required=True)
+    p_grant_check = executor_sub.add_parser("check-grant", help="check a grant from stdin; never grants eligibility")
+    p_grant_check.set_defaults(func=grant_check)
+
     return parser
 
 
