@@ -1,9 +1,10 @@
 # TEE sandbox box design
 
-Status: design proposal, 2026-09-28. Nothing in this page has run on live
-hardware. Each section separates **Existing** (code on `main`, or an open PR
-named by number) from **Proposal** (not built). Citations are `file:line`.
-Paths without a repository name are in this repository.
+Status: design proposal, 2026-09-28, revised 2026-09-29. Nothing in this page
+has run on live hardware. Each section separates **Existing** (code on `main`,
+or an open PR named by number) from **Proposal** (not built). Citations are
+`file:line`. Paths without a repository name are in this repository. Files
+that exist only in an open PR are named with that PR's number.
 
 ## Owner decisions this design keeps
 
@@ -19,6 +20,9 @@ Paths without a repository name are in this repository.
 - Weights follow a signed market price table with separate TEE rates. The
   minimum box shape comes from SN120/Affine and SN81. The SN94 owner runs the
   prober; validators on SN39 and SN94 verify receipts. No netuid is hard-coded.
+
+The v1 decisions on this design itself are at the end of the page, in "Owner
+decisions for v1".
 
 ## 1. What a TEE box is
 
@@ -46,10 +50,11 @@ in the same guest:
 |---|---|---|
 | Evidence (`/v1/evidence`, REPORT_DATA v2) | yes | nothing |
 | In-guest TLS key, fresh at each start | yes | also carries the sandbox API |
-| Validator-access signed requests | yes | a control-plane caller key set |
-| SAT work route | yes, for now (open question 7) | none |
-| Sandbox executor | none | `runsc` with `systrap`, one sandbox per customer request |
-| Guest image | miner-administered VM | locked, measured appliance image (section 3) |
+| Validator-access signed requests | yes, for validators | central access for the control plane, with its root digest in measured state (section 3) |
+| SAT work route | yes, for now ("SAT" under "Still open") | none |
+| Sandbox executor | none | `runsc` with `systrap`, serving one customer allocation at a time |
+| Guest image | miner-administered VM | locked, measured appliance image (section 3), relaunched between customers |
+| Writable storage | host-backed disk | guest memory, or dm-crypt with integrity keyed inside the TD (section 4) |
 
 The executor is modeled on the Reliquary exclusive executor. That deployment
 does not choose `systrap` itself. The operator passes `--platform kvm` or
@@ -57,6 +62,12 @@ does not choose `systrap` itself. The operator passes `--platform kvm` or
 `systrap` without a usable `/dev/kvm` (`deploy/reliquary-workers/README.md:11`),
 but its example uses `kvm` (line 47). Qualification has not run (lines 3
 and 21).
+
+The network exposure differs from Reliquary's. The Reliquary executor listens
+on the host network with its own mTLS identity
+(`deploy/reliquary-workers/prepare.py:90-92`, `:106`). The TEE box executor
+has no listener at all. It sits behind the worker's attested TLS listener
+(section 3).
 
 ## 2. The sandbox API a TEE box serves
 
@@ -95,8 +106,8 @@ calls:
 - `GET /v1/sandboxes/{id}` (line 351) and `GET /v1/sandboxes` (line 584).
 
 The module docstring (lines 5-15) lists only some of these, so it is stale.
-The runtime raises `CathedralUnsupported` for `open_process`, `expose` and a
-runtime network policy (lines 168-172).
+The runtime raises `CathedralUnsupported` for `open_process` (lines 161-166),
+`expose` (lines 168-172) and a runtime network policy (lines 174-176).
 
 The runtime's E2B-compatible front door allows more. Per open runtime PR #33
 (`deploy/cathedral/ingress-proxy.go:40-62`, `:71-100`, `:170-182`; on base
@@ -119,11 +130,11 @@ line 274), so today it exposes no customer port either. Open runtime PR #30
 | create (image, shape, network, lifetime) | OCI bundle, `runsc run`, own cgroup | easy |
 | status, list | executor state | easy |
 | exec (sync and background), processes, stop | `runsc exec`, `runsc kill` | easy |
-| files, tar, stat | exec in the sandbox, or the host-side rootfs overlay | easy |
+| files, tar, stat | exec in the sandbox, or the rootfs overlay on protected storage (section 4) | easy |
 | timeout, lifetime, delete | executor timer, `runsc kill` and `runsc delete` | easy |
 | network `deny_all` | `--network=none`, as Reliquary does (`deploy/reliquary-workers/README.md:56`) | easy |
-| network `internet` | gVisor netstack with guest NAT; block the worker port and guest-local services | medium |
-| image import by digest | pull and unpack a centrally built image | medium |
+| network `internet` | gVisor netstack with guest NAT; the deny list is enforced by nftables on the sandbox link, outside the Sentry (section 4, "Egress") | medium |
+| image import by digest | a centrally built image, stored with a dm-verity hash tree and verified on every read (section 4, "Storage") | medium |
 | image build on the box | needs a builder in the guest | hard; build centrally instead |
 | snapshot, fork | `runsc checkpoint` exists but is tied to a runsc version and one box | hard; defer |
 | port exposure | needs netstack forwarding plus central routing | hard; defer (no adapter uses it) |
@@ -138,6 +149,41 @@ more things are needed before it covers Harbor:
   (`src/cathedral_harbor/environment.py:231-236`). The box must present as a
   Standard box: exec `env`, `user` and `cwd` (lines 471-477), and execs up to
   14,400 s (line 44).
+
+**Churn and cold start.** The target is thousands of short-lived sandboxes a
+day, so create and delete sit on the hot path.
+
+- **Existing load.** verifiers imports each image once per run and shape,
+  then creates one sandbox per rollout, optionally paced per minute. Teardown
+  polls until cleanup is confirmed (`_runtime.py:5-11`, `:120`). Harbor
+  creates one sandbox per trial (`src/cathedral_harbor/environment.py:209-215`).
+- **Proposed targets**, to confirm in qualification. With the image already
+  on the box, create to `running` within 2 s at p50 and 5 s at p99. Delete to
+  confirmed cleanup within 5 s at p99. The box sustains at least 60 creates a
+  minute at full occupancy. A relaunch between customers (decision 1), from
+  drain to a new admitted attestation, completes within 5 minutes. The box
+  takes no allocation during a relaunch.
+- **Image cache.** The cache is keyed by image digest and shared by the
+  sandboxes of one allocation. Customer images live on the TD's protected
+  storage (section 4), whose key is made at boot, so they do not survive the
+  relaunch between customers. Only public catalog base images may be cached
+  across relaunches. They sit on host disk as dm-verity images, verified on
+  every read against the root hash the control plane names, and they need no
+  confidentiality.
+- **Warm pool.** Reliquary pre-starts 50 sandboxes and retires each after
+  one use (`deploy/reliquary-workers/prepare.py:86-88`). The TEE box may keep
+  a warm pool of pre-started `runsc` sandboxes for the allocation's most-used
+  image. Each is used once and retired, and pool slots count against the
+  allocation's admitted shape. The pool is off until qualification shows cold
+  creates miss the target.
+- **Retire and cleanup.** Delete returns after `runsc kill`. `runsc delete`,
+  overlay and cgroup removal run from a bounded queue. A sandbox's resources
+  count as used until its cleanup is confirmed. The drain before a relaunch
+  waits for that queue to empty.
+- **Qualification measures** these alongside the systrap overhead: create
+  latency (cold image, cached image, warm slot), delete-to-cleanup latency,
+  sustained creates a minute at full occupancy, image import throughput,
+  dm-crypt and dm-verity I/O cost, and relaunch-to-admission time.
 
 ## 3. Binding the sandbox API to the attestation
 
@@ -170,7 +216,8 @@ own. The central API and the prober follow the validator's pattern:
 1. Open TLS to the box and record the peer SPKI.
 2. `POST /v1/evidence` with a fresh nonce. Verify the quote with the pinned
    verifier against the REPORT_DATA they compute.
-3. Check the measurement against the allowlist, and the platform identity.
+3. Check the measurement against the owner's published measurement list
+   (decision 5), and the platform identity.
 4. Send every sandbox call over a connection whose SPKI equals the attested
    one. On any mismatch, or a restart that rotates the key, stop routing and
    attest again.
@@ -179,10 +226,73 @@ One key is simpler than a second key. REPORT_DATA v2 has exactly one binding
 field (`cathedral/common.py:291-292`), so a separate executor key would need a
 second quote or a signed key hierarchy.
 
-Callers must also be authenticated. The worker already requires signed
-validator requests on protected routes (docs/WORK_REQUEST_V2.md, "Signed
-request"). The sandbox routes would accept only requests signed by a
-control-plane key set, supplied the same way.
+**Callers: central access, with its root in measured state (decision 2).**
+
+Existing, in open PRs:
+
+- #225 adds `central_access.py`. An offline Ed25519 root signs a short-lived
+  delegation naming one online central key and the routes it may call. The
+  central key signs each request over the route, the body hash, a nonce and
+  the worker's TLS channel binding. The worker keeps its own replay state and
+  a delegation high-water mark, apart from validator access (#241
+  `central_access.py:3-10`, `:143-147`).
+- A delegation lasts at most 24 hours (#241 `central_access.py:65`, `:436`).
+  It may name only routes in `CENTRAL_ROUTES`, which today holds only
+  `/v1/capabilities` (#241 `central_access.py:73`, `:423`).
+- #228 serves central requests from the worker, off by default. #241 adds a
+  root-signed revocation list. The worker persists it, re-reads a local list
+  file, and refuses central requests while the list is missing or unusable
+  (#241 `central_access.py:494-526`, `cli.py:4433-4436`). #239 adds the
+  offline root tool.
+- The worker takes the root keys and their digest from miner flags,
+  `--central-root-keys` and `--central-root-keys-digest` (#241
+  `central_access.py:12-16`, `cli.py:4421-4426`).
+
+Proposal:
+
+- The sandbox routes are added to `CENTRAL_ROUTES`. There is no second caller
+  key set.
+- The root key digest is never a miner flag or a miner-supplied file. In the
+  appliance it comes from measured state, in one of two ways:
+  - MRCONFIGID on TDX. The Cathedral TDX value already covers it
+    (`docs/MRTD.md:12-18`). At boot the appliance reads its own MRCONFIGID
+    from a TD report. It serves no sandbox route unless the root key file
+    hashes to that value.
+  - A root key file inside the dm-verity root, on either TEE kind. SNP needs
+    this form: its `MEASUREMENT` does not cover `HOST_DATA`, the launch field
+    closest to MRCONFIGID.
+- Delegations of at most 24 h rotate under the root without re-measuring.
+  Replacing the root means a new entry on the published measurement list.
+- Admission checks this (section 6).
+
+**Why the replaced decision 2 was unsafe.** It had the control-plane caller
+keys arrive as a signed snapshot "like validator access". The validator-access
+snapshot is signed by the operator's artifact key outside the guest, that is,
+by the miner (`cathedral/validator_access.py:3-5`). The miner also chooses the
+trusted key file and its digest (`cathedral/audit_miner_entrypoint.py:266-270`,
+`inputs.validator_access_keys_digest`). That is sound for validator access,
+because each validator re-verifies everything itself. On the sandbox routes it
+would let the miner mint its own caller key. It could then exec into, and read
+or change files in, the current customer's sandboxes through the front door.
+Section 4's protection from the host would be gone.
+
+Open PR #242 implements the replaced decision. It authorizes callers with a
+signed control-plane snapshot and miner flags `--tee-box-caller-keys` and
+`--tee-box-caller-keys-digest` (its `tee_box/service.py:151`, and its
+TEE_BOX_SERVICE.md, "Caller authorization"). It has to move to central access.
+
+**Central state across a relaunch.** Central state lives in guest memory
+(section 4), and the guest is relaunched between customers (decision 1), so
+each boot starts empty. A replayed request still fails, because it is bound to
+the previous boot's TLS key. But the delegation high-water resets, and the
+host could offer an older revocation list: #241 compares a list's sequence
+only with the stored one (`central_access.py:506-510`). Withholding a newer
+list works today too, since the miner delivers the list file. Proposal: after
+each relaunch, and whenever the list changes, the control plane installs the
+current revocation list over the attested channel, on a central route. The
+appliance serves no sandbox route until it has one. A revoked delegation then
+stops working as soon as the control plane has pushed the list, not only at
+its expiry.
 
 **The co-location hole, and what closes it.** The attack: a miner has a
 genuine TDX machine A and a cheaper machine B. It shows A's quote but runs
@@ -214,8 +324,9 @@ customer sandboxes, or the capacity challenge, on B.
   contain the OCI digest either (`docs/SN94_SNP_MINER_IMAGE.md:45-49`).
 - The direct validator does not use the TDX measurement as a gate
   (`docs/MRTD.md:51-54`). Open PR cathedral-validator #256 adds an optional
-  owner allowlist, `CATHEDRAL_TDX_MEASUREMENT_POLICY`, with `shadow` and
-  `enforce` modes (its `tdx_measurement.py:39-41`). The SNP preview already
+  allowlist: a local, unsigned file each validator names with
+  `CATHEDRAL_TDX_MEASUREMENT_POLICY`, with `shadow` and `enforce` modes. It is
+  TDX-only (its `tdx_measurement.py:24`, `:38-41`). The SNP preview already
   loads `allowed_measurements` (cathedral-validator
   `cathedral_thin/independent_runtime/amd_snp_dev_preview.py:304-319`).
 
@@ -224,6 +335,14 @@ Proposal: ship the box as a measured appliance image:
 - The kernel, initrd and command line are measured (RTMR1 and RTMR2 on TDX,
   measured direct boot on SNP). The command line pins a dm-verity root hash
   for a read-only root holding the worker, `runsc` and the executor.
+- The central-access root key digest is in MRCONFIGID or the dm-verity root,
+  as above.
+- **RTMR3.** The appliance extends nothing into RTMR3, and enables nothing
+  that extends it at runtime. Customer images are data and are not extended.
+  RTMR3 therefore keeps its initial all-zero value. #256 notes that RTMR3
+  varies with runtime extends (its `tdx_measurement.py:20-22`), so this keeps
+  one entry per image and VM shape. An image that later extends RTMR3 needs
+  entries for the values it produces.
 - **Provider-dependent assumption, to verify:** this needs a provider that lets
   the miner supply the kernel and command line, and measures them into the
   RTMRs or the SNP launch digest. Clouds that boot through a paravisor or vTPM
@@ -231,31 +350,99 @@ Proposal: ship the box as a measured appliance image:
 - There is no SSH, no miner shell, no Docker socket and no debug mode.
 - Customer images are data. They run inside gVisor and are not measured.
 
-Then the allowlist entry names the executor. RTMR0 can vary with VM shape
-(PR #256), so one image may need one entry per shape.
+Then the published list entry names the executor. RTMR0 can vary with VM shape
+(#256 `tdx_measurement.py:20-22`), so one image may need one entry per shape.
 
-## 4. Isolation and overhead
+## 4. Isolation, storage and overhead
 
-**Proposal.** Sandboxes share one confidential VM:
+**Proposal.** One confidential VM per box serves one customer allocation at a
+time (decision 1):
 
-- **Sandbox from sandbox:** each sandbox has its own gVisor Sentry (a
-  user-space kernel), cgroup, rootfs overlay and network namespace, or no
-  network. A tenant must escape gVisor and then attack the guest kernel.
+- **Sandbox from sandbox,** within one customer's allocation: each sandbox has
+  its own gVisor Sentry (a user-space kernel), cgroup, rootfs overlay and
+  network namespace, or no network.
+- **Customer from customer:** the VM is relaunched and re-attested between
+  allocations (decision 1). The relaunch gives a fresh TLS key, a clean
+  dm-verity root, a fresh storage key and fresh evidence. The control plane
+  routes the next customer only after admission (section 6) passes on the new
+  SPKI. So a gVisor escape during one allocation does not persist into the
+  next.
 - **All sandboxes from the host:** the TEE encrypts and integrity-protects
   guest memory. The host still controls scheduling, I/O and availability.
   Guest egress is visible to the host, so customers must encrypt their own
-  traffic.
-- **Residual risk:** a gVisor escape reaches the guest kernel. That kernel
-  holds the TLS key and quote access, and it is shared with the other tenants.
-  An escaped tenant could impersonate the box. The design does not remove this
-  risk (open question 1).
+  traffic. Host-backed disk is covered under "Storage" below.
+- **Residual risk:** a gVisor escape reaches the guest kernel for the rest of
+  that allocation. That kernel holds the TLS key, quote access and the central
+  state. The escaped tenant can reach only its own sandboxes, since no other
+  customer and no probe shares the guest, but it could impersonate the box
+  until the relaunch.
+
+**Storage.** The host controls the disk, so the design treats host-backed
+storage like host-visible traffic:
+
+- **All writable storage** is in guest memory, or on dm-crypt with integrity
+  (AEAD, dm-integrity) under a key the TD makes at boot and never writes out.
+  That covers imported images, rootfs overlays, `files` and `tar` uploads,
+  scratch space, and the replay, high-water and revocation state.
+- **Images are verified on read.** The central builder emits each image as a
+  read-only filesystem with a dm-verity hash tree, and the image id binds its
+  root hash. The box opens the image with dm-verity against the root hash the
+  control plane named, so every block is checked when `runsc` reads it. There
+  is no time-of-check gap between import and `runsc run`. A customer's
+  private image is also encrypted under the boot key.
+- **State files cannot be rolled back.** They live in guest memory only.
+  AEAD sector tags detect a changed sector, but not the replay of an older
+  version of the same sector written under the same key. So dm-crypt alone
+  would not stop the host rolling a state file back within one boot. State
+  does not need to outlive a boot (section 3, "Central state across a
+  relaunch").
+- **Residual risk:** on dm-crypt, the host can still replay an older version
+  of an overlay or scratch sector within one allocation. That can revert the
+  customer's own data. It cannot forge data or read it. A customer who needs
+  more puts its scratch space in memory.
+- Open PR #242's `RunscExecutor` drives `docker run --runtime=runsc` (its
+  TEE_BOX_SERVICE.md, "What T6a adds"). Docker's image and container store
+  must then sit on the protected storage too, with images verified on read as
+  above.
+- Guest memory used for storage comes out of the box's reserve ("Paid shape"
+  under "Still open").
+
+**Egress (decision 6).** The `internet` deny list is enforced outside the
+Sentry, never in the sandbox's own netstack, where a root tenant could change
+it:
+
+- nftables in the guest, on the sandbox link. The forward hook drops packets
+  to denied ranges. The input hook drops everything from the sandbox link
+  addressed to the box itself: the worker port, the executor and guest
+  services.
+- The rules match each packet's destination address, so they apply after DNS
+  resolution. A name that resolves, or rebinds, to a denied address is
+  dropped.
+- The denied ranges include `100.64.0.0/10`, the IPv4 private, link-local and
+  reserved ranges, the IPv6 ranges `fc00::/7`, `fe80::/10`, `::ffff:0:0/96`
+  and `64:ff9b::/96`, and each cloud metadata address. The public internet is
+  allowed, with a per-sandbox bandwidth cap.
+- Open PR #243 implements this. The ranges are its `tee_box/egress.py:30-72`,
+  and the nft rules on the sandbox bridge are `:102-137`. Its
+  `tee_box/enforce.py:1-25` applies them, reads them back before every
+  `internet` create, and fails closed. The bandwidth cap is `tc` on each
+  sandbox's host-side veth (`tee_box/egress.py:139`). Because the input hook
+  drops guest-local DNS, sandboxes use public resolvers (its
+  `tee_box/executor.py:47`).
 
 **Overhead.** Systrap intercepts system calls through seccomp traps and needs
 no virtualization extensions. Compute and memory-bound code, such as the
 capacity lanes, should run near native. System-call-heavy code, such as builds
-and small-file I/O, pays more. TDX and SNP add their own cost. None of this
-has been measured for Cathedral. Qualification must measure it before TEE
-prices are set.
+and small-file I/O, pays more. TDX and SNP add their own cost, and so do
+dm-crypt and dm-verity. None of this has been measured for Cathedral.
+Qualification must measure it before TEE prices are set.
+
+The capacity probe needs its own calibration. #217 budgets 5 s of startup and
+a per-step deadline set from native runs on development VMs (#217
+CAPACITY.md, "Timing", lines 94-107 at a6ca3da). A probe inside `runsc` inside
+a TD must be calibrated there. The deadline timer must start after the probe
+sandbox is running. #217 already bounds only the exec and times the create
+separately (`timings_ms.create`, same section), and the TEE prober keeps that.
 
 **Existing: the Reliquary limits and admission pattern.**
 
@@ -283,21 +470,46 @@ Each sandbox gets its own cgroup with a CPU quota, memory and swap limit,
 PID cap and disk quota. The executor admits a sandbox only while the sum of
 admitted shapes fits the box's proven capacity minus a fixed guest reserve.
 Every sandbox is retired at delete or lifetime end. Box enable, disable and
-image upgrades keep Reliquary's disabled-first grant and drain pattern.
+image upgrades keep Reliquary's disabled-first grant and drain pattern. Every
+allocation ends with a drain and a relaunch.
 
 ## 5. Capacity and receipts
 
-**Existing (open PR cathedral-sandbox #217, `cathedral.capacity`).**
+**Existing (open PR cathedral-sandbox #217 at a6ca3da, `cathedral.capacity`).**
 
-- One scrypt-like lane per claimed vCPU, holding 80% of the claimed memory.
-  The box commits to all outputs first. Then the prober samples lanes with a
-  fresh nonce (its `capacity/challenge.py:104-223`).
-- The receipt names a hardware identity by kind: `ppid` for TDX, `chip_id` for
-  SNP, `probe_fingerprint` for bare metal. An all-zero id is refused (its
-  `capacity/receipt.py:58-66`, `:169-185`).
+- One scrypt-like lane per claimed vCPU, holding 80% of the claimed memory
+  (its `capacity/challenge.py:51`). The box commits to all outputs first. Then
+  the prober samples lanes with a fresh nonce (its
+  `capacity/challenge.py:104-223`).
+- The receipt names a hardware identity by kind: `tdx_platform` for TDX,
+  `chip_id` for SNP, `probe_fingerprint` for bare metal (its
+  `capacity/receipt.py:61-65`). The TDX id comes from the strict verifier's
+  `stable_platform_id`, not the PPID: "No TDX verifier outputs the raw PPID"
+  (its CAPACITY.md:207, "Hardware identity"). An all-zero id is refused (its
+  `capacity/receipt.py:173-190`).
+- A receipt answers one validator's nonce in one round, and is valid for at
+  most 2 hours (its `capacity/receipt.py:71`, `:297-328`).
 - The price table has separate `tee` and `bare_metal` rates and per-consumer
   minimum profiles (its CAPACITY.md, "Pricing").
-- The receipt body has no evidence field (its `capacity/receipt.py:75-89`).
+- The v1 receipt body has no evidence field (its `capacity/receipt.py:79-92`).
+
+**Existing (open PR #237, stacked on #217): receipt v2 with evidence.** It
+adds a signed `evidence` object, required for a TEE box and `null` for bare
+metal, with seven fields: `evidence_kind`, `evidence_sha256` over the raw
+quote or report, `measurement`, `verifier_digest`, `tls_spki_sha256`,
+`attestation_nonce` and `attested_at`. `expected_report_data` recomputes the
+quote's REPORT_DATA v2 from the nonce, the miner hotkey and the SPKI, for
+audit. `verify_receipt(..., max_evidence_age=)` lets a validator refuse
+evidence older than it accepts. The evidence comes from admission and is
+reused for later receipts (its CAPACITY.md, "Evidence").
+
+What it does not prove: the receipt carries the quote's hash, not the quote.
+A validator cannot re-verify the quote, or check that the hardware id came
+from it, from the receipt alone. It trusts the prober for that, as it does for
+the challenge. With the quote, from the prober's archive or the box, anyone
+can audit the receipt end to end: hash the quote, verify it, recompute the
+hardware id and measurement, and compare its REPORT_DATA with
+`expected_report_data` (same section).
 
 This repository already extracts the needed identities:
 
@@ -308,105 +520,183 @@ This repository already extracts the needed identities:
 
 **Proposal.**
 
-1. Each round, the prober attests the box as in section 3. It takes the
-   PPID or CHIP_ID from the quote it verified itself, never from a box field.
-2. Over the pinned channel it creates a probe sandbox of the claimed shape,
-   with no network. It runs the challenge there, samples, then deletes the
-   sandbox.
-3. The challenge still runs because a quote proves neither vCPU count nor
-   memory size.
-4. Queue item T4 bumps the receipt schema to add an `evidence` object:
-   `evidence_kind` (`tdx` or `sev_snp`), `evidence_sha256` over the raw quote
-   or report the prober verified, the `measurement`, the verifier digest, and
-   the attested `tls_spki_sha256`. A validator can then check that the
-   hardware id and measurement come from one verified quote, and audit it
-   later.
+1. **Probe only when idle (decision 4).** The prober probes a box only
+   between allocations, with the box drained: no customer sandbox, and no
+   cleanup pending. So the probe never shares the guest with a customer, and
+   the prober is never a second tenant. The natural slot is right after the
+   relaunch between customers, before the next allocation. That relaunch's
+   fresh attestation is then the receipt's evidence.
+2. The prober attests the box as in section 3. It takes the TDX
+   `stable_platform_id` or the SNP CHIP_ID from the quote it verified itself,
+   never from a box field.
+3. Over the pinned channel it creates a probe sandbox of the full claimed
+   shape, with no network. It runs the challenge there, samples, then deletes
+   the sandbox. The challenge still runs because a quote proves neither vCPU
+   count nor memory size.
+4. **An allocated box keeps its last good receipt for the round.** Receipts
+   are bound to one round and one validator nonce (#217
+   `capacity/receipt.py:297-328`). So for each round in which the control
+   plane lists the box as allocated, the prober still signs that round's
+   receipt. The receipt carries the capacity and challenge result of the
+   box's last passing probe, and the evidence of the attestation the current
+   allocation was admitted on. A proposed field, `carried_from_round`, names
+   the round of that probe, and is `null` on a receipt probed this round.
+   Scoring:
+   - Validators pay a carried receipt like a fresh one, so a box does not lose
+     pay for serving a customer.
+   - A receipt may be carried for at most 24 hours after its probe (proposed).
+     The control plane schedules a drain and probe before that. Past the
+     bound the box scores zero until it is probed again.
+   - Only a box the control plane lists as allocated is carried. An idle box
+     that refuses or fails a probe scores zero for the round.
+   - Dedupe by hardware id is unchanged, and carried receipts count in it.
+5. **Receipt evidence (T4)** follows #237 as implemented. The design does not
+   claim more than it does: a validator trusts the prober for the link between
+   the quote and the hardware id. The prober keeps an archive of the quotes it
+   relied on, so any receipt can be audited with `expected_report_data`.
+   Carrying the quote in the receipt stays a possible later change.
 
 ## 6. Admission (queue item T3)
 
-**Proposal.** The control plane admits a TEE box only when all of these hold,
-on one connection:
+**Proposal.** The control plane admits a TEE box, and again after every
+relaunch, only when all of these hold, on one connection:
 
 - the quote verifies with the pinned verifier (TDX QVL or the SNP chain);
-- REPORT_DATA v2 binds the nonce, the miner hotkey and the SPKI of the TLS
+- REPORT_DATA v2 binds a fresh nonce, the miner hotkey and the SPKI of the TLS
   key serving the sandbox API;
-- the measurement is on the owner allowlist (the PR #256 policy for TDX, the
-  SNP `allowed_measurements`);
+- the measurement is on the owner's published measurement list (decision 5);
+- the central-access root digest is in measured state. On TDX the list entry
+  fixes MRCONFIGID, which the appliance has checked against its root key
+  file. Otherwise the root key file is inside the listed dm-verity root. A
+  box whose root keys come from a miner flag or file outside measured state
+  is not admitted. Its measurement cannot match a listed entry;
 - the hardware id is not already registered to another box;
-- a first capacity challenge passes.
+- a first capacity challenge passes, with the box drained.
 
-Reuse, do not rebuild: validator-access signed requests and the fleet
-manifest (docs/WORK_REQUEST_V2.md), the validator's evidence collection and
-SPKI pinning (section 3), and the disabled-first grant pattern (section 4).
+Open PR #240 implements the REPORT_DATA, hardware-id and measurement checks
+as a library. It reads #256's policy file format for TDX (its
+`capacity/admission.py:1-35`). Under decision 5 it would read the published
+list instead.
+
+Reuse, do not rebuild: central access (#225, #228, #241) for control-plane
+calls; validator-access signed requests and the fleet manifest for validators
+(docs/WORK_REQUEST_V2.md); the validator's evidence collection and SPKI
+pinning (section 3); and the disabled-first grant pattern (section 4).
 
 **Dedupe by hardware id.** The validator already zeroes every claimant that
 shares a hardware identity
 (cathedral-validator
-`cathedral_thin/independent_runtime/fleet_score.py:1063-1066`). The PPID names
-the physical platform, not the guest. Co-resident TDs on one cloud host
-therefore collide (`cathedral/runtime.py:1177-1179`). SNP is the same: CHIP_ID
-is per processor (`cathedral/verify/snp.py:163`), so co-resident SNP guests
-share it. So one physical host is one TEE box. A miner runs one large TD or
-SNP guest per host, not several small ones.
+`cathedral_thin/independent_runtime/fleet_score.py:1063-1066`). The TDX
+platform id derives from the PPID, which names the physical platform, not the
+guest. Co-resident TDs on one cloud host therefore collide
+(`cathedral/runtime.py:1177-1179`). SNP is the same: CHIP_ID is per processor
+(`cathedral/verify/snp.py:163`), so co-resident SNP guests share it. So one
+physical host is one TEE box. A miner runs one large TD or SNP guest per host,
+not several small ones.
 
 ## 7. What changes where
 
 - **cathedral-sandbox:** a `runsc` executor serving the section 2 subset
-  behind the worker's TLS listener; signed control-plane caller keys on the
-  sandbox routes; Standard-box behavior (exec env, user, cwd, 14,400 s execs);
-  image import into the TD by digest; measured appliance image builds for TDX
-  and SNP; receipt schema v2 with the evidence object (T4), on top of PR #217.
-- **cathedral-validator:** land #256, run it in shadow on the new image, then
-  enforce; promote the SNP measurement allowlist; verify capacity receipts,
-  including the evidence object, and dedupe across receipts by hardware id.
-- **Private control plane:** a central image builder serving
-  `POST /v1/images/build`, plus image delivery to boxes; registration and
-  admission (T3); routing that
-  pins each box's attested SPKI, attests again on change, and drains before
-  an image upgrade; the SN94 owner's prober, with TEE rates in the signed
+  behind the worker's TLS listener; the sandbox routes in `CENTRAL_ROUTES`,
+  with the root digest taken from measured state, and #242's caller snapshot
+  replaced by central access; revocation-list install over the attested
+  channel; all writable storage in guest memory or dm-crypt with integrity,
+  images verified on read with dm-verity; Standard-box behavior (exec env,
+  user, cwd, 14,400 s execs); image import into the TD by digest; the egress
+  enforcer (#243); measured appliance image builds for TDX and SNP that
+  extend nothing into RTMR3; receipt v2 with the evidence object (#237), on
+  top of #217, plus `carried_from_round`.
+- **cathedral-validator:** land #256, with its local file mirroring the
+  published measurement list during rollout; run it in shadow on the new
+  image, then enforce; take the SNP allowlist from the same list; verify
+  capacity receipts, including the evidence object, its age and carried
+  receipts, and dedupe across receipts by hardware id.
+- **Private control plane:** the owner's signed measurement list, which
+  validators, admission, routing and the prober all consume; a central image
+  builder serving `POST /v1/images/build` that emits dm-verity images, plus
+  image delivery to boxes; registration and admission (T3); routing that pins
+  each box's attested SPKI, attests again on change, drains before an image
+  upgrade, and relaunches and re-admits the box between customers; the SN94
+  owner's prober, probing only drained boxes, with TEE rates in the signed
   price table.
 
 **Ordered plan**
 
 1. Agree this design.
-2. Build the TDX appliance image with worker, `runsc` and the executor. It is
-   not paid yet.
-3. Serve the executor subset behind the worker's TLS, presenting as a
-   Standard box. Add the central image builder and image delivery into the TD.
-   Test with the Harbor and verifiers adapters through a staging central API.
-4. Run #256 in shadow and record the new image's measurements.
-5. Receipt v2 (T4) and the prober's TEE path.
-6. Control-plane admission (T3) and routing, disabled by default.
-7. Enforce the measurement allowlist and enable paid TDX boxes. SNP follows
-   with the same image layout.
+2. Build the TDX appliance image with worker, `runsc`, the executor and
+   protected storage. It is not paid yet.
+3. Serve the executor subset behind the worker's TLS on central access,
+   presenting as a Standard box. Add the central image builder and image
+   delivery into the TD. Test with the Harbor and verifiers adapters through a
+   staging central API, and measure the churn targets (section 2).
+4. Publish the signed measurement list with the new image's measurements. Run
+   #256 in shadow with its local file mirroring the list.
+5. Receipt v2 (#237) and the prober's TEE path, probing only drained boxes.
+6. Control-plane admission (T3), relaunch between customers, and routing,
+   disabled by default.
+7. Enforce the measurement list and enable paid TDX boxes. SNP follows with
+   the same image layout.
 8. Later: port exposure, snapshots, Docker-in-Docker, and bare-metal supply.
 
-## Owner decisions for v1 (2026-09-28)
+## Owner decisions for v1 (2026-09-28, amended 2026-09-29)
 
-The owner answered six of the eight open questions:
+The owner's answers were given in this PR's conversation (cathedral-sandbox
+#236), on 2026-09-28 and 2026-09-29. The 2026-09-29 answers respond to the
+third review round. Decisions 1, 2, 4 and 6 changed or gained detail that day,
+and decisions 7 and 8 are new.
 
-1. **Shared guest.** One shared confidential VM per box, serving one customer
-   at a time, as the Reliquary exclusive executor does. This keeps a gVisor
-   escape from reaching another customer, without a VM per sandbox.
-   One VM per tenant can come later for customers who need it.
-2. **Caller keys.** Control-plane keys arrive as a signed snapshot, like
-   validator access, not pinned in the measured image. Keys can rotate
-   without rebuilding and re-measuring the image.
+1. **One customer at a time, relaunched between customers.** One confidential
+   VM per box serves one customer allocation at a time, as the Reliquary
+   exclusive executor does. *Amended 2026-09-29:* the VM is relaunched and
+   re-attested between customer allocations, so a gVisor escape cannot
+   persist into the next customer's allocation (section 4). One VM per tenant
+   can come later for customers who need it.
+2. **Caller keys: central access.** *Replaced 2026-09-29.* Control-plane
+   callers use central access (`central_access.py` from #225, #228 and #241).
+   An offline Cathedral root key signs short-lived, route-scoped delegations
+   of at most 24 h, with a signed revocation list. The root key's digest is in
+   measured state: MRCONFIGID, already covered by the Cathedral TDX value
+   (`docs/MRTD.md:12-18`), or the dm-verity root. It is never a miner flag or
+   file. The sandbox routes are added to `CENTRAL_ROUTES`. Admission checks
+   this (section 6). The replaced decision (a signed snapshot like validator
+   access) was unsafe: the miner signs that snapshot and chooses its trusted
+   keys (`cathedral/validator_access.py:3-5`,
+   `cathedral/audit_miner_entrypoint.py:266-270`), so it could authorize
+   itself on the sandbox routes (section 3).
 3. **Cloud guests.** Whole-host boxes only. One physical host is one box, and
    a miner runs one large confidential VM per host. Cloud guests that share a
-   PPID or CHIP_ID with a co-tenant are not admitted in v1.
-4. **Measurement approval.** The allowlist is the cathedral-validator #256
-   policy file, shadow first. The signed registry flow (`docs/MRTD.md:70-86`)
-   follows once the image build is reproducible.
+   TDX platform id or CHIP_ID with a co-tenant are not admitted in v1.
+4. **One published measurement list.** *Replaced 2026-09-29.* The owner
+   publishes one signed measurement list. Validators, admission, routing and
+   the prober all consume it. It replaces per-validator local #256 files as
+   the source of truth. During rollout, #256's local file can mirror it. The
+   existing signed registry format and approval flow
+   (`cathedral/policy_registry.py`, `docs/MRTD.md:70-86`) are candidates for
+   it. The appliance extends nothing into RTMR3 (section 3). Who builds and
+   approves the image is still open.
 5. **Consumer needs.** No snapshots, fork, port exposure or Docker-in-Docker
    in v1. The adapters use none of them (section 2).
 6. **Egress.** `internet` sandboxes may not reach private, link-local or
    cloud metadata ranges, or the box's own addresses. The public internet is
-   allowed, with a per-sandbox bandwidth cap.
+   allowed, with a per-sandbox bandwidth cap. Enforcement is by nftables on
+   the sandbox link, outside the Sentry, after DNS resolution, and covers the
+   IPv6 ranges and `100.64.0.0/10` (section 4, as open PR #243 does).
+7. **Encrypted storage.** *New 2026-09-29.* All writable storage (imported
+   images, rootfs overlays, `files` and `tar` uploads and scratch, and replay
+   and high-water state) lives in guest memory, or on dm-crypt with integrity
+   (AEAD) under a key made inside the TD at boot. Images are verified on read,
+   with no time-of-check gap between import and `runsc run`. The host cannot
+   roll state files back (section 4).
+8. **Probe only when idle.** *New 2026-09-29.* The capacity probe runs only
+   between allocations, with the box drained. An allocated box keeps its last
+   good receipt for the round (section 5, step 4).
 
 Still open:
 
+- **Image build and approval.** Who builds and approves the appliance image
+  and its measurement list entries? This was the original question 4.
 - **Paid shape.** Is the paid shape the proven shape minus the guest and
-  gVisor reserve? How large is that reserve?
+  gVisor reserve, now including memory used for storage? How large is that
+  reserve?
 - **SAT.** Does SAT work continue on TEE boxes, or do capacity receipts
   replace it for box pay?
