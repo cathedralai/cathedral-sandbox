@@ -176,6 +176,41 @@ def sign_receipt(
     }
 
 
+def sign_executor(body: dict[str, Any], key: Ed25519PrivateKey) -> str:
+    """Guest-side signature using its quoted Ed25519 TLS private key."""
+    return base64.b64encode(key.sign(signing_bytes(body))).decode("ascii")
+
+
+def countersign_receipt(
+    body: dict[str, Any],
+    *,
+    executor_signature: str,
+    executor_key: Ed25519PublicKey,
+    control_plane_key: Ed25519PrivateKey,
+) -> dict[str, Any]:
+    """Add the allocation authority signature after checking the guest's.
+
+    The caller must first compare the body with its durable allocation and
+    admitted key. This helper cannot establish lifecycle facts by itself.
+    """
+    checked = check_body(body)
+    message = signing_bytes(checked)
+    try:
+        raw = base64.b64decode(executor_signature, validate=True)
+        if base64.b64encode(raw).decode("ascii") != executor_signature:
+            raise DeliveryError("noncanonical executor signature")
+        executor_key.verify(raw, message)
+    except (ValueError, TypeError, InvalidSignature) as exc:
+        raise DeliveryError("executor signature rejected before countersigning") from exc
+    return {
+        "body": checked,
+        "signatures": {
+            "executor": executor_signature,
+            "control_plane": base64.b64encode(control_plane_key.sign(message)).decode("ascii"),
+        },
+    }
+
+
 def verify_receipt(
     receipt: object,
     *,

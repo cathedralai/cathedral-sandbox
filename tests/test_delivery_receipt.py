@@ -152,3 +152,137 @@ def test_admission_without_quote_or_approved_measurement_refuses(tmp_path):
             verifier_path="/missing",
             verifier_sha256="aa" * 32,
         )
+
+
+def test_authority_countersigns_only_exact_executor_body():
+    from cathedral.delivery import sign_executor, countersign_receipt
+
+    executor, central = Ed25519PrivateKey.generate(), Ed25519PrivateKey.generate()
+    value = body()
+    signature = sign_executor(value, executor)
+    receipt = countersign_receipt(
+        value,
+        executor_signature=signature,
+        executor_key=executor.public_key(),
+        control_plane_key=central,
+    )
+    assert (
+        verify_receipt(
+            receipt,
+            executor_key=executor.public_key(),
+            control_plane_key=central.public_key(),
+            now=NOW,
+        ).resource_seconds
+        == 300
+    )
+    value["sandbox_id"] = "different"
+    with pytest.raises(DeliveryError):
+        countersign_receipt(
+            value,
+            executor_signature=signature,
+            executor_key=executor.public_key(),
+            control_plane_key=central,
+        )
+
+
+def admitted_fixture(tmp_path, monkeypatch):
+    """Synthetic quote plus substituted vendor result; never hardware proof."""
+    from types import SimpleNamespace
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    from cathedral.common import ChannelBinding, ChannelBindingType, Tier, report_data_v2
+    from cathedral.verify.tdx_quote import parse_tdx_quote
+    from tests.tdx_quote_fixtures import synthetic_tdx_quote
+    import cathedral.verify
+
+    executor, central = Ed25519PrivateKey.generate(), Ed25519PrivateKey.generate()
+    value = body()
+    spki = executor.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+    binding = ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, hashlib.sha256(spki).digest())
+    quote = synthetic_tdx_quote(
+        report_data=report_data_v2(
+            bytes.fromhex(value["admission_nonce"]), value["miner_hotkey"], binding
+        )
+    )
+    measurement = parse_tdx_quote(quote).measurement
+    value.update(
+        measurement=measurement,
+        evidence_sha256=hashlib.sha256(quote).hexdigest(),
+        hardware_id=hashlib.sha256(
+            b"cathedral.capacity.hardware_id.v1\0tdx_platform\0" + b"h" * 32
+        ).hexdigest(),
+    )
+    verifier = tmp_path / "verifier"
+    verifier.write_bytes(b"synthetic verifier pin, not executable")
+    verifier.chmod(0o600)
+    verdict = SimpleNamespace(
+        tier=Tier.CC_CPU_TDX,
+        verification_status="VERIFIED",
+        chain_verified=True,
+        debug_enabled=False,
+        collateral_current=True,
+        platform_identity_kind="stable",
+        policy_mode="strict",
+        measurement=measurement,
+        chip_id="tdx-platform-sha256:" + (b"h" * 32).hex(),
+    )
+    monkeypatch.setattr(cathedral.verify, "replay_verify_tdx", lambda *a, **k: verdict)
+    kwargs = dict(
+        quote=quote,
+        executor_key=executor.public_key(),
+        allowed_measurements=frozenset([measurement]),
+        verifier_path=str(verifier),
+        verifier_sha256=hashlib.sha256(verifier.read_bytes()).hexdigest(),
+    )
+
+    def receipt(changes=None):
+        candidate = dict(value)
+        candidate.update(changes or {})
+        return verify_receipt(
+            sign_receipt(candidate, executor_key=executor, control_plane_key=central),
+            executor_key=executor.public_key(),
+            control_plane_key=central.public_key(),
+            now=NOW,
+        )
+
+    return receipt, kwargs, verdict
+
+
+def test_admission_binds_raw_quote_key_nonce_hardware(tmp_path, monkeypatch):
+    from cathedral.delivery import admit_delivery
+
+    receipt, kwargs, verdict = admitted_fixture(tmp_path, monkeypatch)
+    admitted = admit_delivery(receipt(), **kwargs)
+    assert admitted.receipt.resource_seconds == 300
+    for change in (
+        {"admission_nonce": "55" * 32},
+        {"miner_hotkey": "other"},
+        {"hardware_id": "66" * 32},
+        {"evidence_sha256": "77" * 32},
+    ):
+        with pytest.raises(DeliveryError):
+            admit_delivery(receipt(change), **kwargs)
+    with pytest.raises(DeliveryError):
+        admit_delivery(
+            receipt(), **dict(kwargs, executor_key=Ed25519PrivateKey.generate().public_key())
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("chain_verified", False),
+        ("debug_enabled", True),
+        ("collateral_current", False),
+        ("platform_identity_kind", "ephemeral"),
+        ("policy_mode", "permissive"),
+        ("verification_status", "NOT_PROVEN"),
+        ("chip_id", "tdx-platform-sha256:" + "00" * 32),
+    ],
+)
+def test_partial_vendor_verdict_cannot_admit(tmp_path, monkeypatch, field, value):
+    from cathedral.delivery import admit_delivery
+
+    receipt, kwargs, verdict = admitted_fixture(tmp_path, monkeypatch)
+    setattr(verdict, field, value)
+    with pytest.raises(DeliveryError):
+        admit_delivery(receipt(), **kwargs)
