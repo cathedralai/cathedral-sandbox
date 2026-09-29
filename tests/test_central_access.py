@@ -520,3 +520,29 @@ def test_finalize_refuses_when_the_high_water_cannot_be_read(authorizer):
     authorizer.state.delegation_high_water = lambda: None
     with pytest.raises(ca.CentralAccessError, match="high-water is unreadable"):
         authorizer.finalize(request, body=BODY, now=NOW)
+
+
+def test_a_scoped_request_needs_its_scope_and_signs_its_method(authorizer):
+    # The TEE box maps each request to a scope; the delegation must grant it.
+    target = "/v1/sandboxes/sbx-" + "0" * 24 + "/files?path=/a"
+    delegation = _delegation(routes=["tee-box:files"])
+    header = _header(delegation, method="GET", path=target, body=b"")
+    request = authorizer.preauthorize(
+        header, method="GET", path=target, now=NOW, scope="tee-box:files"
+    )
+    assert authorizer.finalize(request, body=b"", now=NOW).startswith("central:")
+    header = _header(delegation, method="GET", path=target, body=b"", nonce=b"m" * 32)
+    with pytest.raises(ca.CentralAccessError, match="does not grant this route"):
+        authorizer.preauthorize(header, method="GET", path=target, now=NOW, scope="tee-box:exec")
+    with pytest.raises(ca.CentralAccessError, match="target does not match"):
+        authorizer.preauthorize(
+            header, method="DELETE", path=target, now=NOW, scope="tee-box:files"
+        )
+    with pytest.raises(ca.CentralAccessError, match="scope is unknown"):
+        authorizer.preauthorize(header, method="GET", path=target, now=NOW, scope=PATH)
+    # A scope is never a path route, and a path route is never a scope.
+    with pytest.raises(ca.CentralAccessError, match="does not grant this route"):
+        _accept(authorizer, _header(nonce=b"k" * 32, delegation=delegation))
+    header = _header(nonce=b"j" * 32, path="tee-box:files", delegation=delegation)
+    with pytest.raises(ca.CentralAccessError, match="target does not match"):
+        _accept(authorizer, header, path="tee-box:files")

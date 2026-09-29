@@ -4,19 +4,24 @@
 them, the worker has no sandbox routes. Any one of them requires the whole
 required set, or the worker refuses to start, as the signed validator-access
 flags do. The API also requires the worker's attested TLS listener.
+
+No flag names the callers. They use central access under the Cathedral root
+keys the launch measured (cathedral/tee_box/measured_root.py); the worker
+refuses to start when those are unavailable or do not match.
 """
 
 from __future__ import annotations
 
 import argparse
-import datetime
 import ipaddress
+import os
 import subprocess
 import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
 
 from cathedral.common import ChannelBinding
+from cathedral.tee_box import measured_root
 from cathedral.tee_box.egress import (
     DEFAULT_BANDWIDTH_MBIT,
     EgressPolicy,
@@ -32,15 +37,11 @@ from cathedral.tee_box.executor import DEFAULT_RUNTIME_PATH, RunscExecutor, Shap
 
 EXECUTORS = ("runsc",)
 DEFAULT_DOCKER_PATH = "/usr/bin/docker"
-DEFAULT_CALLER_MAX_AGE_SECONDS = 3600
 
 # Flags with no default: giving any TEE box flag requires all of these, plus
 # exactly one address source (--tee-box-address or --tee-box-detect-addresses).
 REQUIRED = {
-    "tee_box_caller_snapshot": "--tee-box-caller-snapshot",
-    "tee_box_caller_keys": "--tee-box-caller-keys",
-    "tee_box_caller_keys_digest": "--tee-box-caller-keys-digest",
-    "tee_box_caller_state": "--tee-box-caller-state",
+    "tee_box_central_state": "--tee-box-central-state",
     "tee_box_executor": "--tee-box-executor",
     "tee_box_capacity": "--tee-box-capacity",
     "tee_box_default_shape": "--tee-box-default-shape",
@@ -50,7 +51,6 @@ REQUIRED = {
 OPTIONAL = (
     "tee_box_address",
     "tee_box_detect_addresses",
-    "tee_box_caller_max_age_seconds",
     "tee_box_docker_path",
     "tee_box_runtime",
     "tee_box_runtime_path",
@@ -82,22 +82,11 @@ def add_tee_box_arguments(command: argparse.ArgumentParser) -> None:
         "TEE box sandbox API (off by default; docs/TEE_BOX_SERVICE.md)"
     )
     group.add_argument(
-        "--tee-box-caller-snapshot",
-        help="signed control-plane caller snapshot (network label cathedral-control-plane)",
-    )
-    group.add_argument("--tee-box-caller-keys", help="trusted Ed25519 keys for the caller snapshot")
-    group.add_argument(
-        "--tee-box-caller-keys-digest",
-        help="required sha256 pin for the caller key file",
-    )
-    group.add_argument(
-        "--tee-box-caller-state",
-        help="owner-only SQLite replay state for callers, apart from validator access",
-    )
-    group.add_argument(
-        "--tee-box-caller-max-age-seconds",
-        type=int,
-        help=f"caller snapshot freshness (default {DEFAULT_CALLER_MAX_AGE_SECONDS})",
+        "--tee-box-central-state",
+        help=(
+            "owner-only SQLite replay state for central callers, apart from validator "
+            "and --central-access state (the root keys are measured, not a flag)"
+        ),
     )
     group.add_argument("--tee-box-executor", choices=EXECUTORS, help="sandbox executor")
     group.add_argument(
@@ -146,11 +135,7 @@ def add_tee_box_arguments(command: argparse.ArgumentParser) -> None:
 
 @dataclass(frozen=True)
 class TeeBoxConfig:
-    caller_snapshot: str
-    caller_keys: str
-    caller_keys_digest: str
-    caller_state: str
-    caller_max_age_seconds: int
+    central_state: str
     executor: str
     docker_path: str
     runtime: str
@@ -183,21 +168,18 @@ def tee_box_config(args: argparse.Namespace) -> TeeBoxConfig | None:
     capacity, default_shape = args.tee_box_capacity, args.tee_box_default_shape
     if not default_shape.fits_within(capacity):
         raise ValueError("the TEE box default shape must fit its capacity")
-    if args.tee_box_caller_state == getattr(args, "validator_access_state", None):
-        raise ValueError("the TEE box caller state must be separate from validator access state")
+    for other in ("validator_access_state", "central_access_state"):
+        if _same_file(args.tee_box_central_state, getattr(args, other, None)):
+            raise ValueError(
+                "the TEE box central state must be separate from validator and central access state"
+            )
 
     def pick(name: str, default):  # noqa: ANN001, ANN202
         value = getattr(args, name, None)
         return default if value is None else value
 
     return TeeBoxConfig(
-        caller_snapshot=args.tee_box_caller_snapshot,
-        caller_keys=args.tee_box_caller_keys,
-        caller_keys_digest=args.tee_box_caller_keys_digest,
-        caller_state=args.tee_box_caller_state,
-        caller_max_age_seconds=pick(
-            "tee_box_caller_max_age_seconds", DEFAULT_CALLER_MAX_AGE_SECONDS
-        ),
+        central_state=args.tee_box_central_state,
         executor=args.tee_box_executor,
         docker_path=pick("tee_box_docker_path", DEFAULT_DOCKER_PATH),
         runtime=pick("tee_box_runtime", "runsc"),
@@ -210,6 +192,17 @@ def tee_box_config(args: argparse.Namespace) -> TeeBoxConfig | None:
         box_id=pick("tee_box_id", "default"),
         disk_quota=not bool(getattr(args, "tee_box_no_disk_quota", None)),
     )
+
+
+def _same_file(first: str, second: str | None) -> bool:
+    if second is None:
+        return False
+    if os.path.abspath(first) == os.path.abspath(second):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
 
 
 def _endpoint_address(public_endpoint: str | None) -> tuple[str, ...]:
@@ -245,57 +238,53 @@ def box_policy(
 def build_tee_box_api(
     config: TeeBoxConfig,
     *,
+    tee: str,
     hotkey: str,
     channel_binding: ChannelBinding,
+    network: str,
     netuid: int,
     public_endpoint: str | None,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-    now: Callable[[], datetime.datetime] = lambda: datetime.datetime.now(datetime.UTC),
+    read_binding: measured_root.MeasuredBindingReader | None = None,
 ):  # noqa: ANN201 - returns (TeeBoxSandboxApi, startup facts)
     """Build the sandbox API or refuse to start.
 
-    Refuses when the caller snapshot is absent or stale, the runsc runtime is
-    not registered, or disk quotas are unsupported without the opt-out. An
-    egress table that fails to apply does not refuse: the box starts with
+    Refuses first when the central root keys at the fixed image path do not
+    hash to the launch's measured binding (MRCONFIGID on TDX; SNP has none
+    yet), then when the central state is unusable, the runsc runtime is not
+    registered, or disk quotas are unsupported without the opt-out. An egress
+    table that fails to apply does not refuse: the box starts with
     ``deny_all`` only and reports the error, and the reaper retries.
+
+    ``read_binding`` replaces the TD report reader in tests only.
     """
 
-    from cathedral.admission_policy import load_policy_keys
-    from cathedral.tee_box.service import (
-        TeeBoxSandboxApi,
-        caller_authorizer,
-        caller_snapshot_provider,
+    from cathedral.central_access import (
+        CentralAccessAuthorizer,
+        CentralAccessError,
+        open_central_access_state,
     )
-    from cathedral.validator_access import (
-        ValidatorAccessState,
-        load_sr25519_verifier,
-        preflight_sr25519_verifier,
-    )
+    from cathedral.tee_box.service import TeeBoxSandboxApi
 
     if config.executor != "runsc":
         raise ValueError("the TEE box executor must be runsc")
-    keys = load_policy_keys(
-        config.caller_keys, production_mode=True, pinned_digest=config.caller_keys_digest
-    )
-    state = ValidatorAccessState(config.caller_state)
-    provider = caller_snapshot_provider(
-        config.caller_snapshot,
-        keys,
-        netuid=netuid,
-        state=state,
-        max_age_seconds=config.caller_max_age_seconds,
-    )
-    if provider.load(now=now()) is None:
-        raise ValueError("TEE box caller snapshot is absent, stale, or invalid")
-    verifier = load_sr25519_verifier()
-    preflight_sr25519_verifier(verifier)
-    authorizer = caller_authorizer(
-        provider,
-        worker_hotkey=hotkey,
-        channel_binding=channel_binding,
-        state=state,
-        signature_verifier=verifier,
-    )
+    try:
+        root_keys, root_digest = measured_root.load_measured_root_keys(
+            tee, read_binding=read_binding
+        )
+    except measured_root.MeasuredRootError as exc:
+        raise ValueError(f"TEE box central root: {exc}") from exc
+    try:
+        authorizer = CentralAccessAuthorizer(
+            root_keys,
+            worker_hotkey=hotkey,
+            network=network,
+            netuid=netuid,
+            channel_binding=channel_binding,
+            state=open_central_access_state(config.central_state),
+        )
+    except CentralAccessError as exc:
+        raise ValueError(f"TEE box central access: {exc}") from exc
     policy = box_policy(config, public_endpoint=public_endpoint, runner=runner)
     try:
         enforcer = EgressEnforcer(policy, docker=config.docker_path, runner=runner)
@@ -332,6 +321,9 @@ def build_tee_box_api(
         default_shape=config.default_shape,
     )
     facts = {
+        "central_root_keys": measured_root.CENTRAL_ROOT_KEYS_PATH,
+        "central_root_digest": root_digest,
+        "central_root_key_ids": sorted(root_keys),
         "executor": config.executor,
         "runtime": runtime_detail,
         "network_modes": list(executor.network_modes),

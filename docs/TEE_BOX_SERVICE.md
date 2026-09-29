@@ -1,9 +1,10 @@
-# TEE box sandbox service (T6a, T6b1)
+# TEE box sandbox service (T6a, T6b1, T7)
 
 Status: **off by default**. T6a added the library, and T6b1 adds the worker
 flags, the egress enforcer, in-sandbox exec kills, disk quotas and an opt-in
-runsc image layer. Nothing here has run on TDX or SEV-SNP hardware yet; that
-is T6b2 (see "Not done" below). The design is `TEE_BOX.md` on PR #236, branch
+runsc image layer. T7 moves caller authorization to central access, with the
+root keys in measured state (see "Caller authorization"). Nothing here has
+run on TDX or SEV-SNP hardware yet; that is T6b2 (see "Not done" below). The design is `TEE_BOX.md` on PR #236, branch
 `docs/tee-box-design` (sections 2 to 4 and "Owner decisions for v1").
 Citations are `file:line` in this repository.
 
@@ -83,8 +84,10 @@ Citations are `file:line` in this repository.
 
   `deny_all` maps to `--network none`, and `internet` maps to the sandbox
   bridge.
-- **Customer lease** (`cathedral/tee_box/lease.py:57`). One control-plane
-  caller key holds the box at a time.
+- **Customer lease** (`cathedral/tee_box/lease.py:57`). One central caller
+  key holds the box at a time. The caller is `central:` plus the sha256 of
+  the delegated central key, so it stays the same when the root re-delegates
+  that key.
   - A lease lasts 60 s to 24 h and can be renewed.
   - Every other caller gets `409` with reason `box_busy`. A caller with no
     lease gets `409` with reason `lease_required`.
@@ -121,80 +124,179 @@ Citations are `file:line` in this repository.
     when `rm` succeeds or the daemon reports the container missing
     (`cathedral/tee_box/executor.py:905`).
   - A create holds the lease lock, so a drain cannot miss it
-    (`cathedral/tee_box/service.py:638-639`).
+    (`cathedral/tee_box/service.py:720-721`).
   - A worker thread runs every 5 s, and once at start
-    (`cathedral/worker.py:1342`). It checks expiry, retries the drain, and
+    (`cathedral/worker.py:1462`). It checks expiry, retries the drain, and
     sweeps orphans.
 - **API** (`cathedral/tee_box/service.py:308`). The routes are listed in
-  `cathedral/tee_box/service.py:77`. Only `GET /v1/box` and the lease routes
-  run without a lease (`cathedral/tee_box/service.py:448`).
+  `cathedral/tee_box/service.py:82`, and the central-access scope each needs
+  in `cathedral/tee_box/service.py:117`. Only `GET /v1/box`, the revocation
+  push and the lease routes run without a lease
+  (`cathedral/tee_box/service.py:461`).
 
-| Call | Route |
-|---|---|
-| Box contract | `GET /v1/box` |
-| Lease | `GET`, `POST` (`ttl_seconds`), `DELETE /v1/lease` |
-| Image import | `POST /v1/images/import` (`digest`, `reference`), `GET /v1/images/{digest}` |
-| Create, list | `POST /v1/sandboxes` (`image_id`, `network`, `lifetime_seconds`, optional `shape`, `labels`, `env`), `GET /v1/sandboxes?label=k=v` |
-| Get, delete | `GET`, `DELETE /v1/sandboxes/{id}` |
-| Lifetime | `POST .../lifetime` (`extend_by_seconds` or `lifetime_seconds`) |
-| Exec | `POST .../exec` (up to 45 s); `POST .../execs` or `.../processes`, then `GET .../execs/{exec_id}?wait=N` and `DELETE` |
-| Files | `PUT`/`GET .../files?path=&mode=`, `PUT`/`GET .../tar?path=&exclude=`, `GET .../stat?path=` |
+| Call | Route | Scope |
+|---|---|---|
+| Box contract | `GET /v1/box` | `tee-box:box` |
+| Revocation list | `POST /v1/box/revocations` (the root-signed list) | `tee-box:revocations` |
+| Lease | `GET`, `POST` (`ttl_seconds`), `DELETE /v1/lease` | `tee-box:lease` |
+| Image import | `POST /v1/images/import` (`digest`, `reference`), `GET /v1/images/{digest}` | `tee-box:image-import` |
+| Create | `POST /v1/sandboxes` (`image_id`, `network`, `lifetime_seconds`, optional `shape`, `labels`, `env`) | `tee-box:create` |
+| List | `GET /v1/sandboxes?label=k=v` | `tee-box:list` |
+| Get | `GET /v1/sandboxes/{id}` | `tee-box:get` |
+| Delete | `DELETE /v1/sandboxes/{id}` | `tee-box:delete` |
+| Lifetime | `POST .../lifetime` (`extend_by_seconds` or `lifetime_seconds`) | `tee-box:lifetime` |
+| Exec | `POST .../exec` (up to 45 s); `POST .../execs` or `.../processes`, then `GET .../execs/{exec_id}?wait=N` and `DELETE` | `tee-box:exec` |
+| Files | `PUT`/`GET .../files?path=&mode=`, `PUT`/`GET .../tar?path=&exclude=`, `GET .../stat?path=` | `tee-box:files` |
 
 v1 has no snapshot, fork, port or Docker-in-Docker routes.
 
 Every sandbox reports `"hardware": "standard"`
 (`cathedral/tee_box/service.py:418`). Exec takes `env`, `user`, `cwd` and
 `timeout_seconds`. Background execs may run up to 14,400 s
-(`cathedral/tee_box/service.py:60-61`).
+(`cathedral/tee_box/service.py:65-66`).
 
 A create is admitted only while the sum of sandbox shapes fits the configured
 capacity. Otherwise it gets `409` with reason `box_capacity_full`
-(`cathedral/tee_box/service.py:644`), the reason Harbor already waits on.
+(`cathedral/tee_box/service.py:726`), the reason Harbor already waits on.
 
 `GET /v1/box` lists the network modes the box offers now, and its `egress`
 object says whether the egress rules are enforced, with the last error
-(`cathedral/tee_box/service.py:509`).
+(`cathedral/tee_box/service.py:522`).
 
 ## Caller authorization
 
-Callers use the validator-access code, with no new cryptography.
+Callers use central access (`cathedral/central_access.py`, from #225, #228
+and #241), with the root keys in measured state. The design is `TEE_BOX.md`
+on PR #236, section 3, "Callers: central access, with its root in measured
+state".
 
-- **Snapshot.** The caller snapshot is a signed
-  `cathedral_validator_access_snapshot_v1`. Its rows are the control-plane
-  hotkeys, with permit `true` and stake 0. It carries the network label
-  `cathedral-control-plane` and a zero stake floor. It is loaded by
-  `caller_snapshot_provider` (`cathedral/tee_box/service.py:152`) through
-  `SignedValidatorSnapshotProvider`. A validator snapshot cannot stand in for
-  it, and the reverse holds too: the authorizer refuses any other network
-  label (`cathedral/tee_box/service.py:196`).
-- **Requests.** Requests carry the validator request envelope in
-  `X-Cathedral-Validator-Request`.
-  - `ValidatorRequestAuthorizer` and `build_validator_request_header` gained
-    a `target_allowed` check (`cathedral/validator_access.py:164`, `:1609`).
-    It defaults to the validator routes.
-  - The sandbox API passes `sandbox_target_allowed`
-    (`cathedral/tee_box/service.py:133`). The signed `path` is the full
-    target, query included, so the signature covers file paths.
-- **Worker.** The worker verifies the envelope before it reserves a slot or
-  reads the body (`cathedral/worker.py:442`). After the body is read, it
-  checks the body digest and replay (`cathedral/worker.py:458`).
-- **Refusals.** Each of these gets `401`: a request with no header, a key not
-  in the snapshot, a stale snapshot, an expired or replayed request, another
-  network label, a signature over a different target or body, and an unknown
-  route.
+- **Why not the validator-access snapshot.** T6b1 took caller keys from a
+  signed snapshot in the validator-access format. The miner's own operator
+  key signs that snapshot, and the miner picks the trusted key file and its
+  pin (`cathedral/validator_access.py:3-5`,
+  `cathedral/audit_miner_entrypoint.py:266-270`). The miner could have
+  minted its own caller key and reached the current customer's sandboxes.
+  The snapshot path and its flags are gone.
+- **Root keys.** The box reads them from a fixed path inside the image,
+  `/usr/share/cathedral/central-root-keys.json`
+  (`cathedral/tee_box/measured_root.py:38`). The file has the key-file format
+  that the offline root tool's `keygen --keys-out` writes
+  (`scripts/cathedral_central_access.py`, from #239):
+  one canonical JSON object of key id to base64 Ed25519 public key.
+  - **TDX.** MRCONFIGID is `sha256(root key file)` followed by 16 zero bytes
+    (`mrconfigid_for_root_keys`, `cathedral/tee_box/measured_root.py:160`).
+    The Cathedral TDX value covers MRCONFIGID (`docs/MRTD.md`), so a box
+    launched with another root key file cannot match a published measurement.
+    At start the box asks the TDX module for a TDREPORT through
+    `/dev/tdx_guest` (`TDX_CMD_GET_REPORT0`,
+    `cathedral/tee_box/measured_root.py:64`). It checks the report type and
+    the random REPORTDATA it sent, takes MRCONFIGID from it, and loads the
+    file only if its sha256 matches
+    (`cathedral/tee_box/measured_root.py:127`). The box does not use a
+    configfs-tsm quote here: the host's quoting service writes those bytes,
+    and the guest does not verify them.
+  - **SEV-SNP.** HOST_DATA would be the binding, but the SNP report code does
+    not read it, so `serve-snp` with the TEE box flags refuses to start
+    (`cathedral/tee_box/measured_root.py:95`).
+  - Nothing reads the root, its digest or MRCONFIGID from a flag, an
+    environment variable or a writable config file. A missing device, a
+    zero or malformed MRCONFIGID, or a file that does not match refuses
+    startup (`cathedral/tee_box/configure.py:272`). The startup line reports
+    the root digest and key ids.
+- **Delegations and scopes.** The offline root signs a delegation of at most
+  24 h naming one central key, the subnet (`--validator-network` and
+  `--validator-netuid`) and the scopes it may call. The scopes are
+  `TEE_BOX_CENTRAL_SCOPES` (`cathedral/central_access.py:83`), which join
+  `CENTRAL_ROUTES` (`:99`); the table above maps each route to its scope.
+  A `/v1/capabilities` delegation does not reach the sandbox API, and a
+  scope is never a path route.
+- **Requests.** Requests carry a central request in
+  `X-Cathedral-Central-Request`. The central key signs the method, the full
+  target (query included, so file paths are covered), the body digest, a
+  nonce, the worker hotkey, the subnet and the worker's TLS key.
+- **Worker.** The worker maps the method and target to a scope with
+  `route_scope` (`cathedral/tee_box/service.py:174`). Before it reserves a
+  slot or reads the body, it verifies the delegation against the measured
+  root, its expiry, its scope and the revocation list, then the request's
+  signature and expiry (`cathedral/worker.py:511`). After the body is read,
+  it checks the body digest, the revocation list again and replay
+  (`cathedral/worker.py:532`). Replay and the delegation high-water live in
+  the `--tee-box-central-state` file.
+- **Separate from the `--central-*` flags.** The worker's own central
+  access, for `/v1/capabilities`, trusts root keys the miner names by flag.
+  The TEE box builds its own authorizer from the measured root, and
+  `WorkerServer` refuses to share that authorizer or its state
+  (`cathedral/worker.py:1357-1364`).
+- **Revocation list.** State starts empty on a fresh box, so the control
+  plane pushes the root-signed revocation list to `POST /v1/box/revocations`
+  after every start (`cathedral/tee_box/service.py:578`). Until it has, only
+  `GET /v1/box` and the push are served; every other route gets `409` with
+  reason `revocation_list_required`. A list older than the one in force, a
+  different list under the same sequence, or one the root did not sign is
+  refused (`revocations_refused`). Pushing the list in force again is
+  accepted.
+  - **Freshness.** The push accepts only a list whose signed `issued_at` is
+    at most 24 h old (`MAX_REVOCATIONS_AGE_SECONDS`, the longest a
+    delegation lives) and at most 15 s ahead of the box clock; any other
+    gets `409` with reason `revocations_stale` and is not installed. The gate
+    re-checks on every call: once the pushed list is older than 24 h, every
+    route but `GET /v1/box` and the push gets `409` with reason
+    `revocation_list_stale` until a freshly signed list is pushed. The
+    offline root therefore signs a new list (a higher sequence) at least
+    every 24 h, as it already re-signs delegations.
+  - **Why.** After a relaunch or a wipe of the state file, the sequence check
+    compares against nothing. Without freshness, a stolen delegation revoked
+    under list 2 could push the older list 1 and open every route until the
+    delegation expired, since the miner controls the network and can drop
+    the control plane's own push.
+  - **What the control plane must do.** Push the current list right after
+    every relaunch, and whenever it changes. Do not trust
+    `revocations.pushed` alone: compare `GET /v1/box` `revocations.sequence`
+    and `revocations.issued_at` with the current list, and check
+    `revocations.fresh`. Route no customer to a box that reports an older
+    list, and push again.
+  - **Residual risk: lists that are still fresh.** A list signed less than
+    24 h ago is accepted even if a newer one exists. A delegation revoked by
+    list N can still reopen a relaunched box with list N-1 while N-1 is
+    fresh, until the control plane's push of N lands or the delegation
+    expires. Issuing lists more often does not narrow this: it only keeps
+    list N-1 fresh for longer after N. A shorter
+    `MAX_REVOCATIONS_AGE_SECONDS` narrows it, at the cost of the root
+    re-signing the list more often.
+  - **Trusted clock.** Freshness is judged against the box clock, as
+    delegation and request expiry already are. Its source (for example NTP
+    over the host network) must be trusted; a host that sets the box clock
+    back can make a stale list look fresh.
+  - **Residual risk: the delegation high-water resets.** The high-water that
+    refuses a delegation older than one already accepted lives in the same
+    state, so after a relaunch a superseded but unexpired, unrevoked
+    delegation works again, for at most its remaining lifetime (24 h). A
+    revoked one is still refused once the current list is pushed. Closing
+    this needs a signed floor. **Proposed follow-up for #241:** a
+    `min_delegation_sequence` field in the root-signed revocation list, which
+    the worker applies as its high-water floor when it installs the list.
+    Until then, the root should revoke, not merely supersede, a delegation
+    that must stop working.
+- `GET /v1/box` reports `revocations.pushed`, `sequence`, `issued_at` (epoch
+  seconds) and `fresh`.
+- **Refusals.** Each of these gets `401`: no header or two, a validator
+  header beside it, a delegation the pinned root did not sign, an expired
+  delegation or request, a revoked delegation, one older than a delegation
+  already accepted, a delegation for another subnet or a request for another
+  worker or TLS key, a scope the delegation does not grant, a bad request
+  signature, a signature over a different method, target or body, a replay,
+  and an unknown route.
 
 ## How to enable it (T6b1)
 
 `cathedral worker serve` (TDX) and `cathedral worker serve-snp` take the TEE
 box flags (`cathedral/tee_box/configure.py:80`, registered at
-`cathedral/cli.py:4410` and `:4434`). The development, migration and GPU
+`cathedral/cli.py:4479` and `:4503`). The development, migration and GPU
 commands do not offer them.
 
 | Flag | Required | Meaning |
 |---|---|---|
-| `--tee-box-caller-snapshot` | yes | signed caller snapshot (label `cathedral-control-plane`) |
-| `--tee-box-caller-keys`, `--tee-box-caller-keys-digest` | yes | trusted Ed25519 keys and their sha256 pin |
-| `--tee-box-caller-state` | yes | owner-only SQLite replay state, separate from validator access |
+| `--tee-box-central-state` | yes | owner-only SQLite replay state for central callers, separate from the validator-access and `--central-access-state` files |
 | `--tee-box-executor runsc` | yes | the only executor |
 | `--tee-box-capacity V,M,D` | yes | vCPUs, memory MiB and disk MiB for all sandboxes together |
 | `--tee-box-default-shape V,M,D` | yes | shape of a sandbox created without one; must fit the capacity |
@@ -202,30 +304,32 @@ commands do not offer them.
 | `--tee-box-bandwidth-mbit` | no (100) | per-sandbox cap |
 | `--tee-box-docker-path` | no (`/usr/bin/docker`) | docker CLI in the guest |
 | `--tee-box-runtime`, `--tee-box-runtime-path` | no (`runsc`, `/usr/local/bin/runsc`) | the daemon's runtime entry |
-| `--tee-box-caller-max-age-seconds` | no (3600) | caller snapshot freshness |
 | `--tee-box-id` | no (`default`) | container label for this box |
 | `--tee-box-no-disk-quota` | no | run without per-sandbox disk quotas |
+
+No flag names the callers or their root keys; see "Caller authorization".
 
 - **All or nothing.** With no TEE box flag, the worker passes no API and
   serves no sandbox routes. Giving any flag, even an optional one, requires
   every required flag and one address source, or the worker refuses to
-  start (`cathedral/tee_box/configure.py:167`, called at
-  `cathedral/cli.py:1382`).
+  start (`cathedral/tee_box/configure.py:152`, called at
+  `cathedral/cli.py:1391`).
 - **Attested TLS only.** The flags need `--tls-certificate` and
-  `--tls-private-key` (`cathedral/cli.py:1388`). The API then binds the
+  `--tls-private-key` (`cathedral/cli.py:1397`). The API then binds the
   worker's TLS key and hotkey, the key REPORT_DATA binds (design section 3);
-  `WorkerServer` checks this again (`cathedral/worker.py:1249-1261`).
+  `WorkerServer` checks this again (`cathedral/worker.py:1344-1356`).
 - **Detected addresses** are every address in `ip -json address show`,
   plus the `--public-endpoint` host when it is an IP literal. On a cloud
   guest behind 1:1 NAT the public address is not on an interface, so pass
   it with `--tee-box-address` instead.
-- **Startup refuses** (`cathedral/tee_box/configure.py:245`) when the caller
-  snapshot is absent or stale (`:288`), when the daemon does not register
-  the runtime at the runtime path with `--platform=systrap` (`:314`), or
+- **Startup refuses** (`cathedral/tee_box/configure.py:238`) when the root
+  key file does not match the measured binding, or on SEV-SNP (`:272`),
+  when the central state is unusable, when the daemon does not register
+  the runtime at the runtime path with `--platform=systrap` (`:303`), or
   when disk quotas are unsupported without `--tee-box-no-disk-quota`
-  (`:317`).
+  (`:306`).
 - **Startup does not refuse** when the egress rules fail to apply
-  (`:326`). The box then serves `deny_all` only, and the startup line's
+  (`:315`). The box then serves `deny_all` only, and the startup line's
   `tee_box.egress` field reports the error. The egress thread re-applies
   every 60 s, and reads an applied table back every 5 s.
 
@@ -236,7 +340,7 @@ CLI, `nft`, `tc`, `ip` and `nsenter` at `/usr/sbin/nft`, `/usr/sbin/tc`,
 shipped image provides all of that yet (see "Packaging").
 
 The sandbox routes have their own request pool of 8
-(`cathedral/worker.py:80`). Request bodies may be up to 8 MiB, under the
+(`cathedral/worker.py:89`). Request bodies may be up to 8 MiB, under the
 worker's request deadline.
 
 ## Egress enforcement (T6b1)
@@ -274,9 +378,9 @@ a 15 s timeout.
   detaches only what it confirmed removed. It treats a veth already gone as
   removed.
 - **Re-checked on its own thread.** The worker runs the egress check on a
-  thread of its own (`cathedral/worker.py:1356`), apart from the reaper, whose
+  thread of its own (`cathedral/worker.py:1476`), apart from the reaper, whose
   expiry deletes and drain wait on docker. It starts a check every 5 s
-  (`cathedral/worker.py:84`), or at once if the last one overran. Each
+  (`cathedral/worker.py:93`), or at once if the last one overran. Each
   check runs `check_egress` (`cathedral/tee_box/executor.py:1002`), which
   calls `maintain` (`cathedral/tee_box/enforce.py:548`): one
   `nft --json list table` read-back while the table is active, bounded by
@@ -400,6 +504,25 @@ image (design plan step 2) is where runsc, the daemon and the host tools
 belong.
 
 ## Not done (T6b2 and later)
+
+- **Measured root on hardware.** The TDREPORT read has run only against a
+  fake driver. On a real TD, T6b2 must show that `/dev/tdx_guest` is present
+  in the appliance, that the ioctl number and TDREPORT offsets hold (type at
+  0, REPORTDATA at 128, MRCONFIGID at 576), and that a launch with
+  MRCONFIGID set to `mrconfigid_for_root_keys(file)` starts while any other
+  value refuses. The appliance image must install the root key file at
+  `/usr/share/cathedral/central-root-keys.json`; no image does yet, and the
+  Cathedral root has not been minted.
+- **SNP binding.** An SNP box refuses to start. Either read HOST_DATA from
+  the SNP report (the design notes that `MEASUREMENT` does not cover it, so
+  admission would have to check it separately) or rely on the root key file
+  sitting inside the listed dm-verity root (design section 3).
+- **Admission.** Admission (T3) must check that the listed measurement fixes
+  MRCONFIGID to the Cathedral root, and the control plane must push the
+  current revocation list after every start and check what the box reports
+  (see "Revocation list").
+- **Signed high-water floor.** See the proposed `min_delegation_sequence`
+  follow-up for #241 under "Revocation list".
 
 - **Hardware qualification.** Nothing has run on real TDX or SNP guests:
   not runsc with systrap under a TD or an SNP guest, not gVisor's

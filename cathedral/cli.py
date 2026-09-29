@@ -1668,10 +1668,13 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
     tee_box_facts = None
     if tee_box is not None:
         assert channel_binding is not None
+        # The callers' root keys come from measured state, never these args.
         tee_box_api, tee_box_facts = build_tee_box_api(
             tee_box,
+            tee=tee,
             hotkey=args.hotkey,
             channel_binding=channel_binding,
+            network=getattr(args, "validator_network", DEFAULT_ENROLL_NETWORK),
             netuid=getattr(args, "validator_netuid", DEFAULT_ENROLL_NETUID),
             public_endpoint=public_endpoint,
         )

@@ -14,6 +14,13 @@ The worker admits a central caller only when the miner passes the three
 migrate). Step 2 has no revocation-list fetch yet: nothing calls
 install_revocations, so a compromised delegation is bounded only by its expiry,
 at most MAX_DELEGATION_SECONDS (24 hours), until the fetch lands.
+
+A delegation grants path routes, which are POST only, or route scopes. The TEE
+box sandbox API (docs/TEE_BOX_SERVICE.md) maps each of its requests to one of
+TEE_BOX_CENTRAL_SCOPES and passes it to ``preauthorize``; the request then
+signs its method and full target, and the delegation must grant the scope. The
+TEE box builds its own authorizer from the root keys in measured state
+(cathedral/tee_box/measured_root.py), never from the --central-* flags.
 """
 
 from __future__ import annotations
@@ -70,7 +77,26 @@ MAX_CENTRAL_CONCURRENT = 2
 DEFAULT_CENTRAL_REQUESTS_PER_WINDOW = 60
 DEFAULT_CENTRAL_RATE_WINDOW_SECONDS = 60.0
 MAX_CENTRAL_CALLERS = 16
-CENTRAL_ROUTES = frozenset({"/v1/capabilities"})
+# Route scopes of the TEE box sandbox API. Each names a group of its method and
+# path templates (cathedral/tee_box/service.py maps them); scoped requests may
+# use any of SCOPED_METHODS, while the path routes stay POST only.
+TEE_BOX_CENTRAL_SCOPES = frozenset(
+    {
+        "tee-box:box",
+        "tee-box:lease",
+        "tee-box:revocations",
+        "tee-box:image-import",
+        "tee-box:create",
+        "tee-box:list",
+        "tee-box:get",
+        "tee-box:lifetime",
+        "tee-box:delete",
+        "tee-box:exec",
+        "tee-box:files",
+    }
+)
+SCOPED_METHODS = frozenset({"GET", "POST", "PUT", "DELETE"})
+CENTRAL_ROUTES = frozenset({"/v1/capabilities"}) | TEE_BOX_CENTRAL_SCOPES
 
 _DELEGATION_KEYS = frozenset(
     {
@@ -719,12 +745,33 @@ class CentralAccessAuthorizer:
             return
         self._revocations_file_error = None
 
+    @property
+    def revocations_sequence(self) -> int:
+        """The sequence of the revocation list in force, 0 if none."""
+
+        with self._lock:
+            return self._revocations_sequence
+
     def preauthorize(
-        self, header: object, *, method: str, path: str, now: datetime
+        self,
+        header: object,
+        *,
+        method: str,
+        path: str,
+        now: datetime,
+        scope: str | None = None,
     ) -> PreauthorizedCentralRequest:
-        """Check everything but the body, before the body is read."""
+        """Check everything but the body, before the body is read.
+
+        With no ``scope``, ``path`` must be a path route the delegation grants
+        and the method POST. With a ``scope`` from TEE_BOX_CENTRAL_SCOPES, the
+        caller has already mapped ``method`` and ``path`` (the full target) to
+        that scope, and the delegation must grant it.
+        """
 
         now = _check_now(now)
+        if scope is not None and scope not in TEE_BOX_CENTRAL_SCOPES:
+            raise CentralAccessError("central route scope is unknown")
         with self._lock:
             self._refresh_revocations_locked()
             if self._revocations_file_error is not None:
@@ -766,9 +813,15 @@ class CentralAccessAuthorizer:
             if delegation.sequence < self._delegation_high_water:
                 raise CentralAccessError("central delegation is older than one already accepted")
 
-        if method != "POST" or document["method"] != method or document["path"] != path:
+        if scope is None:
+            method_allowed = method == "POST" and path not in TEE_BOX_CENTRAL_SCOPES
+            granted = path
+        else:
+            method_allowed = method in SCOPED_METHODS
+            granted = scope
+        if not method_allowed or document["method"] != method or document["path"] != path:
             raise CentralAccessError("central request target does not match")
-        if path not in delegation.routes:
+        if granted not in delegation.routes:
             raise CentralAccessError("central delegation does not grant this route")
         if document["worker_hotkey"] != self.worker_hotkey:
             raise CentralAccessError("central request worker does not match")

@@ -1,14 +1,20 @@
 """The v1 TEE box sandbox API, served on the worker's attested TLS listener.
 
-The worker authenticates each call with a control-plane caller key before
-``TeeBoxSandboxApi.handle`` runs. Caller keys arrive as a signed snapshot in
-the validator-access format, under the network label ``TEE_BOX_CALLER_NETWORK``
-so that neither kind of snapshot can stand in for the other. Requests use the
-validator request envelope, restricted to the routes below.
+The worker authenticates each call with central access
+(cathedral/central_access.py) before ``TeeBoxSandboxApi.handle`` runs. The
+root keys come from measured state (cathedral/tee_box/measured_root.py). A
+root-signed delegation names the central key and the route scopes it may
+call; the central key signs each request over its method, full target, body,
+nonce and the worker's TLS key. ``ROUTE_SCOPES`` maps every route below to
+its scope in ``TEE_BOX_CENTRAL_SCOPES``.
 
 v1 serves create, exec (sync and background), files, list, get, lifetime,
 delete and image import by digest. It has no snapshots, fork, ports or
-Docker-in-Docker (owner decision 5).
+Docker-in-Docker (owner decision 5). The control plane pushes the root-signed
+revocation list to ``POST /v1/box/revocations`` after every start, and the
+box serves no other route but ``GET /v1/box`` until it has one that is fresh:
+signed (its ``issued_at``) at most ``MAX_REVOCATIONS_AGE_SECONDS`` ago. When
+that list goes stale, the other routes close again until a fresh one arrives.
 """
 
 from __future__ import annotations
@@ -19,9 +25,15 @@ import secrets
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from urllib.parse import parse_qsl
 
-from cathedral.common import ChannelBinding
+from cathedral.central_access import (
+    MAX_DELEGATION_SECONDS,
+    CentralAccessAuthorizer,
+    CentralAccessError,
+)
+from cathedral.policy_registry import canonical_json, parse_registry_json
 from cathedral.tee_box.egress import EgressPolicy
 from cathedral.tee_box.executor import (
     MAX_FILE_BYTES,
@@ -46,15 +58,8 @@ from cathedral.tee_box.lease import (
     LeaseDraining,
     LeaseRequired,
 )
-from cathedral.validator_access import (
-    SignatureVerifier,
-    SignedValidatorSnapshotProvider,
-    ValidatorAccessState,
-    ValidatorRequestAuthorizer,
-)
 
 TEE_BOX_API_SCHEMA = "cathedral_tee_box_v1"
-TEE_BOX_CALLER_NETWORK = "cathedral-control-plane"
 HARDWARE_CLASS = "standard"
 ISOLATION = "gvisor-runsc-systrap"
 MAX_EXEC_TIMEOUT_SECONDS = 14_400
@@ -78,6 +83,7 @@ _ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = tuple(
     (method, re.compile(pattern), name)
     for method, pattern, name in (
         ("GET", r"/v1/box", "box"),
+        ("POST", r"/v1/box/revocations", "revocations"),
         ("GET", r"/v1/lease", "lease_get"),
         ("POST", r"/v1/lease", "lease_acquire"),
         ("DELETE", r"/v1/lease", "lease_release"),
@@ -107,8 +113,43 @@ _ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = tuple(
         ("GET", rf"/v1/sandboxes/(?P<sid>{_SANDBOX_ID})/stat", "stat"),
     )
 )
+# The central-access scope each route needs (TEE_BOX_CENTRAL_SCOPES).
+ROUTE_SCOPES: Mapping[str, str] = {
+    "box": "tee-box:box",
+    "revocations": "tee-box:revocations",
+    "lease_get": "tee-box:lease",
+    "lease_acquire": "tee-box:lease",
+    "lease_release": "tee-box:lease",
+    "image_import": "tee-box:image-import",
+    "image_get": "tee-box:image-import",
+    "list": "tee-box:list",
+    "create": "tee-box:create",
+    "get": "tee-box:get",
+    "delete": "tee-box:delete",
+    "lifetime": "tee-box:lifetime",
+    "exec": "tee-box:exec",
+    "exec_start": "tee-box:exec",
+    "exec_poll": "tee-box:exec",
+    "exec_stop": "tee-box:exec",
+    "file_get": "tee-box:files",
+    "file_put": "tee-box:files",
+    "tar_get": "tee-box:files",
+    "tar_put": "tee-box:files",
+    "stat": "tee-box:files",
+}
 _PREFIXES = ("/v1/box", "/v1/lease", "/v1/images", "/v1/sandboxes")
-_NO_LEASE_ROUTES = frozenset({"box", "lease_get", "lease_acquire", "lease_release"})
+_NO_LEASE_ROUTES = frozenset({"box", "revocations", "lease_get", "lease_acquire", "lease_release"})
+# Routes served before the control plane has pushed a revocation list.
+_NO_REVOCATIONS_ROUTES = frozenset({"box", "revocations"})
+MAX_REVOCATIONS_BODY = 512 * 1024
+# A pushed revocation list opens the box only while its signed issued_at is at
+# most this old: the longest a delegation can live, so a list from before a
+# delegation was revoked cannot reopen the box for longer than that
+# delegation could have lived anyway. The root therefore re-signs the list at
+# least this often.
+MAX_REVOCATIONS_AGE_SECONDS = MAX_DELEGATION_SECONDS
+MAX_REVOCATIONS_FUTURE_SKEW_SECONDS = 15
+_ISSUED_AT_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _LABEL_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 _USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,31})?$")
@@ -130,11 +171,12 @@ def _match(method: str, path: str) -> tuple[str, dict[str, str]] | None:
     return None
 
 
-def sandbox_target_allowed(method: str, target: str) -> bool:
-    """The request targets a signed envelope may name for the sandbox API.
+def route_scope(method: str, target: str) -> str | None:
+    """The central-access scope a request needs, or None if it is no route.
 
-    ``target`` is the full request target, path and query, so the caller's
-    signature covers the file path and every other query parameter.
+    ``target`` is the full request target, path and query. The central
+    request signs it whole, so the signature covers the file path and every
+    other query parameter.
     """
 
     if (
@@ -145,57 +187,15 @@ def sandbox_target_allowed(method: str, target: str) -> bool:
         or any(ord(character) <= 0x20 or ord(character) == 0x7F for character in target)
         or "#" in target
     ):
-        return False
-    return _match(method, target.partition("?")[0]) is not None
+        return None
+    matched = _match(method, target.partition("?")[0])
+    return None if matched is None else ROUTE_SCOPES[matched[0]]
 
 
-def caller_snapshot_provider(
-    path: str,
-    trusted_keys: Mapping[str, bytes],
-    *,
-    netuid: int,
-    state: ValidatorAccessState,
-    max_age_seconds: int = 3600,
-) -> SignedValidatorSnapshotProvider:
-    """Load the signed control-plane caller snapshot with the validator machinery.
+def sandbox_target_allowed(method: str, target: str) -> bool:
+    """True when ``method`` and ``target`` name a sandbox API route."""
 
-    The document is a ``cathedral_validator_access_snapshot_v1`` whose rows
-    are the control-plane hotkeys (permit true, stake 0) under the network
-    label ``cathedral-control-plane`` and a zero stake floor.
-    """
-
-    return SignedValidatorSnapshotProvider(
-        path,
-        trusted_keys,
-        network=TEE_BOX_CALLER_NETWORK,
-        netuid=netuid,
-        minimum_stake_rao=0,
-        state=state,
-        max_age_seconds=max_age_seconds,
-    )
-
-
-def caller_authorizer(
-    snapshot_provider,  # noqa: ANN001 - a validator snapshot provider or snapshot
-    *,
-    worker_hotkey: str,
-    channel_binding: ChannelBinding,
-    state: ValidatorAccessState,
-    signature_verifier: SignatureVerifier | None = None,
-) -> ValidatorRequestAuthorizer:
-    """A request authorizer that accepts only sandbox API targets."""
-
-    authorizer = ValidatorRequestAuthorizer(
-        snapshot_provider,
-        worker_hotkey=worker_hotkey,
-        channel_binding=channel_binding,
-        state=state,
-        signature_verifier=signature_verifier,
-        target_allowed=sandbox_target_allowed,
-    )
-    if authorizer.snapshot_provider.network != TEE_BOX_CALLER_NETWORK:
-        raise ValueError("the caller snapshot must use the control-plane network label")
-    return authorizer
+    return route_scope(method, target) is not None
 
 
 @dataclass(frozen=True)
@@ -312,19 +312,15 @@ class TeeBoxSandboxApi:
         self,
         *,
         executor: Executor,
-        authorizer: ValidatorRequestAuthorizer,
+        authorizer: CentralAccessAuthorizer,
         egress: EgressPolicy,
         capacity: Shape,
         default_shape: Shape,
         max_lease_seconds: int = DEFAULT_MAX_LEASE_SECONDS,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        if not isinstance(authorizer, ValidatorRequestAuthorizer):
-            raise ValueError("the sandbox API requires a caller authorizer")
-        if authorizer.target_allowed is not sandbox_target_allowed:
-            raise ValueError("the caller authorizer must accept only sandbox API targets")
-        if authorizer.snapshot_provider.network != TEE_BOX_CALLER_NETWORK:
-            raise ValueError("the caller snapshot must use the control-plane network label")
+        if not isinstance(authorizer, CentralAccessAuthorizer):
+            raise ValueError("the sandbox API requires a central access authorizer")
         if not isinstance(egress, EgressPolicy):
             raise ValueError("the sandbox API requires an egress policy")
         if not default_shape.fits_within(capacity):
@@ -335,6 +331,10 @@ class TeeBoxSandboxApi:
         self.capacity = capacity
         self.default_shape = default_shape
         self._clock = clock
+        # The signed issued_at (epoch seconds) of the last list pushed to this
+        # process. Only GET /v1/box and the push are served until one is
+        # pushed, and again whenever it is no longer fresh.
+        self._revocations_issued_at: float | None = None
         self.lease = CustomerLease(self._drain_owner, max_seconds=max_lease_seconds, clock=clock)
 
     # -- lifecycle helpers -----------------------------------------------
@@ -444,6 +444,19 @@ class TeeBoxSandboxApi:
         except ValueError:
             return _json(400, {"error": "invalid query"})
         try:
+            if name not in _NO_REVOCATIONS_ROUTES:
+                if self._revocations_issued_at is None:
+                    raise _Refusal(
+                        409,
+                        "the control plane has not pushed a revocation list since the box started",
+                        "revocation_list_required",
+                    )
+                if not self._fresh(self._revocations_issued_at):
+                    raise _Refusal(
+                        409,
+                        "the pushed revocation list is stale; push a freshly signed one",
+                        "revocation_list_stale",
+                    )
             self.reap(force_drain=False)
             if name not in _NO_LEASE_ROUTES:
                 self.lease.require(caller)
@@ -534,6 +547,17 @@ class TeeBoxSandboxApi:
                 "allocated": self._allocated().view(),
                 "default_shape": self.default_shape.view(),
                 "egress": self._egress_view(),
+                "revocations": {
+                    "pushed": self._revocations_issued_at is not None,
+                    "sequence": self.authorizer.revocations_sequence,
+                    "issued_at": (
+                        None
+                        if self._revocations_issued_at is None
+                        else int(self._revocations_issued_at)
+                    ),
+                    "fresh": self._revocations_issued_at is not None
+                    and self._fresh(self._revocations_issued_at),
+                },
                 "lease": {
                     "held": lease is not None,
                     "held_by_caller": lease is not None and lease.holder == caller,
@@ -541,6 +565,64 @@ class TeeBoxSandboxApi:
                     "draining": self.lease.draining,
                 },
             },
+        )
+
+    def _fresh(self, issued_at: float) -> bool:
+        now = self._clock()
+        return (
+            now - MAX_REVOCATIONS_AGE_SECONDS
+            <= issued_at
+            <= now + MAX_REVOCATIONS_FUTURE_SKEW_SECONDS
+        )
+
+    def _revocations(self, caller, body, fields) -> Response:  # noqa: ANN001
+        """Install the root-signed revocation list the control plane pushes.
+
+        The list must be fresh: its signed ``issued_at`` at most
+        MAX_REVOCATIONS_AGE_SECONDS old and at most 15 s ahead. A stale list
+        is refused before it is installed, so after a relaunch a revoked
+        delegation cannot reopen the box with a list from before its
+        revocation (unless that list is itself still fresh; see
+        docs/TEE_BOX_SERVICE.md). It is then verified against the measured
+        root keys, and never older than the one in force. Pushing the list in
+        force again is accepted, so the control plane can push after every
+        start.
+        """
+
+        self._query(fields, frozenset())
+        if len(body) > MAX_REVOCATIONS_BODY:
+            raise _Refusal(413, "revocation list is too large")
+        try:
+            document = parse_registry_json(body)
+            if not isinstance(document, dict) or body.rstrip(b"\n") != canonical_json(document):
+                raise ValueError("not canonical")
+        except ValueError as exc:
+            raise _bad("the revocation list must be one canonical JSON object") from exc
+        issued_text = document.get("issued_at")
+        try:
+            if not isinstance(issued_text, str) or _ISSUED_AT_RE.fullmatch(issued_text) is None:
+                raise ValueError("not canonical UTC")
+            issued_at = (
+                datetime.strptime(issued_text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC).timestamp()
+            )
+        except ValueError as exc:
+            raise _Refusal(
+                409, "revocation list issued_at must be canonical UTC time", "revocations_refused"
+            ) from exc
+        if not self._fresh(issued_at):
+            raise _Refusal(
+                409,
+                "revocation list is stale or issued in the future; push a freshly signed one",
+                "revocations_stale",
+            )
+        try:
+            self.authorizer.install_revocations(document)
+        except CentralAccessError as exc:
+            raise _Refusal(409, f"revocation list refused: {exc}", "revocations_refused") from exc
+        self._revocations_issued_at = issued_at
+        return _json(
+            200,
+            {"sequence": self.authorizer.revocations_sequence, "issued_at": int(issued_at)},
         )
 
     def _lease_get(self, caller, body, fields) -> Response:  # noqa: ANN001

@@ -161,13 +161,6 @@ _PROTECTED_PATHS = frozenset({"/v1/fleet", "/v1/evidence", "/v1/sat-work", "/v1/
                               "/v1/gpu-evidence", "/v1/gpu-work", "/v1/gpu-capabilities"})
 _FLEET_KEYS = frozenset({"schema", "worker_hotkey", "endpoints"})
 
-
-def validator_target_allowed(method: str, path: str) -> bool:
-    """The worker's validator routes: POST to one fixed protected path."""
-
-    return method == "POST" and path in _PROTECTED_PATHS
-
-
 _BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _BASE58_INDEX = {character: index for index, character in enumerate(_BASE58_ALPHABET)}
 _SS58_PREFIX = b"SS58PRE"
@@ -1503,17 +1496,12 @@ def build_validator_request_header(
     issued_at: datetime,
     expires_at: datetime,
     signer: RequestSigner,
-    target_allowed: Callable[[str, str], bool] = validator_target_allowed,
 ) -> str:
-    """Build one canonical signed header with an injected Bittensor signer.
-
-    ``target_allowed`` names the routes this envelope may sign for. The default
-    is the validator routes; the TEE box sandbox API passes its own.
-    """
+    """Build one canonical signed header with an injected Bittensor signer."""
 
     bittensor_account_id(validator_hotkey)
     bittensor_account_id(worker_hotkey)
-    if not isinstance(method, str) or not isinstance(path, str) or not target_allowed(method, path):
+    if method != "POST" or path not in _PROTECTED_PATHS:
         raise ValidatorAccessError("validator request method or path is unsupported")
     if not isinstance(body, bytes):
         raise ValidatorAccessError("validator request body must be bytes")
@@ -1575,11 +1563,8 @@ class ValidatorRequestAuthorizer:
         channel_binding: ChannelBinding,
         state: ValidatorAccessState,
         signature_verifier: SignatureVerifier | None = None,
-        target_allowed: Callable[[str, str], bool] = validator_target_allowed,
     ) -> None:
         bittensor_account_id(worker_hotkey)
-        if not callable(target_allowed):
-            raise ValidatorAccessError("request target check must be callable")
         if isinstance(snapshot_provider, ValidatorAccessSnapshot):
             snapshot_provider = StaticValidatorSnapshotProvider(snapshot_provider)
         if (
@@ -1598,7 +1583,6 @@ class ValidatorRequestAuthorizer:
         self.channel_binding = channel_binding
         self.state = state
         self.signature_verifier = signature_verifier or load_sr25519_verifier()
-        self.target_allowed = target_allowed
 
     def authorize(
         self,
@@ -1735,9 +1719,7 @@ class ValidatorRequestAuthorizer:
             raise ValidatorAccessError("validator request fields are invalid")
         if document["schema"] != VALIDATOR_REQUEST_SCHEMA:
             raise ValidatorAccessError("validator request schema is unsupported")
-        if not isinstance(method, str) or not isinstance(path, str):
-            raise ValidatorAccessError("validator request target is unsupported")
-        if not self.target_allowed(method, path):
+        if method != "POST" or path not in _PROTECTED_PATHS:
             raise ValidatorAccessError("validator request target is unsupported")
         if document["method"] != method or document["path"] != path:
             raise ValidatorAccessError("validator request target does not match")
