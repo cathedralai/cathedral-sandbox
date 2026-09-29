@@ -20,6 +20,7 @@ from cathedral.capacity import admission as adm
 from cathedral.capacity import receipt
 from cathedral.channel import extract_spki_der
 from cathedral.common import Attested, ChannelBinding, ChannelBindingType, Tier, report_data_v2
+from cathedral.tee_box.boot import RTMR3_CONSUMED
 from cathedral.verify import snp
 from cathedral.verify.tdx_quote import parse_tdx_quote
 from tests.tdx_quote_fixtures import synthetic_tdx_quote
@@ -623,6 +624,67 @@ def test_a_release_refusal_is_reported_with_the_others():
     )
 
 
+# -- a fresh boot: RTMR3 all zeros ------------------------------------------------------
+
+FRESH_QUOTE = _tdx_quote(rtmr3=bytes(48))
+CONSUMED_QUOTE = _tdx_quote(rtmr3=RTMR3_CONSUMED)
+FRESH_MEASUREMENT = parse_tdx_quote(FRESH_QUOTE).measurement
+CONSUMED_MEASUREMENT = parse_tdx_quote(CONSUMED_QUOTE).measurement
+BOTH = _policy("tdx", allowed=sorted([FRESH_MEASUREMENT, CONSUMED_MEASUREMENT]))
+
+
+def test_a_fresh_boot_is_admitted_when_required():
+    result = _admit(_tdx(FRESH_QUOTE), policy=BOTH, require_fresh_boot=True)
+    assert result.admitted and result.reasons == ()
+    assert result.evidence is not None and result.measurement == FRESH_MEASUREMENT
+
+
+@pytest.mark.parametrize(
+    "rtmr3", [RTMR3_CONSUMED, b"3" * 48, bytes(47) + b"\x01"], ids=["consumed", "other", "last"]
+)
+def test_a_consumed_boot_is_refused_when_required(rtmr3):
+    quote = _tdx_quote(rtmr3=rtmr3)
+    policy = _policy("tdx", allowed=[parse_tdx_quote(quote).measurement])
+    result = _admit(_tdx(quote), policy=policy, require_fresh_boot=True)
+    assert result.reasons == (adm.BOOT_CONSUMED,) and adm.BOOT_CONSUMED == "boot_consumed"
+    assert not result.admitted and result.evidence is None
+
+
+def test_a_consumed_boot_is_admitted_when_not_required():
+    # A re-attestation during an allocation: the consumed measurement is listed.
+    result = _admit(_tdx(CONSUMED_QUOTE), policy=BOTH)
+    assert result.admitted and result.measurement == CONSUMED_MEASUREMENT
+    assert _admit(_tdx(CONSUMED_QUOTE), policy=BOTH, require_fresh_boot=False) == result
+
+
+def test_a_consumed_boot_is_refused_in_shadow_too():
+    shadow = _policy("tdx", mode="shadow", allowed=[FRESH_MEASUREMENT])
+    result = _admit(_tdx(CONSUMED_QUOTE), policy=shadow, require_fresh_boot=True)
+    assert result.reasons == (adm.BOOT_CONSUMED,) and result.evidence is None
+
+
+def test_rtmr3_is_read_from_the_quote_not_the_verdict():
+    # The verdict carries only the measurement; RTMR3 comes from the bytes.
+    result = _admit(_tdx(), require_fresh_boot=True)  # the fixture's RTMR3 is "3" * 48
+    assert result.reasons == (adm.BOOT_CONSUMED,)
+
+
+def test_the_consumed_measurement_differs_from_the_fresh_one():
+    # Why a policy lists both: the Cathedral TDX measurement covers the RTMRs.
+    assert FRESH_MEASUREMENT != CONSUMED_MEASUREMENT
+    assert _admit(
+        _tdx(CONSUMED_QUOTE), policy=_policy("tdx", allowed=[FRESH_MEASUREMENT])
+    ).reasons == (adm.MEASUREMENT_NOT_ALLOWED,)
+
+
+def test_fresh_boot_is_a_tdx_check():
+    with pytest.raises(adm.AdmissionError, match="SEV-SNP has no RTMR3"):
+        _admit(_snp(), require_fresh_boot=True)
+    assert _admit(_snp(), require_fresh_boot=False).admitted
+    parameter = inspect.signature(adm.admit).parameters["require_fresh_boot"]
+    assert parameter.default is False and parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+
 # -- malformed input -----------------------------------------------------------------------
 
 
@@ -724,6 +786,8 @@ _BAD_CALL = {
     "released_naive": {"last_released_at": ATTESTED_AT.replace(tzinfo=None)},
     "released_str": {"last_released_at": "2026-09-28T11:00:00Z"},
     "released_epoch": {"last_released_at": ATTESTED_AT.timestamp()},
+    "fresh_boot_none": {"require_fresh_boot": None},
+    "fresh_boot_int": {"require_fresh_boot": 1},
     "nonce_short": {"nonce": NONCE[:31]},
     "nonce_zero": {"nonce": bytes(32)},
     "nonce_str": {"nonce": NONCE.hex()},

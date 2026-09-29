@@ -46,6 +46,13 @@ quote (or SEV-SNP report) bytes it verified. :func:`admit` then decides:
   previous customer lease ended, evidence verified at or before it is refused,
   so the previous allocation's admission cannot be reused for the next one.
   ``None`` (the default) skips the check.
+- **Fresh boot (optional, TDX).** A TEE box extends RTMR3 once before its
+  first lease in a boot (cathedral/tee_box/boot.py), which no guest code can
+  undo. With ``require_fresh_boot=True`` a quote whose RTMR3, read from the
+  quote itself, is not all zeros is refused, in shadow as in enforce: that
+  boot has served a customer, and the VM must be relaunched first. This is
+  the check that holds against guest root. SEV-SNP has no RTMR, so asking for
+  it there is an error. ``False`` (the default) skips it.
 
 The evidence :func:`admit` returns for the box's receipts carries the SHA-256
 of the quote bytes (computed here, never taken from the caller), the nonce, the
@@ -113,6 +120,8 @@ REPORT_DATA_MISMATCH = "report_data_mismatch"
 MEASUREMENT_NOT_ALLOWED = "measurement_not_allowed"
 HARDWARE_ID_CLAIMED = "hardware_id_admitted_to_another_box"
 ATTESTATION_PREDATES_RELEASE = "attestation_predates_release"
+BOOT_CONSUMED = "boot_consumed"
+_RTMR_ZERO = bytes(48)
 
 
 class AdmissionError(ValueError):
@@ -243,16 +252,22 @@ def _complete(attested: Attested, kind: str) -> bool:
     return True
 
 
-def _parse_quote(quote: bytes, kind: str) -> tuple[bytes, str, bool, bytes | None]:
-    """REPORT_DATA, measurement, debug bit and (SEV-SNP) raw chip id, read from
-    the quote bytes themselves."""
+def _parse_quote(quote: bytes, kind: str) -> tuple[bytes, str, bool, bytes | None, bytes | None]:
+    """REPORT_DATA, measurement, debug bit, (SEV-SNP) raw chip id and (TDX)
+    RTMR3, read from the quote bytes themselves."""
 
     try:
         if kind == "tdx":
             parsed = parse_tdx_quote(quote)
-            return parsed.report_data, parsed.measurement, parsed.debug_enabled, None
+            return (
+                parsed.report_data,
+                parsed.measurement,
+                parsed.debug_enabled,
+                None,
+                parsed.body.rtmr3,
+            )
         report = parse_snp_report(quote)
-        return report.report_data, report.measurement, False, bytes.fromhex(report.chip_id)
+        return report.report_data, report.measurement, False, bytes.fromhex(report.chip_id), None
     except (TdxQuoteParseError, ValueError) as exc:
         raise AdmissionError(f"quote: {exc}") from exc
 
@@ -318,6 +333,7 @@ def admit(
     tls_certificate_der: bytes | None = None,
     tls_spki_der: bytes | None = None,
     last_released_at: datetime | None = None,
+    require_fresh_boot: bool = False,
 ) -> Admission:
     """Decide one TEE box's admission.
 
@@ -331,7 +347,10 @@ def admit(
     each already-admitted hardware id to its box. ``last_released_at``
     (timezone-aware, optional) is when the box's last customer lease ended:
     evidence whose ``attested_at`` is not strictly after it is refused with
-    ``attestation_predates_release``; ``None`` skips that check. Raises
+    ``attestation_predates_release``; ``None`` skips that check.
+    ``require_fresh_boot`` (TDX only) refuses a quote whose RTMR3 is not all
+    zeros with ``boot_consumed``; use it for every admission before a new
+    customer. Raises
     :class:`AdmissionError` on malformed input."""
 
     if not isinstance(attested, Attested):
@@ -371,10 +390,16 @@ def admit(
         not isinstance(last_released_at, datetime) or last_released_at.utcoffset() is None
     ):
         raise AdmissionError("last_released_at must be a timezone-aware datetime or None")
+    if not isinstance(require_fresh_boot, bool):
+        raise AdmissionError("require_fresh_boot must be a bool")
+    if require_fresh_boot and kind != "tdx":
+        raise AdmissionError("require_fresh_boot needs a TDX quote: SEV-SNP has no RTMR3")
     registry = _check_admitted(admitted)
     binding = _tls_binding(tls_certificate_der, tls_spki_der)
 
-    report_data, quote_measurement, quote_debug, quote_chip_id = _parse_quote(quote, kind)
+    report_data, quote_measurement, quote_debug, quote_chip_id, quote_rtmr3 = _parse_quote(
+        quote, kind
+    )
     # The verdict must be for these bytes, so the hash in the evidence names the
     # quote that was actually verified.
     if attested.measurement != quote_measurement:
@@ -428,6 +453,8 @@ def admit(
     # have come from before it.
     if last_released_at is not None and attested_at <= last_released_at:
         reasons.append(ATTESTATION_PREDATES_RELEASE)
+    if require_fresh_boot and quote_rtmr3 != _RTMR_ZERO:
+        reasons.append(BOOT_CONSUMED)
 
     return Admission(
         admitted=not reasons,
