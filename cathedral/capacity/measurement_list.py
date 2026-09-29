@@ -48,6 +48,24 @@ even when another eligible profile lists it: revocation wins.
 
 Admission (:func:`measurement_policy`) takes only TEE box profiles, so a worker
 image approved for other CPU work is never admitted as a TEE box.
+
+**Security controls.** A TEE box ``cpu_tdx`` profile is still a ``cpu_tdx``
+profile: ``PolicyRegistrySnapshot.to_policy`` requires every eligible one to
+share min_tcb, TCB statuses, advisories and firmware, and a release where it
+raises is refused, so a box profile can never break worker admission. Those
+controls are applied by the pinned verifier (:func:`verifier_policy`), not by
+``admission.admit``, which takes the verifier's verdict and checks only that it
+is a complete strict verification.
+
+**MRCONFIGID.** Every TDX image must carry a central-access root binding
+(``cathedral.tee_box.measured_root.root_digest_from_mrconfigid``:
+SHA-256 of the root key file then 16 zero bytes, not zero), and
+:func:`accept_release` can pin the expected root digest.
+
+**Deny all.** An enforcing policy with nothing eligible (every box profile
+revoked, say) lists one all-zero measurement (:data:`DENY_ALL`) instead of
+failing: #256 refuses an empty enforcing list and stops validating when the
+file is missing, while no quote has an all-zero measurement.
 """
 
 from __future__ import annotations
@@ -57,7 +75,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Mapping
+from typing import Callable, Mapping
 
 from cathedral.capacity.admission import (
     MODES,
@@ -73,7 +91,9 @@ from cathedral.policy_registry import (
     PolicyRegistryState,
     verify_registry,
 )
+from cathedral.common import Policy
 from cathedral.tee_box.boot import RTMR3_CONSUMED, RTMR3_FRESH
+from cathedral.tee_box.measured_root import MeasuredRootError, root_digest_from_mrconfigid
 
 TEE_BOX_METADATA_KEY = "tee_box"
 TEE_BOX_SCHEMA = "cathedral_tee_box_images_v1"
@@ -101,6 +121,11 @@ _TEE_BOX_KEYS = frozenset({"schema", "images"})
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _SNP_MEASUREMENT = re.compile(r"[0-9a-f]{96}")
 _TDX_DEBUG_BIT = 0x1  # TD_ATTRIBUTES bit 0, read little-endian as tdx_quote.py does
+_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+# What an enforcing policy lists when nothing is eligible: a well-formed value
+# (#256 and parse_policy load it) that no SHA-256 or SHA-384 output will equal.
+DENY_ALL = {"tdx": "tdx-measurement-sha256:" + "0" * 64, "sev_snp": "0" * 96}
+SCOPES = ("box", "all")
 
 
 class MeasurementListError(ValueError):
@@ -137,6 +162,7 @@ class TeeBoxImage:
     fresh: str  # TDX: RTMR3 all zero. SEV-SNP: the image's one measurement.
     consumed: str | None  # TDX: RTMR3 = RTMR3_CONSUMED. SEV-SNP: None.
     mrconfigid: str | None  # TDX: the central-access root binding (docs/TEE_BOX.md section 6)
+    root_digest: str | None  # TDX: sha256:<hex> of the root key file MRCONFIGID binds
 
     @property
     def measurements(self) -> frozenset[str]:
@@ -150,7 +176,9 @@ def _hex_field(image: Mapping[str, object], name: str, length: int, where: str) 
     return bytes.fromhex(value)
 
 
-def _profile_images(profile: PolicyProfile) -> tuple[TeeBoxImage, ...] | None:
+def _profile_images(
+    profile: PolicyProfile, expected_root_digest: str | None
+) -> tuple[TeeBoxImage, ...] | None:
     """The profile's TEE box images, or None when it is not a TEE box profile.
 
     Raises :class:`MeasurementListError` when the ``tee_box`` object is
@@ -190,6 +218,14 @@ def _profile_images(profile: PolicyProfile) -> tuple[TeeBoxImage, ...] | None:
             fields = {name: _hex_field(raw, name, length, at) for name, length in TDX_IMAGE_FIELDS}
             if int.from_bytes(fields["td_attributes"], "little") & _TDX_DEBUG_BIT:
                 raise MeasurementListError(f"{at}: td_attributes has the debug bit set")
+            try:
+                root_digest = root_digest_from_mrconfigid(fields["mrconfigid"])
+            except MeasuredRootError as exc:
+                raise MeasurementListError(f"{at}: {exc}") from exc
+            if expected_root_digest is not None and root_digest != expected_root_digest:
+                raise MeasurementListError(
+                    f"{at}: MRCONFIGID binds {root_digest}, not the pinned central root"
+                )
             images.append(
                 TeeBoxImage(
                     kind=kind,
@@ -198,6 +234,7 @@ def _profile_images(profile: PolicyProfile) -> tuple[TeeBoxImage, ...] | None:
                     fresh=tdx_measurement(fields, RTMR3_FRESH),
                     consumed=tdx_measurement(fields, RTMR3_CONSUMED),
                     mrconfigid=fields["mrconfigid"].hex(),
+                    root_digest=root_digest,
                 )
             )
         else:
@@ -212,6 +249,7 @@ def _profile_images(profile: PolicyProfile) -> tuple[TeeBoxImage, ...] | None:
                     fresh=measurement,
                     consumed=None,
                     mrconfigid=None,
+                    root_digest=None,
                 )
             )
     ids = [image.image_id for image in images]
@@ -255,28 +293,56 @@ def accept_release(
     *,
     now: datetime | None = None,
     max_age_seconds: int = 86400,
+    expected_root_digest: str | None = None,
+    before_commit: Callable[[AcceptedRelease], None] | None = None,
 ) -> AcceptedRelease:
     """Verify one signed release and accept it into the high-water state.
 
     ``verify_registry`` checks the signature with ``trusted_keys`` (the pinned
     owner keys), the schema, validity and staleness. Every TEE box profile is
-    then validated (:func:`_profile_images`), and only then does
-    ``state.accept`` advance the durable high-water mark, refusing a lower
-    release, an equivocated one, or an invalid profile transition. So a release
-    this refuses leaves the state where it was. Raises ``PolicyRegistryError``
-    or :class:`MeasurementListError`."""
+    then validated (:func:`_profile_images`; ``expected_root_digest`` pins the
+    central root every TDX image's MRCONFIGID must bind), the eligible
+    ``cpu_tdx`` profiles must still give a worker policy (``to_policy``), and
+    only then does ``state.accept`` advance the durable high-water mark,
+    refusing a lower release, an equivocated one, or an invalid profile
+    transition. ``before_commit`` runs inside that transaction after every
+    check, before the commit: a caller that writes files from the release
+    does it there, so the high-water mark never moves past what it wrote, and
+    if it raises nothing is recorded. A release this refuses leaves the state
+    where it was. Raises ``PolicyRegistryError`` or
+    :class:`MeasurementListError`."""
 
     if not isinstance(state, PolicyRegistryState):
         raise MeasurementListError("state must be the durable PolicyRegistryState")
+    if expected_root_digest is not None and (
+        not isinstance(expected_root_digest, str)
+        or _DIGEST_RE.fullmatch(expected_root_digest) is None
+    ):
+        raise MeasurementListError("expected_root_digest must be sha256:<64 hex>")
     snapshot = verify_registry(data, trusted_keys, now=now, max_age_seconds=max_age_seconds)
     images: list[TeeBoxImage] = []
     for profile in snapshot.profiles:
-        found = _profile_images(profile)
+        found = _profile_images(profile, expected_root_digest)
         if found is not None:
             images.extend(found)
-    state.accept(snapshot)
+    when = now or datetime.now(UTC)
+    if any(
+        profile.kind == "cpu_tdx" and profile.eligible_at(when) for profile in snapshot.profiles
+    ):
+        # A box profile whose controls differ from the worker profiles' would
+        # make to_policy, and so every worker's admission, fail.
+        try:
+            snapshot.to_policy(at=when)
+        except PolicyRegistryError as exc:
+            raise MeasurementListError(
+                f"the CPU TDX profiles give no worker policy: {exc}"
+            ) from exc
     release = AcceptedRelease(snapshot=snapshot, images=tuple(images))
     object.__setattr__(release, "_accepted", True)
+    state.accept(
+        snapshot,
+        before_commit=None if before_commit is None else lambda: before_commit(release),
+    )
     return release
 
 
@@ -287,17 +353,30 @@ def _when(at: datetime | None) -> datetime:
     return when
 
 
+def verifier_policy(release: AcceptedRelease, *, at: datetime | None = None) -> Policy:
+    """The pinned TDX verifier's strict ``Policy`` from the same release: its
+    allowlist and the signed TCB status, advisory and firmware controls. The
+    prober verifies a box's quote with it before calling ``admission.admit``."""
+
+    _check(release, "tdx")
+    return release.snapshot.to_policy(at=_when(at))
+
+
 def _check(release: object, kind: object, mode: object = "shadow") -> None:
+    _check_release(release)
+    if kind not in PROFILE_KINDS:
+        raise MeasurementListError(f"kind must be one of {sorted(PROFILE_KINDS)}")
+    if mode not in MODES:
+        raise MeasurementListError("mode must be shadow or enforce")
+
+
+def _check_release(release: object) -> None:
     if (
         not isinstance(release, AcceptedRelease)
         or release._accepted is not True
         or not release.snapshot.signature_verified
     ):
         raise MeasurementListError("release must come from accept_release")
-    if kind not in PROFILE_KINDS:
-        raise MeasurementListError(f"kind must be one of {sorted(PROFILE_KINDS)}")
-    if mode not in MODES:
-        raise MeasurementListError("mode must be shadow or enforce")
 
 
 def eligible_images(
@@ -333,21 +412,22 @@ def allowed_measurements(
     release: AcceptedRelease,
     *,
     kind: str,
+    scope: str,
     at: datetime | None = None,
-    all_profiles: bool = False,
 ) -> tuple[str, ...]:
     """The sorted allowlist of ``kind`` at ``at``.
 
-    By default only TEE box images (both values of each TDX image).
-    ``all_profiles=True`` also takes every other eligible profile of the kind,
-    for the validator mirror while it still gates non-box miners; revoked
-    measurements are excluded either way."""
+    ``scope="box"``: only TEE box images (both values of each TDX image).
+    ``scope="all"``: also every other eligible profile of the kind, for the
+    validator mirror while it still gates non-box miners. There is no default,
+    so no caller drops the non-box miners by accident. Revoked measurements are
+    excluded either way."""
 
-    if not isinstance(all_profiles, bool):
-        raise MeasurementListError("all_profiles must be a bool")
+    if scope not in SCOPES:
+        raise MeasurementListError("scope must be box or all")
     images = eligible_images(release, kind=kind, at=at)
     values = {value for image in images for value in image.measurements}
-    if all_profiles:
+    if scope == "all":
         when = _when(at)
         # TEE box profiles are already counted, image by image, above.
         box_profiles = {image.profile_id for image in release.images}
@@ -368,8 +448,8 @@ def policy_bytes(
     *,
     kind: str,
     mode: str,
+    scope: str,
     at: datetime | None = None,
-    all_profiles: bool = False,
 ) -> bytes:
     """The measurement policy file for ``kind`` in #256's exact format.
 
@@ -377,20 +457,18 @@ def policy_bytes(
     strict loader reads it (TDX), as does ``admission.parse_policy`` (both
     kinds). The bytes are deterministic, so the policy digest #256 logs and the
     digest :func:`measurement_policy` hands admission are the same for the same
-    release, kind, mode and time."""
+    release, kind, mode, scope and time. An enforcing policy with nothing
+    eligible lists :data:`DENY_ALL` instead."""
 
     _check(release, kind, mode)
-    document = {
-        "schema": POLICY_SCHEMAS[kind],
-        "mode": mode,
-        "allowed_measurements": list(
-            allowed_measurements(release, kind=kind, at=at, all_profiles=all_profiles)
-        ),
-    }
+    allowed = list(allowed_measurements(release, kind=kind, scope=scope, at=at))
+    if mode == "enforce" and not allowed:
+        allowed = [DENY_ALL[kind]]
+    document = {"schema": POLICY_SCHEMAS[kind], "mode": mode, "allowed_measurements": allowed}
     raw = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("ascii")
     try:
         parse_policy(raw)  # never emit a file admission or #256 would refuse
-    except AdmissionError as exc:  # e.g. enforce with nothing eligible
+    except AdmissionError as exc:
         raise MeasurementListError(f"no usable {kind} policy: {exc}") from exc
     return raw
 
@@ -407,10 +485,12 @@ def measurement_policy(
     require_fresh_boot=True)`` is what refuses a consumed boot before a new
     customer, while the consumed value lets a mid-lease re-attestation match."""
 
-    return parse_policy(policy_bytes(release, kind=kind, mode=mode, at=at))
+    return parse_policy(policy_bytes(release, kind=kind, mode=mode, scope="box", at=at))
 
 
-def mirror_source(release: AcceptedRelease, policy: bytes, *, kind: str, mode: str) -> bytes:
+def mirror_source(
+    release: AcceptedRelease, policy: bytes, *, kind: str, mode: str, scope: str
+) -> bytes:
     """The provenance record written next to an exported policy file.
 
     #256's loader refuses any key beyond schema, mode and allowed_measurements,
@@ -420,6 +500,8 @@ def mirror_source(release: AcceptedRelease, policy: bytes, *, kind: str, mode: s
     reported digest names which signed release it mirrors."""
 
     _check(release, kind, mode)
+    if scope not in SCOPES:
+        raise MeasurementListError("scope must be box or all")
     if not isinstance(policy, bytes):
         raise MeasurementListError("policy must be bytes")
     snapshot = release.snapshot
@@ -427,6 +509,7 @@ def mirror_source(release: AcceptedRelease, policy: bytes, *, kind: str, mode: s
         "schema": MIRROR_SOURCE_SCHEMA,
         "kind": kind,
         "mode": mode,
+        "scope": scope,
         "policy_digest": "sha256:" + hashlib.sha256(policy).hexdigest(),
         "registry_release": snapshot.release,
         "registry_digest": snapshot.digest,
@@ -437,20 +520,62 @@ def mirror_source(release: AcceptedRelease, policy: bytes, *, kind: str, mode: s
     return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("ascii")
 
 
+def check_mirror_floor(release: AcceptedRelease, source: bytes | None) -> None:
+    """Refuse to mirror a release older than the one an existing source record names.
+
+    The high-water state is the real guard; this one covers a mirror whose
+    state file was lost or recreated, which would otherwise take any release
+    still inside its validity. ``source`` is the existing
+    ``<out>.source.json`` bytes, or None when there is none. A lower release,
+    or the same release with another digest, is refused, and so is a record
+    that cannot be read: remove it deliberately to start over."""
+
+    _check_release(release)
+    if source is None:
+        return
+    try:
+        document = json.loads(source)
+        prior_release = document["registry_release"]
+        prior_digest = document["registry_digest"]
+        if (
+            document["schema"] != MIRROR_SOURCE_SCHEMA
+            or isinstance(prior_release, bool)
+            or not isinstance(prior_release, int)
+            or not isinstance(prior_digest, str)
+        ):
+            raise ValueError
+    except (ValueError, TypeError, KeyError) as exc:
+        raise MeasurementListError(
+            "the existing mirror source record is unreadable; inspect and remove it to start over"
+        ) from exc
+    if release.release < prior_release:
+        raise MeasurementListError(
+            f"registry rollback rejected: the mirror already holds release {prior_release}"
+        )
+    if release.release == prior_release and release.digest != prior_digest:
+        raise MeasurementListError(
+            f"registry release {prior_release} was equivocated: the mirror holds another digest"
+        )
+
+
 __all__ = [
     "MIRROR_SOURCE_SCHEMA",
     "PROFILE_KINDS",
     "TEE_BOX_METADATA_KEY",
     "TEE_BOX_SCHEMA",
+    "DENY_ALL",
+    "SCOPES",
     "AcceptedRelease",
     "MeasurementListError",
     "PolicyRegistryError",
     "TeeBoxImage",
     "accept_release",
     "allowed_measurements",
+    "check_mirror_floor",
     "eligible_images",
     "measurement_policy",
     "mirror_source",
     "policy_bytes",
     "tdx_measurement",
+    "verifier_policy",
 ]
