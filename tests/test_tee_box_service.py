@@ -1,7 +1,9 @@
-"""The T6a TEE box sandbox API: routes, caller keys, the customer lease, and the flag."""
+"""The TEE box sandbox API: routes, central callers, the customer lease, and the flag."""
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import http.client
 import io
 import json
@@ -15,97 +17,97 @@ from pathlib import Path
 from urllib.parse import quote
 
 import pytest
-import sr25519
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
+from cathedral import central_access as ca
 from cathedral.policy_registry import canonical_json
 from cathedral.tee_box import (
-    TEE_BOX_CALLER_NETWORK,
     FakeExecutor,
     Shape,
     TeeBoxSandboxApi,
     build_egress_policy,
-    caller_authorizer,
-    caller_snapshot_provider,
-    sandbox_target_allowed,
+    route_scope,
 )
 from cathedral.tee_box.executor import ExecResult
-from cathedral.validator_access import (
-    VALIDATOR_ACCESS_SNAPSHOT_SCHEMA,
-    ValidatorAccessError,
-    ValidatorAccessState,
-    ValidatorRequestAuthorizer,
-    build_validator_request_header,
-    load_sr25519_verifier,
-    sign_validator_access_snapshot,
-    verify_validator_access_snapshot,
-)
 from cathedral.worker import WorkerServer
-from tests.test_validator_access import (
-    OTHER_VALIDATOR_HOTKEY as OTHER,
-    OTHER_VALIDATOR_PAIR as OTHER_PAIR,
-    SNAPSHOT_SEED,
-    VALIDATOR_HOTKEY as CALLER,
-    VALIDATOR_PAIR as CALLER_PAIR,
-    WORKER_HOTKEY,
-    _hotkey,
-    _tls_contexts,
-)
+from tests.test_validator_access import WORKER_HOTKEY, _tls_contexts
 
+NETWORK = "finney"
 NETUID = random.SystemRandom().randrange(1, 65536)
-KEY_ID = "cathedral-control-plane"
-STRANGER_PAIR = sr25519.pair_from_seed(b"x" * 32)
-STRANGER = _hotkey(STRANGER_PAIR[0])
+ROOT_KEY_ID = "cathedral-root-1"
+ROOT_SEED = b"r" * 32
+OTHER_ROOT_SEED = b"o" * 32
+CENTRAL_SEED = b"c" * 32
+OTHER_CENTRAL_SEED = b"d" * 32
+STRANGER_SEED = b"x" * 32
 DIGEST = "sha256:" + "ab" * 32
 BOX_IP = "34.120.1.2"
 CAPACITY = Shape(8, 32768, 204800)
 DEFAULT_SHAPE = Shape(2, 4096, 10240)
-TRUSTED = {
-    KEY_ID: ed25519.Ed25519PrivateKey.from_private_bytes(SNAPSHOT_SEED)
-    .public_key()
-    .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-}
+ALL_SCOPES = sorted(ca.TEE_BOX_CENTRAL_SCOPES)
+CENTRAL_HEADER = ca.CENTRAL_REQUEST_HEADER
+
+
+def _public(seed: bytes) -> bytes:
+    return (
+        ed25519.Ed25519PrivateKey.from_private_bytes(seed)
+        .public_key()
+        .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    )
+
+
+def _caller(seed: bytes) -> str:
+    return "central:" + hashlib.sha256(_public(seed)).hexdigest()
+
+
+ROOT_KEYS = {ROOT_KEY_ID: _public(ROOT_SEED)}
+CALLER = _caller(CENTRAL_SEED)
+OTHER = _caller(OTHER_CENTRAL_SEED)
 
 
 def _now() -> datetime:
     return datetime.now(UTC).replace(microsecond=0)
 
 
-def _snapshot_bytes(
+def _delegation(
     *,
-    callers: tuple[str, ...] = (CALLER, OTHER),
-    generated_at: datetime | None = None,
-    network: str = TEE_BOX_CALLER_NETWORK,
-) -> bytes:
-    generated_at = generated_at or _now() - timedelta(seconds=5)
-    document = {
-        "schema": VALIDATOR_ACCESS_SNAPSHOT_SCHEMA,
-        "network": network,
-        "netuid": NETUID,
-        "block": 1_000,
-        "block_hash": "0x" + "c" * 64,
-        "block_is_finalized": True,
-        "generated_at": generated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "expires_at": (generated_at + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "minimum_stake_rao": 0,
-        "validators": [
-            {"hotkey": hotkey, "uid": uid, "validator_permit": True, "stake_rao": 0}
-            for uid, hotkey in enumerate(sorted(callers))
-        ],
-        "signing_key_id": KEY_ID,
-    }
-    return canonical_json(sign_validator_access_snapshot(document, SNAPSHOT_SEED))
-
-
-def _static_snapshot(network: str = TEE_BOX_CALLER_NETWORK, **kwargs):
-    return verify_validator_access_snapshot(
-        _snapshot_bytes(network=network, **kwargs),
-        TRUSTED,
-        network=network,
-        netuid=NETUID,
-        required_minimum_stake_rao=0,
+    central_seed: bytes = CENTRAL_SEED,
+    routes=ALL_SCOPES,
+    root_seed: bytes = ROOT_SEED,
+    sequence: int = 5,
+    issued_at: datetime | None = None,
+    lifetime: timedelta = timedelta(hours=1),
+    netuid: int = NETUID,
+) -> dict[str, object]:
+    issued_at = issued_at or _now() - timedelta(minutes=5)
+    return ca.sign_delegation(
+        root_key_id=ROOT_KEY_ID,
+        root_seed=root_seed,
+        central_key=_public(central_seed),
+        routes=routes,
+        network=NETWORK,
+        netuid=netuid,
+        sequence=sequence,
+        issued_at=issued_at,
+        expires_at=issued_at + lifetime,
     )
+
+
+def _revocations(sequence: int = 1, revoked=(), seed: bytes = ROOT_SEED) -> dict[str, object]:
+    return ca.sign_revocations(
+        root_key_id=ROOT_KEY_ID,
+        root_seed=seed,
+        sequence=sequence,
+        issued_at=_now(),
+        revoked=list(revoked),
+    )
+
+
+def _delegation_digest(delegation: dict[str, object]) -> str:
+    return ca.verify_delegation(
+        delegation, ROOT_KEYS, network=NETWORK, netuid=NETUID, now=_now()
+    ).digest
 
 
 class _Clock:
@@ -116,25 +118,37 @@ class _Clock:
         return self.value
 
 
-def _api(tmp_path: Path, binding, *, snapshot=None, clock=None, executor=None):
-    state = ValidatorAccessState(str(tmp_path / f"callers-{os.urandom(4).hex()}.sqlite"))
-    authorizer = caller_authorizer(
-        snapshot if snapshot is not None else _static_snapshot(),
+def _authorizer(tmp_path: Path, binding, root_keys=ROOT_KEYS) -> ca.CentralAccessAuthorizer:
+    state = ca.open_central_access_state(str(tmp_path / f"central-{os.urandom(4).hex()}.sqlite"))
+    return ca.CentralAccessAuthorizer(
+        root_keys,
         worker_hotkey=WORKER_HOTKEY,
+        network=NETWORK,
+        netuid=NETUID,
         channel_binding=binding,
         state=state,
-        signature_verifier=load_sr25519_verifier(),
     )
+
+
+def _push_revocations(api: TeeBoxSandboxApi, document=None) -> None:
+    body = canonical_json(document if document is not None else _revocations())
+    response = api.handle("POST", "/v1/box/revocations", CALLER, body)
+    assert response.status == 200, response.body
+
+
+def _api(tmp_path: Path, binding, *, clock=None, executor=None, ready=True):
     fake = executor or FakeExecutor()
     kwargs = {} if clock is None else {"clock": clock}
     api = TeeBoxSandboxApi(
         executor=fake,
-        authorizer=authorizer,
+        authorizer=_authorizer(tmp_path, binding),
         egress=build_egress_policy([BOX_IP]),
         capacity=CAPACITY,
         default_shape=DEFAULT_SHAPE,
         **kwargs,
     )
+    if ready:
+        _push_revocations(api)
     return api, fake
 
 
@@ -144,19 +158,19 @@ def _header(
     target: str,
     body: bytes = b"",
     *,
-    hotkey=CALLER,
-    pair=CALLER_PAIR,
-    issued_at=None,
-    lifetime=60,
-    network=TEE_BOX_CALLER_NETWORK,
-    nonce=None,
-    target_allowed=sandbox_target_allowed,
+    central_seed: bytes = CENTRAL_SEED,
+    delegation: dict[str, object] | None = None,
+    issued_at: datetime | None = None,
+    lifetime: int = 60,
+    nonce: bytes | None = None,
+    worker_hotkey: str = WORKER_HOTKEY,
 ) -> str:
     issued_at = issued_at or _now()
-    return build_validator_request_header(
-        validator_hotkey=hotkey,
-        worker_hotkey=WORKER_HOTKEY,
-        network=network,
+    return ca.build_central_request_header(
+        delegation=delegation if delegation is not None else _delegation(central_seed=central_seed),
+        central_seed=central_seed,
+        worker_hotkey=worker_hotkey,
+        network=NETWORK,
         netuid=NETUID,
         method=method,
         path=target,
@@ -165,17 +179,15 @@ def _header(
         nonce=nonce or os.urandom(32),
         issued_at=issued_at,
         expires_at=issued_at + timedelta(seconds=lifetime),
-        signer=lambda message: sr25519.sign(pair, message),
-        target_allowed=target_allowed,
     )
 
 
 class _Box:
     """A worker with the sandbox API enabled, over real TLS."""
 
-    def __init__(self, tmp_path: Path, **api_kwargs) -> None:
+    def __init__(self, tmp_path: Path, *, ready: bool = True, **api_kwargs) -> None:
         server_context, self.client_context, self.binding = _tls_contexts(tmp_path)
-        self.api, self.fake = _api(tmp_path, self.binding, **api_kwargs)
+        self.api, self.fake = _api(tmp_path, self.binding, ready=False, **api_kwargs)
         self.server = WorkerServer(
             configured_hotkey=WORKER_HOTKEY,
             channel_binding=self.binding,
@@ -183,6 +195,11 @@ class _Box:
             tee_box_api=self.api,
         )
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        if ready:
+            status, _type, raw = self.call(
+                "POST", "/v1/box/revocations", canonical_json(_revocations())
+            )
+            assert status == 200, raw
 
     def raw(self, method: str, target: str, body: bytes = b"", headers=None):
         connection = http.client.HTTPSConnection(
@@ -205,7 +222,7 @@ class _Box:
             body = json.dumps(body).encode()
         body = body or b""
         header = _header(self.binding, method, target, body, **signing)
-        return self.raw(method, target, body, {"X-Cathedral-Validator-Request": header})
+        return self.raw(method, target, body, {CENTRAL_HEADER: header})
 
     def json(self, method: str, target: str, body=None, **signing):
         status, _type, raw = self.call(method, target, body, **signing)
@@ -402,15 +419,15 @@ def test_exec_limits_follow_the_standard_contract(box: _Box):
         ("POST", f"/v1/sandboxes/{sid}/snapshot"),
         ("POST", f"/v1/sandboxes/{sid}/ports"),
     ):
-        with pytest.raises(ValidatorAccessError):
-            _header(box.binding, method, target)
+        assert route_scope(method, target) is None
+        assert box.call(method, target, b"{}")[0] == 401
 
 
 def test_one_customer_at_a_time_and_release_drains(box: _Box):
     _lease_and_image(box)
     first = _create(box)["id"]
     second = _create(box)["id"]
-    busy = box.json("POST", "/v1/lease", {"ttl_seconds": 600}, hotkey=OTHER, pair=OTHER_PAIR)
+    busy = box.json("POST", "/v1/lease", {"ttl_seconds": 600}, central_seed=OTHER_CENTRAL_SEED)
     assert busy == (409, {"error": "the box is leased to another customer", "reason": "box_busy"})
     for method, target in (
         ("GET", "/v1/sandboxes"),
@@ -418,27 +435,26 @@ def test_one_customer_at_a_time_and_release_drains(box: _Box):
         ("DELETE", f"/v1/sandboxes/{first}"),
         ("DELETE", "/v1/lease"),
     ):
-        assert box.json(method, target, hotkey=OTHER, pair=OTHER_PAIR)[1]["reason"] == "box_busy"
+        assert box.json(method, target, central_seed=OTHER_CENTRAL_SEED)[1]["reason"] == "box_busy"
     assert (
         box.json(
             "POST",
             "/v1/sandboxes",
             {"image_id": DIGEST, "network": "deny_all", "lifetime_seconds": 60},
-            hotkey=OTHER,
-            pair=OTHER_PAIR,
+            central_seed=OTHER_CENTRAL_SEED,
         )[0]
         == 409
     )
-    assert box.json("GET", "/v1/box", hotkey=OTHER, pair=OTHER_PAIR)[1]["lease"]["held"] is True
+    assert box.json("GET", "/v1/box", central_seed=OTHER_CENTRAL_SEED)[1]["lease"]["held"] is True
     assert box.fake.deleted == []
 
     assert box.json("DELETE", "/v1/lease")[1] == {"released": True, "draining": False}
     assert sorted(box.fake.deleted) == sorted([first, second])
     status, lease = box.json(
-        "POST", "/v1/lease", {"ttl_seconds": 600}, hotkey=OTHER, pair=OTHER_PAIR
+        "POST", "/v1/lease", {"ttl_seconds": 600}, central_seed=OTHER_CENTRAL_SEED
     )
     assert status == 200 and lease["lease"]["holder"] == OTHER
-    assert box.json("GET", "/v1/sandboxes", hotkey=OTHER, pair=OTHER_PAIR)[1] == {"sandboxes": []}
+    assert box.json("GET", "/v1/sandboxes", central_seed=OTHER_CENTRAL_SEED)[1] == {"sandboxes": []}
 
 
 def test_calls_without_a_lease_are_refused(tmp_path: Path):
@@ -565,122 +581,239 @@ def test_sandbox_lifetime_and_capacity_are_enforced(tmp_path: Path):
 def test_unsigned_unknown_expired_and_mismatched_callers_are_refused(box: _Box):
     _lease_and_image(box)
     assert box.raw("GET", "/v1/box")[0] == 401
-    assert box.raw("GET", "/v1/box", headers={"X-Cathedral-Validator-Request": "junk"})[0] == 401
-    # A key the snapshot does not list.
-    assert box.call("GET", "/v1/box", hotkey=STRANGER, pair=STRANGER_PAIR)[0] == 401
-    # A listed key's name with another key's signature.
-    assert box.call("GET", "/v1/box", hotkey=CALLER, pair=OTHER_PAIR)[0] == 401
-    # An expired request.
+    assert box.raw("GET", "/v1/box", headers={CENTRAL_HEADER: "junk"})[0] == 401
+    # A central key the root never delegated to, signing under another key's delegation.
+    assert (
+        box.call("GET", "/v1/box", central_seed=STRANGER_SEED, delegation=_delegation())[0] == 401
+    )
+    # A delegation the pinned root did not sign.
+    stranger = _delegation(central_seed=STRANGER_SEED, root_seed=OTHER_ROOT_SEED)
+    assert box.call("GET", "/v1/box", central_seed=STRANGER_SEED, delegation=stranger)[0] == 401
+    # An expired request, and a request under an expired delegation.
     assert box.call("GET", "/v1/box", issued_at=_now() - timedelta(minutes=5))[0] == 401
-    # Signed for another network label (a validator-access envelope).
-    assert box.call("GET", "/v1/box", network="finney")[0] == 401
+    expired = _delegation(issued_at=_now() - timedelta(hours=3))
+    assert box.call("GET", "/v1/box", delegation=expired)[0] == 401
+    # A delegation for another subnet, and a request for another worker.
+    other_subnet = _delegation(netuid=(NETUID % 65_535) + 1)
+    assert box.call("GET", "/v1/box", delegation=other_subnet)[0] == 401
+    other_worker = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+    assert box.call("GET", "/v1/box", worker_hotkey=other_worker)[0] == 401
     # Signed for one target, sent to another; and a query the signature did not cover.
     header = _header(box.binding, "GET", "/v1/lease")
-    assert box.raw("GET", "/v1/box", headers={"X-Cathedral-Validator-Request": header})[0] == 401
+    assert box.raw("GET", "/v1/box", headers={CENTRAL_HEADER: header})[0] == 401
     sid = _create(box)["id"]
     header = _header(box.binding, "GET", f"/v1/sandboxes/{sid}/files?path=/a")
     assert (
         box.raw(
             "GET",
             f"/v1/sandboxes/{sid}/files?path=/etc/shadow",
-            headers={"X-Cathedral-Validator-Request": header},
+            headers={CENTRAL_HEADER: header},
         )[0]
         == 401
     )
+    # Signed for one method, sent with another.
+    header = _header(box.binding, "GET", f"/v1/sandboxes/{sid}")
+    assert box.raw("DELETE", f"/v1/sandboxes/{sid}", headers={CENTRAL_HEADER: header})[0] == 401
     # A body the signature did not cover.
     body = json.dumps({"ttl_seconds": 600}).encode()
     header = _header(box.binding, "POST", "/v1/lease", body)
+    assert box.raw("POST", "/v1/lease", b'{"ttl_seconds":900}', {CENTRAL_HEADER: header})[0] == 401
+    # A replayed request.
+    header = _header(box.binding, "GET", "/v1/box")
+    assert box.raw("GET", "/v1/box", headers={CENTRAL_HEADER: header})[0] == 200
+    assert box.raw("GET", "/v1/box", headers={CENTRAL_HEADER: header})[0] == 401
+    # Two central headers, or a validator header beside one.
+    header = _header(box.binding, "GET", "/v1/box")
     assert (
         box.raw(
-            "POST", "/v1/lease", b'{"ttl_seconds":900}', {"X-Cathedral-Validator-Request": header}
+            "GET",
+            "/v1/box",
+            headers={CENTRAL_HEADER: header, "X-Cathedral-Validator-Request": "x"},
         )[0]
         == 401
     )
-    # A replayed envelope.
-    header = _header(box.binding, "GET", "/v1/box")
-    assert box.raw("GET", "/v1/box", headers={"X-Cathedral-Validator-Request": header})[0] == 200
-    assert box.raw("GET", "/v1/box", headers={"X-Cathedral-Validator-Request": header})[0] == 401
     # Unknown paths in the namespace are refused before any handler runs,
-    # even under an envelope a permissive signer produced for them.
+    # even under a validly signed central request.
     assert box.raw("GET", "/v1/sandboxes/sbx-x/ports")[0] == 401
     for method, target in (("GET", f"/v1/sandboxes/{sid}/ports"), ("POST", "/v1/sandboxes/fork")):
         body = b"" if method == "GET" else b"{}"
-        header = _header(box.binding, method, target, body, target_allowed=lambda _m, _p: True)
-        status = box.raw(method, target, body, {"X-Cathedral-Validator-Request": header})[0]
-        assert status == 401, (method, target)
+        assert box.call(method, target, body)[0] == 401, (method, target)
+    assert box.fake.get(sid) is not None
 
 
-def test_an_expired_caller_snapshot_refuses_every_call(tmp_path: Path):
-    snapshot_path = tmp_path / "callers.json"
-    snapshot_path.write_bytes(_snapshot_bytes())
-    snapshot_path.chmod(0o644)
-    state = ValidatorAccessState(str(tmp_path / "callers.sqlite"))
-    provider = caller_snapshot_provider(
-        str(snapshot_path), TRUSTED, netuid=NETUID, state=state, max_age_seconds=60
+def test_a_bad_request_signature_is_refused(box: _Box):
+    header = _header(box.binding, "GET", "/v1/box")
+    document = json.loads(base64.b64decode(header))
+    document["nonce_hex"] = "ab" * 32
+    tampered = base64.b64encode(canonical_json(document)).decode("ascii")
+    assert box.raw("GET", "/v1/box", headers={CENTRAL_HEADER: tampered})[0] == 401
+    # Signed by the root key itself instead of the delegated central key.
+    header = _header(
+        box.binding, "GET", "/v1/box", central_seed=ROOT_SEED, delegation=_delegation()
     )
-    box = _Box(tmp_path, snapshot=provider)
-    try:
-        assert box.call("GET", "/v1/box")[0] == 200
-        stale = tmp_path / "stale.json"
-        stale.write_bytes(_snapshot_bytes(generated_at=_now() - timedelta(minutes=9)))
-        stale.chmod(0o644)
-        state2 = ValidatorAccessState(str(tmp_path / "stale.sqlite"))
-        stale_provider = caller_snapshot_provider(
-            str(stale), TRUSTED, netuid=NETUID, state=state2, max_age_seconds=60
+    assert box.raw("GET", "/v1/box", headers={CENTRAL_HEADER: header})[0] == 401
+
+
+# One request per route, each with the scope it needs.
+_SCOPED_ROUTES = (
+    ("tee-box:box", "GET", "/v1/box", None),
+    ("tee-box:lease", "GET", "/v1/lease", None),
+    ("tee-box:lease", "POST", "/v1/lease", {"ttl_seconds": 600}),
+    (
+        "tee-box:image-import",
+        "POST",
+        "/v1/images/import",
+        {"digest": DIGEST, "reference": "registry.example/tasks/base"},
+    ),
+    ("tee-box:image-import", "GET", f"/v1/images/{DIGEST}", None),
+    (
+        "tee-box:create",
+        "POST",
+        "/v1/sandboxes",
+        {"image_id": DIGEST, "network": "deny_all", "lifetime_seconds": 3600},
+    ),
+    ("tee-box:list", "GET", "/v1/sandboxes", None),
+    ("tee-box:get", "GET", "/v1/sandboxes/{sid}", None),
+    ("tee-box:lifetime", "POST", "/v1/sandboxes/{sid}/lifetime", {"extend_by_seconds": 60}),
+    ("tee-box:exec", "POST", "/v1/sandboxes/{sid}/exec", {"command": "true"}),
+    ("tee-box:exec", "POST", "/v1/sandboxes/{sid}/execs", {"command": "true"}),
+    ("tee-box:files", "PUT", "/v1/sandboxes/{sid}/files?path=/a", b"x"),
+    ("tee-box:files", "GET", "/v1/sandboxes/{sid}/files?path=/a", None),
+    ("tee-box:files", "GET", "/v1/sandboxes/{sid}/stat?path=/a", None),
+    ("tee-box:files", "GET", "/v1/sandboxes/{sid}/tar?path=/", None),
+    ("tee-box:delete", "DELETE", "/v1/sandboxes/{sid}", None),
+    ("tee-box:lease", "DELETE", "/v1/lease", None),
+)
+
+
+def test_every_route_needs_exactly_its_scope(box: _Box):
+    from cathedral.tee_box import ROUTE_SCOPES, route_scope
+
+    assert frozenset(ROUTE_SCOPES.values()) == ca.TEE_BOX_CENTRAL_SCOPES
+    assert ca.TEE_BOX_CENTRAL_SCOPES <= ca.CENTRAL_ROUTES
+    sid = None
+    for scope, method, template, body in _SCOPED_ROUTES:
+        target = template.format(sid=sid)
+        assert route_scope(method, target) == scope, (method, target)
+        raw = (
+            body if isinstance(body, bytes) else b"" if body is None else json.dumps(body).encode()
         )
-        assert stale_provider.load(now=datetime.now(UTC)) is None
+        others = sorted(ca.TEE_BOX_CENTRAL_SCOPES - {scope})
+        # Every scope but this one: refused before any handler runs.
+        wrong = _delegation(routes=others)
+        assert box.call(method, target, raw, delegation=wrong)[0] == 401, (method, target)
+        # A /v1/capabilities delegation does not reach the sandbox API.
+        path_only = _delegation(routes=["/v1/capabilities"])
+        assert box.call(method, target, raw, delegation=path_only)[0] == 401
+        # This scope alone: served.
+        status, _type, answer = box.call(
+            method, target, raw, delegation=_delegation(routes=[scope])
+        )
+        assert status in {200, 201}, (method, target, status, answer)
+        if template == "/v1/sandboxes" and method == "POST":
+            sid = json.loads(answer)["id"]
+
+
+def test_scoped_requests_do_not_open_the_path_routes(tmp_path: Path):
+    # A scope names TEE box routes only: it is no path route, and a scoped
+    # request never passes as a POST to /v1/capabilities.
+    binding = _binding()
+    authorizer = _authorizer(tmp_path, binding)
+    now = datetime.now(UTC)
+    header = _header(binding, "POST", "tee-box:box", b"{}")
+    with pytest.raises(ca.CentralAccessError, match="target does not match"):
+        authorizer.preauthorize(header, method="POST", path="tee-box:box", now=now)
+    header = _header(binding, "GET", "/v1/box")
+    with pytest.raises(ca.CentralAccessError, match="scope is unknown"):
+        authorizer.preauthorize(header, method="GET", path="/v1/box", now=now, scope="/v1/box")
+    with pytest.raises(ca.CentralAccessError, match="target does not match"):
+        authorizer.preauthorize(
+            _header(binding, "PATCH", "/v1/box"),
+            method="PATCH",
+            path="/v1/box",
+            now=now,
+            scope="tee-box:box",
+        )
+
+
+def test_a_revoked_delegation_is_refused_on_every_route(box: _Box):
+    delegation = _delegation()
+    assert box.call("GET", "/v1/box", delegation=delegation)[0] == 200
+    revoked = _revocations(2, [_delegation_digest(delegation)])
+    assert box.call("POST", "/v1/box/revocations", canonical_json(revoked))[0] == 200
+    for method, target in (("GET", "/v1/box"), ("POST", "/v1/lease"), ("GET", "/v1/sandboxes")):
+        body = b'{"ttl_seconds":600}' if method == "POST" else b""
+        assert box.call(method, target, body, delegation=delegation)[0] == 401
+    # A fresh delegation to the same central key is served again.
+    assert box.call("GET", "/v1/box", delegation=_delegation(sequence=6))[0] == 200
+
+
+def test_no_route_but_box_is_served_before_a_revocation_list_is_pushed(tmp_path: Path):
+    box = _Box(tmp_path, ready=False)
+    try:
+        status, contract = box.json("GET", "/v1/box")
+        assert status == 200
+        assert contract["revocations"] == {"pushed": False, "sequence": 0}
+        for method, target, body in (
+            ("POST", "/v1/lease", {"ttl_seconds": 600}),
+            ("GET", "/v1/sandboxes", None),
+            ("POST", "/v1/images/import", {"digest": DIGEST, "reference": "r.example/a/b"}),
+        ):
+            status, refusal = box.json(method, target, body)
+            assert (status, refusal["reason"]) == (409, "revocation_list_required")
+        # Lists the pinned root did not sign, or not canonical, are refused.
+        status, refusal = box.json(
+            "POST", "/v1/box/revocations", canonical_json(_revocations(seed=OTHER_ROOT_SEED))
+        )
+        assert (status, refusal["reason"]) == (409, "revocations_refused")
+        assert (
+            box.json("POST", "/v1/box/revocations", json.dumps(_revocations(), indent=1).encode())[
+                0
+            ]
+            == 400
+        )
+        assert box.json("GET", "/v1/box")[1]["revocations"]["pushed"] is False
+        # A signed list opens the box; the same list may be pushed again, an older one not.
+        assert box.json("POST", "/v1/box/revocations", canonical_json(_revocations(3)))[1] == {
+            "sequence": 3
+        }
+        assert box.json("POST", "/v1/box/revocations", canonical_json(_revocations(3)))[0] == 200
+        status, refusal = box.json("POST", "/v1/box/revocations", canonical_json(_revocations(2)))
+        assert (status, refusal["reason"]) == (409, "revocations_refused")
+        assert box.json("POST", "/v1/lease", {"ttl_seconds": 600})[0] == 200
+        assert box.json("GET", "/v1/box")[1]["revocations"] == {"pushed": True, "sequence": 3}
     finally:
         box.close()
-    box = _Box(tmp_path, snapshot=stale_provider)
-    try:
-        assert box.call("GET", "/v1/box")[0] == 401
-    finally:
-        box.close()
 
 
-def test_validator_access_cannot_stand_in_for_caller_access(tmp_path: Path):
-    state = ValidatorAccessState(str(tmp_path / "state.sqlite"))
-    with pytest.raises(ValueError, match="control-plane network label"):
-        caller_authorizer(
-            _static_snapshot(network="finney"),
-            worker_hotkey=WORKER_HOTKEY,
-            channel_binding=_binding(),
-            state=state,
-            signature_verifier=load_sr25519_verifier(),
-        )
-    validator_routes = ValidatorRequestAuthorizer(
-        _static_snapshot(),
-        worker_hotkey=WORKER_HOTKEY,
-        channel_binding=_binding(),
-        state=state,
-        signature_verifier=load_sr25519_verifier(),
-    )
-    with pytest.raises(ValueError, match="only sandbox API targets"):
+def test_the_sandbox_api_needs_a_central_authorizer(tmp_path: Path):
+    from cathedral.validator_access import ValidatorAccessState
+
+    with pytest.raises(ValueError, match="central access authorizer"):
         TeeBoxSandboxApi(
             executor=FakeExecutor(),
-            authorizer=validator_routes,
+            authorizer=ValidatorAccessState(str(tmp_path / "state.sqlite")),
             egress=build_egress_policy([BOX_IP]),
             capacity=CAPACITY,
             default_shape=DEFAULT_SHAPE,
         )
-    # The default envelope builder still signs only the validator routes.
-    with pytest.raises(ValidatorAccessError, match="unsupported"):
-        build_validator_request_header(
-            validator_hotkey=CALLER,
-            worker_hotkey=WORKER_HOTKEY,
-            network="finney",
-            netuid=NETUID,
-            method="GET",
-            path="/v1/box",
-            body=b"",
-            channel_binding=_binding(),
-            nonce=b"n" * 32,
-            issued_at=_now(),
-            expires_at=_now() + timedelta(seconds=30),
-            signer=lambda message: sr25519.sign(CALLER_PAIR, message),
+
+
+def test_the_flag_configured_central_authorizer_cannot_serve_the_sandbox_api(tmp_path: Path):
+    from tests.test_central_access_worker import _validator_authorizer
+
+    server_context, _client, binding = _tls_contexts(tmp_path)
+    api, _fake = _api(tmp_path, binding)
+    with pytest.raises(ValueError, match="must not share the flag-configured one"):
+        WorkerServer(
+            configured_hotkey=WORKER_HOTKEY,
+            channel_binding=binding,
+            tls_context=server_context,
+            validator_authorizer=_validator_authorizer(tmp_path, binding),
+            fleet_endpoints=("https://127.0.0.1:1",),
+            tee_box_api=api,
+            central_authorizer=api.authorizer,
         )
-    assert not sandbox_target_allowed("POST", "/v1/fleet")
-    assert not sandbox_target_allowed("GET", "/v1/sandboxes/sbx-" + "0" * 24 + "/files?p=a b")
 
 
 def test_flag_off_means_no_sandbox_routes(tmp_path: Path):
@@ -797,7 +930,9 @@ def test_an_untracked_container_blocks_the_hand_over(tmp_path: Path):
 
 def _fresh(tmp_path: Path, fake: FakeExecutor):
     clock = _Clock()
-    api, _ = _api(tmp_path, _binding(), clock=clock, executor=fake)
+    api, _ = _api(tmp_path, _binding(), clock=clock, executor=fake, ready=False)
+    # Mark the list pushed without a call: any call would run the first sweep.
+    api._revocations_pushed = True  # noqa: SLF001
     return api, clock
 
 

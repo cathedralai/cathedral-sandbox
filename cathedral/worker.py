@@ -765,12 +765,13 @@ def _make_handler(
             return body, 200, ""
 
         def _tee_box_request(self, method: str) -> None:
-            """Serve one sandbox API call: signed caller, own pool, then the API."""
+            """Serve one sandbox API call: central caller, own pool, then the API."""
 
             from cathedral.tee_box.service import (
                 MAX_REQUEST_BODY as TEE_BOX_MAX_BODY,
                 MAX_RESPONSE_BODY as TEE_BOX_MAX_RESPONSE,
                 owns_path,
+                route_scope,
             )
 
             assert tee_box_api is not None and tee_box_semaphore is not None
@@ -779,14 +780,28 @@ def _make_handler(
                 self._send_json(404, {"error": "not found"})
                 return
             authorizer = tee_box_api.authorizer
-            header = self._validator_request_header()
-            # The signed envelope names the full target, query included, and
-            # is verified before the caller gets a slot or a body read.
-            preauthorized = (
-                None
-                if header is None
-                else authorizer.preauthorize(header, method=method, path=target)
-            )
+            headers = self.headers.get_all(CENTRAL_REQUEST_HEADER, failobj=[])
+            scope = route_scope(method, target)
+            # The central request signs the method and full target, query
+            # included, and the delegation must grant the route's scope. All of
+            # it is verified before the caller gets a slot or a body read, and
+            # every refusal is the same 401.
+            preauthorized = None
+            if (
+                len(headers) == 1
+                and scope is not None
+                and not self.headers.get_all(VALIDATOR_REQUEST_HEADER, failobj=[])
+            ):
+                try:
+                    preauthorized = authorizer.preauthorize(
+                        headers[0],
+                        method=method,
+                        path=target,
+                        now=datetime.now(UTC),
+                        scope=scope,
+                    )
+                except CentralAccessError:
+                    preauthorized = None
             if preauthorized is None:
                 self._send_json(401, {"error": "unauthorized"})
                 return
@@ -798,8 +813,9 @@ def _make_handler(
                 if raw is None:
                     self._send_json(error_code, {"error": error_message})
                     return
-                caller = authorizer.finalize(preauthorized, body=raw)
-                if caller is None:
+                try:
+                    caller = authorizer.finalize(preauthorized, body=raw, now=datetime.now(UTC))
+                except CentralAccessError:
                     self._send_json(401, {"error": "unauthorized"})
                     return
                 response = tee_box_api.handle(method, target, caller, raw)
@@ -1757,6 +1773,14 @@ class WorkerServer:
                 raise ValueError("TEE box caller access must bind the worker TLS key")
             if tee_box_api.authorizer.worker_hotkey != configured_hotkey:
                 raise ValueError("TEE box caller access must bind the configured worker hotkey")
+            # Its roots come from measured state; the --central-* authorizer's
+            # come from miner flags, so the two never share an authorizer or
+            # replay state.
+            if central_authorizer is not None and (
+                tee_box_api.authorizer is central_authorizer
+                or tee_box_api.authorizer.state.path == central_authorizer.state.path
+            ):
+                raise ValueError("TEE box caller access must not share the flag-configured one")
         if (gpu_executor is None) != (gpu_evidence_collector is None):
             raise ValueError("GPU execution and composite collector are required together")
         if gpu_executor is not None:

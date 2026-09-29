@@ -17,15 +17,14 @@ from cathedral.tee_box.executor import (
 )
 from cathedral.tee_box.lease import CustomerLease, LeaseBusy, LeaseRequired
 from cathedral.tee_box.service import (
-    TEE_BOX_CALLER_NETWORK,
+    ROUTE_SCOPES,
     TeeBoxSandboxApi,
-    caller_authorizer,
-    caller_snapshot_provider,
+    route_scope,
     sandbox_target_allowed,
 )
 
 __all__ = [
-    "TEE_BOX_CALLER_NETWORK",
+    "ROUTE_SCOPES",
     "CustomerLease",
     "EgressEnforcementError",
     "EgressEnforcer",
@@ -42,7 +41,6 @@ __all__ = [
     "Shape",
     "TeeBoxSandboxApi",
     "build_egress_policy",
-    "caller_authorizer",
-    "caller_snapshot_provider",
+    "route_scope",
     "sandbox_target_allowed",
 ]

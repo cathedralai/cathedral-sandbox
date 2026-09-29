@@ -1,7 +1,12 @@
-"""T6b1 worker flags for the TEE box API: off by default, all or nothing, TLS only."""
+"""Worker flags for the TEE box API: off by default, all or nothing, TLS only.
+
+The callers' root keys are not a flag: they come from the fixed image path and
+must match the launch's measured binding (cathedral/tee_box/measured_root.py).
+"""
 
 from __future__ import annotations
 
+import base64
 import json
 import subprocess
 from pathlib import Path
@@ -10,11 +15,12 @@ import pytest
 
 from cathedral import cli
 from cathedral.cli import DEFAULT_WORKER_BEARER_ENV, build_parser, cmd_worker_serve
-from cathedral.tee_box import TeeBoxSandboxApi
+from cathedral.policy_registry import canonical_json
+from cathedral.tee_box import TeeBoxSandboxApi, measured_root
 from cathedral.tee_box import configure as configure_module
 from cathedral.tee_box.configure import OPTIONAL, REQUIRED, tee_box_config
 from tests.test_cli import _tls_material
-from tests.test_tee_box_service import NETUID, TRUSTED, _snapshot_bytes
+from tests.test_tee_box_service import NETUID, OTHER_ROOT_SEED, ROOT_KEYS, ROOT_SEED, _public
 from tests.test_validator_access import WORKER_HOTKEY
 
 RUNSC = '{"runsc":{"path":"/usr/local/bin/runsc","runtimeArgs":["--platform=systrap"]}}'
@@ -79,18 +85,14 @@ class _Guest:
         raise AssertionError(argv)
 
 
+def _root_key_file(seed: bytes = ROOT_SEED) -> bytes:
+    return canonical_json({"cathedral-root-1": base64.b64encode(_public(seed)).decode("ascii")})
+
+
 def _full_flags(tmp_path: Path) -> list[str]:
-    snapshot = tmp_path / "callers.json"
-    snapshot.write_bytes(_snapshot_bytes())
     return [
-        "--tee-box-caller-snapshot",
-        str(snapshot),
-        "--tee-box-caller-keys",
-        str(tmp_path / "caller-keys.json"),
-        "--tee-box-caller-keys-digest",
-        "sha256:" + "cd" * 32,
-        "--tee-box-caller-state",
-        str(tmp_path / "callers.sqlite"),
+        "--tee-box-central-state",
+        str(tmp_path / "tee-box-central.sqlite"),
         "--tee-box-executor",
         "runsc",
         "--tee-box-address",
@@ -111,18 +113,27 @@ def _args(tmp_path: Path, *extra: str, tls: bool = True, command: str = "serve")
 
 
 @pytest.fixture
-def guest(monkeypatch):
+def guest(monkeypatch, tmp_path: Path):
+    """A TDX guest whose image holds the root key file its MRCONFIGID names."""
+
     _FakeServer.calls = []
     monkeypatch.setenv(DEFAULT_WORKER_BEARER_ENV, "worker-token")
     monkeypatch.setattr("cathedral.cli.WorkerServer", _FakeServer)
-    monkeypatch.setattr(
-        "cathedral.admission_policy.load_policy_keys", lambda *_a, **_k: dict(TRUSTED)
-    )
+    image_root = tmp_path / "image-central-root-keys.json"
+    image_root.write_bytes(_root_key_file())
+    monkeypatch.setattr(measured_root, "CENTRAL_ROOT_KEYS_PATH", str(image_root))
     box = _Guest()
+    box.mrconfigid = measured_root.mrconfigid_for_root_keys(_root_key_file())
+    box.image_root = image_root
     real_build = configure_module.build_tee_box_api
 
     def build(config, **kwargs):
-        return real_build(config, runner=box, **kwargs)
+        def read_binding():
+            if isinstance(box.mrconfigid, Exception):
+                raise box.mrconfigid
+            return box.mrconfigid
+
+        return real_build(config, runner=box, read_binding=read_binding, **kwargs)
 
     monkeypatch.setattr(cli, "build_tee_box_api", build)
     return box
@@ -153,6 +164,8 @@ def test_the_full_flag_set_serves_the_sandbox_api(tmp_path: Path, guest, capsys)
     assert isinstance(api, TeeBoxSandboxApi)
     assert api.authorizer.worker_hotkey == WORKER_HOTKEY
     assert api.authorizer.channel_binding == _FakeServer.calls[0]["channel_binding"]
+    assert api.authorizer.root_keys == ROOT_KEYS
+    assert (api.authorizer.network, api.authorizer.netuid) == ("finney", NETUID)
     assert api.executor.network_modes == ("internet", "deny_all")
     assert api.executor.storage_quota is True
     assert [str(net) for net in api.egress.box_addresses] == ["34.120.1.2/32"]
@@ -160,11 +173,109 @@ def test_the_full_flag_set_serves_the_sandbox_api(tmp_path: Path, guest, capsys)
     assert startup["tee_box"]["egress"]["enforced"] is True
     assert startup["tee_box"]["network_modes"] == ["internet", "deny_all"]
     assert startup["tee_box"]["capacity"] == {"vcpus": 8, "memory_mib": 32768, "disk_mib": 204800}
+    assert startup["tee_box"]["central_root_digest"] == measured_root.root_digest_from_mrconfigid(
+        guest.mrconfigid
+    )
+    assert startup["tee_box"]["central_root_key_ids"] == ["cathedral-root-1"]
 
 
 def test_serve_snp_takes_the_same_flags(tmp_path: Path, guest):
     args = _args(tmp_path, *_full_flags(tmp_path), command="serve-snp")
     assert tee_box_config(args) is not None
+
+
+def test_serve_snp_refuses_without_a_measured_root_binding(tmp_path: Path, monkeypatch):
+    # The real SNP reader, not the guest fixture's: HOST_DATA is not read yet.
+    monkeypatch.setenv(DEFAULT_WORKER_BEARER_ENV, "worker-token")
+    monkeypatch.setattr("cathedral.cli.WorkerServer", _FakeServer)
+    monkeypatch.setattr(cli, "build_tee_box_api", _with_runner(_Guest()))
+    _FakeServer.calls = []
+    args = _args(tmp_path, *_full_flags(tmp_path), command="serve-snp")
+    args.worker_posture = "development"  # skip SNP production's signed access requirement
+    with pytest.raises(ValueError, match="HOST_DATA"):
+        cmd_worker_serve(args)
+    assert _FakeServer.calls == []
+
+
+def _with_runner(box):
+    real_build = configure_module.build_tee_box_api
+
+    def build(config, **kwargs):
+        return real_build(config, runner=box, **kwargs)
+
+    return build
+
+
+def test_a_root_key_file_that_does_not_match_mrconfigid_refuses(tmp_path: Path, guest):
+    guest.image_root.write_bytes(_root_key_file(OTHER_ROOT_SEED))
+    with pytest.raises(ValueError, match="does not match MRCONFIGID"):
+        cmd_worker_serve(_args(tmp_path, *_full_flags(tmp_path)))
+    assert _FakeServer.calls == [] and guest.calls == []
+
+
+@pytest.mark.parametrize(
+    ("binding", "match"),
+    [
+        (bytes(48), "MRCONFIGID is zero"),
+        (b"\x01" * 48, "16 zero bytes"),
+        (b"\x01" * 32, "48 bytes"),
+        (measured_root.MeasuredRootError("the TD report device is unavailable"), "unavailable"),
+        (OSError("ioctl failed"), "unreadable"),
+    ],
+)
+def test_an_unusable_measured_binding_refuses(tmp_path: Path, guest, binding, match):
+    guest.mrconfigid = binding
+    with pytest.raises(ValueError, match=match):
+        cmd_worker_serve(_args(tmp_path, *_full_flags(tmp_path)))
+    assert _FakeServer.calls == [] and guest.calls == []
+
+
+def test_a_missing_root_key_file_refuses(tmp_path: Path, guest):
+    guest.image_root.unlink()
+    with pytest.raises(ValueError, match="central root"):
+        cmd_worker_serve(_args(tmp_path, *_full_flags(tmp_path)))
+    assert _FakeServer.calls == []
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--tee-box-caller-snapshot",
+        "--tee-box-caller-keys",
+        "--tee-box-caller-keys-digest",
+        "--tee-box-caller-state",
+        "--tee-box-caller-max-age-seconds",
+        "--tee-box-central-root-keys",
+        "--tee-box-central-root-keys-digest",
+        "--tee-box-root-keys",
+        "--tee-box-mrconfigid",
+    ],
+)
+def test_no_flag_names_the_callers_or_their_root(tmp_path: Path, flag, capsys):
+    for command in ("serve", "serve-snp"):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(
+                ["worker", command, "--hotkey", WORKER_HOTKEY, *_full_flags(tmp_path), flag, "x"]
+            )
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
+def test_no_environment_variable_changes_the_root(tmp_path: Path, guest, monkeypatch):
+    other_keys = tmp_path / "other-root.json"
+    other_keys.write_bytes(_root_key_file(OTHER_ROOT_SEED))
+    for name in (
+        "CATHEDRAL_CENTRAL_ROOT_KEYS",
+        "CATHEDRAL_TEE_BOX_ROOT_KEYS",
+        "CATHEDRAL_TDX_TSM_REPORT_ROOT",
+        "CATHEDRAL_MRCONFIGID",
+    ):
+        monkeypatch.setenv(name, str(other_keys))
+    assert cmd_worker_serve(_args(tmp_path, *_full_flags(tmp_path))) == 0
+    assert _FakeServer.calls[0]["tee_box_api"].authorizer.root_keys == ROOT_KEYS
+    # The module that loads the root reads no environment at all.
+    source = Path(measured_root.__file__).read_text()
+    assert "os.environ" not in source and "getenv" not in source
+    assert measured_root.CENTRAL_ROOT_KEYS_PATH == str(guest.image_root)
 
 
 def _without(flags: list[str], flag: str) -> list[str]:
@@ -248,13 +359,6 @@ def test_an_unapplied_egress_table_starts_deny_all_only(tmp_path: Path, guest, c
     assert startup["tee_box"]["network_modes"] == ["deny_all"]
 
 
-def test_a_stale_caller_snapshot_refuses(tmp_path: Path, guest):
-    flags = _full_flags(tmp_path)
-    Path(flags[1]).write_bytes(b"{}")
-    with pytest.raises(ValueError, match="caller snapshot"):
-        cmd_worker_serve(_args(tmp_path, *flags))
-
-
 def test_detected_addresses_include_interfaces_and_an_ip_endpoint(tmp_path: Path, guest):
     config = tee_box_config(
         _args(
@@ -273,8 +377,9 @@ def test_detected_addresses_include_interfaces_and_an_ip_endpoint(tmp_path: Path
     assert [str(net) for net in named.box_addresses] == ["10.128.0.5/32"]
 
 
-def test_the_caller_state_must_be_separate(tmp_path: Path, guest):
+@pytest.mark.parametrize("other", ["--validator-access-state", "--central-access-state"])
+def test_the_central_state_must_be_separate(tmp_path: Path, guest, other):
     flags = _full_flags(tmp_path)
-    args = _args(tmp_path, *flags, "--validator-access-state", flags[7])
+    args = _args(tmp_path, *flags, other, flags[1])
     with pytest.raises(ValueError, match="separate"):
         tee_box_config(args)
