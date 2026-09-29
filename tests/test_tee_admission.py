@@ -570,6 +570,59 @@ def test_every_refusal_is_reported_together():
     )
 
 
+# -- attestation after the last release -------------------------------------------------
+
+
+def test_evidence_from_before_the_last_release_is_refused():
+    released = ATTESTED_AT + timedelta(seconds=1)
+    result = _admit(_tdx(), last_released_at=released)
+    assert result.reasons == (adm.ATTESTATION_PREDATES_RELEASE,)
+    assert not result.admitted and result.evidence is None
+    assert adm.ATTESTATION_PREDATES_RELEASE == "attestation_predates_release"
+
+
+def test_evidence_verified_at_the_release_instant_is_refused():
+    # Strictly after: the same instant could be before the release.
+    result = _admit(_snp(), last_released_at=ATTESTED_AT)
+    assert result.reasons == (adm.ATTESTATION_PREDATES_RELEASE,)
+    assert result.evidence is None
+
+
+def test_evidence_verified_after_the_last_release_is_admitted():
+    released = ATTESTED_AT - timedelta(microseconds=1)
+    result = _admit(_tdx(), last_released_at=released)
+    assert result.admitted and result.reasons == ()
+    assert result.evidence == _admit(_tdx()).evidence
+
+
+def test_the_release_is_compared_as_an_instant_across_time_zones():
+    # 12:00:01 at +01:00 is 11:00:01 UTC, one second after ATTESTED_AT.
+    plus_one = timezone(timedelta(hours=1))
+    later = datetime(2026, 9, 28, 12, 0, 1, tzinfo=plus_one)
+    earlier = datetime(2026, 9, 28, 11, 59, 59, tzinfo=plus_one)
+    assert _admit(_tdx(), last_released_at=later).reasons == (adm.ATTESTATION_PREDATES_RELEASE,)
+    assert _admit(_tdx(), last_released_at=earlier).admitted
+
+
+def test_no_release_time_skips_the_check_and_keeps_the_old_signature():
+    assert _admit(_tdx(), last_released_at=None) == _admit(_tdx())
+    parameter = inspect.signature(adm.admit).parameters["last_released_at"]
+    assert parameter.default is None and parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_a_release_refusal_is_reported_with_the_others():
+    result = _admit(
+        _tdx(collateral_current=False),
+        nonce=bytes(reversed(NONCE)),
+        last_released_at=ATTESTED_AT + timedelta(hours=1),
+    )
+    assert result.reasons == (
+        adm.VERIFICATION_INCOMPLETE,
+        adm.REPORT_DATA_MISMATCH,
+        adm.ATTESTATION_PREDATES_RELEASE,
+    )
+
+
 # -- malformed input -----------------------------------------------------------------------
 
 
@@ -668,6 +721,9 @@ _BAD_CALL = {
     "attested_at_epoch": {"attested_at": ATTESTED_AT.timestamp()},
     "attested_at_overflow": {"attested_at": datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=5)))},
     "attested_at_year_5": {"attested_at": datetime(5, 1, 1, tzinfo=timezone.utc)},
+    "released_naive": {"last_released_at": ATTESTED_AT.replace(tzinfo=None)},
+    "released_str": {"last_released_at": "2026-09-28T11:00:00Z"},
+    "released_epoch": {"last_released_at": ATTESTED_AT.timestamp()},
     "nonce_short": {"nonce": NONCE[:31]},
     "nonce_zero": {"nonce": bytes(32)},
     "nonce_str": {"nonce": NONCE.hex()},

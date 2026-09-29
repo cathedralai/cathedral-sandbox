@@ -330,20 +330,21 @@ as at most as trustworthy as one box per address.
 ## Admission (`admission.py`)
 
 Before a TEE box is routed sandboxes or probed for receipts, the control plane (or the prober)
-admits it. `admit` (`admission.py:301-427`) is a pure function: no network, clock or files. The
+admits it. `admit` (`admission.py:307-445`) is a pure function: no network, clock or files. The
 caller first verifies the box's quote itself with the pinned verifier
 (`cathedral/verify/__init__.py` in strict mode for TDX, `cathedral/verify/snp.py` `verify_snp`
 for SEV-SNP), on the TLS connection that serves the sandbox API. It then passes the verifier's
 own verdict, the `cathedral.common.Attested` it returned (`cathedral/common.py:200-225`),
 together with the raw quote or report bytes it verified, the verifier digest, the certificate
 (or SPKI) from its own handshake, the miner hotkey, its 32-byte nonce, when it verified the
-quote (`attested_at`), the box id, a measurement policy and the already-admitted hardware ids.
+quote (`attested_at`), the box id, a measurement policy and the already-admitted hardware ids,
+and optionally when the box's last customer lease ended (`last_released_at`).
 There is no raw PPID input (no TDX verifier outputs one), and no caller-supplied hash,
-REPORT_DATA or measurement: admission reads those from the quote bytes (`admission.py:240-251`).
+REPORT_DATA or measurement: admission reads those from the quote bytes (`admission.py:246-257`).
 
-It checks, and reports every failure together (`admission.py:398-412`):
+It checks, and reports every failure together (`admission.py:412-430`):
 
-- **Complete verification** (`admission.py:224-237`, `admission.py:399-400`). The verdict must
+- **Complete verification** (`admission.py:230-243`, `admission.py:413-414`). The verdict must
   be `verification_status == "VERIFIED"` with `chain_verified` true; for TDX also
   `policy_mode == "strict"`, `collateral_current` true and `debug_enabled` false, and the
   quote's own TD_ATTRIBUTES debug bit clear. A partial verdict is refused
@@ -353,41 +354,50 @@ It checks, and reports every failure together (`admission.py:398-412`):
   strict collateral and platform-identity gates (`cathedral/verify/__init__.py:220-234`, against
   the strict ones at `cathedral/verify/__init__.py:185-219`). The verdict must also be for these
   bytes: its measurement, and for SEV-SNP its chip id, must match the quote's own, or it is an
-  `AdmissionError` (`admission.py:366-367`, `admission.py:377-378`).
+  `AdmissionError` (`admission.py:380-381`, `admission.py:391-392`).
 - **REPORT_DATA**, read from the quote, must equal `report_data_v2(nonce, miner_hotkey, binding)`
-  (`admission.py:401-406`), the worker's existing v2 construction (`cathedral/common.py:260-295`,
+  (`admission.py:415-420`), the worker's existing v2 construction (`cathedral/common.py:260-295`,
   byte for byte cathedral-validator's `cathedral_thin/independent/collect.py` `report_data_v2`).
   It is SHA-512 over a domain tag, version 2, and four tagged, length-prefixed fields: the nonce,
   the hotkey (UTF-8), the binding type `tls_spki_sha256`, and SHA-256 of the SPKI of the
   certificate the caller saw (`cathedral/channel.py:78-82`). So a quote made for another nonce,
   hotkey or TLS key, or with an `application_key_sha256` binding, is refused
   (`report_data_mismatch`). No new format is added.
-- **Hardware id** (`admission.py:368-379`), exactly as receipts name the machine. TDX:
+- **Hardware id** (`admission.py:382-393`), exactly as receipts name the machine. TDX:
   `tdx_hardware_id(stable_platform_id)`, the `tdx_platform` id over the digest in the pinned Go
   verifier's `stable_platform_id` (the strict verdict's `chip_id`; see Hardware identity,
   including why it is stable only under that verifier). SEV-SNP: `derive_hardware_id("chip_id",
   ...)` over the CHIP_ID read from the report (`cathedral/verify/snp.py:163`). A malformed or
   missing id is an `AdmissionError`.
-- **Measurement** against the admission policy (`admission.py:407-409`): in `enforce` an
+- **Measurement** against the admission policy (`admission.py:421-423`): in `enforce` an
   unlisted measurement is refused (`measurement_not_allowed`); in `shadow` the box is admitted
   with `measurement_allowed: false` recorded, **and no receipt evidence**, so it is not paid (see
   below).
-- **One box per host, first claim wins** (`admission.py:410-412`). TEE boxes are whole hosts: a
+- **One box per host, first claim wins** (`admission.py:424-426`). TEE boxes are whole hosts: a
   TDX platform id or a CHIP_ID names the physical machine, so co-resident guests share it. If the
   hardware id is already admitted to a different box (another `box_id`, or the same `box_id` under
   another hotkey) the new claim is refused (`hardware_id_admitted_to_another_box`); the first box
   keeps it until the caller removes its entry. The same box presenting the same host again is
   re-admitted. Every key of the registry must be a canonical hardware id
-  (`admission.py:280-298`), so a registry keyed another way cannot let a duplicate slip past.
+  (`admission.py:286-304`), so a registry keyed another way cannot let a duplicate slip past.
   `admit` only reads the registry: the caller must look the id up and record the new claim
   atomically, under one lock or in one database transaction, or two concurrent admissions of one
   host for different boxes can both pass.
+- **After the last release**, only when `last_released_at` is given (`admission.py:427-430`).
+  A TEE box is relaunched and re-attested between customers (docs/TEE_BOX_SERVICE.md,
+  "Relaunch between customers"). Evidence whose `attested_at` is not strictly after
+  `last_released_at` is refused (`attestation_predates_release`), so the admission made before
+  one customer's allocation is not reused after it. The default, `None`, skips the check, and
+  every existing call keeps its result. Pass the later of the box's `boot.last_released_at` from
+  `GET /v1/box` (whole seconds, rounded up) and the control plane's own record of the release: the
+  box clock and the prober clock may differ. This check alone does not show that the VM was
+  relaunched; see that section for what does and does not.
 
-The result is an `Admission` (`admission.py:136-149`): `admitted`, `reasons`, `hardware_id`,
+The result is an `Admission` (`admission.py:142-155`): `admitted`, `reasons`, `hardware_id`,
 `hardware_id_kind`, `measurement`, `measurement_allowed`, `mode`, the policy digest and the
 `ReceiptEvidence` for the box's receipts, which is set **only when the box is admitted and its
-measurement is on the admission policy's list** (`admission.py:426`). That evidence goes through
-the receipt's own evidence check (`admission.py:382-395`). Its `evidence_sha256` is SHA-256 of
+measurement is on the admission policy's list** (`admission.py:444`). That evidence goes through
+the receipt's own evidence check (`admission.py:396-409`). Its `evidence_sha256` is SHA-256 of
 the quote bytes computed by `admit`, `tls_spki_sha256` comes from the caller's handshake, never
 from the box, and it carries the caller's nonce as `attestation_nonce` and `attested_at`, so a
 receipt signed over it can be audited end to end (see Evidence).
@@ -419,19 +429,19 @@ refused by the verifier; to collect it, read it from the quote before verifying
 `parse_snp_report(report).measurement`), which is how operators survey the fleet's measurements
 before listing them. Such a box is not admitted.
 
-**Policy.** `parse_policy(raw)` (`admission.py:161-221`) takes the file's bytes. The TDX policy
+**Policy.** `parse_policy(raw)` (`admission.py:167-227`) takes the file's bytes. The TDX policy
 is cathedral-validator #256's file unchanged: `{"schema": "cathedral_tdx_measurement_policy_v1",
 "mode": "shadow" | "enforce", "allowed_measurements": ["tdx-measurement-sha256:<64 hex>", ...]}`.
 The SEV-SNP policy has the same shape with schema `cathedral_snp_measurement_policy_v1` and
-96-hex measurements (`admission.py:91-99`). Exactly those three keys, no repeated key
-(`admission.py:152-158`), a sorted, unique list (`admission.py:209-210`), and a non-empty list when
-enforcing (`admission.py:214-215`); at most 128 KiB (`admission.py:174-175`,
+96-hex measurements (`admission.py:96-104`). Exactly those three keys, no repeated key
+(`admission.py:158-164`), a sorted, unique list (`admission.py:215-216`), and a non-empty list when
+enforcing (`admission.py:220-221`); at most 128 KiB (`admission.py:180-181`,
 `test_the_policy_size_cap_is_128_kib_of_otherwise_valid_json`) of UTF-8 JSON, and anything
 `json.loads` refuses, including a number past Python's integer digit limit, is an
-`AdmissionError` (`admission.py:176-183`). Reading the file safely (owner, mode) stays with the
+`AdmissionError` (`admission.py:182-189`). Reading the file safely (owner, mode) stays with the
 caller, as #256's loader does. A policy of the other kind is an error.
 
-**Errors.** Any malformed input, of any type, raises `AdmissionError` (`admission.py:112-113`),
+**Errors.** Any malformed input, of any type, raises `AdmissionError` (`admission.py:118-119`),
 never a bare exception (`test_fuzzed_input_is_an_admission_error_or_a_decision_never_another_exception`).
 
 **Not bound, and why.** Admission trusts the caller to have run the verifier on the same

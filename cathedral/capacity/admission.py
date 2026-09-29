@@ -41,6 +41,11 @@ quote (or SEV-SNP report) bytes it verified. :func:`admit` then decides:
   entry. The same box presenting the same host again is re-admitted. The
   caller must check and record the claim atomically (one lock or transaction),
   or two concurrent admissions of one host can both pass.
+- **After the last release (optional).** A TEE box is relaunched and
+  re-attested between customers. Given ``last_released_at``, when the box's
+  previous customer lease ended, evidence verified at or before it is refused,
+  so the previous allocation's admission cannot be reused for the next one.
+  ``None`` (the default) skips the check.
 
 The evidence :func:`admit` returns for the box's receipts carries the SHA-256
 of the quote bytes (computed here, never taken from the caller), the nonce, the
@@ -107,6 +112,7 @@ VERIFICATION_INCOMPLETE = "verification_incomplete"
 REPORT_DATA_MISMATCH = "report_data_mismatch"
 MEASUREMENT_NOT_ALLOWED = "measurement_not_allowed"
 HARDWARE_ID_CLAIMED = "hardware_id_admitted_to_another_box"
+ATTESTATION_PREDATES_RELEASE = "attestation_predates_release"
 
 
 class AdmissionError(ValueError):
@@ -311,6 +317,7 @@ def admit(
     admitted: Mapping[str, AdmittedBox],
     tls_certificate_der: bytes | None = None,
     tls_spki_der: bytes | None = None,
+    last_released_at: datetime | None = None,
 ) -> Admission:
     """Decide one TEE box's admission.
 
@@ -321,7 +328,10 @@ def admit(
     ``attested_at`` (timezone-aware) when it verified the quote.
     ``tls_certificate_der`` (or its ``tls_spki_der``) is from the caller's own
     handshake on the connection that serves the sandbox API; ``admitted`` maps
-    each already-admitted hardware id to its box. Raises
+    each already-admitted hardware id to its box. ``last_released_at``
+    (timezone-aware, optional) is when the box's last customer lease ended:
+    evidence whose ``attested_at`` is not strictly after it is refused with
+    ``attestation_predates_release``; ``None`` skips that check. Raises
     :class:`AdmissionError` on malformed input."""
 
     if not isinstance(attested, Attested):
@@ -357,6 +367,10 @@ def admit(
         attested_iso = _iso(attested_at)
     except (OverflowError, ValueError) as exc:  # outside what UTC can represent
         raise AdmissionError("attested_at is out of range") from exc
+    if last_released_at is not None and (
+        not isinstance(last_released_at, datetime) or last_released_at.utcoffset() is None
+    ):
+        raise AdmissionError("last_released_at must be a timezone-aware datetime or None")
     registry = _check_admitted(admitted)
     binding = _tls_binding(tls_certificate_der, tls_spki_der)
 
@@ -410,6 +424,10 @@ def admit(
     holder = registry.get(hardware_id)
     if holder is not None and (holder.box_id, holder.miner_hotkey) != (box_id, miner_hotkey):
         reasons.append(HARDWARE_ID_CLAIMED)
+    # Strictly after: evidence verified in the same instant as the release may
+    # have come from before it.
+    if last_released_at is not None and attested_at <= last_released_at:
+        reasons.append(ATTESTATION_PREDATES_RELEASE)
 
     return Admission(
         admitted=not reasons,
