@@ -1117,3 +1117,40 @@ def test_failed_fresh_evidence_attempt_clears_previously_trusted_binding(
             remote.fetch_evidence(os.urandom(32))
         with pytest.raises(RemoteError, match="required before work"):
             remote.do_sat_work(_sat_item())
+
+
+def test_tls_idle_sockets_cannot_lock_out_a_real_request(tmp_path: Path, capfd):
+    """Review finding W1 on the native TLS path: sockets that never send a
+    ClientHello are evicted, the real request succeeds, and no handler thread
+    dies with a traceback while its socket is shut down under it."""
+    cert, key, certificate_der = _certificate_pair(tmp_path, "worker")
+    binding = tls_spki_binding(certificate_der)
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(cert, key)
+    client_context = ssl.create_default_context(cafile=str(cert))
+    with WorkerServer(
+        configured_hotkey=HOTKEY,
+        evidence_collector=_bound_evidence,
+        channel_binding=binding,
+        tls_context=server_context,
+        bearer_token="protected-token",
+        max_connection_concurrent=8,
+    ) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        idle = [socket.create_connection(("127.0.0.1", server.port), timeout=10) for _ in range(8)]
+        try:
+            deadline = time.monotonic() + 2.0
+            while server._server.active_connection_count < 8 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert server._server.active_connection_count == 8
+            remote = RemoteMiner(
+                server.base_url, HOTKEY, bearer_token="protected-token", ssl_context=client_context
+            )
+            evidence = remote.fetch_evidence(os.urandom(32))
+            assert evidence.channel_binding == binding
+            assert server._server.evicted_connection_count >= 1
+            time.sleep(0.2)
+        finally:
+            for conn in idle:
+                conn.close()
+    assert "Traceback" not in capfd.readouterr().err

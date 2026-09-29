@@ -1,0 +1,1238 @@
+"""The capacity challenge, prober receipts and market pricing (docs/CAPACITY.md)."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import inspect
+import json
+import math
+import os
+import random
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from cathedral.capacity import challenge as ch
+from cathedral.capacity import pricing, receipt
+
+SEED = bytes(range(32))
+NONCE_A = bytes([7]) * 32
+SMALL = ch.ChallengeSpec(SEED, lanes=6, blocks=64, steps=128)
+NOW = datetime(2026, 9, 28, 12, 0, 0, tzinfo=timezone.utc)
+HOTKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+VALIDATOR_NONCE = "ab" * 32
+FINGERPRINT = "f0" * 32
+NETUID = random.SystemRandom().randrange(1, 65536)
+OTHER_NETUID = NETUID % 65535 + 1
+
+
+# -- challenge -------------------------------------------------------------------
+
+
+def test_lanes_are_deterministic_distinct_and_seed_bound():
+    outputs = ch.run(SMALL, workers=1)
+    assert outputs == ch.run(SMALL, workers=1)
+    assert len(set(outputs)) == SMALL.lanes
+    other = ch.run(ch.ChallengeSpec(bytes(32), 6, 64, 128), workers=1)
+    assert not set(outputs) & set(other)
+
+
+def test_parallel_and_sequential_runs_agree():
+    assert ch.run(SMALL, workers=3) == ch.run(SMALL, workers=1)
+
+
+def test_every_parameter_changes_the_answer():
+    base = ch.lane_output(SMALL, 0)
+    assert ch.lane_output(ch.ChallengeSpec(SEED, 6, 65, 128), 0) != base
+    assert ch.lane_output(ch.ChallengeSpec(SEED, 6, 64, 129), 0) != base
+    assert ch.lane_output(SMALL, 1) != base
+
+
+def test_a_correct_answer_verifies_and_every_faked_lane_is_caught_when_sampled():
+    outputs = ch.run(SMALL, workers=1)
+    assert ch.verify(SMALL, outputs, nonce=NONCE_A, sample=SMALL.lanes)
+    for lane in range(SMALL.lanes):
+        faked = list(outputs)
+        faked[lane] = bytes(32)
+        assert not ch.verify(SMALL, faked, nonce=NONCE_A, sample=SMALL.lanes)
+
+
+def test_a_box_cannot_steer_the_sample_onto_its_honest_lanes():
+    # 12 honest lanes of 16, the rest garbage: with the nonce drawn after the
+    # commitment, a pass needs all 8 sampled lanes to be honest, 495 in 12870.
+    spec = ch.ChallengeSpec(SEED, lanes=16, blocks=8, steps=16)
+    honest = ch.run(spec, workers=1)
+    outputs = [honest[i] if i < 12 else bytes([i]) * 32 for i in range(16)]
+    digest = ch.result_digest(spec, outputs)
+    passes = 0
+    samples = set()
+    for i in range(300):
+        nonce = os.urandom(32)
+        samples.add(tuple(ch.sample_lanes(spec, digest, nonce, ch.required_samples(16))))
+        passes += ch.verify(spec, outputs, nonce=nonce)
+    assert passes <= 40  # 11.5 expected
+    assert len(samples) > 100  # the nonce, not the box, decides the sample
+
+
+@pytest.mark.parametrize(
+    "lanes, required", [(1, 1), (3, 3), (4, 4), (5, 4), (8, 4), (9, 5), (16, 8), (1024, 512)]
+)
+def test_the_sample_floor_covers_small_boxes_and_half_of_large_ones(lanes, required):
+    assert ch.required_samples(lanes) == required
+
+
+def test_the_documented_pass_probabilities_hold():
+    # docs/CAPACITY.md: faking f of n lanes passes a k-lane sample with
+    # C(n - f, k) / C(n, k), at most (1 - k / n) ** f, so at most 2 ** -f.
+    def passes(n, f):
+        k = ch.required_samples(n)
+        return math.comb(n - f, k) / math.comb(n, k)
+
+    assert passes(8, 1) == 0.5 and passes(8, 2) == 15 / 70 and passes(4, 1) == 0
+    assert passes(5, 1) == 0.2 and passes(9, 1) == 4 / 9 and passes(64, 1) == 0.5
+    for n in range(1, 129):
+        for f in range(1, n + 1):
+            k = ch.required_samples(n)
+            assert passes(n, f) <= (1 - k / n) ** f + 1e-12 <= 2.0**-f + 2e-12
+
+
+def test_a_box_one_lane_short_passes_about_half_the_time_at_the_floor():
+    spec = ch.ChallengeSpec(SEED, lanes=8, blocks=8, steps=16)
+    outputs = ch.run(spec, workers=1)
+    outputs[5] = bytes(32)
+    passes = sum(ch.verify(spec, outputs, nonce=os.urandom(32)) for _ in range(400))
+    assert 140 <= passes <= 260  # 200 expected
+    assert not any(
+        ch.verify(spec, outputs, nonce=os.urandom(32), sample=spec.lanes) for _ in range(20)
+    )
+
+
+def test_verify_refuses_a_sample_below_the_floor():
+    outputs = ch.run(SMALL, workers=1)
+    assert ch.verify(SMALL, outputs, nonce=NONCE_A, sample=ch.required_samples(SMALL.lanes))
+    assert not ch.verify(SMALL, outputs, nonce=NONCE_A, sample=ch.required_samples(SMALL.lanes) - 1)
+
+
+def test_the_deadline_bound_follows_the_spec():
+    small = ch.ChallengeSpec(SEED, 1, 1, 1)
+    assert ch.max_deadline_ms(small) == ch.DEADLINE_STARTUP_MS + 1 == 5_001
+    big = ch.spec_for(SEED, vcpus=8, memory_gib=32)
+    assert ch.max_deadline_ms(big) == ch.DEADLINE_STARTUP_MS + math.ceil(
+        big.steps * ch.DEADLINE_NS_PER_STEP / 1_000_000
+    )
+    assert ch.max_deadline_ms(big) == 219_749  # a 32 GiB, 8 vCPU box: about 3.7 minutes
+
+
+def _native_exec_ms(spec, cores):
+    # The exec time of the fastest native worker assumed (ASSUMED_NATIVE_NS_PER_STEP,
+    # huge pages, fill included) on ``cores`` cores, lanes time-sliced over the cores and
+    # never faster than one lane alone. Startup is left out, in the box's favour.
+    lane_ms = spec.steps * ch.ASSUMED_NATIVE_NS_PER_STEP / 1_000_000
+    return lane_ms * max(1, spec.lanes / cores)
+
+
+def test_the_reviewers_inflated_vcpu_claims_no_longer_fit():
+    # Round 2: 8 cores claiming 1024 vCPUs over 16 GiB fitted a 124 s cap.
+    # Re-review: 4 cores ran all 20 lanes of a 20 vCPU / 13 GiB claim in 77.2 s
+    # under a 79.8 s cap. The first is refused by the lane floor; the second
+    # needs about 44 s even at the fastest assumed speed (huge pages) against a
+    # 39.9 s bound now.
+    honest = ch.spec_for(SEED, vcpus=8, memory_gib=16)
+    assert 26_000 < _native_exec_ms(honest, 8) < 28_000  # about 43 s with 4 KiB pages
+    assert ch.max_deadline_ms(honest) > 4 * _native_exec_ms(honest, 8)  # honest fits
+    with pytest.raises(ch.ChallengeError, match="512 MiB of lane"):
+        ch.spec_for(SEED, vcpus=1024, memory_gib=16)
+    twenty = ch.spec_for(SEED, vcpus=20, memory_gib=13)
+    assert ch.max_deadline_ms(twenty) == 39_897  # was 79 794
+    assert _native_exec_ms(twenty, 4) > 1.09 * ch.max_deadline_ms(twenty)
+    assert 77_200 > ch.max_deadline_ms(twenty)
+
+
+@pytest.mark.parametrize(
+    "cores, memory_gib", [(4, 13), (8, 16), (8, 64), (16, 64), (32, 128), (8, 5)]
+)
+def test_a_vcpu_claim_inflates_at_most_the_documented_factor(cores, memory_gib):
+    # docs/CAPACITY.md, Timing: at the fastest assumed native speed (huge
+    # pages) a box meets the deadline only while it claims at most about 4
+    # times its cores (up to 4.6 at the smallest lane).
+    fitting = [
+        vcpus
+        for vcpus in range(cores, min(ch.MAX_LANES, memory_gib * 2) + 1)
+        if vcpus <= ch.provable_vcpus(vcpus, memory_gib)
+        and _native_exec_ms(ch.spec_for(SEED, vcpus=vcpus, memory_gib=memory_gib), cores)
+        <= ch.max_deadline_ms(ch.spec_for(SEED, vcpus=vcpus, memory_gib=memory_gib))
+    ]
+    assert fitting[0] == cores  # the honest claim fits
+    assert fitting == list(range(cores, fitting[-1] + 1))
+    assert fitting[-1] <= 4.6 * cores
+    if ch.provable_vcpus(ch.MAX_LANES, memory_gib) >= 4 * cores:
+        assert fitting[-1] >= 3.9 * cores  # the factor is real, not a bound that fits nobody
+
+
+def test_the_residual_inflation_factor_matches_the_constants():
+    # The fastest native lane measured was 0.29 us per step (2 MiB pages); the
+    # assumption must stay at or below it (docs/CAPACITY.md, Timing).
+    assert ch.ASSUMED_NATIVE_NS_PER_STEP <= 290
+    assert ch.DEADLINE_NS_PER_STEP / ch.ASSUMED_NATIVE_NS_PER_STEP == 4
+    smallest = ch.ChallengeSpec(SEED, 1, ch.MIN_LANE_BYTES // 32, ch.MIN_LANE_BYTES // 16)
+    budget = ch.max_deadline_ms(smallest) - ch.DEADLINE_STARTUP_MS
+    assert 33_500 < budget < 33_600
+    assert 0.14 < ch.DEADLINE_STARTUP_MS / budget < 0.15
+    assert 4.5 < ch.max_deadline_ms(smallest) / _native_exec_ms(smallest, 1) < 4.6
+
+
+def test_the_sample_is_recomputable_from_the_receipt_fields():
+    digest = ch.result_digest(SMALL, ch.run(SMALL, workers=1))
+    lanes = ch.sample_lanes(SMALL, digest, NONCE_A, 3)
+    assert lanes == ch.sample_lanes(SMALL, digest, NONCE_A, 3)
+    assert len(lanes) == 3 and lanes == sorted(set(lanes))
+    assert ch.sample_lanes(SMALL, digest, NONCE_A, 99) == list(range(SMALL.lanes))
+    with pytest.raises(ch.ChallengeError):
+        ch.sample_lanes(SMALL, digest, b"short", 3)
+
+
+def test_malformed_answers_do_not_verify():
+    outputs = ch.run(SMALL, workers=1)
+    assert not ch.verify(SMALL, outputs[:-1], nonce=NONCE_A)
+    assert not ch.verify(SMALL, [*outputs[:-1], b"short"], nonce=NONCE_A)
+    assert not ch.verify(SMALL, outputs, nonce=b"short")
+    with pytest.raises(ch.ChallengeError):
+        ch.result_digest(SMALL, outputs + [bytes(32)])
+
+
+def test_the_spec_proves_the_whole_claim_or_refuses_it():
+    spec = ch.spec_for(SEED, vcpus=8, memory_gib=32)
+    assert spec.lanes == 8
+    assert spec.memory_bytes == 8 * (32 * (1 << 30) * 4 // 5 // 8 // 32) * 32
+    assert spec.steps == 2 * spec.blocks
+    assert ch.spec_for(SEED, vcpus=16, memory_gib=64).memory_bytes > 51 * (1 << 30)
+    with pytest.raises(ch.ChallengeError, match="more than 1024"):
+        ch.spec_for(SEED, vcpus=1025, memory_gib=4096)
+    with pytest.raises(ch.ChallengeError, match="per vCPU"):
+        ch.spec_for(SEED, vcpus=1, memory_gib=11)  # more than one lane can hold
+    with pytest.raises(ch.ChallengeError, match="0.625 GiB"):
+        ch.spec_for(SEED, vcpus=2, memory_gib=1)  # less than the smallest lane
+    for bad in (0, -1, True, 1.5):
+        with pytest.raises(ch.ChallengeError):
+            ch.spec_for(SEED, vcpus=bad, memory_gib=8)
+
+
+def test_the_lane_floor_admits_the_consumer_shapes_and_refuses_thin_claims():
+    # 0.625 GiB claimed per vCPU is exactly a 512 MiB lane.
+    assert ch.spec_for(SEED, vcpus=8, memory_gib=5).blocks * ch.BLOCK_BYTES == ch.MIN_LANE_BYTES
+    for vcpus, memory_gib in ((1, 4), (2, 4), (8, 32), (6, 24), (1024, 640)):  # SN120, SN81, tests
+        assert ch.spec_for(SEED, vcpus=vcpus, memory_gib=memory_gib).lanes == vcpus
+    for vcpus, memory_gib in ((9, 5), (1024, 639), (1024, 16), (1024, 2), (7, 4)):
+        with pytest.raises(ch.ChallengeError, match="512 MiB of lane"):
+            ch.spec_for(SEED, vcpus=vcpus, memory_gib=memory_gib)
+
+
+def test_a_cpu_heavy_claim_is_probed_at_what_can_be_proven():
+    assert ch.provable_vcpus(64, 32) == 51
+    assert ch.provable_vcpus(8, 32) == 8
+    assert ch.provable_vcpus(2048, 4096) == ch.MAX_LANES
+    assert ch.provable_vcpus(4, 1) == 1
+    ch.spec_for(SEED, vcpus=ch.provable_vcpus(64, 32), memory_gib=32)  # does not raise
+    with pytest.raises(ch.ChallengeError):
+        ch.spec_for(SEED, vcpus=ch.provable_vcpus(64, 32) + 1, memory_gib=32)
+
+
+def test_a_memory_heavy_claim_is_probed_at_what_can_be_proven():
+    assert ch.provable_memory_gib(4, 256) == 40
+    assert ch.provable_memory_gib(8, 32) == 32
+    ch.spec_for(SEED, vcpus=4, memory_gib=ch.provable_memory_gib(4, 256))  # does not raise
+    with pytest.raises(ch.ChallengeError):
+        ch.spec_for(SEED, vcpus=4, memory_gib=ch.provable_memory_gib(4, 256) + 1)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        (b"short", 1, 1, 1),
+        (SEED, 0, 1, 1),
+        (SEED, 1, 0, 1),
+        (SEED, 1, 1, 0),
+        (SEED, ch.MAX_LANES + 1, 1, 1),
+        (SEED, True, 1, 1),
+        (SEED, 1.5, 1, 1),
+    ],
+)
+def test_bad_specs_are_refused(args):
+    with pytest.raises(ch.ChallengeError):
+        ch.ChallengeSpec(*args)
+
+
+def test_spec_json_round_trip_is_strict():
+    assert ch.ChallengeSpec.from_json(SMALL.to_json()) == SMALL
+    for bad in (
+        {**SMALL.to_json(), "x": 1},
+        {**SMALL.to_json(), "seed": "AB" * 32},
+        {**SMALL.to_json(), "seed": "zz" * 32},
+        [1],
+    ):
+        with pytest.raises(ch.ChallengeError):
+            ch.ChallengeSpec.from_json(bad)
+
+
+def test_the_sandbox_command_prints_the_answer():
+    done = subprocess.run(
+        [sys.executable, "-m", "cathedral.capacity.challenge", "--workers", "2"],
+        input=json.dumps(SMALL.to_json()),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    answer = json.loads(done.stdout)
+    outputs = [bytes.fromhex(item) for item in answer["outputs"]]
+    assert outputs == ch.run(SMALL, workers=1)
+    assert answer["result_digest"] == ch.result_digest(SMALL, outputs).hex()
+    bad = subprocess.run(
+        [sys.executable, "-m", "cathedral.capacity.challenge"],
+        input="{}",
+        capture_output=True,
+        text=True,
+    )
+    assert bad.returncode == 2 and "error" in json.loads(bad.stdout)
+
+
+# -- receipts ---------------------------------------------------------------------
+
+DIGEST = bytes([3]) * 32
+TEE_HARDWARE_ID = "aa" * 32
+TDX_EVIDENCE = {
+    "evidence_kind": "tdx",
+    "evidence_sha256": "e1" * 32,
+    "measurement": "tdx-measurement-sha256:" + "4d" * 32,
+    "verifier_digest": "sha256:" + "7e" * 32,
+    "tls_spki_sha256": "5b" * 32,
+    "attestation_nonce": "a7" * 32,
+    "attested_at": "2026-09-28T11:00:00Z",  # an hour before the receipt (NOW)
+}
+SNP_EVIDENCE = {**TDX_EVIDENCE, "evidence_kind": "sev_snp", "measurement": "6c" * 48}
+EVIDENCE_FOR = {"tdx": TDX_EVIDENCE, "sev_snp": SNP_EVIDENCE, None: None}
+
+
+def _body(**changes):
+    """A TDX box by default (TEE boxes first); kind="bare_metal" gives a bare-metal one."""
+    vcpus = changes.pop("vcpus", 6)
+    memory_gib = changes.pop("memory_gib", 24)
+    spec = changes.pop("challenge", None) or ch.spec_for(SEED, vcpus=vcpus, memory_gib=memory_gib)
+    sample_count = changes.pop("sample_count", ch.required_samples(spec.lanes))
+    lanes = ch.sample_lanes(spec, DIGEST, NONCE_A, sample_count)
+    kind = changes.pop("kind", "tee")
+    tee_kind = changes.pop("tee_kind", "tdx" if kind == "tee" else None)
+    fields = dict(
+        netuid=NETUID,
+        round=7,
+        validator_nonce=VALIDATOR_NONCE,
+        box_id="box-1",
+        miner_hotkey=HOTKEY,
+        kind=kind,
+        tee_kind=tee_kind,
+        hardware_id=TEE_HARDWARE_ID if kind == "tee" else FINGERPRINT,
+        vcpus=vcpus,
+        memory_gib=memory_gib,
+        challenge=spec,
+        result_digest=DIGEST,
+        sample_nonce=NONCE_A,
+        sample_count=sample_count,
+        sampled_outputs={lane: bytes([lane % 256]) * 32 for lane in lanes},
+        deadline_ms=60_000,
+        timings_ms={"create": 900, "exec": 40_000, "delete": 300},
+        issued_at=NOW,
+        valid_for=timedelta(minutes=30),
+        prober_key_id="sn94-prober-1",
+        evidence=EVIDENCE_FOR.get(tee_kind),
+    )
+    fields.update(changes)
+    return receipt.make_body(**fields)
+
+
+@pytest.fixture
+def prober():
+    key = Ed25519PrivateKey.generate()
+    return key, {"sn94-prober-1": key.public_key()}
+
+
+def _verify(signed, keys, **changes):
+    args = dict(
+        prober_keys=keys,
+        netuid=NETUID,
+        validator_nonce=VALIDATOR_NONCE,
+        now=NOW + timedelta(minutes=1),
+        expected_round=7,
+    )
+    args.update(changes)
+    return receipt.verify_receipt(signed, **args)
+
+
+def test_a_signed_receipt_verifies_on_any_netuid(prober):
+    key, keys = prober
+    verified = _verify(receipt.sign_receipt(_body(), key), keys)
+    assert (verified.box_id, verified.vcpus, verified.memory_gib) == ("box-1", 6, 24)
+    assert (verified.kind, verified.tee_kind, verified.hardware_id_kind) == (
+        "tee",
+        "tdx",
+        "tdx_platform",
+    )
+    assert verified.evidence == receipt.ReceiptEvidence(**TDX_EVIDENCE)
+    assert verified.sample_count == ch.required_samples(6) == 4
+    assert sorted(verified.sampled_outputs) == ch.sample_lanes(
+        verified.challenge, DIGEST, NONCE_A, verified.sample_count
+    )
+    other = receipt.sign_receipt(_body(netuid=OTHER_NETUID), key)
+    assert _verify(other, keys, netuid=OTHER_NETUID).round == 7
+
+
+def test_verify_receipt_requires_the_round(prober):
+    key, keys = prober
+    signed = receipt.sign_receipt(_body(), key)
+    with pytest.raises(TypeError):
+        receipt.verify_receipt(
+            signed, prober_keys=keys, netuid=NETUID, validator_nonce=VALIDATOR_NONCE, now=NOW
+        )
+    for bad in (None, -1, True, "7"):
+        with pytest.raises(receipt.ReceiptError, match="expected_round"):
+            _verify(signed, keys, expected_round=bad)
+
+
+def test_a_validator_can_recompute_the_sampled_lanes(prober):
+    # A small real run standing in for a probe: the receipt's samples recompute.
+    key, keys = prober
+    spec = ch.spec_for(SEED, vcpus=2, memory_gib=4)
+    small = ch.ChallengeSpec(spec.seed, spec.lanes, 64, 128)
+    outputs = ch.run(small, workers=1)
+    digest = ch.result_digest(small, outputs)
+    assert all(
+        ch.lane_output(small, lane) == outputs[lane]
+        for lane in ch.sample_lanes(small, digest, NONCE_A, ch.required_samples(small.lanes))
+    )
+
+
+def test_receipts_for_someone_else_or_another_round_are_refused(prober):
+    key, keys = prober
+    signed = receipt.sign_receipt(_body(), key)
+    for changes, message in (
+        ({"validator_nonce": "cd" * 32}, "another validator"),
+        ({"netuid": OTHER_NETUID}, "another netuid"),
+        ({"expected_round": 8}, "another round"),
+        ({"now": NOW + timedelta(hours=1)}, "not currently valid"),
+        ({"now": NOW - timedelta(hours=1)}, "not currently valid"),
+        ({"prober_keys": {"other": key.public_key()}}, "unknown prober key"),
+        (
+            {"prober_keys": {"sn94-prober-1": Ed25519PrivateKey.generate().public_key()}},
+            "does not verify",
+        ),
+    ):
+        with pytest.raises(receipt.ReceiptError, match=message):
+            _verify(signed, keys, **changes)
+
+
+def test_a_tampered_receipt_is_refused(prober):
+    key, keys = prober
+    signed = receipt.sign_receipt(_body(), key)
+    tampered = json.loads(json.dumps(signed))
+    tampered["box"]["miner_hotkey"] = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+    with pytest.raises(receipt.ReceiptError, match="does not verify"):
+        _verify(tampered, keys)
+    unsigned = {k: v for k, v in signed.items() if k != "signature"}
+    with pytest.raises(receipt.ReceiptError, match="not a signed object"):
+        _verify(unsigned, keys)
+
+
+def test_capacity_must_be_exactly_what_the_challenge_proved(prober):
+    key, _keys = prober
+    # A receipt paying for a million vCPUs over a tiny challenge is refused.
+    with pytest.raises(receipt.ReceiptError, match="does not prove the capacity"):
+        receipt.sign_receipt(_body(vcpus=6, memory_gib=24, challenge=SMALL), key)
+    body = _body()
+    body["capacity"]["memory_gib"] = 48
+    with pytest.raises(receipt.ReceiptError, match="does not prove the capacity"):
+        receipt.sign_receipt(body, key)
+    with pytest.raises(receipt.ReceiptError, match="more than 1024"):
+        spec = ch.spec_for(SEED, vcpus=1024, memory_gib=1024)
+        body = _body(vcpus=1024, memory_gib=1024, challenge=spec)
+        body["capacity"]["vcpus"] = 2048
+        receipt.sign_receipt(body, key)
+
+
+def test_samples_must_be_exactly_the_lanes_the_nonce_picks(prober):
+    key, _keys = prober
+    body = _body()
+    lanes = sorted(int(lane) for lane in body["challenge"]["sampled_outputs"])
+    other = next(lane for lane in range(6) if lane not in lanes)
+    moved = dict(body["challenge"]["sampled_outputs"])
+    moved.pop(str(lanes[0]))
+    moved[str(other)] = "00" * 32
+    body["challenge"]["sampled_outputs"] = moved
+    with pytest.raises(receipt.ReceiptError, match="exactly the lanes"):
+        receipt.sign_receipt(body, key)
+    body["challenge"]["sampled_outputs"] = {}
+    with pytest.raises(receipt.ReceiptError, match="exactly the lanes"):
+        receipt.sign_receipt(body, key)
+
+
+@pytest.mark.parametrize("alias", ["03", "٣", "²", "-1", " 3"])
+def test_lane_keys_are_plain_decimal(prober, alias):
+    key, _keys = prober
+    body = _body()
+    sampled = dict(body["challenge"]["sampled_outputs"])
+    sampled[alias] = "00" * 32
+    body["challenge"]["sampled_outputs"] = sampled
+    with pytest.raises(receipt.ReceiptError):
+        receipt.sign_receipt(body, key)
+
+
+def test_a_late_answer_is_refused(prober):
+    key, _keys = prober
+    with pytest.raises(receipt.ReceiptError, match="after its deadline"):
+        receipt.sign_receipt(
+            _body(deadline_ms=30_000, timings_ms={"create": 1, "exec": 30_001, "delete": 1}),
+            key,
+        )
+
+
+def test_a_loose_deadline_is_refused(prober):
+    key, keys = prober
+    spec = ch.spec_for(SEED, vcpus=6, memory_gib=24)
+    top = ch.max_deadline_ms(spec)
+    assert _verify(receipt.sign_receipt(_body(deadline_ms=top), key), keys).deadline_ms == top
+    for loose in (top + 1, 10**15):
+        with pytest.raises(receipt.ReceiptError, match="looser than"):
+            receipt.sign_receipt(
+                _body(deadline_ms=loose, timings_ms={"create": 1, "exec": 10**14, "delete": 1}),
+                key,
+            )
+
+
+def _sign_unchecked(body, key):
+    # A signed receipt the prober's own checks would have refused: what a
+    # buggy or compromised prober could serve, which verify_receipt must catch.
+    return {**body, "signature": base64.b64encode(key.sign(receipt.canonical_bytes(body))).decode()}
+
+
+def test_the_reviewers_inflated_receipt_is_refused(prober):
+    key, keys = prober
+    # Round 2: 1024 vCPUs over 16 GiB, exec 95 000 ms under a 124 194 ms cap.
+    blocks = 16 * (1 << 30) * 4 // (5 * 1024) // ch.BLOCK_BYTES
+    old = ch.ChallengeSpec(SEED, 1024, blocks, 2 * blocks)
+    timings = {"create": 900, "exec": 95_000, "delete": 300}
+    body = _body(vcpus=1024, memory_gib=16, challenge=old, deadline_ms=124_194, timings_ms=timings)
+    with pytest.raises(receipt.ReceiptError, match="512 MiB of lane"):
+        _verify(_sign_unchecked(body, key), keys)
+    # Re-review: 4 cores, all 20 lanes of 20 vCPU / 13 GiB in 77.2 s under the old
+    # 79 794 ms cap. Signed with the old cap, or with the new one, it is refused.
+    timings = {"create": 900, "exec": 77_200, "delete": 300}
+    for deadline_ms, message in ((79_794, "looser than 39897"), (39_897, "after its deadline")):
+        body = _body(vcpus=20, memory_gib=13, deadline_ms=deadline_ms, timings_ms=timings)
+        with pytest.raises(receipt.ReceiptError, match=message):
+            _verify(_sign_unchecked(body, key), keys)
+        with pytest.raises(receipt.ReceiptError, match=message):
+            receipt.sign_receipt(body, key)
+    # Honest 8 vCPUs over 16 GiB: about 43 s with 4 KiB pages against a 112 375 ms bound.
+    timings = {"create": 900, "exec": 43_000, "delete": 300}
+    honest = _body(vcpus=8, memory_gib=16, deadline_ms=112_375, timings_ms=timings)
+    assert _verify(_sign_unchecked(honest, key), keys).vcpus == 8
+
+
+@pytest.mark.parametrize("vcpus, memory_gib", [(6, 24), (20, 13), (8, 16), (8, 5)])
+def test_verify_receipt_refuses_an_exec_over_the_bound(prober, vcpus, memory_gib):
+    # The bound as verify_receipt applies it (receipt.py), one millisecond either side.
+    key, keys = prober
+    top = ch.max_deadline_ms(ch.spec_for(SEED, vcpus=vcpus, memory_gib=memory_gib))
+
+    def signed(deadline_ms, exec_ms):
+        timings = {"create": 900, "exec": exec_ms, "delete": 300}
+        body = _body(
+            vcpus=vcpus, memory_gib=memory_gib, deadline_ms=deadline_ms, timings_ms=timings
+        )
+        return _sign_unchecked(body, key)
+
+    assert _verify(signed(top, top), keys).deadline_ms == top  # just fits
+    with pytest.raises(receipt.ReceiptError, match="after its deadline"):
+        _verify(signed(top, top + 1), keys)
+    with pytest.raises(receipt.ReceiptError, match="looser than"):
+        _verify(signed(top + 1, top), keys)
+
+
+def test_the_sample_count_is_bound_to_the_lane_count(prober):
+    key, keys = prober
+    everything = receipt.sign_receipt(_body(sample_count=6), key)
+    assert sorted(_verify(everything, keys).sampled_outputs) == list(range(6))
+    for bad in (3, 7):  # below required_samples(6) == 4, or above the lanes
+        with pytest.raises(receipt.ReceiptError, match="sample_count must be from 4 to 6"):
+            receipt.sign_receipt(_body(sample_count=bad), key)
+    for bad in (0, True, 4.0, "4"):
+        body = _body()
+        body["challenge"]["sample_count"] = bad
+        with pytest.raises(receipt.ReceiptError, match="sample_count"):
+            receipt.sign_receipt(body, key)
+    # A count the outputs do not match: 5 lanes' outputs, but a count of 4.
+    body = _body(sample_count=5)
+    body["challenge"]["sample_count"] = 4
+    with pytest.raises(receipt.ReceiptError, match="exactly the lanes"):
+        receipt.sign_receipt(body, key)
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("issued_at", "2026-02-30T00:00:00Z"),
+        ("issued_at", "2026-09-28T24:00:00Z"),
+        ("expires_at", "2026-13-01T00:00:00Z"),
+        ("expires_at", "0000-01-01T00:00:00Z"),
+    ],
+)
+def test_an_impossible_date_is_a_receipt_error_before_the_signature(prober, field, value):
+    key, keys = prober
+    body = _body()
+    body[field] = value
+    with pytest.raises(receipt.ReceiptError, match="not a real date"):
+        receipt.sign_receipt(body, key)
+    with pytest.raises(receipt.ReceiptError, match="not a real date"):
+        _verify({**body, "signature": "AAAA"}, keys)
+
+
+def test_extreme_dates_do_not_overflow(prober):
+    key, keys = prober
+    body = _body()
+    body["issued_at"], body["expires_at"] = "9999-12-31T23:00:00Z", "9999-12-31T23:30:00Z"
+    signed = receipt.sign_receipt(body, key)
+    with pytest.raises(receipt.ReceiptError, match="not currently valid"):
+        _verify(signed, keys)
+    body["issued_at"], body["expires_at"] = "0001-01-01T00:00:00Z", "0001-01-01T00:30:00Z"
+    body["evidence"]["attested_at"] = "0001-01-01T00:00:00Z"
+    with pytest.raises(receipt.ReceiptError, match="not currently valid"):
+        _verify(receipt.sign_receipt(body, key), keys)
+    # The evidence age bound, from the earliest attested_at to a late now.
+    signed = receipt.sign_receipt({**body, "expires_at": "0001-01-01T02:00:00Z"}, key)
+    late = datetime(1, 1, 1, 1, tzinfo=timezone.utc)
+    assert _verify(signed, keys, now=late, max_evidence_age=timedelta(hours=1)).kind == "tee"
+    with pytest.raises(receipt.ReceiptError, match="older than max_evidence_age"):
+        _verify(signed, keys, now=late, max_evidence_age=timedelta(minutes=59))
+
+
+def test_a_naive_now_is_refused(prober):
+    key, keys = prober
+    signed = receipt.sign_receipt(_body(), key)
+    for bad in (NOW.replace(tzinfo=None), NOW.timestamp(), None):
+        with pytest.raises(receipt.ReceiptError, match="timezone-aware"):
+            _verify(signed, keys, now=bad)
+
+
+def test_the_prober_never_signs_twice(prober):
+    key, _keys = prober
+    signed = receipt.sign_receipt(_body(), key)
+    with pytest.raises(receipt.ReceiptError, match="already carries a signature"):
+        receipt.sign_receipt(signed, key)
+
+
+@pytest.mark.parametrize(
+    "path, value, message",
+    [
+        (("schema",), "cathedral_capacity_receipt_v0", "wrong fields or schema"),
+        (("netuid",), "1", "netuid"),
+        (("netuid",), -1, "netuid"),
+        (("netuid",), True, "netuid"),
+        (("round",), -1, "round"),
+        (("prober_key_id",), "bad key id", "prober_key_id"),
+        (("prober_key_id",), 7, "prober_key_id"),
+        (("challenge", "sampled_outputs"), [], "sampled_outputs must be an object"),
+        (("capacity", "memory_gib"), 0, "^memory_gib must be an integer"),
+        (("capacity", "memory_gib"), 24.0, "^memory_gib must be an integer"),
+        (("capacity", "vcpus"), 0, "^vcpus must be an integer"),
+        (("timings_ms", "create"), -1, "timings_ms.create"),
+        (("timings_ms", "delete"), 1.5, "timings_ms.delete"),
+        (("timings_ms", "exec"), -1, "timings_ms.exec"),
+        (("timings_ms", "exec"), True, "timings_ms.exec"),
+        (("box", "tee_kind"), None, "tee_kind"),
+        (("box", "tee_kind"), ["tdx"], "tee_kind"),
+        (("box", "kind"), "bare_metal", "tee_kind"),
+        (("box", "hardware_id_kind"), "chip_id", "hardware_id_kind"),
+    ],
+)
+def test_each_field_check_refuses_its_bad_input(prober, path, value, message):
+    key, _keys = prober
+    body = _body()
+    target = body
+    for name in path[:-1]:
+        target = target[name]
+    target[path[-1]] = value
+    with pytest.raises(receipt.ReceiptError, match=message):
+        receipt.sign_receipt(body, key)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"tee_kind": None},  # a tee box names its tee kind
+        {"tee_kind": "sgx"},
+        {"kind": "bare_metal", "tee_kind": "tdx"},  # and bare metal has none
+        {"hardware_id": "short"},
+        {"miner_hotkey": "not-an-address"},
+        {"box_id": "bad box id"},
+        {"validator_nonce": "short"},
+        {"valid_for": timedelta(hours=3)},
+        {"valid_for": timedelta(0)},
+        {"timings_ms": {"create": 1}},
+        {"deadline_ms": 0},
+    ],
+)
+def test_the_prober_never_signs_a_malformed_body(prober, changes):
+    key, _keys = prober
+    with pytest.raises(receipt.ReceiptError):
+        receipt.sign_receipt(_body(**changes), key)
+
+
+@pytest.mark.parametrize(
+    "tee_kind, hardware_id_kind", [("tdx", "tdx_platform"), ("sev_snp", "chip_id")]
+)
+def test_a_tee_receipt_carries_its_one_hardware_identity(prober, tee_kind, hardware_id_kind):
+    key, keys = prober
+    signed = receipt.sign_receipt(_body(tee_kind=tee_kind), key)
+    verified = _verify(signed, keys)
+    assert verified.evidence == receipt.ReceiptEvidence(**EVIDENCE_FOR[tee_kind])
+    assert (verified.tee_kind, verified.hardware_id, verified.hardware_id_kind) == (
+        tee_kind,
+        "aa" * 32,
+        hardware_id_kind,
+    )
+    # The other TEE's id kind is refused: one machine, one hardware id.
+    other = "chip_id" if hardware_id_kind == "tdx_platform" else "tdx_platform"
+    body = _body(tee_kind=tee_kind)
+    body["box"]["hardware_id_kind"] = other
+    with pytest.raises(receipt.ReceiptError, match="hardware_id_kind"):
+        receipt.sign_receipt(body, key)
+
+
+def test_evidence_is_required_for_a_tee_box_and_null_for_bare_metal(prober):
+    key, keys = prober
+    for tee_kind in ("tdx", "sev_snp"):
+        with pytest.raises(receipt.ReceiptError, match="evidence must have exactly"):
+            receipt.sign_receipt(_body(tee_kind=tee_kind, evidence=None), key)
+    body = _body(kind="bare_metal")
+    assert body["evidence"] is None and '"evidence":null' in receipt.canonical_bytes(body).decode()
+    verified = _verify(receipt.sign_receipt(body, key, allow_bare_metal=True), keys)
+    assert (verified.kind, verified.evidence) == ("bare_metal", None)
+    with pytest.raises(receipt.ReceiptError, match="carries no evidence"):
+        receipt.sign_receipt(_body(kind="bare_metal", evidence=TDX_EVIDENCE), key)
+    # The prober states the evidence, even when it is None: there is no default.
+    parameter = inspect.signature(receipt.make_body).parameters["evidence"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
+
+
+@pytest.mark.parametrize("tee_kind, other", [("tdx", "sev_snp"), ("sev_snp", "tdx")])
+def test_evidence_kind_must_be_the_boxs_tee_kind(prober, tee_kind, other):
+    key, _keys = prober
+    # The other TEE's whole evidence, and just its kind, are both refused.
+    for evidence in (EVIDENCE_FOR[other], {**EVIDENCE_FOR[tee_kind], "evidence_kind": other}):
+        with pytest.raises(receipt.ReceiptError, match="evidence_kind must equal"):
+            receipt.sign_receipt(_body(tee_kind=tee_kind, evidence=evidence), key)
+
+
+GOOD_HEX = "0123456789abcdef" * 4
+BAD_HEX64 = ["ab" * 31, "ab" * 33, "AB" * 32, "g" + "a" * 63, "sha256:" + "ab" * 32, "", 7, None]
+
+
+@pytest.mark.parametrize(
+    "tee_kind, field, value, ok",
+    [
+        *[(t, "evidence_sha256", GOOD_HEX, True) for t in ("tdx", "sev_snp")],
+        *[("tdx", "evidence_sha256", bad, False) for bad in BAD_HEX64],
+        *[(t, "tls_spki_sha256", GOOD_HEX, True) for t in ("tdx", "sev_snp")],
+        *[("sev_snp", "tls_spki_sha256", bad, False) for bad in BAD_HEX64],
+        ("tdx", "verifier_digest", "sha256:" + GOOD_HEX, True),
+        ("tdx", "verifier_digest", GOOD_HEX, False),  # one form: the prefix is required
+        ("tdx", "verifier_digest", "SHA256:" + GOOD_HEX, False),
+        ("tdx", "verifier_digest", "sha384:" + GOOD_HEX, False),
+        ("sev_snp", "verifier_digest", "sha256:" + GOOD_HEX[:-1], False),
+        ("sev_snp", "verifier_digest", "sha256:" + GOOD_HEX.upper(), False),
+        ("tdx", "measurement", "tdx-measurement-sha256:" + GOOD_HEX, True),
+        ("tdx", "measurement", GOOD_HEX, False),
+        ("tdx", "measurement", "tdx-measurement-sha256:" + GOOD_HEX + "00", False),
+        ("tdx", "measurement", "tdx-measurement-sha256:" + GOOD_HEX.upper(), False),
+        ("tdx", "measurement", "tdx-measurement-sha256:" + "00" * 32, False),
+        ("tdx", "measurement", "ab" * 48, False),  # an SNP measurement on a TDX box
+        ("sev_snp", "measurement", "ab" * 48, True),
+        ("sev_snp", "measurement", "00" * 48, False),  # as cathedral/verify/snp.py refuses
+        ("sev_snp", "measurement", "ab" * 47, False),
+        ("sev_snp", "measurement", "ab" * 49, False),
+        ("sev_snp", "measurement", "AB" * 48, False),
+        ("sev_snp", "measurement", "tdx-measurement-sha256:" + GOOD_HEX, False),
+        *[(t, "attestation_nonce", GOOD_HEX, True) for t in ("tdx", "sev_snp")],
+        *[("tdx", "attestation_nonce", bad, False) for bad in BAD_HEX64],
+        ("sev_snp", "attestation_nonce", "00" * 32, False),  # as admission refuses
+        ("tdx", "attested_at", "2026-09-28T12:00:00Z", True),  # the same second as issued_at
+        ("sev_snp", "attested_at", "2025-01-01T00:00:00Z", True),
+        ("tdx", "attested_at", "2026-09-28T12:00:01Z", False),  # after the receipt was issued
+        ("tdx", "attested_at", "2026-02-30T00:00:00Z", False),
+        ("tdx", "attested_at", "2026-09-28 11:00:00Z", False),
+        ("tdx", "attested_at", "2026-09-28T11:00:00+00:00", False),
+        ("sev_snp", "attested_at", 1790000000, False),
+        ("sev_snp", "attested_at", None, False),
+    ],
+)
+def test_each_evidence_field_has_one_format(prober, tee_kind, field, value, ok):
+    key, keys = prober
+    body = _body(tee_kind=tee_kind, evidence={**EVIDENCE_FOR[tee_kind], field: value})
+    if ok:
+        assert getattr(_verify(receipt.sign_receipt(body, key), keys).evidence, field) == value
+        return
+    with pytest.raises(receipt.ReceiptError, match=field):
+        receipt.sign_receipt(body, key)
+    with pytest.raises(receipt.ReceiptError, match=field):  # before the signature is looked at
+        _verify({**body, "signature": "AAAA"}, keys)
+
+
+FUZZ = [None, True, 0, 1.5, [], ["tdx"], "tdx", "x" * 100_000, "\ud800", b"tdx", {}]
+
+
+@pytest.mark.parametrize("value", FUZZ, ids=repr)
+def test_malformed_evidence_is_always_a_receipt_error(prober, value):
+    key, keys = prober
+    # as the whole object, as each field, and as an extra or renamed key
+    bodies = [_body(evidence=value)]
+    for field in (name for name in TDX_EVIDENCE if TDX_EVIDENCE[name] != value):
+        bodies.append(_body(evidence={**TDX_EVIDENCE, field: value}))
+    bodies.append(_body(evidence={**TDX_EVIDENCE, "extra": value}))
+    missing = dict(TDX_EVIDENCE)
+    del missing["measurement"]
+    bodies.append(_body(evidence=missing))
+    if isinstance(value, str):
+        bodies.append(_body(evidence={**missing, value: TDX_EVIDENCE["measurement"]}))
+    for body in bodies:
+        with pytest.raises(receipt.ReceiptError):
+            receipt.sign_receipt(body, key)
+        with pytest.raises(receipt.ReceiptError):
+            _verify({**body, "signature": "AAAA"}, keys)
+    bare = _body(kind="bare_metal", evidence=value)
+    if value is not None:
+        with pytest.raises(receipt.ReceiptError, match="carries no evidence"):
+            receipt.sign_receipt(bare, key, allow_bare_metal=True)
+
+
+def test_the_prober_signs_bare_metal_only_when_allowed(prober):
+    key, keys = prober
+    body = _body(kind="bare_metal")
+    for refused in (
+        {},
+        {"allow_bare_metal": False},
+        {"allow_bare_metal": 1},
+        {"allow_bare_metal": "yes"},
+    ):
+        with pytest.raises(receipt.ReceiptError, match="refusing to sign a bare-metal receipt"):
+            receipt.sign_receipt(body, key, **refused)
+    signed = receipt.sign_receipt(body, key, allow_bare_metal=True)
+    # A correctly signed bare-metal receipt verifies: admission is the validator's own policy.
+    assert _verify(signed, keys).hardware_id_kind == "probe_fingerprint"
+    # The flag changes nothing for a TEE box.
+    assert _verify(receipt.sign_receipt(_body(), key), keys).kind == "tee"
+    with pytest.raises(TypeError):  # keyword-only
+        receipt.sign_receipt(body, key, True)
+    for junk in (None, [], "body"):
+        with pytest.raises(receipt.ReceiptError, match="body must be an object"):
+            receipt.sign_receipt(junk, key)
+
+
+@pytest.mark.parametrize("field", sorted(TDX_EVIDENCE.keys() - {"evidence_kind"}))
+def test_a_tampered_evidence_field_fails_the_signature(prober, field):
+    key, keys = prober
+    signed = json.loads(json.dumps(receipt.sign_receipt(_body(), key)))
+    value = signed["evidence"][field]
+    if field == "attested_at":  # one second earlier: still well formed
+        signed["evidence"][field] = value[:-2] + ("0" if value[-2] != "0" else "1") + "Z"
+    else:
+        signed["evidence"][field] = value[:-1] + ("0" if value[-1] != "0" else "1")
+    with pytest.raises(receipt.ReceiptError, match="does not verify"):
+        _verify(signed, keys)
+
+
+def test_verify_receipt_can_bound_the_evidence_age(prober):
+    # The evidence (an hour old at NOW) is reused across rounds; a validator
+    # bounds its age with max_evidence_age, measured from now.
+    key, keys = prober
+    signed = receipt.sign_receipt(_body(), key)
+    now = NOW + timedelta(minutes=1)  # the evidence is 61 minutes old
+    assert _verify(signed, keys).evidence.attested_at == "2026-09-28T11:00:00Z"  # no limit
+    assert _verify(signed, keys, max_evidence_age=timedelta(minutes=61)).kind == "tee"
+    with pytest.raises(receipt.ReceiptError, match="older than max_evidence_age"):
+        _verify(signed, keys, max_evidence_age=timedelta(minutes=61) - timedelta(seconds=1))
+    assert now - datetime(2026, 9, 28, 11, tzinfo=timezone.utc) == timedelta(minutes=61)
+    for bad in (timedelta(0), timedelta(seconds=-1), 3600, "1h", True):
+        with pytest.raises(receipt.ReceiptError, match="must be a positive timedelta"):
+            _verify(signed, keys, max_evidence_age=bad)
+    # Bare metal has no evidence, so the bound does not apply to it.
+    bare = receipt.sign_receipt(_body(kind="bare_metal"), key, allow_bare_metal=True)
+    assert _verify(bare, keys, max_evidence_age=timedelta(seconds=1)).evidence is None
+
+
+def test_the_evidence_report_data_is_auditable_from_the_receipt(prober):
+    # REPORT_DATA is report_data_v2(nonce, hotkey, tls_spki_sha256): with the
+    # nonce in the receipt, an auditor holding the archived quote can check
+    # that it was made for this hotkey, this TLS key and the prober's nonce.
+    from cathedral.common import ChannelBinding, ChannelBindingType, report_data_v2
+
+    key, keys = prober
+    verified = _verify(receipt.sign_receipt(_body(), key), keys)
+    expected = report_data_v2(
+        bytes.fromhex("a7" * 32),
+        HOTKEY,
+        ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, bytes.fromhex("5b" * 32)),
+    )
+    assert receipt.expected_report_data(verified) == expected
+    assert len(expected) == 64
+    # Another nonce or another TLS key gives other REPORT_DATA, so a quote made
+    # for either does not audit against this receipt.
+    for change in ({"attestation_nonce": "a8" * 32}, {"tls_spki_sha256": "5c" * 32}):
+        other = _verify(receipt.sign_receipt(_body(evidence={**TDX_EVIDENCE, **change}), key), keys)
+        assert receipt.expected_report_data(other) != expected
+    other_hotkey = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+    other = _verify(receipt.sign_receipt(_body(miner_hotkey=other_hotkey), key), keys)
+    assert receipt.expected_report_data(other) != expected
+    bare = _verify(receipt.sign_receipt(_body(kind="bare_metal"), key, allow_bare_metal=True), keys)
+    for junk in (bare, None, TDX_EVIDENCE):
+        with pytest.raises(receipt.ReceiptError, match="only a verified TEE receipt"):
+            receipt.expected_report_data(junk)
+
+
+def test_a_v1_receipt_is_refused(prober):
+    key, keys = prober
+    assert receipt.SCHEMA == "cathedral_capacity_receipt_v2"
+    # A v1 body (no evidence), correctly signed by a pinned key, is still refused.
+    v1 = {k: v for k, v in _body(kind="bare_metal").items() if k != "evidence"}
+    v1["schema"] = "cathedral_capacity_receipt_v1"
+    signed = {**v1, "signature": base64.b64encode(key.sign(receipt.canonical_bytes(v1))).decode()}
+    with pytest.raises(receipt.ReceiptError, match="wrong fields or schema"):
+        _verify(signed, keys)
+    # And so is the v1 schema name on a v2 body.
+    body = _body()
+    body["schema"] = "cathedral_capacity_receipt_v1"
+    with pytest.raises(receipt.ReceiptError, match="wrong fields or schema"):
+        receipt.sign_receipt(body, key)
+
+
+def test_hardware_ids_are_derived_one_way_per_kind():
+    platform = bytes(range(1, 33))
+    assert receipt.derive_hardware_id("tdx_platform", platform) == receipt.derive_hardware_id(
+        "tdx_platform", platform
+    )
+    assert receipt.derive_hardware_id("tdx_platform", platform) != receipt.derive_hardware_id(
+        "chip_id", platform * 2
+    )
+    for kind, raw in (
+        ("tdx_platform", bytes(range(1, 17))),  # a raw 16-byte PPID is not the input
+        ("tdx_platform", bytes(32)),  # all zeros
+        ("ppid", bytes(range(1, 17))),  # the old kind name is gone
+        ("chip_id", bytes(64)),  # all zeros: SEV-SNP's MASK_CHIP_ID
+        ("chip_id", platform),
+        ("probe_fingerprint", b"x" * 17),
+        ("serial", platform),
+    ):
+        with pytest.raises(receipt.ReceiptError):
+            receipt.derive_hardware_id(kind, raw)
+
+
+def _stable_platform_id(ppid_hex: str) -> str:
+    # cmd/cathedral-tdx-verifier/main.go stablePlatformID
+    digest = hashlib.sha256(b"cathedral-tdx-platform-v1\x00" + ppid_hex.encode()).hexdigest()
+    return "tdx-platform-sha256:" + digest
+
+
+def test_a_tdx_hardware_id_comes_from_the_verifiers_stable_platform_id():
+    stable = _stable_platform_id("0123456789abcdef0123456789abcdef")
+    hardware_id = receipt.tdx_hardware_id(stable)
+    assert hardware_id == receipt.derive_hardware_id(
+        "tdx_platform", bytes.fromhex(stable.removeprefix("tdx-platform-sha256:"))
+    )
+    # Another platform's stable_platform_id names another machine.
+    assert hardware_id != receipt.tdx_hardware_id(
+        _stable_platform_id("0123456789abcdef0123456789abcdee")
+    )
+    # The tdx_platform kind keeps it apart from a chip id over the same bytes.
+    assert hardware_id != receipt.derive_hardware_id("chip_id", bytes.fromhex(stable[-64:]) * 2)
+    digest = stable.removeprefix("tdx-platform-sha256:")
+    for bad in (
+        digest,  # no prefix
+        "tdx-platform-sha256:" + digest.upper(),
+        "tdx-platform-sha256:" + digest[:-2],
+        "tdx-platform-sha256:" + digest + "00",
+        "tdx-pck-cert-sha256:" + digest,
+        "tdx-platform-sha256:" + "0" * 64,  # all zeros
+        " " + stable,
+        stable + "\n",
+        bytes.fromhex(digest),
+        None,
+    ):
+        with pytest.raises(receipt.ReceiptError):
+            receipt.tdx_hardware_id(bad)
+
+
+def test_a_probe_fingerprint_names_the_address_the_prober_reached_not_the_port():
+    v4 = receipt.probe_fingerprint("203.0.113.5")
+    assert re.fullmatch(r"[0-9a-f]{64}", v4)
+    assert v4 == receipt.probe_fingerprint("::ffff:203.0.113.5")
+    assert v4 != receipt.probe_fingerprint("203.0.113.6")
+    # One IPv6 /64 is one id, whatever the interface id; another /64 is another.
+    v6 = receipt.probe_fingerprint("2001:db8:1:2::1")
+    assert v6 == receipt.probe_fingerprint("2001:0db8:0001:0002:ffff:ffff:ffff:ffff")
+    assert v6 != receipt.probe_fingerprint("2001:db8:1:3::1")
+    assert v6 != v4
+    # The family is part of the id: an IPv4 address never collides with a /64
+    # holding the same bytes, and ::/64 (all zeros) is still an id.
+    assert receipt.probe_fingerprint("203.0.113.5") != receipt.probe_fingerprint("cb00:7105::")
+    assert re.fullmatch(r"[0-9a-f]{64}", receipt.probe_fingerprint("::1"))
+    for bad in ("box.example", "203.0.113.5:8000", "", 3405803781, None, b"\xcb\x00qu"):
+        with pytest.raises(receipt.ReceiptError, match="probe address"):
+            receipt.probe_fingerprint(bad)
+
+
+def test_one_host_on_many_ports_is_one_bare_metal_box():
+    # Round 2: probe_fingerprint("203.0.113.5", 8000) != (..., 8001) gave one host
+    # N ids. The port is no longer an input, so N registrations collapse.
+    with pytest.raises(TypeError):
+        receipt.probe_fingerprint("203.0.113.5", 8000)
+    ids = {receipt.probe_fingerprint(address) for address in ("203.0.113.5",) * 8}
+    ids |= {receipt.probe_fingerprint(f"2001:db8:1:2::{n:x}") for n in range(1, 9)}
+    assert len(ids) == 2
+
+
+def test_hardware_ids_match_the_known_answers():
+    # Fixed vectors: the prober, the validator-side inventory and any native
+    # port must derive these bytes exactly, so a change to the padding, the
+    # family tag, the /64 cut or the domain shows up here, not only as ids that
+    # still agree with each other.
+    assert receipt.probe_fingerprint("203.0.113.5") == (
+        "f8e8cfdfcc7a80073883ce2ad4bb00bbcaa3724911c618459ec0355d7c596356"
+    )
+    assert receipt.probe_fingerprint("2001:db8:1:2::1") == (
+        "7c8ed29056ca4f59ee68662fa1c6f64685064c8cce7d5023dbf88f500961c5f2"
+    )
+    stable = _stable_platform_id("0123456789abcdef0123456789abcdef")
+    assert stable == (
+        "tdx-platform-sha256:1bfd8131b4b52971d146d568b956f4528b9dd299351f72671b246c2445e6c05c"
+    )
+    assert receipt.tdx_hardware_id(stable) == (
+        "3452cf9d0d342e3f9352d44824cdd57fd282ea0796b468d12f47dd74d4e28f58"
+    )
+    assert receipt.derive_hardware_id("chip_id", bytes(range(1, 65))) == (
+        "dddae87349494831c2da7fb46f557eae10d414efa70460f7289f64a745f20834"
+    )
+
+
+# -- pricing -----------------------------------------------------------------------
+
+
+def _table(**changes):
+    table = {
+        "schema": pricing.SCHEMA,
+        "currency": "usd",
+        "rates": {
+            "tee": {"vcpu_hour": 30_000, "gib_hour": 4_000},
+            "bare_metal": {"vcpu_hour": 18_000, "gib_hour": 2_500},
+        },
+        "consumer_profiles": {
+            "sn120": {"min_vcpus": 2, "min_memory_gib": 4},
+            "sn81": {"min_vcpus": 8, "min_memory_gib": 32},
+        },
+        "effective_from": "2026-09-28T00:00:00Z",
+        "key_id": "sn94-owner-1",
+        "sequence": 3,
+    }
+    table.update(changes)
+    return table
+
+
+@pytest.fixture
+def owner():
+    key = Ed25519PrivateKey.generate()
+    return key, {"sn94-owner-1": key.public_key()}
+
+
+def _load(signed, keys, **changes):
+    args = dict(owner_keys=keys, now=NOW, minimum_sequence=3, pinned_digest=None)
+    args.update(changes)
+    return pricing.load_price_table(signed, **args)
+
+
+def test_value_follows_the_market_rates_for_each_kind(owner):
+    key, keys = owner
+    table = _load(pricing.sign_price_table(_table(), key), keys)
+    assert table.sequence == 3
+    bare = table.value(kind="bare_metal", vcpus=8, memory_gib=32)
+    tee = table.value(kind="tee", vcpus=8, memory_gib=32)
+    assert bare == 8 * 18_000 + 32 * 2_500
+    assert tee == 8 * 30_000 + 32 * 4_000
+    assert tee > bare
+
+
+def test_a_box_below_every_consumer_profile_earns_zero(owner):
+    key, keys = owner
+    table = _load(pricing.sign_price_table(_table(), key), keys)
+    assert table.value(kind="tee", vcpus=1, memory_gib=64) == 0
+    assert table.value(kind="tee", vcpus=16, memory_gib=2) == 0
+    assert table.value(kind="bare_metal", vcpus=2, memory_gib=4) == 2 * 18_000 + 4 * 2_500
+
+
+def test_a_table_must_be_signed_pinned_effective_and_not_rolled_back(owner):
+    key, keys = owner
+    signed = pricing.sign_price_table(_table(), key)
+    with pytest.raises(pricing.PriceTableError, match="unknown key"):
+        _load(signed, {"other": key.public_key()})
+    forged = {
+        **signed,
+        "rates": {**signed["rates"], "bare_metal": {"vcpu_hour": 10**9, "gib_hour": 0}},
+    }
+    with pytest.raises(pricing.PriceTableError, match="does not verify"):
+        _load(forged, keys)
+    future = pricing.sign_price_table(_table(effective_from="2027-01-01T00:00:00Z"), key)
+    with pytest.raises(pricing.PriceTableError, match="not effective"):
+        _load(future, keys)
+    with pytest.raises(pricing.PriceTableError, match="older than"):
+        _load(signed, keys, minimum_sequence=4)
+    assert _load(json.dumps(signed), keys, minimum_sequence=3).currency == "usd"
+
+
+def test_load_price_table_requires_the_minimum_sequence(owner):
+    key, keys = owner
+    signed = pricing.sign_price_table(_table(), key)
+    with pytest.raises(TypeError):
+        pricing.load_price_table(signed, owner_keys=keys, now=NOW, pinned_digest=None)
+    for bad in (None, 0, True, "3"):
+        with pytest.raises(pricing.PriceTableError, match="minimum_sequence"):
+            _load(signed, keys, minimum_sequence=bad)
+
+
+def test_a_different_table_at_the_pinned_sequence_is_refused(owner):
+    key, keys = owner
+    pinned = pricing.sign_price_table(_table(), key)
+    digest = _load(pinned, keys).digest
+    assert digest == pricing.table_digest(pinned) == pricing.table_digest(_table())
+    assert _load(pinned, keys, pinned_digest=digest).sequence == 3
+    rates = {
+        "tee": {"vcpu_hour": 30_000, "gib_hour": 4_000},
+        "bare_metal": {"vcpu_hour": 90_000, "gib_hour": 2_500},
+    }
+    swapped = pricing.sign_price_table(_table(rates=rates), key)
+    # an explicit None (the very first load) pins only the sequence
+    assert _load(swapped, keys, pinned_digest=None).sequence == 3
+    with pytest.raises(pricing.PriceTableError, match="differs from the one pinned"):
+        _load(swapped, keys, pinned_digest=digest)
+    newer = pricing.sign_price_table(_table(rates=rates, sequence=4), key)
+    assert _load(newer, keys, pinned_digest=digest).sequence == 4  # a newer table moves on
+    for bad in ("AB" * 32, "ab", 7):
+        with pytest.raises(pricing.PriceTableError, match="pinned_digest"):
+            _load(pinned, keys, pinned_digest=bad)
+
+
+def test_load_price_table_requires_the_pinned_digest(owner):
+    # Round 2: a default of None made the same-sequence check opt-in. The caller
+    # must now say which table it pinned, or None on the very first load.
+    key, keys = owner
+    signed = pricing.sign_price_table(_table(), key)
+    with pytest.raises(TypeError, match="pinned_digest"):
+        pricing.load_price_table(signed, owner_keys=keys, now=NOW, minimum_sequence=3)
+    first = pricing.load_price_table(
+        signed, owner_keys=keys, now=NOW, minimum_sequence=1, pinned_digest=None
+    )
+    assert first.digest == pricing.table_digest(signed)
+
+
+def test_a_table_with_an_impossible_date_or_a_naive_now_is_a_table_error(owner):
+    key, keys = owner
+    with pytest.raises(pricing.PriceTableError, match="not a real date"):
+        pricing.sign_price_table(_table(effective_from="2026-02-30T00:00:00Z"), key)
+    unsigned = {**_table(effective_from="2026-02-30T00:00:00Z"), "signature": "AAAA"}
+    with pytest.raises(pricing.PriceTableError, match="not a real date"):
+        _load(unsigned, keys)
+    signed = pricing.sign_price_table(_table(), key)
+    for bad in (NOW.replace(tzinfo=None), NOW.timestamp()):
+        with pytest.raises(pricing.PriceTableError, match="timezone-aware"):
+            _load(signed, keys, now=bad)
+
+
+def test_value_refuses_a_non_positive_shape(owner):
+    key, keys = owner
+    table = _load(pricing.sign_price_table(_table(), key), keys)
+    for vcpus, memory_gib in ((0, 32), (8, 0), (-8, 32), (True, 32), (8, 32.0)):
+        with pytest.raises(pricing.PriceTableError, match="positive integer"):
+            table.value(kind="tee", vcpus=vcpus, memory_gib=memory_gib)
+    with pytest.raises(pricing.PriceTableError, match="no rate"):
+        table.value(kind="gpu", vcpus=8, memory_gib=32)
+
+
+def test_a_profile_may_not_ask_for_more_vcpus_than_can_be_proven(owner):
+    key, _keys = owner
+    top = {"sn81": {"min_vcpus": ch.MAX_LANES, "min_memory_gib": 4096}}
+    pricing.sign_price_table(_table(consumer_profiles=top), key)
+    over = {"sn81": {"min_vcpus": ch.MAX_LANES + 1, "min_memory_gib": 32}}
+    with pytest.raises(pricing.PriceTableError, match=f"from 1 to {ch.MAX_LANES}"):
+        pricing.sign_price_table(_table(consumer_profiles=over), key)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"schema": "other"},
+        {"rates": {"tee": {"vcpu_hour": 1, "gib_hour": 1}}},
+        {
+            "rates": {
+                "tee": {"vcpu_hour": -1, "gib_hour": 1},
+                "bare_metal": {"vcpu_hour": 1, "gib_hour": 1},
+            }
+        },
+        {
+            "rates": {
+                "tee": {"vcpu_hour": 1.5, "gib_hour": 1},
+                "bare_metal": {"vcpu_hour": 1, "gib_hour": 1},
+            }
+        },
+        {"consumer_profiles": {}},
+        {"consumer_profiles": {"SN120": {"min_vcpus": 2, "min_memory_gib": 4}}},
+        {"consumer_profiles": {"sn120": {"min_vcpus": 0, "min_memory_gib": 4}}},
+        {"currency": "US Dollars"},
+        {"effective_from": "tomorrow"},
+        {"sequence": 0},
+        {"sequence": True},
+        {"key_id": "bad key id"},
+        {"key_id": 7},
+        {
+            "rates": {
+                "tee": {"vcpu_hour": pricing.MAX_MICRO + 1, "gib_hour": 1},
+                "bare_metal": {"vcpu_hour": 1, "gib_hour": 1},
+            }
+        },
+        {"consumer_profiles": {"sn81": {"min_vcpus": 8, "min_memory_gib": 4097}}},
+    ],
+)
+def test_malformed_tables_are_refused(owner, changes):
+    key, _keys = owner
+    with pytest.raises(pricing.PriceTableError):
+        pricing.sign_price_table(_table(**changes), key)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"sequence": ' + "1" * 5000 + "}",
+        "[" * 100_000,
+        b"\xff\xfe",
+    ],
+)
+def test_unsigned_table_bytes_never_escape_as_other_errors(owner, raw):
+    _key, keys = owner
+    with pytest.raises(pricing.PriceTableError, match="not JSON"):
+        _load(raw, keys, minimum_sequence=1)
+
+
+def test_a_huge_sequence_is_refused_before_the_signature_check(owner):
+    key, keys = owner
+    signed = pricing.sign_price_table(_table(), key)
+    signed["sequence"] = 10**5000
+    with pytest.raises(pricing.PriceTableError, match="sequence"):
+        _load(signed, keys, minimum_sequence=1)

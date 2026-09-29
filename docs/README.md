@@ -22,6 +22,14 @@ admission, key release, lifecycle state, provider contracts, and policy
 registries. They are for developers and reviewers. They are not alternate SN94
 mining paths.
 
+[Central pool access](CENTRAL_POOL_ACCESS.md) specifies how Cathedral's central
+service would authenticate to an opted-in miner, and what it may do there.
+
 The current Cathedral validator derives weights directly from miner evidence.
 It does not consume the repository's older signed-vector publisher,
 central-enrollment, burn, or provenance flows.
+
+## Design proposals
+
+- [TEE sandbox box](TEE_BOX.md): TDX and SEV-SNP boxes that run customer
+  sandboxes under gVisor. Proposal only; not a mining path.

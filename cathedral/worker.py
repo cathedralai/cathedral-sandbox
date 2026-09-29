@@ -20,10 +20,19 @@ import ssl
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 
 from cathedral.attest import collect_tdx
+from cathedral.central_access import (
+    CENTRAL_REQUEST_HEADER,
+    CENTRAL_ROUTES,
+    MAX_CENTRAL_CONCURRENT,
+    CentralAccessAuthorizer,
+    CentralAccessError,
+    CentralRequestLimiter,
+)
 from cathedral.common import (
     ChannelBinding,
     ChannelBindingType,
@@ -71,10 +80,65 @@ MAX_CONCURRENT: int = 4
 MAX_CHALLENGE_CONCURRENT: int = 2
 MAX_SAT_CHALLENGE_CONCURRENT: int = 2
 MAX_VALIDATOR_CHALLENGE_CONCURRENT: int = 2
+# Connections allowed beyond the request-class slots while a handshake or the
+# headers are still arriving. Such a connection costs an idle thread, and the
+# oldest is evicted when a new one needs its permit, so a few idle sockets can
+# no longer lock validators out (review finding W1). Permits stay strict;
+# evicted threads exit on their next read.
+PREAUTH_CONNECTION_HEADROOM: int = 22
+# A signed validator body is at most MAX_REQUEST_BODY and arrives within one
+# round trip. A request still reading its body after this long is stalled, and
+# a new validator may take its slot (review finding W2).
+VALIDATOR_BODY_STALL_SECONDS: float = 1.0
+# The stall grace grows with the declared body at this rate, so a distant
+# validator's large upload is not mistaken for a stall.
+VALIDATOR_BODY_MIN_RATE_BYTES: int = 32 * 1024
+# A validator whose signed request leaves its slot without a complete body
+# (displaced, closed or timed out), or is refused for a client fault (a body
+# its signature does not cover, a replayed nonce, a request that expired in
+# flight), is kept out of the signed class this long, so stalling and
+# reconnecting just inside the grace no longer holds slots.
+VALIDATOR_ABANDON_PENALTY_SECONDS: float = 20.0
+# The bench does not stop a validator that sends valid requests with each
+# body just inside its grace: such a request holds a slot for almost the grace
+# and is never displaced or benched, and the rate limit allows about two a
+# second, so two hotkeys doing it used to lock a third out of a class of two.
+# Each hotkey therefore has a budget of slow slot time. The time a request
+# holds its slot before its body arrives, beyond the first tenth of its grace,
+# is charged to a per-hotkey bucket that holds VALIDATOR_SLOW_SLOT_BUDGET_SECONDS
+# and drains at that much per VALIDATOR_SLOW_SLOT_WINDOW_SECONDS. While its
+# bucket is over the budget, a hotkey's request that is still waiting for its
+# body is displaced at once by another validator arriving at a full class,
+# without a bench. A validator that sends its body within a tenth of its
+# grace (about 0.1 s for a small body, 0.3 s for a 64 KiB one) is never
+# charged, so it is never displaced before its grace.
+#
+# What remains is the uncharged tenth and the budget itself. Under the default
+# rate limit a hotkey can hold a slot undisplaceably before its body for about
+# 5 / 60 + 2 * 0.1 * G of the time, where G is its grace: about 0.31 on the
+# small signed routes (G <= 1.125 s) and 0.68 on a 64 KiB sat-work request
+# (G = 3 s). Keeping both slots of the class full that way takes about seven
+# colluding permit holders on the small routes and three on sat-work, where
+# two used to be enough. A request whose body has arrived is served, not
+# displaced: that is rate-limited work, one in flight per hotkey.
+VALIDATOR_SLOW_SLOT_BUDGET_SECONDS: float = 5.0
+VALIDATOR_SLOW_SLOT_WINDOW_SECONDS: float = 60.0
+VALIDATOR_PROMPT_GRACE_FRACTION: float = 0.1
+# Signed evidence, fleet and capabilities bodies are a few hundred bytes; only
+# sat-work may declare up to the body cap and so earn a longer grace.
+SMALL_SIGNED_BODY_BYTES: int = 4096
 MAX_HOTKEY_LENGTH: int = 256
 MAX_BEARER_TOKEN_LENGTH: int = 4096
 MAX_CUSTOMER_SAT_SOLVE_SECONDS: float = 30.0
 MAX_CUSTOMER_SAT_MEMORY_BYTES: int = 256 * 1024 * 1024
+# The TEE box sandbox API (off unless a TeeBoxSandboxApi is supplied) has its
+# own request-class pool, so a long sync exec or poll cannot take the slots
+# validators need.
+MAX_TEE_BOX_CONCURRENT: int = 8
+TEE_BOX_REAP_INTERVAL_SECONDS: float = 5.0
+# The egress re-check runs on its own thread at a fixed rate, apart from the
+# reaper's docker calls (docs/TEE_BOX_SERVICE.md, "Egress enforcement").
+TEE_BOX_EGRESS_CHECK_INTERVAL_SECONDS: float = 5.0
 
 _EVIDENCE_REQUEST_KEYS = frozenset({"nonce_hex", "assigned_hotkey"})
 _EVIDENCE_V2_REQUEST_KEYS = _EVIDENCE_REQUEST_KEYS | frozenset(
@@ -277,11 +341,240 @@ class _DeadlineWriter(io.BufferedIOBase):
         return total
 
 
+class _ValidatorSlot:
+    """One signed request's place in the validator class.
+
+    Its life has three marks. ``mark_body_received`` records a complete,
+    full-length body: the stall clock stops and the slot can no longer be
+    displaced, so a slow ``finalize`` (a synchronous replay-store write) never
+    costs an honest validator its slot. ``mark_client_fault`` records a
+    refusal that is the validator's fault: a body its signature does not
+    cover, a replayed nonce or a request that expired in flight.
+    ``mark_verified`` records that ``finalize`` accepted the body. On release
+    the validator is benched only for a client fault: no complete body, or a
+    refusal marked as one. A refusal on the worker's side (replay store full
+    or failing, snapshot unavailable) does not bench an honest validator.
+    """
+
+    __slots__ = (
+        "pool",
+        "connection",
+        "hotkey",
+        "admitted_at",
+        "grace",
+        "body_received",
+        "client_refused",
+        "verified",
+        "charged",
+        "owned",
+    )
+
+    def __init__(
+        self,
+        pool: "_ValidatorPool",
+        connection: socket.socket,
+        hotkey: str,
+        admitted_at: float,
+        grace: float,
+    ) -> None:
+        self.pool = pool
+        self.connection = connection
+        self.hotkey = hotkey
+        self.admitted_at = admitted_at
+        self.grace = grace
+        self.body_received = False
+        self.client_refused = False
+        self.verified = False
+        self.charged = False
+        self.owned = True
+
+    def mark_body_received(self) -> bool:
+        """Record a complete body; False when the slot was already taken over,
+        in which case the request must stop rather than run over capacity."""
+        with self.pool._lock:
+            if self.owned:
+                self.body_received = True
+                self.pool._charge_locked(self, self.pool._clock())
+            return self.owned
+
+    def mark_client_fault(self) -> None:
+        with self.pool._lock:
+            self.client_refused = True
+
+    def mark_verified(self) -> None:
+        with self.pool._lock:
+            self.verified = True
+
+    @property
+    def client_fault(self) -> bool:
+        return not self.verified and (not self.body_received or self.client_refused)
+
+    def release(self) -> None:
+        self.pool._release(self)
+
+
+class _ValidatorPool:
+    """The signed-validator request class, fair across validators.
+
+    Each validator is already limited to one request in flight, but the class
+    itself is small and shared, so a few permitted validators stalling their
+    bodies used to hold every slot until the request deadline and turn all
+    other validators away (review finding W2). Three rules close that:
+
+    - when the class is full, a new validator takes the slot of the request
+      that has spent longest reading its body past its grace (one second plus
+      the declared body at VALIDATOR_BODY_MIN_RATE_BYTES per second); a
+      request whose body has been read is never displaced;
+    - a validator whose request leaves its slot without a complete body
+      (stalled, closed, displaced past its grace) or is refused for a client
+      fault is kept out of the class for VALIDATOR_ABANDON_PENALTY_SECONDS, so
+      stalling and reconnecting just inside the grace does not hold slots;
+    - a hotkey over its slow-slot budget (VALIDATOR_SLOW_SLOT_BUDGET_SECONDS)
+      loses the grace: its request still waiting for a body may be displaced
+      at once, without a bench, so valid bodies sent just inside the grace
+      cannot hold the class either.
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        *,
+        stall_seconds: float = VALIDATOR_BODY_STALL_SECONDS,
+        min_rate_bytes: int = VALIDATOR_BODY_MIN_RATE_BYTES,
+        penalty_seconds: float = VALIDATOR_ABANDON_PENALTY_SECONDS,
+        slow_budget_seconds: float = VALIDATOR_SLOW_SLOT_BUDGET_SECONDS,
+        slow_window_seconds: float = VALIDATOR_SLOW_SLOT_WINDOW_SECONDS,
+        prompt_fraction: float = VALIDATOR_PROMPT_GRACE_FRACTION,
+        max_penalized: int = 256,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._capacity = capacity
+        self._stall_seconds = stall_seconds
+        self._min_rate_bytes = min_rate_bytes
+        self._penalty_seconds = penalty_seconds
+        self._slow_budget = slow_budget_seconds
+        self._slow_drain = slow_budget_seconds / slow_window_seconds
+        self._prompt_fraction = prompt_fraction
+        self._max_penalized = max_penalized
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._slots: list[_ValidatorSlot] = []
+        self._penalized_until: dict[str, float] = {}
+        # hotkey -> (charged slow seconds, as of this clock reading)
+        self._slow_usage: dict[str, tuple[float, float]] = {}
+        self.displaced_count = 0
+
+    def penalized(self, hotkey: str) -> bool:
+        with self._lock:
+            return self._penalized_until.get(hotkey, 0.0) > self._clock()
+
+    def slow_usage(self, hotkey: str) -> float:
+        with self._lock:
+            return self._slow_usage_locked(hotkey, self._clock())
+
+    def _slow_usage_locked(self, hotkey: str, now: float) -> float:
+        level, at = self._slow_usage.get(hotkey, (0.0, now))
+        return max(0.0, level - max(0.0, now - at) * self._slow_drain)
+
+    def _slow_seconds(self, slot: _ValidatorSlot, now: float) -> float:
+        """Pre-body slot time beyond the prompt part of the grace."""
+        return max(0.0, now - slot.admitted_at - slot.grace * self._prompt_fraction)
+
+    def _charge_locked(self, slot: _ValidatorSlot, now: float) -> None:
+        if slot.charged:
+            return
+        slot.charged = True
+        slow = self._slow_seconds(slot, now)
+        if slow <= 0.0:
+            return
+        hotkey = slot.hotkey
+        if hotkey not in self._slow_usage and len(self._slow_usage) >= self._max_penalized:
+            drained = [key for key in self._slow_usage if self._slow_usage_locked(key, now) <= 0.0]
+            for key in drained:
+                del self._slow_usage[key]
+            if len(self._slow_usage) >= self._max_penalized:
+                lowest = min(self._slow_usage, key=lambda key: self._slow_usage_locked(key, now))
+                del self._slow_usage[lowest]
+        self._slow_usage[hotkey] = (self._slow_usage_locked(hotkey, now) + slow, now)
+
+    def _displaceable_locked(self, held: _ValidatorSlot, now: float) -> bool:
+        if held.body_received:
+            return False
+        if now - held.admitted_at >= held.grace:
+            return True
+        return (
+            self._slow_usage_locked(held.hotkey, now) + self._slow_seconds(held, now)
+            > self._slow_budget
+        )
+
+    def admit(
+        self, connection: socket.socket, hotkey: str, declared_length: int = 0
+    ) -> _ValidatorSlot | None:
+        now = self._clock()
+        grace = self._stall_seconds + max(0, declared_length) / self._min_rate_bytes
+        slot = _ValidatorSlot(self, connection, hotkey, now, grace)
+        with self._lock:
+            if self._penalized_until.get(hotkey, 0.0) > now:
+                return None
+            if len(self._slots) < self._capacity:
+                self._slots.append(slot)
+                return slot
+            candidates = [held for held in self._slots if self._displaceable_locked(held, now)]
+            if not candidates:
+                return None
+            victim = min(candidates, key=lambda held: held.admitted_at)
+            victim.owned = False
+            self._slots[self._slots.index(victim)] = slot
+            self._charge_locked(victim, now)
+            if now - victim.admitted_at >= victim.grace:
+                # Stalled past its grace. A victim displaced only for being
+                # over its slow-slot budget is not benched.
+                self._penalize_locked(victim.hotkey, now)
+            self.displaced_count += 1
+            # Still under the lock: the victim cannot have released and closed
+            # its socket, so its descriptor cannot have been reused. The raw TCP
+            # shutdown wakes its body read with EOF. This is the same call as
+            # _BoundedThreadingHTTPServer's _shutdown_transport helper where
+            # that exists; swap this block for it when both are present.
+            try:
+                socket.socket.shutdown(victim.connection, socket.SHUT_RDWR)
+            except OSError:
+                pass
+        return slot
+
+    def _penalize_locked(self, hotkey: str, now: float) -> None:
+        if hotkey not in self._penalized_until and len(self._penalized_until) >= self._max_penalized:
+            expired = [key for key, until in self._penalized_until.items() if until <= now]
+            for key in expired:
+                del self._penalized_until[key]
+            if len(self._penalized_until) >= self._max_penalized:
+                oldest = min(self._penalized_until, key=self._penalized_until.__getitem__)
+                del self._penalized_until[oldest]
+        self._penalized_until[hotkey] = now + self._penalty_seconds
+
+    def _release(self, slot: _ValidatorSlot) -> None:
+        with self._lock:
+            if slot.owned:
+                slot.owned = False
+                self._slots.remove(slot)
+                now = self._clock()
+                self._charge_locked(slot, now)
+                if slot.client_fault:
+                    # Closed or timed out before its body, or refused for a
+                    # client fault after it.
+                    self._penalize_locked(slot.hotkey, now)
+
+    @property
+    def in_use(self) -> int:
+        with self._lock:
+            return len(self._slots)
+
+
 def _make_handler(
     semaphore: threading.Semaphore,
     challenge_semaphore: threading.Semaphore,
     sat_challenge_semaphore: threading.Semaphore,
-    validator_challenge_semaphore: threading.Semaphore,
+    validator_pool: _ValidatorPool,
     configured_hotkey: str,
     bearer_token: str | None,
     evidence_collector: Callable[..., Evidence | tuple[Evidence, ...] | list[Evidence]],
@@ -297,6 +590,11 @@ def _make_handler(
     validator_request_limiter: ValidatorRequestLimiter | None,
     gpu_executor,
     gpu_evidence_collector,
+    central_authorizer: CentralAccessAuthorizer | None = None,
+    central_request_limiter: CentralRequestLimiter | None = None,
+    central_semaphore: threading.Semaphore | None = None,
+    tee_box_api=None,
+    tee_box_semaphore: threading.Semaphore | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     class _Handler(BaseHTTPRequestHandler):
         def setup(self) -> None:
@@ -314,6 +612,14 @@ def _make_handler(
 
         def log_message(self, fmt: str, *args: object) -> None:
             pass
+
+        def parse_request(self) -> bool:
+            parsed = super().parse_request()
+            if parsed:
+                protect = getattr(self.server, "protect_connection", None)
+                if protect is not None:
+                    protect(self.request)
+            return parsed
 
         def _send_json(self, code: int, obj: dict[str, object]) -> None:
             body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
@@ -347,6 +653,52 @@ def _make_handler(
                 return None
             return values[0]
 
+        def _serve_central(self, path: str) -> None:
+            # A central caller never shares the validator header, limiter,
+            # replay state, or pool. Every refusal is the same 401, before any
+            # body is read, and only granted routes are served.
+            headers = self.headers.get_all(CENTRAL_REQUEST_HEADER, failobj=[])
+            if (
+                len(headers) != 1
+                or self.headers.get_all(VALIDATOR_REQUEST_HEADER, failobj=[])
+                or path not in CENTRAL_ROUTES
+            ):
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            assert central_authorizer is not None
+            assert central_request_limiter is not None
+            assert central_semaphore is not None
+            try:
+                request = central_authorizer.preauthorize(
+                    headers[0], method="POST", path=path, now=datetime.now(UTC)
+                )
+            except CentralAccessError:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            lease = central_request_limiter.acquire(request.caller)
+            if lease is None:
+                self._send_json(429, {"error": "central rate limit exceeded"})
+                return
+            try:
+                if not central_semaphore.acquire(blocking=False):
+                    self._send_json(503, {"error": "busy"})
+                    return
+                try:
+                    raw, error_code, error_message = self._read_body()
+                    if raw is None:
+                        self._send_json(error_code, {"error": error_message})
+                        return
+                    try:
+                        central_authorizer.finalize(request, body=raw, now=datetime.now(UTC))
+                    except CentralAccessError:
+                        self._send_json(401, {"error": "unauthorized"})
+                        return
+                    self._handle_post(raw)
+                finally:
+                    central_semaphore.release()
+            finally:
+                lease.release()
+
         def _preauthorize_validator(self, path: str) -> PreauthorizedValidatorRequest | None:
             if validator_authorizer is None:
                 return None
@@ -379,8 +731,118 @@ def _make_handler(
                 return None, 400, "incomplete request body"
             return body, 200, ""
 
+        def _send_bytes(self, code: int, body: bytes, content_type: str, limit: int) -> None:
+            if len(body) > limit:
+                self._send_json(500, {"error": "response too large"})
+                return
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def _read_tee_box_body(self, method: str, limit: int) -> tuple[bytes | None, int, str]:
+            if self.headers.get("Transfer-Encoding") is not None:
+                return None, 400, "invalid request framing"
+            lengths = self.headers.get_all("Content-Length", failobj=[])
+            if not lengths and method in {"GET", "DELETE"}:
+                return b"", 200, ""
+            if len(lengths) != 1:
+                return None, 411, "content length required"
+            if _DECIMAL_RE.fullmatch(lengths[0]) is None:
+                return None, 400, "invalid content length"
+            length = int(lengths[0])
+            if length > limit:
+                return None, 413, "request too large"
+            try:
+                body = self.rfile.read(length)
+            except (socket.timeout, TimeoutError, OSError):
+                return None, 400, "incomplete request body"
+            if len(body) != length:
+                return None, 400, "incomplete request body"
+            return body, 200, ""
+
+        def _tee_box_request(self, method: str) -> None:
+            """Serve one sandbox API call: central caller, own pool, then the API."""
+
+            from cathedral.tee_box.service import (
+                MAX_REQUEST_BODY as TEE_BOX_MAX_BODY,
+                MAX_RESPONSE_BODY as TEE_BOX_MAX_RESPONSE,
+                owns_path,
+                route_scope,
+            )
+
+            assert tee_box_api is not None and tee_box_semaphore is not None
+            target = self.path
+            if not owns_path(target.partition("?")[0]):
+                self._send_json(404, {"error": "not found"})
+                return
+            authorizer = tee_box_api.authorizer
+            headers = self.headers.get_all(CENTRAL_REQUEST_HEADER, failobj=[])
+            scope = route_scope(method, target)
+            # The central request signs the method and full target, query
+            # included, and the delegation must grant the route's scope. All of
+            # it is verified before the caller gets a slot or a body read, and
+            # every refusal is the same 401.
+            preauthorized = None
+            if (
+                len(headers) == 1
+                and scope is not None
+                and not self.headers.get_all(VALIDATOR_REQUEST_HEADER, failobj=[])
+            ):
+                try:
+                    preauthorized = authorizer.preauthorize(
+                        headers[0],
+                        method=method,
+                        path=target,
+                        now=datetime.now(UTC),
+                        scope=scope,
+                    )
+                except CentralAccessError:
+                    preauthorized = None
+            if preauthorized is None:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            if not tee_box_semaphore.acquire(blocking=False):
+                self._send_json(503, {"error": "busy"})
+                return
+            try:
+                raw, error_code, error_message = self._read_tee_box_body(method, TEE_BOX_MAX_BODY)
+                if raw is None:
+                    self._send_json(error_code, {"error": error_message})
+                    return
+                try:
+                    caller = authorizer.finalize(preauthorized, body=raw, now=datetime.now(UTC))
+                except CentralAccessError:
+                    self._send_json(401, {"error": "unauthorized"})
+                    return
+                response = tee_box_api.handle(method, target, caller, raw)
+                self._send_bytes(
+                    response.status,
+                    response.body,
+                    response.content_type,
+                    TEE_BOX_MAX_RESPONSE,
+                )
+            except (socket.timeout, TimeoutError, OSError):
+                try:
+                    self._send_json(400, {"error": "request failed"})
+                except OSError:
+                    pass
+            except Exception:
+                try:
+                    self._send_json(500, {"error": "internal error"})
+                except OSError:
+                    pass
+            finally:
+                tee_box_semaphore.release()
+
         def do_POST(self) -> None:
             path = self.path.partition("?")[0]
+            if tee_box_api is not None and _tee_box_owns(path):
+                self._tee_box_request("POST")
+                return
             # Header presence is not authentication. Reject unknown routes
             # before it can influence pool selection or trigger a body read,
             # otherwise a fake validator header could occupy the small signed
@@ -393,6 +855,22 @@ def _make_handler(
                 return
             if path == "/v1/fleet" and validator_authorizer is None:
                 self._send_json(404, {"error": "fleet discovery unavailable"})
+                return
+            if central_authorizer is not None and self.headers.get_all(
+                CENTRAL_REQUEST_HEADER, failobj=[]
+            ):
+                try:
+                    self._serve_central(path)
+                except (socket.timeout, TimeoutError, OSError):
+                    try:
+                        self._send_json(400, {"error": "request failed"})
+                    except OSError:
+                        pass
+                except Exception:
+                    try:
+                        self._send_json(500, {"error": "internal error"})
+                    except OSError:
+                        pass
                 return
             # Public evidence and canonical SAT exist only for an explicit
             # migration bridge or a development worker with authentication
@@ -474,13 +952,13 @@ def _make_handler(
                 # evidence pool. Canonical classification needs the parsed
                 # instance. Sharing the evidence pool would let migration SAT
                 # traffic 503 a validator's quote collection.
+                validator_slot = None
                 if preauthorized_validator is not None:
                     # Signed validator control traffic has reserved
                     # request-class capacity after headers are parsed and the
-                    # envelope is authenticated. The earlier connection gate
-                    # is shared by every TLS client and must be protected at
-                    # the network edge in a production deployment.
-                    pool = validator_challenge_semaphore
+                    # envelope is authenticated. A validator stalling its body
+                    # can be displaced by another (see _ValidatorPool).
+                    pool = None
                 elif path == "/v1/sat-work" and bearer_token is not None and auth_ok:
                     pool = semaphore
                 elif path == "/v1/sat-work":
@@ -493,7 +971,30 @@ def _make_handler(
                     pool = challenge_semaphore
                 else:
                     pool = semaphore
-                if not pool.acquire(blocking=False):
+                if pool is None:
+                    assert preauthorized_validator is not None
+                    hotkey = preauthorized_validator.validator_hotkey
+                    if validator_pool.penalized(hotkey):
+                        self._send_json(429, {"error": "validator recently abandoned a request"})
+                        return
+                    # A header whose nonce an accepted request already used
+                    # gets no slot at all. finalize still decides every nonce.
+                    assert validator_authorizer is not None
+                    if validator_authorizer.is_replay(preauthorized_validator):
+                        self._send_json(401, {"error": "unauthorized"})
+                        return
+                    declared = self.headers.get("Content-Length", "")
+                    route_cap = max_body if path == "/v1/sat-work" else SMALL_SIGNED_BODY_BYTES
+                    declared_length = (
+                        min(int(declared), route_cap)
+                        if _DECIMAL_RE.fullmatch(declared or "")
+                        else 0
+                    )
+                    validator_slot = validator_pool.admit(self.connection, hotkey, declared_length)
+                    admitted = validator_slot is not None
+                else:
+                    admitted = pool.acquire(blocking=False)
+                if not admitted:
                     self._send_json(503, {"error": "busy"})
                     return
                 try:
@@ -506,20 +1007,33 @@ def _make_handler(
                     if raw is None:
                         self._send_json(error_code, {"error": error_message})
                         return
+                    # A full-length body stops the stall clock before finalize
+                    # writes the replay store, so a slow write cannot get an
+                    # honest validator displaced. A request displaced just
+                    # before its body arrived must stop (see _ValidatorPool).
+                    if validator_slot is not None and not validator_slot.mark_body_received():
+                        return
                     if preauthorized_validator is not None:
                         assert validator_authorizer is not None
-                        if (
-                            validator_authorizer.finalize(
-                                preauthorized_validator,
-                                body=raw,
-                            )
-                            is None
-                        ):
+                        finalized = validator_authorizer.finalize_result(
+                            preauthorized_validator, body=raw
+                        )
+                        if not isinstance(finalized, str):
+                            # A mismatched body, a replay or an expiry is the
+                            # client's fault and benches; a replay-store or
+                            # snapshot refusal is the worker's and does not.
+                            if validator_slot is not None and finalized.client_fault:
+                                validator_slot.mark_client_fault()
                             self._send_json(401, {"error": "unauthorized"})
                             return
+                        if validator_slot is not None:
+                            validator_slot.mark_verified()
                     self._handle_post(raw)
                 finally:
-                    pool.release()
+                    if validator_slot is not None:
+                        validator_slot.release()
+                    elif pool is not None:
+                        pool.release()
             except (socket.timeout, TimeoutError, OSError):
                 try:
                     self._send_json(400, {"error": "request failed"})
@@ -816,7 +1330,18 @@ def _make_handler(
                 },
             )
 
+    if tee_box_api is not None:
+        # Only an enabled sandbox API gives the worker GET, PUT and DELETE.
+        _Handler.do_GET = lambda self: self._tee_box_request("GET")  # type: ignore[attr-defined]
+        _Handler.do_PUT = lambda self: self._tee_box_request("PUT")  # type: ignore[attr-defined]
+        _Handler.do_DELETE = lambda self: self._tee_box_request("DELETE")  # type: ignore[attr-defined]
     return _Handler
+
+
+def _tee_box_owns(path: str) -> bool:
+    from cathedral.tee_box.service import owns_path
+
+    return owns_path(path)
 
 
 def _parse_instance(raw: object) -> SatInstance | None:
@@ -832,15 +1357,56 @@ def _parse_instance(raw: object) -> SatInstance | None:
     return instance
 
 
-class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
-    """Start at most ``max_connection_concurrent`` request threads.
+def _shutdown_transport(request: socket.socket) -> None:
+    """Shut the underlying TCP socket down from another thread.
 
-    The handler's three semaphores reserve execution capacity by request
-    class. This earlier gate covers the part before a handler knows the path,
-    including a client that never finishes its headers. A refused connection
-    is closed without starting a thread or attempting an HTTP response. At
-    this point the server has not parsed HTTP, and a nonblocking write is not
-    portable when the peer is still sending or a TLS handshake is pending.
+    ``SSLSocket.shutdown`` also drops its TLS object, which races a handler
+    thread mid-read and makes it raise instead of seeing EOF; the plain socket
+    call wakes that read with EOF and leaves the TLS object to its owner.
+    """
+    try:
+        socket.socket.shutdown(request, socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+class _Connection:
+    """One accepted connection's place at the server-level gate."""
+
+    __slots__ = ("request", "accepted_at", "protected", "owns_permit", "closed")
+
+    def __init__(self, request: socket.socket, accepted_at: float) -> None:
+        self.request = request
+        self.accepted_at = accepted_at
+        # Set once the handler has parsed a request line and headers. Until then
+        # the connection has shown nothing, and it may be evicted.
+        self.protected = False
+        self.owns_permit = True
+        # Set under the server's _active_lock just before the socket is closed.
+        # Another thread may shut the socket down only while holding that lock
+        # and seeing this False, so it never touches a descriptor that has been
+        # closed and possibly reused.
+        self.closed = False
+
+
+class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Hand out at most ``max_connection_concurrent`` connection permits, and
+    never let idle connections lock out real requests.
+
+    The handler's semaphores reserve execution capacity by request class. This
+    earlier gate covers the part before a handler knows the path: the TLS
+    handshake and the headers. When every permit is taken, a new connection
+    evicts the oldest connection that has not yet produced a parsed request,
+    and takes over its permit. Permits stay strict; evicted threads exit on
+    their next read, so until then live handler threads and
+    ``active_connection_count`` can briefly exceed the permit count. A connection
+    becomes protected as soon as its headers parse, so an honest client, which
+    sends its headers within one round trip, is not evicted by idle sockets,
+    while an attacker's idle sockets are the first to go (review finding W1).
+    Only when every permit belongs to a protected connection is a new one
+    closed, without a thread or an HTTP response: the server has not parsed
+    HTTP, and a nonblocking write is not portable while the peer is still
+    sending or a TLS handshake is pending.
     """
 
     def __init__(
@@ -852,7 +1418,8 @@ class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
     ) -> None:
         self._connection_slots = threading.BoundedSemaphore(max_connection_concurrent)
         self._active_lock = threading.Lock()
-        self._active_requests: set[socket.socket] = set()
+        self._active_requests: dict[socket.socket, _Connection] = {}
+        self.evicted_connection_count = 0
         super().__init__(server_address, request_handler)
 
     @property
@@ -860,26 +1427,58 @@ class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
         with self._active_lock:
             return len(self._active_requests)
 
+    def protect_connection(self, request: socket.socket) -> None:
+        """Called by the handler once a request line and headers have parsed."""
+
+        with self._active_lock:
+            record = self._active_requests.get(request)
+            if record is not None:
+                record.protected = True
+
+    def _evict_oldest_unprotected(self, newcomer: _Connection) -> bool:
+        """Hand the oldest unprotected connection's permit to ``newcomer``."""
+
+        with self._active_lock:
+            idle = [
+                record
+                for record in self._active_requests.values()
+                if not record.protected and record.owns_permit
+            ]
+            if not idle:
+                return False
+            victim = min(idle, key=lambda record: record.accepted_at)
+            victim.owns_permit = False
+            newcomer.owns_permit = True
+            self._active_requests[newcomer.request] = newcomer
+            self.evicted_connection_count += 1
+            # The victim's thread fails its next read and exits without
+            # releasing the permit it no longer owns. Under the lock, and only
+            # while its record is open: its thread marks the record closed under
+            # this lock before closing the socket (shutdown_request), so the
+            # descriptor cannot have been closed and reused by now.
+            if not victim.closed:
+                _shutdown_transport(victim.request)
+        return True
+
     def process_request(
         self,
         request: socket.socket,
         client_address: tuple[str, int],
     ) -> None:
-        if not self._connection_slots.acquire(blocking=False):
-            # Keep the accept loop nonblocking and the thread ceiling strict.
-            # HTTP status belongs to the later class-pool gates, after a
-            # handler has parsed enough of the request to send one reliably.
+        record = _Connection(request, time.monotonic())
+        if self._connection_slots.acquire(blocking=False):
+            with self._active_lock:
+                self._active_requests[request] = record
+        elif not self._evict_oldest_unprotected(record):
+            # Every permit belongs to a connection that has shown a request.
+            # Keep the accept loop nonblocking and the permits strict.
             self.shutdown_request(request)
             return
 
-        with self._active_lock:
-            self._active_requests.add(request)
         try:
             super().process_request(request, client_address)
         except BaseException:
-            with self._active_lock:
-                self._active_requests.discard(request)
-            self._connection_slots.release()
+            self._forget(record)
             raise
 
     def process_request_thread(
@@ -887,11 +1486,28 @@ class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
         request: socket.socket,
         client_address: tuple[str, int],
     ) -> None:
+        with self._active_lock:
+            record = self._active_requests.get(request)
         try:
             super().process_request_thread(request, client_address)
         finally:
-            with self._active_lock:
-                self._active_requests.discard(request)
+            if record is not None:
+                self._forget(record)
+
+    def shutdown_request(self, request: socket.socket) -> None:
+        with self._active_lock:
+            record = self._active_requests.get(request)
+            if record is not None:
+                record.closed = True
+        super().shutdown_request(request)
+
+    def _forget(self, record: _Connection) -> None:
+        with self._active_lock:
+            if self._active_requests.get(record.request) is record:
+                del self._active_requests[record.request]
+            release = record.owns_permit
+            record.owns_permit = False
+        if release:
             self._connection_slots.release()
 
     def server_close(self) -> None:
@@ -900,12 +1516,9 @@ class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
         # each tracked socket makes shutdown a cancellation boundary and frees
         # every connection permit promptly.
         with self._active_lock:
-            active_requests = tuple(self._active_requests)
-        for request in active_requests:
-            try:
-                request.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+            for record in self._active_requests.values():
+                if not record.closed:
+                    _shutdown_transport(record.request)
         super().server_close()
 
 
@@ -1005,6 +1618,12 @@ class WorkerServer:
         max_validator_challenge_concurrent: int = MAX_VALIDATOR_CHALLENGE_CONCURRENT,
         gpu_executor=None,
         gpu_evidence_collector=None,
+        central_authorizer: CentralAccessAuthorizer | None = None,
+        max_central_concurrent: int = MAX_CENTRAL_CONCURRENT,
+        central_requests_per_window: int = 60,
+        central_rate_window_seconds: float = 60.0,
+        tee_box_api=None,
+        max_tee_box_concurrent: int = MAX_TEE_BOX_CONCURRENT,
     ) -> None:
         try:
             loopback = ipaddress.ip_address(host).is_loopback
@@ -1041,6 +1660,8 @@ class WorkerServer:
                 max_validator_challenge_concurrent,
             ),
             ("max_response_body", max_response_body),
+            ("max_central_concurrent", max_central_concurrent),
+            ("max_tee_box_concurrent", max_tee_box_concurrent),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
@@ -1048,13 +1669,16 @@ class WorkerServer:
             max_validator_challenge_concurrent
             if validator_authorizer is not None
             else 0
-        )
+        ) + (max_central_concurrent if central_authorizer is not None else 0)
+        tee_box_class_capacity = max_tee_box_concurrent if tee_box_api is not None else 0
         if max_connection_concurrent is None:
             max_connection_concurrent = (
                 max_concurrent
                 + max_challenge_concurrent
                 + max_sat_challenge_concurrent
                 + validator_class_capacity
+                + PREAUTH_CONNECTION_HEADROOM
+                + tee_box_class_capacity
             )
         if (
             isinstance(max_connection_concurrent, bool)
@@ -1067,6 +1691,7 @@ class WorkerServer:
             + max_challenge_concurrent
             + max_sat_challenge_concurrent
             + validator_class_capacity
+            + tee_box_class_capacity
         )
         if max_connection_concurrent < class_capacity:
             raise ValueError("max_connection_concurrent must cover all request-class capacity")
@@ -1126,6 +1751,36 @@ class WorkerServer:
                 or any(not isinstance(endpoint, str) for endpoint in fleet_endpoints)
             ):
                 raise ValueError("signed validator access requires bounded fleet candidates")
+        if central_authorizer is not None:
+            if not isinstance(central_authorizer, CentralAccessAuthorizer):
+                raise ValueError("central_authorizer must be a CentralAccessAuthorizer")
+            if validator_authorizer is None or tls_context is None:
+                raise ValueError("central access requires signed validator access and native TLS")
+            if central_authorizer.channel_binding != channel_binding:
+                raise ValueError("central access must bind the worker TLS key")
+            if central_authorizer.worker_hotkey != configured_hotkey:
+                raise ValueError("central access must bind the configured worker hotkey")
+        if tee_box_api is not None:
+            from cathedral.tee_box.service import TeeBoxSandboxApi
+
+            if not isinstance(tee_box_api, TeeBoxSandboxApi):
+                raise ValueError("tee_box_api must be a TeeBoxSandboxApi")
+            # The sandbox API shares the attested listener, so its TLS key is
+            # the one REPORT_DATA binds (docs/TEE_BOX_SERVICE.md).
+            if tls_context is None or channel_binding is None:
+                raise ValueError("the TEE box sandbox API requires the attested worker TLS")
+            if tee_box_api.authorizer.channel_binding != channel_binding:
+                raise ValueError("TEE box caller access must bind the worker TLS key")
+            if tee_box_api.authorizer.worker_hotkey != configured_hotkey:
+                raise ValueError("TEE box caller access must bind the configured worker hotkey")
+            # Its roots come from measured state; the --central-* authorizer's
+            # come from miner flags, so the two never share an authorizer or
+            # replay state.
+            if central_authorizer is not None and (
+                tee_box_api.authorizer is central_authorizer
+                or tee_box_api.authorizer.state.path == central_authorizer.state.path
+            ):
+                raise ValueError("TEE box caller access must not share the flag-configured one")
         if (gpu_executor is None) != (gpu_evidence_collector is None):
             raise ValueError("GPU execution and composite collector are required together")
         if gpu_executor is not None:
@@ -1140,9 +1795,8 @@ class WorkerServer:
         semaphore = _Semaphore(max_concurrent)
         challenge_semaphore = _Semaphore(max_challenge_concurrent)
         sat_challenge_semaphore = _Semaphore(max_sat_challenge_concurrent)
-        validator_challenge_semaphore = _Semaphore(
-            max_validator_challenge_concurrent
-        )
+        validator_pool = _ValidatorPool(max_validator_challenge_concurrent)
+        self._validator_pool = validator_pool
         if isinstance(fleet_endpoints, FleetManifest):
             fleet_source = fleet_endpoints.endpoints
         elif fleet_endpoints is not None:
@@ -1163,7 +1817,7 @@ class WorkerServer:
             semaphore,
             challenge_semaphore,
             sat_challenge_semaphore,
-            validator_challenge_semaphore,
+            validator_pool,
             configured_hotkey,
             bearer_token,
             evidence_collector or collect_tdx,
@@ -1179,7 +1833,19 @@ class WorkerServer:
             validator_request_limiter,
             gpu_executor,
             gpu_evidence_collector,
+            central_authorizer,
+            None
+            if central_authorizer is None
+            else CentralRequestLimiter(
+                requests_per_window=central_requests_per_window,
+                window_seconds=central_rate_window_seconds,
+            ),
+            None if central_authorizer is None else _Semaphore(max_central_concurrent),
+            tee_box_api,
+            None if tee_box_api is None else _Semaphore(max_tee_box_concurrent),
         )
+        self._tee_box_api = tee_box_api
+        self._reaper_stop = threading.Event()
         self._server = _BoundedThreadingHTTPServer(
             (host, port),
             handler,
@@ -1202,10 +1868,42 @@ class WorkerServer:
         scheme = "https" if self._tls_enabled else "http"
         return f"{scheme}://{self.host}:{self.port}"
 
+    def _reap_tee_box(self) -> None:
+        # Lease and sandbox expiry also run on every sandbox call. This loop
+        # ends an expired customer's sandboxes when no call arrives, retries a
+        # drain whose deletes failed, and removes box-labelled containers the
+        # executor does not track, starting with any a previous process left.
+        while True:
+            for step in (self._tee_box_api.reap, self._tee_box_api.sweep):
+                try:
+                    step()
+                except Exception:
+                    pass
+            if self._reaper_stop.wait(TEE_BOX_REAP_INTERVAL_SECONDS):
+                return
+
+    def _check_tee_box_egress(self) -> None:
+        # A fixed-rate loop: the next check is due one interval after the
+        # previous one started, whatever the reaper is doing.
+        interval = TEE_BOX_EGRESS_CHECK_INTERVAL_SECONDS
+        due = time.monotonic()
+        while True:
+            try:
+                self._tee_box_api.check_egress()
+            except Exception:
+                pass
+            due = max(due + interval, time.monotonic())
+            if self._reaper_stop.wait(max(0.0, due - time.monotonic())):
+                return
+
     def serve_forever(self) -> None:
+        if self._tee_box_api is not None:
+            threading.Thread(target=self._reap_tee_box, daemon=True).start()
+            threading.Thread(target=self._check_tee_box_egress, daemon=True).start()
         self._server.serve_forever()
 
     def shutdown(self) -> None:
+        self._reaper_stop.set()
         self._server.shutdown()
         self._server.server_close()
 
