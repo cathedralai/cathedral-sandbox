@@ -27,3 +27,8 @@ mining paths.
 The current Cathedral validator derives weights directly from miner evidence.
 It does not consume the repository's older signed-vector publisher,
 central-enrollment, burn, or provenance flows.
+
+## Design proposals
+
+- [TEE sandbox box](TEE_BOX.md): TDX and SEV-SNP boxes that run customer
+  sandboxes under gVisor. Proposal only; not a mining path.
