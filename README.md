@@ -54,7 +54,8 @@ guarantee TAO. The subnet must have positive emission.
 The current direct validator source supports Intel TDX and AMD SEV-SNP. Each
 validator owns its SNP measurement and TCB allowlist. An AMD machine earns zero
 from that validator until its live hardware run is admitted by the policy and
-fresh evidence and SAT pass. No SN94 validator scores Cathedral miners yet; see
+fresh evidence and SAT pass. This source does not prove a deployed SN94
+validator or finalized weights; see
 [Validator-side dependencies](docs/SN94_MINER_QUICKSTART.md#validator-side-dependencies-not-live-until-the-validator-cutover).
 
 For AMD, the validator proves an admitted guest measurement, distinct hardware,
@@ -528,9 +529,9 @@ btcli --network finney query uid \
 btcli --network finney --json query weights --netuid 94
 ```
 
-SN94 uses commit-reveal. After a validator that scores Cathedral miners submits,
-and its commit reveals one epoch later, that validator's row must contain your
-miner UID with a positive fraction.
+Check the current SN94 commit-reveal settings before registration. After a
+validator that scores Cathedral miners submits and any configured reveal delay
+completes, that validator's row must contain your miner UID with a positive fraction.
 
 All of these must also be true:
 

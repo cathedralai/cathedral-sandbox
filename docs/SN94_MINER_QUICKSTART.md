@@ -16,11 +16,11 @@ quotes or launch evidence. This guide is the existing SAT lane, not the
 - **Miner side: ready.** The pinned images compile Finney netuid 94
   (`cathedral/audit_miner_entrypoint.py`, `VALIDATOR_NETUID = 94`) and every
   command below matches the source revision they were built from.
-- **Scoring: not live until the validator cutover.** No SN94 validator scores
-  Cathedral miners yet, so a miner that finishes this page serves correctly
-  and earns nothing until the items in
+- **Scoring requires the validator cutover.** No deployed SN94 validator scoring
+  Cathedral miners is proved by this source. A miner that finishes this page
+  still needs the items in
   [Validator-side dependencies](#validator-side-dependencies-not-live-until-the-validator-cutover)
-  are done. The miner needs no further change when they are.
+  to be qualified. This guide does not establish current earnings.
 - **Intel TDX needs no per-miner validator action.** A validator checks the
   Intel quote, the live TLS key, and SAT work; it keeps no TDX measurement
   allowlist.
@@ -378,11 +378,10 @@ weight, or emission.
 
 ## Part 3: register and announce (wallet machine)
 
-Register only after the reachability check passes. SN94 is full (256 of 256
-UIDs), so a registration takes the slot of a non-immune UID. Your UID is then
-immune for 5000 blocks, about 17 hours. After that, a UID with no emission can
-be replaced by a later registration, lowest emission and oldest registration
-first.
+Register only after the reachability check passes and you recheck current
+registration cost, occupied UIDs and immunity on the chain. The prior handoff
+recorded 256 occupied UIDs and 5000 immunity blocks; those are historical
+observations, not this run's verified current parameters.
 
 ```bash
 btcli --network finney subnets burn-cost 94
@@ -419,9 +418,9 @@ for validator, row in json.load(sys.stdin).items():
 ```
 
 The second command must print your UID, your public IPv4, and `8081`. The third
-prints nothing until a validator scores you. SN94 uses commit-reveal with a
-reveal period of one epoch (360 blocks, about 72 minutes), so a row changes
-only after the validator's commit reveals. There is no public validator-result
+prints nothing until a validator scores you. The prior handoff recorded
+commit-reveal with a one-epoch delay. Recheck the current settings; a row
+changes only after the applicable reveal completes. There is no public validator-result
 feed yet; ask the validator operator for your machine's result.
 
 ## What you see before the cutover
@@ -595,16 +594,18 @@ None of these is a miner action. Until all hold for a validator, it cannot
 score you.
 
 1. **An SN94 validator release.** The published validator release channel
-   still ships the SN39 build (commit `1ab0530`). A signed release built for
+   was recorded as the SN39 build (commit `1ab0530`) in the reviewed handoff.
+   Inspect the signed channel at installation. A signed release built for
    netuid 94 must be published and installed.
-2. **Weight writes under commit-reveal.** SN94 has commit-reveal enabled. The
-   validator must submit weights through it.
+2. **Weight writes under the current chain policy.** The handoff recorded
+   commit-reveal enabled. Verify the current policy and qualify a writer that
+   supports it.
 3. **A registered validator with a permit.** The Cathedral validator's hotkey
    must be registered on SN94 and hold a validator permit, or your snapshot
    will not list it and your worker refuses its requests.
-4. **Stake behind the weights.** Bittensor's consensus clips each miner's
-   weight to the stake-weighted median at `kappa` 0.5, so validators holding
-   more than half of SN94's active stake must weight a miner before it earns.
+4. **Consensus and emissions.** A positive submitted weight alone does not
+   prove emission. Inspect finalized consensus and actual miner emissions
+   after the applicable reveal and epoch boundaries.
 5. **SNP only: admission.** Each validator adds each SNP measurement and TCB
    floor to its own policy by hand. Setting `require_single_socket` to `false`
    through validator setup needs a newer signed validator bootstrap.
