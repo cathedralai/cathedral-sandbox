@@ -1671,7 +1671,9 @@ def test_public_legacy_bridge_cannot_starve_signed_validator_control(
         timeout=5.0,
     ) as server:
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        assert len(created) == 4
+        # Three semaphore classes; signed validator traffic has its own fair pool.
+        assert len(created) == 3
+        assert isinstance(server._validator_pool, worker_module._ValidatorPool)
         public_evidence_pool = created[1]
 
         validator = RemoteMiner(
@@ -1708,3 +1710,864 @@ def test_public_legacy_bridge_cannot_starve_signed_validator_control(
         finally:
             for connection in stalled:
                 connection.close()
+
+
+THIRD_VALIDATOR_PAIR = sr25519.pair_from_seed(b"t" * 32)
+THIRD_VALIDATOR_HOTKEY = _hotkey(THIRD_VALIDATOR_PAIR[0])
+
+
+def _three_validator_snapshot(*, generated_at: datetime, expires_at: datetime):
+    document = _snapshot_document(generated_at=generated_at, expires_at=expires_at)
+    document["validators"] = [
+        {"hotkey": hotkey, "uid": uid, "validator_permit": True, "stake_rao": 2_000}
+        for hotkey, uid in (
+            (VALIDATOR_HOTKEY, 30),
+            (OTHER_VALIDATOR_HOTKEY, 31),
+            (THIRD_VALIDATOR_HOTKEY, 32),
+        )
+    ]
+    signing_public = (
+        ed25519.Ed25519PrivateKey.from_private_bytes(SNAPSHOT_SEED)
+        .public_key()
+        .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    )
+    return verify_validator_access_snapshot(
+        canonical_json(sign_validator_access_snapshot(document, SNAPSHOT_SEED)),
+        {"cathedral-validator-access": signing_public},
+        network=NETWORK,
+        netuid=NETUID,
+        required_minimum_stake_rao=1_000,
+        now=generated_at,
+    )
+
+
+def test_two_validators_stalling_bodies_cannot_lock_out_a_third(tmp_path: Path):
+    """Review finding W2: the signed class is shared, so permitted validators
+    stalling their bodies used to turn every other validator away until the
+    request deadline. A stalled body now yields its slot to a new validator."""
+    server_context, client_context, binding = _tls_contexts(tmp_path)
+    current = datetime.now(UTC).replace(microsecond=0)
+    authorizer = ValidatorRequestAuthorizer(
+        _three_validator_snapshot(
+            generated_at=current, expires_at=current + timedelta(minutes=10)
+        ),
+        worker_hotkey=WORKER_HOTKEY,
+        channel_binding=binding,
+        state=ValidatorAccessState(str(tmp_path / "validator-access.sqlite")),
+        signature_verifier=load_sr25519_verifier(),
+    )
+
+    def evidence_collector(nonce, hotkey, **kwargs):
+        return Evidence(
+            kind=EvidenceKind.TDX,
+            quote=b"quote",
+            nonce=nonce,
+            miner_hotkey=hotkey,
+            report_data_version=kwargs["report_data_version"],
+            channel_binding=kwargs["channel_binding"],
+        )
+
+    with WorkerServer(
+        configured_hotkey=WORKER_HOTKEY,
+        bearer_token=None,
+        evidence_collector=evidence_collector,
+        channel_binding=binding,
+        tls_context=server_context,
+        validator_authorizer=authorizer,
+        fleet_endpoints=("https://8.8.8.8:8081",),
+        max_validator_challenge_concurrent=2,
+        timeout=10.0,
+    ) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        payload = canonical_json(
+            {
+                "assigned_hotkey": WORKER_HOTKEY,
+                "channel_binding_digest_hex": binding.digest.hex(),
+                "channel_binding_type": binding.binding_type.value,
+                "nonce_hex": os.urandom(32).hex(),
+                "report_data_version": 2,
+            }
+        )
+
+        def stall(hotkey, pair, nonce):
+            header = build_validator_request_header(
+                validator_hotkey=hotkey,
+                worker_hotkey=WORKER_HOTKEY,
+                network=NETWORK,
+                netuid=NETUID,
+                method="POST",
+                path="/v1/evidence",
+                body=payload,
+                channel_binding=binding,
+                nonce=nonce,
+                issued_at=current,
+                expires_at=current + timedelta(seconds=60),
+                signer=lambda message: sr25519.sign(pair, message),
+            )
+            connection = client_context.wrap_socket(
+                socket.create_connection((server.host, server.port), timeout=5.0),
+                server_hostname="127.0.0.1",
+            )
+            connection.sendall(
+                (
+                    "POST /v1/evidence HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{server.port}\r\n"
+                    "Content-Type: application/json\r\n"
+                    f"Content-Length: {len(payload)}\r\n"
+                    f"{VALIDATOR_REQUEST_HEADER}: {header}\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("ascii")
+            )
+            return connection
+
+        pool = server._validator_pool
+        stalled = [
+            stall(VALIDATOR_HOTKEY, VALIDATOR_PAIR, b"a" * 32),
+            stall(OTHER_VALIDATOR_HOTKEY, OTHER_VALIDATOR_PAIR, b"b" * 32),
+        ]
+        try:
+            deadline = time.monotonic() + 3.0
+            while pool.in_use != 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert pool.in_use == 2
+            time.sleep(worker_module.VALIDATOR_BODY_STALL_SECONDS + 0.2)
+            third = RemoteMiner(
+                server.base_url,
+                WORKER_HOTKEY,
+                ssl_context=client_context,
+                validator_hotkey=THIRD_VALIDATOR_HOTKEY,
+                validator_signer=lambda message: sr25519.sign(THIRD_VALIDATOR_PAIR, message),
+            )
+            evidence = third.fetch_evidence(os.urandom(32))
+            assert evidence.miner_hotkey == WORKER_HOTKEY
+            assert pool.displaced_count >= 1
+        finally:
+            for connection in stalled:
+                connection.close()
+
+
+def _pool(now, **kwargs):
+    return worker_module._ValidatorPool(
+        1, stall_seconds=1.0, penalty_seconds=20.0, clock=lambda: now[0], **kwargs
+    )
+
+
+def test_a_request_past_its_body_is_never_displaced():
+    now = [100.0]
+    pool = _pool(now)
+    a, b = socket.socketpair()
+    try:
+        slot = pool.admit(a, "v1")
+        assert slot is not None
+        now[0] += 0.5
+        assert pool.admit(b, "v2") is None  # still inside the grace
+        assert slot.mark_body_received() is True
+        now[0] += 5.0
+        assert pool.admit(b, "v2") is None  # body read: never displaced
+        slot.release()
+        assert pool.in_use == 0 and not pool.penalized("v1")
+    finally:
+        a.close()
+        b.close()
+
+
+def test_a_stalled_request_is_displaced_and_its_validator_benched():
+    now = [100.0]
+    pool = _pool(now)
+    a, b = socket.socketpair()
+    c, d = socket.socketpair()
+    try:
+        stalled = pool.admit(a, "attacker")
+        now[0] += 1.5
+        newcomer = pool.admit(c, "honest")
+        assert newcomer is not None and pool.displaced_count == 1
+        # A displaced request that finished reading just too late must stop.
+        assert stalled.mark_body_received() is False
+        stalled.release()  # owns nothing
+        assert pool.in_use == 1
+        assert pool.penalized("attacker")
+        newcomer.release()
+        assert pool.admit(b, "attacker") is None  # benched
+        now[0] += 21.0
+        assert pool.admit(b, "attacker") is not None  # served its time
+    finally:
+        for sock in (a, b, c, d):
+            sock.close()
+
+
+def test_leaving_without_a_body_benches_the_validator():
+    # The adaptive attack: stall, then close just inside the grace, and repeat.
+    now = [100.0]
+    pool = _pool(now)
+    a, b = socket.socketpair()
+    try:
+        slot = pool.admit(a, "attacker")
+        now[0] += 0.95
+        slot.release()  # closed before its body arrived
+        assert pool.penalized("attacker")
+        assert pool.admit(b, "attacker") is None
+        assert pool.admit(b, "honest") is not None
+    finally:
+        a.close()
+        b.close()
+
+
+def test_the_grace_grows_with_the_declared_body():
+    now = [100.0]
+    pool = _pool(now)
+    a, b = socket.socketpair()
+    try:
+        assert pool.admit(a, "far-validator", 64 * 1024) is not None  # grace 1 s + 2 s
+        now[0] += 2.5
+        assert pool.admit(b, "other") is None
+        now[0] += 1.0
+        assert pool.admit(b, "other") is not None
+    finally:
+        a.close()
+        b.close()
+
+
+def test_only_a_client_fault_after_the_body_benches():
+    now = [100.0]
+    pool = worker_module._ValidatorPool(3, penalty_seconds=20.0, clock=lambda: now[0])
+    pairs = [socket.socketpair() for _ in range(3)]
+    try:
+        verified, refused, rejected = (
+            pool.admit(a, hotkey) for (a, _b), hotkey in zip(pairs, ("ok", "server", "junk"))
+        )
+        for slot in (verified, refused, rejected):
+            assert slot.mark_body_received() is True
+        verified.mark_verified()
+        rejected.mark_client_fault()  # e.g. the body is not the one signed
+        now[0] += 5.0  # a slow finalize: no stall clock once the body is in
+        for slot in (verified, refused, rejected):
+            slot.release()
+        assert not pool.penalized("ok")
+        assert not pool.penalized("server")  # the worker refused: replay store, snapshot
+        assert pool.penalized("junk")
+    finally:
+        for a, b in pairs:
+            a.close()
+            b.close()
+
+
+def test_the_penalty_table_is_bounded():
+    now = [100.0]
+    pool = worker_module._ValidatorPool(
+        1, penalty_seconds=20.0, max_penalized=3, clock=lambda: now[0]
+    )
+    sockets = [socket.socketpair() for _ in range(5)]
+    try:
+        for index, (a, _b) in enumerate(sockets):
+            pool.admit(a, f"v{index}").release()
+        assert len(pool._penalized_until) == 3
+    finally:
+        for a, b in sockets:
+            a.close()
+            b.close()
+
+
+def test_the_body_arrival_ends_the_slow_charge():
+    """Only pre-body time is slow. The charge is taken when the body arrives,
+    so the time spent serving the request is never billed to the validator."""
+    now = [100.0]
+    pool = _pool(now)
+    a, _b = socket.socketpair()
+    c, _d = socket.socketpair()
+    try:
+        prompt = pool.admit(a, "prompt")
+        now[0] += 0.05
+        assert prompt.mark_body_received() is True
+        prompt.mark_verified()
+        now[0] += 10.0  # a long solve
+        prompt.release()
+        assert pool.slow_usage("prompt") == 0.0
+
+        late = pool.admit(c, "late")
+        now[0] += 0.9
+        assert late.mark_body_received() is True
+        charged = pool.slow_usage("late")
+        # The grace is 1 s; its prompt fraction is free.
+        assert charged == pytest.approx(0.9 - 1.0 * worker_module.VALIDATOR_PROMPT_GRACE_FRACTION)
+        late.mark_verified()
+        now[0] += 10.0
+        late.release()
+        assert pool.slow_usage("late") < charged  # draining, never charged again
+    finally:
+        for sock in (a, _b, c, _d):
+            sock.close()
+
+
+def test_the_slow_usage_table_is_bounded():
+    now = [100.0]
+    pool = worker_module._ValidatorPool(1, stall_seconds=1.0, max_penalized=3, clock=lambda: now[0])
+    sockets = [socket.socketpair() for _ in range(5)]
+    try:
+        for index, (a, _b) in enumerate(sockets):
+            slot = pool.admit(a, f"v{index}")
+            now[0] += 0.9  # a valid body just inside the grace: charged, not benched
+            assert slot.mark_body_received() is True
+            slot.mark_verified()
+            slot.release()
+        assert len(pool._slow_usage) == 3
+        assert "v4" in pool._slow_usage
+        assert not any(pool.penalized(f"v{index}") for index in range(5))
+    finally:
+        for a, b in sockets:
+            a.close()
+            b.close()
+
+
+def test_a_body_that_fails_its_signature_benches_the_validator(tmp_path: Path):
+    """Sending a mismatched body at the end of the grace used to keep the slot,
+    dodge the bench and leave the header replayable. A body the signature does
+    not cover is a client fault, so it still benches even though a full-length
+    body stops the stall clock."""
+    server_context, client_context, binding = _tls_contexts(tmp_path)
+    current = datetime.now(UTC).replace(microsecond=0)
+    authorizer = ValidatorRequestAuthorizer(
+        _three_validator_snapshot(
+            generated_at=current, expires_at=current + timedelta(minutes=10)
+        ),
+        worker_hotkey=WORKER_HOTKEY,
+        channel_binding=binding,
+        state=ValidatorAccessState(str(tmp_path / "validator-access.sqlite")),
+        signature_verifier=load_sr25519_verifier(),
+    )
+
+    def evidence_collector(nonce, hotkey, **kwargs):
+        return Evidence(
+            kind=EvidenceKind.TDX,
+            quote=b"quote",
+            nonce=nonce,
+            miner_hotkey=hotkey,
+            report_data_version=kwargs["report_data_version"],
+            channel_binding=kwargs["channel_binding"],
+        )
+
+    with WorkerServer(
+        configured_hotkey=WORKER_HOTKEY,
+        bearer_token=None,
+        evidence_collector=evidence_collector,
+        channel_binding=binding,
+        tls_context=server_context,
+        validator_authorizer=authorizer,
+        fleet_endpoints=("https://8.8.8.8:8081",),
+        timeout=5.0,
+    ) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        signed_body = canonical_json({"nonce_hex": "00" * 32})
+        header = build_validator_request_header(
+            validator_hotkey=VALIDATOR_HOTKEY,
+            worker_hotkey=WORKER_HOTKEY,
+            network=NETWORK,
+            netuid=NETUID,
+            method="POST",
+            path="/v1/evidence",
+            body=signed_body,
+            channel_binding=binding,
+            nonce=b"x" * 32,
+            issued_at=current,
+            expires_at=current + timedelta(seconds=60),
+            signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
+        )
+
+        def send(body: bytes) -> bytes:
+            connection = client_context.wrap_socket(
+                socket.create_connection((server.host, server.port), timeout=5.0),
+                server_hostname="127.0.0.1",
+            )
+            try:
+                connection.sendall(
+                    (
+                        "POST /v1/evidence HTTP/1.1\r\n"
+                        f"Host: 127.0.0.1:{server.port}\r\n"
+                        "Content-Type: application/json\r\n"
+                        f"Content-Length: {len(body)}\r\n"
+                        f"{VALIDATOR_REQUEST_HEADER}: {header}\r\n"
+                        "Connection: close\r\n\r\n"
+                    ).encode("ascii")
+                    + body
+                )
+                response = b""
+                while b"\r\n\r\n" not in response:
+                    chunk = connection.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+                return response.partition(b"\r\n")[0]
+            finally:
+                connection.close()
+
+        junk = b"x" * len(signed_body)
+        assert b" 401 " in send(junk)
+        assert server._validator_pool.penalized(VALIDATOR_HOTKEY)
+        assert b" 429 " in send(signed_body)  # benched: the replay gets nowhere
+
+
+def _three_validator_authorizer(tmp_path: Path, binding, current, **state_kwargs):
+    return ValidatorRequestAuthorizer(
+        _three_validator_snapshot(generated_at=current, expires_at=current + timedelta(minutes=10)),
+        worker_hotkey=WORKER_HOTKEY,
+        channel_binding=binding,
+        state=ValidatorAccessState(str(tmp_path / "validator-access.sqlite"), **state_kwargs),
+        signature_verifier=load_sr25519_verifier(),
+    )
+
+
+def _evidence_server(authorizer, server_context, binding, **kwargs):
+    def evidence_collector(nonce, hotkey, **collector_kwargs):
+        return Evidence(
+            kind=EvidenceKind.TDX,
+            quote=b"quote",
+            nonce=nonce,
+            miner_hotkey=hotkey,
+            report_data_version=collector_kwargs["report_data_version"],
+            channel_binding=collector_kwargs["channel_binding"],
+        )
+
+    return WorkerServer(
+        configured_hotkey=WORKER_HOTKEY,
+        bearer_token=None,
+        evidence_collector=evidence_collector,
+        channel_binding=binding,
+        tls_context=server_context,
+        validator_authorizer=authorizer,
+        fleet_endpoints=("https://8.8.8.8:8081",),
+        **kwargs,
+    )
+
+
+def test_a_slow_finalize_does_not_displace_a_validator_that_sent_its_body(tmp_path: Path):
+    """Review of W2: the stall clock used to run through finalize, a
+    synchronous replay-store write. With finalize taking longer than the grace,
+    a third validator arriving while the class was full displaced a validator
+    that had already sent a complete, valid body: its nonce was consumed, it
+    got no response, and it was benched."""
+    server_context, client_context, binding = _tls_contexts(tmp_path)
+    current = datetime.now(UTC).replace(microsecond=0)
+    authorizer = _three_validator_authorizer(tmp_path, binding, current)
+    # The worker finalizes through finalize_result; slow that down, and count the
+    # calls so the test fails if the worker ever stops going through it.
+    original_finalize = authorizer.finalize_result
+    slow_calls: list[float] = []
+
+    def slow_finalize(*args, **kwargs):
+        slow_calls.append(time.monotonic())
+        time.sleep(1.5)
+        return original_finalize(*args, **kwargs)
+
+    authorizer.finalize_result = slow_finalize
+    with _evidence_server(
+        authorizer, server_context, binding, max_validator_challenge_concurrent=2, timeout=10.0
+    ) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        pool = server._validator_pool
+        results: dict[str, object] = {}
+
+        def fetch(name, hotkey, pair):
+            miner = RemoteMiner(
+                server.base_url,
+                WORKER_HOTKEY,
+                ssl_context=client_context,
+                validator_hotkey=hotkey,
+                validator_signer=lambda message: sr25519.sign(pair, message),
+            )
+            try:
+                results[name] = miner.fetch_evidence(os.urandom(32))
+            except RemoteError as exc:
+                results[name] = exc
+
+        first = [
+            threading.Thread(target=fetch, args=("A", VALIDATOR_HOTKEY, VALIDATOR_PAIR)),
+            threading.Thread(
+                target=fetch, args=("B", OTHER_VALIDATOR_HOTKEY, OTHER_VALIDATOR_PAIR)
+            ),
+        ]
+        for thread in first:
+            thread.start()
+        time.sleep(1.2)
+        fetch("C", THIRD_VALIDATOR_HOTKEY, THIRD_VALIDATOR_PAIR)
+        for thread in first:
+            thread.join(timeout=10.0)
+        assert len(slow_calls) >= 2  # A's and B's bodies went through the slow finalize
+        for name in ("A", "B"):
+            assert isinstance(results[name], Evidence), results[name]
+            assert results[name].miner_hotkey == WORKER_HOTKEY
+        assert pool.displaced_count == 0
+        assert not pool.penalized(VALIDATOR_HOTKEY)
+        assert not pool.penalized(OTHER_VALIDATOR_HOTKEY)
+        # C found the class full of requests past their bodies and was turned
+        # away (or, if it raced a release, served), never at A's expense.
+        assert not pool.penalized(THIRD_VALIDATOR_HOTKEY)
+
+
+class _SwitchableSnapshotProvider:
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.available = True
+
+    @property
+    def network(self) -> str:
+        return self.inner.network
+
+    @property
+    def netuid(self) -> int:
+        return self.inner.netuid
+
+    def load(self, *, now):
+        return self.inner.load(now=now) if self.available else None
+
+
+@pytest.mark.parametrize(
+    "refusal", ["replay-store-full", "replay-store-error", "snapshot-unavailable"]
+)
+def test_a_refusal_on_the_worker_side_does_not_bench_the_validator(tmp_path: Path, refusal: str):
+    """Review of W2: every finalize refusal used to bench, so a full replay
+    store (which an attacker can fill) turned into 20 s bans for honest
+    validators. Only a client fault benches now."""
+    server_context, client_context, binding = _tls_contexts(tmp_path)
+    current = datetime.now(UTC).replace(microsecond=0)
+    authorizer = _three_validator_authorizer(
+        tmp_path,
+        binding,
+        current,
+        **({"max_replay_entries": 1} if refusal == "replay-store-full" else {}),
+    )
+    switchable = _SwitchableSnapshotProvider(authorizer.snapshot_provider)
+    authorizer.snapshot_provider = switchable
+    original_preauthorize = authorizer.preauthorize
+    original_connect = authorizer.state._connect
+    sabotaged = [False]
+
+    def preauthorize(*args, **kwargs):
+        # The envelope checks pass; the worker then fails before replay commit.
+        result = original_preauthorize(*args, **kwargs)
+        if sabotaged[0] and refusal == "snapshot-unavailable":
+            switchable.available = False
+        return result
+
+    def failing_connect():
+        if sabotaged[0]:
+            raise sqlite3.OperationalError("disk I/O error")
+        return original_connect()
+
+    authorizer.preauthorize = preauthorize
+    authorizer.state._connect = failing_connect
+    with _evidence_server(authorizer, server_context, binding, timeout=5.0) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        pool = server._validator_pool
+
+        def miner(hotkey, pair):
+            return RemoteMiner(
+                server.base_url,
+                WORKER_HOTKEY,
+                ssl_context=client_context,
+                validator_hotkey=hotkey,
+                validator_signer=lambda message: sr25519.sign(pair, message),
+            )
+
+        if refusal == "replay-store-full":
+            # Another validator's accepted request fills the one-entry store.
+            miner(OTHER_VALIDATOR_HOTKEY, OTHER_VALIDATOR_PAIR).fetch_evidence(os.urandom(32))
+        else:
+            sabotaged[0] = True
+        with pytest.raises(RemoteError) as refused:
+            miner(VALIDATOR_HOTKEY, VALIDATOR_PAIR).fetch_evidence(os.urandom(32))
+        assert refused.value.status_code == 401
+        _wait_released(pool)
+        assert not pool.penalized(VALIDATOR_HOTKEY)
+        # Not benched: the next request reaches finalize again (401 while the
+        # fault lasts, never 429), and succeeds once the worker recovers.
+        with pytest.raises(RemoteError) as again:
+            miner(VALIDATOR_HOTKEY, VALIDATOR_PAIR).fetch_evidence(os.urandom(32))
+        assert again.value.status_code == 401
+        if refusal != "replay-store-full":
+            sabotaged[0] = False
+            switchable.available = True
+            evidence = miner(VALIDATOR_HOTKEY, VALIDATOR_PAIR).fetch_evidence(os.urandom(32))
+            assert evidence.miner_hotkey == WORKER_HOTKEY
+
+
+def test_a_hotkey_over_its_slow_slot_budget_loses_its_grace():
+    """Review of W2: a valid body sent just inside the grace was never
+    displaced or benched, so two hotkeys doing it back to back held a class of
+    two. Slow slot time now drains a per-hotkey budget; once over it, the
+    hotkey's request still waiting for its body is displaced at once, without
+    a bench. A prompt validator is never charged."""
+    now = [100.0]
+    pool = worker_module._ValidatorPool(
+        1,
+        penalty_seconds=20.0,
+        slow_budget_seconds=2.0,
+        slow_window_seconds=60.0,
+        clock=lambda: now[0],
+    )
+    a, b = socket.socketpair()
+    try:
+        # A prompt validator sends many bodies within a tenth of its grace.
+        for _ in range(200):
+            slot = pool.admit(a, "prompt")
+            now[0] += 0.09
+            assert slot.mark_body_received() is True
+            slot.release()
+        assert pool.slow_usage("prompt") == 0.0
+        slot = pool.admit(a, "prompt")
+        now[0] += 0.5
+        assert pool.admit(b, "other") is None  # inside its grace: kept
+        slot.release()
+
+        # A slow validator sends each valid body at 0.95 s of a 1 s grace.
+        for _ in range(2):
+            slot = pool.admit(a, "slow")
+            now[0] += 0.95
+            assert pool.admit(b, "other") is None  # still under budget
+            assert slot.mark_body_received() is True
+            slot.release()
+        assert pool.slow_usage("slow") == pytest.approx(2 * 0.85, abs=0.05)  # less drain
+        slot = pool.admit(a, "slow")
+        now[0] += 0.05
+        assert pool.admit(b, "other") is None  # within its prompt tenth
+        now[0] += 0.45  # 1.7 + 0.4 charged is over the 2 s budget
+        newcomer = pool.admit(b, "other")
+        assert newcomer is not None and pool.displaced_count == 1
+        assert slot.mark_body_received() is False  # displaced: must stop
+        slot.release()
+        assert not pool.penalized("slow")  # displaced for the budget, not benched
+        newcomer.release()
+        # The budget drains: after its window the hotkey has its grace back.
+        now[0] += 120.0
+        assert pool.slow_usage("slow") == 0.0
+        slot = pool.admit(a, "slow")
+        now[0] += 0.5
+        assert pool.admit(b, "other") is None
+        slot.release()
+    finally:
+        a.close()
+        b.close()
+
+
+def _evidence_request_body(binding) -> bytes:
+    return canonical_json(
+        {
+            "nonce_hex": os.urandom(32).hex(),
+            "assigned_hotkey": WORKER_HOTKEY,
+            "report_data_version": 2,
+            "channel_binding_type": binding.binding_type.value,
+            "channel_binding_digest_hex": binding.digest.hex(),
+        }
+    )
+
+
+def _evidence_header(binding, issued_at, hotkey, pair, body, nonce, lifetime=100):
+    return build_validator_request_header(
+        validator_hotkey=hotkey,
+        worker_hotkey=WORKER_HOTKEY,
+        network=NETWORK,
+        netuid=NETUID,
+        method="POST",
+        path="/v1/evidence",
+        body=body,
+        channel_binding=binding,
+        nonce=nonce,
+        issued_at=issued_at,
+        expires_at=issued_at + timedelta(seconds=lifetime),
+        signer=lambda message: sr25519.sign(pair, message),
+    )
+
+
+def _send_evidence(server, context, header, body, delay=0.0) -> bytes:
+    """One raw signed request whose body follows its headers after delay."""
+    try:
+        connection = context.wrap_socket(
+            socket.create_connection((server.host, server.port), timeout=5.0),
+            server_hostname="127.0.0.1",
+        )
+    except OSError:
+        return b""
+    try:
+        connection.sendall(
+            (
+                "POST /v1/evidence HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{server.port}\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"{VALIDATOR_REQUEST_HEADER}: {header}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii")
+        )
+        if delay:
+            time.sleep(delay)
+        connection.sendall(body)
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        return response.partition(b"\r\n")[0]
+    except OSError:
+        return b""  # displaced: the worker shut the connection
+    finally:
+        connection.close()
+
+
+def _wait_released(pool) -> None:
+    """The 401 goes out before the handler releases its slot and benches."""
+    deadline = time.monotonic() + 3.0
+    while pool.in_use and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert pool.in_use == 0
+
+
+def _without_early_replay_check(authorizer):
+    authorizer.is_replay = lambda *args, **kwargs: False
+    return authorizer
+
+
+@pytest.mark.parametrize("early_check", [True, False], ids=["early-check", "finalize-only"])
+def test_a_replayed_request_cannot_hold_a_slot(tmp_path: Path, early_check: bool):
+    """Review of 514f220: a replay was refused only in finalize, which did not
+    bench it, so resending one signed request held a slot for its whole
+    lifetime. The early check now refuses it before a slot; a replay that gets
+    past it (finalize-only here) is a client fault and benches."""
+    server_context, client_context, binding = _tls_contexts(tmp_path)
+    current = datetime.now(UTC).replace(microsecond=0)
+    authorizer = _three_validator_authorizer(tmp_path, binding, current)
+    if not early_check:
+        _without_early_replay_check(authorizer)
+    with _evidence_server(authorizer, server_context, binding, timeout=5.0) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        pool = server._validator_pool
+        body = _evidence_request_body(binding)
+        header = _evidence_header(
+            binding, current, VALIDATOR_HOTKEY, VALIDATOR_PAIR, body, b"r" * 32
+        )
+        assert b" 200 " in _send_evidence(server, client_context, header, body)
+        _wait_released(pool)
+        assert not pool.penalized(VALIDATOR_HOTKEY)
+        assert b" 401 " in _send_evidence(server, client_context, header, body)
+        _wait_released(pool)
+        if early_check:
+            assert not pool.penalized(VALIDATOR_HOTKEY)  # never held a slot
+            assert b" 401 " in _send_evidence(server, client_context, header, body)
+        else:
+            assert pool.penalized(VALIDATOR_HOTKEY)
+            assert b" 429 " in _send_evidence(server, client_context, header, body)
+
+
+def test_a_request_that_expires_in_flight_benches(tmp_path: Path):
+    """Review of 514f220: signing expires_at just ahead and sending the body
+    after it was refused as expired without a bench."""
+    server_context, client_context, binding = _tls_contexts(tmp_path)
+    current = datetime.now(UTC).replace(microsecond=0)
+    authorizer = _three_validator_authorizer(tmp_path, binding, current)
+    with _evidence_server(authorizer, server_context, binding, timeout=5.0) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        body = _evidence_request_body(binding)
+        issued = datetime.now(UTC).replace(microsecond=0)
+        header = _evidence_header(
+            binding, issued, VALIDATOR_HOTKEY, VALIDATOR_PAIR, body, os.urandom(32), lifetime=2
+        )
+        delay = (issued + timedelta(seconds=2) - datetime.now(UTC)).total_seconds() + 0.2
+        assert b" 401 " in _send_evidence(server, client_context, header, body, delay=delay)
+        _wait_released(server._validator_pool)
+        assert server._validator_pool.penalized(VALIDATOR_HOTKEY)
+
+
+def _lockout_round(server, client_context, binding, current, attacker_request, seconds=6.0):
+    """A and B loop attacker_request with each body at 0.95 s; C sends prompt
+    fresh requests. Returns C's status lines."""
+    stop = time.monotonic() + seconds
+
+    def attack(hotkey, pair, tag):
+        while time.monotonic() < stop:
+            attacker_request(hotkey, pair, tag)
+
+    attackers = [
+        threading.Thread(target=attack, args=(hotkey, pair, tag), daemon=True)
+        for hotkey, pair, tag in (
+            (VALIDATOR_HOTKEY, VALIDATOR_PAIR, b"a"),
+            (OTHER_VALIDATOR_HOTKEY, OTHER_VALIDATOR_PAIR, b"b"),
+        )
+    ]
+    for thread in attackers:
+        thread.start()
+    time.sleep(0.3)
+    third = []
+    while time.monotonic() < stop - 0.5:
+        body = _evidence_request_body(binding)
+        header = _evidence_header(
+            binding, current, THIRD_VALIDATOR_HOTKEY, THIRD_VALIDATOR_PAIR, body, os.urandom(32)
+        )
+        third.append(_send_evidence(server, client_context, header, body))
+        time.sleep(0.25)
+    for thread in attackers:
+        thread.join(timeout=10.0)
+    return third
+
+
+@pytest.mark.parametrize("early_check", [True, False], ids=["early-check", "finalize-only"])
+def test_two_replaying_validators_do_not_lock_out_a_third(tmp_path: Path, early_check: bool):
+    """The reviewer's lockout: with a class of two, A and B resending one
+    signed request each, body at 0.95 s, turned C away 27 of 27 times."""
+    server_context, client_context, binding = _tls_contexts(tmp_path)
+    current = datetime.now(UTC).replace(microsecond=0)
+    authorizer = _three_validator_authorizer(tmp_path, binding, current)
+    if not early_check:
+        _without_early_replay_check(authorizer)
+    with _evidence_server(
+        authorizer, server_context, binding, timeout=5.0, max_validator_challenge_concurrent=2
+    ) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        requests = {}
+        for hotkey, pair, tag in (
+            (VALIDATOR_HOTKEY, VALIDATOR_PAIR, b"a"),
+            (OTHER_VALIDATOR_HOTKEY, OTHER_VALIDATOR_PAIR, b"b"),
+        ):
+            body = _evidence_request_body(binding)
+            requests[hotkey] = (
+                _evidence_header(binding, current, hotkey, pair, body, tag * 32),
+                body,
+            )
+
+        def replay(hotkey, _pair, _tag):
+            header, body = requests[hotkey]
+            _send_evidence(server, client_context, header, body, delay=0.95)
+
+        third = _lockout_round(server, client_context, binding, current, replay)
+        # Finalize-only, A's and B's first replay still holds a slot until it
+        # is refused and benched, about 2 s in; C is then served.
+        served = sum(b" 200 " in line for line in third[10:])
+        assert served >= len(third[10:]) * 3 // 4, third
+
+
+def test_two_slow_fresh_validators_do_not_lock_out_a_third(tmp_path: Path):
+    """The reviewer's second lockout, which predates the bench: fresh valid
+    requests with each body at 0.95 s are never displaced or benched, so A and
+    B held a class of two. Over the slow-slot budget they lose the grace."""
+    server_context, client_context, binding = _tls_contexts(tmp_path)
+    current = datetime.now(UTC).replace(microsecond=0)
+    authorizer = _three_validator_authorizer(tmp_path, binding, current)
+    with _evidence_server(
+        authorizer, server_context, binding, timeout=5.0, max_validator_challenge_concurrent=2
+    ) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        pool = server._validator_pool
+        pool._slow_budget = 1.0  # the default 5 s would outlast a short test
+        pool._slow_drain = 1.0 / 60.0
+
+        def fresh(hotkey, pair, _tag):
+            body = _evidence_request_body(binding)
+            header = _evidence_header(binding, current, hotkey, pair, body, os.urandom(32))
+            _send_evidence(server, client_context, header, body, delay=0.95)
+
+        third = _lockout_round(server, client_context, binding, current, fresh, seconds=8.0)
+        # A and B exceed the 1 s budget within about two requests each; from
+        # then on C is admitted whenever it arrives.
+        served = sum(b" 200 " in line for line in third[10:])
+        assert served >= len(third[10:]) * 3 // 4, third
+        assert pool.displaced_count > 0
+        assert not pool.penalized(VALIDATOR_HOTKEY)
+        assert not pool.penalized(OTHER_VALIDATOR_HOTKEY)
+        assert not pool.penalized(THIRD_VALIDATOR_HOTKEY)
