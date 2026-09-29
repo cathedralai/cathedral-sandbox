@@ -135,6 +135,9 @@ from cathedral.runtime import (
     RuntimeConfig,
 )
 from cathedral.score_class import export_score_class_report
+from cathedral.capacity.measurement_list import accept_release as accept_measurement_list
+from cathedral.capacity.measurement_list import mirror_source as measurement_mirror_source
+from cathedral.capacity.measurement_list import policy_bytes as measurement_policy_bytes
 from cathedral.tee_box.configure import add_tee_box_arguments, build_tee_box_api, tee_box_config
 from cathedral.worker import WorkerServer
 
@@ -690,6 +693,62 @@ def cmd_policy_registry_verify(args: argparse.Namespace) -> int:
                     {"id": profile.profile_id, "kind": profile.kind, "status": profile.status}
                     for profile in snapshot.profiles
                 ],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_policy_registry_export_measurement_policy(args: argparse.Namespace) -> int:
+    """Write a measurement policy file, in cathedral-validator #256's format,
+    from one verified release of the owner's signed measurement list.
+
+    The rollout mirror (docs/MRTD.md, "The TEE box measurement list"): the
+    validator keeps reading its local file, and operators regenerate it from
+    the signed list. The release is verified with the pinned owner key file
+    and accepted into ``--state``'s high-water mark before anything is
+    written, so a lower release than one already exported is refused. #256's
+    loader takes no extra keys, so the release and digest go in
+    ``<out>.source.json``, bound to the policy file by its SHA-256."""
+
+    keys = _load_registry_keys(
+        args.trusted_keys,
+        production_mode=True,
+        pinned_digest=args.trusted_keys_digest,
+    )
+    state = PolicyRegistryState(
+        args.state,
+        production_mode=True,
+        minimum_release=args.min_release,
+        pinned_release=args.pinned_release,
+        pinned_digest=args.pinned_digest,
+    )
+    release = accept_measurement_list(
+        _read_bounded_registry_file(args.registry, "policy registry"),
+        keys,
+        state,
+        max_age_seconds=args.max_age_seconds,
+    )
+    policy = measurement_policy_bytes(
+        release, kind=args.kind, mode=args.mode, all_profiles=args.all_profiles
+    )
+    source = measurement_mirror_source(release, policy, kind=args.kind, mode=args.mode)
+    source_path = args.out + ".source.json"
+    # The source record first: a policy file is never newer than its record.
+    _write_score_class_report(source_path, source)
+    _write_score_class_report(args.out, policy)
+    print(
+        json.dumps(
+            {
+                "out": args.out,
+                "source": source_path,
+                "kind": args.kind,
+                "mode": args.mode,
+                "policy_digest": "sha256:" + hashlib.sha256(policy).hexdigest(),
+                "registry_release": release.release,
+                "registry_digest": release.digest,
+                "allowed_measurements": len(json.loads(policy)["allowed_measurements"]),
             },
             sort_keys=True,
         )
@@ -4631,6 +4690,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="verify at canonical UTC receipt time instead of current admission time",
     )
     p_policy_verify.set_defaults(func=cmd_policy_registry_verify)
+    p_policy_export = policy_sub.add_parser(
+        "export-measurement-policy",
+        help="write the validator's #256 measurement policy file from the signed list",
+        description=(
+            "Verify one release of the owner's signed measurement list with the "
+            "pinned key file, accept it into the high-water state, and write "
+            "cathedral-validator #256's policy file plus <out>.source.json "
+            "naming the release and digest it came from."
+        ),
+    )
+    p_policy_export.add_argument("--registry", required=True)
+    p_policy_export.add_argument("--trusted-keys", required=True)
+    p_policy_export.add_argument(
+        "--trusted-keys-digest",
+        required=True,
+        help="sha256:<hex> of the trusted key file, pinning the owner key",
+    )
+    p_policy_export.add_argument(
+        "--state", required=True, help="the durable high-water SQLite state for this mirror"
+    )
+    p_policy_export.add_argument("--min-release", type=int)
+    p_policy_export.add_argument("--pinned-release", type=int)
+    p_policy_export.add_argument("--pinned-digest")
+    p_policy_export.add_argument("--max-age-seconds", type=int, default=86400)
+    p_policy_export.add_argument("--kind", choices=("tdx", "sev_snp"), default="tdx")
+    p_policy_export.add_argument("--mode", choices=("shadow", "enforce"), required=True)
+    p_policy_export.add_argument(
+        "--all-profiles",
+        action="store_true",
+        help="also list other eligible CPU profiles of the kind, not only TEE box images",
+    )
+    p_policy_export.add_argument("--out", required=True)
+    p_policy_export.set_defaults(func=cmd_policy_registry_export_measurement_policy)
 
     p_receipt = sub.add_parser("receipt", help="verify assurance receipts")
     receipt_sub = p_receipt.add_subparsers(dest="receipt_command", required=True)

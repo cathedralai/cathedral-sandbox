@@ -7,6 +7,7 @@ measurement list".
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import hashlib
 import json
@@ -19,6 +20,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from cathedral import cli
 from cathedral.capacity import admission as adm
 from cathedral.capacity import measurement_list as ml
 from cathedral.policy_registry import (
@@ -504,6 +506,107 @@ def test_the_mirror_source_names_the_release_and_binds_the_policy_file(tmp_path)
         "registry_generated_at": "2026-09-29T11:00:00Z",
         "registry_valid_until": VALID_UNTIL,
     }
+
+
+# -- the CLI ------------------------------------------------------------------------------
+
+
+def _cli_files(tmp_path, registry: bytes) -> dict[str, str]:
+    keys = json.dumps({KEY_ID: base64.b64encode(PUBLIC).decode()}).encode()
+    (tmp_path / "keys.json").write_bytes(keys)
+    (tmp_path / "registry.json").write_bytes(registry)
+    return {
+        "keys": str(tmp_path / "keys.json"),
+        "digest": "sha256:" + hashlib.sha256(keys).hexdigest(),
+        "registry": str(tmp_path / "registry.json"),
+        "state": str(tmp_path / "mirror-state.sqlite3"),
+        "out": str(tmp_path / "out" / "tdx-measurement-policy.json"),
+    }
+
+
+def _export(files: dict[str, str], *extra: str) -> int:
+    return cli.main(
+        [
+            "policy-registry",
+            "export-measurement-policy",
+            "--registry",
+            files["registry"],
+            "--trusted-keys",
+            files["keys"],
+            "--trusted-keys-digest",
+            files["digest"],
+            "--state",
+            files["state"],
+            "--min-release",
+            "1",
+            "--mode",
+            "shadow",
+            "--out",
+            files["out"],
+            *extra,
+        ]
+    )
+
+
+def _registry_now(release: int = 1, profiles=None) -> bytes:
+    # The CLI verifies at the wall clock, so this release is fresh now.
+    now = datetime.now(UTC).replace(microsecond=0)
+    generated = (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    start = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end = (now + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    document = json.loads(_registry(profiles, release=release))
+    document.pop("signature")
+    document.update(generated_at=generated, valid_from=start, valid_until=end)
+    for profile in document["profiles"]:
+        profile.update(status_changed_at=start, valid_from=start, valid_until=end)
+    return canonical_json(sign_registry(document, SEED))
+
+
+def test_the_cli_writes_the_256_file_and_its_source(tmp_path, capsys):
+    files = _cli_files(tmp_path, _registry_now(release=3))
+    assert _export(files) == 0
+    summary = json.loads(capsys.readouterr().out)
+    out = tmp_path / "out" / "tdx-measurement-policy.json"
+    raw = out.read_bytes()
+    mode, allowed, digest = _load_like_256(raw)
+    assert (mode, allowed) == ("shadow", frozenset(_pair(IMAGE)))
+    assert out.stat().st_mode & 0o022 == 0  # #256 refuses a group or world writable file
+    source = json.loads((tmp_path / "out" / "tdx-measurement-policy.json.source.json").read_text())
+    assert source["policy_digest"] == digest == summary["policy_digest"]
+    assert source["registry_release"] == summary["registry_release"] == 3
+    assert source["registry_digest"] == summary["registry_digest"]
+    assert summary["allowed_measurements"] == 2
+
+
+def test_the_cli_refuses_a_lower_release_and_writes_nothing(tmp_path, capsys):
+    files = _cli_files(tmp_path, _registry_now(release=3))
+    assert _export(files) == 0
+    out = tmp_path / "out" / "tdx-measurement-policy.json"
+    first = out.read_bytes()
+    (tmp_path / "registry.json").write_bytes(
+        _registry_now(release=2, profiles=[_profile("box", images=[OTHER_IMAGE])])
+    )
+    capsys.readouterr()
+    assert _export(files) == 2
+    assert "rollback" in capsys.readouterr().err
+    assert out.read_bytes() == first
+
+
+def test_the_cli_requires_the_pinned_key_file(tmp_path, capsys):
+    files = _cli_files(tmp_path, _registry_now())
+    files["digest"] = "sha256:" + "00" * 32
+    assert _export(files) == 2
+    assert "key digest does not match" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+def test_the_cli_refuses_an_enforcing_file_with_nothing_to_allow(tmp_path, capsys):
+    files = _cli_files(tmp_path, _registry_now(profiles=[_profile("cpu-worker-v1")]))
+    assert _export(files, "--mode", "enforce") == 2
+    assert "at least one measurement" in capsys.readouterr().err
+    assert _export(files, "--mode", "enforce", "--all-profiles") == 0
+    _, allowed, _ = _load_like_256((tmp_path / "out" / "tdx-measurement-policy.json").read_bytes())
+    assert allowed == frozenset({WORKER_MEASUREMENT})
 
 
 def test_the_registry_profile_schema_is_unchanged():
