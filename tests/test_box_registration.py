@@ -15,6 +15,7 @@ import pytest
 import sr25519
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 from cathedral import box_registration as reg
 
@@ -24,7 +25,8 @@ OTHER_NETUID = NETUID % 65535 + 1
 NOW = datetime(2026, 9, 28, 12, 0, 0, tzinfo=UTC)
 CERT = "c3" * 32
 REVISION = "bd143ad8a18569351ffabf28c84e282f7c55b41b"
-RUNTIME_KEY = b"e2b_0123456789abcdef0123456789abcdef"
+PROBE_KEY = b"5e" * 32
+TEAM_KEY = b"e2b_0123456789abcdef0123456789abcdef"
 
 
 def _base58(data: bytes) -> str:
@@ -73,6 +75,7 @@ def _host_values(**changes) -> str:
             ]
         ),
         "CATHEDRAL_TUNNEL_MODE": "direct",
+        "CATHEDRAL_PROBE_TEMPLATE_ID": "t1",
     }
     values.update(changes)
     return "".join(f"{key}={value}\n" for key, value in values.items() if value is not None)
@@ -81,7 +84,7 @@ def _host_values(**changes) -> str:
 def _registration(**changes):
     args = dict(
         host_values_text=_host_values(),
-        runtime_key=RUNTIME_KEY,
+        probe_key=PROBE_KEY,
         prober_public_key=PROBER.public_key(),
         netuid=NETUID,
         kind="bare_metal",
@@ -105,12 +108,13 @@ def test_a_registration_verifies_and_only_the_prober_opens_its_key():
     assert (verified.vcpus, verified.memory_gib, verified.kind) == (16, 52, "bare_metal")
     assert verified.control_url == "https://34.1.2.3"
     assert verified.box_id == reg.box_id_for(CERT, MINER.ss58_address)
-    assert reg.open_runtime_key(verified, PROBER) == RUNTIME_KEY
+    assert verified.probe_template_id == "t1"
+    assert reg.open_probe_key(verified, PROBER) == PROBE_KEY
     with pytest.raises(reg.RegistrationError, match="verify the registration"):
-        reg.open_runtime_key(signed, PROBER)  # an unverified document is never opened
+        reg.open_probe_key(signed, PROBER)  # an unverified document is never opened
     with pytest.raises(reg.RegistrationError, match="does not open"):
-        reg.open_runtime_key(verified, X25519PrivateKey.generate())
-    assert RUNTIME_KEY not in json.dumps(signed).encode()
+        reg.open_probe_key(verified, X25519PrivateKey.generate())
+    assert PROBE_KEY not in json.dumps(signed).encode()
 
 
 def test_a_sealed_key_cannot_be_lifted_onto_another_registration():
@@ -121,11 +125,11 @@ def test_a_sealed_key_cannot_be_lifted_onto_another_registration():
             CATHEDRAL_E2B_SANDBOX_URL="https://34.9.9.9:8443",
         )
     )
-    second["sealed_runtime_key"] = first["sealed_runtime_key"]
+    second["sealed_probe_key"] = first["sealed_probe_key"]
     body = {k: v for k, v in second.items() if k != "signature"}
     resigned = reg.sign_registration(body, MINER.sign)
     with pytest.raises(reg.RegistrationError, match="does not open"):
-        reg.open_runtime_key(_verify(resigned), PROBER)
+        reg.open_probe_key(_verify(resigned), PROBER)
 
 
 def test_tampering_or_another_hotkey_is_refused():
@@ -207,10 +211,10 @@ def test_replays_are_ordered_per_ip_and_hotkey_by_the_signed_issued_at():
     # verifies and opens (only the probe fails), but it is ordered in its own
     # scope, so it never outranks or refuses the owner's renewal.
     squatter = _verify(
-        _registration(keypair=OTHER, runtime_key=b"f" * 64, now=NOW + reg.ISSUED_AT_SKEW), now=NOW
+        _registration(keypair=OTHER, probe_key=b"f" * 64, now=NOW + reg.ISSUED_AT_SKEW), now=NOW
     )
     assert (squatter.control_url, squatter.box_key) == (owner.control_url, owner.box_key)
-    assert reg.open_runtime_key(squatter, PROBER) == b"f" * 64
+    assert reg.open_probe_key(squatter, PROBER) == b"f" * 64
     owner_scope, owner_order = reg.replay_order(owner)
     squatter_scope, squatter_order = reg.replay_order(squatter)
     assert owner_scope == ("34.1.2.3", MINER.ss58_address)
@@ -246,13 +250,13 @@ def test_a_proxy_on_a_second_ip_seals_the_same_key_digest():
         )
     )
     assert (direct.control_url, direct.box_key) != (proxied.control_url, proxied.box_key)
-    digest = reg.opened_key_digest(reg.open_runtime_key(direct, PROBER))
-    assert digest == reg.opened_key_digest(reg.open_runtime_key(proxied, PROBER))
-    assert digest != reg.opened_key_digest(RUNTIME_KEY + b"x")
+    digest = reg.opened_key_digest(reg.open_probe_key(direct, PROBER))
+    assert digest == reg.opened_key_digest(reg.open_probe_key(proxied, PROBER))
+    assert digest != reg.opened_key_digest(PROBE_KEY + b"x")
     assert len(digest) == 64 and int(digest, 16) >= 0
-    assert digest != hashlib.sha256(RUNTIME_KEY).hexdigest()  # domain-separated
+    assert digest != hashlib.sha256(PROBE_KEY).hexdigest()  # domain-separated
     with pytest.raises(reg.RegistrationError, match="must be bytes"):
-        reg.opened_key_digest(RUNTIME_KEY.decode())
+        reg.opened_key_digest(PROBE_KEY.decode())
 
 
 @pytest.mark.parametrize("form", ["extra key", "json string"])
@@ -290,10 +294,10 @@ def test_a_signature_that_is_not_64_bytes_never_reaches_the_verifier():
 
 def test_only_the_seal_algorithm_is_accepted():
     body = _body(_registration())
-    body["sealed_runtime_key"]["algorithm"] = "x25519-hkdf-sha256-aes256gcm"
-    with pytest.raises(reg.RegistrationError, match="sealed_runtime_key is malformed"):
+    body["sealed_probe_key"]["algorithm"] = "x25519-hkdf-sha256-aes256gcm"
+    with pytest.raises(reg.RegistrationError, match="sealed_probe_key is malformed"):
         _verify(_hand_signed(body))
-    with pytest.raises(reg.RegistrationError, match="sealed_runtime_key is malformed"):
+    with pytest.raises(reg.RegistrationError, match="sealed_probe_key is malformed"):
         reg.sign_registration(body, MINER.sign)
 
 
@@ -306,15 +310,38 @@ def test_the_seal_derivation_binds_both_public_keys():
     # ephemeral key gives the same shared secret. Binding the key bytes in the
     # derivation is what makes the edited registration fail to open.
     body = _body(_registration())
-    original = base64.b64decode(body["sealed_runtime_key"]["ephemeral_public_b64"])
+    original = base64.b64decode(body["sealed_probe_key"]["ephemeral_public_b64"])
     twin = original[:31] + bytes([original[31] ^ 0x80])
     assert PROBER.exchange(X25519PublicKey.from_public_bytes(twin)) == PROBER.exchange(
         X25519PublicKey.from_public_bytes(original)
     )
-    body["sealed_runtime_key"]["ephemeral_public_b64"] = base64.b64encode(twin).decode()
+    body["sealed_probe_key"]["ephemeral_public_b64"] = base64.b64encode(twin).decode()
     verified = _verify(reg.sign_registration(body, MINER.sign))
     with pytest.raises(reg.RegistrationError, match="does not open"):
-        reg.open_runtime_key(verified, PROBER)
+        reg.open_probe_key(verified, PROBER)
+
+
+def test_a_key_sealed_under_the_team_key_info_does_not_open(monkeypatch):
+    # Known answer for the probe-key domain: a seal made with the old
+    # team-key info string never opens, even over an otherwise valid body.
+    assert reg.SEAL_INFO == b"cathedral.box-registration.probe-key.v1"
+    with monkeypatch.context() as patched:
+        patched.setattr(reg, "SEAL_INFO", b"cathedral.box-registration.runtime-key.v1")
+        signed = _registration()
+    verified = _verify(signed)
+    with pytest.raises(reg.RegistrationError, match="does not open"):
+        reg.open_probe_key(verified, PROBER)
+    assert reg.open_probe_key(_verify(_registration()), PROBER) == PROBE_KEY
+
+
+def test_a_v1_registration_is_refused():
+    # v1 had the team-key field set (sealed_runtime_key, no probe_template_id).
+    # The field set changed, so the schema did too, and a v1 label is refused.
+    assert reg.SCHEMA == "cathedral_box_registration_v2"
+    body = _body(_registration())
+    body["schema"] = "cathedral_box_registration_v1"
+    with pytest.raises(reg.RegistrationError, match="schema is unsupported"):
+        _verify(_hand_signed(body))
 
 
 def test_the_box_id_is_bound_to_certificate_and_hotkey():
@@ -424,17 +451,111 @@ def test_validity_is_bounded_and_the_kind_is_checked():
     assert _verify(_registration(kind="tee")).kind == "tee"
 
 
-def test_the_runtime_key_size_is_bounded():
-    for key in (b"", b"k" * 1025):
-        with pytest.raises(reg.RegistrationError, match="1 to 1024"):
-            _registration(runtime_key=key)
+def test_only_the_installers_probe_key_is_sealed():
+    for key in (b"", TEAM_KEY, b"5E" * 32, b"5e" * 31, b"5e" * 33, "\u00e9".encode() * 32):
+        with pytest.raises(reg.RegistrationError, match="probe key"):
+            _registration(probe_key=key)
+
+
+def test_the_probe_template_must_be_one_of_the_boxs_templates():
+    with pytest.raises(reg.RegistrationError, match="--probe-template"):
+        _registration(host_values_text=_host_values(CATHEDRAL_PROBE_TEMPLATE_ID=None))
+    with pytest.raises(reg.RegistrationError, match="--probe-template"):
+        _registration(host_values_text=_host_values(CATHEDRAL_PROBE_TEMPLATE_ID=""))
+    with pytest.raises(reg.RegistrationError, match="not one of the box's templates"):
+        _registration(host_values_text=_host_values(CATHEDRAL_PROBE_TEMPLATE_ID="t2"))
+    with pytest.raises(reg.RegistrationError, match="probe_template_id is malformed"):
+        _registration(host_values_text=_host_values(CATHEDRAL_PROBE_TEMPLATE_ID="t 1"))
+    # A template without an ID cannot be the probe template.
+    no_id = json.dumps([{"name": "t", "cpu": 1, "memory_gib": 4}])
+    with pytest.raises(reg.RegistrationError, match="not one of the box's templates"):
+        _registration(host_values_text=_host_values(CATHEDRAL_TEMPLATES_JSON=no_id))
+
+
+def test_the_box_is_paid_at_the_probe_templates_shape():
+    # The challenge runs in one probe sandbox, so this is all the prober can prove.
+    small = _verify(_registration())
+    assert small.probe_capacity == {"cpu": 1, "memory_gib": 4}
+    assert (small.vcpus, small.memory_gib) == (16, 52)  # measured, not paid
+    two = json.dumps(
+        [
+            {"name": "small", "cpu": 1, "memory_gib": 4, "template_id": "t1"},
+            {"name": "box", "cpu": 16, "memory_gib": 52, "template_id": "t2"},
+        ]
+    )
+    for probe, shape in (("t1", (1, 4)), ("t2", (16, 52))):
+        verified = _verify(
+            _registration(
+                host_values_text=_host_values(
+                    CATHEDRAL_TEMPLATES_JSON=two, CATHEDRAL_PROBE_TEMPLATE_ID=probe
+                )
+            )
+        )
+        template = next(t for t in verified.templates if t["template_id"] == probe)
+        assert verified.probe_capacity == {
+            "cpu": template["cpu"],
+            "memory_gib": template["memory_gib"],
+        }
+        assert (verified.probe_capacity["cpu"], verified.probe_capacity["memory_gib"]) == shape
+
+
+def test_the_probe_template_id_must_name_one_shape():
+    twice = json.dumps(
+        [
+            {"name": "small", "cpu": 1, "memory_gib": 4, "template_id": "t1"},
+            {"name": "box", "cpu": 16, "memory_gib": 52, "template_id": "t1"},
+        ]
+    )
+    with pytest.raises(reg.RegistrationError, match="more than one template"):
+        _registration(host_values_text=_host_values(CATHEDRAL_TEMPLATES_JSON=twice))
+
+
+def test_the_probe_template_is_signed_and_bound_to_the_seal():
+    two = json.dumps(
+        [
+            {"name": "small", "cpu": 1, "memory_gib": 4, "template_id": "t1"},
+            {"name": "large", "cpu": 2, "memory_gib": 8, "template_id": "t2"},
+        ]
+    )
+    signed = _registration(host_values_text=_host_values(CATHEDRAL_TEMPLATES_JSON=two))
+    swapped = copy.deepcopy(signed)
+    swapped["probe_template_id"] = "t2"
+    with pytest.raises(reg.RegistrationError, match="does not verify"):
+        _verify(swapped)
+    body = {k: v for k, v in swapped.items() if k != "signature"}
+    with pytest.raises(reg.RegistrationError, match="does not open"):
+        reg.open_probe_key(_verify(reg.sign_registration(body, MINER.sign)), PROBER)
+
+
+def test_the_prober_refuses_a_sealed_team_key():
+    body = {k: v for k, v in _registration().items() if k != "signature"}
+    del body["sealed_probe_key"]
+    # Sealed by hand, as a registration built without seal_probe_key could be.
+    ephemeral = X25519PrivateKey.generate()
+    raw = reg._raw(ephemeral.public_key())
+    aad = reg._unsealed_digest(body)
+    key = reg._seal_key(
+        ephemeral.exchange(PROBER.public_key()), aad, raw, reg._raw(PROBER.public_key())
+    )
+    nonce = b"\x00" * 12
+    body["sealed_probe_key"] = {
+        "algorithm": reg.SEAL_ALGORITHM,
+        "ephemeral_public_b64": base64.b64encode(raw).decode(),
+        "nonce_b64": base64.b64encode(nonce).decode(),
+        "ciphertext_b64": base64.b64encode(
+            ChaCha20Poly1305(key).encrypt(nonce, TEAM_KEY, aad)
+        ).decode(),
+    }
+    verified = _verify(reg.sign_registration(body, MINER.sign))
+    with pytest.raises(reg.RegistrationError, match="not a probe key"):
+        reg.open_probe_key(verified, PROBER)
 
 
 def test_the_command_writes_a_verifiable_registration(tmp_path, capsys):
     host_values = tmp_path / "host-values.env"
     host_values.write_text(_host_values())
-    key_file = tmp_path / "runtime.key"
-    key_file.write_bytes(RUNTIME_KEY + b"\n")
+    key_file = tmp_path / "cathedral-runtime-box.probe-key"
+    key_file.write_bytes(PROBE_KEY + b"\n")
     key_file.chmod(0o600)
     host_values.chmod(0o644)  # host values are not secret: no warning
     prober_hex = (
@@ -445,7 +566,7 @@ def test_the_command_writes_a_verifiable_registration(tmp_path, capsys):
     argv = [
         "--host-values",
         str(host_values),
-        "--runtime-key-file",
+        "--probe-key-file",
         str(key_file),
         "--prober-key",
         prober_hex,
@@ -464,7 +585,7 @@ def test_the_command_writes_a_verifiable_registration(tmp_path, capsys):
     assert "warning" not in captured.err
     signed = json.loads(captured.out)
     verified = reg.verify_registration(signed, netuid=NETUID, now=datetime.now(UTC))
-    assert reg.open_runtime_key(verified, PROBER) == RUNTIME_KEY  # trailing newline stripped
+    assert reg.open_probe_key(verified, PROBER) == PROBE_KEY  # trailing newline stripped
     bad_argv = ["zz" if arg == prober_hex else arg for arg in argv]
     bad = reg.main(bad_argv, keypair_factory=lambda *_args: MINER)
     assert bad == 2 and "refused" in capsys.readouterr().err
@@ -473,12 +594,12 @@ def test_the_command_writes_a_verifiable_registration(tmp_path, capsys):
         key_file.chmod(mode)
         assert reg.main(argv, keypair_factory=lambda *_args: MINER) == 0
         captured = capsys.readouterr()
-        assert f"runtime key file {key_file} is readable by group or others" in captured.err
+        assert f"probe key file {key_file} is readable by group or others" in captured.err
         assert "host values" not in captured.err
         verified = reg.verify_registration(
             json.loads(captured.out), netuid=NETUID, now=datetime.now(UTC)
         )
-        assert reg.open_runtime_key(verified, PROBER) == RUNTIME_KEY
+        assert reg.open_probe_key(verified, PROBER) == PROBE_KEY
 
 
 def test_real_installer_output_registers_and_tunnel_mode_is_refused():
@@ -504,10 +625,10 @@ def test_real_installer_output_registers_and_tunnel_mode_is_refused():
 def test_a_sealed_key_cannot_be_lifted_onto_another_hotkeys_registration():
     theirs = _registration()
     mine = _registration(keypair=OTHER)
-    mine["sealed_runtime_key"] = theirs["sealed_runtime_key"]
+    mine["sealed_probe_key"] = theirs["sealed_probe_key"]
     body = {k: v for k, v in mine.items() if k != "signature"}
     with pytest.raises(reg.RegistrationError, match="does not open"):
-        reg.open_runtime_key(_verify(reg.sign_registration(body, OTHER.sign)), PROBER)
+        reg.open_probe_key(_verify(reg.sign_registration(body, OTHER.sign)), PROBER)
 
 
 def test_template_ids_are_plain_ascii():
@@ -553,8 +674,8 @@ def test_deeply_nested_templates_are_a_registration_error(tmp_path, capsys):
     # And through the command: a refusal, not a traceback.
     host_values = tmp_path / "host-values.env"
     host_values.write_text(_host_values(CATHEDRAL_TEMPLATES_JSON="[" * 60_000))
-    key_file = tmp_path / "runtime.key"
-    key_file.write_bytes(RUNTIME_KEY)
+    key_file = tmp_path / "cathedral-runtime-box.probe-key"
+    key_file.write_bytes(PROBE_KEY)
     key_file.chmod(0o600)
     prober_hex = (
         PROBER.public_key()
@@ -565,7 +686,7 @@ def test_deeply_nested_templates_are_a_registration_error(tmp_path, capsys):
         [
             "--host-values",
             str(host_values),
-            "--runtime-key-file",
+            "--probe-key-file",
             str(key_file),
             "--prober-key",
             prober_hex,
@@ -581,3 +702,33 @@ def test_deeply_nested_templates_are_a_registration_error(tmp_path, capsys):
         keypair_factory=lambda *_args: MINER,
     )
     assert code == 2 and "not JSON" in capsys.readouterr().err
+
+
+def test_the_probe_key_file_is_small(tmp_path, capsys):
+    # 64 hex characters and a newline fit; a 129-byte file is refused.
+    host_values = tmp_path / "host-values.env"
+    host_values.write_text(_host_values())
+    key_file = tmp_path / "cathedral-runtime-box.probe-key"
+    key_file.write_bytes(PROBE_KEY + b"\n" * 64)
+    key_file.chmod(0o600)
+    argv = [
+        "--host-values",
+        str(host_values),
+        "--probe-key-file",
+        str(key_file),
+        "--prober-key",
+        reg._raw(PROBER.public_key()).hex(),
+        "--netuid",
+        str(NETUID),
+        "--kind",
+        "bare_metal",
+        "--wallet-name",
+        "miner",
+        "--hotkey-name",
+        "default",
+    ]
+    assert reg.main(argv, keypair_factory=lambda *_args: MINER) == 0
+    capsys.readouterr()
+    key_file.write_bytes(PROBE_KEY + b"\n" * 65)
+    assert reg.main(argv, keypair_factory=lambda *_args: MINER) == 2
+    assert "probe key is empty or too large" in capsys.readouterr().err
