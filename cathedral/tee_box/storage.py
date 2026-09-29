@@ -68,9 +68,12 @@ _INTEGRITY_TYPE_RE = re.compile(r"^(?:aead|hmac\(sha(?:256|512)\))$")
 # AEAD: authenc of HMAC-SHA-2 and AES-XTS (cryptsetup's --integrity
 # hmac-sha256/512 with aes-xts), AES-GCM, or ChaCha20-Poly1305. An HMAC type
 # needs AES-XTS. Anything with a null cipher or digest, or ECB, is refused.
+# GCM and ChaCha20-Poly1305 take only the random IV: with plain64 the nonce
+# is the sector number, so rewriting a sector repeats it and the host can
+# forge sectors. XTS-based modes keep plain64.
 _AEAD_CIPHER_RE = re.compile(
-    r"^capi:(?:authenc\(hmac\(sha(?:256|512)\),xts\(aes\)\)|gcm\(aes\)"
-    r"|rfc7539\(chacha20,poly1305\))-(?:random|plain64)$"
+    r"^capi:(?:authenc\(hmac\(sha(?:256|512)\),xts\(aes\)\)-(?:random|plain64)"
+    r"|(?:gcm\(aes\)|rfc7539\(chacha20,poly1305\))-random)$"
 )
 _HMAC_CIPHER_RE = re.compile(r"^(?:aes-xts|capi:xts\(aes\))-(?:random|plain64)$")
 _WEAK_CIPHER_RE = re.compile(r"null|ecb", re.IGNORECASE)

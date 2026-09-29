@@ -281,6 +281,16 @@ def test_crypt_tables_with_authenticated_integrity_are_accepted(table, integrity
         ),
         (f"0 8 crypt aes-cbc-essiv:sha256 {KEY} 0 253:2 0 1 integrity:32:hmac(sha256)", "allowed"),
         (f"0 8 crypt aes-ecb {KEY} 0 253:2 0 1 integrity:32:hmac(sha256)", "not an allowed"),
+        # GCM and ChaCha20-Poly1305 with the sector number as nonce repeat it.
+        (
+            f"0 8 crypt capi:gcm(aes)-plain64 {KEY} 0 253:2 0 1 integrity:28:aead",
+            "not an allowed cipher for integrity aead",
+        ),
+        (
+            f"0 8 crypt capi:rfc7539(chacha20,poly1305)-plain64 {KEY} 0 253:2 0 1 "
+            "integrity:28:aead",
+            "not an allowed cipher for integrity aead",
+        ),
         # Each integrity type pairs only with its own ciphers.
         (f"0 8 crypt aes-xts-plain64 {KEY} 0 253:2 0 1 integrity:28:aead", "not an allowed"),
         (
@@ -463,6 +473,39 @@ def test_an_overlay_below_the_root_with_a_layer_elsewhere_refuses(tmp_path, opti
     extra = _overlay(root, options.format(root=root))
     probe, _checked = _probe(_root_table(root, extra=extra), {(253, 3): (True, "dm-crypt aead")})
     with pytest.raises(StorageError, match=rf"layer outside the Docker data root: \S*{outside}$"):
+        require_protected_scratch(str(root), probe)
+
+
+def test_nonce_ciphers_pass_only_with_the_random_iv():
+    for cipher in ("capi:gcm(aes)", "capi:rfc7539(chacha20,poly1305)"):
+        ok, detail = parse_crypt_table(
+            f"0 8 crypt {cipher}-random {KEY} 0 253:2 0 1 integrity:28:aead"
+        )
+        assert ok is True, detail
+        ok, detail = parse_crypt_table(
+            f"0 8 crypt {cipher}-plain64 {KEY} 0 253:2 0 1 integrity:28:aead"
+        )
+        assert ok is False and "not an allowed cipher" in detail
+
+
+def test_a_datadir_layer_outside_the_root_refuses(tmp_path: Path):
+    root = tmp_path.resolve()
+    options = f"lowerdir=l/AAAA,datadir+=/mnt/plain/data,upperdir={root}/overlay2/abc/diff"
+    extra = _overlay(root, options)
+    probe, _checked = _probe(_root_table(root, extra=extra), {(253, 3): (True, "dm-crypt aead")})
+    with pytest.raises(StorageError, match="outside the Docker data root: /mnt/plain/data$"):
+        require_protected_scratch(str(root), probe)
+
+
+def test_a_sibling_directory_sharing_the_root_prefix_is_outside(tmp_path: Path):
+    # /x/docker-other is not under /x/docker: the comparison is by path
+    # component, not by string prefix.
+    root = tmp_path.resolve() / "docker"
+    root.mkdir()
+    sibling = f"{root}x/diff"
+    extra = _overlay(root, f"lowerdir=l/AAAA,upperdir={sibling},workdir={root}/overlay2/w")
+    probe, _checked = _probe(_root_table(root, extra=extra), {(253, 3): (True, "dm-crypt aead")})
+    with pytest.raises(StorageError, match=rf"outside the Docker data root: {re.escape(sibling)}$"):
         require_protected_scratch(str(root), probe)
 
 
