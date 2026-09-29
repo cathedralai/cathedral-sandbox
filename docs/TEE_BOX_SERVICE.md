@@ -624,9 +624,14 @@ kinds:
   (cryptsetup's mapping; `CRYPT-SUBDEV-`, the dm-integrity device under a
   LUKS2 volume, does not count) and whose `dmsetup table` is all `crypt`
   segments carrying `integrity:<tag bytes>:aead`, or `:hmac(sha256)` or
-  `:hmac(sha512)` (`cathedral/tee_box/storage.py:228`, `:267`). A table
-  with no integrity parameter, an unkeyed one (`crc32c`, `none`), or any
-  other target refuses. With `--integrity hmac-sha256` and aes-xts,
+  `:hmac(sha512)` (`parse_crypt_table`, `dm_crypt_integrity_check`), and
+  whose cipher is allowed for that type. With `aead`:
+  `capi:authenc(hmac(sha256|sha512),xts(aes))`, `capi:gcm(aes)` or
+  `capi:rfc7539(chacha20,poly1305)`; with an HMAC type: `aes-xts` or
+  `capi:xts(aes)`; each with a `-random` or `-plain64` IV. Any cipher
+  containing `null` or `ecb` (`digest_null`, `cipher_null`) refuses, as
+  does any other cipher, a table with no integrity parameter, an unkeyed
+  one (`crc32c`, `none`), or any other target. With `--integrity hmac-sha256` and aes-xts,
   cryptsetup builds an `authenc(hmac(sha256),xts(aes))` AEAD cipher, which
   the table shows as `integrity:48:aead`.
 

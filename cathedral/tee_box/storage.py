@@ -64,6 +64,16 @@ CRYPT_SUBDEV_PREFIX = "CRYPT-SUBDEV-"
 # authenticates each sector with a key the TD holds. Unkeyed checksums
 # (crc32c, "none") are refused.
 _INTEGRITY_TYPE_RE = re.compile(r"^(?:aead|hmac\(sha(?:256|512)\))$")
+# The ciphers each integrity type may pair with. An AEAD type needs a real
+# AEAD: authenc of HMAC-SHA-2 and AES-XTS (cryptsetup's --integrity
+# hmac-sha256/512 with aes-xts), AES-GCM, or ChaCha20-Poly1305. An HMAC type
+# needs AES-XTS. Anything with a null cipher or digest, or ECB, is refused.
+_AEAD_CIPHER_RE = re.compile(
+    r"^capi:(?:authenc\(hmac\(sha(?:256|512)\),xts\(aes\)\)|gcm\(aes\)"
+    r"|rfc7539\(chacha20,poly1305\))-(?:random|plain64)$"
+)
+_HMAC_CIPHER_RE = re.compile(r"^(?:aes-xts|capi:xts\(aes\))-(?:random|plain64)$")
+_WEAK_CIPHER_RE = re.compile(r"null|ecb", re.IGNORECASE)
 _INTEGRITY_PARAM_RE = re.compile(r"^integrity:([1-9][0-9]{0,3}):(.+)$")
 _DM_NAME_RE = re.compile(r"^[A-Za-z0-9_+.][A-Za-z0-9_+.-]{0,126}$")
 _MAJOR_MINOR_RE = re.compile(r"^([0-9]{1,10}):([0-9]{1,10})$")
@@ -284,8 +294,9 @@ def parse_crypt_table(text: str) -> tuple[bool, str]:
     """Whether a ``dmsetup table`` listing is dm-crypt with authenticated integrity.
 
     Every segment must be a ``crypt`` target whose optional parameters carry
-    ``integrity:<tag bytes>:<type>`` with an AEAD or HMAC type. The key field
-    is never kept or reported.
+    ``integrity:<tag bytes>:<type>`` with an AEAD or HMAC type, and whose
+    cipher is on the allowlist for that type. The key field is never kept or
+    reported.
     """
 
     lines = [line.split() for line in text.splitlines() if line.strip()]
@@ -315,6 +326,11 @@ def parse_crypt_table(text: str) -> tuple[bool, str]:
             return False, f"crypt cipher {cipher!s:.64} has no integrity (no AEAD or HMAC tags)"
         if _INTEGRITY_TYPE_RE.fullmatch(found) is None:
             return False, f"crypt integrity {found!s:.32} is not authenticated (need aead or hmac)"
+        allowed = _AEAD_CIPHER_RE if found == "aead" else _HMAC_CIPHER_RE
+        if _WEAK_CIPHER_RE.search(cipher) or allowed.fullmatch(cipher) is None:
+            return False, (
+                f"crypt cipher {cipher!s:.64} is not an allowed cipher for integrity {found}"
+            )
         integrity_types.add(f"{cipher} integrity {found}")
     return True, "dm-crypt " + ", ".join(sorted(integrity_types))
 

@@ -200,11 +200,27 @@ def test_device_of_reads_stat(tmp_path: Path):
             "1 integrity:48:aead\n",
             "aead",
         ),
-        (f"0 8 crypt aes-gcm-random {KEY} 0 253:2 0 2 allow_discards integrity:28:aead", "aead"),
+        (
+            f"0 8 crypt capi:authenc(hmac(sha512),xts(aes))-plain64 {KEY} 0 253:2 0 "
+            "1 integrity:80:aead",
+            "aead",
+        ),
+        (
+            f"0 8 crypt capi:gcm(aes)-random {KEY} 0 253:2 0 2 allow_discards integrity:28:aead",
+            "aead",
+        ),
+        (
+            f"0 8 crypt capi:rfc7539(chacha20,poly1305)-random {KEY} 0 253:2 0 1 integrity:28:aead",
+            "aead",
+        ),
         (
             f"0 8 crypt aes-xts-plain64 {KEY} 0 253:2 0 2 sector_size:4096 "
             "integrity:32:hmac(sha256)",
             "hmac(sha256)",
+        ),
+        (
+            f"0 8 crypt capi:xts(aes)-random {KEY} 0 253:2 0 1 integrity:80:hmac(sha512)",
+            "hmac(sha512)",
         ),
     ],
 )
@@ -224,14 +240,37 @@ def test_crypt_tables_with_authenticated_integrity_are_accepted(table, integrity
         (f"0 8 crypt aes-xts-random {KEY} 0 253:2 0 1 integrity:4:crc32c", "not authenticated"),
         (f"0 8 crypt aes-xts-random {KEY} 0 253:2 0 1 integrity:16:none", "not authenticated"),
         (f"0 8 crypt aes-xts-random {KEY} 0 253:2 0 1 integrity:0:aead", "has no integrity"),
-        (f"0 8 crypt aes-gcm-random {KEY} 0 253:2 0 2 integrity:28:aead", "malformed"),
-        (f"0 8 crypt aes-gcm-random {KEY} 0 253:2 0 x integrity:28:aead", "malformed"),
+        (f"0 8 crypt capi:gcm(aes)-random {KEY} 0 253:2 0 2 integrity:28:aead", "malformed"),
+        (f"0 8 crypt capi:gcm(aes)-random {KEY} 0 253:2 0 x integrity:28:aead", "malformed"),
         ("0 8 linear 8:2 0", "linear target"),
         # dm-integrity alone (no encryption), even with an HMAC and eight fields.
         ("0 8 integrity 8:2 0 32 J 1 internal_hash:hmac(sha256)", "integrity target"),
         (
-            f"0 8 crypt aes-gcm-random {KEY} 0 253:2 0 1 integrity:28:aead\n8 8 linear 8:3 0",
+            f"0 8 crypt capi:gcm(aes)-random {KEY} 0 253:2 0 1 integrity:28:aead\n8 8 linear 8:3 0",
             "linear target",
+        ),
+        # The cipher allowlist: an integrity mode alone is not enough.
+        (
+            f"0 8 crypt capi:authenc(digest_null,cbc(aes))-random {KEY} 0 253:2 0 1 "
+            "integrity:16:aead",
+            "not an allowed cipher for integrity aead",
+        ),
+        (
+            f"0 8 crypt cipher_null-ecb {KEY} 0 253:2 0 1 integrity:32:hmac(sha256)",
+            "not an allowed cipher for integrity hmac(sha256)",
+        ),
+        (
+            f"0 8 crypt capi:authenc(hmac(sha1),xts(aes))-random {KEY} 0 253:2 0 1 "
+            "integrity:36:aead",
+            "not an allowed cipher",
+        ),
+        (f"0 8 crypt aes-cbc-essiv:sha256 {KEY} 0 253:2 0 1 integrity:32:hmac(sha256)", "allowed"),
+        (f"0 8 crypt aes-ecb {KEY} 0 253:2 0 1 integrity:32:hmac(sha256)", "not an allowed"),
+        # Each integrity type pairs only with its own ciphers.
+        (f"0 8 crypt aes-xts-plain64 {KEY} 0 253:2 0 1 integrity:28:aead", "not an allowed"),
+        (
+            f"0 8 crypt capi:gcm(aes)-random {KEY} 0 253:2 0 1 integrity:32:hmac(sha256)",
+            "not an allowed",
         ),
     ],
 )
