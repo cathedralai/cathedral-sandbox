@@ -410,6 +410,15 @@ def test_host_values_are_read_literally_never_sourced():
 def test_validity_is_bounded_and_the_kind_is_checked():
     with pytest.raises(reg.RegistrationError, match="7 days"):
         _registration(valid_for=timedelta(days=8))
+    # Exactly 7 days is allowed: the runbook advertises --valid-hours up to 168.
+    week = _registration(valid_for=timedelta(hours=168))
+    _verify(week)
+    with pytest.raises(reg.RegistrationError, match="7 days"):
+        _registration(valid_for=timedelta(days=7, seconds=1))
+    body = {k: v for k, v in week.items() if k != "signature"}
+    body["expires_at"] = reg._iso(NOW + timedelta(days=7, seconds=1))
+    with pytest.raises(reg.RegistrationError, match="7 days"):
+        _verify(_signed_directly(body))
     with pytest.raises(reg.RegistrationError, match="tee or bare_metal"):
         _registration(kind="gpu")
     assert _verify(_registration(kind="tee")).kind == "tee"
