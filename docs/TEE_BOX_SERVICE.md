@@ -1,4 +1,4 @@
-# TEE box sandbox service (T6a, T6b1, T7, T8, T9)
+# TEE box sandbox service (T6a, T6b1, T7, T8, T9, T11)
 
 Status: **off by default**. T6a added the library, and T6b1 adds the worker
 flags, the egress enforcer, in-sandbox exec kills, disk quotas and an opt-in
@@ -11,7 +11,9 @@ box-side guard, the boot id and admission's `attestation_predates_release`
 prove nothing; the owner's guarantee rests only on the RTMR3 extend before
 each boot's first lease plus `require_fresh_boot` admission, and the extend
 interface has yet to be confirmed on hardware (see "Relaunch between
-customers (T9)").
+customers (T9)"). T11 reads the owner's one signed measurement list, the
+existing signed policy registry, for admission and for the validator's
+#256 file (see "The measurement list (T11)").
 Nothing here has
 run on TDX or SEV-SNP hardware yet; that is T6b2 (see "Not done" below). The design is `TEE_BOX.md` on PR #236, branch
 `docs/tee-box-design` (sections 2 to 4 and "Owner decisions for v1").
@@ -407,7 +409,8 @@ is updated separately.
     equivalent (a vTPM PCR) is open.
 - **Two measurements per image.** The Cathedral TDX measurement covers the
   RTMRs (`cathedral/verify/tdx_quote.py:91-104`), so each image has a fresh
-  and a consumed measurement. The published list must hold both, so a
+  and a consumed measurement. The published list holds both, derived from
+  one approved image (see "The measurement list (T11)"), so a
   re-attestation during an allocation still verifies and pays; only
   `require_fresh_boot` tells them apart (docs/CAPACITY.md, "Admission").
 - **Nothing else may extend RTMR3.** A box whose RTMR3 is not zero at start,
@@ -520,6 +523,92 @@ write it to tmpfs at boot (T6b2).
   accordingly; exempting the prober would need a scope the box trusts, which
   central access does not have, and would let a prober escape reach the next
   customer.
+
+## The measurement list (T11)
+
+Owner decision (2026-09-29, design decision 4): the owner publishes one
+signed measurement list, and validators, admission, routing and the prober
+all consume it. It replaces each validator's local cathedral-validator #256
+file as the source of truth; during rollout that file mirrors it.
+
+**The list is the signed policy registry** (`cathedral/policy_registry.py`,
+docs/MRTD.md): Ed25519 under a pinned owner key, monotonic releases with a
+durable high-water mark, and per-profile revocation. No new signed format.
+`cathedral/capacity/measurement_list.py` reads it.
+
+**TEE box entries.** A `cpu_tdx` (or `cpu_snp`) profile is a TEE box profile
+when its signed `metadata` carries a `tee_box` object. The registry refuses
+unknown profile keys (`cathedral/policy_registry.py:373`), so metadata is the
+backward-compatible place: an older verifier accepts the release unchanged.
+
+```json
+"metadata": {"tee_box": {"schema": "cathedral_tee_box_images_v1", "images": [
+  {"id": "appliance-v1-c3-176",
+   "td_attributes": "<16 hex>", "xfam": "<16 hex>", "mrtd": "<96 hex>",
+   "mrconfigid": "<96 hex>", "mrowner": "<96 hex>", "mrownerconfig": "<96 hex>",
+   "rtmr0": "<96 hex>", "rtmr1": "<96 hex>", "rtmr2": "<96 hex>"}]}}
+```
+
+One entry per image and VM shape (RTMR0 can vary with the shape). An SNP
+image is `{"id", "measurement": "<96 hex>"}`.
+
+**Consumed values are derived, not listed.** The Cathedral measurement is a
+SHA-256 over TD_ATTRIBUTES, XFAM, MRTD, MRCONFIGID, MROWNER, MROWNERCONFIG and
+RTMR0-3 (docs/MRTD.md; #256's `reference_measurement`). A hash cannot be
+turned into another, so the entry carries the fields and both values follow:
+RTMR3 all zero (fresh) and RTMR3 = `RTMR3_CONSUMED` (after the lease extend).
+The owner approves one image; the pair cannot be listed unpaired or
+mismatched. The profile's own `measurements` must equal exactly the derived
+values of its images, so the registry's other readers (`to_policy`, the
+verifier's own allowlist) see the same set. A release that breaks this is
+refused before the high-water mark moves. The entry also exposes MRCONFIGID,
+which fixes the central-access root (see "Caller authorization"). A
+TD_ATTRIBUTES with the debug bit set is refused.
+
+**What each consumer calls.**
+
+- `accept_release(data, trusted_keys, state)` verifies the signature with the
+  trusted owner keys, the validity window and staleness, validates every TEE
+  box entry, then `state.accept` refuses a lower or equivocated release. Only
+  it makes an `AcceptedRelease`; the functions below refuse anything else.
+- `measurement_policy(release, kind=, mode=)` is the `MeasurementPolicy`
+  `admission.admit` takes. It lists both values of each eligible TEE box
+  image, and only TEE box images: a worker image approved for other CPU work
+  is never admitted as a box. Before each new customer, `admit(...,
+  require_fresh_boot=True)` refuses the consumed value by RTMR3.
+- `eligible_images(release, kind=)` gives routing and the prober each image's
+  `fresh` and `consumed` values and MRCONFIGID.
+- Only profiles eligible now contribute (active, or retiring before
+  `retire_at`, inside validity). A measurement any `revoked` profile lists is
+  excluded even if another profile lists it, and revoking either value of an
+  image drops the whole image.
+
+**The validator mirror.**
+
+```bash
+cathedral policy-registry export-measurement-policy \
+  --registry registry.json --trusted-keys keys.json \
+  --trusted-keys-digest sha256:<hex of keys.json> \
+  --state /var/lib/cathedral/measurement-mirror.sqlite3 --min-release <n> \
+  --mode shadow --out tdx-measurement-policy.json
+```
+
+It writes #256's policy file (`{"schema", "mode", "allowed_measurements"}`,
+deterministic bytes, mode 0644 before umask) and
+`tdx-measurement-policy.json.source.json`. #256's loader refuses any other
+key, so the list's release and digest go in the source record, bound to the
+policy file by its SHA-256. That is the `policy_digest` #256 logs and puts in
+its evidence, so a validator's reported digest names the release it mirrors;
+for the same release and mode, admission records the same digest. `--kind
+sev_snp` writes the sandbox's SNP schema instead (the validator's SNP policy
+is a different, per-generation format). `--all-profiles` also lists the other
+eligible CPU profiles of the kind, for while the validator still gates
+non-box miners. The mode is the operator's flag, not part of the signed list.
+
+Install it as #256 documents (`install -o root -g cathedral-validator -m 0440`)
+and restart the validator. The exported file has no expiry of its own:
+regenerate it for every release, and before `registry_valid_until` in the
+source record.
 
 ## How to enable it (T6b1)
 
@@ -963,8 +1052,9 @@ Before its Docker daemon and worker start, the appliance boot must:
     guest reboot. SEV-SNP needs its own mark (a vTPM PCR); open.
   - **Control plane.** Ask the miner to relaunch after `needs_relaunch`;
     admit with `require_fresh_boot=True` (and `last_released_at`) before
-    each new customer and pin that admission's SPKI; list both the fresh and
-    the consumed measurement; push revocations; and give each customer
+    each new customer and pin that admission's SPKI; take the measurement
+    policy from the signed list (`measurement_policy`, T11); push
+    revocations; and give each customer
     (better, each allocation) its own central key.
   - **Appliance.** Make the TLS key at each boot, on tmpfs; extend RTMR3
     nowhere else.
@@ -984,6 +1074,12 @@ Before its Docker daemon and worker start, the appliance boot must:
   sandbox and show the lapse path end to end: detection within the bound,
   `409` on calls, the quarantine cutting the sandbox's traffic at once, and
   the removal.
+- **Measurement list (T11).** Approval tooling for TEE box entries:
+  `scripts/cathedral_measurement_approval.py` adds one bare measurement to
+  a profile, and `accept_release` refuses that on a TEE box profile; it needs a mode that takes an
+  image's fields (from a live quote) and writes the `tee_box` entry. The
+  validator side (#256 reading the source record, or the signed list
+  directly) and routing's use of `eligible_images` are not built.
 - **Image measurement.** No measured image ships runsc, the daemon runtime
   entry, the host tools and the worker together. The opt-in layer is not
   measured or published. Measurement approval follows the design's plan
