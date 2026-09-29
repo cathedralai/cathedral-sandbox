@@ -1,4 +1,4 @@
-# TEE box sandbox service (T6a, T6b1, T7, T8, T9)
+# TEE box sandbox service (T6a, T6b1, T7, T8, T9, T11)
 
 Status: **off by default**. T6a added the library, and T6b1 adds the worker
 flags, the egress enforcer, in-sandbox exec kills, disk quotas and an opt-in
@@ -11,10 +11,15 @@ box-side guard, the boot id and admission's `attestation_predates_release`
 prove nothing; the owner's guarantee rests only on the RTMR3 extend before
 each boot's first lease plus `require_fresh_boot` admission, and the extend
 interface has yet to be confirmed on hardware (see "Relaunch between
-customers (T9)").
-Nothing here has
-run on TDX or SEV-SNP hardware yet; that is T6b2 (see "Not done" below). The design is `TEE_BOX.md` on PR #236, branch
-`docs/tee-box-design` (sections 2 to 4 and "Owner decisions for v1").
+customers (T9)"). T11 reads the owner's one signed measurement list, the
+existing signed policy registry, for admission and for the validator's
+#256 file (see "The measurement list (T11)").
+Parts of it have
+run on a real TDX guest (a Polaris TDX sandbox, 2026-09-29: the TD report,
+the RTMR3 extend, the dm-crypt tables, runsc and the egress enforcer); the
+rest of T6b2 needs our own measured image (see "Not done" below). SEV-SNP is
+untested. The design is `docs/TEE_BOX.md` (sections 2 to 4 and "Owner
+decisions for v1").
 Citations are `file:line` in this repository.
 
 ## What T6a adds
@@ -139,7 +144,7 @@ Citations are `file:line` in this repository.
   - A create holds the lease lock, so a drain cannot miss it
     (`cathedral/tee_box/service.py:765-766`).
   - A worker thread runs every 5 s, and once at start
-    (`cathedral/worker.py:1462`). It checks expiry, retries the drain, and
+    (`cathedral/worker.py:1871`). It checks expiry, retries the drain, and
     sweeps orphans.
 - **API** (`cathedral/tee_box/service.py:314`). The routes are listed in
   `cathedral/tee_box/service.py:88`, and the central-access scope each needs
@@ -179,8 +184,8 @@ object says whether the egress rules are enforced, with the last error
 ## Caller authorization
 
 Callers use central access (`cathedral/central_access.py`, from #225, #228
-and #241), with the root keys in measured state. The design is `TEE_BOX.md`
-on PR #236, section 3, "Callers: central access, with its root in measured
+and #241), with the root keys in measured state. The design is `docs/TEE_BOX.md`,
+section 3, "Callers: central access, with its root in measured
 state".
 
 - **Why not the validator-access snapshot.** T6b1 took caller keys from a
@@ -231,15 +236,15 @@ state".
   `route_scope` (`cathedral/tee_box/service.py:180`). Before it reserves a
   slot or reads the body, it verifies the delegation against the measured
   root, its expiry, its scope and the revocation list, then the request's
-  signature and expiry (`cathedral/worker.py:511`). After the body is read,
+  signature and expiry (`cathedral/worker.py:796`). After the body is read,
   it checks the body digest, the revocation list again and replay
-  (`cathedral/worker.py:532`). Replay and the delegation high-water live in
+  (`cathedral/worker.py:817`). Replay and the delegation high-water live in
   the `--tee-box-central-state` file.
 - **Separate from the `--central-*` flags.** The worker's own central
   access, for `/v1/capabilities`, trusts root keys the miner names by flag.
   The TEE box builds its own authorizer from the measured root, and
   `WorkerServer` refuses to share that authorizer or its state
-  (`cathedral/worker.py:1357-1364`).
+  (`cathedral/worker.py:1776-1783`).
 - **Revocation list.** State starts empty on a fresh box, so the control
   plane pushes the root-signed revocation list to `POST /v1/box/revocations`
   after every start (`cathedral/tee_box/service.py:615`). Until it has, only
@@ -304,7 +309,7 @@ state".
 
 Owner decision 1, amended 2026-09-29: the confidential VM is relaunched and
 re-attested between customer allocations, so a gVisor escape by one customer
-cannot persist into the next. The design is `TEE_BOX.md` on PR #236,
+cannot persist into the next. The design is `docs/TEE_BOX.md`,
 decisions 1 and 8 and sections 4 to 6.
 
 **What the guarantee rests on.** A tenant that escapes gVisor has root in
@@ -407,7 +412,8 @@ is updated separately.
     equivalent (a vTPM PCR) is open.
 - **Two measurements per image.** The Cathedral TDX measurement covers the
   RTMRs (`cathedral/verify/tdx_quote.py:91-104`), so each image has a fresh
-  and a consumed measurement. The published list must hold both, so a
+  and a consumed measurement. The published list holds both, derived from
+  one approved image (see "The measurement list (T11)"), so a
   re-attestation during an allocation still verifies and pays; only
   `require_fresh_boot` tells them apart (docs/CAPACITY.md, "Admission").
 - **Nothing else may extend RTMR3.** A box whose RTMR3 is not zero at start,
@@ -521,6 +527,136 @@ write it to tmpfs at boot (T6b2).
   central access does not have, and would let a prober escape reach the next
   customer.
 
+## The measurement list (T11)
+
+Owner decision (2026-09-29, design decision 4): the owner publishes one
+signed measurement list, and validators, admission, routing and the prober
+all consume it. It replaces each validator's local cathedral-validator #256
+file as the source of truth; during rollout that file mirrors it.
+
+**The list is the signed policy registry** (`cathedral/policy_registry.py`,
+docs/MRTD.md): Ed25519 under a pinned owner key, monotonic releases with a
+durable high-water mark, and per-profile revocation. No new signed format.
+`cathedral/capacity/measurement_list.py` reads it.
+
+**TEE box entries.** A `cpu_tdx` (or `cpu_snp`) profile is a TEE box profile
+when its signed `metadata` carries a `tee_box` object. The registry refuses
+unknown profile keys (`cathedral/policy_registry.py:373`), so metadata is the
+backward-compatible place: an older verifier accepts the release unchanged.
+
+```json
+"metadata": {"tee_box": {"schema": "cathedral_tee_box_images_v1", "images": [
+  {"id": "appliance-v1-c3-176",
+   "td_attributes": "<16 hex>", "xfam": "<16 hex>", "mrtd": "<96 hex>",
+   "mrconfigid": "<96 hex>", "mrowner": "<96 hex>", "mrownerconfig": "<96 hex>",
+   "rtmr0": "<96 hex>", "rtmr1": "<96 hex>", "rtmr2": "<96 hex>"}]}}
+```
+
+One entry per image and VM shape (RTMR0 can vary with the shape). An SNP
+image is `{"id", "measurement": "<96 hex>"}`.
+
+**Consumed values are derived, not listed.** The Cathedral measurement is a
+SHA-256 over TD_ATTRIBUTES, XFAM, MRTD, MRCONFIGID, MROWNER, MROWNERCONFIG and
+RTMR0-3 (docs/MRTD.md; #256's `reference_measurement`). A hash cannot be
+turned into another, so the entry carries the fields and both values follow:
+RTMR3 all zero (fresh) and RTMR3 = `RTMR3_CONSUMED` (after the lease extend).
+The owner approves one image; the pair cannot be listed unpaired or
+mismatched. The profile's own `measurements` must equal exactly the derived
+values of its images, so the registry's other readers (`to_policy`, the
+verifier's own allowlist) see the same set. A release that breaks this is
+refused before the high-water mark moves. A TD_ATTRIBUTES with the debug bit
+set is refused.
+
+**MRCONFIGID.** Every TDX image must bind a central-access root (see "Caller
+authorization"): `root_digest_from_mrconfigid`
+(`cathedral/tee_box/measured_root.py:112`) must accept it, that is SHA-256
+of the root key file followed by 16 zero bytes, and not zero. An image with
+no root binding is refused. `accept_release(expected_root_digest=)`, and the
+export's `--expected-root-digest`, also pin which root.
+
+**Security controls.** A TEE box `cpu_tdx` profile is still a `cpu_tdx`
+profile, and `to_policy` requires every eligible one to share min_tcb, TCB
+statuses, advisories and firmware. A release where `to_policy` raises is
+refused, so a box profile can never break worker admission. Those controls
+are the pinned verifier's to apply: `verifier_policy(release)` is its strict
+`Policy` from the same release, and the prober verifies a box's quote with
+it. `admission.admit` does not recheck them: it has no input for them, and
+checks only that the verdict is a complete strict verification. A caller
+that verifies with another policy is not held to the list's controls.
+
+**What each consumer calls.**
+
+- `accept_release(data, trusted_keys, state)` verifies the signature with the
+  trusted owner keys, the validity window and staleness, validates every TEE
+  box entry and the worker policy, then `state.accept` refuses a lower or
+  equivocated release. Its `before_commit` callback runs inside that
+  transaction after every check and before the commit
+  (`PolicyRegistryState.accept(before_commit=)`), so anything published from
+  the release is written before the high-water mark moves, and a failure
+  records nothing. Only it makes an `AcceptedRelease`; the functions below
+  refuse anything else.
+- `verifier_policy(release)` is the verifier's strict `Policy` (above).
+- `measurement_policy(release, kind=, mode=)` is the `MeasurementPolicy`
+  `admission.admit` takes. It lists both values of each eligible TEE box
+  image, and only TEE box images: a worker image approved for other CPU work
+  is never admitted as a box. Before each new customer, `admit(...,
+  require_fresh_boot=True)` refuses the consumed value by RTMR3.
+- `eligible_images(release, kind=)` gives routing and the prober each image's
+  `fresh` and `consumed` values and MRCONFIGID.
+- Only profiles eligible now contribute (active, or retiring before
+  `retire_at`, inside validity). A measurement any `revoked` profile lists is
+  excluded even if another profile lists it, and revoking either value of an
+  image drops the whole image.
+
+**The validator mirror.**
+
+```bash
+cathedral policy-registry export-measurement-policy \
+  --registry registry.json --trusted-keys keys.json \
+  --trusted-keys-digest sha256:<hex of keys.json> \
+  --state /var/lib/cathedral/measurement-mirror.sqlite3 --min-release <n> \
+  --mode shadow --scope all --out tdx-measurement-policy.json
+```
+
+It writes #256's policy file (`{"schema", "mode", "allowed_measurements"}`,
+deterministic bytes, mode 0644 before umask) and
+`tdx-measurement-policy.json.source.json`. #256's loader refuses any other
+key, so the list's release and digest go in the source record, bound to the
+policy file by its SHA-256. That is the `policy_digest` #256 logs and puts in
+its evidence, so a validator's reported digest names the release it mirrors;
+for the same release and mode, admission records the same digest. `--kind
+sev_snp` writes the sandbox's SNP schema instead (the validator's SNP policy
+is a different, per-generation format).
+
+- **`--scope` is required, with no default.** `box` lists only TEE box
+  images; `all` also lists every other eligible CPU profile of the kind. Under
+  enforce, `box` stops paying every non-box TDX miner, so it must be chosen
+  on purpose.
+- **Deny all.** Under enforce with nothing eligible (release 2 revokes the
+  only box profile, say), the file lists one all-zero
+  `tdx-measurement-sha256:` value (96 zero hex for SNP). #256 loads it and
+  it allows no real quote. The old file is not left in place, and not
+  deleted either: #256 refuses an empty enforcing list, and a missing file
+  stops it validating.
+- **Order.** The files are written inside the state's accept transaction:
+  the policy file atomically, then the source record atomically, then the
+  high-water commit. A failed write moves nothing. A crash between the two
+  writes leaves a record whose `policy_digest` does not match the file,
+  which the next export (same or higher release) rewrites.
+- **Rollback without state.** If the state file is lost or recreated, an
+  existing `<out>.source.json` still refuses a lower release, or the same
+  release with another digest. An unreadable record is refused; remove it
+  deliberately to start over.
+- **The mode is the operator's flag, not yet signed.** Once validators read
+  the list directly, the enforce switch belongs in the signed list, for
+  example a per-kind `enforce_from` time in registry metadata, so the owner
+  flips every validator at once.
+
+Install it as #256 documents (`install -o root -g cathedral-validator -m 0440`)
+and restart the validator. The exported file has no expiry of its own:
+regenerate it for every release, and before `registry_valid_until` in the
+source record.
+
 ## How to enable it (T6b1)
 
 `cathedral worker serve` (TDX) and `cathedral worker serve-snp` take the TEE
@@ -551,7 +687,7 @@ No flag names the callers or their root keys; see "Caller authorization".
 - **Attested TLS only.** The flags need `--tls-certificate` and
   `--tls-private-key` (`cathedral/cli.py:1397`). The API then binds the
   worker's TLS key and hotkey, the key REPORT_DATA binds (design section 3);
-  `WorkerServer` checks this again (`cathedral/worker.py:1344-1356`).
+  `WorkerServer` checks this again (`cathedral/worker.py:1763-1775`).
 - **Detected addresses** are every address in `ip -json address show`,
   plus the `--public-endpoint` host when it is an IP literal. On a cloud
   guest behind 1:1 NAT the public address is not on an interface, so pass
@@ -578,7 +714,7 @@ CLI, `nft`, `tc`, `ip` and `nsenter` at `/usr/sbin/nft`, `/usr/sbin/tc`,
 shipped image provides all of that yet (see "Packaging").
 
 The sandbox routes have their own request pool of 8
-(`cathedral/worker.py:89`). Request bodies may be up to 8 MiB, under the
+(`cathedral/worker.py:137`). Request bodies may be up to 8 MiB, under the
 worker's request deadline.
 
 ## Egress enforcement (T6b1)
@@ -616,9 +752,9 @@ a 15 s timeout.
   detaches only what it confirmed removed. It treats a veth already gone as
   removed.
 - **Re-checked on its own thread.** The worker runs the egress check on a
-  thread of its own (`cathedral/worker.py:1476`), apart from the reaper, whose
+  thread of its own (`cathedral/worker.py:1885`), apart from the reaper, whose
   expiry deletes and drain wait on docker. It starts a check every 5 s
-  (`cathedral/worker.py:93`), or at once if the last one overran. Each
+  (`cathedral/worker.py:141`), or at once if the last one overran. Each
   check runs `check_egress` (`cathedral/tee_box/executor.py:1145`), which
   calls `maintain` (`cathedral/tee_box/enforce.py:548`): one
   `nft --json list table` read-back while the table is active, bounded by
@@ -963,8 +1099,9 @@ Before its Docker daemon and worker start, the appliance boot must:
     guest reboot. SEV-SNP needs its own mark (a vTPM PCR); open.
   - **Control plane.** Ask the miner to relaunch after `needs_relaunch`;
     admit with `require_fresh_boot=True` (and `last_released_at`) before
-    each new customer and pin that admission's SPKI; list both the fresh and
-    the consumed measurement; push revocations; and give each customer
+    each new customer and pin that admission's SPKI; take the measurement
+    policy from the signed list (`measurement_policy`, T11); push
+    revocations; and give each customer
     (better, each allocation) its own central key.
   - **Appliance.** Make the TLS key at each boot, on tmpfs; extend RTMR3
     nowhere else.
@@ -984,6 +1121,12 @@ Before its Docker daemon and worker start, the appliance boot must:
   sandbox and show the lapse path end to end: detection within the bound,
   `409` on calls, the quarantine cutting the sandbox's traffic at once, and
   the removal.
+- **Measurement list (T11).** Approval tooling for TEE box entries:
+  `scripts/cathedral_measurement_approval.py` adds one bare measurement to
+  a profile, and `accept_release` refuses that on a TEE box profile; it needs a mode that takes an
+  image's fields (from a live quote) and writes the `tee_box` entry. The
+  validator side (#256 reading the source record, or the signed list
+  directly) and routing's use of `eligible_images` are not built.
 - **Image measurement.** No measured image ships runsc, the daemon runtime
   entry, the host tools and the worker together. The opt-in layer is not
   measured or published. Measurement approval follows the design's plan
