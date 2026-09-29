@@ -326,8 +326,7 @@ No flag names the callers or their root keys; see "Caller authorization".
   it with `--tee-box-address` instead.
 - **Startup refuses** (`cathedral/tee_box/configure.py:257`) when the root
   key file does not match the measured binding, or on SEV-SNP (`:300`);
-  when the central state is not on tmpfs or ramfs, or swap other than zram
-  is on (`:301-307`); when the central state is unusable (`:308-318`); when
+  when the central state is not on tmpfs or ramfs, or any swap is on (`:301-307`); when the central state is unusable (`:308-318`); when
   the daemon does not register the runtime at the runtime path with
   `--platform=systrap` (`:336`); when Docker's data root is neither in guest
   memory nor on dm-crypt with integrity (`:337-341`); or when disk quotas
@@ -596,10 +595,12 @@ process memory already.
 - **Why not dm-crypt for state.** Its sector tags do not stop the host
   replaying an older version of a sector written under the same key, which
   would roll the file back within one boot.
-- **Swap.** tmpfs pages can be swapped out. The worker refuses while any
-  swap other than zram is on (`cathedral/tee_box/storage.py:367`,
-  `cathedral/tee_box/configure.py:305`), including swap on dm-crypt, which
-  would bring the sector replay back.
+- **Swap.** tmpfs pages can be swapped out, so the worker refuses while
+  any swap is on (`require_no_swap`, `cathedral/tee_box/configure.py:305`):
+  `/proc/swaps` must hold only its header line. That includes swap on
+  dm-crypt, which would bring the sector replay back, and zram, whose
+  `backing_dev` writes idle pages to a disk in the clear. No device or file
+  name is trusted to mean memory.
 
 ### Scratch: Docker's data root
 
@@ -646,7 +647,7 @@ Before its Docker daemon and worker start, the appliance boot must:
 1. Mount a tmpfs for the central state, for example
    `mount -t tmpfs -o mode=0700,size=64m tmpfs /run/cathedral-tee-box`, and
    pass `--tee-box-central-state /run/cathedral-tee-box/central.sqlite`.
-2. Leave swap off, or use zram only.
+2. Leave all swap off, zram included.
 3. Make a random key inside the TD, never written out, and open the scratch
    disk with integrity (`/dev/urandom` in a TD is seeded by the guest
    kernel from RDRAND and RDSEED, not by the host):

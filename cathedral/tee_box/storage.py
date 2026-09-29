@@ -14,8 +14,9 @@ only (the TEE box flags on ``worker serve``):
   it, is on tmpfs or ramfs, or on a dm-crypt device whose table carries an
   authenticated integrity mode. Imported image layers, container overlays,
   gVisor's overlay file, and ``files`` and ``tar`` uploads all live there.
-- ``require_no_disk_swap``: no swap outside guest memory (zram only), or the
-  tmpfs pages above could be written to a host disk in the clear.
+- ``require_no_swap``: no swap at all (not even zram, which can write to a
+  backing device), or the tmpfs pages above could reach a host disk in the
+  clear.
 
 Making the key (random, inside the TD, never written out) is the appliance
 boot's job; see docs/TEE_BOX_SERVICE.md, "Storage (T8)". Every probe is
@@ -364,20 +365,22 @@ def require_protected_scratch(
     return "; ".join(details)
 
 
-def require_no_disk_swap(probe: StorageProbe) -> str:
-    """Refuse while any swap outside guest memory is active (zram only)."""
+def require_no_swap(probe: StorageProbe) -> str:
+    """Refuse while any swap is active, of any kind.
 
-    lines = probe.swaps().splitlines()
-    active = []
-    for line in lines[1:]:
-        fields = line.split()
-        if not fields:
-            continue
-        device = _unescape(fields[0])
-        if not os.path.basename(device).startswith("zram"):
-            raise StorageError(
-                f"swap on {device!s:.128} could write guest memory, including the TEE box "
-                "state, to a host disk; turn it off (only zram is allowed)"
-            )
-        active.append(device)
-    return "zram swap only" if active else "no swap"
+    ``/proc/swaps`` must be exactly its header line. Anything more refuses:
+    swap on a disk or a file writes guest memory, the TEE box state
+    included, to host storage, and so can zram, whose ``backing_dev`` writes
+    pages to a disk in the clear. A name is never trusted to mean memory.
+    """
+
+    lines = [line for line in probe.swaps().splitlines() if line.strip()]
+    if not lines or lines[0].split() != ["Filename", "Type", "Size", "Used", "Priority"]:
+        raise StorageError("the swap table is unreadable")
+    if len(lines) > 1:
+        device = _unescape(lines[1].split()[0])
+        raise StorageError(
+            f"swap is on ({device!s:.128}); swap can write guest memory, including the "
+            "TEE box state, to a host disk, so the TEE box needs every swap off"
+        )
+    return "no swap"

@@ -524,18 +524,17 @@ def test_the_containerd_image_store_refuses(tmp_path: Path, guest):
 
 
 @pytest.mark.parametrize(
-    ("line", "refused"),
+    "line",
     [
-        ("/dev/sda2                               partition\t8388604\t0\t-2", True),
-        ("/swapfile                               file\t\t2097148\t0\t-3", True),
-        ("/dev/dm-4                               partition\t8388604\t0\t-2", True),
-        ("/dev/zram0                              partition\t4194300\t0\t100", False),
+        "/dev/sda2                               partition\t8388604\t0\t-2",
+        "/swapfile                               file\t\t2097148\t0\t-3",
+        "/dev/dm-4                               partition\t8388604\t0\t-2",
+        # zram too: a backing_dev writes its pages to a disk in the clear.
+        "/dev/zram0                              partition\t4194300\t0\t100",
+        "/var/zram.img                           file\t\t2097148\t0\t-3",
     ],
 )
-def test_swap_outside_guest_memory_refuses(tmp_path: Path, guest, line, refused):
+def test_any_swap_refuses(tmp_path: Path, guest, line):
     guest.disk.swap_lines = [line]
-    if refused:
-        _refused(tmp_path, r"^TEE box storage: swap on /\S+ could write guest memory")
-        assert not (tmp_path / "tee-box-central.sqlite").exists()
-    else:
-        assert cmd_worker_serve(_args(tmp_path, *_full_flags(tmp_path))) == 0
+    _refused(tmp_path, r"^TEE box storage: swap is on \(/\S+\); swap can write guest memory")
+    assert not (tmp_path / "tee-box-central.sqlite").exists()

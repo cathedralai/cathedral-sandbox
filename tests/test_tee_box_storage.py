@@ -24,7 +24,7 @@ from cathedral.tee_box.storage import (
     parse_crypt_table,
     parse_mountinfo,
     require_memory_backed,
-    require_no_disk_swap,
+    require_no_swap,
     require_protected_scratch,
     state_paths,
     statfs_type,
@@ -387,16 +387,9 @@ def test_a_failing_device_check_refuses(tmp_path: Path):
 SWAPS = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n"
 
 
-@pytest.mark.parametrize(
-    ("lines", "result"),
-    [
-        ([], "no swap"),
-        (["/dev/zram0 partition 4194300 0 100", "/dev/zram1 partition 4194300 0 100"], "zram"),
-    ],
-)
-def test_no_swap_or_zram_swap_is_accepted(lines, result):
-    probe, _ = _probe("", swaps=SWAPS + "".join(line + "\n" for line in lines))
-    assert result in require_no_disk_swap(probe)
+def test_a_swap_table_with_only_its_header_means_no_swap():
+    probe, _ = _probe("", swaps=SWAPS)
+    assert require_no_swap(probe) == "no swap"
 
 
 @pytest.mark.parametrize(
@@ -405,9 +398,18 @@ def test_no_swap_or_zram_swap_is_accepted(lines, result):
         "/dev/sda2 partition 8388604 0 -2",
         "/swap\\040file file 2097148 0 -3",
         "/dev/mapper/swap partition 8388604 0 -2",
+        "/dev/zram0 partition 4194300 0 100",  # zram may have a backing device
+        "/var/zram.img file 2097148 0 -3",  # a name is not a kind
     ],
 )
-def test_swap_on_any_disk_refuses(line):
-    probe, _ = _probe("", swaps=SWAPS + "/dev/zram0 partition 1 0 100\n" + line + "\n")
-    with pytest.raises(StorageError, match="could write guest memory"):
-        require_no_disk_swap(probe)
+def test_any_swap_refuses(line):
+    probe, _ = _probe("", swaps=SWAPS + line + "\n")
+    with pytest.raises(StorageError, match=r"^swap is on \(/.+\); swap can write guest memory"):
+        require_no_swap(probe)
+
+
+@pytest.mark.parametrize("text", ["", "/dev/sda2 partition 8388604 0 -2\n", "garbage\n"])
+def test_a_swap_table_without_its_header_refuses(text):
+    probe, _ = _probe("", swaps=text)
+    with pytest.raises(StorageError, match="swap table is unreadable"):
+        require_no_swap(probe)

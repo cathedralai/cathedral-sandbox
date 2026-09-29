@@ -11,7 +11,7 @@ refuses to start when those are unavailable or do not match.
 
 The TEE box runs only in TEE mode, so its storage rules always apply
 (cathedral/tee_box/storage.py): the central state on tmpfs or ramfs, no
-disk swap, and Docker's data root in memory or on dm-crypt with integrity.
+swap, and Docker's data root in memory or on dm-crypt with integrity.
 No flag relaxes them.
 """
 
@@ -49,7 +49,7 @@ from cathedral.tee_box.storage import (
     StorageProbe,
     default_storage_probe,
     require_memory_backed,
-    require_no_disk_swap,
+    require_no_swap,
     require_protected_scratch,
 )
 
@@ -271,8 +271,8 @@ def build_tee_box_api(
 
     Refuses first when the central root keys at the fixed image path do not
     hash to the launch's measured binding (MRCONFIGID on TDX; SNP has none
-    yet), then when the central state is not on tmpfs or ramfs, any swap
-    outside guest memory is on, the central state is unusable, the runsc
+    yet), then when the central state is not on tmpfs or ramfs, any swap is
+    on, the central state is unusable, the runsc
     runtime is not registered, Docker's data root is neither in memory nor
     on dm-crypt with integrity, or disk quotas are unsupported without the
     opt-out. An egress table that fails to apply does not refuse: the box
@@ -302,7 +302,7 @@ def build_tee_box_api(
     # Checked before the state is opened, which would create it.
     try:
         state_storage = require_memory_backed(config.central_state, fs_type=probe.fs_type)
-        swap = require_no_disk_swap(probe)
+        swap = require_no_swap(probe)
     except (StorageError, OSError) as exc:
         raise ValueError(f"TEE box storage: {exc}") from exc
     try:
