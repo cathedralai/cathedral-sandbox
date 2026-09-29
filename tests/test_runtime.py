@@ -49,7 +49,6 @@ from cathedral.runtime import (
 CANARY = MinerTarget("canary", "http://127.0.0.1:9000")
 
 
-
 @pytest.fixture(autouse=True)
 def _free_runtime_cycles():
     """Free runtimes left in reference cycles (a patched method closing over its

@@ -21,6 +21,7 @@ unmerged checkout cannot fail a healthy public tip.
 
     python3 scripts/detect_publisher_drift.py \\
       --evidence-url https://api.cathedral.computer/v1/evidence \\
+      --netuid NETUID \\
       --git-dir . \\
       --git-ref origin/main \\
       --release pins/publisher-release.json \\
@@ -54,7 +55,6 @@ from cathedral.provenance import MECHANISM_REVISIONS
 DEFAULT_EVIDENCE_URL = "https://api.cathedral.computer/v1/evidence"
 DEFAULT_MECHANISM_ID = "validated_supply_v2"
 DEFAULT_NETWORK = "finney"
-DEFAULT_NETUID = 39
 MAX_INDEX_BYTES = 1 << 20
 MAX_MANIFEST_BYTES = 1 << 20
 FETCH_DEADLINE_SECONDS = 30.0
@@ -147,7 +147,7 @@ def load_latest_manifest(
     fetch: Fetcher | None = None,
     index_keys: dict[str, bytes] | None = None,
     network: str = DEFAULT_NETWORK,
-    netuid: int = DEFAULT_NETUID,
+    netuid: int,
     require_signed_index: bool = False,
     now: datetime | None = None,
 ) -> tuple[str, dict[str, Any]]:
@@ -300,11 +300,15 @@ def compare_manifest(
             "cathedral/provenance.py",
             "cathedral/evidence.py",
             "cathedral/cli.py",
+            "cathedral/runtime.py",
+            "cathedral/receipt.py",
+            "cathedral/ledger.py",
+            "cathedral/score_class.py",
         )
         if newest_touch and not _is_ancestor(git_dir, newest_touch, source_revision):
             mismatches.append(
                 f"source_revision {source_revision} is older than the newest "
-                f"commit on {git_ref} touching mechanism files ({newest_touch})"
+                f"commit on {git_ref} touching mechanism or reward files ({newest_touch})"
             )
 
     if mismatches:
@@ -320,7 +324,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--git-ref",
         default="HEAD",
-        help="revision used to find the newest mechanism-file commit "
+        help="revision used to find the newest mechanism- or reward-file commit "
         "(pull requests should pass origin/main)",
     )
     parser.add_argument(
@@ -344,7 +348,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="fail unless the public index verifies under --index-keys",
     )
     parser.add_argument("--network", default=DEFAULT_NETWORK)
-    parser.add_argument("--netuid", type=int, default=DEFAULT_NETUID)
+    parser.add_argument(
+        "--netuid",
+        type=int,
+        required=True,
+        help="subnet the evidence index is signed for (deploy config, no default)",
+    )
     parser.add_argument(
         "--max-age-minutes",
         type=int,
