@@ -94,12 +94,14 @@ def _delegation(
     )
 
 
-def _revocations(sequence: int = 1, revoked=(), seed: bytes = ROOT_SEED) -> dict[str, object]:
+def _revocations(
+    sequence: int = 1, revoked=(), seed: bytes = ROOT_SEED, issued_at: datetime | None = None
+) -> dict[str, object]:
     return ca.sign_revocations(
         root_key_id=ROOT_KEY_ID,
         root_seed=seed,
         sequence=sequence,
-        issued_at=_now(),
+        issued_at=issued_at or _now(),
         revoked=list(revoked),
     )
 
@@ -131,7 +133,9 @@ def _authorizer(tmp_path: Path, binding, root_keys=ROOT_KEYS) -> ca.CentralAcces
 
 
 def _push_revocations(api: TeeBoxSandboxApi, document=None) -> None:
-    body = canonical_json(document if document is not None else _revocations())
+    # Signed "now" on the API's own clock, which some tests replace.
+    issued_at = datetime.fromtimestamp(int(api._clock()), UTC)  # noqa: SLF001
+    body = canonical_json(document if document is not None else _revocations(issued_at=issued_at))
     response = api.handle("POST", "/v1/box/revocations", CALLER, body)
     assert response.status == 200, response.body
 
@@ -753,7 +757,12 @@ def test_no_route_but_box_is_served_before_a_revocation_list_is_pushed(tmp_path:
     try:
         status, contract = box.json("GET", "/v1/box")
         assert status == 200
-        assert contract["revocations"] == {"pushed": False, "sequence": 0}
+        assert contract["revocations"] == {
+            "pushed": False,
+            "sequence": 0,
+            "issued_at": None,
+            "fresh": False,
+        }
         for method, target, body in (
             ("POST", "/v1/lease", {"ttl_seconds": 600}),
             ("GET", "/v1/sandboxes", None),
@@ -774,14 +783,22 @@ def test_no_route_but_box_is_served_before_a_revocation_list_is_pushed(tmp_path:
         )
         assert box.json("GET", "/v1/box")[1]["revocations"]["pushed"] is False
         # A signed list opens the box; the same list may be pushed again, an older one not.
-        assert box.json("POST", "/v1/box/revocations", canonical_json(_revocations(3)))[1] == {
-            "sequence": 3
+        signed = _now()
+        pushed = canonical_json(_revocations(3, issued_at=signed))
+        assert box.json("POST", "/v1/box/revocations", pushed)[1] == {
+            "sequence": 3,
+            "issued_at": int(signed.timestamp()),
         }
-        assert box.json("POST", "/v1/box/revocations", canonical_json(_revocations(3)))[0] == 200
+        assert box.json("POST", "/v1/box/revocations", pushed)[0] == 200
         status, refusal = box.json("POST", "/v1/box/revocations", canonical_json(_revocations(2)))
         assert (status, refusal["reason"]) == (409, "revocations_refused")
         assert box.json("POST", "/v1/lease", {"ttl_seconds": 600})[0] == 200
-        assert box.json("GET", "/v1/box")[1]["revocations"] == {"pushed": True, "sequence": 3}
+        assert box.json("GET", "/v1/box")[1]["revocations"] == {
+            "pushed": True,
+            "sequence": 3,
+            "issued_at": int(signed.timestamp()),
+            "fresh": True,
+        }
     finally:
         box.close()
 
@@ -932,7 +949,7 @@ def _fresh(tmp_path: Path, fake: FakeExecutor):
     clock = _Clock()
     api, _ = _api(tmp_path, _binding(), clock=clock, executor=fake, ready=False)
     # Mark the list pushed without a call: any call would run the first sweep.
-    api._revocations_pushed = True  # noqa: SLF001
+    api._revocations_issued_at = clock.value  # noqa: SLF001
     return api, clock
 
 
@@ -1119,3 +1136,87 @@ def test_the_egress_check_runs_on_its_own_thread(tmp_path: Path, monkeypatch):
     finally:
         executor.release.set()
         box.close()
+
+
+def test_a_revoked_delegation_cannot_reopen_a_relaunched_box_with_a_stale_list(tmp_path: Path):
+    # Review of 5f7d355: after a relaunch the central state is empty, so any
+    # root-signed list passed the sequence check. A stolen delegation revoked
+    # under list 2 pushed the older list 1 and reopened every route.
+    delegation = _delegation()
+    list_one = _revocations(1, issued_at=_now() - timedelta(hours=30))
+    list_two = _revocations(2, [_delegation_digest(delegation)])
+    for name in ("before", "relaunched"):
+        (tmp_path / name).mkdir(mode=0o700)
+    before = _Box(tmp_path / "before", ready=False)
+    try:
+        assert before.call("POST", "/v1/box/revocations", canonical_json(list_two))[0] == 200
+        assert before.call("GET", "/v1/box", delegation=delegation)[0] == 401
+    finally:
+        before.close()
+    relaunched = _Box(tmp_path / "relaunched", ready=False)
+    try:
+        status, refusal = relaunched.json(
+            "POST", "/v1/box/revocations", canonical_json(list_one), delegation=delegation
+        )
+        assert (status, refusal["reason"]) == (409, "revocations_stale")
+        contract = relaunched.json("GET", "/v1/box", delegation=delegation)[1]
+        assert contract["revocations"]["pushed"] is False
+        status, refusal = relaunched.json(
+            "POST", "/v1/lease", {"ttl_seconds": 600}, delegation=delegation
+        )
+        assert (status, refusal["reason"]) == (409, "revocation_list_required")
+        # The current list closes the delegation for good.
+        assert relaunched.call("POST", "/v1/box/revocations", canonical_json(list_two))[0] == 200
+        assert relaunched.call("GET", "/v1/box", delegation=delegation)[0] == 401
+    finally:
+        relaunched.close()
+
+
+@pytest.mark.parametrize(
+    "issued_at",
+    [
+        lambda now: now - timedelta(seconds=24 * 3600 + 1),
+        lambda now: now + timedelta(seconds=16),
+    ],
+)
+def test_a_stale_or_future_list_is_refused(tmp_path: Path, issued_at):
+    clock = _Clock()
+    api, _fake = _api(tmp_path, _binding(), clock=clock, ready=False)
+    now = datetime.fromtimestamp(clock.value, UTC)
+    response = api.handle(
+        "POST",
+        "/v1/box/revocations",
+        CALLER,
+        canonical_json(_revocations(issued_at=issued_at(now))),
+    )
+    assert (response.status, json.loads(response.body)["reason"]) == (409, "revocations_stale")
+    assert api.authorizer.revocations_sequence == 0  # never installed
+    # At the bounds, a list is fresh.
+    for edge in (now - timedelta(seconds=24 * 3600), now + timedelta(seconds=15)):
+        body = canonical_json(_revocations(2, issued_at=edge))
+        assert api.handle("POST", "/v1/box/revocations", CALLER, body).status == 200
+
+
+def test_the_gate_closes_when_the_pushed_list_goes_stale(tmp_path: Path):
+    from cathedral.tee_box.service import MAX_REVOCATIONS_AGE_SECONDS
+
+    assert MAX_REVOCATIONS_AGE_SECONDS == ca.MAX_DELEGATION_SECONDS
+    clock = _Clock()
+    api, _fake = _api(tmp_path, _binding(), clock=clock)  # pushes a list signed now
+    assert _handle(api, "POST", "/v1/lease", body={"ttl_seconds": 60})[0] == 200
+    clock.value += MAX_REVOCATIONS_AGE_SECONDS
+    assert _handle(api, "GET", "/v1/lease")[0] == 200
+    clock.value += 1
+    status, refusal = _handle(api, "GET", "/v1/sandboxes")
+    assert (status, refusal["reason"]) == (409, "revocation_list_stale")
+    status, contract = _handle(api, "GET", "/v1/box")
+    assert status == 200
+    assert contract["revocations"]["pushed"] is True
+    assert contract["revocations"]["fresh"] is False
+    # The same list again is still stale; a freshly signed one reopens the box.
+    stale = canonical_json(_revocations(issued_at=datetime.fromtimestamp(1_900_000_000, UTC)))
+    assert api.handle("POST", "/v1/box/revocations", CALLER, stale).status == 409
+    fresh = canonical_json(_revocations(2, issued_at=datetime.fromtimestamp(int(clock.value), UTC)))
+    assert api.handle("POST", "/v1/box/revocations", CALLER, fresh).status == 200
+    assert _handle(api, "GET", "/v1/box")[1]["revocations"]["fresh"] is True
+    assert _handle(api, "POST", "/v1/lease", body={"ttl_seconds": 60})[0] == 200

@@ -12,7 +12,9 @@ v1 serves create, exec (sync and background), files, list, get, lifetime,
 delete and image import by digest. It has no snapshots, fork, ports or
 Docker-in-Docker (owner decision 5). The control plane pushes the root-signed
 revocation list to ``POST /v1/box/revocations`` after every start, and the
-box serves no other route but ``GET /v1/box`` until it has one.
+box serves no other route but ``GET /v1/box`` until it has one that is fresh:
+signed (its ``issued_at``) at most ``MAX_REVOCATIONS_AGE_SECONDS`` ago. When
+that list goes stale, the other routes close again until a fresh one arrives.
 """
 
 from __future__ import annotations
@@ -23,9 +25,14 @@ import secrets
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from urllib.parse import parse_qsl
 
-from cathedral.central_access import CentralAccessAuthorizer, CentralAccessError
+from cathedral.central_access import (
+    MAX_DELEGATION_SECONDS,
+    CentralAccessAuthorizer,
+    CentralAccessError,
+)
 from cathedral.policy_registry import canonical_json, parse_registry_json
 from cathedral.tee_box.egress import EgressPolicy
 from cathedral.tee_box.executor import (
@@ -135,6 +142,14 @@ _NO_LEASE_ROUTES = frozenset({"box", "revocations", "lease_get", "lease_acquire"
 # Routes served before the control plane has pushed a revocation list.
 _NO_REVOCATIONS_ROUTES = frozenset({"box", "revocations"})
 MAX_REVOCATIONS_BODY = 512 * 1024
+# A pushed revocation list opens the box only while its signed issued_at is at
+# most this old: the longest a delegation can live, so a list from before a
+# delegation was revoked cannot reopen the box for longer than that
+# delegation could have lived anyway. The root therefore re-signs the list at
+# least this often.
+MAX_REVOCATIONS_AGE_SECONDS = MAX_DELEGATION_SECONDS
+MAX_REVOCATIONS_FUTURE_SKEW_SECONDS = 15
+_ISSUED_AT_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _LABEL_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 _USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,31})?$")
@@ -316,9 +331,10 @@ class TeeBoxSandboxApi:
         self.capacity = capacity
         self.default_shape = default_shape
         self._clock = clock
-        # Set once the control plane has pushed a revocation list to this
-        # process; until then only GET /v1/box and the push are served.
-        self._revocations_pushed = False
+        # The signed issued_at (epoch seconds) of the last list pushed to this
+        # process. Only GET /v1/box and the push are served until one is
+        # pushed, and again whenever it is no longer fresh.
+        self._revocations_issued_at: float | None = None
         self.lease = CustomerLease(self._drain_owner, max_seconds=max_lease_seconds, clock=clock)
 
     # -- lifecycle helpers -----------------------------------------------
@@ -428,12 +444,19 @@ class TeeBoxSandboxApi:
         except ValueError:
             return _json(400, {"error": "invalid query"})
         try:
-            if name not in _NO_REVOCATIONS_ROUTES and not self._revocations_pushed:
-                raise _Refusal(
-                    409,
-                    "the control plane has not pushed a revocation list since the box started",
-                    "revocation_list_required",
-                )
+            if name not in _NO_REVOCATIONS_ROUTES:
+                if self._revocations_issued_at is None:
+                    raise _Refusal(
+                        409,
+                        "the control plane has not pushed a revocation list since the box started",
+                        "revocation_list_required",
+                    )
+                if not self._fresh(self._revocations_issued_at):
+                    raise _Refusal(
+                        409,
+                        "the pushed revocation list is stale; push a freshly signed one",
+                        "revocation_list_stale",
+                    )
             self.reap(force_drain=False)
             if name not in _NO_LEASE_ROUTES:
                 self.lease.require(caller)
@@ -525,8 +548,15 @@ class TeeBoxSandboxApi:
                 "default_shape": self.default_shape.view(),
                 "egress": self._egress_view(),
                 "revocations": {
-                    "pushed": self._revocations_pushed,
+                    "pushed": self._revocations_issued_at is not None,
                     "sequence": self.authorizer.revocations_sequence,
+                    "issued_at": (
+                        None
+                        if self._revocations_issued_at is None
+                        else int(self._revocations_issued_at)
+                    ),
+                    "fresh": self._revocations_issued_at is not None
+                    and self._fresh(self._revocations_issued_at),
                 },
                 "lease": {
                     "held": lease is not None,
@@ -537,12 +567,26 @@ class TeeBoxSandboxApi:
             },
         )
 
+    def _fresh(self, issued_at: float) -> bool:
+        now = self._clock()
+        return (
+            now - MAX_REVOCATIONS_AGE_SECONDS
+            <= issued_at
+            <= now + MAX_REVOCATIONS_FUTURE_SKEW_SECONDS
+        )
+
     def _revocations(self, caller, body, fields) -> Response:  # noqa: ANN001
         """Install the root-signed revocation list the control plane pushes.
 
-        The list is verified against the measured root keys, and never older
-        than the one in force. Pushing the list in force again is accepted,
-        so the control plane can push after every start.
+        The list must be fresh: its signed ``issued_at`` at most
+        MAX_REVOCATIONS_AGE_SECONDS old and at most 15 s ahead. A stale list
+        is refused before it is installed, so after a relaunch a revoked
+        delegation cannot reopen the box with a list from before its
+        revocation (unless that list is itself still fresh; see
+        docs/TEE_BOX_SERVICE.md). It is then verified against the measured
+        root keys, and never older than the one in force. Pushing the list in
+        force again is accepted, so the control plane can push after every
+        start.
         """
 
         self._query(fields, frozenset())
@@ -554,12 +598,32 @@ class TeeBoxSandboxApi:
                 raise ValueError("not canonical")
         except ValueError as exc:
             raise _bad("the revocation list must be one canonical JSON object") from exc
+        issued_text = document.get("issued_at")
+        try:
+            if not isinstance(issued_text, str) or _ISSUED_AT_RE.fullmatch(issued_text) is None:
+                raise ValueError("not canonical UTC")
+            issued_at = (
+                datetime.strptime(issued_text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC).timestamp()
+            )
+        except ValueError as exc:
+            raise _Refusal(
+                409, "revocation list issued_at must be canonical UTC time", "revocations_refused"
+            ) from exc
+        if not self._fresh(issued_at):
+            raise _Refusal(
+                409,
+                "revocation list is stale or issued in the future; push a freshly signed one",
+                "revocations_stale",
+            )
         try:
             self.authorizer.install_revocations(document)
         except CentralAccessError as exc:
             raise _Refusal(409, f"revocation list refused: {exc}", "revocations_refused") from exc
-        self._revocations_pushed = True
-        return _json(200, {"sequence": self.authorizer.revocations_sequence})
+        self._revocations_issued_at = issued_at
+        return _json(
+            200,
+            {"sequence": self.authorizer.revocations_sequence, "issued_at": int(issued_at)},
+        )
 
     def _lease_get(self, caller, body, fields) -> Response:  # noqa: ANN001
         lease = self.lease.current()
