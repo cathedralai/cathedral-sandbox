@@ -630,9 +630,15 @@ kinds:
   cryptsetup builds an `authenc(hmac(sha256),xts(aes))` AEAD cipher, which
   the table shows as `integrity:48:aead`.
 
-Overlay and nsfs mounts below the root are views of the root's own storage
-and are skipped. An overlay serving the root itself (a worker inside a
-container) refuses: the worker must see the data root in the daemon's mount
+Below the root, nsfs mounts hold no data and are skipped. An overlay mount
+below the root (a running container's root filesystem) passes only when its
+`upperdir`, `workdir` and every `lowerdir` (including `lowerdir+` and
+`datadir+`) resolve, symlinks followed, under the data root, whose mounts
+are all checked; relative layer paths, as Docker's overlay2 driver passes
+them, are resolved from `<data root>/overlay2`. A layer anywhere else, such
+as an upper directory on an unencrypted disk, refuses, and so does an
+overlay with no lower layer. An overlay serving the root itself (a worker
+inside a container) refuses: the worker must see the data root in the daemon's mount
 namespace, as the appliance runs both. sysfs gives the dm uuid and name to
 anyone but not the table, and `dmsetup table` needs CAP_SYS_ADMIN (the
 device-mapper ioctl). The worker already runs as guest root for docker, nft

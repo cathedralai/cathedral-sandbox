@@ -122,7 +122,8 @@ MOUNTINFO = """\
 
 def test_mountinfo_is_parsed_with_escapes():
     mounts = parse_mountinfo(MOUNTINFO)
-    assert mounts[2] == Mount("/var/lib/docker", 253, 3, "ext4", "/dev/mapper/scratch")
+    assert mounts[2] == Mount("/var/lib/docker", 253, 3, "ext4", "/dev/mapper/scratch", "rw")
+    assert mounts[3].options == "rw,lowerdir=x"
     assert mounts[4].mount_point == "/srv/with space"
 
 
@@ -371,13 +372,75 @@ def _root_table(root: Path, fstype: str = "ext4", device: str = "253:3", extra: 
     )
 
 
+def _overlay(root: Path, options: str) -> str:
+    return f"91 90 0:60 / {root}/overlay2/abc/merged rw - overlay overlay rw,{options}\n"
+
+
+def _docker_overlay(root: Path) -> str:
+    # How Docker's overlay2 driver mounts: relative lowerdirs from its home.
+    return (
+        f"lowerdir=l/AAAA:l/BBBB,upperdir={root}/overlay2/abc/diff,workdir={root}/overlay2/abc/work"
+    )
+
+
 def test_a_docker_root_on_dm_crypt_with_integrity_is_accepted(tmp_path: Path):
     root = tmp_path.resolve()
-    extra = f"91 90 0:60 / {root}/overlay2/abc/merged rw - overlay overlay rw\n"
+    extra = _overlay(root, _docker_overlay(root))
     extra += f"92 90 0:4 net:[4026532] {root}/netns/x rw - nsfs nsfs rw\n"
     probe, checked = _probe(_root_table(root, extra=extra), {(253, 3): (True, "dm-crypt aead")})
     assert require_protected_scratch(str(root), probe) == f"{root}: dm-crypt aead"
     assert checked == [(253, 3)]  # overlay and nsfs views are not devices to check
+
+
+@pytest.mark.parametrize(
+    ("options", "outside"),
+    [
+        # A container's writable layer on an unencrypted disk.
+        ("lowerdir=l/AAAA,upperdir=/mnt/plain/diff,workdir={root}/overlay2/abc/work", "diff"),
+        ("lowerdir=l/AAAA,upperdir={root}/overlay2/abc/diff,workdir=/mnt/plain/work", "work"),
+        ("lowerdir=l/AAAA:/mnt/plain/layer,upperdir={root}/overlay2/abc/diff", "layer"),
+        ("lowerdir=../../mnt/plain,upperdir={root}/overlay2/abc/diff", "plain"),
+        ("lowerdir=l/AAAA::/mnt/plain/data,upperdir={root}/overlay2/abc/diff", "data"),
+        ("lowerdir+=/mnt/plain/layer,upperdir={root}/overlay2/abc/diff", "layer"),
+    ],
+)
+def test_an_overlay_below_the_root_with_a_layer_elsewhere_refuses(tmp_path, options, outside):
+    root = tmp_path.resolve()
+    extra = _overlay(root, options.format(root=root))
+    probe, _checked = _probe(_root_table(root, extra=extra), {(253, 3): (True, "dm-crypt aead")})
+    with pytest.raises(StorageError, match=rf"layer outside the Docker data root: \S*{outside}$"):
+        require_protected_scratch(str(root), probe)
+
+
+def test_an_overlay_layer_linked_out_of_the_root_refuses(tmp_path: Path):
+    root = tmp_path.resolve() / "docker"
+    (root / "overlay2" / "l").mkdir(parents=True)
+    (root / "overlay2" / "l" / "AAAA").symlink_to(tmp_path.resolve() / "elsewhere")
+    extra = _overlay(root, _docker_overlay(root))
+    probe, _checked = _probe(_root_table(root, extra=extra), {(253, 3): (True, "dm-crypt aead")})
+    with pytest.raises(StorageError, match="outside the Docker data root: l/AAAA$"):
+        require_protected_scratch(str(root), probe)
+
+
+@pytest.mark.parametrize(
+    ("options", "reason"),
+    [
+        ("upperdir={root}/overlay2/abc/diff,workdir={root}/overlay2/abc/work", "no lower layer"),
+        ("lowerdir=,upperdir={root}/overlay2/abc/diff", "empty lowerdir"),
+        ("lowerdir=l/AAAA,upperdir", "empty upperdir"),
+    ],
+)
+def test_an_overlay_with_malformed_layers_refuses(tmp_path, options, reason):
+    root = tmp_path.resolve()
+    extra = _overlay(root, options.format(root=root))
+    probe, _checked = _probe(_root_table(root, extra=extra), {(253, 3): (True, "dm-crypt aead")})
+    with pytest.raises(StorageError, match=reason):
+        require_protected_scratch(str(root), probe)
+
+
+def test_overlay_dirs_undo_the_kernel_escapes():
+    options = r"rw,lowerdir=/a\072b:/c\054d::/e,upperdir=/u\040v,workdir=/w,xino=off"
+    assert storage.overlay_dirs(options) == ("/a:b", "/c,d", "/e", "/u v", "/w")
 
 
 @pytest.mark.parametrize("fstype", ["tmpfs", "ramfs"])

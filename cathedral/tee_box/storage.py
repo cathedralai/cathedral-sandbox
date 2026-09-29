@@ -38,10 +38,14 @@ TMPFS_MAGIC = 0x01021994
 RAMFS_MAGIC = 0x858458F6
 MEMORY_MAGICS = {TMPFS_MAGIC: "tmpfs", RAMFS_MAGIC: "ramfs"}
 MEMORY_FSTYPES = frozenset({"tmpfs", "ramfs"})
-# Mounts below the data root that are views of storage checked elsewhere:
-# Docker's overlay mounts of a running container (its layers are directories
-# under the data root) and network namespace handles.
-VIEW_FSTYPES = frozenset({"overlay", "nsfs"})
+# Network namespace handles below the data root hold no data. Overlay mounts
+# below it (a running container's root filesystem) are accepted only when
+# every layer directory resolves under the data root (``overlay_dirs``).
+VIEW_FSTYPES = frozenset({"nsfs"})
+# Docker's overlay2 driver mounts from its own directory with relative
+# lowerdir paths, to fit the mount data into one page.
+OVERLAY2_HOME = "overlay2"
+_OVERLAY_DIR_KEYS = frozenset({"lowerdir", "lowerdir+", "datadir+", "upperdir", "workdir"})
 # SQLite and ValidatorAccessState files beside the state database.
 STATE_SIDE_SUFFIXES = (".lock", "-journal", "-wal", "-shm")
 DMSETUP_PATH = "/usr/sbin/dmsetup"
@@ -170,6 +174,7 @@ class Mount:
     minor: int
     fstype: str
     source: str
+    options: str = ""
 
 
 def _unescape(field: str) -> str:
@@ -198,6 +203,7 @@ def parse_mountinfo(text: str) -> tuple[Mount, ...]:
                     minor=int(device.group(2)),
                     fstype=fields[separator + 1],
                     source=_unescape(fields[separator + 2]),
+                    options=fields[separator + 3],
                 )
             )
         except (ValueError, IndexError) as exc:
@@ -234,6 +240,44 @@ def mounts_for(root: str, mounts: tuple[Mount, ...], device: tuple[int, int]) ->
         and mount.mount_point.startswith(root.rstrip("/") + "/")
     )
     return (serving, *below)
+
+
+def overlay_dirs(options: str) -> tuple[str, ...]:
+    """Every layer directory an overlay mount's super options name.
+
+    ``lowerdir`` is a colon list (``::`` before data-only layers); the
+    kernel escapes commas, colons and spaces inside a path. Refuses options
+    with no lower layer.
+    """
+
+    dirs = []
+    lower = False
+    for option in options.split(","):
+        key, sep, value = option.partition("=")
+        if key not in _OVERLAY_DIR_KEYS:
+            continue
+        if not sep or not value:
+            raise StorageError(f"an overlay mount has an empty {key}")
+        if key == "lowerdir":
+            parts = [part for part in re.split(r"(?<!\\):", value) if part]
+        else:
+            parts = [value]
+        lower = lower or key in ("lowerdir", "lowerdir+")
+        dirs += [_unescape(part).replace("\\:", ":") for part in parts]
+    if not lower:
+        raise StorageError("an overlay mount names no lower layer")
+    return tuple(dirs)
+
+
+def _overlay_outside(root: str, mount: Mount) -> str | None:
+    """The first layer directory of ``mount`` outside ``root``, or None."""
+
+    home = os.path.join(root, OVERLAY2_HOME)
+    for path in overlay_dirs(mount.options):
+        resolved = os.path.realpath(os.path.join(home, path))
+        if resolved != root and not resolved.startswith(root.rstrip("/") + "/"):
+            return path
+    return None
 
 
 def parse_crypt_table(text: str) -> tuple[bool, str]:
@@ -334,8 +378,10 @@ def require_protected_scratch(
 
     ``root`` is the daemon's ``DockerRootDir``, looked up in the worker's own
     mount namespace, which must be the daemon's. Each mount must be tmpfs or
-    ramfs, or a block device ``probe.crypt_integrity`` accepts. Overlay and
-    nsfs mounts below the root are views of storage the root mount holds.
+    ramfs, or a block device ``probe.crypt_integrity`` accepts. Below the
+    root, nsfs mounts are skipped, and an overlay mount passes only when its
+    upperdir, workdir and every lowerdir resolve under the root (relative
+    ones from Docker's overlay2 directory), whose mounts are all checked.
     """
 
     if (driver_status or {}).get("driver-type") == CONTAINERD_SNAPSHOTTER:
@@ -368,6 +414,15 @@ def require_protected_scratch(
             details.append(f"{mount.mount_point}: {mount.fstype}")
             continue
         if index > 0 and mount.fstype in VIEW_FSTYPES:
+            continue
+        if index > 0 and mount.fstype == "overlay":
+            outside = _overlay_outside(resolved, mount)
+            if outside is not None:
+                raise StorageError(
+                    f"TEE box scratch must be in guest memory or on dm-crypt with integrity; "
+                    f"the overlay on {mount.mount_point} has a layer outside the Docker data "
+                    f"root: {outside!s:.256}"
+                )
             continue
         try:
             ok, detail = probe.crypt_integrity(mount.major, mount.minor)
