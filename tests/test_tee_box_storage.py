@@ -7,6 +7,7 @@ real statfs(2) on /proc and /dev/shm.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -73,6 +74,20 @@ def test_a_state_file_linked_onto_disk_refuses(tmp_path: Path):
         require_memory_backed(
             str(memory / "central.sqlite"), fs_type=_memory_except(disk.resolve())
         )
+
+
+def test_a_disk_directory_linking_into_tmpfs_refuses(tmp_path: Path):
+    # The state path is a symlink in a disk directory pointing into tmpfs.
+    # The database resolves into tmpfs, but the lock file (opened without
+    # following links, at path + ".lock") and SQLite's side files land in the
+    # disk directory. Only the unresolved directory catches that.
+    disk, memory = tmp_path / "disk", tmp_path / "shm"
+    disk.mkdir()
+    memory.mkdir()
+    (disk / "central.sqlite").symlink_to(memory / "central.sqlite")
+    fs_type = _memory_except(disk, disk.resolve())
+    with pytest.raises(StorageError, match=rf"{re.escape(str(disk))} is on .* 0xef53$"):
+        require_memory_backed(str(disk / "central.sqlite"), fs_type=fs_type)
 
 
 @pytest.mark.parametrize("suffix", ["", ".lock", "-journal", "-wal", "-shm"])

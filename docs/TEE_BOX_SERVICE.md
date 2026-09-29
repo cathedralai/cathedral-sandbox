@@ -652,7 +652,7 @@ and tc; one that cannot read the table refuses. It runs
 name read from sysfs and checked against a strict pattern.
 
 The checks run once, at startup. The appliance must not change these mounts
-or turn swap on afterwards.
+or turn swap on afterwards. Checking only at startup is accepted for v1.
 
 ### The appliance boot step
 
