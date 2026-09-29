@@ -37,7 +37,9 @@ probes, and pays, the box at the probe template's shape
 (``VerifiedRegistration.probe_capacity``) and never more. ``capacity`` is the
 host as the installer measured it; it bounds the templates, and host vCPUs or
 memory outside the probe template earn nothing. A miner makes the probe
-template its largest shape, ideally the whole box.
+template its largest shape, ideally the whole box. docs/CAPACITY.md (#217)
+sizes the challenge from claimed vCPUs and memory, so the prober must size it
+with ``spec_for`` from ``probe_capacity``, never from ``capacity``.
 
 The prober verifies the registration, probes the box through its front door,
 and only then admits it (docs/MINER_BOX_RUNBOOK.md).
@@ -124,7 +126,10 @@ from cathedral.validator_access import (
     load_sr25519_verifier,
 )
 
-SCHEMA = "cathedral_box_registration_v1"
+# v2: the sealed key is the box's scoped probe key (`sealed_probe_key`) and the
+# body names the probe template (`probe_template_id`). v1 sealed the runtime
+# team key; it is refused, so no v1 document is ever read with this field set.
+SCHEMA = "cathedral_box_registration_v2"
 SEAL_ALGORITHM = "x25519-hkdf-sha256-chacha20poly1305"
 SEAL_INFO = b"cathedral.box-registration.probe-key.v1"
 ISSUED_AT_SKEW = timedelta(minutes=5)

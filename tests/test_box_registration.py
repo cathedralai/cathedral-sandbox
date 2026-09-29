@@ -321,6 +321,29 @@ def test_the_seal_derivation_binds_both_public_keys():
         reg.open_probe_key(verified, PROBER)
 
 
+def test_a_key_sealed_under_the_team_key_info_does_not_open(monkeypatch):
+    # Known answer for the probe-key domain: a seal made with the old
+    # team-key info string never opens, even over an otherwise valid body.
+    assert reg.SEAL_INFO == b"cathedral.box-registration.probe-key.v1"
+    with monkeypatch.context() as patched:
+        patched.setattr(reg, "SEAL_INFO", b"cathedral.box-registration.runtime-key.v1")
+        signed = _registration()
+    verified = _verify(signed)
+    with pytest.raises(reg.RegistrationError, match="does not open"):
+        reg.open_probe_key(verified, PROBER)
+    assert reg.open_probe_key(_verify(_registration()), PROBER) == PROBE_KEY
+
+
+def test_a_v1_registration_is_refused():
+    # v1 had the team-key field set (sealed_runtime_key, no probe_template_id).
+    # The field set changed, so the schema did too, and a v1 label is refused.
+    assert reg.SCHEMA == "cathedral_box_registration_v2"
+    body = _body(_registration())
+    body["schema"] = "cathedral_box_registration_v1"
+    with pytest.raises(reg.RegistrationError, match="schema is unsupported"):
+        _verify(_hand_signed(body))
+
+
 def test_the_box_id_is_bound_to_certificate_and_hotkey():
     body = {k: v for k, v in _registration().items() if k != "signature"}
     body["box_id"] = "box-" + "0" * 32
