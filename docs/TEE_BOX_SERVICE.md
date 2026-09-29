@@ -14,9 +14,12 @@ interface has yet to be confirmed on hardware (see "Relaunch between
 customers (T9)"). T11 reads the owner's one signed measurement list, the
 existing signed policy registry, for admission and for the validator's
 #256 file (see "The measurement list (T11)").
-Nothing here has
-run on TDX or SEV-SNP hardware yet; that is T6b2 (see "Not done" below). The design is `TEE_BOX.md` on PR #236, branch
-`docs/tee-box-design` (sections 2 to 4 and "Owner decisions for v1").
+Parts of it have
+run on a real TDX guest (a Polaris TDX sandbox, 2026-09-29: the TD report,
+the RTMR3 extend, the dm-crypt tables, runsc and the egress enforcer); the
+rest of T6b2 needs our own measured image (see "Not done" below). SEV-SNP is
+untested. The design is `docs/TEE_BOX.md` (sections 2 to 4 and "Owner
+decisions for v1").
 Citations are `file:line` in this repository.
 
 ## What T6a adds
@@ -141,7 +144,7 @@ Citations are `file:line` in this repository.
   - A create holds the lease lock, so a drain cannot miss it
     (`cathedral/tee_box/service.py:765-766`).
   - A worker thread runs every 5 s, and once at start
-    (`cathedral/worker.py:1462`). It checks expiry, retries the drain, and
+    (`cathedral/worker.py:1871`). It checks expiry, retries the drain, and
     sweeps orphans.
 - **API** (`cathedral/tee_box/service.py:314`). The routes are listed in
   `cathedral/tee_box/service.py:88`, and the central-access scope each needs
@@ -181,8 +184,8 @@ object says whether the egress rules are enforced, with the last error
 ## Caller authorization
 
 Callers use central access (`cathedral/central_access.py`, from #225, #228
-and #241), with the root keys in measured state. The design is `TEE_BOX.md`
-on PR #236, section 3, "Callers: central access, with its root in measured
+and #241), with the root keys in measured state. The design is `docs/TEE_BOX.md`,
+section 3, "Callers: central access, with its root in measured
 state".
 
 - **Why not the validator-access snapshot.** T6b1 took caller keys from a
@@ -233,15 +236,15 @@ state".
   `route_scope` (`cathedral/tee_box/service.py:180`). Before it reserves a
   slot or reads the body, it verifies the delegation against the measured
   root, its expiry, its scope and the revocation list, then the request's
-  signature and expiry (`cathedral/worker.py:511`). After the body is read,
+  signature and expiry (`cathedral/worker.py:796`). After the body is read,
   it checks the body digest, the revocation list again and replay
-  (`cathedral/worker.py:532`). Replay and the delegation high-water live in
+  (`cathedral/worker.py:817`). Replay and the delegation high-water live in
   the `--tee-box-central-state` file.
 - **Separate from the `--central-*` flags.** The worker's own central
   access, for `/v1/capabilities`, trusts root keys the miner names by flag.
   The TEE box builds its own authorizer from the measured root, and
   `WorkerServer` refuses to share that authorizer or its state
-  (`cathedral/worker.py:1357-1364`).
+  (`cathedral/worker.py:1776-1783`).
 - **Revocation list.** State starts empty on a fresh box, so the control
   plane pushes the root-signed revocation list to `POST /v1/box/revocations`
   after every start (`cathedral/tee_box/service.py:615`). Until it has, only
@@ -306,7 +309,7 @@ state".
 
 Owner decision 1, amended 2026-09-29: the confidential VM is relaunched and
 re-attested between customer allocations, so a gVisor escape by one customer
-cannot persist into the next. The design is `TEE_BOX.md` on PR #236,
+cannot persist into the next. The design is `docs/TEE_BOX.md`,
 decisions 1 and 8 and sections 4 to 6.
 
 **What the guarantee rests on.** A tenant that escapes gVisor has root in
@@ -684,7 +687,7 @@ No flag names the callers or their root keys; see "Caller authorization".
 - **Attested TLS only.** The flags need `--tls-certificate` and
   `--tls-private-key` (`cathedral/cli.py:1397`). The API then binds the
   worker's TLS key and hotkey, the key REPORT_DATA binds (design section 3);
-  `WorkerServer` checks this again (`cathedral/worker.py:1344-1356`).
+  `WorkerServer` checks this again (`cathedral/worker.py:1763-1775`).
 - **Detected addresses** are every address in `ip -json address show`,
   plus the `--public-endpoint` host when it is an IP literal. On a cloud
   guest behind 1:1 NAT the public address is not on an interface, so pass
@@ -711,7 +714,7 @@ CLI, `nft`, `tc`, `ip` and `nsenter` at `/usr/sbin/nft`, `/usr/sbin/tc`,
 shipped image provides all of that yet (see "Packaging").
 
 The sandbox routes have their own request pool of 8
-(`cathedral/worker.py:89`). Request bodies may be up to 8 MiB, under the
+(`cathedral/worker.py:137`). Request bodies may be up to 8 MiB, under the
 worker's request deadline.
 
 ## Egress enforcement (T6b1)
@@ -749,9 +752,9 @@ a 15 s timeout.
   detaches only what it confirmed removed. It treats a veth already gone as
   removed.
 - **Re-checked on its own thread.** The worker runs the egress check on a
-  thread of its own (`cathedral/worker.py:1476`), apart from the reaper, whose
+  thread of its own (`cathedral/worker.py:1885`), apart from the reaper, whose
   expiry deletes and drain wait on docker. It starts a check every 5 s
-  (`cathedral/worker.py:93`), or at once if the last one overran. Each
+  (`cathedral/worker.py:141`), or at once if the last one overran. Each
   check runs `check_egress` (`cathedral/tee_box/executor.py:1145`), which
   calls `maintain` (`cathedral/tee_box/enforce.py:548`): one
   `nft --json list table` read-back while the table is active, bounded by
