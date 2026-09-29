@@ -1,10 +1,11 @@
-"""In-guest TEE box sandbox service (queue item T6a), off by default.
+"""In-guest TEE box sandbox service (queue items T6a and T6b1), off by default.
 
 See docs/TEE_BOX_SERVICE.md. The worker serves these routes only when it is
 given a ``TeeBoxSandboxApi``; nothing here runs otherwise.
 """
 
 from cathedral.tee_box.egress import EgressPolicy, EgressPolicyError, build_egress_policy
+from cathedral.tee_box.enforce import EgressEnforcementError, EgressEnforcer
 from cathedral.tee_box.executor import (
     ExecRequest,
     ExecResult,
@@ -26,6 +27,8 @@ from cathedral.tee_box.service import (
 __all__ = [
     "TEE_BOX_CALLER_NETWORK",
     "CustomerLease",
+    "EgressEnforcementError",
+    "EgressEnforcer",
     "EgressPolicy",
     "EgressPolicyError",
     "ExecRequest",

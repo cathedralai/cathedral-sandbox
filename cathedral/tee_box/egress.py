@@ -6,8 +6,8 @@ ranges, cloud metadata services, or the box's own addresses, and each sandbox
 has a bandwidth cap. A ``deny_all`` sandbox has no network at all.
 
 This module only computes and renders the policy as text and argv lists. It
-never applies a rule. Applying the rendered nft ruleset and ``tc`` commands on
-a live box is not done yet (docs/TEE_BOX_SERVICE.md).
+never applies a rule; ``cathedral.tee_box.enforce`` applies and verifies them
+(docs/TEE_BOX_SERVICE.md).
 """
 
 from __future__ import annotations

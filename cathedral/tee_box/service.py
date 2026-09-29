@@ -32,6 +32,7 @@ from cathedral.tee_box.executor import (
     Executor,
     ExecutorError,
     ExecutorRefused,
+    NetworkLapsed,
     NotFound,
     SandboxInfo,
     SandboxSpec,
@@ -361,6 +362,16 @@ class TeeBoxSandboxApi:
         except ExecutorError:
             return False
 
+    def check_egress(self) -> None:
+        """Re-check egress enforcement (the worker's own egress thread, not the reaper)."""
+
+        check = getattr(self.executor, "check_egress", None)
+        if callable(check):
+            try:
+                check()
+            except Exception:
+                pass
+
     def sweep(self) -> None:
         """Remove labelled containers the executor does not track (reaper thread)."""
 
@@ -456,6 +467,14 @@ class TeeBoxSandboxApi:
                     "reason": "box_draining",
                 },
             )
+        except NetworkLapsed:
+            return _json(
+                409,
+                {
+                    "error": "the sandbox ran while the egress rules lapsed; it is being removed",
+                    "reason": "sandbox_network_lapsed",
+                },
+            )
         except NotFound:
             return _json(404, {"error": "not found"})
         except TooLarge:
@@ -487,6 +506,15 @@ class TeeBoxSandboxApi:
 
     # -- box and lease ---------------------------------------------------
 
+    def _egress_view(self) -> dict[str, object]:
+        view = self.egress.describe()
+        status = getattr(self.executor, "egress_status", None)
+        if callable(status):
+            state = status()
+            view["enforced"] = state.get("enforced") is True
+            view["enforcement_error"] = state.get("error")
+        return view
+
     def _box(self, caller, body, fields) -> Response:  # noqa: ANN001
         lease = self.lease.current()
         return _json(
@@ -505,7 +533,7 @@ class TeeBoxSandboxApi:
                 "capacity": self.capacity.view(),
                 "allocated": self._allocated().view(),
                 "default_shape": self.default_shape.view(),
-                "egress": self.egress.describe(),
+                "egress": self._egress_view(),
                 "lease": {
                     "held": lease is not None,
                     "held_by_caller": lease is not None and lease.holder == caller,

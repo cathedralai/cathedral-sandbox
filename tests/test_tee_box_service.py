@@ -908,3 +908,79 @@ def test_an_expiry_found_under_the_create_lock_never_runs_the_drain_there():
     assert lease.draining
     lease.retry_drain()  # the drain runs later, outside the lock
     assert drains == ["customer-a"] and not lease.draining
+
+
+class _DenyAllExecutor(FakeExecutor):
+    """An executor whose egress table is down: deny_all only, with the error reported."""
+
+    @property
+    def network_modes(self) -> tuple[str, ...]:
+        return ("deny_all",)
+
+    def egress_status(self):
+        return {"enforced": False, "error": "nft apply failed"}
+
+
+def test_the_box_reports_egress_enforcement_and_refuses_internet_without_it(tmp_path: Path):
+    api, fake = _api(tmp_path, _binding(), executor=_DenyAllExecutor())
+    status, contract = _handle(api, "GET", "/v1/box")
+    assert status == 200
+    assert contract["network_modes"] == ["deny_all"]
+    assert contract["egress"]["enforced"] is False
+    assert contract["egress"]["enforcement_error"] == "nft apply failed"
+    assert _handle(api, "POST", "/v1/lease", body={"ttl_seconds": 60})[0] == 200
+    fake.import_image(DIGEST, "registry.example/tasks/base")
+    status, refusal = _handle(
+        api,
+        "POST",
+        "/v1/sandboxes",
+        body={"image_id": DIGEST, "network": "internet", "lifetime_seconds": 600},
+    )
+    assert (status, refusal["reason"]) == (409, "network_unavailable")
+    assert fake.list() == ()
+
+
+class _LapsedExecutor(FakeExecutor):
+    def exec(self, sandbox_id, request):
+        from cathedral.tee_box.executor import NetworkLapsed
+
+        raise NetworkLapsed("lapsed")
+
+
+def test_a_lapsed_sandbox_call_is_refused_with_its_reason(tmp_path: Path):
+    api, fake = _api(tmp_path, _binding(), executor=_LapsedExecutor())
+    fake.import_image(DIGEST, "registry.example/tasks/base")
+    sid = _one_sandbox(api)
+    status, refusal = _handle(api, "POST", f"/v1/sandboxes/{sid}/exec", body={"command": "true"})
+    assert (status, refusal["reason"]) == (409, "sandbox_network_lapsed")
+
+
+class _SlowReapExecutor(FakeExecutor):
+    """A docker-bound reaper stuck on a slow daemon; the egress check still runs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = threading.Event()
+        self.checks = 0
+
+    def sweep(self) -> int:
+        self.release.wait(30)
+        return 0
+
+    def check_egress(self) -> int:
+        self.checks += 1
+        return 0
+
+
+def test_the_egress_check_runs_on_its_own_thread(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("cathedral.worker.TEE_BOX_EGRESS_CHECK_INTERVAL_SECONDS", 0.05)
+    executor = _SlowReapExecutor()
+    box = _Box(tmp_path, executor=executor)
+    try:
+        deadline = time.monotonic() + 10
+        while executor.checks < 5 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert executor.checks >= 5, "the egress check waited behind the reaper"
+    finally:
+        executor.release.set()
+        box.close()

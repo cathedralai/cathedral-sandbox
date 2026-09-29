@@ -136,6 +136,9 @@ MAX_CUSTOMER_SAT_MEMORY_BYTES: int = 256 * 1024 * 1024
 # validators need.
 MAX_TEE_BOX_CONCURRENT: int = 8
 TEE_BOX_REAP_INTERVAL_SECONDS: float = 5.0
+# The egress re-check runs on its own thread at a fixed rate, apart from the
+# reaper's docker calls (docs/TEE_BOX_SERVICE.md, "Egress enforcement").
+TEE_BOX_EGRESS_CHECK_INTERVAL_SECONDS: float = 5.0
 
 _EVIDENCE_REQUEST_KEYS = frozenset({"nonce_hex", "assigned_hotkey"})
 _EVIDENCE_V2_REQUEST_KEYS = _EVIDENCE_REQUEST_KEYS | frozenset(
@@ -1855,9 +1858,24 @@ class WorkerServer:
             if self._reaper_stop.wait(TEE_BOX_REAP_INTERVAL_SECONDS):
                 return
 
+    def _check_tee_box_egress(self) -> None:
+        # A fixed-rate loop: the next check is due one interval after the
+        # previous one started, whatever the reaper is doing.
+        interval = TEE_BOX_EGRESS_CHECK_INTERVAL_SECONDS
+        due = time.monotonic()
+        while True:
+            try:
+                self._tee_box_api.check_egress()
+            except Exception:
+                pass
+            due = max(due + interval, time.monotonic())
+            if self._reaper_stop.wait(max(0.0, due - time.monotonic())):
+                return
+
     def serve_forever(self) -> None:
         if self._tee_box_api is not None:
             threading.Thread(target=self._reap_tee_box, daemon=True).start()
+            threading.Thread(target=self._check_tee_box_egress, daemon=True).start()
         self._server.serve_forever()
 
     def shutdown(self) -> None:

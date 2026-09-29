@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import ipaddress
+import os
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -245,6 +248,8 @@ def test_create_argv_uses_runsc_limits_and_the_policy_network():
         "4096",
         "--security-opt",
         "no-new-privileges",
+        "--storage-opt",
+        "size=10240m",
         "--network",
         "none",
         "--env",
@@ -295,31 +300,178 @@ def test_failed_docker_calls_raise():
         executor.create(_spec())
 
 
+class _Enforcer:
+    """An egress enforcer double: the table state and per-sandbox caps are levers."""
+
+    def __init__(self, *, active: bool = True, attach_fails: bool = False) -> None:
+        self.table_active = active
+        self.attach_fails = attach_fails
+        self.report_enforced = True
+        self.attached: list[str] = []
+        self.detached: list[str] = []
+        self.maintained = 0
+        self.lapses = 0
+        self.quarantined = False
+        self.quarantine_leftover = False
+        self.quarantines = 0
+        self.lift_hook = None
+
+    def quarantine(self) -> bool:
+        self.quarantined = True
+        self.quarantines += 1
+        return True
+
+    def lift_quarantine(self) -> bool:
+        if self.lift_hook is not None:
+            self.lift_hook()
+        self.quarantined = False
+        self.quarantine_leftover = False
+        return True
+
+    @property
+    def active(self) -> bool:
+        return self.table_active
+
+    def verify(self) -> bool:
+        return self.table_active
+
+    def attach(self, container):
+        if self.attach_fails:
+            raise RuntimeError("tc failed")
+        self.attached.append(container)
+
+    def is_enforced(self, container) -> bool:
+        return self.table_active and self.report_enforced and container in self.attached
+
+    def detach(self, container) -> bool:
+        self.detached.append(container)
+        if container in self.attached:
+            self.attached.remove(container)
+        return True
+
+    def maintain(self, on_lapse=None) -> None:
+        self.maintained += 1
+
+    def status(self):
+        return {"enforced": self.table_active, "error": None if self.table_active else "down"}
+
+
 def test_internet_needs_live_egress_enforcement():
     runner = _Runner()
     executor = _executor(runner)
     executor.import_image(DIGEST, IMAGE.reference)
     assert executor.network_modes == ("deny_all",)
+    assert executor.egress_status()["enforced"] is False
     with pytest.raises(ExecutorRefused):
         executor.create(_spec("internet"))
     assert len(runner.calls) == 1  # only the pull
 
-    applied = []
-    enforced = _executor(runner, egress_enforcer=lambda name, policy: applied.append(name))
+    enforcer = _Enforcer()
+    enforced = _executor(runner, egress_enforcer=enforcer)
     enforced.import_image(DIGEST, IMAGE.reference)
     enforced.create(_spec("internet"))
-    assert applied == ["cathsbx-sbx-" + "1" * 24]
+    assert enforcer.attached == ["cathsbx-sbx-" + "1" * 24]
     assert enforced.network_modes == ("internet", "deny_all")
+    # Delete removes the sandbox's cap once the container is gone.
+    enforced.delete(_spec().sandbox_id)
+    assert enforcer.detached == ["cathsbx-sbx-" + "1" * 24]
+    assert runner.calls[-1][0][:3] == ["docker", "rm", "--force"]
 
-    def broken(_name, _policy):
-        raise RuntimeError("tc failed")
-
-    failing = _executor(runner, egress_enforcer=broken)
+    failing = _executor(runner, egress_enforcer=_Enforcer(attach_fails=True))
     failing.import_image(DIGEST, IMAGE.reference)
     with pytest.raises(ExecutorError, match="egress"):
         failing.create(_spec("internet"))
     assert runner.calls[-1][0][:3] == ["docker", "rm", "--force"]
     assert failing.get(_spec().sandbox_id) is None
+
+
+def test_internet_is_refused_while_the_table_is_not_active():
+    runner = _Runner()
+    enforcer = _Enforcer(active=False)
+    executor = _executor(runner, egress_enforcer=enforcer)
+    executor.import_image(DIGEST, IMAGE.reference)
+    assert executor.network_modes == ("deny_all",)
+    status = executor.egress_status()
+    assert (status["enforced"], status["error"]) == (False, "down")
+    with pytest.raises(ExecutorRefused):
+        executor.create(_spec("internet"))
+    assert [call[0][1] for call in runner.calls] == ["pull"]  # no docker run
+    executor.create(_spec("deny_all"))  # deny_all never needs the enforcer
+    assert enforcer.attached == []
+    # The egress thread's check retries a failed apply; the sweep does not.
+    executor.sweep()
+    assert enforcer.maintained == 0
+    executor.check_egress()
+    assert enforcer.maintained == 1
+
+
+def test_an_unverified_cap_removes_the_new_internet_sandbox():
+    runner = _Runner()
+    enforcer = _Enforcer()
+    enforcer.report_enforced = False  # attach returned, but the cap did not verify
+    executor = _executor(runner, egress_enforcer=enforcer)
+    executor.import_image(DIGEST, IMAGE.reference)
+    with pytest.raises(ExecutorError, match="egress"):
+        executor.create(_spec("internet"))
+    assert executor.get(_spec().sandbox_id) is None
+    assert runner.calls[-1][0] == ["docker", "rm", "--force", NAME]
+    assert enforcer.detached == [NAME]
+
+
+def test_disk_quota_is_a_storage_opt_and_can_be_opted_out():
+    spec = _spec()
+    argv = _executor().create_argv(spec)
+    at = argv.index("--storage-opt")
+    assert argv[at : at + 2] == ["--storage-opt", "size=10240m"]
+    assert "--storage-opt" not in _executor(storage_quota=False).create_argv(spec)
+
+
+@pytest.mark.parametrize(
+    ("driver", "status", "supported"),
+    [
+        ('"overlay2"', '[["Backing Filesystem","xfs"],["Supports d_type","true"]]', True),
+        ('"overlay2"', '[["Backing Filesystem","extfs"]]', False),
+        ('"btrfs"', "[]", True),
+        ('"zfs"', "null", True),
+        ('"vfs"', "[]", False),
+        ("not json", "[]", False),
+    ],
+)
+def test_storage_quota_support_reads_the_storage_driver(driver, status, supported):
+    class Info(_Runner):
+        def __call__(self, argv, **kwargs):
+            self.calls.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 0, f"{driver} {status}\n".encode(), b"")
+
+    runner = Info()
+    ok, detail = _executor(runner).storage_quota_support()
+    assert ok is supported, detail
+    assert runner.calls[0][0] == [
+        "docker",
+        "info",
+        "--format",
+        "{{json .Driver}} {{json .DriverStatus}}",
+    ]
+    assert runner.calls[0][1]["shell"] is False
+
+
+@pytest.mark.parametrize(
+    ("runtimes", "ok"),
+    [
+        ('{"runsc":{"path":"/usr/local/bin/runsc","runtimeArgs":["--platform=systrap"]}}', True),
+        ('{"runsc":{"path":"/usr/local/bin/runsc"}}', False),
+        ('{"runsc":{"path":"/opt/runsc","runtimeArgs":["--platform=systrap"]}}', False),
+        ('{"runc":{"path":"runc"}}', False),
+        ("[]", False),
+    ],
+)
+def test_runtime_check_needs_runsc_with_systrap(runtimes, ok):
+    class Info(_Runner):
+        def __call__(self, argv, **kwargs):
+            self.calls.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 0, runtimes.encode(), b"")
+
+    assert _executor(Info()).runtime_check()[0] is ok
 
 
 def test_exec_and_file_argv_pass_caller_values_as_arguments(monkeypatch):
@@ -723,3 +875,399 @@ def test_file_uploads_refuse_a_target_that_is_not_a_regular_file(monkeypatch):
         executor.write_file(_spec().sandbox_id, "/tmp/fifo", b"data", 0o644)
     script = seen[0][seen[0].index("-c") + 1]
     assert script.index('test -f "$1"') < script.index('cat > "$1"')
+
+
+class _HangingJob(_FakeJob):
+    """A docker exec client that runs until its in-sandbox process is killed."""
+
+    finished = False
+    events: list[str] = []
+
+    def kill(self):
+        _HangingJob.events.append("client killed")
+        self.done.set()
+
+    def result(self):
+        ended = self.timed_out or self.killed
+        return ExecResult(None if ended else 0, timed_out=self.timed_out)
+
+
+def _kill_executor():
+    """An executor whose docker double ends the hanging exec when the kill script runs."""
+
+    executor, docker, _clock = _docker_executor()
+    executor.create(_spec())
+    jobs: list[_HangingJob] = []
+    started: list[list[str]] = []
+    _HangingJob.events = []
+
+    def factory(argv, cap, stdin):
+        started.append(argv)
+        job = _HangingJob(argv, cap, stdin)
+        jobs.append(job)
+        return job
+
+    original = docker.__call__
+
+    def runner(argv, **kwargs):
+        if argv[1] == "exec":
+            _HangingJob.events.append("killed in sandbox")
+            for job in jobs:
+                job.done.set()
+        return original(argv, **kwargs)
+
+    executor._job_factory = factory
+    executor._runner = runner
+    return executor, docker, started
+
+
+def _pid_of(argv):
+    return argv[argv.index("cathedral-exec") + 1]
+
+
+PID_FILE_RE = re.compile(r"^/tmp/\.cathedral-exec-[0-9a-f]{32}\.pid$")
+
+
+def _kill_call(docker, pid_file):
+    return [
+        "docker",
+        "exec",
+        "--user",
+        "0",
+        NAME,
+        "/bin/sh",
+        "-c",
+        executor_module._KILL_SCRIPT,
+        "cathedral-sandbox",
+        pid_file,
+    ]
+
+
+def test_a_timed_out_exec_is_killed_inside_the_sandbox_first():
+    executor, docker, started = _kill_executor()
+    sid = _spec().sandbox_id
+    result = executor.exec(sid, ExecRequest(("sleep", "100"), timeout_seconds=1, cwd="/w"))
+    assert result.timed_out and result.exit_code is None
+    argv = started[0]
+    assert argv[:5] == ["docker", "exec", "--workdir", "/w", NAME]
+    assert argv[5:9] == ["/bin/sh", "-c", executor_module._EXEC_WRAPPER, "cathedral-exec"]
+    pid_file = argv[9]
+    assert PID_FILE_RE.fullmatch(pid_file) and argv[10:] == ["sleep", "100"]
+    assert docker.calls[-1] == _kill_call(docker, pid_file)
+    # The process inside is killed before the host-side client.
+    assert _HangingJob.events == ["killed in sandbox", "client killed"]
+
+
+def test_an_exec_that_finishes_in_time_kills_nothing():
+    executor, docker, started = _kill_executor()
+    executor._job_factory = _FakeJob
+    before = list(docker.calls)
+    executor.exec(_spec().sandbox_id, ExecRequest(("true",), timeout_seconds=5))
+    assert docker.calls == before
+
+
+def test_a_timed_out_background_exec_is_killed_inside_the_sandbox():
+    executor, docker, started = _kill_executor()
+    sid = _spec().sandbox_id
+    exec_id = executor.start_exec(sid, ExecRequest(("sleep", "100"), timeout_seconds=1))
+    pid_file = _pid_of(started[0])
+    deadline = time.monotonic() + 10
+    while executor.poll_exec(sid, exec_id, 0).state == "running" and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert executor.poll_exec(sid, exec_id, 0).state == "timed_out"
+    assert _kill_call(docker, pid_file) in docker.calls
+    assert _HangingJob.events[:2] == ["killed in sandbox", "client killed"]
+
+
+def test_stopping_a_background_exec_kills_it_inside_the_sandbox():
+    executor, docker, started = _kill_executor()
+    sid = _spec().sandbox_id
+    exec_id = executor.start_exec(sid, ExecRequest(("sleep", "100"), timeout_seconds=600))
+    assert executor.stop_exec(sid, exec_id).state == "killed"
+    assert docker.calls[-1] == _kill_call(docker, _pid_of(started[0]))
+    assert _HangingJob.events == ["killed in sandbox", "client killed"]
+
+
+def test_the_exec_wrapper_and_kill_script_really_end_a_process_tree(tmp_path):
+    """Run the two scripts with the local sh: the recorded pid is the command's.
+
+    One grandchild moves to its own session, so only the script's walk of the
+    process tree, not the process-group kill, can find it.
+    """
+
+    if shutil.which("setsid") is None:
+        pytest.skip("setsid is not installed")
+    pid_file = str(tmp_path / "exec.pid")
+    tree = "sleep 300 & sh -c 'setsid sleep 301 & sleep 302' & sleep 303"
+    process = subprocess.Popen(
+        [
+            "/bin/sh",
+            "-c",
+            executor_module._EXEC_WRAPPER,
+            "cathedral-exec",
+            pid_file,
+            "/bin/sh",
+            "-c",
+            tree,
+        ],
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        tree_pids: set[int] = set()
+        while time.monotonic() < deadline:
+            try:
+                recorded = (tmp_path / "exec.pid").read_text().strip()
+            except FileNotFoundError:
+                recorded = ""
+            tree_pids = _descendants(process.pid)
+            if recorded and len(tree_pids) >= 5:  # 4 sleeps and the inner sh
+                break
+            time.sleep(0.05)
+        assert int(recorded) == process.pid
+        assert len(tree_pids) >= 5
+        separate = [pid for pid in tree_pids if os.getsid(pid) != process.pid]
+        assert separate, "the setsid grandchild did not leave the session"
+        killed = subprocess.run(
+            ["/bin/sh", "-c", executor_module._KILL_SCRIPT, "cathedral-sandbox", pid_file],
+            capture_output=True,
+            timeout=30,
+        )
+        assert killed.returncode == 0, killed.stderr
+        assert process.wait(10) == -9
+        assert not (tmp_path / "exec.pid").exists()
+        deadline = time.monotonic() + 5
+        while _alive(tree_pids) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _alive(tree_pids) == set()
+    finally:
+        if process.poll() is None:
+            process.kill()
+        for pid in _alive(tree_pids):
+            os.kill(pid, 9)
+
+
+def _parent(pid: int) -> int | None:
+    try:
+        with open(f"/proc/{pid}/status") as status:
+            for line in status:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except OSError:
+        return None
+    return None
+
+
+def _descendants(root: int) -> set[int]:
+    found: set[int] = set()
+    grew = True
+    while grew:
+        grew = False
+        for entry in os.listdir("/proc"):
+            if entry.isdigit() and int(entry) not in found:
+                parent = _parent(int(entry))
+                if parent == root or parent in found:
+                    found.add(int(entry))
+                    grew = True
+    return found
+
+
+def _alive(pids: set[int]) -> set[int]:
+    """The pids still running (not gone and not a zombie)."""
+
+    alive = set()
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/status") as status:
+                state = next(line for line in status if line.startswith("State:"))
+        except (OSError, StopIteration):
+            continue
+        if "Z" not in state.split()[1]:
+            alive.add(pid)
+    return alive
+
+
+def _wait_gone(executor, sandbox_id, seconds=10.0):
+    deadline = time.monotonic() + seconds
+    while executor.get(sandbox_id) is not None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return executor.get(sandbox_id) is None
+
+
+class _LapsingEnforcer(_Enforcer):
+    """The egress thread records a lapse while a create is attaching."""
+
+    def attach(self, container):
+        super().attach(container)
+        self.lapses += 1
+
+
+def test_a_lapse_during_create_ends_the_new_sandbox():
+    docker, clock = _Docker(), _Clock()
+    enforcer = _LapsingEnforcer()
+    executor = _executor(docker, clock=clock, egress_enforcer=enforcer)
+    executor.import_image(DIGEST, IMAGE.reference)
+    with pytest.raises(ExecutorError, match="egress"):
+        executor.create(_spec("internet"))
+    assert _wait_gone(executor, _spec().sandbox_id)
+    assert NAME not in docker.containers
+    assert enforcer.detached == [NAME]  # after the container was removed
+
+
+def test_a_failed_create_keeps_the_cap_until_its_container_is_gone():
+    docker, clock = _Docker(), _Clock()
+    enforcer = _Enforcer()
+    enforcer.report_enforced = False
+    executor = _executor(docker, clock=clock, egress_enforcer=enforcer)
+    executor.import_image(DIGEST, IMAGE.reference)
+    docker.rm_failures = 10**6
+    with pytest.raises(ExecutorError, match="egress"):
+        executor.create(_spec("internet"))
+    assert NAME in docker.containers and enforcer.detached == []
+    docker.rm_failures = 0
+    assert executor.sweep() == 0 and NAME not in docker.containers
+    assert enforcer.detached == [NAME]
+
+
+def test_a_refused_create_ends_sandboxes_left_from_a_lapse():
+    docker, clock = _Docker(), _Clock()
+    enforcer = _Enforcer()
+    executor = _executor(docker, clock=clock, egress_enforcer=enforcer)
+    executor.import_image(DIGEST, IMAGE.reference)
+    running = _spec("internet")
+    executor.create(running)
+    # The table lapses; no egress tick has run yet. The next internet create
+    # finds it, is refused, and ends the running sandbox.
+    enforcer.table_active = False
+    enforcer.lapses += 1
+    with pytest.raises(ExecutorRefused):
+        executor.create(_spec("internet", sid="sbx-" + "2" * 24))
+    assert _wait_gone(executor, running.sandbox_id)
+    assert NAME not in docker.containers
+
+
+def test_a_sandbox_waiting_for_lapse_removal_refuses_every_call():
+    docker, clock = _Docker(), _Clock()
+    enforcer = _Enforcer()
+    executor = _executor(docker, clock=clock, egress_enforcer=enforcer)
+    executor.import_image(DIGEST, IMAGE.reference)
+    executor._job_factory = _FakeJob
+    running = _spec("internet")
+    executor.create(running)
+    sid = running.sandbox_id
+    exec_id = executor.start_exec(sid, REQUEST)
+    docker.rm_failures = 10**6
+    enforcer.table_active = False
+    enforcer.lapses += 1
+    assert executor.end_lapsed_sandboxes(wait=True) == 1
+    assert executor.get(sid) is not None
+    for call in (
+        lambda: executor.exec(sid, REQUEST),
+        lambda: executor.start_exec(sid, REQUEST),
+        lambda: executor.poll_exec(sid, exec_id, 0),
+        lambda: executor.stop_exec(sid, exec_id),
+        lambda: executor.write_file(sid, "/f", b"x", 0o644),
+        lambda: executor.read_file(sid, "/f"),
+        lambda: executor.stat(sid, "/f"),
+        lambda: executor.put_tar(sid, "/d", b""),
+        lambda: executor.get_tar(sid, "/d", []),
+        lambda: executor.set_expiry(sid, 0.0),
+    ):
+        with pytest.raises(executor_module.NetworkLapsed):
+            call()
+    docker.rm_failures = 0
+    assert executor.end_lapsed_sandboxes(wait=True) == 0
+    assert executor.get(sid) is None
+
+
+class _SlowRemoveDocker(_Docker):
+    """rm of one container hangs until its call timeout; the others are quick."""
+
+    def __init__(self, slow: str) -> None:
+        super().__init__()
+        self.slow = slow
+        self.timeouts: list[float] = []
+
+    def __call__(self, argv, **kwargs):
+        if argv[1] in ("rm", "kill", "container") and argv[-1] == self.slow:
+            self.timeouts.append(kwargs["timeout"])
+            time.sleep(0.3)
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return super().__call__(argv, **kwargs)
+
+
+def test_lapse_removals_run_concurrently_with_a_bounded_timeout():
+    slow = "cathsbx-sbx-" + "1" * 24
+    docker, clock = _SlowRemoveDocker(slow), _Clock()
+    enforcer = _Enforcer()
+    executor = _executor(docker, clock=clock, egress_enforcer=enforcer)
+    executor.import_image(DIGEST, IMAGE.reference)
+    specs = [_spec("internet", sid="sbx-" + digit * 24) for digit in "1234"]
+    for spec in specs:
+        executor.create(spec)
+    enforcer.table_active = False
+    enforcer.lapses += 1
+    started = time.monotonic()
+    assert executor.check_egress() >= 1  # returns without waiting for removals
+    assert time.monotonic() - started < 0.25
+    for spec in specs[1:]:
+        assert _wait_gone(executor, spec.sandbox_id, 1.0), "a quick removal waited on the slow one"
+    executor.end_lapsed_sandboxes(wait=True)
+    assert executor.get(specs[0].sandbox_id) is not None
+    assert docker.timeouts and set(docker.timeouts) == {
+        executor_module.LAPSE_REMOVAL_CALL_TIMEOUT_SECONDS
+    }
+    assert len(docker.timeouts) <= 4 * 2  # at most four calls per attempt
+
+
+def test_a_mark_during_a_lift_leaves_the_bridge_quarantined():
+    """A concurrent lapse between the lift decision and the lift must not be undone."""
+
+    docker, clock = _Docker(), _Clock()
+    enforcer = _Enforcer()
+    executor = _executor(docker, clock=clock, egress_enforcer=enforcer)
+    executor.import_image(DIGEST, IMAGE.reference)
+    running = _spec("internet")
+    executor.create(running)
+    docker.rm_failures = 10**6  # the new lapse's removal stays pending
+    enforcer.quarantined = True  # left from an earlier lapse, now fully cleaned up
+    racer_done = threading.Event()
+
+    def concurrent_lapse():
+        enforcer.lapses += 1  # another thread's read-back finds a new lapse
+        executor.end_lapsed_sandboxes()
+        racer_done.set()
+
+    def during_lift():
+        enforcer.lift_hook = None
+        threading.Thread(target=concurrent_lapse, daemon=True).start()
+        # Give the racer every chance to mark and quarantine before the lift.
+        racer_done.wait(0.5)
+
+    enforcer.lift_hook = during_lift
+    executor.end_lapsed_sandboxes()  # decides to lift: nothing is waiting yet
+    assert racer_done.wait(10)
+    assert enforcer.quarantined, "the lift undid a quarantine installed for a new lapse"
+    with pytest.raises(executor_module.NetworkLapsed):
+        executor.stat(running.sandbox_id, "/")
+    docker.rm_failures = 0
+    executor.end_lapsed_sandboxes(wait=True)
+
+
+def test_a_leftover_quarantine_is_lifted_only_after_a_clean_sweep():
+    docker, clock = _Docker(), _Clock()
+    enforcer = _Enforcer()
+    enforcer.quarantined = enforcer.quarantine_leftover = True  # found in the kernel at start
+    executor = _executor(docker, clock=clock, egress_enforcer=enforcer)
+    executor.import_image(DIGEST, IMAGE.reference)
+    docker.containers.add("cathsbx-sbx-left-by-a-crash")
+    docker.rm_failures = 10**6
+    executor.check_egress()
+    assert enforcer.quarantined  # no sweep yet: the earlier run's sandbox may be running
+    assert executor.sweep() == 1
+    executor.check_egress()
+    assert enforcer.quarantined
+    docker.rm_failures = 0
+    assert executor.sweep() == 0
+    executor.check_egress()
+    assert not enforcer.quarantined
