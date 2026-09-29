@@ -157,11 +157,16 @@ field in the remote SNP report.
 
 ## Run one Intel TDX machine
 
-This is not yet a one-command unattended installation. You must supply two
-ordinary operations pieces outside this repository: a recurring secure
-transfer for the signed validator-access snapshot, and a process supervisor
-which restarts the fixed root-owned launcher. If you do not have both, stop
-before registration. The commands below install and run one foreground worker.
+This is not yet a one-command unattended installation. For the ordered
+installation, follow the quickstart's
+[systemd steps](docs/SN94_MINER_QUICKSTART.md#24-start-the-miner-under-systemd).
+They provide a systemd process supervisor and its one miner configuration file,
+`/etc/cathedral/sn94-tdx-miner.env`, around the fixed root-owned launcher.
+The separate validator-access refresh and fetch timers must also be running,
+and you must supply the signed snapshot's secure publication/transfer path.
+Stop before registration if either supervision or snapshot refresh is missing.
+The reference commands below install and run one foreground SAT worker; they
+do not install a customer sandbox executor.
 
 ### 1. Check the host
 

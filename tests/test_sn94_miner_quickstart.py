@@ -67,6 +67,13 @@ def test_quickstart_is_linked_and_marks_the_validator_dependencies() -> None:
     assert "REVIEWED_REVISION" not in quickstart
 
 
+def test_readme_points_to_the_supplied_supervision_steps() -> None:
+    readme = _text(REPO_ROOT / "README.md")
+    assert "docs/SN94_MINER_QUICKSTART.md#24-start-the-miner-under-systemd" in readme
+    assert "/etc/cathedral/sn94-tdx-miner.env" in readme
+    assert "supply two ordinary operations pieces outside this repository" not in " ".join(readme.split())
+
+
 def _commands(text: str) -> list[str]:
     """Shell commands with backslash continuations joined."""
 
