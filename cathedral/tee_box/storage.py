@@ -1,0 +1,383 @@
+"""TEE box storage checks (queue item T8): state in memory, scratch encrypted.
+
+Owner decision 7 (TEE_BOX.md on PR #236): all writable storage lives in guest
+memory or on dm-crypt with integrity (AEAD) under a key made inside the TD at
+boot. The worker enforces the part it can observe, at startup, in TEE mode
+only (the TEE box flags on ``worker serve``):
+
+- ``require_memory_backed``: the central replay, delegation high-water and
+  revocation state (``--tee-box-central-state``), its lock and its SQLite
+  side files are on tmpfs or ramfs. dm-crypt is not enough here: its sector
+  tags do not stop the host replaying an older sector written under the same
+  key, which would roll the state back.
+- ``require_protected_scratch``: Docker's data root, and every mount below
+  it, is on tmpfs or ramfs, or on a dm-crypt device whose table carries an
+  authenticated integrity mode. Imported image layers, container overlays,
+  gVisor's overlay file, and ``files`` and ``tar`` uploads all live there.
+- ``require_no_disk_swap``: no swap outside guest memory (zram only), or the
+  tmpfs pages above could be written to a host disk in the clear.
+
+Making the key (random, inside the TD, never written out) is the appliance
+boot's job; see docs/TEE_BOX_SERVICE.md, "Storage (T8)". Every probe is
+injectable (``StorageProbe``) so tests need no devices, and every failure
+refuses startup.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import os
+import re
+import subprocess
+from collections.abc import Callable
+from dataclasses import dataclass
+
+# statfs(2) f_type values (linux/magic.h).
+TMPFS_MAGIC = 0x01021994
+RAMFS_MAGIC = 0x858458F6
+MEMORY_MAGICS = {TMPFS_MAGIC: "tmpfs", RAMFS_MAGIC: "ramfs"}
+MEMORY_FSTYPES = frozenset({"tmpfs", "ramfs"})
+# Mounts below the data root that are views of storage checked elsewhere:
+# Docker's overlay mounts of a running container (its layers are directories
+# under the data root) and network namespace handles.
+VIEW_FSTYPES = frozenset({"overlay", "nsfs"})
+# SQLite and ValidatorAccessState files beside the state database.
+STATE_SIDE_SUFFIXES = (".lock", "-journal", "-wal", "-shm")
+DMSETUP_PATH = "/usr/sbin/dmsetup"
+SYSFS_DEV_BLOCK = "/sys/dev/block"
+MOUNTINFO_PATH = "/proc/self/mountinfo"
+SWAPS_PATH = "/proc/swaps"
+DMSETUP_TIMEOUT_SECONDS = 15.0
+# cryptsetup names the device it maps CRYPT-<type>-...; the dm-integrity
+# device under a LUKS2 volume with integrity is CRYPT-SUBDEV-..., not a crypt
+# target itself.
+CRYPT_UUID_PREFIX = "CRYPT-"
+CRYPT_SUBDEV_PREFIX = "CRYPT-SUBDEV-"
+# dm-crypt's ``integrity:<tag bytes>:<type>`` optional parameter. ``aead``
+# covers AEAD ciphers (aes-gcm, chacha20-poly1305, and the authenc() cipher
+# cryptsetup builds for --integrity hmac-sha256 with aes-xts); an hmac type
+# authenticates each sector with a key the TD holds. Unkeyed checksums
+# (crc32c, "none") are refused.
+_INTEGRITY_TYPE_RE = re.compile(r"^(?:aead|hmac\(sha(?:256|512)\))$")
+_INTEGRITY_PARAM_RE = re.compile(r"^integrity:([1-9][0-9]{0,3}):(.+)$")
+_DM_NAME_RE = re.compile(r"^[A-Za-z0-9_+.][A-Za-z0-9_+.-]{0,126}$")
+_MAJOR_MINOR_RE = re.compile(r"^([0-9]{1,10}):([0-9]{1,10})$")
+CONTAINERD_SNAPSHOTTER = "io.containerd.snapshotter.v1"
+
+CryptIntegrityCheck = Callable[[int, int], tuple[bool, str]]
+
+
+class StorageError(ValueError):
+    """TEE box storage is not in guest memory or not encrypted with integrity."""
+
+
+def statfs_type(path: str) -> int:
+    """The filesystem magic statfs(2) reports for ``path``."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    # struct statfs is 120 bytes on x86-64; f_type is its first member, a
+    # native long on the 64-bit Linux ABIs a TD runs.
+    buffer = ctypes.create_string_buffer(512)
+    if libc.statfs(os.fsencode(path), buffer) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), path)
+    return ctypes.c_long.from_buffer(buffer).value & 0xFFFFFFFF
+
+
+def _read_text(path: str) -> str:
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        return handle.read(4 * 1024 * 1024)
+
+
+@dataclass(frozen=True)
+class StorageProbe:
+    """What the storage checks read from the guest; tests replace each part."""
+
+    fs_type: Callable[[str], int]
+    mountinfo: Callable[[], str]
+    swaps: Callable[[], str]
+    crypt_integrity: CryptIntegrityCheck
+
+
+def default_storage_probe(
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> StorageProbe:
+    return StorageProbe(
+        fs_type=statfs_type,
+        mountinfo=lambda: _read_text(MOUNTINFO_PATH),
+        swaps=lambda: _read_text(SWAPS_PATH),
+        crypt_integrity=dm_crypt_integrity_check(runner),
+    )
+
+
+# -- state in guest memory ---------------------------------------------------
+
+
+def state_paths(path: str) -> tuple[str, ...]:
+    """Every location the state at ``path`` uses: its directory and files."""
+
+    resolved = os.path.realpath(path)
+    candidates = [os.path.dirname(resolved), os.path.dirname(os.path.abspath(path))]
+    for suffix in ("", *STATE_SIDE_SUFFIXES):
+        if os.path.lexists(path + suffix):
+            candidates.append(os.path.realpath(path + suffix))
+    return tuple(dict.fromkeys(candidates))
+
+
+def require_memory_backed(path: str, *, fs_type: Callable[[str], int] = statfs_type) -> str:
+    """Refuse unless the state at ``path`` can live only in guest memory.
+
+    The directory holding the state (before and after resolving symlinks)
+    and each existing state file must be on tmpfs or ramfs. The directory
+    must exist: mount the tmpfs before the worker starts.
+    """
+
+    kinds = set()
+    for candidate in state_paths(path):
+        try:
+            magic = fs_type(candidate)
+        except OSError as exc:
+            raise StorageError(
+                f"the TEE box central state location {candidate} cannot be inspected: "
+                f"{exc.strerror or exc}"
+            ) from exc
+        kind = MEMORY_MAGICS.get(magic)
+        if kind is None:
+            raise StorageError(
+                f"the TEE box central state must be on tmpfs or ramfs (guest memory); "
+                f"{candidate} is on filesystem type {magic:#x}"
+            )
+        kinds.add(kind)
+    return "central state on " + "+".join(sorted(kinds))
+
+
+# -- scratch on memory or dm-crypt with integrity ----------------------------
+
+
+@dataclass(frozen=True)
+class Mount:
+    mount_point: str
+    major: int
+    minor: int
+    fstype: str
+    source: str
+
+
+def _unescape(field: str) -> str:
+    """Undo the kernel's octal escapes (space, tab, newline, backslash)."""
+
+    return re.sub(r"\\([0-7]{3})", lambda found: chr(int(found.group(1), 8)), field)
+
+
+def parse_mountinfo(text: str) -> tuple[Mount, ...]:
+    """Parse /proc/<pid>/mountinfo; a malformed line refuses the whole listing."""
+
+    mounts = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split(" ")
+        try:
+            separator = fields.index("-", 6)
+            device = _MAJOR_MINOR_RE.fullmatch(fields[2])
+            if device is None:
+                raise ValueError("bad device")
+            mounts.append(
+                Mount(
+                    mount_point=_unescape(fields[4]),
+                    major=int(device.group(1)),
+                    minor=int(device.group(2)),
+                    fstype=fields[separator + 1],
+                    source=_unescape(fields[separator + 2]),
+                )
+            )
+        except (ValueError, IndexError) as exc:
+            raise StorageError("the mount table is unreadable") from exc
+    return tuple(mounts)
+
+
+def _within(path: str, mount_point: str) -> bool:
+    return mount_point == "/" or path == mount_point or path.startswith(mount_point + "/")
+
+
+def mounts_for(root: str, mounts: tuple[Mount, ...]) -> tuple[Mount, ...]:
+    """The mount serving ``root`` first, then every mount strictly below it.
+
+    The serving mount is the one with the longest mount point containing
+    ``root``, the last listed when several share it (the one on top).
+    """
+
+    serving = None
+    for mount in mounts:
+        if _within(root, mount.mount_point) and (
+            serving is None or len(mount.mount_point) >= len(serving.mount_point)
+        ):
+            serving = mount
+    if serving is None:
+        return ()
+    below = tuple(
+        mount
+        for mount in mounts
+        if mount is not serving
+        and mount.mount_point != root
+        and mount.mount_point.startswith(root.rstrip("/") + "/")
+    )
+    return (serving, *below)
+
+
+def parse_crypt_table(text: str) -> tuple[bool, str]:
+    """Whether a ``dmsetup table`` listing is dm-crypt with authenticated integrity.
+
+    Every segment must be a ``crypt`` target whose optional parameters carry
+    ``integrity:<tag bytes>:<type>`` with an AEAD or HMAC type. The key field
+    is never kept or reported.
+    """
+
+    lines = [line.split() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False, "the device has an empty table"
+    integrity_types = set()
+    for fields in lines:
+        # <start> <length> crypt <cipher> <key> <iv offset> <device> <offset>
+        # [<#opt params> <opt params>...]
+        if len(fields) < 8 or fields[2] != "crypt":
+            target = fields[2] if len(fields) > 2 else "?"
+            return False, f"a segment is a {target!s:.32} target, not crypt"
+        cipher = fields[3]
+        found = None
+        if len(fields) > 8:
+            try:
+                count = int(fields[8])
+            except ValueError:
+                return False, "the crypt table is malformed"
+            if count != len(fields) - 9:
+                return False, "the crypt table is malformed"
+            for option in fields[9:]:
+                matched = _INTEGRITY_PARAM_RE.fullmatch(option)
+                if matched is not None:
+                    found = matched.group(2)
+        if found is None:
+            return False, f"crypt cipher {cipher!s:.64} has no integrity (no AEAD or HMAC tags)"
+        if _INTEGRITY_TYPE_RE.fullmatch(found) is None:
+            return False, f"crypt integrity {found!s:.32} is not authenticated (need aead or hmac)"
+        integrity_types.add(f"{cipher} integrity {found}")
+    return True, "dm-crypt " + ", ".join(sorted(integrity_types))
+
+
+def dm_crypt_integrity_check(
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    *,
+    dmsetup: str = DMSETUP_PATH,
+    sysfs: str = SYSFS_DEV_BLOCK,
+    read_text: Callable[[str], str] = _read_text,
+) -> CryptIntegrityCheck:
+    """Classify block device ``major:minor`` from sysfs and its dm table.
+
+    sysfs gives the device-mapper uuid and name (``dm/uuid``, ``dm/name``)
+    to anyone, but not the table. The table comes from ``dmsetup table``,
+    which needs CAP_SYS_ADMIN; the worker already runs as guest root to drive
+    docker, nft and tc. A device that is not device-mapper, whose uuid is not
+    cryptsetup's ``CRYPT-``, or whose table cannot be read, is refused.
+    """
+
+    def check(major: int, minor: int) -> tuple[bool, str]:
+        base = f"{sysfs}/{major}:{minor}/dm"
+        try:
+            uuid = read_text(base + "/uuid").strip()
+            name = read_text(base + "/name").strip()
+        except OSError:
+            return False, f"block device {major}:{minor} is not a device-mapper device"
+        if not uuid.startswith(CRYPT_UUID_PREFIX) or uuid.startswith(CRYPT_SUBDEV_PREFIX):
+            return False, f"device-mapper device {major}:{minor} is not a dm-crypt mapping"
+        if _DM_NAME_RE.fullmatch(name) is None:
+            return False, f"device-mapper device {major}:{minor} has an unusable name"
+        try:
+            result = runner(
+                [dmsetup, "table", name],
+                capture_output=True,
+                timeout=DMSETUP_TIMEOUT_SECONDS,
+                check=False,
+                shell=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False, "dmsetup table failed"
+        if result.returncode != 0:
+            return False, "dmsetup table failed (it needs root)"
+        try:
+            table = (result.stdout or b"").decode()
+        except UnicodeDecodeError:
+            return False, "dmsetup table output is invalid"
+        ok, detail = parse_crypt_table(table)
+        return ok, f"{name}: {detail}"
+
+    return check
+
+
+def require_protected_scratch(
+    root: str,
+    probe: StorageProbe,
+    *,
+    driver_status: dict[str, str] | None = None,
+) -> str:
+    """Refuse unless Docker's data root, and every mount below it, is protected.
+
+    ``root`` is the daemon's ``DockerRootDir``, looked up in the worker's own
+    mount namespace, which must be the daemon's. Each mount must be tmpfs or
+    ramfs, or a block device ``probe.crypt_integrity`` accepts. Overlay and
+    nsfs mounts below the root are views of storage the root mount holds.
+    """
+
+    if (driver_status or {}).get("driver-type") == CONTAINERD_SNAPSHOTTER:
+        raise StorageError(
+            "the Docker daemon uses the containerd image store, which keeps images "
+            "outside its data root; the TEE box needs the classic graphdriver store"
+        )
+    if not isinstance(root, str) or not root.startswith("/"):
+        raise StorageError("the Docker data root is not an absolute path")
+    resolved = os.path.realpath(root)
+    if not os.path.isdir(resolved):
+        raise StorageError(
+            f"the Docker data root {root} is not visible to the worker; run the worker "
+            "in the daemon's mount namespace"
+        )
+    selected = mounts_for(resolved, parse_mountinfo(probe.mountinfo()))
+    if not selected:
+        raise StorageError(f"no mount serves the Docker data root {root}")
+    details = []
+    for index, mount in enumerate(selected):
+        where = f"{mount.mount_point} ({mount.fstype} on {mount.major}:{mount.minor})"
+        if mount.fstype in MEMORY_FSTYPES:
+            details.append(f"{mount.mount_point}: {mount.fstype}")
+            continue
+        if index > 0 and mount.fstype in VIEW_FSTYPES:
+            continue
+        try:
+            ok, detail = probe.crypt_integrity(mount.major, mount.minor)
+        except Exception as exc:  # noqa: BLE001 - any probe failure refuses startup
+            ok, detail = False, f"the device check failed: {exc}"
+        if ok is not True:
+            raise StorageError(
+                f"TEE box scratch must be in guest memory or on dm-crypt with integrity; "
+                f"{where} under the Docker data root is not: {detail}"
+            )
+        details.append(f"{mount.mount_point}: {detail}")
+    return "; ".join(details)
+
+
+def require_no_disk_swap(probe: StorageProbe) -> str:
+    """Refuse while any swap outside guest memory is active (zram only)."""
+
+    lines = probe.swaps().splitlines()
+    active = []
+    for line in lines[1:]:
+        fields = line.split()
+        if not fields:
+            continue
+        device = _unescape(fields[0])
+        if not os.path.basename(device).startswith("zram"):
+            raise StorageError(
+                f"swap on {device!s:.128} could write guest memory, including the TEE box "
+                "state, to a host disk; turn it off (only zram is allowed)"
+            )
+        active.append(device)
+    return "zram swap only" if active else "no swap"
