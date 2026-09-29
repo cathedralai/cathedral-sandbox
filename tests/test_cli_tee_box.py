@@ -108,6 +108,7 @@ class _Storage:
         self.disk_paths: set[str] = set()  # statfs says ext4 for these
         self.root_fstype = "ext4"
         self.extra_mounts: list[str] = []
+        self.root_device = (253, 3)
         self.crypt_devices = {
             "253:3": (True, "cathedral-scratch: dm-crypt capi:authenc integrity aead")
         }
@@ -137,8 +138,14 @@ class _Storage:
         device = f"{major}:{minor}"
         return self.crypt_devices.get(device, (False, f"{device} is not a device-mapper device"))
 
+    def device_of(self, path: str):
+        self.probed.append(f"stat {path}")
+        return self.root_device
+
     def probe(self) -> StorageProbe:
-        return StorageProbe(self.fs_type, self.mountinfo, self.swaps, self.crypt_integrity)
+        return StorageProbe(
+            self.fs_type, self.mountinfo, self.swaps, self.crypt_integrity, self.device_of
+        )
 
 
 def _root_key_file(seed: bytes = ROOT_SEED) -> bytes:
@@ -516,6 +523,15 @@ def test_a_docker_root_in_guest_memory_needs_no_device(tmp_path: Path, guest, ca
     assert not any(item.startswith("crypt") for item in guest.disk.probed)
     startup = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert startup["tee_box"]["storage"]["scratch"] == f"{guest.docker_root}: tmpfs"
+
+
+def test_a_docker_root_shadowed_by_a_plain_disk_refuses(tmp_path: Path, guest):
+    # The dm-crypt mount on the data root is hidden by a disk mounted later
+    # over its parent; stat reports the disk.
+    parent = str(Path(guest.docker_root).parent)
+    guest.disk.extra_mounts.append(f"95 22 8:2 / {parent} rw - xfs /dev/sda2 rw")
+    guest.disk.root_device = (8, 2)
+    _refused(tmp_path, rf"{re.escape(parent)} \(xfs on 8:2\)")
 
 
 def test_the_containerd_image_store_refuses(tmp_path: Path, guest):

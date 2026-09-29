@@ -132,15 +132,60 @@ def test_a_malformed_mount_table_refuses(line):
         parse_mountinfo(line)
 
 
-def test_the_serving_mount_is_the_deepest_and_topmost():
+def test_the_serving_mount_is_the_last_mount_of_the_device_stat_reports():
     mounts = parse_mountinfo(MOUNTINFO + "93 22 0:70 / /var/lib/docker rw - tmpfs tmpfs rw\n")
-    selected = mounts_for("/var/lib/docker", mounts)
+    selected = mounts_for("/var/lib/docker", mounts, (0, 70))
     assert [(m.mount_point, m.fstype) for m in selected] == [
         ("/var/lib/docker", "tmpfs"),  # mounted over the ext4 one
         ("/var/lib/docker/overlay2/abc/merged", "overlay"),
     ]
-    assert mounts_for("/var/lib/dockerx", mounts)[0].mount_point == "/"
-    assert mounts_for("/var/lib/docker/image", mounts)[0].fstype == "tmpfs"
+    assert mounts_for("/var/lib/dockerx", mounts, (8, 1))[0].mount_point == "/"
+    assert mounts_for("/var/lib/docker/image", mounts, (0, 70))[0].fstype == "tmpfs"
+    # A device no listed mount over the path has refuses (empty).
+    assert mounts_for("/var/lib/docker", mounts, (8, 5)) == ()
+    assert mounts_for("/var/lib/docker", mounts, (9, 9)) == ()
+
+
+SHADOWED = """\
+22 1 8:1 / / rw - ext4 /dev/sda1 rw
+90 22 0:70 / /x/docker rw - tmpfs tmpfs rw
+95 22 8:2 / /x rw - ext4 /dev/sda2 rw
+"""
+
+
+def test_a_deeper_mount_shadowed_by_a_later_mount_over_its_parent_is_not_chosen():
+    # tmpfs on /x/docker, then ext4 mounted on /x: /x/docker is now ext4's
+    # directory, and stat says 8:2. The longest mount point would say tmpfs.
+    selected = mounts_for("/x/docker", parse_mountinfo(SHADOWED), (8, 2))
+    assert [(m.mount_point, m.fstype) for m in selected] == [("/x", "ext4")]
+
+
+def test_a_shadowed_tmpfs_docker_root_refuses(tmp_path: Path):
+    root = tmp_path.resolve()
+    table = (
+        "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
+        f"90 22 0:70 / {root} rw - tmpfs tmpfs rw\n"
+        f"95 22 8:2 / {root.parent} rw - ext4 /dev/sda2 rw\n"
+    )
+    probe, checked = _probe(table, device=(8, 2))
+    with pytest.raises(StorageError, match=rf"{root.parent} \(ext4 on 8:2\) .* not dm-crypt$"):
+        require_protected_scratch(str(root), probe)
+    assert checked == [(8, 2)]
+    # Unshadowed (stat says tmpfs), the same table passes.
+    probe, checked = _probe(table, device=(0, 70))
+    assert require_protected_scratch(str(root), probe) == f"{root}: tmpfs"
+
+
+def test_a_docker_root_whose_device_is_not_listed_refuses(tmp_path: Path):
+    root = tmp_path.resolve()
+    probe, _checked = _probe(_root_table(root, fstype="tmpfs"), device=(0, 99))
+    with pytest.raises(StorageError, match="no mount of device 0:99"):
+        require_protected_scratch(str(root), probe)
+
+
+def test_device_of_reads_stat(tmp_path: Path):
+    device = os.stat(tmp_path).st_dev
+    assert storage.device_of(str(tmp_path)) == (os.major(device), os.minor(device))
 
 
 # -- dm-crypt tables ---------------------------------------------------------
@@ -284,14 +329,38 @@ def test_a_dmsetup_that_cannot_run_refuses(tmp_path: Path):
 # -- scratch -----------------------------------------------------------------
 
 
-def _probe(mountinfo: str, crypt=None, swaps: str = "Filename Type Size Used Priority\n"):
+def _kernel_device(mountinfo: str):
+    """stat(2)'s st_dev for a path when nothing is shadowed: the topmost deepest mount."""
+
+    def device(path: str) -> tuple[int, int]:
+        found = None
+        for mount in parse_mountinfo(mountinfo):
+            within = mount.mount_point == "/" or path == mount.mount_point
+            within = within or path.startswith(mount.mount_point + "/")
+            if within and (found is None or len(mount.mount_point) >= len(found.mount_point)):
+                found = mount
+        assert found is not None
+        return found.major, found.minor
+
+    return device
+
+
+def _probe(
+    mountinfo: str,
+    crypt=None,
+    swaps: str = "Filename Type Size Used Priority\n",
+    device: tuple[int, int] | None = None,
+):
     checked: list[tuple[int, int]] = []
 
     def crypt_integrity(major: int, minor: int):
         checked.append((major, minor))
         return (crypt or {}).get((major, minor), (False, "not dm-crypt"))
 
-    probe = StorageProbe(lambda _p: TMPFS_MAGIC, lambda: mountinfo, lambda: swaps, crypt_integrity)
+    device_of = _kernel_device(mountinfo) if device is None else (lambda _path: device)
+    probe = StorageProbe(
+        lambda _p: TMPFS_MAGIC, lambda: mountinfo, lambda: swaps, crypt_integrity, device_of
+    )
     return probe, checked
 
 
@@ -377,7 +446,10 @@ def test_a_failing_device_check_refuses(tmp_path: Path):
     def broken(major: int, minor: int):
         raise RuntimeError("sysfs vanished")
 
-    probe = StorageProbe(lambda _p: TMPFS_MAGIC, lambda: _root_table(root), lambda: "", broken)
+    table = _root_table(root)
+    probe = StorageProbe(
+        lambda _p: TMPFS_MAGIC, lambda: table, lambda: "", broken, _kernel_device(table)
+    )
     with pytest.raises(StorageError, match="the device check failed: sysfs vanished"):
         require_protected_scratch(str(root), probe)
 

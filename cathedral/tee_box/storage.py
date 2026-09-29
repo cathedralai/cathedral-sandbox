@@ -90,6 +90,13 @@ def _read_text(path: str) -> str:
         return handle.read(4 * 1024 * 1024)
 
 
+def device_of(path: str) -> tuple[int, int]:
+    """The major and minor number of the filesystem holding ``path`` (stat(2))."""
+
+    device = os.stat(path).st_dev
+    return os.major(device), os.minor(device)
+
+
 @dataclass(frozen=True)
 class StorageProbe:
     """What the storage checks read from the guest; tests replace each part."""
@@ -98,6 +105,7 @@ class StorageProbe:
     mountinfo: Callable[[], str]
     swaps: Callable[[], str]
     crypt_integrity: CryptIntegrityCheck
+    device_of: Callable[[str], tuple[int, int]] = device_of
 
 
 def default_storage_probe(
@@ -201,18 +209,20 @@ def _within(path: str, mount_point: str) -> bool:
     return mount_point == "/" or path == mount_point or path.startswith(mount_point + "/")
 
 
-def mounts_for(root: str, mounts: tuple[Mount, ...]) -> tuple[Mount, ...]:
+def mounts_for(root: str, mounts: tuple[Mount, ...], device: tuple[int, int]) -> tuple[Mount, ...]:
     """The mount serving ``root`` first, then every mount strictly below it.
 
-    The serving mount is the one with the longest mount point containing
-    ``root``, the last listed when several share it (the one on top).
+    ``device`` is what stat(2) reports for ``root``: the filesystem that
+    really serves the path. The serving mount is the last listed mount of
+    that device whose mount point contains ``root``, not the longest mount
+    point: a filesystem mounted later over an ancestor (ext4 on ``/x`` after
+    tmpfs on ``/x/docker``) hides the deeper one, and its device is the
+    answer stat gives. No such mount refuses (empty result).
     """
 
     serving = None
     for mount in mounts:
-        if _within(root, mount.mount_point) and (
-            serving is None or len(mount.mount_point) >= len(serving.mount_point)
-        ):
+        if (mount.major, mount.minor) == device and _within(root, mount.mount_point):
             serving = mount
     if serving is None:
         return ()
@@ -341,9 +351,16 @@ def require_protected_scratch(
             f"the Docker data root {root} is not visible to the worker; run the worker "
             "in the daemon's mount namespace"
         )
-    selected = mounts_for(resolved, parse_mountinfo(probe.mountinfo()))
+    try:
+        device = probe.device_of(resolved)
+    except OSError as exc:
+        raise StorageError(f"the Docker data root {root} cannot be inspected: {exc}") from exc
+    selected = mounts_for(resolved, parse_mountinfo(probe.mountinfo()), device)
     if not selected:
-        raise StorageError(f"no mount serves the Docker data root {root}")
+        raise StorageError(
+            f"no mount of device {device[0]}:{device[1]}, which serves the Docker data "
+            f"root {root}, is listed over it"
+        )
     details = []
     for index, mount in enumerate(selected):
         where = f"{mount.mount_point} ({mount.fstype} on {mount.major}:{mount.minor})"

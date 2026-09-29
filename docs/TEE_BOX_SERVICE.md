@@ -611,7 +611,13 @@ and `tar` uploads, which go through `docker exec` into that overlay; so do
 the imported layers. The worker asks the daemon for `DockerRootDir`
 (`cathedral/tee_box/executor.py:1014`) and refuses
 (`cathedral/tee_box/storage.py:316`) unless the mount serving it, and every
-mount below it in `/proc/self/mountinfo`, is either:
+mount below it in `/proc/self/mountinfo`, is either of the two kinds below.
+The serving mount is found by device, not by path: the last listed mount
+whose major:minor is the `st_dev` that stat(2) reports for the data root,
+and whose mount point contains it. A filesystem mounted later over a parent
+of the data root hides a deeper mount, which then no longer serves the path,
+so the longest matching mount point would be the wrong answer. The two
+kinds:
 
 - tmpfs or ramfs; or
 - a device-mapper device whose sysfs `dm/uuid` starts with `CRYPT-`
