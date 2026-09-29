@@ -20,6 +20,7 @@ from cathedral.capacity import admission as adm
 from cathedral.capacity import receipt
 from cathedral.channel import extract_spki_der
 from cathedral.common import Attested, ChannelBinding, ChannelBindingType, Tier, report_data_v2
+from cathedral.tee_box.boot import RTMR3_CONSUMED
 from cathedral.verify import snp
 from cathedral.verify.tdx_quote import parse_tdx_quote
 from tests.tdx_quote_fixtures import synthetic_tdx_quote
@@ -570,6 +571,120 @@ def test_every_refusal_is_reported_together():
     )
 
 
+# -- attestation after the last release -------------------------------------------------
+
+
+def test_evidence_from_before_the_last_release_is_refused():
+    released = ATTESTED_AT + timedelta(seconds=1)
+    result = _admit(_tdx(), last_released_at=released)
+    assert result.reasons == (adm.ATTESTATION_PREDATES_RELEASE,)
+    assert not result.admitted and result.evidence is None
+    assert adm.ATTESTATION_PREDATES_RELEASE == "attestation_predates_release"
+
+
+def test_evidence_verified_at_the_release_instant_is_refused():
+    # Strictly after: the same instant could be before the release.
+    result = _admit(_snp(), last_released_at=ATTESTED_AT)
+    assert result.reasons == (adm.ATTESTATION_PREDATES_RELEASE,)
+    assert result.evidence is None
+
+
+def test_evidence_verified_after_the_last_release_is_admitted():
+    released = ATTESTED_AT - timedelta(microseconds=1)
+    result = _admit(_tdx(), last_released_at=released)
+    assert result.admitted and result.reasons == ()
+    assert result.evidence == _admit(_tdx()).evidence
+
+
+def test_the_release_is_compared_as_an_instant_across_time_zones():
+    # 12:00:01 at +01:00 is 11:00:01 UTC, one second after ATTESTED_AT.
+    plus_one = timezone(timedelta(hours=1))
+    later = datetime(2026, 9, 28, 12, 0, 1, tzinfo=plus_one)
+    earlier = datetime(2026, 9, 28, 11, 59, 59, tzinfo=plus_one)
+    assert _admit(_tdx(), last_released_at=later).reasons == (adm.ATTESTATION_PREDATES_RELEASE,)
+    assert _admit(_tdx(), last_released_at=earlier).admitted
+
+
+def test_no_release_time_skips_the_check_and_keeps_the_old_signature():
+    assert _admit(_tdx(), last_released_at=None) == _admit(_tdx())
+    parameter = inspect.signature(adm.admit).parameters["last_released_at"]
+    assert parameter.default is None and parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_a_release_refusal_is_reported_with_the_others():
+    result = _admit(
+        _tdx(collateral_current=False),
+        nonce=bytes(reversed(NONCE)),
+        last_released_at=ATTESTED_AT + timedelta(hours=1),
+    )
+    assert result.reasons == (
+        adm.VERIFICATION_INCOMPLETE,
+        adm.REPORT_DATA_MISMATCH,
+        adm.ATTESTATION_PREDATES_RELEASE,
+    )
+
+
+# -- a fresh boot: RTMR3 all zeros ------------------------------------------------------
+
+FRESH_QUOTE = _tdx_quote(rtmr3=bytes(48))
+CONSUMED_QUOTE = _tdx_quote(rtmr3=RTMR3_CONSUMED)
+FRESH_MEASUREMENT = parse_tdx_quote(FRESH_QUOTE).measurement
+CONSUMED_MEASUREMENT = parse_tdx_quote(CONSUMED_QUOTE).measurement
+BOTH = _policy("tdx", allowed=sorted([FRESH_MEASUREMENT, CONSUMED_MEASUREMENT]))
+
+
+def test_a_fresh_boot_is_admitted_when_required():
+    result = _admit(_tdx(FRESH_QUOTE), policy=BOTH, require_fresh_boot=True)
+    assert result.admitted and result.reasons == ()
+    assert result.evidence is not None and result.measurement == FRESH_MEASUREMENT
+
+
+@pytest.mark.parametrize(
+    "rtmr3", [RTMR3_CONSUMED, b"3" * 48, bytes(47) + b"\x01"], ids=["consumed", "other", "last"]
+)
+def test_a_consumed_boot_is_refused_when_required(rtmr3):
+    quote = _tdx_quote(rtmr3=rtmr3)
+    policy = _policy("tdx", allowed=[parse_tdx_quote(quote).measurement])
+    result = _admit(_tdx(quote), policy=policy, require_fresh_boot=True)
+    assert result.reasons == (adm.BOOT_CONSUMED,) and adm.BOOT_CONSUMED == "boot_consumed"
+    assert not result.admitted and result.evidence is None
+
+
+def test_a_consumed_boot_is_admitted_when_not_required():
+    # A re-attestation during an allocation: the consumed measurement is listed.
+    result = _admit(_tdx(CONSUMED_QUOTE), policy=BOTH)
+    assert result.admitted and result.measurement == CONSUMED_MEASUREMENT
+    assert _admit(_tdx(CONSUMED_QUOTE), policy=BOTH, require_fresh_boot=False) == result
+
+
+def test_a_consumed_boot_is_refused_in_shadow_too():
+    shadow = _policy("tdx", mode="shadow", allowed=[FRESH_MEASUREMENT])
+    result = _admit(_tdx(CONSUMED_QUOTE), policy=shadow, require_fresh_boot=True)
+    assert result.reasons == (adm.BOOT_CONSUMED,) and result.evidence is None
+
+
+def test_rtmr3_is_read_from_the_quote_not_the_verdict():
+    # The verdict carries only the measurement; RTMR3 comes from the bytes.
+    result = _admit(_tdx(), require_fresh_boot=True)  # the fixture's RTMR3 is "3" * 48
+    assert result.reasons == (adm.BOOT_CONSUMED,)
+
+
+def test_the_consumed_measurement_differs_from_the_fresh_one():
+    # Why a policy lists both: the Cathedral TDX measurement covers the RTMRs.
+    assert FRESH_MEASUREMENT != CONSUMED_MEASUREMENT
+    assert _admit(
+        _tdx(CONSUMED_QUOTE), policy=_policy("tdx", allowed=[FRESH_MEASUREMENT])
+    ).reasons == (adm.MEASUREMENT_NOT_ALLOWED,)
+
+
+def test_fresh_boot_is_a_tdx_check():
+    with pytest.raises(adm.AdmissionError, match="SEV-SNP has no RTMR3"):
+        _admit(_snp(), require_fresh_boot=True)
+    assert _admit(_snp(), require_fresh_boot=False).admitted
+    parameter = inspect.signature(adm.admit).parameters["require_fresh_boot"]
+    assert parameter.default is False and parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+
 # -- malformed input -----------------------------------------------------------------------
 
 
@@ -668,6 +783,11 @@ _BAD_CALL = {
     "attested_at_epoch": {"attested_at": ATTESTED_AT.timestamp()},
     "attested_at_overflow": {"attested_at": datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=5)))},
     "attested_at_year_5": {"attested_at": datetime(5, 1, 1, tzinfo=timezone.utc)},
+    "released_naive": {"last_released_at": ATTESTED_AT.replace(tzinfo=None)},
+    "released_str": {"last_released_at": "2026-09-28T11:00:00Z"},
+    "released_epoch": {"last_released_at": ATTESTED_AT.timestamp()},
+    "fresh_boot_none": {"require_fresh_boot": None},
+    "fresh_boot_int": {"require_fresh_boot": 1},
     "nonce_short": {"nonce": NONCE[:31]},
     "nonce_zero": {"nonce": bytes(32)},
     "nonce_str": {"nonce": NONCE.hex()},

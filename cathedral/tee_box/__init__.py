@@ -4,6 +4,14 @@ See docs/TEE_BOX_SERVICE.md. The worker serves these routes only when it is
 given a ``TeeBoxSandboxApi``; nothing here runs otherwise.
 """
 
+from cathedral.tee_box.boot import (
+    RTMR3_CONSUMED,
+    BootError,
+    BootGuard,
+    RelaunchRequired,
+    RtmrError,
+    SysfsRtmr3,
+)
 from cathedral.tee_box.egress import EgressPolicy, EgressPolicyError, build_egress_policy
 from cathedral.tee_box.enforce import EgressEnforcementError, EgressEnforcer
 from cathedral.tee_box.executor import (
@@ -25,6 +33,9 @@ from cathedral.tee_box.service import (
 
 __all__ = [
     "ROUTE_SCOPES",
+    "RTMR3_CONSUMED",
+    "BootError",
+    "BootGuard",
     "CustomerLease",
     "EgressEnforcementError",
     "EgressEnforcer",
@@ -37,8 +48,11 @@ __all__ = [
     "FakeExecutor",
     "LeaseBusy",
     "LeaseRequired",
+    "RelaunchRequired",
+    "RtmrError",
     "RunscExecutor",
     "Shape",
+    "SysfsRtmr3",
     "TeeBoxSandboxApi",
     "build_egress_policy",
     "route_scope",
