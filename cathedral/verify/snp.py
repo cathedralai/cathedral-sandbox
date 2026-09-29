@@ -7,7 +7,9 @@ hand-rolling vendor crypto. See docs/DESIGN.md §6 and the AMD friend-test guide
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import math
 import os
 import re
@@ -20,7 +22,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
@@ -104,6 +106,50 @@ class SnpVerifierUnavailable(RuntimeError):
     """The pinned local verifier or its AMD certificate path was unavailable."""
 
     category = "verifier_infrastructure_unavailable"
+
+
+@dataclass(frozen=True)
+class SnpCertificateChain:
+    """Immutable DER inputs. Never pass caller-owned paths to snpguest."""
+
+    vcek: bytes
+    ask: bytes
+    ark: bytes
+
+    def __post_init__(self) -> None:
+        for encoded in (self.vcek, self.ask, self.ark):
+            if not isinstance(encoded, bytes) or not 1 <= len(encoded) <= MAX_AMD_ARK_BYTES:
+                raise ValueError("SNP certificate must be bounded DER bytes")
+            certificate = x509.load_der_x509_certificate(encoded)
+            if certificate.public_bytes(serialization.Encoding.DER) != encoded:
+                raise ValueError("SNP certificate must contain exactly one DER certificate")
+
+
+def persist_snp_capture(report: bytes, chain: SnpCertificateChain, directory: Path) -> Path:
+    """Persist the admitted report and its verified chain in one private file.
+
+    The content-addressed snapshot survives KDS outages. The directory is an
+    output sink only, and none of its paths are passed to the vendor verifier.
+    """
+    document = {
+        "schema": "cathedral_snp_capture_v1",
+        "report_base64": base64.b64encode(report).decode("ascii"),
+        "certificates": {name + "_base64": base64.b64encode(getattr(chain, name)).decode("ascii")
+                         for name in ("vcek", "ask", "ark")},
+    }
+    encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("ascii")
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    destination = directory / (hashlib.sha256(encoded).hexdigest() + ".json")
+    fd, temporary = tempfile.mkstemp(prefix=".snp-capture-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    return destination
 
 
 @dataclass(frozen=True)
@@ -545,6 +591,8 @@ def _verify_chain_with_snpguest(
     snpguest_path: str,
     certs_dir: str | os.PathLike[str] | None,
     deadline_monotonic: float | None = None,
+    certificate_chain: SnpCertificateChain | None = None,
+    capture: Callable[[bytes, SnpCertificateChain], None] | None = None,
 ) -> bool:
     """Ask snpguest to fetch AMD certs and verify the report signature chain."""
 
@@ -569,23 +617,31 @@ def _verify_chain_with_snpguest(
                 timeout=_snpguest_command_timeout(deadline_monotonic),
             )
 
-        run([snpguest_path, "fetch", "vcek", "DER", str(certs_path), str(report_path)])
+        if certificate_chain is None:
+            run([snpguest_path, "fetch", "vcek", "DER", str(certs_path), str(report_path)])
 
-        # This is the exact v0.10.0 interface documented at
-        # https://github.com/virtee/snpguest/blob/v0.10.0/README.md#4-fetch.
-        # Trying legacy orders after a real KDS 5xx would replace the outage
-        # diagnostic with a local CLI parse error and incorrectly blame the miner.
-        run(
-            [
-                snpguest_path,
-                "fetch",
-                "ca",
-                "DER",
-                str(certs_path),
-                "--report",
-                str(report_path),
-            ]
-        )
+            # This is the exact v0.10.0 interface documented at
+            # https://github.com/virtee/snpguest/blob/v0.10.0/README.md#4-fetch.
+            # Trying legacy orders after a real KDS 5xx would replace the outage
+            # diagnostic with a local CLI parse error and incorrectly blame the miner.
+            run(
+                [
+                    snpguest_path,
+                    "fetch",
+                    "ca",
+                    "DER",
+                    str(certs_path),
+                    "--report",
+                    str(report_path),
+                ]
+            )
+        else:
+            if not isinstance(certificate_chain, SnpCertificateChain):
+                return False
+            for name in ("vcek", "ask", "ark"):
+                path = certs_path / (name + ".der")
+                path.write_bytes(getattr(certificate_chain, name))
+                path.chmod(0o600)
 
         generation = _snp_generation(parse_snp_report(report))
         if generation is None or not _amd_ark_is_pinned(certs_path, generation):
@@ -603,6 +659,12 @@ def _verify_chain_with_snpguest(
         for cmd in verify_orders:
             try:
                 run(cmd)
+                if capture is not None:
+                    captured = SnpCertificateChain(**{
+                        name: (certs_path / (name + ".der")).read_bytes()
+                        for name in ("vcek", "ask", "ark")
+                    })
+                    capture(report, captured)
                 return True
             except subprocess.CalledProcessError:
                 continue
@@ -619,6 +681,7 @@ def verify_snp_report_data(
     require_chain: bool = True,
     raise_on_verifier_unavailable: bool = False,
     deadline_monotonic: float | None = None,
+    certificate_chain: SnpCertificateChain | None = None,
 ) -> Attested | None:
     """Verify a raw SNP report against explicit 64-byte REPORT_DATA.
 
@@ -626,7 +689,7 @@ def verify_snp_report_data(
     admission ticket, so without a vendor-verified signature chain the default
     verdict is ``None``. Diagnostic/shadow tooling that wants the parsed report
     with an explicit ``STRUCTURE_OK_CHAIN_UNVERIFIED`` status can opt in with
-    ``require_chain=False`` — that verdict must never be used for admission.
+    ``require_chain=False``. That verdict must never be used for admission.
 
     ``certs_dir`` remains in the compatibility signature but any non-``None``
     value is refused. Vendor certificates must stay in the verifier's private
@@ -666,6 +729,13 @@ def verify_snp_report_data(
                     }
                     if deadline_monotonic is not None:
                         verify_kwargs["deadline_monotonic"] = deadline_monotonic
+                    if certificate_chain is not None:
+                        verify_kwargs["certificate_chain"] = certificate_chain
+                    capture_directory = os.environ.get("CATHEDRAL_SNP_CAPTURE_DIR")
+                    if capture_directory and certificate_chain is None:
+                        verify_kwargs["capture"] = lambda raw, chain: persist_snp_capture(
+                            raw, chain, Path(capture_directory)
+                        )
                     chain_verified = _verify_chain_with_snpguest(report, **verify_kwargs)
                     break
                 except subprocess.CalledProcessError as exc:
@@ -739,3 +809,31 @@ def verify_snp(
         raise_on_verifier_unavailable=raise_on_verifier_unavailable,
         deadline_monotonic=deadline_monotonic,
     )
+
+
+def verify_snp_offline(
+    report: bytes,
+    expected_report_data: bytes,
+    policy: Policy,
+    *,
+    vcek_der: bytes,
+    ask_der: bytes,
+    ark_der: bytes,
+    snpguest_path: str | os.PathLike[str] | None = None,
+    raise_on_verifier_unavailable: bool = False,
+) -> Attested | None:
+    """Replay vendor signatures and the complete admission policy without KDS.
+
+    Offline replay proves the supplied chain, not current revocation state.
+    No diagnostic override or external certificate directory is accepted.
+    """
+    try:
+        chain = SnpCertificateChain(vcek_der, ask_der, ark_der)
+        return verify_snp_report_data(
+            report, expected_report_data, policy,
+            certificate_chain=chain,
+            snpguest_path=snpguest_path,
+            raise_on_verifier_unavailable=raise_on_verifier_unavailable,
+        )
+    except (TypeError, ValueError):
+        return None

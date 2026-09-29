@@ -1,0 +1,5 @@
+{
+  "vcek": "https://kdsintf.amd.com/vcek/v1/Turin/d010789547cc0e11?fmcSPL=01&blSPL=03&teeSPL=02&snpSPL=05&ucodeSPL=97",
+  "ca": "https://kdsintf.amd.com/vcek/v1/Turin/cert_chain",
+  "report_sha256": "841d5d9c35e0f621428a06b58d325036b714ddf59943696e9fcf0bb12b6b10e1"
+}
