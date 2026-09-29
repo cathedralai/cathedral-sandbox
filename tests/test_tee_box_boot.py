@@ -14,11 +14,18 @@ import pytest
 
 from cathedral.tee_box import FakeExecutor, TeeBoxSandboxApi, build_egress_policy
 from cathedral.tee_box.boot import (
+    LEASE_EVENT,
+    LEASE_EVENT_DIGEST,
     MARKER_SCHEMA,
+    RTMR3_CONSUMED,
+    RTMR3_FRESH,
+    TDX_RTMR3_PATH,
     UNKNOWN_CONSUMER,
     BootError,
     BootGuard,
     RelaunchRequired,
+    RtmrError,
+    SysfsRtmr3,
     marker_path_for,
     read_boot_id,
     read_booted_at,
@@ -36,6 +43,7 @@ from tests.test_tee_box_service import (
     _binding,
     _BootIds,
     _Clock,
+    _FakeRtmr,
     _handle,
     _push_revocations,
 )
@@ -123,11 +131,13 @@ def test_a_guard_refuses_to_start_without_a_boot_id(tmp_path: Path):
         raise BootError("no boot id")
 
     with pytest.raises(BootError, match="no boot id"):
-        BootGuard(None, read_boot_id=broken, read_booted_at=lambda: BOOTED_AT)
+        BootGuard(None, rtmr=_FakeRtmr(), read_boot_id=broken, read_booted_at=lambda: BOOTED_AT)
     with pytest.raises(BootError, match="no boot id"):
-        BootGuard(None, read_boot_id=lambda: "junk", read_booted_at=lambda: BOOTED_AT)
+        BootGuard(
+            None, rtmr=_FakeRtmr(), read_boot_id=lambda: "junk", read_booted_at=lambda: BOOTED_AT
+        )
     with pytest.raises(BootError, match="no time"):
-        BootGuard(None, read_boot_id=_BootIds(), read_booted_at=lambda: True)
+        BootGuard(None, rtmr=_FakeRtmr(), read_boot_id=_BootIds(), read_booted_at=lambda: True)
 
 
 def test_the_sandbox_api_requires_a_boot_guard(tmp_path: Path):
@@ -206,6 +216,8 @@ def test_needs_relaunch_is_reported_with_the_boot_and_the_release(box):
         "consumed_by_caller": False,
         "needs_relaunch": False,
         "last_released_at": None,
+        "rtmr3": "00" * 48,
+        "rtmr3_extended": False,
     }
     assert _lease(api)[0] == 200
     leased = _boot_view(api)
@@ -260,6 +272,8 @@ def test_a_new_boot_id_clears_the_record(box):
         "consumed_by_caller": False,
         "needs_relaunch": False,
         "last_released_at": None,
+        "rtmr3": "00" * 48,
+        "rtmr3_extended": False,
     }
     status, lease = _lease(api, OTHER)
     assert status == 200 and lease["lease"]["holder"] == OTHER
@@ -391,6 +405,8 @@ def test_a_boot_id_that_can_no_longer_be_read_refuses_new_leases(box):
         "consumed_by_caller": False,
         "needs_relaunch": True,
         "last_released_at": None,
+        "rtmr3": "00" * 48,
+        "rtmr3_extended": False,
     }
 
 
@@ -461,3 +477,136 @@ def test_a_release_whose_record_cannot_be_written_needs_a_relaunch(box):
     view = _boot_view(api)
     assert view["needs_relaunch"] is True
     assert view["last_released_at"] == math.ceil(clock.value)
+
+
+# -- RTMR3: the lease extend ------------------------------------------------
+
+
+def test_the_consumed_value_is_one_sha384_extend_of_the_lease_event():
+    import hashlib
+
+    assert LEASE_EVENT == b"cathedral tee-box lease granted v1"
+    assert LEASE_EVENT_DIGEST == hashlib.sha384(LEASE_EVENT).digest()
+    assert RTMR3_FRESH == bytes(48)
+    by_hand = hashlib.sha384(bytes(48) + hashlib.sha384(LEASE_EVENT).digest()).digest()
+    assert RTMR3_CONSUMED == by_hand
+    assert len(RTMR3_CONSUMED) == 48 and RTMR3_CONSUMED != RTMR3_FRESH
+    assert TDX_RTMR3_PATH == "/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384"
+
+
+def test_the_first_lease_extends_rtmr3_once_per_boot(box):
+    api, _fake, clock, boot_ids, _marker = box
+    rtmr = boot_ids.rtmr
+    assert rtmr.extends == [] and _boot_view(api)["rtmr3"] == "00" * 48
+    assert _lease(api)[0] == 200
+    assert rtmr.extends == [LEASE_EVENT_DIGEST]
+    assert rtmr.value == RTMR3_CONSUMED
+    view = _boot_view(api)
+    assert view["rtmr3"] == RTMR3_CONSUMED.hex() and view["rtmr3_extended"] is True
+    # Renewal, release and the same customer's next lease: no second extend.
+    assert _lease(api)[0] == 200
+    assert _handle(api, "DELETE", "/v1/lease")[0] == 200
+    clock.value += 5
+    assert _lease(api)[0] == 200
+    assert rtmr.extends == [LEASE_EVENT_DIGEST] and rtmr.value == RTMR3_CONSUMED
+    # A new boot has a new RTMR3, extended once more on its own first lease.
+    assert _handle(api, "DELETE", "/v1/lease")[0] == 200
+    boot_ids.relaunch()
+    assert _lease(api, OTHER)[0] == 200
+    assert boot_ids.rtmr.extends == [LEASE_EVENT_DIGEST]
+    assert rtmr.extends == [LEASE_EVENT_DIGEST]
+
+
+def test_a_failed_extend_refuses_the_lease(box):
+    api, _fake, _clock, boot_ids, marker = box
+    boot_ids.rtmr.fail = OSError("EIO")
+    status, body = _lease(api)
+    assert (status, body["reason"]) == (503, "rtmr_extend_failed")
+    assert api.lease.current() is None
+    assert api.boot.record.consumed_by is None and not marker.exists()
+    # RTMR3 is still zero, so a retry may extend.
+    boot_ids.rtmr.fail = None
+    assert _lease(api)[0] == 200
+    assert boot_ids.rtmr.extends == [LEASE_EVENT_DIGEST] * 2
+    assert boot_ids.rtmr.value == RTMR3_CONSUMED
+
+
+def test_an_extend_that_landed_but_reported_failure_is_not_repeated(box):
+    api, _fake, _clock, boot_ids, _marker = box
+    boot_ids.rtmr.fail = OSError("timeout")
+    boot_ids.rtmr.fail_after_landing = True
+    assert _lease(api)[1]["reason"] == "rtmr_extend_failed"
+    assert boot_ids.rtmr.value == RTMR3_CONSUMED
+    boot_ids.rtmr.fail = None
+    assert _lease(api)[0] == 200
+    assert len(boot_ids.rtmr.extends) == 1 and boot_ids.rtmr.value == RTMR3_CONSUMED
+
+
+def test_rtmr3_left_at_another_value_closes_the_box(box):
+    api, _fake, _clock, boot_ids, _marker = box
+    rtmr = boot_ids.rtmr
+
+    def extend_twice(digest: bytes) -> None:
+        _FakeRtmr.extend(rtmr, digest)
+        _FakeRtmr.extend(rtmr, digest)
+
+    rtmr.extend = extend_twice
+    assert _lease(api)[1]["reason"] == "rtmr_extend_failed"
+    assert _relaunch_required(api, CALLER) and _relaunch_required(api, OTHER)
+
+
+def test_rtmr3_at_start_must_agree_with_the_record(box, tmp_path: Path):
+    api, _fake, clock, boot_ids, marker = box
+    # Consumed in hardware, no record (a crash between extend and write).
+    boot_ids.rtmr.value = RTMR3_CONSUMED
+    restarted = _restart(tmp_path, clock, boot_ids, marker)
+    assert restarted.boot.record.consumed_by == UNKNOWN_CONSUMER
+    assert _relaunch_required(restarted, CALLER)
+    assert boot_ids.rtmr.extends == []
+
+
+def test_a_record_with_rtmr3_still_zero_closes_the_box(box, tmp_path: Path):
+    api, _fake, clock, boot_ids, marker = box
+    assert _lease(api)[0] == 200
+    boot_ids.rtmr.value = RTMR3_FRESH  # the record says consumed; RTMR3 says not
+    restarted = _restart(tmp_path, clock, boot_ids, marker)
+    assert restarted.boot.record.consumed_by == UNKNOWN_CONSUMER
+    assert _relaunch_required(restarted, CALLER)
+
+
+def test_an_unexpected_rtmr3_at_start_closes_the_box(tmp_path: Path):
+    boot_ids = _BootIds()
+    boot_ids.rtmr.value = b"\x01" * 48
+    api = _restart(tmp_path, _Clock(), boot_ids, tmp_path / "central.sqlite.boot")
+    assert api.boot.record.consumed_by == UNKNOWN_CONSUMER
+    assert _relaunch_required(api, CALLER)
+
+
+def test_a_guard_refuses_to_start_without_rtmr3(tmp_path: Path):
+    rtmr = _FakeRtmr()
+    rtmr.unreadable = True
+    with pytest.raises(RtmrError, match="RTMR3 is unavailable"):
+        BootGuard(None, rtmr=rtmr, read_boot_id=_BootIds(), read_booted_at=lambda: BOOTED_AT)
+    with pytest.raises(ValueError, match="read and extend"):
+        BootGuard(None, rtmr=object(), read_boot_id=_BootIds(), read_booted_at=lambda: BOOTED_AT)
+    with pytest.raises(TypeError):
+        BootGuard(None, read_boot_id=_BootIds(), read_booted_at=lambda: BOOTED_AT)  # no default
+
+
+def test_the_sysfs_interface_reads_and_writes_48_raw_bytes(tmp_path: Path):
+    path = tmp_path / "rtmr3:sha384"
+    path.write_bytes(bytes(48))
+    rtmr = SysfsRtmr3(str(path))
+    assert rtmr.read() == bytes(48)
+    rtmr.extend(LEASE_EVENT_DIGEST)
+    # A plain file just holds what was written; the kernel attribute extends.
+    assert path.read_bytes() == LEASE_EVENT_DIGEST
+    with pytest.raises(RtmrError):
+        rtmr.extend(b"short")
+    path.write_bytes(bytes(47))
+    with pytest.raises(RtmrError, match="48 bytes"):
+        rtmr.read()
+    with pytest.raises(RtmrError):
+        SysfsRtmr3(str(tmp_path / "missing")).read()
+    with pytest.raises(RtmrError):
+        SysfsRtmr3(str(tmp_path / "missing")).extend(LEASE_EVENT_DIGEST)

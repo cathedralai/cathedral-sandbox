@@ -39,7 +39,7 @@ from cathedral.central_access import (
     CentralAccessError,
 )
 from cathedral.policy_registry import canonical_json, parse_registry_json
-from cathedral.tee_box.boot import BootError, BootGuard, RelaunchRequired
+from cathedral.tee_box.boot import BootError, BootGuard, RelaunchRequired, RtmrError
 from cathedral.tee_box.egress import EgressPolicy
 from cathedral.tee_box.executor import (
     MAX_FILE_BYTES,
@@ -490,6 +490,14 @@ class TeeBoxSandboxApi:
                 {
                     "error": "another customer used this boot; the VM must be relaunched first",
                     "reason": "relaunch_required",
+                },
+            )
+        except RtmrError:
+            return _json(
+                503,
+                {
+                    "error": "the box cannot extend RTMR3 before the first lease",
+                    "reason": "rtmr_extend_failed",
                 },
             )
         except BootError:

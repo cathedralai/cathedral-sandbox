@@ -15,14 +15,21 @@ written in, and a file for any other boot id is ignored, so one that somehow
 survived a relaunch does not carry over. A file that cannot be read or parsed
 refuses every caller until the next boot.
 
-This protects against a box that is not relaunched while the guest kernel is
-intact. A tenant that escapes gVisor into the guest kernel controls this code,
-the file and the boot id, so it proves nothing after an escape; see
-docs/TEE_BOX_SERVICE.md, "Relaunch between customers".
+The record, and the boot id, protect only against a box that is not
+relaunched while the guest kernel is intact. A tenant that escapes gVisor into
+the guest kernel controls this code, the file and the boot id. What holds
+against guest root is the RTMR3 extend: before a boot's first lease is
+granted, the box extends TDX RTMR3 once with ``LEASE_EVENT``. Nothing in the
+guest can undo an extend, so every later quote of that boot carries
+``RTMR3_CONSUMED`` instead of zeros, and admission with
+``require_fresh_boot=True`` (cathedral/capacity/admission.py) refuses it until
+the VM is relaunched. See docs/TEE_BOX_SERVICE.md, "Relaunch between
+customers".
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -42,6 +49,29 @@ UNKNOWN_CONSUMER = "(unknown)"
 _BOOT_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _MARKER_KEYS = frozenset({"schema", "boot_id", "consumed_by", "consumed_at", "released_at"})
 
+# RTMR3 through the kernel's TSM measurement registers (Linux 6.16 and later,
+# drivers/virt/coco/tdx-guest). A write of exactly 48 bytes at offset 0 is
+# passed to TDG.MR.RTMR.EXTEND unchanged; a read returns the 48-byte value.
+# The kernel has no RTMR extend ioctl. /sys/class/misc/tdx_guest links here.
+TDX_RTMR3_PATH = "/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384"
+RTMR_BYTES = 48
+# The one event a box extends into RTMR3, once per boot, before the first lease.
+LEASE_EVENT = b"cathedral tee-box lease granted v1"
+LEASE_EVENT_DIGEST = hashlib.sha384(LEASE_EVENT).digest()
+RTMR3_FRESH = bytes(RTMR_BYTES)
+
+
+def rtmr_extend(value: bytes, digest: bytes) -> bytes:
+    """What TDG.MR.RTMR.EXTEND leaves in an RTMR: SHA-384(value || digest)."""
+
+    if len(value) != RTMR_BYTES or len(digest) != RTMR_BYTES:
+        raise ValueError("an RTMR and its extend data are 48 bytes each")
+    return hashlib.sha384(value + digest).digest()
+
+
+# RTMR3 of a consumed boot: SHA-384(48 zero bytes || SHA-384(LEASE_EVENT)).
+RTMR3_CONSUMED = rtmr_extend(RTMR3_FRESH, LEASE_EVENT_DIGEST)
+
 
 class BootError(Exception):
     """The boot identity or the boot record cannot be read or written."""
@@ -49,6 +79,49 @@ class BootError(Exception):
 
 class RelaunchRequired(Exception):
     """Another customer consumed this boot; the VM must be relaunched first."""
+
+
+class RtmrError(BootError):
+    """RTMR3 cannot be read or extended."""
+
+
+class SysfsRtmr3:
+    """TDX RTMR3 through the kernel's sysfs measurement registers.
+
+    The interface has not been exercised on a TD yet (T6b2): the path, the
+    raw 48-byte read and the pass-through write follow the kernel source and
+    its ABI document (Documentation/ABI/testing/sysfs-devices-virtual-misc-tdx_guest).
+    """
+
+    def __init__(self, path: str = TDX_RTMR3_PATH) -> None:
+        self.path = path
+
+    def read(self) -> bytes:
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                value = os.read(fd, RTMR_BYTES + 1)
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            raise RtmrError(f"cannot read RTMR3 from {self.path}: {exc}") from exc
+        if len(value) != RTMR_BYTES:
+            raise RtmrError(f"{self.path} did not return 48 bytes")
+        return value
+
+    def extend(self, digest: bytes) -> None:
+        if not isinstance(digest, bytes) or len(digest) != RTMR_BYTES:
+            raise RtmrError("the RTMR3 extend data must be 48 bytes")
+        try:
+            fd = os.open(self.path, os.O_WRONLY | os.O_CLOEXEC)
+            try:
+                written = os.write(fd, digest)
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            raise RtmrError(f"cannot extend RTMR3 at {self.path}: {exc}") from exc
+        if written != RTMR_BYTES:
+            raise RtmrError(f"{self.path} took {written} of 48 bytes")
 
 
 def read_boot_id(path: str = BOOT_ID_PATH) -> str:
@@ -130,9 +203,15 @@ class BootGuard:
 
     ``marker_path`` is the record's file (``marker_path_for(central state)``),
     or None to keep it in memory only (tests; a worker restart then forgets
-    it). ``read_boot_id`` and ``read_booted_at`` are the kernel readers,
-    replaced in tests. Construction reads both and raises :class:`BootError`
-    when either is unavailable, so the worker refuses to start.
+    it). ``rtmr`` reads and extends RTMR3 (``SysfsRtmr3`` on a TD; a fake in
+    tests); there is no default, so a box cannot run without it.
+    ``read_boot_id`` and ``read_booted_at`` are the kernel readers, replaced
+    in tests. Construction reads all three and raises :class:`BootError` when
+    any is unavailable, so the worker refuses to start.
+
+    RTMR3 at start must be zero, or ``RTMR3_CONSUMED`` with a record of this
+    boot's customer. Anything else (consumed with no record, a record with
+    RTMR3 still zero, any other value) closes the box until the next boot.
 
     The boot id is read again on every check. In a real box it cannot change
     while the process lives (a relaunch ends the process); if it does, the
@@ -143,20 +222,31 @@ class BootGuard:
         self,
         marker_path: str | None,
         *,
+        rtmr,  # noqa: ANN001 - read() -> bytes, extend(digest: bytes) -> None
         read_boot_id: Callable[[], str] = read_boot_id,
         read_booted_at: Callable[[], int] = read_booted_at,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if not callable(read_boot_id) or not callable(read_booted_at) or not callable(clock):
             raise ValueError("boot readers and clock must be callable")
+        if not callable(getattr(rtmr, "read", None)) or not callable(getattr(rtmr, "extend", None)):
+            raise ValueError("rtmr must read and extend RTMR3")
+        self._rtmr = rtmr
         self._read_boot_id = read_boot_id
         self._read_booted_at = read_booted_at
         self._clock = clock
         self.marker_path = marker_path
         boot_id = self._checked_boot_id()
         self._booted_at = self._checked_booted_at()
+        rtmr3 = self._checked_rtmr3()
+        self._rtmr_extended = rtmr3 == RTMR3_CONSUMED
         self._record = self._load(boot_id)
-        if self._record.consumed_by is not None and self._record.released_at is None:
+        consumed = self._record.consumed_by is not None
+        if rtmr3 not in (RTMR3_FRESH, RTMR3_CONSUMED) or self._rtmr_extended != consumed:
+            # RTMR3 and the record disagree: nobody can tell who used this boot.
+            self._record = BootRecord(boot_id, UNKNOWN_CONSUMER, None, self._clock())
+            self._store_or_close()
+        elif consumed and self._record.released_at is None:
             # An earlier worker in this boot held a lease; whatever it was, it
             # ended no later than now.
             self._record = BootRecord(
@@ -177,6 +267,15 @@ class BootGuard:
         if isinstance(booted_at, bool) or not isinstance(booted_at, int) or booted_at < 0:
             raise BootError("the boot time reader returned no time")
         return booted_at
+
+    def _checked_rtmr3(self) -> bytes:
+        try:
+            value = self._rtmr.read()
+        except (OSError, BootError) as exc:
+            raise RtmrError(f"RTMR3 is unavailable: {exc}") from exc
+        if not isinstance(value, bytes) or len(value) != RTMR_BYTES:
+            raise RtmrError("RTMR3 is unavailable: the reader returned no 48-byte value")
+        return value
 
     def _load(self, boot_id: str) -> BootRecord:
         fresh = BootRecord(boot_id, None, None, None)
@@ -263,10 +362,56 @@ class BootGuard:
         if boot_id != self._record.boot_id:
             try:
                 self._booted_at = self._checked_booted_at()
+                rtmr3 = self._checked_rtmr3()
             except Exception:
                 return None
-            self._record = BootRecord(boot_id, None, None, None)
+            self._rtmr_extended = rtmr3 == RTMR3_CONSUMED
+            fresh = rtmr3 == RTMR3_FRESH
+            self._record = BootRecord(boot_id, None if fresh else UNKNOWN_CONSUMER, None, None)
         return self._record
+
+    def _close(self) -> None:
+        """Refuse every caller until the next boot."""
+
+        record = self._record
+        self._record = BootRecord(
+            record.boot_id, UNKNOWN_CONSUMER, record.consumed_at, record.released_at
+        )
+        try:
+            self._store()
+        except OSError:
+            pass
+
+    def _extend_once(self) -> None:
+        """Extend RTMR3 with ``LEASE_EVENT`` unless this boot already did.
+
+        Raises :class:`RtmrError` when the extend fails; the lease is then
+        refused. If RTMR3 is left at any value but zero or ``RTMR3_CONSUMED``,
+        the box closes until the next boot.
+        """
+
+        if self._rtmr_extended:
+            return
+        try:
+            self._rtmr.extend(LEASE_EVENT_DIGEST)
+        except Exception as exc:
+            try:
+                landed = self._checked_rtmr3()
+            except RtmrError:
+                landed = None
+            if landed == RTMR3_CONSUMED:
+                self._rtmr_extended = True
+            elif landed != RTMR3_FRESH:
+                self._close()
+            raise RtmrError(f"the RTMR3 lease extend failed: {exc}") from exc
+        try:
+            landed = self._checked_rtmr3()
+        except RtmrError:
+            landed = None
+        if landed != RTMR3_CONSUMED:
+            self._close()
+            raise RtmrError("RTMR3 does not hold the consumed value after the lease extend")
+        self._rtmr_extended = True
 
     # -- the lease's hooks (called under the lease lock) ---------------------
 
@@ -295,6 +440,8 @@ class BootGuard:
                 return
             self._record = BootRecord(previous.boot_id, caller, previous.consumed_at, None)
         else:
+            # Hardware first: once extended, no quote of this boot is fresh.
+            self._extend_once()
             self._record = BootRecord(previous.boot_id, caller, now, None)
         try:
             self._store()
@@ -324,6 +471,10 @@ class BootGuard:
         """
 
         record = self._current()
+        try:
+            rtmr3 = self._checked_rtmr3().hex()
+        except RtmrError:
+            rtmr3 = None
         if record is None:
             return {
                 "boot_id": None,
@@ -332,6 +483,8 @@ class BootGuard:
                 "consumed_by_caller": False,
                 "needs_relaunch": True,
                 "last_released_at": None,
+                "rtmr3": rtmr3,
+                "rtmr3_extended": self._rtmr_extended,
             }
         consumed = record.consumed_by is not None
         return {
@@ -343,6 +496,9 @@ class BootGuard:
             "last_released_at": (
                 None if record.released_at is None else math.ceil(record.released_at)
             ),
+            # Informational: a quote is what shows RTMR3, not this answer.
+            "rtmr3": rtmr3,
+            "rtmr3_extended": self._rtmr_extended,
         }
 
     @property
@@ -352,3 +508,7 @@ class BootGuard:
     @property
     def booted_at(self) -> int:
         return self._booted_at
+
+    @property
+    def rtmr3_extended(self) -> bool:
+        return self._rtmr_extended

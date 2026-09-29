@@ -19,13 +19,15 @@ from cathedral.cli import DEFAULT_WORKER_BEARER_ENV, build_parser, cmd_worker_se
 from cathedral.policy_registry import canonical_json
 from cathedral.tee_box import TeeBoxSandboxApi, measured_root
 from cathedral.tee_box import configure as configure_module
-from cathedral.tee_box.boot import BootError, BootGuard, RelaunchRequired
+from cathedral.tee_box import boot as boot_module
+from cathedral.tee_box.boot import RTMR3_CONSUMED, BootError, BootGuard, RelaunchRequired
 from cathedral.tee_box.configure import OPTIONAL, REQUIRED, tee_box_config
 from cathedral.tee_box.storage import TMPFS_MAGIC, StorageProbe
 from tests.test_cli import _tls_material
 from tests.test_tee_box_service import (
     BOOTED_AT,
     NETUID,
+    _FakeRtmr,
     OTHER_ROOT_SEED,
     ROOT_KEYS,
     ROOT_SEED,
@@ -201,6 +203,7 @@ def guest(monkeypatch, tmp_path: Path):
     box.docker_root = str(docker_root.resolve())
     box.disk = _Storage(docker_root.resolve())
     box.boot_id = "0f2d6c5e-1b7a-4c8e-9d3f-2a6b8c0e4f11"
+    box.rtmr = _FakeRtmr()
     real_build = configure_module.build_tee_box_api
 
     def build(config, **kwargs):
@@ -219,7 +222,11 @@ def guest(monkeypatch, tmp_path: Path):
             runner=box,
             read_binding=read_binding,
             storage_probe=box.disk.probe(),
-            boot_readers={"read_boot_id": read_boot_id, "read_booted_at": lambda: BOOTED_AT},
+            boot_options={
+                **({} if box.rtmr is None else {"rtmr": box.rtmr}),
+                "read_boot_id": read_boot_id,
+                "read_booted_at": lambda: BOOTED_AT,
+            },
             **kwargs,
         )
 
@@ -507,6 +514,7 @@ def test_the_startup_line_reports_the_boot_and_its_record(tmp_path: Path, guest,
         "boot_id": guest.boot_id,
         "booted_at": BOOTED_AT,
         "consumed": False,
+        "rtmr3_extended": False,
         "record": str(tmp_path / "tee-box-central.sqlite.boot"),
     }
     api = _FakeServer.calls[0]["tee_box_api"]
@@ -518,16 +526,66 @@ def test_an_unreadable_boot_id_refuses_to_start(tmp_path: Path, guest):
     _refused(tmp_path, r"^TEE box boot identity: cannot read the boot id$")
 
 
+def test_an_unreadable_rtmr3_refuses_to_start(tmp_path: Path, guest):
+    guest.rtmr.unreadable = True
+    _refused(tmp_path, r"^TEE box boot identity: RTMR3 is unavailable: no such file$")
+
+
+def test_the_box_uses_the_kernel_rtmr3_interface_by_default(tmp_path: Path, guest, monkeypatch):
+    seen = []
+
+    class _Recording(boot_module.SysfsRtmr3):
+        def read(self) -> bytes:
+            seen.append(self.path)
+            return bytes(48)
+
+    monkeypatch.setattr(configure_module, "SysfsRtmr3", _Recording)
+    guest.rtmr = None  # no test double: build_tee_box_api picks the interface
+    assert cmd_worker_serve(_args(tmp_path, *_full_flags(tmp_path))) == 0
+    assert seen == ["/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384"]
+    assert isinstance(_FakeServer.calls[0]["tee_box_api"].boot._rtmr, _Recording)  # noqa: SLF001
+
+
+def test_a_box_on_sev_snp_has_no_rtmr3_to_extend(tmp_path: Path, guest, monkeypatch):
+    # SEV-SNP is refused earlier for want of a measured root binding; were
+    # that added, the missing RTMR would still refuse.
+    monkeypatch.setattr(
+        measured_root,
+        "load_measured_root_keys",
+        lambda tee, read_binding=None: (ROOT_KEYS, "sha256:" + "0" * 64),
+    )
+    config = tee_box_config(_args(tmp_path, *_full_flags(tmp_path)))
+    with pytest.raises(ValueError, match=r"^TEE box boot identity: TEE 'snp' has no RTMR3"):
+        configure_module.build_tee_box_api(
+            config,
+            tee="snp",
+            hotkey=WORKER_HOTKEY,
+            channel_binding=None,
+            network="finney",
+            netuid=NETUID,
+            public_endpoint=None,
+            runner=guest,
+            read_binding=lambda: guest.mrconfigid,
+            storage_probe=guest.disk.probe(),
+        )
+
+
 def test_a_restarted_worker_keeps_this_boots_customer(tmp_path: Path, guest, capsys):
     # The first worker of this boot leased the box to one customer.
     marker = tmp_path / "tee-box-central.sqlite.boot"
     first = BootGuard(
-        str(marker), read_boot_id=lambda: guest.boot_id, read_booted_at=lambda: BOOTED_AT
+        str(marker),
+        rtmr=guest.rtmr,
+        read_boot_id=lambda: guest.boot_id,
+        read_booted_at=lambda: BOOTED_AT,
     )
     first.consume("central:" + "a" * 64, 1_900_000_000.0)
+    assert guest.rtmr.value == RTMR3_CONSUMED
     assert cmd_worker_serve(_args(tmp_path, *_full_flags(tmp_path))) == 0
     startup = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert startup["tee_box"]["boot"]["consumed"] is True
+    assert startup["tee_box"]["boot"]["rtmr3_extended"] is True
+    assert len(guest.rtmr.extends) == 1  # the restarted worker does not extend again
     api = _FakeServer.calls[0]["tee_box_api"]
     with pytest.raises(RelaunchRequired):
         api.boot.check("central:" + "b" * 64)

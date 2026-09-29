@@ -30,7 +30,7 @@ from cathedral.tee_box import (
     build_egress_policy,
     route_scope,
 )
-from cathedral.tee_box.boot import BootGuard
+from cathedral.tee_box.boot import BootGuard, rtmr_extend
 from cathedral.tee_box.executor import ExecResult
 from cathedral.worker import WorkerServer
 from tests.test_validator_access import WORKER_HOTKEY, _tls_contexts
@@ -145,24 +145,65 @@ def _push_revocations(api: TeeBoxSandboxApi, document=None) -> None:
 BOOTED_AT = 1_899_990_000
 
 
+class _FakeRtmr:
+    """RTMR3 of a fake TD: extends as TDG.MR.RTMR.EXTEND does."""
+
+    def __init__(self) -> None:
+        self.value = bytes(48)
+        self.extends: list[bytes] = []
+        self.fail: Exception | None = None
+        self.fail_after_landing = False
+        self.unreadable = False
+
+    def read(self) -> bytes:
+        if self.unreadable:
+            raise OSError("no such file")
+        return self.value
+
+    def extend(self, digest: bytes) -> None:
+        self.extends.append(digest)
+        if self.fail is not None and not self.fail_after_landing:
+            raise self.fail
+        self.value = rtmr_extend(self.value, digest)
+        if self.fail is not None:
+            raise self.fail
+
+
 class _BootIds:
-    """An injectable kernel boot id; ``relaunch`` stands for a new boot."""
+    """An injectable kernel boot id and RTMR3; ``relaunch`` stands for a new boot."""
 
     def __init__(self) -> None:
         self.value = str(uuid.uuid4())
+        self.rtmr = _FakeRtmr()
 
     def __call__(self) -> str:
         return self.value
 
     def relaunch(self) -> None:
         self.value = str(uuid.uuid4())
+        self.rtmr = _FakeRtmr()
+
+
+class _CurrentRtmr:
+    """Follows ``boot_ids.rtmr``, which a relaunch replaces."""
+
+    def __init__(self, boot_ids: _BootIds) -> None:
+        self.boot_ids = boot_ids
+
+    def read(self) -> bytes:
+        return self.boot_ids.rtmr.read()
+
+    def extend(self, digest: bytes) -> None:
+        self.boot_ids.rtmr.extend(digest)
 
 
 def _boot(boot_ids=None, marker=None, clock=None) -> BootGuard:
     kwargs = {} if clock is None else {"clock": clock}
+    boot_ids = boot_ids or _BootIds()
     return BootGuard(
         None if marker is None else str(marker),
-        read_boot_id=boot_ids or _BootIds(),
+        rtmr=_CurrentRtmr(boot_ids),
+        read_boot_id=boot_ids,
         read_booted_at=lambda: BOOTED_AT,
         **kwargs,
     )
@@ -323,6 +364,8 @@ def test_every_v1_route_maps_to_the_executor(box: _Box):
         "consumed_by_caller": False,
         "needs_relaunch": False,
         "last_released_at": None,
+        "rtmr3": "00" * 48,
+        "rtmr3_extended": False,
     }
 
     _lease_and_image(box)
