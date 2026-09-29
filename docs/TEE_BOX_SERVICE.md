@@ -561,16 +561,38 @@ The owner approves one image; the pair cannot be listed unpaired or
 mismatched. The profile's own `measurements` must equal exactly the derived
 values of its images, so the registry's other readers (`to_policy`, the
 verifier's own allowlist) see the same set. A release that breaks this is
-refused before the high-water mark moves. The entry also exposes MRCONFIGID,
-which fixes the central-access root (see "Caller authorization"). A
-TD_ATTRIBUTES with the debug bit set is refused.
+refused before the high-water mark moves. A TD_ATTRIBUTES with the debug bit
+set is refused.
+
+**MRCONFIGID.** Every TDX image must bind a central-access root (see "Caller
+authorization"): `root_digest_from_mrconfigid`
+(`cathedral/tee_box/measured_root.py:112`) must accept it, that is SHA-256
+of the root key file followed by 16 zero bytes, and not zero. An image with
+no root binding is refused. `accept_release(expected_root_digest=)`, and the
+export's `--expected-root-digest`, also pin which root.
+
+**Security controls.** A TEE box `cpu_tdx` profile is still a `cpu_tdx`
+profile, and `to_policy` requires every eligible one to share min_tcb, TCB
+statuses, advisories and firmware. A release where `to_policy` raises is
+refused, so a box profile can never break worker admission. Those controls
+are the pinned verifier's to apply: `verifier_policy(release)` is its strict
+`Policy` from the same release, and the prober verifies a box's quote with
+it. `admission.admit` does not recheck them: it has no input for them, and
+checks only that the verdict is a complete strict verification. A caller
+that verifies with another policy is not held to the list's controls.
 
 **What each consumer calls.**
 
 - `accept_release(data, trusted_keys, state)` verifies the signature with the
   trusted owner keys, the validity window and staleness, validates every TEE
-  box entry, then `state.accept` refuses a lower or equivocated release. Only
-  it makes an `AcceptedRelease`; the functions below refuse anything else.
+  box entry and the worker policy, then `state.accept` refuses a lower or
+  equivocated release. Its `before_commit` callback runs inside that
+  transaction after every check and before the commit
+  (`PolicyRegistryState.accept(before_commit=)`), so anything published from
+  the release is written before the high-water mark moves, and a failure
+  records nothing. Only it makes an `AcceptedRelease`; the functions below
+  refuse anything else.
+- `verifier_policy(release)` is the verifier's strict `Policy` (above).
 - `measurement_policy(release, kind=, mode=)` is the `MeasurementPolicy`
   `admission.admit` takes. It lists both values of each eligible TEE box
   image, and only TEE box images: a worker image approved for other CPU work
@@ -590,7 +612,7 @@ cathedral policy-registry export-measurement-policy \
   --registry registry.json --trusted-keys keys.json \
   --trusted-keys-digest sha256:<hex of keys.json> \
   --state /var/lib/cathedral/measurement-mirror.sqlite3 --min-release <n> \
-  --mode shadow --out tdx-measurement-policy.json
+  --mode shadow --scope all --out tdx-measurement-policy.json
 ```
 
 It writes #256's policy file (`{"schema", "mode", "allowed_measurements"}`,
@@ -601,9 +623,31 @@ policy file by its SHA-256. That is the `policy_digest` #256 logs and puts in
 its evidence, so a validator's reported digest names the release it mirrors;
 for the same release and mode, admission records the same digest. `--kind
 sev_snp` writes the sandbox's SNP schema instead (the validator's SNP policy
-is a different, per-generation format). `--all-profiles` also lists the other
-eligible CPU profiles of the kind, for while the validator still gates
-non-box miners. The mode is the operator's flag, not part of the signed list.
+is a different, per-generation format).
+
+- **`--scope` is required, with no default.** `box` lists only TEE box
+  images; `all` also lists every other eligible CPU profile of the kind. Under
+  enforce, `box` stops paying every non-box TDX miner, so it must be chosen
+  on purpose.
+- **Deny all.** Under enforce with nothing eligible (release 2 revokes the
+  only box profile, say), the file lists one all-zero
+  `tdx-measurement-sha256:` value (96 zero hex for SNP). #256 loads it and
+  it allows no real quote. The old file is not left in place, and not
+  deleted either: #256 refuses an empty enforcing list, and a missing file
+  stops it validating.
+- **Order.** The files are written inside the state's accept transaction:
+  the policy file atomically, then the source record atomically, then the
+  high-water commit. A failed write moves nothing. A crash between the two
+  writes leaves a record whose `policy_digest` does not match the file,
+  which the next export (same or higher release) rewrites.
+- **Rollback without state.** If the state file is lost or recreated, an
+  existing `<out>.source.json` still refuses a lower release, or the same
+  release with another digest. An unreadable record is refused; remove it
+  deliberately to start over.
+- **The mode is the operator's flag, not yet signed.** Once validators read
+  the list directly, the enforce switch belongs in the signed list, for
+  example a per-kind `enforce_from` time in registry metadata, so the owner
+  flips every validator at once.
 
 Install it as #256 documents (`install -o root -g cathedral-validator -m 0440`)
 and restart the validator. The exported file has no expiry of its own:
