@@ -16,7 +16,10 @@ User=root
 Group=root
 EnvironmentFile=/etc/cathedral/sn94-snp-miner.env
 ExecStart=/usr/local/sbin/cathedral-run-sn94-snp-miner
-Restart=on-failure
+# Always: the launcher exits 143 after a docker daemon restart, which
+# SuccessExitStatus counts as clean, so on-failure would leave the miner
+# stopped. Only `systemctl stop` does.
+Restart=always
 RestartSec=15s
 SuccessExitStatus=129 130 143
 TimeoutStopSec=30s

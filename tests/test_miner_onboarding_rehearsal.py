@@ -87,7 +87,7 @@ def test_public_readme_scopes_the_rehearsal_and_help_path():
     assert "scripts/rehearse_sn94_miner.py" in readme
     assert "for run in 1 2 3" in readme
     assert "loopback with clearly synthetic TDX and SEV-SNP evidence" in readme
-    assert "0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255" in readme
+    assert "d477a68dffe1213ef31c86248dbc12bd1c10508cf3cf0d591694cff1ce16eda0" in readme
     assert "The published image pin\ndoes not prove" in readme
     assert "https://github.com/cathedralai/cathedral-sandbox/issues" in readme
     assert "Do not paste a coldkey, seed phrase, wallet file" in readme

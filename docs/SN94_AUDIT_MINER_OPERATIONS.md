@@ -6,14 +6,14 @@ repository [README](../README.md).
 ## Current image
 
 ```text
-Source: 78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
-Image: ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99
+Source: a66d7c4ca970487026c130610ee9efefa0416a07
+Image: ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:e7f8b1b2d8ffb3f7a3a2f006e39d036c7631ae0fb01e7e30d56f483f25dd8503
 Platform: linux/amd64
 Listener: native TLS on TCP 8081
 ```
 
 GitHub Actions run
-[`33266307118`](https://github.com/cathedralai/cathedral-sandbox/actions/runs/33266307118)
+[`36380135854`](https://github.com/cathedralai/cathedral-sandbox/actions/runs/36380135854)
 published this digest with build provenance. Publication proves the image
 artifact exists. It does not prove a miner is online or receiving weight.
 
