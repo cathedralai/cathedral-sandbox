@@ -1,11 +1,13 @@
-# TEE box sandbox service (T6a, T6b1, T7, T8)
+# TEE box sandbox service (T6a, T6b1, T7, T8, T9)
 
 Status: **off by default**. T6a added the library, and T6b1 adds the worker
 flags, the egress enforcer, in-sandbox exec kills, disk quotas and an opt-in
 runsc image layer. T7 moves caller authorization to central access, with the
 root keys in measured state (see "Caller authorization"). T8 keeps writable
 storage in guest memory or on dm-crypt with integrity, and starts images by
-content address (see "Storage (T8)"). Nothing here has
+content address (see "Storage (T8)"). T9 serves one customer per boot: the
+VM is relaunched between customers (see "Relaunch between customers (T9)").
+Nothing here has
 run on TDX or SEV-SNP hardware yet; that is T6b2 (see "Not done" below). The design is `TEE_BOX.md` on PR #236, branch
 `docs/tee-box-design` (sections 2 to 4 and "Owner decisions for v1").
 Citations are `file:line` in this repository.
@@ -86,28 +88,32 @@ Citations are `file:line` in this repository.
 
   `deny_all` maps to `--network none`, and `internet` maps to the sandbox
   bridge.
-- **Customer lease** (`cathedral/tee_box/lease.py:57`). One central caller
+- **Customer lease** (`cathedral/tee_box/lease.py:75`). One central caller
   key holds the box at a time. The caller is `central:` plus the sha256 of
   the delegated central key, so it stays the same when the root re-delegates
   that key.
   - A lease lasts 60 s to 24 h and can be renewed.
   - Every other caller gets `409` with reason `box_busy`. A caller with no
     lease gets `409` with reason `lease_required`.
+  - Once a lease has been granted in a boot, a different caller also needs
+    the VM relaunched: after the lease ends it gets `409` with reason
+    `relaunch_required` (see "Relaunch between customers (T9)"). The drain
+    below still runs, and still gates the same customer's next lease.
   - **Drain guarantee.** Release or expiry
-    (`cathedral/tee_box/lease.py:95`) ends the lease and drains it
-    (`cathedral/tee_box/service.py:342`). The drain deletes the customer's
+    (`cathedral/tee_box/lease.py:117`) ends the lease and drains it
+    (`cathedral/tee_box/service.py:354`). The drain deletes the customer's
     sandboxes and then sweeps every untracked box container. It succeeds
     only when none of the customer's sandboxes is still listed and the sweep
     reports nothing left.
   - Until the drain succeeds, the box is **draining**. Every lease request
     and every sandbox call, from the old customer or a new one, gets `409`
-    with reason `box_draining` (`cathedral/tee_box/lease.py:159`).
+    with reason `box_draining` (`cathedral/tee_box/lease.py:191`).
   - The drain runs outside the lease lock, because the box is already
-    marked draining (`cathedral/tee_box/lease.py:102`). A slow container
+    marked draining (`cathedral/tee_box/lease.py:132`). A slow container
     daemon therefore holds up only the call that runs the drain.
   - Ordinary calls retry the drain at most every 2 s. The reaper retries it
-    on every tick (`cathedral/tee_box/service.py:383`).
-  - **A worker starts draining** (`cathedral/tee_box/lease.py:91`). A new
+    on every tick (`cathedral/tee_box/service.py:395`).
+  - **A worker starts draining** (`cathedral/tee_box/lease.py:113`). A new
     process does not know what an earlier one left running. So no customer
     is leased the box until the first sweep reports that none of the box's
     labelled containers remain and none are pending cleanup. A restart
@@ -126,15 +132,15 @@ Citations are `file:line` in this repository.
     when `rm` succeeds or the daemon reports the container missing
     (`cathedral/tee_box/executor.py:1047`).
   - A create holds the lease lock, so a drain cannot miss it
-    (`cathedral/tee_box/service.py:720-721`).
+    (`cathedral/tee_box/service.py:757-758`).
   - A worker thread runs every 5 s, and once at start
     (`cathedral/worker.py:1462`). It checks expiry, retries the drain, and
     sweeps orphans.
-- **API** (`cathedral/tee_box/service.py:308`). The routes are listed in
-  `cathedral/tee_box/service.py:82`, and the central-access scope each needs
-  in `cathedral/tee_box/service.py:117`. Only `GET /v1/box`, the revocation
+- **API** (`cathedral/tee_box/service.py:314`). The routes are listed in
+  `cathedral/tee_box/service.py:88`, and the central-access scope each needs
+  in `cathedral/tee_box/service.py:123`. Only `GET /v1/box`, the revocation
   push and the lease routes run without a lease
-  (`cathedral/tee_box/service.py:461`).
+  (`cathedral/tee_box/service.py:473`).
 
 | Call | Route | Scope |
 |---|---|---|
@@ -153,17 +159,17 @@ Citations are `file:line` in this repository.
 v1 has no snapshot, fork, port or Docker-in-Docker routes.
 
 Every sandbox reports `"hardware": "standard"`
-(`cathedral/tee_box/service.py:418`). Exec takes `env`, `user`, `cwd` and
+(`cathedral/tee_box/service.py:430`). Exec takes `env`, `user`, `cwd` and
 `timeout_seconds`. Background execs may run up to 14,400 s
-(`cathedral/tee_box/service.py:65-66`).
+(`cathedral/tee_box/service.py:71-72`).
 
 A create is admitted only while the sum of sandbox shapes fits the configured
 capacity. Otherwise it gets `409` with reason `box_capacity_full`
-(`cathedral/tee_box/service.py:726`), the reason Harbor already waits on.
+(`cathedral/tee_box/service.py:763`), the reason Harbor already waits on.
 
 `GET /v1/box` lists the network modes the box offers now, and its `egress`
 object says whether the egress rules are enforced, with the last error
-(`cathedral/tee_box/service.py:522`).
+(`cathedral/tee_box/service.py:550`).
 
 ## Caller authorization
 
@@ -203,7 +209,7 @@ state".
   - Nothing reads the root, its digest or MRCONFIGID from a flag, an
     environment variable or a writable config file. A missing device, a
     zero or malformed MRCONFIGID, or a file that does not match refuses
-    startup (`cathedral/tee_box/configure.py:296`). The startup line reports
+    startup (`cathedral/tee_box/configure.py:303`). The startup line reports
     the root digest and key ids.
 - **Delegations and scopes.** The offline root signs a delegation of at most
   24 h naming one central key, the subnet (`--validator-network` and
@@ -217,7 +223,7 @@ state".
   target (query included, so file paths are covered), the body digest, a
   nonce, the worker hotkey, the subnet and the worker's TLS key.
 - **Worker.** The worker maps the method and target to a scope with
-  `route_scope` (`cathedral/tee_box/service.py:174`). Before it reserves a
+  `route_scope` (`cathedral/tee_box/service.py:180`). Before it reserves a
   slot or reads the body, it verifies the delegation against the measured
   root, its expiry, its scope and the revocation list, then the request's
   signature and expiry (`cathedral/worker.py:511`). After the body is read,
@@ -231,7 +237,7 @@ state".
   (`cathedral/worker.py:1357-1364`).
 - **Revocation list.** State starts empty on a fresh box, so the control
   plane pushes the root-signed revocation list to `POST /v1/box/revocations`
-  after every start (`cathedral/tee_box/service.py:578`). Until it has, only
+  after every start (`cathedral/tee_box/service.py:607`). Until it has, only
   `GET /v1/box` and the push are served; every other route gets `409` with
   reason `revocation_list_required`. A list older than the one in force, a
   different list under the same sequence, or one the root did not sign is
@@ -289,10 +295,167 @@ state".
   signature, a signature over a different method, target or body, a replay,
   and an unknown route.
 
+## Relaunch between customers (T9)
+
+Owner decision 1, amended 2026-09-29: the confidential VM is relaunched and
+re-attested between customer allocations, so a gVisor escape by one customer
+cannot persist into the next. The design is `TEE_BOX.md` on PR #236,
+decisions 1 and 8 and sections 4 to 6. The box enforces its half: **one
+customer per boot** (`cathedral/tee_box/boot.py:128`). Admission can refuse
+evidence from before the last release (docs/CAPACITY.md, "Admission"). The
+relaunch itself, and the checks that it happened, belong to the miner's host
+and the control plane.
+
+### Lifecycle
+
+1. **Boot.** The appliance boots with a new tmpfs (so empty central state and
+   no boot record), a new dm-crypt key for scratch, and a new TLS key. The
+   worker starts draining and sweeps (see "Drain guarantee"). `GET /v1/box`
+   reports the new `boot.boot_id` and `boot.booted_at`, with `consumed` and
+   `needs_relaunch` false. Until a revocation list is pushed, only
+   `GET /v1/box` and the push are served.
+2. **Re-attest.** The control plane (or the prober) attests the box on a new
+   connection, with a fresh nonce, and calls `admit(...,
+   last_released_at=...)` with the previous boot's release time. It also
+   checks what the box itself cannot prove (see "What the checks show"): the
+   `boot_id` differs from the previous boot's, `booted_at` is after the
+   previous `last_released_at`, and the TLS SPKI differs from the one it
+   pinned for the previous allocation.
+3. **Revocations push.** The control plane pushes the current revocation list
+   (see "Revocation list"). Only now are the lease and sandbox routes served.
+4. **Available.** The control plane routes one customer to the box.
+5. **Lease.** The customer's first lease records it as this boot's customer
+   before the lease is granted (`cathedral/tee_box/lease.py:197`). The same
+   customer may renew, release and lease again.
+6. **Release.** Release or expiry ends the lease and drains it, as before.
+   The box now reports `needs_relaunch: true` and `last_released_at`. Every
+   other caller gets `409` with reason `relaunch_required`, on
+   `POST /v1/lease` and on every sandbox route
+   (`cathedral/tee_box/lease.py:126`, `cathedral/tee_box/service.py:487`),
+   however long it waits. While the lease is live, other callers still get
+   `box_busy`.
+7. **Relaunch.** The control plane asks the miner to relaunch the VM, and
+   waits until `GET /v1/box` shows a new `boot_id`. Then back to step 1.
+
+### Who counts as one customer
+
+- The caller is `central:` plus the sha256 of the delegated central key (see
+  "Customer lease"). So the control plane must give each customer its own
+  central key, and should give each allocation its own. One key shared by
+  two customers makes them one customer to the box, and the guard cannot
+  separate them.
+- **Same customer, no relaunch.** The owner asked for a relaunch between
+  customers, so the caller that consumed the boot may lease again after a
+  release or an expiry, without a relaunch. A gVisor escape during its own
+  earlier lease then reaches only its own later lease.
+- **Key rotation.** Re-delegating the same central key keeps the caller the
+  same. Rotating to a new central key in the middle of an allocation makes a
+  new caller, which gets `relaunch_required` once the old key's lease has
+  ended. Rotate central keys between allocations, not during one.
+
+### The boot record
+
+- **Where.** In memory, and in `<central state>.boot`, next to
+  `--tee-box-central-state` on the same tmpfs
+  (`cathedral/tee_box/configure.py:315-318`). The storage check covers the
+  file like the SQLite side files. A worker restart within one boot keeps
+  it; a relaunch empties the tmpfs.
+- **Keyed to the boot.** It names the `boot_id` from
+  `/proc/sys/kernel/random/boot_id` it was written in. A file for another
+  boot id is ignored (`cathedral/tee_box/boot.py:181`), and the boot id is
+  read again on every check (`cathedral/tee_box/boot.py:246`), so a file that
+  somehow survived a relaunch does not carry over.
+- **Written first.** The customer is recorded (owner-only, written to a
+  temporary file and renamed) before its first lease is granted. If the
+  write fails, the lease is refused with `503` and reason
+  `boot_record_unavailable`, and nothing is recorded
+  (`cathedral/tee_box/boot.py:272`).
+- **Fails closed.** A record that cannot be read or parsed, or a symlink,
+  counts as consumed by an unknown caller: every caller gets
+  `relaunch_required` until the next boot. So does a boot id that can no
+  longer be read. The worker refuses to start if the boot id or the boot
+  time cannot be read at all.
+- **Restart with a live lease.** A worker that restarts loses its lease
+  table. The record keeps the customer, and `last_released_at` becomes the
+  restart time, since the lease ended no later than that.
+
+`GET /v1/box` now has a `boot` object (`cathedral/tee_box/boot.py:301`):
+
+| Field | Meaning |
+|---|---|
+| `boot_id` | the kernel's boot id, or `null` when it cannot be read |
+| `booted_at` | `btime` from `/proc/stat`, epoch seconds, by the guest clock |
+| `consumed` | a customer has leased the box in this boot |
+| `consumed_by_caller` | that customer is the caller |
+| `needs_relaunch` | consumed and no lease is live: no other customer until a relaunch |
+| `last_released_at` | when the customer's last lease ended, epoch seconds rounded up, or `null` |
+
+`DELETE /v1/lease` also returns `needs_relaunch`.
+
+### No reboot route
+
+The box offers no route for the control plane to reboot the guest:
+
+- **It would not relaunch anything.** TDX has no in-place TD reset: a guest
+  reboot ends the TD, and only the host's VMM can build a new one. SEV-SNP is
+  the same. The miner's host has to act anyway, and a reboot request from the
+  guest proves nothing. The control plane still has to see a new boot id and
+  attest again.
+- **It adds a privileged action to the network API.** A leaked delegation
+  with that scope could take boxes down. The guard already stops the next
+  customer until the relaunch happens, and the prober cannot probe the box
+  until then either (see below), so the miner has a reason to relaunch.
+- **Unknown behaviour.** What the VMM does on a guest reboot of a TD (stop,
+  or rebuild) depends on the host's QEMU and must be qualified on hardware.
+
+### What the checks show, and the boot binding
+
+- **REPORT_DATA does not bind the boot.** The quote binds
+  `report_data_v2(nonce, miner_hotkey, TLS SPKI)` (`cathedral/common.py:260`):
+  a domain tag, version 2 and exactly four fields, byte for byte what
+  cathedral-validator's `collect.py`, admission (#240) and receipt evidence
+  (#237) recompute. Adding the boot id would change the hash, so it needs a
+  new REPORT_DATA version on every side. It is not added here.
+- **The boot id would not help much anyway.** It is chosen by the guest
+  kernel. A tenant that escapes gVisor reaches that kernel for the rest of
+  its allocation (design section 4, "Residual risk"). It can then rewrite the
+  boot record, report any `boot_id` and `booted_at`, make a new TLS key, and
+  ask for quotes over any REPORT_DATA. The fresh nonce already shows that a
+  quote was made after the nonce was drawn; a boot id in REPORT_DATA would
+  show nothing more.
+- **What the box-side guard does.** It stops a box whose guest kernel is
+  intact from serving a second customer without a relaunch: a miner that
+  restarts only the worker, or skips the relaunch, gets
+  `relaunch_required`.
+- **What the control-plane checks do.** A new `boot_id`, `booted_at` after
+  the release, a new SPKI and evidence verified after the release catch a
+  miner that did not relaunch, as long as the guest kernel is intact. The
+  new SPKI holds only if the appliance makes its TLS key at boot, in guest
+  memory. Today the worker reads `--tls-private-key` from a file; the
+  appliance boot step must generate it on tmpfs at each boot (T6b2).
+- **What would show a relaunch after an escape: not built.** A value the
+  guest cannot reset without a relaunch. For example, on TDX the box could
+  extend an RTMR once, when a boot's first lease is granted. Any quote from a
+  consumed boot would then carry a measurement that is not on the published
+  list, and admission would refuse it until the VM is relaunched. The
+  Cathedral measurement covers the RTMRs (`cathedral/verify/tdx_quote.py:91-104`).
+  This conflicts with the design's proposal of no RTMR3 extends, and must be
+  qualified on hardware. It is an open question for the design.
+
+### The probe consumes a boot
+
+The prober leases the box like any caller, with its own central key. Under
+this guard, a probe consumes the boot too, so a box probed after a relaunch
+needs a second relaunch before a customer. The design's natural slot for the
+probe (right after the relaunch, before the next allocation, design section
+5) therefore costs two relaunches per customer, unless the probe does not
+count as a customer. That needs the box to recognise the prober, for example
+by a root-delegated scope, which central access does not have. Open.
+
 ## How to enable it (T6b1)
 
 `cathedral worker serve` (TDX) and `cathedral worker serve-snp` take the TEE
-box flags (`cathedral/tee_box/configure.py:98`, registered at
+box flags (`cathedral/tee_box/configure.py:99`, registered at
 `cathedral/cli.py:4479` and `:4503`). The development, migration and GPU
 commands do not offer them.
 
@@ -314,7 +477,7 @@ No flag names the callers or their root keys; see "Caller authorization".
 - **All or nothing.** With no TEE box flag, the worker passes no API and
   serves no sandbox routes. Giving any flag, even an optional one, requires
   every required flag and one address source, or the worker refuses to
-  start (`cathedral/tee_box/configure.py:171`, called at
+  start (`cathedral/tee_box/configure.py:172`, called at
   `cathedral/cli.py:1391`).
 - **Attested TLS only.** The flags need `--tls-certificate` and
   `--tls-private-key` (`cathedral/cli.py:1397`). The API then binds the
@@ -324,16 +487,18 @@ No flag names the callers or their root keys; see "Caller authorization".
   plus the `--public-endpoint` host when it is an IP literal. On a cloud
   guest behind 1:1 NAT the public address is not on an interface, so pass
   it with `--tee-box-address` instead.
-- **Startup refuses** (`cathedral/tee_box/configure.py:257`) when the root
-  key file does not match the measured binding, or on SEV-SNP (`:300`);
-  when the central state is not on tmpfs or ramfs, or any swap is on (`:301-307`); when the central state is unusable (`:308-318`); when
+- **Startup refuses** (`cathedral/tee_box/configure.py:258`) when the root
+  key file does not match the measured binding, or on SEV-SNP (`:307`);
+  when the central state is not on tmpfs or ramfs, or any swap is on (`:308-314`); when
+  the kernel's boot id or boot time cannot be read (`:315-318`, see "Relaunch between
+  customers (T9)"); when the central state is unusable (`:319-329`); when
   the daemon does not register the runtime at the runtime path with
-  `--platform=systrap` (`:336`); when Docker's data root is neither in guest
-  memory nor on dm-crypt with integrity (`:337-341`); or when disk quotas
-  are unsupported without `--tee-box-no-disk-quota` (`:342-350`). No flag
+  `--platform=systrap` (`:347`); when Docker's data root is neither in guest
+  memory nor on dm-crypt with integrity (`:348-352`); or when disk quotas
+  are unsupported without `--tee-box-no-disk-quota` (`:353-361`). No flag
   relaxes the storage checks (see "Storage (T8)").
 - **Startup does not refuse** when the egress rules fail to apply
-  (`:351`). The box then serves `deny_all` only, and the startup line's
+  (`:362`). The box then serves `deny_all` only, and the startup line's
   `tee_box.egress` field reports the error. The egress thread re-applies
   every 60 s, and reads an applied table back every 5 s.
 
@@ -522,7 +687,7 @@ and `serve-snp`), so every check below applies whenever the box is enabled,
 and no flag relaxes it. `FakeExecutor`, the library API used directly, and
 every worker without the TEE box flags are unaffected. The checks are in
 `cathedral/tee_box/storage.py`, each probe injectable (`StorageProbe`,
-`:118`) for tests; startup reports what it found in `tee_box.storage`.
+`:119`) for tests; startup reports what it found in `tee_box.storage`.
 
 ### Images: started by content address
 
@@ -563,7 +728,7 @@ every worker without the TEE box flags are unaffected. The checks are in
   yet, so v1 still imports from a registry.
 - The containerd image store (`driver-type io.containerd.snapshotter.v1`)
   keeps content outside the data root, so the worker refuses it
-  (`cathedral/tee_box/storage.py:406`). The reasoning above is for the
+  (`cathedral/tee_box/storage.py:407`). The reasoning above is for the
   classic graphdriver store. Recent Docker releases enable the containerd
   store by default on new installs, so the appliance sets
   `"features": {"containerd-snapshotter": false}` in `daemon.json`.
@@ -585,18 +750,19 @@ process memory already.
   relaunch, and the host cannot roll back guest memory. The state class
   also refuses `:memory:` by design: its lock file keeps an operator reset
   and a running worker apart.
-- **Check** (`cathedral/tee_box/storage.py:153`, called at
-  `cathedral/tee_box/configure.py:304` before the state is opened, since
+- **Check** (`cathedral/tee_box/storage.py:154`, called at
+  `cathedral/tee_box/configure.py:311` before the state is opened, since
   opening creates it): statfs(2) must report tmpfs (`0x01021994`) or ramfs
   (`0x858458f6`) for the state's directory, before and after resolving
-  symlinks, and for every existing state file, its `.lock` and its SQLite
-  `-journal`, `-wal` and `-shm` files. A missing directory refuses: mount
+  symlinks, and for every existing state file, its `.lock`, its SQLite
+  `-journal`, `-wal` and `-shm` files, and the boot record `.boot` (see
+  "Relaunch between customers (T9)"). A missing directory refuses: mount
   the tmpfs before the worker starts.
 - **Why not dm-crypt for state.** Its sector tags do not stop the host
   replaying an older version of a sector written under the same key, which
   would roll the file back within one boot.
 - **Swap.** tmpfs pages can be swapped out, so the worker refuses while
-  any swap is on (`require_no_swap`, `cathedral/tee_box/configure.py:305`):
+  any swap is on (`require_no_swap`, `cathedral/tee_box/configure.py:312`):
   `/proc/swaps` must hold only its header line. That includes swap on
   dm-crypt, which would bring the sector replay back, and zram, whose
   `backing_dev` writes idle pages to a disk in the clear. No device or file
@@ -610,7 +776,7 @@ the upper layer in a file in the container's root directory), and `files`
 and `tar` uploads, which go through `docker exec` into that overlay; so do
 the imported layers. The worker asks the daemon for `DockerRootDir`
 (`cathedral/tee_box/executor.py:1014`) and refuses
-(`cathedral/tee_box/storage.py:390`) unless the mount serving it, and every
+(`cathedral/tee_box/storage.py:391`) unless the mount serving it, and every
 mount below it in `/proc/self/mountinfo`, is either of the two kinds below.
 The serving mount is found by device, not by path: the last listed mount
 whose major:minor is the `st_dev` that stat(2) reports for the data root,
@@ -718,6 +884,15 @@ Before its Docker daemon and worker start, the appliance boot must:
   (see "Revocation list").
 - **Signed high-water floor.** See the proposed `min_delegation_sequence`
   follow-up for #241 under "Revocation list".
+- **Relaunch between customers (T9).** The control plane must: ask the miner
+  to relaunch after `needs_relaunch`; admit again with `last_released_at`;
+  check the new `boot_id`, `booted_at` and SPKI; push revocations; and give
+  each customer (better, each allocation) its own central key. The appliance
+  boot step must make the TLS key at boot on tmpfs. On hardware, T6b2 must
+  measure relaunch-to-admission time against the design's 5 minute target,
+  and show what the host's VMM does on a guest reboot. Open: whether a
+  probe should consume a boot, and an RTMR extend as proof of relaunch (see
+  "What the checks show, and the boot binding").
 
 - **Hardware qualification.** Nothing has run on real TDX or SNP guests:
   not runsc with systrap under a TD or an SNP guest, not gVisor's
