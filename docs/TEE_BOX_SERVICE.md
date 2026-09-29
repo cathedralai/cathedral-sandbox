@@ -522,7 +522,7 @@ and `serve-snp`), so every check below applies whenever the box is enabled,
 and no flag relaxes it. `FakeExecutor`, the library API used directly, and
 every worker without the TEE box flags are unaffected. The checks are in
 `cathedral/tee_box/storage.py`, each probe injectable (`StorageProbe`,
-`:93`) for tests; startup reports what it found in `tee_box.storage`.
+`:115`) for tests; startup reports what it found in `tee_box.storage`.
 
 ### Images: started by content address
 
@@ -563,7 +563,7 @@ every worker without the TEE box flags are unaffected. The checks are in
   yet, so v1 still imports from a registry.
 - The containerd image store (`driver-type io.containerd.snapshotter.v1`)
   keeps content outside the data root, so the worker refuses it
-  (`cathedral/tee_box/storage.py:330`). The reasoning above is for the
+  (`cathedral/tee_box/storage.py:403`). The reasoning above is for the
   classic graphdriver store. Recent Docker releases enable the containerd
   store by default on new installs, so the appliance sets
   `"features": {"containerd-snapshotter": false}` in `daemon.json`.
@@ -585,7 +585,7 @@ process memory already.
   relaunch, and the host cannot roll back guest memory. The state class
   also refuses `:memory:` by design: its lock file keeps an operator reset
   and a running worker apart.
-- **Check** (`cathedral/tee_box/storage.py:127`, called at
+- **Check** (`cathedral/tee_box/storage.py:150`, called at
   `cathedral/tee_box/configure.py:304` before the state is opened, since
   opening creates it): statfs(2) must report tmpfs (`0x01021994`) or ramfs
   (`0x858458f6`) for the state's directory, before and after resolving
@@ -610,7 +610,7 @@ the upper layer in a file in the container's root directory), and `files`
 and `tar` uploads, which go through `docker exec` into that overlay; so do
 the imported layers. The worker asks the daemon for `DockerRootDir`
 (`cathedral/tee_box/executor.py:1014`) and refuses
-(`cathedral/tee_box/storage.py:316`) unless the mount serving it, and every
+(`cathedral/tee_box/storage.py:387`) unless the mount serving it, and every
 mount below it in `/proc/self/mountinfo`, is either of the two kinds below.
 The serving mount is found by device, not by path: the last listed mount
 whose major:minor is the `st_dev` that stat(2) reports for the data root,
