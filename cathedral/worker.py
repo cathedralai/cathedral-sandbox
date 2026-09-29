@@ -77,6 +77,47 @@ MAX_VALIDATOR_CHALLENGE_CONCURRENT: int = 2
 # no longer lock validators out (review finding W1). Permits stay strict;
 # evicted threads exit on their next read.
 PREAUTH_CONNECTION_HEADROOM: int = 22
+# A signed validator body is at most MAX_REQUEST_BODY and arrives within one
+# round trip. A request still reading its body after this long is stalled, and
+# a new validator may take its slot (review finding W2).
+VALIDATOR_BODY_STALL_SECONDS: float = 1.0
+# The stall grace grows with the declared body at this rate, so a distant
+# validator's large upload is not mistaken for a stall.
+VALIDATOR_BODY_MIN_RATE_BYTES: int = 32 * 1024
+# A validator whose signed request leaves its slot without a complete body
+# (displaced, closed or timed out), or is refused for a client fault (a body
+# its signature does not cover, a replayed nonce, a request that expired in
+# flight), is kept out of the signed class this long, so stalling and
+# reconnecting just inside the grace no longer holds slots.
+VALIDATOR_ABANDON_PENALTY_SECONDS: float = 20.0
+# The bench does not stop a validator that sends valid requests with each
+# body just inside its grace: such a request holds a slot for almost the grace
+# and is never displaced or benched, and the rate limit allows about two a
+# second, so two hotkeys doing it used to lock a third out of a class of two.
+# Each hotkey therefore has a budget of slow slot time. The time a request
+# holds its slot before its body arrives, beyond the first tenth of its grace,
+# is charged to a per-hotkey bucket that holds VALIDATOR_SLOW_SLOT_BUDGET_SECONDS
+# and drains at that much per VALIDATOR_SLOW_SLOT_WINDOW_SECONDS. While its
+# bucket is over the budget, a hotkey's request that is still waiting for its
+# body is displaced at once by another validator arriving at a full class,
+# without a bench. A validator that sends its body within a tenth of its
+# grace (about 0.1 s for a small body, 0.3 s for a 64 KiB one) is never
+# charged, so it is never displaced before its grace.
+#
+# What remains is the uncharged tenth and the budget itself. Under the default
+# rate limit a hotkey can hold a slot undisplaceably before its body for about
+# 5 / 60 + 2 * 0.1 * G of the time, where G is its grace: about 0.31 on the
+# small signed routes (G <= 1.125 s) and 0.68 on a 64 KiB sat-work request
+# (G = 3 s). Keeping both slots of the class full that way takes about seven
+# colluding permit holders on the small routes and three on sat-work, where
+# two used to be enough. A request whose body has arrived is served, not
+# displaced: that is rate-limited work, one in flight per hotkey.
+VALIDATOR_SLOW_SLOT_BUDGET_SECONDS: float = 5.0
+VALIDATOR_SLOW_SLOT_WINDOW_SECONDS: float = 60.0
+VALIDATOR_PROMPT_GRACE_FRACTION: float = 0.1
+# Signed evidence, fleet and capabilities bodies are a few hundred bytes; only
+# sat-work may declare up to the body cap and so earn a longer grace.
+SMALL_SIGNED_BODY_BYTES: int = 4096
 MAX_HOTKEY_LENGTH: int = 256
 MAX_BEARER_TOKEN_LENGTH: int = 4096
 MAX_CUSTOMER_SAT_SOLVE_SECONDS: float = 30.0
@@ -283,11 +324,240 @@ class _DeadlineWriter(io.BufferedIOBase):
         return total
 
 
+class _ValidatorSlot:
+    """One signed request's place in the validator class.
+
+    Its life has three marks. ``mark_body_received`` records a complete,
+    full-length body: the stall clock stops and the slot can no longer be
+    displaced, so a slow ``finalize`` (a synchronous replay-store write) never
+    costs an honest validator its slot. ``mark_client_fault`` records a
+    refusal that is the validator's fault: a body its signature does not
+    cover, a replayed nonce or a request that expired in flight.
+    ``mark_verified`` records that ``finalize`` accepted the body. On release
+    the validator is benched only for a client fault: no complete body, or a
+    refusal marked as one. A refusal on the worker's side (replay store full
+    or failing, snapshot unavailable) does not bench an honest validator.
+    """
+
+    __slots__ = (
+        "pool",
+        "connection",
+        "hotkey",
+        "admitted_at",
+        "grace",
+        "body_received",
+        "client_refused",
+        "verified",
+        "charged",
+        "owned",
+    )
+
+    def __init__(
+        self,
+        pool: "_ValidatorPool",
+        connection: socket.socket,
+        hotkey: str,
+        admitted_at: float,
+        grace: float,
+    ) -> None:
+        self.pool = pool
+        self.connection = connection
+        self.hotkey = hotkey
+        self.admitted_at = admitted_at
+        self.grace = grace
+        self.body_received = False
+        self.client_refused = False
+        self.verified = False
+        self.charged = False
+        self.owned = True
+
+    def mark_body_received(self) -> bool:
+        """Record a complete body; False when the slot was already taken over,
+        in which case the request must stop rather than run over capacity."""
+        with self.pool._lock:
+            if self.owned:
+                self.body_received = True
+                self.pool._charge_locked(self, self.pool._clock())
+            return self.owned
+
+    def mark_client_fault(self) -> None:
+        with self.pool._lock:
+            self.client_refused = True
+
+    def mark_verified(self) -> None:
+        with self.pool._lock:
+            self.verified = True
+
+    @property
+    def client_fault(self) -> bool:
+        return not self.verified and (not self.body_received or self.client_refused)
+
+    def release(self) -> None:
+        self.pool._release(self)
+
+
+class _ValidatorPool:
+    """The signed-validator request class, fair across validators.
+
+    Each validator is already limited to one request in flight, but the class
+    itself is small and shared, so a few permitted validators stalling their
+    bodies used to hold every slot until the request deadline and turn all
+    other validators away (review finding W2). Three rules close that:
+
+    - when the class is full, a new validator takes the slot of the request
+      that has spent longest reading its body past its grace (one second plus
+      the declared body at VALIDATOR_BODY_MIN_RATE_BYTES per second); a
+      request whose body has been read is never displaced;
+    - a validator whose request leaves its slot without a complete body
+      (stalled, closed, displaced past its grace) or is refused for a client
+      fault is kept out of the class for VALIDATOR_ABANDON_PENALTY_SECONDS, so
+      stalling and reconnecting just inside the grace does not hold slots;
+    - a hotkey over its slow-slot budget (VALIDATOR_SLOW_SLOT_BUDGET_SECONDS)
+      loses the grace: its request still waiting for a body may be displaced
+      at once, without a bench, so valid bodies sent just inside the grace
+      cannot hold the class either.
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        *,
+        stall_seconds: float = VALIDATOR_BODY_STALL_SECONDS,
+        min_rate_bytes: int = VALIDATOR_BODY_MIN_RATE_BYTES,
+        penalty_seconds: float = VALIDATOR_ABANDON_PENALTY_SECONDS,
+        slow_budget_seconds: float = VALIDATOR_SLOW_SLOT_BUDGET_SECONDS,
+        slow_window_seconds: float = VALIDATOR_SLOW_SLOT_WINDOW_SECONDS,
+        prompt_fraction: float = VALIDATOR_PROMPT_GRACE_FRACTION,
+        max_penalized: int = 256,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._capacity = capacity
+        self._stall_seconds = stall_seconds
+        self._min_rate_bytes = min_rate_bytes
+        self._penalty_seconds = penalty_seconds
+        self._slow_budget = slow_budget_seconds
+        self._slow_drain = slow_budget_seconds / slow_window_seconds
+        self._prompt_fraction = prompt_fraction
+        self._max_penalized = max_penalized
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._slots: list[_ValidatorSlot] = []
+        self._penalized_until: dict[str, float] = {}
+        # hotkey -> (charged slow seconds, as of this clock reading)
+        self._slow_usage: dict[str, tuple[float, float]] = {}
+        self.displaced_count = 0
+
+    def penalized(self, hotkey: str) -> bool:
+        with self._lock:
+            return self._penalized_until.get(hotkey, 0.0) > self._clock()
+
+    def slow_usage(self, hotkey: str) -> float:
+        with self._lock:
+            return self._slow_usage_locked(hotkey, self._clock())
+
+    def _slow_usage_locked(self, hotkey: str, now: float) -> float:
+        level, at = self._slow_usage.get(hotkey, (0.0, now))
+        return max(0.0, level - max(0.0, now - at) * self._slow_drain)
+
+    def _slow_seconds(self, slot: _ValidatorSlot, now: float) -> float:
+        """Pre-body slot time beyond the prompt part of the grace."""
+        return max(0.0, now - slot.admitted_at - slot.grace * self._prompt_fraction)
+
+    def _charge_locked(self, slot: _ValidatorSlot, now: float) -> None:
+        if slot.charged:
+            return
+        slot.charged = True
+        slow = self._slow_seconds(slot, now)
+        if slow <= 0.0:
+            return
+        hotkey = slot.hotkey
+        if hotkey not in self._slow_usage and len(self._slow_usage) >= self._max_penalized:
+            drained = [key for key in self._slow_usage if self._slow_usage_locked(key, now) <= 0.0]
+            for key in drained:
+                del self._slow_usage[key]
+            if len(self._slow_usage) >= self._max_penalized:
+                lowest = min(self._slow_usage, key=lambda key: self._slow_usage_locked(key, now))
+                del self._slow_usage[lowest]
+        self._slow_usage[hotkey] = (self._slow_usage_locked(hotkey, now) + slow, now)
+
+    def _displaceable_locked(self, held: _ValidatorSlot, now: float) -> bool:
+        if held.body_received:
+            return False
+        if now - held.admitted_at >= held.grace:
+            return True
+        return (
+            self._slow_usage_locked(held.hotkey, now) + self._slow_seconds(held, now)
+            > self._slow_budget
+        )
+
+    def admit(
+        self, connection: socket.socket, hotkey: str, declared_length: int = 0
+    ) -> _ValidatorSlot | None:
+        now = self._clock()
+        grace = self._stall_seconds + max(0, declared_length) / self._min_rate_bytes
+        slot = _ValidatorSlot(self, connection, hotkey, now, grace)
+        with self._lock:
+            if self._penalized_until.get(hotkey, 0.0) > now:
+                return None
+            if len(self._slots) < self._capacity:
+                self._slots.append(slot)
+                return slot
+            candidates = [held for held in self._slots if self._displaceable_locked(held, now)]
+            if not candidates:
+                return None
+            victim = min(candidates, key=lambda held: held.admitted_at)
+            victim.owned = False
+            self._slots[self._slots.index(victim)] = slot
+            self._charge_locked(victim, now)
+            if now - victim.admitted_at >= victim.grace:
+                # Stalled past its grace. A victim displaced only for being
+                # over its slow-slot budget is not benched.
+                self._penalize_locked(victim.hotkey, now)
+            self.displaced_count += 1
+            # Still under the lock: the victim cannot have released and closed
+            # its socket, so its descriptor cannot have been reused. The raw TCP
+            # shutdown wakes its body read with EOF. This is the same call as
+            # _BoundedThreadingHTTPServer's _shutdown_transport helper where
+            # that exists; swap this block for it when both are present.
+            try:
+                socket.socket.shutdown(victim.connection, socket.SHUT_RDWR)
+            except OSError:
+                pass
+        return slot
+
+    def _penalize_locked(self, hotkey: str, now: float) -> None:
+        if hotkey not in self._penalized_until and len(self._penalized_until) >= self._max_penalized:
+            expired = [key for key, until in self._penalized_until.items() if until <= now]
+            for key in expired:
+                del self._penalized_until[key]
+            if len(self._penalized_until) >= self._max_penalized:
+                oldest = min(self._penalized_until, key=self._penalized_until.__getitem__)
+                del self._penalized_until[oldest]
+        self._penalized_until[hotkey] = now + self._penalty_seconds
+
+    def _release(self, slot: _ValidatorSlot) -> None:
+        with self._lock:
+            if slot.owned:
+                slot.owned = False
+                self._slots.remove(slot)
+                now = self._clock()
+                self._charge_locked(slot, now)
+                if slot.client_fault:
+                    # Closed or timed out before its body, or refused for a
+                    # client fault after it.
+                    self._penalize_locked(slot.hotkey, now)
+
+    @property
+    def in_use(self) -> int:
+        with self._lock:
+            return len(self._slots)
+
+
 def _make_handler(
     semaphore: threading.Semaphore,
     challenge_semaphore: threading.Semaphore,
     sat_challenge_semaphore: threading.Semaphore,
-    validator_challenge_semaphore: threading.Semaphore,
+    validator_pool: _ValidatorPool,
     configured_hotkey: str,
     bearer_token: str | None,
     evidence_collector: Callable[..., Evidence | tuple[Evidence, ...] | list[Evidence]],
@@ -488,13 +758,13 @@ def _make_handler(
                 # evidence pool. Canonical classification needs the parsed
                 # instance. Sharing the evidence pool would let migration SAT
                 # traffic 503 a validator's quote collection.
+                validator_slot = None
                 if preauthorized_validator is not None:
                     # Signed validator control traffic has reserved
                     # request-class capacity after headers are parsed and the
-                    # envelope is authenticated. The earlier connection gate
-                    # is shared by every TLS client and must be protected at
-                    # the network edge in a production deployment.
-                    pool = validator_challenge_semaphore
+                    # envelope is authenticated. A validator stalling its body
+                    # can be displaced by another (see _ValidatorPool).
+                    pool = None
                 elif path == "/v1/sat-work" and bearer_token is not None and auth_ok:
                     pool = semaphore
                 elif path == "/v1/sat-work":
@@ -507,7 +777,30 @@ def _make_handler(
                     pool = challenge_semaphore
                 else:
                     pool = semaphore
-                if not pool.acquire(blocking=False):
+                if pool is None:
+                    assert preauthorized_validator is not None
+                    hotkey = preauthorized_validator.validator_hotkey
+                    if validator_pool.penalized(hotkey):
+                        self._send_json(429, {"error": "validator recently abandoned a request"})
+                        return
+                    # A header whose nonce an accepted request already used
+                    # gets no slot at all. finalize still decides every nonce.
+                    assert validator_authorizer is not None
+                    if validator_authorizer.is_replay(preauthorized_validator):
+                        self._send_json(401, {"error": "unauthorized"})
+                        return
+                    declared = self.headers.get("Content-Length", "")
+                    route_cap = max_body if path == "/v1/sat-work" else SMALL_SIGNED_BODY_BYTES
+                    declared_length = (
+                        min(int(declared), route_cap)
+                        if _DECIMAL_RE.fullmatch(declared or "")
+                        else 0
+                    )
+                    validator_slot = validator_pool.admit(self.connection, hotkey, declared_length)
+                    admitted = validator_slot is not None
+                else:
+                    admitted = pool.acquire(blocking=False)
+                if not admitted:
                     self._send_json(503, {"error": "busy"})
                     return
                 try:
@@ -520,20 +813,33 @@ def _make_handler(
                     if raw is None:
                         self._send_json(error_code, {"error": error_message})
                         return
+                    # A full-length body stops the stall clock before finalize
+                    # writes the replay store, so a slow write cannot get an
+                    # honest validator displaced. A request displaced just
+                    # before its body arrived must stop (see _ValidatorPool).
+                    if validator_slot is not None and not validator_slot.mark_body_received():
+                        return
                     if preauthorized_validator is not None:
                         assert validator_authorizer is not None
-                        if (
-                            validator_authorizer.finalize(
-                                preauthorized_validator,
-                                body=raw,
-                            )
-                            is None
-                        ):
+                        finalized = validator_authorizer.finalize_result(
+                            preauthorized_validator, body=raw
+                        )
+                        if not isinstance(finalized, str):
+                            # A mismatched body, a replay or an expiry is the
+                            # client's fault and benches; a replay-store or
+                            # snapshot refusal is the worker's and does not.
+                            if validator_slot is not None and finalized.client_fault:
+                                validator_slot.mark_client_fault()
                             self._send_json(401, {"error": "unauthorized"})
                             return
+                        if validator_slot is not None:
+                            validator_slot.mark_verified()
                     self._handle_post(raw)
                 finally:
-                    pool.release()
+                    if validator_slot is not None:
+                        validator_slot.release()
+                    elif pool is not None:
+                        pool.release()
             except (socket.timeout, TimeoutError, OSError):
                 try:
                     self._send_json(400, {"error": "request failed"})
@@ -1243,9 +1549,8 @@ class WorkerServer:
         semaphore = _Semaphore(max_concurrent)
         challenge_semaphore = _Semaphore(max_challenge_concurrent)
         sat_challenge_semaphore = _Semaphore(max_sat_challenge_concurrent)
-        validator_challenge_semaphore = _Semaphore(
-            max_validator_challenge_concurrent
-        )
+        validator_pool = _ValidatorPool(max_validator_challenge_concurrent)
+        self._validator_pool = validator_pool
         if isinstance(fleet_endpoints, FleetManifest):
             fleet_source = fleet_endpoints.endpoints
         elif fleet_endpoints is not None:
@@ -1266,7 +1571,7 @@ class WorkerServer:
             semaphore,
             challenge_semaphore,
             sat_challenge_semaphore,
-            validator_challenge_semaphore,
+            validator_pool,
             configured_hotkey,
             bearer_token,
             evidence_collector or collect_tdx,

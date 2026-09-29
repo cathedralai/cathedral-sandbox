@@ -54,7 +54,10 @@ from cathedral.validator_access import (
     VALIDATOR_REQUEST_SCHEMA,
     SignedValidatorSnapshotProvider,
     ValidatorAccessError,
+    ReplayRecord,
+    StaticValidatorSnapshotProvider,
     ValidatorAccessState,
+    ValidatorRefusal,
     ValidatorRequestAuthorizer,
     build_validator_request_header,
     load_sr25519_verifier,
@@ -1439,3 +1442,97 @@ def test_snapshot_file_is_bounded_at_its_size_cap(tmp_path: Path):
     refused.mkdir(mode=0o700)
     assert _snapshot_provider(accepted, at_cap).load(now=NOW) is not None
     assert _snapshot_provider(refused, over_cap).load(now=NOW) is None
+
+
+def test_finalize_result_names_each_refusal_and_its_fault(tmp_path: Path):
+    """The worker benches only client faults, so finalize must say which
+    refusal it made. finalize itself still answers None for every one."""
+    authorizer = _authorizer(tmp_path)
+
+    def refusal(request, *, body=b"{}", now=NOW):
+        assert authorizer.finalize(request, body=body, now=now) is None
+        return authorizer.finalize_result(request, body=body, now=now)
+
+    request = _preauthorized(authorizer, _header(), now=NOW)
+    assert refusal(request, body=b'{"x":1}') is ValidatorRefusal.BODY_MISMATCH
+    assert refusal(request, now=NOW + REQUEST_LIFETIME) is ValidatorRefusal.EXPIRED
+    assert not authorizer.is_replay(request, now=NOW)
+    assert authorizer.finalize_result(request, body=b"{}", now=NOW) == VALIDATOR_HOTKEY
+    assert authorizer.is_replay(request, now=NOW)
+    assert refusal(request) is ValidatorRefusal.REPLAYED
+    for client in (
+        ValidatorRefusal.BODY_MISMATCH,
+        ValidatorRefusal.EXPIRED,
+        ValidatorRefusal.REPLAYED,
+        ValidatorRefusal.NOT_QUALIFIED,
+    ):
+        assert client.client_fault
+    for worker_side in (
+        ValidatorRefusal.SNAPSHOT_UNAVAILABLE,
+        ValidatorRefusal.REPLAY_STATE_UNAVAILABLE,
+        ValidatorRefusal.WORKER_ERROR,
+    ):
+        assert not worker_side.client_fault
+    assert refusal(request, body="{}") is ValidatorRefusal.WORKER_ERROR
+
+
+def test_a_current_snapshot_that_drops_the_validator_is_a_client_fault(tmp_path: Path):
+    """A lapsed or missing snapshot is the worker's refusal, but a current one
+    that no longer lists the caller is the validator's, so it benches."""
+    authorizer = _authorizer(tmp_path)
+    request = _preauthorized(authorizer, _header(), now=NOW)
+    authorizer.snapshot_provider = StaticValidatorSnapshotProvider(
+        _access_snapshot(hotkeys=(OTHER_VALIDATOR_HOTKEY,))
+    )
+    assert authorizer.finalize(request, body=b"{}", now=NOW) is None
+    refusal = authorizer.finalize_result(request, body=b"{}", now=NOW)
+    assert refusal is ValidatorRefusal.NOT_QUALIFIED
+    assert refusal.client_fault
+
+
+def test_a_store_expiry_is_refused_as_expired(tmp_path: Path, monkeypatch):
+    """record_request compares whole seconds, so it can answer EXPIRED for a
+    request finalize's own check still treats as live. That is the request's
+    lapse, not the worker's store failing."""
+    authorizer = _authorizer(tmp_path)
+    request = _preauthorized(authorizer, _header(), now=NOW)
+    monkeypatch.setattr(
+        authorizer.state, "record_request", lambda *_args, **_kwargs: ReplayRecord.EXPIRED
+    )
+    assert authorizer.finalize_result(request, body=b"{}", now=NOW) is ValidatorRefusal.EXPIRED
+
+
+def test_is_replay_consumes_nothing(tmp_path: Path):
+    authorizer = _authorizer(tmp_path)
+    request = _preauthorized(authorizer, _header(nonce=b"q" * 32), now=NOW)
+    for _ in range(3):
+        assert not authorizer.is_replay(request, now=NOW)
+    assert authorizer.finalize(request, body=b"{}", now=NOW) == VALIDATOR_HOTKEY
+
+
+def test_a_lapsed_snapshot_or_a_full_store_is_the_workers_refusal(tmp_path: Path):
+    snapshot = _access_snapshot(
+        generated_at=NOW - timedelta(minutes=5),
+        expires_at=NOW + timedelta(seconds=30),
+    )
+    authorizer = _authorizer(tmp_path, snapshot)
+    request = _preauthorized(authorizer, _header(), now=NOW)
+    assert (
+        authorizer.finalize_result(request, body=b"{}", now=NOW + timedelta(seconds=30))
+        is ValidatorRefusal.SNAPSHOT_UNAVAILABLE
+    )
+
+    full = ValidatorRequestAuthorizer(
+        _access_snapshot(),
+        worker_hotkey=WORKER_HOTKEY,
+        channel_binding=_binding(),
+        state=ValidatorAccessState(str(tmp_path / "full.sqlite"), max_replay_entries=1),
+        signature_verifier=load_sr25519_verifier(),
+    )
+    first = _preauthorized(full, _header(nonce=b"1" * 32), now=NOW)
+    second = _preauthorized(full, _header(nonce=b"2" * 32), now=NOW)
+    assert full.finalize(first, body=b"{}", now=NOW) == VALIDATOR_HOTKEY
+    assert (
+        full.finalize_result(second, body=b"{}", now=NOW)
+        is ValidatorRefusal.REPLAY_STATE_UNAVAILABLE
+    )
