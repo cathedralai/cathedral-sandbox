@@ -77,25 +77,33 @@ serves customers directly.
 
 **Existing: what the adapters call on the central API.**
 
-cathedral-harbor (`src/cathedral_harbor/environment.py`):
+cathedral-harbor (`src/cathedral_harbor/environment.py`, `main` at 9435023):
 
-- catalog: `GET /v1/sandboxes/catalog` (line 193);
+- catalog: `GET /v1/sandboxes/catalog` (line 432);
 - image: `POST /v1/images/import` or `/v1/images/build`, then
-  `GET /v1/images/{id}` (lines 319-342);
+  `GET /v1/images/{id}` (lines 602, 607-630);
 - create: `POST /v1/sandboxes` with `image_id`, `network`
   (`internet` or `deny_all`), `lifetime_seconds`, `max_spend_usd` and `labels`
-  (lines 78, 209-215, 248);
+  (lines 98, 445-457, 520);
 - status and list: `GET /v1/sandboxes/{id}` and `GET /v1/sandboxes`
-  (lines 390, 444);
+  (lines 675, 740);
 - exec: synchronous `POST .../exec` up to 45 s, otherwise
   `POST .../execs`, poll `GET .../execs/{exec_id}`, stop with `DELETE`
-  (lines 48, 465-484, 497-558);
+  (lines 68, 781-800, 813-822, 867-879);
+- processes: `POST .../processes`, to start `dockerd` for a compose task
+  (lines 488-497);
 - files: `PUT`/`GET .../files`, `PUT`/`GET .../tar`, `GET .../stat`
-  (lines 567-630);
-- delete: `DELETE /v1/sandboxes/{id}` (line 425).
+  (lines 883-968);
+- delete: `DELETE /v1/sandboxes/{id}`, then poll until cleanup is confirmed
+  (lines 711-718).
 
-It refuses docker-compose tasks, since sandboxes offer no Docker-in-Docker
-(lines 166-167).
+Since Harbor PRs #13 and #15 (2026-09-28), Harbor runs docker-compose tasks
+in Docker-in-Docker. Every compose sandbox is created from the published
+`ghcr.io/cathedralai/cathedral-dind` image, imported once per job by digest
+(lines 100-113). The sandbox itself is the DinD host: `dockerd` runs inside
+it, and the compose services run under that `dockerd` (lines 131-141,
+480-482). A compose task always needs `internet`, since it pulls and builds
+inside the sandbox (lines 434-437).
 
 cathedral-verifiers (`src/cathedral_verifiers/_runtime.py`, `main`) uses the
 same catalog, image import, create, `execs`, `files` and delete calls. It also
@@ -138,17 +146,20 @@ line 274), so today it exposes no customer port either. Open runtime PR #30
 | image build on the box | needs a builder in the guest | hard; build centrally instead |
 | snapshot, fork | `runsc checkpoint` exists but is tied to a runsc version and one box | hard; defer |
 | port exposure | needs netstack forwarding plus central routing | hard; defer (no adapter uses it) |
-| Docker-in-Docker | needs extra runsc privileges | hard; defer (Harbor already refuses it) |
+| Docker-in-Docker | `dockerd` inside the sandbox; needs extra runsc privileges | hard; not in v1 (decision 5), though Harbor's compose tasks now use it ("Still open") |
 
 The first version serves the "easy" rows plus image import by digest. Two
-more things are needed before it covers Harbor:
+more things are needed before it covers Harbor's single-container tasks:
 
-- Harbor's `POST /v1/images/build` (`src/cathedral_harbor/environment.py:342`)
+- Harbor's `POST /v1/images/build` (`src/cathedral_harbor/environment.py:627`)
   needs a central builder and a way to deliver the built image into the TD.
 - Harbor deletes any sandbox whose `hardware` is not `standard`
-  (`src/cathedral_harbor/environment.py:231-236`). The box must present as a
-  Standard box: exec `env`, `user` and `cwd` (lines 471-477), and execs up to
-  14,400 s (line 44).
+  (`src/cathedral_harbor/environment.py:473-478`). The box must present as a
+  Standard box: exec `env`, `user` and `cwd` (lines 786-793), and execs up to
+  14,400 s (line 64).
+
+Harbor's compose tasks need Docker-in-Docker, which decision 5 leaves out of
+v1. A v1 TEE box therefore does not serve them.
 
 **Churn and cold start.** The target is thousands of short-lived sandboxes a
 day, so create and delete sit on the hot path.
@@ -156,7 +167,7 @@ day, so create and delete sit on the hot path.
 - **Existing load.** verifiers imports each image once per run and shape,
   then creates one sandbox per rollout, optionally paced per minute. Teardown
   polls until cleanup is confirmed (`_runtime.py:5-11`, `:120`). Harbor
-  creates one sandbox per trial (`src/cathedral_harbor/environment.py:209-215`).
+  creates one sandbox per trial (`src/cathedral_harbor/environment.py:451-460`).
 - **Proposed targets**, to confirm in qualification. With the image already
   on the box, create to `running` within 2 s at p50 and 5 s at p99. Delete to
   confirmed cleanup within 5 s at p99. The box sustains at least 60 creates a
@@ -276,10 +287,14 @@ would let the miner mint its own caller key. It could then exec into, and read
 or change files in, the current customer's sandboxes through the front door.
 Section 4's protection from the host would be gone.
 
-Open PR #242 implements the replaced decision. It authorizes callers with a
-signed control-plane snapshot and miner flags `--tee-box-caller-keys` and
-`--tee-box-caller-keys-digest` (its `tee_box/service.py:151`, and its
-TEE_BOX_SERVICE.md, "Caller authorization"). It has to move to central access.
+Open PRs #242 and #243 implement the replaced decision. #242, a library,
+authorizes callers with a signed control-plane snapshot through the
+validator-access code (its `tee_box/service.py:151`, and its
+TEE_BOX_SERVICE.md, "Caller authorization"). #243 adds the worker flags that
+feed it from the miner: `--tee-box-caller-snapshot`, `--tee-box-caller-keys`,
+`--tee-box-caller-keys-digest` and `--tee-box-caller-state` (its
+`tee_box/configure.py:40-43`, `:85-88`). Both have to move to central
+access.
 
 **Central state across a relaunch.** Central state lives in guest memory
 (section 4), and the guest is relaunched between customers (decision 1), so
@@ -323,11 +338,11 @@ customer sandboxes, or the capacity challenge, on B.
   prove a particular OCI image (`docs/MRTD.md:40-42`). The SNP report does not
   contain the OCI digest either (`docs/SN94_SNP_MINER_IMAGE.md:45-49`).
 - The direct validator does not use the TDX measurement as a gate
-  (`docs/MRTD.md:51-54`). Open PR cathedral-validator #256 adds an optional
-  allowlist: a local, unsigned file each validator names with
+  (`docs/MRTD.md:51-54`). Open PR cathedral-validator #256 (at 14e2370) adds
+  an optional allowlist: a local, unsigned file each validator names with
   `CATHEDRAL_TDX_MEASUREMENT_POLICY`, with `shadow` and `enforce` modes. It is
-  TDX-only (its `tdx_measurement.py:24`, `:38-41`). The SNP preview already
-  loads `allowed_measurements` (cathedral-validator
+  TDX-only (its `tdx_measurement.py:10-18`, `:33`, `:48-51`). The SNP
+  preview already loads `allowed_measurements` (cathedral-validator
   `cathedral_thin/independent_runtime/amd_snp_dev_preview.py:304-319`).
 
 Proposal: ship the box as a measured appliance image:
@@ -337,12 +352,15 @@ Proposal: ship the box as a measured appliance image:
   for a read-only root holding the worker, `runsc` and the executor.
 - The central-access root key digest is in MRCONFIGID or the dm-verity root,
   as above.
-- **RTMR3.** The appliance extends nothing into RTMR3, and enables nothing
-  that extends it at runtime. Customer images are data and are not extended.
-  RTMR3 therefore keeps its initial all-zero value. #256 notes that RTMR3
-  varies with runtime extends (its `tdx_measurement.py:20-22`), so this keeps
-  one entry per image and VM shape. An image that later extends RTMR3 needs
-  entries for the values it produces.
+- **RTMR3.** The owner asked for the RTMR3 extends to be defined; proposed
+  answer: none. *Proposal:* the appliance extends nothing into RTMR3, and
+  enables nothing that extends it at runtime. The kernel, initrd, command
+  line and dm-verity root are already in RTMR1 and RTMR2, and customer images
+  are data, not extended. RTMR3 therefore keeps its initial all-zero value.
+  #256 notes that RTMR3 follows what the guest extends at runtime (its
+  `tdx_measurement.py:24-25`), so this keeps one entry per image and VM
+  shape. An image that later extends RTMR3 needs entries for the values it
+  produces.
 - **Provider-dependent assumption, to verify:** this needs a provider that lets
   the miner supply the kernel and command line, and measures them into the
   RTMRs or the SNP launch digest. Clouds that boot through a paravisor or vTPM
@@ -351,7 +369,7 @@ Proposal: ship the box as a measured appliance image:
 - Customer images are data. They run inside gVisor and are not measured.
 
 Then the published list entry names the executor. RTMR0 can vary with VM shape
-(#256 `tdx_measurement.py:20-22`), so one image may need one entry per shape.
+(#256 `tdx_measurement.py:20-21`), so one image may need one entry per shape.
 
 ## 4. Isolation, storage and overhead
 
@@ -381,20 +399,23 @@ time (decision 1):
 storage like host-visible traffic:
 
 - **All writable storage** is in guest memory, or on dm-crypt with integrity
-  (AEAD, dm-integrity) under a key the TD makes at boot and never writes out.
-  That covers imported images, rootfs overlays, `files` and `tar` uploads,
-  scratch space, and the replay, high-water and revocation state.
+  (AEAD, dm-integrity) under a key the TD makes at boot and never writes out
+  (decision 7). *Proposal*, per kind: imported images are read through
+  dm-verity (below) and, when private, encrypted under the boot key; rootfs
+  overlays, `files` and `tar` uploads and bulk scratch space are on dm-crypt
+  with integrity; the replay, high-water and revocation state is in guest
+  memory only.
 - **Images are verified on read.** The central builder emits each image as a
   read-only filesystem with a dm-verity hash tree, and the image id binds its
   root hash. The box opens the image with dm-verity against the root hash the
   control plane named, so every block is checked when `runsc` reads it. There
   is no time-of-check gap between import and `runsc run`. A customer's
   private image is also encrypted under the boot key.
-- **State files cannot be rolled back.** They live in guest memory only.
-  AEAD sector tags detect a changed sector, but not the replay of an older
-  version of the same sector written under the same key. So dm-crypt alone
-  would not stop the host rolling a state file back within one boot. State
-  does not need to outlive a boot (section 3, "Central state across a
+- **State files cannot be rolled back.** *Proposal:* they live in guest
+  memory only, never on dm-crypt. AEAD sector tags detect a changed sector,
+  but not the replay of an older version of the same sector written under
+  the same key. So dm-crypt alone would not stop the host rolling a state
+  file back within one boot. State does not need to outlive a boot (section 3, "Central state across a
   relaunch").
 - **Residual risk:** on dm-crypt, the host can still replay an older version
   of an overlay or scratch sector within one allocation. That can revert the
@@ -407,9 +428,9 @@ storage like host-visible traffic:
 - Guest memory used for storage comes out of the box's reserve ("Paid shape"
   under "Still open").
 
-**Egress (decision 6).** The `internet` deny list is enforced outside the
-Sentry, never in the sandbox's own netstack, where a root tenant could change
-it:
+**Egress (decision 6; where it is enforced is a proposal, not an owner
+decision).** The `internet` deny list is enforced outside the Sentry,
+never in the sandbox's own netstack, where a root tenant could change it:
 
 - nftables in the guest, on the sandbox link. The forward hook drops packets
   to denied ranges. The input hook drops everything from the sandbox link
@@ -439,7 +460,7 @@ Qualification must measure it before TEE prices are set.
 
 The capacity probe needs its own calibration. #217 budgets 5 s of startup and
 a per-step deadline set from native runs on development VMs (#217
-CAPACITY.md, "Timing", lines 94-107 at a6ca3da). A probe inside `runsc` inside
+CAPACITY.md, "Timing", lines 93-164 at 7812b15). A probe inside `runsc` inside
 a TD must be calibrated there. The deadline timer must start after the probe
 sandbox is running. #217 already bounds only the exec and times the create
 separately (`timings_ms.create`, same section), and the TEE prober keeps that.
@@ -475,17 +496,19 @@ allocation ends with a drain and a relaunch.
 
 ## 5. Capacity and receipts
 
-**Existing (open PR cathedral-sandbox #217 at a6ca3da, `cathedral.capacity`).**
+**Existing (open PR cathedral-sandbox #217 at 7812b15, `cathedral.capacity`).**
 
 - One scrypt-like lane per claimed vCPU, holding 80% of the claimed memory
-  (its `capacity/challenge.py:51`). The box commits to all outputs first. Then
-  the prober samples lanes with a fresh nonce (its
-  `capacity/challenge.py:104-223`).
+  (its `capacity/challenge.py:51`). The prober sends a spec with a fresh
+  seed, and the box returns every lane's output, which commits it. Only then
+  does the prober draw a fresh nonce and recompute the lanes it picks (its
+  `capacity/challenge.py:13-22`; the commitment and sampling are
+  `:226-252`).
 - The receipt names a hardware identity by kind: `tdx_platform` for TDX,
   `chip_id` for SNP, `probe_fingerprint` for bare metal (its
   `capacity/receipt.py:61-65`). The TDX id comes from the strict verifier's
   `stable_platform_id`, not the PPID: "No TDX verifier outputs the raw PPID"
-  (its CAPACITY.md:207, "Hardware identity"). An all-zero id is refused (its
+  (its CAPACITY.md:224, "Hardware identity"). An all-zero id is refused (its
   `capacity/receipt.py:173-190`).
 - A receipt answers one validator's nonce in one round, and is valid for at
   most 2 hours (its `capacity/receipt.py:71`, `:297-328`).
@@ -493,7 +516,8 @@ allocation ends with a drain and a relaunch.
   minimum profiles (its CAPACITY.md, "Pricing").
 - The v1 receipt body has no evidence field (its `capacity/receipt.py:79-92`).
 
-**Existing (open PR #237, stacked on #217): receipt v2 with evidence.** It
+**Existing (open PR #237 at 92d79ed, stacked on #217): receipt v2 with
+evidence.** It
 adds a signed `evidence` object, required for a TEE box and `null` for bare
 metal, with seven fields: `evidence_kind`, `evidence_sha256` over the raw
 quote or report, `measurement`, `verifier_digest`, `tls_spki_sha256`,
@@ -501,7 +525,7 @@ quote or report, `measurement`, `verifier_digest`, `tls_spki_sha256`,
 quote's REPORT_DATA v2 from the nonce, the miner hotkey and the SPKI, for
 audit. `verify_receipt(..., max_evidence_age=)` lets a validator refuse
 evidence older than it accepts. The evidence comes from admission and is
-reused for later receipts (its CAPACITY.md, "Evidence").
+reused for later receipts (its CAPACITY.md:211-260, "Evidence").
 
 What it does not prove: the receipt carries the quote's hash, not the quote.
 A validator cannot re-verify the quote, or check that the hardware id came
@@ -533,20 +557,31 @@ This repository already extracts the needed identities:
    shape, with no network. It runs the challenge there, samples, then deletes
    the sandbox. The challenge still runs because a quote proves neither vCPU
    count nor memory size.
-4. **An allocated box keeps its last good receipt for the round.** Receipts
-   are bound to one round and one validator nonce (#217
-   `capacity/receipt.py:297-328`). So for each round in which the control
-   plane lists the box as allocated, the prober still signs that round's
-   receipt. The receipt carries the capacity and challenge result of the
-   box's last passing probe, and the evidence of the attestation the current
-   allocation was admitted on. A proposed field, `carried_from_round`, names
-   the round of that probe, and is `null` on a receipt probed this round.
-   Scoring:
-   - Validators pay a carried receipt like a fresh one, so a box does not lose
-     pay for serving a customer.
-   - A receipt may be carried for at most 24 hours after its probe (proposed).
-     The control plane schedules a drain and probe before that. Past the
-     bound the box scores zero until it is probed again.
+4. **An allocated box keeps its last good receipt for the round** (decision
+   8). How it is scored is a *proposal*, and it needs a change to #237.
+   #237's prober rule requires a fresh challenge over the attested TLS key
+   each round, and says the prober "must not sign a receipt otherwise" (#237
+   CAPACITY.md:256-260, and the rules list at `:90-91`). #217 also binds each
+   receipt to one round and one validator nonce, valid for at most 2 hours
+   (#217 `capacity/receipt.py:71`, `:297-328`). So the prober cannot simply
+   sign this round's receipt for a box it did not probe. Two ways to change
+   #237:
+   - **Validator-side carry.** The prober signs nothing new. For a box the
+     control plane lists as allocated in a signed allocation record, a
+     validator pays the box's last receipt that it verified, up to a bounded
+     age. `verify_receipt` then needs a mode that accepts a receipt from an
+     earlier round, within that bound.
+   - **A new receipt kind.** The prober signs a "carried" receipt for the
+     round. It names the round of the last passing probe and repeats that
+     probe's capacity and evidence. #237's rule would then allow exactly this
+     kind without a fresh challenge.
+
+   Either way, the proposed scoring:
+   - A carried receipt is paid like a fresh one, so a box does not lose pay
+     for serving a customer.
+   - It may be carried for at most 24 hours after its probe. The control
+     plane schedules a drain and probe before that. Past the bound, the box
+     scores zero until it is probed again.
    - Only a box the control plane lists as allocated is carried. An idle box
      that refuses or fails a probe scores zero for the round.
    - Dedupe by hardware id is unchanged, and carried receipts count in it.
@@ -573,9 +608,9 @@ relaunch, only when all of these hold, on one connection:
 - the hardware id is not already registered to another box;
 - a first capacity challenge passes, with the box drained.
 
-Open PR #240 implements the REPORT_DATA, hardware-id and measurement checks
-as a library. It reads #256's policy file format for TDX (its
-`capacity/admission.py:1-35`). Under decision 5 it would read the published
+Open PR #240 (at 796144c) implements the REPORT_DATA, hardware-id and
+measurement checks as a library. It reads #256's policy file format for TDX
+(its `capacity/admission.py:1-51`). Under decision 5 it would read the published
 list instead.
 
 Reuse, do not rebuild: central access (#225, #228, #241) for control-plane
@@ -598,19 +633,21 @@ not several small ones.
 
 - **cathedral-sandbox:** a `runsc` executor serving the section 2 subset
   behind the worker's TLS listener; the sandbox routes in `CENTRAL_ROUTES`,
-  with the root digest taken from measured state, and #242's caller snapshot
-  replaced by central access; revocation-list install over the attested
-  channel; all writable storage in guest memory or dm-crypt with integrity,
+  with the root digest taken from measured state, and the caller snapshot
+  of #242 and #243 replaced by central access; revocation-list install over
+  the attested channel; all writable storage in guest memory or dm-crypt with integrity,
   images verified on read with dm-verity; Standard-box behavior (exec env,
   user, cwd, 14,400 s execs); image import into the TD by digest; the egress
-  enforcer (#243); measured appliance image builds for TDX and SNP that
-  extend nothing into RTMR3; receipt v2 with the evidence object (#237), on
-  top of #217, plus `carried_from_round`.
+  enforcer (#243); measured appliance image builds for TDX and SNP, with
+  no RTMR3 extends (proposal, section 3); receipt v2 with the evidence
+  object (#237), on top of #217, plus the change to #237 that a carried
+  receipt needs (section 5, step 4).
 - **cathedral-validator:** land #256, with its local file mirroring the
   published measurement list during rollout; run it in shadow on the new
   image, then enforce; take the SNP allowlist from the same list; verify
-  capacity receipts, including the evidence object, its age and carried
-  receipts, and dedupe across receipts by hardware id.
+  capacity receipts, including the evidence object and its age, and dedupe
+  across receipts by hardware id. If the carry is validator-side (section 5,
+  step 4), validators also carry an allocated box's last receipt.
 - **Private control plane:** the owner's signed measurement list, which
   validators, admission, routing and the prober all consume; a central image
   builder serving `POST /v1/images/build` that emits dm-verity images, plus
@@ -640,10 +677,9 @@ not several small ones.
 
 ## Owner decisions for v1 (2026-09-28, amended 2026-09-29)
 
-The owner's answers were given in this PR's conversation (cathedral-sandbox
-#236), on 2026-09-28 and 2026-09-29. The 2026-09-29 answers respond to the
-third review round. Decisions 1, 2, 4 and 6 changed or gained detail that day,
-and decisions 7 and 8 are new.
+The owner gave these answers to the author on 2026-09-28 and 2026-09-29;
+this section is the record. The 2026-09-29 answers respond to the third
+review round. Decisions 1, 2 and 4 changed; 7 and 8 are new.
 
 1. **One customer at a time, relaunched between customers.** One confidential
    VM per box serves one customer allocation at a time, as the Reliquary
@@ -672,26 +708,40 @@ and decisions 7 and 8 are new.
    the source of truth. During rollout, #256's local file can mirror it. The
    existing signed registry format and approval flow
    (`cathedral/policy_registry.py`, `docs/MRTD.md:70-86`) are candidates for
-   it. The appliance extends nothing into RTMR3 (section 3). Who builds and
-   approves the image is still open.
+   it. The owner asked for the RTMR3 extends to be defined; proposed answer:
+   none (section 3). Who builds and approves the image is still open.
 5. **Consumer needs.** No snapshots, fork, port exposure or Docker-in-Docker
-   in v1. The adapters use none of them (section 2).
+   in v1. When this was decided, the adapters used none of them. Since
+   2026-09-28, Harbor runs its docker-compose tasks in Docker-in-Docker
+   (Harbor PRs #13 and #15, section 2), so this decision now excludes those
+   tasks ("Still open").
 6. **Egress.** `internet` sandboxes may not reach private, link-local or
    cloud metadata ranges, or the box's own addresses. The public internet is
-   allowed, with a per-sandbox bandwidth cap. Enforcement is by nftables on
-   the sandbox link, outside the Sentry, after DNS resolution, and covers the
-   IPv6 ranges and `100.64.0.0/10` (section 4, as open PR #243 does).
+   allowed, with a per-sandbox bandwidth cap. *Proposal (section 4), not an
+   owner decision:* enforcement by nftables on the sandbox link, outside the
+   Sentry, after DNS resolution, covering the IPv6 ranges and
+   `100.64.0.0/10`, as open PR #243 does.
 7. **Encrypted storage.** *New 2026-09-29.* All writable storage (imported
    images, rootfs overlays, `files` and `tar` uploads and scratch, and replay
    and high-water state) lives in guest memory, or on dm-crypt with integrity
    (AEAD) under a key made inside the TD at boot. Images are verified on read,
-   with no time-of-check gap between import and `runsc run`. The host cannot
-   roll state files back (section 4).
+   with no time-of-check gap between import and `runsc run`. State files
+   cannot be rolled back by the host. *Proposal (section 4), which is which:*
+   images are read through dm-verity; overlays, uploads and bulk scratch are
+   on dm-crypt with integrity; the replay, high-water and revocation state
+   stays in guest memory only, because dm-crypt with integrity does not stop
+   the host replaying an older sector.
 8. **Probe only when idle.** *New 2026-09-29.* The capacity probe runs only
    between allocations, with the box drained. An allocated box keeps its last
-   good receipt for the round (section 5, step 4).
+   good receipt for the round. How that is scored is a proposal that needs a
+   change to #237 (section 5, step 4).
 
 Still open:
+
+- **Docker-in-Docker for Harbor's compose tasks.** Decision 5 (no
+  Docker-in-Docker in v1) now excludes Harbor's docker-compose tasks, which
+  run `dockerd` inside the sandbox (section 2). Does the owner want
+  Docker-in-Docker under gVisor in a later version?
 
 - **Image build and approval.** Who builds and approves the appliance image
   and its measurement list entries? This was the original question 4.
