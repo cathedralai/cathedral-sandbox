@@ -258,7 +258,14 @@ state".
     24 h ago is accepted even if a newer one exists. A delegation revoked by
     list N can still reopen a relaunched box with list N-1 while N-1 is
     fresh, until the control plane's push of N lands or the delegation
-    expires. Keeping the interval between list issues short narrows this.
+    expires. Issuing lists more often does not narrow this: it only keeps
+    list N-1 fresh for longer after N. A shorter
+    `MAX_REVOCATIONS_AGE_SECONDS` narrows it, at the cost of the root
+    re-signing the list more often.
+  - **Trusted clock.** Freshness is judged against the box clock, as
+    delegation and request expiry already are. Its source (for example NTP
+    over the host network) must be trusted; a host that sets the box clock
+    back can make a stale list look fresh.
   - **Residual risk: the delegation high-water resets.** The high-water that
     refuses a delegation older than one already accepted lives in the same
     state, so after a relaunch a superseded but unexpired, unrevoked

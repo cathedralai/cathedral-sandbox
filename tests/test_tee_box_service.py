@@ -1220,3 +1220,17 @@ def test_the_gate_closes_when_the_pushed_list_goes_stale(tmp_path: Path):
     assert api.handle("POST", "/v1/box/revocations", CALLER, fresh).status == 200
     assert _handle(api, "GET", "/v1/box")[1]["revocations"]["fresh"] is True
     assert _handle(api, "POST", "/v1/lease", body={"ttl_seconds": 60})[0] == 200
+
+
+def test_the_gate_follows_the_signed_issued_at_not_the_push_time(tmp_path: Path):
+    # A list signed 23 h ago is fresh when pushed, and goes stale about 1 h
+    # later, not 24 h after the push.
+    clock = _Clock()
+    api, _fake = _api(tmp_path, _binding(), clock=clock, ready=False)
+    signed = datetime.fromtimestamp(int(clock.value) - 23 * 3600, UTC)
+    body = canonical_json(_revocations(issued_at=signed))
+    assert api.handle("POST", "/v1/box/revocations", CALLER, body).status == 200
+    assert _handle(api, "POST", "/v1/lease", body={"ttl_seconds": 7200})[0] == 200
+    clock.value += 3600 + 1
+    status, refusal = _handle(api, "GET", "/v1/lease")
+    assert (status, refusal["reason"]) == (409, "revocation_list_stale")
