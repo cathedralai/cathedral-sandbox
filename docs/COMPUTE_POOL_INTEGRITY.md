@@ -15,8 +15,9 @@ SEV-SNP evidence, one unit per verified machine, and receipts authenticated by
 the validator hotkey. That path admits no bare-metal evidence
 (`snp_production.py` lines 3-6).
 
-PR #217 proposes a separate capacity path (its `CAPACITY.md` and the
-`cathedral.capacity` package, not yet merged). There an SN94-owner prober
+#217 (merged) adds a separate capacity path ([CAPACITY.md](CAPACITY.md) and
+the `cathedral.capacity` package), which validator #257 scores in shadow only.
+There an SN94-owner prober
 challenges each box and signs a `cathedral_capacity_receipt_v1` with an
 Ed25519 prober key; validators
 pay each box the market value of its proven vCPUs and memory from a signed
@@ -65,9 +66,11 @@ lines 445-448). A row counts only when all of these hold in the same round:
    `cathedral-validator/cathedral_thin/independent_runtime/multicompute.py`
    lines 140-210).
 
-A round with any unproven step writes no weights: an infrastructure error,
-a blocked feature, or a missing identity adapter stops the whole cycle
-(`direct_validator.py` lines 355-361).
+By default a round with any unproven step writes no weights: an
+infrastructure error, a blocked feature, or a missing identity adapter stops
+the whole cycle (`direct_validator.py` lines 355-361). Validator #259 adds an
+opt-in `CATHEDRAL_INFRA_HALT=scoped` mode in which one miner's INFRA verdict
+stops only that machine.
 
 ## Copying attacks and what stops each
 
@@ -80,7 +83,7 @@ a blocked feature, or a missing identity adapter stops the whole cycle
 | One TLS key on several endpoints | Channel dedupe zeroes every claimant |
 | Copy another miner's SAT answer | The seed includes the hotkey and TLS key, so the challenge differs |
 | Inflate claimed work | The validator derives the units; the miner's figure is ignored |
-| Present one bare-metal box as several (#217 capacity path) | **Partly mitigated in #217's design.** The direct validator admits no bare metal. #217 deduplicates bare metal on a `probe_fingerprint` derived from the address and port the prober connected to, which names an endpoint, not a machine, so one host behind two addresses or ports gets two fingerprints and can pass challenges run at different times. Needs concurrent challenges for boxes that may share hardware, or no bare-metal pay until an unspoofable identity exists |
+| Present one bare-metal box as several (#217 capacity path) | **Partly mitigated.** The direct validator admits no bare metal, and the team's TEE-first decision defers bare-metal pay (validator #265 keeps it off by default). #217 deduplicates bare metal on a `probe_fingerprint` taken from the address the prober connected to: the whole IPv4 address or the IPv6 `/64`, never the port ([CAPACITY.md](CAPACITY.md), "Bare metal has no hardware root of trust"). One host behind one address is one identity however many ports it uses. One host behind several addresses still gets several fingerprints and can pass challenges run at different times, so bare-metal pay needs concurrent challenges for boxes that may share hardware, or an unspoofable identity |
 
 ## Where protection ends today
 
@@ -128,6 +131,11 @@ cannot learn from any signed artifact why a machine was or was not paid.
 
 ### 1. Gate TDX on a signed measurement policy
 
+**Status:** validator #256 (merged) implements this as an optional, shadow-first
+gate. The policy file is named by `CATHEDRAL_TDX_MEASUREMENT_POLICY`, and a row
+that is not admitted fails with `tdx_measurement_not_allowed`. The design below
+is the target it moves toward.
+
 Mirror the SNP owner policy. The validator loads a root-owned policy file,
 `cathedral_intel_tdx_policy_v1`, containing a sorted, non-empty list of
 `tdx-measurement-sha256:` values, and refuses to start without one when TDX
@@ -149,7 +157,10 @@ is unproven ([MRTD.md](MRTD.md) lines 24-38); new firmware changes MRTD.
 Enforcing the policy therefore means every TDX miner must boot a reproducible
 Cathedral guest image whose measurement is admitted, and may not patch that
 guest itself. A provider firmware rollout would FAIL every TDX machine on that
-provider at once, in the same round, until the new value is approved.
+provider at once, in the same round, until the new value is approved. On
+2026-09-29, two separately rented TDX guests of the same product size reported
+different measurements (sandbox #251), so an admitted list has to be built from
+the exact image, not from one sample boot.
 
 Roll out in shadow first:
 
@@ -202,17 +213,27 @@ tracking a signed per-machine record to count.
 ### 4. Bind the image into measured state
 
 Close the image gap on SNP first, where boot state is already gated: the
-launcher derives HOST_DATA or the guest's measured command line from the
-pinned image digest, so the admitted measurement implies the image. For TDX,
-extend the image digest into RTMR3 before the worker starts and admit the
-resulting measurement under design item 1.
+launcher puts the pinned image digest on the guest's measured kernel command
+line, so the admitted measurement implies the image. HOST_DATA does not work
+on its own: the SNP `MEASUREMENT` does not cover it ([TEE_BOX.md](TEE_BOX.md),
+"MRCONFIGID on TDX"), so a validator relying on it would have to pin HOST_DATA
+as a separate policy field.
+
+For TDX, bind the image through state that is already measured, such as
+MRCONFIGID or a measured dm-verity root, and admit the result under design
+item 1. Don't extend the image digest into RTMR3: under the TEE box scheme
+(#236, #246), RTMR3 carries exactly one per-boot lease event, so the admitted
+list has one fresh and one consumed value per image.
 
 ## Order of work
 
-1. TDX measurement policy, in shadow, then enforced.
-2. Intel outage mapped to INFRA.
-3. Per-machine receipts committed under the signed telemetry root.
-4. Image binding, SNP then TDX.
+1. TDX measurement policy, in shadow, then enforced. *Shadow gate merged
+   (validator #256); enforcement pending.*
+2. Intel outage mapped to INFRA. *Validator side merged (#267); verifier side in
+   sandbox #238, then a verifier release.*
+3. Per-machine receipts committed under the signed telemetry root. *Built as
+   receipts under the signed pool inventory instead (validator #263, #264).*
+4. Image binding, SNP then TDX. *Open.*
 
 Item 1 changes the validator, but once enforced it also fixes what every TDX
 miner may boot (see its operator cost). Item 2 changes the released verifier's
