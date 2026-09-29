@@ -180,7 +180,8 @@ state".
 - **Root keys.** The box reads them from a fixed path inside the image,
   `/usr/share/cathedral/central-root-keys.json`
   (`cathedral/tee_box/measured_root.py:38`). The file has the key-file format
-  that the offline root tool's `keygen --keys-out` writes (open PR #239):
+  that the offline root tool's `keygen --keys-out` writes
+  (`scripts/cathedral_central_access.py`, from #239):
   one canonical JSON object of key id to base64 Ed25519 public key.
   - **TDX.** MRCONFIGID is `sha256(root key file)` followed by 16 zero bytes
     (`mrconfigid_for_root_keys`, `cathedral/tee_box/measured_root.py:160`).
