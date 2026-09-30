@@ -8,6 +8,7 @@ central key signs, and a list from ``revoke`` withdraws it.
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -290,6 +291,52 @@ def test_delegate_refuses_bad_pins_and_keys(tmp_path, root, capsys, change, mess
     with pytest.raises(SystemExit, match=message):
         _delegate(capsys, {**root, **change}, out, 1)
     assert not out.exists()
+
+
+_P = 2**255 - 19
+
+
+@pytest.mark.parametrize(
+    ("key", "message"),
+    [
+        # The identity point, 0x01 then 31 zero bytes, with either sign bit.
+        (bytes([1]) + bytes(31), "is a small-order Ed25519 point"),
+        (bytes([1]) + bytes(30) + b"\x80", "is a small-order Ed25519 point"),
+        # A point of order 8.
+        (
+            bytes.fromhex("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"),
+            "is a small-order Ed25519 point",
+        ),
+        # y = p, the non-canonical form of y = 0 (order 4).
+        (_P.to_bytes(32, "little"), "is not a canonical Ed25519 point"),
+        # y = 2 is not on the curve.
+        ((2).to_bytes(32, "little"), "is not an Ed25519 point"),
+    ],
+    ids=["identity", "identity-sign-bit", "order-8", "non-canonical", "off-curve"],
+)
+def test_delegate_refuses_to_sign_for_a_small_order_or_non_canonical_key(
+    tmp_path, root, capsys, key, message
+):
+    # A delegation to a small-order key lets anyone sign central requests.
+    out = tmp_path / "delegation.json"
+    central_public = base64.b64encode(key).decode("ascii")
+    with pytest.raises(SystemExit, match=f"refusing to delegate: --central-public-key {message}"):
+        _delegate(capsys, {**root, "central_public": central_public}, out, 1)
+    assert not out.exists()
+    assert not Path(root["ledger"]).exists()
+
+
+def test_a_malformed_pinned_key_file_is_refused_without_a_traceback(tmp_path, root, capsys):
+    keys = tmp_path / "malformed-keys.json"
+    keys.write_bytes(b"[]")
+    malformed = {**root, "keys": keys, "digest": "sha256:" + hashlib.sha256(b"[]").hexdigest()}
+    with pytest.raises(SystemExit, match="central root keys are unusable"):
+        _delegate(capsys, malformed, tmp_path / "delegation.json", 1)
+
+    revocations = tmp_path / "revocations.json"
+    revocations.write_bytes(b"{}")
+    assert tool.main(["verify", *_pinned(malformed), "--revocations", str(revocations)]) == 1
+    assert "CENTRAL_ACCESS_INVALID central root keys are unusable" in capsys.readouterr().out
 
 
 def test_delegate_refuses_to_delegate_to_a_root_key(tmp_path, root, capsys):

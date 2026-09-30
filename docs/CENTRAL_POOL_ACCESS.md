@@ -107,7 +107,15 @@ The root signs a delegation containing:
 - `schema`: `cathedral_central_delegation_v1`;
 - `root_key_id`: which key in the pinned root file signed it;
 - `central_key_base64`: the online Ed25519 public key, 32 bytes in canonical
-  base64;
+  base64. It must encode a curve point with a canonical y (below p), and it
+  must not be one of the eight small-order points, in either sign. Under a
+  small-order key a signature whose R is the identity and whose S is zero
+  verifies for any message, and `cryptography` (OpenSSL) does not refuse
+  such a key, so a delegation to one would let anyone sign central requests.
+  The worker refuses such a key in a delegation and in the pinned root key
+  file (`check_ed25519_public_key` in `cathedral/central_access.py`, the
+  same blocklist as libsodium's), and the offline tool's `delegate` refuses
+  to sign for one;
 - `routes`: an explicit list, initially `POST /v1/capabilities` only;
 - `network` and `netuid`: the subnet it is valid for;
 - `sequence`: a monotonic integer;
@@ -154,13 +162,17 @@ Central gets its own pool, limiter and replay table:
   most a day.
 - For faster revocation, the root signs a `cathedral_central_revocations_v1`
   list with a monotonic sequence, and a worker refuses any listed delegation.
-  The format and its verifier exist, but fetching the list is not implemented
-  in implementation-plan item 2 (#228): nothing installs a list, and the worker holds revocations
-  only in memory. Until fetching lands, the 24-hour delegation expiry is the
-  only bound on a compromised delegation.
-- When fetching lands, the worker must persist the list and its sequence in
-  the central access state. Otherwise a restart drops them, and an older list
-  could be accepted again.
+  The worker persists the list in force and its sequence in the central
+  access state, so a restart never drops it, and it refuses an older list or
+  a different list under the same sequence. With `--central-revocations` it
+  follows a local list file the operator keeps current, and refuses every
+  central request while that file is missing or unusable. The TEE box takes
+  the list the control plane pushes instead
+  ([TEE_BOX_SERVICE.md](TEE_BOX_SERVICE.md), "Revocation list").
+- The worker opens that list file without following a symlink and without
+  blocking, and reads it only if it is a regular file of bounded size that
+  only its owner can write. A FIFO or other special file at the path is
+  refused, not waited on, so it cannot hang startup or central requests.
 - A revocation list has no freshness bound. Its `issued_at` is parsed but not
   checked against a maximum age, so withholding a newer list delays revocation
   without failing closed. The 24-hour delegation expiry remains the real bound;
@@ -168,6 +180,23 @@ Central gets its own pool, limiter and replay table:
 - Rotating the root means shipping a new root file in a release and each miner
   updating `--central-root-keys-digest`. That is consent again, by design,
   with the same limit as above: it binds honest releases only.
+- Replacing the root key also means wiping the central access state. The
+  worker re-verifies the stored revocation list against the pinned root keys
+  at every start, and a stored list the new root file does not verify stops
+  the worker ("names an untrusted root key", or "signature verification
+  failed" when the key id is reused) rather than being dropped. So stop the
+  worker, remove the `--central-access-state` file and its `.lock`, pin the
+  new root file and digest, and start it with a list the new root signed.
+  Wiping also resets the replay table and the delegation high-water, which
+  loses nothing: no delegation from the old root verifies any more. A TEE box
+  keeps its central state in guest memory, and a new root is a new launch
+  measurement, so it starts empty.
+- The offline tool's `revoke` trusts `--previous` to be the latest list the
+  root signed. It carries that list's entries forward and requires a higher
+  sequence, but it cannot tell whether a newer list exists, so passing an
+  older one drops every revocation added since. A local ledger of the lists
+  the root signed, like the delegation ledger `delegate` keeps, is a
+  follow-up.
 
 ### Scope
 
