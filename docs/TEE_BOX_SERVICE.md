@@ -9,17 +9,21 @@ content address (see "Storage (T8)"). T9 serves one customer per boot: the
 VM is relaunched between customers. Against a tenant with guest root, the
 box-side guard, the boot id and admission's `attestation_predates_release`
 prove nothing; the owner's guarantee rests only on the RTMR3 extend before
-each boot's first lease plus `require_fresh_boot` admission, and the extend
-interface has yet to be confirmed on hardware (see "Relaunch between
-customers (T9)"). T11 reads the owner's one signed measurement list, the
-existing signed policy registry, for admission and for the validator's
-#256 file (see "The measurement list (T11)").
-Parts of it have
-run on a real TDX guest (a Polaris TDX sandbox, 2026-09-29: the TD report,
-the RTMR3 extend, the dm-crypt tables, runsc and the egress enforcer); the
-rest of T6b2 needs our own measured image (see "Not done" below). SEV-SNP is
-untested. The design is `docs/TEE_BOX.md` (sections 2 to 4 and "Owner
-decisions for v1").
+each boot's first lease plus `require_fresh_boot` admission, both of which
+have run on a real TDX guest (see "Relaunch between customers (T9)"). T11
+reads the owner's one signed measurement list, the existing signed policy
+registry, for admission and for the validator's #256 file (see "The
+measurement list (T11)").
+The service has run end to end on a real TDX guest (a Polaris TDX sandbox,
+2026-09-30; results in `docs/TEE_BOX_TDX_E2E_RESULTS.md`, harness in
+`scripts/tee_box_tdx_e2e/README.md`). The real worker ran with Docker on a
+LUKS2 integrity mount, sandboxes under runsc, and the egress enforcer. The run
+covered the RTMR3 extend at the first lease, fresh-boot admission, one
+customer per boot, the revocation freshness gate, and scope and revocation
+checks. Only the MRCONFIGID binding was injected, because the provider chooses
+the launch values. The rest of T6b2 needs our own measured image (see "Done on
+hardware" and "Not done" below). SEV-SNP is untested. The design is
+`docs/TEE_BOX.md` (sections 2 to 4 and "Owner decisions for v1").
 Citations are `file:line` in this repository.
 
 ## What T6a adds
@@ -329,9 +333,11 @@ on two things only:
   connection.
 
 The rest catches a miner who skips the relaunch while the guest kernel is
-intact, and gives the control plane clear answers. **The extend interface
-has not run on a TD yet**: T6b2 must confirm it on hardware (see "The RTMR3
-extend").
+intact, and gives the control plane clear answers. The extend has run on a
+TD (2026-09-30, `docs/TEE_BOX_TDX_E2E_RESULTS.md`). The worker extended RTMR3
+at the first lease, and the next quote carried `RTMR3_CONSUMED`. Admission
+with `require_fresh_boot=True` then refused that quote for `boot_consumed`
+only, where before the lease it had admitted a quote with RTMR3 at zero.
 
 This replaces #236's proposal of no RTMR3 extends (design section 3); #236
 is updated separately.
@@ -1005,8 +1011,10 @@ kinds:
   containing `null` or `ecb` (`digest_null`, `cipher_null`) refuses, as
   does any other cipher, a table with no integrity parameter, an unkeyed
   one (`crc32c`, `none`), or any other target. With `--integrity hmac-sha256` and aes-xts,
-  cryptsetup builds an `authenc(hmac(sha256),xts(aes))` AEAD cipher, which
-  the table shows as `integrity:48:aead`.
+  cryptsetup builds an `authenc(hmac(sha256),xts(aes))` AEAD cipher. With
+  `aes-xts-plain64` the table shows it as `integrity:32:aead` (seen on a TD,
+  2026-09-30); a `-random` IV also keeps the IV in the tag
+  (`integrity:48:aead`).
 
 Below the root, nsfs mounts hold no data and are skipped. An overlay mount
 below the root (a running container's root filesystem) passes only when its
@@ -1069,85 +1077,141 @@ Before its Docker daemon and worker start, the appliance boot must:
 4. Set `"features": {"containerd-snapshotter": false}` in the Docker
    daemon's `daemon.json` (see "Images" above).
 
+## Done on hardware (T6b2, 2026-09-30)
+
+`scripts/tee_box_tdx_e2e/README.md` describes a harness that runs the real
+worker (`cathedral worker serve` with the TEE box flags) on an Intel TDX
+guest. It calls the worker over HTTPS as a central-access client, using
+root-signed delegations and signed requests. It ran on a Polaris "Sealed CPU
+Small" guest (GCP, Linux 6.17) against this repository at 40f818b. All seven
+required checks passed. The results are in `docs/TEE_BOX_TDX_E2E_RESULTS.md`.
+
+The provider launches with MRCONFIGID all zero. So the harness replaced one
+piece, the measured-root binding reader: it used `build_tee_box_api`'s
+`read_binding` hook to return `mrconfigid_for_root_keys` of the root key file
+it installed. The following ran for real on the TD:
+
+- **Measured root, fail-closed half.** The real TDREPORT reader refused the
+  zero MRCONFIGID ("the launch bound no central root"). A binding for another
+  root key file refused too.
+- **Storage (T8).** Startup refused Docker's data root on plain ext4. It
+  accepted the data root on a LUKS2 mapping made with `--integrity
+  hmac-sha256`: the `CRYPT-LUKS2-` uuid, and the table
+  `capi:authenc(hmac(sha256),xts(aes))-plain64 … integrity:32:aead`. It
+  refused central state on a disk path and accepted it on tmpfs. There was no
+  swap. Images were imported by digest and started by content address.
+- **runsc.** Sandboxes ran under runsc with systrap, checked with `docker
+  inspect` and gVisor's `dmesg`. Exec, list by label and delete worked.
+- **Egress (T6b1).** The table was applied and verified at startup. An
+  `internet` sandbox had its tc cap attached and verified, so Docker's
+  `SandboxKey` and `eth0` held for runsc with `--network=sandbox`. The
+  sandbox got no answer from four addresses: the GCP metadata server, the VPC
+  gateway, the box's own address and the bridge gateway. It reached 1.1.1.1.
+  The metadata server and the box's own listener did answer the TD itself.
+  The VPC gateway answered neither HTTP nor ping from the TD, so that probe
+  shows little.
+- **RTMR3 and fresh-boot admission (T9).** RTMR3 read zero before the first
+  lease, in sysfs and in `GET /v1/box`. A fresh quote from configfs-tsm
+  passed the pinned strict verifier (TCB `UpToDate`), and
+  `admit(require_fresh_boot=True)` admitted it. The policy allowlisted the
+  quote's own measurement, since a rented TD has no approved image, so this
+  does not show the measurement is an approved one. The first lease extended RTMR3
+  to `RTMR3_CONSUMED`, and the next quote carried that value at body 472:520.
+  Admission then refused it for `boot_consumed` only, and admitted it without
+  `require_fresh_boot`.
+- **One customer per boot (T9).** After customer A released, the box reported
+  `needs_relaunch`. Customer B, holding another delegated key, got
+  `409 relaunch_required`. A could lease again, and RTMR3 was not extended a
+  second time.
+- **Revocation freshness gate (T7).** Before any list was pushed, routes
+  other than `GET /v1/box` got `409 revocation_list_required`. A list issued
+  25 hours earlier got `409 revocations_stale`, both before and after a
+  fresh one. A fresh list opened the routes.
+- **Scope and revocation (T7).** Routes outside a delegation's scopes got
+  `401`, and so did a request signed for another route. A revoked delegation
+  got `401`, while a sibling delegation minted before it still worked.
+
+The sandbox suite also passed in full on the TD.
+
 ## Not done (T6b2 and later)
 
-- **Measured root on hardware.** The TDREPORT read has run only against a
-  fake driver. On a real TD, T6b2 must show that `/dev/tdx_guest` is present
-  in the appliance, that the ioctl number and TDREPORT offsets hold (type at
-  0, REPORTDATA at 128, MRCONFIGID at 576), and that a launch with
-  MRCONFIGID set to `mrconfigid_for_root_keys(file)` starts while any other
-  value refuses. The appliance image must install the root key file at
-  `/usr/share/cathedral/central-root-keys.json`; no image does yet, and the
-  Cathedral root has not been minted.
-- **SNP binding.** An SNP box refuses to start. Either read HOST_DATA from
-  the SNP report (the design notes that `MEASUREMENT` does not cover it, so
-  admission would have to check it separately) or rely on the root key file
-  sitting inside the listed dm-verity root (design section 3).
+What T6b2 still needs is our own measured image, SEV-SNP, and relaunch
+orchestration by the control plane.
+
+- **Our own measured image.**
+  - **MRCONFIGID binding.** A launch with MRCONFIGID set to
+    `mrconfigid_for_root_keys(file)` must start, and any other value must
+    refuse. On hardware, the TDREPORT read works: on 2026-09-29, MRCONFIGID
+    matched the kernel's `measurements/mrconfigid`. The refusing half also
+    works (above). The starting half needs a launch whose MRCONFIGID we
+    choose. The appliance image must install the root key file at
+    `/usr/share/cathedral/central-root-keys.json`. No image does yet, and the
+    Cathedral root has not been minted.
+  - **dm-verity root.** The root key file, the worker and runsc must sit in
+    the listed dm-verity root (design section 3). See also "dm-verity images"
+    below.
+  - **The appliance boot step.** The harness's `setup.sh` makes the tmpfs,
+    turns swap off and builds the LUKS2 scratch by hand after boot, on a
+    loop-backed file. The image must do this at boot, on its own scratch disk.
+    It must also make the TLS key at each boot, on tmpfs. The harness keeps
+    the key on disk. Nothing in the image but the worker may extend RTMR3.
+  - **Image measurement.** No measured image ships runsc, the daemon runtime
+    entry, the host tools and the worker together. The opt-in layer is not
+    measured or published. Measurement approval follows the design's plan
+    steps 2 to 7.
+- **SEV-SNP.** An SNP box refuses to start. To fix that, either read
+  HOST_DATA from the SNP report, or rely on the root key file sitting inside
+  the listed dm-verity root (design section 3). The design notes that
+  `MEASUREMENT` does not cover HOST_DATA, so admission would have to check it
+  separately. SNP also needs its own mark in place of RTMR3 (a vTPM PCR). And
+  runsc has not run under an SNP guest.
+- **Relaunch orchestration (control plane, T9).** Ask the miner to relaunch
+  after `needs_relaunch`. Before each new customer, admit with
+  `require_fresh_boot=True` (and `last_released_at`) and pin that admission's
+  SPKI. Take the measurement policy from the signed list
+  (`measurement_policy`, T11) and push revocations. Give each customer (or
+  better, each allocation) its own central key. Measure relaunch-to-admission
+  time against the design's 5 minute target, and find out what the host's
+  VMM does on a guest reboot.
 - **Admission.** Admission (T3) must check that the listed measurement fixes
-  MRCONFIGID to the Cathedral root, and the control plane must push the
-  current revocation list after every start and check what the box reports
-  (see "Revocation list").
+  MRCONFIGID to the Cathedral root. The control plane must push the current
+  revocation list after every start and check what the box reports (see
+  "Revocation list").
 - **Signed high-water floor.** See the proposed `min_delegation_sequence`
   follow-up for #241 under "Revocation list".
-- **Relaunch between customers (T9).**
-  - **Hardware (T6b2).** Confirm the RTMR3 interface on a TD: that
-    `/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384` exists in
-    the appliance kernel (6.16 or later), that a read returns 48 raw bytes,
-    that a 48-byte write extends RTMR3 to `RTMR3_CONSUMED` as computed, and
-    that the next quote carries it. Measure relaunch-to-admission time
-    against the design's 5 minute target, and what the host's VMM does on a
-    guest reboot. SEV-SNP needs its own mark (a vTPM PCR); open.
-  - **Control plane.** Ask the miner to relaunch after `needs_relaunch`;
-    admit with `require_fresh_boot=True` (and `last_released_at`) before
-    each new customer and pin that admission's SPKI; take the measurement
-    policy from the signed list (`measurement_policy`, T11); push
-    revocations; and give each customer
-    (better, each allocation) its own central key.
-  - **Appliance.** Make the TLS key at each boot, on tmpfs; extend RTMR3
-    nowhere else.
-
-- **Hardware qualification.** Nothing has run on real TDX or SNP guests:
-  not runsc with systrap under a TD or an SNP guest, not gVisor's
-  overhead (system-call-heavy work pays most), capacity sizing, or the
-  guest reserve.
-- **Live egress check.** The enforcer has run against real `nft` and `tc`
-  in a network namespace, but not on a box: T6b2 must show from inside a
-  runsc sandbox that denied ranges, metadata and the box's own addresses
-  are unreachable, that the public internet works, and that the cap holds.
-  It must also show that Docker's `SandboxKey` and `eth0` hold for runsc
-  with `--network=sandbox`, and qualify DNS from inside gVisor on the
-  user-defined bridge.
-- **Lapse drill.** On a box, flush the ruleset under a running `internet`
-  sandbox and show the lapse path end to end: detection within the bound,
-  `409` on calls, the quarantine cutting the sandbox's traffic at once, and
-  the removal.
-- **Measurement list (T11).** Approval tooling for TEE box entries:
-  `scripts/cathedral_measurement_approval.py` adds one bare measurement to
-  a profile, and `accept_release` refuses that on a TEE box profile; it needs a mode that takes an
+- **Left open by the 2026-09-30 run.**
+  - **DNS inside the sandbox.** A name lookup from inside gVisor on the
+    user-defined bridge failed (`wget: bad address 'one.one.one.one'`). Egress
+    to an IP address worked. Qualify DNS, or state that sandboxes get none.
+  - **Egress cap and lapse drill.** The cap was verified in tc but its rate
+    was not measured. On a box, flush the ruleset under a running `internet`
+    sandbox and show the lapse path end to end: detection within the bound,
+    `409` on calls, the quarantine cutting the sandbox's traffic at once, and
+    the removal.
+  - **Disk quota under runsc.** The harness ran with
+    `--tee-box-no-disk-quota`. Confirm that runsc's root overlay counts
+    against the `--storage-opt` quota on the qualified storage driver.
+  - **Storage costs.** Measure what integrity costs in write throughput. The
+    dm-integrity journal doubles writes; `--integrity-no-journal` avoids that,
+    at the cost of crash consistency, which a one-boot scratch disk may not
+    need. Also qualify `--integrity-no-wipe` with the filesystem. The full
+    wipe of a 2 GiB device took 18 s. Check `RepoDigests` for every registry
+    used; only Docker Hub was tried.
+  - **gVisor overhead and sizing.** On 2026-09-29, against runc, CPU-bound
+    work was about 2% slower under runsc, `stat` about 2× slower, and 64-byte
+    writes about 7× slower. Capacity sizing and the guest reserve are not
+    settled.
+- **Measurement list (T11).** `scripts/cathedral_measurement_approval.py`
+  adds one bare measurement to a profile, and `accept_release` refuses that
+  on a TEE box profile. The approval tooling needs a mode that takes an
   image's fields (from a live quote) and writes the `tee_box` entry. The
   validator side (#256 reading the source record, or the signed list
   directly) and routing's use of `eligible_images` are not built.
-- **Image measurement.** No measured image ships runsc, the daemon runtime
-  entry, the host tools and the worker together. The opt-in layer is not
-  measured or published. Measurement approval follows the design's plan
-  steps 2 to 7.
-- **Storage on hardware (T8).** The appliance boot step above does not
-  exist yet. On a TD, T6b2 must show that the pinned cryptsetup's LUKS2
-  mapping with `--integrity hmac-sha256` has the `CRYPT-` uuid and the
-  `integrity:48:aead` table the parser expects, that mountinfo gives the
-  mapping's major:minor, that statfs from the worker sees the tmpfs, that
-  the pinned Docker runs `--pull never sha256:<id>` and prints
-  `RepoDigests` as expected for the registries used, and what integrity
-  costs in write throughput (the dm-integrity journal doubles writes;
-  `--integrity-no-journal` avoids that, at the cost of crash consistency,
-  which a one-boot scratch disk may not need).
 - **dm-verity images.** Images come from a registry and are checked when
   pulled, not on every read (see "The gap that remains"). The central
   builder's verity images would close that.
-- **Disk quota under runsc.** Confirm that runsc's root overlay counts
-  against the `--storage-opt` quota on the qualified storage driver.
-- **State across restarts.** The executor tables live in memory. A
-  restarted worker forgets its sandboxes and leases, and starts draining.
-  Its sweep removes every container with the box label, so an earlier
-  customer's sandboxes end rather than being adopted. The box is leasable
-  only once that sweep comes back clean.
+- **State across restarts.** The executor tables live in memory. A restarted
+  worker forgets its sandboxes and leases, and starts draining. Its sweep
+  removes every container with the box label, so an earlier customer's
+  sandboxes end rather than being adopted. The box is leasable only once that
+  sweep comes back clean.
