@@ -25,6 +25,10 @@ mining paths.
 [Central pool access](CENTRAL_POOL_ACCESS.md) specifies how Cathedral's central
 service would authenticate to an opted-in miner, and what it may do there.
 
+[Compute pool integrity](COMPUTE_POOL_INTEGRITY.md) records what the direct
+validator checks before it pays a machine, where that protection ends, and the
+proposed enclave-policy and signed-receipt changes.
+
 The current Cathedral validator derives weights directly from miner evidence.
 It does not consume the repository's older signed-vector publisher,
 central-enrollment, burn, or provenance flows.
