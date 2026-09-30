@@ -8,8 +8,33 @@ The new `cathedral_customer_attestation_receipt_v1` schema retains every require
 customer receipt field and adds a signed `hardware_binding` object:
 
 ```
-{"box_id":"box-0001","quote_sha256":"<64 lowercase hex>","report_data_hex":"<128 lowercase hex>"}
+{"box_id":"box-0001","machine_id":"<machine identity>","quote_sha256":"<64 lowercase hex>","report_data_hex":"<128 lowercase hex>"}
 ```
+
+`report_data_hex` is not free-form. It must equal the receipt commitment
+`customer_attestation_report_data(receipt_id, box_id, nonce_sha256)`:
+
+```
+SHA-512( "cathedral.customer-attestation.report-data\0" || u16be(1)
+         || 0x01 || u16be(len) || receipt_id (ASCII UUID)
+         || 0x02 || u16be(len) || box_id (ASCII)
+         || 0x03 || u16be(32)  || nonce_sha256 (32 raw bytes) )
+```
+
+The receipt verifier recomputes it from the signed fields and rejects a mismatch,
+and the bundle verifier requires the hardware report's REPORT_DATA to equal it.
+Because every receipt ID is unique, the producer must request a fresh quote for
+each receipt after choosing its `receipt_id`: an admission quote, or a quote bound
+to another receipt, box or nonce, is rejected. SHA-512 fills all 64 REPORT_DATA
+bytes, following `report_data_v2`.
+
+`machine_id` names the physical machine and is compared with the vendor-verified
+report: `amd-sev-snp-chip:<128 lowercase hex CHIP_ID>` for SNP, or the verifier's
+`stable_platform_id` (`tdx-platform-sha256:<64 lowercase hex>`) for TDX. The receipt
+verifier rejects a `machine_id` whose kind does not match `execution_class`
+(`snp_cpu` needs the SNP form, `tdx_cpu` the TDX form). The offline
+TDX gate already requires `platform_identity_verified=true`, so a TDX bundle whose
+verifier output lacks a matching stable platform ID is rejected.
 
 Its policy digest is SHA-256 of the exact ASCII bytes
 `cathedral.customer-attestation-receipt.policy.v1`, prefixed with `sha256:`.
@@ -61,7 +86,9 @@ receipt and vendor chain succeed. This proves authenticity and the signed
 receipt-to-evidence association. It does not independently prove the receipt's
 execution, billing or teardown assertions. Offline replay is historical evidence,
 not a fresh challenge, and does not establish the latest vendor revocation state.
-Use `max_age_seconds` to require bounded receipt age.
+`verify_attestation_bundle` requires the keyword arguments `expected_box_id` (the
+box the customer asked about) and `max_age_seconds` (a positive receipt age bound);
+neither has a default.
 
 ## API owner blocker
 
@@ -87,8 +114,9 @@ No customer authorization or real producer path was exercised.
 `tests/fixtures/attestation/snp-real-rejected-bundle.json` embeds the original real
 SNP report and its AMD certificates, with a synthetic test receipt signed by the
 existing deterministic unit-test key. The keyring and policy are fixture-only.
-The expected result is `policy` rejection because the original report violates
-current VMPL and reserved-bit policy. It is not a passing vendor demonstration.
+The expected result is `binding` rejection: the historical report predates the
+receipt commitment, so its REPORT_DATA cannot commit to any receipt. It would also
+fail current VMPL and reserved-bit policy. It is not a passing vendor demonstration.
 
 The receipt branch is stacked on workstream 1 at cathedral-sandbox commit
 `ef91fe1b3927dd2818c226182244a222651dd5f8`. It imports the shared SNP and TDX

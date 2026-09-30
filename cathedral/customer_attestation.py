@@ -1,4 +1,5 @@
 """Offline verification of a signed customer receipt and bound vendor evidence."""
+
 from __future__ import annotations
 
 import base64
@@ -13,8 +14,10 @@ from pathlib import Path
 from cathedral.common import Policy
 from cathedral.customer_receipt import (
     CUSTOMER_ATTESTATION_RECEIPT_SCHEMA,
+    SNP_MACHINE_ID_PREFIX,
     CustomerReceiptError,
     _duplicate_safe_object,
+    customer_attestation_report_data,
     verify_customer_receipt,
 )
 from cathedral.verify.snp import (
@@ -51,8 +54,11 @@ def _object(data: bytes, maximum: int) -> dict:
     if not isinstance(data, bytes) or not 0 < len(data) <= maximum:
         raise CustomerReceiptError("schema", "JSON input size is outside the accepted range")
     try:
-        value = json.loads(data, object_pairs_hook=_duplicate_safe_object,
-                           parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+        value = json.loads(
+            data,
+            object_pairs_hook=_duplicate_safe_object,
+            parse_constant=lambda _: (_ for _ in ()).throw(ValueError()),
+        )
     except (ValueError, UnicodeError, RecursionError) as exc:
         raise CustomerReceiptError("schema", "invalid or ambiguous JSON input") from exc
     if not isinstance(value, dict):
@@ -79,9 +85,13 @@ def parse_attestation_policy(data: bytes) -> Policy:
         raise CustomerReceiptError("policy", "local policy fields are invalid")
     measurements = document["allowed_measurements"]
     floor = document["min_snp_tcb"]
-    if (not isinstance(measurements, list) or not 1 <= len(measurements) <= 128
-            or any(not isinstance(item, str) or not 1 <= len(item) <= 128 for item in measurements)
-            or type(floor) is not int or not 0 <= floor < 2**64):
+    if (
+        not isinstance(measurements, list)
+        or not 1 <= len(measurements) <= 128
+        or any(not isinstance(item, str) or not 1 <= len(item) <= 128 for item in measurements)
+        or type(floor) is not int
+        or not 0 <= floor < 2**64
+    ):
         raise CustomerReceiptError("policy", "local measurement policy or SNP TCB floor is invalid")
     return Policy(allowed_measurements=frozenset(measurements), min_tcb=floor)
 
@@ -91,23 +101,41 @@ def verify_attestation_bundle(
     trusted_keys,
     policy: Policy,
     *,
-    expected_box_id: str | None = None,
-    max_age_seconds: int | None = None,
+    expected_box_id: str,
+    max_age_seconds: int,
     now: datetime | None = None,
     snpguest_path: str | None = None,
     tdx_executable: str | None = None,
     tdx_implementation_digest: str | None = None,
 ) -> dict:
+    """Verify a signed receipt and the hardware evidence it binds, offline.
+
+    ``expected_box_id`` (the box the customer asked about) and
+    ``max_age_seconds`` are required: a bundle is never accepted for an
+    unnamed box or without a receipt age bound. The evidence's REPORT_DATA
+    must equal :func:`customer_attestation_report_data` for this receipt, and
+    the vendor-verified machine identity must equal the signed ``machine_id``.
+    """
+    if not isinstance(expected_box_id, str) or not expected_box_id:
+        raise CustomerReceiptError("binding", "the expected box identity is required")
+    if (
+        isinstance(max_age_seconds, bool)
+        or not isinstance(max_age_seconds, int)
+        or max_age_seconds <= 0
+    ):
+        raise CustomerReceiptError("stale", "receipt maximum age must be positive")
     bundle = _object(data, MAX_BUNDLE_BYTES)
     if set(bundle) != {"schema", "receipt_base64", "evidence"} or bundle["schema"] != BUNDLE_SCHEMA:
         raise CustomerReceiptError("schema", "attestation bundle schema or fields are invalid")
     receipt_bytes = _decode(bundle["receipt_base64"], 256 * 1024)
-    receipt = verify_customer_receipt(receipt_bytes, trusted_keys, max_age_seconds=max_age_seconds, now=now)
+    receipt = verify_customer_receipt(
+        receipt_bytes, trusted_keys, max_age_seconds=max_age_seconds, now=now
+    )
     document = receipt.document
     if document["schema"] != CUSTOMER_ATTESTATION_RECEIPT_SCHEMA:
         raise CustomerReceiptError("binding", "legacy receipt has no signed hardware binding")
     binding = document["hardware_binding"]
-    if expected_box_id is not None and binding["box_id"] != expected_box_id:
+    if binding["box_id"] != expected_box_id:
         raise CustomerReceiptError("binding", "signed receipt belongs to another box")
     evidence = bundle["evidence"]
     if not isinstance(evidence, dict) or set(evidence) != {"kind", "quote_base64", "collateral"}:
@@ -115,49 +143,98 @@ def verify_attestation_bundle(
     quote = _decode(evidence["quote_base64"], 1024 * 1024)
     if hashlib.sha256(quote).hexdigest() != binding["quote_sha256"]:
         raise CustomerReceiptError("binding", "hardware quote does not match the signed receipt")
-    expected = bytes.fromhex(binding["report_data_hex"])
+    # Recomputed from the signed receipt fields, never taken from the bundle.
+    # verify_customer_receipt already required report_data_hex to equal it.
+    expected = customer_attestation_report_data(
+        receipt.receipt_id, binding["box_id"], document["nonce_sha256"]
+    )
     if not isinstance(policy, Policy) or not policy.allowed_measurements:
         raise CustomerReceiptError("policy", "local hardware measurement policy is required")
     kind = evidence["kind"]
     collateral = evidence["collateral"]
     if kind == "sev_snp" and document["execution_class"] == "snp_cpu":
-        if not isinstance(collateral, dict) or set(collateral) != {"vcek_base64", "ask_base64", "ark_base64"}:
+        if not isinstance(collateral, dict) or set(collateral) != {
+            "vcek_base64",
+            "ask_base64",
+            "ark_base64",
+        }:
             raise CustomerReceiptError("vendor_chain", "SNP certificate chain is incomplete")
         try:
-            chain = SnpCertificateChain(**{name: _decode(collateral[name + "_base64"], 64 * 1024, "vendor_chain")
-                                          for name in ("vcek", "ask", "ark")})
+            chain = SnpCertificateChain(
+                **{
+                    name: _decode(collateral[name + "_base64"], 64 * 1024, "vendor_chain")
+                    for name in ("vcek", "ask", "ark")
+                }
+            )
             parsed = parse_snp_report(quote)
         except ValueError as exc:
             if isinstance(exc, CustomerReceiptError):
                 raise
-            raise CustomerReceiptError("vendor_chain", "SNP report or DER chain is malformed") from exc
+            raise CustomerReceiptError(
+                "vendor_chain", "SNP report or DER chain is malformed"
+            ) from exc
         if parsed.report_data != expected:
-            raise CustomerReceiptError("binding", "SNP REPORT_DATA does not match the signed binding")
-        if (not _snp_report_is_admissible(quote, parsed)
-                or parsed.measurement not in policy.allowed_measurements
-                or not _tcb_meets_minimum(parsed.tcb.reported, policy.min_tcb, snp_generation(parsed))):
+            raise CustomerReceiptError("binding", "SNP REPORT_DATA does not commit to this receipt")
+        if SNP_MACHINE_ID_PREFIX + parsed.chip_id != binding["machine_id"]:
+            raise CustomerReceiptError(
+                "binding", "SNP chip identity does not match the signed receipt"
+            )
+        if (
+            not _snp_report_is_admissible(quote, parsed)
+            or parsed.measurement not in policy.allowed_measurements
+            or not _tcb_meets_minimum(parsed.tcb.reported, policy.min_tcb, snp_generation(parsed))
+        ):
             raise CustomerReceiptError("policy", "SNP report fails the unchanged admission policy")
         try:
-            verdict = verify_snp_offline(quote, expected, policy, vcek_der=chain.vcek,
-                                         ask_der=chain.ask, ark_der=chain.ark,
-                                         snpguest_path=snpguest_path, raise_on_verifier_unavailable=True)
+            verdict = verify_snp_offline(
+                quote,
+                expected,
+                policy,
+                vcek_der=chain.vcek,
+                ask_der=chain.ask,
+                ark_der=chain.ark,
+                snpguest_path=snpguest_path,
+                raise_on_verifier_unavailable=True,
+            )
         except SnpVerifierUnavailable as exc:
-            raise CustomerReceiptError("vendor_unavailable", "pinned SNP verifier is unavailable") from exc
+            raise CustomerReceiptError(
+                "vendor_unavailable", "pinned SNP verifier is unavailable"
+            ) from exc
         if verdict is None or verdict.chain_verified is not True:
-            raise CustomerReceiptError("vendor_chain", "AMD certificate chain or report signature failed")
+            raise CustomerReceiptError(
+                "vendor_chain", "AMD certificate chain or report signature failed"
+            )
         measurement = verdict.measurement
         current_reason = "offline SNP replay does not establish current vendor revocation state"
     elif kind == "tdx" and document["execution_class"] == "tdx_cpu":
         encoded = _decode(collateral, 24 * 1024 * 1024, "vendor_chain")
         if not tdx_executable or not tdx_implementation_digest:
-            raise CustomerReceiptError("vendor_unavailable", "local TDX executable and implementation digest are required")
+            raise CustomerReceiptError(
+                "vendor_unavailable", "local TDX executable and implementation digest are required"
+            )
         try:
-            claims = verify_tdx_offline(quote, expected, encoded, executable=tdx_executable,
-                                        implementation_digest=tdx_implementation_digest)
+            claims = verify_tdx_offline(
+                quote,
+                expected,
+                encoded,
+                executable=tdx_executable,
+                implementation_digest=tdx_implementation_digest,
+            )
         except TdxOfflineUnavailable as exc:
-            raise CustomerReceiptError("vendor_unavailable", "pinned offline TDX verifier is unavailable") from exc
+            raise CustomerReceiptError(
+                "vendor_unavailable", "pinned offline TDX verifier is unavailable"
+            ) from exc
         if not claims:
-            raise CustomerReceiptError("vendor_chain", "Intel signature, collateral validity, revocation or TCB check failed")
+            raise CustomerReceiptError(
+                "vendor_chain",
+                "Intel signature, collateral validity, revocation or TCB check failed",
+            )
+        # verify_tdx_offline requires platform_identity_verified=true, so the
+        # stable platform ID is vendor-derived and must name the signed machine.
+        if claims.get("stable_platform_id") != binding["machine_id"]:
+            raise CustomerReceiptError(
+                "binding", "TDX platform identity does not match the signed receipt"
+            )
         measurement = claims.get("measurement")
         if measurement not in policy.allowed_measurements:
             raise CustomerReceiptError("policy", "TDX measurement is outside local policy")
@@ -171,6 +248,7 @@ def verify_attestation_bundle(
         "verification_scope": "cathedral_receipt_and_vendor_hardware",
         "receipt_id": receipt.receipt_id,
         "box_id": binding["box_id"],
+        "machine_id": binding["machine_id"],
         "hardware_kind": kind,
         "measurement": measurement,
         "collateral_current": False,
