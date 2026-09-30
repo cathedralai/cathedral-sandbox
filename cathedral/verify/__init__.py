@@ -55,8 +55,13 @@ def verify(
     *,
     raise_on_verifier_unavailable: bool = False,
     deadline_monotonic: float | None = None,
+    capture_box_id: str | None = None,
 ) -> Attested | None:
     """Verify one piece of evidence against the policy. None => rejected.
+
+    ``capture_box_id`` is optional context for opt-in evidence capture
+    (``CATHEDRAL_SNP_CAPTURE_DIR`` / ``CATHEDRAL_TDX_CAPTURE_DIR``); it is
+    written to the capture's metadata sidecar and never affects the verdict.
 
     Steps (per vendor, Phase 1):
       1. vendor-verify the quote's signature + cert chain (KDS / DCAP / NRAS)
@@ -77,9 +82,10 @@ def verify(
             policy,
             raise_on_verifier_unavailable=raise_on_verifier_unavailable,
             deadline_monotonic=deadline_monotonic,
+            capture_box_id=capture_box_id,
         )
     if evidence.kind is EvidenceKind.TDX:
-        return _verify_tdx(evidence, nonce, policy)
+        return _verify_tdx(evidence, nonce, policy, capture_box_id=capture_box_id)
     if evidence.kind is EvidenceKind.GPU_CC:
         # A GPU component can never produce a standalone admission verdict.
         # cathedral.gpu.verify_composite_gpu performs configured external
@@ -121,6 +127,8 @@ def _verify_tdx(
     policy: Policy,
     _pinned_replay_command: list[str] | None = None,
     _pinned_timeout: float | None = None,
+    *,
+    capture_box_id: str | None = None,
 ) -> Attested | None:
     """TDX verifier adapter.
 
@@ -150,6 +158,8 @@ def _verify_tdx(
         expected_report_data=expected_report_data,
         pinned_command=_pinned_replay_command,
         pinned_timeout=_pinned_timeout,
+        capture_nonce=nonce or None,
+        capture_box_id=capture_box_id,
     )
     # Both flags must be the exact JSON boolean true; missing, malformed, or
     # false (including string forms and integers) all reject.
@@ -532,6 +542,8 @@ def _run_tdx_verifier(
     expected_report_data: bytes | None = None,
     pinned_command: list[str] | None = None,
     pinned_timeout: float | None = None,
+    capture_nonce: bytes | None = None,
+    capture_box_id: str | None = None,
 ) -> dict[str, Any]:
     """Invoke the external TDX verifier and return its parsed JSON claims.
 
@@ -606,8 +618,11 @@ def _run_tdx_verifier(
         verifier_args.append(str(quote_path))
         if production_mode:
             verifier_args.append(production_expected_hex)
-        capture_directory = (os.environ.get("CATHEDRAL_TDX_CAPTURE_DIR")
-                             if production_mode and pinned_command is None else None)
+        capture_directory = (
+            os.environ.get("CATHEDRAL_TDX_CAPTURE_DIR")
+            if production_mode and pinned_command is None
+            else None
+        )
         capture_path = Path(td) / "collateral.json"
         if capture_directory:
             verifier_args.extend(["--capture-collateral", str(capture_path)])
@@ -622,10 +637,17 @@ def _run_tdx_verifier(
             return {}  # reject: verifier exceeded time budget
         if returncode == 0 and capture_directory:
             from cathedral.verify.tdx_offline import persist_tdx_capture
+
             try:
                 with capture_path.open("rb") as captured:
                     collateral_bytes = captured.read(24 * 1024 * 1024 + 1)
-                persist_tdx_capture(quote, collateral_bytes, Path(capture_directory))
+                persist_tdx_capture(
+                    quote,
+                    collateral_bytes,
+                    Path(capture_directory),
+                    admission_nonce=capture_nonce,
+                    box_id=capture_box_id,
+                )
             except (OSError, ValueError):
                 return {}  # configured admission capture must be durable
 
