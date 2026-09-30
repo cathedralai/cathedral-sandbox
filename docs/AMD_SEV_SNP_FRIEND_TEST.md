@@ -31,6 +31,81 @@ Report version 2, report version 6, an unknown processor family, a changed AMD
 root, or a different `snpguest` binary fails closed. Supporting any of them
 requires a reviewed source update.
 
+### Socket policy and hardware identity
+
+Two separate rules are easy to confuse. One is a validator option. The other is
+not optional and is now confirmed on real hardware.
+
+**The socket bit is the validator owner's choice.** The guest launch policy bit
+`SINGLE_SOCKET` (bit 20, `POLICY.SINGLE_SOCKET` in AMD publication 56860) gates
+whether the validator will use the report's CHIP_ID as the machine identity.
+Since cathedral-validator #235 that gate is an owner policy field,
+`require_single_socket`, which defaults to `true`. A validator that leaves the
+default refuses a report without the bit as `snp_single_socket_required`,
+whatever the measurement and TCB.
+
+Why the default matters on a multi-socket host: AMD firmware refuses to activate
+a `SINGLE_SOCKET` guest through `SNP_ACTIVATE`, and only `SNP_ACTIVATE_EX` can
+pin a guest to one socket (56860 section 4.4). Upstream Linux KVM issues
+`SNP_ACTIVATE` only. So on a host with two or more populated sockets you cannot
+launch a guest that satisfies the default, and your validator's operator must
+decide whether to set `require_single_socket` to `false`. The flag is
+policy-wide: it applies to every admitted processor generation, not to one
+(cathedral-validator `cathedral_thin/independent_runtime/snp_production.py`
+lines 57-61 and 103-112).
+
+`cathedral-validator-setup` accepts the key on current cathedral-validator
+main. Since cathedral-validator #266 (merged 2026-09-29), its `_validate_policy`
+allows `require_single_socket` beside `schema` and `generations` and refuses a
+value that is not a JSON boolean, as the runtime does
+(`deploy/validator-update/cathedral-validator-setup` lines 291-302). Setup is
+installed from the signed updater bootstrap
+(`deploy/validator-update/install_updater_bundle.py` lines 95-100), and the
+published bootstrap, sequence 3, was signed on 2026-09-27, before #266
+(`cathedral-validator/docs/AUTO_UPDATE.md` line 121). So a host installed with
+bootstrap sequence 3 or earlier still refuses any policy that contains the key,
+whatever its value, with "SNP policy has an unsupported production shape",
+until its next bootstrap. That includes the `require_single_socket: true`
+that this repository's #222 policy entry carries for a guest with the bit.
+
+On SN39, by operator report (unverified in-repo), UID30 set
+`require_single_socket` to `false` on 2026-09-08 and admitted a two-socket
+`milan` host that same day. Setup refused the key then, so that would have
+needed a manual policy install. The date matches the merge of
+cathedral-validator #235, which added the flag. That is one validator's
+decision. Ask your target validator's operator rather than assuming.
+
+**Hardware identity dedup is not optional.** Linux routes every SNP command,
+including the guest's attestation request, through one PSP on the host. On
+2026-09-08 we ran the direct test: two guests on one confirmed shared physical
+host both verified against the AMD chain and returned the identical chip
+pseudonym `5a8e82885be3a995`, identical measurement, and identical reported TCB.
+
+The validator scores every machine that shares a CHIP_ID with another machine in
+the same fleet as zero, under `duplicate_hardware_indexes`. Two guests on one
+host therefore cancel each other out rather than doubling anything. Run one SNP
+guest per physical host for scoring purposes.
+
+That experiment used one host and did not establish the socket placement of the
+two guests, so it confirms same-host CHIP_ID collision and does not by itself
+prove the general cross-socket case.
+
+Customer capacity offered from one host is not a second scoring machine. The
+direct validator pays one unit per surviving verified machine row per UID. In
+cathedral-validator, `cathedral_thin/independent_runtime/fleet_score.py` lines
+1064-1092 set every claimant of a repeated hardware identity to zero (the
+repeats are found by `duplicate_hardware_indexes`,
+`cathedral_thin/independent_runtime/multicompute.py` lines 165-187), and
+`cathedral_thin/independent_runtime/direct_validator.py` lines 515-519 then
+count the rows that remain per UID. So adding customer slots cannot multiply
+reward claims for one chip. The weight computation in those three files never
+reads customer capacity. Since cathedral-validator #257, `direct_validator.py`
+can also score SN94 prober capacity receipts, but only as a shadow record made
+after the weight write, which never reaches the weight plan
+(`direct_validator.py` lines 1131-1162 and 1426-1429,
+`cathedral_thin/independent_runtime/capacity_shadow.py` lines 35-37). So this
+document makes no claim about how customer capacity itself is accounted.
+
 ## Requirements and first hardware proof
 
 - An x86-64 Linux SEV-SNP guest where root can read and write the native
