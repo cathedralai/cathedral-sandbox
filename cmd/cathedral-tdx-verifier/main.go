@@ -142,14 +142,18 @@ func refuseUnsafeCollateralRedirect(req *http.Request, via []*http.Request) erro
 	return nil
 }
 
-func (g *intelHTTPSGetter) markUnavailable() {
+// recordOutcome keeps the outcome of the latest collateral request only: an
+// earlier outage followed by a request that got an answer (a body, or a
+// terminal refusal) is not an outage any more. Verification stops at the
+// first request it cannot use, so the latest outcome is the one that decided.
+func (g *intelHTTPSGetter) recordOutcome(outage bool) {
 	g.mu.Lock()
-	g.unavailable = true
+	g.unavailable = outage
 	g.mu.Unlock()
 }
 
-// collateralUnavailable reports whether any collateral request in this run
-// failed because Intel's service did not give a usable answer.
+// collateralUnavailable reports whether the latest collateral request in this
+// run got no usable answer from Intel's service.
 func (g *intelHTTPSGetter) collateralUnavailable() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -243,6 +247,7 @@ func (g *intelHTTPSGetter) GetContext(
 		return nil, nil, errors.New("invalid collateral URL")
 	}
 	if err := prepareIntelCollateralURL(parsed); err != nil {
+		g.recordOutcome(false)
 		return nil, nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
@@ -252,24 +257,21 @@ func (g *intelHTTPSGetter) GetContext(
 	req.Header.Set("Accept", "application/json, application/pkix-crl, application/octet-stream")
 	resp, err := g.client.Do(req)
 	if err != nil {
-		if !errors.Is(err, errCollateralRedirectRefused) {
-			g.markUnavailable()
-		}
+		g.recordOutcome(!errors.Is(err, errCollateralRedirectRefused))
 		return nil, nil, errors.New("collateral request failed")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		if _, transient := transientCollateralStatuses[resp.StatusCode]; transient ||
-			resp.StatusCode >= http.StatusInternalServerError {
-			g.markUnavailable()
-		}
+		_, transient := transientCollateralStatuses[resp.StatusCode]
+		g.recordOutcome(transient || resp.StatusCode >= http.StatusInternalServerError)
 		return nil, nil, fmt.Errorf("collateral endpoint returned HTTP %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCollateralBytes+1))
 	if err != nil {
-		g.markUnavailable()
+		g.recordOutcome(true)
 		return nil, nil, errors.New("could not read collateral response")
 	}
+	g.recordOutcome(false)
 	if len(body) > maxCollateralBytes {
 		return nil, nil, errors.New("collateral response exceeds size limit")
 	}
@@ -383,21 +385,38 @@ func verifyAndBuildClaims(
 		return nil, err
 	}
 	if err := verify.TdxQuoteContext(ctx, quote, options); err != nil {
-		if collateralWasUnavailable(options) {
-			return nil, errCollateralUnavailable
-		}
-		return nil, errors.New("Intel quote, collateral, revocation, or TCB verification failed")
+		return nil, verificationFailure(stageQuoteAndCollateral, options)
 	}
 	if err := requireCurrentCollateralLevels(quote, options); err != nil {
-		if collateralWasUnavailable(options) {
-			return nil, errCollateralUnavailable
-		}
-		return nil, errors.New("Intel platform, TDX module, or QE is not fully current")
+		return nil, verificationFailure(stageCurrentLevels, options)
 	}
 	if err := validateLaunchQuote(quote); err != nil {
 		return nil, errors.New("quote uses launch-disallowed TDX attributes")
 	}
 	return buildVerifiedClaims(quote, body, expectedReportData)
+}
+
+type verificationStage int
+
+const (
+	// stageQuoteAndCollateral fetches collateral, so a failure there can be
+	// Intel's service not answering.
+	stageQuoteAndCollateral verificationStage = iota
+	// stageCurrentLevels runs only after every collateral request succeeded.
+	// A platform, TDX module or QE that is not fully current is a fact about
+	// the miner's machine, so it is always an invalid quote: reporting it as
+	// an outage would let a miner with stale firmware stop the round.
+	stageCurrentLevels
+)
+
+func verificationFailure(stage verificationStage, options *verify.Options) error {
+	if stage == stageQuoteAndCollateral {
+		if collateralWasUnavailable(options) {
+			return errCollateralUnavailable
+		}
+		return errors.New("Intel quote, collateral, revocation, or TCB verification failed")
+	}
+	return errors.New("Intel platform, TDX module, or QE is not fully current")
 }
 
 func collateralWasUnavailable(options *verify.Options) bool {
