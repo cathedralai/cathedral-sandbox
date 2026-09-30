@@ -52,7 +52,7 @@ launch a guest that satisfies the default, and your validator's operator must
 decide whether to set `require_single_socket` to `false`. The flag is
 policy-wide: it applies to every admitted processor generation, not to one
 (cathedral-validator `cathedral_thin/independent_runtime/snp_production.py`
-lines 55-59 and 101-110).
+lines 57-61 and 103-112).
 
 `cathedral-validator-setup` accepts the key on current cathedral-validator
 main. Since cathedral-validator #266 (merged 2026-09-29), its `_validate_policy`
