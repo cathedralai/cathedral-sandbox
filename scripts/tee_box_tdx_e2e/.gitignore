@@ -1,0 +1,5 @@
+# Local output of run.sh, run_tests.sh and harness.py --local (never commit)
+/out/
+/local/
+/venvs/
+/results/
