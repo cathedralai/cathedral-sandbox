@@ -10,6 +10,7 @@ operator guide.
 - [Validator access and multi-machine fleet protocol](WORK_REQUEST_V2.md)
 - [Intel TDX verifier release](TDX_VERIFIER_RELEASE.md)
 - [AMD SEV-SNP miner and first hardware proof](AMD_SEV_SNP_FRIEND_TEST.md)
+- [Run an SNP miner on your own server, in order](SNP_OWN_SERVER_ONBOARDING.md)
 - [Development tests](TESTING.md)
 
 These pages explain a narrow contract. They do not replace the README's launch
