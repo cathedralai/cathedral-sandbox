@@ -8,6 +8,7 @@ request while that file is missing or unusable.
 
 from __future__ import annotations
 
+import io
 import os
 import threading
 from pathlib import Path
@@ -272,6 +273,31 @@ def test_a_fifo_swapped_in_later_refuses_requests_without_blocking(tmp_path):
 
     _write(path, _revocations(3, []))
     _accept(authorizer, _header(nonce=b"d" * 32))
+
+
+def test_a_directory_at_the_revocation_path_refuses_to_start(tmp_path):
+    # A directory passes the size bound (its st_size is a block), so only the
+    # regular-file check keeps the read from raising IsADirectoryError.
+    path = tmp_path / "revocations.json"
+    path.mkdir(mode=0o755)
+
+    with pytest.raises(ca.CentralAccessError, match="bounded regular file"):
+        _authorizer(tmp_path, path)
+
+
+def test_a_file_that_grows_past_the_cap_while_read_is_refused(tmp_path, monkeypatch):
+    path = _write(tmp_path / "revocations.json", _revocations(2, []))
+    real_fdopen = os.fdopen
+
+    def grown(descriptor, mode="r", *args, **kwargs):
+        if mode == "rb":
+            os.close(descriptor)
+            return io.BytesIO(b"x" * (ca.MAX_REVOCATIONS_FILE_BYTES + 1))
+        return real_fdopen(descriptor, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", grown)
+    with pytest.raises(ca.CentralAccessError, match="grew past its size limit"):
+        _authorizer(tmp_path, path)
 
 
 # CLI ------------------------------------------------------------------------
