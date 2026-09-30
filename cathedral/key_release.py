@@ -1892,6 +1892,7 @@ class KeyReleaseService:
                 "attestation_denied", "worker attestation does not satisfy key-release policy"
             )
         try:
+            # Derived from the verified tier: Attested carries no evidence kind.
             attested_evidence_kind = _CPU_TIER_EVIDENCE_KIND[attested.tier]
         except (KeyError, TypeError) as exc:
             raise KeyReleaseError(
