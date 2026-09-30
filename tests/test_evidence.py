@@ -2425,6 +2425,42 @@ def test_export_evidence_refuses_a_current_verifier_on_a_historical_pin(
     assert not evidence_dir.exists()
 
 
+def test_export_evidence_ignores_an_archived_verifier_under_a_different_pin(tmp_path: Path, capsys):
+    """The archived epoch copy is reused for a historical pin only when its
+    own verifier digest equals the frozen report's. An archived copy under a
+    different digest must not lend its binary and command to this report."""
+    evidence_dir = _prepared_export_workspace(tmp_path)
+    snapshot_path = tmp_path / "candidate-snapshot.json"
+    assert cli_main(_export_evidence_args(tmp_path, snapshot_path, evidence_dir=evidence_dir)) == 0
+    capsys.readouterr()
+
+    (archived_path,) = (evidence_dir / "epochs").glob("*.json")
+    archived = json.loads(archived_path.read_bytes())
+    assert archived["verifier"]["digest"] == VERIFIER_DIGEST
+    other_pin = "sha256:" + "c" * 64
+    assert other_pin != VERIFIER_DIGEST
+    archived["verifier"]["digest"] = other_pin
+    archived_path.chmod(0o644)
+    archived_path.write_bytes(json.dumps(archived, sort_keys=True, separators=(",", ":")).encode())
+
+    verifier = tmp_path / "today-verifier.bin"
+    verifier.write_bytes(b"\x7fELF-today")
+    assert (
+        cli_main(
+            _export_evidence_args(
+                tmp_path,
+                snapshot_path,
+                evidence_dir=evidence_dir,
+                verifier_digest="sha256:" + "e" * 64,
+                verifier_binary=str(verifier),
+                verifier_production_path="/opt/cathedral/bin/verifier",
+            )
+        )
+        != 0
+    )
+    assert "cannot bind the current verifier" in capsys.readouterr().err
+
+
 def test_export_evidence_fails_closed_when_no_release_carries_the_pinned_digest(
     tmp_path: Path, capsys
 ):

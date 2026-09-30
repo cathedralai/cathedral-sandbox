@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 from datetime import UTC, datetime, timedelta
@@ -42,7 +43,9 @@ def _manifest(**over: object) -> dict:
     return document
 
 
-def _files_for_manifest(manifest: dict, *, signed: bool = False) -> tuple[str, dict[str, bytes]]:
+def _files_for_manifest(
+    manifest: dict, *, signed: bool = False, index_generated_at: datetime = NOW
+) -> tuple[str, dict[str, bytes]]:
     body = json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode()
     digest = digest_bytes(body)
     hex_digest = digest.removeprefix("sha256:")
@@ -55,7 +58,7 @@ def _files_for_manifest(manifest: dict, *, signed: bool = False) -> tuple[str, d
             recent=[],
             signing_key_id="evidence-index-test-1",
             private_key_seed=INDEX_SEED,
-            generated_at=NOW.strftime("%Y-%m-%dT%H:%M:%S.000000Z"),
+            generated_at=index_generated_at.strftime("%Y-%m-%dT%H:%M:%S.000000Z"),
         )
     else:
         index = json.dumps({"latest": {"manifest": digest}}).encode()
@@ -142,7 +145,7 @@ def test_load_latest_manifest_rejects_an_unhashed_pointer() -> None:
         f"https://evidence.test/blobs/sha256/{'00' * 32}": json.dumps(_manifest()).encode(),
     }
     with pytest.raises(DriftError, match="do not hash"):
-        load_latest_manifest("https://evidence.test", fetch=lambda url: files[url])
+        load_latest_manifest("https://evidence.test", fetch=lambda url: files[url], netuid=39)
 
 
 def test_load_latest_manifest_reads_the_public_index_shape() -> None:
@@ -150,6 +153,7 @@ def test_load_latest_manifest_reads_the_public_index_shape() -> None:
     got, manifest = load_latest_manifest(
         "https://evidence.test",
         fetch=lambda url: files[url],
+        netuid=39,
     )
     assert got == digest
     assert manifest["reward_mechanism"]["id"] == DEFAULT_MECHANISM_ID
@@ -166,6 +170,7 @@ def test_load_latest_manifest_verifies_a_signed_index() -> None:
         "https://evidence.test",
         fetch=lambda url: files[url],
         index_keys={"evidence-index-test-1": public},
+        netuid=39,
         require_signed_index=True,
         now=NOW,
     )
@@ -179,11 +184,14 @@ def test_load_latest_manifest_rejects_unsigned_index_when_required() -> None:
         load_latest_manifest(
             "https://evidence.test",
             fetch=lambda url: files[url],
+            netuid=39,
             require_signed_index=True,
         )
 
 
-def test_main_prints_ok_for_a_matching_surface(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_main_prints_ok_for_a_matching_surface(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     manifest = _manifest()
     digest, files = _files_for_manifest(manifest)
     release_path = tmp_path / "release.json"
@@ -201,12 +209,15 @@ def test_main_prints_ok_for_a_matching_surface(tmp_path: Path, capsys: pytest.Ca
             [
                 "--evidence-url",
                 "https://evidence.test",
+                "--netuid",
+                "39",
                 "--release",
                 str(release_path),
                 "--max-age-minutes",
                 "180",
             ],
             fetch=lambda url: files[url],
+            now=NOW,
         )
         == 0
     )
@@ -214,11 +225,73 @@ def test_main_prints_ok_for_a_matching_surface(tmp_path: Path, capsys: pytest.Ca
     assert digest.startswith("sha256:")
 
 
+def test_main_freshness_reads_the_injected_clock() -> None:
+    """A tip fresh by the wall clock is stale under the injected clock, so the
+    freshness gate provably reads `now` and the fixed-date fixtures above
+    never age out."""
+    wall = datetime.now(UTC).replace(microsecond=0)
+    _digest, files = _files_for_manifest(
+        _manifest(generated_at=wall.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    )
+    with pytest.raises(DriftError, match="generated_at"):
+        main(
+            [
+                "--evidence-url",
+                "https://evidence.test",
+                "--netuid",
+                "39",
+                "--max-age-minutes",
+                "180",
+            ],
+            fetch=lambda url: files[url],
+            now=wall + timedelta(hours=4),
+        )
+
+
 def test_main_requires_release_when_asked() -> None:
     with pytest.raises(DriftError, match="requires --release"):
-        main(["--require-release", "--evidence-url", "https://evidence.test"])
+        main(["--require-release", "--evidence-url", "https://evidence.test", "--netuid", "39"])
 
 
 def test_main_requires_index_keys_when_signed_index_is_required() -> None:
     with pytest.raises(DriftError, match="requires --index-keys"):
-        main(["--require-signed-index", "--evidence-url", "https://evidence.test"])
+        main(
+            ["--require-signed-index", "--evidence-url", "https://evidence.test", "--netuid", "39"]
+        )
+
+
+def test_main_requires_the_netuid() -> None:
+    # The netuid is deploy config: no default quietly supplies one.
+    with pytest.raises(SystemExit) as refused:
+        main(["--evidence-url", "https://evidence.test"])
+    assert refused.value.code == 2
+
+
+def test_main_verifies_a_signed_index_against_the_injected_clock(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The signed index is dated after the wall clock but not after the
+    injected one, so verify_index accepts it only if main passes `now` on."""
+    later = datetime.now(UTC).replace(microsecond=0) + timedelta(days=1)
+    manifest = _manifest(generated_at=later.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    digest, files = _files_for_manifest(manifest, signed=True, index_generated_at=later)
+    public = (
+        Ed25519PrivateKey.from_private_bytes(INDEX_SEED)
+        .public_key()
+        .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    )
+    keys = tmp_path / "evidence-index-keys.json"
+    keys.write_text(json.dumps({"evidence-index-test-1": base64.b64encode(public).decode()}))
+    argv = [
+        "--evidence-url",
+        "https://evidence.test",
+        "--netuid",
+        "39",
+        "--index-keys",
+        str(keys),
+        "--require-signed-index",
+    ]
+    assert main(argv, fetch=lambda url: files[url], now=later + timedelta(minutes=1)) == 0
+    assert json.loads(capsys.readouterr().out)["manifest"] == digest
+    with pytest.raises(DriftError, match="in the future"):
+        main(argv, fetch=lambda url: files[url], now=later - timedelta(minutes=1))
