@@ -62,6 +62,26 @@ def test_a_root_file_changed_after_launch_refuses(image_root: Path):
         measured_root.load_measured_root_keys("tdx", read_binding=lambda: binding)
 
 
+@pytest.mark.parametrize(
+    ("contents", "match"),
+    [
+        (b"[]", "central root keys are unusable"),
+        (
+            canonical_json(
+                {"cathedral-root-1": base64.b64encode(bytes([1]) + bytes(31)).decode("ascii")}
+            ),
+            "is a small-order Ed25519 point",
+        ),
+    ],
+    ids=["malformed", "identity-key"],
+)
+def test_a_measured_but_unusable_root_file_refuses_cleanly(image_root: Path, contents, match):
+    image_root.write_bytes(contents)
+    binding = measured_root.mrconfigid_for_root_keys(contents)
+    with pytest.raises(measured_root.MeasuredRootError, match=match):
+        measured_root.load_measured_root_keys("tdx", read_binding=lambda: binding)
+
+
 def test_snp_and_unknown_tees_refuse(image_root: Path):
     with pytest.raises(measured_root.MeasuredRootError, match="HOST_DATA"):
         measured_root.load_measured_root_keys("snp")

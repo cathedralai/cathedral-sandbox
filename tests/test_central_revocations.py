@@ -9,6 +9,7 @@ request while that file is missing or unusable.
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -224,6 +225,53 @@ def test_a_symlinked_revocation_file_is_refused(tmp_path):
 
     with pytest.raises(ca.CentralAccessError, match="unavailable"):
         _authorizer(tmp_path, link)
+
+
+def _without_blocking(action) -> BaseException | None:
+    """Run ``action`` in a thread and return what it raised; fail if it blocks."""
+
+    raised: list[BaseException | None] = []
+
+    def run() -> None:
+        try:
+            action()
+        except BaseException as exc:  # noqa: BLE001 - handed back to the test
+            raised.append(exc)
+        else:
+            raised.append(None)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "opening the revocation path blocked on a FIFO"
+    return raised[0]
+
+
+def test_a_fifo_at_the_revocation_path_refuses_to_start_without_blocking(tmp_path):
+    # Opened without O_NONBLOCK, a FIFO waits for a writer and hangs startup.
+    path = tmp_path / "revocations.json"
+    os.mkfifo(path, 0o644)
+
+    raised = _without_blocking(lambda: _authorizer(tmp_path, path))
+
+    assert isinstance(raised, ca.CentralAccessError)
+    assert "bounded regular file" in str(raised)
+
+
+def test_a_fifo_swapped_in_later_refuses_requests_without_blocking(tmp_path):
+    path = _write(tmp_path / "revocations.json", _revocations(2, []))
+    authorizer = _authorizer(tmp_path, path)
+    _accept(authorizer, _header())
+    path.unlink()
+    os.mkfifo(path, 0o644)
+
+    for nonce in (b"b" * 32, b"c" * 32):
+        raised = _without_blocking(lambda nonce=nonce: _accept(authorizer, _header(nonce=nonce)))
+        assert isinstance(raised, ca.CentralAccessError)
+        assert "bounded regular file" in str(raised)
+
+    _write(path, _revocations(3, []))
+    _accept(authorizer, _header(nonce=b"d" * 32))
 
 
 # CLI ------------------------------------------------------------------------
