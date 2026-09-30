@@ -2,10 +2,11 @@
 # TEE box guest setup for the end-to-end harness. Run as root on the TD (run.sh
 # ships it and runs it with sudo; see README.md).
 #
-#   setup.sh prepare   packages, pinned runsc registered with docker (systrap),
-#                      classic image store, tmpfs for the central state, no swap,
-#                      the harness venv. Docker's data root is NOT moved yet, so
-#                      the harness can show the storage refusal on plain ext4.
+#   setup.sh prepare   the test-box marker, packages, pinned runsc registered
+#                      with docker (systrap), classic image store, tmpfs for the
+#                      central state, no swap, the harness venv. Docker's data
+#                      root is NOT moved yet, so the harness can show the storage
+#                      refusal on plain ext4.
 #   setup.sh luks      a LUKS2 integrity scratch device (aes-xts-plain64 +
 #                      hmac-sha256, random key kept only in ramfs during setup),
 #                      ext4 on it, docker's data root moved onto it, docker
@@ -32,12 +33,19 @@ DOCKER_ROOT="$SCRATCH_MNT/docker"
 IMAGE_REF=${IMAGE_REF:-docker.io/library/alpine}
 IMAGE_DIGEST=${IMAGE_DIGEST:-sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc}
 VENV=${VENV:-/opt/cathedral-e2e/venv}
+# harness.py and serve_worker.py refuse to run without this marker. It sits on
+# tmpfs, so it goes away at the next boot. Keep in step with serve_worker.py.
+MARKER_DIR=/run/cathedral-tee-e2e
+MARKER=$MARKER_DIR/TEST_BOX
+# The LUKS key lives in a ramfs under here, only while the scratch is formatted.
+KEY_PARENT=${KEY_PARENT:-/run}
+# Global, not local: the EXIT trap reads it after the function has returned,
+# and under set -u a local would be unbound there.
+KEY_DIR=
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 log() { printf '[setup %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 die() { printf '[setup] ERROR: %s\n' "$*" >&2; exit 1; }
-
-[ "$(id -u)" = 0 ] || die "run as root (sudo)"
 
 wait_docker() {
   for _ in $(seq 1 60); do
@@ -160,8 +168,22 @@ harness_venv() {
   log "harness venv created at $VENV"
 }
 
+# The marker says: this TD is a disposable test box, set up by this script, in
+# this boot. harness.py and serve_worker.py check it before they touch anything.
+write_marker() {
+  mkdir -p "$MARKER_DIR"
+  chmod 0755 "$MARKER_DIR"
+  [ "$(findmnt -no FSTYPE --target "$MARKER_DIR")" = tmpfs ] \
+    || die "$MARKER_DIR is not on tmpfs; the test-box marker must vanish at reboot"
+  printf 'cathedral TEE box e2e TEST BOX, disposable; boot_id %s\n' \
+    "$(cat /proc/sys/kernel/random/boot_id)" > "$MARKER"
+  chmod 0644 "$MARKER"
+  log "test-box marker written at $MARKER (tmpfs; gone at the next boot)"
+}
+
 phase_prepare() {
   check_tdx
+  write_marker
   need_packages python3-venv python3-pip cryptsetup-bin nftables iproute2 util-linux dmsetup e2fsprogs curl git
   command -v docker >/dev/null || die "docker is not installed"
   [ -x /usr/bin/docker ] || die "the worker expects the docker CLI at /usr/bin/docker"
@@ -182,6 +204,40 @@ phase_prepare() {
   log "prepare done; docker root: $(docker info --format '{{.DockerRootDir}}')"
 }
 
+# Shred the key and unmount its ramfs. Runs from the EXIT trap too, so it only
+# uses globals and never fails.
+cleanup_key() {
+  [ -n "$KEY_DIR" ] || return 0
+  shred -u "$KEY_DIR/key" 2>/dev/null || rm -f "$KEY_DIR/key" 2>/dev/null
+  if mountpoint -q "$KEY_DIR" 2>/dev/null; then umount "$KEY_DIR" 2>/dev/null; fi
+  rmdir "$KEY_DIR" 2>/dev/null
+  if [ -e "$KEY_DIR" ]; then
+    printf '[setup] ERROR: could not remove the key directory %s; remove it by hand\n' "$KEY_DIR" >&2
+  fi
+  KEY_DIR=
+  return 0
+}
+
+# format_and_open DEVICE NAME: LUKS2 with integrity under a random 64-byte key
+# that exists only in a ramfs, then open it as /dev/mapper/NAME. The key is
+# shredded and the ramfs unmounted whether this succeeds or fails.
+format_and_open() {
+  local device=$1 name=$2
+  KEY_DIR=$(mktemp -d "$KEY_PARENT/cathedral-key.XXXXXX")
+  trap cleanup_key EXIT
+  trap 'exit 130' INT TERM HUP   # so the EXIT trap runs on a signal too
+  mount -t ramfs -o mode=0700 ramfs "$KEY_DIR"   # never swapped
+  head -c 64 /dev/urandom > "$KEY_DIR/key"
+  log "luksFormat: LUKS2, aes-xts-plain64, 512-bit key, integrity hmac-sha256, pbkdf2 1000 iterations"
+  cryptsetup luksFormat --batch-mode --type luks2 \
+    --cipher aes-xts-plain64 --key-size 512 --integrity hmac-sha256 \
+    --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
+    --key-file "$KEY_DIR/key" "$device"
+  cryptsetup open --type luks2 --key-file "$KEY_DIR/key" "$device" "$name"
+  cleanup_key
+  trap - EXIT INT TERM HUP
+}
+
 phase_luks() {
   need_packages cryptsetup-bin e2fsprogs
   if mountpoint -q "$SCRATCH_MNT" && [ -e "/dev/mapper/$SCRATCH_NAME" ]; then
@@ -197,25 +253,11 @@ phase_luks() {
     rm -f "$SCRATCH_IMG"
     fallocate -l "${SCRATCH_GIB}G" "$SCRATCH_IMG"
     chmod 0600 "$SCRATCH_IMG"
-    local loopdev key_dir started
+    local loopdev started
     loopdev=$(losetup --find --show "$SCRATCH_IMG")
     log "backing file $SCRATCH_IMG (${SCRATCH_GIB} GiB) on $loopdev"
-    key_dir=$(mktemp -d /run/cathedral-key.XXXXXX)
-    mount -t ramfs -o mode=0700 ramfs "$key_dir"
-    # On any failure below, do not leave the key behind.
-    trap 'shred -u "$key_dir/key" 2>/dev/null; umount "$key_dir" 2>/dev/null; rmdir "$key_dir" 2>/dev/null' EXIT
-    head -c 64 /dev/urandom > "$key_dir/key"
     started=$(date +%s)
-    log "luksFormat: LUKS2, aes-xts-plain64, 512-bit key, integrity hmac-sha256, pbkdf2 1000 iterations"
-    cryptsetup luksFormat --batch-mode --type luks2 \
-      --cipher aes-xts-plain64 --key-size 512 --integrity hmac-sha256 \
-      --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
-      --key-file "$key_dir/key" "$loopdev"
-    cryptsetup open --type luks2 --key-file "$key_dir/key" "$loopdev" "$SCRATCH_NAME"
-    shred -u "$key_dir/key"
-    umount "$key_dir"
-    rmdir "$key_dir"
-    trap - EXIT
+    format_and_open "$loopdev" "$SCRATCH_NAME"
     log "luksFormat + open took $(( $(date +%s) - started )) s; key shredded, ramfs unmounted"
     mkfs.ext4 -q -F -L cathedral-scratch "/dev/mapper/$SCRATCH_NAME"
     mkdir -p "$SCRATCH_MNT"
@@ -242,7 +284,7 @@ phase_luks() {
 
 status_luks() {
   local dev uuid
-  dev=$(findmnt -no MAJ:MIN "$SCRATCH_MNT" 2>/dev/null || true)
+  dev=$(findmnt -no MAJ:MIN "$SCRATCH_MNT" 2>/dev/null | tr -d '[:space:]' || true)
   uuid=$(cat "/sys/dev/block/$dev/dm/uuid" 2>/dev/null || true)
   log "scratch device $dev dm uuid ${uuid:-?}"
   # Never print a key: mask the key field of every crypt segment.
@@ -251,6 +293,7 @@ status_luks() {
 }
 
 phase_status() {
+  echo "marker: $(cat "$MARKER" 2>/dev/null || echo "none at $MARKER")"
   echo "runsc: $(sha256sum "$RUNSC_PATH" 2>/dev/null | cut -d' ' -f1)"
   echo "docker root: $(docker info --format '{{.DockerRootDir}} {{.Driver}} {{json .DriverStatus}}' 2>/dev/null)"
   echo "docker runsc: $(docker info --format '{{json .Runtimes.runsc}}' 2>/dev/null)"
@@ -259,10 +302,16 @@ phase_status() {
   status_luks
 }
 
-case "${1:-all}" in
-  prepare) phase_prepare ;;
-  luks) phase_luks ;;
-  all) phase_prepare; phase_luks ;;
-  status) phase_status ;;
-  *) die "usage: setup.sh prepare|luks|all|status" ;;
-esac
+main() {
+  [ "$(id -u)" = 0 ] || die "run as root (sudo)"
+  case "${1:-all}" in
+    prepare) phase_prepare ;;
+    luks) phase_luks ;;
+    all) phase_prepare; phase_luks ;;
+    status) phase_status ;;
+    *) die "usage: setup.sh prepare|luks|all|status" ;;
+  esac
+}
+
+# Sourcing defines the functions only (for tests).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
