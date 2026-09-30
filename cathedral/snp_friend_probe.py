@@ -51,7 +51,9 @@ from cathedral.verify.snp import (
     MAX_SNPGUEST_BYTES,
     PINNED_SNPGUEST_SHA256,
     PINNED_SNPGUEST_VERSION,
+    SnpReport,
     parse_snp_report,
+    snp_generation,
 )
 from cathedral.worker import WorkerServer
 
@@ -62,6 +64,21 @@ SECOND_HOTKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 DEFAULT_SEV_GUEST_DEVICE = Path("/dev/sev-guest")
 PROBE_TIMEOUT_SECONDS = 120.0
 FRIEND_SNPGUEST_TIMEOUT_SECONDS = 15.0
+VALIDATOR_POLICY_SCHEMA = "cathedral_amd_sev_snp_policy_v1"
+GUEST_POLICY_SINGLE_SOCKET = 1 << 20
+SINGLE_SOCKET_WARNING = (
+    "this guest was launched without the SINGLE_SOCKET policy bit; the validator "
+    "requires that bit for every SNP miner by default, so this guest will be refused. "
+    "Relaunch it with the bit set. validator_policy_entry deliberately omits "
+    "require_single_socket: setting it to false is a global policy change that turns "
+    "the socket check off for every SNP miner, and must be a separate, explicit decision."
+)
+# TCB bytes the validator compares per generation; every other byte is reserved.
+_TCB_COMPONENT_BYTES = {
+    "milan": (0, 1, 6, 7),
+    "genoa": (0, 1, 6, 7),
+    "turin": (0, 1, 2, 3, 7),
+}
 
 
 class ProbeError(RuntimeError):
@@ -445,8 +462,14 @@ def run_probe(review_challenge: bytes) -> dict[str, Any]:
                 b"cathedral.amd-sev-snp.platform.v1\x00" + bytes.fromhex(parsed.chip_id),
                 hashlib.sha256,
             ).hexdigest(),
+            "processor_generation": snp_generation(parsed),
+            "current_tcb_hex": f"0x{parsed.tcb.current:016x}",
             "reported_tcb_hex": f"0x{parsed.tcb.reported:016x}",
+            "committed_tcb_hex": f"0x{parsed.tcb.committed:016x}",
+            "launch_tcb_hex": f"0x{parsed.tcb.launch:016x}",
         },
+        "validator_policy_entry": validator_policy_entry(parsed),
+        "validator_policy_warnings": validator_policy_warnings(parsed),
         "channel": {
             "binding_type": binding.binding_type.value,
             "binding_digest": "sha256:" + binding.digest.hex(),
@@ -459,6 +482,57 @@ def run_probe(review_challenge: bytes) -> dict[str, Any]:
             "durable_machine_dedup_proven": False,
         },
     }
+
+
+def validator_policy_entry(parsed: SnpReport) -> dict[str, Any]:
+    """Return the exact validator SNP policy entry this observed guest needs.
+
+    The validator applies one component-wise floor to the current, reported,
+    committed and launch TCB, so the floor is the per-component minimum of all
+    four, with the generation's reserved bytes left at zero.
+
+    ``require_single_socket`` is global to the validator policy, so the entry
+    only ever carries it as ``true``. A guest without the SINGLE_SOCKET bit
+    gets no such field, never ``false``: pasting ``false`` would switch the
+    socket check off for every SNP miner. :func:`validator_policy_warnings`
+    says why such a guest stays refused.
+    """
+
+    generation = snp_generation(parsed)
+    if generation not in _TCB_COMPONENT_BYTES:
+        raise ProbeError("the processor generation is not one the validator admits")
+    values = (parsed.tcb.current, parsed.tcb.reported, parsed.tcb.committed, parsed.tcb.launch)
+    encoded = [value.to_bytes(8, "little") for value in values]
+    floor = bytearray(8)
+    for index in _TCB_COMPONENT_BYTES[generation]:
+        floor[index] = min(value[index] for value in encoded)
+    minimum_tcb = int.from_bytes(floor, "little")
+    if minimum_tcb == 0:
+        raise ProbeError("every TCB component is zero; the validator refuses a zero floor")
+    entry: dict[str, Any] = {
+        "schema": VALIDATOR_POLICY_SCHEMA,
+        "generations": {
+            generation: {
+                "allowed_measurements": [parsed.measurement],
+                "minimum_tcb": f"0x{minimum_tcb:016x}",
+            }
+        },
+    }
+    if _has_single_socket_bit(parsed):
+        entry["require_single_socket"] = True
+    return entry
+
+
+def validator_policy_warnings(parsed: SnpReport) -> list[str]:
+    """Return what the operator must know before merging the policy entry."""
+
+    if _has_single_socket_bit(parsed):
+        return []
+    return [SINGLE_SOCKET_WARNING]
+
+
+def _has_single_socket_bit(parsed: SnpReport) -> bool:
+    return bool(parsed.guest_policy & GUEST_POLICY_SINGLE_SOCKET)
 
 
 def _write_new(path: Path, document: dict[str, Any]) -> None:
@@ -499,6 +573,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         print(json.dumps(failure, sort_keys=True), file=sys.stderr)
         return 1
+    for warning in result.get("validator_policy_warnings", ()):
+        print(f"WARNING: {warning}", file=sys.stderr)
     print(
         json.dumps(
             {
