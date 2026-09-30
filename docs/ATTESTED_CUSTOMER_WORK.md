@@ -1,16 +1,17 @@
 # Attested customer work
 
 Status: **draft, and not ready to build**. This document exists to record a
-problem with the obvious design before anyone implements it. The small
-admission decision in this change is implemented and tested. The guarantee the
-feature is meant to sell is **not** delivered by that decision, and this
-document says why.
+problem with the obvious design before anyone implements it. An earlier
+revision of #205 carried a small admission decision; it has been
+removed (see "What this document records"), so this change is documentation
+only. The guarantee the feature is meant to sell would **not** be delivered by
+such a decision, and this document says why.
 
 ## The problem, honestly stated
 
 The runtime sends customer work to any miner that answers
 `{"customer_sat": true}` on `/v1/capabilities`
-(`cathedral/runtime.py:1446-1464`). That is a claim made by code the machine's
+(`cathedral/runtime.py:1456-1479`). That is a claim made by code the machine's
 operator controls.
 
 The obvious fix is to pin the TEE measurement, so only an approved guest image
@@ -18,7 +19,7 @@ can receive work. **That fix does not do what it appears to do.**
 
 The measurement is a hash of boot-time state — MRTD plus the runtime
 measurement registers (`docs/MRTD.md`). The worker is a Python package sitting
-on the guest filesystem (`Dockerfile.sn39-audit-miner:21`), started after boot.
+on the guest filesystem (`Dockerfile.sn94-audit-miner:26`), started after boot.
 Nothing extends a measurement register when that code is read, and no OCI layer
 digest is in the measurement. So an operator can:
 
@@ -97,10 +98,12 @@ also carried a caller-side admission module,
 `customer_work_admission.py`. Review recommended removing it, and it has been removed. The reasons
 are worth recording, because the same module will otherwise be rebuilt:
 
-- **It is not a security boundary.** `Attested` is a plain dataclass whose
-  `verification_status` defaults to `"VERIFIED"` and whose `chain_verified`
-  defaults to `True`. A hand-built or defaulted verdict is therefore admitted.
-  The module's own docstring said so.
+- **It was not a security boundary.** When it was reviewed, `Attested` was a
+  plain dataclass whose `verification_status` defaulted to `"VERIFIED"` and
+  whose `chain_verified` defaulted to `True`, so a hand-built or defaulted
+  verdict was admitted. The module's own docstring said so. #208 has since
+  changed those two defaults (below), but `Attested` is still a plain dataclass
+  that any caller can construct.
 - **It has no callers.** Nothing in the dispatcher or the worker imports it.
 - **A security-shaped object that is not a security boundary is a net
   negative.** A future engineer grepping for it finds a plausible control,
@@ -110,17 +113,23 @@ are worth recording, because the same module will otherwise be rebuilt:
 
 ### The field class, in full
 
-Fields of `Attested` whose **default is the admitted value**:
+Fields of `Attested` whose default was the admitted value when the module was
+reviewed, and their defaults on `main` since #208 (`cathedral/common.py`):
 
-| Field | Default | Consequence |
-|---|---|---|
-| `verification_status` | `"VERIFIED"` | the admitted value itself |
-| `chain_verified` | `True` | the admitted value itself |
-| `advisory_ids` | `()` | `set(()).issubset(allowed)` passes vacuously |
-| `policy_mode` | `None` | coerced to "compatibility", the weaker mode |
+| Field | Default then | Default now | Consequence now |
+|---|---|---|---|
+| `verification_status` | `"VERIFIED"` | `"UNVERIFIED"` (line 214) | a defaulted verdict is refused by the gates that check it (`cathedral/neuron/validator.py:101`, `cathedral/key_release.py:1615`, `cathedral/gpu.py:222` and `:2524`) |
+| `chain_verified` | `True` | `False` (line 215) | a defaulted verdict claims no vendor chain |
+| `advisory_ids` | `()` | `()` (line 217) | unchanged: `set(()).issubset(allowed)` passes vacuously |
+| `policy_mode` | `None` | `None` (line 224) | unchanged: recorded as "compatibility", the weaker mode, in the ledger (`cathedral/runtime.py:1325`) |
 
-The TDX, mock and GPU builders never set the first two. Every bypass found
-across four review rounds was an instance of this one class.
+Every bypass found across four review rounds was an instance of this one
+class. The builders now declare the first two instead of inheriting them: TDX
+sets `"VERIFIED"` and `True` (`cathedral/verify/__init__.py:242-243`), the mock
+sets `"VERIFIED"` and `False` (`cathedral/verify/mock.py:146-147`), and the GPU
+preview leaves both at the fail-closed defaults (`cathedral/gpu.py:2590-2593`).
+SNP already declared both from its chain verdict
+(`cathedral/verify/snp.py:714-715`).
 
 ### Where the decision belongs instead
 
@@ -131,9 +140,12 @@ an admission decision must live in the process that runs the verifier.
 The durable fix is to make the verdict carry provenance: a required field with
 no default, assigned only by the verifier, so a defaulted or hand-built verdict
 fails everywhere at once. Cost: `proto/evidence.proto`, four construction
-sites, gate reads, and the receipt and ledger schema. A cheaper partial is to
-delete the two permissive verdict defaults and use an explicit sentinel for
-`advisory_ids`.
+sites, gate reads, and the receipt and ledger schema. That fix is still open.
+
+The cheaper partial proposed here has largely landed: #208 made the two
+permissive verdict defaults fail closed (`cathedral/common.py:210-215`). The
+explicit sentinel for `advisory_ids` has not, and `policy_mode` still defaults
+to `None`.
 
 ## What this change does not do
 
@@ -175,8 +187,9 @@ determined operator can satisfy with a different worker on the same guest.
 - Confidentiality covers guest memory and register state. It does **not** cover
   the guest's persistent disk, and it does **not** detect an operator restoring
   an earlier disk image.
-- On the Intel TDX path as the direct SN39 validator is currently configured,
-  no measurement allowlist is applied at all.
+- On the Intel TDX path the direct validator applies no measurement
+  allowlist; it accepts no TDX measurement policy as input
+  (`docs/DESIGN.md:22-27`).
 - Capacity is whatever miners are online. Bursty, unreserved, no SLA.
 - Results are verified, not merely reported.
 - State the resource ceiling per workload rather than implying one general
