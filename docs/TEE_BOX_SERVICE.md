@@ -1113,7 +1113,9 @@ it installed. The following ran for real on the TD:
 - **RTMR3 and fresh-boot admission (T9).** RTMR3 read zero before the first
   lease, in sysfs and in `GET /v1/box`. A fresh quote from configfs-tsm
   passed the pinned strict verifier (TCB `UpToDate`), and
-  `admit(require_fresh_boot=True)` admitted it. The first lease extended RTMR3
+  `admit(require_fresh_boot=True)` admitted it. The policy allowlisted the
+  quote's own measurement, since a rented TD has no approved image, so this
+  does not show the measurement is an approved one. The first lease extended RTMR3
   to `RTMR3_CONSUMED`, and the next quote carried that value at body 472:520.
   Admission then refused it for `boot_consumed` only, and admitted it without
   `require_fresh_boot`.

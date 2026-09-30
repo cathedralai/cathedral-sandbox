@@ -1,5 +1,13 @@
 # TEE box end-to-end harness for a real Intel TDX guest (T6b2)
 
+> **TEST HARNESS ONLY: NOT A PRODUCTION LAUNCHER.** It injects the MRCONFIGID
+> binding and overwrites `/usr/share/cathedral/central-root-keys.json` with a
+> throwaway root. `harness.py` and `serve_worker.py` refuse to run unless
+> `setup.sh prepare` has marked the current boot as a disposable test box. The
+> marker is `/run/cathedral-tee-e2e/TEST_BOX`, on tmpfs, so it goes away at
+> reboot. In local mode (`--local` or `E2E_LOCAL=1`) they refuse on any machine
+> that has `/dev/tdx_guest`.
+
 This harness runs the real TEE box worker on an Intel TDX guest and talks to it
 the way Cathedral's control plane and customers would. The worker is
 `cathedral worker serve` with the TEE box flags, described in
@@ -48,6 +56,12 @@ refuses on such a launch.
   image, and so do the dm-verity root and a real appliance boot step. The
   harness's `setup.sh` does the boot step by hand, after boot, on a loop-backed
   file, and keeps the worker's TLS key on disk.
+- **That the measurement is an approved one.** d.2 and d.5 build their policy
+  from the quote itself. They allowlist the quote's own measurement, TCB status
+  and advisories, because a rented TD has no approved image to compare against.
+  So these checks prove the quote's signature and collateral, the REPORT_DATA
+  binding, and the RTMR3 and `require_fresh_boot` logic. They do not prove the
+  measurement is one Cathedral approved.
 - **Items outside the run.** SEV-SNP, relaunch between customers and its
   timing, the egress lapse drill, disk quotas (the worker runs with
   `--tee-box-no-disk-quota`), the tc cap's measured rate, and integrity write
@@ -145,15 +159,16 @@ the suite results.
   digest. `IMAGE_REF` and `IMAGE_DIGEST` change it.
 
 The LUKS key is 64 random bytes made on the box. It is held in a ramfs only
-until `cryptsetup open`, then shredded. It is never printed: the key field of
-the dm table is masked in every log.
+until `cryptsetup open`, then shredded and the ramfs unmounted. An EXIT trap
+does the same when `luksFormat` or `open` fails, or on a signal. The key is
+never printed: the key field of the dm table is masked in every log.
 
 ## Files
 
 | File | Role |
 |---|---|
 | `run.sh` | Runs on your machine: bundles, ships, runs each step over SSH, collects and summarises. |
-| `setup.sh` | Runs as root on the TD. `prepare`: packages, pinned runsc registered with Docker (systrap), tmpfs for the central state, swap off, the harness venv. `luks`: the LUKS2 integrity scratch device, Docker's data root moved onto it, the test image pulled. |
+| `setup.sh` | Runs as root on the TD. `prepare`: the test-box marker, packages, pinned runsc registered with Docker (systrap), tmpfs for the central state, swap off, the harness venv. `luks`: the LUKS2 integrity scratch device, Docker's data root moved onto it, the test image pulled. |
 | `harness.py` | Checks a to g, in two phases: `pre-luks` (the ext4 refusal) and `main`. It prints one line per check and writes a JSON report. |
 | `serve_worker.py` | Starts the real worker CLI with the injected MRCONFIGID reader, the only change. |
 | `run_tests.sh` | Runs the cathedral-sandbox suite and the cathedral-validator suites against sandbox main, then re-runs failures once to separate flakes. |

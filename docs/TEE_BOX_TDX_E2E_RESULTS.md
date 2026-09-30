@@ -30,12 +30,21 @@ and "Not done" sections take this run into account.
 
 - **cathedral-sandbox:** main at `40f818b58a5de19274332050b0140a30f4fdd47e`.
 - **cathedral-validator:** main at `2e197b9eb81a3c15da4476d215ca0735481811e0`.
-- **The harness:** the files in `scripts/tee_box_tdx_e2e/`. The committed copy
-  differs from the one that ran only in packaging. ruff formatted
-  `harness.py`, and its syntax tree is unchanged. A few shellcheck warnings
-  were fixed. `run.sh` got a new output directory and new repository defaults,
-  and it now fetches the verifier from its release instead of copying a local
-  file. The checks are unchanged.
+- **The harness:** the files in `scripts/tee_box_tdx_e2e/`. The checks are
+  unchanged from the run. The committed copy differs from the one that ran in
+  these ways:
+  - ruff formatting;
+  - two changed strings in `harness.py`: the module docstring's description of
+    `--local`, and a skip message used only in local mode;
+  - a test-only banner, and a guard: `harness.py` and `serve_worker.py` refuse
+    to run without the marker from `setup.sh prepare`, and local mode refuses
+    on a TDX guest;
+  - in `setup.sh`, the LUKS key cleanup on failure now works (the EXIT trap
+    read a local variable that was out of scope), and the scratch device's
+    major:minor has its padding stripped in the status log;
+  - shellcheck fixes;
+  - `run.sh`: a new output directory, new repository defaults, and fetching
+    the verifier from its release instead of copying a local file.
 
 ## Required checks
 
@@ -44,7 +53,7 @@ and "Not done" sections take this run into account.
 | a. Storage and measured root | PASS (a.1 to a.12) | Startup refused Docker's data root on plain ext4. It accepted the data root on the LUKS2 mapping: uuid `CRYPT-LUKS2-…`, table `capi:authenc(hmac(sha256),xts(aes))-plain64 … integrity:32:aead`. Central state on disk refused, and on tmpfs was accepted. There was no swap, and runsc ran with systrap. The real TDREPORT reader refused ("MRCONFIGID is zero: the launch bound no central root"), and a binding for another root key file refused. The egress table was verified at startup. |
 | b. Revocation freshness gate | PASS (b.1 to b.6) | `GET /v1/box` was served before any list, and other routes got `409 revocation_list_required`. A list issued 25 hours earlier got `409 revocations_stale`, both before and after a fresh one. A fresh list opened the routes. |
 | c. Lease and sandbox lifecycle | PASS (c.1 to c.8) | Customer A leased the box and imported the image by digest. A `deny_all` sandbox ran under runsc from the pinned image id, with gVisor's `dmesg` and a `4.19.0-gvisor` uname. `exec echo hello` returned `hello`. List by label, delete, and a `404` afterwards all worked. |
-| d. RTMR3 and fresh-boot admission | PASS (d.1 to d.5) | Before the lease, RTMR3 read zero in sysfs and in `GET /v1/box`. A fresh quote bound to the nonce, hotkey and TLS key passed the strict verifier, and `admit(require_fresh_boot=True)` admitted it. After the lease RTMR3 held `RTMR3_CONSUMED`, and the next quote carried it at body 472:520. Admission then refused for `boot_consumed` only, and admitted without `require_fresh_boot`. |
+| d. RTMR3 and fresh-boot admission | PASS (d.1 to d.5) | Before the lease, RTMR3 read zero in sysfs and in `GET /v1/box`. A fresh quote bound to the nonce, hotkey and TLS key passed the strict verifier, and `admit(require_fresh_boot=True)` admitted it. After the lease RTMR3 held `RTMR3_CONSUMED`, and the next quote carried it at body 472:520. Admission then refused for `boot_consumed` only, and admitted without `require_fresh_boot`. The policy allowlisted each quote's own measurement, TCB status and advisories (see Observations). |
 | e. Egress | PASS (e.1 to e.7, e.10) | The `internet` sandbox had its tc cap attached and verified. It got no answer from the GCP metadata server, the VPC gateway, the box's own address or the bridge gateway. `http://1.1.1.1/` answered `301` from Cloudflare. |
 | f. One customer per boot | PASS (f.1 to f.4) | After A released, the box reported `needs_relaunch`. Customer B, holding another delegated key, got `409 relaunch_required` on lease and list. A leased again with a re-delegated key, and RTMR3 was not extended a second time. |
 | g. Scope and revocation | PASS (g.1 to g.4) | A delegation scoped to the box route alone got `401` everywhere else. A request signed for `GET /v1/box` and sent to `/v1/lease` got `401`. A revoked delegation got `401` although the offline tool still verified it, while a sibling delegation minted before it kept working. |
@@ -52,7 +61,11 @@ and "Not done" sections take this run into account.
 ## Observations
 
 - **Quotes.** Both quotes had TCB status `UpToDate`, no advisories, current
-  collateral, and debug off. The fresh quote's measurement
+  collateral, and debug off. d.2 and d.5 allowlist the quote's own
+  measurement, TCB status and advisories, because a rented TD has no approved
+  image to compare against. So they prove the signature and collateral, the
+  REPORT_DATA binding, and the RTMR3 and `require_fresh_boot` logic. They do
+  not prove the measurement is an approved one. The fresh quote's measurement
   (`tdx-measurement-sha256:83e10f55…`) differs from the consumed quote's
   (`…9e38f69d…`) because the measurement covers the RTMRs. That is why each
   image needs two list entries ("Two measurements per image" in

@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""End-to-end harness for the cathedral-sandbox TEE box on a real Intel TDX guest.
+"""TEST HARNESS ONLY: NOT A PRODUCTION LAUNCHER (injects MRCONFIGID, overwrites root keys).
+
+It injects the MRCONFIGID binding and overwrites
+/usr/share/cathedral/central-root-keys.json with a throwaway root. It refuses to
+run unless setup.sh has marked this boot as a disposable test box
+(``/run/cathedral-tee-e2e/TEST_BOX``, on tmpfs); ``--local`` refuses on any
+machine that has ``/dev/tdx_guest``.
+
+End-to-end harness for the cathedral-sandbox TEE box on a real Intel TDX guest.
 
 It runs the real worker (``cathedral worker serve`` with the TEE box flags, via
 serve_worker.py) and talks to it as a central-access client: root-signed
@@ -824,6 +832,11 @@ class Harness:
             )
             return out
         claims = json.loads(run.stdout)
+        # The policy allowlists the quote's OWN measurement, TCB status and
+        # advisories: there is no approved image to compare against on a rented
+        # TD. So d.2/d.5 prove the signature, collateral, REPORT_DATA binding and
+        # the RTMR3 / require_fresh_boot logic, not that the measurement is one
+        # Cathedral approved.
         out["claims"] = {
             k: claims.get(k)
             for k in (
@@ -1662,6 +1675,9 @@ def main() -> int:
         help="local only: run the verifier+admission path on the saved quote",
     )
     args = parser.parse_args()
+    from serve_worker import require_test_box
+
+    require_test_box(args.local)
     if args.work is None:
         args.work = str(HERE / "local" / "work") if args.local else "/var/lib/cathedral-e2e"
     if not args.local and os.geteuid() != 0:
