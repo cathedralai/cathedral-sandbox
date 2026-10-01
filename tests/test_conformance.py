@@ -201,3 +201,21 @@ def test_cleanup_deletes_everything_the_run_created():
     api, fake = make()
     run(api, C.Config(samples=2), {"create.first", "create.cached", "create.idempotent", "lifecycle.delete"})
     assert fake.live() == 0
+
+
+def test_computesdk_score_matches_their_formula():
+    # 1 s everywhere, all succeed: 100 x (1 - 0.1) = 90.
+    assert C.computesdk_score([1000.0] * 10, 10) == 90.0
+    # Half fail: the success rate halves the score.
+    assert C.computesdk_score([1000.0] * 5, 10) == 45.0
+    # Slower than the 10 s ceiling floors at zero.
+    assert C.computesdk_score([20_000.0], 1) == 0.0
+    assert C.computesdk_score([], 10) == 0.0
+
+
+def test_burst_tti_measures_to_first_command():
+    api, _ = make()
+    report = run(api, C.Config(burst=5), {"create.burst_tti"})
+    result = by_id(report)["create.burst_tti"]
+    assert result["measured"]["succeeded"] == 5
+    assert result["status"] == "pass", result

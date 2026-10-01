@@ -52,6 +52,7 @@ and is deleted at the end, also after a crash, then swept again by label.
 | `usage.by_label` | mvp | §3.13 | usage groups by a label and carries a cost |
 | `docker.nested` | mvp | §3.10, §3.17 | dockerd starts, `docker run -v` bind-mounts, 50 networks create |
 | `snapshot.fork` | later | §3.5, §4 test 4 | snapshot ready in 30 s, 8 forks running in 15 s each, identical pre-fork bytes, independent writes, forks survive the parent's delete |
+| `create.burst_tti` | later | [ComputeSDK Burst TTI](https://www.computesdk.com/benchmarks/sandboxes/burst-tti/) | `--burst` concurrent creates (ComputeSDK runs 100), timed to the first successful command; all succeed and median < 1 s. Reports ComputeSDK's composite score so we know our board position before we list |
 | `quota.full_429` | later | §3.8 | a create past quota answers 429 with Retry-After in under 1 s |
 
 `quota.full_429` fills the remaining quota first, so it runs only when that

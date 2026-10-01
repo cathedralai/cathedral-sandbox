@@ -87,6 +87,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--samples", type=int, default=Config.samples)
     parser.add_argument("--exec-samples", type=int, default=Config.exec_samples)
     parser.add_argument("--fork-count", type=int, default=Config.fork_count)
+    parser.add_argument("--burst", type=int, default=Config.burst,
+                        help="concurrent creates for create.burst_tti (ComputeSDK runs 100)")
     parser.add_argument("--max-fill", type=int, default=Config.max_fill,
                         help="most sandboxes quota.full_429 may create to reach the limit")
     parser.add_argument("--max-spend-usd", default=Config.max_spend_usd, help="per-sandbox spend cap")
@@ -106,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"unknown check ids: {sorted(unknown)}", file=sys.stderr)
         return 2
     config = Config(image=args.image, template=args.template, samples=args.samples,
-                    exec_samples=args.exec_samples, fork_count=args.fork_count,
+                    exec_samples=args.exec_samples, fork_count=args.fork_count, burst=args.burst,
                     max_fill=args.max_fill, max_spend_usd=args.max_spend_usd)
     report = run(Api(args.api_url, key, team=args.team), config, only, args.strict,
                  log=lambda line: print(line, file=sys.stderr))

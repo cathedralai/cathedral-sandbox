@@ -47,6 +47,7 @@ class Config:
     samples: int = 3
     exec_samples: int = 20
     fork_count: int = 8
+    burst: int = 10
     max_fill: int = 10
     nested_networks: int = 50
 
@@ -184,6 +185,45 @@ def create_cached(ctx: Context):
                 "p95_s": round(percentile(times, 95), 2), "failures": len(failures)}
     ok = not failures and measured["p50_s"] < 10 and measured["p95_s"] < 60
     return ("pass" if ok else "fail"), measured, "; ".join(failures)
+
+
+def computesdk_score(times_ms: list[float], attempts: int) -> float:
+    """ComputeSDK's composite: 100 x (1 - ms / 10,000) on median 60 %, p95 25 %,
+    p99 15 %, each floored at 0, times the success rate."""
+    if not times_ms:
+        return 0.0
+    part = lambda pct: max(0.0, 1 - percentile(times_ms, pct) / 10_000)  # noqa: E731
+    return round(100 * (0.6 * part(50) + 0.25 * part(95) + 0.15 * part(99)) * len(times_ms) / attempts, 1)
+
+
+@check("create.burst_tti", "Burst time to interactive (ComputeSDK method)", "ComputeSDK Burst TTI",
+       "N concurrent creates; create() to first successful `true`; all succeed; median < 1 s",
+       tier="later", needs_primary=False)
+def create_burst_tti(ctx: Context):
+    def one(_):
+        started = ctx.api.clock()
+        reply = ctx.create()
+        if not reply.ok:
+            return None, reply.summary()
+        sandbox_id = reply.json()["id"]
+        # TTI ends at the first command that succeeds, not at state=running.
+        while ctx.api.clock() - started < ctx.config.create_timeout_s:
+            ran = ctx.api.exec(sandbox_id, ["true"], timeout_seconds=10)
+            if ran.ok and (ran.json() or {}).get("exit_code") == 0:
+                return (ctx.api.clock() - started) * 1000, ""
+            ctx.api.sleep(0.1)
+        return None, f"{sandbox_id} never ran a command"
+
+    n = ctx.config.burst
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        outcomes = list(pool.map(one, range(n)))
+    times = [t for t, _ in outcomes if t is not None]
+    errors = [e for t, e in outcomes if t is None]
+    measured: dict[str, Any] = {"n": n, "succeeded": len(times), "score": computesdk_score(times, n)}
+    if times:
+        measured.update({f"p{p}_ms": round(percentile(times, p)) for p in (50, 95, 99)})
+    ok = not errors and measured.get("p50_ms", 10**9) < 1000
+    return ("pass" if ok else "fail"), measured, "; ".join(sorted(set(errors)))[:500]
 
 
 @check("create.idempotent", "Same Idempotency-Key makes one sandbox", "§3.12",
