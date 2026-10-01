@@ -37,6 +37,7 @@ cathedral = "cathedral.cli:main"
 cathedral-census = "cathedral.census:main"
 cathedral-prober = "cathedral.prober:main"
 cathedral-snp-friend-probe = "cathedral.snp_friend_probe:main"
+cathedral-conformance = "cathedral.conformance.runner:main"
 
 [build-system]
 requires = ["hatchling"]
