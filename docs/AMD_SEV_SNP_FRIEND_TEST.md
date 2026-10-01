@@ -210,7 +210,10 @@ overwrites an existing transcript.
 - Fresh nonce, miner hotkey, measurement, TCB, and TLS SPKI binding.
 - VMPL 0, debug disabled, and migration-agent disabled policy checks.
 - Rejection of the wrong nonce, hotkey, TLS key, measurement, and a tampered
-  signature.
+  signature. A rejection counts only when the verifier actually ran: if AMD KDS
+  is unavailable (for example HTTP 429), any check that needed it stops the
+  probe as inconclusive ("... is inconclusive: the AMD verifier was
+  unavailable"), and nothing passes. Run the probe again later.
 - One canonical SAT round trip.
 - A second report after hotkey and TLS-key rotation with a matching,
   review-scoped platform pseudonym.

@@ -356,3 +356,43 @@ def test_policy_entry_refuses_an_unknown_generation_or_a_zero_floor():
         probe.validator_policy_entry(_report(0x17, 0x01, tcbs, 0x30000))
     with pytest.raises(probe.ProbeError, match="zero floor"):
         probe.validator_policy_entry(_report(0x19, 0x01, (_tcb({2: 9}),) * 4, 0x30000))
+
+
+def test_an_unavailable_amd_verifier_makes_a_negative_control_inconclusive(monkeypatch):
+    # verify() returns None both for a refusal and, by default, for an AMD
+    # outage such as KDS rate limiting. The tampered-signature control must not
+    # count an outage as "rejected": it has to stop the probe as inconclusive.
+    seen = {}
+
+    def unavailable(_evidence, _nonce, _policy, **kwargs):
+        seen.update(kwargs)
+        raise probe.SnpVerifierUnavailable("AMD KDS returned 429")
+
+    monkeypatch.setattr(probe, "verify", unavailable)
+    with pytest.raises(
+        probe.ProbeError, match="tampered-signature negative control is inconclusive"
+    ):
+        probe._verify_or_inconclusive(
+            object(), b"n" * 32, object(), what="the tampered-signature negative control"
+        )
+    assert seen == {"raise_on_verifier_unavailable": True}
+
+
+def test_a_genuine_refusal_and_a_success_pass_through_unchanged(monkeypatch):
+    monkeypatch.setattr(probe, "verify", lambda *_args, **_kwargs: None)
+    assert probe._verify_or_inconclusive(object(), b"n" * 32, object(), what="x") is None
+
+    attested = object()
+    monkeypatch.setattr(probe, "verify", lambda *_args, **_kwargs: attested)
+    assert probe._verify_or_inconclusive(object(), b"n" * 32, object(), what="x") is attested
+
+
+def test_every_amd_verification_in_the_probe_reports_outages():
+    # Every attestation verify() in the probe goes through the outage-aware
+    # helper, so no check can report a result the verifier never reached.
+    import inspect
+    import re
+
+    source = inspect.getsource(probe.run_probe)
+    assert source.count("_verify_or_inconclusive(") == 7
+    assert not re.search(r"(?<![\w.])verify\(", source)
