@@ -43,7 +43,7 @@ from cryptography.x509.oid import NameOID
 
 from cathedral.attest import collect_snp
 from cathedral.channel import tls_spki_binding
-from cathedral.common import ChannelBinding, Policy, Tier, issue_nonce
+from cathedral.common import ChannelBinding, Evidence, Policy, Tier, issue_nonce
 from cathedral.lanes.sat import SatLane
 from cathedral.remote import RemoteMiner
 from cathedral.verify import verify
@@ -52,6 +52,7 @@ from cathedral.verify.snp import (
     PINNED_SNPGUEST_SHA256,
     PINNED_SNPGUEST_VERSION,
     SnpReport,
+    SnpVerifierUnavailable,
     parse_snp_report,
     snp_generation,
 )
@@ -266,6 +267,26 @@ def _parse_review_challenge(value: str) -> bytes:
     return challenge
 
 
+def _verify_or_inconclusive(evidence: Evidence, nonce: bytes, policy: Policy, *, what: str):
+    """``verify`` that tells an AMD outage apart from a refusal.
+
+    ``verify`` returns None both for invalid evidence and, by default, when the
+    AMD key distribution service is unavailable (for example HTTP 429 rate
+    limiting). A negative control that only checks ``is None`` would then pass
+    without the signature ever being checked, so an unavailable verifier stops
+    the probe as inconclusive instead of reporting any result.
+    """
+
+    try:
+        return verify(evidence, nonce, policy, raise_on_verifier_unavailable=True)
+    except SnpVerifierUnavailable as exc:
+        raise ProbeError(
+            f"{what} is inconclusive: the AMD verifier was unavailable "
+            "(AMD KDS rate limiting or outage), so nothing was checked; "
+            "run the probe again later"
+        ) from exc
+
+
 def run_probe(review_challenge: bytes) -> dict[str, Any]:
     if len(review_challenge) != 32 or not any(review_challenge):
         raise ProbeError("a nonzero 32-byte reviewer challenge is required")
@@ -316,7 +337,9 @@ def run_probe(review_challenge: bytes) -> dict[str, Any]:
                     allowed_measurements={parsed.measurement},
                     min_tcb=parsed.tcb.reported,
                 )
-                attested = verify(evidence, nonce, policy)
+                attested = _verify_or_inconclusive(
+                    evidence, nonce, policy, what="the AMD VCEK chain check"
+                )
                 if attested is None or not attested.chain_verified:
                     raise ProbeError("AMD VCEK chain or Cathedral SNP policy verification failed")
                 if attested.tier is not Tier.CC_CPU_SNP:
@@ -330,12 +353,18 @@ def run_probe(review_challenge: bytes) -> dict[str, Any]:
                     "vmpl_zero": parsed.vmpl == 0,
                     "debug_disabled": not bool(parsed.guest_policy & (1 << 19)),
                     "migration_agent_disabled": not bool(parsed.guest_policy & (1 << 18)),
-                    "wrong_nonce_rejected": verify(evidence, issue_nonce(), policy) is None,
-                    "wrong_hotkey_rejected": verify(
-                        replace(evidence, miner_hotkey=HOTKEY[:-1] + "x"), nonce, policy
+                    "wrong_nonce_rejected": _verify_or_inconclusive(
+                        evidence, issue_nonce(), policy, what="the wrong-nonce control"
                     )
                     is None,
-                    "wrong_channel_key_rejected": verify(
+                    "wrong_hotkey_rejected": _verify_or_inconclusive(
+                        replace(evidence, miner_hotkey=HOTKEY[:-1] + "x"),
+                        nonce,
+                        policy,
+                        what="the wrong-hotkey control",
+                    )
+                    is None,
+                    "wrong_channel_key_rejected": _verify_or_inconclusive(
                         replace(
                             evidence,
                             channel_binding=ChannelBinding(
@@ -345,19 +374,27 @@ def run_probe(review_challenge: bytes) -> dict[str, Any]:
                         ),
                         nonce,
                         policy,
+                        what="the wrong-channel-key control",
                     )
                     is None,
-                    "wrong_measurement_rejected": verify(
+                    "wrong_measurement_rejected": _verify_or_inconclusive(
                         evidence,
                         nonce,
                         Policy(allowed_measurements={"00" * 48}, min_tcb=0),
+                        what="the wrong-measurement control",
                     )
                     is None,
                 }
                 tampered_quote = bytearray(evidence.quote)
                 tampered_quote[0x2A0] ^= 1
                 checks["tampered_signature_rejected"] = (
-                    verify(replace(evidence, quote=bytes(tampered_quote)), nonce, policy) is None
+                    _verify_or_inconclusive(
+                        replace(evidence, quote=bytes(tampered_quote)),
+                        nonce,
+                        policy,
+                        what="the tampered-signature negative control",
+                    )
+                    is None
                 )
                 remote.confirm_channel_binding(evidence)
                 lane = SatLane(namespace="amd-sev-snp-friend-transcript")
@@ -403,13 +440,14 @@ def run_probe(review_challenge: bytes) -> dict[str, Any]:
                 ).digest()
                 evidence_2 = remote_2.fetch_evidence(nonce_2)
                 parsed_2 = parse_snp_report(evidence_2.quote)
-                attested_2 = verify(
+                attested_2 = _verify_or_inconclusive(
                     evidence_2,
                     nonce_2,
                     Policy(
                         allowed_measurements={parsed_2.measurement},
                         min_tcb=parsed_2.tcb.reported,
                     ),
+                    what="the second report's AMD VCEK chain check",
                 )
                 checks["second_amd_vcek_chain_verified"] = bool(
                     attested_2 is not None and attested_2.chain_verified
