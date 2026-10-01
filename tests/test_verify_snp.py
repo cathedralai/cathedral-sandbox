@@ -683,3 +683,71 @@ def test_amd_ark_requires_the_reviewed_generation_spki(monkeypatch, tmp_path):
         hashlib.sha256(spki).hexdigest(),
     )
     assert snp_module._amd_ark_is_pinned(certs, "milan")
+
+
+def test_amd_ark_pin_holds_for_certificates_fetched_under_a_permissive_umask(monkeypatch, tmp_path):
+    """The pin must accept an authentic ARK that snpguest wrote under umask 0002.
+
+    The stand-in verifier is a real executable that creates the certificates by
+    shell redirection, so their mode comes from the umask the child inherits,
+    as it does for snpguest. Without an owner-only umask for that child the ARK
+    is group-writable and _read_amd_ark refuses it.
+    """
+
+    import os
+    import shlex
+    from datetime import UTC, datetime, timedelta
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP384R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test-ark")])
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(1)
+        .not_valid_before(datetime.now(UTC) - timedelta(days=1))
+        .not_valid_after(datetime.now(UTC) + timedelta(days=1))
+        .sign(key, hashes.SHA384())
+    )
+    source_ark = tmp_path / "source-ark.der"
+    source_ark.write_bytes(certificate.public_bytes(serialization.Encoding.DER))
+    spki = key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    report = _admissible_fixture()
+    generation = snp_module._snp_generation(snp_module.parse_snp_report(report))
+    assert generation is not None
+    monkeypatch.setitem(
+        snp_module.PINNED_AMD_ARK_SPKI_SHA256,
+        generation,
+        hashlib.sha256(spki).hexdigest(),
+    )
+
+    # Both fetch forms name the certificate directory as the fourth argument.
+    # Every verify command succeeds; this test isolates the root pin.
+    stand_in = tmp_path / "snpguest"
+    stand_in.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        '  "fetch vcek") : > "$4/vcek.der" ;;\n'
+        f'  "fetch ca") cat {shlex.quote(str(source_ark))} > "$4/ark.der"; : > "$4/ask.der" ;;\n'
+        "esac\n"
+    )
+    stand_in.chmod(0o700)
+
+    previous = os.umask(0o002)
+    try:
+        assert snp_module._verify_chain_with_snpguest(
+            report,
+            snpguest_path=str(stand_in),
+            certs_dir=None,
+        )
+    finally:
+        os.umask(previous)

@@ -561,12 +561,17 @@ def _verify_chain_with_snpguest(
         certs_path.mkdir(parents=True, exist_ok=True)
 
         def run(command: list[str]) -> None:
+            # snpguest creates the fetched certificates with the inherited
+            # umask. Under the common 0002 the ARK comes out group-writable and
+            # _read_amd_ark refuses it, so the root pin fails closed for an
+            # authentic chain. Owner-only files keep that strict check intact.
             subprocess.run(
                 command,
                 check=True,
                 capture_output=True,
                 text=True,
                 timeout=_snpguest_command_timeout(deadline_monotonic),
+                umask=0o077,
             )
 
         run([snpguest_path, "fetch", "vcek", "DER", str(certs_path), str(report_path)])
