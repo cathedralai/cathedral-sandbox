@@ -751,3 +751,467 @@ def test_amd_ark_pin_holds_for_certificates_fetched_under_a_permissive_umask(mon
         )
     finally:
         os.umask(previous)
+
+
+# AMD certificate cache and KDS backoff ---------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _empty_certificate_cache():
+    snp_module.clear_snp_certificate_cache()
+    yield
+    snp_module.clear_snp_certificate_cache()
+
+
+def _test_certificate(common_name: str) -> tuple[bytes, str]:
+    """Return a self-signed DER certificate and the SHA-256 of its SPKI."""
+
+    from datetime import UTC, datetime, timedelta
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP384R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(1)
+        .not_valid_before(datetime.now(UTC) - timedelta(days=1))
+        .not_valid_after(datetime.now(UTC) + timedelta(days=1))
+        .sign(key, hashes.SHA384())
+    )
+    spki = key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return (
+        certificate.public_bytes(serialization.Encoding.DER),
+        hashlib.sha256(spki).hexdigest(),
+    )
+
+
+_STAND_IN_BODY = r"""
+import json
+import stat
+import sys
+
+state = json.loads(STATE.read_text())
+action = " ".join(sys.argv[1:3])
+state["calls"].append(action)
+if action == "verify certs":
+    state["seen"].append(
+        {
+            entry.name: [stat.S_IMODE(entry.lstat().st_mode), entry.read_bytes().hex()]
+            for entry in Path(sys.argv[3]).iterdir()
+        }
+    )
+message = None
+if state["fail"].get(action):
+    message = state["fail"][action].pop(0)
+elif action in state["always_fail"]:
+    message = state["always_fail"][action]
+STATE.write_text(json.dumps(state))
+if message is not None:
+    sys.stderr.write(message + "\n")
+    sys.exit(1)
+names = {"fetch vcek": ["vcek.der"], "fetch ca": ["ark.der", "ask.der"]}.get(action, [])
+files = {name: state["certs"][name] for name in names}
+files.update(state["extra"].get(action, {}))
+for name, body in files.items():
+    path = Path(sys.argv[4], name)
+    path.write_bytes(bytes.fromhex(body))
+    if name in state["modes"]:
+        path.chmod(state["modes"][name])
+"""
+
+_KDS_429 = "ERROR: Unable to fetch VCEK from URL: 429 Too Many Requests"
+
+
+class _StandInSnpguest:
+    """A real executable that plays snpguest v0.10.0 for one test.
+
+    Both fetch forms name the certificate directory as their fourth argument.
+    The stand-in writes the configured DER certificates there with the umask it
+    inherits, records every command and what each ``verify certs`` saw, and
+    fails a command when the test asks it to.
+    """
+
+    def __init__(self, directory: Path, *, ark: bytes, ask: bytes, vcek: bytes) -> None:
+        import sys
+
+        self.path = directory / "snpguest"
+        self._state_path = directory / "snpguest-state.json"
+        self._save(
+            {
+                "calls": [],
+                "seen": [],
+                "certs": {"ark.der": ark.hex(), "ask.der": ask.hex(), "vcek.der": vcek.hex()},
+                "fail": {},
+                "always_fail": {},
+                "extra": {},
+                "modes": {},
+            }
+        )
+        self.path.write_text(
+            f"#!{sys.executable} -I\n"
+            "from pathlib import Path\n"
+            f"STATE = Path({str(self._state_path)!r})\n" + _STAND_IN_BODY
+        )
+        self.path.chmod(0o700)
+
+    def _load(self) -> dict:
+        import json
+
+        return json.loads(self._state_path.read_text())
+
+    def _save(self, state: dict) -> None:
+        import json
+
+        self._state_path.write_text(json.dumps(state))
+
+    def configure(self, field: str, key: str, value) -> None:
+        state = self._load()
+        state[field][key] = value
+        self._save(state)
+
+    def clear(self, field: str) -> None:
+        state = self._load()
+        state[field] = {}
+        self._save(state)
+
+    def serve(self, name: str, body: bytes) -> None:
+        self.configure("certs", name, body.hex())
+
+    def count(self, action: str) -> int:
+        return self._load()["calls"].count(action)
+
+    @property
+    def seen(self) -> list[dict[str, list]]:
+        return self._load()["seen"]
+
+
+@pytest.fixture
+def chain(monkeypatch, tmp_path):
+    """A stand-in snpguest serving a test chain whose ARK is pinned for Turin."""
+
+    ark, ark_spki = _test_certificate("test-ark")
+    ask, _ = _test_certificate("test-ask")
+    vcek, _ = _test_certificate("test-vcek")
+    monkeypatch.setitem(snp_module.PINNED_AMD_ARK_SPKI_SHA256, "turin", ark_spki)
+    stand_in = _StandInSnpguest(tmp_path, ark=ark, ask=ask, vcek=vcek)
+    stand_in.ark, stand_in.ask, stand_in.vcek = ark, ask, vcek
+    return stand_in
+
+
+def _check(stand_in: _StandInSnpguest, report: bytes | None = None) -> bool:
+    return snp_module._verify_chain_with_snpguest(
+        _admissible_fixture() if report is None else report,
+        snpguest_path=str(stand_in.path),
+        certs_dir=None,
+    )
+
+
+def _verify_through_public_api(monkeypatch, stand_in, **kwargs):
+    monkeypatch.setattr(
+        snp_module,
+        "_pinned_snpguest",
+        lambda _path: nullcontext(str(stand_in.path)),
+    )
+    report = _admissible_fixture()
+    return verify_snp_report_data(
+        report,
+        REQUEST_DATA.read_bytes(),
+        _policy_for(report),
+        snpguest_path=stand_in.path,
+        **kwargs,
+    )
+
+
+def _record_sleeps(monkeypatch) -> list[float]:
+    sleeps: list[float] = []
+    monkeypatch.setattr(snp_module, "_kds_backoff_sleep", sleeps.append)
+    return sleeps
+
+
+def _with_chip_id(report: bytes, chip_id: bytes) -> bytes:
+    changed = bytearray(report)
+    changed[snp_module.CHIP_ID_OFFSET : snp_module.CHIP_ID_OFFSET + 64] = chip_id
+    return bytes(changed)
+
+
+def test_repeated_checks_of_one_chip_fetch_the_vcek_and_ca_once(monkeypatch, chain):
+    for _ in range(4):
+        verdict = _verify_through_public_api(monkeypatch, chain)
+        assert verdict is not None
+        assert verdict.chain_verified is True
+
+    assert chain.count("fetch vcek") == 1
+    assert chain.count("fetch ca") == 1
+    # A cached certificate never skips verification.
+    assert chain.count("verify certs") == 4
+    assert chain.count("verify attestation") == 4
+    expected = {
+        "ark.der": [0o600, chain.ark.hex()],
+        "ask.der": [0o600, chain.ask.hex()],
+        "vcek.der": [0o600, chain.vcek.hex()],
+    }
+    assert chain.seen == [expected] * 4
+
+
+def test_kds_429_is_retried_after_a_jittered_backoff(monkeypatch, chain):
+    sleeps = _record_sleeps(monkeypatch)
+    chain.configure("fail", "fetch vcek", [_KDS_429])
+
+    verdict = _verify_through_public_api(monkeypatch, chain, raise_on_verifier_unavailable=True)
+
+    assert verdict is not None
+    assert verdict.chain_verified is True
+    assert chain.count("fetch vcek") == 2
+    assert len(sleeps) == 1
+    assert 1.5 <= sleeps[0] <= 2.5
+
+
+def test_persistent_kds_429_is_verifier_infrastructure_not_invalid_evidence(monkeypatch, chain):
+    sleeps = _record_sleeps(monkeypatch)
+    chain.configure("always_fail", "fetch vcek", _KDS_429)
+
+    with pytest.raises(SnpVerifierUnavailable, match="infrastructure is unavailable") as error:
+        _verify_through_public_api(monkeypatch, chain, raise_on_verifier_unavailable=True)
+
+    assert error.value.category == "verifier_infrastructure_unavailable"
+    assert isinstance(error.value.__cause__, snp_module.subprocess.CalledProcessError)
+    assert chain.count("fetch vcek") == 3
+    assert len(sleeps) == 2
+    assert 1.5 <= sleeps[0] <= 2.5
+    assert 3.75 <= sleeps[1] <= 6.25
+    assert len(snp_module._CERTIFICATE_CACHE) == 0
+
+
+def test_kds_backoff_never_sleeps_past_the_validator_deadline(monkeypatch, chain):
+    sleeps = _record_sleeps(monkeypatch)
+    chain.configure("always_fail", "fetch vcek", _KDS_429)
+
+    with pytest.raises(SnpVerifierUnavailable, match="deadline expired"):
+        _verify_through_public_api(
+            monkeypatch,
+            chain,
+            raise_on_verifier_unavailable=True,
+            deadline_monotonic=snp_module.time.monotonic() + 1.0,
+        )
+
+    assert sleeps == []
+    assert chain.count("fetch vcek") == 1
+
+
+def test_kds_backoff_grows_and_is_jittered():
+    first = [snp_module._kds_backoff_seconds(0) for _ in range(200)]
+    second = [snp_module._kds_backoff_seconds(1) for _ in range(200)]
+
+    assert all(1.5 <= delay <= 2.5 for delay in first)
+    assert all(3.75 <= delay <= 6.25 for delay in second)
+    assert len(set(first)) > 1
+    assert max(first) < min(second)
+
+
+def test_cached_ark_that_no_longer_matches_the_pin_is_refused_and_refetched(monkeypatch, chain):
+    assert _check(chain)
+    rotated_ark, rotated_spki = _test_certificate("rotated-ark")
+    monkeypatch.setitem(snp_module.PINNED_AMD_ARK_SPKI_SHA256, "turin", rotated_spki)
+
+    # KDS still serves the old root: the cached copy and the refetch both fail
+    # the pin, and neither reaches snpguest's verification.
+    assert not _check(chain)
+    assert chain.count("fetch ca") == 2
+    assert chain.count("verify certs") == 1
+    assert snp_module._CERTIFICATE_CACHE.get(("ca", "turin")) is None
+
+    chain.serve("ark.der", rotated_ark)
+    assert _check(chain)
+    assert chain.count("fetch ca") == 3
+    assert snp_module._CERTIFICATE_CACHE.get(("ca", "turin")) == (
+        ("ark.der", rotated_ark),
+        ("ask.der", chain.ask),
+    )
+
+
+def test_tampered_cache_entry_is_evicted_and_the_chain_refetched(chain):
+    other_ark, _ = _test_certificate("not-the-pinned-ark")
+    snp_module._CERTIFICATE_CACHE.put(
+        ("ca", "turin"), (("ark.der", other_ark), ("ask.der", chain.ask))
+    )
+
+    assert _check(chain)
+    assert chain.count("fetch ca") == 1
+    assert chain.count("verify certs") == 1
+    assert snp_module._CERTIFICATE_CACHE.get(("ca", "turin")) == (
+        ("ark.der", chain.ark),
+        ("ask.der", chain.ask),
+    )
+
+
+@pytest.mark.parametrize("step", ["verify certs", "verify attestation"])
+def test_cache_hit_whose_verify_step_fails_is_evicted_and_refetched(chain, step):
+    assert _check(chain)
+
+    # One failed check with cached certificates (both argument orders, for
+    # verify attestation): drop them, fetch fresh, verify again.
+    rejections = 2 if step == "verify attestation" else 1
+    chain.configure("fail", step, ["stand-in rejects the cached chain"] * rejections)
+    assert _check(chain)
+    assert chain.count("fetch vcek") == 2
+    assert chain.count("fetch ca") == 2
+
+    assert _check(chain)
+    assert chain.count("fetch vcek") == 2
+
+    # A report that never verifies is refused with the cache and without it,
+    # and leaves nothing cached.
+    chain.configure("always_fail", step, "stand-in rejects every chain")
+    assert not _check(chain)
+    assert chain.count("fetch vcek") == 3
+    assert len(snp_module._CERTIFICATE_CACHE) == 0
+
+
+def test_different_chip_or_tcb_values_are_separate_cache_entries(monkeypatch, chain):
+    base = _admissible_fixture()
+    other_chip = _with_chip_id(base, bytes(range(1, 65)))
+    other_tcb = bytearray(base)
+    other_tcb[0x180] ^= 0x01
+    milan = bytearray(base)
+    milan[0x188:0x18A] = bytes([0x19, 0x01])
+    monkeypatch.setitem(
+        snp_module.PINNED_AMD_ARK_SPKI_SHA256,
+        "milan",
+        snp_module.PINNED_AMD_ARK_SPKI_SHA256["turin"],
+    )
+    reports = [base, other_chip, bytes(other_tcb), bytes(milan)]
+
+    for report in reports:
+        assert _check(chain, report)
+    assert chain.count("fetch vcek") == 4
+    assert chain.count("fetch ca") == 2
+    assert len(snp_module._CERTIFICATE_CACHE) == 6
+
+    for report in reports:
+        assert _check(chain, report)
+    assert chain.count("fetch vcek") == 4
+    assert chain.count("fetch ca") == 2
+
+
+@pytest.mark.parametrize("failure", ["pin", "verify certs", "verify attestation"])
+def test_failed_verification_never_populates_the_cache(monkeypatch, chain, failure):
+    if failure == "pin":
+        _, other_spki = _test_certificate("other-root")
+        monkeypatch.setitem(snp_module.PINNED_AMD_ARK_SPKI_SHA256, "turin", other_spki)
+    else:
+        chain.configure("always_fail", failure, "stand-in rejects the chain")
+
+    assert not _check(chain)
+    assert len(snp_module._CERTIFICATE_CACHE) == 0
+
+    monkeypatch.setitem(
+        snp_module.PINNED_AMD_ARK_SPKI_SHA256,
+        "turin",
+        _spki_sha256(chain.ark),
+    )
+    chain.clear("always_fail")
+    assert _check(chain)
+    assert chain.count("fetch vcek") == 2
+    assert chain.count("fetch ca") == 2
+
+
+def _spki_sha256(der: bytes) -> str:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
+    spki = (
+        x509.load_der_x509_certificate(der)
+        .public_key()
+        .public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    return hashlib.sha256(spki).hexdigest()
+
+
+@pytest.mark.parametrize("oddity", ["extra file", "group-writable vcek"])
+def test_unexpected_certificate_files_are_never_cached(chain, oddity):
+    if oddity == "extra file":
+        chain.configure("extra", "fetch ca", {"ark.pem": chain.ark.hex()})
+    else:
+        chain.configure("modes", "vcek.der", 0o664)
+
+    assert _check(chain)
+    assert len(snp_module._CERTIFICATE_CACHE) == 0
+
+
+def test_certificate_cache_bound_and_age_limit_hold():
+    now = [1000.0]
+    cache = snp_module._SnpCertificateCache(max_entries=3, ttl_seconds=10.0, clock=lambda: now[0])
+    entries = {key: ((f"{key}.der", key.encode()),) for key in ("a", "b", "c", "d")}
+
+    for key in ("a", "b", "c"):
+        cache.put((key,), entries[key])
+    assert cache.get(("a",)) == entries["a"]  # "a" is now the most recently used
+    cache.put(("d",), entries["d"])
+    assert len(cache) == 3
+    assert cache.get(("b",)) is None
+    assert cache.get(("a",)) == entries["a"]
+
+    now[0] += 10.0
+    assert cache.get(("a",)) is None
+    assert len(cache) == 2
+
+    cache.clear()
+    assert len(cache) == 0
+    for bad in ({"max_entries": 0}, {"max_entries": True}, {"ttl_seconds": 0.0}):
+        with pytest.raises(ValueError):
+            snp_module._SnpCertificateCache(**bad)
+
+
+def test_cache_age_runs_from_the_fetch_not_the_last_use(monkeypatch, chain):
+    now = [0.0]
+    monkeypatch.setattr(
+        snp_module,
+        "_CERTIFICATE_CACHE",
+        snp_module._SnpCertificateCache(ttl_seconds=100.0, clock=lambda: now[0]),
+    )
+
+    assert _check(chain)
+    now[0] = 60.0
+    assert _check(chain)
+    assert chain.count("fetch vcek") == 1
+    now[0] = 100.0
+    assert _check(chain)
+    assert chain.count("fetch vcek") == 2
+    assert chain.count("fetch ca") == 2
+
+
+def test_process_cache_bound_holds_across_many_chips(monkeypatch, chain):
+    monkeypatch.setattr(
+        snp_module, "_CERTIFICATE_CACHE", snp_module._SnpCertificateCache(max_entries=2)
+    )
+    base = _admissible_fixture()
+
+    for index in range(1, 4):
+        assert _check(chain, _with_chip_id(base, bytes([index]) * 64))
+    assert len(snp_module._CERTIFICATE_CACHE) == 2
+
+
+def test_eviction_spares_an_entry_a_concurrent_check_replaced():
+    cache = snp_module._SnpCertificateCache()
+    stale = (("vcek.der", b"stale"),)
+    fresh = (("vcek.der", b"fresh"),)
+    cache.put(("vcek",), stale)
+    cache.put(("vcek",), fresh)
+
+    cache.evict(("vcek",), stale)
+    assert cache.get(("vcek",)) is fresh
+    cache.evict(("vcek",), fresh)
+    assert cache.get(("vcek",)) is None

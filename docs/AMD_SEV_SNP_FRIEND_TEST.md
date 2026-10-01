@@ -149,6 +149,40 @@ test -r /dev/sev-guest -a -w /dev/sev-guest
 Stop if either digest check fails. Do not run tests repeatedly or in parallel.
 They contact AMD KDS and rapid retries risk rate limiting.
 
+### How the verifier fetches AMD certificates
+
+The verifier has the pinned `snpguest` fetch the VCEK, ASK, and ARK from AMD
+KDS into a private temporary directory. It then checks the ARK against the
+pinned root and runs `snpguest verify certs` and `snpguest verify attestation`.
+
+- **No umask setting is needed.** Before this fix, `snpguest` wrote the
+  certificates with the caller's umask. Under the common `0002` default the
+  ARK came out group-writable and the pinned-root check refused it, so an
+  authentic report failed with no diagnostic unless the run used an
+  owner-only umask such as `umask 077`. The verifier now runs every `snpguest`
+  command with umask `0077`, so the certificates are owner-only whatever the
+  shell's umask is. Production validator services already run with
+  `UMask=0077`.
+- **Fetched certificates are cached in memory.** After a fully verified check,
+  the verifier keeps the certificate bytes for the life of the process: the
+  VCEK per processor generation, CHIP_ID, and reported TCB, and the ARK and ASK
+  per generation. The cache holds at most 256 entries, drops the least
+  recently used first, and keeps no entry longer than 24 hours after its
+  fetch. A later check of the same chip and TCB writes the cached bytes into a
+  fresh private directory, owner-only, instead of fetching them, and still
+  pins the ARK and runs both `snpguest` verifications. A cached certificate
+  never skips a check. If a check that used the cache fails, the verifier
+  drops the entries it used and checks once more from fresh KDS fetches. A
+  failed check caches nothing, and nothing is cached on disk. Because the
+  cache ends with the process, separate probe or test runs each contact KDS
+  again.
+- **KDS throttling is backed off.** A transient KDS failure (HTTP 5xx, 408,
+  425, or 429, or a network error) is retried at most twice: after about 2
+  seconds and then about 5 seconds, each wait randomized by up to 25 percent,
+  and never past the caller's deadline. If KDS stays unavailable, a validator
+  that asks for it gets `SnpVerifierUnavailable`, an infrastructure outcome,
+  never a verdict that the miner's evidence is invalid.
+
 ## Run the observed HTTPS and SAT test
 
 The reviewer sends a fresh, nonzero 32-byte challenge as 64 lowercase hex

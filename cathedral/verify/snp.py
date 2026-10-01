@@ -10,17 +10,20 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import random
 import re
 import shutil
 import stat
 import struct
 import subprocess
 import tempfile
+import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
@@ -41,7 +44,8 @@ SIGNATURE_SIZE = 512
 PINNED_SNPGUEST_VERSION = "0.10.0"
 PINNED_SNPGUEST_SHA256 = "70e700465e3523e67dd5104583dc36cd11eef630c6f04c5b9ccafd6ba2e76ca0"
 MAX_SNPGUEST_BYTES = 64 * 1024 * 1024
-MAX_AMD_ARK_BYTES = 64 * 1024
+MAX_AMD_CERTIFICATE_BYTES = 64 * 1024
+MAX_AMD_ARK_BYTES = MAX_AMD_CERTIFICATE_BYTES
 PINNED_AMD_ARK_SPKI_SHA256 = {
     "milan": "9f056bee44377e29308cb5ffa895bdfb62d18881fa6bed8d6f075b0204089cb9",
     "genoa": "429a69c9422aa258ee4d8db5fcda9c6470ef15f8cd5a9cebd6cbc7d90b863831",
@@ -95,6 +99,23 @@ _KDS_TRANSPORT_ERROR_MARKERS = (
     "tls error",
     "certificate verify failed",
 )
+
+# AMD KDS throttles per VCEK. Retry a transient failure at most twice, about
+# 2 s and then about 5 s later, each wait spread by +/-25% so verifiers that
+# were throttled together do not come back in lockstep.
+_KDS_ATTEMPTS = 3
+_KDS_BACKOFF_BASE_SECONDS = 2.0
+_KDS_BACKOFF_FACTOR = 2.5
+_KDS_BACKOFF_JITTER = 0.25
+
+# Fetched AMD certificates are cached in memory for this process only. The
+# bound and age limit keep the cache small and pick up a reissued or revoked
+# certificate within a day. The file names are the ones the pinned snpguest
+# v0.10.0 writes for DER output with the default VCEK endorser.
+CERTIFICATE_CACHE_MAX_ENTRIES = 256
+CERTIFICATE_CACHE_TTL_SECONDS = 24 * 60 * 60
+_VCEK_CERTIFICATE_FILES = ("vcek.der",)
+_CA_CERTIFICATE_FILES = ("ark.der", "ask.der")
 
 VERIFIED = "VERIFIED"
 STRUCTURE_OK_CHAIN_UNVERIFIED = "STRUCTURE_OK_CHAIN_UNVERIFIED"
@@ -328,6 +349,12 @@ def snp_generation(parsed: SnpReport) -> str | None:
 
 
 def _read_amd_ark(path: Path) -> bytes | None:
+    return _read_amd_certificate(path)
+
+
+def _read_amd_certificate(path: Path) -> bytes | None:
+    """Read one bounded, owner-controlled certificate file without following links."""
+
     if not hasattr(os, "O_NOFOLLOW"):
         return None
     flags = os.O_RDONLY | os.O_NOFOLLOW
@@ -343,17 +370,17 @@ def _read_amd_ark(path: Path) -> bytes | None:
             not stat.S_ISREG(before.st_mode)
             or before.st_uid not in {0, os.geteuid()}
             or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-            or not 1 <= before.st_size <= MAX_AMD_ARK_BYTES
+            or not 1 <= before.st_size <= MAX_AMD_CERTIFICATE_BYTES
         ):
             return None
         chunks: list[bytes] = []
         total = 0
         while True:
-            chunk = os.read(descriptor, min(16 * 1024, MAX_AMD_ARK_BYTES + 1 - total))
+            chunk = os.read(descriptor, min(16 * 1024, MAX_AMD_CERTIFICATE_BYTES + 1 - total))
             if not chunk:
                 break
             total += len(chunk)
-            if total > MAX_AMD_ARK_BYTES:
+            if total > MAX_AMD_CERTIFICATE_BYTES:
                 return None
             chunks.append(chunk)
         after = os.fstat(descriptor)
@@ -539,26 +566,164 @@ def _snpguest_fetch_failure_is_unavailable(
     return any(marker in lowered for marker in _KDS_TRANSPORT_ERROR_MARKERS)
 
 
-def _verify_chain_with_snpguest(
-    report: bytes,
-    *,
-    snpguest_path: str,
-    certs_dir: str | os.PathLike[str] | None,
-    deadline_monotonic: float | None = None,
-) -> bool:
-    """Ask snpguest to fetch AMD certs and verify the report signature chain."""
+_CachedCertificates = tuple[tuple[str, bytes], ...]
+_CacheKey = tuple[object, ...]
 
-    # An external directory lets another process swap ARK/ASK/VCEK pathnames
-    # after the root pin check but before snpguest reopens them. Keep the
-    # argument for fail-closed API compatibility, but never verify from it.
-    if certs_dir is not None:
-        return False
+
+class _SnpCertificateCache:
+    """Bounded, thread-safe, process-local LRU of AMD certificate bytes.
+
+    An entry only replaces one KDS fetch. Every verification that uses it still
+    writes the bytes into a fresh private directory and runs the ARK pin,
+    ``verify certs`` and ``verify attestation``. Nothing is written to disk
+    outside that directory, and no entry outlives the process.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_entries: int = CERTIFICATE_CACHE_MAX_ENTRIES,
+        ttl_seconds: float | None = CERTIFICATE_CACHE_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if isinstance(max_entries, bool) or not isinstance(max_entries, int) or max_entries < 1:
+            raise ValueError("certificate cache bound must be a positive integer")
+        if ttl_seconds is not None and not (math.isfinite(ttl_seconds) and ttl_seconds > 0):
+            raise ValueError("certificate cache TTL must be positive and finite")
+        self._max_entries = max_entries
+        self._ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[_CacheKey, tuple[float, _CachedCertificates]] = OrderedDict()
+
+    def get(self, key: _CacheKey) -> _CachedCertificates | None:
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            stored_at, certificates = entry
+            if self._ttl_seconds is not None and self._clock() - stored_at >= self._ttl_seconds:
+                del self._entries[key]
+                return None
+            self._entries.move_to_end(key)
+            return certificates
+
+    def put(self, key: _CacheKey, certificates: _CachedCertificates) -> None:
+        with self._lock:
+            self._entries[key] = (self._clock(), certificates)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+    def evict(self, key: _CacheKey, certificates: _CachedCertificates) -> None:
+        """Drop ``key`` only while it still holds the entry the caller used."""
+
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None and entry[1] is certificates:
+                del self._entries[key]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+
+_CERTIFICATE_CACHE = _SnpCertificateCache()
+
+
+def clear_snp_certificate_cache() -> None:
+    """Forget every cached AMD certificate, so the next check fetches from KDS."""
+
+    _CERTIFICATE_CACHE.clear()
+
+
+def _vcek_cache_key(generation: str, parsed: SnpReport) -> _CacheKey:
+    # KDS serves the VCEK for one product, hardware ID, and reported TCB.
+    return ("vcek", generation, parsed.chip_id, parsed.tcb.reported)
+
+
+def _ca_cache_key(generation: str) -> _CacheKey:
+    return ("ca", generation)
+
+
+def _write_cached_certificates(certs_path: Path, certificates: _CachedCertificates) -> None:
+    """Recreate cached certificates as new owner-only files in a private directory."""
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    for name, body in certificates:
+        descriptor = os.open(certs_path / name, flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            view = memoryview(body)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("cached certificate write made no progress")
+                view = view[written:]
+        finally:
+            os.close(descriptor)
+
+
+def _remember_fetched_certificates(
+    cache: _SnpCertificateCache,
+    certs_path: Path,
+    fetched: dict[_CacheKey, tuple[str, ...]],
+) -> None:
+    """Cache what KDS returned, after the whole chain verified.
+
+    The directory must hold exactly the files the verifier used, and each one
+    must pass the same strict read as the pinned ARK. Anything else is simply
+    not cached; the verdict is already decided.
+    """
+
+    if not fetched:
+        return
+    try:
+        present = sorted(os.listdir(certs_path))
+    except OSError:
+        return
+    if present != sorted(_VCEK_CERTIFICATE_FILES + _CA_CERTIFICATE_FILES):
+        return
+    entries: dict[_CacheKey, _CachedCertificates] = {}
+    for key, names in fetched.items():
+        certificates: list[tuple[str, bytes]] = []
+        for name in names:
+            body = _read_amd_certificate(certs_path / name)
+            if body is None:
+                return
+            certificates.append((name, body))
+        entries[key] = tuple(certificates)
+    for key, certificates in entries.items():
+        cache.put(key, certificates)
+
+
+def _verify_chain_once(
+    report: bytes,
+    generation: str,
+    *,
+    vcek_key: _CacheKey,
+    ca_key: _CacheKey,
+    cached: dict[_CacheKey, _CachedCertificates],
+    cache: _SnpCertificateCache,
+    snpguest_path: str,
+    deadline_monotonic: float | None,
+) -> bool:
+    """Run one complete chain check, taking certificates from ``cached`` or KDS."""
+
     with tempfile.TemporaryDirectory() as td:
         work = Path(td)
         report_path = work / "attestation-report.bin"
         report_path.write_bytes(report)
         certs_path = work / "certs"
-        certs_path.mkdir(parents=True, exist_ok=True)
+        certs_path.mkdir(mode=0o700)
 
         def run(command: list[str]) -> None:
             # snpguest creates the fetched certificates with the inherited
@@ -574,26 +739,38 @@ def _verify_chain_with_snpguest(
                 umask=0o077,
             )
 
-        run([snpguest_path, "fetch", "vcek", "DER", str(certs_path), str(report_path)])
+        fetched: dict[_CacheKey, tuple[str, ...]] = {}
+        vcek = cached.get(vcek_key)
+        if vcek is None:
+            run([snpguest_path, "fetch", "vcek", "DER", str(certs_path), str(report_path)])
+            fetched[vcek_key] = _VCEK_CERTIFICATE_FILES
+        else:
+            _write_cached_certificates(certs_path, vcek)
 
-        # This is the exact v0.10.0 interface documented at
-        # https://github.com/virtee/snpguest/blob/v0.10.0/README.md#4-fetch.
-        # Trying legacy orders after a real KDS 5xx would replace the outage
-        # diagnostic with a local CLI parse error and incorrectly blame the miner.
-        run(
-            [
-                snpguest_path,
-                "fetch",
-                "ca",
-                "DER",
-                str(certs_path),
-                "--report",
-                str(report_path),
-            ]
-        )
+        ca = cached.get(ca_key)
+        if ca is None:
+            # This is the exact v0.10.0 interface documented at
+            # https://github.com/virtee/snpguest/blob/v0.10.0/README.md#4-fetch.
+            # Trying legacy orders after a real KDS 5xx would replace the outage
+            # diagnostic with a local CLI parse error and incorrectly blame the
+            # miner.
+            run(
+                [
+                    snpguest_path,
+                    "fetch",
+                    "ca",
+                    "DER",
+                    str(certs_path),
+                    "--report",
+                    str(report_path),
+                ]
+            )
+            fetched[ca_key] = _CA_CERTIFICATE_FILES
+        else:
+            _write_cached_certificates(certs_path, ca)
 
-        generation = _snp_generation(parse_snp_report(report))
-        if generation is None or not _amd_ark_is_pinned(certs_path, generation):
+        # A cached ARK is pinned and verified exactly like a fetched one.
+        if not _amd_ark_is_pinned(certs_path, generation):
             return False
 
         try:
@@ -608,10 +785,81 @@ def _verify_chain_with_snpguest(
         for cmd in verify_orders:
             try:
                 run(cmd)
-                return True
             except subprocess.CalledProcessError:
                 continue
+            _remember_fetched_certificates(cache, certs_path, fetched)
+            return True
     return False
+
+
+def _verify_chain_with_snpguest(
+    report: bytes,
+    *,
+    snpguest_path: str,
+    certs_dir: str | os.PathLike[str] | None,
+    deadline_monotonic: float | None = None,
+) -> bool:
+    """Ask snpguest to verify the report signature chain to the pinned AMD root.
+
+    Certificates come from AMD KDS or, after an earlier fully verified check of
+    the same chip and TCB, from the in-memory cache. A cached certificate only
+    skips its fetch: the pin and both snpguest verifications always run. If a
+    check that used the cache fails, the entries it used are dropped and the
+    chain is checked once more from fresh KDS fetches, so a stale entry can
+    never make an authentic report fail.
+    """
+
+    # An external directory lets another process swap ARK/ASK/VCEK pathnames
+    # after the root pin check but before snpguest reopens them. Keep the
+    # argument for fail-closed API compatibility, but never verify from it.
+    if certs_dir is not None:
+        return False
+    parsed = parse_snp_report(report)
+    generation = _snp_generation(parsed)
+    if generation is None:
+        return False
+
+    cache = _CERTIFICATE_CACHE
+    vcek_key = _vcek_cache_key(generation, parsed)
+    ca_key = _ca_cache_key(generation)
+    cached: dict[_CacheKey, _CachedCertificates] = {}
+    for key in (vcek_key, ca_key):
+        certificates = cache.get(key)
+        if certificates is not None:
+            cached[key] = certificates
+
+    def attempt(certificates: dict[_CacheKey, _CachedCertificates]) -> bool:
+        return _verify_chain_once(
+            report,
+            generation,
+            vcek_key=vcek_key,
+            ca_key=ca_key,
+            cached=certificates,
+            cache=cache,
+            snpguest_path=snpguest_path,
+            deadline_monotonic=deadline_monotonic,
+        )
+
+    if attempt(cached):
+        return True
+    if not cached:
+        return False
+    for key, certificates in cached.items():
+        cache.evict(key, certificates)
+    return attempt({})
+
+
+def _kds_backoff_seconds(retry: int) -> float:
+    """Return the jittered wait before KDS retry ``retry`` (0 is the first retry)."""
+
+    nominal = _KDS_BACKOFF_BASE_SECONDS * _KDS_BACKOFF_FACTOR**retry
+    return nominal * random.uniform(1.0 - _KDS_BACKOFF_JITTER, 1.0 + _KDS_BACKOFF_JITTER)
+
+
+def _kds_backoff_sleep(seconds: float) -> None:
+    """Wait before a KDS retry. Tests replace this hook to observe the backoff."""
+
+    time.sleep(seconds)
 
 
 def verify_snp_report_data(
@@ -637,6 +885,12 @@ def verify_snp_report_data(
     value is refused. Vendor certificates must stay in the verifier's private
     temporary tree so their pathnames cannot be replaced between root pinning
     and signature verification.
+
+    A transient AMD KDS failure (5xx, 408, 425, 429, or a network error) is
+    retried at most twice, after a jittered wait of about 2 s and then about
+    5 s, never past ``deadline_monotonic``. Fetched certificates are reused
+    from a bounded in-memory cache, but every check still pins and verifies
+    the full chain.
     """
 
     if len(expected_report_data) != REPORT_DATA_SIZE:
@@ -662,8 +916,8 @@ def verify_snp_report_data(
         if snpguest is None and raise_on_verifier_unavailable:
             raise SnpVerifierUnavailable("pinned SNP verifier is unavailable")
         if snpguest is not None:
-            for attempt in range(3):
-                unavailable_error: BaseException | None = None
+            for attempt in range(_KDS_ATTEMPTS):
+                unavailable_error: BaseException
                 try:
                     verify_kwargs = {
                         "snpguest_path": snpguest,
@@ -680,25 +934,24 @@ def verify_snp_report_data(
                 except (OSError, subprocess.TimeoutExpired) as exc:
                     unavailable_error = exc
 
-                if unavailable_error is None:
-                    continue
-                if attempt == 2:
+                if attempt == _KDS_ATTEMPTS - 1:
                     if raise_on_verifier_unavailable:
                         raise SnpVerifierUnavailable(
                             "AMD certificate or verifier infrastructure is unavailable"
                         ) from unavailable_error
                     return None
+                delay = _kds_backoff_seconds(attempt)
                 if deadline_monotonic is not None:
+                    # Stop now rather than sleep into a deadline that would
+                    # leave the retry no time to reach KDS.
                     remaining = float(deadline_monotonic) - time.monotonic()
-                    if remaining <= 0:
+                    if remaining <= delay:
                         if raise_on_verifier_unavailable:
                             raise SnpVerifierUnavailable(
                                 "AMD verifier deadline expired"
                             ) from unavailable_error
                         return None
-                    time.sleep(min(1.0, remaining))
-                else:
-                    time.sleep(1)
+                _kds_backoff_sleep(delay)
 
     if require_chain and not chain_verified:
         return None
