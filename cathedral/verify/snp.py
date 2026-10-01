@@ -117,6 +117,12 @@ CERTIFICATE_CACHE_TTL_SECONDS = 24 * 60 * 60
 _VCEK_CERTIFICATE_FILES = ("vcek.der",)
 _CA_CERTIFICATE_FILES = ("ark.der", "ask.der")
 
+# Where one chain check ended. Only a refusal of the certificates themselves
+# implicates cached bytes; a refused report does not.
+_CHAIN_VERIFIED = "verified"
+_CHAIN_CERTIFICATES_REFUSED = "certificates_refused"
+_CHAIN_REPORT_REFUSED = "report_refused"
+
 VERIFIED = "VERIFIED"
 STRUCTURE_OK_CHAIN_UNVERIFIED = "STRUCTURE_OK_CHAIN_UNVERIFIED"
 
@@ -715,8 +721,13 @@ def _verify_chain_once(
     cache: _SnpCertificateCache,
     snpguest_path: str,
     deadline_monotonic: float | None,
-) -> bool:
-    """Run one complete chain check, taking certificates from ``cached`` or KDS."""
+) -> str:
+    """Run one complete chain check, taking certificates from ``cached`` or KDS.
+
+    Return where it ended: ``_CHAIN_VERIFIED``, ``_CHAIN_CERTIFICATES_REFUSED``
+    (ARK pin or ``verify certs``), or ``_CHAIN_REPORT_REFUSED``
+    (``verify attestation`` in both argument orders).
+    """
 
     with tempfile.TemporaryDirectory() as td:
         work = Path(td)
@@ -771,12 +782,12 @@ def _verify_chain_once(
 
         # A cached ARK is pinned and verified exactly like a fetched one.
         if not _amd_ark_is_pinned(certs_path, generation):
-            return False
+            return _CHAIN_CERTIFICATES_REFUSED
 
         try:
             run([snpguest_path, "verify", "certs", str(certs_path)])
         except subprocess.CalledProcessError:
-            return False
+            return _CHAIN_CERTIFICATES_REFUSED
 
         verify_orders = [
             [snpguest_path, "verify", "attestation", str(certs_path), str(report_path)],
@@ -788,8 +799,8 @@ def _verify_chain_once(
             except subprocess.CalledProcessError:
                 continue
             _remember_fetched_certificates(cache, certs_path, fetched)
-            return True
-    return False
+            return _CHAIN_VERIFIED
+    return _CHAIN_REPORT_REFUSED
 
 
 def _verify_chain_with_snpguest(
@@ -803,10 +814,11 @@ def _verify_chain_with_snpguest(
 
     Certificates come from AMD KDS or, after an earlier fully verified check of
     the same chip and TCB, from the in-memory cache. A cached certificate only
-    skips its fetch: the pin and both snpguest verifications always run. If a
-    check that used the cache fails, the entries it used are dropped and the
-    chain is checked once more from fresh KDS fetches, so a stale entry can
-    never make an authentic report fail.
+    skips its fetch: the pin and both snpguest verifications always run. If the
+    pin or ``verify certs`` refuses cached certificates, the entries used are
+    dropped and the chain is checked once more from fresh KDS fetches, so a
+    stale entry can never make an authentic report fail. A report refused only
+    by ``verify attestation`` is refused without touching the cache.
     """
 
     # An external directory lets another process swap ARK/ASK/VCEK pathnames
@@ -828,7 +840,7 @@ def _verify_chain_with_snpguest(
         if certificates is not None:
             cached[key] = certificates
 
-    def attempt(certificates: dict[_CacheKey, _CachedCertificates]) -> bool:
+    def attempt(certificates: dict[_CacheKey, _CachedCertificates]) -> str:
         return _verify_chain_once(
             report,
             generation,
@@ -840,13 +852,26 @@ def _verify_chain_with_snpguest(
             deadline_monotonic=deadline_monotonic,
         )
 
-    if attempt(cached):
+    outcome = attempt(cached)
+    if outcome == _CHAIN_VERIFIED:
         return True
-    if not cached:
+    # Refetch only when the cached certificates are implicated. If the ARK pin
+    # and `verify certs` both pass on cached bytes, the ARK is the pinned AMD
+    # root and the ASK and VCEK chain to it, so the certificates are AMD's.
+    # The VCEK entry is keyed by generation, CHIP_ID and reported TCB, which
+    # are exactly what select the VCEK KDS serves, and it was stored only after
+    # a full verification under that same key, so it is the VCEK for this
+    # report's chip and TCB. A fresh fetch would return that same VCEK. A
+    # failure of `verify attestation` alone therefore condemns the report (a
+    # bad signature, for example), not the cache: refuse it, keep the entries,
+    # and do not refetch. Refetching here would let every forged report for a
+    # chip evict its entries and force new KDS fetches, which is how the
+    # friend probe's deliberate tampered-signature check kept hitting KDS.
+    if outcome == _CHAIN_REPORT_REFUSED or not cached:
         return False
     for key, certificates in cached.items():
         cache.evict(key, certificates)
-    return attempt({})
+    return attempt({}) == _CHAIN_VERIFIED
 
 
 def _kds_backoff_seconds(retry: int) -> float:

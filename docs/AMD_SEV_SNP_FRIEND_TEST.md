@@ -171,11 +171,13 @@ pinned root and runs `snpguest verify certs` and `snpguest verify attestation`.
   fetch. A later check of the same chip and TCB writes the cached bytes into a
   fresh private directory, owner-only, instead of fetching them, and still
   pins the ARK and runs both `snpguest` verifications. A cached certificate
-  never skips a check. If a check that used the cache fails, the verifier
-  drops the entries it used and checks once more from fresh KDS fetches. A
-  failed check caches nothing, and nothing is cached on disk. Because the
-  cache ends with the process, separate probe or test runs each contact KDS
-  again.
+  never skips a check. If the pinned-root check or `verify certs` refuses
+  cached certificates, the verifier drops the entries it used and checks once
+  more from fresh KDS fetches. If only `verify attestation` fails, the cached
+  chain was valid and the report is refused without a refetch, so the probe's
+  tampered-signature check does not contact KDS again. A failed check caches
+  nothing, and nothing is cached on disk. Because the cache ends with the
+  process, separate probe or test runs each contact KDS again.
 - **KDS throttling is backed off.** A transient KDS failure (HTTP 5xx, 408,
   425, or 429, or a network error) is retried at most twice: after about 2
   seconds and then about 5 seconds, each wait randomized by up to 25 percent,

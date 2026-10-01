@@ -815,6 +815,12 @@ if state["fail"].get(action):
     message = state["fail"][action].pop(0)
 elif action in state["always_fail"]:
     message = state["always_fail"][action]
+elif action == "verify attestation":
+    import hashlib
+
+    report = next(Path(arg) for arg in sys.argv[3:5] if Path(arg).is_file())
+    if hashlib.sha256(report.read_bytes()).hexdigest() in state["reject_reports"]:
+        message = "stand-in: the attestation report signature does not verify"
 STATE.write_text(json.dumps(state))
 if message is not None:
     sys.stderr.write(message + "\n")
@@ -838,7 +844,8 @@ class _StandInSnpguest:
     Both fetch forms name the certificate directory as their fourth argument.
     The stand-in writes the configured DER certificates there with the umask it
     inherits, records every command and what each ``verify certs`` saw, and
-    fails a command when the test asks it to.
+    fails a command when the test asks it to. ``verify attestation`` also
+    fails, in either argument order, for a report the test marks as forged.
     """
 
     def __init__(self, directory: Path, *, ark: bytes, ask: bytes, vcek: bytes) -> None:
@@ -855,6 +862,7 @@ class _StandInSnpguest:
                 "always_fail": {},
                 "extra": {},
                 "modes": {},
+                "reject_reports": [],
             }
         )
         self.path.write_text(
@@ -882,6 +890,11 @@ class _StandInSnpguest:
     def clear(self, field: str) -> None:
         state = self._load()
         state[field] = {}
+        self._save(state)
+
+    def reject_report(self, report: bytes) -> None:
+        state = self._load()
+        state["reject_reports"].append(hashlib.sha256(report).hexdigest())
         self._save(state)
 
     def serve(self, name: str, body: bytes) -> None:
@@ -1054,14 +1067,11 @@ def test_tampered_cache_entry_is_evicted_and_the_chain_refetched(chain):
     )
 
 
-@pytest.mark.parametrize("step", ["verify certs", "verify attestation"])
-def test_cache_hit_whose_verify_step_fails_is_evicted_and_refetched(chain, step):
+def test_cache_hit_refused_by_verify_certs_is_evicted_and_refetched_once(chain):
     assert _check(chain)
 
-    # One failed check with cached certificates (both argument orders, for
-    # verify attestation): drop them, fetch fresh, verify again.
-    rejections = 2 if step == "verify attestation" else 1
-    chain.configure("fail", step, ["stand-in rejects the cached chain"] * rejections)
+    # verify certs refuses the cached chain once: drop it, fetch fresh, verify.
+    chain.configure("fail", "verify certs", ["stand-in rejects the cached chain"])
     assert _check(chain)
     assert chain.count("fetch vcek") == 2
     assert chain.count("fetch ca") == 2
@@ -1069,12 +1079,69 @@ def test_cache_hit_whose_verify_step_fails_is_evicted_and_refetched(chain, step)
     assert _check(chain)
     assert chain.count("fetch vcek") == 2
 
-    # A report that never verifies is refused with the cache and without it,
-    # and leaves nothing cached.
-    chain.configure("always_fail", step, "stand-in rejects every chain")
+    # A chain refused with the cache and without it is refused, after exactly
+    # one refetch, and leaves nothing cached.
+    chain.configure("always_fail", "verify certs", "stand-in rejects every chain")
     assert not _check(chain)
     assert chain.count("fetch vcek") == 3
+    assert chain.count("fetch ca") == 3
     assert len(snp_module._CERTIFICATE_CACHE) == 0
+
+
+def test_report_refused_only_by_verify_attestation_keeps_the_cache(chain):
+    assert _check(chain)
+    chain.configure("always_fail", "verify attestation", "stand-in rejects the report")
+
+    assert not _check(chain)
+    # The cached chain was still pinned and verified, and nothing was refetched.
+    assert chain.count("verify certs") == 2
+    assert chain.count("fetch vcek") == 1
+    assert chain.count("fetch ca") == 1
+    assert len(snp_module._CERTIFICATE_CACHE) == 2
+
+    chain.clear("always_fail")
+    assert _check(chain)
+    assert chain.count("fetch vcek") == 1
+
+
+def test_friend_probe_sequence_fetches_each_certificate_once(monkeypatch, chain):
+    """An authentic report, a tampered signature for the same chip, then a
+    second authentic report, as ``cathedral-snp-friend-probe`` verifies them."""
+
+    first = _admissible_fixture()
+    tampered = bytearray(first)
+    tampered[snp_module.SIGNATURE_OFFSET] ^= 0x01
+    second_data = bytes(range(64))
+    second = bytearray(first)
+    second[REPORT_DATA_OFFSET : REPORT_DATA_OFFSET + 64] = second_data
+    chain.reject_report(bytes(tampered))
+    monkeypatch.setattr(
+        snp_module,
+        "_pinned_snpguest",
+        lambda _path: nullcontext(str(chain.path)),
+    )
+    policy = _policy_for(first)
+
+    def verify(report: bytes, expected: bytes):
+        return verify_snp_report_data(
+            report,
+            expected,
+            policy,
+            snpguest_path=chain.path,
+            raise_on_verifier_unavailable=True,
+        )
+
+    first_verdict = verify(first, REQUEST_DATA.read_bytes())
+    tampered_verdict = verify(bytes(tampered), REQUEST_DATA.read_bytes())
+    second_verdict = verify(bytes(second), second_data)
+
+    assert first_verdict is not None and first_verdict.chain_verified is True
+    assert tampered_verdict is None
+    assert second_verdict is not None and second_verdict.chain_verified is True
+    assert chain.count("fetch vcek") == 1
+    assert chain.count("fetch ca") == 1
+    assert chain.count("verify certs") == 3
+    assert chain.count("verify attestation") == 4  # both orders for the tampered one
 
 
 def test_different_chip_or_tcb_values_are_separate_cache_entries(monkeypatch, chain):
