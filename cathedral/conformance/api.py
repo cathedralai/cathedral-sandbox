@@ -150,8 +150,8 @@ class Api:
         Returns the last answer: on success the exec's final status, which carries
         `state`, `exit_code`, `stdout`, `stderr` and `timed_out` like a synchronous
         exec. A 4xx is returned as it is. No answer or a 5xx is asked again until
-        the timeout plus EXEC_END_GRACE_SECONDS; then the exec is stopped and a
-        status 0 response says so.
+        the timeout plus EXEC_END_GRACE_SECONDS; then cancellation is requested
+        and a status 0 response reports that its outcome is unconfirmed.
         """
         body: dict[str, Any] = {"command": command, "timeout_seconds": timeout_seconds}
         if user:
@@ -170,7 +170,8 @@ class Api:
             if self.clock() >= deadline:
                 self.call("DELETE", path)
                 return Response(0, {}, f"exec {exec_id} did not end within "
-                                f"{timeout_seconds + EXEC_END_GRACE_SECONDS} s; stopped".encode())
+                                f"{timeout_seconds + EXEC_END_GRACE_SECONDS} s; "
+                                "cancellation requested, not confirmed".encode())
             polled = self.call("GET", path, params={"wait": EXEC_POLL_WAIT_SECONDS},
                                timeout=EXEC_POLL_WAIT_SECONDS + 15)
             if polled.ok:
@@ -190,7 +191,7 @@ class Api:
 
     def delete(self, sandbox_id: str, *, key: str | None = None) -> Response:
         # The API requires an Idempotency-Key on DELETE and answers 422 without
-        # one. A fresh key per call: a repeat DELETE is a new request, which a
-        # sandbox that is already deleted must still answer with 2xx.
+        # one. A new intent gets a fresh key; cleanup retries supply their
+        # existing key. An already deleted sandbox must still answer with 2xx.
         return self.call("DELETE", f"/v1/sandboxes/{sandbox_id}",
                          key=key or idempotency_key("conf-del"))
