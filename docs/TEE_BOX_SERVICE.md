@@ -674,6 +674,7 @@ commands do not offer them.
 |---|---|---|
 | `--tee-box-central-state` | yes | owner-only SQLite replay state for central callers, separate from the validator-access and `--central-access-state` files, in a directory on tmpfs or ramfs (see "Storage (T8)") |
 | `--tee-box-executor runsc` | yes | the only executor |
+| `--validator-network`, `--validator-netuid` | yes | the subnet the central delegations and requests are bound to; no default. Signed validator access, when also configured, uses the same pair |
 | `--tee-box-capacity V,M,D` | yes | vCPUs, memory MiB and disk MiB for all sandboxes together |
 | `--tee-box-default-shape V,M,D` | yes | shape of a sandbox created without one; must fit the capacity |
 | `--tee-box-address IP` (repeat) or `--tee-box-detect-addresses` | exactly one | the box's own addresses, denied to sandboxes |
