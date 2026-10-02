@@ -2,9 +2,9 @@
 
     CATHEDRAL_API_KEY=cat_sk_... cathedral-conformance --report report.json
 
-Exit status: 0 when every mvp check passes (every check with --strict),
-1 otherwise, 2 for a usage error. Everything the run created is deleted at the
-end, including after a crash, and swept again by the run's label.
+Exit status: 0 when every mvp check passes (every check with --strict) and
+cleanup is confirmed, 1 otherwise, 2 for a usage error. The normal finalizer
+sweeps run-owned sandboxes. Process or host crashes can prevent cleanup.
 """
 
 from __future__ import annotations

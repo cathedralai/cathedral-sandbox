@@ -27,6 +27,9 @@ run fail. Delete confirmation is polled for at most 30 seconds per resource;
 an unconfirmed sandbox or snapshot is a cleanup failure. Cleanup runs in the
 normal process-finalization path; it is not guaranteed after a process or host
 crash, so use short lifetimes as a backstop.
+An ambiguous snapshot-create response without a recovered identifier also
+blocks success, even without `--strict`. The report records that uncertainty;
+it does not claim an untracked snapshot was removed.
 
 ## Checks
 

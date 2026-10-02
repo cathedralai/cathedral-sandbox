@@ -685,11 +685,17 @@ def snapshot_fork(ctx: Context):
         return "fail", {}, err
     parent_digest = digest.split()[0]
     began = ctx.api.clock()
-    reply = ctx.api.call("POST", f"/v1/sandboxes/{ctx.primary}/snapshots", json={},
+    reply = ctx.api.call("POST", f"/v1/sandboxes/{ctx.primary}/snapshots",
+                         json={"labels": {"conformance_run": ctx.config.run_id}},
                          key=f"conf-s-{uuid.uuid4().hex}")
     if not reply.ok:
+        if reply.status == 0 or reply.status >= 500:
+            ctx.cleanup_errors.append("snapshot create outcome is unknown; no cleanup identifier was recovered")
         return "fail", {}, reply.summary()
     snapshot = reply.json()
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("id"), str) or not snapshot["id"]:
+        ctx.cleanup_errors.append("snapshot create returned no valid cleanup identifier")
+        return "fail", {}, "snapshot create returned a malformed response"
     ctx.snapshots.append(snapshot["id"])
     while snapshot.get("state") not in ("ready", "failed") and ctx.api.clock() - began < 300:
         ctx.api.sleep(1)

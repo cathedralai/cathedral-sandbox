@@ -41,7 +41,8 @@ class FakeCathedral:
                  lose_create_response: bool = False, delete_delay_polls: int = 0,
                  reject_delete: bool = False, shared_filesystem: bool = False,
                  api_key_limit: int | None = None, quota_error: str = "sandbox_quota_exceeded",
-                 snapshot_delete_delay_polls: int = 0, reject_snapshot_delete: bool = False):
+                 snapshot_delete_delay_polls: int = 0, reject_snapshot_delete: bool = False,
+                 lose_snapshot_response: bool = False):
         self.clock = clock
         self.latency = latency
         self.quota_limit = quota_limit
@@ -59,6 +60,7 @@ class FakeCathedral:
         self.shared_filesystem = shared_filesystem
         self.snapshot_delete_delay_polls = snapshot_delete_delay_polls
         self.reject_snapshot_delete = reject_snapshot_delete
+        self.lose_snapshot_response = lose_snapshot_response
         self.sandboxes: dict[str, dict] = {}
         self.keys: dict[str, str] = {}
         self.deleted: list[str] = []
@@ -140,6 +142,8 @@ class FakeCathedral:
         if method == "POST" and parts[:2] == ["v1", "sandboxes"] and len(parts) == 4 and parts[3] == "snapshots":
             snapshot_id = f"snap{len(self.snapshots)}"
             self.snapshots[snapshot_id] = {"id": snapshot_id, "state": "ready", "source_id": parts[2]}
+            if self.lose_snapshot_response:
+                return self.reply(0, {"error_code": "response_lost"})
             return self.reply(202, self.snapshots[snapshot_id])
         if method in {"GET", "DELETE"} and len(parts) == 3 and parts[:2] == ["v1", "snapshots"]:
             snapshot = self.snapshots.get(parts[2])
@@ -397,6 +401,17 @@ def test_cleanup_fails_when_snapshot_delete_is_rejected():
     assert cleanup["ok"] is False
     assert cleanup["failed"] == ["snapshot:snap-only"]
     assert fake.snapshots["snap-only"]["state"] == "ready"
+
+
+def test_lost_snapshot_response_blocks_success_even_without_strict():
+    api, fake = make(lose_snapshot_response=True)
+    report = run(api, C.Config(), {"create.first", "snapshot.fork"})
+    assert by_id(report)["snapshot.fork"]["status"] == "fail"
+    assert report["passed"] is False
+    assert report["cleanup"]["ok"] is False
+    assert any("snapshot create outcome is unknown" in error for error in report["cleanup"]["errors"])
+    assert len(fake.snapshots) == 1
+    assert fake.snapshots["snap0"]["state"] == "ready"
 
 
 def test_cleanup_listing_failure_gates_run_after_later_tier_check():
