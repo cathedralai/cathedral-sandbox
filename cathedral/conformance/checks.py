@@ -364,18 +364,25 @@ def create_burst_tti(ctx: Context):
         if not reply.ok:
             return None, reply.summary()
         sandbox_id = reply.json()["id"]
+        measured_ms = None
+        failure = ""
         try:
             # TTI ends at the first command that succeeds, not at state=running.
             while ctx.api.clock() - started < ctx.config.create_timeout_s:
                 ran = ctx.api.exec(sandbox_id, ["true"], timeout_seconds=10)
                 if ran.ok and (ran.json() or {}).get("exit_code") == 0:
-                    return (ctx.api.clock() - started) * 1000, ""
+                    measured_ms = (ctx.api.clock() - started) * 1000
+                    break
                 ctx.api.sleep(0.1)
-            return None, f"{sandbox_id} never ran a command"
+            if measured_ms is None:
+                failure = f"{sandbox_id} never ran a command"
         finally:
             # Measured (or given up on): delete it now rather than leave the burst
             # holding quota and billing until the end-of-run cleanup.
-            ctx.api.delete(sandbox_id)
+            if not ctx._delete_sandbox_confirmed(sandbox_id):
+                measured_ms = None
+                failure = f"{sandbox_id} deletion was not confirmed"
+        return measured_ms, failure
 
     n = ctx.config.burst
     with ThreadPoolExecutor(max_workers=n) as pool:
