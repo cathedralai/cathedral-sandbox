@@ -380,7 +380,7 @@ func verifyAndBuildClaims(
 	if err != nil {
 		return nil, err
 	}
-	if err := verify.TdxQuoteContext(ctx, quote, options); err != nil {
+	if err := verifyQuoteAndCollateral(ctx, quote, options); err != nil {
 		return nil, verificationFailure(stageQuoteAndCollateral, options)
 	}
 	if err := requireCurrentCollateralLevels(quote, options); err != nil {
@@ -391,6 +391,11 @@ func verifyAndBuildClaims(
 	}
 	return buildVerifiedClaims(quote, body, expectedReportData)
 }
+
+// verifyQuoteAndCollateral is go-tdx-guest's DCAP verification. It is a
+// variable only so tests can reach the checks after it without live Intel
+// collateral; production never reassigns it.
+var verifyQuoteAndCollateral = verify.TdxQuoteContext
 
 type verificationStage int
 
