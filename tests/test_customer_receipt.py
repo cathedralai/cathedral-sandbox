@@ -12,6 +12,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from cathedral import central_access
 from cathedral.cli import main as cli_main
 from cathedral.customer_receipt import (
     CUSTOMER_RECEIPT_POLICY_DIGEST,
@@ -197,6 +198,91 @@ def test_wrong_public_key_fails_signature(cpu_receipt: bytes):
         verify_customer_receipt(cpu_receipt, wrong_keys)
 
     assert caught.value.category == "signature"
+
+
+def test_trusted_keyring_rejects_small_order_ed25519_identity_point():
+    document = json.loads(_trusted_keys_bytes())
+    document["keys"][KEY_ID]["public_key_base64"] = base64.b64encode(
+        b"\x01" + bytes(31)
+    ).decode("ascii")
+
+    with pytest.raises(CustomerReceiptError, match="small-order Ed25519 point") as caught:
+        parse_customer_receipt_trusted_keys_json(json.dumps(document).encode("ascii"))
+
+    assert caught.value.category == "key"
+
+
+def _malformed_ed25519_public_keys() -> tuple[bytes, ...]:
+    p = 2**255 - 19
+    order_8_y = (
+        2707385501144840649318225287225658788936804267575313519463743609750303402022,
+        55188659117513257062467267217118295137698188065244968500265048394206261417927,
+    )
+    small_order_y = (0, 1, p - 1, *order_8_y, *(p - y for y in order_8_y))
+    encodings = {
+        (y | (int(sign) << 255)).to_bytes(32, "little")
+        for y in small_order_y
+        for sign in (False, True)
+    }
+    # Non-canonical y encodings and y=2, which has no corresponding x.
+    encodings.update(
+        (y | (int(sign) << 255)).to_bytes(32, "little")
+        for y in (p, p + 1, p + 3)
+        for sign in (False, True)
+    )
+    encodings.add((2).to_bytes(32, "little"))
+    return tuple(sorted(encodings))
+
+
+@pytest.mark.parametrize("public_key", _malformed_ed25519_public_keys())
+def test_customer_receipt_keyring_rejects_every_point_refused_by_central_access(
+    public_key: bytes,
+):
+    with pytest.raises(central_access.CentralAccessError):
+        central_access.check_ed25519_public_key(public_key, "receipt signing key")
+
+    keyring = json.loads(_trusted_keys_bytes())
+    keyring["keys"][KEY_ID]["public_key_base64"] = base64.b64encode(
+        public_key
+    ).decode("ascii")
+    with pytest.raises(CustomerReceiptError, match="Ed25519"):
+        parse_customer_receipt_trusted_keys_json(json.dumps(keyring).encode("ascii"))
+
+
+def test_customer_receipt_keyring_still_accepts_generated_ed25519_keys():
+    for _ in range(32):
+        private_key = Ed25519PrivateKey.generate()
+        trusted = parse_customer_receipt_trusted_keys_json(
+            _trusted_keys_bytes(private_key=private_key)
+        )[KEY_ID]
+        assert central_access.check_ed25519_public_key(
+            trusted.public_key, "receipt signing key"
+        ) == trusted.public_key
+
+
+def test_forged_receipt_is_rejected_with_malformed_configured_trust_root():
+    keyring = json.loads(_trusted_keys_bytes())
+    keyring["keys"][KEY_ID]["public_key_base64"] = base64.b64encode(
+        b"\x01" + bytes(31)
+    ).decode("ascii")
+    document = _unsigned_cpu_document()
+    # OpenSSL accepts this identity-point signature under the identity point
+    # for any message. The configured-key parser must stop it before verify().
+    forged_signature = b"\x01" + bytes(31) + bytes(32)
+    document["signature"] = {
+        "algorithm": "ed25519",
+        "value_base64": base64.b64encode(forged_signature).decode("ascii"),
+    }
+    forged_receipt = canonical_customer_receipt_json(document)
+
+    with pytest.raises(CustomerReceiptError, match="small-order Ed25519 point") as caught:
+        verify_customer_receipt(
+            forged_receipt,
+            parse_customer_receipt_trusted_keys_json(json.dumps(keyring).encode("ascii")),
+            now=ISSUED_AT,
+        )
+
+    assert caught.value.category == "key"
 
 
 def test_stale_max_age_rejected(cpu_receipt: bytes, trusted_keys):

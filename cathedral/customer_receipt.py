@@ -42,6 +42,17 @@ MAX_JSON_INTEGER = 2**63 - 1
 _TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
 _KEY_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+_ED25519_P = 2**255 - 19
+_ED25519_D = -121665 * pow(121666, -1, _ED25519_P) % _ED25519_P
+_ED25519_SMALL_ORDER_Y = frozenset(
+    {
+        0,
+        1,
+        _ED25519_P - 1,
+        2707385501144840649318225287225658788936804267575313519463743609750303402022,
+        55188659117513257062467267217118295137698188065244968500265048394206261417927,
+    }
+)
 _TOP_LEVEL_KEYS = frozenset(
     {
         "schema",
@@ -308,6 +319,23 @@ def _canonical_base64(value: object, *, decoded_bytes: int, label: str) -> bytes
     return decoded
 
 
+def _validate_ed25519_public_key(public_key: bytes, label: str) -> None:
+    """Reject encodings that cryptography accepts but cannot safely anchor trust."""
+
+    y = int.from_bytes(public_key, "little") & ((1 << 255) - 1)
+    if y >= _ED25519_P:
+        raise CustomerReceiptError("key", f"{label} is not a canonical Ed25519 point")
+    if y in _ED25519_SMALL_ORDER_Y:
+        raise CustomerReceiptError("key", f"{label} is a small-order Ed25519 point")
+    y_squared = y * y % _ED25519_P
+    denominator = (_ED25519_D * y_squared + 1) % _ED25519_P
+    if denominator == 0:
+        raise CustomerReceiptError("key", f"{label} is not an Ed25519 point")
+    x_squared = (y_squared - 1) * pow(denominator, -1, _ED25519_P) % _ED25519_P
+    if pow(x_squared, (_ED25519_P - 1) // 2, _ED25519_P) != 1:
+        raise CustomerReceiptError("key", f"{label} is not an Ed25519 point")
+
+
 def parse_customer_receipt_trusted_keys_json(
     data: bytes | str,
 ) -> Mapping[str, CustomerReceiptVerificationKey]:
@@ -344,6 +372,7 @@ def parse_customer_receipt_trusted_keys_json(
             )
         except CustomerReceiptError as exc:
             raise CustomerReceiptError("key", str(exc)) from exc
+        _validate_ed25519_public_key(public_key, f"trusted key {key_id!r} public key")
         status = raw["status"]
         if not isinstance(status, str) or status not in _KEY_STATUSES:
             raise CustomerReceiptError("key", f"trusted key {key_id!r} status is invalid")
