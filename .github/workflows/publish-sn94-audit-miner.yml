@@ -21,7 +21,7 @@ on:
 permissions: {}
 
 env:
-  IMAGE_PATH: ghcr.io/cathedralai/cathedral-sn39-audit-miner
+  IMAGE_PATH: ghcr.io/cathedralai/cathedral-sn94-audit-miner
 
 jobs:
   publish:
