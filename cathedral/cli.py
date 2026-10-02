@@ -1497,6 +1497,13 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
     fleet_manifest_path = getattr(args, "fleet_manifest", None)
     validator_network = getattr(args, "validator_network", None)
     validator_netuid = getattr(args, "validator_netuid", None)
+    # The TEE box binds its central delegations to the subnet, so it takes
+    # the same explicit network and netuid as signed validator access, with
+    # no default. A box without signed validator access still needs both.
+    if tee_box is not None and (validator_network is None or validator_netuid is None):
+        raise ValueError(
+            "the TEE box sandbox API requires --validator-network and --validator-netuid"
+        )
     access_values = (
         access_snapshot_path,
         access_keys_path,
@@ -1523,8 +1530,15 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             "a non-loopback AMD SEV-SNP worker requires signed validator access; "
             "bearer-only SNP service is development-only"
         )
-    access_enabled = any(value is not None for value in access_values) or (
-        fleet_manifest_path is not None or allow_public_bootstrap or allow_public_legacy_audit
+    signed_access_values = access_values[:-2]
+    # Network and netuid alone ask for signed validator access, unless the
+    # TEE box is the one that takes them.
+    subnet_given = validator_network is not None or validator_netuid is not None
+    access_enabled = any(value is not None for value in signed_access_values) or (
+        fleet_manifest_path is not None
+        or allow_public_bootstrap
+        or allow_public_legacy_audit
+        or (subnet_given and tee_box is None)
     )
     if access_enabled and any(value is None for value in access_values):
         raise ValueError(
@@ -1766,8 +1780,8 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             tee=tee,
             hotkey=args.hotkey,
             channel_binding=channel_binding,
-            network=getattr(args, "validator_network", DEFAULT_ENROLL_NETWORK),
-            netuid=getattr(args, "validator_netuid", DEFAULT_ENROLL_NETUID),
+            network=validate_network(validator_network),
+            netuid=validate_netuid(validator_netuid),
             public_endpoint=public_endpoint,
         )
     with WorkerServer(
@@ -4550,10 +4564,19 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         command.add_argument(
-            "--validator-network", help="chain network the signed validator snapshot is bound to"
+            "--validator-network",
+            help=(
+                "chain network that signed validator access and the TEE box are bound to; "
+                "no default, required by either"
+            ),
         )
         command.add_argument(
-            "--validator-netuid", type=int, help="netuid the signed validator snapshot is bound to"
+            "--validator-netuid",
+            type=int,
+            help=(
+                "netuid that signed validator access and the TEE box are bound to; "
+                "no default, required by either"
+            ),
         )
         command.add_argument(
             "--public-endpoint",
