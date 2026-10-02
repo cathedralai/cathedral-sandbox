@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping
+from typing import Callable, Mapping
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -806,7 +806,20 @@ class PolicyRegistryState:
                 raise PolicyRegistryError("persisted receipt key state is invalid")
         return states
 
-    def accept(self, snapshot: PolicyRegistrySnapshot) -> None:
+    def accept(
+        self,
+        snapshot: PolicyRegistrySnapshot,
+        *,
+        before_commit: Callable[[], None] | None = None,
+    ) -> None:
+        """Accept ``snapshot`` or raise, all in one transaction.
+
+        ``before_commit``, when given, runs after every check has passed and
+        before the new state commits, with the database write lock held. If
+        it raises, nothing is recorded. A caller that publishes something
+        derived from the release (a mirrored policy file) does it here, so
+        the high-water mark never moves past what it published."""
+
         if self.minimum_release is not None and snapshot.release < self.minimum_release:
             raise PolicyRegistryError("registry release is below the configured minimum")
         states = {
@@ -865,6 +878,8 @@ class PolicyRegistryState:
                                         ),
                                     ),
                                 )
+                            if before_commit is not None:
+                                before_commit()
                             connection.execute("COMMIT")
                             return
                         raise PolicyRegistryError("registry release was equivocated")
@@ -959,6 +974,8 @@ class PolicyRegistryState:
                         snapshot.generated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     ),
                 )
+                if before_commit is not None:
+                    before_commit()
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise

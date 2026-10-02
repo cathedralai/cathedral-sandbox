@@ -72,8 +72,22 @@ match exactly.
 On success it emits one bounded JSON object containing the verified REPORTDATA,
 Cathedral launch measurement, raw TCB SVN, current TCB status, stable hashed
 platform identity, rotating PCK and attestation-key fingerprints, and the exact
-booleans `intel_verified=true` and `report_data_match=true`. Any verification,
-network, parsing, or shape failure exits nonzero.
+booleans `intel_verified=true` and `report_data_match=true`. On failure it
+prints nothing on stdout and exits:
+
+| Exit | Meaning | Validator verdict |
+|---|---|---|
+| `0` | The quote verified; the claims are on stdout. | PASS |
+| `1` | The quote, its input, or its collateral is invalid. | FAIL |
+| `3` | Intel's collateral service did not answer: a network or TLS error, a timeout, HTTP 5xx, or HTTP 408, 425 or 429. | INFRA |
+
+Exit `3` says nothing about the miner, so it must not zero the machine. It is
+chosen only for answers that describe Intel's service, never for an answer
+about the request: any other 4xx, a refused redirect, a disallowed URL, or
+collateral that does not verify exits `1`. A miner therefore cannot craft a
+quote that turns into a validator-wide stop. Releases before this contract
+exit `1` for every failure. Any other nonzero exit, such as a Go runtime panic
+(`2`), is a failure of this run and must be read as `1`.
 
 The verifier fetches collateral only from the two allowlisted Intel PCS hosts,
 over bounded HTTPS requests using Intel's `standard` update channel. It never

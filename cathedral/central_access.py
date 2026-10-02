@@ -14,6 +14,13 @@ The worker admits a central caller only when the miner passes the three
 migrate). Step 2 has no revocation-list fetch yet: nothing calls
 install_revocations, so a compromised delegation is bounded only by its expiry,
 at most MAX_DELEGATION_SECONDS (24 hours), until the fetch lands.
+
+A delegation grants path routes, which are POST only, or route scopes. The TEE
+box sandbox API (docs/TEE_BOX_SERVICE.md) maps each of its requests to one of
+TEE_BOX_CENTRAL_SCOPES and passes it to ``preauthorize``; the request then
+signs its method and full target, and the delegation must grant the scope. The
+TEE box builds its own authorizer from the root keys in measured state
+(cathedral/tee_box/measured_root.py), never from the --central-* flags.
 """
 
 from __future__ import annotations
@@ -42,6 +49,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 from cathedral.admission_policy import AdmissionPolicyError, load_policy_keys
 from cathedral.common import ChannelBinding
 from cathedral.policy_registry import (
+    PolicyRegistryError,
     canonical_json,
     canonical_signed_bytes,
     parse_registry_json,
@@ -70,7 +78,26 @@ MAX_CENTRAL_CONCURRENT = 2
 DEFAULT_CENTRAL_REQUESTS_PER_WINDOW = 60
 DEFAULT_CENTRAL_RATE_WINDOW_SECONDS = 60.0
 MAX_CENTRAL_CALLERS = 16
-CENTRAL_ROUTES = frozenset({"/v1/capabilities"})
+# Route scopes of the TEE box sandbox API. Each names a group of its method and
+# path templates (cathedral/tee_box/service.py maps them); scoped requests may
+# use any of SCOPED_METHODS, while the path routes stay POST only.
+TEE_BOX_CENTRAL_SCOPES = frozenset(
+    {
+        "tee-box:box",
+        "tee-box:lease",
+        "tee-box:revocations",
+        "tee-box:image-import",
+        "tee-box:create",
+        "tee-box:list",
+        "tee-box:get",
+        "tee-box:lifetime",
+        "tee-box:delete",
+        "tee-box:exec",
+        "tee-box:files",
+    }
+)
+SCOPED_METHODS = frozenset({"GET", "POST", "PUT", "DELETE"})
+CENTRAL_ROUTES = frozenset({"/v1/capabilities"}) | TEE_BOX_CENTRAL_SCOPES
 
 _DELEGATION_KEYS = frozenset(
     {
@@ -113,10 +140,52 @@ _HEX_32_RE = re.compile(r"[0-9a-f]{64}")
 _KEY_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _NETWORK_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 _TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+# Ed25519 public keys. ``cryptography`` takes any 32 bytes as a public key, and
+# OpenSSL does not refuse a small-order one when it verifies: under such a key,
+# a signature whose R is the identity and whose S is zero verifies for any
+# message. Every key this module parses must therefore decode to a curve point
+# (RFC 8032 section 5.1.3) with a canonical y below p, and must not be one of
+# the eight small-order points. Those are the points with the y values below,
+# in either sign: the same blocklist as libsodium's ge25519_has_small_order.
+_ED25519_P = 2**255 - 19
+_ED25519_D = -121665 * pow(121666, -1, _ED25519_P) % _ED25519_P
+_ED25519_SMALL_ORDER_Y = frozenset(
+    {
+        0,  # the two points of order 4
+        1,  # the identity
+        _ED25519_P - 1,  # order 2
+        # the four points of order 8
+        2707385501144840649318225287225658788936804267575313519463743609750303402022,
+        55188659117513257062467267217118295137698188065244968500265048394206261417927,
+    }
+)
 
 
 class CentralAccessError(ValueError):
     """A central delegation, request, or revocation list was refused."""
+
+
+def check_ed25519_public_key(key: object, label: str) -> bytes:
+    """Return ``key`` if it is a usable Ed25519 public key, else refuse it.
+
+    It must be 32 bytes encoding a curve point with a canonical y, and not a
+    small-order point, whose holder need not know a private key to sign.
+    """
+
+    if not isinstance(key, bytes) or len(key) != 32:
+        raise CentralAccessError(f"{label} must be a 32-byte Ed25519 public key")
+    y = int.from_bytes(key, "little") & ((1 << 255) - 1)
+    if y >= _ED25519_P:
+        raise CentralAccessError(f"{label} is not a canonical Ed25519 point")
+    if y in _ED25519_SMALL_ORDER_Y:
+        raise CentralAccessError(f"{label} is a small-order Ed25519 point")
+    # x^2 = (y^2 - 1) / (d y^2 + 1). It is zero only for y = 1 or p - 1, both
+    # refused above, so the point exists, in either sign, when x^2 is a square.
+    y_squared = y * y % _ED25519_P
+    x_squared = (y_squared - 1) * pow(_ED25519_D * y_squared + 1, -1, _ED25519_P) % _ED25519_P
+    if pow(x_squared, (_ED25519_P - 1) // 2, _ED25519_P) != 1:
+        raise CentralAccessError(f"{label} is not an Ed25519 point")
+    return key
 
 
 @dataclass(frozen=True)
@@ -289,11 +358,12 @@ def load_central_root_keys(path: str, *, pinned_digest: str) -> dict[str, bytes]
         raise CentralAccessError("central root key digest must be sha256 plus 64 hex")
     try:
         keys = load_policy_keys(path, production_mode=True, pinned_digest=pinned_digest)
-    except AdmissionPolicyError as exc:
+    except (AdmissionPolicyError, PolicyRegistryError) as exc:
         raise CentralAccessError(f"central root keys are unusable: {exc}") from exc
-    for key_id in keys:
+    for key_id, key in keys.items():
         if _KEY_ID_RE.fullmatch(key_id) is None:
             raise CentralAccessError("central root key id is not canonical")
+        check_ed25519_public_key(key, f"central root key {key_id}")
     return keys
 
 
@@ -346,6 +416,7 @@ def _verify_ed25519(document: Mapping[str, object], public_key: bytes, label: st
     if signature["algorithm"] != "ed25519":
         raise CentralAccessError(f"{label} signature algorithm is unsupported")
     raw = _b64(signature["value_base64"], 64, f"{label} signature")
+    check_ed25519_public_key(public_key, f"{label} signing key")
     try:
         Ed25519PublicKey.from_public_bytes(public_key).verify(raw, canonical_signed_bytes(document))
     except (InvalidSignature, ValueError) as exc:
@@ -413,7 +484,9 @@ def _check_delegation_fields(
     key_id = document.get("root_key_id")
     if not isinstance(key_id, str) or _KEY_ID_RE.fullmatch(key_id) is None:
         raise CentralAccessError("central delegation root key id is not canonical")
-    central_key = _b64(document.get("central_key_base64"), 32, "central key")
+    central_key = check_ed25519_public_key(
+        _b64(document.get("central_key_base64"), 32, "central key"), "central key"
+    )
     routes = document.get("routes")
     if (
         not isinstance(routes, list)
@@ -600,6 +673,8 @@ class CentralAccessAuthorizer:
     ) -> None:
         if not root_keys:
             raise CentralAccessError("central access requires at least one pinned root key")
+        for key_id, key in root_keys.items():
+            check_ed25519_public_key(key, f"central root key {key_id}")
         bittensor_account_id(worker_hotkey)
         self.network, self.netuid = _check_subnet(network, netuid)
         if not isinstance(channel_binding, ChannelBinding):
@@ -678,7 +753,13 @@ class CentralAccessAuthorizer:
         if path is None:
             return
         try:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+            # O_NONBLOCK: opening a FIFO for reading would otherwise wait for a
+            # writer, holding the lock, and hang startup or every request. The
+            # fstat below then refuses anything but a regular file.
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            )
         except OSError:
             self._revocations_file = None
             self._revocations_file_error = "central revocation list file is unavailable"
@@ -710,6 +791,8 @@ class CentralAccessAuthorizer:
         finally:
             os.close(descriptor)
         try:
+            if len(raw) > MAX_REVOCATIONS_FILE_BYTES:
+                raise ValueError("it grew past its size limit while being read")
             document = parse_registry_json(raw)
             if raw.rstrip(b"\n") != canonical_json(document):
                 raise ValueError("not canonical")
@@ -719,12 +802,33 @@ class CentralAccessAuthorizer:
             return
         self._revocations_file_error = None
 
+    @property
+    def revocations_sequence(self) -> int:
+        """The sequence of the revocation list in force, 0 if none."""
+
+        with self._lock:
+            return self._revocations_sequence
+
     def preauthorize(
-        self, header: object, *, method: str, path: str, now: datetime
+        self,
+        header: object,
+        *,
+        method: str,
+        path: str,
+        now: datetime,
+        scope: str | None = None,
     ) -> PreauthorizedCentralRequest:
-        """Check everything but the body, before the body is read."""
+        """Check everything but the body, before the body is read.
+
+        With no ``scope``, ``path`` must be a path route the delegation grants
+        and the method POST. With a ``scope`` from TEE_BOX_CENTRAL_SCOPES, the
+        caller has already mapped ``method`` and ``path`` (the full target) to
+        that scope, and the delegation must grant it.
+        """
 
         now = _check_now(now)
+        if scope is not None and scope not in TEE_BOX_CENTRAL_SCOPES:
+            raise CentralAccessError("central route scope is unknown")
         with self._lock:
             self._refresh_revocations_locked()
             if self._revocations_file_error is not None:
@@ -766,9 +870,15 @@ class CentralAccessAuthorizer:
             if delegation.sequence < self._delegation_high_water:
                 raise CentralAccessError("central delegation is older than one already accepted")
 
-        if method != "POST" or document["method"] != method or document["path"] != path:
+        if scope is None:
+            method_allowed = method == "POST" and path not in TEE_BOX_CENTRAL_SCOPES
+            granted = path
+        else:
+            method_allowed = method in SCOPED_METHODS
+            granted = scope
+        if not method_allowed or document["method"] != method or document["path"] != path:
             raise CentralAccessError("central request target does not match")
-        if path not in delegation.routes:
+        if granted not in delegation.routes:
             raise CentralAccessError("central delegation does not grant this route")
         if document["worker_hotkey"] != self.worker_hotkey:
             raise CentralAccessError("central request worker does not match")

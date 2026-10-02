@@ -9,11 +9,12 @@ tool is what the root holder runs, on the offline host:
   keygen    mint an Ed25519 seed (mode 0600, create-only) for the root or the
             central service; for a root, also write the key file miners pin
             and print its digest;
-  delegate  sign one delegation to a central public key, check it against the
-            pinned root key file before writing it, and record it in the
-            root's append-only ledger, which refuses a sequence that does not
-            increase (the worker refuses a delegation older than one it has
-            accepted);
+  delegate  sign one delegation to a central public key (never a small-order
+            or non-canonical one, which anyone could sign as), check it
+            against the pinned root key file before writing it, and record it
+            in the root's append-only ledger, which refuses a sequence that
+            does not increase (the worker refuses a delegation older than one
+            it has accepted);
   revoke    sign a revocation list, carrying every entry of the previous list
             forward under a higher sequence, and check it before writing it;
   verify    check a delegation or a revocation list against the pinned root
@@ -47,6 +48,7 @@ from cathedral.central_access import (
     CENTRAL_ROUTES,
     MAX_DELEGATION_SECONDS,
     CentralAccessError,
+    check_ed25519_public_key,
     load_central_root_keys,
     sign_delegation,
     sign_revocations,
@@ -293,6 +295,11 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         or base64.b64encode(central_key).decode("ascii") != args.central_public_key
     ):
         raise SystemExit("--central-public-key must be a 32-byte canonical base64 key")
+    try:
+        # Anyone can sign as a small-order key: never delegate to one.
+        check_ed25519_public_key(central_key, "--central-public-key")
+    except CentralAccessError as exc:
+        raise SystemExit(f"refusing to delegate: {exc}") from None
 
     seed = _load_seed(args.root_key_file)
     keys = _pinned_root_key(args, seed)

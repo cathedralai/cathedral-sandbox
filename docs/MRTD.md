@@ -85,6 +85,28 @@ update, an unexpected initramfs change, or provider firmware. A provider must
 never approve its own machine automatically. Freeze boot-critical packages if
 your operating policy requires a stable measurement.
 
+## The TEE box measurement list
+
+The owner's one signed measurement list (TEE box design decision 4,
+2026-09-29) is this registry. A `cpu_tdx` profile whose signed `metadata`
+has a `tee_box` object lists TEE box images by their quote-body fields
+except RTMR3. Each image has two Cathedral values, derived rather than
+listed: RTMR3 all zero on a fresh boot, and RTMR3 =
+`SHA-384(0^48 || SHA-384("cathedral tee-box lease granted v1"))` once the
+boot has served a lease (`RTMR3_CONSUMED`, `cathedral/tee_box/boot.py`). The
+profile's `measurements` must be exactly those values, every image's
+MRCONFIGID must bind a central root, and the release must still give the
+worker policy (`to_policy`), so a box profile cannot change the shared TCB
+controls.
+
+`cathedral/capacity/measurement_list.py` verifies a release, checks those
+entries, advances the high-water mark, and gives TEE box admission its
+policy. `cathedral policy-registry export-measurement-policy` writes
+cathedral-validator #256's local policy file from the same release, with a
+`.source.json` record of the release and digest; `--scope box|all` is
+required, and an enforcing list with nothing eligible is written as deny
+all. The rules below apply unchanged. See docs/TEE_BOX_SERVICE.md, "The measurement list (T11)".
+
 ## Rollback and revocation
 
 - To withdraw a measurement, publish a higher signed registry release that

@@ -131,6 +131,14 @@ MAX_HOTKEY_LENGTH: int = 256
 MAX_BEARER_TOKEN_LENGTH: int = 4096
 MAX_CUSTOMER_SAT_SOLVE_SECONDS: float = 30.0
 MAX_CUSTOMER_SAT_MEMORY_BYTES: int = 256 * 1024 * 1024
+# The TEE box sandbox API (off unless a TeeBoxSandboxApi is supplied) has its
+# own request-class pool, so a long sync exec or poll cannot take the slots
+# validators need.
+MAX_TEE_BOX_CONCURRENT: int = 8
+TEE_BOX_REAP_INTERVAL_SECONDS: float = 5.0
+# The egress re-check runs on its own thread at a fixed rate, apart from the
+# reaper's docker calls (docs/TEE_BOX_SERVICE.md, "Egress enforcement").
+TEE_BOX_EGRESS_CHECK_INTERVAL_SECONDS: float = 5.0
 
 _EVIDENCE_REQUEST_KEYS = frozenset({"nonce_hex", "assigned_hotkey"})
 _EVIDENCE_V2_REQUEST_KEYS = _EVIDENCE_REQUEST_KEYS | frozenset(
@@ -585,6 +593,8 @@ def _make_handler(
     central_authorizer: CentralAccessAuthorizer | None = None,
     central_request_limiter: CentralRequestLimiter | None = None,
     central_semaphore: threading.Semaphore | None = None,
+    tee_box_api=None,
+    tee_box_semaphore: threading.Semaphore | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     class _Handler(BaseHTTPRequestHandler):
         def setup(self) -> None:
@@ -721,8 +731,118 @@ def _make_handler(
                 return None, 400, "incomplete request body"
             return body, 200, ""
 
+        def _send_bytes(self, code: int, body: bytes, content_type: str, limit: int) -> None:
+            if len(body) > limit:
+                self._send_json(500, {"error": "response too large"})
+                return
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def _read_tee_box_body(self, method: str, limit: int) -> tuple[bytes | None, int, str]:
+            if self.headers.get("Transfer-Encoding") is not None:
+                return None, 400, "invalid request framing"
+            lengths = self.headers.get_all("Content-Length", failobj=[])
+            if not lengths and method in {"GET", "DELETE"}:
+                return b"", 200, ""
+            if len(lengths) != 1:
+                return None, 411, "content length required"
+            if _DECIMAL_RE.fullmatch(lengths[0]) is None:
+                return None, 400, "invalid content length"
+            length = int(lengths[0])
+            if length > limit:
+                return None, 413, "request too large"
+            try:
+                body = self.rfile.read(length)
+            except (socket.timeout, TimeoutError, OSError):
+                return None, 400, "incomplete request body"
+            if len(body) != length:
+                return None, 400, "incomplete request body"
+            return body, 200, ""
+
+        def _tee_box_request(self, method: str) -> None:
+            """Serve one sandbox API call: central caller, own pool, then the API."""
+
+            from cathedral.tee_box.service import (
+                MAX_REQUEST_BODY as TEE_BOX_MAX_BODY,
+                MAX_RESPONSE_BODY as TEE_BOX_MAX_RESPONSE,
+                owns_path,
+                route_scope,
+            )
+
+            assert tee_box_api is not None and tee_box_semaphore is not None
+            target = self.path
+            if not owns_path(target.partition("?")[0]):
+                self._send_json(404, {"error": "not found"})
+                return
+            authorizer = tee_box_api.authorizer
+            headers = self.headers.get_all(CENTRAL_REQUEST_HEADER, failobj=[])
+            scope = route_scope(method, target)
+            # The central request signs the method and full target, query
+            # included, and the delegation must grant the route's scope. All of
+            # it is verified before the caller gets a slot or a body read, and
+            # every refusal is the same 401.
+            preauthorized = None
+            if (
+                len(headers) == 1
+                and scope is not None
+                and not self.headers.get_all(VALIDATOR_REQUEST_HEADER, failobj=[])
+            ):
+                try:
+                    preauthorized = authorizer.preauthorize(
+                        headers[0],
+                        method=method,
+                        path=target,
+                        now=datetime.now(UTC),
+                        scope=scope,
+                    )
+                except CentralAccessError:
+                    preauthorized = None
+            if preauthorized is None:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            if not tee_box_semaphore.acquire(blocking=False):
+                self._send_json(503, {"error": "busy"})
+                return
+            try:
+                raw, error_code, error_message = self._read_tee_box_body(method, TEE_BOX_MAX_BODY)
+                if raw is None:
+                    self._send_json(error_code, {"error": error_message})
+                    return
+                try:
+                    caller = authorizer.finalize(preauthorized, body=raw, now=datetime.now(UTC))
+                except CentralAccessError:
+                    self._send_json(401, {"error": "unauthorized"})
+                    return
+                response = tee_box_api.handle(method, target, caller, raw)
+                self._send_bytes(
+                    response.status,
+                    response.body,
+                    response.content_type,
+                    TEE_BOX_MAX_RESPONSE,
+                )
+            except (socket.timeout, TimeoutError, OSError):
+                try:
+                    self._send_json(400, {"error": "request failed"})
+                except OSError:
+                    pass
+            except Exception:
+                try:
+                    self._send_json(500, {"error": "internal error"})
+                except OSError:
+                    pass
+            finally:
+                tee_box_semaphore.release()
+
         def do_POST(self) -> None:
             path = self.path.partition("?")[0]
+            if tee_box_api is not None and _tee_box_owns(path):
+                self._tee_box_request("POST")
+                return
             # Header presence is not authentication. Reject unknown routes
             # before it can influence pool selection or trigger a body read,
             # otherwise a fake validator header could occupy the small signed
@@ -1210,7 +1330,18 @@ def _make_handler(
                 },
             )
 
+    if tee_box_api is not None:
+        # Only an enabled sandbox API gives the worker GET, PUT and DELETE.
+        _Handler.do_GET = lambda self: self._tee_box_request("GET")  # type: ignore[attr-defined]
+        _Handler.do_PUT = lambda self: self._tee_box_request("PUT")  # type: ignore[attr-defined]
+        _Handler.do_DELETE = lambda self: self._tee_box_request("DELETE")  # type: ignore[attr-defined]
     return _Handler
+
+
+def _tee_box_owns(path: str) -> bool:
+    from cathedral.tee_box.service import owns_path
+
+    return owns_path(path)
 
 
 def _parse_instance(raw: object) -> SatInstance | None:
@@ -1491,6 +1622,8 @@ class WorkerServer:
         max_central_concurrent: int = MAX_CENTRAL_CONCURRENT,
         central_requests_per_window: int = 60,
         central_rate_window_seconds: float = 60.0,
+        tee_box_api=None,
+        max_tee_box_concurrent: int = MAX_TEE_BOX_CONCURRENT,
     ) -> None:
         try:
             loopback = ipaddress.ip_address(host).is_loopback
@@ -1528,6 +1661,7 @@ class WorkerServer:
             ),
             ("max_response_body", max_response_body),
             ("max_central_concurrent", max_central_concurrent),
+            ("max_tee_box_concurrent", max_tee_box_concurrent),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
@@ -1536,6 +1670,7 @@ class WorkerServer:
             if validator_authorizer is not None
             else 0
         ) + (max_central_concurrent if central_authorizer is not None else 0)
+        tee_box_class_capacity = max_tee_box_concurrent if tee_box_api is not None else 0
         if max_connection_concurrent is None:
             max_connection_concurrent = (
                 max_concurrent
@@ -1543,6 +1678,7 @@ class WorkerServer:
                 + max_sat_challenge_concurrent
                 + validator_class_capacity
                 + PREAUTH_CONNECTION_HEADROOM
+                + tee_box_class_capacity
             )
         if (
             isinstance(max_connection_concurrent, bool)
@@ -1555,6 +1691,7 @@ class WorkerServer:
             + max_challenge_concurrent
             + max_sat_challenge_concurrent
             + validator_class_capacity
+            + tee_box_class_capacity
         )
         if max_connection_concurrent < class_capacity:
             raise ValueError("max_connection_concurrent must cover all request-class capacity")
@@ -1623,6 +1760,27 @@ class WorkerServer:
                 raise ValueError("central access must bind the worker TLS key")
             if central_authorizer.worker_hotkey != configured_hotkey:
                 raise ValueError("central access must bind the configured worker hotkey")
+        if tee_box_api is not None:
+            from cathedral.tee_box.service import TeeBoxSandboxApi
+
+            if not isinstance(tee_box_api, TeeBoxSandboxApi):
+                raise ValueError("tee_box_api must be a TeeBoxSandboxApi")
+            # The sandbox API shares the attested listener, so its TLS key is
+            # the one REPORT_DATA binds (docs/TEE_BOX_SERVICE.md).
+            if tls_context is None or channel_binding is None:
+                raise ValueError("the TEE box sandbox API requires the attested worker TLS")
+            if tee_box_api.authorizer.channel_binding != channel_binding:
+                raise ValueError("TEE box caller access must bind the worker TLS key")
+            if tee_box_api.authorizer.worker_hotkey != configured_hotkey:
+                raise ValueError("TEE box caller access must bind the configured worker hotkey")
+            # Its roots come from measured state; the --central-* authorizer's
+            # come from miner flags, so the two never share an authorizer or
+            # replay state.
+            if central_authorizer is not None and (
+                tee_box_api.authorizer is central_authorizer
+                or tee_box_api.authorizer.state.path == central_authorizer.state.path
+            ):
+                raise ValueError("TEE box caller access must not share the flag-configured one")
         if (gpu_executor is None) != (gpu_evidence_collector is None):
             raise ValueError("GPU execution and composite collector are required together")
         if gpu_executor is not None:
@@ -1683,7 +1841,11 @@ class WorkerServer:
                 window_seconds=central_rate_window_seconds,
             ),
             None if central_authorizer is None else _Semaphore(max_central_concurrent),
+            tee_box_api,
+            None if tee_box_api is None else _Semaphore(max_tee_box_concurrent),
         )
+        self._tee_box_api = tee_box_api
+        self._reaper_stop = threading.Event()
         self._server = _BoundedThreadingHTTPServer(
             (host, port),
             handler,
@@ -1706,10 +1868,42 @@ class WorkerServer:
         scheme = "https" if self._tls_enabled else "http"
         return f"{scheme}://{self.host}:{self.port}"
 
+    def _reap_tee_box(self) -> None:
+        # Lease and sandbox expiry also run on every sandbox call. This loop
+        # ends an expired customer's sandboxes when no call arrives, retries a
+        # drain whose deletes failed, and removes box-labelled containers the
+        # executor does not track, starting with any a previous process left.
+        while True:
+            for step in (self._tee_box_api.reap, self._tee_box_api.sweep):
+                try:
+                    step()
+                except Exception:
+                    pass
+            if self._reaper_stop.wait(TEE_BOX_REAP_INTERVAL_SECONDS):
+                return
+
+    def _check_tee_box_egress(self) -> None:
+        # A fixed-rate loop: the next check is due one interval after the
+        # previous one started, whatever the reaper is doing.
+        interval = TEE_BOX_EGRESS_CHECK_INTERVAL_SECONDS
+        due = time.monotonic()
+        while True:
+            try:
+                self._tee_box_api.check_egress()
+            except Exception:
+                pass
+            due = max(due + interval, time.monotonic())
+            if self._reaper_stop.wait(max(0.0, due - time.monotonic())):
+                return
+
     def serve_forever(self) -> None:
+        if self._tee_box_api is not None:
+            threading.Thread(target=self._reap_tee_box, daemon=True).start()
+            threading.Thread(target=self._check_tee_box_egress, daemon=True).start()
         self._server.serve_forever()
 
     def shutdown(self) -> None:
+        self._reaper_stop.set()
         self._server.shutdown()
         self._server.server_close()
 
