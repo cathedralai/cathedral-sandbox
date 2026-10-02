@@ -23,7 +23,7 @@ provides its automatic source archives.
 - Environment: `GOENV=off`, `GOWORK=off`
 - Target: `CGO_ENABLED=0`, `GOOS=linux`, `GOARCH=amd64`, `GOAMD64=v1`
 - Flags: `-mod=readonly -trimpath -buildvcs=false -ldflags='-s -w'`
-- Binary SHA-256: `4a918bcde8ef45d567acdcd2a92559313e474c81ca20e7a9e797a744fb185082`
+- Binary SHA-256: `eb3fffb61e35ad9605e3a84869f8c3a9f8e647605b3d407ebf4a29324c4e93cc`
 - Workflow: `.github/workflows/release-tdx-verifier.yml`
 
 The literal build command is:
