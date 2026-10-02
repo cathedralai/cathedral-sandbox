@@ -205,7 +205,10 @@ class Attested:
 
     tier: Tier
     chip_id: str  # SNP CHIP_ID / TDX platform id / certified GPU UUID
-    measurement: str  # the attested measurement, matched against policy
+    # The identity that matched policy. For Intel TDX: the v1 launch
+    # measurement when the policy lists it, otherwise the v2 image identity
+    # (docs/MRTD.md). Policy re-checks compare this value.
+    measurement: str
     tcb: int  # trusted computing base version
     # Fail-closed by default. These two are the verdict, so a verifier that
     # forgets to declare one must produce an unusable Attested rather than a
@@ -223,6 +226,12 @@ class Attested:
     attestation_key_id: str | None = None
     policy_mode: str | None = None
     assurance: AssuranceClaims | None = None
+    # Intel TDX audit values, both from the pinned verifier: the v1
+    # ``tdx-measurement-sha256`` launch measurement (includes host-set
+    # MROWNER) and the v2 ``tdx-image-sha256`` image identity (None when the
+    # verifier release predates it).
+    launch_measurement: str | None = None
+    image_measurement: str | None = None
 
 
 def issue_nonce() -> bytes:

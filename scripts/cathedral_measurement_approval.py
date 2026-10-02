@@ -73,6 +73,9 @@ from cathedral.policy_registry import parse_registry_json, sign_registry, verify
 from cathedral.remote import RemoteMiner
 
 MEASUREMENT_PREFIX = "tdx-measurement-sha256:"
+# The v2 image identity (docs/MRTD.md, "Image identity"): the value to approve
+# when the provider sets MROWNER per VM, as GCP does.
+IMAGE_MEASUREMENT_PREFIX = "tdx-image-sha256:"
 ACCEPTABLE_TCB = {"UpToDate"}
 MAX_ROLLOVER_DAYS = 180
 MIN_ROLLOVER_DAYS = 7
@@ -165,8 +168,18 @@ def _capture(endpoint: str, cacert: str, hotkey: str, verifier: str) -> dict:
     measurement = claims.get("measurement")
     if not isinstance(measurement, str) or not measurement.startswith(MEASUREMENT_PREFIX):
         raise SystemExit(f"verifier returned an unexpected measurement value: {measurement!r}")
+    image_measurement = claims.get("image_measurement")
+    if not isinstance(image_measurement, str) or not image_measurement.startswith(
+        IMAGE_MEASUREMENT_PREFIX
+    ):
+        image_measurement = None  # a verifier release from before the v2 identity
     chip = claims.get("stable_platform_id") or claims.get("chip_id")
-    return {"measurement": measurement, "tcb_status": tcb, "chip_id": chip}
+    return {
+        "measurement": measurement,
+        "image_measurement": image_measurement,
+        "tcb_status": tcb,
+        "chip_id": chip,
+    }
 
 
 def _select_active_profile(document: dict, profile_id: str) -> dict:
@@ -306,7 +319,15 @@ def cmd_approve(args: argparse.Namespace) -> int:
     # the capture spends a live probe against the worker.
     _select_active_profile(registry, profile_id)
     candidate = _capture(args.endpoint, args.cacert, args.hotkey, args.verifier)
-    measurement = candidate["measurement"]
+    if getattr(args, "identity", "launch") == "image":
+        measurement = candidate.get("image_measurement")
+        if measurement is None:
+            raise SystemExit(
+                "the verifier did not emit image_measurement; use a verifier release "
+                "with the v2 image identity or approve --identity launch"
+            )
+    else:
+        measurement = candidate["measurement"]
     print(
         f"captured candidate {measurement} (tcb {candidate['tcb_status']}, "
         f"chip {str(candidate['chip_id'])[:16]}...)",
@@ -1203,6 +1224,16 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument("--cacert", required=True)
     approve.add_argument("--hotkey", required=True)
     approve.add_argument("--verifier", required=True)
+    approve.add_argument(
+        "--identity",
+        choices=("launch", "image"),
+        default="launch",
+        help=(
+            "launch approves the v1 tdx-measurement-sha256 value (includes "
+            "host-set MROWNER, so one value per VM on GCP); image approves the "
+            "v2 tdx-image-sha256 value, one per image and VM shape (docs/MRTD.md)"
+        ),
+    )
     approve.add_argument("--operator", required=True)
     approve.add_argument("--reason", required=True)
     approve.add_argument("--approval-log", required=True)

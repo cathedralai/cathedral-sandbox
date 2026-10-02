@@ -922,3 +922,99 @@ def test_a_repeated_policy_key_keeps_its_own_message():
     )
     with pytest.raises(adm.AdmissionError, match="repeats a JSON key"):
         adm.parse_policy(raw)
+
+
+# -- v2 image identity (docs/MRTD.md, "Image identity"; #265) ----------------------
+
+# Two VMs from one image: GCP sets MROWNER per VM, so their v1 values differ.
+VM_A = _tdx_quote(mr_owner=b"a" * 48)
+VM_B = _tdx_quote(mr_owner=b"b" * 48)
+TDX_IMAGE = parse_tdx_quote(VM_A).image_measurement
+
+
+def test_the_fixture_vms_share_an_image_identity_but_not_a_launch_measurement():
+    assert parse_tdx_quote(VM_A).measurement != parse_tdx_quote(VM_B).measurement
+    assert parse_tdx_quote(VM_B).image_measurement == TDX_IMAGE
+
+
+def test_a_tdx_policy_accepts_image_identity_entries():
+    allowed = sorted([TDX_IMAGE, TDX_MEASUREMENT])
+    policy = adm.parse_policy(_policy_bytes("tdx", "enforce", allowed))
+    assert policy.allowed_measurements == frozenset(allowed)
+    for bad in ("tdx-image-sha256:" + "A1" * 32, "tdx-image-sha256:" + "11" * 31):
+        with pytest.raises(adm.AdmissionError, match="tdx-image-sha256"):
+            adm.parse_policy(_policy_bytes("tdx", "shadow", [bad]))
+    with pytest.raises(adm.AdmissionError):
+        adm.parse_policy(_policy_bytes("sev_snp", "shadow", [TDX_IMAGE]))
+
+
+@pytest.mark.parametrize("quote", [VM_A, VM_B], ids=["vm_a", "vm_b"])
+@pytest.mark.parametrize("verdict", ["image", "launch"])
+def test_an_image_listing_admits_every_honest_vm_of_that_image(quote, verdict):
+    # The verifier's verdict names v2 when its own policy listed only v2, and
+    # v1 when it listed v1; admission accepts either for these quote bytes.
+    parsed = parse_tdx_quote(quote)
+    named = parsed.image_measurement if verdict == "image" else parsed.measurement
+    pair = _tdx(quote, measurement=named)
+    result = _admit(pair, policy=_policy("tdx", "enforce", [TDX_IMAGE]))
+    assert result.admitted and result.reasons == ()
+    assert result.measurement == TDX_IMAGE
+    assert (result.launch_measurement, result.image_measurement) == (
+        parsed.measurement,
+        TDX_IMAGE,
+    )
+    assert result.evidence.measurement == TDX_IMAGE
+    # A receipt carries the v2 value and its evidence check accepts it.
+    assert receipt._check_evidence(dataclasses.asdict(result.evidence), "tdx") == result.evidence
+
+
+def test_a_v1_listing_still_records_v1_and_refuses_the_other_vm():
+    policy = _policy("tdx", "enforce", [parse_tdx_quote(VM_A).measurement])
+    a = _admit(_tdx(VM_A), policy=policy)
+    assert a.admitted and a.evidence.measurement == parse_tdx_quote(VM_A).measurement
+    # The same image on another VM: the #265 failure a v2 listing fixes.
+    b = _admit(_tdx(VM_B), policy=policy)
+    assert b.reasons == (adm.MEASUREMENT_NOT_ALLOWED,)
+
+
+def test_a_listing_of_both_identities_records_v1():
+    parsed = parse_tdx_quote(VM_A)
+    policy = _policy("tdx", "enforce", sorted([parsed.measurement, TDX_IMAGE]))
+    assert _admit(_tdx(VM_A), policy=policy).evidence.measurement == parsed.measurement
+
+
+def test_an_unlisted_image_is_refused_and_recorded_in_shadow():
+    other = parse_tdx_quote(_tdx_quote(mr_td=OTHER_MR_TD)).image_measurement
+    enforce = _admit(_tdx(VM_A), policy=_policy("tdx", "enforce", [other]))
+    assert enforce.reasons == (adm.MEASUREMENT_NOT_ALLOWED,)
+    shadow = _admit(_tdx(VM_A), policy=_policy("tdx", "shadow", [other]))
+    assert shadow.admitted and not shadow.measurement_allowed and shadow.evidence is None
+    assert shadow.measurement == parse_tdx_quote(VM_A).measurement
+
+
+def test_a_verdict_naming_another_image_identity_is_refused():
+    other = parse_tdx_quote(_tdx_quote(mr_td=OTHER_MR_TD)).image_measurement
+    with pytest.raises(adm.AdmissionError, match="not the quote's"):
+        _admit(_tdx(VM_A, measurement=other), policy=_policy("tdx", "enforce", [TDX_IMAGE]))
+
+
+def test_snp_admission_has_no_tdx_audit_values():
+    result = _admit(_snp())
+    assert (result.launch_measurement, result.image_measurement) == (None, None)
+
+
+def test_a_v2_verdict_for_another_vm_of_the_image_is_refused():
+    # Same image, different MROWNER: the v2 values match, the v1 audit value does not.
+    a, b = parse_tdx_quote(VM_A), parse_tdx_quote(VM_B)
+    verdict = _tdx(
+        VM_B,
+        measurement=TDX_IMAGE,
+        launch_measurement=a.measurement,
+        image_measurement=TDX_IMAGE,
+    )
+    with pytest.raises(adm.AdmissionError, match="not the quote's"):
+        _admit(verdict, policy=_policy("tdx", "enforce", [b.measurement]))
+    honest = _tdx(
+        VM_B, measurement=TDX_IMAGE, launch_measurement=b.measurement, image_measurement=TDX_IMAGE
+    )
+    assert _admit(honest, policy=_policy("tdx", "enforce", [TDX_IMAGE])).admitted
