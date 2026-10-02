@@ -4422,6 +4422,42 @@ def cmd_enroll_submit(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 
+def _delivery_contract_missing(exc: ModuleNotFoundError) -> ValueError | None:
+    if exc.name != "cathedral_delivery" and not (exc.name or "").startswith("cathedral_delivery."):
+        return None
+    return ValueError(
+        "this command needs the cathedral-delivery package (packages/delivery-contract), "
+        "which this installation does not include"
+    )
+
+
+def cmd_delivery_receipt_check(args: argparse.Namespace) -> int:
+    """Check a delivery receipt's dual signatures from stdin; never grants eligibility.
+
+    The delivery contract is imported here, not at module or parser load. The
+    SN94 miner images copy only ``cathedral/``, without ``cathedral_delivery``,
+    and every other command (``worker migrate``, ``worker serve-snp``) must
+    still build its parser and start there.
+    """
+    try:
+        from cathedral.delivery import cmd_check
+    except ModuleNotFoundError as exc:
+        raise (_delivery_contract_missing(exc) or exc) from exc
+    return cmd_check(args)
+
+
+def cmd_executor_check_grant(args: argparse.Namespace) -> int:
+    """Check an executor allocation grant from stdin; never grants eligibility.
+
+    Imported lazily for the same reason as ``cmd_delivery_receipt_check``.
+    """
+    try:
+        from cathedral_delivery.grants import cmd_check
+    except ModuleNotFoundError as exc:
+        raise (_delivery_contract_missing(exc) or exc) from exc
+    return cmd_check(args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cathedral", description="Cathedral operator CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -5539,17 +5575,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_controlled.set_defaults(func=cmd_runtime_export_controlled)
 
     # Delivery signature inspection does not grant TEE or reward admission.
-    from cathedral.delivery import cmd_check as delivery_check
+    # The delivery contract is imported only when one of these two commands
+    # runs (cmd_delivery_receipt_check, cmd_executor_check_grant), never here.
     p_delivery = sub.add_parser("delivery-receipt", help="inspect signed delivery metadata")
     delivery_sub = p_delivery.add_subparsers(dest="delivery_command", required=True)
     p_delivery_check = delivery_sub.add_parser("check", help="check dual signatures from stdin; never grants eligibility")
-    p_delivery_check.set_defaults(func=delivery_check)
+    p_delivery_check.set_defaults(func=cmd_delivery_receipt_check)
 
-    from cathedral_delivery.grants import cmd_check as grant_check
     p_executor = sub.add_parser("executor", help="inspect bounded executor allocation authority")
     executor_sub = p_executor.add_subparsers(dest="executor_command", required=True)
     p_grant_check = executor_sub.add_parser("check-grant", help="check a grant from stdin; never grants eligibility")
-    p_grant_check.set_defaults(func=grant_check)
+    p_grant_check.set_defaults(func=cmd_executor_check_grant)
 
     return parser
 
