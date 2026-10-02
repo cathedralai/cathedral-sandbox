@@ -436,6 +436,17 @@ def admit(
         quote_image_measurement is None or attested.measurement != quote_image_measurement
     ):
         raise AdmissionError("the verdict's measurement is not the quote's")
+    # A verdict matched on v2 cannot tell quotes apart by their owner fields,
+    # so its v1 audit value, when the verifier reported one, must be this
+    # quote's too (and likewise its v2 value).
+    if (
+        attested.launch_measurement is not None
+        and attested.launch_measurement != quote_measurement
+    ) or (
+        attested.image_measurement is not None
+        and attested.image_measurement != quote_image_measurement
+    ):
+        raise AdmissionError("the verdict's measurement is not the quote's")
     # The identity this policy is judged on: v1 unless the policy lists only
     # the v2 image identity. A policy listing v1 values behaves exactly as before.
     if (

@@ -18,9 +18,8 @@ import pytest
 
 from cathedral.verify.tdx_quote import QUOTE_HEADER_SIZE, parse_tdx_quote
 
-FIXTURES = (
-    Path(__file__).resolve().parents[1] / "cmd" / "cathedral-tdx-verifier" / "testdata" / "gcp-mrowner"
-)
+ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = ROOT / "cmd" / "cathedral-tdx-verifier" / "testdata" / "gcp-mrowner"
 VECTORS = json.loads((FIXTURES / "vectors.json").read_text())["vectors"]
 
 # Body offsets (cathedral/verify/tdx_quote.py _parse_body), into the raw quote.
@@ -72,7 +71,9 @@ def test_fixture_vectors(vector):
     assert parsed.body.mr_owner.hex() == vector["mr_owner"]
 
 
-@pytest.mark.parametrize("pair", [("same-image-a", "same-image-b"), ("clean-image-a", "clean-image-b")])
+@pytest.mark.parametrize(
+    "pair", [("same-image-a", "same-image-b"), ("clean-image-a", "clean-image-b")]
+)
 def test_two_honest_vms_from_one_image_share_v2_but_not_v1(pair):
     a, b = (parse_tdx_quote(_quote(name + ".bin")) for name in pair)
     assert a.body.mr_owner != b.body.mr_owner  # host-set, per VM

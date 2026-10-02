@@ -954,7 +954,8 @@ def test_an_image_listing_admits_every_honest_vm_of_that_image(quote, verdict):
     # The verifier's verdict names v2 when its own policy listed only v2, and
     # v1 when it listed v1; admission accepts either for these quote bytes.
     parsed = parse_tdx_quote(quote)
-    pair = _tdx(quote, measurement=getattr(parsed, f"{verdict}_measurement" if verdict == "image" else "measurement"))
+    named = parsed.image_measurement if verdict == "image" else parsed.measurement
+    pair = _tdx(quote, measurement=named)
     result = _admit(pair, policy=_policy("tdx", "enforce", [TDX_IMAGE]))
     assert result.admitted and result.reasons == ()
     assert result.measurement == TDX_IMAGE
@@ -1000,3 +1001,20 @@ def test_a_verdict_naming_another_image_identity_is_refused():
 def test_snp_admission_has_no_tdx_audit_values():
     result = _admit(_snp())
     assert (result.launch_measurement, result.image_measurement) == (None, None)
+
+
+def test_a_v2_verdict_for_another_vm_of_the_image_is_refused():
+    # Same image, different MROWNER: the v2 values match, the v1 audit value does not.
+    a, b = parse_tdx_quote(VM_A), parse_tdx_quote(VM_B)
+    verdict = _tdx(
+        VM_B,
+        measurement=TDX_IMAGE,
+        launch_measurement=a.measurement,
+        image_measurement=TDX_IMAGE,
+    )
+    with pytest.raises(adm.AdmissionError, match="not the quote's"):
+        _admit(verdict, policy=_policy("tdx", "enforce", [b.measurement]))
+    honest = _tdx(
+        VM_B, measurement=TDX_IMAGE, launch_measurement=b.measurement, image_measurement=TDX_IMAGE
+    )
+    assert _admit(honest, policy=_policy("tdx", "enforce", [TDX_IMAGE])).admitted
