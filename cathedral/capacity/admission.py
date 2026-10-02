@@ -106,7 +106,9 @@ POLICY_SCHEMAS = {
 }
 _POLICY_KEYS = frozenset({"schema", "mode", "allowed_measurements"})
 _POLICY_MEASUREMENT = {
-    "tdx": re.compile(r"tdx-measurement-sha256:[0-9a-f]{64}"),
+    # v1 launch measurement or v2 image identity (docs/MRTD.md); a TDX policy
+    # may list either.
+    "tdx": re.compile(r"tdx-(?:measurement|image)-sha256:[0-9a-f]{64}"),
     "sev_snp": re.compile(r"[0-9a-f]{96}"),
 }
 MAX_POLICY_BYTES = 128 * 1024  # as #256
@@ -155,6 +157,9 @@ class Admission:
     miner_hotkey: str
     hardware_id: str  # derive_hardware_id(hardware_id_kind, raw): the receipt's hardware_id
     hardware_id_kind: str  # tdx_platform or chip_id
+    # The identity judged against the policy and written to the receipt
+    # evidence: for TDX the v1 launch measurement, or the v2 image identity
+    # when the policy lists only that (docs/MRTD.md, "Image identity").
     measurement: str
     measurement_allowed: bool
     mode: str  # the policy's mode
@@ -162,6 +167,10 @@ class Admission:
     # For T4 receipts: None unless admitted with an allowed measurement, so a
     # shadow admission of an unlisted measurement is recorded but never paid.
     evidence: ReceiptEvidence | None
+    # TDX audit values read from the quote itself: v1 (includes host-set
+    # MROWNER) and v2. None for SEV-SNP.
+    launch_measurement: str | None = None
+    image_measurement: str | None = None
 
 
 def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -179,7 +188,8 @@ def parse_policy(raw: bytes) -> MeasurementPolicy:
     ``{"schema", "mode", "allowed_measurements"}`` and nothing else, as #256:
     the schema names the kind (``POLICY_SCHEMAS``), ``mode`` is ``shadow`` or
     ``enforce``, and ``allowed_measurements`` is a sorted list of unique
-    ``tdx-measurement-sha256:<64 hex>`` (TDX) or 96-hex (SEV-SNP) strings, not
+    ``tdx-measurement-sha256:<64 hex>`` or ``tdx-image-sha256:<64 hex>`` (TDX)
+    or 96-hex (SEV-SNP) strings, not
     empty when enforcing. Reading the file safely is the caller's job (#256's
     loader checks owner, mode and size); this takes its bytes.
     """
@@ -224,7 +234,11 @@ def parse_policy(raw: bytes) -> MeasurementPolicy:
         or measurements != sorted(measurements)
         or len(set(measurements)) != len(measurements)
     ):
-        shape = "tdx-measurement-sha256:<64 hex>" if kind == "tdx" else "96 lowercase hex"
+        shape = (
+            "tdx-measurement-sha256:<64 hex> or tdx-image-sha256:<64 hex>"
+            if kind == "tdx"
+            else "96 lowercase hex"
+        )
         raise AdmissionError(f"allowed_measurements must be a sorted, unique list of {shape}")
     if mode == "enforce" and not measurements:
         raise AdmissionError("an enforcing measurement policy must allow at least one measurement")
@@ -252,9 +266,11 @@ def _complete(attested: Attested, kind: str) -> bool:
     return True
 
 
-def _parse_quote(quote: bytes, kind: str) -> tuple[bytes, str, bool, bytes | None, bytes | None]:
-    """REPORT_DATA, measurement, debug bit, (SEV-SNP) raw chip id and (TDX)
-    RTMR3, read from the quote bytes themselves."""
+def _parse_quote(
+    quote: bytes, kind: str
+) -> tuple[bytes, str, bool, bytes | None, bytes | None, str | None]:
+    """REPORT_DATA, measurement, debug bit, (SEV-SNP) raw chip id, (TDX)
+    RTMR3 and (TDX) v2 image identity, read from the quote bytes themselves."""
 
     try:
         if kind == "tdx":
@@ -265,9 +281,17 @@ def _parse_quote(quote: bytes, kind: str) -> tuple[bytes, str, bool, bytes | Non
                 parsed.debug_enabled,
                 None,
                 parsed.body.rtmr3,
+                parsed.image_measurement,
             )
         report = parse_snp_report(quote)
-        return report.report_data, report.measurement, False, bytes.fromhex(report.chip_id), None
+        return (
+            report.report_data,
+            report.measurement,
+            False,
+            bytes.fromhex(report.chip_id),
+            None,
+            None,
+        )
     except (TdxQuoteParseError, ValueError) as exc:
         raise AdmissionError(f"quote: {exc}") from exc
 
@@ -397,13 +421,31 @@ def admit(
     registry = _check_admitted(admitted)
     binding = _tls_binding(tls_certificate_der, tls_spki_der)
 
-    report_data, quote_measurement, quote_debug, quote_chip_id, quote_rtmr3 = _parse_quote(
-        quote, kind
-    )
+    (
+        report_data,
+        quote_measurement,
+        quote_debug,
+        quote_chip_id,
+        quote_rtmr3,
+        quote_image_measurement,
+    ) = _parse_quote(quote, kind)
     # The verdict must be for these bytes, so the hash in the evidence names the
-    # quote that was actually verified.
-    if attested.measurement != quote_measurement:
+    # quote that was actually verified. A TDX verdict names the v1 launch
+    # measurement or, when its policy listed only that, the v2 image identity.
+    if attested.measurement != quote_measurement and (
+        quote_image_measurement is None or attested.measurement != quote_image_measurement
+    ):
         raise AdmissionError("the verdict's measurement is not the quote's")
+    # The identity this policy is judged on: v1 unless the policy lists only
+    # the v2 image identity. A policy listing v1 values behaves exactly as before.
+    if (
+        quote_image_measurement is not None
+        and not policy.allows(quote_measurement)
+        and policy.allows(quote_image_measurement)
+    ):
+        judged_measurement = quote_image_measurement
+    else:
+        judged_measurement = quote_measurement
     hardware_id_kind = HARDWARE_ID_KINDS[("tee", kind)]
     try:
         # One hardware identity per kind, derived as receipts derive it.
@@ -422,7 +464,7 @@ def admit(
             {
                 "evidence_kind": kind,
                 "evidence_sha256": hashlib.sha256(quote).hexdigest(),
-                "measurement": quote_measurement,
+                "measurement": judged_measurement,
                 "verifier_digest": verifier_digest,
                 "tls_spki_sha256": binding.digest.hex(),
                 "attestation_nonce": nonce.hex(),
@@ -469,4 +511,6 @@ def admit(
         policy_digest=policy.digest,
         # Record-only in shadow: an unlisted measurement is never paid.
         evidence=evidence if not reasons and measurement_allowed else None,
+        launch_measurement=quote_measurement if kind == "tdx" else None,
+        image_measurement=quote_image_measurement,
     )

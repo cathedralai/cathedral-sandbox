@@ -1,0 +1,35 @@
+{
+  "source": "GCP c3-standard-8 TDX, us-central1-a, 2026-10-02 (cathedral-sandbox #265)",
+  "vectors": [
+    {
+      "quote": "same-image-a.quote",
+      "measurement": "tdx-measurement-sha256:95a072114c647fdcc5925aaef5b6d06f8cae7616c1dc80e7da4ab3471601f780",
+      "image_measurement": "tdx-image-sha256:70ba984789435196557e6fa1e36408f7613acb4151134eefc1f73c31c99c6c5e",
+      "mr_owner": "d584727f55d74521d409a954ad49388877af68c73ec85b8b6f6cecff636b4da466d7f3d8252413cd4517ca79e420a748"
+    },
+    {
+      "quote": "same-image-b.quote",
+      "measurement": "tdx-measurement-sha256:48caa26e5dc419af25921eaf55e6f9ea68ffc52d81d53242daec9e02e400bcfc",
+      "image_measurement": "tdx-image-sha256:70ba984789435196557e6fa1e36408f7613acb4151134eefc1f73c31c99c6c5e",
+      "mr_owner": "8a3f850331ee8c036f99a41358a44730be02cf3e827a23a3003cbb5ff08966556ec674edaf77bce8d1b231cd3757d553"
+    },
+    {
+      "quote": "cmdline-changed.quote",
+      "measurement": "tdx-measurement-sha256:93e068da58fd9a2e94bfcb931fb28e2bfeba9f2d4f4f4ad4138a841913b084a2",
+      "image_measurement": "tdx-image-sha256:b5e9f5ea5ad907a98632bb5742923df19e2fe04b961e64311672f3cd1433fad1",
+      "mr_owner": "1e323ca3409ef699b71047213327ce77639d7d6eeae868c6663f299ede4fdd1ff5d5d6309fd6c4eac73193dc5b405575"
+    },
+    {
+      "quote": "clean-image-a.quote",
+      "measurement": "tdx-measurement-sha256:c6d2826599ce814c2e5ccfa611c7061592bd46cf3ca7319d7ca53cee6f8d890d",
+      "image_measurement": "tdx-image-sha256:03bff30a01e92921a633acdc92cb5b8b3efad2830f3bddae333eda0c24fb8407",
+      "mr_owner": "27331064d53e92faf81a9d59bb44cab6aeadd4defaef35026f8ce71527a58d3e78a23e3347f6724cbe8eec80a49e996e"
+    },
+    {
+      "quote": "clean-image-b.quote",
+      "measurement": "tdx-measurement-sha256:2635ee3c833c56c1aca81b48645fd320cac2a8ed6942e65a3cab3cb8e28d0fc5",
+      "image_measurement": "tdx-image-sha256:03bff30a01e92921a633acdc92cb5b8b3efad2830f3bddae333eda0c24fb8407",
+      "mr_owner": "9c9dbef7b91bfa3d10a5d83831e51b5fbe438f6c6f2a22f39544ad76861ae93cc72a826842bafc665760eeb323cf4ec0"
+    }
+  ]
+}

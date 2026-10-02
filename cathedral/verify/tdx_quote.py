@@ -34,6 +34,12 @@ TDX_TEE_TYPE = 0x81
 TDX_CERTIFICATION_DATA_TYPE_PCK_CHAIN = 6
 
 _MEASUREMENT_DOMAIN = b"cathedral-tdx-measurement-v1\0"
+# The v2 image identity (docs/MRTD.md, "Image identity"). It leaves out the
+# fields whoever launches the TD sets (MRCONFIGID, MROWNER, MROWNERCONFIG):
+# on GCP MROWNER differs on every VM, so v1 is a per-instance value there.
+_IMAGE_DOMAIN = b"cathedral-tdx-image-v1\0"
+MEASUREMENT_PREFIX = "tdx-measurement-sha256:"
+IMAGE_MEASUREMENT_PREFIX = "tdx-image-sha256:"
 
 
 class TdxQuoteParseError(ValueError):
@@ -101,7 +107,23 @@ class ParsedTdxQuote:
         h.update(self.body.mr_owner_config)
         for rtmr in self.body.rtmrs:
             h.update(rtmr)
-        return "tdx-measurement-sha256:" + h.hexdigest()
+        return MEASUREMENT_PREFIX + h.hexdigest()
+
+    @property
+    def image_measurement(self) -> str:
+        """Cathedral TDX image identity (v2) over the guest-measured fields only.
+
+        TD_ATTRIBUTES, XFAM, MRTD and RTMR0-3: the same for every honest VM
+        booted from one image on one VM shape, whichever host launched it."""
+
+        h = hashlib.sha256()
+        h.update(_IMAGE_DOMAIN)
+        h.update(self.body.td_attributes)
+        h.update(self.body.xfam)
+        h.update(self.body.mr_td)
+        for rtmr in self.body.rtmrs:
+            h.update(rtmr)
+        return IMAGE_MEASUREMENT_PREFIX + h.hexdigest()
 
     @property
     def tcb(self) -> int:

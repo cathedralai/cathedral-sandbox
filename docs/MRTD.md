@@ -1,7 +1,10 @@
 # Intel TDX launch measurement
 
 This file keeps its historical name, but Cathedral's approved value is not a
-bare Intel MRTD.
+bare Intel MRTD. There are two values: the v1 launch measurement and the v2
+image identity. Policy should list the v2 image identity (see "Image identity").
+
+## Launch measurement (v1)
 
 The released verifier emits:
 
@@ -18,7 +21,64 @@ TD_ATTRIBUTES || XFAM || MRTD || MRCONFIGID || MROWNER || MROWNERCONFIG
 ```
 
 Both `cmd/cathedral-tdx-verifier/main.go` and
-`cathedral/verify/tdx_quote.py` implement this exact contract.
+`cathedral/verify/tdx_quote.py` implement this exact contract. It is kept for
+audit and for policies that already list it.
+
+## Image identity (v2)
+
+The verifier also emits `image_measurement` (verifier releases after
+`cathedral-tdx-verifier-v1.0.0`; older releases omit it):
+
+```text
+tdx-image-sha256:<64 lowercase hex characters>
+```
+
+It is SHA-256 over the domain separator `cathedral-tdx-image-v1\0` followed by:
+
+```text
+TD_ATTRIBUTES || XFAM || MRTD || RTMR0 || RTMR1 || RTMR2 || RTMR3
+```
+
+`imageMeasurementID` in `cmd/cathedral-tdx-verifier/main.go` and
+`ParsedTdxQuote.image_measurement` in `cathedral/verify/tdx_quote.py`
+implement it. Both are tested against the same real GCP quotes and vectors in
+`cmd/cathedral-tdx-verifier/testdata/gcp-mrowner/`.
+
+Why the owner fields are left out (cathedral-sandbox #265):
+
+- **MROWNER** is set by whoever launches the TD, not measured from the guest.
+  On GCP (c3-standard-8, us-central1-a, 2026-10-02, 5+ VMs) it differed on
+  every VM, including two VMs booted from one image on one host, so the v1
+  value is a per-instance value there and a v1 allowlist in `enforce` refuses
+  every new honest VM. Every other register was identical across those VMs.
+  This is a small sample on one provider; other providers are not yet checked.
+- **MROWNERCONFIG** is set by the launcher in the same way. It was all zero on
+  GCP, but nothing in the guest image fixes it.
+- **MRCONFIGID** is also launcher-set. It was all zero on GCP, where the guest
+  owner cannot choose it. Cathedral only gives it meaning where Cathedral itself
+  sets it: the TEE box binds its central-access root there
+  (docs/TEE_BOX.md section 6). That binding is checked by the TEE box
+  measurement list, which stays on v1 values with MRCONFIGID pinned per image;
+  a v2 value alone does not prove it.
+
+What v2 still covers: TD_ATTRIBUTES (including the debug bit), XFAM, the
+initial TD (MRTD, the firmware), and RTMR0-3. On GCP RTMR1 holds the UKI's
+Authenticode digest, so the kernel, initrd, command line and dm-verity root
+hash are in it; a one-byte command-line change moved RTMR1 and the v2 value
+exactly as predicted offline. RTMR0 can still vary with the VM shape, so list
+one v2 value per image and shape. Data outside the measured boot chain (a
+model file on a dm-verity disk, say) is not in either value; it relies on the
+guest's own integrity checks.
+
+**Policy use.** A strict policy may list v1 values, v2 values or both. The
+Python verifier admits a quote when its v1 value is listed, or else when its
+v2 value is listed; the verdict's `Attested.measurement` names the identity
+that matched (v1 first, so a v1 policy behaves exactly as before), and
+`Attested.launch_measurement` and `Attested.image_measurement` keep both for
+audit. TEE box admission (`cathedral/capacity/admission.py`) and its policy
+file accept `tdx-image-sha256:` entries in the same way (docs/CAPACITY.md). To
+approve a v2 value, run `scripts/cathedral_measurement_approval.py approve
+--identity image` with a verifier release that emits it.
 
 ## Why this is not MRTD
 

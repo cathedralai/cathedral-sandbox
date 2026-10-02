@@ -36,8 +36,11 @@ const (
 	requestBudget      = 8 * time.Second
 	platformDomain     = "cathedral-tdx-platform-v1\x00"
 	measurementDomain  = "cathedral-tdx-measurement-v1\x00"
-	tdxTcbInfoPath     = "/tdx/certification/v4/tcb"
-	tdxQeIdentityPath  = "/tdx/certification/v4/qe/identity"
+	// The v2 image identity leaves out the fields the TD's launcher sets
+	// (MRCONFIGID, MROWNER, MROWNERCONFIG); see docs/MRTD.md, "Image identity".
+	imageDomain       = "cathedral-tdx-image-v1\x00"
+	tdxTcbInfoPath    = "/tdx/certification/v4/tcb"
+	tdxQeIdentityPath = "/tdx/certification/v4/qe/identity"
 
 	// exitInvalid means the quote did not verify; the validator scores the
 	// machine zero. exitCollateralUnavailable means Intel's collateral service
@@ -73,6 +76,7 @@ var intelCollateralHosts = map[string]struct{}{
 type claims struct {
 	ReportData               string   `json:"report_data"`
 	Measurement              string   `json:"measurement"`
+	ImageMeasurement         string   `json:"image_measurement"`
 	TcbSvn                   string   `json:"tcb_svn"`
 	TcbStatus                string   `json:"tcb_status"`
 	AdvisoryIDs              []string `json:"advisory_ids"`
@@ -513,11 +517,16 @@ func buildVerifiedClaims(
 	if err != nil {
 		return nil, err
 	}
+	imageMeasurement, err := imageMeasurementID(body)
+	if err != nil {
+		return nil, err
+	}
 	pckDigest := sha256.Sum256(chain.PCKCertificate.Raw)
 	akDigest := sha256.Sum256(signed.GetEcdsaAttestationKey())
 	return &claims{
 		ReportData:               hex.EncodeToString(body.GetReportData()),
 		Measurement:              measurement,
+		ImageMeasurement:         imageMeasurement,
 		TcbSvn:                   hex.EncodeToString(body.GetTeeTcbSvn()),
 		TcbStatus:                "UpToDate",
 		AdvisoryIDs:              []string{},
@@ -576,6 +585,34 @@ func measurementID(body launchBody) (string, error) {
 		_, _ = hash.Write(rtmr)
 	}
 	return "tdx-measurement-sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// imageMeasurementID is the v2 image identity: SHA-256 over imageDomain then
+// TD_ATTRIBUTES, XFAM, MRTD and RTMR0-3. It must equal
+// cathedral/verify/tdx_quote.py ParsedTdxQuote.image_measurement byte for byte.
+func imageMeasurementID(body launchBody) (string, error) {
+	fields := [][]byte{body.GetTdAttributes(), body.GetXfam(), body.GetMrTd()}
+	wantLengths := []int{8, 8, 48}
+	for index, field := range fields {
+		if len(field) != wantLengths[index] {
+			return "", errors.New("verified quote has an invalid measurement field")
+		}
+	}
+	if len(body.GetRtmrs()) != 4 {
+		return "", errors.New("verified quote has an invalid RTMR count")
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte(imageDomain))
+	for _, field := range fields {
+		_, _ = hash.Write(field)
+	}
+	for _, rtmr := range body.GetRtmrs() {
+		if len(rtmr) != 48 {
+			return "", errors.New("verified quote has an invalid RTMR")
+		}
+		_, _ = hash.Write(rtmr)
+	}
+	return "tdx-image-sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func parseExpectedReportData(raw string) ([]byte, error) {

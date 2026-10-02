@@ -167,7 +167,21 @@ def _verify_tdx(
         if policy.tdx_strict
         else _claim_str(claims, "measurement", "mrtd", "td_measurement")
     )
-    if not measurement or measurement not in policy.allowed_measurements:
+    # The v2 image identity (docs/MRTD.md, "Image identity"), when the pinned
+    # verifier emits it. Older verifier releases do not, and a malformed value
+    # is treated as absent: it can then only fail to match a v2 allowlist entry.
+    image_measurement = _claim_exact_str(claims, "image_measurement")
+    if _IMAGE_MEASUREMENT_RE.fullmatch(image_measurement) is None:
+        image_measurement = ""
+    launch_measurement = measurement
+    # The verdict's measurement is the identity the policy listed: the v1
+    # launch measurement when listed (unchanged behaviour), otherwise the v2
+    # image identity. Every later policy re-check compares this value.
+    if measurement and measurement in policy.allowed_measurements:
+        pass
+    elif image_measurement and image_measurement in policy.allowed_measurements:
+        measurement = image_measurement
+    else:
         return None
 
     tcb_svn = _claim_exact_str(claims, "tcb_svn") or None
@@ -236,6 +250,8 @@ def _verify_tdx(
         tier=Tier.CC_CPU_TDX,
         chip_id=chip_id,
         measurement=measurement,
+        launch_measurement=launch_measurement,
+        image_measurement=image_measurement or None,
         tcb=tcb,
         # Declared, not inherited. This function returns None above unless the
         # QVL reported intel_verified and report_data_match, so both hold here.
@@ -651,6 +667,9 @@ def _claim_str(claims: dict[str, Any], *keys: str) -> str:
         if value is not None:
             return str(value)
     return ""
+
+
+_IMAGE_MEASUREMENT_RE = re.compile(r"tdx-image-sha256:[0-9a-f]{64}")
 
 
 def _claim_exact_str(claims: dict[str, Any], *keys: str) -> str:
