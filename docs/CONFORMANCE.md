@@ -30,6 +30,21 @@ crash, so use short lifetimes as a backstop.
 An ambiguous snapshot-create response without a recovered identifier also
 blocks success, even without `--strict`. The report records that uncertainty;
 it does not claim an untracked snapshot was removed.
+`create.burst_tti` deletes each sandbox as soon as it is measured.
+
+The suite keeps to the API's request rules (`https://cathedral.computer/openapi.json`):
+
+- Every create, sandbox DELETE, lifetime extension and background exec sends a
+  valid `Idempotency-Key`. The API answers 422 without one. New operations get
+  new keys; retries of a cleanup intent retain its key.
+- A synchronous `POST /v1/sandboxes/{id}/exec` asks for `timeout_seconds` of at
+  most 45, because the API closes a request that sends nothing for 60 s. Longer
+  steps, such as the nested Docker image pull and network creation, run as
+  background execs: `POST .../execs`, then `GET .../execs/{exec_id}?wait=25`
+  until the exec ends.
+- A client polling deadline requests background-exec cancellation, but does
+  not claim that cancellation was confirmed. Final sandbox cleanup still
+  gates the report.
 
 ## Checks
 

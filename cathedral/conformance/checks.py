@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from cathedral.conformance.api import Api, Response
+from cathedral.conformance.api import SYNC_EXEC_MAX_SECONDS, Api, Response, idempotency_key
 
 MIB = 1024 * 1024
 
@@ -268,12 +268,20 @@ def percentile(values: list[float], pct: float) -> float:
     return ordered[index]
 
 
-def _sh(ctx: Context, command: str, timeout: int = 60, user: str | None = None) -> tuple[int, str, str]:
-    reply = ctx.api.exec(ctx.primary, ["sh", "-c", command], timeout_seconds=timeout, user=user)
+def _outcome(body: Any) -> tuple[int, str, str]:
+    """(exit code, stdout, stderr) of a sync or background exec; -1 when there is no code."""
+    body = body if isinstance(body, dict) else {}
+    code = body.get("exit_code")
+    return (code if isinstance(code, int) else -1), body.get("stdout") or "", body.get("stderr") or ""
+
+
+def _sh(ctx: Context, command: str, timeout: int = SYNC_EXEC_MAX_SECONDS,
+        user: str | None = None) -> tuple[int, str, str]:
+    # Synchronous up to the API's 45 s cap, a background exec past it.
+    reply = ctx.api.run(ctx.primary, ["sh", "-c", command], timeout_seconds=timeout, user=user)
     if not reply.ok:
         return -1, "", reply.summary()
-    body = reply.json()
-    return int(body.get("exit_code", -1)), body.get("stdout", ""), body.get("stderr", "")
+    return _outcome(reply.json())
 
 
 def _command_exit_code(reply: Response) -> int | None:
@@ -356,13 +364,25 @@ def create_burst_tti(ctx: Context):
         if not reply.ok:
             return None, reply.summary()
         sandbox_id = reply.json()["id"]
-        # TTI ends at the first command that succeeds, not at state=running.
-        while ctx.api.clock() - started < ctx.config.create_timeout_s:
-            ran = ctx.api.exec(sandbox_id, ["true"], timeout_seconds=10)
-            if ran.ok and (ran.json() or {}).get("exit_code") == 0:
-                return (ctx.api.clock() - started) * 1000, ""
-            ctx.api.sleep(0.1)
-        return None, f"{sandbox_id} never ran a command"
+        measured_ms = None
+        failure = ""
+        try:
+            # TTI ends at the first command that succeeds, not at state=running.
+            while ctx.api.clock() - started < ctx.config.create_timeout_s:
+                ran = ctx.api.exec(sandbox_id, ["true"], timeout_seconds=10)
+                if ran.ok and (ran.json() or {}).get("exit_code") == 0:
+                    measured_ms = (ctx.api.clock() - started) * 1000
+                    break
+                ctx.api.sleep(0.1)
+            if measured_ms is None:
+                failure = f"{sandbox_id} never ran a command"
+        finally:
+            # Measured (or given up on): delete it now rather than leave the burst
+            # holding quota and billing until the end-of-run cleanup.
+            if not ctx._delete_sandbox_confirmed(sandbox_id):
+                measured_ms = None
+                failure = f"{sandbox_id} deletion was not confirmed"
+        return measured_ms, failure
 
     n = ctx.config.burst
     with ThreadPoolExecutor(max_workers=n) as pool:
@@ -433,7 +453,7 @@ def exec_timeout(ctx: Context):
 @check("exec.output", "Exec returns at least 10 MiB of output", "§3.2", "stdout >= 10 MiB")
 def exec_output(ctx: Context):
     reply = ctx.api.exec(ctx.primary, ["sh", "-c", "head -c 11534336 /dev/zero | tr '\\0' a"],
-                         timeout_seconds=60)
+                         timeout_seconds=SYNC_EXEC_MAX_SECONDS)
     if not reply.ok:
         return "fail", {}, reply.summary()
     body = reply.json()
@@ -524,7 +544,8 @@ def lifecycle_extend(ctx: Context):
     from datetime import datetime
 
     before = (ctx.api.get_sandbox(ctx.primary).json() or {}).get("lifetime_deadline_at")
-    reply = ctx.api.call("POST", f"/v1/sandboxes/{ctx.primary}/lifetime", json={"extend_by_seconds": 600})
+    reply = ctx.api.call("POST", f"/v1/sandboxes/{ctx.primary}/lifetime", json={"extend_by_seconds": 600},
+                         key=idempotency_key("conf-l"))
     after = (reply.json() or {}).get("lifetime_deadline_at") if reply.ok else None
     if not (before and after):
         return "fail", {"before": before, "after": after}, reply.summary()
@@ -648,10 +669,13 @@ def docker_nested(ctx: Context):
     start = ctx.api.call("POST", f"/v1/sandboxes/{sandbox_id}/processes", key=f"conf-d-{uuid.uuid4().hex}",
                          json={"cmd": ["sh", "-c", "exec dockerd > /var/log/dockerd.log 2>&1"], "user": "root"})
 
-    def sh(command: str, timeout: int = 120) -> tuple[int, str]:
-        reply = ctx.api.exec(sandbox_id, ["sh", "-c", command], timeout_seconds=timeout, user="root")
-        body = reply.json() if reply.ok else {}
-        return int(body.get("exit_code", -1)), (body.get("stdout", "") + body.get("stderr", ""))[-500:]
+    def sh(command: str, timeout: int = SYNC_EXEC_MAX_SECONDS) -> tuple[int, str]:
+        # The 300 s steps run as background execs; the API caps a synchronous exec at 45 s.
+        reply = ctx.api.run(sandbox_id, ["sh", "-c", command], timeout_seconds=timeout, user="root")
+        if not reply.ok:
+            return -1, reply.summary()
+        code, out, err = _outcome(reply.json())
+        return code, (out + err)[-500:]
 
     ready_s = None
     began = ctx.api.clock()
