@@ -265,3 +265,25 @@ func TestAPlatformThatIsNotCurrentIsNeverAnOutage(t *testing.T) {
 		t.Fatal("quote-stage failure without an outage was reported as one")
 	}
 }
+
+func TestTheLevelsCallSiteNeverReportsAnOutage(t *testing.T) {
+	// Drive the real call site: quote verification "succeeds", then the
+	// levels check fails (this getter recorded no TCB collateral), with the
+	// outage flag left set by an earlier request. The result must be an
+	// invalid quote, exit 1, never an outage.
+	original := verifyQuoteAndCollateral
+	t.Cleanup(func() { verifyQuoteAndCollateral = original })
+	verifyQuoteAndCollateral = func(context.Context, any, *verify.Options) error { return nil }
+
+	getter := newIntelHTTPSGetter()
+	getter.recordOutcome(true)
+	_, err := verifyAndBuildClaims(
+		context.Background(), canonicalQuoteV4Fixture(t), make([]byte, 64), productionOptionsWith(getter),
+	)
+	if err == nil {
+		t.Fatal("levels check unexpectedly passed without TCB collateral")
+	}
+	if errors.Is(err, errCollateralUnavailable) || exitCode(err) != exitInvalid {
+		t.Fatalf("levels failure at the call site = %v (exit %d), want an invalid quote", err, exitCode(err))
+	}
+}
