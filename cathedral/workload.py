@@ -214,6 +214,10 @@ class WorkloadRequest:
     host_integration: bool = False
     host_network: bool = False
     privileged: bool = False
+    disk_gib: int = 10
+    network_policy: str = "public"
+    network_allowlist: tuple[str, ...] = ()
+    dind_enabled: bool = False
 
     def __post_init__(self) -> None:
         _validate_identity(self.required_signer, "required signer")
@@ -244,6 +248,31 @@ class WorkloadRequest:
         ):
             raise WorkloadAdmissionError(
                 "invalid_manifest", "runtime isolation controls must be booleans"
+            )
+        if (
+            isinstance(self.disk_gib, bool)
+            or not isinstance(self.disk_gib, int)
+            or not 5 <= self.disk_gib <= 1000
+        ):
+            raise WorkloadAdmissionError(
+                "invalid_manifest", "disk_gib must be an integer between 5 and 1000 GiB"
+            )
+        if self.network_policy not in {"public", "none", "allowlist"}:
+            raise WorkloadAdmissionError(
+                "invalid_manifest", "network_policy must be public, none, or allowlist"
+            )
+        if not isinstance(self.network_allowlist, tuple) or len(self.network_allowlist) > 256:
+            raise WorkloadAdmissionError(
+                "invalid_manifest", "network_allowlist must be a bounded tuple"
+            )
+        for entry in self.network_allowlist:
+            if not isinstance(entry, str) or not 1 <= len(entry) <= 255:
+                raise WorkloadAdmissionError(
+                    "invalid_manifest", "network_allowlist entries must be non-empty strings"
+                )
+        if not isinstance(self.dind_enabled, bool):
+            raise WorkloadAdmissionError(
+                "invalid_manifest", "dind_enabled must be a boolean"
             )
 
 
@@ -683,6 +712,10 @@ class WorkloadManifest:
     host_integration: bool = False
     host_network: bool = False
     privileged: bool = False
+    disk_gib: int = 10
+    network_policy: str = "public"
+    network_allowlist: tuple[str, ...] = ()
+    dind_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.image, ImageReference):
@@ -717,6 +750,31 @@ class WorkloadManifest:
             raise WorkloadAdmissionError(
                 "invalid_manifest", "manifest runtime isolation controls are invalid"
             )
+        if (
+            isinstance(self.disk_gib, bool)
+            or not isinstance(self.disk_gib, int)
+            or not 5 <= self.disk_gib <= 1000
+        ):
+            raise WorkloadAdmissionError(
+                "invalid_manifest", "manifest disk_gib must be an integer between 5 and 1000 GiB"
+            )
+        if self.network_policy not in {"public", "none", "allowlist"}:
+            raise WorkloadAdmissionError(
+                "invalid_manifest", "manifest network_policy must be public, none, or allowlist"
+            )
+        if not isinstance(self.network_allowlist, tuple) or len(self.network_allowlist) > 256:
+            raise WorkloadAdmissionError(
+                "invalid_manifest", "manifest network_allowlist must be a bounded tuple"
+            )
+        for entry in self.network_allowlist:
+            if not isinstance(entry, str) or not 1 <= len(entry) <= 255:
+                raise WorkloadAdmissionError(
+                    "invalid_manifest", "manifest network_allowlist entries must be non-empty strings"
+                )
+        if not isinstance(self.dind_enabled, bool):
+            raise WorkloadAdmissionError(
+                "invalid_manifest", "manifest dind_enabled must be a boolean"
+            )
 
     def document(self) -> Mapping[str, object]:
         return MappingProxyType(
@@ -725,10 +783,14 @@ class WorkloadManifest:
                 "artifact_digests": list(self.artifact_digests),
                 "config_digest": self.config_digest,
                 "default_service_credentials": self.default_service_credentials,
+                "dind_enabled": self.dind_enabled,
+                "disk_gib": self.disk_gib,
                 "host_integration": self.host_integration,
                 "host_network": self.host_network,
                 "image_digest": self.image.digest,
                 "image_reference": self.image.canonical,
+                "network_allowlist": list(self.network_allowlist),
+                "network_policy": self.network_policy,
                 "policy_digest": self.policy_digest,
                 "policy_id": self.policy_id,
                 "privileged": self.privileged,
@@ -903,6 +965,31 @@ class WorkloadExecutionAdapter(Protocol):
         authorization: ExecutionAuthorization | None = None,
     ) -> WorkloadExecutionResult: ...
 
+    def update_network_policy(
+        self,
+        execution_id: str,
+        *,
+        policy: str,
+        allowlist: tuple[str, ...] = (),
+    ) -> dict[str, object]: ...
+
+    def expose_port(
+        self,
+        execution_id: str,
+        *,
+        port: int,
+    ) -> dict[str, object]: ...
+
+    def open_process(
+        self,
+        execution_id: str,
+        *,
+        process_id: str,
+        stdin_stream: bool = True,
+        stdout_stream: bool = True,
+        stderr_stream: bool = True,
+    ) -> dict[str, object]: ...
+
 
 class RecordingExecutionAdapter:
     """Safe local adapter: records admitted manifests and executes no process."""
@@ -911,6 +998,70 @@ class RecordingExecutionAdapter:
 
     def __init__(self) -> None:
         self.workloads: list[tuple[str, AdmittedWorkload]] = []
+        self.network_policies: dict[str, dict[str, object]] = {}
+        self.exposed_ports: dict[str, list[dict[str, object]]] = {}
+        self.interactive_processes: dict[str, dict[str, object]] = {}
+
+    def update_network_policy(
+        self,
+        execution_id: str,
+        *,
+        policy: str,
+        allowlist: tuple[str, ...] = (),
+    ) -> dict[str, object]:
+        if not isinstance(execution_id, str) or _EXECUTION_ID_RE.fullmatch(execution_id) is None:
+            raise WorkloadAdmissionError("execution_denied", "execution id is invalid")
+        if policy not in {"public", "none", "allowlist"}:
+            raise WorkloadAdmissionError("invalid_policy", "policy must be public, none, or allowlist")
+        result = {
+            "execution_id": execution_id,
+            "policy": policy,
+            "allowlist": list(allowlist),
+            "status": "applied",
+        }
+        self.network_policies[execution_id] = result
+        return result
+
+    def expose_port(
+        self,
+        execution_id: str,
+        *,
+        port: int,
+    ) -> dict[str, object]:
+        if not isinstance(execution_id, str) or _EXECUTION_ID_RE.fullmatch(execution_id) is None:
+            raise WorkloadAdmissionError("execution_denied", "execution id is invalid")
+        if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
+            raise ValueError("port must be an integer between 1 and 65535")
+        url = f"https://{execution_id}-{port}.cathedral.computer"
+        entry = {
+            "execution_id": execution_id,
+            "port": port,
+            "url": url,
+            "status": "exposed",
+        }
+        self.exposed_ports.setdefault(execution_id, []).append(entry)
+        return entry
+
+    def open_process(
+        self,
+        execution_id: str,
+        *,
+        process_id: str,
+        stdin_stream: bool = True,
+        stdout_stream: bool = True,
+        stderr_stream: bool = True,
+    ) -> dict[str, object]:
+        if not isinstance(execution_id, str) or _EXECUTION_ID_RE.fullmatch(execution_id) is None:
+            raise WorkloadAdmissionError("execution_denied", "execution id is invalid")
+        _validate_id(process_id, "process id")
+        info = {
+            "execution_id": execution_id,
+            "process_id": process_id,
+            "websocket_url": f"wss://cathedral.computer/v1/sandboxes/{execution_id}/processes/{process_id}/attach",
+            "status": "ready",
+        }
+        self.interactive_processes[f"{execution_id}:{process_id}"] = info
+        return info
 
     def _execute_authorized(
         self,
@@ -1780,6 +1931,73 @@ class ExternalExecutionAdapter:
                 if "connection" in locals():
                     connection.close()
 
+    def update_network_policy(
+        self,
+        execution_id: str,
+        *,
+        policy: str,
+        allowlist: tuple[str, ...] = (),
+    ) -> dict[str, object]:
+        if not isinstance(execution_id, str) or _EXECUTION_ID_RE.fullmatch(execution_id) is None:
+            raise WorkloadAdmissionError("execution_denied", "execution id is invalid")
+        if policy not in {"public", "none", "allowlist"}:
+            raise WorkloadAdmissionError("invalid_policy", "policy must be public, none, or allowlist")
+        return self._invoke(
+            {
+                "schema": "cathedral_workload_network_policy_request_v1",
+                "execution_id": execution_id,
+                "policy": policy,
+                "allowlist": list(allowlist),
+                "configuration_digest": self.config.configuration_digest,
+                "worker_hotkey": self.config.worker_hotkey,
+            }
+        )
+
+    def expose_port(
+        self,
+        execution_id: str,
+        *,
+        port: int,
+    ) -> dict[str, object]:
+        if not isinstance(execution_id, str) or _EXECUTION_ID_RE.fullmatch(execution_id) is None:
+            raise WorkloadAdmissionError("execution_denied", "execution id is invalid")
+        if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
+            raise ValueError("port must be an integer between 1 and 65535")
+        return self._invoke(
+            {
+                "schema": "cathedral_workload_port_exposure_request_v1",
+                "execution_id": execution_id,
+                "port": port,
+                "configuration_digest": self.config.configuration_digest,
+                "worker_hotkey": self.config.worker_hotkey,
+            }
+        )
+
+    def open_process(
+        self,
+        execution_id: str,
+        *,
+        process_id: str,
+        stdin_stream: bool = True,
+        stdout_stream: bool = True,
+        stderr_stream: bool = True,
+    ) -> dict[str, object]:
+        if not isinstance(execution_id, str) or _EXECUTION_ID_RE.fullmatch(execution_id) is None:
+            raise WorkloadAdmissionError("execution_denied", "execution id is invalid")
+        _validate_id(process_id, "process id")
+        return self._invoke(
+            {
+                "schema": "cathedral_workload_interactive_attach_request_v1",
+                "execution_id": execution_id,
+                "process_id": process_id,
+                "stdin_stream": stdin_stream,
+                "stdout_stream": stdout_stream,
+                "stderr_stream": stderr_stream,
+                "configuration_digest": self.config.configuration_digest,
+                "worker_hotkey": self.config.worker_hotkey,
+            }
+        )
+
 
 @dataclass(frozen=True)
 class AdmissionDecision:
@@ -1953,6 +2171,10 @@ class WorkloadAdmissionController:
             host_integration=request.host_integration,
             host_network=request.host_network,
             privileged=request.privileged,
+            disk_gib=request.disk_gib,
+            network_policy=request.network_policy,
+            network_allowlist=request.network_allowlist,
+            dind_enabled=request.dind_enabled,
         )
 
     def _capability(
@@ -2035,6 +2257,10 @@ class WorkloadAdmissionController:
             host_integration=request.host_integration,
             host_network=request.host_network,
             privileged=request.privileged,
+            disk_gib=request.disk_gib,
+            network_policy=request.network_policy,
+            network_allowlist=request.network_allowlist,
+            dind_enabled=request.dind_enabled,
         )
         LOGGER.warning(
             "development workload admission bypass used policy_id=%s "
@@ -2178,3 +2404,46 @@ class WorkloadAdmissionController:
                 "execution_denied", "workload admission capability is invalid"
             )
         return workload.manifest
+
+    def update_network_policy(
+        self,
+        workload: AdmittedWorkload,
+        adapter: WorkloadExecutionAdapter,
+        *,
+        execution_id: str,
+        policy: str,
+        allowlist: tuple[str, ...] = (),
+    ) -> dict[str, object]:
+        self.validate_admission(workload)
+        return adapter.update_network_policy(execution_id, policy=policy, allowlist=allowlist)
+
+    def expose_port(
+        self,
+        workload: AdmittedWorkload,
+        adapter: WorkloadExecutionAdapter,
+        *,
+        execution_id: str,
+        port: int,
+    ) -> dict[str, object]:
+        self.validate_admission(workload)
+        return adapter.expose_port(execution_id, port=port)
+
+    def open_process(
+        self,
+        workload: AdmittedWorkload,
+        adapter: WorkloadExecutionAdapter,
+        *,
+        execution_id: str,
+        process_id: str,
+        stdin_stream: bool = True,
+        stdout_stream: bool = True,
+        stderr_stream: bool = True,
+    ) -> dict[str, object]:
+        self.validate_admission(workload)
+        return adapter.open_process(
+            execution_id,
+            process_id=process_id,
+            stdin_stream=stdin_stream,
+            stdout_stream=stdout_stream,
+            stderr_stream=stderr_stream,
+        )

@@ -954,10 +954,14 @@ _WORKLOAD_MANIFEST_DOCUMENT_KEYS = frozenset(
         "artifact_digests",
         "config_digest",
         "default_service_credentials",
+        "dind_enabled",
+        "disk_gib",
         "host_integration",
         "host_network",
         "image_digest",
         "image_reference",
+        "network_allowlist",
+        "network_policy",
         "policy_digest",
         "policy_id",
         "privileged",
@@ -1023,6 +1027,10 @@ def parse_workload_manifest_document(document: object) -> WorkloadManifest:
             host_integration=document["host_integration"],  # type: ignore[arg-type]
             host_network=document["host_network"],  # type: ignore[arg-type]
             privileged=document["privileged"],  # type: ignore[arg-type]
+            disk_gib=document.get("disk_gib", 10),  # type: ignore[arg-type]
+            network_policy=document.get("network_policy", "public"),  # type: ignore[arg-type]
+            network_allowlist=tuple(document.get("network_allowlist", ())),  # type: ignore[arg-type]
+            dind_enabled=document.get("dind_enabled", False),  # type: ignore[arg-type]
         )
     except WorkloadAdmissionError as exc:
         raise ProviderContractError(f"workload manifest is invalid: {exc}") from exc

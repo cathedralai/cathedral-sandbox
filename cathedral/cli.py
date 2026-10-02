@@ -1301,6 +1301,49 @@ def cmd_worker_reset_replay_clock(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sandbox_serve(args: argparse.Namespace) -> int:
+    """Serve the Cathedral compute sandbox API (§§3.1-3.16) over HTTP.
+
+    This is the tenant-facing control-plane surface (Bearer project keys, sandboxes,
+    exec, snapshots/forks, quota, usage).  It is distinct from ``worker serve``,
+    which is the SN94 attestation/SAT path.  Keys and quotas come from the operator
+    environment (see :func:`cathedral.sandbox_runtime.build_sandbox_provider`);
+    ``--allow-insecure-dev`` runs the permissive reference provider on loopback.
+    ``--runtime docker`` requires a live Docker daemon; ``--runtime kata``
+    requires Docker plus a registered kata-runtime (fails closed otherwise).
+    """
+    from cathedral.sandbox_runtime import build_sandbox_provider, capabilities_document
+    from cathedral.sandbox_server import SandboxApplication, run
+
+    provider = build_sandbox_provider(
+        runtime=getattr(args, "runtime", None),
+        allow_insecure_dev=bool(args.allow_insecure_dev),
+    )
+    app = SandboxApplication(provider, require_auth=True)
+    httpd, (host, port) = run(app, host=args.host, port=args.port)
+    print(
+        json.dumps(
+            {
+                "status": "serving",
+                "surface": "sandbox",
+                "host": host,
+                "port": port,
+                "capabilities": dict(capabilities_document(provider)),
+            }
+        ),
+        flush=True,
+    )
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        provider.close()
+    return 0
+
+
 def cmd_worker_serve(args: argparse.Namespace) -> int:
     posture = getattr(args, "worker_posture", "production")
     if posture not in {"production", "snp-production", "gpu-production", "g4-prelaunch", "development", "migration"}:
@@ -5315,6 +5358,39 @@ def build_parser() -> argparse.ArgumentParser:
     p_controlled.add_argument("--retention-dir", required=True)
     p_controlled.add_argument("--out-dir", required=True)
     p_controlled.set_defaults(func=cmd_runtime_export_controlled)
+
+    p_sandbox = sub.add_parser(
+        "sandbox",
+        help="serve the tenant-facing compute sandbox control-plane API (§3)",
+        description=(
+            "The OpenAI-style sandbox HTTP surface used by Harbor and verifiers: "
+            "sandboxes, exec, files, snapshots/forks, quota and usage. This is the "
+            "control-plane reference server, distinct from the SN94 attestation "
+            "worker path. Project Bearer keys and quotas are read from the "
+            "CATHEDRAL_SANDBOX_* / CATHEDRAL_KEY_QUOTAS environment."
+        ),
+    )
+    sandbox_sub = p_sandbox.add_subparsers(dest="sandbox_command", required=True)
+    p_sandbox_serve = sandbox_sub.add_parser(
+        "serve", help="serve the sandbox API over HTTP"
+    )
+    p_sandbox_serve.add_argument("--host", default="127.0.0.1")
+    p_sandbox_serve.add_argument("--port", type=int, default=8080)
+    p_sandbox_serve.add_argument(
+        "--allow-insecure-dev",
+        action="store_true",
+        help="run the permissive reference provider without configured keys (loopback only)",
+    )
+    p_sandbox_serve.add_argument(
+        "--runtime",
+        choices=["memory", "docker", "kata"],
+        default=None,
+        help=(
+            "sandbox guest runtime (default: CATHEDRAL_SANDBOX_RUNTIME or memory). "
+            "docker = Linux containers; kata = Kata micro-VMs (customer production)"
+        ),
+    )
+    p_sandbox_serve.set_defaults(func=cmd_sandbox_serve)
 
     return parser
 
