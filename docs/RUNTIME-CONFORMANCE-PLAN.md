@@ -59,7 +59,7 @@ developer can move (memory overcommit, ballooning, smaller guest images).
 ### 3. Baseline on `cathedral-1`
 
 - Install the runtime with Embed's Docker Compose shape on `cathedral-1`
-  (167.150.153.211: 8 vCPU EPYC 7763, 31 GB, 96 GB, `/dev/kvm` present).
+  (8 vCPU EPYC 7763, 31 GB, 96 GB, `/dev/kvm` present).
 - Run the full suite with the runtime driver, plus the density check. Publish
   the report on this repo. This is the baseline every bounty improves from.
 - Run the cathedral driver against production in the same session, so the two
