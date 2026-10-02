@@ -74,22 +74,22 @@ def test_fixture_vectors(vector):
 
 @pytest.mark.parametrize("pair", [("same-image-a", "same-image-b"), ("clean-image-a", "clean-image-b")])
 def test_two_honest_vms_from_one_image_share_v2_but_not_v1(pair):
-    a, b = (parse_tdx_quote(_quote(name + ".quote")) for name in pair)
+    a, b = (parse_tdx_quote(_quote(name + ".bin")) for name in pair)
     assert a.body.mr_owner != b.body.mr_owner  # host-set, per VM
     assert a.measurement != b.measurement  # so v1 is per instance
     assert a.image_measurement == b.image_measurement  # and v2 is the image
 
 
 def test_a_changed_kernel_cmdline_changes_v2():
-    same = parse_tdx_quote(_quote("same-image-a.quote"))
-    changed = parse_tdx_quote(_quote("cmdline-changed.quote"))
+    same = parse_tdx_quote(_quote("same-image-a.bin"))
+    changed = parse_tdx_quote(_quote("cmdline-changed.bin"))
     assert same.body.rtmr1 != changed.body.rtmr1
     assert same.image_measurement != changed.image_measurement
 
 
 @pytest.mark.parametrize("field", ["mr_config_id", "mr_owner", "mr_owner_config"])
 def test_launcher_set_fields_change_v1_only(field):
-    raw = _quote("same-image-a.quote")
+    raw = _quote("same-image-a.bin")
     base, flipped = parse_tdx_quote(raw), parse_tdx_quote(_flip(raw, field))
     assert flipped.measurement != base.measurement
     assert flipped.image_measurement == base.image_measurement
@@ -99,14 +99,14 @@ def test_launcher_set_fields_change_v1_only(field):
     "field", ["td_attributes", "xfam", "mr_td", "rtmr0", "rtmr1", "rtmr2", "rtmr3"]
 )
 def test_guest_measured_fields_change_v2(field):
-    raw = _quote("same-image-a.quote")
+    raw = _quote("same-image-a.bin")
     base, flipped = parse_tdx_quote(raw), parse_tdx_quote(_flip(raw, field))
     assert flipped.image_measurement != base.image_measurement
     assert flipped.measurement != base.measurement
 
 
 def test_v1_and_v2_never_collide():
-    parsed = parse_tdx_quote(_quote("same-image-a.quote"))
+    parsed = parse_tdx_quote(_quote("same-image-a.bin"))
     assert parsed.image_measurement.startswith("tdx-image-sha256:")
     assert parsed.measurement.startswith("tdx-measurement-sha256:")
     assert parsed.measurement.rpartition(":")[2] != parsed.image_measurement.rpartition(":")[2]

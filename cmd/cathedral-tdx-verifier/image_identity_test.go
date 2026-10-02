@@ -116,8 +116,8 @@ func TestIdentityVectorsFromRealGCPQuotes(t *testing.T) {
 
 func TestTwoVMsFromOneImageShareOnlyTheImageIdentity(t *testing.T) {
 	for _, pair := range [][2]string{
-		{"same-image-a.quote", "same-image-b.quote"},
-		{"clean-image-a.quote", "clean-image-b.quote"},
+		{"same-image-a.bin", "same-image-b.bin"},
+		{"clean-image-a.bin", "clean-image-b.bin"},
 	} {
 		a, b := fixtureBody(t, pair[0]), fixtureBody(t, pair[1])
 		if bytes.Equal(a.GetMrOwner(), b.GetMrOwner()) {
