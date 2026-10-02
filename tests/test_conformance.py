@@ -143,8 +143,9 @@ class FakeCathedral:
     def exec(self, payload) -> Response:
         self.sync_exec_timeouts.append(payload["timeout_seconds"])
         if payload["timeout_seconds"] > SYNC_EXEC_MAX_SECONDS:
-            # A request that sends nothing for 60 s is closed; the cap is 45 s.
-            return self.reply(422, {"error_code": "exec_timeout_too_long"})
+            # The API refuses it before anything starts (a request that sends
+            # nothing for 60 s is closed, so the synchronous cap is 45 s).
+            return self.reply(422, {"error_code": "exec_too_long_for_sync"})
         command = payload["command"]
         if command == ["sleep", "60"]:
             self.clock.now += payload["timeout_seconds"]
