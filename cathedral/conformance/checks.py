@@ -3,7 +3,8 @@ requirements (2026-09-22) and states its threshold in the report.
 
 Tier ``mvp`` is what Affine needs to move its first SWE-bench job; a failing
 mvp check fails the run. Tier ``later`` (fork, quota pressure) is reported
-but only fails the run with ``--strict``.
+but only fails the run with ``--strict``. Cleanup is an unconditional safety
+gate and must be confirmed independently of check tier.
 
 Every number is a measurement from this run with its sample count. A check
 that cannot run says why and is reported as ``skip``, never as a pass.
@@ -33,6 +34,10 @@ DEFAULT_DIND_IMAGE = (
 
 # Affine §3.8 minimum sustained quota.
 AFFINE_MIN_QUOTA = {"sandboxes": 500, "vcpu": 1000, "memory_gib": 3000}
+CLEANUP_TIMEOUT_S = 30.0
+CLEANUP_POLL_S = 1.0
+SANDBOX_LIST_PAGE_SIZE = 100
+SANDBOX_LIST_MAX_ROWS = 10_000
 
 
 @dataclass
@@ -84,6 +89,7 @@ class Context:
         self.primary_failure = ""
         self.sandboxes: list[str] = []
         self.snapshots: list[str] = []
+        self.cleanup_errors: list[str] = []
 
     def create_body(self, **overrides: Any) -> dict:
         body: dict[str, Any] = {
@@ -99,11 +105,15 @@ class Context:
         return body
 
     def create(self, body: dict | None = None, key: str | None = None) -> Response:
-        reply = self.api.call("POST", "/v1/sandboxes", json=body or self.create_body(),
+        request_body = body or self.create_body()
+        reply = self.api.call("POST", "/v1/sandboxes", json=request_body,
                               key=key or f"conf-{uuid.uuid4().hex}")
         view = reply.json()
-        if reply.ok and isinstance(view, dict) and view.get("id") and view["id"] not in self.sandboxes:
-            self.sandboxes.append(view["id"])
+        if reply.ok and isinstance(view, dict) and isinstance(view.get("id"), str) and view["id"]:
+            if view.get("labels") != request_body.get("labels"):
+                self.cleanup_errors.append(f"create {view['id']} did not echo the requested ownership labels")
+            elif view["id"] not in self.sandboxes:
+                self.sandboxes.append(view["id"])
         return reply
 
     def create_running(self, body: dict | None = None) -> tuple[str | None, float, str]:
@@ -120,15 +130,135 @@ class Context:
         return sandbox_id, elapsed, ""
 
     def cleanup(self) -> dict:
-        """Delete everything this run made, then sweep by label for lost creates."""
-        listed = self.api.call("GET", "/v1/sandboxes",
-                               params=[("label", f"conformance_run={self.config.run_id}")])
-        for view in (listed.json() or {}).get("sandboxes", []) if listed.ok else []:
-            if view.get("id") not in self.sandboxes:
-                self.sandboxes.append(view["id"])
-        failed = [s for s in self.sandboxes if not self.api.delete(s).ok]
-        failed += [s for s in self.snapshots if not self.api.call("DELETE", f"/v1/snapshots/{s}").ok]
-        return {"deleted": len(self.sandboxes) + len(self.snapshots) - len(failed), "failed": failed}
+        """Sweep only proven run-owned resources and report unconfirmed cleanup."""
+        errors = list(self.cleanup_errors)
+        discovered: list[str] = []
+        offset = 0
+        seen: set[str] = set()
+        complete = False
+        while offset <= SANDBOX_LIST_MAX_ROWS:
+            listed = self.api.call(
+                "GET", "/v1/sandboxes",
+                params=[("label", f"conformance_run={self.config.run_id}"),
+                        ("limit", SANDBOX_LIST_PAGE_SIZE), ("offset", offset)],
+            )
+            if not listed.ok:
+                errors.append(f"sandbox list at offset {offset} failed: {listed.summary()}")
+                break
+            page = listed.json()
+            if (not isinstance(page, dict) or not isinstance(page.get("sandboxes"), list)
+                    or not isinstance(page.get("has_more"), bool)):
+                errors.append(f"sandbox list at offset {offset} returned a malformed page")
+                break
+            rows = page["sandboxes"]
+            if len(rows) > SANDBOX_LIST_PAGE_SIZE or (page["has_more"] and not rows):
+                errors.append(f"sandbox list at offset {offset} violated pagination bounds")
+                break
+            malformed = False
+            for view in rows:
+                if not isinstance(view, dict) or not isinstance(view.get("id"), str) or not view["id"]:
+                    errors.append(f"sandbox list at offset {offset} contained a malformed row")
+                    malformed = True
+                    continue
+                sandbox_id = view["id"]
+                if sandbox_id in seen:
+                    errors.append(f"sandbox list repeated id {sandbox_id}")
+                    malformed = True
+                    continue
+                seen.add(sandbox_id)
+                labels = view.get("labels")
+                if not isinstance(labels, dict) or labels.get("conformance_run") != self.config.run_id:
+                    errors.append(f"sandbox {sandbox_id} lacked the exact conformance_run ownership label")
+                    continue
+                discovered.append(sandbox_id)
+            if malformed:
+                break
+            if len(seen) > SANDBOX_LIST_MAX_ROWS:
+                errors.append(f"sandbox list exceeded the {SANDBOX_LIST_MAX_ROWS}-row safety bound")
+                break
+            if not page["has_more"]:
+                complete = True
+                break
+            if len(rows) < SANDBOX_LIST_PAGE_SIZE:
+                errors.append(f"sandbox list at offset {offset} claimed more rows after a short page")
+                break
+            offset += len(rows)
+        if not complete and not any("sandbox list" in e for e in errors):
+            errors.append("sandbox list did not complete within the pagination safety bound")
+
+        # Do not mutate the collection until every page has been read: the API
+        # paginates by offset over a newest-first list, so deleting mid-scan can
+        # shift rows and silently skip an owned sandbox.
+        sandbox_ids = list(dict.fromkeys([*self.sandboxes, *discovered]))
+        deleted = 0
+        failed: list[str] = []
+        for sandbox_id in sandbox_ids:
+            if self._delete_sandbox_confirmed(sandbox_id):
+                deleted += 1
+            else:
+                failed.append(sandbox_id)
+        for snapshot_id in dict.fromkeys(self.snapshots):
+            if self._delete_snapshot_confirmed(snapshot_id):
+                deleted += 1
+            else:
+                failed.append(f"snapshot:{snapshot_id}")
+        errors = list(dict.fromkeys([*errors, *self.cleanup_errors]))
+        return {"deleted": deleted, "failed": failed, "errors": errors,
+                "listing_complete": complete,
+                "ok": complete and not failed and not errors}
+
+    def _delete_sandbox_confirmed(self, sandbox_id: str) -> bool:
+        reply = self.api.get_sandbox(sandbox_id)
+        if reply.status == 404:
+            return True
+        if not reply.ok:
+            self.cleanup_errors.append(f"sandbox {sandbox_id} ownership/status lookup failed: {reply.summary()}")
+            return False
+        view = reply.json()
+        if not isinstance(view, dict) or not isinstance(view.get("labels"), dict):
+            self.cleanup_errors.append(f"sandbox {sandbox_id} returned malformed ownership/status")
+            return False
+        if view["labels"].get("conformance_run") != self.config.run_id:
+            self.cleanup_errors.append(f"refused to delete sandbox {sandbox_id} with a different run label")
+            return False
+        if view.get("state") == "deleted" and view.get("cleanup_state") == "confirmed":
+            return True
+        key = f"conf-cleanup-{self.config.run_id}-{sandbox_id}"
+        deleted = self.api.delete(sandbox_id, key=key)
+        deadline = self.api.clock() + CLEANUP_TIMEOUT_S
+        while self.api.clock() <= deadline:
+            status = self.api.get_sandbox(sandbox_id)
+            if status.status == 404:
+                return True
+            if status.ok:
+                current = status.json()
+                if (isinstance(current, dict) and current.get("state") == "deleted"
+                        and current.get("cleanup_state") == "confirmed"):
+                    return True
+            self.api.sleep(CLEANUP_POLL_S)
+        reason = f"sandbox {sandbox_id} deletion was not confirmed within {CLEANUP_TIMEOUT_S:g}s"
+        if not deleted.ok:
+            reason += f" after DELETE returned {deleted.summary()}"
+        self.cleanup_errors.append(reason)
+        return False
+
+    def _delete_snapshot_confirmed(self, snapshot_id: str) -> bool:
+        deleted = self.api.call("DELETE", f"/v1/snapshots/{snapshot_id}")
+        deadline = self.api.clock() + CLEANUP_TIMEOUT_S
+        while self.api.clock() <= deadline:
+            status = self.api.call("GET", f"/v1/snapshots/{snapshot_id}")
+            if status.status == 404:
+                return True
+            if status.ok:
+                current = status.json()
+                if isinstance(current, dict) and current.get("state") == "deleted":
+                    return True
+            self.api.sleep(CLEANUP_POLL_S)
+        reason = f"snapshot {snapshot_id} deletion was not confirmed within {CLEANUP_TIMEOUT_S:g}s"
+        if not deleted.ok:
+            reason += f" after DELETE returned {deleted.summary()}"
+        self.cleanup_errors.append(reason)
+        return False
 
 
 def percentile(values: list[float], pct: float) -> float:
@@ -439,17 +569,40 @@ def quota_full_429(ctx: Context):
     if quota is None:
         return "fail", {}, failure
     room = (quota.get("available") or {}).get("sandboxes")
-    if room is None or room > ctx.config.max_fill:
+    if type(room) is not int or room < 0:
+        return "fail", {"available": room}, "project quota omitted an integer sandbox headroom"
+    if room > ctx.config.max_fill:
         return "skip", {"available": room}, f"filling {room} sandboxes exceeds --max-fill {ctx.config.max_fill}"
+    key_quota = quota.get("api_key")
+    if isinstance(key_quota, dict):
+        key_room = (key_quota.get("available") or {}).get("sandboxes")
+        if type(key_room) is not int:
+            return "fail", {"available": room, "api_key_available": key_room}, "API-key quota omitted sandbox headroom"
+        if key_room < room:
+            return ("skip", {"available": room, "api_key_available": key_room},
+                    "API-key quota would stop this key before the advertised project quota")
+    filled = 0
     for _ in range(room):
-        ctx.create()
+        created = ctx.create()
+        body = created.json()
+        if not created.ok or not isinstance(body, dict) or not isinstance(body.get("id"), str):
+            return ("fail", {"filled": filled, "expected": room, "fill_status": created.status},
+                    f"project-quota filler create failed: {created.summary()}")
+        filled += 1
     started = ctx.api.clock()
     reply = ctx.create()
     elapsed = ctx.api.clock() - started
     retry_after = {k.lower(): v for k, v in reply.headers.items()}.get("retry-after")
-    measured = {"filled": room, "status": reply.status, "seconds": round(elapsed, 3), "retry_after": retry_after}
-    ok = reply.status == 429 and elapsed < 1 and retry_after is not None
-    return ("pass" if ok else "fail"), measured, ""
+    body = reply.json()
+    detail = body.get("detail") if isinstance(body, dict) else None
+    error = detail if isinstance(detail, dict) else body if isinstance(body, dict) else {}
+    error_code = error.get("error") or error.get("error_code") or error.get("code")
+    measured = {"filled": filled, "expected": room, "status": reply.status,
+                "error_code": error_code, "seconds": round(elapsed, 3), "retry_after": retry_after}
+    ok = (filled == room and reply.status == 429 and error_code == "sandbox_quota_exceeded"
+          and elapsed < 1 and retry_after is not None)
+    detail_text = "" if ok else "expected sandbox_quota_exceeded (not a key quota, capacity, or generic 429) after every advertised project slot was filled"
+    return ("pass" if ok else "fail"), measured, detail_text
 
 
 @check("usage.by_label", "Usage and cost grouped by label", "§3.13",
@@ -536,16 +689,50 @@ def snapshot_fork(ctx: Context):
     if len(running) != len(forks):
         return "fail", measured, "; ".join(f[2] for f in forks if not f[0])
 
-    digests, marks = set(), set()
+    # Write every fork before reading any of them. Then verify each sentinel
+    # is present only in its owner; serial write/read can pass on shared storage.
+    markers = [f"fork-{index}-{uuid.uuid4().hex}" for index in range(len(running))]
+    write_failures = []
     for index, fork in enumerate(running):
-        r = ctx.api.exec(fork, ["sh", "-c", f"sha256sum /tmp/state.bin && echo {index} > /tmp/fork && cat /tmp/fork"])
-        lines = (r.json() or {}).get("stdout", "").split() if r.ok else []
-        digests.add(lines[0] if lines else None)
-        marks.add(lines[-1] if lines else None)
-    ctx.api.delete(ctx.primary)
-    survivors = sum(1 for f in running if (ctx.api.exec(f, ["true"]).json() or {}).get("exit_code") == 0)
-    measured.update(same_state=digests == {parent_digest}, independent=len(marks) == len(running),
+        path = f"/tmp/conformance-fork-{index}.txt"
+        response = ctx.api.exec(fork, ["sh", "-c", f"printf '%s' '{markers[index]}' > '{path}'"])
+        body_result = response.json() if response.ok else {}
+        if not response.ok or not isinstance(body_result, dict) or body_result.get("exit_code") != 0:
+            write_failures.append(f"fork {index} sentinel write failed: {response.summary()}")
+    same_state = True
+    independent = True
+    read_failures = []
+    for index, fork in enumerate(running):
+        own_path = f"/tmp/conformance-fork-{index}.txt"
+        own = ctx.api.exec(fork, ["sh", "-c", f"cat '{own_path}' && sha256sum /tmp/state.bin"])
+        own_body = own.json() if own.ok else {}
+        own_lines = own_body.get("stdout", "").splitlines() if isinstance(own_body, dict) else []
+        if (not own.ok or own_body.get("exit_code") != 0 or not own_lines
+                or own_lines[0] != markers[index]):
+            independent = False
+            read_failures.append(f"fork {index} did not read its own sentinel")
+        digest_line = own_lines[1].split() if len(own_lines) >= 2 else []
+        if not digest_line or digest_line[0] != parent_digest:
+            same_state = False
+        for other in range(len(running)):
+            if other == index:
+                continue
+            path = f"/tmp/conformance-fork-{other}.txt"
+            probe = ctx.api.exec(fork, ["sh", "-c", f"test ! -e '{path}'"])
+            probe_body = probe.json() if probe.ok else {}
+            if not probe.ok or not isinstance(probe_body, dict) or probe_body.get("exit_code") != 0:
+                independent = False
+                read_failures.append(f"fork {index} saw fork {other}'s sentinel")
+    parent_delete_ok = ctx._delete_sandbox_confirmed(ctx.primary)
+    survivors = None
+    if parent_delete_ok:
+        survivors = sum(1 for f in running if (ctx.api.exec(f, ["true"]).json() or {}).get("exit_code") == 0)
+    measured.update(same_state=same_state, independent=independent,
+                    sentinel_writes=len(running) - len(write_failures),
+                    parent_delete_confirmed=parent_delete_ok,
                     alive_after_parent_delete=survivors)
+    if write_failures or read_failures:
+        return "fail", measured, "; ".join(write_failures + read_failures)
     ok = (snapshot_s <= 30 and measured["fork_max_s"] <= 15 and measured["same_state"]
-          and measured["independent"] and survivors == len(running))
-    return ("pass" if ok else "fail"), measured, ""
+          and measured["independent"] and parent_delete_ok and survivors == len(running))
+    return ("pass" if ok else "fail"), measured, "parent deletion was not confirmed before survivor checks" if not parent_delete_ok else ""

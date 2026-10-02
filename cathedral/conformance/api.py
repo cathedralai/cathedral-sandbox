@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -41,7 +42,10 @@ class Response:
     def summary(self) -> str:
         body = self.json()
         if isinstance(body, dict):
-            code = body.get("error_code") or body.get("code") or body.get("error")
+            detail = body.get("detail")
+            nested = detail if isinstance(detail, dict) else {}
+            code = (body.get("error_code") or body.get("code") or body.get("error")
+                    or nested.get("error_code") or nested.get("code") or nested.get("error"))
             message = body.get("message") or body.get("detail")
             return f"HTTP {self.status} {code or ''} {message or ''}".strip()
         return f"HTTP {self.status}"
@@ -122,5 +126,6 @@ class Api:
         return self.call("POST", f"/v1/sandboxes/{sandbox_id}/exec", json=body,
                          timeout=timeout_seconds + 15)
 
-    def delete(self, sandbox_id: str) -> Response:
-        return self.call("DELETE", f"/v1/sandboxes/{sandbox_id}")
+    def delete(self, sandbox_id: str, *, key: str | None = None) -> Response:
+        return self.call("DELETE", f"/v1/sandboxes/{sandbox_id}",
+                         key=key or f"conf-delete-{uuid.uuid4().hex}")
