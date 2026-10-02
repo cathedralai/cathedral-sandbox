@@ -2,9 +2,9 @@
 
     CATHEDRAL_API_KEY=cat_sk_... cathedral-conformance --report report.json
 
-Exit status: 0 when every mvp check passes (every check with --strict),
-1 otherwise, 2 for a usage error. Everything the run created is deleted at the
-end, including after a crash, and swept again by the run's label.
+Exit status: 0 when every mvp check passes (every check with --strict) and
+cleanup is confirmed, 1 otherwise, 2 for a usage error. The normal finalizer
+sweeps run-owned sandboxes. Process or host crashes can prevent cleanup.
 """
 
 from __future__ import annotations
@@ -66,7 +66,9 @@ def run(api: Api, config: Config, only: set[str] | None = None, strict: bool = F
         "started_at": started.isoformat(),
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "strict": strict,
-        "passed": all(r.status == "pass" for r in gating),
+        # Cleanup is a safety contract, not an optional/later-tier result. A
+        # run never passes while created resources may still be live.
+        "passed": all(r.status == "pass" for r in gating) and cleanup.get("ok") is True,
         "counts": {s: sum(1 for r in results if r.status == s) for s in ("pass", "fail", "skip")},
         "config": asdict(config),
         "results": [asdict(r) for r in results],

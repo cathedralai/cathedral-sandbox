@@ -55,7 +55,10 @@ class Response:
     def summary(self) -> str:
         body = self.json()
         if isinstance(body, dict):
-            code = body.get("error_code") or body.get("code") or body.get("error")
+            detail = body.get("detail")
+            nested = detail if isinstance(detail, dict) else {}
+            code = (body.get("error_code") or body.get("code") or body.get("error")
+                    or nested.get("error_code") or nested.get("code") or nested.get("error"))
             message = body.get("message") or body.get("detail")
             return f"HTTP {self.status} {code or ''} {message or ''}".strip()
         return f"HTTP {self.status}"
@@ -185,8 +188,9 @@ class Api:
             return self.exec(sandbox_id, command, timeout_seconds=timeout_seconds, user=user)
         return self.exec_background(sandbox_id, command, timeout_seconds=timeout_seconds, user=user)
 
-    def delete(self, sandbox_id: str) -> Response:
+    def delete(self, sandbox_id: str, *, key: str | None = None) -> Response:
         # The API requires an Idempotency-Key on DELETE and answers 422 without
         # one. A fresh key per call: a repeat DELETE is a new request, which a
         # sandbox that is already deleted must still answer with 2xx.
-        return self.call("DELETE", f"/v1/sandboxes/{sandbox_id}", key=idempotency_key("conf-del"))
+        return self.call("DELETE", f"/v1/sandboxes/{sandbox_id}",
+                         key=key or idempotency_key("conf-del"))
