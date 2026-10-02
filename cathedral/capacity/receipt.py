@@ -21,7 +21,22 @@ What a receipt binds, and what ``verify_receipt`` checks:
   the lanes that nonce and count sample, so anyone can recompute which lanes
   were checked and re-check them;
 - timing: the exec time must fit the deadline the prober set, and the deadline
-  may be no looser than ``max_deadline_ms(spec)``.
+  may be no looser than ``max_deadline_ms(spec)``;
+- evidence (TEE boxes only, ``null`` for bare metal): which attestation the
+  prober verified before it took the hardware id, as the SHA-256 of the raw
+  quote or report, its launch measurement, the digest of the verifier that
+  checked it, the attested TLS key's SPKI hash, the nonce the quote's
+  REPORT_DATA was made over and when the prober verified it (no later than the
+  receipt's ``issued_at``). With the archived quote anyone can audit it end to
+  end: the hash, the measurement, the hardware id, and REPORT_DATA against
+  :func:`expected_report_data` (the nonce, this box's hotkey and the TLS key);
+  the receipt alone cannot re-verify the quote. ``verify_receipt`` can refuse
+  evidence older than ``max_evidence_age``.
+
+The prober signs bare-metal receipts only when told to (``sign_receipt(...,
+allow_bare_metal=True)``): TEE boxes come first. ``verify_receipt`` accepts a
+correctly signed bare-metal receipt; whether to pay for it is the validator's
+own policy.
 
 Wire form: canonical JSON (sorted keys, no whitespace, UTF-8) of the body, and
 ``signature`` = base64 Ed25519 over those bytes with the key named by
@@ -54,8 +69,9 @@ from cathedral.capacity.challenge import (
     sample_lanes,
     spec_for,
 )
+from cathedral.common import ChannelBinding, ChannelBindingType, report_data_v2
 
-SCHEMA = "cathedral_capacity_receipt_v1"
+SCHEMA = "cathedral_capacity_receipt_v2"
 BOX_KINDS = ("tee", "bare_metal")
 # The one hardware identity each kind of box is deduplicated by: (kind, tee_kind) -> id kind.
 HARDWARE_ID_KINDS = {
@@ -76,6 +92,27 @@ _SS58 = re.compile(r"[1-9A-HJ-NP-Za-km-z]{46,48}")
 _BOX_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _LANE = re.compile(r"0|[1-9][0-9]{0,3}")
 _TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
+# The verifier digest, as cathedral/verify/__init__.py's implementation digest
+# and cathedral-validator's SNP verifier digest write it; a bare 64-hex digest
+# (the QVL binary's SHA-256) is written with the prefix.
+_VERIFIER_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+# The launch measurement each verifier reports: TDX as cathedral/verify/tdx_quote.py
+# computes it, SNP as the report's 48-byte MEASUREMENT in hex (cathedral/verify/snp.py).
+_MEASUREMENT = {
+    "tdx": re.compile(r"tdx-measurement-sha256:[0-9a-f]{64}"),
+    "sev_snp": re.compile(r"[0-9a-f]{96}"),
+}
+_EVIDENCE_KEYS = frozenset(
+    {
+        "evidence_kind",
+        "evidence_sha256",
+        "measurement",
+        "verifier_digest",
+        "tls_spki_sha256",
+        "attestation_nonce",
+        "attested_at",
+    }
+)
 _BODY_KEYS = frozenset(
     {
         "schema",
@@ -89,6 +126,7 @@ _BODY_KEYS = frozenset(
         "issued_at",
         "expires_at",
         "prober_key_id",
+        "evidence",
     }
 )
 _BOX_KEYS = frozenset(
@@ -114,6 +152,19 @@ class ReceiptError(ValueError):
 
 
 @dataclass(frozen=True)
+class ReceiptEvidence:
+    """The attestation a TEE box's receipt rests on (docs/CAPACITY.md)."""
+
+    evidence_kind: str  # the box's tee_kind: tdx or sev_snp
+    evidence_sha256: str  # SHA-256 of the raw quote or report the prober verified
+    measurement: str  # tdx-measurement-sha256:<64 hex>, or the SNP MEASUREMENT's 96 hex
+    verifier_digest: str  # sha256:<64 hex>
+    tls_spki_sha256: str  # SHA-256 of the SPKI of the TLS key the evidence attests
+    attestation_nonce: str  # 64 hex: the 32-byte nonce REPORT_DATA was made over
+    attested_at: str  # YYYY-MM-DDTHH:MM:SSZ: when the prober verified the quote
+
+
+@dataclass(frozen=True)
 class VerifiedReceipt:
     box_id: str
     miner_hotkey: str
@@ -132,6 +183,7 @@ class VerifiedReceipt:
     timings_ms: Mapping[str, int]
     round: int
     issued_at: datetime
+    evidence: ReceiptEvidence | None  # None for bare metal
 
 
 def canonical_bytes(body: Mapping[str, Any]) -> bytes:
@@ -253,7 +305,12 @@ def make_body(
     issued_at: datetime,
     valid_for: timedelta,
     prober_key_id: str,
+    evidence: Mapping[str, str] | None,
 ) -> dict[str, Any]:
+    """The body the prober signs. ``evidence`` is required for a TEE box (the
+    seven ``_EVIDENCE_KEYS``, as ``dataclasses.asdict`` of a ``ReceiptEvidence``
+    gives them) and must be None for bare metal; ``sign_receipt`` checks it."""
+
     return {
         "schema": SCHEMA,
         "netuid": netuid,
@@ -281,15 +338,30 @@ def make_body(
         "issued_at": _iso(issued_at),
         "expires_at": _iso(issued_at + valid_for),
         "prober_key_id": prober_key_id,
+        # copied if it is a mapping; anything else is left for _check_body to refuse
+        "evidence": dict(evidence) if isinstance(evidence, Mapping) else evidence,
     }
 
 
-def sign_receipt(body: Mapping[str, Any], private_key: Ed25519PrivateKey) -> dict[str, Any]:
-    """The prober's side: sign a body (checked first, so it never signs junk)."""
+def sign_receipt(
+    body: Mapping[str, Any],
+    private_key: Ed25519PrivateKey,
+    *,
+    allow_bare_metal: bool = False,
+) -> dict[str, Any]:
+    """The prober's side: sign a body (checked first, so it never signs junk).
+    A bare-metal body is refused unless ``allow_bare_metal`` is True: TEE boxes
+    come first, and bare metal is deferred."""
 
+    if not isinstance(body, Mapping):
+        raise ReceiptError("body must be an object")
     if "signature" in body:
         raise ReceiptError("body already carries a signature")
-    _check_body(body)
+    if _check_body(body).kind == "bare_metal" and allow_bare_metal is not True:
+        raise ReceiptError(
+            "refusing to sign a bare-metal receipt: TEE boxes come first;"
+            " pass allow_bare_metal=True to sign one"
+        )
     signature = private_key.sign(canonical_bytes(body))
     return {**body, "signature": base64.b64encode(signature).decode()}
 
@@ -302,12 +374,20 @@ def verify_receipt(
     validator_nonce: str,
     now: datetime,
     expected_round: int,
+    max_evidence_age: timedelta | None = None,
 ) -> VerifiedReceipt:
     """A validator's side: signature, audience (netuid, nonce and round),
-    freshness and shape, or raise."""
+    freshness and shape, or raise. ``max_evidence_age``, when given, also
+    refuses a TEE receipt whose evidence was verified longer ago than that
+    before ``now``: the attestation a receipt rests on is reused across rounds,
+    and this is how a validator bounds its age."""
 
     now = _aware(now)
     _count(expected_round, "expected_round")
+    if max_evidence_age is not None and (
+        not isinstance(max_evidence_age, timedelta) or max_evidence_age <= timedelta(0)
+    ):
+        raise ReceiptError("max_evidence_age must be a positive timedelta or None")
     if not isinstance(receipt, Mapping) or "signature" not in receipt:
         raise ReceiptError("receipt is not a signed object")
     body = {key: value for key, value in receipt.items() if key != "signature"}
@@ -329,7 +409,35 @@ def verify_receipt(
     expires_at = _parse_time(body["expires_at"], "expires_at")
     if not (parsed.issued_at <= now + CLOCK_SKEW and now < expires_at):
         raise ReceiptError("receipt is not currently valid")
+    if max_evidence_age is not None and parsed.evidence is not None:
+        attested_at = _parse_time(parsed.evidence.attested_at, "attested_at")
+        if now - attested_at > max_evidence_age:
+            raise ReceiptError("the receipt's evidence is older than max_evidence_age")
     return parsed
+
+
+def expected_report_data(verified: VerifiedReceipt) -> bytes:
+    """The 64-byte REPORT_DATA the quote behind a TEE receipt must carry:
+    ``report_data_v2(attestation_nonce, miner_hotkey, tls_spki_sha256)``, the
+    worker's v2 channel binding. An auditor holding the archived quote checks
+    its SHA-256 against ``evidence_sha256``, verifies it, and compares its
+    REPORT_DATA to this, which shows the quote was made for this box's hotkey,
+    the TLS key the prober pinned, and the prober's nonce, not replayed from
+    another box. Bare-metal receipts have no evidence and are refused."""
+
+    if not isinstance(verified, VerifiedReceipt) or verified.evidence is None:
+        raise ReceiptError("only a verified TEE receipt has evidence to audit")
+    evidence = verified.evidence
+    try:
+        return report_data_v2(
+            bytes.fromhex(evidence.attestation_nonce),
+            verified.miner_hotkey,
+            ChannelBinding(
+                ChannelBindingType.TLS_SPKI_SHA256, bytes.fromhex(evidence.tls_spki_sha256)
+            ),
+        )
+    except ValueError as exc:
+        raise ReceiptError(f"evidence: {exc}") from exc
 
 
 def _check_body(body: Mapping[str, Any]) -> VerifiedReceipt:
@@ -418,6 +526,7 @@ def _check_body(body: Mapping[str, Any]) -> VerifiedReceipt:
     expires_at = _parse_time(body["expires_at"], "expires_at")
     if not timedelta(0) < expires_at - issued_at <= MAX_VALIDITY:
         raise ReceiptError("receipt validity must be positive and at most 2 hours")
+    evidence = _check_evidence(body["evidence"], tee_kind, issued_at=issued_at)
     return VerifiedReceipt(
         box_id=box["box_id"],
         miner_hotkey=box["miner_hotkey"],
@@ -436,4 +545,47 @@ def _check_body(body: Mapping[str, Any]) -> VerifiedReceipt:
         timings_ms=dict(timings),
         round=round_,
         issued_at=issued_at,
+        evidence=evidence,
+    )
+
+
+def _check_evidence(
+    evidence: object, tee_kind: str | None, *, issued_at: datetime | None = None
+) -> ReceiptEvidence | None:
+    """Required for a TEE box and null for bare metal; ``tee_kind`` is already
+    checked. ``issued_at`` is the receipt's: the evidence cannot be later."""
+
+    if tee_kind is None:
+        if evidence is not None:
+            raise ReceiptError("a bare-metal receipt carries no evidence (null)")
+        return None
+    if not isinstance(evidence, Mapping) or set(evidence) != _EVIDENCE_KEYS:
+        raise ReceiptError(f"a tee receipt's evidence must have exactly {sorted(_EVIDENCE_KEYS)}")
+    if not isinstance(evidence["evidence_kind"], str) or evidence["evidence_kind"] != tee_kind:
+        raise ReceiptError("evidence_kind must equal the box's tee_kind")
+    measurement = evidence["measurement"]
+    if not isinstance(measurement, str) or _MEASUREMENT[tee_kind].fullmatch(measurement) is None:
+        raise ReceiptError(
+            "measurement must be tdx-measurement-sha256:<64 hex> for tdx"
+            " and 96 lowercase hex for sev_snp"
+        )
+    if not any(bytes.fromhex(measurement.rpartition(":")[2])):
+        raise ReceiptError("measurement is all zeros")
+    verifier_digest = evidence["verifier_digest"]
+    if not isinstance(verifier_digest, str) or _VERIFIER_DIGEST.fullmatch(verifier_digest) is None:
+        raise ReceiptError("verifier_digest must be sha256:<64 lowercase hex>")
+    attestation_nonce = _hex64(evidence["attestation_nonce"], "attestation_nonce")
+    if not any(bytes.fromhex(attestation_nonce)):
+        raise ReceiptError("attestation_nonce is all zeros")
+    attested_at = _parse_time(evidence["attested_at"], "attested_at")
+    if issued_at is not None and attested_at > issued_at:
+        raise ReceiptError("attested_at is after the receipt's issued_at")
+    return ReceiptEvidence(
+        evidence_kind=tee_kind,
+        evidence_sha256=_hex64(evidence["evidence_sha256"], "evidence_sha256"),
+        measurement=measurement,
+        verifier_digest=verifier_digest,
+        tls_spki_sha256=_hex64(evidence["tls_spki_sha256"], "tls_spki_sha256"),
+        attestation_nonce=attestation_nonce,
+        attested_at=evidence["attested_at"],
     )

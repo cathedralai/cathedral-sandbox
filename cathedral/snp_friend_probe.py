@@ -43,7 +43,7 @@ from cryptography.x509.oid import NameOID
 
 from cathedral.attest import collect_snp
 from cathedral.channel import tls_spki_binding
-from cathedral.common import ChannelBinding, Policy, Tier, issue_nonce
+from cathedral.common import ChannelBinding, Evidence, Policy, Tier, issue_nonce
 from cathedral.lanes.sat import SatLane
 from cathedral.remote import RemoteMiner
 from cathedral.verify import verify
@@ -51,7 +51,10 @@ from cathedral.verify.snp import (
     MAX_SNPGUEST_BYTES,
     PINNED_SNPGUEST_SHA256,
     PINNED_SNPGUEST_VERSION,
+    SnpReport,
+    SnpVerifierUnavailable,
     parse_snp_report,
+    snp_generation,
 )
 from cathedral.worker import WorkerServer
 
@@ -62,6 +65,21 @@ SECOND_HOTKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 DEFAULT_SEV_GUEST_DEVICE = Path("/dev/sev-guest")
 PROBE_TIMEOUT_SECONDS = 120.0
 FRIEND_SNPGUEST_TIMEOUT_SECONDS = 15.0
+VALIDATOR_POLICY_SCHEMA = "cathedral_amd_sev_snp_policy_v1"
+GUEST_POLICY_SINGLE_SOCKET = 1 << 20
+SINGLE_SOCKET_WARNING = (
+    "this guest was launched without the SINGLE_SOCKET policy bit; the validator "
+    "requires that bit for every SNP miner by default, so this guest will be refused. "
+    "Relaunch it with the bit set. validator_policy_entry deliberately omits "
+    "require_single_socket: setting it to false is a global policy change that turns "
+    "the socket check off for every SNP miner, and must be a separate, explicit decision."
+)
+# TCB bytes the validator compares per generation; every other byte is reserved.
+_TCB_COMPONENT_BYTES = {
+    "milan": (0, 1, 6, 7),
+    "genoa": (0, 1, 6, 7),
+    "turin": (0, 1, 2, 3, 7),
+}
 
 
 class ProbeError(RuntimeError):
@@ -249,6 +267,26 @@ def _parse_review_challenge(value: str) -> bytes:
     return challenge
 
 
+def _verify_or_inconclusive(evidence: Evidence, nonce: bytes, policy: Policy, *, what: str):
+    """``verify`` that tells an AMD outage apart from a refusal.
+
+    ``verify`` returns None both for invalid evidence and, by default, when the
+    AMD key distribution service is unavailable (for example HTTP 429 rate
+    limiting). A negative control that only checks ``is None`` would then pass
+    without the signature ever being checked, so an unavailable verifier stops
+    the probe as inconclusive instead of reporting any result.
+    """
+
+    try:
+        return verify(evidence, nonce, policy, raise_on_verifier_unavailable=True)
+    except SnpVerifierUnavailable as exc:
+        raise ProbeError(
+            f"{what} is inconclusive: the AMD verifier was unavailable "
+            "(AMD KDS rate limiting or outage), so nothing was checked; "
+            "run the probe again later"
+        ) from exc
+
+
 def run_probe(review_challenge: bytes) -> dict[str, Any]:
     if len(review_challenge) != 32 or not any(review_challenge):
         raise ProbeError("a nonzero 32-byte reviewer challenge is required")
@@ -299,7 +337,9 @@ def run_probe(review_challenge: bytes) -> dict[str, Any]:
                     allowed_measurements={parsed.measurement},
                     min_tcb=parsed.tcb.reported,
                 )
-                attested = verify(evidence, nonce, policy)
+                attested = _verify_or_inconclusive(
+                    evidence, nonce, policy, what="the AMD VCEK chain check"
+                )
                 if attested is None or not attested.chain_verified:
                     raise ProbeError("AMD VCEK chain or Cathedral SNP policy verification failed")
                 if attested.tier is not Tier.CC_CPU_SNP:
@@ -313,12 +353,18 @@ def run_probe(review_challenge: bytes) -> dict[str, Any]:
                     "vmpl_zero": parsed.vmpl == 0,
                     "debug_disabled": not bool(parsed.guest_policy & (1 << 19)),
                     "migration_agent_disabled": not bool(parsed.guest_policy & (1 << 18)),
-                    "wrong_nonce_rejected": verify(evidence, issue_nonce(), policy) is None,
-                    "wrong_hotkey_rejected": verify(
-                        replace(evidence, miner_hotkey=HOTKEY[:-1] + "x"), nonce, policy
+                    "wrong_nonce_rejected": _verify_or_inconclusive(
+                        evidence, issue_nonce(), policy, what="the wrong-nonce control"
                     )
                     is None,
-                    "wrong_channel_key_rejected": verify(
+                    "wrong_hotkey_rejected": _verify_or_inconclusive(
+                        replace(evidence, miner_hotkey=HOTKEY[:-1] + "x"),
+                        nonce,
+                        policy,
+                        what="the wrong-hotkey control",
+                    )
+                    is None,
+                    "wrong_channel_key_rejected": _verify_or_inconclusive(
                         replace(
                             evidence,
                             channel_binding=ChannelBinding(
@@ -328,19 +374,27 @@ def run_probe(review_challenge: bytes) -> dict[str, Any]:
                         ),
                         nonce,
                         policy,
+                        what="the wrong-channel-key control",
                     )
                     is None,
-                    "wrong_measurement_rejected": verify(
+                    "wrong_measurement_rejected": _verify_or_inconclusive(
                         evidence,
                         nonce,
                         Policy(allowed_measurements={"00" * 48}, min_tcb=0),
+                        what="the wrong-measurement control",
                     )
                     is None,
                 }
                 tampered_quote = bytearray(evidence.quote)
                 tampered_quote[0x2A0] ^= 1
                 checks["tampered_signature_rejected"] = (
-                    verify(replace(evidence, quote=bytes(tampered_quote)), nonce, policy) is None
+                    _verify_or_inconclusive(
+                        replace(evidence, quote=bytes(tampered_quote)),
+                        nonce,
+                        policy,
+                        what="the tampered-signature negative control",
+                    )
+                    is None
                 )
                 remote.confirm_channel_binding(evidence)
                 lane = SatLane(namespace="amd-sev-snp-friend-transcript")
@@ -386,13 +440,14 @@ def run_probe(review_challenge: bytes) -> dict[str, Any]:
                 ).digest()
                 evidence_2 = remote_2.fetch_evidence(nonce_2)
                 parsed_2 = parse_snp_report(evidence_2.quote)
-                attested_2 = verify(
+                attested_2 = _verify_or_inconclusive(
                     evidence_2,
                     nonce_2,
                     Policy(
                         allowed_measurements={parsed_2.measurement},
                         min_tcb=parsed_2.tcb.reported,
                     ),
+                    what="the second report's AMD VCEK chain check",
                 )
                 checks["second_amd_vcek_chain_verified"] = bool(
                     attested_2 is not None and attested_2.chain_verified
@@ -445,8 +500,14 @@ def run_probe(review_challenge: bytes) -> dict[str, Any]:
                 b"cathedral.amd-sev-snp.platform.v1\x00" + bytes.fromhex(parsed.chip_id),
                 hashlib.sha256,
             ).hexdigest(),
+            "processor_generation": snp_generation(parsed),
+            "current_tcb_hex": f"0x{parsed.tcb.current:016x}",
             "reported_tcb_hex": f"0x{parsed.tcb.reported:016x}",
+            "committed_tcb_hex": f"0x{parsed.tcb.committed:016x}",
+            "launch_tcb_hex": f"0x{parsed.tcb.launch:016x}",
         },
+        "validator_policy_entry": validator_policy_entry(parsed),
+        "validator_policy_warnings": validator_policy_warnings(parsed),
         "channel": {
             "binding_type": binding.binding_type.value,
             "binding_digest": "sha256:" + binding.digest.hex(),
@@ -459,6 +520,57 @@ def run_probe(review_challenge: bytes) -> dict[str, Any]:
             "durable_machine_dedup_proven": False,
         },
     }
+
+
+def validator_policy_entry(parsed: SnpReport) -> dict[str, Any]:
+    """Return the exact validator SNP policy entry this observed guest needs.
+
+    The validator applies one component-wise floor to the current, reported,
+    committed and launch TCB, so the floor is the per-component minimum of all
+    four, with the generation's reserved bytes left at zero.
+
+    ``require_single_socket`` is global to the validator policy, so the entry
+    only ever carries it as ``true``. A guest without the SINGLE_SOCKET bit
+    gets no such field, never ``false``: pasting ``false`` would switch the
+    socket check off for every SNP miner. :func:`validator_policy_warnings`
+    says why such a guest stays refused.
+    """
+
+    generation = snp_generation(parsed)
+    if generation not in _TCB_COMPONENT_BYTES:
+        raise ProbeError("the processor generation is not one the validator admits")
+    values = (parsed.tcb.current, parsed.tcb.reported, parsed.tcb.committed, parsed.tcb.launch)
+    encoded = [value.to_bytes(8, "little") for value in values]
+    floor = bytearray(8)
+    for index in _TCB_COMPONENT_BYTES[generation]:
+        floor[index] = min(value[index] for value in encoded)
+    minimum_tcb = int.from_bytes(floor, "little")
+    if minimum_tcb == 0:
+        raise ProbeError("every TCB component is zero; the validator refuses a zero floor")
+    entry: dict[str, Any] = {
+        "schema": VALIDATOR_POLICY_SCHEMA,
+        "generations": {
+            generation: {
+                "allowed_measurements": [parsed.measurement],
+                "minimum_tcb": f"0x{minimum_tcb:016x}",
+            }
+        },
+    }
+    if _has_single_socket_bit(parsed):
+        entry["require_single_socket"] = True
+    return entry
+
+
+def validator_policy_warnings(parsed: SnpReport) -> list[str]:
+    """Return what the operator must know before merging the policy entry."""
+
+    if _has_single_socket_bit(parsed):
+        return []
+    return [SINGLE_SOCKET_WARNING]
+
+
+def _has_single_socket_bit(parsed: SnpReport) -> bool:
+    return bool(parsed.guest_policy & GUEST_POLICY_SINGLE_SOCKET)
 
 
 def _write_new(path: Path, document: dict[str, Any]) -> None:
@@ -499,6 +611,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         print(json.dumps(failure, sort_keys=True), file=sys.stderr)
         return 1
+    for warning in result.get("validator_policy_warnings", ()):
+        print(f"WARNING: {warning}", file=sys.stderr)
     print(
         json.dumps(
             {

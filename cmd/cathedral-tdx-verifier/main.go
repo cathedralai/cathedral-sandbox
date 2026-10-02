@@ -38,7 +38,32 @@ const (
 	measurementDomain  = "cathedral-tdx-measurement-v1\x00"
 	tdxTcbInfoPath     = "/tdx/certification/v4/tcb"
 	tdxQeIdentityPath  = "/tdx/certification/v4/qe/identity"
+
+	// exitInvalid means the quote did not verify; the validator scores the
+	// machine zero. exitCollateralUnavailable means Intel's collateral service
+	// did not answer, which says nothing about the miner; the validator treats
+	// it as infrastructure and stops the round instead of zeroing the machine.
+	exitInvalid               = 1
+	exitCollateralUnavailable = 3
 )
+
+// errCollateralUnavailable marks a verification that failed while Intel's
+// collateral service was unreachable, slow, rate limiting, or returning 5xx.
+var errCollateralUnavailable = errors.New("Intel collateral service is unavailable")
+
+// errCollateralRedirectRefused marks a redirect this verifier refused. A
+// refused redirect is a policy decision, never an outage.
+var errCollateralRedirectRefused = errors.New("collateral redirect refused")
+
+// transientCollateralStatuses are the 4xx answers that describe the service,
+// not the request: request timeout, too early, and rate limiting. Every other
+// 4xx is a terminal answer about the quote-derived request and stays invalid,
+// so a miner cannot turn a crafted quote into a validator-wide stop.
+var transientCollateralStatuses = map[int]struct{}{
+	http.StatusRequestTimeout:  {},
+	http.StatusTooEarly:        {},
+	http.StatusTooManyRequests: {},
+}
 
 var intelCollateralHosts = map[string]struct{}{
 	"api.trustedservices.intel.com":          {},
@@ -80,6 +105,7 @@ type intelHTTPSGetter struct {
 	client      *http.Client
 	mu          sync.Mutex
 	tcbInfoBody []byte
+	unavailable bool
 }
 
 func newIntelHTTPSGetter() *intelHTTPSGetter {
@@ -101,8 +127,29 @@ func newIntelHTTPSGetter() *intelHTTPSGetter {
 	return &intelHTTPSGetter{client: &http.Client{
 		Transport:     transport,
 		Timeout:       requestBudget,
-		CheckRedirect: checkIntelCollateralRedirect,
+		CheckRedirect: refuseUnsafeCollateralRedirect,
 	}}
+}
+
+func refuseUnsafeCollateralRedirect(req *http.Request, via []*http.Request) error {
+	if err := checkIntelCollateralRedirect(req, via); err != nil {
+		return fmt.Errorf("%w: %v", errCollateralRedirectRefused, err)
+	}
+	return nil
+}
+
+func (g *intelHTTPSGetter) markUnavailable() {
+	g.mu.Lock()
+	g.unavailable = true
+	g.mu.Unlock()
+}
+
+// collateralUnavailable reports whether any collateral request in this run
+// failed because Intel's service did not give a usable answer.
+func (g *intelHTTPSGetter) collateralUnavailable() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.unavailable
 }
 
 func checkIntelCollateralRedirect(req *http.Request, via []*http.Request) error {
@@ -201,14 +248,22 @@ func (g *intelHTTPSGetter) GetContext(
 	req.Header.Set("Accept", "application/json, application/pkix-crl, application/octet-stream")
 	resp, err := g.client.Do(req)
 	if err != nil {
+		if !errors.Is(err, errCollateralRedirectRefused) {
+			g.markUnavailable()
+		}
 		return nil, nil, errors.New("collateral request failed")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		if _, transient := transientCollateralStatuses[resp.StatusCode]; transient ||
+			resp.StatusCode >= http.StatusInternalServerError {
+			g.markUnavailable()
+		}
 		return nil, nil, fmt.Errorf("collateral endpoint returned HTTP %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCollateralBytes+1))
 	if err != nil {
+		g.markUnavailable()
 		return nil, nil, errors.New("could not read collateral response")
 	}
 	if len(body) > maxCollateralBytes {
@@ -324,15 +379,26 @@ func verifyAndBuildClaims(
 		return nil, err
 	}
 	if err := verify.TdxQuoteContext(ctx, quote, options); err != nil {
+		if collateralWasUnavailable(options) {
+			return nil, errCollateralUnavailable
+		}
 		return nil, errors.New("Intel quote, collateral, revocation, or TCB verification failed")
 	}
 	if err := requireCurrentCollateralLevels(quote, options); err != nil {
+		if collateralWasUnavailable(options) {
+			return nil, errCollateralUnavailable
+		}
 		return nil, errors.New("Intel platform, TDX module, or QE is not fully current")
 	}
 	if err := validateLaunchQuote(quote); err != nil {
 		return nil, errors.New("quote uses launch-disallowed TDX attributes")
 	}
 	return buildVerifiedClaims(quote, body, expectedReportData)
+}
+
+func collateralWasUnavailable(options *verify.Options) bool {
+	getter, ok := options.Getter.(*intelHTTPSGetter)
+	return ok && getter.collateralUnavailable()
 }
 
 func requireCurrentCollateralLevels(quote *tdxpb.QuoteV4, options *verify.Options) error {
@@ -560,6 +626,13 @@ func main() {
 	defer claimOutput.Close()
 	if err := run(os.Args[1:], claimOutput); err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, "cathedral TDX verification failed:", err)
-		os.Exit(1)
+		os.Exit(exitCode(err))
 	}
+}
+
+func exitCode(err error) int {
+	if errors.Is(err, errCollateralUnavailable) {
+		return exitCollateralUnavailable
+	}
+	return exitInvalid
 }

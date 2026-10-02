@@ -57,7 +57,7 @@ guarantee TAO. The subnet must have positive emission.
 |---|---|---|
 | Intel TDX on Linux | Miner side ready; SN94 scoring starts at the validator cutover | Eligible after fresh TDX and SAT verification |
 | More Intel TDX machines on one UID | Miner side ready; SN94 scoring starts at the validator cutover | Each distinct verified machine adds to that UID's score |
-| AMD SEV-SNP on Linux | Validator path merged, live hardware policy pending | Eligible after that validator's policy admits the measurement and TCB, then fresh evidence and SAT pass |
+| AMD SEV-SNP on Linux | One admission observed on SN39 at block 9025398 (observed on chain; unverified in-repo); SN94 status pending verification | Eligible after that validator's policy admits the measurement and TCB, then fresh evidence and SAT pass |
 
 The current direct validator source supports Intel TDX and AMD SEV-SNP. Each
 validator owns its SNP measurement and TCB allowlist. An AMD machine earns zero
@@ -65,6 +65,17 @@ from that validator until its live hardware run is admitted by the policy and
 fresh evidence and SAT pass. This source does not prove a deployed SN94
 validator or finalized weights; see
 [Validator-side dependencies](docs/SN94_MINER_QUICKSTART.md#validator-side-dependencies-not-live-until-the-validator-cutover).
+
+On SN39, UID30 admitted its first live AMD machine on 2026-09-08 and recorded
+the weight row `[(68, 1.0)]` at block 9025398. Both are observed on chain and
+reported by the operator; neither this repository nor cathedral-validator
+records them, so treat them as unverified in-repo. That was one observed cycle
+on one validator, not a standing payout and not a promise about any other
+validator. Cathedral moved to SN94 on 2026-09-28 (this repository's #215,
+`a66d7c4`, and cathedral-validator #261, `28a2779`), and no SN94 AMD admission
+has been verified yet, so the SN94 AMD status is pending verification. Every
+validator still owns its own policy, so admission by UID30 says nothing about
+whether another validator will admit the same machine.
 
 For AMD, the validator proves an admitted guest measurement, distinct hardware,
 the live HTTPS key, and returned SAT work. It does not remotely attest the OCI
@@ -78,7 +89,12 @@ runtime in this repository is not the SN94 weight-writing path.
 ## What you need
 
 - A Linux Intel TDX confidential VM with `/sys/kernel/config/tsm/report`, or an
-  AMD SEV-SNP guest with `/dev/sev-guest`.
+  AMD SEV-SNP guest with `/dev/sev-guest`. For AMD, check with your target
+  validator whether it requires the `SINGLE_SOCKET` guest policy bit, which a
+  multi-socket Linux KVM host cannot set. It is an owner policy option that
+  defaults to required. See the
+  [socket policy and hardware identity](docs/AMD_SEV_SNP_FRIEND_TEST.md#socket-policy-and-hardware-identity)
+  notes, which also explain why two guests on one host score zero.
 - Git, Python 3.12 with `venv`, Docker, `nft`, and `curl` inside the guest.
 - A public IPv4 address with TCP `8081` open.
 - One public Bittensor hotkey which you will register on Finney SN94 only after

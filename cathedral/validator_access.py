@@ -37,6 +37,7 @@ import weakref
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
@@ -175,6 +176,60 @@ LOGGER = logging.getLogger(__name__)
 
 class ValidatorAccessError(ValueError):
     """A validator snapshot, request, or fleet manifest is not trustworthy."""
+
+
+class ValidatorRefusal(Enum):
+    """Why ``finalize`` refused a preauthorized request.
+
+    It never reaches the caller, which sees only a 401. The worker uses it to
+    tell a client fault, which benches the validator, from a refusal on its
+    own side, which must not bench an honest validator.
+    """
+
+    BODY_MISMATCH = "body_mismatch"
+    EXPIRED = "expired"
+    NOT_QUALIFIED = "not_qualified"
+    REPLAYED = "replayed"
+    SNAPSHOT_UNAVAILABLE = "snapshot_unavailable"
+    REPLAY_STATE_UNAVAILABLE = "replay_state_unavailable"
+    WORKER_ERROR = "worker_error"
+
+    @property
+    def client_fault(self) -> bool:
+        """A body the signature does not cover, a request that expired in
+        flight, a nonce already used, or a validator the current snapshot no
+        longer qualifies. A missing or lapsed snapshot, a full or failing
+        replay store and a malformed call or other error in the worker are the
+        worker's."""
+
+        return self in _CLIENT_FAULT_REFUSALS
+
+
+_CLIENT_FAULT_REFUSALS = frozenset(
+    {
+        ValidatorRefusal.BODY_MISMATCH,
+        ValidatorRefusal.EXPIRED,
+        ValidatorRefusal.NOT_QUALIFIED,
+        ValidatorRefusal.REPLAYED,
+    }
+)
+
+
+class _FinalizeRefused(ValidatorAccessError):
+    def __init__(self, message: str, refusal: ValidatorRefusal) -> None:
+        super().__init__(message)
+        self.refusal = refusal
+
+
+class ReplayRecord(Enum):
+    """The outcome of recording one request nonce in the replay store."""
+
+    ACCEPTED = "accepted"
+    REPLAYED = "replayed"
+    EXPIRED = "expired"
+    # Closed, full, failing (sqlite3.Error) or refusing on a clock step or the
+    # replay floor: the worker's state, not the request, is at fault.
+    UNAVAILABLE = "unavailable"
 
 
 class RequestSigner(Protocol):
@@ -557,6 +612,47 @@ class ValidatorAccessState:
         now: datetime,
         expires_at: datetime,
     ) -> bool:
+        """Whether ``record_request`` accepted the nonce."""
+
+        return (
+            self.record_request(validator_hotkey, nonce_hex, now=now, expires_at=expires_at)
+            is ReplayRecord.ACCEPTED
+        )
+
+    def has_recorded_request(self, validator_hotkey: str, nonce_hex: str, *, now: datetime) -> bool:
+        """Whether an unexpired accepted request already used this nonce.
+
+        A read-only early check: it consumes nothing and a store error answers
+        False, so it can only refuse a replay sooner. ``record_request`` stays
+        the authority on every nonce.
+        """
+
+        if self.closed:
+            return False
+        try:
+            connection = self._connect()
+            try:
+                row = connection.execute(
+                    """
+                    SELECT 1 FROM validator_request_replays
+                    WHERE validator_hotkey = ? AND nonce_hex = ? AND expires_at_epoch > ?
+                    """,
+                    (validator_hotkey, nonce_hex, int(now.timestamp())),
+                ).fetchone()
+            finally:
+                connection.close()
+        except (sqlite3.Error, ValidatorAccessError, OSError):
+            return False
+        return row is not None
+
+    def record_request(
+        self,
+        validator_hotkey: str,
+        nonce_hex: str,
+        *,
+        now: datetime,
+        expires_at: datetime,
+    ) -> ReplayRecord:
         """Atomically refuse replay and retain the nonce through its validity.
 
         Replay safety rests on the replay floor, not on the clock. A row is
@@ -575,11 +671,11 @@ class ValidatorAccessState:
         """
 
         if self.closed:
-            return False
+            return ReplayRecord.UNAVAILABLE
         now_epoch = int(now.timestamp())
         expires_epoch = int(expires_at.timestamp())
         if expires_epoch <= now_epoch:
-            return False
+            return ReplayRecord.EXPIRED
         try:
             connection = self._connect()
             try:
@@ -614,7 +710,7 @@ class ValidatorAccessState:
                         REQUEST_CLOCK_RESET_COMMAND,
                         self.path,
                     )
-                    return False
+                    return ReplayRecord.UNAVAILABLE
                 if expires_epoch <= replay_floor:
                     # A pruned row may have held this nonce. The floor is
                     # ahead of the clock here, since expires_epoch > now_epoch.
@@ -633,7 +729,7 @@ class ValidatorAccessState:
                         MAX_REQUEST_LIFETIME_SECONDS,
                         _epoch_utc(resume),
                     )
-                    return False
+                    return ReplayRecord.UNAVAILABLE
                 pruned_through = connection.execute(
                     """
                     SELECT MAX(expires_at_epoch) FROM validator_request_replays
@@ -665,7 +761,7 @@ class ValidatorAccessState:
                 )
                 if count >= self.max_replay_entries:
                     connection.rollback()
-                    return False
+                    return ReplayRecord.UNAVAILABLE
                 try:
                     connection.execute(
                         """
@@ -677,13 +773,13 @@ class ValidatorAccessState:
                     )
                 except sqlite3.IntegrityError:
                     connection.rollback()
-                    return False
+                    return ReplayRecord.REPLAYED
                 connection.commit()
-                return True
+                return ReplayRecord.ACCEPTED
             finally:
                 connection.close()
         except sqlite3.Error:
-            return False
+            return ReplayRecord.UNAVAILABLE
 
     def reset_request_clock(self, *, now: datetime) -> RequestClockReset:
         """Lower the clock high-water to ``now`` after a backward clock step.
@@ -1555,10 +1651,45 @@ class ValidatorRequestAuthorizer:
     ) -> str | None:
         """Bind the body and durably consume replay state before handling."""
 
+        result = self.finalize_result(request, body=body, now=now)
+        return result if isinstance(result, str) else None
+
+    def finalize_result(
+        self,
+        request: PreauthorizedValidatorRequest,
+        *,
+        body: bytes,
+        now: datetime | None = None,
+    ) -> str | ValidatorRefusal:
+        """``finalize``, answering why it refused instead of None.
+
+        It refuses exactly what ``finalize`` refuses; the reason only lets the
+        worker decide whether to bench the caller.
+        """
+
         try:
             return self._finalize(request, body=body, now=now)
+        except _FinalizeRefused as exc:
+            return exc.refusal
         except (ValidatorAccessError, TypeError, ValueError, OverflowError):
-            return None
+            return ValidatorRefusal.WORKER_ERROR
+
+    def is_replay(
+        self, request: PreauthorizedValidatorRequest, *, now: datetime | None = None
+    ) -> bool:
+        """Whether an accepted request already used this request's nonce.
+
+        A read-only early check the worker makes before it gives the request a
+        slot, so a replayed header cannot hold one. It consumes nothing and a
+        store error answers False: ``finalize`` still decides every request.
+        """
+
+        if not isinstance(request, PreauthorizedValidatorRequest):
+            return False
+        check_time = now or datetime.now(UTC)
+        return self.state.has_recorded_request(
+            request.validator_hotkey, request.nonce_hex, now=check_time
+        )
 
     def _preauthorize(
         self,
@@ -1665,23 +1796,39 @@ class ValidatorRequestAuthorizer:
             raise ValidatorAccessError("validator request body must be bytes")
         body_sha256 = "sha256:" + hashlib.sha256(body).hexdigest()
         if not hmac.compare_digest(request.body_sha256, body_sha256):
-            raise ValidatorAccessError("validator request body does not match")
+            raise _FinalizeRefused(
+                "validator request body does not match", ValidatorRefusal.BODY_MISMATCH
+            )
         check_time = now or datetime.now(UTC)
         if check_time.tzinfo is None or check_time.utcoffset() != timedelta(0):
             raise ValidatorAccessError("validator request verification time must be UTC")
         if not check_time < request.expires_at:
-            raise ValidatorAccessError("validator request has expired")
+            raise _FinalizeRefused("validator request has expired", ValidatorRefusal.EXPIRED)
         snapshot = self.snapshot_provider.load(now=check_time)
         if snapshot is None or not snapshot.qualifies(request.validator_hotkey, at=check_time):
-            raise ValidatorAccessError("validator is not qualified")
+            # A snapshot that is missing or no longer valid is the worker's
+            # fault; a current snapshot that drops the validator is not.
+            refusal = (
+                ValidatorRefusal.SNAPSHOT_UNAVAILABLE
+                if snapshot is None or not snapshot.generated_at <= check_time < snapshot.expires_at
+                else ValidatorRefusal.NOT_QUALIFIED
+            )
+            raise _FinalizeRefused("validator is not qualified", refusal)
 
-        if not self.state.check_and_record_request(
+        recorded = self.state.record_request(
             request.validator_hotkey,
             request.nonce_hex,
             now=check_time,
             expires_at=request.expires_at,
-        ):
-            raise ValidatorAccessError("validator request was replayed or replay state failed")
+        )
+        if recorded is not ReplayRecord.ACCEPTED:
+            raise _FinalizeRefused(
+                "validator request was replayed or replay state failed",
+                {
+                    ReplayRecord.REPLAYED: ValidatorRefusal.REPLAYED,
+                    ReplayRecord.EXPIRED: ValidatorRefusal.EXPIRED,
+                }.get(recorded, ValidatorRefusal.REPLAY_STATE_UNAVAILABLE),
+            )
         return request.validator_hotkey
 
 
