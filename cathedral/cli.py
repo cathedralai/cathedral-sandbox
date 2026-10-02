@@ -63,8 +63,6 @@ from cathedral.customer_receipt import (
     verify_customer_receipt,
 )
 from cathedral.enroll import (
-    DEFAULT_ENROLL_NETUID,
-    DEFAULT_ENROLL_NETWORK,
     MAX_BODY,
     JsonHotkeyRegistrationProvider,
     RegistryStore,
@@ -1497,6 +1495,15 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
     minimum_validator_stake_rao = getattr(args, "validator_minimum_stake_rao", None)
     public_endpoint = getattr(args, "public_endpoint", None)
     fleet_manifest_path = getattr(args, "fleet_manifest", None)
+    validator_network = getattr(args, "validator_network", None)
+    validator_netuid = getattr(args, "validator_netuid", None)
+    # The TEE box binds its central delegations to the subnet, so it takes
+    # the same explicit network and netuid as signed validator access, with
+    # no default. A box without signed validator access still needs both.
+    if tee_box is not None and (validator_network is None or validator_netuid is None):
+        raise ValueError(
+            "the TEE box sandbox API requires --validator-network and --validator-netuid"
+        )
     access_values = (
         access_snapshot_path,
         access_keys_path,
@@ -1504,6 +1511,8 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         access_state_path,
         minimum_validator_stake_rao,
         public_endpoint,
+        validator_network,
+        validator_netuid,
     )
     if tee == "snp" and (allow_public_bootstrap or allow_public_legacy_audit):
         raise ValueError(
@@ -1521,13 +1530,20 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             "a non-loopback AMD SEV-SNP worker requires signed validator access; "
             "bearer-only SNP service is development-only"
         )
-    access_enabled = any(value is not None for value in access_values) or (
-        fleet_manifest_path is not None or allow_public_bootstrap or allow_public_legacy_audit
+    signed_access_values = access_values[:-2]
+    # Network and netuid alone ask for signed validator access, unless the
+    # TEE box is the one that takes them.
+    subnet_given = validator_network is not None or validator_netuid is not None
+    access_enabled = any(value is not None for value in signed_access_values) or (
+        fleet_manifest_path is not None
+        or allow_public_bootstrap
+        or allow_public_legacy_audit
+        or (subnet_given and tee_box is None)
     )
     if access_enabled and any(value is None for value in access_values):
         raise ValueError(
             "signed validator access requires snapshot, pinned keys, durable state, "
-            "minimum stake, and public endpoint"
+            "minimum stake, public endpoint, network, and netuid"
         )
     if development_no_auth and access_enabled:
         raise ValueError("signed validator access cannot use development-no-auth")
@@ -1668,8 +1684,8 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         provider = SignedValidatorSnapshotProvider(
             access_snapshot_path,
             keys,
-            network=getattr(args, "validator_network", DEFAULT_ENROLL_NETWORK),
-            netuid=getattr(args, "validator_netuid", DEFAULT_ENROLL_NETUID),
+            network=validate_network(validator_network),
+            netuid=validate_netuid(validator_netuid),
             minimum_stake_rao=minimum_validator_stake_rao,
             state=access_state,
             max_age_seconds=getattr(
@@ -1764,8 +1780,8 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             tee=tee,
             hotkey=args.hotkey,
             channel_binding=channel_binding,
-            network=getattr(args, "validator_network", DEFAULT_ENROLL_NETWORK),
-            netuid=getattr(args, "validator_netuid", DEFAULT_ENROLL_NETUID),
+            network=validate_network(validator_network),
+            netuid=validate_netuid(validator_netuid),
             public_endpoint=public_endpoint,
         )
     with WorkerServer(
@@ -4062,10 +4078,8 @@ def cmd_enroll_reconcile(args: argparse.Namespace) -> int:
             raise ValueError(f"{flag} must be sha256 followed by 64 lowercase hex characters")
         return value
 
-    network = validate_network(
-        getattr(args, "network", DEFAULT_ENROLL_NETWORK)
-    )
-    netuid = validate_netuid(getattr(args, "netuid", DEFAULT_ENROLL_NETUID))
+    network = validate_network(getattr(args, "network", None))
+    netuid = validate_netuid(getattr(args, "netuid", None))
     approved: frozenset[str] | None
     artifact: dict[str, object]
     if allowlist_path:
@@ -4549,8 +4563,21 @@ def build_parser() -> argparse.ArgumentParser:
                 "central requests are refused while it is missing or unusable"
             ),
         )
-        command.add_argument("--validator-network", default=DEFAULT_ENROLL_NETWORK)
-        command.add_argument("--validator-netuid", type=int, default=DEFAULT_ENROLL_NETUID)
+        command.add_argument(
+            "--validator-network",
+            help=(
+                "chain network that signed validator access and the TEE box are bound to; "
+                "no default, required by either"
+            ),
+        )
+        command.add_argument(
+            "--validator-netuid",
+            type=int,
+            help=(
+                "netuid that signed validator access and the TEE box are bound to; "
+                "no default, required by either"
+            ),
+        )
         command.add_argument(
             "--public-endpoint",
             help="this worker's canonical public HTTPS axon origin",
@@ -4905,10 +4932,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_enroll_reconcile.add_argument(
-        "--network", default="finney", help="network the policy must be bound to"
+        "--network", required=True, help="network the policy must be bound to"
     )
     p_enroll_reconcile.add_argument(
-        "--netuid", type=int, default=94, help="netuid the policy must be bound to"
+        "--netuid", type=int, required=True, help="netuid the policy must be bound to"
     )
     p_enroll_reconcile.add_argument(
         "--allowlist-keys-digest",
@@ -4992,8 +5019,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_enroll_submit.add_argument("--wallet-name", required=True)
     p_enroll_submit.add_argument("--hotkey-name", required=True)
     p_enroll_submit.add_argument("--wallet-path", default=None)
-    p_enroll_submit.add_argument("--network", default=DEFAULT_ENROLL_NETWORK)
-    p_enroll_submit.add_argument("--netuid", type=int, default=DEFAULT_ENROLL_NETUID)
+    p_enroll_submit.add_argument("--network", required=True)
+    p_enroll_submit.add_argument("--netuid", type=int, required=True)
     p_enroll_submit.add_argument("--timeout-seconds", type=float, default=30.0)
     p_enroll_submit.add_argument(
         "--token-out",
@@ -5409,8 +5436,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="legacy public evidence-store base URL",
     )
     source.add_argument("--evidence-dir", help="local evidence store directory")
-    p_prov_verify.add_argument("--network", default="finney")
-    p_prov_verify.add_argument("--netuid", type=int, default=94)
+    p_prov_verify.add_argument("--network", required=True)
+    p_prov_verify.add_argument("--netuid", type=int, required=True)
     p_prov_verify.add_argument(
         "--registry-keys", required=True, help="trusted policy-registry key file (key_id -> base64)"
     )

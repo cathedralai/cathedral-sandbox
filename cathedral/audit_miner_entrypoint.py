@@ -1,11 +1,11 @@
-"""Fixed entrypoint for the signed-fleet SN94 audit-miner image.
+"""Fixed entrypoint for the signed-fleet audit-miner image.
 
-The container accepts three public deployment values: the miner hotkey, its
-canonical public axon endpoint, and the digest pin for the snapshot-signing
-public keys. Snapshot, key, fleet, replay-state, network, subnet, stake, and
-migration-policy paths and values are fixed by the image contract. The worker
-contains no wallet, chain RPC, signing seed, shared bearer, or selectable auth
-mode.
+The container accepts five public deployment values: the miner hotkey, its
+canonical public axon endpoint, the digest pin for the snapshot-signing public
+keys, and the chain network and netuid the miner serves. Snapshot, key, fleet,
+replay-state, stake, and migration-policy paths and values are fixed by the
+image contract. The worker contains no wallet, chain RPC, signing seed, shared
+bearer, or selectable auth mode.
 """
 
 from __future__ import annotations
@@ -30,11 +30,13 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.x509.oid import NameOID
 
-from cathedral.validator_access import validate_public_worker_endpoint
+from cathedral.validator_access import MAX_NETUID, validate_public_worker_endpoint
 
 HOTKEY_ENV = "CATHEDRAL_MINER_HOTKEY"
 PUBLIC_ENDPOINT_ENV = "CATHEDRAL_PUBLIC_ENDPOINT"
 VALIDATOR_ACCESS_KEYS_DIGEST_ENV = "CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST"
+NETWORK_ENV = "CATHEDRAL_NETWORK"
+NETUID_ENV = "CATHEDRAL_NETUID"
 # Named only so tests and callers can prove this former input stays refused.
 WORKER_BEARER_ENV = "CATHEDRAL_WORKER_BEARER_TOKEN"
 TSM_REPORT_ROOT_ENV = "CATHEDRAL_TDX_TSM_REPORT_ROOT"
@@ -50,13 +52,13 @@ TLS_CERTIFICATE = "worker.crt"
 TLS_PRIVATE_KEY = "worker.key"
 WORKER_HOST = "0.0.0.0"
 WORKER_PORT = 8081
-VALIDATOR_NETWORK = "finney"
-VALIDATOR_NETUID = 94
 VALIDATOR_MINIMUM_STAKE_RAO = 0
 
 _ALLOWED_CATHEDRAL_INPUTS = frozenset(
-    {HOTKEY_ENV, PUBLIC_ENDPOINT_ENV, VALIDATOR_ACCESS_KEYS_DIGEST_ENV}
+    {HOTKEY_ENV, PUBLIC_ENDPOINT_ENV, VALIDATOR_ACCESS_KEYS_DIGEST_ENV, NETWORK_ENV, NETUID_ENV}
 )
+_CANONICAL_NETUID = re.compile(r"0|[1-9][0-9]{0,4}")
+_NETWORK = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 _CHILD_PATH = "/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
 _SHA256_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -82,6 +84,8 @@ class DeploymentInputs:
     hotkey: str
     public_endpoint: str
     validator_access_keys_digest: str
+    network: str
+    netuid: int
 
 
 def _decode_base58(value: str) -> bytes:
@@ -115,8 +119,27 @@ def validate_public_hotkey(value: object) -> str:
     return value
 
 
+def validate_deployment_network(value: object) -> str:
+    """Accept the chain network name the operator deploys this miner on."""
+
+    if not isinstance(value, str) or _NETWORK.fullmatch(value) is None:
+        raise EntrypointError(f"{NETWORK_ENV} must be a bounded lowercase network name")
+    return value
+
+
+def validate_deployment_netuid(value: object) -> int:
+    """Accept one canonical decimal netuid; there is no compiled default."""
+
+    if not isinstance(value, str) or _CANONICAL_NETUID.fullmatch(value) is None:
+        raise EntrypointError(f"{NETUID_ENV} must be a canonical decimal netuid")
+    netuid = int(value)
+    if netuid > MAX_NETUID:
+        raise EntrypointError(f"{NETUID_ENV} is outside the subnet range")
+    return netuid
+
+
 def validate_environment(environ: Mapping[str, str]) -> DeploymentInputs:
-    """Read only the three public values admitted by the image contract."""
+    """Read only the five public values admitted by the image contract."""
 
     unknown = {
         name
@@ -125,8 +148,8 @@ def validate_environment(environ: Mapping[str, str]) -> DeploymentInputs:
     }
     if unknown:
         raise EntrypointError(
-            "only the miner hotkey, public endpoint, and validator-access "
-            "keys digest are accepted as CATHEDRAL_* environment inputs"
+            "only the miner hotkey, public endpoint, validator-access keys digest, "
+            "network, and netuid are accepted as CATHEDRAL_* environment inputs"
         )
     hotkey = validate_public_hotkey(environ.get(HOTKEY_ENV))
     try:
@@ -149,10 +172,14 @@ def validate_environment(environ: Mapping[str, str]) -> DeploymentInputs:
         raise EntrypointError(
             f"{VALIDATOR_ACCESS_KEYS_DIGEST_ENV} must be sha256 plus 64 lowercase hex characters"
         )
+    network = validate_deployment_network(environ.get(NETWORK_ENV))
+    netuid = validate_deployment_netuid(environ.get(NETUID_ENV))
     return DeploymentInputs(
         hotkey=hotkey,
         public_endpoint=public_endpoint,
         validator_access_keys_digest=keys_digest,
+        network=network,
+        netuid=netuid,
     )
 
 
@@ -273,9 +300,9 @@ def worker_command(inputs: DeploymentInputs, material: TLSMaterial) -> list[str]
         "--validator-minimum-stake-rao",
         str(VALIDATOR_MINIMUM_STAKE_RAO),
         "--validator-network",
-        VALIDATOR_NETWORK,
+        inputs.network,
         "--validator-netuid",
-        str(VALIDATOR_NETUID),
+        str(inputs.netuid),
         "--public-endpoint",
         inputs.public_endpoint,
         "--fleet-manifest",

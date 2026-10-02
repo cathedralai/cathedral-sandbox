@@ -27,6 +27,7 @@ from tests.test_cli import _tls_material
 from tests.test_tee_box_service import (
     BOOTED_AT,
     NETUID,
+    NETWORK,
     _FakeRtmr,
     OTHER_ROOT_SEED,
     ROOT_KEYS,
@@ -177,8 +178,13 @@ def _full_flags(tmp_path: Path) -> list[str]:
     ]
 
 
-def _args(tmp_path: Path, *extra: str, tls: bool = True, command: str = "serve"):
-    base = ["worker", command, "--hotkey", WORKER_HOTKEY, "--validator-netuid", str(NETUID)]
+def _args(
+    tmp_path: Path, *extra: str, tls: bool = True, command: str = "serve", subnet: bool = True
+):
+    # The box takes the subnet from the flags; neither has a default.
+    base = ["worker", command, "--hotkey", WORKER_HOTKEY]
+    if subnet:
+        base += ["--validator-network", NETWORK, "--validator-netuid", str(NETUID)]
     if tls:
         certificate, private_key = _tls_material(tmp_path)
         base += ["--tls-certificate", str(certificate), "--tls-private-key", str(private_key)]
@@ -235,7 +241,7 @@ def guest(monkeypatch, tmp_path: Path):
 
 
 def test_no_tee_box_flags_mean_no_sandbox_api(tmp_path: Path, guest, capsys):
-    assert cmd_worker_serve(_args(tmp_path)) == 0
+    assert cmd_worker_serve(_args(tmp_path, subnet=False)) == 0
     assert _FakeServer.calls[0]["tee_box_api"] is None
     assert guest.calls == []
     assert guest.disk.probed == []  # no TEE box, no storage rules
@@ -261,7 +267,7 @@ def test_the_full_flag_set_serves_the_sandbox_api(tmp_path: Path, guest, capsys)
     assert api.authorizer.worker_hotkey == WORKER_HOTKEY
     assert api.authorizer.channel_binding == _FakeServer.calls[0]["channel_binding"]
     assert api.authorizer.root_keys == ROOT_KEYS
-    assert (api.authorizer.network, api.authorizer.netuid) == ("finney", NETUID)
+    assert (api.authorizer.network, api.authorizer.netuid) == (NETWORK, NETUID)
     assert api.executor.network_modes == ("internet", "deny_all")
     assert api.executor.storage_quota is True
     assert [str(net) for net in api.egress.box_addresses] == ["34.120.1.2/32"]
@@ -280,6 +286,68 @@ def test_the_full_flag_set_serves_the_sandbox_api(tmp_path: Path, guest, capsys)
         "scratch": f"{guest.docker_root}: cathedral-scratch: dm-crypt capi:authenc integrity aead",
     }
     assert "crypt 253:3" in guest.disk.probed
+
+
+@pytest.mark.parametrize("missing", ["--validator-network", "--validator-netuid"])
+def test_the_box_has_no_default_network_or_netuid(tmp_path: Path, guest, missing):
+    flags = [*_full_flags(tmp_path), "--validator-network", NETWORK, "--validator-netuid", "7"]
+    with pytest.raises(
+        ValueError,
+        match=r"^the TEE box sandbox API requires --validator-network and --validator-netuid$",
+    ):
+        cmd_worker_serve(_args(tmp_path, *_without(flags, missing), subnet=False))
+    # Refused before any storage probe, guest command or listener.
+    assert _FakeServer.calls == [] and guest.calls == [] and guest.disk.probed == []
+
+
+def test_the_box_binds_the_network_and_netuid_it_is_given(tmp_path: Path, guest, capsys):
+    args = _args(
+        tmp_path,
+        *_full_flags(tmp_path),
+        "--validator-network",
+        "test",
+        "--validator-netuid",
+        "2",
+        subnet=False,
+    )
+    assert cmd_worker_serve(args) == 0
+    api = _FakeServer.calls[0]["tee_box_api"]
+    assert (api.authorizer.network, api.authorizer.netuid) == ("test", 2)
+    # The pair serves the box alone; it does not turn on signed validator access.
+    assert _FakeServer.calls[0]["validator_authorizer"] is None
+
+
+@pytest.mark.parametrize("network,netuid", [("Finney", "94"), ("finney", "-1")])
+def test_the_box_refuses_a_malformed_network_or_netuid(tmp_path: Path, guest, network, netuid):
+    args = _args(
+        tmp_path,
+        *_full_flags(tmp_path),
+        "--validator-network",
+        network,
+        "--validator-netuid",
+        netuid,
+        subnet=False,
+    )
+    with pytest.raises(ValueError, match="network must be|netuid must be"):
+        cmd_worker_serve(args)
+    assert _FakeServer.calls == []
+
+
+def test_a_network_and_netuid_without_the_box_still_ask_for_signed_access(
+    tmp_path: Path, guest
+):
+    with pytest.raises(ValueError, match="^signed validator access requires"):
+        cmd_worker_serve(_args(tmp_path))
+    assert _FakeServer.calls == [] and guest.calls == []
+
+
+def test_the_box_does_not_relax_a_partial_signed_access_set(tmp_path: Path, guest):
+    snapshot = str(tmp_path / "validator-access.json")
+    with pytest.raises(ValueError, match="^signed validator access requires"):
+        cmd_worker_serve(
+            _args(tmp_path, *_full_flags(tmp_path), "--validator-access-snapshot", snapshot)
+        )
+    assert _FakeServer.calls == [] and guest.calls == []
 
 
 def test_serve_snp_takes_the_same_flags(tmp_path: Path, guest):

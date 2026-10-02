@@ -190,12 +190,20 @@ sudo install -o root -g root -m 0755 \
   cathedral-runtime/scripts/run_sn94_signed_fleet_miner.sh \
   /usr/local/libexec/cathedral/run-sn94-miner
 printf '%s  %s\n' \
-  bad027acb1a46915723fc51ec2fa537bd632148b5715477223e2eddb6ab67c25 \
+  29b86abf29ff0acb50fffa7931ea980adf731f1225689918f2c1bad93fd599cc \
   /usr/local/libexec/cathedral/run-sn94-miner | sudo sha256sum --check
 ```
 
 Stop if the census does not report Intel TDX or the TSM report path is not
 readable and writable.
+
+The launcher digest above is the launcher in this repository revision. It
+requires runtime contract `signed-validator-fleet-v2` and refuses the `-v1`
+images pinned on this page before starting them. The two come from one release
+only after the `-v2` images built from this revision are published and pinned,
+replacing the current `-v1` pins; follow the
+[pin order](docs/SN94_AUDIT_MINER_IMAGE.md#pin-order-for-the-v2-runtime-contract)
+before relying on this pin.
 
 ### 2. Refresh validator access from a control host
 
@@ -468,8 +476,10 @@ export SN94_AUDIT_MINER_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sh
 export CATHEDRAL_MINER_HOTKEY='YOUR_PUBLIC_HOTKEY'
 export CATHEDRAL_PUBLIC_ENDPOINT='https://YOUR_PUBLIC_IPV4:8081'
 export CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST='PASTE_KEYS_DIGEST_VALUE'
+export CATHEDRAL_NETWORK='YOUR_NETWORK'
+export CATHEDRAL_NETUID='YOUR_NETUID'
 
-sudo --preserve-env=SN94_AUDIT_MINER_IMAGE,CATHEDRAL_MINER_HOTKEY,CATHEDRAL_PUBLIC_ENDPOINT,CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST \
+sudo --preserve-env=SN94_AUDIT_MINER_IMAGE,CATHEDRAL_MINER_HOTKEY,CATHEDRAL_PUBLIC_ENDPOINT,CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST,CATHEDRAL_NETWORK,CATHEDRAL_NETUID \
   /usr/local/libexec/cathedral/run-sn94-miner
 ```
 

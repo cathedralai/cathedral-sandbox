@@ -23,6 +23,8 @@ from __future__ import annotations
 import base64
 import io
 import json
+import random
+import functools
 import os
 import shutil
 import sqlite3
@@ -44,7 +46,7 @@ from cathedral.common import Attested, EvidenceKind, Policy, Tier, is_globally_r
 from cathedral.enroll import (
     IpRateLimiter,
     JsonHotkeyRegistrationProvider,
-    RegistryApp,
+    RegistryApp as _RegistryApp,
     RegistryStore,
     canonical_allowlist_enroll_payload,
     canonical_legacy_enroll_payload,
@@ -52,6 +54,7 @@ from cathedral.enroll import (
     validate_endpoint_url,
 )
 from cathedral.lifecycle import TERMINAL_STATES, WorkerLifecycleState
+
 from cathedral.prober import (
     _PreResolvedHTTPConnection,
     _PreResolvedHTTPSConnection,
@@ -59,6 +62,11 @@ from cathedral.prober import (
     _resolve_endpoint,
     probe_once,
 )
+
+# The subnet is deploy-time config with no default; draw one per run.
+NETWORK = "finney"
+NETUID = random.SystemRandom().randrange(1, 65_536)
+RegistryApp = functools.partial(_RegistryApp, network=NETWORK, netuid=NETUID)
 
 
 def _attested(chip_id: str, measurement: str = "measurement") -> Attested:
@@ -97,7 +105,9 @@ def _signed_payload(
 ) -> dict[str, object]:
     ts = timestamp if timestamp is not None else now_iso()
     message = (
-        canonical_allowlist_enroll_payload(hotkey, endpoint_url, nonce, ts)
+        canonical_allowlist_enroll_payload(
+            hotkey, endpoint_url, nonce, ts, network=NETWORK, netuid=NETUID
+        )
         if domain_bound
         else canonical_legacy_enroll_payload(hotkey, endpoint_url, nonce, ts)
     )
@@ -110,7 +120,7 @@ def _signed_payload(
         "signature_b64": sig,
     }
     if domain_bound:
-        payload.update(network="finney", netuid=94)
+        payload.update(network=NETWORK, netuid=NETUID)
     return payload
 
 

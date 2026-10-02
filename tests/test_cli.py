@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import random
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from cathedral.cli import (
     cmd_worker_serve,
     main,
 )
+
 from cathedral.lanes.sat import _compute_challenge_id
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
 from cathedral.gpu import (
@@ -45,6 +47,10 @@ from cathedral.attest import collect_snp, collect_snp_report_only
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.runtime import MinerOutcome, RuntimeConfig
 from cathedral.worker import WorkerServer
+
+# The subnet is deploy-time config with no default; draw one per run.
+NETWORK = "finney"
+NETUID = random.SystemRandom().randrange(1, 65_536)
 
 
 def test_compute_package_does_not_claim_subnet_validator_command():
@@ -1288,10 +1294,50 @@ def test_worker_signed_access_requires_native_tls():
             "1000",
             "--public-endpoint",
             "https://8.8.8.8:8081",
+            "--validator-network",
+            NETWORK,
+            "--validator-netuid",
+            str(NETUID),
         ]
     )
 
     with pytest.raises(ValueError, match="requires worker TLS"):
+        cmd_worker_serve(args)
+
+
+@pytest.mark.parametrize("missing", ["--validator-network", "--validator-netuid"])
+def test_worker_signed_access_has_no_default_network_or_netuid(missing):
+    argv = [
+        "worker",
+        "serve",
+        "--hotkey",
+        "miner",
+        "--channel-binding-type",
+        "tls_spki_sha256",
+        "--channel-binding-digest",
+        "ab" * 32,
+        "--validator-access-snapshot",
+        "/srv/cathedral/validator-access.json",
+        "--validator-access-keys",
+        "/srv/cathedral/keys.json",
+        "--validator-access-keys-digest",
+        "sha256:" + "cd" * 32,
+        "--validator-access-state",
+        "/var/lib/cathedral/validator-access.sqlite",
+        "--validator-minimum-stake-rao",
+        "1000",
+        "--public-endpoint",
+        "https://8.8.8.8:8081",
+        "--validator-network",
+        NETWORK,
+        "--validator-netuid",
+        str(NETUID),
+    ]
+    index = argv.index(missing)
+    del argv[index : index + 2]
+    args = build_parser().parse_args(argv)
+
+    with pytest.raises(ValueError, match="network, and netuid"):
         cmd_worker_serve(args)
 
 
@@ -1364,6 +1410,10 @@ def test_worker_signed_access_starts_without_bearer_and_wires_legacy_bridge(
             "1000",
             "--public-endpoint",
             "https://8.8.8.8:8081",
+            "--validator-network",
+            NETWORK,
+            "--validator-netuid",
+            str(NETUID),
             "--migration-mode",
             "public-legacy-audit",
         ]
@@ -1577,6 +1627,10 @@ def test_worker_serve_snp_selects_snp_collector_with_signed_access(
             "1000",
             "--public-endpoint",
             "https://8.8.8.8:8081",
+            "--validator-network",
+            NETWORK,
+            "--validator-netuid",
+            str(NETUID),
         ]
     )
 
