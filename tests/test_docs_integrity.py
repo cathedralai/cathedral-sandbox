@@ -32,7 +32,14 @@ def test_readme_is_the_single_current_mining_guide() -> None:
         "each distinct verified machine",
         "Intel TDX",
         "AMD SEV-SNP",
-        "Validator path merged, live hardware policy pending",
+        # Updated 2026-09-09. UID30 admitted its first live AMD machine on
+        # 2026-09-08, so the previous "live hardware policy pending" wording
+        # became false. This guard is what kept it in place, so it moves with
+        # the claim rather than pinning a stale one. Updated 2026-09-28: that
+        # admission was on SN39, and SN94 has not been verified yet. The block
+        # is observed on chain and not recorded in-repo, so it stays marked.
+        "One admission observed on SN39 at block 9025398 (observed on chain; unverified in-repo)",
+        "SN94 status pending verification",
         "e7f8b1b2d8ffb3f7a3a2f006e39d036c7631ae0fb01e7e30d56f483f25dd8503",
         "d477a68dffe1213ef31c86248dbc12bd1c10508cf3cf0d591694cff1ce16eda0",
         "current migration bridge",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -302,23 +303,38 @@ def test_the_sandbox_command_prints_the_answer():
 # -- receipts ---------------------------------------------------------------------
 
 DIGEST = bytes([3]) * 32
+TEE_HARDWARE_ID = "aa" * 32
+TDX_EVIDENCE = {
+    "evidence_kind": "tdx",
+    "evidence_sha256": "e1" * 32,
+    "measurement": "tdx-measurement-sha256:" + "4d" * 32,
+    "verifier_digest": "sha256:" + "7e" * 32,
+    "tls_spki_sha256": "5b" * 32,
+    "attestation_nonce": "a7" * 32,
+    "attested_at": "2026-09-28T11:00:00Z",  # an hour before the receipt (NOW)
+}
+SNP_EVIDENCE = {**TDX_EVIDENCE, "evidence_kind": "sev_snp", "measurement": "6c" * 48}
+EVIDENCE_FOR = {"tdx": TDX_EVIDENCE, "sev_snp": SNP_EVIDENCE, None: None}
 
 
 def _body(**changes):
+    """A TDX box by default (TEE boxes first); kind="bare_metal" gives a bare-metal one."""
     vcpus = changes.pop("vcpus", 6)
     memory_gib = changes.pop("memory_gib", 24)
     spec = changes.pop("challenge", None) or ch.spec_for(SEED, vcpus=vcpus, memory_gib=memory_gib)
     sample_count = changes.pop("sample_count", ch.required_samples(spec.lanes))
     lanes = ch.sample_lanes(spec, DIGEST, NONCE_A, sample_count)
+    kind = changes.pop("kind", "tee")
+    tee_kind = changes.pop("tee_kind", "tdx" if kind == "tee" else None)
     fields = dict(
         netuid=NETUID,
         round=7,
         validator_nonce=VALIDATOR_NONCE,
         box_id="box-1",
         miner_hotkey=HOTKEY,
-        kind="bare_metal",
-        tee_kind=None,
-        hardware_id=FINGERPRINT,
+        kind=kind,
+        tee_kind=tee_kind,
+        hardware_id=TEE_HARDWARE_ID if kind == "tee" else FINGERPRINT,
         vcpus=vcpus,
         memory_gib=memory_gib,
         challenge=spec,
@@ -331,6 +347,7 @@ def _body(**changes):
         issued_at=NOW,
         valid_for=timedelta(minutes=30),
         prober_key_id="sn94-prober-1",
+        evidence=EVIDENCE_FOR.get(tee_kind),
     )
     fields.update(changes)
     return receipt.make_body(**fields)
@@ -359,10 +376,11 @@ def test_a_signed_receipt_verifies_on_any_netuid(prober):
     verified = _verify(receipt.sign_receipt(_body(), key), keys)
     assert (verified.box_id, verified.vcpus, verified.memory_gib) == ("box-1", 6, 24)
     assert (verified.kind, verified.tee_kind, verified.hardware_id_kind) == (
-        "bare_metal",
-        None,
-        "probe_fingerprint",
+        "tee",
+        "tdx",
+        "tdx_platform",
     )
+    assert verified.evidence == receipt.ReceiptEvidence(**TDX_EVIDENCE)
     assert verified.sample_count == ch.required_samples(6) == 4
     assert sorted(verified.sampled_outputs) == ch.sample_lanes(
         verified.challenge, DIGEST, NONCE_A, verified.sample_count
@@ -588,8 +606,15 @@ def test_extreme_dates_do_not_overflow(prober):
     with pytest.raises(receipt.ReceiptError, match="not currently valid"):
         _verify(signed, keys)
     body["issued_at"], body["expires_at"] = "0001-01-01T00:00:00Z", "0001-01-01T00:30:00Z"
+    body["evidence"]["attested_at"] = "0001-01-01T00:00:00Z"
     with pytest.raises(receipt.ReceiptError, match="not currently valid"):
         _verify(receipt.sign_receipt(body, key), keys)
+    # The evidence age bound, from the earliest attested_at to a late now.
+    signed = receipt.sign_receipt({**body, "expires_at": "0001-01-01T02:00:00Z"}, key)
+    late = datetime(1, 1, 1, 1, tzinfo=timezone.utc)
+    assert _verify(signed, keys, now=late, max_evidence_age=timedelta(hours=1)).kind == "tee"
+    with pytest.raises(receipt.ReceiptError, match="older than max_evidence_age"):
+        _verify(signed, keys, now=late, max_evidence_age=timedelta(minutes=59))
 
 
 def test_a_naive_now_is_refused(prober):
@@ -625,8 +650,9 @@ def test_the_prober_never_signs_twice(prober):
         (("timings_ms", "delete"), 1.5, "timings_ms.delete"),
         (("timings_ms", "exec"), -1, "timings_ms.exec"),
         (("timings_ms", "exec"), True, "timings_ms.exec"),
-        (("box", "tee_kind"), "tdx", "tee_kind"),
+        (("box", "tee_kind"), None, "tee_kind"),
         (("box", "tee_kind"), ["tdx"], "tee_kind"),
+        (("box", "kind"), "bare_metal", "tee_kind"),
         (("box", "hardware_id_kind"), "chip_id", "hardware_id_kind"),
     ],
 )
@@ -644,9 +670,9 @@ def test_each_field_check_refuses_its_bad_input(prober, path, value, message):
 @pytest.mark.parametrize(
     "changes",
     [
-        {"kind": "tee"},  # a tee box names its tee kind
-        {"kind": "tee", "tee_kind": "sgx"},
-        {"tee_kind": "tdx"},  # and bare metal has none
+        {"tee_kind": None},  # a tee box names its tee kind
+        {"tee_kind": "sgx"},
+        {"kind": "bare_metal", "tee_kind": "tdx"},  # and bare metal has none
         {"hardware_id": "short"},
         {"miner_hotkey": "not-an-address"},
         {"box_id": "bad box id"},
@@ -668,8 +694,9 @@ def test_the_prober_never_signs_a_malformed_body(prober, changes):
 )
 def test_a_tee_receipt_carries_its_one_hardware_identity(prober, tee_kind, hardware_id_kind):
     key, keys = prober
-    signed = receipt.sign_receipt(_body(kind="tee", tee_kind=tee_kind, hardware_id="aa" * 32), key)
+    signed = receipt.sign_receipt(_body(tee_kind=tee_kind), key)
     verified = _verify(signed, keys)
+    assert verified.evidence == receipt.ReceiptEvidence(**EVIDENCE_FOR[tee_kind])
     assert (verified.tee_kind, verified.hardware_id, verified.hardware_id_kind) == (
         tee_kind,
         "aa" * 32,
@@ -677,9 +704,216 @@ def test_a_tee_receipt_carries_its_one_hardware_identity(prober, tee_kind, hardw
     )
     # The other TEE's id kind is refused: one machine, one hardware id.
     other = "chip_id" if hardware_id_kind == "tdx_platform" else "tdx_platform"
-    body = _body(kind="tee", tee_kind=tee_kind, hardware_id="aa" * 32)
+    body = _body(tee_kind=tee_kind)
     body["box"]["hardware_id_kind"] = other
     with pytest.raises(receipt.ReceiptError, match="hardware_id_kind"):
+        receipt.sign_receipt(body, key)
+
+
+def test_evidence_is_required_for_a_tee_box_and_null_for_bare_metal(prober):
+    key, keys = prober
+    for tee_kind in ("tdx", "sev_snp"):
+        with pytest.raises(receipt.ReceiptError, match="evidence must have exactly"):
+            receipt.sign_receipt(_body(tee_kind=tee_kind, evidence=None), key)
+    body = _body(kind="bare_metal")
+    assert body["evidence"] is None and '"evidence":null' in receipt.canonical_bytes(body).decode()
+    verified = _verify(receipt.sign_receipt(body, key, allow_bare_metal=True), keys)
+    assert (verified.kind, verified.evidence) == ("bare_metal", None)
+    with pytest.raises(receipt.ReceiptError, match="carries no evidence"):
+        receipt.sign_receipt(_body(kind="bare_metal", evidence=TDX_EVIDENCE), key)
+    # The prober states the evidence, even when it is None: there is no default.
+    parameter = inspect.signature(receipt.make_body).parameters["evidence"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
+
+
+@pytest.mark.parametrize("tee_kind, other", [("tdx", "sev_snp"), ("sev_snp", "tdx")])
+def test_evidence_kind_must_be_the_boxs_tee_kind(prober, tee_kind, other):
+    key, _keys = prober
+    # The other TEE's whole evidence, and just its kind, are both refused.
+    for evidence in (EVIDENCE_FOR[other], {**EVIDENCE_FOR[tee_kind], "evidence_kind": other}):
+        with pytest.raises(receipt.ReceiptError, match="evidence_kind must equal"):
+            receipt.sign_receipt(_body(tee_kind=tee_kind, evidence=evidence), key)
+
+
+GOOD_HEX = "0123456789abcdef" * 4
+BAD_HEX64 = ["ab" * 31, "ab" * 33, "AB" * 32, "g" + "a" * 63, "sha256:" + "ab" * 32, "", 7, None]
+
+
+@pytest.mark.parametrize(
+    "tee_kind, field, value, ok",
+    [
+        *[(t, "evidence_sha256", GOOD_HEX, True) for t in ("tdx", "sev_snp")],
+        *[("tdx", "evidence_sha256", bad, False) for bad in BAD_HEX64],
+        *[(t, "tls_spki_sha256", GOOD_HEX, True) for t in ("tdx", "sev_snp")],
+        *[("sev_snp", "tls_spki_sha256", bad, False) for bad in BAD_HEX64],
+        ("tdx", "verifier_digest", "sha256:" + GOOD_HEX, True),
+        ("tdx", "verifier_digest", GOOD_HEX, False),  # one form: the prefix is required
+        ("tdx", "verifier_digest", "SHA256:" + GOOD_HEX, False),
+        ("tdx", "verifier_digest", "sha384:" + GOOD_HEX, False),
+        ("sev_snp", "verifier_digest", "sha256:" + GOOD_HEX[:-1], False),
+        ("sev_snp", "verifier_digest", "sha256:" + GOOD_HEX.upper(), False),
+        ("tdx", "measurement", "tdx-measurement-sha256:" + GOOD_HEX, True),
+        ("tdx", "measurement", GOOD_HEX, False),
+        ("tdx", "measurement", "tdx-measurement-sha256:" + GOOD_HEX + "00", False),
+        ("tdx", "measurement", "tdx-measurement-sha256:" + GOOD_HEX.upper(), False),
+        ("tdx", "measurement", "tdx-measurement-sha256:" + "00" * 32, False),
+        ("tdx", "measurement", "ab" * 48, False),  # an SNP measurement on a TDX box
+        ("sev_snp", "measurement", "ab" * 48, True),
+        ("sev_snp", "measurement", "00" * 48, False),  # as cathedral/verify/snp.py refuses
+        ("sev_snp", "measurement", "ab" * 47, False),
+        ("sev_snp", "measurement", "ab" * 49, False),
+        ("sev_snp", "measurement", "AB" * 48, False),
+        ("sev_snp", "measurement", "tdx-measurement-sha256:" + GOOD_HEX, False),
+        *[(t, "attestation_nonce", GOOD_HEX, True) for t in ("tdx", "sev_snp")],
+        *[("tdx", "attestation_nonce", bad, False) for bad in BAD_HEX64],
+        ("sev_snp", "attestation_nonce", "00" * 32, False),  # as admission refuses
+        ("tdx", "attested_at", "2026-09-28T12:00:00Z", True),  # the same second as issued_at
+        ("sev_snp", "attested_at", "2025-01-01T00:00:00Z", True),
+        ("tdx", "attested_at", "2026-09-28T12:00:01Z", False),  # after the receipt was issued
+        ("tdx", "attested_at", "2026-02-30T00:00:00Z", False),
+        ("tdx", "attested_at", "2026-09-28 11:00:00Z", False),
+        ("tdx", "attested_at", "2026-09-28T11:00:00+00:00", False),
+        ("sev_snp", "attested_at", 1790000000, False),
+        ("sev_snp", "attested_at", None, False),
+    ],
+)
+def test_each_evidence_field_has_one_format(prober, tee_kind, field, value, ok):
+    key, keys = prober
+    body = _body(tee_kind=tee_kind, evidence={**EVIDENCE_FOR[tee_kind], field: value})
+    if ok:
+        assert getattr(_verify(receipt.sign_receipt(body, key), keys).evidence, field) == value
+        return
+    with pytest.raises(receipt.ReceiptError, match=field):
+        receipt.sign_receipt(body, key)
+    with pytest.raises(receipt.ReceiptError, match=field):  # before the signature is looked at
+        _verify({**body, "signature": "AAAA"}, keys)
+
+
+FUZZ = [None, True, 0, 1.5, [], ["tdx"], "tdx", "x" * 100_000, "\ud800", b"tdx", {}]
+
+
+@pytest.mark.parametrize("value", FUZZ, ids=repr)
+def test_malformed_evidence_is_always_a_receipt_error(prober, value):
+    key, keys = prober
+    # as the whole object, as each field, and as an extra or renamed key
+    bodies = [_body(evidence=value)]
+    for field in (name for name in TDX_EVIDENCE if TDX_EVIDENCE[name] != value):
+        bodies.append(_body(evidence={**TDX_EVIDENCE, field: value}))
+    bodies.append(_body(evidence={**TDX_EVIDENCE, "extra": value}))
+    missing = dict(TDX_EVIDENCE)
+    del missing["measurement"]
+    bodies.append(_body(evidence=missing))
+    if isinstance(value, str):
+        bodies.append(_body(evidence={**missing, value: TDX_EVIDENCE["measurement"]}))
+    for body in bodies:
+        with pytest.raises(receipt.ReceiptError):
+            receipt.sign_receipt(body, key)
+        with pytest.raises(receipt.ReceiptError):
+            _verify({**body, "signature": "AAAA"}, keys)
+    bare = _body(kind="bare_metal", evidence=value)
+    if value is not None:
+        with pytest.raises(receipt.ReceiptError, match="carries no evidence"):
+            receipt.sign_receipt(bare, key, allow_bare_metal=True)
+
+
+def test_the_prober_signs_bare_metal_only_when_allowed(prober):
+    key, keys = prober
+    body = _body(kind="bare_metal")
+    for refused in (
+        {},
+        {"allow_bare_metal": False},
+        {"allow_bare_metal": 1},
+        {"allow_bare_metal": "yes"},
+    ):
+        with pytest.raises(receipt.ReceiptError, match="refusing to sign a bare-metal receipt"):
+            receipt.sign_receipt(body, key, **refused)
+    signed = receipt.sign_receipt(body, key, allow_bare_metal=True)
+    # A correctly signed bare-metal receipt verifies: admission is the validator's own policy.
+    assert _verify(signed, keys).hardware_id_kind == "probe_fingerprint"
+    # The flag changes nothing for a TEE box.
+    assert _verify(receipt.sign_receipt(_body(), key), keys).kind == "tee"
+    with pytest.raises(TypeError):  # keyword-only
+        receipt.sign_receipt(body, key, True)
+    for junk in (None, [], "body"):
+        with pytest.raises(receipt.ReceiptError, match="body must be an object"):
+            receipt.sign_receipt(junk, key)
+
+
+@pytest.mark.parametrize("field", sorted(TDX_EVIDENCE.keys() - {"evidence_kind"}))
+def test_a_tampered_evidence_field_fails_the_signature(prober, field):
+    key, keys = prober
+    signed = json.loads(json.dumps(receipt.sign_receipt(_body(), key)))
+    value = signed["evidence"][field]
+    if field == "attested_at":  # one second earlier: still well formed
+        signed["evidence"][field] = value[:-2] + ("0" if value[-2] != "0" else "1") + "Z"
+    else:
+        signed["evidence"][field] = value[:-1] + ("0" if value[-1] != "0" else "1")
+    with pytest.raises(receipt.ReceiptError, match="does not verify"):
+        _verify(signed, keys)
+
+
+def test_verify_receipt_can_bound_the_evidence_age(prober):
+    # The evidence (an hour old at NOW) is reused across rounds; a validator
+    # bounds its age with max_evidence_age, measured from now.
+    key, keys = prober
+    signed = receipt.sign_receipt(_body(), key)
+    now = NOW + timedelta(minutes=1)  # the evidence is 61 minutes old
+    assert _verify(signed, keys).evidence.attested_at == "2026-09-28T11:00:00Z"  # no limit
+    assert _verify(signed, keys, max_evidence_age=timedelta(minutes=61)).kind == "tee"
+    with pytest.raises(receipt.ReceiptError, match="older than max_evidence_age"):
+        _verify(signed, keys, max_evidence_age=timedelta(minutes=61) - timedelta(seconds=1))
+    assert now - datetime(2026, 9, 28, 11, tzinfo=timezone.utc) == timedelta(minutes=61)
+    for bad in (timedelta(0), timedelta(seconds=-1), 3600, "1h", True):
+        with pytest.raises(receipt.ReceiptError, match="must be a positive timedelta"):
+            _verify(signed, keys, max_evidence_age=bad)
+    # Bare metal has no evidence, so the bound does not apply to it.
+    bare = receipt.sign_receipt(_body(kind="bare_metal"), key, allow_bare_metal=True)
+    assert _verify(bare, keys, max_evidence_age=timedelta(seconds=1)).evidence is None
+
+
+def test_the_evidence_report_data_is_auditable_from_the_receipt(prober):
+    # REPORT_DATA is report_data_v2(nonce, hotkey, tls_spki_sha256): with the
+    # nonce in the receipt, an auditor holding the archived quote can check
+    # that it was made for this hotkey, this TLS key and the prober's nonce.
+    from cathedral.common import ChannelBinding, ChannelBindingType, report_data_v2
+
+    key, keys = prober
+    verified = _verify(receipt.sign_receipt(_body(), key), keys)
+    expected = report_data_v2(
+        bytes.fromhex("a7" * 32),
+        HOTKEY,
+        ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, bytes.fromhex("5b" * 32)),
+    )
+    assert receipt.expected_report_data(verified) == expected
+    assert len(expected) == 64
+    # Another nonce or another TLS key gives other REPORT_DATA, so a quote made
+    # for either does not audit against this receipt.
+    for change in ({"attestation_nonce": "a8" * 32}, {"tls_spki_sha256": "5c" * 32}):
+        other = _verify(receipt.sign_receipt(_body(evidence={**TDX_EVIDENCE, **change}), key), keys)
+        assert receipt.expected_report_data(other) != expected
+    other_hotkey = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+    other = _verify(receipt.sign_receipt(_body(miner_hotkey=other_hotkey), key), keys)
+    assert receipt.expected_report_data(other) != expected
+    bare = _verify(receipt.sign_receipt(_body(kind="bare_metal"), key, allow_bare_metal=True), keys)
+    for junk in (bare, None, TDX_EVIDENCE):
+        with pytest.raises(receipt.ReceiptError, match="only a verified TEE receipt"):
+            receipt.expected_report_data(junk)
+
+
+def test_a_v1_receipt_is_refused(prober):
+    key, keys = prober
+    assert receipt.SCHEMA == "cathedral_capacity_receipt_v2"
+    # A v1 body (no evidence), correctly signed by a pinned key, is still refused.
+    v1 = {k: v for k, v in _body(kind="bare_metal").items() if k != "evidence"}
+    v1["schema"] = "cathedral_capacity_receipt_v1"
+    signed = {**v1, "signature": base64.b64encode(key.sign(receipt.canonical_bytes(v1))).decode()}
+    with pytest.raises(receipt.ReceiptError, match="wrong fields or schema"):
+        _verify(signed, keys)
+    # And so is the v1 schema name on a v2 body.
+    body = _body()
+    body["schema"] = "cathedral_capacity_receipt_v1"
+    with pytest.raises(receipt.ReceiptError, match="wrong fields or schema"):
         receipt.sign_receipt(body, key)
 
 

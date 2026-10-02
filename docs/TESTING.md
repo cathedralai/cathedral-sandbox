@@ -53,6 +53,10 @@ fresh runs as the onboarding preflight.
 
 ## Intel TDX hardware tests
 
+For the current evidence path, run the
+[live Intel TDX check](LIVE_TDX_CHECK.md) on the TDX guest. The two tests
+below drive the retained verifier adapter.
+
 Run inside an Intel TDX guest:
 
 ```bash

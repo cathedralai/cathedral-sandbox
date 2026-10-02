@@ -3,20 +3,43 @@
 A miner turns a server into a Cathedral runtime box with the runtime's
 ``install-runtime-host.sh --direct-ip``, which writes ``host-values.env`` (its
 front door, certificate pin, measured capacity and templates) and the box's
-runtime API key. This module turns those into one registration document:
+keys. With ``--probe-template NAME`` it also makes a probe key and records the
+template it is scoped to. This module turns those into one registration
+document:
 
 - signed with the miner's hotkey (sr25519), so the box is tied to the hotkey
   that will be paid for it;
-- carrying the box's runtime API key sealed to the prober's X25519 key, so only
-  the prober can open it. The sealing binds the digest of the rest of the
-  registration, and the signature covers the sealed key, so a key cannot be
-  lifted onto another registration.
+- naming the probe template and carrying the box's probe key sealed to the
+  prober's X25519 key, so only the prober can open it. The sealing binds the
+  digest of the rest of the registration, and the signature covers the sealed
+  key, so a key cannot be lifted onto another registration.
 
-The key is the runtime's team key for the box: the runtime has no narrower key
-yet. Through the box's front door it reaches only the routes the ingress
-allowlists (create, look up, time out and delete sandboxes, snapshots, template
-builds), but it controls every sandbox on the box, so a miner should run no
-other tenant's sandboxes on a registered box.
+The probe key is not the team key. The box's front door lets it create only
+short, offline sandboxes from the probe template, look up and delete its own,
+and hold at most 8 at once; it cannot see or touch any other sandbox. The team
+key never leaves the box's operator. Runtime team keys carry the ``e2b_``
+prefix (the runtime's ``packages/auth/pkg/auth/consts.go``, ``PrefixAPIKey``)
+and a probe key is exactly 64 hex characters, so the format check at seal and
+at open tells the two apart.
+
+A leaked probe key lets its holder register the box under another hotkey,
+which the first-claim rule below refuses while the owner's claim holds, and
+keep the 8-sandbox cap full so the prober's challenge cannot start. The
+runbook gives the rotation: delete the key on the box, rerun the installer
+with ``--probe-template``, register again. Rotating ends every claim made with
+the old key, the owner's too until the new registration passes a probe; while
+a squatter's claim holds, the owner's new registration is refused as another
+hotkey's until the prober sees the squatter's probe fail, so the owner retries
+after the next probe round.
+
+Capacity. The prober's challenge runs in one probe sandbox, so the prober
+probes, and pays, the box at the probe template's shape
+(``VerifiedRegistration.probe_capacity``) and never more. ``capacity`` is the
+host as the installer measured it; it bounds the templates, and host vCPUs or
+memory outside the probe template earn nothing. A miner makes the probe
+template its largest shape, ideally the whole box. docs/CAPACITY.md (#217)
+sizes the challenge from claimed vCPUs and memory, so the prober must size it
+with ``spec_for`` from ``probe_capacity``, never from ``capacity``.
 
 The prober verifies the registration, probes the box through its front door,
 and only then admits it (docs/MINER_BOX_RUNBOOK.md).
@@ -103,14 +126,18 @@ from cathedral.validator_access import (
     load_sr25519_verifier,
 )
 
-SCHEMA = "cathedral_box_registration_v1"
+# v2: the sealed key is the box's scoped probe key (`sealed_probe_key`) and the
+# body names the probe template (`probe_template_id`). v1 sealed the runtime
+# team key; it is refused, so no v1 document is ever read with this field set.
+SCHEMA = "cathedral_box_registration_v2"
 SEAL_ALGORITHM = "x25519-hkdf-sha256-chacha20poly1305"
-SEAL_INFO = b"cathedral.box-registration.runtime-key.v1"
+SEAL_INFO = b"cathedral.box-registration.probe-key.v1"
 ISSUED_AT_SKEW = timedelta(minutes=5)
 BOX_KINDS = ("tee", "bare_metal")
 MAX_VALIDITY = timedelta(days=7)
 MAX_HOST_VALUES_BYTES = 64 * 1024
-MAX_RUNTIME_KEY_BYTES = 1024
+# The installer's probe key is 64 hex characters and a newline.
+MAX_PROBE_KEY_FILE_BYTES = 128
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 _TEMPLATE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
@@ -132,7 +159,8 @@ _BODY_KEYS = frozenset(
         "runtime_revision",
         "issued_at",
         "expires_at",
-        "sealed_runtime_key",
+        "probe_template_id",
+        "sealed_probe_key",
     }
 )
 
@@ -157,7 +185,9 @@ class VerifiedRegistration:
     runtime_revision: str
     issued_at: datetime
     expires_at: datetime
-    sealed_runtime_key: Mapping[str, str]
+    probe_template_id: str
+    probe_capacity: Mapping[str, int]  # the probe template's cpu and memory_gib
+    sealed_probe_key: Mapping[str, str]
     digest: bytes
 
 
@@ -314,13 +344,17 @@ def build_body(
     now: datetime,
     valid_for: timedelta = timedelta(days=1),
 ) -> dict[str, Any]:
-    """The registration body from host values, without its sealed key."""
+    """The registration body from host values, without its sealed probe key."""
 
     def need(key: str) -> str:
         if key not in host_values or not host_values[key]:
             raise RegistrationError(f"host values lack {key}")
         return host_values[key]
 
+    if not host_values.get("CATHEDRAL_PROBE_TEMPLATE_ID"):
+        raise RegistrationError(
+            "host values lack CATHEDRAL_PROBE_TEMPLATE_ID: rerun the installer with --probe-template"
+        )
     cert = need("CATHEDRAL_TLS_CERT_SHA256")
     if _HEX64.fullmatch(cert) is None:
         raise RegistrationError("CATHEDRAL_TLS_CERT_SHA256 must be 64 lowercase hex characters")
@@ -343,6 +377,7 @@ def build_body(
         },
         "templates": _templates(need("CATHEDRAL_TEMPLATES_JSON")),
         "runtime_revision": need("CATHEDRAL_RUNTIME_GIT_REVISION"),
+        "probe_template_id": host_values["CATHEDRAL_PROBE_TEMPLATE_ID"],
         "issued_at": _iso(now),
         "expires_at": _iso(now + valid_for),
     }
@@ -351,7 +386,7 @@ def build_body(
 
 
 def _unsealed_digest(body: Mapping[str, Any]) -> bytes:
-    unsealed = {key: value for key, value in body.items() if key != "sealed_runtime_key"}
+    unsealed = {key: value for key, value in body.items() if key != "sealed_probe_key"}
     return hashlib.sha256(b"cathedral.box-registration.v1\x00" + canonical_bytes(unsealed)).digest()
 
 
@@ -366,13 +401,17 @@ def _seal_key(shared: bytes, aad: bytes, ephemeral: bytes, recipient: bytes) -> 
     ).derive(shared)
 
 
-def seal_runtime_key(
-    runtime_key: bytes, prober_public_key: X25519PublicKey, body: Mapping[str, Any]
+def seal_probe_key(
+    probe_key: bytes, prober_public_key: X25519PublicKey, body: Mapping[str, Any]
 ) -> dict[str, str]:
-    """Seal the box's runtime API key to the prober, bound to this registration."""
+    """Seal the box's probe key to the prober, bound to this registration."""
 
-    if not isinstance(runtime_key, bytes) or not 1 <= len(runtime_key) <= MAX_RUNTIME_KEY_BYTES:
-        raise RegistrationError("runtime key must be 1 to 1024 bytes")
+    # Exactly what the installer writes. A team key starts with "e2b_", so one
+    # passed by mistake is refused.
+    if not isinstance(probe_key, bytes) or _HEX64.fullmatch(probe_key.decode("latin-1")) is None:
+        raise RegistrationError(
+            "probe key must be the installer's cathedral-runtime-LABEL.probe-key (64 hex characters)"
+        )
     ephemeral = X25519PrivateKey.generate()
     aad = _unsealed_digest(body)
     raw_public = _raw(ephemeral.public_key())
@@ -383,21 +422,21 @@ def seal_runtime_key(
         "ephemeral_public_b64": base64.b64encode(raw_public).decode(),
         "nonce_b64": base64.b64encode(nonce).decode(),
         "ciphertext_b64": base64.b64encode(
-            ChaCha20Poly1305(key).encrypt(nonce, runtime_key, aad)
+            ChaCha20Poly1305(key).encrypt(nonce, probe_key, aad)
         ).decode(),
     }
 
 
-def open_runtime_key(
+def open_probe_key(
     registration: VerifiedRegistration, prober_private_key: X25519PrivateKey
 ) -> bytes:
-    """The prober's side: recover the runtime key from a registration it has
+    """The prober's side: recover the probe key from a registration it has
     verified, or raise when the key was sealed to someone else or lifted from
     another registration."""
 
     if not isinstance(registration, VerifiedRegistration):
         raise RegistrationError("verify the registration before opening its key")
-    sealed, aad = registration.sealed_runtime_key, registration.digest
+    sealed, aad = registration.sealed_probe_key, registration.digest
     try:
         raw_ephemeral = base64.b64decode(sealed["ephemeral_public_b64"], validate=True)
         ephemeral = X25519PublicKey.from_public_bytes(raw_ephemeral)
@@ -409,9 +448,14 @@ def open_runtime_key(
             raw_ephemeral,
             _raw(prober_private_key.public_key()),
         )
-        return ChaCha20Poly1305(key).decrypt(nonce, ciphertext, aad)
+        opened = ChaCha20Poly1305(key).decrypt(nonce, ciphertext, aad)
     except (InvalidTag, KeyError, TypeError, ValueError, binascii.Error) as exc:
-        raise RegistrationError("the sealed runtime key does not open for this prober") from exc
+        raise RegistrationError("the sealed probe key does not open for this prober") from exc
+    # A registration built without this module could seal the team key
+    # instead; a team key starts with "e2b_", so it is never 64 hex.
+    if _HEX64.fullmatch(opened.decode("latin-1")) is None:
+        raise RegistrationError("the sealed key is not a probe key")
+    return opened
 
 
 def sign_registration(body: Mapping[str, Any], signer: Callable[[bytes], bytes]) -> dict[str, Any]:
@@ -466,7 +510,7 @@ def verify_registration(
 
 
 def _check_unsealed(body: Mapping[str, Any]) -> None:
-    if set(body) != _BODY_KEYS - {"sealed_runtime_key"}:
+    if set(body) != _BODY_KEYS - {"sealed_probe_key"}:
         raise RegistrationError("registration body has the wrong fields")
     _fields(body)
 
@@ -474,14 +518,14 @@ def _check_unsealed(body: Mapping[str, Any]) -> None:
 def _check_sealed(body: Mapping[str, Any]) -> VerifiedRegistration:
     if set(body) != _BODY_KEYS:
         raise RegistrationError("registration body has the wrong fields")
-    sealed = body["sealed_runtime_key"]
+    sealed = body["sealed_probe_key"]
     if (
         not isinstance(sealed, Mapping)
         or set(sealed) != {"algorithm", "ephemeral_public_b64", "nonce_b64", "ciphertext_b64"}
         or sealed["algorithm"] != SEAL_ALGORITHM
         or any(not isinstance(value, str) for value in sealed.values())
     ):
-        raise RegistrationError("sealed_runtime_key is malformed")
+        raise RegistrationError("sealed_probe_key is malformed")
     return _fields(body)
 
 
@@ -520,6 +564,20 @@ def _fields(body: Mapping[str, Any]) -> VerifiedRegistration:
         raise RegistrationError("templates must be in canonical form")
     if any(t["cpu"] > vcpus or t["memory_gib"] > memory for t in templates):
         raise RegistrationError("a template is larger than the box")
+    probe_template = body["probe_template_id"]
+    if not isinstance(probe_template, str) or _TEMPLATE_ID.fullmatch(probe_template) is None:
+        raise RegistrationError("probe_template_id is malformed")
+    probe_shapes = [t for t in templates if t.get("template_id") == probe_template]
+    if not probe_shapes:
+        raise RegistrationError("probe_template_id is not one of the box's templates")
+    if len(probe_shapes) > 1:
+        raise RegistrationError("probe_template_id names more than one template")
+    # The one shape the prober can prove, and so pay: its challenge runs in one
+    # probe sandbox.
+    probe_capacity = {
+        "cpu": probe_shapes[0]["cpu"],
+        "memory_gib": probe_shapes[0]["memory_gib"],
+    }
     revision = body["runtime_revision"]
     if not isinstance(revision, str) or _REVISION.fullmatch(revision) is None:
         raise RegistrationError("runtime_revision must be a 40-hex git revision")
@@ -542,7 +600,9 @@ def _fields(body: Mapping[str, Any]) -> VerifiedRegistration:
         runtime_revision=revision,
         issued_at=issued,
         expires_at=expires,
-        sealed_runtime_key=dict(body.get("sealed_runtime_key") or {}),
+        probe_template_id=probe_template,
+        probe_capacity=probe_capacity,
+        sealed_probe_key=dict(body.get("sealed_probe_key") or {}),
         digest=_unsealed_digest(body),
     )
 
@@ -550,7 +610,7 @@ def _fields(body: Mapping[str, Any]) -> VerifiedRegistration:
 def register(
     *,
     host_values_text: str,
-    runtime_key: bytes,
+    probe_key: bytes,
     prober_public_key: X25519PublicKey,
     netuid: int,
     kind: str,
@@ -558,7 +618,7 @@ def register(
     now: datetime,
     valid_for: timedelta = timedelta(days=1),
 ) -> dict[str, Any]:
-    """Host values + runtime key + hotkey → one signed, sealed registration."""
+    """Host values + probe key + hotkey → one signed, sealed registration."""
 
     body = build_body(
         parse_host_values(host_values_text),
@@ -568,7 +628,7 @@ def register(
         now=now,
         valid_for=valid_for,
     )
-    body["sealed_runtime_key"] = seal_runtime_key(runtime_key, prober_public_key, body)
+    body["sealed_probe_key"] = seal_probe_key(probe_key, prober_public_key, body)
     return sign_registration(body, keypair.sign)
 
 
@@ -600,7 +660,9 @@ def main(
     parser.add_argument(
         "--host-values", required=True, help="the installer's cathedral-runtime-LABEL.values"
     )
-    parser.add_argument("--runtime-key-file", required=True, help="the box's runtime API key file")
+    parser.add_argument(
+        "--probe-key-file", required=True, help="the installer's cathedral-runtime-LABEL.probe-key"
+    )
     parser.add_argument(
         "--prober-key", required=True, help="the SN94 prober's X25519 public key, 64 hex characters"
     )
@@ -626,8 +688,8 @@ def main(
             host_values_text=_read_file(
                 options.host_values, "host values", MAX_HOST_VALUES_BYTES
             ).decode(),
-            runtime_key=_read_file(
-                options.runtime_key_file, "runtime key", MAX_RUNTIME_KEY_BYTES, private=True
+            probe_key=_read_file(
+                options.probe_key_file, "probe key", MAX_PROBE_KEY_FILE_BYTES, private=True
             ).strip(),
             prober_public_key=prober,
             netuid=options.netuid,
