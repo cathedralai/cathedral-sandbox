@@ -47,6 +47,7 @@ from cathedral.admission_policy import (
 )
 from cathedral.assurance import AssuranceDimension
 from cathedral.attest import collect_snp, collect_snp_report_only, collect_tdx_gpu
+from cathedral.capacity import measurement_list
 from cathedral.channel import ChannelBindingError, tls_spki_binding
 from cathedral.coldkey_allowlist import (
     DEFAULT_ALLOWLIST_MAX_AGE_SECONDS,
@@ -133,6 +134,7 @@ from cathedral.runtime import (
     RuntimeConfig,
 )
 from cathedral.score_class import export_score_class_report
+from cathedral.tee_box.configure import add_tee_box_arguments, build_tee_box_api, tee_box_config
 from cathedral.worker import WorkerServer
 
 DEFAULT_PUBLISHER_BEARER_ENV = "CATHEDRAL_PUBLISHER_BEARER_TOKEN"
@@ -687,6 +689,95 @@ def cmd_policy_registry_verify(args: argparse.Namespace) -> int:
                     {"id": profile.profile_id, "kind": profile.kind, "status": profile.status}
                     for profile in snapshot.profiles
                 ],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _read_mirror_source(path: str) -> bytes | None:
+    """An existing ``<out>.source.json``, or None when there is none."""
+
+    try:
+        with Path(path).open("rb") as handle:
+            data = handle.read(64 * 1024 + 1)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("unable to read the existing mirror source record") from exc
+    if len(data) > 64 * 1024:
+        raise ValueError("the existing mirror source record is too large")
+    return data
+
+
+def cmd_policy_registry_export_measurement_policy(args: argparse.Namespace) -> int:
+    """Write a measurement policy file, in cathedral-validator #256's format,
+    from one verified release of the owner's signed measurement list.
+
+    The rollout mirror (docs/MRTD.md, "The TEE box measurement list"): the
+    validator keeps reading its local file, and operators regenerate it from
+    the signed list. The release is verified with the pinned owner key file;
+    it must not be older than the release ``--state`` or an existing
+    ``<out>.source.json`` holds. The files are written inside the state's
+    accept transaction, so the high-water mark only moves once they are
+    written. #256's loader takes no extra keys, so the release and digest go
+    in ``<out>.source.json``, bound to the policy file by its SHA-256."""
+
+    keys = _load_registry_keys(
+        args.trusted_keys,
+        production_mode=True,
+        pinned_digest=args.trusted_keys_digest,
+    )
+    state = PolicyRegistryState(
+        args.state,
+        production_mode=True,
+        minimum_release=args.min_release,
+        pinned_release=args.pinned_release,
+        pinned_digest=args.pinned_digest,
+    )
+    source_path = args.out + ".source.json"
+    written: dict[str, bytes] = {}
+
+    def publish(release: measurement_list.AcceptedRelease) -> None:
+        # Also covers a lost or recreated state file.
+        measurement_list.check_mirror_floor(release, _read_mirror_source(source_path))
+        policy = measurement_list.policy_bytes(
+            release, kind=args.kind, mode=args.mode, scope=args.scope
+        )
+        source = measurement_list.mirror_source(
+            release, policy, kind=args.kind, mode=args.mode, scope=args.scope
+        )
+        # The policy first, then its record, each atomically. A crash between
+        # leaves a record whose policy_digest does not match the file, and the
+        # next run (same or higher release) rewrites both.
+        _write_score_class_report(args.out, policy)
+        _write_score_class_report(source_path, source)
+        written["policy"] = policy
+
+    release = measurement_list.accept_release(
+        _read_bounded_registry_file(args.registry, "policy registry"),
+        keys,
+        state,
+        max_age_seconds=args.max_age_seconds,
+        expected_root_digest=args.expected_root_digest,
+        before_commit=publish,
+    )
+    policy = written["policy"]
+    allowed = json.loads(policy)["allowed_measurements"]
+    print(
+        json.dumps(
+            {
+                "out": args.out,
+                "source": source_path,
+                "kind": args.kind,
+                "mode": args.mode,
+                "scope": args.scope,
+                "policy_digest": "sha256:" + hashlib.sha256(policy).hexdigest(),
+                "registry_release": release.release,
+                "registry_digest": release.digest,
+                "allowed_measurements": len(allowed),
+                "deny_all": allowed == [measurement_list.DENY_ALL[args.kind]],
             },
             sort_keys=True,
         )
@@ -1384,11 +1475,15 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             )
     allow_public_bootstrap = migration_mode == "public-bootstrap-evidence"
     allow_public_legacy_audit = migration_mode == "public-legacy-audit"
+    # All TEE box flags or none; a partial set refuses before anything starts.
+    tee_box = tee_box_config(args)
     tls_certificate = getattr(args, "tls_certificate", None)
     tls_private_key = getattr(args, "tls_private_key", None)
     if (tls_certificate is None) != (tls_private_key is None):
         raise ValueError("worker TLS certificate and private key must be supplied together")
     tls_enabled = tls_certificate is not None
+    if tee_box is not None and not tls_enabled:
+        raise ValueError("the TEE box sandbox API requires the attested worker TLS listener")
     try:
         is_loopback = ipaddress.ip_address(args.host).is_loopback
     except ValueError:
@@ -1552,6 +1647,8 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         raise ValueError("customer SAT cannot use the development non-loopback HTTP bind")
     if allow_customer_sat and getattr(args, "gpu_composite", False):
         raise ValueError("customer SAT is available only on the CPU worker path")
+    if tee_box is not None and (tls_context is None or channel_binding is None):
+        raise ValueError("the TEE box sandbox API requires the attested worker TLS listener")
     validator_authorizer = None
     fleet_endpoints = None
     fleet_candidates = 0
@@ -1659,6 +1756,20 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         )
         gpu_executor = CudaWorkExecutor(G4_WORKER_PROFILE_ID, (gpu_evidence_collector.gpu_uuid,))
         evidence_collector = cpu_evidence_unavailable
+    tee_box_api = None
+    tee_box_facts = None
+    if tee_box is not None:
+        assert channel_binding is not None
+        # The callers' root keys come from measured state, never these args.
+        tee_box_api, tee_box_facts = build_tee_box_api(
+            tee_box,
+            tee=tee,
+            hotkey=args.hotkey,
+            channel_binding=channel_binding,
+            network=getattr(args, "validator_network", DEFAULT_ENROLL_NETWORK),
+            netuid=getattr(args, "validator_netuid", DEFAULT_ENROLL_NETUID),
+            public_endpoint=public_endpoint,
+        )
     with WorkerServer(
         args.host,
         args.port,
@@ -1676,6 +1787,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         gpu_executor=gpu_executor,
         gpu_evidence_collector=gpu_evidence_collector,
         central_authorizer=central_authorizer,
+        tee_box_api=tee_box_api,
     ) as server:
         print(
             json.dumps(
@@ -1704,6 +1816,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
                     "customer_sat": allow_customer_sat,
                     "signed_validator_access": validator_authorizer is not None,
                     "fleet_candidates": fleet_candidates,
+                    "tee_box": tee_box_facts,
                 }
             )
         )
@@ -4457,6 +4570,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_worker_base(p_serve)
     add_worker_signed_access(p_serve)
+    add_tee_box_arguments(p_serve)
     p_serve.add_argument(
         "--allow-customer-sat",
         action="store_true",
@@ -4480,6 +4594,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_worker_base(p_serve_snp)
     add_worker_signed_access(p_serve_snp)
+    add_tee_box_arguments(p_serve_snp)
     p_serve_snp.set_defaults(
         func=cmd_worker_serve,
         worker_posture="snp-production",
@@ -4610,6 +4725,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="verify at canonical UTC receipt time instead of current admission time",
     )
     p_policy_verify.set_defaults(func=cmd_policy_registry_verify)
+    p_policy_export = policy_sub.add_parser(
+        "export-measurement-policy",
+        help="write the validator's #256 measurement policy file from the signed list",
+        description=(
+            "Verify one release of the owner's signed measurement list with the "
+            "pinned key file, accept it into the high-water state, and write "
+            "cathedral-validator #256's policy file plus <out>.source.json "
+            "naming the release and digest it came from."
+        ),
+    )
+    p_policy_export.add_argument("--registry", required=True)
+    p_policy_export.add_argument("--trusted-keys", required=True)
+    p_policy_export.add_argument(
+        "--trusted-keys-digest",
+        required=True,
+        help="sha256:<hex> of the trusted key file, pinning the owner key",
+    )
+    p_policy_export.add_argument(
+        "--state", required=True, help="the durable high-water SQLite state for this mirror"
+    )
+    p_policy_export.add_argument("--min-release", type=int)
+    p_policy_export.add_argument("--pinned-release", type=int)
+    p_policy_export.add_argument("--pinned-digest")
+    p_policy_export.add_argument("--max-age-seconds", type=int, default=86400)
+    p_policy_export.add_argument("--kind", choices=("tdx", "sev_snp"), default="tdx")
+    p_policy_export.add_argument("--mode", choices=("shadow", "enforce"), required=True)
+    p_policy_export.add_argument(
+        "--scope",
+        choices=("box", "all"),
+        required=True,
+        help=(
+            "box: TEE box images only; all: also every other eligible CPU profile of "
+            "the kind. Under enforce, box stops paying non-box miners"
+        ),
+    )
+    p_policy_export.add_argument(
+        "--expected-root-digest",
+        help="sha256:<hex> of the central root key file every TDX image's MRCONFIGID must bind",
+    )
+    p_policy_export.add_argument("--out", required=True)
+    p_policy_export.set_defaults(func=cmd_policy_registry_export_measurement_policy)
 
     p_receipt = sub.add_parser("receipt", help="verify assurance receipts")
     receipt_sub = p_receipt.add_subparsers(dest="receipt_command", required=True)

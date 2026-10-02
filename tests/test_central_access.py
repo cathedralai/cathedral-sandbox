@@ -520,3 +520,207 @@ def test_finalize_refuses_when_the_high_water_cannot_be_read(authorizer):
     authorizer.state.delegation_high_water = lambda: None
     with pytest.raises(ca.CentralAccessError, match="high-water is unreadable"):
         authorizer.finalize(request, body=BODY, now=NOW)
+
+
+def test_a_scoped_request_needs_its_scope_and_signs_its_method(authorizer):
+    # The TEE box maps each request to a scope; the delegation must grant it.
+    target = "/v1/sandboxes/sbx-" + "0" * 24 + "/files?path=/a"
+    delegation = _delegation(routes=["tee-box:files"])
+    header = _header(delegation, method="GET", path=target, body=b"")
+    request = authorizer.preauthorize(
+        header, method="GET", path=target, now=NOW, scope="tee-box:files"
+    )
+    assert authorizer.finalize(request, body=b"", now=NOW).startswith("central:")
+    header = _header(delegation, method="GET", path=target, body=b"", nonce=b"m" * 32)
+    with pytest.raises(ca.CentralAccessError, match="does not grant this route"):
+        authorizer.preauthorize(header, method="GET", path=target, now=NOW, scope="tee-box:exec")
+    with pytest.raises(ca.CentralAccessError, match="target does not match"):
+        authorizer.preauthorize(
+            header, method="DELETE", path=target, now=NOW, scope="tee-box:files"
+        )
+    with pytest.raises(ca.CentralAccessError, match="scope is unknown"):
+        authorizer.preauthorize(header, method="GET", path=target, now=NOW, scope=PATH)
+    # A scope is never a path route, and a path route is never a scope.
+    with pytest.raises(ca.CentralAccessError, match="does not grant this route"):
+        _accept(authorizer, _header(nonce=b"k" * 32, delegation=delegation))
+    header = _header(nonce=b"j" * 32, path="tee-box:files", delegation=delegation)
+    with pytest.raises(ca.CentralAccessError, match="target does not match"):
+        _accept(authorizer, header, path="tee-box:files")
+
+
+# Small-order and non-canonical Ed25519 keys ----------------------------------
+
+_P = 2**255 - 19
+_D = -121665 * pow(121666, -1, _P) % _P
+# 0x01 then 31 zero bytes: the identity point, "AQAA...AA=" in base64.
+IDENTITY_KEY = bytes([1]) + bytes(31)
+_ORDER_8_Y = 2707385501144840649318225287225658788936804267575313519463743609750303402022
+
+
+def _encoded(y: int, *, x_odd: bool = False) -> bytes:
+    return (y | int(x_odd) << 255).to_bytes(32, "little")
+
+
+def _decode(key: bytes) -> tuple[int, int]:
+    """RFC 8032 section 5.1.3, for test vectors that are known to decode."""
+
+    y = int.from_bytes(key, "little") & ((1 << 255) - 1)
+    x_squared = (y * y - 1) * pow(_D * y * y + 1, -1, _P) % _P
+    x = pow(x_squared, (_P + 3) // 8, _P)
+    if (x * x - x_squared) % _P:
+        x = x * pow(2, (_P - 1) // 4, _P) % _P
+    assert (x * x - x_squared) % _P == 0
+    if x & 1 != key[31] >> 7:
+        x = -x % _P
+    return x, y
+
+
+def _add(first: tuple[int, int], second: tuple[int, int]) -> tuple[int, int]:
+    (x1, y1), (x2, y2) = first, second
+    t = _D * x1 * x2 * y1 * y2 % _P
+    return (
+        (x1 * y2 + y1 * x2) * pow(1 + t, -1, _P) % _P,
+        (y1 * y2 + x1 * x2) * pow(1 - t, -1, _P) % _P,
+    )
+
+
+# The eight small-order points, each with the sign bit clear and set. Setting
+# it on the identity or the order-2 point (x = 0) gives a non-canonical form.
+SMALL_ORDER_KEYS = {
+    name + ("-odd" if x_odd else ""): _encoded(y, x_odd=x_odd)
+    for name, y in (
+        ("order-4", 0),
+        ("identity", 1),
+        ("order-2", _P - 1),
+        ("order-8", _ORDER_8_Y),
+        ("order-8-negated", _P - _ORDER_8_Y),
+    )
+    for x_odd in (False, True)
+}
+BAD_KEYS = [
+    *(pytest.param(key, "is a small-order", id=name) for name, key in SMALL_ORDER_KEYS.items()),
+    # y at or above p: the non-canonical forms of 0, 1 and 3.
+    *(
+        pytest.param(_encoded(y, x_odd=x_odd), "is not a canonical", id=f"y-{name}-{x_odd}")
+        for name, y in (("p", _P), ("p+1", _P + 1), ("p+3", _P + 3))
+        for x_odd in (False, True)
+    ),
+    # y = 2 has no x on the curve.
+    pytest.param(_encoded(2), "is not an Ed25519 point", id="off-curve"),
+]
+
+
+def test_the_small_order_blocklist_is_exactly_the_eight_small_order_points():
+    identity = (0, 1)
+    points = set()
+    for key in SMALL_ORDER_KEYS.values():
+        point = _decode(key)
+        multiple = point
+        for _ in range(3):
+            multiple = _add(multiple, multiple)
+        assert multiple == identity
+        points.add(point)
+    # The torsion subgroup of edwards25519 has exactly eight points.
+    assert len(points) == 8
+    assert _decode(IDENTITY_KEY) == identity
+
+
+@pytest.mark.parametrize(("key", "match"), BAD_KEYS)
+def test_a_small_order_or_non_canonical_key_is_refused_at_parse(key, match):
+    with pytest.raises(ca.CentralAccessError, match=f"central key {match}"):
+        ca.check_ed25519_public_key(key, "central key")
+    with pytest.raises(ca.CentralAccessError, match=f"central key {match}"):
+        _delegation(central_key=key)
+    document = _resign(
+        {**_delegation(), "central_key_base64": base64.b64encode(key).decode("ascii")}, ROOT_SEED
+    )
+    with pytest.raises(ca.CentralAccessError, match=f"central key {match}"):
+        ca.verify_delegation(document, ROOT_KEYS, network=NETWORK, netuid=NETUID, now=NOW)
+
+
+def test_generated_keys_are_accepted():
+    for _ in range(64):
+        public = (
+            Ed25519PrivateKey.generate().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        )
+        assert ca.check_ed25519_public_key(public, "central key") == public
+
+
+def test_a_request_forged_under_a_small_order_delegation_is_refused(authorizer):
+    # The review's proof of concept: the root delegated to the identity point,
+    # and a signature with R the identity and S zero needs no private key.
+    delegation = _resign(
+        {**_delegation(), "central_key_base64": base64.b64encode(IDENTITY_KEY).decode("ascii")},
+        ROOT_SEED,
+    )
+    document = {
+        "schema": ca.CENTRAL_REQUEST_SCHEMA,
+        "delegation": delegation,
+        "worker_hotkey": WORKER,
+        "network": NETWORK,
+        "netuid": NETUID,
+        "method": "POST",
+        "path": PATH,
+        "body_sha256": "sha256:" + hashlib.sha256(BODY).hexdigest(),
+        "channel_binding_type": BINDING.binding_type.value,
+        "channel_binding_digest_hex": BINDING.digest.hex(),
+        "nonce_hex": "ab" * 32,
+        "issued_at": "2026-09-28T11:59:50Z",
+        "expires_at": "2026-09-28T12:01:00Z",
+        "signature": {
+            "algorithm": "ed25519",
+            "value_base64": base64.b64encode(IDENTITY_KEY + bytes(32)).decode("ascii"),
+        },
+    }
+    header = base64.b64encode(canonical_json(document)).decode("ascii")
+    with pytest.raises(ca.CentralAccessError, match="central key is a small-order"):
+        authorizer.preauthorize(header, method="POST", path=PATH, now=NOW)
+    assert authorizer.state.delegation_high_water() == 0
+
+
+def test_a_small_order_root_key_is_refused(tmp_path):
+    path = tmp_path / "central-root-keys.json"
+    path.write_bytes(
+        canonical_json({"cathedral-root-1": base64.b64encode(IDENTITY_KEY).decode("ascii")})
+    )
+    pin = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(ca.CentralAccessError, match="root key cathedral-root-1 is a small-order"):
+        ca.load_central_root_keys(str(path), pinned_digest=pin)
+
+    identity_root = {"cathedral-root-1": IDENTITY_KEY}
+    with pytest.raises(ca.CentralAccessError, match="root key cathedral-root-1 is a small-order"):
+        ca.CentralAccessAuthorizer(
+            identity_root,
+            worker_hotkey=WORKER,
+            network=NETWORK,
+            netuid=NETUID,
+            channel_binding=BINDING,
+            state=ca.open_central_access_state(str(tmp_path / "central-access.sqlite")),
+        )
+    # A list "signed" without a private key, for a caller that passes keys in.
+    forged = {
+        "schema": ca.CENTRAL_REVOCATIONS_SCHEMA,
+        "root_key_id": "cathedral-root-1",
+        "sequence": 1,
+        "issued_at": "2026-09-28T12:00:00Z",
+        "revoked": [],
+        "signature": {
+            "algorithm": "ed25519",
+            "value_base64": base64.b64encode(IDENTITY_KEY + bytes(32)).decode("ascii"),
+        },
+    }
+    with pytest.raises(ca.CentralAccessError, match="signing key is a small-order"):
+        ca.verify_revocations(forged, identity_root, minimum_sequence=1)
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [b"[]", b"{", b'{"a":"x","a":"y"}', b'{"cathedral-root-1":1.5}', b"\xff"],
+    ids=["array", "truncated", "duplicate-key", "float", "not-utf8"],
+)
+def test_a_malformed_pinned_root_key_file_is_refused_cleanly(tmp_path, contents):
+    path = tmp_path / "central-root-keys.json"
+    path.write_bytes(contents)
+    pin = "sha256:" + hashlib.sha256(contents).hexdigest()
+    with pytest.raises(ca.CentralAccessError, match="central root keys are unusable"):
+        ca.load_central_root_keys(str(path), pinned_digest=pin)
