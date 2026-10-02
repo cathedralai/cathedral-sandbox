@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -19,6 +20,19 @@ from typing import Any, Callable
 USER_AGENT = "cathedral-conformance/0.1"
 
 TERMINAL_STATES = {"failed", "deleted", "deleting"}
+
+# The API closes a request that sends nothing for 60 s, so synchronous
+# `POST .../exec` takes `timeout_seconds` up to 45. Anything longer runs in the
+# background: `POST .../execs`, then `GET .../execs/{exec_id}?wait=N`, N <= 25.
+SYNC_EXEC_MAX_SECONDS = 45
+EXEC_POLL_WAIT_SECONDS = 25
+# Client-side allowance past a background exec's own timeout before it is stopped.
+EXEC_END_GRACE_SECONDS = 30
+
+
+def idempotency_key(prefix: str) -> str:
+    """A fresh Idempotency-Key (the API takes 8-128 of A-Z a-z 0-9 . _ : -)."""
+    return f"{prefix}-{uuid.uuid4().hex}"
 
 
 @dataclass
@@ -116,11 +130,63 @@ class Api:
 
     def exec(self, sandbox_id: str, command: str | list[str], *, timeout_seconds: int = 30,
              user: str | None = None) -> Response:
+        """Synchronous exec, `timeout_seconds` at most SYNC_EXEC_MAX_SECONDS."""
+        if timeout_seconds > SYNC_EXEC_MAX_SECONDS:
+            raise ValueError(f"synchronous exec takes timeout_seconds up to {SYNC_EXEC_MAX_SECONDS}; "
+                             "use exec_background or run")
         body: dict[str, Any] = {"command": command, "timeout_seconds": timeout_seconds}
         if user:
             body["user"] = user
         return self.call("POST", f"/v1/sandboxes/{sandbox_id}/exec", json=body,
                          timeout=timeout_seconds + 15)
 
+    def exec_background(self, sandbox_id: str, command: str | list[str], *, timeout_seconds: int,
+                        user: str | None = None, poll_s: float = 1.0) -> Response:
+        """Start a background exec and poll it to its end.
+
+        Returns the last answer: on success the exec's final status, which carries
+        `state`, `exit_code`, `stdout`, `stderr` and `timed_out` like a synchronous
+        exec. A 4xx is returned as it is. No answer or a 5xx is asked again until
+        the timeout plus EXEC_END_GRACE_SECONDS; then the exec is stopped and a
+        status 0 response says so.
+        """
+        body: dict[str, Any] = {"command": command, "timeout_seconds": timeout_seconds}
+        if user:
+            body["user"] = user
+        reply = self.call("POST", f"/v1/sandboxes/{sandbox_id}/execs", json=body,
+                          key=idempotency_key("conf-x"), timeout=30)
+        if not reply.ok:
+            return reply
+        status = reply.json() or {}
+        exec_id = status.get("exec_id")
+        if not exec_id:
+            return Response(0, {}, b"background exec answered without an exec_id", reply.elapsed_s)
+        path = f"/v1/sandboxes/{sandbox_id}/execs/{exec_id}"
+        deadline = self.clock() + timeout_seconds + EXEC_END_GRACE_SECONDS
+        while status.get("state") == "running":
+            if self.clock() >= deadline:
+                self.call("DELETE", path)
+                return Response(0, {}, f"exec {exec_id} did not end within "
+                                f"{timeout_seconds + EXEC_END_GRACE_SECONDS} s; stopped".encode())
+            polled = self.call("GET", path, params={"wait": EXEC_POLL_WAIT_SECONDS},
+                               timeout=EXEC_POLL_WAIT_SECONDS + 15)
+            if polled.ok:
+                reply, status = polled, polled.json() or {}
+            elif 0 < polled.status < 500:
+                return polled
+            else:
+                self.sleep(poll_s)
+        return reply
+
+    def run(self, sandbox_id: str, command: str | list[str], *, timeout_seconds: int = 30,
+            user: str | None = None) -> Response:
+        """Synchronous exec up to SYNC_EXEC_MAX_SECONDS, a background exec past it."""
+        if timeout_seconds <= SYNC_EXEC_MAX_SECONDS:
+            return self.exec(sandbox_id, command, timeout_seconds=timeout_seconds, user=user)
+        return self.exec_background(sandbox_id, command, timeout_seconds=timeout_seconds, user=user)
+
     def delete(self, sandbox_id: str) -> Response:
-        return self.call("DELETE", f"/v1/sandboxes/{sandbox_id}")
+        # The API requires an Idempotency-Key on DELETE and answers 422 without
+        # one. A fresh key per call: a repeat DELETE is a new request, which a
+        # sandbox that is already deleted must still answer with 2xx.
+        return self.call("DELETE", f"/v1/sandboxes/{sandbox_id}", key=idempotency_key("conf-del"))

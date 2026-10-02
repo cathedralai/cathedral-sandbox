@@ -29,6 +29,17 @@ subset. `--strict` makes later-tier checks gate the result too.
 Exit status is 0 when every mvp check passes, 1 when any fails, 2 for a usage
 error. Everything the run creates carries the label `conformance_run=<run_id>`
 and is deleted at the end, also after a crash, then swept again by label.
+`create.burst_tti` deletes each of its sandboxes as soon as it is measured.
+
+The suite keeps to the API's request rules (`https://cathedral.computer/openapi.json`):
+
+- Every create, sandbox DELETE, lifetime extension and background exec sends a
+  fresh `Idempotency-Key`. The API answers 422 without one.
+- A synchronous `POST /v1/sandboxes/{id}/exec` asks for `timeout_seconds` of at
+  most 45, because the API closes a request that sends nothing for 60 s. Longer
+  steps, such as the nested Docker image pull and network creation, run as
+  background execs: `POST .../execs`, then `GET .../execs/{exec_id}?wait=25`
+  until the exec ends.
 
 ## Checks
 
