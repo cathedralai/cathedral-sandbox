@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import shlex
 import tarfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -273,6 +274,25 @@ def _sh(ctx: Context, command: str, timeout: int = 60, user: str | None = None) 
         return -1, "", reply.summary()
     body = reply.json()
     return int(body.get("exit_code", -1)), body.get("stdout", ""), body.get("stderr", "")
+
+
+def _command_exit_code(reply: Response) -> int | None:
+    """Return an integer exit code only for a well-formed successful response."""
+    if not reply.ok:
+        return None
+    body = reply.json()
+    code = body.get("exit_code") if isinstance(body, dict) else None
+    return code if type(code) is int else None
+
+
+def _fork_sentinel_commands(index: int, marker: str, *, directory: str = "/tmp") -> tuple[str, str, str]:
+    """Build the write, own-read, and foreign-sentinel probes for one fork."""
+    sentinel = shlex.quote(f"{directory}/conformance-fork-{index}.txt")
+    state = shlex.quote(f"{directory}/state.bin")
+    write = f"printf '%s\\n' '{marker}' > {sentinel}"
+    read = f"cat {sentinel} && sha256sum {state}"
+    absent = f"test ! -e {sentinel}"
+    return write, read, absent
 
 
 CHECKS: list[Check] = []
@@ -585,7 +605,7 @@ def quota_full_429(ctx: Context):
     for _ in range(room):
         created = ctx.create()
         body = created.json()
-        if not created.ok or not isinstance(body, dict) or not isinstance(body.get("id"), str):
+        if not created.ok or not isinstance(body, dict) or not isinstance(body.get("id"), str) or not body["id"]:
             return ("fail", {"filled": filled, "expected": room, "fill_status": created.status},
                     f"project-quota filler create failed: {created.summary()}")
         filled += 1
@@ -694,20 +714,19 @@ def snapshot_fork(ctx: Context):
     markers = [f"fork-{index}-{uuid.uuid4().hex}" for index in range(len(running))]
     write_failures = []
     for index, fork in enumerate(running):
-        path = f"/tmp/conformance-fork-{index}.txt"
-        response = ctx.api.exec(fork, ["sh", "-c", f"printf '%s' '{markers[index]}' > '{path}'"])
-        body_result = response.json() if response.ok else {}
-        if not response.ok or not isinstance(body_result, dict) or body_result.get("exit_code") != 0:
+        write, _, _ = _fork_sentinel_commands(index, markers[index])
+        response = ctx.api.exec(fork, ["sh", "-c", write])
+        if _command_exit_code(response) != 0:
             write_failures.append(f"fork {index} sentinel write failed: {response.summary()}")
     same_state = True
     independent = True
     read_failures = []
     for index, fork in enumerate(running):
-        own_path = f"/tmp/conformance-fork-{index}.txt"
-        own = ctx.api.exec(fork, ["sh", "-c", f"cat '{own_path}' && sha256sum /tmp/state.bin"])
+        _, read, _ = _fork_sentinel_commands(index, markers[index])
+        own = ctx.api.exec(fork, ["sh", "-c", read])
         own_body = own.json() if own.ok else {}
         own_lines = own_body.get("stdout", "").splitlines() if isinstance(own_body, dict) else []
-        if (not own.ok or own_body.get("exit_code") != 0 or not own_lines
+        if (_command_exit_code(own) != 0 or not own_lines
                 or own_lines[0] != markers[index]):
             independent = False
             read_failures.append(f"fork {index} did not read its own sentinel")
@@ -717,16 +736,15 @@ def snapshot_fork(ctx: Context):
         for other in range(len(running)):
             if other == index:
                 continue
-            path = f"/tmp/conformance-fork-{other}.txt"
-            probe = ctx.api.exec(fork, ["sh", "-c", f"test ! -e '{path}'"])
-            probe_body = probe.json() if probe.ok else {}
-            if not probe.ok or not isinstance(probe_body, dict) or probe_body.get("exit_code") != 0:
+            _, _, absent = _fork_sentinel_commands(other, markers[other])
+            probe = ctx.api.exec(fork, ["sh", "-c", absent])
+            if _command_exit_code(probe) != 0:
                 independent = False
                 read_failures.append(f"fork {index} saw fork {other}'s sentinel")
     parent_delete_ok = ctx._delete_sandbox_confirmed(ctx.primary)
     survivors = None
     if parent_delete_ok:
-        survivors = sum(1 for f in running if (ctx.api.exec(f, ["true"]).json() or {}).get("exit_code") == 0)
+        survivors = sum(1 for f in running if _command_exit_code(ctx.api.exec(f, ["true"])) == 0)
     measured.update(same_state=same_state, independent=independent,
                     sentinel_writes=len(running) - len(write_failures),
                     parent_delete_confirmed=parent_delete_ok,

@@ -8,7 +8,11 @@ skips, gating by tier, run order and cleanup.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
+import shlex
+import shutil
+import subprocess
 import urllib.parse
 
 from cathedral.conformance import checks as C
@@ -62,7 +66,8 @@ class FakeCathedral:
         self.files: dict[str, dict[str, str]] = {}
         self.delete_polls: dict[str, int] = {}
         self.snapshot_polls: dict[str, int] = {}
-        self.parent_digest = "abc123-state-digest"
+        self.parent_data = "pre-fork-state-bytes"
+        self.parent_digest = hashlib.sha256(self.parent_data.encode()).hexdigest()
         if foreign_sentinel:
             self.sandboxes["foreign"] = {"id": "foreign", "state": "running", "labels": {"owner": "other"},
                                            "cleanup_state": "none"}
@@ -192,27 +197,29 @@ class FakeCathedral:
         sandbox_id = payload.get("sandbox_id")
         if shell_command.startswith("head -c 4194304 /dev/urandom"):
             if sandbox_id:
-                self.files.setdefault(sandbox_id, {})["/tmp/state.bin"] = self.parent_digest
+                self.files.setdefault(sandbox_id, {})["/tmp/state.bin"] = self.parent_data
             return self.reply(200, {"exit_code": 0, "stdout": f"{self.parent_digest} /tmp/state.bin\n", "stderr": ""})
-        write = re.search(r"printf '%s' '([^']+)' > '([^']+)'", shell_command)
+        write = re.fullmatch(r"printf '%s\\n' '([^']+)' > (.+)", shell_command)
         if write and sandbox_id:
             store = self.files.setdefault(sandbox_id, {})
             if self.shared_filesystem:
                 shared = self.files.setdefault("shared", {})
                 store = shared
-            store[write.group(2)] = write.group(1)
+            store[shlex.split(write.group(2))[0]] = write.group(1) + "\n"
             return self.reply(200, {"exit_code": 0, "stdout": "", "stderr": ""})
-        if shell_command.startswith("cat '") and "sha256sum /tmp/state.bin" in shell_command:
-            match = re.search(r"cat '([^']+)'", shell_command)
+        read = re.fullmatch(r"cat (.+?) && sha256sum (.+)", shell_command)
+        if read:
+            sentinel_path, state_path = (shlex.split(part)[0] for part in read.groups())
             store = self.files.get("shared", {}) if self.shared_filesystem else self.files.get(sandbox_id, {})
-            if not match or match.group(1) not in store:
+            if sentinel_path not in store or state_path not in store:
                 return self.reply(200, {"exit_code": 1, "stdout": "", "stderr": "missing"})
-            digest = store.get("/tmp/state.bin", "")
-            return self.reply(200, {"exit_code": 0, "stdout": f"{store[match.group(1)]}\n{digest} /tmp/state.bin\n", "stderr": ""})
-        missing = re.search(r"test ! -e '([^']+)'", shell_command)
+            digest = hashlib.sha256(store[state_path].encode()).hexdigest()
+            return self.reply(200, {"exit_code": 0, "stdout": f"{store[sentinel_path]}{digest}  {state_path}\n", "stderr": ""})
+        missing = re.fullmatch(r"test ! -e (.+)", shell_command)
         if missing:
             store = self.files.get("shared", {}) if self.shared_filesystem else self.files.get(sandbox_id, {})
-            return self.reply(200, {"exit_code": 0 if missing.group(1) not in store else 1, "stdout": "", "stderr": ""})
+            path = shlex.split(missing.group(1))[0]
+            return self.reply(200, {"exit_code": 0 if path not in store else 1, "stdout": "", "stderr": ""})
         stdout = "42\n" if "6*7" in shell_command else ""
         return self.reply(200, {"exit_code": 0, "stdout": stdout, "stderr": "", "timed_out": False})
 
@@ -436,6 +443,39 @@ def test_snapshot_fork_rejects_shared_storage():
     result = by_id(report)["snapshot.fork"]
     assert result["status"] == "fail"
     assert result["measured"]["independent"] is False
+
+
+def test_fork_sentinel_commands_work_in_shell_and_fake(tmp_path):
+    marker = "fork-0-marker"
+    state_path = tmp_path / "state.bin"
+    state_path.write_text("pre-fork-state-bytes")
+    write, read, _ = C._fork_sentinel_commands(0, marker, directory=str(tmp_path))
+    shasum = shutil.which("shasum")
+    assert shasum is not None
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    sha256sum = bin_dir / "sha256sum"
+    sha256sum.write_text(f'#!/bin/sh\nexec "{shasum}" -a 256 "$@"\n')
+    sha256sum.chmod(0o755)
+    shell_env = {"PATH": f"{bin_dir}:/opt/homebrew/bin:/usr/bin:/bin"}
+
+    local_write = subprocess.run(["sh", "-c", write], capture_output=True, text=True,
+                                 check=False, env=shell_env)
+    assert local_write.returncode == 0
+    local_read = subprocess.run(["sh", "-c", read], capture_output=True, text=True,
+                                check=False, env=shell_env)
+    assert local_read.returncode == 0
+    assert local_read.stdout.splitlines()[0] == marker
+    assert local_read.stdout.splitlines()[1].split()[0] == hashlib.sha256(b"pre-fork-state-bytes").hexdigest()
+
+    api, fake = make()
+    fake.sandboxes["sb-test"] = {"id": "sb-test", "state": "running", "labels": {"conformance_run": "test"}}
+    fake.files["sb-test"] = {str(state_path): "pre-fork-state-bytes"}
+    fake_write = api.exec("sb-test", ["sh", "-c", write])
+    fake_read = api.exec("sb-test", ["sh", "-c", read])
+    assert fake_write.ok and fake_write.json()["exit_code"] == 0
+    assert fake_read.ok and fake_read.json()["exit_code"] == 0
+    assert fake_read.json()["stdout"] == local_read.stdout
 
 
 def test_snapshot_fork_requires_parent_delete_confirmation_before_survivors():
