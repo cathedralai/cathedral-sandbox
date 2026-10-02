@@ -104,7 +104,7 @@ fully current is always exit `1`. v1.0.0 exits `1` for every failure.
 | Field | Expected value |
 |---|---|
 | Tag | `cathedral-tdx-verifier-v1.1.0` |
-| Asset SHA-256 | `4a918bcde8ef45d567acdcd2a92559313e474c81ca20e7a9e797a744fb185082` |
+| Asset SHA-256 | `eb3fffb61e35ad9605e3a84869f8c3a9f8e647605b3d407ebf4a29324c4e93cc` |
 
 That digest is the reproducible build of the verifier source in sandbox #253,
 under the flags below. Rebuilding the v1.0.0 source the same way reproduces
@@ -114,7 +114,7 @@ To publish it, a maintainer tags a commit on `main` whose
 `cmd/cathedral-tdx-verifier` directory matches that source:
 
 ```bash
-git diff --quiet <#253 commit> <commit> -- cmd/cathedral-tdx-verifier
+git diff --quiet 8fe9670fb77610c8ce63ee15c9c736fee1698f25 <commit> -- cmd/cathedral-tdx-verifier
 git tag cathedral-tdx-verifier-v1.1.0 <commit>
 git push origin cathedral-tdx-verifier-v1.1.0
 ```
@@ -129,8 +129,9 @@ install the new asset. Only then does the validator see exit `3`.
 
 The tag-only release workflow uses Go 1.25.13, two separate empty build caches,
 and fixed static-build flags. The builds must be byte-identical and match the
-workflow's `EXPECTED_SHA256`, which is the next release's digest below. The workflow publishes exactly the binary and checksum, then
-downloads both anonymously and checks them again.
+workflow's `EXPECTED_SHA256`, which is the digest in "Next release" above. The
+workflow publishes exactly the binary and checksum, then downloads both
+anonymously and checks them again.
 
 A verified download proves which executable bytes you installed. It does not
 prove a miner is running those bytes, prove quote freshness, enforce a machine
