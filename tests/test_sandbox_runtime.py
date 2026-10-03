@@ -16,9 +16,10 @@ from cathedral.sandbox_runtime import (
 )
 
 
-def test_detect_runtime_defaults_to_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_detect_runtime_requires_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CATHEDRAL_SANDBOX_RUNTIME", raising=False)
-    assert detect_runtime(None) == RUNTIME_MEMORY
+    with pytest.raises(ValueError, match="CATHEDRAL_SANDBOX_RUNTIME required"):
+        detect_runtime(None)
 
 
 def test_detect_runtime_rejects_unknown() -> None:
@@ -29,6 +30,26 @@ def test_detect_runtime_rejects_unknown() -> None:
 def test_detect_runtime_accepts_docker_and_kata() -> None:
     assert detect_runtime("docker") == RUNTIME_DOCKER
     assert detect_runtime("kata") == RUNTIME_KATA
+
+
+def test_memory_runtime_forbidden_without_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CATHEDRAL_ALLOW_MEMORY_RUNTIME", raising=False)
+    monkeypatch.delenv("CATHEDRAL_SANDBOX_FLEET", raising=False)
+    with pytest.raises(SandboxOpError) as exc:
+        build_sandbox_provider(runtime=RUNTIME_MEMORY, allow_insecure_dev=False)
+    assert exc.value.code == "runtime_forbidden"
+
+
+def test_memory_runtime_allowed_with_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CATHEDRAL_ALLOW_MEMORY_RUNTIME", "1")
+    monkeypatch.delenv("CATHEDRAL_SANDBOX_FLEET", raising=False)
+    monkeypatch.setenv("CATHEDRAL_SANDBOX_KEYS", "k:demo:2")
+    provider = build_sandbox_provider(runtime=RUNTIME_MEMORY, allow_insecure_dev=False)
+    try:
+        assert provider.status().runtime == RUNTIME_MEMORY
+        assert provider.status().kernel_isolation is False
+    finally:
+        provider.close()
 
 
 def test_disk_enforced_rejects_oversize_write() -> None:
@@ -98,6 +119,7 @@ def test_build_with_fleet_refuses_oversized_quota(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("CATHEDRAL_SANDBOX_FLEET", "n1:2:4:8:20")
     monkeypatch.setenv("CATHEDRAL_SANDBOX_QUOTA", "500:1000:3000")
     monkeypatch.setenv("CATHEDRAL_SANDBOX_KEYS", "k:demo:2")
+    monkeypatch.setenv("CATHEDRAL_ALLOW_MEMORY_RUNTIME", "1")
     with pytest.raises(SandboxOpError) as exc:
         build_sandbox_provider(runtime=RUNTIME_MEMORY, allow_insecure_dev=False)
     assert exc.value.code == "fleet_capacity_insufficient"

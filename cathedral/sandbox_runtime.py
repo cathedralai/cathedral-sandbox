@@ -66,7 +66,12 @@ def kata_host_ready() -> bool:
 
 
 def detect_runtime(explicit: str | None = None) -> str:
-    raw = (explicit or os.environ.get("CATHEDRAL_SANDBOX_RUNTIME") or RUNTIME_MEMORY).strip().lower()
+    raw = (explicit or os.environ.get("CATHEDRAL_SANDBOX_RUNTIME") or "").strip().lower()
+    if not raw:
+        raise ValueError(
+            "CATHEDRAL_SANDBOX_RUNTIME required (docker|kata); "
+            "memory is only for --allow-insecure-dev or CATHEDRAL_ALLOW_MEMORY_RUNTIME=1"
+        )
     if raw not in RUNTIME_CHOICES:
         raise ValueError(f"unknown sandbox runtime {raw!r}; choose from {sorted(RUNTIME_CHOICES)}")
     return raw
@@ -116,8 +121,24 @@ def build_sandbox_provider(
     base_url: str | None = None,
     require_fleet: bool | None = None,
 ) -> SandboxProvider:
-    """Construct the provider ``sandbox serve`` mounts. No stub runtimes."""
-    kind = detect_runtime(RUNTIME_MEMORY if allow_insecure_dev else runtime)
+    """Construct the provider ``sandbox serve`` mounts. No stub runtimes.
+
+    Memory is not an isolation boundary for shared tenants. It is only admitted
+    via ``--allow-insecure-dev`` or explicit ``CATHEDRAL_ALLOW_MEMORY_RUNTIME=1``.
+    """
+    if allow_insecure_dev:
+        kind = RUNTIME_MEMORY
+    else:
+        kind = detect_runtime(runtime)
+        if kind == RUNTIME_MEMORY and os.environ.get("CATHEDRAL_ALLOW_MEMORY_RUNTIME") != "1":
+            raise SandboxOpError(
+                "runtime_forbidden",
+                503,
+                "memory runtime is not a tenant isolation boundary; "
+                "use --runtime docker|kata, or set CATHEDRAL_ALLOW_MEMORY_RUNTIME=1 "
+                "for local contract tests only",
+                retry_after=60,
+            )
 
     fleet_raw = os.environ.get("CATHEDRAL_SANDBOX_FLEET", "").strip()
     use_fleet = require_fleet if require_fleet is not None else bool(fleet_raw)
@@ -169,7 +190,7 @@ def build_sandbox_provider(
                 "runtime_unavailable",
                 503,
                 "kata runtime not available; install kata-runtime + Docker on Linux, "
-                "or use --runtime docker / --runtime memory",
+                "or use --runtime docker (memory requires CATHEDRAL_ALLOW_MEMORY_RUNTIME=1)",
                 retry_after=60,
             )
         provider = DockerGuestProvider(

@@ -54,6 +54,24 @@ from cathedral.coldkey_allowlist import (
     verify_allowlist,
 )
 from cathedral.common import ChannelBinding, ChannelBindingType, Policy, Tier
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from cathedral.affine_claim import (
+    MAX_AFFINE_CLAIM_BYTES,
+    MAX_AFFINE_CLAIM_TRUSTED_KEYS_BYTES,
+    AffineClaimError,
+    parse_affine_claim_trusted_keys_json,
+    verify_affine_claim,
+)
+from cathedral.affine_claim_cvm import (
+    cvm_instance_from_running_document,
+    issue_affine_claim_from_cvm,
+)
+from cathedral.affine_validator import (
+    ValidatorAction,
+    decision_to_json,
+    validate_affine_submission,
+)
 from cathedral.customer_receipt import (
     MAX_CUSTOMER_RECEIPT_BYTES,
     MAX_CUSTOMER_RECEIPT_TRUSTED_KEYS_BYTES,
@@ -757,6 +775,201 @@ def cmd_receipt_verify(args: argparse.Namespace) -> int:
             sort_keys=True,
         )
     )
+    return 0
+
+
+def _read_bounded_affine_claim_file(
+    path: str,
+    label: str,
+    *,
+    maximum_bytes: int,
+    category: str,
+) -> bytes:
+    try:
+        with Path(path).open("rb") as handle:
+            data = handle.read(maximum_bytes + 1)
+    except OSError as exc:
+        raise AffineClaimError(category, f"unable to load {label}") from exc
+    if len(data) > maximum_bytes:
+        raise AffineClaimError(category, f"{label} exceeds the maximum encoded size")
+    return data
+
+
+def cmd_affine_claim_verify(args: argparse.Namespace) -> int:
+    try:
+        claim_bytes = _read_bounded_affine_claim_file(
+            args.claim,
+            "affine claim",
+            maximum_bytes=MAX_AFFINE_CLAIM_BYTES,
+            category="schema",
+        )
+        trusted_keys = parse_affine_claim_trusted_keys_json(
+            _read_bounded_affine_claim_file(
+                args.trusted_keys,
+                "affine claim trusted keys",
+                maximum_bytes=MAX_AFFINE_CLAIM_TRUSTED_KEYS_BYTES,
+                category="key",
+            )
+        )
+        verified = verify_affine_claim(
+            claim_bytes,
+            trusted_keys,
+            max_age_seconds=args.max_age_seconds,
+        )
+    except AffineClaimError as exc:
+        print(
+            json.dumps(
+                {"valid": False, "category": exc.category, "error": str(exc)},
+                sort_keys=True,
+            )
+        )
+        return 1
+    print(
+        json.dumps(
+            {
+                "valid": True,
+                "schema": verified.document["schema"],
+                "claim_id": verified.claim_id,
+                "claim_digest": verified.claim_digest,
+                "issued_at": verified.document["issued_at"],
+                "signing_key_id": verified.document["signing_key_id"],
+                "policy_digest": verified.document["policy_digest"],
+                "verify_outcome": verified.document["verify_outcome"],
+                "attestation_class": verified.document["attestation_class"],
+                "skip_rerun_authorized": verified.skip_rerun_authorized,
+                "affline_sandbox_tee_claimed": verified.document[
+                    "affline_sandbox_tee_claimed"
+                ],
+                "verification_scope": "cathedral_affine_claim_binding",
+                "evidence_independently_verified": verified.document[
+                    "attestation_independently_verified"
+                ],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_affine_claim_validate(args: argparse.Namespace) -> int:
+    try:
+        claim_bytes = _read_bounded_affine_claim_file(
+            args.claim,
+            "affine claim",
+            maximum_bytes=MAX_AFFINE_CLAIM_BYTES,
+            category="schema",
+        )
+        trusted_keys = parse_affine_claim_trusted_keys_json(
+            _read_bounded_affine_claim_file(
+                args.trusted_keys,
+                "affine claim trusted keys",
+                maximum_bytes=MAX_AFFINE_CLAIM_TRUSTED_KEYS_BYTES,
+                category="key",
+            )
+        )
+        verify_result = (
+            Path(args.verify_result).read_bytes() if args.verify_result else None
+        )
+        decision = validate_affine_submission(
+            claim_bytes=claim_bytes,
+            trusted_keys=trusted_keys,
+            verify_code=Path(args.verify_code).read_bytes(),
+            verify_inputs=Path(args.verify_inputs).read_bytes(),
+            miner_payload=Path(args.miner_payload).read_bytes(),
+            verify_result=verify_result,
+            force_full_rerun=bool(args.force_full_rerun),
+            spot_check=bool(args.spot_check),
+            is_king=bool(args.king),
+            is_dispute=bool(args.dispute),
+            max_age_seconds=args.max_age_seconds,
+        )
+    except (AffineClaimError, OSError, ValueError) as exc:
+        category = getattr(exc, "category", "schema")
+        print(
+            json.dumps(
+                {"action": "reject", "category": category, "error": str(exc)},
+                sort_keys=True,
+            )
+        )
+        return 1
+    print(json.dumps(decision_to_json(decision), sort_keys=True))
+    if decision.action == ValidatorAction.REJECT:
+        return 1
+    return 0
+
+
+def cmd_affine_claim_issue_from_cvm(args: argparse.Namespace) -> int:
+    """Issue an affine claim bound to a running CVM document (not Affline)."""
+
+    try:
+        cvm_raw = _read_bounded_affine_claim_file(
+            args.cvm_document,
+            "CVM document",
+            maximum_bytes=MAX_AFFINE_CLAIM_BYTES,
+            category="schema",
+        )
+        cvm_doc = json.loads(cvm_raw.decode("utf-8"))
+        if not isinstance(cvm_doc, dict):
+            raise AffineClaimError("schema", "CVM document must be a JSON object")
+        cvm = cvm_instance_from_running_document(cvm_doc)
+        key_bytes = Path(args.signing_key_file).read_bytes()
+        if len(key_bytes) != 32:
+            raise AffineClaimError(
+                "key",
+                "signing key file must be exactly 32 raw ed25519 seed bytes",
+            )
+        private_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
+        verify_result = None
+        if args.verify_result:
+            verify_result = Path(args.verify_result).read_bytes()
+        claim = issue_affine_claim_from_cvm(
+            cvm=cvm,
+            private_key=private_key,
+            signing_key_id=args.signing_key_id,
+            verify_code=Path(args.verify_code).read_bytes(),
+            verify_inputs=Path(args.verify_inputs).read_bytes(),
+            miner_payload=Path(args.miner_payload).read_bytes(),
+            verify_result=verify_result,
+            allow_reference=not args.require_hardware,
+        )
+        Path(args.out).write_bytes(claim)
+        body = json.loads(claim.decode("ascii"))
+        skip_authorized = (
+            body["attestation_class"] == "confidential_cpu"
+            and body["attestation_independently_verified"] is True
+            and body["verify_outcome"] == "passed"
+            and body["skip_rerun_eligible"] is True
+        )
+        print(
+            json.dumps(
+                {
+                    "issued": True,
+                    "out": args.out,
+                    "attestation_class": body["attestation_class"],
+                    "verify_outcome": body["verify_outcome"],
+                    "skip_rerun_eligible": body["skip_rerun_eligible"],
+                    "skip_rerun_authorized": skip_authorized,
+                    "claim_id": body["claim_id"],
+                },
+                sort_keys=True,
+            )
+        )
+    except AffineClaimError as exc:
+        print(
+            json.dumps(
+                {"issued": False, "category": exc.category, "error": str(exc)},
+                sort_keys=True,
+            )
+        )
+        return 1
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(
+            json.dumps(
+                {"issued": False, "category": "schema", "error": str(exc)},
+                sort_keys=True,
+            )
+        )
+        return 1
     return 0
 
 
@@ -4621,6 +4834,66 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_customer_receipt_verify.set_defaults(func=cmd_customer_receipt_verify)
 
+    p_affine_claim = sub.add_parser(
+        "affine-claim",
+        help="verify Affine claim bindings (validator load-off; not Affline TEE)",
+    )
+    affine_claim_sub = p_affine_claim.add_subparsers(
+        dest="affine_claim_command",
+        required=True,
+    )
+    p_affine_claim_verify = affine_claim_sub.add_parser(
+        "verify",
+        help="verify exact signed cathedral_affine_claim_v1 bytes",
+    )
+    p_affine_claim_verify.add_argument("--claim", required=True)
+    p_affine_claim_verify.add_argument("--trusted-keys", required=True)
+    p_affine_claim_verify.add_argument(
+        "--max-age-seconds",
+        type=int,
+        help="reject a valid signed claim older than this many seconds",
+    )
+    p_affine_claim_verify.set_defaults(func=cmd_affine_claim_verify)
+
+    p_affine_claim_issue = affine_claim_sub.add_parser(
+        "issue-from-cvm",
+        help="issue a claim from a running CVM document after Affine verify bytes",
+    )
+    p_affine_claim_issue.add_argument("--cvm-document", required=True)
+    p_affine_claim_issue.add_argument("--verify-code", required=True)
+    p_affine_claim_issue.add_argument("--verify-inputs", required=True)
+    p_affine_claim_issue.add_argument("--miner-payload", required=True)
+    p_affine_claim_issue.add_argument(
+        "--verify-result",
+        help="canonical Affine verify result JSON bytes; default: tiny built-in check",
+    )
+    p_affine_claim_issue.add_argument("--signing-key-file", required=True)
+    p_affine_claim_issue.add_argument("--signing-key-id", required=True)
+    p_affine_claim_issue.add_argument("--out", required=True)
+    p_affine_claim_issue.add_argument(
+        "--require-hardware",
+        action="store_true",
+        help="refuse reference CVM evidence (production skip-rerun path)",
+    )
+    p_affine_claim_issue.set_defaults(func=cmd_affine_claim_issue_from_cvm)
+
+    p_affine_claim_validate = affine_claim_sub.add_parser(
+        "validate",
+        help="validator stub: verify claim first, full re-run only when required",
+    )
+    p_affine_claim_validate.add_argument("--claim", required=True)
+    p_affine_claim_validate.add_argument("--trusted-keys", required=True)
+    p_affine_claim_validate.add_argument("--verify-code", required=True)
+    p_affine_claim_validate.add_argument("--verify-inputs", required=True)
+    p_affine_claim_validate.add_argument("--miner-payload", required=True)
+    p_affine_claim_validate.add_argument("--verify-result")
+    p_affine_claim_validate.add_argument("--max-age-seconds", type=int)
+    p_affine_claim_validate.add_argument("--king", action="store_true")
+    p_affine_claim_validate.add_argument("--dispute", action="store_true")
+    p_affine_claim_validate.add_argument("--spot-check", action="store_true")
+    p_affine_claim_validate.add_argument("--force-full-rerun", action="store_true")
+    p_affine_claim_validate.set_defaults(func=cmd_affine_claim_validate)
+
     p_lifecycle = sub.add_parser(
         "lifecycle",
         help="retained central-registry lifecycle; not current SN94 mining",
@@ -5386,8 +5659,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["memory", "docker", "kata"],
         default=None,
         help=(
-            "sandbox guest runtime (default: CATHEDRAL_SANDBOX_RUNTIME or memory). "
-            "docker = Linux containers; kata = Kata micro-VMs (customer production)"
+            "sandbox guest runtime (default: CATHEDRAL_SANDBOX_RUNTIME; required). "
+            "docker = Linux containers; kata = Kata micro-VMs (customer production). "
+            "memory requires --allow-insecure-dev or CATHEDRAL_ALLOW_MEMORY_RUNTIME=1"
         ),
     )
     p_sandbox_serve.set_defaults(func=cmd_sandbox_serve)

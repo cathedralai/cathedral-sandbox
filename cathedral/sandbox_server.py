@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import sys
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Mapping
@@ -157,9 +159,22 @@ class SandboxApplication:
         self._add("POST", s + r"/(?P<id>[^/]+)/network", self.set_network)
         self._add("PATCH", s + r"/(?P<id>[^/]+)/network", self.set_network)
         self._add("POST", s + r"/(?P<id>[^/]+)/expose", self.expose)
+        self._add("POST", s + r"/(?P<id>[^/]+)/freeze", self.freeze)
+        self._add("POST", s + r"/(?P<id>[^/]+)/thaw", self.thaw)
+        self._add("POST", s + r"/(?P<id>[^/]+)/access-tickets", self.mint_access_ticket)
+        self._add("POST", s + r"/(?P<id>[^/]+)/terminals", self.create_terminal)
+        self._add("GET", s + r"/(?P<id>[^/]+)/terminals", self.list_terminals)
+        self._add("DELETE", s + r"/(?P<id>[^/]+)/terminals/(?P<tid>[^/]+)", self.delete_terminal)
+        self._add("POST", s + r"/(?P<id>[^/]+)/terminals/(?P<tid>[^/]+)/connect", self.connect_terminal)
+        self._add("POST", s + r"/(?P<id>[^/]+)/terminals/(?P<tid>[^/]+)/input", self.terminal_write)
+        self._add("GET", s + r"/(?P<id>[^/]+)/terminals/(?P<tid>[^/]+)/output", self.terminal_read)
+        self._add("POST", s + r"/(?P<id>[^/]+)/publish", self.publish_template)
+        self._add("GET", s + r"/(?P<id>[^/]+)/desktop", self.desktop)
         self._add("GET", s + r"/(?P<id>[^/]+)/logs", self.logs)
         self._add("GET", r"/v1/snapshots", self.list_snapshots)
         self._add("DELETE", r"/v1/snapshots/(?P<id>[^/]+)", self.delete_snapshot)
+        self._add("GET", r"/v1/sandbox-templates", self.list_templates)
+        self._add("GET", r"/v1/sandbox-templates/(?P<uid>[^/]+)", self.get_template)
         self._add("POST", r"/v1/images/prefetch", self.prefetch)
         self._add("GET", r"/v1/images/(?P<ref>.+)", self.image_lookup)
         self._add("GET", r"/v1/quota", self.quota)
@@ -368,6 +383,73 @@ class SandboxApplication:
         payload = self._json(body)
         return Response.json(200, self.provider.expose(id, ExposeRequest(port=payload.get("port"))))
 
+    # ------------------------------------------------------------------ Agent IDE freeze / thaw
+    def freeze(self, *, id, **_):
+        return Response.json(200, self.provider.freeze(id))
+
+    def thaw(self, *, id, **_):
+        return Response.json(200, self.provider.thaw(id))
+
+    # ------------------------------------------------------------------ Agent IDE interactive (G4–G6)
+    def mint_access_ticket(self, *, id, body, **_):
+        payload = self._json(body)
+        return Response.json(200, self.provider.mint_access_ticket(id, ttl_sec=payload.get("ttl_sec")))
+
+    def create_terminal(self, *, id, body, **_):
+        payload = self._json(body)
+        return Response.json(
+            201,
+            self.provider.create_terminal(id, cols=payload.get("cols"), rows=payload.get("rows")),
+        )
+
+    def list_terminals(self, *, id, **_):
+        return Response.json(200, self.provider.list_terminals(id))
+
+    def delete_terminal(self, *, id, tid, **_):
+        self.provider.delete_terminal(id, tid)
+        return Response.no_content()
+
+    def connect_terminal(self, *, id, tid, query, body, **_):
+        payload = self._json(body)
+        ticket = payload.get("ticket") or (query.get("ticket") or [None])[0]
+        if not ticket:
+            raise api.SandboxContractError("invalid_access_ticket", "ticket is required")
+        return Response.json(200, self.provider.connect_terminal(id, tid, ticket=ticket))
+
+    def terminal_write(self, *, id, tid, body, **_):
+        payload = self._json(body)
+        data = payload.get("data")
+        if data is None:
+            raise api.SandboxContractError("invalid_terminal_input", "data is required")
+        return Response.json(200, self.provider.terminal_write(id, tid, str(data)))
+
+    def terminal_read(self, *, id, tid, **_):
+        return Response.json(200, self.provider.terminal_read(id, tid))
+
+    def publish_template(self, *, id, body, **_):
+        payload = self._json(body)
+        name = payload.get("name")
+        if not name:
+            raise api.SandboxContractError("invalid_template_name", "name is required")
+        doc = self.provider.publish_template(
+            id,
+            name=name,
+            display_name=payload.get("display_name"),
+            description=payload.get("description") or "",
+        )
+        return Response.json(202, doc)
+
+    def list_templates(self, *, query, **_):
+        kind = (query.get("kind") or [None])[0]
+        status = (query.get("status") or [None])[0]
+        return Response.json(200, {"items": self.provider.list_templates(kind=kind, status=status)})
+
+    def get_template(self, *, uid, **_):
+        return Response.json(200, self.provider.get_template(uid))
+
+    def desktop(self, *, id, **_):
+        return Response.json(200, self.provider.desktop(id))
+
     # ------------------------------------------------------------------ §3.13 logs
     def logs(self, *, id, **_):
         return Response.json(200, self.provider.logs(id))
@@ -441,6 +523,21 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/sandboxes/{id}/network", "post", "Set network policy", "§3.6"),
     ("/v1/sandboxes/{id}/network", "patch", "Patch network policy", "§3.6"),
     ("/v1/sandboxes/{id}/expose", "post", "Expose a port", "§3.7"),
+    ("/v1/sandboxes/{id}/freeze", "post", "Freeze (pause) a sandbox", "Agent IDE; state → frozen"),
+    ("/v1/sandboxes/{id}/thaw", "post", "Thaw a frozen sandbox", "Agent IDE; state → running"),
+    ("/v1/sandboxes/{id}/access-tickets", "post", "Mint access ticket", "Agent IDE G4; single-use"),
+    ("/v1/sandboxes/{id}/terminals", "post", "Create terminal", "Agent IDE G4"),
+    ("/v1/sandboxes/{id}/terminals", "get", "List terminals", "Agent IDE G4"),
+    ("/v1/sandboxes/{id}/terminals/{tid}", "delete", "Delete terminal", "Agent IDE G4"),
+    ("/v1/sandboxes/{id}/terminals/{tid}/connect", "post", "Connect terminal with ticket", "Agent IDE G4"),
+    ("/v1/sandboxes/{id}/terminals/{tid}/input", "post", "Write terminal input", "Agent IDE G4 REST PTY"),
+    ("/v1/sandboxes/{id}/terminals/{tid}/output", "get", "Read terminal output", "Agent IDE G4 REST PTY"),
+    ("/v1/sandboxes/{id}/terminals/{tid}/ws", "get", "Terminal WebSocket PTY", "Agent IDE G4; Upgrade + ticket"),
+    ("/v1/sandboxes/{id}/publish", "post", "Publish template from sandbox", "Agent IDE G6"),
+    ("/v1/sandboxes/{id}/desktop", "get", "Desktop availability", "Agent IDE G5; gated"),
+    ("/v1/sandboxes/{id}/desktop/ws", "get", "Desktop RFB WebSocket", "Agent IDE G5; ticket + CATHEDRAL_AGENT_DESKTOP=1"),
+    ("/v1/sandbox-templates", "get", "List sandbox templates", "Agent IDE G6"),
+    ("/v1/sandbox-templates/{uid}", "get", "Get sandbox template", "Agent IDE G6"),
     ("/v1/sandboxes/{id}/logs", "get", "Container + exec logs", "§3.13; kept 24 h after delete"),
     ("/v1/snapshots", "get", "List snapshots", "§3.5"),
     ("/v1/snapshots/{id}", "delete", "Delete a snapshot", "§3.5"),
@@ -563,6 +660,9 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(resp.body)
 
     def do_GET(self):
+        if (self.headers.get("Upgrade") or "").lower() == "websocket":
+            self._handle_websocket()
+            return
         self._run("GET")
 
     def do_POST(self):
@@ -577,8 +677,196 @@ class _Handler(BaseHTTPRequestHandler):
     def do_PATCH(self):
         self._run("PATCH")
 
-    def log_message(self, *args):  # silence
-        pass
+    def log_message(self, format: str, *args) -> None:  # noqa: A003
+        if os.environ.get("CATHEDRAL_SANDBOX_ACCESS_LOG") == "1":
+            sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
+
+    def _ws_fail(self, status: int, code: str, message: str) -> None:
+        body = json.dumps({"error": {"code": code, "message": message}}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_websocket(self) -> None:
+        from cathedral import agent_rfb
+        from cathedral import agent_websocket as ws
+
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        ticket, ticket_err = ws.extract_access_ticket(self.headers, query)
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key:
+            self._ws_fail(400, "invalid_websocket", "Sec-WebSocket-Key required")
+            return
+        if ticket_err == "ticket_query_forbidden":
+            self._ws_fail(
+                401,
+                "ticket_query_forbidden",
+                "pass ticket via X-Cathedral-Access-Ticket (query string disabled)",
+            )
+            return
+
+        term_match = re.match(
+            r"^/v1/sandboxes/(?P<id>[^/]+)/terminals/(?P<tid>[^/]+)/ws$", path
+        )
+        desk_match = re.match(r"^/v1/sandboxes/(?P<id>[^/]+)/desktop/ws$", path)
+        if term_match:
+            self._ws_terminal(term_match.group("id"), term_match.group("tid"), ticket, key, ws)
+            return
+        if desk_match:
+            self._ws_desktop(desk_match.group("id"), ticket, key, ws, agent_rfb)
+            return
+        self._ws_fail(404, "route_not_found", f"no websocket route for {path}")
+
+    def _ws_terminal(self, sandbox_id: str, terminal_id: str, ticket: str | None, key: str, ws) -> None:
+        if not ticket:
+            self._ws_fail(
+                401,
+                "access_ticket_invalid",
+                "X-Cathedral-Access-Ticket header (or cathedral.ticket.* subprotocol) required",
+            )
+            return
+        try:
+            # Consume ticket + mark connected (same gate as REST connect).
+            self.app.provider.connect_terminal(sandbox_id, terminal_id, ticket=ticket)
+        except SandboxOpError as exc:
+            self._ws_fail(exc.http_status, exc.code, str(exc))
+            return
+        protocol = f"cathedral.ticket.{ticket}"
+        self.wfile.write(ws.handshake_response(key, protocol=protocol))
+        self.wfile.flush()
+        # Push any buffered output (connect banner).
+        try:
+            out = self.app.provider.terminal_read(sandbox_id, terminal_id)
+            if out.get("data"):
+                self.wfile.write(ws.encode_frame(out["data"].encode("utf-8"), opcode=ws.OP_TEXT))
+                self.wfile.flush()
+        except SandboxOpError:
+            pass
+        buf = bytearray()
+        self.connection.settimeout(120.0)
+        try:
+            while True:
+                chunk = self.connection.recv(4096)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                frames, buf = ws.decode_frames(buf)
+                stop = False
+                for opcode, payload in frames:
+                    if opcode == ws.OP_CLOSE:
+                        self.wfile.write(ws.encode_frame(b"", opcode=ws.OP_CLOSE))
+                        stop = True
+                        break
+                    if opcode == ws.OP_PING:
+                        self.wfile.write(ws.encode_frame(payload, opcode=ws.OP_PONG))
+                        self.wfile.flush()
+                        continue
+                    if opcode in (ws.OP_TEXT, ws.OP_BINARY):
+                        text = payload.decode("utf-8", errors="replace")
+                        if text and not text.endswith("\n"):
+                            text += "\n"
+                        self.app.provider.terminal_write(sandbox_id, terminal_id, text)
+                        out = self.app.provider.terminal_read(sandbox_id, terminal_id)
+                        data = (out.get("data") or "").encode("utf-8")
+                        if data:
+                            self.wfile.write(ws.encode_frame(data, opcode=ws.OP_TEXT))
+                            self.wfile.flush()
+                if stop:
+                    break
+        except (TimeoutError, BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def _ws_desktop(self, sandbox_id: str, ticket: str | None, key: str, ws, agent_rfb) -> None:
+        import os as _os
+
+        if _os.environ.get("CATHEDRAL_AGENT_DESKTOP", "0") != "1":
+            self._ws_fail(404, "desktop_unavailable", "set CATHEDRAL_AGENT_DESKTOP=1 to enable desktop")
+            return
+        if not ticket:
+            self._ws_fail(
+                401,
+                "access_ticket_invalid",
+                "X-Cathedral-Access-Ticket header (or cathedral.ticket.* subprotocol) required",
+            )
+            return
+        try:
+            self.app.provider.consume_access_ticket(sandbox_id, ticket)
+        except SandboxOpError as exc:
+            self._ws_fail(exc.http_status, exc.code, str(exc))
+            return
+        protocol = f"cathedral.ticket.{ticket}"
+        self.wfile.write(ws.handshake_response(key, protocol=protocol))
+        self.wfile.flush()
+
+        def send_rfb(data: bytes) -> None:
+            self.wfile.write(ws.encode_frame(data, opcode=ws.OP_BINARY))
+            self.wfile.flush()
+
+        # RFB version exchange over WS binary frames, then VNC Auth with the ticket.
+        send_rfb(agent_rfb.RFB_VERSION)
+        buf = bytearray()
+        self.connection.settimeout(120.0)
+        stage = "version"
+        challenge = b""
+        rfb_buf = bytearray()
+        try:
+            while True:
+                chunk = self.connection.recv(4096)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                frames, buf = ws.decode_frames(buf)
+                stop = False
+                for opcode, payload in frames:
+                    if opcode == ws.OP_CLOSE:
+                        self.wfile.write(ws.encode_frame(b"", opcode=ws.OP_CLOSE))
+                        stop = True
+                        break
+                    if opcode == ws.OP_PING:
+                        self.wfile.write(ws.encode_frame(payload, opcode=ws.OP_PONG))
+                        self.wfile.flush()
+                        continue
+                    if opcode not in (ws.OP_BINARY, ws.OP_TEXT):
+                        continue
+                    if stage == "version":
+                        if b"RFB " in payload or payload.startswith(b"RFB"):
+                            send_rfb(agent_rfb.security_offer_vnc())
+                            stage = "security_type"
+                        continue
+                    if stage == "security_type":
+                        # Client selects one byte security type.
+                        if not payload:
+                            continue
+                        chosen = payload[0]
+                        if chosen != agent_rfb.SECURITY_TYPE_VNC:
+                            send_rfb(agent_rfb.security_result_fail())
+                            stop = True
+                            break
+                        challenge = agent_rfb.new_vnc_challenge()
+                        send_rfb(challenge)
+                        stage = "vnc_response"
+                        continue
+                    if stage == "vnc_response":
+                        if len(payload) < 16:
+                            continue
+                        if not agent_rfb.verify_vnc_response(challenge, payload[:16], ticket):
+                            send_rfb(agent_rfb.security_result_fail())
+                            stop = True
+                            break
+                        send_rfb(agent_rfb.security_result_ok())
+                        send_rfb(agent_rfb.server_init())
+                        stage = "session"
+                        continue
+                    rfb_buf.extend(payload)
+                    agent_rfb.handle_client_messages(rfb_buf, send_rfb)
+                if stop:
+                    break
+        except (TimeoutError, BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
 
 def serve(app: SandboxApplication, host: str = "127.0.0.1", port: int = 0) -> ThreadingHTTPServer:

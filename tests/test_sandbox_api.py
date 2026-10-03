@@ -201,6 +201,23 @@ def test_evaluate_quota_respects_per_key_subquota(monkeypatch: pytest.MonkeyPatc
     assert decision.http_status == 429 and decision.reason == "key_subquota_exhausted"
 
 
+def test_evaluate_quota_falls_back_to_key_store_max_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ApiKey.max_running / CATHEDRAL_SANDBOX_KEYS third field applies when KEY_QUOTAS unset."""
+    monkeypatch.delenv("CATHEDRAL_KEY_QUOTAS", raising=False)
+    monkeypatch.delenv("FACADE_KEY_QUOTAS", raising=False)
+    limits = QuotaLimits(running_sandboxes=500, vcpu=1000, memory_gib=3000)
+    usage = QuotaUsage(running_sandboxes=3, vcpu=3, memory_gib=6)
+    blocked = evaluate_quota(
+        _create(), limits=limits, usage=usage, api_key="ditto-demo-key", key_max_running=3
+    )
+    assert blocked.http_status == 429 and blocked.reason == "key_subquota_exhausted"
+    ok = evaluate_quota(
+        _create(), limits=limits, usage=usage, api_key="ditto-demo-key", key_max_running=8
+    )
+    assert ok.admitted is True
+
+
+
 # ---------------------------------------------------------------- §3.4 lifecycle / GC
 def test_is_collectable_past_ttl_and_stalled_heartbeat() -> None:
     now = datetime(2026, 9, 30, tzinfo=timezone.utc)
