@@ -8,7 +8,9 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = ROOT / ".github" / "workflows" / "release-tdx-verifier.yml"
 TEMPLATE_PATH = ROOT / "docs" / "TDX_VERIFIER_RELEASE_NOTES_TEMPLATE.md"
 GUIDE_PATH = ROOT / "docs" / "TDX_VERIFIER_RELEASE.md"
-EXPECTED_SHA256 = "4b6fbaf12def5e4284b54f557c5c29e472d7666f0160a11a5472fdcf462db148"
+# The next release the workflow will accept; v1.0.0 stays the published one.
+EXPECTED_SHA256 = "eb3fffb61e35ad9605e3a84869f8c3a9f8e647605b3d407ebf4a29324c4e93cc"
+PUBLISHED_V1_0_0_SHA256 = "4b6fbaf12def5e4284b54f557c5c29e472d7666f0160a11a5472fdcf462db148"
 
 
 def test_verifier_release_requires_an_explicit_exact_semver_tag():
@@ -178,6 +180,8 @@ def test_release_notes_template_binds_provenance_and_states_trust_limits():
     assert "cathedral-tdx-verifier-v1.0.0" in guide
     assert "065852443ef423e16b77289086321807f226a50d" in guide
     assert EXPECTED_SHA256 in guide
+    assert PUBLISHED_V1_0_0_SHA256 in guide
+    assert "not yet published" in normalized_guide
     assert "exactly the binary and checksum" in normalized_guide
     assert "downloads both anonymously" in normalized_guide
     assert "two separate empty build caches" in normalized_guide
