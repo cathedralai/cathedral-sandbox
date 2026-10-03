@@ -97,6 +97,8 @@ _IMAGE_REF_RE = re.compile(
     r"^(?:(?P<registry>[a-z0-9._-]+(?::[0-9]+)?)/)?(?P<repository>[a-z0-9._/-]+?)"
     r"(?::(?P<tag>[A-Za-z0-9][A-Za-z0-9_.-]{0,127})|@(?P<digest>sha256:[0-9a-f]{64}))$"
 )
+# Agent IDE published templates (G6): sbt-<slug>-<hex>
+_TEMPLATE_UID_RE = re.compile(r"^sbt-[a-z0-9][a-z0-9-]{0,48}$")
 
 
 class SandboxContractError(ValueError):
@@ -128,6 +130,9 @@ class ImageSource:
     resolved_digest: str | None = None
 
     def __post_init__(self) -> None:
+        if _TEMPLATE_UID_RE.fullmatch(self.image):
+            # Agent IDE template UID — resolved by the provider to a concrete image.
+            return
         match = _IMAGE_REF_RE.match(self.image)
         _require(match is not None, "invalid_image_reference", f"image reference is invalid: {self.image!r}")
         assert match is not None
@@ -449,8 +454,16 @@ def evaluate_quota(
     limits: QuotaLimits,
     usage: QuotaUsage,
     api_key: str | None = None,
+    key_max_running: int | None = None,
+    key_usage: QuotaUsage | None = None,
 ) -> QuotaDecision:
-    """§3.8: a full quota is a synchronous 429 with Retry-After, never a start-timeout."""
+    """§3.8: a full quota is a synchronous 429 with Retry-After, never a start-timeout.
+
+    Per-key caps prefer ``CATHEDRAL_KEY_QUOTAS``; when unset, ``key_max_running`` from
+    the key store (``CATHEDRAL_SANDBOX_KEYS`` third field / ``ApiKey.max_running``) applies.
+    Key subquota is measured against ``key_usage`` (resident sandboxes owned by the key),
+    not the project-wide usage, so one tenant cannot exhaust another's subquota math.
+    """
     projected = QuotaUsage(
         running_sandboxes=usage.running_sandboxes + request.count,
         vcpu=usage.vcpu + request.total_vcpu,
@@ -460,7 +473,10 @@ def evaluate_quota(
         return QuotaDecision(admitted=False, http_status=429, retry_after_seconds=1, reason="project_quota_exhausted")
     if api_key is not None:
         max_running = key_quota_for(api_key)
-        if max_running is not None and usage.running_sandboxes + request.count > max_running:
+        if max_running is None:
+            max_running = key_max_running
+        owned = key_usage if key_usage is not None else usage
+        if max_running is not None and owned.running_sandboxes + request.count > max_running:
             return QuotaDecision(admitted=False, http_status=429, retry_after_seconds=1, reason="key_subquota_exhausted")
     return QuotaDecision(admitted=True, http_status=202, retry_after_seconds=None)
 
@@ -833,6 +849,8 @@ class StatusReport:
                 "kernel_isolation": self.kernel_isolation,
                 "dind": self.dind,
                 "disk_enforced": self.disk_enforced,
+                # Honest: allowlist mode maps to network=none until an egress proxy exists.
+                "network_allowlist_enforced": False,
             }
         )
 

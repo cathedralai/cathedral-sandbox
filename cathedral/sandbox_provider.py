@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol
 
 from cathedral import sandbox_api as api
+from cathedral import agent_interactive as agent_ux
 from cathedral.sandbox_api import (
     ApiKey,
     CreateSandboxRequest,
@@ -146,6 +147,29 @@ class SandboxProvider(Protocol):
     def logs(self, sandbox_id: str) -> dict[str, Any]: ...
     def get_operation(self, operation_id: str) -> dict[str, Any]: ...
     def sweep(self) -> int: ...
+    def freeze(self, sandbox_id: str) -> dict[str, Any]: ...
+    def thaw(self, sandbox_id: str) -> dict[str, Any]: ...
+    def mint_access_ticket(self, sandbox_id: str, *, ttl_sec: int | None = None) -> dict[str, Any]: ...
+    def consume_access_ticket(self, sandbox_id: str, ticket: str) -> None: ...
+    def create_terminal(
+        self, sandbox_id: str, *, cols: int | None = None, rows: int | None = None
+    ) -> dict[str, Any]: ...
+    def list_terminals(self, sandbox_id: str) -> list[dict[str, Any]]: ...
+    def delete_terminal(self, sandbox_id: str, terminal_id: str) -> None: ...
+    def connect_terminal(self, sandbox_id: str, terminal_id: str, *, ticket: str) -> dict[str, Any]: ...
+    def terminal_write(self, sandbox_id: str, terminal_id: str, data: str) -> dict[str, Any]: ...
+    def terminal_read(self, sandbox_id: str, terminal_id: str) -> dict[str, Any]: ...
+    def publish_template(
+        self,
+        sandbox_id: str,
+        *,
+        name: str,
+        display_name: str | None = None,
+        description: str = "",
+    ) -> dict[str, Any]: ...
+    def list_templates(self, *, kind: str | None = None, status: str | None = None) -> list[dict[str, Any]]: ...
+    def get_template(self, template_uid: str) -> dict[str, Any]: ...
+    def desktop(self, sandbox_id: str) -> dict[str, Any]: ...
 
 
 class InMemorySandboxProvider:
@@ -196,21 +220,73 @@ class InMemorySandboxProvider:
         # Customer checklist §3.6: when enabled, file/tar writes that would exceed resources.disk_gib fail.
         self._enforce_disk = enforce_disk
         self._runtime_label = runtime_label
+        # Agent IDE interactive (G4–G6): tickets, terminals, published templates.
+        self._tickets: dict[str, agent_ux.AccessTicket] = {}
+        self._terminals: dict[str, dict[str, agent_ux.TerminalSession]] = {}
+        self._templates: dict[str, agent_ux.SandboxTemplate] = {}
+        # Per-request tenant context (thread-local) — set by authorize().
+        self._ctx = threading.local()
+        # Per-key create pacing buckets (noisy-neighbor isolation).
+        self._create_times_by_key: dict[str, list[datetime]] = {}
 
     # ------------------------------------------------------------------ helpers
+    def _caller_key(self) -> str | None:
+        return getattr(self._ctx, "api_key", None)
+
     def _host(self, sandbox: _Sandbox, path: str) -> Path:
         api._validated_abs_path(path)
-        return sandbox.root / path.lstrip("/")
+        host = (sandbox.root / path.lstrip("/")).resolve()
+        root = sandbox.root.resolve()
+        try:
+            host.relative_to(root)
+        except ValueError as exc:
+            raise SandboxOpError(
+                "path_escape",
+                400,
+                f"path escapes sandbox root: {path}",
+            ) from exc
+        return host
+
+    def _assert_owner(self, sandbox: _Sandbox) -> None:
+        """BOLA guard: authenticated callers may only touch their own sandboxes."""
+        caller = self._caller_key()
+        if caller is None:
+            return
+        if sandbox.api_key is not None and sandbox.api_key != caller:
+            raise SandboxOpError(
+                "sandbox_not_found",
+                404,
+                f"no sandbox {sandbox.id}",
+            )
 
     def _require_active(self, sandbox_id: str) -> _Sandbox:
         sandbox = self._sandboxes.get(sandbox_id)
         if sandbox is None or sandbox.state == "deleted":
             raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
+        self._assert_owner(sandbox)
+        return sandbox
+
+    def _require_running(self, sandbox_id: str) -> _Sandbox:
+        """Agent IDE: exec/mutate paths need running; frozen is 409."""
+        sandbox = self._require_active(sandbox_id)
+        if sandbox.state == "frozen":
+            raise SandboxOpError(
+                "sandbox_frozen",
+                409,
+                f"sandbox {sandbox_id} is frozen; thaw before this operation",
+            )
+        if sandbox.state not in ("running", "creating"):
+            raise SandboxOpError(
+                "sandbox_not_running",
+                409,
+                f"sandbox {sandbox_id} is {sandbox.state}",
+            )
         return sandbox
 
     def authorize(self, api_key: str | None) -> None:
         """Public auth gate: validate a bearer key for any request (§3.14)."""
         self._auth(api_key)
+        self._ctx.api_key = api_key
 
     def _auth(self, api_key: str | None) -> None:
         """§3.14: revoke blocks new calls but deletes nothing; unknown keys are rejected.
@@ -271,6 +347,7 @@ class InMemorySandboxProvider:
     def create(self, request: CreateSandboxRequest, *, api_key: str | None, idempotency: str | None, body_digest: str) -> dict[str, Any]:
         with self._lock:
             self._auth(api_key)
+            self._ctx.api_key = api_key
             if idempotency is not None:
                 api.validate_idempotency_key(idempotency)
                 seen = self._idempotency.get(idempotency)
@@ -293,18 +370,30 @@ class InMemorySandboxProvider:
 
     def _create_locked(self, request: CreateSandboxRequest, api_key: str | None) -> dict[str, Any]:
         # §3.10/§3.11 pacing: at most ``creates_per_minute`` sandbox-creates in any
-        # trailing 60-second window (a fork of N counts as N creates).
+        # trailing 60-second window (a fork of N counts as N creates), per API key.
         now = _now()
         window_start = now - timedelta(seconds=60)
-        self._create_times = [t for t in self._create_times if t > window_start]
-        if len(self._create_times) + request.count > self._creates_per_minute:
+        rate_key = api_key or ""
+        times = [t for t in self._create_times_by_key.get(rate_key, []) if t > window_start]
+        if len(times) + request.count > self._creates_per_minute:
             raise SandboxOpError(
                 "create_rate_exceeded",
                 429,
                 f"create pacing exceeded ({self._creates_per_minute}/min)",
                 retry_after=1,
             )
-        decision = api.evaluate_quota(request, limits=self._limits, usage=self._usage_now(), api_key=api_key)
+        self._create_times_by_key[rate_key] = times
+        # Keep legacy global list for status metrics (sum of buckets).
+        self._create_times = [t for bucket in self._create_times_by_key.values() for t in bucket if t > window_start]
+        key_record = self._keys.get(api_key) if api_key else None
+        decision = api.evaluate_quota(
+            request,
+            limits=self._limits,
+            usage=self._usage_now(),
+            api_key=api_key,
+            key_max_running=key_record.max_running if key_record is not None else None,
+            key_usage=self._usage_now(api_key=api_key) if api_key else None,
+        )
         if not decision.admitted:
             raise SandboxOpError(
                 "quota_exhausted" if decision.reason != "key_subquota_exhausted" else "key_subquota_exhausted",
@@ -327,10 +416,21 @@ class InMemorySandboxProvider:
             snap = None
 
         image_id = self._image_id_for(request)
+        allow = os.environ.get("CATHEDRAL_SANDBOX_IMAGE_ALLOWLIST", "").strip()
+        if allow and request.image is not None:
+            allowed = {x.strip() for x in allow.split(",") if x.strip()}
+            ref = request.image.image
+            if ref not in allowed:
+                raise SandboxOpError(
+                    "image_not_allowed",
+                    403,
+                    f"image {ref!r} is not in CATHEDRAL_SANDBOX_IMAGE_ALLOWLIST",
+                )
         created: list[_Sandbox] = []
         for _ in range(request.count):
             sandbox = self._materialize(request, now, api_key, image_id, snap)
             created.append(sandbox)
+        self._create_times_by_key.setdefault(rate_key, []).extend(now for _ in created)
         self._create_times.extend(now for _ in created)
         if len(created) == 1:
             return self._get_doc(created[0])
@@ -341,7 +441,34 @@ class InMemorySandboxProvider:
             # §3.9: built images are cached by content hash; a rebuild is a no-op.
             return "img_" + request.build.content_hash.split(":")[1][:16]
         if request.image is not None:
-            self._images.setdefault(request.image.image, {"cached": True, "size_bytes": 0, "digest": request.image.digest})
+            ref = request.image.image
+            tmpl = self._templates.get(ref)
+            if tmpl is not None:
+                caller = self._caller_key()
+                if (
+                    caller is not None
+                    and tmpl.owner_api_key is not None
+                    and tmpl.owner_api_key != caller
+                ):
+                    raise SandboxOpError(
+                        "template_not_found",
+                        404,
+                        f"no template {ref}",
+                    )
+                if tmpl.status != "READY":
+                    raise SandboxOpError(
+                        "template_not_ready",
+                        409,
+                        f"template {ref} is {tmpl.status}",
+                    )
+                self._images.setdefault(
+                    tmpl.image_ref,
+                    {"cached": True, "size_bytes": 0, "digest": None},
+                )
+                return tmpl.image_ref
+            self._images.setdefault(
+                ref, {"cached": True, "size_bytes": 0, "digest": request.image.digest}
+            )
             return "img_" + uuid.uuid4().hex[:12]
         return None
 
@@ -428,11 +555,25 @@ class InMemorySandboxProvider:
         return doc
 
     # ------------------------------------------------------------------ §3.2 exec / processes
+    @staticmethod
+    def _guest_env(sandbox: _Sandbox, request_env: Mapping[str, str] | None = None) -> dict[str, str]:
+        """Build guest env without inheriting host secrets (CATHEDRAL_*, cloud keys, etc.)."""
+        env: dict[str, str] = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+            "HOME": str(sandbox.root),
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+            "TERM": os.environ.get("TERM", "xterm"),
+        }
+        env.update(sandbox.env)
+        if request_env:
+            env.update(dict(request_env))
+        return env
+
     def _run(self, sandbox: _Sandbox, request: ExecRequest) -> tuple[int, bytes, bytes, bool, float]:
         argv = list(request.argv)
         cwd = str(self._host(sandbox, request.cwd)) if request.cwd else str(sandbox.root / "work")
         os.makedirs(cwd, exist_ok=True)
-        env = {**os.environ, "HOME": str(sandbox.root), **sandbox.env, **dict(request.env)}
+        env = self._guest_env(sandbox, request.env)
         stdin = request.stdin.encode() if request.stdin is not None else None
         proc = subprocess.Popen(
             argv, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -454,7 +595,7 @@ class InMemorySandboxProvider:
 
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
         with self._lock:
-            sandbox = self._require_active(sandbox_id)
+            sandbox = self._require_running(sandbox_id)
         code, out, err, timed_out, duration = self._run(sandbox, request)
         sandbox_api_cap = api.STDOUT_CAP_BYTES
         truncated = len(out) > sandbox_api_cap or len(err) > sandbox_api_cap
@@ -482,14 +623,14 @@ class InMemorySandboxProvider:
 
     def start_process(self, sandbox_id: str, request: ExecRequest) -> ProcessHandle:
         with self._lock:
-            sandbox = self._require_active(sandbox_id)
+            sandbox = self._require_running(sandbox_id)
             pid = "proc_" + uuid.uuid4().hex[:10]
             logpath = sandbox.root / f".process-{pid}.log"
             cwd = str(self._host(sandbox, request.cwd)) if request.cwd else str(sandbox.root / "work")
             os.makedirs(cwd, exist_ok=True)
             # A background process must outlive the call that started it (§3.2).
             handle = subprocess.Popen(
-                list(request.argv), cwd=cwd, env={**os.environ, **sandbox.env, **dict(request.env)},
+                list(request.argv), cwd=cwd, env=self._guest_env(sandbox, request.env),
                 stdout=open(logpath, "wb"), stderr=subprocess.STDOUT, start_new_session=True,
             )
             sandbox.processes[pid] = (handle, logpath)
@@ -519,7 +660,7 @@ class InMemorySandboxProvider:
     # ------------------------------------------------------------------ §3.3 files / tar / stat
     def write_file(self, sandbox_id: str, path: str, data: bytes, mode: int | None) -> None:
         with self._lock:
-            sandbox = self._require_active(sandbox_id)
+            sandbox = self._require_running(sandbox_id)
             self._touch(sandbox)
             self._assert_disk_room(sandbox, extra_bytes=len(data), replacing=path)
         host = self._host(sandbox, path)
@@ -548,7 +689,7 @@ class InMemorySandboxProvider:
 
     def write_tar(self, sandbox_id: str, path: str, tarball: bytes) -> None:
         with self._lock:
-            sandbox = self._require_active(sandbox_id)
+            sandbox = self._require_running(sandbox_id)
             self._touch(sandbox)
             # Bound by compressed size as a conservative pre-check; post-extract
             # recheck catches expansion past disk_gib.
@@ -736,6 +877,7 @@ class InMemorySandboxProvider:
             "resources": sandbox.resources,
             "created_at": sandbox.created_at,
             "deleted_at": sandbox.deleted_at,
+            "api_key": sandbox.api_key,
             "retained_until": sandbox.deleted_at + timedelta(hours=api.PROCESS_LOG_RETENTION_HOURS),
         }
 
@@ -744,6 +886,7 @@ class InMemorySandboxProvider:
         with self._lock:
             sandbox = self._sandboxes.get(sandbox_id)
             if sandbox is not None and sandbox.state != "deleted":
+                self._assert_owner(sandbox)
                 return {
                     "sandbox_id": sandbox.id,
                     "state": sandbox.state,
@@ -753,6 +896,10 @@ class InMemorySandboxProvider:
                 }
             tomb = self._log_tombstones.get(sandbox_id)
             if tomb is None or _now() > tomb["retained_until"]:
+                raise SandboxOpError("sandbox_not_found", 404, f"no logs for sandbox {sandbox_id}")
+            tomb_key = tomb.get("api_key")
+            caller = self._caller_key()
+            if caller is not None and tomb_key is not None and tomb_key != caller:
                 raise SandboxOpError("sandbox_not_found", 404, f"no logs for sandbox {sandbox_id}")
             return {
                 "sandbox_id": sandbox_id,
@@ -800,9 +947,12 @@ class InMemorySandboxProvider:
     # ------------------------------------------------------------------ §3.4 list / bulk delete
     def list(self, *, labels: Iterable[str], state: str | None) -> list[dict[str, Any]]:
         want = _parse_label_filters(labels)
+        caller = self._caller_key()
         with self._lock:
             out = []
             for sandbox in self._sandboxes.values():
+                if caller is not None and sandbox.api_key is not None and sandbox.api_key != caller:
+                    continue
                 if state and sandbox.state != state:
                     continue
                 if all(sandbox.labels.get(k) == v for k, v in want.items()):
@@ -814,9 +964,13 @@ class InMemorySandboxProvider:
         if not want:
             # §3.4: bulk delete is label-scoped; an unfiltered bulk delete is refused.
             raise SandboxContractError("invalid_label", "bulk delete requires at least one label filter")
+        caller = self._caller_key()
         with self._lock:
             targets = [
-                sid for sid, s in self._sandboxes.items() if all(s.labels.get(k) == v for k, v in want.items())
+                sid
+                for sid, s in self._sandboxes.items()
+                if all(s.labels.get(k) == v for k, v in want.items())
+                and (caller is None or s.api_key is None or s.api_key == caller)
             ]
         for sid in targets:
             self.delete(sid)
@@ -825,17 +979,286 @@ class InMemorySandboxProvider:
     # ------------------------------------------------------------------ §3.7 network / expose
     def set_network(self, sandbox_id: str, patch: NetworkPatch) -> dict[str, Any]:
         with self._lock:
-            sandbox = self._require_active(sandbox_id)
+            sandbox = self._require_running(sandbox_id)
             sandbox.network_mode = patch.mode
             sandbox.network_allow = tuple(patch.allow)
             return {"sandbox_id": sandbox_id, "network": {"mode": sandbox.network_mode, "allow": list(sandbox.network_allow)}}
 
     def expose(self, sandbox_id: str, request: ExposeRequest) -> dict[str, Any]:
         with self._lock:
-            sandbox = self._require_active(sandbox_id)
+            sandbox = self._require_running(sandbox_id)
             url = f"https://{sandbox_id}-{request.port}.{_host_of(self._base_url)}"
             sandbox.exposed[request.port] = url
             return {"port": request.port, "url": url, "status": "exposed"}
+
+    # ------------------------------------------------------------------ Agent IDE freeze / thaw (G2)
+    def freeze(self, sandbox_id: str) -> dict[str, Any]:
+        """Pause a running sandbox without deleting it (Agent IDE).
+
+        Frozen sandboxes still occupy resident quota (honest host capacity).
+        Mutate/exec paths refuse with sandbox_frozen until thaw.
+        """
+        with self._lock:
+            sandbox = self._require_active(sandbox_id)
+            if sandbox.state == "frozen":
+                return self._get_doc(sandbox)
+            if sandbox.state != "running":
+                raise SandboxOpError(
+                    "sandbox_not_running",
+                    409,
+                    f"cannot freeze sandbox in state {sandbox.state}",
+                )
+            # Best-effort pause of background processes (memory runtime).
+            for handle, _log in list(sandbox.processes.values()):
+                if handle.poll() is None:
+                    try:
+                        os.killpg(os.getpgid(handle.pid), signal.SIGSTOP)
+                    except (ProcessLookupError, PermissionError, AttributeError):
+                        try:
+                            handle.send_signal(signal.SIGSTOP)
+                        except (ProcessLookupError, PermissionError, AttributeError):
+                            pass
+            sandbox.state = "frozen"
+            return self._get_doc(sandbox)
+
+    def thaw(self, sandbox_id: str) -> dict[str, Any]:
+        """Restore a frozen sandbox to running."""
+        with self._lock:
+            sandbox = self._require_active(sandbox_id)
+            if sandbox.state == "running":
+                return self._get_doc(sandbox)
+            if sandbox.state != "frozen":
+                raise SandboxOpError(
+                    "sandbox_not_frozen",
+                    409,
+                    f"cannot thaw sandbox in state {sandbox.state}",
+                )
+            for handle, _log in list(sandbox.processes.values()):
+                if handle.poll() is None:
+                    try:
+                        os.killpg(os.getpgid(handle.pid), signal.SIGCONT)
+                    except (ProcessLookupError, PermissionError, AttributeError):
+                        try:
+                            handle.send_signal(signal.SIGCONT)
+                        except (ProcessLookupError, PermissionError, AttributeError):
+                            pass
+            sandbox.state = "running"
+            self._touch(sandbox)
+            return self._get_doc(sandbox)
+
+    # ------------------------------------------------------------------ Agent IDE interactive (G4–G6)
+    def mint_access_ticket(self, sandbox_id: str, *, ttl_sec: int | None = None) -> dict[str, Any]:
+        with self._lock:
+            self._require_running(sandbox_id)
+            try:
+                ttl = agent_ux.validate_ticket_ttl(ttl_sec)
+            except ValueError as exc:
+                raise SandboxOpError("invalid_access_ticket_ttl", 400, str(exc)) from exc
+            ticket = agent_ux.AccessTicket(
+                ticket=agent_ux.new_ticket_id(),
+                sandbox_id=sandbox_id,
+                expires_at=time.time() + ttl,
+            )
+            self._tickets[ticket.ticket] = ticket
+            return ticket.to_document()
+
+    def consume_access_ticket(self, sandbox_id: str, ticket: str) -> None:
+        """Public single-use ticket consume (desktop WS / external bridges)."""
+        with self._lock:
+            self._require_running(sandbox_id)
+            self._consume_ticket(sandbox_id, ticket)
+
+    def _consume_ticket(self, sandbox_id: str, ticket: str) -> None:
+        rec = self._tickets.get(ticket)
+        if rec is None or rec.sandbox_id != sandbox_id or not rec.alive():
+            raise SandboxOpError("access_ticket_invalid", 401, "missing, expired, or consumed access ticket")
+        rec.consumed = True
+
+    def create_terminal(
+        self, sandbox_id: str, *, cols: int | None = None, rows: int | None = None
+    ) -> dict[str, Any]:
+        with self._lock:
+            self._require_running(sandbox_id)
+            try:
+                c, r = agent_ux.validate_terminal_size(cols, rows)
+            except ValueError as exc:
+                raise SandboxOpError("invalid_terminal_size", 400, str(exc)) from exc
+            term = agent_ux.TerminalSession(
+                id=agent_ux.new_terminal_id(),
+                sandbox_id=sandbox_id,
+                cols=c,
+                rows=r,
+                started_at=agent_ux.utc_now(),
+            )
+            self._terminals.setdefault(sandbox_id, {})[term.id] = term
+            return term.to_document()
+
+    def list_terminals(self, sandbox_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            self._require_active(sandbox_id)
+            return [t.to_document() for t in self._terminals.get(sandbox_id, {}).values()]
+
+    def delete_terminal(self, sandbox_id: str, terminal_id: str) -> None:
+        with self._lock:
+            self._require_active(sandbox_id)
+            bag = self._terminals.get(sandbox_id, {})
+            term = bag.get(terminal_id)
+            if term is None:
+                raise SandboxOpError("terminal_not_found", 404, f"no terminal {terminal_id}")
+            term.exited = True
+            term.exit_code = 0
+            del bag[terminal_id]
+
+    def connect_terminal(self, sandbox_id: str, terminal_id: str, *, ticket: str) -> dict[str, Any]:
+        """Consume a single-use access ticket and mark the terminal connected (G4).
+
+        Full WebSocket PTY framing can ride this handshake; the reference provider
+        exposes REST write/read after connect for deterministic tests.
+        """
+        with self._lock:
+            self._require_running(sandbox_id)
+            self._consume_ticket(sandbox_id, ticket)
+            term = self._terminals.get(sandbox_id, {}).get(terminal_id)
+            if term is None or term.exited:
+                raise SandboxOpError("terminal_not_found", 404, f"no terminal {terminal_id}")
+            term.connected = True
+            term.output.extend(b"[cathedral] terminal connected\n")
+            return {
+                "terminal_id": terminal_id,
+                "connected": True,
+                "transport": "websocket+rest",
+                "ws_path": f"/v1/sandboxes/{sandbox_id}/terminals/{terminal_id}/ws",
+                "note": "Prefer WebSocket /ws with X-Cathedral-Access-Ticket (query tickets disabled); REST write/read remain for tests.",
+            }
+
+    def terminal_write(self, sandbox_id: str, terminal_id: str, data: str) -> dict[str, Any]:
+        with self._lock:
+            self._require_running(sandbox_id)
+            term = self._terminals.get(sandbox_id, {}).get(terminal_id)
+            if term is None or term.exited:
+                raise SandboxOpError("terminal_not_found", 404, f"no terminal {terminal_id}")
+            if not term.connected:
+                raise SandboxOpError("terminal_not_connected", 409, "connect with an access ticket first")
+            term.input_buf.extend(data.encode("utf-8", errors="replace"))
+            # Execute complete lines through the sandbox exec path (interactive shell lines).
+            text = term.input_buf.decode("utf-8", errors="replace")
+            if "\n" not in text and "\r" not in text:
+                return {"written": len(data), "pending": True}
+            lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            term.input_buf = bytearray(lines[-1].encode("utf-8"))
+            for line in lines[:-1]:
+                cmd = line.strip()
+                if not cmd:
+                    continue
+                term.output.extend(f"$ {cmd}\n".encode())
+        # Run outside the lock (exec takes its own lock).
+        for line in lines[:-1]:
+            cmd = line.strip()
+            if not cmd:
+                continue
+            try:
+                result = self.exec(sandbox_id, ExecRequest(cmd=cmd, timeout_seconds=30))
+                chunk = (result.stdout or "") + (result.stderr or "")
+                with self._lock:
+                    term = self._terminals.get(sandbox_id, {}).get(terminal_id)
+                    if term is not None:
+                        term.output.extend(chunk.encode("utf-8", errors="replace"))
+                        if not chunk.endswith("\n"):
+                            term.output.extend(b"\n")
+            except SandboxOpError as exc:
+                with self._lock:
+                    term = self._terminals.get(sandbox_id, {}).get(terminal_id)
+                    if term is not None:
+                        term.output.extend(f"[error] {exc}\n".encode())
+        return {"written": len(data), "pending": False}
+
+    def terminal_read(self, sandbox_id: str, terminal_id: str) -> dict[str, Any]:
+        with self._lock:
+            self._require_active(sandbox_id)
+            term = self._terminals.get(sandbox_id, {}).get(terminal_id)
+            if term is None:
+                raise SandboxOpError("terminal_not_found", 404, f"no terminal {terminal_id}")
+            data = bytes(term.output)
+            term.output.clear()
+            return {
+                "terminal_id": terminal_id,
+                "data": data.decode("utf-8", errors="replace"),
+                "exited": term.exited,
+            }
+
+    def publish_template(
+        self,
+        sandbox_id: str,
+        *,
+        name: str,
+        display_name: str | None = None,
+        description: str = "",
+    ) -> dict[str, Any]:
+        with self._lock:
+            sandbox = self._require_running(sandbox_id)
+            try:
+                name = agent_ux.validate_template_name(name)
+            except ValueError as exc:
+                raise SandboxOpError("invalid_template_name", 400, str(exc)) from exc
+            uid = agent_ux.new_template_uid(name)
+            image_ref = sandbox.image_id or f"cathedral-template-{uid}"
+            tmpl = agent_ux.SandboxTemplate(
+                uid=uid,
+                name=name,
+                display_name=display_name or name,
+                description=description or "",
+                kind="USER",
+                status="PENDING",
+                source_sandbox_id=sandbox_id,
+                image_ref=image_ref,
+                owner_api_key=sandbox.api_key,
+            )
+            self._templates[uid] = tmpl
+            # Reference provider: snapshot FS into a named image entry and mark READY.
+            self._images[uid] = {"cached": True, "size_bytes": self._disk_bytes(sandbox), "digest": None}
+            self._images[image_ref] = {"cached": True, "size_bytes": self._disk_bytes(sandbox), "digest": None}
+            tmpl.status = "READY"
+            tmpl.updated_at = agent_ux.utc_now()
+            return tmpl.to_document()
+
+    def list_templates(self, *, kind: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+        caller = self._caller_key()
+        with self._lock:
+            out = []
+            for tmpl in self._templates.values():
+                if caller is not None and tmpl.owner_api_key is not None and tmpl.owner_api_key != caller:
+                    continue
+                if kind and tmpl.kind != kind:
+                    continue
+                if status and tmpl.status != status:
+                    continue
+                out.append(tmpl.to_document())
+            return out
+
+    def get_template(self, template_uid: str) -> dict[str, Any]:
+        with self._lock:
+            tmpl = self._templates.get(template_uid)
+            if tmpl is None:
+                raise SandboxOpError("template_not_found", 404, f"no template {template_uid}")
+            caller = self._caller_key()
+            if caller is not None and tmpl.owner_api_key is not None and tmpl.owner_api_key != caller:
+                raise SandboxOpError("template_not_found", 404, f"no template {template_uid}")
+            return tmpl.to_document()
+
+    def desktop(self, sandbox_id: str) -> dict[str, Any]:
+        """G5: desktop only when CATHEDRAL_AGENT_DESKTOP=1; RFB WS is listening when enabled."""
+        with self._lock:
+            self._require_active(sandbox_id)
+        enabled = os.environ.get("CATHEDRAL_AGENT_DESKTOP", "0") == "1"
+        if not enabled:
+            return {"available": False}
+        return {
+            "available": True,
+            "port": 5901,
+            "listening": True,
+            "ws_url": f"{self._base_url}/v1/sandboxes/{sandbox_id}/desktop/ws",
+            "note": "Reference runtime serves a minimal RFB stream over WebSocket after access ticket.",
+        }
 
     # ------------------------------------------------------------------ §3.9 images
     def prefetch(self, request: PrefetchRequest) -> str:
@@ -856,16 +1279,24 @@ class InMemorySandboxProvider:
         return doc
 
     # ------------------------------------------------------------------ §3.8 quota / usage / status
-    def _usage_now(self) -> QuotaUsage:
-        running = [s for s in self._sandboxes.values() if s.state in ("running", "creating")]
+    def _usage_now(self, *, api_key: str | None = None) -> QuotaUsage:
+        """Resident capacity: running + creating + frozen (freeze does not free host slots)."""
+        resident = [
+            s
+            for s in self._sandboxes.values()
+            if s.state in ("running", "creating", "frozen")
+            and (api_key is None or s.api_key == api_key)
+        ]
         return QuotaUsage(
-            running_sandboxes=len(running),
-            vcpu=sum(s.resources.vcpu for s in running),
-            memory_gib=sum(s.resources.memory_gib for s in running),
+            running_sandboxes=len(resident),
+            vcpu=sum(s.resources.vcpu for s in resident),
+            memory_gib=sum(s.resources.memory_gib for s in resident),
         )
 
     def quota(self) -> dict[str, Any]:
         usage = self._usage_now()
+        running = [s for s in self._sandboxes.values() if s.state in ("running", "creating")]
+        frozen = [s for s in self._sandboxes.values() if s.state == "frozen"]
         return {
             "limits": {
                 "running_sandboxes": self._limits.running_sandboxes,
@@ -873,13 +1304,16 @@ class InMemorySandboxProvider:
                 "memory_gib": self._limits.memory_gib,
             },
             "usage": {
-                "running_sandboxes": usage.running_sandboxes,
+                "running_sandboxes": len(running),
+                "frozen_sandboxes": len(frozen),
+                "resident_sandboxes": usage.running_sandboxes,
                 "vcpu": usage.vcpu,
                 "memory_gib": usage.memory_gib,
             },
             # §3.5 / §3.10-§3.11: guaranteed snapshot store and create pacing.
             "snapshot_store": self._max_snapshots,
             "creates_per_minute": self._creates_per_minute,
+            "note": "Frozen sandboxes count toward resident quota; freeze does not free create slots",
         }
 
     def usage(self, *, group_by: str | None, labels: Iterable[str]) -> dict[str, Any]:
@@ -1088,15 +1522,40 @@ def provider_from_environment(
 
 
 def _safe_extract(tf: tarfile.TarFile, target: Path) -> None:
+    """Extract tar members without path/symlink escape (fail closed)."""
     base = target.resolve()
     for member in tf.getmembers():
-        if member.name.startswith("/") or ".." in Path(member.name).parts:
-            raise SandboxOpError("unsafe_tar", 400, f"tar member escapes target: {member.name}")
-    # Python 3.12+ supports filter="data"; 3.9 in this environment does not.
+        name = member.name
+        if name.startswith("/") or ".." in Path(name).parts:
+            raise SandboxOpError("unsafe_tar", 400, f"tar member escapes target: {name}")
+        if member.issym() or member.islnk():
+            link = member.linkname or ""
+            if link.startswith("/") or ".." in Path(link).parts:
+                raise SandboxOpError(
+                    "unsafe_tar",
+                    400,
+                    f"tar link escapes target: {name} -> {link}",
+                )
+        dest = (base / name).resolve()
+        try:
+            dest.relative_to(base)
+        except ValueError as exc:
+            raise SandboxOpError("unsafe_tar", 400, f"tar member escapes target: {name}") from exc
+    # Prefer filter="data"; never fall back to unfiltered extractall.
     try:
         tf.extractall(base, filter="data")
     except TypeError:
-        tf.extractall(base)
+        # Python < 3.12: extract members one-by-one after the checks above.
+        for member in tf.getmembers():
+            if member.isfile() or member.isdir():
+                tf.extract(member, path=base)
+            # Skip links/devices on old Python — refuse rather than invent host links.
+            elif member.issym() or member.islnk():
+                raise SandboxOpError(
+                    "unsafe_tar",
+                    400,
+                    "symlink/hardlink members require Python 3.12+ filter=data",
+                )
 
 
 # Kept small: an ImageStatus document when a ref is unknown to the cache.

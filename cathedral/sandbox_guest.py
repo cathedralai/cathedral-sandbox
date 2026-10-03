@@ -243,6 +243,13 @@ class DockerClient:
         if use_kata:
             argv.extend(["--runtime", self.kata_runtime])
         if dind:
+            if os.environ.get("CATHEDRAL_ALLOW_PRIVILEGED_DIND") != "1":
+                raise SandboxOpError(
+                    "privileged_dind_disabled",
+                    403,
+                    "DinD requires CATHEDRAL_ALLOW_PRIVILEGED_DIND=1 "
+                    "(privileged guests are host-risk on plain Docker; prefer Kata)",
+                )
             argv.append("--privileged")
             argv.extend(["-e", "DOCKER_TLS_CERTDIR="])
         # Prefer storage quota when the local driver accepts it (overlay2+xfs usually).
@@ -367,6 +374,24 @@ class DockerClient:
     def remove(self, container_id: str) -> None:
         self.run(["docker", "rm", "-f", container_id], timeout=60.0)
 
+    def pause(self, container_id: str) -> None:
+        result = self.run(["docker", "pause", container_id], timeout=30.0)
+        if result.returncode != 0:
+            raise SandboxOpError(
+                "guest_pause_failed",
+                502,
+                f"docker pause failed: {(result.stderr or result.stdout or '')[:200]}",
+            )
+
+    def unpause(self, container_id: str) -> None:
+        result = self.run(["docker", "unpause", container_id], timeout=30.0)
+        if result.returncode != 0:
+            raise SandboxOpError(
+                "guest_unpause_failed",
+                502,
+                f"docker unpause failed: {(result.stderr or result.stdout or '')[:200]}",
+            )
+
     def commit(self, container_id: str, image_name: str) -> str:
         result = self.run(["docker", "commit", container_id, image_name], timeout=300.0)
         if result.returncode != 0:
@@ -413,11 +438,57 @@ def _registry_host(image: str) -> str:
 
 
 def _fetch_context_tar(url: str) -> bytes:
-    if url.startswith("file://"):
-        path = Path(url[7:])
-        return path.read_bytes()
+    """Fetch a build context. Fail closed against file:// and link-local/private SSRF."""
+    from urllib.parse import urlparse
+    import ipaddress
+    import socket
+
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme == "file" or url.startswith("file:"):
+        raise SandboxOpError(
+            "build_context_forbidden",
+            400,
+            "file:// build contexts are not allowed",
+        )
+    if scheme not in ("http", "https"):
+        raise SandboxOpError(
+            "build_context_forbidden",
+            400,
+            f"unsupported build context scheme: {scheme or '<none>'}",
+        )
+    host = parsed.hostname or ""
+    if not host:
+        raise SandboxOpError("build_context_forbidden", 400, "build context URL missing host")
     try:
-        with urllib.request.urlopen(url, timeout=120) as resp:  # noqa: S310 — operator-supplied build URL
+        addrs = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise SandboxOpError(
+            "build_context_fetch_failed",
+            502,
+            f"failed to resolve build context host: {exc}",
+        ) from exc
+    for info in addrs:
+        raw = info[4][0]
+        try:
+            ip = ipaddress.ip_address(raw)
+        except ValueError:
+            continue
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise SandboxOpError(
+                "build_context_forbidden",
+                400,
+                "build context URL resolves to a non-public address",
+            )
+    try:
+        with urllib.request.urlopen(url, timeout=120) as resp:  # noqa: S310 — gated above
             return resp.read()
     except (urllib.error.URLError, OSError) as exc:
         raise SandboxOpError(
@@ -790,6 +861,19 @@ class DockerGuestProvider:
             doc["network"]["allowlist_fail_closed"] = patch.mode == "allowlist"
         return doc
 
+    def freeze(self, sandbox_id: str) -> dict[str, Any]:
+        guest = self._guests.get(sandbox_id)
+        if guest is not None:
+            self._client.pause(guest.container_id)
+        return self._inner.freeze(sandbox_id)
+
+    def thaw(self, sandbox_id: str) -> dict[str, Any]:
+        guest = self._guests.get(sandbox_id)
+        doc = self._inner.thaw(sandbox_id)
+        if guest is not None:
+            self._client.unpause(guest.container_id)
+        return doc
+
     def delete(self, sandbox_id: str) -> None:
         guest = self._guests.get(sandbox_id)
         if guest is not None:
@@ -807,11 +891,13 @@ class DockerGuestProvider:
         want = _parse_label_filters(labels)
         if not want:
             raise SandboxContractError("invalid_label", "bulk delete requires at least one label filter")
+        caller = self._inner._caller_key()  # noqa: SLF001
         with self._inner._lock:  # noqa: SLF001
             targets = [
                 sid
                 for sid, s in self._inner._sandboxes.items()  # noqa: SLF001
                 if all(s.labels.get(k) == v for k, v in want.items())
+                and (caller is None or s.api_key is None or s.api_key == caller)
             ]
         for sid in targets:
             self.delete(sid)
