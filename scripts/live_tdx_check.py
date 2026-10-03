@@ -50,7 +50,12 @@ VERIFIER_TIMEOUT_SECONDS = 60
 # never signs with it and it needs no wallet.
 DEFAULT_HOTKEY = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 OTHER_HOTKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
-TAMPER_OFFSET = 700
+# A quote v4 is a 48-byte header, then the 584-byte TD quote body that the
+# quoting enclave signs. Offset 184 is the first byte of MRTD in that body
+# (header 48 + TEE_TCB_SVN 16 + MRSEAM 48 + MRSIGNERSEAM 48 + SEAMATTRIBUTES,
+# TDATTRIBUTES, XFAM 8 each), so the flip must break the signature, not merely
+# an attestation-key field.
+TAMPER_OFFSET = 184
 
 
 @dataclass(frozen=True)

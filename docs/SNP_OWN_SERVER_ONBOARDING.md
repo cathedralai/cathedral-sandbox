@@ -1,8 +1,8 @@
 # Run an SNP miner on your own server: from a server to a scored machine
 
 This page puts the path for running the AMD SEV-SNP miner on your own server
-in order, from "I have a server" to a machine the validator scores. It adds no new commands: each step links to the
-section that owns them. The repository [README](../README.md) remains the only
+in order, from "I have a server" to a machine the validator scores. It adds no
+new commands: each step links to the section that owns them. The repository [README](../README.md) remains the only
 active operator guide; where this page and the README differ, the README wins.
 
 Here your own EPYC host runs an SNP guest, and the miner runs inside that guest.
@@ -135,8 +135,12 @@ your UID and the validator weight rows. The validator pays one unit per
 distinct verified machine, so your row should appear once a validator has
 verified fresh evidence and SAT and written its weights.
 
-There is no public validator-result feed yet. Until validators publish a
-per-cycle inventory, ask the validator operator for the machine's result.
+A validator can publish a signed per-cycle pool inventory. It is opt-in: its
+read-only server answers `GET /v1/pool/inventory` with the whole signed
+document, and `GET /v1/pool/receipt?uid=N&endpoint=URL` with one machine's
+signed receipt, which says whether that machine was healthy, unverified or
+unreachable, and why. Ask each validator operator whether they publish it and
+where. If they don't, ask them for the machine's result.
 
 ## 8. Add more machines
 
