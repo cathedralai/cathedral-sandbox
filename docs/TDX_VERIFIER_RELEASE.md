@@ -99,22 +99,24 @@ The next release, `cathedral-tdx-verifier-v1.1.0`, is not yet published. Until
 it is, v1.0.0 above is the release to install. It brings the exit `3` contract
 above: an Intel collateral outage is reported as an outage, decided by the
 latest collateral request only, and a platform, TDX module or QE that is not
-fully current is always exit `1`. v1.0.0 exits `1` for every failure.
+fully current is always exit `1`. v1.0.0 exits `1` for every failure. It also
+emits `image_measurement`, the v2 image identity from #267, which leaves out
+the owner fields a host sets per VM.
 
 | Field | Expected value |
 |---|---|
 | Tag | `cathedral-tdx-verifier-v1.1.0` |
-| Asset SHA-256 | `eb3fffb61e35ad9605e3a84869f8c3a9f8e647605b3d407ebf4a29324c4e93cc` |
+| Asset SHA-256 | `6596a93aaef33ecb0e841ebcfe23221e68aac36d6971e0e138269be713babacc` |
 
-That digest is the reproducible build of the verifier source in sandbox #253,
-under the flags below. Rebuilding the v1.0.0 source the same way reproduces
+That digest is the reproducible build of the verifier source on `main` after
+#267, plus sandbox #253, under the flags below. Rebuilding the v1.0.0 source the same way reproduces
 v1.0.0's published digest exactly, so the build is deterministic.
 
 To publish it, a maintainer tags a commit on `main` whose
 `cmd/cathedral-tdx-verifier` directory matches that source:
 
 ```bash
-git diff --quiet 8fe9670fb77610c8ce63ee15c9c736fee1698f25 <commit> -- cmd/cathedral-tdx-verifier
+git diff --quiet 7031b0e82f710949f0fcb001ec4b05cb12ced95c <commit> -- cmd/cathedral-tdx-verifier
 git tag cathedral-tdx-verifier-v1.1.0 <commit>
 git push origin cathedral-tdx-verifier-v1.1.0
 ```
