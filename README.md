@@ -25,11 +25,14 @@ For each UID, the validator:
 5. zeroes every claimant involved in a duplicate endpoint, hardware identity,
    or TLS key;
 6. sends one bounded SAT task to each remaining machine; and
-7. assigns weight from the verified work those machines returned.
+7. counts each machine that returned correct SAT work as one verified
+   machine, and assigns weight in proportion to that count.
 
 The Cathedral validator uses zero burn. Registration, uptime, a quote, or a
-self-reported machine count earns nothing by itself. Weight also does not
-guarantee TAO. The subnet must have positive emission.
+self-reported machine count earns nothing by itself. SAT is a pass check for
+each machine, not a measure of size: a faster machine or more SAT work does not
+add weight. Weight also does not guarantee TAO. The subnet must have positive
+emission.
 
 ## Current support
 
