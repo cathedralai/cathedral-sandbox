@@ -1,7 +1,7 @@
 # Documentation
 
-For mining, use the repository [README](../README.md). It is the only active
-operator guide.
+For mining, start with the [repository overview](../README.md), then follow
+[Mining Cathedral](MINING.md), the only active operator guide.
 
 ## Current operator references
 
@@ -14,7 +14,7 @@ operator guide.
 - [Run an SNP miner on your own server, in order](SNP_OWN_SERVER_ONBOARDING.md)
 - [Development tests](TESTING.md)
 
-These pages explain a narrow contract. They do not replace the README's launch
+These pages explain a narrow contract. They do not replace the mining guide's launch
 order.
 
 ## Protocol and product-library references

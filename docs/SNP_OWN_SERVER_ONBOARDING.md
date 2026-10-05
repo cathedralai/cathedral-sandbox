@@ -2,8 +2,8 @@
 
 This page puts the path for running the AMD SEV-SNP miner on your own server
 in order, from "I have a server" to a machine the validator scores. It adds no new commands: each step links to the
-section that owns them. The repository [README](../README.md) remains the only
-active operator guide; where this page and the README differ, the README wins.
+section that owns them. [Mining Cathedral](MINING.md) remains the only
+active operator guide; where this page and the mining guide differ, the guide wins.
 
 Here your own EPYC host runs an SNP guest, and the miner runs inside that guest.
 The machine is a TEE box: its evidence comes from the AMD hardware. That is not
@@ -12,10 +12,10 @@ all, a path that is currently deferred ([CAPACITY.md](CAPACITY.md)). When a
 registration asks for the kind of box, an SNP host is `--kind tee`
 ([MINER_BOX_RUNBOOK.md](MINER_BOX_RUNBOOK.md)). Intel TDX mining runs in a TDX
 confidential VM, usually rented; see
-[Run one Intel TDX machine](../README.md#run-one-intel-tdx-machine).
+[Run one Intel TDX machine](MINING.md#run-one-intel-tdx-machine).
 
 Each step ends with what must be true before the next one. Stop at the first
-step that does not hold, as [Stop and get help](../README.md#stop-and-get-help)
+step that does not hold, as [Stop and get help](MINING.md#stop-and-get-help)
 describes.
 
 ## 1. Check the hardware
@@ -90,8 +90,8 @@ The worker answers only validators on a list your own control host signs. Set
 that host up once, keep its signing seed there, and run the refresh timer on
 it and the fetch timer on each worker:
 
-- [Refresh validator access from a control host](../README.md#2-refresh-validator-access-from-a-control-host)
-- [Keep the snapshot fresh with two timers](../README.md#keep-the-snapshot-fresh-with-two-timers)
+- [Refresh validator access from a control host](MINING.md#2-refresh-validator-access-from-a-control-host)
+- [Keep the snapshot fresh with two timers](MINING.md#keep-the-snapshot-fresh-with-two-timers)
 
 The snapshot is valid for at most an hour, and the timers alarm before it
 expires. A worker whose snapshot expires refuses every validator and scores
@@ -117,20 +117,20 @@ access files, and a missing `/dev/sev-guest`. It runs the container read-only wi
 dropped.
 
 **Before step 6:** the miner stays running and passes the reachability check
-in [Rehearse before renting or registering](../README.md#rehearse-before-renting-or-registering).
+in [Rehearse before renting or registering](MINING.md#rehearse-before-renting-or-registering).
 
 ## 6. Register and announce the hotkey
 
 Only now, from the separate wallet machine, register the hotkey and announce
 the guest's public IPv4 and port `8081` as its axon:
-[Register and announce the hotkey](../README.md#4-register-and-announce-the-hotkey).
+[Register and announce the hotkey](MINING.md#4-register-and-announce-the-hotkey).
 Never copy the wallet into the guest.
 
 **Before step 7:** the subnet shows your hotkey at that IP and port.
 
 ## 7. Confirm the machine is scored
 
-[Confirm chain state](../README.md#5-confirm-chain-state) shows how to read
+[Confirm chain state](MINING.md#5-confirm-chain-state) shows how to read
 your UID and the validator weight rows. The validator pays one unit per
 distinct verified machine, so your row should appear once a validator has
 verified fresh evidence and SAT and written its weights.
@@ -142,5 +142,5 @@ per-cycle inventory, ask the validator operator for the machine's result.
 
 Each additional machine is its own physical host with its own SNP guest, the
 same hotkey, and an entry in the primary worker's `fleet.json`:
-[Add more machines to one UID](../README.md#add-more-machines-to-one-uid).
+[Add more machines to one UID](MINING.md#add-more-machines-to-one-uid).
 Each needs its own measurement admitted (step 3) if it differs.

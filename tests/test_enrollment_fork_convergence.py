@@ -177,7 +177,7 @@ def test_allowlist_preimage_is_domain_and_audience_bound() -> None:
 
 
 def test_current_mining_guide_does_not_teach_legacy_enrollment() -> None:
-    text = (REPO_ROOT / "README.md").read_text()
+    text = (REPO_ROOT / "docs" / "MINING.md").read_text()
     assert "enroll submit" not in text
     assert "enroll-preimage-example" not in text
     assert "/v1/enroll" not in text

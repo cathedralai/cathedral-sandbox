@@ -9,6 +9,7 @@ CLAIM = re.compile(r"(\d[\d,]*)\s*(?:passing\s+)?(tests|passed)\b", re.IGNORECAS
 DOCUMENTED = (
     "README.md",
     "MINING.md",
+    "docs/MINING.md",
     "docs/README.md",
     "docs/TESTING.md",
 )
