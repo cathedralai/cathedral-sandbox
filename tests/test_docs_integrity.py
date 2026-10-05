@@ -295,8 +295,22 @@ OPERATOR_LINK_DOCUMENTS = [
     "docs/MINING.md",
     "docs/SNP_OWN_SERVER_ONBOARDING.md",
     "docs/AMD_SEV_SNP_FRIEND_TEST.md",
+    "docs/TDX_LAUNCH.md",
+    "docs/WORK_REQUEST_V2.md",
 ]
 LINK_ROOT = REPO_ROOT
+
+
+def test_operating_step_references_follow_the_moved_guide() -> None:
+    references = {
+        "docs/TDX_LAUNCH.md": "[mining guide](MINING.md)",
+        "docs/WORK_REQUEST_V2.md": "MINING.md#keep-the-snapshot-fresh-with-two-timers",
+        "docs/G4_OPERATOR_TRUST.md": "[mining guide](MINING.md)",
+    }
+    for relative, reference in references.items():
+        assert reference in (REPO_ROOT / relative).read_text(), relative
+    amd = (REPO_ROOT / "docs/AMD_SEV_SNP_FRIEND_TEST.md").read_text()
+    assert "Do not run the mining guide's TDX host or image steps" in amd
 
 
 def test_current_operator_markdown_links_resolve() -> None:
