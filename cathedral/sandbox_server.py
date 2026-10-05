@@ -27,6 +27,7 @@ from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, unquote, urlparse
 
 from cathedral import sandbox_api as api
+from cathedral.affline_rerun import AfflineRerunError, handle_affline_validate_rerun
 from cathedral.sandbox_api import (
     BuildSpec,
     CreateSandboxRequest,
@@ -181,6 +182,8 @@ class SandboxApplication:
         self._add("GET", r"/v1/usage", self.usage)
         self._add("GET", r"/v1/status", self.status)
         self._add("GET", r"/v1/operations/(?P<id>[^/]+)", self.get_operation)
+        # Affline: secret-triggered full re-run + validator-shaped receipt.
+        self._add("POST", r"/v1/affline/validate-rerun", self.affline_validate_rerun)
         # §3.10/§3.11: machine-readable contract, served unauthenticated.
         self._add("GET", r"/openapi.json", self.openapi)
 
@@ -209,6 +212,8 @@ class SandboxApplication:
         except SandboxOpError as exc:
             hdrs = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
             return Response.error(exc.http_status, exc.code, str(exc), hdrs)
+        except AfflineRerunError as exc:
+            return Response.error(exc.http_status, exc.category, str(exc))
         except json.JSONDecodeError as exc:
             return Response.error(400, "invalid_json", f"request body is not JSON: {exc}")
 
@@ -481,6 +486,25 @@ class SandboxApplication:
     def status(self, **_):
         return Response.json(200, self.provider.status().to_document())
 
+    def affline_validate_rerun(self, *, headers, body, api_key, **_):
+        """POST /v1/affline/validate-rerun — Bearer + optional trigger secret.
+
+        Forces Affine full re-run by default and returns
+        ``cathedral_affline_rerun_receipt_v1`` with decision + full_rerun detail.
+        Never stamps Affline sandbox TEE.
+        """
+
+        project = None
+        keys = getattr(self.provider, "_keys", None)
+        if isinstance(keys, dict) and api_key in keys:
+            project = getattr(keys[api_key], "project", None)
+        result = handle_affline_validate_rerun(
+            body=body,
+            headers=headers,
+            api_key_project=project if isinstance(project, str) else None,
+        )
+        return Response.json(result.http_status, result.receipt)
+
     def get_operation(self, *, id, **_):
         return Response.json(200, self.provider.get_operation(id))
 
@@ -546,6 +570,12 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/quota", "get", "Project quota + usage", "§3.8"),
     ("/v1/usage", "get", "Metered usage + cost", "§3.13/§3.16; grouped by label"),
     ("/v1/status", "get", "Service status", "§3.15"),
+    (
+        "/v1/affline/validate-rerun",
+        "post",
+        "Affline validate with forced full re-run",
+        "Bearer + optional X-Cathedral-Affline-Trigger; returns cathedral_affline_rerun_receipt_v1",
+    ),
     ("/v1/operations/{id}", "get", "Poll an async operation", "§3.1"),
 ]
 

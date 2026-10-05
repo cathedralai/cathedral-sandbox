@@ -79,6 +79,11 @@ from cathedral.customer_receipt import (
     parse_customer_receipt_trusted_keys_json,
     verify_customer_receipt,
 )
+from cathedral.product_run_receipt import (
+    ProductRunReceiptError,
+    issue_product_run_receipt,
+    verify_product_run_receipt,
+)
 from cathedral.enroll import (
     DEFAULT_ENROLL_NETUID,
     DEFAULT_ENROLL_NETWORK,
@@ -1016,6 +1021,98 @@ def cmd_customer_receipt_verify(args: argparse.Namespace) -> int:
                 "profile_id": verified.document["profile_id"],
                 "verification_scope": "cathedral_signed_assertions",
                 "evidence_independently_verified": False,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_product_run_receipt_issue(args: argparse.Namespace) -> int:
+    try:
+        seed = Path(args.signing_key_file).read_bytes()
+        if len(seed) == 32:
+            private = Ed25519PrivateKey.from_private_bytes(seed)
+        else:
+            raise ProductRunReceiptError("key", "signing key file must be 32 raw Ed25519 seed bytes")
+        request_bytes = Path(args.request).read_bytes() if args.request else b""
+        result_bytes = Path(args.result).read_bytes() if args.result else b""
+        if not args.execution or not args.evidence:
+            raise ProductRunReceiptError(
+                "schema",
+                "product-run-receipt issue requires --execution and --evidence JSON files",
+            )
+        execution = json.loads(Path(args.execution).read_text(encoding="utf-8"))
+        evidence = json.loads(Path(args.evidence).read_text(encoding="utf-8"))
+        if not isinstance(execution, dict) or not isinstance(evidence, dict):
+            raise ProductRunReceiptError("schema", "execution and evidence must be JSON objects")
+        raw = issue_product_run_receipt(
+            product=args.product,
+            surface=args.surface,
+            run_id=args.run_id,
+            request_bytes=request_bytes,
+            result_bytes=result_bytes,
+            outcome=args.outcome,
+            private_key=private,
+            signing_key_id=args.signing_key_id,
+            note=args.note or "",
+            execution=execution,
+            evidence=evidence,
+        )
+    except (OSError, ProductRunReceiptError, ValueError, json.JSONDecodeError) as exc:
+        category = getattr(exc, "category", "error")
+        print(json.dumps({"ok": False, "category": category, "error": str(exc)}, sort_keys=True))
+        return 1
+    Path(args.out).write_bytes(raw)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "schema": "cathedral_product_run_receipt_v1",
+                "out": args.out,
+                "tee_claimed": False,
+                "product": args.product,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_product_run_receipt_verify(args: argparse.Namespace) -> int:
+    try:
+        receipt_bytes = Path(args.receipt).read_bytes()
+        trusted_keys = Path(args.trusted_keys).read_bytes()
+        verified = verify_product_run_receipt(
+            receipt_bytes,
+            trusted_keys=trusted_keys,
+            max_age_seconds=args.max_age_seconds,
+        )
+    except (OSError, ProductRunReceiptError) as exc:
+        category = getattr(exc, "category", "error")
+        print(
+            json.dumps(
+                {"valid": False, "category": category, "error": str(exc)},
+                sort_keys=True,
+            )
+        )
+        return 1
+    print(
+        json.dumps(
+            {
+                "valid": True,
+                "schema": verified.document["schema"],
+                "receipt_id": verified.receipt_id,
+                "product": verified.product,
+                "surface": verified.surface,
+                "outcome": verified.outcome,
+                "tee_claimed": False,
+                "attestation_class": "none",
+                "execution_kind": verified.document["execution"]["kind"],
+                "validator_view": dict(verified.validator_view),
+                "verification_scope": "cathedral_signed_host_trusted_run",
+                "evidence_independently_verified": False,
+                "intel_tdx_asserted": False,
             },
             sort_keys=True,
         )
@@ -4833,6 +4930,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="reject a valid signed receipt older than this many seconds",
     )
     p_customer_receipt_verify.set_defaults(func=cmd_customer_receipt_verify)
+
+    p_product_run = sub.add_parser(
+        "product-run-receipt",
+        help="issue/verify host-trusted product run receipts (not sealed TDX customer receipts)",
+    )
+    product_run_sub = p_product_run.add_subparsers(dest="product_run_command", required=True)
+    p_product_run_issue = product_run_sub.add_parser(
+        "issue",
+        help="issue cathedral_product_run_receipt_v1 with tee_claimed=false",
+    )
+    p_product_run_issue.add_argument(
+        "--product",
+        required=True,
+        choices=["affline", "ditto", "reliquary", "agent", "cvm"],
+    )
+    p_product_run_issue.add_argument(
+        "--surface",
+        required=True,
+        choices=["v1_sandboxes", "v1_workers", "cvm_lifecycle", "offline_pack"],
+    )
+    p_product_run_issue.add_argument("--run-id", required=True)
+    p_product_run_issue.add_argument("--request", help="path to request bytes to hash")
+    p_product_run_issue.add_argument("--result", help="path to result bytes to hash")
+    p_product_run_issue.add_argument(
+        "--execution",
+        required=True,
+        help="path to product-specific execution JSON (validator-shaped)",
+    )
+    p_product_run_issue.add_argument(
+        "--evidence",
+        required=True,
+        help="path to product-specific evidence JSON (host_trusted; skip_rerun false)",
+    )
+    p_product_run_issue.add_argument(
+        "--outcome",
+        required=True,
+        choices=["succeeded", "failed"],
+    )
+    p_product_run_issue.add_argument("--signing-key-file", required=True)
+    p_product_run_issue.add_argument("--signing-key-id", required=True)
+    p_product_run_issue.add_argument("--note", default="")
+    p_product_run_issue.add_argument("--out", required=True)
+    p_product_run_issue.set_defaults(func=cmd_product_run_receipt_issue)
+
+    p_product_run_verify = product_run_sub.add_parser(
+        "verify",
+        help="verify cathedral_product_run_receipt_v1 (rejects tee_claimed=true)",
+    )
+    p_product_run_verify.add_argument("--receipt", required=True)
+    p_product_run_verify.add_argument("--trusted-keys", required=True)
+    p_product_run_verify.add_argument("--max-age-seconds", type=int)
+    p_product_run_verify.set_defaults(func=cmd_product_run_receipt_verify)
 
     p_affine_claim = sub.add_parser(
         "affine-claim",
