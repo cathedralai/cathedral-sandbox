@@ -316,9 +316,9 @@ test -z "$(git -C cathedral-snp-runtime status --porcelain)"
 ```
 
 On the separate miner-controlled host, follow only the
-[Refresh validator access from a control host](../README.md#2-refresh-validator-access-from-a-control-host)
+[Refresh validator access from a control host](MINING.md#2-refresh-validator-access-from-a-control-host)
 procedure, at a reviewed revision that ships its `refresh` and `fetch`
-commands. Do not run the README's TDX host or image steps. Keep the snapshot
+commands. Do not run the mining guide's TDX host or image steps. Keep the snapshot
 signing seed on the control host. Transfer only `snapshot-keys.json` and the
 fresh `validator-access.json` to the SNP guest.
 

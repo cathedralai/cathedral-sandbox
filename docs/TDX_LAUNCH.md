@@ -4,8 +4,8 @@ Intel TDX is Cathedral's scored confidential-CPU path. AMD SEV-SNP has its
 own fixed worker and validator admission policy. This page is only the Intel
 TDX contract.
 
-This page defines the machine and quote contract. The repository README is the
-operator run order. Cathedral Validator derives weights directly from miner
+This page defines the machine and quote contract. The [mining guide](MINING.md)
+owns the operator run order. Cathedral Validator derives weights directly from miner
 evidence. No publisher, signed weight vector, relay, or epoch service sits in
 that path.
 

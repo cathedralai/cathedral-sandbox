@@ -80,7 +80,7 @@ is a JSON map of key ID to raw Ed25519 public key as 64 lowercase hex characters
 These must be real approved keys; the worker creates no example endorsements.
 
 Reuse the validator-access setup, native TLS certificate, public endpoint and
-fleet manifest from the README. Run on each of the eight operator-controlled
+fleet manifest from the [mining guide](MINING.md). Run on each of the eight operator-controlled
 guests, supplying that guest's own endorsement, signing key, TLS key and endpoint:
 
 ```sh

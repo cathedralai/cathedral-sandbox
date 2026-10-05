@@ -44,7 +44,7 @@ def test_clean_install_extras_supply_each_enrollment_role() -> None:
 
 
 def test_current_guide_selects_validator_access_roles_not_legacy_enrollment() -> None:
-    mining = (ROOT / "README.md").read_text()
+    mining = (ROOT / "docs" / "MINING.md").read_text()
     legacy_note = (ROOT / "docs" / "ENROLLMENT_ALLOWLIST.md").read_text()
     producer = (ROOT / "scripts" / "cathedral_enroll_allowlist.py").read_text()
 

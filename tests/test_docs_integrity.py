@@ -20,8 +20,8 @@ def test_every_doc_cited_repo_path_exists():
     assert missing == [], f"docs cite nonexistent repo files: {missing}"
 
 
-def test_readme_is_the_single_current_mining_guide() -> None:
-    readme = (REPO_ROOT / "README.md").read_text()
+def test_mining_guide_is_the_single_current_operator_path() -> None:
+    readme = (REPO_ROOT / "docs" / "MINING.md").read_text()
     mining = (REPO_ROOT / "MINING.md").read_text()
     map_text = (REPO_ROOT / "docs" / "README.md").read_text()
     normalized = " ".join(readme.split())
@@ -60,6 +60,7 @@ def test_current_operator_docs_exclude_retired_launch_paths() -> None:
     current_paths = (
         "README.md",
         "MINING.md",
+        "docs/MINING.md",
         "docs/README.md",
         "docs/DESIGN.md",
         "docs/SN94_AUDIT_MINER_IMAGE.md",
@@ -94,7 +95,7 @@ def test_current_operator_docs_exclude_retired_launch_paths() -> None:
 
 
 def test_current_guide_never_runs_user_writable_code_as_root() -> None:
-    readme = (REPO_ROOT / "README.md").read_text()
+    readme = (REPO_ROOT / "docs" / "MINING.md").read_text()
 
     assert "sudo .venv" not in readme
     assert "sudo cathedral-runtime/" not in readme
@@ -105,7 +106,7 @@ def test_current_guide_never_runs_user_writable_code_as_root() -> None:
 
 
 def test_validator_access_signing_seed_stays_outside_the_checkout() -> None:
-    readme = (REPO_ROOT / "README.md").read_text()
+    readme = (REPO_ROOT / "docs" / "MINING.md").read_text()
     contract = (REPO_ROOT / "docs" / "WORK_REQUEST_V2.md").read_text()
     gitignore = (REPO_ROOT / ".gitignore").read_text()
 
@@ -116,10 +117,8 @@ def test_validator_access_signing_seed_stays_outside_the_checkout() -> None:
 
 
 def test_additional_machine_flow_reuses_the_signer_and_reloads_without_restart() -> None:
-    readme = (REPO_ROOT / "README.md").read_text()
-    section = " ".join(
-        readme.split("## Add more machines to one UID", maxsplit=1)[1].split()
-    )
+    readme = (REPO_ROOT / "docs" / "MINING.md").read_text()
+    section = " ".join(readme.split("## Add more machines to one UID", maxsplit=1)[1].split())
 
     assert "Do not create a second signing key" in section
     assert "/etc/cathedral/validator-access/.fleet.json.new" in section
@@ -129,14 +128,12 @@ def test_additional_machine_flow_reuses_the_signer_and_reloads_without_restart()
 
 
 def test_current_guide_proves_reachability_before_paid_registration() -> None:
-    readme = (REPO_ROOT / "README.md").read_text()
+    readme = (REPO_ROOT / "docs" / "MINING.md").read_text()
 
     assert readme.index("### 3. Start the reviewed image") < readme.index(
         "### 4. Register and announce the hotkey"
     )
-    assert readme.index('test "$HEALTH_STATUS" = 400') < readme.index(
-        "subnet register --netuid 94"
-    )
+    assert readme.index('test "$HEALTH_STATUS" = 400') < readme.index("subnet register --netuid 94")
     assert "btcli --network finney query uid" in readme
     assert "btcli --network finney --json query weights --netuid 94" in readme
     assert "There is not yet a public validator-result feed" in readme
@@ -154,7 +151,7 @@ def test_amd_friend_test_never_runs_the_checkout_or_download_as_root() -> None:
     assert "sudo git" not in guide
     assert 'CATHEDRAL_SNPGUEST="$SNP_GUEST_DOWNLOAD"' in guide
     assert "test -r /dev/sev-guest -a -w /dev/sev-guest" in guide
-    assert 'org.opencontainers.image.revision' in guide
+    assert "org.opencontainers.image.revision" in guide
     assert "steps 1 and 2" not in guide
 
 
@@ -174,7 +171,7 @@ def test_snp_operator_surfaces_pin_the_published_image_without_placeholders() ->
     source_commit = "8dde6eaca27116eed53386a1fa33ec70b74a01fb"
     placeholder = "REPLACE_WITH_" + "PUBLISHED_DIGEST"
     surfaces = (
-        "README.md",
+        "docs/MINING.md",
         "docs/AMD_SEV_SNP_FRIEND_TEST.md",
         "docs/SN94_SNP_MINER_IMAGE.md",
         "examples/systemd/sn94-snp-miner.env.example",
@@ -274,3 +271,71 @@ def test_runtime_help_does_not_point_at_deleted_documents() -> None:
 
     for removed in retired:
         assert removed not in source, removed
+
+
+def test_readme_is_a_short_mission_first_miner_entrypoint() -> None:
+    readme = (REPO_ROOT / "README.md").read_text()
+    assert len(readme.splitlines()) <= 120
+    assert "trusted operators" in readme
+    assert "This repository is for miners" in readme
+    assert "This mining path is not a customer sandbox API" in readme
+    assert "SN94 admission remains unverified" in readme
+    assert "Keep the coldkey and wallet off every worker" in readme
+    assert "protocol wiring, not hardware" in readme
+    assert "GPU | Not a qualified mining path" in readme
+    assert "scripts/run_sn94_signed_fleet_miner.sh" not in readme
+    assert "docs/MINING.md#5-confirm-chain-state" in readme
+    assert "docs/MINING.md#stop-and-get-help" in readme
+
+
+OPERATOR_LINK_DOCUMENTS = [
+    "README.md",
+    "MINING.md",
+    "docs/README.md",
+    "docs/MINING.md",
+    "docs/SNP_OWN_SERVER_ONBOARDING.md",
+    "docs/AMD_SEV_SNP_FRIEND_TEST.md",
+    "docs/TDX_LAUNCH.md",
+    "docs/WORK_REQUEST_V2.md",
+]
+LINK_ROOT = REPO_ROOT
+
+
+def test_operating_step_references_follow_the_moved_guide() -> None:
+    references = {
+        "docs/TDX_LAUNCH.md": "[mining guide](MINING.md)",
+        "docs/WORK_REQUEST_V2.md": "MINING.md#keep-the-snapshot-fresh-with-two-timers",
+        "docs/G4_OPERATOR_TRUST.md": "[mining guide](MINING.md)",
+    }
+    for relative, reference in references.items():
+        assert reference in (REPO_ROOT / relative).read_text(), relative
+    amd = (REPO_ROOT / "docs/AMD_SEV_SNP_FRIEND_TEST.md").read_text()
+    assert "Do not run the mining guide's TDX host or image steps" in amd
+
+
+def test_current_operator_markdown_links_resolve() -> None:
+    """Moving instructions must not strand operators at missing files/anchors."""
+    from urllib.parse import unquote, urlsplit
+
+    def prose(text: str) -> str:
+        # Shell examples contain headings and example URL syntax, not doc links.
+        return re.sub(r"^(`{3,}|~{3,}).*?^\1[^\n]*$", "", text, flags=re.M | re.S)
+
+    def anchors(text: str) -> set[str]:
+        headings = re.findall(r"^#{1,6} (.+)$", prose(text), flags=re.M)
+        return {re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-") for heading in headings}
+
+    for relative in OPERATOR_LINK_DOCUMENTS:
+        path = LINK_ROOT / relative
+        targets = re.findall(r"\[[^\]]*\]\(([^)\s]+)\)", prose(path.read_text()))
+        assert targets, f"{relative}: link check matched nothing"
+        for target in targets:
+            url = urlsplit(target)
+            if url.scheme or url.netloc:
+                continue
+            destination = path.parent / unquote(url.path) if url.path else path
+            assert destination.is_file(), f"{relative}: missing {target}"
+            if url.fragment and destination.suffix == ".md":
+                assert unquote(url.fragment) in anchors(destination.read_text()), (
+                    f"{relative}: missing anchor {target}"
+                )
