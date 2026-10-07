@@ -43,3 +43,27 @@ When the reader is on main: ask the launch owner to set `host-data` on
 cathedral-1/2 (or the production SNP pool) to the Cathedral root digest
 and confirm with one report dump. Until then, #274 phase A real-binding
 stays **BLOCKED**; harness injects may still exercise the box.
+
+### Paste-ready ask (ops / WildCommunist)
+
+```text
+We need one SNP launch with host-data bound to Cathedral's central root.
+
+1) Install the same central-root-keys.json the guest will serve at
+   /usr/share/cathedral/central-root-keys.json
+2) On a builder with cathedral-sandbox:
+   python -m cathedral.tee_box.host_data_cli --root-keys /path/to/central-root-keys.json
+3) Pass that exact 32-byte hex as the VMM host-data (SNP report offset 0xC0).
+4) Boot cathedral-1 (or -2); return one snpguest/report dump showing host_data
+   matches the CLI output.
+
+Until this lands, #274 sealed SNP acceptance stays BLOCKED on real HOST_DATA
+(test injects are not a PASS). Guest reader + CLI are already on
+feat/tee-box-snp-startup-gates / docs/SNP_HOST_DATA_LAUNCH.md.
+```
+
+### Parallel owner ask (Cathedral root)
+
+Who mints the offline Cathedral root and who approves the measured tee-box
+image + measurement-list entries? Without that, MRCONFIGID/HOST_DATA bind has
+nothing production-trusted to pin.
