@@ -8,7 +8,9 @@ export PATH='/usr/sbin:/usr/bin:/sbin:/bin'
 unset DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG
 
 readonly IMAGE_PATH='ghcr.io/cathedralai/cathedral-sn39-snp-miner'
-readonly RUNTIME_CONTRACT='snp-signed-validator-fleet-v1'
+# v2: the image takes CATHEDRAL_NETWORK and CATHEDRAL_NETUID from this launcher.
+# A v1 image refuses them, so a v1 image is refused here, before any start.
+readonly RUNTIME_CONTRACT='snp-signed-validator-fleet-v2'
 readonly CONTAINER_NAME='cathedral-sn94-snp-miner'
 readonly CONFIG_DIRECTORY='/etc/cathedral/validator-access'
 readonly STATE_DIRECTORY='/var/lib/cathedral/validator-access'
@@ -70,6 +72,8 @@ trap 'exit 129' HUP
 : "${CATHEDRAL_MINER_HOTKEY:?CATHEDRAL_MINER_HOTKEY is required}"
 : "${CATHEDRAL_PUBLIC_ENDPOINT:?CATHEDRAL_PUBLIC_ENDPOINT is required}"
 : "${CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST:?CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST is required}"
+: "${CATHEDRAL_NETWORK:?CATHEDRAL_NETWORK is required}"
+: "${CATHEDRAL_NETUID:?CATHEDRAL_NETUID is required}"
 
 readonly IMAGE_PREFIX="${IMAGE_PATH}@sha256:"
 [[ "${SN94_SNP_MINER_IMAGE}" == "${IMAGE_PREFIX}"* ]] \
@@ -79,6 +83,10 @@ image_digest="${SN94_SNP_MINER_IMAGE#"${IMAGE_PREFIX}"}"
   || die 'the image must use one immutable lowercase sha256 digest'
 [[ "${CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] \
   || die 'the validator-access public-key file needs an exact lowercase sha256 pin'
+[[ "${CATHEDRAL_NETWORK}" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] \
+  || die 'the network must be a bounded lowercase name'
+[[ "${CATHEDRAL_NETUID}" =~ ^(0|[1-9][0-9]{0,4})$ ]] && (( CATHEDRAL_NETUID <= 65535 )) \
+  || die 'the netuid must be one canonical decimal subnet number'
 
 require_root_directory() {
   local path=$1
@@ -131,8 +139,10 @@ grep -Fx -- "${SN94_SNP_MINER_IMAGE}" <<<"${repo_digests}" >/dev/null \
   || die 'the pulled image does not report the exact requested RepoDigest'
 [[ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "${SN94_SNP_MINER_IMAGE}")" == 'linux/amd64' ]] \
   || die 'the pulled image is not linux/amd64'
-[[ "$(docker image inspect --format '{{index .Config.Labels "org.cathedral.sn94.runtime-contract"}}' "${SN94_SNP_MINER_IMAGE}")" == "${RUNTIME_CONTRACT}" ]] \
-  || die 'the pulled image does not declare the reviewed SNP runtime contract'
+image_contract="$(docker image inspect --format '{{index .Config.Labels "org.cathedral.sn94.runtime-contract"}}' "${SN94_SNP_MINER_IMAGE}")" \
+  || die 'the pulled image labels cannot be read'
+[[ "${image_contract}" == "${RUNTIME_CONTRACT}" ]] \
+  || die "the image declares runtime contract '${image_contract//[^[:alnum:]._-]/?}', but this launcher requires '${RUNTIME_CONTRACT}'; install the launcher and the image from the same release"
 
 nft_rules="$(mktemp /run/cathedral-sn94-snp-nft.XXXXXX)"
 if nft list table "${NFT_FAMILY}" "${NFT_TABLE}" >/dev/null 2>&1; then
@@ -187,6 +197,8 @@ docker run --rm \
   --env "CATHEDRAL_MINER_HOTKEY=${CATHEDRAL_MINER_HOTKEY}" \
   --env "CATHEDRAL_PUBLIC_ENDPOINT=${CATHEDRAL_PUBLIC_ENDPOINT}" \
   --env "CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST=${CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST}" \
+  --env "CATHEDRAL_NETWORK=${CATHEDRAL_NETWORK}" \
+  --env "CATHEDRAL_NETUID=${CATHEDRAL_NETUID}" \
   "${SN94_SNP_MINER_IMAGE}" &
 docker_client_pid=$!
 

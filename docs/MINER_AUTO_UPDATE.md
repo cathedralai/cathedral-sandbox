@@ -115,7 +115,10 @@ asked for. It then runs `cathedral/miner_bootstrap.py`, which:
    It writes the host trust set, or moves an existing one forward and revokes
    every key the pinned root drops. It refuses a root that lists a revoked key;
 2. reads the launcher the miner unit runs today, and refuses if it is not a
-   launcher for this product;
+   launcher for this product. A launcher of this product at an earlier runtime
+   contract (`previous_contracts` in `cathedral/miner_products.py`, such as a
+   `-v1` launcher on a `-v2` revision) is accepted and recorded as it is; a
+   launcher for the other product is refused;
 3. installs the updater tree built from the checkout and makes it current. It
    removes any `previous` updater, so nothing falls back to what the bootstrap
    replaced;
@@ -261,8 +264,11 @@ it, up to twice, so a registry or systemd blip during the first start does not
 strand the host. The launchers in this repository start from the locally
 verified image digest when it is present, so a registry outage does not block
 a rollback to a managed release. The `legacy` launcher a host ran before it
-enrolled may still pull on every start; that is one more reason for the first
-managed release to name the image the host already runs (rollout step 2). The
+enrolled may still pull on every start. A move away from a v1 `legacy`
+launcher never rolls back on its own, because the first managed release must
+change the image (see below and rollout step 2); a legacy launcher already at
+the current contract whose first release names the image it already runs can
+roll back automatically. The
 rollback is reported only once the previous image runs again. If it does not
 come back, the check halts; a later check starts the previous release once
 more, and if it then runs, clears the halt and remembers the failed release.
@@ -474,9 +480,21 @@ record keeps running what it has and reports `refused`.
 
 1. The key holders generate the canary and stable keys and commit
    `deploy/miner-update/release-keys.json`. No key is committed yet.
-2. Build and publish images from this commit, so they carry the state-schema
-   label. Or sign the image each host already runs: the updater takes that
-   over unlabelled, with one restart, and the rollback is always allowed.
+2. Build and publish `-v2` images from this commit, so they carry the
+   `-v2` runtime-contract label and the state-schema label, and sign them.
+   Every image a host runs today is a `-v1` image under a `-v1` launcher, and
+   nothing runs a mismatched launcher and image: the updater refuses a record
+   whose contract is not its bundle launcher's, `prepare_image` refuses an
+   image whose label is not the record's contract, and the `-v2` launcher
+   itself refuses a `-v1` image before starting it.
+   So the image each host already runs cannot be signed as the first managed
+   release. That release moves the launcher and the image together, from the
+   `legacy` `-v1` pair to the `-v2` pair.
+   Because it changes the image and `legacy`'s schema is unverified, it never
+   rolls back on its own: if it fails, the updater halts, and an operator
+   chooses a `resolve` action (`--restore-previous` puts the `legacy` launcher
+   and its `-v1` image back). Canary it on one host of each product first, and
+   watch the first stable rollout.
 3. Bootstrap one TDX host and one SNP host, install the page hook, and enable
    the timer. Record the signed record, the key fingerprints, `status` before
    and after, and the journal.

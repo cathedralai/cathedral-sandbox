@@ -22,7 +22,7 @@ from cathedral.worker import WorkerServer
 import cathedral.gpu_provider as provider
 import cathedral.validator_access as access_module
 from test_gpu_worker import UUID, work_request
-from test_validator_access import VALIDATOR_HOTKEY, VALIDATOR_PAIR, WORKER_HOTKEY, _snapshot, _tls_contexts
+from test_validator_access import NETUID, NETWORK, VALIDATOR_HOTKEY, VALIDATOR_PAIR, WORKER_HOTKEY, _snapshot, _tls_contexts
 
 
 def fixture(binding):
@@ -120,7 +120,7 @@ def test_signed_tls_g4_evidence_work_and_cpu_denial(tmp_path, monkeypatch):
         gpu_evidence_collector=collector, evidence_collector=cpu_evidence_unavailable) as server:
         threading.Thread(target=server.serve_forever, daemon=True).start()
         remote = RemoteMiner(server.base_url, WORKER_HOTKEY, ssl_context=client_context,
-            validator_hotkey=VALIDATOR_HOTKEY, validator_signer=lambda m: sr25519.sign(VALIDATOR_PAIR, m))
+            validator_hotkey=VALIDATOR_HOTKEY, validator_signer=lambda m: sr25519.sign(VALIDATOR_PAIR, m), validator_network=NETWORK, validator_netuid=NETUID,)
         def post(path, body, signed=True):
             return remote._post_tls(path, lambda _b: body, expected_binding=binding,
                 include_auth=False, include_validator_auth=signed)[0]

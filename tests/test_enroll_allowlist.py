@@ -23,6 +23,8 @@ import argparse
 import hashlib
 import io
 import json
+import random
+import functools
 import logging
 import sqlite3
 from unittest import mock
@@ -45,17 +47,21 @@ from cathedral.coldkey_allowlist import (
     verify_allowlist,
 )
 from cathedral.enroll import (
-    DEFAULT_ENROLL_NETUID,
-    DEFAULT_ENROLL_NETWORK,
     REGISTRATION_SNAPSHOT_SCHEMA,
     JsonHotkeyRegistrationProvider,
-    RegistryApp,
+    RegistryApp as _RegistryApp,
     RegistryStore,
     canonical_allowlist_enroll_payload,
     canonical_legacy_enroll_payload,
     now_iso,
 )
+
 from cathedral.lifecycle import WorkerLifecycleState
+
+# The subnet is deploy-time config with no default; draw one per run.
+NETWORK = "finney"
+NETUID = random.SystemRandom().randrange(1, 65_536)
+RegistryApp = functools.partial(_RegistryApp, network=NETWORK, netuid=NETUID)
 
 # ---------------------------------------------------------------------------
 # Shared helpers (same WSGI-call style as test_enrollment_hardening.py)
@@ -90,7 +96,9 @@ def _signed_payload(
 ) -> dict[str, object]:
     ts = timestamp if timestamp is not None else now_iso()
     message = (
-        canonical_allowlist_enroll_payload(hotkey, endpoint_url, nonce, ts)
+        canonical_allowlist_enroll_payload(
+            hotkey, endpoint_url, nonce, ts, network=NETWORK, netuid=NETUID
+        )
         if domain_bound
         else canonical_legacy_enroll_payload(hotkey, endpoint_url, nonce, ts)
     )
@@ -103,7 +111,7 @@ def _signed_payload(
         "signature_b64": sig,
     }
     if domain_bound:
-        payload.update(network="finney", netuid=94)
+        payload.update(network=NETWORK, netuid=NETUID)
     return payload
 
 
@@ -164,8 +172,8 @@ def _snapshot_file(tmp_path: Path, mapping: dict[str, str] | list[str]) -> Path:
         document.update(
             {
                 "schema": REGISTRATION_SNAPSHOT_SCHEMA,
-                "network": DEFAULT_ENROLL_NETWORK,
-                "netuid": DEFAULT_ENROLL_NETUID,
+                "network": NETWORK,
+                "netuid": NETUID,
                 "block": 9_000_000,
                 "block_is_finalized": True,
                 "generated_at": now_iso(),
@@ -533,8 +541,8 @@ def _reconcile_args(tmp_path: Path, *, remove: bool) -> argparse.Namespace:
             if remove
             else None
         ),
-        network=DEFAULT_ENROLL_NETWORK,
-        netuid=DEFAULT_ENROLL_NETUID,
+        network=NETWORK,
+        netuid=NETUID,
         allowlist_max_age_seconds=86400,
         registered_hotkeys_file=str(tmp_path / "registered-hotkeys.json"),
         registration_max_age_seconds=3600,
@@ -706,7 +714,7 @@ def test_reconcile_dry_run_persists_block_high_water_and_rejects_rollback(
     capsys.readouterr()
     assert (
         store.registration_snapshot_high_water(
-            DEFAULT_ENROLL_NETWORK, DEFAULT_ENROLL_NETUID
+            NETWORK, NETUID
         )
         == 9_000_001
     )
@@ -787,7 +795,6 @@ def test_extended_snapshot_with_invalid_values_fails_closed(tmp_path: Path) -> N
 # ---------------------------------------------------------------------------
 # Worker token minted at enrollment (#60 interim: removes the manual step)
 # ---------------------------------------------------------------------------
-
 
 
 def _iso_seconds_from_now(offset: int) -> str:

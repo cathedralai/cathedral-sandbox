@@ -43,6 +43,8 @@ from cathedral.validator_access import (
 from cathedral.worker import WorkerServer
 from tests.test_cli import _tls_material
 from tests.test_validator_access import (
+    NETUID,
+    NETWORK,
     OTHER_VALIDATOR_HOTKEY,
     VALIDATOR_HOTKEY,
     VALIDATOR_PAIR,
@@ -414,7 +416,7 @@ def test_worker_route_serves_a_changed_manifest_without_restart(
             WORKER_HOTKEY,
             ssl_context=client_context,
             validator_hotkey=VALIDATOR_HOTKEY,
-            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message),
+            validator_signer=lambda message: sr25519.sign(VALIDATOR_PAIR, message), validator_network=NETWORK, validator_netuid=NETUID,
         )
         remote.confirm_channel_binding(remote.fetch_evidence(os.urandom(32)))
         assert remote.fetch_fleet() == (primary, *FIRST)
@@ -491,6 +493,10 @@ def test_worker_cli_passes_a_reloading_manifest(tmp_path: Path, monkeypatch):
             "1000",
             "--public-endpoint",
             PRIMARY,
+            "--validator-network",
+            NETWORK,
+            "--validator-netuid",
+            str(NETUID),
             "--fleet-manifest",
             str(path),
         ]

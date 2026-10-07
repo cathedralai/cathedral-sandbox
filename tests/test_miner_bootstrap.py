@@ -13,7 +13,15 @@ import pytest
 
 from cathedral.miner_bootstrap import BootstrapError, install
 from cathedral.miner_bundle import link_target, release_tree_sha256
-from cathedral.miner_products import AUDIT_MINER, SNP_MINER, find_launcher, read_launcher_profile
+from cathedral.miner_products import (
+    AUDIT_MINER,
+    PRODUCTS,
+    SNP_MINER,
+    MinerProduct,
+    find_launcher,
+    product_for_contract,
+    read_launcher_profile,
+)
 from cathedral.miner_updater import (
     CONFIG_SCHEMA,
     LEGACY,
@@ -68,11 +76,30 @@ def _keys_sha256(source: Path) -> str:
     return hashlib.sha256((source / "deploy/miner-update/release-keys.json").read_bytes()).hexdigest()
 
 
+def _older_launcher(directory: Path, product: MinerProduct, contract: str) -> Path:
+    """This product's launcher as an earlier release shipped it, enforcing ``contract``.
+
+    The in-tree launcher with only its contract replaced: a66d7c4's v1 launchers
+    differ from it in other lines too, but the bootstrap reads only the profile.
+    """
+
+    launcher = find_launcher(REPO_ROOT, product)
+    text = launcher.read_text()
+    current = f"readonly RUNTIME_CONTRACT='{product.runtime_contract}'"
+    assert text.count(current) == 1
+    older = directory / f"{contract}-{launcher.name}"
+    older.write_text(text.replace(current, f"readonly RUNTIME_CONTRACT='{contract}'"))
+    older.chmod(0o755)
+    return older
+
+
 def _install(
     source: Path, root: Path, *, exec_start: Path | None = None, repair_trust_set: bool = False, **config
 ):
     calls: list[tuple[str, ...]] = []
-    launcher = exec_start or find_launcher(REPO_ROOT, SNP_MINER)
+    # By default the unit runs the launcher hosts run today: the snp miner's v1.
+    root.parent.mkdir(parents=True, exist_ok=True)
+    launcher = exec_start or _older_launcher(root.parent, SNP_MINER, SNP_MINER.previous_contracts[0])
     report = install(
         source,
         paths=HostPaths(root=root),
@@ -135,9 +162,64 @@ def test_a_trust_root_with_no_key_for_the_channel_is_refused(source, tmp_path):
         _install(source, tmp_path / "root")
 
 
-def test_a_unit_running_another_products_launcher_is_refused(source, tmp_path):
-    with pytest.raises(BootstrapError, match="another product"):
-        _install(source, tmp_path / "root", exec_start=find_launcher(REPO_ROOT, AUDIT_MINER))
+def test_each_product_names_its_v1_contract_as_an_earlier_release():
+    assert AUDIT_MINER.previous_contracts == ("signed-validator-fleet-v1",)
+    assert SNP_MINER.previous_contracts == ("snp-signed-validator-fleet-v1",)
+    for product in PRODUCTS.values():
+        for contract in product.contracts:
+            assert product_for_contract(contract) is product
+    assert product_for_contract("snp-signed-validator-fleet-v3") is None
+
+
+@pytest.mark.parametrize("product", [SNP_MINER, AUDIT_MINER], ids=lambda p: p.product)
+def test_a_unit_running_this_products_v1_launcher_is_adopted_as_legacy(source, tmp_path, product):
+    """A host on the README's v1 launcher enrols from a v2 revision; its launcher
+    becomes the legacy release unchanged."""
+
+    root = tmp_path / "root"
+    older = _older_launcher(tmp_path, product, product.previous_contracts[0])
+    report, calls = _install(source, root, exec_start=older, product=product.product)
+    paths = HostPaths(root=root)
+    assert link_target(paths.miner_current) == LEGACY
+    assert (paths.miner_legacy / "unit.conf").read_bytes() == b""
+    profile = json.loads((paths.miner_legacy / "profile.json").read_text())
+    assert profile["container"] == read_launcher_profile(older).container
+    assert report["config"]["product"] == product.product
+    assert calls == [("daemon-reload",)]
+
+
+@pytest.mark.parametrize("product", [SNP_MINER, AUDIT_MINER], ids=lambda p: p.product)
+def test_a_unit_running_this_products_current_launcher_is_adopted(source, tmp_path, product):
+    report, _ = _install(
+        source, tmp_path / "root", exec_start=find_launcher(REPO_ROOT, product), product=product.product
+    )
+    assert report["config"]["product"] == product.product
+
+
+@pytest.mark.parametrize(
+    ("host", "running", "contract"),
+    [
+        (SNP_MINER, AUDIT_MINER, "signed-validator-fleet-v1"),
+        (SNP_MINER, AUDIT_MINER, "signed-validator-fleet-v2"),
+        (AUDIT_MINER, SNP_MINER, "snp-signed-validator-fleet-v1"),
+        (AUDIT_MINER, SNP_MINER, "snp-signed-validator-fleet-v2"),
+    ],
+)
+def test_a_unit_running_another_products_launcher_is_refused(source, tmp_path, host, running, contract):
+    root = tmp_path / "root"
+    launcher = _older_launcher(tmp_path, running, contract)
+    with pytest.raises(BootstrapError, match="another product") as refused:
+        _install(source, root, exec_start=launcher, product=host.product)
+    message = str(refused.value)
+    assert running.description in message and contract in message
+    assert host.description in message
+    assert not HostPaths(root=root).trust_file.exists()
+
+
+def test_a_unit_running_an_unknown_contract_is_refused(source, tmp_path):
+    launcher = _older_launcher(tmp_path, SNP_MINER, "snp-signed-validator-fleet-v3")
+    with pytest.raises(BootstrapError, match="another product: an unknown product"):
+        _install(source, tmp_path / "root", exec_start=launcher)
 
 
 def test_a_unit_running_an_unrecognised_program_is_refused(source, tmp_path):

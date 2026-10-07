@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import sqlite3
 import stat
 import sys
@@ -29,8 +30,6 @@ from cathedral.cli import (
     cmd_enroll_submit,
 )
 from cathedral.enroll import (
-    DEFAULT_ENROLL_NETUID,
-    DEFAULT_ENROLL_NETWORK,
     ENROLL_DOMAIN_TAG,
     REGISTRATION_SNAPSHOT_SCHEMA,
     IpRateLimiter,
@@ -45,7 +44,13 @@ from cathedral.enroll import (
     preflight_signature_verifier,
     validate_endpoint_url,
 )
+
 from cathedral.policy_registry import canonical_json
+
+# The subnet is deploy-time config with no default; draw one per run.
+NETWORK = "finney"
+NETUID = random.SystemRandom().randrange(1, 65_536)
+OTHER_NETUID = (NETUID % 65_535) + 1
 
 
 KEYPAIR = Keypair.create_from_uri("//Alice", crypto_type=KeypairType.SR25519)
@@ -117,7 +122,17 @@ def test_main_refuses_to_bind_without_a_verifier(
         ),
     )
     monkeypatch.setattr(
-        sys, "argv", ["cathedral.enroll", "--db", str(tmp_path / "registry.sqlite")]
+        sys,
+        "argv",
+        [
+            "cathedral.enroll",
+            "--db",
+            str(tmp_path / "registry.sqlite"),
+            "--network",
+            NETWORK,
+            "--netuid",
+            str(NETUID),
+        ],
     )
     with pytest.raises(SystemExit) as excinfo:
         enroll_module.main()
@@ -152,28 +167,38 @@ def test_production_endpoint_grammar_rejects_aliases_and_resources(
 
 
 def test_allowlist_preimage_is_domain_and_audience_bound() -> None:
+    bound = {"network": NETWORK, "netuid": NETUID}
     document = json.loads(
         canonical_allowlist_enroll_payload(
-            HOTKEY, ENDPOINT, "aa" * 16, "2026-08-16T00:00:00Z"
+            HOTKEY, ENDPOINT, "aa" * 16, "2026-08-16T00:00:00Z", **bound
         )
     )
     assert document["domain"] == ENROLL_DOMAIN_TAG
-    assert document["network"] == DEFAULT_ENROLL_NETWORK
-    assert document["netuid"] == DEFAULT_ENROLL_NETUID
+    assert document["network"] == NETWORK
+    assert document["netuid"] == NETUID
     assert canonical_enroll_payload(
-        HOTKEY, ENDPOINT, "aa" * 16, "2026-08-16T00:00:00Z"
+        HOTKEY, ENDPOINT, "aa" * 16, "2026-08-16T00:00:00Z", **bound
     ) == canonical_allowlist_enroll_payload(
-        HOTKEY, ENDPOINT, "aa" * 16, "2026-08-16T00:00:00Z"
+        HOTKEY, ENDPOINT, "aa" * 16, "2026-08-16T00:00:00Z", **bound
     )
     assert canonical_allowlist_enroll_payload(
         HOTKEY,
         ENDPOINT,
         "aa" * 16,
         "2026-08-16T00:00:00Z",
-        netuid=40,
+        network=NETWORK,
+        netuid=OTHER_NETUID,
     ) != canonical_allowlist_enroll_payload(
-        HOTKEY, ENDPOINT, "aa" * 16, "2026-08-16T00:00:00Z"
+        HOTKEY, ENDPOINT, "aa" * 16, "2026-08-16T00:00:00Z", **bound
     )
+
+
+def test_enrollment_preimage_has_no_default_subnet() -> None:
+    for build in (canonical_enroll_payload, canonical_allowlist_enroll_payload):
+        with pytest.raises(TypeError, match="netuid"):
+            build(HOTKEY, ENDPOINT, "aa" * 16, "2026-08-16T00:00:00Z", network=NETWORK)
+        with pytest.raises(TypeError, match="network"):
+            build(HOTKEY, ENDPOINT, "aa" * 16, "2026-08-16T00:00:00Z", netuid=NETUID)
 
 
 def test_current_mining_guide_does_not_teach_legacy_enrollment() -> None:
@@ -186,8 +211,8 @@ def test_current_mining_guide_does_not_teach_legacy_enrollment() -> None:
 def _snapshot(**overrides: object) -> dict[str, object]:
     document: dict[str, object] = {
         "schema": REGISTRATION_SNAPSHOT_SCHEMA,
-        "network": DEFAULT_ENROLL_NETWORK,
-        "netuid": DEFAULT_ENROLL_NETUID,
+        "network": NETWORK,
+        "netuid": NETUID,
         "block": 9_000_000,
         "block_is_finalized": True,
         "generated_at": now_iso(),
@@ -215,8 +240,8 @@ def _strict(
         str(path),
         max_age_seconds=3600,
         strict=True,
-        network=DEFAULT_ENROLL_NETWORK,
-        netuid=DEFAULT_ENROLL_NETUID,
+        network=NETWORK,
+        netuid=NETUID,
         expected_uid=os.getuid(),
         high_water_store=high_water_store,
         advance_high_water_on_use=advance_on_use,
@@ -238,7 +263,7 @@ def test_strict_snapshot_accepts_finalized_audience_bound_mapping(
     [
         {"schema": "cathedral_registration_snapshot_v1"},
         {"network": "test"},
-        {"netuid": 292},
+        {"netuid": OTHER_NETUID},
         {"block_is_finalized": False},
         {"block": 0},
         {"block": True},
@@ -280,7 +305,7 @@ def test_strict_snapshot_high_water_survives_provider_restart(tmp_path: Path) ->
     assert _strict(path, store=store).is_registered(HOTKEY) is True
     assert (
         store.registration_snapshot_high_water(
-            DEFAULT_ENROLL_NETWORK, DEFAULT_ENROLL_NETUID
+            NETWORK, NETUID
         )
         == 20
     )
@@ -309,7 +334,7 @@ def test_snapshot_high_water_migrates_and_rejects_same_block_equivocation(
         )
         connection.execute(
             "INSERT INTO registration_snapshot_high_water VALUES (?, ?, ?)",
-            (DEFAULT_ENROLL_NETWORK, DEFAULT_ENROLL_NETUID, 20),
+            (NETWORK, NETUID, 20),
         )
 
     migrated = RegistryStore(str(database))
@@ -386,7 +411,7 @@ def test_pure_strict_snapshot_parse_does_not_advance_high_water(tmp_path: Path) 
     assert provider.load_snapshot() is not None
     assert (
         store.registration_snapshot_high_water(
-            DEFAULT_ENROLL_NETWORK, DEFAULT_ENROLL_NETUID
+            NETWORK, NETUID
         )
         is None
     )
@@ -400,7 +425,7 @@ def test_invalid_empty_snapshot_does_not_advance_high_water(tmp_path: Path) -> N
     assert provider.is_registered(HOTKEY) is None
     assert (
         store.registration_snapshot_high_water(
-            DEFAULT_ENROLL_NETWORK, DEFAULT_ENROLL_NETUID
+            NETWORK, NETUID
         )
         is None
     )
@@ -774,8 +799,8 @@ def test_submit_signs_domain_bound_request_without_exporting_seed(
         wallet_name="cathedral",
         hotkey_name="miner",
         wallet_path=None,
-        network=DEFAULT_ENROLL_NETWORK,
-        netuid=DEFAULT_ENROLL_NETUID,
+        network=NETWORK,
+        netuid=NETUID,
         timeout_seconds=30.0,
         token_out=str(tmp_path / "worker-token"),
         transport=transport,
@@ -813,6 +838,10 @@ def test_submit_parser_requires_token_output_path() -> None:
         "cathedral",
         "--hotkey-name",
         "miner",
+        "--network",
+        NETWORK,
+        "--netuid",
+        str(NETUID),
     ]
     with pytest.raises(SystemExit):
         build_parser().parse_args(command)
@@ -852,8 +881,8 @@ def _submit_args(transport, *, token_out: Path | str | None) -> argparse.Namespa
         wallet_name="cathedral",
         hotkey_name="miner",
         wallet_path=None,
-        network=DEFAULT_ENROLL_NETWORK,
-        netuid=DEFAULT_ENROLL_NETUID,
+        network=NETWORK,
+        netuid=NETUID,
         timeout_seconds=30.0,
         token_out=None if token_out is None else str(token_out),
         transport=transport,

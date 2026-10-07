@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import functools
 import io
 import json
+import random
 import sqlite3
 import sys
 import time
@@ -11,7 +13,12 @@ from typing import Any
 import pytest
 
 import cathedral.enroll as enroll_module
-from cathedral.enroll import RegistryApp, RegistryStore
+from cathedral.enroll import RegistryApp as _RegistryApp
+from cathedral.enroll import RegistryStore
+
+# The subnet is deploy-time config with no default; draw one per run.
+NETUID = random.SystemRandom().randrange(1, 65_536)
+RegistryApp = functools.partial(_RegistryApp, network="finney", netuid=NETUID)
 
 
 def _call(app: RegistryApp) -> tuple[int, dict[str, Any], dict[str, str]]:
@@ -134,6 +141,10 @@ def test_main_accepts_deployed_busy_timeout_flag(
             "cathedral.enroll",
             "--db",
             str(tmp_path / "registry.sqlite"),
+            "--network",
+            "finney",
+            "--netuid",
+            str(NETUID),
             "--sqlite-busy-timeout-ms",
             "4000",
         ],
@@ -161,6 +172,10 @@ def test_main_rejects_nonpositive_busy_timeout(
             "cathedral.enroll",
             "--db",
             str(tmp_path / "registry.sqlite"),
+            "--network",
+            "finney",
+            "--netuid",
+            str(NETUID),
             "--sqlite-busy-timeout-ms",
             "0",
         ],

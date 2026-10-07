@@ -114,8 +114,6 @@ _DEFAULT_REGISTRATION_MAX_AGE_SECONDS = 3600
 # bound to this protocol and subnet. Bare v1 remains available only when no
 # production admission artifact is configured.
 ENROLL_DOMAIN_TAG = "cathedral-enroll-v1"
-DEFAULT_ENROLL_NETWORK = "finney"
-DEFAULT_ENROLL_NETUID = 94
 
 # RegistryStore is shared by enrollment and the epoch loop. Keep the existing
 # sqlite3 default at five seconds unless one caller explicitly chooses a lower
@@ -984,8 +982,8 @@ def canonical_enroll_payload(
     nonce: str,
     timestamp: str,
     *,
-    network: str = DEFAULT_ENROLL_NETWORK,
-    netuid: int = DEFAULT_ENROLL_NETUID,
+    network: str,
+    netuid: int,
     domain: str = ENROLL_DOMAIN_TAG,
 ) -> bytes:
     """Canonical domain-bound v1 bytes for coldkey-allowlist enrollment."""
@@ -1007,8 +1005,8 @@ def canonical_allowlist_enroll_payload(
     nonce: str,
     timestamp: str,
     *,
-    network: str = DEFAULT_ENROLL_NETWORK,
-    netuid: int = DEFAULT_ENROLL_NETUID,
+    network: str,
+    netuid: int,
     domain: str = ENROLL_DOMAIN_TAG,
 ) -> bytes:
     """Explicit alias for the canonical deployed allowlist-v1 preimage."""
@@ -3275,8 +3273,8 @@ class RegistryApp:
         trusted_proxy: bool = False,
         hotkey_enroll_limit: int = DEFAULT_HOTKEY_ENROLL_LIMIT,
         hotkey_enroll_window_seconds: int = DEFAULT_HOTKEY_ENROLL_WINDOW_SECONDS,
-        network: str = DEFAULT_ENROLL_NETWORK,
-        netuid: int = DEFAULT_ENROLL_NETUID,
+        network: str,
+        netuid: int,
     ) -> None:
         preflight_signature_verifier()
         self.network = validate_network(network)
@@ -4022,13 +4020,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--network",
-        default=DEFAULT_ENROLL_NETWORK,
+        required=True,
         help="network the enrollment artifact and request must be bound to",
     )
     parser.add_argument(
         "--netuid",
         type=int,
-        default=DEFAULT_ENROLL_NETUID,
+        required=True,
         help="netuid the enrollment artifact and request must be bound to",
     )
     parser.add_argument(

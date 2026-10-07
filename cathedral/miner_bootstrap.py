@@ -49,6 +49,7 @@ from cathedral.miner_bundle import (
 from cathedral.miner_products import (
     LauncherProfileError,
     product_by_name,
+    product_for_contract,
     read_launcher_profile,
 )
 from cathedral.miner_release import (
@@ -204,10 +205,16 @@ def install(
             raise BootstrapError(
                 f"{config.miner_unit} does not run a recognised miner launcher ({exec_path}): {exc}"
             ) from exc
-        if profile.runtime_contract != product.runtime_contract:
+        # An older launcher of this product (an earlier contract) is adopted
+        # as it is: the legacy release only records what already runs, and
+        # the first managed release replaces launcher and image together.
+        if profile.runtime_contract not in product.contracts:
+            other = product_for_contract(profile.runtime_contract)
+            runs = f"the {other.description}" if other else "an unknown product"
             raise BootstrapError(
-                f"{config.miner_unit} runs a launcher for another product "
-                f"({profile.runtime_contract}, not {product.runtime_contract})"
+                f"{config.miner_unit} runs a launcher for another product: {runs} "
+                f"(contract {profile.runtime_contract}), not the {product.description} "
+                f"this host is configured for (contracts {', '.join(product.contracts)})"
             )
         container = profile.container
 

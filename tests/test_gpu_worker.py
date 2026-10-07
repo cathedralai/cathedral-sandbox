@@ -24,7 +24,7 @@ from cathedral.worker import WorkerServer
 import cathedral.gpu_work as gpu_work
 import cathedral.validator_access as access_module
 from test_validator_access import (
-    VALIDATOR_HOTKEY, VALIDATOR_PAIR, WORKER_HOTKEY, _snapshot, _tls_contexts,
+    NETUID, NETWORK, VALIDATOR_HOTKEY, VALIDATOR_PAIR, WORKER_HOTKEY, _snapshot, _tls_contexts,
 )
 
 UUID = "GPU-11111111-1111-4111-8111-111111111111"
@@ -137,7 +137,7 @@ def test_gpu_signed_endpoints_bind_completion_and_leave_cpu_wire_unchanged(tmp_p
         threading.Thread(target=server.serve_forever, daemon=True).start()
         remote = RemoteMiner(server.base_url, WORKER_HOTKEY, ssl_context=client_context,
                              validator_hotkey=VALIDATOR_HOTKEY,
-                             validator_signer=lambda m: sr25519.sign(VALIDATOR_PAIR, m))
+                             validator_signer=lambda m: sr25519.sign(VALIDATOR_PAIR, m), validator_network=NETWORK, validator_netuid=NETUID,)
         def post(path, body, signed=True):
             return remote._post_tls(path, lambda _b: body, expected_binding=binding,
                                     include_auth=False, include_validator_auth=signed)[0]

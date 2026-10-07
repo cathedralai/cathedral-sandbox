@@ -348,6 +348,10 @@ _SIGNED_ACCESS_ARGS = [
     "1000",
     "--public-endpoint",
     "https://8.8.8.8:8081",
+    "--validator-network",
+    "finney",
+    "--validator-netuid",
+    "7",
 ]
 _CENTRAL_ARGS = [
     "--central-root-keys",
