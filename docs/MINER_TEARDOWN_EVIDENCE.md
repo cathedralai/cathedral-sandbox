@@ -1,7 +1,9 @@
 # Miner teardown evidence (draft)
 
-Status: **draft schema only**. Does not activate miner rewards. Does not
-relax `CUSTOMER_EXECUTION_SUPPLY_BOUNDARY.md` condition 3.
+Status: **schema + verify helpers** in `cathedral/miner_lifecycle_receipt.py`.
+Does not activate miner rewards. Does not relax
+`CUSTOMER_EXECUTION_SUPPLY_BOUNDARY.md` condition 3. Polaris production
+reconciler that *issues* receipts is still to wire.
 
 ## Why
 
@@ -50,9 +52,9 @@ Rejected by verifiers: any receipt whose only evidence is miner-signed
 
 ## Implementation order
 
-1. This draft (docs only).
-2. Canonical JSON + Ed25519 verify helpers in `cathedral-sandbox` (no
-   production wiring).
+1. This draft (docs) — done.
+2. Canonical JSON + Ed25519 verify helpers in `cathedral-sandbox` — **done**
+   (`cathedral/miner_lifecycle_receipt.py`, tests). No production wiring.
 3. Polaris reconciler that *produces* the receipt after an independent
    observation (needs central pool access or operator reclaim path).
 4. Wire `resolve_cleanup` only from that verifier — never from miner
