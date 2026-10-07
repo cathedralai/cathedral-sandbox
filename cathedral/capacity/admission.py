@@ -417,7 +417,12 @@ def admit(
     if not isinstance(require_fresh_boot, bool):
         raise AdmissionError("require_fresh_boot must be a bool")
     if require_fresh_boot and kind != "tdx":
-        raise AdmissionError("require_fresh_boot needs a TDX quote: SEV-SNP has no RTMR3")
+        # SNP has no guest-extendable report field (docs/TEE_BOX_SERVICE.md,
+        # issue #274 B.d). SoftwareLeaseRegister is guest-local only.
+        raise AdmissionError(
+            "require_fresh_boot needs a TDX quote: SEV-SNP has no RTMR3-class "
+            "register in the attestation report (issue #274 B.d BLOCKED)"
+        )
     registry = _check_admitted(admitted)
     binding = _tls_binding(tls_certificate_der, tls_spki_der)
 

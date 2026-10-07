@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -82,13 +83,33 @@ def test_a_measured_but_unusable_root_file_refuses_cleanly(image_root: Path, con
         measured_root.load_measured_root_keys("tdx", read_binding=lambda: binding)
 
 
-def test_snp_and_unknown_tees_refuse(image_root: Path):
+def test_matching_host_data_loads_the_root(image_root: Path):
+    binding = measured_root.host_data_for_root_keys(image_root.read_bytes())
+    assert binding == hashlib.sha256(image_root.read_bytes()).digest()
+    keys, digest = measured_root.load_measured_root_keys("snp", read_binding=lambda: binding)
+    assert keys == ROOT_KEYS
+    assert digest == "sha256:" + hashlib.sha256(image_root.read_bytes()).hexdigest()
+
+
+def test_a_root_file_changed_after_snp_launch_refuses(image_root: Path):
+    binding = measured_root.host_data_for_root_keys(image_root.read_bytes())
+    image_root.write_bytes(_root_file(OTHER_ROOT_SEED))
+    with pytest.raises(measured_root.MeasuredRootError, match="does not match HOST_DATA"):
+        measured_root.load_measured_root_keys("snp", read_binding=lambda: binding)
+
+
+def test_snp_without_a_guest_device_refuses(image_root: Path):
     with pytest.raises(measured_root.MeasuredRootError, match="HOST_DATA"):
         measured_root.load_measured_root_keys("snp")
+
+
+def test_an_mrconfigid_shaped_binding_is_not_host_data(image_root: Path):
     binding = measured_root.mrconfigid_for_root_keys(image_root.read_bytes())
-    # Even a reader that returns a matching value is not an SNP binding.
-    with pytest.raises(measured_root.MeasuredRootError, match="no measured root binding"):
+    with pytest.raises(measured_root.MeasuredRootError, match="HOST_DATA must be 32 bytes"):
         measured_root.load_measured_root_keys("snp", read_binding=lambda: binding)
+
+
+def test_unknown_tees_refuse(image_root: Path):
     with pytest.raises(measured_root.MeasuredRootError, match="no measured root binding"):
         measured_root.load_measured_root_keys("gpu")
 
@@ -177,3 +198,108 @@ def test_a_missing_td_report_device_refuses(tmp_path: Path):
 def test_malformed_mrconfigid_refuses(binding, match):
     with pytest.raises(measured_root.MeasuredRootError, match=match):
         measured_root.root_digest_from_mrconfigid(binding)
+
+
+@pytest.mark.parametrize(
+    ("binding", "match"),
+    [
+        (bytes(32), "zero"),
+        (b"\x01" * 31, "32 bytes"),
+        (b"\x01" * 48, "32 bytes"),
+        ("01" * 32, "32 bytes"),
+    ],
+)
+def test_malformed_host_data_refuses(binding, match):
+    with pytest.raises(measured_root.MeasuredRootError, match=match):
+        measured_root.root_digest_from_host_data(binding)
+
+
+class _FakeSnpGuest:
+    """Stands in for ``snpguest report`` writing an 1184-byte attestation report."""
+
+    def __init__(self, host_data: bytes) -> None:
+        self.host_data = host_data
+        self.echo = True
+        self.fail = False
+        self.timeout = False
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        assert argv[1] == "report" and argv[4:6] == ["--vmpl", "0"]
+        if self.timeout:
+            raise subprocess.TimeoutExpired(argv[0], kwargs["timeout"])
+        if self.fail:
+            raise subprocess.CalledProcessError(1, argv, stderr="report failed")
+        request = Path(argv[3]).read_bytes()
+        report = bytearray(measured_root.SNP_REPORT_SIZE)
+        report_data = request if self.echo else bytes(64)
+        report[
+            measured_root.SNP_REPORT_DATA_OFFSET : measured_root.SNP_REPORT_DATA_OFFSET
+            + measured_root.SNP_REPORT_DATA_SIZE
+        ] = report_data
+        report[
+            measured_root.HOST_DATA_OFFSET : measured_root.HOST_DATA_OFFSET
+            + measured_root.HOST_DATA_SIZE
+        ] = self.host_data
+        Path(argv[2]).write_bytes(report)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+@pytest.fixture
+def snp_guest(tmp_path: Path, monkeypatch):
+    device = tmp_path / "sev-guest"
+    device.write_bytes(b"")
+    binary = tmp_path / "snpguest"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    guest = _FakeSnpGuest(measured_root.host_data_for_root_keys(_root_file()))
+    monkeypatch.setattr(measured_root.subprocess, "run", guest)
+    guest.device = str(device)
+    guest.binary = str(binary)
+    return guest
+
+
+def test_the_snp_report_reader_returns_host_data(snp_guest):
+    assert (
+        measured_root.read_snp_host_data(snp_guest.device, snpguest=snp_guest.binary)
+        == snp_guest.host_data
+    )
+    assert snp_guest.calls[0][0] == snp_guest.binary
+    assert snp_guest.calls[0][4:6] == ["--vmpl", "0"]
+
+
+def test_the_default_snp_reader_is_the_report(image_root: Path, snp_guest, monkeypatch):
+    assert measured_root.default_binding_reader("snp") is measured_root.read_snp_host_data
+    real = measured_root.read_snp_host_data
+    monkeypatch.setattr(
+        measured_root,
+        "read_snp_host_data",
+        lambda: real(snp_guest.device, snpguest=snp_guest.binary),
+    )
+    keys, _digest = measured_root.load_measured_root_keys("snp")
+    assert keys == ROOT_KEYS and snp_guest.calls
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [
+        ("echo", "requested REPORT_DATA"),
+        ("fail", "refused an SNP report"),
+        ("timeout", "timed out"),
+    ],
+)
+def test_a_bad_snp_report_refuses(snp_guest, change, match):
+    if change == "echo":
+        snp_guest.echo = False
+    elif change == "fail":
+        snp_guest.fail = True
+    else:
+        snp_guest.timeout = True
+    with pytest.raises(measured_root.MeasuredRootError, match=match):
+        measured_root.read_snp_host_data(snp_guest.device, snpguest=snp_guest.binary)
+
+
+def test_a_missing_sev_guest_device_refuses(tmp_path: Path):
+    with pytest.raises(measured_root.MeasuredRootError, match="unavailable"):
+        measured_root.read_snp_host_data(str(tmp_path / "absent"))
