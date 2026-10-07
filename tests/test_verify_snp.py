@@ -67,6 +67,8 @@ def test_parses_real_report_data_fixture_byte_for_byte():
     assert parsed.report_data == request_data
     assert parsed.version == 5
     assert parsed.measurement
+    assert len(parsed.host_data) == 32
+    assert parsed.host_data == report[0xC0:0xE0]
     assert parsed.chip_id
     assert parsed.tcb.reported > 0
 
