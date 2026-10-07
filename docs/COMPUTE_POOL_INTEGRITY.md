@@ -3,7 +3,7 @@
 This is a design reference for reviewers. It records how the direct validator
 stops a miner from being paid for a machine it does not run, where that
 protection ends today, and the changes that close the remaining gaps. It is not
-an operator guide; the repository [README](../README.md) is.
+an operator guide; the repository [mining guide](MINING.md) is.
 
 Paths prefixed `cathedral-validator/` are in the validator repository at
 `7533d9d`. Other paths are in this repository at `e4f8e92`.

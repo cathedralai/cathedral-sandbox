@@ -26,8 +26,9 @@ The worker's TLS server requests no client certificate
 guest on every start (`cathedral/audit_miner_entrypoint.py` lines 193-240), and
 validators trust it only because fresh vendor evidence binds its SPKI.
 
-The README states the current trust boundary: "Cathedral does not issue a
-credential and no Cathedral API is involved" (`README.md` lines 185-189).
+The [mining guide](MINING.md#2-refresh-validator-access-from-a-control-host)
+states the current trust boundary: "Cathedral does not issue a credential and
+no Cathedral API is involved".
 
 ## Requirements
 

@@ -97,9 +97,11 @@ _TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 # (the QVL binary's SHA-256) is written with the prefix.
 _VERIFIER_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 # The launch measurement each verifier reports: TDX as cathedral/verify/tdx_quote.py
-# computes it, SNP as the report's 48-byte MEASUREMENT in hex (cathedral/verify/snp.py).
+# computes it (the v1 launch measurement, or the v2 image identity when the
+# admission policy listed only that; docs/MRTD.md), SNP as the report's 48-byte
+# MEASUREMENT in hex (cathedral/verify/snp.py).
 _MEASUREMENT = {
-    "tdx": re.compile(r"tdx-measurement-sha256:[0-9a-f]{64}"),
+    "tdx": re.compile(r"tdx-(?:measurement|image)-sha256:[0-9a-f]{64}"),
     "sev_snp": re.compile(r"[0-9a-f]{96}"),
 }
 _EVIDENCE_KEYS = frozenset(
@@ -157,7 +159,9 @@ class ReceiptEvidence:
 
     evidence_kind: str  # the box's tee_kind: tdx or sev_snp
     evidence_sha256: str  # SHA-256 of the raw quote or report the prober verified
-    measurement: str  # tdx-measurement-sha256:<64 hex>, or the SNP MEASUREMENT's 96 hex
+    # tdx-measurement-sha256:<64 hex> or tdx-image-sha256:<64 hex>, or the SNP
+    # MEASUREMENT's 96 hex
+    measurement: str
     verifier_digest: str  # sha256:<64 hex>
     tls_spki_sha256: str  # SHA-256 of the SPKI of the TLS key the evidence attests
     attestation_nonce: str  # 64 hex: the 32-byte nonce REPORT_DATA was made over
@@ -566,8 +570,8 @@ def _check_evidence(
     measurement = evidence["measurement"]
     if not isinstance(measurement, str) or _MEASUREMENT[tee_kind].fullmatch(measurement) is None:
         raise ReceiptError(
-            "measurement must be tdx-measurement-sha256:<64 hex> for tdx"
-            " and 96 lowercase hex for sev_snp"
+            "measurement must be tdx-measurement-sha256:<64 hex> or"
+            " tdx-image-sha256:<64 hex> for tdx and 96 lowercase hex for sev_snp"
         )
     if not any(bytes.fromhex(measurement.rpartition(":")[2])):
         raise ReceiptError("measurement is all zeros")

@@ -1,7 +1,7 @@
 # Intel TDX miner image
 
 This page records the immutable image contract. Use the repository
-[README](../README.md) for the mining sequence.
+[mining guide](MINING.md) for the mining sequence.
 
 ## Current release
 

@@ -1,7 +1,7 @@
 # SN94 miner image operations
 
 This is a release reference, not a second mining guide. Start with the
-repository [README](../README.md).
+repository [mining guide](MINING.md).
 
 ## Current image
 

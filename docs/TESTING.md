@@ -48,7 +48,7 @@ AMD SEV-SNP evidence. It checks the exact health response, evidence transport,
 capabilities, canonical SAT, extra-machine fleet parsing, and duplicate fleet
 rejection. It creates and removes fresh temporary state on every run. It does
 not contact the example fleet endpoints, a chain, a wallet, Docker, or TEE
-hardware. A pass is not production evidence. The public README requires three
+hardware. A pass is not production evidence. The mining guide requires three
 fresh runs as the onboarding preflight.
 
 ## Intel TDX hardware tests

@@ -15,6 +15,7 @@ def synthetic_tdx_quote(
     td_attributes: bytes | None = None,
     rtmr3: bytes | None = None,
     mr_config_id: bytes | None = None,
+    mr_owner: bytes | None = None,
 ) -> bytes:
     assert len(report_data) == 64
     mr_td = mr_td or (b"M" * 48)
@@ -27,6 +28,7 @@ def synthetic_tdx_quote(
     assert len(td_attributes) == 8
     assert rtmr3 is None or len(rtmr3) == 48
     assert mr_config_id is None or len(mr_config_id) == 48
+    assert mr_owner is None or len(mr_owner) == 48
 
     header = bytearray(48)
     header[0:2] = (4).to_bytes(2, "little")
@@ -46,7 +48,7 @@ def synthetic_tdx_quote(
     body[128:136] = b"X" * 8
     body[136:184] = mr_td
     body[184:232] = b"C" * 48 if mr_config_id is None else mr_config_id
-    body[232:280] = b"O" * 48
+    body[232:280] = b"O" * 48 if mr_owner is None else mr_owner
     body[280:328] = b"o" * 48
     body[328:376] = b"0" * 48
     body[376:424] = b"1" * 48

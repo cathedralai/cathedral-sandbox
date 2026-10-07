@@ -457,7 +457,7 @@ def test_operator_docs_bind_the_current_image_and_one_migration_boundary() -> No
         REPOSITORY_ROOT / "docs" / "SN94_AUDIT_MINER_OPERATIONS.md"
     ).read_text()
     work_request = (REPOSITORY_ROOT / "docs" / "WORK_REQUEST_V2.md").read_text()
-    mining = (REPOSITORY_ROOT / "README.md").read_text()
+    mining = (REPOSITORY_ROOT / "docs" / "MINING.md").read_text()
 
     for documentation in (image_documentation, operations):
         assert "78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8" in " ".join(
@@ -493,7 +493,7 @@ def test_operator_docs_bind_the_current_image_and_one_migration_boundary() -> No
 def test_host_startup_is_syntax_valid_and_pins_the_exact_pulled_runtime() -> None:
     script_path = REPOSITORY_ROOT / "scripts" / "run_sn94_signed_fleet_miner.sh"
     script = script_path.read_text()
-    readme = (REPOSITORY_ROOT / "README.md").read_text()
+    readme = (REPOSITORY_ROOT / "docs" / "MINING.md").read_text()
 
     result = subprocess.run(
         ["bash", "-n", str(script_path)], capture_output=True, text=True, check=False

@@ -221,7 +221,7 @@ A TEE box's receipt names the attestation the prober verified before it took the
 |---|---|
 | `evidence_kind` | the box's `tee_kind`: `tdx` or `sev_snp` |
 | `evidence_sha256` | 64 lowercase hex: SHA-256 of the raw TDX quote or SEV-SNP report bytes |
-| `measurement` | TDX: `tdx-measurement-sha256:<64 hex>`, the launch measurement `cathedral/verify/tdx_quote.py:91-104` computes (and cathedral-validator's TDX measurement allowlist uses). SEV-SNP: 96 lowercase hex, the report's 48-byte `MEASUREMENT` as `cathedral/verify/snp.py:162` reads it. All zeros is refused, as `cathedral/verify/snp.py:485` does. |
+| `measurement` | TDX: `tdx-measurement-sha256:<64 hex>`, the v1 launch measurement `cathedral/verify/tdx_quote.py` `ParsedTdxQuote.measurement` computes (and cathedral-validator's TDX measurement allowlist uses), or `tdx-image-sha256:<64 hex>`, the v2 image identity (`ParsedTdxQuote.image_measurement`, docs/MRTD.md "Image identity"), when the admission policy listed only that. Admission writes whichever value the policy matched; with the archived quote an auditor recomputes both. SEV-SNP: 96 lowercase hex, the report's 48-byte `MEASUREMENT` as `cathedral/verify/snp.py:162` reads it. All zeros is refused, as `cathedral/verify/snp.py:485` does. |
 | `verifier_digest` | `sha256:<64 lowercase hex>`, the form of the TDX verifier implementation digest (`cathedral/verify/__init__.py:262`, `cathedral/verify/__init__.py:459`) and of cathedral-validator's SNP verifier digest. A verifier known by a bare SHA-256 (cathedral-validator's `qvl_digest`) is written with the prefix, so one verifier has one spelling. |
 | `tls_spki_sha256` | 64 lowercase hex: SHA-256 of the DER SubjectPublicKeyInfo of the TLS key the evidence attests, as `tls_spki_binding` computes it (`cathedral/channel.py:76-80`) |
 | `attestation_nonce` | 64 lowercase hex, not all zeros: the 32-byte nonce the prober sent with its evidence request, which the quote's REPORT_DATA was made over |
@@ -443,13 +443,24 @@ In `enforce`, run the verifier with exactly the admission policy's list. In `sha
 that list plus the candidate measurements being evaluated: a candidate then verifies fully and is
 admitted unpaid with `measurement_allowed: false` recorded. A measurement on neither list is
 refused by the verifier; to collect it, read it from the quote before verifying
-(`cathedral/verify/tdx_quote.py:91-104` `parse_tdx_quote(quote).measurement`, or
+(`parse_tdx_quote(quote).measurement` and `.image_measurement`, or
 `parse_snp_report(report).measurement`), which is how operators survey the fleet's measurements
 before listing them. Such a box is not admitted.
 
+**TDX: list the image identity on GCP.** The v1 `tdx-measurement-sha256` value includes MROWNER,
+which GCP sets per VM, so two honest VMs from one image have different v1 values and a v1
+listing in `enforce` refuses every new VM (#265). List the v2 `tdx-image-sha256` value instead:
+one per image and VM shape. Both lists accept either form. A verdict matched on v2 names v2
+(`Attested.measurement`, with `launch_measurement` and `image_measurement` kept for audit), and
+`admit` accepts a verdict naming either of the quote's two values. When a policy lists the v1
+value, admission judges and records v1 exactly as before; it judges v2 only when the quote's v1
+is unlisted. `Admission.launch_measurement` and `Admission.image_measurement` carry both values
+from the quote. The image identity does not cover MRCONFIGID, so a deployment that binds
+something through MRCONFIGID (the TEE box central root) must keep checking it separately.
+
 **Policy.** `parse_policy(raw)` (`admission.py:176-236`) takes the file's bytes. The TDX policy
 is cathedral-validator #256's file unchanged: `{"schema": "cathedral_tdx_measurement_policy_v1",
-"mode": "shadow" | "enforce", "allowed_measurements": ["tdx-measurement-sha256:<64 hex>", ...]}`.
+"mode": "shadow" | "enforce", "allowed_measurements": ["tdx-image-sha256:<64 hex>" | "tdx-measurement-sha256:<64 hex>", ...]}`.
 The SEV-SNP policy has the same shape with schema `cathedral_snp_measurement_policy_v1` and
 96-hex measurements (`admission.py:103-111`). Exactly those three keys, no repeated key
 (`admission.py:167-173`), a sorted, unique list (`admission.py:224-225`), and a non-empty list when

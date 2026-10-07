@@ -839,3 +839,64 @@ time.sleep(3600)  # child keeps running after pipes closed
     assert result is None  # timeout causes rejection
     # Must fire within ~1.2s (1s timeout + small overhead), not ~2s
     assert elapsed < 2, f"timeout took {elapsed:.1f}s, expected <2s (suggests 1s timeout extended)"
+
+
+# -- v2 image identity (docs/MRTD.md, "Image identity"; #265) ----------------------
+
+V1 = "tdx-measurement-sha256:" + "1a" * 32
+V2 = "tdx-image-sha256:" + "2b" * 32
+
+
+def _image_policy(allowed: set[str]) -> Policy:
+    return Policy(
+        allowed_measurements=allowed,
+        tdx_strict=True,
+        tdx_allowed_tcb_statuses={"UpToDate"},
+    )
+
+
+def _image_evidence(tmp_path, monkeypatch, image_measurement: object = V2):
+    nonce = issue_nonce()
+    claims = {} if image_measurement is None else {"image_measurement": image_measurement}
+    evidence, _ = _configure_strict_verifier(
+        tmp_path, monkeypatch, nonce=nonce, hotkey="hotkey-tdx", claims=claims
+    )
+    monkeypatch.setenv("FAKE_MEASUREMENT", V1)
+    return evidence, nonce
+
+
+def test_a_v2_only_policy_admits_by_image_identity(tmp_path, monkeypatch):
+    evidence, nonce = _image_evidence(tmp_path, monkeypatch)
+    attested = verify(evidence, nonce, _image_policy({V2}))
+    assert attested is not None
+    # The verdict names the identity the policy listed; both are kept for audit.
+    assert attested.measurement == V2
+    assert attested.launch_measurement == V1
+    assert attested.image_measurement == V2
+
+
+def test_a_v1_listing_keeps_the_v1_verdict(tmp_path, monkeypatch):
+    evidence, nonce = _image_evidence(tmp_path, monkeypatch)
+    for allowed in ({V1}, {V1, V2}):
+        attested = verify(evidence, nonce, _image_policy(allowed))
+        assert attested is not None
+        assert attested.measurement == V1
+        assert attested.image_measurement == V2
+
+
+def test_an_unlisted_image_identity_is_refused(tmp_path, monkeypatch):
+    evidence, nonce = _image_evidence(tmp_path, monkeypatch)
+    assert verify(evidence, nonce, _image_policy({"tdx-image-sha256:" + "3c" * 32})) is None
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [None, "", V2.upper(), V2 + "00", "tdx-measurement-sha256:" + "2b" * 32, 7, ["x"]],
+)
+def test_a_missing_or_malformed_image_claim_never_matches_v2(tmp_path, monkeypatch, claim):
+    # A verifier release from before the v2 identity emits no image_measurement.
+    evidence, nonce = _image_evidence(tmp_path, monkeypatch, image_measurement=claim)
+    allowed = {V2, claim} if isinstance(claim, str) and claim else {V2}
+    assert verify(evidence, nonce, _image_policy(allowed)) is None
+    attested = verify(evidence, nonce, _image_policy({V1}))
+    assert attested is not None and attested.image_measurement is None

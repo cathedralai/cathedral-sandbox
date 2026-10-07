@@ -81,8 +81,8 @@ def test_public_miner_rehearsal_reports_protocol_failure_as_json(monkeypatch, ca
     }
 
 
-def test_public_readme_scopes_the_rehearsal_and_help_path():
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+def test_mining_guide_scopes_the_rehearsal_and_help_path():
+    readme = (ROOT / "docs" / "MINING.md").read_text(encoding="utf-8")
 
     assert "scripts/rehearse_sn94_miner.py" in readme
     assert "for run in 1 2 3" in readme
