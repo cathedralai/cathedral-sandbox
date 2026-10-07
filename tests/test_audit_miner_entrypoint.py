@@ -399,7 +399,7 @@ def test_operator_doc_keeps_digest_and_tdx_measurement_as_separate_boundaries() 
 
     assert (
         f"{IMAGE_PATH}@sha256:"
-        "c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99"
+        "7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b"
         in documentation
     )
     assert "/sys/kernel/config/tsm/report" in documentation
@@ -423,11 +423,11 @@ def test_operator_docs_bind_the_current_image_and_one_migration_boundary() -> No
     mining = (REPOSITORY_ROOT / "docs" / "MINING.md").read_text()
 
     for documentation in (image_documentation, operations):
-        assert "78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8" in " ".join(
+        assert "a22fb1df124ed3e4414335f109f30624152ff548" in " ".join(
             documentation.split()
         )
     for documentation in (image_documentation, operations, work_request):
-        assert "c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99" in (
+        assert "7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b" in (
             " ".join(documentation.split())
         )
 

@@ -282,7 +282,7 @@ Startup emits `cathedral_effective_startup_v1`. The intended posture reports
 The currently published image is:
 
 ```text
-ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99
+ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b
 ```
 
 Its fixed entrypoint still runs
