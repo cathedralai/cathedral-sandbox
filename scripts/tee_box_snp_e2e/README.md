@@ -1,21 +1,35 @@
 # TEE box SNP e2e harness (#274)
 
-Scaffold only. Prefer extending or mirroring
-`scripts/tee_box_tdx_e2e/` rather than claiming a sealed run from this
-directory alone.
+Phase A launch-bind checker is live. Full B–F still mirrors
+`scripts/tee_box_tdx_e2e/` and must be recorded in
+`docs/TEE_BOX_SNP_E2E_RESULTS.md` — do not claim sealed PASS from phase A alone.
 
 ## Goal
 
-One acceptance day on cathedral-1/2 covering tee-box, sealed evidence,
-receipts, and fork/density — recorded in
-`docs/TEE_BOX_SNP_E2E_RESULTS.md`.
+One acceptance day on Cathedral-controlled SNP metal covering tee-box, sealed
+evidence, receipts, and fork/density.
+
+Current stamp surface: host `84.32.220.48`, guest `ssh -p 2222` →
+`snp-guest-official`.
 
 ## Non-goals
 
 - Claiming B.d PASS (hardware fresh-boot): **BLOCKED** — see
   `docs/TEE_BOX_SERVICE.md`
 - Treating HOST_DATA inject as launch-bound binding
-- Firecracker / E2B (no KVM on the SNP guests)
+- Claiming measured tee-box image PASS while guest is stock Ubuntu
+
+## Phase A (launch bind) — run on stamped guest
+
+```bash
+cd /root/sb && source .venv/bin/activate && export PYTHONPATH=/root/sb
+unset E2E_HOST_DATA_HEX CATHEDRAL_E2E_HOST_DATA_HEX
+python -m scripts.tee_box_snp_e2e.phase_a_launch_bind \
+  --root-keys /usr/share/cathedral/central-root-keys.json
+```
+
+Exit 0 = live HOST_DATA matches official root, AMD verify OK, official
+STARTED, wrong key REFUSED. Still not full #274.
 
 ## Preflight
 
