@@ -55,8 +55,9 @@ Rejected by verifiers: any receipt whose only evidence is miner-signed
 1. This draft (docs) — done.
 2. Canonical JSON + Ed25519 verify helpers in `cathedral-sandbox` — **done**
    (`cathedral/miner_lifecycle_receipt.py`, tests). No production wiring.
-3. Polaris reconciler that *produces* the receipt after an independent
-   observation (needs central pool access or operator reclaim path).
+3. Polaris issuer + in-process ingest — **done**
+   (`polariscomputer` `cathedral_miner_lifecycle_issuer.py`,
+   `docs/MINER_LIFECYCLE_RECEIPT_ISSUER.md`). Still needs live observation hooks.
 4. Wire `resolve_cleanup` only from that verifier — never from miner
    self-report.
 5. Shadow facts, then explicit reward-policy activation.
