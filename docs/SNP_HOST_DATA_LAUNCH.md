@@ -1,10 +1,12 @@
 # SNP HOST_DATA launch contract
 
 Status: guest reader **implemented** (`cathedral/tee_box/measured_root.py`).
-Host launch path is **outside this repository** (no QEMU/cloud-hypervisor
-launcher ships here). This document is the contract a hypervisor operator
-(WildCommunist or Cathedral ops) must satisfy so an SNP tee-box can start
-with a real binding — not a test inject.
+Remote admit pin **implemented** (`admission.admit(..., expected_root_digest=)` /
+`capacity/tee_honesty.py` — same digest TDX pins via MRCONFIGID; see
+`TEE_HONESTY_STACK.md`). Host launch path is **outside this repository**
+(no QEMU/cloud-hypervisor launcher ships here). This document is the contract
+a hypervisor operator (WildCommunist or Cathedral ops) must satisfy so an SNP
+tee-box can start with a real binding — not a test inject.
 
 ## Binding
 
@@ -66,4 +68,33 @@ feat/tee-box-snp-startup-gates / docs/SNP_HOST_DATA_LAUNCH.md.
 
 Who mints the offline Cathedral root and who approves the measured tee-box
 image + measurement-list entries? Without that, MRCONFIGID/HOST_DATA bind has
-nothing production-trusted to pin.
+nothing production-trusted to pin. See
+`docs/CATHEDRAL_ROOT_AND_IMAGE_OWNERSHIP.md`.
+
+## Evidence pack (post on #274 when W1 completes)
+
+Copy, fill, attach report dump:
+
+```text
+HOST_DATA evidence — cathedral-N — YYYY-MM-DD
+
+Root owner: ________
+Image owner: ________
+Launch owner: ________
+
+central-root-keys.json sha256:
+host_data_cli hex:
+VMM host-data hex actually launched:
+SNP report host_data hex:
+Match CLI == report? YES/NO
+Image id / measurement-list rev:
+Inject used? NO (required)
+
+Attached: snp report dump / snpguest output
+```
+
+### Done when (HOST_DATA bolt green)
+
+1. Ceremony seats named in `CATHEDRAL_ROOT_AND_IMAGE_OWNERSHIP.md`.
+2. Evidence pack above posted on #274 with **Match = YES** and **Inject = NO**.
+3. Optional: sealed SNP e2e on that guest without `E2E_HOST_DATA_HEX`.
