@@ -1,90 +1,53 @@
 # TEE box SEV-SNP e2e results (#274)
 
-Status: **Measured tee-box images (official + dev) are up on Cherry Genoa
-metal.** HOST_DATA + MEASUREMENT (kernel-hashes + dm-verity roothash) +
-#275 gate + runsc 20261005.0 verified. **B–F harness still UNTESTED** —
-Toby can start on the measured guests. Full #274 Done-when is not closed.
+Status: **Measured tee-box images live. Phase A + B clearout (storage/runsc)
+PASS on official `:2225`.** B.d **BLOCKED** (honest). Full worker path B.b/e/f/g
+and C–E still **UNTESTED**. #274 not fully closed.
 
-## Machines (current)
+Evidence JSON: `docs/evidence/snp-bf-report-20261009T175646Z.json`
 
-| Role | Address | Notes |
-| --- | --- | --- |
-| SNP host | `ssh root@84.32.220.48` | Cherry, EPYC 9124 Genoa |
-| Stock stamped guest (untouched) | `ssh -p 2222 root@84.32.220.48` | `snp-guest-official`, OVMF.fd only (firmware MEASUREMENT) |
-| **Measured official** | `ssh -p 2225 root@84.32.220.48` | Cathedral OS / tee-box; use for B–F |
-| **Measured dev** | `ssh -p 2224 root@84.32.220.48` | Same stack + debug tools |
-| Build / launch | `/root/snp-launch/tee-box-image/` | `launch-tee-box.sh`, mkosi project, images/ |
+## Machines
 
-Sandbox on measured guests: `/opt/cathedral/sandbox` @ **`efe7585`**
-(`feat/tee-box-snp-startup-gates`). Harness `setup.sh` now pins **runsc
-20261005.0** via `gvisor.tar.zstd` (was 20260817 bare binary).
-
-## Official measured image (2026-10-09)
-
-| Field | Value |
+| Role | Address |
 | --- | --- |
-| Image owner | @skyrocket2026 |
-| Boot | `OVMF.amdsev.fd` + direct boot, `kernel-hashes=on` |
-| dm-verity roothash (on measured cmdline) | `e1a3ce4f9546926232482a7eeb442c3de0871c856eb0ddb7a0b705c94ff57a6b` |
-| MEASUREMENT (live) | `0132f65b23fc8776dcd248b47224301be8d7f66a6c612b00c7b9780c16101291948e5c3df9fac140a0048971fa3ea3db` |
-| HOST_DATA | `551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e` (same official root) |
-| runsc | `release-20261005.0` sha256 `210b437a9cfae51e8f8c9074ed19b8b5e59477178e2e391a18117d8d6b924f7a` |
-| #275 gate | **STARTED** (`cathedral-root-1`) |
-| Attack tests | cmdline word flip → MEASUREMENT changes; one-byte root flip → dm-verity corruption |
+| Host | `ssh root@84.32.220.48` |
+| Stock guest (untouched) | `:2222` |
+| **Measured official (B–F)** | `:2225` |
+| Measured dev | `:2224` |
 
-Dev guest MEASUREMENT: `f4df8ff3…` (roothash `993ad3ff…`).
+Sandbox tip used for clearout: **`73894ba`** (+ setup SNP patches).
 
-Draft measurement-list object:
+## Phase verdicts (2026-10-09 clearout on :2225)
 
-```json
-{"id":"cathedral-tee-box-snp_official-20261009",
- "measurement":"0132f65b23fc8776dcd248b47224301be8d7f66a6c612b00c7b9780c16101291948e5c3df9fac140a0048971fa3ea3db",
- "host_data":"551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e"}
-```
-
-## Prerequisites
-
-| Item | Verdict | Notes |
+| Phase | Verdict | Notes |
 | --- | --- | --- |
-| `read_snp_host_data` + measured-root SNP bind | **PASS** | Live on measured + stock guests |
-| Real HOST_DATA at launch | **PASS** | Official digest; Inject=NO |
-| Measured tee-box image + dm-verity | **PASS** (live) | Official 2225 / dev 2224 |
-| Image owner seat | **PASS** | @skyrocket2026 |
-| Fresh-boot HW register (B.d) | **BLOCKED** | No RTMR3-class field; written reason stands |
-| Measurement-list published in policy registry | **UNTESTED** | Draft object above; owner release still needed |
-| Miner `PROVEN_ABSENT` | **BLOCKED** | Separate |
+| A. Launch bind / #275 / AMD | **PASS** | `phase_a_launch_bind` |
+| A′. Measured image | **PASS** | dm-verity + MEASUREMENT `0132f65b…` |
+| B.prepare + runsc 20261005.0 | **PASS** | `setup.sh prepare` TEE=snp |
+| B.a no-swap / state tmpfs / LUKS2 | **PASS** | scratch on `/tmp` (1G) |
+| B.c pull + runsc exec | **PASS** | alpine by digest under runsc |
+| B.d fresh-boot HW | **BLOCKED** | no RTMR3-class register |
+| B.b revocation | **UNTESTED** | needs tee-box worker + central-access |
+| B.e egress | **UNTESTED** | needs worker nft/tc matrix |
+| B.f one-customer / B.g 401s | **UNTESTED** | needs `serve_worker` / lease API |
+| C–E | **UNTESTED** | receipts / fork / customer formats |
+| F bundle | **PARTIAL** | this file + evidence JSON |
 
-## Phase verdicts
-
-| Phase | Verdict | Evidence |
-| --- | --- | --- |
-| A. Sealed hardware / launch bind | **PASS** | HOST_DATA + AMD chain (earlier) |
-| A′. Measured Cathedral OS image | **PASS** | 2225/2224; predicted==live; verity; #275; runsc |
-| B.a–c, e–g tee-box | **UNTESTED** | Start on **2225** (or 2224); no `E2E_HOST_DATA_HEX` |
-| B.d Fresh-boot admission | **BLOCKED** | Software lease ≠ sealed PASS |
-| C. Receipts | **UNTESTED** | |
-| D. Fork / density | **UNTESTED** | Host has KVM |
-| E. Customer formats | **UNTESTED** | |
-| F. Bundle | **PARTIAL** | This file + #274; harness day not done |
-
-## How Toby starts B–F
+## Re-run clearout
 
 ```bash
-# Preferred: measured official
 ssh -p 2225 root@84.32.220.48
-cd /opt/cathedral/sandbox   # tip efe7585+ after pull
+cd /opt/cathedral/sandbox
+git pull --ff-only   # feat/tee-box-snp-startup-gates
+export PYTHONPATH=$PWD TEE=snp
 unset E2E_HOST_DATA_HEX CATHEDRAL_E2E_HOST_DATA_HEX
-# pull latest feat/tee-box-snp-startup-gates, then:
-sudo bash scripts/tee_box_tdx_e2e/setup.sh prepare   # now pins runsc 20261005.0
-# then SNP-adapted harness / port of tee_box_tdx_e2e with --tee snp
+python3 scripts/tee_box_snp_e2e/run_bf_clear.py
 ```
 
-Do **not** use stock 2222 for sealed B–F claims. Do **not** enable
-panic-on-corruption verity until after this B–F run (changes MEASUREMENT).
+## Remaining to close #274
 
-## Ops follow-ups (not Toby blockers for starting B–F)
-
-- Reproducible builds (build twice, compare)
-- panic-on-corruption (hold until after B–F)
-- Sealed official build without SSH
-- Desktop / browser / base sandbox images
+1. Start tee-box worker on measured guest (`serve_worker` / configure SNP path).
+2. Run B.b, B.e, B.f, B.g against that worker (port TDX harness checks).
+3. C receipts + D fork as scoped; E if customer formats agreed.
+4. Publish measurement-list entry for `0132f65b…` + `host_data` `551df92e…`.
+5. Hold panic-on-corruption until after those runs (changes MEASUREMENT).
