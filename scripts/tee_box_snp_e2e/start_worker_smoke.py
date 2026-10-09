@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
@@ -42,23 +43,68 @@ def die(msg: str, code: int = 2) -> int:
     return code
 
 
-def ensure_deps() -> str | None:
-    try:
-        import cryptography  # noqa: F401
-    except ImportError:
-        return "cryptography missing; use /opt/cathedral-e2e/venv/bin/python after setup prepare"
-    try:
-        import sr25519  # noqa: F401
-    except ImportError:
-        pip = Path(sys.executable).parent / "pip"
-        r = subprocess.run(
-            [str(pip), "install", "-q", "py-sr25519-bindings==0.2.2"],
+def _pip_install_sr25519(python: str) -> tuple[bool, str]:
+    """Install a *wheel only* — never compile (measured guests have no Rust)."""
+    pip = [python, "-m", "pip", "install", "-q", "--only-binary=:all:", "py-sr25519-bindings==0.2.2"]
+    r = subprocess.run(pip, capture_output=True, text=True)
+    if r.returncode == 0:
+        return True, ""
+    return False, (r.stdout + r.stderr)[-500:]
+
+
+def _python_with_sr25519() -> tuple[str | None, str]:
+    """Return an interpreter that can import sr25519, or (None, why)."""
+    candidates: list[str] = [sys.executable]
+    # Ubuntu 26 / Python 3.14 often has no manylinux wheel; prefer 3.13/3.12.
+    for name in ("python3.13", "python3.12", "python3.11"):
+        path = shutil.which(name)
+        if path and path not in candidates:
+            candidates.append(path)
+    tried: list[str] = []
+    for py in candidates:
+        probe = subprocess.run(
+            [py, "-c", "import sr25519; print(sr25519.__file__)"],
             capture_output=True,
             text=True,
         )
-        if r.returncode != 0:
-            return f"need py-sr25519-bindings: {(r.stdout + r.stderr)[-400:]}"
-    return None
+        if probe.returncode == 0:
+            return py, f"already present in {py}"
+        ok, err = _pip_install_sr25519(py)
+        tried.append(f"{py}: {'ok' if ok else err.splitlines()[-1] if err else 'fail'}")
+        if not ok:
+            continue
+        probe = subprocess.run(
+            [py, "-c", "import sr25519"],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode == 0:
+            return py, f"installed wheel into {py}"
+    ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+    return None, (
+        f"no py-sr25519-bindings wheel for this guest (python {ver}). "
+        f"wheels exist for cp310–cp313 only. tried: {'; '.join(tried)}. "
+        "fix: use/create a 3.13 venv, e.g. "
+        "`python3.13 -m venv /opt/cathedral-e2e/venv313 && "
+        "/opt/cathedral-e2e/venv313/bin/pip install cryptography "
+        "'py-sr25519-bindings==0.2.2' --only-binary=:all:` "
+        "then re-run with that python."
+    )
+
+
+def ensure_deps() -> tuple[str | None, str | None]:
+    """Return (python_to_use, error). python_to_use may differ from sys.executable."""
+    try:
+        import cryptography  # noqa: F401
+    except ImportError:
+        return None, (
+            "cryptography missing; use /opt/cathedral-e2e/venv/bin/python after setup prepare"
+        )
+    py, detail = _python_with_sr25519()
+    if py is None:
+        return None, detail
+    print(f"sr25519: {detail}", flush=True)
+    return py, None
 
 
 def write_tls(work: Path) -> tuple[Path, Path]:
@@ -156,13 +202,15 @@ def main() -> int:
             return die(f"inject env {bad} is set — refuse")
     if not MARKER.is_file():
         return die(f"missing {MARKER}; run: TEE=snp bash scripts/tee_box_tdx_e2e/setup.sh prepare")
-    miss = ensure_deps()
-    if miss:
-        return die(miss)
+    worker_py, miss = ensure_deps()
+    if miss or worker_py is None:
+        return die(miss or "no python with sr25519")
 
     sys.path.insert(0, str(ROOT))
     WORK.mkdir(parents=True, exist_ok=True)
     cert_path, key_path = write_tls(WORK)
+    # Material writers run under *this* interpreter (cryptography); worker may
+    # be a different python that has the sr25519 wheel.
     access = write_validator_access(WORK)
     token = secrets.token_hex(24)
     env = os.environ.copy()
@@ -177,7 +225,7 @@ def main() -> int:
     Path("/run/cathedral-tee-box").mkdir(parents=True, exist_ok=True)
     log_path = WORK / "worker.log"
     argv = [
-        sys.executable,
+        worker_py,
         str(ROOT / "scripts/tee_box_tdx_e2e/serve_worker.py"),
         "worker",
         "serve-snp",
