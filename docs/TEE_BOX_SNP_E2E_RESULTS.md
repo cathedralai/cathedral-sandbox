@@ -36,7 +36,7 @@ Sandbox tip: **`feat/tee-box-snp-startup-gates`**.
 | B.e egress matrix | **BLOCKED** | same — API routes need central signatures |
 | B.f one-customer / B.g 401s | **BLOCKED** | same |
 | C. receipts | **BLOCKED** | Polaris/prober capacity receipt path + idle probe/lease; not Toby-solo on `:2225` |
-| D. fork density | **SKIP** | Owner decision: no snapshot/fork in v1 (`docs/TEE_BOX.md` decision 5) |
+| D. fork density | **SKIP** | Owner decision: no snapshot/fork in v1 (`docs/TEE_BOX.md` decision 5). Not implemented; not a #274 bug. |
 | E. customer formats | **BLOCKED** | awaiting agreed customer verifier formats |
 | measurement-list | **DRAFT** | see evidence JSON; **@skyrocket2026** publishes |
 | panic-on-corruption | **HOLD** | changes MEASUREMENT; do after list publish / new image rev |
