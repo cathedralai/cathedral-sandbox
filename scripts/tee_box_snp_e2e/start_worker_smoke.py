@@ -52,6 +52,87 @@ def _pip_install_sr25519(python: str) -> tuple[bool, str]:
     return False, (r.stdout + r.stderr)[-500:]
 
 
+def _bootstrap_uv_python313() -> tuple[str | None, str]:
+    """Measured Ubuntu 26 images ship only 3.14; fetch portable CPython 3.13 via uv."""
+    venv = Path("/opt/cathedral-e2e/venv313")
+    py = venv / "bin" / "python"
+    if py.is_file():
+        return str(py), f"reuse {py}"
+
+    uv = shutil.which("uv")
+    if uv is None:
+        install = subprocess.run(
+            "curl -LsSf https://astral.sh/uv/install.sh | sh",
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        if install.returncode != 0:
+            return None, f"uv install failed: {(install.stdout + install.stderr)[-400:]}"
+        local_uv = Path.home() / ".local" / "bin" / "uv"
+        uv = str(local_uv) if local_uv.is_file() else shutil.which("uv")
+        if not uv:
+            return None, "uv installed but not on PATH (~/.local/bin/uv missing)"
+
+    env = os.environ.copy()
+    env["PATH"] = f"{Path.home() / '.local' / 'bin'}:{env.get('PATH', '')}"
+    steps = [
+        [uv, "python", "install", "3.13"],
+        [uv, "venv", str(venv), "--python", "3.13"],
+    ]
+    for cmd in steps:
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            return None, f"{' '.join(cmd)} failed: {(r.stdout + r.stderr)[-400:]}"
+    if not py.is_file():
+        return None, f"uv venv did not create {py}"
+    # cryptography + sr25519 into the portable 3.13 venv
+    deps = subprocess.run(
+        [
+            str(py),
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "--upgrade",
+            "pip",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if deps.returncode != 0:
+        # uv venvs may need `uv pip`
+        alt = subprocess.run(
+            [uv, "pip", "install", "--python", str(py), "cryptography", "py-sr25519-bindings==0.2.2"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if alt.returncode != 0:
+            return None, f"pip bootstrap failed: {(deps.stdout + deps.stderr + alt.stdout + alt.stderr)[-500:]}"
+        return str(py), f"bootstrapped portable 3.13 at {py} via uv pip"
+    ok, err = _pip_install_sr25519(str(py))
+    crypto = subprocess.run(
+        [str(py), "-m", "pip", "install", "-q", "--only-binary=:all:", "cryptography>=42"],
+        capture_output=True,
+        text=True,
+    )
+    if not ok or crypto.returncode != 0:
+        alt = subprocess.run(
+            [uv, "pip", "install", "--python", str(py), "cryptography", "py-sr25519-bindings==0.2.2"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if alt.returncode != 0:
+            return None, (
+                f"deps into 3.13 venv failed: sr25519={err[-200:]} "
+                f"crypto={(crypto.stdout + crypto.stderr)[-200:]} "
+                f"uv={(alt.stdout + alt.stderr)[-200:]}"
+            )
+    return str(py), f"bootstrapped portable 3.13 at {py}"
+
+
 def _python_with_sr25519() -> tuple[str | None, str]:
     """Return an interpreter that can import sr25519, or (None, why)."""
     candidates: list[str] = [sys.executable]
@@ -60,6 +141,10 @@ def _python_with_sr25519() -> tuple[str | None, str]:
         path = shutil.which(name)
         if path and path not in candidates:
             candidates.append(path)
+    portable = Path("/opt/cathedral-e2e/venv313/bin/python")
+    if portable.is_file() and str(portable) not in candidates:
+        candidates.append(str(portable))
+
     tried: list[str] = []
     for py in candidates:
         probe = subprocess.run(
@@ -80,15 +165,31 @@ def _python_with_sr25519() -> tuple[str | None, str]:
         )
         if probe.returncode == 0:
             return py, f"installed wheel into {py}"
+
+    # Last resort on 3.14-only measured images: portable CPython via uv.
+    if sys.version_info[:2] >= (3, 14) or not any("3.13" in t or "3.12" in t for t in tried):
+        print("bootstrapping portable CPython 3.13 via uv (no system python3.13)...", flush=True)
+        py, detail = _bootstrap_uv_python313()
+        if py is not None:
+            probe = subprocess.run(
+                [py, "-c", "import cryptography, sr25519"],
+                capture_output=True,
+                text=True,
+            )
+            if probe.returncode == 0:
+                return py, detail
+            tried.append(f"uv313: import failed {(probe.stdout + probe.stderr)[-200:]}")
+        else:
+            tried.append(f"uv313: {detail}")
+
     ver = f"{sys.version_info.major}.{sys.version_info.minor}"
     return None, (
         f"no py-sr25519-bindings wheel for this guest (python {ver}). "
         f"wheels exist for cp310–cp313 only. tried: {'; '.join(tried)}. "
-        "fix: use/create a 3.13 venv, e.g. "
-        "`python3.13 -m venv /opt/cathedral-e2e/venv313 && "
-        "/opt/cathedral-e2e/venv313/bin/pip install cryptography "
-        "'py-sr25519-bindings==0.2.2' --only-binary=:all:` "
-        "then re-run with that python."
+        "Manual fix: curl -LsSf https://astral.sh/uv/install.sh | sh && "
+        "uv python install 3.13 && uv venv /opt/cathedral-e2e/venv313 --python 3.13 && "
+        "uv pip install --python /opt/cathedral-e2e/venv313/bin/python "
+        "cryptography 'py-sr25519-bindings==0.2.2'"
     )
 
 
