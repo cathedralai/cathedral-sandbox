@@ -22,6 +22,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 OUT_DIR = Path(os.environ.get("E2E_SNP_OUT", "/var/lib/cathedral-e2e/snp-bf"))
+# setup.sh prepare installs cryptography here; system python3 on measured
+# images often has none — phase_a imports cathedral.tee_box → central_access.
+HARNESS_VENV_PYTHON = Path(os.environ.get("E2E_VENV_PYTHON", "/opt/cathedral-e2e/venv/bin/python"))
+
+
+def harness_python() -> str:
+    """Prefer the prepare venv so A.launch_bind can import cryptography."""
+    if HARNESS_VENV_PYTHON.is_file() and os.access(HARNESS_VENV_PYTHON, os.X_OK):
+        return str(HARNESS_VENV_PYTHON)
+    return sys.executable
 
 
 @dataclass
@@ -68,17 +78,30 @@ def ensure_no_inject(report: Report) -> bool:
 
 
 def phase_a(report: Report) -> None:
+    py = harness_python()
+    # Ensure cryptography is present before blaming launch bind.
+    probe = run([py, "-c", "import cryptography; print(cryptography.__version__)"])
+    if probe.returncode != 0:
+        report.add(
+            "A.launch_bind",
+            "FAIL",
+            f"python={py} missing cryptography; run: "
+            f"TEE=snp bash scripts/tee_box_tdx_e2e/setup.sh prepare "
+            f"(detail: {(probe.stdout + probe.stderr)[-200:]})",
+        )
+        return
     r = run(
         [
-            sys.executable,
+            py,
             str(ROOT / "scripts/tee_box_snp_e2e/phase_a_launch_bind.py"),
             "--root-keys",
             "/usr/share/cathedral/central-root-keys.json",
-        ]
+        ],
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
     )
     out = (r.stdout + r.stderr).strip()
     if r.returncode == 0 and "phase_a_launch_bind=PASS" in out:
-        report.add("A.launch_bind", "PASS", "HOST_DATA+AMD+#275")
+        report.add("A.launch_bind", "PASS", f"HOST_DATA+AMD+#275 via {py}")
     else:
         report.add("A.launch_bind", "FAIL", out[-500:])
 
