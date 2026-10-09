@@ -19,9 +19,11 @@
 set -euo pipefail
 umask 022
 
-RUNSC_VERSION=20260817.0
-RUNSC_SHA256=048b89aada69dc3333422e139d6e9d02f8ab06bda52398060e0fbdacca00074c
-RUNSC_URL="https://storage.googleapis.com/gvisor/releases/release/${RUNSC_VERSION}/x86_64/runsc"
+# gVisor weekly releases after 20260817 ship gvisor.tar.zstd (no bare runsc).
+# Pin matches the measured tee-box images on Cherry (2026-10-09).
+RUNSC_VERSION=20261005.0
+RUNSC_SHA256=210b437a9cfae51e8f8c9074ed19b8b5e59477178e2e391a18117d8d6b924f7a
+RUNSC_BUNDLE_URL="https://storage.googleapis.com/gvisor/releases/release/${RUNSC_VERSION}/x86_64/gvisor.tar.zstd"
 RUNSC_PATH=/usr/local/bin/runsc
 DAEMON_JSON=${DAEMON_JSON:-/etc/docker/daemon.json}
 STATE_DIR=${STATE_DIR:-/run/cathedral-tee-box}
@@ -129,13 +131,21 @@ install_runsc() {
     log "runsc $RUNSC_VERSION already installed (sha256 ok)"
     return
   fi
-  local tmp
+  local tmp bundle
   tmp=$(mktemp /tmp/runsc.XXXXXX)
   if [ -f "$HERE/bin/runsc" ]; then
     cp "$HERE/bin/runsc" "$tmp"
   else
-    log "downloading runsc $RUNSC_VERSION"
-    curl --fail --silent --show-error --location --proto '=https' --retry 3 -o "$tmp" "$RUNSC_URL"
+    log "downloading gVisor $RUNSC_VERSION bundle (gvisor.tar.zstd)"
+    bundle=$(mktemp /tmp/gvisor.XXXXXX.tar.zstd)
+    curl --fail --silent --show-error --location --proto '=https' --retry 3 \
+      -o "$bundle" "$RUNSC_BUNDLE_URL"
+    if command -v zstd >/dev/null 2>&1; then
+      zstd -d -c "$bundle" | tar -xOf - runsc >"$tmp"
+    else
+      tar --use-compress-program=zstd -xOf "$bundle" runsc >"$tmp"
+    fi
+    rm -f "$bundle"
   fi
   echo "$RUNSC_SHA256  $tmp" | sha256sum --check --status - \
     || { rm -f "$tmp"; die "runsc sha256 mismatch"; }

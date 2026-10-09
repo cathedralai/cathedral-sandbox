@@ -1,10 +1,12 @@
 # Measured tee-box image — what we need on the SNP host
 
-**Why:** Phase A (HOST_DATA stamp + #275 gate) is **PASS** on
-`84.32.220.48`. The guest is still **stock Ubuntu cloudimg** with
-`central-root-keys.json` copied in after boot. That is not a measured
-tee-box appliance, so the **image-owner** row stays open and the SNP
-`MEASUREMENT` field does not yet mean “Cathedral tee-box image X”.
+**Status 2026-10-09:** **FULFILLED** on Cherry — official `:2225` /
+dev `:2224` measured images up (see `TEE_BOX_SNP_E2E_RESULTS.md`). Kept as
+the historical ask + inventory.
+
+**Why (original):** Phase A (HOST_DATA stamp + #275 gate) was **PASS** on
+`84.32.220.48` while the guest was still **stock Ubuntu cloudimg** with
+`central-root-keys.json` copied in after boot.
 
 Related: `CATHEDRAL_ROOT_AND_IMAGE_OWNERSHIP.md`, `TEE_BOX_SNP_E2E_RESULTS.md`,
 `TEE_BOX_SERVICE.md` (“Our own measured image”).
