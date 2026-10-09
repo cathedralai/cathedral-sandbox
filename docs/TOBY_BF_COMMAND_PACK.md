@@ -44,12 +44,23 @@ export PYTHONPATH=/opt/cathedral/sandbox TEE=snp
 unset E2E_HOST_DATA_HEX CATHEDRAL_E2E_HOST_DATA_HEX
 PY=/opt/cathedral-e2e/venv/bin/python
 
+# If venv python is 3.14+, there is no py-sr25519 wheel — use 3.13:
+"$PY" -c 'import sys; print(sys.version)'
+if ! "$PY" -c 'import sr25519' 2>/dev/null; then
+  command -v python3.13
+  python3.13 -m venv /opt/cathedral-e2e/venv313
+  /opt/cathedral-e2e/venv313/bin/pip install -q --upgrade pip
+  /opt/cathedral-e2e/venv313/bin/pip install -q cryptography \
+    'py-sr25519-bindings==0.2.2' --only-binary=:all:
+  PY=/opt/cathedral-e2e/venv313/bin/python
+fi
+
 "$PY" scripts/tee_box_snp_e2e/start_worker_smoke.py
 # expect: worker_smoke=PASS … cathedral_effective_startup_v1
 # log: /var/lib/cathedral-e2e/snp-worker/worker.log
 ```
 
-If it fails, paste the tail of `worker.log`.
+If it fails, paste `python -V` and the tail of `worker.log`.
 
 ## 2) B.b / B.e / B.f / B.g — fork (honest)
 
