@@ -1,12 +1,14 @@
 # TEE box SEV-SNP e2e results (#274)
 
 Status: **Measured official `:2225` — Phase A + B clearout + `serve-snp` worker
-smoke PASS** (live HOST_DATA, no inject). B.d **BLOCKED** (honest). B.b/e/f/g
-API matrix **BLOCKED** until Fred signs central-access (root private key offline)
-or leadership accepts that scope. C–E still **UNTESTED**. #274 not fully closed.
+smoke PASS** (live HOST_DATA, no inject). Remaining items are honest
+**SKIP / BLOCKED** (not silent gaps). #274 measured-image + worker-startup
+bolt is ready to close once image owner publishes the list entry and
+leadership accepts the BLOCKED rows.
 
 Evidence: `docs/evidence/snp-bf-report-20261009T175646Z.json`,
-worker smoke startup at tip **`e622448`**.
+worker smoke tip **`e622448`**, measurement-list draft
+`docs/evidence/measurement-list-draft-tee-box-snp-official-2225.json`.
 
 ## Machines
 
@@ -17,34 +19,62 @@ worker smoke startup at tip **`e622448`**.
 | **Measured official (B–F)** | `:2225` |
 | Measured dev | `:2224` |
 
-Sandbox tip: **`e622448`** on `feat/tee-box-snp-startup-gates`.
+Sandbox tip: **`feat/tee-box-snp-startup-gates`**.
 
 ## Phase verdicts (2026-10-09 on :2225)
 
 | Phase | Verdict | Notes |
 | --- | --- | --- |
 | A. Launch bind / #275 / AMD | **PASS** | `phase_a_launch_bind` via harness venv |
-| A′. Measured image | **PASS** | dm-verity + MEASUREMENT `0132f65b…` |
+| A′. Measured image | **PASS** | dm-verity + MEASUREMENT prefix `0132f65b…` (full hex → image owner) |
 | B.prepare + runsc 20261005.0 | **PASS** | `setup.sh prepare` TEE=snp |
 | B.a no-swap / state tmpfs / LUKS2 | **PASS** | scratch LUKS2 integrity |
 | B.c pull + runsc exec | **PASS** | alpine by digest under runsc |
 | B.d fresh-boot HW | **BLOCKED** | `fresh_boot_hardware_backed=false` (software lease register) |
-| Worker smoke `serve-snp` | **PASS** | live HOST_DATA `551df92e…`, egress enforced, pid kept |
-| B.b revocation | **BLOCKED** | needs Fred-signed central-access; key not on guest |
+| Worker smoke `serve-snp` | **PASS** | live HOST_DATA `551df92e…`, egress enforced |
+| B.b revocation | **BLOCKED** | needs Fred-signed central-access; root seed offline |
 | B.e egress matrix | **BLOCKED** | same — API routes need central signatures |
 | B.f one-customer / B.g 401s | **BLOCKED** | same |
-| C–E | **UNTESTED** | receipts / fork / customer formats |
+| C. receipts | **BLOCKED** | Polaris/prober capacity receipt path + idle probe/lease; not Toby-solo on `:2225` |
+| D. fork density | **SKIP** | Owner decision: no snapshot/fork in v1 (`docs/TEE_BOX.md` decision 5) |
+| E. customer formats | **BLOCKED** | awaiting agreed customer verifier formats |
+| measurement-list | **DRAFT** | see evidence JSON; **@skyrocket2026** publishes |
+| panic-on-corruption | **HOLD** | changes MEASUREMENT; do after list publish / new image rev |
 | F bundle | **PARTIAL** | this file + evidence |
 
-### Worker smoke facts (2026-10-09)
+### Worker smoke facts
 
 - `posture=snp-production`, `tee=snp`, TLS + signed validator access
 - `central_root_digest=sha256:551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e`
 - `egress.enforced=true`, runsc systrap, docker on LUKS scratch
-- `fresh_boot_hardware_backed=false` (matches B.d)
-- Portable CPython 3.13 via uv (guest system Python is 3.14; no sr25519 wheel)
+- Portable CPython 3.13 via uv (guest system Python is 3.14)
 
-## Re-run
+## Honesty pass (C / D / E)
+
+| Item | Verdict | Why |
+| --- | --- | --- |
+| **C receipts** | **BLOCKED** | Capacity receipts need Polaris/prober + drained-box probe (lease). Same central-access dependency as B.b. Follow-on, not a silent UNTESTED. |
+| **D fork** | **SKIP** | `TEE_BOX.md` decision 5: no snapshots/fork/port/DinD in v1. Not a missing test. |
+| **E customer formats** | **BLOCKED** | No agreed customer verifier formats for this bolt. Spec first, then re-open. |
+
+## Measurement-list draft → @skyrocket2026
+
+File: `docs/evidence/measurement-list-draft-tee-box-snp-official-2225.json`
+
+- Image id: `tee-box-snp-cherry-official-2026-10-09`
+- `host_data`: `551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e` (**confirmed** on `:2225`)
+- `measurement`: **FILL** — replace `REPLACE_WITH_96_LOWERCASE_HEX_MEASUREMENT` with live report MEASUREMENT (96 lowercase hex; prefix observed `0132f65b`)
+
+On `:2225`:
+
+```bash
+# example — use whatever snpguest/display path the image has
+snpguest report /tmp/att.bin /tmp/req.bin
+snpguest display report /tmp/att.bin
+# copy MEASUREMENT → 96 lowercase hex into the draft, then publish signed registry release
+```
+
+## Re-run clearout / worker smoke
 
 ```bash
 ssh -p 2225 root@84.32.220.48
@@ -52,16 +82,18 @@ cd /opt/cathedral/sandbox
 git fetch && git reset --hard origin/feat/tee-box-snp-startup-gates
 export PYTHONPATH=$PWD TEE=snp PATH=$HOME/.local/bin:$PATH
 unset E2E_HOST_DATA_HEX CATHEDRAL_E2E_HOST_DATA_HEX
-PY=/opt/cathedral-e2e/venv313/bin/python   # after uv bootstrap once
+PY=/opt/cathedral-e2e/venv313/bin/python
 "$PY" scripts/tee_box_snp_e2e/run_bf_clear.py
 "$PY" scripts/tee_box_snp_e2e/start_worker_smoke.py
 ```
 
-## Remaining to close #274
+## Remaining owners
 
-1. **Fred** (or root owner): sign central-access against live `:2225` for B.b/e/f/g — **or** mark those honest BLOCKED in the issue if out of scope for this bolt.
-2. C receipts + D fork as scoped; E if customer formats agreed.
-3. Publish measurement-list entry for `0132f65b…` + `host_data` `551df92e…`.
-4. Hold panic-on-corruption until after agreed runs (changes MEASUREMENT).
+| Who | Action |
+| --- | --- |
+| **Fred** | Sign central-access for B.b/e/f/g **or** accept those BLOCKED |
+| **@skyrocket2026** | Fill MEASUREMENT + publish signed measurement-list entry |
+| **Leadership** | Accept C BLOCKED / D SKIP / E BLOCKED for this bolt if closing #274 now |
+| **Toby** | Keep evidence current; do **not** enable panic-on-corruption yet |
 
-Do **not** overwrite `/usr/share/cathedral/central-root-keys.json` on `:2225` (breaks launch bind).
+Do **not** overwrite `/usr/share/cathedral/central-root-keys.json` on `:2225`.
