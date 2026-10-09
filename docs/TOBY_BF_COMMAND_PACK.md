@@ -77,11 +77,18 @@ is **not** allowed as a measured SNP PASS.
 
 Do **not** overwrite `/usr/share/cathedral/central-root-keys.json` on `:2225`.
 
-## 3) Close checklist
+## 3) Close checklist (honesty pass)
 
-- Update `docs/TEE_BOX_SNP_E2E_RESULTS.md`
-- Comment on #274
-- Close only when B.b/e/f/g are PASS or honest BLOCKED; B.d stays BLOCKED
+| Item | Verdict |
+| --- | --- |
+| B.b/e/f/g | **BLOCKED** (Fred / central-access) |
+| C receipts | **BLOCKED** (Polaris/prober follow-on) |
+| D fork | **SKIP** (v1 no fork — `TEE_BOX.md` decision 5) |
+| E customer formats | **BLOCKED** (awaiting spec) |
+| measurement-list | draft `docs/evidence/measurement-list-draft-tee-box-snp-official-2225.json` → **@skyrocket2026** |
+| panic-on-corruption | **HOLD** |
+
+B.d stays BLOCKED (no RTMR3-class register on SNP).
 
 ## Agent note
 

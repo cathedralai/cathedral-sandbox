@@ -207,17 +207,47 @@ def phase_b_d_blocked(report: Report) -> None:
 
 
 def phase_rest_untested(report: Report) -> None:
-    for cid, why in (
-        ("B.b_revocation", "central-access freshness matrix not run in this clearout"),
-        ("B.e_egress", "nft/tc egress matrix not run in this clearout"),
-        ("B.f_one_customer", "needs full tee-box worker lease path"),
-        ("B.g_scope_401", "needs full tee-box worker"),
-        ("C.receipts", "Polaris chain / capacity receipt not exercised here"),
-        ("D.fork_density", "runsc CoW / checkpoint not run"),
-        ("E.customer_formats", "customer verifiers not run"),
-        ("F.bundle", "partial — this JSON is the clearout bundle"),
+    # Honesty pass: do not leave C/D/E as silent UNTESTED when the reason is
+    # known (docs/TEE_BOX_SNP_E2E_RESULTS.md).
+    for cid, verdict, why in (
+        (
+            "B.b_revocation",
+            "BLOCKED",
+            "needs Fred-signed central-access; root private key offline",
+        ),
+        (
+            "B.e_egress",
+            "BLOCKED",
+            "egress matrix needs tee-box API + central-access signatures",
+        ),
+        (
+            "B.f_one_customer",
+            "BLOCKED",
+            "lease path needs central-access signatures",
+        ),
+        (
+            "B.g_scope_401",
+            "BLOCKED",
+            "scope 401s need tee-box API + central-access",
+        ),
+        (
+            "C.receipts",
+            "BLOCKED",
+            "Polaris/prober capacity receipts + idle probe/lease; not clearout scope",
+        ),
+        (
+            "D.fork_density",
+            "SKIP",
+            "v1 owner decision: no snapshot/fork (docs/TEE_BOX.md decision 5)",
+        ),
+        (
+            "E.customer_formats",
+            "BLOCKED",
+            "awaiting agreed customer verifier formats",
+        ),
+        ("F.bundle", "UNTESTED", "partial — this JSON is the clearout bundle"),
     ):
-        report.add(cid, "UNTESTED", why)
+        report.add(cid, verdict, why)
 
 
 def main() -> int:
