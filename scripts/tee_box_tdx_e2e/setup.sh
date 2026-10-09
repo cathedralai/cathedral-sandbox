@@ -98,12 +98,17 @@ need_packages() {
   for pkg in "$@"; do
     dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
   done
-  if [ "${#missing[@]}" -gt 0 ]; then
-    log "installing ${missing[*]}"
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get -o DPkg::Lock::Timeout=600 update -qq
-    apt-get -o DPkg::Lock::Timeout=600 install -y -qq "${missing[@]}" >/dev/null
+  if [ "${#missing[@]}" -eq 0 ]; then
+    return 0
   fi
+  if ! command -v apt-get >/dev/null 2>&1; then
+    log "apt-get absent (measured image); skipping install of: ${missing[*]}"
+    return 0
+  fi
+  log "installing ${missing[*]}"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get -o DPkg::Lock::Timeout=600 update -qq
+  apt-get -o DPkg::Lock::Timeout=600 install -y -qq "${missing[@]}" >/dev/null
 }
 
 check_tdx() {
@@ -115,6 +120,27 @@ check_tdx() {
   fi
   [ -d /sys/kernel/config/tsm/report ] || die "configfs-tsm report root is missing"
   log "TDX guest: /dev/tdx_guest, RTMR3 sysfs and configfs-tsm present"
+}
+
+check_snp() {
+  [ -e /dev/sev-guest ] || die "/dev/sev-guest is missing: not an AMD SEV-SNP guest"
+  command -v snpguest >/dev/null || die "snpguest missing on PATH"
+  log "SNP guest: /dev/sev-guest and snpguest present (no RTMR3-class register)"
+}
+
+# TEE=auto|tdx|snp (default auto). Measured Cherry tee-box images are SNP.
+check_tee() {
+  case "${TEE:-auto}" in
+    tdx) check_tdx ;;
+    snp) check_snp ;;
+    auto)
+      if [ -e /dev/tdx_guest ]; then check_tdx
+      elif [ -e /dev/sev-guest ]; then check_snp
+      else die "neither /dev/tdx_guest nor /dev/sev-guest present"
+      fi
+      ;;
+    *) die "TEE must be auto|tdx|snp (got ${TEE:-})" ;;
+  esac
 }
 
 no_swap() {
@@ -192,9 +218,19 @@ write_marker() {
 }
 
 phase_prepare() {
-  check_tdx
+  check_tee
+  # SNP measured images use a small volatile overlay; keep LUKS scratch modest
+  # unless the caller already overrode these env vars for a larger disk.
+  if [ -e /dev/sev-guest ] && [ ! -e /dev/tdx_guest ]; then
+    if [ "${SCRATCH_GIB}" = "2" ] && [ "${SCRATCH_IMG}" = "/var/lib/cathedral-scratch.img" ]; then
+      SCRATCH_GIB=1
+      SCRATCH_IMG=/tmp/cathedral-scratch.img
+      DOCKER_ROOT="$SCRATCH_MNT/docker"
+    fi
+    log "SNP scratch: SCRATCH_GIB=$SCRATCH_GIB SCRATCH_IMG=$SCRATCH_IMG"
+  fi
   write_marker
-  need_packages python3-venv python3-pip cryptsetup-bin nftables iproute2 util-linux dmsetup e2fsprogs curl git
+  need_packages python3-venv python3-pip cryptsetup-bin nftables iproute2 util-linux dmsetup e2fsprogs curl git zstd
   command -v docker >/dev/null || die "docker is not installed"
   [ -x /usr/bin/docker ] || die "the worker expects the docker CLI at /usr/bin/docker"
   for tool in /usr/sbin/nft /usr/sbin/tc /usr/sbin/ip /usr/bin/nsenter /usr/sbin/dmsetup; do

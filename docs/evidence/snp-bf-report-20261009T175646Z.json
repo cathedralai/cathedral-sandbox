@@ -1,0 +1,97 @@
+{
+  "started_at": "2026-10-09T17:56:41.451843+00:00",
+  "host": "localhost",
+  "commit": "73894ba9623353e0a38b8c49f88b0a91fedaa7f8",
+  "checks": [
+    {
+      "id": "inject",
+      "verdict": "PASS",
+      "detail": "no HOST_DATA inject env"
+    },
+    {
+      "id": "A.launch_bind",
+      "verdict": "PASS",
+      "detail": "HOST_DATA+AMD+#275"
+    },
+    {
+      "id": "B.prepare",
+      "verdict": "PASS",
+      "detail": "setup.sh prepare (SNP)"
+    },
+    {
+      "id": "B.runsc_pin",
+      "verdict": "PASS",
+      "detail": "runsc release-20261005.0"
+    },
+    {
+      "id": "B.a_no_swap",
+      "verdict": "PASS",
+      "detail": "no swap"
+    },
+    {
+      "id": "B.a_state_tmpfs",
+      "verdict": "PASS",
+      "detail": "/run/cathedral-tee-box"
+    },
+    {
+      "id": "B.a_luks",
+      "verdict": "PASS",
+      "detail": "LUKS2 integrity scratch + docker root"
+    },
+    {
+      "id": "B.c_pull",
+      "verdict": "PASS",
+      "detail": "alpine by digest"
+    },
+    {
+      "id": "B.c_runsc_exec",
+      "verdict": "PASS",
+      "detail": "Linux 60f8787d98a3 4.19.0-gvisor #1 SMP Sun Jan 10 15:06:54 PST 2016 x86_64 Linux"
+    },
+    {
+      "id": "B.d_fresh_boot_hw",
+      "verdict": "BLOCKED",
+      "detail": "no RTMR3-class register on SNP; SoftwareLeaseRegister is guest-local only (docs/TEE_BOX_SERVICE.md)"
+    },
+    {
+      "id": "B.b_revocation",
+      "verdict": "UNTESTED",
+      "detail": "central-access freshness matrix not run in this clearout"
+    },
+    {
+      "id": "B.e_egress",
+      "verdict": "UNTESTED",
+      "detail": "nft/tc egress matrix not run in this clearout"
+    },
+    {
+      "id": "B.f_one_customer",
+      "verdict": "UNTESTED",
+      "detail": "needs full tee-box worker lease path"
+    },
+    {
+      "id": "B.g_scope_401",
+      "verdict": "UNTESTED",
+      "detail": "needs full tee-box worker"
+    },
+    {
+      "id": "C.receipts",
+      "verdict": "UNTESTED",
+      "detail": "Polaris chain / capacity receipt not exercised here"
+    },
+    {
+      "id": "D.fork_density",
+      "verdict": "UNTESTED",
+      "detail": "runsc CoW / checkpoint not run"
+    },
+    {
+      "id": "E.customer_formats",
+      "verdict": "UNTESTED",
+      "detail": "customer verifiers not run"
+    },
+    {
+      "id": "F.bundle",
+      "verdict": "UNTESTED",
+      "detail": "partial \u2014 this JSON is the clearout bundle"
+    }
+  ]
+}
