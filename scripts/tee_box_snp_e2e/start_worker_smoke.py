@@ -259,7 +259,10 @@ def write_validator_access(work: Path) -> dict[str, str | int]:
     keys_path.write_bytes(keys_bytes)
     digest = "sha256:" + hashlib.sha256(keys_bytes).hexdigest()
 
-    now = datetime.now(UTC)
+    from cathedral.validator_access import verify_validator_access_snapshot
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    # MAX_SNAPSHOT_VALIDITY_SECONDS is 3600 — a 2h window is refused as "too long".
     document = {
         "schema": VALIDATOR_ACCESS_SNAPSHOT_SCHEMA,
         "network": NETWORK,
@@ -268,7 +271,7 @@ def write_validator_access(work: Path) -> dict[str, str | int]:
         "block_hash": "0x" + "a" * 64,
         "block_is_finalized": True,
         "generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "expires_at": (now + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": (now + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "minimum_stake_rao": 1_000,
         "validators": [
             {
@@ -280,8 +283,21 @@ def write_validator_access(work: Path) -> dict[str, str | int]:
         ],
         "signing_key_id": "cathedral-validator-access",
     }
+    signed = sign_validator_access_snapshot(document, SNAPSHOT_SEED)
     snap_path = work / "validator-access-snapshot.json"
-    snap_path.write_bytes(canonical_json(sign_validator_access_snapshot(document, SNAPSHOT_SEED)))
+    encoded = canonical_json(signed)
+    snap_path.write_bytes(encoded)
+    os.chmod(snap_path, stat.S_IRUSR | stat.S_IWUSR)
+    os.chmod(keys_path, stat.S_IRUSR | stat.S_IWUSR)
+    # Fail here with the real reason instead of the worker's opaque summary.
+    verify_validator_access_snapshot(
+        encoded,
+        {"cathedral-validator-access": pub},
+        network=NETWORK,
+        netuid=NETUID,
+        required_minimum_stake_rao=1_000,
+        now=now,
+    )
     state_path = work / "validator-access.sqlite"
     if state_path.exists():
         state_path.unlink()
