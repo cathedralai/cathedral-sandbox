@@ -307,7 +307,9 @@ def write_validator_access(work: Path) -> dict[str, str | int]:
         "digest": digest,
         "state": str(state_path),
         "minimum_stake_rao": 1_000,
-        "public_endpoint": "https://127.0.0.1:8443",
+        # Fleet/singleton_fleet refuses loopback; advertise a dummy global IP.
+        # The TLS listener still binds 127.0.0.1 (smoke only).
+        "public_endpoint": "https://34.120.1.2:8443",
     }
 
 
