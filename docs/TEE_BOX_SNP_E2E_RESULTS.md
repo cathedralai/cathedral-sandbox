@@ -1,92 +1,90 @@
 # TEE box SEV-SNP e2e results (#274)
 
-Status: **HOST_DATA launch bind + #275 measured-root gate PASS on Genoa bare
-metal we control.** Full tee-box B–F harness is still open. Missing rows stay
-**UNTESTED** or **BLOCKED**, never silent PASS.
+Status: **Measured tee-box images (official + dev) are up on Cherry Genoa
+metal.** HOST_DATA + MEASUREMENT (kernel-hashes + dm-verity roothash) +
+#275 gate + runsc 20261005.0 verified. **B–F harness still UNTESTED** —
+Toby can start on the measured guests. Full #274 Done-when is not closed.
 
 ## Machines (current)
 
 | Role | Address | Notes |
 | --- | --- | --- |
-| SNP host (launch) | `ssh root@84.32.220.48` | Cherry bare metal, AMD EPYC 9124 Genoa, SNP on in BIOS, QEMU `sev-snp-guest` |
-| Stamped guest | `ssh -p 2222 root@84.32.220.48` | hostname `snp-guest-official`; code at `/root/sb` |
-| Relaunch | `/root/snp-launch/launch-snp-guest.sh <root-keys.json>` | HOST_DATA = sha256(root file) |
-| Old Milan guests | cathedral-1/2 | Superseded for this stamp; do not treat as current PASS surface |
-| GCP TDX | gone | Tell ops if Intel needed again |
+| SNP host | `ssh root@84.32.220.48` | Cherry, EPYC 9124 Genoa |
+| Stock stamped guest (untouched) | `ssh -p 2222 root@84.32.220.48` | `snp-guest-official`, OVMF.fd only (firmware MEASUREMENT) |
+| **Measured official** | `ssh -p 2225 root@84.32.220.48` | Cathedral OS / tee-box; use for B–F |
+| **Measured dev** | `ssh -p 2224 root@84.32.220.48` | Same stack + debug tools |
+| Build / launch | `/root/snp-launch/tee-box-image/` | `launch-tee-box.sh`, mkosi project, images/ |
 
-Sandbox commit on guest for this evidence: **`fde596b`**
-(`feat/tee-box-snp-startup-gates`).
+Sandbox on measured guests: `/opt/cathedral/sandbox` @ **`efe7585`**
+(`feat/tee-box-snp-startup-gates`). Harness `setup.sh` now pins **runsc
+20261005.0** via `gvisor.tar.zstd` (was 20260817 bare binary).
+
+## Official measured image (2026-10-09)
+
+| Field | Value |
+| --- | --- |
+| Image owner | @skyrocket2026 |
+| Boot | `OVMF.amdsev.fd` + direct boot, `kernel-hashes=on` |
+| dm-verity roothash (on measured cmdline) | `e1a3ce4f9546926232482a7eeb442c3de0871c856eb0ddb7a0b705c94ff57a6b` |
+| MEASUREMENT (live) | `0132f65b23fc8776dcd248b47224301be8d7f66a6c612b00c7b9780c16101291948e5c3df9fac140a0048971fa3ea3db` |
+| HOST_DATA | `551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e` (same official root) |
+| runsc | `release-20261005.0` sha256 `210b437a9cfae51e8f8c9074ed19b8b5e59477178e2e391a18117d8d6b924f7a` |
+| #275 gate | **STARTED** (`cathedral-root-1`) |
+| Attack tests | cmdline word flip → MEASUREMENT changes; one-byte root flip → dm-verity corruption |
+
+Dev guest MEASUREMENT: `f4df8ff3…` (roothash `993ad3ff…`).
+
+Draft measurement-list object:
+
+```json
+{"id":"cathedral-tee-box-snp_official-20261009",
+ "measurement":"0132f65b23fc8776dcd248b47224301be8d7f66a6c612b00c7b9780c16101291948e5c3df9fac140a0048971fa3ea3db",
+ "host_data":"551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e"}
+```
 
 ## Prerequisites
 
 | Item | Verdict | Notes |
 | --- | --- | --- |
-| `read_snp_host_data` + measured-root SNP bind | **PASS** (in-repo + live) | #275 gate on stamped guest |
-| SNP configure / SoftwareLeaseRegister | implemented | Guest-local only; `fresh_boot_hardware_backed=false` |
-| Real HOST_DATA at launch | **PASS** | Official root; Inject=NO; see Phase A |
-| Fresh-boot HW register (B.d) | **BLOCKED** | Written reason: no RTMR3-class field in SNP report (`docs/TEE_BOX_SERVICE.md`) |
-| Official root minted | **PASS** | `cathedral-root-1`; Fred holds seed offline |
-| Measured tee-box image (image-owner row) | **BLOCKED** | Guest is stock Ubuntu cloud image, not measured tee-box |
-| Polaris sealed field fill / #1444 | external | Platform signer today; sealed fields null |
-| Miner `PROVEN_ABSENT` | **BLOCKED** | Draft / issuer scaffolding; not this run |
-
-## Ownership seats (as of 2026-10-08)
-
-| Seat | Name |
-| --- | --- |
-| Root owner | Fred (`cathedral-root-1`, seed offline) |
-| Launch owner | Cathedral (Cherry Servers host `84.32.220.48`) |
-| Image owner | **TBD** — blocks measured-image language |
-
-See `docs/CATHEDRAL_ROOT_AND_IMAGE_OWNERSHIP.md`.
-
-## Phase A — Sealed hardware / launch bind (2026-10-08)
-
-| Field | Value |
-| --- | --- |
-| Root key id | `cathedral-root-1` |
-| File / report / QEMU host-data sha256 | `551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e` |
-| Inject | **NO** |
-| snpguest | 0.10.0 |
-| Policy | `0x30000` |
-| AMD chain | ARK self-signed → ASK by ARK → VCEK by ASK; VEK signed report |
-| #275 official | **STARTED** |
-| #275 wrong key | **REFUSED** (`does not match HOST_DATA`) |
-
-**How to re-run (no inject):**
-
-```bash
-ssh -p 2222 root@84.32.220.48
-cd /root/sb && source .venv/bin/activate && export PYTHONPATH=/root/sb
-# unset E2E_HOST_DATA_HEX CATHEDRAL_E2E_HOST_DATA_HEX
-python -m scripts.tee_box_snp_e2e.phase_a_launch_bind \
-  --root-keys /usr/share/cathedral/central-root-keys.json
-```
-
-Evidence links:
-- https://github.com/cathedralai/cathedral-sandbox/issues/274#issuecomment-6065495704
-- https://github.com/cathedralai/cathedral-sandbox/issues/274#issuecomment-6065599339
+| `read_snp_host_data` + measured-root SNP bind | **PASS** | Live on measured + stock guests |
+| Real HOST_DATA at launch | **PASS** | Official digest; Inject=NO |
+| Measured tee-box image + dm-verity | **PASS** (live) | Official 2225 / dev 2224 |
+| Image owner seat | **PASS** | @skyrocket2026 |
+| Fresh-boot HW register (B.d) | **BLOCKED** | No RTMR3-class field; written reason stands |
+| Measurement-list published in policy registry | **UNTESTED** | Draft object above; owner release still needed |
+| Miner `PROVEN_ABSENT` | **BLOCKED** | Separate |
 
 ## Phase verdicts
 
 | Phase | Verdict | Evidence |
 | --- | --- | --- |
-| A. Sealed hardware (launch HOST_DATA + AMD verify + #275 gate) | **PASS** | Genoa guest `snp-guest-official`; script above |
-| B.a–c, e–g tee-box | **UNTESTED** | Need LUKS/runsc/egress harness day on this guest |
-| B.d Fresh-boot admission | **BLOCKED** | No HW register; software lease ≠ sealed PASS |
-| C. Receipts | **UNTESTED** / partial in Polaris | #1415 chain; sealed fields null |
-| D. Fork / density | **UNTESTED** | Host has KVM; guest path still unrun |
+| A. Sealed hardware / launch bind | **PASS** | HOST_DATA + AMD chain (earlier) |
+| A′. Measured Cathedral OS image | **PASS** | 2225/2224; predicted==live; verity; #275; runsc |
+| B.a–c, e–g tee-box | **UNTESTED** | Start on **2225** (or 2224); no `E2E_HOST_DATA_HEX` |
+| B.d Fresh-boot admission | **BLOCKED** | Software lease ≠ sealed PASS |
+| C. Receipts | **UNTESTED** | |
+| D. Fork / density | **UNTESTED** | Host has KVM |
 | E. Customer formats | **UNTESTED** | |
-| F. Bundle | **PARTIAL** | This file + #274 comments; full harness bundle not yet |
+| F. Bundle | **PARTIAL** | This file + #274; harness day not done |
 
-## Honest substitutes (not sealed PASS)
+## How Toby starts B–F
 
-- **HOST_DATA inject** via `read_binding` / `E2E_HOST_DATA_HEX`: exercises
-  the box; label every result `test_hook`, never launch-bound PASS.
-- **SoftwareLeaseRegister**: one customer per boot inside the guest only.
+```bash
+# Preferred: measured official
+ssh -p 2225 root@84.32.220.48
+cd /opt/cathedral/sandbox   # tip efe7585+ after pull
+unset E2E_HOST_DATA_HEX CATHEDRAL_E2E_HOST_DATA_HEX
+# pull latest feat/tee-box-snp-startup-gates, then:
+sudo bash scripts/tee_box_tdx_e2e/setup.sh prepare   # now pins runsc 20261005.0
+# then SNP-adapted harness / port of tee_box_tdx_e2e with --tee snp
+```
 
-## What this does *not* close
+Do **not** use stock 2222 for sealed B–F claims. Do **not** enable
+panic-on-corruption verity until after this B–F run (changes MEASUREMENT).
 
-- Full #274 Done-when (B–F on measured tee-box image)
-- Image-owner approval of a measured guest image + measurement-list
-- Customer / miner private path (custody + other SN94 blockers)
+## Ops follow-ups (not Toby blockers for starting B–F)
+
+- Reproducible builds (build twice, compare)
+- panic-on-corruption (hold until after B–F)
+- Sealed official build without SSH
+- Desktop / browser / base sandbox images

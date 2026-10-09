@@ -11,11 +11,11 @@ Related: `SNP_HOST_DATA_LAUNCH.md`, `COMPUTE_POOL_INTEGRITY.md`.
 | Seat | Authority | Name |
 | --- | --- | --- |
 | **Root owner** | Mints / holds offline Cathedral root; publishes official `central-root-keys.json` | **Fred** — key id `cathedral-root-1`; seed offline (2026-10-08) |
-| **Image owner** | Approves measured tee-box guest image + measurement-list entries | **TBD** — stamped guest is still stock Ubuntu cloud image |
+| **Image owner** | Approves measured tee-box guest image + measurement-list entries | **@skyrocket2026** — official+dev mkosi images 2026-10-09 on Cherry |
 | **Launch owner** | Sets VMM `host-data` / MRCONFIGID from the published root digest | **Cathedral** — Cherry Servers `84.32.220.48` (Genoa SNP host) |
 
-Root + launch seats are filled for the HOST_DATA bolt. Image owner still
-**BLOCKED** for measured-image / full #274 sealed PASS language.
+All three seats filled for the HOST_DATA + measured-image bolts. Policy-registry
+measurement-list **release** and B–F harness remain for full #274 close.
 
 ## What “official” means
 
