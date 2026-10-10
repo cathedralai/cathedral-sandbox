@@ -1,12 +1,12 @@
 {
-  "_comment": "DRAFT for @skyrocket2026 (image owner) — not a signed registry release. Fill measurement from live :2225 report before publishing. Schema matches cathedral/capacity/measurement_list.py SNP image + cpu_snp tee_box profile metadata.",
-  "_fill_measurement": "On :2225 as root: snpguest report attestation.bin request-file.bin && snpguest display report attestation.bin | grep -i measurement  — or python that parses the report MEASUREMENT field to 96 lowercase hex.",
+  "_comment": "DRAFT for @skyrocket2026 (image owner) — not a signed registry release. MEASUREMENT filled from live :2225 snpguest display report on 2026-10-10. Schema matches cathedral/capacity/measurement_list.py SNP image + cpu_snp tee_box profile metadata.",
+  "_measurement_source": "ssh -p 2225 root@84.32.220.48; snpguest report /tmp/att.bin /tmp/req.bin && snpguest display report /tmp/att.bin",
   "profile": {
     "id": "tee-box-snp-cherry-official-v1",
     "kind": "cpu_snp",
     "status": "active",
     "measurements": [
-      "REPLACE_WITH_96_LOWERCASE_HEX_MEASUREMENT"
+      "0132f65b23fc8776dcd248b47224301be8d7f66a6c612b00c7b9780c16101291948e5c3df9fac140a0048971fa3ea3db"
     ],
     "runtime_measurements": [],
     "allowed_firmware": [],
@@ -20,7 +20,7 @@
         "images": [
           {
             "id": "tee-box-snp-cherry-official-2026-10-09",
-            "measurement": "REPLACE_WITH_96_LOWERCASE_HEX_MEASUREMENT",
+            "measurement": "0132f65b23fc8776dcd248b47224301be8d7f66a6c612b00c7b9780c16101291948e5c3df9fac140a0048971fa3ea3db",
             "host_data": "551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e"
           }
         ]
@@ -29,8 +29,9 @@
   },
   "known_pins": {
     "host_data": "551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e",
-    "host_data_source": "sha256(/usr/share/cathedral/central-root-keys.json) — Phase A PASS on :2225",
-    "measurement_prefix_reported": "0132f65b",
+    "host_data_source": "sha256(/usr/share/cathedral/central-root-keys.json) — Phase A PASS on :2225; snpguest Host Data matches",
+    "measurement": "0132f65b23fc8776dcd248b47224301be8d7f66a6c612b00c7b9780c16101291948e5c3df9fac140a0048971fa3ea3db",
+    "measurement_filled_at": "2026-10-10T07:00:00Z",
     "guest": "ssh -p 2225 root@84.32.220.48",
     "branch_evidence": "feat/tee-box-snp-startup-gates",
     "do_not_enable_panic_on_corruption_yet": true
