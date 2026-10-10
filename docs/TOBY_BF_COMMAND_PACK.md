@@ -62,12 +62,17 @@ fi
 
 If it fails, paste `python -V` and the tail of `worker.log`.
 
-## 2) B.b / B.e / B.f / B.g — fork (honest)
+## 2) B.b / B.e / B.f / B.g — Path A (Fred signs)
 
 Tee-box routes require **central-access signatures** from the measured root
 private key. That seed is offline with **Fred** (`cathedral-root-1`); it is
 not on `:2225`. The TDX harness injects throwaway roots + MRCONFIGID — that
 is **not** allowed as a measured SNP PASS.
+
+When Fred returns signed files, drop them in
+`scripts/tee_box_snp_e2e/central_access_materials/` and run
+`scripts/tee_box_snp_e2e/central_bf_client.py` (see materials README).
+Keep the central seed locally; never overwrite measured `central-root-keys.json`.
 
 | Path | What it proves | Claim |
 | --- | --- | --- |

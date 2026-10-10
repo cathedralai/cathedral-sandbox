@@ -38,7 +38,7 @@ Sandbox tip: **`feat/tee-box-snp-startup-gates`**.
 | C. receipts | **BLOCKED** | Polaris/prober capacity receipt path + idle probe/lease; not Toby-solo on `:2225` |
 | D. fork density | **SKIP** | Owner decision: no snapshot/fork in v1 (`docs/TEE_BOX.md` decision 5). Not implemented; not a #274 bug. |
 | E. customer formats | **BLOCKED** | awaiting agreed customer verifier formats |
-| measurement-list | **DRAFT** | see evidence JSON; **@skyrocket2026** publishes |
+| measurement-list | **DRAFT (measurement filled)** | 96-hex MEASUREMENT from live `:2225` snpguest; **@skyrocket2026** publishes signed registry |
 | panic-on-corruption | **HOLD** | changes MEASUREMENT; do after list publish / new image rev |
 | F bundle | **PARTIAL** | this file + evidence |
 
@@ -63,16 +63,10 @@ File: `docs/evidence/measurement-list-draft-tee-box-snp-official-2225.json`
 
 - Image id: `tee-box-snp-cherry-official-2026-10-09`
 - `host_data`: `551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e` (**confirmed** on `:2225`)
-- `measurement`: **FILL** — replace `REPLACE_WITH_96_LOWERCASE_HEX_MEASUREMENT` with live report MEASUREMENT (96 lowercase hex; prefix observed `0132f65b`)
+- `measurement`: **filled** `0132f65b23fc8776dcd248b47224301be8d7f66a6c612b00c7b9780c16101291948e5c3df9fac140a0048971fa3ea3db` (live `snpguest display report` on `:2225`, 2026-10-10)
+- Host Data in same report matches `551df92e…71c9885e`
 
-On `:2225`:
-
-```bash
-# example — use whatever snpguest/display path the image has
-snpguest report /tmp/att.bin /tmp/req.bin
-snpguest display report /tmp/att.bin
-# copy MEASUREMENT → 96 lowercase hex into the draft, then publish signed registry release
-```
+Next: **@skyrocket2026** publishes the signed measurement-list registry entry from the draft JSON.
 
 ## Re-run clearout / worker smoke
 
@@ -92,7 +86,7 @@ PY=/opt/cathedral-e2e/venv313/bin/python
 | Who | Action |
 | --- | --- |
 | **Fred** | Sign central-access for B.b/e/f/g **or** accept those BLOCKED |
-| **@skyrocket2026** | Fill MEASUREMENT + publish signed measurement-list entry |
+| **@skyrocket2026** | Draft MEASUREMENT filled — publish signed measurement-list entry |
 | **Leadership** | Accept C BLOCKED / D SKIP / E BLOCKED for this bolt if closing #274 now |
 | **Toby** | Keep evidence current; do **not** enable panic-on-corruption yet |
 
