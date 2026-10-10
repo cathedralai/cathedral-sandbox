@@ -153,8 +153,9 @@ the suite results.
   [docs/TDX_VERIFIER_RELEASE.md](../../docs/TDX_VERIFIER_RELEASE.md)).
   `TDX_VERIFIER=/path/to/it` uses a local copy instead, which is checked the
   same way.
-- **runsc.** `setup.sh` downloads runsc `20260817.0` on the box and checks its
-  sha256, the same pin as `Dockerfile.tee-box-runsc`.
+- **runsc.** `setup.sh` downloads gVisor `20261005.0` as `gvisor.tar.zstd`,
+  extracts `runsc`, and checks sha256 `210b437a…` (same pin as
+  `Dockerfile.tee-box-runsc` and the Cherry measured tee-box images).
 - **The test image.** The image is `docker.io/library/alpine`, pulled by
   digest. `IMAGE_REF` and `IMAGE_DIGEST` change it.
 

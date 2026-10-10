@@ -37,6 +37,8 @@ REPORT_DATA_OFFSET = 0x50
 REPORT_DATA_SIZE = 64
 MEASUREMENT_OFFSET = 0x90
 MEASUREMENT_SIZE = 48
+HOST_DATA_OFFSET = 0xC0
+HOST_DATA_SIZE = 32
 CHIP_ID_OFFSET = 0x1A0
 CHIP_ID_SIZE = 64
 SIGNATURE_OFFSET = 0x2A0
@@ -159,6 +161,7 @@ class SnpReport:
     cpuid_step: int
     report_data: bytes
     measurement: str
+    host_data: bytes
     chip_id: str
     tcb: SnpTcb
     signature: bytes
@@ -187,6 +190,7 @@ def parse_snp_report(report: bytes) -> SnpReport:
 
     report_data = report[REPORT_DATA_OFFSET : REPORT_DATA_OFFSET + REPORT_DATA_SIZE]
     measurement = report[MEASUREMENT_OFFSET : MEASUREMENT_OFFSET + MEASUREMENT_SIZE].hex()
+    host_data = report[HOST_DATA_OFFSET : HOST_DATA_OFFSET + HOST_DATA_SIZE]
     chip_id = report[CHIP_ID_OFFSET : CHIP_ID_OFFSET + CHIP_ID_SIZE].hex()
     signature = report[SIGNATURE_OFFSET : SIGNATURE_OFFSET + SIGNATURE_SIZE]
 
@@ -206,6 +210,7 @@ def parse_snp_report(report: bytes) -> SnpReport:
         cpuid_step=cpuid_step,
         report_data=report_data,
         measurement=measurement,
+        host_data=host_data,
         chip_id=chip_id,
         tcb=SnpTcb(
             current=current_tcb,

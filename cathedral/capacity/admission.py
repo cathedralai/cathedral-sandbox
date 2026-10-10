@@ -53,6 +53,10 @@ quote (or SEV-SNP report) bytes it verified. :func:`admit` then decides:
   boot has served a customer, and the VM must be relaunched first. This is
   the check that holds against guest root. SEV-SNP has no RTMR, so asking for
   it there is an error. ``False`` (the default) skips it.
+- **Root bind (optional, TDX and SNP).** When ``expected_root_digest`` is set
+  (``sha256:<64 hex>`` of the Cathedral central-root file), the quote must
+  carry that digest in TDX MRCONFIGID (first 32 bytes, 16 zero pad) or SNP
+  HOST_DATA. Same pin guest startup enforces locally. ``None`` skips (legacy).
 
 The evidence :func:`admit` returns for the box's receipts carries the SHA-256
 of the quote bytes (computed here, never taken from the caller), the nonce, the
@@ -92,6 +96,7 @@ from cathedral.common import (
     Tier,
     report_data_v2,
 )
+from cathedral.capacity.tee_honesty import check_root_binding
 from cathedral.verify.snp import VERIFIED, parse_snp_report
 from cathedral.verify.tdx_quote import TdxQuoteParseError, parse_tdx_quote
 
@@ -358,6 +363,7 @@ def admit(
     tls_spki_der: bytes | None = None,
     last_released_at: datetime | None = None,
     require_fresh_boot: bool = False,
+    expected_root_digest: str | None = None,
 ) -> Admission:
     """Decide one TEE box's admission.
 
@@ -374,8 +380,9 @@ def admit(
     ``attestation_predates_release``; ``None`` skips that check.
     ``require_fresh_boot`` (TDX only) refuses a quote whose RTMR3 is not all
     zeros with ``boot_consumed``; use it for every admission before a new
-    customer. Raises
-    :class:`AdmissionError` on malformed input."""
+    customer. ``expected_root_digest`` (optional, TDX and SNP) pins the
+    Cathedral central-root file digest against MRCONFIGID / HOST_DATA.
+    Raises :class:`AdmissionError` on malformed input."""
 
     if not isinstance(attested, Attested):
         raise AdmissionError("attested must be the verifier's cathedral.common.Attested")
@@ -417,7 +424,12 @@ def admit(
     if not isinstance(require_fresh_boot, bool):
         raise AdmissionError("require_fresh_boot must be a bool")
     if require_fresh_boot and kind != "tdx":
-        raise AdmissionError("require_fresh_boot needs a TDX quote: SEV-SNP has no RTMR3")
+        # SNP has no guest-extendable report field (docs/TEE_BOX_SERVICE.md,
+        # issue #274 B.d). SoftwareLeaseRegister is guest-local only.
+        raise AdmissionError(
+            "require_fresh_boot needs a TDX quote: SEV-SNP has no RTMR3-class "
+            "register in the attestation report (issue #274 B.d BLOCKED)"
+        )
     registry = _check_admitted(admitted)
     binding = _tls_binding(tls_certificate_der, tls_spki_der)
 
@@ -508,6 +520,12 @@ def admit(
         reasons.append(ATTESTATION_PREDATES_RELEASE)
     if require_fresh_boot and quote_rtmr3 != _RTMR_ZERO:
         reasons.append(BOOT_CONSUMED)
+    try:
+        root_reason = check_root_binding(kind, quote, expected_root_digest)
+    except ValueError as exc:
+        raise AdmissionError(str(exc)) from exc
+    if root_reason is not None:
+        reasons.append(root_reason)
 
     return Admission(
         admitted=not reasons,

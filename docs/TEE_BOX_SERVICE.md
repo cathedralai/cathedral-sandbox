@@ -217,9 +217,13 @@ state".
     (`cathedral/tee_box/measured_root.py:127`). The box does not use a
     configfs-tsm quote here: the host's quoting service writes those bytes,
     and the guest does not verify them.
-  - **SEV-SNP.** HOST_DATA would be the binding, but the SNP report code does
-    not read it, so `serve-snp` with the TEE box flags refuses to start
-    (`cathedral/tee_box/measured_root.py:95`).
+  - **SEV-SNP.** HOST_DATA (32 bytes at report offset 0xC0) is
+    `sha256(root key file)` (`host_data_for_root_keys`,
+    `cathedral/tee_box/measured_root.py`). At start the box collects a fresh
+    SNP report through `snpguest` and `/dev/sev-guest`, checks the random
+    REPORT_DATA echo, and loads the file only if its sha256 matches HOST_DATA.
+    SNP `MEASUREMENT` does not cover HOST_DATA, so admission that cares about
+    the root must check HOST_DATA separately.
   - Nothing reads the root, its digest or MRCONFIGID from a flag, an
     environment variable or a writable config file. A missing device, a
     zero or malformed MRCONFIGID, or a file that does not match refuses
@@ -413,9 +417,13 @@ is updated separately.
     or `RTMR3_CONSUMED` with one. Anything else closes the box
     (`cathedral/tee_box/boot.py:245`). This covers a crash between the
     extend and the record write.
-  - The worker refuses to start when RTMR3 cannot be read, and on SEV-SNP
-    (`cathedral/tee_box/configure.py:317-319`), which has no RTMR. The SNP
-    equivalent (a vTPM PCR) is open.
+  - The worker refuses to start when the fresh-boot register cannot be
+    read. On TDX that is RTMR3; on SEV-SNP it is a guest-local
+    `SoftwareLeaseRegister` next to the central state
+    (`cathedral/tee_box/boot.py`, `configure.py`). The software register is
+    **not** hardware-backed and is not in the SNP report, so
+    `require_fresh_boot` admission remains a TDX check until a hardware
+    register exists.
 - **Two measurements per image.** The Cathedral TDX measurement covers the
   RTMRs (`cathedral/verify/tdx_quote.py:91-104`), so each image has a fresh
   and a consumed measurement. The published list holds both, derived from
@@ -699,15 +707,16 @@ No flag names the callers or their root keys; see "Caller authorization".
   guest behind 1:1 NAT the public address is not on an interface, so pass
   it with `--tee-box-address` instead.
 - **Startup refuses** (`cathedral/tee_box/configure.py:258`) when the root
-  key file does not match the measured binding, or on SEV-SNP (`:309`);
-  when the central state is not on tmpfs or ramfs, or any swap is on (`:310-316`); when
-  the kernel's boot id, boot time or RTMR3 cannot be read, or the TEE is not TDX
-  (`:317-324`, see "Relaunch between customers (T9)"); when the central state is unusable (`:325-335`); when
-  the daemon does not register the runtime at the runtime path with
-  `--platform=systrap` (`:353`); when Docker's data root is neither in guest
-  memory nor on dm-crypt with integrity (`:354-358`); or when disk quotas
-  are unsupported without `--tee-box-no-disk-quota` (`:359-367`). No flag
-  relaxes the storage checks (see "Storage (T8)").
+  key file does not match the measured binding (MRCONFIGID on TDX, HOST_DATA
+  on SNP); when the central state is not on tmpfs or ramfs, or any swap is
+  on; when the kernel's boot id, boot time or fresh-boot register cannot be
+  read, or the TEE is neither TDX nor SNP (see "Relaunch between customers
+  (T9)"); when the central state is unusable; when the daemon does not
+  register the runtime at the runtime path with `--platform=systrap`; when
+  Docker's data root is neither in guest memory nor on dm-crypt with
+  integrity; or when disk quotas are unsupported without
+  `--tee-box-no-disk-quota`. No flag relaxes the storage checks (see
+  "Storage (T8)").
 - **Startup does not refuse** when the egress rules fail to apply
   (`:368`). The box then serves `deny_all` only, and the startup line's
   `tee_box.egress` field reports the error. The egress thread re-applies
@@ -1159,12 +1168,26 @@ orchestration by the control plane.
     entry, the host tools and the worker together. The opt-in layer is not
     measured or published. Measurement approval follows the design's plan
     steps 2 to 7.
-- **SEV-SNP.** An SNP box refuses to start. To fix that, either read
-  HOST_DATA from the SNP report, or rely on the root key file sitting inside
-  the listed dm-verity root (design section 3). The design notes that
-  `MEASUREMENT` does not cover HOST_DATA, so admission would have to check it
-  separately. SNP also needs its own mark in place of RTMR3 (a vTPM PCR). And
-  runsc has not run under an SNP guest.
+- **SEV-SNP.** The box can start: it reads HOST_DATA from an SNP report and
+  uses a guest-local `SoftwareLeaseRegister` for one-customer-per-boot.
+  `MEASUREMENT` still does not cover HOST_DATA, so admission that cares about
+  the root must check HOST_DATA separately. And runsc has not yet been proven
+  under an SNP guest.
+
+  **Fresh-boot (issue #274 B.d) — written reason it cannot exist on SNP.**
+  The AMD SEV-SNP attestation report Cathedral verifies has no guest-extendable
+  measurement register comparable to TDX RTMR3. `MEASUREMENT` and `HOST_DATA`
+  are fixed at launch; `REPORT_DATA` is per-request and not sticky boot state.
+  A guest-local file (`SoftwareLeaseRegister`) enforces one customer per boot
+  *inside* the guest only: it does not appear in the quote, so
+  `admit(..., require_fresh_boot=True)` stays a TDX check and raises on SNP
+  (`cathedral/capacity/admission.py`). Cathedral does not treat Azure/plain
+  vTPM PCR as SNP evidence (`docs/MINING.md`). Until firmware/SVSM exposes an
+  attested mutable register that (a) the guest can extend once per boot,
+  (b) appears in the verified report, and (c) resets only on relaunch, sealed
+  B.d is **BLOCKED** — not PASS. What replaces it for in-guest policy is
+  `SoftwareLeaseRegister` + relaunch orchestration; what replaces it for
+  admission is “do not claim hardware fresh-boot on SNP.”
 - **Relaunch orchestration (control plane, T9).** Ask the miner to relaunch
   after `needs_relaunch`. Before each new customer, admit with
   `require_fresh_boot=True` (and `last_released_at`) and pin that admission's

@@ -1,0 +1,39 @@
+{
+  "_comment": "DRAFT for @skyrocket2026 (image owner) — not a signed registry release. MEASUREMENT filled from live :2225 snpguest display report on 2026-10-10. Schema matches cathedral/capacity/measurement_list.py SNP image + cpu_snp tee_box profile metadata.",
+  "_measurement_source": "ssh -p 2225 root@84.32.220.48; snpguest report /tmp/att.bin /tmp/req.bin && snpguest display report /tmp/att.bin",
+  "profile": {
+    "id": "tee-box-snp-cherry-official-v1",
+    "kind": "cpu_snp",
+    "status": "active",
+    "measurements": [
+      "0132f65b23fc8776dcd248b47224301be8d7f66a6c612b00c7b9780c16101291948e5c3df9fac140a0048971fa3ea3db"
+    ],
+    "runtime_measurements": [],
+    "allowed_firmware": [],
+    "min_tcb": 0,
+    "tdx_allowed_tcb_statuses": [],
+    "tdx_allowed_advisories": [],
+    "metadata": {
+      "description": "Cherry official measured tee-box SNP guest :2225 (2026-10-09)",
+      "tee_box": {
+        "schema": "cathedral_tee_box_images_v1",
+        "images": [
+          {
+            "id": "tee-box-snp-cherry-official-2026-10-09",
+            "measurement": "0132f65b23fc8776dcd248b47224301be8d7f66a6c612b00c7b9780c16101291948e5c3df9fac140a0048971fa3ea3db",
+            "host_data": "551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e"
+          }
+        ]
+      }
+    }
+  },
+  "known_pins": {
+    "host_data": "551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e",
+    "host_data_source": "sha256(/usr/share/cathedral/central-root-keys.json) — Phase A PASS on :2225; snpguest Host Data matches",
+    "measurement": "0132f65b23fc8776dcd248b47224301be8d7f66a6c612b00c7b9780c16101291948e5c3df9fac140a0048971fa3ea3db",
+    "measurement_filled_at": "2026-10-10T07:00:00Z",
+    "guest": "ssh -p 2225 root@84.32.220.48",
+    "branch_evidence": "feat/tee-box-snp-startup-gates",
+    "do_not_enable_panic_on_corruption_yet": true
+  }
+}

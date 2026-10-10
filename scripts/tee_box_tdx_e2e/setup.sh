@@ -19,9 +19,11 @@
 set -euo pipefail
 umask 022
 
-RUNSC_VERSION=20260817.0
-RUNSC_SHA256=048b89aada69dc3333422e139d6e9d02f8ab06bda52398060e0fbdacca00074c
-RUNSC_URL="https://storage.googleapis.com/gvisor/releases/release/${RUNSC_VERSION}/x86_64/runsc"
+# gVisor weekly releases after 20260817 ship gvisor.tar.zstd (no bare runsc).
+# Pin matches the measured tee-box images on Cherry (2026-10-09).
+RUNSC_VERSION=20261005.0
+RUNSC_SHA256=210b437a9cfae51e8f8c9074ed19b8b5e59477178e2e391a18117d8d6b924f7a
+RUNSC_BUNDLE_URL="https://storage.googleapis.com/gvisor/releases/release/${RUNSC_VERSION}/x86_64/gvisor.tar.zstd"
 RUNSC_PATH=/usr/local/bin/runsc
 DAEMON_JSON=${DAEMON_JSON:-/etc/docker/daemon.json}
 STATE_DIR=${STATE_DIR:-/run/cathedral-tee-box}
@@ -96,12 +98,17 @@ need_packages() {
   for pkg in "$@"; do
     dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
   done
-  if [ "${#missing[@]}" -gt 0 ]; then
-    log "installing ${missing[*]}"
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get -o DPkg::Lock::Timeout=600 update -qq
-    apt-get -o DPkg::Lock::Timeout=600 install -y -qq "${missing[@]}" >/dev/null
+  if [ "${#missing[@]}" -eq 0 ]; then
+    return 0
   fi
+  if ! command -v apt-get >/dev/null 2>&1; then
+    log "apt-get absent (measured image); skipping install of: ${missing[*]}"
+    return 0
+  fi
+  log "installing ${missing[*]}"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get -o DPkg::Lock::Timeout=600 update -qq
+  apt-get -o DPkg::Lock::Timeout=600 install -y -qq "${missing[@]}" >/dev/null
 }
 
 check_tdx() {
@@ -113,6 +120,27 @@ check_tdx() {
   fi
   [ -d /sys/kernel/config/tsm/report ] || die "configfs-tsm report root is missing"
   log "TDX guest: /dev/tdx_guest, RTMR3 sysfs and configfs-tsm present"
+}
+
+check_snp() {
+  [ -e /dev/sev-guest ] || die "/dev/sev-guest is missing: not an AMD SEV-SNP guest"
+  command -v snpguest >/dev/null || die "snpguest missing on PATH"
+  log "SNP guest: /dev/sev-guest and snpguest present (no RTMR3-class register)"
+}
+
+# TEE=auto|tdx|snp (default auto). Measured Cherry tee-box images are SNP.
+check_tee() {
+  case "${TEE:-auto}" in
+    tdx) check_tdx ;;
+    snp) check_snp ;;
+    auto)
+      if [ -e /dev/tdx_guest ]; then check_tdx
+      elif [ -e /dev/sev-guest ]; then check_snp
+      else die "neither /dev/tdx_guest nor /dev/sev-guest present"
+      fi
+      ;;
+    *) die "TEE must be auto|tdx|snp (got ${TEE:-})" ;;
+  esac
 }
 
 no_swap() {
@@ -129,13 +157,21 @@ install_runsc() {
     log "runsc $RUNSC_VERSION already installed (sha256 ok)"
     return
   fi
-  local tmp
+  local tmp bundle
   tmp=$(mktemp /tmp/runsc.XXXXXX)
   if [ -f "$HERE/bin/runsc" ]; then
     cp "$HERE/bin/runsc" "$tmp"
   else
-    log "downloading runsc $RUNSC_VERSION"
-    curl --fail --silent --show-error --location --proto '=https' --retry 3 -o "$tmp" "$RUNSC_URL"
+    log "downloading gVisor $RUNSC_VERSION bundle (gvisor.tar.zstd)"
+    bundle=$(mktemp /tmp/gvisor.XXXXXX.tar.zstd)
+    curl --fail --silent --show-error --location --proto '=https' --retry 3 \
+      -o "$bundle" "$RUNSC_BUNDLE_URL"
+    if command -v zstd >/dev/null 2>&1; then
+      zstd -d -c "$bundle" | tar -xOf - runsc >"$tmp"
+    else
+      tar --use-compress-program=zstd -xOf "$bundle" runsc >"$tmp"
+    fi
+    rm -f "$bundle"
   fi
   echo "$RUNSC_SHA256  $tmp" | sha256sum --check --status - \
     || { rm -f "$tmp"; die "runsc sha256 mismatch"; }
@@ -182,9 +218,19 @@ write_marker() {
 }
 
 phase_prepare() {
-  check_tdx
+  check_tee
+  # SNP measured images use a small volatile overlay; keep LUKS scratch modest
+  # unless the caller already overrode these env vars for a larger disk.
+  if [ -e /dev/sev-guest ] && [ ! -e /dev/tdx_guest ]; then
+    if [ "${SCRATCH_GIB}" = "2" ] && [ "${SCRATCH_IMG}" = "/var/lib/cathedral-scratch.img" ]; then
+      SCRATCH_GIB=1
+      SCRATCH_IMG=/tmp/cathedral-scratch.img
+      DOCKER_ROOT="$SCRATCH_MNT/docker"
+    fi
+    log "SNP scratch: SCRATCH_GIB=$SCRATCH_GIB SCRATCH_IMG=$SCRATCH_IMG"
+  fi
   write_marker
-  need_packages python3-venv python3-pip cryptsetup-bin nftables iproute2 util-linux dmsetup e2fsprogs curl git
+  need_packages python3-venv python3-pip cryptsetup-bin nftables iproute2 util-linux dmsetup e2fsprogs curl git zstd
   command -v docker >/dev/null || die "docker is not installed"
   [ -x /usr/bin/docker ] || die "the worker expects the docker CLI at /usr/bin/docker"
   for tool in /usr/sbin/nft /usr/sbin/tc /usr/sbin/ip /usr/bin/nsenter /usr/sbin/dmsetup; do
