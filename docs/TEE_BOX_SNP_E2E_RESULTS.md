@@ -87,7 +87,7 @@ PY=/opt/cathedral-e2e/venv313/bin/python
 
 | Who | Action |
 | --- | --- |
-| **Fred** | Sign central-access for B.b/e/f/g **or** accept those BLOCKED |
+| **Fred** | Optional: 2nd central delegation (B.f.2) + box-only + revoke list (B.g.1/2/4); else accept PARTIAL |
 | **@skyrocket2026** | Draft MEASUREMENT filled — publish signed measurement-list entry |
 | **Leadership** | Accept C BLOCKED / D SKIP / E BLOCKED for this bolt if closing #274 now |
 | **Toby** | Keep evidence current; do **not** enable panic-on-corruption yet |
