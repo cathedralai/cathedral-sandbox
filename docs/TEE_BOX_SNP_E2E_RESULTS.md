@@ -7,6 +7,7 @@ bolt is ready to close once image owner publishes the list entry and
 leadership accepts the BLOCKED rows.
 
 Evidence: `docs/evidence/snp-bf-report-20261009T175646Z.json`,
+`docs/evidence/snp-bf-efg-20261011T1414Z.json` (B.b/e/f/g with Fred central-access),
 worker smoke tip **`e622448`**, measurement-list draft
 `docs/evidence/measurement-list-draft-tee-box-snp-official-2225.json`.
 
@@ -32,9 +33,10 @@ Sandbox tip: **`feat/tee-box-snp-startup-gates`**.
 | B.c pull + runsc exec | **PASS** | alpine by digest under runsc |
 | B.d fresh-boot HW | **BLOCKED** | `fresh_boot_hardware_backed=false` (software lease register) |
 | Worker smoke `serve-snp` | **PASS** | live HOST_DATA `551df92e…`, egress enforced |
-| B.b revocation | **BLOCKED** | needs Fred-signed central-access; root seed offline |
-| B.e egress matrix | **BLOCKED** | same — API routes need central signatures |
-| B.f one-customer / B.g 401s | **BLOCKED** | same |
+| B.b revocation | **PASS** | Fred-signed empty rev list pushed; `fresh=true` (2026-10-11) |
+| B.e egress matrix | **PASS** | internet sandbox; metadata/VPC/box blocked; 1.1.1.1 OK |
+| B.f one-customer | **PARTIAL** | f.1/f.3/f.4 PASS; **f.2 BLOCKED** (needs 2nd Fred central key) |
+| B.g scope 401s | **PARTIAL** | g.3 PASS (wrong-route 401); g.1/g.2/g.4 BLOCKED (box-only + revoke) |
 | C. receipts | **BLOCKED** | Polaris/prober capacity receipt path + idle probe/lease; not Toby-solo on `:2225` |
 | D. fork density | **SKIP** | Owner decision: no snapshot/fork in v1 (`docs/TEE_BOX.md` decision 5). Not implemented; not a #274 bug. |
 | E. customer formats | **BLOCKED** | awaiting agreed customer verifier formats |
