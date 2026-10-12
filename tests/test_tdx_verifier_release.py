@@ -64,7 +64,7 @@ def test_verifier_release_build_and_two_asset_contract_are_fixed():
     normalized = " ".join(workflow.split())
 
     for expected in (
-        'GO_VERSION: "1.25.13"',
+        'GO_VERSION: "1.26.9"',
         'CGO_ENABLED: "0"',
         "GOOS: linux",
         "GOARCH: amd64",
@@ -151,7 +151,7 @@ def test_release_notes_template_binds_provenance_and_states_trust_limits():
     assert 'notes.replace("{{GO_SUM_SHA256}}"' in workflow
     for expected in (
         EXPECTED_SHA256,
-        "Go `1.25.13`",
+        "Go `1.26.9`",
         "CGO_ENABLED=0",
         "GOOS=linux",
         "GOARCH=amd64",
