@@ -93,12 +93,51 @@ The verifier fetches collateral only from the two allowlisted Intel PCS hosts,
 over bounded HTTPS requests using Intel's `standard` update channel. It never
 prints the raw PPID used to derive the stable platform identity.
 
+## Next release (not yet published)
+
+The next release, `cathedral-tdx-verifier-v1.1.0`, is not yet published. Until
+it is, v1.0.0 above is the release to install. It brings the exit `3` contract
+above: an Intel collateral outage is reported as an outage, decided by the
+latest collateral request only, and a platform, TDX module or QE that is not
+fully current is always exit `1`. v1.0.0 exits `1` for every failure. It also
+emits `image_measurement`, the v2 image identity from #267, which leaves out
+the owner fields a host sets per VM.
+
+| Field | Expected value |
+|---|---|
+| Tag | `cathedral-tdx-verifier-v1.1.0` |
+| Asset SHA-256 | `d7cf66e94b0d9d8ba337f6b448b51b9591e30d5f44eb2852ca91e11f976cf053` |
+
+That digest is the reproducible build of the verifier source on `main` after
+#267, plus sandbox #253, with Go 1.26.9 and the flags below. Two builds with
+separate empty caches give the same bytes, and rebuilding the v1.0.0 source
+with the Go 1.25.13 it was released with reproduces v1.0.0's published digest
+exactly, so the build is deterministic. v1.1.0 moves to Go 1.26.9 for the
+standard-library fixes of 2026-10-08 (GO-2026-6603 and the eight related
+advisories), which the pinned vulnerability scan requires.
+
+To publish it, a maintainer tags a commit on `main` whose
+`cmd/cathedral-tdx-verifier` directory matches that source:
+
+```bash
+git diff --quiet 5241424493e47e874635d93f25890b8090499e82 <commit> -- cmd/cathedral-tdx-verifier
+git tag cathedral-tdx-verifier-v1.1.0 <commit>
+git push origin cathedral-tdx-verifier-v1.1.0
+```
+
+The workflow refuses to publish a build with any other digest. After it
+publishes, update the table at the top of this page. Then cathedral-validator
+re-pins `DIRECT_VALIDATOR_QVL_DIGEST` in
+`cathedral_thin/independent_runtime/qvl.py` to the new digest, and operators
+install the new asset. Only then does the validator see exit `3`.
+
 ## Release controls and limits
 
 The tag-only release workflow uses Go 1.26.9, two separate empty build caches,
 and fixed static-build flags. The builds must be byte-identical and match the
-digest above. The workflow publishes exactly the binary and checksum, then
-downloads both anonymously and checks them again.
+workflow's `EXPECTED_SHA256`, which is the digest in "Next release" above. The
+workflow publishes exactly the binary and checksum, then downloads both
+anonymously and checks them again.
 
 A verified download proves which executable bytes you installed. It does not
 prove a miner is running those bytes, prove quote freshness, enforce a machine
