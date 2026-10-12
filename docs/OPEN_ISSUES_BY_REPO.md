@@ -115,7 +115,7 @@ Open issues only, by repository (from `gh issue list`).
 - **Author:** app/github-actions
 - **Created:** 2026-10-06T13:17:17Z
 - **Updated:** 2026-10-07T13:21:07Z
-- **Description:** @wallscaler the daily release expiry check failed: https://github.com/cathedralai/cathedral-validator/actions/runs/37469578239 ``` release expiry check FAILED for 2 of 3 artifacts; see docs/RENEW_RELEASE_CHANNEL.md EXPIRES SOON: stable release metadata sequence 5 expires at 2026-10-10T20:33:45Z, in 4.3 days (alarm threshold 5.0 days); re-sign it: docs/RENEW_RELEASE_CHANNEL.md, case (a). ::error title=stable release metadata expiry::EXPIRES SOON: stable release metadata sequence 5 expires at 2...
+- **Description:** @wallscaler the daily release expiry check failed: https://github.com/cathedralai/cathedral-validator/actions/runs/37469578239 ``` release expiry check FAILED for 2 of 3 artifacts; see cathedral-validator/docs/RENEW_RELEASE_CHANNEL.md EXPIRES SOON: stable release metadata sequence 5 expires at 2026-10-10T20:33:45Z, in 4.3 days (alarm threshold 5.0 days); re-sign it: cathedral-validator/docs/RENEW_RELEASE_CHANNEL.md, case (a). ::error title=stable release metadata expiry::EXPIRES SOON: stable release metadata sequence 5 expires at 2...
 
 ## `bigailabs/polariscomputer` — 71 open
 

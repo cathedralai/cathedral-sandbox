@@ -212,7 +212,7 @@ Without those names, teammates cannot parallelize — they do not know who to as
 | **W3** | Approve measured guest image | Image owner | Same ownership doc + candidate build | Approve image id + measurement-list rev | Written approval; e2e can target it | Build artifact | W1 after stamp |
 | **W4** | Custody checklist v0 | Custody product + legal | **`polariscomputer/docs/CUSTODY_ENROLLMENT.md`** (created) | Fill C1–C6 policy specifics; lead approves | Doc signed off; ops can enroll | Leadership schedule | W1–W3, W5–W7 |
 | **W5** | Custody flag in Polaris | Polaris eng | **`cathedral_custody_enrollment.py`** (created) | Ops `enroll` / `deny`; adapters fill `custody_approved`; never miner self-serve | Tests green; staging private reject/approve | W4 policy text (or enroll against v0) | W1–W3, W6 |
-| **W6** | Staging soak of shadow/gates | Staging ops + Polaris eng | **`UNIT_CAPACITY_STAGING_SOAK.md`** (created) | Run soak order; paste notes template | Notes: no sealed/SAT regression | Staging deploy | W1–W5 |
+| **W6** | Staging soak of shadow/gates | Staging ops + Polaris eng | **`polariscomputer/docs/UNIT_CAPACITY_STAGING_SOAK.md`** (created) | Run soak order; paste notes template | Notes: no sealed/SAT regression | Staging deploy | W1–W5 |
 | **W7** | Wire lifecycle receipt **issuer** | Sandbox + Polaris eng | **Issuer created** (`cathedral_miner_lifecycle_issuer.py`); needs live observation hook | Call `issue_after_observation` after real reclaim; persist later | Staging: one real teardown → ingested receipt | Observation hook | After W5 OK |
 | **W8** | Relaunch driver on real SNP box | Sandbox eng | W1 stamp; VMM reboot API or operator script | Drive `relaunch.py` SM: drain → stop → reboot → health → admit | One full cycle on cathedral-1/2 with logs | W1 | W5–W7 |
 | **W9** | #274 phase claim (honest) | Sandbox eng + Launch | W1 + W3 | Run sealed SNP e2e **without** inject; attach report | Issue #274 updated: real HOST_DATA PASS or still blocked with evidence | W1, W3 | — |
@@ -254,13 +254,13 @@ ETA for Done-when: ________
 | Diagram box | Implementation |
 | --- | --- |
 | Broker / JobIntent | `polariscomputer` `cathedral_job_intent.py`, `cathedral_capacity_router.py` |
-| Gittensor SN74 challenges (additive) | JobIntent `gittensor_challenge` → CVMHost; `POST/GET /v1/challenges/runs` (flag off); docs `GITTENSOR_CHALLENGE_PATH.md` + sandbox `#276` receipt |
+| Gittensor SN74 challenges (additive) | JobIntent `gittensor_challenge` → CVMHost; `POST/GET /v1/challenges/runs` (flag off); docs `polariscomputer/docs/GITTENSOR_CHALLENGE_PATH.md` + sandbox `#276` receipt |
 | Three checks | `cathedral_machine_eligibility.py` |
-| Custody enrollment | `cathedral_custody_enrollment.py`, `docs/CUSTODY_ENROLLMENT.md` |
+| Custody enrollment | `cathedral_custody_enrollment.py`, `polariscomputer/docs/CUSTODY_ENROLLMENT.md` |
 | Shadow / gates | `cathedral_unit_adapters.py`; flags in config (default off) |
-| Staging soak | `docs/UNIT_CAPACITY_STAGING_SOAK.md` |
+| Staging soak | `polariscomputer/docs/UNIT_CAPACITY_STAGING_SOAK.md` |
 | SAT cache | `cathedral_sat_pass_cache.py` |
-| Lifecycle receipt issuer | `cathedral_miner_lifecycle_issuer.py`, `docs/MINER_LIFECYCLE_RECEIPT_ISSUER.md` |
+| Lifecycle receipt issuer | `cathedral_miner_lifecycle_issuer.py`, `polariscomputer/docs/MINER_LIFECYCLE_RECEIPT_ISSUER.md` |
 | Tee-box / SNP | `cathedral-sandbox` `cathedral/tee_box/`, `SNP_HOST_DATA_LAUNCH.md` |
 | TEE honesty (TDX+SNP) | `TEE_HONESTY_STACK.md`, `capacity/tee_honesty.py`, `admit(expected_root_digest=)` |
 | Root / image ownership | `CATHEDRAL_ROOT_AND_IMAGE_OWNERSHIP.md` |
@@ -310,13 +310,13 @@ ETA for Done-when: ________
 
 ```bash
 # Polaris (expect 53+ passed)
-cd polariscomputer && pytest tests/test_cathedral_job_intent.py \
-  tests/test_cathedral_machine_eligibility.py \
-  tests/test_cathedral_unit_eligibility_shadow.py \
-  tests/test_cathedral_unit_adapters.py \
-  tests/test_cathedral_sat_pass_cache.py \
-  tests/test_cathedral_custody_enrollment.py \
-  tests/test_cathedral_miner_lifecycle_issuer.py -q --noconftest
+cd polariscomputer && pytest polariscomputer/tests/test_cathedral_job_intent.py \
+  polariscomputer/tests/test_cathedral_machine_eligibility.py \
+  polariscomputer/tests/test_cathedral_unit_eligibility_shadow.py \
+  polariscomputer/tests/test_cathedral_unit_adapters.py \
+  polariscomputer/tests/test_cathedral_sat_pass_cache.py \
+  polariscomputer/tests/test_cathedral_custody_enrollment.py \
+  polariscomputer/tests/test_cathedral_miner_lifecycle_issuer.py -q --noconftest
 
 # Sandbox helpers (expect 7 passed)
 cd cathedral-sandbox && pytest tests/test_miner_lifecycle_receipt.py \

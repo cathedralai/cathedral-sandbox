@@ -20,5 +20,5 @@ create returns `detail.receipt=null` even when the challenges flag is on.
 ## Related
 
 - polaris #1446 — challenges API / packs
-- polaris `docs/GITTENSOR_CHALLENGE_PATH.md`
+- polaris `polariscomputer/docs/GITTENSOR_CHALLENGE_PATH.md`
 - sandbox #270 — workload receipts launch lane
