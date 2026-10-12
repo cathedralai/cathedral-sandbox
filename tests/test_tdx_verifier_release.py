@@ -9,7 +9,7 @@ WORKFLOW_PATH = ROOT / ".github" / "workflows" / "release-tdx-verifier.yml"
 TEMPLATE_PATH = ROOT / "docs" / "TDX_VERIFIER_RELEASE_NOTES_TEMPLATE.md"
 GUIDE_PATH = ROOT / "docs" / "TDX_VERIFIER_RELEASE.md"
 # The next release the workflow will accept; v1.0.0 stays the published one.
-EXPECTED_SHA256 = "6596a93aaef33ecb0e841ebcfe23221e68aac36d6971e0e138269be713babacc"
+EXPECTED_SHA256 = "d7cf66e94b0d9d8ba337f6b448b51b9591e30d5f44eb2852ca91e11f976cf053"
 PUBLISHED_V1_0_0_SHA256 = "4b6fbaf12def5e4284b54f557c5c29e472d7666f0160a11a5472fdcf462db148"
 
 

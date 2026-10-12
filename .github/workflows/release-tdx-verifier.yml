@@ -11,7 +11,7 @@ env:
   GO_VERSION: "1.26.9"
   ARTIFACT_NAME: cathedral-tdx-verifier-linux-amd64
   CHECKSUM_NAME: cathedral-tdx-verifier-linux-amd64.sha256
-  EXPECTED_SHA256: 6596a93aaef33ecb0e841ebcfe23221e68aac36d6971e0e138269be713babacc
+  EXPECTED_SHA256: d7cf66e94b0d9d8ba337f6b448b51b9591e30d5f44eb2852ca91e11f976cf053
   TAG_RULESET_NAME: Protect Cathedral TDX verifier release tags
 
 jobs:

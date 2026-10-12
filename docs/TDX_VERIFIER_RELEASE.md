@@ -106,17 +106,21 @@ the owner fields a host sets per VM.
 | Field | Expected value |
 |---|---|
 | Tag | `cathedral-tdx-verifier-v1.1.0` |
-| Asset SHA-256 | `6596a93aaef33ecb0e841ebcfe23221e68aac36d6971e0e138269be713babacc` |
+| Asset SHA-256 | `d7cf66e94b0d9d8ba337f6b448b51b9591e30d5f44eb2852ca91e11f976cf053` |
 
 That digest is the reproducible build of the verifier source on `main` after
-#267, plus sandbox #253, under the flags below. Rebuilding the v1.0.0 source the same way reproduces
-v1.0.0's published digest exactly, so the build is deterministic.
+#267, plus sandbox #253, with Go 1.26.9 and the flags below. Two builds with
+separate empty caches give the same bytes, and rebuilding the v1.0.0 source
+with the Go 1.25.13 it was released with reproduces v1.0.0's published digest
+exactly, so the build is deterministic. v1.1.0 moves to Go 1.26.9 for the
+standard-library fixes of 2026-10-08 (GO-2026-6603 and the eight related
+advisories), which the pinned vulnerability scan requires.
 
 To publish it, a maintainer tags a commit on `main` whose
 `cmd/cathedral-tdx-verifier` directory matches that source:
 
 ```bash
-git diff --quiet 7031b0e82f710949f0fcb001ec4b05cb12ced95c <commit> -- cmd/cathedral-tdx-verifier
+git diff --quiet 5241424493e47e874635d93f25890b8090499e82 <commit> -- cmd/cathedral-tdx-verifier
 git tag cathedral-tdx-verifier-v1.1.0 <commit>
 git push origin cathedral-tdx-verifier-v1.1.0
 ```
