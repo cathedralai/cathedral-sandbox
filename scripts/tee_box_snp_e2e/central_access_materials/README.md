@@ -1,34 +1,42 @@
-# Central-access materials for measured SNP `:2225` (B.b/e/f/g)
+# Central-access materials for measured SNP `:2225`
 
-Drop Fred-signed files here. **Never commit** seeds, delegations, or rev lists
-(see `.gitignore`). Keep the central seed offline on the laptop only.
+Drop Fred-signed files here. **Never commit** seeds or signed JSON (gitignored).
 
-## Expected files
+## Round 1 (done 2026-10-11) — filenames used by `smoke-bb` / `matrix-efg`
 
-| File | Source |
+| File | Role |
 | --- | --- |
-| `delegation-full.json` | Fred — full `TEE_BOX_CENTRAL_SCOPES` to your central pubkey |
-| `revocations-first.json` | Fred — first empty list (`--first-list --allow-empty`) |
-| `delegation-box-only.json` | Optional — B.g scope 401s (`tee-box:box` only) |
+| `delegation-full.json` | A full scopes (seq 1 — **expired**) |
+| `revocations-first.json` | Empty list seq 1 (stale after 24h) |
 
-Central seed (local, not here):  
-`Cathedral/.secrets/snp-central-2225/toby-snp-2225-bf.seed`
+## Round 2 — Fred signing batch (`fred-signing-batch-bf-fg-20261012.md`)
 
-Public key sent to Fred:  
-`wgyQxlR1GNnuVDnextSRonGLkB4geLh3bw4P6DIqoIA=`
+Place exactly:
 
-## After files land
+| File | Role |
+| --- | --- |
+| `delegation-a-full-seq2.json` | A renew |
+| `delegation-b-full-seq3.json` | Customer B |
+| `delegation-box-only-seq4.json` | Least-privilege (+ revoke target) |
+| `delegation-sibling-box-seq5.json` | Unrevoked sibling |
+| `delegation-a-full-seq6.json` | A after high-water |
+| `revocations-seq2-fresh-empty.json` | Fresh empty list |
+| `revocations-seq3-revoke-box-only.json` | Revokes box-only digest |
 
-On the guest (worker already smoking on `:8443`):
+Seeds (laptop only): `.secrets/snp-central-2225/toby-snp-2225-{bf,b,box,sibling}.seed`
+
+## After Round 2 lands
 
 ```bash
 export PYTHONPATH=/opt/cathedral/sandbox
-export CENTRAL_SEED=/path/to/toby-snp-2225-bf.seed
 export MATERIALS=/path/to/central_access_materials
+export CENTRAL_SEED_A=/path/to/toby-snp-2225-bf.seed
+export CENTRAL_SEED_B=/path/to/toby-snp-2225-b.seed
+export CENTRAL_SEED_BOX=/path/to/toby-snp-2225-box.seed
+export CENTRAL_SEED_SIBLING=/path/to/toby-snp-2225-sibling.seed
+export WORKER_HOST=127.0.0.1 WORKER_PORT=8443
 PY=/opt/cathedral-e2e/venv313/bin/python
-"$PY" scripts/tee_box_snp_e2e/central_bf_client.py push-revocations
-"$PY" scripts/tee_box_snp_e2e/central_bf_client.py get-box
-"$PY" scripts/tee_box_snp_e2e/central_bf_client.py smoke-bb
+"$PY" scripts/tee_box_snp_e2e/central_bf_client.py matrix-fg-finish
 ```
 
 Do **not** overwrite `/usr/share/cathedral/central-root-keys.json`.
