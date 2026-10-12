@@ -1,5 +1,5 @@
 {
-  "_comment": "DRAFT for @skyrocket2026 (image owner) — not a signed registry release. MEASUREMENT filled from live :2225 snpguest display report on 2026-10-10. Schema matches cathedral/capacity/measurement_list.py SNP image + cpu_snp tee_box profile metadata.",
+  "_comment": "DRAFT for @skyrocket2026 (image owner) — not a signed registry release. MEASUREMENT filled from live :2225 snpguest. Schema matches cathedral/capacity/measurement_list.py SNP image + cpu_snp tee_box profile metadata. Throwaway-key accept_release validated 2026-10-12 (see measurement-list-publish-ready-tee-box-snp-2225.json). Fred central-access signatures cannot sign this list.",
   "_measurement_source": "ssh -p 2225 root@84.32.220.48; snpguest report /tmp/att.bin /tmp/req.bin && snpguest display report /tmp/att.bin",
   "profile": {
     "id": "tee-box-snp-cherry-official-v1",
@@ -32,6 +32,8 @@
     "host_data_source": "sha256(/usr/share/cathedral/central-root-keys.json) — Phase A PASS on :2225; snpguest Host Data matches",
     "measurement": "0132f65b23fc8776dcd248b47224301be8d7f66a6c612b00c7b9780c16101291948e5c3df9fac140a0048971fa3ea3db",
     "measurement_filled_at": "2026-10-10T07:00:00Z",
+    "measurement_reconfirmed_at": "2026-10-12T17:45:00Z",
+    "schema_validate": "PASS throwaway accept_release 2026-10-12",
     "guest": "ssh -p 2225 root@84.32.220.48",
     "branch_evidence": "feat/tee-box-snp-startup-gates",
     "do_not_enable_panic_on_corruption_yet": true

@@ -9,23 +9,24 @@ Drop Fred-signed files here. **Never commit** seeds or signed JSON (gitignored).
 | `delegation-full.json` | A full scopes (seq 1 — **expired**) |
 | `revocations-first.json` | Empty list seq 1 (stale after 24h) |
 
-## Round 2 — Fred signing batch (`fred-signing-batch-bf-fg-20261012.md`)
+## Corrected Round 2 — `toby-handoff-20261012` (use this README order)
 
-Place exactly:
+Seven delegations. **Never reorder.** A2 → B3 → Box4 → A5 → Box6 → Sibling7 → A8.
 
 | File | Role |
 | --- | --- |
-| `delegation-a-full-seq2.json` | A renew |
-| `delegation-b-full-seq3.json` | Customer B |
-| `delegation-box-only-seq4.json` | Least-privilege (+ revoke target) |
-| `delegation-sibling-box-seq5.json` | Unrevoked sibling |
-| `delegation-a-full-seq6.json` | A after high-water |
-| `revocations-seq2-fresh-empty.json` | Fresh empty list |
-| `revocations-seq3-revoke-box-only.json` | Revokes box-only digest |
+| `delegation-a-full-seq2.json` | A start / release |
+| `delegation-b-full-seq3.json` | Customer B → 409 |
+| `delegation-box-scope-seq4.json` | Scope-only (NOT revoke target) |
+| `delegation-a-full-seq5.json` | A re-lease + push rev3 |
+| `delegation-box-revoke-target-seq6.json` | Revoke target (`BOX_DIGEST`) |
+| `delegation-sibling-box-seq7.json` | Sibling after revoke → 200 |
+| `delegation-a-cleanup-seq8.json` | Cleanup last |
+| `revocations-seq2-fresh.json` | Fresh empty list |
+| `revocations-seq3-revoke-box-seq6.json` | Revokes seq6 digest only |
+| `SIGNING_RECEIPT.json` | Local audit (`BOX_DIGEST`) |
 
 Seeds (laptop only): `.secrets/snp-central-2225/toby-snp-2225-{bf,b,box,sibling}.seed`
-
-## After Round 2 lands
 
 ```bash
 export PYTHONPATH=/opt/cathedral/sandbox

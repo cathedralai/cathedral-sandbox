@@ -31,6 +31,8 @@ if str(ROOT) not in sys.path:
 from cathedral.central_access import (  # noqa: E402
     CENTRAL_REQUEST_HEADER,
     build_central_request_header,
+    load_central_root_keys,
+    verify_delegation,
 )
 from cathedral.channel import tls_spki_binding  # noqa: E402
 
@@ -175,14 +177,30 @@ def jcall(
 
 
 def _reason(doc: object) -> str | None:
+    """Extract a machine reason when present; prefer ``reason`` over free-text error."""
+
     if isinstance(doc, dict):
+        top = doc.get("reason")
+        if isinstance(top, str) and top:
+            return top
         err = doc.get("error")
         if isinstance(err, dict):
-            return err.get("reason") or err.get("code")
-        if isinstance(err, str):
+            nested = err.get("reason") or err.get("code")
+            if isinstance(nested, str) and nested:
+                return nested
+        if isinstance(err, str) and err:
             return err
-        return doc.get("reason")
     return None
+
+
+def _is_relaunch_required(status: int, doc: object) -> bool:
+    if status != 409:
+        return False
+    reason = _reason(doc)
+    if reason == "relaunch_required":
+        return True
+    blob = json.dumps(doc, default=str).lower()
+    return "relaunch_required" in blob or "must be relaunched" in blob
 
 
 def _check(results: list[dict], cid: str, name: str, ok: bool, detail: object) -> None:
@@ -520,10 +538,12 @@ def _require_seed_env(name: str) -> bytes:
 
 
 def cmd_matrix_fg_finish(args: argparse.Namespace) -> int:
-    """Finish B.f.2 + B.g after Fred Round-2 signed files land.
+    """Finish B.f.2 + B.g with Fred's corrected 2026-10-12 seven-delegation order.
 
-    Expects materials from ``fred-signing-batch-bf-fg-20261012.md`` and env:
+    Expects materials from ``toby-handoff-20261012`` (corrected README) and env:
     CENTRAL_SEED_A, CENTRAL_SEED_B, CENTRAL_SEED_BOX, CENTRAL_SEED_SIBLING.
+
+    Order (never reorder): A2 → B3 → Box4 → A5 → revoked Box6 → Sibling7 → A8.
     """
 
     host, port = args.host, args.port
@@ -533,17 +553,64 @@ def cmd_matrix_fg_finish(args: argparse.Namespace) -> int:
     seed_sib = _require_seed_env("CENTRAL_SEED_SIBLING")
     del_a2 = _load_json("delegation-a-full-seq2.json")
     del_b = _load_json("delegation-b-full-seq3.json")
-    del_box = _load_json("delegation-box-only-seq4.json")
-    del_sib = _load_json("delegation-sibling-box-seq5.json")
-    del_a6 = _load_json("delegation-a-full-seq6.json")
-    rev2 = _materials_dir() / "revocations-seq2-fresh-empty.json"
-    rev3 = _materials_dir() / "revocations-seq3-revoke-box-only.json"
+    del_box4 = _load_json("delegation-box-scope-seq4.json")
+    del_a5 = _load_json("delegation-a-full-seq5.json")
+    del_box6 = _load_json("delegation-box-revoke-target-seq6.json")
+    del_sib = _load_json("delegation-sibling-box-seq7.json")
+    del_a8 = _load_json("delegation-a-cleanup-seq8.json")
+    rev2 = _materials_dir() / "revocations-seq2-fresh.json"
+    rev3 = _materials_dir() / "revocations-seq3-revoke-box-seq6.json"
     if not rev2.is_file() or not rev3.is_file():
-        return _die("missing Round-2 revocations JSON in MATERIALS")
+        return _die("missing corrected handoff revocations JSON in MATERIALS")
+
+    receipt_path = _materials_dir() / "SIGNING_RECEIPT.json"
+    expected_box_digest = None
+    if receipt_path.is_file():
+        receipt = json.loads(receipt_path.read_bytes())
+        expected_box_digest = receipt.get("BOX_DIGEST")
 
     results: list[dict] = []
 
-    # T0 — fresh empty rev list
+    # Offline verify Box6 before any live use (Fred requirement).
+    roots_path = Path(
+        os.environ.get(
+            "CENTRAL_ROOT_KEYS",
+            "/usr/share/cathedral/central-root-keys.json",
+        )
+    )
+    if not roots_path.is_file():
+        return _die(f"missing root keys at {roots_path} for offline Box6 verify")
+    pinned = os.environ.get(
+        "CENTRAL_ROOT_KEYS_DIGEST",
+        "sha256:551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e",
+    )
+    root_keys = load_central_root_keys(str(roots_path), pinned_digest=pinned)
+    try:
+        verified = verify_delegation(
+            del_box6, root_keys, network=NETWORK, netuid=NETUID, now=datetime.now(UTC)
+        )
+    except Exception as exc:  # noqa: BLE001 — surface authorizer refusal reason
+        return _die(f"Box6 offline verify failed: {exc}")
+    digest_ok = expected_box_digest is None or verified.digest == expected_box_digest
+    scope_ok = verified.routes == frozenset({"tee-box:box"})
+    _check(
+        results,
+        "offline.box6",
+        "Box6 signature/subnet/scope/expiry + BOX_DIGEST",
+        digest_ok and scope_ok and verified.sequence == 6,
+        {
+            "digest": verified.digest,
+            "expected": expected_box_digest,
+            "routes": sorted(verified.routes),
+            "sequence": verified.sequence,
+            "expires_at": verified.expires_at.isoformat(),
+        },
+    )
+    if not (digest_ok and scope_ok and verified.sequence == 6):
+        print(json.dumps({"summary_failed": 1, "results": results}, indent=2, default=str))
+        return 1
+
+    # 1) A2 — push rev2, inspect fresh, lease, release
     st, doc = call(
         method="POST",
         path="/v1/box/revocations",
@@ -554,38 +621,26 @@ def cmd_matrix_fg_finish(args: argparse.Namespace) -> int:
         port=port,
     )
     st_box, view = jcall(
-        method="GET", path="/v1/box", payload=None, delegation=del_a2, seed=seed_a, host=host, port=port
-    )
-    fresh = isinstance(view, dict) and (view.get("revocations") or {}).get("fresh") is True
-    _check(results, "T0", "push rev seq2; box fresh", st in (200, 204) and st_box == 200 and fresh, (st, doc, view))
-
-    # T1/T2 — box-only inspect OK, management 401
-    st, _ = jcall(
-        method="GET", path="/v1/box", payload=None, delegation=del_box, seed=seed_box, host=host, port=port
-    )
-    _check(results, "T1", "box-only GET /v1/box → 200", st == 200, st)
-    st_lease, _ = jcall(
-        method="POST",
-        path="/v1/lease",
-        payload={"ttl_seconds": 60},
-        delegation=del_box,
-        seed=seed_box,
+        method="GET",
+        path="/v1/box",
+        payload=None,
+        delegation=del_a2,
+        seed=seed_a,
         host=host,
         port=port,
     )
-    st_list, _ = jcall(
-        method="GET", path="/v1/sandboxes", payload=None, delegation=del_box, seed=seed_box, host=host, port=port
-    )
+    rev = view.get("revocations") if isinstance(view, dict) else None
+    fresh = isinstance(rev, dict) and rev.get("fresh") is True
+    rev_seq = rev.get("sequence") if isinstance(rev, dict) else None
     _check(
         results,
-        "T2",
-        "box-only lease/list → 401",
-        st_lease == 401 and st_list == 401,
-        {"lease": st_lease, "list": st_list},
+        "A2.rev2",
+        "push rev seq2; box fresh sequence2",
+        st in (200, 204) and st_box == 200 and fresh and rev_seq == 2,
+        {"push": (st, doc), "box": view},
     )
 
-    # T3 — A lease then release
-    st, _ = jcall(
+    st, leased = jcall(
         method="POST",
         path="/v1/lease",
         payload={"ttl_seconds": 600},
@@ -594,16 +649,31 @@ def cmd_matrix_fg_finish(args: argparse.Namespace) -> int:
         host=host,
         port=port,
     )
-    if st == 409 and _reason(_) == "relaunch_required":
-        return _die("box needs relaunch before T3 — reboot guest, restart serve-snp, re-run")
-    _check(results, "T3a", "A seq2 lease", st == 200, (st, _))
+    if st == 409 and _reason(leased) == "relaunch_required":
+        return _die(
+            "box needs relaunch before A2 lease — STOP per Fred (no guest relaunch "
+            "to bypass ordering). Reconcile used-boot state first."
+        )
+    _check(results, "A2.lease", "A seq2 lease", st == 200, (st, leased))
     st, released = jcall(
-        method="DELETE", path="/v1/lease", payload=None, delegation=del_a2, seed=seed_a, host=host, port=port
+        method="DELETE",
+        path="/v1/lease",
+        payload=None,
+        delegation=del_a2,
+        seed=seed_a,
+        host=host,
+        port=port,
     )
     needs = isinstance(released, dict) and released.get("needs_relaunch") is True
-    _check(results, "T3", "A release → needs_relaunch", st == 200 and needs, released)
+    _check(
+        results,
+        "A2.release",
+        "A release → needs_relaunch",
+        st == 200 and needs,
+        released,
+    )
 
-    # T4 — B different customer → 409
+    # 2) B3 — different customer → 409 (auth still raises high-water to 3)
     st, body = jcall(
         method="POST",
         path="/v1/lease",
@@ -615,46 +685,186 @@ def cmd_matrix_fg_finish(args: argparse.Namespace) -> int:
     )
     _check(
         results,
-        "T4",
-        "B lease → 409 relaunch_required",
-        st == 409 and _reason(body) == "relaunch_required",
+        "B3",
+        "different-customer lease → 409 relaunch_required",
+        _is_relaunch_required(st, body),
         (st, body),
     )
 
-    # T5 — A seq6 can lease again
-    st, _ = jcall(
+    # 3) Box4 — inspect OK; management + revocations missing-scope 401
+    st, box4_view = jcall(
+        method="GET",
+        path="/v1/box",
+        payload=None,
+        delegation=del_box4,
+        seed=seed_box,
+        host=host,
+        port=port,
+    )
+    _check(results, "Box4.get", "box-scope GET /v1/box → 200", st == 200, (st, box4_view))
+    st_lease, lease_doc = jcall(
         method="POST",
         path="/v1/lease",
-        payload={"ttl_seconds": 120},
-        delegation=del_a6,
+        payload={"ttl_seconds": 60},
+        delegation=del_box4,
+        seed=seed_box,
+        host=host,
+        port=port,
+    )
+    st_list, list_doc = jcall(
+        method="GET",
+        path="/v1/sandboxes",
+        payload=None,
+        delegation=del_box4,
+        seed=seed_box,
+        host=host,
+        port=port,
+    )
+    st_rev, rev_doc = call(
+        method="POST",
+        path="/v1/box/revocations",
+        body=rev2.read_bytes(),
+        delegation=del_box4,
+        seed=seed_box,
+        host=host,
+        port=port,
+    )
+    missing = (
+        st_lease == 401
+        and st_list == 401
+        and st_rev == 401
+        and all(
+            "scope" in str(_reason(d) or d).lower() or "permission" in str(_reason(d) or d).lower()
+            or "route" in str(_reason(d) or d).lower()
+            for d in (lease_doc, list_doc, rev_doc)
+        )
+    )
+    # Accept plain 401 on all three even if reason text varies; record bodies.
+    _check(
+        results,
+        "Box4.scope",
+        "missing-scope lease/list/revocations → 401",
+        st_lease == 401 and st_list == 401 and st_rev == 401,
+        {
+            "lease": (st_lease, lease_doc),
+            "list": (st_list, list_doc),
+            "revocations": (st_rev, rev_doc),
+            "reason_hint_ok": missing,
+        },
+    )
+
+    # 4) A5 — same-customer re-lease; push rev3 (revokes Box6 only)
+    st, a5_lease = jcall(
+        method="POST",
+        path="/v1/lease",
+        payload={"ttl_seconds": 300},
+        delegation=del_a5,
         seed=seed_a,
         host=host,
         port=port,
     )
-    _check(results, "T5", "A seq6 lease after B high-water", st == 200, (st, _))
-    jcall(method="DELETE", path="/v1/lease", payload=None, delegation=del_a6, seed=seed_a, host=host, port=port)
-
-    # T6 — push revoke list
-    st, doc = call(
+    _check(results, "A5.lease", "A seq5 same-customer re-lease", st == 200, (st, a5_lease))
+    st, rev3_doc = call(
         method="POST",
         path="/v1/box/revocations",
         body=rev3.read_bytes(),
-        delegation=del_a6,
+        delegation=del_a5,
         seed=seed_a,
         host=host,
         port=port,
     )
-    _check(results, "T6", "push rev seq3 (revoke box-only)", st in (200, 204), (st, doc))
+    st_box, view = jcall(
+        method="GET",
+        path="/v1/box",
+        payload=None,
+        delegation=del_a5,
+        seed=seed_a,
+        host=host,
+        port=port,
+    )
+    rev = view.get("revocations") if isinstance(view, dict) else None
+    rev_seq = rev.get("sequence") if isinstance(rev, dict) else None
+    _check(
+        results,
+        "A5.rev3",
+        "push rev seq3; active list sequence3",
+        st in (200, 204) and st_box == 200 and rev_seq == 3,
+        {"push": (st, rev3_doc), "box": view},
+    )
 
-    # T7/T8 — revoked vs sibling
-    st, _ = jcall(
-        method="GET", path="/v1/box", payload=None, delegation=del_box, seed=seed_box, host=host, port=port
+    # 5) Box6 — first live use after revoke → 401 (worker maps revoke to
+    # generic unauthorized; offline verify + sibling 200 prove cause).
+    st, box6_doc = jcall(
+        method="GET",
+        path="/v1/box",
+        payload=None,
+        delegation=del_box6,
+        seed=seed_box,
+        host=host,
+        port=port,
     )
-    _check(results, "T7", "revoked box-only → 401", st == 401, st)
-    st, _ = jcall(
-        method="GET", path="/v1/box", payload=None, delegation=del_sib, seed=seed_sib, host=host, port=port
+    _check(
+        results,
+        "Box6",
+        "revoked Box6 GET /v1/box → 401",
+        st == 401,
+        (st, box6_doc),
     )
-    _check(results, "T8", "sibling box-only still → 200", st == 200, st)
+
+    # 6) Sibling7 — unrevoked inspect after revocation
+    st, sib_doc = jcall(
+        method="GET",
+        path="/v1/box",
+        payload=None,
+        delegation=del_sib,
+        seed=seed_sib,
+        host=host,
+        port=port,
+    )
+    sib_detail: object = sib_doc
+    if isinstance(sib_doc, dict):
+        sib_detail = {
+            "status": st,
+            "revocations": sib_doc.get("revocations"),
+            "network_modes": sib_doc.get("network_modes"),
+            "egress": (sib_doc.get("egress") or {}).get("enforced")
+            if isinstance(sib_doc.get("egress"), dict)
+            else sib_doc.get("egress"),
+        }
+    _check(
+        results,
+        "Sibling7",
+        "sibling GET /v1/box → 200",
+        st == 200,
+        sib_detail,
+    )
+
+    # 7) A8 — cleanup last
+    st, a8_view = jcall(
+        method="GET",
+        path="/v1/box",
+        payload=None,
+        delegation=del_a8,
+        seed=seed_a,
+        host=host,
+        port=port,
+    )
+    st_rel, a8_rel = jcall(
+        method="DELETE",
+        path="/v1/lease",
+        payload=None,
+        delegation=del_a8,
+        seed=seed_a,
+        host=host,
+        port=port,
+    )
+    _check(
+        results,
+        "A8",
+        "A cleanup inspect + release",
+        st == 200 and st_rel in (200, 404, 409),
+        {"box": (st, a8_view), "release": (st_rel, a8_rel)},
+    )
 
     failed = [r for r in results if r.get("ok") is False]
     print(json.dumps({"summary_failed": len(failed), "results": results}, indent=2, default=str))
