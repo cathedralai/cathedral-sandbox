@@ -16,7 +16,11 @@ and root. Any TDX provider works, including a rented TDX sandbox such as a
 Polaris "Sealed CPU" machine. Then:
 1. Install the reviewed source as in [Development tests](TESTING.md).
 2. Install the verifier from its release, as in
-   [Intel TDX verifier release](TDX_VERIFIER_RELEASE.md).
+   [Intel TDX verifier release](TDX_VERIFIER_RELEASE.md). The outage check
+   needs a verifier that exits 3 when Intel's collateral service is
+   unavailable. Release v1.0.0 predates that and exits 1, so with v1.0.0 the
+   outage check fails: build the verifier from this repository's source, or
+   pass `--skip-outage` until a newer release is published.
 3. Run the check:
 
 ```bash

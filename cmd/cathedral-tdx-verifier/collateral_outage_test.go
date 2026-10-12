@@ -197,3 +197,93 @@ func TestInvalidInputNeverReportsUnavailable(t *testing.T) {
 		}
 	}
 }
+
+func sequenceGetter(statuses ...int) *intelHTTPSGetter {
+	next := 0
+	return stubGetter(func(req *http.Request) (*http.Response, error) {
+		status := statuses[next]
+		next++
+		return stubResponse(req, status, nil), nil
+	})
+}
+
+func TestOnlyTheLatestCollateralRequestDecidesAnOutage(t *testing.T) {
+	for name, tc := range map[string]struct {
+		statuses []int
+		outage   bool
+	}{
+		"outage then answer":           {[]int{http.StatusServiceUnavailable, http.StatusOK}, false},
+		"answer then outage":           {[]int{http.StatusOK, http.StatusServiceUnavailable}, true},
+		"outage then terminal refusal": {[]int{http.StatusServiceUnavailable, http.StatusNotFound}, false},
+		"terminal refusal then outage": {[]int{http.StatusNotFound, http.StatusTooManyRequests}, true},
+		"two outages":                  {[]int{http.StatusBadGateway, http.StatusGatewayTimeout}, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			getter := sequenceGetter(tc.statuses...)
+			for range tc.statuses {
+				_, _, _ = getter.GetContext(context.Background(), stubCollateralURL)
+			}
+			if got := getter.collateralUnavailable(); got != tc.outage {
+				t.Fatalf("collateralUnavailable() = %v, want %v", got, tc.outage)
+			}
+		})
+	}
+}
+
+func TestADisallowedURLAfterAnOutageIsNotAnOutage(t *testing.T) {
+	getter := stubGetter(func(req *http.Request) (*http.Response, error) {
+		return stubResponse(req, http.StatusServiceUnavailable, nil), nil
+	})
+	_, _, _ = getter.GetContext(context.Background(), stubCollateralURL)
+	_, _, _ = getter.GetContext(
+		context.Background(), "https://collateral.example.invalid/tdx/certification/v4/tcb",
+	)
+	if getter.collateralUnavailable() {
+		t.Fatal("a refused URL after an outage was still reported as an outage")
+	}
+}
+
+func TestAPlatformThatIsNotCurrentIsNeverAnOutage(t *testing.T) {
+	// The levels check runs only after every collateral request succeeded, so
+	// its failure is about the miner's machine. Even with the outage flag
+	// set, it must be an invalid quote (exit 1): an outage (exit 3) would let
+	// a miner with stale firmware stop the validator's round.
+	getter := newIntelHTTPSGetter()
+	getter.recordOutcome(true)
+	options := productionOptionsWith(getter)
+
+	levels := verificationFailure(stageCurrentLevels, options)
+	if errors.Is(levels, errCollateralUnavailable) || exitCode(levels) != exitInvalid {
+		t.Fatalf("levels failure = %v (exit %d), want an invalid quote", levels, exitCode(levels))
+	}
+	quote := verificationFailure(stageQuoteAndCollateral, options)
+	if !errors.Is(quote, errCollateralUnavailable) {
+		t.Fatalf("quote-stage failure with an outage = %v, want collateral unavailable", quote)
+	}
+	getter.recordOutcome(false)
+	if errors.Is(verificationFailure(stageQuoteAndCollateral, options), errCollateralUnavailable) {
+		t.Fatal("quote-stage failure without an outage was reported as one")
+	}
+}
+
+func TestTheLevelsCallSiteNeverReportsAnOutage(t *testing.T) {
+	// Drive the real call site: quote verification "succeeds", then the
+	// levels check fails (this getter recorded no TCB collateral), with the
+	// outage flag left set by an earlier request. The result must be an
+	// invalid quote, exit 1, never an outage.
+	original := verifyQuoteAndCollateral
+	t.Cleanup(func() { verifyQuoteAndCollateral = original })
+	verifyQuoteAndCollateral = func(context.Context, any, *verify.Options) error { return nil }
+
+	getter := newIntelHTTPSGetter()
+	getter.recordOutcome(true)
+	_, err := verifyAndBuildClaims(
+		context.Background(), canonicalQuoteV4Fixture(t), make([]byte, 64), productionOptionsWith(getter),
+	)
+	if err == nil {
+		t.Fatal("levels check unexpectedly passed without TCB collateral")
+	}
+	if errors.Is(err, errCollateralUnavailable) || exitCode(err) != exitInvalid {
+		t.Fatalf("levels failure at the call site = %v (exit %d), want an invalid quote", err, exitCode(err))
+	}
+}

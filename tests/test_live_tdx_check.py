@@ -43,7 +43,7 @@ def _expected() -> str:
     return report_data_v2(NONCE, live.DEFAULT_HOTKEY, binding).hex()
 
 
-def _verifier(*, accept_any_binding=False, outage_exit=3, good_stdout=None):
+def _verifier(*, accept_any_binding=False, outage_exit=3, good_stdout=None, refusal_exit=1):
     """A fake cathedral-tdx-verifier that decides like the real one."""
 
     calls: list[list[str]] = []
@@ -60,7 +60,7 @@ def _verifier(*, accept_any_binding=False, outage_exit=3, good_stdout=None):
         elif report_data == _expected() or accept_any_binding:
             code, out = 0, good_stdout if good_stdout is not None else json.dumps(CLAIMS).encode()
         else:
-            code, out = 1, b""
+            code, out = refusal_exit, b""
         return subprocess.CompletedProcess(command, code, out, b"verifier says no" if code else b"")
 
     return runner, calls
@@ -110,8 +110,14 @@ def test_an_outage_reported_as_an_invalid_quote_fails(tmp_path):
 
 @pytest.mark.parametrize(
     "stdout",
-    [b"not json", b"[]", json.dumps({**CLAIMS, "intel_verified": False}).encode()],
-    ids=["not-json", "not-object", "not-intel-verified"],
+    [
+        b"not json",
+        b"[]",
+        json.dumps({**CLAIMS, "intel_verified": False}).encode(),
+        json.dumps({**CLAIMS, "report_data_match": False}).encode(),
+        json.dumps({**CLAIMS, "claims_bound_to_quote": False}).encode(),
+    ],
+    ids=["not-json", "not-object", "not-intel-verified", "no-report-data-match", "not-bound"],
 )
 def test_a_pass_without_verified_quote_bound_claims_fails(tmp_path, stdout):
     runner, _ = _verifier(good_stdout=stdout)
@@ -142,3 +148,20 @@ def test_main_refuses_a_verifier_that_is_not_executable(tmp_path):
     missing = tmp_path / "absent"
     with pytest.raises(SystemExit, match="not an executable file"):
         live.main(["--verifier", str(missing)])
+
+
+def test_a_binding_mismatch_reported_as_an_outage_is_not_a_refusal(tmp_path):
+    """Exit 3 for a wrong nonce, hotkey or TLS key would let a miner stop the
+    validator's round, so only exit 1 counts as a refusal."""
+
+    runner, _ = _verifier(refusal_exit=3)
+    checks = {check.name: check.passed for check in _run(tmp_path, runner)}
+
+    assert checks["a replayed quote (other nonce) is refused"] is False
+    assert checks["a copied quote (other hotkey) is refused"] is False
+    assert checks["a relayed quote (other TLS key) is refused"] is False
+
+
+def test_the_tamper_offset_is_inside_the_signed_td_body():
+    header, body = 48, 584
+    assert header <= live.TAMPER_OFFSET < header + body

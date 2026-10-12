@@ -95,7 +95,7 @@ prints the raw PPID used to derive the stable platform identity.
 
 ## Release controls and limits
 
-The tag-only release workflow uses Go 1.25.13, two separate empty build caches,
+The tag-only release workflow uses Go 1.26.9, two separate empty build caches,
 and fixed static-build flags. The builds must be byte-identical and match the
 digest above. The workflow publishes exactly the binary and checksum, then
 downloads both anonymously and checks them again.

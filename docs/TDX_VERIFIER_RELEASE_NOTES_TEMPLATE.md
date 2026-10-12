@@ -19,7 +19,7 @@ provides its automatic source archives.
 - Module: `cmd/cathedral-tdx-verifier`
 - `go.mod` SHA-256: `{{GO_MOD_SHA256}}` ([source](https://github.com/cathedralai/cathedral-sandbox/blob/{{SOURCE_REVISION}}/cmd/cathedral-tdx-verifier/go.mod))
 - `go.sum` SHA-256: `{{GO_SUM_SHA256}}` ([source](https://github.com/cathedralai/cathedral-sandbox/blob/{{SOURCE_REVISION}}/cmd/cathedral-tdx-verifier/go.sum))
-- Toolchain: Go `1.25.13`, with automatic toolchain switching disabled
+- Toolchain: Go `1.26.9`, with automatic toolchain switching disabled
 - Environment: `GOENV=off`, `GOWORK=off`
 - Target: `CGO_ENABLED=0`, `GOOS=linux`, `GOARCH=amd64`, `GOAMD64=v1`
 - Flags: `-mod=readonly -trimpath -buildvcs=false -ldflags='-s -w'`
