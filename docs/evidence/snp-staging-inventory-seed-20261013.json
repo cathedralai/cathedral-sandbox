@@ -1,0 +1,13 @@
+{
+  "schema": "cathedral_snp_staging_inventory_v1",
+  "stamp": "20261013T0816Z",
+  "provider_id": "cathedral-snp-staging-cherry-001",
+  "provider_row_id": "8e475491-9c51-462b-baef-81331766d5d2",
+  "slot_id": "cathedral-snp-staging-slot-001",
+  "slot_row_id": "53c3fbdb-23e3-4bf5-b8b8-cef73cb3c665",
+  "execution_profile": "systrap-snp-customer-v1",
+  "image_digest": "sha256:a7ad573bc5801d404525823ef670f632860fe2d41174c58a0df0c2ceac7abae5",
+  "claim_outcome": "RoutingOutcome.CHOSEN",
+  "slot_state_after_claim": "claimed",
+  "note": "Inventory seeded for broker. Guest still unqualified; no API create yet."
+}
