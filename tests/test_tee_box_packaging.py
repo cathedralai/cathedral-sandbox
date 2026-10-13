@@ -6,8 +6,12 @@ import re
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
-RUNSC_URL = "https://storage.googleapis.com/gvisor/releases/release/20260817.0/x86_64/runsc"
-RUNSC_SHA256 = "048b89aada69dc3333422e139d6e9d02f8ab06bda52398060e0fbdacca00074c"
+RUNSC_URL = "https://storage.googleapis.com/gvisor/releases/release/20261005.0/x86_64/gvisor.tar.bz2"
+GVISOR_TARBALL_SHA512 = (
+    "79869ae9a589355a46d46fdac068d9a954e741741ffe77c64e38c56ea955498c"
+    "1cb04e9bce44e1cce5155333e6b76bee72347c6661bb7c78fd2fe3aad198c8fe"
+)
+RUNSC_SHA256 = "210b437a9cfae51e8f8c9074ed19b8b5e59477178e2e391a18117d8d6b924f7a"
 BASE = (
     "python:3.12-slim-bookworm@"
     "sha256:4427763a1ba36f5aa8f656a03e5d00f3b8d61f5dd950c73df6c14f8c7640f8ab"
@@ -23,6 +27,8 @@ def test_the_opt_in_layer_pins_runsc_by_release_and_sha256():
     assert dockerfile.count(RUNSC_URL) == 1
     assert f"expected='{RUNSC_SHA256}'" in dockerfile
     assert "assert digest.hexdigest() == expected" in dockerfile
+    assert f"expected_tarball='{GVISOR_TARBALL_SHA512}'" in dockerfile
+    assert "filter='data'" in dockerfile
     assert f'org.cathedral.tee-box.runsc-sha256="{RUNSC_SHA256}"' in dockerfile
     assert "http://" not in dockerfile
     assert "# syntax=" not in dockerfile
