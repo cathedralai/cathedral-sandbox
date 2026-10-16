@@ -869,10 +869,11 @@ fails; creates never run unbounded.
 
 `Dockerfile.tee-box-runsc` is a separate, opt-in build. It takes an SN94
 TDX or SNP miner image pinned by digest (`MINER_IMAGE`, no default) and adds
-gVisor `runsc` from release `20260817.0`, the last weekly release that
-publishes runsc as a single binary. The build fetches it from Google's
-release bucket and refuses any file whose sha256 differs from the pinned
-one. `tests/test_tee_box_packaging.py` checks the pins.
+gVisor `runsc` from release `20261005.0`, the first release with the fixes
+for two public guest-to-host escapes (Oct 2026). The build fetches the
+release tarball from Google's bucket, refuses it unless its sha512 matches
+the published one, keeps only `runsc` and its `gvisor-bin/` sidecars, and
+refuses a `runsc` whose sha256 differs from the pinned one. `tests/test_tee_box_packaging.py` checks the pins.
 
 The production `Dockerfile.sn94-audit-miner` and `Dockerfile.sn94-snp-miner`,
 their publishers and their runtime contracts are unchanged. Adding runsc to
