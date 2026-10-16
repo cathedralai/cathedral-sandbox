@@ -41,7 +41,7 @@ def test_mining_guide_is_the_single_current_operator_path() -> None:
         "One admission observed on SN39 at block 9025398 (observed on chain; unverified in-repo)",
         "SN94 status pending verification",
         "7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b",
-        "7e414f0112b2e6460f7be4e1910fc419c1f32a871d4246ebfa68135c29fd6a80",
+        "3e1cb9144417e1e0d526445a43245e305e772cae0568202a332183071ef0c584",
         "current migration bridge",
         "btcli axon set",
         "/usr/local/libexec/cathedral/run-sn94-miner",
@@ -166,9 +166,9 @@ def test_amd_friend_test_creates_exact_launcher_directories() -> None:
 def test_snp_operator_surfaces_pin_the_published_image_without_placeholders() -> None:
     image_ref = (
         "ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:"
-        "7e414f0112b2e6460f7be4e1910fc419c1f32a871d4246ebfa68135c29fd6a80"
+        "3e1cb9144417e1e0d526445a43245e305e772cae0568202a332183071ef0c584"
     )
-    source_commit = "a22fb1df124ed3e4414335f109f30624152ff548"
+    source_commit = "dd7182ccd91ca25b566ff210025bdea5fda57c4c"
     placeholder = "REPLACE_WITH_" + "PUBLISHED_DIGEST"
     surfaces = (
         "docs/MINING.md",
