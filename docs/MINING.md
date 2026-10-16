@@ -119,13 +119,13 @@ test "$(docker image inspect "$TDX_IMAGE" --format \
   '{{index .Config.Labels "org.cathedral.sn94.runtime-contract"}}')" = \
   signed-validator-fleet-v1
 
-SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:7e414f0112b2e6460f7be4e1910fc419c1f32a871d4246ebfa68135c29fd6a80'
+SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:3e1cb9144417e1e0d526445a43245e305e772cae0568202a332183071ef0c584'
 docker pull --platform linux/amd64 "$SNP_IMAGE"
 test "$(docker image inspect "$SNP_IMAGE" --format '{{.Os}}/{{.Architecture}}')" = \
   linux/amd64
 test "$(docker image inspect "$SNP_IMAGE" --format \
   '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
-  a22fb1df124ed3e4414335f109f30624152ff548
+  dd7182ccd91ca25b566ff210025bdea5fda57c4c
 test "$(docker image inspect "$SNP_IMAGE" --format \
   '{{index .Config.Labels "org.cathedral.sn94.runtime-contract"}}')" = \
   snp-signed-validator-fleet-v1
