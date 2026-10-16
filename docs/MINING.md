@@ -108,24 +108,24 @@ If Docker and registry access are available, inspect the published Intel image
 without starting it:
 
 ```bash
-TDX_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99'
+TDX_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b'
 docker pull --platform linux/amd64 "$TDX_IMAGE"
 test "$(docker image inspect "$TDX_IMAGE" --format '{{.Os}}/{{.Architecture}}')" = \
   linux/amd64
 test "$(docker image inspect "$TDX_IMAGE" --format \
   '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
-  78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+  a22fb1df124ed3e4414335f109f30624152ff548
 test "$(docker image inspect "$TDX_IMAGE" --format \
   '{{index .Config.Labels "org.cathedral.sn94.runtime-contract"}}')" = \
   signed-validator-fleet-v1
 
-SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255'
+SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:7e414f0112b2e6460f7be4e1910fc419c1f32a871d4246ebfa68135c29fd6a80'
 docker pull --platform linux/amd64 "$SNP_IMAGE"
 test "$(docker image inspect "$SNP_IMAGE" --format '{{.Os}}/{{.Architecture}}')" = \
   linux/amd64
 test "$(docker image inspect "$SNP_IMAGE" --format \
   '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = \
-  8dde6eaca27116eed53386a1fa33ec70b74a01fb
+  a22fb1df124ed3e4414335f109f30624152ff548
 test "$(docker image inspect "$SNP_IMAGE" --format \
   '{{index .Config.Labels "org.cathedral.sn94.runtime-contract"}}')" = \
   snp-signed-validator-fleet-v1
@@ -160,14 +160,14 @@ before registration. The commands below install and run one foreground worker.
 ### 1. Check the host
 
 The pinned checkout below supplies reviewed runtime code only. Its local
-README and MINING files predate the direct validator and are obsolete. Keep
-following this current GitHub mining guide after the checkout.
+README and MINING files are older copies of this guide. Keep following this
+current GitHub mining guide after the checkout.
 
 ```bash
 git clone https://github.com/cathedralai/cathedral-sandbox.git cathedral-runtime
-git -C cathedral-runtime checkout --detach 78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+git -C cathedral-runtime checkout --detach a22fb1df124ed3e4414335f109f30624152ff548
 test "$(git -C cathedral-runtime rev-parse HEAD)" = \
-  78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+  a22fb1df124ed3e4414335f109f30624152ff548
 test -z "$(git -C cathedral-runtime status --porcelain)"
 
 python3.12 -m venv cathedral-runtime/.venv
@@ -201,9 +201,9 @@ files and keep following this current GitHub mining guide.
 
 ```bash
 git clone https://github.com/cathedralai/cathedral-sandbox.git cathedral-access
-git -C cathedral-access checkout --detach 78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+git -C cathedral-access checkout --detach a22fb1df124ed3e4414335f109f30624152ff548
 test "$(git -C cathedral-access rev-parse HEAD)" = \
-  78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
+  a22fb1df124ed3e4414335f109f30624152ff548
 test -z "$(git -C cathedral-access status --porcelain)"
 
 python3.12 -m venv cathedral-access/.venv
@@ -283,7 +283,7 @@ which is the floor minus the 120-second maximum request lifetime. The reset
 prints `replay_floor` and `requests_resume_at`, and the worker logs both,
 at most once a minute, while it refuses. Only images built from a revision
 that includes `cathedral worker reset-replay-clock` have this command. The
-image pinned in step 3 predates it.
+image pinned in step 3 includes it.
 
 The `init-key` command prints `keys_digest sha256:...`. Keep the value after
 `keys_digest` for step 3.
@@ -370,7 +370,7 @@ On each worker, install the refresher checkout, the path checker, and the fetch
 units. The worker needs only the base package, not the chain client:
 
 ```bash
-REFRESHER_REVISION='REVIEWED_REVISION_THAT_SHIPS_THE_REFRESHER'
+REFRESHER_REVISION='a22fb1df124ed3e4414335f109f30624152ff548'
 sudo git clone https://github.com/cathedralai/cathedral-sandbox.git \
   /opt/cathedral-validator-access
 sudo git -C /opt/cathedral-validator-access checkout --detach "$REFRESHER_REVISION"
@@ -396,8 +396,9 @@ sudo systemctl enable --now cathedral-validator-access-fetch.timer
 
 In both env files, replace the `<NETWORK>` and `<NETUID>` placeholders for
 `CATHEDRAL_VALIDATOR_ACCESS_NETWORK` and `CATHEDRAL_VALIDATOR_ACCESS_NETUID`
-with the chain network and subnet the worker image checks. Neither has a
-default, and both commands refuse the placeholders. Set
+with the chain network and subnet the worker image checks: `finney` and `94`
+for the images pinned on this page. Neither has a default, and both commands
+refuse the placeholders. Set
 `CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST` to the `keys_digest` value. On the
 worker, set `CATHEDRAL_VALIDATOR_ACCESS_SOURCE` to the published URL or path. A
 local-path source must be world-readable and outside `/home`. The fetch service
@@ -452,11 +453,11 @@ protected route closes until a fresh snapshot arrives.
 The current live-testing image is immutable:
 
 ```text
-ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99
+ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b
 ```
 
 ```bash
-export SN94_AUDIT_MINER_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99'
+export SN94_AUDIT_MINER_IMAGE='ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b'
 export CATHEDRAL_MINER_HOTKEY='YOUR_PUBLIC_HOTKEY'
 export CATHEDRAL_PUBLIC_ENDPOINT='https://YOUR_PUBLIC_IPV4:8081'
 export CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST='PASTE_KEYS_DIGEST_VALUE'

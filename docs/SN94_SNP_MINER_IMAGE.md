@@ -9,11 +9,11 @@ mode.
 The current anonymous `linux/amd64` image is:
 
 ```text
-ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255
+ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:7e414f0112b2e6460f7be4e1910fc419c1f32a871d4246ebfa68135c29fd6a80
 ```
 
 Its OCI revision label is
-`8dde6eaca27116eed53386a1fa33ec70b74a01fb` and its fixed runtime-contract
+`a22fb1df124ed3e4414335f109f30624152ff548` and its fixed runtime-contract
 label is `snp-signed-validator-fleet-v1`. The immutable digest proves the
 published bytes available from GHCR. It does not prove a running SNP machine,
 vendor evidence, validator admission, or an on-chain weight.

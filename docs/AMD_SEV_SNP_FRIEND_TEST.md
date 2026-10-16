@@ -297,7 +297,7 @@ Do not install a launcher from a different source revision. Start with the
 published immutable image reference:
 
 ```bash
-SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255'
+SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:7e414f0112b2e6460f7be4e1910fc419c1f32a871d4246ebfa68135c29fd6a80'
 docker pull --platform linux/amd64 "$SNP_IMAGE"
 test "$(docker image inspect "$SNP_IMAGE" \
   --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
@@ -307,7 +307,7 @@ test "$(docker image inspect "$SNP_IMAGE" \
 SOURCE_COMMIT="$(docker image inspect \
   --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
   "$SNP_IMAGE")"
-test "$SOURCE_COMMIT" = 8dde6eaca27116eed53386a1fa33ec70b74a01fb
+test "$SOURCE_COMMIT" = a22fb1df124ed3e4414335f109f30624152ff548
 
 git clone https://github.com/cathedralai/cathedral-sandbox.git cathedral-snp-runtime
 git -C cathedral-snp-runtime checkout --detach "$SOURCE_COMMIT"
@@ -317,27 +317,11 @@ test -z "$(git -C cathedral-snp-runtime status --porcelain)"
 
 On the separate miner-controlled host, follow only the
 [Refresh validator access from a control host](MINING.md#2-refresh-validator-access-from-a-control-host)
-procedure, at a reviewed revision that ships its `refresh` and `fetch`
-commands. Do not run the mining guide's TDX host or image steps. Keep the snapshot
+procedure, at `$SOURCE_COMMIT`. That revision ships the `refresh` and `fetch`
+commands (#211), and its worker reloads `fleet.json` without a restart (#210).
+Do not run the mining guide's TDX host or image steps. Keep the snapshot
 signing seed on the control host. Transfer only `snapshot-keys.json` and the
 fresh `validator-access.json` to the SNP guest.
-
-Two notes apply only while the pinned image's `SOURCE_COMMIT` is
-`8dde6eaca27116eed53386a1fa33ec70b74a01fb`, which predates #210 and #211:
-
-- Do not use `$SOURCE_COMMIT` for the control-host procedure. At `8dde6ea`,
-  `scripts/cathedral_validator_access.py` has only `init-key`, `capture`, and
-  `verify`, so the refresh and fetch timers cannot run. Use a later reviewed
-  revision instead. Both revisions sign and verify the same
-  `cathedral_validator_access_snapshot_v1` document, so the `8dde6ea` image
-  accepts what the newer refresher publishes.
-- The `8dde6ea` worker predates live `fleet.json` reloading (#210). Restart the
-  miner unit after changing `fleet.json`.
-
-Once the SNP pin moves to a source commit that includes #210 and #211 (#226
-moves it to `a66d7c4ca970487026c130610ee9efefa0416a07`), neither note applies:
-run the control-host procedure at `$SOURCE_COMMIT` itself, and the worker
-reloads `fleet.json` without a restart.
 
 On the guest, create both private destinations first. The launcher refuses
 linked, non-root-owned, or group/world-accessible access state:
