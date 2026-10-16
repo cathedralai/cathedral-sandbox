@@ -566,3 +566,31 @@ def test_host_startup_uses_fixed_owner_checked_mounts_and_container_limits() -> 
     assert "BEARER" not in script
     assert "SEED" not in script
     assert "RPC" not in script
+
+
+def test_image_chain_defaults_to_mainnet(tmp_path):
+    from cathedral.audit_miner_entrypoint import load_image_chain
+    assert load_image_chain(tmp_path / "absent.json") == ("finney", 94)
+
+
+def test_image_chain_accepts_testnet_584(tmp_path):
+    from cathedral.audit_miner_entrypoint import load_image_chain
+    path = tmp_path / "image_chain.json"
+    path.write_text('{"network":"test","netuid":584}')
+    assert load_image_chain(path) == ("test", 584)
+
+
+@pytest.mark.parametrize("body", [
+    '{"network":"finney","netuid":584}',
+    '{"network":"test","netuid":94}',
+    '{"network":"test","netuid":true}',
+    '{"network":"test"}',
+    '{"network":"test","netuid":584,"extra":1}',
+    '[]',
+])
+def test_image_chain_refuses_other_pairs(tmp_path, body):
+    from cathedral.audit_miner_entrypoint import load_image_chain
+    path = tmp_path / "image_chain.json"
+    path.write_text(body)
+    with pytest.raises(RuntimeError):
+        load_image_chain(path)

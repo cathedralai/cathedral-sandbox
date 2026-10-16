@@ -29,6 +29,16 @@ RUN python -c "import hashlib,pathlib,urllib.request; url='https://github.com/vi
 
 COPY cathedral/ /usr/local/lib/python3.12/site-packages/cathedral/
 
+# Fix the served subnet in the image: finney-94 (default, mainnet) or test-584
+# (the public testnet rehearsal). The entrypoint refuses any other pair.
+ARG CATHEDRAL_IMAGE_CHAIN=finney-94
+RUN case "$CATHEDRAL_IMAGE_CHAIN" in \
+      finney-94) ;; \
+      test-584) printf '{"network":"test","netuid":584}' > /usr/local/lib/python3.12/site-packages/cathedral/image_chain.json ;; \
+      *) echo "unsupported CATHEDRAL_IMAGE_CHAIN=$CATHEDRAL_IMAGE_CHAIN" >&2; exit 1 ;; \
+    esac
+LABEL org.cathedral.image-chain="${CATHEDRAL_IMAGE_CHAIN}"
+
 # Refuse the build if the exact sr25519 wheel cannot verify the fixed positive
 # vector or reject its corrupted negative control.
 RUN python -I -c 'import cathedral.snp_miner_entrypoint, cathedral.cli; from cathedral.validator_access import load_sr25519_verifier, preflight_sr25519_verifier; preflight_sr25519_verifier(load_sr25519_verifier())'
