@@ -12,12 +12,12 @@
 ## Blocked — need from you
 1. **Staging `cat_sk` value** for key `b30b7437-7d2d-53fc-b7b4-97f4f47f9081` (secure channel)  
 2. **These 6 Polaris files** from `acaa2961` / `66deb72e` (ZIP only has tiny deltas):
-   - `polaris/db/snp_runtime.py`
-   - `polaris/providers/broker_runtime_connector_proposal.py`
-   - `polaris/providers/snp_customer_adapter_proposal.py`
-   - `polaris/providers/snp_postgres_journal_proposal.py`
-   - `polaris/providers/snp_selected_runtime_proposal.py`
-   - `tests/test_snp_customer_adapter_proposal.py`
+   - `polariscomputer/polaris/db/snp_runtime.py`
+   - `polariscomputer/polaris/providers/broker_runtime_connector_proposal.py`
+   - `polariscomputer/polaris/providers/snp_customer_adapter_proposal.py`
+   - `polariscomputer/polaris/providers/snp_postgres_journal_proposal.py`
+   - `polariscomputer/polaris/providers/snp_selected_runtime_proposal.py`
+   - `polariscomputer/tests/test_snp_customer_adapter_proposal.py`
 3. Image/policy accept to boot the new guest  
 4. 15-min central grant **after** guest HTTPS is up  
 
