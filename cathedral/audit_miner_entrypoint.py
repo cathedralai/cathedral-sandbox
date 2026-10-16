@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import ipaddress
+import json
 import os
 import re
 import stat
@@ -50,8 +51,28 @@ TLS_CERTIFICATE = "worker.crt"
 TLS_PRIVATE_KEY = "worker.key"
 WORKER_HOST = "0.0.0.0"
 WORKER_PORT = 8081
-VALIDATOR_NETWORK = "finney"
-VALIDATOR_NETUID = 94
+# The subnet the worker serves is fixed per image. A build writes image_chain.json
+# beside this module (Dockerfile build arg CATHEDRAL_IMAGE_CHAIN); without it the
+# worker serves mainnet. Only these pairs exist, so a built image cannot be
+# pointed at another subnet at run time.
+IMAGE_CHAIN_FILE = Path(__file__).with_name("image_chain.json")
+ALLOWED_IMAGE_CHAINS = frozenset({("finney", 94), ("test", 584)})
+
+
+def load_image_chain(path: Path = IMAGE_CHAIN_FILE) -> tuple[str, int]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ("finney", 94)
+    if not isinstance(raw, dict) or set(raw) != {"network", "netuid"}:
+        raise RuntimeError("image_chain.json must hold exactly network and netuid")
+    chain = (raw["network"], raw["netuid"])
+    if isinstance(chain[1], bool) or chain not in ALLOWED_IMAGE_CHAINS:
+        raise RuntimeError(f"image chain {chain!r} is not an allowed subnet")
+    return chain
+
+
+VALIDATOR_NETWORK, VALIDATOR_NETUID = load_image_chain()
 VALIDATOR_MINIMUM_STAKE_RAO = 0
 
 _ALLOWED_CATHEDRAL_INPUTS = frozenset(
