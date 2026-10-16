@@ -1,0 +1,121 @@
+{
+  "stage": "LIVE_MATRIX_FG_FINISH_CORRECTED_20261012",
+  "guest": "ssh -p 2225 root@84.32.220.48",
+  "worker": "127.0.0.1:8443 serve-snp",
+  "handoff": "toby-handoff-20261012",
+  "BOX_DIGEST": "sha256:01487b00ad03dbf31087a3a048ef661d6800b1c64c77b285f16d8269d7395c74",
+  "order": "A2\u2192B3\u2192Box4\u2192A5\u2192Box6\u2192Sibling7\u2192A8",
+  "post_state": {
+    "delegation_high_water": 8,
+    "revocations_sequence": 3
+  },
+  "fred_required": {
+    "different_customer_409": {
+      "ok": true,
+      "status": 409,
+      "body": {
+        "error": "another customer used this boot; the VM must be relaunched first",
+        "reason": "relaunch_required"
+      },
+      "note": "checker initially false-failed because _reason preferred free-text error over reason field; live body is correct"
+    },
+    "missing_scope_401": {
+      "ok": true,
+      "lease": {
+        "status": 401,
+        "body": {
+          "error": "unauthorized"
+        }
+      },
+      "list": {
+        "status": 401,
+        "body": {
+          "error": "unauthorized"
+        }
+      },
+      "revocations": {
+        "status": 401,
+        "body": {
+          "error": "unauthorized"
+        }
+      },
+      "contrast": "Box4 GET /v1/box was 200 with tee-box:box only"
+    },
+    "revoked_401": {
+      "ok": true,
+      "status": 401,
+      "body": {
+        "error": "unauthorized"
+      },
+      "proof": "offline Box6 verify PASS (digest matches receipt); Box4 same key GET 200 before rev3; Box6 first live GET 401 after rev3; Sibling7 GET 200; revoke checked before high-water raise so seq6 did not stick"
+    },
+    "sibling_200": {
+      "ok": true,
+      "status": 200,
+      "revocations_sequence": 3
+    }
+  },
+  "steps": [
+    {
+      "id": "offline.box6",
+      "ok": true
+    },
+    {
+      "id": "A2.rev2",
+      "ok": true
+    },
+    {
+      "id": "A2.lease",
+      "ok": true
+    },
+    {
+      "id": "A2.release",
+      "ok": true,
+      "needs_relaunch": true
+    },
+    {
+      "id": "B3",
+      "ok": true,
+      "status": 409,
+      "reason": "relaunch_required"
+    },
+    {
+      "id": "Box4.get",
+      "ok": true,
+      "status": 200
+    },
+    {
+      "id": "Box4.scope",
+      "ok": true,
+      "statuses": [
+        401,
+        401,
+        401
+      ]
+    },
+    {
+      "id": "A5.lease",
+      "ok": true
+    },
+    {
+      "id": "A5.rev3",
+      "ok": true,
+      "revocations_sequence": 3
+    },
+    {
+      "id": "Box6",
+      "ok": true,
+      "status": 401
+    },
+    {
+      "id": "Sibling7",
+      "ok": true,
+      "status": 200
+    },
+    {
+      "id": "A8",
+      "ok": true
+    }
+  ],
+  "verdict": "PASS \u2014 all four Fred-required proofs captured on measured :2225"
+}

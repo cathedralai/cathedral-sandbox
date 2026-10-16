@@ -1,0 +1,29 @@
+{
+  "schema": "cathedral_snp_staging_broker_proof_v1",
+  "stamp": "20261013T0755Z",
+  "wrong_profile_outcome": "RoutingOutcome.NO_CAPACITY",
+  "wrong_profile_ok": true,
+  "claim": {
+    "outcome": "RoutingOutcome.CHOSEN",
+    "provider_id": "c4636a8d-2749-4837-a501-a41c6a373900",
+    "slot_row_id": "939d38b1-a0b6-415f-a33c-e890c2dba0c1",
+    "physical_slot_id": "snp-staging-slot-56cd7d63-cd39-4272-933a-045f248351ab",
+    "attempt_id": "031032a7-3bb0-4fec-9e2e-6e9b7ea1f39a",
+    "slot_state": "claimed",
+    "execution_profile": "systrap-snp-customer-v1"
+  },
+  "claim_ok": true,
+  "postgres": "127.0.0.1:55432/cathedral_snp_staging",
+  "broker_flag": "cathedral_capacity_broker_enabled=true",
+  "environment": "staging",
+  "missing_for_full_customer_path": [
+    "polaris/db/snp_runtime.py (acaa2961 base)",
+    "polaris/providers/broker_runtime_connector_proposal.py",
+    "polaris/providers/snp_customer_adapter_proposal.py",
+    "polaris/providers/snp_postgres_journal_proposal.py",
+    "polaris/providers/snp_selected_runtime_proposal.py",
+    "tests/test_snp_customer_adapter_proposal.py",
+    "staging API key + 15-min central grant + booted SNP guest"
+  ],
+  "official_railway": "https://polariscomputer-staging-staging.up.railway.app still cold acaa2961; not used for this proof"
+}

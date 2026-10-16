@@ -1,0 +1,86 @@
+{
+  "schema": "cathedral_live_customer_smoke_v1",
+  "stamp": "20261012T2041Z",
+  "base": "https://cathedral.computer",
+  "purpose": "Fred: live customer API smoke \u2014 create/run/result/delete; check intended worker + usage/receipts. Start small.",
+  "fred_target_worker": "measured SNP (tee-box :2225) \u2014 NOT available as customer hardware_class",
+  "actual_path": "POST /v1/workers attest.v1 one_shot tdx_cpu (--.20 list price)",
+  "key_prefix": "cat_sk_E-j9h",
+  "account_email_redacted": "mylifeandbooks@gmail.com",
+  "idempotency_key": "smoke-snp-gap-20261012T2041Z-98353",
+  "worker_id": "fd75e2b2-20da-4206-a596-579e4a8d761e",
+  "credits_before_usd": 51.844001,
+  "credits_after_usd": 51.644001,
+  "credit_delta_usd": 0.19999999999999574,
+  "create": {
+    "id": "fd75e2b2-20da-4206-a596-579e4a8d761e",
+    "object": "worker",
+    "status": "pending",
+    "profile": "attest.v1",
+    "profile_id": "attest.v1",
+    "links": {
+      "self": "/v1/workers/fd75e2b2-20da-4206-a596-579e4a8d761e",
+      "receipt": "/v1/receipts/fd75e2b2-20da-4206-a596-579e4a8d761e"
+    }
+  },
+  "final_status": "completed",
+  "poll_summary": {
+    "id": "fd75e2b2-20da-4206-a596-579e4a8d761e",
+    "status": "completed",
+    "profile_id": "attest.v1",
+    "links": {
+      "self": "/v1/workers/fd75e2b2-20da-4206-a596-579e4a8d761e",
+      "receipt": "/v1/receipts/fd75e2b2-20da-4206-a596-579e4a8d761e"
+    }
+  },
+  "result_summary": {
+    "detail": {
+      "error": {
+        "code": "workers_job_not_found",
+        "message": "Workers job was not found.",
+        "retryable": false
+      }
+    }
+  },
+  "receipt_summary": {
+    "receipt_id": "fd75e2b2-20da-4206-a596-579e4a8d761e",
+    "schema": "cathedral_customer_receipt_v1",
+    "receipt_status": "ready",
+    "execution_class": "tdx_cpu",
+    "cpu_tee": "intel_tdx",
+    "profile_id": "attest.v1",
+    "execution_outcome": "succeeded",
+    "billed": true,
+    "billing_status": "billed",
+    "billing_outcome": "charged",
+    "intel_verified": true,
+    "execution_binding_verified": true,
+    "teardown_confirmed": true,
+    "signed": true,
+    "signing_key_id": "cathedral-customer-receipt-2026-07-31-01",
+    "issued_at": "2026-10-12T20:43:39.461198Z",
+    "policy_digest": "sha256:c7ff160107c32648e99773feacaaff4f5a4dae059ef237ac8992b2a6fae743eb"
+  },
+  "flags": [
+    "MISSING_CONNECTION: customer /v1/profiles has no snp/sev_snp hardware_class; create cannot target measured SNP :2225. Run landed on tdx_cpu (tee_attestation.kind=tdx-1.5).",
+    "RECEIPT_OK: cathedral_customer_receipt_v1 signed/ready on /v1/receipts/{id}; billed $0.20.",
+    "USAGE_OK: credits 51.844001 -> 51.644001 (delta $0.20).",
+    "RESULT_ROUTE_GAP: GET /v1/workers/result?request_id= returned workers_job_not_found; result+artifacts live on GET /v1/workers/{id} for attest one-shot.",
+    "CLEANUP_OK: lifecycle.cleanup_state=deleted (one-shot auto-delete; no separate DELETE needed)."
+  ],
+  "note": "API key not stored in evidence. Staging unit-capacity soak still separate.",
+  "lifecycle": {
+    "provider_safety_deadline": "2026-10-12T21:01:16Z",
+    "cleanup_state": "deleted",
+    "cleanup_confirmed_at": "2026-10-12T20:43:39Z",
+    "environment": "fresh",
+    "cleanup_requested_at": "2026-10-12T20:42:48Z"
+  },
+  "result_on_worker": {
+    "exit_code": 0,
+    "artifact_text": "cathedral-live-smoke-ok\\n",
+    "artifact_sha256": "789e41d09aaf0d53cf2ef6390be29b5b505ba669662b9ec63827bf9fc7a9aa40",
+    "tee_kind": "tdx-1.5",
+    "receipt_status": "ready"
+  }
+}

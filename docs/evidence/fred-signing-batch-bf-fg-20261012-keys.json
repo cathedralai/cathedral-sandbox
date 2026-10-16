@@ -1,0 +1,43 @@
+{
+  "_comment": "Public keys only for Fred signing batch 2026-10-12. Private seeds stay with Toby under Cathedral/.secrets/snp-central-2225/.",
+  "network": "finney",
+  "netuid": 94,
+  "root_key_id": "cathedral-root-1",
+  "continue_ledger_from_sequence": 2,
+  "previous_revocations_sequence": 1,
+  "valid_hours": 24,
+  "identities": {
+    "A_full": {
+      "label": "toby-snp-2225-a",
+      "public_key_base64": "wgyQxlR1GNnuVDnextSRonGLkB4geLh3bw4P6DIqoIA=",
+      "routes": "full TEE_BOX_CENTRAL_SCOPES",
+      "planned_sequences": [2, 6],
+      "notes": "seq2 renewal (seq1 expired); seq6 post high-water after B"
+    },
+    "B_full": {
+      "label": "toby-snp-2225-b",
+      "public_key_base64": "LmIlQv2lDW8JAZc4Nfgh8TOPYSjRVuhfCecFJBseDAM=",
+      "routes": "full TEE_BOX_CENTRAL_SCOPES",
+      "planned_sequences": [3],
+      "notes": "different-customer test → expect 409 relaunch_required"
+    },
+    "box_only": {
+      "label": "toby-snp-2225-box",
+      "public_key_base64": "emZAvtFBPcTr+EvSzwq/vQtePuUmO5nM9pefHTAHtZQ=",
+      "routes": ["tee-box:box"],
+      "planned_sequences": [4],
+      "notes": "least-privilege + revoke target for rev list seq3"
+    },
+    "sibling_box": {
+      "label": "toby-snp-2225-sibling",
+      "public_key_base64": "EtqqmeCBtBQAw+B+AojE490oBfa0Xm2Z8QLxIJ1eTqw=",
+      "routes": ["tee-box:box"],
+      "planned_sequences": [5],
+      "notes": "unrevoked partner after box-only is revoked"
+    }
+  },
+  "revocations": {
+    "seq2": "fresh empty carry-forward from seq1 (--previous seq1 file)",
+    "seq3": "revoke box_only seq4 digest only; sibling stays valid"
+  }
+}

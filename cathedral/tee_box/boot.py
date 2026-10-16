@@ -18,13 +18,16 @@ refuses every caller until the next boot.
 The record, and the boot id, protect only against a box that is not
 relaunched while the guest kernel is intact. A tenant that escapes gVisor into
 the guest kernel controls this code, the file and the boot id. What holds
-against guest root is the RTMR3 extend: before a boot's first lease is
+against guest root on TDX is the RTMR3 extend: before a boot's first lease is
 granted, the box extends TDX RTMR3 once with ``LEASE_EVENT``. Nothing in the
 guest can undo an extend, so every later quote of that boot carries
 ``RTMR3_CONSUMED`` instead of zeros, and admission with
 ``require_fresh_boot=True`` (cathedral/capacity/admission.py) refuses it until
-the VM is relaunched. See docs/TEE_BOX_SERVICE.md, "Relaunch between
-customers".
+the VM is relaunched. On SEV-SNP there is no RTMR; the box uses
+:class:`SoftwareLeaseRegister` for the same one-customer-per-boot bookkeeping
+inside the guest. That register is not hardware-backed and does not appear in
+the SNP report, so ``require_fresh_boot`` admission remains unavailable on SNP.
+See docs/TEE_BOX_SERVICE.md, "Relaunch between customers".
 """
 
 from __future__ import annotations
@@ -122,6 +125,79 @@ class SysfsRtmr3:
             raise RtmrError(f"cannot extend RTMR3 at {self.path}: {exc}") from exc
         if written != RTMR_BYTES:
             raise RtmrError(f"{self.path} took {written} of 48 bytes")
+
+
+class SoftwareLeaseRegister:
+    """Guest-local lease digest for SEV-SNP. Not hardware-backed.
+
+    Mimics the RTMR3 read/extend ABI so :class:`BootGuard` can enforce one
+    customer per boot inside the guest. The value lives next to the boot
+    marker on the same tmpfs; a relaunch empties it with the marker. A quote
+    does not carry this value, and SNP admission with ``require_fresh_boot``
+    remains unavailable until a hardware-backed register exists.
+    """
+
+    def __init__(self, path: str) -> None:
+        if not isinstance(path, str) or not path:
+            raise ValueError("software lease register path must be a non-empty string")
+        self.path = path
+        self.hardware_backed = False
+
+    def read(self) -> bytes:
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                value = os.read(fd, RTMR_BYTES + 1)
+            finally:
+                os.close(fd)
+        except FileNotFoundError:
+            return bytes(RTMR_BYTES)
+        except OSError as exc:
+            raise RtmrError(
+                f"cannot read the software lease register from {self.path}: {exc}"
+            ) from exc
+        if len(value) != RTMR_BYTES:
+            raise RtmrError(f"{self.path} did not return 48 bytes")
+        return value
+
+    def extend(self, digest: bytes) -> None:
+        if not isinstance(digest, bytes) or len(digest) != RTMR_BYTES:
+            raise RtmrError("the software lease register extend data must be 48 bytes")
+        landed = rtmr_extend(self.read(), digest)
+        temporary = f"{self.path}.tmp-{os.getpid()}"
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        try:
+            fd = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+            )
+            try:
+                written = os.write(fd, landed)
+            finally:
+                os.close(fd)
+            if written != RTMR_BYTES:
+                raise OSError(
+                    f"the software lease register took {written} of 48 bytes"
+                )
+            os.replace(temporary, self.path)
+        except OSError as exc:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise RtmrError(
+                f"cannot extend the software lease register at {self.path}: {exc}"
+            ) from exc
+
+
+def lease_register_path_for(central_state: str) -> str:
+    """The software lease register file for the central state at ``central_state``."""
+
+    return central_state + ".lease"
 
 
 def read_boot_id(path: str = BOOT_ID_PATH) -> str:

@@ -10,6 +10,7 @@ from cathedral.tee_box.boot import (
     BootGuard,
     RelaunchRequired,
     RtmrError,
+    SoftwareLeaseRegister,
     SysfsRtmr3,
 )
 from cathedral.tee_box.egress import EgressPolicy, EgressPolicyError, build_egress_policy
@@ -52,6 +53,7 @@ __all__ = [
     "RtmrError",
     "RunscExecutor",
     "Shape",
+    "SoftwareLeaseRegister",
     "SysfsRtmr3",
     "TeeBoxSandboxApi",
     "build_egress_policy",
