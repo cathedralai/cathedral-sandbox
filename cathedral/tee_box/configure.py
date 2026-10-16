@@ -45,6 +45,12 @@ from cathedral.tee_box.executor import (
     RunscExecutor,
     Shape,
 )
+from cathedral.tee_box.tunables import (
+    Tunables,
+    TunablesError,
+    default_tunables,
+    load_tunables_file,
+)
 from cathedral.tee_box.storage import (
     StorageError,
     StorageProbe,
@@ -76,6 +82,7 @@ OPTIONAL = (
     "tee_box_bandwidth_mbit",
     "tee_box_id",
     "tee_box_no_disk_quota",
+    "tee_box_tunables",
 )
 
 
@@ -146,6 +153,14 @@ def add_tee_box_arguments(command: argparse.ArgumentParser) -> None:
     )
     group.add_argument("--tee-box-id", help="container label for this box (default: default)")
     group.add_argument(
+        "--tee-box-tunables",
+        help=(
+            "start-up tunables file (JSON, docs/TEE_BOX_TUNABLES.md): runsc flags, log driver, "
+            "image priming, warm pool, create concurrency. Unknown keys are refused; "
+            "no file means today's behaviour"
+        ),
+    )
+    group.add_argument(
         "--tee-box-no-disk-quota",
         action="store_true",
         default=None,
@@ -167,6 +182,7 @@ class TeeBoxConfig:
     bandwidth_mbit: int
     box_id: str
     disk_quota: bool
+    tunables: Tunables
 
 
 def tee_box_config(args: argparse.Namespace) -> TeeBoxConfig | None:
@@ -198,6 +214,13 @@ def tee_box_config(args: argparse.Namespace) -> TeeBoxConfig | None:
         value = getattr(args, name, None)
         return default if value is None else value
 
+    tunables_path = getattr(args, "tee_box_tunables", None)
+    try:
+        tunables = (
+            default_tunables() if tunables_path is None else load_tunables_file(tunables_path)
+        )
+    except TunablesError as exc:
+        raise ValueError(f"--tee-box-tunables: {exc}") from exc
     return TeeBoxConfig(
         central_state=args.tee_box_central_state,
         executor=args.tee_box_executor,
@@ -211,6 +234,7 @@ def tee_box_config(args: argparse.Namespace) -> TeeBoxConfig | None:
         bandwidth_mbit=pick("tee_box_bandwidth_mbit", DEFAULT_BANDWIDTH_MBIT),
         box_id=pick("tee_box_id", "default"),
         disk_quota=not bool(getattr(args, "tee_box_no_disk_quota", None)),
+        tunables=tunables,
     )
 
 
@@ -347,6 +371,8 @@ def build_tee_box_api(
         storage_quota=config.disk_quota,
         runner=runner,
         box_id=config.box_id,
+        tunables=config.tunables,
+        warm_shape=config.default_shape,
     )
     registered, runtime_detail = executor.runtime_check()
     if not registered:
@@ -373,6 +399,7 @@ def build_tee_box_api(
         capacity=config.capacity,
         default_shape=config.default_shape,
         boot=boot,
+        create_concurrency=config.tunables.create_concurrency,
     )
     facts = {
         "central_root_keys": measured_root.CENTRAL_ROOT_KEYS_PATH,
@@ -391,6 +418,7 @@ def build_tee_box_api(
             "docker_root": docker_root,
             "scratch": scratch,
         },
+        "tunables": {"sha256": config.tunables.sha256, "values": config.tunables.nested()},
         "capacity": config.capacity.view(),
         "default_shape": config.default_shape.view(),
         "boot": {

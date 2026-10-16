@@ -27,9 +27,10 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from urllib.parse import parse_qsl
 
@@ -325,6 +326,7 @@ class TeeBoxSandboxApi:
         boot: BootGuard,
         max_lease_seconds: int = DEFAULT_MAX_LEASE_SECONDS,
         clock: Callable[[], float] = time.time,
+        create_concurrency: int = 1,
     ) -> None:
         if not isinstance(authorizer, CentralAccessAuthorizer):
             raise ValueError("the sandbox API requires a central access authorizer")
@@ -345,6 +347,20 @@ class TeeBoxSandboxApi:
         # pushed, and again whenever it is no longer fresh.
         self._revocations_issued_at: float | None = None
         self.boot = boot
+        if (
+            isinstance(create_concurrency, bool)
+            or not isinstance(create_concurrency, int)
+            or not 1 <= create_concurrency <= 16
+        ):
+            raise ValueError("create concurrency must be 1 to 16")
+        # Creates run outside the lease lock, up to this many at once. What an in-flight create
+        # will take is reserved under the lock first (so admission cannot overcommit), and a
+        # drain waits for every in-flight create (so none lands after the hand-over).
+        self._create_slots = threading.BoundedSemaphore(create_concurrency)
+        self._reserved = Shape(0, 0, 0)
+        self._reserved_count = 0
+        self._inflight = 0
+        self._inflight_cv = threading.Condition(threading.Lock())
         self.lease = CustomerLease(
             self._drain_owner, max_seconds=max_lease_seconds, clock=clock, boot=boot
         )
@@ -361,6 +377,14 @@ class TeeBoxSandboxApi:
         owner also blocks the hand-over.
         """
 
+        # The pool belongs to no customer: it goes at every hand-over. A create already past
+        # admission finishes first, so its sandbox is in the list when the deletes run.
+        discard = getattr(self.executor, "discard_warm", None)
+        if callable(discard):
+            discard()
+        with self._inflight_cv:
+            if not self._inflight_cv.wait_for(lambda: self._inflight == 0, timeout=300):
+                return False
         for info in self.executor.list():
             if info.spec.owner == owner:
                 try:
@@ -409,12 +433,45 @@ class TeeBoxSandboxApi:
                     self.executor.delete(info.sandbox_id)
                 except ExecutorError:
                     pass
+        self._maintain_pool()
+
+    def _maintain_pool(self) -> None:
+        """Keep the warm pool full while a customer holds the lease; empty it otherwise."""
+
+        maintain = getattr(self.executor, "maintain_pool", None)
+        if not callable(maintain):
+            return
+        # current() may run a drain, which must not happen under the lease lock.
+        held = self.lease.current() is not None and not self.lease.draining
+        with self.lease.locked():
+            room = self._room_locked() if held else 0
+        try:
+            maintain(enabled=held, room=room)
+        except ExecutorError:
+            pass
+
+    def _room_locked(self) -> int:
+        """How many more default-shape sandboxes fit, counting warm and in-flight ones."""
+
+        shape = self.default_shape
+        used = self._allocated().plus(self._reserved)
+        count = len(self.executor.list()) + self._reserved_count + self._warm_count()
+        fits = [
+            (getattr(self.capacity, name) - getattr(used, name)) // getattr(shape, name)
+            for name in ("vcpus", "memory_mib", "disk_mib")
+        ]
+        return max(0, min(*fits, MAX_SANDBOXES - count))
+
+    def _warm_count(self) -> int:
+        count = getattr(self.executor, "warm_count", None)
+        return count() if callable(count) else 0
 
     def _allocated(self) -> Shape:
         total = Shape(0, 0, 0)
         for info in self.executor.list():
             total = total.plus(info.spec.shape)
-        return total
+        usage = getattr(self.executor, "warm_usage", None)
+        return total.plus(usage()) if callable(usage) else total
 
     def _owned(self, caller: str, sandbox_id: str) -> SandboxInfo:
         info = self.executor.get(sandbox_id)
@@ -761,15 +818,14 @@ class TeeBoxSandboxApi:
             raise _Refusal(404, "image not imported")
         labels = _labels(document.get("labels"))
         env = _env(document.get("env"))
-        # Hold the lease lock so a drain cannot miss this sandbox.
+        # Admission and reservation happen under the lease lock; the create itself does not,
+        # so up to ``create_concurrency`` run at once. The reservation counts the new sandbox
+        # against the count and capacity until the executor has recorded it, and a drain waits
+        # for ``_inflight`` to reach zero, so a create cannot land after a hand-over.
+        warm = ""
         with self.lease.locked():
             self.lease.require_locked(caller)
-            sandboxes = self.executor.list()
-            if len(sandboxes) >= MAX_SANDBOXES or not self._allocated().plus(shape).fits_within(
-                self.capacity
-            ):
-                raise _Refusal(409, "the box has no room for this shape", "box_capacity_full")
-            spec = SandboxSpec(
+            probe = SandboxSpec(
                 sandbox_id="sbx-" + secrets.token_hex(12),
                 owner=caller,
                 image=image,
@@ -779,8 +835,51 @@ class TeeBoxSandboxApi:
                 env=env,
                 labels=labels,
             )
-            info = self.executor.create(spec)
+            reserve = getattr(self.executor, "reserve_warm", None)
+            if callable(reserve):
+                warm = reserve(probe)
+            try:
+                self._admit_locked(shape, warm)
+            except _Refusal:
+                if warm:
+                    self.executor.release_warm(warm, image.digest)  # type: ignore[attr-defined]
+                raise
+            spec = replace(probe, warm=warm)
+            self._reserved = self._reserved.plus(shape)
+            self._reserved_count += 1
+            with self._inflight_cv:
+                self._inflight += 1
+        try:
+            with self._create_slots:
+                info = self.executor.create(spec)
+        finally:
+            with self.lease.locked():
+                self._reserved = Shape(
+                    self._reserved.vcpus - shape.vcpus,
+                    self._reserved.memory_mib - shape.memory_mib,
+                    self._reserved.disk_mib - shape.disk_mib,
+                )
+                self._reserved_count -= 1
+            with self._inflight_cv:
+                self._inflight -= 1
+                self._inflight_cv.notify_all()
         return _json(201, self._sandbox_view(info))
+
+    def _admit_locked(self, shape: Shape, warm: str) -> None:
+        """Refuse unless the box has room for ``shape`` beyond what is listed, warm and in flight.
+
+        A reserved warm container has already left the pool, so it no longer counts as warm;
+        its slot is what the new sandbox takes. Idle warm containers are evicted to make room.
+        """
+
+        while True:
+            count = len(self.executor.list()) + self._reserved_count + self._warm_count()
+            used = self._allocated().plus(self._reserved)
+            if count < MAX_SANDBOXES and used.plus(shape).fits_within(self.capacity):
+                return
+            evict = getattr(self.executor, "evict_warm", None)
+            if not (callable(evict) and evict()):
+                raise _Refusal(409, "the box has no room for this shape", "box_capacity_full")
 
     def _get(self, caller, body, fields, sid: str) -> Response:  # noqa: ANN001
         return _json(200, self._sandbox_view(self._owned(caller, sid)))
