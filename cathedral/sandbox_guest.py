@@ -336,9 +336,12 @@ class DockerClient:
             argv.extend(list(entrypoint))
         else:
             argv.extend([image, "sleep", "infinity"])
-        result = self.run(argv, timeout=180.0)
+        result = self._run_guest(argv, name)
         if result.returncode != 0 and storage_opt:
             # Driver may reject size=; retry without it (API disk still enforced on /work).
+            # A failed docker run can leave a created container with this name.
+            # Remove it first, or the retry fails on a name conflict.
+            self.remove_confirmed(name, timeout=60.0)
             stripped = []
             skip_next = False
             for part in argv:
@@ -349,8 +352,9 @@ class DockerClient:
                     skip_next = True
                     continue
                 stripped.append(part)
-            result = self.run(stripped, timeout=180.0)
+            result = self._run_guest(stripped, name)
         if result.returncode != 0:
+            self.remove_confirmed(name, timeout=60.0)
             raise SandboxOpError(
                 "guest_start_failed",
                 502,
@@ -360,6 +364,15 @@ class DockerClient:
         if not container_id:
             raise SandboxOpError("guest_start_failed", 502, "docker run returned empty container id")
         return container_id
+
+    def _run_guest(self, argv: list[str], name: str) -> subprocess.CompletedProcess[str]:
+        """docker run; on a CLI timeout, remove the container it may have left."""
+        try:
+            return self.run(argv, timeout=180.0)
+        except SandboxOpError as exc:
+            if exc.code == "docker_timeout":
+                self.remove_confirmed(name, timeout=60.0)
+            raise
 
     def set_network(self, container_id: str, mode: str) -> None:
         """Apply egress mode on a live container. allowlist fails closed to none."""

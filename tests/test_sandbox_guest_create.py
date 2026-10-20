@@ -2,8 +2,8 @@
 
 Defects from the 2026-10-20 pool qualification run:
 1. every create ran docker pull;
-2. a pull failure left a ghost sandbox that held quota.
-
+2. a pull failure left a ghost sandbox that held quota;
+3. a failed docker run leaked a created container.
 """
 
 from __future__ import annotations
@@ -173,5 +173,33 @@ def test_idempotent_retry_after_pull_failure_creates_again(fake: FakeDocker) -> 
         doc = _create(provider, image="acme/flaky:1", key="retry-key-0001")
         assert doc["guest"]["container_id"]
         assert provider.get(doc["id"])["state"] == "running"
+    finally:
+        provider.close()
+
+
+# ---------------------------------------------------------------- D3: failed docker run
+def test_storage_opt_retry_does_not_leak_the_first_container(fake: FakeDocker) -> None:
+    fake.add_image("alpine:3.20")
+    fake.set(reject_storage_opt=True)
+    provider = DockerGuestProvider()
+    try:
+        doc = _create(provider)
+        containers = fake.containers
+        assert list(containers) == [doc["guest"]["container_id"]]
+        assert "--storage-opt" not in next(iter(containers.values()))["argv"]
+    finally:
+        provider.close()
+
+
+def test_failed_run_removes_partial_container_and_releases_quota(fake: FakeDocker) -> None:
+    fake.add_image("acme/broken:1")
+    fake.set(run_fail_images=["acme/broken:1"])
+    provider = DockerGuestProvider()
+    try:
+        with pytest.raises(SandboxOpError) as err:
+            _create(provider, image="acme/broken:1")
+        assert err.value.code == "guest_start_failed"
+        assert fake.containers == {}
+        assert _resident(provider) == 0
     finally:
         provider.close()
