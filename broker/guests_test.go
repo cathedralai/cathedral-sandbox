@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 )
@@ -239,3 +240,20 @@ func TestProbeAndCounterResetNeedOps(t *testing.T) {
 }
 
 func mustString(v any) string { return string(mustMarshal(v)) }
+
+func TestLimitsComeFromTheConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/config.json"
+	raw := `{"listen":"127.0.0.1:0","hotels":[],"guests":[{"id":"x","key_sha256":"ab","max_rooms":7,"max_creates_per_minute":3,"default_sealed":true,"hotels":["h1"],"ops":true}]}`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, err := loadBroker(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := b.guests["x"]
+	if l := g.limits; l.maxRooms() != 7 || l.MaxCreatesPerMinute != 3 || !l.DefaultSealed || len(l.Hotels) != 1 || l.Hotels[0] != "h1" || !g.cfg.Ops {
+		t.Fatalf("limits %+v ops %v", g.limits, g.cfg.Ops)
+	}
+}
