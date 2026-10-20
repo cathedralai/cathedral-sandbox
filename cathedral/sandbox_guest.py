@@ -11,6 +11,7 @@ guest, and no path that pretends Kata or DinD when they are absent.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import shlex
@@ -297,6 +298,9 @@ class GuestRecord:
     network_mode: str = "public"
     network: str | None = None  # room network that holds the guest's port (pool only)
     guest_processes: dict[str, Path] = field(default_factory=dict)
+    # How this guest's image runs a command under a time limit: "gnu"
+    # (timeout N), "busybox" (timeout -t N) or "none". None: not probed yet.
+    timeout_form: str | None = None
 
 
 class DockerClient:
@@ -898,6 +902,8 @@ class DockerGuestProvider:
         self._snapshot_images: dict[str, str] = {}
         self._snapshot_meta: dict[str, dict[str, Any]] = {}  # snapshot id -> sizes and image
         self._built_images: dict[str, str] = {}  # content_hash -> tag
+        self._build_locks: dict[str, threading.Lock] = {}  # tag -> lock; one build per tag
+        self._build_locks_guard = threading.Lock()
         # GC state. A sandbox id in _doomed has a "deleting" record and a container
         # that is not yet confirmed gone. Only one drain runs at a time.
         self._owner = os.environ.get("CATHEDRAL_SANDBOX_OWNER", "").strip() or "default"
@@ -969,6 +975,44 @@ class DockerGuestProvider:
 
     def authorize(self, api_key: str | None) -> None:
         self._inner.authorize(api_key)
+
+    def build_image(self, dockerfile: str, context: bytes | None = None) -> dict[str, Any]:
+        """Build *dockerfile* with an optional gzip tar *context*. Cached by content.
+
+        The tag is cathedral-build-<hash>:latest, where the hash covers the
+        Dockerfile and the context bytes. A second build of the same content
+        only checks that the image is present.
+        """
+        if not dockerfile.strip():
+            raise SandboxContractError("invalid_build", "dockerfile must not be empty")
+        digest = hashlib.sha256(dockerfile.encode("utf-8") + b"\0" + (context or b"")).hexdigest()
+        tag = f"cathedral-build-{digest[:16]}:latest"
+        with self._build_locks_guard:
+            lock = self._build_locks.setdefault(tag, threading.Lock())
+        with lock:
+            cached = self._client.image_exists(tag)
+            if not cached:
+                work = Path(tempfile.mkdtemp(prefix="cathedral-build-"))
+                try:
+                    if context:
+                        import io
+                        import tarfile
+
+                        try:
+                            with tarfile.open(fileobj=io.BytesIO(context), mode="r:*") as tf:
+                                tf.extractall(work, filter="data")
+                        except (tarfile.TarError, OSError) as exc:
+                            raise SandboxOpError("invalid_build_context", 400, f"build context is not a valid tar: {exc}") from exc
+                    (work / "Dockerfile").write_text(dockerfile, encoding="utf-8")
+                    self._client.build(tag=tag, context_dir=work)
+                finally:
+                    shutil.rmtree(work, ignore_errors=True)
+        return {
+            "image": tag,
+            "content_hash": "sha256:" + digest,
+            "cached": cached,
+            "size_bytes": self._client.image_size(tag),
+        }
 
     def _build_image(self, request: CreateSandboxRequest) -> str:
         assert request.build is not None
@@ -1235,27 +1279,26 @@ class DockerGuestProvider:
             argv[0] = "sh"
         timeout_seconds = request.timeout_seconds or 60
         # Enforce timeout inside the guest so the container stays alive (§3.2).
-        # Try GNU timeout first, then BusyBox ``timeout -t``.
-        candidates = [
-            ["timeout", str(timeout_seconds), *argv],
-            ["timeout", "-t", str(timeout_seconds), *argv],
-            argv,
-        ]
+        # The timeout form of the image is probed once with a no-op command.
+        # The customer command runs exactly once: an exit code of 127 from it
+        # is its own result, not a sign that the timeout binary is missing.
+        form = self._timeout_form(guest)
+        if form == "gnu":
+            wrapped = ["timeout", str(timeout_seconds), *argv]
+        elif form == "busybox":
+            wrapped = ["timeout", "-t", str(timeout_seconds), *argv]
+        else:
+            wrapped = argv
         t0 = time.perf_counter()
-        code, out, err, timed_out = 1, "", "", False
-        for wrapped in candidates:
-            code, out, err, timed_out = self._client.exec(
-                guest.container_id,
-                wrapped,
-                cwd=cwd,
-                env={**dict(request.env)},
-                timeout_seconds=timeout_seconds + 15 if wrapped is not argv else timeout_seconds,
-                stdin=request.stdin,
-                user=request.user,
-            )
-            # 127 = command not found (no timeout binary) — try next form.
-            if wrapped is argv or code != 127:
-                break
+        code, out, err, timed_out = self._client.exec(
+            guest.container_id,
+            wrapped,
+            cwd=cwd,
+            env={**dict(request.env)},
+            timeout_seconds=timeout_seconds + 15 if wrapped is not argv else timeout_seconds,
+            stdin=request.stdin,
+            user=request.user,
+        )
         # GNU timeout → 124; BusyBox/KILL → 137/143; client-side timeout flag.
         if code in {124, 137, 143} or timed_out:
             timed_out = True
@@ -1283,6 +1326,24 @@ class DockerGuestProvider:
             timed_out=timed_out,
             truncated=truncated,
         )
+
+    def _timeout_form(self, guest: GuestRecord) -> str:
+        """Return "gnu", "busybox" or "none" for the guest image. Probe once.
+
+        The probe runs only "true", so a repeat has no side effect.
+        """
+        if guest.timeout_form is not None:
+            return guest.timeout_form
+        form = "none"
+        for name, probe in (("gnu", ["timeout", "5", "true"]), ("busybox", ["timeout", "-t", "5", "true"])):
+            code, _, _, _ = self._client.exec(
+                guest.container_id, probe, cwd=None, env={}, timeout_seconds=20, stdin=None
+            )
+            if code == 0:
+                form = name
+                break
+        guest.timeout_form = form
+        return form
 
     def start_process(self, sandbox_id: str, request: ExecRequest) -> ProcessHandle:
         guest = self._guests.get(sandbox_id)
