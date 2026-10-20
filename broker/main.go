@@ -126,10 +126,12 @@ type hotel struct {
 	queued       int
 	creating     int
 	backoffUntil time.Time
-	ok           bool      // health answered within okWindow
-	lastOK       time.Time // last good /room/health answer
-	healthMs     float64   // duration of the last /room/health call
-	listOK       bool      // last room list answered
+	ok           bool         // health answered within okWindow, or room calls did (see syncHotel)
+	healthLate   bool         // ok only because room calls answer; health is late
+	lastOK       time.Time    // last good /room/health answer
+	lastAnswer   atomic.Int64 // unix ns of the last room call the hotel answered (status < 500)
+	healthMs     float64      // duration of the last /room/health call
+	listOK       bool         // last room list answered
 	lastErr      string
 	caps         map[string]any // capability probe results (probe.go)
 	cpuPct       float64
@@ -266,6 +268,11 @@ func (h *hotel) doBase(ctx context.Context, base, method, path string, query url
 	}
 	defer resp.Body.Close()
 	out, err := io.ReadAll(resp.Body)
+	if err == nil && resp.StatusCode < 500 {
+		// The hotel answers room calls. syncHotel keeps it "answering" while
+		// these continue, even when its health endpoint is slow under load.
+		h.lastAnswer.Store(time.Now().UnixNano())
+	}
 	return resp.StatusCode, resp.Header, out, err
 }
 
@@ -934,7 +941,13 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	if herr == nil {
 		h.lastOK, h.healthMs = now, healthMs
 	}
-	h.ok = !h.lastOK.IsZero() && now.Sub(h.lastOK) < okWindow
+	healthOK := !h.lastOK.IsZero() && now.Sub(h.lastOK) < okWindow
+	// A slow health endpoint does not take a hotel out of placement while
+	// the hotel still answers room calls (a sealed guest at full CPU answered
+	// rooms but not health at about 1,000 rooms).
+	callsOK := now.Sub(time.Unix(0, h.lastAnswer.Load())) < okWindow
+	h.ok = healthOK || (callsOK && !h.lastOK.IsZero())
+	h.healthLate = !healthOK && h.ok
 	if herr == nil {
 		slots := hd.Slots
 		if h.cfg.MaxSlots > 0 && slots > h.cfg.MaxSlots {
@@ -1138,7 +1151,7 @@ func (b *broker) snapshot(g *guestState) map[string]any {
 			"grid": string(grid), "cpu": h.cpuPct, "mem_pct": h.memPct, "mem_gib": h.memGiB, "load1": h.load1,
 			"containers": h.containers, "rooms_all": h.apiRunning, "deleting_all": h.apiDeleting,
 			"queued": h.queued, "creating": h.creating,
-			"seen_age_s": seenAge(h.lastOK, now), "health_ms": h.healthMs, "list_ok": h.listOK, "caps": h.caps,
+			"seen_age_s": seenAge(h.lastOK, now), "health_late": h.healthLate, "health_ms": h.healthMs, "list_ok": h.listOK, "caps": h.caps,
 			"mine": map[string]int{"running": mine[stRunning], "creating": mine[stCreating], "deleting": mine[stDeleting], "failed": mine[stFailed]},
 		})
 	}

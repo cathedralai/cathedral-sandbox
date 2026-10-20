@@ -300,6 +300,9 @@ Group=poolroom
 Environment=ROOM_ETC=$ROOM_ETC ROOM_DOCKER_SOCK=$SOCK ROOM_HEALTH_PORT=$ROOM_HEALTH_PORT ROOM_PROBE_IMAGE=$PROBE_IMAGE HOME=/var/lib/pool-room
 ExecStart=$ROOM_OPT/venv/bin/python $ROOM_OPT/bin/room_health.py
 Restart=on-failure
+# Health must answer when the rooms use every CPU.
+Nice=-5
+CPUWeight=1000
 NoNewPrivileges=yes
 [Install]
 WantedBy=multi-user.target
@@ -340,6 +343,9 @@ After=$ROOM_ID.service $ROOM_ID-health.service
 Environment=ROOM_RECEIPTS_LISTEN=$ROOM_RECEIPTS_LISTEN ROOM_HOTEL_NAME=$ROOM_HOTEL_NAME ROOM_API_PORT=$ROOM_API_PORT ROOM_HEALTH_PORT=$ROOM_HEALTH_PORT ROOM_DOCKER_SOCK=$SOCK ROOM_API_KEY_PATH=$ROOM_ETC/api.key ROOM_RECEIPTS_DIR=/run/room-receipts
 ExecStart=$ROOM_OPT/venv/bin/python $ROOM_OPT/bin/room_receipts.py
 Restart=on-failure
+# The receipts front serves health and every room call: keep it ahead of the rooms.
+Nice=-5
+CPUWeight=1000
 RestartSec=2
 LimitNOFILE=1048576
 [Install]

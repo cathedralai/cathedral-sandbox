@@ -249,19 +249,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, canonical({"sandbox_id": m["id"], "binding_sha256": ledger.binding_sha256,
                                               "receipts": page}))
         if path == "/room/health":
-            status, headers, out = self.upstream(self.server.health_port, body)
-            if status == 200:
-                try:
-                    doc = json.loads(out)
-                    doc["sealed"] = True
-                    doc["receipts"] = {"binding_sha256": ledger.binding_sha256, "count": len(ledger.chain)}
-                    doc["runsc_sandbox_procs"] = int(subprocess.run(
-                        ["pgrep", "-cf", "[r]unsc-sandbox"], capture_output=True, text=True).stdout.strip() or 0)
-                    doc["guest_kernel_sev"] = self.server.sev_log()
-                    out = canonical(doc)
-                except ValueError:
-                    pass
-            return self.reply(status, out)
+            # Served from the cache that health_loop fills. No upstream call,
+            # no subprocess and no ledger lock in the request, so health
+            # answers at once when the guest CPU is full.
+            if not self.authorized():
+                return self.reply(401, b'{"error":"unauthorized"}')
+            with self.server.health_lock:
+                status, out, at = self.server.health
+            if out is None:
+                return self.reply(503, b'{"error":"health_not_ready"}')
+            return self.reply(status, out, {"X-Health-Age-Ms": str(int((time.time() - at) * 1000))})
         status, headers, out = self.upstream(self.server.api_port, body)
         extra = {}
         action = next((a for meth, pat, a in SIGNED if meth == self.command and pat.match(path)), None)
@@ -314,6 +311,33 @@ class Server(ThreadingHTTPServer):
         self.ledger, self.api_port, self.health_port, self.api_key = ledger, api_port, health_port, api_key
         self.docker_sock = docker_sock
         self._digests: dict[str, str | None] = {}
+        self.health_lock = threading.Lock()
+        self.health: tuple[int, bytes | None, float] = (503, None, 0.0)
+        threading.Thread(target=self.health_loop, daemon=True).start()
+
+    def health_loop(self) -> None:
+        """Build the health answer once a second, off the request path."""
+        up = http.client.HTTPConnection("127.0.0.1", self.health_port, timeout=30)
+        auth = {"Authorization": "Bearer " + self.api_key.decode()}
+        while True:
+            try:
+                up.request("GET", "/room/health", headers=auth)
+                r = up.getresponse()
+                status, out = r.status, r.read()
+                if status == 200:
+                    doc = json.loads(out)
+                    doc["sealed"] = True
+                    doc["receipts"] = {"binding_sha256": self.ledger.binding_sha256, "count": len(self.ledger.chain)}
+                    doc["runsc_sandbox_procs"] = int(subprocess.run(
+                        ["pgrep", "-cf", "[r]unsc-sandbox"], capture_output=True, text=True, timeout=20).stdout.strip() or 0)
+                    doc["guest_kernel_sev"] = self.sev_log()
+                    out = canonical(doc)
+                with self.health_lock:
+                    self.health = (status, out, time.time())
+            except (http.client.HTTPException, OSError, ValueError, subprocess.SubprocessError):
+                up.close()
+                up = http.client.HTTPConnection("127.0.0.1", self.health_port, timeout=30)
+            time.sleep(1)
 
     def sev_log(self) -> list[str]:
         """The guest kernel's own SEV lines (dmesg), read once."""

@@ -30,6 +30,10 @@ _lock = threading.Lock()
 # Live numbers sampled in the background, so a busy room daemon never makes
 # the health call slow: host CPU busy % (1 s window), load, room containers.
 _live: dict = {"cpu_pct": None, "containers": None, "containers_at": None}
+# The health document, built in the background once a second. A request only
+# sends these bytes, so the answer stays fast when the host CPU is full.
+_doc: dict = {"body": None, "at": 0.0}
+_files: dict = {}  # path -> (mtime, parsed); room.env, machine.json and size.json change only on install
 
 
 def run(argv: list[str], timeout: float = 60) -> tuple[int, str]:
@@ -101,12 +105,24 @@ def meminfo() -> dict[str, int]:
     return out
 
 
+def _cached(path: Path, parse):
+    mtime = path.stat().st_mtime
+    hit = _files.get(path)
+    if hit is None or hit[0] != mtime:
+        hit = (mtime, parse(path.read_text()))
+        _files[path] = hit
+    return hit[1]
+
+
+def _parse_env(text: str) -> dict:
+    env = dict(line.split("=", 1) for line in text.splitlines() if "=" in line and not line.lstrip().startswith("#"))
+    return {k: v.strip().strip('"') for k, v in env.items()}
+
+
 def document() -> dict:
-    env = dict(line.split("=", 1) for line in (ETC / "room.env").read_text().splitlines()
-               if "=" in line and not line.lstrip().startswith("#"))
-    env = {k: v.strip().strip('"') for k, v in env.items()}
-    machine = json.loads((ETC / "machine.json").read_text())
-    size = json.loads((ETC / "size.json").read_text())
+    env = _cached(ETC / "room.env", _parse_env)
+    machine = _cached(ETC / "machine.json", json.loads)
+    size = _cached(ETC / "size.json", json.loads)
     with _lock:
         live = dict(_live)
     if live["containers_at"] is None:
@@ -152,6 +168,17 @@ def document() -> dict:
     }
 
 
+def doc_loop() -> None:
+    while True:
+        try:
+            body = json.dumps(document(), sort_keys=True).encode()
+            with _lock:
+                _doc["body"], _doc["at"] = body, time.time()
+        except Exception as exc:  # noqa: BLE001 - keep serving the last document
+            print(f"room-health: document failed: {exc!r}", file=sys.stderr, flush=True)
+        time.sleep(1)
+
+
 def load_key() -> str:
     raw = Path(os.environ.get("ROOM_KEY_FILE", str(ETC / "api.key"))).read_text().strip()
     return raw
@@ -170,11 +197,20 @@ class Handler(BaseHTTPRequestHandler):
         token = auth[7:] if auth.startswith("Bearer ") else ""
         if not hmac.compare_digest(token.encode(), self.key.encode()):
             return self._send(401, {"error": {"code": "unauthorized"}})
-        self._send(200, document())
+        with _lock:
+            body, at = _doc["body"], _doc["at"]
+        if body is None:  # first second after start
+            body = json.dumps(document(), sort_keys=True).encode()
+            at = time.time()
+        self._send_bytes(200, body, age=time.time() - at)
 
     def _send(self, code: int, body: dict) -> None:
-        data = json.dumps(body, sort_keys=True).encode()
+        self._send_bytes(code, json.dumps(body, sort_keys=True).encode())
+
+    def _send_bytes(self, code: int, data: bytes, age: float | None = None) -> None:
         self.send_response(code)
+        if age is not None:
+            self.send_header("X-Health-Age-Ms", str(int(age * 1000)))
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -190,6 +226,7 @@ def main() -> int:
     threading.Thread(target=refresh_probe_loop, daemon=True).start()
     threading.Thread(target=cpu_loop, daemon=True).start()
     threading.Thread(target=containers_loop, daemon=True).start()
+    threading.Thread(target=doc_loop, daemon=True).start()
     port = int(os.environ.get("ROOM_HEALTH_PORT", "18091"))
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
     return 0

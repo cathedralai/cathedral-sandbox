@@ -215,6 +215,24 @@ def get(url: str, key: str) -> dict:
         return json.loads(resp.read())
 
 
+PAGE = 10000  # the hotel's largest page
+
+
+def fetch_chain(broker: str, hotel: str, key: str) -> dict:
+    """Read the whole receipt chain page by page (after=0, 10000, ...).
+
+    The chain can grow while it is read. Reading stops at the first short
+    page; the head of that page is the head the chain must end at.
+    """
+    receipts: list[dict] = []
+    while True:
+        page = get(f"{broker}/v1/hotels/{hotel}/receipts?after={len(receipts)}&limit={PAGE}", key)
+        receipts.extend(page["receipts"])
+        if len(page["receipts"]) < PAGE:
+            return {"binding_sha256": page.get("binding_sha256"), "head": page.get("head"),
+                    "count": len(receipts), "receipts": receipts}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--attestation", help="JSON from GET /room/attestation (or the broker's /v1/hotels/<id>/attestation)")
@@ -235,8 +253,10 @@ def main() -> int:
         if a.broker:
             key = open(a.key_file).read().strip()
             att = get(f"{a.broker}/v1/hotels/{a.hotel}/attestation", key)
-            path = f"/v1/sandboxes/{a.sandbox}/receipts" if a.sandbox else f"/v1/hotels/{a.hotel}/receipts?limit=10000"
-            doc = get(a.broker + path, key)
+            if a.sandbox:
+                doc = get(f"{a.broker}/v1/sandboxes/{a.sandbox}/receipts", key)
+            else:
+                doc = fetch_chain(a.broker, a.hotel, key)
             if a.save:
                 os.makedirs(a.save, exist_ok=True)
                 json.dump(att, open(os.path.join(a.save, "attestation.json"), "w"), indent=1)

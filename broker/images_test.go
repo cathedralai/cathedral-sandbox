@@ -31,6 +31,7 @@ type fakeHotel struct {
 	builds      []map[string]any
 	failBuild   bool
 	createDelay time.Duration
+	healthFail  bool
 	rooms       []map[string]any // id + labels, for the room list
 }
 
@@ -62,6 +63,8 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 202, map[string]any{"id": id, "state": "running", "snapshot_id": req["snapshot_id"]})
 	case p == "/v1/sandboxes" && r.Method == "GET":
 		writeJSON(w, 200, map[string]any{"sandboxes": f.rooms})
+	case p == "/room/health" && f.healthFail:
+		writeErr(w, 503, "busy", "health did not answer")
 	case p == "/room/health" || p == "/v1/quota" || p == "/v1/status":
 		writeJSON(w, 200, map[string]any{})
 	case strings.HasSuffix(p, "/exec") && r.Method == "POST":
