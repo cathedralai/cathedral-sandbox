@@ -200,7 +200,9 @@ func (b *broker) placementFor(ctx context.Context, g *guestState, payload map[st
 	if e != nil {
 		return pl, e
 	}
-	if pl.sealedByDefault { // a fork goes to its snapshot's hotel; the sealed default does not apply
+	// A fork goes to its snapshot's hotel. The guest's sealed default does not
+	// stop a fork of a snapshot on an unsealed hotel.
+	if pl.sealedByDefault && h.cfg.Labels["sealed"] != "true" {
 		delete(pl.match, "sealed")
 		pl.sealedByDefault = false
 	}

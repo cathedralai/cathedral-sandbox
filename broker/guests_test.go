@@ -80,6 +80,27 @@ func TestForkIgnoresTheSealedDefault(t *testing.T) {
 	}
 }
 
+func TestForkOfASealedSnapshotStaysSealed(t *testing.T) {
+	tc := limitedChain(t, guestLimits{DefaultSealed: true})
+	room := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+	if hotelOf(room) != "a" {
+		t.Fatalf("room on %s", room)
+	}
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+room+"/snapshot", map[string]any{"name": "s"})
+	if status != 202 {
+		t.Fatalf("snapshot: %d %v", status, doc)
+	}
+	snap := doc["result"].(map[string]any)["snapshot_id"].(string)
+	if id := tc.room(t, "key1", map[string]any{"snapshot_id": snap}); hotelOf(id) != "a" {
+		t.Fatalf("fork on %s", id)
+	}
+	// A guest without the default forks a sealed snapshot with "sealed": true.
+	tc.b.guests["g1"].limits.DefaultSealed = false
+	if id := tc.room(t, "key1", map[string]any{"snapshot_id": snap, "sealed": true}); hotelOf(id) != "a" {
+		t.Fatalf("explicit sealed fork on %s", id)
+	}
+}
+
 func TestGuestHotelSet(t *testing.T) {
 	tc := limitedChain(t, guestLimits{Hotels: []string{"a", "b"}})
 	for i := 0; i < 20; i++ {
