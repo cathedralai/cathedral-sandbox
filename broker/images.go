@@ -44,9 +44,14 @@ type placement struct {
 	// snapshotRef is the broker snapshot id the guest sent; hotelSnap is the
 	// id on the hotel.
 	snapshotRef, hotelSnap string
+	allowed                map[string]bool // non-empty: the guest may use only these hotels (guests.go)
+	sealedByDefault        bool            // match["sealed"] comes from the guest default, not the request
 }
 
 func (pl placement) selects(h *hotel) bool {
+	if len(pl.allowed) > 0 && !pl.allowed[h.cfg.ID] {
+		return false
+	}
 	if len(pl.ids) > 0 && !pl.ids[h.cfg.ID] {
 		return false
 	}
@@ -123,9 +128,10 @@ func stringMap(v any, field string) (map[string]string, *apiErr) {
 	return out, nil
 }
 
-// parseSelection reads "hotels", "hotel_labels" and "exclude_hotel_labels".
+// parseSelection reads "hotels", "hotel_labels", "exclude_hotel_labels" and
+// "sealed", and applies the guest's hotel set and sealed default (guests.go).
 // It answers 400 for an unknown hotel id and 409 when no hotel matches.
-func (b *broker) parseSelection(payload map[string]any) (placement, *apiErr) {
+func (b *broker) parseSelection(g *guestState, payload map[string]any) (placement, *apiErr) {
 	var pl placement
 	if v, ok := payload["hotels"]; ok && v != nil {
 		list, ok := v.([]any)
@@ -135,7 +141,7 @@ func (b *broker) parseSelection(payload map[string]any) (placement, *apiErr) {
 		pl.ids = map[string]bool{}
 		for _, x := range list {
 			id, _ := x.(string)
-			if b.hotelByID(id) == nil {
+			if b.hotelByID(id) == nil || !g.limitsAllow(b, id) {
 				return pl, &apiErr{400, "unknown_hotel", fmt.Sprintf("no hotel %q", fmt.Sprint(x))}
 			}
 			pl.ids[id] = true
@@ -161,6 +167,16 @@ func (b *broker) parseSelection(payload map[string]any) (placement, *apiErr) {
 	if pl.exclude, e = stringMap(payload["exclude_hotel_labels"], "exclude_hotel_labels"); e != nil {
 		return pl, e
 	}
+	// "sealed": false asks for an unsealed hotel.
+	if v, ok := payload["sealed"].(bool); ok && !v {
+		if pl.exclude == nil {
+			pl.exclude = map[string]string{}
+		}
+		pl.exclude["sealed"] = "true"
+	}
+	_, named := payload["hotels"]
+	_, sealedField := payload["sealed"]
+	b.scope(g, &pl, named && payload["hotels"] != nil, sealedField && payload["sealed"] != nil)
 	for _, h := range b.hotelList() {
 		if pl.selects(h) {
 			return pl, nil
@@ -172,17 +188,21 @@ func (b *broker) parseSelection(payload map[string]any) (placement, *apiErr) {
 // placementFor reads the hotel choice of a create and, for a fork, finds the
 // hotel that holds the snapshot.
 func (b *broker) placementFor(ctx context.Context, g *guestState, payload map[string]any) (placement, *apiErr) {
-	pl, e := b.parseSelection(payload)
-	if e != nil {
+	ref, _ := payload["snapshot_id"].(string)
+	pl, e := b.parseSelection(g, payload)
+	if e != nil && !(ref != "" && e.code == "no_matching_hotel") {
 		return pl, e
 	}
-	ref, _ := payload["snapshot_id"].(string)
 	if ref == "" {
 		return pl, nil
 	}
 	h, sid, e := b.findSnapshot(ctx, g, ref)
 	if e != nil {
 		return pl, e
+	}
+	if pl.sealedByDefault { // a fork goes to its snapshot's hotel; the sealed default does not apply
+		delete(pl.match, "sealed")
+		pl.sealedByDefault = false
 	}
 	if !pl.selects(h) {
 		return pl, &apiErr{409, "snapshot_hotel_excluded", "the hotel that holds this snapshot does not match the hotel selection"}
@@ -196,6 +216,9 @@ func (b *broker) handleHotels(w http.ResponseWriter, g *guestState) {
 	b.mu.Lock()
 	out := []map[string]any{}
 	for _, h := range b.hotelList() {
+		if !g.limits.allows(h.cfg.ID) {
+			continue
+		}
 		free := h.slots - h.used()
 		if free < 0 || !h.ok || h.cfg.Drain {
 			free = 0
@@ -464,7 +487,7 @@ func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guest
 		writeErr(w, 400, "invalid_prefetch", "images must be a non-empty list of image references")
 		return
 	}
-	pl, e := b.parseSelection(req)
+	pl, e := b.parseSelection(g, req)
 	if e != nil {
 		writeErr(w, e.status, e.code, e.msg)
 		return

@@ -62,7 +62,22 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": req["labels"]})
 		writeJSON(w, 202, map[string]any{"id": id, "state": "running", "snapshot_id": req["snapshot_id"]})
 	case p == "/v1/sandboxes" && r.Method == "GET":
-		writeJSON(w, 200, map[string]any{"sandboxes": f.rooms})
+		// Like a hotel: every "label" filter must match.
+		out := []map[string]any{}
+		for _, rm := range f.rooms {
+			labels, _ := rm["labels"].(map[string]any)
+			keep := true
+			for _, want := range r.URL.Query()["label"] {
+				k, v, _ := strings.Cut(want, "=")
+				if labels[k] != v {
+					keep = false
+				}
+			}
+			if keep {
+				out = append(out, rm)
+			}
+		}
+		writeJSON(w, 200, map[string]any{"sandboxes": out})
 	case p == "/room/health" && f.healthFail:
 		writeErr(w, 503, "busy", "health did not answer")
 	case p == "/room/health" || p == "/v1/quota" || p == "/v1/status":

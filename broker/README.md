@@ -45,6 +45,37 @@ hotel matches, the broker answers 409 `no_matching_hotel`. When the
 matching hotels are full, it answers 429 `no_free_rooms`. It never uses
 a hotel outside the choice.
 
+## Guest limits
+
+Each guest in the config can have limits (`guests.go`):
+
+| Field | Meaning |
+|---|---|
+| `max_rooms` | Rooms running or starting at one time. Absent or 0: 1,000. Over the limit, a create gets 429 `room_limit`. A batch that does not fit is refused as a whole. |
+| `max_creates_per_minute` | Rooms the guest may ask for in any 60 s. Absent or 0: no limit. Over the limit, a create gets 429 `create_rate_limit` with `Retry-After`. |
+| `default_sealed` | `true`: a create with no hotel choice goes to sealed hotels only. The guest gets an unsealed room only when the create says `"sealed": false`, names hotels with `"hotels"`, or excludes sealed hotels with `"exclude_hotel_labels"`. A fork goes to the hotel of its snapshot. |
+| `hotels` | The hotel ids the guest may use. Absent: all hotels. Other hotels are not in the guest's hotel list, and a create that names one gets 400 `unknown_hotel`. |
+| `ops` | `true`: the guest may run `POST /v1/broker/probe` and reset the counters with `POST /v1/broker/stats`. Other guests get 403. |
+
+The limits apply to the native routes and to the client (Harbor, ctcli)
+routes. `GET /v1/quota` shows the guest its limits.
+
+With `operator_key_sha256` in the config, an operator reads and changes
+limits without a restart:
+
+| Route (operator key) | What it does |
+|---|---|
+| `GET /v1/broker/guests` | Every guest with its limits and active rooms. No key hashes. |
+| `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed` and `hotels`. |
+
+A runtime change stays in memory. A restart goes back to the config file.
+
+Guests are apart: the broker labels each room with its guest, lists with
+that label only, and answers 404 `sandbox_not_found` to a call on a room of
+another guest. The hotel receipt chain (`GET /v1/hotels/<id>/receipts`) is
+one chain per hotel boot: it shows every guest's room ids, image names and
+hashes, but no commands, files or outputs.
+
 ## Snapshots and forks
 
 A snapshot stays on the hotel that made it.
