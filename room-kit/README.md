@@ -35,10 +35,43 @@ customer API is on port 443 with a real TLS certificate.
   you run the installer.
 - A free private /22 or larger for the guest bridge (one address per sandbox).
   One Linux bridge takes at most 1,024 ports, so one bridge serves at most
-  1,023 rooms with a network. For more, set `ROOM_NETS` (one private CIDR per
-  extra bridge). The API then puts each room with a network on the least used
-  room network, `ROOM_NET_SIZE` rooms each, and the kit adds the same firewall
-  rules for every room bridge. Rooms with network `none` use no bridge port.
+  1,023 rooms with a network. With `ROOM_NETS=auto` (the default) the kit
+  adds room networks when the host can hold more rooms (see "Room networks").
+  Rooms with network `none` use no bridge port.
+
+## Room networks
+
+One Linux bridge takes at most 1,024 ports. A host that can hold more than
+1,023 rooms with a network needs more bridges ("room networks").
+
+With `ROOM_NETS=auto` (the default), the installer does this:
+
+1. It sizes the host by CPU, memory and disk, with no bridge limit.
+2. If the main bridge holds that many rooms (`ROOM_BRIDGE_PORT_CAP`), it
+   adds no room network.
+3. Otherwise it makes one room network for each `ROOM_NET_SIZE` rooms
+   (default 1,000). It cuts the CIDRs from `ROOM_NETS_POOL` (default
+   10.214.0.0/16) and skips CIDRs that other host networks use.
+4. It writes the CIDRs to the resolved `/etc/pool-room/room.env` and sizes
+   the host again with the room networks.
+
+To choose the CIDRs yourself, set `ROOM_NETS` to a space-separated list.
+`ROOM_NETS=""` keeps every room on the main bridge.
+
+For every room network the kit adds the same firewall rules as for the main
+bridge (`room-net.sh`, by bridge name `${ROOM_NET_BRIDGE_PREFIX}N`). Guests
+use `ROOM_DNS`. The kit sets these API settings (`/etc/pool-room/api.env`):
+
+| Setting | Value from the kit | Meaning |
+|---|---|---|
+| `CATHEDRAL_ROOM_NETWORKS` | count of `ROOM_NETS` | Number of room networks. Unset or 0: no room networks. |
+| `CATHEDRAL_ROOM_NETWORK_SUBNETS` | `ROOM_NETS`, comma separated | One subnet per network. |
+| `CATHEDRAL_ROOM_NETWORK_SIZE` | `ROOM_NET_SIZE` | Rooms per network (max 1,023). |
+| `CATHEDRAL_ROOM_NETWORK_PREFIX` | `$ROOM_ID-net` | Docker network name prefix. |
+| `CATHEDRAL_ROOM_NETWORK_BRIDGE_PREFIX` | `ROOM_NET_BRIDGE_PREFIX` | Linux bridge name prefix: bridge N is `<prefix>N`. |
+| `CATHEDRAL_ROOM_NETWORK_DNS` | `ROOM_DNS` | Name servers for guests on room networks. |
+
+`GET /v1/quota` shows `room_networks`, with the use of each network.
 
 ## Build the API tarball
 

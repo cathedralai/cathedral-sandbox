@@ -65,9 +65,16 @@ python3 "$KIT/assess.py" --data-dir "$ROOM_DATA_DIR" --room-socket "$SOCK" --out
 log "assess: $ROOM_ETC/machine.json"
 
 # Resolved copy of the config (values only, no comments) for units and health.
-ROOM_KEYS="ROOM_TLS ROOM_REGISTRY_MIRRORS ROOM_ID ROOM_HOSTNAME ROOM_ACME_EMAIL ROOM_CUSTOMER ROOM_REGION API_PROFILE ROOM_API_PORT ROOM_HEALTH_PORT ROOM_PUBLIC_PORT ROOM_DATA_DIR ROOM_DATA_DEVICE ROOM_DATA_IMG ROOM_DATA_SIZE_GB ROOM_BRIDGE ROOM_BRIDGE_CIDR ROOM_DNS ROOM_RUNSC_FLAGS ROOM_ALLOW_DIND ROOM_CREATES_PER_MINUTE ROOM_GC_PARALLELISM ROOM_DIND_DOCKERD_ARGS ROOM_DIND_ENV ROOM_BRIDGE_PORT_CAP ROOM_NETS ROOM_NET_SIZE ROOM_NET_BRIDGE_PREFIX SHAPE_VCPU SHAPE_MEM_GIB SHAPE_DISK_GIB RESERVE_RAM_PCT RESERVE_THREADS DISK_MAX_FILL_PCT CPU_OVERCOMMIT MEM_OVERCOMMIT DISK_OVERCOMMIT ROOM_MAX_SLOTS"
-for k in $ROOM_KEYS; do printf '%s="%s"\n' "$k" "${!k:-}"; done > "$ROOM_ETC/room.env"
-chmod 0644 "$ROOM_ETC/room.env"
+ROOM_KEYS="ROOM_TLS ROOM_REGISTRY_MIRRORS ROOM_ID ROOM_HOSTNAME ROOM_ACME_EMAIL ROOM_CUSTOMER ROOM_REGION API_PROFILE ROOM_API_PORT ROOM_HEALTH_PORT ROOM_PUBLIC_PORT ROOM_DATA_DIR ROOM_DATA_DEVICE ROOM_DATA_IMG ROOM_DATA_SIZE_GB ROOM_BRIDGE ROOM_BRIDGE_CIDR ROOM_DNS ROOM_RUNSC_FLAGS ROOM_ALLOW_DIND ROOM_CREATES_PER_MINUTE ROOM_GC_PARALLELISM ROOM_DIND_DOCKERD_ARGS ROOM_DIND_ENV ROOM_BRIDGE_PORT_CAP ROOM_NETS ROOM_NETS_POOL ROOM_NET_SIZE ROOM_NET_BRIDGE_PREFIX SHAPE_VCPU SHAPE_MEM_GIB SHAPE_DISK_GIB RESERVE_RAM_PCT RESERVE_THREADS DISK_MAX_FILL_PCT CPU_OVERCOMMIT MEM_OVERCOMMIT DISK_OVERCOMMIT ROOM_MAX_SLOTS"
+write_room_env() {
+  for k in $ROOM_KEYS; do printf '%s="%s"\n' "$k" "${!k:-}"; done > "$ROOM_ETC/room.env"
+  chmod 0644 "$ROOM_ETC/room.env"
+}
+# ROOM_NETS=auto: the room networks come from the host size in step 8. Until
+# then the resolved file has no room networks.
+ROOM_NETS_AUTO=0
+if [ "${ROOM_NETS:-}" = auto ]; then ROOM_NETS_AUTO=1; ROOM_NETS=""; fi
+write_room_env
 
 # ---------------------------------------------------------------- 2. data volume (xfs, prjquota, no nodev)
 DATA_UNIT=$ROOM_ID-data.service
@@ -197,11 +204,27 @@ grep -E " $ROOM_DATA_DIR " /proc/mounts | grep -q prjquota || { echo "prjquota m
 mkdir -p "$ROOM_DATA_DIR/work" "$ROOM_DATA_DIR/docker"
 chown poolroom:poolroom "$ROOM_DATA_DIR/work"
 ROOM_DISK_BYTES=$(df -B1 --output=size "$ROOM_DATA_DIR" | tail -1)
-python3 "$KIT/size.py" "$ROOM_ETC/machine.json" --vcpu "$SHAPE_VCPU" --mem-gib "$SHAPE_MEM_GIB" --disk-gib "$SHAPE_DISK_GIB" \
-  --cpu-overcommit "$CPU_OVERCOMMIT" --mem-overcommit "$MEM_OVERCOMMIT" --disk-overcommit "$DISK_OVERCOMMIT" \
-  --reserve-ram-pct "$RESERVE_RAM_PCT" --reserve-threads "$RESERVE_THREADS" --disk-max-fill-pct "$DISK_MAX_FILL_PCT" \
-  --room-disk-bytes "$ROOM_DISK_BYTES" --max-slots "${ROOM_MAX_SLOTS:-0}" --out "$ROOM_ETC/size.json" \
-  --bridge-addresses "$(python3 "$KIT/lib/net_capacity.py" "$ROOM_BRIDGE_CIDR" "${ROOM_BRIDGE_PORT_CAP:-1023}" "${ROOM_NET_SIZE:-1000}" ${ROOM_NETS:-})"
+size_room() { # size_room <bridge addresses (0 = no bridge limit)> <out>
+  python3 "$KIT/size.py" "$ROOM_ETC/machine.json" --vcpu "$SHAPE_VCPU" --mem-gib "$SHAPE_MEM_GIB" --disk-gib "$SHAPE_DISK_GIB" \
+    --cpu-overcommit "$CPU_OVERCOMMIT" --mem-overcommit "$MEM_OVERCOMMIT" --disk-overcommit "$DISK_OVERCOMMIT" \
+    --reserve-ram-pct "$RESERVE_RAM_PCT" --reserve-threads "$RESERVE_THREADS" --disk-max-fill-pct "$DISK_MAX_FILL_PCT" \
+    --room-disk-bytes "$ROOM_DISK_BYTES" --max-slots "${ROOM_MAX_SLOTS:-0}" --bridge-addresses "$1" --out "$2"
+}
+if [ "$ROOM_NETS_AUTO" = 1 ]; then
+  # One room network for each ROOM_NET_SIZE rooms that CPU, memory and disk
+  # allow, cut from ROOM_NETS_POOL. Skip CIDRs that other host networks use
+  # (this room's own bridges do not count, so a second install keeps them).
+  size_room 0 "$ROOM_ETC/size-unbridged.json"
+  RAW_SLOTS=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["slots"])' "$ROOM_ETC/size-unbridged.json")
+  ROUTED=$(ip -o route show | awk -v main="$ROOM_BRIDGE" -v pre="${ROOM_NET_BRIDGE_PREFIX:-rmnet}" '
+    { dev=""; for (i=1;i<NF;i++) if ($i=="dev") dev=$(i+1) }
+    $1 ~ /\// && dev != main && dev !~ ("^" pre "[0-9]+$") { print $1 }')
+  ROOM_NETS=$(python3 "$KIT/lib/net_plan.py" "$RAW_SLOTS" "${ROOM_BRIDGE_PORT_CAP:-1023}" "${ROOM_NET_SIZE:-1000}" \
+    "${ROOM_NETS_POOL:-10.214.0.0/16}" "$ROOM_BRIDGE_CIDR" $ROUTED)
+  log "room networks (auto, $RAW_SLOTS rooms by resources): ${ROOM_NETS:-none, the main bridge holds them}"
+  write_room_env
+fi
+size_room "$(python3 "$KIT/lib/net_capacity.py" "$ROOM_BRIDGE_CIDR" "${ROOM_BRIDGE_PORT_CAP:-1023}" "${ROOM_NET_SIZE:-1000}" ${ROOM_NETS:-})" "$ROOM_ETC/size.json"
 SIZE_SLOTS=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["slots"])' "$ROOM_ETC/size.json")
 SIZE_QUOTA=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["quota"])' "$ROOM_ETC/size.json")
 [ "$SIZE_SLOTS" -gt 0 ] || { echo "size: 0 slots on this machine; see $ROOM_ETC/size.json" >&2; exit 1; }

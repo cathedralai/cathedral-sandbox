@@ -59,6 +59,7 @@ up() {
   guard "$BR" "$NET"
   local i=0 cidr
   for cidr in "${EXTRA_NETS[@]}"; do
+    if ip route show "$cidr" | grep -q .; then echo "room network $cidr already routed on this host; pick other ROOM_NETS or ROOM_NETS_POOL" >&2; exit 1; fi
     guard "$NET_BR_PREFIX$i" "$(python3 -c "import ipaddress,sys;print(ipaddress.ip_network(sys.argv[1]))" "$cidr")"
     i=$((i+1))
   done
