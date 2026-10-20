@@ -129,7 +129,7 @@ func (b *broker) parseSelection(payload map[string]any) (placement, *apiErr) {
 		pl.ids = map[string]bool{}
 		for _, x := range list {
 			id, _ := x.(string)
-			if b.byHotel[id] == nil {
+			if b.hotelByID(id) == nil {
 				return pl, &apiErr{400, "unknown_hotel", fmt.Sprintf("no hotel %q", fmt.Sprint(x))}
 			}
 			pl.ids[id] = true
@@ -142,7 +142,7 @@ func (b *broker) parseSelection(payload map[string]any) (placement, *apiErr) {
 	if pl.exclude, e = stringMap(payload["exclude_hotel_labels"], "exclude_hotel_labels"); e != nil {
 		return pl, e
 	}
-	for _, h := range b.hotels {
+	for _, h := range b.hotelList() {
 		if pl.selects(h) {
 			return pl, nil
 		}
@@ -176,7 +176,7 @@ func (b *broker) placementFor(ctx context.Context, g *guestState, payload map[st
 func (b *broker) handleHotels(w http.ResponseWriter, g *guestState) {
 	b.mu.Lock()
 	out := []map[string]any{}
-	for _, h := range b.hotels {
+	for _, h := range b.hotelList() {
 		free := h.slots - h.used()
 		if free < 0 || !h.ok || h.cfg.Drain {
 			free = 0
@@ -246,8 +246,8 @@ func matchSnapshot(g *guestState, list []map[string]any, ref string) string {
 // The hotel must list the snapshot under the guest's label.
 func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*hotel, string, *apiErr) {
 	notFound := &apiErr{404, "snapshot_not_found", "no snapshot " + ref}
-	if hotelID, rest, ok := strings.Cut(ref, "."); ok && b.byHotel[hotelID] != nil {
-		h := b.byHotel[hotelID]
+	if hotelID, rest, ok := strings.Cut(ref, "."); ok && b.hotelByID(hotelID) != nil {
+		h := b.hotelByID(hotelID)
 		list, err := b.hotelSnapshots(ctx, g, h)
 		if err != nil {
 			return nil, "", &apiErr{502, "hotel_unreachable", "hotel " + h.cfg.ID + " did not answer"}
@@ -265,7 +265,7 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	var mu sync.Mutex
 	var hits []hit
 	var wg sync.WaitGroup
-	for _, h := range b.hotels {
+	for _, h := range b.hotelList() {
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
@@ -336,7 +336,7 @@ func (b *broker) handleSnapshotList(w http.ResponseWriter, r *http.Request, g *g
 	errs := map[string]string{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for _, h := range b.hotels {
+	for _, h := range b.hotelList() {
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
@@ -458,7 +458,7 @@ func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guest
 
 	job := &prefetchJob{ID: newID("pf_"), guest: g.cfg.ID, Images: images, Created: time.Now().UTC(), Hotels: map[string]*prefetchHotel{}}
 	var targets []*hotel
-	for _, h := range b.hotels {
+	for _, h := range b.hotelList() {
 		if pl.selects(h) {
 			targets = append(targets, h)
 			job.Hotels[h.cfg.ID] = &prefetchHotel{State: "pulling", StartedAt: job.Created}

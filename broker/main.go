@@ -22,6 +22,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"math/rand/v2"
@@ -69,6 +70,9 @@ type config struct {
 	// MaxExecSeconds is the longest exec the broker accepts (default 14,400).
 	// Keep it at or below the hotels' CATHEDRAL_SANDBOX_EXEC_TIMEOUT_MAX.
 	MaxExecSeconds int `json:"max_exec_seconds"`
+	// OperatorKeySHA256 is the SHA-256 of the operator key. It allows hotel
+	// join, change and leave at runtime (hotels.go). Empty: no operator routes.
+	OperatorKeySHA256 string `json:"operator_key_sha256"`
 }
 
 func (b *broker) maxExec() int {
@@ -134,6 +138,8 @@ type hotel struct {
 	failed       int
 	rejected     int
 	lat          latencies
+	runtime      bool               // joined at runtime (hotels.go), not from the config file
+	stop         context.CancelFunc // stops the sync loop when the hotel leaves
 }
 
 type guestState struct {
@@ -148,8 +154,8 @@ type guestState struct {
 type broker struct {
 	cfg      config
 	mu       sync.Mutex
-	hotels   []*hotel
-	byHotel  map[string]*hotel
+	hset     atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
+	hotelsMu sync.Mutex               // serialises joins and leaves
 	guests   map[string]*guestState
 	byKey    map[string]*guestState // sha256(key) -> guest
 	byUUID   map[string]*room
@@ -168,7 +174,7 @@ const okWindow = 15 * time.Second
 // byBID finds a room by its broker id. Caller holds b.mu.
 func (b *broker) byBID(bid string) *room {
 	hotelID, hid, _ := strings.Cut(bid, ".")
-	if h := b.byHotel[hotelID]; h != nil {
+	if h := b.hotelByID(hotelID); h != nil {
 		return h.rooms[hid]
 	}
 	return nil
@@ -199,7 +205,7 @@ func loadBroker(path string) (*broker, error) {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
-	b := &broker{cfg: c, byHotel: map[string]*hotel{}, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), started: time.Now()}
+	b := &broker{cfg: c, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), started: time.Now()}
 	for _, hc := range c.Hotels {
 		if strings.Contains(hc.ID, ".") || hc.ID == "" {
 			return nil, fmt.Errorf("hotel id %q: must be non-empty and have no dot", hc.ID)
@@ -211,10 +217,10 @@ func loadBroker(path string) (*broker, error) {
 		if hc.Concurrency <= 0 {
 			hc.Concurrency = 16
 		}
-		tr := &http.Transport{MaxIdleConns: 1024, MaxIdleConnsPerHost: hc.Concurrency + 64, MaxConnsPerHost: hc.Concurrency + 64, IdleConnTimeout: 90 * time.Second}
-		h := &hotel{cfg: hc, key: strings.TrimSpace(string(k)), client: &http.Client{Transport: tr}, sem: make(chan struct{}, hc.Concurrency), rooms: map[string]*room{}}
-		b.hotels = append(b.hotels, h)
-		b.byHotel[hc.ID] = h
+		h := newHotel(hc, strings.TrimSpace(string(k)))
+		if err := b.addHotel(h); err != nil {
+			return nil, err
+		}
 	}
 	for _, gc := range c.Guests {
 		g := &guestState{cfg: gc}
@@ -324,8 +330,8 @@ func (h *hotel) used() int { return len(h.rooms) + h.creating + h.queued }
 func (b *broker) pick(exclude map[*hotel]bool, pl placement) *hotel {
 	now := time.Now()
 	total := 0
-	free := make([]int, len(b.hotels))
-	for i, h := range b.hotels {
+	free := make([]int, len(b.hotelList()))
+	for i, h := range b.hotelList() {
 		if !h.ok || h.cfg.Drain || exclude[h] || now.Before(h.backoffUntil) || !pl.allows(h) {
 			continue
 		}
@@ -340,7 +346,7 @@ func (b *broker) pick(exclude map[*hotel]bool, pl placement) *hotel {
 	n := rand.IntN(total)
 	for i, f := range free {
 		if n < f {
-			return b.hotels[i]
+			return b.hotelList()[i]
 		}
 		n -= f
 	}
@@ -580,7 +586,7 @@ func (b *broker) finishCreate(w http.ResponseWriter, res createResult, tRecv tim
 		over := ms(time.Since(tRecv)) - q - c
 		w.Header().Set("X-Broker-Overhead-Ms", strconv.FormatFloat(over, 'f', 2, 64))
 		b.mu.Lock()
-		if h := b.byHotel[res.header.Get("X-Broker-Hotel")]; h != nil {
+		if h := b.hotelByID(res.header.Get("X-Broker-Hotel")); h != nil {
 			h.lat.overhead = append(h.lat.overhead, over)
 		}
 		b.mu.Unlock()
@@ -599,7 +605,7 @@ func (b *broker) finishCreate(w http.ResponseWriter, res createResult, tRecv tim
 func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestState, rest string) {
 	bid, tail, _ := strings.Cut(rest, "/")
 	hotelID, hid, ok := strings.Cut(bid, ".")
-	h := b.byHotel[hotelID]
+	h := b.hotelByID(hotelID)
 	if !ok || h == nil {
 		writeErr(w, 404, "sandbox_not_found", "no sandbox "+bid)
 		return
@@ -669,7 +675,7 @@ func (b *broker) fanout(ctx context.Context, path string, q url.Values) map[stri
 	out := map[string]json.RawMessage{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for _, h := range b.hotels {
+	for _, h := range b.hotelList() {
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
@@ -746,7 +752,7 @@ func (b *broker) handleQuota(w http.ResponseWriter, r *http.Request, g *guestSta
 	}
 	b.mu.Lock()
 	mine := 0
-	for _, h := range b.hotels {
+	for _, h := range b.hotelList() {
 		for _, rm := range h.rooms {
 			if rm.guest == g.cfg.ID && rm.state == stRunning {
 				mine++
@@ -776,7 +782,7 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 	res := map[string]int{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for _, h := range b.hotels {
+	for _, h := range b.hotelList() {
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
@@ -809,7 +815,7 @@ func (b *broker) handleStats(w http.ResponseWriter, r *http.Request, g *guestSta
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if r.Method == "POST" {
-		for _, h := range b.hotels {
+		for _, h := range b.hotelList() {
 			h.created, h.failed, h.rejected, h.lat = 0, 0, 0, latencies{}
 		}
 		for _, x := range b.guests {
@@ -819,7 +825,7 @@ func (b *broker) handleStats(w http.ResponseWriter, r *http.Request, g *guestSta
 		return
 	}
 	hotels := []any{}
-	for _, h := range b.hotels {
+	for _, h := range b.hotelList() {
 		running := 0
 		for _, rm := range h.rooms {
 			if rm.state == stRunning {
@@ -966,23 +972,64 @@ func (b *broker) viewGuest(r *http.Request, guestID string) (*guestState, string
 	return nil, ""
 }
 
+// writeSignIn answers 401 with a form that asks for the view token. The form posts the token in the body,
+// so it does not stay in the browser history like a ?token= link.
+func writeSignIn(w http.ResponseWriter, guestID, msg string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(401)
+	note := "Enter the view token, or open the link that has the token."
+	if msg != "" {
+		note = msg
+	}
+	_, _ = fmt.Fprintf(w, `<!doctype html><meta name="viewport" content="width=device-width"><title>Central booking</title>
+<body style="font:16px system-ui;background:#0A0A1A;color:#F0F0F5;padding:24px">
+<form method="post" action="/%s/live/sign-in" style="display:flex;flex-direction:column;gap:12px;max-width:420px">
+<label for="token">%s</label>
+<input id="token" name="token" type="password" autocomplete="current-password" required style="font:16px system-ui;padding:8px">
+<button type="submit" style="font:16px system-ui;padding:8px">Sign in</button>
+</form></body>`, url.PathEscape(guestID), html.EscapeString(note))
+}
+
+// handleSignIn: POST /<guest>/live/sign-in with form field "token" sets the
+// view cookie and redirects to the live view.
+func (b *broker) handleSignIn(w http.ResponseWriter, r *http.Request, guestID string) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Frame-Options", "DENY")
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	token := ""
+	if r.ParseForm() == nil {
+		token = r.PostForm.Get("token")
+	}
+	g := b.guests[guestID]
+	if g == nil || g.cfg.ViewTokenSHA256 == "" || token == "" ||
+		subtle.ConstantTimeCompare([]byte(sha(token)), []byte(strings.ToLower(g.cfg.ViewTokenSHA256))) != 1 {
+		writeSignIn(w, guestID, "The token is not correct. Try again.")
+		return
+	}
+	b.setViewCookie(w, guestID, token)
+	http.Redirect(w, r, "/"+guestID+"/live", http.StatusSeeOther)
+}
+
+func (b *broker) setViewCookie(w http.ResponseWriter, guestID, token string) {
+	// Lax, not Strict: a link opened from another app (for example a
+	// terminal) is a cross-site navigation, and Strict would drop the
+	// cookie on the redirect that follows.
+	http.SetCookie(w, &http.Cookie{Name: "bv_" + guestID, Value: token, Path: "/" + guestID + "/", MaxAge: 30 * 86400,
+		HttpOnly: true, Secure: !b.cfg.InsecureCookie, SameSite: http.SameSiteLaxMode})
+}
+
 func (b *broker) handleLive(w http.ResponseWriter, r *http.Request, guestID, tail string) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Frame-Options", "DENY")
 	g, fresh := b.viewGuest(r, guestID)
 	if g == nil {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(401)
-		_, _ = w.Write([]byte(`<!doctype html><meta name="viewport" content="width=device-width"><title>Central booking</title><body style="font:16px system-ui;background:#0A0A1A;color:#F0F0F5;padding:24px">View token required. Open the link that has the token.</body>`))
+		writeSignIn(w, guestID, "")
 		return
 	}
 	if fresh != "" {
-		// Lax, not Strict: a link opened from another app (for example a
-		// terminal) is a cross-site navigation, and Strict would drop the
-		// cookie on the redirect that follows.
-		http.SetCookie(w, &http.Cookie{Name: "bv_" + guestID, Value: fresh, Path: "/" + guestID + "/", MaxAge: 30 * 86400,
-			HttpOnly: true, Secure: !b.cfg.InsecureCookie, SameSite: http.SameSiteLaxMode})
+		b.setViewCookie(w, guestID, fresh)
 		http.Redirect(w, r, "/"+guestID+"/live", http.StatusSeeOther)
 		return
 	}
@@ -1015,7 +1062,7 @@ func (b *broker) snapshot(g *guestState) map[string]any {
 	}
 	tot := map[string]int{"running": 0, "creating": 0, "deleting": 0, "failed_now": 0}
 	hotels := []any{}
-	for _, h := range b.hotels {
+	for _, h := range b.hotelList() {
 		grid := make([]byte, len(h.grid))
 		mine := map[byte]int{}
 		for i, rm := range h.grid {
@@ -1088,6 +1135,10 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 		return
 	}
+	if (p == "/v1/broker/hotels" && r.Method != "GET") || strings.HasPrefix(p, "/v1/broker/hotels/") {
+		b.handleHotelAdmin(w, r, strings.TrimPrefix(strings.TrimPrefix(p, "/v1/broker/hotels"), "/"))
+		return
+	}
 	if strings.HasPrefix(p, "/v1/") {
 		g := b.guestFromKey(r)
 		if g == nil {
@@ -1107,6 +1158,10 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// /<guest>/live and /<guest>/live/events
 	parts := strings.SplitN(strings.TrimPrefix(p, "/"), "/", 2)
+	if len(parts) == 2 && parts[1] == "live/sign-in" && r.Method == "POST" {
+		b.handleSignIn(w, r, parts[0])
+		return
+	}
 	if len(parts) == 2 && (parts[1] == "live" || parts[1] == "live/events") {
 		b.handleLive(w, r, parts[0], parts[1])
 		return
@@ -1147,13 +1202,13 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 		case p == "/v1/status":
 			b.mu.Lock()
 			up := 0
-			for _, h := range b.hotels {
+			for _, h := range b.hotelList() {
 				if h.ok {
 					up++
 				}
 			}
 			b.mu.Unlock()
-			writeJSON(w, 200, map[string]any{"service": "central-booking", "hotels": len(b.hotels), "hotels_up": up, "uptime_s": int(time.Since(b.started).Seconds())})
+			writeJSON(w, 200, map[string]any{"service": "central-booking", "hotels": len(b.hotelList()), "hotels_up": up, "uptime_s": int(time.Since(b.started).Seconds())})
 		default:
 			writeErr(w, 404, "route_not_found", "central booking does not route "+r.Method+" "+p)
 		}
@@ -1186,8 +1241,11 @@ func main() {
 		log.Printf("client state not loaded: %v", err)
 	}
 	go b.saveLoop(ctx)
-	for _, h := range b.hotels {
-		go b.syncLoop(ctx, h)
+	if err := b.loadRuntimeHotels(); err != nil {
+		log.Printf("runtime hotels not loaded: %v", err)
+	}
+	for _, h := range b.hotelList() {
+		b.startSync(ctx, h)
 	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cw := &countingWriter{ResponseWriter: w, status: 200}
@@ -1201,6 +1259,6 @@ func main() {
 		}
 	})
 	srv := &http.Server{Addr: b.cfg.Listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
-	log.Printf("central booking on %s: %d hotels, %d guests", b.cfg.Listen, len(b.hotels), len(b.guests))
+	log.Printf("central booking on %s: %d hotels, %d guests", b.cfg.Listen, len(b.hotelList()), len(b.guests))
 	log.Fatal(srv.ListenAndServe())
 }

@@ -55,7 +55,7 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 202, map[string]any{"id": id, "state": "running", "snapshot_id": req["snapshot_id"]})
 	case p == "/v1/sandboxes" && r.Method == "GET":
 		writeJSON(w, 200, map[string]any{"sandboxes": f.rooms})
-	case p == "/room/health" || p == "/v1/quota":
+	case p == "/room/health" || p == "/v1/quota" || p == "/v1/status":
 		writeJSON(w, 200, map[string]any{})
 	case strings.HasSuffix(p, "/exec") && r.Method == "POST":
 		f.execs = append(f.execs, req)
@@ -140,7 +140,7 @@ func newChainState(t *testing.T, stateDir string) *testChain {
 		t.Fatal(err)
 	}
 	tc := &testChain{hotels: map[string]*fakeHotel{}}
-	cfg := config{StateDir: stateDir, Guests: []guestConfig{{ID: "g1", KeySHA256: sha("key1")}, {ID: "g2", KeySHA256: sha("key2")}}}
+	cfg := config{StateDir: stateDir, OperatorKeySHA256: sha("operator-key"), InsecureCookie: true, Guests: []guestConfig{{ID: "g1", KeySHA256: sha("key1"), ViewTokenSHA256: sha("view1")}, {ID: "g2", KeySHA256: sha("key2")}}}
 	for _, id := range []string{"a", "b", "c"} {
 		f := &fakeHotel{t: t, snaps: map[string]map[string]any{}}
 		hs := httptest.NewServer(f)
@@ -175,7 +175,10 @@ func (tc *testChain) start(t *testing.T) {
 	if err := b.loadCompat(); err != nil {
 		t.Fatal(err)
 	}
-	for _, h := range b.hotels {
+	if err := b.loadRuntimeHotels(); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range b.hotelList() {
 		h.ok, h.slots = true, 100
 	}
 	tc.b = b
@@ -296,7 +299,7 @@ func TestForkWaitsForTheOwnerHotelInsteadOfScattering(t *testing.T) {
 	_, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+room+"/snapshot", map[string]any{})
 	snapID := doc["result"].(map[string]any)["snapshot_id"].(string)
 	tc.b.mu.Lock()
-	tc.b.byHotel["c"].cfg.Drain = true
+	tc.b.hotelByID("c").cfg.Drain = true
 	tc.b.mu.Unlock()
 	before := createsOn(tc)
 	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"snapshot_id": snapID})
@@ -376,7 +379,7 @@ func TestCreateByHotelLabelsAndIDs(t *testing.T) {
 	}
 	// Selected hotel full: 429, never another hotel.
 	tc.b.mu.Lock()
-	tc.b.byHotel["a"].slots = len(tc.b.byHotel["a"].rooms)
+	tc.b.hotelByID("a").slots = len(tc.b.hotelByID("a").rooms)
 	tc.b.mu.Unlock()
 	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotel_labels": map[string]string{"sealed": "true"}})
 	if status != 429 || errCode(doc) != "no_free_rooms" {

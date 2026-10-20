@@ -118,7 +118,7 @@ func (b *broker) handleProbe(w http.ResponseWriter, r *http.Request, g *guestSta
 	out := map[string]probeResult{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for _, h := range b.hotels {
+	for _, h := range b.hotelList() {
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
@@ -149,7 +149,7 @@ func (b *broker) saveCaps() {
 	}
 	b.mu.Lock()
 	m := map[string]any{}
-	for _, h := range b.hotels {
+	for _, h := range b.hotelList() {
 		if h.caps != nil {
 			m[h.cfg.ID] = h.caps
 		}
@@ -172,7 +172,7 @@ func (b *broker) loadCaps() {
 		return
 	}
 	for id, c := range m {
-		if h := b.byHotel[id]; h != nil {
+		if h := b.hotelByID(id); h != nil {
 			h.caps = c
 		}
 	}

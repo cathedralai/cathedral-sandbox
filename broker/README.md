@@ -82,6 +82,22 @@ Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
   `state_dir/build-contexts/`. After a restart, a repeated create with the
   same key returns the first answer, and a room keeps its client id.
 
+## Hotels at runtime
+
+With `operator_key_sha256` (SHA-256 of the operator key) and `state_dir` in
+the config, an operator adds and removes hotels without a restart:
+
+| Route (operator key) | What it does |
+|---|---|
+| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "threads"?, "ram_gib"?}`. The broker first calls `GET /v1/status` on the hotel with the key (`"verify": false` skips it). |
+| `PATCH /v1/broker/hotels/<id>` | Sets `drain` and `labels`. |
+| `DELETE /v1/broker/hotels/<id>` | Removes a runtime hotel that has no rooms. Drain it first. |
+
+The broker keeps runtime hotels in `state_dir/hotels.json` and their keys in
+`state_dir/hotel-keys/<id>.key` (mode 0600). A hotel from the config file
+cannot be removed at runtime. `GET /v1/broker/hotels` (guest key) lists all
+hotels with labels and free rooms.
+
 ## Secrets
 
 - The config file is private (not in git). It holds hotel addresses, the
@@ -92,8 +108,11 @@ Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
 
 ## Live view
 
-`/<guest>/live?token=<view token>` sets an HttpOnly, Secure, SameSite=Lax
-cookie for that guest path and redirects to `/<guest>/live`. Every request
+`/<guest>/live` without the cookie shows a sign-in form. The form posts
+the view token to `/<guest>/live/sign-in`, so the token does not stay in
+the browser history. A good token sets an HttpOnly, Secure, SameSite=Lax
+cookie for that guest path and redirects to `/<guest>/live`. The older link
+`/<guest>/live?token=<view token>` still works the same way. Every request
 to the page and to its data stream (`/<guest>/live/events`, server-sent
 events, 1 per second) needs that cookie. A wrong token and an unknown guest
 both get 401. The page shows hotel names, threads and RAM from the config,

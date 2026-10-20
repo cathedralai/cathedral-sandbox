@@ -233,7 +233,7 @@ var compatTemplates = map[string][2]int{"room-1x4": {1, 4}, "room-2x8": {2, 8}, 
 func (b *broker) compatCatalog(w http.ResponseWriter) {
 	b.mu.Lock()
 	free := 0
-	for _, h := range b.hotels {
+	for _, h := range b.hotelList() {
 		if h.ok {
 			if f := h.slots - h.used(); f > 0 {
 				free += f
@@ -278,7 +278,7 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 	b.markDirty()
 	// Warm every hotel in the background; a create pulls a missing image anyway.
 	pf, _ := json.Marshal(map[string]any{"images": []string{img.Ref}})
-	for _, ht := range b.hotels {
+	for _, ht := range b.hotelList() {
 		go func(ht *hotel) {
 			_, _, _, _ = ht.do(context.Background(), "POST", "/v1/images/prefetch", nil, pf, 10*time.Minute)
 		}(ht)
@@ -465,7 +465,7 @@ func (b *broker) compatQuota(w http.ResponseWriter, r *http.Request, g *guestSta
 	_ = json.Unmarshal(c.buf.Bytes(), &doc)
 	b.mu.Lock()
 	free := 0
-	for _, h := range b.hotels {
+	for _, h := range b.hotelList() {
 		if f := h.slots - h.used(); h.ok && f > 0 {
 			free += f
 		}
@@ -599,7 +599,7 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 
 func (b *broker) cleanupState(ctx context.Context, bid string) string {
 	hotelID, hid, _ := strings.Cut(bid, ".")
-	h := b.byHotel[hotelID]
+	h := b.hotelByID(hotelID)
 	if h == nil {
 		return "confirmed"
 	}

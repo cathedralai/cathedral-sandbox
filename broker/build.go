@@ -86,7 +86,7 @@ func (b *broker) compatBuild(w http.ResponseWriter, r *http.Request, g *guestSta
 func (b *broker) ensureBuilds(img *compatImage) {
 	b.mu.Lock()
 	var hotels []*hotel
-	for _, h := range b.hotels {
+	for _, h := range b.hotelList() {
 		if !h.cfg.Drain {
 			hotels = append(hotels, h)
 		}

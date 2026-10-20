@@ -104,7 +104,7 @@ func waitImage(t *testing.T, tc *testChain, id string) map[string]any {
 func TestBuildThroughTheBrokerAndCreateOnlyWhereBuilt(t *testing.T) {
 	tc := newChain(t)
 	tc.hotels["c"].failBuild = true
-	tc.b.byHotel["b"].cfg.Drain = true // a draining hotel does not build
+	tc.b.hotelByID("b").cfg.Drain = true // a draining hotel does not build
 	body, ctype := buildForm(t, "FROM alpine:3.20\n", []byte("gzip-bytes"))
 	status, doc := tc.clientCall(t, "POST", "/v1/images/build", body, map[string]string{"Content-Type": ctype})
 	if status != 200 || doc["image_id"] == nil {
@@ -121,7 +121,7 @@ func TestBuildThroughTheBrokerAndCreateOnlyWhereBuilt(t *testing.T) {
 	if len(tc.hotels["b"].builds) != 0 {
 		t.Fatalf("draining hotel built")
 	}
-	tc.b.byHotel["b"].cfg.Drain = false
+	tc.b.hotelByID("b").cfg.Drain = false
 	before := createsOn(tc)
 	for i := 0; i < 4; i++ {
 		status, doc = tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": view["image_id"]}), nil)
@@ -177,7 +177,7 @@ func TestIdempotentCreateSurvivesABrokerRestart(t *testing.T) {
 	before := createsOn(tc)
 
 	tc.start(t) // restart: a new broker process over the same state_dir
-	for _, h := range tc.b.hotels {
+	for _, h := range tc.b.hotelList() {
 		tc.b.syncHotel(context.Background(), h)
 	}
 	status, again := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4"}), hdr)
