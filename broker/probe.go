@@ -93,7 +93,26 @@ func (b *broker) probeHotel(ctx context.Context, h *hotel, g *guestState, dind b
 	if dind {
 		res.Dind, res.DindNote = b.probeDind(ctx, h, g)
 	}
+	if h.cfg.Sealed {
+		res.Sealed, res.SealedNote = b.probeSealed(ctx, h)
+	}
 	return res
+}
+
+// probeSealed reads a sealed hotel's attestation. The broker does not check
+// the AMD signature chain; a guest checks it offline with verify_receipts.py.
+func (b *broker) probeSealed(ctx context.Context, h *hotel) (bool, string) {
+	var att struct {
+		Binding struct {
+			Measurement string `json:"measurement"`
+		} `json:"binding"`
+		Report string `json:"report_b64"`
+	}
+	if err := h.getJSON(ctx, h.cfg.Health, "/room/attestation", nil, &att); err != nil || att.Report == "" || len(att.Binding.Measurement) != 96 {
+		return false, "configured as sealed, but the hotel gives no SEV-SNP attestation"
+	}
+	return true, "rooms run under gVisor inside an AMD SEV-SNP guest (measurement " + att.Binding.Measurement[:16] +
+		"...); report and receipts at /v1/hotels/" + h.cfg.ID + "/attestation, verify offline with verify_receipts.py"
 }
 
 func (b *broker) probeDind(ctx context.Context, h *hotel, g *guestState) (string, string) {
