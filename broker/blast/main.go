@@ -83,6 +83,7 @@ type hotelStat struct {
 	Load1       float64 `json:"load1"`
 	Queued      int     `json:"queued"`
 	Creating    int     `json:"creating"`
+	Failed      int     `json:"failed"`
 }
 
 func stats(ctx context.Context) ([]hotelStat, map[string]any) {
@@ -111,6 +112,7 @@ func main() {
 	execEvery := flag.Duration("exec", 30*time.Second, "exec interval for the sample")
 	watch := flag.Duration("watch", 40*time.Minute, "max time to watch cleanup")
 	memStop := flag.Float64("memstop", 90, "abort if any hotel RAM % is above this")
+	failStop := flag.Float64("failstop", 1, "abort if failed room starts exceed this % of -n")
 	outDir := flag.String("out", ".", "output directory")
 	stopFile := flag.String("stopfile", "", "abort when this file exists")
 	netCheck := flag.Int("netcheck", 0, "rooms that fetch a public URL once at the start of the hold")
@@ -159,6 +161,14 @@ func main() {
 					aborted.Store(fmt.Sprintf("hotel %s RAM %.1f%% > %.0f%%", h.ID, h.Mem, *memStop))
 					cancel()
 				}
+			}
+			failed := 0
+			for _, h := range hs {
+				failed += h.Failed
+			}
+			if float64(failed) > *failStop/100*float64(*n) && aborted.Load() == "" {
+				aborted.Store(fmt.Sprintf("%d failed room starts > %.1f%%", failed, *failStop))
+				cancel()
 			}
 			pmu.Unlock()
 			if *stopFile != "" {

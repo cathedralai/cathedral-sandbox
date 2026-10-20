@@ -251,8 +251,9 @@ footer { margin-top: 18px; font-size: 14px; color: var(--muted); max-width: 80ch
     const el = t.el.querySelector(".state"), txt = t.el.querySelector(".stxt");
     const age = h.seen_age_s, ms = h.health_ms || 0;
     let cls = "ok", label = `answering · seen ${age < 0 ? "?" : Math.max(0, Math.round(age))} s ago`;
-    if (!h.ok) { cls = "down"; label = age < 0 ? "not answering yet" : `not answering · last seen ${Math.round(age)} s ago`; }
-    else if (ms > 2000 || age > 5) { cls = "slow"; label = `slow · ${(ms / 1000).toFixed(1)} s`; }
+    if (h.drain && h.ok) { cls = "slow"; label = "not taking new rooms"; }
+    else if (!h.ok) { cls = "down"; label = age < 0 ? "not answering yet" : `not answering · last seen ${Math.round(age)} s ago`; }
+    else if (!h.drain && (ms > 2000 || age > 5)) { cls = "slow"; label = `slow · ${(ms / 1000).toFixed(1)} s`; }
     el.className = "state " + cls; txt.textContent = label;
   }
   function setCaps(t, c) {

@@ -131,7 +131,10 @@ tar -xzf "$ROOM_OPT/cache/caddy-$CADDY_VERSION.tar.gz" -C "$ROOM_OPT/bin" caddy
 id poolroom >/dev/null 2>&1 || { useradd --system --home-dir /var/lib/pool-room --shell /usr/sbin/nologin poolroom; mark "user:poolroom"; }
 
 # ---------------------------------------------------------------- 7. room Docker daemon (runsc default)
-ROOM_DAEMON_HASH_BEFORE=$({ cat "$ROOM_ETC/daemon.json" "$ROOM_OPT/bin/room-net.sh" 2>/dev/null || true; } | sha256sum)
+# The firewall for room bridges comes from room-net.sh and the bridge settings;
+# a change in any of them restarts the room daemon (room guests only).
+net_settings() { grep -E '^(ROOM_BRIDGE|ROOM_BRIDGE_CIDR|ROOM_NETS|ROOM_NET_BRIDGE_PREFIX)=' "$ROOM_ETC/room.env.applied" 2>/dev/null || true; }
+ROOM_DAEMON_HASH_BEFORE=$({ cat "$ROOM_ETC/daemon.json" "$ROOM_OPT/bin/room-net.sh" 2>/dev/null; net_settings; } | sha256sum)
 install -m 0755 "$KIT/lib/room-net.sh" "$ROOM_OPT/bin/room-net.sh"
 DNS_JSON=$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1].split()))' "$ROOM_DNS")
 MIRRORS_JSON=$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1].split()))' "${ROOM_REGISTRY_MIRRORS:-}")
@@ -205,7 +208,8 @@ SIZE_QUOTA=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["quo
 log "size: $SIZE_SLOTS slots, quota $SIZE_QUOTA"
 
 systemctl enable --now "$ROOM_ID-docker.service"
-if [ "$(cat "$ROOM_ETC/daemon.json" "$ROOM_OPT/bin/room-net.sh" | sha256sum)" != "$ROOM_DAEMON_HASH_BEFORE" ] && [ -n "${ROOM_DAEMON_HASH_BEFORE// -/}" ]; then
+cp "$ROOM_ETC/room.env" "$ROOM_ETC/room.env.applied"
+if [ "$({ cat "$ROOM_ETC/daemon.json" "$ROOM_OPT/bin/room-net.sh"; net_settings; } | sha256sum)" != "$ROOM_DAEMON_HASH_BEFORE" ] && [ -n "${ROOM_DAEMON_HASH_BEFORE// -/}" ]; then
   log "room daemon config changed: restarting the room daemon (room guests only)"
   systemctl restart "$ROOM_ID-docker.service"
 fi

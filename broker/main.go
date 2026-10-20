@@ -47,6 +47,7 @@ type hotelConfig struct {
 	Health      string `json:"health"` // base URL of the hotel /room/health endpoint
 	KeyFile     string `json:"key_file"`
 	Concurrency int    `json:"concurrency"` // creates in flight at this hotel
+	Drain       bool   `json:"drain"`       // true: no new rooms here; existing rooms keep working
 }
 
 type guestConfig struct {
@@ -298,7 +299,7 @@ func (b *broker) pick(exclude map[*hotel]bool) *hotel {
 	total := 0
 	free := make([]int, len(b.hotels))
 	for i, h := range b.hotels {
-		if !h.ok || exclude[h] || now.Before(h.backoffUntil) {
+		if !h.ok || h.cfg.Drain || exclude[h] || now.Before(h.backoffUntil) {
 			continue
 		}
 		if f := h.slots - h.used(); f > 0 {
@@ -776,7 +777,7 @@ func (b *broker) handleStats(w http.ResponseWriter, r *http.Request, g *guestSta
 			}
 		}
 		hotels = append(hotels, map[string]any{
-			"id": h.cfg.ID, "ok": h.ok, "slots": h.slots, "broker_running": running, "queued": h.queued, "creating": h.creating,
+			"id": h.cfg.ID, "ok": h.ok, "drain": h.cfg.Drain, "slots": h.slots, "broker_running": running, "queued": h.queued, "creating": h.creating,
 			"api_running": h.apiRunning, "api_deleting": h.apiDeleting, "containers": h.containers,
 			"cpu_pct": h.cpuPct, "mem_pct": h.memPct, "mem_gib": h.memGiB, "load1": h.load1,
 			"created": h.created, "failed": h.failed, "rejected_429": h.rejected,
@@ -983,7 +984,7 @@ func (b *broker) snapshot(g *guestState) map[string]any {
 		tot["deleting"] += mine[stDeleting]
 		tot["failed_now"] += mine[stFailed]
 		hotels = append(hotels, map[string]any{
-			"id": h.cfg.ID, "name": h.cfg.Name, "threads": h.cfg.Threads, "ram_gib": h.cfg.RAMGiB, "slots": h.slots, "ok": h.ok,
+			"id": h.cfg.ID, "name": h.cfg.Name, "threads": h.cfg.Threads, "ram_gib": h.cfg.RAMGiB, "slots": h.slots, "ok": h.ok, "drain": h.cfg.Drain,
 			"grid": string(grid), "cpu": h.cpuPct, "mem_pct": h.memPct, "mem_gib": h.memGiB, "load1": h.load1,
 			"containers": h.containers, "rooms_all": h.apiRunning, "deleting_all": h.apiDeleting,
 			"queued": h.queued, "creating": h.creating,
