@@ -22,7 +22,7 @@ OUT=$SEALED_DIR/images/$STAMP
 mkdir -p "$B" "$OUT"
 
 # ---------------------------------------------------------------- 1. base root file system (cached)
-PKGS=systemd,systemd-sysv,udev,kmod,iproute2,nftables,iptables,docker.io,containerd,xfsprogs,cryptsetup-bin,curl,ca-certificates,bzip2,python3,procps,util-linux,iputils-ping,linux-image-virtual,openssh-server,less,tar,gzip,zstd,passwd
+PKGS=systemd,systemd-sysv,udev,kmod,iproute2,nftables,iptables,docker.io,containerd,xfsprogs,cryptsetup-bin,curl,ca-certificates,bzip2,python3,procps,util-linux,iputils-ping,linux-image-virtual,openssh-server,less,tar,gzip,zstd,passwd,dmsetup
 BASE_ID=$(echo "$SEALED_SUITE $SEALED_MIRROR $PKGS" | sha256sum | cut -c1-12)
 if [ ! -d "$B/base-$BASE_ID" ]; then
   log "mmdebstrap $SEALED_SUITE (base $BASE_ID)"
@@ -177,7 +177,7 @@ EOF
 # Units: no logins, no host Docker daemon, no apt timers; the hotel and the guard on.
 in_root() { chroot "$R" "$@"; }
 in_root systemctl mask -q docker.service docker.socket serial-getty@ttyS0.service getty@tty1.service \
-  console-getty.service apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+  console-getty.service getty.target apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 in_root systemctl enable -q systemd-networkd.service sealed-guard.service sealed-hotel.service containerd.service
 in_root passwd -l root >/dev/null
 if [ $DEBUG = 1 ]; then
@@ -186,6 +186,8 @@ if [ $DEBUG = 1 ]; then
   chmod 0600 "$R/root/.ssh/authorized_keys"
   printf 'ListenAddress %s\nPasswordAuthentication no\nPermitRootLogin prohibit-password\n' "$SEALED_GUEST_IP" \
     > "$R/etc/ssh/sshd_config.d/10-sealed-debug.conf"
+  mkdir -p "$R/etc/systemd/system/ssh.service.d"
+  printf '[Service]\nExecStartPre=/usr/bin/ssh-keygen -A\n' > "$R/etc/systemd/system/ssh.service.d/10-hostkeys.conf"
   in_root systemctl enable -q ssh.service
 else
   in_root systemctl mask -q ssh.service ssh.socket 2>/dev/null || true
@@ -198,7 +200,7 @@ rm -f "$R"/etc/ssh/ssh_host_*
 log "packing initrd"
 ( cd "$R" && find . -mindepth 1 \( -path './proc/*' -o -path './sys/*' -o -path './dev/*' \) -prune -o -print0 \
   | LC_ALL=C sort -z | cpio --null -o -H newc --reproducible --quiet ) | zstd -q -T0 -10 > "$OUT/initrd.cpio.zst"
-CMDLINE="console=ttyS0 loglevel=4 panic=-1 rdinit=/init cathedral.hotel=$SEALED_NAME cathedral.debug=$DEBUG"
+CMDLINE="console=ttyS0 loglevel=6 systemd.show_status=error panic=-1 rdinit=/init cathedral.hotel=$SEALED_NAME cathedral.debug=$DEBUG"
 printf '%s' "$CMDLINE" > "$OUT/cmdline"
 install -m 0644 "$SEALED_OVMF" "$OUT/OVMF.amdsev.fd"
 

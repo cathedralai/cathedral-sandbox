@@ -11,7 +11,8 @@ DEV=/dev/disk/by-id/virtio-sealed-scratch
 for _ in $(seq 60); do [ -b "$DEV" ] && break; sleep 1; done
 [ -b "$DEV" ] || { log "no scratch disk"; exit 1; }
 if [ ! -e /dev/mapper/sealed-scratch ]; then
-  cryptsetup open --type plain --cipher aes-xts-plain64 --key-size 512 --hash plain \
+  # No udev sync for device-mapper in this minimal guest: libdevmapper makes the node itself.
+  DM_DISABLE_UDEV=1 cryptsetup open --type plain --cipher aes-xts-plain64 --key-size 512 --hash plain \
     --key-file /dev/urandom --keyfile-size 64 --sector-size 4096 "$DEV" sealed-scratch
 fi
 log "scratch encrypted: $(blockdev --getsize64 /dev/mapper/sealed-scratch) bytes"
