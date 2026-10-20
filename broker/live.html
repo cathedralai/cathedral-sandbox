@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central Booking Live</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0A0A1A; --card: #12122A; --raise: #1A1A4E; --line: rgba(76,201,240,.18);
+  --text: #FFFFFF; --body: #F0F0F5; --muted: #8E92A4;
+  --free: rgba(142,146,164,.16); --creating: #FFB800; --running: #4CC9F0; --deleting: #9B8CFF;
+  --failed: #FF5C7A; --other: rgba(142,146,164,.55); --bar: #4CC9F0; --barwarn: #FFB800; --barbad: #FF5C7A;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #F4F6FC; --card: #FFFFFF; --raise: #E9ECF7; --line: rgba(34,34,214,.14);
+    --text: #0A0A1A; --body: #4A4E69; --muted: #6B6F86;
+    --free: rgba(74,78,105,.12); --creating: #E09A00; --running: #1C8FC0; --deleting: #6A55E0;
+    --failed: #D7264A; --other: rgba(74,78,105,.45); --bar: #2222D6;
+  }
+}
+:root[data-theme="light"] {
+  --bg: #F4F6FC; --card: #FFFFFF; --raise: #E9ECF7; --line: rgba(34,34,214,.14);
+  --text: #0A0A1A; --body: #4A4E69; --muted: #6B6F86;
+  --free: rgba(74,78,105,.12); --creating: #E09A00; --running: #1C8FC0; --deleting: #6A55E0;
+  --failed: #D7264A; --other: rgba(74,78,105,.45); --bar: #2222D6;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--body); }
+body { font: 16px/1.45 Inter, system-ui, -apple-system, sans-serif; padding: 20px 16px 40px; }
+.wrap { max-width: 1440px; margin: 0 auto; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 18px; }
+h1 { margin: 0; color: var(--text); font-size: 28px; font-weight: 700; letter-spacing: -.01em; }
+.guest { font-family: "JetBrains Mono", monospace; font-size: 14px; color: var(--muted); }
+.guest b { color: var(--text); font-weight: 600; }
+.live { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; color: var(--muted); margin-left: auto; }
+.dot { width: 8px; height: 8px; border-radius: 4px; background: var(--muted); }
+.dot.on { background: #3DDC97; box-shadow: 0 0 0 3px rgba(61,220,151,.18); }
+button.theme { font: inherit; font-size: 14px; color: var(--body); background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button.theme:hover { border-color: var(--running); }
+button.theme:focus-visible { outline: 2px solid var(--running); outline-offset: 2px; }
+.top { display: grid; grid-template-columns: minmax(260px, 1.1fr) 2fr; gap: 12px; margin-bottom: 12px; }
+@media (max-width: 860px) { .top { grid-template-columns: 1fr; } }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
+.hero { padding: 16px 18px; }
+.hero .k { font-size: 14px; color: var(--muted); }
+.hero .big { font: 600 64px/1.05 "JetBrains Mono", monospace; color: var(--text); font-variant-numeric: tabular-nums; }
+.hero .sub { font-size: 14px; color: var(--muted); margin-top: 6px; }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0; padding: 6px 0; }
+@media (min-width: 1200px) { .stats { grid-template-columns: repeat(6, 1fr); } }
+.stat { padding: 10px 16px; }
+.stat .k { font-size: 13px; color: var(--muted); white-space: nowrap; }
+.stat .v { font: 600 24px/1.2 "JetBrains Mono", monospace; color: var(--text); font-variant-numeric: tabular-nums; }
+.chart { padding: 10px 16px 12px; border-top: 1px solid var(--line); grid-column: 1 / -1; }
+.chart .k { font-size: 13px; color: var(--muted); display: flex; gap: 14px; }
+.chart .k i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 4px; }
+.chart canvas { width: 100%; height: 72px; display: block; }
+.panel { display: grid; grid-template-rows: auto auto; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 14px; color: var(--muted); margin: 14px 2px 10px; }
+.legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; background: var(--c); }
+.hotels { display: flex; flex-wrap: wrap; gap: 12px; }
+.hotel { padding: 14px 16px 16px; min-width: 270px; flex: var(--w) 1 0; }
+@media (max-width: 700px) { .hotel { flex-basis: 100%; } }
+.hotel .head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.hotel h2 { margin: 0; font-size: 20px; font-weight: 600; color: var(--text); }
+.hotel .spec { font-size: 14px; color: var(--muted); }
+.hotel .state { font-size: 13px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
+.hotel .state i { width: 8px; height: 8px; border-radius: 4px; background: var(--muted); }
+.hotel .state.ok i { background: #3DDC97; }
+.hotel .state.slow i { background: var(--creating); }
+.hotel .state.down { color: var(--failed); }
+.hotel .state.down i { background: var(--failed); }
+.caps { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 2px; }
+.caps span { font-size: 13px; padding: 2px 8px; border-radius: 4px; background: var(--raise); color: var(--body); border: 1px solid var(--line); }
+.caps span b { font-weight: 600; color: var(--text); }
+.caps span.no b { color: var(--muted); }
+.meters { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; margin: 10px 0 8px; }
+.meter .k { font-size: 13px; color: var(--muted); display: flex; justify-content: space-between; }
+.meter .k b { font-family: "JetBrains Mono", monospace; font-weight: 600; color: var(--body); }
+.meter .track { height: 6px; border-radius: 3px; background: var(--free); overflow: hidden; margin-top: 4px; }
+.meter .fill { height: 100%; width: 0; background: var(--bar); transition: width .3s ease; }
+.counts { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 14px; color: var(--muted); margin-bottom: 10px; }
+.counts b { font-family: "JetBrains Mono", monospace; color: var(--text); font-weight: 600; }
+.grid { width: 100%; display: block; }
+footer { margin-top: 18px; font-size: 14px; color: var(--muted); max-width: 80ch; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Central booking</h1>
+    <span class="guest">guest <b id="guest">...</b></span>
+    <span class="live"><span class="dot" id="dot"></span><span id="clock">connecting</span></span>
+    <button class="theme" id="theme" type="button" aria-label="Switch theme">Theme</button>
+  </header>
+
+  <section class="top">
+    <div class="card hero" aria-live="polite">
+      <div class="k">Your rooms running</div>
+      <div class="big" id="running">0</div>
+      <div class="sub" id="chain">0 hotels in the chain</div>
+    </div>
+    <div class="card panel">
+      <div class="stats">
+        <div class="stat"><div class="k">Creates/s</div><div class="v" id="rate">0</div></div>
+        <div class="stat"><div class="k">Waiting</div><div class="v" id="queued">0</div></div>
+        <div class="stat"><div class="k">Creating</div><div class="v" id="creating">0</div></div>
+        <div class="stat"><div class="k">Deleting</div><div class="v" id="deleting">0</div></div>
+        <div class="stat"><div class="k">Failures</div><div class="v" id="failed">0</div></div>
+        <div class="stat"><div class="k">Turned away</div><div class="v" id="rejected">0</div></div>
+      </div>
+      <div class="chart">
+        <div class="k"><span><i style="background:var(--running)"></i>rooms running</span><span><i style="background:var(--creating)"></i>creates/s</span><span id="window">last 10 min</span></div>
+        <canvas id="spark" aria-label="Rooms running and creates per second over time"></canvas>
+      </div>
+    </div>
+  </section>
+
+  <div class="legend">
+    <span style="--c:var(--free)">free</span>
+    <span style="--c:var(--creating)">creating</span>
+    <span style="--c:var(--running)">running</span>
+    <span style="--c:var(--deleting)">deleting</span>
+    <span style="--c:var(--failed)">failed</span>
+    <span style="--c:var(--other)">other guests</span>
+  </div>
+  <section class="hotels" id="hotels"></section>
+  <footer>Each square is one room. A hotel is one machine; the chain is all hotels. Central booking sends each new room to a hotel with free rooms, in proportion to its free rooms. Every room runs under gVisor.</footer>
+</div>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const fmt = new Intl.NumberFormat("en-US");
+  const root = document.documentElement;
+  try { const t = localStorage.getItem("cb-theme"); if (t) root.dataset.theme = t; } catch (e) {}
+  $("theme").onclick = () => {
+    const dark = getComputedStyle(root).getPropertyValue("--bg").trim().toUpperCase() === "#0A0A1A";
+    root.dataset.theme = dark ? "light" : "dark";
+    try { localStorage.setItem("cb-theme", root.dataset.theme); } catch (e) {}
+    colors = readColors(); tiles.forEach((t) => (t.dirty = true)); drawSpark();
+  };
+  const STATES = { ".": "free", c: "creating", r: "running", d: "deleting", f: "failed", o: "other" };
+  let colors = readColors();
+  function readColors() {
+    const cs = getComputedStyle(root), o = {};
+    for (const k of Object.values(STATES)) o[k] = cs.getPropertyValue("--" + k).trim();
+    o.flash = cs.getPropertyValue("--text").trim();
+    return o;
+  }
+
+  const tiles = new Map();
+  function tileFor(h) {
+    let t = tiles.get(h.id);
+    if (t) return t;
+    const el = document.createElement("article");
+    el.className = "card hotel";
+    el.innerHTML = `<div class="head"><h2></h2><span class="spec"></span><span class="state"><i></i><span class="stxt">waiting</span></span></div>
+      <div class="caps" hidden></div>
+      <div class="meters">
+        <div class="meter"><div class="k">CPU <b class="cpu">0%</b></div><div class="track"><div class="fill fcpu"></div></div></div>
+        <div class="meter"><div class="k">RAM <b class="ram">0%</b></div><div class="track"><div class="fill fram"></div></div></div>
+      </div>
+      <div class="counts"><span>yours <b class="mine">0</b></span><span>all rooms <b class="all">0</b></span><span>containers <b class="cont">0</b></span><span>deleting <b class="del">0</b></span><span>waiting <b class="q">0</b></span></div>
+      <canvas class="grid" role="img"></canvas>`;
+    $("hotels").appendChild(el);
+    t = { el, canvas: el.querySelector("canvas"), grid: "", changed: new Map(), dirty: true, w: 0 };
+    t.canvas.addEventListener("mousemove", (e) => {
+      if (!t.L) return;
+      const r = t.canvas.getBoundingClientRect(), col = Math.floor((e.clientX - r.left) / t.L.cell), row = Math.floor((e.clientY - r.top) / t.L.cell);
+      const i = row * t.L.cols + col, st = STATES[t.grid[i]];
+      t.canvas.title = st ? `Room ${i + 1} · ${st === "other" ? "another guest" : st}` + (t.capsText ? `\n${t.capsText}` : "") : "";
+    });
+    el.querySelector("h2").textContent = h.name;
+    el.querySelector(".spec").textContent = `${h.threads} threads · ${fmt.format(h.ram_gib)} GiB`;
+    tiles.set(h.id, t);
+    new ResizeObserver(() => { t.dirty = true; kick(); }).observe(el);
+    return t;
+  }
+
+  function layout(t, n) {
+    // One cell size for every hotel, so a grid's area shows the hotel's size.
+    const w = t.canvas.clientWidth || 300;
+    const cell = innerWidth >= 1200 ? 7 : innerWidth >= 700 ? 6 : 5;
+    const cols = Math.max(1, Math.floor(w / cell));
+    const rows = Math.ceil(n / cols);
+    return { w, cell, cols, rows, h: rows * cell };
+  }
+
+  function draw(t, now) {
+    const n = t.grid.length, L = layout(t, n), dpr = window.devicePixelRatio || 1;
+    if (t.L === undefined || t.L.w !== L.w || t.L.rows !== L.rows || t.L.cell !== L.cell) {
+      t.canvas.style.height = L.h + "px";
+      t.canvas.width = Math.round(L.w * dpr); t.canvas.height = Math.round(L.h * dpr);
+      t.L = L;
+    }
+    const ctx = t.canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, L.w, L.h);
+    const gap = L.cell >= 6 ? 1 : 0.5, s = L.cell - gap;
+    let busy = false;
+    for (let i = 0; i < n; i++) {
+      const st = STATES[t.grid[i]] || "free";
+      const x = (i % L.cols) * L.cell, y = Math.floor(i / L.cols) * L.cell;
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = colors[st];
+      ctx.fillRect(x, y, s, s);
+      const at = t.changed.get(i);
+      if (at !== undefined) {
+        const k = 1 - (now - at) / 700;
+        if (k > 0 && st !== "free") { ctx.globalAlpha = 0.65 * k; ctx.fillStyle = colors.flash; ctx.fillRect(x, y, s, s); busy = true; }
+        else t.changed.delete(i);
+      }
+    }
+    ctx.globalAlpha = 1;
+    t.dirty = busy;
+    return busy;
+  }
+
+  let raf = 0;
+  function kick() { if (!raf) raf = requestAnimationFrame(frame); }
+  function frame(now) {
+    raf = 0;
+    let more = false;
+    tiles.forEach((t) => { if (t.dirty) more = draw(t, now) || more; });
+    if (more) kick();
+  }
+
+  // Time series kept in the page: one point per update, 10 minutes.
+  const series = [];
+  function drawSpark() {
+    const c = $("spark"), dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
+    c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+    const ctx = c.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
+    if (series.length < 2) return;
+    const t0 = series[0].t, t1 = series[series.length - 1].t, span = Math.max(t1 - t0, 60000);
+    const maxR = Math.max(10, ...series.map((p) => p.r)), maxC = Math.max(5, ...series.map((p) => p.c));
+    const line = (key, max, color, fill) => {
+      ctx.beginPath();
+      series.forEach((p, i) => { const x = ((p.t - t0) / span) * w, y = h - 3 - (p[key] / max) * (h - 8); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+      ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.stroke();
+      if (fill) { ctx.lineTo(((series[series.length - 1].t - t0) / span) * w, h); ctx.lineTo(0, h); ctx.closePath(); ctx.globalAlpha = 0.12; ctx.fillStyle = color; ctx.fill(); ctx.globalAlpha = 1; }
+    };
+    line("r", maxR, colors.running, true);
+    line("c", maxC, colors.creating, false);
+  }
+  addEventListener("resize", drawSpark);
+
+  function setState(t, h) {
+    const el = t.el.querySelector(".state"), txt = t.el.querySelector(".stxt");
+    const age = h.seen_age_s, ms = h.health_ms || 0;
+    let cls = "ok", label = `answering · seen ${age < 0 ? "?" : Math.max(0, Math.round(age))} s ago`;
+    if (!h.ok) { cls = "down"; label = age < 0 ? "not answering yet" : `not answering · last seen ${Math.round(age)} s ago`; }
+    else if (ms > 2000 || age > 5) { cls = "slow"; label = `slow · ${(ms / 1000).toFixed(1)} s`; }
+    el.className = "state " + cls; txt.textContent = label;
+  }
+  function setCaps(t, c) {
+    const box = t.el.querySelector(".caps");
+    if (!c) { box.hidden = true; t.capsText = ""; return; }
+    const items = [
+      ["Isolation", c.isolation || "?", c.isolation && c.isolation.startsWith("gVisor")],
+      ["Sealed", c.sealed ? "Yes" : "No", !!c.sealed],
+      ["Internet", c.internet == null ? "?" : c.internet ? `yes · ${Math.round(c.internet_ms || 0)} ms` : "no", !!c.internet],
+      ["Docker inside", c.dind || "not tested", c.dind === "yes"],
+    ];
+    const key = JSON.stringify(items);
+    if (key === t.capsKey) return;
+    t.capsKey = key; box.hidden = false; box.replaceChildren();
+    for (const [k, v, good] of items) {
+      const s = document.createElement("span"); if (!good) s.className = "no";
+      s.append(k + " "); const bb = document.createElement("b"); bb.textContent = v; s.append(bb);
+      box.append(s);
+    }
+    box.title = (c.sealed_note || "") + (c.dind_note ? ". " + c.dind_note : "") + (c.probed_at ? `. Checked ${c.probed_at} on a sample room.` : "");
+    t.capsText = items.map(([k, v]) => `${k}: ${v}`).join(" · ");
+  }
+
+  function setMeter(el, cls, pct) {
+    const f = el.querySelector(cls);
+    f.style.width = Math.max(0, Math.min(100, pct || 0)) + "%";
+    f.style.background = pct >= 90 ? "var(--barbad)" : pct >= 75 ? "var(--barwarn)" : "var(--bar)";
+  }
+
+  function update(d) {
+    $("guest").textContent = d.guest;
+    const T = d.totals;
+    $("running").textContent = fmt.format(T.running);
+    $("rate").textContent = T.creates_per_s.toFixed(1);
+    $("queued").textContent = fmt.format(T.queued);
+    $("creating").textContent = fmt.format(T.creating);
+    $("deleting").textContent = fmt.format(T.deleting);
+    $("failed").textContent = fmt.format(T.failed);
+    $("rejected").textContent = fmt.format(T.rejected);
+    const slots = d.hotels.reduce((a, h) => a + h.slots, 0), up = d.hotels.filter((h) => h.ok).length;
+    $("chain").textContent = `${up} of ${d.hotels.length} hotels in the chain answer · ${fmt.format(slots)} rooms`;
+    for (const h of d.hotels) {
+      const t = tileFor(h);
+      t.el.style.setProperty("--w", Math.max(1, h.slots / 100).toFixed(2));
+      setState(t, h);
+      setCaps(t, h.caps);
+      t.el.querySelector(".cpu").textContent = Math.round(h.cpu) + "%";
+      t.el.querySelector(".ram").textContent = `${Math.round(h.mem_pct)}% · ${Math.round(h.mem_gib)} GiB`;
+      setMeter(t.el, ".fcpu", h.cpu); setMeter(t.el, ".fram", h.mem_pct);
+      t.el.querySelector(".mine").textContent = fmt.format(h.mine.running);
+      t.el.querySelector(".all").textContent = fmt.format(h.rooms_all);
+      t.el.querySelector(".cont").textContent = fmt.format(h.containers);
+      t.el.querySelector(".del").textContent = fmt.format(h.deleting_all);
+      t.el.querySelector(".q").textContent = fmt.format(h.queued);
+      t.canvas.setAttribute("aria-label", `${h.name}: ${h.mine.running} of your rooms running, ${h.slots} rooms in total`);
+      const now = performance.now();
+      if (t.grid.length === h.grid.length) {
+        for (let i = 0; i < h.grid.length; i++) if (h.grid[i] !== t.grid[i]) t.changed.set(i, now);
+      }
+      if (t.grid !== h.grid) { t.grid = h.grid; t.dirty = true; }
+    }
+    series.push({ t: d.t, r: T.running, c: T.creates_per_s });
+    while (series.length && d.t - series[0].t > 600000) series.shift();
+    drawSpark();
+    kick();
+    $("clock").textContent = new Date(d.t).toISOString().slice(11, 19) + " UTC";
+  }
+
+  function connect() {
+    const es = new EventSource("live/events");
+    es.onopen = () => $("dot").classList.add("on");
+    es.onmessage = (e) => { try { update(JSON.parse(e.data)); } catch (err) {} };
+    es.onerror = () => { $("dot").classList.remove("on"); $("clock").textContent = "reconnecting"; };
+  }
+  connect();
+})();
+</script>
+</body>
+</html>

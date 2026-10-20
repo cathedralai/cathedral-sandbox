@@ -1,0 +1,363 @@
+#!/bin/bash
+# Room kit installer. Run as root: ./install.sh room.env
+# Steps: assess -> size -> deploy. Idempotent: run it again to apply changes.
+# It never edits the host Docker daemon (/etc/docker/daemon.json) and never
+# restarts it. The room runs its own dockerd (default runtime runsc) on its own
+# socket, data root, containerd namespace and bridge.
+set -euo pipefail
+umask 022
+KIT=$(cd "$(dirname "$0")" && pwd)
+ENV_FILE=$(readlink -f "${1:?usage: install.sh room.env}")
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+# shellcheck disable=SC1091
+source "$KIT/versions.lock"
+[ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+PROFILE_FILE="$KIT/profiles/${API_PROFILE}.sh"
+[ -f "$PROFILE_FILE" ] || { echo "unknown API_PROFILE $API_PROFILE" >&2; exit 1; }
+
+ROOM_ETC=/etc/pool-room
+ROOM_OPT=/opt/pool-room
+ROOM_RUN=/run/pool-room
+SOCK=$ROOM_RUN/docker.sock
+STATE=$ROOM_ETC/install-state
+mkdir -p "$ROOM_ETC" "$ROOM_OPT/cache" "$ROOM_OPT/bin"
+log() { echo "[room-kit] $*"; }
+mark() { grep -qxF "$1" "$STATE" 2>/dev/null || echo "$1" >> "$STATE"; }
+
+fetch() { # url sha-algo sha out
+  local url=$1 algo=$2 sum=$3 out=$4
+  if [ -f "$out" ] && echo "$sum  $out" | "${algo}sum" -c --quiet - 2>/dev/null; then return 0; fi
+  curl -fsSL --retry 3 -o "$out.part" "$url"
+  echo "$sum  $out.part" | "${algo}sum" -c --quiet - || { echo "checksum mismatch: $url" >&2; rm -f "$out.part"; exit 1; }
+  mv "$out.part" "$out"
+}
+
+# ---------------------------------------------------------------- 0. host packages
+need=()
+command -v dockerd >/dev/null || need+=(docker.io)
+command -v mkfs.xfs >/dev/null || need+=(xfsprogs)
+command -v curl >/dev/null || need+=(curl)
+command -v bzip2 >/dev/null || need+=(bzip2)
+command -v iptables >/dev/null || need+=(iptables)
+if [ ${#need[@]} -gt 0 ]; then
+  log "apt install ${need[*]}"
+  # A fresh docker.io install starts the host Docker daemon. That daemon sets
+  # the FORWARD policy to DROP, which can cut off VMs that already run here.
+  # The room does not need it: block service starts during the install and
+  # mask the host daemon units if this install added them.
+  NEW_DOCKER=0; [[ " ${need[*]} " == *" docker.io "* ]] && NEW_DOCKER=1
+  if [ $NEW_DOCKER = 1 ] && [ ! -e /usr/sbin/policy-rc.d ]; then
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d; chmod 0755 /usr/sbin/policy-rc.d; RM_POLICY=1
+  fi
+  DEBIAN_FRONTEND=noninteractive apt-get update -q
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${need[@]}"
+  [ "${RM_POLICY:-0}" = 1 ] && rm -f /usr/sbin/policy-rc.d
+  for p in "${need[@]}"; do mark "apt:$p"; done
+  if [ $NEW_DOCKER = 1 ]; then
+    systemctl mask docker.service docker.socket >/dev/null 2>&1 && mark "masked:docker"
+  fi
+fi
+[ -S /run/containerd/containerd.sock ] || systemctl enable --now containerd
+
+# ---------------------------------------------------------------- 1. assess (read-only)
+python3 "$KIT/assess.py" --data-dir "$ROOM_DATA_DIR" --room-socket "$SOCK" --out "$ROOM_ETC/machine.json"
+log "assess: $ROOM_ETC/machine.json"
+
+# Resolved copy of the config (values only, no comments) for units and health.
+ROOM_KEYS="ROOM_TLS ROOM_REGISTRY_MIRRORS ROOM_ID ROOM_HOSTNAME ROOM_ACME_EMAIL ROOM_CUSTOMER ROOM_REGION API_PROFILE ROOM_API_PORT ROOM_HEALTH_PORT ROOM_PUBLIC_PORT ROOM_DATA_DIR ROOM_DATA_DEVICE ROOM_DATA_IMG ROOM_DATA_SIZE_GB ROOM_BRIDGE ROOM_BRIDGE_CIDR ROOM_DNS ROOM_RUNSC_FLAGS ROOM_ALLOW_DIND ROOM_CREATES_PER_MINUTE ROOM_GC_PARALLELISM ROOM_DIND_DOCKERD_ARGS ROOM_DIND_ENV SHAPE_VCPU SHAPE_MEM_GIB SHAPE_DISK_GIB RESERVE_RAM_PCT RESERVE_THREADS DISK_MAX_FILL_PCT CPU_OVERCOMMIT MEM_OVERCOMMIT DISK_OVERCOMMIT ROOM_MAX_SLOTS"
+for k in $ROOM_KEYS; do printf '%s="%s"\n' "$k" "${!k:-}"; done > "$ROOM_ETC/room.env"
+chmod 0644 "$ROOM_ETC/room.env"
+
+# ---------------------------------------------------------------- 2. data volume (xfs, prjquota, no nodev)
+DATA_UNIT=$ROOM_ID-data.service
+install -m 0755 "$KIT/lib/room-data.sh" "$ROOM_OPT/bin/room-data.sh"
+if [ -n "${ROOM_DATA_DEVICE:-}" ]; then
+  if [ "$(blkid -o value -s TYPE "$ROOM_DATA_DEVICE" 2>/dev/null || true)" != xfs ]; then
+    [ "${ROOM_DATA_DEVICE_WIPE:-no}" = yes ] || { echo "$ROOM_DATA_DEVICE is not xfs; set ROOM_DATA_DEVICE_WIPE=yes to format it" >&2; exit 1; }
+    mkfs.xfs -f -q "$ROOM_DATA_DEVICE"
+  fi
+elif [ ! -f "$ROOM_DATA_IMG" ]; then
+  truncate -s "${ROOM_DATA_SIZE_GB}G" "$ROOM_DATA_IMG"
+  mkfs.xfs -f -q "$ROOM_DATA_IMG"
+  mark "file:$ROOM_DATA_IMG"
+fi
+cat > /etc/systemd/system/$DATA_UNIT <<EOF
+[Unit]
+Description=Pool room $ROOM_ID data volume (xfs prjquota)
+Before=$ROOM_ID-docker.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$ROOM_OPT/bin/room-data.sh up $ROOM_ETC/room.env
+ExecStop=$ROOM_OPT/bin/room-data.sh down $ROOM_ETC/room.env
+[Install]
+WantedBy=multi-user.target
+EOF
+mark "unit:$DATA_UNIT"
+
+# ---------------------------------------------------------------- 3. gVisor runsc (pinned, sha512)
+fetch "$GVISOR_URL" sha512 "$GVISOR_SHA512" "$ROOM_OPT/cache/gvisor-$GVISOR_RELEASE.tar.bz2"
+if [ ! -x "$ROOM_OPT/gvisor-$GVISOR_RELEASE/runsc" ]; then
+  mkdir -p "$ROOM_OPT/gvisor-$GVISOR_RELEASE"
+  tar -xjf "$ROOM_OPT/cache/gvisor-$GVISOR_RELEASE.tar.bz2" -C "$ROOM_OPT/gvisor-$GVISOR_RELEASE"
+fi
+ln -sfn "gvisor-$GVISOR_RELEASE" "$ROOM_OPT/gvisor"
+RUNSC=$ROOM_OPT/gvisor/runsc
+
+# ---------------------------------------------------------------- 4. Python 3.12 + cathedral (pinned)
+fetch "$UV_URL" sha256 "$UV_SHA256" "$ROOM_OPT/cache/uv-$UV_VERSION.tar.gz"
+tar -xzf "$ROOM_OPT/cache/uv-$UV_VERSION.tar.gz" -C "$ROOM_OPT/bin" --strip-components=1
+export UV_PYTHON_INSTALL_DIR=$ROOM_OPT/python UV_CACHE_DIR=$ROOM_OPT/cache/uv UV_NO_CONFIG=1
+"$ROOM_OPT/bin/uv" python install -q "$PYTHON_VERSION"
+export UV_PYTHON_PREFERENCE=only-managed
+[ -x "$ROOM_OPT/venv/bin/python" ] || "$ROOM_OPT/bin/uv" venv -q --python "$PYTHON_VERSION" "$ROOM_OPT/venv"
+"$ROOM_OPT/bin/uv" pip install -q --python "$ROOM_OPT/venv/bin/python" --require-hashes --only-binary :all: -r "$KIT/files/requirements.lock"
+echo "$CATHEDRAL_TARBALL_SHA256  $KIT/$CATHEDRAL_TARBALL" | sha256sum -c --quiet -
+rm -rf "$ROOM_OPT/src.new" && mkdir -p "$ROOM_OPT/src.new"
+tar -xzf "$KIT/$CATHEDRAL_TARBALL" -C "$ROOM_OPT/src.new" --strip-components=1
+rm -rf "$ROOM_OPT/src" && mv "$ROOM_OPT/src.new" "$ROOM_OPT/src"
+echo "$CATHEDRAL_COMMIT" > "$ROOM_OPT/src/COMMIT"
+install -m 0755 "$KIT/room_health.py" "$ROOM_OPT/bin/room_health.py"
+install -m 0755 "$KIT/room_api.py" "$ROOM_OPT/bin/room_api.py"
+install -m 0755 "$KIT/assess.py" "$ROOM_OPT/bin/assess.py"
+install -m 0755 "$KIT/size.py" "$ROOM_OPT/bin/size.py"
+
+# ---------------------------------------------------------------- 5. Caddy (pinned, sha512)
+fetch "$CADDY_URL" sha512 "$CADDY_SHA512" "$ROOM_OPT/cache/caddy-$CADDY_VERSION.tar.gz"
+tar -xzf "$ROOM_OPT/cache/caddy-$CADDY_VERSION.tar.gz" -C "$ROOM_OPT/bin" caddy
+
+# ---------------------------------------------------------------- 6. service user
+id poolroom >/dev/null 2>&1 || { useradd --system --home-dir /var/lib/pool-room --shell /usr/sbin/nologin poolroom; mark "user:poolroom"; }
+
+# ---------------------------------------------------------------- 7. room Docker daemon (runsc default)
+ROOM_DAEMON_HASH_BEFORE=$({ cat "$ROOM_ETC/daemon.json" "$ROOM_OPT/bin/room-net.sh" 2>/dev/null || true; } | sha256sum)
+install -m 0755 "$KIT/lib/room-net.sh" "$ROOM_OPT/bin/room-net.sh"
+DNS_JSON=$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1].split()))' "$ROOM_DNS")
+MIRRORS_JSON=$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1].split()))' "${ROOM_REGISTRY_MIRRORS:-}")
+RUNSC_ARGS_JSON=$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1].split()))' "$ROOM_RUNSC_FLAGS")
+cat > "$ROOM_ETC/daemon.json" <<EOF
+{
+  "hosts": ["unix://$SOCK"],
+  "group": "poolroom",
+  "data-root": "$ROOM_DATA_DIR/docker",
+  "exec-root": "$ROOM_RUN/exec",
+  "pidfile": "$ROOM_RUN/docker.pid",
+  "containerd": "/run/containerd/containerd.sock",
+  "containerd-namespace": "pool-room-$ROOM_ID",
+  "containerd-plugins-namespace": "pool-room-$ROOM_ID-plugins",
+  "features": {"containerd-snapshotter": false},
+  "storage-driver": "overlay2",
+  "bridge": "$ROOM_BRIDGE",
+  "iptables": false,
+  "ip6tables": false,
+  "ip-masq": false,
+  "userland-proxy": false,
+  "dns": $DNS_JSON,
+  "registry-mirrors": $MIRRORS_JSON,
+  "default-runtime": "runsc",
+  "runtimes": {"runsc": {"path": "$RUNSC", "runtimeArgs": $RUNSC_ARGS_JSON}},
+  "log-driver": "json-file",
+  "log-opts": {"max-size": "20m", "max-file": "2"}
+}
+EOF
+cat > /etc/systemd/system/$ROOM_ID-docker.service <<EOF
+[Unit]
+Description=Pool room $ROOM_ID Docker daemon (runsc)
+Requires=$DATA_UNIT
+After=$DATA_UNIT containerd.service network-online.target
+[Service]
+Type=notify
+RuntimeDirectory=pool-room
+RuntimeDirectoryPreserve=yes
+ExecStartPre=$ROOM_OPT/bin/room-net.sh up $ROOM_ETC/room.env
+ExecStart=/usr/bin/dockerd --config-file $ROOM_ETC/daemon.json
+ExecStopPost=$ROOM_OPT/bin/room-net.sh down $ROOM_ETC/room.env
+ExecReload=/bin/kill -s HUP \$MAINPID
+TimeoutStartSec=120
+Restart=on-failure
+LimitNOFILE=1048576
+TasksMax=infinity
+Delegate=yes
+KillMode=process
+[Install]
+WantedBy=multi-user.target
+EOF
+mark "unit:$ROOM_ID-docker.service"
+
+# ---------------------------------------------------------------- 8. size (after the volume exists)
+systemctl daemon-reload
+systemctl enable --now "$DATA_UNIT"
+mountpoint -q "$ROOM_DATA_DIR" || { echo "data volume did not mount" >&2; exit 1; }
+xfs_info "$ROOM_DATA_DIR" >/dev/null
+grep -E " $ROOM_DATA_DIR " /proc/mounts | grep -q prjquota || { echo "prjquota missing on $ROOM_DATA_DIR" >&2; exit 1; }
+mkdir -p "$ROOM_DATA_DIR/work" "$ROOM_DATA_DIR/docker"
+chown poolroom:poolroom "$ROOM_DATA_DIR/work"
+ROOM_DISK_BYTES=$(df -B1 --output=size "$ROOM_DATA_DIR" | tail -1)
+python3 "$KIT/size.py" "$ROOM_ETC/machine.json" --vcpu "$SHAPE_VCPU" --mem-gib "$SHAPE_MEM_GIB" --disk-gib "$SHAPE_DISK_GIB" \
+  --cpu-overcommit "$CPU_OVERCOMMIT" --mem-overcommit "$MEM_OVERCOMMIT" --disk-overcommit "$DISK_OVERCOMMIT" \
+  --reserve-ram-pct "$RESERVE_RAM_PCT" --reserve-threads "$RESERVE_THREADS" --disk-max-fill-pct "$DISK_MAX_FILL_PCT" \
+  --room-disk-bytes "$ROOM_DISK_BYTES" --max-slots "${ROOM_MAX_SLOTS:-0}" --out "$ROOM_ETC/size.json" \
+  --bridge-addresses "$(python3 -c 'import ipaddress,sys;print(ipaddress.ip_interface(sys.argv[1]).network.num_addresses-3)' "$ROOM_BRIDGE_CIDR")"
+SIZE_SLOTS=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["slots"])' "$ROOM_ETC/size.json")
+SIZE_QUOTA=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["quota"])' "$ROOM_ETC/size.json")
+[ "$SIZE_SLOTS" -gt 0 ] || { echo "size: 0 slots on this machine; see $ROOM_ETC/size.json" >&2; exit 1; }
+log "size: $SIZE_SLOTS slots, quota $SIZE_QUOTA"
+
+systemctl enable --now "$ROOM_ID-docker.service"
+if [ "$(cat "$ROOM_ETC/daemon.json" "$ROOM_OPT/bin/room-net.sh" | sha256sum)" != "$ROOM_DAEMON_HASH_BEFORE" ] && [ -n "${ROOM_DAEMON_HASH_BEFORE// -/}" ]; then
+  log "room daemon config changed: restarting the room daemon (room guests only)"
+  systemctl restart "$ROOM_ID-docker.service"
+fi
+for _ in $(seq 60); do docker -H "unix://$SOCK" info >/dev/null 2>&1 && break; sleep 1; done
+[ "$(docker -H "unix://$SOCK" info --format '{{.DefaultRuntime}}')" = runsc ] || { echo "room daemon default runtime is not runsc" >&2; exit 1; }
+docker -H "unix://$SOCK" pull -q "$PROBE_IMAGE" >/dev/null
+
+# ---------------------------------------------------------------- 9. key (from a file; never printed)
+{ XTRACE=$(set +o | grep xtrace); set +x; } 2>/dev/null
+KEY=$(tr -d ' \r\n' < "$ROOM_API_KEY_FILE")
+[[ "$KEY" =~ ^[A-Za-z0-9_-]{32,}$ ]] || { echo "key file must hold one key of 32+ chars [A-Za-z0-9_-]" >&2; exit 1; }
+install -m 0640 -o root -g poolroom /dev/null "$ROOM_ETC/api.key"
+printf '%s\n' "$KEY" > "$ROOM_ETC/api.key"
+# shellcheck disable=SC1090
+source "$PROFILE_FILE"
+install -m 0600 -o root -g root /dev/null "$ROOM_ETC/secret.env"
+profile_keys_env "$KEY" > "$ROOM_ETC/secret.env"
+install -m 0600 -o root -g root /dev/null "$ROOM_ETC/reaper.headers"
+printf 'Authorization: Bearer %s\n' "$KEY" > "$ROOM_ETC/reaper.headers"
+unset KEY
+eval "$XTRACE"
+
+# ---------------------------------------------------------------- 10. API unit (profile)
+{
+  echo "DOCKER_HOST=unix://$SOCK"
+  echo "HOME=/var/lib/pool-room"
+  echo "TMPDIR=$ROOM_DATA_DIR/work"
+  profile_env
+} > "$ROOM_ETC/api.env"
+cat > /etc/systemd/system/$ROOM_ID.service <<EOF
+[Unit]
+Description=Pool room $ROOM_ID API (profile $API_PROFILE)
+Requires=$ROOM_ID-docker.service
+After=$ROOM_ID-docker.service
+[Service]
+User=poolroom
+Group=poolroom
+StateDirectory=pool-room
+EnvironmentFile=$ROOM_ETC/api.env
+EnvironmentFile=$ROOM_ETC/secret.env
+ExecStart=$(profile_exec)
+Restart=on-failure
+LimitNOFILE=1048576
+TasksMax=infinity
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+ReadWritePaths=$ROOM_DATA_DIR/work /var/lib/pool-room
+[Install]
+WantedBy=multi-user.target
+EOF
+mark "unit:$ROOM_ID.service"
+
+cat > /etc/systemd/system/$ROOM_ID-health.service <<EOF
+[Unit]
+Description=Pool room $ROOM_ID health endpoint
+After=$ROOM_ID-docker.service
+[Service]
+User=poolroom
+Group=poolroom
+Environment=ROOM_ETC=$ROOM_ETC ROOM_DOCKER_SOCK=$SOCK ROOM_HEALTH_PORT=$ROOM_HEALTH_PORT ROOM_PROBE_IMAGE=$PROBE_IMAGE HOME=/var/lib/pool-room
+ExecStart=$ROOM_OPT/venv/bin/python $ROOM_OPT/bin/room_health.py
+Restart=on-failure
+NoNewPrivileges=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+mark "unit:$ROOM_ID-health.service"
+
+# The API collects past-TTL sandboxes only when it handles a list/get.
+# This timer makes collection happen even when no client is calling.
+cat > /etc/systemd/system/$ROOM_ID-reaper.service <<EOF
+[Unit]
+Description=Pool room $ROOM_ID TTL reaper tick
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/curl -fsS -o /dev/null -H @$ROOM_ETC/reaper.headers http://127.0.0.1:$ROOM_API_PORT/v1/sandboxes
+EOF
+cat > /etc/systemd/system/$ROOM_ID-reaper.timer <<EOF
+[Unit]
+Description=Pool room $ROOM_ID TTL reaper (every 60 s)
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=60
+AccuracySec=5
+[Install]
+WantedBy=timers.target
+EOF
+mark "unit:$ROOM_ID-reaper.timer"; mark "unit:$ROOM_ID-reaper.service"
+
+# ---------------------------------------------------------------- 11. Caddy on 443 (TLS-ALPN only, no port 80)
+if [ "${ROOM_TLS:-on}" = on ]; then
+cat > "$ROOM_ETC/Caddyfile" <<EOF
+{
+	auto_https disable_redirects
+	admin off
+	${ROOM_ACME_EMAIL:+email $ROOM_ACME_EMAIL}
+}
+https://$ROOM_HOSTNAME:$ROOM_PUBLIC_PORT {
+	tls {
+		issuer acme {
+			disable_http_challenge
+		}
+	}
+	handle /room/health {
+		reverse_proxy 127.0.0.1:$ROOM_HEALTH_PORT
+	}
+	handle {
+		reverse_proxy 127.0.0.1:$ROOM_API_PORT {
+			flush_interval -1
+			transport http {
+				read_timeout 15m
+				write_timeout 15m
+			}
+		}
+	}
+}
+EOF
+cat > /etc/systemd/system/$ROOM_ID-caddy.service <<EOF
+[Unit]
+Description=Pool room $ROOM_ID TLS front (Caddy $CADDY_VERSION)
+After=network-online.target $ROOM_ID.service
+[Service]
+DynamicUser=yes
+StateDirectory=pool-room-caddy
+Environment=XDG_DATA_HOME=/var/lib/pool-room-caddy XDG_CONFIG_HOME=/var/lib/pool-room-caddy
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ExecStart=$ROOM_OPT/bin/caddy run --config $ROOM_ETC/Caddyfile --adapter caddyfile
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+chmod 0644 "$ROOM_ETC/Caddyfile"
+mark "unit:$ROOM_ID-caddy.service"
+fi
+
+# ---------------------------------------------------------------- 12. host firewall (only if it blocks 443)
+if [ "${ROOM_TLS:-on}" != on ]; then
+  log "ROOM_TLS=off: no Caddy, no port $ROOM_PUBLIC_PORT; the API stays on 127.0.0.1 (front desk or SSH tunnel)"
+elif command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
+  ufw allow "$ROOM_PUBLIC_PORT/tcp" comment "pool-room:$ROOM_ID" >/dev/null && mark "ufw:$ROOM_PUBLIC_PORT/tcp"
+elif [ "$(iptables -S INPUT | head -1)" = "-P INPUT DROP" ] && ! iptables -C INPUT -p tcp --dport "$ROOM_PUBLIC_PORT" -j ACCEPT -m comment --comment "pool-room:$ROOM_ID" 2>/dev/null; then
+  iptables -I INPUT -p tcp --dport "$ROOM_PUBLIC_PORT" -j ACCEPT -m comment --comment "pool-room:$ROOM_ID" && mark "iptables:$ROOM_PUBLIC_PORT"
+fi
+
+# ---------------------------------------------------------------- 13. start
+systemctl daemon-reload
+systemctl enable -q "$ROOM_ID.service" "$ROOM_ID-health.service" "$ROOM_ID-reaper.timer"
+systemctl restart "$ROOM_ID.service" "$ROOM_ID-health.service"
+if [ "${ROOM_TLS:-on}" = on ]; then systemctl enable -q "$ROOM_ID-caddy.service"; systemctl restart "$ROOM_ID-caddy.service"; fi
+systemctl start "$ROOM_ID-reaper.timer"
+for _ in $(seq 30); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ROOM_API_PORT/v1/status")" != 000 ] && break; sleep 1; done
+log "API status: $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ROOM_API_PORT/v1/status")"
+log "python: $("$ROOM_OPT/venv/bin/python" -V) runsc: $("$RUNSC" --version | head -1) caddy: $("$ROOM_OPT/bin/caddy" version | cut -d' ' -f1)"
+log "done. health: curl -H 'Authorization: Bearer <key>' https://$ROOM_HOSTNAME/room/health"
