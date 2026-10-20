@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -120,4 +121,73 @@ func TestCreateTimeAverage(t *testing.T) {
 	if h.createEWMA < 1.59 || h.createEWMA > 1.61 {
 		t.Fatalf("second: %v", h.createEWMA)
 	}
+}
+
+// Run 5 rerun: creates that had left one hotel never went back to it, so a
+// queue of 300 stayed on a full hotel while the hotel they had left was idle.
+func TestQueuedCreateCanGoBackToAHotelItLeft(t *testing.T) {
+	tc := newChain(t)
+	tc.b.cfg.MaxQueueWaitSeconds = 0.2
+	a, bh := tc.b.hotelByID("a"), tc.b.hotelByID("b")
+	setHotel(tc, "c", func(h *hotel) { h.ok = false })
+	setHotel(tc, "b", func(h *hotel) {
+		h.sem = make(chan struct{}, 1)
+		h.sem <- struct{}{} // b's only slot is busy for the whole test
+		h.creating = 1
+		h.createEWMA = 30
+	})
+	g := tc.b.guests["g1"]
+	tc.b.mu.Lock()
+	bh.queued++
+	g.queued++
+	tc.b.mu.Unlock()
+	tried := map[*hotel]bool{a: true, bh: true} // it came from a earlier
+	done := make(chan *hotel, 1)
+	go func() { done <- tc.b.waitSlot(context.Background(), g, bh, placement{}, tried) }()
+	select {
+	case got := <-done:
+		if got != a {
+			t.Fatalf("moved to %v", got)
+		}
+		<-a.sem
+	case <-time.After(3 * time.Second):
+		t.Fatalf("the create stayed at the busy hotel")
+	}
+}
+
+func TestQueuedCreateDoesNotMoveForASmallGain(t *testing.T) {
+	tc := newChain(t)
+	tc.b.cfg.MaxQueueWaitSeconds = 0.1
+	setHotel(tc, "c", func(h *hotel) { h.ok = false })
+	a, bh := tc.b.hotelByID("a"), tc.b.hotelByID("b")
+	setHotel(tc, "a", func(h *hotel) {
+		h.sem = make(chan struct{}, 1)
+		h.sem <- struct{}{}
+		h.creating = 1
+		h.createEWMA = 1
+		h.queued = 3
+	})
+	setHotel(tc, "b", func(h *hotel) {
+		h.sem = make(chan struct{}, 1)
+		h.sem <- struct{}{}
+		h.creating = 1
+		h.createEWMA = 1
+		h.queued = 3
+	})
+	g := tc.b.guests["g1"]
+	tc.b.mu.Lock()
+	bh.queued++
+	g.queued++
+	tc.b.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	if got := tc.b.waitSlot(ctx, g, bh, placement{}, map[*hotel]bool{}); got != nil {
+		t.Fatalf("got a slot at %v", got.cfg.ID)
+	}
+	var moved int
+	setHotel(tc, "b", func(h *hotel) { moved = h.moved })
+	if moved != 0 {
+		t.Fatalf("moved %d times between equal hotels", moved)
+	}
+	_ = a
 }
