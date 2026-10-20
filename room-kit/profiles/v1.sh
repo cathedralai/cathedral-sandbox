@@ -29,6 +29,16 @@ ROOM_CREATES_PER_MINUTE=${ROOM_CREATES_PER_MINUTE:-100}
 CATHEDRAL_DIND_DOCKERD_ARGS="${ROOM_DIND_DOCKERD_ARGS:-}"
 CATHEDRAL_DIND_ENV="${ROOM_DIND_ENV:-}"
 EOV
+  # Room networks: one bridge per ROOM_NETS CIDR, ROOM_NET_SIZE guests each.
+  if [ -n "${ROOM_NETS:-}" ]; then
+    local nets; read -r -a nets <<< "$ROOM_NETS"
+    echo "CATHEDRAL_ROOM_NETWORKS=${#nets[@]}"
+    echo "CATHEDRAL_ROOM_NETWORK_SUBNETS=$(IFS=,; echo "${nets[*]}")"
+    echo "CATHEDRAL_ROOM_NETWORK_SIZE=${ROOM_NET_SIZE:-1000}"
+    echo "CATHEDRAL_ROOM_NETWORK_PREFIX=$ROOM_ID-net"
+    echo "CATHEDRAL_ROOM_NETWORK_BRIDGE_PREFIX=${ROOM_NET_BRIDGE_PREFIX:-rmnet}"
+    echo "CATHEDRAL_ROOM_NETWORK_DNS=\"$ROOM_DNS\""
+  fi
 }
 
 # key:project:max_running (CATHEDRAL_SANDBOX_KEYS, cathedral/sandbox_provider.py parse_sandbox_keys)

@@ -34,8 +34,11 @@ customer API is on port 443 with a real TLS certificate.
 - DNS: an A record for `ROOM_HOSTNAME` to the machine IP, DNS only, before
   you run the installer.
 - A free private /22 or larger for the guest bridge (one address per sandbox).
-  One Linux bridge takes at most 1,024 ports, so one room host serves at most
-  1,023 rooms with a network. Rooms with network `none` do not use the bridge.
+  One Linux bridge takes at most 1,024 ports, so one bridge serves at most
+  1,023 rooms with a network. For more, set `ROOM_NETS` (one private CIDR per
+  extra bridge). The API then puts each room with a network on the least used
+  room network, `ROOM_NET_SIZE` rooms each, and the kit adds the same firewall
+  rules for every room bridge. Rooms with network `none` use no bridge port.
 
 ## Build the API tarball
 
