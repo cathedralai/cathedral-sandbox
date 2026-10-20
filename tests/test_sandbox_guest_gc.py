@@ -196,3 +196,17 @@ def test_bulk_delete_removes_containers(fake: FakeDocker) -> None:
         assert fake.containers == {} and _resident(provider) == 0
     finally:
         provider.close()
+
+
+def test_idempotent_replay_of_deleted_sandbox_starts_no_container(fake: FakeDocker) -> None:
+    provider = DockerGuestProvider()
+    try:
+        doc = provider.create(_req(), api_key="k", idempotency="replay-key-01", body_digest="b")
+        provider.delete(doc["id"])
+        with pytest.raises(SandboxOpError) as err:
+            provider.create(_req(), api_key="k", idempotency="replay-key-01", body_digest="b")
+        assert err.value.http_status == 404
+        assert fake.containers == {}
+        assert _resident(provider) == 0
+    finally:
+        provider.close()

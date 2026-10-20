@@ -890,6 +890,11 @@ class DockerGuestProvider:
     def _start_guest(self, doc: dict[str, Any], request: CreateSandboxRequest) -> dict[str, Any]:
         """Start the guest for one record. The caller releases the record on failure."""
         sandbox_id = doc["id"]
+        with self._inner._lock:  # noqa: SLF001
+            record = self._inner._sandboxes.get(sandbox_id)  # noqa: SLF001
+            if record is None or record.state in ("deleting", "deleted"):
+                # An Idempotency-Key replay of a sandbox that is gone or going.
+                raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
         image = self._image_for(request)
         if request.snapshot_id and request.snapshot_id in self._snapshot_images:
             image = self._snapshot_images[request.snapshot_id]
