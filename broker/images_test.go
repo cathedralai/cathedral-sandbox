@@ -17,20 +17,21 @@ import (
 
 // fakeHotel is a minimal hotel /v1 API: rooms, snapshots and prefetch.
 type fakeHotel struct {
-	t         *testing.T
-	mu        sync.Mutex
-	creates   []map[string]any
-	snaps     map[string]map[string]any // hotel snapshot id -> document
-	prefetch  []map[string]any
-	pushes    []map[string]any
-	deleted   []string
-	failPull  bool
-	pullDelay time.Duration
-	n         int
-	execs     []map[string]any
-	builds    []map[string]any
-	failBuild bool
-	rooms     []map[string]any // id + labels, for the room list
+	t           *testing.T
+	mu          sync.Mutex
+	creates     []map[string]any
+	snaps       map[string]map[string]any // hotel snapshot id -> document
+	prefetch    []map[string]any
+	pushes      []map[string]any
+	deleted     []string
+	failPull    bool
+	pullDelay   time.Duration
+	n           int
+	execs       []map[string]any
+	builds      []map[string]any
+	failBuild   bool
+	createDelay time.Duration
+	rooms       []map[string]any // id + labels, for the room list
 }
 
 func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -42,6 +43,12 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	switch {
 	case p == "/v1/sandboxes" && r.Method == "POST":
+		if f.createDelay > 0 {
+			d := f.createDelay
+			f.mu.Unlock()
+			time.Sleep(d)
+			f.mu.Lock()
+		}
 		f.creates = append(f.creates, req)
 		if sid, ok := req["snapshot_id"].(string); ok {
 			if _, known := f.snaps[sid]; !known {
