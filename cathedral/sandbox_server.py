@@ -234,6 +234,7 @@ class SandboxApplication:
         self._add("GET", s + r"/(?P<id>[^/]+)/logs", self.logs)
         self._add("GET", r"/v1/snapshots", self.list_snapshots)
         self._add("DELETE", r"/v1/snapshots/(?P<id>[^/]+)", self.delete_snapshot)
+        self._add("POST", r"/v1/snapshots/(?P<id>[^/]+)/push", self.push_snapshot)
         self._add("GET", r"/v1/sandbox-templates", self.list_templates)
         self._add("GET", r"/v1/sandbox-templates/(?P<uid>[^/]+)", self.get_template)
         self._add("POST", r"/v1/images/prefetch", self.prefetch)
@@ -428,6 +429,14 @@ class SandboxApplication:
 
     def list_snapshots(self, *, query, **_):
         return Response.json(200, {"snapshots": self.provider.list_snapshots(labels=query.get("label", []))})
+
+    def push_snapshot(self, *, id, body, **_):
+        payload = self._json(body)
+        push = getattr(self.provider, "push_snapshot", None)
+        if push is None:
+            return Response.error(501, "push_not_supported", "this runtime cannot push a snapshot to a registry")
+        image = ImageSource(image=payload.get("image") or "", registry_auth=payload.get("registry_auth"))
+        return Response.json(200, push(id, image=image.image, registry_auth=image.registry_auth))
 
     def delete_snapshot(self, *, id, **_):
         existed = self.provider.delete_snapshot(id)
@@ -631,6 +640,7 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/sandboxes/{id}/logs", "get", "Container + exec logs", "§3.13; kept 24 h after delete"),
     ("/v1/snapshots", "get", "List snapshots", "§3.5"),
     ("/v1/snapshots/{id}", "delete", "Delete a snapshot", "§3.5"),
+    ("/v1/snapshots/{id}/push", "post", "Push a snapshot image to a registry", "§3.5"),
     ("/v1/images/prefetch", "post", "Prefetch an image", "§3.9"),
     ("/v1/images/{ref}", "get", "Image cache status", "§3.9"),
     ("/v1/quota", "get", "Project quota + usage", "§3.8"),

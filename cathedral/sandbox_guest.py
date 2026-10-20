@@ -24,7 +24,7 @@ import urllib.error
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -272,6 +272,38 @@ class DockerClient:
                 502,
                 f"docker pull failed for {image}: {result.stderr.strip()[:300]}",
             )
+
+    def push(self, source: str, target: str, *, registry_auth: Mapping[str, str] | None = None) -> str | None:
+        """Tag local image *source* as *target* and push it. Return the repo digest, if known."""
+        tagged = self.run(["docker", "tag", source, target], timeout=30.0)
+        if tagged.returncode != 0:
+            raise SandboxOpError(
+                "snapshot_push_failed",
+                502,
+                f"docker tag failed: {(tagged.stderr or '').strip()[:300]}",
+            )
+        with self._registry_env(target, registry_auth) as env:
+            result = self.run(["docker", "push", target], timeout=1800.0, env=env)
+        if result.returncode != 0:
+            raise SandboxOpError(
+                "snapshot_push_failed",
+                502,
+                f"docker push failed for {target}: {(result.stderr or '').strip()[:300]}",
+            )
+        digests = self.image_inspect(target).get("RepoDigests") or []
+        repo = target.rsplit("@", 1)[0]
+        repo = repo.rsplit(":", 1)[0] if ":" in repo.rsplit("/", 1)[-1] else repo
+        for entry in digests:
+            if entry.startswith(repo + "@"):
+                return entry
+        return digests[0] if digests else None
+
+    def image_size(self, image: str) -> int:
+        """Total size in bytes of a local image, base layers included. 0 when unknown."""
+        try:
+            return max(0, int(self.image_inspect(image).get("Size") or 0))
+        except (TypeError, ValueError):
+            return 0
 
     def ensure_image(
         self,
@@ -725,6 +757,7 @@ class DockerGuestProvider:
         self._default_image = default_image
         self._guests: dict[str, GuestRecord] = {}
         self._snapshot_images: dict[str, str] = {}
+        self._snapshot_meta: dict[str, dict[str, Any]] = {}  # snapshot id -> sizes and image
         self._built_images: dict[str, str] = {}  # content_hash -> tag
         # GC state. A sandbox id in _doomed has a "deleting" record and a container
         # that is not yet confirmed gone. Only one drain runs at a time.
@@ -827,13 +860,39 @@ class DockerGuestProvider:
         if request.image is not None:
             return request.image.image
         if request.snapshot_id is not None:
-            snap = self._snapshot_images.get(request.snapshot_id)
-            if snap:
-                return snap
-            return self._default_image
+            return self._snapshot_image(request.snapshot_id)
         if request.build is not None:
             return self._build_image(request)
         return self._default_image
+
+    def _resolve_snapshot(self, ref: str) -> str | None:
+        """Return the snapshot id for *ref* (an id or a name), or None when unknown."""
+        with self._inner._lock:  # noqa: SLF001
+            snapshots = self._inner._snapshots  # noqa: SLF001
+            if ref in snapshots:
+                return ref
+            for sid, (_, rec) in snapshots.items():
+                if rec.name == ref:
+                    return sid
+        return None
+
+    def _snapshot_image(self, ref: str) -> str:
+        """Return the committed image of snapshot *ref*. Never fall back to another image.
+
+        Unknown snapshot: 404 snapshot_not_found. A known snapshot record with no
+        committed image on this host: 409 snapshot_image_missing.
+        """
+        snap_id = self._resolve_snapshot(ref)
+        if snap_id is None:
+            raise SandboxOpError("snapshot_not_found", 404, f"no snapshot {ref} on this host")
+        image = self._snapshot_images.get(snap_id)
+        if not image or not self._client.image_exists(image):
+            raise SandboxOpError(
+                "snapshot_image_missing",
+                409,
+                f"snapshot {snap_id} has no committed image on this host",
+            )
+        return image
 
     def create(
         self,
@@ -843,6 +902,9 @@ class DockerGuestProvider:
         idempotency: str | None,
         body_digest: str,
     ) -> dict[str, Any]:
+        if request.snapshot_id is not None:
+            # Fail before any record exists. A fork never starts another image.
+            self._snapshot_image(request.snapshot_id)
         docs = self._inner.create(
             request, api_key=api_key, idempotency=idempotency, body_digest=body_digest
         )
@@ -907,8 +969,8 @@ class DockerGuestProvider:
                 # An Idempotency-Key replay of a sandbox that is gone or going.
                 raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
         image = self._image_for(request)
-        if request.snapshot_id and request.snapshot_id in self._snapshot_images:
-            image = self._snapshot_images[request.snapshot_id]
+        if request.snapshot_id is not None:
+            pass  # _image_for returned the committed snapshot image or raised.
         elif request.image is not None:
             self._ensure_image(image, registry_auth=request.image.registry_auth)
             inspected = self._client.image_inspect(image)
@@ -1105,13 +1167,78 @@ class DockerGuestProvider:
         op_id = self._inner.snapshot(
             sandbox_id, ttl_seconds=ttl_seconds, name=name, labels=labels
         )
-        snap_id = self._inner.get_operation(op_id)["result"]["snapshot_id"]
+        result = self._inner.get_operation(op_id)["result"]
+        snap_id = result["snapshot_id"]
+        if snap_id in self._snapshot_images:
+            # A named snapshot is get-or-create: keep the first commit unchanged.
+            return op_id
         guest = self._guests.get(sandbox_id)
-        if guest is not None:
-            image_name = f"cathedral-snap-{snap_id}:latest"
+        if guest is None:
+            return op_id
+        image_name = f"cathedral-snap-{snap_id}:latest"
+        try:
             self._client.commit(guest.container_id, image_name)
-            self._snapshot_images[snap_id] = image_name
+        except SandboxOpError:
+            # Drop the record, so no fork can find a snapshot without an image.
+            self._inner.delete_snapshot(snap_id)
+            raise
+        self._snapshot_images[snap_id] = image_name
+        sizes = self._snapshot_sizes(snap_id, image_name, guest.image, int(result.get("size_bytes") or 0))
+        self._snapshot_meta[snap_id] = sizes
+        with self._inner._lock:  # noqa: SLF001
+            entry = self._inner._snapshots.get(snap_id)  # noqa: SLF001
+            if entry is not None:
+                path, rec = entry
+                self._inner._snapshots[snap_id] = (path, replace(rec, size_bytes=sizes["size_bytes"]))  # noqa: SLF001
+            self._inner._operations[op_id]["result"].update(sizes)  # noqa: SLF001
         return op_id
+
+    def _snapshot_sizes(self, snap_id: str, image_name: str, base_image: str, work_archive_bytes: int) -> dict[str, Any]:
+        """Sizes of one snapshot, in bytes.
+
+        image_size_bytes: the whole committed image, base layers included.
+        layer_size_bytes: the layer that docker commit added (image minus base).
+        work_archive_bytes: the compressed archive of /work (a bind mount, so
+        not in the image).
+        size_bytes: what this snapshot stores on the host (layer + archive).
+        """
+        image_size = self._client.image_size(image_name)
+        base_size = self._client.image_size(base_image)
+        layer_size = max(0, image_size - base_size) if base_size else image_size
+        return {
+            "size_bytes": layer_size + work_archive_bytes,
+            "layer_size_bytes": layer_size,
+            "image_size_bytes": image_size,
+            "work_archive_bytes": work_archive_bytes,
+            "image": image_name,
+        }
+
+    def list_snapshots(self, labels: Iterable[str] = ()) -> list[dict[str, Any]]:
+        out = self._inner.list_snapshots(labels)
+        for doc in out:
+            doc.update(self._snapshot_meta.get(doc["snapshot_id"], {}))
+        return out
+
+    def delete_snapshot(self, snapshot_id: str) -> bool:
+        existed = self._inner.delete_snapshot(snapshot_id)
+        self._snapshot_meta.pop(snapshot_id, None)
+        image = self._snapshot_images.pop(snapshot_id, None)
+        if image:
+            self._client.run(["docker", "image", "rm", image], timeout=60.0)
+        return existed
+
+    def push_snapshot(
+        self, snapshot_id: str, *, image: str, registry_auth: Mapping[str, str] | None = None
+    ) -> dict[str, Any]:
+        """Push the committed image of a snapshot to a registry as *image*.
+
+        Any host can then start rooms from *image*. The image holds the root
+        file system only. /work is a bind mount and is not in the image.
+        """
+        local = self._snapshot_image(snapshot_id)
+        snap_id = self._resolve_snapshot(snapshot_id) or snapshot_id
+        digest = self._client.push(local, image, registry_auth=registry_auth)
+        return {"snapshot_id": snap_id, "image": image, "digest": digest, "includes_work": False}
 
     def set_network(self, sandbox_id: str, patch: NetworkPatch) -> dict[str, Any]:
         doc = self._inner.set_network(sandbox_id, patch)
