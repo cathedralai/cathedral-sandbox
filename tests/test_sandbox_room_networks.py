@@ -200,6 +200,23 @@ def test_switch_to_none_and_back_moves_the_port(fake: FakeDocker, monkeypatch) -
         provider.close()
 
 
+def test_room_network_guest_gets_its_own_resolv_conf(fake: FakeDocker, monkeypatch) -> None:
+    _pool_env(monkeypatch, count=1, size=2)
+    monkeypatch.setenv("CATHEDRAL_ROOM_NETWORK_DNS", "1.1.1.1 8.8.8.8")
+    provider = DockerGuestProvider()
+    try:
+        _create(provider)
+        run = fake.calls_of("run")[-1]
+        mount = next(run[i + 1] for i, p in enumerate(run) if p == "-v" and run[i + 1].endswith(":/etc/resolv.conf"))
+        host_path = mount.rsplit(":", 1)[0]
+        with open(host_path) as fh:
+            assert fh.read() == "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+        _create(provider, mode="none", digest="n")
+        assert not any(p.endswith(":/etc/resolv.conf") for p in fake.calls_of("run")[-1])
+    finally:
+        provider.close()
+
+
 def test_pool_settings_are_checked() -> None:
     with pytest.raises(ValueError):
         RoomNetworkPool(count=2, subnets=("10.0.0.0/22",))

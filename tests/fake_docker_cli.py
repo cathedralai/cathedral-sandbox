@@ -331,6 +331,7 @@ def install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeDocker:
         "CATHEDRAL_ROOM_NETWORK_PREFIX",
         "CATHEDRAL_ROOM_NETWORK_SUBNETS",
         "CATHEDRAL_ROOM_NETWORK_BRIDGE_PREFIX",
+        "CATHEDRAL_ROOM_NETWORK_DNS",
     ):
         monkeypatch.delenv(name, raising=False)
     return FakeDocker(state_path)

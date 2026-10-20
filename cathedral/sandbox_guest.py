@@ -171,6 +171,10 @@ class RoomNetworkPool:
     CATHEDRAL_ROOM_NETWORK_SUBNETS: comma-separated subnets, one per network.
     CATHEDRAL_ROOM_NETWORK_BRIDGE_PREFIX: Linux bridge name prefix; bridge i
       is <prefix><i> (so the host firewall can name it).
+    CATHEDRAL_ROOM_NETWORK_DNS: name servers (space or comma separated). On a
+      user-defined network Docker points the guest at its embedded resolver
+      127.0.0.11, which gVisor guests cannot reach. With this set, each guest
+      on a room network gets its own resolv.conf with these servers.
     A missing network is created; an existing one is reused.
     """
 
@@ -184,6 +188,7 @@ class RoomNetworkPool:
         prefix: str = "cathedral-room",
         subnets: tuple[str, ...] = (),
         bridge_prefix: str | None = None,
+        dns: tuple[str, ...] = (),
     ) -> None:
         if subnets and len(subnets) != count:
             raise ValueError("CATHEDRAL_ROOM_NETWORK_SUBNETS needs one subnet per network")
@@ -191,6 +196,7 @@ class RoomNetworkPool:
         self.names = [f"{prefix}-{i}" for i in range(count)]
         self.subnets = subnets
         self.bridge_prefix = bridge_prefix
+        self.dns = dns
         self.used: dict[str, int] = {n: 0 for n in self.names}
         self._lock = threading.Lock()
         self._ready = False
@@ -207,6 +213,7 @@ class RoomNetworkPool:
             prefix=os.environ.get("CATHEDRAL_ROOM_NETWORK_PREFIX", "").strip() or "cathedral-room",
             subnets=subnets,
             bridge_prefix=os.environ.get("CATHEDRAL_ROOM_NETWORK_BRIDGE_PREFIX", "").strip() or None,
+            dns=tuple(os.environ.get("CATHEDRAL_ROOM_NETWORK_DNS", "").replace(",", " ").split()),
         )
 
     @property
@@ -465,6 +472,7 @@ class DockerClient:
         user: str | None,
         labels: Mapping[str, str] | None = None,
         network: str | None = None,
+        resolv_conf: Path | None = None,
     ) -> str:
         work_dir.mkdir(parents=True, exist_ok=True)
         argv = [
@@ -514,6 +522,8 @@ class DockerClient:
             argv.extend(["--network", "none"])
         elif network:
             argv.extend(["--network", network])
+            if resolv_conf is not None:
+                argv.extend(["-v", f"{resolv_conf.resolve()}:/etc/resolv.conf"])
         for key, value in env.items():
             argv.extend(["-e", f"{key}={value}"])
         if dind:
@@ -1104,6 +1114,12 @@ class DockerGuestProvider:
         entrypoint: tuple[str, ...] | None,
         network: str | None,
     ) -> str:
+        resolv_conf = None
+        if network and self._net_pool is not None and self._net_pool.dns:
+            # The guest's own copy, beside (not inside) its /work mount.
+            resolv_conf = work.parent / "resolv.conf"
+            work.parent.mkdir(parents=True, exist_ok=True)
+            resolv_conf.write_text("".join(f"nameserver {ns}\n" for ns in self._net_pool.dns))
         return self._client.create_and_start(
             image=image,
             name=name,
@@ -1120,6 +1136,7 @@ class DockerGuestProvider:
             user=request.user,
             labels={LABEL_OWNER: self._owner, LABEL_SANDBOX_ID: sandbox_id},
             network=network,
+            resolv_conf=resolv_conf,
         )
 
     def _after_start(self, doc: dict[str, Any], sandbox_id: str, container_id: str, dind: bool) -> dict[str, Any]:
