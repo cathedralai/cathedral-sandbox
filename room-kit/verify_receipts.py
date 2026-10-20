@@ -20,7 +20,7 @@ Image approval is a signed policy release; that is a later step.
 
 Usage:
   verify_receipts.py --attestation att.json --receipts chain.json [--receipt-header B64 ...]
-  verify_receipts.py --broker https://live.cathedral.computer --key-file KEY --hotel nc-sealed [--sandbox ID]
+  verify_receipts.py --broker https://<broker> --key-file KEY --hotel <hotel id> [--sandbox ID]
 """
 from __future__ import annotations
 
@@ -222,7 +222,7 @@ def main() -> int:
     ap.add_argument("--receipt-header", action="append", default=[], help="X-Room-Receipt header value")
     ap.add_argument("--broker", help="broker base URL; fetches attestation and receipts itself")
     ap.add_argument("--key-file", help="guest API key file for --broker")
-    ap.add_argument("--hotel", default="nc-sealed")
+    ap.add_argument("--hotel", required=False, default="sealed-1")
     ap.add_argument("--sandbox", help="with --broker: one room's receipts instead of the whole chain")
     ap.add_argument("--expected-measurement")
     ap.add_argument("--ark-sha256", help="pin the AMD ARK certificate (sha256 of its DER)")
