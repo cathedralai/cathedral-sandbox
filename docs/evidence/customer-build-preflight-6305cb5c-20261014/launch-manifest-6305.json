@@ -1,0 +1,98 @@
+{
+  "manifest": {
+    "schema": "cathedral_customer_snp_launch_v1",
+    "name": "cathedral-customer-6305",
+    "artifacts": {
+      "firmware": {
+        "path": "/usr/share/ovmf/OVMF.amdsev.fd",
+        "sha256": "ac27e626b097cf6f9eae09b79fc87fc2d3fb6e99c8d97b27f0603993c06a28bb"
+      },
+      "kernel": {
+        "path": "/root/snp-launch/cathedral-customer-20261013/images-customer/cathedral-customer-snp-20261013.vmlinuz",
+        "sha256": "9f55ef7253055a9cf68f8a04323c93dead2fca617386d842fbde9ca7b178b27e"
+      },
+      "initrd": {
+        "path": "/root/snp-launch/cathedral-customer-20261013/images-customer/cathedral-customer-snp-20261013.initrd",
+        "sha256": "6f9688380b2568418af89a6e5f8f8e66f862b126304eae4fb7035f485d85d501"
+      },
+      "raw": {
+        "path": "/root/snp-launch/cathedral-customer-20261013/images-customer/cathedral-customer-snp-20261013.raw",
+        "sha256": "1869626c2f5ebe8d3096cab53df60581b9d1047770549a41000555040c38402d"
+      },
+      "uki": {
+        "path": "/root/snp-launch/cathedral-customer-20261013/images-customer/cathedral-customer-snp-20261013.efi",
+        "sha256": "fe23b7432fcfdf3e2109c00e346a78e45e309cada6f1dcac0c62de4e8b4f19a7"
+      },
+      "public_root": {
+        "path": "/root/snp-launch/central-root-keys.json",
+        "sha256": "551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e"
+      }
+    },
+    "root_hash": "6891f7f2e9d05a11ada6db6952aa399bb2e0d339a8de5ef5e2535cf1700bab70",
+    "cmdline": "roothash=6891f7f2e9d05a11ada6db6952aa399bb2e0d339a8de5ef5e2535cf1700bab70 console=ttyS0 systemd.volatile=state ro systemd.swap=0 panic=-1",
+    "public_input": {
+      "path": "/root/snp-launch/cathedral-customer-20261013/public-input-6305-20261014T023638Z.json",
+      "sha256": "0d23c5e7ffa084615dcd28d86c09659e7ed33b192c4f85b6086e88de84cb0ad2"
+    },
+    "run_directory": "/root/snp-launch/cathedral-customer-20261013/run-6305-20261014T023638Z",
+    "https_bind": "127.0.0.1",
+    "https_port": 8444,
+    "scratch_mib": 8192
+  },
+  "argv": [
+    "/usr/bin/qemu-system-x86_64",
+    "-no-user-config",
+    "-nodefaults",
+    "-name",
+    "cathedral-customer-6305",
+    "-enable-kvm",
+    "-cpu",
+    "EPYC-v4",
+    "-smp",
+    "4",
+    "-m",
+    "8G",
+    "-machine",
+    "q35,confidential-guest-support=sev0,memory-backend=ram1",
+    "-object",
+    "memory-backend-memfd,id=ram1,size=8G,share=true,prealloc=false",
+    "-object",
+    "sev-snp-guest,id=sev0,policy=0x30000,cbitpos=51,reduced-phys-bits=1,kernel-hashes=on,host-data=VR35Ls6k4fpnvRDD0rCX13XEvq+LaOxOAF/2bXHJiF4=",
+    "-bios",
+    "/usr/share/ovmf/OVMF.amdsev.fd",
+    "-kernel",
+    "/root/snp-launch/cathedral-customer-20261013/images-customer/cathedral-customer-snp-20261013.vmlinuz",
+    "-initrd",
+    "/root/snp-launch/cathedral-customer-20261013/images-customer/cathedral-customer-snp-20261013.initrd",
+    "-append",
+    "roothash=6891f7f2e9d05a11ada6db6952aa399bb2e0d339a8de5ef5e2535cf1700bab70 console=ttyS0 systemd.volatile=state ro systemd.swap=0 panic=-1",
+    "-drive",
+    "if=none,id=disk0,format=raw,readonly=on,file=/root/snp-launch/cathedral-customer-20261013/images-customer/cathedral-customer-snp-20261013.raw",
+    "-device",
+    "virtio-blk-pci,drive=disk0,disable-legacy=on,iommu_platform=true",
+    "-drive",
+    "if=none,id=scratch,format=raw,file=/root/snp-launch/cathedral-customer-20261013/run-6305-20261014T023638Z/scratch.raw",
+    "-device",
+    "virtio-blk-pci,drive=scratch,serial=cath-cust-scratch,disable-legacy=on,iommu_platform=true",
+    "-fw_cfg",
+    "name=opt/cathedral/public-input,file=/root/snp-launch/cathedral-customer-20261013/public-input-6305-20261014T023638Z.json",
+    "-netdev",
+    "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:8444-:8444",
+    "-device",
+    "virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=true,romfile=",
+    "-display",
+    "none",
+    "-vga",
+    "none",
+    "-monitor",
+    "none",
+    "-pidfile",
+    "/root/snp-launch/cathedral-customer-20261013/run-6305-20261014T023638Z/guest.pid",
+    "-serial",
+    "file:/root/snp-launch/cathedral-customer-20261013/run-6305-20261014T023638Z/public-serial.log",
+    "-daemonize"
+  ],
+  "challenge_hex": "ff87f2a66e187078794fa204548cb922bcd5be9e558b5430081905276659634c",
+  "public_input_sha256": "0d23c5e7ffa084615dcd28d86c09659e7ed33b192c4f85b6086e88de84cb0ad2",
+  "unit": "cathedral-customer-guest-20261014.service"
+}

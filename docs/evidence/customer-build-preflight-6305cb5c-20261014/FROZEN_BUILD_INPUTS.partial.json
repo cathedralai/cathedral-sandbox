@@ -1,0 +1,172 @@
+{
+  "approval": {
+    "dispatcher": "Toby",
+    "reference": "PENDING_FRED_EXACT_BUILD_APPROVAL",
+    "scope": "exact_build_only",
+    "subject_sha256": "f1d0f3d937cddb422f3276e3de4b59735864b05441b2542a437aea6334a505ba"
+  },
+  "baseline_manifest_sha256": "2330d24e293d32ad4f9e65b9ce2753b4618f55f6997ecdb5fb5376a4cfb79d6d",
+  "customer_only_source_reviewed": true,
+  "guest_fences": [
+    {
+      "command_sha256": "48ad40b4bb85456f74ec27f41c461385d127f7984c69b59b23eca52eb799e076",
+      "name": "snp-guest",
+      "pid": 6712,
+      "startticks": 46424
+    },
+    {
+      "command_sha256": "1651c97e4c5de0944a7042c5b9d8cfd9d46e71930f3cb6be9a1a50cac55579db",
+      "name": "tee-box-dev",
+      "pid": 63141,
+      "startticks": 4552067
+    },
+    {
+      "command_sha256": "db06ce97d77d8c7ec3e67d1d0b6b92150c6cb423a6c09c51faa1604c9decb0ac",
+      "name": "tee-box-official",
+      "pid": 73539,
+      "startticks": 4620243
+    }
+  ],
+  "preserved_images": {
+    "/root/snp-launch/cathedral-staging-20261013/images-rootfix/cathedral-staging-snp-rootfix-20261013.efi": {
+      "device": 2304,
+      "inode": 9175411,
+      "mtime_ns": 1791912736068927395,
+      "size": 83730944
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images-rootfix/cathedral-staging-snp-rootfix-20261013.initrd": {
+      "device": 2304,
+      "inode": 9175413,
+      "mtime_ns": 1791912736480926662,
+      "size": 44617528
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images-rootfix/cathedral-staging-snp-rootfix-20261013.raw": {
+      "device": 2304,
+      "inode": 9175397,
+      "mtime_ns": 1791912735953927599,
+      "size": 3706277888
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images-rootfix/cathedral-staging-snp-rootfix-20261013.vmlinuz": {
+      "device": 2304,
+      "inode": 9175412,
+      "mtime_ns": 1791912736217927130,
+      "size": 17320328
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images-rootfix/initrd.cpio.zst": {
+      "device": 2304,
+      "inode": 9175313,
+      "mtime_ns": 1791912654217072906,
+      "size": 35343680
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images-verity/cathedral-staging-snp-verity-20261013.efi": {
+      "device": 2304,
+      "inode": 9175451,
+      "mtime_ns": 1791920805812711955,
+      "size": 83730944
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images-verity/cathedral-staging-snp-verity-20261013.esp.raw": {
+      "device": 2304,
+      "inode": 9175448,
+      "mtime_ns": 1791920805139713135,
+      "size": 536870912
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images-verity/cathedral-staging-snp-verity-20261013.initrd": {
+      "device": 2304,
+      "inode": 9175453,
+      "mtime_ns": 1791920806217711245,
+      "size": 44617528
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images-verity/cathedral-staging-snp-verity-20261013.manifest": {
+      "device": 2304,
+      "inode": 9175454,
+      "mtime_ns": 1791920806256711176,
+      "size": 28497
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images-verity/cathedral-staging-snp-verity-20261013.raw": {
+      "device": 2304,
+      "inode": 9175435,
+      "mtime_ns": 1791920805050713292,
+      "size": 2548928512
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images-verity/cathedral-staging-snp-verity-20261013.root-x86-64-verity.raw": {
+      "device": 2304,
+      "inode": 9175450,
+      "mtime_ns": 1791920805685712178,
+      "size": 15720448
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images-verity/cathedral-staging-snp-verity-20261013.root-x86-64.raw": {
+      "device": 2304,
+      "inode": 9175449,
+      "mtime_ns": 1791920805680712187,
+      "size": 1995268096
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images-verity/cathedral-staging-snp-verity-20261013.roothash": {
+      "device": 2304,
+      "inode": 9175438,
+      "mtime_ns": 1791920799984680773,
+      "size": 64
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images-verity/cathedral-staging-snp-verity-20261013.vmlinuz": {
+      "device": 2304,
+      "inode": 9175452,
+      "mtime_ns": 1791920805959711697,
+      "size": 17320328
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images-verity/initrd.cpio.zst": {
+      "device": 2304,
+      "inode": 9175369,
+      "mtime_ns": 1791920734291837394,
+      "size": 35343680
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images/cathedral-staging-snp-0029cec5-20261013.efi": {
+      "device": 2304,
+      "inode": 9175404,
+      "mtime_ns": 1791871860353742050,
+      "size": 83730944
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images/cathedral-staging-snp-0029cec5-20261013.initrd": {
+      "device": 2304,
+      "inode": 9175406,
+      "mtime_ns": 1791871860761741296,
+      "size": 44617528
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images/cathedral-staging-snp-0029cec5-20261013.raw": {
+      "device": 2304,
+      "inode": 9175371,
+      "mtime_ns": 1791871860224742288,
+      "size": 3706277888
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images/cathedral-staging-snp-0029cec5-20261013.vmlinuz": {
+      "device": 2304,
+      "inode": 9175405,
+      "mtime_ns": 1791871860500741779,
+      "size": 17320328
+    },
+    "/root/snp-launch/cathedral-staging-20261013/images/initrd.cpio.zst": {
+      "device": 2304,
+      "inode": 9175307,
+      "mtime_ns": 1791871777941894284,
+      "size": 35343680
+    }
+  },
+  "public_data_sha256": {
+    "profile.json": "5ab94ac8651bc2d68c03264ee63c8108d1188e5d68ca11930d501ddd13faf04e"
+  },
+  "runtime_budget_confirmed": true,
+  "schema": "cathedral_customer_bounded_build_inputs_v1",
+  "script_sha256": "c92b6d6f5fa8482782675371bc8166d4393ae3166d1da8fbe3eb9fbf9fae849e",
+  "source_ref": "6305cb5c42948715ac33d756cd1bb63daa3cb75b",
+  "source_tar_sha256": "aeca318d6bbb458c22d81aad7d689c88d882e40e18c55278f9d476a208a9aa1d",
+  "tool_sha256": {
+    "blockdev": "03126e10ddc85388cd315c6c365d330dcefa0dc3e6f191c22712afb29da339e0",
+    "ip": "2829deca72cff655d6d1290646abb9cc829da2e2db615eec8bc0ccd283acf3a7",
+    "losetup": "fe584e61a8255f65854064073ed55bda5c325a3bc9343a28183bbefdbb326ff2",
+    "mke2fs": "e42e49656dfc308efeed86f9bfad7746fc22ad1d4a3b0d508b5dba7a4b9a904f",
+    "mkosi": "8a671b36fef6b71ece78c54288b0d97b449b854c71b598b16340a125bf5e9a03",
+    "mount": "66a7104ffb87e469ee3aeb00baa8c73093d765a66242b1d2eb8d3e5c37dcc627",
+    "python": "52e0a13e60a981d8c4b6478be2ba5176f69da07948a056bf49cf6f077e30cb41",
+    "systemctl": "6394f5e8df92878184de9d4dfb7ac242471cb09daf89d23be4e81ae17e9c03b2",
+    "systemd-run": "03a68bafb0ebc0f5eff41cbdf3cbbdf126a3bb87e21140f9147bf78edce36d88",
+    "umount": "8d160edce6166bcc29f5b7cb8b9cc7b66feb176d6149f597340885fff8db85e3"
+  }
+}
