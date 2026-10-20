@@ -261,7 +261,9 @@ class InMemorySandboxProvider:
 
     def _require_active(self, sandbox_id: str) -> _Sandbox:
         sandbox = self._sandboxes.get(sandbox_id)
-        if sandbox is None or sandbox.state == "deleted":
+        # A "deleting" record waits for its guest to be confirmed gone. The API
+        # treats it as gone; only quota still counts it.
+        if sandbox is None or sandbox.state in ("deleted", "deleting"):
             raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
         self._assert_owner(sandbox)
         return sandbox
@@ -841,7 +843,7 @@ class InMemorySandboxProvider:
         """
         with self._lock:
             sandbox = self._sandboxes.get(sandbox_id)
-            if sandbox is None or sandbox.state == "deleted":
+            if sandbox is None or sandbox.state in ("deleted", "deleting"):
                 return
             for handle, _ in sandbox.processes.values():
                 if handle is None:
@@ -923,16 +925,7 @@ class InMemorySandboxProvider:
         removed = 0
         with self._lock:
             for sid, sandbox in list(self._sandboxes.items()):
-                past_ttl = api.is_collectable(now, deadline_at=api.gc_deadline(sandbox.expires_at), last_heartbeat_at=None)
-                idle_expired = (
-                    sandbox.idle_timeout_seconds is not None
-                    and sandbox.last_activity_at is not None
-                    and (now - sandbox.last_activity_at) >= timedelta(seconds=sandbox.idle_timeout_seconds)
-                )
-                # §3.4: a sandbox whose owning project key has been revoked is collected too.
-                key = self._keys.get(sandbox.api_key) if sandbox.api_key is not None else None
-                revoked = key is not None and key.revoked
-                if past_ttl or idle_expired or revoked:
+                if self._is_collectable_locked(sandbox, now):
                     sandbox.state = "deleted"
                     sandbox.deleted_at = now
                     self._retain_logs(sandbox)
@@ -944,6 +937,66 @@ class InMemorySandboxProvider:
                     del self._log_tombstones[sid]
         return removed
 
+    def _is_collectable_locked(self, sandbox: _Sandbox, now: datetime) -> bool:
+        """True when GC must collect *sandbox* (TTL, idle window or revoked key).
+
+        Callers must already hold ``self._lock``. A record that is already
+        "deleting" is not collectable again; its owner finishes the removal.
+        """
+        if sandbox.state in ("deleted", "deleting"):
+            return False
+        past_ttl = api.is_collectable(now, deadline_at=api.gc_deadline(sandbox.expires_at), last_heartbeat_at=None)
+        idle_expired = (
+            sandbox.idle_timeout_seconds is not None
+            and sandbox.last_activity_at is not None
+            and (now - sandbox.last_activity_at) >= timedelta(seconds=sandbox.idle_timeout_seconds)
+        )
+        # §3.4: a sandbox whose owning project key has been revoked is collected too.
+        key = self._keys.get(sandbox.api_key) if sandbox.api_key is not None else None
+        revoked = key is not None and key.revoked
+        return past_ttl or idle_expired or revoked
+
+    # ------------------------------------------------------------------ two-phase delete
+    # A provider that owns an outside guest (a Docker container) must not drop the
+    # record before the guest is gone. Otherwise the guest keeps running and no
+    # longer counts against quota. These methods let that provider hold the record
+    # in a "deleting" state: hidden from the API, still counted in quota.
+    def collectable_ids(self) -> list[str]:
+        """Ids that GC must collect now. Does not change any state."""
+        now = _now()
+        with self._lock:
+            return [sid for sid, s in self._sandboxes.items() if self._is_collectable_locked(s, now)]
+
+    def begin_delete(self, sandbox_id: str) -> bool:
+        """Mark a record "deleting". Return False when it is already gone or deleting."""
+        with self._lock:
+            sandbox = self._sandboxes.get(sandbox_id)
+            if sandbox is None or sandbox.state in ("deleted", "deleting"):
+                return False
+            for handle, _ in sandbox.processes.values():
+                if handle is not None and handle.poll() is None:
+                    handle.terminate()
+            sandbox.state = "deleting"
+            sandbox.deleted_at = _now()
+            self._retain_logs(sandbox)
+            return True
+
+    def finish_delete(self, sandbox_id: str) -> None:
+        """Drop a record after its guest is confirmed gone. Idempotent."""
+        with self._lock:
+            sandbox = self._sandboxes.pop(sandbox_id, None)
+            if sandbox is None:
+                return
+            if sandbox.state != "deleting":
+                self._retain_logs(sandbox)
+            sandbox.state = "deleted"
+            shutil.rmtree(sandbox.root, ignore_errors=True)
+
+    def has_record(self, sandbox_id: str) -> bool:
+        """True while any record (live or "deleting") exists for *sandbox_id*."""
+        with self._lock:
+            return sandbox_id in self._sandboxes
+
     # ------------------------------------------------------------------ §3.4 list / bulk delete
     def list(self, *, labels: Iterable[str], state: str | None) -> list[dict[str, Any]]:
         want = _parse_label_filters(labels)
@@ -952,6 +1005,8 @@ class InMemorySandboxProvider:
             out = []
             for sandbox in self._sandboxes.values():
                 if caller is not None and sandbox.api_key is not None and sandbox.api_key != caller:
+                    continue
+                if sandbox.state == "deleting":
                     continue
                 if state and sandbox.state != state:
                     continue
@@ -969,7 +1024,8 @@ class InMemorySandboxProvider:
             targets = [
                 sid
                 for sid, s in self._sandboxes.items()
-                if all(s.labels.get(k) == v for k, v in want.items())
+                if s.state != "deleting"
+                and all(s.labels.get(k) == v for k, v in want.items())
                 and (caller is None or s.api_key is None or s.api_key == caller)
             ]
         for sid in targets:
@@ -1280,11 +1336,15 @@ class InMemorySandboxProvider:
 
     # ------------------------------------------------------------------ §3.8 quota / usage / status
     def _usage_now(self, *, api_key: str | None = None) -> QuotaUsage:
-        """Resident capacity: running + creating + frozen (freeze does not free host slots)."""
+        """Resident capacity: running + creating + frozen + deleting.
+
+        Freeze does not free host slots. A "deleting" record still holds its guest
+        until removal is confirmed, so it still counts.
+        """
         resident = [
             s
             for s in self._sandboxes.values()
-            if s.state in ("running", "creating", "frozen")
+            if s.state in ("running", "creating", "frozen", "deleting")
             and (api_key is None or s.api_key == api_key)
         ]
         return QuotaUsage(
@@ -1297,6 +1357,7 @@ class InMemorySandboxProvider:
         usage = self._usage_now()
         running = [s for s in self._sandboxes.values() if s.state in ("running", "creating")]
         frozen = [s for s in self._sandboxes.values() if s.state == "frozen"]
+        deleting = [s for s in self._sandboxes.values() if s.state == "deleting"]
         return {
             "limits": {
                 "running_sandboxes": self._limits.running_sandboxes,
@@ -1306,6 +1367,7 @@ class InMemorySandboxProvider:
             "usage": {
                 "running_sandboxes": len(running),
                 "frozen_sandboxes": len(frozen),
+                "deleting_sandboxes": len(deleting),
                 "resident_sandboxes": usage.running_sandboxes,
                 "vcpu": usage.vcpu,
                 "memory_gib": usage.memory_gib,
@@ -1339,7 +1401,8 @@ class InMemorySandboxProvider:
             return group
 
         with self._lock:
-            actives = list(self._sandboxes.values())
+            # A "deleting" record already has a tombstone; do not bill it twice.
+            actives = [s for s in self._sandboxes.values() if s.state != "deleting"]
             tombs = [t for t in self._log_tombstones.values() if t.get("resources") is not None]
 
         for sandbox in actives:

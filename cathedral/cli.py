@@ -1723,13 +1723,17 @@ def cmd_sandbox_serve(args: argparse.Namespace) -> int:
     requires Docker plus a registered kata-runtime (fails closed otherwise).
     """
     from cathedral.sandbox_runtime import build_sandbox_provider, capabilities_document
-    from cathedral.sandbox_server import SandboxApplication, run
+    from cathedral.sandbox_server import SandboxApplication, reaper_interval_from_env, run
 
     provider = build_sandbox_provider(
         runtime=getattr(args, "runtime", None),
         allow_insecure_dev=bool(args.allow_insecure_dev),
     )
     app = SandboxApplication(provider, require_auth=True)
+    reaper_seconds = getattr(args, "reaper_interval", None)
+    if reaper_seconds is None:
+        reaper_seconds = reaper_interval_from_env()
+    app.start_reaper(reaper_seconds)
     httpd, (host, port) = run(app, host=args.host, port=args.port)
     print(
         json.dumps(
@@ -1748,6 +1752,7 @@ def cmd_sandbox_serve(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        app.stop_reaper()
         httpd.shutdown()
         httpd.server_close()
         provider.close()
@@ -6033,6 +6038,15 @@ def build_parser() -> argparse.ArgumentParser:
             "sandbox guest runtime (default: CATHEDRAL_SANDBOX_RUNTIME; required). "
             "docker = Linux containers; kata = Kata micro-VMs (customer production). "
             "memory requires --allow-insecure-dev or CATHEDRAL_ALLOW_MEMORY_RUNTIME=1"
+        ),
+    )
+    p_sandbox_serve.add_argument(
+        "--reaper-interval",
+        type=float,
+        default=None,
+        help=(
+            "seconds between background GC passes (default: "
+            "CATHEDRAL_SANDBOX_REAPER_SECONDS or 30; 0 turns the reaper off)"
         ),
     )
     p_sandbox_serve.set_defaults(func=cmd_sandbox_serve)

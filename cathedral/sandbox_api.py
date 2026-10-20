@@ -521,7 +521,19 @@ def idempotency_digest(prefix: str, *parts: Sequence[object] | object) -> str:
 
 
 # ---------------------------------------------------------------- §3.2 exec / processes
-EXEC_MAX_TIMEOUT_SECONDS = 3600
+# Default exec time limit. Harbor tasks ask for up to 4 hours (#290). The
+# operator sets another limit with CATHEDRAL_SANDBOX_EXEC_TIMEOUT_MAX.
+EXEC_MAX_TIMEOUT_SECONDS = 14400
+
+
+def exec_max_timeout_seconds() -> int:
+    """The exec time limit of this server, in seconds."""
+    raw = os.environ.get("CATHEDRAL_SANDBOX_EXEC_TIMEOUT_MAX", "").strip()
+    try:
+        value = int(raw) if raw else EXEC_MAX_TIMEOUT_SECONDS
+    except ValueError:
+        return EXEC_MAX_TIMEOUT_SECONDS
+    return value if value >= 1 else EXEC_MAX_TIMEOUT_SECONDS
 # §3.2: output must be streamed or capped at a stated size >= 10 MiB with a truncated flag.
 STDOUT_MIN_CAP_BYTES = 10 * 1024 * 1024
 STDOUT_CAP_BYTES = 16 * 1024 * 1024
@@ -580,9 +592,9 @@ class ExecRequest:
             _require(
                 isinstance(self.timeout_seconds, int)
                 and not isinstance(self.timeout_seconds, bool)
-                and 1 <= self.timeout_seconds <= EXEC_MAX_TIMEOUT_SECONDS,
+                and 1 <= self.timeout_seconds <= exec_max_timeout_seconds(),
                 "invalid_timeout",
-                f"timeout_seconds must be between 1 and {EXEC_MAX_TIMEOUT_SECONDS}",
+                f"timeout_seconds must be between 1 and {exec_max_timeout_seconds()}",
             )
 
     @property
@@ -770,11 +782,22 @@ class PrefetchRequest:
     """§3.9 warm a list of image references before a job (bounded; dedup preserved)."""
 
     images: tuple[str, ...]
+    # Optional private-registry login for these pulls. It is used for one call
+    # only and is kept out of repr, so it does not reach a log line.
+    registry_auth: Mapping[str, str] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _require(len(self.images) <= 1000, "invalid_prefetch", "prefetch list is bounded to 1000 images")
         for ref in self.images:
             _require(_IMAGE_REF_RE.match(ref) is not None, "invalid_image_reference", f"image ref is invalid: {ref!r}")
+        if self.registry_auth is not None:
+            _require(
+                isinstance(self.registry_auth, Mapping)
+                and set(self.registry_auth) == {"username", "password"}
+                and all(isinstance(v, str) and v for v in self.registry_auth.values()),
+                "invalid_registry_auth",
+                "registry_auth needs non-empty username and password",
+            )
 
 
 @dataclass(frozen=True)

@@ -406,3 +406,20 @@ def test_min_snapshots_floor_beats_daytona() -> None:
     # §3.5: we guarantee at least 1,000 snapshots per project (Daytona caps at 30).
     assert sandbox_api.MIN_SNAPSHOTS >= 1000
     assert 1 <= sandbox_api.SNAPSHOT_TTL_DEFAULT_SECONDS <= sandbox_api.SNAPSHOT_TTL_MAX_SECONDS
+
+
+def test_exec_accepts_a_four_hour_timeout_by_default(monkeypatch) -> None:
+    # #290: Harbor asks for exec timeouts up to 14,400 s.
+    monkeypatch.delenv("CATHEDRAL_SANDBOX_EXEC_TIMEOUT_MAX", raising=False)
+    assert ExecRequest(cmd="true", timeout_seconds=14400).timeout_seconds == 14400
+    with pytest.raises(SandboxContractError, match="invalid_timeout"):
+        ExecRequest(cmd="true", timeout_seconds=14401)
+
+
+def test_exec_timeout_limit_comes_from_config(monkeypatch) -> None:
+    monkeypatch.setenv("CATHEDRAL_SANDBOX_EXEC_TIMEOUT_MAX", "600")
+    assert ExecRequest(cmd="true", timeout_seconds=600).timeout_seconds == 600
+    with pytest.raises(SandboxContractError, match="invalid_timeout"):
+        ExecRequest(cmd="true", timeout_seconds=601)
+    monkeypatch.setenv("CATHEDRAL_SANDBOX_EXEC_TIMEOUT_MAX", "not-a-number")
+    assert ExecRequest(cmd="true", timeout_seconds=14400).timeout_seconds == 14400

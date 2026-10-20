@@ -16,11 +16,13 @@ reads, ``413`` past ``?max_bytes``, ``204`` on idempotent deletes, and an
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import re
 import sys
+import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Mapping
@@ -44,6 +46,18 @@ from cathedral.sandbox_api import (
 from cathedral.sandbox_provider import InMemorySandboxProvider, SandboxOpError, SandboxProvider
 
 JSON = "application/json"
+REAPER_INTERVAL_DEFAULT_SECONDS = 30.0
+
+
+def reaper_interval_from_env() -> float:
+    """CATHEDRAL_SANDBOX_REAPER_SECONDS: seconds between GC passes. 0 turns the reaper off."""
+    raw = os.environ.get("CATHEDRAL_SANDBOX_REAPER_SECONDS", "").strip()
+    if not raw:
+        return REAPER_INTERVAL_DEFAULT_SECONDS
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return REAPER_INTERVAL_DEFAULT_SECONDS
 OCTET = "application/octet-stream"
 
 
@@ -129,6 +143,53 @@ class SandboxApplication:
         self.require_auth = require_auth
         self._routes: list[tuple[str, re.Pattern[str], Callable[..., Response]]] = []
         self._register()
+        self._reaper: threading.Thread | None = None
+        self._reaper_stop = threading.Event()
+
+    # ------------------------------------------------------------------ background GC
+    def start_reaper(self, interval_seconds: float = REAPER_INTERVAL_DEFAULT_SECONDS) -> None:
+        """Run provider.sweep() every *interval_seconds* on a daemon thread.
+
+        TTL expiry then does not depend on API traffic. A failed sweep is logged
+        and the loop continues. Calling this twice does nothing.
+        """
+        if interval_seconds <= 0 or self._reaper is not None:
+            return
+        self._reaper_stop.clear()
+
+        def loop() -> None:
+            while not self._reaper_stop.wait(interval_seconds):
+                try:
+                    self.provider.sweep()
+                except Exception as exc:  # noqa: BLE001 - the reaper must keep running
+                    print(f"cathedral-sandbox reaper: sweep failed: {exc!r}", file=sys.stderr, flush=True)
+
+        self._reaper = threading.Thread(target=loop, name="cathedral-sandbox-reaper", daemon=True)
+        self._reaper.start()
+
+    def stop_reaper(self, timeout: float | None = 10.0) -> None:
+        thread = self._reaper
+        if thread is None:
+            return
+        self._reaper_stop.set()
+        thread.join(timeout)
+        self._reaper = None
+
+    @property
+    def reaper_running(self) -> bool:
+        return self._reaper is not None and self._reaper.is_alive()
+
+    def _sweep_inline(self) -> None:
+        """GC before a read, so an expired sandbox reads as gone (§3.4).
+
+        With the reaper running, only mark expired records when the provider
+        supports it. The slow container removal stays on the reaper thread.
+        """
+        mark = getattr(self.provider, "mark_expired", None) if self.reaper_running else None
+        if callable(mark):
+            mark()
+        else:
+            self.provider.sweep()
 
     # ------------------------------------------------------------------ routing
     def _add(self, method: str, pattern: str, handler: Callable[..., Response]) -> None:
@@ -174,9 +235,11 @@ class SandboxApplication:
         self._add("GET", s + r"/(?P<id>[^/]+)/logs", self.logs)
         self._add("GET", r"/v1/snapshots", self.list_snapshots)
         self._add("DELETE", r"/v1/snapshots/(?P<id>[^/]+)", self.delete_snapshot)
+        self._add("POST", r"/v1/snapshots/(?P<id>[^/]+)/push", self.push_snapshot)
         self._add("GET", r"/v1/sandbox-templates", self.list_templates)
         self._add("GET", r"/v1/sandbox-templates/(?P<uid>[^/]+)", self.get_template)
         self._add("POST", r"/v1/images/prefetch", self.prefetch)
+        self._add("POST", r"/v1/images/build", self.build_image)
         self._add("GET", r"/v1/images/(?P<ref>.+)", self.image_lookup)
         self._add("GET", r"/v1/quota", self.quota)
         self._add("GET", r"/v1/usage", self.usage)
@@ -242,7 +305,7 @@ class SandboxApplication:
     def list_sandboxes(self, *, query, headers, body, api_key, **_):
         # §3.4: reap anything past TTL / its idle window before reading state, so a
         # collected sandbox never lingers in the list or counts against quota.
-        self.provider.sweep()
+        self._sweep_inline()
         docs = self.provider.list(labels=query.get("label", []), state=(query.get("state") or [None])[0])
         return Response.json(200, {"sandboxes": docs})
 
@@ -254,7 +317,7 @@ class SandboxApplication:
         return Response.no_content()
 
     def get_sandbox(self, *, id, **_):
-        self.provider.sweep()  # §3.4: an expired sandbox reads as gone, not "archived"
+        self._sweep_inline()  # §3.4: an expired sandbox reads as gone, not "archived"
         return Response.json(200, self.provider.get(id))
 
     def delete_sandbox(self, *, id, **_):
@@ -369,6 +432,14 @@ class SandboxApplication:
     def list_snapshots(self, *, query, **_):
         return Response.json(200, {"snapshots": self.provider.list_snapshots(labels=query.get("label", []))})
 
+    def push_snapshot(self, *, id, body, **_):
+        payload = self._json(body)
+        push = getattr(self.provider, "push_snapshot", None)
+        if push is None:
+            return Response.error(501, "push_not_supported", "this runtime cannot push a snapshot to a registry")
+        image = ImageSource(image=payload.get("image") or "", registry_auth=payload.get("registry_auth"))
+        return Response.json(200, push(id, image=image.image, registry_auth=image.registry_auth))
+
     def delete_snapshot(self, *, id, **_):
         existed = self.provider.delete_snapshot(id)
         return Response.json(200, {"deleted": existed}) if existed else Response.error(404, "snapshot_not_found", f"no snapshot {id}")
@@ -463,15 +534,43 @@ class SandboxApplication:
     def prefetch(self, *, headers, body, api_key, **_):
         payload = self._json(body)
         idem = headers.get("Idempotency-Key") or headers.get("idempotency-key")
-        op = self.provider.prefetch(PrefetchRequest(images=tuple(payload.get("images", ()))))
-        return Response.json(202, {"operation_id": op, "idempotent": idem is not None})
+        op = self.provider.prefetch(
+            PrefetchRequest(images=tuple(payload.get("images", ())), registry_auth=payload.get("registry_auth"))
+        )
+        result = self.provider.get_operation(op)
+        return Response.json(
+            202,
+            {"operation_id": op, "idempotent": idem is not None, "status": result["status"], "result": result["result"]},
+        )
+
+    # Largest build context, after base64 decoding.
+    BUILD_CONTEXT_MAX_BYTES = 256 * 1024 * 1024
+
+    def build_image(self, *, body, **_):
+        payload = self._json(body)
+        build = getattr(self.provider, "build_image", None)
+        if build is None:
+            return Response.error(501, "build_not_supported", "this runtime cannot build images")
+        dockerfile = payload.get("dockerfile")
+        if not isinstance(dockerfile, str) or not dockerfile.strip():
+            raise api.SandboxContractError("invalid_build", "dockerfile is required")
+        context = None
+        raw = payload.get("context_tar_b64")
+        if raw:
+            try:
+                context = base64.b64decode(raw, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise api.SandboxContractError("invalid_build_context", "context_tar_b64 is not base64") from exc
+            if len(context) > self.BUILD_CONTEXT_MAX_BYTES:
+                return Response.error(413, "build_context_too_large", "build context is larger than 256 MiB")
+        return Response.json(200, build(dockerfile, context))
 
     def image_lookup(self, *, ref, **_):
         return Response.json(200, dict(self.provider.image_status(ref)))
 
     # ------------------------------------------------------------------ §3.8 / §3.13 aggregate
     def quota(self, **_):
-        self.provider.sweep()  # §3.4: an expired sandbox stops counting against quota
+        self._sweep_inline()  # §3.4: an expired sandbox stops counting against quota
         return Response.json(200, self.provider.quota())
 
     def usage(self, *, query, **_):
@@ -565,7 +664,9 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/sandboxes/{id}/logs", "get", "Container + exec logs", "§3.13; kept 24 h after delete"),
     ("/v1/snapshots", "get", "List snapshots", "§3.5"),
     ("/v1/snapshots/{id}", "delete", "Delete a snapshot", "§3.5"),
+    ("/v1/snapshots/{id}/push", "post", "Push a snapshot image to a registry", "§3.5"),
     ("/v1/images/prefetch", "post", "Prefetch an image", "§3.9"),
+    ("/v1/images/build", "post", "Build an image from a Dockerfile and a context", "§3.9"),
     ("/v1/images/{ref}", "get", "Image cache status", "§3.9"),
     ("/v1/quota", "get", "Project quota + usage", "§3.8"),
     ("/v1/usage", "get", "Metered usage + cost", "§3.13/§3.16; grouped by label"),
@@ -916,4 +1017,12 @@ def run(app: SandboxApplication, host: str = "127.0.0.1", port: int = 0) -> tupl
     return httpd, httpd.server_address
 
 
-__all__ = ["Response", "SandboxApplication", "openapi_document", "run", "serve"]
+__all__ = [
+    "REAPER_INTERVAL_DEFAULT_SECONDS",
+    "Response",
+    "SandboxApplication",
+    "openapi_document",
+    "reaper_interval_from_env",
+    "run",
+    "serve",
+]
