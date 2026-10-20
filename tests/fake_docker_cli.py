@@ -212,6 +212,37 @@ def main(argv):
                     print(f"{cid} {c['labels'].get('cathedral.sandbox.id', '')}")
         return 0
 
+    if cmd == "exec" and b.get("exec_model"):
+        # The guest command is everything after the container id.
+        with Locked() as st:
+            ids = set(st["containers"])
+        rest = argv[1:]
+        for i, part in enumerate(rest):
+            if part in ids:
+                rest = rest[i + 1:]
+                break
+        form = b.get("timeout_form", "gnu")
+        if rest[:1] == ["timeout"]:
+            busybox = rest[1:2] == ["-t"]
+            if form == "none":
+                print("sh: timeout: not found", file=sys.stderr)
+                return 127
+            if busybox != (form == "busybox"):
+                print("timeout: invalid usage", file=sys.stderr)
+                return 125 if form == "gnu" else 1
+            rest = rest[3:] if busybox else rest[2:]
+        if rest == ["true"]:
+            return 0
+        line = " ".join(rest)
+        for rule in b.get("exec_rules", []):
+            if rule["contains"] in line:
+                if rule.get("append"):
+                    with open(rule["append"], "a") as f:
+                        f.write("ran\n")
+                print(rule.get("stdout", ""), end="")
+                return rule.get("exit", 0)
+        return 0
+
     if cmd == "exec" and "info" in argv:
         print("27.0.0-fake")  # inner dockerd of a DinD guest is ready
         return 0

@@ -164,6 +164,9 @@ class GuestRecord:
     work_mount: Path
     network_mode: str = "public"
     guest_processes: dict[str, Path] = field(default_factory=dict)
+    # How this guest's image runs a command under a time limit: "gnu"
+    # (timeout N), "busybox" (timeout -t N) or "none". None: not probed yet.
+    timeout_form: str | None = None
 
 
 class DockerClient:
@@ -1042,27 +1045,26 @@ class DockerGuestProvider:
             argv[0] = "sh"
         timeout_seconds = request.timeout_seconds or 60
         # Enforce timeout inside the guest so the container stays alive (§3.2).
-        # Try GNU timeout first, then BusyBox ``timeout -t``.
-        candidates = [
-            ["timeout", str(timeout_seconds), *argv],
-            ["timeout", "-t", str(timeout_seconds), *argv],
-            argv,
-        ]
+        # The timeout form of the image is probed once with a no-op command.
+        # The customer command runs exactly once: an exit code of 127 from it
+        # is its own result, not a sign that the timeout binary is missing.
+        form = self._timeout_form(guest)
+        if form == "gnu":
+            wrapped = ["timeout", str(timeout_seconds), *argv]
+        elif form == "busybox":
+            wrapped = ["timeout", "-t", str(timeout_seconds), *argv]
+        else:
+            wrapped = argv
         t0 = time.perf_counter()
-        code, out, err, timed_out = 1, "", "", False
-        for wrapped in candidates:
-            code, out, err, timed_out = self._client.exec(
-                guest.container_id,
-                wrapped,
-                cwd=cwd,
-                env={**dict(request.env)},
-                timeout_seconds=timeout_seconds + 15 if wrapped is not argv else timeout_seconds,
-                stdin=request.stdin,
-                user=request.user,
-            )
-            # 127 = command not found (no timeout binary) — try next form.
-            if wrapped is argv or code != 127:
-                break
+        code, out, err, timed_out = self._client.exec(
+            guest.container_id,
+            wrapped,
+            cwd=cwd,
+            env={**dict(request.env)},
+            timeout_seconds=timeout_seconds + 15 if wrapped is not argv else timeout_seconds,
+            stdin=request.stdin,
+            user=request.user,
+        )
         # GNU timeout → 124; BusyBox/KILL → 137/143; client-side timeout flag.
         if code in {124, 137, 143} or timed_out:
             timed_out = True
@@ -1090,6 +1092,24 @@ class DockerGuestProvider:
             timed_out=timed_out,
             truncated=truncated,
         )
+
+    def _timeout_form(self, guest: GuestRecord) -> str:
+        """Return "gnu", "busybox" or "none" for the guest image. Probe once.
+
+        The probe runs only "true", so a repeat has no side effect.
+        """
+        if guest.timeout_form is not None:
+            return guest.timeout_form
+        form = "none"
+        for name, probe in (("gnu", ["timeout", "5", "true"]), ("busybox", ["timeout", "-t", "5", "true"])):
+            code, _, _, _ = self._client.exec(
+                guest.container_id, probe, cwd=None, env={}, timeout_seconds=20, stdin=None
+            )
+            if code == 0:
+                form = name
+                break
+        guest.timeout_form = form
+        return form
 
     def start_process(self, sandbox_id: str, request: ExecRequest) -> ProcessHandle:
         guest = self._guests.get(sandbox_id)
