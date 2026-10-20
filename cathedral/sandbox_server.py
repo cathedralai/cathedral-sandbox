@@ -523,8 +523,14 @@ class SandboxApplication:
     def prefetch(self, *, headers, body, api_key, **_):
         payload = self._json(body)
         idem = headers.get("Idempotency-Key") or headers.get("idempotency-key")
-        op = self.provider.prefetch(PrefetchRequest(images=tuple(payload.get("images", ()))))
-        return Response.json(202, {"operation_id": op, "idempotent": idem is not None})
+        op = self.provider.prefetch(
+            PrefetchRequest(images=tuple(payload.get("images", ())), registry_auth=payload.get("registry_auth"))
+        )
+        result = self.provider.get_operation(op)
+        return Response.json(
+            202,
+            {"operation_id": op, "idempotent": idem is not None, "status": result["status"], "result": result["result"]},
+        )
 
     def image_lookup(self, *, ref, **_):
         return Response.json(200, dict(self.provider.image_status(ref)))

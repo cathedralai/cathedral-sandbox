@@ -81,6 +81,12 @@ def main(argv):
 
     if cmd == "pull":
         ref = argv[-1]
+        config = os.environ.get("DOCKER_CONFIG")
+        if config:
+            with open(os.path.join(config, "config.json")) as f:
+                auth = json.load(f)
+            with Locked() as st:
+                st.setdefault("pull_auth", []).append({"ref": ref, "auth": auth, "config_dir": config})
         if b.get("pull_delay"):
             time.sleep(b["pull_delay"])
         if ref in b.get("pull_fail", []):

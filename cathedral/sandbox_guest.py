@@ -10,6 +10,7 @@ guest, and no path that pretends Kata or DinD when they are absent.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shlex
@@ -231,13 +232,23 @@ class DockerClient:
             return False
         return result.returncode == 0 and bool(result.stdout.strip())
 
-    def pull(self, image: str, *, registry_auth: Mapping[str, str] | None = None) -> None:
-        env: dict[str, str] | None = None
-        config_dir: Path | None = None
-        if registry_auth is not None:
-            config_dir = Path(tempfile.mkdtemp(prefix="cathedral-docker-auth-"))
-            config_dir.joinpath("config.json").write_text(
-                json.dumps(
+    @contextlib.contextmanager
+    def _registry_env(self, image: str, registry_auth: Mapping[str, str] | None):
+        """Yield a docker env with a one-call client config, or None.
+
+        The credentials go into a private temp dir that is deleted after the
+        call. They never reach the daemon's own config or a log line.
+        """
+        if registry_auth is None:
+            yield None
+            return
+        config_dir = Path(tempfile.mkdtemp(prefix="cathedral-docker-auth-"))
+        try:
+            config_dir.chmod(0o700)
+            config_file = config_dir / "config.json"
+            fd = os.open(config_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(
                     {
                         "auths": {
                             _registry_host(image): {
@@ -245,22 +256,22 @@ class DockerClient:
                                 "password": registry_auth["password"],
                             }
                         }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            env = {"DOCKER_CONFIG": str(config_dir)}
-        try:
-            result = self.run(["docker", "pull", image], timeout=600.0, env=env)
-            if result.returncode != 0:
-                raise SandboxOpError(
-                    "image_pull_failed",
-                    502,
-                    f"docker pull failed for {image}: {result.stderr.strip()[:300]}",
+                    },
+                    fh,
                 )
+            yield {"DOCKER_CONFIG": str(config_dir)}
         finally:
-            if config_dir is not None:
-                shutil.rmtree(config_dir, ignore_errors=True)
+            shutil.rmtree(config_dir, ignore_errors=True)
+
+    def pull(self, image: str, *, registry_auth: Mapping[str, str] | None = None) -> None:
+        with self._registry_env(image, registry_auth) as env:
+            result = self.run(["docker", "pull", image], timeout=600.0, env=env)
+        if result.returncode != 0:
+            raise SandboxOpError(
+                "image_pull_failed",
+                502,
+                f"docker pull failed for {image}: {result.stderr.strip()[:300]}",
+            )
 
     def ensure_image(
         self,
@@ -1326,17 +1337,23 @@ class DockerGuestProvider:
         )
 
     def prefetch(self, request: PrefetchRequest) -> str:
+        pulled: list[dict[str, Any]] = []
         for image in request.images:
             # Prefetch is the explicit refresh path: it always pulls.
-            self._ensure_image(image, refresh=True)
+            self._ensure_image(image, registry_auth=request.registry_auth, refresh=True)
             inspected = self._client.image_inspect(image)
-            self._inner._images[image] = {  # noqa: SLF001
+            entry = {
                 "ref": image,
                 "cached": True,
                 "size_bytes": int(inspected.get("Size") or 0),
                 "digest": (inspected.get("RepoDigests") or [None])[0],
             }
-        return self._inner.prefetch(request)
+            self._inner._images[image] = entry  # noqa: SLF001
+            pulled.append(dict(entry))
+        op_id = self._inner.prefetch(PrefetchRequest(images=request.images))
+        with self._inner._lock:  # noqa: SLF001
+            self._inner._operations[op_id]["result"]["images"] = pulled  # noqa: SLF001
+        return op_id
 
     def image_status(self, ref: str) -> dict[str, Any]:
         entry = self._inner.image_status(ref)

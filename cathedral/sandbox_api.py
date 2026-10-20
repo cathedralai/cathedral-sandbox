@@ -770,11 +770,22 @@ class PrefetchRequest:
     """§3.9 warm a list of image references before a job (bounded; dedup preserved)."""
 
     images: tuple[str, ...]
+    # Optional private-registry login for these pulls. It is used for one call
+    # only and is kept out of repr, so it does not reach a log line.
+    registry_auth: Mapping[str, str] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _require(len(self.images) <= 1000, "invalid_prefetch", "prefetch list is bounded to 1000 images")
         for ref in self.images:
             _require(_IMAGE_REF_RE.match(ref) is not None, "invalid_image_reference", f"image ref is invalid: {ref!r}")
+        if self.registry_auth is not None:
+            _require(
+                isinstance(self.registry_auth, Mapping)
+                and set(self.registry_auth) == {"username", "password"}
+                and all(isinstance(v, str) and v for v in self.registry_auth.values()),
+                "invalid_registry_auth",
+                "registry_auth needs non-empty username and password",
+            )
 
 
 @dataclass(frozen=True)
