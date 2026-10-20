@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -99,6 +100,44 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
         return default
 
 
+DIND_DOCKERD_ARGS_DEFAULT = (
+    "--host=unix:///var/run/docker.sock",
+    "--default-address-pool",
+    "base=172.28.0.0/16,size=24",
+)
+
+
+@dataclass(frozen=True)
+class DindConfig:
+    """Operator settings for Docker-in-Docker guests.
+
+    CATHEDRAL_DIND_RUNTIME: OCI runtime for DinD guests (for example
+    runsc-netraw, a runsc entry with --net-raw). Not used with Kata.
+    CATHEDRAL_DIND_DOCKERD_ARGS: inner dockerd arguments (shell words). They
+    replace the default arguments.
+    CATHEDRAL_DIND_ENV: extra guest environment as shell words of KEY=VALUE.
+    """
+
+    runtime: str | None = None
+    dockerd_args: tuple[str, ...] = DIND_DOCKERD_ARGS_DEFAULT
+    env: tuple[tuple[str, str], ...] = ()
+
+    @classmethod
+    def from_env(cls) -> "DindConfig":
+        raw_args = os.environ.get("CATHEDRAL_DIND_DOCKERD_ARGS", "").strip()
+        env: list[tuple[str, str]] = []
+        for word in shlex.split(os.environ.get("CATHEDRAL_DIND_ENV", "")):
+            key, sep, value = word.partition("=")
+            if not sep or not key:
+                raise ValueError(f"CATHEDRAL_DIND_ENV entry is not KEY=VALUE: {word!r}")
+            env.append((key, value))
+        return cls(
+            runtime=os.environ.get("CATHEDRAL_DIND_RUNTIME", "").strip() or None,
+            dockerd_args=tuple(shlex.split(raw_args)) if raw_args else DIND_DOCKERD_ARGS_DEFAULT,
+            env=tuple(env),
+        )
+
+
 def runtime_has_kernel_isolation(runtime: str) -> bool:
     """True for OCI runtimes that put a separate kernel under the guest.
 
@@ -134,6 +173,7 @@ class DockerClient:
         # Optional OCI runtime for non-Kata guests (for example runsc). Empty means
         # the daemon default runtime.
         self.guest_runtime = os.environ.get("CATHEDRAL_DOCKER_RUNTIME", "").strip() or None
+        self.dind = DindConfig.from_env()
 
     def default_runtime(self) -> str:
         """The daemon's default OCI runtime name, or "" when unknown."""
@@ -323,6 +363,8 @@ class DockerClient:
             argv.extend(["--user", user])
         if use_kata:
             argv.extend(["--runtime", self.kata_runtime])
+        elif dind and self.dind.runtime:
+            argv.extend(["--runtime", self.dind.runtime])
         elif self.guest_runtime:
             argv.extend(["--runtime", self.guest_runtime])
         if dind:
@@ -335,6 +377,8 @@ class DockerClient:
                 )
             argv.append("--privileged")
             argv.extend(["-e", "DOCKER_TLS_CERTDIR="])
+            for key, value in self.dind.env:
+                argv.extend(["-e", f"{key}={value}"])
         # Prefer storage quota when the local driver accepts it (overlay2+xfs usually).
         storage_opt = ["--storage-opt", f"size={disk_gib}G"] if disk_gib > 0 and not use_kata else []
         argv.extend(storage_opt)
@@ -344,16 +388,7 @@ class DockerClient:
         for key, value in env.items():
             argv.extend(["-e", f"{key}={value}"])
         if dind:
-            argv.extend(
-                [
-                    image,
-                    "dockerd-entrypoint.sh",
-                    "dockerd",
-                    "--host=unix:///var/run/docker.sock",
-                    "--default-address-pool",
-                    "base=172.28.0.0/16,size=24",
-                ]
-            )
+            argv.extend([image, "dockerd-entrypoint.sh", "dockerd", *self.dind.dockerd_args])
         elif entrypoint:
             argv.append(image)
             argv.extend(list(entrypoint))
@@ -1308,6 +1343,8 @@ def shlex_quote(value: str) -> str:
 
 
 __all__ = [
+    "DIND_DOCKERD_ARGS_DEFAULT",
+    "DindConfig",
     "DockerClient",
     "DockerGuestProvider",
     "GuestRecord",

@@ -172,6 +172,10 @@ def main(argv):
                     print(f"{cid} {c['labels'].get('cathedral.sandbox.id', '')}")
         return 0
 
+    if cmd == "exec" and "info" in argv:
+        print("27.0.0-fake")  # inner dockerd of a DinD guest is ready
+        return 0
+
     if cmd in ("exec", "inspect", "network", "pause", "unpause", "commit", "build"):
         return 0
 

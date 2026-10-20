@@ -234,3 +234,67 @@ def test_explicit_guest_runtime_is_passed_to_docker_run(fake: FakeDocker, monkey
         assert run[run.index("--runtime") + 1] == "runsc"
     finally:
         provider.close()
+
+
+# ---------------------------------------------------------------- D6: DinD flags
+def _dind_run(fake: FakeDocker) -> list[str]:
+    (run,) = fake.calls_of("run")
+    return run
+
+
+def test_dind_defaults_are_unchanged(fake: FakeDocker, monkeypatch) -> None:
+    monkeypatch.setenv("CATHEDRAL_ALLOW_PRIVILEGED_DIND", "1")
+    fake.add_image("docker:28-dind")
+    provider = DockerGuestProvider()
+    try:
+        _create(provider, image="docker:28-dind")
+        run = _dind_run(fake)
+        assert "--runtime" not in run
+        assert run[run.index("docker:28-dind") + 1 :] == [
+            "dockerd-entrypoint.sh",
+            "dockerd",
+            "--host=unix:///var/run/docker.sock",
+            "--default-address-pool",
+            "base=172.28.0.0/16,size=24",
+        ]
+    finally:
+        provider.close()
+
+
+def test_dind_gvisor_recipe_is_configurable(fake: FakeDocker, monkeypatch) -> None:
+    monkeypatch.setenv("CATHEDRAL_ALLOW_PRIVILEGED_DIND", "1")
+    monkeypatch.setenv("CATHEDRAL_DOCKER_RUNTIME", "runsc")
+    monkeypatch.setenv("CATHEDRAL_DIND_RUNTIME", "runsc-netraw")
+    monkeypatch.setenv(
+        "CATHEDRAL_DIND_DOCKERD_ARGS",
+        "--host=unix:///var/run/docker.sock --iptables=false --ip6tables=false "
+        "--default-network-opt bridge=com.docker.network.advertise_addr_nmsgs=0",
+    )
+    monkeypatch.setenv("CATHEDRAL_DIND_ENV", "DOCKER_IPTABLES_LEGACY=1")
+    fake.add_image("docker:28-dind")
+    fake.add_image("alpine:3.20")
+    provider = DockerGuestProvider()
+    try:
+        _create(provider, image="docker:28-dind")
+        run = _dind_run(fake)
+        assert run[run.index("--runtime") + 1] == "runsc-netraw"
+        assert "DOCKER_IPTABLES_LEGACY=1" in run
+        assert run[run.index("dockerd") + 1 :] == [
+            "--host=unix:///var/run/docker.sock",
+            "--iptables=false",
+            "--ip6tables=false",
+            "--default-network-opt",
+            "bridge=com.docker.network.advertise_addr_nmsgs=0",
+        ]
+        # Plain guests keep the plain runtime.
+        _create(provider, digest="c")
+        plain = fake.calls_of("run")[1]
+        assert plain[plain.index("--runtime") + 1] == "runsc"
+    finally:
+        provider.close()
+
+
+def test_dind_env_rejects_malformed_entry(fake: FakeDocker, monkeypatch) -> None:
+    monkeypatch.setenv("CATHEDRAL_DIND_ENV", "NOEQUALS")
+    with pytest.raises(ValueError):
+        DockerGuestProvider()
