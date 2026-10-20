@@ -431,3 +431,40 @@ func TestPrefetchToChosenHotelsWithLoginAndStatus(t *testing.T) {
 
 func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
 
+func TestCompatUnknownTemplateIsAnErrorNotABaseImageRoom(t *testing.T) {
+	tc := newChain(t)
+	send := func(tpl string) int {
+		raw, _ := json.Marshal(map[string]any{"template": tpl})
+		req, _ := http.NewRequest("POST", tc.srv.URL+"/v1/sandboxes", bytes.NewReader(raw))
+		req.Header.Set("Authorization", "Bearer key1")
+		req.Header.Set("User-Agent", "ctcli/1.0")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	before := createsOn(tc)
+	if got := send("no-such-template"); got != 404 {
+		t.Fatalf("unknown template: %d", got)
+	}
+	after := createsOn(tc)
+	for id := range before {
+		if after[id] != before[id] {
+			t.Fatalf("unknown template reached hotel %s", id)
+		}
+	}
+	if got := send("room-2x8"); got != 201 {
+		t.Fatalf("catalog template: %d", got)
+	}
+	var last map[string]any
+	for _, f := range tc.hotels {
+		if len(f.creates) > 0 {
+			last = f.creates[len(f.creates)-1]
+		}
+	}
+	if res := last["resources"].(map[string]any); res["vcpu"].(float64) != 2 || res["memory_gib"].(float64) != 8 {
+		t.Fatalf("template resources: %v", res)
+	}
+}

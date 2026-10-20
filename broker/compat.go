@@ -216,6 +216,9 @@ func (b *broker) serveCompat(w http.ResponseWriter, r *http.Request, g *guestSta
 	}
 }
 
+// compatTemplates are the catalog templates: name -> {vcpu, memory GiB}.
+var compatTemplates = map[string][2]int{"room-1x4": {1, 4}, "room-2x8": {2, 8}, "room-4x16": {4, 16}}
+
 func (b *broker) compatCatalog(w http.ResponseWriter) {
 	b.mu.Lock()
 	free := 0
@@ -332,7 +335,15 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	} else if ref, _ := req["image"].(string); ref != "" {
 		native["image"] = ref
 	} else if t, _ := req["template"].(string); t != "" {
+		// Only the catalog templates map to the base image. An unknown name
+		// is an error, never a silent base-image room.
+		size, ok := compatTemplates[t]
+		if !ok {
+			compatErr(w, 404, "template_not_found", "no template "+t+"; see /v1/sandboxes/catalog", 0)
+			return
+		}
 		native["image"] = "alpine:3.20"
+		res = map[string]any{"vcpu": size[0], "memory_gib": size[1], "disk_gib": 10}
 	} else {
 		compatErr(w, 400, "invalid_source", "image_id is required", 0)
 		return
