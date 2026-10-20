@@ -62,7 +62,7 @@ type guestConfig struct {
 	KeySHA256       string `json:"key_sha256"`        // empty: the guest has a view only
 	ViewTokenSHA256 string `json:"view_token_sha256"` // token for /<id>/live
 	Ops             bool   `json:"ops"`               // may run the probe and reset the broker counters
-	guestLimits                                       // max_rooms, max_creates_per_minute, default_sealed, hotels (guests.go)
+	guestLimits            // max_rooms, max_creates_per_minute, default_sealed, hotels (guests.go)
 }
 
 type config struct {
