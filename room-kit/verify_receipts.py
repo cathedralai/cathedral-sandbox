@@ -173,7 +173,7 @@ def verify_attestation(att: dict, expected_measurement: str | None, prod: str | 
     return out
 
 
-def verify_receipts(att: dict, receipts: list[dict]) -> dict:
+def verify_receipts(att: dict, receipts: list[dict], head: str | None = None) -> dict:
     binding = att["binding"]
     bsha = att["binding_sha256"]
     key = Ed25519PublicKey.from_public_bytes(base64.b64decode(binding["receipt_key_ed25519_b64"]))
@@ -198,6 +198,9 @@ def verify_receipts(att: dict, receipts: list[dict]) -> dict:
             links += 1
     seqs = sorted(by_seq)
     contiguous = bool(seqs) and seqs == list(range(seqs[0], seqs[-1] + 1))
+    if head is not None:  # a whole chain (GET .../receipts from 0): no gap, ends at the head
+        need(seqs and seqs[0] == 1 and contiguous, "the chain has a gap or does not start at receipt 1")
+        need(by_seq[seqs[-1]]["receipt_sha256"] == head, "the chain does not end at the hotel's head")
     actions = {}
     for rc in receipts:
         actions[rc["statement"]["action"]] = actions.get(rc["statement"]["action"], 0) + 1
@@ -242,11 +245,12 @@ def main() -> int:
             att = json.load(open(a.attestation))
             doc = json.load(open(a.receipts)) if a.receipts else []
         receipts = doc["receipts"] if isinstance(doc, dict) else doc
+        head = doc.get("head") if isinstance(doc, dict) and not a.sandbox and not a.receipt_header else None
         for h in a.receipt_header:
             receipts.append(json.loads(base64.urlsafe_b64decode(h + "=" * (-len(h) % 4))))
         out = {"attestation": verify_attestation(att, a.expected_measurement, a.product, a.kds_cache,
                                                  a.ark_sha256, a.skip_amd),
-               "chain": verify_receipts(att, receipts), "verdict": "PASS"}
+               "chain": verify_receipts(att, receipts, head), "verdict": "PASS"}
         print(json.dumps(out, indent=1))
         return 0
     except Fail as exc:
