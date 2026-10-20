@@ -31,7 +31,7 @@ Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
 
 ## Live view
 
-`/<guest>/live?token=<view token>` sets an HttpOnly, Secure, SameSite=Strict
+`/<guest>/live?token=<view token>` sets an HttpOnly, Secure, SameSite=Lax
 cookie for that guest path and redirects to `/<guest>/live`. Every request
 to the page and to its data stream (`/<guest>/live/events`, server-sent
 events, 1 per second) needs that cookie. A wrong token and an unknown guest

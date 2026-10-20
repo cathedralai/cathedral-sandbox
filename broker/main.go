@@ -927,8 +927,11 @@ func (b *broker) handleLive(w http.ResponseWriter, r *http.Request, guestID, tai
 		return
 	}
 	if fresh != "" {
+		// Lax, not Strict: a link opened from another app (for example a
+		// terminal) is a cross-site navigation, and Strict would drop the
+		// cookie on the redirect that follows.
 		http.SetCookie(w, &http.Cookie{Name: "bv_" + guestID, Value: fresh, Path: "/" + guestID + "/", MaxAge: 30 * 86400,
-			HttpOnly: true, Secure: !b.cfg.InsecureCookie, SameSite: http.SameSiteStrictMode})
+			HttpOnly: true, Secure: !b.cfg.InsecureCookie, SameSite: http.SameSiteLaxMode})
 		http.Redirect(w, r, "/"+guestID+"/live", http.StatusSeeOther)
 		return
 	}

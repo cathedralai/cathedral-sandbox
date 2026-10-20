@@ -113,6 +113,7 @@ func main() {
 	memStop := flag.Float64("memstop", 90, "abort if any hotel RAM % is above this")
 	outDir := flag.String("out", ".", "output directory")
 	stopFile := flag.String("stopfile", "", "abort when this file exists")
+	netCheck := flag.Int("netcheck", 0, "rooms that fetch a public URL once at the start of the hold")
 	finalTTL := flag.Int("final-ttl", 0, "TTL set by the last heartbeat before cleanup (0 = -ttl)")
 	network := flag.String("network", "public", "room network mode: public or none (none uses no bridge port)")
 	flag.Parse()
@@ -269,6 +270,41 @@ func main() {
 	samp := ids[:min(*sample, len(ids))]
 	var execMs []float64
 	var emu sync.Mutex
+	// Internet check: one HTTPS fetch from rooms spread over the whole run.
+	var netOK, netFail atomic.Int64
+	var netMs []float64
+	netByHotel := map[string][2]int{}
+	if *netCheck > 0 && len(ids) > 0 {
+		step := max(1, len(ids)/(*netCheck))
+		var pick []string
+		for i := 0; i < len(ids) && len(pick) < *netCheck; i += step {
+			pick = append(pick, ids[i])
+		}
+		pool(pick, func(id string) {
+			st, _, out, err := call(ctx, "POST", "/v1/sandboxes/"+id+"/exec", map[string]any{"cmd": []string{"sh", "-c", "wget -q -T 15 -O /dev/null https://www.cloudflare.com/cdn-cgi/trace && echo net-ok"}, "timeout_seconds": 30})
+			hotel, _, _ := strings.Cut(id, ".")
+			var doc map[string]any
+			_ = json.Unmarshal(out, &doc)
+			ok := err == nil && st == 200 && strings.Contains(fmt.Sprint(doc["stdout"]), "net-ok")
+			emu.Lock()
+			c := netByHotel[hotel]
+			if ok {
+				c[0]++
+				if d, isNum := doc["duration_ms"].(float64); isNum {
+					netMs = append(netMs, d)
+				}
+			} else {
+				c[1]++
+			}
+			netByHotel[hotel] = c
+			emu.Unlock()
+			if ok {
+				netOK.Add(1)
+			} else {
+				netFail.Add(1)
+			}
+		})
+	}
 	lastHB := time.Now()
 	nextExec := time.Now()
 	for time.Since(holdStart) < *hold && ctx.Err() == nil {
@@ -348,6 +384,7 @@ func main() {
 		"by_status": byStatus, "per_hotel": perHotel,
 		"client_ms": pct(cl), "queue_ms": pct(q), "hotel_ms": pct(hm), "overhead_ms": pct(ov),
 		"heartbeats_ok": hbOK.Load(), "heartbeats_failed": hbFail.Load(), "exec_ok": exOK.Load(), "exec_failed": exFail.Load(), "exec_ms": pct(execMs),
+		"net_check_ok": netOK.Load(), "net_check_failed": netFail.Load(), "net_check_ms": pct(netMs), "net_check_by_hotel": netByHotel,
 		"heartbeats_stopped_s": hbStoppedS, "api_empty_at_s": firstZeroAPI, "containers_gone_at_s": firstZeroCont,
 		"peaks": peaks, "broker_stats_after_create": brokerStats,
 	}
