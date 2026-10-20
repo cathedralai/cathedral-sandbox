@@ -62,7 +62,8 @@ log "expected measurement $EXPECTED"
 
 # ---------------------------------------------------------------- 4. unit
 install -m 0755 "$KIT/sealed/host-net.sh" "$KIT/sealed/launch-guest.sh" -t "$SEALED_DIR/"
-install -m 0600 "$ENV_FILE" "$SEALED_DIR/sealed.env"
+# A rerun may pass the installed copy itself.
+[ "$ENV_FILE" -ef "$SEALED_DIR/sealed.env" ] || install -m 0600 "$ENV_FILE" "$SEALED_DIR/sealed.env"
 cat > /etc/systemd/system/$UNIT <<EOF
 [Unit]
 Description=Sealed hotel $SEALED_NAME (AMD SEV-SNP guest with the room kit)

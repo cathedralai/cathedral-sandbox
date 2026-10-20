@@ -73,6 +73,47 @@ use `ROOM_DNS`. The kit sets these API settings (`/etc/pool-room/api.env`):
 
 `GET /v1/quota` shows `room_networks`, with the use of each network.
 
+## Room egress policy
+
+Each room has one policy: `internet`, `deny_all` or `allowlist`. The hotel
+applies it outside the room. The room cannot change it.
+
+`room_egress.py` (unit `<ROOM_ID>-egress.service`, root) does the work:
+
+- **nftables.** One table per hotel (`ip` and `bridge` family). A room address
+  that has no policy has no egress (deny by default). Sets hold the rooms with
+  internet, the rooms with hostnames, and the pairs (room address, allowed
+  IPv4 address or CIDR). A change is one nftables transaction.
+- **DNS.** All DNS from a fenced room goes to the hotel resolver on the bridge
+  gateway, whatever server the room asks. It answers allowed names only
+  (NXDOMAIN for other names, REFUSED for `deny_all`).
+- **Egress proxy for hostnames.** TCP 443 and 80 from a room with hostnames
+  go to the proxy on the gateway. The proxy reads the TLS SNI or the HTTP
+  Host, checks it against the room's list, resolves the name itself and
+  connects to that answer only (public IPv4 only). A connection with no name
+  or another name closes.
+- **Port binding.** Frames from a room's bridge port must carry the room's
+  MAC and address, so a room with raw sockets cannot take another room's
+  address and policy.
+
+Why a proxy and not DNS answers in an address set: many allowed names share
+CDN addresses with names that are not allowed. The proxy connects to the
+address of the allowed name, so an allowed address does not open other names.
+
+Allowlist entries: hostnames, `*.suffix` wildcards (subdomains only, not the
+suffix), IPv4 addresses and IPv4 CIDRs, at most 256. Hostnames and wildcards
+work on TCP 80 and 443 only. Addresses and CIDRs work on every port.
+`room-net.sh` still drops private and link-local ranges, so an allowlist
+cannot open them. IPv6 is not supported.
+
+The API sends the policy to the daemon over `/run/pool-room-egress/control.sock`
+after each start and on each `PUT /v1/sandboxes/{id}/network`. A live switch
+also closes open proxy connections the new policy does not allow and deletes
+the room's conntrack entries. A room created with network `none` has no
+interface and cannot switch (409 `network_not_switchable`). Set
+`ROOM_EGRESS=0` to turn the daemon off; then `allowlist` and `deny_all` fail
+closed to network `none`, as before.
+
 ## Build the API tarball
 
 The kit installs a pinned commit of this repository. Run

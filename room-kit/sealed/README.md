@@ -80,13 +80,17 @@ network, or refuse the scratch disk.
   HOST_DATA, kernel command line, kit and API commits.
 - It asks the AMD secure processor for a report with
   `REPORT_DATA = sha256(canonical(binding)) || 32 zero bytes`.
-- For each create, exec, background process start and delete, it signs a
-  statement. The statement has the same core fields as the staging lane:
+- For each create, exec, background process start, delete and network
+  policy switch, it signs a statement. The statement has the same core fields as the staging lane:
   `operation_id`, `action`, `target`, `customer_request_sha256`,
   `command_sha256`, `result_sha256`, `sequence`, `previous_receipt_sha256`,
   `issued_at`. It adds `hotel`, `sandbox_id`, `image`, `image_digest`,
   `status` and `binding_sha256`. Receipt 1 links to the binding. Each next
   receipt links to the receipt before it.
+- Create and network switch receipts also carry `network_policy` (the
+  canonical policy the hotel applied: mode and sorted allowlist) and
+  `network_policy_sha256`. The egress rules run inside the guest, so the host
+  cannot change them.
 
 Routes (through the broker):
 
@@ -112,7 +116,8 @@ python3 verify_receipts.py --attestation attestation.json --receipts chain.json 
 It checks the binding digest, REPORT_DATA, the AMD chain (ARK, ASK and VCEK
 from AMD KDS, RSA-PSS SHA-384), the VCEK chip id and TCB extensions, the
 report signature (ECDSA P-384), each receipt signature (Ed25519) and the
-chain links.
+chain links. It prints the policy timeline of each room
+(`policy_timeline`) and checks each policy sha256.
 
 ### Not covered yet
 

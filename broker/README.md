@@ -76,6 +76,21 @@ another guest. The hotel receipt chain (`GET /v1/hotels/<id>/receipts`) is
 one chain per hotel boot: it shows every guest's room ids, image names and
 hashes, but no commands, files or outputs.
 
+## Room network policy
+
+A create takes `"network": {"mode": "internet" | "deny_all" | "allowlist", "allow": [...]}`.
+`PUT /v1/sandboxes/{id}/network` with the same object switches the policy of a
+live room. The broker passes both to the room's hotel. The hotel applies the
+policy outside the room (see `room-kit/README.md`, "Room egress policy") and
+answers with the canonical policy and its sha256. A sealed hotel also signs a
+receipt for the switch (`X-Room-Receipt`).
+
+Clients (Harbor plugin, ctcli) send `"network": "allowlist"` with
+`"network_allow": [...]`, and the same PUT with `{"mode", "allow"}`. The
+catalog shows `dynamic_network_policy: true` and the entry types in
+`network_allowlist`. Client `deny_all` and `none` both become hotel
+`deny_all`: the room keeps an interface, so it can switch later.
+
 ## Snapshots and forks
 
 A snapshot stays on the hotel that made it.
