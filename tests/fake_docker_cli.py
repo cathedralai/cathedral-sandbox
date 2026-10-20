@@ -100,6 +100,50 @@ def main(argv):
             st["images"].append(argv[2])
         return 0
 
+    if cmd == "network" and argv[1] == "create":
+        name = argv[-1]
+        opts = [argv[i + 1] for i, p in enumerate(argv) if p == "-o"]
+        subnet = argv[argv.index("--subnet") + 1] if "--subnet" in argv else None
+        with Locked() as st:
+            nets = st.setdefault("networks", {"bridge": {"containers": []}})
+            if name in nets:
+                print(f"Error response from daemon: network with name {name} already exists", file=sys.stderr)
+                return 1
+            nets[name] = {"containers": [], "opts": opts, "subnet": subnet}
+        print(uuid.uuid4().hex)
+        return 0
+
+    if cmd == "network" and argv[1] == "inspect":
+        name = argv[-1]
+        with Locked() as st:
+            net = st.setdefault("networks", {"bridge": {"containers": []}}).get(name)
+        if net is None:
+            print(f"Error response from daemon: network {name} not found", file=sys.stderr)
+            return 1
+        print(len(net["containers"]))
+        return 0
+
+    if cmd == "network" and argv[1] in ("connect", "disconnect"):
+        net_name, ref = argv[-2], argv[-1]
+        with Locked() as st:
+            nets = st.setdefault("networks", {"bridge": {"containers": []}})
+            cid = find(st, ref)
+            if net_name == "none":
+                return 0
+            if net_name not in nets or cid is None:
+                print(f"Error response from daemon: network {net_name} not found", file=sys.stderr)
+                return 1
+            members = nets[net_name]["containers"]
+            if argv[1] == "connect":
+                if len(members) >= b.get("bridge_ports", 1 << 30):
+                    print("Error response from daemon: adding interface to bridge failed: exchange full", file=sys.stderr)
+                    return 1
+                if cid not in members:
+                    members.append(cid)
+            elif cid in members:
+                members.remove(cid)
+        return 0
+
     if cmd == "run":
         name = argv[argv.index("--name") + 1]
         labels = {}
@@ -117,6 +161,18 @@ def main(argv):
             cid = uuid.uuid4().hex + uuid.uuid4().hex
             fail = "--storage-opt" in argv and b.get("reject_storage_opt")
             fail = fail or any(img in argv for img in b.get("run_fail_images", []))
+            net_name = argv[argv.index("--network") + 1] if "--network" in argv else "bridge"
+            nets = st.setdefault("networks", {"bridge": {"containers": []}})
+            net_error = None
+            if net_name != "none" and not fail:
+                if net_name not in nets:
+                    net_error = f"docker: Error response from daemon: network {net_name} not found."
+                elif len(nets[net_name]["containers"]) >= b.get("bridge_ports", 1 << 30):
+                    net_error = ("docker: Error response from daemon: failed to set up container networking: "
+                                 "adding interface to bridge failed: exchange full")
+                else:
+                    nets[net_name]["containers"].append(cid)
+            fail = fail or net_error is not None
             st["containers"][cid] = {
                 "name": name,
                 "labels": labels,
@@ -124,7 +180,7 @@ def main(argv):
                 "argv": argv,
             }
         if fail:
-            print("docker: Error response from daemon: start failed.", file=sys.stderr)
+            print(net_error or "docker: Error response from daemon: start failed.", file=sys.stderr)
             return 125
         print(cid)
         return 0
@@ -156,6 +212,9 @@ def main(argv):
                     return 1
                 del st["containers"][cid]
                 st["removed"].append(cid)
+                for net in st.setdefault("networks", {}).values():
+                    if cid in net["containers"]:
+                        net["containers"].remove(cid)
             print(ref)
             return 0
         finally:
@@ -221,6 +280,10 @@ class FakeDocker:
         return self._load()["containers"]
 
     @property
+    def networks(self) -> dict[str, dict[str, Any]]:
+        return self._load().get("networks", {"bridge": {"containers": []}})
+
+    @property
     def calls(self) -> list[list[str]]:
         return self._load()["calls"]
 
@@ -263,6 +326,11 @@ def install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeDocker:
         "CATHEDRAL_DIND_RUNTIME",
         "CATHEDRAL_DIND_DOCKERD_ARGS",
         "CATHEDRAL_DIND_ENV",
+        "CATHEDRAL_ROOM_NETWORKS",
+        "CATHEDRAL_ROOM_NETWORK_SIZE",
+        "CATHEDRAL_ROOM_NETWORK_PREFIX",
+        "CATHEDRAL_ROOM_NETWORK_SUBNETS",
+        "CATHEDRAL_ROOM_NETWORK_BRIDGE_PREFIX",
     ):
         monkeypatch.delenv(name, raising=False)
     return FakeDocker(state_path)

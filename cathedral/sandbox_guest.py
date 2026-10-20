@@ -154,6 +154,131 @@ def is_dind_image(image: str) -> bool:
     return "docker:" in lowered and "dind" in lowered
 
 
+class RoomNetworkPool:
+    """Spread guests with a network over several Docker bridge networks.
+
+    One Linux bridge takes at most 1,024 ports ("exchange full"), so one
+    network holds at most about 1,000 guests. With a pool, every guest with
+    network "public" goes to the least used pool network that has a free
+    port. Guests with network "none" or "allowlist" use no port.
+
+    Settings (all optional; with CATHEDRAL_ROOM_NETWORKS unset or 0 the pool
+    is off and guests use the daemon's default bridge, as before):
+    CATHEDRAL_ROOM_NETWORKS: number of networks.
+    CATHEDRAL_ROOM_NETWORK_SIZE: guests per network (default 1000, max 1023).
+    CATHEDRAL_ROOM_NETWORK_PREFIX: Docker network name prefix (default
+      "cathedral-room"); networks are <prefix>-0, <prefix>-1, ...
+    CATHEDRAL_ROOM_NETWORK_SUBNETS: comma-separated subnets, one per network.
+    CATHEDRAL_ROOM_NETWORK_BRIDGE_PREFIX: Linux bridge name prefix; bridge i
+      is <prefix><i> (so the host firewall can name it).
+    A missing network is created; an existing one is reused.
+    """
+
+    MAX_PORTS = 1023
+
+    def __init__(
+        self,
+        *,
+        count: int,
+        size: int = 1000,
+        prefix: str = "cathedral-room",
+        subnets: tuple[str, ...] = (),
+        bridge_prefix: str | None = None,
+    ) -> None:
+        if subnets and len(subnets) != count:
+            raise ValueError("CATHEDRAL_ROOM_NETWORK_SUBNETS needs one subnet per network")
+        self.size = max(1, min(size, self.MAX_PORTS))
+        self.names = [f"{prefix}-{i}" for i in range(count)]
+        self.subnets = subnets
+        self.bridge_prefix = bridge_prefix
+        self.used: dict[str, int] = {n: 0 for n in self.names}
+        self._lock = threading.Lock()
+        self._ready = False
+
+    @classmethod
+    def from_env(cls) -> "RoomNetworkPool | None":
+        count = _env_int("CATHEDRAL_ROOM_NETWORKS", 0)
+        if count <= 0:
+            return None
+        subnets = tuple(s.strip() for s in os.environ.get("CATHEDRAL_ROOM_NETWORK_SUBNETS", "").split(",") if s.strip())
+        return cls(
+            count=count,
+            size=_env_int("CATHEDRAL_ROOM_NETWORK_SIZE", 1000, minimum=1),
+            prefix=os.environ.get("CATHEDRAL_ROOM_NETWORK_PREFIX", "").strip() or "cathedral-room",
+            subnets=subnets,
+            bridge_prefix=os.environ.get("CATHEDRAL_ROOM_NETWORK_BRIDGE_PREFIX", "").strip() or None,
+        )
+
+    @property
+    def capacity(self) -> int:
+        return self.size * len(self.names)
+
+    def ensure(self, client: "DockerClient") -> None:
+        """Create missing networks once; count guests already attached."""
+        with self._lock:
+            if self._ready:
+                return
+            for i, name in enumerate(self.names):
+                found = client.run(["docker", "network", "inspect", "--format", "{{len .Containers}}", name], timeout=30.0)
+                if found.returncode == 0:
+                    try:
+                        self.used[name] = int((found.stdout or "0").strip() or 0)
+                    except ValueError:
+                        self.used[name] = 0
+                    continue
+                argv = ["docker", "network", "create", "--driver", "bridge"]
+                if self.subnets:
+                    argv += ["--subnet", self.subnets[i]]
+                if self.bridge_prefix:
+                    argv += ["-o", f"com.docker.network.bridge.name={self.bridge_prefix}{i}"]
+                created = client.run(argv + [name], timeout=60.0)
+                if created.returncode != 0:
+                    raise SandboxOpError(
+                        "network_setup_failed",
+                        502,
+                        f"docker network create {name} failed: {(created.stderr or '').strip()[:300]}",
+                        retry_after=30,
+                    )
+            self._ready = True
+
+    def acquire(self) -> str:
+        """Reserve one port on the least used network with a free port."""
+        with self._lock:
+            free = [n for n in self.names if self.used[n] < self.size]
+            if not free:
+                raise SandboxOpError(
+                    "network_capacity_exhausted",
+                    503,
+                    f"all {len(self.names)} room networks are full ({self.capacity} guests with a network); "
+                    "retry later or use network none",
+                    retry_after=10,
+                )
+            name = min(free, key=lambda n: self.used[n])
+            self.used[name] += 1
+            return name
+
+    def release(self, name: str | None) -> None:
+        if not name:
+            return
+        with self._lock:
+            if name in self.used and self.used[name] > 0:
+                self.used[name] -= 1
+
+    def recount(self, held: Iterable[str | None]) -> None:
+        """Reset usage from the networks that live guests and queued removals hold."""
+        counts = {n: 0 for n in self.names}
+        for name in held:
+            if name in counts:
+                counts[name] += 1
+        with self._lock:
+            self.used = counts
+
+    def document(self) -> dict[str, Any]:
+        with self._lock:
+            return {"networks": dict(self.used), "size": self.size, "capacity": self.capacity,
+                    "used": sum(self.used.values())}
+
+
 @dataclass
 class GuestRecord:
     sandbox_id: str
@@ -162,6 +287,7 @@ class GuestRecord:
     dind: bool
     work_mount: Path
     network_mode: str = "public"
+    network: str | None = None  # room network that holds the guest's port (pool only)
     guest_processes: dict[str, Path] = field(default_factory=dict)
 
 
@@ -338,6 +464,7 @@ class DockerClient:
         workdir: str | None,
         user: str | None,
         labels: Mapping[str, str] | None = None,
+        network: str | None = None,
     ) -> str:
         work_dir.mkdir(parents=True, exist_ok=True)
         argv = [
@@ -385,6 +512,8 @@ class DockerClient:
         # allowlist fails closed to none until an egress proxy lands (honest).
         if network_mode in {"none", "allowlist"}:
             argv.extend(["--network", "none"])
+        elif network:
+            argv.extend(["--network", network])
         for key, value in env.items():
             argv.extend(["-e", f"{key}={value}"])
         if dind:
@@ -432,7 +561,7 @@ class DockerClient:
                 self.remove_confirmed(name, timeout=60.0)
             raise
 
-    def set_network(self, container_id: str, mode: str) -> None:
+    def set_network(self, container_id: str, mode: str, network: str = "bridge") -> None:
         """Apply egress mode on a live container. allowlist fails closed to none."""
         want_none = mode in {"none", "allowlist"}
         networks = self.run(
@@ -450,11 +579,11 @@ class DockerClient:
                 if net != "none":
                     self.run(["docker", "network", "disconnect", "-f", net, container_id], timeout=30.0)
             return
-        # public: ensure bridge (or first non-none network)
-        if "bridge" not in attached and "none" in attached:
+        # public: ensure the target network (default bridge or a room network)
+        if network not in attached and "none" in attached:
             self.run(["docker", "network", "disconnect", "-f", "none", container_id], timeout=30.0)
-        if "bridge" not in attached:
-            connect = self.run(["docker", "network", "connect", "bridge", container_id], timeout=30.0)
+        if network not in attached:
+            connect = self.run(["docker", "network", "connect", network, container_id], timeout=30.0)
             if connect.returncode != 0:
                 raise SandboxOpError(
                     "network_change_failed",
@@ -719,6 +848,11 @@ class DockerGuestProvider:
         # that is not yet confirmed gone. Only one drain runs at a time.
         self._owner = os.environ.get("CATHEDRAL_SANDBOX_OWNER", "").strip() or "default"
         self._doomed: dict[str, str] = {}  # sandbox_id -> container_id
+        # Room networks (see RoomNetworkPool). A port is held from the start of
+        # docker run until the container is confirmed gone.
+        self._net_pool = RoomNetworkPool.from_env()
+        self._doomed_nets: dict[str, str | None] = {}  # sandbox_id -> network of a queued removal
+        self._net_pending: dict[str, str] = {}  # sandbox_id -> network while docker run runs
         self._doomed_attempts: dict[str, int] = {}
         self._doomed_lock = threading.Lock()
         self._drain_lock = threading.Lock()
@@ -868,6 +1002,7 @@ class DockerGuestProvider:
             "image": guest.image,
             "dind": guest.dind,
             "network_mode": guest.network_mode,
+            "network_name": guest.network,
             "network_enforced": guest.network_mode != "allowlist",
             "allowlist_fail_closed": guest.network_mode == "allowlist",
         }
@@ -918,7 +1053,58 @@ class DockerGuestProvider:
         work = Path(self._inner._sandboxes[sandbox_id].root) / "work"  # noqa: SLF001
         name = f"cathedral-{sandbox_id}"
         entrypoint = None if dind else (tuple(request.entrypoint) if request.entrypoint else ("sleep", "infinity"))
-        container_id = self._client.create_and_start(
+        network = None
+        if self._net_pool is not None and request.network.mode not in {"none", "allowlist"}:
+            self._net_pool.ensure(self._client)
+            network = self._net_pool.acquire()
+            with self._doomed_lock:
+                self._net_pending[sandbox_id] = network
+        try:
+            container_id = self._start_container(
+                request, sandbox_id=sandbox_id, image=image, name=name, work=work, dind=dind,
+                entrypoint=entrypoint, network=network,
+            )
+        except BaseException:
+            self._release_pending(sandbox_id)
+            raise
+        if not self._inner.has_record(sandbox_id):
+            # GC or DELETE removed the record while the guest started. Do not
+            # register an orphan; the reconcile pass retries if this rm fails.
+            self._client.remove_confirmed(container_id, timeout=self._rm_timeout)
+            self._release_pending(sandbox_id)
+            raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
+        with self._doomed_lock:
+            self._net_pending.pop(sandbox_id, None)
+        self._guests[sandbox_id] = GuestRecord(
+            sandbox_id=sandbox_id,
+            container_id=container_id,
+            image=image,
+            dind=dind,
+            work_mount=work,
+            network_mode=request.network.mode,
+            network=network,
+        )
+        return self._after_start(doc, sandbox_id, container_id, dind)
+
+    def _release_pending(self, sandbox_id: str) -> None:
+        with self._doomed_lock:
+            network = self._net_pending.pop(sandbox_id, None)
+        if self._net_pool is not None:
+            self._net_pool.release(network)
+
+    def _start_container(
+        self,
+        request: CreateSandboxRequest,
+        *,
+        sandbox_id: str,
+        image: str,
+        name: str,
+        work: Path,
+        dind: bool,
+        entrypoint: tuple[str, ...] | None,
+        network: str | None,
+    ) -> str:
+        return self._client.create_and_start(
             image=image,
             name=name,
             work_dir=work,
@@ -933,20 +1119,10 @@ class DockerGuestProvider:
             workdir=request.workdir,
             user=request.user,
             labels={LABEL_OWNER: self._owner, LABEL_SANDBOX_ID: sandbox_id},
+            network=network,
         )
-        if not self._inner.has_record(sandbox_id):
-            # GC or DELETE removed the record while the guest started. Do not
-            # register an orphan; the reconcile pass retries if this rm fails.
-            self._client.remove_confirmed(container_id, timeout=self._rm_timeout)
-            raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
-        self._guests[sandbox_id] = GuestRecord(
-            sandbox_id=sandbox_id,
-            container_id=container_id,
-            image=image,
-            dind=dind,
-            work_mount=work,
-            network_mode=request.network.mode,
-        )
+
+    def _after_start(self, doc: dict[str, Any], sandbox_id: str, container_id: str, dind: bool) -> dict[str, Any]:
         if dind:
             self._capabilities_dind = True
             self._client.wait_dind_ready(container_id)
@@ -1105,7 +1281,22 @@ class DockerGuestProvider:
     def set_network(self, sandbox_id: str, patch: NetworkPatch) -> dict[str, Any]:
         doc = self._inner.set_network(sandbox_id, patch)
         guest = self._guests.get(sandbox_id)
-        if guest is not None:
+        if guest is not None and self._net_pool is not None:
+            if patch.mode in {"none", "allowlist"}:
+                self._client.set_network(guest.container_id, patch.mode)
+                self._net_pool.release(guest.network)
+                guest.network = None
+            elif guest.network is None:
+                self._net_pool.ensure(self._client)
+                network = self._net_pool.acquire()
+                try:
+                    self._client.set_network(guest.container_id, patch.mode, network)
+                except BaseException:
+                    self._net_pool.release(network)
+                    raise
+                guest.network = network
+            guest.network_mode = patch.mode
+        elif guest is not None:
             self._client.set_network(guest.container_id, patch.mode)
             guest.network_mode = patch.mode
             doc["network"]["enforced"] = patch.mode != "allowlist"
@@ -1176,12 +1367,16 @@ class DockerGuestProvider:
             return True
         with self._doomed_lock:
             self._doomed[sandbox_id] = guest.container_id
+            self._doomed_nets[sandbox_id] = guest.network
         return True
 
     def _confirm_removed(self, sandbox_id: str) -> None:
         with self._doomed_lock:
             self._doomed.pop(sandbox_id, None)
             self._doomed_attempts.pop(sandbox_id, None)
+            network = self._doomed_nets.pop(sandbox_id, None)
+        if self._net_pool is not None:
+            self._net_pool.release(network)
         self._inner.finish_delete(sandbox_id)
 
     def _remove_queued(self, sandbox_ids: list[str]) -> None:
@@ -1257,7 +1452,24 @@ class DockerGuestProvider:
             for cid, sid in labeled
             if sid not in queued and not (sid and self._inner.has_record(sid))
         ]
-        return sum(1 for gone in self._remove_many(orphans) if gone)
+        removed = sum(1 for gone in self._remove_many(orphans) if gone)
+        if self._net_pool is not None:
+            # Drift guard: count ports from what this API holds now.
+            with self._doomed_lock:
+                held = [g.network for g in list(self._guests.values())]
+                held += list(self._doomed_nets.values()) + list(self._net_pending.values())
+            self._net_pool.recount(held)
+        return removed
+
+    def room_networks(self) -> dict[str, Any] | None:
+        """Port use per room network, or None when the pool is off."""
+        return None if self._net_pool is None else self._net_pool.document()
+
+    def quota(self) -> dict[str, Any]:
+        doc = self._inner.quota()
+        if self._net_pool is not None:
+            doc["room_networks"] = self._net_pool.document()
+        return doc
 
     def sweep(self) -> int:
         """GC expired guests. Return the number of sandboxes collected by this call.
