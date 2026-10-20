@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Mapping
@@ -44,6 +45,18 @@ from cathedral.sandbox_api import (
 from cathedral.sandbox_provider import InMemorySandboxProvider, SandboxOpError, SandboxProvider
 
 JSON = "application/json"
+REAPER_INTERVAL_DEFAULT_SECONDS = 30.0
+
+
+def reaper_interval_from_env() -> float:
+    """CATHEDRAL_SANDBOX_REAPER_SECONDS: seconds between GC passes. 0 turns the reaper off."""
+    raw = os.environ.get("CATHEDRAL_SANDBOX_REAPER_SECONDS", "").strip()
+    if not raw:
+        return REAPER_INTERVAL_DEFAULT_SECONDS
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return REAPER_INTERVAL_DEFAULT_SECONDS
 OCTET = "application/octet-stream"
 
 
@@ -129,6 +142,53 @@ class SandboxApplication:
         self.require_auth = require_auth
         self._routes: list[tuple[str, re.Pattern[str], Callable[..., Response]]] = []
         self._register()
+        self._reaper: threading.Thread | None = None
+        self._reaper_stop = threading.Event()
+
+    # ------------------------------------------------------------------ background GC
+    def start_reaper(self, interval_seconds: float = REAPER_INTERVAL_DEFAULT_SECONDS) -> None:
+        """Run provider.sweep() every *interval_seconds* on a daemon thread.
+
+        TTL expiry then does not depend on API traffic. A failed sweep is logged
+        and the loop continues. Calling this twice does nothing.
+        """
+        if interval_seconds <= 0 or self._reaper is not None:
+            return
+        self._reaper_stop.clear()
+
+        def loop() -> None:
+            while not self._reaper_stop.wait(interval_seconds):
+                try:
+                    self.provider.sweep()
+                except Exception as exc:  # noqa: BLE001 - the reaper must keep running
+                    print(f"cathedral-sandbox reaper: sweep failed: {exc!r}", file=sys.stderr, flush=True)
+
+        self._reaper = threading.Thread(target=loop, name="cathedral-sandbox-reaper", daemon=True)
+        self._reaper.start()
+
+    def stop_reaper(self, timeout: float | None = 10.0) -> None:
+        thread = self._reaper
+        if thread is None:
+            return
+        self._reaper_stop.set()
+        thread.join(timeout)
+        self._reaper = None
+
+    @property
+    def reaper_running(self) -> bool:
+        return self._reaper is not None and self._reaper.is_alive()
+
+    def _sweep_inline(self) -> None:
+        """GC before a read, so an expired sandbox reads as gone (§3.4).
+
+        With the reaper running, only mark expired records when the provider
+        supports it. The slow container removal stays on the reaper thread.
+        """
+        mark = getattr(self.provider, "mark_expired", None) if self.reaper_running else None
+        if callable(mark):
+            mark()
+        else:
+            self.provider.sweep()
 
     # ------------------------------------------------------------------ routing
     def _add(self, method: str, pattern: str, handler: Callable[..., Response]) -> None:
@@ -242,7 +302,7 @@ class SandboxApplication:
     def list_sandboxes(self, *, query, headers, body, api_key, **_):
         # §3.4: reap anything past TTL / its idle window before reading state, so a
         # collected sandbox never lingers in the list or counts against quota.
-        self.provider.sweep()
+        self._sweep_inline()
         docs = self.provider.list(labels=query.get("label", []), state=(query.get("state") or [None])[0])
         return Response.json(200, {"sandboxes": docs})
 
@@ -254,7 +314,7 @@ class SandboxApplication:
         return Response.no_content()
 
     def get_sandbox(self, *, id, **_):
-        self.provider.sweep()  # §3.4: an expired sandbox reads as gone, not "archived"
+        self._sweep_inline()  # §3.4: an expired sandbox reads as gone, not "archived"
         return Response.json(200, self.provider.get(id))
 
     def delete_sandbox(self, *, id, **_):
@@ -471,7 +531,7 @@ class SandboxApplication:
 
     # ------------------------------------------------------------------ §3.8 / §3.13 aggregate
     def quota(self, **_):
-        self.provider.sweep()  # §3.4: an expired sandbox stops counting against quota
+        self._sweep_inline()  # §3.4: an expired sandbox stops counting against quota
         return Response.json(200, self.provider.quota())
 
     def usage(self, *, query, **_):
@@ -916,4 +976,12 @@ def run(app: SandboxApplication, host: str = "127.0.0.1", port: int = 0) -> tupl
     return httpd, httpd.server_address
 
 
-__all__ = ["Response", "SandboxApplication", "openapi_document", "run", "serve"]
+__all__ = [
+    "REAPER_INTERVAL_DEFAULT_SECONDS",
+    "Response",
+    "SandboxApplication",
+    "openapi_document",
+    "reaper_interval_from_env",
+    "run",
+    "serve",
+]
