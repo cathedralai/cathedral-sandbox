@@ -190,9 +190,9 @@ def read_snp_host_data(
         )
     echoed = report[SNP_REPORT_DATA_OFFSET : SNP_REPORT_DATA_OFFSET + SNP_REPORT_DATA_SIZE]
     if not hmac.compare_digest(echoed, report_data):
-    raise MeasuredRootError(
+        raise MeasuredRootError(
             "the SNP report does not carry the requested REPORT_DATA while reading HOST_DATA"
-    )
+        )
     return report[HOST_DATA_OFFSET : HOST_DATA_OFFSET + HOST_DATA_SIZE]
 
 
