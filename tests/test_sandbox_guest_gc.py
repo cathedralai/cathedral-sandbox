@@ -7,6 +7,7 @@ record but left the container running.
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -209,4 +210,32 @@ def test_idempotent_replay_of_deleted_sandbox_starts_no_container(fake: FakeDock
         assert fake.containers == {}
         assert _resident(provider) == 0
     finally:
+        provider.close()
+
+
+def test_each_room_leaves_quota_when_its_own_container_is_gone(fake: FakeDocker, monkeypatch) -> None:
+    # Run 3 and run 4: removals were confirmed only when the whole batch ended,
+    # so fast removals stayed "deleting" and in quota behind one slow removal.
+    monkeypatch.setenv("CATHEDRAL_SANDBOX_RM_TIMEOUT", "6")
+    monkeypatch.setenv("CATHEDRAL_SANDBOX_GC_PARALLELISM", "4")
+    provider = DockerGuestProvider()
+    try:
+        slow, fast = _create(provider, 2)
+        slow_cid = provider._guests[slow].container_id  # noqa: SLF001
+        fake.set(rm_hang={slow_cid: 1})
+        _expire(provider, slow, fast)
+        worker = threading.Thread(target=provider.sweep)
+        worker.start()
+        deadline = time.monotonic() + 4.0
+        while provider.has_record(fast) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        # The slow removal is still running here; the fast room is already out.
+        assert worker.is_alive()
+        assert not provider.has_record(fast)
+        assert provider.has_record(slow)
+        assert _resident(provider) == 1
+        worker.join(timeout=20)
+        assert slow in provider.pending_removals()  # the slow one stays queued for retry
+    finally:
+        fake.set(rm_hang={})
         provider.close()

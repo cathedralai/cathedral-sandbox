@@ -22,7 +22,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1191,9 +1191,12 @@ class DockerGuestProvider:
         """
         with self._doomed_lock:
             batch = [(sid, self._doomed[sid]) for sid in sandbox_ids if sid in self._doomed]
-        for (sid, _), gone in zip(batch, self._remove_many([cid for _, cid in batch])):
+
+        def done(index: int, gone: bool) -> None:
             if gone:
-                self._confirm_removed(sid)
+                self._confirm_removed(batch[index][0])
+
+        self._remove_many([cid for _, cid in batch], on_done=done)
 
     def mark_expired(self) -> int:
         """Move every collectable sandbox to "deleting". Fast; runs no docker command."""
@@ -1203,15 +1206,31 @@ class DockerGuestProvider:
                 marked += 1
         return marked
 
-    def _remove_many(self, refs: list[str]) -> list[bool]:
-        """Remove containers in bounded parallel batches. Return one result per ref."""
+    def _remove_many(self, refs: list[str], *, on_done=None) -> list[bool]:
+        """Remove containers with bounded parallelism. Return one result per ref.
+
+        *on_done(index, gone)* runs as soon as each removal ends, not after the
+        whole list. So each sandbox leaves "deleting" and quota when its own
+        container is confirmed gone.
+        """
         if not refs:
             return []
+        results = [False] * len(refs)
         workers = min(self._gc_parallelism, len(refs))
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cathedral-gc") as pool:
-            return list(
-                pool.map(lambda ref: self._client.remove_confirmed(ref, timeout=self._rm_timeout), refs)
-            )
+            futures = {
+                pool.submit(self._client.remove_confirmed, ref, timeout=self._rm_timeout): i
+                for i, ref in enumerate(refs)
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    results[index] = bool(future.result())
+                except Exception:  # noqa: BLE001 - a failed removal stays queued for retry
+                    results[index] = False
+                if on_done is not None:
+                    on_done(index, results[index])
+        return results
 
     def _drain_locked(self) -> int:
         """Try once to remove each queued container. Caller holds _drain_lock."""
@@ -1223,8 +1242,10 @@ class DockerGuestProvider:
             if not batch:
                 return confirmed
             attempted.update(sid for sid, _ in batch)
-            results = self._remove_many([cid for _, cid in batch])
-            for (sid, cid), gone in zip(batch, results):
+
+            def done(index: int, gone: bool, batch=batch) -> None:
+                nonlocal confirmed
+                sid, cid = batch[index]
                 if gone:
                     self._confirm_removed(sid)
                     confirmed += 1
@@ -1238,6 +1259,8 @@ class DockerGuestProvider:
                         file=sys.stderr,
                         flush=True,
                     )
+
+            self._remove_many([cid for _, cid in batch], on_done=done)
 
     def _reconcile_locked(self) -> int:
         """Remove containers with our owner label that have no sandbox record.
