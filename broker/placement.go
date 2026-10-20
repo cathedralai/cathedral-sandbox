@@ -10,8 +10,9 @@
 //     (1 + expected queue wait)). CPU comes from the hotel health
 //     (host_cpu_pct); create time is a moving average of the hotel create call.
 //   - A create that waits longer than max_queue_wait_seconds for a create
-//     slot moves to another eligible hotel, if one has a free room. If none
-//     has, it keeps waiting where it is.
+//     slot moves to another eligible hotel that has a free room and less
+//     than half the expected wait. Otherwise it keeps waiting. It may move
+//     back to a hotel it left earlier.
 package main
 
 import (
@@ -45,6 +46,24 @@ func (h *hotel) noteCreate(d time.Duration) {
 		return
 	}
 	h.createEWMA = ewmaAlpha*sec + (1-ewmaAlpha)*h.createEWMA
+}
+
+// expectedWait is the time in seconds until a create that joins the queue
+// now (extra = 1) or is already in it (extra = 0) can start. Caller holds b.mu.
+func (h *hotel) expectedWait(extra int) float64 {
+	create := h.createEWMA
+	if create <= 0 {
+		create = defaultCreateSec
+	}
+	slots := cap(h.sem)
+	if slots < 1 {
+		slots = 1
+	}
+	ahead := h.queued + h.creating + extra - slots
+	if ahead < 0 {
+		ahead = 0
+	}
+	return float64(ahead) / float64(slots) * create
 }
 
 // weight of a hotel with free > 0 free rooms. Caller holds b.mu.
@@ -91,12 +110,12 @@ func (b *broker) waitSlot(ctx context.Context, g *guestState, h *hotel, pl place
 			b.mu.Unlock()
 			return nil
 		case <-timer:
+			// Only the current hotel is excluded: a create that left a hotel
+			// may go back to it when that hotel is the faster one now. The
+			// move needs a clear gain (half the expected wait), so creates
+			// do not swing between two hotels.
 			b.mu.Lock()
-			exclude := map[*hotel]bool{h: true}
-			for t := range tried {
-				exclude[t] = true
-			}
-			if alt := b.pick(exclude, pl); alt != nil {
+			if alt := b.pick(map[*hotel]bool{h: true}, pl); alt != nil && alt.expectedWait(1) < h.expectedWait(0)/2 {
 				h.queued--
 				alt.queued++
 				h.moved++
