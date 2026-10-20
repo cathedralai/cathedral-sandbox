@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
-"""Offline verifier for sealed-hotel receipts (room_receipts.py).
+"""Offline verifier for hotel receipts (room_receipts.py).
 
-Checks, in order:
+Level 1 (binding level "hotel", schema cathedral_hotel_binding_v1) has no SNP
+report. Checks, in order:
+  1. binding: sha256(canonical(binding)) equals binding_sha256, level is hotel,
+     and the binding carries no SNP measurement and no report.
+  2. receipts: each statement names this binding and the hotel receipt schema,
+     receipt_sha256 = sha256(canonical(statement)), the Ed25519 signature
+     verifies with the binding's receipt key, and the chain links (sequence 1
+     links to the binding; each next receipt links to the one before). A whole
+     chain must start at receipt 1 and end at head.
+  3. network policy: same as the sealed path below.
+
+Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
   1. binding: sha256(canonical(binding)) equals binding_sha256.
   2. SNP report: REPORT_DATA = binding_sha256 || 32 zero bytes; measurement,
      chip id, reported TCB, policy and HOST_DATA equal the binding; debug is off;
@@ -44,6 +55,8 @@ from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 KDS = "https://kdsintf.amd.com/vcek/v1"
 SIGNED_LEN = 0x2A0
+HOTEL_BINDING_SCHEMA = "cathedral_hotel_binding_v1"
+HOTEL_RECEIPT_SCHEMA = "cathedral_hotel_receipt_v1"
 
 
 def canonical(doc) -> bytes:
@@ -153,6 +166,25 @@ def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str 
     return {"product": prod, "ark_sha256": ark_fp, "tcb": {"bootloader": bl, "tee": tee, "snp": snp, "microcode": ucode}}
 
 
+def is_hotel_level(att: dict) -> bool:
+    binding = att.get("binding")
+    if not isinstance(binding, dict):
+        return False
+    return binding.get("level") == "hotel" or binding.get("schema") == HOTEL_BINDING_SCHEMA
+
+
+def verify_hotel_attestation(att: dict) -> dict:
+    """Level 1 binding. Signature and chain are checked in verify_receipts."""
+    binding = att["binding"]
+    need(binding.get("level") == "hotel", "level 1 binding must say level hotel")
+    need(binding.get("schema") == HOTEL_BINDING_SCHEMA, "level 1 binding schema is not a hotel binding")
+    bsha = sha(canonical(binding))
+    need(bsha == att["binding_sha256"], "binding_sha256 does not match the binding")
+    need(not att.get("report_b64"), "a level 1 chain has no SNP report")
+    need("measurement" not in binding, "a level 1 binding has no SNP measurement")
+    return {"level": "hotel", "binding_sha256": bsha, "hotel": binding.get("hotel")}
+
+
 def verify_attestation(att: dict, expected_measurement: str | None, prod: str | None, cache: str,
                        ark_sha256: str | None, skip_amd: bool) -> dict:
     binding = att["binding"]
@@ -179,10 +211,13 @@ def verify_attestation(att: dict, expected_measurement: str | None, prod: str | 
 def verify_receipts(att: dict, receipts: list[dict], head: str | None = None) -> dict:
     binding = att["binding"]
     bsha = att["binding_sha256"]
+    hotel = is_hotel_level(att)
     key = Ed25519PublicKey.from_public_bytes(base64.b64decode(binding["receipt_key_ed25519_b64"]))
     by_seq = {}
     for rc in receipts:
         st = rc["statement"]
+        if hotel:
+            need(st.get("schema") == HOTEL_RECEIPT_SCHEMA, f"receipt {st.get('sequence')}: not a hotel receipt")
         need(st["binding_sha256"] == bsha, f"receipt {st.get('sequence')} names another binding")
         need(rc["receipt_sha256"] == sha(canonical(st)), f"receipt {st['sequence']}: receipt_sha256 mismatch")
         try:
@@ -296,8 +331,12 @@ def main() -> int:
         head = doc.get("head") if isinstance(doc, dict) and not a.sandbox and not a.receipt_header else None
         for h in a.receipt_header:
             receipts.append(json.loads(base64.urlsafe_b64decode(h + "=" * (-len(h) % 4))))
-        out = {"attestation": verify_attestation(att, a.expected_measurement, a.product, a.kds_cache,
-                                                 a.ark_sha256, a.skip_amd),
+        if is_hotel_level(att):
+            attestation_out = verify_hotel_attestation(att)
+        else:
+            attestation_out = verify_attestation(att, a.expected_measurement, a.product, a.kds_cache,
+                                                 a.ark_sha256, a.skip_amd)
+        out = {"attestation": attestation_out,
                "chain": verify_receipts(att, receipts, head),
                "policy_timeline": policy_timeline(receipts), "verdict": "PASS"}
         print(json.dumps(out, indent=1))

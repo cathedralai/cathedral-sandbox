@@ -75,10 +75,17 @@ write_room_env() {
   for k in $ROOM_KEYS; do printf '%s="%s"\n' "$k" "${!k:-}"; done > "$ROOM_ETC/room.env"
   chmod 0644 "$ROOM_ETC/room.env"
 }
-# ROOM_NETS=auto: the room networks come from the host size in step 8. Until
-# then the resolved file has no room networks.
-ROOM_NETS_AUTO=0
-if [ "${ROOM_NETS:-}" = auto ]; then ROOM_NETS_AUTO=1; ROOM_NETS=""; fi
+# Level 1 receipts default on. ROOM_RECEIPTS=0 is the off switch. A sealed
+# guest sets ROOM_RECEIPTS and ROOM_RECEIPTS_LISTEN itself; those values stay.
+# shellcheck disable=SC1091
+source "$KIT/lib/receipts_mode.sh"
+receipts_apply_defaults
+# Unset ROOM_NETS is auto: one room network per ROOM_NET_SIZE rooms, from the
+# host size in step 8. Until then the resolved file has no room networks.
+# ROOM_NETS=auto is the same. none, off, or empty keeps the main bridge.
+# shellcheck disable=SC1091
+source "$KIT/lib/room_nets_mode.sh"
+resolve_room_nets
 write_room_env
 
 # ---------------------------------------------------------------- 2. data volume (xfs, prjquota, no nodev)
@@ -360,10 +367,11 @@ EOF
 mark "unit:$ROOM_ID-egress.service"
 fi
 
-# Signed receipts (sealed hotels only, ROOM_RECEIPTS=1): room_receipts.py makes
-# an Ed25519 key and an SNP attestation report at start, then fronts the API
-# and health on ROOM_RECEIPTS_LISTEN and signs every create, exec and delete.
-if [ "${ROOM_RECEIPTS:-0}" = 1 ]; then
+# Signed receipts (ROOM_RECEIPTS=1, the default). Level 1 is an Ed25519 hotel
+# chain and does not read the SNP report. When the TSM provider is sev_guest
+# the same unit keeps the sealed SNP binding. The listener proxies create,
+# exec and delete to the API.
+if [ "$ROOM_RECEIPTS" = 1 ]; then
 cat > /etc/systemd/system/$ROOM_ID-receipts.service <<EOF
 [Unit]
 Description=Pool room $ROOM_ID signed receipts and attestation
@@ -385,7 +393,12 @@ mark "unit:$ROOM_ID-receipts.service"
 fi
 
 # ---------------------------------------------------------------- 11. Caddy on 443 (TLS-ALPN only, no port 80)
+# Receipts on: create, exec and delete go to the receipt proxy. /room/health
+# stays on the health port. Receipts off: the API port, as before.
+ROOM_API_UPSTREAM=$(receipts_api_upstream)
 if [ "${ROOM_TLS:-on}" = on ]; then
+CADDY_AFTER="network-online.target $ROOM_ID.service"
+if [ "$ROOM_RECEIPTS" = 1 ]; then CADDY_AFTER="$CADDY_AFTER $ROOM_ID-receipts.service"; fi
 cat > "$ROOM_ETC/Caddyfile" <<EOF
 {
 	auto_https disable_redirects
@@ -402,7 +415,7 @@ https://$ROOM_HOSTNAME:$ROOM_PUBLIC_PORT {
 		reverse_proxy 127.0.0.1:$ROOM_HEALTH_PORT
 	}
 	handle {
-		reverse_proxy 127.0.0.1:$ROOM_API_PORT {
+		reverse_proxy $ROOM_API_UPSTREAM {
 			flush_interval -1
 			transport http {
 				read_timeout 15m
@@ -415,7 +428,7 @@ EOF
 cat > /etc/systemd/system/$ROOM_ID-caddy.service <<EOF
 [Unit]
 Description=Pool room $ROOM_ID TLS front (Caddy $CADDY_VERSION)
-After=network-online.target $ROOM_ID.service
+After=$CADDY_AFTER
 [Service]
 DynamicUser=yes
 StateDirectory=pool-room-caddy
@@ -433,6 +446,9 @@ fi
 # ---------------------------------------------------------------- 12. host firewall (only if it blocks 443)
 if [ "${ROOM_TLS:-on}" != on ]; then
   log "ROOM_TLS=off: no Caddy, no port $ROOM_PUBLIC_PORT; the API stays on 127.0.0.1 (front desk or SSH tunnel)"
+  if [ "$ROOM_RECEIPTS" = 1 ]; then
+    log "receipts: create, exec and delete through $ROOM_RECEIPTS_LISTEN (proxies to the API); /room/health stays on 127.0.0.1:$ROOM_HEALTH_PORT"
+  fi
 elif command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
   ufw allow "$ROOM_PUBLIC_PORT/tcp" comment "pool-room:$ROOM_ID" >/dev/null && mark "ufw:$ROOM_PUBLIC_PORT/tcp"
 elif [ "$(iptables -S INPUT | head -1)" = "-P INPUT DROP" ] && ! iptables -C INPUT -p tcp --dport "$ROOM_PUBLIC_PORT" -j ACCEPT -m comment --comment "pool-room:$ROOM_ID" 2>/dev/null; then
@@ -444,9 +460,9 @@ systemctl daemon-reload
 if [ "${ROOM_EGRESS:-1}" = 1 ]; then systemctl enable -q "$ROOM_ID-egress.service"; systemctl restart "$ROOM_ID-egress.service"; fi
 systemctl enable -q "$ROOM_ID.service" "$ROOM_ID-health.service" "$ROOM_ID-reaper.timer"
 systemctl restart "$ROOM_ID.service" "$ROOM_ID-health.service"
+if [ "$ROOM_RECEIPTS" = 1 ]; then systemctl enable -q "$ROOM_ID-receipts.service"; systemctl restart "$ROOM_ID-receipts.service"; fi
 if [ "${ROOM_TLS:-on}" = on ]; then systemctl enable -q "$ROOM_ID-caddy.service"; systemctl restart "$ROOM_ID-caddy.service"; fi
 systemctl start "$ROOM_ID-reaper.timer"
-if [ "${ROOM_RECEIPTS:-0}" = 1 ]; then systemctl enable -q "$ROOM_ID-receipts.service"; systemctl restart "$ROOM_ID-receipts.service"; fi
 for _ in $(seq 30); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ROOM_API_PORT/v1/status")" != 000 ] && break; sleep 1; done
 log "API status: $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ROOM_API_PORT/v1/status")"
 log "python: $("$ROOM_OPT/venv/bin/python" -V) runsc: $("$RUNSC" --version | head -1) caddy: $("$ROOM_OPT/bin/caddy" version | cut -d' ' -f1)"

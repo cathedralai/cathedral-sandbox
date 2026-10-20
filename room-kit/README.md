@@ -35,16 +35,16 @@ customer API is on port 443 with a real TLS certificate.
   you run the installer.
 - A free private /22 or larger for the guest bridge (one address per sandbox).
   One Linux bridge takes at most 1,024 ports, so one bridge serves at most
-  1,023 rooms with a network. With `ROOM_NETS=auto` (the default) the kit
-  adds room networks when the host can hold more rooms (see "Room networks").
-  Rooms with network `none` use no bridge port.
+  1,023 rooms with a network. With `ROOM_NETS` unset or `ROOM_NETS=auto` (the
+  default) the kit adds room networks when the host can hold more rooms (see
+  "Room networks"). Rooms with network `none` use no bridge port.
 
 ## Room networks
 
 One Linux bridge takes at most 1,024 ports. A host that can hold more than
 1,023 rooms with a network needs more bridges ("room networks").
 
-With `ROOM_NETS=auto` (the default), the installer does this:
+With `ROOM_NETS` unset or `ROOM_NETS=auto` (the default on a new install), the installer does this:
 
 1. It sizes the host by CPU, memory and disk, with no bridge limit.
 2. If the main bridge holds that many rooms (`ROOM_BRIDGE_PORT_CAP`), it
@@ -56,11 +56,15 @@ With `ROOM_NETS=auto` (the default), the installer does this:
    the host again with the room networks.
 
 To choose the CIDRs yourself, set `ROOM_NETS` to a space-separated list.
-`ROOM_NETS=""` keeps every room on the main bridge.
+`ROOM_NETS=none` or `ROOM_NETS=off` keeps every room on the main bridge. An
+empty `ROOM_NETS` does the same. `ROOM_NETS=auto` still means the sized plan.
 
 For every room network the kit adds the same firewall rules as for the main
-bridge (`room-net.sh`, by bridge name `${ROOM_NET_BRIDGE_PREFIX}N`). Guests
-use `ROOM_DNS`. The kit sets these API settings (`/etc/pool-room/api.env`):
+bridge (`room-net.sh`, by bridge name `${ROOM_NET_BRIDGE_PREFIX}N`). The
+same script refuses a room-network CIDR that another host route already uses.
+Guests
+use `ROOM_DNS`. The kit sets these API settings (`/etc/pool-room/api.env`)
+when the resolved `ROOM_NETS` list is not empty:
 
 | Setting | Value from the kit | Meaning |
 |---|---|---|
@@ -72,6 +76,43 @@ use `ROOM_DNS`. The kit sets these API settings (`/etc/pool-room/api.env`):
 | `CATHEDRAL_ROOM_NETWORK_DNS` | `ROOM_DNS` | Name servers for guests on room networks. |
 
 `GET /v1/quota` shows `room_networks`, with the use of each network.
+
+`CATHEDRAL_ROOM_NETWORK_DNS` is set from `ROOM_DNS` in `profiles/v1.sh` whenever
+`ROOM_NETS` resolved to one or more CIDRs. The other `CATHEDRAL_ROOM_NETWORK_*`
+settings in the table come from the same place.
+
+## Receipts
+
+`ROOM_RECEIPTS=1` is the default for a new install. `ROOM_RECEIPTS=0` turns
+receipts off. The installer starts `<ROOM_ID>-receipts.service`
+(`room_receipts.py`).
+
+What it turns on: an Ed25519 receipt chain for create, exec, background
+process start, delete and network policy changes. The process listens on
+`ROOM_RECEIPTS_LISTEN` (default `127.0.0.1:18092`). That port is not
+`ROOM_API_PORT` and not `ROOM_HEALTH_PORT`. It proxies those calls to the
+room API on `127.0.0.1:ROOM_API_PORT`. When receipts are on, Caddy sends
+every request except `/room/health` to that listener. `/room/health` stays
+on the health port, so health still answers on
+`https://<host>/room/health`. With `ROOM_TLS=off` there is no Caddy; the
+receipt listener is the signing front and health stays on
+`127.0.0.1:ROOM_HEALTH_PORT`.
+
+On a normal host the binding says `level` `hotel` (schema
+`cathedral_hotel_binding_v1`). It does not read
+`/sys/kernel/config/tsm/report`, it does not invent an SNP measurement, and
+health does not say `sealed`. Verify a chain offline with
+`verify_receipts.py`: signature, link to the previous receipt, and head. A
+level 1 chain has no SNP report.
+
+Sealed SNP receipts are a separate path and stay opt-in. `install.sh --sealed`
+builds a guest that sets `ROOM_RECEIPTS=1` and its own listen address. Inside
+that guest, when the TSM provider is `sev_guest`, the same process keeps the
+sealed binding (`cathedral_sealed_hotel_binding_v1`), the SNP report, and
+`sealed` true on the receipt listener's health document. A new unsealed host
+does not enter that path.
+
+`ROOM_HOTEL_NAME` empty means the installer uses `ROOM_ID`.
 
 ## Room egress policy
 
@@ -145,8 +186,9 @@ idempotent.
 | Python 3.12 (uv, pinned) and the cathedral package (pinned commit, sha256) | `/opt/pool-room/python`, `/opt/pool-room/venv`, `/opt/pool-room/src` |
 | API (profile) on 127.0.0.1 | `<ROOM_ID>.service` |
 | Health endpoint on 127.0.0.1 | `<ROOM_ID>-health.service` |
+| Signed receipts (level 1 by default; listener `ROOM_RECEIPTS_LISTEN`) | `<ROOM_ID>-receipts.service` when `ROOM_RECEIPTS=1` |
 | TTL reaper (every 60 s) | `<ROOM_ID>-reaper.timer` |
-| Caddy (pinned, sha512) on 443 | `<ROOM_ID>-caddy.service`, `/etc/pool-room/Caddyfile` |
+| Caddy (pinned, sha512) on 443. With receipts on, API calls go to the receipt listener; `/room/health` stays on the health port | `<ROOM_ID>-caddy.service`, `/etc/pool-room/Caddyfile` |
 | Service user | `poolroom` |
 
 The kit does not edit `/etc/docker/daemon.json` and does not restart the host

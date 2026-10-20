@@ -34,6 +34,8 @@ EOV
     echo "CATHEDRAL_ROOM_EGRESS_SOCKET=/run/pool-room-egress/control.sock"
   fi
   # Room networks: one bridge per ROOM_NETS CIDR, ROOM_NET_SIZE guests each.
+  # install.sh resolves unset and auto to this list before the profile runs.
+  # Empty (none, off, or a host the main bridge can hold) sets no room networks.
   if [ -n "${ROOM_NETS:-}" ]; then
     local nets; read -r -a nets <<< "$ROOM_NETS"
     echo "CATHEDRAL_ROOM_NETWORKS=${#nets[@]}"
