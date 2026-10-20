@@ -201,6 +201,34 @@ class DockerClient:
             if config_dir is not None:
                 shutil.rmtree(config_dir, ignore_errors=True)
 
+    def ensure_image(
+        self,
+        image: str,
+        *,
+        registry_auth: Mapping[str, str] | None = None,
+        refresh: bool = False,
+        mirror: str | None = None,
+    ) -> bool:
+        """Make *image* present locally. Return True when a pull ran.
+
+        Skip the pull when the image is already present, unless *refresh* is set.
+        With *mirror* set, a Docker Hub image is pulled from the mirror first and
+        tagged with its original name; on mirror failure the pull goes direct.
+        """
+        if not refresh and self.image_exists(image):
+            return False
+        mirrored = mirror_ref(mirror, image) if mirror and registry_auth is None else None
+        if mirrored is not None:
+            try:
+                self.pull(mirrored)
+                tagged = self.run(["docker", "tag", mirrored, image], timeout=30.0)
+                if tagged.returncode == 0:
+                    return True
+            except SandboxOpError:
+                pass
+        self.pull(image, registry_auth=registry_auth)
+        return True
+
     def image_inspect(self, image: str) -> dict[str, Any]:
         result = self.run(
             ["docker", "image", "inspect", "--format", "{{json .}}", image],
@@ -509,6 +537,29 @@ class DockerClient:
         )
 
 
+def mirror_ref(mirror: str, image: str) -> str | None:
+    """Return the mirror reference for a Docker Hub *image*, else None.
+
+    "alpine:3.20" -> "<mirror>/library/alpine:3.20". Images on another
+    registry and digest references are not mirrored.
+    """
+    mirror = mirror.strip().rstrip("/")
+    if not mirror or "@" in image:
+        return None
+    name = image
+    for prefix in ("docker.io/", "index.docker.io/", "registry-1.docker.io/"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    else:
+        first = name.split("/", 1)[0]
+        if "/" in name and ("." in first or ":" in first or first == "localhost"):
+            return None
+    if "/" not in name:
+        name = "library/" + name
+    return f"{mirror}/{name}"
+
+
 def _registry_host(image: str) -> str:
     first = image.split("/", 1)[0]
     if "." in first or ":" in first or first == "localhost":
@@ -604,6 +655,13 @@ class DockerGuestProvider:
         self._rm_timeout = _env_float("CATHEDRAL_SANDBOX_RM_TIMEOUT", 60.0, minimum=0.1)
         self._reconcile_interval = _env_float("CATHEDRAL_SANDBOX_RECONCILE_SECONDS", 60.0)
         self._last_reconcile: float | None = None
+        # Image pulls. "missing" (default) pulls only when the image is not local;
+        # "always" restores the old pull-on-every-create behaviour.
+        self._pull_policy = (os.environ.get("CATHEDRAL_SANDBOX_PULL_POLICY", "").strip().lower() or "missing")
+        self._registry_mirror = os.environ.get("CATHEDRAL_SANDBOX_REGISTRY_MIRROR", "").strip() or None
+        # Images pulled with registry credentials. A create of one of these always
+        # pulls, so the registry still checks the caller's credentials.
+        self._auth_pulled: set[str] = set()
         if not self._client.info_ok():
             raise SandboxOpError(
                 "runtime_unavailable",
@@ -727,14 +785,28 @@ class DockerGuestProvider:
         }
         return enriched
 
+    def _ensure_image(
+        self, image: str, *, registry_auth: Mapping[str, str] | None = None, refresh: bool = False
+    ) -> None:
+        if registry_auth is not None or image in self._auth_pulled or self._pull_policy == "always":
+            refresh = True
+        self._client.ensure_image(
+            image,
+            registry_auth=registry_auth,
+            refresh=refresh,
+            mirror=self._registry_mirror,
+        )
+        if registry_auth is not None:
+            self._auth_pulled.add(image)
+
     def _start_guest(self, doc: dict[str, Any], request: CreateSandboxRequest) -> dict[str, Any]:
+        """Start the guest for one record. The caller releases the record on failure."""
         sandbox_id = doc["id"]
         image = self._image_for(request)
         if request.snapshot_id and request.snapshot_id in self._snapshot_images:
             image = self._snapshot_images[request.snapshot_id]
         elif request.image is not None:
-            auth = request.image.registry_auth
-            self._client.pull(image, registry_auth=auth)
+            self._ensure_image(image, registry_auth=request.image.registry_auth)
             inspected = self._client.image_inspect(image)
             self._inner._images[image] = {  # noqa: SLF001
                 "ref": image,
@@ -1148,7 +1220,8 @@ class DockerGuestProvider:
 
     def prefetch(self, request: PrefetchRequest) -> str:
         for image in request.images:
-            self._client.pull(image)
+            # Prefetch is the explicit refresh path: it always pulls.
+            self._ensure_image(image, refresh=True)
             inspected = self._client.image_inspect(image)
             self._inner._images[image] = {  # noqa: SLF001
                 "ref": image,
