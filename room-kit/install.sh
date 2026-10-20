@@ -65,7 +65,7 @@ python3 "$KIT/assess.py" --data-dir "$ROOM_DATA_DIR" --room-socket "$SOCK" --out
 log "assess: $ROOM_ETC/machine.json"
 
 # Resolved copy of the config (values only, no comments) for units and health.
-ROOM_KEYS="ROOM_TLS ROOM_REGISTRY_MIRRORS ROOM_ID ROOM_HOSTNAME ROOM_ACME_EMAIL ROOM_CUSTOMER ROOM_REGION API_PROFILE ROOM_API_PORT ROOM_HEALTH_PORT ROOM_PUBLIC_PORT ROOM_DATA_DIR ROOM_DATA_DEVICE ROOM_DATA_IMG ROOM_DATA_SIZE_GB ROOM_BRIDGE ROOM_BRIDGE_CIDR ROOM_DNS ROOM_RUNSC_FLAGS ROOM_ALLOW_DIND ROOM_CREATES_PER_MINUTE ROOM_GC_PARALLELISM ROOM_DIND_DOCKERD_ARGS ROOM_DIND_ENV SHAPE_VCPU SHAPE_MEM_GIB SHAPE_DISK_GIB RESERVE_RAM_PCT RESERVE_THREADS DISK_MAX_FILL_PCT CPU_OVERCOMMIT MEM_OVERCOMMIT DISK_OVERCOMMIT ROOM_MAX_SLOTS"
+ROOM_KEYS="ROOM_TLS ROOM_REGISTRY_MIRRORS ROOM_ID ROOM_HOSTNAME ROOM_ACME_EMAIL ROOM_CUSTOMER ROOM_REGION API_PROFILE ROOM_API_PORT ROOM_HEALTH_PORT ROOM_PUBLIC_PORT ROOM_DATA_DIR ROOM_DATA_DEVICE ROOM_DATA_IMG ROOM_DATA_SIZE_GB ROOM_BRIDGE ROOM_BRIDGE_CIDR ROOM_DNS ROOM_RUNSC_FLAGS ROOM_ALLOW_DIND ROOM_CREATES_PER_MINUTE ROOM_GC_PARALLELISM ROOM_DIND_DOCKERD_ARGS ROOM_DIND_ENV ROOM_BRIDGE_PORT_CAP SHAPE_VCPU SHAPE_MEM_GIB SHAPE_DISK_GIB RESERVE_RAM_PCT RESERVE_THREADS DISK_MAX_FILL_PCT CPU_OVERCOMMIT MEM_OVERCOMMIT DISK_OVERCOMMIT ROOM_MAX_SLOTS"
 for k in $ROOM_KEYS; do printf '%s="%s"\n' "$k" "${!k:-}"; done > "$ROOM_ETC/room.env"
 chmod 0644 "$ROOM_ETC/room.env"
 
@@ -198,7 +198,7 @@ python3 "$KIT/size.py" "$ROOM_ETC/machine.json" --vcpu "$SHAPE_VCPU" --mem-gib "
   --cpu-overcommit "$CPU_OVERCOMMIT" --mem-overcommit "$MEM_OVERCOMMIT" --disk-overcommit "$DISK_OVERCOMMIT" \
   --reserve-ram-pct "$RESERVE_RAM_PCT" --reserve-threads "$RESERVE_THREADS" --disk-max-fill-pct "$DISK_MAX_FILL_PCT" \
   --room-disk-bytes "$ROOM_DISK_BYTES" --max-slots "${ROOM_MAX_SLOTS:-0}" --out "$ROOM_ETC/size.json" \
-  --bridge-addresses "$(python3 -c 'import ipaddress,sys;print(ipaddress.ip_interface(sys.argv[1]).network.num_addresses-3)' "$ROOM_BRIDGE_CIDR")"
+  --bridge-addresses "$(python3 -c 'import ipaddress,sys;n=ipaddress.ip_interface(sys.argv[1]).network.num_addresses-3;c=int(sys.argv[2]);print(min(n,c) if c>0 else n)' "$ROOM_BRIDGE_CIDR" "${ROOM_BRIDGE_PORT_CAP:-1023}")"
 SIZE_SLOTS=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["slots"])' "$ROOM_ETC/size.json")
 SIZE_QUOTA=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["quota"])' "$ROOM_ETC/size.json")
 [ "$SIZE_SLOTS" -gt 0 ] || { echo "size: 0 slots on this machine; see $ROOM_ETC/size.json" >&2; exit 1; }

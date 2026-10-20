@@ -34,6 +34,8 @@ customer API is on port 443 with a real TLS certificate.
 - DNS: an A record for `ROOM_HOSTNAME` to the machine IP, DNS only, before
   you run the installer.
 - A free private /22 or larger for the guest bridge (one address per sandbox).
+  One Linux bridge takes at most 1,024 ports, so one room host serves at most
+  1,023 rooms with a network. Rooms with network `none` do not use the bridge.
 
 ## Build the API tarball
 

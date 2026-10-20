@@ -113,6 +113,8 @@ func main() {
 	memStop := flag.Float64("memstop", 90, "abort if any hotel RAM % is above this")
 	outDir := flag.String("out", ".", "output directory")
 	stopFile := flag.String("stopfile", "", "abort when this file exists")
+	finalTTL := flag.Int("final-ttl", 0, "TTL set by the last heartbeat before cleanup (0 = -ttl)")
+	network := flag.String("network", "public", "room network mode: public or none (none uses no bridge port)")
 	flag.Parse()
 	k, err := os.ReadFile(*keyFile)
 	if err != nil {
@@ -174,7 +176,7 @@ func main() {
 	// Phase 1: all creates at once.
 	phase.Store("create")
 	body := map[string]any{"image": *image, "resources": map[string]any{"vcpu": 1, "memory_gib": 4, "disk_gib": 10},
-		"ttl_seconds": *ttl, "labels": map[string]string{"run": run, "kind": "blast"}}
+		"ttl_seconds": *ttl, "labels": map[string]string{"run": run, "kind": "blast"}, "network": map[string]any{"mode": *network}}
 	res := make([]result, *n)
 	var wg sync.WaitGroup
 	start := make(chan struct{})
@@ -253,9 +255,10 @@ func main() {
 		}
 		w.Wait()
 	}
+	hbTTL := *ttl
 	heartbeat := func() {
 		pool(ids, func(id string) {
-			st, _, _, err := call(ctx, "POST", "/v1/sandboxes/"+id+"/heartbeat", map[string]any{"ttl_seconds": *ttl})
+			st, _, _, err := call(ctx, "POST", "/v1/sandboxes/"+id+"/heartbeat", map[string]any{"ttl_seconds": hbTTL})
 			if err == nil && st == 200 {
 				hbOK.Add(1)
 			} else {
@@ -292,6 +295,9 @@ func main() {
 	}
 	// Final heartbeat so every room has the same TTL clock from here.
 	if ctx.Err() == nil {
+		if *finalTTL > 0 {
+			hbTTL = *finalTTL
+		}
 		heartbeat()
 	}
 	hbStoppedS := time.Since(t0).Seconds()
@@ -337,7 +343,7 @@ func main() {
 	pmu.Lock()
 	defer pmu.Unlock()
 	out := map[string]any{
-		"run": run, "n": *n, "image": *image, "ttl_seconds": *ttl, "aborted": aborted.Load(),
+		"run": run, "n": *n, "image": *image, "network": *network, "ttl_seconds": *ttl, "final_ttl_seconds": hbTTL, "aborted": aborted.Load(),
 		"create_start_s": createStartS, "create_wall_s": createWall.Seconds(), "all_accepted_running_s": lastOK / 1000,
 		"by_status": byStatus, "per_hotel": perHotel,
 		"client_ms": pct(cl), "queue_ms": pct(q), "hotel_ms": pct(hm), "overhead_ms": pct(ov),

@@ -367,6 +367,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 		b.mu.Lock()
 		h := b.pick(tried)
 		if h == nil {
+			if last.status >= 500 {
+				g.failed++
+			}
 			b.mu.Unlock()
 			if last.status != 0 {
 				return last
@@ -441,18 +444,35 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 			last = createResult{status: 429, header: http.Header{"Retry-After": {strconv.Itoa(ra)}}, body: out}
 			continue // try another hotel
 		default:
+			// The hotel could not start the room (for example a full bridge).
+			// Rest it for a short time and try another hotel.
 			rm.state, rm.since = stFailed, tDone
 			h.failed++
-			g.failed++
-			b.mu.Unlock()
+			h.backoffUntil = time.Now().Add(hotelFailBackoff)
 			if err != nil {
-				return createResult{status: 502, doc: map[string]any{"error": map[string]string{"code": "hotel_unreachable", "message": "hotel " + h.cfg.ID + " did not answer"}}}
+				last = createResult{status: 502, doc: map[string]any{"error": map[string]string{"code": "hotel_unreachable", "message": "hotel " + h.cfg.ID + " did not answer"}}}
+			} else {
+				last = createResult{status: status, body: out, header: http.Header{"X-Broker-Hotel": {h.cfg.ID}}}
 			}
-			return createResult{status: status, body: out, header: http.Header{"X-Broker-Hotel": {h.cfg.ID}}}
+			if status >= 400 && status < 500 { // the request itself is wrong: no retry
+				g.failed++
+				b.mu.Unlock()
+				return last
+			}
+			b.mu.Unlock()
+			continue
 		}
+	}
+	if last.status >= 500 {
+		b.mu.Lock()
+		g.failed++
+		b.mu.Unlock()
 	}
 	return last
 }
+
+// hotelFailBackoff rests a hotel after a failed room start.
+const hotelFailBackoff = 10 * time.Second
 
 func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestState) {
 	tRecv := time.Now()
