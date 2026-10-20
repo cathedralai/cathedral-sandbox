@@ -257,6 +257,7 @@ class Handler(BaseHTTPRequestHandler):
                     doc["receipts"] = {"binding_sha256": ledger.binding_sha256, "count": len(ledger.chain)}
                     doc["runsc_sandbox_procs"] = int(subprocess.run(
                         ["pgrep", "-cf", "[r]unsc-sandbox"], capture_output=True, text=True).stdout.strip() or 0)
+                    doc["guest_kernel_sev"] = self.server.sev_log()
                     out = canonical(doc)
                 except ValueError:
                     pass
@@ -313,6 +314,13 @@ class Server(ThreadingHTTPServer):
         self.ledger, self.api_port, self.health_port, self.api_key = ledger, api_port, health_port, api_key
         self.docker_sock = docker_sock
         self._digests: dict[str, str | None] = {}
+
+    def sev_log(self) -> list[str]:
+        """The guest kernel's own SEV lines (dmesg), read once."""
+        if not hasattr(self, "_sev"):
+            out = subprocess.run(["dmesg"], capture_output=True, text=True).stdout
+            self._sev = [ln.strip() for ln in out.splitlines() if "SEV" in ln][:12]
+        return self._sev
 
     def image_digest(self, ref: str) -> str | None:
         if ref not in self._digests:

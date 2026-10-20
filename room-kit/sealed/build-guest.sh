@@ -200,7 +200,7 @@ rm -f "$R"/etc/ssh/ssh_host_*
 log "packing initrd"
 ( cd "$R" && find . -mindepth 1 \( -path './proc/*' -o -path './sys/*' -o -path './dev/*' \) -prune -o -print0 \
   | LC_ALL=C sort -z | cpio --null -o -H newc --reproducible --quiet ) | zstd -q -T0 -10 > "$OUT/initrd.cpio.zst"
-CMDLINE="console=ttyS0 loglevel=6 systemd.show_status=error panic=-1 rdinit=/init cathedral.hotel=$SEALED_NAME cathedral.debug=$DEBUG"
+CMDLINE="console=ttyS0 loglevel=7 systemd.show_status=error panic=-1 rdinit=/init cathedral.hotel=$SEALED_NAME cathedral.debug=$DEBUG"
 printf '%s' "$CMDLINE" > "$OUT/cmdline"
 install -m 0644 "$SEALED_OVMF" "$OUT/OVMF.amdsev.fd"
 
