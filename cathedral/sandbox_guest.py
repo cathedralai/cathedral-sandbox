@@ -14,13 +14,16 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -36,8 +39,6 @@ from cathedral.sandbox_api import (
     SandboxContractError,
     StatusReport,
     TarGet,
-    gc_deadline,
-    is_collectable,
 )
 from cathedral.sandbox_provider import (
     InMemorySandboxProvider,
@@ -70,6 +71,32 @@ def docker_daemon_ready(*, timeout_seconds: float = 2.0) -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     return completed.returncode == 0 and bool(completed.stdout.strip())
+
+
+# Docker labels on every guest container. The reconcile pass uses them to find
+# containers that have no live sandbox record.
+LABEL_OWNER = "cathedral.sandbox.owner"
+LABEL_SANDBOX_ID = "cathedral.sandbox.id"
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(int(raw), minimum)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(float(raw), minimum)
+    except ValueError:
+        return default
 
 
 def is_dind_image(image: str) -> bool:
@@ -221,6 +248,7 @@ class DockerClient:
         entrypoint: tuple[str, ...] | None,
         workdir: str | None,
         user: str | None,
+        labels: Mapping[str, str] | None = None,
     ) -> str:
         work_dir.mkdir(parents=True, exist_ok=True)
         argv = [
@@ -229,6 +257,10 @@ class DockerClient:
             "-d",
             "--name",
             name,
+        ]
+        for key, value in (labels or {}).items():
+            argv.extend(["--label", f"{key}={value}"])
+        argv += [
             "--cpus",
             str(vcpu),
             "--memory",
@@ -372,7 +404,54 @@ class DockerClient:
         return result.returncode, result.stdout, result.stderr, False
 
     def remove(self, container_id: str) -> None:
+        """Best-effort removal. The result is not checked; use remove_confirmed for GC."""
         self.run(["docker", "rm", "-f", container_id], timeout=60.0)
+
+    def remove_confirmed(self, container_ref: str, *, timeout: float = 60.0) -> bool:
+        """Remove a container. Return True only when it is gone.
+
+        A timeout or a daemon error returns False, so the caller can retry.
+        "No such container" counts as gone.
+        """
+        try:
+            result = self.run(["docker", "rm", "-f", container_ref], timeout=timeout)
+        except SandboxOpError:
+            return False
+        if result.returncode == 0:
+            return True
+        return "no such container" in (result.stderr or "").lower()
+
+    def list_labeled(self, owner: str) -> list[tuple[str, str]]:
+        """Return (container_id, sandbox_id) for all containers with our owner label.
+
+        Raises SandboxOpError when the daemon cannot list. The caller must not
+        treat a failed list as "no containers".
+        """
+        result = self.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--no-trunc",
+                "--filter",
+                f"label={LABEL_OWNER}={owner}",
+                "--format",
+                "{{.ID}} {{.Label \"" + LABEL_SANDBOX_ID + "\"}}",
+            ],
+            timeout=60.0,
+        )
+        if result.returncode != 0:
+            raise SandboxOpError(
+                "docker_list_failed",
+                502,
+                f"docker ps failed: {(result.stderr or '').strip()[:200]}",
+            )
+        out: list[tuple[str, str]] = []
+        for line in (result.stdout or "").splitlines():
+            parts = line.strip().split(" ", 1)
+            if parts and parts[0]:
+                out.append((parts[0], parts[1].strip() if len(parts) > 1 else ""))
+        return out
 
     def pause(self, container_id: str) -> None:
         result = self.run(["docker", "pause", container_id], timeout=30.0)
@@ -514,6 +593,17 @@ class DockerGuestProvider:
         self._guests: dict[str, GuestRecord] = {}
         self._snapshot_images: dict[str, str] = {}
         self._built_images: dict[str, str] = {}  # content_hash -> tag
+        # GC state. A sandbox id in _doomed has a "deleting" record and a container
+        # that is not yet confirmed gone. Only one drain runs at a time.
+        self._owner = os.environ.get("CATHEDRAL_SANDBOX_OWNER", "").strip() or "default"
+        self._doomed: dict[str, str] = {}  # sandbox_id -> container_id
+        self._doomed_attempts: dict[str, int] = {}
+        self._doomed_lock = threading.Lock()
+        self._drain_lock = threading.Lock()
+        self._gc_parallelism = _env_int("CATHEDRAL_SANDBOX_GC_PARALLELISM", 8, minimum=1)
+        self._rm_timeout = _env_float("CATHEDRAL_SANDBOX_RM_TIMEOUT", 60.0, minimum=0.1)
+        self._reconcile_interval = _env_float("CATHEDRAL_SANDBOX_RECONCILE_SECONDS", 60.0)
+        self._last_reconcile: float | None = None
         if not self._client.info_ok():
             raise SandboxOpError(
                 "runtime_unavailable",
@@ -678,10 +768,16 @@ class DockerGuestProvider:
                 entrypoint=entrypoint,
                 workdir=request.workdir,
                 user=request.user,
+                labels={LABEL_OWNER: self._owner, LABEL_SANDBOX_ID: sandbox_id},
             )
         except SandboxOpError:
             self._inner.delete(sandbox_id)
             raise
+        if not self._inner.has_record(sandbox_id):
+            # GC or DELETE removed the record while the guest started. Do not
+            # register an orphan; the reconcile pass retries if this rm fails.
+            self._client.remove_confirmed(container_id, timeout=self._rm_timeout)
+            raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
         self._guests[sandbox_id] = GuestRecord(
             sandbox_id=sandbox_id,
             container_id=container_id,
@@ -695,9 +791,8 @@ class DockerGuestProvider:
             try:
                 self._client.wait_dind_ready(container_id)
             except SandboxOpError:
-                self._client.remove(container_id)
-                self._guests.pop(sandbox_id, None)
-                self._inner.delete(sandbox_id)
+                self._retire(sandbox_id)
+                self._remove_queued([sandbox_id])
                 raise
         # Guest start can take longer than a short idle_timeout; refresh activity
         # so idle GC does not reap a sandbox mid-create.
@@ -875,16 +970,22 @@ class DockerGuestProvider:
         return doc
 
     def delete(self, sandbox_id: str) -> None:
+        """DELETE is idempotent (204). The record only goes when the container is gone.
+
+        When the container removal fails, the sandbox stays "deleting": hidden
+        from the API, still counted in quota. The next sweep retries it.
+        """
         guest = self._guests.get(sandbox_id)
-        if guest is not None:
-            for process_id in list(guest.guest_processes):
-                try:
-                    self.stop_process(sandbox_id, process_id)
-                except SandboxOpError:
-                    pass
-            self._guests.pop(sandbox_id, None)
-            self._client.remove(guest.container_id)
-        self._inner.delete(sandbox_id)
+        if guest is None:
+            self._inner.delete(sandbox_id)
+            return
+        for process_id in list(guest.guest_processes):
+            try:
+                self.stop_process(sandbox_id, process_id)
+            except SandboxOpError:
+                pass
+        if self._retire(sandbox_id):
+            self._remove_queued([sandbox_id])
 
     def bulk_delete(self, labels: Iterable[str]) -> int:
         # Must use this.delete so containers are removed (inner.bulk_delete would leak).
@@ -896,44 +997,141 @@ class DockerGuestProvider:
             targets = [
                 sid
                 for sid, s in self._inner._sandboxes.items()  # noqa: SLF001
-                if all(s.labels.get(k) == v for k, v in want.items())
+                if s.state != "deleting"
+                and all(s.labels.get(k) == v for k, v in want.items())
                 and (caller is None or s.api_key is None or s.api_key == caller)
             ]
-        for sid in targets:
-            self.delete(sid)
+        retired = [sid for sid in targets if self._retire(sid)]
+        self._remove_queued(retired)
         return len(targets)
 
+    # ------------------------------------------------------------------ GC
+    def _retire(self, sandbox_id: str) -> bool:
+        """Move a sandbox to "deleting" and queue its container for removal.
+
+        Return False when another caller already retired it. A record with no
+        container is dropped at once.
+        """
+        if not self._inner.begin_delete(sandbox_id):
+            return False
+        guest = self._guests.pop(sandbox_id, None)
+        if guest is None:
+            self._inner.finish_delete(sandbox_id)
+            return True
+        with self._doomed_lock:
+            self._doomed[sandbox_id] = guest.container_id
+        return True
+
+    def _confirm_removed(self, sandbox_id: str) -> None:
+        with self._doomed_lock:
+            self._doomed.pop(sandbox_id, None)
+            self._doomed_attempts.pop(sandbox_id, None)
+        self._inner.finish_delete(sandbox_id)
+
+    def _remove_queued(self, sandbox_ids: list[str]) -> None:
+        """Try once, in parallel, to remove the queued containers of *sandbox_ids*.
+
+        Failures stay queued for the next sweep.
+        """
+        with self._doomed_lock:
+            batch = [(sid, self._doomed[sid]) for sid in sandbox_ids if sid in self._doomed]
+        for (sid, _), gone in zip(batch, self._remove_many([cid for _, cid in batch])):
+            if gone:
+                self._confirm_removed(sid)
+
+    def mark_expired(self) -> int:
+        """Move every collectable sandbox to "deleting". Fast; runs no docker command."""
+        marked = 0
+        for sid in self._inner.collectable_ids():
+            if self._retire(sid):
+                marked += 1
+        return marked
+
+    def _remove_many(self, refs: list[str]) -> list[bool]:
+        """Remove containers in bounded parallel batches. Return one result per ref."""
+        if not refs:
+            return []
+        workers = min(self._gc_parallelism, len(refs))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cathedral-gc") as pool:
+            return list(
+                pool.map(lambda ref: self._client.remove_confirmed(ref, timeout=self._rm_timeout), refs)
+            )
+
+    def _drain_locked(self) -> int:
+        """Try once to remove each queued container. Caller holds _drain_lock."""
+        attempted: set[str] = set()
+        confirmed = 0
+        while True:
+            with self._doomed_lock:
+                batch = [(sid, cid) for sid, cid in self._doomed.items() if sid not in attempted]
+            if not batch:
+                return confirmed
+            attempted.update(sid for sid, _ in batch)
+            results = self._remove_many([cid for _, cid in batch])
+            for (sid, cid), gone in zip(batch, results):
+                if gone:
+                    self._confirm_removed(sid)
+                    confirmed += 1
+                else:
+                    with self._doomed_lock:
+                        attempts = self._doomed_attempts.get(sid, 0) + 1
+                        self._doomed_attempts[sid] = attempts
+                    print(
+                        f"cathedral-sandbox gc: container {cid[:12]} of {sid} not removed "
+                        f"(attempt {attempts}); will retry",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+    def _reconcile_locked(self) -> int:
+        """Remove containers with our owner label that have no sandbox record.
+
+        Caller holds _drain_lock. A record is created before its container, so
+        a container whose sandbox id has no record is an orphan.
+        """
+        try:
+            labeled = self._client.list_labeled(self._owner)
+        except SandboxOpError as exc:
+            print(f"cathedral-sandbox gc: reconcile skipped: {exc}", file=sys.stderr, flush=True)
+            return 0
+        with self._doomed_lock:
+            queued = set(self._doomed)
+        orphans = [
+            cid
+            for cid, sid in labeled
+            if sid not in queued and not (sid and self._inner.has_record(sid))
+        ]
+        return sum(1 for gone in self._remove_many(orphans) if gone)
+
     def sweep(self) -> int:
-        """GC expired guests and remove their Docker containers."""
-        now = _now()
-        to_remove: list[str] = []
-        with self._inner._lock:  # noqa: SLF001
-            for sid, sandbox in list(self._inner._sandboxes.items()):  # noqa: SLF001
-                past_ttl = is_collectable(
-                    now, deadline_at=gc_deadline(sandbox.expires_at), last_heartbeat_at=None
-                )
-                idle_expired = (
-                    sandbox.idle_timeout_seconds is not None
-                    and sandbox.last_activity_at is not None
-                    and (now - sandbox.last_activity_at)
-                    >= timedelta(seconds=sandbox.idle_timeout_seconds)
-                )
-                key = (
-                    self._inner._keys.get(sandbox.api_key)  # noqa: SLF001
-                    if sandbox.api_key is not None
-                    else None
-                )
-                revoked = key is not None and key.revoked
-                if past_ttl or idle_expired or revoked:
-                    to_remove.append(sid)
-        for sid in to_remove:
-            guest = self._guests.pop(sid, None)
-            if guest is not None:
-                try:
-                    self._client.remove(guest.container_id)
-                except SandboxOpError:
-                    pass
-        return self._inner.sweep()
+        """GC expired guests. Return the number of sandboxes collected by this call.
+
+        1. Mark expired records "deleting" (hidden from the API, still in quota).
+        2. Remove queued containers in parallel batches. Drop each record only
+           after its container is confirmed gone. Failures stay queued.
+        3. At most every CATHEDRAL_SANDBOX_RECONCILE_SECONDS, remove labeled
+           containers that have no record.
+        Only one call runs steps 2 and 3 at a time. A concurrent call returns
+        after step 1.
+        """
+        marked = self.mark_expired()
+        if self._drain_lock.acquire(blocking=False):
+            try:
+                self._drain_locked()
+                now = time.monotonic()
+                if self._last_reconcile is None or now - self._last_reconcile >= self._reconcile_interval:
+                    self._last_reconcile = now
+                    self._reconcile_locked()
+            finally:
+                self._drain_lock.release()
+        # Drops expired log tombstones. Live expired records are already "deleting".
+        self._inner.sweep()
+        return marked
+
+    def pending_removals(self) -> dict[str, str]:
+        """Sandbox id -> container id for containers not yet confirmed gone."""
+        with self._doomed_lock:
+            return dict(self._doomed)
 
     def status(self) -> StatusReport:
         report = self._inner.status()
@@ -979,11 +1177,11 @@ class DockerGuestProvider:
         return getattr(self._inner, name)
 
     def close(self) -> None:
-        for guest in list(self._guests.values()):
-            try:
-                self._client.remove(guest.container_id)
-            except SandboxOpError:
-                pass
+        refs = [g.container_id for g in self._guests.values()]
+        with self._doomed_lock:
+            refs.extend(self._doomed.values())
+            self._doomed.clear()
+        self._remove_many(refs)
         self._guests.clear()
         self._inner.close()
 
