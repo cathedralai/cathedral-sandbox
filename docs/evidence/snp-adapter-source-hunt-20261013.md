@@ -33,7 +33,7 @@ Railway staging still **serves** `acaa2961` (code in the deploy image), but that
 3. `polaris/providers/snp_customer_adapter_proposal.py` — `9832f94f…` (~31734 B)
 4. `polaris/providers/snp_postgres_journal_proposal.py` — `3d218b2b…` (~19081 B)
 5. `polaris/providers/snp_selected_runtime_proposal.py` — `80892420…` (~5919 B)
-6. `tests/test_snp_customer_adapter_proposal.py`
+6. `polariscomputer/tests/test_snp_customer_adapter_proposal.py`
 
 ## How Fred can deliver (one of)
 

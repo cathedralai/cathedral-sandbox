@@ -11,7 +11,7 @@ Required six (hashes MATCH package + earlier handoff manifest):
 - `polaris/providers/snp_customer_adapter_proposal.py`
 - `polaris/providers/snp_postgres_journal_proposal.py`
 - `polaris/providers/snp_selected_runtime_proposal.py`
-- `tests/test_snp_customer_adapter_proposal.py`
+- `polariscomputer/tests/test_snp_customer_adapter_proposal.py`
 
 Also joined:
 

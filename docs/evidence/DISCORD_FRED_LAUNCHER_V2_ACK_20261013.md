@@ -16,4 +16,4 @@
 - Boot/`--execute` still held until separate owner boot authorization
 - Policy accept + customer qualification still outstanding; 900s grant clock not running
 
-Local refs: `scripts/snp_staging/launch_diagnostic_20261013.py`, `docs/evidence/VERIFIED_DIAGNOSTIC_LAUNCH_INPUTS_v2_20261013.json`, updated `scripts/snp_staging/boot_new_guest.sh`.
+Local refs: `polariscomputer/scripts/snp_staging/launch_diagnostic_20261013.py`, `docs/evidence/VERIFIED_DIAGNOSTIC_LAUNCH_INPUTS_v2_20261013.json`, updated `polariscomputer/scripts/snp_staging/boot_new_guest.sh`.

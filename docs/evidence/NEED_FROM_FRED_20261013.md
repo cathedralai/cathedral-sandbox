@@ -39,7 +39,7 @@ Railway caller pubkey must **not** be substituted.
 ## Nice-to-have (unblocks smoother install, not boot itself)
 
 ### 5. Startup / artifact packaging
-- [ ] Push or attach the local API recipe commits noted in the 18:04 PR comment (`Dockerfile.snp-staging`, `ops/cathedral_snp/native_artifact_probe.py`, `docs/SNP_API_ARTIFACT.md`) if Toby should consume them from GitHub
+- [ ] Push or attach the local API recipe commits noted in the 18:04 PR comment (`polariscomputer/Dockerfile.snp-staging`, `polariscomputer/ops/cathedral_snp/native_artifact_probe.py`, `polariscomputer/docs/SNP_API_ARTIFACT.md`) if Toby should consume them from GitHub
 - [ ] Share nonsecret `launch-inputs-public.json` contents (or gist) so Toby can diff against `scripts/snp_staging/boot_new_guest.sh`
 - [ ] Any example `cathedral_snp_staging_startup_v1` JSON with **placeholders only** (no secrets)
 
@@ -64,7 +64,7 @@ Railway caller pubkey must **not** be substituted.
 ## Toby sequence after Fred delivers
 
 1. Verify ports free → boot corrected image with exact APPEND + HOST_DATA (still no `a7ad573b`)
-2. Pin TLS / fill Binding + startup JSON (`docs/SNP_STAGING_STARTUP.md`)
+2. Pin TLS / fill Binding + startup JSON (`polariscomputer/docs/SNP_STAGING_STARTUP.md`)
 3. Install via `CATHEDRAL_SNP_STARTUP_FILE` (official path)
 4. Apply signed grant → run canary inside the 900s window
 5. Cleanup with independent absence receipt

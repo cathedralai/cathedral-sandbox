@@ -28,6 +28,6 @@ Please sign the 900s grant to **this** caller (8 scopes as approved). Railway ca
 - Still need from image/policy owner: **exact APPEND including verity roothash**, signed policy/measurement accept, verifier pins/checkpoint
 - No merge/deploy/boot/signing from my side until those + grant lands
 
-Startup JSON will follow `docs/SNP_STAGING_STARTUP.md` once TLS pin + binding + policy + journal/observer pubs are filled.
+Startup JSON will follow `polariscomputer/docs/SNP_STAGING_STARTUP.md` once TLS pin + binding + policy + journal/observer pubs are filled.
 
 ---

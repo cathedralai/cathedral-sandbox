@@ -7,7 +7,7 @@
 - Hooked in app lifespan when `ENVIRONMENT=staging`
 - Installs `TobySandboxes` **only** when `SNP_STAGING_INSTALL=1` + complete qualification dir + policy/signer loaders
 - Otherwise logs uninstalled and leaves `503 snp_customer_path_unqualified`
-- Unit tests: `tests/test_cathedral_snp_staging_install.py` (3 passed)
+- Unit tests: `polariscomputer/tests/test_cathedral_snp_staging_install.py` (3 passed)
 
 ### 2. Boot script (no launch)
 - `scripts/snp_staging/boot_new_guest.sh`

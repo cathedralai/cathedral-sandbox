@@ -17,7 +17,7 @@
 **Wired into pilot (source)**
 - PR #1449 tip `f7625052` already compared/integrated (recipe, probe, startup template)
 - PR #1451 @ `7de36c09` pulled: `cathedral_pilot_absence_receipts.py` + docs; **34/34** focused tests passed locally
-- Pilot composition: `scripts/snp_staging/wire_pilot_absence_producer.py` (loads my observer seed locally, refuses HostReader until live authenticated reader is injected after real launch fence)
+- Pilot composition: `polariscomputer/scripts/snp_staging/wire_pilot_absence_producer.py` (loads my observer seed locally, refuses HostReader until live authenticated reader is injected after real launch fence)
 - Startup template `independent_probe` pin set to the key above
 - Understood: #1451 is whole-guest teardown seam; does **not** prove container delete while guest stays up
 
