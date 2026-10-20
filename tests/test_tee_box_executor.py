@@ -1194,19 +1194,29 @@ def test_the_exec_wrapper_and_kill_script_really_end_a_process_tree(tmp_path):
     )
     try:
         deadline = time.monotonic() + 10
+        recorded = ""
         tree_pids: set[int] = set()
+        separate: list[int] = []
         while time.monotonic() < deadline:
             try:
                 recorded = (tmp_path / "exec.pid").read_text().strip()
             except FileNotFoundError:
                 recorded = ""
             tree_pids = _descendants(process.pid)
-            if recorded and len(tree_pids) >= 5:  # 4 sleeps and the inner sh
+            separate = []
+            for pid in tree_pids:
+                try:
+                    sid = os.getsid(pid)
+                except ProcessLookupError:
+                    continue
+                if sid != process.pid:
+                    separate.append(pid)
+            # The four sleeps can exist before setsid has moved the grandchild.
+            if recorded and len(tree_pids) >= 5 and separate:
                 break
             time.sleep(0.05)
-        assert int(recorded) == process.pid
+        assert recorded and int(recorded) == process.pid
         assert len(tree_pids) >= 5
-        separate = [pid for pid in tree_pids if os.getsid(pid) != process.pid]
         assert separate, "the setsid grandchild did not leave the session"
         killed = subprocess.run(
             ["/bin/sh", "-c", executor_module._KILL_SCRIPT, "cathedral-sandbox", pid_file],
