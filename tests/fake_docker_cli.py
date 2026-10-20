@@ -76,11 +76,51 @@ def main(argv):
         if fmt == "{{.Id}}":
             print("sha256:" + "ab" * 32)
         else:
-            print(json.dumps({"Id": "sha256:" + "ab" * 32, "Size": 1234, "RepoDigests": [ref + "@sha256:" + "cd" * 32]}))
+            size = b.get("image_sizes", {}).get(ref, 1234)
+            print(json.dumps({"Id": "sha256:" + "ab" * 32, "Size": size, "RepoDigests": [ref + "@sha256:" + "cd" * 32]}))
+        return 0
+
+    if cmd == "image" and argv[1] == "rm":
+        with Locked() as st:
+            if argv[-1] in st["images"]:
+                st["images"].remove(argv[-1])
+        return 0
+
+    if cmd == "commit":
+        with Locked() as st:
+            if find(st, argv[-2]) is None:
+                print(f"Error response from daemon: No such container: {argv[-2]}", file=sys.stderr)
+                return 1
+            if argv[-1] not in st["images"]:
+                st["images"].append(argv[-1])
+        return 0
+
+    if cmd == "push":
+        ref = argv[-1]
+        config = os.environ.get("DOCKER_CONFIG")
+        auth = None
+        if config:
+            with open(os.path.join(config, "config.json")) as f:
+                auth = json.load(f)
+        with Locked() as st:
+            present = ref in st["images"]
+            st.setdefault("pushed", []).append({"ref": ref, "auth": auth})
+        if not present:
+            print(f"An image does not exist locally with the tag: {ref}", file=sys.stderr)
+            return 1
+        if ref in b.get("push_fail", []):
+            print(f"denied: permission to push {ref}", file=sys.stderr)
+            return 1
         return 0
 
     if cmd == "pull":
         ref = argv[-1]
+        config = os.environ.get("DOCKER_CONFIG")
+        if config:
+            with open(os.path.join(config, "config.json")) as f:
+                auth = json.load(f)
+            with Locked() as st:
+                st.setdefault("pull_auth", []).append({"ref": ref, "auth": auth, "config_dir": config})
         if b.get("pull_delay"):
             time.sleep(b["pull_delay"])
         if ref in b.get("pull_fail", []):
@@ -235,7 +275,7 @@ def main(argv):
         print("27.0.0-fake")  # inner dockerd of a DinD guest is ready
         return 0
 
-    if cmd in ("exec", "inspect", "network", "pause", "unpause", "commit", "build"):
+    if cmd in ("exec", "inspect", "network", "pause", "unpause", "build"):
         return 0
 
     print(f"fake docker: unsupported command {argv}", file=sys.stderr)
