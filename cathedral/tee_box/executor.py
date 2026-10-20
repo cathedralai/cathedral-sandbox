@@ -1041,10 +1041,13 @@ class RunscExecutor(_Table):
         shape = self._warm_shape
         if shape is None:
             return Shape(0, 0, 0)
+        # One count. Three separate reads can straddle a refill and charge a
+        # container in one dimension only.
+        count = self.warm_count()
         return Shape(
-            shape.vcpus * self.warm_count(),
-            shape.memory_mib * self.warm_count(),
-            shape.disk_mib * self.warm_count(),
+            shape.vcpus * count,
+            shape.memory_mib * count,
+            shape.disk_mib * count,
         )
 
     def reserve_warm(self, spec: SandboxSpec) -> str:
