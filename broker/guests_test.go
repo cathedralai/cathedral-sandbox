@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // limitedChain is newChain with hotel "a" sealed and limits on guest g1.
@@ -276,5 +277,55 @@ func TestLimitsComeFromTheConfigFile(t *testing.T) {
 	g := b.guests["x"]
 	if l := g.limits; l.maxRooms() != 7 || l.MaxCreatesPerMinute != 3 || !l.DefaultSealed || len(l.Hotels) != 1 || l.Hotels[0] != "h1" || !g.cfg.Ops {
 		t.Fatalf("limits %+v ops %v", g.limits, g.cfg.Ops)
+	}
+}
+
+// A create from a broker-built image obeys the sealed default and the hotel
+// set: it never lands on an unsealed hotel only because that hotel built it.
+func TestBuiltImageObeysSealedDefaultAndHotelSet(t *testing.T) {
+	tc := limitedChain(t, guestLimits{DefaultSealed: true, Hotels: []string{"a", "b"}})
+	tc.hotels["a"].failBuild = true // the sealed hotel cannot build at first
+	body, ctype := buildForm(t, "FROM alpine:3.20\n", []byte("ctx"))
+	_, doc := tc.clientCall(t, "POST", "/v1/images/build", body, map[string]string{"Content-Type": ctype})
+	imgID := doc["image_id"].(string)
+	view := waitImage(t, tc, imgID)
+	if view["state"] == "ready" {
+		t.Fatalf("image ready for a sealed-default guest with no sealed build: %v", view)
+	}
+	if len(tc.hotels["c"].builds) != 0 {
+		t.Fatalf("a hotel outside the guest's set built the image")
+	}
+	before := createsOn(tc)
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": imgID}), nil)
+	detail, _ := doc["detail"].(map[string]any)
+	if status != 409 || detail["error"] != "image_not_ready" {
+		t.Fatalf("create with the image only on an unsealed hotel: %d %v", status, doc)
+	}
+	if after := createsOn(tc); after["b"] != before["b"] {
+		t.Fatalf("create went to the unsealed hotel that built the image")
+	}
+	// An explicit unsealed create may use the unsealed build.
+	status, doc = tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": imgID, "sealed": false}), nil)
+	if status != 201 || createsOn(tc)["b"] != before["b"]+1 {
+		t.Fatalf("unsealed create from the image: %d %v", status, doc)
+	}
+	// The sealed hotel builds on the next try; then a plain create goes there.
+	tc.hotels["a"].mu.Lock()
+	tc.hotels["a"].failBuild = false
+	tc.hotels["a"].mu.Unlock()
+	tc.b.compat.mu.Lock()
+	tc.b.compat.images[imgID].failedAt["a"] = time.Now().Add(-2 * time.Minute)
+	tc.b.compat.mu.Unlock()
+	status, _ = tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": imgID}), nil)
+	if status != 409 {
+		t.Fatalf("create while the sealed build runs: %d", status)
+	}
+	if v := waitImage(t, tc, imgID); v["state"] != "ready" {
+		t.Fatalf("view after the sealed build: %v", v)
+	}
+	before = createsOn(tc)
+	status, doc = tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": imgID}), nil)
+	if status != 201 || createsOn(tc)["a"] != before["a"]+1 {
+		t.Fatalf("sealed create from the image: %d %v", status, doc)
 	}
 }

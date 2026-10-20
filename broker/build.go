@@ -77,17 +77,17 @@ func (b *broker) compatBuild(w http.ResponseWriter, r *http.Request, g *guestSta
 	}
 	b.compat.mu.Unlock()
 	b.markDirty()
-	b.ensureBuilds(img)
-	writeJSON(w, 200, b.imageView(img))
+	b.ensureBuilds(img, g)
+	writeJSON(w, 200, b.imageView(img, g))
 }
 
 // ensureBuilds starts a build on each hotel that takes new rooms and has no
 // build state for img yet. A failed hotel is tried again after a minute.
-func (b *broker) ensureBuilds(img *compatImage) {
+func (b *broker) ensureBuilds(img *compatImage, g *guestState) {
 	b.mu.Lock()
 	var hotels []*hotel
 	for _, h := range b.hotelList() {
-		if !h.cfg.Drain {
+		if !h.cfg.Drain && g.limits.allows(h.cfg.ID) {
 			hotels = append(hotels, h)
 		}
 	}
@@ -156,15 +156,21 @@ func (img *compatImage) builtOn() (map[string]bool, string) {
 }
 
 // imageView is the client view of an image.
-func (b *broker) imageView(img *compatImage) map[string]any {
+// A built image is ready for g when a hotel that g's plain create may use
+// (its hotel set and sealed default) holds it.
+func (b *broker) imageView(img *compatImage, g *guestState) map[string]any {
+	var pl placement
+	b.scope(g, &pl, false, false)
 	b.compat.mu.Lock()
 	defer b.compat.mu.Unlock()
 	if !img.Build {
 		return map[string]any{"image_id": img.ID, "state": "ready", "image": img.Ref}
 	}
 	ids, tag := img.builtOn()
-	if len(ids) > 0 {
-		return map[string]any{"image_id": img.ID, "state": "ready", "image": tag}
+	for id := range ids {
+		if h := b.hotelByID(id); h != nil && pl.selects(h) {
+			return map[string]any{"image_id": img.ID, "state": "ready", "image": tag}
+		}
 	}
 	if img.ctxMissing {
 		return map[string]any{"image_id": img.ID, "state": "failed", "error": "image_build_failed",
