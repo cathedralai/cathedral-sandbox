@@ -203,3 +203,34 @@ def test_failed_run_removes_partial_container_and_releases_quota(fake: FakeDocke
         assert _resident(provider) == 0
     finally:
         provider.close()
+
+
+# ---------------------------------------------------------------- D7: kernel isolation
+@pytest.mark.parametrize(
+    ("default_runtime", "explicit", "want"),
+    [("runc", None, False), ("runsc", None, True), ("runc", "runsc", True), ("runc", "kata-runtime", True)],
+)
+def test_status_reports_kernel_isolation_for_runsc_and_kata(
+    fake: FakeDocker, monkeypatch, default_runtime: str, explicit: str | None, want: bool
+) -> None:
+    fake.set(default_runtime=default_runtime)
+    if explicit:
+        monkeypatch.setenv("CATHEDRAL_DOCKER_RUNTIME", explicit)
+    provider = DockerGuestProvider()
+    try:
+        assert provider.status().kernel_isolation is want
+        assert provider.status().runtime == "docker"
+    finally:
+        provider.close()
+
+
+def test_explicit_guest_runtime_is_passed_to_docker_run(fake: FakeDocker, monkeypatch) -> None:
+    monkeypatch.setenv("CATHEDRAL_DOCKER_RUNTIME", "runsc")
+    fake.add_image("alpine:3.20")
+    provider = DockerGuestProvider()
+    try:
+        _create(provider)
+        (run,) = fake.calls_of("run")
+        assert run[run.index("--runtime") + 1] == "runsc"
+    finally:
+        provider.close()

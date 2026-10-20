@@ -4,7 +4,7 @@ Runtimes:
 
 * ``memory`` — real in-process reference provider (subprocess FS). Contract tests.
 * ``docker`` — real Linux containers via the Docker daemon. Fails closed if Docker
-  is down. ``kernel_isolation=false`` (honest).
+  is down. ``kernel_isolation`` is true only when the guest runtime is runsc or Kata.
 * ``kata`` — real Docker guests with ``--runtime=kata-runtime``. Fails closed if
   Kata is not registered. No stub mode.
 """

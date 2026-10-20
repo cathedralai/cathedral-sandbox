@@ -99,6 +99,16 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
         return default
 
 
+def runtime_has_kernel_isolation(runtime: str) -> bool:
+    """True for OCI runtimes that put a separate kernel under the guest.
+
+    runsc (gVisor) runs a user-space kernel; Kata runs a micro-VM. runc shares
+    the host kernel.
+    """
+    name = runtime.strip().lower()
+    return name.startswith("runsc") or "kata" in name
+
+
 def is_dind_image(image: str) -> bool:
     """True when the image is a Docker-in-Docker base used for compose tasks."""
     lowered = image.lower()
@@ -121,6 +131,17 @@ class DockerClient:
 
     def __init__(self, *, kata_runtime: str | None = None) -> None:
         self.kata_runtime = kata_runtime or os.environ.get("CATHEDRAL_KATA_RUNTIME", "kata-runtime")
+        # Optional OCI runtime for non-Kata guests (for example runsc). Empty means
+        # the daemon default runtime.
+        self.guest_runtime = os.environ.get("CATHEDRAL_DOCKER_RUNTIME", "").strip() or None
+
+    def default_runtime(self) -> str:
+        """The daemon's default OCI runtime name, or "" when unknown."""
+        try:
+            result = self.run(["docker", "info", "--format", "{{.DefaultRuntime}}"], timeout=15.0)
+        except SandboxOpError:
+            return ""
+        return result.stdout.strip() if result.returncode == 0 else ""
 
     def run(
         self,
@@ -302,6 +323,8 @@ class DockerClient:
             argv.extend(["--user", user])
         if use_kata:
             argv.extend(["--runtime", self.kata_runtime])
+        elif self.guest_runtime:
+            argv.extend(["--runtime", self.guest_runtime])
         if dind:
             if os.environ.get("CATHEDRAL_ALLOW_PRIVILEGED_DIND") != "1":
                 raise SandboxOpError(
@@ -697,6 +720,12 @@ class DockerGuestProvider:
                         retry_after=60,
                     )
         runtime_label = "kata" if use_kata else "docker"
+        # The OCI runtime under each guest decides kernel isolation for /v1/status.
+        self._oci_runtime = (
+            self._client.kata_runtime
+            if use_kata
+            else (self._client.guest_runtime or self._client.default_runtime())
+        )
         if inner is not None:
             self._inner = inner
         elif os.environ.get("CATHEDRAL_SANDBOX_KEYS", "").strip():
@@ -1228,7 +1257,7 @@ class DockerGuestProvider:
             error_rate=report.error_rate,
             region=report.region,
             runtime="kata" if self._use_kata else "docker",
-            kernel_isolation=self._use_kata,
+            kernel_isolation=self._use_kata or runtime_has_kernel_isolation(self._oci_runtime),
             dind=self.capabilities_dind,
             disk_enforced=True,
         )
