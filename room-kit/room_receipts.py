@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Room kit: signed receipts for a sealed hotel.
+"""Room kit: signed receipts for a hotel.
 
-This process runs inside the sealed guest (AMD SEV-SNP). At start it:
+Two modes. The mode is chosen at start from the TSM provider.
 
-1. makes an Ed25519 receipt key in memory (the private key never goes to disk),
-2. writes a binding document (hotel, boot id, receipt public key, launch facts),
-3. asks the AMD secure processor for an attestation report whose REPORT_DATA
-   is sha256(canonical(binding)) followed by 32 zero bytes.
+Level 1, every host (TSM provider is not sev_guest). An Ed25519 receipt key
+in memory and a binding that says level "hotel". No read of
+/sys/kernel/config/tsm/report, no SNP measurement, and health does not say
+sealed. Schema cathedral_hotel_binding_v1 / cathedral_hotel_receipt_v1.
+
+Sealed (TSM provider sev_guest). The same chain, plus an SNP report whose
+REPORT_DATA is sha256(canonical(binding)) followed by 32 zero bytes. Schema
+cathedral_sealed_hotel_binding_v1 / cathedral_sealed_hotel_receipt_v1, and
+health sealed is true. That path is the sealed guest, not level 1.
 
 Then it listens on ROOM_RECEIPTS_LISTEN and passes every request to the room
 API (127.0.0.1:ROOM_API_PORT) and /room/health to the health endpoint. For each
@@ -46,6 +51,8 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 BINDING_SCHEMA = "cathedral_sealed_hotel_binding_v1"
 RECEIPT_SCHEMA = "cathedral_sealed_hotel_receipt_v1"
+HOTEL_BINDING_SCHEMA = "cathedral_hotel_binding_v1"
+HOTEL_RECEIPT_SCHEMA = "cathedral_hotel_receipt_v1"
 TSM = "/sys/kernel/config/tsm/report"
 
 
@@ -63,8 +70,13 @@ def b64(data: bytes) -> str:
 
 # ---------------------------------------------------------------- attestation
 
-def snp_report(report_data: bytes) -> bytes:
-    """One SNP attestation report through configfs-tsm (Linux TSM reports)."""
+# The sealed path's first report uses 64 zero bytes. tsm_provider() reads that
+# report once; snp_report() returns it instead of asking the processor again.
+_ZERO_REPORT: tuple[str, bytes] | None = None
+
+
+def _read_tsm(report_data: bytes) -> tuple[str, bytes]:
+    """One configfs-tsm report: provider name and outblob."""
     assert len(report_data) == 64
     entry = os.path.join(TSM, "room-" + uuid.uuid4().hex[:12])
     os.mkdir(entry)
@@ -77,6 +89,34 @@ def snp_report(report_data: bytes) -> bytes:
             provider = f.read().strip()
     finally:
         os.rmdir(entry)
+    return provider, report
+
+
+def tsm_provider() -> str | None:
+    """The configfs-tsm provider, or None when this host has no TSM report.
+
+    No configfs directory means level 1. A probe writes a zero REPORT_DATA
+    and reads provider. sev_guest is the sealed path. Any other provider is
+    level 1. A probe error is raised: a sealed guest with a broken TSM must
+    not publish a hotel binding instead. The zero report is kept for
+    snp_report(), so a sealed start still asks for two reports, as before.
+    """
+    global _ZERO_REPORT
+    if not os.path.isdir(TSM):
+        return None
+    provider, report = _read_tsm(bytes(64))
+    _ZERO_REPORT = (provider, report)
+    return provider or None
+
+
+def snp_report(report_data: bytes) -> bytes:
+    """One SNP attestation report through configfs-tsm (Linux TSM reports)."""
+    global _ZERO_REPORT
+    if report_data == bytes(64) and _ZERO_REPORT is not None:
+        provider, report = _ZERO_REPORT
+        _ZERO_REPORT = None
+    else:
+        provider, report = _read_tsm(report_data)
     if provider != "sev_guest" or len(report) < 0x4A0:
         raise RuntimeError(f"unexpected TSM provider {provider!r} or report size {len(report)}")
     return report
@@ -106,6 +146,15 @@ class Ledger:
     """The receipt key, the binding and the chain of this boot."""
 
     def __init__(self, hotel: str, store: str):
+        if tsm_provider() == "sev_guest":
+            self._init_sealed(hotel, store)
+        else:
+            self._init_hotel(hotel, store)
+
+    def _init_sealed(self, hotel: str, store: str) -> None:
+        """SNP binding. Same schema, report and fields as the sealed guest."""
+        self.sealed = True
+        self.receipt_schema = RECEIPT_SCHEMA
         self.hotel = hotel
         self.key = Ed25519PrivateKey.generate()
         pub = self.key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
@@ -133,6 +182,34 @@ class Ledger:
         self.report = snp_report(bytes.fromhex(self.binding_sha256) + bytes(32))
         if report_fields(self.report)["measurement"] != facts["measurement"]:
             raise RuntimeError("measurement changed between the two reports")
+        self._open_store(store)
+
+    def _init_hotel(self, hotel: str, store: str) -> None:
+        """Level 1: an Ed25519 hotel chain. No SNP report and no measurement."""
+        self.sealed = False
+        self.receipt_schema = HOTEL_RECEIPT_SCHEMA
+        self.hotel = hotel
+        self.key = Ed25519PrivateKey.generate()
+        pub = self.key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        self.binding = {
+            "schema": HOTEL_BINDING_SCHEMA,
+            "level": "hotel",
+            "hotel": hotel,
+            "boot_id": read("/proc/sys/kernel/random/boot_id"),
+            "created_at": int(time.time()),
+            "receipt_key_ed25519_b64": b64(pub),
+            "kernel_cmdline": read("/proc/cmdline"),
+            "kernel_release": os.uname().release,
+            "software": {
+                "room_kit": read("/opt/room-kit/KIT_COMMIT", "unknown"),
+                "cathedral": read("/opt/pool-room/src/COMMIT", "unknown"),
+            },
+        }
+        self.binding_sha256 = sha(canonical(self.binding))
+        self.report = b""
+        self._open_store(store)
+
+    def _open_store(self, store: str) -> None:
         self.lock = threading.Lock()
         self.chain: list[dict] = []
         self.by_room: dict[str, list[int]] = {}
@@ -143,11 +220,14 @@ class Ledger:
             json.dump(self.attestation(), f)
 
     def attestation(self) -> dict:
-        return {"binding": self.binding, "binding_sha256": self.binding_sha256, "report_b64": b64(self.report)}
+        doc = {"binding": self.binding, "binding_sha256": self.binding_sha256}
+        if self.sealed:
+            doc["report_b64"] = b64(self.report)
+        return doc
 
     def sign(self, fields: dict) -> dict:
         with self.lock:
-            statement = {"schema": RECEIPT_SCHEMA, "binding_sha256": self.binding_sha256, "hotel": self.hotel,
+            statement = {"schema": self.receipt_schema, "binding_sha256": self.binding_sha256, "hotel": self.hotel,
                          "operation_id": str(uuid.uuid4()), "sequence": len(self.chain) + 1,
                          "previous_receipt_sha256": self.head, "issued_at": int(time.time()), **fields}
             receipt = {"statement": statement, "signature_b64": b64(self.key.sign(canonical(statement))),
@@ -344,7 +424,9 @@ class Server(ThreadingHTTPServer):
                 status, out = r.status, r.read()
                 if status == 200:
                     doc = json.loads(out)
-                    doc["sealed"] = True
+                    # Sealed guests only. Level 1 must not claim an SNP binding.
+                    if self.ledger.sealed:
+                        doc["sealed"] = True
                     doc["receipts"] = {"binding_sha256": self.ledger.binding_sha256, "count": len(self.ledger.chain)}
                     doc["runsc_sandbox_procs"] = int(subprocess.run(
                         ["pgrep", "-cf", "[r]unsc-sandbox"], capture_output=True, text=True, timeout=20).stdout.strip() or 0)
@@ -378,7 +460,10 @@ def main() -> int:
     with open(env.get("ROOM_API_KEY_PATH", "/etc/pool-room/api.key"), "rb") as f:
         api_key = f.read().strip()
     ledger = Ledger(env["ROOM_HOTEL_NAME"], env.get("ROOM_RECEIPTS_DIR", "/run/room-receipts"))
-    print(f"room-receipts: binding {ledger.binding_sha256} measurement {ledger.binding['measurement']}", flush=True)
+    if ledger.sealed:
+        print(f"room-receipts: binding {ledger.binding_sha256} measurement {ledger.binding['measurement']}", flush=True)
+    else:
+        print(f"room-receipts: binding {ledger.binding_sha256} level hotel", flush=True)
     srv = Server((host, int(port)), ledger, int(env.get("ROOM_API_PORT", "18090")),
                  int(env.get("ROOM_HEALTH_PORT", "18091")), api_key, env.get("ROOM_DOCKER_SOCK", "/run/pool-room/docker.sock"))
     srv.serve_forever()

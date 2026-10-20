@@ -82,6 +82,7 @@ class _Upstream(BaseHTTPRequestHandler):
 
 
 class _Ledger:
+    sealed = True
     binding_sha256 = "ab" * 32
     chain: list = []
     lock = threading.Lock()
