@@ -247,7 +247,19 @@ def main(argv):
         print("27.0.0-fake")  # inner dockerd of a DinD guest is ready
         return 0
 
-    if cmd in ("exec", "inspect", "network", "pause", "unpause", "build"):
+    if cmd == "build":
+        tag = argv[argv.index("-t") + 1]
+        context = argv[-1]
+        with Locked() as st:
+            st.setdefault("builds", []).append({"tag": tag, "files": sorted(os.listdir(context))})
+            if tag not in st["images"] and not b.get("build_fail"):
+                st["images"].append(tag)
+        if b.get("build_fail"):
+            print("failed to solve: process did not complete successfully", file=sys.stderr)
+            return 1
+        return 0
+
+    if cmd in ("exec", "inspect", "network", "pause", "unpause"):
         return 0
 
     print(f"fake docker: unsupported command {argv}", file=sys.stderr)

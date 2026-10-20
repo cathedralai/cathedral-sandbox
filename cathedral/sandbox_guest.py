@@ -11,6 +11,7 @@ guest, and no path that pretends Kata or DinD when they are absent.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import shlex
@@ -762,6 +763,8 @@ class DockerGuestProvider:
         self._snapshot_images: dict[str, str] = {}
         self._snapshot_meta: dict[str, dict[str, Any]] = {}  # snapshot id -> sizes and image
         self._built_images: dict[str, str] = {}  # content_hash -> tag
+        self._build_locks: dict[str, threading.Lock] = {}  # tag -> lock; one build per tag
+        self._build_locks_guard = threading.Lock()
         # GC state. A sandbox id in _doomed has a "deleting" record and a container
         # that is not yet confirmed gone. Only one drain runs at a time.
         self._owner = os.environ.get("CATHEDRAL_SANDBOX_OWNER", "").strip() or "default"
@@ -828,6 +831,44 @@ class DockerGuestProvider:
 
     def authorize(self, api_key: str | None) -> None:
         self._inner.authorize(api_key)
+
+    def build_image(self, dockerfile: str, context: bytes | None = None) -> dict[str, Any]:
+        """Build *dockerfile* with an optional gzip tar *context*. Cached by content.
+
+        The tag is cathedral-build-<hash>:latest, where the hash covers the
+        Dockerfile and the context bytes. A second build of the same content
+        only checks that the image is present.
+        """
+        if not dockerfile.strip():
+            raise SandboxContractError("invalid_build", "dockerfile must not be empty")
+        digest = hashlib.sha256(dockerfile.encode("utf-8") + b"\0" + (context or b"")).hexdigest()
+        tag = f"cathedral-build-{digest[:16]}:latest"
+        with self._build_locks_guard:
+            lock = self._build_locks.setdefault(tag, threading.Lock())
+        with lock:
+            cached = self._client.image_exists(tag)
+            if not cached:
+                work = Path(tempfile.mkdtemp(prefix="cathedral-build-"))
+                try:
+                    if context:
+                        import io
+                        import tarfile
+
+                        try:
+                            with tarfile.open(fileobj=io.BytesIO(context), mode="r:*") as tf:
+                                tf.extractall(work, filter="data")
+                        except (tarfile.TarError, OSError) as exc:
+                            raise SandboxOpError("invalid_build_context", 400, f"build context is not a valid tar: {exc}") from exc
+                    (work / "Dockerfile").write_text(dockerfile, encoding="utf-8")
+                    self._client.build(tag=tag, context_dir=work)
+                finally:
+                    shutil.rmtree(work, ignore_errors=True)
+        return {
+            "image": tag,
+            "content_hash": "sha256:" + digest,
+            "cached": cached,
+            "size_bytes": self._client.image_size(tag),
+        }
 
     def _build_image(self, request: CreateSandboxRequest) -> str:
         assert request.build is not None

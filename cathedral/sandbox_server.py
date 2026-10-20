@@ -16,6 +16,7 @@ reads, ``413`` past ``?max_bytes``, ``204`` on idempotent deletes, and an
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -238,6 +239,7 @@ class SandboxApplication:
         self._add("GET", r"/v1/sandbox-templates", self.list_templates)
         self._add("GET", r"/v1/sandbox-templates/(?P<uid>[^/]+)", self.get_template)
         self._add("POST", r"/v1/images/prefetch", self.prefetch)
+        self._add("POST", r"/v1/images/build", self.build_image)
         self._add("GET", r"/v1/images/(?P<ref>.+)", self.image_lookup)
         self._add("GET", r"/v1/quota", self.quota)
         self._add("GET", r"/v1/usage", self.usage)
@@ -541,6 +543,28 @@ class SandboxApplication:
             {"operation_id": op, "idempotent": idem is not None, "status": result["status"], "result": result["result"]},
         )
 
+    # Largest build context, after base64 decoding.
+    BUILD_CONTEXT_MAX_BYTES = 256 * 1024 * 1024
+
+    def build_image(self, *, body, **_):
+        payload = self._json(body)
+        build = getattr(self.provider, "build_image", None)
+        if build is None:
+            return Response.error(501, "build_not_supported", "this runtime cannot build images")
+        dockerfile = payload.get("dockerfile")
+        if not isinstance(dockerfile, str) or not dockerfile.strip():
+            raise api.SandboxContractError("invalid_build", "dockerfile is required")
+        context = None
+        raw = payload.get("context_tar_b64")
+        if raw:
+            try:
+                context = base64.b64decode(raw, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise api.SandboxContractError("invalid_build_context", "context_tar_b64 is not base64") from exc
+            if len(context) > self.BUILD_CONTEXT_MAX_BYTES:
+                return Response.error(413, "build_context_too_large", "build context is larger than 256 MiB")
+        return Response.json(200, build(dockerfile, context))
+
     def image_lookup(self, *, ref, **_):
         return Response.json(200, dict(self.provider.image_status(ref)))
 
@@ -642,6 +666,7 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/snapshots/{id}", "delete", "Delete a snapshot", "§3.5"),
     ("/v1/snapshots/{id}/push", "post", "Push a snapshot image to a registry", "§3.5"),
     ("/v1/images/prefetch", "post", "Prefetch an image", "§3.9"),
+    ("/v1/images/build", "post", "Build an image from a Dockerfile and a context", "§3.9"),
     ("/v1/images/{ref}", "get", "Image cache status", "§3.9"),
     ("/v1/quota", "get", "Project quota + usage", "§3.8"),
     ("/v1/usage", "get", "Metered usage + cost", "§3.13/§3.16; grouped by label"),
