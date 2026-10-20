@@ -34,6 +34,7 @@ type fakeHotel struct {
 	healthFail  bool
 	rooms       []map[string]any // id + labels, for the room list
 	networks    []map[string]any // bodies of PUT /v1/sandboxes/{id}/network
+	receipts    []byte           // body of GET /room/receipts
 }
 
 func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -79,6 +80,14 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		writeJSON(w, 200, map[string]any{"sandboxes": out})
+	case p == "/room/receipts" && r.Method == "GET":
+		if f.receipts == nil {
+			writeErr(w, 404, "no_receipts", "no chain")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write(f.receipts)
 	case p == "/room/health" && f.healthFail:
 		writeErr(w, 503, "busy", "health did not answer")
 	case p == "/room/health" || p == "/v1/quota" || p == "/v1/status":

@@ -72,9 +72,14 @@ A runtime change stays in memory. A restart goes back to the config file.
 
 Guests are apart: the broker labels each room with its guest, lists with
 that label only, and answers 404 `sandbox_not_found` to a call on a room of
-another guest. The hotel receipt chain (`GET /v1/hotels/<id>/receipts`) is
-one chain per hotel boot: it shows every guest's room ids, image names and
-hashes, but no commands, files or outputs.
+another guest. The hotel still signs one receipt chain per boot.
+`GET /v1/hotels/<id>/receipts` returns that chain to an ops key. Any other
+guest receives only the receipts for rooms that guest has owned on that
+hotel, including rooms already deleted. A receipt left out can still be the
+`previous_receipt_sha256` of a receipt that is returned; the response does
+not include the other guest's room id, image name, or target path. Receipts
+still omit commands, files, and outputs. One room's own receipts are
+`GET /v1/sandboxes/<id>/receipts`.
 
 ## Room network policy
 

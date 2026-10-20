@@ -180,6 +180,11 @@ type broker struct {
 	// Durable client state (state.go).
 	savedUUIDs map[string]string // broker room id -> client id, from the state file
 	dirty      atomic.Bool
+
+	// guestRooms is guest id -> hotel id -> hotel-local room id. It keeps
+	// rooms after they leave the hotel list, so a guest can still read their
+	// own receipts. Guarded by b.mu.
+	guestRooms map[string]map[string]map[string]struct{}
 }
 
 // A hotel counts as answering while its last good health answer is younger than okWindow.
@@ -206,6 +211,9 @@ func (b *broker) register(rm *room) {
 	}
 	b.byUUID[rm.uuid] = rm
 	b.markDirty()
+	if rm.h != nil {
+		b.rememberGuestRoom(rm.guest, rm.h.cfg.ID, rm.hid)
+	}
 }
 
 func sha(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }
@@ -721,7 +729,9 @@ func copyRoomHeaders(dst, src http.Header) {
 
 // handleHotelDoc passes a hotel's attestation or receipt chain to a guest:
 // GET /v1/hotels/<id>/attestation and GET /v1/hotels/<id>/receipts.
-func (b *broker) handleHotelDoc(w http.ResponseWriter, r *http.Request, rest string) {
+// The hotel chain is one list per boot. A guest sees only receipts for rooms
+// they have owned. An ops key sees the whole chain.
+func (b *broker) handleHotelDoc(w http.ResponseWriter, r *http.Request, rest string, g *guestState) {
 	id, doc, _ := strings.Cut(rest, "/")
 	h := b.hotelByID(id)
 	if h == nil || (doc != "attestation" && doc != "receipts") || r.Method != "GET" {
@@ -733,9 +743,18 @@ func (b *broker) handleHotelDoc(w http.ResponseWriter, r *http.Request, rest str
 		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
 		return
 	}
+	if doc == "receipts" && status == 200 && !g.cfg.Ops {
+		filtered, ferr := filterHotelReceipts(out, b.guestRoomIDs(g.cfg.ID, h.cfg.ID))
+		if ferr != nil {
+			writeErr(w, 502, "receipts_unreadable", "hotel receipt chain could not be filtered")
+			return
+		}
+		out = filtered
+	}
 	if v := hdr.Get("Content-Type"); v != "" {
 		w.Header().Set("Content-Type", v)
 	}
+	w.Header().Del("Content-Length")
 	w.WriteHeader(status)
 	_, _ = w.Write(out)
 }
@@ -1277,7 +1296,7 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 		case strings.HasPrefix(p, "/v1/sandboxes/"):
 			b.handleRoom(w, r, g, strings.TrimPrefix(p, "/v1/sandboxes/"))
 		case strings.HasPrefix(p, "/v1/hotels/"):
-			b.handleHotelDoc(w, r, strings.TrimPrefix(p, "/v1/hotels/"))
+			b.handleHotelDoc(w, r, strings.TrimPrefix(p, "/v1/hotels/"), g)
 		case p == "/v1/quota" && r.Method == "GET":
 			b.handleQuota(w, r, g)
 		case p == "/v1/usage" && r.Method == "GET":
