@@ -61,6 +61,8 @@ type guestConfig struct {
 	ID              string `json:"id"`
 	KeySHA256       string `json:"key_sha256"`        // empty: the guest has a view only
 	ViewTokenSHA256 string `json:"view_token_sha256"` // token for /<id>/live
+	Ops             bool   `json:"ops"`               // may run the probe and reset the broker counters
+	guestLimits            // max_rooms, max_creates_per_minute, default_sealed, hotels (guests.go)
 }
 
 type config struct {
@@ -158,6 +160,9 @@ type guestState struct {
 	rejected int // 429 sent to the guest
 	queued   int
 	recent   []time.Time // create times in the last 60 s
+	limits   guestLimits // from the config; an operator can change them at runtime (guests.go)
+	pending  int         // rooms admitted and not yet placed or failed
+	admits   []time.Time // admitted rooms in the last 60 s, for max_creates_per_minute
 }
 
 type broker struct {
@@ -232,7 +237,8 @@ func loadBroker(path string) (*broker, error) {
 		}
 	}
 	for _, gc := range c.Guests {
-		g := &guestState{cfg: gc}
+		g := &guestState{cfg: gc, limits: gc.guestLimits}
+		g.limits.Hotels = append([]string(nil), gc.Hotels...)
 		b.guests[gc.ID] = g
 		if gc.KeySHA256 != "" {
 			b.byKey[strings.ToLower(gc.KeySHA256)] = g
@@ -560,8 +566,13 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		return
 	}
 	pl.apply(payload)
+	if e, retry := b.admit(g, count); e != nil {
+		writeLimitErr(w, e, retry)
+		return
+	}
 	if count == 1 {
 		res := b.createOne(r.Context(), g, payload, tRecv, pl)
+		b.unreserve(g, 1)
 		b.finishCreate(w, res, tRecv)
 		return
 	}
@@ -573,7 +584,11 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		_ = json.Unmarshal(raw, &p)
 		pl.apply(p)
 		wg.Add(1)
-		go func(i int) { defer wg.Done(); results[i] = b.createOne(r.Context(), g, p, tRecv, pl) }(i)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = b.createOne(r.Context(), g, p, tRecv, pl)
+			b.unreserve(g, 1)
+		}(i)
 	}
 	wg.Wait()
 	var docs []any
@@ -815,9 +830,15 @@ func (b *broker) handleQuota(w http.ResponseWriter, r *http.Request, g *guestSta
 			}
 		}
 	}
+	lim := g.limits
 	b.mu.Unlock()
+	allowed := lim.Hotels
+	if allowed == nil {
+		allowed = []string{}
+	}
 	total["hotels"] = hotels
-	total["guest"] = map[string]any{"id": g.cfg.ID, "running_sandboxes": mine}
+	total["guest"] = map[string]any{"id": g.cfg.ID, "running_sandboxes": mine, "max_rooms": lim.maxRooms(),
+		"max_creates_per_minute": lim.MaxCreatesPerMinute, "default_sealed": lim.DefaultSealed, "allowed_hotels": allowed}
 	writeJSON(w, 200, total)
 }
 
@@ -868,6 +889,10 @@ func pct(xs []float64) map[string]float64 {
 }
 
 func (b *broker) handleStats(w http.ResponseWriter, r *http.Request, g *guestState) {
+	if r.Method == "POST" && !g.cfg.Ops {
+		writeErr(w, 403, "forbidden", "this key may not reset the broker counters")
+		return
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if r.Method == "POST" {
@@ -1205,6 +1230,10 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.handleHotelAdmin(w, r, strings.TrimPrefix(strings.TrimPrefix(p, "/v1/broker/hotels"), "/"))
 		return
 	}
+	if p == "/v1/broker/guests" || strings.HasPrefix(p, "/v1/broker/guests/") {
+		b.handleGuestAdmin(w, r, strings.TrimPrefix(strings.TrimPrefix(p, "/v1/broker/guests"), "/"))
+		return
+	}
 	if strings.HasPrefix(p, "/v1/") {
 		g := b.guestFromKey(r)
 		if g == nil {
@@ -1266,6 +1295,10 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 		case p == "/v1/broker/stats":
 			b.handleStats(w, r, g)
 		case p == "/v1/broker/probe" && r.Method == "POST":
+			if !g.cfg.Ops {
+				writeErr(w, 403, "forbidden", "this key may not run the probe")
+				return
+			}
 			b.handleProbe(w, r, g)
 		case p == "/v1/status":
 			b.mu.Lock()

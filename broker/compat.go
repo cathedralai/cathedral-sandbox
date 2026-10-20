@@ -394,7 +394,23 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		ttl = 48 * 3600
 	}
 	native["ttl_seconds"] = ttl
+	// Hotel choice: the guest's hotel set and sealed default apply; "sealed"
+	// true or false in the request chooses explicitly.
+	sealed, sealedField := req["sealed"].(bool)
+	if sealedField {
+		if sealed {
+			pl.match = map[string]string{"sealed": "true"}
+		} else {
+			pl.exclude = map[string]string{"sealed": "true"}
+		}
+	}
+	b.scope(g, &pl, len(pl.ids) > 0, sealedField)
+	if e, retry := b.admit(g, 1); e != nil {
+		compatErr(w, e.status, e.code, e.msg, retry)
+		return
+	}
 	out := b.createOne(r.Context(), g, native, time.Now(), pl)
+	b.unreserve(g, 1)
 	if out.status != 202 {
 		code, msg := "create_failed", "the hotel refused the room"
 		if e, ok := out.doc["error"].(map[string]string); ok {
