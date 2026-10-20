@@ -203,9 +203,9 @@ func (b *broker) serveCompat(w http.ResponseWriter, r *http.Request, g *guestSta
 			return
 		}
 		if img.Build {
-			b.ensureBuilds(img)
+			b.ensureBuilds(img, g)
 		}
-		writeJSON(w, 200, b.imageView(img))
+		writeJSON(w, 200, b.imageView(img, g))
 	case p == "/v1/sandboxes" && r.Method == "POST":
 		b.compatIdem(w, r, g, func(w http.ResponseWriter, body []byte) { b.compatCreate(w, r, g, body) })
 	case p == "/v1/sandboxes" && r.Method == "GET":
@@ -348,7 +348,7 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		ref := ""
 		if img != nil && img.Build {
 			// A built image is only on the hotels that built it.
-			pl.ids, ref = img.builtOn()
+			pl.images, ref = img.builtOn()
 		} else if img != nil {
 			ref = img.Ref
 		}
@@ -404,7 +404,16 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 			pl.exclude = map[string]string{"sealed": "true"}
 		}
 	}
-	b.scope(g, &pl, len(pl.ids) > 0, sealedField)
+	b.scope(g, &pl, false, sealedField)
+	if len(pl.images) > 0 && !b.anyHotel(pl) {
+		// Built, but not on a hotel this create may use (for example only on
+		// an unsealed hotel for a sealed create). Build it there and say so.
+		if img := b.compatImageByID(req["image_id"]); img != nil {
+			b.ensureBuilds(img, g)
+		}
+		compatErr(w, 409, "image_not_ready", "the image is not built yet on a hotel this create may use (sealed hotels unless the create says \"sealed\": false); the broker is building it there, retry", 10)
+		return
+	}
 	if e, retry := b.admit(g, 1); e != nil {
 		compatErr(w, e.status, e.code, e.msg, retry)
 		return

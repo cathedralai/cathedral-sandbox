@@ -238,3 +238,20 @@ func (g *guestState) limitsAllow(b *broker, id string) bool {
 	defer b.mu.Unlock()
 	return g.limits.allows(id)
 }
+
+// anyHotel reports whether some hotel matches pl, full or not.
+func (b *broker) anyHotel(pl placement) bool {
+	for _, h := range b.hotelList() {
+		if pl.allows(h) {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *broker) compatImageByID(v any) *compatImage {
+	id, _ := v.(string)
+	b.compat.mu.Lock()
+	defer b.compat.mu.Unlock()
+	return b.compat.images[id]
+}

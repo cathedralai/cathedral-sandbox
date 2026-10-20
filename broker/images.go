@@ -45,7 +45,11 @@ type placement struct {
 	// id on the hotel.
 	snapshotRef, hotelSnap string
 	allowed                map[string]bool // non-empty: the guest may use only these hotels (guests.go)
-	sealedByDefault        bool            // match["sealed"] comes from the guest default, not the request
+	// images: non-empty for a create from a broker-built image, the hotels
+	// that hold it. Unlike ids it is not a hotel choice: the sealed rule and
+	// the guest's sealed default still apply.
+	images          map[string]bool
+	sealedByDefault bool // match["sealed"] comes from the guest default, not the request
 }
 
 func (pl placement) selects(h *hotel) bool {
@@ -53,6 +57,9 @@ func (pl placement) selects(h *hotel) bool {
 		return false
 	}
 	if len(pl.ids) > 0 && !pl.ids[h.cfg.ID] {
+		return false
+	}
+	if len(pl.images) > 0 && !pl.images[h.cfg.ID] {
 		return false
 	}
 	// A hotel with "sealed": true in the config takes only creates that ask
