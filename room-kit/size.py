@@ -8,9 +8,14 @@ Usage: size.py machine.json [--vcpu 1] [--mem-gib 4] [--disk-gib 10]
        [--max-slots N] [--out size.json]
 
 Rules:
-* Existing workloads are subtracted at their committed limits (Docker
-  --cpus/--memory, VM -smp/-m). A container with no limit is charged at its
-  live memory and 1 thread.
+* A sealed hotel guest on the same host (room kit --sealed, a QEMU guest named
+  sealed-<hotel>) is an operator reserve: its vCPUs and memory leave the
+  physical pool before overcommit, because SEV-SNP guest memory is real and
+  cannot be shared.
+* Other existing workloads are charged at their committed limits (Docker
+  --cpus/--memory, VM -smp/-m) against the overcommitted pool. A container
+  with no limit is charged at its live memory and 1 thread. With overcommit
+  1.0 this is the same as subtracting them from the physical pool.
 * The room's own Docker daemon is not subtracted (those are our slots).
 * Disk: the room may grow the host filesystem to disk-max-fill-pct, no more.
   If the room has its own data volume (room-disk-bytes), the smaller wins.
@@ -52,22 +57,26 @@ def main() -> int:
     ram = m["memory"]["total_bytes"]
     hd = m["workloads"].get("host_docker") or {}
     vms = m["workloads"].get("vms") or {}
-    used_cpu = (hd.get("cpu_limit_sum") or 0) + (hd.get("unlimited_cpu") or 0) + (vms.get("vcpus_sum") or 0)
-    used_ram = (hd.get("mem_limit_sum_bytes") or 0) + (vms.get("mem_sum_bytes") or 0)
+    sealed_cpu = vms.get("sealed_hotel_vcpus_sum") or 0
+    sealed_ram = vms.get("sealed_hotel_mem_sum_bytes") or 0
+    used_cpu = (hd.get("cpu_limit_sum") or 0) + (hd.get("unlimited_cpu") or 0) + (vms.get("vcpus_sum") or 0) - sealed_cpu
+    used_ram = (hd.get("mem_limit_sum_bytes") or 0) + (vms.get("mem_sum_bytes") or 0) - sealed_ram
     used_ram += m["memory"].get("hugepages_reserved_bytes", 0)
     if hd.get("unlimited_mem"):
         used_ram += hd.get("mem_usage_sum_bytes") or 0
 
-    cpu_pool = max(threads - a.reserve_threads - used_cpu, 0)
-    ram_pool = max(ram * (1 - a.reserve_ram_pct / 100.0) - used_ram, 0)
+    # Physical pool after the host reserve and sealed guests; overcommit it,
+    # then charge the other workloads' commitments against it.
+    cpu_pool = max((threads - a.reserve_threads - sealed_cpu) * a.cpu_overcommit - used_cpu, 0)
+    ram_pool = max((ram * (1 - a.reserve_ram_pct / 100.0) - sealed_ram) * a.mem_overcommit - used_ram, 0)
     fs = m["root_fs"] if m["data_dir"].get("mount") == m["root_fs"].get("mount") else m["data_dir"]
     disk_pool = max(fs["total_bytes"] * a.disk_max_fill_pct / 100.0 - fs["used_bytes"], 0)
     if a.room_disk_bytes:
         disk_pool = min(disk_pool, a.room_disk_bytes * 0.95)
 
     by = {
-        "cpu": math.floor(cpu_pool * a.cpu_overcommit / a.vcpu),
-        "memory": math.floor(ram_pool * a.mem_overcommit / (a.mem_gib * GIB)),
+        "cpu": math.floor(cpu_pool / a.vcpu),
+        "memory": math.floor(ram_pool / (a.mem_gib * GIB)),
         "disk": math.floor(disk_pool * a.disk_overcommit / (a.disk_gib * GIB)),
     }
     if a.max_slots:
@@ -82,6 +91,9 @@ def main() -> int:
         "host": {"threads": threads, "ram_gib": round(ram / GIB, 1)},
         "already_used": {"vcpu": round(used_cpu, 2), "ram_gib": round(used_ram / GIB, 1),
                          "host_containers": hd.get("running", 0), "vms": vms.get("count", 0)},
+        "sealed_hotel_reserve": {"vcpu": sealed_cpu, "ram_gib": round(sealed_ram / GIB, 1),
+                                 "guests": vms.get("sealed_hotel_count", 0)},
+        # vcpu and ram_gib are after overcommit and after other workloads.
         "pool": {"vcpu": round(cpu_pool, 2), "ram_gib": round(ram_pool / GIB, 1), "disk_gib": round(disk_pool / GIB, 1)},
         "slots_by_resource": by,
         "slots": slots,

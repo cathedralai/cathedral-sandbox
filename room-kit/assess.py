@@ -140,10 +140,16 @@ def vms() -> dict:
             if mem:
                 n, unit = int(mem.group(1)), mem.group(2).upper()
                 mem_b = n * (1 << 30) if unit == "G" else n * (1 << 20)
+            name = re.search(r"-name\s+(?:guest=)?([^\s,]+)", args)
             found.append({"vcpus": int(smp.group(1)) if smp else 1, "mem_bytes": mem_b, "rss_bytes": int(rss) * 1024,
-                          "cmd": args.split()[0]})
+                          "cmd": args.split()[0], "name": name.group(1) if name else None,
+                          # A sealed hotel guest (room kit --sealed) names itself sealed-<hotel>.
+                          "sealed_hotel": bool(name and name.group(1).startswith("sealed-"))})
+    sealed = [v for v in found if v["sealed_hotel"]]
     return {"count": len(found), "vcpus_sum": sum(v["vcpus"] for v in found),
-            "mem_sum_bytes": sum(v["mem_bytes"] for v in found), "items": found}
+            "mem_sum_bytes": sum(v["mem_bytes"] for v in found), "items": found,
+            "sealed_hotel_count": len(sealed), "sealed_hotel_vcpus_sum": sum(v["vcpus"] for v in sealed),
+            "sealed_hotel_mem_sum_bytes": sum(v["mem_bytes"] for v in sealed)}
 
 
 def ports() -> list[dict]:
