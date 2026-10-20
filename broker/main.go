@@ -48,6 +48,9 @@ type hotelConfig struct {
 	KeyFile     string `json:"key_file"`
 	Concurrency int    `json:"concurrency"` // creates in flight at this hotel
 	Drain       bool   `json:"drain"`       // true: no new rooms here; existing rooms keep working
+	// Labels describe the hotel, for example {"sealed": "true"}. A guest can
+	// ask for rooms only on hotels with (or without) some labels.
+	Labels map[string]string `json:"labels"`
 }
 
 type guestConfig struct {
@@ -132,15 +135,16 @@ type guestState struct {
 }
 
 type broker struct {
-	cfg     config
-	mu      sync.Mutex
-	hotels  []*hotel
-	byHotel map[string]*hotel
-	guests  map[string]*guestState
-	byKey   map[string]*guestState // sha256(key) -> guest
-	byUUID  map[string]*room
-	compat  *compatState
-	started time.Time
+	cfg      config
+	mu       sync.Mutex
+	hotels   []*hotel
+	byHotel  map[string]*hotel
+	guests   map[string]*guestState
+	byKey    map[string]*guestState // sha256(key) -> guest
+	byUUID   map[string]*room
+	compat   *compatState
+	prefetch prefetchJobs
+	started  time.Time
 }
 
 // A hotel counts as answering while its last good health answer is younger than okWindow.
@@ -293,13 +297,14 @@ func (h *hotel) release(r *room) {
 
 func (h *hotel) used() int { return len(h.rooms) + h.creating + h.queued }
 
-// pick a hotel at random, weight = free rooms. Caller holds b.mu.
-func (b *broker) pick(exclude map[*hotel]bool) *hotel {
+// pick a hotel at random, weight = free rooms, among the hotels that pl
+// allows. Caller holds b.mu.
+func (b *broker) pick(exclude map[*hotel]bool, pl placement) *hotel {
 	now := time.Now()
 	total := 0
 	free := make([]int, len(b.hotels))
 	for i, h := range b.hotels {
-		if !h.ok || h.cfg.Drain || exclude[h] || now.Before(h.backoffUntil) {
+		if !h.ok || h.cfg.Drain || exclude[h] || now.Before(h.backoffUntil) || !pl.allows(h) {
 			continue
 		}
 		if f := h.slots - h.used(); f > 0 {
@@ -352,7 +357,7 @@ type createResult struct {
 }
 
 // createOne places one room. tRecv is when the guest request arrived.
-func (b *broker) createOne(ctx context.Context, g *guestState, payload map[string]any, tRecv time.Time) createResult {
+func (b *broker) createOne(ctx context.Context, g *guestState, payload map[string]any, tRecv time.Time, pl placement) createResult {
 	labels, _ := payload["labels"].(map[string]any)
 	if labels == nil {
 		labels = map[string]any{}
@@ -366,7 +371,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 	var last createResult
 	for attempt := 0; attempt < 3; attempt++ {
 		b.mu.Lock()
-		h := b.pick(tried)
+		h := b.pick(tried, pl)
 		if h == nil {
 			if last.status >= 500 {
 				g.failed++
@@ -375,7 +380,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 			if last.status != 0 {
 				return last
 			}
-			return createResult{status: 429, header: http.Header{"Retry-After": {"5"}}, doc: map[string]any{"error": map[string]string{"code": "no_free_rooms", "message": "all hotels are full; retry later"}}}
+			return pl.noRoom()
 		}
 		tried[h] = true
 		h.queued++
@@ -424,6 +429,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 			g.recent = append(g.recent, tDone)
 			doc["id"] = rm.id
 			doc["hotel"] = h.cfg.ID
+			if pl.snapshotRef != "" {
+				doc["snapshot_id"] = pl.snapshotRef
+			}
 			queue, call := tDispatch.Sub(tRecv), tDone.Sub(tDispatch)
 			h.lat.queue = append(h.lat.queue, ms(queue))
 			h.lat.hotel = append(h.lat.hotel, ms(call))
@@ -495,8 +503,14 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, 400, "invalid_count", "count must be between 1 and 10000")
 		return
 	}
+	pl, perr := b.placementFor(r.Context(), g, payload)
+	if perr != nil {
+		writeErr(w, perr.status, perr.code, perr.msg)
+		return
+	}
+	pl.apply(payload)
 	if count == 1 {
-		res := b.createOne(r.Context(), g, payload, tRecv)
+		res := b.createOne(r.Context(), g, payload, tRecv, pl)
 		b.finishCreate(w, res, tRecv)
 		return
 	}
@@ -506,8 +520,9 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	for i := 0; i < count; i++ {
 		p := map[string]any{}
 		_ = json.Unmarshal(raw, &p)
+		pl.apply(p)
 		wg.Add(1)
-		go func(i int) { defer wg.Done(); results[i] = b.createOne(r.Context(), g, p, tRecv) }(i)
+		go func(i int) { defer wg.Done(); results[i] = b.createOne(r.Context(), g, p, tRecv, pl) }(i)
 	}
 	wg.Wait()
 	var docs []any
@@ -576,6 +591,10 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		return
 	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 256<<20))
+	if r.Method == "POST" && tail == "snapshot" {
+		b.roomSnapshot(w, r, g, h, hid, body)
+		return
+	}
 	path := "/v1/sandboxes/" + url.PathEscape(hid)
 	if tail != "" {
 		path += "/" + tail
@@ -1080,6 +1099,16 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 			b.handleQuota(w, r, g)
 		case p == "/v1/usage" && r.Method == "GET":
 			b.handleUsage(w, r, g)
+		case p == "/v1/images/prefetch" && r.Method == "POST":
+			b.handlePrefetch(w, r, g)
+		case strings.HasPrefix(p, "/v1/images/prefetch/") && r.Method == "GET":
+			b.handlePrefetchStatus(w, g, strings.TrimPrefix(p, "/v1/images/prefetch/"))
+		case p == "/v1/snapshots" && r.Method == "GET":
+			b.handleSnapshotList(w, r, g)
+		case strings.HasPrefix(p, "/v1/snapshots/"):
+			b.handleSnapshot(w, r, g, strings.TrimPrefix(p, "/v1/snapshots/"))
+		case p == "/v1/broker/hotels" && r.Method == "GET":
+			b.handleHotels(w, g)
 		case p == "/v1/broker/stats":
 			b.handleStats(w, r, g)
 		case p == "/v1/broker/probe" && r.Method == "POST":

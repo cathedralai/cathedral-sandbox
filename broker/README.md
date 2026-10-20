@@ -16,6 +16,51 @@ The broker does four things:
 Room ids are `<hotel id>.<hotel room id>`. The broker adds the label
 `broker_guest=<guest>` to each room it creates, and filters on it.
 
+## Hotel choice
+
+A create can limit the hotels it may use. The broker removes these fields
+before it calls the hotel.
+
+| Field | Meaning |
+|---|---|
+| `"hotels": ["a", "b"]` | Only these hotels. An unknown id gives 400 `unknown_hotel`. |
+| `"hotel_labels": {"sealed": "true"}` | Only hotels with every pair. |
+| `"exclude_hotel_labels": {"sealed": "true"}` | No hotel with any pair. |
+
+Hotel labels come from the `labels` object of each hotel in the config.
+`GET /v1/broker/hotels` lists hotel ids, labels and free rooms. When no
+hotel matches, the broker answers 409 `no_matching_hotel`. When the
+matching hotels are full, it answers 429 `no_free_rooms`. It never uses
+a hotel outside the choice.
+
+## Snapshots and forks
+
+A snapshot stays on the hotel that made it.
+
+| Route | What it does |
+|---|---|
+| `POST /v1/sandboxes/<room>/snapshot` | Snapshots the room on its hotel. The answer gives `snapshot_id` = `<hotel>.<hotel snapshot id>`. |
+| `POST /v1/sandboxes` with `snapshot_id` | Forks. The broker sends every room of the fork to the hotel in the id, and to no other hotel. A bare snapshot name also works when one hotel has it. |
+| `GET /v1/snapshots` | The guest's snapshots on all hotels. |
+| `DELETE /v1/snapshots/<id>` | Deletes the snapshot and its image on the hotel. |
+| `POST /v1/snapshots/<id>/push` | Pushes the snapshot image to a registry: `{"image": "<ref>", "registry_auth": {"username": "...", "password": "..."}}` (login optional). A create with that `image` can then go to any hotel. The image has the root file system only, not `/work`. |
+
+A guest sees, forks, pushes and deletes only its own snapshots (the broker
+labels each snapshot with the guest). An unknown or foreign snapshot gives
+404 `snapshot_not_found`. A fork whose hotel is full, draining or down gives
+503 `snapshot_hotel_unavailable`. A fork whose hotel is outside the hotel
+choice gives 409 `snapshot_hotel_excluded`.
+
+## Image prefetch
+
+`POST /v1/images/prefetch` with `{"images": [...]}` pulls the images on
+every hotel, or on the hotels that the hotel choice fields select. An
+optional `registry_auth` goes to the hotels for that pull only. The broker
+does not keep it and does not show it. The answer (202) gives a
+`prefetch_id`. `GET /v1/images/prefetch/<id>` gives the state on each
+hotel (`pulling`, `done` with image sizes, or `failed` with the error).
+The broker keeps a job for 24 hours, in memory.
+
 `GET /v1/broker/stats` gives per-hotel counts and latency percentiles
 (hotel call, wait in the broker queue, broker overhead). `POST` resets them.
 Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,

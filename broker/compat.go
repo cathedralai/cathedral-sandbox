@@ -352,7 +352,7 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		ttl = 48 * 3600
 	}
 	native["ttl_seconds"] = ttl
-	out := b.createOne(r.Context(), g, native, time.Now())
+	out := b.createOne(r.Context(), g, native, time.Now(), placement{})
 	if out.status != 202 {
 		code, msg := "create_failed", "the hotel refused the room"
 		if e, ok := out.doc["error"].(map[string]string); ok {
