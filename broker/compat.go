@@ -35,8 +35,8 @@ import (
 var compatAgents = []string{"cathedral-harbor/", "ctcli/"}
 
 const (
-	hotelExecMaxSeconds = 3600     // the hotel refuses a longer exec timeout
-	fileMaxBytes        = 64 << 20 // file and tar moves through exec, base64 encoded
+	defaultMaxExecSeconds = 14400    // Harbor asks for up to 4 hours; the hotels allow it by default
+	fileMaxBytes          = 64 << 20 // file and tar moves through exec, base64 encoded
 )
 
 func isCompat(r *http.Request) bool {
@@ -64,6 +64,14 @@ type compatImage struct {
 	CPU       float64
 	MemoryGiB float64
 	DiskGiB   float64
+	// A built image (build.go): the Dockerfile, the context and the build
+	// state on each hotel. The context is kept in state_dir, not in the state file.
+	Build      bool
+	Dockerfile string
+	buildCtx   []byte
+	ctxMissing bool
+	builds     map[string]*buildHotel
+	failedAt   map[string]time.Time
 }
 
 type compatExec struct {
@@ -157,8 +165,8 @@ func (b *broker) roomByUUID(g *guestState, id string) *room {
 
 // hotelExec runs one exec on a room's hotel and returns the hotel answer.
 func (b *broker) hotelExec(ctx context.Context, rm *room, body map[string]any, timeout int) (int, map[string]any, error) {
-	if timeout <= 0 || timeout > hotelExecMaxSeconds {
-		timeout = hotelExecMaxSeconds
+	if max := b.maxExec(); timeout <= 0 || timeout > max {
+		timeout = max
 	}
 	body["timeout_seconds"] = timeout
 	raw, _ := json.Marshal(body)
@@ -184,7 +192,7 @@ func (b *broker) serveCompat(w http.ResponseWriter, r *http.Request, g *guestSta
 	case p == "/v1/images/import" && r.Method == "POST":
 		b.compatImport(w, r, g)
 	case p == "/v1/images/build" && r.Method == "POST":
-		compatErr(w, 501, "build_not_supported", "central booking does not build images yet; use a prebuilt docker_image", 0)
+		b.compatBuild(w, r, g)
 	case strings.HasPrefix(p, "/v1/images/") && r.Method == "GET":
 		id := strings.TrimPrefix(p, "/v1/images/")
 		b.compat.mu.Lock()
@@ -194,7 +202,10 @@ func (b *broker) serveCompat(w http.ResponseWriter, r *http.Request, g *guestSta
 			compatErr(w, 404, "image_not_found", "no image "+id, 0)
 			return
 		}
-		writeJSON(w, 200, map[string]any{"image_id": img.ID, "state": "ready", "image": img.Ref})
+		if img.Build {
+			b.ensureBuilds(img)
+		}
+		writeJSON(w, 200, b.imageView(img))
 	case p == "/v1/sandboxes" && r.Method == "POST":
 		b.compatIdem(w, r, g, func(w http.ResponseWriter, body []byte) { b.compatCreate(w, r, g, body) })
 	case p == "/v1/sandboxes" && r.Method == "GET":
@@ -236,7 +247,7 @@ func (b *broker) compatCatalog(w http.ResponseWriter) {
 	}
 	writeJSON(w, 200, map[string]any{
 		"available": free > 0, "free_rooms": free, "max_lifetime_seconds": 23 * 3600, "cleanup_margin_seconds": 0,
-		"exec_output_limit_bytes": 16 << 20, "max_exec_seconds": hotelExecMaxSeconds,
+		"exec_output_limit_bytes": 16 << 20, "max_exec_seconds": b.maxExec(),
 		"templates": []any{tpl("room-1x4", 1, 4, "0.05"), tpl("room-2x8", 2, 8, "0.10"), tpl("room-4x16", 4, 16, "0.20")},
 	})
 }
@@ -264,6 +275,7 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 	b.compat.mu.Lock()
 	b.compat.images[img.ID] = img
 	b.compat.mu.Unlock()
+	b.markDirty()
 	// Warm every hotel in the background; a create pulls a missing image anyway.
 	pf, _ := json.Marshal(map[string]any{"images": []string{img.Ref}})
 	for _, ht := range b.hotels {
@@ -298,6 +310,7 @@ func (b *broker) compatIdem(w http.ResponseWriter, r *http.Request, g *guestStat
 			b.compat.mu.Unlock()
 		}
 		close(e.done)
+		b.markDirty()
 		for kk, v := range c.hdr {
 			w.Header()[kk] = v
 		}
@@ -322,15 +335,27 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	}
 	native := map[string]any{"labels": req["labels"]}
 	res := map[string]any{"vcpu": 1, "memory_gib": 4, "disk_gib": 10}
+	var pl placement
 	if id, _ := req["image_id"].(string); id != "" {
 		b.compat.mu.Lock()
 		img := b.compat.images[id]
+		ref := ""
+		if img != nil && img.Build {
+			// A built image is only on the hotels that built it.
+			pl.ids, ref = img.builtOn()
+		} else if img != nil {
+			ref = img.Ref
+		}
 		b.compat.mu.Unlock()
 		if img == nil {
 			compatErr(w, 404, "image_not_found", "no image "+id+"; import it first", 0)
 			return
 		}
-		native["image"] = img.Ref
+		if ref == "" {
+			compatErr(w, 409, "image_not_ready", "image "+id+" is not built yet; poll /v1/images/"+id, 5)
+			return
+		}
+		native["image"] = ref
 		res = map[string]any{"vcpu": img.CPU, "memory_gib": img.MemoryGiB, "disk_gib": img.DiskGiB}
 	} else if ref, _ := req["image"].(string); ref != "" {
 		native["image"] = ref
@@ -363,7 +388,7 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		ttl = 48 * 3600
 	}
 	native["ttl_seconds"] = ttl
-	out := b.createOne(r.Context(), g, native, time.Now(), placement{})
+	out := b.createOne(r.Context(), g, native, time.Now(), pl)
 	if out.status != 202 {
 		code, msg := "create_failed", "the hotel refused the room"
 		if e, ok := out.doc["error"].(map[string]string); ok {
@@ -500,10 +525,11 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		b.compat.mu.Lock()
 		b.compat.tombs[id] = compatTomb{bid: bid, at: time.Now()}
 		b.compat.mu.Unlock()
+		b.markDirty()
 		writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "cleanup_state": b.cleanupState(r.Context(), bid)})
 	case tail == "exec" && r.Method == "POST":
 		b.compatIdem(w, r, g, func(w http.ResponseWriter, raw []byte) {
-			body, timeout, err := compatExecBody(raw)
+			body, timeout, err := compatExecBody(raw, b.maxExec())
 			if err != nil {
 				compatErr(w, 400, "invalid_exec", err.Error(), 0)
 				return
@@ -612,7 +638,7 @@ func (b *broker) flushCompat(w http.ResponseWriter, c *capture, rm *room) {
 }
 
 // compatExecBody translates a client exec body to a hotel exec body.
-func compatExecBody(raw []byte) (map[string]any, int, error) {
+func compatExecBody(raw []byte, maxExec int) (map[string]any, int, error) {
 	var req map[string]any
 	if json.Unmarshal(raw, &req) != nil {
 		return nil, 0, fmt.Errorf("request body is not JSON")
@@ -630,7 +656,7 @@ func compatExecBody(raw []byte) (map[string]any, int, error) {
 			body[k] = v
 		}
 	}
-	timeout := hotelExecMaxSeconds
+	timeout := maxExec
 	if v, ok := req["timeout_seconds"].(float64); ok && v > 0 {
 		timeout = int(v)
 	}
@@ -638,7 +664,7 @@ func compatExecBody(raw []byte) (map[string]any, int, error) {
 }
 
 func (b *broker) compatExecStart(w http.ResponseWriter, rm *room, roomUUID string, raw []byte) {
-	body, timeout, err := compatExecBody(raw)
+	body, timeout, err := compatExecBody(raw, b.maxExec())
 	if err != nil {
 		compatErr(w, 400, "invalid_exec", err.Error(), 0)
 		return

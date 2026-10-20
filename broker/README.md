@@ -66,6 +66,22 @@ The broker keeps a job for 24 hours, in memory.
 Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
 `X-Broker-Hotel-Ms` and `X-Broker-Overhead-Ms`.
 
+## Client limits and state
+
+- Exec: the longest exec is `max_exec_seconds` in the config (default
+  14,400). Keep it at or below the hotel limit
+  `CATHEDRAL_SANDBOX_EXEC_TIMEOUT_MAX` (default 14,400).
+- Image build (client path): `POST /v1/images/build` takes the Dockerfile
+  and the build context. The broker asks each hotel that takes new rooms
+  to build it. The image is `ready` when one hotel has it, and a create
+  with it goes only to hotels that have it. A failed build gives state
+  `failed` with error `image_build_failed`.
+- With `state_dir` set, the broker keeps client room ids, Idempotency-Key
+  answers (48 hours), deleted-room tombstones and images in
+  `state_dir/client-state.json` (mode 0600), and build contexts in
+  `state_dir/build-contexts/`. After a restart, a repeated create with the
+  same key returns the first answer, and a room keeps its client id.
+
 ## Secrets
 
 - The config file is private (not in git). It holds hotel addresses, the

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -26,6 +27,10 @@ type fakeHotel struct {
 	failPull  bool
 	pullDelay time.Duration
 	n         int
+	execs     []map[string]any
+	builds    []map[string]any
+	failBuild bool
+	rooms     []map[string]any // id + labels, for the room list
 }
 
 func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -45,7 +50,23 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		f.n++
-		writeJSON(w, 202, map[string]any{"id": "sbx_" + string(rune('a'+f.n)), "state": "running", "snapshot_id": req["snapshot_id"]})
+		id := fmt.Sprintf("sbx_%d", f.n)
+		f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": req["labels"]})
+		writeJSON(w, 202, map[string]any{"id": id, "state": "running", "snapshot_id": req["snapshot_id"]})
+	case p == "/v1/sandboxes" && r.Method == "GET":
+		writeJSON(w, 200, map[string]any{"sandboxes": f.rooms})
+	case p == "/room/health" || p == "/v1/quota":
+		writeJSON(w, 200, map[string]any{})
+	case strings.HasSuffix(p, "/exec") && r.Method == "POST":
+		f.execs = append(f.execs, req)
+		writeJSON(w, 200, map[string]any{"exit_code": 0, "stdout": "", "stderr": "", "timed_out": false})
+	case p == "/v1/images/build" && r.Method == "POST":
+		f.builds = append(f.builds, req)
+		if f.failBuild {
+			writeErr(w, 502, "image_build_failed", "docker build failed")
+			return
+		}
+		writeJSON(w, 200, map[string]any{"image": "cathedral-build-0123456789abcdef:latest", "cached": false})
 	case strings.HasSuffix(p, "/snapshot") && r.Method == "POST":
 		f.n++
 		sid := "snap_" + string(rune('a'+f.n))
@@ -101,13 +122,17 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type testChain struct {
-	b      *broker
-	srv    *httptest.Server
-	hotels map[string]*fakeHotel
+	b       *broker
+	srv     *httptest.Server
+	hotels  map[string]*fakeHotel
+	cfgPath string
 }
 
 // newChain builds a broker over fake hotels "a" (sealed), "b" and "c".
-func newChain(t *testing.T) *testChain {
+func newChain(t *testing.T) *testChain { return newChainState(t, "") }
+
+// newChainState is newChain with a broker state_dir.
+func newChainState(t *testing.T, stateDir string) *testChain {
 	t.Helper()
 	dir := t.TempDir()
 	key := filepath.Join(dir, "hotel.key")
@@ -115,13 +140,13 @@ func newChain(t *testing.T) *testChain {
 		t.Fatal(err)
 	}
 	tc := &testChain{hotels: map[string]*fakeHotel{}}
-	cfg := config{Guests: []guestConfig{{ID: "g1", KeySHA256: sha("key1")}, {ID: "g2", KeySHA256: sha("key2")}}}
+	cfg := config{StateDir: stateDir, Guests: []guestConfig{{ID: "g1", KeySHA256: sha("key1")}, {ID: "g2", KeySHA256: sha("key2")}}}
 	for _, id := range []string{"a", "b", "c"} {
 		f := &fakeHotel{t: t, snaps: map[string]map[string]any{}}
 		hs := httptest.NewServer(f)
 		t.Cleanup(hs.Close)
 		tc.hotels[id] = f
-		hc := hotelConfig{ID: id, Name: id, API: hs.URL, KeyFile: key, Concurrency: 4}
+		hc := hotelConfig{ID: id, Name: id, API: hs.URL, Health: hs.URL, KeyFile: key, Concurrency: 4}
 		if id == "a" {
 			hc.Labels = map[string]string{"sealed": "true"}
 		}
@@ -132,8 +157,22 @@ func newChain(t *testing.T) *testChain {
 	if err := os.WriteFile(cfgPath, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	b, err := loadBroker(cfgPath)
+	tc.cfgPath = cfgPath
+	tc.start(t)
+	return tc
+}
+
+// start (or restart) the broker over the same hotels and config.
+func (tc *testChain) start(t *testing.T) {
+	t.Helper()
+	if tc.srv != nil {
+		tc.srv.Close()
+	}
+	b, err := loadBroker(tc.cfgPath)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.loadCompat(); err != nil {
 		t.Fatal(err)
 	}
 	for _, h := range b.hotels {
@@ -142,7 +181,6 @@ func newChain(t *testing.T) *testChain {
 	tc.b = b
 	tc.srv = httptest.NewServer(b)
 	t.Cleanup(tc.srv.Close)
-	return tc
 }
 
 func (tc *testChain) call(t *testing.T, key, method, path string, body any) (int, map[string]any) {

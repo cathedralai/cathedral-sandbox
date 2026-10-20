@@ -32,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -65,6 +66,16 @@ type config struct {
 	Hotels         []hotelConfig `json:"hotels"`
 	Guests         []guestConfig `json:"guests"`
 	InsecureCookie bool          `json:"insecure_cookie"` // true only for plain-HTTP local tests
+	// MaxExecSeconds is the longest exec the broker accepts (default 14,400).
+	// Keep it at or below the hotels' CATHEDRAL_SANDBOX_EXEC_TIMEOUT_MAX.
+	MaxExecSeconds int `json:"max_exec_seconds"`
+}
+
+func (b *broker) maxExec() int {
+	if b.cfg.MaxExecSeconds > 0 {
+		return b.cfg.MaxExecSeconds
+	}
+	return defaultMaxExecSeconds
 }
 
 // Room states. One byte each, so the live view can send a grid as a string.
@@ -145,6 +156,10 @@ type broker struct {
 	compat   *compatState
 	prefetch prefetchJobs
 	started  time.Time
+
+	// Durable client state (state.go).
+	savedUUIDs map[string]string // broker room id -> client id, from the state file
+	dirty      atomic.Bool
 }
 
 // A hotel counts as answering while its last good health answer is younger than okWindow.
@@ -162,9 +177,15 @@ func (b *broker) byBID(bid string) *room {
 // register gives a room its client UUID. Caller holds b.mu.
 func (b *broker) register(rm *room) {
 	if rm.uuid == "" {
-		rm.uuid = newUUID()
+		// After a restart, a room keeps the client id it had (state.go).
+		if u := b.savedUUIDs[rm.id]; u != "" && b.byUUID[u] == nil {
+			rm.uuid = u
+		} else {
+			rm.uuid = newUUID()
+		}
 	}
 	b.byUUID[rm.uuid] = rm
+	b.markDirty()
 }
 
 func sha(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }
@@ -281,6 +302,7 @@ func (h *hotel) place(r *room) {
 func (b *broker) release(h *hotel, r *room) {
 	if r.uuid != "" && b.byUUID[r.uuid] == r {
 		delete(b.byUUID, r.uuid)
+		b.markDirty()
 	}
 	h.release(r)
 }
@@ -602,6 +624,15 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	timeout := 2 * time.Minute
 	if strings.HasSuffix(tail, "exec") || strings.HasSuffix(tail, "wait") {
 		timeout = 20 * time.Minute
+		// A long exec must not lose its answer: wait for its own limit plus a margin.
+		var req struct {
+			Timeout float64 `json:"timeout_seconds"`
+		}
+		if json.Unmarshal(body, &req) == nil && req.Timeout > 0 {
+			if t := time.Duration(req.Timeout)*time.Second + 2*time.Minute; t > timeout {
+				timeout = t
+			}
+		}
 	}
 	var bodyArg []byte
 	if r.Method != "GET" && r.Method != "DELETE" {
@@ -1149,8 +1180,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	b.loadCaps()
 	ctx := context.Background()
+	b.loadCaps()
+	if err := b.loadCompat(); err != nil {
+		log.Printf("client state not loaded: %v", err)
+	}
+	go b.saveLoop(ctx)
 	for _, h := range b.hotels {
 		go b.syncLoop(ctx, h)
 	}
