@@ -72,6 +72,9 @@ type config struct {
 	// MaxExecSeconds is the longest exec the broker accepts (default 14,400).
 	// Keep it at or below the hotels' CATHEDRAL_SANDBOX_EXEC_TIMEOUT_MAX.
 	MaxExecSeconds int `json:"max_exec_seconds"`
+	// MaxQueueWaitSeconds: a create that waits longer than this for a create
+	// slot at its hotel moves to another eligible hotel (default 10; -1: never).
+	MaxQueueWaitSeconds float64 `json:"max_queue_wait_seconds"`
 	// OperatorKeySHA256 is the SHA-256 of the operator key. It allows hotel
 	// join, change and leave at runtime (hotels.go). Empty: no operator routes.
 	OperatorKeySHA256 string `json:"operator_key_sha256"`
@@ -140,6 +143,8 @@ type hotel struct {
 	failed       int
 	rejected     int
 	lat          latencies
+	createEWMA   float64            // seconds, moving average of the hotel create call (placement.go)
+	moved        int                // creates that left this hotel's queue for another hotel
 	runtime      bool               // joined at runtime (hotels.go), not from the config file
 	stop         context.CancelFunc // stops the sync loop when the hotel leaves
 }
@@ -331,30 +336,36 @@ func (h *hotel) release(r *room) {
 
 func (h *hotel) used() int { return len(h.rooms) + h.creating + h.queued }
 
-// pick a hotel at random, weight = free rooms, among the hotels that pl
-// allows. Caller holds b.mu.
+// pick a hotel at random among the hotels that pl allows. The weight is the
+// free rooms times the hotel's headroom (placement.go). Caller holds b.mu.
 func (b *broker) pick(exclude map[*hotel]bool, pl placement) *hotel {
 	now := time.Now()
-	total := 0
-	free := make([]int, len(b.hotelList()))
-	for i, h := range b.hotelList() {
+	hotels := b.hotelList()
+	total := 0.0
+	weight := make([]float64, len(hotels))
+	for i, h := range hotels {
 		if !h.ok || h.cfg.Drain || exclude[h] || now.Before(h.backoffUntil) || !pl.allows(h) {
 			continue
 		}
 		if f := h.slots - h.used(); f > 0 {
-			free[i] = f
-			total += f
+			weight[i] = h.weight(f)
+			total += weight[i]
 		}
 	}
-	if total == 0 {
+	if total <= 0 {
 		return nil
 	}
-	n := rand.IntN(total)
-	for i, f := range free {
-		if n < f {
-			return b.hotelList()[i]
+	n := rand.Float64() * total
+	for i, w := range weight {
+		if w > 0 && n < w {
+			return hotels[i]
 		}
-		n -= f
+		n -= w
+	}
+	for i := len(weight) - 1; i >= 0; i-- { // rounding: the last eligible hotel
+		if weight[i] > 0 {
+			return hotels[i]
+		}
 	}
 	return nil
 }
@@ -421,13 +432,10 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 		g.queued++
 		b.mu.Unlock()
 
-		select {
-		case h.sem <- struct{}{}:
-		case <-ctx.Done():
-			b.mu.Lock()
-			h.queued--
-			g.queued--
-			b.mu.Unlock()
+		// Wait for a create slot. A create that waits too long moves to
+		// another eligible hotel (placement.go).
+		h = b.waitSlot(ctx, g, h, pl, tried)
+		if h == nil {
 			return createResult{status: 499, doc: map[string]any{"error": map[string]string{"code": "client_gone", "message": "request cancelled"}}}
 		}
 		tDispatch := time.Now()
@@ -469,6 +477,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 			queue, call := tDispatch.Sub(tRecv), tDone.Sub(tDispatch)
 			h.lat.queue = append(h.lat.queue, ms(queue))
 			h.lat.hotel = append(h.lat.hotel, ms(call))
+			h.noteCreate(call)
 			b.mu.Unlock()
 			hdrs := http.Header{}
 			copyRoomHeaders(hdrs, hdr)

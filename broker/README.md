@@ -16,6 +16,18 @@ The broker does four things:
 Room ids are `<hotel id>.<hotel room id>`. The broker adds the label
 `broker_guest=<guest>` to each room it creates, and filters on it.
 
+## Placement
+
+- The broker picks a hotel at random. The weight is free rooms x CPU
+  headroom / (create time x (1 + expected queue wait)). CPU is the hotel
+  health value `host_cpu_pct`. Create time is a moving average of the hotel
+  create call. Expected queue wait is creates queued and running at the
+  broker / creates in flight allowed x create time. Before the first data,
+  the weight is free rooms.
+- A create that waits longer than `max_queue_wait_seconds` (config, default
+  10; -1 turns it off) for a create slot moves to another eligible hotel
+  with a free room. If there is none, it keeps waiting.
+
 ## Hotel choice
 
 A create can limit the hotels it may use. The broker removes these fields
