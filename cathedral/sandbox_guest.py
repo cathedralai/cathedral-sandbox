@@ -758,19 +758,30 @@ class DockerGuestProvider:
         docs = self._inner.create(
             request, api_key=api_key, idempotency=idempotency, body_digest=body_digest
         )
-        if "sandboxes" in docs:
-            started = []
-            for doc in docs["sandboxes"]:
+        batch = docs["sandboxes"] if "sandboxes" in docs else [docs]
+        started: list[dict[str, Any]] = []
+        try:
+            for doc in batch:
                 existing = self._guests.get(doc["id"])
                 if existing is not None:
                     started.append(self._enrich_doc(doc, existing))
                 else:
                     started.append(self._start_guest(doc, request))
+        except Exception:
+            # One failed guest fails the whole create. Release every record and
+            # guest of this batch, so no ghost holds quota, and forget the
+            # Idempotency-Key so a retry creates again.
+            for doc in batch:
+                self.delete(doc["id"])
+            if idempotency is not None:
+                with self._inner._lock:  # noqa: SLF001
+                    seen = self._inner._idempotency.get(idempotency)  # noqa: SLF001
+                    if seen is not None and seen[1] is docs:
+                        del self._inner._idempotency[idempotency]  # noqa: SLF001
+            raise
+        if "sandboxes" in docs:
             return {"sandboxes": started, "count": len(started)}
-        existing = self._guests.get(docs["id"])
-        if existing is not None:
-            return self._enrich_doc(docs, existing)
-        return self._start_guest(docs, request)
+        return started[0]
 
     def _enrich_doc(self, doc: dict[str, Any], guest: GuestRecord) -> dict[str, Any]:
         enriched = dict(doc)
@@ -825,26 +836,22 @@ class DockerGuestProvider:
         work = Path(self._inner._sandboxes[sandbox_id].root) / "work"  # noqa: SLF001
         name = f"cathedral-{sandbox_id}"
         entrypoint = None if dind else (tuple(request.entrypoint) if request.entrypoint else ("sleep", "infinity"))
-        try:
-            container_id = self._client.create_and_start(
-                image=image,
-                name=name,
-                work_dir=work,
-                vcpu=request.resources.vcpu,
-                memory_gib=request.resources.memory_gib,
-                disk_gib=request.resources.disk_gib,
-                network_mode=request.network.mode,
-                env=request.env,
-                dind=dind,
-                use_kata=self._use_kata,
-                entrypoint=entrypoint,
-                workdir=request.workdir,
-                user=request.user,
-                labels={LABEL_OWNER: self._owner, LABEL_SANDBOX_ID: sandbox_id},
-            )
-        except SandboxOpError:
-            self._inner.delete(sandbox_id)
-            raise
+        container_id = self._client.create_and_start(
+            image=image,
+            name=name,
+            work_dir=work,
+            vcpu=request.resources.vcpu,
+            memory_gib=request.resources.memory_gib,
+            disk_gib=request.resources.disk_gib,
+            network_mode=request.network.mode,
+            env=request.env,
+            dind=dind,
+            use_kata=self._use_kata,
+            entrypoint=entrypoint,
+            workdir=request.workdir,
+            user=request.user,
+            labels={LABEL_OWNER: self._owner, LABEL_SANDBOX_ID: sandbox_id},
+        )
         if not self._inner.has_record(sandbox_id):
             # GC or DELETE removed the record while the guest started. Do not
             # register an orphan; the reconcile pass retries if this rm fails.
@@ -860,12 +867,7 @@ class DockerGuestProvider:
         )
         if dind:
             self._capabilities_dind = True
-            try:
-                self._client.wait_dind_ready(container_id)
-            except SandboxOpError:
-                self._retire(sandbox_id)
-                self._remove_queued([sandbox_id])
-                raise
+            self._client.wait_dind_ready(container_id)
         # Guest start can take longer than a short idle_timeout; refresh activity
         # so idle GC does not reap a sandbox mid-create.
         with self._inner._lock:  # noqa: SLF001

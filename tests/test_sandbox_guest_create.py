@@ -1,14 +1,21 @@
 """DockerGuestProvider create path against a fake docker CLI (no daemon needed).
 
-Defect 1 from the 2026-10-20 pool qualification run: every create ran docker pull.
+Defects from the 2026-10-20 pool qualification run:
+1. every create ran docker pull;
+2. a pull failure left a ghost sandbox that held quota.
+
 """
 
 from __future__ import annotations
+
+import json
 
 import pytest
 
 from cathedral.sandbox_api import CreateSandboxRequest, ImageSource, PrefetchRequest, Resources
 from cathedral.sandbox_guest import DockerGuestProvider, mirror_ref
+from cathedral.sandbox_provider import SandboxOpError
+from cathedral.sandbox_server import SandboxApplication
 from tests.fake_docker_cli import FakeDocker, install
 
 
@@ -124,3 +131,47 @@ def test_registry_mirror_failure_falls_back_to_direct_pull(fake: FakeDocker, mon
 )
 def test_mirror_ref(image: str, want: str | None) -> None:
     assert mirror_ref("m.io/", image) == want
+
+
+# ---------------------------------------------------------------- D2: pull failure
+def test_pull_failure_releases_record_and_quota(fake: FakeDocker) -> None:
+    fake.set(pull_fail=["acme/missing:1"])
+    provider = DockerGuestProvider()
+    try:
+        with pytest.raises(SandboxOpError) as err:
+            _create(provider, image="acme/missing:1")
+        assert err.value.code == "image_pull_failed" and err.value.http_status == 502
+        assert provider.list(labels=[], state=None) == []
+        assert _resident(provider) == 0
+        assert fake.calls_of("run") == []
+    finally:
+        provider.close()
+
+
+def test_pull_failure_returns_stable_json_error_over_http(fake: FakeDocker) -> None:
+    fake.set(pull_fail=["acme/missing:1"])
+    provider = DockerGuestProvider()
+    app = SandboxApplication(provider)
+    try:
+        body = json.dumps({"image": "acme/missing:1"}).encode()
+        resp = app.dispatch("POST", "/v1/sandboxes", {"Authorization": "Bearer k"}, body)
+        assert resp.status == 502
+        assert json.loads(resp.body)["error"]["code"] == "image_pull_failed"
+        quota = json.loads(app.dispatch("GET", "/v1/quota", {"Authorization": "Bearer k"}, b"").body)
+        assert quota["usage"]["resident_sandboxes"] == 0
+    finally:
+        provider.close()
+
+
+def test_idempotent_retry_after_pull_failure_creates_again(fake: FakeDocker) -> None:
+    fake.set(pull_fail=["acme/flaky:1"])
+    provider = DockerGuestProvider()
+    try:
+        with pytest.raises(SandboxOpError):
+            _create(provider, image="acme/flaky:1", key="retry-key-0001")
+        fake.set(pull_fail=[])
+        doc = _create(provider, image="acme/flaky:1", key="retry-key-0001")
+        assert doc["guest"]["container_id"]
+        assert provider.get(doc["id"])["state"] == "running"
+    finally:
+        provider.close()
