@@ -521,7 +521,19 @@ def idempotency_digest(prefix: str, *parts: Sequence[object] | object) -> str:
 
 
 # ---------------------------------------------------------------- §3.2 exec / processes
-EXEC_MAX_TIMEOUT_SECONDS = 3600
+# Default exec time limit. Harbor tasks ask for up to 4 hours (#290). The
+# operator sets another limit with CATHEDRAL_SANDBOX_EXEC_TIMEOUT_MAX.
+EXEC_MAX_TIMEOUT_SECONDS = 14400
+
+
+def exec_max_timeout_seconds() -> int:
+    """The exec time limit of this server, in seconds."""
+    raw = os.environ.get("CATHEDRAL_SANDBOX_EXEC_TIMEOUT_MAX", "").strip()
+    try:
+        value = int(raw) if raw else EXEC_MAX_TIMEOUT_SECONDS
+    except ValueError:
+        return EXEC_MAX_TIMEOUT_SECONDS
+    return value if value >= 1 else EXEC_MAX_TIMEOUT_SECONDS
 # §3.2: output must be streamed or capped at a stated size >= 10 MiB with a truncated flag.
 STDOUT_MIN_CAP_BYTES = 10 * 1024 * 1024
 STDOUT_CAP_BYTES = 16 * 1024 * 1024
@@ -580,9 +592,9 @@ class ExecRequest:
             _require(
                 isinstance(self.timeout_seconds, int)
                 and not isinstance(self.timeout_seconds, bool)
-                and 1 <= self.timeout_seconds <= EXEC_MAX_TIMEOUT_SECONDS,
+                and 1 <= self.timeout_seconds <= exec_max_timeout_seconds(),
                 "invalid_timeout",
-                f"timeout_seconds must be between 1 and {EXEC_MAX_TIMEOUT_SECONDS}",
+                f"timeout_seconds must be between 1 and {exec_max_timeout_seconds()}",
             )
 
     @property
