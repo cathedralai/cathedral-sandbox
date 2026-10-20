@@ -33,6 +33,7 @@ type fakeHotel struct {
 	createDelay time.Duration
 	healthFail  bool
 	rooms       []map[string]any // id + labels, for the room list
+	networks    []map[string]any // bodies of PUT /v1/sandboxes/{id}/network
 }
 
 func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -67,6 +68,16 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "busy", "health did not answer")
 	case p == "/room/health" || p == "/v1/quota" || p == "/v1/status":
 		writeJSON(w, 200, map[string]any{})
+	case strings.HasSuffix(p, "/network") && r.Method == "PUT":
+		f.networks = append(f.networks, req)
+		if req["mode"] == "allowlist" && len(req["allow"].([]any)) > 0 && req["allow"].([]any)[0] == "::1" {
+			writeErr(w, 400, "invalid_network_allowlist", "IPv6 is not supported")
+			return
+		}
+		w.Header().Set("X-Room-Receipt", "signed-receipt")
+		policy := map[string]any{"mode": req["mode"], "allow": req["allow"]}
+		writeJSON(w, 200, map[string]any{"sandbox_id": strings.Split(p, "/")[3],
+			"network": map[string]any{"mode": req["mode"], "allow": req["allow"], "policy": policy, "policy_sha256": "abc"}})
 	case strings.HasSuffix(p, "/exec") && r.Method == "POST":
 		f.execs = append(f.execs, req)
 		writeJSON(w, 200, map[string]any{"exit_code": 0, "stdout": "", "stderr": "", "timed_out": false})

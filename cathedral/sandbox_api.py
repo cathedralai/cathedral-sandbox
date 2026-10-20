@@ -230,7 +230,88 @@ class Resources:
             )
 
 
-NETWORK_MODES = frozenset({"public", "none", "allowlist"})
+# Network modes. "internet", "deny_all" and "allowlist" are the room network
+# policy. "public" is the old name of "internet". "none" starts a guest with no
+# network interface at all; such a guest cannot switch policy later.
+NETWORK_MODES = frozenset({"public", "none", "allowlist", "internet", "deny_all"})
+NETWORK_MODE_ALIASES = MappingProxyType({"public": "internet"})
+NETWORK_ALLOW_MAX = 256
+_HOST_LABEL_RE = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
+
+
+def canonical_network_mode(mode: str) -> str:
+    """The policy name of *mode*: "public" is "internet"; other names stay."""
+    return NETWORK_MODE_ALIASES.get(mode, mode)
+
+
+def normalize_allow_entry(entry: object) -> str:
+    """Validate one allowlist entry and return its canonical form.
+
+    Accepted: a hostname ("pypi.org"), a leading wildcard ("*.pythonhosted.org",
+    which matches every name below the suffix but not the suffix itself), an
+    IPv4 address and an IPv4 CIDR. Hostnames are lower case with no trailing
+    dot. A CIDR is written in network form (10.1.2.3/8 is 10.0.0.0/8).
+    IPv6, URLs, ports and paths are refused.
+    """
+    import ipaddress
+
+    _require(isinstance(entry, str) and 1 <= len(entry) <= 255, "invalid_network_allowlist",
+             "allowlist entries must be non-empty strings of at most 255 characters")
+    value = entry.strip().lower().rstrip(".")
+    bad = f"allowlist entry {entry!r} is not a hostname, *.wildcard, IPv4 address or IPv4 CIDR"
+    _require(bool(value), "invalid_network_allowlist", bad)
+    if "/" in value:
+        try:
+            net = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            raise SandboxContractError("invalid_network_allowlist", bad) from None
+        _require(net.version == 4, "invalid_network_allowlist", f"allowlist entry {entry!r}: IPv6 is not supported")
+        return str(net)
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        addr = None
+    if addr is not None:
+        _require(addr.version == 4, "invalid_network_allowlist", f"allowlist entry {entry!r}: IPv6 is not supported")
+        return str(addr)
+    _require(":" not in value and "[" not in value, "invalid_network_allowlist", bad)
+    name = value[2:] if value.startswith("*.") else value
+    labels = name.split(".")
+    _require(len(name) <= 253 and len(labels) >= 2 and all(_HOST_LABEL_RE.match(lb) for lb in labels),
+             "invalid_network_allowlist", bad)
+    _require(not labels[-1].isdigit(), "invalid_network_allowlist", bad)
+    return value
+
+
+def canonical_network_policy(mode: str, allow: Sequence[str] = ()) -> dict[str, object]:
+    """The canonical policy document: mode name and the sorted, unique,
+    normalized allowlist (empty for every mode except "allowlist")."""
+    mode = canonical_network_mode(mode)
+    entries = sorted({normalize_allow_entry(e) for e in allow}) if mode == "allowlist" else []
+    return {"mode": mode, "allow": entries}
+
+
+def network_policy_sha256(policy: Mapping[str, object]) -> str:
+    """sha256 of the canonical JSON of *policy* (sort_keys, no spaces, UTF-8)."""
+    import json
+
+    raw = json.dumps(dict(policy), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _validate_network(mode: str, allow: Sequence[str]) -> None:
+    _require(mode in NETWORK_MODES, "invalid_network_mode",
+             "mode must be internet, deny_all, allowlist, none or public (old name of internet)")
+    _require(len(allow) <= NETWORK_ALLOW_MAX, "invalid_network_allowlist",
+             f"allowlist must be bounded to {NETWORK_ALLOW_MAX} entries")
+    if mode == "allowlist":
+        _require(bool(allow), "invalid_network_allowlist", "allowlist mode requires at least one entry")
+        for entry in allow:
+            normalize_allow_entry(entry)
+    else:
+        for entry in allow:
+            _require(isinstance(entry, str) and 1 <= len(entry) <= 255, "invalid_network_allowlist",
+                     "allowlist entries must be non-empty strings")
 
 
 @dataclass(frozen=True)
@@ -241,16 +322,11 @@ class NetworkSpec:
     allow: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        _require(self.mode in NETWORK_MODES, "invalid_network_mode", "mode must be public, none, or allowlist")
-        _require(len(self.allow) <= 256, "invalid_network_allowlist", "allowlist must be bounded to 256 entries")
-        for entry in self.allow:
-            _require(
-                isinstance(entry, str) and 1 <= len(entry) <= 255,
-                "invalid_network_allowlist",
-                "allowlist entries must be non-empty strings",
-            )
-        if self.mode == "allowlist":
-            _require(bool(self.allow), "invalid_network_allowlist", "allowlist mode requires at least one entry")
+        _validate_network(self.mode, self.allow)
+
+    @property
+    def policy(self) -> dict[str, object]:
+        return canonical_network_policy(self.mode, self.allow)
 
 
 # ---------------------------------------------------------------- §3.1 / §3.4 / §3.5 create
@@ -746,10 +822,11 @@ class NetworkPatch:
     allow: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        _require(self.mode in NETWORK_MODES, "invalid_network_mode", "mode must be public, none, or allowlist")
-        _require(len(self.allow) <= 256, "invalid_network_allowlist", "allowlist must be bounded to 256 entries")
-        if self.mode == "allowlist":
-            _require(bool(self.allow), "invalid_network_allowlist", "allowlist mode requires at least one entry")
+        _validate_network(self.mode, self.allow)
+
+    @property
+    def policy(self) -> dict[str, object]:
+        return canonical_network_policy(self.mode, self.allow)
 
 
 PORT_MIN, PORT_MAX = 1, 65535
@@ -860,6 +937,7 @@ class StatusReport:
     kernel_isolation: bool = False
     dind: bool = False
     disk_enforced: bool = False
+    network_allowlist_enforced: bool = False
 
     def to_document(self) -> Mapping[str, object]:
         return MappingProxyType(
@@ -872,8 +950,9 @@ class StatusReport:
                 "kernel_isolation": self.kernel_isolation,
                 "dind": self.dind,
                 "disk_enforced": self.disk_enforced,
-                # Honest: allowlist mode maps to network=none until an egress proxy exists.
-                "network_allowlist_enforced": False,
+                # False: allowlist and deny_all fail closed to network none.
+                # True: a hotel egress daemon enforces them outside the guest.
+                "network_allowlist_enforced": self.network_allowlist_enforced,
             }
         )
 
@@ -1021,6 +1100,11 @@ __all__ = [
     "Metrics",
     "MODAL_TARGET_DISCOUNT",
     "NETWORK_MODES",
+    "NETWORK_MODE_ALIASES",
+    "canonical_network_mode",
+    "canonical_network_policy",
+    "network_policy_sha256",
+    "normalize_allow_entry",
     "NetworkPatch",
     "NetworkSpec",
     "PORT_MAX",

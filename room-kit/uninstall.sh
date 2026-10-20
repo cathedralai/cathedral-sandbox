@@ -16,7 +16,7 @@ STATE=$ROOM_ETC/install-state
 log() { echo "[room-kit] $*"; }
 
 # One unit at a time: a unit that is missing (e.g. Caddy with ROOM_TLS=off) must not stop the others.
-for u in "$ROOM_ID-receipts.service" "$ROOM_ID-reaper.timer" "$ROOM_ID-caddy.service" "$ROOM_ID-health.service" "$ROOM_ID.service"; do
+for u in "$ROOM_ID-receipts.service" "$ROOM_ID-reaper.timer" "$ROOM_ID-caddy.service" "$ROOM_ID-health.service" "$ROOM_ID.service" "$ROOM_ID-egress.service"; do
   systemctl disable --now "$u" 2>/dev/null || systemctl stop "$u" 2>/dev/null || true
 done
 if [ -S $SOCK ]; then
@@ -26,6 +26,9 @@ if [ -S $SOCK ]; then
 fi
 systemctl disable --now "$ROOM_ID-docker.service" 2>/dev/null
 $ROOM_OPT/bin/room-net.sh down $ROOM_ETC/room.env 2>/dev/null || true
+EGRESS_TABLE="pool_room_egress_$(echo "$ROOM_ID" | tr -c 'a-zA-Z0-9\n' '_')"
+nft delete table ip "$EGRESS_TABLE" 2>/dev/null; nft delete table bridge "$EGRESS_TABLE" 2>/dev/null
+rm -rf /run/pool-room-egress
 # The containerd namespace of the room daemon (metadata only).
 if command -v ctr >/dev/null; then
   for ns in "pool-room-$ROOM_ID" "pool-room-$ROOM_ID-plugins"; do
@@ -43,7 +46,7 @@ if [ -z "${ROOM_DATA_DEVICE:-}" ]; then
   if [ $KEEP_DATA = 0 ] && grep -qxF "file:$ROOM_DATA_IMG" "$STATE"; then rm -f "$ROOM_DATA_IMG"; log "deleted $ROOM_DATA_IMG"; fi
 fi
 rmdir "$ROOM_DATA_DIR" 2>/dev/null || true
-for u in "$ROOM_ID-receipts.service" "$ROOM_ID.service" "$ROOM_ID-health.service" "$ROOM_ID-caddy.service" "$ROOM_ID-reaper.service" "$ROOM_ID-reaper.timer" "$ROOM_ID-docker.service" "$ROOM_ID-data.service"; do
+for u in "$ROOM_ID-receipts.service" "$ROOM_ID-egress.service" "$ROOM_ID.service" "$ROOM_ID-health.service" "$ROOM_ID-caddy.service" "$ROOM_ID-reaper.service" "$ROOM_ID-reaper.timer" "$ROOM_ID-docker.service" "$ROOM_ID-data.service"; do
   rm -f "/etc/systemd/system/$u"
 done
 systemctl daemon-reload

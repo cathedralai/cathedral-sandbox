@@ -169,6 +169,9 @@ SIGNED = [  # (method, path pattern, action)
     ("POST", re.compile("^" + ROOM + r"/exec$"), "exec"),
     ("POST", re.compile("^" + ROOM + r"/processes$"), "process_start"),
     ("DELETE", re.compile("^" + ROOM + r"$"), "delete"),
+    ("PUT", re.compile("^" + ROOM + r"/network$"), "network_set"),
+    ("POST", re.compile("^" + ROOM + r"/network$"), "network_set"),
+    ("PATCH", re.compile("^" + ROOM + r"/network$"), "network_set"),
     ("DELETE", re.compile(r"^/v1/sandboxes$"), "bulk_delete"),
 ]
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
@@ -284,6 +287,7 @@ class Handler(BaseHTTPRequestHandler):
         sandbox = m["id"] if m else (res.get("id") if isinstance(res, dict) else None)
         command = (req.get("cmd", req.get("command")) if isinstance(req, dict) else None)
         image = req.get("image") if action == "create" and isinstance(req, dict) else None
+        policy = self.network_policy(action, status, res)
         return {
             "action": action,
             "target": f"{self.command} {self.path}",
@@ -294,7 +298,21 @@ class Handler(BaseHTTPRequestHandler):
             "image_digest": self.server.image_digest(image) if image and status in (200, 201, 202) else None,
             "status": status,
             "result_sha256": sha(out),
+            # Create and network switch: the egress policy the hotel applied
+            # (canonical {"mode", "allow"}) and its sha256. The sha256 is
+            # computed here from the policy, not copied from the API.
+            **({"network_policy": policy, "network_policy_sha256": sha(canonical(policy))} if policy else {}),
         }
+
+    @staticmethod
+    def network_policy(action: str, status: int, res) -> dict | None:
+        if action not in ("create", "network_set") or not 200 <= status < 300 or not isinstance(res, dict):
+            return None
+        net = res.get("network")
+        policy = net.get("policy") if isinstance(net, dict) else None
+        if not (isinstance(policy, dict) and isinstance(policy.get("mode"), str) and isinstance(policy.get("allow"), list)):
+            return None
+        return {"mode": policy["mode"], "allow": [str(x) for x in policy["allow"]]}
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = handle_any
 

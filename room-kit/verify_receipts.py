@@ -14,6 +14,9 @@ Checks, in order:
      sha256(canonical(statement)), the Ed25519 signature verifies with the
      binding's receipt key, and the chain links (sequence 1 links to the
      binding; each next receipt links to the one before).
+  5. network policy: each create and network_set receipt that carries
+     network_policy has network_policy_sha256 = sha256(canonical(policy)).
+     The output has the policy timeline of each room, in chain order.
 
 Not checked here (by design, today): that the measurement is an approved image.
 Image approval is a signed policy release; that is a later step.
@@ -209,6 +212,31 @@ def verify_receipts(att: dict, receipts: list[dict], head: str | None = None) ->
             "actions": actions}
 
 
+def policy_timeline(receipts: list[dict]) -> dict:
+    """Room id -> the signed policy events of that room, in chain order.
+
+    A room enters the timeline with a create or network_set receipt that
+    carries a network policy. Its delete receipt closes the timeline."""
+    out: dict[str, list[dict]] = {}
+    for rc in sorted(receipts, key=lambda r: r["statement"]["sequence"]):
+        st = rc["statement"]
+        room = st.get("sandbox_id")
+        if not room:
+            continue
+        policy = st.get("network_policy")
+        if policy is not None:
+            need(st.get("network_policy_sha256") == sha(canonical(policy)),
+                 f"receipt {st['sequence']}: network_policy_sha256 does not match the policy")
+            out.setdefault(room, []).append({
+                "sequence": st["sequence"], "issued_at": st["issued_at"], "action": st["action"],
+                "status": st["status"], "mode": policy["mode"], "allow": policy["allow"],
+                "policy_sha256": st["network_policy_sha256"]})
+        elif room in out and st["action"] == "delete":
+            out[room].append({"sequence": st["sequence"], "issued_at": st["issued_at"], "action": "delete",
+                              "status": st["status"]})
+    return out
+
+
 def get(url: str, key: str) -> dict:
     req = urllib.request.Request(url, headers={"Authorization": "Bearer " + key})
     with urllib.request.urlopen(req, timeout=60) as resp:
@@ -270,7 +298,8 @@ def main() -> int:
             receipts.append(json.loads(base64.urlsafe_b64decode(h + "=" * (-len(h) % 4))))
         out = {"attestation": verify_attestation(att, a.expected_measurement, a.product, a.kds_cache,
                                                  a.ark_sha256, a.skip_amd),
-               "chain": verify_receipts(att, receipts, head), "verdict": "PASS"}
+               "chain": verify_receipts(att, receipts, head),
+               "policy_timeline": policy_timeline(receipts), "verdict": "PASS"}
         print(json.dumps(out, indent=1))
         return 0
     except Fail as exc:

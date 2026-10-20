@@ -20,6 +20,9 @@ TAG="pool-room:$ROOM_ID"
 NET_BR_PREFIX=${ROOM_NET_BRIDGE_PREFIX:-rmnet}
 read -r -a EXTRA_NETS <<< "${ROOM_NETS:-}"
 NFT_TABLE="pool_room_$(echo "$ROOM_ID" | tr -c 'a-zA-Z0-9\n' '_')"
+EGRESS_DNS_PORT=${ROOM_EGRESS_DNS_PORT:-15353}
+EGRESS_HTTP_PORT=${ROOM_EGRESS_HTTP_PORT:-15080}
+EGRESS_TLS_PORT=${ROOM_EGRESS_TLS_PORT:-15443}
 
 del_all() { while iptables "$@" 2>/dev/null; do :; done; }
 
@@ -83,6 +86,10 @@ guard() {
   iptables -A "$CHAIN" -o "$br" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
   iptables -A "$CHAIN" -o "$br" -j DROP
   iptables -A "$CHAIN" -i "$br" -j DROP
+  # The hotel egress daemon (room_egress.py) serves DNS and the egress proxy
+  # on the bridge gateway. Its own nftables table redirects fenced rooms there.
+  iptables -I "$CHAIN_IN" 1 -i "$br" -p udp --dport "$EGRESS_DNS_PORT" -j ACCEPT
+  iptables -I "$CHAIN_IN" 1 -i "$br" -p tcp -m multiport --dports "$EGRESS_DNS_PORT,$EGRESS_HTTP_PORT,$EGRESS_TLS_PORT" -j ACCEPT
   iptables -I INPUT 1 -i "$br" -j "$CHAIN_IN" -m comment --comment "$TAG"
   iptables -t nat -A POSTROUTING -s "$net" ! -o "$br" -j MASQUERADE -m comment --comment "$TAG"
   # Guest to guest on the same bridge is layer 2 and skips iptables unless

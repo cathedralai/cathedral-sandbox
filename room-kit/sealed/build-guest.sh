@@ -22,7 +22,7 @@ OUT=$SEALED_DIR/images/$STAMP
 mkdir -p "$B" "$OUT"
 
 # ---------------------------------------------------------------- 1. base root file system (cached)
-PKGS=systemd,systemd-sysv,udev,kmod,iproute2,nftables,iptables,docker.io,containerd,xfsprogs,cryptsetup-bin,curl,ca-certificates,bzip2,python3,procps,util-linux,iputils-ping,linux-image-virtual,openssh-server,less,tar,gzip,zstd,passwd,dmsetup
+PKGS=systemd,systemd-sysv,udev,kmod,iproute2,nftables,iptables,conntrack,docker.io,containerd,xfsprogs,cryptsetup-bin,curl,ca-certificates,bzip2,python3,procps,util-linux,iputils-ping,linux-image-virtual,openssh-server,less,tar,gzip,zstd,passwd,dmsetup
 BASE_ID=$(echo "$SEALED_SUITE $SEALED_MIRROR $PKGS" | sha256sum | cut -c1-12)
 if [ ! -d "$B/base-$BASE_ID" ]; then
   log "mmdebstrap $SEALED_SUITE (base $BASE_ID)"

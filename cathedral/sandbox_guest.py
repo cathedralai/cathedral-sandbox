@@ -38,11 +38,15 @@ from cathedral.sandbox_api import (
     FileGet,
     NetworkPatch,
     PrefetchRequest,
+    canonical_network_mode,
+    canonical_network_policy,
+    network_policy_sha256,
     ProcessHandle,
     SandboxContractError,
     StatusReport,
     TarGet,
 )
+from cathedral.sandbox_egress import EgressClient
 from cathedral.sandbox_provider import (
     InMemorySandboxProvider,
     SandboxOpError,
@@ -297,6 +301,11 @@ class GuestRecord:
     work_mount: Path
     network_mode: str = "public"
     network: str | None = None  # room network that holds the guest's port (pool only)
+    # The guest has a network interface (a bridge port). With an egress daemon
+    # its policy can switch live; a guest started with "none" has no interface.
+    attached: bool = True
+    policy: dict[str, Any] | None = None  # canonical policy the egress daemon applied
+    policy_sha256: str | None = None
     guest_processes: dict[str, Path] = field(default_factory=dict)
     # How this guest's image runs a command under a time limit: "gnu"
     # (timeout N), "busybox" (timeout -t N) or "none". None: not probed yet.
@@ -520,6 +529,7 @@ class DockerClient:
         labels: Mapping[str, str] | None = None,
         network: str | None = None,
         resolv_conf: Path | None = None,
+        attach: bool | None = None,
     ) -> str:
         work_dir.mkdir(parents=True, exist_ok=True)
         argv = [
@@ -564,8 +574,12 @@ class DockerClient:
         # Prefer storage quota when the local driver accepts it (overlay2+xfs usually).
         storage_opt = ["--storage-opt", f"size={disk_gib}G"] if disk_gib > 0 and not use_kata else []
         argv.extend(storage_opt)
-        # allowlist fails closed to none until an egress proxy lands (honest).
-        if network_mode in {"none", "allowlist"}:
+        # Without a hotel egress daemon, allowlist and deny_all fail closed to
+        # network none. With one, the caller passes attach=True and the daemon
+        # enforces the policy outside the guest.
+        if attach is None:
+            attach = canonical_network_mode(network_mode) == "internet"
+        if not attach:
             argv.extend(["--network", "none"])
         elif network:
             argv.extend(["--network", network])
@@ -911,6 +925,11 @@ class DockerGuestProvider:
         # Room networks (see RoomNetworkPool). A port is held from the start of
         # docker run until the container is confirmed gone.
         self._net_pool = RoomNetworkPool.from_env()
+        # Hotel egress daemon (sandbox_egress.py). With it, internet, deny_all
+        # and allowlist guests all get a bridge port, and the daemon enforces
+        # the policy outside the guest. Without it, only internet guests get a
+        # port and the other modes fail closed to network none.
+        self._egress = EgressClient.from_env()
         self._doomed_nets: dict[str, str | None] = {}  # sandbox_id -> network of a queued removal
         self._net_pending: dict[str, str] = {}  # sandbox_id -> network while docker run runs
         self._doomed_attempts: dict[str, int] = {}
@@ -1124,16 +1143,50 @@ class DockerGuestProvider:
     def _enrich_doc(self, doc: dict[str, Any], guest: GuestRecord) -> dict[str, Any]:
         enriched = dict(doc)
         enriched["runtime"] = "kata" if self._use_kata else "docker"
+        fail_closed = not self._egress_manages(guest) and canonical_network_mode(guest.network_mode) in {"allowlist", "deny_all"}
         enriched["guest"] = {
             "container_id": guest.container_id,
             "image": guest.image,
             "dind": guest.dind,
             "network_mode": guest.network_mode,
             "network_name": guest.network,
-            "network_enforced": guest.network_mode != "allowlist",
-            "allowlist_fail_closed": guest.network_mode == "allowlist",
+            "network_enforced": True,
+            "allowlist_fail_closed": fail_closed,
+            "network_switchable": self._egress_manages(guest),
         }
+        net = dict(enriched.get("network") or {"mode": guest.network_mode, "allow": []})
+        net.update(self._policy_doc(guest))
+        enriched["network"] = net
         return enriched
+
+    def _egress_manages(self, guest: GuestRecord) -> bool:
+        return self._egress is not None and guest.attached
+
+    def _policy_doc(self, guest: GuestRecord) -> dict[str, Any]:
+        """The canonical policy that holds for *guest* and its sha256.
+
+        With the egress daemon this is the policy the daemon applied. Without
+        it, a guest with no interface has the policy of what it can reach:
+        deny_all.
+        """
+        if guest.policy is not None:
+            policy = guest.policy
+        elif guest.attached:
+            policy = canonical_network_policy("internet")
+        else:
+            policy = canonical_network_policy("deny_all")
+        return {
+            "policy": policy,
+            "policy_sha256": guest.policy_sha256 or network_policy_sha256(policy),
+            "enforced_by": "hotel_egress" if self._egress_manages(guest) else ("bridge" if guest.attached else "no_interface"),
+        }
+
+    def _attach_for(self, mode: str) -> bool:
+        """Give the guest a network interface for *mode*."""
+        mode = canonical_network_mode(mode)
+        if mode == "none":
+            return False
+        return mode == "internet" or self._egress is not None
 
     def _ensure_image(
         self, image: str, *, registry_auth: Mapping[str, str] | None = None, refresh: bool = False
@@ -1181,7 +1234,8 @@ class DockerGuestProvider:
         name = f"cathedral-{sandbox_id}"
         entrypoint = None if dind else (tuple(request.entrypoint) if request.entrypoint else ("sleep", "infinity"))
         network = None
-        if self._net_pool is not None and request.network.mode not in {"none", "allowlist"}:
+        attach = self._attach_for(request.network.mode)
+        if self._net_pool is not None and attach:
             self._net_pool.ensure(self._client)
             network = self._net_pool.acquire()
             with self._doomed_lock:
@@ -1189,11 +1243,22 @@ class DockerGuestProvider:
         try:
             container_id = self._start_container(
                 request, sandbox_id=sandbox_id, image=image, name=name, work=work, dind=dind,
-                entrypoint=entrypoint, network=network,
+                entrypoint=entrypoint, network=network, attach=attach,
             )
         except BaseException:
             self._release_pending(sandbox_id)
             raise
+        applied: dict[str, Any] | None = None
+        if attach and self._egress is not None:
+            # The daemon denies a new guest by default. Open it to its policy
+            # now; on failure the guest goes, so no guest runs unmanaged.
+            try:
+                applied = self._egress.apply(container_id, sandbox_id, request.network.policy)
+            except BaseException:
+                self._client.remove_confirmed(container_id, timeout=self._rm_timeout)
+                self._egress.forget(container_id)
+                self._release_pending(sandbox_id)
+                raise
         if not self._inner.has_record(sandbox_id):
             # GC or DELETE removed the record while the guest started. Do not
             # register an orphan; the reconcile pass retries if this rm fails.
@@ -1210,6 +1275,9 @@ class DockerGuestProvider:
             work_mount=work,
             network_mode=request.network.mode,
             network=network,
+            attached=attach,
+            policy=applied["policy"] if applied else None,
+            policy_sha256=applied["policy_sha256"] if applied else None,
         )
         return self._after_start(doc, sandbox_id, container_id, dind)
 
@@ -1230,6 +1298,7 @@ class DockerGuestProvider:
         dind: bool,
         entrypoint: tuple[str, ...] | None,
         network: str | None,
+        attach: bool | None = None,
     ) -> str:
         resolv_conf = None
         if network and self._net_pool is not None and self._net_pool.dns:
@@ -1254,6 +1323,7 @@ class DockerGuestProvider:
             labels={LABEL_OWNER: self._owner, LABEL_SANDBOX_ID: sandbox_id},
             network=network,
             resolv_conf=resolv_conf,
+            attach=attach,
         )
 
     def _after_start(self, doc: dict[str, Any], sandbox_id: str, container_id: str, dind: bool) -> dict[str, Any]:
@@ -1495,28 +1565,57 @@ class DockerGuestProvider:
         return {"snapshot_id": snap_id, "image": image, "digest": digest, "includes_work": False}
 
     def set_network(self, sandbox_id: str, patch: NetworkPatch) -> dict[str, Any]:
-        doc = self._inner.set_network(sandbox_id, patch)
         guest = self._guests.get(sandbox_id)
+        if guest is not None and self._egress is not None:
+            return self._switch_policy(sandbox_id, guest, patch)
+        doc = self._inner.set_network(sandbox_id, patch)
         if guest is not None and self._net_pool is not None:
-            if patch.mode in {"none", "allowlist"}:
-                self._client.set_network(guest.container_id, patch.mode)
+            if not self._attach_for(patch.mode):
+                self._client.set_network(guest.container_id, "none")
                 self._net_pool.release(guest.network)
                 guest.network = None
+                guest.attached = False
             elif guest.network is None:
                 self._net_pool.ensure(self._client)
                 network = self._net_pool.acquire()
                 try:
-                    self._client.set_network(guest.container_id, patch.mode, network)
+                    self._client.set_network(guest.container_id, "public", network)
                 except BaseException:
                     self._net_pool.release(network)
                     raise
                 guest.network = network
+                guest.attached = True
             guest.network_mode = patch.mode
         elif guest is not None:
-            self._client.set_network(guest.container_id, patch.mode)
+            attach = self._attach_for(patch.mode)
+            self._client.set_network(guest.container_id, "public" if attach else "none")
             guest.network_mode = patch.mode
-            doc["network"]["enforced"] = patch.mode != "allowlist"
-            doc["network"]["allowlist_fail_closed"] = patch.mode == "allowlist"
+            guest.attached = attach
+            doc["network"]["enforced"] = True
+            doc["network"]["allowlist_fail_closed"] = canonical_network_mode(patch.mode) in {"allowlist", "deny_all"}
+        if guest is not None:
+            doc["network"].update(self._policy_doc(guest))
+        return doc
+
+    def _switch_policy(self, sandbox_id: str, guest: GuestRecord, patch: NetworkPatch) -> dict[str, Any]:
+        """Live switch through the egress daemon. The guest keeps its interface;
+        only the rules outside it change. "none" on a live guest means deny_all."""
+        if not guest.attached:
+            raise SandboxOpError(
+                "network_not_switchable",
+                409,
+                f"sandbox {sandbox_id} was created with network none and has no interface; "
+                "create it with deny_all to switch its policy later",
+            )
+        mode = "deny_all" if patch.mode == "none" else patch.mode
+        policy = canonical_network_policy(mode, patch.allow)
+        applied = self._egress.apply(guest.container_id, sandbox_id, policy)
+        guest.policy, guest.policy_sha256 = applied["policy"], applied["policy_sha256"]
+        guest.network_mode = mode
+        doc = self._inner.set_network(sandbox_id, NetworkPatch(mode=mode, allow=tuple(patch.allow)))
+        doc["network"].update(self._policy_doc(guest))
+        if applied.get("applied_at"):
+            doc["network"]["applied_at"] = applied["applied_at"]
         return doc
 
     def freeze(self, sandbox_id: str) -> dict[str, Any]:
@@ -1581,6 +1680,10 @@ class DockerGuestProvider:
         if guest is None:
             self._inner.finish_delete(sandbox_id)
             return True
+        if self._egress is not None and guest.attached:
+            # Deny the leaving guest at once, so its address carries no policy
+            # to the next guest that gets it.
+            self._egress.forget(guest.container_id)
         with self._doomed_lock:
             self._doomed[sandbox_id] = guest.container_id
             self._doomed_nets[sandbox_id] = guest.network
@@ -1751,6 +1854,7 @@ class DockerGuestProvider:
             kernel_isolation=self._use_kata or runtime_has_kernel_isolation(self._oci_runtime),
             dind=self.capabilities_dind,
             disk_enforced=True,
+            network_allowlist_enforced=self._egress is not None,
         )
 
     def prefetch(self, request: PrefetchRequest) -> str:

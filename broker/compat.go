@@ -243,9 +243,15 @@ func (b *broker) compatCatalog(w http.ResponseWriter) {
 	b.mu.Unlock()
 	tpl := func(name string, cpu, mem int, rate string) map[string]any {
 		return map[string]any{"name": name, "resources": map[string]any{"cpu": cpu, "memory_gib": mem}, "hourly_rate_usd": rate,
-			"network_modes": []string{"internet", "deny_all"}}
+			"network_modes": []string{"internet", "deny_all", "allowlist"}}
 	}
 	writeJSON(w, 200, map[string]any{
+		// Each hotel enforces the room policy outside the room (nftables,
+		// a hotel DNS resolver and an SNI/HTTP egress proxy) and can switch
+		// it live: PUT /v1/sandboxes/{id}/network.
+		"dynamic_network_policy": true,
+		"network_allowlist": map[string]any{"hostnames": true, "wildcard_hostnames": true, "ipv4_addresses": true,
+			"ipv4_cidrs": true, "ipv6": false, "hostname_ports": []int{80, 443}},
 		"available": free > 0, "free_rooms": free, "max_lifetime_seconds": 23 * 3600, "cleanup_margin_seconds": 0,
 		"exec_output_limit_bytes": 16 << 20, "max_exec_seconds": b.maxExec(),
 		"templates": []any{tpl("room-1x4", 1, 4, "0.05"), tpl("room-2x8", 2, 8, "0.10"), tpl("room-4x16", 4, 16, "0.20")},
@@ -374,12 +380,12 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		return
 	}
 	native["resources"] = res
-	switch req["network"] {
-	case "deny_all", "none":
-		native["network"] = map[string]any{"mode": "none"}
-	default:
-		native["network"] = map[string]any{"mode": "public"}
+	net, nerr := compatNetwork(req["network"], req["network_allow"])
+	if nerr != nil {
+		compatErr(w, 400, nerr.code, nerr.msg, 0)
+		return
 	}
+	native["network"] = net
 	ttl := 3600
 	if v, ok := req["lifetime_seconds"].(float64); ok && v > 0 {
 		ttl = int(v)
@@ -415,6 +421,72 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	}
 	b.mu.Unlock()
 	writeJSON(w, 201, compatView(out.doc, u))
+}
+
+// compatNetwork turns the client network fields into the hotel network
+// object. The client sends a mode name ("internet", "deny_all", "allowlist",
+// or the old "none") with the list in network_allow, or the hotel object
+// {"mode", "allow"} itself. "deny_all" and "none" become the hotel mode
+// deny_all: the room keeps a network interface, so its policy can switch
+// later. The hotel checks every entry.
+func compatNetwork(mode, allow any) (map[string]any, *apiErr) {
+	if obj, ok := mode.(map[string]any); ok {
+		mode, allow = obj["mode"], obj["allow"]
+	}
+	list := []any{}
+	switch a := allow.(type) {
+	case nil:
+	case []any:
+		list = a
+	default:
+		return nil, &apiErr{400, "invalid_network_allowlist", "network_allow must be a list of strings"}
+	}
+	switch mode {
+	case nil, "", "internet", "public":
+		return map[string]any{"mode": "internet", "allow": []any{}}, nil
+	case "deny_all", "none":
+		return map[string]any{"mode": "deny_all", "allow": []any{}}, nil
+	case "allowlist":
+		if len(list) == 0 {
+			return nil, &apiErr{400, "invalid_network_allowlist", "allowlist mode needs at least one network_allow entry"}
+		}
+		return map[string]any{"mode": "allowlist", "allow": list}, nil
+	}
+	return nil, &apiErr{400, "invalid_network_mode", fmt.Sprintf("network must be internet, deny_all or allowlist, not %v", mode)}
+}
+
+// compatSetNetwork switches a room's policy live: PUT /v1/sandboxes/{uuid}/network.
+func (b *broker) compatSetNetwork(w http.ResponseWriter, r *http.Request, rm *room, id string) {
+	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	var req map[string]any
+	if json.Unmarshal(raw, &req) != nil {
+		compatErr(w, 400, "invalid_json", "request body is not JSON", 0)
+		return
+	}
+	allow := req["allow"]
+	if allow == nil {
+		allow = req["network_allow"]
+	}
+	net, nerr := compatNetwork(req["mode"], allow)
+	if nerr != nil {
+		compatErr(w, 400, nerr.code, nerr.msg, 0)
+		return
+	}
+	body, _ := json.Marshal(net)
+	status, hdr, out, err := rm.h.do(r.Context(), "PUT", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/network", nil, body, 2*time.Minute)
+	if err != nil {
+		compatErr(w, 502, "hotel_unreachable", "the hotel did not answer", 5)
+		return
+	}
+	copyRoomHeaders(w.Header(), hdr)
+	var doc map[string]any
+	if status != 200 || json.Unmarshal(out, &doc) != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write(reEnvelope(status, hdr, out))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": id, "network": doc["network"]})
 }
 
 // compatView turns a hotel sandbox document into the client view.
@@ -552,6 +624,8 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			}
 			writeJSON(w, 200, doc)
 		})
+	case tail == "network" && (r.Method == "PUT" || r.Method == "POST" || r.Method == "PATCH"):
+		b.compatSetNetwork(w, r, rm, id)
 	case tail == "execs" && r.Method == "POST":
 		b.compatIdem(w, r, g, func(w http.ResponseWriter, raw []byte) { b.compatExecStart(w, rm, id, raw) })
 	case strings.HasPrefix(tail, "execs/"):

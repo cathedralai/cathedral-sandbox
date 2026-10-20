@@ -93,10 +93,29 @@ def _body_digest(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _allow_list(raw: Any) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        raise api.SandboxContractError("invalid_network_allowlist", "allow must be a list of strings")
+    return tuple(raw)
+
+
+def _network_spec(net: Any, allow: Any = None) -> NetworkSpec:
+    """network is {"mode", "allow"} or a mode name with the list in network_allow."""
+    if isinstance(net, dict):
+        return NetworkSpec(mode=net.get("mode", "public"), allow=_allow_list(net.get("allow")))
+    if isinstance(net, str):
+        return NetworkSpec(mode=net, allow=_allow_list(allow))
+    if net is None:
+        return NetworkSpec()
+    raise api.SandboxContractError("invalid_network_mode", "network must be an object or a mode name")
+
+
 def _create_request(payload: dict[str, Any]) -> CreateSandboxRequest:
     resources = Resources(**payload["resources"]) if isinstance(payload.get("resources"), dict) else Resources()
     net = payload.get("network")
-    network = NetworkSpec(mode=net.get("mode", "public"), allow=tuple(net.get("allow", ()))) if isinstance(net, dict) else NetworkSpec()
+    network = _network_spec(net, payload.get("network_allow"))
     image = ImageSource(**payload["image"]) if isinstance(payload.get("image"), dict) else (
         ImageSource(image=payload["image"]) if payload.get("image") else None
     )
@@ -218,6 +237,7 @@ class SandboxApplication:
         self._add("GET", s + r"/(?P<id>[^/]+)/tar", self.get_tar)
         self._add("GET", s + r"/(?P<id>[^/]+)/stat", self.stat)
         self._add("POST", s + r"/(?P<id>[^/]+)/snapshot", self.snapshot)
+        self._add("PUT", s + r"/(?P<id>[^/]+)/network", self.set_network)
         self._add("POST", s + r"/(?P<id>[^/]+)/network", self.set_network)
         self._add("PATCH", s + r"/(?P<id>[^/]+)/network", self.set_network)
         self._add("POST", s + r"/(?P<id>[^/]+)/expose", self.expose)
@@ -452,7 +472,7 @@ class SandboxApplication:
     # ------------------------------------------------------------------ §3.7 network / expose
     def set_network(self, *, id, body, **_):
         payload = self._json(body)
-        patch = NetworkPatch(mode=payload.get("mode", "public"), allow=tuple(payload.get("allow", ())))
+        patch = NetworkPatch(mode=payload.get("mode", "public"), allow=_allow_list(payload.get("allow")))
         return Response.json(200, self.provider.set_network(id, patch))
 
     def expose(self, *, id, body, **_):
@@ -643,6 +663,7 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/sandboxes/{id}/tar", "get", "Read a tar archive", "§3.3"),
     ("/v1/sandboxes/{id}/stat", "get", "Stat a path", "§3.3"),
     ("/v1/sandboxes/{id}/snapshot", "post", "Snapshot a sandbox", "§3.5; TTL + fork"),
+    ("/v1/sandboxes/{id}/network", "put", "Set network policy (live switch)", "§3.6"),
     ("/v1/sandboxes/{id}/network", "post", "Set network policy", "§3.6"),
     ("/v1/sandboxes/{id}/network", "patch", "Patch network policy", "§3.6"),
     ("/v1/sandboxes/{id}/expose", "post", "Expose a port", "§3.7"),

@@ -43,6 +43,8 @@ command -v mkfs.xfs >/dev/null || need+=(xfsprogs)
 command -v curl >/dev/null || need+=(curl)
 command -v bzip2 >/dev/null || need+=(bzip2)
 command -v iptables >/dev/null || need+=(iptables)
+command -v nft >/dev/null || need+=(nftables)
+command -v conntrack >/dev/null || need+=(conntrack)
 if [ ${#need[@]} -gt 0 ]; then
   log "apt install ${need[*]}"
   # A fresh docker.io install starts the host Docker daemon. That daemon sets
@@ -68,7 +70,7 @@ python3 "$KIT/assess.py" --data-dir "$ROOM_DATA_DIR" --room-socket "$SOCK" --out
 log "assess: $ROOM_ETC/machine.json"
 
 # Resolved copy of the config (values only, no comments) for units and health.
-ROOM_KEYS="ROOM_TLS ROOM_REGISTRY_MIRRORS ROOM_ID ROOM_HOSTNAME ROOM_ACME_EMAIL ROOM_CUSTOMER ROOM_REGION API_PROFILE ROOM_API_PORT ROOM_HEALTH_PORT ROOM_PUBLIC_PORT ROOM_DATA_DIR ROOM_DATA_DEVICE ROOM_DATA_IMG ROOM_DATA_SIZE_GB ROOM_BRIDGE ROOM_BRIDGE_CIDR ROOM_DNS ROOM_RUNSC_FLAGS ROOM_ALLOW_DIND ROOM_CREATES_PER_MINUTE ROOM_GC_PARALLELISM ROOM_DIND_DOCKERD_ARGS ROOM_DIND_ENV ROOM_BRIDGE_PORT_CAP ROOM_NETS ROOM_NETS_POOL ROOM_NET_SIZE ROOM_NET_BRIDGE_PREFIX SHAPE_VCPU SHAPE_MEM_GIB SHAPE_DISK_GIB RESERVE_RAM_PCT RESERVE_THREADS DISK_MAX_FILL_PCT CPU_OVERCOMMIT MEM_OVERCOMMIT DISK_OVERCOMMIT ROOM_MAX_SLOTS ROOM_RECEIPTS ROOM_RECEIPTS_LISTEN ROOM_HOTEL_NAME"
+ROOM_KEYS="ROOM_TLS ROOM_REGISTRY_MIRRORS ROOM_ID ROOM_HOSTNAME ROOM_ACME_EMAIL ROOM_CUSTOMER ROOM_REGION API_PROFILE ROOM_API_PORT ROOM_HEALTH_PORT ROOM_PUBLIC_PORT ROOM_DATA_DIR ROOM_DATA_DEVICE ROOM_DATA_IMG ROOM_DATA_SIZE_GB ROOM_BRIDGE ROOM_BRIDGE_CIDR ROOM_DNS ROOM_RUNSC_FLAGS ROOM_ALLOW_DIND ROOM_CREATES_PER_MINUTE ROOM_GC_PARALLELISM ROOM_DIND_DOCKERD_ARGS ROOM_DIND_ENV ROOM_BRIDGE_PORT_CAP ROOM_NETS ROOM_NETS_POOL ROOM_NET_SIZE ROOM_NET_BRIDGE_PREFIX SHAPE_VCPU SHAPE_MEM_GIB SHAPE_DISK_GIB RESERVE_RAM_PCT RESERVE_THREADS DISK_MAX_FILL_PCT CPU_OVERCOMMIT MEM_OVERCOMMIT DISK_OVERCOMMIT ROOM_MAX_SLOTS ROOM_RECEIPTS ROOM_RECEIPTS_LISTEN ROOM_HOTEL_NAME ROOM_EGRESS"
 write_room_env() {
   for k in $ROOM_KEYS; do printf '%s="%s"\n' "$k" "${!k:-}"; done > "$ROOM_ETC/room.env"
   chmod 0644 "$ROOM_ETC/room.env"
@@ -133,6 +135,7 @@ install -m 0755 "$KIT/room_api.py" "$ROOM_OPT/bin/room_api.py"
 install -m 0755 "$KIT/assess.py" "$ROOM_OPT/bin/assess.py"
 install -m 0755 "$KIT/size.py" "$ROOM_OPT/bin/size.py"
 install -m 0755 "$KIT/room_receipts.py" "$ROOM_OPT/bin/room_receipts.py"
+install -m 0755 "$KIT/room_egress.py" "$ROOM_OPT/bin/room_egress.py"
 
 # ---------------------------------------------------------------- 5. Caddy (pinned, sha512)
 fetch "$CADDY_URL" sha512 "$CADDY_SHA512" "$ROOM_OPT/cache/caddy-$CADDY_VERSION.tar.gz"
@@ -330,6 +333,33 @@ WantedBy=timers.target
 EOF
 mark "unit:$ROOM_ID-reaper.timer"; mark "unit:$ROOM_ID-reaper.service"
 
+# Egress policy per room (ROOM_EGRESS=1, the default): room_egress.py runs as
+# root outside the rooms. It owns the nftables rules per room, the hotel DNS
+# resolver and the SNI/HTTP egress proxy. A room address with no policy has no
+# egress, so it starts before the API and goes down with the room daemon.
+if [ "${ROOM_EGRESS:-1}" = 1 ]; then
+cat > /etc/systemd/system/$ROOM_ID-egress.service <<EOF
+[Unit]
+Description=Pool room $ROOM_ID egress policy (nftables per room, DNS, egress proxy)
+Requires=$ROOM_ID-docker.service
+After=$ROOM_ID-docker.service
+Before=$ROOM_ID.service
+PartOf=$ROOM_ID-docker.service
+[Service]
+Environment=ROOM_ENV=$ROOM_ETC/room.env ROOM_DOCKER_SOCK=$SOCK ROOM_EGRESS_SOCKET=/run/pool-room-egress/control.sock ROOM_EGRESS_GROUP=poolroom
+ExecStart=$ROOM_OPT/venv/bin/python $ROOM_OPT/bin/room_egress.py
+Restart=always
+RestartSec=1
+# Fenced rooms need DNS and the proxy: keep them ahead of the rooms.
+Nice=-5
+CPUWeight=1000
+LimitNOFILE=1048576
+[Install]
+WantedBy=multi-user.target
+EOF
+mark "unit:$ROOM_ID-egress.service"
+fi
+
 # Signed receipts (sealed hotels only, ROOM_RECEIPTS=1): room_receipts.py makes
 # an Ed25519 key and an SNP attestation report at start, then fronts the API
 # and health on ROOM_RECEIPTS_LISTEN and signs every create, exec and delete.
@@ -411,6 +441,7 @@ fi
 
 # ---------------------------------------------------------------- 13. start
 systemctl daemon-reload
+if [ "${ROOM_EGRESS:-1}" = 1 ]; then systemctl enable -q "$ROOM_ID-egress.service"; systemctl restart "$ROOM_ID-egress.service"; fi
 systemctl enable -q "$ROOM_ID.service" "$ROOM_ID-health.service" "$ROOM_ID-reaper.timer"
 systemctl restart "$ROOM_ID.service" "$ROOM_ID-health.service"
 if [ "${ROOM_TLS:-on}" = on ]; then systemctl enable -q "$ROOM_ID-caddy.service"; systemctl restart "$ROOM_ID-caddy.service"; fi
