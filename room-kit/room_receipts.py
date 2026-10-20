@@ -284,7 +284,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         m = re.match("^" + ROOM, path)
         sandbox = m["id"] if m else (res.get("id") if isinstance(res, dict) else None)
-        command = req.get("command") if isinstance(req, dict) else None
+        command = (req.get("cmd", req.get("command")) if isinstance(req, dict) else None)
         image = req.get("image") if action == "create" and isinstance(req, dict) else None
         return {
             "action": action,
