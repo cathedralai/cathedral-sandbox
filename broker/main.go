@@ -52,7 +52,9 @@ type hotelConfig struct {
 	Drain       bool   `json:"drain"`       // true: no new rooms here; existing rooms keep working
 	// Labels describe the hotel, for example {"sealed": "true"}. A guest can
 	// ask for rooms only on hotels with (or without) some labels.
-	Labels map[string]string `json:"labels"`
+	Labels   map[string]string `json:"labels"`
+	Sealed   bool              `json:"sealed"`    // true: a sealed hotel (SEV-SNP guest); only creates with "sealed": true go here
+	MaxSlots int               `json:"max_slots"` // > 0: cap on the slots the hotel reports, set at the broker (no hotel restart)
 }
 
 type guestConfig struct {
@@ -235,7 +237,11 @@ func loadBroker(path string) (*broker, error) {
 // ---------------------------------------------------------------- hotel calls
 
 func (h *hotel) do(ctx context.Context, method, path string, query url.Values, body []byte, timeout time.Duration) (int, http.Header, []byte, error) {
-	u := h.cfg.API + path
+	return h.doBase(ctx, h.cfg.API, method, path, query, body, timeout)
+}
+
+func (h *hotel) doBase(ctx context.Context, base, method, path string, query url.Values, body []byte, timeout time.Duration) (int, http.Header, []byte, error) {
+	u := base + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
@@ -465,6 +471,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 			h.lat.hotel = append(h.lat.hotel, ms(call))
 			b.mu.Unlock()
 			hdrs := http.Header{}
+			copyRoomHeaders(hdrs, hdr)
 			hdrs.Set("X-Broker-Hotel", h.cfg.ID)
 			hdrs.Set("X-Broker-Queue-Ms", strconv.FormatFloat(ms(queue), 'f', 1, 64))
 			hdrs.Set("X-Broker-Hotel-Ms", strconv.FormatFloat(ms(call), 'f', 1, 64))
@@ -661,9 +668,42 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			w.Header().Set(k, v)
 		}
 	}
-	if strings.HasPrefix(hdr.Get("Content-Type"), "application/json") {
+	copyRoomHeaders(w.Header(), hdr)
+	// Signed receipts must reach the guest byte for byte: no id rewrite there.
+	if strings.HasPrefix(hdr.Get("Content-Type"), "application/json") && tail != "receipts" {
 		out = bytes.ReplaceAll(out, []byte(`"`+hid+`"`), []byte(`"`+bid+`"`))
 		w.Header().Del("Content-Length")
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(out)
+}
+
+// copyRoomHeaders passes the hotel's X-Room-* headers (for example the signed
+// receipt of a sealed hotel, X-Room-Receipt) to the guest unchanged.
+func copyRoomHeaders(dst, src http.Header) {
+	for k, v := range src {
+		if strings.HasPrefix(k, "X-Room-") {
+			dst[k] = v
+		}
+	}
+}
+
+// handleHotelDoc passes a hotel's attestation or receipt chain to a guest:
+// GET /v1/hotels/<id>/attestation and GET /v1/hotels/<id>/receipts.
+func (b *broker) handleHotelDoc(w http.ResponseWriter, r *http.Request, rest string) {
+	id, doc, _ := strings.Cut(rest, "/")
+	h := b.hotelByID(id)
+	if h == nil || (doc != "attestation" && doc != "receipts") || r.Method != "GET" {
+		writeErr(w, 404, "route_not_found", "no such hotel document")
+		return
+	}
+	status, hdr, out, err := h.doBase(r.Context(), h.cfg.Health, "GET", "/room/"+doc, r.URL.Query(), nil, time.Minute)
+	if err != nil {
+		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		return
+	}
+	if v := hdr.Get("Content-Type"); v != "" {
+		w.Header().Set("Content-Type", v)
 	}
 	w.WriteHeader(status)
 	_, _ = w.Write(out)
@@ -833,7 +873,7 @@ func (b *broker) handleStats(w http.ResponseWriter, r *http.Request, g *guestSta
 			}
 		}
 		hotels = append(hotels, map[string]any{
-			"id": h.cfg.ID, "ok": h.ok, "drain": h.cfg.Drain, "slots": h.slots, "broker_running": running, "queued": h.queued, "creating": h.creating,
+			"id": h.cfg.ID, "ok": h.ok, "drain": h.cfg.Drain, "sealed": h.cfg.Sealed, "slots": h.slots, "broker_running": running, "queued": h.queued, "creating": h.creating,
 			"api_running": h.apiRunning, "api_deleting": h.apiDeleting, "containers": h.containers,
 			"cpu_pct": h.cpuPct, "mem_pct": h.memPct, "mem_gib": h.memGiB, "load1": h.load1,
 			"created": h.created, "failed": h.failed, "rejected_429": h.rejected,
@@ -887,7 +927,11 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	}
 	h.ok = !h.lastOK.IsZero() && now.Sub(h.lastOK) < okWindow
 	if herr == nil {
-		h.resize(hd.Slots)
+		slots := hd.Slots
+		if h.cfg.MaxSlots > 0 && slots > h.cfg.MaxSlots {
+			slots = h.cfg.MaxSlots
+		}
+		h.resize(slots)
 		if hd.Live.CPU != nil {
 			h.cpuPct = *hd.Live.CPU
 		}
@@ -1081,7 +1125,7 @@ func (b *broker) snapshot(g *guestState) map[string]any {
 		tot["deleting"] += mine[stDeleting]
 		tot["failed_now"] += mine[stFailed]
 		hotels = append(hotels, map[string]any{
-			"id": h.cfg.ID, "name": h.cfg.Name, "threads": h.cfg.Threads, "ram_gib": h.cfg.RAMGiB, "slots": h.slots, "ok": h.ok, "drain": h.cfg.Drain,
+			"id": h.cfg.ID, "name": h.cfg.Name, "threads": h.cfg.Threads, "ram_gib": h.cfg.RAMGiB, "slots": h.slots, "ok": h.ok, "drain": h.cfg.Drain, "sealed": h.cfg.Sealed,
 			"grid": string(grid), "cpu": h.cpuPct, "mem_pct": h.memPct, "mem_gib": h.memGiB, "load1": h.load1,
 			"containers": h.containers, "rooms_all": h.apiRunning, "deleting_all": h.apiDeleting,
 			"queued": h.queued, "creating": h.creating,
@@ -1181,6 +1225,8 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 			b.handleBulkDelete(w, r, g)
 		case strings.HasPrefix(p, "/v1/sandboxes/"):
 			b.handleRoom(w, r, g, strings.TrimPrefix(p, "/v1/sandboxes/"))
+		case strings.HasPrefix(p, "/v1/hotels/"):
+			b.handleHotelDoc(w, r, strings.TrimPrefix(p, "/v1/hotels/"))
 		case p == "/v1/quota" && r.Method == "GET":
 			b.handleQuota(w, r, g)
 		case p == "/v1/usage" && r.Method == "GET":

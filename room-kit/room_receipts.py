@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""Room kit: signed receipts for a sealed hotel.
+
+This process runs inside the sealed guest (AMD SEV-SNP). At start it:
+
+1. makes an Ed25519 receipt key in memory (the private key never goes to disk),
+2. writes a binding document (hotel, boot id, receipt public key, launch facts),
+3. asks the AMD secure processor for an attestation report whose REPORT_DATA
+   is sha256(canonical(binding)) followed by 32 zero bytes.
+
+Then it listens on ROOM_RECEIPTS_LISTEN and passes every request to the room
+API (127.0.0.1:ROOM_API_PORT) and /room/health to the health endpoint. For each
+create, exec, background process start and delete it signs one receipt. The
+receipts make one chain per boot: each statement carries the sha256 of the
+statement before it; the first one carries the binding's sha256.
+
+Routes it adds:
+  GET /room/attestation            binding, binding_sha256, report (base64)
+  GET /room/receipts?after=&limit= the chain of this boot, in order
+  GET /v1/sandboxes/<id>/receipts  the receipts of one room
+Response header on a signed operation:
+  X-Room-Receipt: base64url(canonical(receipt))
+
+Canonical JSON: sort_keys, separators (",", ":"), ensure_ascii=False, UTF-8.
+Verify offline with verify_receipts.py.
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import http.client
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+BINDING_SCHEMA = "cathedral_sealed_hotel_binding_v1"
+RECEIPT_SCHEMA = "cathedral_sealed_hotel_receipt_v1"
+TSM = "/sys/kernel/config/tsm/report"
+
+
+def canonical(doc) -> bytes:
+    return json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def b64(data: bytes) -> str:
+    return base64.b64encode(data).decode()
+
+
+# ---------------------------------------------------------------- attestation
+
+def snp_report(report_data: bytes) -> bytes:
+    """One SNP attestation report through configfs-tsm (Linux TSM reports)."""
+    assert len(report_data) == 64
+    entry = os.path.join(TSM, "room-" + uuid.uuid4().hex[:12])
+    os.mkdir(entry)
+    try:
+        with open(os.path.join(entry, "inblob"), "wb") as f:
+            f.write(report_data)
+        with open(os.path.join(entry, "outblob"), "rb") as f:
+            report = f.read()
+        with open(os.path.join(entry, "provider")) as f:
+            provider = f.read().strip()
+    finally:
+        os.rmdir(entry)
+    if provider != "sev_guest" or len(report) < 0x4A0:
+        raise RuntimeError(f"unexpected TSM provider {provider!r} or report size {len(report)}")
+    return report
+
+
+def report_fields(report: bytes) -> dict:
+    u64 = lambda o: int.from_bytes(report[o:o + 8], "little")  # noqa: E731
+    return {
+        "version": int.from_bytes(report[0:4], "little"),
+        "policy": hex(u64(0x08)),
+        "measurement": report[0x90:0xC0].hex(),
+        "host_data": report[0xC0:0xE0].hex(),
+        "reported_tcb": u64(0x180).to_bytes(8, "little").hex(),
+        "chip_id": report[0x1A0:0x1E0].hex(),
+    }
+
+
+def read(path: str, default: str = "") -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+class Ledger:
+    """The receipt key, the binding and the chain of this boot."""
+
+    def __init__(self, hotel: str, store: str):
+        self.hotel = hotel
+        self.key = Ed25519PrivateKey.generate()
+        pub = self.key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        # A first report (zero REPORT_DATA) gives the launch facts the binding names.
+        facts = report_fields(snp_report(bytes(64)))
+        self.binding = {
+            "schema": BINDING_SCHEMA,
+            "hotel": hotel,
+            "boot_id": read("/proc/sys/kernel/random/boot_id"),
+            "created_at": int(time.time()),
+            "receipt_key_ed25519_b64": b64(pub),
+            "measurement": facts["measurement"],
+            "chip_id": facts["chip_id"],
+            "reported_tcb": facts["reported_tcb"],
+            "policy": facts["policy"],
+            "host_data": facts["host_data"],
+            "kernel_cmdline": read("/proc/cmdline"),
+            "kernel_release": os.uname().release,
+            "software": {
+                "room_kit": read("/opt/room-kit/KIT_COMMIT", "unknown"),
+                "cathedral": read("/opt/pool-room/src/COMMIT", "unknown"),
+            },
+        }
+        self.binding_sha256 = sha(canonical(self.binding))
+        self.report = snp_report(bytes.fromhex(self.binding_sha256) + bytes(32))
+        if report_fields(self.report)["measurement"] != facts["measurement"]:
+            raise RuntimeError("measurement changed between the two reports")
+        self.lock = threading.Lock()
+        self.chain: list[dict] = []
+        self.by_room: dict[str, list[int]] = {}
+        self.head = self.binding_sha256
+        os.makedirs(store, mode=0o700, exist_ok=True)
+        self.store = open(os.path.join(store, f"chain-{self.binding['boot_id']}.jsonl"), "ab", buffering=0)
+        with open(os.path.join(store, f"attestation-{self.binding['boot_id']}.json"), "w") as f:
+            json.dump(self.attestation(), f)
+
+    def attestation(self) -> dict:
+        return {"binding": self.binding, "binding_sha256": self.binding_sha256, "report_b64": b64(self.report)}
+
+    def sign(self, fields: dict) -> dict:
+        with self.lock:
+            statement = {"schema": RECEIPT_SCHEMA, "binding_sha256": self.binding_sha256, "hotel": self.hotel,
+                         "operation_id": str(uuid.uuid4()), "sequence": len(self.chain) + 1,
+                         "previous_receipt_sha256": self.head, "issued_at": int(time.time()), **fields}
+            receipt = {"statement": statement, "signature_b64": b64(self.key.sign(canonical(statement))),
+                       "receipt_sha256": sha(canonical(statement))}
+            self.head = receipt["receipt_sha256"]
+            self.chain.append(receipt)
+            room = statement.get("sandbox_id")
+            if room:
+                self.by_room.setdefault(room, []).append(len(self.chain) - 1)
+            self.store.write(canonical(receipt) + b"\n")
+            return receipt
+
+
+# ---------------------------------------------------------------- proxy
+
+ROOM = r"/v1/sandboxes/(?P<id>[^/]+)"
+SIGNED = [  # (method, path pattern, action)
+    ("POST", re.compile(r"^/v1/sandboxes$"), "create"),
+    ("POST", re.compile("^" + ROOM + r"/exec$"), "exec"),
+    ("POST", re.compile("^" + ROOM + r"/processes$"), "process_start"),
+    ("DELETE", re.compile("^" + ROOM + r"$"), "delete"),
+    ("DELETE", re.compile(r"^/v1/sandboxes$"), "bulk_delete"),
+]
+HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
+       "proxy-authenticate", "content-length", "host"}
+
+
+class Upstreams(threading.local):
+    def conn(self, port: int) -> http.client.HTTPConnection:
+        conns = self.__dict__.setdefault("conns", {})
+        if port not in conns:
+            conns[port] = http.client.HTTPConnection("127.0.0.1", port, timeout=1800)
+        return conns[port]
+
+    def drop(self, port: int) -> None:
+        c = self.__dict__.get("conns", {}).pop(port, None)
+        if c:
+            c.close()
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "room-receipts"
+
+    def log_message(self, *args):  # no request logs
+        pass
+
+    # -- helpers
+    def reply(self, status: int, body: bytes, headers: dict | None = None, ctype="application/json"):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def authorized(self) -> bool:
+        raw = self.headers.get("Authorization", "")
+        return raw[:7].lower() == "bearer " and hmac.compare_digest(raw[7:].strip().encode(), self.server.api_key)
+
+    def upstream(self, port: int, body: bytes | None):
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+        for attempt in (1, 2):
+            c = UP.conn(port)
+            try:
+                c.request(self.command, self.path, body=body, headers=headers)
+                r = c.getresponse()
+                return r.status, r.getheaders(), r.read()
+            except (http.client.HTTPException, OSError):
+                UP.drop(port)
+                if attempt == 2:
+                    raise
+
+    # -- routes
+    def handle_any(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n) if n else (b"" if self.command in ("POST", "PUT", "PATCH") else None)
+        path = urlsplit(self.path).path
+        ledger: Ledger = self.server.ledger
+        if self.command == "GET" and path == "/room/attestation":
+            return self.reply(200, canonical(ledger.attestation()))
+        if self.command == "GET" and path == "/room/receipts":
+            if not self.authorized():
+                return self.reply(401, b'{"error":"unauthorized"}')
+            q = parse_qs(urlsplit(self.path).query)
+            after, limit = int(q.get("after", ["0"])[0]), min(int(q.get("limit", ["1000"])[0]), 10000)
+            with ledger.lock:
+                page = ledger.chain[after:after + limit]
+                head = ledger.head
+            return self.reply(200, canonical({"binding_sha256": ledger.binding_sha256, "head": head,
+                                              "count": len(page), "receipts": page}))
+        m = re.match("^" + ROOM + r"/receipts$", path)
+        if self.command == "GET" and m:
+            if not self.authorized():
+                return self.reply(401, b'{"error":"unauthorized"}')
+            with ledger.lock:
+                page = [ledger.chain[i] for i in ledger.by_room.get(m["id"], [])]
+            return self.reply(200, canonical({"sandbox_id": m["id"], "binding_sha256": ledger.binding_sha256,
+                                              "receipts": page}))
+        if path == "/room/health":
+            status, headers, out = self.upstream(self.server.health_port, body)
+            if status == 200:
+                try:
+                    doc = json.loads(out)
+                    doc["sealed"] = True
+                    doc["receipts"] = {"binding_sha256": ledger.binding_sha256, "count": len(ledger.chain)}
+                    doc["runsc_sandbox_procs"] = int(subprocess.run(
+                        ["pgrep", "-cf", "[r]unsc-sandbox"], capture_output=True, text=True).stdout.strip() or 0)
+                    out = canonical(doc)
+                except ValueError:
+                    pass
+            return self.reply(status, out)
+        status, headers, out = self.upstream(self.server.api_port, body)
+        extra = {}
+        action = next((a for meth, pat, a in SIGNED if meth == self.command and pat.match(path)), None)
+        if action and self.authorized():
+            extra["X-Room-Receipt"] = base64.urlsafe_b64encode(
+                canonical(ledger.sign(self.fields(action, path, body, status, out)))).decode()
+        ctype = next((v for k, v in headers if k.lower() == "content-type"), "application/json")
+        passthrough = {k: v for k, v in headers if k.lower() not in HOP and k.lower() != "content-type"}
+        return self.reply(status, out, {**passthrough, **extra}, ctype)
+
+    def fields(self, action: str, path: str, body: bytes | None, status: int, out: bytes) -> dict:
+        req = {}
+        try:
+            req = json.loads(body) if body else {}
+        except ValueError:
+            pass
+        res = {}
+        try:
+            res = json.loads(out) if out else {}
+        except ValueError:
+            pass
+        m = re.match("^" + ROOM, path)
+        sandbox = m["id"] if m else (res.get("id") if isinstance(res, dict) else None)
+        command = req.get("command") if isinstance(req, dict) else None
+        image = req.get("image") if action == "create" and isinstance(req, dict) else None
+        return {
+            "action": action,
+            "target": f"{self.command} {self.path}",
+            "sandbox_id": sandbox if isinstance(sandbox, str) else None,
+            "customer_request_sha256": sha(body or b""),
+            "command_sha256": sha(canonical(command)) if command is not None else None,
+            "image": image,
+            "image_digest": self.server.image_digest(image) if image and status in (200, 201, 202) else None,
+            "status": status,
+            "result_sha256": sha(out),
+        }
+
+    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = handle_any
+
+
+UP = Upstreams()
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 1024
+
+    def __init__(self, addr, ledger, api_port, health_port, api_key, docker_sock):
+        super().__init__(addr, Handler)
+        self.ledger, self.api_port, self.health_port, self.api_key = ledger, api_port, health_port, api_key
+        self.docker_sock = docker_sock
+        self._digests: dict[str, str | None] = {}
+
+    def image_digest(self, ref: str) -> str | None:
+        if ref not in self._digests:
+            r = subprocess.run(["docker", "-H", "unix://" + self.docker_sock, "image", "inspect", "--format",
+                                "{{.Id}}", ref], capture_output=True, text=True, timeout=30)
+            self._digests[ref] = r.stdout.strip() or None if r.returncode == 0 else None
+        return self._digests[ref]
+
+
+def main() -> int:
+    env = os.environ
+    host, port = env["ROOM_RECEIPTS_LISTEN"].rsplit(":", 1)
+    with open(env.get("ROOM_API_KEY_PATH", "/etc/pool-room/api.key"), "rb") as f:
+        api_key = f.read().strip()
+    ledger = Ledger(env["ROOM_HOTEL_NAME"], env.get("ROOM_RECEIPTS_DIR", "/run/room-receipts"))
+    print(f"room-receipts: binding {ledger.binding_sha256} measurement {ledger.binding['measurement']}", flush=True)
+    srv = Server((host, int(port)), ledger, int(env.get("ROOM_API_PORT", "18090")),
+                 int(env.get("ROOM_HEALTH_PORT", "18091")), api_key, env.get("ROOM_DOCKER_SOCK", "/run/pool-room/docker.sock"))
+    srv.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

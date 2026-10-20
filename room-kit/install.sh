@@ -7,6 +7,9 @@
 set -euo pipefail
 umask 022
 KIT=$(cd "$(dirname "$0")" && pwd)
+# Sealed hotel: build and boot one AMD SEV-SNP guest on this host. The guest
+# then runs this same installer inside itself (see sealed/README.md).
+if [ "${1:-}" = --sealed ]; then exec "$KIT/sealed/install-sealed.sh" "${2:?usage: install.sh --sealed sealed.env}"; fi
 ENV_FILE=$(readlink -f "${1:?usage: install.sh room.env}")
 # shellcheck disable=SC1090
 source "$ENV_FILE"
@@ -65,7 +68,7 @@ python3 "$KIT/assess.py" --data-dir "$ROOM_DATA_DIR" --room-socket "$SOCK" --out
 log "assess: $ROOM_ETC/machine.json"
 
 # Resolved copy of the config (values only, no comments) for units and health.
-ROOM_KEYS="ROOM_TLS ROOM_REGISTRY_MIRRORS ROOM_ID ROOM_HOSTNAME ROOM_ACME_EMAIL ROOM_CUSTOMER ROOM_REGION API_PROFILE ROOM_API_PORT ROOM_HEALTH_PORT ROOM_PUBLIC_PORT ROOM_DATA_DIR ROOM_DATA_DEVICE ROOM_DATA_IMG ROOM_DATA_SIZE_GB ROOM_BRIDGE ROOM_BRIDGE_CIDR ROOM_DNS ROOM_RUNSC_FLAGS ROOM_ALLOW_DIND ROOM_CREATES_PER_MINUTE ROOM_GC_PARALLELISM ROOM_DIND_DOCKERD_ARGS ROOM_DIND_ENV ROOM_BRIDGE_PORT_CAP ROOM_NETS ROOM_NETS_POOL ROOM_NET_SIZE ROOM_NET_BRIDGE_PREFIX SHAPE_VCPU SHAPE_MEM_GIB SHAPE_DISK_GIB RESERVE_RAM_PCT RESERVE_THREADS DISK_MAX_FILL_PCT CPU_OVERCOMMIT MEM_OVERCOMMIT DISK_OVERCOMMIT ROOM_MAX_SLOTS"
+ROOM_KEYS="ROOM_TLS ROOM_REGISTRY_MIRRORS ROOM_ID ROOM_HOSTNAME ROOM_ACME_EMAIL ROOM_CUSTOMER ROOM_REGION API_PROFILE ROOM_API_PORT ROOM_HEALTH_PORT ROOM_PUBLIC_PORT ROOM_DATA_DIR ROOM_DATA_DEVICE ROOM_DATA_IMG ROOM_DATA_SIZE_GB ROOM_BRIDGE ROOM_BRIDGE_CIDR ROOM_DNS ROOM_RUNSC_FLAGS ROOM_ALLOW_DIND ROOM_CREATES_PER_MINUTE ROOM_GC_PARALLELISM ROOM_DIND_DOCKERD_ARGS ROOM_DIND_ENV ROOM_BRIDGE_PORT_CAP ROOM_NETS ROOM_NETS_POOL ROOM_NET_SIZE ROOM_NET_BRIDGE_PREFIX SHAPE_VCPU SHAPE_MEM_GIB SHAPE_DISK_GIB RESERVE_RAM_PCT RESERVE_THREADS DISK_MAX_FILL_PCT CPU_OVERCOMMIT MEM_OVERCOMMIT DISK_OVERCOMMIT ROOM_MAX_SLOTS ROOM_RECEIPTS ROOM_RECEIPTS_LISTEN ROOM_HOTEL_NAME"
 write_room_env() {
   for k in $ROOM_KEYS; do printf '%s="%s"\n' "$k" "${!k:-}"; done > "$ROOM_ETC/room.env"
   chmod 0644 "$ROOM_ETC/room.env"
@@ -129,6 +132,7 @@ install -m 0755 "$KIT/room_health.py" "$ROOM_OPT/bin/room_health.py"
 install -m 0755 "$KIT/room_api.py" "$ROOM_OPT/bin/room_api.py"
 install -m 0755 "$KIT/assess.py" "$ROOM_OPT/bin/assess.py"
 install -m 0755 "$KIT/size.py" "$ROOM_OPT/bin/size.py"
+install -m 0755 "$KIT/room_receipts.py" "$ROOM_OPT/bin/room_receipts.py"
 
 # ---------------------------------------------------------------- 5. Caddy (pinned, sha512)
 fetch "$CADDY_URL" sha512 "$CADDY_SHA512" "$ROOM_OPT/cache/caddy-$CADDY_VERSION.tar.gz"
@@ -323,6 +327,27 @@ WantedBy=timers.target
 EOF
 mark "unit:$ROOM_ID-reaper.timer"; mark "unit:$ROOM_ID-reaper.service"
 
+# Signed receipts (sealed hotels only, ROOM_RECEIPTS=1): room_receipts.py makes
+# an Ed25519 key and an SNP attestation report at start, then fronts the API
+# and health on ROOM_RECEIPTS_LISTEN and signs every create, exec and delete.
+if [ "${ROOM_RECEIPTS:-0}" = 1 ]; then
+cat > /etc/systemd/system/$ROOM_ID-receipts.service <<EOF
+[Unit]
+Description=Pool room $ROOM_ID signed receipts and attestation
+Requires=$ROOM_ID.service
+After=$ROOM_ID.service $ROOM_ID-health.service
+[Service]
+Environment=ROOM_RECEIPTS_LISTEN=$ROOM_RECEIPTS_LISTEN ROOM_HOTEL_NAME=$ROOM_HOTEL_NAME ROOM_API_PORT=$ROOM_API_PORT ROOM_HEALTH_PORT=$ROOM_HEALTH_PORT ROOM_DOCKER_SOCK=$SOCK ROOM_API_KEY_PATH=$ROOM_ETC/api.key ROOM_RECEIPTS_DIR=/run/room-receipts
+ExecStart=$ROOM_OPT/venv/bin/python $ROOM_OPT/bin/room_receipts.py
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+[Install]
+WantedBy=multi-user.target
+EOF
+mark "unit:$ROOM_ID-receipts.service"
+fi
+
 # ---------------------------------------------------------------- 11. Caddy on 443 (TLS-ALPN only, no port 80)
 if [ "${ROOM_TLS:-on}" = on ]; then
 cat > "$ROOM_ETC/Caddyfile" <<EOF
@@ -384,6 +409,7 @@ systemctl enable -q "$ROOM_ID.service" "$ROOM_ID-health.service" "$ROOM_ID-reape
 systemctl restart "$ROOM_ID.service" "$ROOM_ID-health.service"
 if [ "${ROOM_TLS:-on}" = on ]; then systemctl enable -q "$ROOM_ID-caddy.service"; systemctl restart "$ROOM_ID-caddy.service"; fi
 systemctl start "$ROOM_ID-reaper.timer"
+if [ "${ROOM_RECEIPTS:-0}" = 1 ]; then systemctl enable -q "$ROOM_ID-receipts.service"; systemctl restart "$ROOM_ID-receipts.service"; fi
 for _ in $(seq 30); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ROOM_API_PORT/v1/status")" != 000 ] && break; sleep 1; done
 log "API status: $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ROOM_API_PORT/v1/status")"
 log "python: $("$ROOM_OPT/venv/bin/python" -V) runsc: $("$RUNSC" --version | head -1) caddy: $("$ROOM_OPT/bin/caddy" version | cut -d' ' -f1)"

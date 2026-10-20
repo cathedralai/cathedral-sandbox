@@ -52,6 +52,14 @@ func newHotel(hc hotelConfig, key string) *hotel {
 	if hc.Concurrency <= 0 {
 		hc.Concurrency = 16
 	}
+	if hc.Sealed { // a sealed hotel always carries the label guests select it by
+		labels := map[string]string{"sealed": "true"}
+		for k, v := range hc.Labels {
+			labels[k] = v
+		}
+		labels["sealed"] = "true"
+		hc.Labels = labels
+	}
 	tr := &http.Transport{MaxIdleConns: 1024, MaxIdleConnsPerHost: hc.Concurrency + 64, MaxConnsPerHost: hc.Concurrency + 64, IdleConnTimeout: 90 * time.Second}
 	return &hotel{cfg: hc, key: key, client: &http.Client{Transport: tr}, sem: make(chan struct{}, hc.Concurrency), rooms: map[string]*room{}}
 }

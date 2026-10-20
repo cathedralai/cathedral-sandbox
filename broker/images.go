@@ -50,6 +50,11 @@ func (pl placement) selects(h *hotel) bool {
 	if len(pl.ids) > 0 && !pl.ids[h.cfg.ID] {
 		return false
 	}
+	// A hotel with "sealed": true in the config takes only creates that ask
+	// for a sealed room ("sealed": true or hotel label sealed=true) or name it.
+	if h.cfg.Sealed && len(pl.ids) == 0 && pl.match["sealed"] != "true" {
+		return false
+	}
 	for k, v := range pl.match {
 		if h.cfg.Labels[k] != v {
 			return false
@@ -73,6 +78,7 @@ func (pl placement) apply(payload map[string]any) {
 	delete(payload, "hotels")
 	delete(payload, "hotel_labels")
 	delete(payload, "exclude_hotel_labels")
+	delete(payload, "sealed")
 	if pl.hotelSnap != "" {
 		payload["snapshot_id"] = pl.hotelSnap
 	}
@@ -138,6 +144,19 @@ func (b *broker) parseSelection(payload map[string]any) (placement, *apiErr) {
 	var e *apiErr
 	if pl.match, e = stringMap(payload["hotel_labels"], "hotel_labels"); e != nil {
 		return pl, e
+	}
+	// "sealed": true is short for hotel_labels {"sealed": "true"}.
+	if v, ok := payload["sealed"]; ok && v != nil {
+		sealed, ok := v.(bool)
+		if !ok {
+			return pl, &apiErr{400, "invalid_hotel_selection", "sealed must be true or false"}
+		}
+		if sealed {
+			if pl.match == nil {
+				pl.match = map[string]string{}
+			}
+			pl.match["sealed"] = "true"
+		}
 	}
 	if pl.exclude, e = stringMap(payload["exclude_hotel_labels"], "exclude_hotel_labels"); e != nil {
 		return pl, e

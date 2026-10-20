@@ -509,3 +509,33 @@ func TestCompatUnknownTemplateIsAnErrorNotABaseImageRoom(t *testing.T) {
 		t.Fatalf("template resources: %v", res)
 	}
 }
+
+func TestSealedHotelTakesOnlySealedCreates(t *testing.T) {
+	tc := newChain(t)
+	// Make "b" a config-sealed hotel: exclusive, label added by the broker.
+	h := tc.b.hotelByID("b")
+	h.cfg.Sealed = true
+	h.cfg.Labels = map[string]string{"sealed": "true"}
+	for i := 0; i < 20; i++ {
+		if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"}); strings.HasPrefix(id, "b.") {
+			t.Fatalf("plain create landed on the sealed hotel: %s", id)
+		}
+		if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "sealed": true}); strings.HasPrefix(id, "c.") {
+			t.Fatalf("sealed create landed on an unsealed hotel: %s", id)
+		}
+	}
+	if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}}); !strings.HasPrefix(id, "b.") {
+		t.Fatalf("named sealed hotel not used: %s", id)
+	}
+	for _, f := range tc.hotels {
+		for _, c := range f.creates {
+			if _, ok := c["sealed"]; ok {
+				t.Fatal("hotel got the broker field sealed")
+			}
+		}
+	}
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "sealed": "yes"})
+	if status != 400 || errCode(doc) != "invalid_hotel_selection" {
+		t.Fatalf("bad sealed value: %d %v", status, doc)
+	}
+}
