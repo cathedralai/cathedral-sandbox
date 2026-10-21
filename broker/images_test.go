@@ -35,6 +35,8 @@ type fakeHotel struct {
 	rooms       []map[string]any // id + labels, for the room list
 	networks    []map[string]any // bodies of PUT /v1/sandboxes/{id}/network
 	receipts    []byte           // body of GET /room/receipts
+	roomDeletes []string         // room ids of DELETE /v1/sandboxes/{id}
+	bulkDeletes [][]string       // label filters of DELETE /v1/sandboxes
 }
 
 func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -80,6 +82,35 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		writeJSON(w, 200, map[string]any{"sandboxes": out})
+	case p == "/v1/sandboxes" && r.Method == "DELETE":
+		f.bulkDeletes = append(f.bulkDeletes, r.URL.Query()["label"])
+		kept := f.rooms[:0]
+		for _, rm := range f.rooms {
+			labels, _ := rm["labels"].(map[string]any)
+			match := true
+			for _, want := range r.URL.Query()["label"] {
+				k, v, _ := strings.Cut(want, "=")
+				if labels[k] != v {
+					match = false
+				}
+			}
+			if !match {
+				kept = append(kept, rm)
+			}
+		}
+		f.rooms = kept
+		w.WriteHeader(204)
+	case strings.HasPrefix(p, "/v1/sandboxes/") && strings.Count(p, "/") == 3 && r.Method == "DELETE":
+		id := strings.TrimPrefix(p, "/v1/sandboxes/")
+		f.roomDeletes = append(f.roomDeletes, id)
+		kept := f.rooms[:0]
+		for _, rm := range f.rooms {
+			if rm["id"] != id {
+				kept = append(kept, rm)
+			}
+		}
+		f.rooms = kept
+		w.WriteHeader(204)
 	case p == "/room/receipts" && r.Method == "GET":
 		if f.receipts == nil {
 			writeErr(w, 404, "no_receipts", "no chain")
