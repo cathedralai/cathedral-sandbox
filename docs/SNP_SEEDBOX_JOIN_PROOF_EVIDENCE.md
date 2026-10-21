@@ -4,7 +4,7 @@
 
 **Fence (Contabo T3):** only after Fred greenlight · policy release 13 installed · Ditto slot free.
 
-**Cherry `.46` / testnet 584 T1 (2026-10-21):** **PASS** on staging — sealed create auto-admit; founding Join T1 marked TESTNET GREEN in polariscomputer `docs/TESTNET_UNIT_GO_GREEN.md`. Contabo rows below remain the Contabo/T3 template.
+**Cherry `.46` / testnet 584 T1 (2026-10-21):** **PASS** on staging — sealed create auto-admit; founding Join T1 marked TESTNET GREEN on the polariscomputer testnet unit go-green scoreboard. Contabo rows below remain the Contabo/T3 template.
 
 ---
 
