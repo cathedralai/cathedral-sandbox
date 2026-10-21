@@ -185,6 +185,10 @@ type broker struct {
 	// rooms after they leave the hotel list, so a guest can still read their
 	// own receipts. Guarded by b.mu.
 	guestRooms map[string]map[string]map[string]struct{}
+
+	// tombs is guest id -> recent deletes by label, which also catch creates
+	// in flight (inflight.go). Guarded by b.mu.
+	tombs map[string][]tombstone
 }
 
 // A hotel counts as answering while its last good health answer is younger than okWindow.
@@ -457,8 +461,23 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 		// another eligible hotel (placement.go).
 		h = b.waitSlot(ctx, g, h, pl, tried)
 		if h == nil {
-			return createResult{status: 499, doc: map[string]any{"error": map[string]string{"code": "client_gone", "message": "request cancelled"}}}
+			return clientGone()
 		}
+		b.mu.Lock()
+		gone, doomed := ctx.Err() != nil, b.tombstoned(g.cfg.ID, labels, tRecv)
+		if gone || doomed {
+			// The guest went away, or deleted this create by label, while it
+			// waited for a slot: start no room.
+			h.queued--
+			g.queued--
+			b.mu.Unlock()
+			<-h.sem
+			if gone {
+				return clientGone()
+			}
+			return deletedDuringCreate()
+		}
+		b.mu.Unlock()
 		tDispatch := time.Now()
 		rm := &room{h: h, guest: g.cfg.ID, state: stCreating, since: tDispatch}
 		b.mu.Lock()
@@ -468,7 +487,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 		h.place(rm)
 		b.mu.Unlock()
 
-		status, hdr, out, err := h.do(ctx, "POST", "/v1/sandboxes", nil, body, 5*time.Minute)
+		// The hotel does not stop a create when the guest goes away. Keep the
+		// call open, so the broker learns the room id and can delete the room.
+		status, hdr, out, err := h.do(context.WithoutCancel(ctx), "POST", "/v1/sandboxes", nil, body, 5*time.Minute)
 		<-h.sem
 		tDone := time.Now()
 
@@ -479,8 +500,20 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 			_ = json.Unmarshal(out, &doc)
 		}
 		hid, _ := doc["id"].(string)
+		started := err == nil && (status == 200 || status == 202) && hid != ""
+		if started && (ctx.Err() != nil || b.tombstoned(g.cfg.ID, labels, tRecv)) {
+			gone := ctx.Err() != nil
+			h.release(rm)
+			rm.hid, rm.id = hid, h.cfg.ID+"."+hid
+			b.mu.Unlock()
+			b.reapRoom(h, rm)
+			if gone {
+				return clientGone()
+			}
+			return deletedDuringCreate()
+		}
 		switch {
-		case err == nil && (status == 200 || status == 202) && hid != "":
+		case started:
 			rm.hid, rm.id, rm.state, rm.since = hid, h.cfg.ID+"."+hid, stRunning, tDone
 			if old := h.rooms[hid]; old != nil && old != rm { // the sync loop saw it first
 				b.release(h, old)
@@ -874,6 +907,10 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 		writeErr(w, 400, "invalid_label", "bulk delete requires a label filter")
 		return
 	}
+	// Creates in flight that match this filter are deleted too (inflight.go).
+	b.mu.Lock()
+	b.addTombstone(g.cfg.ID, q["label"], time.Now())
+	b.mu.Unlock()
 	q.Add("label", guestLabel+"="+g.cfg.ID)
 	res := map[string]int{}
 	var mu sync.Mutex
