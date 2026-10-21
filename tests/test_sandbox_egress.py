@@ -285,3 +285,82 @@ def test_put_network_route(fake, daemon) -> None:
         assert bad.status == 400 and json.loads(bad.body)["error"]["code"] == "invalid_network_allowlist"
     finally:
         provider.close()
+
+
+# ---------------------------------------------------------------- client timeouts (#298)
+
+def test_client_timeout_setting_is_bounded(monkeypatch) -> None:
+    from cathedral.sandbox_egress import EgressClient
+
+    monkeypatch.setenv("CATHEDRAL_ROOM_EGRESS_SOCKET", "/tmp/none.sock")
+    monkeypatch.delenv("CATHEDRAL_ROOM_EGRESS_TIMEOUT", raising=False)
+    assert EgressClient.from_env().timeout == 120.0  # was 30 s: shorter than a busy docker answer
+    for raw, want in (("1", 5.0), ("90", 90.0), ("9999", 600.0), ("soon", 120.0)):
+        monkeypatch.setenv("CATHEDRAL_ROOM_EGRESS_TIMEOUT", raw)
+        assert EgressClient.from_env().timeout == want
+
+
+def test_client_waits_for_a_restarting_daemon(monkeypatch) -> None:
+    """No listener yet (Restart=always, RestartSec=1): the call tries again."""
+    from cathedral.sandbox_egress import EgressClient
+
+    monkeypatch.setattr(eg, "flush_conntrack", lambda ip: None)
+    facts = Facts()
+    table = eg.Table(eg.Rules("room-test", ["10.214.0.0/22"], 15353, 15080, 15443, run=lambda s: None), facts, None)
+    table.load()
+    path = tempfile.mktemp(prefix="egr", suffix=".sock", dir="/tmp")
+    box = {}
+
+    def start_late():
+        import time
+
+        time.sleep(0.6)
+        srv = eg.ControlServer(path, eg.Control)
+        srv.table = table
+        box["srv"] = srv
+        srv.serve_forever()
+
+    threading.Thread(target=start_late, daemon=True).start()
+    try:
+        doc = EgressClient(path, timeout=10).apply("ab" * 32, "sbx_late", {"mode": "internet", "allow": []})
+        assert doc["policy"] == {"mode": "internet", "allow": []}
+    finally:
+        if "srv" in box:
+            box["srv"].shutdown()
+        Path(path).unlink(missing_ok=True)
+    with pytest.raises(SandboxOpError) as err:
+        EgressClient(path, timeout=10, connect_retry=0.3).apply("ab" * 32, "sbx_x", {"mode": "internet", "allow": []})
+    assert err.value.code == "egress_unavailable"
+
+
+def test_client_does_not_send_again_after_a_timeout() -> None:
+    """A daemon that takes the call and does not answer: one call, then 503."""
+    import socket
+
+    from cathedral.sandbox_egress import EgressClient
+
+    path = tempfile.mktemp(prefix="egs", suffix=".sock", dir="/tmp")
+    lsock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    lsock.bind(path)
+    lsock.listen(16)
+    accepted = []
+
+    def accept():
+        while True:
+            try:
+                conn, _ = lsock.accept()
+            except OSError:
+                return
+            accepted.append(conn)  # read nothing, answer nothing
+
+    threading.Thread(target=accept, daemon=True).start()
+    try:
+        with pytest.raises(SandboxOpError) as err:
+            EgressClient(path, timeout=0.5).apply("ab" * 32, "sbx_slow", {"mode": "internet", "allow": []})
+        assert err.value.code == "egress_unavailable" and "timed out" in str(err.value)
+        assert len(accepted) == 1
+    finally:
+        lsock.close()
+        for c in accepted:
+            c.close()
+        Path(path).unlink(missing_ok=True)

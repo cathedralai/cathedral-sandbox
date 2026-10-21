@@ -204,6 +204,11 @@ LimitNOFILE=1048576
 TasksMax=infinity
 Delegate=yes
 KillMode=process
+# Each room is a scope next to this unit with the default weight (100). At
+# 300 rooms the daemon got about 1/300 of the CPU in a create storm, and every
+# create waits on it (#298). The rooms run in their own scopes, so this weight
+# covers the daemon only.
+CPUWeight=1000
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -289,6 +294,8 @@ EnvironmentFile=$ROOM_ETC/api.env
 EnvironmentFile=$ROOM_ETC/secret.env
 ExecStart=$(profile_exec)
 Restart=on-failure
+# The API is on every create path: keep it ahead of the rooms (#298).
+CPUWeight=1000
 LimitNOFILE=1048576
 TasksMax=infinity
 NoNewPrivileges=yes
