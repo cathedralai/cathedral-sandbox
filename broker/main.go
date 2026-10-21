@@ -265,8 +265,8 @@ func (h *hotel) doBase(ctx context.Context, base, method, path string, query url
 	return h.doHeaders(ctx, base, method, path, query, body, timeout, nil)
 }
 
-// doHeaders is doBase with extra request headers (for example the guest id
-// on workspace calls, workspaces.go).
+// doHeaders is doBase with extra request headers (the guest id of
+// guestcalls.go).
 func (h *hotel) doHeaders(ctx context.Context, base, method, path string, query url.Values, body []byte, timeout time.Duration, extra http.Header) (int, http.Header, []byte, error) {
 	u := base + path
 	if len(query) > 0 {

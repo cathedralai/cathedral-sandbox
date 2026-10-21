@@ -44,7 +44,7 @@ from cathedral.sandbox_api import (
     TarGet,
 )
 from cathedral.sandbox_provider import InMemorySandboxProvider, SandboxOpError, SandboxProvider
-from cathedral.sandbox_workspaces import guest_from, owner_id
+from cathedral.sandbox_owner import guest_from, owner_id
 
 JSON = "application/json"
 REAPER_INTERVAL_DEFAULT_SECONDS = 30.0

@@ -37,7 +37,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shutil
 import threading
 from datetime import datetime, timezone
@@ -45,43 +44,15 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from cathedral.sandbox_api import SandboxContractError, WORKSPACE_NAME_RE, validate_workspace_name
+from cathedral.sandbox_owner import BROKER_GUEST_LABEL, GUEST_HEADER, guest_from, owner_id
 from cathedral.sandbox_provider import SandboxOpError
 
 NAME_RE = WORKSPACE_NAME_RE
-GUEST_RE = re.compile(r"^[A-Za-z0-9_.:-]{0,128}$")
-GUEST_HEADER = "X-Cathedral-Guest"
-# The broker label on every room it creates. A create that comes through the
-# broker carries the guest id here; the hotel uses it when the header is absent.
-BROKER_GUEST_LABEL = "broker_guest"
 SAFE_MOUNT_OPTIONS = ("nosuid", "nodev", "noexec")
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def owner_id(api_key: str | None, guest: str | None) -> str:
-    """The owner of a call: a short hash of the hotel key plus the guest id.
-
-    Two hotel keys never share an owner, even with the same guest id.
-    """
-    key = hashlib.sha256((api_key or "").encode("utf-8")).hexdigest()[:16]
-    return f"{key}:{guest or ''}"
-
-
-def guest_from(headers: Any, labels: Any = None) -> str:
-    """The broker guest id of a call: the header, else the room label."""
-    raw = ""
-    if headers is not None:
-        for k, v in dict(headers).items():
-            if k.lower() == GUEST_HEADER.lower():
-                raw = str(v)
-                break
-    if not raw and isinstance(labels, dict):
-        raw = str(labels.get(BROKER_GUEST_LABEL) or "")
-    if not GUEST_RE.fullmatch(raw):
-        raise SandboxOpError("invalid_guest", 400, "the guest id has characters that are not allowed")
-    return raw
 
 
 def validate_name(name: object) -> str:

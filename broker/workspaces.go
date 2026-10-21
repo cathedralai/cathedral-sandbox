@@ -25,14 +25,6 @@ import (
 	"time"
 )
 
-const guestHeader = "X-Cathedral-Guest"
-
-// doGuest is a hotel call made for guest g. The hotel scopes workspaces and
-// secrets to the guest in the header.
-func (h *hotel) doGuest(ctx context.Context, g *guestState, method, path string, query url.Values, body []byte, timeout time.Duration) (int, http.Header, []byte, error) {
-	return h.doHeaders(ctx, h.cfg.API, method, path, query, body, timeout, http.Header{guestHeader: {g.cfg.ID}})
-}
-
 // workspaceName reads the name of the "workspace" field of a create: a name
 // or {"name": ...}.
 func workspaceName(v any) (string, bool) {
