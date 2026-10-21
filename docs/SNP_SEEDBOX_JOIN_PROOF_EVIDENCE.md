@@ -4,7 +4,7 @@
 
 **Fence (Contabo T3):** only after Fred greenlight · policy release 13 installed · Ditto slot free.
 
-**Cherry `.46` / testnet 584 T1 (2026-10-21):** **PASS** on staging — sealed create auto-admit; founding Join T1 marked TESTNET GREEN on the polariscomputer testnet unit go-green scoreboard. Contabo rows below remain the Contabo/T3 template.
+**Founding T1 / testnet 584 (2026-10-21):** **PASS** on staging — sealed create auto-admit; founding Join T1 marked TESTNET GREEN on the polariscomputer testnet unit go-green scoreboard. Contabo rows below remain the Contabo/T3 template.
 
 ---
 
@@ -12,16 +12,16 @@
 
 | Field | Value |
 | --- | --- |
-| Date (UTC) | 2026-10-21 (Cherry T1) / _(Contabo T3: fill)_ |
-| Operator | Eng |
-| Host | Cherry `84.32.220.46` (T1) / Contabo _(T3)_ |
+| Date (UTC) | 2026-10-21 (founding T1) / _(Contabo T3: fill)_ |
+| Operator | `<operator>` |
+| Host | `<T1 host>` / Contabo _(T3)_ |
 | Miner hotkey / UID | UID **5** (T1) / UID 3 (Contabo template) |
-| Customer endpoint | `https://84.32.220.46:8444` (T1) |
+| Customer endpoint | `https://<T1 host>:8444` |
 | Policy release | `12` |
 | Staging join flag | `CATHEDRAL_SNP_JOIN_ENABLED=true` |
 | Start script path | _(host-local; do not commit paths with secrets)_ |
 | Start script sha256 | |
-| Customer image pin | `b7144296` (T1) |
+| Customer image pin | _(image digest; host-local)_ |
 | Run dir | _(host-local)_ |
 
 ---
@@ -45,19 +45,19 @@
 
 ## Acceptance (must all be PASS)
 
-- [x] First sandbox after boot with **no** human admission script (**Cherry T1 2026-10-21**)  
+- [x] First sandbox after boot with **no** human admission script (**founding T1 2026-10-21**)  
 - [ ] **No** Railway variable edits _(T1 used image-only redeploy to drop static chip; Contabo T3 still aim for zero mid-proof redeploy)_  
 - [ ] **No** redeploy between boot and first sandbox _(same note)_  
-- [x] Offer path: roster → waiting → sealed (**Cherry T1**)  
+- [x] Offer path: roster → waiting → sealed (**founding T1**)  
 
-**Overall:** **PASS** (Cherry founding T1) / Contabo T3 still open  
+**Overall:** **PASS** (founding T1) / Contabo T3 still open  
 
 **Blockers / notes:**
 
 ```
-Cherry T1: customer identity hotkey must equal roster miner hotkey;
+T1: customer identity hotkey must equal roster miner hotkey;
 chip must not remain a company standing worker in SNP startup JSON.
-Do not paste API keys, age material, or STARTUP_B64 into git.
+Do not paste API keys, age material, STARTUP_B64, host IPs, or customer names into git.
 ```
 
 ---
