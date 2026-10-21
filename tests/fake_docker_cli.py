@@ -184,6 +184,31 @@ def main(argv):
                 members.remove(cid)
         return 0
 
+    if cmd == "run" and "--rm" in argv and any(p.startswith("cathedral.workspace.op=") for p in argv):
+        # Workspace helper (#305): do the copy on the host paths of the -v mounts.
+        import shutil
+        op = next(p for p in argv if p.startswith("cathedral.workspace.op=")).split("=", 1)[1]
+        vols = {}
+        for i, part in enumerate(argv):
+            if part == "-v":
+                src, dst = argv[i + 1].split(":")[:2]
+                vols[dst] = src
+        with Locked() as st:
+            st.setdefault("helpers", []).append(argv)
+        if b.get("helper_fail"):
+            print("cp: write error: No space left on device", file=sys.stderr)
+            return 1
+        dst = vols["/dst"]
+        if op in ("replace", "clear"):
+            for entry in os.scandir(dst):
+                if entry.is_dir(follow_symlinks=False):
+                    shutil.rmtree(entry.path)
+                else:
+                    os.unlink(entry.path)
+        if op in ("copy", "replace"):
+            shutil.copytree(vols["/src"], dst, symlinks=True, dirs_exist_ok=True)
+        return 0
+
     if cmd == "run":
         name = argv[argv.index("--name") + 1]
         labels = {}
@@ -416,6 +441,11 @@ def install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeDocker:
         "CATHEDRAL_ROOM_NETWORK_BRIDGE_PREFIX",
         "CATHEDRAL_ROOM_NETWORK_DNS",
         "CATHEDRAL_ROOM_EGRESS_SOCKET",
+        "CATHEDRAL_WORKSPACE_ROOT",
+        "CATHEDRAL_WORKSPACE_MAX_PER_OWNER",
+        "CATHEDRAL_WORKSPACE_MAX_VERSIONS",
+        "CATHEDRAL_WORKSPACE_HELPER_IMAGE",
+        "CATHEDRAL_WORKSPACE_MOUNT_CHECK",
     ):
         monkeypatch.delenv(name, raising=False)
     return FakeDocker(state_path)

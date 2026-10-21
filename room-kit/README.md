@@ -155,6 +155,33 @@ interface and cannot switch (409 `network_not_switchable`). Set
 `ROOM_EGRESS=0` to turn the daemon off; then `allowlist` and `deny_all` fail
 closed to network `none`, as before.
 
+## Workspaces
+
+`ROOM_WORKSPACES=1` turns on persistent workspaces (#305). The default is 0.
+A workspace is a named directory that outlives rooms. A room mounts it
+read-write when its create has `"workspace": "<name>"` (or
+`{"name", "path", "version_on_delete"}`; the default path is `/workspace`).
+
+- Storage: `$ROOM_DATA_DIR/workspaces`. `room-data.sh` makes it a bind mount
+  of itself with `nosuid,nodev,noexec`. The API turns workspaces off (503
+  `workspaces_unavailable`) when the mount does not have these options.
+- Owner: a hash of the hotel API key plus the broker guest id (header
+  `X-Cathedral-Guest`, or the `broker_guest` label on a create). A workspace
+  of another owner answers 404 `workspace_not_found`.
+- Names: 1 to 63 of `a-z 0-9 - _`. No dots and no slashes.
+- Routes: `POST/GET /v1/workspaces`, `GET/DELETE /v1/workspaces/<name>`,
+  `POST/GET /v1/workspaces/<name>/versions`,
+  `POST /v1/workspaces/<name>/rollback` `{"version": n}`.
+- A room delete never deletes the workspace. Delete and rollback answer 409
+  `workspace_in_use` while a room mounts it.
+- Copies, rollback and delete run in a helper container
+  (`CATHEDRAL_WORKSPACE_HELPER_IMAGE`, default `alpine:3.20`) under the room
+  runtime, with no network. The API never follows a path inside a workspace.
+- Limits: `CATHEDRAL_WORKSPACE_MAX_PER_OWNER` (default 10) and
+  `CATHEDRAL_WORKSPACE_MAX_VERSIONS` (default 20). There is no byte quota yet.
+- Sealed hotels: off. A sealed workspace needs a key that only the guest
+  holds (#305 design).
+
 ## Build the API tarball
 
 The kit installs a pinned commit of this repository. Run
