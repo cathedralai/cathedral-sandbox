@@ -329,6 +329,71 @@ class NetworkSpec:
         return canonical_network_policy(self.mode, self.allow)
 
 
+# ---------------------------------------------------------------- workspaces (#305)
+WORKSPACE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+WORKSPACE_DEFAULT_PATH = "/workspace"
+# A workspace may not cover these paths in the room.
+_WORKSPACE_RESERVED = ("/proc", "/sys", "/dev", "/work", "/etc", "/bin", "/sbin", "/lib", "/lib64", "/usr", "/run", "/var/run")
+_WORKSPACE_PATH_PART_RE = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+def validate_workspace_name(name: object) -> str:
+    """A workspace name: 1 to 63 of a-z, 0-9, '-' and '_'. No dots or slashes,
+    so a name can never leave its owner directory on the hotel."""
+    _require(
+        isinstance(name, str) and WORKSPACE_NAME_RE.fullmatch(name) is not None,
+        "invalid_workspace_name",
+        "workspace name must be 1 to 63 characters: a-z, 0-9, '-' and '_', starting with a letter or digit",
+    )
+    return name  # type: ignore[return-value]
+
+
+def validate_workspace_path(path: object) -> str:
+    """The mount point in the room: a plain absolute path, not a system path."""
+    _require(isinstance(path, str) and path.startswith("/") and len(path) <= 255,
+             "invalid_workspace_path", "workspace path must be an absolute path")
+    parts = path.split("/")[1:]  # type: ignore[union-attr]
+    _require(bool(parts) and all(p not in ("", ".", "..") and _WORKSPACE_PATH_PART_RE.fullmatch(p) for p in parts),
+             "invalid_workspace_path", "workspace path must be a plain absolute path such as /workspace")
+    for reserved in _WORKSPACE_RESERVED:
+        _require(not (path == reserved or path.startswith(reserved + "/")),  # type: ignore[union-attr]
+                 "invalid_workspace_path", f"workspace path may not be under {reserved}")
+    return path  # type: ignore[return-value]
+
+
+@dataclass(frozen=True)
+class WorkspaceSpec:
+    """A workspace that a room mounts read-write (#305)."""
+
+    name: str
+    path: str = WORKSPACE_DEFAULT_PATH
+    version_on_delete: bool = False
+
+    def __post_init__(self) -> None:
+        validate_workspace_name(self.name)
+        validate_workspace_path(self.path)
+        _require(isinstance(self.version_on_delete, bool), "invalid_workspace", "version_on_delete must be true or false")
+
+    @classmethod
+    def parse(cls, raw: object) -> "WorkspaceSpec | None":
+        """"workspace": "<name>" or {"name", "path"?, "version_on_delete"?}."""
+        if raw is None:
+            return None
+        if isinstance(raw, str):
+            return cls(name=raw)
+        _require(isinstance(raw, Mapping), "invalid_workspace", "workspace must be a name or an object")
+        unknown = set(raw) - {"name", "path", "version_on_delete"}  # type: ignore[arg-type]
+        _require(not unknown, "invalid_workspace", f"unknown workspace fields: {sorted(unknown)}")
+        return cls(
+            name=raw.get("name"),  # type: ignore[union-attr, arg-type]
+            path=raw.get("path", WORKSPACE_DEFAULT_PATH),  # type: ignore[union-attr]
+            version_on_delete=raw.get("version_on_delete", False),  # type: ignore[union-attr]
+        )
+
+    def to_document(self) -> dict[str, object]:
+        return {"name": self.name, "path": self.path, "version_on_delete": self.version_on_delete}
+
+
 # ---------------------------------------------------------------- §3.1 / §3.4 / §3.5 create
 def _validated_labels(labels: Mapping[str, str]) -> Mapping[str, str]:
     for key, value in labels.items():
@@ -368,6 +433,8 @@ class CreateSandboxRequest:
     count: int = 1
     # §3.10/§3.11: the verifier runtime drives idle reclamation and create pacing.
     idle_timeout_seconds: int | None = None
+    # #305: a persistent workspace of the caller, mounted read-write.
+    workspace: WorkspaceSpec | None = None
 
     def __post_init__(self) -> None:
         sources = [self.image is not None, self.build is not None, self.snapshot_id is not None]
@@ -435,6 +502,7 @@ class CreateSandboxRequest:
                 "labels": dict(self.labels),
                 "env_keys": sorted(self.env),  # §3.17: names only, never secret values
                 "entrypoint": list(self.entrypoint),
+                **({"workspace": self.workspace.to_document()} if self.workspace is not None else {}),
             }
         )
 

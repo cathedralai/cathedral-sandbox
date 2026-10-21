@@ -29,6 +29,11 @@ ROOM_CREATES_PER_MINUTE=${ROOM_CREATES_PER_MINUTE:-100}
 CATHEDRAL_DIND_DOCKERD_ARGS="${ROOM_DIND_DOCKERD_ARGS:-}"
 CATHEDRAL_DIND_ENV="${ROOM_DIND_ENV:-}"
 EOV
+  # Persistent workspaces (#305), opt-in. room-data.sh mounts the root
+  # nosuid,nodev,noexec.
+  if [ "${ROOM_WORKSPACES:-0}" = 1 ]; then
+    echo "CATHEDRAL_WORKSPACE_ROOT=$ROOM_DATA_DIR/workspaces"
+  fi
   # Egress policy per room through the hotel egress daemon (room_egress.py).
   if [ "${ROOM_EGRESS:-1}" = 1 ]; then
     echo "CATHEDRAL_ROOM_EGRESS_SOCKET=/run/pool-room-egress/control.sock"
