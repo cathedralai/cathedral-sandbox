@@ -22,7 +22,16 @@ attestation.json
 *.jwt
 *.pem
 *.key
+*.keys
+*.age
+*.docx
+*.docx.keys
+*.docx.key
 *.seed
+*.p12
+*.pfx
+operator-key*
+*STARTUP_B64*
 operator-state/
 validator-access-state/
 
