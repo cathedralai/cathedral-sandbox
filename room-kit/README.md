@@ -181,6 +181,40 @@ read-write when its create has `"workspace": "<name>"` (or
   `CATHEDRAL_WORKSPACE_MAX_VERSIONS` (default 20). There is no byte quota yet.
 - Sealed hotels: off. A sealed workspace needs a key that only the guest
   holds (#305 design).
+## Egress credentials
+
+A room can use a secret without holding its value (#304). The egress
+daemon keeps the values and adds them to requests outside the room.
+
+1. Put the value: `PUT /v1/secrets/<NAME>` with `{"value": "Bearer ..."}`.
+   Names are `A-Z 0-9 _`, starting with a letter. The value is the full
+   header value: 1 to 8,192 visible ASCII characters. No route returns a
+   value. `GET /v1/secrets` lists names; `DELETE /v1/secrets/<NAME>` deletes.
+2. Reference it in the room policy (create or `PUT .../network`):
+   `{"mode": "allowlist", "allow": ["pypi.example"], "credentials": [{"host": "pypi.example", "header": "Authorization", "secret": "PIP_TOKEN"}]}`.
+   The host is an exact hostname that the allowlist allows. One entry per
+   host, at most 16.
+3. In the room, call `http://pypi.example/...` (plain HTTP, port 80). The
+   proxy removes any header of that name from the request, adds the value,
+   and sends the request over TLS to port 443 with certificate and hostname
+   checks (system CA store). It sends `Connection: close`, so there is one
+   request for each connection.
+
+- The proxy reads the value for each request: a new value takes effect at
+  once, with no room restart. A missing value gives 502 with the secret name.
+- Port 443 from the room stays a TLS pass-through with no credential.
+- The answer of the host goes to the room unchanged. A host that echoes
+  request headers shows the value to the room. Give a credential only to a
+  host you trust.
+- Owner: a hash of the hotel API key plus the broker guest id. A secret of
+  another owner is never used and answers 404.
+- Storage: memory, and with `ROOM_SECRETS_PERSIST=1` (default) also
+  `/var/lib/pool-room-egress/secrets.json` (AES-256-GCM; key file
+  `secrets.key`, root only, mode 0600). Sealed hotels set
+  `ROOM_SECRETS_PERSIST=0`: values stay in SNP guest memory and a reboot
+  loses them.
+- Receipts sign the policy with the credential references (host, header
+  name, secret name). No log line, answer or receipt has a value.
 
 ## Build the API tarball
 

@@ -135,6 +135,21 @@ another guest answers 404 `workspace_not_found`. A create whose hotel choice
 excludes the workspace hotel gets 409 `workspace_hotel_excluded`. A fork and
 a workspace on different hotels get 409 `workspace_snapshot_conflict`. A
 full workspace hotel gets 503 `workspace_hotel_unavailable`.
+## Guest secrets (egress credentials)
+
+A secret is a named value that the hotel egress proxy adds as a header to
+plain HTTP requests from a room to one allowed host (#304). The room never
+holds the value. See `room-kit/README.md`, "Egress credentials".
+
+| Route | What it does |
+|---|---|
+| `PUT /v1/secrets/<NAME>` `{"value": "..."}` | Stores the value on every hotel the guest may use. The answer gives the state on each hotel, never the value. |
+| `GET /v1/secrets` | Names and the hotels that hold them. |
+| `DELETE /v1/secrets/<NAME>` | Deletes it on every hotel. |
+
+The broker keeps no value and logs no request data. A secret of another
+guest answers 404 `secret_not_found`. A hotel that joins later does not have
+the secret: put it again.
 
 ## Image prefetch
 

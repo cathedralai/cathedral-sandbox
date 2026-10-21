@@ -30,10 +30,23 @@ Each room is also bound to its bridge port: frames from the port must carry
 the room's MAC and address (bridge table), so a room with raw sockets
 (runsc --net-raw) cannot take another room's address and its policy.
 
+Credentials (#304): an allowlist policy can name a secret for one host,
+{"host", "header", "secret"}. A plain HTTP request from the room to that host
+(port 80) gets the header with the secret value here, and goes upstream over
+TLS to port 443 with certificate checks. The room never holds the value. The
+proxy reads the value for each request, so a new value takes effect at once.
+Values are kept by (owner hash, name) in SecretStore: in memory, and on a
+normal hotel also in an AES-GCM file with a key that only root reads. With
+ROOM_SECRETS_PERSIST=0 (sealed hotels) nothing goes to disk. No answer, log
+line or error message carries a value.
+
 Control socket (HTTP over a Unix socket, group of the API user):
-  PUT    /rooms/<container_id>  {"sandbox_id": str, "policy": {"mode", "allow"}}
+  PUT    /rooms/<container_id>  {"sandbox_id": str, "policy": {"mode", "allow", "credentials"?}, "owner"?: hash}
   DELETE /rooms/<container_id>
   GET    /rooms                  the table
+  PUT    /secrets/<owner>/<NAME> {"value": str}   answers the name only
+  GET    /secrets/<owner>                         names only
+  DELETE /secrets/<owner>/<NAME>
   GET    /health
 Settings come from the resolved room.env (ROOM_ID, ROOM_BRIDGE_CIDR, ROOM_NETS,
 ROOM_DNS, ROOM_RUN) and these optional environment variables:
@@ -45,6 +58,7 @@ ROOM_DNS, ROOM_RUN) and these optional environment variables:
 from __future__ import annotations
 
 import asyncio
+import base64
 import grp
 import hashlib
 import ipaddress
@@ -53,6 +67,7 @@ import os
 import re
 import shlex
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -67,6 +82,14 @@ IP_FREEBIND = 15
 DNS_PORT_DEFAULT, HTTP_PORT_DEFAULT, TLS_PORT_DEFAULT = 15353, 15080, 15443
 MAX_ALLOW = 256
 HOST_LABEL = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
+MAX_CREDENTIALS = 16
+SECRET_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+HEADER_NAME = re.compile(r"^[a-z0-9!#$%&'*+.^_`|~-]{1,64}$")
+FORBIDDEN_HEADERS = frozenset({"host", "connection", "content-length", "transfer-encoding", "upgrade", "te",
+                               "trailer", "keep-alive", "expect"})
+OWNER_HASH = re.compile(r"^[0-9a-f]{64}$")
+SECRET_MAX_CHARS = 8192
+SECRETS_PER_OWNER = 64
 
 
 # ---------------------------------------------------------------- policy
@@ -113,6 +136,7 @@ class Policy:
     hosts: frozenset = frozenset()
     wilds: tuple[str, ...] = ()
     nets: tuple[str, ...] = ()
+    credentials: tuple[tuple[str, str, str], ...] = ()  # (host, header, secret name), sorted by host
 
     @classmethod
     def parse(cls, doc: dict) -> "Policy":
@@ -125,6 +149,8 @@ class Policy:
         if mode != "allowlist":
             if allow:
                 raise ValueError(f"mode {mode} takes no allow entries")
+            if doc.get("credentials"):
+                raise ValueError("credentials need mode allowlist")
             return cls(mode=mode)
         if not allow:
             raise ValueError("allowlist mode needs at least one entry")
@@ -134,10 +160,24 @@ class Policy:
             {"host": hosts, "wild": wilds, "cidr": nets}[kind].add(value)
         canon = sorted(hosts | {"*." + w for w in wilds} | nets)
         collapsed = tuple(str(n) for n in ipaddress.collapse_addresses(ipaddress.ip_network(x) for x in nets))
-        return cls(mode=mode, allow=tuple(canon), hosts=frozenset(hosts), wilds=tuple(sorted(wilds)), nets=collapsed)
+        policy = cls(mode=mode, allow=tuple(canon), hosts=frozenset(hosts), wilds=tuple(sorted(wilds)), nets=collapsed)
+        creds = parse_credentials(doc.get("credentials") or [], policy)
+        return cls(mode=mode, allow=policy.allow, hosts=policy.hosts, wilds=policy.wilds, nets=policy.nets,
+                   credentials=creds)
 
     def document(self) -> dict:
-        return {"mode": self.mode, "allow": list(self.allow)}
+        doc = {"mode": self.mode, "allow": list(self.allow)}
+        if self.credentials:
+            doc["credentials"] = [{"host": h, "header": k, "secret": s} for h, k, s in self.credentials]
+        return doc
+
+    def credential_for(self, name: str) -> tuple[str, str] | None:
+        """(header, secret name) for a request to *name*, or None."""
+        name = name.strip().lower().rstrip(".")
+        for host, header, secret in self.credentials:
+            if host == name:
+                return header, secret
+        return None
 
     @property
     def named(self) -> bool:
@@ -152,6 +192,32 @@ class Policy:
         return any(name.endswith("." + w) for w in self.wilds)
 
 
+def parse_credentials(raw, policy: "Policy") -> tuple[tuple[str, str, str], ...]:
+    """Same rules as cathedral.sandbox_api.normalize_credentials; the daemon
+    checks again because it attaches the values."""
+    if not isinstance(raw, list) or len(raw) > MAX_CREDENTIALS:
+        raise ValueError(f"credentials must be a list of at most {MAX_CREDENTIALS} entries")
+    out: dict[str, tuple[str, str, str]] = {}
+    for entry in raw:
+        if not isinstance(entry, dict) or set(entry) != {"host", "header", "secret"}:
+            raise ValueError("each credential is {host, header, secret}")
+        kind, host = classify(entry["host"])
+        if kind != "host":
+            raise ValueError("credential host must be an exact hostname")
+        if not policy.allows_name(host):
+            raise ValueError(f"credential host {host} is not in the allowlist")
+        header = entry["header"].lower() if isinstance(entry["header"], str) else ""
+        if not HEADER_NAME.match(header) or header in FORBIDDEN_HEADERS or header.startswith("proxy-"):
+            raise ValueError("credential header is not allowed")
+        secret = entry["secret"]
+        if not isinstance(secret, str) or not SECRET_NAME.match(secret):
+            raise ValueError("bad secret name")
+        if host in out:
+            raise ValueError(f"one credential per host: {host}")
+        out[host] = (host, header, secret)
+    return tuple(out[h] for h in sorted(out))
+
+
 @dataclass
 class Room:
     container_id: str
@@ -161,6 +227,108 @@ class Room:
     port: str | None
     policy: Policy
     applied_at: float = field(default_factory=time.time)
+    owner: str = ""  # owner hash of the room (#304); its secrets are under it
+
+
+# ---------------------------------------------------------------- secrets (#304)
+
+def valid_secret_value(value) -> bool:
+    """A header value: 1 to 8192 visible ASCII characters, space or tab.
+    No CR or LF, so a value cannot add a header or a request."""
+    return (isinstance(value, str) and 0 < len(value) <= SECRET_MAX_CHARS
+            and all(c == "\t" or " " <= c <= "~" for c in value))
+
+
+class SecretStore:
+    """Secret values by (owner hash, name).
+
+    A value leaves this process only as a header on an upstream request.
+    With *path*, the store is also an AES-256-GCM file. The key file is made
+    once (32 random bytes, mode 0600, root). The owner hash and the name are
+    the associated data, so a value cannot move to another owner or name.
+    """
+
+    def __init__(self, path: str | None = None, key_path: str | None = None):
+        self.lock = threading.Lock()
+        self.values: dict[tuple[str, str], tuple[str, float]] = {}
+        self.path = path
+        self.aead = None
+        if path:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+            self.aead = AESGCM(self._key(key_path or path + ".key"))
+            self._load()
+
+    @staticmethod
+    def _key(key_path: str) -> bytes:
+        os.makedirs(os.path.dirname(key_path) or ".", mode=0o700, exist_ok=True)
+        try:
+            fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            with open(key_path, "rb") as f:
+                key = f.read()
+            if len(key) != 32:
+                raise RuntimeError("secret key file has the wrong length")
+            return key
+        key = os.urandom(32)
+        with os.fdopen(fd, "wb") as f:
+            f.write(key)
+        return key
+
+    def _load(self) -> None:
+        if not os.path.exists(self.path):
+            return
+        with open(self.path) as f:
+            entries = json.load(f)
+        for e in entries:
+            owner, name = e["owner"], e["name"]
+            try:
+                value = self.aead.decrypt(base64.b64decode(e["nonce"]), base64.b64decode(e["ct"]),
+                                          f"{owner}/{name}".encode()).decode()
+            except Exception:  # noqa: BLE001 - a bad entry is skipped, by name only
+                print(f"room-egress: secret {name} could not be read; put it again", file=sys.stderr, flush=True)
+                continue
+            self.values[(owner, name)] = (value, float(e.get("updated_at") or 0))
+
+    def _save(self) -> None:
+        if not self.path:
+            return
+        entries = []
+        for (owner, name), (value, updated) in sorted(self.values.items()):
+            nonce = os.urandom(12)
+            ct = self.aead.encrypt(nonce, value.encode(), f"{owner}/{name}".encode())
+            entries.append({"owner": owner, "name": name, "updated_at": updated,
+                            "nonce": base64.b64encode(nonce).decode(), "ct": base64.b64encode(ct).decode()})
+        tmp = self.path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(entries, f)
+        os.replace(tmp, self.path)
+
+    def put(self, owner: str, name: str, value: str) -> float:
+        with self.lock:
+            if (owner, name) not in self.values and sum(1 for o, _ in self.values if o == owner) >= SECRETS_PER_OWNER:
+                raise OverflowError("secret_limit")
+            now = time.time()
+            self.values[(owner, name)] = (value, now)
+            self._save()
+            return now
+
+    def get(self, owner: str, name: str) -> str | None:
+        with self.lock:
+            hit = self.values.get((owner, name))
+        return hit[0] if hit else None
+
+    def delete(self, owner: str, name: str) -> bool:
+        with self.lock:
+            found = self.values.pop((owner, name), None) is not None
+            if found:
+                self._save()
+            return found
+
+    def names(self, owner: str) -> list[tuple[str, float]]:
+        with self.lock:
+            return sorted((n, u) for (o, n), (_, u) in self.values.items() if o == owner)
 
 
 # ---------------------------------------------------------------- nftables
@@ -316,7 +484,8 @@ class Table:
                 with open(self.state_path) as f:
                     for d in json.load(f):
                         rooms.append(Room(d["container_id"], d["sandbox_id"], d["ip"], d["mac"], d.get("port"),
-                                          Policy.parse(d["policy"]), d.get("applied_at", time.time())))
+                                          Policy.parse(d["policy"]), d.get("applied_at", time.time()),
+                                          d.get("owner", "")))
             except (OSError, ValueError, KeyError) as exc:
                 print(f"room-egress: state not loaded: {exc}", file=sys.stderr, flush=True)
                 rooms = []
@@ -339,16 +508,17 @@ class Table:
         tmp = self.state_path + ".tmp"
         with open(tmp, "w") as f:
             json.dump([{"container_id": r.container_id, "sandbox_id": r.sandbox_id, "ip": r.ip, "mac": r.mac,
-                        "port": r.port, "policy": r.policy.document(), "applied_at": r.applied_at}
+                        "port": r.port, "policy": r.policy.document(), "applied_at": r.applied_at,
+                        "owner": r.owner}
                        for r in self.by_cid.values()], f)
         os.replace(tmp, self.state_path)
 
-    def put(self, container_id: str, sandbox_id: str, policy: Policy) -> Room:
+    def put(self, container_id: str, sandbox_id: str, policy: Policy, owner: str = "") -> Room:
         ip, mac, port = self.docker.facts(container_id)
         with self.lock:
             old = self.by_cid.get(container_id)
             stale = self.by_ip.get(ip)
-            new = Room(container_id, sandbox_id, ip, mac, port, policy)
+            new = Room(container_id, sandbox_id, ip, mac, port, policy, owner=owner)
             # A stale room on the same address (container gone, not yet
             # reaped) loses its elements in the same transaction.
             dropped = [r for r in (old, stale) if r is not None]
@@ -401,6 +571,10 @@ class Table:
     def policy_of(self, ip: str) -> Policy | None:
         room = self.by_ip.get(ip)
         return room.policy if room else None
+
+    def owner_of(self, ip: str) -> str:
+        room = self.by_ip.get(ip)
+        return room.owner if room else ""
 
     def reconcile(self) -> int:
         """Drop rooms whose container no longer runs."""
@@ -610,10 +784,37 @@ async def resolve_ipv4(name: str, port: int) -> list[str]:
     return [i[4][0] for i in infos]
 
 
+HOP_HEADERS = frozenset({b"connection", b"keep-alive", b"proxy-connection", b"proxy-authorization", b"te", b"upgrade"})
+
+
+def add_credential(head: bytes, header: str, value: str) -> bytes:
+    """The request head with *header* set to *value*.
+
+    The room's own header of that name and the hop-by-hop headers go. The
+    upstream closes after one answer (Connection: close), so the next request
+    on the connection cannot go up without the credential check."""
+    lines = head[:-4].split(b"\r\n") if head.endswith(b"\r\n\r\n") else head.split(b"\r\n")
+    drop = HOP_HEADERS | {header.encode()}
+    kept = [lines[0]] + [ln for ln in lines[1:] if ln and ln.split(b":", 1)[0].strip().lower() not in drop]
+    kept += [header.encode() + b": " + value.encode(), b"Connection: close"]
+    return b"\r\n".join(kept) + b"\r\n\r\n"
+
+
+def http_error(status: int, reason: str, text: str) -> bytes:
+    body = (text + "\n").encode()
+    return (f"HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {len(body)}\r\n"
+            "Connection: close\r\n\r\n").encode() + body
+
+
 class Proxy:
-    def __init__(self, table: Table, resolve=resolve_ipv4, addr_ok=public_ipv4):
+    def __init__(self, table: Table, resolve=resolve_ipv4, addr_ok=public_ipv4, secrets: SecretStore | None = None,
+                 tls_context: ssl.SSLContext | None = None, tls_port: int = 443):
         self.table = table
         self.resolve, self.addr_ok = resolve, addr_ok
+        # Credentials (#304): plain HTTP from the room, TLS to the host.
+        self.secrets = secrets
+        self.tls_context = tls_context
+        self.tls_port = tls_port
         self.lock = threading.Lock()
         self.active: dict[str, set] = {}  # room ip -> {(name, writer, upstream writer)}
 
@@ -644,12 +845,32 @@ class Proxy:
                 if not tls:
                     writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 return
+            tls_args: dict = {}
+            cred = None if tls else policy.credential_for(name)
+            if cred is not None:
+                # The value is read now, so a rotation takes effect on the
+                # next request. Only the secret name appears in any answer.
+                header, secret = cred
+                value = self.secrets.get(self.table.owner_of(ip), secret) if self.secrets else None
+                if value is None:
+                    writer.write(http_error(502, "Bad Gateway", f"credential {secret} is not set on this hotel"))
+                    return
+                first = add_credential(first, header, value)
+                port = self.tls_port
+                if self.tls_context is None:
+                    self.tls_context = ssl.create_default_context()  # system CA store, hostname check on
+                tls_args = {"ssl": self.tls_context, "server_hostname": name}
             # Connect to the address of the name the room asked for, never to
             # the address the room used. No private or local answers.
             addrs = [a for a in await self.resolve(name, port) if self.addr_ok(a)]
             if not addrs:
                 return
-            up_r, up_w = await asyncio.wait_for(asyncio.open_connection(addrs[0], port), 15)
+            try:
+                up_r, up_w = await asyncio.wait_for(asyncio.open_connection(addrs[0], port, **tls_args), 15)
+            except (OSError, asyncio.TimeoutError):
+                if cred is not None:
+                    writer.write(http_error(502, "Bad Gateway", f"TLS to {name} failed"))
+                raise
             item = (name, writer, up_w)
             with self.lock:
                 self.active.setdefault(ip, set()).add(item)
@@ -715,6 +936,10 @@ class Control(BaseHTTPRequestHandler):
         table: Table = self.server.table
         if self.path == "/health":
             return self.reply(200, {"status": "ok", "rooms": len(table.by_cid)})
+        sp = self.secret_path()
+        if sp and not sp[1]:
+            return self.reply(200, {"secrets": [{"name": n, "updated_at": iso(u)}
+                                                for n, u in self.server.secrets.names(sp[0])]})
         if self.path == "/rooms":
             with table.lock:
                 rooms = [{"container_id": r.container_id, "sandbox_id": r.sandbox_id, "ip": r.ip, "port": r.port,
@@ -723,7 +948,33 @@ class Control(BaseHTTPRequestHandler):
             return self.reply(200, {"rooms": rooms})
         return self.reply(404, {"error": {"code": "not_found", "message": self.path}})
 
+    def secret_path(self):
+        """(owner, name or None) of /secrets/<owner>[/<NAME>], or None."""
+        m = re.fullmatch(r"/secrets/([0-9a-f]{64})(?:/([A-Z][A-Z0-9_]{0,63}))?", self.path)
+        return (m.group(1), m.group(2)) if m else None
+
+    def put_secret(self, owner: str, name: str):
+        store: SecretStore = self.server.secrets
+        try:
+            doc = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            value = doc.get("value")
+        except (ValueError, AttributeError):
+            value = None
+        if not valid_secret_value(value):
+            # No part of the body goes into the answer.
+            return self.reply(400, {"error": {"code": "invalid_secret_value",
+                                              "message": "value must be 1 to 8192 visible ASCII characters"}})
+        try:
+            updated = store.put(owner, name, value)
+        except OverflowError:
+            return self.reply(409, {"error": {"code": "secret_limit",
+                                              "message": f"at most {SECRETS_PER_OWNER} secrets for each owner"}})
+        return self.reply(200, {"name": name, "updated_at": iso(updated)})
+
     def do_PUT(self):
+        sp = self.secret_path()
+        if sp and sp[1]:
+            return self.put_secret(*sp)
         m = re.fullmatch(r"/rooms/([0-9a-f]{12,64})", self.path)
         if not m:
             return self.reply(404, {"error": {"code": "not_found", "message": self.path}})
@@ -732,8 +983,11 @@ class Control(BaseHTTPRequestHandler):
             policy = Policy.parse(doc.get("policy") or {})
         except (ValueError, AttributeError) as exc:
             return self.reply(400, {"error": {"code": "invalid_policy", "message": str(exc)}})
+        owner = doc.get("owner") or ""
+        if owner and not (isinstance(owner, str) and OWNER_HASH.match(owner)):
+            return self.reply(400, {"error": {"code": "invalid_owner", "message": "owner must be a sha256 hex"}})
         try:
-            room = self.server.table.put(m.group(1), str(doc.get("sandbox_id") or ""), policy)
+            room = self.server.table.put(m.group(1), str(doc.get("sandbox_id") or ""), policy, owner)
         except (RuntimeError, subprocess.SubprocessError, OSError, ValueError) as exc:
             return self.reply(502, {"error": {"code": "apply_failed", "message": str(exc)[:400]}})
         pdoc = room.policy.document()
@@ -742,6 +996,11 @@ class Control(BaseHTTPRequestHandler):
                                 "applied_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(room.applied_at))})
 
     def do_DELETE(self):
+        sp = self.secret_path()
+        if sp and sp[1]:
+            if not self.server.secrets.delete(*sp):
+                return self.reply(404, {"error": {"code": "secret_not_found", "message": "no such secret"}})
+            return self.reply(200, {"deleted": True})
         m = re.fullmatch(r"/rooms/([0-9a-f]{12,64})", self.path)
         if not m:
             return self.reply(404, {"error": {"code": "not_found", "message": self.path}})
@@ -752,8 +1011,13 @@ class Control(BaseHTTPRequestHandler):
         return self.reply(200, {"forgotten": found})
 
 
+def iso(t: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
 class ControlServer(ThreadingMixIn, UnixStreamServer):
     daemon_threads = True
+    secrets: SecretStore = SecretStore()
 
 
 # ---------------------------------------------------------------- main
@@ -821,13 +1085,19 @@ def main() -> int:
     table = Table(rules, docker, os.path.join(run_dir, "state.json"),
                   on_change=lambda room: proxy_box and proxy_box[0].recheck(room))
     table.load()
-    proxy = Proxy(table)
+    # Secrets (#304). ROOM_SECRETS_PERSIST=0 (sealed hotels): memory only.
+    state_dir = os.environ.get("ROOM_EGRESS_STATE_DIR", "/var/lib/pool-room-egress")
+    persist = env.get("ROOM_SECRETS_PERSIST", "1") != "0"
+    secrets = SecretStore(os.path.join(state_dir, "secrets.json") if persist else None,
+                          os.path.join(state_dir, "secrets.key"))
+    proxy = Proxy(table, secrets=secrets)
     proxy_box.append(proxy)
     resolver = Resolver(table, env.get("ROOM_DNS", "1.1.1.1").split())
     if os.path.exists(sock_path):
         os.unlink(sock_path)
     ctl = ControlServer(sock_path, Control)
     ctl.table = table
+    ctl.secrets = secrets
     group = os.environ.get("ROOM_EGRESS_GROUP", "poolroom")
     try:
         os.chown(sock_path, 0, grp.getgrnam(group).gr_gid)

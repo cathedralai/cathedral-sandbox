@@ -379,7 +379,7 @@ class Handler(BaseHTTPRequestHandler):
             "status": status,
             "result_sha256": sha(out),
             # Create and network switch: the egress policy the hotel applied
-            # (canonical {"mode", "allow"}) and its sha256. The sha256 is
+            # (canonical {"mode", "allow", "credentials"?}) and its sha256. The sha256 is
             # computed here from the policy, not copied from the API.
             **({"network_policy": policy, "network_policy_sha256": sha(canonical(policy))} if policy else {}),
         }
@@ -392,7 +392,14 @@ class Handler(BaseHTTPRequestHandler):
         policy = net.get("policy") if isinstance(net, dict) else None
         if not (isinstance(policy, dict) and isinstance(policy.get("mode"), str) and isinstance(policy.get("allow"), list)):
             return None
-        return {"mode": policy["mode"], "allow": [str(x) for x in policy["allow"]]}
+        out = {"mode": policy["mode"], "allow": [str(x) for x in policy["allow"]]}
+        # #304: credential references (host, header name, secret name). The
+        # policy never carries a secret value.
+        creds = policy.get("credentials")
+        if isinstance(creds, list) and creds:
+            out["credentials"] = [{"host": str(c.get("host")), "header": str(c.get("header")),
+                                   "secret": str(c.get("secret"))} for c in creds if isinstance(c, dict)]
+        return out
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = handle_any
 
