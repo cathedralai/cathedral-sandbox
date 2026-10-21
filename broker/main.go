@@ -1322,6 +1322,13 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 			b.handleWorkspaces(w, r, g)
 		case strings.HasPrefix(p, "/v1/workspaces/"):
 			b.handleWorkspace(w, r, g, strings.TrimPrefix(p, "/v1/workspaces/"))
+		case p == "/v1/secrets" || strings.HasPrefix(p, "/v1/secrets/"):
+			name, ok := secretRoute(p)
+			if !ok {
+				writeErr(w, 404, "route_not_found", "central booking does not route "+r.Method+" "+p)
+				return
+			}
+			b.handleSecrets(w, r, g, name)
 		case p == "/v1/broker/hotels" && r.Method == "GET":
 			b.handleHotels(w, g)
 		case p == "/v1/broker/stats":

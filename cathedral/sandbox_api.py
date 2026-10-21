@@ -283,12 +283,68 @@ def normalize_allow_entry(entry: object) -> str:
     return value
 
 
-def canonical_network_policy(mode: str, allow: Sequence[str] = ()) -> dict[str, object]:
+# Credential references (#304): the hotel egress proxy adds a header with a
+# secret value to plain HTTP requests from the room to one allowed host. The
+# room never holds the value. The policy carries names only.
+CREDENTIALS_MAX = 16
+SECRET_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$")
+_FORBIDDEN_CREDENTIAL_HEADERS = frozenset({
+    "host", "connection", "content-length", "transfer-encoding", "upgrade", "te", "trailer", "keep-alive", "expect",
+})
+
+
+def validate_secret_name(name: object) -> str:
+    _require(isinstance(name, str) and SECRET_NAME_RE.fullmatch(name) is not None, "invalid_secret_name",
+             "secret name must be 1 to 64 characters: A-Z, 0-9 and '_', starting with a letter")
+    return name  # type: ignore[return-value]
+
+
+def normalize_credentials(mode: str, allow: Sequence[str], credentials: object) -> list[dict[str, str]]:
+    """Validate credential references and return them sorted by host.
+
+    Each entry is {"host", "header", "secret"}. Only in mode allowlist. The
+    host is an exact hostname that the allowlist allows. One entry per host.
+    """
+    if not credentials:
+        return []
+    _require(isinstance(credentials, (list, tuple)), "invalid_credentials", "credentials must be a list")
+    _require(canonical_network_mode(mode) == "allowlist", "invalid_credentials", "credentials need mode allowlist")
+    _require(len(credentials) <= CREDENTIALS_MAX, "invalid_credentials",  # type: ignore[arg-type]
+             f"at most {CREDENTIALS_MAX} credentials")
+    allowed = {normalize_allow_entry(e) for e in allow}
+    out: dict[str, dict[str, str]] = {}
+    for entry in credentials:  # type: ignore[union-attr]
+        _require(isinstance(entry, Mapping) and set(entry) == {"host", "header", "secret"}, "invalid_credentials",
+                 "each credential is {\"host\", \"header\", \"secret\"}")
+        host = normalize_allow_entry(entry["host"])
+        _require(not host.startswith("*.") and "/" not in host and not host.replace(".", "").isdigit(),
+                 "invalid_credentials", "credential host must be an exact hostname")
+        _require(host in allowed or any(a.startswith("*.") and host.endswith(a[1:]) for a in allowed),
+                 "invalid_credentials", f"credential host {host} is not in the allowlist")
+        header = entry["header"]
+        _require(isinstance(header, str) and _HEADER_NAME_RE.fullmatch(header) is not None, "invalid_credentials",
+                 "credential header must be an HTTP header name")
+        header = header.lower()
+        _require(header not in _FORBIDDEN_CREDENTIAL_HEADERS and not header.startswith("proxy-"),
+                 "invalid_credentials", f"credential header {header} is not allowed")
+        _require(host not in out, "invalid_credentials", f"one credential per host: {host}")
+        out[host] = {"host": host, "header": header, "secret": validate_secret_name(entry["secret"])}
+    return [out[h] for h in sorted(out)]
+
+
+def canonical_network_policy(mode: str, allow: Sequence[str] = (), credentials: object = ()) -> dict[str, object]:
     """The canonical policy document: mode name and the sorted, unique,
-    normalized allowlist (empty for every mode except "allowlist")."""
+    normalized allowlist (empty for every mode except "allowlist").
+    "credentials" is present only when the policy has credential references,
+    so a policy without them keeps its old document and hash."""
     mode = canonical_network_mode(mode)
     entries = sorted({normalize_allow_entry(e) for e in allow}) if mode == "allowlist" else []
-    return {"mode": mode, "allow": entries}
+    doc: dict[str, object] = {"mode": mode, "allow": entries}
+    creds = normalize_credentials(mode, allow, credentials)
+    if creds:
+        doc["credentials"] = creds
+    return doc
 
 
 def network_policy_sha256(policy: Mapping[str, object]) -> str:
@@ -320,13 +376,16 @@ class NetworkSpec:
 
     mode: str = "public"
     allow: tuple[str, ...] = ()
+    # #304: credential references {"host", "header", "secret"}; names only.
+    credentials: tuple[Mapping[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         _validate_network(self.mode, self.allow)
+        normalize_credentials(self.mode, self.allow, self.credentials)
 
     @property
     def policy(self) -> dict[str, object]:
-        return canonical_network_policy(self.mode, self.allow)
+        return canonical_network_policy(self.mode, self.allow, self.credentials)
 
 
 # ---------------------------------------------------------------- workspaces (#305)
@@ -496,7 +555,9 @@ class CreateSandboxRequest:
                     "disk_gib": self.resources.disk_gib,
                     **({"gpu": self.resources.gpu} if self.resources.gpu is not None else {}),
                 },
-                "network": {"mode": self.network.mode, "allow": list(self.network.allow)},
+                "network": {"mode": self.network.mode, "allow": list(self.network.allow),
+                            **({"credentials": [dict(c) for c in self.network.credentials]}
+                               if self.network.credentials else {})},
                 "ttl_seconds": self.ttl_seconds,
                 "idle_timeout_seconds": self.idle_timeout_seconds,
                 "labels": dict(self.labels),
@@ -888,13 +949,15 @@ class NetworkPatch:
 
     mode: str
     allow: tuple[str, ...] = ()
+    credentials: tuple[Mapping[str, str], ...] = ()  # #304, names only
 
     def __post_init__(self) -> None:
         _validate_network(self.mode, self.allow)
+        normalize_credentials(self.mode, self.allow, self.credentials)
 
     @property
     def policy(self) -> dict[str, object]:
-        return canonical_network_policy(self.mode, self.allow)
+        return canonical_network_policy(self.mode, self.allow, self.credentials)
 
 
 PORT_MIN, PORT_MAX = 1, 65535
