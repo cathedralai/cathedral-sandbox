@@ -97,12 +97,53 @@ func (pl placement) apply(payload map[string]any) {
 }
 
 // noRoom is the answer when pick finds no hotel and no hotel was tried.
-func (pl placement) noRoom() createResult {
+// Caller must NOT hold b.mu; noRoomReason locks.
+func (b *broker) noRoom(pl placement) createResult {
 	if pl.only != nil {
 		return createResult{status: 503, header: http.Header{"Retry-After": {"5"}}, doc: errDoc("snapshot_hotel_unavailable",
 			"the hotel that holds this snapshot has no free room or does not answer; retry later, or push the snapshot to a registry and create from the image")}
 	}
-	return createResult{status: 429, header: http.Header{"Retry-After": {"5"}}, doc: errDoc("no_free_rooms", "all hotels are full; retry later")}
+	return b.noRoomReason(pl)
+}
+
+// noRoomReason distinguishes "hotels down" from "hotels full" so a dead hotel
+// (e.g. green) is not reported as 429 all hotels are full.
+func (b *broker) noRoomReason(pl placement) createResult {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var matching, down, full, free int
+	for _, h := range b.hotelList() {
+		if !pl.allows(h) {
+			continue
+		}
+		matching++
+		if !h.ok || h.cfg.Drain || time.Now().Before(h.backoffUntil) {
+			down++
+			continue
+		}
+		if h.slots-h.used() > 0 {
+			free++
+		} else {
+			full++
+		}
+	}
+	ra := http.Header{"Retry-After": {"5"}}
+	if matching == 0 {
+		return createResult{status: 409, header: ra, doc: errDoc("no_matching_hotel", "no hotel matches the hotel selection")}
+	}
+	if free > 0 {
+		// Race: a room freed between pick and noRoom; still ask the guest to retry.
+		return createResult{status: 429, header: ra, doc: errDoc("no_free_rooms", "all hotels are full; retry later")}
+	}
+	if down > 0 && full == 0 {
+		return createResult{status: 503, header: ra, doc: errDoc("hotels_unavailable",
+			"selected hotels are down or draining; retry later")}
+	}
+	if down > 0 {
+		return createResult{status: 503, header: ra, doc: errDoc("hotels_unavailable",
+			"selected hotels are down or full; retry later")}
+	}
+	return createResult{status: 429, header: ra, doc: errDoc("no_free_rooms", "all hotels are full; retry later")}
 }
 
 func errDoc(code, msg string) map[string]any {
@@ -137,7 +178,7 @@ func stringMap(v any, field string) (map[string]string, *apiErr) {
 
 // parseSelection reads "hotels", "hotel_labels", "exclude_hotel_labels" and
 // "sealed", and applies the guest's hotel set and sealed default (guests.go).
-// It answers 400 for an unknown hotel id and 409 when no hotel matches.
+// It answers 409 for an unknown hotel id and 409 when no hotel matches.
 func (b *broker) parseSelection(g *guestState, payload map[string]any) (placement, *apiErr) {
 	var pl placement
 	if v, ok := payload["hotels"]; ok && v != nil {
@@ -149,7 +190,7 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 		for _, x := range list {
 			id, _ := x.(string)
 			if b.hotelByID(id) == nil || !g.limitsAllow(b, id) {
-				return pl, &apiErr{400, "unknown_hotel", fmt.Sprintf("no hotel %q", fmt.Sprint(x))}
+				return pl, &apiErr{409, "unknown_hotel", fmt.Sprintf("no hotel %q", fmt.Sprint(x))}
 			}
 			pl.ids[id] = true
 		}

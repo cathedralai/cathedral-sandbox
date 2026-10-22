@@ -83,10 +83,30 @@ def classify(entry: str) -> tuple[str, str]:
     """("cidr", "1.2.3.0/24") | ("host", "pypi.org") | ("wild", "example.com").
 
     Same rules as cathedral.sandbox_api.normalize_allow_entry; the daemon
-    checks again because it is the enforcement point."""
+    checks again because it is the enforcement point. Optional ``:80`` / ``:443``
+    on a hostname is accepted and stripped (proxy only offers those ports).
+    """
     if not isinstance(entry, str) or not entry or len(entry) > 255:
         raise ValueError(f"bad allowlist entry {entry!r}")
     value = entry.strip().lower().rstrip(".")
+    if value.count(":") == 1 and "/" not in value and not value.startswith("["):
+        host_part, port_part = value.rsplit(":", 1)
+        if port_part.isdigit():
+            port = int(port_part)
+            if not 1 <= port <= 65535:
+                raise ValueError(f"bad allowlist entry {entry!r}")
+            try:
+                ipaddress.ip_address(host_part)
+            except ValueError:
+                if port not in (80, 443):
+                    raise ValueError(
+                        f"named hosts only allow TCP 80 and 443: {entry!r}"
+                    ) from None
+                value = host_part
+            else:
+                raise ValueError(
+                    f"use a bare IPv4/CIDR (all ports) or a hostname:80|:443: {entry!r}"
+                )
     try:
         # "1.2.3.4" stays an address, "1.2.3.4/8" becomes "1.0.0.0/8".
         net = ipaddress.ip_network(value, strict=False) if "/" in value else ipaddress.ip_address(value)

@@ -747,9 +747,21 @@ func compatExecBody(raw []byte, maxExec int) (map[string]any, int, error) {
 		cmd = req["cmd"]
 	}
 	if cmd == nil {
-		return nil, 0, fmt.Errorf("command is required")
+		return nil, 0, fmt.Errorf("cmd is required")
 	}
-	body := map[string]any{"cmd": cmd}
+	list, ok := cmd.([]any)
+	if !ok || len(list) == 0 {
+		return nil, 0, fmt.Errorf("cmd must be a non-empty list of strings")
+	}
+	argv := make([]string, 0, len(list))
+	for _, x := range list {
+		s, ok := x.(string)
+		if !ok || s == "" {
+			return nil, 0, fmt.Errorf("cmd must be a non-empty list of strings")
+		}
+		argv = append(argv, s)
+	}
+	body := map[string]any{"cmd": argv}
 	for _, k := range []string{"cwd", "env", "user", "stdin"} {
 		if v, ok := req[k]; ok && v != nil {
 			body[k] = v

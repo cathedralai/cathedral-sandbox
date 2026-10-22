@@ -446,7 +446,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 			if last.status != 0 {
 				return last
 			}
-			return pl.noRoom()
+			return b.noRoom(pl)
 		}
 		tried[h] = true
 		h.queued++
