@@ -381,3 +381,39 @@ def test_put_refuses_a_room_without_its_bridge_port(table) -> None:
 def test_policy_refuses_non_public_ranges(bad) -> None:
     with pytest.raises(ValueError):
         eg.Policy.parse({"mode": "allowlist", "allow": [bad]})
+
+
+def test_known_bridges_drop_unbound_ports_and_ipv6() -> None:
+    # A room port with no policy yet used to pass the guard ("return"): with
+    # raw sockets a new room could send as a neighbour until apply() bound it.
+    runner = Runner()
+    rules = eg.Rules("room-test", ["10.214.0.0/22"], 15353, 15080, 15443, run=runner, bridges=["rmbr0", "rmnet0"])
+    base = rules.base([])
+    guard = base[base.index("chain room_guard"):]
+    assert 'meta ibrname != { "rmbr0", "rmnet0" } return' in guard
+    assert "iifname != @ports drop" in guard and "iifname != @ports return" not in guard
+    assert guard.index("ether type ip6 drop") < guard.index("iifname . ether saddr != @bound_mac drop")
+    # Without bridge names (older callers) the guard stays open to unknown ports but still drops IPv6.
+    old = eg.Rules("room-test", ["10.214.0.0/22"], 15353, 15080, 15443, run=runner).base([])
+    assert "iifname != @ports return" in old and "ether type ip6 drop" in old
+
+
+def test_room_bridges_follow_room_net_sh_names() -> None:
+    env = {"ROOM_BRIDGE": "rmbr0", "ROOM_NETS": "10.214.0.0/22 10.214.4.0/22"}
+    assert eg.room_bridges(env) == ["rmbr0", "rmnet0", "rmnet1"]
+    assert eg.room_bridges({"ROOM_BRIDGE": "rmbr0"}) == ["rmbr0"]
+
+
+def test_proxy_admits_a_bounded_number_of_connections_per_room(table) -> None:
+    proxy = eg.Proxy(table, per_room_max=2)
+    assert proxy.admit("10.214.0.2") and proxy.admit("10.214.0.2")
+    assert not proxy.admit("10.214.0.2")
+    assert proxy.admit("10.214.0.3")  # another room is not affected
+    proxy.release("10.214.0.2")
+    assert proxy.admit("10.214.0.2")
+
+
+def test_room_net_sh_drops_ipv6_from_room_bridges() -> None:
+    text = (Path(__file__).resolve().parents[1] / "room-kit" / "lib" / "room-net.sh").read_text()
+    assert 'ip6tables -I FORWARD 1 -i "$br" -j DROP' in text and 'ip6tables -I INPUT 1 -i "$br" -j DROP' in text
+    assert "ip6tables $rule" in text  # and down() removes them

@@ -203,11 +203,15 @@ class Rules:
     """The nftables tables of this hotel. All changes go through apply()."""
 
     def __init__(self, room_id: str, room_nets: list[str], dns_port: int, http_port: int, tls_port: int,
-                 run: Callable[[str], None] | None = None):
+                 run: Callable[[str], None] | None = None, bridges: list[str] | None = None):
         self.table = nft_name(room_id)
         self.room_nets = room_nets
         self.ports = (dns_port, http_port, tls_port)
         self.run = run or self._nft
+        # The room bridges. With them known, a frame from a port that is not
+        # bound yet is dropped instead of let through: a new room could send
+        # with a neighbour's source address until its policy was applied.
+        self.bridges = list(bridges or [])
 
     @staticmethod
     def _nft(script: str) -> None:
@@ -251,7 +255,17 @@ class Rules:
             "  set bound_mac { type ifname . ether_addr; }",
             "  chain room_guard {",
             "    type filter hook prerouting priority -300; policy accept;",
-            "    iifname != @ports return",
+        ]
+        if self.bridges:
+            names = ", ".join(f'"{b}"' for b in self.bridges)
+            lines += [
+                f"    meta ibrname != {{ {names} }} return",  # other bridges on the host are not ours
+                "    iifname != @ports drop",  # a room port with no policy yet sends nothing
+            ]
+        else:
+            lines += ["    iifname != @ports return"]
+        lines += [
+            "    ether type ip6 drop",  # rooms have no IPv6; every rule below is IPv4
             "    iifname . ether saddr != @bound_mac drop",
             "    ether type ip iifname . ip saddr != @bound drop",
             "    ether type arp iifname . arp saddr ip != @bound drop",
@@ -646,12 +660,37 @@ async def resolve_ipv4(name: str, port: int) -> list[str]:
     return [i[4][0] for i in infos]
 
 
+# One room may hold this many proxy connections at once. The daemon serves
+# DNS and the proxy for every room on the hotel; without a cap one room could
+# use every file descriptor it has.
+PROXY_PER_ROOM_MAX = 256
+
+
 class Proxy:
-    def __init__(self, table: Table, resolve=resolve_ipv4, addr_ok=public_ipv4):
+    def __init__(self, table: Table, resolve=resolve_ipv4, addr_ok=public_ipv4, per_room_max: int = PROXY_PER_ROOM_MAX):
         self.table = table
         self.resolve, self.addr_ok = resolve, addr_ok
         self.lock = threading.Lock()
         self.active: dict[str, set] = {}  # room ip -> {(name, writer, upstream writer)}
+        self.per_room_max = per_room_max
+        self.pending: dict[str, int] = {}  # room ip -> connections being handled
+
+    def admit(self, ip: str) -> bool:
+        """Take one connection slot for ip; False when the room is at its cap."""
+        with self.lock:
+            n = self.pending.get(ip, 0)
+            if n >= self.per_room_max:
+                return False
+            self.pending[ip] = n + 1
+            return True
+
+    def release(self, ip: str) -> None:
+        with self.lock:
+            n = self.pending.get(ip, 0) - 1
+            if n <= 0:
+                self.pending.pop(ip, None)
+            else:
+                self.pending[ip] = n
 
     def recheck(self, room: Room) -> None:
         """After a policy change, close this room's connections the new policy does not allow."""
@@ -669,6 +708,14 @@ class Proxy:
     async def handle(self, reader, writer, port: int, tls: bool):
         ip = writer.get_extra_info("peername")[0]
         up_w = None
+        if not self.admit(ip):
+            try:
+                if not tls:
+                    writer.write(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return
         try:
             if tls:
                 first, hello = await asyncio.wait_for(read_client_hello(reader), 15)
@@ -702,6 +749,7 @@ class Proxy:
         except (OSError, ValueError, asyncio.IncompleteReadError, asyncio.TimeoutError, asyncio.LimitOverrunError):
             pass
         finally:
+            self.release(ip)
             for w in (writer, up_w):
                 if w is not None:
                     try:
@@ -814,6 +862,12 @@ def room_networks(env: dict[str, str]) -> list[tuple[str, str]]:
     return out
 
 
+def room_bridges(env: dict[str, str]) -> list[str]:
+    """The main bridge and one bridge per room network, as room-net.sh names them."""
+    prefix = env.get("ROOM_NET_BRIDGE_PREFIX", "rmnet")
+    return [env["ROOM_BRIDGE"]] + [f"{prefix}{i}" for i in range(len(env.get("ROOM_NETS", "").split()))]
+
+
 def bound_socket(kind: int, addr: str, port: int) -> socket.socket:
     s = socket.socket(socket.AF_INET, kind)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -851,7 +905,7 @@ def main() -> int:
     sock_path = os.environ.get("ROOM_EGRESS_SOCKET", "/run/pool-room-egress/control.sock")
     run_dir = os.path.dirname(sock_path)
     os.makedirs(run_dir, mode=0o750, exist_ok=True)
-    rules = Rules(env["ROOM_ID"], [n for n, _ in nets], *ports)
+    rules = Rules(env["ROOM_ID"], [n for n, _ in nets], *ports, bridges=room_bridges(env))
     docker = Docker(os.environ.get("ROOM_DOCKER_SOCK", "/run/pool-room/docker.sock"))
     proxy_box: list[Proxy] = []
     table = Table(rules, docker, os.path.join(run_dir, "state.json"),

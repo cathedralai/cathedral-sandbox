@@ -25,5 +25,36 @@ def test_debug_ssh_makes_host_keys_before_sshd_checks_them() -> None:
 
 def test_measurement_mismatch_fails_the_install() -> None:
     text = (SEALED / "install-sealed.sh").read_text()
-    line = next(l for l in text.splitlines() if "MEASUREMENT DIFFERS" in l)
-    assert "exit 1" in line
+    branch = text[text.index("MEASUREMENT DIFFERS"):text.index("MEASUREMENT DIFFERS") + 600]
+    assert "exit 1" in branch
+
+
+def test_sealed_install_refuses_a_restart_with_live_rooms() -> None:
+    text = (SEALED / "install-sealed.sh").read_text()
+    assert text.index("refuse_sealed_restart_with_rooms\n") < text.index('systemctl restart "$UNIT"')
+    assert "SEALED_RESTART_WITH_ROOMS" in text
+
+
+def test_a_measurement_mismatch_stops_the_guest_and_keeps_the_old_image() -> None:
+    text = (SEALED / "install-sealed.sh").read_text()
+    branch = text[text.index("MEASUREMENT DIFFERS"):]
+    assert 'systemctl disable --now "$UNIT"' in branch and 'ln -sfn "$PREV_IMG"' in branch
+    assert text.index("PREV_IMG=$(readlink") < text.index('"$KIT/sealed/build-guest.sh"')
+
+
+def test_host_link_rules_are_checked_every_minute() -> None:
+    text = (SEALED / "install-sealed.sh").read_text()
+    assert "-net.timer" in text and "OnUnitActiveSec=1min" in text and "host-net.sh check" in text
+    net = (SEALED / "host-net.sh").read_text()
+    assert "check)" in net and 'exec "$0" up "$2"' in net
+
+
+def test_firmware_is_checked_before_the_long_build() -> None:
+    text = (SEALED / "install-sealed.sh").read_text()
+    assert text.index("apt-get install") < text.index('[ -f "$SEALED_OVMF" ] || { echo "no AmdSev firmware') < text.index('"$KIT/sealed/build-guest.sh"')
+
+
+def test_the_measured_initrd_takes_tracked_kit_files_only() -> None:
+    text = (SEALED / "build-guest.sh").read_text()
+    assert "git -C \"$KIT\" ls-files -z" in text
+    assert 'install -m 0644 "$KIT/$CATHEDRAL_TARBALL" "$R/opt/room-kit/dist/"' in text

@@ -18,6 +18,9 @@ source "$KIT/versions.lock"
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 PROFILE_FILE="$KIT/profiles/${API_PROFILE}.sh"
 [ -f "$PROFILE_FILE" ] || { echo "unknown API_PROFILE $API_PROFILE" >&2; exit 1; }
+# The key is read at step 9. Checking it here keeps a re-run from rewriting
+# config and restarting the room daemon before it fails on a missing file.
+[ -r "${ROOM_API_KEY_FILE:-}" ] || { echo "ROOM_API_KEY_FILE (${ROOM_API_KEY_FILE:-unset}) must be a readable file; keep it for re-runs" >&2; exit 1; }
 
 ROOM_ETC=/etc/pool-room
 ROOM_OPT=/opt/pool-room
@@ -74,10 +77,11 @@ if [ ${#need[@]} -gt 0 ]; then
   NEW_DOCKER=0; [[ " ${need[*]} " == *" docker.io "* ]] && NEW_DOCKER=1
   if [ $NEW_DOCKER = 1 ] && [ ! -e /usr/sbin/policy-rc.d ]; then
     printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d; chmod 0755 /usr/sbin/policy-rc.d; RM_POLICY=1
+    trap 'rm -f /usr/sbin/policy-rc.d' EXIT  # a failed apt must not leave every later package start blocked
   fi
   DEBIAN_FRONTEND=noninteractive apt-get update -q
   DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${need[@]}"
-  [ "${RM_POLICY:-0}" = 1 ] && rm -f /usr/sbin/policy-rc.d
+  [ "${RM_POLICY:-0}" = 1 ] && { rm -f /usr/sbin/policy-rc.d; trap - EXIT; }
   for p in "${need[@]}"; do mark "apt:$p"; done
   if [ $NEW_DOCKER = 1 ]; then
     systemctl mask docker.service docker.socket >/dev/null 2>&1 && mark "masked:docker"
@@ -148,14 +152,16 @@ mark "unit:$DATA_UNIT"
 fetch "$GVISOR_URL" sha512 "$GVISOR_SHA512" "$ROOM_OPT/cache/gvisor-$GVISOR_RELEASE.tar.bz2"
 if [ ! -x "$ROOM_OPT/gvisor-$GVISOR_RELEASE/runsc" ]; then
   mkdir -p "$ROOM_OPT/gvisor-$GVISOR_RELEASE"
-  tar -xjf "$ROOM_OPT/cache/gvisor-$GVISOR_RELEASE.tar.bz2" -C "$ROOM_OPT/gvisor-$GVISOR_RELEASE"
+  tar --no-same-owner -xjf "$ROOM_OPT/cache/gvisor-$GVISOR_RELEASE.tar.bz2" -C "$ROOM_OPT/gvisor-$GVISOR_RELEASE"
 fi
 ln -sfn "gvisor-$GVISOR_RELEASE" "$ROOM_OPT/gvisor"
 RUNSC=$ROOM_OPT/gvisor/runsc
 
 # ---------------------------------------------------------------- 4. Python 3.12 + cathedral (pinned)
 fetch "$UV_URL" sha256 "$UV_SHA256" "$ROOM_OPT/cache/uv-$UV_VERSION.tar.gz"
-tar -xzf "$ROOM_OPT/cache/uv-$UV_VERSION.tar.gz" -C "$ROOM_OPT/bin" --strip-components=1
+# --no-same-owner: these archives carry their builder's uid (1001). A host with
+# a second user would own code that runs as root and the TLS front.
+tar --no-same-owner -xzf "$ROOM_OPT/cache/uv-$UV_VERSION.tar.gz" -C "$ROOM_OPT/bin" --strip-components=1
 export UV_PYTHON_INSTALL_DIR=$ROOM_OPT/python UV_CACHE_DIR=$ROOM_OPT/cache/uv UV_NO_CONFIG=1
 "$ROOM_OPT/bin/uv" python install -q "$PYTHON_VERSION"
 export UV_PYTHON_PREFERENCE=only-managed
@@ -163,7 +169,7 @@ export UV_PYTHON_PREFERENCE=only-managed
 "$ROOM_OPT/bin/uv" pip install -q --python "$ROOM_OPT/venv/bin/python" --require-hashes --only-binary :all: -r "$KIT/files/requirements.lock"
 echo "$CATHEDRAL_TARBALL_SHA256  $KIT/$CATHEDRAL_TARBALL" | sha256sum -c --quiet -
 rm -rf "$ROOM_OPT/src.new" && mkdir -p "$ROOM_OPT/src.new"
-tar -xzf "$KIT/$CATHEDRAL_TARBALL" -C "$ROOM_OPT/src.new" --strip-components=1
+tar --no-same-owner -xzf "$KIT/$CATHEDRAL_TARBALL" -C "$ROOM_OPT/src.new" --strip-components=1
 rm -rf "$ROOM_OPT/src" && mv "$ROOM_OPT/src.new" "$ROOM_OPT/src"
 echo "$CATHEDRAL_COMMIT" > "$ROOM_OPT/src/COMMIT"
 install -m 0755 "$KIT/room_health.py" "$ROOM_OPT/bin/room_health.py"
@@ -175,7 +181,8 @@ install -m 0755 "$KIT/room_egress.py" "$ROOM_OPT/bin/room_egress.py"
 
 # ---------------------------------------------------------------- 5. Caddy (pinned, sha512)
 fetch "$CADDY_URL" sha512 "$CADDY_SHA512" "$ROOM_OPT/cache/caddy-$CADDY_VERSION.tar.gz"
-tar -xzf "$ROOM_OPT/cache/caddy-$CADDY_VERSION.tar.gz" -C "$ROOM_OPT/bin" caddy
+tar --no-same-owner -xzf "$ROOM_OPT/cache/caddy-$CADDY_VERSION.tar.gz" -C "$ROOM_OPT/bin" caddy
+chown -R root:root "$ROOM_OPT/bin" "$ROOM_OPT/src" "$ROOM_OPT/gvisor-$GVISOR_RELEASE"
 
 # ---------------------------------------------------------------- 6. service user
 id poolroom >/dev/null 2>&1 || { useradd --system --home-dir /var/lib/pool-room --shell /usr/sbin/nologin poolroom; mark "user:poolroom"; }
@@ -246,6 +253,10 @@ xfs_info "$ROOM_DATA_DIR" >/dev/null
 grep -E " $ROOM_DATA_DIR " /proc/mounts | grep -q prjquota || { echo "prjquota missing on $ROOM_DATA_DIR" >&2; exit 1; }
 mkdir -p "$ROOM_DATA_DIR/work" "$ROOM_DATA_DIR/docker"
 chown poolroom:poolroom "$ROOM_DATA_DIR/work"
+# Assess again now that the volume is mounted: the first pass saw the parent
+# file system, and the disk leg of the sizing differed between a first
+# install and a re-run.
+python3 "$KIT/assess.py" --data-dir "$ROOM_DATA_DIR" --room-socket "$SOCK" --out "$ROOM_ETC/machine.json"
 ROOM_DISK_BYTES=$(df -B1 --output=size "$ROOM_DATA_DIR" | tail -1)
 size_room() { # size_room <bridge addresses (0 = no bridge limit)> <out>
   python3 "$KIT/size.py" "$ROOM_ETC/machine.json" --vcpu "$SHAPE_VCPU" --mem-gib "$SHAPE_MEM_GIB" --disk-gib "$SHAPE_DISK_GIB" \
@@ -277,6 +288,7 @@ systemctl enable --now "$ROOM_ID-docker.service"
 cp "$ROOM_ETC/room.env" "$ROOM_ETC/room.env.applied"
 if [ "$({ cat "$ROOM_ETC/daemon.json" "$ROOM_OPT/bin/room-net.sh"; net_settings; } | sha256sum)" != "$ROOM_DAEMON_HASH_BEFORE" ] && [ -n "${ROOM_DAEMON_HASH_BEFORE// -/}" ]; then
   log "room daemon config changed: restarting the room daemon (room guests only)"
+  refuse_restart_with_rooms  # rooms may have started since the first check
   systemctl restart "$ROOM_ID-docker.service"
 fi
 for _ in $(seq 60); do docker -H "unix://$SOCK" info >/dev/null 2>&1 && break; sleep 1; done
@@ -485,6 +497,7 @@ elif [ "$(iptables -S INPUT | head -1)" = "-P INPUT DROP" ] && ! iptables -C INP
 fi
 
 # ---------------------------------------------------------------- 13. start
+refuse_restart_with_rooms  # the guard at the top is minutes old by now
 systemctl daemon-reload
 if [ "${ROOM_EGRESS:-1}" = 1 ]; then systemctl enable -q "$ROOM_ID-egress.service"; systemctl restart "$ROOM_ID-egress.service"; fi
 systemctl enable -q "$ROOM_ID.service" "$ROOM_ID-health.service" "$ROOM_ID-reaper.timer"

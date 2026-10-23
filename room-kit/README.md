@@ -169,7 +169,8 @@ and prints the sha256. Put both values in `versions.lock`.
    make keys and does not print keys.
 3. Copy `room.env.example` to `room.env` and set the values.
 4. Run `sudo ./install.sh room.env`.
-5. Delete the key file from step 2. The kit keeps its own copy in
+5. Keep the key file from step 2 (mode 0600, root): a re-run reads it
+   again and stops at once without it. The kit keeps its own copy in
    `/etc/pool-room/` (root only, and the service group for health).
 
 Run `install.sh` again to apply a changed `room.env`. The installer is
