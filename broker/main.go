@@ -650,6 +650,12 @@ func (b *broker) finishCreate(w http.ResponseWriter, res createResult, tRecv tim
 
 func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestState, rest string) {
 	bid, tail, _ := strings.Cut(rest, "/")
+	// Room terminals stay closed until every hotel runs a package where a
+	// terminal line goes through the runtime's exec (B154).
+	if tail == "terminals" || strings.HasPrefix(tail, "terminals/") {
+		writeErr(w, 403, "terminals_disabled", "room terminals are disabled on this broker; use exec")
+		return
+	}
 	hotelID, hid, ok := strings.Cut(bid, ".")
 	h := b.hotelByID(hotelID)
 	if !ok || h == nil {
