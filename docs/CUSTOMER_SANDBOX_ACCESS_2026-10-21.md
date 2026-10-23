@@ -14,6 +14,9 @@
 | `"exclude_hotel_labels": {"sealed": "true"}` | Exclude any hotel with any listed label pair. |
 
 When no hotel matches the selection, the broker returns **409** `no_matching_hotel`.
+A sealed hotel takes only sealed creates: send `"sealed": true`, or ask the
+operator to set your `default_sealed`. Without it, a guest whose only hotel is
+sealed gets `no_matching_hotel`.
 
 ### Capacity errors
 
@@ -36,7 +39,7 @@ Allowlist entries in `"network": {"mode": "allowlist", "allow": [...]}` can be:
 | Entry type | Example | Behavior |
 |---|---|---|
 | Hostname | `"pypi.org"` | Reachable on TCP 80 and 443 via egress proxy |
-| Hostname with port | `"pypi.org:443"` or `"pypi.org:80"` | Normalized to bare hostname; same as above |
+| Hostname with port | `"pypi.org:443"` or `"pypi.org:80"` | Normalized to bare hostname; same as above (so `:443` also opens 80) |
 | Wildcard hostname | `"*.pythonhosted.org"` | All subdomains, TCP 80 and 443 only |
 | IPv4 address | `"1.2.3.4"` | Reachable on **all ports** directly (nftables) |
 | IPv4 CIDR | `"10.0.0.0/8"` | All addresses in the range, all ports |
@@ -79,6 +82,15 @@ non-empty JSON array of strings:
 
 ---
 
+## Files (`/v1/sandboxes/<id>/files`, `/tar`, `/stat`)
+
+The files API reaches **`/work` only**, the directory shared with the room.
+A path outside `/work` returns **400** `path_outside_work`. To place a file
+elsewhere in the room, write it under `/work` and move it with an exec.
+Snapshots and forks keep `/work` and the room's own filesystem.
+
+---
+
 ## Room isolation: gVisor vs sealed TEE
 
 The broker serves two kinds of hotel:
@@ -86,7 +98,7 @@ The broker serves two kinds of hotel:
 | Type | Isolation | Notes |
 |---|---|---|
 | Standard room | **gVisor** (`runsc`) kernel intercept | Protects the hotel host from room workloads; the hotel operator can read room memory. |
-| Sealed room | **AMD SEV-SNP** hardware TEE (VM) | The hotel operator cannot read room memory; attestation binds the guest policy to the hardware measurement. Use `"sealed": true` or `hotel_labels: {"sealed": "true"}`. |
+| Sealed room | **AMD SEV-SNP** hardware TEE (VM) | The host cannot read the guest's memory or its disk. The attestation binds the receipt key to the measured guest. The operator still holds the hotel API key, so it can call the API like the broker does; each such call gets a signed receipt. Today the API traffic between the broker and the guest is plain HTTP on the host's link. Use `"sealed": true` or `hotel_labels: {"sealed": "true"}`. |
 
 Sealed hotels are identified by the `sealed: true` label in
 `GET /v1/broker/hotels`. A guest's sealed default can be set by the broker
@@ -105,6 +117,15 @@ memory-only and resets on restart.
 An ops key (`"ops": true` in the guest config) receives the raw, unfiltered
 chain.
 
+A guest's chain is marked `"filtered": true`: it holds only that guest's
+receipts, so it has gaps. `verify_receipts.py --broker ... --key-file ...`
+checks each receipt's signature and attestation binding; the full-chain
+checks (no gaps, ends at `head`) apply only to an unfiltered chain.
+Each receipt proves itself: its signature, its link to the receipt before it
+and its binding to the attestation. A chain does not prove that nothing was
+left out, filtered or not, because `head` is not signed. To check the
+receipts of one room, use `--sandbox <id>`.
+
 ---
 
 ## Error codes quick reference
@@ -119,5 +140,7 @@ chain.
 | `snapshot_hotel_excluded` | 409 | The fork's snapshot hotel does not match the hotel selection |
 | `invalid_network_allowlist` | 400 | An allowlist entry is invalid (see above) |
 | `invalid_exec` | 400 | `cmd` is missing, empty, or not a list of strings |
+| `path_outside_work` | 400 | A files, tar or stat path is not under `/work` |
+| `invalid_network_mode` | 400 | A network change has no `mode` |
 | `room_limit` | 429 | Guest has reached its `max_rooms` limit |
 | `create_rate_limit` | 429 | Guest has exceeded `max_creates_per_minute` |

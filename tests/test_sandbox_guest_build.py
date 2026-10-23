@@ -86,3 +86,42 @@ def test_built_image_starts_a_room_without_a_pull(fake, app) -> None:
     resp = app.dispatch("POST", "/v1/sandboxes", AUTHZ, body)
     assert resp.status in (200, 202), resp.body
     assert fake.calls_of("pull") == []
+
+
+def test_build_context_fetch_checks_the_address_it_connects_to(monkeypatch) -> None:
+    # The guard resolved the name once, then urlopen resolved it again (DNS
+    # rebinding) and followed redirects with no check. The address the socket
+    # actually reaches must be public, on every hop.
+    import socket
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from cathedral import sandbox_guest
+    from cathedral.sandbox_provider import SandboxOpError
+
+    class Inside(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"INTERNAL")
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Inside)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    real = socket.getaddrinfo
+    answers = iter([[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]])
+
+    def rebinding(host, *args, **kwargs):
+        if host == "build.test":
+            return next(answers, None) or real("127.0.0.1", *args, **kwargs)
+        return real(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding)
+    try:
+        with pytest.raises(SandboxOpError) as err:
+            sandbox_guest._fetch_context_tar(f"http://build.test:{server.server_address[1]}/ctx")
+        assert err.value.code == "build_context_forbidden"
+    finally:
+        server.shutdown()

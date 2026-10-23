@@ -73,13 +73,13 @@ def table(tmp_path, monkeypatch):
     return t
 
 
-ALLOW = {"mode": "allowlist", "allow": ["pypi.org", "*.pythonhosted.org", "1.2.3.4", "10.0.0.0/8"]}
+ALLOW = {"mode": "allowlist", "allow": ["pypi.org", "*.pythonhosted.org", "1.2.3.4", "9.0.0.0/8"]}
 
 
 def test_policy_parse_canonical_and_matching() -> None:
-    p = eg.Policy.parse({"mode": "allowlist", "allow": ["PyPI.org.", "*.pythonhosted.org", "1.2.3.4", "10.1.2.3/8", "1.2.3.0/24"]})
-    assert p.document() == {"mode": "allowlist", "allow": ["*.pythonhosted.org", "1.2.3.0/24", "1.2.3.4", "10.0.0.0/8", "pypi.org"]}
-    assert p.nets == ("1.2.3.0/24", "10.0.0.0/8")  # 1.2.3.4 folds into 1.2.3.0/24: no interval overlap in nft
+    p = eg.Policy.parse({"mode": "allowlist", "allow": ["PyPI.org.", "*.pythonhosted.org", "1.2.3.4", "9.1.2.3/8", "1.2.3.0/24"]})
+    assert p.document() == {"mode": "allowlist", "allow": ["*.pythonhosted.org", "1.2.3.0/24", "1.2.3.4", "9.0.0.0/8", "pypi.org"]}
+    assert p.nets == ("1.2.3.0/24", "9.0.0.0/8")  # 1.2.3.4 folds into 1.2.3.0/24: no interval overlap in nft
     assert p.allows_name("pypi.org") and p.allows_name("PYPI.ORG.")
     assert p.allows_name("files.pythonhosted.org") and p.allows_name("a.b.pythonhosted.org")
     assert not p.allows_name("pythonhosted.org")  # a wildcard does not match its suffix
@@ -122,7 +122,7 @@ def test_put_switch_and_forget(table) -> None:
     assert room.ip == "10.214.0.2"
     add = table.runner.scripts[-1]
     assert "add element ip pool_room_egress_room_test named { 10.214.0.2 }" in add
-    assert "add element ip pool_room_egress_room_test allow { 10.214.0.2 . 1.2.3.4/32, 10.214.0.2 . 10.0.0.0/8 }" in add
+    assert "add element ip pool_room_egress_room_test allow { 10.214.0.2 . 1.2.3.4/32, 10.214.0.2 . 9.0.0.0/8 }" in add
     assert 'add element bridge pool_room_egress_room_test bound { "veth1" . 10.214.0.2 }' in add
     assert "open" not in add
     # Live switch to internet: the old elements go and the new one comes in one transaction.
@@ -365,3 +365,19 @@ def test_control_socket_round_trip(table, tmp_path) -> None:
     assert status == 200 and doc["forgotten"] is True
     srv.shutdown()
     Path(path).unlink(missing_ok=True)
+
+
+def test_put_refuses_a_room_without_its_bridge_port(table) -> None:
+    # Without the host-side port the room is not in @ports, so the guard that
+    # binds its source IP and MAC skips it and a raw-socket room could send as
+    # another room. Refuse the room instead (the API then removes the guest).
+    table.fake.add("d" * 64, "10.214.0.9", port=None)
+    with pytest.raises(RuntimeError):
+        table.put("d" * 64, "sbx_9", eg.Policy.parse({"mode": "internet"}))
+    assert table.policy_of("10.214.0.9") is None
+
+
+@pytest.mark.parametrize("bad", ["169.254.169.254/32", "127.0.0.1", "10.0.0.0/8", "0.0.0.0/0"])
+def test_policy_refuses_non_public_ranges(bad) -> None:
+    with pytest.raises(ValueError):
+        eg.Policy.parse({"mode": "allowlist", "allow": [bad]})

@@ -206,3 +206,37 @@ func TestIdempotentCreateSurvivesABrokerRestart(t *testing.T) {
 		t.Fatalf("image after restart: %v", view)
 	}
 }
+
+// Harbor image import warms only the guest's own hotels.
+func TestCompatImportKeepsToGuestHotels(t *testing.T) {
+	tc := newChain(t)
+	tc.b.mu.Lock()
+	tc.b.guests["g1"].limits = guestLimits{Hotels: []string{"b", "c"}}
+	tc.b.mu.Unlock()
+	status, doc := tc.clientCall(t, "POST", "/v1/images/import", mustMarshal(map[string]any{"image": "alpine:3.20"}), nil)
+	if status != 200 {
+		t.Fatalf("import: %d %v", status, doc)
+	}
+	time.Sleep(200 * time.Millisecond) // prefetch runs in the background
+	if n := callsTo(tc.hotels["a"], "POST /v1/images/prefetch"); n != 0 {
+		t.Fatalf("import warmed hotel a outside the guest's list")
+	}
+}
+
+// A live network change on the Harbor path must name its mode; a missing
+// mode must not open the room to the internet.
+func TestCompatNetworkChangeNeedsMode(t *testing.T) {
+	tc := newChain(t)
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image": "alpine:3.20", "network": "deny_all"}), nil)
+	if status != 200 && status != 201 && status != 202 {
+		t.Fatalf("create: %d %v", status, doc)
+	}
+	id, _ := doc["sandbox_id"].(string)
+	if id == "" {
+		id, _ = doc["id"].(string)
+	}
+	status, doc = tc.clientCall(t, "PUT", "/v1/sandboxes/"+id+"/network", mustMarshal(map[string]any{"network_allow": []string{"pypi.org"}}), nil)
+	if status != 400 {
+		t.Fatalf("network change without mode: %d %v", status, doc)
+	}
+}

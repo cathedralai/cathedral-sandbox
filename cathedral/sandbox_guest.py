@@ -16,6 +16,7 @@ import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -43,6 +44,7 @@ from cathedral.sandbox_api import (
     network_policy_sha256,
     ProcessHandle,
     SandboxContractError,
+    StatResult,
     StatusReport,
     TarGet,
 )
@@ -838,10 +840,62 @@ def _registry_host(image: str) -> str:
     return "https://index.docker.io/v1/"
 
 
+def _public_ip(raw: str) -> bool:
+    import ipaddress
+
+    try:
+        ip = ipaddress.ip_address(raw.split("%", 1)[0])
+    except ValueError:
+        return False
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _checked_opener() -> urllib.request.OpenerDirector:
+    """An opener that refuses a connection whose peer is not a public address.
+
+    A name check before the fetch is not enough: urlopen resolves the name
+    again (DNS rebinding) and follows redirects to any host. The check runs on
+    the socket each hop actually connected to.
+    """
+    import http.client
+
+    def check(sock) -> None:
+        peer = sock.getpeername()[0]
+        if not _public_ip(peer):
+            sock.close()
+            raise SandboxOpError("build_context_forbidden", 400, "build context URL reaches a non-public address")
+
+    class CheckedHTTP(http.client.HTTPConnection):
+        def connect(self) -> None:
+            super().connect()
+            check(self.sock)
+
+    class CheckedHTTPS(http.client.HTTPSConnection):
+        def connect(self) -> None:
+            super().connect()
+            check(self.sock)
+
+    class HTTP(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(CheckedHTTP, req)
+
+    class HTTPS(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(CheckedHTTPS, req, context=self._context)
+
+    return urllib.request.build_opener(HTTP, HTTPS)
+
+
 def _fetch_context_tar(url: str) -> bytes:
     """Fetch a build context. Fail closed against file:// and link-local/private SSRF."""
     from urllib.parse import urlparse
-    import ipaddress
     import socket
 
     parsed = urlparse(url)
@@ -869,27 +923,15 @@ def _fetch_context_tar(url: str) -> bytes:
             502,
             f"failed to resolve build context host: {exc}",
         ) from exc
-    for info in addrs:
-        raw = info[4][0]
-        try:
-            ip = ipaddress.ip_address(raw)
-        except ValueError:
-            continue
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_reserved
-            or ip.is_multicast
-            or ip.is_unspecified
-        ):
-            raise SandboxOpError(
-                "build_context_forbidden",
-                400,
-                "build context URL resolves to a non-public address",
-            )
+    # Early, clear refusal; the opener checks the real peer on every hop.
+    if any(not _public_ip(info[4][0]) for info in addrs):
+        raise SandboxOpError(
+            "build_context_forbidden",
+            400,
+            "build context URL resolves to a non-public address",
+        )
     try:
-        with urllib.request.urlopen(url, timeout=120) as resp:  # noqa: S310 — gated above
+        with _checked_opener().open(url, timeout=120) as resp:  # noqa: S310 — peer checked per hop
             return resp.read()
     except (urllib.error.URLError, OSError) as exc:
         raise SandboxOpError(
@@ -897,6 +939,34 @@ def _fetch_context_tar(url: str) -> bytes:
             502,
             f"failed to fetch build context: {exc}",
         ) from exc
+
+
+def _in_work(path: str) -> str:
+    """Refuse a file path outside /work, the only directory mounted into the room.
+
+    The files API reads and writes the host side of the mount. Any other path
+    lands on the host beside it: the room never sees the file and a snapshot
+    leaves it out, so a 200 there would be a lie.
+    """
+    if not isinstance(path, str) or not (path == "/work" or path.startswith("/work/")):
+        raise SandboxOpError("path_outside_work", 400, f"the files API reaches /work only: {path!r}")
+    return path
+
+
+def _read_room_log(path: Path) -> str:
+    """Read a process log from the room's /work without following a symlink.
+
+    The room can write /work, so it can swap its log for a link to a host file
+    (the hotel API key). O_NOFOLLOW refuses that; a FIFO or device reads empty.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return ""
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return ""
+        return fh.read().decode("utf-8", errors="replace")
 
 
 class DockerGuestProvider:
@@ -1451,8 +1521,7 @@ class DockerGuestProvider:
         guest = self._guests.get(sandbox_id)
         if guest is None or process_id not in guest.guest_processes:
             return self._inner.process_logs(sandbox_id, process_id)
-        path = guest.guest_processes[process_id]
-        return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        return _read_room_log(guest.guest_processes[process_id])
 
     def stop_process(self, sandbox_id: str, process_id: str) -> None:
         guest = self._guests.get(sandbox_id)
@@ -1469,16 +1538,21 @@ class DockerGuestProvider:
         )
 
     def write_file(self, sandbox_id: str, path: str, data: bytes, mode: int | None) -> None:
-        self._inner.write_file(sandbox_id, path, data, mode)
+        self._inner.write_file(sandbox_id, _in_work(path), data, mode)
 
     def read_file(self, sandbox_id: str, spec: FileGet) -> tuple[bytes, int]:
+        _in_work(spec.path)
         return self._inner.read_file(sandbox_id, spec)
 
     def write_tar(self, sandbox_id: str, path: str, tarball: bytes) -> None:
-        self._inner.write_tar(sandbox_id, path, tarball)
+        self._inner.write_tar(sandbox_id, _in_work(path), tarball)
 
     def read_tar(self, sandbox_id: str, spec: TarGet) -> bytes:
+        _in_work(spec.path)
         return self._inner.read_tar(sandbox_id, spec)
+
+    def stat(self, sandbox_id: str, path: str) -> StatResult:
+        return self._inner.stat(sandbox_id, _in_work(path))
 
     def snapshot(
         self,

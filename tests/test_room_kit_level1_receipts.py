@@ -130,6 +130,7 @@ def test_level1_chain_verifies_offline_without_snp(tmp_path, monkeypatch) -> Non
     assert out["chain"]["links_checked"] == 2
     assert out["chain"]["contiguous"] is True
     assert out["chain"]["first"] == 1 and out["chain"]["last"] == 2
+    assert out["checked"] == "whole chain to the head the server named"
 
 
 def test_tampered_level1_receipt_fails(tmp_path, monkeypatch) -> None:
@@ -275,3 +276,59 @@ printf 'wild %s\n' "$(receipts_api_upstream)"
     assert 'reverse_proxy $ROOM_API_UPSTREAM' in install
     assert "reverse_proxy 127.0.0.1:$ROOM_HEALTH_PORT" in install
     assert "receipts_apply_defaults" in install
+
+
+def test_guest_filtered_chain_verifies(tmp_path, monkeypatch) -> None:
+    # The broker gives a guest only its own receipts, with the hotel's head.
+    # A filtered chain is a subset: each receipt is checked, not the whole chain.
+    ledger = _chain(tmp_path, monkeypatch)
+    proc = _verify_cli(tmp_path, ledger.attestation(), {
+        "binding_sha256": ledger.binding_sha256, "head": ledger.head, "filtered": True,
+        "receipts": ledger.chain[1:],
+    })
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["verdict"] == "PASS"
+    # The doc says it is filtered, so only each receipt was checked: say so.
+    assert out["checked"] == "each receipt; not that none are missing"
+
+
+def test_fetch_chain_pages_a_filtered_chain_by_raw_offset(monkeypatch) -> None:
+    # The broker filters each hotel page, so a guest page is short while the
+    # hotel has more. Paging must follow the hotel's offset ("scanned"), not
+    # the number of receipts the guest got back.
+    monkeypatch.setattr(vr, "PAGE", 3)
+    raw = [{"seq": i, "mine": i in (2, 5, 7)} for i in range(1, 9)]
+    asked = []
+
+    def fake_get(url, _key):
+        after = int(url.split("after=")[1].split("&")[0])
+        asked.append(after)
+        page = raw[after:after + 3]
+        return {"head": "h", "filtered": True, "scanned": len(page),
+                "receipts": [r for r in page if r["mine"]]}
+
+    monkeypatch.setattr(vr, "get", fake_get)
+    doc = vr.fetch_chain("https://b", "h1", "k")
+    assert [r["seq"] for r in doc["receipts"]] == [2, 5, 7]
+    assert asked == [0, 3, 6]
+    assert doc["filtered"] is True
+
+
+def _sealed_att(cmdline: str) -> dict:
+    binding = {"schema": rr.BINDING_SCHEMA, "hotel": "room-a", "receipt_key_ed25519_b64": "AA==",
+               "measurement": "ab" * 48, "chip_id": "ef" * 64, "reported_tcb": "01" * 8,
+               "host_data": "cd" * 32, "policy": "0x30000", "kernel_cmdline": cmdline}
+    bsha = rr.sha(rr.canonical(binding))
+    report = bytearray(_fake_report())
+    report[0x50:0x90] = bytes.fromhex(bsha) + bytes(32)
+    return {"binding": binding, "binding_sha256": bsha, "report_b64": base64.b64encode(bytes(report)).decode()}
+
+
+def test_verifier_refuses_a_debug_sealed_build(tmp_path) -> None:
+    # A debug build gives the host root SSH into the guest. The SNP policy is
+    # the same, so the measured cmdline flag is what tells them apart.
+    ok = vr.verify_attestation(_sealed_att("rdinit=/init cathedral.debug=0"), None, None, str(tmp_path), None, True)
+    assert "cathedral.debug=0" in ok["kernel_cmdline"]
+    with pytest.raises(vr.Fail):
+        vr.verify_attestation(_sealed_att("rdinit=/init cathedral.debug=1"), None, None, str(tmp_path), None, True)

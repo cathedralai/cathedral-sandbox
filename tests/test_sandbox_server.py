@@ -211,6 +211,17 @@ def test_network_and_expose(app: SandboxApplication) -> None:
     assert ex.status == 200 and "8080" in json.loads(ex.body)["url"]
 
 
+def test_network_change_without_mode_is_refused(app: SandboxApplication) -> None:
+    # A change that names no mode must not silently open the room to the
+    # internet: it is refused and the room keeps its policy.
+    sid = _create(app)
+    app.dispatch("POST", f"/v1/sandboxes/{sid}/network", AUTH, json.dumps({"mode": "none"}).encode())
+    bad = app.dispatch("PUT", f"/v1/sandboxes/{sid}/network", AUTH, json.dumps({"allow": ["pypi.org"]}).encode())
+    assert bad.status == 400 and json.loads(bad.body)["error"]["code"] == "invalid_network_mode"
+    nested = app.dispatch("PUT", f"/v1/sandboxes/{sid}/network", AUTH, json.dumps({"network": {"mode": "deny_all"}}).encode())
+    assert nested.status == 400
+
+
 # ------------------------------------------------------------------ §3.9 images
 def test_prefetch_and_image_lookup(app: SandboxApplication) -> None:
     pf = app.dispatch("POST", "/v1/images/prefetch", AUTH, json.dumps({"images": ["repo/x:latest"]}).encode())

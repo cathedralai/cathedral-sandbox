@@ -79,6 +79,13 @@ def policy_sha256(policy: dict) -> str:
     return hashlib.sha256(canonical(policy)).hexdigest()
 
 
+# Ranges a room may not allowlist (same list as cathedral/sandbox_api.py): the
+# host firewall drops them anyway, so naming them must not open the policy.
+_NON_PUBLIC_V4 = tuple(ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+    "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
+))
+
 def classify(entry: str) -> tuple[str, str]:
     """("cidr", "1.2.3.0/24") | ("host", "pypi.org") | ("wild", "example.com").
 
@@ -115,6 +122,9 @@ def classify(entry: str) -> tuple[str, str]:
     if net is not None:
         if net.version != 4:
             raise ValueError(f"IPv6 is not supported: {entry!r}")
+        span = net if isinstance(net, ipaddress.IPv4Network) else ipaddress.ip_network(f"{net}/32")
+        if any(span.overlaps(n) for n in _NON_PUBLIC_V4):
+            raise ValueError(f"private, host or reserved ranges cannot be allowlisted: {entry!r}")
         return "cidr", str(net)
     if ":" in value or "/" in value:
         raise ValueError(f"bad allowlist entry {entry!r}")
@@ -365,6 +375,12 @@ class Table:
 
     def put(self, container_id: str, sandbox_id: str, policy: Policy) -> Room:
         ip, mac, port = self.docker.facts(container_id)
+        if not port:
+            # Without the host-side port the room is not in @ports, so the
+            # guard that binds its source IP and MAC would skip it and a
+            # raw-socket room could send as another room. Fail closed: the
+            # API removes a guest whose policy cannot be applied.
+            raise RuntimeError(f"container {container_id[:12]}: bridge port not found, room not admitted")
         with self.lock:
             old = self.by_cid.get(container_id)
             stale = self.by_ip.get(ip)

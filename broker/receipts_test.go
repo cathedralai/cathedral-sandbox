@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -174,4 +175,58 @@ func (tc *testChain) body(t *testing.T, key, method, path string) (int, []byte) 
 		t.Fatal(err)
 	}
 	return resp.StatusCode, raw
+}
+
+// A guest's own bulk delete is signed without a sandbox id; keep it for that
+// guest (the broker's own label is the last broker_guest label) and drop it
+// for everyone else, including a guest that forged the label earlier in the
+// query.
+func TestFilterKeepsOwnBulkDeleteReceipt(t *testing.T) {
+	body := []byte(`{"receipts":[` +
+		`{"statement":{"action":"bulk_delete","sandbox_id":null,"target":"DELETE /v1/sandboxes?label=job%3Dx&label=broker_guest%3Dg1"}},` +
+		`{"statement":{"action":"bulk_delete","sandbox_id":null,"target":"DELETE /v1/sandboxes?label=broker_guest%3Dg1&label=broker_guest%3Dg2"}},` +
+		`{"statement":{"action":"create","sandbox_id":null,"target":"POST /v1/sandboxes"}}` +
+		`],"count":3}`)
+	out, err := filterHotelReceiptsFor(body, map[string]bool{}, "g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Count int `json:"count"`
+	}
+	_ = json.Unmarshal(out, &doc)
+	if doc.Count != 1 || !strings.Contains(string(out), "job%3Dx") {
+		t.Fatalf("own bulk delete not kept exactly once: %s", out)
+	}
+}
+
+func TestFilteredChainIsMarkedFiltered(t *testing.T) {
+	body := []byte(`{"receipts":[{"statement":{"action":"create","sandbox_id":"a"}}],"count":1,"head":"h"}`)
+	out, err := filterHotelReceiptsFor(body, map[string]bool{"a": true}, "g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Filtered bool `json:"filtered"`
+	}
+	_ = json.Unmarshal(out, &doc)
+	if !doc.Filtered {
+		t.Fatalf("a guest's chain must say it is filtered, or verify_receipts.py checks it as a whole chain: %s", out)
+	}
+}
+
+func TestFilteredChainCountsScannedReceipts(t *testing.T) {
+	body := []byte(`{"receipts":[{"statement":{"sandbox_id":"a"}},{"statement":{"sandbox_id":"b"}},{"statement":{"sandbox_id":"c"}}],"count":3}`)
+	out, err := filterHotelReceiptsFor(body, map[string]bool{"b": true}, "g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Scanned int `json:"scanned"`
+		Count   int `json:"count"`
+	}
+	_ = json.Unmarshal(out, &doc)
+	if doc.Scanned != 3 || doc.Count != 1 {
+		t.Fatalf("a filtered page must say how many hotel receipts it covered, so a client can page on: %s", out)
+	}
 }

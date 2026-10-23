@@ -39,11 +39,11 @@ type savedTomb struct {
 }
 
 type savedState struct {
-	UUIDs      map[string]string                       `json:"uuids"` // client id -> broker room id
-	Idem       map[string]savedIdem                    `json:"idempotency"`
-	Tombs      map[string]savedTomb                    `json:"tombstones"`
-	Images     map[string]*compatImage                 `json:"images"`
-	GuestRooms map[string]map[string]map[string]bool   `json:"guest_rooms"` // guest -> hotel -> room id
+	UUIDs      map[string]string                     `json:"uuids"` // client id -> broker room id
+	Idem       map[string]savedIdem                  `json:"idempotency"`
+	Tombs      map[string]savedTomb                  `json:"tombstones"`
+	Images     map[string]*compatImage               `json:"images"`
+	GuestRooms map[string]map[string]map[string]bool `json:"guest_rooms"` // guest -> hotel -> room id
 }
 
 func (b *broker) markDirty() { b.dirty.Store(true) }
@@ -149,7 +149,13 @@ func (b *broker) saveBuildContext(img *compatImage) {
 		log.Printf("build context not saved: %v", err)
 		return
 	}
-	if err := os.WriteFile(filepath.Join(dir, img.ID+".tar.gz"), img.buildCtx, 0o600); err != nil {
+	// Write and rename, so a crash leaves the old file or the whole new one.
+	final := filepath.Join(dir, img.ID+".tar.gz")
+	if err := os.WriteFile(final+".tmp", img.buildCtx, 0o600); err != nil {
+		log.Printf("build context not saved: %v", err)
+		return
+	}
+	if err := os.Rename(final+".tmp", final); err != nil {
 		log.Printf("build context not saved: %v", err)
 	}
 }

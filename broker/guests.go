@@ -202,6 +202,16 @@ func (b *broker) patchGuest(w http.ResponseWriter, r *http.Request, id string) {
 		writeErr(w, 400, "invalid_limit", "limits must be 0 or more")
 		return
 	}
+	// In config, an absent list and max_rooms 0 mean "all hotels" and 1,000
+	// rooms. A PATCH that sends [] or 0 means the opposite, so refuse it.
+	if req.Hotels != nil && len(*req.Hotels) == 0 {
+		writeErr(w, 400, "invalid_limit", "hotels must name at least one hotel; an empty list would mean every hotel")
+		return
+	}
+	if req.MaxRooms != nil && *req.MaxRooms == 0 {
+		writeErr(w, 400, "invalid_limit", "max_rooms must be 1 or more; 0 would mean 1,000")
+		return
+	}
 	if req.Hotels != nil {
 		for _, h := range *req.Hotels {
 			if b.hotelByID(h) == nil {

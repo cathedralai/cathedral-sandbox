@@ -92,11 +92,20 @@ MIN_CREATES_PER_MINUTE = 100
 
 # §3.12 idempotency-key grammar (Harbor's own pattern: 8-128 of A-Za-z0-9._:-).
 _IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9._:-]{8,128}")
+# Ranges a room may not allowlist: the host firewall drops them anyway, and an
+# allowlist that names them would open the host, metadata or private networks
+# if that rule were ever missing.
+_NON_PUBLIC_V4 = tuple(ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+    "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
+))
 _LABEL_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,62}")
 _LABEL_VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,63}")
 # A docker reference path: optional registry, repository, and a :tag or @digest suffix.
+# Each part starts with a letter or digit: the ref is a docker CLI argument, and a
+# leading dash would read as a flag.
 _IMAGE_REF_RE = re.compile(
-    r"^(?:(?P<registry>[a-z0-9._-]+(?::[0-9]+)?)/)?(?P<repository>[a-z0-9._/-]+?)"
+    r"^(?:(?P<registry>[a-z0-9][a-z0-9._-]*(?::[0-9]+)?)/)?(?P<repository>[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)*?)"
     r"(?::(?P<tag>[A-Za-z0-9][A-Za-z0-9_.-]{0,127})|@(?P<digest>sha256:[0-9a-f]{64}))$"
 )
 # Agent IDE published templates (G6): sbt-<slug>-<hex>
@@ -286,6 +295,8 @@ def normalize_allow_entry(entry: object) -> str:
         except ValueError:
             raise SandboxContractError("invalid_network_allowlist", bad) from None
         _require(net.version == 4, "invalid_network_allowlist", f"allowlist entry {entry!r}: IPv6 is not supported")
+        _require(not any(net.overlaps(n) for n in _NON_PUBLIC_V4), "invalid_network_allowlist",
+                 f"allowlist entry {entry!r}: private, host or reserved ranges cannot be allowlisted")
         return str(net)
     try:
         addr = ipaddress.ip_address(value)
@@ -293,6 +304,8 @@ def normalize_allow_entry(entry: object) -> str:
         addr = None
     if addr is not None:
         _require(addr.version == 4, "invalid_network_allowlist", f"allowlist entry {entry!r}: IPv6 is not supported")
+        _require(not any(addr in n for n in _NON_PUBLIC_V4), "invalid_network_allowlist",
+                 f"allowlist entry {entry!r}: private, host or reserved addresses cannot be allowlisted")
         return str(addr)
     _require(":" not in value and "[" not in value, "invalid_network_allowlist", bad)
     if host_port is not None and host_port[1] not in (80, 443):

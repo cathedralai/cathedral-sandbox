@@ -138,6 +138,15 @@ func (b *broker) handleProbe(w http.ResponseWriter, r *http.Request, g *guestSta
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
+		// A hotel outside the guest's list may be dedicated to another
+		// guest: the probe must not start a room there.
+		if !g.limitsAllow(b, h.cfg.ID) {
+			mu.Lock()
+			out[h.cfg.ID] = probeResult{ProbedAt: time.Now().UTC().Format(time.RFC3339),
+				Error: "skipped: hotel is not in this guest's hotel list"}
+			mu.Unlock()
+			continue
+		}
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()

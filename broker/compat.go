@@ -285,6 +285,9 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 	// Warm every hotel in the background; a create pulls a missing image anyway.
 	pf, _ := json.Marshal(map[string]any{"images": []string{img.Ref}})
 	for _, ht := range b.hotelList() {
+		if !g.limitsAllow(b, ht.cfg.ID) { // never touch a hotel outside the guest's list
+			continue
+		}
 		go func(ht *hotel) {
 			_, _, _, _ = ht.do(context.Background(), "POST", "/v1/images/prefetch", nil, pf, 10*time.Minute)
 		}(ht)
@@ -491,6 +494,13 @@ func (b *broker) compatSetNetwork(w http.ResponseWriter, r *http.Request, rm *ro
 	allow := req["allow"]
 	if allow == nil {
 		allow = req["network_allow"]
+	}
+	// A live change must name its mode. compatNetwork defaults a missing
+	// mode to internet, which is right for a create but would turn a
+	// malformed change into full internet access.
+	if m, _ := req["mode"].(string); m == "" {
+		compatErr(w, 400, "invalid_network_mode", "network change needs a mode: internet, deny_all or allowlist", 0)
+		return
 	}
 	net, nerr := compatNetwork(req["mode"], allow)
 	if nerr != nil {
@@ -852,7 +862,8 @@ func (b *broker) runScript(ctx context.Context, rm *room, script string, stdin s
 	}
 	status, doc, err := b.hotelExec(ctx, rm, body, timeout)
 	if err != nil {
-		return nil, err
+		// A transport error names the hotel's private API URL; guests see the hotel id only.
+		return nil, fmt.Errorf("hotel %s did not answer", rm.h.cfg.ID)
 	}
 	if status != 200 {
 		return nil, fmt.Errorf("hotel answered %d", status)

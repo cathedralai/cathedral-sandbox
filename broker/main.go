@@ -521,14 +521,26 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 			// The hotel could not start the room (for example a full bridge).
 			// Rest it for a short time and try another hotel.
 			rm.state, rm.since = stFailed, tDone
-			h.failed++
-			h.backoffUntil = time.Now().Add(hotelFailBackoff)
+			// A 4xx usually means the request is wrong, not the hotel:
+			// resting the hotel would turn one guest's bad input into a 503
+			// for the next create of every guest. 401 and 403 are the
+			// exception: the hotel rejects the broker's own key, so it is
+			// broken for every guest and must rest.
+			// image_pull_failed (502) is the guest's error only when the
+			// registry says the image is missing or denied; a hotel that
+			// cannot reach the registry (DNS, network, rate limit, disk) is
+			// at fault and must rest so the create moves on.
+			guestImage := status == 502 && errCodeOf(out) == "image_pull_failed" && guestImageFault(out)
+			if err != nil || (status >= 500 && !guestImage) || status == 401 || status == 403 {
+				h.failed++
+				h.backoffUntil = time.Now().Add(hotelFailBackoff)
+			}
 			if err != nil {
 				last = createResult{status: 502, doc: map[string]any{"error": map[string]string{"code": "hotel_unreachable", "message": "hotel " + h.cfg.ID + " did not answer"}}}
 			} else {
 				last = createResult{status: status, body: out, header: http.Header{"X-Broker-Hotel": {h.cfg.ID}}}
 			}
-			if status >= 400 && status < 500 { // the request itself is wrong: no retry
+			if (status >= 400 && status < 500) || guestImage { // the request itself is wrong: no retry
 				g.failed++
 				b.mu.Unlock()
 				return last
@@ -650,6 +662,14 @@ func (b *broker) finishCreate(w http.ResponseWriter, res createResult, tRecv tim
 
 func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestState, rest string) {
 	bid, tail, _ := strings.Cut(rest, "/")
+	// The tail goes to the hotel as part of its path. A dot segment would
+	// climb out of this room if anything between us and the hotel normalized it.
+	for _, seg := range strings.Split(tail, "/") {
+		if seg == "." || seg == ".." {
+			writeErr(w, 400, "invalid_path", "a sandbox path cannot contain . or .. segments")
+			return
+		}
+	}
 	hotelID, hid, ok := strings.Cut(bid, ".")
 	h := b.hotelByID(hotelID)
 	if !ok || h == nil {
@@ -738,13 +758,20 @@ func (b *broker) handleHotelDoc(w http.ResponseWriter, r *http.Request, rest str
 		writeErr(w, 404, "route_not_found", "no such hotel document")
 		return
 	}
+	// The receipt chain of a hotel outside the guest's list (for example one
+	// dedicated to another guest) is not this guest's, ops included. The
+	// attestation stays public: it proves the machine, not anyone's work.
+	if doc == "receipts" && !g.limitsAllow(b, h.cfg.ID) {
+		writeErr(w, 404, "route_not_found", "no such hotel document")
+		return
+	}
 	status, hdr, out, err := h.doBase(r.Context(), h.cfg.Health, "GET", "/room/"+doc, r.URL.Query(), nil, time.Minute)
 	if err != nil {
 		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
 		return
 	}
 	if doc == "receipts" && status == 200 && !g.cfg.Ops {
-		filtered, ferr := filterHotelReceipts(out, b.guestRoomIDs(g.cfg.ID, h.cfg.ID))
+		filtered, ferr := filterHotelReceiptsFor(out, b.guestRoomIDs(g.cfg.ID, h.cfg.ID), g.cfg.ID)
 		if ferr != nil {
 			writeErr(w, 502, "receipts_unreadable", "hotel receipt chain could not be filtered")
 			return
@@ -761,11 +788,16 @@ func (b *broker) handleHotelDoc(w http.ResponseWriter, r *http.Request, rest str
 
 // ---------------------------------------------------------------- gather
 
-func (b *broker) fanout(ctx context.Context, path string, q url.Values) map[string]json.RawMessage {
+// fanout asks every hotel in the guest's list. A hotel outside the list is
+// not asked: it may hang, and its id and totals are not the guest's.
+func (b *broker) fanout(ctx context.Context, g *guestState, path string, q url.Values) map[string]json.RawMessage {
 	out := map[string]json.RawMessage{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
+		if !g.limitsAllow(b, h.cfg.ID) {
+			continue
+		}
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
@@ -786,7 +818,7 @@ func (b *broker) fanout(ctx context.Context, path string, q url.Values) map[stri
 func (b *broker) handleList(w http.ResponseWriter, r *http.Request, g *guestState) {
 	q := r.URL.Query()
 	q.Add("label", guestLabel+"="+g.cfg.ID)
-	parts := b.fanout(r.Context(), "/v1/sandboxes", q)
+	parts := b.fanout(r.Context(), g, "/v1/sandboxes", q)
 	all := []map[string]any{}
 	errs := map[string]string{}
 	for hid, raw := range parts {
@@ -828,7 +860,7 @@ func sumInto(dst map[string]any, src map[string]any) {
 }
 
 func (b *broker) handleQuota(w http.ResponseWriter, r *http.Request, g *guestState) {
-	parts := b.fanout(r.Context(), "/v1/quota", nil)
+	parts := b.fanout(r.Context(), g, "/v1/quota", nil)
 	total := map[string]any{}
 	hotels := map[string]any{}
 	for hid, raw := range parts {
@@ -864,7 +896,7 @@ func (b *broker) handleQuota(w http.ResponseWriter, r *http.Request, g *guestSta
 func (b *broker) handleUsage(w http.ResponseWriter, r *http.Request, g *guestState) {
 	q := r.URL.Query()
 	q.Add("label", guestLabel+"="+g.cfg.ID)
-	parts := b.fanout(r.Context(), "/v1/usage", q)
+	parts := b.fanout(r.Context(), g, "/v1/usage", q)
 	writeJSON(w, 200, map[string]any{"hotels": parts})
 }
 
@@ -879,6 +911,9 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
+		if !g.limitsAllow(b, h.cfg.ID) { // a guest has no rooms outside its list
+			continue
+		}
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
@@ -1378,7 +1413,38 @@ func main() {
 			}
 		}
 	})
-	srv := &http.Server{Addr: b.cfg.Listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+	// No WriteTimeout: an exec may run for hours. IdleTimeout closes kept-alive
+	// connections that send nothing, so they cannot pile up to the fd limit.
+	srv := &http.Server{Addr: b.cfg.Listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
 	log.Printf("central booking on %s: %d hotels, %d guests", b.cfg.Listen, len(b.hotelList()), len(b.guests))
 	log.Fatal(srv.ListenAndServe())
+}
+
+// errCodeOf reads error.code from a hotel's JSON error body.
+func errCodeOf(body []byte) string {
+	var doc struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(body, &doc)
+	return doc.Error.Code
+}
+
+// guestImageFault reports whether a hotel's image_pull_failed message names
+// a missing or denied image (the guest's error) rather than a hotel fault.
+func guestImageFault(body []byte) bool {
+	var doc struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(body, &doc)
+	m := strings.ToLower(doc.Error.Message)
+	for _, s := range []string{"manifest unknown", "not found", "pull access denied", "repository does not exist", "invalid reference format", "unauthorized"} {
+		if strings.Contains(m, s) {
+			return true
+		}
+	}
+	return false
 }

@@ -544,3 +544,38 @@ def test_quota_exposes_pacing_and_snapshot_store(provider: InMemorySandboxProvid
     q = provider.quota()
     assert q["creates_per_minute"] == api.MIN_CREATES_PER_MINUTE
     assert q["snapshot_store"] == api.MIN_SNAPSHOTS
+
+
+def _swap_after_check(provider: InMemorySandboxProvider, monkeypatch, sid: str, outside) -> None:
+    # The room owns /work. Model the race: the path check sees a real dir, then
+    # the room swaps it for a link to a host directory before the file opens.
+    root = provider._sandboxes[sid].root  # noqa: SLF001
+    original = provider._host  # noqa: SLF001
+
+    def racing_host(sandbox, path):
+        host = original(sandbox, path)
+        sub = root / "work" / "sub"
+        if sub.is_dir() and not sub.is_symlink():
+            for child in sub.iterdir():
+                child.unlink()
+            sub.rmdir()
+            sub.symlink_to(outside)
+        return host
+
+    monkeypatch.setattr(provider, "_host", racing_host)
+
+
+def test_files_api_does_not_follow_a_link_swapped_in_after_the_check(provider: InMemorySandboxProvider, monkeypatch, tmp_path) -> None:
+    sid = provider.create(_req(), api_key="k", idempotency=None, body_digest="d")["id"]
+    outside = tmp_path / "host-etc"
+    outside.mkdir()
+    (outside / "api.key").write_bytes(b"SECRET")
+    provider.write_file(sid, "/work/sub/api.key", b"in-room", None)
+    _swap_after_check(provider, monkeypatch, sid, outside)
+    with pytest.raises(SandboxOpError):
+        provider.read_file(sid, FileGet(path="/work/sub/api.key"))
+    with pytest.raises(SandboxOpError):
+        provider.stat(sid, "/work/sub/api.key")
+    with pytest.raises(SandboxOpError):
+        provider.write_file(sid, "/work/sub/api.key", b"overwrite", None)
+    assert (outside / "api.key").read_bytes() == b"SECRET"

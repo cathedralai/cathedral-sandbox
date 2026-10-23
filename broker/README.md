@@ -68,7 +68,7 @@ limits without a restart:
 | Route (operator key) | What it does |
 |---|---|
 | `GET /v1/broker/guests` | Every guest with its limits and active rooms. No key hashes. |
-| `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed` and `hotels`. |
+| `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed` and `hotels`. `max_rooms: 0` and `hotels: []` get 400: in config they mean 1,000 rooms and every hotel. |
 
 A runtime change stays in memory. A restart goes back to the config file.
 

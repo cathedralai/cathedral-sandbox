@@ -187,8 +187,11 @@ if [ $DEBUG = 1 ]; then
   printf 'ListenAddress %s\nPasswordAuthentication no\nPermitRootLogin prohibit-password\n' "$SEALED_GUEST_IP" \
     > "$R/etc/ssh/sshd_config.d/10-sealed-debug.conf"
   mkdir -p "$R/etc/systemd/system/ssh.service.d"
-  printf '[Service]\nExecStartPre=/usr/bin/ssh-keygen -A\n' > "$R/etc/systemd/system/ssh.service.d/10-hostkeys.conf"
+  # Ubuntu's unit runs "sshd -t" first and the build removes host keys, so
+  # reset the list: make keys, then check the config.
+  printf '[Service]\nExecStartPre=\nExecStartPre=/usr/bin/ssh-keygen -A\nExecStartPre=/usr/sbin/sshd -t\n' > "$R/etc/systemd/system/ssh.service.d/10-hostkeys.conf"
   in_root systemctl enable -q ssh.service
+  in_root systemctl mask -q ssh.socket 2>/dev/null || true
 else
   in_root systemctl mask -q ssh.service ssh.socket 2>/dev/null || true
   rm -f "$R"/etc/ssh/ssh_host_*

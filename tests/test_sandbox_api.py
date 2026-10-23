@@ -449,3 +449,10 @@ def test_exec_timeout_limit_comes_from_config(monkeypatch) -> None:
         ExecRequest(cmd="true", timeout_seconds=601)
     monkeypatch.setenv("CATHEDRAL_SANDBOX_EXEC_TIMEOUT_MAX", "not-a-number")
     assert ExecRequest(cmd="true", timeout_seconds=14400).timeout_seconds == 14400
+
+
+@pytest.mark.parametrize("ref", ["-privileged:latest", "--network:latest", "-v/x:latest", "reg.io/-x:1", "-reg.io/x:1"])
+def test_image_reference_cannot_start_a_part_with_a_dash(ref) -> None:
+    # The ref goes to the docker CLI as an argument; a leading dash reads as a flag.
+    with pytest.raises(SandboxContractError):
+        ImageSource(image=ref)
