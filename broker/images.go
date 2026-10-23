@@ -340,6 +340,9 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	notFound := &apiErr{404, "snapshot_not_found", "no snapshot " + ref}
 	if hotelID, rest, ok := strings.Cut(ref, "."); ok && b.hotelByID(hotelID) != nil {
 		h := b.hotelByID(hotelID)
+		if !g.limitsAllow(b, h.cfg.ID) {
+			return nil, "", notFound
+		}
 		list, err := b.hotelSnapshots(ctx, g, h)
 		if err != nil {
 			return nil, "", &apiErr{502, "hotel_unreachable", "hotel " + h.cfg.ID + " did not answer"}
@@ -358,6 +361,9 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	var hits []hit
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
+		if !g.limitsAllow(b, h.cfg.ID) { // a hotel outside the list may hang; it holds none of this guest's snapshots
+			continue
+		}
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
@@ -429,6 +435,9 @@ func (b *broker) handleSnapshotList(w http.ResponseWriter, r *http.Request, g *g
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
+		if !g.limitsAllow(b, h.cfg.ID) {
+			continue
+		}
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
