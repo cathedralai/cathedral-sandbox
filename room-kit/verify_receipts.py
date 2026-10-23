@@ -199,10 +199,15 @@ def verify_attestation(att: dict, expected_measurement: str | None, prod: str | 
     need(rep["host_data"] == binding["host_data"], "report HOST_DATA differs from the binding")
     need(hex(rep["policy"]) == binding["policy"], "report policy differs from the binding")
     need(not rep["policy"] & (1 << 19), "guest policy allows debug")
+    # A debug build has the same SNP policy but gives the host root SSH into
+    # the guest. The flag is on the measured kernel cmdline.
+    cmdline = binding.get("kernel_cmdline") or ""
+    need("cathedral.debug=1" not in cmdline.split(), "debug build: the host can log in to this guest")
     if expected_measurement:
         need(rep["measurement"] == expected_measurement.lower(), "measurement differs from the expected build")
     out = {"binding_sha256": bsha, "measurement": rep["measurement"], "chip_id": rep["chip_id"].hex()[:16] + "...",
-           "policy": hex(rep["policy"]), "host_data": rep["host_data"], "report_version": rep["version"]}
+           "policy": hex(rep["policy"]), "host_data": rep["host_data"], "report_version": rep["version"],
+           "kernel_cmdline": cmdline}
     if not skip_amd:
         out["amd"] = verify_amd(report, rep, product(rep, prod), cache, ark_sha256)
     return out

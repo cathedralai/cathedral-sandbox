@@ -96,5 +96,5 @@ done
 [ -f "$ATT" ] || { echo "no attestation after 15 min; see the serial log" >&2; exit 1; }
 GOT=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["binding"]["measurement"])' "$ATT")
 cp "$ATT" "$IMG/attestation-$(date -u +%Y%m%dT%H%M%SZ).json"
-if [ "$GOT" = "$EXPECTED" ]; then log "measurement matches the build: $GOT"; else log "MEASUREMENT DIFFERS: report $GOT, build $EXPECTED"; fi
+if [ "$GOT" = "$EXPECTED" ]; then log "measurement matches the build: $GOT"; else log "MEASUREMENT DIFFERS: report $GOT, build $EXPECTED"; exit 1; fi
 log "done. hotel API (receipts front) http://$SEALED_GUEST_IP:18090, attestation $ATT"

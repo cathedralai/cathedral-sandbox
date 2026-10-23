@@ -35,7 +35,11 @@ refuse_restart_with_rooms() {
   [ -S "$SOCK" ] || return 0
   [ "${ROOM_RESTART_WITH_ROOMS:-0}" = 1 ] && return 0
   local live
-  live=$(docker -H "unix://$SOCK" ps -q --filter label=cathedral.sandbox.owner 2>/dev/null | wc -l | tr -d ' ')
+  live=$(docker -H "unix://$SOCK" ps -q --filter label=cathedral.sandbox.owner 2>/dev/null | wc -l | tr -d ' ') || {
+    echo "room-kit: the room daemon on $SOCK does not answer, so live rooms cannot be counted." >&2
+    echo "Fix the daemon, or set ROOM_RESTART_WITH_ROOMS=1 to go on." >&2
+    exit 1
+  }
   if [ "${live:-0}" -gt 0 ]; then
     echo "room-kit: $live live room(s); an update restarts the API and removes them." >&2
     echo "Wait until no room is open, or set ROOM_RESTART_WITH_ROOMS=1." >&2
@@ -102,7 +106,16 @@ receipts_apply_defaults
 # shellcheck disable=SC1091
 source "$KIT/lib/room_nets_mode.sh"
 resolve_room_nets
-write_room_env
+if [ "$ROOM_NETS_AUTO" = 1 ] && [ -f "$ROOM_ETC/room.env.applied" ]; then
+  # The running units read room.env. Until step 8 plans the new list, keep
+  # the applied one, so a re-run that fails before step 8 leaves no live room
+  # network without its egress rules.
+  ROOM_NETS=$(sed -n 's/^ROOM_NETS="\(.*\)"$/\1/p' "$ROOM_ETC/room.env.applied")
+  write_room_env
+  ROOM_NETS=""
+else
+  write_room_env
+fi
 
 # ---------------------------------------------------------------- 2. data volume (xfs, prjquota, no nodev)
 DATA_UNIT=$ROOM_ID-data.service

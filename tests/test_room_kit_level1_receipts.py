@@ -309,3 +309,22 @@ def test_fetch_chain_pages_a_filtered_chain_by_raw_offset(monkeypatch) -> None:
     assert [r["seq"] for r in doc["receipts"]] == [2, 5, 7]
     assert asked == [0, 3, 6]
     assert doc["filtered"] is True
+
+
+def _sealed_att(cmdline: str) -> dict:
+    binding = {"schema": rr.BINDING_SCHEMA, "hotel": "room-a", "receipt_key_ed25519_b64": "AA==",
+               "measurement": "ab" * 48, "chip_id": "ef" * 64, "reported_tcb": "01" * 8,
+               "host_data": "cd" * 32, "policy": "0x30000", "kernel_cmdline": cmdline}
+    bsha = rr.sha(rr.canonical(binding))
+    report = bytearray(_fake_report())
+    report[0x50:0x90] = bytes.fromhex(bsha) + bytes(32)
+    return {"binding": binding, "binding_sha256": bsha, "report_b64": base64.b64encode(bytes(report)).decode()}
+
+
+def test_verifier_refuses_a_debug_sealed_build(tmp_path) -> None:
+    # A debug build gives the host root SSH into the guest. The SNP policy is
+    # the same, so the measured cmdline flag is what tells them apart.
+    ok = vr.verify_attestation(_sealed_att("rdinit=/init cathedral.debug=0"), None, None, str(tmp_path), None, True)
+    assert "cathedral.debug=0" in ok["kernel_cmdline"]
+    with pytest.raises(vr.Fail):
+        vr.verify_attestation(_sealed_att("rdinit=/init cathedral.debug=1"), None, None, str(tmp_path), None, True)
