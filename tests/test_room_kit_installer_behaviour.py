@@ -118,7 +118,8 @@ if [ -n "$fmt" ]; then # install.sh's final check: 200 only with the hotel's own
   n=$(count curl-status)
   if [ -n "${FAKE_API_CODES:-}" ]; then code=$(pick "$n" "$FAKE_API_CODES")
   else code=401; case "$hdr" in @*) [ "$(cat "${hdr#@}")" = "Authorization: Bearer ${FAKE_API_KEY:-}" ] && code=200 ;; esac; fi
-  printf '%s' "$code"; exit 0
+  # Like real curl: 000 means no connection, which curl also reports as exit 7.
+  printf '%s' "$code"; [ "$code" = 000 ] && exit 7; exit 0
 fi
 case "$url" in
   */v1/sandboxes) # the sealed installer counts live rooms through the hotel API
