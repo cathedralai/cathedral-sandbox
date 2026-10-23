@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"path"
@@ -81,7 +82,11 @@ type compatExec struct {
 	cancel context.CancelFunc
 	result map[string]any
 	state  string
+	doneAt time.Time // when the command ended; a finished result is kept one hour
 }
+
+// execKeep is how long a finished background exec result stays for polling.
+const execKeep = time.Hour
 
 type compatTomb struct {
 	bid string
@@ -165,18 +170,24 @@ func (b *broker) roomByUUID(g *guestState, id string) *room {
 
 // hotelExec runs one exec on a room's hotel and returns the hotel answer.
 func (b *broker) hotelExec(ctx context.Context, rm *room, body map[string]any, timeout int) (int, map[string]any, error) {
+	status, _, doc, err := b.hotelExecH(ctx, rm, body, timeout)
+	return status, doc, err
+}
+
+// hotelExecH is hotelExec with the hotel's response headers (the signed receipt).
+func (b *broker) hotelExecH(ctx context.Context, rm *room, body map[string]any, timeout int) (int, http.Header, map[string]any, error) {
 	if max := b.maxExec(); timeout <= 0 || timeout > max {
 		timeout = max
 	}
 	body["timeout_seconds"] = timeout
 	raw, _ := json.Marshal(body)
-	status, _, out, err := rm.h.do(ctx, "POST", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/exec", nil, raw, time.Duration(timeout+60)*time.Second)
+	status, hdr, out, err := rm.h.do(ctx, "POST", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/exec", nil, raw, time.Duration(timeout+60)*time.Second)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	var doc map[string]any
 	_ = json.Unmarshal(out, &doc)
-	return status, doc, nil
+	return status, hdr, doc, nil
 }
 
 func (b *broker) serveCompat(w http.ResponseWriter, r *http.Request, g *guestState) {
@@ -186,7 +197,7 @@ func (b *broker) serveCompat(w http.ResponseWriter, r *http.Request, g *guestSta
 		writeJSON(w, 200, map[string]any{"owner_id": g.cfg.ID, "email": "", "scopes": []string{"sandboxes:control"},
 			"teams": []any{}, "api_key": map[string]any{"expires_at": nil, "budget_usd": nil}})
 	case p == "/v1/sandboxes/catalog" && r.Method == "GET":
-		b.compatCatalog(w)
+		b.compatCatalog(w, g)
 	case p == "/v1/runs" && r.Method == "POST":
 		writeJSON(w, 201, map[string]any{"url": ""})
 	case p == "/v1/images/import" && r.Method == "POST":
@@ -230,17 +241,8 @@ func (b *broker) serveCompat(w http.ResponseWriter, r *http.Request, g *guestSta
 // compatTemplates are the catalog templates: name -> {vcpu, memory GiB}.
 var compatTemplates = map[string][2]int{"room-1x4": {1, 4}, "room-2x8": {2, 8}, "room-4x16": {4, 16}}
 
-func (b *broker) compatCatalog(w http.ResponseWriter) {
-	b.mu.Lock()
-	free := 0
-	for _, h := range b.hotelList() {
-		if h.ok {
-			if f := h.slots - h.used(); f > 0 {
-				free += f
-			}
-		}
-	}
-	b.mu.Unlock()
+func (b *broker) compatCatalog(w http.ResponseWriter, g *guestState) {
+	free := b.freeRoomsFor(g)
 	tpl := func(name string, cpu, mem int, rate string) map[string]any {
 		return map[string]any{"name": name, "resources": map[string]any{"cpu": cpu, "memory_gib": mem}, "hourly_rate_usd": rate,
 			"network_modes": []string{"internet", "deny_all", "allowlist"}}
@@ -313,7 +315,7 @@ func (b *broker) compatIdem(w http.ResponseWriter, r *http.Request, g *guestStat
 		c := &capture{hdr: http.Header{}, status: 200}
 		fn(c, body)
 		e.status, e.body = c.status, c.buf.Bytes()
-		if c.status == 429 || c.status >= 500 { // a retry may run it again
+		if c.status == 429 || c.status >= 500 || c.hdr.Get("Retry-After") != "" { // a retry may run it again
 			b.compat.mu.Lock()
 			delete(b.compat.idem, k)
 			b.compat.mu.Unlock()
@@ -361,6 +363,9 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 			return
 		}
 		if ref == "" {
+			// After a restart no hotel holds the build until something asks
+			// for it; a client that only retries the create would wait forever.
+			b.ensureBuilds(img, g)
 			compatErr(w, 409, "image_not_ready", "image "+id+" is not built yet; poll /v1/images/"+id, 5)
 			return
 		}
@@ -382,7 +387,21 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		compatErr(w, 400, "invalid_source", "image_id is required", 0)
 		return
 	}
+	if shape, ok := req["shape"].(map[string]any); ok { // the cloud API's size fields
+		if v, ok := shape["vcpus"].(float64); ok && v > 0 {
+			res["vcpu"] = int(v)
+		}
+		if v, ok := shape["memory_mib"].(float64); ok && v > 0 {
+			res["memory_gib"] = int(math.Ceil(v / 1024))
+		}
+		if v, ok := shape["disk_gib"].(float64); ok && v > 0 {
+			res["disk_gib"] = int(v)
+		}
+	}
 	native["resources"] = res
+	if env, ok := req["env"].(map[string]any); ok && len(env) > 0 {
+		native["env"] = env // the hotel checks the names; the room needs them to run the task
+	}
 	net, nerr := compatNetwork(req["network"], req["network_allow"])
 	if nerr != nil {
 		compatErr(w, 400, nerr.code, nerr.msg, 0)
@@ -421,8 +440,7 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		compatErr(w, e.status, e.code, e.msg, retry)
 		return
 	}
-	out := b.createOne(r.Context(), g, native, time.Now(), pl)
-	b.unreserve(g, 1)
+	out := b.createMany(r.Context(), g, native, 1, time.Now(), pl)[0]
 	if out.status != 202 {
 		code, msg := "create_failed", "the hotel refused the room"
 		if e, ok := out.doc["error"].(map[string]string); ok {
@@ -448,6 +466,7 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		u = rm.uuid
 	}
 	b.mu.Unlock()
+	copyRoomHeaders(w.Header(), out.header) // the signed receipt, when the hotel has one
 	writeJSON(w, 201, compatView(out.doc, u))
 }
 
@@ -570,14 +589,7 @@ func (b *broker) compatQuota(w http.ResponseWriter, r *http.Request, g *guestSta
 	b.handleQuota(c, r, g)
 	var doc map[string]any
 	_ = json.Unmarshal(c.buf.Bytes(), &doc)
-	b.mu.Lock()
-	free := 0
-	for _, h := range b.hotelList() {
-		if f := h.slots - h.used(); h.ok && f > 0 {
-			free += f
-		}
-	}
-	b.mu.Unlock()
+	free := b.freeRoomsFor(g)
 	doc["admission_open"] = free > 0
 	doc["available"] = map[string]any{"rooms": free}
 	writeJSON(w, 200, doc)
@@ -631,8 +643,14 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		}
 		b.compat.mu.Lock()
 		b.compat.tombs[id] = compatTomb{bid: bid, at: time.Now()}
+		for eid, ex := range b.compat.execs { // results of a deleted room have no reader
+			if ex.room == id {
+				delete(b.compat.execs, eid)
+			}
+		}
 		b.compat.mu.Unlock()
 		b.markDirty()
+		copyRoomHeaders(w.Header(), c.hdr)
 		writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "cleanup_state": b.cleanupState(r.Context(), bid)})
 	case tail == "exec" && r.Method == "POST":
 		b.compatIdem(w, r, g, func(w http.ResponseWriter, raw []byte) {
@@ -641,11 +659,12 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 				compatErr(w, 400, "invalid_exec", err.Error(), 0)
 				return
 			}
-			status, doc, herr := b.hotelExec(r.Context(), rm, body, timeout)
+			status, hdr, doc, herr := b.hotelExecH(r.Context(), rm, body, timeout)
 			if herr != nil {
 				compatErr(w, 502, "hotel_unreachable", "the hotel did not answer", 5)
 				return
 			}
+			copyRoomHeaders(w.Header(), hdr)
 			if status != 200 {
 				out, _ := json.Marshal(doc)
 				w.Header().Set("Content-Type", "application/json")
@@ -681,9 +700,21 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		_ = json.Unmarshal(raw, &req)
 		ttl := 3600.0
 		if v, ok := req["extend_by_seconds"].(float64); ok && v > 0 {
-			ttl = v
+			// Relative: the hotel's heartbeat takes an absolute TTL, so add
+			// to what the room has left (sending v alone shortened rooms).
+			left := b.roomSecondsLeft(r.Context(), rm)
+			if left < 0 {
+				compatErr(w, 502, "hotel_unreachable", "the hotel did not say when the room ends", 5)
+				return
+			}
+			ttl = left + v
+		} else if v, ok := req["lifetime_seconds"].(float64); ok && v > 0 {
+			ttl = v // absolute from now, the cloud API's field
 		} else if v, ok := req["ttl_seconds"].(float64); ok && v > 0 {
 			ttl = v
+		}
+		if ttl > 48*3600 {
+			ttl = 48 * 3600
 		}
 		hb, _ := json.Marshal(map[string]any{"ttl_seconds": int(ttl)})
 		status, hdr, out, err := rm.h.do(r.Context(), "POST", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/heartbeat", nil, hb, 30*time.Second)
@@ -800,6 +831,7 @@ func (b *broker) compatExecStart(w http.ResponseWriter, rm *room, roomUUID strin
 		status, doc, herr := b.hotelExec(ctx, rm, body, timeout)
 		b.compat.mu.Lock()
 		defer b.compat.mu.Unlock()
+		ex.doneAt = time.Now()
 		switch {
 		case ex.state == "killed":
 		case herr != nil:
@@ -974,8 +1006,16 @@ func (b *broker) compatGetTar(w http.ResponseWriter, r *http.Request, rm *room) 
 	}
 	s, _ := doc["stdout"].(string)
 	data, derr := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(s), ""))
-	if exitCode(doc) != 0 || derr != nil || doc["truncated"] == true {
-		compatErr(w, 500, "tar_failed", fmt.Sprint(doc["stderr"]), 0)
+	if doc["truncated"] == true {
+		compatErr(w, 413, "file_too_large", "the archive is larger than the exec output limit; fetch the files one by one", 0)
+		return
+	}
+	if exitCode(doc) != 0 || derr != nil {
+		msg := strings.TrimSpace(fmt.Sprint(doc["stderr"]))
+		if msg == "" || msg == "<nil>" {
+			msg = "tar failed inside the room"
+		}
+		compatErr(w, 500, "tar_failed", msg, 0)
 		return
 	}
 	w.Header().Set("Content-Type", "application/gzip")
@@ -996,4 +1036,46 @@ func (b *broker) compatStat(w http.ResponseWriter, r *http.Request, rm *room) {
 	}
 	kind := strings.TrimSpace(fmt.Sprint(doc["stdout"]))
 	writeJSON(w, 200, map[string]any{"path": p, "exists": true, "is_dir": kind == "dir", "is_file": kind == "file"})
+}
+
+// roomSecondsLeft asks the hotel when the room ends. -1 when it cannot say.
+func (b *broker) roomSecondsLeft(ctx context.Context, rm *room) float64 {
+	status, _, out, err := rm.h.do(ctx, "GET", "/v1/sandboxes/"+url.PathEscape(rm.hid), nil, nil, 10*time.Second)
+	if err != nil || status != 200 {
+		return -1
+	}
+	var doc struct {
+		ExpiresAt string `json:"expires_at"`
+	}
+	if json.Unmarshal(out, &doc) != nil || doc.ExpiresAt == "" {
+		return -1
+	}
+	t, err := time.Parse(time.RFC3339Nano, doc.ExpiresAt)
+	if err != nil {
+		if t, err = time.Parse(time.RFC3339, doc.ExpiresAt); err != nil {
+			return -1
+		}
+	}
+	left := time.Until(t).Seconds()
+	if left < 0 {
+		left = 0
+	}
+	return left
+}
+
+// freeRoomsFor counts free slots on the hotels the guest may use. Counting
+// the whole chain told a guest whose only hotel is full that rooms are free.
+func (b *broker) freeRoomsFor(g *guestState) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	free := 0
+	for _, h := range b.hotelList() {
+		if !h.ok || !g.limits.allows(h.cfg.ID) {
+			continue
+		}
+		if f := h.slots - h.used(); f > 0 {
+			free += f
+		}
+	}
+	return free
 }

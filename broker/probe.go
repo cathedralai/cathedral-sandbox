@@ -37,7 +37,9 @@ func (b *broker) probeCreate(ctx context.Context, h *hotel, g *guestState, image
 		"labels":    map[string]string{guestLabel: g.cfg.ID, "kind": "probe"}})
 	status, _, out, err := h.do(ctx, "POST", "/v1/sandboxes", nil, body, 5*time.Minute)
 	if err != nil {
-		return "", err
+		// The transport error names the hotel's private URL, and the result
+		// goes to every live board: say only that the hotel did not answer.
+		return "", fmt.Errorf("hotel %s did not answer", h.cfg.ID)
 	}
 	var doc map[string]any
 	_ = json.Unmarshal(out, &doc)
@@ -147,6 +149,18 @@ func (b *broker) handleProbe(w http.ResponseWriter, r *http.Request, g *guestSta
 			mu.Unlock()
 			continue
 		}
+		b.mu.Lock()
+		resting := h.drain() || time.Now().Before(h.backoffUntil)
+		b.mu.Unlock()
+		if resting {
+			// Drain means no new rooms here; a probe room would block the
+			// hotel's removal and a kit update.
+			mu.Lock()
+			out[h.cfg.ID] = probeResult{ProbedAt: time.Now().UTC().Format(time.RFC3339),
+				Error: "skipped: hotel is draining or resting"}
+			mu.Unlock()
+			continue
+		}
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
@@ -177,6 +191,9 @@ func (b *broker) saveCaps() {
 	}
 	b.mu.Lock()
 	m := map[string]any{}
+	for id, c := range b.capsOnDisk { // a hotel not loaded yet keeps its entry
+		m[id] = c
+	}
 	for _, h := range b.hotelList() {
 		if h.caps != nil {
 			m[h.cfg.ID] = h.caps
@@ -199,6 +216,9 @@ func (b *broker) loadCaps() {
 	if json.Unmarshal(raw, &m) != nil {
 		return
 	}
+	b.mu.Lock()
+	b.capsOnDisk = m // hotels added after this (runtime joins) take theirs in addHotel
+	b.mu.Unlock()
 	for id, c := range m {
 		if h := b.hotelByID(id); h != nil {
 			h.caps = c

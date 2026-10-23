@@ -56,7 +56,7 @@ def test_timeout_form_is_probed_once_per_room(fake: FakeDocker) -> None:
             assert result.exit_code == 0 and result.stdout == "hi"
         runs = _guest_execs(fake, "hello")
         assert len(runs) == 3
-        assert all(c[c.index("timeout"):][:3] == ["timeout", "-t", "30"] for c in runs)
+        assert all(c[c.index("timeout"):][:5] == ["timeout", "-s", "KILL", "-t", "30"] for c in runs)
         probes = [c for c in fake.calls_of("exec") if c[-1] == "true"]
         assert len(probes) == 2  # GNU form refused, BusyBox form accepted; then cached
     finally:

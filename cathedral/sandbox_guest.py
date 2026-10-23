@@ -314,6 +314,97 @@ class GuestRecord:
     timeout_form: str | None = None
 
 
+# A room's exec output, process log and the API's own log record are capped
+# here: the API reads a room's bytes into memory, and a room is not trusted
+# with the API's memory. The hotel's catalog states this limit.
+EXEC_OUTPUT_CAP = 16 * 1024 * 1024
+BUILD_CONTEXT_CAP = 256 << 20
+BUILD_CONTEXT_EXPANDED_CAP = 1 << 30
+
+# docker run errors that name the request, not the hotel.
+_GUEST_START_FAULTS = (
+    ("executable file not found", "invalid_entrypoint"),
+    ("exec format error", "invalid_entrypoint"),
+    ("no such file or directory", "invalid_entrypoint"),
+    ("permission denied", "invalid_entrypoint"),
+    ("unable to find user", "invalid_user"),
+    ("unable to find group", "invalid_user"),
+    ("chdir to cwd", "invalid_workdir"),
+    ("not a directory", "invalid_workdir"),
+)
+
+
+def _guest_start_fault(stderr: str) -> str | None:
+    """The error code for a docker run failure the request caused, or None."""
+    text = (stderr or "").lower()
+    for needle, code in _GUEST_START_FAULTS:
+        if needle in text:
+            return code
+    return None
+
+
+def _run_bounded(argv, *, timeout, input_bytes, env, cap: int) -> subprocess.CompletedProcess[bytes]:
+    """subprocess.run with each output stream kept to cap + 1 bytes."""
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    kept: dict[str, bytes] = {}
+
+    def drain(name: str, stream) -> None:
+        buf = bytearray()
+        for chunk in iter(lambda: stream.read(65536), b""):
+            if len(buf) <= cap:
+                buf.extend(chunk[: cap + 1 - len(buf)])
+        kept[name] = bytes(buf)
+
+    readers = [threading.Thread(target=drain, args=(n, st), daemon=True) for n, st in (("out", proc.stdout), ("err", proc.stderr))]
+    for t in readers:
+        t.start()
+    if input_bytes is not None:
+        def feed() -> None:
+            try:
+                proc.stdin.write(input_bytes)
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        threading.Thread(target=feed, daemon=True).start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+    for t in readers:
+        t.join()
+    return subprocess.CompletedProcess(argv, proc.returncode, kept.get("out", b""), kept.get("err", b""))
+
+
+def _auth_pulled_path() -> Path:
+    return Path(os.environ.get("CATHEDRAL_SANDBOX_AUTH_PULLED_FILE") or Path(os.environ.get("HOME", "/tmp")) / ".cathedral-auth-pulled.json")
+
+
+def _load_auth_pulled() -> set[str]:
+    """Images pulled with registry credentials. Kept on disk: after a restart
+    a key without credentials must still not start another key's private image."""
+    try:
+        data = json.loads(_auth_pulled_path().read_text())
+        return {x for x in data if isinstance(x, str)}
+    except (OSError, ValueError):
+        return set()
+
+
+def _save_auth_pulled(refs: set[str]) -> None:
+    try:
+        path = _auth_pulled_path()
+        path.write_text(json.dumps(sorted(refs)))
+    except OSError:
+        pass
+
+
 class DockerClient:
     """Real docker CLI only — every call hits the local daemon."""
 
@@ -339,17 +430,21 @@ class DockerClient:
         timeout: float | None = 120.0,
         input_bytes: bytes | None = None,
         env: Mapping[str, str] | None = None,
+        output_cap: int | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        """Run argv. Output is decoded with replacement: a room's bytes are
+        not always UTF-8, and a decode error must not drop the request.
+        With output_cap, at most cap + 1 bytes of each stream are kept (the
+        extra byte shows the overflow) and the rest is drained and dropped.
+        """
         merged = None if env is None else {**os.environ, **dict(env)}
         try:
-            return subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                input=(None if input_bytes is None else input_bytes.decode("utf-8", "replace")),
-                check=False,
-                env=merged,
+            if output_cap is None:
+                raw = subprocess.run(argv, capture_output=True, timeout=timeout, input=input_bytes, check=False, env=merged)
+            else:
+                raw = _run_bounded(argv, timeout=timeout, input_bytes=input_bytes, env=merged, cap=output_cap)
+            return subprocess.CompletedProcess(
+                raw.args, raw.returncode, raw.stdout.decode("utf-8", "replace"), raw.stderr.decode("utf-8", "replace")
             )
         except FileNotFoundError as exc:
             raise SandboxOpError(
@@ -494,9 +589,13 @@ class DockerClient:
             return {}
 
     def build(self, *, tag: str, context_dir: Path, dockerfile_name: str = "Dockerfile") -> None:
+        # The classic builder, not BuildKit: BuildKit runs RUN steps in its
+        # own runc worker and ignores the daemon's default runtime, so a
+        # build's commands ran on the host kernel while rooms ran under gVisor.
         result = self.run(
             ["docker", "build", "-t", tag, "-f", str(context_dir / dockerfile_name), str(context_dir)],
             timeout=900.0,
+            env={"DOCKER_BUILDKIT": "0"},
         )
         if result.returncode != 0:
             raise SandboxOpError(
@@ -615,6 +714,10 @@ class DockerClient:
             result = self._run_guest(stripped, name)
         if result.returncode != 0:
             self.remove_confirmed(name, timeout=60.0)
+            if fault := _guest_start_fault(result.stderr):
+                # The request is wrong, not the hotel: a 502 here rested the
+                # hotel for every guest at the broker.
+                raise SandboxOpError(fault, 400, f"the room could not start: {result.stderr.strip()[:400]}")
             raise SandboxOpError(
                 "guest_start_failed",
                 502,
@@ -694,6 +797,7 @@ class DockerClient:
                 cmd,
                 timeout=float(timeout_seconds),
                 input_bytes=(stdin.encode() if stdin is not None else None),
+                output_cap=EXEC_OUTPUT_CAP,
             )
         except SandboxOpError as exc:
             if exc.code == "docker_timeout":
@@ -703,6 +807,20 @@ class DockerClient:
                 return 137, "", "exec timed out", True
             raise
         return result.returncode, result.stdout, result.stderr, False
+
+    def exit_code_if_stopped(self, container_id: str) -> int | None:
+        """The exit code of a container that is no longer running, else None."""
+        try:
+            r = self.run(["docker", "inspect", "--format", "{{.State.Running}} {{.State.ExitCode}}", container_id], timeout=15.0)
+        except SandboxOpError:
+            return None
+        parts = r.stdout.split()
+        if r.returncode != 0 or len(parts) != 2 or parts[0] != "false":
+            return None
+        try:
+            return int(parts[1])
+        except ValueError:
+            return None
 
     def remove(self, container_id: str) -> None:
         """Best-effort removal. The result is not checked; use remove_confirmed for GC."""
@@ -932,13 +1050,16 @@ def _fetch_context_tar(url: str) -> bytes:
         )
     try:
         with _checked_opener().open(url, timeout=120) as resp:  # noqa: S310 — peer checked per hop
-            return resp.read()
+            data = resp.read(BUILD_CONTEXT_CAP + 1)
     except (urllib.error.URLError, OSError) as exc:
         raise SandboxOpError(
             "build_context_fetch_failed",
             502,
             f"failed to fetch build context: {exc}",
         ) from exc
+    if len(data) > BUILD_CONTEXT_CAP:
+        raise SandboxOpError("build_context_too_large", 413, f"build context is over {BUILD_CONTEXT_CAP} bytes")
+    return data
 
 
 def _in_work(path: str) -> str:
@@ -966,7 +1087,31 @@ def _read_room_log(path: Path) -> str:
     with os.fdopen(fd, "rb") as fh:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return ""
-        return fh.read().decode("utf-8", errors="replace")
+        return fh.read(EXEC_OUTPUT_CAP).decode("utf-8", errors="replace")
+
+
+def _sweep_stale_bases(own: Path) -> None:
+    """Remove work bases an earlier instance left (killed mid-stop by systemd).
+
+    Each instance keeps its rooms' /work under one mkdtemp base in TMPDIR. A
+    stop that ran out of its time budget left those on the data volume for
+    good; nothing else ever looked at them. Bases older than a minute that
+    are not ours go. Only the kit sets the switch (one API per host).
+    """
+    try:
+        parent = own.parent
+        for base in parent.glob("cathedral-sandbox-*"):
+            if base == own or not base.is_dir():
+                continue
+            try:
+                if time.time() - base.stat().st_mtime < 60:
+                    continue
+                shutil.rmtree(base, ignore_errors=True)
+                print(f"cathedral-sandbox: removed stale work base {base}", file=sys.stderr, flush=True)
+            except OSError:
+                continue
+    except OSError:
+        return
 
 
 class DockerGuestProvider:
@@ -1015,7 +1160,7 @@ class DockerGuestProvider:
         self._registry_mirror = os.environ.get("CATHEDRAL_SANDBOX_REGISTRY_MIRROR", "").strip() or None
         # Images pulled with registry credentials. A create of one of these always
         # pulls, so the registry still checks the caller's credentials.
-        self._auth_pulled: set[str] = set()
+        self._auth_pulled: set[str] = _load_auth_pulled()
         if not self._client.info_ok():
             raise SandboxOpError(
                 "runtime_unavailable",
@@ -1057,6 +1202,8 @@ class DockerGuestProvider:
                 runtime_label=runtime_label,
             )
         self._capabilities_dind = False
+        if os.environ.get("CATHEDRAL_SANDBOX_SWEEP_STALE_BASES", "") == "1":
+            _sweep_stale_bases(self._inner._base)  # noqa: SLF001
 
     @property
     def capabilities_dind(self) -> bool:
@@ -1089,6 +1236,8 @@ class DockerGuestProvider:
 
                         try:
                             with tarfile.open(fileobj=io.BytesIO(context), mode="r:*") as tf:
+                                if sum(max(m.size, 0) for m in tf.getmembers()) > BUILD_CONTEXT_EXPANDED_CAP:
+                                    raise SandboxOpError("invalid_build_context", 400, "build context expands past 1 GiB")
                                 tf.extractall(work, filter="data")
                         except (tarfile.TarError, OSError) as exc:
                             raise SandboxOpError("invalid_build_context", 400, f"build context is not a valid tar: {exc}") from exc
@@ -1146,10 +1295,11 @@ class DockerGuestProvider:
         """Return the snapshot id for *ref* (an id or a name), or None when unknown."""
         with self._inner._lock:  # noqa: SLF001
             snapshots = self._inner._snapshots  # noqa: SLF001
-            if ref in snapshots:
+            visible = self._inner._snapshot_visible  # noqa: SLF001
+            if ref in snapshots and visible(ref):
                 return ref
             for sid, (_, rec) in snapshots.items():
-                if rec.name == ref:
+                if rec.name == ref and visible(sid):
                     return sid
         return None
 
@@ -1202,9 +1352,9 @@ class DockerGuestProvider:
                 self.delete(doc["id"])
             if idempotency is not None:
                 with self._inner._lock:  # noqa: SLF001
-                    seen = self._inner._idempotency.get(idempotency)  # noqa: SLF001
+                    seen = self._inner._idempotency.get((api_key, idempotency))  # noqa: SLF001
                     if seen is not None and seen[1] is docs:
-                        del self._inner._idempotency[idempotency]  # noqa: SLF001
+                        del self._inner._idempotency[(api_key, idempotency)]  # noqa: SLF001
             raise
         if "sandboxes" in docs:
             return {"sandboxes": started, "count": len(started)}
@@ -1271,6 +1421,7 @@ class DockerGuestProvider:
         )
         if registry_auth is not None:
             self._auth_pulled.add(image)
+            _save_auth_pulled(self._auth_pulled)
 
     def _start_guest(self, doc: dict[str, Any], request: CreateSandboxRequest) -> dict[str, Any]:
         """Start the guest for one record. The caller releases the record on failure."""
@@ -1324,10 +1475,18 @@ class DockerGuestProvider:
             # now; on failure the guest goes, so no guest runs unmanaged.
             try:
                 applied = self._egress.apply(container_id, sandbox_id, request.network.policy)
-            except BaseException:
+            except BaseException as exc:
+                exited = self._client.exit_code_if_stopped(container_id)
                 self._client.remove_confirmed(container_id, timeout=self._rm_timeout)
                 self._egress.forget(container_id)
                 self._release_pending(sandbox_id)
+                if exited is not None:
+                    # The daemon found no running container: the entrypoint
+                    # ended at once. That is the request's fault, not ours.
+                    raise SandboxOpError(
+                        "entrypoint_exited", 400,
+                        f"the room's entrypoint ended at once with exit code {exited}; a room needs a long-running entrypoint",
+                    ) from exc
                 raise
         if not self._inner.has_record(sandbox_id):
             # GC or DELETE removed the record while the guest started. Do not
@@ -1423,10 +1582,12 @@ class DockerGuestProvider:
         # The customer command runs exactly once: an exit code of 127 from it
         # is its own result, not a sign that the timeout binary is missing.
         form = self._timeout_form(guest)
+        # GNU: TERM at the limit, KILL 5 s later for a command that ignores
+        # TERM. BusyBox: KILL at the limit (its -k is not on every build).
         if form == "gnu":
-            wrapped = ["timeout", str(timeout_seconds), *argv]
+            wrapped = ["timeout", "-k", "5", str(timeout_seconds), *argv]
         elif form == "busybox":
-            wrapped = ["timeout", "-t", str(timeout_seconds), *argv]
+            wrapped = ["timeout", "-s", "KILL", "-t", str(timeout_seconds), *argv]
         else:
             wrapped = argv
         t0 = time.perf_counter()
@@ -1455,6 +1616,10 @@ class DockerGuestProvider:
             )
             sandbox.container_stdout.extend(out.encode("utf-8", "replace"))
             sandbox.container_stderr.extend(err.encode("utf-8", "replace"))
+            # The log record keeps the last EXEC_OUTPUT_CAP bytes: a room that
+            # prints without end must not grow the API's memory without end.
+            del sandbox.container_stdout[:-EXEC_OUTPUT_CAP]
+            del sandbox.container_stderr[:-EXEC_OUTPUT_CAP]
             self._inner._touch(sandbox)  # noqa: SLF001
         cap = 16 * 1024 * 1024
         truncated = len(out.encode()) > cap or len(err.encode()) > cap
@@ -1619,6 +1784,11 @@ class DockerGuestProvider:
 
     def delete_snapshot(self, snapshot_id: str) -> bool:
         existed = self._inner.delete_snapshot(snapshot_id)
+        if not existed:
+            # Unknown to the caller, or another key's: the image stays with
+            # its record. One whose record expired meanwhile loses its image
+            # in the next sweep.
+            return False
         self._snapshot_meta.pop(snapshot_id, None)
         image = self._snapshot_images.pop(snapshot_id, None)
         if image:
@@ -1636,6 +1806,10 @@ class DockerGuestProvider:
         local = self._snapshot_image(snapshot_id)
         snap_id = self._resolve_snapshot(snapshot_id) or snapshot_id
         digest = self._client.push(local, image, registry_auth=registry_auth)
+        if image != local:
+            # Untag: a local copy under the registry name would start for any
+            # key on this hotel with no pull and no credentials.
+            self._client.run(["docker", "image", "rm", image], timeout=60.0)
         return {"snapshot_id": snap_id, "image": image, "digest": digest, "includes_work": False}
 
     def set_network(self, sandbox_id: str, patch: NetworkPatch) -> dict[str, Any]:
@@ -1683,6 +1857,8 @@ class DockerGuestProvider:
             )
         mode = "deny_all" if patch.mode == "none" else patch.mode
         policy = canonical_network_policy(mode, patch.allow)
+        with self._inner._lock:  # noqa: SLF001
+            self._inner._require_running(sandbox_id)  # noqa: SLF001  a frozen room is 409 before the daemon moves
         applied = self._egress.apply(guest.container_id, sandbox_id, policy)
         guest.policy, guest.policy_sha256 = applied["policy"], applied["policy_sha256"]
         guest.network_mode = mode
@@ -1869,6 +2045,7 @@ class DockerGuestProvider:
             if sid not in queued and not (sid and self._inner.has_record(sid))
         ]
         removed = sum(1 for gone in self._remove_many(orphans) if gone)
+        self._reconcile_snapshot_images()
         if self._net_pool is not None:
             # Drift guard: count ports from what this API holds now.
             with self._doomed_lock:
@@ -1908,9 +2085,36 @@ class DockerGuestProvider:
                     self._reconcile_locked()
             finally:
                 self._drain_lock.release()
-        # Drops expired log tombstones. Live expired records are already "deleting".
-        self._inner.sweep()
+        # Drops expired log tombstones only. A record that became collectable
+        # during the drain goes through the two-phase delete on the next
+        # sweep; collecting it here left its container and policy behind.
+        self._inner.sweep_tombstones()
+        self._gc_snapshot_images()
         return marked
+
+    def _gc_snapshot_images(self) -> None:
+        """Remove the committed image of a snapshot whose record expired."""
+        with self._inner._lock:  # noqa: SLF001
+            self._inner._sweep_snapshots_locked()  # noqa: SLF001
+            live = set(self._inner._snapshots)  # noqa: SLF001
+        for sid, image in list(self._snapshot_images.items()):
+            if sid not in live:
+                self._client.run(["docker", "image", "rm", image], timeout=60.0)
+                self._snapshot_images.pop(sid, None)
+                self._snapshot_meta.pop(sid, None)
+
+    def _reconcile_snapshot_images(self) -> None:
+        """Remove cathedral-snap-* images no snapshot record names (left by a restart)."""
+        listed = self._client.run(
+            ["docker", "images", "--filter", "reference=cathedral-snap-*", "--format", "{{.Repository}}:{{.Tag}}"],
+            timeout=60.0,
+        )
+        if listed.returncode != 0:
+            return
+        known = set(self._snapshot_images.values())
+        for image in listed.stdout.split():
+            if image not in known:
+                self._client.run(["docker", "image", "rm", image], timeout=60.0)
 
     def pending_removals(self) -> dict[str, str]:
         """Sandbox id -> container id for containers not yet confirmed gone."""

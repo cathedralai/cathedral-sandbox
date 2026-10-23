@@ -8,6 +8,8 @@ ConditionPathIsDirectory=/sys/kernel/config/tsm/report
 ConditionPathExists=/etc/cathedral/audit-miner.env
 StartLimitIntervalSec=300
 StartLimitBurst=5
+# Page a person when the start limit leaves the unit failed.
+OnFailure=cathedral-validator-access-alert@%n.service
 
 [Service]
 Type=simple

@@ -6,7 +6,7 @@ import base64
 import hashlib
 import os
 import struct
-from typing import Iterable, Mapping
+from typing import Mapping
 
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"

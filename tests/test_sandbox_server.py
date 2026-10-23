@@ -420,3 +420,46 @@ def test_openapi_security_scheme_present() -> None:
     doc = openapi_document(base_url="https://cathedral.test/api")
     assert doc["servers"][0]["url"] == "https://cathedral.test/api"
     assert doc["components"]["securitySchemes"]["bearerAuth"]["scheme"] == "bearer"
+
+
+@pytest.mark.parametrize("payload", [
+    {"image": {"image": "repo/app:latest", "tag": "latest"}},
+    {"image": "repo/app:latest", "resources": {"vcpu": 1, "bogus": 2}},
+    {"image": "repo/app:latest", "entrypoint": 123},
+    {"image": "repo/app:latest", "build": {"dockerfile": "FROM x", "nope": 1}},
+])
+def test_wrong_shaped_create_is_a_400_not_a_dropped_connection(app: SandboxApplication, payload) -> None:
+    # A JSON-valid body with a wrong field shape raised a bare TypeError out
+    # of dispatch. The listener then closed the connection with no answer, and
+    # the broker read that as a hotel outage and rested the hotel for everyone.
+    r = app.dispatch("POST", "/v1/sandboxes", AUTH, json.dumps(payload).encode())
+    assert r.status == 400, r.body
+    assert json.loads(r.body)["error"]["code"] == "invalid_request"
+
+
+def test_unexpected_handler_error_is_a_500_json_answer(app: SandboxApplication, monkeypatch) -> None:
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom at /etc/pool-room/api.key")
+
+    monkeypatch.setattr(app.provider, "list", boom)
+    r = app.dispatch("GET", "/v1/sandboxes", AUTH, b"")
+    assert r.status == 500
+    doc = json.loads(r.body)
+    assert doc["error"]["code"] == "internal_error"
+    assert "boom" not in r.body.decode() and "api.key" not in r.body.decode()
+
+
+def test_real_listener_answers_a_wrong_shaped_create(app: SandboxApplication) -> None:
+    import http.client
+
+    httpd, (host, port) = run(app, host="127.0.0.1", port=0)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        c = http.client.HTTPConnection(host, int(port), timeout=5)
+        c.request("POST", "/v1/sandboxes", body=json.dumps({"image": {"image": "repo/app:latest", "tag": "x"}}).encode(),
+                  headers={**AUTH, "Content-Type": "application/json"})
+        assert c.getresponse().status == 400
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

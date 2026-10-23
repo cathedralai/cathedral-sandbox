@@ -136,11 +136,11 @@ Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
 - Exec: the longest exec is `max_exec_seconds` in the config (default
   14,400). Keep it at or below the hotel limit
   `CATHEDRAL_SANDBOX_EXEC_TIMEOUT_MAX` (default 14,400).
-  The exec body field is `cmd` (a non-empty JSON **array** of strings);
-  `command` is also accepted as an alias. A string `cmd` value gives 400
-  `invalid_exec`. Large exec output is truncated by the hotel at
-  `exec_output_limit_bytes` (default 16 MiB); the response includes
-  `"truncated": true` when that happens.
+  On the Harbor/ctcli path the exec body field is `cmd` (a non-empty JSON
+  **array** of strings) or the alias `command`; a string value gives 400
+  `invalid_exec`. The native `/v1` route reads `cmd` only and runs a string
+  through `sh -c`. Exec output is capped by the hotel at 16 MiB per stream;
+  the response includes `"truncated": true` when that happens.
 - Image build (client path): `POST /v1/images/build` takes the Dockerfile
   and the build context. The broker asks each hotel that takes new rooms
   to build it. The image is `ready` when one hotel has it, and a create
@@ -162,7 +162,7 @@ the config, an operator adds and removes hotels without a restart:
 
 | Route (operator key) | What it does |
 |---|---|
-| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "threads"?, "ram_gib"?}`. The broker first calls `GET /v1/status` on the hotel with the key (`"verify": false` skips it). |
+| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?}`. `"sealed": true` is what makes a hotel sealed; a `sealed` label alone leaves it taking unsealed creates. The broker first calls `GET /v1/status` on the hotel with the key (`"verify": false` skips it). |
 | `PATCH /v1/broker/hotels/<id>` | Sets `drain` and `labels`. |
 | `DELETE /v1/broker/hotels/<id>` | Removes a runtime hotel that has no rooms. Drain it first. |
 

@@ -85,3 +85,73 @@ def test_bad_receipt_paging_is_a_400(front, query) -> None:
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     c.request("GET", "/room/receipts?" + query, headers={"Authorization": "Bearer " + KEY.decode()})
     assert c.getresponse().status == 400
+
+
+def _post(port: int, path: str, body: bytes, extra: dict | None = None):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    c.request("POST", path, body=body, headers={"Authorization": "Bearer " + KEY.decode(),
+                                                 "Content-Type": "application/json", **(extra or {})})
+    r = c.getresponse()
+    return r.status, dict(r.getheaders()), r.read()
+
+
+def _receipt(headers: dict) -> dict:
+    import base64 as b64
+
+    raw = headers["X-Room-Receipt"]
+    return json.loads(b64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+
+
+def test_an_image_given_as_an_object_is_signed_by_its_reference(front, monkeypatch) -> None:
+    # The API accepts {"image": {"image": ref, "registry_auth": ...}}. The
+    # front crashed on the dict (unhashable) after the create had run, and on
+    # a refused create it signed the registry password into the chain.
+    port, seen, _mode, ledger = front
+    asked = []
+    monkeypatch.setattr(rr.Server, "image_digest", lambda self, ref: asked.append(ref) or "sha256:abc")
+    body = json.dumps({"image": {"image": "repo/app:latest", "registry_auth": {"username": "u", "password": "hunter2"}}}).encode()
+    status, headers, _out = _post(port, "/v1/sandboxes", body)
+    assert status == 200 and "X-Room-Receipt" in headers
+    st = _receipt(headers)["statement"]
+    assert st["image"] == "repo/app:latest" and st["image_digest"] == "sha256:abc" and asked == ["repo/app:latest"]
+    assert "hunter2" not in json.dumps(ledger.chain)
+    assert len(seen) == 1
+
+
+def test_a_lone_surrogate_in_the_body_is_refused_before_the_api_runs_it(front) -> None:
+    port, seen, _mode, ledger = front
+    body = b'{"cmd": ["echo", "\\udc80"]}'
+    status, _headers, out = _post(port, "/v1/sandboxes/sbx_1/exec", body)
+    assert status == 400 and b"invalid_request" in out
+    assert seen == [] and ledger.chain == []
+
+
+def test_image_inspect_errors_give_no_digest(front, monkeypatch) -> None:
+    # The real image_digest must swallow a docker timeout or a missing
+    # docker binary: a digest is a bonus, the receipt is the product.
+    import subprocess
+
+    port, _seen, _mode, _ledger = front
+
+    def run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], kwargs.get("timeout", 30))
+
+    monkeypatch.setattr(rr.subprocess, "run", run)
+    status, headers, _out = _post(port, "/v1/sandboxes", json.dumps({"image": "repo/app:latest"}).encode())
+    assert status == 200 and _receipt(headers)["statement"]["image_digest"] is None
+
+
+def test_a_signing_failure_still_answers_the_caller(front, monkeypatch) -> None:
+    # The action ran; a dropped connection would read as a hotel outage at the
+    # broker (hotel rested, create retried elsewhere: an orphan room per hotel).
+    port, seen, _mode, ledger = front
+    monkeypatch.setattr(rr.Server, "image_digest", lambda self, ref: None)
+
+    def broken(statement):
+        raise RuntimeError("hsm down")
+
+    monkeypatch.setattr(ledger, "sign", broken)
+    status, headers, out = _post(port, "/v1/sandboxes", json.dumps({"image": "repo/app:latest"}).encode())
+    assert status == 200 and json.loads(out) == {"exit_code": 0}
+    assert "X-Room-Receipt" not in headers and headers.get("X-Room-Receipt-Error") == "RuntimeError"
+    assert len(seen) == 1

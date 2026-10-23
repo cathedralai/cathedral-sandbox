@@ -84,6 +84,7 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.n++
 		id := fmt.Sprintf("sbx_%d", f.n)
 		f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": req["labels"]})
+		w.Header().Set("X-Room-Receipt", "signed-create")
 		writeJSON(w, 202, map[string]any{"id": id, "state": "running", "snapshot_id": req["snapshot_id"]})
 	case p == "/v1/sandboxes" && r.Method == "GET":
 		// Like a hotel: every "label" filter must match.
@@ -126,6 +127,7 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"network": map[string]any{"mode": req["mode"], "allow": req["allow"], "policy": policy, "policy_sha256": "abc"}})
 	case strings.HasSuffix(p, "/exec") && r.Method == "POST":
 		f.execs = append(f.execs, req)
+		w.Header().Set("X-Room-Receipt", "signed-exec")
 		writeJSON(w, 200, map[string]any{"exit_code": 0, "stdout": "", "stderr": "", "timed_out": false})
 	case p == "/v1/images/build" && r.Method == "POST":
 		f.builds = append(f.builds, req)
@@ -183,6 +185,17 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			images = append(images, map[string]any{"ref": ref, "size_bytes": 3640000})
 		}
 		writeJSON(w, 202, map[string]any{"operation_id": "op_2", "status": "done", "result": map[string]any{"images": images}})
+	case strings.HasPrefix(p, "/v1/sandboxes/") && strings.Count(p, "/") == 3 && r.Method == "DELETE":
+		id := strings.TrimPrefix(p, "/v1/sandboxes/")
+		for i, rm := range f.rooms {
+			if rm["id"] == id {
+				f.rooms = append(f.rooms[:i], f.rooms[i+1:]...)
+				w.Header().Set("X-Room-Receipt", "signed-delete")
+				w.WriteHeader(204)
+				return
+			}
+		}
+		writeErr(w, 404, "sandbox_not_found", "no sandbox "+id)
 	default:
 		writeErr(w, 404, "route_not_found", p)
 	}

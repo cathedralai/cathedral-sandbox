@@ -332,3 +332,26 @@ def test_verifier_refuses_a_debug_sealed_build(tmp_path) -> None:
     assert "cathedral.debug=0" in ok["kernel_cmdline"]
     with pytest.raises(vr.Fail):
         vr.verify_attestation(_sealed_att("rdinit=/init cathedral.debug=1"), None, None, str(tmp_path), None, True)
+
+
+def test_a_fresh_hotel_with_no_receipts_verifies(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "tsm_provider", lambda: None)
+    fresh = rr.Ledger("room-b", str(tmp_path / "b"))
+    proc = _verify_cli(tmp_path, fresh.attestation(), {"binding_sha256": fresh.binding_sha256, "head": fresh.head, "receipts": []})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(proc.stdout)["chain"]["receipts"] == 0
+
+
+def test_sealed_flags_refuse_a_level1_answer(tmp_path, monkeypatch) -> None:
+    # A sealed guest whose TSM is missing silently runs level 1. The customer
+    # who asked for a measurement must not get PASS from a level-1 binding.
+    ledger = _chain(tmp_path, monkeypatch)
+    att = tmp_path / "attestation.json"
+    chain = tmp_path / "receipts.json"
+    att.write_text(json.dumps(ledger.attestation()))
+    chain.write_text(json.dumps({"binding_sha256": ledger.binding_sha256, "head": ledger.head, "receipts": ledger.chain}))
+    for flags in (["--expected-measurement", "ab" * 48], ["--ark-sha256", "cd" * 32], ["--require-sealed"]):
+        proc = subprocess.run([sys.executable, str(KIT / "verify_receipts.py"), "--attestation", str(att), "--receipts", str(chain), *flags],
+                              capture_output=True, text=True, check=False)
+        assert proc.returncode == 1, flags
+        assert "level 1" in json.loads(proc.stdout)["reason"], proc.stdout

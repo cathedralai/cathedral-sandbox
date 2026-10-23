@@ -9,13 +9,15 @@ PYTHON_VERSION=3.12
 CADDY_VERSION=2.11.4
 CADDY_URL=https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_amd64.tar.gz
 CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777ccc8fd0b6e6f2486ce3a33fe389fbb7db12d05baa474f4587509fb4f5ebf1c9
-# cathedral-sandbox commit 6701dda (allowlist hostname:80/:443; network changes must name a mode;
-# process logs read without following a symlink; files API reaches /work only and opens
-# each path component without following links; build context fetch checks every peer;
-# allowlists refuse private ranges; image refs cannot start with a dash),
+# cathedral-sandbox commit 99e0cc2 (review rounds 3 to 6: allowlist ports, network changes
+# must name a mode, files API /work only with no link following, build context peer check,
+# allowlists refuse private ranges, every request answered, bounded output, per-key
+# snapshots and replays, docker build through the classic builder, SIGTERM cleanup, a
+# blank or malformed key store or quota refused at start, stale work bases swept, a
+# wrong-shaped snapshot_id is a 400, deleting another key's snapshot leaves its image),
 # made with:
-#   ./make-dist.sh 6701dda   (git archive of pyproject.toml and cathedral/)
-CATHEDRAL_COMMIT=6701dda
-CATHEDRAL_TARBALL=dist/cathedral-6701dda.tar.gz
-CATHEDRAL_TARBALL_SHA256=033e8807a51fa9c8b3fe07e19d6d4e7db1f701c4fa1b439c36a559a10743c262
+#   ./make-dist.sh 99e0cc2   (git archive of pyproject.toml and cathedral/)
+CATHEDRAL_COMMIT=99e0cc2
+CATHEDRAL_TARBALL=dist/cathedral-99e0cc2.tar.gz
+CATHEDRAL_TARBALL_SHA256=32e21775a9ccaacb7827569a036d08d6aebd33fb9dfe0a82337486fbebbd5dad
 PROBE_IMAGE=alpine:3.20

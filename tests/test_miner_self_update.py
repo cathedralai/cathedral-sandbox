@@ -506,6 +506,18 @@ def test_the_fallback_passes_the_current_status_through_when_it_cannot_run(h):
     assert unreadable.exit_status == EXIT_FAULT
 
 
+def test_the_fallback_pages_on_an_unreadable_state_when_the_current_status_is_quiet(h):
+    """Review round 6: a refusal (10) counts as success for the unit, so an
+    unreadable state must not pass it through quietly."""
+
+    h.release(sequence=5, bundle=V2)
+    h.commit()
+    h.paths.state_file.write_text("not json")
+    unreadable = fallback_to_previous(h.host(running_tree=h.tree_a), EXIT_REFUSED)
+    assert unreadable.exit_status == EXIT_ALERT and unreadable.alert
+    assert "state unreadable" in unreadable.reason
+
+
 def test_the_fallback_command_passes_the_status_through_when_it_cannot_start(monkeypatch, tmp_path):
     monkeypatch.setenv(cli.ROOT_ENV, str(tmp_path))  # no config here, so it refuses at once
     assert cli.main(["fallback", "--current-status", "13"]) == EXIT_FAULT

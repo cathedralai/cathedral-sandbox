@@ -18,10 +18,19 @@ source "$KIT/versions.lock"
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 PROFILE_FILE="$KIT/profiles/${API_PROFILE}.sh"
 [ -f "$PROFILE_FILE" ] || { echo "unknown API_PROFILE $API_PROFILE" >&2; exit 1; }
+# The key is read at step 9. Checking it here keeps a re-run from rewriting
+# config and restarting the room daemon before it fails on a missing file.
+[ -r "${ROOM_API_KEY_FILE:-}" ] || { echo "ROOM_API_KEY_FILE (${ROOM_API_KEY_FILE:-unset}) must be a readable file; keep it for re-runs" >&2; exit 1; }
+# ROOM_CUSTOMER names the key's project in CATHEDRAL_SANDBOX_KEYS (key:project:slots).
+# Empty closed the API for its own key; a comma or colon minted a second key.
+[[ "${ROOM_CUSTOMER:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "ROOM_CUSTOMER must be 1 to 64 of [A-Za-z0-9._-] (got '${ROOM_CUSTOMER:-}')" >&2; exit 1; }
 
-ROOM_ETC=/etc/pool-room
-ROOM_OPT=/opt/pool-room
-ROOM_RUN=/run/pool-room
+# ROOM_DESTDIR prefixes every host path the installer writes. It is empty on a
+# hotel; the behaviour tests set it to a temporary directory and fake the host.
+ROOM_ETC=${ROOM_DESTDIR:-}/etc/pool-room
+ROOM_OPT=${ROOM_DESTDIR:-}/opt/pool-room
+ROOM_RUN=${ROOM_DESTDIR:-}/run/pool-room
+UNIT_DIR=${ROOM_DESTDIR:-}/etc/systemd/system
 SOCK=$ROOM_RUN/docker.sock
 STATE=$ROOM_ETC/install-state
 mkdir -p "$ROOM_ETC" "$ROOM_OPT/cache" "$ROOM_OPT/bin"
@@ -74,10 +83,11 @@ if [ ${#need[@]} -gt 0 ]; then
   NEW_DOCKER=0; [[ " ${need[*]} " == *" docker.io "* ]] && NEW_DOCKER=1
   if [ $NEW_DOCKER = 1 ] && [ ! -e /usr/sbin/policy-rc.d ]; then
     printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d; chmod 0755 /usr/sbin/policy-rc.d; RM_POLICY=1
+    trap 'rm -f /usr/sbin/policy-rc.d' EXIT  # a failed apt must not leave every later package start blocked
   fi
   DEBIAN_FRONTEND=noninteractive apt-get update -q
   DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${need[@]}"
-  [ "${RM_POLICY:-0}" = 1 ] && rm -f /usr/sbin/policy-rc.d
+  [ "${RM_POLICY:-0}" = 1 ] && { rm -f /usr/sbin/policy-rc.d; trap - EXIT; }
   for p in "${need[@]}"; do mark "apt:$p"; done
   if [ $NEW_DOCKER = 1 ]; then
     systemctl mask docker.service docker.socket >/dev/null 2>&1 && mark "masked:docker"
@@ -130,7 +140,7 @@ elif [ ! -f "$ROOM_DATA_IMG" ]; then
   mkfs.xfs -f -q "$ROOM_DATA_IMG"
   mark "file:$ROOM_DATA_IMG"
 fi
-cat > /etc/systemd/system/$DATA_UNIT <<EOF
+cat > "$UNIT_DIR/$DATA_UNIT" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID data volume (xfs prjquota)
 Before=$ROOM_ID-docker.service
@@ -148,14 +158,16 @@ mark "unit:$DATA_UNIT"
 fetch "$GVISOR_URL" sha512 "$GVISOR_SHA512" "$ROOM_OPT/cache/gvisor-$GVISOR_RELEASE.tar.bz2"
 if [ ! -x "$ROOM_OPT/gvisor-$GVISOR_RELEASE/runsc" ]; then
   mkdir -p "$ROOM_OPT/gvisor-$GVISOR_RELEASE"
-  tar -xjf "$ROOM_OPT/cache/gvisor-$GVISOR_RELEASE.tar.bz2" -C "$ROOM_OPT/gvisor-$GVISOR_RELEASE"
+  tar --no-same-owner -xjf "$ROOM_OPT/cache/gvisor-$GVISOR_RELEASE.tar.bz2" -C "$ROOM_OPT/gvisor-$GVISOR_RELEASE"
 fi
 ln -sfn "gvisor-$GVISOR_RELEASE" "$ROOM_OPT/gvisor"
 RUNSC=$ROOM_OPT/gvisor/runsc
 
 # ---------------------------------------------------------------- 4. Python 3.12 + cathedral (pinned)
 fetch "$UV_URL" sha256 "$UV_SHA256" "$ROOM_OPT/cache/uv-$UV_VERSION.tar.gz"
-tar -xzf "$ROOM_OPT/cache/uv-$UV_VERSION.tar.gz" -C "$ROOM_OPT/bin" --strip-components=1
+# --no-same-owner: these archives carry their builder's uid (1001). A host with
+# a second user would own code that runs as root and the TLS front.
+tar --no-same-owner -xzf "$ROOM_OPT/cache/uv-$UV_VERSION.tar.gz" -C "$ROOM_OPT/bin" --strip-components=1
 export UV_PYTHON_INSTALL_DIR=$ROOM_OPT/python UV_CACHE_DIR=$ROOM_OPT/cache/uv UV_NO_CONFIG=1
 "$ROOM_OPT/bin/uv" python install -q "$PYTHON_VERSION"
 export UV_PYTHON_PREFERENCE=only-managed
@@ -163,7 +175,7 @@ export UV_PYTHON_PREFERENCE=only-managed
 "$ROOM_OPT/bin/uv" pip install -q --python "$ROOM_OPT/venv/bin/python" --require-hashes --only-binary :all: -r "$KIT/files/requirements.lock"
 echo "$CATHEDRAL_TARBALL_SHA256  $KIT/$CATHEDRAL_TARBALL" | sha256sum -c --quiet -
 rm -rf "$ROOM_OPT/src.new" && mkdir -p "$ROOM_OPT/src.new"
-tar -xzf "$KIT/$CATHEDRAL_TARBALL" -C "$ROOM_OPT/src.new" --strip-components=1
+tar --no-same-owner -xzf "$KIT/$CATHEDRAL_TARBALL" -C "$ROOM_OPT/src.new" --strip-components=1
 rm -rf "$ROOM_OPT/src" && mv "$ROOM_OPT/src.new" "$ROOM_OPT/src"
 echo "$CATHEDRAL_COMMIT" > "$ROOM_OPT/src/COMMIT"
 install -m 0755 "$KIT/room_health.py" "$ROOM_OPT/bin/room_health.py"
@@ -175,7 +187,8 @@ install -m 0755 "$KIT/room_egress.py" "$ROOM_OPT/bin/room_egress.py"
 
 # ---------------------------------------------------------------- 5. Caddy (pinned, sha512)
 fetch "$CADDY_URL" sha512 "$CADDY_SHA512" "$ROOM_OPT/cache/caddy-$CADDY_VERSION.tar.gz"
-tar -xzf "$ROOM_OPT/cache/caddy-$CADDY_VERSION.tar.gz" -C "$ROOM_OPT/bin" caddy
+tar --no-same-owner -xzf "$ROOM_OPT/cache/caddy-$CADDY_VERSION.tar.gz" -C "$ROOM_OPT/bin" caddy
+chown -R root:root "$ROOM_OPT/bin" "$ROOM_OPT/src" "$ROOM_OPT/gvisor-$GVISOR_RELEASE"
 
 # ---------------------------------------------------------------- 6. service user
 id poolroom >/dev/null 2>&1 || { useradd --system --home-dir /var/lib/pool-room --shell /usr/sbin/nologin poolroom; mark "user:poolroom"; }
@@ -183,8 +196,13 @@ id poolroom >/dev/null 2>&1 || { useradd --system --home-dir /var/lib/pool-room 
 # ---------------------------------------------------------------- 7. room Docker daemon (runsc default)
 # The firewall for room bridges comes from room-net.sh and the bridge settings;
 # a change in any of them restarts the room daemon (room guests only).
-net_settings() { grep -E '^(ROOM_BRIDGE|ROOM_BRIDGE_CIDR|ROOM_NETS|ROOM_NET_BRIDGE_PREFIX)=' "$ROOM_ETC/room.env.applied" 2>/dev/null || true; }
-ROOM_DAEMON_HASH_BEFORE=$({ cat "$ROOM_ETC/daemon.json" "$ROOM_OPT/bin/room-net.sh" 2>/dev/null; net_settings; } | sha256sum)
+# The bridge settings the room daemon runs with come from the applied env;
+# the ones it must run with next come from room.env. The two hashes below
+# decide the restart. ROOM_DAEMON_HAD_CONFIG is empty on a first install,
+# where `enable --now` already starts the daemon with the new config.
+net_settings_of() { grep -E '^(ROOM_BRIDGE|ROOM_BRIDGE_CIDR|ROOM_NETS|ROOM_NET_BRIDGE_PREFIX)=' "$1" 2>/dev/null || true; }
+ROOM_DAEMON_HAD_CONFIG=$([ -f "$ROOM_ETC/daemon.json" ] && echo 1 || true)
+ROOM_DAEMON_HASH_BEFORE=$({ cat "$ROOM_ETC/daemon.json" "$ROOM_OPT/bin/room-net.sh" 2>/dev/null; net_settings_of "$ROOM_ETC/room.env.applied"; } | sha256sum)
 install -m 0755 "$KIT/lib/room-net.sh" "$ROOM_OPT/bin/room-net.sh"
 DNS_JSON=$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1].split()))' "$ROOM_DNS")
 MIRRORS_JSON=$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1].split()))' "${ROOM_REGISTRY_MIRRORS:-}")
@@ -214,7 +232,7 @@ cat > "$ROOM_ETC/daemon.json" <<EOF
   "log-opts": {"max-size": "20m", "max-file": "2"}
 }
 EOF
-cat > /etc/systemd/system/$ROOM_ID-docker.service <<EOF
+cat > "$UNIT_DIR/$ROOM_ID-docker.service" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID Docker daemon (runsc)
 Requires=$DATA_UNIT
@@ -246,6 +264,10 @@ xfs_info "$ROOM_DATA_DIR" >/dev/null
 grep -E " $ROOM_DATA_DIR " /proc/mounts | grep -q prjquota || { echo "prjquota missing on $ROOM_DATA_DIR" >&2; exit 1; }
 mkdir -p "$ROOM_DATA_DIR/work" "$ROOM_DATA_DIR/docker"
 chown poolroom:poolroom "$ROOM_DATA_DIR/work"
+# Assess again now that the volume is mounted: the first pass saw the parent
+# file system, and the disk leg of the sizing differed between a first
+# install and a re-run.
+python3 "$KIT/assess.py" --data-dir "$ROOM_DATA_DIR" --room-socket "$SOCK" --out "$ROOM_ETC/machine.json"
 ROOM_DISK_BYTES=$(df -B1 --output=size "$ROOM_DATA_DIR" | tail -1)
 size_room() { # size_room <bridge addresses (0 = no bridge limit)> <out>
   python3 "$KIT/size.py" "$ROOM_ETC/machine.json" --vcpu "$SHAPE_VCPU" --mem-gib "$SHAPE_MEM_GIB" --disk-gib "$SHAPE_DISK_GIB" \
@@ -274,11 +296,14 @@ SIZE_QUOTA=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["quo
 log "size: $SIZE_SLOTS slots, quota $SIZE_QUOTA"
 
 systemctl enable --now "$ROOM_ID-docker.service"
-cp "$ROOM_ETC/room.env" "$ROOM_ETC/room.env.applied"
-if [ "$({ cat "$ROOM_ETC/daemon.json" "$ROOM_OPT/bin/room-net.sh"; net_settings; } | sha256sum)" != "$ROOM_DAEMON_HASH_BEFORE" ] && [ -n "${ROOM_DAEMON_HASH_BEFORE// -/}" ]; then
+if [ "$({ cat "$ROOM_ETC/daemon.json" "$ROOM_OPT/bin/room-net.sh"; net_settings_of "$ROOM_ETC/room.env"; } | sha256sum)" != "$ROOM_DAEMON_HASH_BEFORE" ] && [ -n "$ROOM_DAEMON_HAD_CONFIG" ]; then
   log "room daemon config changed: restarting the room daemon (room guests only)"
+  refuse_restart_with_rooms  # rooms may have started since the first check
   systemctl restart "$ROOM_ID-docker.service"
 fi
+# Applied only once the daemon runs with these settings: a refused restart
+# above leaves room.env.applied at the old values, so the next run restarts.
+cp "$ROOM_ETC/room.env" "$ROOM_ETC/room.env.applied"
 for _ in $(seq 60); do docker -H "unix://$SOCK" info >/dev/null 2>&1 && break; sleep 1; done
 [ "$(docker -H "unix://$SOCK" info --format '{{.DefaultRuntime}}')" = runsc ] || { echo "room daemon default runtime is not runsc" >&2; exit 1; }
 docker -H "unix://$SOCK" pull -q "$PROBE_IMAGE" >/dev/null
@@ -305,7 +330,7 @@ eval "$XTRACE"
   echo "TMPDIR=$ROOM_DATA_DIR/work"
   profile_env
 } > "$ROOM_ETC/api.env"
-cat > /etc/systemd/system/$ROOM_ID.service <<EOF
+cat > "$UNIT_DIR/$ROOM_ID.service" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID API (profile $API_PROFILE)
 Requires=$ROOM_ID-docker.service
@@ -318,6 +343,10 @@ EnvironmentFile=$ROOM_ETC/api.env
 EnvironmentFile=$ROOM_ETC/secret.env
 ExecStart=$(profile_exec)
 Restart=on-failure
+# A stop removes every room's container and work directory; on a full hotel
+# that takes minutes, and the default 90 s ended in SIGKILL mid-pass.
+TimeoutStopSec=600
+KillMode=mixed
 LimitNOFILE=1048576
 TasksMax=infinity
 NoNewPrivileges=yes
@@ -329,7 +358,7 @@ WantedBy=multi-user.target
 EOF
 mark "unit:$ROOM_ID.service"
 
-cat > /etc/systemd/system/$ROOM_ID-health.service <<EOF
+cat > "$UNIT_DIR/$ROOM_ID-health.service" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID health endpoint
 After=$ROOM_ID-docker.service
@@ -350,14 +379,14 @@ mark "unit:$ROOM_ID-health.service"
 
 # The API collects past-TTL sandboxes only when it handles a list/get.
 # This timer makes collection happen even when no client is calling.
-cat > /etc/systemd/system/$ROOM_ID-reaper.service <<EOF
+cat > "$UNIT_DIR/$ROOM_ID-reaper.service" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID TTL reaper tick
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/curl -fsS -o /dev/null -H @$ROOM_ETC/reaper.headers http://127.0.0.1:$ROOM_API_PORT/v1/sandboxes
 EOF
-cat > /etc/systemd/system/$ROOM_ID-reaper.timer <<EOF
+cat > "$UNIT_DIR/$ROOM_ID-reaper.timer" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID TTL reaper (every 60 s)
 [Timer]
@@ -374,7 +403,7 @@ mark "unit:$ROOM_ID-reaper.timer"; mark "unit:$ROOM_ID-reaper.service"
 # resolver and the SNI/HTTP egress proxy. A room address with no policy has no
 # egress, so it starts before the API and goes down with the room daemon.
 if [ "${ROOM_EGRESS:-1}" = 1 ]; then
-cat > /etc/systemd/system/$ROOM_ID-egress.service <<EOF
+cat > "$UNIT_DIR/$ROOM_ID-egress.service" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID egress policy (nftables per room, DNS, egress proxy)
 Requires=$ROOM_ID-docker.service
@@ -401,7 +430,7 @@ fi
 # the same unit keeps the sealed SNP binding. The listener proxies create,
 # exec and delete to the API.
 if [ "$ROOM_RECEIPTS" = 1 ]; then
-cat > /etc/systemd/system/$ROOM_ID-receipts.service <<EOF
+cat > "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID signed receipts and attestation
 Requires=$ROOM_ID.service
@@ -454,7 +483,7 @@ https://$ROOM_HOSTNAME:$ROOM_PUBLIC_PORT {
 	}
 }
 EOF
-cat > /etc/systemd/system/$ROOM_ID-caddy.service <<EOF
+cat > "$UNIT_DIR/$ROOM_ID-caddy.service" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID TLS front (Caddy $CADDY_VERSION)
 After=$CADDY_AFTER
@@ -485,6 +514,7 @@ elif [ "$(iptables -S INPUT | head -1)" = "-P INPUT DROP" ] && ! iptables -C INP
 fi
 
 # ---------------------------------------------------------------- 13. start
+refuse_restart_with_rooms  # the guard at the top is minutes old by now
 systemctl daemon-reload
 if [ "${ROOM_EGRESS:-1}" = 1 ]; then systemctl enable -q "$ROOM_ID-egress.service"; systemctl restart "$ROOM_ID-egress.service"; fi
 systemctl enable -q "$ROOM_ID.service" "$ROOM_ID-health.service" "$ROOM_ID-reaper.timer"
@@ -492,7 +522,14 @@ systemctl restart "$ROOM_ID.service" "$ROOM_ID-health.service"
 if [ "$ROOM_RECEIPTS" = 1 ]; then systemctl enable -q "$ROOM_ID-receipts.service"; systemctl restart "$ROOM_ID-receipts.service"; fi
 if [ "${ROOM_TLS:-on}" = on ]; then systemctl enable -q "$ROOM_ID-caddy.service"; systemctl restart "$ROOM_ID-caddy.service"; fi
 systemctl start "$ROOM_ID-reaper.timer"
-for _ in $(seq 30); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ROOM_API_PORT/v1/status")" != 000 ] && break; sleep 1; done
-log "API status: $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ROOM_API_PORT/v1/status")"
+# With the key: 200 means the API is up and the key store took this key. A
+# bare 401 or 000 used to print "done" over a hotel that answered nobody.
+API_CODE=000
+for _ in $(seq 60); do
+  API_CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "@$ROOM_ETC/reaper.headers" "http://127.0.0.1:$ROOM_API_PORT/v1/status")
+  [ "$API_CODE" = 200 ] && break; sleep 1
+done
+[ "$API_CODE" = 200 ] || { echo "API did not answer 200 on /v1/status with its own key (got $API_CODE); see journalctl -u $ROOM_ID.service" >&2; exit 1; }
+log "API status: $API_CODE"
 log "python: $("$ROOM_OPT/venv/bin/python" -V) runsc: $("$RUNSC" --version | head -1) caddy: $("$ROOM_OPT/bin/caddy" version | cut -d' ' -f1)"
 log "done. health: curl -H 'Authorization: Bearer <key>' https://$ROOM_HOSTNAME/room/health"

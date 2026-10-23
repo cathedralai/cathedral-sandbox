@@ -241,8 +241,10 @@ def verify_receipts(att: dict, receipts: list[dict], head: str | None = None) ->
             links += 1
     seqs = sorted(by_seq)
     contiguous = bool(seqs) and seqs == list(range(seqs[0], seqs[-1] + 1))
-    if head is not None:  # a whole chain (GET .../receipts from 0): no gap, ends at the head
-        need(seqs and seqs[0] == 1 and contiguous, "the chain has a gap or does not start at receipt 1")
+    if head is not None and not seqs:  # a fresh hotel: the head is the binding itself
+        need(head == bsha, "the chain is empty but the head is not the binding")
+    elif head is not None:  # a whole chain (GET .../receipts from 0): no gap, ends at the head
+        need(seqs[0] == 1 and contiguous, "the chain has a gap or does not start at receipt 1")
         need(by_seq[seqs[-1]]["receipt_sha256"] == head, "the chain does not end at the hotel's head")
     actions = {}
     for rc in receipts:
@@ -313,15 +315,18 @@ def main() -> int:
     ap.add_argument("--receipt-header", action="append", default=[], help="X-Room-Receipt header value")
     ap.add_argument("--broker", help="broker base URL; fetches attestation and receipts itself")
     ap.add_argument("--key-file", help="guest API key file for --broker")
-    ap.add_argument("--hotel", required=False, default="sealed-1")
+    ap.add_argument("--hotel", required=False, default=None, help="hotel id (required with --broker)")
     ap.add_argument("--sandbox", help="with --broker: one room's receipts instead of the whole chain")
     ap.add_argument("--expected-measurement")
     ap.add_argument("--ark-sha256", help="pin the AMD ARK certificate (sha256 of its DER)")
     ap.add_argument("--product", help="Milan or Genoa (default: from the report)")
     ap.add_argument("--kds-cache", default=os.path.expanduser("~/.cache/amd-kds"))
     ap.add_argument("--skip-amd", action="store_true", help="skip the AMD chain (offline smoke test only)")
+    ap.add_argument("--require-sealed", action="store_true", help="fail unless the hotel answers an SEV-SNP binding")
     ap.add_argument("--save", help="with --broker: write the fetched attestation and receipts here")
     a = ap.parse_args()
+    if a.broker and not a.hotel:
+        ap.error("--hotel is required with --broker (no default: a wrong hotel is a wrong chain)")
     try:
         if a.broker:
             key = open(a.key_file).read().strip()
@@ -344,6 +349,11 @@ def main() -> int:
         head = doc.get("head") if whole else None
         for h in a.receipt_header:
             receipts.append(json.loads(base64.urlsafe_b64decode(h + "=" * (-len(h) % 4))))
+        sealed_asked = a.require_sealed or a.expected_measurement or a.ark_sha256 or a.product
+        if is_hotel_level(att) and sealed_asked:
+            # A sealed guest whose TSM is missing runs level 1 under the same
+            # hotel name. Asking for a measurement means asking for SNP.
+            raise Fail("the hotel answered a level 1 (unsealed) binding; an SEV-SNP attestation was asked for")
         if is_hotel_level(att):
             attestation_out = verify_hotel_attestation(att)
         else:
