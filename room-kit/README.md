@@ -28,9 +28,10 @@ customer API is on port 443 with a real TLS certificate.
 - Disk: a spare block device (the kit formats it as xfs), or free space on
   the root file system for a sparse loop image. Keep the root file system
   below 70 % full.
-- Network: inbound TCP 443 from the internet. Outbound HTTPS to Docker Hub,
-  Let's Encrypt, GitHub (uv, Caddy, Python) and storage.googleapis.com (gVisor).
-  Port 80 is not used.
+- Network: inbound TCP 443 from the internet. Outbound HTTPS to Docker Hub
+  (or `ROOM_REGISTRY_MIRRORS`, default mirror.gcr.io), Let's Encrypt, GitHub
+  (uv, Caddy, Python), storage.googleapis.com (gVisor) and PyPI (the pinned
+  wheel set). Port 80 is not used.
 - DNS: an A record for `ROOM_HOSTNAME` to the machine IP, DNS only, before
   you run the installer.
 - A free private /22 or larger for the guest bridge (one address per sandbox).
@@ -200,7 +201,10 @@ Docker daemon. Containers that already run on the host are not touched.
 `API_PROFILE` selects the customer API. A profile is `profiles/<name>.sh`.
 It defines the API start command, its environment, and how the API key is
 passed. The API must listen on `127.0.0.1:ROOM_API_PORT` and must start guests
-through `DOCKER_HOST` (the room daemon). Then every guest runs under runsc.
+through `DOCKER_HOST` (the room daemon). Then every guest runs under runsc,
+and so do image builds: the API uses the classic builder, because BuildKit
+runs `RUN` steps in its own runc worker and ignores the daemon's default
+runtime.
 
 - `v1`: the `/v1` sandbox API from cathedral-sandbox
   (`cathedral.cli sandbox serve --runtime docker`, started through
@@ -229,6 +233,6 @@ not remove apt packages. Delete the DNS record yourself.
   no room is open, or set `ROOM_RESTART_WITH_ROOMS=1` to end them on purpose.
   A sealed hotel is rebuilt as a new guest, so an update there always ends its
   rooms.
-- `GET /v1/status` says `runtime: docker` and `kernel_isolation: false`. The
-  API does not know that the room daemon uses runsc. Use `/room/health` for
-  the true runtime.
+- `GET /v1/status` says `runtime: docker` and `kernel_isolation: true` when
+  the room daemon's default runtime is runsc (it asks the daemon). Use
+  `/room/health` for the runtime the probe saw.

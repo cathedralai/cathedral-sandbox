@@ -633,3 +633,39 @@ func TestBackgroundExecIsLostOnBrokerRestart(t *testing.T) {
 	once.Do(func() { close(release) }) // let the held hotel calls finish before the servers close
 	<-retryDone
 }
+
+// Harbor and ctcli clients got the signed receipt header on network changes
+// and process starts only; create, exec and delete answers dropped it.
+func TestCompatClientsGetTheReceiptHeaderOnCreateExecAndDelete(t *testing.T) {
+	tc := newChain(t)
+	req, _ := http.NewRequest("POST", tc.srv.URL+"/v1/sandboxes", strings.NewReader(`{"template": "room-1x4"}`))
+	req.Header.Set("Authorization", "Bearer key1")
+	req.Header.Set("User-Agent", "ctcli/1.0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&doc)
+	resp.Body.Close()
+	if resp.StatusCode != 201 || resp.Header.Get("X-Room-Receipt") != "signed-create" {
+		t.Fatalf("create: %d receipt header %q", resp.StatusCode, resp.Header.Get("X-Room-Receipt"))
+	}
+	id, _ := doc["id"].(string)
+	for _, c := range []struct{ method, path, body, want string }{
+		{"POST", "/v1/sandboxes/" + id + "/exec", `{"cmd": ["true"]}`, "signed-exec"},
+		{"DELETE", "/v1/sandboxes/" + id, "", "signed-delete"},
+	} {
+		req, _ := http.NewRequest(c.method, tc.srv.URL+c.path, strings.NewReader(c.body))
+		req.Header.Set("Authorization", "Bearer key1")
+		req.Header.Set("User-Agent", "ctcli/1.0")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if got := resp.Header.Get("X-Room-Receipt"); got != c.want {
+			t.Errorf("%s %s: receipt header %q, want %q (status %d)", c.method, c.path, got, c.want, resp.StatusCode)
+		}
+	}
+}

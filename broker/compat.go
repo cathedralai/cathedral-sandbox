@@ -170,18 +170,24 @@ func (b *broker) roomByUUID(g *guestState, id string) *room {
 
 // hotelExec runs one exec on a room's hotel and returns the hotel answer.
 func (b *broker) hotelExec(ctx context.Context, rm *room, body map[string]any, timeout int) (int, map[string]any, error) {
+	status, _, doc, err := b.hotelExecH(ctx, rm, body, timeout)
+	return status, doc, err
+}
+
+// hotelExecH is hotelExec with the hotel's response headers (the signed receipt).
+func (b *broker) hotelExecH(ctx context.Context, rm *room, body map[string]any, timeout int) (int, http.Header, map[string]any, error) {
 	if max := b.maxExec(); timeout <= 0 || timeout > max {
 		timeout = max
 	}
 	body["timeout_seconds"] = timeout
 	raw, _ := json.Marshal(body)
-	status, _, out, err := rm.h.do(ctx, "POST", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/exec", nil, raw, time.Duration(timeout+60)*time.Second)
+	status, hdr, out, err := rm.h.do(ctx, "POST", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/exec", nil, raw, time.Duration(timeout+60)*time.Second)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	var doc map[string]any
 	_ = json.Unmarshal(out, &doc)
-	return status, doc, nil
+	return status, hdr, doc, nil
 }
 
 func (b *broker) serveCompat(w http.ResponseWriter, r *http.Request, g *guestState) {
@@ -460,6 +466,7 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		u = rm.uuid
 	}
 	b.mu.Unlock()
+	copyRoomHeaders(w.Header(), out.header) // the signed receipt, when the hotel has one
 	writeJSON(w, 201, compatView(out.doc, u))
 }
 
@@ -643,6 +650,7 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		}
 		b.compat.mu.Unlock()
 		b.markDirty()
+		copyRoomHeaders(w.Header(), c.hdr)
 		writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "cleanup_state": b.cleanupState(r.Context(), bid)})
 	case tail == "exec" && r.Method == "POST":
 		b.compatIdem(w, r, g, func(w http.ResponseWriter, raw []byte) {
@@ -651,11 +659,12 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 				compatErr(w, 400, "invalid_exec", err.Error(), 0)
 				return
 			}
-			status, doc, herr := b.hotelExec(r.Context(), rm, body, timeout)
+			status, hdr, doc, herr := b.hotelExecH(r.Context(), rm, body, timeout)
 			if herr != nil {
 				compatErr(w, 502, "hotel_unreachable", "the hotel did not answer", 5)
 				return
 			}
+			copyRoomHeaders(w.Header(), hdr)
 			if status != 200 {
 				out, _ := json.Marshal(doc)
 				w.Header().Set("Content-Type", "application/json")

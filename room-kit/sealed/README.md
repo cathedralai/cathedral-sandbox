@@ -32,8 +32,13 @@ sudo ./install.sh --sealed sealed.env
      iptables chains only.
    - `launch-guest.sh`: QEMU with `kernel-hashes=on`, the scratch disk, the
      tap link and the hotel key in fw_cfg.
-5. **Check.** It waits for `GET /room/attestation` from the guest. It compares
-   the measurement in the report with the build.
+5. **Check.** Before the restart it refuses to go on while the running guest
+   has rooms (`SEALED_RESTART_WITH_ROOMS=1` overrides). It waits for
+   `GET /room/attestation` from the guest and compares the measurement in
+   the report with the build. On a mismatch it stops and disables the unit,
+   points `images/current` back at the previous image and exits 1. A timer
+   checks the host link rules every minute and restores them after a
+   firewall reload.
 
 Inside the guest, `sealed-hotel.service` runs at every boot:
 
@@ -55,7 +60,7 @@ Inside the guest, `sealed-hotel.service` runs at every boot:
 | Debug access | Yes | `cathedral.debug=0/1` in the command line |
 | Files the kit downloads at boot (gVisor, uv, Python, Caddy, the pinned API wheel set) | No, but pinned | The installer refuses a file whose sha256 or sha512 differs from `versions.lock` and `requirements.lock`, which are in the measured initrd |
 | Room images (for example `alpine:3.20`) | No | Pulled at create. The receipt records the image reference and the image id |
-| Hotel API key | No | fw_cfg. It authenticates the broker. The host gives it, so the host can call the API too; each call gets a receipt |
+| Hotel API key | No | fw_cfg. It authenticates the broker. The host gives it, so the host can call the API too; each create, exec, process start, network change and delete gets a receipt |
 | HOST_DATA | No (host chooses it) | It carries the sha256 of `manifest.json`, so a report names the build it claims |
 
 ## What the host cannot do
@@ -107,7 +112,7 @@ Routes (through the broker):
 
 | Route | Gives |
 |---|---|
-| `X-Room-Receipt` header on create, exec and delete | The signed receipt, base64url of canonical JSON |
+| `X-Room-Receipt` header on create, exec, process start, network change and delete | The signed receipt, base64url of canonical JSON |
 | `GET /v1/sandboxes/<id>/receipts` | The receipts of one room |
 | `GET /v1/hotels/<id>/attestation` | Binding, binding sha256, SNP report |
 | `GET /v1/hotels/<id>/receipts?after=&limit=` | The chain of this boot |
@@ -123,6 +128,11 @@ the broker sends.
 python3 verify_receipts.py --attestation attestation.json --receipts chain.json \
   --expected-measurement <from manifest build>
 ```
+
+Through the broker: `--broker https://<broker> --key-file KEY --hotel <id>`
+(`--hotel` has no default). Add `--require-sealed` so a level 1 (unsealed)
+binding fails even without `--expected-measurement`. `--sandbox <id>` lists
+one room's receipts while the room exists.
 
 It checks the binding digest, REPORT_DATA, that the guest is not a debug
 build (`cathedral.debug=1` on the measured command line fails), the AMD chain
@@ -152,8 +162,10 @@ chain links. It prints the policy timeline of each room
 ## Remove
 
 ```
+sudo systemctl disable --now room-sealed-<name>-net.timer # or it puts the host link back every minute
 sudo systemctl disable --now room-sealed-<name>.service   # stops the guest, removes the host link rules
-sudo rm -f /etc/systemd/system/room-sealed-<name>.service && sudo systemctl daemon-reload
+sudo rm -f /etc/systemd/system/room-sealed-<name>.service /etc/systemd/system/room-sealed-<name>-net.{service,timer}
+sudo systemctl daemon-reload
 sudo rm -rf $SEALED_DIR                                    # images, scratch disk, venv
 ```
 

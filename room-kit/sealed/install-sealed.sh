@@ -74,6 +74,7 @@ install -m 0755 "$KIT/sealed/host-net.sh" "$KIT/sealed/launch-guest.sh" -t "$SEA
 cat > /etc/systemd/system/${UNIT%.service}-net.service <<EOF
 [Unit]
 Description=Sealed hotel $SEALED_NAME host link check
+ConditionPathExists=$SEALED_DIR/sealed.env
 [Service]
 Type=oneshot
 ExecStart=$SEALED_DIR/host-net.sh check $SEALED_DIR/sealed.env

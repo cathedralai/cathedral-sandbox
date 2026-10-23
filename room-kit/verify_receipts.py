@@ -315,7 +315,7 @@ def main() -> int:
     ap.add_argument("--receipt-header", action="append", default=[], help="X-Room-Receipt header value")
     ap.add_argument("--broker", help="broker base URL; fetches attestation and receipts itself")
     ap.add_argument("--key-file", help="guest API key file for --broker")
-    ap.add_argument("--hotel", required=False, default="sealed-1")
+    ap.add_argument("--hotel", required=False, default=None, help="hotel id (required with --broker)")
     ap.add_argument("--sandbox", help="with --broker: one room's receipts instead of the whole chain")
     ap.add_argument("--expected-measurement")
     ap.add_argument("--ark-sha256", help="pin the AMD ARK certificate (sha256 of its DER)")
@@ -325,6 +325,8 @@ def main() -> int:
     ap.add_argument("--require-sealed", action="store_true", help="fail unless the hotel answers an SEV-SNP binding")
     ap.add_argument("--save", help="with --broker: write the fetched attestation and receipts here")
     a = ap.parse_args()
+    if a.broker and not a.hotel:
+        ap.error("--hotel is required with --broker (no default: a wrong hotel is a wrong chain)")
     try:
         if a.broker:
             key = open(a.key_file).read().strip()
