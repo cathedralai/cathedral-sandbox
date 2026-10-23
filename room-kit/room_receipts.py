@@ -42,6 +42,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -365,12 +366,27 @@ class Handler(BaseHTTPRequestHandler):
             if out is None:
                 return self.reply(503, b'{"error":"health_not_ready"}')
             return self.reply(status, out, {"X-Health-Age-Ms": str(int((time.time() - at) * 1000))})
+        action = next((a for meth, pat, a in SIGNED if meth == self.command and pat.match(path)), None)
+        if action and body:
+            # A JSON escape of a lone surrogate parses, but cannot be encoded
+            # when the statement is signed. Refuse it before the API runs
+            # the action: an action with no receipt is the one thing this
+            # front must never produce.
+            try:
+                canonical(json.loads(body))
+            except UnicodeEncodeError:  # before ValueError: it is a subclass
+                return self.reply(400, b'{"error":{"code":"invalid_request","message":"the body holds a lone surrogate escape"}}')
+            except ValueError:
+                pass  # not JSON: the API answers
         status, headers, out = self.upstream(self.server.api_port, body)
         extra = {}
-        action = next((a for meth, pat, a in SIGNED if meth == self.command and pat.match(path)), None)
         if action and self.authorized():
-            extra["X-Room-Receipt"] = base64.urlsafe_b64encode(
-                canonical(ledger.sign(self.fields(action, path, body, status, out)))).decode()
+            try:
+                extra["X-Room-Receipt"] = base64.urlsafe_b64encode(
+                    canonical(ledger.sign(self.fields(action, path, body, status, out)))).decode()
+            except Exception as exc:  # noqa: BLE001 the action ran: answer, and say the receipt is missing
+                traceback.print_exc()
+                extra["X-Room-Receipt-Error"] = type(exc).__name__
         ctype = next((v for k, v in headers if k.lower() == "content-type"), "application/json")
         passthrough = {k: v for k, v in headers if k.lower() not in HOP and k.lower() != "content-type"}
         return self.reply(status, out, {**passthrough, **extra}, ctype)
@@ -390,6 +406,11 @@ class Handler(BaseHTTPRequestHandler):
         sandbox = m["id"] if m else (res.get("id") if isinstance(res, dict) else None)
         command = (req.get("cmd", req.get("command")) if isinstance(req, dict) else None)
         image = req.get("image") if action == "create" and isinstance(req, dict) else None
+        if isinstance(image, dict):
+            # The object form carries registry_auth: record the reference only.
+            image = image.get("image")
+        if not isinstance(image, str):
+            image = None
         policy = self.network_policy(action, status, res)
         return {
             "action": action,
@@ -470,9 +491,14 @@ class Server(ThreadingHTTPServer):
         return self._sev
 
     def image_digest(self, ref: str) -> str | None:
+        if not isinstance(ref, str):
+            return None
         if ref not in self._digests:
-            r = subprocess.run(["docker", "-H", "unix://" + self.docker_sock, "image", "inspect", "--format",
-                                "{{.Id}}", ref], capture_output=True, text=True, timeout=30)
+            try:
+                r = subprocess.run(["docker", "-H", "unix://" + self.docker_sock, "image", "inspect", "--format",
+                                    "{{.Id}}", ref], capture_output=True, text=True, timeout=30)
+            except (subprocess.SubprocessError, OSError):
+                return None  # a digest is a bonus; the receipt is the product
             self._digests[ref] = r.stdout.strip() or None if r.returncode == 0 else None
         return self._digests[ref]
 

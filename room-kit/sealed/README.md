@@ -71,8 +71,10 @@ Inside the guest, `sealed-hotel.service` runs at every boot:
 What the host can do besides availability:
 
 - It holds the hotel API key, so it can create rooms, run commands and read
-  files through the API. Every such call passes the signing front and gets a
-  receipt, so it is on the chain.
+  files through the API. Create, exec, process start, network change, delete
+  and bulk delete pass the signing front and get a receipt. File read and
+  write, tar, stat, snapshot, fork, wait, process logs and process stop do
+  not: the host can read or plant a file in a room with no receipt.
 - The broker reaches the API over plain HTTP on the tap link. The host can
   read that traffic (commands, outputs, files) without leaving a receipt.
 
