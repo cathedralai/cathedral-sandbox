@@ -43,7 +43,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Callable, Any, Iterable, Mapping, Protocol
 
 from cathedral import sandbox_api as api
 from cathedral import agent_interactive as agent_ux
@@ -1227,7 +1227,17 @@ class InMemorySandboxProvider:
                 "note": "Prefer WebSocket /ws with X-Cathedral-Access-Ticket (query tickets disabled); REST write/read remain for tests.",
             }
 
-    def terminal_write(self, sandbox_id: str, terminal_id: str, data: str) -> dict[str, Any]:
+    def terminal_write(
+        self,
+        sandbox_id: str,
+        terminal_id: str,
+        data: str,
+        *,
+        executor: Callable[[str, ExecRequest], ExecResult] | None = None,
+    ) -> dict[str, Any]:
+        # A runtime that keeps rooms elsewhere (a container, a VM) passes its
+        # own exec: this provider's exec runs commands on this machine (B154).
+        run = executor or self.exec
         with self._lock:
             self._require_running(sandbox_id)
             term = self._terminals.get(sandbox_id, {}).get(terminal_id)
@@ -1253,7 +1263,7 @@ class InMemorySandboxProvider:
             if not cmd:
                 continue
             try:
-                result = self.exec(sandbox_id, ExecRequest(cmd=cmd, timeout_seconds=30))
+                result = run(sandbox_id, ExecRequest(cmd=cmd, timeout_seconds=30))
                 chunk = (result.stdout or "") + (result.stderr or "")
                 with self._lock:
                     term = self._terminals.get(sandbox_id, {}).get(terminal_id)
