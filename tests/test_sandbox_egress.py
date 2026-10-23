@@ -130,7 +130,7 @@ def test_canonical_policy_and_sha() -> None:
     assert eg.Policy.parse(p).document() == p
 
 
-@pytest.mark.parametrize("bad", ["::1", "fe80::/10", "https://pypi.org", "pypi.org:443", "pypi.org/simple", "*", "*.", "*.10.0.0.1", "local", "a_b.example"])
+@pytest.mark.parametrize("bad", ["::1", "fe80::/10", "https://pypi.org", "pypi.org:8080", "1.2.3.4:443", "pypi.org/simple", "*", "*.", "*.10.0.0.1", "local", "a_b.example"])
 def test_bad_allowlist_entries_are_refused(bad) -> None:
     with pytest.raises(SandboxContractError):
         normalize_allow_entry(bad)
@@ -285,3 +285,10 @@ def test_put_network_route(fake, daemon) -> None:
         assert bad.status == 400 and json.loads(bad.body)["error"]["code"] == "invalid_network_allowlist"
     finally:
         provider.close()
+
+
+@pytest.mark.parametrize("entry", ["pypi.org:443", "pypi.org:80", "PyPI.org:443"])
+def test_web_ports_on_hostnames_are_accepted(entry) -> None:
+    # The proxy only carries 80 and 443, so the port is accepted and dropped.
+    assert normalize_allow_entry(entry) == "pypi.org"
+    NetworkSpec(mode="allowlist", allow=(entry,))
