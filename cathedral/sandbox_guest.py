@@ -1090,6 +1090,30 @@ def _read_room_log(path: Path) -> str:
         return fh.read(EXEC_OUTPUT_CAP).decode("utf-8", errors="replace")
 
 
+def _sweep_stale_bases(own: Path) -> None:
+    """Remove work bases an earlier instance left (killed mid-stop by systemd).
+
+    Each instance keeps its rooms' /work under one mkdtemp base in TMPDIR. A
+    stop that ran out of its time budget left those on the data volume for
+    good; nothing else ever looked at them. Bases older than a minute that
+    are not ours go. Only the kit sets the switch (one API per host).
+    """
+    try:
+        parent = own.parent
+        for base in parent.glob("cathedral-sandbox-*"):
+            if base == own or not base.is_dir():
+                continue
+            try:
+                if time.time() - base.stat().st_mtime < 60:
+                    continue
+                shutil.rmtree(base, ignore_errors=True)
+                print(f"cathedral-sandbox: removed stale work base {base}", file=sys.stderr, flush=True)
+            except OSError:
+                continue
+    except OSError:
+        return
+
+
 class DockerGuestProvider:
     """SandboxProvider that runs each sandbox as a real Linux Docker (or Kata) guest."""
 
@@ -1178,6 +1202,8 @@ class DockerGuestProvider:
                 runtime_label=runtime_label,
             )
         self._capabilities_dind = False
+        if os.environ.get("CATHEDRAL_SANDBOX_SWEEP_STALE_BASES", "") == "1":
+            _sweep_stale_bases(self._inner._base)  # noqa: SLF001
 
     @property
     def capabilities_dind(self) -> bool:

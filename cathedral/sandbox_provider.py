@@ -1613,18 +1613,21 @@ def parse_sandbox_keys(raw: str) -> list[ApiKey]:
     }
     keys: list[ApiKey] = []
     for entry in filter(None, (part.strip() for part in raw.split(","))):
+        # A malformed entry is refused, never skipped: skipping an empty
+        # project left a hotel with zero keys (401 for everyone, including
+        # the broker), and a stray comma minted a second key.
         fields = entry.split(":")
-        if len(fields) < 2:
-            continue
+        if len(fields) < 2 or len(fields) > 3:
+            raise api.SandboxContractError("invalid_key_store", f"key store entry {entry[:8]!r}...: want key:project[:max_running]")
         key, project = fields[0].strip(), fields[1].strip()
         if not key or not project:
-            continue
+            raise api.SandboxContractError("invalid_key_store", "key store entry with an empty key or project")
         max_running: int | None = None
-        if len(fields) >= 3 and fields[2].strip():
+        if len(fields) == 3 and fields[2].strip():
             try:
                 max_running = int(fields[2].strip())
             except ValueError:
-                max_running = None
+                raise api.SandboxContractError("invalid_key_store", f"max_running {fields[2].strip()!r} is not an integer") from None
         keys.append(ApiKey(key=key, project=project, max_running=max_running, revoked=key in revoked))
     return keys
 
@@ -1647,15 +1650,17 @@ def provider_from_environment(
     ceiling (customer checklist §3.6), not only a recorded number.
     """
     limits: QuotaLimits | None = None
-    raw_quota = os.environ.get("CATHEDRAL_SANDBOX_QUOTA", "")
-    parts = [p.strip() for p in raw_quota.split(":") if p.strip()]
-    if len(parts) == 3:
+    raw_quota = os.environ.get("CATHEDRAL_SANDBOX_QUOTA", "").strip()
+    if raw_quota:
+        # The kit writes this from size.py. A malformed value used to fall
+        # back to 500/1,000/3,000 with no log; it is refused instead.
+        parts = [p.strip() for p in raw_quota.split(":")]
         try:
-            limits = QuotaLimits(
-                running_sandboxes=int(parts[0]), vcpu=int(parts[1]), memory_gib=int(parts[2])
-            )
-        except ValueError:
-            limits = None
+            if len(parts) != 3:
+                raise ValueError("want running:vcpu:memory_gib")
+            limits = QuotaLimits(running_sandboxes=int(parts[0]), vcpu=int(parts[1]), memory_gib=int(parts[2]))
+        except ValueError as exc:
+            raise api.SandboxContractError("invalid_quota", f"CATHEDRAL_SANDBOX_QUOTA {raw_quota!r}: {exc}") from None
     keys = parse_sandbox_keys(os.environ.get("CATHEDRAL_SANDBOX_KEYS", ""))
     return InMemorySandboxProvider(
         limits=limits,

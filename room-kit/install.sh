@@ -21,6 +21,9 @@ PROFILE_FILE="$KIT/profiles/${API_PROFILE}.sh"
 # The key is read at step 9. Checking it here keeps a re-run from rewriting
 # config and restarting the room daemon before it fails on a missing file.
 [ -r "${ROOM_API_KEY_FILE:-}" ] || { echo "ROOM_API_KEY_FILE (${ROOM_API_KEY_FILE:-unset}) must be a readable file; keep it for re-runs" >&2; exit 1; }
+# ROOM_CUSTOMER names the key's project in CATHEDRAL_SANDBOX_KEYS (key:project:slots).
+# Empty closed the API for its own key; a comma or colon minted a second key.
+[[ "${ROOM_CUSTOMER:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "ROOM_CUSTOMER must be 1 to 64 of [A-Za-z0-9._-] (got '${ROOM_CUSTOMER:-}')" >&2; exit 1; }
 
 ROOM_ETC=/etc/pool-room
 ROOM_OPT=/opt/pool-room
@@ -330,6 +333,10 @@ EnvironmentFile=$ROOM_ETC/api.env
 EnvironmentFile=$ROOM_ETC/secret.env
 ExecStart=$(profile_exec)
 Restart=on-failure
+# A stop removes every room's container and work directory; on a full hotel
+# that takes minutes, and the default 90 s ended in SIGKILL mid-pass.
+TimeoutStopSec=600
+KillMode=mixed
 LimitNOFILE=1048576
 TasksMax=infinity
 NoNewPrivileges=yes
@@ -505,7 +512,14 @@ systemctl restart "$ROOM_ID.service" "$ROOM_ID-health.service"
 if [ "$ROOM_RECEIPTS" = 1 ]; then systemctl enable -q "$ROOM_ID-receipts.service"; systemctl restart "$ROOM_ID-receipts.service"; fi
 if [ "${ROOM_TLS:-on}" = on ]; then systemctl enable -q "$ROOM_ID-caddy.service"; systemctl restart "$ROOM_ID-caddy.service"; fi
 systemctl start "$ROOM_ID-reaper.timer"
-for _ in $(seq 30); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ROOM_API_PORT/v1/status")" != 000 ] && break; sleep 1; done
-log "API status: $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ROOM_API_PORT/v1/status")"
+# With the key: 200 means the API is up and the key store took this key. A
+# bare 401 or 000 used to print "done" over a hotel that answered nobody.
+API_CODE=000
+for _ in $(seq 60); do
+  API_CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "@$ROOM_ETC/reaper.headers" "http://127.0.0.1:$ROOM_API_PORT/v1/status")
+  [ "$API_CODE" = 200 ] && break; sleep 1
+done
+[ "$API_CODE" = 200 ] || { echo "API did not answer 200 on /v1/status with its own key (got $API_CODE); see journalctl -u $ROOM_ID.service" >&2; exit 1; }
+log "API status: $API_CODE"
 log "python: $("$ROOM_OPT/venv/bin/python" -V) runsc: $("$RUNSC" --version | head -1) caddy: $("$ROOM_OPT/bin/caddy" version | cut -d' ' -f1)"
 log "done. health: curl -H 'Authorization: Bearer <key>' https://$ROOM_HOSTNAME/room/health"
