@@ -662,6 +662,14 @@ func (b *broker) finishCreate(w http.ResponseWriter, res createResult, tRecv tim
 
 func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestState, rest string) {
 	bid, tail, _ := strings.Cut(rest, "/")
+	// The tail goes to the hotel as part of its path. A dot segment would
+	// climb out of this room if anything between us and the hotel normalized it.
+	for _, seg := range strings.Split(tail, "/") {
+		if seg == "." || seg == ".." {
+			writeErr(w, 400, "invalid_path", "a sandbox path cannot contain . or .. segments")
+			return
+		}
+	}
 	hotelID, hid, ok := strings.Cut(bid, ".")
 	h := b.hotelByID(hotelID)
 	if !ok || h == nil {
@@ -780,11 +788,16 @@ func (b *broker) handleHotelDoc(w http.ResponseWriter, r *http.Request, rest str
 
 // ---------------------------------------------------------------- gather
 
-func (b *broker) fanout(ctx context.Context, path string, q url.Values) map[string]json.RawMessage {
+// fanout asks every hotel in the guest's list. A hotel outside the list is
+// not asked: it may hang, and its id and totals are not the guest's.
+func (b *broker) fanout(ctx context.Context, g *guestState, path string, q url.Values) map[string]json.RawMessage {
 	out := map[string]json.RawMessage{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
+		if !g.limitsAllow(b, h.cfg.ID) {
+			continue
+		}
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
@@ -805,7 +818,7 @@ func (b *broker) fanout(ctx context.Context, path string, q url.Values) map[stri
 func (b *broker) handleList(w http.ResponseWriter, r *http.Request, g *guestState) {
 	q := r.URL.Query()
 	q.Add("label", guestLabel+"="+g.cfg.ID)
-	parts := b.fanout(r.Context(), "/v1/sandboxes", q)
+	parts := b.fanout(r.Context(), g, "/v1/sandboxes", q)
 	all := []map[string]any{}
 	errs := map[string]string{}
 	for hid, raw := range parts {
@@ -847,7 +860,7 @@ func sumInto(dst map[string]any, src map[string]any) {
 }
 
 func (b *broker) handleQuota(w http.ResponseWriter, r *http.Request, g *guestState) {
-	parts := b.fanout(r.Context(), "/v1/quota", nil)
+	parts := b.fanout(r.Context(), g, "/v1/quota", nil)
 	total := map[string]any{}
 	hotels := map[string]any{}
 	for hid, raw := range parts {
@@ -883,7 +896,7 @@ func (b *broker) handleQuota(w http.ResponseWriter, r *http.Request, g *guestSta
 func (b *broker) handleUsage(w http.ResponseWriter, r *http.Request, g *guestState) {
 	q := r.URL.Query()
 	q.Add("label", guestLabel+"="+g.cfg.ID)
-	parts := b.fanout(r.Context(), "/v1/usage", q)
+	parts := b.fanout(r.Context(), g, "/v1/usage", q)
 	writeJSON(w, 200, map[string]any{"hotels": parts})
 }
 
@@ -1400,7 +1413,9 @@ func main() {
 			}
 		}
 	})
-	srv := &http.Server{Addr: b.cfg.Listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+	// No WriteTimeout: an exec may run for hours. IdleTimeout closes kept-alive
+	// connections that send nothing, so they cannot pile up to the fd limit.
+	srv := &http.Server{Addr: b.cfg.Listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
 	log.Printf("central booking on %s: %d hotels, %d guests", b.cfg.Listen, len(b.hotelList()), len(b.guests))
 	log.Fatal(srv.ListenAndServe())
 }

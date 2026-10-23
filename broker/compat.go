@@ -862,7 +862,8 @@ func (b *broker) runScript(ctx context.Context, rm *room, script string, stdin s
 	}
 	status, doc, err := b.hotelExec(ctx, rm, body, timeout)
 	if err != nil {
-		return nil, err
+		// A transport error names the hotel's private API URL; guests see the hotel id only.
+		return nil, fmt.Errorf("hotel %s did not answer", rm.h.cfg.ID)
 	}
 	if status != 200 {
 		return nil, fmt.Errorf("hotel answered %d", status)

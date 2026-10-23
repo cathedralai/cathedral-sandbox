@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -65,8 +66,9 @@ func (b *broker) compatBuild(w http.ResponseWriter, r *http.Request, g *guestSta
 	b.compat.mu.Lock()
 	if old := b.compat.images[img.ID]; old != nil && old.Build {
 		img = old // the same build again: keep its state
-		if img.ctxMissing {
-			// The context was lost in a broker restart; this request has it again.
+		if img.ctxMissing || !bytes.Equal(img.buildCtx, buildCtx) {
+			// The context was lost or cut short (a crash while it was saved).
+			// The id is a hash of the context, so this request's copy is right.
 			img.buildCtx, img.ctxMissing = buildCtx, false
 			img.builds = map[string]*buildHotel{}
 			b.saveBuildContext(img)
