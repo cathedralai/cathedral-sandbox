@@ -102,8 +102,10 @@ _NON_PUBLIC_V4 = tuple(ipaddress.ip_network(n) for n in (
 _LABEL_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,62}")
 _LABEL_VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,63}")
 # A docker reference path: optional registry, repository, and a :tag or @digest suffix.
+# Each part starts with a letter or digit: the ref is a docker CLI argument, and a
+# leading dash would read as a flag.
 _IMAGE_REF_RE = re.compile(
-    r"^(?:(?P<registry>[a-z0-9._-]+(?::[0-9]+)?)/)?(?P<repository>[a-z0-9._/-]+?)"
+    r"^(?:(?P<registry>[a-z0-9][a-z0-9._-]*(?::[0-9]+)?)/)?(?P<repository>[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)*?)"
     r"(?::(?P<tag>[A-Za-z0-9][A-Za-z0-9_.-]{0,127})|@(?P<digest>sha256:[0-9a-f]{64}))$"
 )
 # Agent IDE published templates (G6): sbt-<slug>-<hex>
