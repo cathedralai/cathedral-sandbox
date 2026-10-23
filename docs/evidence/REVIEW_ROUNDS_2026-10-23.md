@@ -104,6 +104,8 @@ Each stage is a separate go. Stop at the first failed check.
 
 ## Pending, by owner
 
+Tracked as a checklist in issue #313 (cathedralai/cathedral-sandbox).
+
 Engineering design: B16, B21, B22, B24 phase 2, B40, B41, B42, B47, B53.
 Small follow-ups: B7, B19, B26, B27, B30, B44, B45 hardening, B51, B54 body
 limits, B55, B61, release workflow Go version.

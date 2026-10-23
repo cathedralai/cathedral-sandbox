@@ -177,6 +177,14 @@ and prints the sha256. Put both values in `versions.lock`.
 Run `install.sh` again to apply a changed `room.env`. The installer is
 idempotent.
 
+The installer stops before it changes anything when the key file is
+unreadable, when `ROOM_CUSTOMER` is not 1 to 64 characters of
+`A-Z a-z 0-9 . _ -`, when rooms are live on the room daemon (stop them or
+wait; a restart would end them), or when a pinned download's checksum differs
+from `versions.lock`. It fails at the end unless the API answers
+`GET /v1/status` with 200 for its own key; "done" is never printed over a
+hotel that answers nobody.
+
 ## What the kit installs
 
 | Item | Location |
@@ -211,6 +219,12 @@ runtime.
   `room_api.py`, which applies `ROOM_CREATES_PER_MINUTE`).
 
 To add a profile, add `profiles/<name>.sh` with the same four items.
+
+The API refuses to start with an empty key store (`CATHEDRAL_SANDBOX_KEYS`),
+a malformed key entry (the shape is `key:project[:slots]`) or a malformed
+quota (`CATHEDRAL_SANDBOX_QUOTA` is `rooms:vcpu:memory_gib`). The installer
+writes both from `room.env` and the sizing step, so a refusal there points
+at `room.env`.
 
 ## Remove
 
