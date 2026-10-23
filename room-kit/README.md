@@ -223,7 +223,11 @@ not remove apt packages. Delete the DNS record yourself.
 
 - One room per machine (one Caddy on 443).
 - The API keeps sandbox state in memory. A restart of `<ROOM_ID>.service`
-  forgets the sandboxes. Their containers keep running until you remove them.
+  forgets the sandboxes, and its first reconcile pass (about 30 s later)
+  removes their containers. `install.sh` stops when rooms are live; wait until
+  no room is open, or set `ROOM_RESTART_WITH_ROOMS=1` to end them on purpose.
+  A sealed hotel is rebuilt as a new guest, so an update there always ends its
+  rooms.
 - `GET /v1/status` says `runtime: docker` and `kernel_isolation: false`. The
   API does not know that the room daemon uses runsc. Use `/room/health` for
   the true runtime.

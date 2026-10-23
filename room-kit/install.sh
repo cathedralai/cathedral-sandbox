@@ -28,6 +28,22 @@ mkdir -p "$ROOM_ETC" "$ROOM_OPT/cache" "$ROOM_OPT/bin"
 log() { echo "[room-kit] $*"; }
 mark() { grep -qxF "$1" "$STATE" 2>/dev/null || echo "$1" >> "$STATE"; }
 
+# The API keeps sandboxes in memory. A restart forgets them and its first
+# reconcile pass removes their containers, so an update during live rooms ends
+# a customer's work. Stop before any restart unless the operator says so.
+refuse_restart_with_rooms() {
+  [ -S "$SOCK" ] || return 0
+  [ "${ROOM_RESTART_WITH_ROOMS:-0}" = 1 ] && return 0
+  local live
+  live=$(docker -H "unix://$SOCK" ps -q --filter label=cathedral.sandbox.owner 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${live:-0}" -gt 0 ]; then
+    echo "room-kit: $live live room(s); an update restarts the API and removes them." >&2
+    echo "Wait until no room is open, or set ROOM_RESTART_WITH_ROOMS=1." >&2
+    exit 1
+  fi
+}
+refuse_restart_with_rooms
+
 fetch() { # url sha-algo sha out
   local url=$1 algo=$2 sum=$3 out=$4
   if [ -f "$out" ] && echo "$sum  $out" | "${algo}sum" -c --quiet - 2>/dev/null; then return 0; fi
