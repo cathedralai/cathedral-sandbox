@@ -912,7 +912,6 @@ class InMemorySandboxProvider:
             "resources": sandbox.resources,
             "created_at": sandbox.created_at,
             "deleted_at": sandbox.deleted_at,
-            "api_key": sandbox.api_key,
             "retained_until": sandbox.deleted_at + timedelta(hours=api.PROCESS_LOG_RETENTION_HOURS),
         }
 

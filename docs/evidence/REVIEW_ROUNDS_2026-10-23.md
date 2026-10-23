@@ -204,6 +204,43 @@ has a test that failed first. Graphs: docs/evidence/REVIEW_ROUND6_GRAPHS.html.
 | B145 | The hotel API unit had no stop budget: stopping a full hotel removes every room's container and work directory, which outran the 90 s default and ended in SIGKILL mid-pass, leaving work directories on the data volume for good | Yes | Fixed (10 min stop budget; stale work directories swept at the next start) | H, S |
 | B146 | The installer's final check accepted any answer: a 401 printed "done" over a hotel that answered nobody | Yes (operator) | Fixed (needs a 200 with the hotel's own key, else the install fails) | H |
 | B147 | The B130 updater fix returned "alert" (12) where the fallback shim must pass the current updater's status through; the existing test caught it in CI, not locally (the suite subset run here did not include it) | No | Fixed (pass-through when the status pages, alert when it would be quiet) | miner host |
+| B148 | A create whose snapshot_id was a list, an object or a number raised out of the request (AttributeError): a 500 with a traceback on the hotel instead of the 400 every other wrong-shaped field gets. Found by the property pass | Yes | Fixed | H, S |
+
+### Other angles (2026-10-23, after the readers)
+
+- **Mutation pass** (reader O): every fix hunk of #312 reverted alone, the
+  commit's tests rerun. 61 fixes were guarded by a test that fails without
+  them, 36 were not, 1 test asserted the pre-fix behaviour (the starvation
+  test, skipped under `-short`). The 36 and the rewrite are in #312 (readers
+  P and Q); their rows are listed below as they land.
+- **Fuzzing**: the broker's config loader and every guest and operator route
+  (bodies, path suffixes, queries, native and client user agents, a fake
+  hotel answering `{}`), 30 s + 150 s under Go's fuzzer. No panic. The
+  seeds run as ordinary tests.
+- **Property tests** (hypothesis, `tests/test_round6_properties.py`): the
+  create parser raises only what the hotel API turns into a 400 (B148 came
+  out of this); a network policy the API accepts is a policy the egress
+  daemon accepts, and the daemon allows exactly the names and networks the
+  API promised; the DNS question parser raises only what the resolver
+  catches; the receipts canonical form is a fixed point; the Range and
+  Idempotency-Key parsers raise only contract errors. About 25,000 examples.
+- **Dependencies**: `pip-audit` over the 29 pinned packages of the hotel
+  venv: no known vulnerabilities. The broker has no third-party modules
+  (`go vet` and `govulncheck` run in CI).
+- **Pinned downloads**: the kit's gVisor, uv and Caddy checksums equal the
+  upstream published checksum files.
+- **Live config under the new strict loader**: the deployed broker config
+  uses only fields the loader accepts (a test keeps that shape), so stage B
+  cannot fail at config load.
+- **Keys**: bearer and view-token comparison is constant-time; no log line
+  carries a key.
+- **Lint**: ruff with the project rules, 6 hygiene items (a duplicated
+  dictionary key in B69's tombstone, an unused import, two one-letter
+  names, a lambda assignment, an unused exception variable); none
+  behavioural, cleaned up in #312. The security rule set (S, B) flagged
+  nothing on the customer path that survives reading: the tar extraction
+  uses `filter="data"`, the SQL strings interpolate internal table names,
+  the WebSocket SHA-1 is the handshake the protocol requires.
 
 Deploy stages are as above (B broker, H shared hotel reinstall, S sealed
 rebuild, T client tool; "miner host" is the Contabo SN94 miner, updated by

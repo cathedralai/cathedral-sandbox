@@ -409,7 +409,13 @@ class CreateSandboxRequest:
         sources = [self.image is not None, self.build is not None, self.snapshot_id is not None]
         _require(sum(sources) == 1, "invalid_source", "exactly one of image, build, or snapshot_id is required")
         if self.snapshot_id is not None:
-            _require(bool(self.snapshot_id.strip()), "invalid_snapshot_id", "snapshot_id must not be blank")
+            # A list or number here was an AttributeError, so a 500 with a
+            # traceback instead of the 400 every other wrong-shaped field gets.
+            _require(
+                isinstance(self.snapshot_id, str) and bool(self.snapshot_id.strip()),
+                "invalid_snapshot_id",
+                "snapshot_id must be a non-blank string",
+            )
         _require(1 <= self.count <= FORK_MAX_COUNT, "invalid_count", f"count must be between 1 and {FORK_MAX_COUNT}")
         _require(
             isinstance(self.ttl_seconds, int)

@@ -106,3 +106,14 @@ def test_stale_work_bases_are_removed_at_start_when_the_kit_asks(fake, monkeypat
         assert Path(provider._inner._base).exists()  # noqa: SLF001
     finally:
         provider.close()
+
+
+@pytest.mark.parametrize("bad", [[], {}, 7, True, ["snap_1"]])
+def test_a_wrong_shaped_snapshot_id_is_a_400_not_a_500(bad) -> None:
+    # Review round 6 property pass (B148): every other wrong-shaped field was
+    # already a 400; this one raised AttributeError out of the request.
+    from cathedral.sandbox_api import CreateSandboxRequest, SandboxContractError
+
+    with pytest.raises(SandboxContractError) as err:
+        CreateSandboxRequest(snapshot_id=bad)
+    assert err.value.code == "invalid_snapshot_id"
