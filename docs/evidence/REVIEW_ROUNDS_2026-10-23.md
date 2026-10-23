@@ -208,6 +208,8 @@ has a test that failed first. Graphs: docs/evidence/REVIEW_ROUND6_GRAPHS.html.
 | B147 | The B130 updater fix returned "alert" (12) where the fallback shim must pass the current updater's status through; the existing test caught it in CI, not locally (the suite subset run here did not include it) | SN94 miner | No | Fixed (pass-through when the status pages, alert when it would be quiet) | miner host |
 | B148 | A create whose snapshot_id was a list, an object or a number raised out of the request (AttributeError): a 500 with a traceback on the hotel instead of the 400 every other wrong-shaped field gets. Found by the property pass | Hotel API | Yes | Fixed | H, S |
 | B149 | Deleting a snapshot id that belonged to another key answered 404 to the caller but still removed the committed image on the hotel: the owner's next fork failed with snapshot_image_missing. Found while adding the test guard for B67 | Hotel API | Latent (one key per hotel) | Fixed | H, S |
+| B150 | install.sh marked the new bridge settings as applied before the daemon-restart guard could refuse them: when a room opened mid-run, the guard stopped the restart but the next run saw "no change", printed "done" and never restarted the room daemon, so the daemon and the room firewall kept the old bridge settings while the API got the new ones. Found by running the installer on a fake host | Installer and sealed kit | Yes (stage H re-run) | Fixed (applied marker written after the restart) | H |
+| B151 | Every first install restarted the room daemon seconds after starting it, with a misleading "config changed" line: the no-previous-config guard compared a hash of nothing and could never be false. Seconds lost, no rooms affected | Installer and sealed kit | No | Fixed (explicit had-config flag) | H |
 
 ### Other angles (2026-10-23, after the readers)
 
@@ -238,6 +240,19 @@ has a test that failed first. Graphs: docs/evidence/REVIEW_ROUND6_GRAPHS.html.
   API promised; the DNS question parser raises only what the resolver
   catches; the receipts canonical form is a fixed point; the Range and
   Idempotency-Key parsers raise only contract errors. About 25,000 examples.
+- **Installer behavioural floor** (reader R): every installer test was a text
+  assertion on the script. install.sh now runs end to end on a fake host
+  (a PATH of argv-logging fakes for systemctl, docker, apt and the rest,
+  real tar and checksums, pinned downloads served from files, a
+  `ROOM_DESTDIR` prefix for every path it writes, empty on a hotel) in
+  `tests/test_room_kit_installer_behaviour.py`: 41 cases, each guard
+  removal caught. Proved: refusals before any write (live rooms, unreadable
+  key, bad customer name), checksum mismatch installs nothing, the unit
+  files carry the stop budget and the key store line, the final 200-with-key
+  check, a re-run is idempotent, room-net.sh and host-net.sh rule order and
+  tag-only cleanup, and install-sealed.sh's restart guard and measurement
+  mismatch (its step 5; steps 1 to 4 probe /dev/sev and need a real host).
+  B150 and B151 came out of this.
 - **Dependencies**: `pip-audit` over the 29 pinned packages of the hotel
   venv: no known vulnerabilities. The broker has no third-party modules
   (`go vet` and `govulncheck` run in CI).

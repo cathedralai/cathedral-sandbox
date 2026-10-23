@@ -24,5 +24,6 @@ findings table is the source of truth.
 | O-mutation.md | every fix hunk of #312 reverted alone: which tests caught it |
 | P-python-gaps.md | the Python test guards added after O |
 | Q-go-gaps.md | the broker test guards added after O, with the create-behind-execs measurement |
+| R-installer-behaviour.md | install.sh, room-net.sh, host-net.sh and install-sealed.sh step 5 run on a fake host: what the harness fakes, what each property proves, B150 and B151 |
 
 Reader H (receipts) folded its notes into the findings table directly.

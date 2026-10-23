@@ -25,9 +25,12 @@ PROFILE_FILE="$KIT/profiles/${API_PROFILE}.sh"
 # Empty closed the API for its own key; a comma or colon minted a second key.
 [[ "${ROOM_CUSTOMER:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "ROOM_CUSTOMER must be 1 to 64 of [A-Za-z0-9._-] (got '${ROOM_CUSTOMER:-}')" >&2; exit 1; }
 
-ROOM_ETC=/etc/pool-room
-ROOM_OPT=/opt/pool-room
-ROOM_RUN=/run/pool-room
+# ROOM_DESTDIR prefixes every host path the installer writes. It is empty on a
+# hotel; the behaviour tests set it to a temporary directory and fake the host.
+ROOM_ETC=${ROOM_DESTDIR:-}/etc/pool-room
+ROOM_OPT=${ROOM_DESTDIR:-}/opt/pool-room
+ROOM_RUN=${ROOM_DESTDIR:-}/run/pool-room
+UNIT_DIR=${ROOM_DESTDIR:-}/etc/systemd/system
 SOCK=$ROOM_RUN/docker.sock
 STATE=$ROOM_ETC/install-state
 mkdir -p "$ROOM_ETC" "$ROOM_OPT/cache" "$ROOM_OPT/bin"
@@ -137,7 +140,7 @@ elif [ ! -f "$ROOM_DATA_IMG" ]; then
   mkfs.xfs -f -q "$ROOM_DATA_IMG"
   mark "file:$ROOM_DATA_IMG"
 fi
-cat > /etc/systemd/system/$DATA_UNIT <<EOF
+cat > "$UNIT_DIR/$DATA_UNIT" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID data volume (xfs prjquota)
 Before=$ROOM_ID-docker.service
@@ -193,8 +196,13 @@ id poolroom >/dev/null 2>&1 || { useradd --system --home-dir /var/lib/pool-room 
 # ---------------------------------------------------------------- 7. room Docker daemon (runsc default)
 # The firewall for room bridges comes from room-net.sh and the bridge settings;
 # a change in any of them restarts the room daemon (room guests only).
-net_settings() { grep -E '^(ROOM_BRIDGE|ROOM_BRIDGE_CIDR|ROOM_NETS|ROOM_NET_BRIDGE_PREFIX)=' "$ROOM_ETC/room.env.applied" 2>/dev/null || true; }
-ROOM_DAEMON_HASH_BEFORE=$({ cat "$ROOM_ETC/daemon.json" "$ROOM_OPT/bin/room-net.sh" 2>/dev/null; net_settings; } | sha256sum)
+# The bridge settings the room daemon runs with come from the applied env;
+# the ones it must run with next come from room.env. The two hashes below
+# decide the restart. ROOM_DAEMON_HAD_CONFIG is empty on a first install,
+# where `enable --now` already starts the daemon with the new config.
+net_settings_of() { grep -E '^(ROOM_BRIDGE|ROOM_BRIDGE_CIDR|ROOM_NETS|ROOM_NET_BRIDGE_PREFIX)=' "$1" 2>/dev/null || true; }
+ROOM_DAEMON_HAD_CONFIG=$([ -f "$ROOM_ETC/daemon.json" ] && echo 1 || true)
+ROOM_DAEMON_HASH_BEFORE=$({ cat "$ROOM_ETC/daemon.json" "$ROOM_OPT/bin/room-net.sh" 2>/dev/null; net_settings_of "$ROOM_ETC/room.env.applied"; } | sha256sum)
 install -m 0755 "$KIT/lib/room-net.sh" "$ROOM_OPT/bin/room-net.sh"
 DNS_JSON=$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1].split()))' "$ROOM_DNS")
 MIRRORS_JSON=$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1].split()))' "${ROOM_REGISTRY_MIRRORS:-}")
@@ -224,7 +232,7 @@ cat > "$ROOM_ETC/daemon.json" <<EOF
   "log-opts": {"max-size": "20m", "max-file": "2"}
 }
 EOF
-cat > /etc/systemd/system/$ROOM_ID-docker.service <<EOF
+cat > "$UNIT_DIR/$ROOM_ID-docker.service" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID Docker daemon (runsc)
 Requires=$DATA_UNIT
@@ -288,12 +296,14 @@ SIZE_QUOTA=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["quo
 log "size: $SIZE_SLOTS slots, quota $SIZE_QUOTA"
 
 systemctl enable --now "$ROOM_ID-docker.service"
-cp "$ROOM_ETC/room.env" "$ROOM_ETC/room.env.applied"
-if [ "$({ cat "$ROOM_ETC/daemon.json" "$ROOM_OPT/bin/room-net.sh"; net_settings; } | sha256sum)" != "$ROOM_DAEMON_HASH_BEFORE" ] && [ -n "${ROOM_DAEMON_HASH_BEFORE// -/}" ]; then
+if [ "$({ cat "$ROOM_ETC/daemon.json" "$ROOM_OPT/bin/room-net.sh"; net_settings_of "$ROOM_ETC/room.env"; } | sha256sum)" != "$ROOM_DAEMON_HASH_BEFORE" ] && [ -n "$ROOM_DAEMON_HAD_CONFIG" ]; then
   log "room daemon config changed: restarting the room daemon (room guests only)"
   refuse_restart_with_rooms  # rooms may have started since the first check
   systemctl restart "$ROOM_ID-docker.service"
 fi
+# Applied only once the daemon runs with these settings: a refused restart
+# above leaves room.env.applied at the old values, so the next run restarts.
+cp "$ROOM_ETC/room.env" "$ROOM_ETC/room.env.applied"
 for _ in $(seq 60); do docker -H "unix://$SOCK" info >/dev/null 2>&1 && break; sleep 1; done
 [ "$(docker -H "unix://$SOCK" info --format '{{.DefaultRuntime}}')" = runsc ] || { echo "room daemon default runtime is not runsc" >&2; exit 1; }
 docker -H "unix://$SOCK" pull -q "$PROBE_IMAGE" >/dev/null
@@ -320,7 +330,7 @@ eval "$XTRACE"
   echo "TMPDIR=$ROOM_DATA_DIR/work"
   profile_env
 } > "$ROOM_ETC/api.env"
-cat > /etc/systemd/system/$ROOM_ID.service <<EOF
+cat > "$UNIT_DIR/$ROOM_ID.service" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID API (profile $API_PROFILE)
 Requires=$ROOM_ID-docker.service
@@ -348,7 +358,7 @@ WantedBy=multi-user.target
 EOF
 mark "unit:$ROOM_ID.service"
 
-cat > /etc/systemd/system/$ROOM_ID-health.service <<EOF
+cat > "$UNIT_DIR/$ROOM_ID-health.service" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID health endpoint
 After=$ROOM_ID-docker.service
@@ -369,14 +379,14 @@ mark "unit:$ROOM_ID-health.service"
 
 # The API collects past-TTL sandboxes only when it handles a list/get.
 # This timer makes collection happen even when no client is calling.
-cat > /etc/systemd/system/$ROOM_ID-reaper.service <<EOF
+cat > "$UNIT_DIR/$ROOM_ID-reaper.service" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID TTL reaper tick
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/curl -fsS -o /dev/null -H @$ROOM_ETC/reaper.headers http://127.0.0.1:$ROOM_API_PORT/v1/sandboxes
 EOF
-cat > /etc/systemd/system/$ROOM_ID-reaper.timer <<EOF
+cat > "$UNIT_DIR/$ROOM_ID-reaper.timer" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID TTL reaper (every 60 s)
 [Timer]
@@ -393,7 +403,7 @@ mark "unit:$ROOM_ID-reaper.timer"; mark "unit:$ROOM_ID-reaper.service"
 # resolver and the SNI/HTTP egress proxy. A room address with no policy has no
 # egress, so it starts before the API and goes down with the room daemon.
 if [ "${ROOM_EGRESS:-1}" = 1 ]; then
-cat > /etc/systemd/system/$ROOM_ID-egress.service <<EOF
+cat > "$UNIT_DIR/$ROOM_ID-egress.service" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID egress policy (nftables per room, DNS, egress proxy)
 Requires=$ROOM_ID-docker.service
@@ -420,7 +430,7 @@ fi
 # the same unit keeps the sealed SNP binding. The listener proxies create,
 # exec and delete to the API.
 if [ "$ROOM_RECEIPTS" = 1 ]; then
-cat > /etc/systemd/system/$ROOM_ID-receipts.service <<EOF
+cat > "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID signed receipts and attestation
 Requires=$ROOM_ID.service
@@ -473,7 +483,7 @@ https://$ROOM_HOSTNAME:$ROOM_PUBLIC_PORT {
 	}
 }
 EOF
-cat > /etc/systemd/system/$ROOM_ID-caddy.service <<EOF
+cat > "$UNIT_DIR/$ROOM_ID-caddy.service" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID TLS front (Caddy $CADDY_VERSION)
 After=$CADDY_AFTER
