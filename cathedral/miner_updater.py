@@ -1024,6 +1024,7 @@ def _locked(
     body: Callable[[MinerUpdaterHost, dict[str, object]], UpdateOutcome],
     *,
     after: Callable[[MinerUpdaterHost, UpdateOutcome], UpdateOutcome] | None = None,
+    unreadable_status: int = EXIT_ALERT,
 ) -> UpdateOutcome:
     inherited = host.lock_fd
     try:
@@ -1038,7 +1039,7 @@ def _locked(
                 # An unreadable state file must page, not go quiet: the miner
                 # health check and the unverified count both need it, and
                 # exit 10 counts as success for the unit.
-                return UpdateOutcome("refused", f"updater state unreadable: {exc}", EXIT_ALERT, alert=True)
+                return UpdateOutcome("refused", f"updater state unreadable: {exc}", unreadable_status, alert=True)
             try:
                 outcome = body(host, state)
             except MinerUpdateHalted as exc:
@@ -1744,11 +1745,12 @@ def fallback_to_previous(host: MinerUpdaterHost, current_status: int) -> UpdateO
             alert=True,
         )
 
-    outcome = _locked(host, body)
+    # The fallback could not run (the lock is busy, the links moved, the
+    # state is unreadable): the current updater's own status stands, so a
+    # fault still pages. An unreadable state pages on its own when that
+    # status would be quiet.
+    outcome = _locked(host, body, unreadable_status=passthrough if passthrough != EXIT_REFUSED else EXIT_ALERT)
     if outcome.exit_status == EXIT_REFUSED and passthrough != EXIT_REFUSED:
-        # The fallback could not run (the lock is busy, the links moved, the
-        # state is unreadable): the current updater's own status stands, so a
-        # fault still pages.
         outcome = dataclasses.replace(outcome, exit_status=passthrough)
     return outcome
 
