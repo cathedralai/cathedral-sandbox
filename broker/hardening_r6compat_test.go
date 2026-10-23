@@ -147,15 +147,16 @@ func TestExtendBySecondsShortensTheRoom(t *testing.T) {
 
 // ---------------------------------------------------------------- F2: create fields
 
-// The cloud API create takes env and shape. The compat create forwards
-// neither: the room starts without the environment the task was given and
-// at the import's default size.
-func TestCompatCreateDropsEnvAndShape(t *testing.T) {
+// The cloud API create takes env and shape. The compat create forwards both
+// to the hotel: vcpus as vcpu, memory_mib rounded up to whole GiB, disk_gib
+// as is. Before the fix the room started without the environment the task
+// was given and at the template's size.
+func TestCompatCreateForwardsEnvAndShape(t *testing.T) {
 	tc := newChain(t)
 	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{
 		"template": "room-1x4",
 		"env":      map[string]string{"HF_TOKEN": "t", "TASK": "x"},
-		"shape":    map[string]any{"vcpus": 2, "memory_mib": 8192, "disk_mib": 20480},
+		"shape":    map[string]any{"vcpus": 2, "memory_mib": 6000, "disk_gib": 20},
 	}), nil)
 	if status != 201 {
 		t.Fatalf("create: %d %v", status, doc)
@@ -164,8 +165,8 @@ func TestCompatCreateDropsEnvAndShape(t *testing.T) {
 	if env, _ := created["env"].(map[string]any); env["HF_TOKEN"] != "t" || env["TASK"] != "x" {
 		t.Errorf("hotel create env=%v; the client sent HF_TOKEN and TASK", created["env"])
 	}
-	if res, _ := created["resources"].(map[string]any); res["vcpu"] != 2.0 {
-		t.Errorf("hotel create resources=%v; the client asked for shape vcpus=2 memory_mib=8192", res)
+	if res, _ := created["resources"].(map[string]any); res["vcpu"] != 2.0 || res["memory_gib"] != 6.0 || res["disk_gib"] != 20.0 {
+		t.Errorf("hotel create resources=%v; the client asked for shape vcpus=2 memory_mib=6000 (6 GiB rounded up) disk_gib=20", res)
 	}
 }
 
@@ -537,7 +538,7 @@ func TestTarOverTheExecCapIsA500WithNoMessage(t *testing.T) {
 // the restart has no saved idempotency entry, so the keyed retry runs the
 // command a second time while the first still runs in the room.
 func TestBackgroundExecIsLostOnBrokerRestart(t *testing.T) {
-	t.Skip("pending (review round 6): background execs live in the broker's memory and the hotel runs exec synchronously; a broker restart loses them")
+	t.Skip("pending design: background execs across a broker restart")
 	dir := t.TempDir()
 	release := make(chan struct{})
 	var once sync.Once

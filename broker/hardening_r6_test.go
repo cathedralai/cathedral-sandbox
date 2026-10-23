@@ -486,14 +486,25 @@ func (zeros) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Run with -race. patchHotel writes h.cfg.Labels under b.mu; parseSelection
-// reads it through pl.selects without b.mu.
+// Run with -race. An operator PATCH writes h.cfg.Labels and h.cfg.Drain
+// while creates (pick, selects, noRoomReason), the hotel list, the stats,
+// the live view, the build starter and the PATCH answer itself read them.
+// Every reader takes cfgMu through labels() and drain().
 func TestLabelsPatchRacesWithHotelSelection(t *testing.T) {
 	tc := newChain(t)
+	body, ctype := buildForm(t, "FROM alpine:3.20\n", []byte("ctx"))
+	_, img := tc.clientCall(t, "POST", "/v1/images/build", body, map[string]string{"Content-Type": ctype})
+	imageID, _ := img["image_id"].(string)
+	// A fork by a guest with the sealed default reads the snapshot hotel's labels (placementFor).
+	room := tc.room(t, "key2", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	_, snap := tc.call(t, "key2", "POST", "/v1/sandboxes/"+room+"/snapshot", map[string]any{})
+	snapID, _ := snap["result"].(map[string]any)["snapshot_id"].(string)
+	tc.b.mu.Lock()
+	tc.b.guests["g2"].limits = guestLimits{DefaultSealed: true}
+	tc.b.mu.Unlock()
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
+	patch := func(body func(i int) string) {
 		defer wg.Done()
 		for i := 0; ; i++ {
 			select {
@@ -501,11 +512,21 @@ func TestLabelsPatchRacesWithHotelSelection(t *testing.T) {
 				return
 			default:
 			}
-			_, _, _ = rawCall(tc, "operator-key", "", "PATCH", "/v1/broker/hotels/b", []byte(fmt.Sprintf(`{"labels":{"zone":"z%d"}}`, i%2)))
+			_, _, _ = rawCall(tc, "operator-key", "", "PATCH", "/v1/broker/hotels/b", []byte(body(i)))
 		}
-	}()
-	for i := 0; i < 200; i++ {
-		_, _, _ = rawCall(tc, "key1", "", "POST", "/v1/sandboxes", []byte(`{"image":"alpine:3.20","hotel_labels":{"zone":"z1"}}`))
+	}
+	wg.Add(2)
+	go patch(func(i int) string { return fmt.Sprintf(`{"labels":{"zone":"z%d"}}`, i%2) })
+	go patch(func(i int) string { return fmt.Sprintf(`{"drain":%v}`, i%2 == 0) })
+	g := tc.b.guests["g1"]
+	for i := 0; i < 100; i++ {
+		_, _, _ = rawCall(tc, "key1", "", "POST", "/v1/sandboxes", []byte(`{"image":"alpine:3.20","hotel_labels":{"zone":"z1"}}`)) // selects, pick
+		_, _, _ = rawCall(tc, "key1", "", "POST", "/v1/sandboxes", []byte(`{"image":"alpine:3.20","hotels":["b"]}`))               // pick; noRoomReason while b drains
+		_, _, _ = rawCall(tc, "key1", "", "GET", "/v1/broker/hotels", nil)                                                         // handleHotels
+		_, _, _ = rawCall(tc, "key1", "", "GET", "/v1/broker/stats", nil)                                                          // handleStats
+		_, _, _ = rawCall(tc, "key1", "cathedral-harbor/0.1.5", "GET", "/v1/images/"+imageID, nil)                                 // ensureBuilds
+		_, _, _ = rawCall(tc, "key2", "", "POST", "/v1/sandboxes", []byte(`{"snapshot_id":"`+snapID+`"}`))                         // placementFor
+		tc.b.snapshot(g)                                                                                                           // the live view
 	}
 	close(stop)
 	wg.Wait()

@@ -492,7 +492,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, tRec
 		h.place(rm)
 		b.mu.Unlock()
 
-		status, hdr, out, err := h.do(ctx, "POST", "/v1/sandboxes", nil, body, 5*time.Minute)
+		status, hdr, out, err := h.do(ctx, "POST", "/v1/sandboxes", nil, body, hotelCreateTimeout)
 		<-h.sem
 		tDone := time.Now()
 
@@ -699,6 +699,10 @@ func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[s
 
 // hotelFailBackoff rests a hotel after a failed room start.
 const hotelFailBackoff = 10 * time.Second
+
+// hotelCreateTimeout bounds one create call to a hotel: a cold image pull
+// can take minutes. A variable, not a constant, so a test can shorten it.
+var hotelCreateTimeout = 5 * time.Minute
 
 func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestState) {
 	tRecv := time.Now()

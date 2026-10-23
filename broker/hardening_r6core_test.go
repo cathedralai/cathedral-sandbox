@@ -14,16 +14,17 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
 // ---------------------------------------------------------------- config loader
 
-// A misspelled key in the config file is dropped without an error. The
-// positive control is a duplicate hotel id, which loadBroker does refuse.
-func TestConfigLoaderFailsOpenOnTypos(t *testing.T) {
+// A typo or a duplicate in the config file refuses the file. Every case here
+// failed open before: an unknown key was dropped, a duplicate guest id or key
+// hash was taken. A valid file still loads (the control), so a loader that
+// refuses everything cannot pass.
+func TestConfigLoaderRefusesTyposAndDuplicates(t *testing.T) {
 	dir := t.TempDir()
 	keyFile := filepath.Join(dir, "h.key")
 	if err := os.WriteFile(keyFile, []byte("k"), 0o600); err != nil {
@@ -38,46 +39,28 @@ func TestConfigLoaderFailsOpenOnTypos(t *testing.T) {
 	}
 	hotels := `"hotels":[{"id":"h1","api":"http://127.0.0.1:1","health":"http://127.0.0.1:1","key_file":"` + keyFile + `"},{"id":"h2","api":"http://127.0.0.1:1","health":"http://127.0.0.1:1","key_file":"` + keyFile + `"}]`
 
-	// Positive control: duplicate hotel id is refused.
-	if _, err := load(`{"listen":"127.0.0.1:0","hotels":[{"id":"h1","api":"x","key_file":"` + keyFile + `"},{"id":"h1","api":"x","key_file":"` + keyFile + `"}]}`); err == nil {
-		t.Fatalf("positive control failed: duplicate hotel id accepted")
+	// Control: a valid file loads.
+	if _, err := load(`{"listen":"127.0.0.1:0",` + hotels + `,"guests":[{"id":"acme","key_sha256":"ab","hotels":["h1"]}]}`); err != nil {
+		t.Fatalf("control: a valid config was refused: %v", err)
 	}
-
-	// 1. "hotel" for "hotels" on a dedicated guest: the guest gets every hotel.
-	b, err := load(`{"listen":"127.0.0.1:0",` + hotels + `,"guests":[{"id":"acme","key_sha256":"ab","hotel":["h1"]}]}`)
-	if err == nil {
-		g := b.guests["acme"]
-		if g.limits.allows("h2") {
-			t.Errorf("typo \"hotel\" accepted: guest acme may use h2 (every hotel), wanted an error")
-		}
-	}
-	// 2. "listen_addr" for "listen": Listen is "" and ListenAndServe would bind :80.
-	if b, err := load(`{"listen_addr":"127.0.0.1:18100",` + hotels + `}`); err == nil && b.cfg.Listen == "" {
-		t.Errorf("typo \"listen_addr\" accepted: Listen is empty, the server would bind :http on every interface")
-	}
-	// 3. Two guests with one id: both keys own each other's rooms.
-	if b, err := load(`{"listen":"127.0.0.1:0",` + hotels + `,"guests":[{"id":"x","key_sha256":"aa"},{"id":"x","key_sha256":"bb"}]}`); err == nil {
-		ga, gb := b.byKey["aa"], b.byKey["bb"]
-		if ga != nil && gb != nil && ga != gb && ga.cfg.ID == gb.cfg.ID {
-			t.Errorf("duplicate guest id accepted: two guest objects share id %q, so each key sees the other's rooms", ga.cfg.ID)
-		}
-	}
-	// 4. Two guests with one key hash: the first guest silently loses its key.
-	if b, err := load(`{"listen":"127.0.0.1:0",` + hotels + `,"guests":[{"id":"x","key_sha256":"aa"},{"id":"y","key_sha256":"aa"}]}`); err == nil {
-		if b.byKey["aa"] != nil && b.byKey["aa"].cfg.ID == "y" {
-			t.Errorf("duplicate key hash accepted: key aa now belongs to y, x is locked out without a message")
-		}
-	}
-	// 5. Guest with no id ("guest_id" typo): id "" matches every unlabeled room.
-	if b, err := load(`{"listen":"127.0.0.1:0",` + hotels + `,"guests":[{"guest_id":"x","key_sha256":"aa"}]}`); err == nil {
-		if g := b.byKey["aa"]; g != nil && g.cfg.ID == "" {
-			t.Errorf("guest with empty id accepted: rooms with no broker_guest label have guest \"\" and this key owns them")
-		}
-	}
-	// 6. "seald" for "sealed" on a hotel: the hotel takes unsealed creates.
-	if b, err := load(`{"listen":"127.0.0.1:0","hotels":[{"id":"h1","api":"x","health":"x","key_file":"` + keyFile + `","seald":true,"labels":{"sealed":"true"}}]}`); err == nil {
-		if h := b.hotelByID("h1"); h != nil && !h.cfg.Sealed {
-			t.Errorf("typo \"seald\" accepted: hotel h1 is not sealed and takes any create")
+	for _, c := range []struct{ name, raw string }{
+		{"duplicate hotel id",
+			`{"listen":"127.0.0.1:0","hotels":[{"id":"h1","api":"x","key_file":"` + keyFile + `"},{"id":"h1","api":"x","key_file":"` + keyFile + `"}]}`},
+		{`"hotel" for "hotels" on a dedicated guest (the guest would get every hotel)`,
+			`{"listen":"127.0.0.1:0",` + hotels + `,"guests":[{"id":"acme","key_sha256":"ab","hotel":["h1"]}]}`},
+		{`"listen_addr" for "listen" (the server would bind :http on every interface)`,
+			`{"listen_addr":"127.0.0.1:18100",` + hotels + `}`},
+		{"two guests with one id (each key would see the other's rooms)",
+			`{"listen":"127.0.0.1:0",` + hotels + `,"guests":[{"id":"x","key_sha256":"aa"},{"id":"x","key_sha256":"bb"}]}`},
+		{"two guests with one key hash (the first guest would lose its key with no message)",
+			`{"listen":"127.0.0.1:0",` + hotels + `,"guests":[{"id":"x","key_sha256":"aa"},{"id":"y","key_sha256":"aa"}]}`},
+		{`"guest_id" for "id" (a guest with id "" would own every unlabeled room)`,
+			`{"listen":"127.0.0.1:0",` + hotels + `,"guests":[{"guest_id":"x","key_sha256":"aa"}]}`},
+		{`"seald" for "sealed" on a hotel (the hotel would take unsealed creates)`,
+			`{"listen":"127.0.0.1:0","hotels":[{"id":"h1","api":"x","health":"x","key_file":"` + keyFile + `","seald":true,"labels":{"sealed":"true"}}]}`},
+	} {
+		if _, err := load(c.raw); err == nil {
+			t.Errorf("%s: accepted; want an error", c.name)
 		}
 	}
 }
@@ -163,37 +146,37 @@ func TestProbeStartsARoomOnADrainedHotel(t *testing.T) {
 	}
 }
 
-// One guest's long execs take every connection the broker has to a hotel
-// (MaxConnsPerHost = concurrency + 64). The sync loop's health GET then waits
-// for a connection, times out, and after okWindow the hotel is "down" for
-// every guest. Condition: health and API share host:port (the config
-// example uses two ports; the sealed hotel's config is private).
-func TestLongExecsStarveHealthAndTakeTheHotelDown(t *testing.T) {
-	if testing.Short() {
-		t.Skip("takes about 50 s")
-	}
-	tc := newChain(t)
+// saturateDataPool puts hotel "b" behind a wrapper that never answers an
+// exec, then starts as many execs of guest g1 as the broker has data
+// connections to the hotel (MaxConnsPerHost = concurrency + 64 in newHotel).
+// Every data connection is then held by one guest. It returns the room id and
+// a release function that ends the execs and waits for their callers.
+func saturateDataPool(t *testing.T, tc *testChain) (string, func()) {
+	t.Helper()
 	f := tc.hotels["b"]
-	var blocked atomic.Int32
+	h := tc.b.hotelByID("b")
+	n := cap(h.sem) + 64
+	arrived := make(chan struct{}, n)
 	wrap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/exec") {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/exec"):
 			_, _ = io.Copy(io.Discard, r.Body) // read the body, so the server notices a closed connection
-			blocked.Add(1)
+			arrived <- struct{}{}
 			<-r.Context().Done() // a long exec: never answers while the client waits
-			return
+		case r.URL.Path == "/room/attestation":
+			// The sealed probe reads this document through the control pool.
+			writeJSON(w, 200, map[string]any{"binding": map[string]any{"measurement": strings.Repeat("a", 96)}, "report_b64": "cmVwb3J0"})
+		default:
+			f.ServeHTTP(w, r)
 		}
-		f.ServeHTTP(w, r)
 	}))
 	t.Cleanup(wrap.Close)
-	h := tc.b.hotelByID("b")
 	h.cfg.API, h.cfg.Health = wrap.URL, wrap.URL
 	tc.b.syncHotel(context.Background(), h) // one good health answer
 	setHotel(tc, "b", func(h *hotel) { h.ok = true })
 	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
 
-	n := cap(h.sem) + 64 // MaxConnsPerHost in newHotel
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
@@ -207,34 +190,54 @@ func TestLongExecsStarveHealthAndTakeTheHotelDown(t *testing.T) {
 			}
 		}()
 	}
-	deadline := time.Now().Add(10 * time.Second)
-	for blocked.Load() < int32(n) && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
+	release := func() { cancel(); wg.Wait() }
+	t.Cleanup(release)
+	for i := 0; i < n; i++ {
+		select {
+		case <-arrived:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("only %d of %d execs reached the hotel", i, n)
+		}
 	}
-	if blocked.Load() < int32(n) {
-		cancel()
-		wg.Wait()
-		t.Fatalf("only %d of %d execs reached the hotel", blocked.Load(), n)
-	}
-	// Let the create's own answer age out of okWindow, as it would in production.
+	// The create's own answer ages out of okWindow, as it does in production
+	// between creates; the hotel then stays up only through the sync loop.
 	h.lastAnswer.Store(time.Now().Add(-okWindow).UnixNano())
 	setHotel(tc, "b", func(h *hotel) { h.lastOK = time.Now().Add(-okWindow) })
+	return id, release
+}
+
+// One guest's long execs hold every data connection the broker has to a
+// hotel. The sync loop (health, quota, room list) and the hotel documents
+// the probe reads use their own small connection pool, so the hotel stays up
+// for every guest. Condition: health and API share host:port (the config
+// example uses two ports; a sealed hotel's config is private). Before the
+// fix the three sync calls each waited 10 s for a connection, failed, and
+// after okWindow the hotel was down for everyone.
+func TestLongExecsDoNotStarveTheSyncLoop(t *testing.T) {
+	tc := newChain(t)
+	_, release := saturateDataPool(t, tc)
+	defer release()
+	h := tc.b.hotelByID("b")
+	// Two seconds is enough for three calls on a free pool and far below the
+	// 10 s each call waited behind the saturated one.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 	t0 := time.Now()
-	tc.b.syncHotel(context.Background(), h) // health, quota and list each wait 10 s for a connection
-	var ok bool
+	tc.b.syncHotel(ctx, h)
+	took := time.Since(t0)
+	var ok, listOK bool
 	var lastErr string
-	setHotel(tc, "b", func(h *hotel) { ok, lastErr = h.ok, h.lastErr })
-	t.Logf("syncHotel took %.1fs, ok=%v, lastErr=%q", time.Since(t0).Seconds(), ok, lastErr)
-	status, doc := tc.call(t, "key2", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
-	cancel()
-	wg.Wait()
-	if ok {
-		t.Errorf("hotel b stayed up while %d execs of one guest held every broker connection", n)
+	setHotel(tc, "b", func(h *hotel) { ok, listOK, lastErr = h.ok, h.listOK, h.lastErr })
+	if !ok || !listOK || lastErr != "" || took > 2*time.Second {
+		t.Errorf("sync behind %d held data connections: ok=%v listOK=%v lastErr=%q after %.2fs; want the hotel up with no error", cap(h.sem)+64, ok, listOK, lastErr, took.Seconds())
 	}
-	if status == 202 {
-		t.Errorf("another guest's create on b answered 202; wanted 503 hotels_unavailable to show the loss")
-	} else {
-		t.Logf("other guest's create: %d %v", status, doc)
+	var att struct {
+		Binding struct {
+			Measurement string `json:"measurement"`
+		} `json:"binding"`
+	}
+	if err := h.getJSON(ctx, h.cfg.Health, "/room/attestation", nil, &att); err != nil || len(att.Binding.Measurement) != 96 {
+		t.Errorf("hotel document behind the held data connections: %v (measurement %d chars); want it read through the control pool", err, len(att.Binding.Measurement))
 	}
 }
 
@@ -378,7 +381,7 @@ func TestCorruptStateFileIsReplacedNotKept(t *testing.T) {
 // A background exec started through the client path lives in memory only. A
 // broker restart answers exec_not_found while the command still runs.
 func TestCompatExecIsForgottenAtRestart(t *testing.T) {
-	t.Skip("pending (review round 6): a background exec lives in the broker's memory; the hotel runs the command synchronously, so a broker restart loses the result")
+	t.Skip("pending design: compat exec results across a broker restart")
 	dir := t.TempDir()
 	tc := newChainState(t, dir)
 	_, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4"}), nil)
