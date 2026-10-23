@@ -16,6 +16,7 @@ import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -899,6 +900,22 @@ def _fetch_context_tar(url: str) -> bytes:
         ) from exc
 
 
+def _read_room_log(path: Path) -> str:
+    """Read a process log from the room's /work without following a symlink.
+
+    The room can write /work, so it can swap its log for a link to a host file
+    (the hotel API key). O_NOFOLLOW refuses that; a FIFO or device reads empty.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return ""
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return ""
+        return fh.read().decode("utf-8", errors="replace")
+
+
 class DockerGuestProvider:
     """SandboxProvider that runs each sandbox as a real Linux Docker (or Kata) guest."""
 
@@ -1451,8 +1468,7 @@ class DockerGuestProvider:
         guest = self._guests.get(sandbox_id)
         if guest is None or process_id not in guest.guest_processes:
             return self._inner.process_logs(sandbox_id, process_id)
-        path = guest.guest_processes[process_id]
-        return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        return _read_room_log(guest.guest_processes[process_id])
 
     def stop_process(self, sandbox_id: str, process_id: str) -> None:
         guest = self._guests.get(sandbox_id)

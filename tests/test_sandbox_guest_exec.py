@@ -73,3 +73,19 @@ def test_exit_124_from_the_timeout_wrapper_is_a_timeout(fake: FakeDocker) -> Non
         assert len(_guest_execs(fake, "sleep")) == 1
     finally:
         provider.close()
+
+
+def test_process_log_read_refuses_a_symlink(tmp_path) -> None:
+    # The log file sits in /work, which the room can write: a room that swaps
+    # it for a symlink must not make the hotel read a host file for it.
+    from cathedral.sandbox_guest import _read_room_log
+
+    secret = tmp_path / "api.key"
+    secret.write_text("hotel-key")
+    log = tmp_path / ".process-1.log"
+    log.symlink_to(secret)
+    assert _read_room_log(log) == ""
+    log.unlink()
+    log.write_text("hello-bg\n")
+    assert _read_room_log(log) == "hello-bg\n"
+    assert _read_room_log(tmp_path / "missing.log") == ""
