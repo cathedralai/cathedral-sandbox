@@ -81,10 +81,23 @@ def test_policy_parse_canonical_and_matching() -> None:
     assert p.document() == {"mode": "allowlist", "allow": ["*.pythonhosted.org", "1.2.3.0/24", "1.2.3.4", "9.0.0.0/8", "pypi.org"]}
     assert p.nets == ("1.2.3.0/24", "9.0.0.0/8")  # 1.2.3.4 folds into 1.2.3.0/24: no interval overlap in nft
     assert p.allows_name("pypi.org") and p.allows_name("PYPI.ORG.")
+    assert p.allows_name("pypi.org", 443) and p.allows_name("pypi.org", 80)
     assert p.allows_name("files.pythonhosted.org") and p.allows_name("a.b.pythonhosted.org")
     assert not p.allows_name("pythonhosted.org")  # a wildcard does not match its suffix
     assert not p.allows_name("github.com") and not p.allows_name("evilpypi.org")
     assert not eg.Policy.parse({"mode": "internet"}).allows_name("pypi.org")
+
+
+def test_policy_honors_hostname_port() -> None:
+    """example.com:443 opens TLS only; :80 is refused (Affinities / CONST)."""
+    p = eg.Policy.parse({"mode": "allowlist", "allow": ["example.com:443"]})
+    assert p.document()["allow"] == ["example.com:443"]
+    assert p.allows_name("example.com")  # DNS
+    assert p.allows_name("example.com", 443)
+    assert not p.allows_name("example.com", 80)
+    both = eg.Policy.parse({"mode": "allowlist", "allow": ["example.com:443", "example.com:80"]})
+    assert both.document()["allow"] == ["example.com"]
+    assert both.allows_name("example.com", 80) and both.allows_name("example.com", 443)
 
 
 @pytest.mark.parametrize("bad", ["::1", "2001:db8::/32", "http://pypi.org", "pypi.org:8080", "*", "*.1.2.3.4", "a..b", "pypi", ""])
@@ -262,14 +275,27 @@ async def _run_proxy(table, *, tls: bool, room_ip: str, payload: bytes):
             return (room_ip, 1) if key == "peername" else real(key, default)
 
         writer.get_extra_info = fake
-        await proxy.handle(reader, writer, up_port, tls)
+        # The proxy checks the policy on the room's real port (80 or 443),
+        # so hand it that port and send its upstream dial to the fake server.
+        await proxy.handle(reader, writer, 443 if tls else 80, tls)
+
+    real_open = asyncio.open_connection
+
+    async def open_upstream(host, port, *args, **kwargs):
+        if host == "127.0.0.1" and port in (80, 443):
+            port = up_port
+        return await real_open(host, port, *args, **kwargs)
 
     front = await asyncio.start_server(handler, "127.0.0.1", 0)
     port = front.sockets[0].getsockname()[1]
     r, w = await asyncio.open_connection("127.0.0.1", port)
-    w.write(payload)
-    await w.drain()
-    answer = await asyncio.wait_for(r.read(65536), 5)
+    asyncio.open_connection = open_upstream
+    try:
+        w.write(payload)
+        await w.drain()
+        answer = await asyncio.wait_for(r.read(65536), 5)
+    finally:
+        asyncio.open_connection = real_open
     w.close()
     up.close()
     front.close()
@@ -320,7 +346,7 @@ def test_switch_closes_open_proxy_connections(table) -> None:
 
     proxy = eg.Proxy(table)
     table.on_change = proxy.recheck
-    proxy.active["10.214.0.24"] = {("pypi.org", W, W)}
+    proxy.active["10.214.0.24"] = {("pypi.org", 443, W, W)}
     table.put("1" * 64, "s1", eg.Policy.parse({"mode": "allowlist", "allow": ["pypi.org"]}))
     assert closed == []  # still allowed
     table.put("1" * 64, "s1", eg.Policy.parse({"mode": "deny_all"}))

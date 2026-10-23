@@ -1622,11 +1622,13 @@ class DockerGuestProvider:
             del sandbox.container_stderr[:-EXEC_OUTPUT_CAP]
             self._inner._touch(sandbox)  # noqa: SLF001
         cap = 16 * 1024 * 1024
-        truncated = len(out.encode()) > cap or len(err.encode()) > cap
+        out_b = out.encode("utf-8", "replace") if isinstance(out, str) else out
+        err_b = err.encode("utf-8", "replace") if isinstance(err, str) else err
+        truncated = len(out_b) > cap or len(err_b) > cap
         return ExecResult(
             exit_code=code,
-            stdout=out[:cap],
-            stderr=err[:cap],
+            stdout=out_b[:cap].decode("utf-8", "replace"),
+            stderr=err_b[:cap].decode("utf-8", "replace"),
             duration_ms=duration_ms,
             timed_out=timed_out,
             truncated=truncated,

@@ -475,7 +475,9 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 // or the old "none") with the list in network_allow, or the hotel object
 // {"mode", "allow"} itself. "deny_all" and "none" become the hotel mode
 // deny_all: the room keeps a network interface, so its policy can switch
-// later. The hotel checks every entry.
+// later. A create that names no mode fails closed to deny_all: egress is
+// something a client asks for, never something it gets by leaving a field
+// out. The hotel checks every entry.
 func compatNetwork(mode, allow any) (map[string]any, *apiErr) {
 	if obj, ok := mode.(map[string]any); ok {
 		mode, allow = obj["mode"], obj["allow"]
@@ -489,9 +491,9 @@ func compatNetwork(mode, allow any) (map[string]any, *apiErr) {
 		return nil, &apiErr{400, "invalid_network_allowlist", "network_allow must be a list of strings"}
 	}
 	switch mode {
-	case nil, "", "internet", "public":
+	case "internet", "public":
 		return map[string]any{"mode": "internet", "allow": []any{}}, nil
-	case "deny_all", "none":
+	case nil, "", "deny_all", "none":
 		return map[string]any{"mode": "deny_all", "allow": []any{}}, nil
 	case "allowlist":
 		if len(list) == 0 {
@@ -514,9 +516,8 @@ func (b *broker) compatSetNetwork(w http.ResponseWriter, r *http.Request, rm *ro
 	if allow == nil {
 		allow = req["network_allow"]
 	}
-	// A live change must name its mode. compatNetwork defaults a missing
-	// mode to internet, which is right for a create but would turn a
-	// malformed change into full internet access.
+	// A live change must name its mode: a malformed change must neither
+	// open the room nor silently close it.
 	if m, _ := req["mode"].(string); m == "" {
 		compatErr(w, 400, "invalid_network_mode", "network change needs a mode: internet, deny_all or allowlist", 0)
 		return
@@ -631,6 +632,8 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			_, _ = w.Write(reEnvelope(status, http.Header{}, out))
 			return
 		}
+		doc["hotel"] = rm.h.cfg.ID
+		doc["isolation"] = isolationDoc(rm.h, doc)
 		writeJSON(w, 200, compatView(doc, id))
 	case tail == "" && r.Method == "DELETE":
 		c := &capture{hdr: http.Header{}, status: 200}
@@ -676,6 +679,7 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			if t, _ := doc["timed_out"].(bool); t {
 				doc["state"] = "timed_out"
 			}
+			clipExecDoc(doc)
 			writeJSON(w, 200, doc)
 		})
 	case tail == "network" && (r.Method == "PUT" || r.Method == "POST" || r.Method == "PATCH"):

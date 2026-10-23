@@ -144,7 +144,8 @@ address of the allowed name, so an allowed address does not open other names.
 
 Allowlist entries: hostnames, `*.suffix` wildcards (subdomains only, not the
 suffix), IPv4 addresses and IPv4 CIDRs, at most 256. Hostnames and wildcards
-work on TCP 80 and 443 only. Addresses and CIDRs work on every port.
+work on TCP 80 and 443 only (`host:443` opens TLS alone; a bare hostname
+opens both). Addresses and CIDRs work on every port.
 `room-net.sh` still drops private and link-local ranges, so an allowlist
 cannot open them. IPv6 is not supported.
 

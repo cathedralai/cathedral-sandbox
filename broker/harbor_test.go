@@ -39,6 +39,40 @@ func (tc *testChain) clientCall(t *testing.T, method, path string, body []byte, 
 
 func mustMarshal(v any) []byte { b, _ := json.Marshal(v); return b }
 
+func TestHotelPathRejectsStringCmd(t *testing.T) {
+	// Hotel ids (a.sbx_…) skip compatExecBody; requireExecCmdList must still refuse a string.
+	tc := newChain(t)
+	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+id+"/exec", map[string]any{"cmd": "echo hi"})
+	if status != 400 || errCode(doc) != "invalid_exec" {
+		t.Fatalf("hotel-path string cmd: %d %v", status, doc)
+	}
+	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes/"+id+"/exec", map[string]any{"cmd": []string{"true"}})
+	if status != 200 {
+		t.Fatalf("hotel-path list cmd: %d %v", status, doc)
+	}
+}
+
+func TestTruncateExecJSONCapsStdoutAndSetsFlag(t *testing.T) {
+	big := strings.Repeat("x", execOutputCapBytes+64)
+	raw, _ := json.Marshal(map[string]any{"stdout": big, "stderr": "", "exit_code": 0, "truncated": false})
+	out := truncateExecJSON(raw)
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc["truncated"] != true {
+		t.Fatalf("truncated flag: %v", doc["truncated"])
+	}
+	if s, _ := doc["stdout"].(string); len(s) != execOutputCapBytes {
+		t.Fatalf("stdout len %d, want %d", len(s), execOutputCapBytes)
+	}
+	small, _ := json.Marshal(map[string]any{"stdout": "ok", "truncated": false})
+	if got := truncateExecJSON(small); !bytes.Equal(got, small) {
+		t.Fatalf("short output rewritten: %s", got)
+	}
+}
+
 func TestExecTimeoutOfFourHoursPassesToTheHotel(t *testing.T) {
 	tc := newChain(t)
 	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4"}), nil)
