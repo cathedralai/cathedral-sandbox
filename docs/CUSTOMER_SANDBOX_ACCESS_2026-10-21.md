@@ -79,6 +79,15 @@ non-empty JSON array of strings:
 
 ---
 
+## Files (`/v1/sandboxes/<id>/files`, `/tar`, `/stat`)
+
+The files API reaches **`/work` only**, the directory shared with the room.
+A path outside `/work` returns **400** `path_outside_work`. To place a file
+elsewhere in the room, write it under `/work` and move it with an exec.
+Snapshots and forks keep `/work` and the room's own filesystem.
+
+---
+
 ## Room isolation: gVisor vs sealed TEE
 
 The broker serves two kinds of hotel:
@@ -105,6 +114,11 @@ memory-only and resets on restart.
 An ops key (`"ops": true` in the guest config) receives the raw, unfiltered
 chain.
 
+A guest's chain is marked `"filtered": true`: it holds only that guest's
+receipts, so it has gaps. `verify_receipts.py --broker ... --key-file ...`
+checks each receipt's signature and attestation binding; the full-chain
+checks (no gaps, ends at `head`) apply only to an unfiltered chain.
+
 ---
 
 ## Error codes quick reference
@@ -119,5 +133,7 @@ chain.
 | `snapshot_hotel_excluded` | 409 | The fork's snapshot hotel does not match the hotel selection |
 | `invalid_network_allowlist` | 400 | An allowlist entry is invalid (see above) |
 | `invalid_exec` | 400 | `cmd` is missing, empty, or not a list of strings |
+| `path_outside_work` | 400 | A files, tar or stat path is not under `/work` |
+| `invalid_network_mode` | 400 | A network change has no `mode` |
 | `room_limit` | 429 | Guest has reached its `max_rooms` limit |
 | `create_rate_limit` | 429 | Guest has exceeded `max_creates_per_minute` |
