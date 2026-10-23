@@ -87,7 +87,7 @@ def test_policy_parse_canonical_and_matching() -> None:
     assert not eg.Policy.parse({"mode": "internet"}).allows_name("pypi.org")
 
 
-@pytest.mark.parametrize("bad", ["::1", "2001:db8::/32", "http://pypi.org", "pypi.org:443", "*", "*.1.2.3.4", "a..b", "pypi", ""])
+@pytest.mark.parametrize("bad", ["::1", "2001:db8::/32", "http://pypi.org", "pypi.org:8080", "*", "*.1.2.3.4", "a..b", "pypi", ""])
 def test_policy_refuses_bad_entries(bad) -> None:
     with pytest.raises(ValueError):
         eg.Policy.parse({"mode": "allowlist", "allow": [bad]})
@@ -365,3 +365,13 @@ def test_control_socket_round_trip(table, tmp_path) -> None:
     assert status == 200 and doc["forgotten"] is True
     srv.shutdown()
     Path(path).unlink(missing_ok=True)
+
+
+def test_put_refuses_a_room_without_its_bridge_port(table) -> None:
+    # Without the host-side port the room is not in @ports, so the guard that
+    # binds its source IP and MAC skips it and a raw-socket room could send as
+    # another room. Refuse the room instead (the API then removes the guest).
+    table.fake.add("d" * 64, "10.214.0.9", port=None)
+    with pytest.raises(RuntimeError):
+        table.put("d" * 64, "sbx_9", eg.Policy.parse({"mode": "internet"}))
+    assert table.policy_of("10.214.0.9") is None

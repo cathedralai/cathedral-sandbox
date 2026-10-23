@@ -365,6 +365,12 @@ class Table:
 
     def put(self, container_id: str, sandbox_id: str, policy: Policy) -> Room:
         ip, mac, port = self.docker.facts(container_id)
+        if not port:
+            # Without the host-side port the room is not in @ports, so the
+            # guard that binds its source IP and MAC would skip it and a
+            # raw-socket room could send as another room. Fail closed: the
+            # API removes a guest whose policy cannot be applied.
+            raise RuntimeError(f"container {container_id[:12]}: bridge port not found, room not admitted")
         with self.lock:
             old = self.by_cid.get(container_id)
             stale = self.by_ip.get(ip)
