@@ -1784,6 +1784,11 @@ class DockerGuestProvider:
 
     def delete_snapshot(self, snapshot_id: str) -> bool:
         existed = self._inner.delete_snapshot(snapshot_id)
+        if not existed:
+            # Unknown to the caller, or another key's: the image stays with
+            # its record. One whose record expired meanwhile loses its image
+            # in the next sweep.
+            return False
         self._snapshot_meta.pop(snapshot_id, None)
         image = self._snapshot_images.pop(snapshot_id, None)
         if image:

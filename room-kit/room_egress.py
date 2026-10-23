@@ -868,6 +868,13 @@ def room_bridges(env: dict[str, str]) -> list[str]:
     return [env["ROOM_BRIDGE"]] + [f"{prefix}{i}" for i in range(len(env.get("ROOM_NETS", "").split()))]
 
 
+def rules_for(env: dict[str, str], ports: tuple[int, int, int], run: Callable[[str], None] | None = None) -> Rules:
+    """The hotel's rules from its room.env: every room network and every room
+    bridge. The bridges turn the port guard from "return" into "drop", so the
+    daemon must name them; a test drives this from an env, main() from the file."""
+    return Rules(env["ROOM_ID"], [n for n, _ in room_networks(env)], *ports, run=run, bridges=room_bridges(env))
+
+
 def bound_socket(kind: int, addr: str, port: int) -> socket.socket:
     s = socket.socket(socket.AF_INET, kind)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -905,7 +912,7 @@ def main() -> int:
     sock_path = os.environ.get("ROOM_EGRESS_SOCKET", "/run/pool-room-egress/control.sock")
     run_dir = os.path.dirname(sock_path)
     os.makedirs(run_dir, mode=0o750, exist_ok=True)
-    rules = Rules(env["ROOM_ID"], [n for n, _ in nets], *ports, bridges=room_bridges(env))
+    rules = rules_for(env, ports)
     docker = Docker(os.environ.get("ROOM_DOCKER_SOCK", "/run/pool-room/docker.sock"))
     proxy_box: list[Proxy] = []
     table = Table(rules, docker, os.path.join(run_dir, "state.json"),

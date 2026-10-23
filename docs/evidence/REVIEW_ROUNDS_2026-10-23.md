@@ -205,6 +205,7 @@ has a test that failed first. Graphs: docs/evidence/REVIEW_ROUND6_GRAPHS.html.
 | B146 | The installer's final check accepted any answer: a 401 printed "done" over a hotel that answered nobody | Yes (operator) | Fixed (needs a 200 with the hotel's own key, else the install fails) | H |
 | B147 | The B130 updater fix returned "alert" (12) where the fallback shim must pass the current updater's status through; the existing test caught it in CI, not locally (the suite subset run here did not include it) | No | Fixed (pass-through when the status pages, alert when it would be quiet) | miner host |
 | B148 | A create whose snapshot_id was a list, an object or a number raised out of the request (AttributeError): a 500 with a traceback on the hotel instead of the 400 every other wrong-shaped field gets. Found by the property pass | Yes | Fixed | H, S |
+| B149 | Deleting a snapshot id that belonged to another key answered 404 to the caller but still removed the committed image on the hotel: the owner's next fork failed with snapshot_image_missing. Found while adding the test guard for B67 | Latent (one key per hotel) | Fixed | H, S |
 
 ### Other angles (2026-10-23, after the readers)
 
@@ -244,5 +245,6 @@ has a test that failed first. Graphs: docs/evidence/REVIEW_ROUND6_GRAPHS.html.
 
 Deploy stages are as above (B broker, H shared hotel reinstall, S sealed
 rebuild, T client tool; "miner host" is the Contabo SN94 miner, updated by
-hand). #312 adds a fifth check to stage H and S: run the build probe (`scratchpad/buildkit/run.sh` in the review transcript) and
-expect the RUN step to report the gVisor kernel.
+hand). #312 adds a fifth check to stage H and S: run the build probe
+(`BROKER_KEY_FILE=<ops key> scripts/build_runtime_probe.sh`) and expect
+"OK: build and room both under gVisor" (exit 0).

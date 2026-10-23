@@ -208,18 +208,27 @@ def test_sigterm_ends_the_server_like_ctrl_c() -> None:
 
 def test_credentialed_pulls_are_remembered_across_a_restart(fake, tmp_path) -> None:
     # A private image pulled with one key's credentials must not start for a
-    # key without credentials after the API restarts.
+    # key without credentials after the API restarts. The remembered set is
+    # written by the credentialed pull itself, not by this test.
+    private = "registry.example.com/acme/private:v1"
+    auth = {"username": "u", "password": "p"}
     first = DockerGuestProvider()
     try:
-        first._auth_pulled.add("registry.example.com/acme/private:v1")  # noqa: SLF001
-        from cathedral.sandbox_guest import _save_auth_pulled
-
-        _save_auth_pulled(first._auth_pulled)  # noqa: SLF001
+        first.create(CreateSandboxRequest(image=ImageSource(image=private, registry_auth=auth), resources=RES),
+                     api_key="k", idempotency=None, body_digest="x")
+        assert private in first._auth_pulled  # noqa: SLF001
     finally:
         first.close()
     second = DockerGuestProvider()
     try:
-        assert "registry.example.com/acme/private:v1" in second._auth_pulled  # noqa: SLF001
+        assert private in second._auth_pulled  # noqa: SLF001
+        # A key without credentials pulls again, so the registry refuses it
+        # instead of the local copy starting for free.
+        fake.set(pull_fail=[private])
+        with pytest.raises(SandboxOpError) as err:
+            second.create(CreateSandboxRequest(image=ImageSource(image=private), resources=RES),
+                          api_key="other", idempotency=None, body_digest="y")
+        assert err.value.code == "image_pull_failed"
     finally:
         second.close()
 
