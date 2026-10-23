@@ -87,7 +87,7 @@ def test_policy_parse_canonical_and_matching() -> None:
     assert not eg.Policy.parse({"mode": "internet"}).allows_name("pypi.org")
 
 
-@pytest.mark.parametrize("bad", ["::1", "2001:db8::/32", "http://pypi.org", "pypi.org:443", "*", "*.1.2.3.4", "a..b", "pypi", ""])
+@pytest.mark.parametrize("bad", ["::1", "2001:db8::/32", "http://pypi.org", "pypi.org:8080", "*", "*.1.2.3.4", "a..b", "pypi", ""])
 def test_policy_refuses_bad_entries(bad) -> None:
     with pytest.raises(ValueError):
         eg.Policy.parse({"mode": "allowlist", "allow": [bad]})

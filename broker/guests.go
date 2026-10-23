@@ -205,7 +205,7 @@ func (b *broker) patchGuest(w http.ResponseWriter, r *http.Request, id string) {
 	if req.Hotels != nil {
 		for _, h := range *req.Hotels {
 			if b.hotelByID(h) == nil {
-				writeErr(w, 400, "unknown_hotel", fmt.Sprintf("no hotel %q", h))
+				writeErr(w, 409, "unknown_hotel", fmt.Sprintf("no hotel %q", h))
 				return
 			}
 		}

@@ -8,7 +8,7 @@ The broker does four things:
 
 | Function | Routes | What it does |
 |---|---|---|
-| Scatter | `POST /v1/sandboxes` (also `count` up to 10,000) | Picks a hotel at random, with weight = free rooms. Each hotel has a fixed number of creates in flight (`concurrency`). If a hotel answers 429, the broker tries another hotel. If no hotel has a free room, it answers 429 with `Retry-After`. |
+| Scatter | `POST /v1/sandboxes` (also `count` up to 10,000) | Picks a hotel at random, with weight = free rooms. Each hotel has a fixed number of creates in flight (`concurrency`). If a hotel answers 429, the broker tries another hotel. If no hotel has a free room, it answers 429 `no_free_rooms`. If all matching hotels are down or draining, it answers 503 `hotels_unavailable`. |
 | Gather | `GET /v1/sandboxes`, `GET /v1/quota`, `GET /v1/usage`, `DELETE /v1/sandboxes?label=` | Asks all hotels in parallel and merges the answers. A guest sees only its own rooms. |
 | Route | `/v1/sandboxes/<hotel>.<id>/...` | Sends exec, files, tar, heartbeat, delete and the other room calls to the hotel that has the room. |
 | Show | `/<guest>/live` | Live view: one tile per hotel, one square per room, live counters. |
@@ -35,14 +35,16 @@ before it calls the hotel.
 
 | Field | Meaning |
 |---|---|
-| `"hotels": ["a", "b"]` | Only these hotels. An unknown id gives 400 `unknown_hotel`. |
+| `"hotels": ["a", "b"]` | Only these hotels. An unknown id gives 409 `unknown_hotel`. |
 | `"hotel_labels": {"sealed": "true"}` | Only hotels with every pair. |
 | `"exclude_hotel_labels": {"sealed": "true"}` | No hotel with any pair. |
 
 Hotel labels come from the `labels` object of each hotel in the config.
 `GET /v1/broker/hotels` lists hotel ids, labels and free rooms. When no
 hotel matches, the broker answers 409 `no_matching_hotel`. When the
-matching hotels are full, it answers 429 `no_free_rooms`. It never uses
+matching hotels are full, it answers 429 `no_free_rooms`. If matching hotels
+are down or draining (not full), it answers 503 `hotels_unavailable` instead of
+claiming they are full. It never uses
 a hotel outside the choice.
 
 ## Guest limits
@@ -54,7 +56,7 @@ Each guest in the config can have limits (`guests.go`):
 | `max_rooms` | Rooms running or starting at one time. Absent or 0: 1,000. Over the limit, a create gets 429 `room_limit`. A batch that does not fit is refused as a whole. |
 | `max_creates_per_minute` | Rooms the guest may ask for in any 60 s. Absent or 0: no limit. Over the limit, a create gets 429 `create_rate_limit` with `Retry-After`. |
 | `default_sealed` | `true`: a create with no hotel choice goes to sealed hotels only. The guest gets an unsealed room only when the create says `"sealed": false`, names hotels with `"hotels"`, or excludes sealed hotels with `"exclude_hotel_labels"`. A fork goes to the hotel of its snapshot. |
-| `hotels` | The hotel ids the guest may use. Absent: all hotels. Other hotels are not in the guest's hotel list, and a create that names one gets 400 `unknown_hotel`. |
+| `hotels` | The hotel ids the guest may use. Absent: all hotels. Other hotels are not in the guest's hotel list, and a create that names one gets 409 `unknown_hotel`. |
 | `ops` | `true`: the guest may run `POST /v1/broker/probe` and reset the counters with `POST /v1/broker/stats`. Other guests get 403. |
 
 The limits apply to the native routes and to the client (Harbor, ctcli)
@@ -134,16 +136,24 @@ Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
 - Exec: the longest exec is `max_exec_seconds` in the config (default
   14,400). Keep it at or below the hotel limit
   `CATHEDRAL_SANDBOX_EXEC_TIMEOUT_MAX` (default 14,400).
+  The exec body field is `cmd` (a non-empty JSON **array** of strings);
+  `command` is also accepted as an alias. A string `cmd` value gives 400
+  `invalid_exec`. Large exec output is truncated by the hotel at
+  `exec_output_limit_bytes` (default 16 MiB); the response includes
+  `"truncated": true` when that happens.
 - Image build (client path): `POST /v1/images/build` takes the Dockerfile
   and the build context. The broker asks each hotel that takes new rooms
   to build it. The image is `ready` when one hotel has it, and a create
   with it goes only to hotels that have it. A failed build gives state
   `failed` with error `image_build_failed`.
 - With `state_dir` set, the broker keeps client room ids, Idempotency-Key
-  answers (48 hours), deleted-room tombstones and images in
-  `state_dir/client-state.json` (mode 0600), and build contexts in
-  `state_dir/build-contexts/`. After a restart, a repeated create with the
-  same key returns the first answer, and a room keeps its client id.
+  answers (48 hours), deleted-room tombstones, images, and guest→hotel→room
+  mappings in `state_dir/client-state.json` (mode 0600), and build contexts
+  in `state_dir/build-contexts/`. After a restart, a repeated create with
+  the same key returns the first answer, a room keeps its client id, and
+  `GET /v1/hotels/<id>/receipts` still filters correctly for each guest
+  (the room→guest mapping is persisted, so a reload does not expose another
+  guest's receipts).
 
 ## Hotels at runtime
 

@@ -41,6 +41,7 @@ from cathedral.sandbox_api import (
     idempotency_digest,
     is_collectable,
     key_quota_for,
+    normalize_allow_entry,
     operation_id,
     parse_byte_range,
     snapshot_gib_months,
@@ -121,6 +122,31 @@ def test_network_spec_modes_and_allowlist() -> None:
         NetworkSpec(mode="bridge")
     with pytest.raises(SandboxContractError, match="invalid_network_allowlist"):
         NetworkSpec(mode="allowlist", allow=())
+
+
+def test_allowlist_hostname_port_80_443_accepted_and_stripped() -> None:
+    """host:80 and host:443 normalize to the bare hostname (CONST fix D)."""
+    assert normalize_allow_entry("pypi.org:443") == "pypi.org"
+    assert normalize_allow_entry("pypi.org:80") == "pypi.org"
+    assert normalize_allow_entry("PYPI.ORG:443") == "pypi.org"
+    # Duplicate after normalization is deduplicated by canonical_network_policy.
+    assert normalize_allow_entry("pypi.org") == "pypi.org"
+
+
+def test_allowlist_hostname_other_port_rejected() -> None:
+    """host:8080 gives a clear error, not a generic bad-entry message."""
+    with pytest.raises(SandboxContractError, match="invalid_network_allowlist"):
+        normalize_allow_entry("pypi.org:8080")
+    with pytest.raises(SandboxContractError, match="invalid_network_allowlist"):
+        normalize_allow_entry("pypi.org:8443")
+
+
+def test_allowlist_ip_colon_port_rejected_with_guidance() -> None:
+    """1.2.3.4:443 is rejected; user should use bare 1.2.3.4 (CONST fix D)."""
+    with pytest.raises(SandboxContractError, match="invalid_network_allowlist"):
+        normalize_allow_entry("1.2.3.4:443")
+    with pytest.raises(SandboxContractError, match="invalid_network_allowlist"):
+        normalize_allow_entry("1.2.3.4:80")
 
 
 # ---------------------------------------------------------------- §3.1/§3.4/§3.5 create

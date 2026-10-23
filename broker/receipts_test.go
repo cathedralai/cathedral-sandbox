@@ -118,6 +118,45 @@ func TestHotelReceiptChainHidesOtherGuests(t *testing.T) {
 	}
 }
 
+// TestGuestRoomsPersistedAndRestoredAfterReload verifies that
+// guestRooms (guest→hotel→room-ids) survive a broker restart so that
+// GET /v1/hotels/<id>/receipts still filters correctly after reload.
+func TestGuestRoomsPersistedAndRestoredAfterReload(t *testing.T) {
+	dir := t.TempDir()
+	tc := newChainState(t, dir)
+	// Create a room on hotel "a" for guest 1.
+	id1 := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+	_, hid1, _ := strings.Cut(id1, ".")
+	mine := `{"statement":{"sandbox_id":"` + hid1 + `","image":"g1-image:1","target":"POST /v1/sandboxes"},"signature_b64":"sig-g1"}`
+	other := `{"statement":{"sandbox_id":"other-room","image":"g2-image:2","target":"POST /v1/sandboxes"},"signature_b64":"sig-g2"}`
+	raw := []byte(`{"binding_sha256":"bb","head":"hh","count":2,"receipts":[` + mine + `,` + other + `]}`)
+	tc.hotels["a"].mu.Lock()
+	tc.hotels["a"].receipts = raw
+	tc.hotels["a"].mu.Unlock()
+
+	// Verify filtering works before restart.
+	status, page := tc.body(t, "key1", "GET", "/v1/hotels/a/receipts")
+	if status != 200 || !bytes.Contains(page, []byte("g1-image:1")) || bytes.Contains(page, []byte("g2-image:2")) {
+		t.Fatalf("pre-reload filter: %d %s", status, page)
+	}
+
+	// Save state and restart the broker.
+	if err := tc.b.saveCompat(); err != nil {
+		t.Fatal(err)
+	}
+	tc.start(t)
+
+	// After restart, guestRooms must still know about hid1 for key1.
+	tc.hotels["a"].mu.Lock()
+	tc.hotels["a"].receipts = raw
+	tc.hotels["a"].mu.Unlock()
+
+	status, page = tc.body(t, "key1", "GET", "/v1/hotels/a/receipts")
+	if status != 200 || !bytes.Contains(page, []byte("g1-image:1")) || bytes.Contains(page, []byte("g2-image:2")) {
+		t.Fatalf("post-reload filter: %d %s (guestRooms not persisted)", status, page)
+	}
+}
+
 func (tc *testChain) body(t *testing.T, key, method, path string) (int, []byte) {
 	t.Helper()
 	req, err := http.NewRequest(method, tc.srv.URL+path, nil)

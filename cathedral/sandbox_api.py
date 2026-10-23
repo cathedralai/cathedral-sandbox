@@ -22,6 +22,8 @@ operator tooling and the audit facade already use (``CATHEDRAL_API_URL``,
 from __future__ import annotations
 
 import hashlib
+import ipaddress
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -247,19 +249,37 @@ def canonical_network_mode(mode: str) -> str:
 def normalize_allow_entry(entry: object) -> str:
     """Validate one allowlist entry and return its canonical form.
 
-    Accepted: a hostname ("pypi.org"), a leading wildcard ("*.pythonhosted.org",
-    which matches every name below the suffix but not the suffix itself), an
-    IPv4 address and an IPv4 CIDR. Hostnames are lower case with no trailing
+    Accepted: a hostname ("pypi.org"), optional ``:80`` / ``:443`` on a hostname
+    (normalized to the bare hostname — the hotel egress proxy only offers TCP
+    80 and 443 for named hosts), a leading wildcard ("*.pythonhosted.org"),
+    an IPv4 address and an IPv4 CIDR. Hostnames are lower case with no trailing
     dot. A CIDR is written in network form (10.1.2.3/8 is 10.0.0.0/8).
-    IPv6, URLs, ports and paths are refused.
+    IPv6, URLs, paths, and hostname ports other than 80/443 are refused.
+    Bare IPv4/CIDR allow every port on that address (nftables); use hostnames
+    when you need name-bound 80/443 only.
     """
-    import ipaddress
-
     _require(isinstance(entry, str) and 1 <= len(entry) <= 255, "invalid_network_allowlist",
              "allowlist entries must be non-empty strings of at most 255 characters")
     value = entry.strip().lower().rstrip(".")
-    bad = f"allowlist entry {entry!r} is not a hostname, *.wildcard, IPv4 address or IPv4 CIDR"
+    bad = f"allowlist entry {entry!r} is not a hostname, hostname:80|:443, *.wildcard, IPv4 address or IPv4 CIDR"
     _require(bool(value), "invalid_network_allowlist", bad)
+    # Optional host:port — only 80/443 for named hosts (egress proxy).
+    host_port = None
+    if value.count(":") == 1 and not value.startswith("[") and "/" not in value:
+        host_part, port_part = value.rsplit(":", 1)
+        if port_part.isdigit():
+            port = int(port_part)
+            _require(1 <= port <= 65535, "invalid_network_allowlist", bad)
+            try:
+                ipaddress.ip_address(host_part)
+            except ValueError:
+                host_port = (host_part, port)
+                value = host_part
+            else:
+                raise SandboxContractError(
+                    "invalid_network_allowlist",
+                    f"allowlist entry {entry!r}: use a bare IPv4/CIDR (all ports) or a hostname:80|:443",
+                ) from None
     if "/" in value:
         try:
             net = ipaddress.ip_network(value, strict=False)
@@ -275,6 +295,11 @@ def normalize_allow_entry(entry: object) -> str:
         _require(addr.version == 4, "invalid_network_allowlist", f"allowlist entry {entry!r}: IPv6 is not supported")
         return str(addr)
     _require(":" not in value and "[" not in value, "invalid_network_allowlist", bad)
+    if host_port is not None and host_port[1] not in (80, 443):
+        raise SandboxContractError(
+            "invalid_network_allowlist",
+            f"allowlist entry {entry!r}: named hosts only allow TCP 80 and 443 (omit the port, or use :80/:443)",
+        )
     name = value[2:] if value.startswith("*.") else value
     labels = name.split(".")
     _require(len(name) <= 253 and len(labels) >= 2 and all(_HOST_LABEL_RE.match(lb) for lb in labels),
@@ -293,8 +318,6 @@ def canonical_network_policy(mode: str, allow: Sequence[str] = ()) -> dict[str, 
 
 def network_policy_sha256(policy: Mapping[str, object]) -> str:
     """sha256 of the canonical JSON of *policy* (sort_keys, no spaces, UTF-8)."""
-    import json
-
     raw = json.dumps(dict(policy), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return hashlib.sha256(raw).hexdigest()
 
@@ -590,8 +613,6 @@ def operation_id() -> str:
 
 def idempotency_digest(prefix: str, *parts: Sequence[object] | object) -> str:
     """A stable Idempotency-Key derived from request content (same body -> same key)."""
-    import json
-
     digest = hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode("utf-8"))
     return validate_idempotency_key(f"{prefix}-{digest.hexdigest()[:40]}")
 

@@ -28,6 +28,7 @@ func (b *broker) rememberGuestRoom(guest, hotel, hid string) {
 		byHotel[hotel] = ids
 	}
 	ids[hid] = struct{}{}
+	b.markDirty()
 }
 
 // guestRoomIDs is the hotel-local room ids this guest has owned on hotel,

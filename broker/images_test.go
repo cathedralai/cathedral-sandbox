@@ -419,7 +419,8 @@ func TestCreateByHotelLabelsAndIDs(t *testing.T) {
 		t.Fatalf("no match: %d %v", status, doc)
 	}
 	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"zz"}})
-	if status != 400 || errCode(doc) != "unknown_hotel" {
+	if status != 409 || errCode(doc) != "unknown_hotel" { // CONST: unknown hotel is 409, not 400
+
 		t.Fatalf("unknown hotel: %d %v", status, doc)
 	}
 	// Selected hotel full: 429, never another hotel.
@@ -429,6 +430,12 @@ func TestCreateByHotelLabelsAndIDs(t *testing.T) {
 	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotel_labels": map[string]string{"sealed": "true"}})
 	if status != 429 || errCode(doc) != "no_free_rooms" {
 		t.Fatalf("full sealed hotel: %d %v", status, doc)
+	}
+	// Selected hotel down: 503 hotels_unavailable — not "all hotels are full".
+	setHotel(tc, "a", func(h *hotel) { h.ok = false; h.slots = 100 })
+	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+	if status != 503 || errCode(doc) != "hotels_unavailable" {
+		t.Fatalf("down hotel: %d %v", status, doc)
 	}
 	status, doc = tc.call(t, "key1", "GET", "/v1/broker/hotels", nil)
 	if status != 200 || len(doc["hotels"].([]any)) != 3 {

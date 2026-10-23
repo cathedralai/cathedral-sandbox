@@ -109,7 +109,7 @@ func TestGuestHotelSet(t *testing.T) {
 			t.Fatalf("create outside the hotel set or on the sealed hotel: %s", id)
 		}
 	}
-	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}}); status != 400 || errCode(doc) != "unknown_hotel" {
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}}); status != 409 || errCode(doc) != "unknown_hotel" {
 		t.Fatalf("hotel outside the set: %d %v", status, doc)
 	}
 	status, doc := tc.call(t, "key1", "GET", "/v1/broker/hotels", nil)
@@ -226,7 +226,7 @@ func TestOperatorChangesGuestLimitsAtRuntime(t *testing.T) {
 	if status, _ := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"}); status != 429 {
 		t.Fatalf("over the patched limit: %d", status)
 	}
-	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{"hotels": []string{"zz"}}); status != 400 || errCode(doc) != "unknown_hotel" {
+	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{"hotels": []string{"zz"}}); status != 409 || errCode(doc) != "unknown_hotel" {
 		t.Fatalf("unknown hotel: %d %v", status, doc)
 	}
 	if status, _ := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{"max_room": 5}); status != 400 {

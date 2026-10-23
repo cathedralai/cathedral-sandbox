@@ -46,7 +46,16 @@ func TestExecTimeoutOfFourHoursPassesToTheHotel(t *testing.T) {
 		t.Fatalf("create: %d %v", status, doc)
 	}
 	id := doc["id"].(string)
+	// cmd must be a list of strings (CONST feedback fix E).
 	status, doc = tc.clientCall(t, "POST", "/v1/sandboxes/"+id+"/exec", mustMarshal(map[string]any{"command": "true", "timeout_seconds": 14400}), nil)
+	if status != 400 {
+		t.Fatalf("string cmd: want 400 invalid_exec, got %d %v", status, doc)
+	}
+	if doc["detail"].(map[string]any)["error"] != "invalid_exec" {
+		t.Fatalf("string cmd error code: %v", doc)
+	}
+	// List cmd is accepted; timeout passes through.
+	status, doc = tc.clientCall(t, "POST", "/v1/sandboxes/"+id+"/exec", mustMarshal(map[string]any{"cmd": []string{"true"}, "timeout_seconds": 14400}), nil)
 	if status != 200 {
 		t.Fatalf("exec: %d %v", status, doc)
 	}
@@ -65,7 +74,7 @@ func TestExecTimeoutOfFourHoursPassesToTheHotel(t *testing.T) {
 	}
 	// The operator limit in the config wins.
 	tc.b.cfg.MaxExecSeconds = 600
-	tc.clientCall(t, "POST", "/v1/sandboxes/"+id+"/exec", mustMarshal(map[string]any{"command": "true", "timeout_seconds": 14400}), nil)
+	tc.clientCall(t, "POST", "/v1/sandboxes/"+id+"/exec", mustMarshal(map[string]any{"cmd": []string{"true"}, "timeout_seconds": 14400}), nil)
 	for _, f := range tc.hotels {
 		for _, e := range f.execs {
 			got = e["timeout_seconds"].(float64)

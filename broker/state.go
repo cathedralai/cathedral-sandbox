@@ -39,10 +39,11 @@ type savedTomb struct {
 }
 
 type savedState struct {
-	UUIDs  map[string]string       `json:"uuids"` // client id -> broker room id
-	Idem   map[string]savedIdem    `json:"idempotency"`
-	Tombs  map[string]savedTomb    `json:"tombstones"`
-	Images map[string]*compatImage `json:"images"`
+	UUIDs      map[string]string                       `json:"uuids"` // client id -> broker room id
+	Idem       map[string]savedIdem                    `json:"idempotency"`
+	Tombs      map[string]savedTomb                    `json:"tombstones"`
+	Images     map[string]*compatImage                 `json:"images"`
+	GuestRooms map[string]map[string]map[string]bool   `json:"guest_rooms"` // guest -> hotel -> room id
 }
 
 func (b *broker) markDirty() { b.dirty.Store(true) }
@@ -73,11 +74,29 @@ func (b *broker) saveCompat() error {
 	if b.cfg.StateDir == "" {
 		return nil
 	}
-	st := savedState{UUIDs: map[string]string{}, Idem: map[string]savedIdem{}, Tombs: map[string]savedTomb{}, Images: map[string]*compatImage{}}
+	st := savedState{
+		UUIDs: map[string]string{}, Idem: map[string]savedIdem{}, Tombs: map[string]savedTomb{},
+		Images: map[string]*compatImage{}, GuestRooms: map[string]map[string]map[string]bool{},
+	}
 	b.mu.Lock()
 	for u, rm := range b.byUUID {
 		if rm.id != "" {
 			st.UUIDs[u] = rm.id
+		}
+	}
+	for guest, byHotel := range b.guestRooms {
+		outHotel := map[string]map[string]bool{}
+		for hotel, ids := range byHotel {
+			outIDs := map[string]bool{}
+			for id := range ids {
+				outIDs[id] = true
+			}
+			if len(outIDs) > 0 {
+				outHotel[hotel] = outIDs
+			}
+		}
+		if len(outHotel) > 0 {
+			st.GuestRooms[guest] = outHotel
 		}
 	}
 	b.mu.Unlock()
@@ -155,6 +174,26 @@ func (b *broker) loadCompat() error {
 	b.savedUUIDs = map[string]string{}
 	for u, bid := range st.UUIDs {
 		b.savedUUIDs[bid] = u
+	}
+	if len(st.GuestRooms) > 0 {
+		b.guestRooms = map[string]map[string]map[string]struct{}{}
+		for guest, byHotel := range st.GuestRooms {
+			outHotel := map[string]map[string]struct{}{}
+			for hotel, ids := range byHotel {
+				outIDs := map[string]struct{}{}
+				for id, ok := range ids {
+					if ok && id != "" {
+						outIDs[id] = struct{}{}
+					}
+				}
+				if len(outIDs) > 0 {
+					outHotel[hotel] = outIDs
+				}
+			}
+			if len(outHotel) > 0 {
+				b.guestRooms[guest] = outHotel
+			}
+		}
 	}
 	b.mu.Unlock()
 	b.compat.mu.Lock()
