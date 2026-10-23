@@ -235,7 +235,7 @@ func (b *broker) compatCatalog(w http.ResponseWriter) {
 	free := 0
 	for _, h := range b.hotelList() {
 		if h.ok {
-			if f := h.slots - h.used(); f > 0 {
+			if f := b.freeFor(h); f > 0 {
 				free += f
 			}
 		}

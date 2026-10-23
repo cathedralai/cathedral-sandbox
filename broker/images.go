@@ -121,7 +121,7 @@ func (b *broker) noRoomReason(pl placement) createResult {
 			down++
 			continue
 		}
-		if h.slots-h.used() > 0 {
+		if b.freeFor(h) > 0 {
 			free++
 		} else {
 			full++
@@ -269,7 +269,7 @@ func (b *broker) handleHotels(w http.ResponseWriter, g *guestState) {
 		if !g.limits.allows(h.cfg.ID) {
 			continue
 		}
-		free := h.slots - h.used()
+		free := b.freeFor(h)
 		if free < 0 || !h.ok || h.cfg.Drain {
 			free = 0
 		}

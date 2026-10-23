@@ -25,7 +25,32 @@ const (
 	defaultCreateSec    = 1.0  // create time before the first measured create
 	minHeadroom         = 0.05 // a hotel at 100% CPU keeps a small weight
 	ewmaAlpha           = 0.2
+	defaultMemFullPct   = 90.0 // host memory use at which a hotel takes no new rooms
 )
+
+// memFull reports whether h is at the memory limit (config mem_full_pct).
+// The reading is the hotel's host_mem_used_pct (MemTotal minus MemAvailable,
+// so page cache does not count). A hotel with no reading yet has memPct 0,
+// which is under any limit. Caller holds b.mu.
+func (b *broker) memFull(h *hotel) bool {
+	limit := b.cfg.MemFullPct
+	switch {
+	case limit < 0:
+		return false
+	case limit == 0:
+		limit = defaultMemFullPct
+	}
+	return h.memPct >= limit
+}
+
+// freeFor is the number of rooms h can take now: its free slots, or 0 when
+// it is at the memory limit. Caller holds b.mu.
+func (b *broker) freeFor(h *hotel) int {
+	if b.memFull(h) {
+		return 0
+	}
+	return h.slots - h.used()
+}
 
 func (b *broker) maxQueueWait() time.Duration {
 	switch v := b.cfg.MaxQueueWaitSeconds; {
