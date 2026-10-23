@@ -10,8 +10,8 @@ policy admission, and a local probe do not earn weight by themselves.
 
 The current TDX audit-miner image is not an SNP image. Use only the separate
 immutable SNP image and launcher described in
-[SN94 SNP miner image](SN94_SNP_MINER_IMAGE.md). The current published pin is
-fixed below. The image digest does not receive weight. A machine started from
+[SN94 SNP miner image](SN94_SNP_MINER_IMAGE.md). That page lists the current
+image reference. The image digest does not receive weight. A machine started from
 that image contributes to its UID only after the scoring validator admits its
 live measurement and TCB and verifies fresh evidence and SAT.
 
@@ -68,12 +68,8 @@ whatever its value, with "SNP policy has an unsupported production shape",
 until its next bootstrap. That includes the `require_single_socket: true`
 that this repository's #222 policy entry carries for a guest with the bit.
 
-On SN39, by operator report (unverified in-repo), UID30 set
-`require_single_socket` to `false` on 2026-09-08 and admitted a two-socket
-`milan` host that same day. Setup refused the key then, so that would have
-needed a manual policy install. The date matches the merge of
-cathedral-validator #235, which added the flag. That is one validator's
-decision. Ask your target validator's operator rather than assuming.
+Whether to set `require_single_socket` to `false` is the validator operator's
+decision. Ask the operator rather than assuming.
 
 **Hardware identity dedup is not optional.** Linux routes every SNP command,
 including the guest's attestation request, through one PSP on the host. On
@@ -294,10 +290,11 @@ identity, so a second guest on the same host costs the first one its weight.
 ### Start the miner
 
 Do not install a launcher from a different source revision. Start with the
-published immutable image reference:
+immutable image reference from [SN94 SNP miner image](SN94_SNP_MINER_IMAGE.md).
+Paste it as `SNP_IMAGE`. Do not copy a digest from any other page.
 
 ```bash
-SNP_IMAGE='ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:3e1cb9144417e1e0d526445a43245e305e772cae0568202a332183071ef0c584'
+SNP_IMAGE='IMAGE_REFERENCE_FROM_SN94_SNP_MINER_IMAGE_MD'
 docker pull --platform linux/amd64 "$SNP_IMAGE"
 test "$(docker image inspect "$SNP_IMAGE" \
   --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
@@ -307,7 +304,6 @@ test "$(docker image inspect "$SNP_IMAGE" \
 SOURCE_COMMIT="$(docker image inspect \
   --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
   "$SNP_IMAGE")"
-test "$SOURCE_COMMIT" = dd7182ccd91ca25b566ff210025bdea5fda57c4c
 
 git clone https://github.com/cathedralai/cathedral-sandbox.git cathedral-snp-runtime
 git -C cathedral-snp-runtime checkout --detach "$SOURCE_COMMIT"
@@ -315,10 +311,12 @@ test "$(git -C cathedral-snp-runtime rev-parse HEAD)" = "$SOURCE_COMMIT"
 test -z "$(git -C cathedral-snp-runtime status --porcelain)"
 ```
 
-On the separate miner-controlled host, follow only the
-[Refresh validator access from a control host](MINING.md#2-refresh-validator-access-from-a-control-host)
-procedure, at `$SOURCE_COMMIT`. That revision ships the `refresh` and `fetch`
-commands (#211), and its worker reloads `fleet.json` without a restart (#210).
+`$SOURCE_COMMIT` must equal the revision listed on the image page. Stop if it
+does not.
+
+On the separate miner-controlled host, do
+[step 4 of the mining guide](MINING.md#4-refresh-validator-access-from-a-control-host)
+if you have not. Use `$SOURCE_COMMIT` as its revision.
 Do not run the mining guide's TDX host or image steps. Keep the snapshot
 signing seed on the control host. Transfer only `snapshot-keys.json` and the
 fresh `validator-access.json` to the SNP guest.
@@ -345,7 +343,7 @@ Then save this as
 ```
 
 Install the two transferred access files at the same location and permissions
-shown in that access procedure. Then install the fixed launcher from the exact
+shown in step 4. Then install the fixed launcher from the exact
 image-labelled source revision:
 
 On the SNP guest:
@@ -363,11 +361,12 @@ sudo install -o root -g root -m 0600 \
   /etc/cathedral/sn94-snp-miner.env
 ```
 
-Edit `/etc/cathedral/sn94-snp-miner.env`. Set the published immutable image
-reference to the same value as `SNP_IMAGE`, public miner hotkey, public HTTPS
-endpoint, and SHA-256 of
-`/etc/cathedral/validator-access/snapshot-keys.json`. A mutable image tag is
-refused.
+Edit `/etc/cathedral/sn94-snp-miner.env`. Set `SN94_SNP_MINER_IMAGE` to the
+same value as `SNP_IMAGE`. Set `CATHEDRAL_MINER_HOTKEY` to your public hotkey,
+`CATHEDRAL_PUBLIC_ENDPOINT` to your public HTTPS endpoint, and
+`CATHEDRAL_VALIDATOR_ACCESS_KEYS_DIGEST` to the SHA-256 of
+`/etc/cathedral/validator-access/snapshot-keys.json`, with `sha256:`. A mutable
+image tag is refused.
 
 Then start and inspect the service:
 
@@ -393,7 +392,7 @@ report. A successful validator round additionally proves that its policy
 admitted the machine and that its endpoint, TLS key, and hardware identity did
 not collide.
 
-Neither check proves SN94 registration, a finalized UID30 weight row, subnet
-emission, or TAO earnings. Those require the separate live chain test.
+Neither check proves SN94 registration, a finalized weight row for your UID,
+subnet emission, or TAO earnings. Those require the separate live chain test.
 Neither check remotely proves the OCI image digest or continuous runtime
 integrity after boot.
