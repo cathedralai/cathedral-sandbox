@@ -189,8 +189,16 @@ has a test that failed first. Graphs: docs/evidence/REVIEW_ROUND6_GRAPHS.html.
 | B130 | Live: the shared hotels carry no receipts; the doc now says which hotels do | Yes | Doc fixed | merge |
 | B131 | The example broker config implied a label alone makes a hotel sealed | No | Fixed | merge |
 | B132 | Live: the sealed hotel's health and API share one port, so B96 applied to it | Yes | Fixed by B96 | B |
+| B133 | SN94 miner unit: a docker daemon restart (exit 143, counted as success) left the only miner stopped; no page when the start limit left it failed | No (SN94 miner, live on Contabo) | Fixed (Restart=always, OnFailure page); the live unit file must be updated by hand | miner host |
+| B134 | Miner updater: an unreadable state file made every hourly check exit 10 (unit success), so a dead miner paged nobody; status refused outright | No (updater not enrolled yet) | Fixed | merge |
+| B135 | The updater installer described --minimum-sequence as inclusive; the code refuses a record at the floor | No | Doc fixed | merge |
+| B136 | Harbor/ctcli clients got no X-Room-Receipt on create, exec or delete (network changes and process starts only) | Yes, Harbor path | Fixed | B |
+| B137 | The hotel pin in versions.lock still named the #311 commit: stage H and S from #312 would not have delivered its hotel API fixes | Yes | Fixed (pin moved to the #312 commit) | H, S |
+| B138 | verify_receipts.py defaulted --hotel to a fixed name; the wrong hotel ended in an uncaught error | Yes | Fixed (required with --broker) | T |
+| B139 | Removing a sealed hotel left the link-check timer restoring the host link every minute | No | Fixed (condition on sealed.env; README) | S |
+| B140 | Customer and operator docs disagreed with the fixed code in 16 places (allowlist example, exec and file contracts per path, receipted calls, verifier flags, error codes, sealed selection, join body, kernel_isolation, network requirements) | Yes | Doc fixed | merge |
 
 Deploy stages are as above (B broker, H shared hotel reinstall, S sealed
-rebuild, T client tool). #312 adds a fifth check to stage H and S: run the
-build probe (`scratchpad/buildkit/run.sh` in the review transcript) and
+rebuild, T client tool; "miner host" is the Contabo SN94 miner, updated by
+hand). #312 adds a fifth check to stage H and S: run the build probe (`scratchpad/buildkit/run.sh` in the review transcript) and
 expect the RUN step to report the gVisor kernel.
