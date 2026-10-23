@@ -193,7 +193,7 @@ Invariant.
   exceeded (miner_updater._effective_floor 908 to 914 with
   miner_release.enforce_monotonic_release 601 to 604; pinned by
   tests/test_miner_updater.py:224). Probe
-  tests/probe_sn94_updater_silence.py::test_minimum_sequence_... fails.
+  scratch probe probe_sn94_updater_silence::test_minimum_sequence_... fails.
 
 ### Clone and verify (61 to 68)
 - `git clone --filter=blob:none` from GitHub into a mktemp dir as root,
@@ -407,7 +407,7 @@ paths are under HostPaths.root ("/" on a host). Everything runs as root.
   `_escalate` and `_record` run. Exit 10, unit success, no alert, no miner
   health check, and `status` refuses too (describe_status 2439). Contrast
   trust.json, which alerts at once. Probe
-  tests/probe_sn94_updater_silence.py::test_a_dead_miner_is_paged_even_when_
+  scratch probe probe_sn94_updater_silence::test_a_dead_miner_is_paged_even_when_
   the_updater_state_is_unreadable fails: seven checks with the miner down, all
   exit 10, none page.
 
@@ -702,7 +702,7 @@ paths are under HostPaths.root ("/" on a host). Everything runs as root.
   needs_operator, last check, last refusal, counters, floors.
 - Hazard: read_state is the first line (2439): an unreadable state.json makes
   `status` refuse, while a bad pin or trust set is reported inline. Probe
-  tests/probe_sn94_updater_silence.py::test_status_still_answers_... fails.
+  scratch probe probe_sn94_updater_silence::test_status_still_answers_... fails.
 
 ---
 
@@ -815,7 +815,7 @@ Live host assumed not enrolled (so none of the updater's alerts exist).
    example unit counts it as success and `Restart=on-failure` does not
    restart. No OnFailure. The audit example unit and the release drop-in were
    fixed for this; the SNP example unit was not. Probe
-   tests/probe_sn94_miner_unit.py::test_the_snp_unit_restarts_after_a_clean_
+   scratch probe probe_sn94_miner_unit::test_the_snp_unit_restarts_after_a_clean_
    signal_exit fails.
 2. Any start while the snapshot is stale (a reboot or restart while the
    control host or its URL is unreachable, or more than 15 min after the last
@@ -823,7 +823,7 @@ Live host assumed not enrolled (so none of the updater's alerts exist).
    300 s hit the start limit, the unit stays failed. The fetch alarm pages
    only while the snapshot is stale and goes quiet once a fresh one lands; the
    miner stays down. Observed live on TDX in 4f0c702. Probe
-   tests/probe_sn94_miner_unit.py::test_the_snp_unit_pages_when_it_stops_
+   scratch probe probe_sn94_miner_unit::test_the_snp_unit_pages_when_it_stops_
    restarting fails.
 3. Snapshot expiry with the worker up: protected routes close; the fetch
    unit's exit 3 pages only if the operator installed

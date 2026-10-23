@@ -12,7 +12,7 @@ Documents read: docs/CUSTOMER_SANDBOX_ACCESS_2026-10-21.md, broker/README.md,
 room-kit/README.md, room-kit/sealed/README.md,
 docs/evidence/CUSTOMER_FEEDBACK_FIXES_2026-10-23.md, README.md,
 docs/evidence/REVIEW_ROUNDS_2026-10-23.md (deploy plan and "Lands at" column).
-docs/DEDICATED_SEALED.md does not exist at this commit.
+a DEDICATED_SEALED page under docs/ does not exist at this commit.
 The top level README.md has no sandbox product section at this commit: it is
 the SN94 mining README (lines 1 to 97). Nothing to check there.
 

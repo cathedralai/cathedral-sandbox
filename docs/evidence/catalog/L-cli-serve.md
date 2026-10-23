@@ -10,8 +10,8 @@ run, room-kit/profiles/v1.sh, room-kit/room_api.py, and the systemd units
 install.sh writes from the profile. Every other CLI command is out of scope.
 Known items B1 to B132 are not repeated.
 
-Probes (new files, all pass): tests/probe_cli_serve_keystore.py (15),
-tests/probe_cli_serve_startup.py (5), tests/probe_cli_serve_stop.py (5).
+Probes (scratch files, all passed; superseded by tests/test_cli_serve_hardening.py):
+probe_cli_serve_keystore (15), probe_cli_serve_startup (5), probe_cli_serve_stop (5).
 Run from the worktree with .venv/bin/python -m pytest -q -p no:cacheprovider.
 
 ## 1. How a hotel runs it
@@ -281,7 +281,7 @@ runtime = a wrong limit or wrong behaviour while serving.
   `_remove_many(refs)` (all containers, N / parallelism rounds, 60 s cap
   each); `_guests.clear()`; `_inner.close()` (work dirs, base). Does not
   call egress.forget, does not release pool ports, does not touch snapshot
-  or built images. Probes in probe_cli_serve_stop.py.
+  or built images. Probes in the scratch file probe_cli_serve_stop (superseded by tests/test_cli_serve_hardening.py).
 
 ### cathedral/sandbox_egress.py
 

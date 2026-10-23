@@ -6,7 +6,7 @@ install-sealed.sh, sealed.env.example, README.md}. Context read: room-kit/instal
 room-kit/room_receipts.py, room-kit/verify_receipts.py, room-kit/lib/{receipts_mode.sh,
 room_nets_mode.sh, room-data.sh, room-net.sh}, room-kit/profiles/v1.sh,
 room-kit/versions.lock, room-kit/make-dist.sh, broker/{config.example.json, probe.go,
-hotels.go}, tests/test_room_kit_sealed_kit.py. docs/DEDICATED_SEALED.md does not exist.
+hotels.go}, tests/test_room_kit_sealed_kit.py. a DEDICATED_SEALED page under docs/ does not exist.
 
 Entry point: `install.sh --sealed sealed.env` (install.sh:12) execs
 `sealed/install-sealed.sh sealed.env`. Everything runs as root on the host. The guest
@@ -550,6 +550,6 @@ HOST_DATA for a given manifest, the sev-snp-measure computation for given inputs
     A level 1 fallback (TSM missing) fails the install with a KeyError and is flagged
     by probeSealed ("gives no SEV-SNP attestation"); the verifier's level 1 path
     ignoring --expected-measurement is covered by
-    tests/probe_receipts_front_r6.py (another reader).
+    the scratch probe probe_receipts_front_r6 (another reader; its cases live in tests/test_room_kit_receipts_proxy.py).
 22. sealed.env.example documents neither SEALED_SKIP_BUILD nor the manual
     `host-net.sh up` re-apply.
