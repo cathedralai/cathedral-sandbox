@@ -1,6 +1,6 @@
-# CONST Feedback Fixes — 2026-10-23
+# Customer Feedback Fixes — 2026-10-23
 
-Applied code fixes and test updates for all CONST customer feedback items
+Applied code fixes and test updates for all Customer customer feedback items
 that had a confirmed root cause in the broker or room-kit code. Date: 2026-10-23.
 
 ---
@@ -23,7 +23,7 @@ incomplete. Now fully tested.
 
 ### B — Unknown hotel returns 409, not 400
 **Root cause:** `parseSelection` in `broker/images.go` returned 400 for
-an unknown hotel id in `"hotels": [...]`. CONST contracts expect 409 (the
+an unknown hotel id in `"hotels": [...]`. Customer contracts expect 409 (the
 request is valid but conflicts with known state).
 
 **Files:** `broker/images.go` (status code), `broker/images_test.go` (test updated),
@@ -80,8 +80,8 @@ would have failed.
 
 ---
 
-### F — Docs: CONST_SANDBOX_ACCESS
-**Created:** `docs/CONST_SANDBOX_ACCESS_2026-10-21.md`
+### F — Docs: CUSTOMER_SANDBOX_ACCESS
+**Created:** `docs/CUSTOMER_SANDBOX_ACCESS_2026-10-21.md`
 
 Covers:
 - Hotel selection fields and error codes (409 for unknown hotel)
@@ -106,7 +106,7 @@ Covers:
 ## Out of scope — ops follow-up required
 
 ### Green hotel hardware
-The `green` hotel reported in CONST ticket #1 is **down at the hardware
+The `green` hotel reported in Customer ticket #1 is **down at the hardware
 level**. No code fix addresses this.
 
 **Action required (ops):** Restore or replace the `green` hotel hardware /

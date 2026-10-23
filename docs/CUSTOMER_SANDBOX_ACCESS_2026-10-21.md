@@ -1,7 +1,7 @@
-# CONST Sandbox Access — API Reference (2026-10-21)
+# Customer Sandbox Access — API Reference (2026-10-21)
 
-> **Status:** current as of the CONST feedback fixes committed 2026-10-23.
-> See `docs/evidence/CONST_FEEDBACK_FIXES_2026-10-23.md` for the change log.
+> **Status:** current as of the Customer feedback fixes committed 2026-10-23.
+> See `docs/evidence/CUSTOMER_FEEDBACK_FIXES_2026-10-23.md` for the change log.
 
 ---
 
