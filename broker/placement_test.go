@@ -88,10 +88,13 @@ func TestWeightFollowsCPUHeadroomCreateTimeAndQueue(t *testing.T) {
 		t.Fatalf("cpu: %v", s)
 	}
 
-	// Same CPU; a creates in 5 s, b in 0.5 s.
+	// Same CPU; a creates in 5 s, b in 0.5 s. b's weight is 10x a's, so b
+	// expects 10/11 of 4000 = 3636 picks, standard deviation about 18. A floor
+	// of 3600 sat two deviations below: it failed 14 of 400 local runs and once
+	// on CI (2026-10-23, b 3597). 3500 is more than seven deviations below.
 	setHotel(tc, "a", func(h *hotel) { h.cpuPct, h.createEWMA = 20, 5 })
 	setHotel(tc, "b", func(h *hotel) { h.cpuPct, h.createEWMA = 20, 0.5 })
-	if s := share(tc, 4000); s["b"] < 3600 {
+	if s := share(tc, 4000); s["b"] < 3500 {
 		t.Fatalf("create time: %v", s)
 	}
 

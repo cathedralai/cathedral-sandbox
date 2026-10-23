@@ -24,7 +24,7 @@ the B number is named.
 |---|---|---|---|---|
 | hotelConfig | 43-58 | id, name, threads, ram, api and health base URLs, key file, concurrency, drain, labels, sealed, max_slots | the private config file and hotels.json | id must have no dot (room ids split on the first dot) |
 | guestConfig | 60-66 | id, key sha256, view token sha256, ops, embedded guestLimits | config | an empty key means view only |
-| config | 68-83 | listen, state_dir, hotels, guests, insecure_cookie, max_exec_seconds, max_queue_wait_seconds, operator_key_sha256 | config | no field is validated beyond hotel id and key file |
+| config | 70-90 | listen, state_dir, hotels, guests, insecure_cookie, max_exec_seconds, max_queue_wait_seconds, mem_full_pct, operator_key_sha256 | config | no field is validated beyond hotel id and key file |
 | room states | 93-100 | '.', 'c', 'r', 'd', 'f', 'o' as bytes | | the live grid is one byte per slot |
 | guestLabel | 102 | "broker_guest" | | ownership label on every room the broker creates |
 | room | 104-114 | id (hotel.hid), uuid, hid, h, guest, state, slot, since, vanished | | id, uuid, hid, h, guest never change after publish; state, slot, since, vanished change under b.mu |

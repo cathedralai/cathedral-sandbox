@@ -79,6 +79,11 @@ type config struct {
 	// MaxQueueWaitSeconds: a create that waits longer than this for a create
 	// slot at its hotel moves to another eligible hotel (default 10; -1: never).
 	MaxQueueWaitSeconds float64 `json:"max_queue_wait_seconds"`
+	// MemFullPct: a hotel whose host memory use is at or above this percent
+	// takes no new rooms (default 90; -1: no memory limit). Slots come from an
+	// install-time sizing with memory overcommit, so they cannot see rooms
+	// that use their full memory limit.
+	MemFullPct float64 `json:"mem_full_pct"`
 	// OperatorKeySHA256 is the SHA-256 of the operator key. It allows hotel
 	// join, change and leave at runtime (hotels.go). Empty: no operator routes.
 	OperatorKeySHA256 string `json:"operator_key_sha256"`
@@ -391,7 +396,7 @@ func (b *broker) pick(exclude map[*hotel]bool, pl placement) *hotel {
 		if !h.ok || h.drain() || exclude[h] || now.Before(h.backoffUntil) || !pl.allows(h) {
 			continue
 		}
-		if f := h.slots - h.used(); f > 0 {
+		if f := b.freeFor(h); f > 0 {
 			weight[i] = h.weight(f)
 			total += weight[i]
 		}
@@ -1110,7 +1115,7 @@ func (b *broker) handleStats(w http.ResponseWriter, r *http.Request, g *guestSta
 		hotels = append(hotels, map[string]any{
 			"id": h.cfg.ID, "ok": h.ok, "drain": h.drain(), "sealed": h.cfg.Sealed, "slots": h.slots, "broker_running": running, "queued": h.queued, "creating": h.creating,
 			"api_running": h.apiRunning, "api_deleting": h.apiDeleting, "containers": h.containers,
-			"cpu_pct": h.cpuPct, "mem_pct": h.memPct, "mem_gib": h.memGiB, "load1": h.load1,
+			"cpu_pct": h.cpuPct, "mem_pct": h.memPct, "mem_gib": h.memGiB, "load1": h.load1, "mem_full": b.memFull(h),
 			"created": h.created, "failed": h.failed, "rejected_429": h.rejected,
 			"hotel_ms": pct(h.lat.hotel), "queue_ms": pct(h.lat.queue), "overhead_ms": pct(h.lat.overhead),
 		})
