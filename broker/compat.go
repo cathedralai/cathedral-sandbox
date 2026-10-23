@@ -679,6 +679,7 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			if t, _ := doc["timed_out"].(bool); t {
 				doc["state"] = "timed_out"
 			}
+			clipExecDoc(doc)
 			writeJSON(w, 200, doc)
 		})
 	case tail == "network" && (r.Method == "PUT" || r.Method == "POST" || r.Method == "PATCH"):

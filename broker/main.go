@@ -834,6 +834,14 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		b.roomSnapshot(w, r, g, h, hid, body)
 		return
 	}
+	// Hotel ids (nc-sealed.sbx_…) proxy the body as-is. Reject a string cmd
+	// here so the hotel path matches the client UUID path and the docs.
+	if r.Method == "POST" && tail == "exec" {
+		if err := requireExecCmdList(body); err != nil {
+			writeErr(w, 400, "invalid_exec", err.Error())
+			return
+		}
+	}
 	path := "/v1/sandboxes/" + url.PathEscape(hid)
 	if tail != "" {
 		path += "/" + tail
@@ -877,6 +885,9 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	// Signed receipts must reach the guest byte for byte: no id rewrite there.
 	if strings.HasPrefix(hdr.Get("Content-Type"), "application/json") && tail != "receipts" {
 		out = bytes.ReplaceAll(out, []byte(`"`+hid+`"`), []byte(`"`+bid+`"`))
+		if tail == "exec" && status == 200 {
+			out = truncateExecJSON(out)
+		}
 		w.Header().Del("Content-Length")
 		// The room document itself says what its placement isolates.
 		if r.Method == "GET" && tail == "" && status == 200 {
@@ -904,6 +915,70 @@ func copyRoomHeaders(dst, src http.Header) {
 	}
 }
 
+// requireExecCmdList enforces the published contract: cmd / command must be a
+// non-empty list of non-empty strings. A shell string is refused.
+func requireExecCmdList(raw []byte) error {
+	var req map[string]any
+	if json.Unmarshal(raw, &req) != nil {
+		return fmt.Errorf("request body is not JSON")
+	}
+	cmd := req["command"]
+	if cmd == nil {
+		cmd = req["cmd"]
+	}
+	if cmd == nil {
+		return fmt.Errorf("cmd is required")
+	}
+	list, ok := cmd.([]any)
+	if !ok || len(list) == 0 {
+		return fmt.Errorf("cmd must be a non-empty list of strings")
+	}
+	for _, x := range list {
+		s, ok := x.(string)
+		if !ok || s == "" {
+			return fmt.Errorf("cmd must be a non-empty list of strings")
+		}
+	}
+	return nil
+}
+
+// execOutputCapBytes is the maximum stdout/stderr the broker returns on an
+// exec. Matches the hotel guest cap; a hotel that forgets to truncate is
+// clipped here and marked truncated.
+const execOutputCapBytes = 16 << 20
+
+// clipExecDoc caps stdout/stderr on an exec JSON object and sets truncated
+// when either stream was longer than the cap.
+func clipExecDoc(doc map[string]any) {
+	for _, k := range []string{"stdout", "stderr"} {
+		s, ok := doc[k].(string)
+		if !ok {
+			continue
+		}
+		b := []byte(s)
+		if len(b) > execOutputCapBytes {
+			doc[k] = string(b[:execOutputCapBytes])
+			doc["truncated"] = true
+		}
+	}
+}
+
+// truncateExecJSON caps stdout/stderr in an exec JSON answer and sets
+// truncated when either stream was longer than the cap.
+func truncateExecJSON(out []byte) []byte {
+	var doc map[string]any
+	if json.Unmarshal(out, &doc) != nil {
+		return out
+	}
+	before, _ := json.Marshal(doc)
+	clipExecDoc(doc)
+	re, err := json.Marshal(doc)
+	if err != nil || bytes.Equal(before, re) {
+		return out
+	}
+	return re
+}
+
 // handleHotelDoc passes a hotel's attestation or receipt chain to a guest:
 // GET /v1/hotels/<id>/attestation and GET /v1/hotels/<id>/receipts.
 // The hotel chain is one list per boot. A guest sees only receipts for rooms
@@ -922,18 +997,24 @@ func (b *broker) handleHotelDoc(w http.ResponseWriter, r *http.Request, rest str
 		writeErr(w, 404, "route_not_found", "no such hotel document")
 		return
 	}
-	status, hdr, out, err := h.doBase(r.Context(), h.cfg.Health, "GET", "/room/"+doc, r.URL.Query(), nil, time.Minute)
-	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
-		return
-	}
-	if doc == "receipts" && status == 200 && !g.cfg.Ops {
-		filtered, ferr := filterHotelReceiptsFor(out, b.guestRoomIDs(g.cfg.ID, h.cfg.ID), g.cfg.ID)
+	if doc == "receipts" && !g.cfg.Ops {
+		// Walk the hotel chain so a busy hotel's oldest page does not hide
+		// this guest's newer receipts (CONST / Affinities empty /receipts).
+		filtered, ferr := b.filterGuestHotelReceipts(r.Context(), h, g.cfg.ID, r.URL.Query())
 		if ferr != nil {
 			writeErr(w, 502, "receipts_unreadable", "hotel receipt chain could not be filtered")
 			return
 		}
-		out = filtered
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Del("Content-Length")
+		w.WriteHeader(200)
+		_, _ = w.Write(filtered)
+		return
+	}
+	status, hdr, out, err := h.doBase(r.Context(), h.cfg.Health, "GET", "/room/"+doc, r.URL.Query(), nil, time.Minute)
+	if err != nil {
+		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		return
 	}
 	if v := hdr.Get("Content-Type"); v != "" {
 		w.Header().Set("Content-Type", v)

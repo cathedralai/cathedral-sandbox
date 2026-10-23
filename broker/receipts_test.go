@@ -230,3 +230,34 @@ func TestFilteredChainCountsScannedReceipts(t *testing.T) {
 		t.Fatalf("a filtered page must say how many hotel receipts it covered, so a client can page on: %s", out)
 	}
 }
+
+// A guest receipt past the hotel's first page must still surface: filtering
+// only the oldest page left Affinities / CONST with count:0.
+func TestHotelReceiptWalkFindsGuestPastFirstPage(t *testing.T) {
+	tc := newChain(t)
+	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+	_, hid, _ := strings.Cut(id, ".")
+	recs := make([]string, 0, 1001)
+	for i := 0; i < 1000; i++ {
+		recs = append(recs, `{"statement":{"sandbox_id":"other-`+strings.Repeat("x", 8)+`","image":"other:1","target":"POST /v1/sandboxes"},"signature_b64":"sig-o"}`)
+	}
+	mine := `{"statement":{"sandbox_id":"` + hid + `","image":"guest-mine:1","target":"POST /v1/sandboxes"},"signature_b64":"sig-mine"}`
+	recs = append(recs, mine)
+	raw := []byte(`{"binding_sha256":"bb","head":"hh","count":1001,"receipts":[` + strings.Join(recs, ",") + `]}`)
+	tc.hotels["a"].mu.Lock()
+	tc.hotels["a"].receipts = raw
+	tc.hotels["a"].mu.Unlock()
+
+	status, page := tc.body(t, "key1", "GET", "/v1/hotels/a/receipts")
+	if status != 200 || !bytes.Contains(page, []byte("guest-mine:1")) {
+		t.Fatalf("walk past first page: %d %s", status, page)
+	}
+	var doc struct {
+		Count   int `json:"count"`
+		Scanned int `json:"scanned"`
+	}
+	_ = json.Unmarshal(page, &doc)
+	if doc.Count != 1 || doc.Scanned < 1001 {
+		t.Fatalf("expected one owned receipt after scanning past page 1: %s", page)
+	}
+}

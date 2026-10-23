@@ -259,13 +259,13 @@ def normalize_allow_entry(entry: object) -> str:
     """Validate one allowlist entry and return its canonical form.
 
     Accepted: a hostname ("pypi.org"), optional ``:80`` / ``:443`` on a hostname
-    (normalized to the bare hostname — the hotel egress proxy only offers TCP
-    80 and 443 for named hosts), a leading wildcard ("*.pythonhosted.org"),
-    an IPv4 address and an IPv4 CIDR. Hostnames are lower case with no trailing
-    dot. A CIDR is written in network form (10.1.2.3/8 is 10.0.0.0/8).
-    IPv6, URLs, paths, and hostname ports other than 80/443 are refused.
-    Bare IPv4/CIDR allow every port on that address (nftables); use hostnames
-    when you need name-bound 80/443 only.
+    or wildcard (kept in the policy so the egress proxy opens only that port;
+    a bare hostname means both TCP 80 and 443), a leading wildcard
+    ("*.pythonhosted.org"), an IPv4 address and an IPv4 CIDR. Hostnames are
+    lower case with no trailing dot. A CIDR is written in network form
+    (10.1.2.3/8 is 10.0.0.0/8). IPv6, URLs, paths, and hostname ports other
+    than 80/443 are refused. Bare IPv4/CIDR allow every port on that address
+    (nftables); use hostnames when you need name-bound 80/443 only.
     """
     _require(isinstance(entry, str) and 1 <= len(entry) <= 255, "invalid_network_allowlist",
              "allowlist entries must be non-empty strings of at most 255 characters")
@@ -273,7 +273,7 @@ def normalize_allow_entry(entry: object) -> str:
     bad = f"allowlist entry {entry!r} is not a hostname, hostname:80|:443, *.wildcard, IPv4 address or IPv4 CIDR"
     _require(bool(value), "invalid_network_allowlist", bad)
     # Optional host:port — only 80/443 for named hosts (egress proxy).
-    host_port = None
+    port: int | None = None
     if value.count(":") == 1 and not value.startswith("[") and "/" not in value:
         host_part, port_part = value.rsplit(":", 1)
         if port_part.isdigit():
@@ -282,7 +282,12 @@ def normalize_allow_entry(entry: object) -> str:
             try:
                 ipaddress.ip_address(host_part)
             except ValueError:
-                host_port = (host_part, port)
+                if port not in (80, 443):
+                    raise SandboxContractError(
+                        "invalid_network_allowlist",
+                        f"allowlist entry {entry!r}: named hosts only allow TCP 80 and 443 "
+                        "(omit the port, or use :80/:443)",
+                    ) from None
                 value = host_part
             else:
                 raise SandboxContractError(
@@ -308,24 +313,63 @@ def normalize_allow_entry(entry: object) -> str:
                  f"allowlist entry {entry!r}: private, host or reserved addresses cannot be allowlisted")
         return str(addr)
     _require(":" not in value and "[" not in value, "invalid_network_allowlist", bad)
-    if host_port is not None and host_port[1] not in (80, 443):
-        raise SandboxContractError(
-            "invalid_network_allowlist",
-            f"allowlist entry {entry!r}: named hosts only allow TCP 80 and 443 (omit the port, or use :80/:443)",
-        )
     name = value[2:] if value.startswith("*.") else value
     labels = name.split(".")
     _require(len(name) <= 253 and len(labels) >= 2 and all(_HOST_LABEL_RE.match(lb) for lb in labels),
              "invalid_network_allowlist", bad)
     _require(not labels[-1].isdigit(), "invalid_network_allowlist", bad)
-    return value
+    if port is None:
+        return value
+    return f"{value}:{port}"
+
+
+def _merge_allow_ports(entries: Sequence[str]) -> list[str]:
+    """Collapse host / host:port rows: bare host means both 80 and 443; listing
+    both ports (or bare plus a port) collapses to the bare hostname."""
+    hosts: dict[str, set[int]] = {}
+    wilds: dict[str, set[int]] = {}
+    others: list[str] = []
+    for raw in entries:
+        e = normalize_allow_entry(raw)
+        port: int | None = None
+        value = e
+        if e.count(":") == 1 and not e.startswith("[") and "/" not in e:
+            host_part, port_part = e.rsplit(":", 1)
+            if port_part.isdigit():
+                value, port = host_part, int(port_part)
+        try:
+            ipaddress.ip_network(value, strict=False) if "/" in value else ipaddress.ip_address(value)
+        except ValueError:
+            pass
+        else:
+            others.append(e)
+            continue
+        bucket = wilds if value.startswith("*.") else hosts
+        key = value[2:] if value.startswith("*.") else value
+        ports = bucket.setdefault(key, set())
+        if port is None:
+            ports.update((80, 443))
+        else:
+            ports.add(port)
+    out: list[str] = list(others)
+    for name, ports in hosts.items():
+        if ports >= {80, 443}:
+            out.append(name)
+        else:
+            out.extend(f"{name}:{p}" for p in sorted(ports))
+    for name, ports in wilds.items():
+        if ports >= {80, 443}:
+            out.append("*." + name)
+        else:
+            out.extend(f"*.{name}:{p}" for p in sorted(ports))
+    return sorted(set(out))
 
 
 def canonical_network_policy(mode: str, allow: Sequence[str] = ()) -> dict[str, object]:
     """The canonical policy document: mode name and the sorted, unique,
     normalized allowlist (empty for every mode except "allowlist")."""
     mode = canonical_network_mode(mode)
-    entries = sorted({normalize_allow_entry(e) for e in allow}) if mode == "allowlist" else []
+    entries = _merge_allow_ports(allow) if mode == "allowlist" else []
     return {"mode": mode, "allow": entries}
 
 

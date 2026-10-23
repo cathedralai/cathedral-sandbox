@@ -41,6 +41,7 @@ from cathedral.sandbox_api import (
     idempotency_digest,
     is_collectable,
     key_quota_for,
+    canonical_network_policy,
     normalize_allow_entry,
     operation_id,
     parse_byte_range,
@@ -124,13 +125,21 @@ def test_network_spec_modes_and_allowlist() -> None:
         NetworkSpec(mode="allowlist", allow=())
 
 
-def test_allowlist_hostname_port_80_443_accepted_and_stripped() -> None:
-    """host:80 and host:443 normalize to the bare hostname (CONST fix D)."""
-    assert normalize_allow_entry("pypi.org:443") == "pypi.org"
-    assert normalize_allow_entry("pypi.org:80") == "pypi.org"
-    assert normalize_allow_entry("PYPI.ORG:443") == "pypi.org"
-    # Duplicate after normalization is deduplicated by canonical_network_policy.
+def test_allowlist_hostname_port_80_443_preserved() -> None:
+    """host:80 / host:443 stay in the policy so egress opens only that port."""
+    assert normalize_allow_entry("pypi.org:443") == "pypi.org:443"
+    assert normalize_allow_entry("pypi.org:80") == "pypi.org:80"
+    assert normalize_allow_entry("PYPI.ORG:443") == "pypi.org:443"
     assert normalize_allow_entry("pypi.org") == "pypi.org"
+    # Bare host (both ports) wins over a port-only row for the same name.
+    pol = canonical_network_policy("allowlist", ["pypi.org:443", "pypi.org"])
+    assert pol["allow"] == ["pypi.org"]
+    # Only :443 does not open :80.
+    pol443 = canonical_network_policy("allowlist", ["example.com:443"])
+    assert pol443["allow"] == ["example.com:443"]
+    # Both ports listed collapse to bare.
+    both = canonical_network_policy("allowlist", ["example.com:80", "example.com:443"])
+    assert both["allow"] == ["example.com"]
 
 
 def test_allowlist_hostname_other_port_rejected() -> None:

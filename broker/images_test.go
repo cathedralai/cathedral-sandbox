@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -107,6 +108,43 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if f.receipts == nil {
 			writeErr(w, 404, "no_receipts", "no chain")
 			return
+		}
+		// Page like a real hotel when after/limit are set so broker walk tests
+		// can leave a guest receipt past the first hotel page. Ops (and old
+		// callers) with no query still get the stored bytes unchanged.
+		afterStr, limitStr := r.URL.Query().Get("after"), r.URL.Query().Get("limit")
+		if afterStr != "" || limitStr != "" {
+			var chain struct {
+				Binding  string            `json:"binding_sha256"`
+				Head     string            `json:"head"`
+				Receipts []json.RawMessage `json:"receipts"`
+			}
+			if json.Unmarshal(f.receipts, &chain) == nil && len(chain.Receipts) > 0 {
+				after, _ := strconv.Atoi(afterStr)
+				limit, _ := strconv.Atoi(limitStr)
+				if limit < 1 {
+					limit = len(chain.Receipts)
+				}
+				if after < 0 {
+					after = 0
+				}
+				end := after + limit
+				if after > len(chain.Receipts) {
+					after = len(chain.Receipts)
+				}
+				if end > len(chain.Receipts) {
+					end = len(chain.Receipts)
+				}
+				page := chain.Receipts[after:end]
+				out, _ := json.Marshal(map[string]any{
+					"binding_sha256": chain.Binding, "head": chain.Head,
+					"count": len(page), "receipts": page,
+				})
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(200)
+				_, _ = w.Write(out)
+				return
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)

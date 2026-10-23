@@ -287,10 +287,15 @@ def test_put_network_route(fake, daemon) -> None:
         provider.close()
 
 
-@pytest.mark.parametrize("entry", ["pypi.org:443", "pypi.org:80", "PyPI.org:443"])
-def test_web_ports_on_hostnames_are_accepted(entry) -> None:
-    # The proxy only carries 80 and 443, so the port is accepted and dropped.
-    assert normalize_allow_entry(entry) == "pypi.org"
+@pytest.mark.parametrize("entry,want", [
+    ("pypi.org:443", "pypi.org:443"),
+    ("pypi.org:80", "pypi.org:80"),
+    ("PyPI.org:443", "pypi.org:443"),
+])
+def test_web_ports_on_hostnames_are_accepted(entry, want) -> None:
+    # The proxy only carries 80 and 443; the port stays in the policy so
+    # egress opens only that port (bare hostname still means both).
+    assert normalize_allow_entry(entry) == want
     NetworkSpec(mode="allowlist", allow=(entry,))
 
 

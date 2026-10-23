@@ -81,10 +81,23 @@ def test_policy_parse_canonical_and_matching() -> None:
     assert p.document() == {"mode": "allowlist", "allow": ["*.pythonhosted.org", "1.2.3.0/24", "1.2.3.4", "9.0.0.0/8", "pypi.org"]}
     assert p.nets == ("1.2.3.0/24", "9.0.0.0/8")  # 1.2.3.4 folds into 1.2.3.0/24: no interval overlap in nft
     assert p.allows_name("pypi.org") and p.allows_name("PYPI.ORG.")
+    assert p.allows_name("pypi.org", 443) and p.allows_name("pypi.org", 80)
     assert p.allows_name("files.pythonhosted.org") and p.allows_name("a.b.pythonhosted.org")
     assert not p.allows_name("pythonhosted.org")  # a wildcard does not match its suffix
     assert not p.allows_name("github.com") and not p.allows_name("evilpypi.org")
     assert not eg.Policy.parse({"mode": "internet"}).allows_name("pypi.org")
+
+
+def test_policy_honors_hostname_port() -> None:
+    """example.com:443 opens TLS only; :80 is refused (Affinities / CONST)."""
+    p = eg.Policy.parse({"mode": "allowlist", "allow": ["example.com:443"]})
+    assert p.document()["allow"] == ["example.com:443"]
+    assert p.allows_name("example.com")  # DNS
+    assert p.allows_name("example.com", 443)
+    assert not p.allows_name("example.com", 80)
+    both = eg.Policy.parse({"mode": "allowlist", "allow": ["example.com:443", "example.com:80"]})
+    assert both.document()["allow"] == ["example.com"]
+    assert both.allows_name("example.com", 80) and both.allows_name("example.com", 443)
 
 
 @pytest.mark.parametrize("bad", ["::1", "2001:db8::/32", "http://pypi.org", "pypi.org:8080", "*", "*.1.2.3.4", "a..b", "pypi", ""])
