@@ -9,9 +9,10 @@ PYTHON_VERSION=3.12
 CADDY_VERSION=2.11.4
 CADDY_URL=https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_amd64.tar.gz
 CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777ccc8fd0b6e6f2486ce3a33fe389fbb7db12d05baa474f4587509fb4f5ebf1c9
-# cathedral-sandbox commit 7601a85 (branch feat/room-network-allowlist: room egress policy), made with:
-#   ./make-dist.sh 7601a85   (git archive of pyproject.toml and cathedral/)
-CATHEDRAL_COMMIT=7601a85
-CATHEDRAL_TARBALL=dist/cathedral-7601a85.tar.gz
-CATHEDRAL_TARBALL_SHA256=a6e7dfd0c2941832fe06d327122c2a68201305b9caaf68ea625291e59359dc65
+# cathedral-sandbox commit 7be8558 (allowlist accepts hostname:80 and hostname:443; the only
+# change to cathedral/ since 7601a85), made with:
+#   ./make-dist.sh 7be8558   (git archive of pyproject.toml and cathedral/)
+CATHEDRAL_COMMIT=7be8558
+CATHEDRAL_TARBALL=dist/cathedral-7be8558.tar.gz
+CATHEDRAL_TARBALL_SHA256=88ef631038f957722fc7d0b1f1d7d392665d52bd99e3c26d9eec052333dff45a
 PROBE_IMAGE=alpine:3.20

@@ -329,3 +329,19 @@ func TestBuiltImageObeysSealedDefaultAndHotelSet(t *testing.T) {
 		t.Fatalf("sealed create from the image: %d %v", status, doc)
 	}
 }
+
+// A dedicated hotel stays dedicated: an ops guest's probe must not start a
+// room on a hotel outside that guest's own hotel list.
+func TestProbeKeepsToGuestHotels(t *testing.T) {
+	tc := limitedChain(t, guestLimits{Hotels: []string{"b", "c"}})
+	tc.b.guests["g1"].cfg.Ops = true
+	if status, doc := tc.call(t, "key1", "POST", "/v1/broker/probe", nil); status != 200 {
+		t.Fatalf("probe: %d %v", status, doc)
+	}
+	if n := len(tc.hotels["a"].creates); n != 0 {
+		t.Fatalf("probe started %d room(s) on hotel a, outside the guest's list", n)
+	}
+	if len(tc.hotels["b"].creates) == 0 {
+		t.Fatalf("probe did not reach an allowed hotel")
+	}
+}

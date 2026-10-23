@@ -36,7 +36,7 @@ Allowlist entries in `"network": {"mode": "allowlist", "allow": [...]}` can be:
 | Entry type | Example | Behavior |
 |---|---|---|
 | Hostname | `"pypi.org"` | Reachable on TCP 80 and 443 via egress proxy |
-| Hostname with port | `"pypi.org:443"` or `"pypi.org:80"` | Normalized to bare hostname; same as above |
+| Hostname with port | `"pypi.org:443"` or `"pypi.org:80"` | Normalized to bare hostname; same as above (so `:443` also opens 80) |
 | Wildcard hostname | `"*.pythonhosted.org"` | All subdomains, TCP 80 and 443 only |
 | IPv4 address | `"1.2.3.4"` | Reachable on **all ports** directly (nftables) |
 | IPv4 CIDR | `"10.0.0.0/8"` | All addresses in the range, all ports |

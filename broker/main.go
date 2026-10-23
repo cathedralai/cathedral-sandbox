@@ -521,8 +521,13 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 			// The hotel could not start the room (for example a full bridge).
 			// Rest it for a short time and try another hotel.
 			rm.state, rm.since = stFailed, tDone
-			h.failed++
-			h.backoffUntil = time.Now().Add(hotelFailBackoff)
+			// A 4xx means the request is wrong, not the hotel: resting the
+			// hotel would turn one guest's bad input into a 503 for the next
+			// create of every guest.
+			if err != nil || status >= 500 {
+				h.failed++
+				h.backoffUntil = time.Now().Add(hotelFailBackoff)
+			}
 			if err != nil {
 				last = createResult{status: 502, doc: map[string]any{"error": map[string]string{"code": "hotel_unreachable", "message": "hotel " + h.cfg.ID + " did not answer"}}}
 			} else {

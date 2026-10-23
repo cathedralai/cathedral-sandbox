@@ -53,6 +53,12 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.mu.Lock()
 		}
 		f.creates = append(f.creates, req)
+		if nw, ok := req["network"].(map[string]any); ok && nw["mode"] == "allowlist" {
+			if allow, _ := nw["allow"].([]any); len(allow) > 0 && allow[0] == "bad.example:9" {
+				writeErr(w, 400, "invalid_network_allowlist", "port 9 is not allowed")
+				return
+			}
+		}
 		if sid, ok := req["snapshot_id"].(string); ok {
 			if _, known := f.snaps[sid]; !known {
 				writeErr(w, 404, "snapshot_not_found", "no snapshot "+sid)
@@ -589,5 +595,21 @@ func TestSealedHotelTakesOnlySealedCreates(t *testing.T) {
 	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "sealed": "yes"})
 	if status != 400 || errCode(doc) != "invalid_hotel_selection" {
 		t.Fatalf("bad sealed value: %d %v", status, doc)
+	}
+}
+
+// A guest's bad request (4xx from the hotel) must not rest the hotel: the
+// next create, from any guest, still lands there.
+func TestClientErrorDoesNotRestHotel(t *testing.T) {
+	tc := newChain(t)
+	bad := map[string]any{"image": "alpine:3.20", "hotels": []string{"b"},
+		"network": map[string]any{"mode": "allowlist", "allow": []string{"bad.example:9"}}}
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", bad)
+	if status != 400 || errCode(doc) != "invalid_network_allowlist" {
+		t.Fatalf("bad allowlist: %d %v", status, doc)
+	}
+	status, doc = tc.call(t, "key2", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	if status != 202 {
+		t.Fatalf("next create after a client error: %d %v", status, doc)
 	}
 }
