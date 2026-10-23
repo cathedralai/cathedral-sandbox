@@ -183,6 +183,16 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			images = append(images, map[string]any{"ref": ref, "size_bytes": 3640000})
 		}
 		writeJSON(w, 202, map[string]any{"operation_id": "op_2", "status": "done", "result": map[string]any{"images": images}})
+	case strings.HasPrefix(p, "/v1/sandboxes/") && strings.Count(p, "/") == 3 && r.Method == "DELETE":
+		id := strings.TrimPrefix(p, "/v1/sandboxes/")
+		for i, rm := range f.rooms {
+			if rm["id"] == id {
+				f.rooms = append(f.rooms[:i], f.rooms[i+1:]...)
+				w.WriteHeader(204)
+				return
+			}
+		}
+		writeErr(w, 404, "sandbox_not_found", "no sandbox "+id)
 	default:
 		writeErr(w, 404, "route_not_found", p)
 	}

@@ -68,12 +68,12 @@ func (pl placement) selects(h *hotel) bool {
 		return false
 	}
 	for k, v := range pl.match {
-		if h.cfg.Labels[k] != v {
+		if h.labels()[k] != v {
 			return false
 		}
 	}
 	for k, v := range pl.exclude {
-		if h.cfg.Labels[k] == v {
+		if h.labels()[k] == v {
 			return false
 		}
 	}
@@ -117,7 +117,7 @@ func (b *broker) noRoomReason(pl placement) createResult {
 			continue
 		}
 		matching++
-		if !h.ok || h.cfg.Drain || time.Now().Before(h.backoffUntil) {
+		if !h.ok || h.drain() || time.Now().Before(h.backoffUntil) {
 			down++
 			continue
 		}
@@ -250,7 +250,7 @@ func (b *broker) placementFor(ctx context.Context, g *guestState, payload map[st
 	}
 	// A fork goes to its snapshot's hotel. The guest's sealed default does not
 	// stop a fork of a snapshot on an unsealed hotel.
-	if pl.sealedByDefault && h.cfg.Labels["sealed"] != "true" {
+	if pl.sealedByDefault && h.labels()["sealed"] != "true" {
 		delete(pl.match, "sealed")
 		pl.sealedByDefault = false
 	}
@@ -270,14 +270,14 @@ func (b *broker) handleHotels(w http.ResponseWriter, g *guestState) {
 			continue
 		}
 		free := h.slots - h.used()
-		if free < 0 || !h.ok || h.cfg.Drain {
+		if free < 0 || !h.ok || h.drain() {
 			free = 0
 		}
-		labels := h.cfg.Labels
+		labels := h.labels()
 		if labels == nil {
 			labels = map[string]string{}
 		}
-		out = append(out, map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "up": h.ok, "drain": h.cfg.Drain, "free_rooms": free})
+		out = append(out, map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "up": h.ok, "drain": h.drain(), "free_rooms": free})
 	}
 	b.mu.Unlock()
 	writeJSON(w, 200, map[string]any{"hotels": out})

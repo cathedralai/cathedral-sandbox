@@ -421,8 +421,7 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		compatErr(w, e.status, e.code, e.msg, retry)
 		return
 	}
-	out := b.createOne(r.Context(), g, native, time.Now(), pl)
-	b.unreserve(g, 1)
+	out := b.createMany(r.Context(), g, native, 1, time.Now(), pl)[0]
 	if out.status != 202 {
 		code, msg := "create_failed", "the hotel refused the room"
 		if e, ok := out.doc["error"].(map[string]string); ok {

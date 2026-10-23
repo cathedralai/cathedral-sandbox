@@ -89,7 +89,7 @@ func (b *broker) ensureBuilds(img *compatImage, g *guestState) {
 	b.mu.Lock()
 	var hotels []*hotel
 	for _, h := range b.hotelList() {
-		if !h.cfg.Drain && g.limits.allows(h.cfg.ID) {
+		if !h.drain() && g.limits.allows(h.cfg.ID) {
 			hotels = append(hotels, h)
 		}
 	}
