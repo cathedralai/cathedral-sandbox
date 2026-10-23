@@ -163,6 +163,7 @@ type guestState struct {
 	limits   guestLimits // from the config; an operator can change them at runtime (guests.go)
 	pending  int         // rooms admitted and not yet placed or failed
 	admits   []time.Time // admitted rooms in the last 60 s, for max_creates_per_minute
+	runtime  bool        // added by an operator at runtime and kept in state_dir/guests.json
 }
 
 type broker struct {
@@ -1363,6 +1364,9 @@ func main() {
 	go b.saveLoop(ctx)
 	if err := b.loadRuntimeHotels(); err != nil {
 		log.Printf("runtime hotels not loaded: %v", err)
+	}
+	if err := b.loadRuntimeGuests(); err != nil {
+		log.Printf("runtime guests not loaded: %v", err)
 	}
 	for _, h := range b.hotelList() {
 		b.startSync(ctx, h)

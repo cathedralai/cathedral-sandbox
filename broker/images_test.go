@@ -223,6 +223,9 @@ func (tc *testChain) start(t *testing.T) {
 	if err := b.loadRuntimeHotels(); err != nil {
 		t.Fatal(err)
 	}
+	if err := b.loadRuntimeGuests(); err != nil {
+		t.Fatal(err)
+	}
 	for _, h := range b.hotelList() {
 		h.ok, h.slots = true, 100
 	}

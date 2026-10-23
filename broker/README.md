@@ -68,9 +68,15 @@ limits without a restart:
 | Route (operator key) | What it does |
 |---|---|
 | `GET /v1/broker/guests` | Every guest with its limits and active rooms. No key hashes. |
+| `POST /v1/broker/guests` | Adds a guest: `{"id", "key_sha256", "view_token_sha256"?, "max_rooms"?, "max_creates_per_minute"?, "default_sealed"?, "hotels"?}`. Send the SHA-256 of the key, never the key. Needs `state_dir`. |
 | `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed` and `hotels`. |
+| `DELETE /v1/broker/guests/<id>` | Removes a runtime guest that has no rooms. |
 
-A runtime change stays in memory. A restart goes back to the config file.
+A guest added at runtime is kept in `state_dir/guests.json` (mode 0600, key
+hashes only) with its limits, so it comes back after a restart. A runtime
+guest never gets `ops`. A limit change on a config-file guest stays in
+memory: a restart goes back to the config file. A config-file guest with the
+same id or key wins over a runtime guest.
 
 Guests are apart: the broker labels each room with its guest, lists with
 that label only, and answers 404 `sandbox_not_found` to a call on a room of

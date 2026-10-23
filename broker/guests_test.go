@@ -329,3 +329,75 @@ func TestBuiltImageObeysSealedDefaultAndHotelSet(t *testing.T) {
 		t.Fatalf("sealed create from the image: %d %v", status, doc)
 	}
 }
+
+func TestOperatorAddsAGuestAtRuntimeAndItSurvivesARestart(t *testing.T) {
+	dir := t.TempDir()
+	tc := newChainState(t, dir)
+	add := map[string]any{"id": "polaris", "key_sha256": sha("key3"), "max_rooms": 2, "hotels": []string{"b", "c"}}
+
+	if status, _ := tc.call(t, "key1", "POST", "/v1/broker/guests", add); status != 401 {
+		t.Fatalf("guest key added a guest: %d", status)
+	}
+	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/guests", add)
+	if status != 201 || doc["id"] != "polaris" || doc["runtime"] != true || doc["ops"] != false {
+		t.Fatalf("add: %d %v", status, doc)
+	}
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/guests", add); status != 409 || errCode(doc) != "guest_exists" {
+		t.Fatalf("second add: %d %v", status, doc)
+	}
+	same := map[string]any{"id": "other", "key_sha256": sha("key1")}
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/guests", same); status != 409 || errCode(doc) != "key_in_use" {
+		t.Fatalf("reused key: %d %v", status, doc)
+	}
+	for _, bad := range []map[string]any{
+		{"id": "Bad_ID", "key_sha256": sha("k")},
+		{"id": "x", "key_sha256": "key-in-clear"},
+		{"id": "x", "key_sha256": sha("k"), "hotels": []string{"zz"}},
+		{"id": "x", "key_sha256": sha("k"), "ops": true},
+	} {
+		if status, _ := tc.call(t, "operator-key", "POST", "/v1/broker/guests", bad); status != 400 {
+			t.Fatalf("bad add %v: %d", bad, status)
+		}
+	}
+	if raw, _ := os.ReadFile(dir + "/" + runtimeGuestsFile); strings.Contains(string(raw), "key3") || !strings.Contains(string(raw), sha("key3")) {
+		t.Fatalf("guests.json: %s", raw)
+	}
+
+	// The new key works at once, inside its hotel set and room limit.
+	if id := tc.room(t, "key3", map[string]any{"image": "alpine:3.20"}); hotelOf(id) == "a" {
+		t.Fatalf("runtime guest got hotel a: %s", id)
+	}
+	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/polaris", map[string]any{"max_rooms": 1}); status != 200 || doc["max_rooms"] != float64(1) {
+		t.Fatalf("patch: %d %v", status, doc)
+	}
+	if status, doc := tc.call(t, "operator-key", "DELETE", "/v1/broker/guests/polaris", nil); status != 409 || errCode(doc) != "guest_has_rooms" {
+		t.Fatalf("delete with rooms: %d %v", status, doc)
+	}
+	if status, doc := tc.call(t, "operator-key", "DELETE", "/v1/broker/guests/g1", nil); status != 409 || errCode(doc) != "config_guest" {
+		t.Fatalf("delete config guest: %d %v", status, doc)
+	}
+
+	// After a restart the guest and its patched limit come back.
+	tc.start(t)
+	status, doc = tc.call(t, "operator-key", "GET", "/v1/broker/guests", nil)
+	var found map[string]any
+	for _, g := range doc["guests"].([]any) {
+		if m := g.(map[string]any); m["id"] == "polaris" {
+			found = m
+		}
+	}
+	if status != 200 || found == nil || found["max_rooms"] != float64(1) || found["runtime"] != true {
+		t.Fatalf("after restart: %d %v", status, doc)
+	}
+	if status, _ := tc.call(t, "key3", "GET", "/v1/quota", nil); status != 200 {
+		t.Fatalf("runtime key after restart: %d", status)
+	}
+}
+
+func TestRuntimeGuestNeedsAStateDir(t *testing.T) {
+	tc := newChain(t)
+	add := map[string]any{"id": "polaris", "key_sha256": sha("key3")}
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/guests", add); status != 409 || errCode(doc) != "no_state_dir" {
+		t.Fatalf("add without state_dir: %d %v", status, doc)
+	}
+}
