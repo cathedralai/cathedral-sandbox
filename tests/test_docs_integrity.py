@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+SNP_IMAGE_DIGEST = "3e1cb9144417e1e0d526445a43245e305e772cae0568202a332183071ef0c584"
 _REFERENCE_RE = re.compile(
     r"(?<!/)\b((?:docs|cathedral|tests|scripts)/[A-Za-z0-9_./-]+\.(?:md|py))\b"
 )
@@ -32,16 +33,14 @@ def test_mining_guide_is_the_single_current_operator_path() -> None:
         "each distinct verified machine",
         "Intel TDX",
         "AMD SEV-SNP",
-        # Updated 2026-09-09. UID30 admitted its first live AMD machine on
-        # 2026-09-08, so the previous "live hardware policy pending" wording
-        # became false. This guard is what kept it in place, so it moves with
-        # the claim rather than pinning a stale one. Updated 2026-09-28: that
-        # admission was on SN39, and SN94 has not been verified yet. The block
-        # is observed on chain and not recorded in-repo, so it stays marked.
-        "One admission observed on SN39 at block 9025398 (observed on chain; unverified in-repo)",
-        "SN94 status pending verification",
+        # The SN39 admission and the UID30 weight row were unverified in-repo
+        # and are gone from the guide. SN39 is legacy.
+        "Cathedral runs on SN94; SN39 is legacy",
+        "This repository records no SN94 mainnet admission",
+        "Founding-miner terms: to be published",
+        "btcli subnets register --netuid 94 --network finney",
+        # The TDX image stays in the legacy section.
         "7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b",
-        "3e1cb9144417e1e0d526445a43245e305e772cae0568202a332183071ef0c584",
         "current migration bridge",
         "btcli axon set",
         "/usr/local/libexec/cathedral/run-sn94-miner",
@@ -54,6 +53,12 @@ def test_mining_guide_is_the_single_current_operator_path() -> None:
     assert "single current mining guide" in mining
     assert "only active operator guide" in " ".join(map_text.split())
     assert len(mining.splitlines()) <= 8
+    # The SNP digest lives in docs/SN94_SNP_MINER_IMAGE.md only.
+    assert SNP_IMAGE_DIGEST not in readme
+    assert "UID 30" not in readme
+    assert readme.index("## Run one AMD SEV-SNP machine") < readme.index(
+        "## Run one Intel TDX machine (legacy)"
+    )
 
 
 def test_current_operator_docs_exclude_retired_launch_paths() -> None:
@@ -130,10 +135,15 @@ def test_additional_machine_flow_reuses_the_signer_and_reloads_without_restart()
 def test_current_guide_proves_reachability_before_paid_registration() -> None:
     readme = (REPO_ROOT / "docs" / "MINING.md").read_text()
 
-    assert readme.index("### 3. Start the reviewed image") < readme.index(
-        "### 4. Register and announce the hotkey"
+    assert readme.index("### 5. Start the miner") < readme.index(
+        "### 6. Register and announce the hotkey"
     )
-    assert readme.index('test "$HEALTH_STATUS" = 400') < readme.index("subnet register --netuid 94")
+    assert readme.index('test "$HEALTH_STATUS" = 401') < readme.index(
+        "btcli subnets register --netuid 94"
+    )
+    # The legacy TDX path registers at step 6 too, and says to check first.
+    assert 'test "$HEALTH_STATUS" = 400' in readme
+    assert "Register only after this check passes." in readme
     assert "btcli --network finney query uid" in readme
     assert "btcli --network finney --json query weights --netuid 94" in readme
     assert "There is not yet a public validator-result feed" in readme
@@ -163,29 +173,35 @@ def test_amd_friend_test_creates_exact_launcher_directories() -> None:
     assert "/var/lib/cathedral/validator-access" in guide
 
 
-def test_snp_operator_surfaces_pin_the_published_image_without_placeholders() -> None:
+def test_snp_image_digest_is_listed_in_one_doc_only() -> None:
     image_ref = (
         "ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:"
-        "3e1cb9144417e1e0d526445a43245e305e772cae0568202a332183071ef0c584"
+        f"{SNP_IMAGE_DIGEST}"
     )
     source_commit = "dd7182ccd91ca25b566ff210025bdea5fda57c4c"
     placeholder = "REPLACE_WITH_" + "PUBLISHED_DIGEST"
-    surfaces = (
-        "docs/MINING.md",
-        "docs/AMD_SEV_SNP_FRIEND_TEST.md",
-        "docs/SN94_SNP_MINER_IMAGE.md",
-        "examples/systemd/sn94-snp-miner.env.example",
-    )
 
-    for path in surfaces:
+    for path in ("docs/SN94_SNP_MINER_IMAGE.md", "examples/systemd/sn94-snp-miner.env.example"):
         document = (REPO_ROOT / path).read_text()
         assert image_ref in document, path
         assert placeholder not in document, path
 
-    for path in ("docs/AMD_SEV_SNP_FRIEND_TEST.md", "docs/SN94_SNP_MINER_IMAGE.md"):
+    image_doc = (REPO_ROOT / "docs/SN94_SNP_MINER_IMAGE.md").read_text()
+    assert source_commit in image_doc
+    assert "no digest is listed" not in image_doc.lower()
+
+    for path in (
+        "README.md",
+        "docs/MINING.md",
+        "docs/AMD_SEV_SNP_FRIEND_TEST.md",
+        "docs/SNP_OWN_SERVER_ONBOARDING.md",
+    ):
         document = (REPO_ROOT / path).read_text()
-        assert source_commit in document, path
-        assert "no digest is listed" not in document.lower(), path
+        assert SNP_IMAGE_DIGEST not in document, path
+        assert source_commit not in document, path
+
+    for path in ("docs/MINING.md", "docs/AMD_SEV_SNP_FRIEND_TEST.md"):
+        assert "SN94_SNP_MINER_IMAGE.md" in (REPO_ROOT / path).read_text(), path
 
 
 def test_current_docs_state_direct_validator_security_contracts() -> None:
@@ -276,15 +292,15 @@ def test_runtime_help_does_not_point_at_deleted_documents() -> None:
 def test_readme_is_a_short_mission_first_miner_entrypoint() -> None:
     readme = (REPO_ROOT / "README.md").read_text()
     assert len(readme.splitlines()) <= 120
-    assert "trusted operators" in readme
+    assert "Cathedral runs on SN94; SN39 is legacy" in readme
     assert "This repository is for miners" in readme
     assert "This mining path is not a customer sandbox API" in readme
-    assert "SN94 admission remains unverified" in readme
+    assert "records no SN94 mainnet admission" in readme
     assert "Keep the coldkey and wallet off every worker" in readme
     assert "protocol wiring, not hardware" in readme
     assert "GPU | Not a qualified mining path" in readme
     assert "scripts/run_sn94_signed_fleet_miner.sh" not in readme
-    assert "docs/MINING.md#5-confirm-chain-state" in readme
+    assert "docs/MINING.md#7-confirm-chain-state" in readme
     assert "docs/MINING.md#stop-and-get-help" in readme
 
 
