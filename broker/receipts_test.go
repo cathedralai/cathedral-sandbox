@@ -214,3 +214,19 @@ func TestFilteredChainIsMarkedFiltered(t *testing.T) {
 		t.Fatalf("a guest's chain must say it is filtered, or verify_receipts.py checks it as a whole chain: %s", out)
 	}
 }
+
+func TestFilteredChainCountsScannedReceipts(t *testing.T) {
+	body := []byte(`{"receipts":[{"statement":{"sandbox_id":"a"}},{"statement":{"sandbox_id":"b"}},{"statement":{"sandbox_id":"c"}}],"count":3}`)
+	out, err := filterHotelReceiptsFor(body, map[string]bool{"b": true}, "g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Scanned int `json:"scanned"`
+		Count   int `json:"count"`
+	}
+	_ = json.Unmarshal(out, &doc)
+	if doc.Scanned != 3 || doc.Count != 1 {
+		t.Fatalf("a filtered page must say how many hotel receipts it covered, so a client can page on: %s", out)
+	}
+}

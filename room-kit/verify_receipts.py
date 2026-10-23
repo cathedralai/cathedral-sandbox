@@ -288,12 +288,17 @@ def fetch_chain(broker: str, hotel: str, key: str) -> dict:
     page; the head of that page is the head the chain must end at.
     """
     receipts: list[dict] = []
+    offset = 0
     while True:
-        page = get(f"{broker}/v1/hotels/{hotel}/receipts?after={len(receipts)}&limit={PAGE}", key)
+        page = get(f"{broker}/v1/hotels/{hotel}/receipts?after={offset}&limit={PAGE}", key)
         receipts.extend(page["receipts"])
-        if len(page["receipts"]) < PAGE:
+        # A guest's page is filtered by the broker: "scanned" is how far the
+        # hotel's chain moved, which can be more than the receipts returned.
+        scanned = page.get("scanned", len(page["receipts"]))
+        offset += scanned
+        if scanned < PAGE:
             return {"binding_sha256": page.get("binding_sha256"), "head": page.get("head"),
-                    "count": len(receipts), "receipts": receipts}
+                    "filtered": bool(page.get("filtered")), "count": len(receipts), "receipts": receipts}
 
 
 def main() -> int:

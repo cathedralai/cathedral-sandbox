@@ -118,6 +118,10 @@ A guest's chain is marked `"filtered": true`: it holds only that guest's
 receipts, so it has gaps. `verify_receipts.py --broker ... --key-file ...`
 checks each receipt's signature and attestation binding; the full-chain
 checks (no gaps, ends at `head`) apply only to an unfiltered chain.
+Each receipt proves itself: its signature, its link to the receipt before it
+and its binding to the attestation. A chain does not prove that nothing was
+left out, filtered or not, because `head` is not signed. To check one room's
+complete history, use `--sandbox <id>`.
 
 ---
 

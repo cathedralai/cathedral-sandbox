@@ -103,6 +103,13 @@ func filterHotelReceiptsFor(body []byte, owned map[string]bool, guest string) ([
 	// The head stays the hotel's real head, but this is a subset: the flag
 	// tells verify_receipts.py to check each receipt, not a gap-free chain.
 	doc["filtered"] = json.RawMessage("true")
+	// The hotel pages by its own offset. "scanned" is how many hotel receipts
+	// this page covered, so a client pages on by that, not by len(receipts).
+	scanned, err := marshalRaw(len(receipts))
+	if err != nil {
+		return nil, err
+	}
+	doc["scanned"] = scanned
 	return marshalRaw(doc)
 }
 

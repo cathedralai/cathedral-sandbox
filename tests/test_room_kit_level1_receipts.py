@@ -287,3 +287,25 @@ def test_guest_filtered_chain_verifies(tmp_path, monkeypatch) -> None:
     })
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert json.loads(proc.stdout)["verdict"] == "PASS"
+
+
+def test_fetch_chain_pages_a_filtered_chain_by_raw_offset(monkeypatch) -> None:
+    # The broker filters each hotel page, so a guest page is short while the
+    # hotel has more. Paging must follow the hotel's offset ("scanned"), not
+    # the number of receipts the guest got back.
+    monkeypatch.setattr(vr, "PAGE", 3)
+    raw = [{"seq": i, "mine": i in (2, 5, 7)} for i in range(1, 9)]
+    asked = []
+
+    def fake_get(url, _key):
+        after = int(url.split("after=")[1].split("&")[0])
+        asked.append(after)
+        page = raw[after:after + 3]
+        return {"head": "h", "filtered": True, "scanned": len(page),
+                "receipts": [r for r in page if r["mine"]]}
+
+    monkeypatch.setattr(vr, "get", fake_get)
+    doc = vr.fetch_chain("https://b", "h1", "k")
+    assert [r["seq"] for r in doc["receipts"]] == [2, 5, 7]
+    assert asked == [0, 3, 6]
+    assert doc["filtered"] is True
