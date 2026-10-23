@@ -526,7 +526,9 @@ systemctl start "$ROOM_ID-reaper.timer"
 # bare 401 or 000 used to print "done" over a hotel that answered nobody.
 API_CODE=000
 for _ in $(seq 60); do
-  API_CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "@$ROOM_ETC/reaper.headers" "http://127.0.0.1:$ROOM_API_PORT/v1/status")
+  # curl exits 7 while the API still starts; under set -e that ended the
+  # install here instead of trying again (2026-10-23, every live hotel).
+  API_CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "@$ROOM_ETC/reaper.headers" "http://127.0.0.1:$ROOM_API_PORT/v1/status" || true)
   [ "$API_CODE" = 200 ] && break; sleep 1
 done
 [ "$API_CODE" = 200 ] || { echo "API did not answer 200 on /v1/status with its own key (got $API_CODE); see journalctl -u $ROOM_ID.service" >&2; exit 1; }
