@@ -153,6 +153,23 @@ _CODE_STATUS = {
 }
 
 
+def install_stop_signal() -> None:
+    """Make SIGTERM end serve_forever like Ctrl-C, so the provider closes.
+
+    systemd restarts send SIGTERM; without this the process died with every
+    room's work directory and snapshot tar left on the data volume.
+    """
+    import signal
+
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, stop)
+    except ValueError:  # not the main thread
+        pass
+
+
 # The broker caps room bodies at 256 MiB (files and tar). Anything larger is
 # refused before it is read, so a client cannot hold a thread on a slow body.
 MAX_BODY_BYTES = 256 << 20

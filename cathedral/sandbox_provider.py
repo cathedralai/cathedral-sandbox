@@ -970,6 +970,14 @@ class InMemorySandboxProvider:
                     del self._log_tombstones[sid]
         return removed
 
+    def sweep_tombstones(self) -> None:
+        """Drop log tombstones past their retention. Collects no sandbox."""
+        now = _now()
+        with self._lock:
+            for sid, tomb in list(self._log_tombstones.items()):
+                if now > tomb["retained_until"]:
+                    del self._log_tombstones[sid]
+
     def _is_collectable_locked(self, sandbox: _Sandbox, now: datetime) -> bool:
         """True when GC must collect *sandbox* (TTL, idle window or revoked key).
 

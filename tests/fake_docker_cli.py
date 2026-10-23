@@ -65,6 +65,20 @@ def main(argv):
             print("27.0.0-fake")
         return 0
 
+    if cmd == "images":
+        import fnmatch
+
+        pattern = None
+        if "--filter" in argv:
+            flt = argv[argv.index("--filter") + 1]
+            if flt.startswith("reference="):
+                pattern = flt[len("reference="):]
+        with Locked() as st:
+            for ref in st["images"]:
+                if pattern is None or fnmatch.fnmatch(ref, pattern) or fnmatch.fnmatch(ref.split(":")[0], pattern):
+                    print(ref)
+        return 0
+
     if cmd == "image" and argv[1] == "inspect":
         ref = argv[-1]
         with Locked() as st:
@@ -282,7 +296,11 @@ def main(argv):
                 break
         form = b.get("timeout_form", "gnu")
         if rest[:1] == ["timeout"]:
-            busybox = rest[1:2] == ["-t"]
+            # BusyBox: timeout [-s SIG] [-t SECS] PROG; GNU: timeout [-k N] SECS PROG.
+            opts = rest[1:]
+            if opts[:2] == ["-s", "KILL"]:
+                opts = opts[2:]
+            busybox = opts[:1] == ["-t"]
             if form == "none":
                 print("sh: timeout: not found", file=sys.stderr)
                 return 127
