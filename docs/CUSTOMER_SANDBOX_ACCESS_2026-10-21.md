@@ -14,6 +14,9 @@
 | `"exclude_hotel_labels": {"sealed": "true"}` | Exclude any hotel with any listed label pair. |
 
 When no hotel matches the selection, the broker returns **409** `no_matching_hotel`.
+A sealed hotel takes only sealed creates: send `"sealed": true`, or ask the
+operator to set your `default_sealed`. Without it, a guest whose only hotel is
+sealed gets `no_matching_hotel`.
 
 ### Capacity errors
 
