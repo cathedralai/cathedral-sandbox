@@ -275,14 +275,27 @@ async def _run_proxy(table, *, tls: bool, room_ip: str, payload: bytes):
             return (room_ip, 1) if key == "peername" else real(key, default)
 
         writer.get_extra_info = fake
-        await proxy.handle(reader, writer, up_port, tls)
+        # The proxy checks the policy on the room's real port (80 or 443),
+        # so hand it that port and send its upstream dial to the fake server.
+        await proxy.handle(reader, writer, 443 if tls else 80, tls)
+
+    real_open = asyncio.open_connection
+
+    async def open_upstream(host, port, *args, **kwargs):
+        if host == "127.0.0.1" and port in (80, 443):
+            port = up_port
+        return await real_open(host, port, *args, **kwargs)
 
     front = await asyncio.start_server(handler, "127.0.0.1", 0)
     port = front.sockets[0].getsockname()[1]
     r, w = await asyncio.open_connection("127.0.0.1", port)
-    w.write(payload)
-    await w.drain()
-    answer = await asyncio.wait_for(r.read(65536), 5)
+    asyncio.open_connection = open_upstream
+    try:
+        w.write(payload)
+        await w.drain()
+        answer = await asyncio.wait_for(r.read(65536), 5)
+    finally:
+        asyncio.open_connection = real_open
     w.close()
     up.close()
     front.close()
@@ -333,7 +346,7 @@ def test_switch_closes_open_proxy_connections(table) -> None:
 
     proxy = eg.Proxy(table)
     table.on_change = proxy.recheck
-    proxy.active["10.214.0.24"] = {("pypi.org", W, W)}
+    proxy.active["10.214.0.24"] = {("pypi.org", 443, W, W)}
     table.put("1" * 64, "s1", eg.Policy.parse({"mode": "allowlist", "allow": ["pypi.org"]}))
     assert closed == []  # still allowed
     table.put("1" * 64, "s1", eg.Policy.parse({"mode": "deny_all"}))
