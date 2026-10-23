@@ -199,3 +199,18 @@ func TestFilterKeepsOwnBulkDeleteReceipt(t *testing.T) {
 		t.Fatalf("own bulk delete not kept exactly once: %s", out)
 	}
 }
+
+func TestFilteredChainIsMarkedFiltered(t *testing.T) {
+	body := []byte(`{"receipts":[{"statement":{"action":"create","sandbox_id":"a"}}],"count":1,"head":"h"}`)
+	out, err := filterHotelReceiptsFor(body, map[string]bool{"a": true}, "g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Filtered bool `json:"filtered"`
+	}
+	_ = json.Unmarshal(out, &doc)
+	if !doc.Filtered {
+		t.Fatalf("a guest's chain must say it is filtered, or verify_receipts.py checks it as a whole chain: %s", out)
+	}
+}

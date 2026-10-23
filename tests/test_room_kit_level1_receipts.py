@@ -275,3 +275,15 @@ printf 'wild %s\n' "$(receipts_api_upstream)"
     assert 'reverse_proxy $ROOM_API_UPSTREAM' in install
     assert "reverse_proxy 127.0.0.1:$ROOM_HEALTH_PORT" in install
     assert "receipts_apply_defaults" in install
+
+
+def test_guest_filtered_chain_verifies(tmp_path, monkeypatch) -> None:
+    # The broker gives a guest only its own receipts, with the hotel's head.
+    # A filtered chain is a subset: each receipt is checked, not the whole chain.
+    ledger = _chain(tmp_path, monkeypatch)
+    proc = _verify_cli(tmp_path, ledger.attestation(), {
+        "binding_sha256": ledger.binding_sha256, "head": ledger.head, "filtered": True,
+        "receipts": ledger.chain[1:],
+    })
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(proc.stdout)["verdict"] == "PASS"

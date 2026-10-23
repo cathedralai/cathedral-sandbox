@@ -328,7 +328,10 @@ def main() -> int:
             att = json.load(open(a.attestation))
             doc = json.load(open(a.receipts)) if a.receipts else []
         receipts = doc["receipts"] if isinstance(doc, dict) else doc
-        head = doc.get("head") if isinstance(doc, dict) and not a.sandbox and not a.receipt_header else None
+        # A guest's chain from the broker is filtered to its own rooms, so it
+        # has gaps by design: check each receipt, not a whole chain to the head.
+        whole = isinstance(doc, dict) and not doc.get("filtered") and not a.sandbox and not a.receipt_header
+        head = doc.get("head") if whole else None
         for h in a.receipt_header:
             receipts.append(json.loads(base64.urlsafe_b64decode(h + "=" * (-len(h) % 4))))
         if is_hotel_level(att):

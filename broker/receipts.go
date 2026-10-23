@@ -100,6 +100,9 @@ func filterHotelReceiptsFor(body []byte, owned map[string]bool, guest string) ([
 		return nil, err
 	}
 	doc["count"] = count
+	// The head stays the hotel's real head, but this is a subset: the flag
+	// tells verify_receipts.py to check each receipt, not a gap-free chain.
+	doc["filtered"] = json.RawMessage("true")
 	return marshalRaw(doc)
 }
 
