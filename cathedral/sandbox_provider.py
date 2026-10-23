@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -665,24 +666,32 @@ class InMemorySandboxProvider:
             sandbox = self._require_running(sandbox_id)
             self._touch(sandbox)
             self._assert_disk_room(sandbox, extra_bytes=len(data), replacing=path)
-        host = self._host(sandbox, path)
-        host.parent.mkdir(parents=True, exist_ok=True)
-        host.write_bytes(data)
-        if mode is not None:
-            os.chmod(host, mode)
+        self._host(sandbox, path)
+        fd = _open_beneath(sandbox.root, path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, make_dirs=True)
+        with os.fdopen(fd, "wb") as fh:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise SandboxOpError("not_a_file", 400, f"{path} is not a regular file")
+            fh.write(data)
+            if mode is not None:
+                os.fchmod(fd, mode)
 
     def read_file(self, sandbox_id: str, spec: FileGet) -> tuple[bytes, int]:
         with self._lock:
             sandbox = self._require_active(sandbox_id)
             self._touch(sandbox)
-        host = self._host(sandbox, spec.path)
-        if not host.is_file():
-            raise SandboxOpError("file_not_found", 404, f"no file {spec.path}")
-        total = host.stat().st_size
-        # §3.3: ?max_bytes= past the cap is a 413 (the whole file is too big to return).
-        if spec.max_bytes is not None and total > spec.max_bytes:
-            raise SandboxOpError("file_too_large", 413, f"{spec.path} is {total} bytes, over max_bytes {spec.max_bytes}")
-        with host.open("rb") as fh:
+        self._host(sandbox, spec.path)
+        try:
+            fd = _open_beneath(sandbox.root, spec.path, os.O_RDONLY | os.O_NONBLOCK)
+        except FileNotFoundError:
+            raise SandboxOpError("file_not_found", 404, f"no file {spec.path}") from None
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise SandboxOpError("file_not_found", 404, f"no file {spec.path}")
+            total = st.st_size
+            # §3.3: ?max_bytes= past the cap is a 413 (the whole file is too big to return).
+            if spec.max_bytes is not None and total > spec.max_bytes:
+                raise SandboxOpError("file_too_large", 413, f"{spec.path} is {total} bytes, over max_bytes {spec.max_bytes}")
             if spec.range_start is not None:
                 fh.seek(spec.range_start)
                 length = (spec.range_end - spec.range_start + 1) if spec.range_end is not None else None
@@ -729,11 +738,17 @@ class InMemorySandboxProvider:
     def stat(self, sandbox_id: str, path: str) -> StatResult:
         with self._lock:
             sandbox = self._require_active(sandbox_id)
-        host = self._host(sandbox, path)
-        if not host.exists():
-            raise SandboxOpError("path_not_found", 404, f"no path {path}")
-        st = host.stat()
-        return StatResult(is_dir=host.is_dir(), is_file=host.is_file(), size=st.st_size, mode=st.st_mode & 0o7777)
+        self._host(sandbox, path)
+        try:
+            fd = _open_beneath(sandbox.root, path, os.O_RDONLY | os.O_NONBLOCK)
+        except FileNotFoundError:
+            raise SandboxOpError("path_not_found", 404, f"no path {path}") from None
+        try:
+            st = os.fstat(fd)
+        finally:
+            os.close(fd)
+        return StatResult(is_dir=stat.S_ISDIR(st.st_mode), is_file=stat.S_ISREG(st.st_mode),
+                          size=st.st_size, mode=st.st_mode & 0o7777)
 
     # ------------------------------------------------------------------ §3.5 snapshot / fork primitives
     def snapshot(self, sandbox_id: str, *, ttl_seconds: int | None = None, name: str | None = None, labels: dict[str, str] | None = None) -> str:
@@ -1482,6 +1497,41 @@ class InMemorySandboxProvider:
             "snapshot_gib_month_usd": self._pricing.snapshot_gib_month_usd,
             "reference": self._pricing.reference_comparisons(),
         }
+
+
+def _open_beneath(root: Path, path: str, flags: int, *, make_dirs: bool = False) -> int:
+    """Open root/path one component at a time and never follow a symlink.
+
+    The room writes the same directories through its bind mount. A check that
+    resolves the path and a later open() that walks it again leave a gap: the
+    room swaps a directory for a link to a host file (the hotel API key) in
+    between. Opening each component with O_NOFOLLOW below an open directory
+    closes that gap. A link anywhere in the path is a path_escape.
+    """
+    parts = [part for part in path.strip("/").split("/") if part not in ("", ".")]
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+    dirfd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        for name in parts[:-1]:
+            try:
+                next_fd = os.open(name, dir_flags, dir_fd=dirfd)
+            except FileNotFoundError:
+                if not make_dirs:
+                    raise
+                os.mkdir(name, 0o755, dir_fd=dirfd)
+                next_fd = os.open(name, dir_flags, dir_fd=dirfd)
+            except OSError as exc:
+                raise SandboxOpError("path_escape", 400, f"path is not a plain directory chain: {path}") from exc
+            os.close(dirfd)
+            dirfd = next_fd
+        try:
+            return os.open(parts[-1] if parts else ".", flags | os.O_NOFOLLOW, 0o644, dir_fd=dirfd)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:  # ELOOP: the last component is a link
+            raise SandboxOpError("path_escape", 400, f"path ends in a link or cannot be opened: {path}") from exc
+    finally:
+        os.close(dirfd)
 
 
 def _render_cmd(request: ExecRequest) -> str:
