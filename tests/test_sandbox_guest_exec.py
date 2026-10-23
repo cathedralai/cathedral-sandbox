@@ -89,3 +89,31 @@ def test_process_log_read_refuses_a_symlink(tmp_path) -> None:
     log.write_text("hello-bg\n")
     assert _read_room_log(log) == "hello-bg\n"
     assert _read_room_log(tmp_path / "missing.log") == ""
+
+
+@pytest.mark.parametrize("path", ["/home/u/x", "/etc/passwd", "/workspace/x", "/"])
+def test_file_paths_outside_work_are_refused(fake: FakeDocker, path: str) -> None:
+    # Only /work is mounted into the room. A file elsewhere landed on the host
+    # beside the mount: a 200 for a file the room never sees.
+    from cathedral.sandbox_api import FileGet, TarGet
+    from cathedral.sandbox_provider import SandboxOpError
+
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        calls = [
+            lambda: provider.write_file(sid, path, b"x", None),
+            lambda: provider.read_file(sid, FileGet(path=path)),
+            lambda: provider.write_tar(sid, path, b""),
+            lambda: provider.read_tar(sid, TarGet(path=path)),
+            lambda: provider.stat(sid, path),
+        ]
+        for call in calls:
+            with pytest.raises(SandboxOpError) as err:
+                call()
+            assert err.value.http_status == 400 and err.value.code == "path_outside_work"
+        provider.write_file(sid, "/work/ok.txt", b"hi", None)
+        assert provider.read_file(sid, FileGet(path="/work/ok.txt"))[0] == b"hi"
+        assert provider.stat(sid, "/work").is_dir
+    finally:
+        provider.close()

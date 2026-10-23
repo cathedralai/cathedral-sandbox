@@ -44,6 +44,7 @@ from cathedral.sandbox_api import (
     network_policy_sha256,
     ProcessHandle,
     SandboxContractError,
+    StatResult,
     StatusReport,
     TarGet,
 )
@@ -900,6 +901,18 @@ def _fetch_context_tar(url: str) -> bytes:
         ) from exc
 
 
+def _in_work(path: str) -> str:
+    """Refuse a file path outside /work, the only directory mounted into the room.
+
+    The files API reads and writes the host side of the mount. Any other path
+    lands on the host beside it: the room never sees the file and a snapshot
+    leaves it out, so a 200 there would be a lie.
+    """
+    if not isinstance(path, str) or not (path == "/work" or path.startswith("/work/")):
+        raise SandboxOpError("path_outside_work", 400, f"the files API reaches /work only: {path!r}")
+    return path
+
+
 def _read_room_log(path: Path) -> str:
     """Read a process log from the room's /work without following a symlink.
 
@@ -1485,16 +1498,21 @@ class DockerGuestProvider:
         )
 
     def write_file(self, sandbox_id: str, path: str, data: bytes, mode: int | None) -> None:
-        self._inner.write_file(sandbox_id, path, data, mode)
+        self._inner.write_file(sandbox_id, _in_work(path), data, mode)
 
     def read_file(self, sandbox_id: str, spec: FileGet) -> tuple[bytes, int]:
+        _in_work(spec.path)
         return self._inner.read_file(sandbox_id, spec)
 
     def write_tar(self, sandbox_id: str, path: str, tarball: bytes) -> None:
-        self._inner.write_tar(sandbox_id, path, tarball)
+        self._inner.write_tar(sandbox_id, _in_work(path), tarball)
 
     def read_tar(self, sandbox_id: str, spec: TarGet) -> bytes:
+        _in_work(spec.path)
         return self._inner.read_tar(sandbox_id, spec)
+
+    def stat(self, sandbox_id: str, path: str) -> StatResult:
+        return self._inner.stat(sandbox_id, _in_work(path))
 
     def snapshot(
         self,
