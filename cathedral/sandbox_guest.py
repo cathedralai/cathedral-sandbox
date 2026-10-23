@@ -1146,10 +1146,11 @@ class DockerGuestProvider:
         """Return the snapshot id for *ref* (an id or a name), or None when unknown."""
         with self._inner._lock:  # noqa: SLF001
             snapshots = self._inner._snapshots  # noqa: SLF001
-            if ref in snapshots:
+            visible = self._inner._snapshot_visible  # noqa: SLF001
+            if ref in snapshots and visible(ref):
                 return ref
             for sid, (_, rec) in snapshots.items():
-                if rec.name == ref:
+                if rec.name == ref and visible(sid):
                     return sid
         return None
 
@@ -1202,9 +1203,9 @@ class DockerGuestProvider:
                 self.delete(doc["id"])
             if idempotency is not None:
                 with self._inner._lock:  # noqa: SLF001
-                    seen = self._inner._idempotency.get(idempotency)  # noqa: SLF001
+                    seen = self._inner._idempotency.get((api_key, idempotency))  # noqa: SLF001
                     if seen is not None and seen[1] is docs:
-                        del self._inner._idempotency[idempotency]  # noqa: SLF001
+                        del self._inner._idempotency[(api_key, idempotency)]  # noqa: SLF001
             raise
         if "sandboxes" in docs:
             return {"sandboxes": started, "count": len(started)}

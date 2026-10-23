@@ -194,9 +194,12 @@ class InMemorySandboxProvider:
         self._base = Path(tempfile.mkdtemp(prefix="cathedral-sandbox-"))
         self._sandboxes: dict[str, _Sandbox] = {}
         self._snapshots: dict[str, tuple[Path, SnapshotRecord]] = {}  # id -> (tar path, record)
+        self._snapshot_owner: dict[str, str | None] = {}  # id -> the key that made it
         self._operations: dict[str, dict[str, Any]] = {}
         self._images: dict[str, dict[str, Any]] = {}
-        self._idempotency: dict[str, tuple[str, Any]] = {}
+        # (api key, Idempotency-Key) -> (body digest, answer). Keyed per key:
+        # two keys can pick the same key string for the same body.
+        self._idempotency: dict[tuple[str | None, str], tuple[str, Any]] = {}
         # §3.13/§3.18: logs kept 24 h after delete (stdout, stderr, exec history).
         self._log_tombstones: dict[str, dict[str, Any]] = {}
         self._limits = limits or QuotaLimits(
@@ -259,6 +262,12 @@ class InMemorySandboxProvider:
                 404,
                 f"no sandbox {sandbox.id}",
             )
+
+    def _snapshot_visible(self, snapshot_id: str) -> bool:
+        """A snapshot belongs to the key that made it; another key cannot see or use it."""
+        caller = self._caller_key()
+        owner = self._snapshot_owner.get(snapshot_id)
+        return caller is None or owner is None or owner == caller
 
     def _require_active(self, sandbox_id: str) -> _Sandbox:
         sandbox = self._sandboxes.get(sandbox_id)
@@ -353,7 +362,7 @@ class InMemorySandboxProvider:
             self._ctx.api_key = api_key
             if idempotency is not None:
                 api.validate_idempotency_key(idempotency)
-                seen = self._idempotency.get(idempotency)
+                seen = self._idempotency.get((api_key, idempotency))
                 if seen is not None:
                     if seen[0] != body_digest:
                         raise SandboxOpError("idempotency_conflict", 409, "Idempotency-Key reused with a different body")
@@ -368,7 +377,7 @@ class InMemorySandboxProvider:
             finally:
                 self._create_latencies_ms.append((time.perf_counter() - started) * 1000)
             if idempotency is not None:
-                self._idempotency[idempotency] = (body_digest, docs)
+                self._idempotency[(api_key, idempotency)] = (body_digest, docs)
             return docs
 
     def _create_locked(self, request: CreateSandboxRequest, api_key: str | None) -> dict[str, Any]:
@@ -407,10 +416,13 @@ class InMemorySandboxProvider:
 
         if request.snapshot_id is not None:
             snap = self._snapshots.get(request.snapshot_id)
+            if snap is not None and not self._snapshot_visible(request.snapshot_id):
+                snap = None  # another key's snapshot: as good as absent
             if snap is None:
                 # §3.5: a fork may name the snapshot instead of its id
                 # (Harbor CreateSandboxFromSnapshotParams(snapshot=name)).
-                snap = next(((sid, r) for sid, (_, r) in self._snapshots.items() if r.name == request.snapshot_id), None)
+                snap = next(((sid, r) for sid, (_, r) in self._snapshots.items()
+                             if r.name == request.snapshot_id and self._snapshot_visible(sid)), None)
                 if snap is not None:
                     snap = self._snapshots[snap[0]]
             if snap is None:
@@ -764,7 +776,7 @@ class InMemorySandboxProvider:
             # existing name returns that snapshot rather than duplicating it.
             if name:
                 for sid, (_, rec) in self._snapshots.items():
-                    if rec.name == name:
+                    if rec.name == name and self._snapshot_visible(sid):
                         op_id = api.operation_id()
                         self._operations[op_id] = {
                             "status": "done",
@@ -786,6 +798,7 @@ class InMemorySandboxProvider:
                 name=name or None, labels=dict(labels or {}),
             )
             self._snapshots[snap_id] = (path, record)
+            self._snapshot_owner[snap_id] = sandbox.api_key
             op_id = api.operation_id()
             self._operations[op_id] = {
                 "status": "done",
@@ -803,6 +816,7 @@ class InMemorySandboxProvider:
         ]
         for sid in expired:
             path, _ = self._snapshots.pop(sid)
+            self._snapshot_owner.pop(sid, None)
             Path(path).unlink(missing_ok=True)
 
     def list_snapshots(self, labels: Iterable[str] = ()) -> list[dict[str, Any]]:
@@ -811,6 +825,8 @@ class InMemorySandboxProvider:
             self._sweep_snapshots_locked()
             out = []
             for sid, (_, rec) in self._snapshots.items():
+                if not self._snapshot_visible(sid):
+                    continue
                 if want and not all((rec.labels or {}).get(k) == v for k, v in want.items()):
                     continue
                 out.append(
@@ -827,9 +843,10 @@ class InMemorySandboxProvider:
 
     def delete_snapshot(self, snapshot_id: str) -> bool:
         with self._lock:
-            meta = self._snapshots.pop(snapshot_id, None)
-            if meta is None:
+            if snapshot_id not in self._snapshots or not self._snapshot_visible(snapshot_id):
                 return False
+            meta = self._snapshots.pop(snapshot_id)
+            self._snapshot_owner.pop(snapshot_id, None)
             Path(meta[0]).unlink(missing_ok=True)
             return True
 
@@ -877,6 +894,7 @@ class InMemorySandboxProvider:
             sandbox.deleted_at = _now()
         self._log_tombstones[sandbox.id] = {
             "sandbox_id": sandbox.id,
+            "api_key": sandbox.api_key,
             "state": "deleted",
             "stdout": bytes(sandbox.container_stdout),
             "stderr": bytes(sandbox.container_stderr),
@@ -1415,10 +1433,17 @@ class InMemorySandboxProvider:
             entry["cost_usd"] += self._pricing.cost_usd(vcpu_hours=hours * vcpu, gib_hours=hours * gib)
             return group
 
+        caller = self._caller_key()
+
+        def mine(owner: str | None) -> bool:
+            return caller is None or owner is None or owner == caller
+
         with self._lock:
             # A "deleting" record already has a tombstone; do not bill it twice.
-            actives = [s for s in self._sandboxes.values() if s.state != "deleting"]
-            tombs = [t for t in self._log_tombstones.values() if t.get("resources") is not None]
+            # Each key sees its own sandboxes, tombstones and snapshots only.
+            actives = [s for s in self._sandboxes.values() if s.state != "deleting" and mine(s.api_key)]
+            tombs = [t for t in self._log_tombstones.values()
+                     if t.get("resources") is not None and mine(t.get("api_key"))]
 
         for sandbox in actives:
             if want and not all(sandbox.labels.get(k) == v for k, v in want.items()):
@@ -1436,7 +1461,7 @@ class InMemorySandboxProvider:
         snap_months = 0.0
         with self._lock:
             self._sweep_snapshots_locked()
-            snap_records = [rec for _, rec in self._snapshots.values()]
+            snap_records = [rec for sid, (_, rec) in self._snapshots.items() if self._snapshot_visible(sid)]
         for rec in snap_records:
             snap_months += api.snapshot_gib_months(rec.size_bytes, rec.ttl_seconds)
         snapshot_cost = self._pricing.cost_usd(snapshot_gib_months=snap_months)
