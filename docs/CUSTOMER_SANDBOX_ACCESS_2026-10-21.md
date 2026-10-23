@@ -95,7 +95,7 @@ The broker serves two kinds of hotel:
 | Type | Isolation | Notes |
 |---|---|---|
 | Standard room | **gVisor** (`runsc`) kernel intercept | Protects the hotel host from room workloads; the hotel operator can read room memory. |
-| Sealed room | **AMD SEV-SNP** hardware TEE (VM) | The hotel operator cannot read room memory; attestation binds the guest policy to the hardware measurement. Use `"sealed": true` or `hotel_labels: {"sealed": "true"}`. |
+| Sealed room | **AMD SEV-SNP** hardware TEE (VM) | The host cannot read the guest's memory or its disk. The attestation binds the receipt key to the measured guest. The operator still holds the hotel API key, so it can call the API like the broker does; each such call gets a signed receipt. Today the API traffic between the broker and the guest is plain HTTP on the host's link. Use `"sealed": true` or `hotel_labels: {"sealed": "true"}`. |
 
 Sealed hotels are identified by the `sealed: true` label in
 `GET /v1/broker/hotels`. A guest's sealed default can be set by the broker

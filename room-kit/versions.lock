@@ -9,11 +9,13 @@ PYTHON_VERSION=3.12
 CADDY_VERSION=2.11.4
 CADDY_URL=https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_amd64.tar.gz
 CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777ccc8fd0b6e6f2486ce3a33fe389fbb7db12d05baa474f4587509fb4f5ebf1c9
-# cathedral-sandbox commit d176394 (allowlist hostname:80/:443; network changes must name a mode;
-# process logs read without following a symlink; files API reaches /work only),
+# cathedral-sandbox commit 6701dda (allowlist hostname:80/:443; network changes must name a mode;
+# process logs read without following a symlink; files API reaches /work only and opens
+# each path component without following links; build context fetch checks every peer;
+# allowlists refuse private ranges; image refs cannot start with a dash),
 # made with:
-#   ./make-dist.sh d176394   (git archive of pyproject.toml and cathedral/)
-CATHEDRAL_COMMIT=d176394
-CATHEDRAL_TARBALL=dist/cathedral-d176394.tar.gz
-CATHEDRAL_TARBALL_SHA256=6676bcf50c51a0003d19835650afcfd6bdfa0b0fddf1080f928528df0a893830
+#   ./make-dist.sh 6701dda   (git archive of pyproject.toml and cathedral/)
+CATHEDRAL_COMMIT=6701dda
+CATHEDRAL_TARBALL=dist/cathedral-6701dda.tar.gz
+CATHEDRAL_TARBALL_SHA256=033e8807a51fa9c8b3fe07e19d6d4e7db1f701c4fa1b439c36a559a10743c262
 PROBE_IMAGE=alpine:3.20
