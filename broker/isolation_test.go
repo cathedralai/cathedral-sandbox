@@ -113,3 +113,23 @@ func TestCompatCreateWithoutNetworkIsDenyAll(t *testing.T) {
 		}
 	}
 }
+
+func TestNativeCreateWithoutNetworkIsDenyAll(t *testing.T) {
+	tc := newChain(t)
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"})
+	if status != 202 {
+		t.Fatalf("create: %d %v", status, doc)
+	}
+	if net, _ := tc.lastCreate(t)["network"].(map[string]any); net["mode"] != "deny_all" {
+		t.Fatalf("hotel network for a native create without a mode: %v", net)
+	}
+	// A native create that names its network keeps it.
+	body := map[string]any{"image": "alpine:3.20", "network": map[string]any{"mode": "internet", "allow": []any{}}}
+	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", body)
+	if status != 202 {
+		t.Fatalf("create internet: %d %v", status, doc)
+	}
+	if net, _ := tc.lastCreate(t)["network"].(map[string]any); net["mode"] != "internet" {
+		t.Fatalf("explicit internet became %v", net)
+	}
+}

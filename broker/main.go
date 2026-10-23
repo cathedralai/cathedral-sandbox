@@ -722,6 +722,11 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
 	}
+	// Same rule as the compat path: a create that names no network fails
+	// closed. Without this the hotel's own default (internet) applies.
+	if v, ok := payload["network"]; !ok || v == nil || v == "" {
+		payload["network"] = map[string]any{"mode": "deny_all", "allow": []any{}}
+	}
 	count := 1
 	if c, ok := payload["count"].(float64); ok {
 		count = int(c)
