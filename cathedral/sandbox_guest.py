@@ -2169,6 +2169,11 @@ class DockerGuestProvider:
             self._inner._images[ref] = entry  # noqa: SLF001
         return entry
 
+    def terminal_write(self, sandbox_id: str, terminal_id: str, data: str) -> dict[str, Any]:
+        # The inner provider keeps the terminal's buffers; each complete line
+        # runs through this provider's exec, in the room's container (B154).
+        return self._inner.terminal_write(sandbox_id, terminal_id, data, executor=self.exec)
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
