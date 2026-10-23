@@ -197,6 +197,13 @@ has a test that failed first. Graphs: docs/evidence/REVIEW_ROUND6_GRAPHS.html.
 | B138 | verify_receipts.py defaulted --hotel to a fixed name; the wrong hotel ended in an uncaught error | Yes | Fixed (required with --broker) | T |
 | B139 | Removing a sealed hotel left the link-check timer restoring the host link every minute | No | Fixed (condition on sealed.env; README) | S |
 | B140 | Customer and operator docs disagreed with the fixed code in 16 places (allowlist example, exec and file contracts per path, receipted calls, verifier flags, error codes, sealed selection, join body, kernel_isolation, network requirements) | Yes | Doc fixed | merge |
+| B141 | A hotel API started on the docker or kata runtime with an empty key store accepted any bearer token as its own tenant with the default quota. Latent: the kit always writes a key, but one typo in the unit file would have opened the hotel | Yes (latent) | Fixed (refuses to start, 503; a local override flag exists) | H, S |
+| B142 | A malformed key store entry was skipped without a word: an empty project name left the hotel with zero keys (401 for everyone, the broker too), a non-integer slot count meant unlimited | Yes | Fixed (refused at start) | H, S |
+| B143 | A malformed hotel quota value fell back to the 500 rooms / 1,000 vCPU / 3,000 GiB default with no log, so a sizing typo oversold the hotel | Yes (capacity) | Fixed (refused at start) | H, S |
+| B144 | The installer took the customer name unvalidated: empty closed the API for its own key, a comma or colon minted a second key | Yes (operator input) | Fixed (shape check before anything changes) | H |
+| B145 | The hotel API unit had no stop budget: stopping a full hotel removes every room's container and work directory, which outran the 90 s default and ended in SIGKILL mid-pass, leaving work directories on the data volume for good | Yes | Fixed (10 min stop budget; stale work directories swept at the next start) | H, S |
+| B146 | The installer's final check accepted any answer: a 401 printed "done" over a hotel that answered nobody | Yes (operator) | Fixed (needs a 200 with the hotel's own key, else the install fails) | H |
+| B147 | The B130 updater fix returned "alert" (12) where the fallback shim must pass the current updater's status through; the existing test caught it in CI, not locally (the suite subset run here did not include it) | No | Fixed (pass-through when the status pages, alert when it would be quiet) | miner host |
 
 Deploy stages are as above (B broker, H shared hotel reinstall, S sealed
 rebuild, T client tool; "miner host" is the Contabo SN94 miner, updated by

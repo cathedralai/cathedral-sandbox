@@ -403,11 +403,16 @@ def test_permissive_reference_mode_allows_supplied_bearer(provider: InMemorySand
 
 def test_parse_sandbox_keys_fields_and_revocation(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CATHEDRAL_SANDBOX_REVOKED_KEYS", "ck_dead")
-    keys = parse_sandbox_keys("ck_live:project-a:5, ck_dead:project-b, malformed, :nope")
+    keys = parse_sandbox_keys("ck_live:project-a:5, ck_dead:project-b")
     by_key = {k.key: k for k in keys}
     assert by_key["ck_live"].project == "project-a" and by_key["ck_live"].max_running == 5
     assert by_key["ck_dead"].revoked is True and by_key["ck_dead"].max_running is None
-    assert "malformed" not in by_key and "" not in by_key
+    # A malformed entry is refused, never skipped: skipping left a hotel with
+    # fewer keys than its operator believed (review round 6, B142).
+    for raw in ("ck_live:project-a:5, malformed", "ck_live:project-a:5, :nope"):
+        with pytest.raises(api.SandboxContractError) as ei:
+            parse_sandbox_keys(raw)
+        assert ei.value.code == "invalid_key_store"
 
 
 def test_env_revoked_key_blocks_and_quota_parses(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -424,13 +429,12 @@ def test_env_revoked_key_blocks_and_quota_parses(monkeypatch: pytest.MonkeyPatch
         p.close()
 
 
-def test_bad_quota_env_falls_back_to_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bad_quota_env_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Falling back to the defaults oversold a mis-sized hotel (review round 6, B143).
     monkeypatch.setenv("CATHEDRAL_SANDBOX_QUOTA", "not:a:valid-triple")
-    p = provider_from_environment()
-    try:
-        assert p.quota()["limits"]["running_sandboxes"] == api.MIN_RUNNING_SANDBOXES
-    finally:
-        p.close()
+    with pytest.raises(api.SandboxContractError) as ei:
+        provider_from_environment()
+    assert ei.value.code == "invalid_quota"
 
 
 # ------------------------------------------------------------------ §3.5 snapshot TTL + quota
