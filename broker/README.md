@@ -27,6 +27,14 @@ Room ids are `<hotel id>.<hotel room id>`. The broker adds the label
 - A create that waits longer than `max_queue_wait_seconds` (config, default
   10; -1 turns it off) for a create slot moves to another eligible hotel
   with a free room. If there is none, it keeps waiting.
+- A hotel whose host memory use is at or above `mem_full_pct` (config,
+  default 90; -1 turns it off) takes no new rooms. The value is the hotel
+  health value `host_mem_used_pct` (MemTotal minus MemAvailable, so page
+  cache does not count). Hotel slots come from an install-time sizing with
+  memory overcommit, so free slots alone cannot see rooms that use their
+  full memory limit. Such a hotel shows 0 free rooms, and the operator stats
+  show `mem_full: true`. When every eligible hotel is full this way, a
+  create gets 429 `no_free_rooms`.
 
 ## Hotel choice
 

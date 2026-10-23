@@ -1073,7 +1073,7 @@ func (b *broker) freeRoomsFor(g *guestState) int {
 		if !h.ok || !g.limits.allows(h.cfg.ID) {
 			continue
 		}
-		if f := h.slots - h.used(); f > 0 {
+		if f := b.freeFor(h); f > 0 {
 			free += f
 		}
 	}

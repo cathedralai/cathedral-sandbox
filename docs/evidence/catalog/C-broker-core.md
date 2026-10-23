@@ -24,7 +24,8 @@ tombs), `b.hset` (atomic pointer to the immutable hotel set), `h.lastAnswer`
 - `config`: listen (empty: Go binds ":http" on every interface), state_dir
   (empty: nothing persists, runtime join is 409), hotels, guests,
   insecure_cookie, max_exec_seconds (0: 14,400), max_queue_wait_seconds
-  (0: 10 s, <0: never move), operator_key_sha256 (empty: no operator routes).
+  (0: 10 s, <0: never move), mem_full_pct (0: 90, <0: no memory limit),
+  operator_key_sha256 (empty: no operator routes).
 - `loadBroker` 221-256: `json.Unmarshal` with no DisallowUnknownFields. Refuses:
   unreadable config, bad JSON, hotel id empty or with a dot, unreadable key
   file, duplicate hotel id. Accepts: unknown keys (dropped), duplicate guest
