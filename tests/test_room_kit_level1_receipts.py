@@ -130,6 +130,7 @@ def test_level1_chain_verifies_offline_without_snp(tmp_path, monkeypatch) -> Non
     assert out["chain"]["links_checked"] == 2
     assert out["chain"]["contiguous"] is True
     assert out["chain"]["first"] == 1 and out["chain"]["last"] == 2
+    assert out["checked"] == "whole chain to the head the server named"
 
 
 def test_tampered_level1_receipt_fails(tmp_path, monkeypatch) -> None:
@@ -286,7 +287,10 @@ def test_guest_filtered_chain_verifies(tmp_path, monkeypatch) -> None:
         "receipts": ledger.chain[1:],
     })
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert json.loads(proc.stdout)["verdict"] == "PASS"
+    out = json.loads(proc.stdout)
+    assert out["verdict"] == "PASS"
+    # The doc says it is filtered, so only each receipt was checked: say so.
+    assert out["checked"] == "each receipt; not that none are missing"
 
 
 def test_fetch_chain_pages_a_filtered_chain_by_raw_offset(monkeypatch) -> None:

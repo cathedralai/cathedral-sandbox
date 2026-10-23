@@ -294,6 +294,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def upstream(self, port: int, body: bytes | None):
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+        if self.command not in ("GET", "HEAD"):
+            # A write may have run before its answer was lost, so it is never
+            # sent twice: a fresh connection (no stale keep-alive) and no
+            # retry. A lost answer is a 502, and the receipt records it.
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=1800)
+            try:
+                c.request(self.command, self.path, body=body, headers=headers)
+                r = c.getresponse()
+                return r.status, r.getheaders(), r.read()
+            except (http.client.HTTPException, OSError):
+                return 502, [], b'{"error":{"code":"hotel_api_no_answer","message":"the API did not answer; the request may have run"}}'
+            finally:
+                c.close()
         for attempt in (1, 2):
             c = UP.conn(port)
             try:
@@ -307,6 +320,11 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- routes
     def handle_any(self):
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            # Only Content-Length bodies are read and signed; a chunked body
+            # would be signed as empty and its bytes left on the connection.
+            self.close_connection = True
+            return self.reply(411, b'{"error":"length_required"}')
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else (b"" if self.command in ("POST", "PUT", "PATCH") else None)
         path = urlsplit(self.path).path
@@ -317,7 +335,12 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return self.reply(401, b'{"error":"unauthorized"}')
             q = parse_qs(urlsplit(self.path).query)
-            after, limit = int(q.get("after", ["0"])[0]), min(int(q.get("limit", ["1000"])[0]), 10000)
+            try:
+                after, limit = int(q.get("after", ["0"])[0]), min(int(q.get("limit", ["1000"])[0]), 10000)
+            except ValueError:
+                after = limit = -1
+            if after < 0 or limit < 1:
+                return self.reply(400, b'{"error":"after must be >= 0 and limit >= 1"}')
             with ledger.lock:
                 page = ledger.chain[after:after + limit]
                 head = ledger.head

@@ -351,7 +351,11 @@ def main() -> int:
                                                  a.ark_sha256, a.skip_amd)
         out = {"attestation": attestation_out,
                "chain": verify_receipts(att, receipts, head),
-               "policy_timeline": policy_timeline(receipts), "verdict": "PASS"}
+               "policy_timeline": policy_timeline(receipts), "verdict": "PASS",
+               # head is named by the server, not signed: even a whole chain does
+               # not prove that nothing was cut from its end.
+               "checked": ("whole chain to the head the server named" if head is not None
+                           else "each receipt; not that none are missing")}
         print(json.dumps(out, indent=1))
         return 0
     except Fail as exc:
