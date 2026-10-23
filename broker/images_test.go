@@ -20,6 +20,7 @@ type fakeHotel struct {
 	t           *testing.T
 	mu          sync.Mutex
 	creates     []map[string]any
+	authFail    bool // answer creates 401, like a hotel whose API key changed
 	snaps       map[string]map[string]any // hotel snapshot id -> document
 	prefetch    []map[string]any
 	pushes      []map[string]any
@@ -53,6 +54,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.mu.Lock()
 		}
 		f.creates = append(f.creates, req)
+		if f.authFail {
+			writeErr(w, 401, "unauthorized", "bad hotel key")
+			return
+		}
 		if nw, ok := req["network"].(map[string]any); ok && nw["mode"] == "allowlist" {
 			if allow, _ := nw["allow"].([]any); len(allow) > 0 && allow[0] == "bad.example:9" {
 				writeErr(w, 400, "invalid_network_allowlist", "port 9 is not allowed")
@@ -611,5 +616,38 @@ func TestClientErrorDoesNotRestHotel(t *testing.T) {
 	status, doc = tc.call(t, "key2", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
 	if status != 202 {
 		t.Fatalf("next create after a client error: %d %v", status, doc)
+	}
+}
+
+// A hotel that rejects the broker's own key (401/403) is broken, not the
+// request: rest it so the next create goes to a working hotel.
+func TestHotelAuthErrorRestsHotel(t *testing.T) {
+	tc := newChain(t)
+	tc.hotels["b"].authFail = true
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	if status != 401 {
+		t.Fatalf("create on broken hotel: %d %v", status, doc)
+	}
+	tc.b.mu.Lock()
+	resting := time.Now().Before(tc.b.hotelByID("b").backoffUntil)
+	tc.b.mu.Unlock()
+	if !resting {
+		t.Fatalf("hotel answering 401 to the broker key is not rested")
+	}
+}
+
+// A guest's contract error (400) must not rest the hotel.
+func TestClientErrorLeavesHotelUnrested(t *testing.T) {
+	tc := newChain(t)
+	bad := map[string]any{"image": "alpine:3.20", "hotels": []string{"b"},
+		"network": map[string]any{"mode": "allowlist", "allow": []string{"bad.example:9"}}}
+	if status, _ := tc.call(t, "key1", "POST", "/v1/sandboxes", bad); status != 400 {
+		t.Fatalf("bad allowlist: %d", status)
+	}
+	tc.b.mu.Lock()
+	resting := time.Now().Before(tc.b.hotelByID("b").backoffUntil)
+	tc.b.mu.Unlock()
+	if resting {
+		t.Fatalf("a guest's 400 rested the hotel")
 	}
 }

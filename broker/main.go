@@ -521,10 +521,12 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 			// The hotel could not start the room (for example a full bridge).
 			// Rest it for a short time and try another hotel.
 			rm.state, rm.since = stFailed, tDone
-			// A 4xx means the request is wrong, not the hotel: resting the
-			// hotel would turn one guest's bad input into a 503 for the next
-			// create of every guest.
-			if err != nil || status >= 500 {
+			// A 4xx usually means the request is wrong, not the hotel:
+			// resting the hotel would turn one guest's bad input into a 503
+			// for the next create of every guest. 401 and 403 are the
+			// exception: the hotel rejects the broker's own key, so it is
+			// broken for every guest and must rest.
+			if err != nil || status >= 500 || status == 401 || status == 403 {
 				h.failed++
 				h.backoffUntil = time.Now().Add(hotelFailBackoff)
 			}
