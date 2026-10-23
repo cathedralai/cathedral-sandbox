@@ -18,7 +18,7 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # terminal lines run through the runtime's exec),
 # made with:
 #   ./make-dist.sh b1739d0   (git archive of pyproject.toml and cathedral/)
-CATHEDRAL_COMMIT=b1739d0
-CATHEDRAL_TARBALL=dist/cathedral-b1739d0.tar.gz
-CATHEDRAL_TARBALL_SHA256=7f4ad4ed71d13a2586fe4b1ff549fdac4b93eb92ff8f8a5d169273b5db5d043d
+CATHEDRAL_COMMIT=d53b3af
+CATHEDRAL_TARBALL=dist/cathedral-d53b3af.tar.gz
+CATHEDRAL_TARBALL_SHA256=c90ddf1c280a0bad68c7fcceaf1c0cba41a17f12125c0011b47277e06b3fa189
 PROBE_IMAGE=alpine:3.20
