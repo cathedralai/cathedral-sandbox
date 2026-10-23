@@ -472,7 +472,11 @@ class SandboxApplication:
     # ------------------------------------------------------------------ §3.7 network / expose
     def set_network(self, *, id, body, **_):
         payload = self._json(body)
-        patch = NetworkPatch(mode=payload.get("mode", "public"), allow=_allow_list(payload.get("allow")))
+        # A change must name its mode: defaulting a missing mode to "public"
+        # would turn a malformed change into full internet access.
+        if not isinstance(payload.get("mode"), str):
+            raise api.SandboxContractError("invalid_network_mode", "network change needs a mode: internet, deny_all or allowlist")
+        patch = NetworkPatch(mode=payload["mode"], allow=_allow_list(payload.get("allow")))
         return Response.json(200, self.provider.set_network(id, patch))
 
     def expose(self, *, id, body, **_):

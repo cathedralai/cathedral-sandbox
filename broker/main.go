@@ -526,7 +526,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 			// for the next create of every guest. 401 and 403 are the
 			// exception: the hotel rejects the broker's own key, so it is
 			// broken for every guest and must rest.
-			if err != nil || status >= 500 || status == 401 || status == 403 {
+			// image_pull_failed (502) is the guest's image, not the hotel.
+			guestImage := status == 502 && errCodeOf(out) == "image_pull_failed"
+			if err != nil || (status >= 500 && !guestImage) || status == 401 || status == 403 {
 				h.failed++
 				h.backoffUntil = time.Now().Add(hotelFailBackoff)
 			}
@@ -535,7 +537,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 			} else {
 				last = createResult{status: status, body: out, header: http.Header{"X-Broker-Hotel": {h.cfg.ID}}}
 			}
-			if status >= 400 && status < 500 { // the request itself is wrong: no retry
+			if (status >= 400 && status < 500) || guestImage { // the request itself is wrong: no retry
 				g.failed++
 				b.mu.Unlock()
 				return last
@@ -745,13 +747,20 @@ func (b *broker) handleHotelDoc(w http.ResponseWriter, r *http.Request, rest str
 		writeErr(w, 404, "route_not_found", "no such hotel document")
 		return
 	}
+	// The receipt chain of a hotel outside the guest's list (for example one
+	// dedicated to another guest) is not this guest's, ops included. The
+	// attestation stays public: it proves the machine, not anyone's work.
+	if doc == "receipts" && !g.limitsAllow(b, h.cfg.ID) {
+		writeErr(w, 404, "route_not_found", "no such hotel document")
+		return
+	}
 	status, hdr, out, err := h.doBase(r.Context(), h.cfg.Health, "GET", "/room/"+doc, r.URL.Query(), nil, time.Minute)
 	if err != nil {
 		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
 		return
 	}
 	if doc == "receipts" && status == 200 && !g.cfg.Ops {
-		filtered, ferr := filterHotelReceipts(out, b.guestRoomIDs(g.cfg.ID, h.cfg.ID))
+		filtered, ferr := filterHotelReceiptsFor(out, b.guestRoomIDs(g.cfg.ID, h.cfg.ID), g.cfg.ID)
 		if ferr != nil {
 			writeErr(w, 502, "receipts_unreadable", "hotel receipt chain could not be filtered")
 			return
@@ -886,6 +895,9 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
+		if !g.limitsAllow(b, h.cfg.ID) { // a guest has no rooms outside its list
+			continue
+		}
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
@@ -1388,4 +1400,15 @@ func main() {
 	srv := &http.Server{Addr: b.cfg.Listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("central booking on %s: %d hotels, %d guests", b.cfg.Listen, len(b.hotelList()), len(b.guests))
 	log.Fatal(srv.ListenAndServe())
+}
+
+// errCodeOf reads error.code from a hotel's JSON error body.
+func errCodeOf(body []byte) string {
+	var doc struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(body, &doc)
+	return doc.Error.Code
 }

@@ -285,6 +285,9 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 	// Warm every hotel in the background; a create pulls a missing image anyway.
 	pf, _ := json.Marshal(map[string]any{"images": []string{img.Ref}})
 	for _, ht := range b.hotelList() {
+		if !g.limitsAllow(b, ht.cfg.ID) { // never touch a hotel outside the guest's list
+			continue
+		}
 		go func(ht *hotel) {
 			_, _, _, _ = ht.do(context.Background(), "POST", "/v1/images/prefetch", nil, pf, 10*time.Minute)
 		}(ht)

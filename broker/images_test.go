@@ -20,7 +20,8 @@ type fakeHotel struct {
 	t           *testing.T
 	mu          sync.Mutex
 	creates     []map[string]any
-	authFail    bool // answer creates 401, like a hotel whose API key changed
+	authFail    bool                      // answer creates 401, like a hotel whose API key changed
+	calls       []string                  // "METHOD /path?query" of every request
 	snaps       map[string]map[string]any // hotel snapshot id -> document
 	prefetch    []map[string]any
 	pushes      []map[string]any
@@ -45,6 +46,7 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.calls = append(f.calls, r.Method+" "+r.URL.RequestURI())
 	switch {
 	case p == "/v1/sandboxes" && r.Method == "POST":
 		if f.createDelay > 0 {
@@ -54,6 +56,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.mu.Lock()
 		}
 		f.creates = append(f.creates, req)
+		if req["image"] == "nosuch/x:1" {
+			writeErr(w, 502, "image_pull_failed", "pull access denied")
+			return
+		}
 		if f.authFail {
 			writeErr(w, 401, "unauthorized", "bad hotel key")
 			return
@@ -649,5 +655,56 @@ func TestClientErrorLeavesHotelUnrested(t *testing.T) {
 	tc.b.mu.Unlock()
 	if resting {
 		t.Fatalf("a guest's 400 rested the hotel")
+	}
+}
+
+func callsTo(f *fakeHotel, prefix string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// An image the guest names wrongly is the guest's error: it must not rest
+// the hotel for every other guest.
+func TestImagePullFailureDoesNotRestHotel(t *testing.T) {
+	tc := newChain(t)
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "nosuch/x:1", "hotels": []string{"b"}})
+	if status != 502 || errCode(doc) != "image_pull_failed" {
+		t.Fatalf("bad image: %d %v", status, doc)
+	}
+	tc.b.mu.Lock()
+	resting := time.Now().Before(tc.b.hotelByID("b").backoffUntil)
+	tc.b.mu.Unlock()
+	if resting {
+		t.Fatalf("a guest's unpullable image rested the hotel")
+	}
+}
+
+// Bulk delete only reaches the guest's own hotels.
+func TestBulkDeleteKeepsToGuestHotels(t *testing.T) {
+	tc := limitedChain(t, guestLimits{Hotels: []string{"b", "c"}})
+	tc.call(t, "key1", "DELETE", "/v1/sandboxes?label=job%3Dx", nil)
+	if n := callsTo(tc.hotels["a"], "DELETE /v1/sandboxes"); n != 0 {
+		t.Fatalf("bulk delete reached hotel a outside the guest's list (%d)", n)
+	}
+	if callsTo(tc.hotels["b"], "DELETE /v1/sandboxes") == 0 {
+		t.Fatalf("bulk delete did not reach an allowed hotel")
+	}
+}
+
+// A guest reads receipts only of hotels in its list, ops included: a
+// dedicated hotel's chain belongs to its guest.
+func TestReceiptsOfHotelOutsideListAre404(t *testing.T) {
+	tc := limitedChain(t, guestLimits{Hotels: []string{"b", "c"}})
+	tc.b.guests["g1"].cfg.Ops = true
+	tc.hotels["a"].receipts = []byte(`{"receipts":[],"count":0}`)
+	if status, doc := tc.call(t, "key1", "GET", "/v1/hotels/a/receipts", nil); status != 404 {
+		t.Fatalf("receipts of a hotel outside the list: %d %v", status, doc)
 	}
 }

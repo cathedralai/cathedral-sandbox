@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"strings"
 )
 
 // rememberGuestRoom records a hotel-local room id for a guest. The hotel
@@ -58,6 +60,14 @@ func (b *broker) guestRoomIDs(guest, hotel string) map[string]bool {
 // image. previous_receipt_sha256 is left as the hotel signed it, even when it
 // points at a receipt this response left out.
 func filterHotelReceipts(body []byte, owned map[string]bool) ([]byte, error) {
+	return filterHotelReceiptsFor(body, owned, "")
+}
+
+// filterHotelReceiptsFor is filterHotelReceipts that also keeps the guest's
+// own bulk deletes. A bulk delete is signed with no sandbox id; the broker
+// appends its broker_guest label last, and the hotel applies the last value
+// of a repeated label, so the last broker_guest label names the guest.
+func filterHotelReceiptsFor(body []byte, owned map[string]bool, guest string) ([]byte, error) {
 	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return nil, err
@@ -76,7 +86,7 @@ func filterHotelReceipts(body []byte, owned map[string]bool) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if keep && owned[id] {
+		if (keep && owned[id]) || (guest != "" && bulkDeleteGuest(rec) == guest) {
 			kept = append(kept, rec)
 		}
 	}
@@ -116,4 +126,34 @@ func marshalRaw(v any) (json.RawMessage, error) {
 		return nil, err
 	}
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// bulkDeleteGuest returns the guest a bulk_delete receipt belongs to: the
+// last broker_guest label in its signed target, or "".
+func bulkDeleteGuest(raw json.RawMessage) string {
+	var rec struct {
+		Statement struct {
+			Action string `json:"action"`
+			Target string `json:"target"`
+		} `json:"statement"`
+	}
+	if json.Unmarshal(raw, &rec) != nil || rec.Statement.Action != "bulk_delete" {
+		return ""
+	}
+	_, rawURL, _ := strings.Cut(rec.Statement.Target, " ")
+	_, query, ok := strings.Cut(rawURL, "?")
+	if !ok {
+		return ""
+	}
+	vals, err := url.ParseQuery(query)
+	if err != nil {
+		return ""
+	}
+	guest := ""
+	for _, l := range vals["label"] {
+		if k, v, ok := strings.Cut(l, "="); ok && k == guestLabel {
+			guest = v
+		}
+	}
+	return guest
 }

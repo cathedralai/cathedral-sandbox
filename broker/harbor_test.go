@@ -206,3 +206,19 @@ func TestIdempotentCreateSurvivesABrokerRestart(t *testing.T) {
 		t.Fatalf("image after restart: %v", view)
 	}
 }
+
+// Harbor image import warms only the guest's own hotels.
+func TestCompatImportKeepsToGuestHotels(t *testing.T) {
+	tc := newChain(t)
+	tc.b.mu.Lock()
+	tc.b.guests["g1"].limits = guestLimits{Hotels: []string{"b", "c"}}
+	tc.b.mu.Unlock()
+	status, doc := tc.clientCall(t, "POST", "/v1/images/import", mustMarshal(map[string]any{"image": "alpine:3.20"}), nil)
+	if status != 200 {
+		t.Fatalf("import: %d %v", status, doc)
+	}
+	time.Sleep(200 * time.Millisecond) // prefetch runs in the background
+	if n := callsTo(tc.hotels["a"], "POST /v1/images/prefetch"); n != 0 {
+		t.Fatalf("import warmed hotel a outside the guest's list")
+	}
+}
