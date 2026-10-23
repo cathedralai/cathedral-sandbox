@@ -840,10 +840,62 @@ def _registry_host(image: str) -> str:
     return "https://index.docker.io/v1/"
 
 
+def _public_ip(raw: str) -> bool:
+    import ipaddress
+
+    try:
+        ip = ipaddress.ip_address(raw.split("%", 1)[0])
+    except ValueError:
+        return False
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _checked_opener() -> urllib.request.OpenerDirector:
+    """An opener that refuses a connection whose peer is not a public address.
+
+    A name check before the fetch is not enough: urlopen resolves the name
+    again (DNS rebinding) and follows redirects to any host. The check runs on
+    the socket each hop actually connected to.
+    """
+    import http.client
+
+    def check(sock) -> None:
+        peer = sock.getpeername()[0]
+        if not _public_ip(peer):
+            sock.close()
+            raise SandboxOpError("build_context_forbidden", 400, "build context URL reaches a non-public address")
+
+    class CheckedHTTP(http.client.HTTPConnection):
+        def connect(self) -> None:
+            super().connect()
+            check(self.sock)
+
+    class CheckedHTTPS(http.client.HTTPSConnection):
+        def connect(self) -> None:
+            super().connect()
+            check(self.sock)
+
+    class HTTP(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(CheckedHTTP, req)
+
+    class HTTPS(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(CheckedHTTPS, req, context=self._context)
+
+    return urllib.request.build_opener(HTTP, HTTPS)
+
+
 def _fetch_context_tar(url: str) -> bytes:
     """Fetch a build context. Fail closed against file:// and link-local/private SSRF."""
     from urllib.parse import urlparse
-    import ipaddress
     import socket
 
     parsed = urlparse(url)
@@ -871,27 +923,15 @@ def _fetch_context_tar(url: str) -> bytes:
             502,
             f"failed to resolve build context host: {exc}",
         ) from exc
-    for info in addrs:
-        raw = info[4][0]
-        try:
-            ip = ipaddress.ip_address(raw)
-        except ValueError:
-            continue
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_reserved
-            or ip.is_multicast
-            or ip.is_unspecified
-        ):
-            raise SandboxOpError(
-                "build_context_forbidden",
-                400,
-                "build context URL resolves to a non-public address",
-            )
+    # Early, clear refusal; the opener checks the real peer on every hop.
+    if any(not _public_ip(info[4][0]) for info in addrs):
+        raise SandboxOpError(
+            "build_context_forbidden",
+            400,
+            "build context URL resolves to a non-public address",
+        )
     try:
-        with urllib.request.urlopen(url, timeout=120) as resp:  # noqa: S310 — gated above
+        with _checked_opener().open(url, timeout=120) as resp:  # noqa: S310 — peer checked per hop
             return resp.read()
     except (urllib.error.URLError, OSError) as exc:
         raise SandboxOpError(
