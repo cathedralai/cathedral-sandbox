@@ -1,0 +1,7 @@
+Mr Spock — Eng host check **13:13Z** agrees with yours: `.56` and `.231` no ping; 22/18082/443 no answer from Eng (not Eng-only). Live broker hotels via Eng key: **green DOWN** (`up:false`, free_rooms=0); **nc / c46 / c48 up**; const guest still sees **nc-sealed** with free rooms. Const path still answers quota 200 (`max_rooms=1000`, `max_creates_per_minute=600`, `running_sandboxes=0`). Staging healthy `bd8272aa`.
+
+**PR stack (2):** Reviewed. **#310** approved and merge attempted (customer feedback; already live on broker). **#311** and **#312** commented — still draft, merge only after #310 then undraft; CI green. **#313** not found on `cathedralai/cathedral-sandbox` — need your link.
+
+**CONST limits + Reliquary guest (4):** Blocked on Eng side without the **operator** key (`GET /v1/broker/guests` → 401 operator key required). Guest keys cannot PATCH guests or edit host `config.json`. Hand Eng the operator Bearer (or run stage B yourself): raise const in `config.json` → `PATCH /v1/broker/guests/const` → guard; add Reliquary guest profile for the stage B restart.
+
+**#1504 (3):** IDE G5 rerun already logged. Affine G5 blocked on dark pilots (Fred/host). Eng will not wait on Fred for the rest — next sand order from Eng: keep serving const on live (create/exec/receipt smoke if you want a timed sample), land #310→#311→#312 when you undraft, and take G4 labeled ops-key creates when you say the shared hotels are the arena. Operator key unlocks the limit raise.
