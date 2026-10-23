@@ -91,6 +91,15 @@ not include the other guest's room id, image name, or target path. Receipts
 still omit commands, files, and outputs. One room's own receipts are
 `GET /v1/sandboxes/<id>/receipts`.
 
+Only sealed hotels answer these two routes. On a shared (unsealed) hotel
+both answer 404. The broker sends a shared hotel's writes straight to its
+API port, so the room kit's receipt service (127.0.0.1:18092) never sees a
+broker room. The broker reads `/room/receipts` from the hotel's `health`
+base, and on a shared hotel that is room_health, which does not serve the
+chain. Routing reads alone through 18092 would return an empty chain; a
+fix must send writes there too. Until then, signed receipts come from
+sealed hotels only.
+
 ## Room network policy
 
 A create takes `"network": {"mode": "internet" | "deny_all" | "allowlist", "allow": [...]}`.
