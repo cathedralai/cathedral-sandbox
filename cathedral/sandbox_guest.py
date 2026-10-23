@@ -589,9 +589,13 @@ class DockerClient:
             return {}
 
     def build(self, *, tag: str, context_dir: Path, dockerfile_name: str = "Dockerfile") -> None:
+        # The classic builder, not BuildKit: BuildKit runs RUN steps in its
+        # own runc worker and ignores the daemon's default runtime, so a
+        # build's commands ran on the host kernel while rooms ran under gVisor.
         result = self.run(
             ["docker", "build", "-t", tag, "-f", str(context_dir / dockerfile_name), str(context_dir)],
             timeout=900.0,
+            env={"DOCKER_BUILDKIT": "0"},
         )
         if result.returncode != 0:
             raise SandboxOpError(

@@ -222,3 +222,25 @@ def test_credentialed_pulls_are_remembered_across_a_restart(fake, tmp_path) -> N
         assert "registry.example.com/acme/private:v1" in second._auth_pulled  # noqa: SLF001
     finally:
         second.close()
+
+
+def test_builds_use_the_room_daemon_default_runtime(fake, monkeypatch) -> None:
+    # BuildKit runs RUN steps with its own runc worker and ignores the daemon's
+    # default runtime: on a live hotel a build's RUN saw the host kernel while
+    # the room saw gVisor's. The classic builder honours default-runtime.
+    seen = {}
+    original = DockerClient.run
+
+    def spy(self, argv, **kw):
+        if argv[:2] == ["docker", "build"]:
+            seen["env"] = kw.get("env") or {}
+        return original(self, argv, **kw)
+
+    monkeypatch.setattr(DockerClient, "run", spy)
+    import tempfile
+    from pathlib import Path
+
+    work = Path(tempfile.mkdtemp())
+    (work / "Dockerfile").write_text("FROM alpine:3.20\n")
+    DockerClient().build(tag="cathedral-build-test:latest", context_dir=work)
+    assert seen["env"].get("DOCKER_BUILDKIT") == "0"

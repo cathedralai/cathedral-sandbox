@@ -108,6 +108,11 @@ operator via `PATCH /v1/broker/guests/<id>` (`"default_sealed": true`).
 
 ## Receipt chain (`GET /v1/hotels/<id>/receipts`)
 
+Receipts come from hotels installed with the receipts front: every sealed
+hotel, and an unsealed hotel only when its operator turned receipts on. A
+hotel without one answers `404 not_found` on this route, and rooms there get
+no `X-Room-Receipt` header. Ask which of your hotels carry receipts.
+
 The receipt chain is **per-hotel, per-boot**. After a broker restart, the
 guest→room mapping is **persisted** in `state_dir/client-state.json`, so
 `GET /v1/hotels/<id>/receipts` continues to filter correctly (only the
