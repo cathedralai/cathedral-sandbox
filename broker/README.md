@@ -96,7 +96,33 @@ Clients (Harbor plugin, ctcli) send `"network": "allowlist"` with
 `"network_allow": [...]`, and the same PUT with `{"mode", "allow"}`. The
 catalog shows `dynamic_network_policy: true` and the entry types in
 `network_allowlist`. Client `deny_all` and `none` both become hotel
-`deny_all`: the room keeps an interface, so it can switch later.
+`deny_all`: the room keeps an interface, so it can switch later. A client
+create that names no network fails closed to `deny_all`; egress is asked
+for with `"network": "internet"` (or an allowlist), never granted by an
+omitted field. A live change must always name its mode (400 otherwise).
+
+## What a room answer says about isolation
+
+Every room document the broker returns (create, get, list, on the native
+and the client routes) carries an `isolation` object:
+
+```json
+"isolation": {
+  "hotel_sealed": true,
+  "hotel_tee": "amd_sev_snp",
+  "room_runtime": "runsc",
+  "attested_per_room": false,
+  "network_mode": "deny_all",
+  "attestation_of_host": "/v1/hotels/nc-sealed/attestation"
+}
+```
+
+`hotel_sealed` is true when the room's hotel is a sealed (SEV-SNP) guest;
+`hotel_tee` is the TEE kind, or null on an unsealed hotel. `room_runtime` is
+what the hotel reports (`runsc`, `docker`, `kata`). `attested_per_room` is
+always false: a TEE covers the hotel VM, rooms on it are separated by the
+room runtime, and the hotel's attestation is at `attestation_of_host`. A
+guest reads the level from this object, never from the hotel id.
 
 ## Snapshots and forks
 

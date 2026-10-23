@@ -516,6 +516,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, tRec
 			g.recent = append(g.recent, tDone)
 			doc["id"] = rm.id
 			doc["hotel"] = h.cfg.ID
+			doc["isolation"] = isolationDoc(h, doc)
 			if pl.snapshotRef != "" {
 				doc["snapshot_id"] = pl.snapshotRef
 			}
@@ -866,6 +867,17 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	if strings.HasPrefix(hdr.Get("Content-Type"), "application/json") && tail != "receipts" {
 		out = bytes.ReplaceAll(out, []byte(`"`+hid+`"`), []byte(`"`+bid+`"`))
 		w.Header().Del("Content-Length")
+		// The room document itself says what its placement isolates.
+		if r.Method == "GET" && tail == "" && status == 200 {
+			var doc map[string]any
+			if json.Unmarshal(out, &doc) == nil {
+				doc["hotel"] = h.cfg.ID
+				doc["isolation"] = isolationDoc(h, doc)
+				if re, err := json.Marshal(doc); err == nil {
+					out = re
+				}
+			}
+		}
 	}
 	w.WriteHeader(status)
 	_, _ = w.Write(out)
@@ -969,6 +981,9 @@ func (b *broker) handleList(w http.ResponseWriter, r *http.Request, g *guestStat
 				s["id"] = hid + "." + id
 			}
 			s["hotel"] = hid
+			if h := b.hotelByID(hid); h != nil {
+				s["isolation"] = isolationDoc(h, s)
+			}
 			all = append(all, s)
 		}
 	}
