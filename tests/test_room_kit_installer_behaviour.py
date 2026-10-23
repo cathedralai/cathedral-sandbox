@@ -467,12 +467,14 @@ def test_a_download_with_the_wrong_checksum_is_refused_and_nothing_starts(host: 
 
 def test_a_corrupt_pinned_tarball_leaves_the_running_api_source_alone(host: FakeHost) -> None:
     _clean_install(host)
-    assert (host.opt / "src" / "COMMIT").read_text().strip() == "99e0cc2"
     lock = host.kit / "versions.lock"
+    # The pin moves with every hotel API release; read it rather than repeat it.
+    pinned = re.search(r"^CATHEDRAL_COMMIT=(\S+)$", lock.read_text(), flags=re.M).group(1)
+    assert (host.opt / "src" / "COMMIT").read_text().strip() == pinned
     lock.write_text(re.sub(r"^CATHEDRAL_TARBALL_SHA256=.*$", "CATHEDRAL_TARBALL_SHA256=" + "0" * 64, lock.read_text(), flags=re.M))
     proc = host.install(str(host.room_env()))
     assert proc.returncode != 0
-    assert (host.opt / "src" / "COMMIT").read_text().strip() == "99e0cc2"
+    assert (host.opt / "src" / "COMMIT").read_text().strip() == pinned
     assert (host.opt / "src" / "cathedral" / "__init__.py").exists()
     assert not (host.opt / "src.new").exists()
     assert not any("restart" in c for c in host.calls("systemctl")), host.calls("systemctl")
