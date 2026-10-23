@@ -38,7 +38,23 @@ SN94 weight-writing path.
 You earn SN94 emission (alpha) through validator weights. Weight does not
 guarantee emission: the subnet needs positive emission.
 
-Founding-miner terms: to be published.
+## Founding miners
+
+Cathedral admits a small group of operators first. Apply with the
+[Founding Miner Application](https://docs.google.com/forms/d/e/1FAIpQLScxnX15Hb70AnkeZcHBI53cv_yN7aen4_h95njQvMzBxBiMpQ/viewform).
+Cathedral answers every application within 48 hours.
+
+The application asks for:
+
+- your company, a contact name and role, and a Telegram or Discord handle;
+- your machines: how many, where they are, whether you own, colocate or rent
+  them, their specs, and whether they are AMD SEV-SNP or Intel TDX capable.
+  Attested hardware is required to earn emission;
+- your SOC 2 status;
+- the capacity you can commit, and your agreement never to access, copy or
+  interfere with customer workloads or data.
+
+After Cathedral accepts you, set up each machine with the steps below.
 
 ## Current support
 

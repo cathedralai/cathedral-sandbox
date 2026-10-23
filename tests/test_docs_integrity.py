@@ -37,7 +37,7 @@ def test_mining_guide_is_the_single_current_operator_path() -> None:
         # and are gone from the guide. SN39 is legacy.
         "Cathedral runs on SN94; SN39 is legacy",
         "This repository records no SN94 mainnet admission",
-        "Founding-miner terms: to be published",
+        "Founding Miner Application",
         "btcli subnets register --netuid 94 --network finney",
         # The TDX image stays in the legacy section.
         "7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b",
