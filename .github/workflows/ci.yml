@@ -90,7 +90,7 @@ jobs:
         env:
           GOTOOLCHAIN: local
         run: |
-          test "$(go env GOVERSION)" = go1.26.9
+          test "$(go env GOVERSION)" = go1.26.10
           go mod verify
           go vet ./...
           go test -race ./...
