@@ -21,6 +21,7 @@ type fakeHotel struct {
 	mu          sync.Mutex
 	creates     []map[string]any
 	authFail    bool                      // answer creates 401, like a hotel whose API key changed
+	pullOutage  bool                      // answer creates 502 image_pull_failed for a registry outage
 	calls       []string                  // "METHOD /path?query" of every request
 	snaps       map[string]map[string]any // hotel snapshot id -> document
 	prefetch    []map[string]any
@@ -57,7 +58,11 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.creates = append(f.creates, req)
 		if req["image"] == "nosuch/x:1" {
-			writeErr(w, 502, "image_pull_failed", "pull access denied")
+			writeErr(w, 502, "image_pull_failed", "docker pull failed for nosuch/x:1: Error response from daemon: pull access denied for nosuch/x, repository does not exist")
+			return
+		}
+		if f.pullOutage {
+			writeErr(w, 502, "image_pull_failed", "docker pull failed for alpine:3.20: Error response from daemon: Get \"https://registry-1.docker.io/v2/\": dial tcp: lookup registry-1.docker.io: no such host")
 			return
 		}
 		if f.authFail {
@@ -706,5 +711,30 @@ func TestReceiptsOfHotelOutsideListAre404(t *testing.T) {
 	tc.hotels["a"].receipts = []byte(`{"receipts":[],"count":0}`)
 	if status, doc := tc.call(t, "key1", "GET", "/v1/hotels/a/receipts", nil); status != 404 {
 		t.Fatalf("receipts of a hotel outside the list: %d %v", status, doc)
+	}
+}
+
+// A hotel that cannot reach the registry is the hotel's fault: rest it and
+// place the create on another hotel.
+func TestRegistryOutageRestsHotelAndRetries(t *testing.T) {
+	tc := newChain(t)
+	tc.hotels["b"].pullOutage = true
+	tc.hotels["c"].pullOutage = false
+	tc.b.mu.Lock()
+	tc.b.hotelByID("c").slots = 1 // prefer b first
+	tc.b.mu.Unlock()
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	if status != 502 {
+		t.Fatalf("outage on the only hotel: %d %v", status, doc)
+	}
+	tc.b.mu.Lock()
+	resting := time.Now().Before(tc.b.hotelByID("b").backoffUntil)
+	tc.b.mu.Unlock()
+	if !resting {
+		t.Fatalf("a hotel that cannot reach the registry is not rested")
+	}
+	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}})
+	if status != 202 || doc["hotel"] != "c" {
+		t.Fatalf("create did not move to a working hotel: %d %v", status, doc)
 	}
 }

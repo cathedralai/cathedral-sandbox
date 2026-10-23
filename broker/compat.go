@@ -495,6 +495,13 @@ func (b *broker) compatSetNetwork(w http.ResponseWriter, r *http.Request, rm *ro
 	if allow == nil {
 		allow = req["network_allow"]
 	}
+	// A live change must name its mode. compatNetwork defaults a missing
+	// mode to internet, which is right for a create but would turn a
+	// malformed change into full internet access.
+	if m, _ := req["mode"].(string); m == "" {
+		compatErr(w, 400, "invalid_network_mode", "network change needs a mode: internet, deny_all or allowlist", 0)
+		return
+	}
 	net, nerr := compatNetwork(req["mode"], allow)
 	if nerr != nil {
 		compatErr(w, 400, nerr.code, nerr.msg, 0)

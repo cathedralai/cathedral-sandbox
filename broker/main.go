@@ -526,8 +526,11 @@ func (b *broker) createOne(ctx context.Context, g *guestState, payload map[strin
 			// for the next create of every guest. 401 and 403 are the
 			// exception: the hotel rejects the broker's own key, so it is
 			// broken for every guest and must rest.
-			// image_pull_failed (502) is the guest's image, not the hotel.
-			guestImage := status == 502 && errCodeOf(out) == "image_pull_failed"
+			// image_pull_failed (502) is the guest's error only when the
+			// registry says the image is missing or denied; a hotel that
+			// cannot reach the registry (DNS, network, rate limit, disk) is
+			// at fault and must rest so the create moves on.
+			guestImage := status == 502 && errCodeOf(out) == "image_pull_failed" && guestImageFault(out)
 			if err != nil || (status >= 500 && !guestImage) || status == 401 || status == 403 {
 				h.failed++
 				h.backoffUntil = time.Now().Add(hotelFailBackoff)
@@ -1411,4 +1414,22 @@ func errCodeOf(body []byte) string {
 	}
 	_ = json.Unmarshal(body, &doc)
 	return doc.Error.Code
+}
+
+// guestImageFault reports whether a hotel's image_pull_failed message names
+// a missing or denied image (the guest's error) rather than a hotel fault.
+func guestImageFault(body []byte) bool {
+	var doc struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(body, &doc)
+	m := strings.ToLower(doc.Error.Message)
+	for _, s := range []string{"manifest unknown", "not found", "pull access denied", "repository does not exist", "invalid reference format", "unauthorized"} {
+		if strings.Contains(m, s) {
+			return true
+		}
+	}
+	return false
 }

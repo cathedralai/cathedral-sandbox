@@ -222,3 +222,21 @@ func TestCompatImportKeepsToGuestHotels(t *testing.T) {
 		t.Fatalf("import warmed hotel a outside the guest's list")
 	}
 }
+
+// A live network change on the Harbor path must name its mode; a missing
+// mode must not open the room to the internet.
+func TestCompatNetworkChangeNeedsMode(t *testing.T) {
+	tc := newChain(t)
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image": "alpine:3.20", "network": "deny_all"}), nil)
+	if status != 200 && status != 201 && status != 202 {
+		t.Fatalf("create: %d %v", status, doc)
+	}
+	id, _ := doc["sandbox_id"].(string)
+	if id == "" {
+		id, _ = doc["id"].(string)
+	}
+	status, doc = tc.clientCall(t, "PUT", "/v1/sandboxes/"+id+"/network", mustMarshal(map[string]any{"network_allow": []string{"pypi.org"}}), nil)
+	if status != 400 {
+		t.Fatalf("network change without mode: %d %v", status, doc)
+	}
+}
