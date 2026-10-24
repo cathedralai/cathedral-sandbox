@@ -21,6 +21,7 @@ from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 from cathedral.tee_box.egress import EgressPolicy
+from cathedral.tee_box.tunables import TUNABLE_FLAG_PREFIXES, Tunables, default_tunables
 
 MAX_OUTPUT_BYTES = 1024 * 1024
 MAX_FILE_BYTES = 8 * 1024 * 1024
@@ -39,6 +40,8 @@ FINISHED_RETENTION_SECONDS = 600.0
 SANDBOX_PREFIX = "cathsbx-"
 BOX_LABEL = "org.cathedral.tee-box.box"
 SANDBOX_LABEL = "org.cathedral.tee-box.sandbox"
+WARM_LABEL = "org.cathedral.tee-box.warm"
+WARM_PREFIX = "cathwarm-"
 # How long a container name from a create that timed out stays pending
 # cleanup: the daemon may still create it after the CLI was killed.
 PENDING_CLEANUP_GRACE_SECONDS = 300.0
@@ -140,6 +143,8 @@ class SandboxSpec:
     expires_at: float
     env: Mapping[str, str] = field(default_factory=dict)
     labels: Mapping[str, str] = field(default_factory=dict)
+    # Name of a warm container the service reserved for this sandbox (``reserve_warm``).
+    warm: str = ""
 
 
 @dataclass(frozen=True)
@@ -592,6 +597,17 @@ _KILL_SCRIPT = (
 )
 
 
+@dataclass(frozen=True)
+class _WarmContainer:
+    name: str
+    digest: str
+    started_at: float
+
+
+def _spawn_thread(work: Callable[[], None]) -> None:
+    threading.Thread(target=work, daemon=True).start()
+
+
 class RunscExecutor(_Table):
     """Drive sandboxes through ``docker --runtime=runsc`` (gVisor, systrap).
 
@@ -638,6 +654,9 @@ class RunscExecutor(_Table):
         control_timeout: float = 120.0,
         kill_timeout: float = KILL_TIMEOUT_SECONDS,
         box_id: str = "default",
+        tunables: Tunables | None = None,
+        warm_shape: Shape | None = None,
+        spawn: Callable[[Callable[[], None]], None] | None = None,
     ) -> None:
         super().__init__(clock)
         if not isinstance(egress, EgressPolicy):
@@ -661,6 +680,15 @@ class RunscExecutor(_Table):
         self._pull_timeout = pull_timeout
         self._control_timeout = control_timeout
         self.box_id = box_id
+        self.tunables = tunables if tunables is not None else default_tunables()
+        self._warm_shape = warm_shape
+        self._spawn = spawn or _spawn_thread
+        # Warm pool: image digest -> started, unclaimed containers (oldest first). Names
+        # still starting are tracked apart so a sweep never removes them.
+        self._pool_digest: str | None = None
+        self._pool_enabled = False
+        self._warm: list[_WarmContainer] = []
+        self._warm_starting: set[str] = set()
         self._job_factory: Callable[[list[str], int, bytes | None], _Job] = _Job
         self._jobs: dict[tuple[str, str], _JobRecord] = {}
         self._creating: set[str] = set()
@@ -714,7 +742,7 @@ class RunscExecutor(_Table):
             "runtimes": {
                 self.runtime: {
                     "path": self.runtime_path,
-                    "runtimeArgs": ["--platform=systrap", "--network=sandbox"],
+                    "runtimeArgs": self.tunables.runtime_args(),
                 }
             }
         }
@@ -754,21 +782,49 @@ class RunscExecutor(_Table):
         ``--pull never`` stops Docker fetching anything in its place.
         """
 
-        image_id = spec.image.image_id
+        return self._run_argv(
+            self.container_name(spec.sandbox_id),
+            {SANDBOX_LABEL: spec.sandbox_id},
+            spec.image.image_id,
+            spec.shape,
+            spec.network,
+            spec.env,
+        )
+
+    def warm_argv(self, name: str, image: ImageInfo, shape: Shape) -> list[str]:
+        """``docker run`` for a warm container: a ``deny_all`` sandbox with no env, unclaimed."""
+
+        return self._run_argv(name, {WARM_LABEL: "1"}, image.image_id, shape, "deny_all", {})
+
+    def prime_argv(self, image: ImageInfo) -> list[str]:
+        """Read every layer of the imported image once (``image.prime``)."""
+
+        return _check_argv([self.docker, "save", "--output", "/dev/null", image.image_id])
+
+    def _run_argv(
+        self,
+        name: str,
+        labels: Mapping[str, str],
+        image_id: str,
+        shape: Shape,
+        network: str,
+        env: Mapping[str, str],
+    ) -> list[str]:
         if not isinstance(image_id, str) or _IMAGE_ID_RE.fullmatch(image_id) is None:
             raise ExecutorError("the image has no local id recorded at import")
-        shape = spec.shape
         argv = [
             self.docker,
             "run",
             "--detach",
             f"--runtime={self.runtime}",
             "--name",
-            self.container_name(spec.sandbox_id),
+            name,
             "--label",
             f"{BOX_LABEL}={self.box_id}",
-            "--label",
-            f"{SANDBOX_LABEL}={spec.sandbox_id}",
+        ]
+        for key, value in labels.items():
+            argv += ["--label", f"{key}={value}"]
+        argv += [
             "--cpus",
             str(shape.vcpus),
             "--memory",
@@ -780,13 +836,14 @@ class RunscExecutor(_Table):
             "--security-opt",
             "no-new-privileges",
         ]
+        argv += self.tunables.docker_run_args()
         if self.storage_quota:
             argv += ["--storage-opt", f"size={shape.disk_mib}m"]
-        argv += [*self.egress.docker_network_args(spec.network)]
-        if spec.network == "internet":
+        argv += [*self.egress.docker_network_args(network)]
+        if network == "internet":
             for server in self.dns:
                 argv += ["--dns", server]
-        for key, value in sorted(spec.env.items()):
+        for key, value in sorted(env.items()):
             argv += ["--env", f"{key}={value}"]
         argv += ["--pull", "never", "--entrypoint", "sleep", image_id, "infinity"]
         return _check_argv(argv)
@@ -912,8 +969,15 @@ class RunscExecutor(_Table):
             return False, f"the docker daemon has no {self.runtime} runtime"
         if entry.get("path") != self.runtime_path:
             return False, f"the {self.runtime} runtime is not {self.runtime_path}"
-        if "--platform=systrap" not in (entry.get("runtimeArgs") or []):
+        args = entry.get("runtimeArgs") or []
+        if "--platform=systrap" not in args:
             return False, f"the {self.runtime} runtime does not use --platform=systrap"
+        # The tunable runsc flags must be exactly the ones the settings file asks for, so a
+        # daemon edited by hand cannot silently disagree with what was approved.
+        wanted = {a for a in self.tunables.runtime_args() if a.startswith(TUNABLE_FLAG_PREFIXES)}
+        present = {a for a in args if isinstance(a, str) and a.startswith(TUNABLE_FLAG_PREFIXES)}
+        if present != wanted:
+            return False, f"the {self.runtime} runtime flags do not match the tunables file"
         return True, f"{self.runtime} at {self.runtime_path} with systrap"
 
     def storage_quota_support(self) -> tuple[bool, str]:
@@ -956,7 +1020,150 @@ class RunscExecutor(_Table):
         image = replace(image, image_id=self._resolve_image(image))
         with self._lock:
             self._images[digest] = image
+            self._pool_digest = digest
+        if self.tunables.prime_page_cache:
+            # Best effort: a failed prime only means the first create is cold.
+            try:
+                self._control(self.prime_argv(image), self._pull_timeout)
+            except ExecutorError:
+                pass
         return image
+
+    # -- warm pool ---------------------------------------------------------
+
+    def warm_count(self) -> int:
+        """Warm containers running or starting: what they take from box capacity."""
+
+        with self._lock:
+            return len(self._warm) + len(self._warm_starting)
+
+    def warm_usage(self) -> Shape:
+        shape = self._warm_shape
+        if shape is None:
+            return Shape(0, 0, 0)
+        # One count. Three separate reads can straddle a refill and charge a
+        # container in one dimension only.
+        count = self.warm_count()
+        return Shape(
+            shape.vcpus * count,
+            shape.memory_mib * count,
+            shape.disk_mib * count,
+        )
+
+    def reserve_warm(self, spec: SandboxSpec) -> str:
+        """Take one warm container for ``spec``, or "" when none fits.
+
+        Only a sandbox that would be started exactly like a warm one qualifies: the same
+        verified image, the default shape, ``deny_all`` and no env. The container leaves
+        the pool here, so no other create can take it.
+        """
+
+        shape = self._warm_shape
+        if (
+            self.tunables.warm_size == 0
+            or shape is None
+            or spec.shape != shape
+            or spec.network != "deny_all"
+            or spec.env
+            or spec.image.image_id == ""
+        ):
+            return ""
+        with self._lock:
+            for index, warm in enumerate(self._warm):
+                if warm.digest == spec.image.digest and self._images.get(warm.digest) == spec.image:
+                    del self._warm[index]
+                    return warm.name
+        return ""
+
+    def release_warm(self, name: str, digest: str) -> None:
+        """Give back a reserved container the caller did not use."""
+
+        with self._lock:
+            self._warm.insert(0, _WarmContainer(name, digest, self._clock()))
+
+    def evict_warm(self) -> bool:
+        """Remove the oldest warm container to free its capacity; false if none."""
+
+        with self._lock:
+            if not self._warm:
+                return False
+            warm = self._warm.pop(0)
+            self._warm_starting.add(warm.name)  # still counts until it is confirmed gone
+        self._drop_warm(warm.name)
+        return True
+
+    def _drop_warm(self, name: str) -> None:
+        removed = self._remove(name)
+        with self._lock:
+            self._warm_starting.discard(name)
+            if not removed:
+                self._pending_cleanup[name] = self._clock()
+
+    def discard_warm(self) -> None:
+        """End the pool: remove every warm container and stop refilling (hand-over)."""
+
+        with self._lock:
+            self._pool_enabled = False
+            doomed = list(self._warm)
+            self._warm.clear()
+            self._warm_starting.update(w.name for w in doomed)
+        for warm in doomed:
+            self._drop_warm(warm.name)
+
+    def maintain_pool(self, *, enabled: bool, room: int = 0) -> None:
+        """Expire idle warm containers, then refill up to ``warm_size``.
+
+        ``enabled`` is true only while a customer holds the lease. ``room`` is how many more
+        default-shape sandboxes the box can hold; a refill never starts more than that.
+        """
+
+        if not enabled:
+            self.discard_warm()
+            return
+        with self._lock:
+            self._pool_enabled = True
+            now = self._clock()
+            idle = [w for w in self._warm if now - w.started_at >= self.tunables.idle_seconds]
+            self._warm = [w for w in self._warm if w not in idle]
+            self._warm_starting.update(w.name for w in idle)
+        for warm in idle:
+            self._drop_warm(warm.name)
+        self._refill(room)
+
+    def _refill(self, room: int) -> None:
+        if self._warm_shape is None or self.tunables.warm_size == 0:
+            return
+        with self._lock:
+            if not self._pool_enabled or self._pool_digest is None:
+                return
+            image = self._images.get(self._pool_digest)
+            want = self.tunables.warm_size - len(self._warm) - len(self._warm_starting)
+            starting = min(want, self.tunables.refill_parallelism - len(self._warm_starting), room)
+            if image is None or starting <= 0:
+                return
+            names = [WARM_PREFIX + secrets.token_hex(12) for _ in range(starting)]
+            self._warm_starting.update(names)
+        for name in names:
+            self._spawn(lambda name=name, image=image: self._start_warm(name, image))
+
+    def _start_warm(self, name: str, image: ImageInfo) -> None:
+        started = False
+        try:
+            verified = self.verified_image(image.digest)
+            argv = self.warm_argv(name, verified, self._warm_shape)  # type: ignore[arg-type]
+            started = self._control(argv, self._control_timeout).returncode == 0
+            if not started:
+                self._abandon(name, timed_out=False)
+        except (ExecutorError, NotFound):
+            self._abandon(name, timed_out=True)
+        with self._lock:
+            self._warm_starting.discard(name)
+            if started:
+                if self._pool_enabled:
+                    self._warm.append(_WarmContainer(name, image.digest, self._clock()))
+                    return
+        if started:
+            self._drop_warm(name)
 
     def _resolve_image(self, image: ImageInfo) -> str:
         """The local id Docker's store gives ``reference@digest`` now.
@@ -1078,15 +1285,24 @@ class RunscExecutor(_Table):
             raise ExecutorRefused("internet egress is not enforced on this box")
         # Run the image recorded at import, re-checked now, whatever the
         # caller's spec carries.
-        spec = replace(spec, image=self.verified_image(spec.image.digest))
+        try:
+            spec = replace(spec, image=self.verified_image(spec.image.digest))
+        except ExecutorError:
+            if spec.warm:
+                self.release_warm(spec.warm, spec.image.digest)
+            raise
         name = self.container_name(spec.sandbox_id)
         argv = self.create_argv(spec)
         with self._lock:
             self._creating.add(spec.sandbox_id)
         try:
+            claimed = bool(spec.warm) and self._claim_warm(spec.warm, name)
             try:
-                started = self._control(argv, self._control_timeout).returncode == 0
-                timed_out = False
+                if claimed:
+                    started, timed_out = True, False
+                else:
+                    started = self._control(argv, self._control_timeout).returncode == 0
+                    timed_out = False
             except ExecutorError:
                 started, timed_out = False, True
             if not started:
@@ -1108,6 +1324,8 @@ class RunscExecutor(_Table):
                     self.end_lapsed_sandboxes()
                     raise ExecutorError("egress enforcement failed")
             info = self._record(spec)
+            if claimed:
+                self._refill(room=1)
             if spec.network == "internet" and enforcer is not None and enforcer.lapses != lapses:
                 # The rules lapsed while this sandbox started: end it too.
                 with self._quarantine_lock, self._lock:
@@ -1118,6 +1336,24 @@ class RunscExecutor(_Table):
         finally:
             with self._lock:
                 self._creating.discard(spec.sandbox_id)
+
+    def _claim_warm(self, warm: str, name: str) -> bool:
+        """Rename a reserved warm container to the sandbox's name; remove it if that fails."""
+
+        try:
+            renamed = (
+                self._control(
+                    _check_argv([self.docker, "rename", warm, name]), self._control_timeout
+                ).returncode
+                == 0
+            )
+        except ExecutorError:
+            renamed = False
+        if not renamed:
+            with self._lock:
+                self._warm_starting.add(warm)
+            self._drop_warm(warm)
+        return renamed
 
     def delete(self, sandbox_id: str) -> bool:
         return self._delete(sandbox_id, None)
@@ -1287,6 +1523,7 @@ class RunscExecutor(_Table):
         }
         with self._lock:
             keep = {self.container_name(sid) for sid in (*self._sandboxes, *self._creating)}
+            keep |= {w.name for w in self._warm} | self._warm_starting
             pending = dict(self._pending_cleanup)
         remaining = 0
         now = self._clock()

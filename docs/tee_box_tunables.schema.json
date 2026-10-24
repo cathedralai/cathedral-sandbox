@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "tee-box tunables",
+  "type": "object",
+  "required": [
+    "schema"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": 1
+    },
+    "runsc": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "directfs": {
+          "type": "boolean",
+          "default": true,
+          "description": "runsc --directfs: the sandbox opens files through host file descriptors instead of the gofer round trip."
+        },
+        "overlay2": {
+          "enum": [
+            "root:self",
+            "all:self"
+          ],
+          "default": "root:self",
+          "description": "runsc --overlay2: which mounts get the in-sandbox overlay. Both options keep writes in the sandbox own storage, so the disk cap still applies. (root:memory is not offered: it would move writes out of the disk cap.)"
+        },
+        "net_channels": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4,
+          "default": 1,
+          "description": "runsc --num-network-channels: packet channels of the sandbox network stack."
+        }
+      }
+    },
+    "docker": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "log_driver": {
+          "enum": [
+            "json-file",
+            "local",
+            "none"
+          ],
+          "default": "json-file",
+          "description": "docker run --log-driver. The sandbox command is `sleep infinity`; customer output is read through exec, not logs."
+        }
+      }
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "prime": {
+          "enum": [
+            "none",
+            "page_cache"
+          ],
+          "default": "none",
+          "description": "After an image is imported, read its layers once (docker save to /dev/null) so the first create does not pay for cold storage."
+        }
+      }
+    },
+    "pool": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "warm_size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16,
+          "default": 0,
+          "description": "Started, unclaimed deny_all sandboxes of the default shape kept ready for the most recently imported image, only while a customer holds the lease. They count against box capacity and are removed at hand-over."
+        },
+        "refill_parallelism": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4,
+          "default": 1,
+          "description": "How many replacement warm sandboxes may start at once after one is claimed."
+        },
+        "idle_seconds": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 900,
+          "default": 300,
+          "description": "A warm sandbox unclaimed for this long is removed and replaced."
+        }
+      }
+    },
+    "boot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create_concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16,
+          "default": 1,
+          "description": "How many sandbox creates one box runs at the same time. 1 is today's behaviour: creates one at a time."
+        }
+      }
+    }
+  }
+}
