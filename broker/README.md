@@ -91,14 +91,25 @@ not include the other guest's room id, image name, or target path. Receipts
 still omit commands, files, and outputs. One room's own receipts are
 `GET /v1/sandboxes/<id>/receipts`.
 
-Only sealed hotels answer these two routes. On a shared (unsealed) hotel
-both answer 404. The broker sends a shared hotel's writes straight to its
-API port, so the room kit's receipt service (127.0.0.1:18092) never sees a
-broker room. The broker reads `/room/receipts` from the hotel's `health`
-base, and on a shared hotel that is room_health, which does not serve the
-chain. Routing reads alone through 18092 would return an empty chain; a
-fix must send writes there too. Until then, signed receipts come from
-sealed hotels only.
+A hotel signs receipts only for calls that pass through its receipt front
+(room kit, `127.0.0.1:18092` on a shared hotel; `:18090` in a sealed
+guest). So point both `api` and `health` of every hotel in the broker
+config at that front: it passes every call to the room API, signs each
+create, exec, process start and delete, and serves `/room/health`,
+`/room/receipts` and `/v1/sandboxes/<id>/receipts`. With `api` on 18090
+and `health` on 18091 instead, broker writes skip the front, both receipt
+routes answer 404, and no receipt is signed.
+
+A shared hotel signs at level 1: an Ed25519 key held in memory, with no
+hardware binding. Its receipts prove that the hotel process signed the
+action, not which machine ran it. Only a sealed hotel binds its key to an
+SEV-SNP report.
+
+For a hotel behind an SSH tunnel, forward 18092 as well: a fourth port in
+`/etc/thin-broker/tunnels.env` (`TUN_<id>="<dest> <api> <health> <receipts>"`),
+and `permitopen="127.0.0.1:18092"` on the tunnel key in the hotel's
+`authorized_keys`. Live since 2026-10-24 00:06Z: nc on 18092, c46 on 38092
+and c48 on 48092.
 
 ## Room network policy
 
