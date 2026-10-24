@@ -25,6 +25,8 @@ attestation.json
 *.seed
 operator-state/
 validator-access-state/
+scripts/tee_box_snp_e2e/central_access_materials/*.json
+!scripts/tee_box_snp_e2e/central_access_materials/README.md
 
 # Generated proto
 *_pb2.py

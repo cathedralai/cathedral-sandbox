@@ -1,0 +1,77 @@
+{
+  "schema": "cathedral_phase0_takeover_v1",
+  "stamp": "20261013T0722Z",
+  "human_staging_owner": "staging_owner",
+  "takeover_recorded_at_utc": "2026-10-13T07:22:00Z",
+  "package_verify": "PASS",
+  "duplicate_build": false,
+  "host_mutations": "NONE",
+  "existing_guests_preserved": true,
+  "staging": {
+    "url": "https://polariscomputer-staging-staging.up.railway.app",
+    "health_http": 200,
+    "release_sha": "acaa296170d47f77bc99deec95c797c17bb35ce9",
+    "deployed_sha": "acaa296170d47f77bc99deec95c797c17bb35ce9",
+    "deployment_id": "b384d8e3-a1de-4fb6-9707-82ba35f82a2e",
+    "migration_head": "cathedral_snp_journal_20261013",
+    "database": "connected",
+    "compute": "disabled",
+    "account_unauth_http": 401,
+    "catalog_unauth_http": 401
+  },
+  "cherry_host": {
+    "ip": "84.32.220.48",
+    "hostname": "cathedral-snp-274",
+    "ssh_host_22": "PASS_TOBY_IDENTITY",
+    "ssh_guest_2225": "PASS_TOBY_IDENTITY",
+    "https_8443": "closed",
+    "build_unit": "inactive/success (no in-flight build)",
+    "image_candidate": {
+      "raw": "/root/snp-launch/cathedral-staging-20261013/images/cathedral-staging-snp-0029cec5-20261013.raw",
+      "sha256_raw": "a7ad573bc5801d404525823ef670f632860fe2d41174c58a0df0c2ceac7abae5",
+      "sha256_efi": "eff4006e35dc85c9c27e00bc84de17c5b9a9f9aebc3430f4db0d87a41f02cf32",
+      "matches_addendum": true,
+      "qualification": "UNQUALIFIED_IMAGE_CANDIDATE"
+    },
+    "running_guests": [
+      {
+        "name": "snp-guest",
+        "fwd": 2222,
+        "disk": "/root/snp-launch/guest-dryrun.qcow2"
+      },
+      {
+        "name": "tee-box-dev",
+        "fwd": 2224,
+        "image": "cathedral-tee-box-snp_dev-20261009"
+      },
+      {
+        "name": "tee-box-official",
+        "fwd": 2225,
+        "image": "cathedral-tee-box-snp_official-20261009"
+      }
+    ]
+  },
+  "local_polariscomputer": {
+    "branch": "feat/snp-customer-staging-broker",
+    "head": "eb58addd66a9385fe40abd39aba7e70ed724f6b9",
+    "acaa2961_present": false,
+    "66deb72e_present": false,
+    "patch_check_on_current_head": "FAIL_WRONG_BASE"
+  },
+  "access": {
+    "cherry_ssh": "HAVE",
+    "staging_url": "HAVE",
+    "staging_api_key_value": "MISSING",
+    "staging_key_id_from_addendum": "b30b7437-7d2d-53fc-b7b4-97f4f47f9081",
+    "staging_key_expires_utc": "2026-10-14T01:08:01Z",
+    "key_extension_executed": false,
+    "railway_cli_or_project_access": "MISSING",
+    "staging_database_connection": "MISSING",
+    "acaa2961_git_tree": "MISSING_NOT_ON_ORIGIN",
+    "central_grant": "UNSIGNED",
+    "independent_prober": "MISSING",
+    "image_policy_acceptance": "MISSING"
+  },
+  "next": "Phase 1 blocked on image-policy accept + isolated boot; Phase 2 blocked on acaa2961 tree + Railway deploy + staging key; canary blocked on key + signed 15-min grant.",
+  "role": "appointed_staging_owner"
+}
