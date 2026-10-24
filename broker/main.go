@@ -143,6 +143,7 @@ type hotel struct {
 	ok           bool         // health answered within okWindow, or room calls did (see syncHotel)
 	healthLate   bool         // ok only because room calls answer; health is late
 	lastOK       time.Time    // last good /room/health answer
+	downSince    time.Time    // when ok last went false; zero while ok
 	lastAnswer   atomic.Int64 // unix ns of the last room call the hotel answered (status < 500)
 	healthMs     float64      // duration of the last /room/health call
 	listOK       bool         // last room list answered
@@ -439,6 +440,14 @@ func (b *broker) guestFromKey(r *http.Request) *guestState {
 	return b.byKey[sha(strings.TrimSpace(a[7:]))]
 }
 
+// downSince is when the hotel went down, for the hotel lists; nil while up.
+func downSince(h *hotel) any {
+	if h.ok || h.downSince.IsZero() {
+		return nil
+	}
+	return h.downSince.UTC().Format(time.RFC3339)
+}
+
 func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
 
 // ---------------------------------------------------------------- scatter
@@ -464,9 +473,17 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, tRec
 	var last createResult
 	var lost []*hotel
 	finish := func(r createResult) createResult { r.lost = lost; return r }
+	asked, fellBack := pl, false
 	for attempt := 0; attempt < 3; attempt++ {
 		b.mu.Lock()
 		h := b.pick(tried, pl)
+		if h == nil && !fellBack {
+			// "placement": "prefer": the named hotels are down or full.
+			if fb, ok := b.fallbackFor(pl); ok {
+				pl, fellBack = fb, true
+				h = b.pick(tried, pl)
+			}
+		}
 		if h == nil {
 			if last.status >= 500 {
 				g.failed++
@@ -475,7 +492,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, tRec
 			if last.status != 0 {
 				return finish(last)
 			}
-			return finish(b.noRoom(pl))
+			return finish(b.noRoom(asked))
 		}
 		tried[h] = true
 		h.queued++
@@ -521,6 +538,12 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, tRec
 			g.recent = append(g.recent, tDone)
 			doc["id"] = rm.id
 			doc["hotel"] = h.cfg.ID
+			// A fallback create can still end on a named hotel (waitSlot,
+			// or a retry once it recovers); only a room elsewhere is a fallback.
+			fellBack = fellBack && !asked.ids[h.cfg.ID]
+			if fellBack {
+				doc["placement_fallback"] = true
+			}
 			doc["isolation"] = isolationDoc(h, doc)
 			if pl.snapshotRef != "" {
 				doc["snapshot_id"] = pl.snapshotRef
@@ -533,6 +556,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, tRec
 			hdrs := http.Header{}
 			copyRoomHeaders(hdrs, hdr)
 			hdrs.Set("X-Broker-Hotel", h.cfg.ID)
+			if fellBack {
+				hdrs.Set("X-Broker-Fallback", "true")
+			}
 			hdrs.Set("X-Broker-Queue-Ms", strconv.FormatFloat(ms(queue), 'f', 1, 64))
 			hdrs.Set("X-Broker-Hotel-Ms", strconv.FormatFloat(ms(call), 'f', 1, 64))
 			return finish(createResult{status: 202, header: hdrs, doc: doc})
@@ -1271,8 +1297,21 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	// the hotel still answers room calls (a sealed guest at full CPU answered
 	// rooms but not health at about 1,000 rooms).
 	callsOK := now.Sub(time.Unix(0, h.lastAnswer.Load())) < okWindow
+	wasOK := h.ok
 	h.ok = healthOK || (callsOK && !h.lastOK.IsZero())
 	h.healthLate = !healthOK && h.ok
+	switch {
+	case h.ok:
+		if !h.downSince.IsZero() {
+			log.Printf("hotel %s up again after %s down", h.cfg.ID, now.Sub(h.downSince).Round(time.Second))
+		}
+		h.downSince = time.Time{}
+	case h.downSince.IsZero():
+		h.downSince = now
+		if wasOK {
+			log.Printf("hotel %s down: %s", h.cfg.ID, h.lastErr)
+		}
+	}
 	if herr == nil {
 		slots := hd.Slots
 		if h.cfg.MaxSlots > 0 && slots > h.cfg.MaxSlots {
@@ -1484,7 +1523,7 @@ func (b *broker) snapshot(g *guestState) map[string]any {
 			"grid": string(grid), "cpu": h.cpuPct, "mem_pct": h.memPct, "mem_gib": h.memGiB, "load1": h.load1,
 			"containers": h.containers, "rooms_all": h.apiRunning, "deleting_all": h.apiDeleting,
 			"queued": h.queued, "creating": h.creating,
-			"seen_age_s": seenAge(h.lastOK, now), "health_late": h.healthLate, "health_ms": h.healthMs, "list_ok": h.listOK, "caps": h.caps,
+			"seen_age_s": seenAge(h.lastOK, now), "down_since": downSince(h), "health_late": h.healthLate, "health_ms": h.healthMs, "list_ok": h.listOK, "caps": h.caps,
 			"mine": map[string]int{"running": mine[stRunning], "creating": mine[stCreating], "deleting": mine[stDeleting], "failed": mine[stFailed]},
 		})
 	}
