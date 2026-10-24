@@ -53,6 +53,9 @@ type placement struct {
 	// prefer: "placement": "prefer". When every named hotel is down or full,
 	// the create may go to another hotel of the same class (fallbackFor).
 	prefer bool
+	// class: set only on a fallback. "sealed" or "unsealed": the hotel must be
+	// of that class, on top of every rule above.
+	class string
 }
 
 func (pl placement) selects(h *hotel) bool {
@@ -65,9 +68,21 @@ func (pl placement) selects(h *hotel) bool {
 	if len(pl.images) > 0 && !pl.images[h.cfg.ID] {
 		return false
 	}
+	isSealed := h.labels()["sealed"] == "true"
+	switch pl.class {
+	case "sealed":
+		if !isSealed {
+			return false
+		}
+	case "unsealed":
+		if isSealed {
+			return false
+		}
+	}
 	// A hotel with "sealed": true in the config takes only creates that ask
 	// for a sealed room ("sealed": true or hotel label sealed=true) or name it.
-	if h.cfg.Sealed && len(pl.ids) == 0 && pl.match["sealed"] != "true" {
+	// A sealed fallback counts as asking: it comes from a named sealed hotel.
+	if h.cfg.Sealed && len(pl.ids) == 0 && pl.match["sealed"] != "true" && pl.class != "sealed" {
 		return false
 	}
 	for k, v := range pl.match {
@@ -274,24 +289,15 @@ func (b *broker) fallbackFor(pl placement) (placement, bool) {
 	if sealed == n && len(pl.allowed) == 0 {
 		return pl, false
 	}
+	// The class is a separate rule, so the request's own hotel_labels and
+	// exclude_hotel_labels (even on the "sealed" label) still apply.
 	fb := pl
 	fb.ids = nil
-	fb.match = copyLabels(pl.match)
-	fb.exclude = copyLabels(pl.exclude)
+	fb.class = "unsealed"
 	if sealed == n {
-		fb.match["sealed"] = "true"
-	} else {
-		fb.exclude["sealed"] = "true"
+		fb.class = "sealed"
 	}
 	return fb, true
-}
-
-func copyLabels(m map[string]string) map[string]string {
-	out := make(map[string]string, len(m)+1)
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
 }
 
 // placementFor reads the hotel choice of a create and, for a fork, finds the

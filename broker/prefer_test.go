@@ -134,3 +134,19 @@ func TestHotelListShowsDownSince(t *testing.T) {
 		}
 	}
 }
+
+func TestPreferKeepsTheCallersOwnSealedLabelRules(t *testing.T) {
+	// Codex review on #323: a fallback must not replace the request's own
+	// exclude_hotel_labels {"sealed": "false"} with its class rule.
+	tc := newChain(t)
+	setHotel(tc, "c", func(h *hotel) {
+		h.cfgMu.Lock()
+		h.cfg.Labels = map[string]string{"sealed": "false"}
+		h.cfgMu.Unlock()
+	})
+	downHotel(tc, "b")
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "placement": "prefer", "exclude_hotel_labels": map[string]string{"sealed": "false"}})
+	if status != 503 || errCode(doc) != "hotels_unavailable" {
+		t.Fatalf("fallback ignored exclude_hotel_labels sealed=false: %d %v", status, doc)
+	}
+}
