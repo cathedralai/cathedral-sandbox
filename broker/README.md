@@ -47,7 +47,7 @@ before it calls the hotel.
 | `"hotel_labels": {"sealed": "true"}` | Only hotels with every pair. |
 | `"exclude_hotel_labels": {"sealed": "true"}` | No hotel with any pair. |
 | `"placement": "require"` | The default. A create that names hotels uses only those hotels. |
-| `"placement": "prefer"` | Try the named hotels first. If all of them are down or full, use another hotel of the same class: sealed for sealed, unsealed for unsealed. The other label rules and the guest's hotel list still apply. A sealed create falls back only when the guest has its own hotel list. A fork and a mix of sealed and unsealed hotels never fall back. The answer has `"placement_fallback": true` and the header `X-Broker-Fallback: true`. |
+| `"placement": "prefer"` | Try the named hotels first. If all of them are down, full or fail the create, use another hotel of the same class: sealed for sealed, unsealed for unsealed. The other label rules and the guest's hotel list still apply. A sealed create falls back only when the guest has its own hotel list. A fork and a mix of sealed and unsealed hotels never fall back. The answer has `"placement_fallback": true` and the header `X-Broker-Fallback: true`. |
 
 Hotel labels come from the `labels` object of each hotel in the config.
 `GET /v1/broker/hotels` lists hotel ids, labels and free rooms. When no

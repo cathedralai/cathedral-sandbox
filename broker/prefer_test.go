@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -148,5 +149,79 @@ func TestPreferKeepsTheCallersOwnSealedLabelRules(t *testing.T) {
 	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "placement": "prefer", "exclude_hotel_labels": map[string]string{"sealed": "false"}})
 	if status != 503 || errCode(doc) != "hotels_unavailable" {
 		t.Fatalf("fallback ignored exclude_hotel_labels sealed=false: %d %v", status, doc)
+	}
+}
+
+func makeSealed(tc *testChain, id string) {
+	setHotel(tc, id, func(h *hotel) {
+		h.cfgMu.Lock()
+		h.cfg.Sealed, h.cfg.Labels = true, map[string]string{"sealed": "true"}
+		h.cfgMu.Unlock()
+	})
+}
+
+func TestPreferSealedFallbackNeedsTheGuestsList(t *testing.T) {
+	// Two sealed hotels, guest without a hotel list: the named sealed hotel
+	// is down, the other sealed hotel is up, and still no fallback.
+	tc := newChain(t)
+	makeSealed(tc, "c")
+	downHotel(tc, "a")
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}, "placement": "prefer"})
+	if status != 503 || errCode(doc) != "hotels_unavailable" {
+		t.Fatalf("sealed fallback without a guest list: %d %v", status, doc)
+	}
+}
+
+func TestPreferMixedClassNeverFallsBack(t *testing.T) {
+	tc := newChain(t)
+	downHotel(tc, "a")
+	downHotel(tc, "b")
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"a", "b"}, "placement": "prefer"})
+	if status != 503 || errCode(doc) != "hotels_unavailable" {
+		t.Fatalf("mixed sealed and unsealed named hotels fell back: %d %v", status, doc)
+	}
+}
+
+func TestPlacementIsNotSentToTheHotel(t *testing.T) {
+	tc := newChain(t)
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "placement": "prefer"})
+	if status != 202 {
+		t.Fatalf("create: %d %v", status, doc)
+	}
+	f := tc.hotels["b"]
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.creates) == 0 {
+		t.Fatal("hotel b got no create")
+	}
+	if _, ok := f.creates[len(f.creates)-1]["placement"]; ok {
+		t.Fatalf("hotel got the placement field: %v", f.creates[len(f.creates)-1])
+	}
+}
+
+func TestDownSinceFollowsHealth(t *testing.T) {
+	tc := newChain(t)
+	f := tc.hotels["b"]
+	f.mu.Lock()
+	f.healthFail = true
+	f.mu.Unlock()
+	setHotel(tc, "b", func(h *hotel) { h.lastOK = time.Now().Add(-time.Hour); h.lastAnswer.Store(0) })
+	h := tc.b.hotelByID("b")
+	tc.b.syncHotel(context.Background(), h)
+	tc.b.mu.Lock()
+	ok, since := h.ok, h.downSince
+	tc.b.mu.Unlock()
+	if ok || since.IsZero() {
+		t.Fatalf("after failed health: ok=%v down_since=%v", ok, since)
+	}
+	f.mu.Lock()
+	f.healthFail = false
+	f.mu.Unlock()
+	tc.b.syncHotel(context.Background(), h)
+	tc.b.mu.Lock()
+	ok, since = h.ok, h.downSince
+	tc.b.mu.Unlock()
+	if !ok || !since.IsZero() {
+		t.Fatalf("after good health: ok=%v down_since=%v", ok, since)
 	}
 }

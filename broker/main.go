@@ -538,6 +538,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, tRec
 			g.recent = append(g.recent, tDone)
 			doc["id"] = rm.id
 			doc["hotel"] = h.cfg.ID
+			// A fallback create can still end on a named hotel (waitSlot,
+			// or a retry once it recovers); only a room elsewhere is a fallback.
+			fellBack = fellBack && !asked.ids[h.cfg.ID]
 			if fellBack {
 				doc["placement_fallback"] = true
 			}
