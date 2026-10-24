@@ -13,6 +13,7 @@ For mining, start with the [repository overview](../README.md), then follow
 - [AMD SEV-SNP miner and first hardware proof](AMD_SEV_SNP_FRIEND_TEST.md)
 - [Run an SNP miner on your own server, in order](SNP_OWN_SERVER_ONBOARDING.md)
 - [Development tests](TESTING.md)
+- [Public leak guard](LEAK_GUARD.md)
 
 These pages explain a narrow contract. They do not replace the mining guide's launch
 order.
