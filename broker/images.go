@@ -50,6 +50,9 @@ type placement struct {
 	// the guest's sealed default still apply.
 	images          map[string]bool
 	sealedByDefault bool // match["sealed"] comes from the guest default, not the request
+	// prefer: "placement": "prefer". When every named hotel is down or full,
+	// the create may go to another hotel of the same class (fallbackFor).
+	prefer bool
 }
 
 func (pl placement) selects(h *hotel) bool {
@@ -91,6 +94,7 @@ func (pl placement) apply(payload map[string]any) {
 	delete(payload, "hotel_labels")
 	delete(payload, "exclude_hotel_labels")
 	delete(payload, "sealed")
+	delete(payload, "placement")
 	if pl.hotelSnap != "" {
 		payload["snapshot_id"] = pl.hotelSnap
 	}
@@ -222,6 +226,17 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 		}
 		pl.exclude["sealed"] = "true"
 	}
+	// "placement": "require" (default) keeps a create on the named hotels;
+	// "prefer" lets it fall back to a hotel of the same class (fallbackFor).
+	if v, ok := payload["placement"]; ok && v != nil {
+		switch v {
+		case "require":
+		case "prefer":
+			pl.prefer = true
+		default:
+			return pl, &apiErr{400, "invalid_hotel_selection", `placement must be "require" or "prefer"`}
+		}
+	}
 	_, named := payload["hotels"]
 	_, sealedField := payload["sealed"]
 	b.scope(g, &pl, named && payload["hotels"] != nil, sealedField && payload["sealed"] != nil)
@@ -231,6 +246,52 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 		}
 	}
 	return pl, &apiErr{409, "no_matching_hotel", "no hotel matches the hotel selection"}
+}
+
+// fallbackFor widens a "prefer" placement whose named hotels are all down or
+// full: any other hotel of the same class (sealed or not) that the rest of the
+// selection and the guest's hotel list allow. A sealed fallback needs the
+// guest's own hotel list, so a guest never lands on a sealed hotel it was not
+// given. Named hotels of mixed class, and forks, do not fall back.
+func (b *broker) fallbackFor(pl placement) (placement, bool) {
+	if !pl.prefer || len(pl.ids) == 0 || pl.only != nil {
+		return pl, false
+	}
+	n, sealed := 0, 0
+	for id := range pl.ids {
+		h := b.hotelByID(id)
+		if h == nil {
+			return pl, false
+		}
+		n++
+		if h.labels()["sealed"] == "true" {
+			sealed++
+		}
+	}
+	if sealed != 0 && sealed != n {
+		return pl, false
+	}
+	if sealed == n && len(pl.allowed) == 0 {
+		return pl, false
+	}
+	fb := pl
+	fb.ids = nil
+	fb.match = copyLabels(pl.match)
+	fb.exclude = copyLabels(pl.exclude)
+	if sealed == n {
+		fb.match["sealed"] = "true"
+	} else {
+		fb.exclude["sealed"] = "true"
+	}
+	return fb, true
+}
+
+func copyLabels(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m)+1)
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // placementFor reads the hotel choice of a create and, for a fork, finds the
@@ -277,7 +338,7 @@ func (b *broker) handleHotels(w http.ResponseWriter, g *guestState) {
 		if labels == nil {
 			labels = map[string]string{}
 		}
-		out = append(out, map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "up": h.ok, "drain": h.drain(), "free_rooms": free})
+		out = append(out, map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "up": h.ok, "drain": h.drain(), "free_rooms": free, "down_since": downSince(h)})
 	}
 	b.mu.Unlock()
 	writeJSON(w, 200, map[string]any{"hotels": out})
