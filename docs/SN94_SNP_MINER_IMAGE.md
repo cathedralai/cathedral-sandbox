@@ -4,9 +4,16 @@ This is the separate immutable image contract for an AMD SEV-SNP miner. It is
 not the Intel TDX audit-miner image and it has no fallback or compatibility
 mode.
 
+This page is the only place that lists the current image digest and source
+revision. Every other page points here. Take the digest and revision from this
+page, not from a copy.
+
 ## Published release pin
 
-The current anonymous `linux/amd64` image is:
+The image name keeps `sn39` for history. It is the SN94 miner image. Mainnet
+images have no tag suffix. Testnet images end in `-test584`.
+
+The current anonymous `linux/amd64` mainnet image is:
 
 ```text
 ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:3e1cb9144417e1e0d526445a43245e305e772cae0568202a332183071ef0c584
