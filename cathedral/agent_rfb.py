@@ -217,10 +217,10 @@ def _des_ecb_encrypt(block8: bytes, key8: bytes) -> bytes:
     subkeys = _des_subkeys(key8)
     block = int.from_bytes(block8, "big")
     block = _permute(block, _IP, 64)
-    l, r = block >> 32, block & 0xFFFFFFFF
+    left, right = block >> 32, block & 0xFFFFFFFF
     for sk in subkeys:
-        l, r = r, l ^ _f(r, sk)
-    return _permute((r << 32) | l, _FP, 64).to_bytes(8, "big")
+        left, right = right, left ^ _f(right, sk)
+    return _permute((right << 32) | left, _FP, 64).to_bytes(8, "big")
 
 
 def vnc_encrypt_challenge(challenge: bytes, password: str) -> bytes:

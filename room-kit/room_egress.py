@@ -80,14 +80,43 @@ def policy_sha256(policy: dict) -> str:
     return hashlib.sha256(canonical(policy)).hexdigest()
 
 
-def classify(entry: str) -> tuple[str, str]:
-    """("cidr", "1.2.3.0/24") | ("host", "pypi.org") | ("wild", "example.com").
+# Ranges a room may not allowlist (same list as cathedral/sandbox_api.py): the
+# host firewall drops them anyway, so naming them must not open the policy.
+_NON_PUBLIC_V4 = tuple(ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+    "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
+))
+
+def classify(entry: str) -> tuple[str, str, frozenset]:
+    """("cidr", "1.2.3.0/24", frozenset()) | ("host"|"wild", name, ports).
 
     Same rules as cathedral.sandbox_api.normalize_allow_entry; the daemon
-    checks again because it is the enforcement point."""
+    checks again because it is the enforcement point. Optional ``:80`` /
+    ``:443`` on a hostname is kept: bare name means both ports.
+    """
     if not isinstance(entry, str) or not entry or len(entry) > 255:
         raise ValueError(f"bad allowlist entry {entry!r}")
     value = entry.strip().lower().rstrip(".")
+    ports: frozenset | None = None
+    if value.count(":") == 1 and "/" not in value and not value.startswith("["):
+        host_part, port_part = value.rsplit(":", 1)
+        if port_part.isdigit():
+            port = int(port_part)
+            if not 1 <= port <= 65535:
+                raise ValueError(f"bad allowlist entry {entry!r}")
+            try:
+                ipaddress.ip_address(host_part)
+            except ValueError:
+                if port not in (80, 443):
+                    raise ValueError(
+                        f"named hosts only allow TCP 80 and 443: {entry!r}"
+                    ) from None
+                value = host_part
+                ports = frozenset({port})
+            else:
+                raise ValueError(
+                    f"use a bare IPv4/CIDR (all ports) or a hostname:80|:443: {entry!r}"
+                )
     try:
         # "1.2.3.4" stays an address, "1.2.3.4/8" becomes "1.0.0.0/8".
         net = ipaddress.ip_network(value, strict=False) if "/" in value else ipaddress.ip_address(value)
@@ -96,7 +125,10 @@ def classify(entry: str) -> tuple[str, str]:
     if net is not None:
         if net.version != 4:
             raise ValueError(f"IPv6 is not supported: {entry!r}")
-        return "cidr", str(net)
+        span = net if isinstance(net, ipaddress.IPv4Network) else ipaddress.ip_network(f"{net}/32")
+        if any(span.overlaps(n) for n in _NON_PUBLIC_V4):
+            raise ValueError(f"private, host or reserved ranges cannot be allowlisted: {entry!r}")
+        return "cidr", str(net), frozenset()
     if ":" in value or "/" in value:
         raise ValueError(f"bad allowlist entry {entry!r}")
     wild = value.startswith("*.")
@@ -104,7 +136,15 @@ def classify(entry: str) -> tuple[str, str]:
     labels = name.split(".")
     if len(name) > 253 or len(labels) < 2 or not all(HOST_LABEL.match(x) for x in labels) or labels[-1].isdigit():
         raise ValueError(f"bad allowlist entry {entry!r}")
-    return ("wild", name) if wild else ("host", name)
+    if ports is None:
+        ports = frozenset({80, 443})
+    return ("wild" if wild else "host"), name, ports
+
+
+def _canon_named(prefix: str, name: str, ports: set[int]) -> list[str]:
+    if ports >= {80, 443}:
+        return [prefix + name]
+    return [f"{prefix}{name}:{p}" for p in sorted(ports)]
 
 
 @dataclass(frozen=True)
@@ -112,7 +152,9 @@ class Policy:
     mode: str
     allow: tuple[str, ...] = ()
     hosts: frozenset = frozenset()
+    host_ports: tuple = ()  # ((name, (80,443)|...), ...)
     wilds: tuple[str, ...] = ()
+    wild_ports: tuple = ()  # ((suffix, ports...), ...)
     nets: tuple[str, ...] = ()
 
     @classmethod
@@ -129,13 +171,34 @@ class Policy:
             return cls(mode=mode)
         if not allow:
             raise ValueError("allowlist mode needs at least one entry")
-        hosts, wilds, nets = set(), set(), set()
+        host_map: dict[str, set[int]] = {}
+        wild_map: dict[str, set[int]] = {}
+        nets: set[str] = set()
         for entry in allow:
-            kind, value = classify(entry)
-            {"host": hosts, "wild": wilds, "cidr": nets}[kind].add(value)
-        canon = sorted(hosts | {"*." + w for w in wilds} | nets)
+            kind, value, ports = classify(entry)
+            if kind == "cidr":
+                nets.add(value)
+            elif kind == "host":
+                host_map.setdefault(value, set()).update(ports)
+            else:
+                wild_map.setdefault(value, set()).update(ports)
+        canon: list[str] = list(nets)
+        for name, ports in host_map.items():
+            canon.extend(_canon_named("", name, ports))
+        for name, ports in wild_map.items():
+            canon.extend(_canon_named("*.", name, ports))
         collapsed = tuple(str(n) for n in ipaddress.collapse_addresses(ipaddress.ip_network(x) for x in nets))
-        return cls(mode=mode, allow=tuple(canon), hosts=frozenset(hosts), wilds=tuple(sorted(wilds)), nets=collapsed)
+        host_ports = tuple(sorted((n, tuple(sorted(p))) for n, p in host_map.items()))
+        wild_ports = tuple(sorted((n, tuple(sorted(p))) for n, p in wild_map.items()))
+        return cls(
+            mode=mode,
+            allow=tuple(sorted(canon)),
+            hosts=frozenset(host_map),
+            host_ports=host_ports,
+            wilds=tuple(sorted(wild_map)),
+            wild_ports=wild_ports,
+            nets=collapsed,
+        )
 
     def document(self) -> dict:
         return {"mode": self.mode, "allow": list(self.allow)}
@@ -144,13 +207,27 @@ class Policy:
     def named(self) -> bool:
         return bool(self.hosts or self.wilds)
 
-    def allows_name(self, name: str) -> bool:
+    def _ports_for(self, name: str) -> frozenset | None:
+        name = name.strip().lower().rstrip(".")
+        for n, ports in self.host_ports:
+            if n == name:
+                return frozenset(ports)
+        for w, ports in self.wild_ports:
+            if name.endswith("." + w):
+                return frozenset(ports)
+        return None
+
+    def allows_name(self, name: str, port: int | None = None) -> bool:
+        """Whether *name* is on the list. With *port*, also require that port
+        (80 or 443). DNS callers omit *port* and match on the name alone."""
         if self.mode != "allowlist":
             return False
-        name = name.strip().lower().rstrip(".")
-        if name in self.hosts:
+        ports = self._ports_for(name)
+        if ports is None:
+            return False
+        if port is None:
             return True
-        return any(name.endswith("." + w) for w in self.wilds)
+        return port in ports
 
 
 @dataclass
@@ -174,11 +251,15 @@ class Rules:
     """The nftables tables of this hotel. All changes go through apply()."""
 
     def __init__(self, room_id: str, room_nets: list[str], dns_port: int, http_port: int, tls_port: int,
-                 run: Callable[[str], None] | None = None):
+                 run: Callable[[str], None] | None = None, bridges: list[str] | None = None):
         self.table = nft_name(room_id)
         self.room_nets = room_nets
         self.ports = (dns_port, http_port, tls_port)
         self.run = run or self._nft
+        # The room bridges. With them known, a frame from a port that is not
+        # bound yet is dropped instead of let through: a new room could send
+        # with a neighbour's source address until its policy was applied.
+        self.bridges = list(bridges or [])
 
     @staticmethod
     def _nft(script: str) -> None:
@@ -222,7 +303,17 @@ class Rules:
             "  set bound_mac { type ifname . ether_addr; }",
             "  chain room_guard {",
             "    type filter hook prerouting priority -300; policy accept;",
-            "    iifname != @ports return",
+        ]
+        if self.bridges:
+            names = ", ".join(f'"{b}"' for b in self.bridges)
+            lines += [
+                f"    meta ibrname != {{ {names} }} return",  # other bridges on the host are not ours
+                "    iifname != @ports drop",  # a room port with no policy yet sends nothing
+            ]
+        else:
+            lines += ["    iifname != @ports return"]
+        lines += [
+            "    ether type ip6 drop",  # rooms have no IPv6; every rule below is IPv4
             "    iifname . ether saddr != @bound_mac drop",
             "    ether type ip iifname . ip saddr != @bound drop",
             "    ether type arp iifname . arp saddr ip != @bound drop",
@@ -403,6 +494,12 @@ class Table:
 
     def put(self, container_id: str, sandbox_id: str, policy: Policy) -> Room:
         ip, mac, port = self.docker.facts(container_id)
+        if not port:
+            # Without the host-side port the room is not in @ports, so the
+            # guard that binds its source IP and MAC would skip it and a
+            # raw-socket room could send as another room. Fail closed: the
+            # API removes a guest whose policy cannot be applied.
+            raise RuntimeError(f"container {container_id[:12]}: bridge port not found, room not admitted")
         with self.lock:
             old = self.by_cid.get(container_id)
             stale = self.by_ip.get(ip)
@@ -675,20 +772,45 @@ async def resolve_ipv4(name: str, port: int) -> list[str]:
     return [i[4][0] for i in infos]
 
 
+# One room may hold this many proxy connections at once. The daemon serves
+# DNS and the proxy for every room on the hotel; without a cap one room could
+# use every file descriptor it has.
+PROXY_PER_ROOM_MAX = 256
+
+
 class Proxy:
-    def __init__(self, table: Table, resolve=resolve_ipv4, addr_ok=public_ipv4):
+    def __init__(self, table: Table, resolve=resolve_ipv4, addr_ok=public_ipv4, per_room_max: int = PROXY_PER_ROOM_MAX):
         self.table = table
         self.resolve, self.addr_ok = resolve, addr_ok
         self.lock = threading.Lock()
         self.active: dict[str, set] = {}  # room ip -> {(name, writer, upstream writer)}
+        self.per_room_max = per_room_max
+        self.pending: dict[str, int] = {}  # room ip -> connections being handled
+
+    def admit(self, ip: str) -> bool:
+        """Take one connection slot for ip; False when the room is at its cap."""
+        with self.lock:
+            n = self.pending.get(ip, 0)
+            if n >= self.per_room_max:
+                return False
+            self.pending[ip] = n + 1
+            return True
+
+    def release(self, ip: str) -> None:
+        with self.lock:
+            n = self.pending.get(ip, 0) - 1
+            if n <= 0:
+                self.pending.pop(ip, None)
+            else:
+                self.pending[ip] = n
 
     def recheck(self, room: Room) -> None:
         """After a policy change, close this room's connections the new policy does not allow."""
         with self.lock:
             conns = list(self.active.get(room.ip, ()))
         for item in conns:
-            name, w1, w2 = item
-            if not room.policy.allows_name(name):
+            name, conn_port, w1, w2 = item
+            if not room.policy.allows_name(name, conn_port):
                 for w in (w1, w2):
                     try:
                         w.transport.abort()
@@ -698,6 +820,14 @@ class Proxy:
     async def handle(self, reader, writer, port: int, tls: bool):
         ip = writer.get_extra_info("peername")[0]
         up_w = None
+        if not self.admit(ip):
+            try:
+                if not tls:
+                    writer.write(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return
         try:
             if tls:
                 first, hello = await asyncio.wait_for(read_client_hello(reader), 15)
@@ -705,7 +835,7 @@ class Proxy:
             else:
                 first, name = await asyncio.wait_for(read_http_head(reader), 15)
             policy = self.table.policy_of(ip)
-            if not name or policy is None or not policy.allows_name(name):
+            if not name or policy is None or not policy.allows_name(name, port):
                 if not tls:
                     writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 return
@@ -715,13 +845,13 @@ class Proxy:
             if not addrs:
                 return
             up_r, up_w = await asyncio.wait_for(asyncio.open_connection(addrs[0], port), 15)
-            item = (name, writer, up_w)
+            item = (name, port, writer, up_w)
             with self.lock:
                 self.active.setdefault(ip, set()).add(item)
             try:
                 # A switch between the policy read and the registration above
                 # is caught here.
-                if not (self.table.policy_of(ip) or Policy("deny_all")).allows_name(name):
+                if not (self.table.policy_of(ip) or Policy("deny_all")).allows_name(name, port):
                     return
                 up_w.write(first)
                 await asyncio.gather(pipe(reader, up_w), pipe(up_r, writer))
@@ -731,6 +861,7 @@ class Proxy:
         except (OSError, ValueError, asyncio.IncompleteReadError, asyncio.TimeoutError, asyncio.LimitOverrunError):
             pass
         finally:
+            self.release(ip)
             for w in (writer, up_w):
                 if w is not None:
                     try:
@@ -847,6 +978,19 @@ def room_networks(env: dict[str, str]) -> list[tuple[str, str]]:
     return out
 
 
+def room_bridges(env: dict[str, str]) -> list[str]:
+    """The main bridge and one bridge per room network, as room-net.sh names them."""
+    prefix = env.get("ROOM_NET_BRIDGE_PREFIX", "rmnet")
+    return [env["ROOM_BRIDGE"]] + [f"{prefix}{i}" for i in range(len(env.get("ROOM_NETS", "").split()))]
+
+
+def rules_for(env: dict[str, str], ports: tuple[int, int, int], run: Callable[[str], None] | None = None) -> Rules:
+    """The hotel's rules from its room.env: every room network and every room
+    bridge. The bridges turn the port guard from "return" into "drop", so the
+    daemon must name them; a test drives this from an env, main() from the file."""
+    return Rules(env["ROOM_ID"], [n for n, _ in room_networks(env)], *ports, run=run, bridges=room_bridges(env))
+
+
 def bound_socket(kind: int, addr: str, port: int) -> socket.socket:
     s = socket.socket(socket.AF_INET, kind)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -884,7 +1028,7 @@ def main() -> int:
     sock_path = os.environ.get("ROOM_EGRESS_SOCKET", "/run/pool-room-egress/control.sock")
     run_dir = os.path.dirname(sock_path)
     os.makedirs(run_dir, mode=0o750, exist_ok=True)
-    rules = Rules(env["ROOM_ID"], [n for n, _ in nets], *ports)
+    rules = rules_for(env, ports)
     docker = Docker(os.environ.get("ROOM_DOCKER_SOCK", "/run/pool-room/docker.sock"))
     proxy_box: list[Proxy] = []
     table = Table(rules, docker, os.path.join(run_dir, "state.json"),

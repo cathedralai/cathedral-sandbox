@@ -61,7 +61,23 @@ func newHotel(hc hotelConfig, key string) *hotel {
 		hc.Labels = labels
 	}
 	tr := &http.Transport{MaxIdleConns: 1024, MaxIdleConnsPerHost: hc.Concurrency + 64, MaxConnsPerHost: hc.Concurrency + 64, IdleConnTimeout: 90 * time.Second}
-	return &hotel{cfg: hc, key: key, client: &http.Client{Transport: tr}, sem: make(chan struct{}, hc.Concurrency), rooms: map[string]*room{}}
+	// The sync loop (health, quota, list) uses its own small pool: when one
+	// guest's long execs hold every data connection, the hotel must not look down.
+	ctl := &http.Transport{MaxIdleConns: 8, MaxIdleConnsPerHost: 8, MaxConnsPerHost: 8, IdleConnTimeout: 90 * time.Second}
+	return &hotel{cfg: hc, key: key, client: &http.Client{Transport: tr}, ctl: &http.Client{Transport: ctl}, sem: make(chan struct{}, hc.Concurrency), rooms: map[string]*room{}}
+}
+
+// labels and drain read the fields an operator PATCH may change at any time.
+func (h *hotel) labels() map[string]string {
+	h.cfgMu.RLock()
+	defer h.cfgMu.RUnlock()
+	return h.cfg.Labels
+}
+
+func (h *hotel) drain() bool {
+	h.cfgMu.RLock()
+	defer h.cfgMu.RUnlock()
+	return h.cfg.Drain
 }
 
 // addHotel adds h to the hotel set. The caller starts its sync loop.
@@ -69,6 +85,11 @@ func (b *broker) addHotel(h *hotel) error {
 	if strings.Contains(h.cfg.ID, ".") || h.cfg.ID == "" {
 		return fmt.Errorf("hotel id %q: must be non-empty and have no dot", h.cfg.ID)
 	}
+	b.mu.Lock()
+	if h.caps == nil && b.capsOnDisk[h.cfg.ID] != nil { // a runtime hotel keeps its probe results
+		h.caps = b.capsOnDisk[h.cfg.ID]
+	}
+	b.mu.Unlock()
 	b.hotelsMu.Lock()
 	defer b.hotelsMu.Unlock()
 	old := b.hset.Load()
@@ -232,12 +253,17 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	b.mu.Lock()
+	h.cfgMu.Lock()
 	if req.Drain != nil {
 		h.cfg.Drain = *req.Drain
 	}
 	if req.Labels != nil {
+		if h.cfg.Sealed { // the label guests select a sealed hotel by stays
+			req.Labels["sealed"] = "true"
+		}
 		h.cfg.Labels = req.Labels
 	}
+	h.cfgMu.Unlock()
 	b.mu.Unlock()
 	if h.runtime {
 		if err := b.saveRuntimeHotels(); err != nil {
@@ -276,11 +302,11 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string) {
 }
 
 func hotelDoc(h *hotel) map[string]any {
-	labels := h.cfg.Labels
+	labels := h.labels()
 	if labels == nil {
 		labels = map[string]string{}
 	}
-	return map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.cfg.Drain, "runtime": h.runtime}
+	return map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime}
 }
 
 // ---------------------------------------------------------------- persistence

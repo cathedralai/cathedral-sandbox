@@ -109,7 +109,7 @@ func TestGuestHotelSet(t *testing.T) {
 			t.Fatalf("create outside the hotel set or on the sealed hotel: %s", id)
 		}
 	}
-	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}}); status != 400 || errCode(doc) != "unknown_hotel" {
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}}); status != 409 || errCode(doc) != "unknown_hotel" {
 		t.Fatalf("hotel outside the set: %d %v", status, doc)
 	}
 	status, doc := tc.call(t, "key1", "GET", "/v1/broker/hotels", nil)
@@ -226,7 +226,7 @@ func TestOperatorChangesGuestLimitsAtRuntime(t *testing.T) {
 	if status, _ := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"}); status != 429 {
 		t.Fatalf("over the patched limit: %d", status)
 	}
-	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{"hotels": []string{"zz"}}); status != 400 || errCode(doc) != "unknown_hotel" {
+	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{"hotels": []string{"zz"}}); status != 409 || errCode(doc) != "unknown_hotel" {
 		t.Fatalf("unknown hotel: %d %v", status, doc)
 	}
 	if status, _ := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{"max_room": 5}); status != 400 {
@@ -327,5 +327,21 @@ func TestBuiltImageObeysSealedDefaultAndHotelSet(t *testing.T) {
 	status, doc = tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": imgID}), nil)
 	if status != 201 || createsOn(tc)["a"] != before["a"]+1 {
 		t.Fatalf("sealed create from the image: %d %v", status, doc)
+	}
+}
+
+// A dedicated hotel stays dedicated: an ops guest's probe must not start a
+// room on a hotel outside that guest's own hotel list.
+func TestProbeKeepsToGuestHotels(t *testing.T) {
+	tc := limitedChain(t, guestLimits{Hotels: []string{"b", "c"}})
+	tc.b.guests["g1"].cfg.Ops = true
+	if status, doc := tc.call(t, "key1", "POST", "/v1/broker/probe", nil); status != 200 {
+		t.Fatalf("probe: %d %v", status, doc)
+	}
+	if n := len(tc.hotels["a"].creates); n != 0 {
+		t.Fatalf("probe started %d room(s) on hotel a, outside the guest's list", n)
+	}
+	if len(tc.hotels["b"].creates) == 0 {
+		t.Fatalf("probe did not reach an allowed hotel")
 	}
 }
