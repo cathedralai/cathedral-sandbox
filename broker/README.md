@@ -187,6 +187,28 @@ labels each snapshot with the guest). An unknown or foreign snapshot gives
 503 `snapshot_hotel_unavailable`. A fork whose hotel is outside the hotel
 choice gives 409 `snapshot_hotel_excluded`.
 
+## Workspaces
+
+A workspace is a named directory on one hotel that outlives rooms (#305).
+The hotel needs `ROOM_WORKSPACES=1` (see `room-kit/README.md`).
+
+| Route | What it does |
+|---|---|
+| `POST /v1/workspaces` `{"name"}` | Makes a workspace on one hotel. Takes the hotel choice fields. The answer gives `id` = `<hotel>.<name>`. |
+| `GET /v1/workspaces` | The guest's workspaces on all hotels. |
+| `GET` or `DELETE /v1/workspaces/<id>` | One workspace. |
+| `POST` or `GET /v1/workspaces/<id>/versions` | Makes or lists versions. |
+| `POST /v1/workspaces/<id>/rollback` `{"version": n}` | Replaces the files with version n. |
+| `POST /v1/sandboxes` with `"workspace": "<id>"` | The room goes to the hotel that holds the workspace and mounts it. |
+
+A bare name works when one hotel has it. A name is unique for each guest.
+The broker sends the guest id to the hotel in `X-Cathedral-Guest` and copies
+no guest header, so a guest cannot act as another guest. A workspace of
+another guest answers 404 `workspace_not_found`. A create whose hotel choice
+excludes the workspace hotel gets 409 `workspace_hotel_excluded`. A fork and
+a workspace on different hotels get 409 `workspace_snapshot_conflict`. A
+full workspace hotel gets 503 `workspace_hotel_unavailable`.
+
 ## Image prefetch
 
 `POST /v1/images/prefetch` with `{"images": [...]}` pulls the images on

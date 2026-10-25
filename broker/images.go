@@ -50,6 +50,9 @@ type placement struct {
 	// the guest's sealed default still apply.
 	images          map[string]bool
 	sealedByDefault bool // match["sealed"] comes from the guest default, not the request
+	// hotelWorkspace: the hotel name of the workspace the create mounts
+	// (workspaces.go). only is then the hotel that holds it.
+	hotelWorkspace string
 	// prefer: "placement": "prefer". When every named hotel is down or full,
 	// the create may go to another hotel of the same class (fallbackFor).
 	prefer bool
@@ -113,11 +116,18 @@ func (pl placement) apply(payload map[string]any) {
 	if pl.hotelSnap != "" {
 		payload["snapshot_id"] = pl.hotelSnap
 	}
+	if pl.hotelWorkspace != "" {
+		setWorkspaceName(payload, pl.hotelWorkspace)
+	}
 }
 
 // noRoom is the answer when pick finds no hotel and no hotel was tried.
 // Caller must NOT hold b.mu; noRoomReason locks.
 func (b *broker) noRoom(pl placement) createResult {
+	if pl.only != nil && pl.hotelSnap == "" && pl.hotelWorkspace != "" {
+		return createResult{status: 503, header: http.Header{"Retry-After": {"5"}}, doc: errDoc("workspace_hotel_unavailable",
+			"the hotel that holds this workspace has no free room or does not answer; retry later")}
+	}
 	if pl.only != nil {
 		return createResult{status: 503, header: http.Header{"Retry-After": {"5"}}, doc: errDoc("snapshot_hotel_unavailable",
 			"the hotel that holds this snapshot has no free room or does not answer; retry later, or push the snapshot to a registry and create from the image")}
@@ -300,9 +310,17 @@ func (b *broker) fallbackFor(pl placement) (placement, bool) {
 	return fb, true
 }
 
-// placementFor reads the hotel choice of a create and, for a fork, finds the
-// hotel that holds the snapshot.
+// placementFor reads the hotel choice of a create and, for a fork or a
+// workspace, finds the hotel that holds it.
 func (b *broker) placementFor(ctx context.Context, g *guestState, payload map[string]any) (placement, *apiErr) {
+	pl, e := b.snapshotPlacement(ctx, g, payload)
+	if e != nil {
+		return pl, e
+	}
+	return b.workspacePlacement(ctx, g, payload, pl)
+}
+
+func (b *broker) snapshotPlacement(ctx context.Context, g *guestState, payload map[string]any) (placement, *apiErr) {
 	ref, _ := payload["snapshot_id"].(string)
 	pl, e := b.parseSelection(g, payload)
 	if e != nil && !(ref != "" && e.code == "no_matching_hotel") {

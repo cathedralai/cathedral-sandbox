@@ -44,6 +44,7 @@ from cathedral.sandbox_api import (
     TarGet,
 )
 from cathedral.sandbox_provider import InMemorySandboxProvider, SandboxOpError, SandboxProvider
+from cathedral.sandbox_owner import guest_from, owner_id
 
 JSON = "application/json"
 REAPER_INTERVAL_DEFAULT_SECONDS = 30.0
@@ -135,6 +136,7 @@ def _create_request(payload: dict[str, Any]) -> CreateSandboxRequest:
         "build": build,
         "snapshot_id": payload.get("snapshot_id"),
         "count": payload.get("count", 1),
+        "workspace": api.WorkspaceSpec.parse(payload.get("workspace")),
     }
     return CreateSandboxRequest(**kwargs)
 
@@ -278,6 +280,14 @@ class SandboxApplication:
         self._add("GET", r"/v1/snapshots", self.list_snapshots)
         self._add("DELETE", r"/v1/snapshots/(?P<id>[^/]+)", self.delete_snapshot)
         self._add("POST", r"/v1/snapshots/(?P<id>[^/]+)/push", self.push_snapshot)
+        w = r"/v1/workspaces"
+        self._add("POST", w, self.create_workspace)
+        self._add("GET", w, self.list_workspaces)
+        self._add("GET", w + r"/(?P<name>[^/]+)", self.get_workspace)
+        self._add("DELETE", w + r"/(?P<name>[^/]+)", self.delete_workspace)
+        self._add("POST", w + r"/(?P<name>[^/]+)/versions", self.create_workspace_version)
+        self._add("GET", w + r"/(?P<name>[^/]+)/versions", self.list_workspace_versions)
+        self._add("POST", w + r"/(?P<name>[^/]+)/rollback", self.rollback_workspace)
         self._add("GET", r"/v1/sandbox-templates", self.list_templates)
         self._add("GET", r"/v1/sandbox-templates/(?P<uid>[^/]+)", self.get_template)
         self._add("POST", r"/v1/images/prefetch", self.prefetch)
@@ -353,8 +363,55 @@ class SandboxApplication:
     def create(self, *, query, headers, body, api_key, **_):
         request = _create_request(self._json(body))
         idem = headers.get("Idempotency-Key") or headers.get("idempotency-key")
-        doc = self.provider.create(request, api_key=api_key, idempotency=idem, body_digest=_body_digest(body))
+        if request.workspace is not None:
+            # #305: the owner of the room is the owner of the workspace it mounts.
+            self._workspace_store()
+            owner = owner_id(api_key, guest_from(headers, dict(request.labels)))
+            doc = self.provider.create(request, api_key=api_key, idempotency=idem, body_digest=_body_digest(body),
+                                       workspace_owner=owner)
+        else:
+            doc = self.provider.create(request, api_key=api_key, idempotency=idem, body_digest=_body_digest(body))
         return Response.json(202, doc)
+
+    # ------------------------------------------------------------------ #305 workspaces
+    def _workspace_store(self):
+        store = getattr(self.provider, "workspace_store", None)
+        if store is None:
+            raise SandboxOpError("workspaces_unavailable", 501, "this hotel has no workspaces")
+        return store
+
+    def _owner(self, headers, api_key) -> str:
+        return owner_id(api_key, guest_from(headers))
+
+    def create_workspace(self, *, headers, body, api_key, **_):
+        store = self._workspace_store()
+        doc = self._json(body)
+        return Response.json(201, store.create(self._owner(headers, api_key), doc.get("name")))
+
+    def list_workspaces(self, *, headers, api_key, **_):
+        store = self._workspace_store()
+        return Response.json(200, {"workspaces": store.list(self._owner(headers, api_key))})
+
+    def get_workspace(self, *, headers, api_key, name, **_):
+        return Response.json(200, self._workspace_store().get(self._owner(headers, api_key), name))
+
+    def delete_workspace(self, *, headers, api_key, name, **_):
+        self._workspace_store().delete(self._owner(headers, api_key), name)
+        return Response.no_content()
+
+    def create_workspace_version(self, *, headers, body, api_key, name, **_):
+        store = self._workspace_store()
+        doc = self._json(body)
+        return Response.json(201, store.version(self._owner(headers, api_key), name, label=doc.get("label")))
+
+    def list_workspace_versions(self, *, headers, api_key, name, **_):
+        store = self._workspace_store()
+        return Response.json(200, {"versions": store.versions(self._owner(headers, api_key), name)})
+
+    def rollback_workspace(self, *, headers, body, api_key, name, **_):
+        store = self._workspace_store()
+        doc = self._json(body)
+        return Response.json(200, store.rollback(self._owner(headers, api_key), name, doc.get("version")))
 
     def list_sandboxes(self, *, query, headers, body, api_key, **_):
         # §3.4: reap anything past TTL / its idle window before reading state, so a

@@ -295,6 +295,12 @@ func (h *hotel) do(ctx context.Context, method, path string, query url.Values, b
 }
 
 func (h *hotel) doBase(ctx context.Context, base, method, path string, query url.Values, body []byte, timeout time.Duration) (int, http.Header, []byte, error) {
+	return h.doHeaders(ctx, base, method, path, query, body, timeout, nil)
+}
+
+// doHeaders is doBase with extra request headers (the guest id of
+// guestcalls.go).
+func (h *hotel) doHeaders(ctx context.Context, base, method, path string, query url.Values, body []byte, timeout time.Duration, extra http.Header) (int, http.Header, []byte, error) {
 	u := base + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
@@ -304,6 +310,9 @@ func (h *hotel) doBase(ctx context.Context, base, method, path string, query url
 	req, err := http.NewRequestWithContext(ctx, method, u, bytes.NewReader(body))
 	if err != nil {
 		return 0, nil, nil, err
+	}
+	for k, v := range extra {
+		req.Header[k] = v
 	}
 	req.Header.Set("Authorization", "Bearer "+h.key)
 	if body != nil {
@@ -1675,6 +1684,10 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 			b.handleSnapshotList(w, r, g)
 		case strings.HasPrefix(p, "/v1/snapshots/"):
 			b.handleSnapshot(w, r, g, strings.TrimPrefix(p, "/v1/snapshots/"))
+		case p == "/v1/workspaces" && (r.Method == "GET" || r.Method == "POST"):
+			b.handleWorkspaces(w, r, g)
+		case strings.HasPrefix(p, "/v1/workspaces/"):
+			b.handleWorkspace(w, r, g, strings.TrimPrefix(p, "/v1/workspaces/"))
 		case p == "/v1/broker/hotels" && r.Method == "GET":
 			b.handleHotels(w, g)
 		case p == "/v1/broker/stats":

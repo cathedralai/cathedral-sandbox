@@ -49,6 +49,7 @@ from cathedral.sandbox_api import (
     TarGet,
 )
 from cathedral.sandbox_egress import EgressClient
+from cathedral.sandbox_workspaces import WorkspaceStore
 from cathedral.sandbox_provider import (
     InMemorySandboxProvider,
     SandboxOpError,
@@ -312,6 +313,8 @@ class GuestRecord:
     # How this guest's image runs a command under a time limit: "gnu"
     # (timeout N), "busybox" (timeout -t N) or "none". None: not probed yet.
     timeout_form: str | None = None
+    # (owner, name, path, version_on_delete) of the mounted workspace (#305).
+    workspace: tuple[str, str, str, bool] | None = None
 
 
 # A room's exec output, process log and the API's own log record are capped
@@ -631,6 +634,7 @@ class DockerClient:
         network: str | None = None,
         resolv_conf: Path | None = None,
         attach: bool | None = None,
+        mounts: Iterable[tuple[Path, str]] = (),
     ) -> str:
         work_dir.mkdir(parents=True, exist_ok=True)
         argv = [
@@ -652,6 +656,10 @@ class DockerClient:
             "-w",
             workdir or "/work",
         ]
+        # Workspaces (#305): one plain bind of the workspace data directory.
+        # The source is a hotel path the API built, never a request value.
+        for source, target in mounts:
+            argv.extend(["--mount", f"type=bind,source={source.resolve()},target={target}"])
         if user:
             argv.extend(["--user", user])
         if use_kata:
@@ -1145,6 +1153,9 @@ class DockerGuestProvider:
         # the policy outside the guest. Without it, only internet guests get a
         # port and the other modes fail closed to network none.
         self._egress = EgressClient.from_env()
+        # Persistent workspaces (#305). None: CATHEDRAL_WORKSPACE_ROOT is unset.
+        self._workspaces = WorkspaceStore.from_env(self._client)
+        self._doomed_ws: dict[str, tuple[str, str, str, bool]] = {}  # sandbox_id -> workspace of a queued removal
         self._doomed_nets: dict[str, str | None] = {}  # sandbox_id -> network of a queued removal
         self._net_pending: dict[str, str] = {}  # sandbox_id -> network while docker run runs
         self._doomed_attempts: dict[str, int] = {}
@@ -1204,6 +1215,10 @@ class DockerGuestProvider:
         self._capabilities_dind = False
         if os.environ.get("CATHEDRAL_SANDBOX_SWEEP_STALE_BASES", "") == "1":
             _sweep_stale_bases(self._inner._base)  # noqa: SLF001
+
+    @property
+    def workspace_store(self) -> WorkspaceStore | None:
+        return self._workspaces
 
     @property
     def capabilities_dind(self) -> bool:
@@ -1328,10 +1343,18 @@ class DockerGuestProvider:
         api_key: str | None,
         idempotency: str | None,
         body_digest: str,
+        workspace_owner: str | None = None,
     ) -> dict[str, Any]:
         if request.snapshot_id is not None:
             # Fail before any record exists. A fork never starts another image.
             self._snapshot_image(request.snapshot_id)
+        if request.workspace is not None:
+            # Fail before any record exists: 404 for a workspace of another owner.
+            if self._workspaces is None:
+                raise SandboxOpError("workspaces_unavailable", 501, "this hotel has no workspaces")
+            if workspace_owner is None:
+                raise SandboxOpError("workspace_not_found", 404, f"no workspace {request.workspace.name}")
+            self._workspaces.check(workspace_owner, request.workspace.name)
         docs = self._inner.create(
             request, api_key=api_key, idempotency=idempotency, body_digest=body_digest
         )
@@ -1343,7 +1366,7 @@ class DockerGuestProvider:
                 if existing is not None:
                     started.append(self._enrich_doc(doc, existing))
                 else:
-                    started.append(self._start_guest(doc, request))
+                    started.append(self._start_guest(doc, request, workspace_owner))
         except Exception:
             # One failed guest fails the whole create. Release every record and
             # guest of this batch, so no ghost holds quota, and forget the
@@ -1374,6 +1397,9 @@ class DockerGuestProvider:
             "allowlist_fail_closed": fail_closed,
             "network_switchable": self._egress_manages(guest),
         }
+        if guest.workspace is not None:
+            enriched["workspace"] = {"name": guest.workspace[1], "path": guest.workspace[2],
+                                     "version_on_delete": guest.workspace[3]}
         net = dict(enriched.get("network") or {"mode": guest.network_mode, "allow": []})
         net.update(self._policy_doc(guest))
         enriched["network"] = net
@@ -1423,8 +1449,25 @@ class DockerGuestProvider:
             self._auth_pulled.add(image)
             _save_auth_pulled(self._auth_pulled)
 
-    def _start_guest(self, doc: dict[str, Any], request: CreateSandboxRequest) -> dict[str, Any]:
+    def _start_guest(
+        self, doc: dict[str, Any], request: CreateSandboxRequest, workspace_owner: str | None = None
+    ) -> dict[str, Any]:
         """Start the guest for one record. The caller releases the record on failure."""
+        workspace = None
+        if request.workspace is not None and self._workspaces is not None and workspace_owner is not None:
+            spec = request.workspace
+            data = self._workspaces.mount(workspace_owner, spec.name, doc["id"])
+            workspace = (workspace_owner, spec.name, spec.path, spec.version_on_delete, data)
+        try:
+            return self._start_guest_mounted(doc, request, workspace)
+        except BaseException:
+            if workspace is not None:
+                self._workspaces.unmount(workspace[0], workspace[1], doc["id"])
+            raise
+
+    def _start_guest_mounted(
+        self, doc: dict[str, Any], request: CreateSandboxRequest, workspace: tuple | None
+    ) -> dict[str, Any]:
         sandbox_id = doc["id"]
         with self._inner._lock:  # noqa: SLF001
             record = self._inner._sandboxes.get(sandbox_id)  # noqa: SLF001
@@ -1465,6 +1508,7 @@ class DockerGuestProvider:
             container_id = self._start_container(
                 request, sandbox_id=sandbox_id, image=image, name=name, work=work, dind=dind,
                 entrypoint=entrypoint, network=network, attach=attach,
+                mounts=[(workspace[4], workspace[2])] if workspace is not None else (),
             )
         except BaseException:
             self._release_pending(sandbox_id)
@@ -1507,6 +1551,7 @@ class DockerGuestProvider:
             attached=attach,
             policy=applied["policy"] if applied else None,
             policy_sha256=applied["policy_sha256"] if applied else None,
+            workspace=workspace[:4] if workspace is not None else None,
         )
         return self._after_start(doc, sandbox_id, container_id, dind)
 
@@ -1528,6 +1573,7 @@ class DockerGuestProvider:
         entrypoint: tuple[str, ...] | None,
         network: str | None,
         attach: bool | None = None,
+        mounts: Iterable[tuple[Path, str]] = (),
     ) -> str:
         resolv_conf = None
         if network and self._net_pool is not None and self._net_pool.dns:
@@ -1553,6 +1599,7 @@ class DockerGuestProvider:
             network=network,
             resolv_conf=resolv_conf,
             attach=attach,
+            mounts=mounts,
         )
 
     def _after_start(self, doc: dict[str, Any], sandbox_id: str, container_id: str, dind: bool) -> dict[str, Any]:
@@ -1939,6 +1986,8 @@ class DockerGuestProvider:
         with self._doomed_lock:
             self._doomed[sandbox_id] = guest.container_id
             self._doomed_nets[sandbox_id] = guest.network
+            if guest.workspace is not None:
+                self._doomed_ws[sandbox_id] = guest.workspace
         return True
 
     def _confirm_removed(self, sandbox_id: str) -> None:
@@ -1946,9 +1995,31 @@ class DockerGuestProvider:
             self._doomed.pop(sandbox_id, None)
             self._doomed_attempts.pop(sandbox_id, None)
             network = self._doomed_nets.pop(sandbox_id, None)
+            workspace = self._doomed_ws.pop(sandbox_id, None)
         if self._net_pool is not None:
             self._net_pool.release(network)
+        if workspace is not None:
+            self._release_workspace(sandbox_id, workspace)
         self._inner.finish_delete(sandbox_id)
+
+    def _release_workspace(self, sandbox_id: str, workspace: tuple[str, str, str, bool]) -> None:
+        """The room container is gone: free the workspace, then version it if asked.
+
+        A room delete never deletes the workspace. The version runs after the
+        container is gone, so no room writes during the copy.
+        """
+        owner, name, _path, version_on_delete = workspace
+        if self._workspaces is None:
+            return
+        self._workspaces.unmount(owner, name, sandbox_id)
+        if not version_on_delete:
+            return
+        try:
+            self._workspaces.version(owner, name, reason="room_delete")
+        except SandboxOpError as exc:
+            # The code only: a message could name files of the workspace.
+            print(f"cathedral-sandbox workspace: version on delete of {sandbox_id} failed: {exc.code}",
+                  file=sys.stderr, flush=True)
 
     def _remove_queued(self, sandbox_ids: list[str]) -> None:
         """Try once, in parallel, to remove the queued containers of *sandbox_ids*.
