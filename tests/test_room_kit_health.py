@@ -55,15 +55,25 @@ def test_health_answers_from_cache_when_building_the_document_is_slow(monkeypatc
 
     monkeypatch.setattr(health, "document", slow_document)
     health.Handler.key = "k" * 32
-    threading.Thread(target=health.doc_loop, daemon=True).start()
-    time.sleep(0.8)  # the first document is built
-    port = _serve(ThreadingHTTPServer(("127.0.0.1", 0), health.Handler))
-    status, doc, took = _get(port, "/room/health")
-    assert status == 200 and doc["body"]["room_id"] == "r"
-    assert took < 0.2, took
-    assert "X-Health-Age-Ms" in doc["headers"]
-    status, _, _ = _get(port, "/room/health", key="x" * 32)
-    assert status == 401
+    stop = threading.Event()
+    builder = threading.Thread(target=health.doc_loop, args=(stop,), daemon=True)
+    builder.start()
+    try:
+        time.sleep(0.8)  # the first document is built
+        port = _serve(ThreadingHTTPServer(("127.0.0.1", 0), health.Handler))
+        status, doc, took = _get(port, "/room/health")
+        assert status == 200 and doc["body"]["room_id"] == "r"
+        assert took < 0.2, took
+        assert "X-Health-Age-Ms" in doc["headers"]
+        status, _, _ = _get(port, "/room/health", key="x" * 32)
+        assert status == 401
+    finally:
+        # Stop the builder here. Once monkeypatch restores the real document(),
+        # a loop left running prints "document failed" every second into the
+        # output of whatever test runs next (#325).
+        stop.set()
+        builder.join(5)
+    assert not builder.is_alive()
 
 
 class _Upstream(BaseHTTPRequestHandler):
