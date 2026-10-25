@@ -168,15 +168,22 @@ def document() -> dict:
     }
 
 
-def doc_loop() -> None:
-    while True:
+def doc_loop(stop: threading.Event | None = None) -> None:
+    """Rebuild the health document once a second.
+
+    The daemon passes nothing and runs until the process ends. Tests pass an
+    Event and set it at teardown; a loop left running kept printing
+    "document failed" into later tests' captured output (#325).
+    """
+    stop = stop if stop is not None else threading.Event()
+    while not stop.is_set():
         try:
             body = json.dumps(document(), sort_keys=True).encode()
             with _lock:
                 _doc["body"], _doc["at"] = body, time.time()
         except Exception as exc:  # noqa: BLE001 - keep serving the last document
             print(f"room-health: document failed: {exc!r}", file=sys.stderr, flush=True)
-        time.sleep(1)
+        stop.wait(1)
 
 
 def load_key() -> str:
