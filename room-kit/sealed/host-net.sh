@@ -14,7 +14,7 @@ IN=SEALED-${TAP^^}-IN
 TAG="sealed-hotel:$SEALED_NAME"
 PRIVATE="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,169.254.0.0/16"
 
-case "${1:?up|down}" in
+case "${1:?up|down|check}" in
 up)
   ip link show "$TAP" >/dev/null 2>&1 || ip tuntap add dev "$TAP" mode tap
   ip addr replace "$SEALED_HOST_IP/30" dev "$TAP"
@@ -33,6 +33,17 @@ up)
   iptables -C INPUT -m comment --comment "$TAG" -j "$IN" 2>/dev/null || iptables -I INPUT 1 -m comment --comment "$TAG" -j "$IN"
   iptables -t nat -C POSTROUTING -s "$SEALED_GUEST_IP/32" ! -o "$TAP" -m comment --comment "$TAG" -j MASQUERADE 2>/dev/null \
     || iptables -t nat -A POSTROUTING -s "$SEALED_GUEST_IP/32" ! -o "$TAP" -m comment --comment "$TAG" -j MASQUERADE
+  ;;
+check)
+  # Put the rules back when a firewall reload took them (idempotent "up").
+  if iptables -C FORWARD -m comment --comment "$TAG" -j "$FWD" 2>/dev/null \
+     && iptables -C INPUT -m comment --comment "$TAG" -j "$IN" 2>/dev/null \
+     && iptables -t nat -C POSTROUTING -s "$SEALED_GUEST_IP/32" ! -o "$TAP" -m comment --comment "$TAG" -j MASQUERADE 2>/dev/null \
+     && [ "$(iptables -S "$FWD" 2>/dev/null | grep -c -- '-A')" -ge 5 ]; then
+    exit 0
+  fi
+  echo "sealed-hotel: host link rules for $TAP were missing; restoring" >&2
+  exec "$0" up "$2"
   ;;
 down)
   iptables -D FORWARD -m comment --comment "$TAG" -j "$FWD" 2>/dev/null || true

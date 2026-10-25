@@ -28,9 +28,10 @@ customer API is on port 443 with a real TLS certificate.
 - Disk: a spare block device (the kit formats it as xfs), or free space on
   the root file system for a sparse loop image. Keep the root file system
   below 70 % full.
-- Network: inbound TCP 443 from the internet. Outbound HTTPS to Docker Hub,
-  Let's Encrypt, GitHub (uv, Caddy, Python) and storage.googleapis.com (gVisor).
-  Port 80 is not used.
+- Network: inbound TCP 443 from the internet. Outbound HTTPS to Docker Hub
+  (or `ROOM_REGISTRY_MIRRORS`, default mirror.gcr.io), Let's Encrypt, GitHub
+  (uv, Caddy, Python), storage.googleapis.com (gVisor) and PyPI (the pinned
+  wheel set). Port 80 is not used.
 - DNS: an A record for `ROOM_HOSTNAME` to the machine IP, DNS only, before
   you run the installer.
 - A free private /22 or larger for the guest bridge (one address per sandbox).
@@ -143,7 +144,8 @@ address of the allowed name, so an allowed address does not open other names.
 
 Allowlist entries: hostnames, `*.suffix` wildcards (subdomains only, not the
 suffix), IPv4 addresses and IPv4 CIDRs, at most 256. Hostnames and wildcards
-work on TCP 80 and 443 only. Addresses and CIDRs work on every port.
+work on TCP 80 and 443 only (`host:443` opens TLS alone; a bare hostname
+opens both). Addresses and CIDRs work on every port.
 `room-net.sh` still drops private and link-local ranges, so an allowlist
 cannot open them. IPv6 is not supported.
 
@@ -169,11 +171,20 @@ and prints the sha256. Put both values in `versions.lock`.
    make keys and does not print keys.
 3. Copy `room.env.example` to `room.env` and set the values.
 4. Run `sudo ./install.sh room.env`.
-5. Delete the key file from step 2. The kit keeps its own copy in
+5. Keep the key file from step 2 (mode 0600, root): a re-run reads it
+   again and stops at once without it. The kit keeps its own copy in
    `/etc/pool-room/` (root only, and the service group for health).
 
 Run `install.sh` again to apply a changed `room.env`. The installer is
 idempotent.
+
+The installer stops before it changes anything when the key file is
+unreadable, when `ROOM_CUSTOMER` is not 1 to 64 characters of
+`A-Z a-z 0-9 . _ -`, when rooms are live on the room daemon (stop them or
+wait; a restart would end them), or when a pinned download's checksum differs
+from `versions.lock`. It fails at the end unless the API answers
+`GET /v1/status` with 200 for its own key; "done" is never printed over a
+hotel that answers nobody.
 
 ## What the kit installs
 
@@ -199,13 +210,22 @@ Docker daemon. Containers that already run on the host are not touched.
 `API_PROFILE` selects the customer API. A profile is `profiles/<name>.sh`.
 It defines the API start command, its environment, and how the API key is
 passed. The API must listen on `127.0.0.1:ROOM_API_PORT` and must start guests
-through `DOCKER_HOST` (the room daemon). Then every guest runs under runsc.
+through `DOCKER_HOST` (the room daemon). Then every guest runs under runsc,
+and so do image builds: the API uses the classic builder, because BuildKit
+runs `RUN` steps in its own runc worker and ignores the daemon's default
+runtime.
 
 - `v1`: the `/v1` sandbox API from cathedral-sandbox
   (`cathedral.cli sandbox serve --runtime docker`, started through
   `room_api.py`, which applies `ROOM_CREATES_PER_MINUTE`).
 
 To add a profile, add `profiles/<name>.sh` with the same four items.
+
+The API refuses to start with an empty key store (`CATHEDRAL_SANDBOX_KEYS`),
+a malformed key entry (the shape is `key:project[:slots]`) or a malformed
+quota (`CATHEDRAL_SANDBOX_QUOTA` is `rooms:vcpu:memory_gib`). The installer
+writes both from `room.env` and the sizing step, so a refusal there points
+at `room.env`.
 
 ## Remove
 
@@ -223,7 +243,11 @@ not remove apt packages. Delete the DNS record yourself.
 
 - One room per machine (one Caddy on 443).
 - The API keeps sandbox state in memory. A restart of `<ROOM_ID>.service`
-  forgets the sandboxes. Their containers keep running until you remove them.
-- `GET /v1/status` says `runtime: docker` and `kernel_isolation: false`. The
-  API does not know that the room daemon uses runsc. Use `/room/health` for
-  the true runtime.
+  forgets the sandboxes, and its first reconcile pass (about 30 s later)
+  removes their containers. `install.sh` stops when rooms are live; wait until
+  no room is open, or set `ROOM_RESTART_WITH_ROOMS=1` to end them on purpose.
+  A sealed hotel is rebuilt as a new guest, so an update there always ends its
+  rooms.
+- `GET /v1/status` says `runtime: docker` and `kernel_isolation: true` when
+  the room daemon's default runtime is runsc (it asks the daemon). Use
+  `/room/health` for the runtime the probe saw.

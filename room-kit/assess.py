@@ -57,7 +57,9 @@ def cpu() -> dict:
 
 
 def tee() -> dict:
-    p = lambda f: read(f).strip()
+    def p(f):
+        return read(f).strip()
+
     return {
         "kvm": os.path.exists("/dev/kvm"),
         "sev_snp_host": p("/sys/module/kvm_amd/parameters/sev_snp") in {"Y", "1"},

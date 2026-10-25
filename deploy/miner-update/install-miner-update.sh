@@ -15,9 +15,11 @@
 #     [--repair-trust-set]
 #
 # --network, --netuid, --miner-unit and --minimum-sequence have no defaults.
-# --minimum-sequence is the lowest channel sequence this host may accept; take
-# it from the release announcement. The keys digest comes
-# from the release announcement, not from this repository.
+# --minimum-sequence is a floor: this host accepts only channel records with a
+# higher sequence, never one at the floor itself. Pass the sequence just
+# below the release you want this host to take; the release announcement
+# gives it. The keys digest comes from the release announcement, not from
+# this repository.
 # --repair-trust-set: only when a re-run refuses because this host's trust set
 # is unreadable. It moves forward from the verified backup, keeping every
 # revocation.

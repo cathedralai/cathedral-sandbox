@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -118,6 +119,45 @@ func TestHotelReceiptChainHidesOtherGuests(t *testing.T) {
 	}
 }
 
+// TestGuestRoomsPersistedAndRestoredAfterReload verifies that
+// guestRooms (guest→hotel→room-ids) survive a broker restart so that
+// GET /v1/hotels/<id>/receipts still filters correctly after reload.
+func TestGuestRoomsPersistedAndRestoredAfterReload(t *testing.T) {
+	dir := t.TempDir()
+	tc := newChainState(t, dir)
+	// Create a room on hotel "a" for guest 1.
+	id1 := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+	_, hid1, _ := strings.Cut(id1, ".")
+	mine := `{"statement":{"sandbox_id":"` + hid1 + `","image":"g1-image:1","target":"POST /v1/sandboxes"},"signature_b64":"sig-g1"}`
+	other := `{"statement":{"sandbox_id":"other-room","image":"g2-image:2","target":"POST /v1/sandboxes"},"signature_b64":"sig-g2"}`
+	raw := []byte(`{"binding_sha256":"bb","head":"hh","count":2,"receipts":[` + mine + `,` + other + `]}`)
+	tc.hotels["a"].mu.Lock()
+	tc.hotels["a"].receipts = raw
+	tc.hotels["a"].mu.Unlock()
+
+	// Verify filtering works before restart.
+	status, page := tc.body(t, "key1", "GET", "/v1/hotels/a/receipts")
+	if status != 200 || !bytes.Contains(page, []byte("g1-image:1")) || bytes.Contains(page, []byte("g2-image:2")) {
+		t.Fatalf("pre-reload filter: %d %s", status, page)
+	}
+
+	// Save state and restart the broker.
+	if err := tc.b.saveCompat(); err != nil {
+		t.Fatal(err)
+	}
+	tc.start(t)
+
+	// After restart, guestRooms must still know about hid1 for key1.
+	tc.hotels["a"].mu.Lock()
+	tc.hotels["a"].receipts = raw
+	tc.hotels["a"].mu.Unlock()
+
+	status, page = tc.body(t, "key1", "GET", "/v1/hotels/a/receipts")
+	if status != 200 || !bytes.Contains(page, []byte("g1-image:1")) || bytes.Contains(page, []byte("g2-image:2")) {
+		t.Fatalf("post-reload filter: %d %s (guestRooms not persisted)", status, page)
+	}
+}
+
 func (tc *testChain) body(t *testing.T, key, method, path string) (int, []byte) {
 	t.Helper()
 	req, err := http.NewRequest(method, tc.srv.URL+path, nil)
@@ -135,4 +175,89 @@ func (tc *testChain) body(t *testing.T, key, method, path string) (int, []byte) 
 		t.Fatal(err)
 	}
 	return resp.StatusCode, raw
+}
+
+// A guest's own bulk delete is signed without a sandbox id; keep it for that
+// guest (the broker's own label is the last broker_guest label) and drop it
+// for everyone else, including a guest that forged the label earlier in the
+// query.
+func TestFilterKeepsOwnBulkDeleteReceipt(t *testing.T) {
+	body := []byte(`{"receipts":[` +
+		`{"statement":{"action":"bulk_delete","sandbox_id":null,"target":"DELETE /v1/sandboxes?label=job%3Dx&label=broker_guest%3Dg1"}},` +
+		`{"statement":{"action":"bulk_delete","sandbox_id":null,"target":"DELETE /v1/sandboxes?label=broker_guest%3Dg1&label=broker_guest%3Dg2"}},` +
+		`{"statement":{"action":"create","sandbox_id":null,"target":"POST /v1/sandboxes"}}` +
+		`],"count":3}`)
+	out, err := filterHotelReceiptsFor(body, map[string]bool{}, "g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Count int `json:"count"`
+	}
+	_ = json.Unmarshal(out, &doc)
+	if doc.Count != 1 || !strings.Contains(string(out), "job%3Dx") {
+		t.Fatalf("own bulk delete not kept exactly once: %s", out)
+	}
+}
+
+func TestFilteredChainIsMarkedFiltered(t *testing.T) {
+	body := []byte(`{"receipts":[{"statement":{"action":"create","sandbox_id":"a"}}],"count":1,"head":"h"}`)
+	out, err := filterHotelReceiptsFor(body, map[string]bool{"a": true}, "g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Filtered bool `json:"filtered"`
+	}
+	_ = json.Unmarshal(out, &doc)
+	if !doc.Filtered {
+		t.Fatalf("a guest's chain must say it is filtered, or verify_receipts.py checks it as a whole chain: %s", out)
+	}
+}
+
+func TestFilteredChainCountsScannedReceipts(t *testing.T) {
+	body := []byte(`{"receipts":[{"statement":{"sandbox_id":"a"}},{"statement":{"sandbox_id":"b"}},{"statement":{"sandbox_id":"c"}}],"count":3}`)
+	out, err := filterHotelReceiptsFor(body, map[string]bool{"b": true}, "g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Scanned int `json:"scanned"`
+		Count   int `json:"count"`
+	}
+	_ = json.Unmarshal(out, &doc)
+	if doc.Scanned != 3 || doc.Count != 1 {
+		t.Fatalf("a filtered page must say how many hotel receipts it covered, so a client can page on: %s", out)
+	}
+}
+
+// A guest receipt past the hotel's first page must still surface: filtering
+// only the oldest page left Affinities / CONST with count:0.
+func TestHotelReceiptWalkFindsGuestPastFirstPage(t *testing.T) {
+	tc := newChain(t)
+	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+	_, hid, _ := strings.Cut(id, ".")
+	recs := make([]string, 0, 1001)
+	for i := 0; i < 1000; i++ {
+		recs = append(recs, `{"statement":{"sandbox_id":"other-`+strings.Repeat("x", 8)+`","image":"other:1","target":"POST /v1/sandboxes"},"signature_b64":"sig-o"}`)
+	}
+	mine := `{"statement":{"sandbox_id":"` + hid + `","image":"guest-mine:1","target":"POST /v1/sandboxes"},"signature_b64":"sig-mine"}`
+	recs = append(recs, mine)
+	raw := []byte(`{"binding_sha256":"bb","head":"hh","count":1001,"receipts":[` + strings.Join(recs, ",") + `]}`)
+	tc.hotels["a"].mu.Lock()
+	tc.hotels["a"].receipts = raw
+	tc.hotels["a"].mu.Unlock()
+
+	status, page := tc.body(t, "key1", "GET", "/v1/hotels/a/receipts")
+	if status != 200 || !bytes.Contains(page, []byte("guest-mine:1")) {
+		t.Fatalf("walk past first page: %d %s", status, page)
+	}
+	var doc struct {
+		Count   int `json:"count"`
+		Scanned int `json:"scanned"`
+	}
+	_ = json.Unmarshal(page, &doc)
+	if doc.Count != 1 || doc.Scanned < 1001 {
+		t.Fatalf("expected one owned receipt after scanning past page 1: %s", page)
+	}
 }
