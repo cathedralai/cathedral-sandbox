@@ -53,6 +53,12 @@ type placement struct {
 	// hotelWorkspace: the hotel name of the workspace the create mounts
 	// (workspaces.go). only is then the hotel that holds it.
 	hotelWorkspace string
+	// prefer: "placement": "prefer". When every named hotel is down or full,
+	// the create may go to another hotel of the same class (fallbackFor).
+	prefer bool
+	// class: set only on a fallback. "sealed" or "unsealed": the hotel must be
+	// of that class, on top of every rule above.
+	class string
 }
 
 func (pl placement) selects(h *hotel) bool {
@@ -65,18 +71,30 @@ func (pl placement) selects(h *hotel) bool {
 	if len(pl.images) > 0 && !pl.images[h.cfg.ID] {
 		return false
 	}
+	isSealed := h.labels()["sealed"] == "true"
+	switch pl.class {
+	case "sealed":
+		if !isSealed {
+			return false
+		}
+	case "unsealed":
+		if isSealed {
+			return false
+		}
+	}
 	// A hotel with "sealed": true in the config takes only creates that ask
 	// for a sealed room ("sealed": true or hotel label sealed=true) or name it.
-	if h.cfg.Sealed && len(pl.ids) == 0 && pl.match["sealed"] != "true" {
+	// A sealed fallback counts as asking: it comes from a named sealed hotel.
+	if h.cfg.Sealed && len(pl.ids) == 0 && pl.match["sealed"] != "true" && pl.class != "sealed" {
 		return false
 	}
 	for k, v := range pl.match {
-		if h.cfg.Labels[k] != v {
+		if h.labels()[k] != v {
 			return false
 		}
 	}
 	for k, v := range pl.exclude {
-		if h.cfg.Labels[k] == v {
+		if h.labels()[k] == v {
 			return false
 		}
 	}
@@ -94,6 +112,7 @@ func (pl placement) apply(payload map[string]any) {
 	delete(payload, "hotel_labels")
 	delete(payload, "exclude_hotel_labels")
 	delete(payload, "sealed")
+	delete(payload, "placement")
 	if pl.hotelSnap != "" {
 		payload["snapshot_id"] = pl.hotelSnap
 	}
@@ -103,7 +122,8 @@ func (pl placement) apply(payload map[string]any) {
 }
 
 // noRoom is the answer when pick finds no hotel and no hotel was tried.
-func (pl placement) noRoom() createResult {
+// Caller must NOT hold b.mu; noRoomReason locks.
+func (b *broker) noRoom(pl placement) createResult {
 	if pl.only != nil && pl.hotelSnap == "" && pl.hotelWorkspace != "" {
 		return createResult{status: 503, header: http.Header{"Retry-After": {"5"}}, doc: errDoc("workspace_hotel_unavailable",
 			"the hotel that holds this workspace has no free room or does not answer; retry later")}
@@ -112,7 +132,47 @@ func (pl placement) noRoom() createResult {
 		return createResult{status: 503, header: http.Header{"Retry-After": {"5"}}, doc: errDoc("snapshot_hotel_unavailable",
 			"the hotel that holds this snapshot has no free room or does not answer; retry later, or push the snapshot to a registry and create from the image")}
 	}
-	return createResult{status: 429, header: http.Header{"Retry-After": {"5"}}, doc: errDoc("no_free_rooms", "all hotels are full; retry later")}
+	return b.noRoomReason(pl)
+}
+
+// noRoomReason distinguishes "hotels down" from "hotels full" so a dead hotel
+// (e.g. green) is not reported as 429 all hotels are full.
+func (b *broker) noRoomReason(pl placement) createResult {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var matching, down, full, free int
+	for _, h := range b.hotelList() {
+		if !pl.allows(h) {
+			continue
+		}
+		matching++
+		if !h.ok || h.drain() || time.Now().Before(h.backoffUntil) {
+			down++
+			continue
+		}
+		if b.freeFor(h) > 0 {
+			free++
+		} else {
+			full++
+		}
+	}
+	ra := http.Header{"Retry-After": {"5"}}
+	if matching == 0 {
+		return createResult{status: 409, header: ra, doc: errDoc("no_matching_hotel", "no hotel matches the hotel selection")}
+	}
+	if free > 0 {
+		// Race: a room freed between pick and noRoom; still ask the guest to retry.
+		return createResult{status: 429, header: ra, doc: errDoc("no_free_rooms", "all hotels are full; retry later")}
+	}
+	if down > 0 && full == 0 {
+		return createResult{status: 503, header: ra, doc: errDoc("hotels_unavailable",
+			"selected hotels are down or draining; retry later")}
+	}
+	if down > 0 {
+		return createResult{status: 503, header: ra, doc: errDoc("hotels_unavailable",
+			"selected hotels are down or full; retry later")}
+	}
+	return createResult{status: 429, header: ra, doc: errDoc("no_free_rooms", "all hotels are full; retry later")}
 }
 
 func errDoc(code, msg string) map[string]any {
@@ -147,7 +207,7 @@ func stringMap(v any, field string) (map[string]string, *apiErr) {
 
 // parseSelection reads "hotels", "hotel_labels", "exclude_hotel_labels" and
 // "sealed", and applies the guest's hotel set and sealed default (guests.go).
-// It answers 400 for an unknown hotel id and 409 when no hotel matches.
+// It answers 409 for an unknown hotel id and 409 when no hotel matches.
 func (b *broker) parseSelection(g *guestState, payload map[string]any) (placement, *apiErr) {
 	var pl placement
 	if v, ok := payload["hotels"]; ok && v != nil {
@@ -159,7 +219,7 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 		for _, x := range list {
 			id, _ := x.(string)
 			if b.hotelByID(id) == nil || !g.limitsAllow(b, id) {
-				return pl, &apiErr{400, "unknown_hotel", fmt.Sprintf("no hotel %q", fmt.Sprint(x))}
+				return pl, &apiErr{409, "unknown_hotel", fmt.Sprintf("no hotel %q", fmt.Sprint(x))}
 			}
 			pl.ids[id] = true
 		}
@@ -191,6 +251,17 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 		}
 		pl.exclude["sealed"] = "true"
 	}
+	// "placement": "require" (default) keeps a create on the named hotels;
+	// "prefer" lets it fall back to a hotel of the same class (fallbackFor).
+	if v, ok := payload["placement"]; ok && v != nil {
+		switch v {
+		case "require":
+		case "prefer":
+			pl.prefer = true
+		default:
+			return pl, &apiErr{400, "invalid_hotel_selection", `placement must be "require" or "prefer"`}
+		}
+	}
 	_, named := payload["hotels"]
 	_, sealedField := payload["sealed"]
 	b.scope(g, &pl, named && payload["hotels"] != nil, sealedField && payload["sealed"] != nil)
@@ -200,6 +271,43 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 		}
 	}
 	return pl, &apiErr{409, "no_matching_hotel", "no hotel matches the hotel selection"}
+}
+
+// fallbackFor widens a "prefer" placement whose named hotels are all down or
+// full: any other hotel of the same class (sealed or not) that the rest of the
+// selection and the guest's hotel list allow. A sealed fallback needs the
+// guest's own hotel list, so a guest never lands on a sealed hotel it was not
+// given. Named hotels of mixed class, and forks, do not fall back.
+func (b *broker) fallbackFor(pl placement) (placement, bool) {
+	if !pl.prefer || len(pl.ids) == 0 || pl.only != nil {
+		return pl, false
+	}
+	n, sealed := 0, 0
+	for id := range pl.ids {
+		h := b.hotelByID(id)
+		if h == nil {
+			return pl, false
+		}
+		n++
+		if h.labels()["sealed"] == "true" {
+			sealed++
+		}
+	}
+	if sealed != 0 && sealed != n {
+		return pl, false
+	}
+	if sealed == n && len(pl.allowed) == 0 {
+		return pl, false
+	}
+	// The class is a separate rule, so the request's own hotel_labels and
+	// exclude_hotel_labels (even on the "sealed" label) still apply.
+	fb := pl
+	fb.ids = nil
+	fb.class = "unsealed"
+	if sealed == n {
+		fb.class = "sealed"
+	}
+	return fb, true
 }
 
 // placementFor reads the hotel choice of a create and, for a fork or a
@@ -227,7 +335,7 @@ func (b *broker) snapshotPlacement(ctx context.Context, g *guestState, payload m
 	}
 	// A fork goes to its snapshot's hotel. The guest's sealed default does not
 	// stop a fork of a snapshot on an unsealed hotel.
-	if pl.sealedByDefault && h.cfg.Labels["sealed"] != "true" {
+	if pl.sealedByDefault && h.labels()["sealed"] != "true" {
 		delete(pl.match, "sealed")
 		pl.sealedByDefault = false
 	}
@@ -246,15 +354,15 @@ func (b *broker) handleHotels(w http.ResponseWriter, g *guestState) {
 		if !g.limits.allows(h.cfg.ID) {
 			continue
 		}
-		free := h.slots - h.used()
-		if free < 0 || !h.ok || h.cfg.Drain {
+		free := b.freeFor(h)
+		if free < 0 || !h.ok || h.drain() {
 			free = 0
 		}
-		labels := h.cfg.Labels
+		labels := h.labels()
 		if labels == nil {
 			labels = map[string]string{}
 		}
-		out = append(out, map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "up": h.ok, "drain": h.cfg.Drain, "free_rooms": free})
+		out = append(out, map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "up": h.ok, "drain": h.drain(), "free_rooms": free, "down_since": downSince(h)})
 	}
 	b.mu.Unlock()
 	writeJSON(w, 200, map[string]any{"hotels": out})
@@ -317,6 +425,9 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	notFound := &apiErr{404, "snapshot_not_found", "no snapshot " + ref}
 	if hotelID, rest, ok := strings.Cut(ref, "."); ok && b.hotelByID(hotelID) != nil {
 		h := b.hotelByID(hotelID)
+		if !g.limitsAllow(b, h.cfg.ID) {
+			return nil, "", notFound
+		}
 		list, err := b.hotelSnapshots(ctx, g, h)
 		if err != nil {
 			return nil, "", &apiErr{502, "hotel_unreachable", "hotel " + h.cfg.ID + " did not answer"}
@@ -335,6 +446,9 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	var hits []hit
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
+		if !g.limitsAllow(b, h.cfg.ID) { // a hotel outside the list may hang; it holds none of this guest's snapshots
+			continue
+		}
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
@@ -406,6 +520,9 @@ func (b *broker) handleSnapshotList(w http.ResponseWriter, r *http.Request, g *g
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
+		if !g.limitsAllow(b, h.cfg.ID) {
+			continue
+		}
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()

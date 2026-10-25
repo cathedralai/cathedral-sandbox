@@ -126,7 +126,19 @@ EOF
 
 # The room kit, exactly as for unsealed hotels, plus the guest's room.env.
 mkdir -p "$R/opt/room-kit"
-tar -C "$KIT" --exclude=./sealed/work -cf - . | tar -C "$R/opt/room-kit" -xf -
+# Only tracked kit files and the pinned API tarball go into the measured
+# initrd. A stray sealed.env, editor swap file or __pycache__ in the checkout
+# changed the measurement and shipped into the guest.
+# shellcheck disable=SC1091
+source "$KIT/versions.lock"
+if git -C "$KIT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C "$KIT" ls-files -z | grep -zv '^sealed/work/' | tar -C "$KIT" --null -T - -cf - | tar -C "$R/opt/room-kit" -xf -
+else
+  tar -C "$KIT" --exclude=./sealed/work --exclude='*.swp' --exclude='__pycache__' --exclude=./sealed/sealed.env \
+    --exclude=./room.env --exclude=./dist -cf - . | tar -C "$R/opt/room-kit" -xf -
+fi
+mkdir -p "$R/opt/room-kit/dist"
+install -m 0644 "$KIT/$CATHEDRAL_TARBALL" "$R/opt/room-kit/dist/"
 { cat "$KIT/KIT_COMMIT" 2>/dev/null || ( cd "$KIT" && git rev-parse HEAD 2>/dev/null ) || echo unknown; } > "$R/opt/room-kit/KIT_COMMIT"
 cat > "$R/opt/room-kit/room.env" <<EOF
 # Sealed hotel $SEALED_NAME: written by sealed/build-guest.sh, part of the measured initrd.
@@ -188,8 +200,11 @@ if [ $DEBUG = 1 ]; then
   printf 'ListenAddress %s\nPasswordAuthentication no\nPermitRootLogin prohibit-password\n' "$SEALED_GUEST_IP" \
     > "$R/etc/ssh/sshd_config.d/10-sealed-debug.conf"
   mkdir -p "$R/etc/systemd/system/ssh.service.d"
-  printf '[Service]\nExecStartPre=/usr/bin/ssh-keygen -A\n' > "$R/etc/systemd/system/ssh.service.d/10-hostkeys.conf"
+  # Ubuntu's unit runs "sshd -t" first and the build removes host keys, so
+  # reset the list: make keys, then check the config.
+  printf '[Service]\nExecStartPre=\nExecStartPre=/usr/bin/ssh-keygen -A\nExecStartPre=/usr/sbin/sshd -t\n' > "$R/etc/systemd/system/ssh.service.d/10-hostkeys.conf"
   in_root systemctl enable -q ssh.service
+  in_root systemctl mask -q ssh.socket 2>/dev/null || true
 else
   in_root systemctl mask -q ssh.service ssh.socket 2>/dev/null || true
   rm -f "$R"/etc/ssh/ssh_host_*

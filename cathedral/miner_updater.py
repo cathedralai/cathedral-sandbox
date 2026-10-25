@@ -1024,6 +1024,7 @@ def _locked(
     body: Callable[[MinerUpdaterHost, dict[str, object]], UpdateOutcome],
     *,
     after: Callable[[MinerUpdaterHost, UpdateOutcome], UpdateOutcome] | None = None,
+    unreadable_status: int = EXIT_ALERT,
 ) -> UpdateOutcome:
     inherited = host.lock_fd
     try:
@@ -1035,7 +1036,10 @@ def _locked(
             try:
                 state = read_state(host.paths.state_file)
             except MinerUpdateError as exc:
-                return UpdateOutcome("refused", str(exc), EXIT_REFUSED)
+                # An unreadable state file must page, not go quiet: the miner
+                # health check and the unverified count both need it, and
+                # exit 10 counts as success for the unit.
+                return UpdateOutcome("refused", f"updater state unreadable: {exc}", unreadable_status, alert=True)
             try:
                 outcome = body(host, state)
             except MinerUpdateHalted as exc:
@@ -1741,11 +1745,12 @@ def fallback_to_previous(host: MinerUpdaterHost, current_status: int) -> UpdateO
             alert=True,
         )
 
-    outcome = _locked(host, body)
+    # The fallback could not run (the lock is busy, the links moved, the
+    # state is unreadable): the current updater's own status stands, so a
+    # fault still pages. An unreadable state pages on its own when that
+    # status would be quiet.
+    outcome = _locked(host, body, unreadable_status=passthrough if passthrough != EXIT_REFUSED else EXIT_ALERT)
     if outcome.exit_status == EXIT_REFUSED and passthrough != EXIT_REFUSED:
-        # The fallback could not run (the lock is busy, the links moved, the
-        # state is unreadable): the current updater's own status stands, so a
-        # fault still pages.
         outcome = dataclasses.replace(outcome, exit_status=passthrough)
     return outcome
 
@@ -2436,8 +2441,13 @@ def resolve(host: MinerUpdaterHost, action: str) -> UpdateOutcome:
 def describe_status(paths: HostPaths, config: HostConfig | None, *, expected_uid: int = 0) -> dict[str, object]:
     """What is installed and what happened last. Works with the channel unreachable."""
 
-    state = read_state(paths.state_file)
-    miner = state["miner"]
+    try:
+        state = read_state(paths.state_file)
+        state_view: object = "readable"
+    except MinerUpdateError as exc:
+        state = {}  # say so, like an unreadable pin or trust set, instead of refusing outright
+        state_view = f"unreadable: {exc}"
+    miner = state.get("miner") or {}
     assert isinstance(miner, dict)
     try:
         pinned: object = read_pin(paths.pin_file)
@@ -2476,7 +2486,9 @@ def describe_status(paths: HostPaths, config: HostConfig | None, *, expected_uid
             "stage": miner.get("stage"),
             "pending": miner.get("pending"),
         },
-        "needs_operator": miner.get("stage") not in (None, STAGE_PREPARED, STAGE_PROBATION)
+        "state": state_view,
+        "needs_operator": state_view != "readable"
+        or miner.get("stage") not in (None, STAGE_PREPARED, STAGE_PROBATION)
         or (isinstance(last, dict) and last.get("action") == "halted"),
         "last_check": last,
         "last_refusal": state.get("last_refusal"),

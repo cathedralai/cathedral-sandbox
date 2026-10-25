@@ -22,6 +22,8 @@ operator tooling and the audit facade already use (``CATHEDRAL_API_URL``,
 from __future__ import annotations
 
 import hashlib
+import ipaddress
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -90,11 +92,20 @@ MIN_CREATES_PER_MINUTE = 100
 
 # §3.12 idempotency-key grammar (Harbor's own pattern: 8-128 of A-Za-z0-9._:-).
 _IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9._:-]{8,128}")
+# Ranges a room may not allowlist: the host firewall drops them anyway, and an
+# allowlist that names them would open the host, metadata or private networks
+# if that rule were ever missing.
+_NON_PUBLIC_V4 = tuple(ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+    "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
+))
 _LABEL_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,62}")
 _LABEL_VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,63}")
 # A docker reference path: optional registry, repository, and a :tag or @digest suffix.
+# Each part starts with a letter or digit: the ref is a docker CLI argument, and a
+# leading dash would read as a flag.
 _IMAGE_REF_RE = re.compile(
-    r"^(?:(?P<registry>[a-z0-9._-]+(?::[0-9]+)?)/)?(?P<repository>[a-z0-9._/-]+?)"
+    r"^(?:(?P<registry>[a-z0-9][a-z0-9._-]*(?::[0-9]+)?)/)?(?P<repository>[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)*?)"
     r"(?::(?P<tag>[A-Za-z0-9][A-Za-z0-9_.-]{0,127})|@(?P<digest>sha256:[0-9a-f]{64}))$"
 )
 # Agent IDE published templates (G6): sbt-<slug>-<hex>
@@ -247,25 +258,50 @@ def canonical_network_mode(mode: str) -> str:
 def normalize_allow_entry(entry: object) -> str:
     """Validate one allowlist entry and return its canonical form.
 
-    Accepted: a hostname ("pypi.org"), a leading wildcard ("*.pythonhosted.org",
-    which matches every name below the suffix but not the suffix itself), an
-    IPv4 address and an IPv4 CIDR. Hostnames are lower case with no trailing
-    dot. A CIDR is written in network form (10.1.2.3/8 is 10.0.0.0/8).
-    IPv6, URLs, ports and paths are refused.
+    Accepted: a hostname ("pypi.org"), optional ``:80`` / ``:443`` on a hostname
+    or wildcard (kept in the policy so the egress proxy opens only that port;
+    a bare hostname means both TCP 80 and 443), a leading wildcard
+    ("*.pythonhosted.org"), an IPv4 address and an IPv4 CIDR. Hostnames are
+    lower case with no trailing dot. A CIDR is written in network form
+    (10.1.2.3/8 is 10.0.0.0/8). IPv6, URLs, paths, and hostname ports other
+    than 80/443 are refused. Bare IPv4/CIDR allow every port on that address
+    (nftables); use hostnames when you need name-bound 80/443 only.
     """
-    import ipaddress
-
     _require(isinstance(entry, str) and 1 <= len(entry) <= 255, "invalid_network_allowlist",
              "allowlist entries must be non-empty strings of at most 255 characters")
     value = entry.strip().lower().rstrip(".")
-    bad = f"allowlist entry {entry!r} is not a hostname, *.wildcard, IPv4 address or IPv4 CIDR"
+    bad = f"allowlist entry {entry!r} is not a hostname, hostname:80|:443, *.wildcard, IPv4 address or IPv4 CIDR"
     _require(bool(value), "invalid_network_allowlist", bad)
+    # Optional host:port — only 80/443 for named hosts (egress proxy).
+    port: int | None = None
+    if value.count(":") == 1 and not value.startswith("[") and "/" not in value:
+        host_part, port_part = value.rsplit(":", 1)
+        if port_part.isdigit():
+            port = int(port_part)
+            _require(1 <= port <= 65535, "invalid_network_allowlist", bad)
+            try:
+                ipaddress.ip_address(host_part)
+            except ValueError:
+                if port not in (80, 443):
+                    raise SandboxContractError(
+                        "invalid_network_allowlist",
+                        f"allowlist entry {entry!r}: named hosts only allow TCP 80 and 443 "
+                        "(omit the port, or use :80/:443)",
+                    ) from None
+                value = host_part
+            else:
+                raise SandboxContractError(
+                    "invalid_network_allowlist",
+                    f"allowlist entry {entry!r}: use a bare IPv4/CIDR (all ports) or a hostname:80|:443",
+                ) from None
     if "/" in value:
         try:
             net = ipaddress.ip_network(value, strict=False)
         except ValueError:
             raise SandboxContractError("invalid_network_allowlist", bad) from None
         _require(net.version == 4, "invalid_network_allowlist", f"allowlist entry {entry!r}: IPv6 is not supported")
+        _require(not any(net.overlaps(n) for n in _NON_PUBLIC_V4), "invalid_network_allowlist",
+                 f"allowlist entry {entry!r}: private, host or reserved ranges cannot be allowlisted")
         return str(net)
     try:
         addr = ipaddress.ip_address(value)
@@ -273,6 +309,8 @@ def normalize_allow_entry(entry: object) -> str:
         addr = None
     if addr is not None:
         _require(addr.version == 4, "invalid_network_allowlist", f"allowlist entry {entry!r}: IPv6 is not supported")
+        _require(not any(addr in n for n in _NON_PUBLIC_V4), "invalid_network_allowlist",
+                 f"allowlist entry {entry!r}: private, host or reserved addresses cannot be allowlisted")
         return str(addr)
     _require(":" not in value and "[" not in value, "invalid_network_allowlist", bad)
     name = value[2:] if value.startswith("*.") else value
@@ -280,7 +318,51 @@ def normalize_allow_entry(entry: object) -> str:
     _require(len(name) <= 253 and len(labels) >= 2 and all(_HOST_LABEL_RE.match(lb) for lb in labels),
              "invalid_network_allowlist", bad)
     _require(not labels[-1].isdigit(), "invalid_network_allowlist", bad)
-    return value
+    if port is None:
+        return value
+    return f"{value}:{port}"
+
+
+def _merge_allow_ports(entries: Sequence[str]) -> list[str]:
+    """Collapse host / host:port rows: bare host means both 80 and 443; listing
+    both ports (or bare plus a port) collapses to the bare hostname."""
+    hosts: dict[str, set[int]] = {}
+    wilds: dict[str, set[int]] = {}
+    others: list[str] = []
+    for raw in entries:
+        e = normalize_allow_entry(raw)
+        port: int | None = None
+        value = e
+        if e.count(":") == 1 and not e.startswith("[") and "/" not in e:
+            host_part, port_part = e.rsplit(":", 1)
+            if port_part.isdigit():
+                value, port = host_part, int(port_part)
+        try:
+            ipaddress.ip_network(value, strict=False) if "/" in value else ipaddress.ip_address(value)
+        except ValueError:
+            pass
+        else:
+            others.append(e)
+            continue
+        bucket = wilds if value.startswith("*.") else hosts
+        key = value[2:] if value.startswith("*.") else value
+        ports = bucket.setdefault(key, set())
+        if port is None:
+            ports.update((80, 443))
+        else:
+            ports.add(port)
+    out: list[str] = list(others)
+    for name, ports in hosts.items():
+        if ports >= {80, 443}:
+            out.append(name)
+        else:
+            out.extend(f"{name}:{p}" for p in sorted(ports))
+    for name, ports in wilds.items():
+        if ports >= {80, 443}:
+            out.append("*." + name)
+        else:
+            out.extend(f"*.{name}:{p}" for p in sorted(ports))
+    return sorted(set(out))
 
 
 # Credential references (#304): the hotel egress proxy adds a header with a
@@ -312,13 +394,13 @@ def normalize_credentials(mode: str, allow: Sequence[str], credentials: object) 
     _require(canonical_network_mode(mode) == "allowlist", "invalid_credentials", "credentials need mode allowlist")
     _require(len(credentials) <= CREDENTIALS_MAX, "invalid_credentials",  # type: ignore[arg-type]
              f"at most {CREDENTIALS_MAX} credentials")
-    allowed = {normalize_allow_entry(e) for e in allow}
+    allowed = {normalize_allow_entry(e).split(":", 1)[0] for e in allow}
     out: dict[str, dict[str, str]] = {}
     for entry in credentials:  # type: ignore[union-attr]
         _require(isinstance(entry, Mapping) and set(entry) == {"host", "header", "secret"}, "invalid_credentials",
                  "each credential is {\"host\", \"header\", \"secret\"}")
         host = normalize_allow_entry(entry["host"])
-        _require(not host.startswith("*.") and "/" not in host and not host.replace(".", "").isdigit(),
+        _require(not host.startswith("*.") and "/" not in host and ":" not in host and not host.replace(".", "").isdigit(),
                  "invalid_credentials", "credential host must be an exact hostname")
         _require(host in allowed or any(a.startswith("*.") and host.endswith(a[1:]) for a in allowed),
                  "invalid_credentials", f"credential host {host} is not in the allowlist")
@@ -339,7 +421,7 @@ def canonical_network_policy(mode: str, allow: Sequence[str] = (), credentials: 
     "credentials" is present only when the policy has credential references,
     so a policy without them keeps its old document and hash."""
     mode = canonical_network_mode(mode)
-    entries = sorted({normalize_allow_entry(e) for e in allow}) if mode == "allowlist" else []
+    entries = _merge_allow_ports(allow) if mode == "allowlist" else []
     doc: dict[str, object] = {"mode": mode, "allow": entries}
     creds = normalize_credentials(mode, allow, credentials)
     if creds:
@@ -349,8 +431,6 @@ def canonical_network_policy(mode: str, allow: Sequence[str] = (), credentials: 
 
 def network_policy_sha256(policy: Mapping[str, object]) -> str:
     """sha256 of the canonical JSON of *policy* (sort_keys, no spaces, UTF-8)."""
-    import json
-
     raw = json.dumps(dict(policy), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return hashlib.sha256(raw).hexdigest()
 
@@ -499,7 +579,13 @@ class CreateSandboxRequest:
         sources = [self.image is not None, self.build is not None, self.snapshot_id is not None]
         _require(sum(sources) == 1, "invalid_source", "exactly one of image, build, or snapshot_id is required")
         if self.snapshot_id is not None:
-            _require(bool(self.snapshot_id.strip()), "invalid_snapshot_id", "snapshot_id must not be blank")
+            # A list or number here was an AttributeError, so a 500 with a
+            # traceback instead of the 400 every other wrong-shaped field gets.
+            _require(
+                isinstance(self.snapshot_id, str) and bool(self.snapshot_id.strip()),
+                "invalid_snapshot_id",
+                "snapshot_id must be a non-blank string",
+            )
         _require(1 <= self.count <= FORK_MAX_COUNT, "invalid_count", f"count must be between 1 and {FORK_MAX_COUNT}")
         _require(
             isinstance(self.ttl_seconds, int)
@@ -719,8 +805,6 @@ def operation_id() -> str:
 
 def idempotency_digest(prefix: str, *parts: Sequence[object] | object) -> str:
     """A stable Idempotency-Key derived from request content (same body -> same key)."""
-    import json
-
     digest = hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode("utf-8"))
     return validate_idempotency_key(f"{prefix}-{digest.hexdigest()[:40]}")
 

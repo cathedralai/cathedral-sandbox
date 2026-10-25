@@ -3636,7 +3636,7 @@ class RegistryApp:
             self.store.enroll(
                 hotkey, endpoint_url, nonce=nonce, request_digest=request_digest
             )
-        except LifecycleError as exc:
+        except LifecycleError:
             # A terminal worker (revoked / retired / retiring) may not
             # re-enroll itself by changing its endpoint; recovery is an
             # operator action (#85). 409:

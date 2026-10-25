@@ -8,7 +8,7 @@ The broker does four things:
 
 | Function | Routes | What it does |
 |---|---|---|
-| Scatter | `POST /v1/sandboxes` (also `count` up to 10,000) | Picks a hotel at random, with weight = free rooms. Each hotel has a fixed number of creates in flight (`concurrency`). If a hotel answers 429, the broker tries another hotel. If no hotel has a free room, it answers 429 with `Retry-After`. |
+| Scatter | `POST /v1/sandboxes` (also `count` up to 10,000) | Picks a hotel at random, with weight = free rooms. Each hotel has a fixed number of creates in flight (`concurrency`). If a hotel answers 429, the broker tries another hotel. If no hotel has a free room, it answers 429 `no_free_rooms`. If all matching hotels are down or draining, it answers 503 `hotels_unavailable`. |
 | Gather | `GET /v1/sandboxes`, `GET /v1/quota`, `GET /v1/usage`, `DELETE /v1/sandboxes?label=` | Asks all hotels in parallel and merges the answers. A guest sees only its own rooms. |
 | Route | `/v1/sandboxes/<hotel>.<id>/...` | Sends exec, files, tar, heartbeat, delete and the other room calls to the hotel that has the room. |
 | Show | `/<guest>/live` | Live view: one tile per hotel, one square per room, live counters. |
@@ -27,6 +27,14 @@ Room ids are `<hotel id>.<hotel room id>`. The broker adds the label
 - A create that waits longer than `max_queue_wait_seconds` (config, default
   10; -1 turns it off) for a create slot moves to another eligible hotel
   with a free room. If there is none, it keeps waiting.
+- A hotel whose host memory use is at or above `mem_full_pct` (config,
+  default 90; -1 turns it off) takes no new rooms. The value is the hotel
+  health value `host_mem_used_pct` (MemTotal minus MemAvailable, so page
+  cache does not count). Hotel slots come from an install-time sizing with
+  memory overcommit, so free slots alone cannot see rooms that use their
+  full memory limit. Such a hotel shows 0 free rooms, and the operator stats
+  show `mem_full: true`. When every eligible hotel is full this way, a
+  create gets 429 `no_free_rooms`.
 
 ## Hotel choice
 
@@ -35,15 +43,22 @@ before it calls the hotel.
 
 | Field | Meaning |
 |---|---|
-| `"hotels": ["a", "b"]` | Only these hotels. An unknown id gives 400 `unknown_hotel`. |
+| `"hotels": ["a", "b"]` | Only these hotels. An unknown id gives 409 `unknown_hotel`. |
 | `"hotel_labels": {"sealed": "true"}` | Only hotels with every pair. |
 | `"exclude_hotel_labels": {"sealed": "true"}` | No hotel with any pair. |
+| `"placement": "require"` | The default. A create that names hotels uses only those hotels. |
+| `"placement": "prefer"` | Try the named hotels first. If all of them are down, full or fail the create, use another hotel of the same class: sealed for sealed, unsealed for unsealed. The other label rules and the guest's hotel list still apply. A sealed create falls back only when the guest has its own hotel list. A fork and a mix of sealed and unsealed hotels never fall back. The answer has `"placement_fallback": true` and the header `X-Broker-Fallback: true`. |
 
 Hotel labels come from the `labels` object of each hotel in the config.
 `GET /v1/broker/hotels` lists hotel ids, labels and free rooms. When no
 hotel matches, the broker answers 409 `no_matching_hotel`. When the
-matching hotels are full, it answers 429 `no_free_rooms`. It never uses
-a hotel outside the choice.
+matching hotels are full, it answers 429 `no_free_rooms`. If matching hotels
+are down or draining (not full), it answers 503 `hotels_unavailable` instead of
+claiming they are full. It never uses
+a hotel outside the choice, except a `"prefer"` fallback inside the same class.
+Each hotel in `GET /v1/broker/hotels` has `down_since`: the time the broker last
+saw it go down, or null while it is up. The broker logs each change between
+down and up.
 
 ## Guest limits
 
@@ -54,7 +69,7 @@ Each guest in the config can have limits (`guests.go`):
 | `max_rooms` | Rooms running or starting at one time. Absent or 0: 1,000. Over the limit, a create gets 429 `room_limit`. A batch that does not fit is refused as a whole. |
 | `max_creates_per_minute` | Rooms the guest may ask for in any 60 s. Absent or 0: no limit. Over the limit, a create gets 429 `create_rate_limit` with `Retry-After`. |
 | `default_sealed` | `true`: a create with no hotel choice goes to sealed hotels only. The guest gets an unsealed room only when the create says `"sealed": false`, names hotels with `"hotels"`, or excludes sealed hotels with `"exclude_hotel_labels"`. A fork goes to the hotel of its snapshot. |
-| `hotels` | The hotel ids the guest may use. Absent: all hotels. Other hotels are not in the guest's hotel list, and a create that names one gets 400 `unknown_hotel`. |
+| `hotels` | The hotel ids the guest may use. Absent: all hotels. Other hotels are not in the guest's hotel list, and a create that names one gets 409 `unknown_hotel`. |
 | `ops` | `true`: the guest may run `POST /v1/broker/probe` and reset the counters with `POST /v1/broker/stats`. Other guests get 403. |
 
 The limits apply to the native routes and to the client (Harbor, ctcli)
@@ -66,7 +81,7 @@ limits without a restart:
 | Route (operator key) | What it does |
 |---|---|
 | `GET /v1/broker/guests` | Every guest with its limits and active rooms. No key hashes. |
-| `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed` and `hotels`. |
+| `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed` and `hotels`. `max_rooms: 0` and `hotels: []` get 400: in config they mean 1,000 rooms and every hotel. |
 
 A runtime change stays in memory. A restart goes back to the config file.
 
@@ -81,6 +96,26 @@ not include the other guest's room id, image name, or target path. Receipts
 still omit commands, files, and outputs. One room's own receipts are
 `GET /v1/sandboxes/<id>/receipts`.
 
+A hotel signs receipts only for calls that pass through its receipt front
+(room kit, `127.0.0.1:18092` on a shared hotel; `:18090` in a sealed
+guest). So point both `api` and `health` of every hotel in the broker
+config at that front: it passes every call to the room API, signs each
+create, exec, process start and delete, and serves `/room/health`,
+`/room/receipts` and `/v1/sandboxes/<id>/receipts`. With `api` on 18090
+and `health` on 18091 instead, broker writes skip the front, both receipt
+routes answer 404, and no receipt is signed.
+
+A shared hotel signs at level 1: an Ed25519 key held in memory, with no
+hardware binding. Its receipts prove that the hotel process signed the
+action, not which machine ran it. Only a sealed hotel binds its key to an
+SEV-SNP report.
+
+For a hotel behind an SSH tunnel, forward 18092 as well: a fourth port in
+`/etc/thin-broker/tunnels.env` (`TUN_<id>="<dest> <api> <health> <receipts>"`),
+and `permitopen="127.0.0.1:18092"` on the tunnel key in the hotel's
+`authorized_keys`. Live since 2026-10-24 00:06Z: nc on 18092, c46 on 38092
+and c48 on 48092.
+
 ## Room network policy
 
 A create takes `"network": {"mode": "internet" | "deny_all" | "allowlist", "allow": [...]}`.
@@ -94,7 +129,33 @@ Clients (Harbor plugin, ctcli) send `"network": "allowlist"` with
 `"network_allow": [...]`, and the same PUT with `{"mode", "allow"}`. The
 catalog shows `dynamic_network_policy: true` and the entry types in
 `network_allowlist`. Client `deny_all` and `none` both become hotel
-`deny_all`: the room keeps an interface, so it can switch later.
+`deny_all`: the room keeps an interface, so it can switch later. A client
+create that names no network fails closed to `deny_all`; egress is asked
+for with `"network": "internet"` (or an allowlist), never granted by an
+omitted field. A live change must always name its mode (400 otherwise).
+
+## What a room answer says about isolation
+
+Every room document the broker returns (create, get, list, on the native
+and the client routes) carries an `isolation` object:
+
+```json
+"isolation": {
+  "hotel_sealed": true,
+  "hotel_tee": "amd_sev_snp",
+  "room_runtime": "runsc",
+  "attested_per_room": false,
+  "network_mode": "deny_all",
+  "attestation_of_host": "/v1/hotels/nc-sealed/attestation"
+}
+```
+
+`hotel_sealed` is true when the room's hotel is a sealed (SEV-SNP) guest;
+`hotel_tee` is the TEE kind, or null on an unsealed hotel. `room_runtime` is
+what the hotel reports (`runsc`, `docker`, `kata`). `attested_per_room` is
+always false: a TEE covers the hotel VM, rooms on it are separated by the
+room runtime, and the hotel's attestation is at `attestation_of_host`. A
+guest reads the level from this object, never from the hotel id.
 
 ## Snapshots and forks
 
@@ -171,16 +232,24 @@ Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
 - Exec: the longest exec is `max_exec_seconds` in the config (default
   14,400). Keep it at or below the hotel limit
   `CATHEDRAL_SANDBOX_EXEC_TIMEOUT_MAX` (default 14,400).
+  On the Harbor/ctcli path the exec body field is `cmd` (a non-empty JSON
+  **array** of strings) or the alias `command`; a string value gives 400
+  `invalid_exec`. The native `/v1` route reads `cmd` only and runs a string
+  through `sh -c`. Exec output is capped by the hotel at 16 MiB per stream;
+  the response includes `"truncated": true` when that happens.
 - Image build (client path): `POST /v1/images/build` takes the Dockerfile
   and the build context. The broker asks each hotel that takes new rooms
   to build it. The image is `ready` when one hotel has it, and a create
   with it goes only to hotels that have it. A failed build gives state
   `failed` with error `image_build_failed`.
 - With `state_dir` set, the broker keeps client room ids, Idempotency-Key
-  answers (48 hours), deleted-room tombstones and images in
-  `state_dir/client-state.json` (mode 0600), and build contexts in
-  `state_dir/build-contexts/`. After a restart, a repeated create with the
-  same key returns the first answer, and a room keeps its client id.
+  answers (48 hours), deleted-room tombstones, images, and guest→hotel→room
+  mappings in `state_dir/client-state.json` (mode 0600), and build contexts
+  in `state_dir/build-contexts/`. After a restart, a repeated create with
+  the same key returns the first answer, a room keeps its client id, and
+  `GET /v1/hotels/<id>/receipts` still filters correctly for each guest
+  (the room→guest mapping is persisted, so a reload does not expose another
+  guest's receipts).
 
 ## Hotels at runtime
 
@@ -189,7 +258,7 @@ the config, an operator adds and removes hotels without a restart:
 
 | Route (operator key) | What it does |
 |---|---|
-| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "threads"?, "ram_gib"?}`. The broker first calls `GET /v1/status` on the hotel with the key (`"verify": false` skips it). |
+| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?}`. `"sealed": true` is what makes a hotel sealed; a `sealed` label alone leaves it taking unsealed creates. The broker first calls `GET /v1/status` on the hotel with the key (`"verify": false` skips it). |
 | `PATCH /v1/broker/hotels/<id>` | Sets `drain` and `labels`. |
 | `DELETE /v1/broker/hotels/<id>` | Removes a runtime hotel that has no rooms. Drain it first. |
 

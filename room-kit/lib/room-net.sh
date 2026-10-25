@@ -34,6 +34,11 @@ down() {
     done
   done
   for c in "$CHAIN" "$CHAIN_IN"; do iptables -F "$c" 2>/dev/null || true; iptables -X "$c" 2>/dev/null || true; done
+  if command -v ip6tables >/dev/null 2>&1; then
+    { ip6tables -S | grep -F -- "--comment \"$TAG\"" || true; } | sed 's/^-A /-D /' | while read -r rule; do
+      eval "ip6tables $rule" 2>/dev/null || true
+    done
+  fi
   nft delete table bridge "$NFT_TABLE" 2>/dev/null || true
   if ip link show "$BR" >/dev/null 2>&1; then ip link set "$BR" down || true; ip link del "$BR" || true; fi
   # Room network bridges: the daemon makes them again from its network list.
@@ -92,6 +97,12 @@ guard() {
   iptables -I "$CHAIN_IN" 1 -i "$br" -p tcp -m multiport --dports "$EGRESS_DNS_PORT,$EGRESS_HTTP_PORT,$EGRESS_TLS_PORT" -j ACCEPT
   iptables -I INPUT 1 -i "$br" -j "$CHAIN_IN" -m comment --comment "$TAG"
   iptables -t nat -A POSTROUTING -s "$net" ! -o "$br" -j MASQUERADE -m comment --comment "$TAG"
+  # Every rule above is IPv4. Rooms get no IPv6 address, and a frame a room
+  # forges with one must not reach the host or be forwarded.
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -I FORWARD 1 -i "$br" -j DROP -m comment --comment "$TAG" 2>/dev/null || true
+    ip6tables -I INPUT 1 -i "$br" -j DROP -m comment --comment "$TAG" 2>/dev/null || true
+  fi
   # Guest to guest on the same bridge is layer 2 and skips iptables unless
   # br_netfilter is loaded (a host-wide change). An nftables bridge-family
   # rule drops frames bridged between two ports of this bridge only.

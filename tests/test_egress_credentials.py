@@ -453,13 +453,27 @@ def test_other_allowed_host_gets_no_credential(proxy_env) -> None:
         async def handler(reader, writer):
             real = writer.get_extra_info
             writer.get_extra_info = lambda k, d=None: (ROOM_IP, 1) if k == "peername" else real(k, d)
-            await proxy.handle(reader, writer, up.sockets[0].getsockname()[1], False)
+            # The proxy checks the policy on the room's real port (80), so hand
+            # it that port and send its upstream dial to the fake server.
+            await proxy.handle(reader, writer, 80, False)
+
+        up_port = up.sockets[0].getsockname()[1]
+        real_open = asyncio.open_connection
+
+        async def open_upstream(host, port, *args, **kwargs):
+            if host == "127.0.0.1" and port == 80:
+                port = up_port
+            return await real_open(host, port, *args, **kwargs)
 
         front = await asyncio.start_server(handler, "127.0.0.1", 0)
         r, w = await asyncio.open_connection("127.0.0.1", front.sockets[0].getsockname()[1])
-        w.write(b"GET / HTTP/1.1\r\nHost: files.example\r\n\r\n")
-        await w.drain()
-        await asyncio.wait_for(r.read(65536), 5)
+        asyncio.open_connection = open_upstream
+        try:
+            w.write(b"GET / HTTP/1.1\r\nHost: files.example\r\n\r\n")
+            await w.drain()
+            await asyncio.wait_for(r.read(65536), 5)
+        finally:
+            asyncio.open_connection = real_open
         w.close()
         up.close()
         front.close()

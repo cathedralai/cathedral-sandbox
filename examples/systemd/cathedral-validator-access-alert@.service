@@ -2,7 +2,8 @@
 Description=Page an operator: %i raised the validator-access expiry alarm
 Documentation=https://github.com/cathedralai/cathedral-sandbox/blob/main/README.md
 # The refresh and fetch units start this through OnFailure= only on exit 3, the
-# expiry alarm. %i is the failed unit's name.
+# expiry alarm. The miner units start it when their start limit leaves them
+# failed. %i is the failed unit's name.
 
 [Service]
 Type=oneshot

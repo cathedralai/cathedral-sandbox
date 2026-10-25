@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -65,9 +66,12 @@ func (b *broker) compatBuild(w http.ResponseWriter, r *http.Request, g *guestSta
 	b.compat.mu.Lock()
 	if old := b.compat.images[img.ID]; old != nil && old.Build {
 		img = old // the same build again: keep its state
-		if img.ctxMissing {
-			// The context was lost in a broker restart; this request has it again.
+		if img.ctxMissing || !bytes.Equal(img.buildCtx, buildCtx) {
+			// The context was lost or cut short (a crash while it was saved).
+			// The id is a hash of the context, so this request's copy is right.
 			img.buildCtx, img.ctxMissing = buildCtx, false
+			// New entries: a build in flight used the old context, and its
+			// result is dropped when it returns (buildOn checks its entry).
 			img.builds = map[string]*buildHotel{}
 			b.saveBuildContext(img)
 		}
@@ -87,7 +91,7 @@ func (b *broker) ensureBuilds(img *compatImage, g *guestState) {
 	b.mu.Lock()
 	var hotels []*hotel
 	for _, h := range b.hotelList() {
-		if !h.cfg.Drain && g.limits.allows(h.cfg.ID) {
+		if !h.drain() && g.limits.allows(h.cfg.ID) {
 			hotels = append(hotels, h)
 		}
 	}
@@ -105,12 +109,16 @@ func (b *broker) ensureBuilds(img *compatImage, g *guestState) {
 		if st != nil && (st.State != "failed" || time.Since(img.failedAt[h.cfg.ID]) < time.Minute) {
 			continue
 		}
-		img.builds[h.cfg.ID] = &buildHotel{State: "building"}
-		go b.buildOn(h, img)
+		entry := &buildHotel{State: "building"}
+		img.builds[h.cfg.ID] = entry
+		go b.buildOn(h, img, entry)
 	}
 }
 
-func (b *broker) buildOn(h *hotel, img *compatImage) {
+// buildOn runs one build on h and records the result in st, the entry it was
+// started for. A newer entry means a newer build replaced this one: its
+// result is stale and is dropped.
+func (b *broker) buildOn(h *hotel, img *compatImage, st *buildHotel) {
 	b.compat.mu.Lock()
 	payload := map[string]any{"dockerfile": img.Dockerfile}
 	if len(img.buildCtx) > 0 {
@@ -123,7 +131,9 @@ func (b *broker) buildOn(h *hotel, img *compatImage) {
 	_ = json.Unmarshal(out, &doc)
 	b.compat.mu.Lock()
 	defer b.compat.mu.Unlock()
-	st := img.builds[h.cfg.ID]
+	if img.builds[h.cfg.ID] != st {
+		return
+	}
 	tag, _ := doc["image"].(string)
 	switch {
 	case err != nil:

@@ -102,7 +102,7 @@ func newSecretChain(t *testing.T, g1Hotels []string) *secretChain {
 	return sc
 }
 
-func rawCall(t *testing.T, url, key, method, path, body string, hdr map[string]string) (int, string) {
+func secretCall(t *testing.T, url, key, method, path, body string, hdr map[string]string) (int, string) {
 	t.Helper()
 	var rd io.Reader
 	if body != "" {
@@ -124,7 +124,7 @@ func rawCall(t *testing.T, url, key, method, path, body string, hdr map[string]s
 
 func TestSecretPutGoesToTheGuestHotelsAndNoAnswerHasTheValue(t *testing.T) {
 	sc := newSecretChain(t, []string{"a", "b"})
-	status, out := rawCall(t, sc.srv.URL, "key1", "PUT", "/v1/secrets/PIP_TOKEN", `{"value":"`+testSecretValue+`"}`, nil)
+	status, out := secretCall(t, sc.srv.URL, "key1", "PUT", "/v1/secrets/PIP_TOKEN", `{"value":"`+testSecretValue+`"}`, nil)
 	if status != 200 || strings.Contains(out, testSecretValue) {
 		t.Fatalf("put: %d %s", status, out)
 	}
@@ -136,7 +136,7 @@ func TestSecretPutGoesToTheGuestHotelsAndNoAnswerHasTheValue(t *testing.T) {
 	if sc.sh["a"].values["g1"]["PIP_TOKEN"] != testSecretValue || sc.sh["c"].values["g1"] != nil {
 		t.Fatal("the value did not reach exactly the guest's hotels")
 	}
-	status, out = rawCall(t, sc.srv.URL, "key1", "GET", "/v1/secrets", "", nil)
+	status, out = secretCall(t, sc.srv.URL, "key1", "GET", "/v1/secrets", "", nil)
 	if status != 200 || strings.Contains(out, testSecretValue) || !strings.Contains(out, `"PIP_TOKEN"`) {
 		t.Fatalf("list: %d %s", status, out)
 	}
@@ -145,11 +145,11 @@ func TestSecretPutGoesToTheGuestHotelsAndNoAnswerHasTheValue(t *testing.T) {
 	if strings.Contains(string(snap), testSecretValue) || strings.Contains(string(snap), "PIP_TOKEN") {
 		t.Fatal("live view shows a secret")
 	}
-	status, _ = rawCall(t, sc.srv.URL, "key1", "DELETE", "/v1/secrets/PIP_TOKEN", "", nil)
+	status, _ = secretCall(t, sc.srv.URL, "key1", "DELETE", "/v1/secrets/PIP_TOKEN", "", nil)
 	if status != 204 {
 		t.Fatalf("delete: %d", status)
 	}
-	status, out = rawCall(t, sc.srv.URL, "key1", "DELETE", "/v1/secrets/PIP_TOKEN", "", nil)
+	status, out = secretCall(t, sc.srv.URL, "key1", "DELETE", "/v1/secrets/PIP_TOKEN", "", nil)
 	if status != 404 || !strings.Contains(out, "secret_not_found") {
 		t.Fatalf("second delete: %d %s", status, out)
 	}
@@ -157,9 +157,9 @@ func TestSecretPutGoesToTheGuestHotelsAndNoAnswerHasTheValue(t *testing.T) {
 
 func TestSecretDeletePartialHotelFailureIs502(t *testing.T) {
 	sc := newSecretChain(t, []string{"a", "b"})
-	rawCall(t, sc.srv.URL, "key1", "PUT", "/v1/secrets/PIP_TOKEN", `{"value":"`+testSecretValue+`"}`, nil)
+	secretCall(t, sc.srv.URL, "key1", "PUT", "/v1/secrets/PIP_TOKEN", `{"value":"`+testSecretValue+`"}`, nil)
 	sc.sh["b"].down = true
-	status, out := rawCall(t, sc.srv.URL, "key1", "DELETE", "/v1/secrets/PIP_TOKEN", "", nil)
+	status, out := secretCall(t, sc.srv.URL, "key1", "DELETE", "/v1/secrets/PIP_TOKEN", "", nil)
 	if status != 502 || !strings.Contains(out, "secrets_partial") {
 		t.Fatalf("partial delete: %d %s", status, out)
 	}
@@ -176,14 +176,14 @@ func TestSecretDeletePartialHotelFailureIs502(t *testing.T) {
 
 func TestSecretsOfAnotherGuestAreInvisible(t *testing.T) {
 	sc := newSecretChain(t, nil)
-	rawCall(t, sc.srv.URL, "key1", "PUT", "/v1/secrets/PIP_TOKEN", `{"value":"`+testSecretValue+`"}`, nil)
+	secretCall(t, sc.srv.URL, "key1", "PUT", "/v1/secrets/PIP_TOKEN", `{"value":"`+testSecretValue+`"}`, nil)
 	// A forged guest header from g2 does not reach the hotels.
 	forged := map[string]string{guestHeader: "g1"}
-	status, out := rawCall(t, sc.srv.URL, "key2", "GET", "/v1/secrets", "", forged)
+	status, out := secretCall(t, sc.srv.URL, "key2", "GET", "/v1/secrets", "", forged)
 	if status != 200 || strings.Contains(out, "PIP_TOKEN") {
 		t.Fatalf("g2 list: %d %s", status, out)
 	}
-	status, out = rawCall(t, sc.srv.URL, "key2", "DELETE", "/v1/secrets/PIP_TOKEN", "", forged)
+	status, out = secretCall(t, sc.srv.URL, "key2", "DELETE", "/v1/secrets/PIP_TOKEN", "", forged)
 	if status != 404 || !strings.Contains(out, "secret_not_found") {
 		t.Fatalf("g2 delete: %d %s", status, out)
 	}
@@ -204,19 +204,19 @@ func TestSecretsOfAnotherGuestAreInvisible(t *testing.T) {
 func TestSecretBadInputsAndHotelErrorsDoNotEchoTheValue(t *testing.T) {
 	sc := newSecretChain(t, nil)
 	for _, name := range []string{"pip_token", "..%2FX", "A-B", strings.Repeat("A", 65)} {
-		status, _ := rawCall(t, sc.srv.URL, "key1", "PUT", "/v1/secrets/"+name, `{"value":"x"}`, nil)
+		status, _ := secretCall(t, sc.srv.URL, "key1", "PUT", "/v1/secrets/"+name, `{"value":"x"}`, nil)
 		if status != 400 && status != 404 {
 			t.Fatalf("name %q: %d", name, status)
 		}
 	}
-	status, out := rawCall(t, sc.srv.URL, "key1", "PUT", "/v1/secrets/PIP_TOKEN", `{"value":`+testSecretValue, nil)
+	status, out := secretCall(t, sc.srv.URL, "key1", "PUT", "/v1/secrets/PIP_TOKEN", `{"value":`+testSecretValue, nil)
 	if status != 400 || strings.Contains(out, testSecretValue) {
 		t.Fatalf("broken JSON: %d %s", status, out)
 	}
 	for _, h := range sc.sh {
 		h.down = true
 	}
-	status, out = rawCall(t, sc.srv.URL, "key1", "PUT", "/v1/secrets/PIP_TOKEN", `{"value":"`+testSecretValue+`"}`, nil)
+	status, out = secretCall(t, sc.srv.URL, "key1", "PUT", "/v1/secrets/PIP_TOKEN", `{"value":"`+testSecretValue+`"}`, nil)
 	if status != 502 || strings.Contains(out, testSecretValue) {
 		t.Fatalf("hotels down: %d %s", status, out)
 	}

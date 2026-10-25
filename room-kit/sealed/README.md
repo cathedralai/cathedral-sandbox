@@ -3,8 +3,9 @@
 A sealed hotel is one AMD SEV-SNP guest on a host. The rooms run under gVisor
 (runsc, systrap platform) inside that guest. The guest runs the same room kit
 and the same hotel API as an unsealed hotel. It also signs a receipt for each
-create, exec and delete, with a key that an SNP attestation report binds to the
-guest.
+create, exec, process start, network change and delete that comes through the
+API, with a key that an SNP attestation report binds to the guest. Rooms that
+expire get no receipt (see "Not covered yet").
 
 One command on the host:
 
@@ -31,8 +32,13 @@ sudo ./install.sh --sealed sealed.env
      iptables chains only.
    - `launch-guest.sh`: QEMU with `kernel-hashes=on`, the scratch disk, the
      tap link and the hotel key in fw_cfg.
-5. **Check.** It waits for `GET /room/attestation` from the guest. It compares
-   the measurement in the report with the build.
+5. **Check.** Before the restart it refuses to go on while the running guest
+   has rooms (`SEALED_RESTART_WITH_ROOMS=1` overrides). It waits for
+   `GET /room/attestation` from the guest and compares the measurement in
+   the report with the build. On a mismatch it stops and disables the unit,
+   points `images/current` back at the previous image and exits 1. A timer
+   checks the host link rules every minute and restores them after a
+   firewall reload.
 
 Inside the guest, `sealed-hotel.service` runs at every boot:
 
@@ -54,7 +60,7 @@ Inside the guest, `sealed-hotel.service` runs at every boot:
 | Debug access | Yes | `cathedral.debug=0/1` in the command line |
 | Files the kit downloads at boot (gVisor, uv, Python, Caddy, the pinned API wheel set) | No, but pinned | The installer refuses a file whose sha256 or sha512 differs from `versions.lock` and `requirements.lock`, which are in the measured initrd |
 | Room images (for example `alpine:3.20`) | No | Pulled at create. The receipt records the image reference and the image id |
-| Hotel API key | No | fw_cfg. It authenticates the broker. It is not a guest secret |
+| Hotel API key | No | fw_cfg. It authenticates the broker. The host gives it, so the host can call the API too; each create, exec, process start, network change and delete gets a receipt |
 | HOST_DATA | No (host chooses it) | It carries the sha256 of `manifest.json`, so a report names the build it claims |
 
 ## What the host cannot do
@@ -66,6 +72,16 @@ Inside the guest, `sealed-hotel.service` runs at every boot:
   getty. `cathedral.debug=1` (a debug build) adds root SSH from the host on
   the tap link, and the measurement shows it.
 - It cannot change the guest software without changing the measurement.
+
+What the host can do besides availability:
+
+- It holds the hotel API key, so it can create rooms, run commands and read
+  files through the API. Create, exec, process start, network change, delete
+  and bulk delete pass the signing front and get a receipt. File read and
+  write, tar, stat, snapshot, fork, wait, process logs and process stop do
+  not: the host can read or plant a file in a room with no receipt.
+- The broker reaches the API over plain HTTP on the tap link. The host can
+  read that traffic (commands, outputs, files) without leaving a receipt.
 
 The host still controls availability: it can stop the guest, drop the
 network, or refuse the scratch disk.
@@ -96,7 +112,7 @@ Routes (through the broker):
 
 | Route | Gives |
 |---|---|
-| `X-Room-Receipt` header on create, exec and delete | The signed receipt, base64url of canonical JSON |
+| `X-Room-Receipt` header on create, exec, process start, network change and delete | The signed receipt, base64url of canonical JSON |
 | `GET /v1/sandboxes/<id>/receipts` | The receipts of one room |
 | `GET /v1/hotels/<id>/attestation` | Binding, binding sha256, SNP report |
 | `GET /v1/hotels/<id>/receipts?after=&limit=` | The chain of this boot |
@@ -113,8 +129,15 @@ python3 verify_receipts.py --attestation attestation.json --receipts chain.json 
   --expected-measurement <from manifest build>
 ```
 
-It checks the binding digest, REPORT_DATA, the AMD chain (ARK, ASK and VCEK
-from AMD KDS, RSA-PSS SHA-384), the VCEK chip id and TCB extensions, the
+Through the broker: `--broker https://<broker> --key-file KEY --hotel <id>`
+(`--hotel` has no default). Add `--require-sealed` so a level 1 (unsealed)
+binding fails even without `--expected-measurement`. `--sandbox <id>` lists
+one room's receipts while the room exists.
+
+It checks the binding digest, REPORT_DATA, that the guest is not a debug
+build (`cathedral.debug=1` on the measured command line fails), the AMD chain
+(ARK, ASK and VCEK from AMD KDS, RSA-PSS SHA-384; pin the ARK with
+`--ark-sha256`, or the KDS answer and the local cache are trusted), the VCEK chip id and TCB extensions, the
 report signature (ECDSA P-384), each receipt signature (Ed25519) and the
 chain links. It prints the policy timeline of each room
 (`policy_timeline`) and checks each policy sha256.
@@ -127,14 +150,22 @@ chain links. It prints the policy timeline of each room
 - A new boot makes a new key and a new chain. A restart of
   `room-sealed-receipts.service` inside the guest also makes a new key and a
   new binding.
-- Rooms that the TTL reaper removes get no delete receipt.
+- Rooms that the TTL reaper removes get no delete receipt. Neither do rooms
+  that a bulk delete or an API restart removes one by one.
+- After a restart of the receipts service, the broker serves the new
+  binding only. Receipts signed under the old one verify only against an
+  attestation saved at the time (`verify_receipts.py --save`).
+- Broker to guest traffic is plain HTTP on the tap (see above).
+- The verifier has no minimum TCB and does not pin the AMD ARK by default.
 - The broker's own records (placement, queue) are not signed.
 
 ## Remove
 
 ```
+sudo systemctl disable --now room-sealed-<name>-net.timer # or it puts the host link back every minute
 sudo systemctl disable --now room-sealed-<name>.service   # stops the guest, removes the host link rules
-sudo rm -f /etc/systemd/system/room-sealed-<name>.service && sudo systemctl daemon-reload
+sudo rm -f /etc/systemd/system/room-sealed-<name>.service /etc/systemd/system/room-sealed-<name>-net.{service,timer}
+sudo systemctl daemon-reload
 sudo rm -rf $SEALED_DIR                                    # images, scratch disk, venv
 ```
 
