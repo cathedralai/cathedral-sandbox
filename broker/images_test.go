@@ -39,6 +39,8 @@ type fakeHotel struct {
 	rooms       []map[string]any // id + labels, for the room list
 	networks    []map[string]any // bodies of PUT /v1/sandboxes/{id}/network
 	receipts    []byte           // body of GET /room/receipts
+	attestIn    [][]byte         // bodies of POST /room/attest
+	attestAuth  []string         // Authorization of POST /room/attest
 	roomDeletes []string         // room ids of DELETE /v1/sandboxes/{id}
 	bulkDeletes [][]string       // label filters of DELETE /v1/sandboxes
 }
@@ -124,6 +126,17 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.rooms = kept
 		w.WriteHeader(204)
+	case p == "/room/attest" && r.Method == "POST":
+		f.attestIn = append(f.attestIn, body)
+		f.attestAuth = append(f.attestAuth, r.Header.Get("Authorization"))
+		if bytes.Contains(body, []byte("slow-down")) {
+			w.Header().Set("Retry-After", "17")
+			writeJSON(w, 429, map[string]string{"error": "attest_rate_limit"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"report_b64":"UkVQT1JU","cert_chain_b64":null,"binding_sha256":"bb","measurement":"aa","generated_at":1761400000,"echo":` + strconv.Quote(string(body)) + `}`))
 	case p == "/room/receipts" && r.Method == "GET":
 		if f.receipts == nil {
 			writeErr(w, 404, "no_receipts", "no chain")

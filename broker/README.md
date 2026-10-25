@@ -108,6 +108,10 @@ not include the other guest's room id, image name, or target path. Receipts
 still omit commands, files, and outputs. One room's own receipts are
 `GET /v1/sandboxes/<id>/receipts`.
 
+| Route (guest key) | What it does |
+|---|---|
+| `POST /v1/hotels/<id>/attest` `{"report_data_hex": "<128 hex>"}` | Passes the body to the hotel's `POST /room/attest` and returns the hotel's status, JSON and `Retry-After` unchanged: a fresh SEV-SNP report whose REPORT_DATA is those 64 bytes verbatim (see room-kit README). A hotel outside the guest's hotel list answers 404, as for receipts. Body cap 4096 bytes (413). |
+
 A hotel signs receipts only for calls that pass through its receipt front
 (room kit, `127.0.0.1:18092` on a shared hotel; `:18090` in a sealed
 guest). So point both `api` and `health` of every hotel in the broker

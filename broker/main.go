@@ -1060,6 +1060,10 @@ func truncateExecJSON(out []byte) []byte {
 func (b *broker) handleHotelDoc(w http.ResponseWriter, r *http.Request, rest string, g *guestState) {
 	id, doc, _ := strings.Cut(rest, "/")
 	h := b.hotelByID(id)
+	if h != nil && doc == "attest" && r.Method == "POST" {
+		b.handleHotelAttest(w, r, h, g)
+		return
+	}
 	if h == nil || (doc != "attestation" && doc != "receipts") || r.Method != "GET" {
 		writeErr(w, 404, "route_not_found", "no such hotel document")
 		return
@@ -1092,6 +1096,40 @@ func (b *broker) handleHotelDoc(w http.ResponseWriter, r *http.Request, rest str
 	}
 	if v := hdr.Get("Content-Type"); v != "" {
 		w.Header().Set("Content-Type", v)
+	}
+	w.Header().Del("Content-Length")
+	w.WriteHeader(status)
+	_, _ = w.Write(out)
+}
+
+// hotelAttestBodyMax caps POST /v1/hotels/<id>/attest. The body is one
+// field of 128 hex characters.
+const hotelAttestBodyMax = 4096
+
+// handleHotelAttest passes POST /v1/hotels/<id>/attest to the hotel's
+// POST /room/attest: a fresh SEV-SNP report whose REPORT_DATA is the 64
+// bytes the caller sent. A hotel outside the guest's list answers 404, as
+// for receipts. The body goes to the hotel unchanged and the hotel's JSON
+// (status, body, Retry-After) comes back unchanged; the hotel validates.
+func (b *broker) handleHotelAttest(w http.ResponseWriter, r *http.Request, h *hotel, g *guestState) {
+	if !g.limitsAllow(b, h.cfg.ID) {
+		writeErr(w, 404, "route_not_found", "no such hotel document")
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, hotelAttestBodyMax))
+	if err != nil {
+		writeErr(w, 413, "body_too_large", "attest body over 4096 bytes")
+		return
+	}
+	status, hdr, out, err := h.doBase(r.Context(), h.cfg.Health, "POST", "/room/attest", nil, body, time.Minute)
+	if err != nil {
+		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		return
+	}
+	for _, k := range []string{"Content-Type", "Retry-After"} {
+		if v := hdr.Get(k); v != "" {
+			w.Header().Set(k, v)
+		}
 	}
 	w.Header().Del("Content-Length")
 	w.WriteHeader(status)
