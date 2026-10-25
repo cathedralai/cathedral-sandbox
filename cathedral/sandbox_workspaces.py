@@ -39,6 +39,7 @@ import json
 import os
 import shutil
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -290,15 +291,20 @@ class WorkspaceStore:
         with self._lock:
             meta = self._meta(path, name)
             self._refuse_in_use(owner, name, "delete")
-            # meta.json goes first, so a failed clear leaves no half workspace
-            # that a room could mount.
-            (path / "meta.json").unlink()
-        self.copier.clear(path / "data")
-        for v in meta.get("versions", []):
-            vdir = path / "versions" / str(v["version"])
-            if vdir.is_dir():
-                self.copier.clear(vdir)
-        shutil.rmtree(path)
+            # Move the tree aside under the lock so a concurrent create cannot
+            # reuse the name while we clear files (Bugbot P1).
+            trash = path.parent / f".deleting-{name}-{os.getpid()}-{time.time_ns()}"
+            path.rename(trash)
+        try:
+            self.copier.clear(trash / "data")
+            for v in meta.get("versions", []):
+                vdir = trash / "versions" / str(v["version"])
+                if vdir.is_dir():
+                    self.copier.clear(vdir)
+            shutil.rmtree(trash, ignore_errors=True)
+        except Exception:
+            shutil.rmtree(trash, ignore_errors=True)
+            raise
 
     def _refuse_in_use(self, owner: str, name: str, what: str) -> None:
         if self._mounts.get((owner, name)):
@@ -315,7 +321,13 @@ class WorkspaceStore:
             meta = self._meta(path, name)
             if "rollback" in self._mounts.get((owner, name), ()):
                 raise SandboxOpError("workspace_in_use", 409, f"workspace {name} is rolling back; retry")
-            if len(meta.get("versions", [])) >= self.max_versions:
+            # Count version dirs too: a copy still in flight has a dir but is
+            # not yet listed in meta["versions"] (Bugbot P2).
+            vroot = path / "versions"
+            n_dirs = (
+                sum(1 for p in vroot.iterdir() if p.is_dir()) if vroot.is_dir() else 0
+            )
+            if max(len(meta.get("versions", [])), n_dirs) >= self.max_versions:
                 raise SandboxOpError(
                     "version_limit", 409, f"workspace {name} has {self.max_versions} versions, the most allowed"
                 )

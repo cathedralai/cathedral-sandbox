@@ -277,6 +277,31 @@ def test_delete_removes_files_and_versions(app, fake) -> None:
     assert (status, err(doc)) == (404, "workspace_not_found")
 
 
+def test_delete_renames_aside_before_clear(tmp_path) -> None:
+    """Name must be free only after the tree is moved, not after meta unlink."""
+    root = tmp_path / "ws"
+    store = WorkspaceStore(
+        root=root, copier=LocalCopier(), max_per_owner=10, max_versions=20, check_mount=False
+    )
+    owner = "owner-a"
+    store.create(owner, "repo")
+    path = store._dir(owner, "repo")  # noqa: SLF001
+    assert path.is_dir()
+    seen: list[bool] = []
+
+    class TrackingCopier(LocalCopier):
+        def clear(self, target):  # noqa: ANN001
+            seen.append(path.exists())
+            super().clear(target)
+
+    store.copier = TrackingCopier()
+    store.delete(owner, "repo")
+    assert seen and seen[0] is False
+    assert not path.exists()
+    # Name is reusable immediately after delete returns.
+    assert store.create(owner, "repo")["name"] == "repo"
+
+
 def test_failed_room_start_releases_the_mount(app, fake) -> None:
     call(app, "POST", "/v1/workspaces", A, {"name": "repo"})
     fake.set(run_fail_images=["alpine:3.20"])
