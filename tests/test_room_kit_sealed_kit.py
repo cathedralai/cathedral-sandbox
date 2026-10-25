@@ -42,6 +42,14 @@ def test_a_measurement_mismatch_stops_the_guest_and_keeps_the_old_image() -> Non
     assert text.index("PREV_IMG=$(readlink") < text.index('"$KIT/sealed/build-guest.sh"')
 
 
+def test_a_verified_guest_boots_again_at_the_next_host_start() -> None:
+    text = (SEALED / "install-sealed.sh").read_text()
+    match = text[text.index("measurement matches the build"):text.index("MEASUREMENT DIFFERS")]
+    assert 'systemctl enable -q "$UNIT"' in match
+    # Never before the check: a mismatched image must not be set to boot.
+    assert text.index('systemctl enable -q "$UNIT"') > text.index('if [ "$GOT" = "$EXPECTED" ]')
+
+
 def test_host_link_rules_are_checked_every_minute() -> None:
     text = (SEALED / "install-sealed.sh").read_text()
     assert "-net.timer" in text and "OnUnitActiveSec=1min" in text and "host-net.sh check" in text

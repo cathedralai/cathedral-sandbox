@@ -141,6 +141,9 @@ GOT=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["binding"][
 cp "$ATT" "$IMG/attestation-$(date -u +%Y%m%dT%H%M%SZ).json"
 if [ "$GOT" = "$EXPECTED" ]; then
   log "measurement matches the build: $GOT"
+  # Boot the guest again at the next host start (an unattended reboot left
+  # sealed guests off until a manual start). Only a verified image is enabled.
+  systemctl enable -q "$UNIT"
 else
   # Do not serve a guest the operator cannot vouch for, and do not boot it
   # again at the next host start. The previous image is current again.
