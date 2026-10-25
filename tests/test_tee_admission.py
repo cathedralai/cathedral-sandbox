@@ -678,7 +678,7 @@ def test_the_consumed_measurement_differs_from_the_fresh_one():
 
 
 def test_fresh_boot_is_a_tdx_check():
-    with pytest.raises(adm.AdmissionError, match="SEV-SNP has no RTMR3"):
+    with pytest.raises(adm.AdmissionError, match="SEV-SNP has no RTMR3-class"):
         _admit(_snp(), require_fresh_boot=True)
     assert _admit(_snp(), require_fresh_boot=False).admitted
     parameter = inspect.signature(adm.admit).parameters["require_fresh_boot"]

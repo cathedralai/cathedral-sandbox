@@ -31,6 +31,7 @@ from tests.test_tee_box_service import (
     OTHER_ROOT_SEED,
     ROOT_KEYS,
     ROOT_SEED,
+    _binding,
     _public,
 )
 from tests.test_validator_access import WORKER_HOTKEY
@@ -288,7 +289,7 @@ def test_serve_snp_takes_the_same_flags(tmp_path: Path, guest):
 
 
 def test_serve_snp_refuses_without_a_measured_root_binding(tmp_path: Path, monkeypatch):
-    # The real SNP reader, not the guest fixture's: HOST_DATA is not read yet.
+    # The real SNP reader, not the guest fixture's: no /dev/sev-guest here.
     monkeypatch.setenv(DEFAULT_WORKER_BEARER_ENV, "worker-token")
     monkeypatch.setattr("cathedral.cli.WorkerServer", _FakeServer)
     monkeypatch.setattr(cli, "build_tee_box_api", _with_runner(_Guest()))
@@ -516,6 +517,8 @@ def test_the_startup_line_reports_the_boot_and_its_record(tmp_path: Path, guest,
         "consumed": False,
         "rtmr3_extended": False,
         "record": str(tmp_path / "tee-box-central.sqlite.boot"),
+        "fresh_boot_register": "tdx_rtmr3",
+        "fresh_boot_hardware_backed": True,
     }
     api = _FakeServer.calls[0]["tee_box_api"]
     assert api.boot.marker_path == str(tmp_path / "tee-box-central.sqlite.boot")
@@ -546,21 +549,97 @@ def test_the_box_uses_the_kernel_rtmr3_interface_by_default(tmp_path: Path, gues
     assert isinstance(_FakeServer.calls[0]["tee_box_api"].boot._rtmr, _Recording)  # noqa: SLF001
 
 
-def test_a_box_on_sev_snp_has_no_rtmr3_to_extend(tmp_path: Path, guest, monkeypatch):
-    # SEV-SNP is refused earlier for want of a measured root binding; were
-    # that added, the missing RTMR would still refuse.
+def test_a_box_on_sev_snp_uses_a_software_lease_register(tmp_path: Path, guest, monkeypatch):
+    host_data = measured_root.host_data_for_root_keys(guest.image_root.read_bytes())
+    monkeypatch.setattr(
+        measured_root,
+        "load_measured_root_keys",
+        lambda tee, read_binding=None: (
+            ROOT_KEYS,
+            measured_root.root_digest_from_host_data(host_data),
+        ),
+    )
+    config = tee_box_config(_args(tmp_path, *_full_flags(tmp_path)))
+    api, facts = configure_module.build_tee_box_api(
+        config,
+        tee="snp",
+        hotkey=WORKER_HOTKEY,
+        channel_binding=_binding(),
+        network="finney",
+        netuid=NETUID,
+        public_endpoint=None,
+        runner=guest,
+        read_binding=lambda: host_data,
+        storage_probe=guest.disk.probe(),
+        boot_options={
+            "rtmr": guest.rtmr,
+            "read_boot_id": lambda: guest.boot_id,
+            "read_booted_at": lambda: BOOTED_AT,
+        },
+    )
+    assert facts["boot"]["fresh_boot_register"] == "software_lease_register"
+    assert facts["boot"]["fresh_boot_hardware_backed"] is False
+    assert isinstance(api, TeeBoxSandboxApi)
+
+
+def test_a_box_on_sev_snp_defaults_to_the_software_lease_register(
+    tmp_path: Path, guest, monkeypatch
+):
+    host_data = measured_root.host_data_for_root_keys(guest.image_root.read_bytes())
+    seen = []
+
+    class _Recording(boot_module.SoftwareLeaseRegister):
+        def read(self) -> bytes:
+            seen.append(self.path)
+            return bytes(48)
+
+    monkeypatch.setattr(configure_module, "SoftwareLeaseRegister", _Recording)
+    monkeypatch.setattr(
+        measured_root,
+        "load_measured_root_keys",
+        lambda tee, read_binding=None: (
+            ROOT_KEYS,
+            measured_root.root_digest_from_host_data(host_data),
+        ),
+    )
+    config = tee_box_config(_args(tmp_path, *_full_flags(tmp_path)))
+    api, facts = configure_module.build_tee_box_api(
+        config,
+        tee="snp",
+        hotkey=WORKER_HOTKEY,
+        channel_binding=_binding(),
+        network="finney",
+        netuid=NETUID,
+        public_endpoint=None,
+        runner=guest,
+        read_binding=lambda: host_data,
+        storage_probe=guest.disk.probe(),
+        boot_options={
+            "read_boot_id": lambda: guest.boot_id,
+            "read_booted_at": lambda: BOOTED_AT,
+        },
+    )
+    assert seen == [str(tmp_path / "tee-box-central.sqlite.lease")]
+    assert facts["boot"]["fresh_boot_register"] == "software_lease_register"
+    assert facts["boot"]["fresh_boot_hardware_backed"] is False
+    assert isinstance(api.boot._rtmr, _Recording)  # noqa: SLF001
+
+
+def test_an_unknown_tee_has_no_fresh_boot_register(tmp_path: Path, guest, monkeypatch):
     monkeypatch.setattr(
         measured_root,
         "load_measured_root_keys",
         lambda tee, read_binding=None: (ROOT_KEYS, "sha256:" + "0" * 64),
     )
     config = tee_box_config(_args(tmp_path, *_full_flags(tmp_path)))
-    with pytest.raises(ValueError, match=r"^TEE box boot identity: TEE 'snp' has no RTMR3"):
+    with pytest.raises(
+        ValueError, match=r"^TEE box boot identity: TEE 'gpu' has no fresh-boot register"
+    ):
         configure_module.build_tee_box_api(
             config,
-            tee="snp",
+            tee="gpu",
             hotkey=WORKER_HOTKEY,
-            channel_binding=None,
+            channel_binding=_binding(),
             network="finney",
             netuid=NETUID,
             public_endpoint=None,

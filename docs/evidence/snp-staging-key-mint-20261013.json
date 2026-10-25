@@ -1,0 +1,18 @@
+{
+  "schema": "cathedral_snp_isolated_staging_key_v1",
+  "stamp": "20261013T084704Z",
+  "key_id": "aed71676-56c2-4490-84aa-773d7c45987c",
+  "key_prefix": "cat_sk_xwGye",
+  "user_id": "d5c60678-c1c9-4d43-a9bc-de2d5023a1de",
+  "email": "snp-staging-owner@localhost",
+  "scopes": ["sandboxes:control", "billing:read"],
+  "budget_usd": "5.000000",
+  "credit_balance_usd": 50.0,
+  "expires_at": "2026-10-15T08:47:04.506807+00:00",
+  "account_http": 200,
+  "base_local": "http://127.0.0.1:8010",
+  "base_public": "http://bore.pub:60916",
+  "secret_location": "/tmp/cathedral-snp-staging-api-key (0600, not in git)",
+  "mint_script": "polariscomputer/scripts/snp_staging/mint_staging_key.py",
+  "note": "Owned isolated staging key. Not Fred key b30b7437. Not prod cat_sk_E-j9h."
+}

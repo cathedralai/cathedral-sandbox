@@ -125,3 +125,30 @@ On a fresh TDX guest, run `SSH_KEY=… HOST=… ./run.sh` from
 `scripts/tee_box_tdx_e2e/`. A second run in the same boot skips the "RTMR3
 reads zero" checks. `scripts/tee_box_tdx_e2e/README.md` covers what the run
 needs, how long it takes, and the local baseline.
+
+## Re-run 2026-10-07 (toby@34.133.62.28, harness only)
+
+Same required checks a–g: **all PASS**. Pre-LUKS 1 PASS; main 46 PASS, 0 FAIL.
+`SKIP_TESTS=1` (no sandbox/validator suites). Artifact directory:
+`scripts/tee_box_tdx_e2e/out/results/34.133.62.28-20261007T091816Z`.
+
+| Item | Value |
+|---|---|
+| Machine | `toby@34.133.62.28` (`sn94-testnet-miner-1…polaris-tdx-attest`), 4 vCPU, 14 GiB |
+| Guest | kernel `7.0.0-1011-gcp`, Docker 29.8.2 |
+| Sandbox | `feat/tee-box-snp-startup-gates` @ `d162591` |
+| Validator | `origin/main` @ `7f027d7` (shipped in the bundle; suites not run) |
+| Verifier | v1.0.0 sha256 `4b6fbaf1…` |
+| Wall time | ~220 s local driver; harness-main 98 s |
+
+Unchanged observations vs 2026-09-30: MRCONFIGID still injected (provider
+launch binds zero); e.8 DNS from gVisor still INFO fail
+(`wget: bad address 'one.one.one.one'`); IP egress to 1.1.1.1 still PASS.
+
+**Clears for #274:** TDX tee-box harness density / receipt path on this GCP
+box. **Does not clear:** SNP `HOST_DATA` launch bind, cathedral-1/2 SNP
+acceptance, B.d hardware fresh-boot on SNP, sealed #274 PASS.
+
+Local `./run.sh all` exited 1 only because `step_summary` expanded an empty
+`baseline` array under `set -u` on macOS bash; summarize was re-run by hand
+into `RESULTS.txt`. Fixed in `scripts/tee_box_tdx_e2e/run.sh`.

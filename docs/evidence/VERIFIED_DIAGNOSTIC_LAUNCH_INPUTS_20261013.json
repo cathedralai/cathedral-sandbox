@@ -1,0 +1,337 @@
+{
+  "schema": "cathedral_diagnostic_verity_launch_inputs_v1",
+  "status": "BUILT_VERIFIED_NOT_BOOTED_NOT_CUSTOMER_QUALIFIED",
+  "build_started_utc": "2026-10-13T19:45:12Z",
+  "build_finished_utc": "2026-10-13T19:46:47.451289Z",
+  "verified_utc": "2026-10-13T19:50:29.054580+00:00",
+  "source_identity": {
+    "backend_commit": "f76250526b300c0c7dd677e16e2f3cf6674a7371",
+    "worker_source_ref": "0029cec5",
+    "worker_archive_sha256": "67a84ea41079503f33abe98356ea7e14a1b849a3087fc6b50ece8a0961039fe5",
+    "bootstrap_sha256": "992f4010f6771b49f8370c8dbbd6f4ecaaa6cf99edbb867a445153ac34acfc99",
+    "mkosi_conf_sha256": "08f7dc1074cb624a9091d818133607aa45f876f390efc3d6d56729d18013577d",
+    "repart_sha256": {
+      "00-esp.conf": "01f0ff168a3aa4c12b0828208616ad58e46a44829a04b60132378258b9151ced",
+      "10-root.conf": "ee732ebfbcb5b10f26bac1158c13ec47b3f775363bbd2b5af019c170a2735a23",
+      "11-root-verity.conf": "0b3e60f2798f8d9368ac5a5c24a88d62a33055256ea2b9973b4361e1a2879998"
+    },
+    "repair_patch_sha256": "20aed849b656b3067b8a81731fde9a5a92611a11248eeb04c28c9ac028d58dd6",
+    "controller_sha256": "23e34f2dcf84f6c52478a63109ecc0ccd254235115ac7074e05f8ffc973fc595",
+    "full_extra_manifest": {
+      "etc/docker/daemon.json": {
+        "sha256": "e1c3be0d467f45ca8db5f3215dbaad77fea600088b901b87a5a8f76318c5f232",
+        "mode": 420
+      },
+      "etc/fstab": {
+        "sha256": "09f2c8ae303e1001a407889b094e7e5a1af782c1f989c4d86ff68d338190f54d",
+        "mode": 420
+      },
+      "etc/systemd/network/80-dhcp.network": {
+        "sha256": "9874e14209f363517c1cfa8d9c2f01af95328a25864dd63aaac6f1b980c70932",
+        "mode": 420
+      },
+      "etc/systemd/system/cathedral-staging-snp.service": {
+        "sha256": "40b4e7c700f853e4f9120f4c5430cfbd78978b538e6a397122b5d720c4718b51",
+        "mode": 420
+      },
+      "opt/cathedral/boot/staging_snp_worker.py": {
+        "sha256": "992f4010f6771b49f8370c8dbbd6f4ecaaa6cf99edbb867a445153ac34acfc99",
+        "mode": 420
+      },
+      "opt/cathedral/build-input/finalize_staging_source.chroot": {
+        "sha256": "9f6d2bfd43c6646772dd174618fe41b3bcac00c5dedca1cd1122a121d6d83f97",
+        "mode": 493
+      },
+      "opt/cathedral/build-input/sky-base-postinst.chroot": {
+        "sha256": "1dcb7f88d0afc96d3ebf4bb2c7507ee2de7ef0e5116567ea5a56cbdc04a6aa8c",
+        "mode": 493
+      },
+      "opt/cathedral/build-input/worker-source-0029cec5.sha256": {
+        "sha256": "1af4fadaa1756c70095f28ac1882e16803bdc4466e0be16777735f1cebc75267",
+        "mode": 420
+      },
+      "opt/cathedral/build-input/worker-source-0029cec5.tar": {
+        "sha256": "67a84ea41079503f33abe98356ea7e14a1b849a3087fc6b50ece8a0961039fe5",
+        "mode": 420
+      },
+      "opt/gvisor/containerd-shim-runsc-v1": {
+        "sha256": "2bff94d15386d36e62e2f105ba835f650e55327cb731d96820cbbfe5592c2a6b",
+        "mode": 493
+      },
+      "opt/gvisor/gvisor-bin/checkpointgofer": {
+        "sha256": "c454d0b5fab4627d8915194f901a70c66bb4792f680e3f75d2a47516382b449a",
+        "mode": 493
+      },
+      "opt/gvisor/gvisor-bin/gvisor-sentry-prewarmer": {
+        "sha256": "3315d7ad7c2d3751d349e4976fa02da1da6fd7e41746c35622304e5fabe4fce0",
+        "mode": 493
+      },
+      "opt/gvisor/gvisor-bin/gvisor_sentry": {
+        "sha256": "0050e7c6063e17de1729500cd73b18322d85c758eb0ffcab18e539df7110bd12",
+        "mode": 493
+      },
+      "opt/gvisor/gvisor-bin/runsc-fd-parking": {
+        "sha256": "03af90d07ea466c10ecc3e3ba839b2a59540959dd3286aea3886917cba850c11",
+        "mode": 493
+      },
+      "opt/gvisor/gvisor-bin/runsc-metric-server": {
+        "sha256": "7bcbe5846a0f6d34c7d2bd312033bb92ab6305b9ac93e09b753b3474f91f27b2",
+        "mode": 493
+      },
+      "opt/gvisor/runsc": {
+        "sha256": "210b437a9cfae51e8f8c9074ed19b8b5e59477178e2e391a18117d8d6b924f7a",
+        "mode": 493
+      },
+      "usr/local/bin/snpguest": {
+        "sha256": "70e700465e3523e67dd5104583dc36cd11eef630c6f04c5b9ccafd6ba2e76ca0",
+        "mode": 493
+      },
+      "usr/share/cathedral/central-root-keys.json": {
+        "sha256": "551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e",
+        "mode": 420
+      }
+    },
+    "build_command": [
+      "/usr/bin/mkosi",
+      "--directory=/root/snp-launch/cathedral-staging-20261013/project-verity",
+      "--output-directory=/root/snp-launch/cathedral-staging-20261013/images-verity",
+      "--output=cathedral-staging-snp-verity-20261013",
+      "--workspace-directory=/root/snp-launch/cathedral-staging-20261013/workspace-verity",
+      "--cache-directory=/root/snp-launch/cathedral-staging-20261013/cache-verity",
+      "--package-cache-dir=/root/snp-launch/cathedral-staging-20261013/package-cache",
+      "--manifest-format=json",
+      "--split-artifacts=uki,kernel,initrd,roothash,repart-definitions,partitions",
+      "build"
+    ],
+    "hermetic_or_bit_identical_reproducibility_proved": false
+  },
+  "resource_limits": {
+    "CPUQuota": "200%",
+    "MemoryMax": "8G",
+    "TasksMax": 512,
+    "RuntimeMaxSec": "45min",
+    "Nice": 10
+  },
+  "artifacts": {
+    "cathedral-staging-snp-verity-20261013.efi": {
+      "bytes": 83730944,
+      "sha256": "311e02f1cb543045256edd5bbacab32883082fae4bbc3f89080975b4027acf2f"
+    },
+    "cathedral-staging-snp-verity-20261013.esp.raw": {
+      "bytes": 536870912,
+      "sha256": "6df4e4a994ba3fe1a5756db3dec614027fa6de2f7a705d4baca1f1c3780c8270"
+    },
+    "cathedral-staging-snp-verity-20261013.initrd": {
+      "bytes": 44617528,
+      "sha256": "18275f1c43df461c0c1436fbf3d78dcd31f888ec2ad6675e2af121af550c0298"
+    },
+    "cathedral-staging-snp-verity-20261013.manifest": {
+      "bytes": 28497,
+      "sha256": "e280f12f979895e9a40ffc228dd8ddf305e28e00876194c6d28df088322dd038"
+    },
+    "cathedral-staging-snp-verity-20261013.raw": {
+      "bytes": 2548928512,
+      "sha256": "8296f243fef954bfc4b5152fb3cc564625d9ff94042762253485200c2a271394"
+    },
+    "cathedral-staging-snp-verity-20261013.root-x86-64-verity.raw": {
+      "bytes": 15720448,
+      "sha256": "d4743786a55ad36ce30876675b3ffb236eeba97f9f78225496f5e4b212228f83"
+    },
+    "cathedral-staging-snp-verity-20261013.root-x86-64.raw": {
+      "bytes": 1995268096,
+      "sha256": "25c0965d15b9eadec5aa89b7f4b575dd146c41434d41e63b353c931814bbf2bd"
+    },
+    "cathedral-staging-snp-verity-20261013.roothash": {
+      "bytes": 64,
+      "sha256": "180f25fa74e9197a72e515df590743c449ff0dd9feb32c461adbdd6091761088"
+    },
+    "cathedral-staging-snp-verity-20261013.vmlinuz": {
+      "bytes": 17320328,
+      "sha256": "9f55ef7253055a9cf68f8a04323c93dead2fca617386d842fbde9ca7b178b27e"
+    },
+    "initrd.cpio.zst": {
+      "bytes": 35343680,
+      "sha256": "ae1214b4f4cba2cb1cc35d835822a86f46fcf2e7ecbabc9f8867416a4f12e3e6"
+    }
+  },
+  "selected_boot_inputs": {
+    "directory": "/root/snp-launch/cathedral-staging-20261013/images-verity",
+    "firmware": {
+      "path": "/usr/share/ovmf/OVMF.amdsev.fd",
+      "bytes": 4194304,
+      "sha256": "ac27e626b097cf6f9eae09b79fc87fc2d3fb6e99c8d97b27f0603993c06a28bb"
+    },
+    "kernel": {
+      "path": "/root/snp-launch/cathedral-staging-20261013/images-verity/cathedral-staging-snp-verity-20261013.vmlinuz",
+      "bytes": 17320328,
+      "sha256": "9f55ef7253055a9cf68f8a04323c93dead2fca617386d842fbde9ca7b178b27e"
+    },
+    "initrd": {
+      "path": "/root/snp-launch/cathedral-staging-20261013/images-verity/cathedral-staging-snp-verity-20261013.initrd",
+      "bytes": 44617528,
+      "sha256": "18275f1c43df461c0c1436fbf3d78dcd31f888ec2ad6675e2af121af550c0298"
+    },
+    "disk": {
+      "path": "/root/snp-launch/cathedral-staging-20261013/images-verity/cathedral-staging-snp-verity-20261013.raw",
+      "bytes": 2548928512,
+      "sha256": "8296f243fef954bfc4b5152fb3cc564625d9ff94042762253485200c2a271394"
+    },
+    "uki": {
+      "path": "/root/snp-launch/cathedral-staging-20261013/images-verity/cathedral-staging-snp-verity-20261013.efi",
+      "bytes": 83730944,
+      "sha256": "311e02f1cb543045256edd5bbacab32883082fae4bbc3f89080975b4027acf2f"
+    },
+    "expected_append_if_reviewed_launcher_selects_this_uki": "roothash=5607dede48e109b93a7cfc116640621c24e422ae4c6722e66a7e3fb79b676f7f console=ttyS0 systemd.volatile=overlay rw panic=-1",
+    "cmdline_sha256": "c87cd688190679dda4e336ae4880595231bf98da9dbcea01ab33a9930498af31",
+    "fresh_verity_roothash": "5607dede48e109b93a7cfc116640621c24e422ae4c6722e66a7e3fb79b676f7f",
+    "public_root_sha256": "551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e",
+    "host_data_base64": "VR35Ls6k4fpnvRDD0rCX13XEvq+LaOxOAF/2bXHJiF4=",
+    "historical_launcher": {
+      "path": "/root/snp-launch/tee-box-image/launch-tee-box.sh",
+      "sha256": "2f43311eae71395d6e2c324ebba2a023bc01bc3ff618ada7c6b9f87dccee9508"
+    },
+    "historical_launch_shape": {
+      "cpu": "EPYC-v4",
+      "vcpus": 4,
+      "memory_gib": 8,
+      "machine": "q35",
+      "policy": "0x30000",
+      "cbitpos": 51,
+      "reduced_phys_bits": 1,
+      "kernel_hashes": "on",
+      "disk_readonly": true
+    },
+    "historical_launch_shape_is_not_new_launch_approval": true,
+    "reviewed_quarantine_launcher": null,
+    "actual_new_guest_append": null,
+    "actual_snp_report": null,
+    "expected_snp_measurement": null,
+    "guest_endpoint": null,
+    "allocation_identity": null,
+    "guest_boot_id": null,
+    "accepted_signed_image_policy": null,
+    "accepted_policy_checkpoint": null,
+    "fresh_caller_grant": null,
+    "fresh_validator_access": null,
+    "measurement_route_limit": "UKI .linux/.initrd equality proves component selection, not that the whole UKI is SNP-measured. UKI also has .ucode (21672448 bytes). A future direct-kernel expected measurement must use actual kernel/initrd/APPEND/firmware/VMSA inputs; UKI boot is a distinct route."
+  },
+  "verification": {
+    "gpt": [
+      {
+        "index": 1,
+        "type_guid": "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+        "uuid": "38150b58-a75f-4112-a59f-2364e10574e5",
+        "first_lba": 2048,
+        "last_lba": 1050623,
+        "bytes": 536870912,
+        "name": "esp"
+      },
+      {
+        "index": 2,
+        "type_guid": "4f68bce3-e8cd-4db1-96e7-fbcaf984b709",
+        "uuid": "5607dede-48e1-09b9-3a7c-fc116640621c",
+        "first_lba": 1050624,
+        "last_lba": 4947631,
+        "bytes": 1995268096,
+        "name": "root-x86-64"
+      },
+      {
+        "index": 3,
+        "type_guid": "2c7357ed-ebd2-46d9-aec1-23d437ec2bf5",
+        "uuid": "24e422ae-4c67-22e6-6a7e-3fb79b676f7f",
+        "first_lba": 4947632,
+        "last_lba": 4978335,
+        "bytes": 15720448,
+        "name": "root-x86-64-verity"
+      }
+    ],
+    "split_partitions": [
+      {
+        "split": "esp.raw",
+        "partition": 1,
+        "sha256": "6df4e4a994ba3fe1a5756db3dec614027fa6de2f7a705d4baca1f1c3780c8270"
+      },
+      {
+        "split": "root-x86-64.raw",
+        "partition": 2,
+        "sha256": "25c0965d15b9eadec5aa89b7f4b575dd146c41434d41e63b353c931814bbf2bd"
+      },
+      {
+        "split": "root-x86-64-verity.raw",
+        "partition": 3,
+        "sha256": "d4743786a55ad36ce30876675b3ffb236eeba97f9f78225496f5e4b212228f83"
+      }
+    ],
+    "filesystem": "EROFS",
+    "verity_verify": {
+      "returncode": 0,
+      "roothash": "5607dede48e109b93a7cfc116640621c24e422ae4c6722e66a7e3fb79b676f7f",
+      "data": "/root/snp-launch/cathedral-staging-20261013/images-verity/cathedral-staging-snp-verity-20261013.root-x86-64.raw",
+      "hash_tree": "/root/snp-launch/cathedral-staging-20261013/images-verity/cathedral-staging-snp-verity-20261013.root-x86-64-verity.raw"
+    },
+    "uki_split_matches": [
+      {
+        "section": ".linux",
+        "split": "cathedral-staging-snp-verity-20261013.vmlinuz",
+        "bytes": 17320328,
+        "sha256": "9f55ef7253055a9cf68f8a04323c93dead2fca617386d842fbde9ca7b178b27e",
+        "match": true
+      },
+      {
+        "section": ".initrd",
+        "split": "cathedral-staging-snp-verity-20261013.initrd",
+        "bytes": 44617528,
+        "sha256": "18275f1c43df461c0c1436fbf3d78dcd31f888ec2ad6675e2af121af550c0298",
+        "match": true
+      }
+    ],
+    "runtime_hashes": {
+      "/opt/cathedral/python-3.13.9/bin/python3.13": {
+        "bytes": 29296032,
+        "sha256": "6b0b5932e322f730ef5c31820df7ead292af44904bb72f46e025237b7762cbb2"
+      },
+      "/opt/gvisor/runsc": {
+        "bytes": 109966750,
+        "sha256": "210b437a9cfae51e8f8c9074ed19b8b5e59477178e2e391a18117d8d6b924f7a"
+      },
+      "/opt/gvisor/containerd-shim-runsc-v1": {
+        "bytes": 43626680,
+        "sha256": "2bff94d15386d36e62e2f105ba835f650e55327cb731d96820cbbfe5592c2a6b"
+      },
+      "/usr/local/bin/snpguest": {
+        "bytes": 13492256,
+        "sha256": "70e700465e3523e67dd5104583dc36cd11eef630c6f04c5b9ccafd6ba2e76ca0"
+      },
+      "/opt/cathedral/boot/staging_snp_worker.py": {
+        "bytes": 5839,
+        "sha256": "992f4010f6771b49f8370c8dbbd6f4ecaaa6cf99edbb867a445153ac34acfc99"
+      },
+      "/etc/systemd/system/cathedral-staging-snp.service": {
+        "bytes": 445,
+        "sha256": "40b4e7c700f853e4f9120f4c5430cfbd78978b538e6a397122b5d720c4718b51"
+      },
+      "/usr/share/cathedral/central-root-keys.json": {
+        "bytes": 67,
+        "sha256": "551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e"
+      }
+    },
+    "site_package_files_count": 1323,
+    "site_package_manifest_sha256": "a4fa575810a6d99cd409852710310171478610108daf0048eea5722a6cb4432a",
+    "worker_source_modules_matched": 88,
+    "existing_guests_unchanged": true,
+    "public_root_unchanged": true,
+    "prior_images_stat_unchanged": true,
+    "site_package_inventory_limit": "1323 regular files only; symlinks skipped; no final guest interpreter/import execution performed"
+  },
+  "customer_profile_blockers": [
+    "systemd.volatile=overlay rw leaves executable code replaceable by guest root",
+    "SSH/serial/rescue and broad root worker allocation options remain unqualified",
+    "Externally supplied P-256 TLS private key and root-readable receipt SQLite do not prove guest-internal custody"
+  ],
+  "separate_customer_profile_owner": "01a135c0-8355-77bf-80d1-ff577183d034",
+  "independent_technical_reviewer": "01a136c4-2eb1-748b-ad4f-8ff3cdeea038",
+  "guest_boot": false,
+  "signing": false,
+  "deployment": false,
+  "customer_execution": false
+}

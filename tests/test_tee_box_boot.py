@@ -25,7 +25,9 @@ from cathedral.tee_box.boot import (
     BootGuard,
     RelaunchRequired,
     RtmrError,
+    SoftwareLeaseRegister,
     SysfsRtmr3,
+    lease_register_path_for,
     marker_path_for,
     read_boot_id,
     read_booted_at,
@@ -610,3 +612,40 @@ def test_the_sysfs_interface_reads_and_writes_48_raw_bytes(tmp_path: Path):
         SysfsRtmr3(str(tmp_path / "missing")).read()
     with pytest.raises(RtmrError):
         SysfsRtmr3(str(tmp_path / "missing")).extend(LEASE_EVENT_DIGEST)
+
+
+def test_the_software_lease_register_extends_like_rtmr3(tmp_path: Path):
+    path = lease_register_path_for(str(tmp_path / "central.sqlite"))
+    assert path.endswith(".lease")
+    register = SoftwareLeaseRegister(path)
+    assert register.hardware_backed is False
+    assert register.read() == RTMR3_FRESH
+    register.extend(LEASE_EVENT_DIGEST)
+    assert register.read() == RTMR3_CONSUMED
+    assert Path(path).read_bytes() == RTMR3_CONSUMED
+    with pytest.raises(RtmrError):
+        register.extend(b"short")
+
+
+def test_a_boot_guard_can_use_the_software_lease_register(tmp_path: Path):
+    path = lease_register_path_for(str(tmp_path / "central.sqlite"))
+    boot_ids = _BootIds()
+    guard = BootGuard(
+        str(tmp_path / "central.sqlite.boot"),
+        rtmr=SoftwareLeaseRegister(path),
+        read_boot_id=boot_ids,
+        read_booted_at=lambda: BOOTED_AT,
+    )
+    assert guard.rtmr3_extended is False
+    guard.consume(CALLER, 1_900_000_000.0)
+    assert guard.rtmr3_extended is True
+    assert SoftwareLeaseRegister(path).read() == RTMR3_CONSUMED
+    # A restarted worker in the same boot keeps the consumed register.
+    again = BootGuard(
+        str(tmp_path / "central.sqlite.boot"),
+        rtmr=SoftwareLeaseRegister(path),
+        read_boot_id=boot_ids,
+        read_booted_at=lambda: BOOTED_AT,
+    )
+    assert again.record.consumed_by == CALLER
+    assert again.rtmr3_extended is True

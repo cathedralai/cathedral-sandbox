@@ -1,0 +1,5 @@
+# Discord → Wallscalr (receipts clarity)
+
+@wallscaler **Yes — there is a standard demoable receipt right now.** On live `https://cathedral.computer`, a normal one-shot worker job issues a signed `cathedral_customer_receipt_v1` at `GET /v1/receipts/{id}` (same id as the run). That is **per job on the customer’s account**, not a custom engineering job — any keyed create→complete path that issues receipts produces one. Current live hardware for that demo is TDX / `attest.v1`, not measured SNP.
+
+The other thing people call a “receipt” here is the **SNP absence / lifecycle receipt** (`cathedral_miner_lifecycle_receipt_v1`) — pilot cleanup plumbing where an independent observer proves a specific guest is gone. That is **not** the customer `/v1/receipts` demo and is **not** ready to sell. A **measured SNP customer receipt** (same product shape, SNP-qualified image) comes only after customer qualification, signed policy/checkpoint, and the grant after HTTPS — Fred still owes the reviewed commit + runnable build packet before that clock starts; no firm date until that packet ships and qual clears.
