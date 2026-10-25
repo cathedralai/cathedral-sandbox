@@ -1723,7 +1723,7 @@ def cmd_sandbox_serve(args: argparse.Namespace) -> int:
     requires Docker plus a registered kata-runtime (fails closed otherwise).
     """
     from cathedral.sandbox_runtime import build_sandbox_provider, capabilities_document
-    from cathedral.sandbox_server import SandboxApplication, reaper_interval_from_env, run
+    from cathedral.sandbox_server import SandboxApplication, install_stop_signal, reaper_interval_from_env, run
 
     provider = build_sandbox_provider(
         runtime=getattr(args, "runtime", None),
@@ -1747,6 +1747,7 @@ def cmd_sandbox_serve(args: argparse.Namespace) -> int:
         ),
         flush=True,
     )
+    install_stop_signal()  # SIGTERM (a systemd restart) cleans up like Ctrl-C
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

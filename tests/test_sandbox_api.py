@@ -41,6 +41,8 @@ from cathedral.sandbox_api import (
     idempotency_digest,
     is_collectable,
     key_quota_for,
+    canonical_network_policy,
+    normalize_allow_entry,
     operation_id,
     parse_byte_range,
     snapshot_gib_months,
@@ -121,6 +123,39 @@ def test_network_spec_modes_and_allowlist() -> None:
         NetworkSpec(mode="bridge")
     with pytest.raises(SandboxContractError, match="invalid_network_allowlist"):
         NetworkSpec(mode="allowlist", allow=())
+
+
+def test_allowlist_hostname_port_80_443_preserved() -> None:
+    """host:80 / host:443 stay in the policy so egress opens only that port."""
+    assert normalize_allow_entry("pypi.org:443") == "pypi.org:443"
+    assert normalize_allow_entry("pypi.org:80") == "pypi.org:80"
+    assert normalize_allow_entry("PYPI.ORG:443") == "pypi.org:443"
+    assert normalize_allow_entry("pypi.org") == "pypi.org"
+    # Bare host (both ports) wins over a port-only row for the same name.
+    pol = canonical_network_policy("allowlist", ["pypi.org:443", "pypi.org"])
+    assert pol["allow"] == ["pypi.org"]
+    # Only :443 does not open :80.
+    pol443 = canonical_network_policy("allowlist", ["example.com:443"])
+    assert pol443["allow"] == ["example.com:443"]
+    # Both ports listed collapse to bare.
+    both = canonical_network_policy("allowlist", ["example.com:80", "example.com:443"])
+    assert both["allow"] == ["example.com"]
+
+
+def test_allowlist_hostname_other_port_rejected() -> None:
+    """host:8080 gives a clear error, not a generic bad-entry message."""
+    with pytest.raises(SandboxContractError, match="invalid_network_allowlist"):
+        normalize_allow_entry("pypi.org:8080")
+    with pytest.raises(SandboxContractError, match="invalid_network_allowlist"):
+        normalize_allow_entry("pypi.org:8443")
+
+
+def test_allowlist_ip_colon_port_rejected_with_guidance() -> None:
+    """1.2.3.4:443 is rejected; user should use bare 1.2.3.4 (CONST fix D)."""
+    with pytest.raises(SandboxContractError, match="invalid_network_allowlist"):
+        normalize_allow_entry("1.2.3.4:443")
+    with pytest.raises(SandboxContractError, match="invalid_network_allowlist"):
+        normalize_allow_entry("1.2.3.4:80")
 
 
 # ---------------------------------------------------------------- §3.1/§3.4/§3.5 create
@@ -423,3 +458,10 @@ def test_exec_timeout_limit_comes_from_config(monkeypatch) -> None:
         ExecRequest(cmd="true", timeout_seconds=601)
     monkeypatch.setenv("CATHEDRAL_SANDBOX_EXEC_TIMEOUT_MAX", "not-a-number")
     assert ExecRequest(cmd="true", timeout_seconds=14400).timeout_seconds == 14400
+
+
+@pytest.mark.parametrize("ref", ["-privileged:latest", "--network:latest", "-v/x:latest", "reg.io/-x:1", "-reg.io/x:1"])
+def test_image_reference_cannot_start_a_part_with_a_dash(ref) -> None:
+    # The ref goes to the docker CLI as an argument; a leading dash reads as a flag.
+    with pytest.raises(SandboxContractError):
+        ImageSource(image=ref)

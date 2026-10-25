@@ -155,6 +155,28 @@ _CODE_STATUS = {
 }
 
 
+def install_stop_signal() -> None:
+    """Make SIGTERM end serve_forever like Ctrl-C, so the provider closes.
+
+    systemd restarts send SIGTERM; without this the process died with every
+    room's work directory and snapshot tar left on the data volume.
+    """
+    import signal
+
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, stop)
+    except ValueError:  # not the main thread
+        pass
+
+
+# The broker caps room bodies at 256 MiB (files and tar). Anything larger is
+# refused before it is read, so a client cannot hold a thread on a slow body.
+MAX_BODY_BYTES = 256 << 20
+
+
 class SandboxApplication:
     # Routes served without a Bearer token (§3.10: the OpenAPI contract is public).
     PUBLIC_PATHS = frozenset({"/openapi.json"})
@@ -309,6 +331,18 @@ class SandboxApplication:
             return Response.error(exc.http_status, exc.category, str(exc))
         except json.JSONDecodeError as exc:
             return Response.error(400, "invalid_json", f"request body is not JSON: {exc}")
+        except (TypeError, ValueError, KeyError, OverflowError, RecursionError) as exc:
+            # A JSON-valid body with a field of the wrong shape (an unknown
+            # key in "image", a number where a list belongs, a 5,000-digit
+            # integer, nesting past the parser's depth). Answer 400: a dropped
+            # connection reads as a hotel outage at the broker, which then
+            # rests this hotel for every guest.
+            return Response.error(400, "invalid_request", f"a request field has the wrong shape: {type(exc).__name__}: {str(exc)[:200]}")
+        except Exception:  # noqa: BLE001 the connection must get an answer
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
+            return Response.error(500, "internal_error", "the hotel could not handle this request")
 
     def _authenticate(self, headers: Mapping[str, str]) -> str | None:
         raw = headers.get("Authorization") or headers.get("authorization")
@@ -529,7 +563,11 @@ class SandboxApplication:
     # ------------------------------------------------------------------ §3.7 network / expose
     def set_network(self, *, id, body, **_):
         payload = self._json(body)
-        patch = NetworkPatch(mode=payload.get("mode", "public"), allow=_allow_list(payload.get("allow")))
+        # A change must name its mode: defaulting a missing mode to "public"
+        # would turn a malformed change into full internet access.
+        if not isinstance(payload.get("mode"), str):
+            raise api.SandboxContractError("invalid_network_mode", "network change needs a mode: internet, deny_all or allowlist")
+        patch = NetworkPatch(mode=payload["mode"], allow=_allow_list(payload.get("allow")))
         return Response.json(200, self.provider.set_network(id, patch))
 
     def expose(self, *, id, body, **_):
@@ -857,9 +895,21 @@ class _Handler(BaseHTTPRequestHandler):
     app: SandboxApplication
 
     def _run(self, method: str) -> None:
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        body = self.rfile.read(length) if length else b""
-        resp = self.app.dispatch(method, self.path, dict(self.headers), body)
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_BODY_BYTES:
+            # Refuse before reading: the body stays on the wire and the
+            # connection closes (HTTP/1.0, no keep-alive).
+            self.close_connection = True
+            resp = Response.error(413, "request_too_large", f"the request body is over {MAX_BODY_BYTES} bytes")
+        else:
+            body = self.rfile.read(length) if length else b""
+            resp = self.app.dispatch(method, self.path, dict(self.headers), body)
+        self._send(resp)
+
+    def _send(self, resp: Response) -> None:
         self.send_response(resp.status)
         for k, v in resp.headers.items():
             self.send_header(k, v)
@@ -978,8 +1028,20 @@ class _Handler(BaseHTTPRequestHandler):
                         text = payload.decode("utf-8", errors="replace")
                         if text and not text.endswith("\n"):
                             text += "\n"
-                        self.app.provider.terminal_write(sandbox_id, terminal_id, text)
-                        out = self.app.provider.terminal_read(sandbox_id, terminal_id)
+                        try:
+                            self.app.provider.terminal_write(sandbox_id, terminal_id, text)
+                            out = self.app.provider.terminal_read(sandbox_id, terminal_id)
+                        except SandboxOpError as exc:
+                            # The sandbox ended (TTL, delete) while the socket
+                            # was open: say so with a close frame, not a
+                            # dropped socket and a traceback.
+                            import struct
+
+                            reason = struct.pack("!H", 1000) + exc.code.encode("ascii", "replace")[:120]
+                            self.wfile.write(ws.encode_frame(reason, opcode=ws.OP_CLOSE))
+                            self.wfile.flush()
+                            stop = True
+                            break
                         data = (out.get("data") or "").encode("utf-8")
                         if data:
                             self.wfile.write(ws.encode_frame(data, opcode=ws.OP_TEXT))

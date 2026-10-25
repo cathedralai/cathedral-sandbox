@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -42,7 +43,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Callable, Any, Iterable, Mapping, Protocol
 
 from cathedral import sandbox_api as api
 from cathedral import agent_interactive as agent_ux
@@ -193,9 +194,12 @@ class InMemorySandboxProvider:
         self._base = Path(tempfile.mkdtemp(prefix="cathedral-sandbox-"))
         self._sandboxes: dict[str, _Sandbox] = {}
         self._snapshots: dict[str, tuple[Path, SnapshotRecord]] = {}  # id -> (tar path, record)
+        self._snapshot_owner: dict[str, str | None] = {}  # id -> the key that made it
         self._operations: dict[str, dict[str, Any]] = {}
         self._images: dict[str, dict[str, Any]] = {}
-        self._idempotency: dict[str, tuple[str, Any]] = {}
+        # (api key, Idempotency-Key) -> (body digest, answer). Keyed per key:
+        # two keys can pick the same key string for the same body.
+        self._idempotency: dict[tuple[str | None, str], tuple[str, Any]] = {}
         # §3.13/§3.18: logs kept 24 h after delete (stdout, stderr, exec history).
         self._log_tombstones: dict[str, dict[str, Any]] = {}
         self._limits = limits or QuotaLimits(
@@ -258,6 +262,12 @@ class InMemorySandboxProvider:
                 404,
                 f"no sandbox {sandbox.id}",
             )
+
+    def _snapshot_visible(self, snapshot_id: str) -> bool:
+        """A snapshot belongs to the key that made it; another key cannot see or use it."""
+        caller = self._caller_key()
+        owner = self._snapshot_owner.get(snapshot_id)
+        return caller is None or owner is None or owner == caller
 
     def _require_active(self, sandbox_id: str) -> _Sandbox:
         sandbox = self._sandboxes.get(sandbox_id)
@@ -352,7 +362,7 @@ class InMemorySandboxProvider:
             self._ctx.api_key = api_key
             if idempotency is not None:
                 api.validate_idempotency_key(idempotency)
-                seen = self._idempotency.get(idempotency)
+                seen = self._idempotency.get((api_key, idempotency))
                 if seen is not None:
                     if seen[0] != body_digest:
                         raise SandboxOpError("idempotency_conflict", 409, "Idempotency-Key reused with a different body")
@@ -367,7 +377,7 @@ class InMemorySandboxProvider:
             finally:
                 self._create_latencies_ms.append((time.perf_counter() - started) * 1000)
             if idempotency is not None:
-                self._idempotency[idempotency] = (body_digest, docs)
+                self._idempotency[(api_key, idempotency)] = (body_digest, docs)
             return docs
 
     def _create_locked(self, request: CreateSandboxRequest, api_key: str | None) -> dict[str, Any]:
@@ -406,10 +416,13 @@ class InMemorySandboxProvider:
 
         if request.snapshot_id is not None:
             snap = self._snapshots.get(request.snapshot_id)
+            if snap is not None and not self._snapshot_visible(request.snapshot_id):
+                snap = None  # another key's snapshot: as good as absent
             if snap is None:
                 # §3.5: a fork may name the snapshot instead of its id
                 # (Harbor CreateSandboxFromSnapshotParams(snapshot=name)).
-                snap = next(((sid, r) for sid, (_, r) in self._snapshots.items() if r.name == request.snapshot_id), None)
+                snap = next(((sid, r) for sid, (_, r) in self._snapshots.items()
+                             if r.name == request.snapshot_id and self._snapshot_visible(sid)), None)
                 if snap is not None:
                     snap = self._snapshots[snap[0]]
             if snap is None:
@@ -665,24 +678,32 @@ class InMemorySandboxProvider:
             sandbox = self._require_running(sandbox_id)
             self._touch(sandbox)
             self._assert_disk_room(sandbox, extra_bytes=len(data), replacing=path)
-        host = self._host(sandbox, path)
-        host.parent.mkdir(parents=True, exist_ok=True)
-        host.write_bytes(data)
-        if mode is not None:
-            os.chmod(host, mode)
+        self._host(sandbox, path)
+        fd = _open_beneath(sandbox.root, path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, make_dirs=True)
+        with os.fdopen(fd, "wb") as fh:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise SandboxOpError("not_a_file", 400, f"{path} is not a regular file")
+            fh.write(data)
+            if mode is not None:
+                os.fchmod(fd, mode)
 
     def read_file(self, sandbox_id: str, spec: FileGet) -> tuple[bytes, int]:
         with self._lock:
             sandbox = self._require_active(sandbox_id)
             self._touch(sandbox)
-        host = self._host(sandbox, spec.path)
-        if not host.is_file():
-            raise SandboxOpError("file_not_found", 404, f"no file {spec.path}")
-        total = host.stat().st_size
-        # §3.3: ?max_bytes= past the cap is a 413 (the whole file is too big to return).
-        if spec.max_bytes is not None and total > spec.max_bytes:
-            raise SandboxOpError("file_too_large", 413, f"{spec.path} is {total} bytes, over max_bytes {spec.max_bytes}")
-        with host.open("rb") as fh:
+        self._host(sandbox, spec.path)
+        try:
+            fd = _open_beneath(sandbox.root, spec.path, os.O_RDONLY | os.O_NONBLOCK)
+        except FileNotFoundError:
+            raise SandboxOpError("file_not_found", 404, f"no file {spec.path}") from None
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise SandboxOpError("file_not_found", 404, f"no file {spec.path}")
+            total = st.st_size
+            # §3.3: ?max_bytes= past the cap is a 413 (the whole file is too big to return).
+            if spec.max_bytes is not None and total > spec.max_bytes:
+                raise SandboxOpError("file_too_large", 413, f"{spec.path} is {total} bytes, over max_bytes {spec.max_bytes}")
             if spec.range_start is not None:
                 fh.seek(spec.range_start)
                 length = (spec.range_end - spec.range_start + 1) if spec.range_end is not None else None
@@ -729,11 +750,17 @@ class InMemorySandboxProvider:
     def stat(self, sandbox_id: str, path: str) -> StatResult:
         with self._lock:
             sandbox = self._require_active(sandbox_id)
-        host = self._host(sandbox, path)
-        if not host.exists():
-            raise SandboxOpError("path_not_found", 404, f"no path {path}")
-        st = host.stat()
-        return StatResult(is_dir=host.is_dir(), is_file=host.is_file(), size=st.st_size, mode=st.st_mode & 0o7777)
+        self._host(sandbox, path)
+        try:
+            fd = _open_beneath(sandbox.root, path, os.O_RDONLY | os.O_NONBLOCK)
+        except FileNotFoundError:
+            raise SandboxOpError("path_not_found", 404, f"no path {path}") from None
+        try:
+            st = os.fstat(fd)
+        finally:
+            os.close(fd)
+        return StatResult(is_dir=stat.S_ISDIR(st.st_mode), is_file=stat.S_ISREG(st.st_mode),
+                          size=st.st_size, mode=st.st_mode & 0o7777)
 
     # ------------------------------------------------------------------ §3.5 snapshot / fork primitives
     def snapshot(self, sandbox_id: str, *, ttl_seconds: int | None = None, name: str | None = None, labels: dict[str, str] | None = None) -> str:
@@ -749,7 +776,7 @@ class InMemorySandboxProvider:
             # existing name returns that snapshot rather than duplicating it.
             if name:
                 for sid, (_, rec) in self._snapshots.items():
-                    if rec.name == name:
+                    if rec.name == name and self._snapshot_visible(sid):
                         op_id = api.operation_id()
                         self._operations[op_id] = {
                             "status": "done",
@@ -771,6 +798,7 @@ class InMemorySandboxProvider:
                 name=name or None, labels=dict(labels or {}),
             )
             self._snapshots[snap_id] = (path, record)
+            self._snapshot_owner[snap_id] = sandbox.api_key
             op_id = api.operation_id()
             self._operations[op_id] = {
                 "status": "done",
@@ -788,6 +816,7 @@ class InMemorySandboxProvider:
         ]
         for sid in expired:
             path, _ = self._snapshots.pop(sid)
+            self._snapshot_owner.pop(sid, None)
             Path(path).unlink(missing_ok=True)
 
     def list_snapshots(self, labels: Iterable[str] = ()) -> list[dict[str, Any]]:
@@ -796,6 +825,8 @@ class InMemorySandboxProvider:
             self._sweep_snapshots_locked()
             out = []
             for sid, (_, rec) in self._snapshots.items():
+                if not self._snapshot_visible(sid):
+                    continue
                 if want and not all((rec.labels or {}).get(k) == v for k, v in want.items()):
                     continue
                 out.append(
@@ -812,9 +843,10 @@ class InMemorySandboxProvider:
 
     def delete_snapshot(self, snapshot_id: str) -> bool:
         with self._lock:
-            meta = self._snapshots.pop(snapshot_id, None)
-            if meta is None:
+            if snapshot_id not in self._snapshots or not self._snapshot_visible(snapshot_id):
                 return False
+            meta = self._snapshots.pop(snapshot_id)
+            self._snapshot_owner.pop(snapshot_id, None)
             Path(meta[0]).unlink(missing_ok=True)
             return True
 
@@ -862,6 +894,7 @@ class InMemorySandboxProvider:
             sandbox.deleted_at = _now()
         self._log_tombstones[sandbox.id] = {
             "sandbox_id": sandbox.id,
+            "api_key": sandbox.api_key,
             "state": "deleted",
             "stdout": bytes(sandbox.container_stdout),
             "stderr": bytes(sandbox.container_stderr),
@@ -879,7 +912,6 @@ class InMemorySandboxProvider:
             "resources": sandbox.resources,
             "created_at": sandbox.created_at,
             "deleted_at": sandbox.deleted_at,
-            "api_key": sandbox.api_key,
             "retained_until": sandbox.deleted_at + timedelta(hours=api.PROCESS_LOG_RETENTION_HOURS),
         }
 
@@ -936,6 +968,14 @@ class InMemorySandboxProvider:
                 if now > tomb["retained_until"]:
                     del self._log_tombstones[sid]
         return removed
+
+    def sweep_tombstones(self) -> None:
+        """Drop log tombstones past their retention. Collects no sandbox."""
+        now = _now()
+        with self._lock:
+            for sid, tomb in list(self._log_tombstones.items()):
+                if now > tomb["retained_until"]:
+                    del self._log_tombstones[sid]
 
     def _is_collectable_locked(self, sandbox: _Sandbox, now: datetime) -> bool:
         """True when GC must collect *sandbox* (TTL, idle window or revoked key).
@@ -1187,7 +1227,17 @@ class InMemorySandboxProvider:
                 "note": "Prefer WebSocket /ws with X-Cathedral-Access-Ticket (query tickets disabled); REST write/read remain for tests.",
             }
 
-    def terminal_write(self, sandbox_id: str, terminal_id: str, data: str) -> dict[str, Any]:
+    def terminal_write(
+        self,
+        sandbox_id: str,
+        terminal_id: str,
+        data: str,
+        *,
+        executor: Callable[[str, ExecRequest], ExecResult] | None = None,
+    ) -> dict[str, Any]:
+        # A runtime that keeps rooms elsewhere (a container, a VM) passes its
+        # own exec: this provider's exec runs commands on this machine (B154).
+        run = executor or self.exec
         with self._lock:
             self._require_running(sandbox_id)
             term = self._terminals.get(sandbox_id, {}).get(terminal_id)
@@ -1213,7 +1263,7 @@ class InMemorySandboxProvider:
             if not cmd:
                 continue
             try:
-                result = self.exec(sandbox_id, ExecRequest(cmd=cmd, timeout_seconds=30))
+                result = run(sandbox_id, ExecRequest(cmd=cmd, timeout_seconds=30))
                 chunk = (result.stdout or "") + (result.stderr or "")
                 with self._lock:
                     term = self._terminals.get(sandbox_id, {}).get(terminal_id)
@@ -1400,10 +1450,17 @@ class InMemorySandboxProvider:
             entry["cost_usd"] += self._pricing.cost_usd(vcpu_hours=hours * vcpu, gib_hours=hours * gib)
             return group
 
+        caller = self._caller_key()
+
+        def mine(owner: str | None) -> bool:
+            return caller is None or owner is None or owner == caller
+
         with self._lock:
             # A "deleting" record already has a tombstone; do not bill it twice.
-            actives = [s for s in self._sandboxes.values() if s.state != "deleting"]
-            tombs = [t for t in self._log_tombstones.values() if t.get("resources") is not None]
+            # Each key sees its own sandboxes, tombstones and snapshots only.
+            actives = [s for s in self._sandboxes.values() if s.state != "deleting" and mine(s.api_key)]
+            tombs = [t for t in self._log_tombstones.values()
+                     if t.get("resources") is not None and mine(t.get("api_key"))]
 
         for sandbox in actives:
             if want and not all(sandbox.labels.get(k) == v for k, v in want.items()):
@@ -1421,7 +1478,7 @@ class InMemorySandboxProvider:
         snap_months = 0.0
         with self._lock:
             self._sweep_snapshots_locked()
-            snap_records = [rec for _, rec in self._snapshots.values()]
+            snap_records = [rec for sid, (_, rec) in self._snapshots.items() if self._snapshot_visible(sid)]
         for rec in snap_records:
             snap_months += api.snapshot_gib_months(rec.size_bytes, rec.ttl_seconds)
         snapshot_cost = self._pricing.cost_usd(snapshot_gib_months=snap_months)
@@ -1484,6 +1541,41 @@ class InMemorySandboxProvider:
         }
 
 
+def _open_beneath(root: Path, path: str, flags: int, *, make_dirs: bool = False) -> int:
+    """Open root/path one component at a time and never follow a symlink.
+
+    The room writes the same directories through its bind mount. A check that
+    resolves the path and a later open() that walks it again leave a gap: the
+    room swaps a directory for a link to a host file (the hotel API key) in
+    between. Opening each component with O_NOFOLLOW below an open directory
+    closes that gap. A link anywhere in the path is a path_escape.
+    """
+    parts = [part for part in path.strip("/").split("/") if part not in ("", ".")]
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+    dirfd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        for name in parts[:-1]:
+            try:
+                next_fd = os.open(name, dir_flags, dir_fd=dirfd)
+            except FileNotFoundError:
+                if not make_dirs:
+                    raise
+                os.mkdir(name, 0o755, dir_fd=dirfd)
+                next_fd = os.open(name, dir_flags, dir_fd=dirfd)
+            except OSError as exc:
+                raise SandboxOpError("path_escape", 400, f"path is not a plain directory chain: {path}") from exc
+            os.close(dirfd)
+            dirfd = next_fd
+        try:
+            return os.open(parts[-1] if parts else ".", flags | os.O_NOFOLLOW, 0o644, dir_fd=dirfd)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:  # ELOOP: the last component is a link
+            raise SandboxOpError("path_escape", 400, f"path ends in a link or cannot be opened: {path}") from exc
+    finally:
+        os.close(dirfd)
+
+
 def _render_cmd(request: ExecRequest) -> str:
     return request.cmd if isinstance(request.cmd, str) else " ".join(request.cmd)
 
@@ -1530,18 +1622,21 @@ def parse_sandbox_keys(raw: str) -> list[ApiKey]:
     }
     keys: list[ApiKey] = []
     for entry in filter(None, (part.strip() for part in raw.split(","))):
+        # A malformed entry is refused, never skipped: skipping an empty
+        # project left a hotel with zero keys (401 for everyone, including
+        # the broker), and a stray comma minted a second key.
         fields = entry.split(":")
-        if len(fields) < 2:
-            continue
+        if len(fields) < 2 or len(fields) > 3:
+            raise api.SandboxContractError("invalid_key_store", f"key store entry {entry[:8]!r}...: want key:project[:max_running]")
         key, project = fields[0].strip(), fields[1].strip()
         if not key or not project:
-            continue
+            raise api.SandboxContractError("invalid_key_store", "key store entry with an empty key or project")
         max_running: int | None = None
-        if len(fields) >= 3 and fields[2].strip():
+        if len(fields) == 3 and fields[2].strip():
             try:
                 max_running = int(fields[2].strip())
             except ValueError:
-                max_running = None
+                raise api.SandboxContractError("invalid_key_store", f"max_running {fields[2].strip()!r} is not an integer") from None
         keys.append(ApiKey(key=key, project=project, max_running=max_running, revoked=key in revoked))
     return keys
 
@@ -1564,15 +1659,17 @@ def provider_from_environment(
     ceiling (customer checklist §3.6), not only a recorded number.
     """
     limits: QuotaLimits | None = None
-    raw_quota = os.environ.get("CATHEDRAL_SANDBOX_QUOTA", "")
-    parts = [p.strip() for p in raw_quota.split(":") if p.strip()]
-    if len(parts) == 3:
+    raw_quota = os.environ.get("CATHEDRAL_SANDBOX_QUOTA", "").strip()
+    if raw_quota:
+        # The kit writes this from size.py. A malformed value used to fall
+        # back to 500/1,000/3,000 with no log; it is refused instead.
+        parts = [p.strip() for p in raw_quota.split(":")]
         try:
-            limits = QuotaLimits(
-                running_sandboxes=int(parts[0]), vcpu=int(parts[1]), memory_gib=int(parts[2])
-            )
-        except ValueError:
-            limits = None
+            if len(parts) != 3:
+                raise ValueError("want running:vcpu:memory_gib")
+            limits = QuotaLimits(running_sandboxes=int(parts[0]), vcpu=int(parts[1]), memory_gib=int(parts[2]))
+        except ValueError as exc:
+            raise api.SandboxContractError("invalid_quota", f"CATHEDRAL_SANDBOX_QUOTA {raw_quota!r}: {exc}") from None
     keys = parse_sandbox_keys(os.environ.get("CATHEDRAL_SANDBOX_KEYS", ""))
     return InMemorySandboxProvider(
         limits=limits,

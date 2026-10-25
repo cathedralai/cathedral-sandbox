@@ -199,10 +199,15 @@ def verify_attestation(att: dict, expected_measurement: str | None, prod: str | 
     need(rep["host_data"] == binding["host_data"], "report HOST_DATA differs from the binding")
     need(hex(rep["policy"]) == binding["policy"], "report policy differs from the binding")
     need(not rep["policy"] & (1 << 19), "guest policy allows debug")
+    # A debug build has the same SNP policy but gives the host root SSH into
+    # the guest. The flag is on the measured kernel cmdline.
+    cmdline = binding.get("kernel_cmdline") or ""
+    need("cathedral.debug=1" not in cmdline.split(), "debug build: the host can log in to this guest")
     if expected_measurement:
         need(rep["measurement"] == expected_measurement.lower(), "measurement differs from the expected build")
     out = {"binding_sha256": bsha, "measurement": rep["measurement"], "chip_id": rep["chip_id"].hex()[:16] + "...",
-           "policy": hex(rep["policy"]), "host_data": rep["host_data"], "report_version": rep["version"]}
+           "policy": hex(rep["policy"]), "host_data": rep["host_data"], "report_version": rep["version"],
+           "kernel_cmdline": cmdline}
     if not skip_amd:
         out["amd"] = verify_amd(report, rep, product(rep, prod), cache, ark_sha256)
     return out
@@ -236,8 +241,10 @@ def verify_receipts(att: dict, receipts: list[dict], head: str | None = None) ->
             links += 1
     seqs = sorted(by_seq)
     contiguous = bool(seqs) and seqs == list(range(seqs[0], seqs[-1] + 1))
-    if head is not None:  # a whole chain (GET .../receipts from 0): no gap, ends at the head
-        need(seqs and seqs[0] == 1 and contiguous, "the chain has a gap or does not start at receipt 1")
+    if head is not None and not seqs:  # a fresh hotel: the head is the binding itself
+        need(head == bsha, "the chain is empty but the head is not the binding")
+    elif head is not None:  # a whole chain (GET .../receipts from 0): no gap, ends at the head
+        need(seqs[0] == 1 and contiguous, "the chain has a gap or does not start at receipt 1")
         need(by_seq[seqs[-1]]["receipt_sha256"] == head, "the chain does not end at the hotel's head")
     actions = {}
     for rc in receipts:
@@ -288,12 +295,17 @@ def fetch_chain(broker: str, hotel: str, key: str) -> dict:
     page; the head of that page is the head the chain must end at.
     """
     receipts: list[dict] = []
+    offset = 0
     while True:
-        page = get(f"{broker}/v1/hotels/{hotel}/receipts?after={len(receipts)}&limit={PAGE}", key)
+        page = get(f"{broker}/v1/hotels/{hotel}/receipts?after={offset}&limit={PAGE}", key)
         receipts.extend(page["receipts"])
-        if len(page["receipts"]) < PAGE:
+        # A guest's page is filtered by the broker: "scanned" is how far the
+        # hotel's chain moved, which can be more than the receipts returned.
+        scanned = page.get("scanned", len(page["receipts"]))
+        offset += scanned
+        if scanned < PAGE:
             return {"binding_sha256": page.get("binding_sha256"), "head": page.get("head"),
-                    "count": len(receipts), "receipts": receipts}
+                    "filtered": bool(page.get("filtered")), "count": len(receipts), "receipts": receipts}
 
 
 def main() -> int:
@@ -303,15 +315,18 @@ def main() -> int:
     ap.add_argument("--receipt-header", action="append", default=[], help="X-Room-Receipt header value")
     ap.add_argument("--broker", help="broker base URL; fetches attestation and receipts itself")
     ap.add_argument("--key-file", help="guest API key file for --broker")
-    ap.add_argument("--hotel", required=False, default="sealed-1")
+    ap.add_argument("--hotel", required=False, default=None, help="hotel id (required with --broker)")
     ap.add_argument("--sandbox", help="with --broker: one room's receipts instead of the whole chain")
     ap.add_argument("--expected-measurement")
     ap.add_argument("--ark-sha256", help="pin the AMD ARK certificate (sha256 of its DER)")
     ap.add_argument("--product", help="Milan or Genoa (default: from the report)")
     ap.add_argument("--kds-cache", default=os.path.expanduser("~/.cache/amd-kds"))
     ap.add_argument("--skip-amd", action="store_true", help="skip the AMD chain (offline smoke test only)")
+    ap.add_argument("--require-sealed", action="store_true", help="fail unless the hotel answers an SEV-SNP binding")
     ap.add_argument("--save", help="with --broker: write the fetched attestation and receipts here")
     a = ap.parse_args()
+    if a.broker and not a.hotel:
+        ap.error("--hotel is required with --broker (no default: a wrong hotel is a wrong chain)")
     try:
         if a.broker:
             key = open(a.key_file).read().strip()
@@ -328,9 +343,17 @@ def main() -> int:
             att = json.load(open(a.attestation))
             doc = json.load(open(a.receipts)) if a.receipts else []
         receipts = doc["receipts"] if isinstance(doc, dict) else doc
-        head = doc.get("head") if isinstance(doc, dict) and not a.sandbox and not a.receipt_header else None
+        # A guest's chain from the broker is filtered to its own rooms, so it
+        # has gaps by design: check each receipt, not a whole chain to the head.
+        whole = isinstance(doc, dict) and not doc.get("filtered") and not a.sandbox and not a.receipt_header
+        head = doc.get("head") if whole else None
         for h in a.receipt_header:
             receipts.append(json.loads(base64.urlsafe_b64decode(h + "=" * (-len(h) % 4))))
+        sealed_asked = a.require_sealed or a.expected_measurement or a.ark_sha256 or a.product
+        if is_hotel_level(att) and sealed_asked:
+            # A sealed guest whose TSM is missing runs level 1 under the same
+            # hotel name. Asking for a measurement means asking for SNP.
+            raise Fail("the hotel answered a level 1 (unsealed) binding; an SEV-SNP attestation was asked for")
         if is_hotel_level(att):
             attestation_out = verify_hotel_attestation(att)
         else:
@@ -338,7 +361,11 @@ def main() -> int:
                                                  a.ark_sha256, a.skip_amd)
         out = {"attestation": attestation_out,
                "chain": verify_receipts(att, receipts, head),
-               "policy_timeline": policy_timeline(receipts), "verdict": "PASS"}
+               "policy_timeline": policy_timeline(receipts), "verdict": "PASS",
+               # head is named by the server, not signed: even a whole chain does
+               # not prove that nothing was cut from its end.
+               "checked": ("whole chain to the head the server named" if head is not None
+                           else "each receipt; not that none are missing")}
         print(json.dumps(out, indent=1))
         return 0
     except Fail as exc:

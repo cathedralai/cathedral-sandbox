@@ -114,6 +114,23 @@ class FleetGuardedProvider:
             close()
 
 
+
+def _require_key_store(kind: str) -> None:
+    """A production runtime never starts open: a blank CATHEDRAL_SANDBOX_KEYS
+    used to build a permissive provider where any non-empty bearer was its
+    own tenant with the default quota. The memory runtime keeps that for tests."""
+    if os.environ.get("CATHEDRAL_SANDBOX_KEYS", "").strip():
+        return
+    if os.environ.get("CATHEDRAL_ALLOW_OPEN_KEYS", "") == "1":
+        return
+    raise SandboxOpError(
+        "runtime_unavailable",
+        503,
+        f"CATHEDRAL_SANDBOX_KEYS is empty: the {kind} runtime refuses to start with no keys "
+        "(set CATHEDRAL_ALLOW_OPEN_KEYS=1 only for a local experiment)",
+        retry_after=60,
+    )
+
 def build_sandbox_provider(
     *,
     runtime: str | None = None,
@@ -174,15 +191,14 @@ def build_sandbox_provider(
             runtime_label=RUNTIME_MEMORY,
         )
     elif kind == RUNTIME_DOCKER:
+        _require_key_store(RUNTIME_DOCKER)
         provider = DockerGuestProvider(
             use_kata=False,
             inner=provider_from_environment(
                 base_url=base_url,
                 enforce_disk=True,
                 runtime_label=RUNTIME_DOCKER,
-            )
-            if os.environ.get("CATHEDRAL_SANDBOX_KEYS", "").strip()
-            else None,
+            ),
         )
     else:
         if not kata_host_ready():
@@ -193,15 +209,14 @@ def build_sandbox_provider(
                 "or use --runtime docker (memory requires CATHEDRAL_ALLOW_MEMORY_RUNTIME=1)",
                 retry_after=60,
             )
+        _require_key_store(RUNTIME_KATA)
         provider = DockerGuestProvider(
             use_kata=True,
             inner=provider_from_environment(
                 base_url=base_url,
                 enforce_disk=True,
                 runtime_label=RUNTIME_KATA,
-            )
-            if os.environ.get("CATHEDRAL_SANDBOX_KEYS", "").strip()
-            else None,
+            ),
         )
 
     if fleet is not None:

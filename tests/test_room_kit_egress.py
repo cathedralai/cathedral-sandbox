@@ -73,21 +73,34 @@ def table(tmp_path, monkeypatch):
     return t
 
 
-ALLOW = {"mode": "allowlist", "allow": ["pypi.org", "*.pythonhosted.org", "1.2.3.4", "10.0.0.0/8"]}
+ALLOW = {"mode": "allowlist", "allow": ["pypi.org", "*.pythonhosted.org", "1.2.3.4", "9.0.0.0/8"]}
 
 
 def test_policy_parse_canonical_and_matching() -> None:
-    p = eg.Policy.parse({"mode": "allowlist", "allow": ["PyPI.org.", "*.pythonhosted.org", "1.2.3.4", "10.1.2.3/8", "1.2.3.0/24"]})
-    assert p.document() == {"mode": "allowlist", "allow": ["*.pythonhosted.org", "1.2.3.0/24", "1.2.3.4", "10.0.0.0/8", "pypi.org"]}
-    assert p.nets == ("1.2.3.0/24", "10.0.0.0/8")  # 1.2.3.4 folds into 1.2.3.0/24: no interval overlap in nft
+    p = eg.Policy.parse({"mode": "allowlist", "allow": ["PyPI.org.", "*.pythonhosted.org", "1.2.3.4", "9.1.2.3/8", "1.2.3.0/24"]})
+    assert p.document() == {"mode": "allowlist", "allow": ["*.pythonhosted.org", "1.2.3.0/24", "1.2.3.4", "9.0.0.0/8", "pypi.org"]}
+    assert p.nets == ("1.2.3.0/24", "9.0.0.0/8")  # 1.2.3.4 folds into 1.2.3.0/24: no interval overlap in nft
     assert p.allows_name("pypi.org") and p.allows_name("PYPI.ORG.")
+    assert p.allows_name("pypi.org", 443) and p.allows_name("pypi.org", 80)
     assert p.allows_name("files.pythonhosted.org") and p.allows_name("a.b.pythonhosted.org")
     assert not p.allows_name("pythonhosted.org")  # a wildcard does not match its suffix
     assert not p.allows_name("github.com") and not p.allows_name("evilpypi.org")
     assert not eg.Policy.parse({"mode": "internet"}).allows_name("pypi.org")
 
 
-@pytest.mark.parametrize("bad", ["::1", "2001:db8::/32", "http://pypi.org", "pypi.org:443", "*", "*.1.2.3.4", "a..b", "pypi", ""])
+def test_policy_honors_hostname_port() -> None:
+    """example.com:443 opens TLS only; :80 is refused (Affinities / CONST)."""
+    p = eg.Policy.parse({"mode": "allowlist", "allow": ["example.com:443"]})
+    assert p.document()["allow"] == ["example.com:443"]
+    assert p.allows_name("example.com")  # DNS
+    assert p.allows_name("example.com", 443)
+    assert not p.allows_name("example.com", 80)
+    both = eg.Policy.parse({"mode": "allowlist", "allow": ["example.com:443", "example.com:80"]})
+    assert both.document()["allow"] == ["example.com"]
+    assert both.allows_name("example.com", 80) and both.allows_name("example.com", 443)
+
+
+@pytest.mark.parametrize("bad", ["::1", "2001:db8::/32", "http://pypi.org", "pypi.org:8080", "*", "*.1.2.3.4", "a..b", "pypi", ""])
 def test_policy_refuses_bad_entries(bad) -> None:
     with pytest.raises(ValueError):
         eg.Policy.parse({"mode": "allowlist", "allow": [bad]})
@@ -122,7 +135,7 @@ def test_put_switch_and_forget(table) -> None:
     assert room.ip == "10.214.0.2"
     add = table.runner.scripts[-1]
     assert "add element ip pool_room_egress_room_test named { 10.214.0.2 }" in add
-    assert "add element ip pool_room_egress_room_test allow { 10.214.0.2 . 1.2.3.4/32, 10.214.0.2 . 10.0.0.0/8 }" in add
+    assert "add element ip pool_room_egress_room_test allow { 10.214.0.2 . 1.2.3.4/32, 10.214.0.2 . 9.0.0.0/8 }" in add
     assert 'add element bridge pool_room_egress_room_test bound { "veth1" . 10.214.0.2 }' in add
     assert "open" not in add
     # Live switch to internet: the old elements go and the new one comes in one transaction.
@@ -262,14 +275,27 @@ async def _run_proxy(table, *, tls: bool, room_ip: str, payload: bytes):
             return (room_ip, 1) if key == "peername" else real(key, default)
 
         writer.get_extra_info = fake
-        await proxy.handle(reader, writer, up_port, tls)
+        # The proxy checks the policy on the room's real port (80 or 443),
+        # so hand it that port and send its upstream dial to the fake server.
+        await proxy.handle(reader, writer, 443 if tls else 80, tls)
+
+    real_open = asyncio.open_connection
+
+    async def open_upstream(host, port, *args, **kwargs):
+        if host == "127.0.0.1" and port in (80, 443):
+            port = up_port
+        return await real_open(host, port, *args, **kwargs)
 
     front = await asyncio.start_server(handler, "127.0.0.1", 0)
     port = front.sockets[0].getsockname()[1]
     r, w = await asyncio.open_connection("127.0.0.1", port)
-    w.write(payload)
-    await w.drain()
-    answer = await asyncio.wait_for(r.read(65536), 5)
+    asyncio.open_connection = open_upstream
+    try:
+        w.write(payload)
+        await w.drain()
+        answer = await asyncio.wait_for(r.read(65536), 5)
+    finally:
+        asyncio.open_connection = real_open
     w.close()
     up.close()
     front.close()
@@ -320,7 +346,7 @@ def test_switch_closes_open_proxy_connections(table) -> None:
 
     proxy = eg.Proxy(table)
     table.on_change = proxy.recheck
-    proxy.active["10.214.0.24"] = {("pypi.org", W, W)}
+    proxy.active["10.214.0.24"] = {("pypi.org", 443, W, W)}
     table.put("1" * 64, "s1", eg.Policy.parse({"mode": "allowlist", "allow": ["pypi.org"]}))
     assert closed == []  # still allowed
     table.put("1" * 64, "s1", eg.Policy.parse({"mode": "deny_all"}))
@@ -365,3 +391,55 @@ def test_control_socket_round_trip(table, tmp_path) -> None:
     assert status == 200 and doc["forgotten"] is True
     srv.shutdown()
     Path(path).unlink(missing_ok=True)
+
+
+def test_put_refuses_a_room_without_its_bridge_port(table) -> None:
+    # Without the host-side port the room is not in @ports, so the guard that
+    # binds its source IP and MAC skips it and a raw-socket room could send as
+    # another room. Refuse the room instead (the API then removes the guest).
+    table.fake.add("d" * 64, "10.214.0.9", port=None)
+    with pytest.raises(RuntimeError):
+        table.put("d" * 64, "sbx_9", eg.Policy.parse({"mode": "internet"}))
+    assert table.policy_of("10.214.0.9") is None
+
+
+@pytest.mark.parametrize("bad", ["169.254.169.254/32", "127.0.0.1", "10.0.0.0/8", "0.0.0.0/0"])
+def test_policy_refuses_non_public_ranges(bad) -> None:
+    with pytest.raises(ValueError):
+        eg.Policy.parse({"mode": "allowlist", "allow": [bad]})
+
+
+def test_known_bridges_drop_unbound_ports_and_ipv6() -> None:
+    # A room port with no policy yet used to pass the guard ("return"): with
+    # raw sockets a new room could send as a neighbour until apply() bound it.
+    runner = Runner()
+    rules = eg.Rules("room-test", ["10.214.0.0/22"], 15353, 15080, 15443, run=runner, bridges=["rmbr0", "rmnet0"])
+    base = rules.base([])
+    guard = base[base.index("chain room_guard"):]
+    assert 'meta ibrname != { "rmbr0", "rmnet0" } return' in guard
+    assert "iifname != @ports drop" in guard and "iifname != @ports return" not in guard
+    assert guard.index("ether type ip6 drop") < guard.index("iifname . ether saddr != @bound_mac drop")
+    # Without bridge names (older callers) the guard stays open to unknown ports but still drops IPv6.
+    old = eg.Rules("room-test", ["10.214.0.0/22"], 15353, 15080, 15443, run=runner).base([])
+    assert "iifname != @ports return" in old and "ether type ip6 drop" in old
+
+
+def test_room_bridges_follow_room_net_sh_names() -> None:
+    env = {"ROOM_BRIDGE": "rmbr0", "ROOM_NETS": "10.214.0.0/22 10.214.4.0/22"}
+    assert eg.room_bridges(env) == ["rmbr0", "rmnet0", "rmnet1"]
+    assert eg.room_bridges({"ROOM_BRIDGE": "rmbr0"}) == ["rmbr0"]
+
+
+def test_proxy_admits_a_bounded_number_of_connections_per_room(table) -> None:
+    proxy = eg.Proxy(table, per_room_max=2)
+    assert proxy.admit("10.214.0.2") and proxy.admit("10.214.0.2")
+    assert not proxy.admit("10.214.0.2")
+    assert proxy.admit("10.214.0.3")  # another room is not affected
+    proxy.release("10.214.0.2")
+    assert proxy.admit("10.214.0.2")
+
+
+def test_room_net_sh_drops_ipv6_from_room_bridges() -> None:
+    text = (Path(__file__).resolve().parents[1] / "room-kit" / "lib" / "room-net.sh").read_text()
+    assert 'ip6tables -I FORWARD 1 -i "$br" -j DROP' in text and 'ip6tables -I INPUT 1 -i "$br" -j DROP' in text
+    assert "ip6tables $rule" in text  # and down() removes them

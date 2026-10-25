@@ -120,8 +120,8 @@ def _run_network(fake):
 # ---------------------------------------------------------------- contract
 
 def test_canonical_policy_and_sha() -> None:
-    p = canonical_network_policy("allowlist", ["PyPI.org.", "*.Pythonhosted.org", "1.2.3.4", "10.9.8.7/8", "pypi.org"])
-    assert p == {"mode": "allowlist", "allow": ["*.pythonhosted.org", "1.2.3.4", "10.0.0.0/8", "pypi.org"]}
+    p = canonical_network_policy("allowlist", ["PyPI.org.", "*.Pythonhosted.org", "1.2.3.4", "9.9.8.7/8", "pypi.org"])
+    assert p == {"mode": "allowlist", "allow": ["*.pythonhosted.org", "1.2.3.4", "9.0.0.0/8", "pypi.org"]}
     assert canonical_network_policy("public") == {"mode": "internet", "allow": []}
     assert canonical_network_policy("deny_all", ["ignored.example"]) == {"mode": "deny_all", "allow": []}
     sha = network_policy_sha256(p)
@@ -130,7 +130,7 @@ def test_canonical_policy_and_sha() -> None:
     assert eg.Policy.parse(p).document() == p
 
 
-@pytest.mark.parametrize("bad", ["::1", "fe80::/10", "https://pypi.org", "pypi.org:443", "pypi.org/simple", "*", "*.", "*.10.0.0.1", "local", "a_b.example"])
+@pytest.mark.parametrize("bad", ["::1", "fe80::/10", "https://pypi.org", "pypi.org:8080", "1.2.3.4:443", "pypi.org/simple", "*", "*.", "*.10.0.0.1", "local", "a_b.example"])
 def test_bad_allowlist_entries_are_refused(bad) -> None:
     with pytest.raises(SandboxContractError):
         normalize_allow_entry(bad)
@@ -285,3 +285,29 @@ def test_put_network_route(fake, daemon) -> None:
         assert bad.status == 400 and json.loads(bad.body)["error"]["code"] == "invalid_network_allowlist"
     finally:
         provider.close()
+
+
+@pytest.mark.parametrize("entry,want", [
+    ("pypi.org:443", "pypi.org:443"),
+    ("pypi.org:80", "pypi.org:80"),
+    ("PyPI.org:443", "pypi.org:443"),
+])
+def test_web_ports_on_hostnames_are_accepted(entry, want) -> None:
+    # The proxy only carries 80 and 443; the port stays in the policy so
+    # egress opens only that port (bare hostname still means both).
+    assert normalize_allow_entry(entry) == want
+    NetworkSpec(mode="allowlist", allow=(entry,))
+
+
+@pytest.mark.parametrize("bad", ["169.254.169.254", "169.254.169.254/32", "127.0.0.1/32", "10.0.0.0/8",
+                                 "192.168.1.0/24", "0.0.0.0/0", "100.64.0.0/10", "8.0.0.0/4"])
+def test_allowlist_refuses_non_public_ranges(bad) -> None:
+    # A host firewall rule drops these today, so they never worked; refusing
+    # them keeps the policy honest if that rule is ever missing.
+    with pytest.raises(SandboxContractError):
+        normalize_allow_entry(bad)
+
+
+def test_allowlist_keeps_public_ranges() -> None:
+    assert normalize_allow_entry("1.1.1.1") == "1.1.1.1"
+    assert normalize_allow_entry("140.82.112.0/20") == "140.82.112.0/20"
