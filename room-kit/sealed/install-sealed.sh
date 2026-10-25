@@ -45,8 +45,12 @@ if [ ${#need[@]} -gt 0 ]; then
   DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "${need[@]}"
 fi
 qemu-system-x86_64 -object help | grep -qx '  sev-snp-guest' || { echo "this QEMU has no sev-snp-guest" >&2; exit 1; }
+# Not every release ships the AmdSev build in the ovmf package. Check before
+# the 10 to 20 minute guest build, not after it.
+[ -f "$SEALED_OVMF" ] || { echo "no AmdSev firmware at $SEALED_OVMF after apt; install ovmf-amdsev or set SEALED_OVMF" >&2; exit 1; }
 
 # ---------------------------------------------------------------- 3. build + expected measurement
+PREV_IMG=$(readlink -f "$SEALED_DIR/images/current" 2>/dev/null || true)
 if [ "${SEALED_SKIP_BUILD:-0}" != 1 ] || [ ! -e "$SEALED_DIR/images/current" ]; then
   "$KIT/sealed/build-guest.sh" "$ENV_FILE"
 fi
@@ -64,6 +68,26 @@ log "expected measurement $EXPECTED"
 install -m 0755 "$KIT/sealed/host-net.sh" "$KIT/sealed/launch-guest.sh" -t "$SEALED_DIR/"
 # A rerun may pass the installed copy itself.
 [ "$ENV_FILE" -ef "$SEALED_DIR/sealed.env" ] || install -m 0600 "$ENV_FILE" "$SEALED_DIR/sealed.env"
+# The host link rules are set by ExecStartPre only; a host firewall reload
+# (ufw) removes them and every room loses the internet while health stays
+# green. A timer checks them each minute and puts them back.
+cat > /etc/systemd/system/${UNIT%.service}-net.service <<EOF
+[Unit]
+Description=Sealed hotel $SEALED_NAME host link check
+ConditionPathExists=$SEALED_DIR/sealed.env
+[Service]
+Type=oneshot
+ExecStart=$SEALED_DIR/host-net.sh check $SEALED_DIR/sealed.env
+EOF
+cat > /etc/systemd/system/${UNIT%.service}-net.timer <<EOF
+[Unit]
+Description=Sealed hotel $SEALED_NAME host link check (every minute)
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+[Install]
+WantedBy=timers.target
+EOF
 cat > /etc/systemd/system/$UNIT <<EOF
 [Unit]
 Description=Sealed hotel $SEALED_NAME (AMD SEV-SNP guest with the room kit)
@@ -82,8 +106,27 @@ LimitMEMLOCK=infinity
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
+systemctl enable -q --now "${UNIT%.service}-net.timer"
 
 # ---------------------------------------------------------------- 5. start and check
+# A restart ends every room in the guest (a new guest, a new measurement
+# unless the build was skipped). Refuse while rooms are live.
+refuse_sealed_restart_with_rooms() {
+  systemctl is-active -q "$UNIT" || return 0
+  [ "${SEALED_RESTART_WITH_ROOMS:-0}" = 1 ] && return 0
+  local live
+  live=$(curl -fsS -m 10 -H "Authorization: Bearer $(tr -d ' \r\n' < "$SEALED_API_KEY_FILE")" \
+    "http://$SEALED_GUEST_IP:18090/v1/sandboxes" 2>/dev/null | python3 -c 'import json,sys;print(len(json.load(sys.stdin).get("sandboxes",[])))' 2>/dev/null || echo "?")
+  if [ "$live" = "?" ]; then
+    echo "sealed: the hotel API on $SEALED_GUEST_IP did not answer, so live rooms cannot be counted; set SEALED_RESTART_WITH_ROOMS=1 to go on" >&2
+    exit 1
+  fi
+  if [ "$live" -gt 0 ]; then
+    echo "sealed: $live live room(s); a restart ends them with no delete receipt. Wait, or set SEALED_RESTART_WITH_ROOMS=1." >&2
+    exit 1
+  fi
+}
+refuse_sealed_restart_with_rooms
 systemctl restart "$UNIT"
 log "guest starting; serial log $SEALED_DIR/run/serial.log"
 ATT=$SEALED_DIR/run/attestation.json
@@ -96,5 +139,17 @@ done
 [ -f "$ATT" ] || { echo "no attestation after 15 min; see the serial log" >&2; exit 1; }
 GOT=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["binding"]["measurement"])' "$ATT")
 cp "$ATT" "$IMG/attestation-$(date -u +%Y%m%dT%H%M%SZ).json"
-if [ "$GOT" = "$EXPECTED" ]; then log "measurement matches the build: $GOT"; else log "MEASUREMENT DIFFERS: report $GOT, build $EXPECTED"; fi
+if [ "$GOT" = "$EXPECTED" ]; then
+  log "measurement matches the build: $GOT"
+  # Boot the guest again at the next host start (an unattended reboot left
+  # sealed guests off until a manual start). Only a verified image is enabled.
+  systemctl enable -q "$UNIT"
+else
+  # Do not serve a guest the operator cannot vouch for, and do not boot it
+  # again at the next host start. The previous image is current again.
+  log "MEASUREMENT DIFFERS: report $GOT, build $EXPECTED"
+  systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
+  [ -n "$PREV_IMG" ] && [ "$PREV_IMG" != "$IMG" ] && ln -sfn "$PREV_IMG" "$SEALED_DIR/images/current"
+  exit 1
+fi
 log "done. hotel API (receipts front) http://$SEALED_GUEST_IP:18090, attestation $ATT"

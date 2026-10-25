@@ -212,3 +212,39 @@ def test_ticket_query_string_rejected(live_app) -> None:
         assert b"ticket_query_forbidden" in buf
     finally:
         sock.close()
+
+
+def test_terminal_websocket_closes_cleanly_when_the_sandbox_is_gone(live_app) -> None:
+    # The sandbox can end while a terminal socket is open (TTL, delete). The
+    # next input frame must get a WebSocket close frame, not a dropped socket
+    # and a traceback on the server.
+    app, host, port = live_app
+    sid = _create(app)
+    tid = json.loads(app.dispatch("POST", f"/v1/sandboxes/{sid}/terminals", AUTH, b"{}").body)["id"]
+    ticket = json.loads(app.dispatch("POST", f"/v1/sandboxes/{sid}/access-tickets", AUTH, b"{}").body)["ticket"]
+    sock = socket.create_connection((host, port), timeout=5)
+    try:
+        req, _sec = ws.iter_client_handshake(f"/v1/sandboxes/{sid}/terminals/{tid}/ws", f"{host}:{port}", ticket=ticket)
+        sock.sendall(req)
+        header_buf = b""
+        while b"\r\n\r\n" not in header_buf:
+            header_buf += sock.recv(1)
+        assert b"101" in header_buf.split(b"\r\n", 1)[0]
+        sock.recv(4096)  # the banner
+        assert app.dispatch("DELETE", f"/v1/sandboxes/{sid}", AUTH, b"").status in (202, 204)
+        sock.sendall(ws.encode_frame(b"echo after-delete", opcode=ws.OP_TEXT, masked=True))
+        got = bytearray()
+        deadline = time.time() + 5
+        opcodes = []
+        while time.time() < deadline:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            got += chunk
+            frames, got = ws.decode_frames(got)
+            opcodes += [op for op, _ in frames]
+            if ws.OP_CLOSE in opcodes:
+                break
+        assert ws.OP_CLOSE in opcodes, f"no close frame; frames {opcodes}"
+    finally:
+        sock.close()

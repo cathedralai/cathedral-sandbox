@@ -65,6 +65,20 @@ def main(argv):
             print("27.0.0-fake")
         return 0
 
+    if cmd == "images":
+        import fnmatch
+
+        pattern = None
+        if "--filter" in argv:
+            flt = argv[argv.index("--filter") + 1]
+            if flt.startswith("reference="):
+                pattern = flt[len("reference="):]
+        with Locked() as st:
+            for ref in st["images"]:
+                if pattern is None or fnmatch.fnmatch(ref, pattern) or fnmatch.fnmatch(ref.split(":")[0], pattern):
+                    print(ref)
+        return 0
+
     if cmd == "image" and argv[1] == "inspect":
         ref = argv[-1]
         with Locked() as st:
@@ -213,10 +227,14 @@ def main(argv):
                 else:
                     nets[net_name]["containers"].append(cid)
             fail = fail or net_error is not None
+            # exit_at_once: {argv token: exit code}. The container starts and
+            # its entrypoint ends at once; docker run -d still prints the id.
+            exited = next((code for tok, code in b.get("exit_at_once", {}).items() if tok in argv), None)
             st["containers"][cid] = {
                 "name": name,
                 "labels": labels,
-                "status": "created" if fail else "running",
+                "status": "created" if fail else ("exited" if exited is not None else "running"),
+                "exit_code": exited,
                 "argv": argv,
             }
         if fail:
@@ -282,7 +300,11 @@ def main(argv):
                 break
         form = b.get("timeout_form", "gnu")
         if rest[:1] == ["timeout"]:
-            busybox = rest[1:2] == ["-t"]
+            # BusyBox: timeout [-s SIG] [-t SECS] PROG; GNU: timeout [-k N] SECS PROG.
+            opts = rest[1:]
+            if opts[:2] == ["-s", "KILL"]:
+                opts = opts[2:]
+            busybox = opts[:1] == ["-t"]
             if form == "none":
                 print("sh: timeout: not found", file=sys.stderr)
                 return 127
@@ -304,6 +326,18 @@ def main(argv):
 
     if cmd == "exec" and "info" in argv:
         print("27.0.0-fake")  # inner dockerd of a DinD guest is ready
+        return 0
+
+    if cmd == "inspect" and "--format" in argv and ".State.Running" in argv[argv.index("--format") + 1]:
+        # The state probe of exit_code_if_stopped: "true 0" while the
+        # container runs, "false <code>" once its entrypoint ended.
+        with Locked() as st:
+            cid = find(st, argv[-1])
+            c = st["containers"].get(cid) if cid else None
+        if c is None:
+            print(f"Error: No such object: {argv[-1]}", file=sys.stderr)
+            return 1
+        print(f"false {c.get('exit_code') or 0}" if c.get("status") == "exited" else "true 0")
         return 0
 
     if cmd == "build":

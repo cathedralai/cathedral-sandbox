@@ -39,6 +39,40 @@ func (tc *testChain) clientCall(t *testing.T, method, path string, body []byte, 
 
 func mustMarshal(v any) []byte { b, _ := json.Marshal(v); return b }
 
+func TestHotelPathRejectsStringCmd(t *testing.T) {
+	// Hotel ids (a.sbx_…) skip compatExecBody; requireExecCmdList must still refuse a string.
+	tc := newChain(t)
+	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+id+"/exec", map[string]any{"cmd": "echo hi"})
+	if status != 400 || errCode(doc) != "invalid_exec" {
+		t.Fatalf("hotel-path string cmd: %d %v", status, doc)
+	}
+	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes/"+id+"/exec", map[string]any{"cmd": []string{"true"}})
+	if status != 200 {
+		t.Fatalf("hotel-path list cmd: %d %v", status, doc)
+	}
+}
+
+func TestTruncateExecJSONCapsStdoutAndSetsFlag(t *testing.T) {
+	big := strings.Repeat("x", execOutputCapBytes+64)
+	raw, _ := json.Marshal(map[string]any{"stdout": big, "stderr": "", "exit_code": 0, "truncated": false})
+	out := truncateExecJSON(raw)
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc["truncated"] != true {
+		t.Fatalf("truncated flag: %v", doc["truncated"])
+	}
+	if s, _ := doc["stdout"].(string); len(s) != execOutputCapBytes {
+		t.Fatalf("stdout len %d, want %d", len(s), execOutputCapBytes)
+	}
+	small, _ := json.Marshal(map[string]any{"stdout": "ok", "truncated": false})
+	if got := truncateExecJSON(small); !bytes.Equal(got, small) {
+		t.Fatalf("short output rewritten: %s", got)
+	}
+}
+
 func TestExecTimeoutOfFourHoursPassesToTheHotel(t *testing.T) {
 	tc := newChain(t)
 	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4"}), nil)
@@ -46,7 +80,16 @@ func TestExecTimeoutOfFourHoursPassesToTheHotel(t *testing.T) {
 		t.Fatalf("create: %d %v", status, doc)
 	}
 	id := doc["id"].(string)
+	// cmd must be a list of strings (CONST feedback fix E).
 	status, doc = tc.clientCall(t, "POST", "/v1/sandboxes/"+id+"/exec", mustMarshal(map[string]any{"command": "true", "timeout_seconds": 14400}), nil)
+	if status != 400 {
+		t.Fatalf("string cmd: want 400 invalid_exec, got %d %v", status, doc)
+	}
+	if doc["detail"].(map[string]any)["error"] != "invalid_exec" {
+		t.Fatalf("string cmd error code: %v", doc)
+	}
+	// List cmd is accepted; timeout passes through.
+	status, doc = tc.clientCall(t, "POST", "/v1/sandboxes/"+id+"/exec", mustMarshal(map[string]any{"cmd": []string{"true"}, "timeout_seconds": 14400}), nil)
 	if status != 200 {
 		t.Fatalf("exec: %d %v", status, doc)
 	}
@@ -65,7 +108,7 @@ func TestExecTimeoutOfFourHoursPassesToTheHotel(t *testing.T) {
 	}
 	// The operator limit in the config wins.
 	tc.b.cfg.MaxExecSeconds = 600
-	tc.clientCall(t, "POST", "/v1/sandboxes/"+id+"/exec", mustMarshal(map[string]any{"command": "true", "timeout_seconds": 14400}), nil)
+	tc.clientCall(t, "POST", "/v1/sandboxes/"+id+"/exec", mustMarshal(map[string]any{"cmd": []string{"true"}, "timeout_seconds": 14400}), nil)
 	for _, f := range tc.hotels {
 		for _, e := range f.execs {
 			got = e["timeout_seconds"].(float64)
@@ -195,5 +238,39 @@ func TestIdempotentCreateSurvivesABrokerRestart(t *testing.T) {
 	view := waitImage(t, tc, img["image_id"].(string))
 	if view["state"] != "ready" {
 		t.Fatalf("image after restart: %v", view)
+	}
+}
+
+// Harbor image import warms only the guest's own hotels.
+func TestCompatImportKeepsToGuestHotels(t *testing.T) {
+	tc := newChain(t)
+	tc.b.mu.Lock()
+	tc.b.guests["g1"].limits = guestLimits{Hotels: []string{"b", "c"}}
+	tc.b.mu.Unlock()
+	status, doc := tc.clientCall(t, "POST", "/v1/images/import", mustMarshal(map[string]any{"image": "alpine:3.20"}), nil)
+	if status != 200 {
+		t.Fatalf("import: %d %v", status, doc)
+	}
+	time.Sleep(200 * time.Millisecond) // prefetch runs in the background
+	if n := callsTo(tc.hotels["a"], "POST /v1/images/prefetch"); n != 0 {
+		t.Fatalf("import warmed hotel a outside the guest's list")
+	}
+}
+
+// A live network change on the Harbor path must name its mode; a missing
+// mode must not open the room to the internet.
+func TestCompatNetworkChangeNeedsMode(t *testing.T) {
+	tc := newChain(t)
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image": "alpine:3.20", "network": "deny_all"}), nil)
+	if status != 200 && status != 201 && status != 202 {
+		t.Fatalf("create: %d %v", status, doc)
+	}
+	id, _ := doc["sandbox_id"].(string)
+	if id == "" {
+		id, _ = doc["id"].(string)
+	}
+	status, doc = tc.clientCall(t, "PUT", "/v1/sandboxes/"+id+"/network", mustMarshal(map[string]any{"network_allow": []string{"pypi.org"}}), nil)
+	if status != 400 {
+		t.Fatalf("network change without mode: %d %v", status, doc)
 	}
 }

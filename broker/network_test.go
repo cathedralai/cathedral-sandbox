@@ -25,8 +25,10 @@ func TestClientCreateMapsNetworkModes(t *testing.T) {
 		mode string
 		n    int
 	}{
-		{map[string]any{"template": "room-1x4"}, "internet", 0},
+		{map[string]any{"template": "room-1x4"}, "deny_all", 0}, // no mode named: fail closed
+		{map[string]any{"template": "room-1x4", "network": ""}, "deny_all", 0},
 		{map[string]any{"template": "room-1x4", "network": "internet"}, "internet", 0},
+		{map[string]any{"template": "room-1x4", "network": "public"}, "internet", 0},
 		{map[string]any{"template": "room-1x4", "network": "deny_all"}, "deny_all", 0},
 		{map[string]any{"template": "room-1x4", "network": "none"}, "deny_all", 0},
 		{map[string]any{"template": "room-1x4", "network": "allowlist", "network_allow": []string{"pypi.org", "1.2.3.0/24"}}, "allowlist", 2},

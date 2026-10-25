@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +21,9 @@ type fakeHotel struct {
 	t           *testing.T
 	mu          sync.Mutex
 	creates     []map[string]any
+	authFail    bool                      // answer creates 401, like a hotel whose API key changed
+	pullOutage  bool                      // answer creates 502 image_pull_failed for a registry outage
+	calls       []string                  // "METHOD /path?query" of every request
 	snaps       map[string]map[string]any // hotel snapshot id -> document
 	prefetch    []map[string]any
 	pushes      []map[string]any
@@ -46,6 +50,7 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.calls = append(f.calls, r.Method+" "+r.URL.RequestURI())
 	switch {
 	case p == "/v1/sandboxes" && r.Method == "POST":
 		if f.createDelay > 0 {
@@ -55,6 +60,24 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.mu.Lock()
 		}
 		f.creates = append(f.creates, req)
+		if req["image"] == "nosuch/x:1" {
+			writeErr(w, 502, "image_pull_failed", "docker pull failed for nosuch/x:1: Error response from daemon: pull access denied for nosuch/x, repository does not exist")
+			return
+		}
+		if f.pullOutage {
+			writeErr(w, 502, "image_pull_failed", "docker pull failed for alpine:3.20: Error response from daemon: Get \"https://registry-1.docker.io/v2/\": dial tcp: lookup registry-1.docker.io: no such host")
+			return
+		}
+		if f.authFail {
+			writeErr(w, 401, "unauthorized", "bad hotel key")
+			return
+		}
+		if nw, ok := req["network"].(map[string]any); ok && nw["mode"] == "allowlist" {
+			if allow, _ := nw["allow"].([]any); len(allow) > 0 && allow[0] == "bad.example:9" {
+				writeErr(w, 400, "invalid_network_allowlist", "port 9 is not allowed")
+				return
+			}
+		}
 		if sid, ok := req["snapshot_id"].(string); ok {
 			if _, known := f.snaps[sid]; !known {
 				writeErr(w, 404, "snapshot_not_found", "no snapshot "+sid)
@@ -64,6 +87,7 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.n++
 		id := fmt.Sprintf("sbx_%d", f.n)
 		f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": req["labels"]})
+		w.Header().Set("X-Room-Receipt", "signed-create")
 		writeJSON(w, 202, map[string]any{"id": id, "state": "running", "snapshot_id": req["snapshot_id"]})
 	case p == "/v1/sandboxes" && r.Method == "GET":
 		// Like a hotel: every "label" filter must match.
@@ -100,21 +124,47 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.rooms = kept
 		w.WriteHeader(204)
-	case strings.HasPrefix(p, "/v1/sandboxes/") && strings.Count(p, "/") == 3 && r.Method == "DELETE":
-		id := strings.TrimPrefix(p, "/v1/sandboxes/")
-		f.roomDeletes = append(f.roomDeletes, id)
-		kept := f.rooms[:0]
-		for _, rm := range f.rooms {
-			if rm["id"] != id {
-				kept = append(kept, rm)
-			}
-		}
-		f.rooms = kept
-		w.WriteHeader(204)
 	case p == "/room/receipts" && r.Method == "GET":
 		if f.receipts == nil {
 			writeErr(w, 404, "no_receipts", "no chain")
 			return
+		}
+		// Page like a real hotel when after/limit are set so broker walk tests
+		// can leave a guest receipt past the first hotel page. Ops (and old
+		// callers) with no query still get the stored bytes unchanged.
+		afterStr, limitStr := r.URL.Query().Get("after"), r.URL.Query().Get("limit")
+		if afterStr != "" || limitStr != "" {
+			var chain struct {
+				Binding  string            `json:"binding_sha256"`
+				Head     string            `json:"head"`
+				Receipts []json.RawMessage `json:"receipts"`
+			}
+			if json.Unmarshal(f.receipts, &chain) == nil && len(chain.Receipts) > 0 {
+				after, _ := strconv.Atoi(afterStr)
+				limit, _ := strconv.Atoi(limitStr)
+				if limit < 1 {
+					limit = len(chain.Receipts)
+				}
+				if after < 0 {
+					after = 0
+				}
+				end := after + limit
+				if after > len(chain.Receipts) {
+					after = len(chain.Receipts)
+				}
+				if end > len(chain.Receipts) {
+					end = len(chain.Receipts)
+				}
+				page := chain.Receipts[after:end]
+				out, _ := json.Marshal(map[string]any{
+					"binding_sha256": chain.Binding, "head": chain.Head,
+					"count": len(page), "receipts": page,
+				})
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(200)
+				_, _ = w.Write(out)
+				return
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
@@ -135,6 +185,7 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"network": map[string]any{"mode": req["mode"], "allow": req["allow"], "policy": policy, "policy_sha256": "abc"}})
 	case strings.HasSuffix(p, "/exec") && r.Method == "POST":
 		f.execs = append(f.execs, req)
+		w.Header().Set("X-Room-Receipt", "signed-exec")
 		writeJSON(w, 200, map[string]any{"exit_code": 0, "stdout": "", "stderr": "", "timed_out": false})
 	case p == "/v1/images/build" && r.Method == "POST":
 		f.builds = append(f.builds, req)
@@ -192,6 +243,28 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			images = append(images, map[string]any{"ref": ref, "size_bytes": 3640000})
 		}
 		writeJSON(w, 202, map[string]any{"operation_id": "op_2", "status": "done", "result": map[string]any{"images": images}})
+	case strings.HasPrefix(p, "/v1/sandboxes/") && strings.Count(p, "/") == 3 && r.Method == "GET":
+		id := strings.TrimPrefix(p, "/v1/sandboxes/")
+		for _, rm := range f.rooms {
+			if rm["id"] == id {
+				writeJSON(w, 200, map[string]any{"id": id, "state": "running", "labels": rm["labels"], "runtime": "docker",
+					"network": map[string]any{"mode": "deny_all", "allow": []any{}}})
+				return
+			}
+		}
+		writeErr(w, 404, "sandbox_not_found", id)
+	case strings.HasPrefix(p, "/v1/sandboxes/") && strings.Count(p, "/") == 3 && r.Method == "DELETE":
+		id := strings.TrimPrefix(p, "/v1/sandboxes/")
+		f.roomDeletes = append(f.roomDeletes, id)
+		for i, rm := range f.rooms {
+			if rm["id"] == id {
+				f.rooms = append(f.rooms[:i], f.rooms[i+1:]...)
+				w.Header().Set("X-Room-Receipt", "signed-delete")
+				w.WriteHeader(204)
+				return
+			}
+		}
+		writeErr(w, 404, "sandbox_not_found", "no sandbox "+id)
 	default:
 		writeErr(w, 404, "route_not_found", p)
 	}
@@ -450,7 +523,8 @@ func TestCreateByHotelLabelsAndIDs(t *testing.T) {
 		t.Fatalf("no match: %d %v", status, doc)
 	}
 	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"zz"}})
-	if status != 400 || errCode(doc) != "unknown_hotel" {
+	if status != 409 || errCode(doc) != "unknown_hotel" { // CONST: unknown hotel is 409, not 400
+
 		t.Fatalf("unknown hotel: %d %v", status, doc)
 	}
 	// Selected hotel full: 429, never another hotel.
@@ -460,6 +534,12 @@ func TestCreateByHotelLabelsAndIDs(t *testing.T) {
 	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotel_labels": map[string]string{"sealed": "true"}})
 	if status != 429 || errCode(doc) != "no_free_rooms" {
 		t.Fatalf("full sealed hotel: %d %v", status, doc)
+	}
+	// Selected hotel down: 503 hotels_unavailable — not "all hotels are full".
+	setHotel(tc, "a", func(h *hotel) { h.ok = false; h.slots = 100 })
+	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+	if status != 503 || errCode(doc) != "hotels_unavailable" {
+		t.Fatalf("down hotel: %d %v", status, doc)
 	}
 	status, doc = tc.call(t, "key1", "GET", "/v1/broker/hotels", nil)
 	if status != 200 || len(doc["hotels"].([]any)) != 3 {
@@ -613,5 +693,130 @@ func TestSealedHotelTakesOnlySealedCreates(t *testing.T) {
 	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "sealed": "yes"})
 	if status != 400 || errCode(doc) != "invalid_hotel_selection" {
 		t.Fatalf("bad sealed value: %d %v", status, doc)
+	}
+}
+
+// A guest's bad request (4xx from the hotel) must not rest the hotel: the
+// next create, from any guest, still lands there.
+func TestClientErrorDoesNotRestHotel(t *testing.T) {
+	tc := newChain(t)
+	bad := map[string]any{"image": "alpine:3.20", "hotels": []string{"b"},
+		"network": map[string]any{"mode": "allowlist", "allow": []string{"bad.example:9"}}}
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", bad)
+	if status != 400 || errCode(doc) != "invalid_network_allowlist" {
+		t.Fatalf("bad allowlist: %d %v", status, doc)
+	}
+	status, doc = tc.call(t, "key2", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	if status != 202 {
+		t.Fatalf("next create after a client error: %d %v", status, doc)
+	}
+}
+
+// A hotel that rejects the broker's own key (401/403) is broken, not the
+// request: rest it so the next create goes to a working hotel.
+func TestHotelAuthErrorRestsHotel(t *testing.T) {
+	tc := newChain(t)
+	tc.hotels["b"].authFail = true
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	if status != 401 {
+		t.Fatalf("create on broken hotel: %d %v", status, doc)
+	}
+	tc.b.mu.Lock()
+	resting := time.Now().Before(tc.b.hotelByID("b").backoffUntil)
+	tc.b.mu.Unlock()
+	if !resting {
+		t.Fatalf("hotel answering 401 to the broker key is not rested")
+	}
+}
+
+// A guest's contract error (400) must not rest the hotel.
+func TestClientErrorLeavesHotelUnrested(t *testing.T) {
+	tc := newChain(t)
+	bad := map[string]any{"image": "alpine:3.20", "hotels": []string{"b"},
+		"network": map[string]any{"mode": "allowlist", "allow": []string{"bad.example:9"}}}
+	if status, _ := tc.call(t, "key1", "POST", "/v1/sandboxes", bad); status != 400 {
+		t.Fatalf("bad allowlist: %d", status)
+	}
+	tc.b.mu.Lock()
+	resting := time.Now().Before(tc.b.hotelByID("b").backoffUntil)
+	tc.b.mu.Unlock()
+	if resting {
+		t.Fatalf("a guest's 400 rested the hotel")
+	}
+}
+
+func callsTo(f *fakeHotel, prefix string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// An image the guest names wrongly is the guest's error: it must not rest
+// the hotel for every other guest.
+func TestImagePullFailureDoesNotRestHotel(t *testing.T) {
+	tc := newChain(t)
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "nosuch/x:1", "hotels": []string{"b"}})
+	if status != 502 || errCode(doc) != "image_pull_failed" {
+		t.Fatalf("bad image: %d %v", status, doc)
+	}
+	tc.b.mu.Lock()
+	resting := time.Now().Before(tc.b.hotelByID("b").backoffUntil)
+	tc.b.mu.Unlock()
+	if resting {
+		t.Fatalf("a guest's unpullable image rested the hotel")
+	}
+}
+
+// Bulk delete only reaches the guest's own hotels.
+func TestBulkDeleteKeepsToGuestHotels(t *testing.T) {
+	tc := limitedChain(t, guestLimits{Hotels: []string{"b", "c"}})
+	tc.call(t, "key1", "DELETE", "/v1/sandboxes?label=job%3Dx", nil)
+	if n := callsTo(tc.hotels["a"], "DELETE /v1/sandboxes"); n != 0 {
+		t.Fatalf("bulk delete reached hotel a outside the guest's list (%d)", n)
+	}
+	if callsTo(tc.hotels["b"], "DELETE /v1/sandboxes") == 0 {
+		t.Fatalf("bulk delete did not reach an allowed hotel")
+	}
+}
+
+// A guest reads receipts only of hotels in its list, ops included: a
+// dedicated hotel's chain belongs to its guest.
+func TestReceiptsOfHotelOutsideListAre404(t *testing.T) {
+	tc := limitedChain(t, guestLimits{Hotels: []string{"b", "c"}})
+	tc.b.guests["g1"].cfg.Ops = true
+	tc.hotels["a"].receipts = []byte(`{"receipts":[],"count":0}`)
+	if status, doc := tc.call(t, "key1", "GET", "/v1/hotels/a/receipts", nil); status != 404 {
+		t.Fatalf("receipts of a hotel outside the list: %d %v", status, doc)
+	}
+}
+
+// A hotel that cannot reach the registry is the hotel's fault: rest it and
+// place the create on another hotel.
+func TestRegistryOutageRestsHotelAndRetries(t *testing.T) {
+	tc := newChain(t)
+	tc.hotels["b"].pullOutage = true
+	tc.hotels["c"].pullOutage = false
+	tc.b.mu.Lock()
+	tc.b.hotelByID("c").slots = 1 // prefer b first
+	tc.b.mu.Unlock()
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	if status != 502 {
+		t.Fatalf("outage on the only hotel: %d %v", status, doc)
+	}
+	tc.b.mu.Lock()
+	resting := time.Now().Before(tc.b.hotelByID("b").backoffUntil)
+	tc.b.mu.Unlock()
+	if !resting {
+		t.Fatalf("a hotel that cannot reach the registry is not rested")
+	}
+	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}})
+	if status != 202 || doc["hotel"] != "c" {
+		t.Fatalf("create did not move to a working hotel: %d %v", status, doc)
 	}
 }

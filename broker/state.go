@@ -39,10 +39,11 @@ type savedTomb struct {
 }
 
 type savedState struct {
-	UUIDs  map[string]string       `json:"uuids"` // client id -> broker room id
-	Idem   map[string]savedIdem    `json:"idempotency"`
-	Tombs  map[string]savedTomb    `json:"tombstones"`
-	Images map[string]*compatImage `json:"images"`
+	UUIDs      map[string]string                     `json:"uuids"` // client id -> broker room id
+	Idem       map[string]savedIdem                  `json:"idempotency"`
+	Tombs      map[string]savedTomb                  `json:"tombstones"`
+	Images     map[string]*compatImage               `json:"images"`
+	GuestRooms map[string]map[string]map[string]bool `json:"guest_rooms"` // guest -> hotel -> room id
 }
 
 func (b *broker) markDirty() { b.dirty.Store(true) }
@@ -56,6 +57,11 @@ func (b *broker) saveLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			if b.dirty.Swap(false) { // the last second of changes goes to disk
+				if err := b.saveCompat(); err != nil {
+					log.Printf("client state not saved at stop: %v", err)
+				}
+			}
 			return
 		case <-t.C:
 			if b.dirty.Swap(false) {
@@ -73,11 +79,36 @@ func (b *broker) saveCompat() error {
 	if b.cfg.StateDir == "" {
 		return nil
 	}
-	st := savedState{UUIDs: map[string]string{}, Idem: map[string]savedIdem{}, Tombs: map[string]savedTomb{}, Images: map[string]*compatImage{}}
+	st := savedState{
+		UUIDs: map[string]string{}, Idem: map[string]savedIdem{}, Tombs: map[string]savedTomb{},
+		Images: map[string]*compatImage{}, GuestRooms: map[string]map[string]map[string]bool{},
+	}
 	b.mu.Lock()
 	for u, rm := range b.byUUID {
 		if rm.id != "" {
 			st.UUIDs[u] = rm.id
+		}
+	}
+	// Ids read at start whose rooms the sync loop has not listed yet: keep
+	// them, or a save before the first sync would drop every client id.
+	for bid, u := range b.savedUUIDs {
+		if _, taken := st.UUIDs[u]; !taken {
+			st.UUIDs[u] = bid
+		}
+	}
+	for guest, byHotel := range b.guestRooms {
+		outHotel := map[string]map[string]bool{}
+		for hotel, ids := range byHotel {
+			outIDs := map[string]bool{}
+			for id := range ids {
+				outIDs[id] = true
+			}
+			if len(outIDs) > 0 {
+				outHotel[hotel] = outIDs
+			}
+		}
+		if len(outHotel) > 0 {
+			st.GuestRooms[guest] = outHotel
 		}
 	}
 	b.mu.Unlock()
@@ -101,6 +132,11 @@ func (b *broker) saveCompat() error {
 			continue
 		}
 		st.Tombs[u] = savedTomb{BID: t.bid, At: t.at}
+	}
+	for id, ex := range b.compat.execs { // a finished result (up to 32 MiB) is kept execKeep
+		if !ex.doneAt.IsZero() && now.Sub(ex.doneAt) > execKeep {
+			delete(b.compat.execs, id)
+		}
 	}
 	for id, img := range b.compat.images {
 		st.Images[id] = img
@@ -130,9 +166,26 @@ func (b *broker) saveBuildContext(img *compatImage) {
 		log.Printf("build context not saved: %v", err)
 		return
 	}
-	if err := os.WriteFile(filepath.Join(dir, img.ID+".tar.gz"), img.buildCtx, 0o600); err != nil {
+	// Write and rename, so a crash leaves the old file or the whole new one.
+	final := filepath.Join(dir, img.ID+".tar.gz")
+	if err := os.WriteFile(final+".tmp", img.buildCtx, 0o600); err != nil {
+		log.Printf("build context not saved: %v", err)
+		return
+	}
+	if err := os.Rename(final+".tmp", final); err != nil {
 		log.Printf("build context not saved: %v", err)
 	}
+}
+
+// keepCorruptState copies a state file that did not parse next to itself,
+// so an operator can recover from it after the next save replaces it.
+func (b *broker) keepCorruptState(raw []byte) {
+	name := filepath.Join(b.cfg.StateDir, stateFile+".corrupt-"+time.Now().UTC().Format("20060102T150405Z"))
+	if err := os.WriteFile(name, raw, 0o600); err != nil {
+		log.Printf("corrupt client state not kept: %v", err)
+		return
+	}
+	log.Printf("client state did not parse; kept a copy at %s", name)
 }
 
 // loadCompat reads the client state file, if there is one.
@@ -147,14 +200,52 @@ func (b *broker) loadCompat() error {
 	if err != nil {
 		return err
 	}
-	var st savedState
-	if err := json.Unmarshal(raw, &st); err != nil {
+	// Read the file section by section: one record of another shape must
+	// not lose every client id. A section that does not parse is skipped
+	// and the file is copied aside, so nothing is lost to the next save.
+	var sections map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &sections); err != nil {
+		b.keepCorruptState(raw)
 		return err
+	}
+	var st savedState
+	var bad []string
+	for name, into := range map[string]any{"uuids": &st.UUIDs, "idempotency": &st.Idem, "tombstones": &st.Tombs,
+		"images": &st.Images, "guest_rooms": &st.GuestRooms} {
+		if v, ok := sections[name]; ok && len(v) > 0 {
+			if err := json.Unmarshal(v, into); err != nil {
+				bad = append(bad, name)
+			}
+		}
+	}
+	if len(bad) > 0 {
+		b.keepCorruptState(raw)
+		log.Printf("client state: sections %v did not parse and were skipped", bad)
 	}
 	b.mu.Lock()
 	b.savedUUIDs = map[string]string{}
 	for u, bid := range st.UUIDs {
 		b.savedUUIDs[bid] = u
+	}
+	if len(st.GuestRooms) > 0 {
+		b.guestRooms = map[string]map[string]map[string]struct{}{}
+		for guest, byHotel := range st.GuestRooms {
+			outHotel := map[string]map[string]struct{}{}
+			for hotel, ids := range byHotel {
+				outIDs := map[string]struct{}{}
+				for id, ok := range ids {
+					if ok && id != "" {
+						outIDs[id] = struct{}{}
+					}
+				}
+				if len(outIDs) > 0 {
+					outHotel[hotel] = outIDs
+				}
+			}
+			if len(outHotel) > 0 {
+				b.guestRooms[guest] = outHotel
+			}
+		}
 	}
 	b.mu.Unlock()
 	b.compat.mu.Lock()

@@ -9,6 +9,10 @@ ConditionPathExists=/dev/sev-guest
 ConditionPathExists=/etc/cathedral/sn94-snp-miner.env
 StartLimitIntervalSec=300
 StartLimitBurst=5
+# When the start limit is hit (five starts in 300 s, for example on a stale
+# validator-access snapshot) the unit stays failed; page a person instead of
+# staying silent. The hook is the same one the validator-access units use.
+OnFailure=cathedral-validator-access-alert@%n.service
 
 [Service]
 Type=simple
@@ -16,7 +20,10 @@ User=root
 Group=root
 EnvironmentFile=/etc/cathedral/sn94-snp-miner.env
 ExecStart=/usr/local/sbin/cathedral-run-sn94-snp-miner
-Restart=on-failure
+# always, not on-failure: the launcher exits 143 on SIGTERM (a docker daemon
+# restart, for one), which SuccessExitStatus counts as success, and
+# on-failure left the only SN94 miner stopped with no page.
+Restart=always
 RestartSec=15s
 SuccessExitStatus=129 130 143
 TimeoutStopSec=30s
