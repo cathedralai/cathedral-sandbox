@@ -16,6 +16,18 @@ The broker does four things:
 Room ids are `<hotel id>.<hotel room id>`. The broker adds the label
 `broker_guest=<guest>` to each room it creates, and filters on it.
 
+Creates in flight:
+
+- A guest that cancels a create, or goes away, gets no room. The hotel does
+  not see the cancel and finishes the room. The broker keeps the hotel call
+  open and deletes the room when the hotel answers.
+- `DELETE /v1/sandboxes?label=` also catches creates of the same guest that
+  the broker received before the delete and that match every label. A
+  queued create does not start. A create that a hotel already runs is
+  deleted when the hotel answers. Such a create answers 409
+  `deleted_during_create`. A create received after the delete runs as usual.
+  The broker keeps each delete filter for 15 minutes.
+
 ## Placement
 
 - The broker picks a hotel at random. The weight is free rooms x CPU

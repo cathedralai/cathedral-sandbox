@@ -1,0 +1,4 @@
+# Paths that the leak guard does not scan. One glob per line (fnmatch).
+# Add only vendored or generated data that you reviewed. A change to this
+# file needs review like any other code change. This file can not exempt
+# itself.
