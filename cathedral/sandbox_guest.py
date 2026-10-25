@@ -50,6 +50,7 @@ from cathedral.sandbox_api import (
 )
 from cathedral.sandbox_egress import EgressClient
 from cathedral.sandbox_workspaces import WorkspaceStore
+from cathedral.sandbox_owner import owner_hash
 from cathedral.sandbox_provider import (
     InMemorySandboxProvider,
     SandboxOpError,
@@ -315,6 +316,9 @@ class GuestRecord:
     timeout_form: str | None = None
     # (owner, name, path, version_on_delete) of the mounted workspace (#305).
     workspace: tuple[str, str, str, bool] | None = None
+    # Owner of the room (sandbox_owner.owner_id). The egress proxy reads the
+    # room's secrets under its hash (#304).
+    owner: str | None = None
 
 
 # A room's exec output, process log and the API's own log record are capped
@@ -1125,6 +1129,9 @@ def _sweep_stale_bases(own: Path) -> None:
 class DockerGuestProvider:
     """SandboxProvider that runs each sandbox as a real Linux Docker (or Kata) guest."""
 
+    # The API passes the room owner to create (sandbox_server.create).
+    takes_owner = True
+
     def __init__(
         self,
         *,
@@ -1219,6 +1226,20 @@ class DockerGuestProvider:
     @property
     def workspace_store(self) -> WorkspaceStore | None:
         return self._workspaces
+
+    @property
+    def egress_client(self) -> EgressClient | None:
+        return self._egress
+
+    def _owner_key(self, owner: str | None) -> str:
+        return owner_hash(owner) if owner else ""
+
+    def _require_credentials_support(self, credentials) -> None:
+        if credentials and self._egress is None:
+            raise SandboxOpError(
+                "credentials_unavailable", 501,
+                "this hotel has no egress daemon, so it cannot attach credentials",
+            )
 
     @property
     def capabilities_dind(self) -> bool:
@@ -1343,8 +1364,9 @@ class DockerGuestProvider:
         api_key: str | None,
         idempotency: str | None,
         body_digest: str,
-        workspace_owner: str | None = None,
+        owner: str | None = None,
     ) -> dict[str, Any]:
+        self._require_credentials_support(request.network.credentials)
         if request.snapshot_id is not None:
             # Fail before any record exists. A fork never starts another image.
             self._snapshot_image(request.snapshot_id)
@@ -1352,9 +1374,9 @@ class DockerGuestProvider:
             # Fail before any record exists: 404 for a workspace of another owner.
             if self._workspaces is None:
                 raise SandboxOpError("workspaces_unavailable", 501, "this hotel has no workspaces")
-            if workspace_owner is None:
+            if owner is None:
                 raise SandboxOpError("workspace_not_found", 404, f"no workspace {request.workspace.name}")
-            self._workspaces.check(workspace_owner, request.workspace.name)
+            self._workspaces.check(owner, request.workspace.name)
         docs = self._inner.create(
             request, api_key=api_key, idempotency=idempotency, body_digest=body_digest
         )
@@ -1366,7 +1388,7 @@ class DockerGuestProvider:
                 if existing is not None:
                     started.append(self._enrich_doc(doc, existing))
                 else:
-                    started.append(self._start_guest(doc, request, workspace_owner))
+                    started.append(self._start_guest(doc, request, owner))
         except Exception:
             # One failed guest fails the whole create. Release every record and
             # guest of this batch, so no ghost holds quota, and forget the
@@ -1450,23 +1472,23 @@ class DockerGuestProvider:
             _save_auth_pulled(self._auth_pulled)
 
     def _start_guest(
-        self, doc: dict[str, Any], request: CreateSandboxRequest, workspace_owner: str | None = None
+        self, doc: dict[str, Any], request: CreateSandboxRequest, owner: str | None = None
     ) -> dict[str, Any]:
         """Start the guest for one record. The caller releases the record on failure."""
         workspace = None
-        if request.workspace is not None and self._workspaces is not None and workspace_owner is not None:
+        if request.workspace is not None and self._workspaces is not None and owner is not None:
             spec = request.workspace
-            data = self._workspaces.mount(workspace_owner, spec.name, doc["id"])
-            workspace = (workspace_owner, spec.name, spec.path, spec.version_on_delete, data)
+            data = self._workspaces.mount(owner, spec.name, doc["id"])
+            workspace = (owner, spec.name, spec.path, spec.version_on_delete, data)
         try:
-            return self._start_guest_mounted(doc, request, workspace)
+            return self._start_guest_mounted(doc, request, workspace, owner)
         except BaseException:
             if workspace is not None:
                 self._workspaces.unmount(workspace[0], workspace[1], doc["id"])
             raise
 
     def _start_guest_mounted(
-        self, doc: dict[str, Any], request: CreateSandboxRequest, workspace: tuple | None
+        self, doc: dict[str, Any], request: CreateSandboxRequest, workspace: tuple | None, owner: str | None = None
     ) -> dict[str, Any]:
         sandbox_id = doc["id"]
         with self._inner._lock:  # noqa: SLF001
@@ -1518,7 +1540,8 @@ class DockerGuestProvider:
             # The daemon denies a new guest by default. Open it to its policy
             # now; on failure the guest goes, so no guest runs unmanaged.
             try:
-                applied = self._egress.apply(container_id, sandbox_id, request.network.policy)
+                applied = self._egress.apply(container_id, sandbox_id, request.network.policy,
+                                             self._owner_key(owner))
             except BaseException as exc:
                 exited = self._client.exit_code_if_stopped(container_id)
                 self._client.remove_confirmed(container_id, timeout=self._rm_timeout)
@@ -1552,6 +1575,7 @@ class DockerGuestProvider:
             policy=applied["policy"] if applied else None,
             policy_sha256=applied["policy_sha256"] if applied else None,
             workspace=workspace[:4] if workspace is not None else None,
+            owner=owner,
         )
         return self._after_start(doc, sandbox_id, container_id, dind)
 
@@ -1862,6 +1886,7 @@ class DockerGuestProvider:
         return {"snapshot_id": snap_id, "image": image, "digest": digest, "includes_work": False}
 
     def set_network(self, sandbox_id: str, patch: NetworkPatch) -> dict[str, Any]:
+        self._require_credentials_support(patch.credentials)
         guest = self._guests.get(sandbox_id)
         if guest is not None and self._egress is not None:
             return self._switch_policy(sandbox_id, guest, patch)
@@ -1905,10 +1930,10 @@ class DockerGuestProvider:
                 "create it with deny_all to switch its policy later",
             )
         mode = "deny_all" if patch.mode == "none" else patch.mode
-        policy = canonical_network_policy(mode, patch.allow)
+        policy = canonical_network_policy(mode, patch.allow, patch.credentials)
         with self._inner._lock:  # noqa: SLF001
             self._inner._require_running(sandbox_id)  # noqa: SLF001  a frozen room is 409 before the daemon moves
-        applied = self._egress.apply(guest.container_id, sandbox_id, policy)
+        applied = self._egress.apply(guest.container_id, sandbox_id, policy, self._owner_key(guest.owner))
         guest.policy, guest.policy_sha256 = applied["policy"], applied["policy_sha256"]
         guest.network_mode = mode
         doc = self._inner.set_network(sandbox_id, NetworkPatch(mode=mode, allow=tuple(patch.allow)))

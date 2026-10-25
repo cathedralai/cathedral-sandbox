@@ -43,8 +43,8 @@ from cathedral.sandbox_api import (
     Resources,
     TarGet,
 )
+from cathedral.sandbox_owner import guest_from, owner_hash, owner_id
 from cathedral.sandbox_provider import InMemorySandboxProvider, SandboxOpError, SandboxProvider
-from cathedral.sandbox_owner import guest_from, owner_id
 
 JSON = "application/json"
 REAPER_INTERVAL_DEFAULT_SECONDS = 30.0
@@ -102,10 +102,19 @@ def _allow_list(raw: Any) -> tuple[str, ...]:
     return tuple(raw)
 
 
+def _credential_list(raw: Any) -> tuple[Any, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        raise api.SandboxContractError("invalid_credentials", "credentials must be a list")
+    return tuple(raw)
+
+
 def _network_spec(net: Any, allow: Any = None) -> NetworkSpec:
     """network is {"mode", "allow"} or a mode name with the list in network_allow."""
     if isinstance(net, dict):
-        return NetworkSpec(mode=net.get("mode", "public"), allow=_allow_list(net.get("allow")))
+        return NetworkSpec(mode=net.get("mode", "public"), allow=_allow_list(net.get("allow")),
+                           credentials=_credential_list(net.get("credentials")))
     if isinstance(net, str):
         return NetworkSpec(mode=net, allow=_allow_list(allow))
     if net is None:
@@ -288,6 +297,9 @@ class SandboxApplication:
         self._add("POST", w + r"/(?P<name>[^/]+)/versions", self.create_workspace_version)
         self._add("GET", w + r"/(?P<name>[^/]+)/versions", self.list_workspace_versions)
         self._add("POST", w + r"/(?P<name>[^/]+)/rollback", self.rollback_workspace)
+        self._add("PUT", r"/v1/secrets/(?P<name>[^/]+)", self.put_secret)
+        self._add("GET", r"/v1/secrets", self.list_secrets)
+        self._add("DELETE", r"/v1/secrets/(?P<name>[^/]+)", self.delete_secret)
         self._add("GET", r"/v1/sandbox-templates", self.list_templates)
         self._add("GET", r"/v1/sandbox-templates/(?P<uid>[^/]+)", self.get_template)
         self._add("POST", r"/v1/images/prefetch", self.prefetch)
@@ -364,11 +376,13 @@ class SandboxApplication:
         request = _create_request(self._json(body))
         idem = headers.get("Idempotency-Key") or headers.get("idempotency-key")
         if request.workspace is not None:
-            # #305: the owner of the room is the owner of the workspace it mounts.
-            self._workspace_store()
+            self._workspace_store()  # 501 before any record on a hotel with no workspaces
+        if getattr(self.provider, "takes_owner", False):
+            # The owner of the room: the owner of the workspace it mounts (#305)
+            # and of the secrets the egress proxy attaches for it (#304).
             owner = owner_id(api_key, guest_from(headers, dict(request.labels)))
             doc = self.provider.create(request, api_key=api_key, idempotency=idem, body_digest=_body_digest(body),
-                                       workspace_owner=owner)
+                                       owner=owner)
         else:
             doc = self.provider.create(request, api_key=api_key, idempotency=idem, body_digest=_body_digest(body))
         return Response.json(202, doc)
@@ -412,6 +426,35 @@ class SandboxApplication:
         store = self._workspace_store()
         doc = self._json(body)
         return Response.json(200, store.rollback(self._owner(headers, api_key), name, doc.get("version")))
+
+    # ------------------------------------------------------------------ #304 secrets
+    # Values go in and never come out. No answer, log line or error message
+    # carries a value. A secret of another owner answers 404, like a missing one.
+    def _egress_client(self):
+        client = getattr(self.provider, "egress_client", None)
+        if client is None:
+            raise SandboxOpError("secrets_unavailable", 501, "this hotel has no egress daemon, so it keeps no secrets")
+        return client
+
+    def put_secret(self, *, headers, body, api_key, name, **_):
+        client = self._egress_client()
+        api.validate_secret_name(name)
+        try:
+            value = self._json(body).get("value")
+        except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+            raise SandboxOpError("invalid_secret_value", 400, "body must be JSON {\"value\": \"...\"}") from None
+        doc = client.put_secret(owner_hash(owner_id(api_key, guest_from(headers))), name, value)
+        return Response.json(200, doc)
+
+    def list_secrets(self, *, headers, api_key, **_):
+        client = self._egress_client()
+        return Response.json(200, {"secrets": client.list_secrets(owner_hash(owner_id(api_key, guest_from(headers))))})
+
+    def delete_secret(self, *, headers, api_key, name, **_):
+        client = self._egress_client()
+        api.validate_secret_name(name)
+        client.delete_secret(owner_hash(owner_id(api_key, guest_from(headers))), name)
+        return Response.no_content()
 
     def list_sandboxes(self, *, query, headers, body, api_key, **_):
         # §3.4: reap anything past TTL / its idle window before reading state, so a
@@ -567,7 +610,8 @@ class SandboxApplication:
         # would turn a malformed change into full internet access.
         if not isinstance(payload.get("mode"), str):
             raise api.SandboxContractError("invalid_network_mode", "network change needs a mode: internet, deny_all or allowlist")
-        patch = NetworkPatch(mode=payload["mode"], allow=_allow_list(payload.get("allow")))
+        patch = NetworkPatch(mode=payload["mode"], allow=_allow_list(payload.get("allow")),
+                             credentials=_credential_list(payload.get("credentials")))
         return Response.json(200, self.provider.set_network(id, patch))
 
     def expose(self, *, id, body, **_):
