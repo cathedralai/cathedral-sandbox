@@ -111,22 +111,31 @@ func (b *broker) handleSecrets(w http.ResponseWriter, r *http.Request, g *guestS
 
 func (b *broker) secretAnswer(w http.ResponseWriter, name string, statuses map[string]int, okStatus int) {
 	hotels := map[string]string{}
-	done, notFound, refused := 0, 0, 0
+	done, notFound, refused, bad := 0, 0, 0, 0
 	for id, s := range statuses {
 		st := secretState(s)
 		hotels[id] = st
 		switch st {
 		case "done":
 			done++
-		case "not_found":
+		case "not_found", "no_secrets":
 			notFound++
 		case "refused":
 			refused++
+		default:
+			bad++ // unreachable or failed
 		}
 	}
 	switch {
-	case done > 0 && okStatus == 204:
+	// DELETE must not return 204 when any hotel failed: the guest would think
+	// every hotel cleared the secret (Bugbot P1).
+	case done > 0 && okStatus == 204 && bad == 0:
 		w.WriteHeader(204)
+	case done > 0 && bad > 0 && okStatus == 204:
+		writeJSON(w, 502, map[string]any{
+			"error":  map[string]string{"code": "secrets_partial", "message": "some hotels did not delete the secret"},
+			"hotels": hotels,
+		})
 	case done > 0:
 		writeJSON(w, 200, map[string]any{"name": name, "hotels": hotels})
 	case notFound > 0:

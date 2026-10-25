@@ -155,6 +155,25 @@ func TestSecretPutGoesToTheGuestHotelsAndNoAnswerHasTheValue(t *testing.T) {
 	}
 }
 
+func TestSecretDeletePartialHotelFailureIs502(t *testing.T) {
+	sc := newSecretChain(t, []string{"a", "b"})
+	rawCall(t, sc.srv.URL, "key1", "PUT", "/v1/secrets/PIP_TOKEN", `{"value":"`+testSecretValue+`"}`, nil)
+	sc.sh["b"].down = true
+	status, out := rawCall(t, sc.srv.URL, "key1", "DELETE", "/v1/secrets/PIP_TOKEN", "", nil)
+	if status != 502 || !strings.Contains(out, "secrets_partial") {
+		t.Fatalf("partial delete: %d %s", status, out)
+	}
+	var doc map[string]any
+	_ = json.Unmarshal([]byte(out), &doc)
+	hotels := doc["hotels"].(map[string]any)
+	if hotels["a"] != "done" || hotels["b"] != "failed" {
+		t.Fatalf("hotels %v", hotels)
+	}
+	if sc.sh["a"].values["g1"]["PIP_TOKEN"] != "" {
+		t.Fatal("hotel a still has the secret after a partial delete report")
+	}
+}
+
 func TestSecretsOfAnotherGuestAreInvisible(t *testing.T) {
 	sc := newSecretChain(t, nil)
 	rawCall(t, sc.srv.URL, "key1", "PUT", "/v1/secrets/PIP_TOKEN", `{"value":"`+testSecretValue+`"}`, nil)
