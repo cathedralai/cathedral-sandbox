@@ -61,6 +61,7 @@ import asyncio
 import base64
 import grp
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -525,34 +526,91 @@ def sh(argv: list[str], timeout: float = 30) -> str:
     return r.stdout
 
 
+SYS_CLASS_NET = "/sys/class/net"
+
+# A create storm keeps the room daemon busy: a docker answer can take many
+# seconds. Wait long enough, but answer the API (its timeout is 120 s) before
+# it gives up, so it sees a clear error and not a timeout.
+DOCKER_TIMEOUT = 90.0
+
+
+class _DockerConnection(http.client.HTTPConnection):
+    def __init__(self, path: str, timeout: float):
+        super().__init__("localhost", timeout=timeout)
+        self._path = path
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self._path)
+        self.sock = sock
+
+
+def host_link_name(ifindex: int, root: str | None = None) -> str | None:
+    """The name of the host interface with *ifindex*, from sysfs."""
+    root = root or SYS_CLASS_NET
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return None
+    for name in names:
+        try:
+            with open(os.path.join(root, name, "ifindex")) as f:
+                if int(f.read().strip()) == ifindex:
+                    return name
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 class Docker:
-    def __init__(self, sock: str):
-        self.base = ["docker", "-H", "unix://" + sock]
+    """Container facts from the room daemon's Engine API.
+
+    One HTTP call on the daemon socket per question. The docker CLI costs a
+    process start and a /_ping round trip per call, which adds up in a create
+    storm (#298)."""
+
+    def __init__(self, sock: str, timeout: float = DOCKER_TIMEOUT):
+        self.sock, self.timeout = sock, timeout
+
+    def _get(self, path: str):
+        conn = _DockerConnection(self.sock, self.timeout)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            body = resp.read()
+        except (OSError, http.client.HTTPException) as exc:
+            raise RuntimeError(f"docker GET {path.split('?')[0]}: {exc}") from None
+        finally:
+            conn.close()
+        if resp.status != 200:
+            raise RuntimeError(f"docker GET {path.split('?')[0]}: HTTP {resp.status} {body[:200]!r}")
+        return json.loads(body)
 
     def facts(self, container_id: str) -> tuple[str, str, str | None]:
         """(ip, mac, host-side port name) of a running container with one network."""
-        fmt = ("{{.State.Running}} {{.NetworkSettings.SandboxKey}}"
-               "{{range .NetworkSettings.Networks}} {{.IPAddress}} {{.MacAddress}}{{end}}")
-        parts = sh(self.base + ["inspect", "--format", fmt, container_id]).split()
-        if len(parts) < 4 or parts[0] != "true" or not parts[2]:
+        doc = self._get(f"/containers/{container_id}/json")
+        state = doc.get("State") or {}
+        settings = doc.get("NetworkSettings") or {}
+        networks = settings.get("Networks") or {}
+        # The first network by name, as the docker CLI template ranged them.
+        first = networks[sorted(networks)[0]] if networks else {}
+        ip, mac, netns = first.get("IPAddress") or "", first.get("MacAddress") or "", settings.get("SandboxKey") or ""
+        if state.get("Running") is not True or not ip or not mac or not netns:
             raise RuntimeError(f"container {container_id[:12]} is not running with one network")
-        netns, ip, mac = parts[1], parts[2], parts[3]
         ipaddress.IPv4Address(ip)
         port = None
         try:
             link = sh(["nsenter", "--net=" + netns, "ip", "-o", "link", "show", "eth0"])
             m = re.search(r"eth0@if(\d+):", link)
             if m:
-                for line in sh(["ip", "-o", "link", "show"]).splitlines():
-                    if line.startswith(m.group(1) + ":"):
-                        port = line.split(":")[1].strip().split("@")[0]
-                        break
+                port = host_link_name(int(m.group(1)))
         except (RuntimeError, subprocess.SubprocessError, OSError):
             port = None
         return ip, mac, port
 
     def running(self) -> set[str]:
-        return set(sh(self.base + ["ps", "-q", "--no-trunc"]).split())
+        return {c["Id"] for c in self._get("/containers/json")}
 
 
 # ---------------------------------------------------------------- state
@@ -585,7 +643,7 @@ class Table:
             try:
                 running = self.docker.running()
                 rooms = [r for r in rooms if r.container_id in running]
-            except (RuntimeError, subprocess.SubprocessError, OSError):
+            except (RuntimeError, subprocess.SubprocessError, OSError, ValueError):
                 rooms = []
         with self.lock:
             self.rules.install(rooms)
@@ -633,7 +691,14 @@ class Table:
             self.by_ip[ip] = new
             self.save()
         self.on_change(new)
-        flush_conntrack(ip)
+        if dropped:
+            # A switch, or an address that carried another room's policy:
+            # flows that started under the old policy must not go on. A new
+            # room on a free address has no such flow. Its only entries are
+            # DNS redirects to the hotel resolver, which reads the policy on
+            # each query. So a first apply skips the two conntrack scans
+            # (#298: they ran on every create).
+            flush_conntrack(ip)
         return new
 
     def forget(self, container_id: str) -> bool:
@@ -1148,6 +1213,10 @@ def iso(t: float) -> str:
 
 class ControlServer(ThreadingMixIn, UnixStreamServer):
     daemon_threads = True
+    # Every create calls this socket. The socketserver default backlog is 5:
+    # in a create storm a full backlog makes a client connect fail at once
+    # (EAGAIN on a Unix socket), not wait.
+    request_queue_size = 1024
     secrets: SecretStore = SecretStore()
 
 

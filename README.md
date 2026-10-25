@@ -94,4 +94,11 @@ Detailed troubleshooting is in the
 [mining guide](docs/MINING.md#stop-and-get-help).
 Protocol and development references are in the [documentation map](docs/README.md).
 
+## Public leak guard
+
+This repository is public. The `Leak guard` check blocks public IP addresses,
+secrets, supplier names and customer names in new lines, pull request text and
+commit messages. [Public leak guard](docs/LEAK_GUARD.md) tells you what it
+blocks, how to add a private term and how to allow a false positive.
+
 License: [MIT](LICENSE).
