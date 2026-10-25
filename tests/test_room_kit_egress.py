@@ -393,6 +393,171 @@ def test_control_socket_round_trip(table, tmp_path) -> None:
     Path(path).unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------------- create storm (#298)
+
+def _unix_http(handler_cls):
+    """An HTTP server on a short Unix socket path. Return (server, path)."""
+    import tempfile
+    import threading
+    from http.server import BaseHTTPRequestHandler  # noqa: F401 - handler base for callers
+    from socketserver import ThreadingMixIn, UnixStreamServer
+
+    class Srv(ThreadingMixIn, UnixStreamServer):
+        daemon_threads = True
+
+    path = tempfile.mktemp(prefix="dk", suffix=".sock", dir="/tmp")  # AF_UNIX paths are short
+    srv = Srv(path, handler_cls)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, path
+
+
+def test_docker_facts_come_from_the_engine_api(tmp_path, monkeypatch) -> None:
+    from http.server import BaseHTTPRequestHandler
+
+    seen: list[str] = []
+    cid = "ab" * 32
+    docs = {
+        cid: {"State": {"Running": True}, "NetworkSettings": {"SandboxKey": "/run/netns/x", "Networks": {
+            "room-net-1": {"IPAddress": "10.214.0.40", "MacAddress": "02:42:0a:d6:00:28"}}}},
+        "cd" * 32: {"State": {"Running": False}, "NetworkSettings": {"SandboxKey": "", "Networks": {}}},
+    }
+
+    class Engine(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            seen.append(self.path)
+            if self.path == "/containers/json":
+                body = json.dumps([{"Id": cid}]).encode()
+                status = 200
+            else:
+                doc = docs.get(self.path.split("/")[2])
+                status, body = (200, json.dumps(doc).encode()) if doc else (404, b'{"message":"no such container"}')
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv, path = _unix_http(Engine)
+    for name, idx in (("lo", 1), ("rmbr0", 3), ("vethfeed01", 7)):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "ifindex").write_text(f"{idx}\n")
+    monkeypatch.setattr(eg, "SYS_CLASS_NET", str(tmp_path))
+    calls: list[list[str]] = []
+
+    def fake_sh(argv, timeout=30):
+        calls.append(argv)
+        assert argv[:2] == ["nsenter", "--net=/run/netns/x"]
+        return "2: eth0@if7: <BROADCAST,MULTICAST,UP> mtu 1500\n"
+
+    monkeypatch.setattr(eg, "sh", fake_sh)
+    try:
+        docker = eg.Docker(path)
+        assert docker.facts(cid) == ("10.214.0.40", "02:42:0a:d6:00:28", "vethfeed01")
+        # One Engine API call per question: no CLI, no /_ping.
+        assert seen == [f"/containers/{cid}/json"]
+        assert len(calls) == 1  # only the in-room link lookup runs a process
+        with pytest.raises(RuntimeError, match="not running"):
+            docker.facts("cd" * 32)
+        with pytest.raises(RuntimeError, match="HTTP 404"):
+            docker.facts("ef" * 32)
+        assert docker.running() == {cid}
+    finally:
+        srv.shutdown()
+        Path(path).unlink(missing_ok=True)
+
+
+def test_a_first_apply_skips_the_conntrack_scans(table, monkeypatch) -> None:
+    flushed: list[str] = []
+    monkeypatch.setattr(eg, "flush_conntrack", flushed.append)
+    table.fake.add("7" * 64, "10.214.0.50")
+    table.put("7" * 64, "sbx_7", eg.Policy.parse({"mode": "internet"}))
+    assert flushed == []  # a new room on a free address has no old flow
+    table.put("7" * 64, "sbx_7", eg.Policy.parse({"mode": "deny_all"}))
+    assert flushed == ["10.214.0.50"]  # a switch drops the old flows
+    # A new room on an address that still carries another room's policy.
+    table.fake.alive.discard("7" * 64)
+    table.fake.add("8" * 64, "10.214.0.50", port="veth8")
+    table.put("8" * 64, "sbx_8", eg.Policy.parse({"mode": "internet"}))
+    assert flushed == ["10.214.0.50", "10.214.0.50"]
+    assert table.forget("8" * 64)
+    assert flushed[-1] == "10.214.0.50"
+
+
+def test_control_socket_survives_a_create_storm(table) -> None:
+    """Many creates call the daemon at once while docker answers slowly.
+
+    The docker question runs outside the table lock, so slow answers overlap
+    and do not queue behind each other. The backlog takes every connect."""
+    import http.client
+    import socket
+    import tempfile
+    import threading
+    import time as _time
+
+    rooms, delay = 64, 0.3
+    active = {"now": 0, "max": 0}
+    lock = threading.Lock()
+    fake = table.fake
+
+    class SlowDocker:
+        def facts(self, cid):
+            with lock:
+                active["now"] += 1
+                active["max"] = max(active["max"], active["now"])
+            _time.sleep(delay)
+            with lock:
+                active["now"] -= 1
+            return fake.facts(cid)
+
+        def running(self):
+            return fake.running()
+
+    for i in range(rooms):
+        fake.add(f"{i:064x}", f"10.214.{1 + i // 200}.{1 + i % 200}", port=f"veth{i}")
+    table.docker = SlowDocker()
+    path = tempfile.mktemp(prefix="eg", suffix=".sock", dir="/tmp")
+    srv = eg.ControlServer(path, eg.Control)
+    srv.table = table
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    class Conn(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(30)
+            self.sock.connect(path)
+
+    results: list[int] = []
+    start = threading.Barrier(rooms)
+
+    def create(i: int) -> None:
+        start.wait()
+        c = Conn("localhost")
+        c.request("PUT", f"/rooms/{i:064x}", body=json.dumps({"sandbox_id": f"sbx_{i}", "policy": {"mode": "internet"}}).encode())
+        r = c.getresponse()
+        r.read()
+        with lock:
+            results.append(r.status)
+
+    t0 = _time.monotonic()
+    threads = [threading.Thread(target=create, args=(i,)) for i in range(rooms)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    took = _time.monotonic() - t0
+    srv.shutdown()
+    Path(path).unlink(missing_ok=True)
+    assert results == [200] * rooms
+    assert len(table.by_cid) == rooms
+    assert active["max"] > rooms // 4
+    # In series the docker answers alone take rooms * delay (19 s).
+    assert took < rooms * delay / 4, took
+
+
 def test_put_refuses_a_room_without_its_bridge_port(table) -> None:
     # Without the host-side port the room is not in @ports, so the guard that
     # binds its source IP and MAC skips it and a raw-socket room could send as

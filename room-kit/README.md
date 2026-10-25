@@ -157,6 +157,14 @@ interface and cannot switch (409 `network_not_switchable`). Set
 `ROOM_EGRESS=0` to turn the daemon off; then `allowlist` and `deny_all` fail
 closed to network `none`, as before.
 
+Every create waits for the daemon. The daemon asks the room Docker daemon
+(Engine API on its socket, one call) for the room address. In a create storm
+that answer can take many seconds, so the API waits up to 120 s
+(`CATHEDRAL_ROOM_EGRESS_TIMEOUT`, 5 to 600) and tries a connect again for 5 s
+while the daemon restarts. The Docker daemon, the API, the egress daemon,
+health and receipts run with `CPUWeight=1000`. Each room scope has the
+default weight, so the control units stay ahead of the rooms.
+
 ## Build the API tarball
 
 The kit installs a pinned commit of this repository. Run
