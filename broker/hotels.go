@@ -275,8 +275,12 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			b.mu.Lock()
-			b.noteAttestation(h, res, nil, time.Now())
+			err = b.noteAttestation(h, res, nil, time.Now())
 			b.mu.Unlock()
+			if err != nil {
+				writeErr(w, 409, "chip_in_use", err.Error())
+				return
+			}
 		}
 	}
 	keyDir := filepath.Join(b.cfg.StateDir, "hotel-keys")
@@ -290,10 +294,30 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(context.Background())
 	h.stop = cancel
 	// Add first, then write the key: of two joins with one id, only the
-	// one that is added writes the key file.
+	// one that is added writes the key file. The hotel joins "leaving" (no
+	// rooms) until the chip check below, made once it is in the set: of two
+	// joins with one chip at once, the second to take b.mu sees the first.
+	h.leaving = true
 	if err := b.addHotel(h); err != nil {
 		cancel()
 		writeErr(w, 409, "hotel_exists", err.Error())
+		return
+	}
+	b.mu.Lock()
+	var holder *hotel
+	if h.adm.chipFull != "" && !h.adm.attestedAt.IsZero() {
+		holder = b.chipHolder(h, h.adm.chipFull, time.Now())
+	}
+	if holder == nil {
+		h.leaving = false
+	} else {
+		h.adm.attestedAt = time.Time{}
+	}
+	b.mu.Unlock()
+	if holder != nil {
+		b.dropHotel(h.cfg.ID)
+		cancel()
+		writeErr(w, 409, "chip_in_use", errChipInUse{other: holder.cfg.ID, chip: h.adm.chipID}.Error())
 		return
 	}
 	if err := os.WriteFile(h.cfg.KeyFile, []byte(req.Key+"\n"), 0o600); err != nil {

@@ -193,7 +193,7 @@ func TestConcurrentJoinsLeavesAndCreates(t *testing.T) {
 	miners := make([]*minerHotel, joins)
 	urls := make([]string, joins)
 	for i := range miners {
-		miners[i], urls[i] = newMinerHotel(t, 3, snpAttestation(t, attestOpts{}))
+		miners[i], urls[i] = newMinerHotel(t, 3, snpAttestation(t, attestOpts{chip: byte(i)}))
 	}
 	var wg sync.WaitGroup
 	var mu sync.Mutex

@@ -31,6 +31,7 @@ type attestOpts struct {
 	badReportData bool // REPORT_DATA does not commit to the binding
 	badSHA        bool // binding_sha256 is not the hash of the binding
 	measurement   byte // fill byte of the measurement (default 0xab)
+	chip          byte // CHIP_ID seed: hotels with one seed are one machine
 }
 
 // snpAttestation builds a GET /room/attestation body the way room_receipts.py
@@ -59,7 +60,7 @@ func snpAttestation(t testing.TB, o attestOpts) []byte {
 		rep[i] = 0x07
 	}
 	for i := 0x1A0; i < 0x1E0; i++ {
-		rep[i] = byte(i)
+		rep[i] = byte(i) + o.chip
 	}
 	cmdline := "console=ttyS0 root=/dev/vda"
 	if o.debugCmdline {
@@ -134,13 +135,22 @@ func newMinerHotel(t *testing.T, slots int, att []byte) (*minerHotel, string) {
 	return m, hs.URL
 }
 
+// chipOf is a CHIP_ID seed per hotel id: each test hotel is its own machine.
+func chipOf(id string) byte {
+	var s byte
+	for _, c := range []byte(id) {
+		s = s*31 + c
+	}
+	return s
+}
+
 // joinMiner joins a miner hotel through the operator route and runs one sync
 // step, as the sync loop would: health, then the attestation check.
 func joinMiner(t *testing.T, tc *testChain, id string, sealed bool, slots int, extra map[string]any) *minerHotel {
 	t.Helper()
 	var att []byte
 	if sealed {
-		att = snpAttestation(t, attestOpts{})
+		att = snpAttestation(t, attestOpts{chip: chipOf(id)})
 	}
 	m, url := newMinerHotel(t, slots, att)
 	tc.hotels[id] = m.fakeHotel
@@ -669,3 +679,39 @@ func TestQueuedCreateDoesNotStartOnAHotelThatLostAdmission(t *testing.T) {
 }
 
 var errDebugBuild = errors.New("debug build: the host can log in to this guest")
+
+// ---------------------------------------------------------------- fake AMD chain verifier
+
+const testARKPin = "1111111111111111111111111111111111111111111111111111111111111111"
+
+const amdPass = `{"verdict": "PASS", "attestation": {"amd": {"product": "Genoa", "ark_sha256": "` + testARKPin + `"}}}`
+
+// fakeAMDVerifier is a stand-in for verify_receipts.py: it prints the
+// verdict in verdict.json and logs its arguments to calls.log.
+func fakeAMDVerifier(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\nd=$(dirname \"$0\")\necho \"$@\" >> \"$d/calls.log\"\ncat \"$d/verdict.json\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "verify.sh"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	setAMDVerdict(t, dir, amdPass)
+	return dir
+}
+
+func setAMDVerdict(t *testing.T, dir, verdict string) {
+	t.Helper()
+	tmp := filepath.Join(dir, "verdict.json.tmp")
+	if err := os.WriteFile(tmp, []byte(verdict), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, filepath.Join(dir, "verdict.json")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// amdCalls is the argument lines the fake verifier was run with.
+func amdCalls(dir string) []string {
+	raw, _ := os.ReadFile(filepath.Join(dir, "calls.log"))
+	return strings.FieldsFunc(string(raw), func(r rune) bool { return r == '\n' })
+}

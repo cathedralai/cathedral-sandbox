@@ -85,11 +85,19 @@ jobs:
           go-version: "1.26.10"
           cache: false # the broker has no module dependencies, so there is no go.sum
 
+      # The AMD chain test runs room-kit/verify_receipts.py, which needs cryptography
+      # (same pin as requirements/sn94-audit-miner.txt).
+      - name: Python for the AMD chain test
+        run: |
+          python3 -m venv "$RUNNER_TEMP/amd-py"
+          "$RUNNER_TEMP/amd-py/bin/pip" install -q cryptography==50.0.1
+
       - name: Test
         working-directory: broker
         env:
           GOTOOLCHAIN: local
         run: |
+          export CATHEDRAL_TEST_PYTHON="$RUNNER_TEMP/amd-py/bin/python"
           test -z "$(gofmt -l .)"
           go vet ./...
           go test -race -short ./...
