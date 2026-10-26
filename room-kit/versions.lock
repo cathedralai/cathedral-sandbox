@@ -18,7 +18,9 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # terminal lines run through the runtime's exec),
 # made with:
 #   ./make-dist.sh b1739d0   (git archive of pyproject.toml and cathedral/)
-CATHEDRAL_COMMIT=d53b3af
-CATHEDRAL_TARBALL=dist/cathedral-d53b3af.tar.gz
-CATHEDRAL_TARBALL_SHA256=c90ddf1c280a0bad68c7fcceaf1c0cba41a17f12125c0011b47277e06b3fa189
+# Rolled 2026-10-26 to ce3009a (#330 hotel DELETE waits for the container, plus
+# workspaces #306 and egress credentials #307) on c48, Contabo and c46.
+CATHEDRAL_COMMIT=ce3009a
+CATHEDRAL_TARBALL=dist/cathedral-ce3009a.tar.gz
+CATHEDRAL_TARBALL_SHA256=54fb60945c17ea67bdfe8e88a53bd44f4bb3b83dab263112e5b7758be4b89a1b
 PROBE_IMAGE=alpine:3.20
