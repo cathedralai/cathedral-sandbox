@@ -58,6 +58,11 @@ _TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
 _KEY_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$")
+# Claims run_id, task_id, batch_id and artifact_id pass through safe_task_id
+# (Claims 41573a4 neurons/tasks.py:181-183): any of [A-Za-z0-9._-], leading
+# "_" allowed, no length limit. 512 bounds the envelope, not Claims.
+_CLAIMS_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,512}$")
+MAX_CLAIMS_PAPER_ID_BYTES = 512
 
 _TOP_LEVEL_KEYS = frozenset(
     {
@@ -289,6 +294,37 @@ def _require_id(value: object, *, field: str) -> str:
     return value
 
 
+def _require_claims_safe_id(value: object, *, field: str, allow_empty: bool = False) -> str:
+    if allow_empty and value == "":
+        return ""
+    if not isinstance(value, str) or _CLAIMS_SAFE_ID_RE.fullmatch(value) is None:
+        raise ClaimsEvidenceError("schema", f"{field} is invalid")
+    return value
+
+
+def _require_claims_paper_id(value: object) -> str:
+    # Claims does not sanitize paper_id (neurons/miner.py:678, neurons/tasks.py:39):
+    # it is the backend string, stripped. Reject only empty, padded, control
+    # characters and oversize values.
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value.encode("utf-8")) > MAX_CLAIMS_PAPER_ID_BYTES
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+    ):
+        raise ClaimsEvidenceError("schema", "paper_id is invalid")
+    return value
+
+
+def _claims_manifest_digest(manifest: Mapping[str, object]) -> str:
+    # The optional cathedral{} block is Cathedral-side audit data. Claims builds
+    # its manifest from its own artifact row, so the digest covers Claims fields only.
+    return sha256_hex(
+        canonical_claims_json({k: v for k, v in manifest.items() if k != "cathedral"})
+    )
+
+
 def _utc_stamp(moment: datetime) -> str:
     if moment.tzinfo is None:
         raise ClaimsEvidenceError("schema", "timestamps must be timezone-aware UTC")
@@ -326,13 +362,14 @@ def build_claims_manifest(
         "schema": CLAIMS_MANIFEST_SCHEMA,
         "netuid": netuid,
         "network": network,
-        "batch_id": _require_id(batch_id, field="batch_id"),
-        "run_id": _require_id(run_id, field="run_id"),
-        "task_id": _require_id(task_id, field="task_id"),
-        "artifact_id": _require_id(artifact_id, field="artifact_id"),
+        # Run-scoped Claims artifacts carry batch_id "" (neurons/tasks.py:103).
+        "batch_id": _require_claims_safe_id(batch_id, field="batch_id", allow_empty=True),
+        "run_id": _require_claims_safe_id(run_id, field="run_id"),
+        "task_id": _require_claims_safe_id(task_id, field="task_id"),
+        "artifact_id": _require_claims_safe_id(artifact_id, field="artifact_id"),
         "uid": uid,
         "hotkey": _require_id(hotkey, field="hotkey"),
-        "paper_id": _require_id(paper_id, field="paper_id"),
+        "paper_id": _require_claims_paper_id(paper_id),
         "source_pdf_sha256": _require_sha256(source_pdf_sha256, field="source_pdf_sha256"),
         "source_payload_hash": _require_sha256(source_payload_hash, field="source_payload_hash"),
         "image_digest_sha256": _require_sha256(image_digest_sha256, field="image_digest_sha256"),
@@ -541,15 +578,11 @@ def parse_claims_evidence_json(data: bytes | str) -> dict[str, object]:
         _NETWORK_RE.fullmatch(str(document["network"])) is None
     ):
         raise ClaimsEvidenceError("schema", "network is invalid")
-    for field in (
-        "batch_id",
-        "run_id",
-        "task_id",
-        "artifact_id",
-        "hotkey",
-        "paper_id",
-    ):
-        _require_id(document.get(field), field=field)
+    _require_claims_safe_id(document.get("batch_id"), field="batch_id", allow_empty=True)
+    for field in ("run_id", "task_id", "artifact_id"):
+        _require_claims_safe_id(document.get(field), field=field)
+    _require_id(document.get("hotkey"), field="hotkey")
+    _require_claims_paper_id(document.get("paper_id"))
     for field in (
         "manifest_sha256",
         "source_pdf_sha256",
@@ -618,7 +651,7 @@ def issue_claims_evidence(
         raise ClaimsEvidenceError(
             "binding", "artifact_hash does not match the manifest artifact_hash"
         )
-    manifest_sha = sha256_hex(canonical_claims_json(frozen))
+    manifest_sha = _claims_manifest_digest(frozen)
     until = reuse_authorized_until or (issued_at + timedelta(days=14))
     unsigned: dict[str, object] = {
         "schema": CLAIMS_EVIDENCE_SCHEMA,
@@ -715,7 +748,7 @@ def verify_claims_evidence(
             and document["artifact_hash"] != expected_artifact_hash
         ):
             reasons.append("artifact_hash_mismatch")
-        expected_manifest_sha = sha256_hex(canonical_claims_json(frozen))
+        expected_manifest_sha = _claims_manifest_digest(frozen)
         if document["manifest_sha256"] != expected_manifest_sha:
             reasons.append("manifest_digest_mismatch")
         for field in (
@@ -738,9 +771,17 @@ def verify_claims_evidence(
             reasons.append("netuid_mismatch")
         if document["uid"] != frozen["uid"]:
             reasons.append("uid_mismatch")
-        if frozen.get("cathedral") != document.get("cathedral"):
+        # Only a Cathedral-side verifier that supplies cathedral{} checks it.
+        if "cathedral" in frozen and frozen["cathedral"] != document.get("cathedral"):
             reasons.append("cathedral_mismatch")
 
+    for label, observed_bytes, maximum in (
+        ("agent_output", observed_agent_output, MAX_CLAIMS_OBSERVED_JSON_BYTES),
+        ("source_payload", observed_source_payload, MAX_CLAIMS_OBSERVED_JSON_BYTES),
+        ("source PDF", observed_source_pdf, MAX_CLAIMS_OBSERVED_PDF_BYTES),
+    ):
+        if observed_bytes is not None and len(observed_bytes) > maximum:
+            raise ClaimsEvidenceError("schema", f"observed {label} exceeds the maximum size")
     if observed_agent_output is not None:
         observed = claims_json_bytes_sha256(observed_agent_output, label="agent_output")
         if observed != document["artifact_hash"]:

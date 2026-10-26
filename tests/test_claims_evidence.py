@@ -515,3 +515,106 @@ def test_claims_native_ids_are_bound():
     assert verified.document["artifact_hash"] == digests["artifact_hash"]
     assert verified.document["source_payload_hash"] == digests["source_payload_hash"]
     assert verified.document["cathedral"]["stage_id"] == "shared_reference_prep"
+
+
+def _claims_safe_task_id(value: str) -> str:
+    # Claims 41573a4 neurons/tasks.py:181-183.
+    cleaned = "".join(c if c.isalnum() or c in {"-", "_", "."} else "_" for c in value.strip())
+    return cleaned or "claims_task"
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        # Run-scoped Claims artifact: batch_id is "" (neurons/tasks.py:103, miner.py:745).
+        {"batch_id": ""},
+        # safe_task_id output may start with "_".
+        {"task_id": _claims_safe_task_id("(pilot) 1"), "run_id": _claims_safe_task_id(" run#7")},
+        # neurons/miner.py:738 artifact_id for a long batch and paper id (136 chars).
+        {
+            "artifact_id": "artifact_"
+            + _claims_safe_task_id("batch-2026-10-26-sn111-mainnet-window-0042")
+            + "_uid_42_"
+            + _claims_safe_task_id(
+                "Rietveld_et_al_2013_Science_GWAS_of_126559_Individuals_Educational_Attainment"
+            )
+        },
+        # Claims does not sanitize paper_id.
+        {"paper_id": "10.1126/science.1235488"},
+    ],
+)
+def test_claims_produced_ids_issue_and_verify(over):
+    output = tiny_claims_agent_output(paper_id="p", claim_statement="c")
+    digests = _digests(output)
+    manifest = _manifest(digests, **over)
+    evidence = issue_claims_evidence(
+        private_key=PRIVATE_KEY,
+        signing_key_id=KEY_ID,
+        issued_at=ISSUED_AT,
+        manifest=manifest,
+        artifact_hash=digests["artifact_hash"],
+    )
+    trusted = parse_claims_evidence_trusted_keys_json(_trusted_keys_bytes())
+    verified = verify_claims_evidence(
+        evidence, trusted, expected_manifest=manifest, now=ISSUED_AT + timedelta(hours=1)
+    )
+    assert verified.accepted is True, verified.reject_reasons
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"task_id": "task/1"},
+        {"run_id": "x" * 513},
+        {"paper_id": " padded"},
+        {"paper_id": "line\nbreak"},
+        {"paper_id": ""},
+    ],
+)
+def test_claims_ids_still_reject_unsafe_values(over):
+    digests = _digests(tiny_claims_agent_output(paper_id="p", claim_statement="c"))
+    with pytest.raises(ClaimsEvidenceError) as err:
+        _manifest(digests, **over)
+    assert err.value.category == "schema"
+
+
+def test_claims_manifest_without_cathedral_block_verifies():
+    # Claims builds its manifest from its own artifact row and has no cathedral{} ids.
+    evidence, manifest, _, output = _issue()
+    claims_side = {k: v for k, v in manifest.items() if k != "cathedral"}
+    trusted = parse_claims_evidence_trusted_keys_json(_trusted_keys_bytes())
+    verified = verify_claims_evidence(
+        evidence,
+        trusted,
+        expected_manifest=claims_side,
+        observed_agent_output=output,
+        now=ISSUED_AT + timedelta(hours=1),
+    )
+    assert verified.accepted is True, verified.reject_reasons
+
+    other = dict(manifest)
+    other["cathedral"] = {"attempt_id": "attempt-2"}
+    verified = verify_claims_evidence(
+        evidence, trusted, expected_manifest=other, now=ISSUED_AT + timedelta(hours=1)
+    )
+    assert "cathedral_mismatch" in verified.reject_reasons
+    assert "manifest_digest_mismatch" not in verified.reject_reasons
+
+
+def test_library_verify_caps_observed_sizes(monkeypatch):
+    import cathedral.claims_evidence as claims_evidence
+
+    evidence, _, _, output = _issue()
+    trusted = parse_claims_evidence_trusted_keys_json(_trusted_keys_bytes())
+    monkeypatch.setattr(claims_evidence, "MAX_CLAIMS_OBSERVED_JSON_BYTES", len(output) - 1)
+    with pytest.raises(ClaimsEvidenceError) as err:
+        verify_claims_evidence(
+            evidence, trusted, observed_agent_output=output, now=ISSUED_AT + timedelta(hours=1)
+        )
+    assert err.value.category == "schema"
+    monkeypatch.setattr(claims_evidence, "MAX_CLAIMS_OBSERVED_PDF_BYTES", len(SOURCE_PDF) - 1)
+    monkeypatch.setattr(claims_evidence, "MAX_CLAIMS_OBSERVED_JSON_BYTES", 8 * 1024 * 1024)
+    with pytest.raises(ClaimsEvidenceError):
+        verify_claims_evidence(
+            evidence, trusted, observed_source_pdf=SOURCE_PDF, now=ISSUED_AT + timedelta(hours=1)
+        )
