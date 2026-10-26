@@ -1021,6 +1021,9 @@ class TeeBoxSandboxApi:
             with self._inflight_cv:
                 self._inflight -= 1
                 self._inflight_cv.notify_all()
+        if warm:
+            # Replace the claimed warm container, within the room left after every reservation.
+            self._maintain_pool()
         return _json(201, self._sandbox_view(info))
 
     def _admit_locked(self, shape: Shape, warm: str) -> None:

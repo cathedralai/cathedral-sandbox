@@ -308,7 +308,10 @@ def test_reserve_claims_one_and_renames_it():
     assert rename == [["docker", "rename", warm, "cathsbx-" + spec.sandbox_id]]
     assert info.spec.sandbox_id == spec.sandbox_id
     assert [c for c in docker.verbs("run") if "cathsbx-" + spec.sandbox_id in c] == []
-    assert executor.warm_count() == 2  # refilled
+    # The executor does not refill on its own: the service does, within the room it knows.
+    assert executor.warm_count() == 1
+    executor.maintain_pool(enabled=True, room=1)
+    assert executor.warm_count() == 2
 
 
 @pytest.mark.parametrize(
@@ -738,3 +741,49 @@ def test_other_customer_never_sees_the_first_ones_pool(tmp_path: Path):
     assert fake.warm == []
     status, _ = _handle(api, "POST", "/v1/lease", OTHER, {"ttl_seconds": 60})
     assert status in (200, 409)
+
+
+class _GatedRename(_Docker):
+    """Holds ``docker rename`` (a warm claim) until the gate opens."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = threading.Event()
+        self.renaming = threading.Event()
+
+    def __call__(self, argv, **kwargs):
+        if argv[1] == "rename":
+            self.renaming.set()
+            self.gate.wait(10)
+        return super().__call__(argv, **kwargs)
+
+
+def test_a_refill_after_a_warm_claim_never_overcommits_in_flight_creates(tmp_path: Path):
+    # Capacity for two default sandboxes, a pool of one. Create A claims the warm container;
+    # while its rename runs, create B is admitted cold into the second slot. When A finishes,
+    # the pool must not start a replacement: that would be a third container on room for two.
+    docker = _GatedRename()
+    tunables = parse_tunables(
+        json.dumps({"schema": 1, "pool": {"warm_size": 1}, "boot": {"create_concurrency": 2}})
+    )
+    executor = _executor(docker, tunables=tunables, warm_shape=WARM_SHAPE, spawn=lambda w: w())
+    api = _service(tmp_path, executor, concurrency=2, capacity=Shape(4, 8192, 20480))
+    api.reap()
+    assert executor.warm_count() == 1
+    results: dict = {}
+
+    def claim() -> None:
+        results["a"] = _handle(api, "POST", "/v1/sandboxes", body=_create_body())
+
+    first = threading.Thread(target=claim)
+    first.start()
+    assert docker.renaming.wait(5)
+    results["b"] = _handle(api, "POST", "/v1/sandboxes", body=_create_body(env={"A": "1"}))
+    docker.gate.set()
+    first.join(10)
+    assert results["a"][0] == 201 and results["b"][0] == 201
+    assert len(executor.list()) + executor.warm_count() <= 2
+    # Once a slot frees, the pool refills into it again.
+    executor.delete(results["b"][1]["id"])
+    api.reap()
+    assert executor.warm_count() == 1

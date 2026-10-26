@@ -1360,9 +1360,9 @@ class RunscExecutor(_Table):
                     # attach's own read-back may have found a lapse.
                     self.end_lapsed_sandboxes()
                     raise ExecutorError("egress enforcement failed")
+            # No refill here: only the service knows the room left once in-flight creates
+            # are counted, so it refills the pool after this returns (``maintain_pool``).
             info = self._record(spec)
-            if claimed:
-                self._refill(room=1)
             if spec.network == "internet" and enforcer is not None and enforcer.lapses != lapses:
                 # The rules lapsed while this sandbox started: end it too.
                 with self._quarantine_lock, self._lock:
