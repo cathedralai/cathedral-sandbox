@@ -206,7 +206,9 @@ ROOM_DAEMON_HASH_BEFORE=$({ cat "$ROOM_ETC/daemon.json" "$ROOM_OPT/bin/room-net.
 install -m 0755 "$KIT/lib/room-net.sh" "$ROOM_OPT/bin/room-net.sh"
 DNS_JSON=$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1].split()))' "$ROOM_DNS")
 MIRRORS_JSON=$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1].split()))' "${ROOM_REGISTRY_MIRRORS:-}")
-RUNSC_ARGS_JSON=$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1].split()))' "$ROOM_RUNSC_FLAGS")
+# runsc plus the 16 per-room tunable variants (lib/tunable_runtimes.py). The
+# default runtime stays runsc: a room without tunables starts as before.
+RUNTIMES_JSON=$(python3 "$KIT/lib/tunable_runtimes.py" "$RUNSC" "$ROOM_RUNSC_FLAGS")
 cat > "$ROOM_ETC/daemon.json" <<EOF
 {
   "hosts": ["unix://$SOCK"],
@@ -227,7 +229,7 @@ cat > "$ROOM_ETC/daemon.json" <<EOF
   "dns": $DNS_JSON,
   "registry-mirrors": $MIRRORS_JSON,
   "default-runtime": "runsc",
-  "runtimes": {"runsc": {"path": "$RUNSC", "runtimeArgs": $RUNSC_ARGS_JSON}},
+  "runtimes": $RUNTIMES_JSON,
   "log-driver": "json-file",
   "log-opts": {"max-size": "20m", "max-file": "2"}
 }

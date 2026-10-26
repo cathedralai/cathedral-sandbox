@@ -28,6 +28,9 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
   5. network policy: each create and network_set receipt that carries
      network_policy has network_policy_sha256 = sha256(canonical(policy)).
      The output has the policy timeline of each room, in chain order.
+  6. tunables: each create receipt that carries tunables has
+     tunables_sha256 = sha256(canonical(tunables)), the tunables document's
+     sha256. The output lists each room's tunables_sha256.
 
 Not checked here (by design, today): that the measurement is an approved image.
 Image approval is a signed policy release; that is a later step.
@@ -254,6 +257,20 @@ def verify_receipts(att: dict, receipts: list[dict], head: str | None = None) ->
             "actions": actions}
 
 
+def room_tunables(receipts: list[dict]) -> dict:
+    """Room id -> the tunables_sha256 its signed create receipt carries (rooms with tunables only)."""
+    out: dict[str, str] = {}
+    for rc in receipts:
+        st = rc["statement"]
+        if st.get("action") != "create" or "tunables" not in st:
+            continue
+        need(st.get("tunables_sha256") == sha(canonical(st["tunables"])),
+             f"receipt {st['sequence']}: tunables_sha256 does not match the tunables")
+        if st.get("sandbox_id"):
+            out[st["sandbox_id"]] = st["tunables_sha256"]
+    return out
+
+
 def policy_timeline(receipts: list[dict]) -> dict:
     """Room id -> the signed policy events of that room, in chain order.
 
@@ -361,7 +378,7 @@ def main() -> int:
                                                  a.ark_sha256, a.skip_amd)
         out = {"attestation": attestation_out,
                "chain": verify_receipts(att, receipts, head),
-               "policy_timeline": policy_timeline(receipts), "verdict": "PASS",
+               "policy_timeline": policy_timeline(receipts), "room_tunables": room_tunables(receipts), "verdict": "PASS",
                # head is named by the server, not signed: even a whole chain does
                # not prove that nothing was cut from its end.
                "checked": ("whole chain to the head the server named" if head is not None

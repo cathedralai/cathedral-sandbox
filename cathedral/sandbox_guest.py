@@ -319,6 +319,8 @@ class GuestRecord:
     # Owner of the room (sandbox_owner.owner_id). The egress proxy reads the
     # room's secrets under its hash (#304).
     owner: str | None = None
+    # Per-room tunables the room started under (room_tunables.room_view), or None.
+    tunables: dict[str, Any] | None = None
 
 
 # A room's exec output, process log and the API's own log record are capped
@@ -471,6 +473,24 @@ class DockerClient:
             raise SandboxOpError(
                 "docker_timeout", 504, f"docker timed out: {' '.join(argv[:4])}"
             ) from exc
+
+    def runtimes(self) -> dict[str, Any]:
+        """The daemon's registered OCI runtimes (``docker info``), {} when unreadable."""
+        result = self.run(["docker", "info", "--format", "{{json .Runtimes}}"], timeout=15.0)
+        if result.returncode != 0:
+            return {}
+        try:
+            doc = json.loads(result.stdout or "{}")
+        except ValueError:
+            return {}
+        return doc if isinstance(doc, dict) else {}
+
+    def prime_image(self, image: str) -> bool:
+        """Read the image's layers once, so a cold page cache does not slow the start (best effort)."""
+        try:
+            return self.run(["docker", "save", "--output", "/dev/null", image], timeout=300.0).returncode == 0
+        except SandboxOpError:
+            return False
 
     def info_ok(self) -> bool:
         try:
@@ -639,6 +659,8 @@ class DockerClient:
         resolv_conf: Path | None = None,
         attach: bool | None = None,
         mounts: Iterable[tuple[Path, str]] = (),
+        runtime: str | None = None,
+        run_args: Iterable[str] = (),
     ) -> str:
         work_dir.mkdir(parents=True, exist_ok=True)
         argv = [
@@ -668,6 +690,9 @@ class DockerClient:
             argv.extend(["--user", user])
         if use_kata:
             argv.extend(["--runtime", self.kata_runtime])
+        elif runtime:
+            # Per-room tunables: a runsc variant the provider checked against the daemon.
+            argv.extend(["--runtime", runtime])
         elif dind and self.dind.runtime:
             argv.extend(["--runtime", self.dind.runtime])
         elif self.guest_runtime:
@@ -687,6 +712,7 @@ class DockerClient:
         # Prefer storage quota when the local driver accepts it (overlay2+xfs usually).
         storage_opt = ["--storage-opt", f"size={disk_gib}G"] if disk_gib > 0 and not use_kata else []
         argv.extend(storage_opt)
+        argv.extend(run_args)
         # Without a hotel egress daemon, allowlist and deny_all fail closed to
         # network none. With one, the caller passes attach=True and the daemon
         # enforces the policy outside the guest.
@@ -1220,6 +1246,7 @@ class DockerGuestProvider:
                 runtime_label=runtime_label,
             )
         self._capabilities_dind = False
+        self._runtimes: dict[str, Any] | None = None  # daemon runtimes, read on the first tunables create
         if os.environ.get("CATHEDRAL_SANDBOX_SWEEP_STALE_BASES", "") == "1":
             _sweep_stale_bases(self._inner._base)  # noqa: SLF001
 
@@ -1230,6 +1257,26 @@ class DockerGuestProvider:
     @property
     def egress_client(self) -> EgressClient | None:
         return self._egress
+
+    @property
+    def applies_tunables(self) -> bool:
+        """Per-room tunables are runsc variants, so a Kata hotel cannot apply them."""
+        return not self._use_kata
+
+    def _room_runtime(self, tunables) -> tuple[str, list[str]]:
+        """The runsc variant for *tunables*, checked against the daemon's own runtimes."""
+        from cathedral.room_tunables import RoomTunablesError, check_runtime, runtime_name
+
+        name = runtime_name(tunables)
+        for fresh in (False, True):
+            if fresh or self._runtimes is None or name not in self._runtimes:
+                self._runtimes = self._client.runtimes()
+            try:
+                return name, check_runtime(self._runtimes, self._oci_runtime, tunables)
+            except RoomTunablesError as exc:
+                if fresh:
+                    raise SandboxOpError(exc.code, 409, str(exc)) from None
+        raise AssertionError("unreachable")
 
     def _owner_key(self, owner: str | None) -> str:
         return owner_hash(owner) if owner else ""
@@ -1419,6 +1466,8 @@ class DockerGuestProvider:
             "allowlist_fail_closed": fail_closed,
             "network_switchable": self._egress_manages(guest),
         }
+        if guest.tunables is not None:
+            enriched["tunables"] = dict(guest.tunables)
         if guest.workspace is not None:
             enriched["workspace"] = {"name": guest.workspace[1], "path": guest.workspace[2],
                                      "version_on_delete": guest.workspace[3]}
@@ -1516,6 +1565,7 @@ class DockerGuestProvider:
                 "digest": request.build.content_hash,
             }
         dind = is_dind_image(image)
+        room_tunables = self._tunables_for(request, image, dind)
         work = Path(self._inner._sandboxes[sandbox_id].root) / "work"  # noqa: SLF001
         name = f"cathedral-{sandbox_id}"
         entrypoint = None if dind else (tuple(request.entrypoint) if request.entrypoint else ("sleep", "infinity"))
@@ -1531,6 +1581,7 @@ class DockerGuestProvider:
                 request, sandbox_id=sandbox_id, image=image, name=name, work=work, dind=dind,
                 entrypoint=entrypoint, network=network, attach=attach,
                 mounts=[(workspace[4], workspace[2])] if workspace is not None else (),
+                tunables=room_tunables,
             )
         except BaseException:
             self._release_pending(sandbox_id)
@@ -1576,8 +1627,29 @@ class DockerGuestProvider:
             policy_sha256=applied["policy_sha256"] if applied else None,
             workspace=workspace[:4] if workspace is not None else None,
             owner=owner,
+            tunables=room_tunables[2] if room_tunables is not None else None,
         )
         return self._after_start(doc, sandbox_id, container_id, dind)
+
+    def _tunables_for(self, request: CreateSandboxRequest, image: str, dind: bool):
+        """(runtime, docker run args, room view) for a create with tunables, else None.
+
+        Everything here acts on this room only: its own runtime and log driver. The
+        image prime reads the room's image before this room starts."""
+        if request.tunables is None:
+            return None
+        from cathedral.room_tunables import docker_run_args, room_view
+
+        if self._use_kata:
+            raise SandboxOpError("tunables_unavailable", 409, "a Kata hotel does not apply per-room tunables")
+        if dind:
+            raise SandboxOpError("tunables_unsupported", 400, "a DinD room runs under the DinD runtime; tunables do not apply")
+        runtime, args = self._room_runtime(request.tunables)
+        prime = "none"
+        if request.tunables.prime_page_cache:
+            prime = "done" if self._client.prime_image(image) else "failed"
+        view = room_view(request.tunables, runtime=runtime, runtime_args=args, image_prime=prime)
+        return runtime, docker_run_args(request.tunables), view
 
     def _release_pending(self, sandbox_id: str) -> None:
         with self._doomed_lock:
@@ -1598,6 +1670,7 @@ class DockerGuestProvider:
         network: str | None,
         attach: bool | None = None,
         mounts: Iterable[tuple[Path, str]] = (),
+        tunables: tuple[str, list[str], dict[str, Any]] | None = None,
     ) -> str:
         resolv_conf = None
         if network and self._net_pool is not None and self._net_pool.dns:
@@ -1624,6 +1697,8 @@ class DockerGuestProvider:
             resolv_conf=resolv_conf,
             attach=attach,
             mounts=mounts,
+            runtime=tunables[0] if tunables is not None else None,
+            run_args=tunables[1] if tunables is not None else (),
         )
 
     def _after_start(self, doc: dict[str, Any], sandbox_id: str, container_id: str, dind: bool) -> dict[str, Any]:
@@ -2306,6 +2381,19 @@ class DockerGuestProvider:
         # The inner provider keeps the terminal's buffers; each complete line
         # runs through this provider's exec, in the room's container (B154).
         return self._inner.terminal_write(sandbox_id, terminal_id, data, executor=self.exec)
+
+    def get(self, sandbox_id: str) -> dict[str, Any]:
+        return self._with_tunables(self._inner.get(sandbox_id))
+
+    def wait(self, sandbox_id: str, timeout_seconds: int) -> dict[str, Any]:
+        return self._with_tunables(self._inner.wait(sandbox_id, timeout_seconds))
+
+    def _with_tunables(self, doc: dict[str, Any]) -> dict[str, Any]:
+        """The room's own tunables on a read, so a caller can check what the room runs."""
+        guest = self._guests.get(doc.get("id")) if isinstance(doc, dict) else None
+        if guest is not None and guest.tunables is not None:
+            doc = {**doc, "tunables": dict(guest.tunables)}
+        return doc
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
