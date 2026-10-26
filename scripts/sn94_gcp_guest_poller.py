@@ -51,7 +51,7 @@ VM_PUBLIC_IPS = {PRIMARY_NAME: PRIMARY_IP, SECONDARY_NAME: SECONDARY_IP}
 IMAGE_REPOSITORY = "ghcr.io/cathedralai/cathedral-sn39-audit-miner"
 ACTIVATION_IMAGE = (
     IMAGE_REPOSITORY
-    + "@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99"
+    + "@sha256:7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b"
 )
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 RUNTIME_CONTRACT = "signed-validator-fleet-v1"

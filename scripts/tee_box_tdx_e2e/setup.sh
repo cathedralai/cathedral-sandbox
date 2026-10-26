@@ -19,9 +19,10 @@
 set -euo pipefail
 umask 022
 
-RUNSC_VERSION=20260817.0
-RUNSC_SHA256=048b89aada69dc3333422e139d6e9d02f8ab06bda52398060e0fbdacca00074c
-RUNSC_URL="https://storage.googleapis.com/gvisor/releases/release/${RUNSC_VERSION}/x86_64/runsc"
+RUNSC_VERSION=20261005.0
+RUNSC_SHA256=210b437a9cfae51e8f8c9074ed19b8b5e59477178e2e391a18117d8d6b924f7a
+GVISOR_TARBALL_SHA512=79869ae9a589355a46d46fdac068d9a954e741741ffe77c64e38c56ea955498c1cb04e9bce44e1cce5155333e6b76bee72347c6661bb7c78fd2fe3aad198c8fe
+GVISOR_URL="https://storage.googleapis.com/gvisor/releases/release/${RUNSC_VERSION}/x86_64/gvisor.tar.bz2"
 RUNSC_PATH=/usr/local/bin/runsc
 DAEMON_JSON=${DAEMON_JSON:-/etc/docker/daemon.json}
 STATE_DIR=${STATE_DIR:-/run/cathedral-tee-box}
@@ -130,17 +131,22 @@ install_runsc() {
     return
   fi
   local tmp
-  tmp=$(mktemp /tmp/runsc.XXXXXX)
-  if [ -f "$HERE/bin/runsc" ]; then
-    cp "$HERE/bin/runsc" "$tmp"
+  tmp=$(mktemp -d /tmp/gvisor.XXXXXX)
+  if [ -f "$HERE/bin/gvisor.tar.bz2" ]; then
+    cp "$HERE/bin/gvisor.tar.bz2" "$tmp/gvisor.tar.bz2"
   else
-    log "downloading runsc $RUNSC_VERSION"
-    curl --fail --silent --show-error --location --proto '=https' --retry 3 -o "$tmp" "$RUNSC_URL"
+    log "downloading gvisor $RUNSC_VERSION"
+    curl --fail --silent --show-error --location --proto '=https' --retry 3 -o "$tmp/gvisor.tar.bz2" "$GVISOR_URL"
   fi
-  echo "$RUNSC_SHA256  $tmp" | sha256sum --check --status - \
-    || { rm -f "$tmp"; die "runsc sha256 mismatch"; }
-  install -o root -g root -m 0755 "$tmp" "$RUNSC_PATH"
-  rm -f "$tmp"
+  echo "$GVISOR_TARBALL_SHA512  $tmp/gvisor.tar.bz2" | sha512sum --check --status - \
+    || { rm -rf "$tmp"; die "gvisor tarball sha512 mismatch"; }
+  tar -xjf "$tmp/gvisor.tar.bz2" -C "$tmp" --no-same-owner runsc gvisor-bin
+  echo "$RUNSC_SHA256  $tmp/runsc" | sha256sum --check --status - \
+    || { rm -rf "$tmp"; die "runsc sha256 mismatch"; }
+  install -o root -g root -m 0755 "$tmp/runsc" "$RUNSC_PATH"
+  install -d -o root -g root -m 0755 "$(dirname "$RUNSC_PATH")/gvisor-bin"
+  install -o root -g root -m 0755 "$tmp"/gvisor-bin/* "$(dirname "$RUNSC_PATH")/gvisor-bin/"
+  rm -rf "$tmp"
   log "runsc installed at $RUNSC_PATH (sha256 $RUNSC_SHA256)"
 }
 

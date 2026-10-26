@@ -101,6 +101,8 @@ jobs:
           pull: true
           push: true
           tags: ${{ steps.image.outputs.tag_ref }}
+          build-args: |
+            CATHEDRAL_IMAGE_CHAIN=finney-94
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
@@ -124,6 +126,62 @@ jobs:
           subject-name: ${{ env.IMAGE_PATH }}
           subject-digest: ${{ steps.pin.outputs.digest }}
           push-to-registry: true
+
+      # The same commit also publishes the public-testnet (subnet 584) image under its own
+      # immutable tag. Miners pin by digest, so this moves no mainnet miner.
+      - name: Refuse to overwrite the testnet commit tag
+        id: image_test
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_ref="${IMAGE_PATH}:sha-${GITHUB_SHA}-test584"
+          set +e
+          inspection="$(docker buildx imagetools inspect "$tag_ref" 2>&1)"
+          inspection_status=$?
+          set -e
+          if [[ $inspection_status -eq 0 ]]; then
+            echo "::error::Immutable image tag already exists: $tag_ref"
+            exit 1
+          fi
+          if ! grep -Eiq 'manifest unknown|not found' <<< "$inspection"; then
+            echo "::error::Could not prove the immutable image tag is unused"
+            printf '%s\n' "$inspection"
+            exit 1
+          fi
+          echo "tag_ref=${tag_ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish the testnet 584 image
+        id: build_test
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile.sn94-snp-miner
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: ${{ steps.image_test.outputs.tag_ref }}
+          build-args: |
+            CATHEDRAL_IMAGE_CHAIN=test-584
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          provenance: mode=max
+
+      - name: Attest the testnet digest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_PATH }}
+          subject-digest: ${{ steps.build_test.outputs.digest }}
+          push-to-registry: true
+
+      - name: Record the testnet launch pin
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build_test.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "Testnet 584 image: ${IMAGE_PATH}@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Log out of GHCR
         if: always()

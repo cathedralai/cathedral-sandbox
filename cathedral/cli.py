@@ -55,12 +55,35 @@ from cathedral.coldkey_allowlist import (
     verify_allowlist,
 )
 from cathedral.common import ChannelBinding, ChannelBindingType, Policy, Tier
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from cathedral.affine_claim import (
+    MAX_AFFINE_CLAIM_BYTES,
+    MAX_AFFINE_CLAIM_TRUSTED_KEYS_BYTES,
+    AffineClaimError,
+    parse_affine_claim_trusted_keys_json,
+    verify_affine_claim,
+)
+from cathedral.affine_claim_cvm import (
+    cvm_instance_from_running_document,
+    issue_affine_claim_from_cvm,
+)
+from cathedral.affine_validator import (
+    ValidatorAction,
+    decision_to_json,
+    validate_affine_submission,
+)
 from cathedral.customer_receipt import (
     MAX_CUSTOMER_RECEIPT_BYTES,
     MAX_CUSTOMER_RECEIPT_TRUSTED_KEYS_BYTES,
     CustomerReceiptError,
     parse_customer_receipt_trusted_keys_json,
     verify_customer_receipt,
+)
+from cathedral.product_run_receipt import (
+    ProductRunReceiptError,
+    issue_product_run_receipt,
+    verify_product_run_receipt,
 )
 from cathedral.enroll import (
     DEFAULT_ENROLL_NETUID,
@@ -851,6 +874,201 @@ def cmd_receipt_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_bounded_affine_claim_file(
+    path: str,
+    label: str,
+    *,
+    maximum_bytes: int,
+    category: str,
+) -> bytes:
+    try:
+        with Path(path).open("rb") as handle:
+            data = handle.read(maximum_bytes + 1)
+    except OSError as exc:
+        raise AffineClaimError(category, f"unable to load {label}") from exc
+    if len(data) > maximum_bytes:
+        raise AffineClaimError(category, f"{label} exceeds the maximum encoded size")
+    return data
+
+
+def cmd_affine_claim_verify(args: argparse.Namespace) -> int:
+    try:
+        claim_bytes = _read_bounded_affine_claim_file(
+            args.claim,
+            "affine claim",
+            maximum_bytes=MAX_AFFINE_CLAIM_BYTES,
+            category="schema",
+        )
+        trusted_keys = parse_affine_claim_trusted_keys_json(
+            _read_bounded_affine_claim_file(
+                args.trusted_keys,
+                "affine claim trusted keys",
+                maximum_bytes=MAX_AFFINE_CLAIM_TRUSTED_KEYS_BYTES,
+                category="key",
+            )
+        )
+        verified = verify_affine_claim(
+            claim_bytes,
+            trusted_keys,
+            max_age_seconds=args.max_age_seconds,
+        )
+    except AffineClaimError as exc:
+        print(
+            json.dumps(
+                {"valid": False, "category": exc.category, "error": str(exc)},
+                sort_keys=True,
+            )
+        )
+        return 1
+    print(
+        json.dumps(
+            {
+                "valid": True,
+                "schema": verified.document["schema"],
+                "claim_id": verified.claim_id,
+                "claim_digest": verified.claim_digest,
+                "issued_at": verified.document["issued_at"],
+                "signing_key_id": verified.document["signing_key_id"],
+                "policy_digest": verified.document["policy_digest"],
+                "verify_outcome": verified.document["verify_outcome"],
+                "attestation_class": verified.document["attestation_class"],
+                "skip_rerun_authorized": verified.skip_rerun_authorized,
+                "affline_sandbox_tee_claimed": verified.document[
+                    "affline_sandbox_tee_claimed"
+                ],
+                "verification_scope": "cathedral_affine_claim_binding",
+                "evidence_independently_verified": verified.document[
+                    "attestation_independently_verified"
+                ],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_affine_claim_validate(args: argparse.Namespace) -> int:
+    try:
+        claim_bytes = _read_bounded_affine_claim_file(
+            args.claim,
+            "affine claim",
+            maximum_bytes=MAX_AFFINE_CLAIM_BYTES,
+            category="schema",
+        )
+        trusted_keys = parse_affine_claim_trusted_keys_json(
+            _read_bounded_affine_claim_file(
+                args.trusted_keys,
+                "affine claim trusted keys",
+                maximum_bytes=MAX_AFFINE_CLAIM_TRUSTED_KEYS_BYTES,
+                category="key",
+            )
+        )
+        verify_result = (
+            Path(args.verify_result).read_bytes() if args.verify_result else None
+        )
+        decision = validate_affine_submission(
+            claim_bytes=claim_bytes,
+            trusted_keys=trusted_keys,
+            verify_code=Path(args.verify_code).read_bytes(),
+            verify_inputs=Path(args.verify_inputs).read_bytes(),
+            miner_payload=Path(args.miner_payload).read_bytes(),
+            verify_result=verify_result,
+            force_full_rerun=bool(args.force_full_rerun),
+            spot_check=bool(args.spot_check),
+            is_king=bool(args.king),
+            is_dispute=bool(args.dispute),
+            max_age_seconds=args.max_age_seconds,
+        )
+    except (AffineClaimError, OSError, ValueError) as exc:
+        category = getattr(exc, "category", "schema")
+        print(
+            json.dumps(
+                {"action": "reject", "category": category, "error": str(exc)},
+                sort_keys=True,
+            )
+        )
+        return 1
+    print(json.dumps(decision_to_json(decision), sort_keys=True))
+    if decision.action == ValidatorAction.REJECT:
+        return 1
+    return 0
+
+
+def cmd_affine_claim_issue_from_cvm(args: argparse.Namespace) -> int:
+    """Issue an affine claim bound to a running CVM document (not Affline)."""
+
+    try:
+        cvm_raw = _read_bounded_affine_claim_file(
+            args.cvm_document,
+            "CVM document",
+            maximum_bytes=MAX_AFFINE_CLAIM_BYTES,
+            category="schema",
+        )
+        cvm_doc = json.loads(cvm_raw.decode("utf-8"))
+        if not isinstance(cvm_doc, dict):
+            raise AffineClaimError("schema", "CVM document must be a JSON object")
+        cvm = cvm_instance_from_running_document(cvm_doc)
+        key_bytes = Path(args.signing_key_file).read_bytes()
+        if len(key_bytes) != 32:
+            raise AffineClaimError(
+                "key",
+                "signing key file must be exactly 32 raw ed25519 seed bytes",
+            )
+        private_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
+        verify_result = None
+        if args.verify_result:
+            verify_result = Path(args.verify_result).read_bytes()
+        claim = issue_affine_claim_from_cvm(
+            cvm=cvm,
+            private_key=private_key,
+            signing_key_id=args.signing_key_id,
+            verify_code=Path(args.verify_code).read_bytes(),
+            verify_inputs=Path(args.verify_inputs).read_bytes(),
+            miner_payload=Path(args.miner_payload).read_bytes(),
+            verify_result=verify_result,
+            allow_reference=not args.require_hardware,
+        )
+        Path(args.out).write_bytes(claim)
+        body = json.loads(claim.decode("ascii"))
+        skip_authorized = (
+            body["attestation_class"] == "confidential_cpu"
+            and body["attestation_independently_verified"] is True
+            and body["verify_outcome"] == "passed"
+            and body["skip_rerun_eligible"] is True
+        )
+        print(
+            json.dumps(
+                {
+                    "issued": True,
+                    "out": args.out,
+                    "attestation_class": body["attestation_class"],
+                    "verify_outcome": body["verify_outcome"],
+                    "skip_rerun_eligible": body["skip_rerun_eligible"],
+                    "skip_rerun_authorized": skip_authorized,
+                    "claim_id": body["claim_id"],
+                },
+                sort_keys=True,
+            )
+        )
+    except AffineClaimError as exc:
+        print(
+            json.dumps(
+                {"issued": False, "category": exc.category, "error": str(exc)},
+                sort_keys=True,
+            )
+        )
+        return 1
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(
+            json.dumps(
+                {"issued": False, "category": "schema", "error": str(exc)},
+                sort_keys=True,
+            )
+        )
+        return 1
+    return 0
+
+
 def cmd_customer_receipt_verify(args: argparse.Namespace) -> int:
     try:
         receipt_bytes = _read_bounded_customer_receipt_file(
@@ -894,6 +1112,98 @@ def cmd_customer_receipt_verify(args: argparse.Namespace) -> int:
                 "profile_id": verified.document["profile_id"],
                 "verification_scope": "cathedral_signed_assertions",
                 "evidence_independently_verified": False,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_product_run_receipt_issue(args: argparse.Namespace) -> int:
+    try:
+        seed = Path(args.signing_key_file).read_bytes()
+        if len(seed) == 32:
+            private = Ed25519PrivateKey.from_private_bytes(seed)
+        else:
+            raise ProductRunReceiptError("key", "signing key file must be 32 raw Ed25519 seed bytes")
+        request_bytes = Path(args.request).read_bytes() if args.request else b""
+        result_bytes = Path(args.result).read_bytes() if args.result else b""
+        if not args.execution or not args.evidence:
+            raise ProductRunReceiptError(
+                "schema",
+                "product-run-receipt issue requires --execution and --evidence JSON files",
+            )
+        execution = json.loads(Path(args.execution).read_text(encoding="utf-8"))
+        evidence = json.loads(Path(args.evidence).read_text(encoding="utf-8"))
+        if not isinstance(execution, dict) or not isinstance(evidence, dict):
+            raise ProductRunReceiptError("schema", "execution and evidence must be JSON objects")
+        raw = issue_product_run_receipt(
+            product=args.product,
+            surface=args.surface,
+            run_id=args.run_id,
+            request_bytes=request_bytes,
+            result_bytes=result_bytes,
+            outcome=args.outcome,
+            private_key=private,
+            signing_key_id=args.signing_key_id,
+            note=args.note or "",
+            execution=execution,
+            evidence=evidence,
+        )
+    except (OSError, ProductRunReceiptError, ValueError, json.JSONDecodeError) as exc:
+        category = getattr(exc, "category", "error")
+        print(json.dumps({"ok": False, "category": category, "error": str(exc)}, sort_keys=True))
+        return 1
+    Path(args.out).write_bytes(raw)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "schema": "cathedral_product_run_receipt_v1",
+                "out": args.out,
+                "tee_claimed": False,
+                "product": args.product,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_product_run_receipt_verify(args: argparse.Namespace) -> int:
+    try:
+        receipt_bytes = Path(args.receipt).read_bytes()
+        trusted_keys = Path(args.trusted_keys).read_bytes()
+        verified = verify_product_run_receipt(
+            receipt_bytes,
+            trusted_keys=trusted_keys,
+            max_age_seconds=args.max_age_seconds,
+        )
+    except (OSError, ProductRunReceiptError) as exc:
+        category = getattr(exc, "category", "error")
+        print(
+            json.dumps(
+                {"valid": False, "category": category, "error": str(exc)},
+                sort_keys=True,
+            )
+        )
+        return 1
+    print(
+        json.dumps(
+            {
+                "valid": True,
+                "schema": verified.document["schema"],
+                "receipt_id": verified.receipt_id,
+                "product": verified.product,
+                "surface": verified.surface,
+                "outcome": verified.outcome,
+                "tee_claimed": False,
+                "attestation_class": "none",
+                "execution_kind": verified.document["execution"]["kind"],
+                "validator_view": dict(verified.validator_view),
+                "verification_scope": "cathedral_signed_host_trusted_run",
+                "evidence_independently_verified": False,
+                "intel_tdx_asserted": False,
             },
             sort_keys=True,
         )
@@ -1399,6 +1709,55 @@ def _same_file(first: str, second: str) -> bool:
         return os.path.samefile(first, second)
     except OSError:
         return os.path.realpath(first) == os.path.realpath(second)
+
+
+def cmd_sandbox_serve(args: argparse.Namespace) -> int:
+    """Serve the Cathedral compute sandbox API (§§3.1-3.16) over HTTP.
+
+    This is the tenant-facing control-plane surface (Bearer project keys, sandboxes,
+    exec, snapshots/forks, quota, usage).  It is distinct from ``worker serve``,
+    which is the SN94 attestation/SAT path.  Keys and quotas come from the operator
+    environment (see :func:`cathedral.sandbox_runtime.build_sandbox_provider`);
+    ``--allow-insecure-dev`` runs the permissive reference provider on loopback.
+    ``--runtime docker`` requires a live Docker daemon; ``--runtime kata``
+    requires Docker plus a registered kata-runtime (fails closed otherwise).
+    """
+    from cathedral.sandbox_runtime import build_sandbox_provider, capabilities_document
+    from cathedral.sandbox_server import SandboxApplication, install_stop_signal, reaper_interval_from_env, run
+
+    provider = build_sandbox_provider(
+        runtime=getattr(args, "runtime", None),
+        allow_insecure_dev=bool(args.allow_insecure_dev),
+    )
+    app = SandboxApplication(provider, require_auth=True)
+    reaper_seconds = getattr(args, "reaper_interval", None)
+    if reaper_seconds is None:
+        reaper_seconds = reaper_interval_from_env()
+    app.start_reaper(reaper_seconds)
+    httpd, (host, port) = run(app, host=args.host, port=args.port)
+    print(
+        json.dumps(
+            {
+                "status": "serving",
+                "surface": "sandbox",
+                "host": host,
+                "port": port,
+                "capabilities": dict(capabilities_document(provider)),
+            }
+        ),
+        flush=True,
+    )
+    install_stop_signal()  # SIGTERM (a systemd restart) cleans up like Ctrl-C
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        app.stop_reaper()
+        httpd.shutdown()
+        httpd.server_close()
+        provider.close()
+    return 0
 
 
 def cmd_worker_serve(args: argparse.Namespace) -> int:
@@ -4800,6 +5159,118 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_customer_receipt_verify.set_defaults(func=cmd_customer_receipt_verify)
 
+    p_product_run = sub.add_parser(
+        "product-run-receipt",
+        help="issue/verify host-trusted product run receipts (not sealed TDX customer receipts)",
+    )
+    product_run_sub = p_product_run.add_subparsers(dest="product_run_command", required=True)
+    p_product_run_issue = product_run_sub.add_parser(
+        "issue",
+        help="issue cathedral_product_run_receipt_v1 with tee_claimed=false",
+    )
+    p_product_run_issue.add_argument(
+        "--product",
+        required=True,
+        choices=["affline", "ditto", "reliquary", "agent", "cvm"],
+    )
+    p_product_run_issue.add_argument(
+        "--surface",
+        required=True,
+        choices=["v1_sandboxes", "v1_workers", "cvm_lifecycle", "offline_pack"],
+    )
+    p_product_run_issue.add_argument("--run-id", required=True)
+    p_product_run_issue.add_argument("--request", help="path to request bytes to hash")
+    p_product_run_issue.add_argument("--result", help="path to result bytes to hash")
+    p_product_run_issue.add_argument(
+        "--execution",
+        required=True,
+        help="path to product-specific execution JSON (validator-shaped)",
+    )
+    p_product_run_issue.add_argument(
+        "--evidence",
+        required=True,
+        help="path to product-specific evidence JSON (host_trusted; skip_rerun false)",
+    )
+    p_product_run_issue.add_argument(
+        "--outcome",
+        required=True,
+        choices=["succeeded", "failed"],
+    )
+    p_product_run_issue.add_argument("--signing-key-file", required=True)
+    p_product_run_issue.add_argument("--signing-key-id", required=True)
+    p_product_run_issue.add_argument("--note", default="")
+    p_product_run_issue.add_argument("--out", required=True)
+    p_product_run_issue.set_defaults(func=cmd_product_run_receipt_issue)
+
+    p_product_run_verify = product_run_sub.add_parser(
+        "verify",
+        help="verify cathedral_product_run_receipt_v1 (rejects tee_claimed=true)",
+    )
+    p_product_run_verify.add_argument("--receipt", required=True)
+    p_product_run_verify.add_argument("--trusted-keys", required=True)
+    p_product_run_verify.add_argument("--max-age-seconds", type=int)
+    p_product_run_verify.set_defaults(func=cmd_product_run_receipt_verify)
+
+    p_affine_claim = sub.add_parser(
+        "affine-claim",
+        help="verify Affine claim bindings (validator load-off; not Affline TEE)",
+    )
+    affine_claim_sub = p_affine_claim.add_subparsers(
+        dest="affine_claim_command",
+        required=True,
+    )
+    p_affine_claim_verify = affine_claim_sub.add_parser(
+        "verify",
+        help="verify exact signed cathedral_affine_claim_v1 bytes",
+    )
+    p_affine_claim_verify.add_argument("--claim", required=True)
+    p_affine_claim_verify.add_argument("--trusted-keys", required=True)
+    p_affine_claim_verify.add_argument(
+        "--max-age-seconds",
+        type=int,
+        help="reject a valid signed claim older than this many seconds",
+    )
+    p_affine_claim_verify.set_defaults(func=cmd_affine_claim_verify)
+
+    p_affine_claim_issue = affine_claim_sub.add_parser(
+        "issue-from-cvm",
+        help="issue a claim from a running CVM document after Affine verify bytes",
+    )
+    p_affine_claim_issue.add_argument("--cvm-document", required=True)
+    p_affine_claim_issue.add_argument("--verify-code", required=True)
+    p_affine_claim_issue.add_argument("--verify-inputs", required=True)
+    p_affine_claim_issue.add_argument("--miner-payload", required=True)
+    p_affine_claim_issue.add_argument(
+        "--verify-result",
+        help="canonical Affine verify result JSON bytes; default: tiny built-in check",
+    )
+    p_affine_claim_issue.add_argument("--signing-key-file", required=True)
+    p_affine_claim_issue.add_argument("--signing-key-id", required=True)
+    p_affine_claim_issue.add_argument("--out", required=True)
+    p_affine_claim_issue.add_argument(
+        "--require-hardware",
+        action="store_true",
+        help="refuse reference CVM evidence (production skip-rerun path)",
+    )
+    p_affine_claim_issue.set_defaults(func=cmd_affine_claim_issue_from_cvm)
+
+    p_affine_claim_validate = affine_claim_sub.add_parser(
+        "validate",
+        help="validator stub: verify claim first, full re-run only when required",
+    )
+    p_affine_claim_validate.add_argument("--claim", required=True)
+    p_affine_claim_validate.add_argument("--trusted-keys", required=True)
+    p_affine_claim_validate.add_argument("--verify-code", required=True)
+    p_affine_claim_validate.add_argument("--verify-inputs", required=True)
+    p_affine_claim_validate.add_argument("--miner-payload", required=True)
+    p_affine_claim_validate.add_argument("--verify-result")
+    p_affine_claim_validate.add_argument("--max-age-seconds", type=int)
+    p_affine_claim_validate.add_argument("--king", action="store_true")
+    p_affine_claim_validate.add_argument("--dispute", action="store_true")
+    p_affine_claim_validate.add_argument("--spot-check", action="store_true")
+    p_affine_claim_validate.add_argument("--force-full-rerun", action="store_true")
+    p_affine_claim_validate.set_defaults(func=cmd_affine_claim_validate)
+
     p_lifecycle = sub.add_parser(
         "lifecycle",
         help="retained central-registry lifecycle; not current SN94 mining",
@@ -5537,6 +6008,49 @@ def build_parser() -> argparse.ArgumentParser:
     p_controlled.add_argument("--retention-dir", required=True)
     p_controlled.add_argument("--out-dir", required=True)
     p_controlled.set_defaults(func=cmd_runtime_export_controlled)
+
+    p_sandbox = sub.add_parser(
+        "sandbox",
+        help="serve the tenant-facing compute sandbox control-plane API (§3)",
+        description=(
+            "The OpenAI-style sandbox HTTP surface used by Harbor and verifiers: "
+            "sandboxes, exec, files, snapshots/forks, quota and usage. This is the "
+            "control-plane reference server, distinct from the SN94 attestation "
+            "worker path. Project Bearer keys and quotas are read from the "
+            "CATHEDRAL_SANDBOX_* / CATHEDRAL_KEY_QUOTAS environment."
+        ),
+    )
+    sandbox_sub = p_sandbox.add_subparsers(dest="sandbox_command", required=True)
+    p_sandbox_serve = sandbox_sub.add_parser(
+        "serve", help="serve the sandbox API over HTTP"
+    )
+    p_sandbox_serve.add_argument("--host", default="127.0.0.1")
+    p_sandbox_serve.add_argument("--port", type=int, default=8080)
+    p_sandbox_serve.add_argument(
+        "--allow-insecure-dev",
+        action="store_true",
+        help="run the permissive reference provider without configured keys (loopback only)",
+    )
+    p_sandbox_serve.add_argument(
+        "--runtime",
+        choices=["memory", "docker", "kata"],
+        default=None,
+        help=(
+            "sandbox guest runtime (default: CATHEDRAL_SANDBOX_RUNTIME; required). "
+            "docker = Linux containers; kata = Kata micro-VMs (customer production). "
+            "memory requires --allow-insecure-dev or CATHEDRAL_ALLOW_MEMORY_RUNTIME=1"
+        ),
+    )
+    p_sandbox_serve.add_argument(
+        "--reaper-interval",
+        type=float,
+        default=None,
+        help=(
+            "seconds between background GC passes (default: "
+            "CATHEDRAL_SANDBOX_REAPER_SECONDS or 30; 0 turns the reaper off)"
+        ),
+    )
+    p_sandbox_serve.set_defaults(func=cmd_sandbox_serve)
 
     return parser
 

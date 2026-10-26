@@ -1,0 +1,11 @@
+{
+  "listen": "127.0.0.1:18100",
+  "hotels": [
+    {"id": "hotel-a", "name": "Hotel A", "threads": 256, "ram_gib": 1000, "api": "http://127.0.0.1:28090", "health": "http://127.0.0.1:28091", "key_file": "/etc/thin-broker/hotel-a.key", "concurrency": 16, "sealed": true},
+    {"id": "hotel-b", "name": "Hotel B", "threads": 32, "ram_gib": 64, "api": "http://127.0.0.1:18090", "health": "http://127.0.0.1:18091", "key_file": "/etc/thin-broker/hotel-b.key", "concurrency": 8}
+  ],
+  "guests": [
+    {"id": "GUEST_ID", "key_sha256": "<sha256 hex of the guest API key>", "view_token_sha256": "<sha256 hex of the view token>",
+     "max_rooms": 1000, "max_creates_per_minute": 600, "default_sealed": true, "hotels": ["hotel-a", "hotel-b"]}
+  ]
+}

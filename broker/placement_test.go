@@ -1,0 +1,196 @@
+package main
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+)
+
+func setHotel(tc *testChain, id string, fn func(h *hotel)) {
+	tc.b.mu.Lock()
+	defer tc.b.mu.Unlock()
+	fn(tc.b.hotelByID(id))
+}
+
+func TestQueuedCreateMovesToAnotherHotelAfterTheWaitLimit(t *testing.T) {
+	tc := newChain(t)
+	tc.b.cfg.MaxQueueWaitSeconds = 0.3
+	tc.hotels["a"].createDelay = 1500 * time.Millisecond
+	setHotel(tc, "a", func(h *hotel) { h.sem = make(chan struct{}, 1) }) // one create at a time
+	setHotel(tc, "b", func(h *hotel) { h.ok = false })
+	setHotel(tc, "c", func(h *hotel) { h.ok = false })
+	start := time.Now()
+	var status int
+	var doc map[string]any
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "count": 4})
+	}()
+	time.Sleep(100 * time.Millisecond) // all 4 are queued at a; now b can take rooms
+	setHotel(tc, "b", func(h *hotel) { h.ok = true })
+	wg.Wait()
+	took := time.Since(start)
+	if status != 202 || doc["count"].(float64) != 4 {
+		t.Fatalf("create: %d %v", status, doc)
+	}
+	on := createsOn(tc)
+	if on["b"] < 2 || on["a"]+on["b"] != 4 {
+		t.Fatalf("creates did not move: %v", on)
+	}
+	// One at a time at a would take 6 s.
+	if took > 4*time.Second {
+		t.Fatalf("took %v", took)
+	}
+	var moved int
+	setHotel(tc, "a", func(h *hotel) { moved = h.moved })
+	if moved < 2 {
+		t.Fatalf("moved %d", moved)
+	}
+}
+
+func TestQueuedCreateStaysWhenNoOtherHotelIsEligible(t *testing.T) {
+	tc := newChain(t)
+	tc.b.cfg.MaxQueueWaitSeconds = 0.1
+	tc.hotels["a"].createDelay = 300 * time.Millisecond
+	setHotel(tc, "a", func(h *hotel) { h.sem = make(chan struct{}, 1) })
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "count": 3, "hotels": []string{"a"}})
+	if status != 202 || doc["count"].(float64) != 3 {
+		t.Fatalf("create: %d %v", status, doc)
+	}
+	if on := createsOn(tc); on["a"] != 3 || on["b"]+on["c"] != 0 {
+		t.Fatalf("creates left the chosen hotel: %v", on)
+	}
+}
+
+func share(tc *testChain, n int) map[string]int {
+	out := map[string]int{}
+	tc.b.mu.Lock()
+	defer tc.b.mu.Unlock()
+	for i := 0; i < n; i++ {
+		if h := tc.b.pick(nil, placement{}); h != nil {
+			out[h.cfg.ID]++
+		}
+	}
+	return out
+}
+
+func TestWeightFollowsCPUHeadroomCreateTimeAndQueue(t *testing.T) {
+	tc := newChain(t)
+	setHotel(tc, "c", func(h *hotel) { h.ok = false })
+
+	// Same free rooms; a at 99% CPU, b at 10%.
+	setHotel(tc, "a", func(h *hotel) { h.cpuPct = 99 })
+	setHotel(tc, "b", func(h *hotel) { h.cpuPct = 10 })
+	if s := share(tc, 4000); s["b"] < 3600 {
+		t.Fatalf("cpu: %v", s)
+	}
+
+	// Same CPU; a creates in 5 s, b in 0.5 s. b's weight is 10x a's, so b
+	// expects 10/11 of 4000 = 3636 picks, standard deviation about 18. A floor
+	// of 3600 sat two deviations below: it failed 14 of 400 local runs and once
+	// on CI (2026-10-23, b 3597). 3500 is more than seven deviations below.
+	setHotel(tc, "a", func(h *hotel) { h.cpuPct, h.createEWMA = 20, 5 })
+	setHotel(tc, "b", func(h *hotel) { h.cpuPct, h.createEWMA = 20, 0.5 })
+	if s := share(tc, 4000); s["b"] < 3500 {
+		t.Fatalf("create time: %v", s)
+	}
+
+	// Same CPU and create time; a has a long queue. More free rooms at a do not win.
+	setHotel(tc, "a", func(h *hotel) { h.createEWMA, h.queued, h.slots = 1, 60, 200 })
+	setHotel(tc, "b", func(h *hotel) { h.createEWMA, h.queued, h.slots = 1, 0, 50 })
+	// a: 140 free, 15 s expected wait; b: 50 free, no wait. b gets about 85%.
+	if s := share(tc, 4000); s["b"] < 3200 {
+		t.Fatalf("queue: %v", s)
+	}
+
+	// No data yet: weight is free rooms, as before.
+	setHotel(tc, "a", func(h *hotel) { h.cpuPct, h.createEWMA, h.queued, h.slots = 0, 0, 0, 100 })
+	setHotel(tc, "b", func(h *hotel) { h.cpuPct, h.createEWMA, h.queued, h.slots = 0, 0, 0, 100 })
+	if s := share(tc, 4000); s["a"] < 1700 || s["b"] < 1700 {
+		t.Fatalf("even: %v", s)
+	}
+}
+
+func TestCreateTimeAverage(t *testing.T) {
+	h := &hotel{}
+	h.noteCreate(2 * time.Second)
+	if h.createEWMA != 2 {
+		t.Fatalf("first: %v", h.createEWMA)
+	}
+	h.noteCreate(0)
+	if h.createEWMA < 1.59 || h.createEWMA > 1.61 {
+		t.Fatalf("second: %v", h.createEWMA)
+	}
+}
+
+// Run 5 rerun: creates that had left one hotel never went back to it, so a
+// queue of 300 stayed on a full hotel while the hotel they had left was idle.
+func TestQueuedCreateCanGoBackToAHotelItLeft(t *testing.T) {
+	tc := newChain(t)
+	tc.b.cfg.MaxQueueWaitSeconds = 0.2
+	a, bh := tc.b.hotelByID("a"), tc.b.hotelByID("b")
+	setHotel(tc, "c", func(h *hotel) { h.ok = false })
+	setHotel(tc, "b", func(h *hotel) {
+		h.sem = make(chan struct{}, 1)
+		h.sem <- struct{}{} // b's only slot is busy for the whole test
+		h.creating = 1
+		h.createEWMA = 30
+	})
+	g := tc.b.guests["g1"]
+	tc.b.mu.Lock()
+	bh.queued++
+	g.queued++
+	tc.b.mu.Unlock()
+	tried := map[*hotel]bool{a: true, bh: true} // it came from a earlier
+	done := make(chan *hotel, 1)
+	go func() { done <- tc.b.waitSlot(context.Background(), g, bh, placement{}, tried) }()
+	select {
+	case got := <-done:
+		if got != a {
+			t.Fatalf("moved to %v", got)
+		}
+		<-a.sem
+	case <-time.After(3 * time.Second):
+		t.Fatalf("the create stayed at the busy hotel")
+	}
+}
+
+func TestQueuedCreateDoesNotMoveForASmallGain(t *testing.T) {
+	tc := newChain(t)
+	tc.b.cfg.MaxQueueWaitSeconds = 0.1
+	setHotel(tc, "c", func(h *hotel) { h.ok = false })
+	a, bh := tc.b.hotelByID("a"), tc.b.hotelByID("b")
+	setHotel(tc, "a", func(h *hotel) {
+		h.sem = make(chan struct{}, 1)
+		h.sem <- struct{}{}
+		h.creating = 1
+		h.createEWMA = 1
+		h.queued = 3
+	})
+	setHotel(tc, "b", func(h *hotel) {
+		h.sem = make(chan struct{}, 1)
+		h.sem <- struct{}{}
+		h.creating = 1
+		h.createEWMA = 1
+		h.queued = 3
+	})
+	g := tc.b.guests["g1"]
+	tc.b.mu.Lock()
+	bh.queued++
+	g.queued++
+	tc.b.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	if got := tc.b.waitSlot(ctx, g, bh, placement{}, map[*hotel]bool{}); got != nil {
+		t.Fatalf("got a slot at %v", got.cfg.ID)
+	}
+	var moved int
+	setHotel(tc, "b", func(h *hotel) { moved = h.moved })
+	if moved != 0 {
+		t.Fatalf("moved %d times between equal hotels", moved)
+	}
+	_ = a
+}

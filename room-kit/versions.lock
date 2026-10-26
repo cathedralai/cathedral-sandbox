@@ -1,0 +1,24 @@
+# Pinned inputs. install.sh refuses any download whose checksum differs.
+GVISOR_RELEASE=20260928.0
+GVISOR_URL=https://storage.googleapis.com/gvisor/releases/release/20260928.0/x86_64/gvisor.tar.bz2
+GVISOR_SHA512=c8d3a9fd4d4c4f5b8ff213caa4517356be128d18659ec4cde37828fe797f61a9725a602a846c81a8ed19c057a996515d31c081eba343ed4613a89951ba32ed59
+UV_VERSION=0.12.24
+UV_URL=https://github.com/astral-sh/uv/releases/download/0.12.24/uv-x86_64-unknown-linux-gnu.tar.gz
+UV_SHA256=b4dfaef47d491a7296981f8374a4595f55dbf84e8937c8ecd2983574d8bb3da6
+PYTHON_VERSION=3.12
+CADDY_VERSION=2.11.4
+CADDY_URL=https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_amd64.tar.gz
+CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777ccc8fd0b6e6f2486ce3a33fe389fbb7db12d05baa474f4587509fb4f5ebf1c9
+# cathedral-sandbox commit b1739d0 (review rounds 3 to 6: allowlist ports, network changes
+# must name a mode, files API /work only with no link following, build context peer check,
+# allowlists refuse private ranges, every request answered, bounded output, per-key
+# snapshots and replays, docker build through the classic builder, SIGTERM cleanup, a
+# blank or malformed key store or quota refused at start, stale work bases swept, a
+# wrong-shaped snapshot_id is a 400, deleting another key's snapshot leaves its image,
+# terminal lines run through the runtime's exec),
+# made with:
+#   ./make-dist.sh b1739d0   (git archive of pyproject.toml and cathedral/)
+CATHEDRAL_COMMIT=d53b3af
+CATHEDRAL_TARBALL=dist/cathedral-d53b3af.tar.gz
+CATHEDRAL_TARBALL_SHA256=c90ddf1c280a0bad68c7fcceaf1c0cba41a17f12125c0011b47277e06b3fa189
+PROBE_IMAGE=alpine:3.20

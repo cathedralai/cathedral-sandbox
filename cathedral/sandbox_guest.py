@@ -1,0 +1,2301 @@
+"""Linux guest sandboxes for customer Sandbox / Image / DinD definitions.
+
+The customer checklist defines a sandbox as an isolated Linux container or
+micro-VM with its own filesystem, network and process tree, started from an OCI
+image (or Dockerfile), with optional Docker-in-Docker for compose tasks.
+
+This module talks to a real Docker daemon only. There is no fake client, no stub
+guest, and no path that pretends Kata or DinD when they are absent.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import os
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Mapping
+
+from cathedral.sandbox_api import (
+    CreateSandboxRequest,
+    ExecRecord,
+    ExecRequest,
+    ExecResult,
+    FileGet,
+    NetworkPatch,
+    PrefetchRequest,
+    canonical_network_mode,
+    canonical_network_policy,
+    network_policy_sha256,
+    ProcessHandle,
+    SandboxContractError,
+    StatResult,
+    StatusReport,
+    TarGet,
+)
+from cathedral.sandbox_egress import EgressClient
+from cathedral.sandbox_workspaces import WorkspaceStore
+from cathedral.sandbox_owner import owner_hash
+from cathedral.sandbox_provider import (
+    InMemorySandboxProvider,
+    SandboxOpError,
+    _parse_label_filters,
+    _render_cmd,
+    provider_from_environment,
+)
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def docker_cli_available() -> bool:
+    return shutil.which("docker") is not None
+
+
+def docker_daemon_ready(*, timeout_seconds: float = 2.0) -> bool:
+    if not docker_cli_available():
+        return False
+    try:
+        completed = subprocess.run(
+            ["docker", "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0 and bool(completed.stdout.strip())
+
+
+# Docker labels on every guest container. The reconcile pass uses them to find
+# containers that have no live sandbox record.
+LABEL_OWNER = "cathedral.sandbox.owner"
+LABEL_SANDBOX_ID = "cathedral.sandbox.id"
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(int(raw), minimum)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(float(raw), minimum)
+    except ValueError:
+        return default
+
+
+DIND_DOCKERD_ARGS_DEFAULT = (
+    "--host=unix:///var/run/docker.sock",
+    "--default-address-pool",
+    "base=172.28.0.0/16,size=24",
+)
+
+
+@dataclass(frozen=True)
+class DindConfig:
+    """Operator settings for Docker-in-Docker guests.
+
+    CATHEDRAL_DIND_RUNTIME: OCI runtime for DinD guests (for example
+    runsc-netraw, a runsc entry with --net-raw). Not used with Kata.
+    CATHEDRAL_DIND_DOCKERD_ARGS: inner dockerd arguments (shell words). They
+    replace the default arguments.
+    CATHEDRAL_DIND_ENV: extra guest environment as shell words of KEY=VALUE.
+    """
+
+    runtime: str | None = None
+    dockerd_args: tuple[str, ...] = DIND_DOCKERD_ARGS_DEFAULT
+    env: tuple[tuple[str, str], ...] = ()
+
+    @classmethod
+    def from_env(cls) -> "DindConfig":
+        raw_args = os.environ.get("CATHEDRAL_DIND_DOCKERD_ARGS", "").strip()
+        env: list[tuple[str, str]] = []
+        for word in shlex.split(os.environ.get("CATHEDRAL_DIND_ENV", "")):
+            key, sep, value = word.partition("=")
+            if not sep or not key:
+                raise ValueError(f"CATHEDRAL_DIND_ENV entry is not KEY=VALUE: {word!r}")
+            env.append((key, value))
+        return cls(
+            runtime=os.environ.get("CATHEDRAL_DIND_RUNTIME", "").strip() or None,
+            dockerd_args=tuple(shlex.split(raw_args)) if raw_args else DIND_DOCKERD_ARGS_DEFAULT,
+            env=tuple(env),
+        )
+
+
+def runtime_has_kernel_isolation(runtime: str) -> bool:
+    """True for OCI runtimes that put a separate kernel under the guest.
+
+    runsc (gVisor) runs a user-space kernel; Kata runs a micro-VM. runc shares
+    the host kernel.
+    """
+    name = runtime.strip().lower()
+    return name.startswith("runsc") or "kata" in name
+
+
+def is_dind_image(image: str) -> bool:
+    """True when the image is a Docker-in-Docker base used for compose tasks."""
+    lowered = image.lower()
+    return "docker:" in lowered and "dind" in lowered
+
+
+class RoomNetworkPool:
+    """Spread guests with a network over several Docker bridge networks.
+
+    One Linux bridge takes at most 1,024 ports ("exchange full"), so one
+    network holds at most about 1,000 guests. With a pool, every guest with
+    network "public" goes to the least used pool network that has a free
+    port. Guests with network "none" or "allowlist" use no port.
+
+    Settings (all optional; with CATHEDRAL_ROOM_NETWORKS unset or 0 the pool
+    is off and guests use the daemon's default bridge, as before):
+    CATHEDRAL_ROOM_NETWORKS: number of networks.
+    CATHEDRAL_ROOM_NETWORK_SIZE: guests per network (default 1000, max 1023).
+    CATHEDRAL_ROOM_NETWORK_PREFIX: Docker network name prefix (default
+      "cathedral-room"); networks are <prefix>-0, <prefix>-1, ...
+    CATHEDRAL_ROOM_NETWORK_SUBNETS: comma-separated subnets, one per network.
+    CATHEDRAL_ROOM_NETWORK_BRIDGE_PREFIX: Linux bridge name prefix; bridge i
+      is <prefix><i> (so the host firewall can name it).
+    CATHEDRAL_ROOM_NETWORK_DNS: name servers (space or comma separated). On a
+      user-defined network Docker points the guest at its embedded resolver
+      127.0.0.11, which gVisor guests cannot reach. With this set, each guest
+      on a room network gets its own resolv.conf with these servers.
+    A missing network is created; an existing one is reused.
+    """
+
+    MAX_PORTS = 1023
+
+    def __init__(
+        self,
+        *,
+        count: int,
+        size: int = 1000,
+        prefix: str = "cathedral-room",
+        subnets: tuple[str, ...] = (),
+        bridge_prefix: str | None = None,
+        dns: tuple[str, ...] = (),
+    ) -> None:
+        if subnets and len(subnets) != count:
+            raise ValueError("CATHEDRAL_ROOM_NETWORK_SUBNETS needs one subnet per network")
+        self.size = max(1, min(size, self.MAX_PORTS))
+        self.names = [f"{prefix}-{i}" for i in range(count)]
+        self.subnets = subnets
+        self.bridge_prefix = bridge_prefix
+        self.dns = dns
+        self.used: dict[str, int] = {n: 0 for n in self.names}
+        self._lock = threading.Lock()
+        self._ready = False
+
+    @classmethod
+    def from_env(cls) -> "RoomNetworkPool | None":
+        count = _env_int("CATHEDRAL_ROOM_NETWORKS", 0)
+        if count <= 0:
+            return None
+        subnets = tuple(s.strip() for s in os.environ.get("CATHEDRAL_ROOM_NETWORK_SUBNETS", "").split(",") if s.strip())
+        return cls(
+            count=count,
+            size=_env_int("CATHEDRAL_ROOM_NETWORK_SIZE", 1000, minimum=1),
+            prefix=os.environ.get("CATHEDRAL_ROOM_NETWORK_PREFIX", "").strip() or "cathedral-room",
+            subnets=subnets,
+            bridge_prefix=os.environ.get("CATHEDRAL_ROOM_NETWORK_BRIDGE_PREFIX", "").strip() or None,
+            dns=tuple(os.environ.get("CATHEDRAL_ROOM_NETWORK_DNS", "").replace(",", " ").split()),
+        )
+
+    @property
+    def capacity(self) -> int:
+        return self.size * len(self.names)
+
+    def ensure(self, client: "DockerClient") -> None:
+        """Create missing networks once; count guests already attached."""
+        with self._lock:
+            if self._ready:
+                return
+            for i, name in enumerate(self.names):
+                found = client.run(["docker", "network", "inspect", "--format", "{{len .Containers}}", name], timeout=30.0)
+                if found.returncode == 0:
+                    try:
+                        self.used[name] = int((found.stdout or "0").strip() or 0)
+                    except ValueError:
+                        self.used[name] = 0
+                    continue
+                argv = ["docker", "network", "create", "--driver", "bridge"]
+                if self.subnets:
+                    argv += ["--subnet", self.subnets[i]]
+                if self.bridge_prefix:
+                    argv += ["-o", f"com.docker.network.bridge.name={self.bridge_prefix}{i}"]
+                created = client.run(argv + [name], timeout=60.0)
+                if created.returncode != 0:
+                    raise SandboxOpError(
+                        "network_setup_failed",
+                        502,
+                        f"docker network create {name} failed: {(created.stderr or '').strip()[:300]}",
+                        retry_after=30,
+                    )
+            self._ready = True
+
+    def acquire(self) -> str:
+        """Reserve one port on the least used network with a free port."""
+        with self._lock:
+            free = [n for n in self.names if self.used[n] < self.size]
+            if not free:
+                raise SandboxOpError(
+                    "network_capacity_exhausted",
+                    503,
+                    f"all {len(self.names)} room networks are full ({self.capacity} guests with a network); "
+                    "retry later or use network none",
+                    retry_after=10,
+                )
+            name = min(free, key=lambda n: self.used[n])
+            self.used[name] += 1
+            return name
+
+    def release(self, name: str | None) -> None:
+        if not name:
+            return
+        with self._lock:
+            if name in self.used and self.used[name] > 0:
+                self.used[name] -= 1
+
+    def recount(self, held: Iterable[str | None]) -> None:
+        """Reset usage from the networks that live guests and queued removals hold."""
+        counts = {n: 0 for n in self.names}
+        for name in held:
+            if name in counts:
+                counts[name] += 1
+        with self._lock:
+            self.used = counts
+
+    def document(self) -> dict[str, Any]:
+        with self._lock:
+            return {"networks": dict(self.used), "size": self.size, "capacity": self.capacity,
+                    "used": sum(self.used.values())}
+
+
+@dataclass
+class GuestRecord:
+    sandbox_id: str
+    container_id: str
+    image: str
+    dind: bool
+    work_mount: Path
+    network_mode: str = "public"
+    network: str | None = None  # room network that holds the guest's port (pool only)
+    # The guest has a network interface (a bridge port). With an egress daemon
+    # its policy can switch live; a guest started with "none" has no interface.
+    attached: bool = True
+    policy: dict[str, Any] | None = None  # canonical policy the egress daemon applied
+    policy_sha256: str | None = None
+    guest_processes: dict[str, Path] = field(default_factory=dict)
+    # How this guest's image runs a command under a time limit: "gnu"
+    # (timeout N), "busybox" (timeout -t N) or "none". None: not probed yet.
+    timeout_form: str | None = None
+    # (owner, name, path, version_on_delete) of the mounted workspace (#305).
+    workspace: tuple[str, str, str, bool] | None = None
+    # Owner of the room (sandbox_owner.owner_id). The egress proxy reads the
+    # room's secrets under its hash (#304).
+    owner: str | None = None
+
+
+# A room's exec output, process log and the API's own log record are capped
+# here: the API reads a room's bytes into memory, and a room is not trusted
+# with the API's memory. The hotel's catalog states this limit.
+EXEC_OUTPUT_CAP = 16 * 1024 * 1024
+BUILD_CONTEXT_CAP = 256 << 20
+BUILD_CONTEXT_EXPANDED_CAP = 1 << 30
+
+# docker run errors that name the request, not the hotel.
+_GUEST_START_FAULTS = (
+    ("executable file not found", "invalid_entrypoint"),
+    ("exec format error", "invalid_entrypoint"),
+    ("no such file or directory", "invalid_entrypoint"),
+    ("permission denied", "invalid_entrypoint"),
+    ("unable to find user", "invalid_user"),
+    ("unable to find group", "invalid_user"),
+    ("chdir to cwd", "invalid_workdir"),
+    ("not a directory", "invalid_workdir"),
+)
+
+
+def _guest_start_fault(stderr: str) -> str | None:
+    """The error code for a docker run failure the request caused, or None."""
+    text = (stderr or "").lower()
+    for needle, code in _GUEST_START_FAULTS:
+        if needle in text:
+            return code
+    return None
+
+
+def _run_bounded(argv, *, timeout, input_bytes, env, cap: int) -> subprocess.CompletedProcess[bytes]:
+    """subprocess.run with each output stream kept to cap + 1 bytes."""
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    kept: dict[str, bytes] = {}
+
+    def drain(name: str, stream) -> None:
+        buf = bytearray()
+        for chunk in iter(lambda: stream.read(65536), b""):
+            if len(buf) <= cap:
+                buf.extend(chunk[: cap + 1 - len(buf)])
+        kept[name] = bytes(buf)
+
+    readers = [threading.Thread(target=drain, args=(n, st), daemon=True) for n, st in (("out", proc.stdout), ("err", proc.stderr))]
+    for t in readers:
+        t.start()
+    if input_bytes is not None:
+        def feed() -> None:
+            try:
+                proc.stdin.write(input_bytes)
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        threading.Thread(target=feed, daemon=True).start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+    for t in readers:
+        t.join()
+    return subprocess.CompletedProcess(argv, proc.returncode, kept.get("out", b""), kept.get("err", b""))
+
+
+def _auth_pulled_path() -> Path:
+    return Path(os.environ.get("CATHEDRAL_SANDBOX_AUTH_PULLED_FILE") or Path(os.environ.get("HOME", "/tmp")) / ".cathedral-auth-pulled.json")
+
+
+def _load_auth_pulled() -> set[str]:
+    """Images pulled with registry credentials. Kept on disk: after a restart
+    a key without credentials must still not start another key's private image."""
+    try:
+        data = json.loads(_auth_pulled_path().read_text())
+        return {x for x in data if isinstance(x, str)}
+    except (OSError, ValueError):
+        return set()
+
+
+def _save_auth_pulled(refs: set[str]) -> None:
+    try:
+        path = _auth_pulled_path()
+        path.write_text(json.dumps(sorted(refs)))
+    except OSError:
+        pass
+
+
+class DockerClient:
+    """Real docker CLI only — every call hits the local daemon."""
+
+    def __init__(self, *, kata_runtime: str | None = None) -> None:
+        self.kata_runtime = kata_runtime or os.environ.get("CATHEDRAL_KATA_RUNTIME", "kata-runtime")
+        # Optional OCI runtime for non-Kata guests (for example runsc). Empty means
+        # the daemon default runtime.
+        self.guest_runtime = os.environ.get("CATHEDRAL_DOCKER_RUNTIME", "").strip() or None
+        self.dind = DindConfig.from_env()
+
+    def default_runtime(self) -> str:
+        """The daemon's default OCI runtime name, or "" when unknown."""
+        try:
+            result = self.run(["docker", "info", "--format", "{{.DefaultRuntime}}"], timeout=15.0)
+        except SandboxOpError:
+            return ""
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    def run(
+        self,
+        argv: list[str],
+        *,
+        timeout: float | None = 120.0,
+        input_bytes: bytes | None = None,
+        env: Mapping[str, str] | None = None,
+        output_cap: int | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run argv. Output is decoded with replacement: a room's bytes are
+        not always UTF-8, and a decode error must not drop the request.
+        With output_cap, at most cap + 1 bytes of each stream are kept (the
+        extra byte shows the overflow) and the rest is drained and dropped.
+        """
+        merged = None if env is None else {**os.environ, **dict(env)}
+        try:
+            if output_cap is None:
+                raw = subprocess.run(argv, capture_output=True, timeout=timeout, input=input_bytes, check=False, env=merged)
+            else:
+                raw = _run_bounded(argv, timeout=timeout, input_bytes=input_bytes, env=merged, cap=output_cap)
+            return subprocess.CompletedProcess(
+                raw.args, raw.returncode, raw.stdout.decode("utf-8", "replace"), raw.stderr.decode("utf-8", "replace")
+            )
+        except FileNotFoundError as exc:
+            raise SandboxOpError(
+                "runtime_unavailable",
+                503,
+                "docker CLI not found on PATH",
+                retry_after=30,
+            ) from exc
+        except OSError as exc:
+            raise SandboxOpError(
+                "runtime_unavailable",
+                503,
+                f"docker could not be executed: {exc}",
+                retry_after=30,
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise SandboxOpError(
+                "docker_timeout", 504, f"docker timed out: {' '.join(argv[:4])}"
+            ) from exc
+
+    def info_ok(self) -> bool:
+        try:
+            result = self.run(
+                ["docker", "info", "--format", "{{.ServerVersion}}"],
+                timeout=15.0,
+            )
+        except SandboxOpError:
+            return False
+        return result.returncode == 0 and bool(result.stdout.strip())
+
+    @contextlib.contextmanager
+    def _registry_env(self, image: str, registry_auth: Mapping[str, str] | None):
+        """Yield a docker env with a one-call client config, or None.
+
+        The credentials go into a private temp dir that is deleted after the
+        call. They never reach the daemon's own config or a log line.
+        """
+        if registry_auth is None:
+            yield None
+            return
+        config_dir = Path(tempfile.mkdtemp(prefix="cathedral-docker-auth-"))
+        try:
+            config_dir.chmod(0o700)
+            config_file = config_dir / "config.json"
+            fd = os.open(config_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "auths": {
+                            _registry_host(image): {
+                                "username": registry_auth["username"],
+                                "password": registry_auth["password"],
+                            }
+                        }
+                    },
+                    fh,
+                )
+            yield {"DOCKER_CONFIG": str(config_dir)}
+        finally:
+            shutil.rmtree(config_dir, ignore_errors=True)
+
+    def pull(self, image: str, *, registry_auth: Mapping[str, str] | None = None) -> None:
+        with self._registry_env(image, registry_auth) as env:
+            result = self.run(["docker", "pull", image], timeout=600.0, env=env)
+        if result.returncode != 0:
+            raise SandboxOpError(
+                "image_pull_failed",
+                502,
+                f"docker pull failed for {image}: {result.stderr.strip()[:300]}",
+            )
+
+    def push(self, source: str, target: str, *, registry_auth: Mapping[str, str] | None = None) -> str | None:
+        """Tag local image *source* as *target* and push it. Return the repo digest, if known."""
+        tagged = self.run(["docker", "tag", source, target], timeout=30.0)
+        if tagged.returncode != 0:
+            raise SandboxOpError(
+                "snapshot_push_failed",
+                502,
+                f"docker tag failed: {(tagged.stderr or '').strip()[:300]}",
+            )
+        with self._registry_env(target, registry_auth) as env:
+            result = self.run(["docker", "push", target], timeout=1800.0, env=env)
+        if result.returncode != 0:
+            raise SandboxOpError(
+                "snapshot_push_failed",
+                502,
+                f"docker push failed for {target}: {(result.stderr or '').strip()[:300]}",
+            )
+        digests = self.image_inspect(target).get("RepoDigests") or []
+        repo = target.rsplit("@", 1)[0]
+        repo = repo.rsplit(":", 1)[0] if ":" in repo.rsplit("/", 1)[-1] else repo
+        for entry in digests:
+            if entry.startswith(repo + "@"):
+                return entry
+        return digests[0] if digests else None
+
+    def image_size(self, image: str) -> int:
+        """Total size in bytes of a local image, base layers included. 0 when unknown."""
+        try:
+            return max(0, int(self.image_inspect(image).get("Size") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def ensure_image(
+        self,
+        image: str,
+        *,
+        registry_auth: Mapping[str, str] | None = None,
+        refresh: bool = False,
+        mirror: str | None = None,
+    ) -> bool:
+        """Make *image* present locally. Return True when a pull ran.
+
+        Skip the pull when the image is already present, unless *refresh* is set.
+        With *mirror* set, a Docker Hub image is pulled from the mirror first and
+        tagged with its original name; on mirror failure the pull goes direct.
+        """
+        if not refresh and self.image_exists(image):
+            return False
+        mirrored = mirror_ref(mirror, image) if mirror and registry_auth is None else None
+        if mirrored is not None:
+            try:
+                self.pull(mirrored)
+                tagged = self.run(["docker", "tag", mirrored, image], timeout=30.0)
+                if tagged.returncode == 0:
+                    return True
+            except SandboxOpError:
+                pass
+        self.pull(image, registry_auth=registry_auth)
+        return True
+
+    def image_inspect(self, image: str) -> dict[str, Any]:
+        result = self.run(
+            ["docker", "image", "inspect", "--format", "{{json .}}", image],
+            timeout=30.0,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return {}
+        try:
+            return json.loads(result.stdout.strip().splitlines()[-1])
+        except json.JSONDecodeError:
+            return {}
+
+    def build(self, *, tag: str, context_dir: Path, dockerfile_name: str = "Dockerfile") -> None:
+        # The classic builder, not BuildKit: BuildKit runs RUN steps in its
+        # own runc worker and ignores the daemon's default runtime, so a
+        # build's commands ran on the host kernel while rooms ran under gVisor.
+        result = self.run(
+            ["docker", "build", "-t", tag, "-f", str(context_dir / dockerfile_name), str(context_dir)],
+            timeout=900.0,
+            env={"DOCKER_BUILDKIT": "0"},
+        )
+        if result.returncode != 0:
+            raise SandboxOpError(
+                "image_build_failed",
+                502,
+                f"docker build failed: {result.stderr.strip()[:400]}",
+            )
+
+    def image_exists(self, tag: str) -> bool:
+        result = self.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", tag],
+            timeout=15.0,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+
+    def create_and_start(
+        self,
+        *,
+        image: str,
+        name: str,
+        work_dir: Path,
+        vcpu: int,
+        memory_gib: int,
+        disk_gib: int,
+        network_mode: str,
+        env: Mapping[str, str],
+        dind: bool,
+        use_kata: bool,
+        entrypoint: tuple[str, ...] | None,
+        workdir: str | None,
+        user: str | None,
+        labels: Mapping[str, str] | None = None,
+        network: str | None = None,
+        resolv_conf: Path | None = None,
+        attach: bool | None = None,
+        mounts: Iterable[tuple[Path, str]] = (),
+    ) -> str:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        argv = [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            name,
+        ]
+        for key, value in (labels or {}).items():
+            argv.extend(["--label", f"{key}={value}"])
+        argv += [
+            "--cpus",
+            str(vcpu),
+            "--memory",
+            f"{memory_gib}g",
+            "-v",
+            f"{work_dir.resolve()}:/work",
+            "-w",
+            workdir or "/work",
+        ]
+        # Workspaces (#305): one plain bind of the workspace data directory.
+        # The source is a hotel path the API built, never a request value.
+        for source, target in mounts:
+            argv.extend(["--mount", f"type=bind,source={source.resolve()},target={target}"])
+        if user:
+            argv.extend(["--user", user])
+        if use_kata:
+            argv.extend(["--runtime", self.kata_runtime])
+        elif dind and self.dind.runtime:
+            argv.extend(["--runtime", self.dind.runtime])
+        elif self.guest_runtime:
+            argv.extend(["--runtime", self.guest_runtime])
+        if dind:
+            if os.environ.get("CATHEDRAL_ALLOW_PRIVILEGED_DIND") != "1":
+                raise SandboxOpError(
+                    "privileged_dind_disabled",
+                    403,
+                    "DinD requires CATHEDRAL_ALLOW_PRIVILEGED_DIND=1 "
+                    "(privileged guests are host-risk on plain Docker; prefer Kata)",
+                )
+            argv.append("--privileged")
+            argv.extend(["-e", "DOCKER_TLS_CERTDIR="])
+            for key, value in self.dind.env:
+                argv.extend(["-e", f"{key}={value}"])
+        # Prefer storage quota when the local driver accepts it (overlay2+xfs usually).
+        storage_opt = ["--storage-opt", f"size={disk_gib}G"] if disk_gib > 0 and not use_kata else []
+        argv.extend(storage_opt)
+        # Without a hotel egress daemon, allowlist and deny_all fail closed to
+        # network none. With one, the caller passes attach=True and the daemon
+        # enforces the policy outside the guest.
+        if attach is None:
+            attach = canonical_network_mode(network_mode) == "internet"
+        if not attach:
+            argv.extend(["--network", "none"])
+        elif network:
+            argv.extend(["--network", network])
+            if resolv_conf is not None:
+                argv.extend(["-v", f"{resolv_conf.resolve()}:/etc/resolv.conf"])
+        for key, value in env.items():
+            argv.extend(["-e", f"{key}={value}"])
+        if dind:
+            argv.extend([image, "dockerd-entrypoint.sh", "dockerd", *self.dind.dockerd_args])
+        elif entrypoint:
+            argv.append(image)
+            argv.extend(list(entrypoint))
+        else:
+            argv.extend([image, "sleep", "infinity"])
+        result = self._run_guest(argv, name)
+        if result.returncode != 0 and storage_opt:
+            # Driver may reject size=; retry without it (API disk still enforced on /work).
+            # A failed docker run can leave a created container with this name.
+            # Remove it first, or the retry fails on a name conflict.
+            self.remove_confirmed(name, timeout=60.0)
+            stripped = []
+            skip_next = False
+            for part in argv:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if part == "--storage-opt":
+                    skip_next = True
+                    continue
+                stripped.append(part)
+            result = self._run_guest(stripped, name)
+        if result.returncode != 0:
+            self.remove_confirmed(name, timeout=60.0)
+            if fault := _guest_start_fault(result.stderr):
+                # The request is wrong, not the hotel: a 502 here rested the
+                # hotel for every guest at the broker.
+                raise SandboxOpError(fault, 400, f"the room could not start: {result.stderr.strip()[:400]}")
+            raise SandboxOpError(
+                "guest_start_failed",
+                502,
+                f"docker run failed: {result.stderr.strip()[:400]}",
+            )
+        container_id = result.stdout.strip().splitlines()[-1].strip()
+        if not container_id:
+            raise SandboxOpError("guest_start_failed", 502, "docker run returned empty container id")
+        return container_id
+
+    def _run_guest(self, argv: list[str], name: str) -> subprocess.CompletedProcess[str]:
+        """docker run; on a CLI timeout, remove the container it may have left."""
+        try:
+            return self.run(argv, timeout=180.0)
+        except SandboxOpError as exc:
+            if exc.code == "docker_timeout":
+                self.remove_confirmed(name, timeout=60.0)
+            raise
+
+    def set_network(self, container_id: str, mode: str, network: str = "bridge") -> None:
+        """Apply egress mode on a live container. allowlist fails closed to none."""
+        want_none = mode in {"none", "allowlist"}
+        networks = self.run(
+            ["docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", container_id],
+            timeout=15.0,
+        )
+        attached: list[str] = []
+        if networks.returncode == 0 and networks.stdout.strip():
+            try:
+                attached = list(json.loads(networks.stdout.strip()).keys())
+            except json.JSONDecodeError:
+                attached = []
+        if want_none:
+            for net in attached:
+                if net != "none":
+                    self.run(["docker", "network", "disconnect", "-f", net, container_id], timeout=30.0)
+            return
+        # public: ensure the target network (default bridge or a room network)
+        if network not in attached and "none" in attached:
+            self.run(["docker", "network", "disconnect", "-f", "none", container_id], timeout=30.0)
+        if network not in attached:
+            connect = self.run(["docker", "network", "connect", network, container_id], timeout=30.0)
+            if connect.returncode != 0:
+                raise SandboxOpError(
+                    "network_change_failed",
+                    502,
+                    f"failed to attach bridge: {connect.stderr.strip()[:300]}",
+                )
+
+    def exec(
+        self,
+        container_id: str,
+        argv: list[str],
+        *,
+        cwd: str | None,
+        env: Mapping[str, str],
+        timeout_seconds: int,
+        stdin: str | None,
+        detach: bool = False,
+        user: str | None = None,
+    ) -> tuple[int, str, str, bool]:
+        cmd = ["docker", "exec"]
+        if detach:
+            cmd.append("-d")
+        else:
+            cmd.append("-i")
+        if user:
+            cmd.extend(["-u", user])
+        if cwd:
+            cmd.extend(["-w", cwd])
+        for key, value in env.items():
+            cmd.extend(["-e", f"{key}={value}"])
+        cmd.append(container_id)
+        cmd.extend(argv)
+        try:
+            result = self.run(
+                cmd,
+                timeout=float(timeout_seconds),
+                input_bytes=(stdin.encode() if stdin is not None else None),
+                output_cap=EXEC_OUTPUT_CAP,
+            )
+        except SandboxOpError as exc:
+            if exc.code == "docker_timeout":
+                # Kill only the timed-out docker-exec client process (already dead via
+                # subprocess timeout). Never docker-kill the whole sandbox — the
+                # checklist requires the sandbox to stay alive after a timed-out exec (§3.2).
+                return 137, "", "exec timed out", True
+            raise
+        return result.returncode, result.stdout, result.stderr, False
+
+    def exit_code_if_stopped(self, container_id: str) -> int | None:
+        """The exit code of a container that is no longer running, else None."""
+        try:
+            r = self.run(["docker", "inspect", "--format", "{{.State.Running}} {{.State.ExitCode}}", container_id], timeout=15.0)
+        except SandboxOpError:
+            return None
+        parts = r.stdout.split()
+        if r.returncode != 0 or len(parts) != 2 or parts[0] != "false":
+            return None
+        try:
+            return int(parts[1])
+        except ValueError:
+            return None
+
+    def remove(self, container_id: str) -> None:
+        """Best-effort removal. The result is not checked; use remove_confirmed for GC."""
+        self.run(["docker", "rm", "-f", container_id], timeout=60.0)
+
+    def remove_confirmed(self, container_ref: str, *, timeout: float = 60.0) -> bool:
+        """Remove a container. Return True only when it is gone.
+
+        A timeout or a daemon error returns False, so the caller can retry.
+        "No such container" counts as gone.
+        """
+        try:
+            result = self.run(["docker", "rm", "-f", container_ref], timeout=timeout)
+        except SandboxOpError:
+            return False
+        if result.returncode == 0:
+            return True
+        return "no such container" in (result.stderr or "").lower()
+
+    def list_labeled(self, owner: str) -> list[tuple[str, str]]:
+        """Return (container_id, sandbox_id) for all containers with our owner label.
+
+        Raises SandboxOpError when the daemon cannot list. The caller must not
+        treat a failed list as "no containers".
+        """
+        result = self.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--no-trunc",
+                "--filter",
+                f"label={LABEL_OWNER}={owner}",
+                "--format",
+                "{{.ID}} {{.Label \"" + LABEL_SANDBOX_ID + "\"}}",
+            ],
+            timeout=60.0,
+        )
+        if result.returncode != 0:
+            raise SandboxOpError(
+                "docker_list_failed",
+                502,
+                f"docker ps failed: {(result.stderr or '').strip()[:200]}",
+            )
+        out: list[tuple[str, str]] = []
+        for line in (result.stdout or "").splitlines():
+            parts = line.strip().split(" ", 1)
+            if parts and parts[0]:
+                out.append((parts[0], parts[1].strip() if len(parts) > 1 else ""))
+        return out
+
+    def pause(self, container_id: str) -> None:
+        result = self.run(["docker", "pause", container_id], timeout=30.0)
+        if result.returncode != 0:
+            raise SandboxOpError(
+                "guest_pause_failed",
+                502,
+                f"docker pause failed: {(result.stderr or result.stdout or '')[:200]}",
+            )
+
+    def unpause(self, container_id: str) -> None:
+        result = self.run(["docker", "unpause", container_id], timeout=30.0)
+        if result.returncode != 0:
+            raise SandboxOpError(
+                "guest_unpause_failed",
+                502,
+                f"docker unpause failed: {(result.stderr or result.stdout or '')[:200]}",
+            )
+
+    def commit(self, container_id: str, image_name: str) -> str:
+        result = self.run(["docker", "commit", container_id, image_name], timeout=300.0)
+        if result.returncode != 0:
+            raise SandboxOpError(
+                "snapshot_failed",
+                502,
+                f"docker commit failed: {result.stderr.strip()[:300]}",
+            )
+        inspect = self.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", image_name],
+            timeout=30.0,
+        )
+        return (inspect.stdout.strip() if inspect.returncode == 0 else image_name) or image_name
+
+    def wait_dind_ready(self, container_id: str, *, timeout_seconds: float = 90.0) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        last_err = ""
+        while time.monotonic() < deadline:
+            code, out, err, _ = self.exec(
+                container_id,
+                ["docker", "info", "--format", "{{.ServerVersion}}"],
+                cwd=None,
+                env={},
+                timeout_seconds=15,
+                stdin=None,
+            )
+            if code == 0 and out.strip():
+                return
+            last_err = (err or out or "dockerd not ready").strip()[:200]
+            time.sleep(1.0)
+        raise SandboxOpError(
+            "dind_not_ready",
+            503,
+            f"dockerd inside guest did not become ready: {last_err}",
+            retry_after=30,
+        )
+
+
+def mirror_ref(mirror: str, image: str) -> str | None:
+    """Return the mirror reference for a Docker Hub *image*, else None.
+
+    "alpine:3.20" -> "<mirror>/library/alpine:3.20". Images on another
+    registry and digest references are not mirrored.
+    """
+    mirror = mirror.strip().rstrip("/")
+    if not mirror or "@" in image:
+        return None
+    name = image
+    for prefix in ("docker.io/", "index.docker.io/", "registry-1.docker.io/"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    else:
+        first = name.split("/", 1)[0]
+        if "/" in name and ("." in first or ":" in first or first == "localhost"):
+            return None
+    if "/" not in name:
+        name = "library/" + name
+    return f"{mirror}/{name}"
+
+
+def _registry_host(image: str) -> str:
+    first = image.split("/", 1)[0]
+    if "." in first or ":" in first or first == "localhost":
+        return first
+    return "https://index.docker.io/v1/"
+
+
+def _public_ip(raw: str) -> bool:
+    import ipaddress
+
+    try:
+        ip = ipaddress.ip_address(raw.split("%", 1)[0])
+    except ValueError:
+        return False
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _checked_opener() -> urllib.request.OpenerDirector:
+    """An opener that refuses a connection whose peer is not a public address.
+
+    A name check before the fetch is not enough: urlopen resolves the name
+    again (DNS rebinding) and follows redirects to any host. The check runs on
+    the socket each hop actually connected to.
+    """
+    import http.client
+
+    def check(sock) -> None:
+        peer = sock.getpeername()[0]
+        if not _public_ip(peer):
+            sock.close()
+            raise SandboxOpError("build_context_forbidden", 400, "build context URL reaches a non-public address")
+
+    class CheckedHTTP(http.client.HTTPConnection):
+        def connect(self) -> None:
+            super().connect()
+            check(self.sock)
+
+    class CheckedHTTPS(http.client.HTTPSConnection):
+        def connect(self) -> None:
+            super().connect()
+            check(self.sock)
+
+    class HTTP(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(CheckedHTTP, req)
+
+    class HTTPS(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(CheckedHTTPS, req, context=self._context)
+
+    return urllib.request.build_opener(HTTP, HTTPS)
+
+
+def _fetch_context_tar(url: str) -> bytes:
+    """Fetch a build context. Fail closed against file:// and link-local/private SSRF."""
+    from urllib.parse import urlparse
+    import socket
+
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme == "file" or url.startswith("file:"):
+        raise SandboxOpError(
+            "build_context_forbidden",
+            400,
+            "file:// build contexts are not allowed",
+        )
+    if scheme not in ("http", "https"):
+        raise SandboxOpError(
+            "build_context_forbidden",
+            400,
+            f"unsupported build context scheme: {scheme or '<none>'}",
+        )
+    host = parsed.hostname or ""
+    if not host:
+        raise SandboxOpError("build_context_forbidden", 400, "build context URL missing host")
+    try:
+        addrs = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise SandboxOpError(
+            "build_context_fetch_failed",
+            502,
+            f"failed to resolve build context host: {exc}",
+        ) from exc
+    # Early, clear refusal; the opener checks the real peer on every hop.
+    if any(not _public_ip(info[4][0]) for info in addrs):
+        raise SandboxOpError(
+            "build_context_forbidden",
+            400,
+            "build context URL resolves to a non-public address",
+        )
+    try:
+        with _checked_opener().open(url, timeout=120) as resp:  # noqa: S310 — peer checked per hop
+            data = resp.read(BUILD_CONTEXT_CAP + 1)
+    except (urllib.error.URLError, OSError) as exc:
+        raise SandboxOpError(
+            "build_context_fetch_failed",
+            502,
+            f"failed to fetch build context: {exc}",
+        ) from exc
+    if len(data) > BUILD_CONTEXT_CAP:
+        raise SandboxOpError("build_context_too_large", 413, f"build context is over {BUILD_CONTEXT_CAP} bytes")
+    return data
+
+
+def _in_work(path: str) -> str:
+    """Refuse a file path outside /work, the only directory mounted into the room.
+
+    The files API reads and writes the host side of the mount. Any other path
+    lands on the host beside it: the room never sees the file and a snapshot
+    leaves it out, so a 200 there would be a lie.
+    """
+    if not isinstance(path, str) or not (path == "/work" or path.startswith("/work/")):
+        raise SandboxOpError("path_outside_work", 400, f"the files API reaches /work only: {path!r}")
+    return path
+
+
+def _read_room_log(path: Path) -> str:
+    """Read a process log from the room's /work without following a symlink.
+
+    The room can write /work, so it can swap its log for a link to a host file
+    (the hotel API key). O_NOFOLLOW refuses that; a FIFO or device reads empty.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return ""
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return ""
+        return fh.read(EXEC_OUTPUT_CAP).decode("utf-8", errors="replace")
+
+
+def _sweep_stale_bases(own: Path) -> None:
+    """Remove work bases an earlier instance left (killed mid-stop by systemd).
+
+    Each instance keeps its rooms' /work under one mkdtemp base in TMPDIR. A
+    stop that ran out of its time budget left those on the data volume for
+    good; nothing else ever looked at them. Bases older than a minute that
+    are not ours go. Only the kit sets the switch (one API per host).
+    """
+    try:
+        parent = own.parent
+        for base in parent.glob("cathedral-sandbox-*"):
+            if base == own or not base.is_dir():
+                continue
+            try:
+                if time.time() - base.stat().st_mtime < 60:
+                    continue
+                shutil.rmtree(base, ignore_errors=True)
+                print(f"cathedral-sandbox: removed stale work base {base}", file=sys.stderr, flush=True)
+            except OSError:
+                continue
+    except OSError:
+        return
+
+
+class DockerGuestProvider:
+    """SandboxProvider that runs each sandbox as a real Linux Docker (or Kata) guest."""
+
+    # The API passes the room owner to create (sandbox_server.create).
+    takes_owner = True
+
+    def __init__(
+        self,
+        *,
+        use_kata: bool = False,
+        default_image: str = "alpine:3.20",
+        inner: InMemorySandboxProvider | None = None,
+    ) -> None:
+        self._client = DockerClient()
+        self._use_kata = use_kata
+        self._default_image = default_image
+        self._guests: dict[str, GuestRecord] = {}
+        self._snapshot_images: dict[str, str] = {}
+        self._snapshot_meta: dict[str, dict[str, Any]] = {}  # snapshot id -> sizes and image
+        self._built_images: dict[str, str] = {}  # content_hash -> tag
+        self._build_locks: dict[str, threading.Lock] = {}  # tag -> lock; one build per tag
+        self._build_locks_guard = threading.Lock()
+        # GC state. A sandbox id in _doomed has a "deleting" record and a container
+        # that is not yet confirmed gone. Only one drain runs at a time.
+        self._owner = os.environ.get("CATHEDRAL_SANDBOX_OWNER", "").strip() or "default"
+        self._doomed: dict[str, str] = {}  # sandbox_id -> container_id
+        # Room networks (see RoomNetworkPool). A port is held from the start of
+        # docker run until the container is confirmed gone.
+        self._net_pool = RoomNetworkPool.from_env()
+        # Hotel egress daemon (sandbox_egress.py). With it, internet, deny_all
+        # and allowlist guests all get a bridge port, and the daemon enforces
+        # the policy outside the guest. Without it, only internet guests get a
+        # port and the other modes fail closed to network none.
+        self._egress = EgressClient.from_env()
+        # Persistent workspaces (#305). None: CATHEDRAL_WORKSPACE_ROOT is unset.
+        self._workspaces = WorkspaceStore.from_env(self._client)
+        self._doomed_ws: dict[str, tuple[str, str, str, bool]] = {}  # sandbox_id -> workspace of a queued removal
+        self._doomed_nets: dict[str, str | None] = {}  # sandbox_id -> network of a queued removal
+        self._net_pending: dict[str, str] = {}  # sandbox_id -> network while docker run runs
+        self._doomed_attempts: dict[str, int] = {}
+        self._doomed_lock = threading.Lock()
+        self._drain_lock = threading.Lock()
+        self._gc_parallelism = _env_int("CATHEDRAL_SANDBOX_GC_PARALLELISM", 8, minimum=1)
+        self._rm_timeout = _env_float("CATHEDRAL_SANDBOX_RM_TIMEOUT", 60.0, minimum=0.1)
+        self._reconcile_interval = _env_float("CATHEDRAL_SANDBOX_RECONCILE_SECONDS", 60.0)
+        self._last_reconcile: float | None = None
+        # Image pulls. "missing" (default) pulls only when the image is not local;
+        # "always" restores the old pull-on-every-create behaviour.
+        self._pull_policy = (os.environ.get("CATHEDRAL_SANDBOX_PULL_POLICY", "").strip().lower() or "missing")
+        self._registry_mirror = os.environ.get("CATHEDRAL_SANDBOX_REGISTRY_MIRROR", "").strip() or None
+        # Images pulled with registry credentials. A create of one of these always
+        # pulls, so the registry still checks the caller's credentials.
+        self._auth_pulled: set[str] = _load_auth_pulled()
+        if not self._client.info_ok():
+            raise SandboxOpError(
+                "runtime_unavailable",
+                503,
+                "docker daemon is not available; start Docker or use --runtime memory",
+                retry_after=30,
+            )
+        if use_kata:
+            probe = self._client.run(
+                ["docker", "info", "--format", "{{json .Runtimes}}"],
+                timeout=5.0,
+            )
+            runtime_name = self._client.kata_runtime
+            if probe.returncode != 0 or runtime_name not in (probe.stdout or ""):
+                if not shutil.which(runtime_name) and "kata" not in (probe.stdout or "").lower():
+                    raise SandboxOpError(
+                        "runtime_unavailable",
+                        503,
+                        f"kata runtime {runtime_name!r} is not registered with this Docker daemon",
+                        retry_after=60,
+                    )
+        runtime_label = "kata" if use_kata else "docker"
+        # The OCI runtime under each guest decides kernel isolation for /v1/status.
+        self._oci_runtime = (
+            self._client.kata_runtime
+            if use_kata
+            else (self._client.guest_runtime or self._client.default_runtime())
+        )
+        if inner is not None:
+            self._inner = inner
+        elif os.environ.get("CATHEDRAL_SANDBOX_KEYS", "").strip():
+            self._inner = provider_from_environment(
+                enforce_disk=True,
+                runtime_label=runtime_label,
+            )
+        else:
+            self._inner = InMemorySandboxProvider(
+                enforce_disk=True,
+                runtime_label=runtime_label,
+            )
+        self._capabilities_dind = False
+        if os.environ.get("CATHEDRAL_SANDBOX_SWEEP_STALE_BASES", "") == "1":
+            _sweep_stale_bases(self._inner._base)  # noqa: SLF001
+
+    @property
+    def workspace_store(self) -> WorkspaceStore | None:
+        return self._workspaces
+
+    @property
+    def egress_client(self) -> EgressClient | None:
+        return self._egress
+
+    def _owner_key(self, owner: str | None) -> str:
+        return owner_hash(owner) if owner else ""
+
+    def _require_credentials_support(self, credentials) -> None:
+        if credentials and self._egress is None:
+            raise SandboxOpError(
+                "credentials_unavailable", 501,
+                "this hotel has no egress daemon, so it cannot attach credentials",
+            )
+
+    @property
+    def capabilities_dind(self) -> bool:
+        return self._capabilities_dind or any(g.dind for g in self._guests.values())
+
+    def authorize(self, api_key: str | None) -> None:
+        self._inner.authorize(api_key)
+
+    def build_image(self, dockerfile: str, context: bytes | None = None) -> dict[str, Any]:
+        """Build *dockerfile* with an optional gzip tar *context*. Cached by content.
+
+        The tag is cathedral-build-<hash>:latest, where the hash covers the
+        Dockerfile and the context bytes. A second build of the same content
+        only checks that the image is present.
+        """
+        if not dockerfile.strip():
+            raise SandboxContractError("invalid_build", "dockerfile must not be empty")
+        digest = hashlib.sha256(dockerfile.encode("utf-8") + b"\0" + (context or b"")).hexdigest()
+        tag = f"cathedral-build-{digest[:16]}:latest"
+        with self._build_locks_guard:
+            lock = self._build_locks.setdefault(tag, threading.Lock())
+        with lock:
+            cached = self._client.image_exists(tag)
+            if not cached:
+                work = Path(tempfile.mkdtemp(prefix="cathedral-build-"))
+                try:
+                    if context:
+                        import io
+                        import tarfile
+
+                        try:
+                            with tarfile.open(fileobj=io.BytesIO(context), mode="r:*") as tf:
+                                if sum(max(m.size, 0) for m in tf.getmembers()) > BUILD_CONTEXT_EXPANDED_CAP:
+                                    raise SandboxOpError("invalid_build_context", 400, "build context expands past 1 GiB")
+                                tf.extractall(work, filter="data")
+                        except (tarfile.TarError, OSError) as exc:
+                            raise SandboxOpError("invalid_build_context", 400, f"build context is not a valid tar: {exc}") from exc
+                    (work / "Dockerfile").write_text(dockerfile, encoding="utf-8")
+                    self._client.build(tag=tag, context_dir=work)
+                finally:
+                    shutil.rmtree(work, ignore_errors=True)
+        return {
+            "image": tag,
+            "content_hash": "sha256:" + digest,
+            "cached": cached,
+            "size_bytes": self._client.image_size(tag),
+        }
+
+    def _build_image(self, request: CreateSandboxRequest) -> str:
+        assert request.build is not None
+        content_hash = request.build.content_hash
+        cached = self._built_images.get(content_hash)
+        if cached and self._client.image_exists(cached):
+            return cached
+        short = content_hash.split(":")[-1][:16]
+        tag = f"cathedral-build-{short}:latest"
+        if self._client.image_exists(tag):
+            self._built_images[content_hash] = tag
+            return tag
+        work = Path(tempfile.mkdtemp(prefix="cathedral-build-"))
+        try:
+            if request.build.context_tar_url:
+                raw = _fetch_context_tar(request.build.context_tar_url)
+                import io
+                import tarfile
+
+                with tarfile.open(fileobj=io.BytesIO(raw), mode="r:*") as tf:
+                    try:
+                        tf.extractall(work, filter="data")
+                    except TypeError:
+                        tf.extractall(work)
+            (work / "Dockerfile").write_text(request.build.dockerfile, encoding="utf-8")
+            self._client.build(tag=tag, context_dir=work)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        self._built_images[content_hash] = tag
+        return tag
+
+    def _image_for(self, request: CreateSandboxRequest) -> str:
+        if request.image is not None:
+            return request.image.image
+        if request.snapshot_id is not None:
+            return self._snapshot_image(request.snapshot_id)
+        if request.build is not None:
+            return self._build_image(request)
+        return self._default_image
+
+    def _resolve_snapshot(self, ref: str) -> str | None:
+        """Return the snapshot id for *ref* (an id or a name), or None when unknown."""
+        with self._inner._lock:  # noqa: SLF001
+            snapshots = self._inner._snapshots  # noqa: SLF001
+            visible = self._inner._snapshot_visible  # noqa: SLF001
+            if ref in snapshots and visible(ref):
+                return ref
+            for sid, (_, rec) in snapshots.items():
+                if rec.name == ref and visible(sid):
+                    return sid
+        return None
+
+    def _snapshot_image(self, ref: str) -> str:
+        """Return the committed image of snapshot *ref*. Never fall back to another image.
+
+        Unknown snapshot: 404 snapshot_not_found. A known snapshot record with no
+        committed image on this host: 409 snapshot_image_missing.
+        """
+        snap_id = self._resolve_snapshot(ref)
+        if snap_id is None:
+            raise SandboxOpError("snapshot_not_found", 404, f"no snapshot {ref} on this host")
+        image = self._snapshot_images.get(snap_id)
+        if not image or not self._client.image_exists(image):
+            raise SandboxOpError(
+                "snapshot_image_missing",
+                409,
+                f"snapshot {snap_id} has no committed image on this host",
+            )
+        return image
+
+    def create(
+        self,
+        request: CreateSandboxRequest,
+        *,
+        api_key: str | None,
+        idempotency: str | None,
+        body_digest: str,
+        owner: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_credentials_support(request.network.credentials)
+        if request.snapshot_id is not None:
+            # Fail before any record exists. A fork never starts another image.
+            self._snapshot_image(request.snapshot_id)
+        if request.workspace is not None:
+            # Fail before any record exists: 404 for a workspace of another owner.
+            if self._workspaces is None:
+                raise SandboxOpError("workspaces_unavailable", 501, "this hotel has no workspaces")
+            if owner is None:
+                raise SandboxOpError("workspace_not_found", 404, f"no workspace {request.workspace.name}")
+            self._workspaces.check(owner, request.workspace.name)
+        docs = self._inner.create(
+            request, api_key=api_key, idempotency=idempotency, body_digest=body_digest
+        )
+        batch = docs["sandboxes"] if "sandboxes" in docs else [docs]
+        started: list[dict[str, Any]] = []
+        try:
+            for doc in batch:
+                existing = self._guests.get(doc["id"])
+                if existing is not None:
+                    started.append(self._enrich_doc(doc, existing))
+                else:
+                    started.append(self._start_guest(doc, request, owner))
+        except Exception:
+            # One failed guest fails the whole create. Release every record and
+            # guest of this batch, so no ghost holds quota, and forget the
+            # Idempotency-Key so a retry creates again.
+            for doc in batch:
+                self.delete(doc["id"])
+            if idempotency is not None:
+                with self._inner._lock:  # noqa: SLF001
+                    seen = self._inner._idempotency.get((api_key, idempotency))  # noqa: SLF001
+                    if seen is not None and seen[1] is docs:
+                        del self._inner._idempotency[(api_key, idempotency)]  # noqa: SLF001
+            raise
+        if "sandboxes" in docs:
+            return {"sandboxes": started, "count": len(started)}
+        return started[0]
+
+    def _enrich_doc(self, doc: dict[str, Any], guest: GuestRecord) -> dict[str, Any]:
+        enriched = dict(doc)
+        enriched["runtime"] = "kata" if self._use_kata else "docker"
+        fail_closed = not self._egress_manages(guest) and canonical_network_mode(guest.network_mode) in {"allowlist", "deny_all"}
+        enriched["guest"] = {
+            "container_id": guest.container_id,
+            "image": guest.image,
+            "dind": guest.dind,
+            "network_mode": guest.network_mode,
+            "network_name": guest.network,
+            "network_enforced": True,
+            "allowlist_fail_closed": fail_closed,
+            "network_switchable": self._egress_manages(guest),
+        }
+        if guest.workspace is not None:
+            enriched["workspace"] = {"name": guest.workspace[1], "path": guest.workspace[2],
+                                     "version_on_delete": guest.workspace[3]}
+        net = dict(enriched.get("network") or {"mode": guest.network_mode, "allow": []})
+        net.update(self._policy_doc(guest))
+        enriched["network"] = net
+        return enriched
+
+    def _egress_manages(self, guest: GuestRecord) -> bool:
+        return self._egress is not None and guest.attached
+
+    def _policy_doc(self, guest: GuestRecord) -> dict[str, Any]:
+        """The canonical policy that holds for *guest* and its sha256.
+
+        With the egress daemon this is the policy the daemon applied. Without
+        it, a guest with no interface has the policy of what it can reach:
+        deny_all.
+        """
+        if guest.policy is not None:
+            policy = guest.policy
+        elif guest.attached:
+            policy = canonical_network_policy("internet")
+        else:
+            policy = canonical_network_policy("deny_all")
+        return {
+            "policy": policy,
+            "policy_sha256": guest.policy_sha256 or network_policy_sha256(policy),
+            "enforced_by": "hotel_egress" if self._egress_manages(guest) else ("bridge" if guest.attached else "no_interface"),
+        }
+
+    def _attach_for(self, mode: str) -> bool:
+        """Give the guest a network interface for *mode*."""
+        mode = canonical_network_mode(mode)
+        if mode == "none":
+            return False
+        return mode == "internet" or self._egress is not None
+
+    def _ensure_image(
+        self, image: str, *, registry_auth: Mapping[str, str] | None = None, refresh: bool = False
+    ) -> None:
+        if registry_auth is not None or image in self._auth_pulled or self._pull_policy == "always":
+            refresh = True
+        self._client.ensure_image(
+            image,
+            registry_auth=registry_auth,
+            refresh=refresh,
+            mirror=self._registry_mirror,
+        )
+        if registry_auth is not None:
+            self._auth_pulled.add(image)
+            _save_auth_pulled(self._auth_pulled)
+
+    def _start_guest(
+        self, doc: dict[str, Any], request: CreateSandboxRequest, owner: str | None = None
+    ) -> dict[str, Any]:
+        """Start the guest for one record. The caller releases the record on failure."""
+        workspace = None
+        if request.workspace is not None and self._workspaces is not None and owner is not None:
+            spec = request.workspace
+            data = self._workspaces.mount(owner, spec.name, doc["id"])
+            workspace = (owner, spec.name, spec.path, spec.version_on_delete, data)
+        try:
+            return self._start_guest_mounted(doc, request, workspace, owner)
+        except BaseException:
+            if workspace is not None:
+                self._workspaces.unmount(workspace[0], workspace[1], doc["id"])
+            raise
+
+    def _start_guest_mounted(
+        self, doc: dict[str, Any], request: CreateSandboxRequest, workspace: tuple | None, owner: str | None = None
+    ) -> dict[str, Any]:
+        sandbox_id = doc["id"]
+        with self._inner._lock:  # noqa: SLF001
+            record = self._inner._sandboxes.get(sandbox_id)  # noqa: SLF001
+            if record is None or record.state in ("deleting", "deleted"):
+                # An Idempotency-Key replay of a sandbox that is gone or going.
+                raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
+        image = self._image_for(request)
+        if request.snapshot_id is not None:
+            pass  # _image_for returned the committed snapshot image or raised.
+        elif request.image is not None:
+            self._ensure_image(image, registry_auth=request.image.registry_auth)
+            inspected = self._client.image_inspect(image)
+            self._inner._images[image] = {  # noqa: SLF001
+                "ref": image,
+                "cached": True,
+                "size_bytes": int(inspected.get("Size") or 0),
+                "digest": (inspected.get("RepoDigests") or [None])[0],
+            }
+        elif request.build is not None:
+            self._inner._images[image] = {  # noqa: SLF001
+                "ref": image,
+                "cached": True,
+                "size_bytes": 0,
+                "digest": request.build.content_hash,
+            }
+        dind = is_dind_image(image)
+        work = Path(self._inner._sandboxes[sandbox_id].root) / "work"  # noqa: SLF001
+        name = f"cathedral-{sandbox_id}"
+        entrypoint = None if dind else (tuple(request.entrypoint) if request.entrypoint else ("sleep", "infinity"))
+        network = None
+        attach = self._attach_for(request.network.mode)
+        if self._net_pool is not None and attach:
+            self._net_pool.ensure(self._client)
+            network = self._net_pool.acquire()
+            with self._doomed_lock:
+                self._net_pending[sandbox_id] = network
+        try:
+            container_id = self._start_container(
+                request, sandbox_id=sandbox_id, image=image, name=name, work=work, dind=dind,
+                entrypoint=entrypoint, network=network, attach=attach,
+                mounts=[(workspace[4], workspace[2])] if workspace is not None else (),
+            )
+        except BaseException:
+            self._release_pending(sandbox_id)
+            raise
+        applied: dict[str, Any] | None = None
+        if attach and self._egress is not None:
+            # The daemon denies a new guest by default. Open it to its policy
+            # now; on failure the guest goes, so no guest runs unmanaged.
+            try:
+                applied = self._egress.apply(container_id, sandbox_id, request.network.policy,
+                                             self._owner_key(owner))
+            except BaseException as exc:
+                exited = self._client.exit_code_if_stopped(container_id)
+                self._client.remove_confirmed(container_id, timeout=self._rm_timeout)
+                self._egress.forget(container_id)
+                self._release_pending(sandbox_id)
+                if exited is not None:
+                    # The daemon found no running container: the entrypoint
+                    # ended at once. That is the request's fault, not ours.
+                    raise SandboxOpError(
+                        "entrypoint_exited", 400,
+                        f"the room's entrypoint ended at once with exit code {exited}; a room needs a long-running entrypoint",
+                    ) from exc
+                raise
+        if not self._inner.has_record(sandbox_id):
+            # GC or DELETE removed the record while the guest started. Do not
+            # register an orphan; the reconcile pass retries if this rm fails.
+            self._client.remove_confirmed(container_id, timeout=self._rm_timeout)
+            self._release_pending(sandbox_id)
+            raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
+        with self._doomed_lock:
+            self._net_pending.pop(sandbox_id, None)
+        self._guests[sandbox_id] = GuestRecord(
+            sandbox_id=sandbox_id,
+            container_id=container_id,
+            image=image,
+            dind=dind,
+            work_mount=work,
+            network_mode=request.network.mode,
+            network=network,
+            attached=attach,
+            policy=applied["policy"] if applied else None,
+            policy_sha256=applied["policy_sha256"] if applied else None,
+            workspace=workspace[:4] if workspace is not None else None,
+            owner=owner,
+        )
+        return self._after_start(doc, sandbox_id, container_id, dind)
+
+    def _release_pending(self, sandbox_id: str) -> None:
+        with self._doomed_lock:
+            network = self._net_pending.pop(sandbox_id, None)
+        if self._net_pool is not None:
+            self._net_pool.release(network)
+
+    def _start_container(
+        self,
+        request: CreateSandboxRequest,
+        *,
+        sandbox_id: str,
+        image: str,
+        name: str,
+        work: Path,
+        dind: bool,
+        entrypoint: tuple[str, ...] | None,
+        network: str | None,
+        attach: bool | None = None,
+        mounts: Iterable[tuple[Path, str]] = (),
+    ) -> str:
+        resolv_conf = None
+        if network and self._net_pool is not None and self._net_pool.dns:
+            # The guest's own copy, beside (not inside) its /work mount.
+            resolv_conf = work.parent / "resolv.conf"
+            work.parent.mkdir(parents=True, exist_ok=True)
+            resolv_conf.write_text("".join(f"nameserver {ns}\n" for ns in self._net_pool.dns))
+        return self._client.create_and_start(
+            image=image,
+            name=name,
+            work_dir=work,
+            vcpu=request.resources.vcpu,
+            memory_gib=request.resources.memory_gib,
+            disk_gib=request.resources.disk_gib,
+            network_mode=request.network.mode,
+            env=request.env,
+            dind=dind,
+            use_kata=self._use_kata,
+            entrypoint=entrypoint,
+            workdir=request.workdir,
+            user=request.user,
+            labels={LABEL_OWNER: self._owner, LABEL_SANDBOX_ID: sandbox_id},
+            network=network,
+            resolv_conf=resolv_conf,
+            attach=attach,
+            mounts=mounts,
+        )
+
+    def _after_start(self, doc: dict[str, Any], sandbox_id: str, container_id: str, dind: bool) -> dict[str, Any]:
+        if dind:
+            self._capabilities_dind = True
+            self._client.wait_dind_ready(container_id)
+        # Guest start can take longer than a short idle_timeout; refresh activity
+        # so idle GC does not reap a sandbox mid-create.
+        with self._inner._lock:  # noqa: SLF001
+            if sandbox_id in self._inner._sandboxes:  # noqa: SLF001
+                self._inner._touch(self._inner._sandboxes[sandbox_id])  # noqa: SLF001
+        return self._enrich_doc(doc, self._guests[sandbox_id])
+
+    def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
+        guest = self._guests.get(sandbox_id)
+        if guest is None:
+            return self._inner.exec(sandbox_id, request)
+        cwd = request.cwd or "/work"
+        argv = list(request.argv)
+        # Portable shell: ExecRequest maps string cmds to bash -c; many customer images
+        # (alpine, slim) only ship sh. Prefer sh when bash is not the guest's shell.
+        if argv and argv[0] == "bash":
+            argv[0] = "sh"
+        timeout_seconds = request.timeout_seconds or 60
+        # Enforce timeout inside the guest so the container stays alive (§3.2).
+        # The timeout form of the image is probed once with a no-op command.
+        # The customer command runs exactly once: an exit code of 127 from it
+        # is its own result, not a sign that the timeout binary is missing.
+        form = self._timeout_form(guest)
+        # GNU: TERM at the limit, KILL 5 s later for a command that ignores
+        # TERM. BusyBox: KILL at the limit (its -k is not on every build).
+        if form == "gnu":
+            wrapped = ["timeout", "-k", "5", str(timeout_seconds), *argv]
+        elif form == "busybox":
+            wrapped = ["timeout", "-s", "KILL", "-t", str(timeout_seconds), *argv]
+        else:
+            wrapped = argv
+        t0 = time.perf_counter()
+        code, out, err, timed_out = self._client.exec(
+            guest.container_id,
+            wrapped,
+            cwd=cwd,
+            env={**dict(request.env)},
+            timeout_seconds=timeout_seconds + 15 if wrapped is not argv else timeout_seconds,
+            stdin=request.stdin,
+            user=request.user,
+        )
+        # GNU timeout → 124; BusyBox/KILL → 137/143; client-side timeout flag.
+        if code in {124, 137, 143} or timed_out:
+            timed_out = True
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        with self._inner._lock:  # noqa: SLF001
+            sandbox = self._inner._require_active(sandbox_id)  # noqa: SLF001
+            sandbox.exec_history.append(
+                ExecRecord(
+                    command=_render_cmd(request),
+                    exit_code=code,
+                    duration_ms=duration_ms,
+                    at=_now(),
+                )
+            )
+            sandbox.container_stdout.extend(out.encode("utf-8", "replace"))
+            sandbox.container_stderr.extend(err.encode("utf-8", "replace"))
+            # The log record keeps the last EXEC_OUTPUT_CAP bytes: a room that
+            # prints without end must not grow the API's memory without end.
+            del sandbox.container_stdout[:-EXEC_OUTPUT_CAP]
+            del sandbox.container_stderr[:-EXEC_OUTPUT_CAP]
+            self._inner._touch(sandbox)  # noqa: SLF001
+        cap = 16 * 1024 * 1024
+        out_b = out.encode("utf-8", "replace") if isinstance(out, str) else out
+        err_b = err.encode("utf-8", "replace") if isinstance(err, str) else err
+        truncated = len(out_b) > cap or len(err_b) > cap
+        return ExecResult(
+            exit_code=code,
+            stdout=out_b[:cap].decode("utf-8", "replace"),
+            stderr=err_b[:cap].decode("utf-8", "replace"),
+            duration_ms=duration_ms,
+            timed_out=timed_out,
+            truncated=truncated,
+        )
+
+    def _timeout_form(self, guest: GuestRecord) -> str:
+        """Return "gnu", "busybox" or "none" for the guest image. Probe once.
+
+        The probe runs only "true", so a repeat has no side effect.
+        """
+        if guest.timeout_form is not None:
+            return guest.timeout_form
+        form = "none"
+        for name, probe in (("gnu", ["timeout", "5", "true"]), ("busybox", ["timeout", "-t", "5", "true"])):
+            code, _, _, _ = self._client.exec(
+                guest.container_id, probe, cwd=None, env={}, timeout_seconds=20, stdin=None
+            )
+            if code == 0:
+                form = name
+                break
+        guest.timeout_form = form
+        return form
+
+    def start_process(self, sandbox_id: str, request: ExecRequest) -> ProcessHandle:
+        guest = self._guests.get(sandbox_id)
+        if guest is None:
+            return self._inner.start_process(sandbox_id, request)
+        pid = "proc_" + uuid.uuid4().hex[:10]
+        log_guest = f"/work/.process-{pid}.log"
+        log_host = guest.work_mount / f".process-{pid}.log"
+        # Background inside the guest so it outlives the HTTP call (§3.2).
+        quoted = " ".join(shlex_quote(part) for part in request.argv)
+        starter = ["sh", "-c", f"({quoted}) > {log_guest} 2>&1"]
+        code, _, err, _ = self._client.exec(
+            guest.container_id,
+            starter,
+            cwd=request.cwd or "/work",
+            env={**dict(request.env)},
+            timeout_seconds=30,
+            stdin=None,
+            detach=True,
+            user=request.user,
+        )
+        if code != 0:
+            raise SandboxOpError(
+                "process_start_failed",
+                502,
+                f"failed to start background process: {err.strip()[:300]}",
+            )
+        guest.guest_processes[pid] = log_host
+        with self._inner._lock:  # noqa: SLF001
+            sandbox = self._inner._require_active(sandbox_id)  # noqa: SLF001
+            sandbox.processes[pid] = (None, log_host)  # type: ignore[arg-type]
+        return ProcessHandle(process_id=pid, argv=tuple(request.argv), running=True)
+
+    def process_logs(self, sandbox_id: str, process_id: str) -> str:
+        guest = self._guests.get(sandbox_id)
+        if guest is None or process_id not in guest.guest_processes:
+            return self._inner.process_logs(sandbox_id, process_id)
+        return _read_room_log(guest.guest_processes[process_id])
+
+    def stop_process(self, sandbox_id: str, process_id: str) -> None:
+        guest = self._guests.get(sandbox_id)
+        if guest is None or process_id not in guest.guest_processes:
+            return self._inner.stop_process(sandbox_id, process_id)
+        # Best-effort: kill matching process tree by log redirect is hard; use pkill on argv marker.
+        self._client.exec(
+            guest.container_id,
+            ["sh", "-c", f"pkill -f '.process-{process_id}.log' || true"],
+            cwd=None,
+            env={},
+            timeout_seconds=15,
+            stdin=None,
+        )
+
+    def write_file(self, sandbox_id: str, path: str, data: bytes, mode: int | None) -> None:
+        self._inner.write_file(sandbox_id, _in_work(path), data, mode)
+
+    def read_file(self, sandbox_id: str, spec: FileGet) -> tuple[bytes, int]:
+        _in_work(spec.path)
+        return self._inner.read_file(sandbox_id, spec)
+
+    def write_tar(self, sandbox_id: str, path: str, tarball: bytes) -> None:
+        self._inner.write_tar(sandbox_id, _in_work(path), tarball)
+
+    def read_tar(self, sandbox_id: str, spec: TarGet) -> bytes:
+        _in_work(spec.path)
+        return self._inner.read_tar(sandbox_id, spec)
+
+    def stat(self, sandbox_id: str, path: str) -> StatResult:
+        return self._inner.stat(sandbox_id, _in_work(path))
+
+    def snapshot(
+        self,
+        sandbox_id: str,
+        *,
+        ttl_seconds: int | None = None,
+        name: str | None = None,
+        labels: dict[str, str] | None = None,
+    ) -> str:
+        op_id = self._inner.snapshot(
+            sandbox_id, ttl_seconds=ttl_seconds, name=name, labels=labels
+        )
+        result = self._inner.get_operation(op_id)["result"]
+        snap_id = result["snapshot_id"]
+        if snap_id in self._snapshot_images:
+            # A named snapshot is get-or-create: keep the first commit unchanged.
+            return op_id
+        guest = self._guests.get(sandbox_id)
+        if guest is None:
+            return op_id
+        image_name = f"cathedral-snap-{snap_id}:latest"
+        try:
+            self._client.commit(guest.container_id, image_name)
+        except SandboxOpError:
+            # Drop the record, so no fork can find a snapshot without an image.
+            self._inner.delete_snapshot(snap_id)
+            raise
+        self._snapshot_images[snap_id] = image_name
+        sizes = self._snapshot_sizes(snap_id, image_name, guest.image, int(result.get("size_bytes") or 0))
+        self._snapshot_meta[snap_id] = sizes
+        with self._inner._lock:  # noqa: SLF001
+            entry = self._inner._snapshots.get(snap_id)  # noqa: SLF001
+            if entry is not None:
+                path, rec = entry
+                self._inner._snapshots[snap_id] = (path, replace(rec, size_bytes=sizes["size_bytes"]))  # noqa: SLF001
+            self._inner._operations[op_id]["result"].update(sizes)  # noqa: SLF001
+        return op_id
+
+    def _snapshot_sizes(self, snap_id: str, image_name: str, base_image: str, work_archive_bytes: int) -> dict[str, Any]:
+        """Sizes of one snapshot, in bytes.
+
+        image_size_bytes: the whole committed image, base layers included.
+        layer_size_bytes: the layer that docker commit added (image minus base).
+        work_archive_bytes: the compressed archive of /work (a bind mount, so
+        not in the image).
+        size_bytes: what this snapshot stores on the host (layer + archive).
+        """
+        image_size = self._client.image_size(image_name)
+        base_size = self._client.image_size(base_image)
+        layer_size = max(0, image_size - base_size) if base_size else image_size
+        return {
+            "size_bytes": layer_size + work_archive_bytes,
+            "layer_size_bytes": layer_size,
+            "image_size_bytes": image_size,
+            "work_archive_bytes": work_archive_bytes,
+            "image": image_name,
+        }
+
+    def list_snapshots(self, labels: Iterable[str] = ()) -> list[dict[str, Any]]:
+        out = self._inner.list_snapshots(labels)
+        for doc in out:
+            doc.update(self._snapshot_meta.get(doc["snapshot_id"], {}))
+        return out
+
+    def delete_snapshot(self, snapshot_id: str) -> bool:
+        existed = self._inner.delete_snapshot(snapshot_id)
+        if not existed:
+            # Unknown to the caller, or another key's: the image stays with
+            # its record. One whose record expired meanwhile loses its image
+            # in the next sweep.
+            return False
+        self._snapshot_meta.pop(snapshot_id, None)
+        image = self._snapshot_images.pop(snapshot_id, None)
+        if image:
+            self._client.run(["docker", "image", "rm", image], timeout=60.0)
+        return existed
+
+    def push_snapshot(
+        self, snapshot_id: str, *, image: str, registry_auth: Mapping[str, str] | None = None
+    ) -> dict[str, Any]:
+        """Push the committed image of a snapshot to a registry as *image*.
+
+        Any host can then start rooms from *image*. The image holds the root
+        file system only. /work is a bind mount and is not in the image.
+        """
+        local = self._snapshot_image(snapshot_id)
+        snap_id = self._resolve_snapshot(snapshot_id) or snapshot_id
+        digest = self._client.push(local, image, registry_auth=registry_auth)
+        if image != local:
+            # Untag: a local copy under the registry name would start for any
+            # key on this hotel with no pull and no credentials.
+            self._client.run(["docker", "image", "rm", image], timeout=60.0)
+        return {"snapshot_id": snap_id, "image": image, "digest": digest, "includes_work": False}
+
+    def set_network(self, sandbox_id: str, patch: NetworkPatch) -> dict[str, Any]:
+        self._require_credentials_support(patch.credentials)
+        guest = self._guests.get(sandbox_id)
+        if guest is not None and self._egress is not None:
+            return self._switch_policy(sandbox_id, guest, patch)
+        doc = self._inner.set_network(sandbox_id, patch)
+        if guest is not None and self._net_pool is not None:
+            if not self._attach_for(patch.mode):
+                self._client.set_network(guest.container_id, "none")
+                self._net_pool.release(guest.network)
+                guest.network = None
+                guest.attached = False
+            elif guest.network is None:
+                self._net_pool.ensure(self._client)
+                network = self._net_pool.acquire()
+                try:
+                    self._client.set_network(guest.container_id, "public", network)
+                except BaseException:
+                    self._net_pool.release(network)
+                    raise
+                guest.network = network
+                guest.attached = True
+            guest.network_mode = patch.mode
+        elif guest is not None:
+            attach = self._attach_for(patch.mode)
+            self._client.set_network(guest.container_id, "public" if attach else "none")
+            guest.network_mode = patch.mode
+            guest.attached = attach
+            doc["network"]["enforced"] = True
+            doc["network"]["allowlist_fail_closed"] = canonical_network_mode(patch.mode) in {"allowlist", "deny_all"}
+        if guest is not None:
+            doc["network"].update(self._policy_doc(guest))
+        return doc
+
+    def _switch_policy(self, sandbox_id: str, guest: GuestRecord, patch: NetworkPatch) -> dict[str, Any]:
+        """Live switch through the egress daemon. The guest keeps its interface;
+        only the rules outside it change. "none" on a live guest means deny_all."""
+        if not guest.attached:
+            raise SandboxOpError(
+                "network_not_switchable",
+                409,
+                f"sandbox {sandbox_id} was created with network none and has no interface; "
+                "create it with deny_all to switch its policy later",
+            )
+        mode = "deny_all" if patch.mode == "none" else patch.mode
+        policy = canonical_network_policy(mode, patch.allow, patch.credentials)
+        with self._inner._lock:  # noqa: SLF001
+            self._inner._require_running(sandbox_id)  # noqa: SLF001  a frozen room is 409 before the daemon moves
+        applied = self._egress.apply(guest.container_id, sandbox_id, policy, self._owner_key(guest.owner))
+        guest.policy, guest.policy_sha256 = applied["policy"], applied["policy_sha256"]
+        guest.network_mode = mode
+        doc = self._inner.set_network(sandbox_id, NetworkPatch(mode=mode, allow=tuple(patch.allow)))
+        doc["network"].update(self._policy_doc(guest))
+        if applied.get("applied_at"):
+            doc["network"]["applied_at"] = applied["applied_at"]
+        return doc
+
+    def freeze(self, sandbox_id: str) -> dict[str, Any]:
+        guest = self._guests.get(sandbox_id)
+        if guest is not None:
+            self._client.pause(guest.container_id)
+        return self._inner.freeze(sandbox_id)
+
+    def thaw(self, sandbox_id: str) -> dict[str, Any]:
+        guest = self._guests.get(sandbox_id)
+        doc = self._inner.thaw(sandbox_id)
+        if guest is not None:
+            self._client.unpause(guest.container_id)
+        return doc
+
+    def delete(self, sandbox_id: str) -> None:
+        """DELETE is idempotent (204). The record only goes when the container is gone.
+
+        When the container removal fails, the sandbox stays "deleting": hidden
+        from the API, still counted in quota. The next sweep retries it.
+        """
+        guest = self._guests.get(sandbox_id)
+        if guest is None:
+            self._inner.delete(sandbox_id)
+            return
+        for process_id in list(guest.guest_processes):
+            try:
+                self.stop_process(sandbox_id, process_id)
+            except SandboxOpError:
+                pass
+        if self._retire(sandbox_id):
+            self._remove_queued([sandbox_id])
+
+    def bulk_delete(self, labels: Iterable[str]) -> int:
+        # Must use this.delete so containers are removed (inner.bulk_delete would leak).
+        want = _parse_label_filters(labels)
+        if not want:
+            raise SandboxContractError("invalid_label", "bulk delete requires at least one label filter")
+        caller = self._inner._caller_key()  # noqa: SLF001
+        with self._inner._lock:  # noqa: SLF001
+            targets = [
+                sid
+                for sid, s in self._inner._sandboxes.items()  # noqa: SLF001
+                if s.state != "deleting"
+                and all(s.labels.get(k) == v for k, v in want.items())
+                and (caller is None or s.api_key is None or s.api_key == caller)
+            ]
+        retired = [sid for sid in targets if self._retire(sid)]
+        self._remove_queued(retired)
+        return len(targets)
+
+    # ------------------------------------------------------------------ GC
+    def _retire(self, sandbox_id: str) -> bool:
+        """Move a sandbox to "deleting" and queue its container for removal.
+
+        Return False when another caller already retired it. A record with no
+        container is dropped at once.
+        """
+        if not self._inner.begin_delete(sandbox_id):
+            return False
+        guest = self._guests.pop(sandbox_id, None)
+        if guest is None:
+            self._inner.finish_delete(sandbox_id)
+            return True
+        if self._egress is not None and guest.attached:
+            # Deny the leaving guest at once, so its address carries no policy
+            # to the next guest that gets it.
+            self._egress.forget(guest.container_id)
+        with self._doomed_lock:
+            self._doomed[sandbox_id] = guest.container_id
+            self._doomed_nets[sandbox_id] = guest.network
+            if guest.workspace is not None:
+                self._doomed_ws[sandbox_id] = guest.workspace
+        return True
+
+    def _confirm_removed(self, sandbox_id: str) -> None:
+        with self._doomed_lock:
+            self._doomed.pop(sandbox_id, None)
+            self._doomed_attempts.pop(sandbox_id, None)
+            network = self._doomed_nets.pop(sandbox_id, None)
+            workspace = self._doomed_ws.pop(sandbox_id, None)
+        if self._net_pool is not None:
+            self._net_pool.release(network)
+        if workspace is not None:
+            self._release_workspace(sandbox_id, workspace)
+        self._inner.finish_delete(sandbox_id)
+
+    def _release_workspace(self, sandbox_id: str, workspace: tuple[str, str, str, bool]) -> None:
+        """The room container is gone: free the workspace, then version it if asked.
+
+        A room delete never deletes the workspace. The version runs after the
+        container is gone, so no room writes during the copy.
+        """
+        owner, name, _path, version_on_delete = workspace
+        if self._workspaces is None:
+            return
+        self._workspaces.unmount(owner, name, sandbox_id)
+        if not version_on_delete:
+            return
+        try:
+            self._workspaces.version(owner, name, reason="room_delete")
+        except SandboxOpError as exc:
+            # The code only: a message could name files of the workspace.
+            print(f"cathedral-sandbox workspace: version on delete of {sandbox_id} failed: {exc.code}",
+                  file=sys.stderr, flush=True)
+
+    def _remove_queued(self, sandbox_ids: list[str]) -> None:
+        """Try once, in parallel, to remove the queued containers of *sandbox_ids*.
+
+        Failures stay queued for the next sweep.
+        """
+        with self._doomed_lock:
+            batch = [(sid, self._doomed[sid]) for sid in sandbox_ids if sid in self._doomed]
+
+        def done(index: int, gone: bool) -> None:
+            if gone:
+                self._confirm_removed(batch[index][0])
+
+        self._remove_many([cid for _, cid in batch], on_done=done)
+
+    def mark_expired(self) -> int:
+        """Move every collectable sandbox to "deleting". Fast; runs no docker command."""
+        marked = 0
+        for sid in self._inner.collectable_ids():
+            if self._retire(sid):
+                marked += 1
+        return marked
+
+    def _remove_many(self, refs: list[str], *, on_done=None) -> list[bool]:
+        """Remove containers with bounded parallelism. Return one result per ref.
+
+        *on_done(index, gone)* runs as soon as each removal ends, not after the
+        whole list. So each sandbox leaves "deleting" and quota when its own
+        container is confirmed gone.
+        """
+        if not refs:
+            return []
+        results = [False] * len(refs)
+        workers = min(self._gc_parallelism, len(refs))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cathedral-gc") as pool:
+            futures = {
+                pool.submit(self._client.remove_confirmed, ref, timeout=self._rm_timeout): i
+                for i, ref in enumerate(refs)
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    results[index] = bool(future.result())
+                except Exception:  # noqa: BLE001 - a failed removal stays queued for retry
+                    results[index] = False
+                if on_done is not None:
+                    on_done(index, results[index])
+        return results
+
+    def _drain_locked(self) -> int:
+        """Try once to remove each queued container. Caller holds _drain_lock."""
+        attempted: set[str] = set()
+        confirmed = 0
+        while True:
+            with self._doomed_lock:
+                batch = [(sid, cid) for sid, cid in self._doomed.items() if sid not in attempted]
+            if not batch:
+                return confirmed
+            attempted.update(sid for sid, _ in batch)
+
+            def done(index: int, gone: bool, batch=batch) -> None:
+                nonlocal confirmed
+                sid, cid = batch[index]
+                if gone:
+                    self._confirm_removed(sid)
+                    confirmed += 1
+                else:
+                    with self._doomed_lock:
+                        attempts = self._doomed_attempts.get(sid, 0) + 1
+                        self._doomed_attempts[sid] = attempts
+                    print(
+                        f"cathedral-sandbox gc: container {cid[:12]} of {sid} not removed "
+                        f"(attempt {attempts}); will retry",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+            self._remove_many([cid for _, cid in batch], on_done=done)
+
+    def _reconcile_locked(self) -> int:
+        """Remove containers with our owner label that have no sandbox record.
+
+        Caller holds _drain_lock. A record is created before its container, so
+        a container whose sandbox id has no record is an orphan.
+        """
+        try:
+            labeled = self._client.list_labeled(self._owner)
+        except SandboxOpError as exc:
+            print(f"cathedral-sandbox gc: reconcile skipped: {exc}", file=sys.stderr, flush=True)
+            return 0
+        with self._doomed_lock:
+            queued = set(self._doomed)
+        orphans = [
+            cid
+            for cid, sid in labeled
+            if sid not in queued and not (sid and self._inner.has_record(sid))
+        ]
+        removed = sum(1 for gone in self._remove_many(orphans) if gone)
+        self._reconcile_snapshot_images()
+        if self._net_pool is not None:
+            # Drift guard: count ports from what this API holds now.
+            with self._doomed_lock:
+                held = [g.network for g in list(self._guests.values())]
+                held += list(self._doomed_nets.values()) + list(self._net_pending.values())
+            self._net_pool.recount(held)
+        return removed
+
+    def room_networks(self) -> dict[str, Any] | None:
+        """Port use per room network, or None when the pool is off."""
+        return None if self._net_pool is None else self._net_pool.document()
+
+    def quota(self) -> dict[str, Any]:
+        doc = self._inner.quota()
+        if self._net_pool is not None:
+            doc["room_networks"] = self._net_pool.document()
+        return doc
+
+    def sweep(self) -> int:
+        """GC expired guests. Return the number of sandboxes collected by this call.
+
+        1. Mark expired records "deleting" (hidden from the API, still in quota).
+        2. Remove queued containers in parallel batches. Drop each record only
+           after its container is confirmed gone. Failures stay queued.
+        3. At most every CATHEDRAL_SANDBOX_RECONCILE_SECONDS, remove labeled
+           containers that have no record.
+        Only one call runs steps 2 and 3 at a time. A concurrent call returns
+        after step 1.
+        """
+        marked = self.mark_expired()
+        if self._drain_lock.acquire(blocking=False):
+            try:
+                self._drain_locked()
+                now = time.monotonic()
+                if self._last_reconcile is None or now - self._last_reconcile >= self._reconcile_interval:
+                    self._last_reconcile = now
+                    self._reconcile_locked()
+            finally:
+                self._drain_lock.release()
+        # Drops expired log tombstones only. A record that became collectable
+        # during the drain goes through the two-phase delete on the next
+        # sweep; collecting it here left its container and policy behind.
+        self._inner.sweep_tombstones()
+        self._gc_snapshot_images()
+        return marked
+
+    def _gc_snapshot_images(self) -> None:
+        """Remove the committed image of a snapshot whose record expired."""
+        with self._inner._lock:  # noqa: SLF001
+            self._inner._sweep_snapshots_locked()  # noqa: SLF001
+            live = set(self._inner._snapshots)  # noqa: SLF001
+        for sid, image in list(self._snapshot_images.items()):
+            if sid not in live:
+                self._client.run(["docker", "image", "rm", image], timeout=60.0)
+                self._snapshot_images.pop(sid, None)
+                self._snapshot_meta.pop(sid, None)
+
+    def _reconcile_snapshot_images(self) -> None:
+        """Remove cathedral-snap-* images no snapshot record names (left by a restart)."""
+        listed = self._client.run(
+            ["docker", "images", "--filter", "reference=cathedral-snap-*", "--format", "{{.Repository}}:{{.Tag}}"],
+            timeout=60.0,
+        )
+        if listed.returncode != 0:
+            return
+        known = set(self._snapshot_images.values())
+        for image in listed.stdout.split():
+            if image not in known:
+                self._client.run(["docker", "image", "rm", image], timeout=60.0)
+
+    def pending_removals(self) -> dict[str, str]:
+        """Sandbox id -> container id for containers not yet confirmed gone."""
+        with self._doomed_lock:
+            return dict(self._doomed)
+
+    def status(self) -> StatusReport:
+        report = self._inner.status()
+        return StatusReport(
+            status=report.status,
+            create_latency_p50_ms=report.create_latency_p50_ms,
+            error_rate=report.error_rate,
+            region=report.region,
+            runtime="kata" if self._use_kata else "docker",
+            kernel_isolation=self._use_kata or runtime_has_kernel_isolation(self._oci_runtime),
+            dind=self.capabilities_dind,
+            disk_enforced=True,
+            network_allowlist_enforced=self._egress is not None,
+        )
+
+    def prefetch(self, request: PrefetchRequest) -> str:
+        pulled: list[dict[str, Any]] = []
+        for image in request.images:
+            # Prefetch is the explicit refresh path: it always pulls.
+            self._ensure_image(image, registry_auth=request.registry_auth, refresh=True)
+            inspected = self._client.image_inspect(image)
+            entry = {
+                "ref": image,
+                "cached": True,
+                "size_bytes": int(inspected.get("Size") or 0),
+                "digest": (inspected.get("RepoDigests") or [None])[0],
+            }
+            self._inner._images[image] = entry  # noqa: SLF001
+            pulled.append(dict(entry))
+        op_id = self._inner.prefetch(PrefetchRequest(images=request.images))
+        with self._inner._lock:  # noqa: SLF001
+            self._inner._operations[op_id]["result"]["images"] = pulled  # noqa: SLF001
+        return op_id
+
+    def image_status(self, ref: str) -> dict[str, Any]:
+        entry = self._inner.image_status(ref)
+        if entry.get("cached") and "ref" not in entry:
+            entry = {"ref": ref, **entry}
+        if not entry.get("cached") and self._client.image_exists(ref):
+            inspected = self._client.image_inspect(ref)
+            entry = {
+                "ref": ref,
+                "cached": True,
+                "size_bytes": int(inspected.get("Size") or 0),
+                "digest": (inspected.get("RepoDigests") or [None])[0],
+            }
+            self._inner._images[ref] = entry  # noqa: SLF001
+        return entry
+
+    def terminal_write(self, sandbox_id: str, terminal_id: str, data: str) -> dict[str, Any]:
+        # The inner provider keeps the terminal's buffers; each complete line
+        # runs through this provider's exec, in the room's container (B154).
+        return self._inner.terminal_write(sandbox_id, terminal_id, data, executor=self.exec)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def close(self) -> None:
+        refs = [g.container_id for g in self._guests.values()]
+        with self._doomed_lock:
+            refs.extend(self._doomed.values())
+            self._doomed.clear()
+        self._remove_many(refs)
+        self._guests.clear()
+        self._inner.close()
+
+
+def shlex_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+__all__ = [
+    "DIND_DOCKERD_ARGS_DEFAULT",
+    "DindConfig",
+    "DockerClient",
+    "DockerGuestProvider",
+    "GuestRecord",
+    "docker_cli_available",
+    "docker_daemon_ready",
+    "is_dind_image",
+]

@@ -9,14 +9,29 @@ mode.
 The current anonymous `linux/amd64` image is:
 
 ```text
-ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:0dc8db081dc35a993e8d59936c3ad036b39e68da84751282d9bba4ef16db2255
+ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:3e1cb9144417e1e0d526445a43245e305e772cae0568202a332183071ef0c584
 ```
 
 Its OCI revision label is
-`8dde6eaca27116eed53386a1fa33ec70b74a01fb` and its fixed runtime-contract
+`dd7182ccd91ca25b566ff210025bdea5fda57c4c` and its fixed runtime-contract
 label is `snp-signed-validator-fleet-v1`. The immutable digest proves the
 published bytes available from GHCR. It does not prove a running SNP machine,
 vendor evidence, validator admission, or an on-chain weight.
+
+The image is fixed to Bittensor `finney` netuid 94 (label
+`org.cathedral.image-chain=finney-94`) and refuses any other chain. The same
+commit is also published for the testnet 584 rehearsal under the tag
+`sha-dd7182ccd91ca25b566ff210025bdea5fda57c4c-test584`:
+
+```text
+ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:ed22b47631819fd709138065143223b6df75e2239880d05ec83ccded28dbc87a
+```
+
+That image carries `org.cathedral.image-chain=test-584` and refuses mainnet.
+Use it only on testnet. One rehearsal on 2026-10-16 ran it in an AMD EPYC
+Genoa SEV-SNP guest, where the testnet validator admitted it and set full
+weight on netuid 584. That is testnet evidence for this commit, not an SN94
+admission.
 
 ## Fixed behavior
 

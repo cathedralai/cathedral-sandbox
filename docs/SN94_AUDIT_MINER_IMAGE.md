@@ -6,14 +6,14 @@ This page records the immutable image contract. Use the repository
 ## Current release
 
 ```text
-Source: 78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8
-Image: ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99
+Source: a22fb1df124ed3e4414335f109f30624152ff548
+Image: ghcr.io/cathedralai/cathedral-sn39-audit-miner@sha256:7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b
 Platform: linux/amd64
 Runtime contract: signed-validator-fleet-v1
 ```
 
 The digest was published by GitHub Actions run
-[`33266307118`](https://github.com/cathedralai/cathedral-sandbox/actions/runs/33266307118)
+[`37065132586`](https://github.com/cathedralai/cathedral-sandbox/actions/runs/37065132586)
 with build provenance and anonymous registry access. This proves the published
 artifact, not a live deployment.
 

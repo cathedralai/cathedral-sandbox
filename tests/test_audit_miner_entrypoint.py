@@ -399,7 +399,7 @@ def test_operator_doc_keeps_digest_and_tdx_measurement_as_separate_boundaries() 
 
     assert (
         f"{IMAGE_PATH}@sha256:"
-        "c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99"
+        "7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b"
         in documentation
     )
     assert "/sys/kernel/config/tsm/report" in documentation
@@ -423,11 +423,11 @@ def test_operator_docs_bind_the_current_image_and_one_migration_boundary() -> No
     mining = (REPOSITORY_ROOT / "docs" / "MINING.md").read_text()
 
     for documentation in (image_documentation, operations):
-        assert "78e588eeb8ad4d9fa5c7c23bba0205c08fc28ba8" in " ".join(
+        assert "a22fb1df124ed3e4414335f109f30624152ff548" in " ".join(
             documentation.split()
         )
     for documentation in (image_documentation, operations, work_request):
-        assert "c73070da9bef25d1fad1769c8f14878a5537964663545deaf377bf34f2644d99" in (
+        assert "7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b" in (
             " ".join(documentation.split())
         )
 
@@ -566,3 +566,31 @@ def test_host_startup_uses_fixed_owner_checked_mounts_and_container_limits() -> 
     assert "BEARER" not in script
     assert "SEED" not in script
     assert "RPC" not in script
+
+
+def test_image_chain_defaults_to_mainnet(tmp_path):
+    from cathedral.audit_miner_entrypoint import load_image_chain
+    assert load_image_chain(tmp_path / "absent.json") == ("finney", 94)
+
+
+def test_image_chain_accepts_testnet_584(tmp_path):
+    from cathedral.audit_miner_entrypoint import load_image_chain
+    path = tmp_path / "image_chain.json"
+    path.write_text('{"network":"test","netuid":584}')
+    assert load_image_chain(path) == ("test", 584)
+
+
+@pytest.mark.parametrize("body", [
+    '{"network":"finney","netuid":584}',
+    '{"network":"test","netuid":94}',
+    '{"network":"test","netuid":true}',
+    '{"network":"test"}',
+    '{"network":"test","netuid":584,"extra":1}',
+    '[]',
+])
+def test_image_chain_refuses_other_pairs(tmp_path, body):
+    from cathedral.audit_miner_entrypoint import load_image_chain
+    path = tmp_path / "image_chain.json"
+    path.write_text(body)
+    with pytest.raises(RuntimeError):
+        load_image_chain(path)
