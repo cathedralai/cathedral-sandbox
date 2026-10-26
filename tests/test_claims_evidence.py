@@ -81,18 +81,25 @@ def _digests(agent_output: bytes) -> dict[str, str]:
 def _manifest(digests: dict[str, str], **over):
     values = dict(
         netuid=111,
+        network="finney",
         batch_id="batch-2026-10-01",
-        assignment_id="assign-1",
-        operation_id="op-1",
-        attempt_id="attempt-1",
+        run_id="run-1",
+        task_id="task-1",
+        artifact_id="artifact-1",
+        uid=42,
+        hotkey="5FixtureMinerHotkey0000000000000001",
         paper_id="rietveld-2013",
-        miner_hotkey="5FixtureMinerHotkey0000000000000001",
-        stage_id="shared_reference_prep",
         source_pdf_sha256=digests["source_pdf_sha256"],
-        source_payload_sha256=digests["source_payload_sha256"],
+        source_payload_hash=digests["source_payload_hash"],
         image_digest_sha256=digests["image_digest_sha256"],
         workload_commit_sha256=digests["workload_commit_sha256"],
         execution_policy_sha256=digests["execution_policy_sha256"],
+        cathedral={
+            "assignment_id": "assign-1",
+            "operation_id": "op-1",
+            "attempt_id": "attempt-1",
+            "stage_id": "shared_reference_prep",
+        },
     )
     values.update(over)
     return build_claims_manifest(**values)
@@ -110,7 +117,7 @@ def _issue(agent_output: bytes | None = None, **over):
         signing_key_id=KEY_ID,
         issued_at=ISSUED_AT,
         manifest=manifest,
-        agent_output_sha256=digests["agent_output_sha256"],
+        artifact_hash=digests["artifact_hash"],
         terminal_status="succeeded",
         assurance_level="service_signed",
         reuse_authorized_until=ISSUED_AT + timedelta(days=14),
@@ -144,17 +151,17 @@ def test_issue_and_verify_accepts_matching_bundle():
     assert verified.document["schema"] == CLAIMS_EVIDENCE_SCHEMA
     assert verified.document["policy_digest"] == CLAIMS_EVIDENCE_POLICY_DIGEST
     assert verified.document["assurance_level"] == "service_signed"
-    assert verified.document["agent_output_sha256"] == digests["agent_output_sha256"]
+    assert verified.document["artifact_hash"] == digests["artifact_hash"]
+    assert verified.document["run_id"] == "run-1"
+    assert verified.document["uid"] == 42
+    assert verified.document["hotkey"].startswith("5Fixture")
     assert json.loads(canonical_claims_json(manifest).decode())["schema"] == CLAIMS_MANIFEST_SCHEMA
 
 
 def test_wrong_miner_is_rejected():
-    evidence, manifest, _, output = _issue()
+    evidence, _, _, output = _issue()
     trusted = parse_claims_evidence_trusted_keys_json(_trusted_keys_bytes())
-    wrong = dict(manifest)
-    wrong["miner_hotkey"] = "5OtherMinerHotkey0000000000000000002"
-    # rebuild through builder for valid id shape
-    wrong = _manifest(_digests(output), miner_hotkey="5OtherMinerHotkey0000000000000000002")
+    wrong = _manifest(_digests(output), hotkey="5OtherMinerHotkey0000000000000000002")
     verified = verify_claims_evidence(
         evidence,
         trusted,
@@ -163,7 +170,7 @@ def test_wrong_miner_is_rejected():
         now=ISSUED_AT + timedelta(hours=1),
     )
     assert verified.accepted is False
-    assert "miner_hotkey_mismatch" in verified.reject_reasons
+    assert "hotkey_mismatch" in verified.reject_reasons
     assert "manifest_digest_mismatch" in verified.reject_reasons
 
 
@@ -179,7 +186,7 @@ def test_tampered_agent_output_is_rejected():
         now=ISSUED_AT + timedelta(hours=1),
     )
     assert verified.accepted is False
-    assert "agent_output_digest_mismatch" in verified.reject_reasons
+    assert "artifact_digest_mismatch" in verified.reject_reasons
 
 
 def test_expired_reuse_window_is_rejected():
@@ -213,7 +220,7 @@ def test_confidential_cpu_cannot_be_issued_yet():
             signing_key_id=KEY_ID,
             issued_at=ISSUED_AT,
             manifest=_manifest(digests),
-            agent_output_sha256=digests["agent_output_sha256"],
+            artifact_hash=digests["artifact_hash"],
             assurance_level="confidential_cpu",
         )
     assert err.value.category == "policy"
@@ -227,7 +234,7 @@ def test_failed_terminal_status_not_accepted():
         signing_key_id=KEY_ID,
         issued_at=ISSUED_AT,
         manifest=_manifest(digests),
-        agent_output_sha256=digests["agent_output_sha256"],
+        artifact_hash=digests["artifact_hash"],
         terminal_status="failed",
     )
     trusted = parse_claims_evidence_trusted_keys_json(_trusted_keys_bytes())
@@ -351,8 +358,8 @@ def test_digests_match_claims_artifact_hash_for_pretty_non_ascii_json():
         workload_commit_ref=COMMIT_REF,
         execution_policy=POLICY,
     )
-    assert digests["agent_output_sha256"] == _claims_stable_hash(agent_output)
-    assert digests["source_payload_sha256"] == _claims_stable_hash(payload)
+    assert digests["artifact_hash"] == _claims_stable_hash(agent_output)
+    assert digests["source_payload_hash"] == _claims_stable_hash(payload)
 
     evidence, manifest, _, _ = _issue(agent_output=raw_output)
     trusted = parse_claims_evidence_trusted_keys_json(_trusted_keys_bytes())
@@ -366,21 +373,21 @@ def test_digests_match_claims_artifact_hash_for_pretty_non_ascii_json():
         now=ISSUED_AT + timedelta(hours=1),
     )
     assert verified.accepted is True
-    assert verified.document["agent_output_sha256"] == _claims_stable_hash(agent_output)
+    assert verified.document["artifact_hash"] == _claims_stable_hash(agent_output)
 
 
 def test_manifest_agent_output_digest_is_enforced():
     output = tiny_claims_agent_output(paper_id="p", claim_statement="c")
     digests = _digests(output)
     other = tiny_claims_agent_output(paper_id="p", claim_statement="other")
-    manifest = _manifest(digests, agent_output_sha256=_digests(other)["agent_output_sha256"])
+    manifest = _manifest(digests, artifact_hash=_digests(other)["artifact_hash"])
     with pytest.raises(ClaimsEvidenceError) as err:
         issue_claims_evidence(
             private_key=PRIVATE_KEY,
             signing_key_id=KEY_ID,
             issued_at=ISSUED_AT,
             manifest=manifest,
-            agent_output_sha256=digests["agent_output_sha256"],
+            artifact_hash=digests["artifact_hash"],
         )
     assert err.value.category == "binding"
 
@@ -390,13 +397,13 @@ def test_manifest_agent_output_digest_is_enforced():
         evidence, trusted, expected_manifest=manifest, now=ISSUED_AT + timedelta(hours=1)
     )
     assert verified.accepted is False
-    assert "agent_output_sha256_mismatch" in verified.reject_reasons
+    assert "artifact_hash_mismatch" in verified.reject_reasons
 
 
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda m: m.update(run_id="run-other"),
+        lambda m: m.update(operation_id="op-other"),
         lambda m: m.update(schema="bogus"),
         lambda m: m.pop("paper_id"),
         lambda m: m.update(netuid="111"),
@@ -414,7 +421,7 @@ def test_manifest_is_strict(mutate):
             signing_key_id=KEY_ID,
             issued_at=ISSUED_AT,
             manifest=manifest,
-            agent_output_sha256=digests["agent_output_sha256"],
+            artifact_hash=digests["artifact_hash"],
         )
     assert err.value.category == "schema"
 
@@ -486,3 +493,25 @@ def test_cli_verify_rejects_oversized_observed_agent_output(tmp_path: Path, caps
     out = capsys.readouterr().out
     assert '"accepted": false' in out or '"accepted":false' in out
     assert "exceeds the maximum encoded size" in out
+
+
+
+def test_claims_native_ids_are_bound():
+    evidence, manifest, digests, output = _issue()
+    trusted = parse_claims_evidence_trusted_keys_json(_trusted_keys_bytes())
+    verified = verify_claims_evidence(
+        evidence,
+        trusted,
+        expected_manifest=manifest,
+        observed_agent_output=output,
+        now=ISSUED_AT + timedelta(hours=1),
+    )
+    assert verified.accepted is True
+    assert verified.document["run_id"] == "run-1"
+    assert verified.document["task_id"] == "task-1"
+    assert verified.document["artifact_id"] == "artifact-1"
+    assert verified.document["uid"] == 42
+    assert verified.document["network"] == "finney"
+    assert verified.document["artifact_hash"] == digests["artifact_hash"]
+    assert verified.document["source_payload_hash"] == digests["source_payload_hash"]
+    assert verified.document["cathedral"]["stage_id"] == "shared_reference_prep"

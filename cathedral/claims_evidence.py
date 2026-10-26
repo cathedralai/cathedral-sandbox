@@ -70,24 +70,30 @@ _TOP_LEVEL_KEYS = frozenset(
         "assurance_level",
         "terminal_status",
         "netuid",
+        "network",
         "batch_id",
-        "assignment_id",
-        "operation_id",
-        "attempt_id",
+        "run_id",
+        "task_id",
+        "artifact_id",
+        "uid",
+        "hotkey",
         "paper_id",
-        "miner_hotkey",
-        "stage_id",
         "manifest_sha256",
         "source_pdf_sha256",
-        "source_payload_sha256",
-        "agent_output_sha256",
+        "source_payload_hash",
+        "artifact_hash",
         "image_digest_sha256",
         "workload_commit_sha256",
         "execution_policy_sha256",
+        "cathedral",
         "reuse_authorized_until",
         "signature",
     }
 )
+_CATHEDRAL_OPTIONAL_KEYS = frozenset(
+    {"assignment_id", "operation_id", "attempt_id", "stage_id"}
+)
+_NETWORK_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _SIGNATURE_KEYS = frozenset({"algorithm", "value_base64"})
 _TRUSTED_KEYS_TOP_LEVEL = frozenset({"schema", "keys"})
 _TRUSTED_KEY_FIELDS = frozenset(
@@ -292,38 +298,43 @@ def _utc_stamp(moment: datetime) -> str:
 def build_claims_manifest(
     *,
     netuid: int,
+    network: str,
     batch_id: str,
-    assignment_id: str,
-    operation_id: str,
-    attempt_id: str,
+    run_id: str,
+    task_id: str,
+    artifact_id: str,
+    uid: int,
+    hotkey: str,
     paper_id: str,
-    miner_hotkey: str,
-    stage_id: str,
     source_pdf_sha256: str,
-    source_payload_sha256: str,
+    source_payload_hash: str,
     image_digest_sha256: str,
     workload_commit_sha256: str,
     execution_policy_sha256: str,
-    agent_output_sha256: str | None = None,
+    artifact_hash: str | None = None,
+    cathedral: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Claims job identity + digests (the submit body, without signature)."""
+    """Claims job identity + digests (Claims-native ids; optional Cathedral block)."""
 
-    if not isinstance(netuid, int) or netuid < 0 or netuid > 65535:
+    if not isinstance(netuid, int) or isinstance(netuid, bool) or netuid < 0 or netuid > 65535:
         raise ClaimsEvidenceError("schema", "netuid must be an integer in 0..65535")
+    if not isinstance(uid, int) or isinstance(uid, bool) or uid < 0 or uid > 65535:
+        raise ClaimsEvidenceError("schema", "uid must be an integer in 0..65535")
+    if not isinstance(network, str) or _NETWORK_RE.fullmatch(network) is None:
+        raise ClaimsEvidenceError("schema", "network is invalid")
     manifest: dict[str, object] = {
         "schema": CLAIMS_MANIFEST_SCHEMA,
         "netuid": netuid,
+        "network": network,
         "batch_id": _require_id(batch_id, field="batch_id"),
-        "assignment_id": _require_id(assignment_id, field="assignment_id"),
-        "operation_id": _require_id(operation_id, field="operation_id"),
-        "attempt_id": _require_id(attempt_id, field="attempt_id"),
+        "run_id": _require_id(run_id, field="run_id"),
+        "task_id": _require_id(task_id, field="task_id"),
+        "artifact_id": _require_id(artifact_id, field="artifact_id"),
+        "uid": uid,
+        "hotkey": _require_id(hotkey, field="hotkey"),
         "paper_id": _require_id(paper_id, field="paper_id"),
-        "miner_hotkey": _require_id(miner_hotkey, field="miner_hotkey"),
-        "stage_id": _require_id(stage_id, field="stage_id"),
         "source_pdf_sha256": _require_sha256(source_pdf_sha256, field="source_pdf_sha256"),
-        "source_payload_sha256": _require_sha256(
-            source_payload_sha256, field="source_payload_sha256"
-        ),
+        "source_payload_hash": _require_sha256(source_payload_hash, field="source_payload_hash"),
         "image_digest_sha256": _require_sha256(image_digest_sha256, field="image_digest_sha256"),
         "workload_commit_sha256": _require_sha256(
             workload_commit_sha256, field="workload_commit_sha256"
@@ -332,33 +343,40 @@ def build_claims_manifest(
             execution_policy_sha256, field="execution_policy_sha256"
         ),
     }
-    if agent_output_sha256 is not None:
-        manifest["agent_output_sha256"] = _require_sha256(
-            agent_output_sha256, field="agent_output_sha256"
-        )
+    if artifact_hash is not None:
+        manifest["artifact_hash"] = _require_sha256(artifact_hash, field="artifact_hash")
+    if cathedral is not None:
+        if not isinstance(cathedral, Mapping) or set(cathedral) - _CATHEDRAL_OPTIONAL_KEYS:
+            raise ClaimsEvidenceError("schema", "cathedral optional block has unexpected fields")
+        if not cathedral:
+            raise ClaimsEvidenceError("schema", "cathedral optional block must not be empty")
+        frozen_cat: dict[str, object] = {}
+        for field, value in cathedral.items():
+            frozen_cat[field] = _require_id(value, field=f"cathedral.{field}")
+        manifest["cathedral"] = frozen_cat
     return manifest
 
 
 _MANIFEST_STRING_FIELDS = (
+    "network",
     "batch_id",
-    "assignment_id",
-    "operation_id",
-    "attempt_id",
+    "run_id",
+    "task_id",
+    "artifact_id",
+    "hotkey",
     "paper_id",
-    "miner_hotkey",
-    "stage_id",
     "source_pdf_sha256",
-    "source_payload_sha256",
+    "source_payload_hash",
     "image_digest_sha256",
     "workload_commit_sha256",
     "execution_policy_sha256",
 )
-_MANIFEST_REQUIRED_KEYS = frozenset({"schema", "netuid", *_MANIFEST_STRING_FIELDS})
-_MANIFEST_ALLOWED_KEYS = _MANIFEST_REQUIRED_KEYS | {"agent_output_sha256"}
+_MANIFEST_REQUIRED_KEYS = frozenset({"schema", "netuid", "uid", *_MANIFEST_STRING_FIELDS})
+_MANIFEST_ALLOWED_KEYS = _MANIFEST_REQUIRED_KEYS | {"artifact_hash", "cathedral"}
 
 
 def _freeze_manifest(manifest: Mapping[str, object]) -> tuple[dict[str, object], str | None]:
-    """Strictly validate a job manifest; return it without agent_output_sha256 plus that digest."""
+    """Strictly validate a job manifest; return it without artifact_hash plus that digest."""
 
     if not isinstance(manifest, Mapping):
         raise ClaimsEvidenceError("schema", "claims manifest must be a JSON object")
@@ -368,19 +386,26 @@ def _freeze_manifest(manifest: Mapping[str, object]) -> tuple[dict[str, object],
     if manifest["schema"] != CLAIMS_MANIFEST_SCHEMA:
         raise ClaimsEvidenceError("schema", "claims manifest schema is unsupported")
     netuid = manifest["netuid"]
+    uid = manifest["uid"]
     if isinstance(netuid, bool) or not isinstance(netuid, int):
         raise ClaimsEvidenceError("schema", "netuid must be an integer in 0..65535")
+    if isinstance(uid, bool) or not isinstance(uid, int):
+        raise ClaimsEvidenceError("schema", "uid must be an integer in 0..65535")
     for field in _MANIFEST_STRING_FIELDS:
         if not isinstance(manifest[field], str):
             raise ClaimsEvidenceError("schema", f"{field} is invalid")
-    agent_output_sha256 = manifest.get("agent_output_sha256")
-    if agent_output_sha256 is not None:
-        agent_output_sha256 = _require_sha256(agent_output_sha256, field="agent_output_sha256")
+    artifact_hash = manifest.get("artifact_hash")
+    if artifact_hash is not None:
+        artifact_hash = _require_sha256(artifact_hash, field="artifact_hash")
+    cathedral = manifest.get("cathedral")
     frozen = build_claims_manifest(
         netuid=netuid,
+        uid=uid,
+        cathedral=cathedral if isinstance(cathedral, Mapping) else None,
         **{field: str(manifest[field]) for field in _MANIFEST_STRING_FIELDS},
     )
-    return frozen, agent_output_sha256
+    return frozen, artifact_hash
+
 
 
 def digest_claims_artifacts(
@@ -401,8 +426,8 @@ def digest_claims_artifacts(
 
     return {
         "source_pdf_sha256": sha256_hex(source_pdf),
-        "source_payload_sha256": claims_json_bytes_sha256(source_payload, label="source_payload"),
-        "agent_output_sha256": claims_json_bytes_sha256(agent_output, label="agent_output"),
+        "source_payload_hash": claims_json_bytes_sha256(source_payload, label="source_payload"),
+        "artifact_hash": claims_json_bytes_sha256(agent_output, label="agent_output"),
         "image_digest_sha256": sha256_hex(image_digest_ref),
         "workload_commit_sha256": sha256_hex(workload_commit_ref),
         "execution_policy_sha256": sha256_hex(execution_policy),
@@ -485,7 +510,8 @@ def parse_claims_evidence_json(data: bytes | str) -> dict[str, object]:
     encoded = data if isinstance(data, bytes) else data.encode("utf-8")
     if encoded != canonical_claims_json(document):
         raise ClaimsEvidenceError("schema", "claims evidence bytes are not canonical")
-    if set(document) != _TOP_LEVEL_KEYS:
+    keys = set(document)
+    if not keys <= _TOP_LEVEL_KEYS or (_TOP_LEVEL_KEYS - {"cathedral"}) - keys:
         raise ClaimsEvidenceError("schema", "claims evidence has unexpected or missing fields")
     if document.get("schema") != CLAIMS_EVIDENCE_SCHEMA:
         raise ClaimsEvidenceError("schema", "claims evidence schema is unsupported")
@@ -507,28 +533,41 @@ def parse_claims_evidence_json(data: bytes | str) -> dict[str, object]:
         _KEY_ID_RE.fullmatch(str(document["signing_key_id"])) is None
     ):
         raise ClaimsEvidenceError("schema", "signing_key_id is invalid")
-    if not isinstance(document.get("netuid"), int):
+    if isinstance(document.get("netuid"), bool) or not isinstance(document.get("netuid"), int):
         raise ClaimsEvidenceError("schema", "netuid must be an integer")
+    if isinstance(document.get("uid"), bool) or not isinstance(document.get("uid"), int):
+        raise ClaimsEvidenceError("schema", "uid must be an integer")
+    if not isinstance(document.get("network"), str) or (
+        _NETWORK_RE.fullmatch(str(document["network"])) is None
+    ):
+        raise ClaimsEvidenceError("schema", "network is invalid")
     for field in (
         "batch_id",
-        "assignment_id",
-        "operation_id",
-        "attempt_id",
+        "run_id",
+        "task_id",
+        "artifact_id",
+        "hotkey",
         "paper_id",
-        "miner_hotkey",
-        "stage_id",
     ):
         _require_id(document.get(field), field=field)
     for field in (
         "manifest_sha256",
         "source_pdf_sha256",
-        "source_payload_sha256",
-        "agent_output_sha256",
+        "source_payload_hash",
+        "artifact_hash",
         "image_digest_sha256",
         "workload_commit_sha256",
         "execution_policy_sha256",
     ):
         _require_sha256(document.get(field), field=field)
+    if "cathedral" in document:
+        cathedral = document["cathedral"]
+        if not isinstance(cathedral, dict) or set(cathedral) - _CATHEDRAL_OPTIONAL_KEYS:
+            raise ClaimsEvidenceError("schema", "cathedral optional block is invalid")
+        if not cathedral:
+            raise ClaimsEvidenceError("schema", "cathedral optional block must not be empty")
+        for field, value in cathedral.items():
+            _require_id(value, field=f"cathedral.{field}")
     _parse_time(document.get("issued_at"), field="issued_at")
     _parse_time(document.get("reuse_authorized_until"), field="reuse_authorized_until")
     signature = document.get("signature")
@@ -557,7 +596,7 @@ def issue_claims_evidence(
     signing_key_id: str,
     issued_at: datetime,
     manifest: Mapping[str, object],
-    agent_output_sha256: str,
+    artifact_hash: str,
     terminal_status: str = "succeeded",
     assurance_level: str = "service_signed",
     reuse_authorized_until: datetime | None = None,
@@ -573,14 +612,11 @@ def issue_claims_evidence(
         raise ClaimsEvidenceError("schema", "terminal_status is invalid")
     if not isinstance(signing_key_id, str) or _KEY_ID_RE.fullmatch(signing_key_id) is None:
         raise ClaimsEvidenceError("schema", "signing_key_id is invalid")
-    frozen, manifest_agent_output_sha256 = _freeze_manifest(manifest)
-    _require_sha256(agent_output_sha256, field="agent_output_sha256")
-    if (
-        manifest_agent_output_sha256 is not None
-        and manifest_agent_output_sha256 != agent_output_sha256
-    ):
+    frozen, manifest_artifact_hash = _freeze_manifest(manifest)
+    _require_sha256(artifact_hash, field="artifact_hash")
+    if manifest_artifact_hash is not None and manifest_artifact_hash != artifact_hash:
         raise ClaimsEvidenceError(
-            "binding", "agent_output_sha256 does not match the manifest agent_output_sha256"
+            "binding", "artifact_hash does not match the manifest artifact_hash"
         )
     manifest_sha = sha256_hex(canonical_claims_json(frozen))
     until = reuse_authorized_until or (issued_at + timedelta(days=14))
@@ -593,22 +629,25 @@ def issue_claims_evidence(
         "assurance_level": assurance_level,
         "terminal_status": terminal_status,
         "netuid": frozen["netuid"],
+        "network": frozen["network"],
         "batch_id": frozen["batch_id"],
-        "assignment_id": frozen["assignment_id"],
-        "operation_id": frozen["operation_id"],
-        "attempt_id": frozen["attempt_id"],
+        "run_id": frozen["run_id"],
+        "task_id": frozen["task_id"],
+        "artifact_id": frozen["artifact_id"],
+        "uid": frozen["uid"],
+        "hotkey": frozen["hotkey"],
         "paper_id": frozen["paper_id"],
-        "miner_hotkey": frozen["miner_hotkey"],
-        "stage_id": frozen["stage_id"],
         "manifest_sha256": manifest_sha,
         "source_pdf_sha256": frozen["source_pdf_sha256"],
-        "source_payload_sha256": frozen["source_payload_sha256"],
-        "agent_output_sha256": _require_sha256(agent_output_sha256, field="agent_output_sha256"),
+        "source_payload_hash": frozen["source_payload_hash"],
+        "artifact_hash": _require_sha256(artifact_hash, field="artifact_hash"),
         "image_digest_sha256": frozen["image_digest_sha256"],
         "workload_commit_sha256": frozen["workload_commit_sha256"],
         "execution_policy_sha256": frozen["execution_policy_sha256"],
         "reuse_authorized_until": _utc_stamp(until),
     }
+    if "cathedral" in frozen:
+        unsigned["cathedral"] = frozen["cathedral"]
     evidence_id = sha256_hex(claims_evidence_body_bytes(unsigned))
     to_sign = {**unsigned, "evidence_id": evidence_id}
     signature = private_key.sign(claims_evidence_signed_bytes(to_sign))
@@ -670,25 +709,25 @@ def verify_claims_evidence(
         reasons.append("reuse_window_expired")
 
     if expected_manifest is not None:
-        frozen, expected_agent_output_sha256 = _freeze_manifest(expected_manifest)
+        frozen, expected_artifact_hash = _freeze_manifest(expected_manifest)
         if (
-            expected_agent_output_sha256 is not None
-            and document["agent_output_sha256"] != expected_agent_output_sha256
+            expected_artifact_hash is not None
+            and document["artifact_hash"] != expected_artifact_hash
         ):
-            reasons.append("agent_output_sha256_mismatch")
+            reasons.append("artifact_hash_mismatch")
         expected_manifest_sha = sha256_hex(canonical_claims_json(frozen))
         if document["manifest_sha256"] != expected_manifest_sha:
             reasons.append("manifest_digest_mismatch")
         for field in (
+            "network",
             "batch_id",
-            "assignment_id",
-            "operation_id",
-            "attempt_id",
+            "run_id",
+            "task_id",
+            "artifact_id",
+            "hotkey",
             "paper_id",
-            "miner_hotkey",
-            "stage_id",
             "source_pdf_sha256",
-            "source_payload_sha256",
+            "source_payload_hash",
             "image_digest_sha256",
             "workload_commit_sha256",
             "execution_policy_sha256",
@@ -697,17 +736,21 @@ def verify_claims_evidence(
                 reasons.append(f"{field}_mismatch")
         if document["netuid"] != frozen["netuid"]:
             reasons.append("netuid_mismatch")
+        if document["uid"] != frozen["uid"]:
+            reasons.append("uid_mismatch")
+        if frozen.get("cathedral") != document.get("cathedral"):
+            reasons.append("cathedral_mismatch")
 
     if observed_agent_output is not None:
         observed = claims_json_bytes_sha256(observed_agent_output, label="agent_output")
-        if observed != document["agent_output_sha256"]:
-            reasons.append("agent_output_digest_mismatch")
+        if observed != document["artifact_hash"]:
+            reasons.append("artifact_digest_mismatch")
     if observed_source_pdf is not None:
         if sha256_hex(observed_source_pdf) != document["source_pdf_sha256"]:
             reasons.append("source_pdf_digest_mismatch")
     if observed_source_payload is not None:
         observed = claims_json_bytes_sha256(observed_source_payload, label="source_payload")
-        if observed != document["source_payload_sha256"]:
+        if observed != document["source_payload_hash"]:
             reasons.append("source_payload_digest_mismatch")
 
     if document["terminal_status"] != "succeeded":
