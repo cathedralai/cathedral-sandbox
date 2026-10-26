@@ -41,6 +41,7 @@ from cathedral.central_access import (
 )
 from cathedral.policy_registry import canonical_json, parse_registry_json
 from cathedral.tee_box.boot import BootError, BootGuard, RelaunchRequired, RtmrError
+from cathedral.tee_box.daemon_reload import DaemonReloader, DaemonReloadError
 from cathedral.tee_box.egress import EgressPolicy
 from cathedral.tee_box.executor import (
     MAX_FILE_BYTES,
@@ -65,6 +66,7 @@ from cathedral.tee_box.lease import (
     LeaseDraining,
     LeaseRequired,
 )
+from cathedral.tee_box.tunables import Tunables, TunablesError, default_tunables, parse_tunables
 
 TEE_BOX_API_SCHEMA = "cathedral_tee_box_v1"
 HARDWARE_CLASS = "standard"
@@ -91,6 +93,8 @@ _ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = tuple(
     for method, pattern, name in (
         ("GET", r"/v1/box", "box"),
         ("POST", r"/v1/box/revocations", "revocations"),
+        ("GET", r"/v1/box/tunables", "tunables_get"),
+        ("POST", r"/v1/box/tunables", "tunables_apply"),
         ("GET", r"/v1/lease", "lease_get"),
         ("POST", r"/v1/lease", "lease_acquire"),
         ("DELETE", r"/v1/lease", "lease_release"),
@@ -124,6 +128,8 @@ _ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = tuple(
 ROUTE_SCOPES: Mapping[str, str] = {
     "box": "tee-box:box",
     "revocations": "tee-box:revocations",
+    "tunables_get": "tee-box:tunables",
+    "tunables_apply": "tee-box:tunables",
     "lease_get": "tee-box:lease",
     "lease_acquire": "tee-box:lease",
     "lease_release": "tee-box:lease",
@@ -145,7 +151,16 @@ ROUTE_SCOPES: Mapping[str, str] = {
     "stat": "tee-box:files",
 }
 _PREFIXES = ("/v1/box", "/v1/lease", "/v1/images", "/v1/sandboxes")
-_NO_LEASE_ROUTES = frozenset({"box", "revocations", "lease_get", "lease_acquire", "lease_release"})
+_NO_LEASE_ROUTES = frozenset(
+    {
+        "box",
+        "revocations",
+        "lease_get",
+        "lease_acquire",
+        "lease_release",
+        "tunables_get",
+    }
+)
 # Routes served before the control plane has pushed a revocation list.
 _NO_REVOCATIONS_ROUTES = frozenset({"box", "revocations"})
 MAX_REVOCATIONS_BODY = 512 * 1024
@@ -327,6 +342,8 @@ class TeeBoxSandboxApi:
         max_lease_seconds: int = DEFAULT_MAX_LEASE_SECONDS,
         clock: Callable[[], float] = time.time,
         create_concurrency: int = 1,
+        tunables_source: str = "default",
+        daemon_reloader: DaemonReloader | None = None,
     ) -> None:
         if not isinstance(authorizer, CentralAccessAuthorizer):
             raise ValueError("the sandbox API requires a central access authorizer")
@@ -357,6 +374,13 @@ class TeeBoxSandboxApi:
         # will take is reserved under the lock first (so admission cannot overcommit), and a
         # drain waits for every in-flight create (so none lands after the hand-over).
         self._create_slots = threading.BoundedSemaphore(create_concurrency)
+        # What the box runs now: the start-up file until a tunables.apply replaces it.
+        current = getattr(executor, "tunables", None)
+        self.tunables: Tunables = current if isinstance(current, Tunables) else default_tunables()
+        self._tunables_source = tunables_source
+        self._tunables_applied_at: int | None = None
+        self._daemon_reloader = daemon_reloader
+        self._daemon_confirmed = True
         self._reserved = Shape(0, 0, 0)
         self._reserved_count = 0
         self._inflight = 0
@@ -741,6 +765,106 @@ class TeeBoxSandboxApi:
                 "needs_relaunch": boot is not None and boot["needs_relaunch"] is True,
             },
         )
+
+    # -- tunables ----------------------------------------------------------
+
+    def _tunables_view(self) -> dict[str, object]:
+        return {
+            "sha256": self.tunables.sha256,
+            "source": self._tunables_source,
+            "applied_at": self._tunables_applied_at,
+            "values": self.tunables.nested(),
+            "daemon_reload": self._daemon_reloader is not None,
+            "daemon_confirmed": self._daemon_confirmed,
+        }
+
+    def _tunables_get(self, caller, body, fields) -> Response:  # noqa: ANN001
+        self._query(fields, frozenset())
+        return _json(200, self._tunables_view())
+
+    def _tunables_apply(self, caller, body, fields) -> Response:  # noqa: ANN001
+        """Replace the box tunables with the document in ``body`` (tunables.apply).
+
+        Same validation as the start-up file. Running sandboxes are never touched: every
+        tunable acts when a container starts or an image is imported. Refused while a create
+        is in flight. A change of runsc flags reloads the Docker daemon, so it is refused
+        unless the box holds no sandbox (warm containers are discarded first) and the worker
+        was started with ``--tee-box-daemon-json``.
+        """
+
+        self._query(fields, frozenset())
+        try:
+            new = parse_tunables(body)
+        except TunablesError as exc:
+            raise _bad(f"tunables refused: {exc}") from exc
+        previous = self.tunables.sha256
+        reloaded = False
+        with self.lease.locked():
+            self.lease.require_locked(caller)
+            if new.sha256 != previous:
+                with self._inflight_cv:
+                    if self._inflight:
+                        raise _Refusal(
+                            409,
+                            "a sandbox create is in flight; apply tunables between bursts",
+                            "creates_in_flight",
+                        )
+                if new.runtime_args() != self.tunables.runtime_args():
+                    self._reload_daemon_locked(new)
+                    reloaded = True
+                else:
+                    self._set_tunables_locked(new)
+                self._tunables_source = "applied"
+                self._tunables_applied_at = int(self._clock())
+        view = self._tunables_view()
+        view.update(
+            {"previous_sha256": previous, "changed": new.sha256 != previous, "reloaded": reloaded}
+        )
+        return _json(200, view)
+
+    def _set_tunables_locked(self, new: Tunables) -> None:
+        apply = getattr(self.executor, "apply_tunables", None)
+        if callable(apply):
+            apply(new)
+        # A create holds the semaphore it acquired; none is in flight here.
+        self._create_slots = threading.BoundedSemaphore(new.create_concurrency)
+        self.tunables = new
+
+    def _reload_daemon_locked(self, new: Tunables) -> None:
+        if self._daemon_reloader is None:
+            raise _Refusal(
+                409,
+                "runsc flags live in the Docker daemon and this box has no daemon reload "
+                "(--tee-box-daemon-json); restart the worker with the new tunables file",
+                "runsc_change_needs_restart",
+            )
+        if self.executor.list():
+            raise _Refusal(
+                409,
+                "changing runsc flags reloads the Docker daemon; delete every sandbox first",
+                "sandboxes_live",
+            )
+        old = self.tunables
+        self._set_tunables_locked(new)  # empties the warm pool: the start arguments changed
+        render = getattr(self.executor, "daemon_runtime_config", None)
+        check = getattr(self.executor, "runtime_check", None)
+        if not (callable(render) and callable(check)):
+            self._set_tunables_locked(old)
+            raise _Refusal(409, "this executor has no Docker daemon", "runsc_change_needs_restart")
+        try:
+            self._daemon_reloader.sync(render(), check)
+        except DaemonReloadError as exc:
+            self._set_tunables_locked(old)
+            self._daemon_confirmed = exc.restored
+            raise _Refusal(503, f"daemon reload failed: {exc}", "daemon_reload_failed") from exc
+        self._daemon_confirmed = True
+        # The reaper refills the pool outside the lease lock, so a warm container may have
+        # started while the daemon still had the old flags. Bump the generation (a start
+        # still in flight never joins) and empty the pool; the next tick refills it.
+        self._set_tunables_locked(new)
+        discard = getattr(self.executor, "discard_warm", None)
+        if callable(discard):
+            discard()
 
     # -- images ----------------------------------------------------------
 

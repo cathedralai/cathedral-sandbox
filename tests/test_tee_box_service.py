@@ -769,6 +769,8 @@ _SCOPED_ROUTES = (
     ("tee-box:box", "GET", "/v1/box", None),
     ("tee-box:lease", "GET", "/v1/lease", None),
     ("tee-box:lease", "POST", "/v1/lease", {"ttl_seconds": 600}),
+    ("tee-box:tunables", "GET", "/v1/box/tunables", None),
+    ("tee-box:tunables", "POST", "/v1/box/tunables", {"schema": 1}),
     (
         "tee-box:image-import",
         "POST",

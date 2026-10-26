@@ -310,10 +310,14 @@ class FakeExecutor(_Table):
         self.orphans: set[str] = set()
         self.orphans_stuck = False
         self.sweep_fails = False
+        self.tunables = default_tunables()
 
     @property
     def network_modes(self) -> tuple[str, ...]:
         return ("internet", "deny_all")
+
+    def apply_tunables(self, tunables: Tunables) -> None:
+        self.tunables = tunables
 
     def import_image(self, digest: str, reference: str) -> ImageInfo:
         image = ImageInfo(digest, reference)
@@ -689,6 +693,9 @@ class RunscExecutor(_Table):
         self._pool_enabled = False
         self._warm: list[_WarmContainer] = []
         self._warm_starting: set[str] = set()
+        # Bumped by apply_tunables. A warm container started under older tunables is never
+        # added to the pool, so a warm start always matches a cold start under the current ones.
+        self._tunables_generation = 0
         self._job_factory: Callable[[list[str], int, bytes | None], _Job] = _Job
         self._jobs: dict[tuple[str, str], _JobRecord] = {}
         self._creating: set[str] = set()
@@ -1110,6 +1117,32 @@ class RunscExecutor(_Table):
         for warm in doomed:
             self._drop_warm(warm.name)
 
+    def apply_tunables(self, tunables: Tunables) -> None:
+        """Use ``tunables`` from now on (the ``tunables.apply`` route).
+
+        Running sandboxes are untouched: every tunable acts only when a container starts or
+        an image is imported. The warm pool is emptied when the start arguments change, so a
+        warm container never differs from a cold start under the new tunables; the next
+        maintain_pool refills it. Changing the runsc flags also needs the daemon reloaded,
+        which the service does (``daemon_reload.py``), never this method. A smaller pool drops
+        its newest extras at once.
+        """
+
+        with self._lock:
+            restart = (
+                tunables.docker_run_args() != self.tunables.docker_run_args()
+                or tunables.runtime_args() != self.tunables.runtime_args()
+            )
+            self.tunables = tunables
+            self._tunables_generation += 1
+            # Containers started under other arguments go; so does any beyond a smaller pool.
+            keep = 0 if restart else tunables.warm_size
+            doomed = self._warm[keep:]
+            del self._warm[keep:]
+            self._warm_starting.update(w.name for w in doomed)
+        for warm in doomed:
+            self._drop_warm(warm.name)
+
     def maintain_pool(self, *, enabled: bool, room: int = 0) -> None:
         """Expire idle warm containers, then refill up to ``warm_size``.
 
@@ -1143,10 +1176,13 @@ class RunscExecutor(_Table):
                 return
             names = [WARM_PREFIX + secrets.token_hex(12) for _ in range(starting)]
             self._warm_starting.update(names)
+            generation = self._tunables_generation
         for name in names:
-            self._spawn(lambda name=name, image=image: self._start_warm(name, image))
+            self._spawn(
+                lambda name=name, image=image: self._start_warm(name, image, generation)
+            )
 
-    def _start_warm(self, name: str, image: ImageInfo) -> None:
+    def _start_warm(self, name: str, image: ImageInfo, generation: int | None = None) -> None:
         started = False
         try:
             verified = self.verified_image(image.digest)
@@ -1158,8 +1194,9 @@ class RunscExecutor(_Table):
             self._abandon(name, timed_out=True)
         with self._lock:
             self._warm_starting.discard(name)
+            current = generation is None or generation == self._tunables_generation
             if started:
-                if self._pool_enabled:
+                if self._pool_enabled and current:
                     self._warm.append(_WarmContainer(name, image.digest, self._clock()))
                     return
         if started:

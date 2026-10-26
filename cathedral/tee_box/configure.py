@@ -45,6 +45,7 @@ from cathedral.tee_box.executor import (
     RunscExecutor,
     Shape,
 )
+from cathedral.tee_box.daemon_reload import DaemonReloader, DaemonReloadError
 from cathedral.tee_box.tunables import (
     Tunables,
     TunablesError,
@@ -83,6 +84,7 @@ OPTIONAL = (
     "tee_box_id",
     "tee_box_no_disk_quota",
     "tee_box_tunables",
+    "tee_box_daemon_json",
 )
 
 
@@ -161,6 +163,15 @@ def add_tee_box_arguments(command: argparse.ArgumentParser) -> None:
         ),
     )
     group.add_argument(
+        "--tee-box-daemon-json",
+        help=(
+            "absolute path of the Docker daemon.json. With it, tunables.apply may change the "
+            "runsc flags while the box holds no sandbox (rewrites the runsc entry, then "
+            "systemctl reload docker), and a start whose daemon flags differ from the "
+            "tunables file syncs them. Without it a runsc change needs a worker restart"
+        ),
+    )
+    group.add_argument(
         "--tee-box-no-disk-quota",
         action="store_true",
         default=None,
@@ -183,6 +194,8 @@ class TeeBoxConfig:
     box_id: str
     disk_quota: bool
     tunables: Tunables
+    tunables_source: str = "default"
+    daemon_json: str | None = None
 
 
 def tee_box_config(args: argparse.Namespace) -> TeeBoxConfig | None:
@@ -235,6 +248,8 @@ def tee_box_config(args: argparse.Namespace) -> TeeBoxConfig | None:
         box_id=pick("tee_box_id", "default"),
         disk_quota=not bool(getattr(args, "tee_box_no_disk_quota", None)),
         tunables=tunables,
+        tunables_source="default" if tunables_path is None else "file",
+        daemon_json=getattr(args, "tee_box_daemon_json", None),
     )
 
 
@@ -374,7 +389,21 @@ def build_tee_box_api(
         tunables=config.tunables,
         warm_shape=config.default_shape,
     )
+    reloader = None
+    if config.daemon_json is not None:
+        try:
+            reloader = DaemonReloader(config.daemon_json, runner=runner)
+        except ValueError as exc:
+            raise ValueError(f"--tee-box-daemon-json: {exc}") from exc
     registered, runtime_detail = executor.runtime_check()
+    if not registered and reloader is not None:
+        # A tunables.apply before the last restart may have left other runsc flags in the
+        # daemon: put back the ones this start's tunables file names, then check again.
+        try:
+            reloader.sync(executor.daemon_runtime_config(), executor.runtime_check)
+        except DaemonReloadError as exc:
+            raise ValueError(f"TEE box runtime: {runtime_detail}; daemon sync: {exc}") from exc
+        registered, runtime_detail = executor.runtime_check()
     if not registered:
         raise ValueError(f"TEE box runtime: {runtime_detail}")
     try:
@@ -400,6 +429,8 @@ def build_tee_box_api(
         default_shape=config.default_shape,
         boot=boot,
         create_concurrency=config.tunables.create_concurrency,
+        tunables_source=config.tunables_source,
+        daemon_reloader=reloader,
     )
     facts = {
         "central_root_keys": measured_root.CENTRAL_ROOT_KEYS_PATH,
@@ -418,7 +449,12 @@ def build_tee_box_api(
             "docker_root": docker_root,
             "scratch": scratch,
         },
-        "tunables": {"sha256": config.tunables.sha256, "values": config.tunables.nested()},
+        "tunables": {
+            "sha256": config.tunables.sha256,
+            "source": config.tunables_source,
+            "values": config.tunables.nested(),
+            "daemon_json": config.daemon_json,
+        },
         "capacity": config.capacity.view(),
         "default_shape": config.default_shape.view(),
         "boot": {
