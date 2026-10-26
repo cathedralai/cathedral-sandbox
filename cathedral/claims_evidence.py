@@ -130,6 +130,33 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def claims_json_sha256(value: object) -> str:
+    """Digest exactly as Claims computes artifact_hash and source_payload_hash.
+
+    Claims hashes the parsed JSON object, not file bytes: sorted keys, compact
+    separators, ensure_ascii=False, UTF-8 (neurons/miner.py _json_hash and
+    neurons/validator.py _stable_hash at Claims 41573a4).
+    """
+
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def claims_json_bytes_sha256(data: bytes, *, label: str) -> str:
+    """Parse a Claims JSON document and return its Claims-canonical digest."""
+
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise ClaimsEvidenceError("schema", f"{label} is not UTF-8 JSON") from exc
+    if not isinstance(value, dict):
+        raise ClaimsEvidenceError("schema", f"{label} must be a JSON object")
+    return claims_json_sha256(value)
+
+
 def _duplicate_safe_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -232,7 +259,10 @@ def claims_evidence_signed_bytes(document: Mapping[str, object]) -> bytes:
 def _parse_time(value: object, *, field: str) -> datetime:
     if not isinstance(value, str) or _TIME_RE.fullmatch(value) is None:
         raise ClaimsEvidenceError("schema", f"{field} must use six-fractional-digit UTC")
-    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+    except ValueError as exc:
+        raise ClaimsEvidenceError("schema", f"{field} is not a valid UTC time") from exc
 
 
 def _require_sha256(value: object, *, field: str) -> str:
@@ -303,6 +333,50 @@ def build_claims_manifest(
     return manifest
 
 
+_MANIFEST_STRING_FIELDS = (
+    "batch_id",
+    "assignment_id",
+    "operation_id",
+    "attempt_id",
+    "paper_id",
+    "miner_hotkey",
+    "stage_id",
+    "source_pdf_sha256",
+    "source_payload_sha256",
+    "image_digest_sha256",
+    "workload_commit_sha256",
+    "execution_policy_sha256",
+)
+_MANIFEST_REQUIRED_KEYS = frozenset({"schema", "netuid", *_MANIFEST_STRING_FIELDS})
+_MANIFEST_ALLOWED_KEYS = _MANIFEST_REQUIRED_KEYS | {"agent_output_sha256"}
+
+
+def _freeze_manifest(manifest: Mapping[str, object]) -> tuple[dict[str, object], str | None]:
+    """Strictly validate a job manifest; return it without agent_output_sha256 plus that digest."""
+
+    if not isinstance(manifest, Mapping):
+        raise ClaimsEvidenceError("schema", "claims manifest must be a JSON object")
+    keys = set(manifest)
+    if not _MANIFEST_REQUIRED_KEYS <= keys or not keys <= _MANIFEST_ALLOWED_KEYS:
+        raise ClaimsEvidenceError("schema", "claims manifest has unexpected or missing fields")
+    if manifest["schema"] != CLAIMS_MANIFEST_SCHEMA:
+        raise ClaimsEvidenceError("schema", "claims manifest schema is unsupported")
+    netuid = manifest["netuid"]
+    if isinstance(netuid, bool) or not isinstance(netuid, int):
+        raise ClaimsEvidenceError("schema", "netuid must be an integer in 0..65535")
+    for field in _MANIFEST_STRING_FIELDS:
+        if not isinstance(manifest[field], str):
+            raise ClaimsEvidenceError("schema", f"{field} is invalid")
+    agent_output_sha256 = manifest.get("agent_output_sha256")
+    if agent_output_sha256 is not None:
+        agent_output_sha256 = _require_sha256(agent_output_sha256, field="agent_output_sha256")
+    frozen = build_claims_manifest(
+        netuid=netuid,
+        **{field: str(manifest[field]) for field in _MANIFEST_STRING_FIELDS},
+    )
+    return frozen, agent_output_sha256
+
+
 def digest_claims_artifacts(
     *,
     source_pdf: bytes,
@@ -312,12 +386,17 @@ def digest_claims_artifacts(
     workload_commit_ref: bytes,
     execution_policy: bytes,
 ) -> dict[str, str]:
-    """Hash the exact bytes a Claims verifier would bind."""
+    """Digest the inputs the way Claims does.
+
+    The PDF is hashed as raw bytes (Claims ``source_sha256``). ``source_payload``
+    and ``agent_output`` are hashed as Claims-canonical JSON so the digests equal
+    Claims ``source_payload_hash`` and ``artifact_hash``.
+    """
 
     return {
         "source_pdf_sha256": sha256_hex(source_pdf),
-        "source_payload_sha256": sha256_hex(source_payload),
-        "agent_output_sha256": sha256_hex(agent_output),
+        "source_payload_sha256": claims_json_bytes_sha256(source_payload, label="source_payload"),
+        "agent_output_sha256": claims_json_bytes_sha256(agent_output, label="agent_output"),
         "image_digest_sha256": sha256_hex(image_digest_ref),
         "workload_commit_sha256": sha256_hex(workload_commit_ref),
         "execution_policy_sha256": sha256_hex(execution_policy),
@@ -457,6 +536,9 @@ def parse_claims_evidence_json(data: bytes | str) -> dict[str, object]:
         raise ClaimsEvidenceError("signature", "signature is not valid base64") from exc
     if len(sig) != 64:
         raise ClaimsEvidenceError("signature", "signature must be 64 bytes")
+    if base64.b64encode(sig).decode("ascii") != signature.get("value_base64"):
+        # Reject non-canonical encodings so one signature has one evidence digest.
+        raise ClaimsEvidenceError("signature", "signature base64 is not canonical")
     expected_id = sha256_hex(claims_evidence_body_bytes(document))
     if document.get("evidence_id") != expected_id:
         raise ClaimsEvidenceError("binding", "evidence_id does not match the canonical body digest")
@@ -485,22 +567,15 @@ def issue_claims_evidence(
         raise ClaimsEvidenceError("schema", "terminal_status is invalid")
     if not isinstance(signing_key_id, str) or _KEY_ID_RE.fullmatch(signing_key_id) is None:
         raise ClaimsEvidenceError("schema", "signing_key_id is invalid")
-    # Re-validate / freeze manifest fields through the builder.
-    frozen = build_claims_manifest(
-        netuid=int(manifest["netuid"]),  # type: ignore[arg-type]
-        batch_id=str(manifest["batch_id"]),
-        assignment_id=str(manifest["assignment_id"]),
-        operation_id=str(manifest["operation_id"]),
-        attempt_id=str(manifest["attempt_id"]),
-        paper_id=str(manifest["paper_id"]),
-        miner_hotkey=str(manifest["miner_hotkey"]),
-        stage_id=str(manifest["stage_id"]),
-        source_pdf_sha256=str(manifest["source_pdf_sha256"]),
-        source_payload_sha256=str(manifest["source_payload_sha256"]),
-        image_digest_sha256=str(manifest["image_digest_sha256"]),
-        workload_commit_sha256=str(manifest["workload_commit_sha256"]),
-        execution_policy_sha256=str(manifest["execution_policy_sha256"]),
-    )
+    frozen, manifest_agent_output_sha256 = _freeze_manifest(manifest)
+    _require_sha256(agent_output_sha256, field="agent_output_sha256")
+    if (
+        manifest_agent_output_sha256 is not None
+        and manifest_agent_output_sha256 != agent_output_sha256
+    ):
+        raise ClaimsEvidenceError(
+            "binding", "agent_output_sha256 does not match the manifest agent_output_sha256"
+        )
     manifest_sha = sha256_hex(canonical_claims_json(frozen))
     until = reuse_authorized_until or (issued_at + timedelta(days=14))
     unsigned: dict[str, object] = {
@@ -584,21 +659,12 @@ def verify_claims_evidence(
         reasons.append("reuse_window_expired")
 
     if expected_manifest is not None:
-        frozen = build_claims_manifest(
-            netuid=int(expected_manifest["netuid"]),  # type: ignore[arg-type]
-            batch_id=str(expected_manifest["batch_id"]),
-            assignment_id=str(expected_manifest["assignment_id"]),
-            operation_id=str(expected_manifest["operation_id"]),
-            attempt_id=str(expected_manifest["attempt_id"]),
-            paper_id=str(expected_manifest["paper_id"]),
-            miner_hotkey=str(expected_manifest["miner_hotkey"]),
-            stage_id=str(expected_manifest["stage_id"]),
-            source_pdf_sha256=str(expected_manifest["source_pdf_sha256"]),
-            source_payload_sha256=str(expected_manifest["source_payload_sha256"]),
-            image_digest_sha256=str(expected_manifest["image_digest_sha256"]),
-            workload_commit_sha256=str(expected_manifest["workload_commit_sha256"]),
-            execution_policy_sha256=str(expected_manifest["execution_policy_sha256"]),
-        )
+        frozen, expected_agent_output_sha256 = _freeze_manifest(expected_manifest)
+        if (
+            expected_agent_output_sha256 is not None
+            and document["agent_output_sha256"] != expected_agent_output_sha256
+        ):
+            reasons.append("agent_output_sha256_mismatch")
         expected_manifest_sha = sha256_hex(canonical_claims_json(frozen))
         if document["manifest_sha256"] != expected_manifest_sha:
             reasons.append("manifest_digest_mismatch")
@@ -622,13 +688,15 @@ def verify_claims_evidence(
             reasons.append("netuid_mismatch")
 
     if observed_agent_output is not None:
-        if sha256_hex(observed_agent_output) != document["agent_output_sha256"]:
+        observed = claims_json_bytes_sha256(observed_agent_output, label="agent_output")
+        if observed != document["agent_output_sha256"]:
             reasons.append("agent_output_digest_mismatch")
     if observed_source_pdf is not None:
         if sha256_hex(observed_source_pdf) != document["source_pdf_sha256"]:
             reasons.append("source_pdf_digest_mismatch")
     if observed_source_payload is not None:
-        if sha256_hex(observed_source_payload) != document["source_payload_sha256"]:
+        observed = claims_json_bytes_sha256(observed_source_payload, label="source_payload")
+        if observed != document["source_payload_sha256"]:
             reasons.append("source_payload_digest_mismatch")
 
     if document["terminal_status"] != "succeeded":

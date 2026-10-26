@@ -68,9 +68,9 @@ from cathedral.claims_evidence import (
     MAX_CLAIMS_EVIDENCE_BYTES,
     MAX_CLAIMS_TRUSTED_KEYS_BYTES,
     ClaimsEvidenceError,
+    claims_json_bytes_sha256,
     issue_claims_evidence,
     parse_claims_evidence_trusted_keys_json,
-    sha256_hex,
     verify_claims_evidence,
 )
 from cathedral.affine_claim_cvm import (
@@ -954,7 +954,7 @@ def cmd_claims_evidence_issue(args: argparse.Namespace) -> int:
             signing_key_id=args.signing_key_id,
             issued_at=issued_at,
             manifest=manifest,
-            agent_output_sha256=sha256_hex(agent_output),
+            agent_output_sha256=claims_json_bytes_sha256(agent_output, label="agent_output"),
             terminal_status=args.terminal_status,
         )
         Path(args.out).write_bytes(evidence)

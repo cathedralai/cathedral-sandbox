@@ -325,3 +325,123 @@ def test_cli_issue_and_verify(tmp_path: Path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert '"accepted": true' in out or '"accepted":true' in out
+
+
+def _claims_stable_hash(value) -> str:
+    # Claims 41573a4 neurons/validator.py _stable_hash and neurons/miner.py _json_hash.
+    import hashlib
+
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def test_digests_match_claims_artifact_hash_for_pretty_non_ascii_json():
+    # Claims writes agent_output.json with indent=2, ensure_ascii=False and hashes the
+    # parsed object; the evidence digest must equal Claims artifact_hash, not file bytes.
+    agent_output = {"paper": {"paper_id": "p1", "title": "β-catenin – GWAS"}, "logic": {"claims": []}}
+    payload = {"schema_version": "agent_v1_source_payload_v1", "spans": [{"span_id": "s1", "text": "été"}]}
+    raw_output = json.dumps(agent_output, indent=2, ensure_ascii=False).encode("utf-8")
+    raw_payload = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+    digests = digest_claims_artifacts(
+        source_pdf=SOURCE_PDF,
+        source_payload=raw_payload,
+        agent_output=raw_output,
+        image_digest_ref=IMAGE_REF,
+        workload_commit_ref=COMMIT_REF,
+        execution_policy=POLICY,
+    )
+    assert digests["agent_output_sha256"] == _claims_stable_hash(agent_output)
+    assert digests["source_payload_sha256"] == _claims_stable_hash(payload)
+
+    evidence, manifest, _, _ = _issue(agent_output=raw_output)
+    trusted = parse_claims_evidence_trusted_keys_json(_trusted_keys_bytes())
+    # Claims re-serializes the backend row; any equivalent encoding must verify.
+    reencoded = json.dumps(agent_output, sort_keys=True, ensure_ascii=True).encode("ascii")
+    verified = verify_claims_evidence(
+        evidence,
+        trusted,
+        expected_manifest=manifest,
+        observed_agent_output=reencoded,
+        now=ISSUED_AT + timedelta(hours=1),
+    )
+    assert verified.accepted is True
+    assert verified.document["agent_output_sha256"] == _claims_stable_hash(agent_output)
+
+
+def test_manifest_agent_output_digest_is_enforced():
+    output = tiny_claims_agent_output(paper_id="p", claim_statement="c")
+    digests = _digests(output)
+    other = tiny_claims_agent_output(paper_id="p", claim_statement="other")
+    manifest = _manifest(digests, agent_output_sha256=_digests(other)["agent_output_sha256"])
+    with pytest.raises(ClaimsEvidenceError) as err:
+        issue_claims_evidence(
+            private_key=PRIVATE_KEY,
+            signing_key_id=KEY_ID,
+            issued_at=ISSUED_AT,
+            manifest=manifest,
+            agent_output_sha256=digests["agent_output_sha256"],
+        )
+    assert err.value.category == "binding"
+
+    evidence, _, _, _ = _issue(agent_output=output)
+    trusted = parse_claims_evidence_trusted_keys_json(_trusted_keys_bytes())
+    verified = verify_claims_evidence(
+        evidence, trusted, expected_manifest=manifest, now=ISSUED_AT + timedelta(hours=1)
+    )
+    assert verified.accepted is False
+    assert "agent_output_sha256_mismatch" in verified.reject_reasons
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda m: m.update(run_id="run-other"),
+        lambda m: m.update(schema="bogus"),
+        lambda m: m.pop("paper_id"),
+        lambda m: m.update(netuid="111"),
+        lambda m: m.update(netuid=True),
+    ],
+)
+def test_manifest_is_strict(mutate):
+    output = tiny_claims_agent_output(paper_id="p", claim_statement="c")
+    digests = _digests(output)
+    manifest = dict(_manifest(digests))
+    mutate(manifest)
+    with pytest.raises(ClaimsEvidenceError) as err:
+        issue_claims_evidence(
+            private_key=PRIVATE_KEY,
+            signing_key_id=KEY_ID,
+            issued_at=ISSUED_AT,
+            manifest=manifest,
+            agent_output_sha256=digests["agent_output_sha256"],
+        )
+    assert err.value.category == "schema"
+
+
+def test_impossible_calendar_time_is_a_schema_error():
+    document = json.loads(_trusted_keys_bytes())
+    document["keys"][KEY_ID]["valid_from"] = "2026-02-30T00:00:00.000000Z"
+    with pytest.raises(ClaimsEvidenceError) as err:
+        parse_claims_evidence_trusted_keys_json(json.dumps(document))
+    assert err.value.category == "schema"
+
+
+def test_non_canonical_signature_base64_is_rejected():
+    evidence, _, _, _ = _issue()
+    document = json.loads(evidence)
+    value = document["signature"]["value_base64"]
+    raw = base64.b64decode(value)
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    alias = next(
+        candidate
+        for candidate in (value[:-3] + char + "==" for char in alphabet)
+        if candidate != value and base64.b64decode(candidate) == raw
+    )
+    document["signature"]["value_base64"] = alias
+    trusted = parse_claims_evidence_trusted_keys_json(_trusted_keys_bytes())
+    with pytest.raises(ClaimsEvidenceError) as err:
+        verify_claims_evidence(
+            canonical_claims_json(document), trusted, now=ISSUED_AT + timedelta(hours=1)
+        )
+    assert err.value.category == "signature"
