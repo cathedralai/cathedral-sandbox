@@ -96,7 +96,7 @@ def test_report_data_is_the_callers_bytes_verbatim(sealed) -> None:
     assert doc["binding_sha256"] == ledger.binding_sha256
     assert doc["measurement"] == MEASUREMENT.hex() == ledger.binding["measurement"]
     assert isinstance(doc["generated_at"], int)
-    assert doc["cert_chain_b64"] is None  # no host certificate table
+    assert doc["cert_chain"] is None  # no host certificate table
 
 
 def test_uppercase_hex_is_accepted(sealed) -> None:
@@ -165,6 +165,36 @@ def test_reports_over_the_limit_get_429(tmp_path, monkeypatch) -> None:
         server.shutdown()
 
 
+def test_attest_rate_limit_is_per_guest(tmp_path, monkeypatch) -> None:
+    tsm = FakeTsm()
+    server, _ledger = _start(tmp_path, monkeypatch, tsm, per_minute=2)
+    port = server.server_address[1]
+
+    def attest_as(guest: str, nibble: int) -> int:
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + KEY.decode(),
+            "X-Cathedral-Guest": guest,
+        }
+        c.request(
+            "POST",
+            "/room/attest",
+            body=json.dumps({"report_data_hex": f"{nibble:02x}" * 64}).encode(),
+            headers=headers,
+        )
+        return c.getresponse().status
+
+    try:
+        assert attest_as("g1", 1) == 200 and attest_as("g1", 2) == 200
+        assert attest_as("g1", 3) == 429
+        # Another guest still has its own budget on the same hotel.
+        assert attest_as("g2", 4) == 200 and attest_as("g2", 5) == 200
+        assert attest_as("g2", 6) == 429
+    finally:
+        server.shutdown()
+
+
 def test_cert_chain_from_the_host_table(tmp_path, monkeypatch) -> None:
     certs = {"vcek": b"VCEK-DER", "ask": b"ASK-DER", "ark": b"ARK-DER"}
     tsm = FakeTsm(aux=_cert_table(certs))
@@ -172,7 +202,7 @@ def test_cert_chain_from_the_host_table(tmp_path, monkeypatch) -> None:
     try:
         status, _h, doc = _attest(server.server_address[1], {"report_data_hex": "11" * 64})
         assert status == 200
-        assert doc["cert_chain_b64"] == {k: base64.b64encode(v).decode() for k, v in certs.items()}
+        assert doc["cert_chain"] == {k: base64.b64encode(v).decode() for k, v in certs.items()}
     finally:
         server.shutdown()
 

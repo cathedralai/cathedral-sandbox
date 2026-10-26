@@ -1121,7 +1121,12 @@ func (b *broker) handleHotelAttest(w http.ResponseWriter, r *http.Request, h *ho
 		writeErr(w, 413, "body_too_large", "attest body over 4096 bytes")
 		return
 	}
-	status, hdr, out, err := h.doBase(r.Context(), h.cfg.Health, "POST", "/room/attest", nil, body, time.Minute)
+	// Pass the guest id so the hotel rate-limits attest per guest, not per
+	// hotel (shared hotels serve many Escape / capacity callers).
+	status, hdr, out, err := h.doHeaders(
+		r.Context(), h.cfg.Health, "POST", "/room/attest", nil, body, time.Minute,
+		http.Header{guestHeader: {g.cfg.ID}},
+	)
 	if err != nil {
 		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
 		return

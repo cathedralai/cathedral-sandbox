@@ -46,7 +46,10 @@ func TestHotelAttestPassesBodyAndAnswerUnchanged(t *testing.T) {
 	if f.attestAuth[0] != "Bearer hotel-key" {
 		t.Fatalf("hotel auth %q: the broker must use the hotel key, not the guest key", f.attestAuth[0])
 	}
-	want := `{"report_b64":"UkVQT1JU","cert_chain_b64":null,"binding_sha256":"bb","measurement":"aa","generated_at":1761400000,"echo":` + `"{\"report_data_hex\":\"` + strings.Repeat("ab", 64) + `\"}"}`
+	if f.attestGuest[0] != "g1" {
+		t.Fatalf("hotel guest %q: the broker must send X-Cathedral-Guest so attest is rate-limited per guest", f.attestGuest[0])
+	}
+	want := `{"report_b64":"UkVQT1JU","cert_chain":null,"binding_sha256":"bb","measurement":"aa","generated_at":1761400000,"echo":` + `"{\"report_data_hex\":\"` + strings.Repeat("ab", 64) + `\"}"}`
 	if string(out) != want {
 		t.Fatalf("answer changed:\n got %s\nwant %s", out, want)
 	}

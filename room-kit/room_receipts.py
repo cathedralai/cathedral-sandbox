@@ -278,7 +278,10 @@ class Ledger:
     def _open_store(self, store: str) -> None:
         self.lock = threading.Lock()
         self.attest_lock = threading.Lock()
-        self.attest_times: list[float] = []
+        # Fresh-report slots keyed by guest id (X-Cathedral-Guest). A shared
+        # hotel serves many guests; a per-hotel counter let one guest starve
+        # the others (Spock / Escape capacity).
+        self.attest_times: dict[str, list[float]] = {}
         self.chain: list[dict] = []
         self.by_room: dict[str, list[int]] = {}
         self.head = self.binding_sha256
@@ -293,14 +296,16 @@ class Ledger:
             doc["report_b64"] = b64(self.report)
         return doc
 
-    def attest_slot(self, per_minute: int) -> float:
-        """Take one fresh-report slot. 0 when taken, else seconds to wait."""
+    def attest_slot(self, guest: str, per_minute: int) -> float:
+        """Take one fresh-report slot for *guest*. 0 when taken, else seconds to wait."""
+        key = guest if guest else "_direct"
         now = time.monotonic()
         with self.attest_lock:
-            self.attest_times = [t for t in self.attest_times if now - t < 60]
-            if len(self.attest_times) >= per_minute:
-                return max(0.001, 60 - (now - self.attest_times[0]))
-            self.attest_times.append(now)
+            times = self.attest_times.setdefault(key, [])
+            times[:] = [t for t in times if now - t < 60]
+            if len(times) >= per_minute:
+                return max(0.001, 60 - (now - times[0]))
+            times.append(now)
             return 0.0
 
     def attest(self, report_data: bytes) -> dict:
@@ -309,7 +314,9 @@ class Ledger:
         measurement = report_fields(report)["measurement"]
         if measurement != self.binding["measurement"]:
             raise RuntimeError("measurement changed since the binding")
-        return {"report_b64": b64(report), "cert_chain_b64": chain, "binding_sha256": self.binding_sha256,
+        # Field name matches the receipt (cathedral_challenge_receipt_v1_1
+        # tee.cert_chain): DER base64 for vcek/ask/ark, or null.
+        return {"report_b64": b64(report), "cert_chain": chain, "binding_sha256": self.binding_sha256,
                 "measurement": measurement, "generated_at": int(time.time())}
 
     def sign(self, fields: dict) -> dict:
@@ -500,7 +507,10 @@ class Handler(BaseHTTPRequestHandler):
         raw = doc.get("report_data_hex") if isinstance(doc, dict) else None
         if not isinstance(raw, str) or not HEX64.fullmatch(raw):
             return self.reply(400, b'{"error":"report_data_hex must be 128 hex characters (64 bytes)"}')
-        wait = ledger.attest_slot(self.server.attest_per_minute)
+        # Broker sets X-Cathedral-Guest; a direct hotel-key call has no guest
+        # and shares the "_direct" bucket. Limit is per guest, not per hotel.
+        guest = (self.headers.get("X-Cathedral-Guest") or "").strip()
+        wait = ledger.attest_slot(guest, self.server.attest_per_minute)
         if wait:
             return self.reply(429, b'{"error":"attest_rate_limit"}', {"Retry-After": str(int(wait) + 1)})
         try:
