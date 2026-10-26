@@ -21,6 +21,7 @@ statement before it; the first one carries the binding's sha256.
 
 Routes it adds:
   GET /room/attestation            binding, binding_sha256, report (base64)
+  POST /room/attest                a fresh SNP report over caller REPORT_DATA (sealed only)
   GET /room/receipts?after=&limit= the chain of this boot, in order
   GET /v1/sandboxes/<id>/receipts  the receipts of one room
 Response header on a signed operation:
@@ -78,9 +79,20 @@ _ZERO_REPORT: tuple[str, bytes] | None = None
 
 def _read_tsm(report_data: bytes) -> tuple[str, bytes]:
     """One configfs-tsm report: provider name and outblob."""
+    provider, report, _aux = _read_tsm_aux(report_data)
+    return provider, report
+
+
+def _read_tsm_aux(report_data: bytes, want_aux: bool = False) -> tuple[str, bytes, bytes]:
+    """One configfs-tsm report: provider, outblob and (if asked) auxblob.
+
+    auxblob is the host's certificate table (VCEK, ASK, ARK) when the host
+    stored one and the kernel exposes it; otherwise it is empty.
+    """
     assert len(report_data) == 64
     entry = os.path.join(TSM, "room-" + uuid.uuid4().hex[:12])
     os.mkdir(entry)
+    aux = b""
     try:
         with open(os.path.join(entry, "inblob"), "wb") as f:
             f.write(report_data)
@@ -88,9 +100,50 @@ def _read_tsm(report_data: bytes) -> tuple[str, bytes]:
             report = f.read()
         with open(os.path.join(entry, "provider")) as f:
             provider = f.read().strip()
+        if want_aux:
+            try:
+                with open(os.path.join(entry, "auxblob"), "rb") as f:
+                    aux = f.read()
+            except OSError:
+                aux = b""  # older kernel or no host certificates: the caller fetches from AMD KDS
     finally:
         os.rmdir(entry)
-    return provider, report
+    return provider, report, aux
+
+
+# GHCB certificate table GUIDs (AMD SEV-SNP firmware ABI / GHCB spec).
+_CERT_GUIDS = {
+    "vcek": "63da758d-e664-4564-adc5-f4b93be8accd",
+    "ask": "4ab7b379-bbac-4fe4-a02f-05aef327c782",
+    "ark": "c0b406a4-a803-4952-9743-3fb6014cd0ae",
+}
+
+
+def cert_chain(aux: bytes) -> dict | None:
+    """VCEK, ASK and ARK (base64 DER) from an SNP certificate table, or None.
+
+    The table is entries of GUID (16 bytes), offset (u32 LE) and length (u32
+    LE), ended by an all-zero entry; offsets count from the table start. The
+    GUID is matched in both byte orders. None unless all three are present
+    and in range: a partial chain is not handed out as a chain.
+    """
+    names = {}
+    for name, g in _CERT_GUIDS.items():
+        u = uuid.UUID(g)
+        names[u.bytes], names[u.bytes_le] = name, name
+    found: dict[str, str] = {}
+    pos = 0
+    while pos + 24 <= len(aux):
+        guid = aux[pos:pos + 16]
+        if guid == bytes(16):
+            break
+        off = int.from_bytes(aux[pos + 16:pos + 20], "little")
+        ln = int.from_bytes(aux[pos + 20:pos + 24], "little")
+        name = names.get(guid)
+        if name and ln and off + ln <= len(aux):
+            found[name] = b64(aux[off:off + ln])
+        pos += 24
+    return found if set(found) == set(_CERT_GUIDS) else None
 
 
 def tsm_provider() -> str | None:
@@ -121,6 +174,18 @@ def snp_report(report_data: bytes) -> bytes:
     if provider != "sev_guest" or len(report) < 0x4A0:
         raise RuntimeError(f"unexpected TSM provider {provider!r} or report size {len(report)}")
     return report
+
+
+def fresh_report(report_data: bytes) -> tuple[bytes, dict | None]:
+    """A new SNP report whose REPORT_DATA is report_data, byte for byte.
+
+    No hashing here: the caller chooses the 64 bytes and so the binding.
+    Returns the report and the certificate chain when the host gave one.
+    """
+    provider, report, aux = _read_tsm_aux(report_data, want_aux=True)
+    if provider != "sev_guest" or len(report) < 0x4A0:
+        raise RuntimeError(f"unexpected TSM provider {provider!r} or report size {len(report)}")
+    return report, cert_chain(aux)
 
 
 def report_fields(report: bytes) -> dict:
@@ -212,6 +277,11 @@ class Ledger:
 
     def _open_store(self, store: str) -> None:
         self.lock = threading.Lock()
+        self.attest_lock = threading.Lock()
+        # Fresh-report slots keyed by guest id (X-Cathedral-Guest). A shared
+        # hotel serves many guests; a per-hotel counter let one guest starve
+        # the others (Spock / Escape capacity).
+        self.attest_times: dict[str, list[float]] = {}
         self.chain: list[dict] = []
         self.by_room: dict[str, list[int]] = {}
         self.head = self.binding_sha256
@@ -225,6 +295,29 @@ class Ledger:
         if self.sealed:
             doc["report_b64"] = b64(self.report)
         return doc
+
+    def attest_slot(self, guest: str, per_minute: int) -> float:
+        """Take one fresh-report slot for *guest*. 0 when taken, else seconds to wait."""
+        key = guest if guest else "_direct"
+        now = time.monotonic()
+        with self.attest_lock:
+            times = self.attest_times.setdefault(key, [])
+            times[:] = [t for t in times if now - t < 60]
+            if len(times) >= per_minute:
+                return max(0.001, 60 - (now - times[0]))
+            times.append(now)
+            return 0.0
+
+    def attest(self, report_data: bytes) -> dict:
+        """A fresh SNP report over the caller's 64 bytes, tied to this boot's binding."""
+        report, chain = fresh_report(report_data)
+        measurement = report_fields(report)["measurement"]
+        if measurement != self.binding["measurement"]:
+            raise RuntimeError("measurement changed since the binding")
+        # Field name matches the receipt (cathedral_challenge_receipt_v1_1
+        # tee.cert_chain): DER base64 for vcek/ask/ark, or null.
+        return {"report_b64": b64(report), "cert_chain": chain, "binding_sha256": self.binding_sha256,
+                "measurement": measurement, "generated_at": int(time.time())}
 
     def sign(self, fields: dict) -> dict:
         with self.lock:
@@ -255,6 +348,7 @@ SIGNED = [  # (method, path pattern, action)
     ("PATCH", re.compile("^" + ROOM + r"/network$"), "network_set"),
     ("DELETE", re.compile(r"^/v1/sandboxes$"), "bulk_delete"),
 ]
+HEX64 = re.compile(r"[0-9a-fA-F]{128}")
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
        "proxy-authenticate", "content-length", "host"}
 
@@ -332,6 +426,8 @@ class Handler(BaseHTTPRequestHandler):
         ledger: Ledger = self.server.ledger
         if self.command == "GET" and path == "/room/attestation":
             return self.reply(200, canonical(ledger.attestation()))
+        if path == "/room/attest":
+            return self.handle_attest(ledger, body)
         if self.command == "GET" and path == "/room/receipts":
             if not self.authorized():
                 return self.reply(401, b'{"error":"unauthorized"}')
@@ -390,6 +486,39 @@ class Handler(BaseHTTPRequestHandler):
         ctype = next((v for k, v in headers if k.lower() == "content-type"), "application/json")
         passthrough = {k: v for k, v in headers if k.lower() not in HOP and k.lower() != "content-type"}
         return self.reply(status, out, {**passthrough, **extra}, ctype)
+
+    def handle_attest(self, ledger: "Ledger", body: bytes | None):
+        """POST /room/attest {"report_data_hex": <128 hex>}: a fresh SNP report.
+
+        REPORT_DATA is the caller's 64 bytes verbatim. The caller must put a
+        digest of what it binds there (for example sha512 of its statement);
+        the hotel does not hash it again.
+        """
+        if self.command != "POST":
+            return self.reply(405, b'{"error":"method_not_allowed"}', {"Allow": "POST"})
+        if not self.authorized():
+            return self.reply(401, b'{"error":"unauthorized"}')
+        if not ledger.sealed:
+            return self.reply(503, b'{"error":"not_sealed"}')
+        try:
+            doc = json.loads(body or b"")
+        except ValueError:
+            doc = None
+        raw = doc.get("report_data_hex") if isinstance(doc, dict) else None
+        if not isinstance(raw, str) or not HEX64.fullmatch(raw):
+            return self.reply(400, b'{"error":"report_data_hex must be 128 hex characters (64 bytes)"}')
+        # Broker sets X-Cathedral-Guest; a direct hotel-key call has no guest
+        # and shares the "_direct" bucket. Limit is per guest, not per hotel.
+        guest = (self.headers.get("X-Cathedral-Guest") or "").strip()
+        wait = ledger.attest_slot(guest, self.server.attest_per_minute)
+        if wait:
+            return self.reply(429, b'{"error":"attest_rate_limit"}', {"Retry-After": str(int(wait) + 1)})
+        try:
+            out = ledger.attest(bytes.fromhex(raw))
+        except Exception as exc:  # noqa: BLE001 a TSM failure is the hotel's, not the caller's
+            traceback.print_exc()
+            return self.reply(500, canonical({"error": "attest_failed", "detail": type(exc).__name__}))
+        return self.reply(200, canonical(out))
 
     def fields(self, action: str, path: str, body: bytes | None, status: int, out: bytes) -> dict:
         req = {}
@@ -455,8 +584,9 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 1024
 
-    def __init__(self, addr, ledger, api_port, health_port, api_key, docker_sock):
+    def __init__(self, addr, ledger, api_port, health_port, api_key, docker_sock, attest_per_minute=30):
         super().__init__(addr, Handler)
+        self.attest_per_minute = max(1, int(attest_per_minute))
         self.ledger, self.api_port, self.health_port, self.api_key = ledger, api_port, health_port, api_key
         self.docker_sock = docker_sock
         self._digests: dict[str, str | None] = {}
@@ -521,7 +651,8 @@ def main() -> int:
     else:
         print(f"room-receipts: binding {ledger.binding_sha256} level hotel", flush=True)
     srv = Server((host, int(port)), ledger, int(env.get("ROOM_API_PORT", "18090")),
-                 int(env.get("ROOM_HEALTH_PORT", "18091")), api_key, env.get("ROOM_DOCKER_SOCK", "/run/pool-room/docker.sock"))
+                 int(env.get("ROOM_HEALTH_PORT", "18091")), api_key, env.get("ROOM_DOCKER_SOCK", "/run/pool-room/docker.sock"),
+                 int(env.get("ROOM_ATTEST_PER_MINUTE", "30")))
     srv.serve_forever()
     return 0
 

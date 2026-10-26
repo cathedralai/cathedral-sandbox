@@ -115,6 +115,39 @@ does not enter that path.
 
 `ROOM_HOTEL_NAME` empty means the installer uses `ROOM_ID`.
 
+### Fresh report over caller data (sealed only)
+
+`POST /room/attest` on the receipt front asks the processor for a new SNP
+report whose REPORT_DATA is the caller's 64 bytes. Auth is the hotel API key
+(`Authorization: Bearer <key>`), as for `/room/receipts`.
+
+Request: `{"report_data_hex": "<128 hex characters>"}`. The hotel puts those
+64 bytes in REPORT_DATA verbatim. It does not hash them. So the caller must
+send a digest of what it binds (for example sha512 of its own statement)
+and check REPORT_DATA against the same digest.
+
+Answer 200:
+
+```json
+{"report_b64": "...", "cert_chain": {"vcek": "...", "ask": "...", "ark": "..."},
+ "binding_sha256": "<this boot's binding sha256>", "measurement": "<hex>", "generated_at": 1761400000}
+```
+
+- `binding_sha256` is the same value as in `GET /room/attestation`. The
+  report comes from the same guest: the hotel refuses (500
+  `attest_failed`) when its measurement differs from the binding.
+- `cert_chain` comes from the host certificate table (configfs-tsm
+  `auxblob`). It is `null` unless VCEK, ASK and ARK are all there; then
+  fetch them from AMD KDS.
+- 400: `report_data_hex` missing, not hex, or not exactly 128 characters.
+- 401: no key or a wrong key.
+- 503 `{"error":"not_sealed"}`: a level 1 hotel. It has no SNP report.
+- 429 `attest_rate_limit` with `Retry-After`: more than
+  `ROOM_ATTEST_PER_MINUTE` reports in 60 s for that guest (default 30;
+  set it in the receipts unit environment). The broker sends
+  `X-Cathedral-Guest`; a direct hotel-key call shares a `_direct` bucket.
+  Bad requests do not use a slot.
+
 ## Room egress policy
 
 Each room has one policy: `internet`, `deny_all` or `allowlist`. The hotel
