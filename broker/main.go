@@ -60,6 +60,10 @@ type hotelConfig struct {
 	// ReservedFor: a guest id. Only that guest may use the hotel; every other
 	// guest treats it as denied (capacity.go). Empty: a pool hotel.
 	ReservedFor string `json:"reserved_for,omitempty"`
+	// MinerHotkey: the SS58 hotkey of the SN94 miner that runs the hotel.
+	// The hotel then carries the labels miner=true and miner_hotkey=<key>,
+	// so a guest policy can deny miner hotels ({"label": {"miner": "true"}}).
+	MinerHotkey string `json:"miner_hotkey,omitempty"`
 }
 
 type guestConfig struct {
@@ -90,6 +94,13 @@ type config struct {
 	// OperatorKeySHA256 is the SHA-256 of the operator key. It allows hotel
 	// join, change and leave at runtime (hotels.go). Empty: no operator routes.
 	OperatorKeySHA256 string `json:"operator_key_sha256"`
+	// Admission of joined hotels (admission.go). SealedAdmission "off" turns
+	// the attestation gate off; anything else ("" or "enforce") keeps it.
+	SealedAdmission    string   `json:"sealed_admission,omitempty"`
+	SealedMeasurements []string `json:"sealed_measurements,omitempty"`  // non-empty: a joined sealed hotel's measurement must be one of these
+	SealedHostData     []string `json:"sealed_host_data,omitempty"`     // non-empty: its HOST_DATA must be one of these
+	AttestTTLSeconds   float64  `json:"attest_ttl_seconds,omitempty"`   // a pass is good this long (default 600)
+	AttestEverySeconds float64  `json:"attest_every_seconds,omitempty"` // check a passed hotel again this often (default 60)
 }
 
 func (b *broker) maxExec() int {
@@ -166,6 +177,8 @@ type hotel struct {
 	createEWMA   float64            // seconds, moving average of the hotel create call (placement.go)
 	moved        int                // creates that left this hotel's queue for another hotel
 	runtime      bool               // joined at runtime (hotels.go), not from the config file
+	adm          admission          // attestation gate of a joined sealed hotel (admission.go)
+	leaving      bool               // a leave passed its empty check; no new rooms (hotels.go)
 	stop         context.CancelFunc // stops the sync loop when the hotel leaves
 }
 
@@ -182,17 +195,18 @@ type guestState struct {
 }
 
 type broker struct {
-	cfg        config
-	mu         sync.Mutex
-	hset       atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
-	hotelsMu   sync.Mutex               // serialises joins and leaves
-	guests     map[string]*guestState
-	capsOnDisk map[string]map[string]any // probe results read from state_dir at start
-	byKey      map[string]*guestState    // sha256(key) -> guest
-	byUUID     map[string]*room
-	compat     *compatState
-	prefetch   prefetchJobs
-	started    time.Time
+	cfg          config
+	mu           sync.Mutex
+	hset         atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
+	hotelsMu     sync.Mutex               // serialises joins and leaves
+	hotelsSaveMu sync.Mutex               // serialises writes of state_dir/hotels.json
+	guests       map[string]*guestState
+	capsOnDisk   map[string]map[string]any // probe results read from state_dir at start
+	byKey        map[string]*guestState    // sha256(key) -> guest
+	byUUID       map[string]*room
+	compat       *compatState
+	prefetch     prefetchJobs
+	started      time.Time
 
 	// Durable client state (state.go).
 	savedUUIDs map[string]string // broker room id -> client id, from the state file
@@ -551,6 +565,16 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			return finish(clientGone())
 		}
 		b.mu.Lock()
+		// The hotel was admitted when the create was placed, but the create
+		// may have queued for its slot past a refused or expired attestation,
+		// or past a leave. Give the slot back and place the create again.
+		if h.leaving || !b.admitted(h, time.Now()) {
+			h.queued--
+			g.queued--
+			b.mu.Unlock()
+			<-h.sem
+			continue
+		}
 		gone, doomed := ctx.Err() != nil, b.tombstoned(g.cfg.ID, labels, tRecv)
 		if gone || doomed {
 			// The guest went away, or deleted this create by label, while it
@@ -1409,6 +1433,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		} `json:"sandboxes"`
 	}
 	lerr := h.getJSON(ctx, h.cfg.API, "/v1/sandboxes", nil, &list)
+	defer b.syncAdmission(ctx, h, herr == nil) // after the health state below is stored
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1437,6 +1462,9 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		h.downSince = time.Time{}
 	case h.downSince.IsZero():
 		h.downSince = now
+		// A hotel that comes back must pass attestation again: it may have
+		// rebooted into another binding.
+		h.adm.attestedAt, h.adm.checkedAt = time.Time{}, time.Time{}
 		if wasOK {
 			log.Printf("hotel %s down: %s", h.cfg.ID, h.lastErr)
 		}

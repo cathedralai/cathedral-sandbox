@@ -46,6 +46,8 @@ type fakeHotel struct {
 	bulkDeletes [][]string       // label filters of DELETE /v1/sandboxes
 	// getStatus overrides GET /v1/sandboxes/{id} when set (e.g. 409 while deleting).
 	getStatus map[string]int
+	// attestation is the body of GET /room/attestation (admission_test.go); nil: 404.
+	attestation []byte
 }
 
 func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -186,6 +188,9 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
 		_, _ = w.Write(f.receipts)
+	case p == "/room/attestation" && r.Method == "GET" && f.attestation != nil:
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(f.attestation)
 	case p == "/room/health" && f.healthFail:
 		writeErr(w, 503, "busy", "health did not answer")
 	case p == "/room/health" || p == "/v1/quota" || p == "/v1/status":
