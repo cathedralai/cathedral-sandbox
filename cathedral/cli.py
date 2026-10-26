@@ -64,6 +64,15 @@ from cathedral.affine_claim import (
     parse_affine_claim_trusted_keys_json,
     verify_affine_claim,
 )
+from cathedral.claims_evidence import (
+    MAX_CLAIMS_EVIDENCE_BYTES,
+    MAX_CLAIMS_TRUSTED_KEYS_BYTES,
+    ClaimsEvidenceError,
+    issue_claims_evidence,
+    parse_claims_evidence_trusted_keys_json,
+    sha256_hex,
+    verify_claims_evidence,
+)
 from cathedral.affine_claim_cvm import (
     cvm_instance_from_running_document,
     issue_affine_claim_from_cvm,
@@ -889,6 +898,149 @@ def _read_bounded_affine_claim_file(
     if len(data) > maximum_bytes:
         raise AffineClaimError(category, f"{label} exceeds the maximum encoded size")
     return data
+
+
+def _read_bounded_claims_file(
+    path: str,
+    label: str,
+    *,
+    maximum_bytes: int,
+    category: str,
+) -> bytes:
+    try:
+        with Path(path).open("rb") as handle:
+            data = handle.read(maximum_bytes + 1)
+    except OSError as exc:
+        raise ClaimsEvidenceError(category, f"unable to load {label}") from exc
+    if len(data) > maximum_bytes:
+        raise ClaimsEvidenceError(category, f"{label} exceeds the maximum encoded size")
+    return data
+
+
+def _parse_claims_utc(value: str, *, field: str) -> datetime.datetime:
+    try:
+        return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=datetime.UTC
+        )
+    except ValueError as exc:
+        raise ClaimsEvidenceError("schema", f"{field} must use six-fractional-digit UTC") from exc
+
+
+def cmd_claims_evidence_issue(args: argparse.Namespace) -> int:
+    try:
+        manifest = json.loads(
+            _read_bounded_claims_file(
+                args.manifest,
+                "claims manifest",
+                maximum_bytes=MAX_CLAIMS_EVIDENCE_BYTES,
+                category="schema",
+            ).decode("utf-8")
+        )
+        if not isinstance(manifest, dict):
+            raise ClaimsEvidenceError("schema", "claims manifest must be a JSON object")
+        agent_output = _read_bounded_claims_file(
+            args.agent_output,
+            "agent_output",
+            maximum_bytes=MAX_CLAIMS_EVIDENCE_BYTES,
+            category="schema",
+        )
+        key_bytes = Path(args.signing_key).read_bytes()
+        if len(key_bytes) != 32:
+            raise ClaimsEvidenceError("key", "signing key must be 32 raw ed25519 bytes")
+        private_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
+        issued_at = _parse_claims_utc(args.issued_at, field="issued_at")
+        evidence = issue_claims_evidence(
+            private_key=private_key,
+            signing_key_id=args.signing_key_id,
+            issued_at=issued_at,
+            manifest=manifest,
+            agent_output_sha256=sha256_hex(agent_output),
+            terminal_status=args.terminal_status,
+        )
+        Path(args.out).write_bytes(evidence)
+    except (ClaimsEvidenceError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        category = getattr(exc, "category", "schema")
+        print(json.dumps({"issued": False, "category": category, "error": str(exc)}, sort_keys=True))
+        return 1
+    print(json.dumps({"issued": True, "out": args.out, "bytes": len(evidence)}, sort_keys=True))
+    return 0
+
+
+def cmd_claims_evidence_verify(args: argparse.Namespace) -> int:
+    try:
+        evidence_bytes = _read_bounded_claims_file(
+            args.evidence,
+            "claims evidence",
+            maximum_bytes=MAX_CLAIMS_EVIDENCE_BYTES,
+            category="schema",
+        )
+        trusted_keys = parse_claims_evidence_trusted_keys_json(
+            _read_bounded_claims_file(
+                args.trusted_keys,
+                "claims evidence trusted keys",
+                maximum_bytes=MAX_CLAIMS_TRUSTED_KEYS_BYTES,
+                category="key",
+            )
+        )
+        expected_manifest = None
+        if args.manifest:
+            expected_manifest = json.loads(
+                _read_bounded_claims_file(
+                    args.manifest,
+                    "claims manifest",
+                    maximum_bytes=MAX_CLAIMS_EVIDENCE_BYTES,
+                    category="schema",
+                ).decode("utf-8")
+            )
+            if not isinstance(expected_manifest, dict):
+                raise ClaimsEvidenceError("schema", "claims manifest must be a JSON object")
+        observed_output = (
+            Path(args.agent_output).read_bytes() if args.agent_output else None
+        )
+        observed_pdf = Path(args.source_pdf).read_bytes() if args.source_pdf else None
+        observed_payload = (
+            Path(args.source_payload).read_bytes() if args.source_payload else None
+        )
+        now = _parse_claims_utc(args.now, field="now") if args.now else None
+        verified = verify_claims_evidence(
+            evidence_bytes,
+            trusted_keys,
+            expected_manifest=expected_manifest,
+            observed_agent_output=observed_output,
+            observed_source_pdf=observed_pdf,
+            observed_source_payload=observed_payload,
+            max_age_seconds=args.max_age_seconds,
+            now=now,
+        )
+    except (ClaimsEvidenceError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        category = getattr(exc, "category", "schema")
+        print(
+            json.dumps(
+                {"accepted": False, "category": category, "error": str(exc)},
+                sort_keys=True,
+            )
+        )
+        return 1
+    print(
+        json.dumps(
+            {
+                "accepted": verified.accepted,
+                "reject_reasons": list(verified.reject_reasons),
+                "schema": verified.document["schema"],
+                "evidence_id": verified.evidence_id,
+                "evidence_digest": verified.evidence_digest,
+                "assurance_level": verified.document["assurance_level"],
+                "terminal_status": verified.document["terminal_status"],
+                "batch_id": verified.document["batch_id"],
+                "paper_id": verified.document["paper_id"],
+                "miner_hotkey": verified.document["miner_hotkey"],
+                "agent_output_sha256": verified.document["agent_output_sha256"],
+                "verification_scope": "cathedral_claims_evidence_binding",
+            },
+            sort_keys=True,
+        )
+    )
+    return 0 if verified.accepted else 2
 
 
 def cmd_affine_claim_verify(args: argparse.Namespace) -> int:
@@ -5270,6 +5422,45 @@ def build_parser() -> argparse.ArgumentParser:
     p_affine_claim_validate.add_argument("--spot-check", action="store_true")
     p_affine_claim_validate.add_argument("--force-full-rerun", action="store_true")
     p_affine_claim_validate.set_defaults(func=cmd_affine_claim_validate)
+
+    p_claims_evidence = sub.add_parser(
+        "claims-evidence",
+        help="issue/verify Claims (SN111) evidence packs over agent_output digests",
+    )
+    claims_evidence_sub = p_claims_evidence.add_subparsers(
+        dest="claims_evidence_command",
+        required=True,
+    )
+    p_claims_issue = claims_evidence_sub.add_parser(
+        "issue",
+        help="sign cathedral_claims_evidence_v1 for a Claims job manifest + agent_output",
+    )
+    p_claims_issue.add_argument("--manifest", required=True)
+    p_claims_issue.add_argument("--agent-output", required=True)
+    p_claims_issue.add_argument("--signing-key", required=True, help="32-byte raw ed25519 private key")
+    p_claims_issue.add_argument("--signing-key-id", required=True)
+    p_claims_issue.add_argument("--issued-at", required=True, help="YYYY-MM-DDTHH:MM:SS.ffffffZ")
+    p_claims_issue.add_argument("--out", required=True)
+    p_claims_issue.add_argument(
+        "--terminal-status",
+        default="succeeded",
+        choices=("succeeded", "failed", "cancelled"),
+    )
+    p_claims_issue.set_defaults(func=cmd_claims_evidence_issue)
+
+    p_claims_verify = claims_evidence_sub.add_parser(
+        "verify",
+        help="verify cathedral_claims_evidence_v1 and optional observed digests",
+    )
+    p_claims_verify.add_argument("--evidence", required=True)
+    p_claims_verify.add_argument("--trusted-keys", required=True)
+    p_claims_verify.add_argument("--manifest", help="expected Claims job manifest JSON")
+    p_claims_verify.add_argument("--agent-output", help="observed agent_output.json bytes")
+    p_claims_verify.add_argument("--source-pdf", help="observed paper PDF bytes")
+    p_claims_verify.add_argument("--source-payload", help="observed source_payload.json bytes")
+    p_claims_verify.add_argument("--max-age-seconds", type=int)
+    p_claims_verify.add_argument("--now", help="override clock for reuse/freshness checks")
+    p_claims_verify.set_defaults(func=cmd_claims_evidence_verify)
 
     p_lifecycle = sub.add_parser(
         "lifecycle",
