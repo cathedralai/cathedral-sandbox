@@ -95,6 +95,7 @@ TEE_BOX_CENTRAL_SCOPES = frozenset(
         "tee-box:exec",
         "tee-box:files",
         "tee-box:tunables",
+        "tee-box:attest",
     }
 )
 SCOPED_METHODS = frozenset({"GET", "POST", "PUT", "DELETE"})

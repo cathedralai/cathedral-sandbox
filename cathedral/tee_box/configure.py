@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 from cathedral.common import ChannelBinding
 from cathedral.tee_box import measured_root
+from cathedral.tee_box.attest import DEFAULT_ATTEST_PER_MINUTE, GuestAttestor
 from cathedral.tee_box.boot import BootError, BootGuard, SysfsRtmr3, marker_path_for
 from cathedral.tee_box.egress import (
     DEFAULT_BANDWIDTH_MBIT,
@@ -85,6 +86,7 @@ OPTIONAL = (
     "tee_box_no_disk_quota",
     "tee_box_tunables",
     "tee_box_daemon_json",
+    "tee_box_attest_per_minute",
 )
 
 
@@ -172,6 +174,14 @@ def add_tee_box_arguments(command: argparse.ArgumentParser) -> None:
         ),
     )
     group.add_argument(
+        "--tee-box-attest-per-minute",
+        type=int,
+        help=(
+            "attest.report: fresh SEV-SNP reports over caller REPORT_DATA allowed per 60 s "
+            f"(default {DEFAULT_ATTEST_PER_MINUTE})"
+        ),
+    )
+    group.add_argument(
         "--tee-box-no-disk-quota",
         action="store_true",
         default=None,
@@ -196,6 +206,7 @@ class TeeBoxConfig:
     tunables: Tunables
     tunables_source: str = "default"
     daemon_json: str | None = None
+    attest_per_minute: int = DEFAULT_ATTEST_PER_MINUTE
 
 
 def tee_box_config(args: argparse.Namespace) -> TeeBoxConfig | None:
@@ -234,6 +245,9 @@ def tee_box_config(args: argparse.Namespace) -> TeeBoxConfig | None:
         )
     except TunablesError as exc:
         raise ValueError(f"--tee-box-tunables: {exc}") from exc
+    attest_per_minute = pick("tee_box_attest_per_minute", DEFAULT_ATTEST_PER_MINUTE)
+    if not 1 <= attest_per_minute <= 600:
+        raise ValueError("--tee-box-attest-per-minute must be 1 to 600")
     return TeeBoxConfig(
         central_state=args.tee_box_central_state,
         executor=args.tee_box_executor,
@@ -250,6 +264,7 @@ def tee_box_config(args: argparse.Namespace) -> TeeBoxConfig | None:
         tunables=tunables,
         tunables_source="default" if tunables_path is None else "file",
         daemon_json=getattr(args, "tee_box_daemon_json", None),
+        attest_per_minute=attest_per_minute,
     )
 
 
@@ -431,6 +446,8 @@ def build_tee_box_api(
         create_concurrency=config.tunables.create_concurrency,
         tunables_source=config.tunables_source,
         daemon_reloader=reloader,
+        # Answers only on an SEV-SNP guest (TSM provider sev_guest); elsewhere a 503.
+        attestor=GuestAttestor(per_minute=config.attest_per_minute),
     )
     facts = {
         "central_root_keys": measured_root.CENTRAL_ROOT_KEYS_PATH,

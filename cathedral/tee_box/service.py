@@ -40,6 +40,7 @@ from cathedral.central_access import (
     CentralAccessError,
 )
 from cathedral.policy_registry import canonical_json, parse_registry_json
+from cathedral.tee_box.attest import AttestRateLimited, AttestUnavailable, GuestAttestor
 from cathedral.tee_box.boot import BootError, BootGuard, RelaunchRequired, RtmrError
 from cathedral.tee_box.daemon_reload import DaemonReloader, DaemonReloadError
 from cathedral.tee_box.egress import EgressPolicy
@@ -95,6 +96,7 @@ _ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = tuple(
         ("POST", r"/v1/box/revocations", "revocations"),
         ("GET", r"/v1/box/tunables", "tunables_get"),
         ("POST", r"/v1/box/tunables", "tunables_apply"),
+        ("POST", r"/v1/box/attest", "attest_report"),
         ("GET", r"/v1/lease", "lease_get"),
         ("POST", r"/v1/lease", "lease_acquire"),
         ("DELETE", r"/v1/lease", "lease_release"),
@@ -130,6 +132,7 @@ ROUTE_SCOPES: Mapping[str, str] = {
     "revocations": "tee-box:revocations",
     "tunables_get": "tee-box:tunables",
     "tunables_apply": "tee-box:tunables",
+    "attest_report": "tee-box:attest",
     "lease_get": "tee-box:lease",
     "lease_acquire": "tee-box:lease",
     "lease_release": "tee-box:lease",
@@ -159,6 +162,7 @@ _NO_LEASE_ROUTES = frozenset(
         "lease_acquire",
         "lease_release",
         "tunables_get",
+        "attest_report",
     }
 )
 # Routes served before the control plane has pushed a revocation list.
@@ -177,6 +181,7 @@ _LABEL_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 _USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,31})?$")
 _REFERENCE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*(?::[0-9]{1,5})?(?:/[a-z0-9][a-z0-9._-]*)+$")
 _DIGEST_RE = re.compile(rf"^{_DIGEST}$")
+_REPORT_DATA_HEX_RE = re.compile(r"[0-9a-fA-F]{128}")
 
 
 def owns_path(path: str) -> bool:
@@ -344,6 +349,7 @@ class TeeBoxSandboxApi:
         create_concurrency: int = 1,
         tunables_source: str = "default",
         daemon_reloader: DaemonReloader | None = None,
+        attestor: GuestAttestor | None = None,
     ) -> None:
         if not isinstance(authorizer, CentralAccessAuthorizer):
             raise ValueError("the sandbox API requires a central access authorizer")
@@ -381,6 +387,7 @@ class TeeBoxSandboxApi:
         self._tunables_applied_at: int | None = None
         self._daemon_reloader = daemon_reloader
         self._daemon_confirmed = True
+        self._attestor = attestor
         self._reserved = Shape(0, 0, 0)
         self._reserved_count = 0
         self._inflight = 0
@@ -865,6 +872,33 @@ class TeeBoxSandboxApi:
         discard = getattr(self.executor, "discard_warm", None)
         if callable(discard):
             discard()
+
+    # -- attestation -------------------------------------------------------
+
+    def _attest_report(self, caller, body, fields) -> Response:  # noqa: ANN001
+        """A fresh SEV-SNP report whose REPORT_DATA is the caller's 64 bytes (attest.report)."""
+
+        self._query(fields, frozenset())
+        document = _body(body, frozenset({"report_data_hex"}), frozenset({"report_data_hex"}))
+        raw = document["report_data_hex"]
+        if not isinstance(raw, str) or _REPORT_DATA_HEX_RE.fullmatch(raw) is None:
+            raise _bad("report_data_hex must be 128 hex characters (64 bytes)")
+        if self._attestor is None:
+            raise _Refusal(503, "this box has no SEV-SNP attestation report", "attest_unavailable")
+        try:
+            report = self._attestor.report(bytes.fromhex(raw))
+        except AttestRateLimited as exc:
+            return _json(
+                429,
+                {
+                    "error": "too many attestation reports; retry later",
+                    "reason": "attest_rate_limit",
+                    "retry_after_seconds": exc.retry_after,
+                },
+            )
+        except AttestUnavailable as exc:
+            raise _Refusal(503, str(exc), "attest_unavailable") from exc
+        return _json(200, report)
 
     # -- images ----------------------------------------------------------
 
