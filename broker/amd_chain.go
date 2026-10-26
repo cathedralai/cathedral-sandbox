@@ -5,10 +5,10 @@
 // room-kit/verify_receipts.py, on the attestation document exactly as the
 // hotel served it:
 //
-//	<command...> --attestation <file> --require-sealed --ark-sha256 <pin> [--kds-cache <dir>]
+//	<command...> --attestation <file> --require-sealed --ark-sha256 <pin> [--ark-sha256 <pin>...] [--kds-cache <dir>]
 //
 // verify_receipts.py fetches ASK, ARK and the VCEK from AMD KDS (or its
-// cache), checks the ARK against the pin, the ASK and VCEK signatures, the
+// cache) for the report's product, checks the ARK against the pins, the ASK and VCEK signatures, the
 // VCEK hwID and TCB against the report, and the report's ECDSA P-384
 // signature. Its JSON verdict decides: PASS admits, FAIL refuses with its
 // reason. A verifier that does not run or prints no verdict (KDS down, no
@@ -19,10 +19,27 @@
 //
 //	"amd_verifier": {
 //	  "command": ["python3", "/opt/room-kit/verify_receipts.py"],
-//	  "ark_sha256": "<sha256 of the AMD ARK DER>",   required: the chain is pinned
+//	  "ark_sha256": "<sha256 of the AMD ARK DER>",   required: the chain is pinned;
+//	                                                 a list of pins admits any of them
 //	  "kds_cache": "/var/lib/thin-broker/amd-kds",   optional
 //	  "timeout_seconds": 120                          optional
 //	}
+//
+// ark_sha256 is one pin (a string) or a list. Each AMD product has its own
+// ARK, so a fleet of several products lists one pin per product. The
+// verifier is run once with every pin (one --ark-sha256 each); it fetches
+// the chain of the report's product and passes if that ARK is any pin. A
+// FAIL is final: there is no retry with another pin. A verifier older than
+// the repeatable flag keeps only the last pin, so a list fails closed there.
+//
+// ARK SHA-256 (DER) per product, from AMD KDS:
+//
+//	Milan  69d063b45344d26a2e94e1f4210de49ef555308287d4c174445c95639a540bcd
+//	Genoa  4c6598d19c18719c5dfd4a7d335f674e5bfe1d8f800cea2cf270c10d103db2f1
+//	Turin  1f084161a44bb6d93778a904877d4819cafa5d05ef4193b2ded9dd9c73dd3f6a
+//
+// verify_receipts.py reads the Milan and Genoa TCB layouts only: a Turin pin
+// is accepted here but a Turin report fails until the verifier handles it.
 package main
 
 import (
@@ -40,7 +57,7 @@ import (
 
 type amdVerifierConfig struct {
 	Command        []string `json:"command"`
-	ARKSHA256      string   `json:"ark_sha256"`
+	ARKSHA256      arkPins  `json:"ark_sha256"`
 	KDSCache       string   `json:"kds_cache,omitempty"`
 	TimeoutSeconds float64  `json:"timeout_seconds,omitempty"`
 }
@@ -52,6 +69,24 @@ const (
 
 var hex64RE = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 
+// arkPins is ark_sha256: a single pin (a JSON string, the original form) or
+// a list of pins.
+type arkPins []string
+
+func (p *arkPins) UnmarshalJSON(raw []byte) error {
+	var one string
+	if json.Unmarshal(raw, &one) == nil {
+		*p = arkPins{one}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(raw, &many); err != nil {
+		return errors.New("ark_sha256 must be a string or a list of strings")
+	}
+	*p = many
+	return nil
+}
+
 func (c *amdVerifierConfig) validate() error {
 	if c == nil {
 		return nil
@@ -59,8 +94,13 @@ func (c *amdVerifierConfig) validate() error {
 	if len(c.Command) == 0 || c.Command[0] == "" {
 		return errors.New("command must name the verifier, e.g. [\"python3\", \"/opt/room-kit/verify_receipts.py\"]")
 	}
-	if !hex64RE.MatchString(c.ARKSHA256) {
+	if len(c.ARKSHA256) == 0 {
 		return errors.New("ark_sha256 must be the SHA-256 (64 hex) of the AMD ARK certificate: an unpinned chain proves nothing")
+	}
+	for _, pin := range c.ARKSHA256 {
+		if !hex64RE.MatchString(pin) {
+			return fmt.Errorf("ark_sha256 %q must be the SHA-256 (64 hex) of an AMD ARK certificate", pin)
+		}
 	}
 	return nil
 }
@@ -94,7 +134,10 @@ func (b *broker) verifyAMDChain(ctx context.Context, raw []byte) (map[string]any
 		return nil, fmt.Errorf("AMD chain verifier: %v", err)
 	}
 	f.Close()
-	args := append(append([]string{}, c.Command[1:]...), "--attestation", f.Name(), "--require-sealed", "--ark-sha256", strings.ToLower(c.ARKSHA256))
+	args := append(append([]string{}, c.Command[1:]...), "--attestation", f.Name(), "--require-sealed")
+	for _, pin := range c.ARKSHA256 {
+		args = append(args, "--ark-sha256", strings.ToLower(pin))
+	}
 	if c.KDSCache != "" {
 		args = append(args, "--kds-cache", c.KDSCache)
 	}

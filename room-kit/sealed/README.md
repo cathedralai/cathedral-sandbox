@@ -137,7 +137,7 @@ one room's receipts while the room exists.
 It checks the binding digest, REPORT_DATA, that the guest is not a debug
 build (`cathedral.debug=1` on the measured command line fails), the AMD chain
 (ARK, ASK and VCEK from AMD KDS, RSA-PSS SHA-384; pin the ARK with
-`--ark-sha256`, or the KDS answer and the local cache are trusted), the VCEK chip id and TCB extensions, the
+`--ark-sha256`, repeated to accept any of several roots, or the KDS answer and the local cache are trusted), the VCEK chip id and TCB extensions, the
 report signature (ECDSA P-384), each receipt signature (Ed25519) and the
 chain links. It prints the policy timeline of each room
 (`policy_timeline`) and checks each policy sha256.
