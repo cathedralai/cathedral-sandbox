@@ -59,6 +59,14 @@ type placement struct {
 	// class: set only on a fallback. "sealed" or "unsealed": the hotel must be
 	// of that class, on top of every rule above.
 	class string
+	// policy: the guest's placement policy (capacity.go), nil for a guest
+	// with none. tier: "" for any tier the policy reaches, or "prefer" or
+	// "allow" for that tier only (pick tries prefer, then allow).
+	policy *guestPolicy
+	tier   string
+	// guest: the guest id (set by scope). A hotel reserved for another
+	// guest never matches; an empty guest matches no reserved hotel.
+	guest string
 }
 
 func (pl placement) selects(h *hotel) bool {
@@ -70,6 +78,15 @@ func (pl placement) selects(h *hotel) bool {
 	}
 	if len(pl.images) > 0 && !pl.images[h.cfg.ID] {
 		return false
+	}
+	if r := h.reservedFor(); r != "" && r != pl.guest {
+		return false
+	}
+	if pl.policy != nil {
+		t := pl.policy.tier(h) // deny wins: a denied hotel has no tier
+		if t == "" || (pl.tier != "" && t != pl.tier) {
+			return false
+		}
 	}
 	isSealed := h.labels()["sealed"] == "true"
 	switch pl.class {
@@ -85,7 +102,9 @@ func (pl placement) selects(h *hotel) bool {
 	// A hotel with "sealed": true in the config takes only creates that ask
 	// for a sealed room ("sealed": true or hotel label sealed=true) or name it.
 	// A sealed fallback counts as asking: it comes from a named sealed hotel.
-	if h.cfg.Sealed && len(pl.ids) == 0 && pl.match["sealed"] != "true" && pl.class != "sealed" {
+	// A guest policy that reaches the hotel (checked above) also counts: the
+	// operator gave the guest that class.
+	if h.cfg.Sealed && len(pl.ids) == 0 && pl.match["sealed"] != "true" && pl.class != "sealed" && pl.policy == nil {
 		return false
 	}
 	for k, v := range pl.match {
@@ -296,7 +315,7 @@ func (b *broker) fallbackFor(pl placement) (placement, bool) {
 	if sealed != 0 && sealed != n {
 		return pl, false
 	}
-	if sealed == n && len(pl.allowed) == 0 {
+	if sealed == n && len(pl.allowed) == 0 && pl.policy == nil {
 		return pl, false
 	}
 	// The class is a separate rule, so the request's own hotel_labels and
@@ -351,7 +370,7 @@ func (b *broker) handleHotels(w http.ResponseWriter, g *guestState) {
 	b.mu.Lock()
 	out := []map[string]any{}
 	for _, h := range b.hotelList() {
-		if !g.limits.allows(h.cfg.ID) {
+		if !g.allowsHotel(h) {
 			continue
 		}
 		free := b.freeFor(h)

@@ -467,7 +467,12 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	}
 	b.mu.Unlock()
 	copyRoomHeaders(w.Header(), out.header) // the signed receipt, when the hotel has one
-	writeJSON(w, 201, compatView(out.doc, u))
+	view := compatView(out.doc, u)
+	if t, _ := out.doc["placement_tier"].(string); t != "" { // a guest policy placed it (capacity.go)
+		w.Header().Set("X-Broker-Placement-Tier", t)
+		view["placement_tier"] = t
+	}
+	writeJSON(w, 201, view)
 }
 
 // compatNetwork turns the client network fields into the hotel network
@@ -1077,7 +1082,7 @@ func (b *broker) freeRoomsFor(g *guestState) int {
 	defer b.mu.Unlock()
 	free := 0
 	for _, h := range b.hotelList() {
-		if !h.ok || !g.limits.allows(h.cfg.ID) {
+		if !h.ok || !g.allowsHotel(h) {
 			continue
 		}
 		if f := b.freeFor(h); f > 0 {

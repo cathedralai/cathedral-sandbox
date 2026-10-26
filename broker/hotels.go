@@ -4,7 +4,7 @@
 // removes hotels with the operator key (config "operator_key_sha256"):
 //
 //	POST   /v1/broker/hotels        {id, name, api, health, key, concurrency, labels, threads, ram_gib}
-//	PATCH  /v1/broker/hotels/<id>   {drain, labels}
+//	PATCH  /v1/broker/hotels/<id>   {drain, labels, reserved_for}  (reserved_for null: back to the pool)
 //	DELETE /v1/broker/hotels/<id>   (only a hotel with no rooms; drain it first)
 //
 // A hotel added at runtime is kept in state_dir/hotels.json, and its key in
@@ -72,6 +72,13 @@ func (h *hotel) labels() map[string]string {
 	h.cfgMu.RLock()
 	defer h.cfgMu.RUnlock()
 	return h.cfg.Labels
+}
+
+// reservedFor is the guest the hotel is reserved for, or "" for a pool hotel.
+func (h *hotel) reservedFor() string {
+	h.cfgMu.RLock()
+	defer h.cfgMu.RUnlock()
+	return h.cfg.ReservedFor
 }
 
 func (h *hotel) drain() bool {
@@ -207,6 +214,10 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "hotel_exists", "hotel "+hc.ID+" exists")
 		return
 	}
+	if hc.ReservedFor != "" && !b.guestExists(hc.ReservedFor) {
+		writeErr(w, 409, "unknown_guest", "reserved_for names no guest "+hc.ReservedFor)
+		return
+	}
 	h := newHotel(hc, req.Key)
 	if req.Verify == nil || *req.Verify {
 		var st map[string]any
@@ -244,13 +255,29 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	var req struct {
-		Drain  *bool             `json:"drain"`
-		Labels map[string]string `json:"labels"`
+		Drain       *bool             `json:"drain"`
+		Labels      map[string]string `json:"labels"`
+		ReservedFor json.RawMessage   `json:"reserved_for"` // a guest id, or null to release
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if json.Unmarshal(raw, &req) != nil {
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
+	}
+	var reserve *string
+	if len(req.ReservedFor) > 0 {
+		v := ""
+		if string(req.ReservedFor) != "null" {
+			if json.Unmarshal(req.ReservedFor, &v) != nil || v == "" {
+				writeErr(w, 400, "invalid_json", "reserved_for must be a guest id or null")
+				return
+			}
+			if !b.guestExists(v) {
+				writeErr(w, 409, "unknown_guest", "reserved_for names no guest "+v)
+				return
+			}
+		}
+		reserve = &v
 	}
 	b.mu.Lock()
 	h.cfgMu.Lock()
@@ -262,6 +289,9 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string) {
 			req.Labels["sealed"] = "true"
 		}
 		h.cfg.Labels = req.Labels
+	}
+	if reserve != nil {
+		h.cfg.ReservedFor = *reserve
 	}
 	h.cfgMu.Unlock()
 	b.mu.Unlock()
@@ -306,7 +336,17 @@ func hotelDoc(h *hotel) map[string]any {
 	if labels == nil {
 		labels = map[string]string{}
 	}
-	return map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime}
+	var reserved any
+	if r := h.reservedFor(); r != "" {
+		reserved = r
+	}
+	return map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime, "reserved_for": reserved}
+}
+
+func (b *broker) guestExists(id string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.guests[id] != nil
 }
 
 // ---------------------------------------------------------------- persistence

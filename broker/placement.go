@@ -140,7 +140,14 @@ func (b *broker) waitSlot(ctx context.Context, g *guestState, h *hotel, pl place
 			// move needs a clear gain (half the expected wait), so creates
 			// do not swing between two hotels.
 			b.mu.Lock()
-			if alt := b.pick(map[*hotel]bool{h: true}, pl); alt != nil && alt.expectedWait(1) < h.expectedWait(0)/2 {
+			// A create queued on a preferred hotel moves only to another
+			// preferred hotel: that hotel has a room, so the allowed tier is
+			// not open to it.
+			mpl := pl
+			if pl.policy != nil && pl.tier == "" && pl.policy.tier(h) == tierPrefer {
+				mpl.tier = tierPrefer
+			}
+			if alt := b.pick(map[*hotel]bool{h: true}, mpl); alt != nil && alt.expectedWait(1) < h.expectedWait(0)/2 {
 				h.queued--
 				alt.queued++
 				h.moved++

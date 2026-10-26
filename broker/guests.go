@@ -6,6 +6,7 @@
 //	"max_creates_per_minute": 600  rooms the guest may ask for in any 60 s (0 or absent: no limit)
 //	"default_sealed": true         a create with no hotel choice goes to sealed hotels only
 //	"hotels": ["a", "b"]           the guest may use only these hotels (absent: all hotels)
+//	"policy": {prefer, allow, deny} hotels by selector; replaces "hotels" and "default_sealed" (capacity.go)
 //	"ops": true                    the guest may run the probe and reset the broker counters
 //
 // With "default_sealed", a create gets an unsealed room only when it says
@@ -15,7 +16,7 @@
 // An operator (operator key) reads and changes limits at runtime:
 //
 //	GET   /v1/broker/guests        every guest with its limits and room counts
-//	PATCH /v1/broker/guests/<id>   {"max_rooms", "max_creates_per_minute", "default_sealed", "hotels"}
+//	PATCH /v1/broker/guests/<id>   {"max_rooms", "max_creates_per_minute", "default_sealed", "hotels", "policy"}
 //
 // A runtime change stays in memory only. A restart goes back to the config
 // file, so change the config file to keep a limit.
@@ -40,6 +41,9 @@ type guestLimits struct {
 	MaxCreatesPerMinute int      `json:"max_creates_per_minute"`
 	DefaultSealed       bool     `json:"default_sealed"`
 	Hotels              []string `json:"hotels"`
+	// Policy, when set, replaces Hotels and DefaultSealed (capacity.go). It
+	// is never changed in place: a PATCH stores a new value.
+	Policy *guestPolicy `json:"policy,omitempty"`
 }
 
 func (l guestLimits) maxRooms() int {
@@ -49,7 +53,21 @@ func (l guestLimits) maxRooms() int {
 	return defaultMaxRooms
 }
 
-// allows reports whether the guest may use hotel id.
+// tierOf is the policy tier of h ("prefer" or "allow"), "hotels" when the
+// guest has no policy and its hotel list allows h, or "" when h is out of
+// reach.
+// It does not look at hotel reservations; guestState.tierOf does.
+func (l guestLimits) tierOf(h *hotel) string {
+	if l.Policy != nil {
+		return l.Policy.tier(h)
+	}
+	if l.allows(h.cfg.ID) {
+		return "hotels"
+	}
+	return ""
+}
+
+// allows reports whether the hotel list (no policy) allows hotel id.
 func (l guestLimits) allows(id string) bool {
 	if len(l.Hotels) == 0 {
 		return true
@@ -132,6 +150,13 @@ func (b *broker) scope(g *guestState, pl *placement, named, sealedField bool) {
 	b.mu.Lock()
 	lim := g.limits
 	b.mu.Unlock()
+	pl.guest = g.cfg.ID // a hotel reserved for another guest is never a candidate
+	if lim.Policy != nil {
+		// The policy replaces the hotel list and the sealed default: it
+		// names the classes the guest may use, in order (pick).
+		pl.policy = lim.Policy
+		return
+	}
 	if len(lim.Hotels) > 0 {
 		pl.allowed = map[string]bool{}
 		for _, id := range lim.Hotels {
@@ -158,7 +183,7 @@ func (b *broker) guestView(g *guestState) map[string]any {
 	return map[string]any{
 		"id": g.cfg.ID, "max_rooms": lim.maxRooms(), "max_creates_per_minute": lim.MaxCreatesPerMinute,
 		"default_sealed": lim.DefaultSealed, "hotels": hotels, "ops": g.cfg.Ops,
-		"active_rooms": b.activeRooms(g),
+		"active_rooms": b.activeRooms(g), "policy": lim.Policy,
 	}
 }
 
@@ -186,16 +211,17 @@ func (b *broker) handleGuestAdmin(w http.ResponseWriter, r *http.Request, id str
 
 func (b *broker) patchGuest(w http.ResponseWriter, r *http.Request, id string) {
 	var req struct {
-		MaxRooms            *int      `json:"max_rooms"`
-		MaxCreatesPerMinute *int      `json:"max_creates_per_minute"`
-		DefaultSealed       *bool     `json:"default_sealed"`
-		Hotels              *[]string `json:"hotels"`
+		MaxRooms            *int            `json:"max_rooms"`
+		MaxCreatesPerMinute *int            `json:"max_creates_per_minute"`
+		DefaultSealed       *bool           `json:"default_sealed"`
+		Hotels              *[]string       `json:"hotels"`
+		Policy              json.RawMessage `json:"policy"` // null clears the policy
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		writeErr(w, 400, "invalid_json", "body must be a JSON object with max_rooms, max_creates_per_minute, default_sealed or hotels")
+		writeErr(w, 400, "invalid_json", "body must be a JSON object with max_rooms, max_creates_per_minute, default_sealed, hotels or policy")
 		return
 	}
 	if (req.MaxRooms != nil && *req.MaxRooms < 0) || (req.MaxCreatesPerMinute != nil && *req.MaxCreatesPerMinute < 0) {
@@ -220,6 +246,21 @@ func (b *broker) patchGuest(w http.ResponseWriter, r *http.Request, id string) {
 			}
 		}
 	}
+	var policy *guestPolicy
+	clearPolicy := string(req.Policy) == "null"
+	if len(req.Policy) > 0 && !clearPolicy {
+		pdec := json.NewDecoder(strings.NewReader(string(req.Policy)))
+		pdec.DisallowUnknownFields()
+		policy = &guestPolicy{}
+		if err := pdec.Decode(policy); err != nil {
+			writeErr(w, 400, "invalid_policy", "policy must be an object with prefer, allow and deny lists of selectors")
+			return
+		}
+		if err := policy.validate(); err != nil {
+			writeErr(w, 400, "invalid_policy", err.Error())
+			return
+		}
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	g := b.guests[id]
@@ -239,14 +280,38 @@ func (b *broker) patchGuest(w http.ResponseWriter, r *http.Request, id string) {
 	if req.Hotels != nil {
 		g.limits.Hotels = append([]string(nil), (*req.Hotels)...)
 	}
+	if policy != nil || clearPolicy {
+		g.limits.Policy = policy
+	}
 	writeJSON(w, 200, b.guestView(g))
 }
 
-// limitsAllow reports whether g may use hotel id.
+// limitsAllow reports whether g may use hotel id. With a policy, an id that
+// is not a hotel now is out of reach.
 func (g *guestState) limitsAllow(b *broker, id string) bool {
+	h := b.hotelByID(id)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return g.limits.allows(id)
+	if h == nil {
+		return g.limits.Policy == nil && g.limits.allows(id)
+	}
+	return g.allowsHotel(h)
+}
+
+// allowsHotel reports whether g may use hotel h: the hotel is not reserved
+// for another guest, and the policy reaches it (or, with no policy, the hotel
+// list holds it).
+func (g *guestState) allowsHotel(h *hotel) bool {
+	return g.tierOf(h) != ""
+}
+
+// tierOf is guestLimits.tierOf behind the hotel reservation: a hotel
+// reserved for another guest is out of reach, as if denied. Caller holds b.mu.
+func (g *guestState) tierOf(h *hotel) string {
+	if r := h.reservedFor(); r != "" && r != g.cfg.ID {
+		return ""
+	}
+	return g.limits.tierOf(h)
 }
 
 // anyHotel reports whether some hotel matches pl, full or not.
