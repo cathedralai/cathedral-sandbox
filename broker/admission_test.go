@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -613,3 +614,58 @@ func TestCapacityClassTotalsIncludeJoinedHotels(t *testing.T) {
 		t.Fatalf("guest totals: %v", classes)
 	}
 }
+
+// A create that queued for a hotel's slot while the hotel was admitted must
+// not start there after the hotel lost admission (Codex P1 on #340).
+func TestQueuedCreateDoesNotStartOnAHotelThatLostAdmission(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	m := joinMiner(t, tc, "m1", true, 5, nil)
+	m.mu.Lock()
+	m.createDelay = 500 * time.Millisecond
+	m.mu.Unlock()
+	h := tc.b.hotelByID("m1")
+	setHotel(tc, "m1", func(h *hotel) { h.sem = make(chan struct{}, 1) }) // one create at a time
+	onM1 := map[string]any{"image": "alpine:3.20", "hotels": []string{"m1"}}
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		for end := time.Now().Add(5 * time.Second); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
+			tc.b.mu.Lock()
+			ok := cond()
+			tc.b.mu.Unlock()
+			if ok {
+				return
+			}
+		}
+		t.Fatalf("timed out waiting for %s", what)
+	}
+	type answer struct {
+		status int
+		doc    map[string]any
+	}
+	first, second := make(chan answer, 1), make(chan answer, 1)
+	go func() { s, d := tc.call(t, "key1", "POST", "/v1/sandboxes", onM1); first <- answer{s, d} }()
+	waitFor("the first create to hold the slot", func() bool { return h.creating == 1 })
+	go func() { s, d := tc.call(t, "key1", "POST", "/v1/sandboxes", onM1); second <- answer{s, d} }()
+	waitFor("the second create to queue", func() bool { return h.queued == 1 })
+	// The hotel's next attestation check fails while the second create waits.
+	tc.b.mu.Lock()
+	tc.b.noteAttestation(h, admission{}, errDebugBuild, time.Now())
+	tc.b.mu.Unlock()
+	if a := <-first; a.status != 202 {
+		t.Fatalf("first create: %d %v", a.status, a.doc)
+	}
+	a := <-second
+	if a.status != 503 || errCode(a.doc) != "hotels_not_admitted" {
+		t.Fatalf("queued create after admission was lost: %d %v", a.status, a.doc)
+	}
+	if n := creates(tc, "m1"); n != 1 {
+		t.Fatalf("hotel m1 started %d rooms, want 1 (none after admission was lost)", n)
+	}
+	tc.b.mu.Lock()
+	defer tc.b.mu.Unlock()
+	if h.queued != 0 || len(h.sem) != 0 {
+		t.Fatalf("slot or queue count leaked: queued %d, slots held %d", h.queued, len(h.sem))
+	}
+}
+
+var errDebugBuild = errors.New("debug build: the host can log in to this guest")

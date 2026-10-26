@@ -565,6 +565,16 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			return finish(clientGone())
 		}
 		b.mu.Lock()
+		// The hotel was admitted when the create was placed, but the create
+		// may have queued for its slot past a refused or expired attestation,
+		// or past a leave. Give the slot back and place the create again.
+		if h.leaving || !b.admitted(h, time.Now()) {
+			h.queued--
+			g.queued--
+			b.mu.Unlock()
+			<-h.sem
+			continue
+		}
 		gone, doomed := ctx.Err() != nil, b.tombstoned(g.cfg.ID, labels, tRecv)
 		if gone || doomed {
 			// The guest went away, or deleted this create by label, while it
