@@ -379,8 +379,15 @@ config hotels are not gated.
   must give an SEV-SNP binding and report that agree: `binding_sha256` is
   the SHA-256 of the binding as served, REPORT_DATA commits to it,
   measurement, chip id, TCB, policy and HOST_DATA equal the binding, debug
-  is off (policy bit and `cathedral.debug=1`). The broker does not check the
-  AMD signature chain; a guest checks it offline with `verify_receipts.py`.
+  is off (policy bit and `cathedral.debug=1`).
+- AMD chain (VCEK, ASK, ARK, report signature): with `amd_verifier` set, the
+  broker runs the repository's own `room-kit/verify_receipts.py` on the
+  attestation as served (`--require-sealed --ark-sha256 <pin>`); its verdict
+  decides. It runs once per binding. Required for a miner hotel
+  (`miner_hotkey`): without `amd_verifier` a miner sealed hotel is refused.
+- One hotel per chip: a hotel whose CHIP_ID is already an admitted hotel's is
+  refused (join: 409 `chip_in_use`; sync loop: `refused` with the other
+  hotel's id). It is admitted once the other hotel leaves placement.
 - A pass is good for `attest_ttl_seconds` (default 600); the sync loop checks
   again every `attest_every_seconds` (default 60), every 5 s while failing.
 
@@ -392,6 +399,7 @@ Config (all optional):
 | `sealed_host_data` | Its HOST_DATA must be in this list. |
 | `attest_ttl_seconds`, `attest_every_seconds` | As above. |
 | `sealed_admission` | `"off"` turns the attestation gate off (rollback lever). |
+| `amd_verifier` | `{"command": ["python3", "/opt/room-kit/verify_receipts.py"], "ark_sha256": "<AMD ARK DER sha256>", "kds_cache"?: "<dir>", "timeout_seconds"?: 120}`. The host needs Python with `cryptography` and HTTPS to `kdsintf.amd.com` (or a filled KDS cache). |
 
 `admission.state` in the hotel document and the catalog is `admitted`,
 `pending` or `refused` (with `reason`). `GET /v1/broker/hotels` (guest key) lists all

@@ -21,9 +21,23 @@
 // HOST_DATA in the report equal the binding, debug is off in the policy and
 // on the kernel command line. With config "sealed_measurements" or
 // "sealed_host_data" set, the measurement and HOST_DATA must be in the list.
-// The broker does not check the AMD signature chain (VCEK, ASK, ARK); the
-// guest checks it offline with verify_receipts.py, as before. The broker adds
-// no new cryptography.
+//
+// AMD chain (VCEK, ASK, ARK and the report signature). The broker does not
+// verify it itself: with config "amd_verifier" it runs the repository's own
+// verifier, room-kit/verify_receipts.py, on the attestation exactly as the
+// hotel served it, with --require-sealed and the pinned ARK (amd_chain.go).
+// The broker adds no new cryptography. The chain check runs once per binding
+// (a new binding comes only with a reboot). It is required for a miner hotel
+// (miner_hotkey set): without amd_verifier a miner sealed hotel is refused.
+// A joined sealed hotel without miner_hotkey is chain-checked when
+// amd_verifier is set.
+//
+// One hotel per chip: a hotel whose report carries the CHIP_ID of another
+// admitted hotel is refused (at join, 409 chip_in_use) or held refused (in
+// the sync loop) with the other hotel's id as reason. It is admitted when the
+// other hotel leaves placement and its own next check passes. Every SNP guest
+// on one host reports the same CHIP_ID, so two hotels with one chip are one
+// machine counted twice.
 package main
 
 import (
@@ -57,6 +71,18 @@ type admission struct {
 	measurement string
 	bindingSHA  string
 	chipID      string // first 16 hex characters
+	chipFull    string // the whole CHIP_ID (128 hex characters): one hotel per chip
+	// amd is the AMD chain result (product, ark_sha256, tcb) of the binding
+	// amdBinding; nil when the chain was not checked.
+	amd        map[string]any
+	amdBinding string
+}
+
+// errChipInUse is a check that passed for a chip another admitted hotel has.
+type errChipInUse struct{ other, chip string }
+
+func (e errChipInUse) Error() string {
+	return fmt.Sprintf("chip %s... is already hotel %s; one hotel per chip", e.chip, e.other)
 }
 
 func (b *broker) attestTTL() time.Duration {
@@ -107,7 +133,11 @@ func (b *broker) admissionState(h *hotel, now time.Time) string {
 
 // admissionDoc is the admission part of a hotel document. Caller holds b.mu.
 func (b *broker) admissionDoc(h *hotel, now time.Time) map[string]any {
-	d := map[string]any{"state": b.admissionState(h, now), "attestation_required": b.needsAttestation(h)}
+	d := map[string]any{"state": b.admissionState(h, now), "attestation_required": b.needsAttestation(h),
+		"amd_chain_required": h.cfg.MinerHotkey != "" && b.needsAttestation(h)}
+	if h.adm.amd != nil && h.adm.amdBinding == h.adm.bindingSHA {
+		d["amd_chain"] = h.adm.amd
+	}
 	if h.adm.reason != "" {
 		d["reason"] = h.adm.reason
 	}
@@ -144,12 +174,31 @@ func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, err
 		BindingSHA string          `json:"binding_sha256"`
 		Report     string          `json:"report_b64"`
 	}
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if err := h.getJSON(ctx, h.cfg.Health, "/room/attestation", nil, &att); err != nil {
+	status, _, raw, err := h.doBase(ctx, h.cfg.Health, "GET", "/room/attestation", nil, nil, 10*time.Second)
+	if err != nil || status != 200 || json.Unmarshal(raw, &att) != nil {
 		return admission{}, attestFetchErr{errors.New("the hotel did not answer GET /room/attestation")}
 	}
-	return verifyAttestation(att.Binding, att.BindingSHA, att.Report, b.cfg.SealedMeasurements, b.cfg.SealedHostData)
+	res, err := verifyAttestation(att.Binding, att.BindingSHA, att.Report, b.cfg.SealedMeasurements, b.cfg.SealedHostData)
+	if err != nil {
+		return res, err
+	}
+	if b.cfg.AMDVerifier == nil && h.cfg.MinerHotkey == "" {
+		return res, nil // chain not checked: an operator hotel with no verifier configured
+	}
+	if b.cfg.AMDVerifier == nil {
+		return admission{}, errors.New("a miner hotel needs the AMD chain check; set amd_verifier in the broker config")
+	}
+	b.mu.Lock()
+	known := h.adm.amd != nil && h.adm.amdBinding == res.bindingSHA
+	prev := h.adm.amd
+	b.mu.Unlock()
+	if !known {
+		if prev, err = b.verifyAMDChain(ctx, raw); err != nil {
+			return admission{}, err
+		}
+	}
+	res.amd, res.amdBinding = prev, res.bindingSHA
+	return res, nil
 }
 
 // snpBinding is the part of a sealed hotel's binding the broker compares.
@@ -226,7 +275,8 @@ func verifyAttestation(rawBinding []byte, bindingSHA, reportB64 string, measurem
 	if len(hostData) > 0 && !inFold(hostData, host) {
 		return fail("HOST_DATA %s... is not in sealed_host_data", host[:16])
 	}
-	return admission{measurement: measurement, bindingSHA: bsha, chipID: hex.EncodeToString(report[0x1A0:0x1A8])}, nil
+	chip := hex.EncodeToString(report[0x1A0:0x1E0])
+	return admission{measurement: measurement, bindingSHA: bsha, chipID: chip[:16], chipFull: chip}, nil
 }
 
 func inFold(list []string, v string) bool {
@@ -238,10 +288,35 @@ func inFold(list []string, v string) bool {
 	return false
 }
 
-// noteAttestation records a check. Caller holds b.mu.
-func (b *broker) noteAttestation(h *hotel, res admission, err error, now time.Time) {
+// chipHolder is the admitted hotel other than h whose chip is chip, or nil.
+// Caller holds b.mu.
+func (b *broker) chipHolder(h *hotel, chip string, now time.Time) *hotel {
+	for _, o := range b.hotelList() {
+		if o != h && !o.leaving && o.adm.chipFull == chip && !o.adm.attestedAt.IsZero() && b.admitted(o, now) {
+			return o
+		}
+	}
+	return nil
+}
+
+// noteAttestation records a check and returns the error that decides it: err,
+// or errChipInUse for a pass on a chip another admitted hotel has. Caller
+// holds b.mu.
+func (b *broker) noteAttestation(h *hotel, res admission, err error, now time.Time) error {
 	was := b.admitted(h, now)
 	h.adm.checkedAt = now
+	if err == nil && res.chipFull != "" {
+		if o := b.chipHolder(h, res.chipFull, now); o != nil {
+			err = errChipInUse{other: o.cfg.ID, chip: res.chipID}
+			// Keep what the check learned (chip, AMD result); only the pass is withheld.
+			res.checkedAt, res.attestedAt, res.reason = now, time.Time{}, err.Error()
+			h.adm = res
+			if was || h.adm.reason != err.Error() {
+				log.Printf("hotel %s refused: %v", h.cfg.ID, err)
+			}
+			return err
+		}
+	}
 	var fe attestFetchErr
 	switch {
 	case err == nil:
@@ -259,6 +334,7 @@ func (b *broker) noteAttestation(h *hotel, res admission, err error, now time.Ti
 		}
 		h.adm.reason = err.Error()
 	}
+	return err
 }
 
 // syncAdmission runs the attestation step of the sync loop for h.

@@ -101,6 +101,9 @@ type config struct {
 	SealedHostData     []string `json:"sealed_host_data,omitempty"`     // non-empty: its HOST_DATA must be one of these
 	AttestTTLSeconds   float64  `json:"attest_ttl_seconds,omitempty"`   // a pass is good this long (default 600)
 	AttestEverySeconds float64  `json:"attest_every_seconds,omitempty"` // check a passed hotel again this often (default 60)
+	// AMDVerifier runs room-kit/verify_receipts.py on a sealed hotel's
+	// attestation to check the AMD chain (amd_chain.go). Required for miner hotels.
+	AMDVerifier *amdVerifierConfig `json:"amd_verifier,omitempty"`
 }
 
 func (b *broker) maxExec() int {
@@ -306,6 +309,9 @@ func loadBroker(path string) (*broker, error) {
 			}
 			b.byKey[k] = g
 		}
+	}
+	if err := c.AMDVerifier.validate(); err != nil {
+		return nil, fmt.Errorf("config: amd_verifier: %w", err)
 	}
 	for _, h := range b.hotelList() {
 		if r := h.cfg.ReservedFor; r != "" && b.guests[r] == nil {
