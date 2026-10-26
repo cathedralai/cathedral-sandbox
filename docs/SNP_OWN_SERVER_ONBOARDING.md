@@ -10,8 +10,7 @@ Here your own EPYC host runs an SNP guest, and the miner runs inside that guest.
 The machine is a TEE box: its evidence comes from the AMD hardware. That is not
 what the capacity documents call "bare metal", which is a host with no TEE at
 all, a path that is currently deferred ([CAPACITY.md](CAPACITY.md)). When a
-registration asks for the kind of box, an SNP host is `--kind tee`
-([MINER_BOX_RUNBOOK.md](MINER_BOX_RUNBOOK.md)). Intel TDX mining runs in a TDX
+registration asks for the kind of box, an SNP host is `--kind tee`. Intel TDX mining runs in a TDX
 confidential VM, usually rented; see
 [Run one Intel TDX machine](MINING.md#run-one-intel-tdx-machine).
 
