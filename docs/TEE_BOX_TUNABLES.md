@@ -27,6 +27,65 @@ runsc flag names and values were checked against gVisor release-20260817.0
 (int, default 1). `root:memory` is not offered because it would move sandbox writes out
 of the per-sandbox disk cap.
 
+## Verbs
+
+Both need the scope `tee-box:tunables`. Errors are `{"error": ..., "reason": ...}`.
+
+### `tunables.get`: `GET /v1/box/tunables`
+
+No lease needed. Answer 200:
+
+```json
+{"sha256": "<64 hex>", "source": "default", "applied_at": null,
+ "values": {"schema": 1, "runsc": {...}, "docker": {...}, "image": {...}, "pool": {...}, "boot": {...}},
+ "daemon_reload": false, "daemon_confirmed": true}
+```
+
+- `sha256` is `Tunables.sha256`: sha256 of the canonical JSON of the normalised document
+  (every key, defaults filled in, sorted keys, no spaces). Two documents that mean the
+  same tunables have the same sha, however they are spelled. The challenge package
+  computes it with the same code.
+- `source`: `default` (no `--tee-box-tunables`), `file` (the start-up file) or `applied`
+  (the last `tunables.apply`). A worker restart goes back to the start-up file.
+- `daemon_reload`: the worker has `--tee-box-daemon-json`, so a runsc change can apply.
+- `daemon_confirmed`: false only after a failed reload whose rollback also failed; the
+  daemon's runsc flags are then unknown until the next confirmed reload or restart.
+
+### `tunables.apply`: `POST /v1/box/tunables`
+
+Needs the lease. The body is a tunables document, the same JSON as the start-up file
+(at most 4096 bytes). It is validated by the same code: unknown keys, pinned settings,
+wrong types, out-of-range values, duplicate keys and floats are `400`. Answer 200: the
+`tunables.get` view plus `previous_sha256`, `changed` and `reloaded`.
+
+What it does:
+
+- Running sandboxes are never touched. Every tunable acts only when a container starts
+  or an image is imported, so a change reaches the next create.
+- Applying the document already in force changes nothing (`changed: false`).
+- `docker.log_driver`, `image.prime`, `pool.*` and `boot.create_concurrency` apply in
+  memory: about 0.06 ms per apply through the service on the fake executor, one-off
+  measurement of 100 applies (the test applies king and challenger
+  50 times each with a sandbox live in under 5 s total). When the start arguments change,
+  warm containers are removed so a warm start never differs from a cold one; the reaper
+  refills the pool on its next tick. A smaller pool drops its extras at once.
+- `runsc.*` flags are Docker daemon `runtimeArgs`, not `docker run` flags. Changing them
+  rewrites the runsc entry of `daemon.json` (every other key kept) and runs
+  `systemctl reload docker` (SIGHUP: dockerd re-reads `runtimes`, it does not restart).
+  The new flags must then show in `docker info`, or the old file is put back and
+  reloaded. This needs `--tee-box-daemon-json PATH`; without it the change is `409
+  runsc_change_needs_restart`. Because a reload must never meet a live room, it is
+  `409 sandboxes_live` while any sandbox exists (warm containers are removed first). A
+  failed reload is `503 daemon_reload_failed` and the box keeps its previous tunables.
+- `409 creates_in_flight` while a create is past admission. Apply between bursts.
+- With `--tee-box-daemon-json`, a worker start whose daemon flags differ from the
+  start-up file (for example after an apply and a restart) writes the file's flags back
+  before the runtime check.
+
+For the capacity executor this means: alternate king and challenger freely while rooms
+are live when the two documents differ only outside `runsc.*`. When they differ in
+`runsc.*`, delete the burst's rooms before each apply.
+
 ## The runtime flags must match the daemon
 
 The runsc flags live in the Docker daemon's `daemon.json`, which the operator owns. The
