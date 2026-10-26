@@ -26,7 +26,7 @@ module outline), cli.py (serve-snp wiring, startup snapshot check at 2027 to
 examples/systemd/cathedral-validator-access-*.{service,timer},
 examples/systemd/cathedral-audit-miner.service, docs/MINER_AUTO_UPDATE.md,
 docs/SN94_SNP_MINER_IMAGE.md, docs/MINING.md, docs/AMD_SEV_SNP_FRIEND_TEST.md
-(280 to 400), docs/MINER_BOX_RUNBOOK.md, docs/SN94_AUDIT_MINER_OPERATIONS.md,
+(280 to 400), MINER_BOX_RUNBOOK (removed 2026-10-26, PR #341), docs/SN94_AUDIT_MINER_OPERATIONS.md,
 tests/miner_update_support.py, tests/test_miner_update_unit.py.
 
 Live state assumed from the docs, not checked on a host: the SNP miner on the
