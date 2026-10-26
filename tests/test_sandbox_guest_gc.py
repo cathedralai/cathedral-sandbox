@@ -96,9 +96,11 @@ def test_rm_timeout_keeps_quota_then_retry_removes(fake: FakeDocker, monkeypatch
 
         provider.sweep()
 
-        # The API treats it as gone, but the container still runs and still holds quota.
-        with pytest.raises(SandboxOpError):
+        # Still deleting: GET is 409 (not 404) so cleanup_state stays pending
+        # while the container and any in-room cloudflared keep running.
+        with pytest.raises(SandboxOpError) as err:
             provider.get(sid)
+        assert err.value.code == "sandbox_deleting" and err.value.http_status == 409
         assert provider.list(labels=[], state=None) == []
         assert cid in fake.containers
         assert provider.pending_removals() == {sid: cid}
@@ -110,6 +112,9 @@ def test_rm_timeout_keeps_quota_then_retry_removes(fake: FakeDocker, monkeypatch
         assert fake.containers == {}
         assert provider.pending_removals() == {}
         assert _resident(provider) == 0
+        with pytest.raises(SandboxOpError) as gone:
+            provider.get(sid)
+        assert gone.value.http_status == 404
     finally:
         provider.close()
 
@@ -163,12 +168,52 @@ def test_delete_with_failed_rm_keeps_quota_until_sweep(fake: FakeDocker) -> None
     try:
         (sid,) = _create(provider, 1)
         (cid,) = fake.containers
-        fake.set(rm_fail={cid: 1})
+        fake.set(rm_fail={cid: 1})  # DELETE's docker rm fails once; sweep's retry clears it
         provider.delete(sid)  # still idempotent: no error
-        provider.delete(sid)
         assert _resident(provider) == 1 and cid in fake.containers
+        with pytest.raises(SandboxOpError) as err:
+            provider.get(sid)
+        assert err.value.code == "sandbox_deleting" and err.value.http_status == 409
+        assert provider.pending_removals() == {sid: cid}
         provider.sweep()
         assert _resident(provider) == 0 and fake.containers == {}
+    finally:
+        provider.close()
+
+
+def test_delete_without_guest_map_still_removes_labeled_container(fake: FakeDocker) -> None:
+    """Guest-map desync must not drop the API record and leave docker running.
+
+    Spock soak 2026-10-26: room DELETE looked gone while cloudflared on c46
+    stayed connected — the container outlived the room.
+    """
+    provider = DockerGuestProvider()
+    try:
+        (sid,) = _create(provider, 1)
+        (cid,) = list(fake.containers)
+        # Lose the in-memory guest entry the way a bad restart / desync does.
+        lost = provider._guests.pop(sid)  # noqa: SLF001
+        assert lost.container_id == cid
+        provider.delete(sid)
+        assert cid not in fake.containers
+        assert provider.pending_removals() == {}
+        assert _resident(provider) == 0
+        with pytest.raises(SandboxOpError) as err:
+            provider.get(sid)
+        assert err.value.http_status == 404
+    finally:
+        provider.close()
+
+
+def test_delete_labeled_orphan_with_no_record(fake: FakeDocker, monkeypatch) -> None:
+    """DELETE for an id with no API record still docker-rms our labeled orphan."""
+    monkeypatch.setenv("CATHEDRAL_SANDBOX_OWNER", "room-a")
+    cid = "d" * 64
+    fake.add_container(cid, name="cathedral-sbx_ghost", labels={LABEL_OWNER: "room-a", LABEL_SANDBOX_ID: "sbx_ghost"})
+    provider = DockerGuestProvider()
+    try:
+        provider.delete("sbx_ghost")
+        assert cid not in fake.containers
     finally:
         provider.close()
 

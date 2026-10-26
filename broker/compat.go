@@ -747,6 +747,9 @@ func (b *broker) cleanupState(ctx context.Context, bid string) string {
 	if h == nil {
 		return "confirmed"
 	}
+	// Hotel GET 404 means the record and guest are gone. While docker rm is
+	// still running the hotel answers 409 sandbox_deleting — that stays pending
+	// so Polaris does not treat a live cloudflared container as cleaned up.
 	status, _, _, err := h.do(ctx, "GET", "/v1/sandboxes/"+url.PathEscape(hid), nil, nil, 15*time.Second)
 	if err == nil && status == 404 {
 		return "confirmed"

@@ -670,3 +670,59 @@ func TestCompatClientsGetTheReceiptHeaderOnCreateExecAndDelete(t *testing.T) {
 		}
 	}
 }
+
+// While docker rm is still running the hotel answers 409 sandbox_deleting, not
+// 404. cleanup_state must stay pending so Polaris does not treat a live
+// cloudflared container as cleaned up (Spock soak 2026-10-26 c46 ghost).
+func TestCompatCleanupStatePendingWhileHotelDeleting(t *testing.T) {
+	tc := newChain(t)
+	compatCall := func(method, path string, body string) (int, map[string]any) {
+		t.Helper()
+		req, _ := http.NewRequest(method, tc.srv.URL+path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer key1")
+		req.Header.Set("User-Agent", "ctcli/1.0")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var doc map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&doc)
+		return resp.StatusCode, doc
+	}
+	status, doc := compatCall("POST", "/v1/sandboxes", `{"template": "room-1x4"}`)
+	if status != 201 {
+		t.Fatalf("create: %d %v", status, doc)
+	}
+	id, _ := doc["id"].(string)
+	hotelID, hid := "", ""
+	for name, h := range tc.hotels {
+		h.mu.Lock()
+		if n := len(h.rooms); n > 0 {
+			hotelID, hid = name, h.rooms[n-1]["id"].(string)
+			h.getStatus = map[string]int{hid: 409}
+			h.mu.Unlock()
+			break
+		}
+		h.mu.Unlock()
+	}
+	if hid == "" {
+		t.Fatal("hotel created no room")
+	}
+
+	status, doc = compatCall("DELETE", "/v1/sandboxes/"+id, "")
+	if status != 200 {
+		t.Fatalf("delete: %d %v", status, doc)
+	}
+	if doc["cleanup_state"] != "pending" {
+		t.Fatalf("cleanup_state=%v, want pending while hotel GET is 409", doc["cleanup_state"])
+	}
+
+	tc.hotels[hotelID].mu.Lock()
+	tc.hotels[hotelID].getStatus = map[string]int{hid: 404}
+	tc.hotels[hotelID].mu.Unlock()
+	status, doc = compatCall("GET", "/v1/sandboxes/"+id, "")
+	if status != 200 || doc["cleanup_state"] != "confirmed" {
+		t.Fatalf("after hotel 404: %d cleanup_state=%v, want confirmed", status, doc["cleanup_state"])
+	}
+}

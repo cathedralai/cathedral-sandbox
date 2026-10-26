@@ -1958,19 +1958,32 @@ class DockerGuestProvider:
     def delete(self, sandbox_id: str) -> None:
         """DELETE is idempotent (204). The record only goes when the container is gone.
 
-        When the container removal fails, the sandbox stays "deleting": hidden
-        from the API, still counted in quota. The next sweep retries it.
+        When the container removal fails, the sandbox stays "deleting": GET
+        answers 409 sandbox_deleting (not 404), still counted in quota. The
+        next sweep retries it. Never drop the API record via the in-memory
+        provider alone when a labeled container may still be running.
         """
         guest = self._guests.get(sandbox_id)
-        if guest is None:
-            self._inner.delete(sandbox_id)
-            return
-        for process_id in list(guest.guest_processes):
-            try:
-                self.stop_process(sandbox_id, process_id)
-            except SandboxOpError:
-                pass
+        if guest is not None:
+            for process_id in list(guest.guest_processes):
+                try:
+                    self.stop_process(sandbox_id, process_id)
+                except SandboxOpError:
+                    pass
         if self._retire(sandbox_id):
+            self._remove_queued([sandbox_id])
+            return
+        # Already deleting, or no record: still try once for a labeled orphan
+        # (API restart / guest-map desync left the container behind).
+        with self._doomed_lock:
+            queued = sandbox_id in self._doomed
+        if queued:
+            self._remove_queued([sandbox_id])
+            return
+        cid = self._find_labeled_container(sandbox_id)
+        if cid is not None:
+            with self._doomed_lock:
+                self._doomed.setdefault(sandbox_id, cid)
             self._remove_queued([sandbox_id])
 
     def bulk_delete(self, labels: Iterable[str]) -> int:
@@ -1992,17 +2005,39 @@ class DockerGuestProvider:
         return len(targets)
 
     # ------------------------------------------------------------------ GC
+    def _find_labeled_container(self, sandbox_id: str) -> str | None:
+        """Container id for *sandbox_id* under our owner label, or None.
+
+        Used when the in-memory guest map lost the entry but docker still has
+        the room (restart / desync). A list failure returns None so delete
+        stays idempotent; the next reconcile retries.
+        """
+        try:
+            labeled = self._client.list_labeled(self._owner)
+        except SandboxOpError:
+            return None
+        for cid, sid in labeled:
+            if sid == sandbox_id:
+                return cid
+        return None
+
     def _retire(self, sandbox_id: str) -> bool:
         """Move a sandbox to "deleting" and queue its container for removal.
 
         Return False when another caller already retired it. A record with no
-        container is dropped at once.
+        guest-map entry still hunts a labeled container before the record is
+        dropped — never finish_delete while docker may still hold the room.
         """
         if not self._inner.begin_delete(sandbox_id):
             return False
         guest = self._guests.pop(sandbox_id, None)
         if guest is None:
-            self._inner.finish_delete(sandbox_id)
+            cid = self._find_labeled_container(sandbox_id)
+            if cid is None:
+                self._inner.finish_delete(sandbox_id)
+                return True
+            with self._doomed_lock:
+                self._doomed[sandbox_id] = cid
             return True
         if self._egress is not None and guest.attached:
             # Deny the leaving guest at once, so its address carries no policy
