@@ -57,6 +57,9 @@ type hotelConfig struct {
 	Labels   map[string]string `json:"labels"`
 	Sealed   bool              `json:"sealed"`    // true: a sealed hotel (SEV-SNP guest); only creates with "sealed": true go here
 	MaxSlots int               `json:"max_slots"` // > 0: cap on the slots the hotel reports, set at the broker (no hotel restart)
+	// ReservedFor: a guest id. Only that guest may use the hotel; every other
+	// guest treats it as denied (capacity.go). Empty: a pool hotel.
+	ReservedFor string `json:"reserved_for,omitempty"`
 }
 
 type guestConfig struct {
@@ -130,7 +133,7 @@ type hotel struct {
 	key    string
 	client *http.Client
 	ctl    *http.Client // sync loop and hotel documents
-	cfgMu  sync.RWMutex // guards cfg.Labels and cfg.Drain, which PATCH changes while creates read them
+	cfgMu  sync.RWMutex // guards cfg.Labels, cfg.Drain and cfg.ReservedFor, which PATCH changes while creates read them
 	sem    chan struct{}
 
 	// Guarded by broker.mu.
@@ -274,6 +277,11 @@ func loadBroker(path string) (*broker, error) {
 		if b.guests[gc.ID] != nil {
 			return nil, fmt.Errorf("config: guest id %q appears twice", gc.ID)
 		}
+		if gc.Policy != nil {
+			if err := gc.Policy.validate(); err != nil {
+				return nil, fmt.Errorf("config: guest %q: %w", gc.ID, err)
+			}
+		}
 		g := &guestState{cfg: gc, limits: gc.guestLimits}
 		g.limits.Hotels = append([]string(nil), gc.Hotels...)
 		b.guests[gc.ID] = g
@@ -283,6 +291,11 @@ func loadBroker(path string) (*broker, error) {
 				return nil, fmt.Errorf("config: guests %q and %q share one key hash", other.cfg.ID, gc.ID)
 			}
 			b.byKey[k] = g
+		}
+	}
+	for _, h := range b.hotelList() {
+		if r := h.cfg.ReservedFor; r != "" && b.guests[r] == nil {
+			return nil, fmt.Errorf("config: hotel %q is reserved_for unknown guest %q", h.cfg.ID, r)
 		}
 	}
 	return b, nil
@@ -400,17 +413,35 @@ func (h *hotel) release(r *room) {
 func (h *hotel) used() int { return len(h.rooms) + h.creating + h.queued }
 
 // pick a hotel at random among the hotels that pl allows. The weight is the
-// free rooms times the hotel's headroom (placement.go). Caller holds b.mu.
+// free rooms times the hotel's headroom (placement.go). With a guest policy
+// and no tier set, the preferred hotels come first: the allowed hotels are a
+// candidate only when no preferred hotel has a free room (capacity.go).
+// Caller holds b.mu.
 func (b *broker) pick(exclude map[*hotel]bool, pl placement) *hotel {
+	if pl.policy != nil && pl.tier == "" {
+		for _, t := range []string{tierPrefer, tierAllow} {
+			tp := pl
+			tp.tier = t
+			if h := b.pickIn(exclude, tp); h != nil {
+				return h
+			}
+		}
+		return nil
+	}
+	return b.pickIn(exclude, pl)
+}
+
+// pickIn is pick inside one candidate set.
+func (b *broker) pickIn(exclude map[*hotel]bool, pl placement) *hotel {
 	now := time.Now()
 	hotels := b.hotelList()
 	total := 0.0
 	weight := make([]float64, len(hotels))
 	for i, h := range hotels {
-		if !h.ok || h.drain() || exclude[h] || now.Before(h.backoffUntil) || !pl.allows(h) {
+		if exclude[h] || !pl.allows(h) {
 			continue
 		}
-		if f := b.freeFor(h); f > 0 {
+		if f := b.admissibleFree(h, now); f > 0 {
 			weight[i] = h.weight(f)
 			total += weight[i]
 		}
@@ -587,6 +618,11 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			if fellBack {
 				doc["placement_fallback"] = true
 			}
+			tier := ""
+			if pl.policy != nil {
+				tier = pl.policy.tier(h)
+				doc["placement_tier"] = tier
+			}
 			doc["isolation"] = isolationDoc(h, doc)
 			if pl.snapshotRef != "" {
 				doc["snapshot_id"] = pl.snapshotRef
@@ -601,6 +637,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			hdrs.Set("X-Broker-Hotel", h.cfg.ID)
 			if fellBack {
 				hdrs.Set("X-Broker-Fallback", "true")
+			}
+			if tier != "" {
+				hdrs.Set("X-Broker-Placement-Tier", tier)
 			}
 			hdrs.Set("X-Broker-Queue-Ms", strconv.FormatFloat(ms(queue), 'f', 1, 64))
 			hdrs.Set("X-Broker-Hotel-Ms", strconv.FormatFloat(ms(call), 'f', 1, 64))
@@ -1667,6 +1706,10 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.handleHotelAdmin(w, r, strings.TrimPrefix(strings.TrimPrefix(p, "/v1/broker/hotels"), "/"))
 		return
 	}
+	if p == "/v1/broker/capacity" && r.Method == "GET" && b.isOperator(r) {
+		b.handleCapacity(w, nil) // every hotel; a guest key gets its own view (serveNative)
+		return
+	}
 	if p == "/v1/broker/guests" || strings.HasPrefix(p, "/v1/broker/guests/") {
 		b.handleGuestAdmin(w, r, strings.TrimPrefix(strings.TrimPrefix(p, "/v1/broker/guests"), "/"))
 		return
@@ -1740,6 +1783,8 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 			b.handleSecrets(w, r, g, name)
 		case p == "/v1/broker/hotels" && r.Method == "GET":
 			b.handleHotels(w, g)
+		case p == "/v1/broker/capacity" && r.Method == "GET":
+			b.handleCapacity(w, g)
 		case p == "/v1/broker/stats":
 			b.handleStats(w, r, g)
 		case p == "/v1/broker/probe" && r.Method == "POST":

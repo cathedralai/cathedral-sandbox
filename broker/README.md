@@ -82,6 +82,7 @@ Each guest in the config can have limits (`guests.go`):
 | `max_creates_per_minute` | Rooms the guest may ask for in any 60 s. Absent or 0: no limit. Over the limit, a create gets 429 `create_rate_limit` with `Retry-After`. |
 | `default_sealed` | `true`: a create with no hotel choice goes to sealed hotels only. The guest gets an unsealed room only when the create says `"sealed": false`, names hotels with `"hotels"`, or excludes sealed hotels with `"exclude_hotel_labels"`. A fork goes to the hotel of its snapshot. |
 | `hotels` | The hotel ids the guest may use. Absent: all hotels. Other hotels are not in the guest's hotel list, and a create that names one gets 409 `unknown_hotel`. |
+| `policy` | Hotels by selector, in order: `prefer`, `allow`, `deny`. Replaces `hotels` and `default_sealed`. See "Guest policy and capacity catalog". |
 | `ops` | `true`: the guest may run `POST /v1/broker/probe` and reset the counters with `POST /v1/broker/stats`. Other guests get 403. |
 
 The limits apply to the native routes and to the client (Harbor, ctcli)
@@ -93,9 +94,82 @@ limits without a restart:
 | Route (operator key) | What it does |
 |---|---|
 | `GET /v1/broker/guests` | Every guest with its limits and active rooms. No key hashes. |
-| `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed` and `hotels`. `max_rooms: 0` and `hotels: []` get 400: in config they mean 1,000 rooms and every hotel. |
+| `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed`, `hotels` and `policy` (`"policy": null` removes it). `max_rooms: 0` and `hotels: []` get 400: in config they mean 1,000 rooms and every hotel. A bad policy gets 400 `invalid_policy`. |
 
 A runtime change stays in memory. A restart goes back to the config file.
+
+## Guest policy and capacity catalog
+
+A guest `policy` chooses hotels by selector, not by a fixed id list
+(`capacity.go`). A hotel that joins at runtime is matched by class and label
+with no config edit.
+
+```json
+"policy": {
+  "prefer": [{"class": "sealed"}],
+  "allow":  [{"class": "unsealed"}],
+  "deny":   [{"hotel": "nc-sealed"}]
+}
+```
+
+| Part | Meaning |
+|---|---|
+| Selector | Exactly one of `{"class": "sealed"\|"unsealed"}`, `{"hotel": "<id>"}` or `{"label": {"k": "v"}}` (every pair). Class is `sealed` when the hotel has the label `sealed=true` (every `"sealed": true` hotel has it). A hotel id need not exist yet. |
+| `prefer` | Tried first. |
+| `allow` | Tried only when no preferred hotel has a free room. |
+| `deny` | Never used. Wins over `prefer`, `allow` and named `hotels`. |
+
+- A create with no hotel choice goes to a preferred hotel while one has a
+  free room, else to an allowed hotel. Inside a tier the pick is the usual
+  weighted random pick. The answer has `"placement_tier": "prefer"|"allow"`
+  and the header `X-Broker-Placement-Tier` (client routes too).
+- The policy is the class choice: a plain create may land on a sealed or an
+  unsealed hotel only when the policy reaches that class. `"sealed": true`
+  still stays on sealed hotels (429 `no_free_rooms` when they are full, never
+  an unsealed room), and `"sealed": false` stays on unsealed hotels.
+- Named `hotels` must be in the policy's reach (prefer or allow, minus deny),
+  else 409 `unknown_hotel`. Tiers still apply among them.
+- `max_rooms` is still the cap: at the cap a create gets 429 `room_limit`.
+- A guest with no policy keeps `hotels` and `default_sealed` exactly as before.
+
+Example: `polaris-sealed` gets sealed rooms first, unsealed rooms when sealed
+is full, never `nc-sealed`, at most 10 rooms:
+
+```json
+{"id": "polaris-sealed", "max_rooms": 10,
+ "policy": {"prefer": [{"class": "sealed"}], "allow": [{"class": "unsealed"}],
+            "deny": [{"hotel": "nc-sealed"}]}}
+```
+
+### Reserved hotels
+
+A hotel can be dedicated to one guest with `"reserved_for": "<guest id>"`
+(hotel config, join body, or `PATCH /v1/broker/hotels/<id>`). Every other
+guest treats it as denied: no create, no named create (409 `unknown_hotel`),
+and it is missing from their catalog. The owner reaches it through its own
+policy or hotel list, as before. `PATCH {"reserved_for": null}` releases it:
+from then on every policy matches it by class and label, with no guest
+config edit. A guest `deny` still wins after a release. An unknown guest id
+gets 409 `unknown_guest`.
+
+`nc-sealed` (const today) is the first candidate: the operator sets
+`reserved_for: "const"` on it. This change does not do that.
+
+### Capacity catalog
+
+`GET /v1/broker/capacity`:
+
+- Operator key: every hotel with `id`, `class`, `labels`, `up`, `drain`,
+  `free_rooms`, `reserved_for`, `down_since` and `source`.
+- Guest key: only the hotels the guest can reach, each with `tier`
+  (`prefer`, `allow`, or `hotels` for a guest with no policy), preferred
+  first, plus `guest` with `max_rooms` and `active_rooms`.
+
+`free_rooms` comes from the function the placer uses (`admissibleFree`: 0
+when the hotel is down, draining, resting after a failure or at
+`mem_full_pct`, else its free slots). A hotel listed with free rooms takes
+the create. `source` is `broker` (config and runtime hotels); a later miner
+join plane adds its own source at `capacityEntries`.
 
 Guests are apart: the broker labels each room with its guest, lists with
 that label only, and answers 404 `sandbox_not_found` to a call on a room of
@@ -275,7 +349,7 @@ the config, an operator adds and removes hotels without a restart:
 | Route (operator key) | What it does |
 |---|---|
 | `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?}`. `"sealed": true` is what makes a hotel sealed; a `sealed` label alone leaves it taking unsealed creates. The broker first calls `GET /v1/status` on the hotel with the key (`"verify": false` skips it). |
-| `PATCH /v1/broker/hotels/<id>` | Sets `drain` and `labels`. |
+| `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels` and `reserved_for` (a guest id, or null to release the hotel to the pool). |
 | `DELETE /v1/broker/hotels/<id>` | Removes a runtime hotel that has no rooms. Drain it first. |
 
 The broker keeps runtime hotels in `state_dir/hotels.json` and their keys in
