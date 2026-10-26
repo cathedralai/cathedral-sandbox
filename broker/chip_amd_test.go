@@ -211,9 +211,9 @@ func TestAMDChainRequiredForMinerHotels(t *testing.T) {
 
 func TestAMDVerifierConfigNeedsAPinnedARK(t *testing.T) {
 	for _, c := range []*amdVerifierConfig{
-		{Command: nil, ARKSHA256: testARKPin},
+		{Command: nil, ARKSHA256: arkPins{testARKPin}},
 		{Command: []string{"python3", "v.py"}},
-		{Command: []string{"python3", "v.py"}, ARKSHA256: "abc"},
+		{Command: []string{"python3", "v.py"}, ARKSHA256: arkPins{"abc"}},
 	} {
 		if c.validate() == nil {
 			t.Fatalf("config %+v accepted", c)
@@ -347,7 +347,7 @@ func TestRealVerifierChecksTheAMDChain(t *testing.T) {
 			"report_b64": base64.StdEncoding.EncodeToString(report)})
 		return out
 	}
-	b := &broker{cfg: config{StateDir: t.TempDir(), AMDVerifier: &amdVerifierConfig{Command: []string{py, verifier}, ARKSHA256: hex.EncodeToString(arkSum[:]), KDSCache: cache}}}
+	b := &broker{cfg: config{StateDir: t.TempDir(), AMDVerifier: &amdVerifierConfig{Command: []string{py, verifier}, ARKSHA256: arkPins{hex.EncodeToString(arkSum[:])}, KDSCache: cache}}}
 
 	amd, err := b.verifyAMDChain(context.Background(), doc(rep))
 	if err != nil || amd["product"] != "Genoa" || amd["ark_sha256"] != hex.EncodeToString(arkSum[:]) {
@@ -360,8 +360,23 @@ func TestRealVerifierChecksTheAMDChain(t *testing.T) {
 		t.Fatalf("bad signature: %v", err)
 	}
 	// Another ARK than the pinned one.
-	b.cfg.AMDVerifier.ARKSHA256 = strings.Repeat("0", 64)
+	b.cfg.AMDVerifier.ARKSHA256 = arkPins{strings.Repeat("0", 64)}
 	if _, err := b.verifyAMDChain(context.Background(), doc(rep)); err == nil || !strings.Contains(err.Error(), "ARK") {
 		t.Fatalf("wrong ARK pin: %v", err)
+	}
+	// A list admits the hotel whose product's ARK is any pin.
+	b.cfg.AMDVerifier.ARKSHA256 = arkPins{arkMilan, hex.EncodeToString(arkSum[:]), arkTurin}
+	if amd, err := b.verifyAMDChain(context.Background(), doc(rep)); err != nil || amd["ark_sha256"] != hex.EncodeToString(arkSum[:]) {
+		t.Fatalf("list with the chain's ARK: %v %v", amd, err)
+	}
+	// The real AMD roots: the test chain's root is none of them.
+	b.cfg.AMDVerifier.ARKSHA256 = arkPins{arkMilan, arkGenoa, arkTurin}
+	if _, err := b.verifyAMDChain(context.Background(), doc(rep)); err == nil || !strings.Contains(err.Error(), "ARK") {
+		t.Fatalf("wrong-root chain against a list: %v", err)
+	}
+	// A list does not hide another failure: a bad signature still fails.
+	b.cfg.AMDVerifier.ARKSHA256 = arkPins{arkMilan, hex.EncodeToString(arkSum[:])}
+	if _, err := b.verifyAMDChain(context.Background(), doc(bad)); err == nil || !strings.Contains(err.Error(), "signature") {
+		t.Fatalf("bad signature with a list: %v", err)
 	}
 }

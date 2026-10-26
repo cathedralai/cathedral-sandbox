@@ -393,7 +393,8 @@ config hotels are not gated.
   is off (policy bit and `cathedral.debug=1`).
 - AMD chain (VCEK, ASK, ARK, report signature): with `amd_verifier` set, the
   broker runs the repository's own `room-kit/verify_receipts.py` on the
-  attestation as served (`--require-sealed --ark-sha256 <pin>`); its verdict
+  attestation as served (`--require-sealed --ark-sha256 <pin>`, one flag per
+  pin); its verdict
   decides. It runs once per binding. Required for a miner hotel
   (`miner_hotkey`): without `amd_verifier` a miner sealed hotel is refused.
 - One hotel per chip: a hotel whose CHIP_ID is already an admitted hotel's is
@@ -410,7 +411,7 @@ Config (all optional):
 | `sealed_host_data` | Its HOST_DATA must be in this list. |
 | `attest_ttl_seconds`, `attest_every_seconds` | As above. |
 | `sealed_admission` | `"off"` turns the attestation gate off (rollback lever). |
-| `amd_verifier` | `{"command": ["python3", "/opt/room-kit/verify_receipts.py"], "ark_sha256": "<AMD ARK DER sha256>", "kds_cache"?: "<dir>", "timeout_seconds"?: 120}`. The host needs Python with `cryptography` and HTTPS to `kdsintf.amd.com` (or a filled KDS cache). |
+| `amd_verifier` | `{"command": ["python3", "/opt/room-kit/verify_receipts.py"], "ark_sha256": "<AMD ARK DER sha256>", "kds_cache"?: "<dir>", "timeout_seconds"?: 120}`. `ark_sha256` is one pin or a list (one per product: Milan, Genoa, Turin; values in `amd_chain.go`); the verifier passes if the report's product chain has any listed ARK, in one run. The host needs Python with `cryptography` and HTTPS to `kdsintf.amd.com` (or a filled KDS cache). |
 
 `admission.state` in the hotel document and the catalog is `admitted`,
 `pending` or `refused` (with `reason`). `GET /v1/broker/hotels` (guest key) lists all

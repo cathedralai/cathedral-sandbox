@@ -333,7 +333,7 @@ func newChainState(t *testing.T, stateDir string) *testChain {
 	}
 	tc := &testChain{hotels: map[string]*fakeHotel{}, amdDir: fakeAMDVerifier(t)}
 	cfg := config{StateDir: stateDir, OperatorKeySHA256: sha("operator-key"), InsecureCookie: true, Guests: []guestConfig{{ID: "g1", KeySHA256: sha("key1"), ViewTokenSHA256: sha("view1")}, {ID: "g2", KeySHA256: sha("key2")}},
-		AMDVerifier: &amdVerifierConfig{Command: []string{"/bin/sh", filepath.Join(tc.amdDir, "verify.sh")}, ARKSHA256: testARKPin}}
+		AMDVerifier: &amdVerifierConfig{Command: []string{"/bin/sh", filepath.Join(tc.amdDir, "verify.sh")}, ARKSHA256: arkPins{testARKPin}}}
 	for _, id := range []string{"a", "b", "c"} {
 		f := &fakeHotel{t: t, snaps: map[string]map[string]any{}}
 		hs := httptest.NewServer(f)

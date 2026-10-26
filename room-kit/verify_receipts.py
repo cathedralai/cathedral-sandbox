@@ -20,7 +20,8 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
   3. AMD chain: ARK (self-signed) -> ASK -> VCEK, all RSA-PSS SHA-384, fetched
      from AMD KDS (kdsintf.amd.com) and cached; VCEK hwID and TCB extensions
      equal the report; the report's ECDSA P-384 signature verifies with the VCEK.
-     Optional --ark-sha256 pins the ARK certificate.
+     Optional --ark-sha256 pins the ARK certificate; repeat it to accept
+     any of several roots (one per product: Milan, Genoa, ...).
   4. receipts: each statement names this binding, receipt_sha256 =
      sha256(canonical(statement)), the Ed25519 signature verifies with the
      binding's receipt key, and the chain links (sequence 1 links to the
@@ -138,7 +139,7 @@ def ext_int(cert: x509.Certificate, oid: str) -> int:
     return int.from_bytes(raw[2:2 + raw[1]], "big")
 
 
-def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str | None) -> dict:
+def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str | list[str] | None) -> dict:
     tcb = rep["reported_tcb"]
     need(prod in ("Genoa", "Milan"), "only Milan and Genoa TCB layouts are handled")
     bl, tee, snp, ucode = tcb[0], tcb[1], tcb[6], tcb[7]
@@ -150,7 +151,10 @@ def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str 
     pss_verify(ark, ask)
     ark_fp = sha(ark.public_bytes(serialization.Encoding.DER))
     if ark_sha256:
-        need(ark_fp == ark_sha256.lower(), f"ARK sha256 {ark_fp} differs from the pinned value")
+        # Any pin may match: each product has its own ARK, and the chain
+        # fetched is the report's product, so one run serves a mixed fleet.
+        pins = [ark_sha256] if isinstance(ark_sha256, str) else ark_sha256
+        need(ark_fp in {p.lower() for p in pins}, f"ARK sha256 {ark_fp} differs from the pinned value")
     chip = rep["chip_id"].hex()
     vcek_url = f"{KDS}/{prod}/{chip}?blSPL={bl}&teeSPL={tee}&snpSPL={snp}&ucodeSPL={ucode}"
     vcek = x509.load_der_x509_certificate(fetch(vcek_url, cache, f"vcek-{chip[:16]}-{tcb.hex()}.der"))
@@ -189,7 +193,7 @@ def verify_hotel_attestation(att: dict) -> dict:
 
 
 def verify_attestation(att: dict, expected_measurement: str | None, prod: str | None, cache: str,
-                       ark_sha256: str | None, skip_amd: bool) -> dict:
+                       ark_sha256: str | list[str] | None, skip_amd: bool) -> dict:
     binding = att["binding"]
     bsha = sha(canonical(binding))
     need(bsha == att["binding_sha256"], "binding_sha256 does not match the binding")
@@ -335,7 +339,8 @@ def main() -> int:
     ap.add_argument("--hotel", required=False, default=None, help="hotel id (required with --broker)")
     ap.add_argument("--sandbox", help="with --broker: one room's receipts instead of the whole chain")
     ap.add_argument("--expected-measurement")
-    ap.add_argument("--ark-sha256", help="pin the AMD ARK certificate (sha256 of its DER)")
+    ap.add_argument("--ark-sha256", action="append",
+                    help="pin the AMD ARK certificate (sha256 of its DER); repeat to accept any of several")
     ap.add_argument("--product", help="Milan or Genoa (default: from the report)")
     ap.add_argument("--kds-cache", default=os.path.expanduser("~/.cache/amd-kds"))
     ap.add_argument("--skip-amd", action="store_true", help="skip the AMD chain (offline smoke test only)")
