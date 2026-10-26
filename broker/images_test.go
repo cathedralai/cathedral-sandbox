@@ -44,6 +44,8 @@ type fakeHotel struct {
 	attestGuest []string         // X-Cathedral-Guest of POST /room/attest
 	roomDeletes []string         // room ids of DELETE /v1/sandboxes/{id}
 	bulkDeletes [][]string       // label filters of DELETE /v1/sandboxes
+	// getStatus overrides GET /v1/sandboxes/{id} when set (e.g. 409 while deleting).
+	getStatus map[string]int
 }
 
 func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -260,6 +262,18 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 202, map[string]any{"operation_id": "op_2", "status": "done", "result": map[string]any{"images": images}})
 	case strings.HasPrefix(p, "/v1/sandboxes/") && strings.Count(p, "/") == 3 && r.Method == "GET":
 		id := strings.TrimPrefix(p, "/v1/sandboxes/")
+		if f.getStatus != nil {
+			if st, ok := f.getStatus[id]; ok {
+				if st == 409 {
+					writeErr(w, 409, "sandbox_deleting", "sandbox "+id+" is deleting; the guest is not confirmed gone")
+					return
+				}
+				if st == 404 {
+					writeErr(w, 404, "sandbox_not_found", id)
+					return
+				}
+			}
+		}
 		for _, rm := range f.rooms {
 			if rm["id"] == id {
 				writeJSON(w, 200, map[string]any{"id": id, "state": "running", "labels": rm["labels"], "runtime": "docker",

@@ -271,9 +271,17 @@ class InMemorySandboxProvider:
 
     def _require_active(self, sandbox_id: str) -> _Sandbox:
         sandbox = self._sandboxes.get(sandbox_id)
-        # A "deleting" record waits for its guest to be confirmed gone. The API
-        # treats it as gone; only quota still counts it.
-        if sandbox is None or sandbox.state in ("deleted", "deleting"):
+        # A "deleting" record waits for its guest to be confirmed gone. Quota
+        # still counts it. Answer 409 (not 404) so callers that treat GET 404 as
+        # "container gone" (broker cleanup_state, Polaris stop) keep waiting
+        # while docker rm may still be running — Spock soak 2026-10-26 c46 ghost.
+        if sandbox is not None and sandbox.state == "deleting":
+            raise SandboxOpError(
+                "sandbox_deleting",
+                409,
+                f"sandbox {sandbox_id} is deleting; the guest is not confirmed gone",
+            )
+        if sandbox is None or sandbox.state == "deleted":
             raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
         self._assert_owner(sandbox)
         return sandbox
