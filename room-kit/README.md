@@ -147,6 +147,48 @@ Answer 200:
   set it in the receipts unit environment). The broker sends
   `X-Cathedral-Guest`; a direct hotel-key call shares a `_direct` bucket.
   Bad requests do not use a slot.
+- Optional `"sandbox_id"`: the answer also has `"room": {"sandbox_id",
+  "create_receipt"}`, that room's signed create receipt from this boot
+  (`null` when there is none). Through the broker only the guest's own
+  rooms are accepted (404 `room_not_found` otherwise).
+
+## Per-room tunables
+
+A create may carry `"tunables"`: the start-up tunables document of the TEE box
+and the Escape challenge (`{"schema": 1, ...}`, `cathedral/tee_box/tunables.py`:
+same keys, bounds and sha256). They act on that room only
+(`cathedral/room_tunables.py`):
+
+| key | how the room gets it |
+|---|---|
+| `runsc.directfs`, `runsc.overlay2`, `runsc.net_channels` | the room starts under `--runtime runsc-tun-<d1\|d0>-<root\|all>-n<1..4>` |
+| `docker.log_driver` | `docker run --log-driver` of that container |
+| `image.prime` | `page_cache`: `docker save` of the room's image to /dev/null before it starts |
+| `pool.*`, `boot.create_concurrency` | hotel-wide: any value but the default is 400 `tunables_not_per_room` |
+
+- The installer registers the 16 runsc variants in the room daemon
+  (`lib/tunable_runtimes.py`): the hotel's `ROOM_RUNSC_FLAGS` without
+  `--directfs`, `--overlay2` and `--num-network-channels`, then those three
+  set explicitly. The default runtime stays `runsc`; a room without
+  `tunables` starts as before. The API reads the daemon's runtimes and
+  refuses (409 `tunables_unavailable`) a variant that is missing or is not
+  that rule, so the room never claims flags it does not run.
+- 400 `invalid_tunables`: unknown or pinned key, wrong type, out of range,
+  float, wrong schema. 400 `tunables_unsupported`: a DinD image.
+- The create answer and `GET /v1/sandboxes/<id>` carry `"tunables"`:
+  `{"schema": "cathedral_room_tunables_v1", "status": "applied", "sha256",
+  "values", "runtime", "runtime_args", "log_driver", "image_prime"}`.
+  `sha256` is the document's sha256 as the challenge computes it.
+- The create receipt signs `tunables`, `tunables_sha256` (computed by the
+  receipt front from the values), `tunables_runtime` and
+  `tunables_runtime_args`. On a sealed hotel the receipt key is in the
+  binding that the boot SNP report covers, and `POST /room/attest` with
+  `sandbox_id` returns that receipt beside a fresh report.
+  `verify_receipts.py` checks the sha256 and lists each room's
+  `room_tunables`.
+- `overlay2` `root:self` and `all:self` keep writes in the room's own
+  storage, but a snapshot of such a room does not see its root file
+  system writes (the hotel default is `--overlay2=none` for that reason).
 
 ## Room egress policy
 

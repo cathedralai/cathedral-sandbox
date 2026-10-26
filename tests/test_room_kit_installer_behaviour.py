@@ -516,6 +516,12 @@ def test_a_clean_host_gets_the_units_the_key_store_and_the_daemon_config(host: F
     assert daemon["default-runtime"] == "runsc" and daemon["iptables"] is False and daemon["ip6tables"] is False
     assert daemon["hosts"] == [f"unix://{host.root}/run/pool-room/docker.sock"]
     assert daemon["runtimes"]["runsc"]["runtimeArgs"] == ["--platform=systrap", "--overlay2=none", "--net-raw"]
+    # Per-room tunables: 16 runsc variants beside runsc; the default runtime is still runsc.
+    assert len(daemon["runtimes"]) == 17
+    assert daemon["runtimes"]["runsc-tun-d0-all-n4"] == {
+        "path": daemon["runtimes"]["runsc"]["path"],
+        "runtimeArgs": ["--platform=systrap", "--net-raw", "--directfs=false", "--overlay2=all:self",
+                        "--num-network-channels=4"]}
     assert daemon["data-root"] == f"{host.data_dir}/docker"
 
     for name in ("room-a-data.service", "room-a-docker.service", "room-a-health.service", "room-a-reaper.service",

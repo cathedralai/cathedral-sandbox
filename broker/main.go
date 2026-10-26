@@ -539,6 +539,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 	var lost []*hotel
 	finish := func(r createResult) createResult { r.lost = lost; return r }
 	asked, fellBack := pl, false
+	wantTunables := createHasTunables(body)
 	for attempt := 0; attempt < 3; attempt++ {
 		b.mu.Lock()
 		h := b.pick(tried, pl)
@@ -628,6 +629,19 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 				return finish(clientGone())
 			}
 			return finish(deletedDuringCreate())
+		}
+		if started && wantTunables && !tunablesApplied(doc) {
+			// The create carried per-room tunables and the hotel started the
+			// room without reporting them (a room kit older than per-room
+			// tunables ignores the field). That room did not run what was
+			// asked: remove it and try another hotel, without resting this one.
+			h.release(rm)
+			rm.hid, rm.id = hid, h.cfg.ID+"."+hid
+			b.mu.Unlock()
+			b.reapRoom(h, rm)
+			last = createResult{status: 409, doc: errDoc("tunables_unavailable",
+				"hotel "+h.cfg.ID+" does not apply per-room tunables (room kit without them)")}
+			continue
 		}
 		switch {
 		case started:
@@ -839,6 +853,33 @@ func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[s
 		}
 		log.Printf("orphan rooms of guest %s on hotel %s (batch %s) could not be reaped; the sync loop will list them", g.cfg.ID, h.cfg.ID, batchID)
 	}()
+}
+
+// createHasTunables: the create body carries a non-null "tunables" object.
+// The broker never reads or changes it; it goes to the one hotel that starts
+// the room, in that room's own create body.
+func createHasTunables(body []byte) bool {
+	if !bytes.Contains(body, []byte(`"tunables"`)) {
+		return false
+	}
+	var probe struct {
+		Tunables json.RawMessage `json:"tunables"`
+	}
+	if json.Unmarshal(body, &probe) != nil {
+		return false
+	}
+	t := bytes.TrimSpace(probe.Tunables)
+	return len(t) > 0 && !bytes.Equal(t, []byte("null"))
+}
+
+// tunablesApplied: the hotel's create answer reports the room's tunables as applied.
+func tunablesApplied(doc map[string]any) bool {
+	t, ok := doc["tunables"].(map[string]any)
+	if !ok {
+		return false
+	}
+	sha, _ := t["sha256"].(string)
+	return t["status"] == "applied" && len(sha) == 64
 }
 
 // hotelFailBackoff rests a hotel after a failed room start.
@@ -1190,6 +1231,13 @@ func (b *broker) handleHotelAttest(w http.ResponseWriter, r *http.Request, h *ho
 		writeErr(w, 413, "body_too_large", "attest body over 4096 bytes")
 		return
 	}
+	// "sandbox_id" asks for that room's signed create receipt too. Only a
+	// room of this guest on this hotel: another guest's room is a 404, as on
+	// the receipts route. The broker id <hotel>.<id> becomes the hotel's id.
+	if body, err = b.attestRoom(body, h, g); err != nil {
+		writeErr(w, 404, "room_not_found", err.Error())
+		return
+	}
 	// Pass the guest id so the hotel rate-limits attest per guest, not per
 	// hotel (shared hotels serve many Escape / capacity callers).
 	status, hdr, out, err := h.doHeaders(
@@ -1208,6 +1256,27 @@ func (b *broker) handleHotelAttest(w http.ResponseWriter, r *http.Request, h *ho
 	w.Header().Del("Content-Length")
 	w.WriteHeader(status)
 	_, _ = w.Write(out)
+}
+
+// attestRoom checks the attest body's optional "sandbox_id" against the
+// guest's rooms on h and rewrites it to the hotel's room id. A body without
+// it, or that is not JSON, goes to the hotel unchanged (the hotel validates).
+func (b *broker) attestRoom(body []byte, h *hotel, g *guestState) ([]byte, error) {
+	var doc map[string]any
+	if json.Unmarshal(body, &doc) != nil {
+		return body, nil
+	}
+	raw, ok := doc["sandbox_id"]
+	if !ok || raw == nil {
+		return body, nil
+	}
+	id, _ := raw.(string)
+	hid := strings.TrimPrefix(id, h.cfg.ID+".")
+	if id == "" || !b.guestRoomIDs(g.cfg.ID, h.cfg.ID)[hid] {
+		return nil, fmt.Errorf("no room %q of this guest on hotel %s", id, h.cfg.ID)
+	}
+	doc["sandbox_id"] = hid
+	return json.Marshal(doc)
 }
 
 // ---------------------------------------------------------------- gather

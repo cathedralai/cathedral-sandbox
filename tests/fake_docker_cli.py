@@ -58,7 +58,8 @@ def main(argv):
     if cmd == "info":
         fmt = argv[argv.index("--format") + 1] if "--format" in argv else ""
         if "Runtimes" in fmt:
-            print(json.dumps({r: {} for r in b.get("runtimes", ["runc"])}))
+            rts = b.get("runtimes", ["runc"])
+            print(json.dumps(rts if isinstance(rts, dict) else {r: {} for r in rts}))
         elif "DefaultRuntime" in fmt:
             print(b.get("default_runtime", "runc"))
         else:
@@ -364,6 +365,11 @@ def main(argv):
             return 1
         print(f"false {c.get('exit_code') or 0}" if c.get("status") == "exited" else "true 0")
         return 0
+
+    if cmd == "save":
+        with Locked() as st:
+            st.setdefault("saved", []).append(argv[-1])
+        return 1 if b.get("save_fail") else 0
 
     if cmd == "build":
         tag = argv[argv.index("-t") + 1]

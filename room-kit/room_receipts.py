@@ -21,7 +21,8 @@ statement before it; the first one carries the binding's sha256.
 
 Routes it adds:
   GET /room/attestation            binding, binding_sha256, report (base64)
-  POST /room/attest                a fresh SNP report over caller REPORT_DATA (sealed only)
+  POST /room/attest                a fresh SNP report over caller REPORT_DATA (sealed only);
+                                   with "sandbox_id", also that room's signed create receipt
   GET /room/receipts?after=&limit= the chain of this boot, in order
   GET /v1/sandboxes/<id>/receipts  the receipts of one room
 Response header on a signed operation:
@@ -319,6 +320,15 @@ class Ledger:
         return {"report_b64": b64(report), "cert_chain": chain, "binding_sha256": self.binding_sha256,
                 "measurement": measurement, "generated_at": int(time.time())}
 
+    def create_receipt(self, room: str) -> dict | None:
+        """The last successful create receipt of *room* in this boot's chain, or None."""
+        with self.lock:
+            for i in reversed(self.by_room.get(room, [])):
+                st = self.chain[i]["statement"]
+                if st.get("action") == "create" and 200 <= int(st.get("status") or 0) < 300:
+                    return self.chain[i]
+        return None
+
     def sign(self, fields: dict) -> dict:
         with self.lock:
             statement = {"schema": self.receipt_schema, "binding_sha256": self.binding_sha256, "hotel": self.hotel,
@@ -507,6 +517,9 @@ class Handler(BaseHTTPRequestHandler):
         raw = doc.get("report_data_hex") if isinstance(doc, dict) else None
         if not isinstance(raw, str) or not HEX64.fullmatch(raw):
             return self.reply(400, b'{"error":"report_data_hex must be 128 hex characters (64 bytes)"}')
+        room = doc.get("sandbox_id")
+        if room is not None and (not isinstance(room, str) or not re.fullmatch(r"[^/\s]{1,200}", room)):
+            return self.reply(400, b'{"error":"sandbox_id must be a room id"}')
         # Broker sets X-Cathedral-Guest; a direct hotel-key call has no guest
         # and shares the "_direct" bucket. Limit is per guest, not per hotel.
         guest = (self.headers.get("X-Cathedral-Guest") or "").strip()
@@ -518,6 +531,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001 a TSM failure is the hotel's, not the caller's
             traceback.print_exc()
             return self.reply(500, canonical({"error": "attest_failed", "detail": type(exc).__name__}))
+        if room is not None:
+            # The room's signed create receipt (its tunables and tunables_sha256, when it
+            # has them), under the receipt key of the binding this report names.
+            out["room"] = {"sandbox_id": room, "create_receipt": ledger.create_receipt(room)}
         return self.reply(200, canonical(out))
 
     def fields(self, action: str, path: str, body: bytes | None, status: int, out: bytes) -> dict:
@@ -541,6 +558,7 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(image, str):
             image = None
         policy = self.network_policy(action, status, res)
+        tunables = self.room_tunables(action, status, res)
         return {
             "action": action,
             "target": f"{self.command} {self.path}",
@@ -555,7 +573,25 @@ class Handler(BaseHTTPRequestHandler):
             # (canonical {"mode", "allow", "credentials"?}) and its sha256. The sha256 is
             # computed here from the policy, not copied from the API.
             **({"network_policy": policy, "network_policy_sha256": sha(canonical(policy))} if policy else {}),
+            # Create with per-room tunables: the values the room started under, the runsc
+            # runtime and its args. tunables_sha256 is computed here from the values (it is
+            # the tunables document's sha256, the one the Escape challenge records), not
+            # copied from the API. The receipt key is in the binding, whose sha256 is the
+            # boot report's REPORT_DATA, so a sealed hotel's SNP report covers this field.
+            **(tunables or {}),
         }
+
+    @staticmethod
+    def room_tunables(action: str, status: int, res) -> dict | None:
+        if action != "create" or not 200 <= status < 300 or not isinstance(res, dict):
+            return None
+        view = res.get("tunables")
+        values = view.get("values") if isinstance(view, dict) else None
+        if not isinstance(values, dict) or view.get("status") != "applied":
+            return None
+        return {"tunables": values, "tunables_sha256": sha(canonical(values)),
+                "tunables_runtime": str(view.get("runtime")),
+                "tunables_runtime_args": [str(a) for a in view.get("runtime_args") or []]}
 
     @staticmethod
     def network_policy(action: str, status: int, res) -> dict | None:

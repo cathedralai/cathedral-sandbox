@@ -48,6 +48,9 @@ type fakeHotel struct {
 	getStatus map[string]int
 	// attestation is the body of GET /room/attestation (admission_test.go); nil: 404.
 	attestation []byte
+	// appliesTunables: answer a create with "tunables" like a room kit with
+	// per-room tunables (the view, sha256 of the document as sent).
+	appliesTunables bool
 }
 
 func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -95,7 +98,12 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		id := fmt.Sprintf("sbx_%d", f.n)
 		f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": req["labels"]})
 		w.Header().Set("X-Room-Receipt", "signed-create")
-		writeJSON(w, 202, map[string]any{"id": id, "state": "running", "snapshot_id": req["snapshot_id"]})
+		out := map[string]any{"id": id, "state": "running", "snapshot_id": req["snapshot_id"]}
+		if t, ok := req["tunables"]; ok && t != nil && f.appliesTunables {
+			raw, _ := json.Marshal(t)
+			out["tunables"] = map[string]any{"status": "applied", "sha256": sha(string(raw)), "values": t}
+		}
+		writeJSON(w, 202, out)
 	case p == "/v1/sandboxes" && r.Method == "GET":
 		// Like a hotel: every "label" filter must match.
 		out := []map[string]any{}

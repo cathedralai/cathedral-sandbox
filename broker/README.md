@@ -195,7 +195,7 @@ still omit commands, files, and outputs. One room's own receipts are
 
 | Route (guest key) | What it does |
 |---|---|
-| `POST /v1/hotels/<id>/attest` `{"report_data_hex": "<128 hex>"}` | Passes the body to the hotel's `POST /room/attest` and returns the hotel's status, JSON and `Retry-After` unchanged: a fresh SEV-SNP report whose REPORT_DATA is those 64 bytes verbatim (see room-kit README). A hotel outside the guest's hotel list answers 404, as for receipts. Body cap 4096 bytes (413). |
+| `POST /v1/hotels/<id>/attest` `{"report_data_hex": "<128 hex>"}` | Passes the body to the hotel's `POST /room/attest` and returns the hotel's status, JSON and `Retry-After` unchanged: a fresh SEV-SNP report whose REPORT_DATA is those 64 bytes verbatim (see room-kit README). A hotel outside the guest's hotel list answers 404, as for receipts. Body cap 4096 bytes (413). An optional `"sandbox_id"` must name a room of this guest on that hotel (404 `room_not_found` otherwise) and goes to the hotel as the hotel's room id. |
 
 A hotel signs receipts only for calls that pass through its receipt front
 (room kit, `127.0.0.1:18092` on a shared hotel; `:18090` in a sealed
@@ -216,6 +216,17 @@ For a hotel behind an SSH tunnel, forward 18092 as well: a fourth port in
 and `permitopen="127.0.0.1:18092"` on the tunnel key in the hotel's
 `authorized_keys`. Live since 2026-10-24 00:06Z: nc on 18092, c46 on 38092
 and c48 on 48092.
+
+## Per-room tunables
+
+A create's `"tunables"` goes to the hotel that starts the room, unchanged, in
+that create's own body; the broker never reads or rewrites it, and no other
+create carries it. A hotel must answer with `"tunables": {"status": "applied",
+"sha256": ...}` (room kit README, "Per-room tunables"). A hotel that starts the
+room without that (a room kit before per-room tunables ignores the field) does
+not keep it: the broker deletes the room and tries the next eligible hotel,
+without resting the first. With none left the answer is 409
+`tunables_unavailable`.
 
 ## Room network policy
 

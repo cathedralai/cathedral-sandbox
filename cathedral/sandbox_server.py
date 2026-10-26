@@ -146,6 +146,7 @@ def _create_request(payload: dict[str, Any]) -> CreateSandboxRequest:
         "snapshot_id": payload.get("snapshot_id"),
         "count": payload.get("count", 1),
         "workspace": api.WorkspaceSpec.parse(payload.get("workspace")),
+        "tunables": payload.get("tunables"),
     }
     return CreateSandboxRequest(**kwargs)
 
@@ -375,6 +376,9 @@ class SandboxApplication:
     def create(self, *, query, headers, body, api_key, **_):
         request = _create_request(self._json(body))
         idem = headers.get("Idempotency-Key") or headers.get("idempotency-key")
+        if request.tunables is not None and not getattr(self.provider, "applies_tunables", False):
+            # A provider that cannot start the room under them must refuse, never ignore them.
+            raise SandboxOpError("tunables_unavailable", 409, "this hotel's runtime does not apply per-room tunables")
         if request.workspace is not None:
             self._workspace_store()  # 501 before any record on a hotel with no workspaces
         if getattr(self.provider, "takes_owner", False):

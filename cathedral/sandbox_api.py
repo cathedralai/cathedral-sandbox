@@ -29,7 +29,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from types import MappingProxyType
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 # ---------------------------------------------------------------- cathedral variables
 CATHEDRAL_API_URL = os.environ.get("CATHEDRAL_API_URL", "https://cathedral.computer").rstrip("/")
@@ -574,8 +574,19 @@ class CreateSandboxRequest:
     idle_timeout_seconds: int | None = None
     # #305: a persistent workspace of the caller, mounted read-write.
     workspace: WorkspaceSpec | None = None
+    # Per-room start-up tunables (cathedral/room_tunables.py). None: the room starts as before.
+    tunables: Any = None
 
     def __post_init__(self) -> None:
+        if self.tunables is not None:
+            from cathedral.room_tunables import RoomTunablesError, parse_room_tunables
+            from cathedral.tee_box.tunables import Tunables
+
+            if not isinstance(self.tunables, Tunables):
+                try:
+                    object.__setattr__(self, "tunables", parse_room_tunables(self.tunables))
+                except RoomTunablesError as exc:
+                    raise SandboxContractError(exc.code, str(exc)) from None
         sources = [self.image is not None, self.build is not None, self.snapshot_id is not None]
         _require(sum(sources) == 1, "invalid_source", "exactly one of image, build, or snapshot_id is required")
         if self.snapshot_id is not None:
