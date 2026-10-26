@@ -38,20 +38,23 @@ json_get() {
   echo
 
   echo "## 0. Hotels"
-  hotels="$(curl -sS -m 30 "${auth[@]}" "${URL}/v1/hotels")"
+  hotels="$(curl -sS -m 30 "${auth[@]}" "${URL}/v1/broker/hotels" 2>/dev/null || true)"
+  if [[ -z "$hotels" ]] || echo "$hotels" | grep -q route_not_found; then
+    hotels="$(curl -sS -m 30 "${auth[@]}" "${URL}/v1/quota")"
+  fi
   echo '```json'
-  echo "$hotels" | python3 -m json.tool
+  echo "$hotels" | python3 -m json.tool 2>/dev/null || echo "$hotels"
   echo '```'
   echo
 
   echo "## 1. Create (sealed)"
-  create_body="$(python3 - <<'PY'
-import json
+  create_body="$(LABEL="$LABEL" python3 - <<'PY'
+import json, os
 print(json.dumps({
   "image": "alpine:3.20",
   "sealed": True,
   "network": {"mode": "deny_all"},
-  "labels": {"smoke": "freeze-thaw", "job": "'"${LABEL}"'"},
+  "labels": {"smoke": "freeze-thaw", "job": os.environ["LABEL"]},
 }))
 PY
 )"
