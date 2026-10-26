@@ -160,16 +160,27 @@ gets 409 `unknown_guest`.
 `GET /v1/broker/capacity`:
 
 - Operator key: every hotel with `id`, `class`, `labels`, `up`, `drain`,
-  `free_rooms`, `reserved_for`, `down_since` and `source`.
+  `free_rooms`, `slots`, `reserved_for`, `down_since`, `source` and
+  `admission`, plus `classes`: per class (`sealed`, `unsealed`) the totals
+  `hotels`, `joined`, `up`, `placeable`, `pending_admission`, `draining`,
+  `slots` and `free_rooms`.
 - Guest key: only the hotels the guest can reach, each with `tier`
   (`prefer`, `allow`, or `hotels` for a guest with no policy), preferred
-  first, plus `guest` with `max_rooms` and `active_rooms`.
+  first, plus `guest` with `max_rooms` and `active_rooms`, and `classes`
+  over those hotels only.
 
 `free_rooms` comes from the function the placer uses (`admissibleFree`: 0
-when the hotel is down, draining, resting after a failure or at
-`mem_full_pct`, else its free slots). A hotel listed with free rooms takes
-the create. `source` is `broker` (config and runtime hotels); a later miner
-join plane adds its own source at `capacityEntries`.
+when the hotel is down, draining, resting after a failure, at
+`mem_full_pct` or not admitted, else its free slots). A hotel listed with
+free rooms takes the create. `source` is `broker` for a config hotel and
+`join` for a hotel that joined at runtime.
+
+When nothing fits, the error carries `reason` with the count of matching
+hotels per state (`matching`, `down`, `draining`, `resting`,
+`pending_admission`, `full`). Status codes are as before (409
+`no_matching_hotel`, 429 `no_free_rooms` when every matching hotel is full,
+503 `hotels_unavailable` otherwise), plus 503 `hotels_not_admitted` when the
+only matching hotels with room are waiting for admission.
 
 Guests are apart: the broker labels each room with its guest, lists with
 that label only, and answers 404 `sandbox_not_found` to a call on a room of
@@ -348,13 +359,42 @@ the config, an operator adds and removes hotels without a restart:
 
 | Route (operator key) | What it does |
 |---|---|
-| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?}`. `"sealed": true` is what makes a hotel sealed; a `sealed` label alone leaves it taking unsealed creates. The broker first calls `GET /v1/status` on the hotel with the key (`"verify": false` skips it). |
-| `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels` and `reserved_for` (a guest id, or null to release the hotel to the pool). |
+| `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey` and `admission`. |
+| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?}`. `"sealed": true` is what makes a hotel sealed; a `sealed` label alone leaves it taking unsealed creates. The broker first calls `GET /v1/status` on the hotel with the key and, for a hotel of class sealed, checks its attestation (422 `attestation_failed`); `"verify": false` skips both and the hotel joins pending. `miner_hotkey` (SS58) adds the labels `miner=true` and `miner_hotkey`, which a PATCH cannot remove. |
+| `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). |
 | `DELETE /v1/broker/hotels/<id>` | Removes a runtime hotel that has no rooms. Drain it first. |
 
 The broker keeps runtime hotels in `state_dir/hotels.json` and their keys in
 `state_dir/hotel-keys/<id>.key` (mode 0600). A hotel from the config file
-cannot be removed at runtime. `GET /v1/broker/hotels` (guest key) lists all
+cannot be removed at runtime.
+
+### Admission of joined hotels
+
+A joined hotel takes rooms only after it passes admission (`admission.go`);
+config hotels are not gated.
+
+- Health: a good `/room/health` answer. A hotel that goes down leaves
+  placement and must pass again (attestation too, for a sealed hotel).
+- Attestation, for a hotel of class sealed: `GET <health>/room/attestation`
+  must give an SEV-SNP binding and report that agree: `binding_sha256` is
+  the SHA-256 of the binding as served, REPORT_DATA commits to it,
+  measurement, chip id, TCB, policy and HOST_DATA equal the binding, debug
+  is off (policy bit and `cathedral.debug=1`). The broker does not check the
+  AMD signature chain; a guest checks it offline with `verify_receipts.py`.
+- A pass is good for `attest_ttl_seconds` (default 600); the sync loop checks
+  again every `attest_every_seconds` (default 60), every 5 s while failing.
+
+Config (all optional):
+
+| Field | Meaning |
+|---|---|
+| `sealed_measurements` | A joined sealed hotel's measurement must be in this list. |
+| `sealed_host_data` | Its HOST_DATA must be in this list. |
+| `attest_ttl_seconds`, `attest_every_seconds` | As above. |
+| `sealed_admission` | `"off"` turns the attestation gate off (rollback lever). |
+
+`admission.state` in the hotel document and the catalog is `admitted`,
+`pending` or `refused` (with `reason`). `GET /v1/broker/hotels` (guest key) lists all
 hotels with labels and free rooms.
 
 ## Secrets

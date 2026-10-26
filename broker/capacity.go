@@ -145,11 +145,12 @@ func (p *guestPolicy) validate() error {
 }
 
 // admissibleFree is the number of rooms a create may get on h now: 0 when h
-// is down, draining or resting after a failure, else freeFor. pick and the
+// is down, draining, resting after a failure or not admitted (a joined sealed
+// hotel without a fresh attestation pass, admission.go), else freeFor. pick and the
 // capacity catalog both use it, so the catalog never lists a hotel with free
 // rooms that the placer would refuse. Caller holds b.mu.
 func (b *broker) admissibleFree(h *hotel, now time.Time) int {
-	if !h.ok || h.drain() || now.Before(h.backoffUntil) {
+	if !h.ok || h.leaving || h.drain() || now.Before(h.backoffUntil) || !b.admitted(h, now) {
 		return 0
 	}
 	if f := b.freeFor(h); f > 0 {
@@ -161,10 +162,10 @@ func (b *broker) admissibleFree(h *hotel, now time.Time) int {
 // capacityEntry is one hotel in the catalog.
 type capacityEntry struct {
 	h *hotel
-	// source is where the capacity comes from. Today only "broker": the
-	// hotels of the config file and of runtime joins. A later miner SNP
-	// plane adds its own source here (a "join" source); the catalog and the
-	// placer read entries, not the source.
+	// source is where the capacity comes from: "broker" for a hotel of the
+	// config file, "join" for a hotel that joined at runtime (an SN94 miner
+	// machine, or an operator hotel added without a restart). The catalog
+	// and the placer read entries, not the source.
 	source string
 }
 
@@ -173,7 +174,11 @@ type capacityEntry struct {
 func (b *broker) capacityEntries() []capacityEntry {
 	var out []capacityEntry
 	for _, h := range b.hotelList() {
-		out = append(out, capacityEntry{h: h, source: "broker"})
+		src := "broker"
+		if h.runtime {
+			src = "join"
+		}
+		out = append(out, capacityEntry{h: h, source: src})
 	}
 	return out
 }
@@ -191,8 +196,44 @@ func (b *broker) capacityDoc(e capacityEntry, now time.Time) map[string]any {
 	return map[string]any{
 		"id": h.cfg.ID, "class": hotelClass(h), "labels": labels, "up": h.ok, "drain": h.drain(),
 		"free_rooms": b.admissibleFree(h, now), "source": e.source, "down_since": downSince(h),
-		"reserved_for": reserved,
+		"reserved_for": reserved, "slots": h.slots, "admission": b.admissionDoc(h, now),
 	}
+}
+
+// classTotals is one class line of the catalog: hotels, how many take rooms
+// now (up, admitted, not draining), and the rooms they have.
+type classTotals struct {
+	Hotels    int `json:"hotels"`
+	Joined    int `json:"joined"`
+	Up        int `json:"up"`
+	Placeable int `json:"placeable"` // free_rooms > 0 is not needed: up, admitted, not draining or resting
+	Pending   int `json:"pending_admission"`
+	Draining  int `json:"draining"`
+	Slots     int `json:"slots"`
+	FreeRooms int `json:"free_rooms"`
+}
+
+// addTotals adds h to the class totals. Caller holds b.mu.
+func (b *broker) addTotals(t map[string]*classTotals, e capacityEntry, now time.Time) {
+	h := e.h
+	c := t[hotelClass(h)]
+	c.Hotels++
+	if e.source == "join" {
+		c.Joined++
+	}
+	if h.ok {
+		c.Up++
+	}
+	switch {
+	case h.drain():
+		c.Draining++
+	case h.ok && !b.admitted(h, now):
+		c.Pending++
+	case h.ok && !now.Before(h.backoffUntil):
+		c.Placeable++
+	}
+	c.Slots += h.slots
+	c.FreeRooms += b.admissibleFree(h, now)
 }
 
 var tierRank = map[string]int{tierPrefer: 0, tierAllow: 1, "hotels": 2}
@@ -203,15 +244,18 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState) {
 	now := time.Now()
 	out := []map[string]any{}
 	var guest map[string]any
+	totals := map[string]*classTotals{classSealed: {}, classUnsealed: {}}
 	for _, e := range b.capacityEntries() {
 		if g == nil {
 			out = append(out, b.capacityDoc(e, now))
+			b.addTotals(totals, e, now)
 			continue
 		}
 		t := g.tierOf(e.h)
 		if t == "" {
 			continue
 		}
+		b.addTotals(totals, e, now)
 		d := b.capacityDoc(e, now)
 		d["tier"] = t
 		out = append(out, d)
@@ -228,7 +272,7 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState) {
 		}
 		return out[i]["id"].(string) < out[j]["id"].(string)
 	})
-	doc := map[string]any{"hotels": out}
+	doc := map[string]any{"hotels": out, "classes": totals}
 	if guest != nil {
 		doc["guest"] = guest
 	}

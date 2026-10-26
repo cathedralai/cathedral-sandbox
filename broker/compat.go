@@ -1082,7 +1082,7 @@ func (b *broker) freeRoomsFor(g *guestState) int {
 	defer b.mu.Unlock()
 	free := 0
 	for _, h := range b.hotelList() {
-		if !h.ok || !g.allowsHotel(h) {
+		if !h.ok || !g.allowsHotel(h) || !b.admitted(h, time.Now()) {
 			continue
 		}
 		if f := b.freeFor(h); f > 0 {

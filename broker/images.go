@@ -155,43 +155,62 @@ func (b *broker) noRoom(pl placement) createResult {
 }
 
 // noRoomReason distinguishes "hotels down" from "hotels full" so a dead hotel
-// (e.g. green) is not reported as 429 all hotels are full.
+// (e.g. green) is not reported as 429 all hotels are full. The status and code
+// are as before; the error also carries "reason": the count of matching hotels
+// in each state, so a guest (and an operator reading logs) sees why nothing fit.
+// Hotels waiting for admission (admission.go) count as "pending_admission";
+// when only those match, the code is hotels_not_admitted.
 func (b *broker) noRoomReason(pl placement) createResult {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	var matching, down, full, free int
+	now := time.Now()
+	var matching, down, draining, resting, pending, full, free int
 	for _, h := range b.hotelList() {
 		if !pl.allows(h) {
 			continue
 		}
 		matching++
-		if !h.ok || h.drain() || time.Now().Before(h.backoffUntil) {
+		switch {
+		case !h.ok:
 			down++
-			continue
-		}
-		if b.freeFor(h) > 0 {
+		case h.drain():
+			draining++
+		case now.Before(h.backoffUntil):
+			resting++
+		case !b.admitted(h, now):
+			pending++
+		case b.freeFor(h) > 0:
 			free++
-		} else {
+		default:
 			full++
 		}
 	}
+	unavailable := down + draining + resting + pending
+	reason := map[string]int{"matching": matching, "down": down, "draining": draining, "resting": resting,
+		"pending_admission": pending, "full": full}
 	ra := http.Header{"Retry-After": {"5"}}
+	answer := func(status int, code, msg string) createResult {
+		doc := errDoc(code, msg)
+		doc["reason"] = reason
+		return createResult{status: status, header: ra, doc: doc}
+	}
 	if matching == 0 {
-		return createResult{status: 409, header: ra, doc: errDoc("no_matching_hotel", "no hotel matches the hotel selection")}
+		return answer(409, "no_matching_hotel", "no hotel matches the hotel selection")
 	}
 	if free > 0 {
 		// Race: a room freed between pick and noRoom; still ask the guest to retry.
-		return createResult{status: 429, header: ra, doc: errDoc("no_free_rooms", "all hotels are full; retry later")}
+		return answer(429, "no_free_rooms", "all hotels are full; retry later")
 	}
-	if down > 0 && full == 0 {
-		return createResult{status: 503, header: ra, doc: errDoc("hotels_unavailable",
-			"selected hotels are down or draining; retry later")}
+	if pending > 0 && pending == unavailable && full == 0 {
+		return answer(503, "hotels_not_admitted", "the selected hotels have not passed admission (health and attestation) yet; retry later")
 	}
-	if down > 0 {
-		return createResult{status: 503, header: ra, doc: errDoc("hotels_unavailable",
-			"selected hotels are down or full; retry later")}
+	if unavailable > 0 && full == 0 {
+		return answer(503, "hotels_unavailable", "selected hotels are down or draining; retry later")
 	}
-	return createResult{status: 429, header: ra, doc: errDoc("no_free_rooms", "all hotels are full; retry later")}
+	if unavailable > 0 {
+		return answer(503, "hotels_unavailable", "selected hotels are down or full; retry later")
+	}
+	return answer(429, "no_free_rooms", "all hotels are full; retry later")
 }
 
 func errDoc(code, msg string) map[string]any {
@@ -374,7 +393,7 @@ func (b *broker) handleHotels(w http.ResponseWriter, g *guestState) {
 			continue
 		}
 		free := b.freeFor(h)
-		if free < 0 || !h.ok || h.drain() {
+		if free < 0 || !h.ok || h.drain() || !b.admitted(h, time.Now()) {
 			free = 0
 		}
 		labels := h.labels()

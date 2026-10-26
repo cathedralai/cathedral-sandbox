@@ -3,13 +3,19 @@
 // The config file lists the first hotels. An operator adds, changes and
 // removes hotels with the operator key (config "operator_key_sha256"):
 //
-//	POST   /v1/broker/hotels        {id, name, api, health, key, concurrency, labels, threads, ram_gib}
-//	PATCH  /v1/broker/hotels/<id>   {drain, labels, reserved_for}  (reserved_for null: back to the pool)
+//	GET    /v1/broker/hotels/<id>   the hotel document with its admission state
+//	POST   /v1/broker/hotels        {id, name, api, health, key, concurrency, labels, threads, ram_gib, sealed, max_slots, reserved_for, miner_hotkey}
+//	PATCH  /v1/broker/hotels/<id>   {drain, labels, reserved_for, max_slots}  (reserved_for null: back to the pool)
 //	DELETE /v1/broker/hotels/<id>   (only a hotel with no rooms; drain it first)
 //
 // A hotel added at runtime is kept in state_dir/hotels.json, and its key in
 // state_dir/hotel-keys/<id>.key (mode 0600). A hotel from the config file
 // cannot be removed at runtime; change the config file instead.
+//
+// A joined hotel takes rooms only after it passes admission (admission.go):
+// health, and for a sealed hotel an SEV-SNP attestation check. A join with
+// verify (the default) checks the attestation of a sealed hotel at once and
+// refuses the hotel (422 attestation_failed) when the check fails.
 package main
 
 import (
@@ -52,19 +58,34 @@ func newHotel(hc hotelConfig, key string) *hotel {
 	if hc.Concurrency <= 0 {
 		hc.Concurrency = 16
 	}
-	if hc.Sealed { // a sealed hotel always carries the label guests select it by
-		labels := map[string]string{"sealed": "true"}
-		for k, v := range hc.Labels {
-			labels[k] = v
-		}
-		labels["sealed"] = "true"
-		hc.Labels = labels
-	}
+	hc.Labels = fixedLabels(hc, hc.Labels)
 	tr := &http.Transport{MaxIdleConns: 1024, MaxIdleConnsPerHost: hc.Concurrency + 64, MaxConnsPerHost: hc.Concurrency + 64, IdleConnTimeout: 90 * time.Second}
 	// The sync loop (health, quota, list) uses its own small pool: when one
 	// guest's long execs hold every data connection, the hotel must not look down.
 	ctl := &http.Transport{MaxIdleConns: 8, MaxIdleConnsPerHost: 8, MaxConnsPerHost: 8, IdleConnTimeout: 90 * time.Second}
 	return &hotel{cfg: hc, key: key, client: &http.Client{Transport: tr}, ctl: &http.Client{Transport: ctl}, sem: make(chan struct{}, hc.Concurrency), rooms: map[string]*room{}}
+}
+
+// fixedLabels is labels plus the labels a hotel always carries: sealed=true
+// for a sealed hotel (guests select it by that label), miner=true and
+// miner_hotkey for a miner hotel (guests deny it by that label). It returns a
+// new map when it adds any.
+func fixedLabels(hc hotelConfig, labels map[string]string) map[string]string {
+	if !hc.Sealed && hc.MinerHotkey == "" {
+		return labels
+	}
+	out := map[string]string{}
+	for k, v := range labels {
+		out[k] = v
+	}
+	if hc.Sealed {
+		out["sealed"] = "true"
+	}
+	if hc.MinerHotkey != "" {
+		out["miner"] = "true"
+		out["miner_hotkey"] = hc.MinerHotkey
+	}
+	return out
 }
 
 // labels and drain read the fields an operator PATCH may change at any time.
@@ -148,7 +169,10 @@ func (b *broker) isOperator(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(sha(strings.TrimSpace(a[7:]))), []byte(want)) == 1
 }
 
-var hotelKeyRE = regexp.MustCompile(`^[A-Za-z0-9_-]{32,}$`)
+var (
+	hotelKeyRE = regexp.MustCompile(`^[A-Za-z0-9_-]{32,}$`)
+	ss58RE     = regexp.MustCompile(`^[1-9A-HJ-NP-Za-km-z]{46,48}$`)
+)
 
 type joinRequest struct {
 	hotelConfig
@@ -167,6 +191,13 @@ func (b *broker) handleHotelAdmin(w http.ResponseWriter, r *http.Request, id str
 		return
 	}
 	switch {
+	case id != "" && r.Method == "GET":
+		h := b.hotelByID(id)
+		if h == nil {
+			writeErr(w, 404, "hotel_not_found", "no hotel "+id)
+			return
+		}
+		writeJSON(w, 200, b.hotelDoc(h))
 	case id == "" && r.Method == "POST":
 		b.joinHotel(w, r)
 	case id != "" && r.Method == "PATCH":
@@ -199,6 +230,12 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 	case !hotelKeyRE.MatchString(req.Key):
 		writeErr(w, 400, "invalid_hotel", "key must be 32 or more characters [A-Za-z0-9_-]")
 		return
+	case hc.MinerHotkey != "" && !ss58RE.MatchString(hc.MinerHotkey):
+		writeErr(w, 400, "invalid_hotel", "miner_hotkey must be an SS58 address")
+		return
+	case hc.MaxSlots < 0:
+		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
+		return
 	}
 	if b.cfg.StateDir == "" {
 		writeErr(w, 409, "no_state_dir", "set state_dir in the config to add hotels at runtime")
@@ -219,11 +256,27 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h := newHotel(hc, req.Key)
+	h.runtime = true
 	if req.Verify == nil || *req.Verify {
 		var st map[string]any
 		if err := h.getJSON(r.Context(), hc.API, "/v1/status", nil, &st); err != nil {
 			writeErr(w, 502, "hotel_unreachable", "the hotel did not answer GET /v1/status with this key")
 			return
+		}
+		// A sealed hotel shows its attestation before it joins, so a bad
+		// one is refused here and not left pending.
+		b.mu.Lock()
+		need := b.needsAttestation(h)
+		b.mu.Unlock()
+		if need {
+			res, err := b.checkAttestation(r.Context(), h)
+			if err != nil {
+				writeErr(w, 422, "attestation_failed", "the hotel's SEV-SNP attestation did not pass: "+err.Error())
+				return
+			}
+			b.mu.Lock()
+			b.noteAttestation(h, res, nil, time.Now())
+			b.mu.Unlock()
 		}
 	}
 	keyDir := filepath.Join(b.cfg.StateDir, "hotel-keys")
@@ -232,20 +285,28 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.cfg.KeyFile = filepath.Join(keyDir, hc.ID+".key")
-	if err := os.WriteFile(h.cfg.KeyFile, []byte(req.Key+"\n"), 0o600); err != nil {
-		writeErr(w, 500, "state_write_failed", "cannot keep the hotel key")
+	// The stop function is set before the hotel is in the set, so a leave
+	// that races this join reads it set.
+	ctx, cancel := context.WithCancel(context.Background())
+	h.stop = cancel
+	// Add first, then write the key: of two joins with one id, only the
+	// one that is added writes the key file.
+	if err := b.addHotel(h); err != nil {
+		cancel()
+		writeErr(w, 409, "hotel_exists", err.Error())
 		return
 	}
-	h.runtime = true
-	if err := b.addHotel(h); err != nil {
-		writeErr(w, 409, "hotel_exists", err.Error())
+	if err := os.WriteFile(h.cfg.KeyFile, []byte(req.Key+"\n"), 0o600); err != nil {
+		b.dropHotel(h.cfg.ID)
+		cancel()
+		writeErr(w, 500, "state_write_failed", "cannot keep the hotel key")
 		return
 	}
 	if err := b.saveRuntimeHotels(); err != nil {
 		log.Printf("runtime hotels not saved: %v", err)
 	}
-	b.startSync(context.Background(), h)
-	writeJSON(w, 201, hotelDoc(h))
+	go b.syncLoop(ctx, h)
+	writeJSON(w, 201, b.hotelDoc(h))
 }
 
 func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string) {
@@ -256,12 +317,17 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	var req struct {
 		Drain       *bool             `json:"drain"`
+		MaxSlots    *int              `json:"max_slots"` // per-hotel room cap; 0: the hotel's own slots
 		Labels      map[string]string `json:"labels"`
 		ReservedFor json.RawMessage   `json:"reserved_for"` // a guest id, or null to release
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if json.Unmarshal(raw, &req) != nil {
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
+		return
+	}
+	if req.MaxSlots != nil && *req.MaxSlots < 0 {
+		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
 		return
 	}
 	var reserve *string
@@ -285,10 +351,15 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string) {
 		h.cfg.Drain = *req.Drain
 	}
 	if req.Labels != nil {
-		if h.cfg.Sealed { // the label guests select a sealed hotel by stays
-			req.Labels["sealed"] = "true"
+		// The sealed and miner labels stay: guests select and deny by them.
+		h.cfg.Labels = fixedLabels(h.cfg, req.Labels)
+	}
+	if req.MaxSlots != nil {
+		// A lower cap applies now; a higher one at the next health answer.
+		h.cfg.MaxSlots = *req.MaxSlots
+		if h.cfg.MaxSlots > 0 && h.slots > h.cfg.MaxSlots {
+			h.resize(h.cfg.MaxSlots)
 		}
-		h.cfg.Labels = req.Labels
 	}
 	if reserve != nil {
 		h.cfg.ReservedFor = *reserve
@@ -300,7 +371,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string) {
 			log.Printf("runtime hotels not saved: %v", err)
 		}
 	}
-	writeJSON(w, 200, hotelDoc(h))
+	writeJSON(w, 200, b.hotelDoc(h))
 }
 
 func (b *broker) leaveHotel(w http.ResponseWriter, id string) {
@@ -313,9 +384,19 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string) {
 		writeErr(w, 409, "hotel_in_config", "hotel "+id+" is in the config file; remove it there")
 		return
 	}
+	// The check and the mark are one step under b.mu: pick holds b.mu, so
+	// no create can be placed on the hotel between "empty" and "gone".
 	b.mu.Lock()
 	busy := len(h.rooms) + h.creating + h.queued
+	leaving := h.leaving
+	if busy == 0 {
+		h.leaving = true
+	}
 	b.mu.Unlock()
+	if leaving {
+		writeErr(w, 404, "hotel_not_found", "hotel "+id+" is leaving")
+		return
+	}
 	if busy > 0 {
 		writeErr(w, 409, "hotel_not_empty", fmt.Sprintf("hotel %s has %d rooms; drain it and wait until they are gone", id, busy))
 		return
@@ -331,7 +412,7 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string) {
 	w.WriteHeader(204)
 }
 
-func hotelDoc(h *hotel) map[string]any {
+func (b *broker) hotelDoc(h *hotel) map[string]any {
 	labels := h.labels()
 	if labels == nil {
 		labels = map[string]string{}
@@ -340,7 +421,12 @@ func hotelDoc(h *hotel) map[string]any {
 	if r := h.reservedFor(); r != "" {
 		reserved = r
 	}
-	return map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime, "reserved_for": reserved}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := time.Now()
+	return map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime,
+		"reserved_for": reserved, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
+		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now)}
 }
 
 func (b *broker) guestExists(id string) bool {
@@ -354,6 +440,9 @@ func (b *broker) guestExists(id string) bool {
 const runtimeHotelsFile = "hotels.json"
 
 func (b *broker) saveRuntimeHotels() error {
+	// One save at a time: concurrent joins share the temporary file.
+	b.hotelsSaveMu.Lock()
+	defer b.hotelsSaveMu.Unlock()
 	var list []hotelConfig
 	b.mu.Lock()
 	for _, h := range b.hotelList() {

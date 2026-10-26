@@ -14,7 +14,8 @@ const joinKey = "hotel-d-key-0123456789abcdefghijklmnop"
 func TestOperatorAddsChangesAndRemovesAHotelAtRuntime(t *testing.T) {
 	dir := t.TempDir()
 	tc := newChainState(t, dir)
-	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}}
+	// d is of class sealed (label): it joins only with an attestation that passes.
+	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, attestation: snpAttestation(t, attestOpts{})}
 	hs := httptest.NewServer(f)
 	t.Cleanup(hs.Close)
 	join := map[string]any{"id": "d", "api": hs.URL, "key": joinKey, "labels": map[string]string{"sealed": "true"}}

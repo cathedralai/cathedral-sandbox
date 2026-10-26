@@ -168,7 +168,7 @@ func TestAutoFreeCapacityUsesEveryHotelOfTheClass(t *testing.T) {
 		t.Fatalf("two creates: %s/%s and %s/%s, want a and s2, both prefer", h1, t1, h2, t2)
 	}
 	// A sealed hotel joins at runtime: the guest uses it with no policy edit.
-	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}}
+	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, attestation: snpAttestation(t, attestOpts{})}
 	hs := httptest.NewServer(f)
 	t.Cleanup(hs.Close)
 	tc.hotels["s3"] = f
@@ -176,6 +176,7 @@ func TestAutoFreeCapacityUsesEveryHotelOfTheClass(t *testing.T) {
 		t.Fatalf("join s3: %d %v", status, doc)
 	}
 	setHotel(tc, "s3", func(h *hotel) { h.ok, h.slots = true, 10 })
+	admitNow(t, tc, "s3") // the sync loop's attestation step (slice 2 admission)
 	h3, t3, _ := createdOn(t, tc, plain)
 	if h3 != "s3" || t3 != "prefer" {
 		t.Fatalf("after join: %s %s, want s3 prefer", h3, t3)
