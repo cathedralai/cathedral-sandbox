@@ -39,9 +39,9 @@ type fakeHotel struct {
 	rooms       []map[string]any // id + labels, for the room list
 	networks    []map[string]any // bodies of PUT /v1/sandboxes/{id}/network
 	receipts    []byte           // body of GET /room/receipts
-	attestIn     [][]byte // bodies of POST /room/attest
-	attestAuth   []string // Authorization of POST /room/attest
-	attestGuest  []string // X-Cathedral-Guest of POST /room/attest
+	attestIn    [][]byte         // bodies of POST /room/attest
+	attestAuth  []string         // Authorization of POST /room/attest
+	attestGuest []string         // X-Cathedral-Guest of POST /room/attest
 	roomDeletes []string         // room ids of DELETE /v1/sandboxes/{id}
 	bulkDeletes [][]string       // label filters of DELETE /v1/sandboxes
 }
