@@ -44,6 +44,12 @@ CLAIMS_MANIFEST_SCHEMA = "cathedral_claims_job_manifest_v1"
 
 MAX_CLAIMS_EVIDENCE_BYTES = 128 * 1024
 MAX_CLAIMS_TRUSTED_KEYS_BYTES = 64 * 1024
+# Observed Claims artifacts can exceed the evidence envelope. Pretty-printed
+# agent_output / source_payload for a long paper may be multi-MiB; PDFs larger.
+MAX_CLAIMS_OBSERVED_JSON_BYTES = 8 * 1024 * 1024
+MAX_CLAIMS_OBSERVED_PDF_BYTES = 96 * 1024 * 1024
+# Allow small forward skew so verify hosts slightly behind the issuer still pass.
+CLAIMS_EVIDENCE_CLOCK_SKEW_SECONDS = 300
 MAX_CLAIMS_NODES = 512
 MAX_CLAIMS_DEPTH = 10
 MAX_JSON_INTEGER = 2**63 - 1
@@ -648,6 +654,11 @@ def verify_claims_evidence(
         raise ClaimsEvidenceError("signature", "claims evidence signature is invalid") from exc
 
     clock = now or datetime.now(UTC)
+    if issued_at > clock + timedelta(seconds=CLAIMS_EVIDENCE_CLOCK_SKEW_SECONDS):
+        raise ClaimsEvidenceError(
+            "freshness",
+            "claims evidence issued_at is beyond allowed clock skew",
+        )
     if max_age_seconds is not None:
         if max_age_seconds < 0:
             raise ClaimsEvidenceError("policy", "max_age_seconds must be non-negative")

@@ -66,6 +66,8 @@ from cathedral.affine_claim import (
 )
 from cathedral.claims_evidence import (
     MAX_CLAIMS_EVIDENCE_BYTES,
+    MAX_CLAIMS_OBSERVED_JSON_BYTES,
+    MAX_CLAIMS_OBSERVED_PDF_BYTES,
     MAX_CLAIMS_TRUSTED_KEYS_BYTES,
     ClaimsEvidenceError,
     claims_json_bytes_sha256,
@@ -941,7 +943,7 @@ def cmd_claims_evidence_issue(args: argparse.Namespace) -> int:
         agent_output = _read_bounded_claims_file(
             args.agent_output,
             "agent_output",
-            maximum_bytes=MAX_CLAIMS_EVIDENCE_BYTES,
+            maximum_bytes=MAX_CLAIMS_OBSERVED_JSON_BYTES,
             category="schema",
         )
         key_bytes = Path(args.signing_key).read_bytes()
@@ -995,11 +997,34 @@ def cmd_claims_evidence_verify(args: argparse.Namespace) -> int:
             if not isinstance(expected_manifest, dict):
                 raise ClaimsEvidenceError("schema", "claims manifest must be a JSON object")
         observed_output = (
-            Path(args.agent_output).read_bytes() if args.agent_output else None
+            _read_bounded_claims_file(
+                args.agent_output,
+                "agent_output",
+                maximum_bytes=MAX_CLAIMS_OBSERVED_JSON_BYTES,
+                category="schema",
+            )
+            if args.agent_output
+            else None
         )
-        observed_pdf = Path(args.source_pdf).read_bytes() if args.source_pdf else None
+        observed_pdf = (
+            _read_bounded_claims_file(
+                args.source_pdf,
+                "source PDF",
+                maximum_bytes=MAX_CLAIMS_OBSERVED_PDF_BYTES,
+                category="schema",
+            )
+            if args.source_pdf
+            else None
+        )
         observed_payload = (
-            Path(args.source_payload).read_bytes() if args.source_payload else None
+            _read_bounded_claims_file(
+                args.source_payload,
+                "source_payload",
+                maximum_bytes=MAX_CLAIMS_OBSERVED_JSON_BYTES,
+                category="schema",
+            )
+            if args.source_payload
+            else None
         )
         now = _parse_claims_utc(args.now, field="now") if args.now else None
         verified = verify_claims_evidence(

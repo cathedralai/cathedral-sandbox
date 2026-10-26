@@ -445,3 +445,44 @@ def test_non_canonical_signature_base64_is_rejected():
             canonical_claims_json(document), trusted, now=ISSUED_AT + timedelta(hours=1)
         )
     assert err.value.category == "signature"
+
+
+def test_future_issued_at_beyond_skew_is_rejected():
+    evidence, _, _, _ = _issue()
+    trusted = parse_claims_evidence_trusted_keys_json(_trusted_keys_bytes())
+    with pytest.raises(ClaimsEvidenceError) as err:
+        verify_claims_evidence(
+            evidence,
+            trusted,
+            max_age_seconds=60,
+            now=ISSUED_AT - timedelta(days=30),
+        )
+    assert err.value.category == "freshness"
+
+
+def test_cli_verify_rejects_oversized_observed_agent_output(tmp_path: Path, capsys):
+    evidence, _, _, _ = _issue()
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_bytes(evidence)
+    trusted_path = tmp_path / "trusted.json"
+    trusted_path.write_bytes(_trusted_keys_bytes())
+    huge = tmp_path / "huge_agent_output.json"
+    huge.write_bytes(b"{" + (b"x" * (8 * 1024 * 1024 + 1)) + b"}")
+    rc = cli_main(
+        [
+            "claims-evidence",
+            "verify",
+            "--evidence",
+            str(evidence_path),
+            "--trusted-keys",
+            str(trusted_path),
+            "--agent-output",
+            str(huge),
+            "--now",
+            "2026-10-26T13:00:00.000000Z",
+        ]
+    )
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert '"accepted": false' in out or '"accepted":false' in out
+    assert "exceeds the maximum encoded size" in out
