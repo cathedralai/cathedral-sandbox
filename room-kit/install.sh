@@ -270,7 +270,11 @@ grep -E " $ROOM_DATA_DIR " /proc/mounts | grep -q prjquota || { echo "prjquota m
 mkdir -p "$ROOM_DATA_DIR/work" "$ROOM_DATA_DIR/docker"
 chown poolroom:poolroom "$ROOM_DATA_DIR/work"
 if [ "${ROOM_WORKSPACES:-0}" = 1 ]; then
-  # room-data.sh made the nosuid,nodev,noexec bind mount; the API owns the root.
+  # On a re-run that turns workspaces on, the data unit is already active, so
+  # enable --now did not run it again. Its "up" is idempotent: run it to make
+  # the nosuid,nodev,noexec bind mount. The API owns the root.
+  "$ROOM_OPT/bin/room-data.sh" up "$ROOM_ETC/room.env"
+  mountpoint -q "$ROOM_DATA_DIR/workspaces" || { echo "workspaces mount missing" >&2; exit 1; }
   chown poolroom:poolroom "$ROOM_DATA_DIR/workspaces"
   chmod 0700 "$ROOM_DATA_DIR/workspaces"
 fi
