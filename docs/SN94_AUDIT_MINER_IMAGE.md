@@ -12,7 +12,7 @@ Platform: linux/amd64
 Runtime contract: signed-validator-fleet-v1
 ```
 
-The `sn39` in that repository name is historical. The image is fixed to
+The GHCR repository name still contains `sn39`. The image is fixed to
 Finney SN94.
 
 The digest was published by GitHub Actions run

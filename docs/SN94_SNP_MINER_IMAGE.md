@@ -12,7 +12,7 @@ The current anonymous `linux/amd64` image is:
 ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:3e1cb9144417e1e0d526445a43245e305e772cae0568202a332183071ef0c584
 ```
 
-The `sn39` in that repository name is historical. The image is fixed to
+The GHCR repository name still contains `sn39`. The image is fixed to
 Bittensor `finney` netuid 94.
 
 Its OCI revision label is

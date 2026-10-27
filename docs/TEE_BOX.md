@@ -23,7 +23,7 @@ PR's number.
   is `install-runtime-host.sh:422`.)
 - Weights follow a signed market price table with separate TEE rates. The
   minimum box shape comes from SN120/Affine and SN81. The SN94 owner runs the
-  prober; validators on the current subnet (SN94; SN39 is historical) verify receipts. No netuid is hard-coded.
+  prober; validators on SN94 verify receipts. No netuid is hard-coded.
 
 The v1 decisions on this design itself are at the end of the page, in "Owner
 decisions for v1".

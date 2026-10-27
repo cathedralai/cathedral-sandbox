@@ -32,16 +32,9 @@ def test_mining_guide_is_the_single_current_operator_path() -> None:
         "each distinct verified machine",
         "Intel TDX",
         "AMD SEV-SNP",
-        # Updated 2026-09-09. UID30 admitted its first live AMD machine on
-        # 2026-09-08, so the previous "live hardware policy pending" wording
-        # became false. This guard is what kept it in place, so it moves with
-        # the claim rather than pinning a stale one. Updated 2026-09-28: that
-        # admission was on SN39, and SN94 has not been verified yet. The block
-        # is observed on chain and not recorded in-repo, so it stays marked.
-        # Updated 2026-10-27: SN39 is historical; the guide must keep saying so.
-        "One admission observed on SN39 at block 9025398 (observed on chain; unverified in-repo)",
-        "SN94 status pending verification",
-        "That SN39 row is historical",
+        # Updated 2026-10-27: Cathedral is SN94, not SN39. Operator docs must
+        # not keep a historical-SN39 identity or UID-specific admission story.
+        "SN94 admission remains unverified",
         "Founding miners",
         "no published founding-miner program",
         "7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b",
@@ -293,12 +286,50 @@ def test_readme_is_a_short_mission_first_miner_entrypoint() -> None:
     assert "scripts/run_sn94_signed_fleet_miner.sh" not in readme
     assert "docs/MINING.md#5-confirm-chain-state" in readme
     assert "docs/MINING.md#stop-and-get-help" in readme
-    assert "Cathedral's current subnet is SN94" in readme
+    assert "Bittensor SN94" in readme
+    assert '<img src="docs/assets/cathedral-mark.png"' in readme
+    assert "## Contents" in readme
+    assert "Cathedral&ensp;turns" in readme
     assert "There is no self-serve sealed capacity" in readme
     assert "Cathedral does not own" in readme
-    assert "The Escape Room is not open to the public" in readme
+    assert "The Escape Room is coming, but it is not open" in readme
     assert "no published founding-miner program" in readme
     assert "Do not install or run a validator from this repository" in readme
+    assert "—" not in readme
+
+
+def test_operator_docs_name_cathedral_as_sn94_not_sn39() -> None:
+    operator_paths = (
+        "README.md",
+        "MINING.md",
+        "docs/README.md",
+        "docs/MINING.md",
+        "docs/AMD_SEV_SNP_FRIEND_TEST.md",
+        "docs/CAPACITY.md",
+        "docs/MINER_BOX_RUNBOOK.md",
+        "docs/SN94_AUDIT_MINER_IMAGE.md",
+        "docs/SN94_SNP_MINER_IMAGE.md",
+        "docs/SNP_OWN_SERVER_ONBOARDING.md",
+        "docs/TEE_BOX.md",
+    )
+    forbidden = (
+        "SN39 is historical",
+        "historical SN39",
+        "On SN39",
+        "admission observed on SN39",
+        "GitHub description still says SN39",
+        "Cathedral runs SN39",
+        "validators on SN39",
+        "--netuid 39",
+        "subnet 39",
+        "netuid 39",
+        "Subnet 39",
+    )
+    for relative in operator_paths:
+        text = (REPO_ROOT / relative).read_text()
+        for phrase in forbidden:
+            assert phrase not in text, f"{relative}: {phrase}"
+        assert "—" not in text, relative
 
 
 OPERATOR_LINK_DOCUMENTS = [

@@ -1,11 +1,21 @@
 # Documentation
 
-For mining, start with the [repository overview](../README.md), then follow
+Cathedral turns independently operated machines from trusted operators into a
+verifiable compute network. For mining on Bittensor SN94, start with the
+[repository overview](../README.md), then follow
 [Mining Cathedral](MINING.md), the only active operator guide.
 
-Cathedral's current subnet is SN94. SN39 is historical. Validator operators
-do not install from this repository; they use
-[cathedral-validator](https://github.com/cathedralai/cathedral-validator).
+Validator operators do not install from this repository; they use
+[Cathedral Validator](https://github.com/cathedralai/cathedral-validator).
+
+## Contents
+<p><sub><strong>Operator path</strong></sub><br>
+<strong>1. <a href="#current-operator-references">Current operator references</a></strong><br>
+<strong>2. <a href="#founding-miners">Founding miners</a></strong><br>
+<strong>3. <a href="#validators">Validators</a></strong><br><br>
+<sub><strong>Support</strong></sub><br>
+<strong>4. <a href="#protocol-and-product-library-references">Protocol and product-library references</a></strong><br>
+<strong>5. <a href="#design-proposals">Design proposals</a></strong></p>
 
 ## Current operator references
 
@@ -56,8 +66,8 @@ central-enrollment, burn, or provenance flows.
 
 Cathedral's customer lease and sandbox products are live on SN94. The public
 sealed tier runs on leased AMD SEV-SNP hosts, by request, not self-serve.
-That product is not this mining path. The Escape Room is not open to the
-public.
+That product is not this mining path. The Escape Room is coming, but it is
+not open.
 
 ## Design proposals
 

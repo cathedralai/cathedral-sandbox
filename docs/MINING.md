@@ -1,12 +1,33 @@
-# Mining Cathedral
+<p align="center"><img src="assets/cathedral-mark.png" alt="Cathedral" width="112"></p>
+<h1 align="center">Mining Cathedral</h1>
+<p align="center"><em>Cathedral&ensp;turns&ensp;independently&ensp;operated&ensp;machines&ensp;into&ensp;a&ensp;verifiable&ensp;compute&ensp;network</em></p>
+<p align="center"><sub>27 October 2026</sub></p>
 
-The single current mining guide for operators on Bittensor SN94. Start at the
-[repository overview](../README.md); follow the instructions here in order.
+## Contents
+<p><sub><strong>Overview</strong></sub><br>
+<strong>1. <a href="#how-mining-works">How mining works</a></strong><br>
+<strong>2. <a href="#current-support">Current support</a></strong><br>
+<strong>3. <a href="#what-you-need">What you need</a></strong><br><br>
+<sub><strong>Operator path</strong></sub><br>
+<strong>4. <a href="#rehearse-before-renting-or-registering">Rehearse before renting or registering</a></strong><br>
+<strong>5. <a href="#run-one-amd-sev-snp-machine">Run one AMD SEV-SNP machine</a></strong><br>
+<strong>6. <a href="#run-one-intel-tdx-machine">Run one Intel TDX machine</a></strong><br>
+<strong>7. <a href="#add-more-machines-to-one-uid">Add more machines to one UID</a></strong><br>
+<strong>8. <a href="#founding-miners">Founding miners</a></strong><br><br>
+<sub><strong>Support</strong></sub><br>
+<strong>9. <a href="#reference">Reference</a></strong><br>
+<strong>10. <a href="#stop-and-get-help">Stop and get help</a></strong></p>
 
-Cathedral's current subnet is SN94. SN39 is historical. Published image
-names that still contain `sn39` are leftover GHCR repository names. Those
-images are labeled `org.cathedral.image-chain=finney-94` and refuse any
-other chain.
+Cathedral turns independently operated machines from trusted operators into a
+verifiable compute network. Miners supply the machines; validators check their
+confidential-computing evidence, test their work and score the results.
+
+This is the single current mining guide for operators on Bittensor SN94. Start
+at the [repository overview](../README.md); follow the instructions here in
+order.
+
+Published GHCR image names still contain `sn39`. Those images are labeled
+`org.cathedral.image-chain=finney-94` and refuse any other chain.
 
 ## How mining works
 
@@ -32,26 +53,15 @@ guarantee TAO. The subnet must have positive emission.
 
 | Path | Status | Weight |
 |---|---|---|
-| AMD SEV-SNP on Linux | Validator source supports it. One admission observed on SN39 at block 9025398 (observed on chain; unverified in-repo); SN94 status pending verification | Eligible after that validator's policy admits the measurement and TCB, then fresh evidence and SAT pass |
+| AMD SEV-SNP on Linux | Validator source supports it. SN94 admission remains unverified | Eligible after that validator's policy admits the measurement and TCB, then fresh evidence and SAT pass |
 | Intel TDX on Linux | Mainnet live testing | Eligible after fresh TDX and SAT verification |
 | More machines on one UID | Mainnet live testing for TDX; SNP follows the same fleet rules once admitted | Each distinct verified machine adds to that UID's score |
 
 The current direct validator source supports Intel TDX and AMD SEV-SNP. Each
 validator owns its SNP measurement and TCB allowlist. An AMD machine earns zero
 from that validator until its live hardware run is admitted by the policy and
-fresh evidence and SAT pass.
-
-That SN39 row is historical. It is not a current-subnet instruction. On SN39,
-UID30 admitted its first live AMD machine on 2026-09-08 and recorded the
-weight row `[(68, 1.0)]` at block 9025398. Both are observed on chain and
-reported by the operator; neither this repository nor cathedral-validator
-records them, so treat them as unverified in-repo. That was one observed cycle
-on one validator, not a standing payout and not a promise about any other
-validator. Cathedral moved to SN94 on 2026-09-28 (this repository's #215,
-`a66d7c4`, and cathedral-validator #261, `28a2779`), and no SN94 AMD admission
-has been verified yet, so the SN94 AMD status is pending verification. Every
-validator still owns its own policy, so admission by that historical UID30
-cycle says nothing about whether another validator will admit the same machine.
+fresh evidence and SAT pass. Admission by one validator says nothing about
+whether another validator will admit the same machine.
 
 For AMD, the validator proves an admitted guest measurement, distinct hardware,
 the live HTTPS key, and returned SAT work. It does not remotely attest the OCI
@@ -64,8 +74,8 @@ runtime in this repository is not the SN94 weight-writing path.
 
 ## What you need
 
-- A Linux Intel TDX confidential VM with `/sys/kernel/config/tsm/report`, or an
-  AMD SEV-SNP guest with `/dev/sev-guest`. For AMD, check with your target
+- A Linux AMD SEV-SNP guest with `/dev/sev-guest`, or an Intel TDX confidential
+  VM with `/sys/kernel/config/tsm/report`. For AMD, check with your target
   validator whether it requires the `SINGLE_SOCKET` guest policy bit, which a
   multi-socket Linux KVM host cannot set. It is an owner policy option that
   defaults to required. See the
@@ -548,9 +558,7 @@ All of these must also be true:
 - the on-chain weight row changes only after the validator submits it.
 
 There is not yet a public validator-result feed for the TDX, SPKI, and SAT
-checks. Until the private telemetry projection reaches the Cathedral
-leaderboard, a miner must ask the validator operator for that final result.
-This is an open self-service gap.
+checks. Ask the validator operator for that final result.
 
 A healthy server is not proof of weight. A weight is not proof of emission.
 

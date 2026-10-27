@@ -1,20 +1,7 @@
 <p align="center"><img src="docs/assets/cathedral-mark.png" alt="Cathedral" width="112"></p>
 <h1 align="center">Cathedral Sandbox</h1>
-<p align="center"><em>Miners&ensp;running&ensp;compute&ensp;workers&ensp;on&ensp;Bittensor&ensp;SN94</em></p>
+<p align="center"><em>Cathedral&ensp;turns&ensp;independently&ensp;operated&ensp;machines&ensp;into&ensp;a&ensp;verifiable&ensp;compute&ensp;network</em></p>
 <p align="center"><sub>27 October 2026</sub></p>
-
-Cathedral turns independently operated machines from trusted operators into a
-verifiable compute network. Miners supply the machines; validators check their
-confidential-computing evidence, test their work and score the results.
-
-This repository is for miners running compute workers on Bittensor SN94.
-Cathedral's current subnet is SN94. SN39 is historical. Image names that still
-say `sn39` are leftover GHCR names; the pinned images are labeled `finney-94`.
-
-For validator operators, use
-[Cathedral Validator](https://github.com/cathedralai/cathedral-validator).
-That repository's GitHub description still says SN39; its README and install
-path are for SN94.
 
 ## Contents
 <p><sub><strong>Overview</strong></sub><br>
@@ -30,6 +17,14 @@ path are for SN94.
 <sub><strong>Support</strong></sub><br>
 <strong>9. <a href="#stop-and-get-help">Stop and get help</a></strong><br>
 <strong>10. <a href="#public-leak-guard">Public leak guard</a></strong></p>
+
+Cathedral turns independently operated machines from trusted operators into a
+verifiable compute network. Miners supply the machines; validators check their
+confidential-computing evidence, test their work and score the results.
+
+This repository is for miners running compute workers on Bittensor SN94.
+For validator operators, use
+[Cathedral Validator](https://github.com/cathedralai/cathedral-validator).
 
 ## How mining works
 
@@ -53,7 +48,7 @@ This mining path is not a customer sandbox API.
 
 A machine quote does not remotely prove its container image digest or continuous
 runtime integrity after boot. See the [mining guide](docs/MINING.md#current-support)
-for the exact evidence boundary and historical observations.
+for the exact evidence boundary.
 
 ## Customer products
 
@@ -62,8 +57,8 @@ tier runs on AMD SEV-SNP hosts that Cathedral leases. Cathedral does not own
 those hosts. There is no self-serve sealed capacity; access is by request.
 This repository does not sell or provision that product.
 
-The Escape Room is not open to the public. Do not treat bounties or prizes as
-live.
+The Escape Room is coming, but it is not open. Do not treat bounties or prizes
+as live.
 
 ## What you need
 

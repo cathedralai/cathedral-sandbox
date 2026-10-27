@@ -68,11 +68,9 @@ whatever its value, with "SNP policy has an unsupported production shape",
 until its next bootstrap. That includes the `require_single_socket: true`
 that this repository's #222 policy entry carries for a guest with the bit.
 
-On historical SN39 (not the current subnet), by operator report (unverified
-in-repo), UID30 set `require_single_socket` to `false` on 2026-09-08 and
-admitted a two-socket `milan` host that same day. Setup refused the key then,
-so that would have needed a manual policy install. The date matches the merge
-of cathedral-validator #235, which added the flag. That is one validator's
+A validator operator can set `require_single_socket` to `false` to admit a
+two-socket host. Setup on an older bootstrap may still refuse the key, which
+needs a manual policy install or a newer bootstrap. That is one validator's
 decision. Ask your target validator's operator rather than assuming.
 
 **Hardware identity dedup is not optional.** Linux routes every SNP command,
