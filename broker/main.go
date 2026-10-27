@@ -104,10 +104,11 @@ type config struct {
 	// AMDVerifier runs room-kit/verify_receipts.py on a sealed hotel's
 	// attestation to check the AMD chain (amd_chain.go). Required for miner hotels.
 	AMDVerifier *amdVerifierConfig `json:"amd_verifier,omitempty"`
-	// EscapeNonceAllowPlaintext: the operator plant may send the nonce in
-	// plaintext when the hotel has no plant key. Default false: fail closed.
-	// TODO Mr Spock: drop after every escape hotel image decrypts (pin move).
-	EscapeNonceAllowPlaintext bool `json:"escape_nonce_allow_plaintext,omitempty"`
+	// EscapeNonceAllowPlaintext is a leftover key. Live configs still set
+	// it to false. The loader accepts false and logs that it is ignored;
+	// true is refused so a leftover "on" cannot start a broker. The nonce
+	// is never sent in the clear.
+	EscapeNonceAllowPlaintext *bool `json:"escape_nonce_allow_plaintext,omitempty"`
 }
 
 func (b *broker) maxExec() int {
@@ -273,6 +274,9 @@ func loadBroker(path string) (*broker, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
+	}
+	if err := refusePlaintextEscapeNonce(c.EscapeNonceAllowPlaintext); err != nil {
+		return nil, err
 	}
 	b := &broker{cfg: c, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), started: time.Now()}
 	for _, hc := range c.Hotels {

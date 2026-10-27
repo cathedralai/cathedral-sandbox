@@ -1,12 +1,14 @@
 // Escape Room nonce plant: the control plane pushes a per-window nonce into
 // a sealed Escape hotel guest. The host can read broker-to-hotel HTTP, so the
-// broker encrypts to a guest-held X25519 key when the hotel publishes one.
-// That key is signed by the guest's attested receipt key (the Ed25519 key
-// named by receipt_key_ed25519_b64 in the binding REPORT_DATA commits to).
-// The broker verifies the signature before it encrypts. It also refuses
-// unless, for this exact binding, the AMD SEV-SNP chain already passed and
-// the launch measurement is on sealed_measurements. An unsigned, swapped,
-// unverifiable, or unattested key fails closed; the nonce is not delivered.
+// broker encrypts to a guest-held X25519 key. There is no plaintext
+// fallback: if the hotel publishes no attested plant key, the nonce is
+// not delivered. That key is signed by the guest's attested receipt key
+// (the Ed25519 key named by receipt_key_ed25519_b64 in the binding
+// REPORT_DATA commits to). The broker verifies the signature before it
+// encrypts. It also refuses unless, for this exact binding, the AMD
+// SEV-SNP chain already passed and the launch measurement is on
+// sealed_measurements. An unsigned, swapped, unverifiable, or unattested
+// key fails closed; the nonce is not delivered.
 //
 //	POST /v1/broker/hotels/<id>/escape-nonce   operator key
 //
@@ -28,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strings"
@@ -138,29 +141,35 @@ func plantErrCode(err error) string {
 	}
 }
 
+func refusePlaintextEscapeNonce(flag *bool) error {
+	if flag == nil {
+		return nil
+	}
+	if *flag {
+		return fmt.Errorf("config: escape_nonce_allow_plaintext=true is refused; the nonce is only delivered sealed")
+	}
+	log.Printf("config: escape_nonce_allow_plaintext is ignored; plaintext nonce delivery has been removed")
+	return nil
+}
+
 func (b *broker) sealEscapePlant(ctx context.Context, h *hotel, req escapePlantRequest) ([]byte, error) {
 	receiptKey, bindingSHA, err := b.escapeReceiptKey(ctx, h)
 	if err != nil {
 		return nil, err
 	}
 	pub, err := b.fetchEscapePlantKey(ctx, h, receiptKey, bindingSHA)
-	if err == nil && pub != nil {
-		env, sealErr := sealPlantNonce([]byte(req.Nonce), pub.Bytes(), h.cfg.ID, req.WindowID)
-		if sealErr != nil {
-			return nil, fmt.Errorf("the hotel plant key could not be used")
-		}
-		env["window_id"] = req.WindowID
-		return json.Marshal(env)
-	}
-	if errors.Is(err, errBadPlantKey) || errors.Is(err, errUnverifiedAttest) {
+	if err != nil {
 		return nil, err
 	}
-	if !b.cfg.EscapeNonceAllowPlaintext {
-		return nil, fmt.Errorf("the hotel published no plant key and plaintext is off")
+	if pub == nil {
+		return nil, errNoPlantKey
 	}
-	// TODO Mr Spock: remove this branch with the pin move once every escape
-	// hotel image decrypts. The host can read this hop.
-	return json.Marshal(map[string]string{"window_id": req.WindowID, "nonce": req.Nonce})
+	env, sealErr := sealPlantNonce([]byte(req.Nonce), pub.Bytes(), h.cfg.ID, req.WindowID)
+	if sealErr != nil {
+		return nil, fmt.Errorf("the hotel plant key could not be used")
+	}
+	env["window_id"] = req.WindowID
+	return json.Marshal(env)
 }
 
 // escapeReceiptKey is the Ed25519 public key named by the attested binding.

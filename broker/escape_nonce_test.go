@@ -7,6 +7,8 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -68,6 +70,8 @@ func assertPlantRefused(t *testing.T, tc *testChain, hotelID, wantCode string) {
 		t.Fatalf("nonce was delivered: %d hotel posts", n)
 	}
 }
+
+func boolPtr(v bool) *bool { return &v }
 
 func escapePlantKeys(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey, *ecdh.PrivateKey) {
 	t.Helper()
@@ -241,7 +245,7 @@ func TestEscapeNoncePlantRefusesASignatureForAnotherRoom(t *testing.T) {
 
 func TestEscapeNoncePlantPlaintextFlagDoesNotBypassABadKey(t *testing.T) {
 	tc := newChain(t)
-	tc.b.cfg.EscapeNonceAllowPlaintext = true
+	tc.b.cfg.EscapeNonceAllowPlaintext = boolPtr(true)
 	receiptPub, _, plant := escapePlantKeys(t)
 	h := tc.b.hotelByID("a")
 	admitEscapeHotel(tc, h, receiptPub, "binding-a")
@@ -343,23 +347,42 @@ func TestEscapeNoncePlantRequiresEncryptionWhenNoKey(t *testing.T) {
 	}
 }
 
-func TestEscapeNoncePlantPlaintextFlag(t *testing.T) {
+func TestEscapeNoncePlantPlaintextFlagDoesNotDeliver(t *testing.T) {
 	tc := newChain(t)
-	tc.b.cfg.EscapeNonceAllowPlaintext = true
+	tc.b.cfg.EscapeNonceAllowPlaintext = boolPtr(true)
 	receiptPub, _, _ := escapePlantKeys(t)
 	h := tc.b.hotelByID("a")
 	admitEscapeHotel(tc, h, receiptPub, "binding-a")
 	nonce := "control-plane-nonce-1"
 	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels/a/escape-nonce",
 		map[string]string{"window_id": "win-1", "nonce": nonce})
-	if status != 200 || doc["ok"] != true {
+	if status != 409 || errCode(doc) != "encryption_required" {
 		t.Fatalf("plaintext flag: %d %v", status, doc)
 	}
 	f := tc.hotels["a"]
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.plantPosts) != 1 || !bytes.Contains(f.plantPosts[0], []byte(nonce)) {
-		t.Fatalf("expected plaintext hop: %v", f.plantPosts)
+	if len(f.plantPosts) != 0 {
+		t.Fatalf("plaintext path delivered a nonce: %s", f.plantPosts[0])
+	}
+}
+
+func TestEscapeNoncePlantPlaintextFlagDoesNotDeliverOnAMinerHotel(t *testing.T) {
+	tc := newChain(t)
+	tc.b.cfg.EscapeNonceAllowPlaintext = boolPtr(true)
+	receiptPub, _, _ := escapePlantKeys(t)
+	h := tc.b.hotelByID("a")
+	admitEscapeHotel(tc, h, receiptPub, "binding-a")
+	h.cfg.MinerHotkey = minerHotkey
+	h.runtime = true
+	nonce := "control-plane-nonce-1"
+	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels/a/escape-nonce",
+		map[string]string{"window_id": "win-1", "nonce": nonce})
+	if status != 409 || errCode(doc) != "encryption_required" {
+		t.Fatalf("miner hotel plaintext flag: %d %v", status, doc)
+	}
+	if n := len(tc.hotels["a"].plantPosts); n != 0 {
+		t.Fatalf("plaintext path delivered a nonce on a miner hotel: %d posts", n)
 	}
 }
 
@@ -488,7 +511,7 @@ func TestEscapeNoncePlantRefusesWithoutASealedAllowlist(t *testing.T) {
 
 func TestEscapeNoncePlantPlaintextFlagDoesNotBypassUnverifiedAttestation(t *testing.T) {
 	tc := newChain(t)
-	tc.b.cfg.EscapeNonceAllowPlaintext = true
+	tc.b.cfg.EscapeNonceAllowPlaintext = boolPtr(true)
 	tc.b.cfg.AMDVerifier = nil
 	tc.b.cfg.SealedMeasurements = []string{strings.Repeat("ab", 48)}
 	hostPub, hostPriv, hostPlant := escapePlantKeys(t)
@@ -530,5 +553,47 @@ func TestEscapeNoncePlantHappyPathFromLiveAttestation(t *testing.T) {
 	}
 	if !bytes.Equal(opened, []byte(nonce)) {
 		t.Fatalf("opened %q", opened)
+	}
+}
+
+func writeBrokerConfig(t *testing.T, extra string) string {
+	t.Helper()
+	dir := t.TempDir()
+	key := filepath.Join(dir, "hotel.key")
+	if err := os.WriteFile(key, []byte("hotel-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	raw := `{"listen":"127.0.0.1:0","hotels":[{"id":"h1","api":"http://127.0.0.1:1","health":"http://127.0.0.1:1","key_file":"` + key + `"}]` + extra + `}`
+	path := filepath.Join(dir, "broker.json")
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadBrokerAcceptsLeftoverPlaintextFlagFalse(t *testing.T) {
+	b, err := loadBroker(writeBrokerConfig(t, `,"escape_nonce_allow_plaintext":false`))
+	if err != nil {
+		t.Fatalf("false leftover flag refused startup: %v", err)
+	}
+	if b.cfg.EscapeNonceAllowPlaintext == nil || *b.cfg.EscapeNonceAllowPlaintext {
+		t.Fatalf("false leftover flag: %v", b.cfg.EscapeNonceAllowPlaintext)
+	}
+}
+
+func TestLoadBrokerAcceptsMissingPlaintextFlag(t *testing.T) {
+	b, err := loadBroker(writeBrokerConfig(t, ""))
+	if err != nil {
+		t.Fatalf("config without the leftover flag refused startup: %v", err)
+	}
+	if b.cfg.EscapeNonceAllowPlaintext != nil {
+		t.Fatalf("absent leftover flag: %v", b.cfg.EscapeNonceAllowPlaintext)
+	}
+}
+
+func TestLoadBrokerRefusesPlaintextFlagTrue(t *testing.T) {
+	_, err := loadBroker(writeBrokerConfig(t, `,"escape_nonce_allow_plaintext":true`))
+	if err == nil || !strings.Contains(err.Error(), "escape_nonce_allow_plaintext") {
+		t.Fatalf("true leftover flag: %v", err)
 	}
 }

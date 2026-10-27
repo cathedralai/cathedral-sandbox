@@ -20,7 +20,8 @@ import (
 // liveShapeConfig mirrors the field set of the deployed broker config (ids and
 // hashes replaced): five hotels, one of them sealed and one with max_slots,
 // three guests with max_rooms, max_creates_per_minute, default_sealed, ops and
-// a hotel list, plus state_dir and the operator key.
+// a hotel list, plus state_dir, the operator key, and the leftover
+// escape_nonce_allow_plaintext=false key live configs still carry.
 func liveShapeConfig(t testing.TB, hotelURL string) string {
 	dir := t.TempDir()
 	key := filepath.Join(dir, "hotel.key")
@@ -46,7 +47,8 @@ func liveShapeConfig(t testing.TB, hotelURL string) string {
   {"id": "eng", "key_sha256": "` + sha("eng-key") + `", "view_token_sha256": "` + sha("eng-view") + `", "max_rooms": 10000, "max_creates_per_minute": 600, "default_sealed": false, "ops": true, "hotels": ["h1", "h2", "h3", "h4"]}
  ],
  "state_dir": "` + dir + `",
- "operator_key_sha256": "` + sha("operator-key") + `"
+ "operator_key_sha256": "` + sha("operator-key") + `",
+ "escape_nonce_allow_plaintext": false
 }`
 	p := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(p, []byte(cfg), 0o600); err != nil {
