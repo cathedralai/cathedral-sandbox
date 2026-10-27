@@ -53,6 +53,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
@@ -284,7 +285,7 @@ def open_plant_nonce(doc: dict, private: X25519PrivateKey, hotel: str, window_id
         key = _plant_wrapping_key(private.exchange(ephemeral), aad, raw_eph, raw_rec)
         opened = AESGCM(key).decrypt(aes_n, ct, aad)
         return opened.decode("ascii")
-    except (KeyError, TypeError, ValueError, UnicodeDecodeError) as exc:
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, InvalidTag) as exc:
         raise PlantError("ciphertext does not open") from exc
 
 
