@@ -48,6 +48,12 @@ type fakeHotel struct {
 	getStatus map[string]int
 	// attestation is the body of GET /room/attestation (admission_test.go); nil: 404.
 	attestation []byte
+	// Escape nonce plant (escape_nonce.go). plantKeyB64 empty: GET plant-key is 403.
+	plantKeyB64 string
+	plantPosts  [][]byte
+	plantAuth   []string
+	plantStatus int // POST /room/escape-nonce; 0 means 200
+	plantFail   bool
 	// appliesTunables: answer a create with "tunables" like a room kit with
 	// per-room tunables (the view, sha256 of the document as sent).
 	appliesTunables bool
@@ -196,6 +202,25 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
 		_, _ = w.Write(f.receipts)
+	case p == "/room/escape-plant-key" && r.Method == "GET":
+		if f.plantKeyB64 == "" {
+			writeErr(w, 403, "escape_disabled", "this hotel does not accept an Escape nonce plant")
+			return
+		}
+		writeJSON(w, 200, map[string]string{"algorithm": plantAlgorithm, "x25519_public_b64": f.plantKeyB64})
+	case p == "/room/escape-nonce" && r.Method == "POST":
+		f.plantPosts = append(f.plantPosts, body)
+		f.plantAuth = append(f.plantAuth, r.Header.Get("Authorization"))
+		if f.plantFail {
+			writeErr(w, 502, "plant_failed", "the nonce file could not be written")
+			return
+		}
+		status := f.plantStatus
+		if status == 0 {
+			status = 200
+		}
+		w.Header().Set("X-Room-Receipt", "signed-plant")
+		writeJSON(w, status, map[string]any{"ok": true, "window_id": req["window_id"], "path": "/run/escape-room/nonce", "encrypted": req["ciphertext_b64"] != nil})
 	case p == "/room/attestation" && r.Method == "GET" && f.attestation != nil:
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(f.attestation)

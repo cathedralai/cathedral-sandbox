@@ -25,6 +25,9 @@ Routes it adds:
                                    with "sandbox_id", also that room's signed create receipt
   GET /room/receipts?after=&limit= the chain of this boot, in order
   GET /v1/sandboxes/<id>/receipts  the receipts of one room
+  GET /room/escape-plant-key       sealed Escape hotels only: the guest X25519 public key
+  POST /room/escape-nonce          sealed Escape hotels only: plant the window nonce
+                                   (never echoed; receipt signs the plant without the value)
 Response header on a signed operation:
   X-Room-Receipt: base64url(canonical(receipt))
 
@@ -42,6 +45,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -49,7 +53,11 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 BINDING_SCHEMA = "cathedral_sealed_hotel_binding_v1"
@@ -57,6 +65,16 @@ RECEIPT_SCHEMA = "cathedral_sealed_hotel_receipt_v1"
 HOTEL_BINDING_SCHEMA = "cathedral_hotel_binding_v1"
 HOTEL_RECEIPT_SCHEMA = "cathedral_hotel_receipt_v1"
 TSM = "/sys/kernel/config/tsm/report"
+PLANT_ACTION = "escape_nonce_plant"
+PLANT_ALGORITHM = "x25519-hkdf-sha256-aes256gcm-v1"
+PLANT_HKDF_INFO = b"cathedral.escape-nonce-plant.v1"
+DEFAULT_ESCAPE_NONCE_PATH = "/run/escape-room/nonce"
+WINDOW_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+NONCE_RE = re.compile(r"^[A-Za-z0-9+/=_-]{16,512}$")
+
+
+class PlantError(ValueError):
+    """The plant ciphertext did not open. The message never names the nonce."""
 
 
 def canonical(doc) -> bytes:
@@ -209,6 +227,96 @@ def read(path: str, default: str = "") -> str:
         return default
 
 
+def escape_plant_open(ledger: "Ledger") -> bool:
+    """Sealed Escape hotels only. Unset or any other value fails closed."""
+    return os.environ.get("ROOM_ESCAPE") == "1" and bool(getattr(ledger, "sealed", False))
+
+
+def escape_nonce_path() -> str:
+    return os.environ.get("ROOM_ESCAPE_NONCE_PATH") or DEFAULT_ESCAPE_NONCE_PATH
+
+
+def plant_aad(hotel: str, window_id: str) -> bytes:
+    return f"escape-nonce-plant:{hotel}:{window_id}".encode()
+
+
+def _raw_x25519(key: X25519PublicKey) -> bytes:
+    return key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+
+def _plant_wrapping_key(shared: bytes, aad: bytes, ephemeral: bytes, recipient: bytes) -> bytes:
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32, salt=aad, info=PLANT_HKDF_INFO + ephemeral + recipient,
+    ).derive(shared)
+
+
+def seal_plant_nonce(plaintext: bytes, recipient: X25519PublicKey, hotel: str, window_id: str) -> dict:
+    """Seal the window nonce to the guest-held plant key. Same construction the broker uses."""
+    aad = plant_aad(hotel, window_id)
+    ephemeral = X25519PrivateKey.generate()
+    raw_eph = _raw_x25519(ephemeral.public_key())
+    raw_rec = _raw_x25519(recipient)
+    key = _plant_wrapping_key(ephemeral.exchange(recipient), aad, raw_eph, raw_rec)
+    n = os.urandom(12)
+    return {
+        "algorithm": PLANT_ALGORITHM,
+        "ephemeral_public_b64": b64(raw_eph),
+        "nonce_b64": b64(n),
+        "ciphertext_b64": b64(AESGCM(key).encrypt(n, plaintext, aad)),
+    }
+
+
+def open_plant_nonce(doc: dict, private: X25519PrivateKey, hotel: str, window_id: str) -> str:
+    """Open a broker plant envelope. Raises PlantError without naming the nonce."""
+    if not isinstance(doc, dict) or doc.get("algorithm") != PLANT_ALGORITHM:
+        raise PlantError("ciphertext does not open")
+    try:
+        raw_eph = base64.b64decode(doc["ephemeral_public_b64"], validate=True)
+        aes_n = base64.b64decode(doc["nonce_b64"], validate=True)
+        ct = base64.b64decode(doc["ciphertext_b64"], validate=True)
+        if len(raw_eph) != 32 or len(aes_n) != 12 or not (16 <= len(ct) <= 2048):
+            raise PlantError("ciphertext does not open")
+        ephemeral = X25519PublicKey.from_public_bytes(raw_eph)
+        # from_public_bytes accepts low-order points; a trial exchange rejects them.
+        X25519PrivateKey.generate().exchange(ephemeral)
+        aad = plant_aad(hotel, window_id)
+        raw_rec = _raw_x25519(private.public_key())
+        key = _plant_wrapping_key(private.exchange(ephemeral), aad, raw_eph, raw_rec)
+        opened = AESGCM(key).decrypt(aes_n, ct, aad)
+        return opened.decode("ascii")
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError) as exc:
+        raise PlantError("ciphertext does not open") from exc
+
+
+def write_escape_nonce(path: str, nonce: str, window_id: str) -> None:
+    """Write the nonce as a root-only file. The window id sits beside it and is not secret."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    _replace_private_file(directory, os.path.join(directory, "window"), window_id.encode() + b"\n", 0o444)
+    _replace_private_file(directory, path, nonce.encode() + b"\n", 0o400)
+
+
+def _replace_private_file(directory: str, path: str, data: bytes, mode: int) -> None:
+    fd, tmp = tempfile.mkstemp(prefix=".plant.", dir=directory)
+    try:
+        os.fchmod(fd, mode)
+        os.write(fd, data)
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp, path)
+        os.chmod(path, mode)
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class Ledger:
     """The receipt key, the binding and the chain of this boot."""
 
@@ -217,6 +325,17 @@ class Ledger:
             self._init_sealed(hotel, store)
         else:
             self._init_hotel(hotel, store)
+        # Runtime guest key. Not in the binding: adding it there would change
+        # REPORT_DATA. The code that generates it is still a measured-image
+        # change (same as the plant route). TODO Mr Spock: pin move after rebuild.
+        self.plant_private = (
+            X25519PrivateKey.generate() if self.sealed and os.environ.get("ROOM_ESCAPE") == "1" else None
+        )
+
+    def plant_public_b64(self) -> str | None:
+        if self.plant_private is None:
+            return None
+        return b64(_raw_x25519(self.plant_private.public_key()))
 
     def _init_sealed(self, hotel: str, store: str) -> None:
         """SNP binding. Same schema, report and fields as the sealed guest."""
@@ -472,6 +591,10 @@ class Handler(BaseHTTPRequestHandler):
             if out is None:
                 return self.reply(503, b'{"error":"health_not_ready"}')
             return self.reply(status, out, {"X-Health-Age-Ms": str(int((time.time() - at) * 1000))})
+        if path == "/room/escape-plant-key":
+            return self.handle_escape_plant_key(ledger)
+        if path == "/room/escape-nonce":
+            return self.handle_escape_nonce(ledger, body)
         action = next((a for meth, pat, a in SIGNED if meth == self.command and pat.match(path)), None)
         if action and body:
             # A JSON escape of a lone surrogate parses, but cannot be encoded
@@ -536,6 +659,78 @@ class Handler(BaseHTTPRequestHandler):
             # has them), under the receipt key of the binding this report names.
             out["room"] = {"sandbox_id": room, "create_receipt": ledger.create_receipt(room)}
         return self.reply(200, canonical(out))
+
+    def handle_escape_plant_key(self, ledger: "Ledger"):
+        """GET /room/escape-plant-key: the guest X25519 public key (Escape hotels only)."""
+        if self.command != "GET":
+            return self.reply(405, b'{"error":"method_not_allowed"}', {"Allow": "GET"})
+        if not self.authorized():
+            return self.reply(401, b'{"error":"unauthorized"}')
+        pub = ledger.plant_public_b64() if escape_plant_open(ledger) else None
+        if pub is None:
+            return self.reply(403, b'{"error":{"code":"escape_disabled","message":"this hotel does not accept an Escape nonce plant"}}')
+        return self.reply(200, canonical({"algorithm": PLANT_ALGORITHM, "x25519_public_b64": pub}))
+
+    def handle_escape_nonce(self, ledger: "Ledger", body: bytes | None):
+        """POST /room/escape-nonce: write the window nonce. Never echo it."""
+        if self.command != "POST":
+            return self.reply(405, b'{"error":"method_not_allowed"}', {"Allow": "POST"})
+        if not self.authorized():
+            return self.reply(401, b'{"error":"unauthorized"}')
+        if not escape_plant_open(ledger) or ledger.plant_private is None:
+            return self.reply(403, b'{"error":{"code":"escape_disabled","message":"this hotel does not accept an Escape nonce plant"}}')
+        try:
+            doc = json.loads(body or b"")
+        except ValueError:
+            return self.reply(400, b'{"error":{"code":"invalid_request","message":"request body is not JSON"}}')
+        if not isinstance(doc, dict):
+            return self.reply(400, b'{"error":{"code":"invalid_request","message":"request body is not JSON"}}')
+        window_id = doc.get("window_id")
+        if not isinstance(window_id, str) or not WINDOW_ID_RE.fullmatch(window_id):
+            return self.reply(400, b'{"error":{"code":"invalid_request","message":"window_id must be 1 to 128 of [A-Za-z0-9._:-]"}}')
+        encrypted = False
+        nonce = None
+        if doc.get("ciphertext_b64"):
+            try:
+                nonce = open_plant_nonce(doc, ledger.plant_private, ledger.hotel, window_id)
+                encrypted = True
+            except PlantError:
+                return self.reply(400, b'{"error":{"code":"invalid_request","message":"ciphertext does not open"}}')
+        elif isinstance(doc.get("nonce"), str):
+            if os.environ.get("ROOM_ESCAPE_ALLOW_PLAINTEXT") != "1":
+                return self.reply(409, b'{"error":{"code":"plaintext_forbidden","message":"this hotel requires an encrypted plant"}}')
+            nonce = doc["nonce"]
+        else:
+            return self.reply(400, b'{"error":{"code":"invalid_request","message":"ciphertext_b64 or nonce is required"}}')
+        if not isinstance(nonce, str) or not NONCE_RE.fullmatch(nonce):
+            return self.reply(400, b'{"error":{"code":"invalid_request","message":"nonce must be 16 to 512 of [A-Za-z0-9+/=_-]"}}')
+        path = escape_nonce_path()
+        try:
+            write_escape_nonce(path, nonce, window_id)
+        except OSError:
+            traceback.print_exc()
+            return self.reply(500, b'{"error":{"code":"plant_failed","message":"the nonce file could not be written"}}')
+        nonce_sha = sha(nonce.encode())
+        nonce = None
+        extra = {}
+        try:
+            receipt = ledger.sign({
+                "action": PLANT_ACTION,
+                "target": "POST /room/escape-nonce",
+                "sandbox_id": None,
+                "window_id": window_id,
+                "nonce_sha256": nonce_sha,
+                "path": path,
+                "encrypted": encrypted,
+                "status": 200,
+            })
+            extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(receipt)).decode()
+        except Exception as exc:  # noqa: BLE001 the file is written: answer, and say the receipt is missing
+            traceback.print_exc()
+            extra["X-Room-Receipt-Error"] = type(exc).__name__
+        return self.reply(200, canonical({
+            "ok": True, "window_id": window_id, "path": path, "encrypted": encrypted,
+        }), extra)
 
     def fields(self, action: str, path: str, body: bytes | None, status: int, out: bytes) -> dict:
         req = {}
