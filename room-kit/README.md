@@ -264,8 +264,11 @@ read-write when its create has `"workspace": "<name>"` (or
   runtime, with no network. The API never follows a path inside a workspace.
 - Limits: `CATHEDRAL_WORKSPACE_MAX_PER_OWNER` (default 10) and
   `CATHEDRAL_WORKSPACE_MAX_VERSIONS` (default 20). There is no byte quota yet.
-- Sealed hotels: off. A sealed workspace needs a key that only the guest
-  holds (#305 design).
+- Sealed hotels: off by default. `SEALED_ROOM_WORKSPACES=1` in `sealed.env`
+  turns them on. The guest data dir is on the dm-crypt scratch whose key is
+  made at boot in guest memory, so only the guest holds the key (#305 design)
+  and a workspace lives until the guest restarts. The switch is in the
+  measured room.env, so turning it on gives the hotel a new measurement.
 ## Egress credentials
 
 A room can use a secret without holding its value (#304). The egress
