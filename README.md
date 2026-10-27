@@ -11,14 +11,14 @@ This repository is for miners running compute workers on Bittensor SN94.
 For validator operators, use [Cathedral Validator](https://github.com/cathedralai/cathedral-validator).
 
 ## Contents
-<p><small><strong>Overview</strong></small><br>
+<p><sub><strong>Overview</strong></sub><br>
 <strong>1. <a href="#how-mining-works">How mining works</a></strong><br>
-<strong>2. <a href="#current-support">Current support</a></strong><br>
-<small><strong>Operator path</strong></small><br>
+<strong>2. <a href="#current-support">Current support</a></strong><br><br>
+<sub><strong>Operator path</strong></sub><br>
 <strong>3. <a href="#what-you-need">What you need</a></strong><br>
 <strong>4. <a href="#install-and-start">Install and start</a></strong><br>
-<strong>5. <a href="#verify">Verify</a></strong><br>
-<small><strong>Support</strong></small><br>
+<strong>5. <a href="#verify">Verify</a></strong><br><br>
+<sub><strong>Support</strong></sub><br>
 <strong>6. <a href="#stop-and-get-help">Stop and get help</a></strong><br>
 <strong>7. <a href="#public-leak-guard">Public leak guard</a></strong></p>
 
