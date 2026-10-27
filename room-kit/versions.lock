@@ -20,7 +20,9 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 #   ./make-dist.sh b1739d0   (git archive of pyproject.toml and cathedral/)
 # Rolled 2026-10-26 to ce3009a (#330 hotel DELETE waits for the container, plus
 # workspaces #306 and egress credentials #307) on c48, Contabo and c46.
-CATHEDRAL_COMMIT=ce3009a
-CATHEDRAL_TARBALL=dist/cathedral-ce3009a.tar.gz
-CATHEDRAL_TARBALL_SHA256=54fb60945c17ea67bdfe8e88a53bd44f4bb3b83dab263112e5b7758be4b89a1b
+# Rolled 2026-10-27 to 20d81fb (#339 per-room Escape start-up tunables) for the sealed
+# hotels nc-sealed-2 and c46-sealed.
+CATHEDRAL_COMMIT=20d81fb
+CATHEDRAL_TARBALL=dist/cathedral-20d81fb.tar.gz
+CATHEDRAL_TARBALL_SHA256=deb0f1a4e3c51cda369c87ec2ee4b5d2015b4e0d8b0c8123c23fd9a3fc91eeef
 PROBE_IMAGE=alpine:3.20
