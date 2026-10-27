@@ -5,15 +5,20 @@ For mining, start with the [repository overview](../README.md), then follow
 
 ## Current operator references
 
-- [Intel TDX image contract](SN94_AUDIT_MINER_IMAGE.md)
+AMD SEV-SNP is the SN94 miner path.
+
 - [AMD SEV-SNP image contract](SN94_SNP_MINER_IMAGE.md)
-- [Validator access and multi-machine fleet protocol](WORK_REQUEST_V2.md)
-- [Intel TDX verifier release](TDX_VERIFIER_RELEASE.md)
-- [Live Intel TDX check](LIVE_TDX_CHECK.md)
 - [AMD SEV-SNP miner and first hardware proof](AMD_SEV_SNP_FRIEND_TEST.md)
-- [Run an SNP miner on your own server, in order](SNP_OWN_SERVER_ONBOARDING.md)
+- [SNP hardware and admission, steps 1 to 3](SNP_OWN_SERVER_ONBOARDING.md)
+- [Validator access and multi-machine fleet protocol](WORK_REQUEST_V2.md)
 - [Development tests](TESTING.md)
 - [Public leak guard](LEAK_GUARD.md)
+
+Intel TDX is a legacy path.
+
+- [Intel TDX image contract (legacy)](SN94_AUDIT_MINER_IMAGE.md)
+- [Intel TDX verifier release (legacy)](TDX_VERIFIER_RELEASE.md)
+- [Live Intel TDX check (legacy)](LIVE_TDX_CHECK.md)
 
 These pages explain a narrow contract. They do not replace the mining guide's launch
 order.

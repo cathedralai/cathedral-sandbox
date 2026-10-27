@@ -87,7 +87,6 @@ def test_mining_guide_scopes_the_rehearsal_and_help_path():
     assert "scripts/rehearse_sn94_miner.py" in readme
     assert "for run in 1 2 3" in readme
     assert "loopback with clearly synthetic TDX and SEV-SNP evidence" in readme
-    assert "3e1cb9144417e1e0d526445a43245e305e772cae0568202a332183071ef0c584" in readme
-    assert "The published image pin\ndoes not prove" in readme
+    assert "SN94_SNP_MINER_IMAGE.md" in readme
     assert "https://github.com/cathedralai/cathedral-sandbox/issues" in readme
     assert "Do not paste a coldkey, seed phrase, wallet file" in readme
