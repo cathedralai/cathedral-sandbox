@@ -3,8 +3,10 @@
 // broker encrypts to a guest-held X25519 key when the hotel publishes one.
 // That key is signed by the guest's attested receipt key (the Ed25519 key
 // named by receipt_key_ed25519_b64 in the binding REPORT_DATA commits to).
-// The broker verifies the signature before it encrypts. An unsigned, swapped,
-// or unverifiable key fails closed; the nonce is not delivered.
+// The broker verifies the signature before it encrypts. It also refuses
+// unless, for this exact binding, the AMD SEV-SNP chain already passed and
+// the launch measurement is on sealed_measurements. An unsigned, swapped,
+// unverifiable, or unattested key fails closed; the nonce is not delivered.
 //
 //	POST /v1/broker/hotels/<id>/escape-nonce   operator key
 //
@@ -42,13 +44,14 @@ const (
 )
 
 var (
-	errNoPlantKey   = errors.New("the hotel published no plant key")
-	errBadPlantKey  = errors.New("the hotel plant key is not attested")
-	errNotAdmitted  = errors.New("the hotel is not admitted")
-	errNoReceiptKey = errors.New("the hotel published no attested receipt key")
-	plantHKDFInfo   = []byte("cathedral.escape-nonce-plant.v1")
-	windowIDRE      = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
-	plantNonceRE    = regexp.MustCompile(`^[A-Za-z0-9+/=_-]{16,512}$`)
+	errNoPlantKey       = errors.New("the hotel published no plant key")
+	errBadPlantKey      = errors.New("the hotel plant key is not attested")
+	errNotAdmitted      = errors.New("the hotel is not admitted")
+	errNoReceiptKey     = errors.New("the hotel published no attested receipt key")
+	errUnverifiedAttest = errors.New("the hotel attestation is not AMD-chain verified for this binding")
+	plantHKDFInfo       = []byte("cathedral.escape-nonce-plant.v1")
+	windowIDRE          = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
+	plantNonceRE        = regexp.MustCompile(`^[A-Za-z0-9+/=_-]{16,512}$`)
 )
 
 type escapePlantRequest struct {
@@ -126,6 +129,8 @@ func plantErrCode(err error) string {
 	switch {
 	case errors.Is(err, errNotAdmitted):
 		return "hotel_not_admitted"
+	case errors.Is(err, errUnverifiedAttest):
+		return "plant_attestation_unverified"
 	case errors.Is(err, errBadPlantKey), errors.Is(err, errNoReceiptKey):
 		return "plant_key_unverified"
 	default:
@@ -147,7 +152,7 @@ func (b *broker) sealEscapePlant(ctx context.Context, h *hotel, req escapePlantR
 		env["window_id"] = req.WindowID
 		return json.Marshal(env)
 	}
-	if errors.Is(err, errBadPlantKey) {
+	if errors.Is(err, errBadPlantKey) || errors.Is(err, errUnverifiedAttest) {
 		return nil, err
 	}
 	if !b.cfg.EscapeNonceAllowPlaintext {
@@ -159,26 +164,42 @@ func (b *broker) sealEscapePlant(ctx context.Context, h *hotel, req escapePlantR
 }
 
 // escapeReceiptKey is the Ed25519 public key named by the attested binding.
-// Joined sealed hotels must be admitted; the key is the one REPORT_DATA
-// already committed to. Config hotels skip the admission loop, so the
-// broker verifies the current attestation (same check as admission) and
-// takes the key from that binding. Missing or unverifiable keys fail closed.
+// The key is trusted only when the AMD chain passed for this exact binding
+// and the launch measurement is on sealed_measurements. That holds for
+// every hotel kind: joined miners, joined non-miners, and config hotels
+// (which skip the admission loop). Admission still defaults AMD-required
+// to miner hotels only; the plant path reuses checkAttestation /
+// verifyAMDChain and fails closed if those checks have not passed.
 func (b *broker) escapeReceiptKey(ctx context.Context, h *hotel) ([]byte, string, error) {
+	if b.cfg.AMDVerifier == nil || len(b.cfg.SealedMeasurements) == 0 {
+		return nil, "", errUnverifiedAttest
+	}
 	b.mu.Lock()
 	needs := b.needsAttestation(h)
 	admitted := b.admitted(h, time.Now())
 	stored := append([]byte(nil), h.adm.receiptKey...)
 	bindingSHA := h.adm.bindingSHA
+	measurement := h.adm.measurement
+	amdOK := h.adm.amd != nil && h.adm.amdBinding == bindingSHA && bindingSHA != ""
 	b.mu.Unlock()
 	if needs && !admitted {
 		return nil, "", errNotAdmitted
 	}
-	if len(stored) == ed25519.PublicKeySize {
+	if len(stored) == ed25519.PublicKeySize && amdOK && inFold(b.cfg.SealedMeasurements, measurement) {
 		return stored, bindingSHA, nil
 	}
 	res, err := b.checkAttestation(ctx, h)
-	if err != nil || len(res.receiptKey) != ed25519.PublicKeySize {
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %v", errUnverifiedAttest, err)
+	}
+	if len(res.receiptKey) != ed25519.PublicKeySize {
 		return nil, "", errNoReceiptKey
+	}
+	if res.amd == nil || res.amdBinding != res.bindingSHA || res.bindingSHA == "" {
+		return nil, "", errUnverifiedAttest
+	}
+	if !inFold(b.cfg.SealedMeasurements, res.measurement) {
+		return nil, "", errUnverifiedAttest
 	}
 	return res.receiptKey, res.bindingSHA, nil
 }
