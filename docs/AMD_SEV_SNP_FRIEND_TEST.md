@@ -68,11 +68,11 @@ whatever its value, with "SNP policy has an unsupported production shape",
 until its next bootstrap. That includes the `require_single_socket: true`
 that this repository's #222 policy entry carries for a guest with the bit.
 
-On SN39, by operator report (unverified in-repo), UID30 set
-`require_single_socket` to `false` on 2026-09-08 and admitted a two-socket
-`milan` host that same day. Setup refused the key then, so that would have
-needed a manual policy install. The date matches the merge of
-cathedral-validator #235, which added the flag. That is one validator's
+On historical SN39 (not the current subnet), by operator report (unverified
+in-repo), UID30 set `require_single_socket` to `false` on 2026-09-08 and
+admitted a two-socket `milan` host that same day. Setup refused the key then,
+so that would have needed a manual policy install. The date matches the merge
+of cathedral-validator #235, which added the flag. That is one validator's
 decision. Ask your target validator's operator rather than assuming.
 
 **Hardware identity dedup is not optional.** Linux routes every SNP command,
@@ -378,6 +378,28 @@ sudo systemctl status cathedral-sn94-snp-miner.service
 sudo journalctl -u cathedral-sn94-snp-miner.service -n 100 --no-pager
 ```
 
+From a second terminal, prove the TLS worker is reachable before paying to
+register. The SNP image requires a signed validator request. An unsigned
+request must return the exact safe error:
+
+```bash
+HEALTH_BODY="$(mktemp)"
+HEALTH_STATUS="$(curl --insecure --silent --show-error \
+  --connect-timeout 5 \
+  --output "$HEALTH_BODY" \
+  --write-out '%{http_code}' \
+  --header 'Content-Type: application/json' \
+  --data '{}' \
+  https://YOUR_PUBLIC_IPV4:8081/v1/evidence)"
+test "$HEALTH_STATUS" = 401
+grep -Fx '{"error":"unauthorized"}' "$HEALTH_BODY"
+rm -f "$HEALTH_BODY"
+```
+
+This proves only that the intended HTTPS worker answers and requires a
+validator signature. It does not prove AMD evidence, admission, SAT, weight
+or emission.
+
 Do not register or announce the hotkey yet. Give the validator operator the
 hardware-proof transcript. Registration follows only after the scoring
 validator's owner-controlled policy contains the exact observed generation,
@@ -393,7 +415,7 @@ report. A successful validator round additionally proves that its policy
 admitted the machine and that its endpoint, TLS key, and hardware identity did
 not collide.
 
-Neither check proves SN94 registration, a finalized UID30 weight row, subnet
-emission, or TAO earnings. Those require the separate live chain test.
+Neither check proves SN94 registration, a finalized validator weight row,
+subnet emission, or TAO earnings. Those require the separate live chain test.
 Neither check remotely proves the OCI image digest or continuous runtime
 integrity after boot.

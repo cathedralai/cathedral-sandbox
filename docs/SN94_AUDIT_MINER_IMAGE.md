@@ -12,6 +12,9 @@ Platform: linux/amd64
 Runtime contract: signed-validator-fleet-v1
 ```
 
+The `sn39` in that repository name is historical. The image is fixed to
+Finney SN94.
+
 The digest was published by GitHub Actions run
 [`37065132586`](https://github.com/cathedralai/cathedral-sandbox/actions/runs/37065132586)
 with build provenance and anonymous registry access. This proves the published

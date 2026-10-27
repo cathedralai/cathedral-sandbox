@@ -3,20 +3,38 @@
 For mining, start with the [repository overview](../README.md), then follow
 [Mining Cathedral](MINING.md), the only active operator guide.
 
+Cathedral's current subnet is SN94. SN39 is historical. Validator operators
+do not install from this repository; they use
+[cathedral-validator](https://github.com/cathedralai/cathedral-validator).
+
 ## Current operator references
 
-- [Intel TDX image contract](SN94_AUDIT_MINER_IMAGE.md)
+- [AMD SEV-SNP miner and first hardware proof](AMD_SEV_SNP_FRIEND_TEST.md)
 - [AMD SEV-SNP image contract](SN94_SNP_MINER_IMAGE.md)
+- [Run an SNP miner on your own server, in order](SNP_OWN_SERVER_ONBOARDING.md)
+- [Intel TDX image contract](SN94_AUDIT_MINER_IMAGE.md)
 - [Validator access and multi-machine fleet protocol](WORK_REQUEST_V2.md)
 - [Intel TDX verifier release](TDX_VERIFIER_RELEASE.md)
 - [Live Intel TDX check](LIVE_TDX_CHECK.md)
-- [AMD SEV-SNP miner and first hardware proof](AMD_SEV_SNP_FRIEND_TEST.md)
-- [Run an SNP miner on your own server, in order](SNP_OWN_SERVER_ONBOARDING.md)
 - [Development tests](TESTING.md)
 - [Public leak guard](LEAK_GUARD.md)
 
 These pages explain a narrow contract. They do not replace the mining guide's launch
 order.
+
+## Founding miners
+
+There is no published founding-miner program in this repository. See
+[Founding miners](MINING.md#founding-miners) for the honest stub and the
+list of terms Cathedral still needs to publish.
+
+## Validators
+
+The operator install, signed bootstrap, SNP policy template and weight-write
+runbook live in
+[cathedral-validator](https://github.com/cathedralai/cathedral-validator).
+This repository serves miner evidence and SAT work. It does not write SN94
+weights.
 
 ## Protocol and product-library references
 
@@ -36,7 +54,14 @@ The current Cathedral validator derives weights directly from miner evidence.
 It does not consume the repository's older signed-vector publisher,
 central-enrollment, burn, or provenance flows.
 
+Cathedral's customer lease and sandbox products are live on SN94. The public
+sealed tier runs on leased AMD SEV-SNP hosts, by request, not self-serve.
+That product is not this mining path. The Escape Room is not open to the
+public.
+
 ## Design proposals
 
-- [TEE sandbox box](TEE_BOX.md): TDX and SEV-SNP boxes that run customer
-  sandboxes under gVisor. Proposal only; not a mining path.
+- [TEE sandbox box](TEE_BOX.md): a miner-run TDX or SEV-SNP box that hosts
+  customer sandboxes under gVisor. This page is a design proposal, not a
+  mining path and not a self-serve install. Cathedral's leased sealed product
+  is separate and is not sold from this repository.

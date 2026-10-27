@@ -12,6 +12,9 @@ The current anonymous `linux/amd64` image is:
 ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:3e1cb9144417e1e0d526445a43245e305e772cae0568202a332183071ef0c584
 ```
 
+The `sn39` in that repository name is historical. The image is fixed to
+Bittensor `finney` netuid 94.
+
 Its OCI revision label is
 `dd7182ccd91ca25b566ff210025bdea5fda57c4c` and its fixed runtime-contract
 label is `snp-signed-validator-fleet-v1`. The immutable digest proves the

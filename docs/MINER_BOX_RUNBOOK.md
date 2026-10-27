@@ -1,5 +1,9 @@
 # Supply a Cathedral runtime box
 
+This page is not the current SN94 miner path and not a founding-miner
+program. Follow [Mining Cathedral](MINING.md). The runtime-box pay model
+below is a different design.
+
 From "I have a server" to a box that validators pay for. The design is in
 [`CAPACITY.md`](CAPACITY.md) (from #217): the SN94 owner's prober creates sandboxes on your
 box each round, checks its CPU and memory with a challenge, and signs receipts that validators

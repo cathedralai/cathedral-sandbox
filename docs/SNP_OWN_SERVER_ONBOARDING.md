@@ -71,9 +71,9 @@ observed measurement and a TCB floor for its processor generation
 ([Production worker](AMD_SEV_SNP_FRIEND_TEST.md#production-worker)). Send each
 validator operator you expect to score you:
 
-- the transcript's measurement and reported TCB. Once #222 lands, the
-  transcript also carries the processor generation and a ready-made policy
-  entry in the validator's format; until then, name the generation yourself;
+- the transcript's measurement, reported TCB, processor generation, and
+  `validator_policy_entry` (#222, merged). The probe never edits a validator
+  policy; the validator operator merges that entry into their own file;
 - whether your guest sets SINGLE_SOCKET;
 - the host facts from step 1.
 
@@ -117,8 +117,10 @@ canonical repository or not pinned by one sha256 digest, missing or unsafe
 access files, and a missing `/dev/sev-guest`. It runs the container read-only with all capabilities
 dropped.
 
-**Before step 6:** the miner stays running and passes the reachability check
-in [Rehearse before renting or registering](MINING.md#rehearse-before-renting-or-registering).
+**Before step 6:** the miner stays running and passes the SNP reachability
+check in [Start the miner](AMD_SEV_SNP_FRIEND_TEST.md#start-the-miner).
+That check is HTTP 401 `unauthorized` on an unsigned evidence request, not
+the TDX migration-bridge 400 response.
 
 ## 6. Register and announce the hotkey
 

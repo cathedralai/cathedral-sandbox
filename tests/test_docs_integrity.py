@@ -38,8 +38,12 @@ def test_mining_guide_is_the_single_current_operator_path() -> None:
         # the claim rather than pinning a stale one. Updated 2026-09-28: that
         # admission was on SN39, and SN94 has not been verified yet. The block
         # is observed on chain and not recorded in-repo, so it stays marked.
+        # Updated 2026-10-27: SN39 is historical; the guide must keep saying so.
         "One admission observed on SN39 at block 9025398 (observed on chain; unverified in-repo)",
         "SN94 status pending verification",
+        "That SN39 row is historical",
+        "Founding miners",
+        "no published founding-miner program",
         "7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b",
         "3e1cb9144417e1e0d526445a43245e305e772cae0568202a332183071ef0c584",
         "current migration bridge",
@@ -53,6 +57,7 @@ def test_mining_guide_is_the_single_current_operator_path() -> None:
 
     assert "single current mining guide" in mining
     assert "only active operator guide" in " ".join(map_text.split())
+    assert "founding-miner terms" in mining.lower()
     assert len(mining.splitlines()) <= 8
 
 
@@ -137,6 +142,8 @@ def test_current_guide_proves_reachability_before_paid_registration() -> None:
     assert "btcli --network finney query uid" in readme
     assert "btcli --network finney --json query weights --netuid 94" in readme
     assert "There is not yet a public validator-result feed" in readme
+    assert "This repository does not publish which SN94 validator UIDs" in readme
+    assert 'An unsigned `POST /v1/evidence` with `{}` must return HTTP 401' in readme
 
 
 def test_public_repo_has_no_invite_only_miner_form() -> None:
@@ -275,7 +282,7 @@ def test_runtime_help_does_not_point_at_deleted_documents() -> None:
 
 def test_readme_is_a_short_mission_first_miner_entrypoint() -> None:
     readme = (REPO_ROOT / "README.md").read_text()
-    assert len(readme.splitlines()) <= 120
+    assert len(readme.splitlines()) <= 160
     assert "trusted operators" in readme
     assert "This repository is for miners" in readme
     assert "This mining path is not a customer sandbox API" in readme
@@ -286,6 +293,12 @@ def test_readme_is_a_short_mission_first_miner_entrypoint() -> None:
     assert "scripts/run_sn94_signed_fleet_miner.sh" not in readme
     assert "docs/MINING.md#5-confirm-chain-state" in readme
     assert "docs/MINING.md#stop-and-get-help" in readme
+    assert "Cathedral's current subnet is SN94" in readme
+    assert "There is no self-serve sealed capacity" in readme
+    assert "Cathedral does not own" in readme
+    assert "The Escape Room is not open to the public" in readme
+    assert "no published founding-miner program" in readme
+    assert "Do not install or run a validator from this repository" in readme
 
 
 OPERATOR_LINK_DOCUMENTS = [
@@ -311,6 +324,8 @@ def test_operating_step_references_follow_the_moved_guide() -> None:
         assert reference in (REPO_ROOT / relative).read_text(), relative
     amd = (REPO_ROOT / "docs/AMD_SEV_SNP_FRIEND_TEST.md").read_text()
     assert "Do not run the mining guide's TDX host or image steps" in amd
+    assert 'test "$HEALTH_STATUS" = 401' in amd
+    assert '{"error":"unauthorized"}' in amd
 
 
 def test_current_operator_markdown_links_resolve() -> None:
