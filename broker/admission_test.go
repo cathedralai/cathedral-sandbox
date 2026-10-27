@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -25,13 +28,14 @@ import (
 const minerHotkey = "5F3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1repo5EYjQX"
 
 type attestOpts struct {
-	debugPolicy   bool // guest policy bit 19 set
-	debugCmdline  bool // cathedral.debug=1 on the kernel command line
-	level1        bool // a hotel (level 1) binding with no report
-	badReportData bool // REPORT_DATA does not commit to the binding
-	badSHA        bool // binding_sha256 is not the hash of the binding
-	measurement   byte // fill byte of the measurement (default 0xab)
-	chip          byte // CHIP_ID seed: hotels with one seed are one machine
+	debugPolicy   bool   // guest policy bit 19 set
+	debugCmdline  bool   // cathedral.debug=1 on the kernel command line
+	level1        bool   // a hotel (level 1) binding with no report
+	badReportData bool   // REPORT_DATA does not commit to the binding
+	badSHA        bool   // binding_sha256 is not the hash of the binding
+	measurement   byte   // fill byte of the measurement (default 0xab)
+	chip          byte   // CHIP_ID seed: hotels with one seed are one machine
+	receiptKey    []byte // 32-byte Ed25519 public key; default is the placeholder "AAAA"
 }
 
 // snpAttestation builds a GET /room/attestation body the way room_receipts.py
@@ -66,9 +70,13 @@ func snpAttestation(t testing.TB, o attestOpts) []byte {
 	if o.debugCmdline {
 		cmdline += " cathedral.debug=1"
 	}
+	receiptKeyB64 := "AAAA"
+	if len(o.receiptKey) == 32 {
+		receiptKeyB64 = base64.StdEncoding.EncodeToString(o.receiptKey)
+	}
 	binding := map[string]any{
 		"schema": "cathedral.room-binding.v1", "hotel": "miner", "boot_id": "b-1", "created_at": 1,
-		"receipt_key_ed25519_b64": "AAAA", "measurement": hex.EncodeToString(rep[0x90:0xC0]),
+		"receipt_key_ed25519_b64": receiptKeyB64, "measurement": hex.EncodeToString(rep[0x90:0xC0]),
 		"chip_id": hex.EncodeToString(rep[0x1A0:0x1E0]), "reported_tcb": hex.EncodeToString(rep[0x180:0x188]),
 		"policy": "0x30000", "host_data": hex.EncodeToString(rep[0xC0:0xE0]), "kernel_cmdline": cmdline,
 		"kernel_release": "6.8.0", "software": map[string]any{"room_kit": "abc", "cathedral": "def"},
@@ -359,6 +367,34 @@ func TestVerifyAttestationAllowlists(t *testing.T) {
 	tampered := []byte(strings.Replace(string(att.Binding), `"miner"`, `"minor"`, 1))
 	if _, err := verifyAttestation(tampered, att.BindingSHA, att.Report, nil, nil); err == nil {
 		t.Fatalf("tampered binding passed")
+	}
+}
+
+func TestVerifyAttestationKeepsTheReceiptKey(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var att struct {
+		Binding    json.RawMessage `json:"binding"`
+		BindingSHA string          `json:"binding_sha256"`
+		Report     string          `json:"report_b64"`
+	}
+	_ = json.Unmarshal(snpAttestation(t, attestOpts{receiptKey: pub}), &att)
+	res, err := verifyAttestation(att.Binding, att.BindingSHA, att.Report, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(res.receiptKey, pub) {
+		t.Fatalf("receipt key %x, want %x", res.receiptKey, pub)
+	}
+	_ = json.Unmarshal(snpAttestation(t, attestOpts{}), &att)
+	empty, err := verifyAttestation(att.Binding, att.BindingSHA, att.Report, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty.receiptKey) != 0 {
+		t.Fatalf("placeholder receipt key was kept: %x", empty.receiptKey)
 	}
 }
 

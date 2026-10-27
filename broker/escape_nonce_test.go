@@ -3,12 +3,52 @@ package main
 import (
 	"bytes"
 	"crypto/ecdh"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
+
+func signPlantKey(t *testing.T, receiptPriv ed25519.PrivateKey, hotel, bindingSHA string, x25519Pub []byte) map[string]string {
+	t.Helper()
+	doc := map[string]string{
+		"algorithm":         plantAlgorithm,
+		"binding_sha256":    bindingSHA,
+		"hotel":             hotel,
+		"purpose":           plantKeyPurpose,
+		"x25519_public_b64": base64.StdEncoding.EncodeToString(x25519Pub),
+	}
+	msg, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc["signature_b64"] = base64.StdEncoding.EncodeToString(ed25519.Sign(receiptPriv, msg))
+	return doc
+}
+
+func admitEscapeHotel(h *hotel, receiptPub ed25519.PublicKey, bindingSHA string) {
+	h.cfg.Sealed = true
+	h.cfg.Labels = map[string]string{"sealed": "true", "escape": "true"}
+	h.adm.receiptKey = append([]byte(nil), receiptPub...)
+	h.adm.bindingSHA = bindingSHA
+	h.adm.attestedAt = time.Now()
+}
+
+func escapePlantKeys(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey, *ecdh.PrivateKey) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pub, priv, x
+}
 
 func TestSealPlantNonceRoundTrip(t *testing.T) {
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
@@ -44,16 +84,12 @@ func TestSealPlantNonceRoundTrip(t *testing.T) {
 
 func TestEscapeNoncePlantHappyPathEncrypts(t *testing.T) {
 	tc := newChain(t)
-	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
+	receiptPub, receiptPriv, plant := escapePlantKeys(t)
 	h := tc.b.hotelByID("a")
-	h.cfg.Sealed = true
-	h.cfg.Labels = map[string]string{"sealed": "true", "escape": "true"}
+	admitEscapeHotel(h, receiptPub, "binding-a")
 	f := tc.hotels["a"]
 	f.mu.Lock()
-	f.plantKeyB64 = base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes())
+	f.plantKeyDoc = signPlantKey(t, receiptPriv, "a", "binding-a", plant.PublicKey().Bytes())
 	f.mu.Unlock()
 
 	nonce := "control-plane-nonce-1"
@@ -89,6 +125,131 @@ func TestEscapeNoncePlantHappyPathEncrypts(t *testing.T) {
 	}
 }
 
+func TestEscapeNoncePlantRefusesAHostSubstitutedKey(t *testing.T) {
+	tc := newChain(t)
+	guestPub, _, _ := escapePlantKeys(t)
+	_, hostPriv, hostPlant := escapePlantKeys(t)
+	h := tc.b.hotelByID("a")
+	admitEscapeHotel(h, guestPub, "binding-a")
+	f := tc.hotels["a"]
+	f.mu.Lock()
+	f.plantKeyDoc = signPlantKey(t, hostPriv, "a", "binding-a", hostPlant.PublicKey().Bytes())
+	f.mu.Unlock()
+
+	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels/a/escape-nonce",
+		map[string]string{"window_id": "win-1", "nonce": "control-plane-nonce-1"})
+	if status != 409 || errCode(doc) != "plant_key_unverified" {
+		t.Fatalf("host key: %d %v", status, doc)
+	}
+	if len(f.plantPosts) != 0 {
+		t.Fatalf("nonce was delivered to a substituted key: %d posts", len(f.plantPosts))
+	}
+}
+
+func TestEscapeNoncePlantRefusesAnUnsignedKey(t *testing.T) {
+	tc := newChain(t)
+	receiptPub, _, plant := escapePlantKeys(t)
+	h := tc.b.hotelByID("a")
+	admitEscapeHotel(h, receiptPub, "binding-a")
+	f := tc.hotels["a"]
+	f.mu.Lock()
+	f.plantKeyB64 = base64.StdEncoding.EncodeToString(plant.PublicKey().Bytes())
+	f.mu.Unlock()
+
+	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels/a/escape-nonce",
+		map[string]string{"window_id": "win-1", "nonce": "control-plane-nonce-1"})
+	if status != 409 || errCode(doc) != "plant_key_unverified" {
+		t.Fatalf("unsigned: %d %v", status, doc)
+	}
+	if len(f.plantPosts) != 0 {
+		t.Fatal("unsigned key delivered a nonce")
+	}
+}
+
+func TestEscapeNoncePlantRefusesANonAttestedSigner(t *testing.T) {
+	tc := newChain(t)
+	guestPub, _, plant := escapePlantKeys(t)
+	_, otherPriv, _ := escapePlantKeys(t)
+	h := tc.b.hotelByID("a")
+	admitEscapeHotel(h, guestPub, "binding-a")
+	f := tc.hotels["a"]
+	f.mu.Lock()
+	f.plantKeyDoc = signPlantKey(t, otherPriv, "a", "binding-a", plant.PublicKey().Bytes())
+	f.mu.Unlock()
+
+	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels/a/escape-nonce",
+		map[string]string{"window_id": "win-1", "nonce": "control-plane-nonce-1"})
+	if status != 409 || errCode(doc) != "plant_key_unverified" {
+		t.Fatalf("non-attested signer: %d %v", status, doc)
+	}
+	if len(f.plantPosts) != 0 {
+		t.Fatal("nonce delivered for a non-attested signer")
+	}
+}
+
+func TestEscapeNoncePlantRefusesASignatureForAnotherRoom(t *testing.T) {
+	tc := newChain(t)
+	receiptPub, receiptPriv, plant := escapePlantKeys(t)
+	h := tc.b.hotelByID("a")
+	admitEscapeHotel(h, receiptPub, "binding-a")
+	f := tc.hotels["a"]
+	f.mu.Lock()
+	f.plantKeyDoc = signPlantKey(t, receiptPriv, "other-hotel", "binding-a", plant.PublicKey().Bytes())
+	f.mu.Unlock()
+
+	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels/a/escape-nonce",
+		map[string]string{"window_id": "win-1", "nonce": "control-plane-nonce-1"})
+	if status != 409 || errCode(doc) != "plant_key_unverified" {
+		t.Fatalf("other room: %d %v", status, doc)
+	}
+	if len(f.plantPosts) != 0 {
+		t.Fatal("nonce delivered for a signature bound to another hotel")
+	}
+}
+
+func TestEscapeNoncePlantPlaintextFlagDoesNotBypassABadKey(t *testing.T) {
+	tc := newChain(t)
+	tc.b.cfg.EscapeNonceAllowPlaintext = true
+	receiptPub, _, plant := escapePlantKeys(t)
+	h := tc.b.hotelByID("a")
+	admitEscapeHotel(h, receiptPub, "binding-a")
+	f := tc.hotels["a"]
+	f.mu.Lock()
+	f.plantKeyB64 = base64.StdEncoding.EncodeToString(plant.PublicKey().Bytes())
+	f.mu.Unlock()
+
+	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels/a/escape-nonce",
+		map[string]string{"window_id": "win-1", "nonce": "control-plane-nonce-1"})
+	if status != 409 || errCode(doc) != "plant_key_unverified" {
+		t.Fatalf("plaintext flag: %d %v", status, doc)
+	}
+	if len(f.plantPosts) != 0 {
+		t.Fatal("plaintext flag delivered an unsigned key's nonce")
+	}
+}
+
+func TestEscapeNoncePlantRefusesWhenNotAdmitted(t *testing.T) {
+	tc := newChain(t)
+	receiptPub, receiptPriv, plant := escapePlantKeys(t)
+	h := tc.b.hotelByID("a")
+	admitEscapeHotel(h, receiptPub, "binding-a")
+	h.runtime = true
+	h.adm.attestedAt = time.Time{}
+	f := tc.hotels["a"]
+	f.mu.Lock()
+	f.plantKeyDoc = signPlantKey(t, receiptPriv, "a", "binding-a", plant.PublicKey().Bytes())
+	f.mu.Unlock()
+
+	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels/a/escape-nonce",
+		map[string]string{"window_id": "win-1", "nonce": "control-plane-nonce-1"})
+	if status != 409 || errCode(doc) != "hotel_not_admitted" {
+		t.Fatalf("not admitted: %d %v", status, doc)
+	}
+	if len(f.plantPosts) != 0 {
+		t.Fatal("nonce delivered to a hotel that is not admitted")
+	}
+}
+
 func TestEscapeNoncePlantRefusesANonEscapeHotel(t *testing.T) {
 	tc := newChain(t)
 	tc.b.hotelByID("a").cfg.Sealed = true
@@ -119,16 +280,12 @@ func TestEscapeNoncePlantGuestKeyIsUnauthorized(t *testing.T) {
 
 func TestEscapeNoncePlantHotelFailure(t *testing.T) {
 	tc := newChain(t)
-	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
+	receiptPub, receiptPriv, plant := escapePlantKeys(t)
 	h := tc.b.hotelByID("a")
-	h.cfg.Sealed = true
-	h.cfg.Labels = map[string]string{"sealed": "true", "escape": "true"}
+	admitEscapeHotel(h, receiptPub, "binding-a")
 	f := tc.hotels["a"]
 	f.mu.Lock()
-	f.plantKeyB64 = base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes())
+	f.plantKeyDoc = signPlantKey(t, receiptPriv, "a", "binding-a", plant.PublicKey().Bytes())
 	f.plantFail = true
 	f.mu.Unlock()
 
@@ -141,9 +298,9 @@ func TestEscapeNoncePlantHotelFailure(t *testing.T) {
 
 func TestEscapeNoncePlantRequiresEncryptionWhenNoKey(t *testing.T) {
 	tc := newChain(t)
+	receiptPub, _, _ := escapePlantKeys(t)
 	h := tc.b.hotelByID("a")
-	h.cfg.Sealed = true
-	h.cfg.Labels = map[string]string{"sealed": "true", "escape": "true"}
+	admitEscapeHotel(h, receiptPub, "binding-a")
 	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels/a/escape-nonce",
 		map[string]string{"window_id": "win-1", "nonce": "control-plane-nonce-1"})
 	if status != 409 || errCode(doc) != "encryption_required" {
@@ -157,9 +314,9 @@ func TestEscapeNoncePlantRequiresEncryptionWhenNoKey(t *testing.T) {
 func TestEscapeNoncePlantPlaintextFlag(t *testing.T) {
 	tc := newChain(t)
 	tc.b.cfg.EscapeNonceAllowPlaintext = true
+	receiptPub, _, _ := escapePlantKeys(t)
 	h := tc.b.hotelByID("a")
-	h.cfg.Sealed = true
-	h.cfg.Labels = map[string]string{"sealed": "true", "escape": "true"}
+	admitEscapeHotel(h, receiptPub, "binding-a")
 	nonce := "control-plane-nonce-1"
 	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels/a/escape-nonce",
 		map[string]string{"window_id": "win-1", "nonce": nonce})

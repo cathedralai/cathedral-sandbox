@@ -25,7 +25,8 @@ Routes it adds:
                                    with "sandbox_id", also that room's signed create receipt
   GET /room/receipts?after=&limit= the chain of this boot, in order
   GET /v1/sandboxes/<id>/receipts  the receipts of one room
-  GET /room/escape-plant-key       sealed Escape hotels only: the guest X25519 public key
+  GET /room/escape-plant-key       sealed Escape hotels only: the guest X25519 public
+                                   key, signed by the attested receipt key
   POST /room/escape-nonce          sealed Escape hotels only: plant the window nonce
                                    (never echoed; receipt signs the plant without the value)
 Response header on a signed operation:
@@ -68,6 +69,7 @@ HOTEL_RECEIPT_SCHEMA = "cathedral_hotel_receipt_v1"
 TSM = "/sys/kernel/config/tsm/report"
 PLANT_ACTION = "escape_nonce_plant"
 PLANT_ALGORITHM = "x25519-hkdf-sha256-aes256gcm-v1"
+PLANT_KEY_PURPOSE = "escape-plant-key"
 PLANT_HKDF_INFO = b"cathedral.escape-nonce-plant.v1"
 DEFAULT_ESCAPE_NONCE_PATH = "/run/escape-room/nonce"
 WINDOW_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -237,6 +239,17 @@ def escape_nonce_path() -> str:
     return os.environ.get("ROOM_ESCAPE_NONCE_PATH") or DEFAULT_ESCAPE_NONCE_PATH
 
 
+def plant_key_statement(hotel: str, x25519_public_b64: str, binding_sha256: str) -> dict:
+    """Canonical fields the guest signs and the broker verifies."""
+    return {
+        "algorithm": PLANT_ALGORITHM,
+        "binding_sha256": binding_sha256,
+        "hotel": hotel,
+        "purpose": PLANT_KEY_PURPOSE,
+        "x25519_public_b64": x25519_public_b64,
+    }
+
+
 def plant_aad(hotel: str, window_id: str) -> bytes:
     return f"escape-nonce-plant:{hotel}:{window_id}".encode()
 
@@ -327,8 +340,9 @@ class Ledger:
         else:
             self._init_hotel(hotel, store)
         # Runtime guest key. Not in the binding: adding it there would change
-        # REPORT_DATA. The code that generates it is still a measured-image
-        # change (same as the plant route). TODO Mr Spock: pin move after rebuild.
+        # REPORT_DATA. Authenticated by an Ed25519 signature over the plant-key
+        # statement using the receipt key the binding already names
+        # (receipt_key_ed25519_b64). TODO Mr Spock: pin move after rebuild.
         self.plant_private = (
             X25519PrivateKey.generate() if self.sealed and os.environ.get("ROOM_ESCAPE") == "1" else None
         )
@@ -337,6 +351,19 @@ class Ledger:
         if self.plant_private is None:
             return None
         return b64(_raw_x25519(self.plant_private.public_key()))
+
+    def plant_key_document(self) -> dict | None:
+        """Public plant key signed by the attested receipt key.
+
+        The statement binds hotel (ROOM_HOTEL_NAME, the broker hotel id),
+        this boot's binding_sha256, the X25519 key, and a purpose string so
+        the signature cannot be replayed onto another hotel or room.
+        """
+        pub = self.plant_public_b64()
+        if pub is None:
+            return None
+        statement = plant_key_statement(self.hotel, pub, self.binding_sha256)
+        return {**statement, "signature_b64": b64(self.key.sign(canonical(statement)))}
 
     def _init_sealed(self, hotel: str, store: str) -> None:
         """SNP binding. Same schema, report and fields as the sealed guest."""
@@ -667,10 +694,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(405, b'{"error":"method_not_allowed"}', {"Allow": "GET"})
         if not self.authorized():
             return self.reply(401, b'{"error":"unauthorized"}')
-        pub = ledger.plant_public_b64() if escape_plant_open(ledger) else None
-        if pub is None:
+        doc = ledger.plant_key_document() if escape_plant_open(ledger) else None
+        if doc is None:
             return self.reply(403, b'{"error":{"code":"escape_disabled","message":"this hotel does not accept an Escape nonce plant"}}')
-        return self.reply(200, canonical({"algorithm": PLANT_ALGORITHM, "x25519_public_b64": pub}))
+        return self.reply(200, canonical(doc))
 
     def handle_escape_nonce(self, ledger: "Ledger", body: bytes | None):
         """POST /room/escape-nonce: write the window nonce. Never echo it."""

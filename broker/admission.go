@@ -76,6 +76,10 @@ type admission struct {
 	// amdBinding; nil when the chain was not checked.
 	amd        map[string]any
 	amdBinding string
+	// receiptKey is receipt_key_ed25519_b64 from the attested binding.
+	// REPORT_DATA commits to that binding, so this is the guest receipt
+	// public key. Empty when the binding omitted a 32-byte key.
+	receiptKey []byte
 }
 
 // errChipInUse is a check that passed for a chip another admitted hotel has.
@@ -210,6 +214,7 @@ type snpBinding struct {
 	Policy        string `json:"policy"`
 	HostData      string `json:"host_data"`
 	KernelCmdline string `json:"kernel_cmdline"`
+	ReceiptKeyB64 string `json:"receipt_key_ed25519_b64"`
 }
 
 // verifyAttestation is the check of the package comment. rawBinding is the
@@ -276,7 +281,11 @@ func verifyAttestation(rawBinding []byte, bindingSHA, reportB64 string, measurem
 		return fail("HOST_DATA %s... is not in sealed_host_data", host[:16])
 	}
 	chip := hex.EncodeToString(report[0x1A0:0x1E0])
-	return admission{measurement: measurement, bindingSHA: bsha, chipID: chip[:16], chipFull: chip}, nil
+	var receiptKey []byte
+	if raw, decErr := base64.StdEncoding.DecodeString(bd.ReceiptKeyB64); decErr == nil && len(raw) == 32 {
+		receiptKey = raw
+	}
+	return admission{measurement: measurement, bindingSHA: bsha, chipID: chip[:16], chipFull: chip, receiptKey: receiptKey}, nil
 }
 
 func inFold(list []string, v string) bool {

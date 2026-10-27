@@ -10,6 +10,8 @@ from pathlib import Path
 from threading import Thread
 
 import pytest
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 
 KIT = Path(__file__).resolve().parents[1] / "room-kit"
@@ -141,12 +143,22 @@ def test_plaintext_is_refused_unless_flagged(tmp_path, monkeypatch) -> None:
     assert not (plant_dir / "nonce").exists()
 
 
+def _plant_statement(doc: dict) -> dict:
+    return {k: doc[k] for k in ("algorithm", "binding_sha256", "hotel", "purpose", "x25519_public_b64")}
+
+
 def test_encrypted_plant_writes_root_only_and_never_echoes(tmp_path, monkeypatch) -> None:
     port, ledger, plant_dir = _front(tmp_path, monkeypatch, escape="1", sealed=True)
     status, headers, key_body = _request(port, "GET", "/room/escape-plant-key")
     assert status == 200
     key_doc = json.loads(key_body)
     assert key_doc["algorithm"] == rr.PLANT_ALGORITHM
+    assert key_doc["hotel"] == "room-a"
+    assert key_doc["purpose"] == rr.PLANT_KEY_PURPOSE
+    assert key_doc["binding_sha256"] == ledger.binding_sha256
+    ledger.key.public_key().verify(
+        base64.b64decode(key_doc["signature_b64"]), rr.canonical(_plant_statement(key_doc)),
+    )
     pub = X25519PublicKey.from_public_bytes(base64.b64decode(key_doc["x25519_public_b64"]))
     env = rr.seal_plant_nonce(NONCE.encode(), pub, "room-a", "win-1")
     env["window_id"] = "win-1"
@@ -214,3 +226,20 @@ def test_seal_open_round_trip() -> None:
     assert rr.open_plant_nonce(env, priv, "hotel", "win-9") == NONCE
     with pytest.raises(rr.PlantError):
         rr.open_plant_nonce(env, priv, "hotel", "win-other")
+
+
+def test_plant_key_signature_is_bound_to_hotel_and_binding(tmp_path, monkeypatch) -> None:
+    _port, ledger, _plant_dir = _front(tmp_path, monkeypatch, escape="1", sealed=True)
+    doc = ledger.plant_key_document()
+    assert doc is not None
+    key = ledger.key.public_key()
+    key.verify(base64.b64decode(doc["signature_b64"]), rr.canonical(_plant_statement(doc)))
+    other_hotel = {**doc, "hotel": "other-hotel"}
+    with pytest.raises(InvalidSignature):
+        key.verify(base64.b64decode(doc["signature_b64"]), rr.canonical(_plant_statement(other_hotel)))
+    other_room = {**doc, "binding_sha256": "0" * 64}
+    with pytest.raises(InvalidSignature):
+        key.verify(base64.b64decode(doc["signature_b64"]), rr.canonical(_plant_statement(other_room)))
+    other_key = Ed25519PrivateKey.generate().public_key()
+    with pytest.raises(InvalidSignature):
+        other_key.verify(base64.b64decode(doc["signature_b64"]), rr.canonical(_plant_statement(doc)))

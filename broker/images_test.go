@@ -48,8 +48,10 @@ type fakeHotel struct {
 	getStatus map[string]int
 	// attestation is the body of GET /room/attestation (admission_test.go); nil: 404.
 	attestation []byte
-	// Escape nonce plant (escape_nonce.go). plantKeyB64 empty: GET plant-key is 403.
+	// Escape nonce plant (escape_nonce.go). plantKeyDoc wins; else plantKeyB64
+	// (unsigned, for negative tests); both empty: GET plant-key is 403.
 	plantKeyB64 string
+	plantKeyDoc map[string]string
 	plantPosts  [][]byte
 	plantAuth   []string
 	plantStatus int // POST /room/escape-nonce; 0 means 200
@@ -203,6 +205,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 		_, _ = w.Write(f.receipts)
 	case p == "/room/escape-plant-key" && r.Method == "GET":
+		if f.plantKeyDoc != nil {
+			writeJSON(w, 200, f.plantKeyDoc)
+			return
+		}
 		if f.plantKeyB64 == "" {
 			writeErr(w, 403, "escape_disabled", "this hotel does not accept an Escape nonce plant")
 			return
