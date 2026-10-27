@@ -190,6 +190,11 @@ func (b *broker) handleHotelAdmin(w http.ResponseWriter, r *http.Request, id str
 		writeErr(w, 401, "unauthorized", "the operator key is required")
 		return
 	}
+	hotelID, action, hadAction := strings.Cut(id, "/")
+	if hadAction && action == "escape-nonce" && hotelID != "" && r.Method == "POST" {
+		b.handleEscapeNoncePlant(w, r, hotelID)
+		return
+	}
 	switch {
 	case id != "" && r.Method == "GET":
 		h := b.hotelByID(id)

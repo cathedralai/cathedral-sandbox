@@ -104,6 +104,10 @@ type config struct {
 	// AMDVerifier runs room-kit/verify_receipts.py on a sealed hotel's
 	// attestation to check the AMD chain (amd_chain.go). Required for miner hotels.
 	AMDVerifier *amdVerifierConfig `json:"amd_verifier,omitempty"`
+	// EscapeNonceAllowPlaintext: the operator plant may send the nonce in
+	// plaintext when the hotel has no plant key. Default false: fail closed.
+	// TODO Mr Spock: drop after every escape hotel image decrypts (pin move).
+	EscapeNonceAllowPlaintext bool `json:"escape_nonce_allow_plaintext,omitempty"`
 }
 
 func (b *broker) maxExec() int {
