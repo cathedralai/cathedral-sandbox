@@ -26,15 +26,9 @@ jobs:
         run: |
           IMAGE=ghcr.io/cathedralai/room-lfm3-1.7b@sha256:6767a53dd2fd003d19913d74ea63e9ab57f63ac1b4bc41b19bcd20c424633f09
           docker run --rm "$IMAGE" bash -c '
-            grep -m1 "model name" /proc/cpuinfo
-            grep -m1 flags /proc/cpuinfo | tr " " "\n" | grep -E "^(avx|fma|bmi|f16c|sse4|amx)" | tr "\n" " "; echo
-            ls -la /opt/llama/bin
-            /opt/llama/bin/llama-cli --version -lv 4 2>&1 | head -40
-            for lib in /opt/llama/bin/libggml-cpu-*.so; do
-              v=$(basename "$lib" .so); v=${v#libggml-cpu-}
-              d=/tmp/v/$v; mkdir -p "$d"; cp -a /opt/llama/bin/. "$d"/
-              for other in "$d"/libggml-cpu-*.so; do [ "$(basename "$other")" = "libggml-cpu-$v.so" ] || rm -f "$other"; done
-              echo "=== variant $v"
-              LFM3_LLAMA_CLI="$d/llama-cli" LFM3_MAX_TOKENS=16 timeout 120 lfm3-ask "Say hi." 2>&1 | tail -3 | cut -c1-220
-            done
+            echo "=== devices (all variants present)"
+            /opt/llama/bin/llama-cli --list-devices -lv 4 2>&1 | grep -i "backend\|device\|cpu" | head -20
+            echo "=== gdb"
+            apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gdb >/dev/null 2>&1
+            gdb -batch -ex run -ex bt -ex "x/3i \$pc" -ex "info sharedlibrary" --args /opt/llama/bin/llama-cli -m /opt/lfm3/LFM3-1.7B-Q4_K_M.gguf -p "Say hi." -st -n 8 -t 2 -c 512 --temp 0 --simple-io --reasoning off </dev/null 2>&1 | grep -v "^\[New Thread\|^\[Thread" | tail -45 | cut -c1-240
           '
