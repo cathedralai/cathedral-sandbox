@@ -25,6 +25,10 @@ admission, key release, lifecycle state, provider contracts, and policy
 registries. They are for developers and reviewers. They are not alternate SN94
 mining paths.
 
+[Partner self-serve](PARTNER-SELF-SERVE.md) maps the white-glove guest and key
+steps for Ditto and the other live integrations, and the broker route that
+takes the first step off the config file.
+
 [Central pool access](CENTRAL_POOL_ACCESS.md) specifies how Cathedral's central
 service would authenticate to an opted-in miner, and what it may do there.
 

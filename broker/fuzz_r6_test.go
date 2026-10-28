@@ -130,7 +130,8 @@ var fuzzRoutes = []struct {
 	{"GET", "/v1/broker/hotels", false}, {"GET", "/v1/broker/stats", false}, {"POST", "/v1/broker/probe", false},
 	{"GET", "/v1/status", false},
 	{"PATCH", "/v1/broker/hotels/%s", true}, {"DELETE", "/v1/broker/hotels/%s", true},
-	{"GET", "/v1/broker/guests", true}, {"PATCH", "/v1/broker/guests/%s", true},
+	{"GET", "/v1/broker/guests", true}, {"POST", "/v1/broker/guests", true},
+	{"PATCH", "/v1/broker/guests/%s", true}, {"DELETE", "/v1/broker/guests/%s", true},
 	{"POST", "/ops/live/sign-in", false}, {"GET", "/ops/live", false},
 	{"GET", "/healthz", false}, {"GET", "/%s", false},
 }

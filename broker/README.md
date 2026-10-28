@@ -93,10 +93,15 @@ limits without a restart:
 
 | Route (operator key) | What it does |
 |---|---|
-| `GET /v1/broker/guests` | Every guest with its limits and active rooms. No key hashes. |
-| `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed`, `hotels` and `policy` (`"policy": null` removes it). `max_rooms: 0` and `hotels: []` get 400: in config they mean 1,000 rooms and every hotel. A bad policy gets 400 `invalid_policy`. |
+| `GET /v1/broker/guests` | Every guest with its limits and active rooms. No key hashes. Shows `runtime`. |
+| `POST /v1/broker/guests` | Adds a guest: `{"id", "key_sha256", "view_token_sha256"?, "max_rooms"?, "max_creates_per_minute"?, "default_sealed"?, "hotels"?, "policy"?}`. Send the SHA-256 of the key, never the key. Needs `state_dir`. Must name `hotels` or `policy` (a runtime guest does not get every hotel). A runtime guest never gets `ops`. |
+| `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed`, `hotels` and `policy` (`"policy": null` removes it). `max_rooms: 0` and `hotels: []` get 400: in config they mean 1,000 rooms and every hotel. A bad policy gets 400 `invalid_policy`. A change on a runtime guest is written to `guests.json`. |
+| `DELETE /v1/broker/guests/<id>` | Removes a runtime guest that has no rooms. A config-file guest gets 409 `config_guest`. |
 
-A runtime change stays in memory. A restart goes back to the config file.
+A guest added at runtime is kept in `state_dir/guests.json` (mode 0600, key
+hashes only) with its limits, so it comes back after a restart. A config-file
+guest with the same id or key wins over a runtime guest. A limit change on a
+config-file guest stays in memory: a restart goes back to the config file.
 
 ## Guest policy and capacity catalog
 
