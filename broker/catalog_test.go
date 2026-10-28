@@ -85,7 +85,7 @@ func TestLFM3CreateUsesTheSameCompatPathAsRoom1x4(t *testing.T) {
 		t.Fatal("lfm3-1.7b must not fall through to the alpine room image")
 	}
 	res := found["resources"].(map[string]any)
-	if res["vcpu"].(float64) != 1 || res["memory_gib"].(float64) != 4 {
+	if res["vcpu"].(float64) != 2 || res["memory_gib"].(float64) != 8 {
 		t.Fatalf("lfm3 resources: %v", res)
 	}
 }
