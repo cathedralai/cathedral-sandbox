@@ -74,7 +74,7 @@ var catalogTemplates = []catalogTemplate{
 	{
 		Name: "lfm3-1.7b", DisplayName: "LFM3 1.7B (CPU)",
 		Description: "LFM3 1.73B on CPU via llama.cpp (LFM3-1.7B-Q4_K_M.gguf). Sandbox inputs: text. Sandbox outputs: text. GPU is not required.",
-		CPU:         1, MemoryGiB: 4, DiskGiB: 10, Rate: "0.05",
+		CPU:         2, MemoryGiB: 8, DiskGiB: 10, Rate: "0.10",
 		Image: pinnedImage(lfm31_7bRepo, lfm31_7bDigest), Live: true, Sealed: sealedPending,
 	},
 	{
