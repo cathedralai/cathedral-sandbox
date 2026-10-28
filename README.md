@@ -1,4 +1,7 @@
-# Cathedral Sandbox
+<p align="center"><img src="docs/assets/cathedral-mark.png" alt="Cathedral" width="112"></p>
+<h1 align="center">Cathedral Sandbox</h1>
+<p align="center"><em>Miners&ensp;running&ensp;compute&ensp;workers&ensp;on&ensp;Bittensor&ensp;SN94</em></p>
+<p align="center"><sub>27 October 2026</sub></p>
 
 Cathedral turns independently operated machines from trusted operators into a
 verifiable compute network. Miners supply the machines; validators check their
@@ -6,6 +9,18 @@ confidential-computing evidence, test their work and score the results.
 
 This repository is for miners running compute workers on Bittensor SN94.
 For validator operators, use [Cathedral Validator](https://github.com/cathedralai/cathedral-validator).
+
+## Contents
+<p><sub><strong>Overview</strong></sub><br>
+<strong>1. <a href="#how-mining-works">How mining works</a></strong><br>
+<strong>2. <a href="#current-support">Current support</a></strong><br><br>
+<sub><strong>Operator path</strong></sub><br>
+<strong>3. <a href="#what-you-need">What you need</a></strong><br>
+<strong>4. <a href="#install-and-start">Install and start</a></strong><br>
+<strong>5. <a href="#verify">Verify</a></strong><br><br>
+<sub><strong>Support</strong></sub><br>
+<strong>6. <a href="#stop-and-get-help">Stop and get help</a></strong><br>
+<strong>7. <a href="#public-leak-guard">Public leak guard</a></strong></p>
 
 ## How mining works
 
