@@ -39,6 +39,9 @@ Built with `GGML_NATIVE=OFF`, `GGML_BACKEND_DL=ON` and `GGML_CPU_ALL_VARIANTS=ON
 every x86-64 CPU variant (sse42 up to zen4) is a loadable module and ggml
 picks the best one the CPU reports when it starts. One image runs on any
 x86-64 host, including AMD EPYC Genoa under gVisor or in an SEV-SNP guest.
+The Intel AMX variant (`sapphirerapids`) is removed from the image: on an
+Intel Xeon that reports AMX inside a container it kills llama-cli with SIGILL,
+and a 1.7B Q4 model does not need it.
 
 ## License
 
