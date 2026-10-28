@@ -18,8 +18,9 @@ func TestCatalogListsRoomSizesThenLFM3(t *testing.T) {
 	if !ok || !lfm.Live || lfm.Sealed != sealedPending {
 		t.Fatalf("lfm3-1.7b: %+v", lfm)
 	}
-	if lfm.Image != lfm31_7bRepo+":"+lfm31_7bTag && !strings.HasPrefix(lfm.Image, lfm31_7bRepo+"@sha256:") {
-		t.Fatalf("lfm3-1.7b image %q is not the published tag or a digest pin", lfm.Image)
+	want := pinnedImage(lfm31_7bRepo, lfm31_7bDigest)
+	if lfm.Image != want {
+		t.Fatalf("lfm3-1.7b image %q want %q", lfm.Image, want)
 	}
 	if strings.HasSuffix(lfm.Image, ":latest") {
 		t.Fatalf("lfm3-1.7b must not use a floating latest tag")
@@ -28,8 +29,8 @@ func TestCatalogListsRoomSizesThenLFM3(t *testing.T) {
 
 func TestPinnedImageIsDigestOnly(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("ab", 32)
-	got := pinnedImage("cathedral/lfm3-1.7b", digest)
-	want := "cathedral/lfm3-1.7b@" + digest
+	got := pinnedImage(lfm31_7bRepo, digest)
+	want := lfm31_7bRepo + "@" + digest
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}
@@ -38,7 +39,7 @@ func TestPinnedImageIsDigestOnly(t *testing.T) {
 			t.Fatal("pinnedImage accepted a tag")
 		}
 	}()
-	_ = pinnedImage("cathedral/lfm3-1.7b:q4_k_m", digest)
+	_ = pinnedImage(lfm31_7bRepo+":q4_k_m", digest)
 }
 
 func TestUnknownTemplateIs404OnCompatAndNative(t *testing.T) {
@@ -72,7 +73,7 @@ func TestLFM3CreateUsesTheSameCompatPathAsRoom1x4(t *testing.T) {
 	var found map[string]any
 	for _, h := range tc.hotels {
 		for _, c := range h.creates {
-			if img, _ := c["image"].(string); img == lfm31_7bRepo+":"+lfm31_7bTag || strings.HasPrefix(img, lfm31_7bRepo+"@sha256:") {
+			if img, _ := c["image"].(string); img == pinnedImage(lfm31_7bRepo, lfm31_7bDigest) {
 				found = c
 			}
 		}
@@ -96,7 +97,7 @@ func TestNativeLFM3TemplateCreateSucceedsLikeAnImageCreate(t *testing.T) {
 		t.Fatalf("native lfm3: %d %v", status, doc)
 	}
 	created := lastLFM3Create(t, tc)
-	if created["image"] != lfm31_7bRepo+":"+lfm31_7bTag && !strings.HasPrefix(created["image"].(string), lfm31_7bRepo+"@sha256:") {
+	if created["image"] != pinnedImage(lfm31_7bRepo, lfm31_7bDigest) {
 		t.Fatalf("hotel image: %v", created["image"])
 	}
 	if _, ok := created["template"]; ok {
@@ -159,7 +160,7 @@ func TestCatalogAdvertisesLFM3LiveAndSealedPending(t *testing.T) {
 	if lfm["live"] != true || lfm["sealed"] != "pending" {
 		t.Fatalf("lfm3 catalog: %v", lfm)
 	}
-	if lfm["image"] != lfm31_7bRepo+":"+lfm31_7bTag && !strings.HasPrefix(lfm["image"].(string), lfm31_7bRepo+"@sha256:") {
+	if lfm["image"] != pinnedImage(lfm31_7bRepo, lfm31_7bDigest) {
 		t.Fatalf("catalog image: %v", lfm["image"])
 	}
 	if byName["lfm3-vl-2b"]["live"] != false || byName["lfm3-vl-2b"]["sealed"] != "pending" {
@@ -198,7 +199,7 @@ func lastLFM3Create(t *testing.T, tc *testChain) map[string]any {
 	for _, h := range tc.hotels {
 		for _, c := range h.creates {
 			img, _ := c["image"].(string)
-			if img == lfm31_7bRepo+":"+lfm31_7bTag || strings.HasPrefix(img, lfm31_7bRepo+"@sha256:") {
+			if img == pinnedImage(lfm31_7bRepo, lfm31_7bDigest) {
 				last = c
 			}
 		}

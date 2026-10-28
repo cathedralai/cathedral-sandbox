@@ -34,19 +34,18 @@ type catalogTemplate struct {
 	DiskGiB     int
 	Rate        string
 	// Image is the hotel create image. Live model templates are pinned by
-	// digest (repository@sha256:hex) when the published digest is known.
-	// Until then they use the published tag hotels already run.
+	// digest (repository@sha256:hex). Unpublished suite templates keep a
+	// tag until those images exist.
 	Image  string
 	Live   bool        // standard create is open
 	Sealed sealedOffer // sealed create: ready or pending
 }
 
-// LFM3-1.7B image. Tag matches cathedralai/cathedral LFM3_IMAGE_REF.
-// Standard hotels already run this tag. Prefer repository@sha256:hex via
-// pinnedImage once the published digest is recorded.
+// LFM3-1.7B image. Same GHCR digest as cathedralai/cathedral PR #446
+// (sandbox_models LFM3_IMAGE_REF).
 const (
-	lfm31_7bRepo = "cathedral/lfm3-1.7b"
-	lfm31_7bTag  = "q4_k_m"
+	lfm31_7bRepo   = "ghcr.io/cathedralai/room-lfm3-1.7b"
+	lfm31_7bDigest = "sha256:b1ba8837ea388c8c98720772b0f41af5813d4cebf214637fde20aae58a1ea761"
 )
 
 var digestPin = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
@@ -76,7 +75,7 @@ var catalogTemplates = []catalogTemplate{
 		Name: "lfm3-1.7b", DisplayName: "LFM3 1.7B (CPU)",
 		Description: "LFM3 1.73B on CPU via llama.cpp (LFM3-1.7B-Q4_K_M.gguf). Sandbox inputs: text. Sandbox outputs: text. GPU is not required.",
 		CPU:         1, MemoryGiB: 4, DiskGiB: 10, Rate: "0.05",
-		Image: lfm31_7bRepo + ":" + lfm31_7bTag, Live: true, Sealed: sealedPending,
+		Image: pinnedImage(lfm31_7bRepo, lfm31_7bDigest), Live: true, Sealed: sealedPending,
 	},
 	{
 		Name: "lfm3-1.7b-base", DisplayName: "LFM3 1.7B Base (CPU)",
@@ -117,8 +116,7 @@ var catalogTemplates = []catalogTemplate{
 }
 
 // pinnedImage is repository@sha256:hex. The hotel image grammar is a tag or a
-// digest, not both. Live model templates should use this once the published
-// digest is known.
+// digest, not both. Live model templates use this for the published digest.
 func pinnedImage(repo, digest string) string {
 	if !digestPin.MatchString(digest) {
 		panic("catalog image digest must be sha256: and 64 lowercase hex digits")
