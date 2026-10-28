@@ -909,6 +909,10 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
 	}
+	if e := applyCatalogTemplate(payload); e != nil {
+		writeErr(w, e.status, e.code, e.msg)
+		return
+	}
 	// Same rule as the compat path: a create that names no network fails
 	// closed. Without this the hotel's own default (internet) applies.
 	if v, ok := payload["network"]; !ok || v == nil || v == "" {
@@ -1861,6 +1865,8 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 		switch {
 		case p == "/v1/sandboxes" && r.Method == "POST":
 			b.handleCreate(w, r, g)
+		case p == "/v1/sandboxes/catalog" && r.Method == "GET":
+			b.compatCatalog(w, g)
 		case p == "/v1/sandboxes" && r.Method == "GET":
 			b.handleList(w, r, g)
 		case p == "/v1/sandboxes" && r.Method == "DELETE":

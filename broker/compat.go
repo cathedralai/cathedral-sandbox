@@ -238,15 +238,8 @@ func (b *broker) serveCompat(w http.ResponseWriter, r *http.Request, g *guestSta
 	}
 }
 
-// compatTemplates are the catalog templates: name -> {vcpu, memory GiB}.
-var compatTemplates = map[string][2]int{"room-1x4": {1, 4}, "room-2x8": {2, 8}, "room-4x16": {4, 16}}
-
 func (b *broker) compatCatalog(w http.ResponseWriter, g *guestState) {
 	free := b.freeRoomsFor(g)
-	tpl := func(name string, cpu, mem int, rate string) map[string]any {
-		return map[string]any{"name": name, "resources": map[string]any{"cpu": cpu, "memory_gib": mem}, "hourly_rate_usd": rate,
-			"network_modes": []string{"internet", "deny_all", "allowlist"}}
-	}
 	writeJSON(w, 200, map[string]any{
 		// Each hotel enforces the room policy outside the room (nftables,
 		// a hotel DNS resolver and an SNI/HTTP egress proxy) and can switch
@@ -256,7 +249,7 @@ func (b *broker) compatCatalog(w http.ResponseWriter, g *guestState) {
 			"ipv4_cidrs": true, "ipv6": false, "hostname_ports": []int{80, 443}},
 		"available": free > 0, "free_rooms": free, "max_lifetime_seconds": 23 * 3600, "cleanup_margin_seconds": 0,
 		"exec_output_limit_bytes": 16 << 20, "max_exec_seconds": b.maxExec(),
-		"templates": []any{tpl("room-1x4", 1, 4, "0.05"), tpl("room-2x8", 2, 8, "0.10"), tpl("room-4x16", 4, 16, "0.20")},
+		"templates": catalogTemplateViews(),
 	})
 }
 
@@ -344,6 +337,10 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		compatErr(w, 400, "invalid_json", "request body is not JSON", 0)
 		return
 	}
+	if e := applyCatalogTemplate(req); e != nil {
+		compatErr(w, e.status, e.code, e.msg, 0)
+		return
+	}
 	native := map[string]any{"labels": req["labels"]}
 	res := map[string]any{"vcpu": 1, "memory_gib": 4, "disk_gib": 10}
 	var pl placement
@@ -373,16 +370,14 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		res = map[string]any{"vcpu": img.CPU, "memory_gib": img.MemoryGiB, "disk_gib": img.DiskGiB}
 	} else if ref, _ := req["image"].(string); ref != "" {
 		native["image"] = ref
-	} else if t, _ := req["template"].(string); t != "" {
-		// Only the catalog templates map to the base image. An unknown name
-		// is an error, never a silent base-image room.
-		size, ok := compatTemplates[t]
-		if !ok {
-			compatErr(w, 404, "template_not_found", "no template "+t+"; see /v1/sandboxes/catalog", 0)
-			return
+		if r, ok := req["resources"].(map[string]any); ok && r != nil {
+			res = r
 		}
-		native["image"] = "alpine:3.20"
-		res = map[string]any{"vcpu": size[0], "memory_gib": size[1], "disk_gib": 10}
+	} else if t, _ := req["template"].(string); t != "" {
+		// applyCatalogTemplate already mapped a known template to image.
+		// An unknown name is an error, never a silent base-image room.
+		compatErr(w, 404, "template_not_found", "no template "+t+"; see /v1/sandboxes/catalog", 0)
+		return
 	} else {
 		compatErr(w, 400, "invalid_source", "image_id is required", 0)
 		return
