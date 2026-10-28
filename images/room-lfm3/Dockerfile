@@ -41,11 +41,18 @@ RUN cmake -S /src -B /build -DCMAKE_BUILD_TYPE=Release \
       -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
     && cmake --build /build --target llama-cli -j"$(nproc)"
 
+# The sapphirerapids variant uses Intel AMX. A CPU that reports AMX but does
+# not let the process enable it (a container, a sandbox) kills llama-cli with
+# SIGILL as soon as that variant wins the pick, so it is not shipped. The
+# decode speed of a 1.7B Q4 model is memory bound and does not need AMX; the
+# AVX-512 variants below it run on the same hosts. Measured on a GitHub runner
+# (Xeon Platinum 8573C): sapphirerapids exits 132, every other variant works.
 # A build that lost its CPU variants would still link and then run on the
 # slowest fallback, so fail here if the variants a Genoa host picks are absent.
 RUN mkdir -p /opt/llama/bin /opt/lfm3/licenses \
     && cp -a /build/bin/llama-cli /build/bin/*.so* /opt/llama/bin/ \
     && cp /src/LICENSE /opt/lfm3/licenses/llama.cpp-LICENSE \
+    && rm -f /opt/llama/bin/libggml-cpu-sapphirerapids.so \
     && ls /opt/llama/bin/libggml-cpu*.so \
     && if [ "$(uname -m)" = x86_64 ]; then \
          test -e /opt/llama/bin/libggml-cpu-haswell.so && test -e /opt/llama/bin/libggml-cpu-zen4.so; \
