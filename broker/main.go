@@ -668,7 +668,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 
 		// The hotel does not stop a create when the guest goes away. Keep the
 		// call open, so the broker learns the room id and can delete the room.
-		status, hdr, out, err := h.do(context.WithoutCancel(ctx), "POST", "/v1/sandboxes", nil, body, hotelCreateTimeout)
+		status, hdr, out, err := h.doHeaders(context.WithoutCancel(ctx), h.cfg.API, "POST", "/v1/sandboxes", nil, body, hotelCreateTimeout, ownerHeadersFrom(ctx))
 		<-h.sem
 		tDone := time.Now()
 
@@ -774,7 +774,10 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			// cannot reach the registry (DNS, network, rate limit, disk) is
 			// at fault and must rest so the create moves on.
 			guestImage := status == 502 && errCodeOf(out) == "image_pull_failed" && guestImageFault(out)
-			if err != nil || (status >= 500 && !guestImage) || status == 401 || status == 403 {
+			// A dedicated machine refusing a create the owner did not sign
+			// (owner_signature_*) is the guest's error, not a broken hotel.
+			ownerRefused := status == 403 && strings.HasPrefix(errCodeOf(out), "owner_signature_")
+			if err != nil || (status >= 500 && !guestImage) || status == 401 || (status == 403 && !ownerRefused) {
 				h.failed++
 				h.backoffUntil = time.Now().Add(hotelFailBackoff)
 			}
@@ -993,7 +996,7 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeLimitErr(w, e, retry)
 		return
 	}
-	results := b.createMany(r.Context(), g, payload, count, tRecv, pl)
+	results := b.createMany(withOwnerHeaders(r.Context(), r), g, payload, count, tRecv, pl)
 	if count == 1 {
 		b.finishCreate(w, results[0], tRecv)
 		return
