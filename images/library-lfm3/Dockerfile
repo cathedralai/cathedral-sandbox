@@ -75,15 +75,22 @@ RUN apt-get update \
 # TextArena (Wordle) downloads two NLTK packages every time it starts, which
 # fails with network deny_all. TEXTARENA_OFFLINE=1 bakes them into
 # /usr/share/nltk_data and marks them present, so the environment starts
-# sealed. The build fails if the module no longer has that flag.
+# sealed. The image carries the package in two virtualenvs (/app/.venv and
+# /app/env/.venv; the server runs from the second), so every copy is patched.
+# The build fails if no copy has the flag or one is left unpatched.
 ARG TEXTARENA_OFFLINE=""
 RUN if [ "${TEXTARENA_OFFLINE}" = 1 ]; then \
       python -m nltk.downloader --quiet --exit-on-error -d /usr/share/nltk_data words averaged_perceptron_tagger_eng \
-      && module="$(python -c 'import textarena_env.server.environment as m; print(m.__file__)')" \
-      && grep -Eq '^_NLTK_DOWNLOADED(: bool)? = False$' "$module" \
-      && sed -i -E 's/^(_NLTK_DOWNLOADED(: bool)?) = False$/\1 = True/' "$module" \
-      && rm -f "$(dirname "$module")"/__pycache__/environment.*.pyc \
-      && python -c 'import nltk, textarena_env.server.environment as m; assert m._NLTK_DOWNLOADED; nltk.data.find("corpora/words"); nltk.data.find("taggers/averaged_perceptron_tagger_eng")'; \
+      && python -c 'import nltk; nltk.data.find("corpora/words"); nltk.data.find("taggers/averaged_perceptron_tagger_eng")' \
+      && modules="$(find / -xdev -path '*/site-packages/textarena_env/server/environment.py' 2>/dev/null)" \
+      && test -n "$modules" \
+      && for module in $modules; do \
+           grep -Eq '^_NLTK_DOWNLOADED(: bool)? = False$' "$module" || exit 1; \
+           sed -i -E 's/^(_NLTK_DOWNLOADED(: bool)?) = False$/\1 = True/' "$module"; \
+           rm -f "$(dirname "$module")"/__pycache__/environment.*.pyc; \
+           echo "patched $module"; \
+         done \
+      && ! grep -lE '^_NLTK_DOWNLOADED(: bool)? = False$' $modules; \
     fi
 
 COPY --from=build /opt/llama /opt/llama
