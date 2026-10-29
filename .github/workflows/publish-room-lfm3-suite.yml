@@ -1,0 +1,345 @@
+name: Publish room LFM3 suite images
+
+# Builds images/room-lfm3-suite once per model of the Liquid AI LFM3 suite
+# (llama.cpp b11960, CPU only, weights baked in) and pushes
+# ghcr.io/cathedralai/room-<model>:sha-<commit>. Each job smoke tests the
+# published digest the way a sealed room runs it (network none, 2 CPUs,
+# 4 GiB) and prints the digest launch pin in its summary.
+
+on:
+  push:
+    branches:
+      - main
+      - feature/room-lfm3-suite
+    paths:
+      - .github/workflows/publish-room-lfm3-suite.yml
+      - images/room-lfm3-suite/**
+      # Pins and proof numbers go in the README after a run; no rebuild.
+      - "!images/room-lfm3-suite/README.md"
+  workflow_dispatch:
+    inputs:
+      image_refs:
+        description: Space-separated image@sha256 refs to check for anonymous pull after GHCR visibility is public
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  publish:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # No official GGUF: converted from Liquid AI's safetensors and
+          # quantized in the build (see the Dockerfile).
+          - name: lfm3-1.7b-base
+            display: LFM3-1.7B-Base
+            kind: chat
+            checks: raw text
+            weights: convert
+            hf_repo: LiquidAI/LFM3-1.7B-Base
+            hf_revision: 545fc8f4c7b5fa9f405105274cd29c4f8f44b526
+            gguf: LFM3-1.7B-Base-Q4_K_M.gguf
+            license_sha256: 4d28ca14dedc0b3d0fcc2b3339f0e79931faa33874f3d24f522183a8fc70068c
+            convert_files: >-
+              config.json:8c6ae8b8f6d88c87cfb98cf4b5e34e943d0ee07e24215c4121b3159a46e1399d
+              generation_config.json:422ed8749f8849f763ffe836a709a2c58e1adcf3d32dfa4da48b3959e87ecce9
+              special_tokens_map.json:7946f864cbfb62a1b041bda937244210a1a87f4a6cab3a48b791131b2cd57f88
+              tokenizer_config.json:bf028f813efc6137bc07ed045cafe71820df9a5e26a38e39954706ed1e30a457
+              chat_template.jinja:f45005c50cd2a97329722bf3a2dee9f16c04cdf825a589b280fb7e99e6827818
+              tokenizer.json:7e226e34bface23ccf6e495d157bf77186c1c30a7659880e1a8994db528c3701
+              model.safetensors:61a3f541d65b03a2180d08964bf0d55e349463a2706032814d455ae046bc8b59
+          - name: lfm3-vl-2b
+            display: LFM3-VL-2B
+            kind: chat
+            checks: text image
+            weights: download
+            hf_repo: LiquidAI/LFM3-VL-2B-GGUF
+            hf_revision: b36554cfd35854b06429900131730cd80f092cdb
+            gguf: LFM3-VL-2B-Q4_K_M.gguf
+            gguf_sha256: 56dac2e192ff0d9ab8507f4f1aeb4aed0463449bbbefaac79497f041c95f21eb
+            mmproj: mmproj-LFM3-VL-2B-Q8_0.gguf
+            mmproj_sha256: c5c5b58d544a18da919172d2d0368090ea1a4a351b6feb7f8a326a264a5918ab
+            license_sha256: 30adf9d6478191fb87f2424f63ba0728598335aaf99cd2848ef17e8e545fe94b
+          - name: lfm3-audio-2b
+            display: LFM3-Audio-2B
+            kind: chat
+            checks: text audio
+            weights: download
+            hf_repo: LiquidAI/LFM3-Audio-2B-GGUF
+            hf_revision: 642697a5597a675cb819ed236ac415c1e60a4f6f
+            gguf: LFM3-Audio-2B-Q4_K_M.gguf
+            gguf_sha256: 9a773289bd321ed879cd3a76545f6aca506e403851a45fb315420aee45625be2
+            mmproj: mmproj-LFM3-Audio-2B-Q8_0.gguf
+            mmproj_sha256: 26601e904245a85bd8f3cf320a629e897cfc01c1d09369e8b4fd951f13024d3e
+            license_sha256: 4d28ca14dedc0b3d0fcc2b3339f0e79931faa33874f3d24f522183a8fc70068c
+          - name: lfm3-omni-2b
+            display: LFM3-Omni-2B
+            kind: chat
+            checks: text image audio
+            weights: download
+            hf_repo: LiquidAI/LFM3-Omni-2B-GGUF
+            hf_revision: 2918dd47cfceb4f260cd1734cd1aac1b22bbe4b6
+            gguf: LFM3-Omni-2B-Q4_K_M.gguf
+            gguf_sha256: 9f8d30e9d4fd7a9349d586e077988229b3ca0a0e4ad730897563d1eccc9893e2
+            mmproj: mmproj-LFM3-Omni-2B-Q8_0.gguf
+            mmproj_sha256: 720ff4fc09df0e026c4ec641d0c698bf27b5bcd50561944c88eda5e3dffe1839
+            license_sha256: 4d28ca14dedc0b3d0fcc2b3339f0e79931faa33874f3d24f522183a8fc70068c
+          # d1 decides in one forward pass; Liquid AI's llama.cpp example
+          # uses Q8_0, the only quant d1-Omni-2B ships.
+          - name: d1-2b
+            display: d1-2B
+            kind: decision
+            checks: decide-text decide-image
+            weights: download
+            hf_repo: LiquidAI/d1-2B-GGUF
+            hf_revision: e968f6575f0d4fad928312d7af15cad90fd365c0
+            gguf: d1-2B-Q8_0.gguf
+            gguf_sha256: 073313d92b53b0ac8193db6e906cb3c78a98183d244b15b7b8f5426115c6738c
+            mmproj: mmproj-d1-2B-Q8_0.gguf
+            mmproj_sha256: 62cc6d74fd1e5b1d6b48518566bf4c0cfd2468079a0c096ea323b74eed01e0d1
+            license_sha256: 4d28ca14dedc0b3d0fcc2b3339f0e79931faa33874f3d24f522183a8fc70068c
+          - name: d1-omni-2b
+            display: d1-Omni-2B
+            kind: decision
+            checks: decide-text decide-image decide-audio
+            weights: download
+            hf_repo: LiquidAI/d1-Omni-2B-GGUF
+            hf_revision: c53ae0b1f92b17065e9158d34019c9ca1ea5bcf8
+            gguf: d1-Omni-2B-Q8_0.gguf
+            gguf_sha256: aedf1a7c341b4281979423dbc39e9c3d3ad1da8834156c8e75af5399ca3b0861
+            mmproj: mmproj-d1-Omni-2B-Q8_0.gguf
+            mmproj_sha256: 31778160ac0ec70f9b59f296aa1c8e70cbd1eb7e3a3ff873d695aaa4c7b8d674
+            license_sha256: 4d28ca14dedc0b3d0fcc2b3339f0e79931faa33874f3d24f522183a8fc70068c
+    concurrency:
+      group: room-lfm3-suite-${{ matrix.name }}-${{ github.sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      IMAGE_PATH: ghcr.io/cathedralai/room-${{ matrix.name }}
+    steps:
+      - name: Check out the reviewed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the immutable source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      # The conversion holds the safetensors, a BF16 GGUF and the quantized
+      # GGUF at once; the build, the pushed image and the smoke pull all land
+      # on this runner.
+      - name: Free runner disk
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          version: v0.36.1
+          driver-opts: >-
+            image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve the commit tag
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_ref="${IMAGE_PATH}:sha-${GITHUB_SHA}"
+          echo "tag_ref=${tag_ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to overwrite the commit tag
+        shell: bash
+        env:
+          TAG_REF: ${{ steps.image.outputs.tag_ref }}
+        run: |
+          set -euo pipefail
+          set +e
+          inspection="$(docker buildx imagetools inspect "$TAG_REF" 2>&1)"
+          inspection_status=$?
+          set -e
+          if [[ $inspection_status -eq 0 ]]; then
+            echo "::error::Immutable image tag already exists: $TAG_REF"
+            exit 1
+          fi
+          if grep -Eiq 'manifest unknown|not found|denied' <<< "$inspection"; then
+            exit 0
+          fi
+          echo "::error::Could not prove the immutable image tag is unused"
+          printf '%s\n' "$inspection"
+          exit 1
+
+      - name: Build and publish linux/amd64 image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ./images/room-lfm3-suite
+          file: ./images/room-lfm3-suite/Dockerfile
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: ${{ steps.image.outputs.tag_ref }}
+          build-args: |
+            WEIGHTS=${{ matrix.weights }}
+            MODEL_NAME=${{ matrix.name }}
+            DISPLAY_NAME=${{ matrix.display }}
+            LFM3_KIND=${{ matrix.kind }}
+            LFM3_CHECKS=${{ matrix.checks }}
+            HF_REPO=${{ matrix.hf_repo }}
+            HF_REVISION=${{ matrix.hf_revision }}
+            GGUF=${{ matrix.gguf }}
+            GGUF_SHA256=${{ matrix.gguf_sha256 }}
+            MMPROJ=${{ matrix.mmproj }}
+            MMPROJ_SHA256=${{ matrix.mmproj_sha256 }}
+            LICENSE_SHA256=${{ matrix.license_sha256 }}
+            CONVERT_FILES=${{ matrix.convert_files }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          provenance: mode=max
+
+      - name: Capture the digest launch pin
+        id: pin
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG_REF: ${{ steps.image.outputs.tag_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          image_ref="${IMAGE_PATH}@${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image_ref=${image_ref}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### ${{ matrix.display }}"
+            echo
+            echo "Commit tag: \`${TAG_REF}\`"
+            echo
+            echo "Pin: \`${image_ref}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Run the published digest the way a sealed room does: network none,
+      # 2 CPUs, 4 GiB and the keepalive command. The model must answer its
+      # self test (the bundled picture and clip for VL, Audio and Omni) and
+      # the endpoint contract must hold.
+      - name: Smoke test the published digest
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.pin.outputs.image_ref }}
+          KIND: ${{ matrix.kind }}
+        run: |
+          set -euo pipefail
+          docker pull --quiet "$IMAGE_REF"
+          size="$(docker image inspect --format '{{.Size}}' "$IMAGE_REF" | awk '{ printf "%.2f GB", $1 / 1e9 }')"
+          docker run -d --name smoke --network none --cpus 2 --memory 4g --memory-swap 4g "$IMAGE_REF" sleep infinity
+          trap 'docker rm -f smoke >/dev/null 2>&1 || true' EXIT
+          ready=""
+          for _ in $(seq 1 240); do
+            if docker exec smoke curl -fsS -o /dev/null http://127.0.0.1:8080/health; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ -z "$ready" ]]; then
+            docker exec smoke tail -n 40 /tmp/lfm3/server.log || true
+            echo "::error::the model server did not answer in 240 s"
+            exit 1
+          fi
+          selftest="$(docker exec smoke lfm3-selftest)" || {
+            printf '%s\n' "$selftest"
+            docker exec smoke tail -n 40 /tmp/lfm3/server.log || true
+            exit 1
+          }
+          printf '%s\n' "$selftest"
+          if [[ "$KIND" == decision ]]; then
+            contract="$(docker exec smoke sh -c 'curl -fsS "$MODEL_BASE_URL/systemone" \
+              -H "Content-Type: application/json" -H "Authorization: Bearer $MODEL_API_KEY" \
+              -d "{\"state\": \"Order 1182 arrived broken, I want my money back.\", \"questions\": {\"refund\": {\"type\": \"noul\", \"instructions\": \"Is the customer asking for a refund?\"}}}"')"
+            jq -e '.answers.refund.noul > 0.5' <<< "$contract" > /dev/null
+            contract="systemone: $(jq -c '.answers' <<< "$contract")"
+          else
+            chat="$(docker exec smoke sh -c 'curl -fsS "$MODEL_BASE_URL/chat/completions" \
+              -H "Content-Type: application/json" -H "Authorization: Bearer $MODEL_API_KEY" \
+              -d "{\"model\": \"$MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"What is the capital of France? Answer in one word.\"}], \"max_tokens\": 32, \"temperature\": 0}"')"
+            answer="$(jq -r '.choices[0].message.content' <<< "$chat")"
+            grep -Eiq 'paris' <<< "$answer"
+            contract="chat/completions: ${answer}"
+          fi
+          printf '%s\n' "$contract"
+          mem="$(docker stats --no-stream --format '{{.MemUsage}}' smoke)"
+          sums="$(docker exec smoke cat /opt/lfm3/SHA256SUMS)"
+          {
+            echo
+            echo "Unpacked size: ${size}. Memory after the checks: ${mem}."
+            echo
+            echo '```'
+            printf '%s\n' "$selftest"
+            printf '%s\n' "$contract"
+            echo
+            printf '%s\n' "$sums"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest the published digest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_PATH }}
+          subject-digest: ${{ steps.pin.outputs.digest }}
+          push-to-registry: true
+
+      - name: Log out of GHCR
+        if: always()
+        shell: bash
+        run: docker logout ghcr.io
+
+  # A sealed hotel pulls with no credentials. Run this with the pins to prove
+  # the packages are public (an owner flips any that come up private).
+  verify-public:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          version: v0.36.1
+          driver-opts: >-
+            image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+
+      - name: Verify anonymous digest access
+        shell: bash
+        env:
+          IMAGE_REFS: ${{ inputs.image_refs }}
+        run: |
+          set -euo pipefail
+          for ref in $IMAGE_REFS; do
+            [[ "$ref" =~ ^ghcr\.io/cathedralai/room-[a-z0-9.-]+@sha256:[0-9a-f]{64}$ ]]
+            docker buildx imagetools inspect "$ref" > /dev/null
+            echo "Anonymous GHCR access passed for \`${ref}\`." >> "$GITHUB_STEP_SUMMARY"
+          done

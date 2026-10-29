@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# lfm3-ask [options] "prompt": one turn with the model this room serves.
+# Prints the answer, then one timing line:
+#   lfm3-timing load_ms=812 prompt_tok_s=118.0 gen_tok_s=52.8 wall_ms=1530 threads=2 max_tokens=256 reasoning=off
+# load_ms is the server's model load, wall_ms this request.
+#
+# The model is the llama-server lfm3-serve starts ($MODEL_BASE_URL), so a
+# question does not load a second copy. lfm3-ask waits for it to load.
+#
+# Options:
+#   --image FILE   add a picture (VL and Omni)
+#   --audio FILE   add an audio clip, WAV or MP3 (Audio and Omni)
+#   --system TEXT  system prompt, for example "Perform ASR in English."
+#   --raw          plain text completion, no chat template (/v1/completions);
+#                  the prompt is sent after the begin-of-text token
+# The prompt may be empty when a picture or a clip is given.
+#
+# Environment:
+#   LFM3_MAX_TOKENS  tokens to generate at most (default 256)
+#   LFM3_WAIT        seconds to wait for the server (default 120)
+#   LFM3_TIMEOUT     seconds for the request (default 600)
+set -euo pipefail
+
+usage() {
+  echo 'usage: lfm3-ask [--image FILE] [--audio FILE] [--system TEXT] [--raw] "prompt"   (or "-" to read stdin)' >&2
+  exit 2
+}
+
+if [ "${LFM3_KIND:-chat}" = decision ]; then
+  echo "lfm3-ask: $MODEL is a decision model; ask it typed questions with lfm3-decide" >&2
+  exit 2
+fi
+
+BASE_URL=${MODEL_BASE_URL:-http://127.0.0.1:8080/v1}
+MAX_TOKENS=${LFM3_MAX_TOKENS:-256}
+LOG=${LFM3_LOG_DIR:-/tmp/lfm3}/server.log
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+echo '[]' >"$work/parts"
+
+system=""
+raw=""
+prompt=""
+have_prompt=""
+media=0
+
+add_part() { # kind file
+  [ -r "$2" ] || { echo "lfm3-ask: cannot read $2" >&2; exit 2; }
+  base64 -w0 "$2" >"$work/b64"
+  case "$1" in
+    image)
+      case "${2,,}" in
+        *.jpg | *.jpeg) mime=image/jpeg ;;
+        *.webp) mime=image/webp ;;
+        *.gif) mime=image/gif ;;
+        *) mime=image/png ;;
+      esac
+      jq --rawfile d "$work/b64" --arg m "$mime" \
+        '. + [{type: "image_url", image_url: {url: ("data:" + $m + ";base64," + $d)}}]' \
+        "$work/parts" >"$work/parts.new"
+      ;;
+    audio)
+      case "${2,,}" in
+        *.mp3) format=mp3 ;;
+        *) format=wav ;;
+      esac
+      jq --rawfile d "$work/b64" --arg f "$format" \
+        '. + [{type: "input_audio", input_audio: {data: $d, format: $f}}]' \
+        "$work/parts" >"$work/parts.new"
+      ;;
+  esac
+  mv "$work/parts.new" "$work/parts"
+  media=$((media + 1))
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h | --help) usage ;;
+    --image | --audio)
+      [ "$#" -ge 2 ] || usage
+      add_part "${1#--}" "$2"
+      shift 2
+      ;;
+    --system)
+      [ "$#" -ge 2 ] || usage
+      system=$2
+      shift 2
+      ;;
+    --raw)
+      raw=1
+      shift
+      ;;
+    -)
+      prompt=$(cat)
+      have_prompt=1
+      shift
+      ;;
+    *)
+      prompt="$*"
+      have_prompt=1
+      break
+      ;;
+  esac
+done
+if [ -z "$prompt" ] && [ "$media" -eq 0 ]; then
+  usage
+fi
+if [ -n "$raw" ] && { [ "$media" -gt 0 ] || [ -n "$system" ] || [ -z "$have_prompt" ]; }; then
+  echo "lfm3-ask: --raw takes a prompt only" >&2
+  exit 2
+fi
+
+ready=""
+for _ in $(seq 1 "${LFM3_WAIT:-120}"); do
+  if curl -fsS -o /dev/null "${BASE_URL%/v1}/health" 2>/dev/null; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+if [ -z "$ready" ]; then
+  echo "lfm3-ask: the model server at $BASE_URL is not up (log: $LOG)" >&2
+  exit 1
+fi
+
+if [ -n "$raw" ]; then
+  path=completions
+  # The server adds no begin-of-text token (the GGUF says add_bos_token
+  # false; the chat template writes it). A plain prompt needs it: without it
+  # LFM3 repeats itself.
+  jq -n --arg model "$MODEL" --arg p "<|startoftext|>$prompt" --argjson n "$MAX_TOKENS" \
+    '{model: $model, prompt: $p, max_tokens: $n, temperature: 0}' >"$work/body"
+else
+  path=chat/completions
+  jq -n --arg model "$MODEL" --arg p "$prompt" --arg sys "$system" --argjson n "$MAX_TOKENS" \
+    --slurpfile parts "$work/parts" '
+    ($parts[0] + (if $p == "" then [] else [{type: "text", text: $p}] end)) as $content
+    | {
+        model: $model,
+        messages: ((if $sys == "" then [] else [{role: "system", content: $sys}] end)
+                   + [{role: "user", content: (if ($parts[0] | length) == 0 then $p else $content end)}]),
+        max_tokens: $n,
+        temperature: 0
+      }' >"$work/body"
+fi
+
+start_ns=$(date +%s%N)
+status=0
+curl -sS --max-time "${LFM3_TIMEOUT:-600}" -o "$work/out" -w '%{http_code}' \
+  -H 'Content-Type: application/json' -H "Authorization: Bearer ${MODEL_API_KEY:-local}" \
+  --data-binary @"$work/body" "$BASE_URL/$path" >"$work/code" || status=$?
+wall_ms=$(( ($(date +%s%N) - start_ns) / 1000000 ))
+code=$(cat "$work/code" 2>/dev/null || true)
+if [ "$status" -ne 0 ] || [ "$code" != 200 ]; then
+  head -c 2000 "$work/out" >&2 2>/dev/null || true
+  echo >&2
+  echo "lfm3-ask: $BASE_URL/$path answered ${code:-nothing} (curl exit $status)" >&2
+  exit 1
+fi
+
+if [ -n "$raw" ]; then
+  jq -r '.choices[0].text' "$work/out"
+else
+  jq -r '.choices[0].message.content' "$work/out"
+fi
+
+# Server log lines start with M.SS.mmm.uuu (elapsed since the server started).
+load_ms=unknown
+if [ -r "$LOG" ]; then
+  load_ms=$(awk '
+    function ms(t,   p) { split(t, p, "."); return (p[1] * 60 + p[2]) * 1000 + p[3] + p[4] / 1000 }
+    /load_model: loading model/ { a = ms($1) }
+    /server_run_i: model loaded/ { b = ms($1) }
+    END { if (a != "" && b != "") printf "%d", b - a + 0.5; else printf "unknown" }
+  ' "$LOG")
+fi
+rates=$(jq -r '[.timings.prompt_per_second, .timings.predicted_per_second]
+  | map(if . == null then "unknown" else (. * 10 | round / 10 | tostring) end) | join(" ")' "$work/out")
+echo "lfm3-timing load_ms=$load_ms prompt_tok_s=${rates% *} gen_tok_s=${rates#* } wall_ms=$wall_ms threads=${LFM3_THREADS:-$(nproc)} max_tokens=$MAX_TOKENS reasoning=${LFM3_REASONING:-off}"
