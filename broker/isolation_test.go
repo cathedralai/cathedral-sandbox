@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 )
 
@@ -131,5 +132,71 @@ func TestNativeCreateWithoutNetworkIsDenyAll(t *testing.T) {
 	}
 	if net, _ := tc.lastCreate(t)["network"].(map[string]any); net["mode"] != "internet" {
 		t.Fatalf("explicit internet became %v", net)
+	}
+}
+
+// room_runtime falls back to the runtime the hotel reports in /room/health,
+// because the hotel's room documents carry none.
+func TestRoomRuntimeFromHotelHealth(t *testing.T) {
+	tc := limitedChain(t, guestLimits{DefaultSealed: true}) // hotel a sealed
+	tc.hotels["a"].healthRuntime = "runsc"
+	tc.b.syncHotel(context.Background(), tc.b.hotelByID("a"))
+	runtimeOf := func(t *testing.T, where string, doc map[string]any) string {
+		t.Helper()
+		iso, _ := doc["isolation"].(map[string]any)
+		rt, _ := iso["room_runtime"].(string)
+		return rt
+	}
+	want := func(t *testing.T, where string, doc map[string]any, rt string) {
+		t.Helper()
+		if got := runtimeOf(t, where, doc); got != rt {
+			t.Fatalf("%s: room_runtime=%q want %q (%v)", where, got, rt, doc)
+		}
+	}
+
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"})
+	if status != 202 {
+		t.Fatalf("create: %d %v", status, doc)
+	}
+	want(t, "native create", doc, "runsc")
+	sid, _ := doc["id"].(string)
+	_, got := tc.call(t, "key1", "GET", "/v1/sandboxes/"+sid, nil)
+	want(t, "native get", got, "runsc")
+	_, list := tc.call(t, "key1", "GET", "/v1/sandboxes", nil)
+	for _, r := range list["sandboxes"].([]any) {
+		d := r.(map[string]any)
+		if d["hotel"] == "a" {
+			want(t, "native list", d, "runsc")
+		}
+	}
+	// Compat create and get (hotel a is chosen by the sealed default).
+	status, cdoc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}}), nil)
+	if status != 201 {
+		t.Fatalf("compat create: %d %v", status, cdoc)
+	}
+	want(t, "compat create", cdoc, "runsc")
+	cid, _ := cdoc["id"].(string)
+	_, cget := tc.clientCall(t, "GET", "/v1/sandboxes/"+cid, nil, nil)
+	want(t, "compat get", cget, "runsc")
+
+	// A hotel that reports no runtime stays unknown.
+	status, plain := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "sealed": false})
+	if status != 202 {
+		t.Fatalf("plain create: %d %v", status, plain)
+	}
+	want(t, "hotel without runtime", plain, "unknown")
+
+	// A failed health fetch keeps the last known value.
+	tc.hotels["a"].mu.Lock()
+	tc.hotels["a"].healthFail = true
+	tc.hotels["a"].mu.Unlock()
+	tc.b.syncHotel(context.Background(), tc.b.hotelByID("a"))
+	_, got = tc.call(t, "key1", "GET", "/v1/sandboxes/"+sid, nil)
+	want(t, "get after failed health", got, "runsc")
+
+	// A room document's own runtime wins.
+	h := tc.b.hotelByID("a")
+	if rt := isolationDoc(h, map[string]any{"runtime": "kata"})["room_runtime"]; rt != "kata" {
+		t.Fatalf("room document runtime lost to health: %v", rt)
 	}
 }
