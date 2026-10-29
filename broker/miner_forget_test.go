@@ -8,10 +8,12 @@ import (
 	"crypto/x509"
 	"math/big"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -25,13 +27,21 @@ type rebootingGuest struct {
 	srv  *httptest.Server
 	mu   sync.Mutex
 	cert *tls.Certificate
+	// healthStatus, when set, is what /room/health answers instead of 200.
+	healthStatus atomic.Int32
 }
 
 func newRebootingGuest(t *testing.T, id string) *rebootingGuest {
 	t.Helper()
 	g := &rebootingGuest{minerHotel: &minerHotel{fakeHotel: &fakeHotel{t: t, snaps: map[string]map[string]any{}}}, chip: chipOf(id)}
 	g.slots.Store(4)
-	g.srv = httptest.NewUnstartedServer(g.minerHotel)
+	g.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if code := g.healthStatus.Load(); code != 0 && r.URL.Path == "/room/health" {
+			w.WriteHeader(int(code))
+			return
+		}
+		g.minerHotel.ServeHTTP(w, r)
+	}))
 	// GetConfigForClient runs on every handshake; GetCertificate would not
 	// (httptest fills Certificates, and a client dialing an IP sends no SNI).
 	g.srv.TLS = &tls.Config{GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
@@ -107,6 +117,7 @@ func goDown(t *testing.T, tc *testChain, h *hotel, g *rebootingGuest, ago time.D
 		t.Fatalf("hotel %s still up after its guest rebooted", h.cfg.ID)
 	}
 	h.downSince = h.downSince.Add(-ago)
+	h.lastAnswer.Store(h.downSince.Add(-time.Second).UnixNano()) // its last answer came before it went down
 }
 
 func TestOperatorForgetsTheRoomsOfADeadMinerHotel(t *testing.T) {
@@ -134,6 +145,7 @@ func TestOperatorForgetsTheRoomsOfADeadMinerHotel(t *testing.T) {
 	const clientID = "0f0e0d0c-0b0a-4000-8000-000000000001"
 	tc.b.mu.Lock()
 	h.downSince = h.downSince.Add(-minerForgetDownFor)
+	h.lastAnswer.Store(h.downSince.Add(-time.Second).UnixNano())
 	for _, rm := range h.rooms {
 		rm.uuid = clientID
 		tc.b.byUUID[clientID] = rm
@@ -270,5 +282,66 @@ func TestForgottenRoomsStayDeletedAfterAnImmediateRestart(t *testing.T) {
 	tc2.b.compat.mu.Unlock()
 	if !tomb || tc2.b.hotelByID("m1") != nil {
 		t.Fatalf("after restart: tombstone=%v hotel back=%v", tomb, tc2.b.hotelByID("m1") != nil)
+	}
+}
+
+func TestForgetIsRefusedWhenTheOldGuestAnswersWithAnError(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	g := newRebootingGuest(t, "m1")
+	g.mu.Lock()
+	old := g.cert
+	g.mu.Unlock()
+	h, _, clientID := readyToForget(t, tc, g)
+	// The old guest is back on its attested key, but its health check fails.
+	g.mu.Lock()
+	g.cert = old
+	g.mu.Unlock()
+	g.srv.CloseClientConnections()
+	g.healthStatus.Store(503)
+	if status, doc := tc.call(t, "operator-key", "DELETE", "/v1/broker/hotels/m1?forget_rooms=true", nil); status != 409 || errCode(doc) != "forget_refused" {
+		t.Fatalf("forget of a guest that answers 503 on its attested key: %d %v", status, doc)
+	}
+	roomsIntact(t, tc, h, clientID)
+}
+
+func TestForgetIsRefusedAfterARoomCallWasAnsweredSinceTheHotelWentDown(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	h, _, clientID := readyToForget(t, tc, newRebootingGuest(t, "m1"))
+	h.lastAnswer.Store(time.Now().UnixNano()) // a room call on the pinned key was answered just now
+	if status, doc := tc.call(t, "operator-key", "DELETE", "/v1/broker/hotels/m1?forget_rooms=true", nil); status != 409 || errCode(doc) != "forget_refused" {
+		t.Fatalf("forget after a fresh answer: %d %v", status, doc)
+	}
+	roomsIntact(t, tc, h, clientID)
+}
+
+// An older snapshot must never land after a newer save: one save is held
+// between its snapshot and its write while a newer one starts.
+func TestAnOlderClientStateSaveNeverOverwritesANewerOne(t *testing.T) {
+	dir := t.TempDir()
+	tc := newChainState(t, dir)
+	const clientID = "0f0e0d0c-0b0a-4000-8000-000000000003"
+	held, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	saved := afterStateSnapshot
+	afterStateSnapshot = func() { once.Do(func() { close(held); <-release }) }
+	defer func() { afterStateSnapshot = saved }()
+	errs := make(chan error, 2)
+	go func() { errs <- tc.b.saveCompat() }() // its snapshot has no tombstone
+	<-held
+	tc.b.setTombs(map[string]string{clientID: "m1.sbx_1"}, true)
+	go func() { errs <- tc.b.saveCompat() }() // its snapshot must be the one on disk
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("save: %v", err)
+		}
+	}
+	tc2 := newChainState(t, dir)
+	tc2.b.compat.mu.Lock()
+	_, tomb := tc2.b.compat.tombs[clientID]
+	tc2.b.compat.mu.Unlock()
+	if !tomb {
+		t.Fatal("an older snapshot overwrote the newer save: the tombstone is gone")
 	}
 }

@@ -14,8 +14,9 @@ package main
 //
 // It is one recoverable step, in this order:
 //  1. Check and mark the hotel leaving, so nothing is placed on it.
-//  2. Ask the old guest once more on its pinned key. An answer means it is
-//     alive: refuse, and start the down interval again.
+//  2. Ask the old guest once more on its pinned key. Any answer, whatever
+//     its status, means it is alive: refuse, and start the down interval
+//     again. A room call it answered since it went down refuses too.
 //  3. Write the rooms' tombstones to disk (client-state.json), so their
 //     clients read "deleted" even after a restart.
 //  4. Remove the hotel from hotels.json, as a plain leave does.
@@ -45,6 +46,8 @@ func (b *broker) forgetRefusal(h *hotel, now time.Time) error {
 		return errors.New("drain the hotel first")
 	case h.ok || h.downSince.IsZero():
 		return errors.New("the hotel answers; its rooms are not lost")
+	case time.Unix(0, h.lastAnswer.Load()).After(h.downSince):
+		return errors.New("the hotel answered a room call since it went down; its rooms are not lost")
 	case now.Sub(h.downSince) < minerForgetDownFor:
 		return fmt.Errorf("the hotel has been down %s; wait until %s", now.Sub(h.downSince).Round(time.Second), minerForgetDownFor)
 	case h.creating+h.queued > 0:
@@ -81,12 +84,9 @@ func (b *broker) forgetAndLeave(w http.ResponseWriter, h *hotel, id string) {
 		b.mu.Unlock()
 	}
 
-	// 2. The old guest answers on its attested key: it is alive.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	var hd healthDoc
-	alive := h.getJSON(ctx, h.cfg.Health, "/room/health", nil, &hd) == nil
-	cancel()
-	if alive {
+	// 2. Any answer on the attested key is the old guest, alive: the pinned
+	// TLS handshake proves who answered, whatever the HTTP status.
+	if h.answersOnPin() {
 		b.mu.Lock()
 		h.leaving, h.downSince = false, time.Now()
 		b.mu.Unlock()
@@ -155,6 +155,24 @@ func (b *broker) forgetAndLeave(w http.ResponseWriter, h *hotel, id string) {
 	_ = os.Remove(h.cfg.KeyFile)
 	log.Printf("hotel %s: the operator forgot %d rooms of a dead miner guest and the hotel left", id, n)
 	w.WriteHeader(204)
+}
+
+// answersOnPin reports whether anything answers h's health URL on h's pinned
+// connections. A refused handshake (another key, or no guest) is no answer.
+func (h *hotel) answersOnPin() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", h.cfg.Health+"/room/health", nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Authorization", "Bearer "+h.key)
+	resp, err := h.ctl.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return true
 }
 
 // setTombs adds (on) or removes the deleted tombstones of gone.

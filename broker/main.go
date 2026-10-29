@@ -221,6 +221,7 @@ type broker struct {
 	hset             atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
 	hotelsMu         sync.Mutex               // serialises joins and leaves
 	hotelsMutationMu sync.Mutex               // keeps runtime mutations and their saves in order
+	stateSaveMu      sync.Mutex               // one client-state save at a time, snapshot through rename (state.go)
 	guests           map[string]*guestState
 	capsOnDisk       map[string]map[string]any // probe results read from state_dir at start
 	byKey            map[string]*guestState    // sha256(key) -> guest
