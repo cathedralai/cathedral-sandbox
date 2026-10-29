@@ -9,6 +9,8 @@ import (
 	"math/big"
 	"net"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -176,5 +178,97 @@ func TestRoomsOfALiveMinerHotelCannotBeForgotten(t *testing.T) {
 	tc.b.mu.Unlock()
 	if status, _ := tc.call(t, "key1", "GET", "/v1/sandboxes/"+roomID, nil); used != 1 || status != 200 {
 		t.Fatalf("live room lost: rooms=%d get=%d", used, status)
+	}
+}
+
+// readyToForget joins g as m1 with one room that has a client id, takes the
+// guest down for longer than minerForgetDownFor, and drains the hotel.
+func readyToForget(t *testing.T, tc *testChain, g *rebootingGuest) (*hotel, string, string) {
+	t.Helper()
+	h, roomID := joinWithRoom(t, tc, "m1", g)
+	goDown(t, tc, h, g, minerForgetDownFor+time.Minute)
+	if status, doc := tc.call(t, "enroller-key", "PATCH", "/v1/broker/hotels/m1", map[string]any{"drain": true}); status != 200 {
+		t.Fatalf("drain: %d %v", status, doc)
+	}
+	const clientID = "0f0e0d0c-0b0a-4000-8000-000000000002"
+	tc.b.mu.Lock()
+	for _, rm := range h.rooms {
+		rm.uuid = clientID
+		tc.b.byUUID[clientID] = rm
+	}
+	tc.b.mu.Unlock()
+	return h, roomID, clientID
+}
+
+// roomsIntact fails the test unless h still holds its room, its client id
+// still finds it, and no tombstone was written.
+func roomsIntact(t *testing.T, tc *testChain, h *hotel, clientID string) {
+	t.Helper()
+	tc.b.mu.Lock()
+	used, mapped, leaving := h.used(), tc.b.byUUID[clientID] != nil, h.leaving
+	tc.b.mu.Unlock()
+	tc.b.compat.mu.Lock()
+	_, tomb := tc.b.compat.tombs[clientID]
+	tc.b.compat.mu.Unlock()
+	if used != 1 || !mapped || tomb || leaving || tc.b.hotelByID("m1") != h {
+		t.Fatalf("rooms not intact: rooms=%d mapped=%v tomb=%v leaving=%v hotel=%v", used, mapped, tomb, leaving, tc.b.hotelByID("m1") == h)
+	}
+}
+
+func TestAFailedWriteDuringForgetKeepsEveryRoom(t *testing.T) {
+	forget := "/v1/broker/hotels/m1?forget_rooms=true"
+	for name, blocked := range map[string]string{"hotel list": runtimeHotelsFile + ".tmp", "tombstones": stateFile + ".tmp"} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			tc := newChainState(t, dir)
+			h, _, clientID := readyToForget(t, tc, newRebootingGuest(t, "m1"))
+			if err := os.Mkdir(filepath.Join(dir, blocked), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if status, doc := tc.call(t, "operator-key", "DELETE", forget, nil); status != 500 || errCode(doc) != "state_write_failed" {
+				t.Fatalf("forget with a failed write: %d %v", status, doc)
+			}
+			roomsIntact(t, tc, h, clientID)
+		})
+	}
+}
+
+func TestForgetIsRefusedWhenTheOldGuestAnswersAgain(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	g := newRebootingGuest(t, "m1")
+	g.mu.Lock()
+	old := g.cert
+	g.mu.Unlock()
+	h, _, clientID := readyToForget(t, tc, g)
+	// The old guest comes back on its attested key before the next sync.
+	g.mu.Lock()
+	g.cert = old
+	g.mu.Unlock()
+	g.srv.CloseClientConnections()
+	if status, doc := tc.call(t, "operator-key", "DELETE", "/v1/broker/hotels/m1?forget_rooms=true", nil); status != 409 || errCode(doc) != "forget_refused" {
+		t.Fatalf("forget of a guest that answers: %d %v", status, doc)
+	}
+	roomsIntact(t, tc, h, clientID)
+	tc.b.mu.Lock()
+	down := time.Since(h.downSince)
+	tc.b.mu.Unlock()
+	if down > time.Minute {
+		t.Fatalf("the down interval did not start again: %s", down)
+	}
+}
+
+func TestForgottenRoomsStayDeletedAfterAnImmediateRestart(t *testing.T) {
+	dir := t.TempDir()
+	tc := newChainState(t, dir)
+	_, _, clientID := readyToForget(t, tc, newRebootingGuest(t, "m1"))
+	if status, doc := tc.call(t, "operator-key", "DELETE", "/v1/broker/hotels/m1?forget_rooms=true", nil); status != 204 {
+		t.Fatalf("forget: %d %v", status, doc)
+	}
+	tc2 := newChainState(t, dir) // no save loop tick between the 204 and the restart
+	tc2.b.compat.mu.Lock()
+	_, tomb := tc2.b.compat.tombs[clientID]
+	tc2.b.compat.mu.Unlock()
+	if !tomb || tc2.b.hotelByID("m1") != nil {
+		t.Fatalf("after restart: tombstone=%v hotel back=%v", tomb, tc2.b.hotelByID("m1") != nil)
 	}
 }

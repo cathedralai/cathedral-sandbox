@@ -624,31 +624,19 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller, forget b
 		writeErr(w, 409, "hotel_in_config", "hotel "+id+" is in the config file; remove it there")
 		return
 	}
+	if forget {
+		b.forgetAndLeave(w, h, id)
+		return
+	}
 	// The check and the mark are one step under b.mu: pick holds b.mu, so
 	// no create can be placed on the hotel between "empty" and "gone".
 	b.mu.Lock()
-	var gone map[string]string
-	forgotten := 0
-	if forget {
-		if err := b.forgetRefusal(h, time.Now()); err != nil {
-			b.mu.Unlock()
-			writeErr(w, 409, "forget_refused", err.Error())
-			return
-		}
-		if h.creating+h.queued == 0 { // a create in flight may still answer: no forget yet
-			forgotten = len(h.rooms)
-			gone = b.forgetRooms(h)
-		}
-	}
 	busy := len(h.rooms) + h.creating + h.queued
 	leaving := h.leaving
 	if busy == 0 {
 		h.leaving = true
 	}
 	b.mu.Unlock()
-	if forgotten > 0 {
-		b.tombstoneForgotten(id, gone, forgotten)
-	}
 	if leaving {
 		writeErr(w, 404, "hotel_not_found", "hotel "+id+" is leaving")
 		return
