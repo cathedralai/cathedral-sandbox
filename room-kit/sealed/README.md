@@ -60,7 +60,8 @@ Inside the guest, `sealed-hotel.service` runs at every boot:
 | Debug access | Yes | `cathedral.debug=0/1` in the command line |
 | Files the kit downloads at boot (gVisor, uv, Python, Caddy, the pinned API wheel set) | No, but pinned | The installer refuses a file whose sha256 or sha512 differs from `versions.lock` and `requirements.lock`, which are in the measured initrd |
 | Room images (for example `alpine:3.20`) | No | Pulled at create. The receipt records the image reference and the image id |
-| Hotel API key | No | fw_cfg. It authenticates the broker. The host gives it, so the host can call the API too; each create, exec, process start, network change and delete gets a receipt |
+| Hotel API key | No | Config hotel: fw_cfg. It authenticates the broker. The host gives it, so the host can call the API too; each create, exec, process start, network change and delete gets a receipt. Miner hotel: never from the host (see "Miner hotel") |
+| Miner hotel settings (`ROOM_MINER`, TLS port, install signers) | Yes | In the guest `room.env`, and the HTTPS port rule in the guest firewall; only when `SEALED_MINER=1` |
 | HOST_DATA | No (host chooses it) | It carries the sha256 of `manifest.json`, so a report names the build it claims |
 
 ## What the host cannot do
@@ -73,7 +74,8 @@ Inside the guest, `sealed-hotel.service` runs at every boot:
   the tap link, and the measurement shows it.
 - It cannot change the guest software without changing the measurement.
 
-What the host can do besides availability:
+What the host of a config hotel can do besides availability (a miner hotel
+keeps the key and the traffic from the host; see "Miner hotel"):
 
 - It holds the hotel API key, so it can create rooms, run commands and read
   files through the API. Create, exec, process start, network change, delete
@@ -155,9 +157,162 @@ chain links. It prints the policy timeline of each room
 - After a restart of the receipts service, the broker serves the new
   binding only. Receipts signed under the old one verify only against an
   attestation saved at the time (`verify_receipts.py --save`).
-- Broker to guest traffic is plain HTTP on the tap (see above).
+- Broker to guest traffic is plain HTTP on the tap on a config hotel (see
+  above). A miner hotel serves HTTPS from the guest; the broker pin is still open.
 - The verifier has no minimum TCB and does not pin the AMD ARK by default.
 - The broker's own records (placement, queue) are not signed.
+
+## Miner hotel
+
+A founding-miner hotel (AB#57) runs on a host the miner controls. The host is
+not trusted with the hotel key or with room traffic. `SEALED_MINER=1` in
+`sealed.env` builds a guest that keeps both inside:
+
+```
+SEALED_MINER=1
+SEALED_HOTEL_KEY_INSTALL_SIGNERS="<base64 Ed25519 public key of the control plane install key>"
+SEALED_MINER_TLS_PORT=18443      # guest HTTPS port (measured)
+SEALED_MINER_PUBLIC_PORT=9443    # host port forwarded to it (not measured)
+```
+
+### At boot, inside the guest
+
+1. `guest-boot.sh` does not read a hotel key from fw_cfg. If the host puts
+   one there, the guest logs it and ignores it, and `launch-guest.sh` passes
+   none. The guest makes a guest-internal API key from its own
+   `/dev/urandom`. Only the API, the health service and the reaper inside
+   the guest use it. It never leaves the guest.
+2. The receipts front makes three things in memory: the receipt key (as
+   before), a P-256 TLS key with a self-issued certificate, and an X25519
+   install key. The binding names all three, plus the pinned signers:
+
+   | Binding field | Value |
+   |---|---|
+   | `tls_spki_sha256` | sha256 of the TLS key's DER SubjectPublicKeyInfo |
+   | `hotel_key_install_x25519_b64` | the install key |
+   | `hotel_key_install_signers_ed25519_b64` | the control plane keys from the measured `room.env` |
+   | `hotel_key_source` | `"install"` |
+
+   `REPORT_DATA = sha256(canonical(binding)) || 32 zero bytes`, as before,
+   so the AMD-signed report commits to the TLS key and the install key.
+3. The front serves every route over HTTPS on `SEALED_MINER_TLS_PORT` with
+   that key. Plain HTTP on the tap (`:18090`) serves `GET /room/attestation`
+   only. Anything else gets 403 `https_required`, and its body is not read.
+   No bearer and no room traffic crosses the tap in the clear.
+4. Until a key is installed, every call is 401 and nothing reaches the API.
+   After that the front accepts only the installed key. It puts the
+   guest-internal key on each call it passes to the API. The internal key is
+   not a hotel key on the front.
+
+A new boot, or a restart of the receipts service, makes new keys and a new
+binding. The installed key is in memory only, so it is gone too. The control
+plane treats that as a new boot: drain, then a fresh join with a new key.
+
+### Join (control plane: polariscomputer #1588)
+
+1. The miner signs an offer with `https://<public ip>:<SEALED_MINER_PUBLIC_PORT>`
+   and the `binding_sha256` of this boot.
+2. The control plane fetches `GET /room/attestation` over TLS. The peer SPKI
+   must equal `binding.tls_spki_sha256`. The report must commit to the
+   binding, the AMD chain must verify, and the measurement must be on the
+   published list.
+3. `GET /room/hotel-key-install-key`, over the same pinned TLS. The guest
+   answers `{algorithm, binding_sha256, purpose: "hotel-key-install",
+   x25519_public_b64, signature_b64}`, signed by the binding's receipt key
+   over the canonical four fields.
+4. `POST /room/hotel-key` with:
+
+   ```json
+   {"schema": "cathedral_hotel_key_install_v1", "binding_sha256": "<this boot>",
+    "hotel_id": "miner-<id>", "key_sha256": "<sha256 of the key>", "issued_at": <unix seconds>,
+    "envelope": {"algorithm": "x25519-hkdf-sha256-aes256gcm-v1", "ephemeral_public_b64": "...",
+                 "nonce_b64": "...", "ciphertext_b64": "..."},
+    "signature_b64": "<Ed25519, a pinned signer, over canonical(request without signature_b64)>"}
+   ```
+
+   The envelope uses the Escape plant construction: X25519, then HKDF-SHA256
+   with salt = AAD and info = `cathedral.hotel-key-install.v1` || ephemeral
+   || recipient, then AES-256-GCM. AAD = `hotel-key-install:<binding_sha256>`.
+
+   The guest refuses the request in these cases:
+
+   | Code | Status | Cause |
+   |---|---|---|
+   | `install_fields_invalid` | 400 | The field set is not exact |
+   | `install_signature_invalid` | 403 | No pinned signer verifies the signature |
+   | `install_wrong_binding` | 409 | The request names another boot |
+   | `install_not_fresh` | 409 | `issued_at` is more than 900 s old or more than 300 s ahead |
+   | `install_replayed` | 409 | `issued_at` is not newer than the last install |
+   | `install_envelope_does_not_open` | 400 | Sealed to another key or under another AAD |
+   | `install_key_invalid` | 400 | The key is not 32 to 256 of `[A-Za-z0-9_-]` |
+   | `install_key_digest_mismatch` | 400 | The key's sha256 is not `key_sha256` |
+
+   The exact request that installed the current key answers 200
+   `"unchanged"`, so a retry after a lost answer is safe. A newer install
+   replaces the key at once. The answer is `{key_sha256, hotel_id,
+   issued_at, status}`. A receipt (`hotel_key_install`) records `key_sha256`
+   and the signer, never the key.
+5. The control plane joins the broker with the scoped miner enrollment key
+   (#365) and the per-hotel key. The broker uses that key as the bearer to
+   the guest.
+
+### On the host
+
+`host-net.sh` (run by the unit) adds, in miner mode only:
+
+- a DNAT of `SEALED_MINER_PUBLIC_PORT` on this host's own addresses to the
+  guest's HTTPS port;
+- a FORWARD accept for new connections to that port;
+- the answers on those connections.
+
+Nothing else comes in. The minute timer puts the rules back. The miner must
+also do the following:
+
+- Open the public port in any firewall outside this path: a cloud security
+  group, a router port-forward, or an nftables forward chain with a drop
+  policy.
+- Have a public IPv4 address.
+- Check from the host itself with `https://<guest ip>:<SEALED_MINER_TLS_PORT>`.
+  The host's own connections to its public address are not forwarded.
+
+`install-sealed.sh` cannot count rooms in a running miner guest, because the
+host has no key. A restart needs `SEALED_RESTART_WITH_ROOMS=1`, after the
+control plane drains the hotel.
+
+A debug build (`SEALED_DEBUG_SSH_PUBKEY`) gives the host root in the guest,
+and so the hotel key. The measured command line shows `cathedral.debug=1`,
+and #1588 and `verify_receipts.py` refuse it.
+
+### Verify
+
+```
+python3 verify_receipts.py --origin https://<public ip>:<port> --require-sealed \
+  --expected-measurement <from the build> --ark-sha256 <pin>
+```
+
+This makes one TLS connection to the guest, with no reconnect. It fetches the
+attestation and the install key, and checks:
+
+- that the TLS peer is the key the binding names;
+- that the install key is signed by the binding's receipt key and is the one
+  the binding names;
+- everything a sealed attestation is checked for.
+
+With a saved attestation, use `--tls-spki-sha256 <peer SPKI sha256>`, or
+`--require-tls` to fail a binding that names no TLS key.
+
+### Still open (broker)
+
+- **TLS pin.** The broker must reach miner hotels over HTTPS pinned to the
+  attested `tls_spki_sha256`, check it on every connection, refuse `http://`
+  miner APIs, and re-admit the hotel when the binding changes. Until then,
+  #365 refuses scoped miner joins with `guest_tls_required` before it sends
+  the key.
+- **Admission checks.** For miner hotels, the broker's admission must require
+  `tls_spki_sha256` and `hotel_key_source: "install"`, and pass
+  `--tls-spki-sha256 <peer>` to the `amd_verifier` command.
+- **`admission_policy`.** The broker must report it in operator capacity
+  (#1588 checklist).
 
 ## Remove
 

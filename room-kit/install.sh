@@ -24,6 +24,10 @@ PROFILE_FILE="$KIT/profiles/${API_PROFILE}.sh"
 # ROOM_CUSTOMER names the key's project in CATHEDRAL_SANDBOX_KEYS (key:project:slots).
 # Empty closed the API for its own key; a comma or colon minted a second key.
 [[ "${ROOM_CUSTOMER:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "ROOM_CUSTOMER must be 1 to 64 of [A-Za-z0-9._-] (got '${ROOM_CUSTOMER:-}')" >&2; exit 1; }
+# Miner hotel settings are checked here too, before anything on the host changes.
+# shellcheck disable=SC1091
+source "$KIT/lib/receipts_mode.sh"
+receipts_miner_check
 
 # ROOM_DESTDIR prefixes every host path the installer writes. It is empty on a
 # hotel; the behaviour tests set it to a temporary directory and fake the host.
@@ -110,7 +114,6 @@ write_room_env() {
 # shellcheck disable=SC1091
 source "$KIT/lib/receipts_mode.sh"
 receipts_apply_defaults
-receipts_miner_check
 # Unset ROOM_NETS is auto: one room network per ROOM_NET_SIZE rooms, from the
 # host size in step 8. Until then the resolved file has no room networks.
 # ROOM_NETS=auto is the same. none, off, or empty keeps the main bridge.

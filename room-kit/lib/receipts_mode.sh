@@ -68,7 +68,7 @@ receipts_miner_check() {
     1) ;;
     *) echo "ROOM_MINER must be 0 or 1" >&2; return 1 ;;
   esac
-  if [ "${ROOM_RECEIPTS:-0}" != 1 ]; then
+  if [ "${ROOM_RECEIPTS:-1}" != 1 ]; then  # unset or empty is the default, 1
     echo "ROOM_MINER=1 needs ROOM_RECEIPTS=1: the receipts front holds the hotel key" >&2
     return 1
   fi
