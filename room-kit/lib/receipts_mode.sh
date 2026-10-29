@@ -57,3 +57,24 @@ receipts_api_upstream() {
   esac
   echo "$host:$port"
 }
+
+# Miner hotel (ROOM_MINER=1, sealed/README.md "Miner hotel"). The receipts
+# front serves HTTPS on ROOM_RECEIPTS_TLS_LISTEN with a key it makes at start,
+# and takes the hotel key only from POST /room/hotel-key signed by a key in
+# ROOM_HOTEL_KEY_INSTALL_SIGNERS. It needs receipts on (the front is the gate).
+receipts_miner_check() {
+  case "${ROOM_MINER:-0}" in
+    0) return 0 ;;
+    1) ;;
+    *) echo "ROOM_MINER must be 0 or 1" >&2; return 1 ;;
+  esac
+  if [ "${ROOM_RECEIPTS:-1}" != 1 ]; then  # unset or empty is the default, 1
+    echo "ROOM_MINER=1 needs ROOM_RECEIPTS=1: the receipts front holds the hotel key" >&2
+    return 1
+  fi
+  if [ -z "${ROOM_RECEIPTS_TLS_LISTEN:-}" ] || [ -z "${ROOM_HOTEL_KEY_INSTALL_SIGNERS:-}" ]; then
+    echo "ROOM_MINER=1 needs ROOM_RECEIPTS_TLS_LISTEN and ROOM_HOTEL_KEY_INSTALL_SIGNERS" >&2
+    return 1
+  fi
+  return 0
+}

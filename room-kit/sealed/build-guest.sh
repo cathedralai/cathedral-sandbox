@@ -16,6 +16,26 @@ KIT=$(cd "$(dirname "$0")/.." && pwd)
 source "$(readlink -f "${1:?usage: build-guest.sh sealed.env}")"
 log() { echo "[sealed-build] $*"; }
 
+# Miner hotel (SEALED_MINER=1, README "Miner hotel"): checked before the long
+# build. 0 or unset builds a config hotel; the files below come out as before.
+MINER=${SEALED_MINER:-0}
+case "$MINER" in 0|1) ;; *) echo "SEALED_MINER must be 0 or 1" >&2; exit 1 ;; esac
+if [ "$MINER" = 1 ]; then
+  MINER_TLS_PORT=${SEALED_MINER_TLS_PORT:-18443}
+  if ! [[ "$MINER_TLS_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$MINER_TLS_PORT" -gt 65535 ] \
+     || [ "$MINER_TLS_PORT" = 18090 ] || [ "$MINER_TLS_PORT" = 18091 ]; then
+    echo "SEALED_MINER_TLS_PORT must be a TCP port other than 18090 and 18091" >&2; exit 1
+  fi
+  # 1 to 4 base64 Ed25519 public keys (raw 32 bytes); printed back space-separated.
+  MINER_SIGNERS=$(python3 -c '
+import base64, sys
+keys = sys.argv[1].split()
+ok = 1 <= len(keys) <= 4 and all(len(base64.b64decode(k, validate=True)) == 32
+                                 and base64.b64encode(base64.b64decode(k)).decode() == k for k in keys)
+print(" ".join(dict.fromkeys(keys)) if ok else "")' "${SEALED_HOTEL_KEY_INSTALL_SIGNERS:-}" 2>/dev/null || true)
+  [ -n "$MINER_SIGNERS" ] || { echo "SEALED_MINER=1 needs SEALED_HOTEL_KEY_INSTALL_SIGNERS: 1 to 4 base64 Ed25519 public keys" >&2; exit 1; }
+fi
+
 B=$SEALED_DIR/build
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 OUT=$SEALED_DIR/images/$STAMP
@@ -75,14 +95,21 @@ EOF
 
 DEBUG=0; [ -n "${SEALED_DEBUG_SSH_PUBKEY:-}" ] && DEBUG=1
 # Guest firewall on the uplink: replies, the hotel API from the host, nothing else.
+# A miner hotel adds its attested HTTPS port from any source: the host forwards
+# one public port to it, and only the guest holds that TLS key.
 SSH_RULE=""; [ $DEBUG = 1 ] && SSH_RULE="iifname \"uplink\" ip saddr $SEALED_HOST_IP tcp dport 22 accept"
+INPUT_RULES=$SSH_RULE
+if [ "$MINER" = 1 ]; then
+  INPUT_RULES="${SSH_RULE:+$SSH_RULE
+    }iifname \"uplink\" tcp dport $MINER_TLS_PORT accept"
+fi
 cat > "$R/etc/sealed-guard.nft" <<EOF
 table inet sealed_guard {
   chain input {
     type filter hook input priority -10; policy accept;
     iifname "uplink" ct state established,related accept
     iifname "uplink" ip saddr $SEALED_HOST_IP tcp dport 18090 accept
-    $SSH_RULE
+    $INPUT_RULES
     iifname "uplink" drop
   }
   chain forward {
@@ -189,6 +216,15 @@ ROOM_ESCAPE=${SEALED_ROOM_ESCAPE:-0}
 ROOM_ESCAPE_ALLOW_PLAINTEXT=${SEALED_ROOM_ESCAPE_ALLOW_PLAINTEXT:-0}
 ROOM_HOTEL_NAME=$SEALED_NAME
 EOF
+if [ "$MINER" = 1 ]; then
+  cat >> "$R/opt/room-kit/room.env" <<EOF
+# Miner hotel: guest TLS on its own key, plain HTTP for /room/attestation only,
+# the hotel key only through POST /room/hotel-key signed by one of these keys.
+ROOM_MINER=1
+ROOM_RECEIPTS_TLS_LISTEN=$SEALED_GUEST_IP:$MINER_TLS_PORT
+ROOM_HOTEL_KEY_INSTALL_SIGNERS="$MINER_SIGNERS"
+EOF
+fi
 
 # Units: no logins, no host Docker daemon, no apt timers; the hotel and the guard on.
 in_root() { chroot "$R" "$@"; }
@@ -223,9 +259,10 @@ CMDLINE="console=ttyS0 loglevel=7 systemd.show_status=error panic=-1 rdinit=/ini
 printf '%s' "$CMDLINE" > "$OUT/cmdline"
 install -m 0644 "$SEALED_OVMF" "$OUT/OVMF.amdsev.fd"
 
-python3 - "$OUT" "$SEALED_NAME" "$SEALED_VCPUS" "$SEALED_CPU_MODEL" "$KVER" "$DEBUG" "$BASE_ID" <<'EOF'
+python3 - "$OUT" "$SEALED_NAME" "$SEALED_VCPUS" "$SEALED_CPU_MODEL" "$KVER" "$DEBUG" "$BASE_ID" \
+  "$MINER" "${MINER_TLS_PORT:-}" "${MINER_SIGNERS:-}" <<'EOF'
 import hashlib, json, os, sys
-out, name, vcpus, cpu, kver, debug, base = sys.argv[1:]
+out, name, vcpus, cpu, kver, debug, base, miner, tls_port, signers = sys.argv[1:]
 def sha(p):
     h = hashlib.sha256()
     with open(os.path.join(out, p), "rb") as f:
@@ -237,6 +274,8 @@ m = {"schema": "cathedral_sealed_hotel_guest_v1", "hotel": name, "vcpus": int(vc
      "cmdline": open(os.path.join(out, "cmdline")).read(),
      "sha256": {p: sha(p) for p in ("OVMF.amdsev.fd", "vmlinuz", "initrd.cpio.zst", "cmdline")},
      "bytes": {p: os.path.getsize(os.path.join(out, p)) for p in ("OVMF.amdsev.fd", "vmlinuz", "initrd.cpio.zst")}}
+if miner == "1":  # a config hotel's manifest keeps its old fields only
+    m["miner"] = {"tls_port": int(tls_port), "hotel_key_install_signers_ed25519_b64": signers.split()}
 json.dump(m, open(os.path.join(out, "manifest.json"), "w"), indent=1, sort_keys=True)
 EOF
 ln -sfn "$STAMP" "$SEALED_DIR/images/current"

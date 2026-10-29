@@ -732,8 +732,9 @@ def test_room_net_down_removes_only_tagged_rules_and_room_bridges(host: FakeHost
 
 # ---------------------------------------------------------------- host-net.sh (sealed host link)
 
-def _run_host_net(host: FakeHost, action: str, **env: str) -> subprocess.CompletedProcess[str]:
-    return host.run(host.kit / "sealed" / "host-net.sh", action, str(host.sealed_env()), env=env)
+def _run_host_net(host: FakeHost, action: str, sealed: dict[str, str] | None = None,
+                  **env: str) -> subprocess.CompletedProcess[str]:
+    return host.run(host.kit / "sealed" / "host-net.sh", action, str(host.sealed_env(**(sealed or {}))), env=env)
 
 
 def test_host_net_up_orders_the_guest_rules_and_down_removes_them(host: FakeHost) -> None:
@@ -782,7 +783,8 @@ def test_sealed_install_on_a_host_without_snp_refuses_at_the_first_check(host: F
     assert host.snapshot() == before and not (host.tmp / "sealed").exists()
 
 
-def _sealed_step5(host: FakeHost, measurement: str, expected: str = "ab" * 48, prev: bool = True, **env: str):
+def _sealed_step5(host: FakeHost, measurement: str, expected: str = "ab" * 48, prev: bool = True,
+                  sealed: dict[str, str] | None = None, **env: str):
     """Run step 5 of install-sealed.sh (restart guard, attestation, measurement) verbatim.
 
     Steps 1 to 4 need /dev/sev (a builtin test on a device path), the guest
@@ -793,7 +795,7 @@ def _sealed_step5(host: FakeHost, measurement: str, expected: str = "ab" * 48, p
     tail = text[text.index("# ---------------------------------------------------------------- 5. start and check"):]
     script = host.kit / "sealed" / "step5-slice.sh"
     script.write_text(head + 'PREV_IMG=${SLICE_PREV_IMG}\nIMG=${SLICE_IMG}\nEXPECTED=${SLICE_EXPECTED}\n' + tail)
-    sealed_env = host.sealed_env()
+    sealed_env = host.sealed_env(**(sealed or {}))
     sealed = host.tmp / "sealed"
     shutil.rmtree(sealed, ignore_errors=True)
     images = sealed / "images"
@@ -856,3 +858,198 @@ def test_sealed_guest_that_stops_fails_the_install_at_once(host: FakeHost) -> No
     assert proc.returncode == 1
     assert "guest stopped" in proc.stderr
     assert len([c for c in host.calls("curl") if "/room/attestation" in c]) == 1
+
+
+# ---------------------------------------------------------------- miner hotel (SEALED_MINER=1, AB#57)
+
+MINER_SIGNER = "y1i6isO+r0ERjm182z2I25hTk1cmAKtbr57TmEm2mEo="
+MINER = {"SEALED_MINER": "1", "SEALED_HOTEL_KEY_INSTALL_SIGNERS": MINER_SIGNER}
+
+
+def test_host_net_miner_forwards_one_public_port_to_the_guest_https_port(host: FakeHost) -> None:
+    proc = _run_host_net(host, "up", MINER)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    ipt = host.calls("iptables")
+    fwd = [c.split("SEALED-SNP0-FWD ")[1] for c in ipt if c.startswith("iptables -A SEALED-SNP0-FWD ")]
+    assert fwd == [
+        "-i snp0 -s 10.215.0.2 -p tcp --sport 18443 -m conntrack --ctstate ESTABLISHED -j ACCEPT",
+        "-i snp0 -d 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,169.254.0.0/16 -j DROP",
+        "-i snp0 -s 10.215.0.2 -j ACCEPT", "-i snp0 -j DROP",
+        "-o snp0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
+        "-o snp0 -d 10.215.0.2 -p tcp --dport 18443 -m conntrack --ctstate NEW -j ACCEPT",
+        "-o snp0 -j DROP"]
+    dnat = ("iptables -t nat -A PREROUTING -p tcp --dport 9443 -m addrtype --dst-type LOCAL -m comment "
+            "--comment sealed-hotel:sealed-1 -j DNAT --to-destination 10.215.0.2:18443")
+    assert dnat in ipt
+    # The fake lists 5 rules per chain: enough for a config hotel, too few for a miner hotel (7).
+    proc = _run_host_net(host, "check", MINER, FAKE_IPTABLES_RULES="present")
+    assert proc.returncode == 0 and "were missing; restoring" in proc.stderr
+    assert any(c.startswith("iptables -t nat -C PREROUTING -p tcp --dport 9443") for c in host.calls("iptables"))
+    proc = _run_host_net(host, "down", MINER)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert dnat.replace(" -A ", " -D ") in host.calls("iptables")
+
+
+def test_host_net_config_hotel_adds_no_forward(host: FakeHost) -> None:
+    proc = _run_host_net(host, "up")
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert not [c for c in host.calls("iptables") if "PREROUTING" in c or "18443" in c]
+    _run_host_net(host, "down")
+    assert not [c for c in host.calls("iptables") if "PREROUTING" in c]
+
+
+def test_sealed_miner_restart_never_sends_a_key_and_needs_the_override(host: FakeHost) -> None:
+    (host.state / "active-units").write_text("room-sealed-sealed-1.service\n")
+    proc, _ = _sealed_step5(host, "ab" * 48, sealed=MINER)
+    assert proc.returncode == 1
+    assert "miner hotel: the host holds no hotel key" in proc.stderr and "SEALED_RESTART_WITH_ROOMS=1" in proc.stderr
+    assert not host.calls("curl") and "systemctl restart room-sealed-sealed-1.service" not in host.calls("systemctl")
+    (host.state / "active-units").write_text("room-sealed-sealed-1.service\n")
+    proc, _ = _sealed_step5(host, "ab" * 48, sealed=MINER, SEALED_RESTART_WITH_ROOMS="1")
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert "done. miner hotel: HTTPS https://10.215.0.2:18443 (public port 9443)" in proc.stdout
+    assert not [c for c in host.calls("curl") if "Authorization" in c or "/v1/" in c]
+
+
+def test_install_miner_mode_gives_the_receipts_front_its_tls_listen_and_signers(host: FakeHost) -> None:
+    proc = host.install(str(host.room_env(ROOM_MINER="1", ROOM_RECEIPTS_LISTEN="10.215.0.2:18090",
+                                          ROOM_RECEIPTS_TLS_LISTEN="10.215.0.2:18443",
+                                          ROOM_HOTEL_KEY_INSTALL_SIGNERS=MINER_SIGNER)))
+    assert proc.returncode == 0, proc.stdout + proc.stderr[-4000:]
+    unit = host.unit("room-a-receipts.service")
+    assert "Environment=ROOM_MINER=1 ROOM_RECEIPTS_TLS_LISTEN=10.215.0.2:18443\n" in unit
+    assert f'Environment="ROOM_HOTEL_KEY_INSTALL_SIGNERS={MINER_SIGNER}"\n' in unit
+    assert unit.index("ROOM_MINER=1") < unit.index("ExecStart=")
+
+
+def test_install_config_hotel_receipts_unit_is_unchanged(host: FakeHost) -> None:
+    _clean_install(host)
+    unit = host.unit("room-a-receipts.service")
+    assert "ROOM_MINER" not in unit and "ROOM_HOTEL_KEY_INSTALL_SIGNERS" not in unit
+    env_line, exec_line = unit.splitlines()[5:7]
+    assert env_line.startswith("Environment=ROOM_RECEIPTS_LISTEN=") and exec_line.startswith("ExecStart=")
+
+
+@pytest.mark.parametrize("overrides,message", [
+    ({"ROOM_MINER": "1", "ROOM_RECEIPTS_TLS_LISTEN": "10.215.0.2:18443"}, "ROOM_HOTEL_KEY_INSTALL_SIGNERS"),
+    ({"ROOM_MINER": "1", "ROOM_HOTEL_KEY_INSTALL_SIGNERS": MINER_SIGNER}, "ROOM_RECEIPTS_TLS_LISTEN"),
+    ({"ROOM_MINER": "1", "ROOM_RECEIPTS": "0", "ROOM_RECEIPTS_TLS_LISTEN": "x:1",
+      "ROOM_HOTEL_KEY_INSTALL_SIGNERS": MINER_SIGNER}, "needs ROOM_RECEIPTS=1"),
+    ({"ROOM_MINER": "yes"}, "ROOM_MINER must be 0 or 1"),
+])
+def test_install_refuses_an_incomplete_miner_config(host: FakeHost, overrides: dict, message: str) -> None:
+    before = host.snapshot()
+    proc = host.install(str(host.room_env(**overrides)))
+    assert proc.returncode == 1 and message in proc.stderr
+    # Refused with the other config checks, before any host command or write.
+    assert not host.calls("systemctl") and not host.calls("apt-get")
+    assert all(p.is_dir() for p in host.snapshot() - before)
+
+
+# guest-boot.sh step 2 runs inside the guest; the slice runs it against files in a temporary root.
+def _guest_boot_key_step(host: FakeHost, miner: bool, fw_cfg_key: str | None) -> tuple[subprocess.CompletedProcess[str], Path]:
+    text = (host.kit / "sealed" / "guest-boot.sh").read_text()
+    step = text[text.index("KEY=/sys/firmware/qemu_fw_cfg"):text.index('log "installing the room kit"')]
+    root = host.tmp / "guest"
+    (root / "fw").mkdir(parents=True, exist_ok=True)
+    (root / "opt").mkdir(exist_ok=True)
+    fw = root / "fw" / "raw"
+    if fw_cfg_key is not None:
+        fw.write_text(fw_cfg_key)
+    (root / "opt" / "room.env").write_text("ROOM_ID=room-sealed\n" + ("ROOM_MINER=1\n" if miner else ""))
+    step = (step.replace("/sys/firmware/qemu_fw_cfg/by_name/opt/cathedral/room-api-key/raw", str(fw))
+            .replace("/opt/room-kit/room.env", str(root / "opt" / "room.env"))
+            .replace("/run/room-api-key", str(root / "room-api-key")))
+    script = root / "step.sh"
+    script.write_text('set -euo pipefail\nlog() { echo "[sealed-hotel] $*"; }\n' + step)
+    proc = subprocess.run([BASH, str(script)], capture_output=True, text=True, check=False, timeout=60,
+                          env={"PATH": BIN_PATH, "LC_ALL": "C"})
+    return proc, root / "room-api-key"
+
+
+def test_guest_boot_config_hotel_takes_the_fw_cfg_key(host: FakeHost) -> None:
+    proc, key = _guest_boot_key_step(host, miner=False, fw_cfg_key=KEY)
+    assert proc.returncode == 0, proc.stderr
+    assert key.read_text() == KEY and _mode(key) == 0o600
+
+
+def test_guest_boot_miner_hotel_ignores_a_fw_cfg_key_and_makes_its_own(host: FakeHost) -> None:
+    proc, key = _guest_boot_key_step(host, miner=True, fw_cfg_key=KEY)
+    assert proc.returncode == 0, proc.stderr
+    internal = key.read_text()
+    assert internal != KEY and KEY not in internal and re.fullmatch(r"[A-Za-z0-9_-]{43}", internal)
+    assert "a hotel key in fw_cfg is ignored" in proc.stdout and _mode(key) == 0o600
+    proc, key = _guest_boot_key_step(host, miner=True, fw_cfg_key=None)  # no fw_cfg entry: no wait, own key
+    assert proc.returncode == 0 and re.fullmatch(r"[A-Za-z0-9_-]{43}", key.read_text()) and key.read_text() != internal
+
+
+# build-guest.sh section 3 (guest configuration): the guard rules and room.env that go into the measured initrd.
+CONFIG_GUARD = """table inet sealed_guard {
+  chain input {
+    type filter hook input priority -10; policy accept;
+    iifname "uplink" ct state established,related accept
+    iifname "uplink" ip saddr 10.215.0.1 tcp dport 18090 accept
+    @RULES@
+    iifname "uplink" drop
+  }
+  chain forward {
+    type filter hook forward priority -10; policy accept;
+    iifname "uplink" ct state established,related accept
+    iifname "uplink" drop
+  }
+}
+"""
+
+
+def _guest_config(host: FakeHost, debug: bool, **sealed: str) -> tuple[subprocess.CompletedProcess[str], Path]:
+    text = (host.kit / "sealed" / "build-guest.sh").read_text()
+    top = text[text.index('log() { echo "[sealed-build] $*"; }'):text.index("B=$SEALED_DIR/build")]
+    guard = text[text.index("DEBUG=0; [ -n"):text.index('cat > "$R/etc/systemd/system/sealed-guard.service"')]
+    env = text[text.index('cat > "$R/opt/room-kit/room.env" <<EOF'):text.index("# Units: no logins")]
+    root = host.tmp / ("guest-" + "-".join(f"{k}{v}" for k, v in sorted(sealed.items()))[:40] + str(debug))
+    (root / "opt" / "room-kit").mkdir(parents=True)
+    (root / "etc").mkdir()
+    script = root / "slice.sh"
+    script.write_text("set -euo pipefail\n" + top + guard + env)
+    values = {"R": str(root), "SEALED_HOST_IP": "10.215.0.1", "SEALED_GUEST_IP": "10.215.0.2", "SEALED_NAME": "sealed-1",
+              "SEALED_DNS": "1.1.1.1", "SEALED_ROOM_MAX_SLOTS": "1000", "SEALED_ROOM_NETS": "10.214.0.0/22",
+              "SEALED_DEBUG_SSH_PUBKEY": "ssh-ed25519 AAAA debug" if debug else "", **sealed}
+    proc = subprocess.run([BASH, str(script)], capture_output=True, text=True, check=False, timeout=60,
+                          env={"PATH": f"{host.bin}:{BIN_PATH}", "LC_ALL": "C", **values})
+    return proc, root
+
+
+@pytest.mark.parametrize("debug", [False, True])
+def test_build_config_hotel_guard_and_room_env_have_no_miner_lines(host: FakeHost, debug: bool) -> None:
+    proc, root = _guest_config(host, debug)
+    assert proc.returncode == 0, proc.stderr
+    ssh = 'iifname "uplink" ip saddr 10.215.0.1 tcp dport 22 accept' if debug else ""
+    assert (root / "etc" / "sealed-guard.nft").read_text() == CONFIG_GUARD.replace("@RULES@", ssh)
+    env = (root / "opt" / "room-kit" / "room.env").read_text()
+    assert "ROOM_MINER" not in env and env.rstrip().endswith("ROOM_HOTEL_NAME=sealed-1")
+
+
+@pytest.mark.parametrize("debug", [False, True])
+def test_build_miner_hotel_opens_its_https_port_and_pins_the_signers(host: FakeHost, debug: bool) -> None:
+    proc, root = _guest_config(host, debug, SEALED_MINER="1", SEALED_HOTEL_KEY_INSTALL_SIGNERS=f" {MINER_SIGNER}  ")
+    assert proc.returncode == 0, proc.stderr
+    rules = 'iifname "uplink" tcp dport 18443 accept'
+    if debug:
+        rules = 'iifname "uplink" ip saddr 10.215.0.1 tcp dport 22 accept\n    ' + rules
+    assert (root / "etc" / "sealed-guard.nft").read_text() == CONFIG_GUARD.replace("@RULES@", rules)
+    env = (root / "opt" / "room-kit" / "room.env").read_text()
+    assert env.endswith(f'ROOM_MINER=1\nROOM_RECEIPTS_TLS_LISTEN=10.215.0.2:18443\n'
+                        f'ROOM_HOTEL_KEY_INSTALL_SIGNERS="{MINER_SIGNER}"\n')
+
+
+@pytest.mark.parametrize("sealed,message", [
+    ({"SEALED_MINER": "1"}, "needs SEALED_HOTEL_KEY_INSTALL_SIGNERS"),
+    ({"SEALED_MINER": "1", "SEALED_HOTEL_KEY_INSTALL_SIGNERS": "not-a-key"}, "needs SEALED_HOTEL_KEY_INSTALL_SIGNERS"),
+    ({"SEALED_MINER": "1", "SEALED_HOTEL_KEY_INSTALL_SIGNERS": MINER_SIGNER, "SEALED_MINER_TLS_PORT": "18090"},
+     "SEALED_MINER_TLS_PORT"),
+    ({"SEALED_MINER": "yes"}, "SEALED_MINER must be 0 or 1"),
+])
+def test_build_refuses_an_incomplete_miner_config(host: FakeHost, sealed: dict, message: str) -> None:
+    proc, root = _guest_config(host, False, **sealed)
+    assert proc.returncode == 1 and message in proc.stderr
+    assert not (root / "etc" / "sealed-guard.nft").exists()

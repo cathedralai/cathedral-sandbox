@@ -24,6 +24,10 @@ PROFILE_FILE="$KIT/profiles/${API_PROFILE}.sh"
 # ROOM_CUSTOMER names the key's project in CATHEDRAL_SANDBOX_KEYS (key:project:slots).
 # Empty closed the API for its own key; a comma or colon minted a second key.
 [[ "${ROOM_CUSTOMER:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "ROOM_CUSTOMER must be 1 to 64 of [A-Za-z0-9._-] (got '${ROOM_CUSTOMER:-}')" >&2; exit 1; }
+# Miner hotel settings are checked here too, before anything on the host changes.
+# shellcheck disable=SC1091
+source "$KIT/lib/receipts_mode.sh"
+receipts_miner_check
 
 # ROOM_DESTDIR prefixes every host path the installer writes. It is empty on a
 # hotel; the behaviour tests set it to a temporary directory and fake the host.
@@ -455,6 +459,16 @@ Requires=$ROOM_ID.service
 After=$ROOM_ID.service $ROOM_ID-health.service
 [Service]
 Environment=ROOM_RECEIPTS_LISTEN=$ROOM_RECEIPTS_LISTEN ROOM_HOTEL_NAME=$ROOM_HOTEL_NAME ROOM_API_PORT=$ROOM_API_PORT ROOM_HEALTH_PORT=$ROOM_HEALTH_PORT ROOM_DOCKER_SOCK=$SOCK ROOM_API_KEY_PATH=$ROOM_ETC/api.key ROOM_RECEIPTS_DIR=/run/room-receipts ROOM_ESCAPE=${ROOM_ESCAPE:-0} ROOM_ESCAPE_ALLOW_PLAINTEXT=${ROOM_ESCAPE_ALLOW_PLAINTEXT:-0}
+EOF
+if [ "${ROOM_MINER:-0}" = 1 ]; then
+# Miner hotel: HTTPS on a key the front makes; api.key is the guest-internal key;
+# the hotel key comes only through POST /room/hotel-key signed by one of these.
+cat >> "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF
+Environment=ROOM_MINER=1 ROOM_RECEIPTS_TLS_LISTEN=$ROOM_RECEIPTS_TLS_LISTEN
+Environment="ROOM_HOTEL_KEY_INSTALL_SIGNERS=$ROOM_HOTEL_KEY_INSTALL_SIGNERS"
+EOF
+fi
+cat >> "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF
 ExecStart=$ROOM_OPT/venv/bin/python $ROOM_OPT/bin/room_receipts.py
 Restart=on-failure
 # The receipts front serves health and every room call: keep it ahead of the rooms.
@@ -524,6 +538,9 @@ if [ "${ROOM_TLS:-on}" != on ]; then
   log "ROOM_TLS=off: no Caddy, no port $ROOM_PUBLIC_PORT; the API stays on 127.0.0.1 (front desk or SSH tunnel)"
   if [ "$ROOM_RECEIPTS" = 1 ]; then
     log "receipts: create, exec and delete through $ROOM_RECEIPTS_LISTEN (proxies to the API); /room/health stays on 127.0.0.1:$ROOM_HEALTH_PORT"
+  fi
+  if [ "${ROOM_MINER:-0}" = 1 ]; then
+    log "miner hotel: HTTPS on $ROOM_RECEIPTS_TLS_LISTEN (attested key); $ROOM_RECEIPTS_LISTEN serves /room/attestation only; no hotel key until the control plane installs one"
   fi
 elif command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
   ufw allow "$ROOM_PUBLIC_PORT/tcp" comment "pool-room:$ROOM_ID" >/dev/null && mark "ufw:$ROOM_PUBLIC_PORT/tcp"

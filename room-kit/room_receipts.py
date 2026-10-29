@@ -29,8 +29,24 @@ Routes it adds:
                                    key, signed by the attested receipt key
   POST /room/escape-nonce          sealed Escape hotels only: plant the window nonce
                                    (never echoed; receipt signs the plant without the value)
+  GET /room/hotel-key-install-key  miner hotels only: the guest X25519 install key, signed
+                                   by the attested receipt key
+  POST /room/hotel-key             miner hotels only: install the per-hotel API key, sealed
+                                   to the install key and signed by a pinned control plane key
 Response header on a signed operation:
   X-Room-Receipt: base64url(canonical(receipt))
+
+Miner hotel (ROOM_MINER=1, sealed only). The host is not trusted with the
+hotel key, so the front makes, at start and in memory, a TLS key (P-256, self-
+issued certificate) and an X25519 install key, and names both in the binding
+(tls_spki_sha256, hotel_key_install_x25519_b64), so the boot's REPORT_DATA
+commits to them. It serves every route above over HTTPS on
+ROOM_RECEIPTS_TLS_LISTEN with that key. Plain HTTP on ROOM_RECEIPTS_LISTEN
+serves GET /room/attestation only. The hotel key is never read from a file:
+the control plane installs it with POST /room/hotel-key, and the front
+accepts a bearer only when it equals the installed key. The API behind the
+front knows only a guest-internal key (ROOM_API_KEY_PATH, made at boot inside
+the guest), which the front puts on each request it passes on.
 
 Canonical JSON: sort_keys, separators (",", ":"), ensure_ascii=False, UTF-8.
 Verify offline with verify_receipts.py.
@@ -38,12 +54,14 @@ Verify offline with verify_receipts.py.
 from __future__ import annotations
 
 import base64
+import datetime
 import hashlib
 import hmac
 import http.client
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -54,13 +72,21 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from cryptography.exceptions import InvalidTag
+from cryptography import x509
+from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+    PublicFormat,
+)
+from cryptography.x509.oid import NameOID
 
 BINDING_SCHEMA = "cathedral_sealed_hotel_binding_v1"
 RECEIPT_SCHEMA = "cathedral_sealed_hotel_receipt_v1"
@@ -74,6 +100,24 @@ PLANT_HKDF_INFO = b"cathedral.escape-nonce-plant.v1"
 DEFAULT_ESCAPE_NONCE_PATH = "/run/escape-room/nonce"
 WINDOW_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 NONCE_RE = re.compile(r"^[A-Za-z0-9+/=_-]{16,512}$")
+# Miner hotel key install (the control plane side is polariscomputer
+# cathedral_hotel_reconciler.RoomKitKeyInstaller; keep the two in step).
+INSTALL_ALGORITHM = PLANT_ALGORITHM  # the plant construction, with its own HKDF info and AAD
+INSTALL_PURPOSE = "hotel-key-install"
+INSTALL_SCHEMA = "cathedral_hotel_key_install_v1"
+INSTALL_HKDF_INFO = b"cathedral.hotel-key-install.v1"
+INSTALL_ACTION = "hotel_key_install"
+INSTALL_FIELDS = frozenset({"schema", "binding_sha256", "hotel_id", "key_sha256", "issued_at", "envelope",
+                            "signature_b64"})
+INSTALL_MAX_BYTES = 16 * 1024
+# The control plane posts a request at once; the window only bounds a request
+# that was made and never delivered. Replays inside it fail the order check.
+INSTALL_MAX_AGE_SECONDS = 900
+INSTALL_FUTURE_SKEW_SECONDS = 300
+INSTALL_MAX_SIGNERS = 4
+HOTEL_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")  # the broker's hotel key rule, bounded
+BROKER_HOTEL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+KEY_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class PlantError(ValueError):
@@ -258,19 +302,20 @@ def _raw_x25519(key: X25519PublicKey) -> bytes:
     return key.public_bytes(Encoding.Raw, PublicFormat.Raw)
 
 
+def _wrapping_key(info: bytes, shared: bytes, aad: bytes, ephemeral: bytes, recipient: bytes) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=aad, info=info + ephemeral + recipient).derive(shared)
+
+
 def _plant_wrapping_key(shared: bytes, aad: bytes, ephemeral: bytes, recipient: bytes) -> bytes:
-    return HKDF(
-        algorithm=hashes.SHA256(), length=32, salt=aad, info=PLANT_HKDF_INFO + ephemeral + recipient,
-    ).derive(shared)
+    return _wrapping_key(PLANT_HKDF_INFO, shared, aad, ephemeral, recipient)
 
 
-def seal_plant_nonce(plaintext: bytes, recipient: X25519PublicKey, hotel: str, window_id: str) -> dict:
-    """Seal the window nonce to the guest-held plant key. Same construction the broker uses."""
-    aad = plant_aad(hotel, window_id)
+def _seal_envelope(plaintext: bytes, recipient: X25519PublicKey, info: bytes, aad: bytes) -> dict:
+    """X25519 to the recipient, HKDF-SHA256 (salt = AAD), AES-256-GCM with the same AAD."""
     ephemeral = X25519PrivateKey.generate()
     raw_eph = _raw_x25519(ephemeral.public_key())
     raw_rec = _raw_x25519(recipient)
-    key = _plant_wrapping_key(ephemeral.exchange(recipient), aad, raw_eph, raw_rec)
+    key = _wrapping_key(info, ephemeral.exchange(recipient), aad, raw_eph, raw_rec)
     n = os.urandom(12)
     return {
         "algorithm": PLANT_ALGORITHM,
@@ -280,8 +325,8 @@ def seal_plant_nonce(plaintext: bytes, recipient: X25519PublicKey, hotel: str, w
     }
 
 
-def open_plant_nonce(doc: dict, private: X25519PrivateKey, hotel: str, window_id: str) -> str:
-    """Open a broker plant envelope. Raises PlantError without naming the nonce."""
+def _open_envelope(doc: dict, private: X25519PrivateKey, info: bytes, aad: bytes) -> bytes:
+    """Open an envelope of _seal_envelope. Raises PlantError, which never names the plaintext."""
     if not isinstance(doc, dict) or doc.get("algorithm") != PLANT_ALGORITHM:
         raise PlantError("ciphertext does not open")
     try:
@@ -293,13 +338,166 @@ def open_plant_nonce(doc: dict, private: X25519PrivateKey, hotel: str, window_id
         ephemeral = X25519PublicKey.from_public_bytes(raw_eph)
         # from_public_bytes accepts low-order points; a trial exchange rejects them.
         X25519PrivateKey.generate().exchange(ephemeral)
-        aad = plant_aad(hotel, window_id)
         raw_rec = _raw_x25519(private.public_key())
-        key = _plant_wrapping_key(private.exchange(ephemeral), aad, raw_eph, raw_rec)
-        opened = AESGCM(key).decrypt(aes_n, ct, aad)
-        return opened.decode("ascii")
-    except (KeyError, TypeError, ValueError, UnicodeDecodeError, InvalidTag) as exc:
+        key = _wrapping_key(info, private.exchange(ephemeral), aad, raw_eph, raw_rec)
+        return AESGCM(key).decrypt(aes_n, ct, aad)
+    except (KeyError, TypeError, ValueError, InvalidTag) as exc:
         raise PlantError("ciphertext does not open") from exc
+
+
+def seal_plant_nonce(plaintext: bytes, recipient: X25519PublicKey, hotel: str, window_id: str) -> dict:
+    """Seal the window nonce to the guest-held plant key. Same construction the broker uses."""
+    return _seal_envelope(plaintext, recipient, PLANT_HKDF_INFO, plant_aad(hotel, window_id))
+
+
+def open_plant_nonce(doc: dict, private: X25519PrivateKey, hotel: str, window_id: str) -> str:
+    """Open a broker plant envelope. Raises PlantError without naming the nonce."""
+    opened = _open_envelope(doc, private, PLANT_HKDF_INFO, plant_aad(hotel, window_id))
+    try:
+        return opened.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise PlantError("ciphertext does not open") from exc
+
+
+# ---------------------------------------------------------------- miner hotel: guest TLS and key install
+
+def install_aad(binding_sha256: str) -> bytes:
+    return f"hotel-key-install:{binding_sha256}".encode()
+
+
+def seal_hotel_key(plaintext: bytes, recipient: X25519PublicKey, binding_sha256: str) -> dict:
+    """The control plane's envelope for POST /room/hotel-key (tests and tools; the guest only opens)."""
+    return _seal_envelope(plaintext, recipient, INSTALL_HKDF_INFO, install_aad(binding_sha256))
+
+
+def install_key_statement(x25519_public_b64: str, binding_sha256: str) -> dict:
+    """Canonical fields the guest signs with the receipt key and the control plane verifies.
+
+    Unlike the plant statement there is no hotel field: the broker hotel id is
+    chosen by the control plane at join and travels in the signed request.
+    """
+    return {"algorithm": INSTALL_ALGORITHM, "binding_sha256": binding_sha256, "purpose": INSTALL_PURPOSE,
+            "x25519_public_b64": x25519_public_b64}
+
+
+def parse_install_signers(raw: str) -> list[bytes]:
+    """ROOM_HOTEL_KEY_INSTALL_SIGNERS: 1 to 4 control plane Ed25519 public keys, base64 of the raw
+    32 bytes, separated by spaces. Measured with room.env. Anything else stops the front."""
+    out = []
+    for item in (raw or "").split():
+        try:
+            key = base64.b64decode(item, validate=True)
+        except ValueError:
+            key = b""
+        if len(key) != 32 or b64(key) != item:
+            raise ValueError("ROOM_HOTEL_KEY_INSTALL_SIGNERS holds a value that is not a base64 Ed25519 public key")
+        Ed25519PublicKey.from_public_bytes(key)
+        if key not in out:
+            out.append(key)
+    if not 1 <= len(out) <= INSTALL_MAX_SIGNERS:
+        raise ValueError(f"ROOM_HOTEL_KEY_INSTALL_SIGNERS must name 1 to {INSTALL_MAX_SIGNERS} keys")
+    return out
+
+
+def spki_sha256(public_key) -> str:
+    """sha256 of the DER SubjectPublicKeyInfo: what a client pins (cathedral.channel.tls_spki_binding)."""
+    return sha(public_key.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo))
+
+
+def make_tls_identity(hotel: str) -> tuple[bytes, bytes, str]:
+    """A P-256 key and a self-issued certificate, made in this process.
+
+    Returns (certificate PEM, key PEM, SPKI sha256). No CA vouches for it:
+    the binding names the SPKI and the client pins that value.
+    """
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, (hotel or "room")[:64])])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1)).not_valid_after(now + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .sign(key, hashes.SHA256()))
+    key_pem = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+    return cert.public_bytes(Encoding.PEM), key_pem, spki_sha256(key.public_key())
+
+
+class InstallRefused(Exception):
+    """POST /room/hotel-key refused. The code is short and never names the key."""
+
+    def __init__(self, status: int, code: str):
+        super().__init__(code)
+        self.status, self.code = status, code
+
+
+class MinerHotel:
+    """A miner hotel's guest-held secrets: TLS key, install key, installed hotel key.
+
+    All three exist in this process only. The TLS key and the install key are
+    made at start and named in the binding (binding_fields), so the boot's SNP
+    report commits to them. The hotel key arrives only through
+    POST /room/hotel-key; the latest accepted install wins.
+    """
+
+    def __init__(self, hotel: str, signers: list[bytes]):
+        if not signers:
+            raise ValueError("a miner hotel needs at least one pinned install signer")
+        self.signers = [(b64(k), Ed25519PublicKey.from_public_bytes(k)) for k in signers]
+        self.cert_pem, self._key_pem, self.tls_spki_sha256 = make_tls_identity(hotel)
+        self.install_private = X25519PrivateKey.generate()
+        self.install_public_b64 = b64(_raw_x25519(self.install_private.public_key()))
+        self.lock = threading.Lock()
+        self.key: bytes | None = None
+        self.key_sha256: str | None = None
+        self.hotel_id: str | None = None
+        self.issued_at = -1
+        self.request_sha256: str | None = None
+
+    def __repr__(self) -> str:
+        return f"MinerHotel(tls_spki_sha256={self.tls_spki_sha256})"
+
+    def binding_fields(self) -> dict:
+        return {
+            "tls_spki_sha256": self.tls_spki_sha256,
+            "hotel_key_install_x25519_b64": self.install_public_b64,
+            "hotel_key_install_signers_ed25519_b64": [name for name, _ in self.signers],
+            # The hotel key never comes from fw_cfg or a host file on this guest.
+            "hotel_key_source": "install",
+        }
+
+    def tls_context(self, private_dir: str) -> ssl.SSLContext:
+        """Server context with the boot TLS key. load_cert_chain reads a file only,
+        so the PEM is written root-only into the guest's private store, loaded and removed."""
+        if self._key_pem is None:
+            raise RuntimeError("the TLS key was already loaded")
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        fd, path = tempfile.mkstemp(prefix=".tls.", dir=private_dir)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, self._key_pem + self.cert_pem)
+            os.close(fd)
+            fd = -1
+            ctx.load_cert_chain(path)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            os.unlink(path)
+        self._key_pem = None
+        return ctx
+
+    def authorized(self, presented: bytes) -> bool:
+        key = self.key
+        return key is not None and hmac.compare_digest(presented, key)
+
+    def signer(self, signature: bytes, message: bytes) -> str | None:
+        for name, public in self.signers:
+            try:
+                public.verify(signature, message)
+                return name
+            except InvalidSignature:
+                continue
+        return None
 
 
 def write_escape_nonce(path: str, nonce: str, window_id: str) -> None:
@@ -334,9 +532,13 @@ def _replace_private_file(directory: str, path: str, data: bytes, mode: int) -> 
 class Ledger:
     """The receipt key, the binding and the chain of this boot."""
 
-    def __init__(self, hotel: str, store: str):
+    def __init__(self, hotel: str, store: str, miner: MinerHotel | None = None):
+        self.miner = miner
         if tsm_provider() == "sev_guest":
             self._init_sealed(hotel, store)
+        elif miner is not None:
+            # A miner hotel's TLS key means something only under an SNP report.
+            raise RuntimeError("miner mode needs a sealed guest (TSM provider sev_guest)")
         else:
             self._init_hotel(hotel, store)
         # Runtime guest key. Not in the binding: adding it there would change
@@ -392,11 +594,99 @@ class Ledger:
                 "cathedral": read("/opt/pool-room/src/COMMIT", "unknown"),
             },
         }
+        if self.miner is not None:
+            # TLS key, install key and pinned signers: REPORT_DATA commits to them.
+            self.binding.update(self.miner.binding_fields())
         self.binding_sha256 = sha(canonical(self.binding))
         self.report = snp_report(bytes.fromhex(self.binding_sha256) + bytes(32))
         if report_fields(self.report)["measurement"] != facts["measurement"]:
             raise RuntimeError("measurement changed between the two reports")
         self._open_store(store)
+
+    def install_key_document(self) -> dict | None:
+        """Miner hotels: the install X25519 key, signed by the attested receipt key."""
+        if self.miner is None:
+            return None
+        statement = install_key_statement(self.miner.install_public_b64, self.binding_sha256)
+        return {**statement, "signature_b64": b64(self.key.sign(canonical(statement)))}
+
+    def install_hotel_key(self, doc, now: float | None = None) -> tuple[dict, dict | None]:
+        """POST /room/hotel-key. Returns (answer, receipt); raises InstallRefused.
+
+        Accepted only when the control plane signature verifies with a pinned
+        signer, the request names this boot's binding, issued_at is fresh and
+        newer than the last install, and the envelope opens with this boot's
+        install key to a key whose sha256 the request names. The exact request
+        that installed the current key answers again with no change (a retry
+        after a lost answer); any other older or equal issued_at is a replay.
+        """
+        miner = self.miner
+        if miner is None:
+            raise InstallRefused(403, "install_disabled")
+        if not isinstance(doc, dict) or set(doc) != INSTALL_FIELDS or doc["schema"] != INSTALL_SCHEMA:
+            raise InstallRefused(400, "install_fields_invalid")
+        signature = doc["signature_b64"]
+        try:
+            raw_sig = base64.b64decode(signature, validate=True) if isinstance(signature, str) else b""
+        except ValueError:
+            raw_sig = b""
+        body = {k: v for k, v in doc.items() if k != "signature_b64"}
+        try:
+            message = canonical(body)
+        except (TypeError, ValueError):
+            raise InstallRefused(400, "install_fields_invalid") from None
+        signer = miner.signer(raw_sig, message) if len(raw_sig) == 64 else None
+        if signer is None:
+            raise InstallRefused(403, "install_signature_invalid")
+        if doc["binding_sha256"] != self.binding_sha256:
+            raise InstallRefused(409, "install_wrong_binding")
+        hotel_id, key_sha256, issued = doc["hotel_id"], doc["key_sha256"], doc["issued_at"]
+        if (not isinstance(hotel_id, str) or not BROKER_HOTEL_ID_RE.fullmatch(hotel_id)
+                or not isinstance(key_sha256, str) or not KEY_SHA256_RE.fullmatch(key_sha256)
+                or type(issued) is not int):
+            raise InstallRefused(400, "install_fields_invalid")
+        now = time.time() if now is None else now
+        if not now - INSTALL_MAX_AGE_SECONDS <= issued <= now + INSTALL_FUTURE_SKEW_SECONDS:
+            raise InstallRefused(409, "install_not_fresh")
+        request_sha256 = sha(canonical(doc))
+
+        def answer(status: str) -> dict:
+            return {"key_sha256": key_sha256, "hotel_id": hotel_id, "issued_at": issued, "status": status}
+
+        with miner.lock:
+            if request_sha256 == miner.request_sha256:
+                return answer("unchanged"), None
+            if issued <= miner.issued_at:
+                raise InstallRefused(409, "install_replayed")
+        try:
+            opened = _open_envelope(doc["envelope"], miner.install_private, INSTALL_HKDF_INFO,
+                                    install_aad(self.binding_sha256))
+        except PlantError:
+            # Sealed to another key (another boot or guest), or altered.
+            raise InstallRefused(400, "install_envelope_does_not_open") from None
+        if not HOTEL_KEY_RE.fullmatch(opened.decode("latin-1")):
+            raise InstallRefused(400, "install_key_invalid")
+        if sha(opened) != key_sha256:
+            raise InstallRefused(400, "install_key_digest_mismatch")
+        with miner.lock:
+            if request_sha256 == miner.request_sha256:
+                return answer("unchanged"), None
+            if issued <= miner.issued_at:  # a newer install landed while this one was opened
+                raise InstallRefused(409, "install_replayed")
+            miner.key, miner.key_sha256, miner.hotel_id = opened, key_sha256, hotel_id
+            miner.issued_at, miner.request_sha256 = issued, request_sha256
+        receipt = self.sign({
+            "action": INSTALL_ACTION,
+            "target": "POST /room/hotel-key",
+            "sandbox_id": None,
+            "broker_hotel_id": hotel_id,
+            "key_sha256": key_sha256,
+            "install_issued_at": issued,
+            "install_request_sha256": request_sha256,
+            "signer_ed25519_b64": signer,
+            "status": 200,
+        })
+        return answer("installed"), receipt
 
     def _init_hotel(self, hotel: str, store: str) -> None:
         """Level 1: an Ed25519 hotel chain. No SNP report and no measurement."""
@@ -542,10 +832,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def authorized(self) -> bool:
         raw = self.headers.get("Authorization", "")
-        return raw[:7].lower() == "bearer " and hmac.compare_digest(raw[7:].strip().encode(), self.server.api_key)
+        if raw[:7].lower() != "bearer ":
+            return False
+        miner = getattr(self.server.ledger, "miner", None)
+        if miner is not None:
+            # Only the key the control plane installed; never the guest-internal API key.
+            return miner.authorized(raw[7:].strip().encode())
+        return hmac.compare_digest(raw[7:].strip().encode(), self.server.api_key)
 
     def upstream(self, port: int, body: bytes | None):
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+        if getattr(self.server.ledger, "miner", None) is not None:
+            # The caller's key was checked against the installed key before this
+            # call. The API knows only the guest-internal key.
+            headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
+            headers["Authorization"] = "Bearer " + self.server.api_key.decode()
         if self.command not in ("GET", "HEAD"):
             # A write may have run before its answer was lost, so it is never
             # sent twice: a fresh connection (no stale keep-alive) and no
@@ -572,6 +873,14 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- routes
     def handle_any(self):
+        if self.server.attestation_only:
+            # A miner hotel's plain HTTP port (the host's side of the tap): the
+            # public attestation only. Nothing else, so no bearer and no room
+            # traffic ever crosses it in the clear. The body is not read.
+            if self.command == "GET" and urlsplit(self.path).path == "/room/attestation":
+                return self.reply(200, canonical(self.server.ledger.attestation()))
+            self.close_connection = True
+            return self.reply(403, b'{"error":{"code":"https_required","message":"this port serves GET /room/attestation only; use the attested HTTPS port"}}')
         if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
             # Only Content-Length bodies are read and signed; a chunked body
             # would be signed as empty and its bytes left on the connection.
@@ -623,6 +932,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_escape_plant_key(ledger)
         if path == "/room/escape-nonce":
             return self.handle_escape_nonce(ledger, body)
+        miner = getattr(ledger, "miner", None)
+        if miner is not None:
+            if path == "/room/hotel-key-install-key":
+                return self.handle_install_key(ledger)
+            if path == "/room/hotel-key":
+                return self.handle_hotel_key(ledger, body)
+            if not self.authorized():
+                # The API behind accepts the internal key the front adds, so the
+                # front is the gate for every call it passes on.
+                return self.reply(401, b'{"error":"unauthorized"}')
         action = next((a for meth, pat, a in SIGNED if meth == self.command and pat.match(path)), None)
         if action and body:
             # A JSON escape of a lone surrogate parses, but cannot be encoded
@@ -687,6 +1006,36 @@ class Handler(BaseHTTPRequestHandler):
             # has them), under the receipt key of the binding this report names.
             out["room"] = {"sandbox_id": room, "create_receipt": ledger.create_receipt(room)}
         return self.reply(200, canonical(out))
+
+    def handle_install_key(self, ledger: "Ledger"):
+        """GET /room/hotel-key-install-key: the install key, signed by the attested receipt key.
+
+        No bearer: the control plane has no key yet. It reads this over TLS
+        pinned to the binding's tls_spki_sha256 and checks the signature with
+        the binding's receipt key.
+        """
+        if self.command != "GET":
+            return self.reply(405, b'{"error":"method_not_allowed"}', {"Allow": "GET"})
+        return self.reply(200, canonical(ledger.install_key_document()))
+
+    def handle_hotel_key(self, ledger: "Ledger", body: bytes | None):
+        """POST /room/hotel-key: install the per-hotel API key. Never echoes it."""
+        if self.command != "POST":
+            return self.reply(405, b'{"error":"method_not_allowed"}', {"Allow": "POST"})
+        if body is None or len(body) > INSTALL_MAX_BYTES:
+            return self.reply(413, b'{"error":{"code":"install_too_large","message":"the request is too large"}}')
+        try:
+            doc = json.loads(body)
+        except ValueError:
+            doc = None
+        try:
+            out, receipt = ledger.install_hotel_key(doc)
+        except InstallRefused as exc:
+            return self.reply(exc.status, canonical({"error": {"code": exc.code, "message": exc.code.replace("_", " ")}}))
+        extra = {}
+        if receipt is not None:
+            extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(receipt)).decode()
+        return self.reply(200, canonical(out), extra)
 
     def handle_escape_plant_key(self, ledger: "Ledger"):
         """GET /room/escape-plant-key: the guest X25519 public key (Escape hotels only)."""
@@ -839,19 +1188,23 @@ class Handler(BaseHTTPRequestHandler):
 UP = Upstreams()
 
 
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 1024
 
-    def __init__(self, addr, ledger, api_port, health_port, api_key, docker_sock, attest_per_minute=30):
+    def __init__(self, addr, ledger, api_port, health_port, api_key, docker_sock, attest_per_minute=30, *,
+                 attestation_only=False):
         super().__init__(addr, Handler)
         self.attest_per_minute = max(1, int(attest_per_minute))
         self.ledger, self.api_port, self.health_port, self.api_key = ledger, api_port, health_port, api_key
         self.docker_sock = docker_sock
+        self.attestation_only = attestation_only
         self._digests: dict[str, str | None] = {}
         self.health_lock = threading.Lock()
         self.health: tuple[int, bytes | None, float] = (503, None, 0.0)
-        threading.Thread(target=self.health_loop, daemon=True).start()
+        if not attestation_only:
+            threading.Thread(target=self.health_loop, daemon=True).start()
 
     def health_loop(self) -> None:
         """Build the health answer once a second, off the request path."""
@@ -899,20 +1252,63 @@ class Server(ThreadingHTTPServer):
         return self._digests[ref]
 
 
+class TLSServer(Server):
+    """The miner hotel front over HTTPS with the boot TLS key the binding names.
+
+    The handshake runs in the request's own thread, so a client that stalls
+    it holds that thread only, not the accept loop.
+    """
+
+    handshake_timeout = 30
+
+    def __init__(self, addr, *args, tls_context: ssl.SSLContext, **kwargs):
+        self.tls_context = tls_context
+        super().__init__(addr, *args, **kwargs)
+
+    def finish_request(self, request, client_address):
+        request.settimeout(self.handshake_timeout)
+        try:
+            conn = self.tls_context.wrap_socket(request, server_side=True)
+        except (ssl.SSLError, OSError):
+            return
+        try:
+            conn.settimeout(None)
+            self.RequestHandlerClass(conn, client_address, self)
+        finally:
+            conn.close()
+
+
 def main() -> int:
     env = os.environ
     host, port = env["ROOM_RECEIPTS_LISTEN"].rsplit(":", 1)
+    mode = env.get("ROOM_MINER") or "0"
+    if mode not in ("0", "1"):
+        raise SystemExit("ROOM_MINER must be 0 or 1")
+    # Miner hotel: this key file holds the guest-internal API key (made at boot in the guest).
     with open(env.get("ROOM_API_KEY_PATH", "/etc/pool-room/api.key"), "rb") as f:
         api_key = f.read().strip()
-    ledger = Ledger(env["ROOM_HOTEL_NAME"], env.get("ROOM_RECEIPTS_DIR", "/run/room-receipts"))
+    miner = None
+    if mode == "1":
+        miner = MinerHotel(env["ROOM_HOTEL_NAME"], parse_install_signers(env.get("ROOM_HOTEL_KEY_INSTALL_SIGNERS", "")))
+    store = env.get("ROOM_RECEIPTS_DIR", "/run/room-receipts")
+    ledger = Ledger(env["ROOM_HOTEL_NAME"], store, miner=miner)
     if ledger.sealed:
         print(f"room-receipts: binding {ledger.binding_sha256} measurement {ledger.binding['measurement']}", flush=True)
     else:
         print(f"room-receipts: binding {ledger.binding_sha256} level hotel", flush=True)
-    srv = Server((host, int(port)), ledger, int(env.get("ROOM_API_PORT", "18090")),
-                 int(env.get("ROOM_HEALTH_PORT", "18091")), api_key, env.get("ROOM_DOCKER_SOCK", "/run/pool-room/docker.sock"),
-                 int(env.get("ROOM_ATTEST_PER_MINUTE", "30")))
-    srv.serve_forever()
+    args = (ledger, int(env.get("ROOM_API_PORT", "18090")), int(env.get("ROOM_HEALTH_PORT", "18091")), api_key,
+            env.get("ROOM_DOCKER_SOCK", "/run/pool-room/docker.sock"), int(env.get("ROOM_ATTEST_PER_MINUTE", "30")))
+    if miner is None:
+        srv = Server((host, int(port)), *args)
+        srv.serve_forever()
+        return 0
+    tls_host, tls_port = env["ROOM_RECEIPTS_TLS_LISTEN"].rsplit(":", 1)
+    tls = TLSServer((tls_host, int(tls_port)), *args, tls_context=miner.tls_context(store))
+    plain = Server((host, int(port)), *args, attestation_only=True)
+    threading.Thread(target=plain.serve_forever, daemon=True).start()
+    print(f"room-receipts: miner hotel: HTTPS {tls_host}:{tls_port} tls_spki_sha256 {miner.tls_spki_sha256}; "
+          f"plain HTTP {host}:{port} serves /room/attestation only; no hotel key until POST /room/hotel-key", flush=True)
+    tls.serve_forever()
     return 0
 
 

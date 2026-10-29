@@ -32,6 +32,13 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
   6. tunables: each create receipt that carries tunables has
      tunables_sha256 = sha256(canonical(tunables)), the tunables document's
      sha256. The output lists each room's tunables_sha256.
+  7. guest TLS (miner hotels): a binding that names tls_spki_sha256 must name
+     a well-formed key, and --tls-spki-sha256 (the SPKI sha256 of the TLS peer
+     that served the attestation) must equal it; --require-tls fails a binding
+     with no TLS key. --origin https://<ip>:<port> fetches the attestation
+     from the guest itself, takes the peer SPKI from that connection, and also
+     checks GET /room/hotel-key-install-key: signed by the binding's receipt
+     key, for this binding, and the X25519 key the binding names.
 
 Not checked here (by design, today): that the measurement is an approved image.
 Image approval is a signed policy release; that is a later step.
@@ -39,16 +46,21 @@ Image approval is a signed policy release; that is a later step.
 Usage:
   verify_receipts.py --attestation att.json --receipts chain.json [--receipt-header B64 ...]
   verify_receipts.py --broker https://<broker> --key-file KEY --hotel <hotel id> [--sandbox ID]
+  verify_receipts.py --origin https://<miner ip>:<port> --require-sealed [--expected-measurement M]
 """
 from __future__ import annotations
 
 import argparse
 import base64
 import hashlib
+import http.client
 import json
 import os
+import re
+import ssl
 import sys
 import urllib.request
+from urllib.parse import urlsplit
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
@@ -61,6 +73,10 @@ KDS = "https://kdsintf.amd.com/vcek/v1"
 SIGNED_LEN = 0x2A0
 HOTEL_BINDING_SCHEMA = "cathedral_hotel_binding_v1"
 HOTEL_RECEIPT_SCHEMA = "cathedral_hotel_receipt_v1"
+INSTALL_ALGORITHM = "x25519-hkdf-sha256-aes256gcm-v1"
+INSTALL_PURPOSE = "hotel-key-install"
+HEX64 = re.compile(r"[0-9a-f]{64}")
+ORIGIN_MAX_BYTES = 64 * 1024
 
 
 def canonical(doc) -> bytes:
@@ -220,6 +236,101 @@ def verify_attestation(att: dict, expected_measurement: str | None, prod: str | 
     return out
 
 
+def _b64_key(value, what: str) -> bytes:
+    try:
+        raw = base64.b64decode(value, validate=True) if isinstance(value, str) else b""
+    except ValueError:
+        raw = b""
+    need(len(raw) == 32, f"{what} is not a base64 32-byte key")
+    return raw
+
+
+def verify_guest_tls(att: dict, peer_spki_sha256: str | None = None, require: bool = False) -> dict | None:
+    """The miner hotel fields of a sealed binding (room_receipts.MinerHotel).
+
+    The binding is covered by REPORT_DATA, so a TLS key it names is the
+    guest's own. peer_spki_sha256 is the SPKI sha256 of the TLS peer that
+    served this attestation: equal means the connection ended in the guest,
+    not on the host. Returns None for a binding with no TLS key.
+    """
+    binding = att["binding"]
+    tls = binding.get("tls_spki_sha256")
+    if tls is None:
+        need(not require and peer_spki_sha256 is None,
+             "the binding names no guest TLS key: this hotel's TLS (if any) is not attested")
+        return None
+    need(isinstance(tls, str) and HEX64.fullmatch(tls) is not None, "binding tls_spki_sha256 is not 64 lower-case hex")
+    if peer_spki_sha256 is not None:
+        need(peer_spki_sha256.lower() == tls, "the TLS peer is not the key the binding names (the host answered?)")
+    install = _b64_key(binding.get("hotel_key_install_x25519_b64"), "binding hotel_key_install_x25519_b64")
+    signers = binding.get("hotel_key_install_signers_ed25519_b64")
+    need(isinstance(signers, list) and signers, "binding names no hotel key install signer")
+    for item in signers:
+        _b64_key(item, "binding install signer")
+    need(binding.get("hotel_key_source") == "install", "binding hotel_key_source is not install")
+    return {"tls_spki_sha256": tls, "peer_checked": peer_spki_sha256 is not None,
+            "hotel_key_install_x25519_b64": base64.b64encode(install).decode(),
+            "hotel_key_install_signers_ed25519_b64": signers, "hotel_key_source": "install"}
+
+
+def verify_install_key(doc: dict, att: dict) -> str:
+    """GET /room/hotel-key-install-key: signed by the binding's receipt key, for this binding,
+    and the X25519 key the binding names. Returns the X25519 key (base64)."""
+    binding = att["binding"]
+    statement = {k: doc.get(k) for k in ("algorithm", "binding_sha256", "purpose", "x25519_public_b64")}
+    need(statement["algorithm"] == INSTALL_ALGORITHM and statement["purpose"] == INSTALL_PURPOSE,
+         "install key document is not a hotel-key-install key")
+    need(statement["binding_sha256"] == att["binding_sha256"], "install key document names another binding")
+    receipt_key = Ed25519PublicKey.from_public_bytes(_b64_key(binding.get("receipt_key_ed25519_b64"), "receipt key"))
+    try:
+        signature = base64.b64decode(doc.get("signature_b64") or "", validate=True)
+        receipt_key.verify(signature, canonical(statement))
+    except (InvalidSignature, ValueError) as exc:
+        raise Fail("install key document is not signed by the binding's receipt key") from exc
+    _b64_key(statement["x25519_public_b64"], "install key")
+    named = binding.get("hotel_key_install_x25519_b64")
+    need(named is None or named == statement["x25519_public_b64"], "install key differs from the one the binding names")
+    return statement["x25519_public_b64"]
+
+
+def spki_sha256_of_certificate(der: bytes) -> str:
+    cert = x509.load_der_x509_certificate(der)
+    return sha(cert.public_key().public_bytes(serialization.Encoding.DER,
+                                              serialization.PublicFormat.SubjectPublicKeyInfo))
+
+
+def fetch_origin(origin: str, paths: list[str], timeout: float = 30.0) -> tuple[list[tuple[int, bytes]], str]:
+    """GET each path from a miner hotel over ONE TLS connection; returns the answers and the peer SPKI sha256.
+
+    The certificate is self-issued by the guest, so there is no CA check: the
+    caller compares the SPKI with the attested binding (verify_guest_tls).
+    """
+    parts = urlsplit(origin)
+    need(parts.scheme == "https" and parts.hostname and not parts.path.strip("/"),
+         "--origin must be https://<host>:<port>")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout, context=ctx)
+    try:
+        conn.connect()
+        spki = spki_sha256_of_certificate(conn.sock.getpeercert(binary_form=True))
+        # One connection and one handshake: every answer comes from the peer
+        # whose SPKI was read. No silent reconnect to another peer.
+        conn.auto_open = 0
+        out = []
+        for path in paths:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            body = resp.read(ORIGIN_MAX_BYTES + 1)
+            need(len(body) <= ORIGIN_MAX_BYTES, f"{path} answer is too large")
+            out.append((resp.status, body))
+        return out, spki
+    finally:
+        conn.close()
+
+
 def verify_receipts(att: dict, receipts: list[dict], head: str | None = None) -> dict:
     binding = att["binding"]
     bsha = att["binding_sha256"]
@@ -346,11 +457,26 @@ def main() -> int:
     ap.add_argument("--skip-amd", action="store_true", help="skip the AMD chain (offline smoke test only)")
     ap.add_argument("--require-sealed", action="store_true", help="fail unless the hotel answers an SEV-SNP binding")
     ap.add_argument("--save", help="with --broker: write the fetched attestation and receipts here")
+    ap.add_argument("--tls-spki-sha256", help="SPKI sha256 of the TLS peer that served the attestation; "
+                                              "fails unless the binding names this key")
+    ap.add_argument("--require-tls", action="store_true", help="fail unless the binding names a guest TLS key")
+    ap.add_argument("--origin", help="a miner hotel's https://<ip>:<port>: fetch the attestation from the guest "
+                                     "and check the TLS peer and the install key")
     a = ap.parse_args()
     if a.broker and not a.hotel:
         ap.error("--hotel is required with --broker (no default: a wrong hotel is a wrong chain)")
+    if a.origin and (a.broker or a.attestation or a.tls_spki_sha256):
+        ap.error("--origin fetches the attestation itself; it takes no --broker, --attestation or --tls-spki-sha256")
     try:
-        if a.broker:
+        peer_spki = a.tls_spki_sha256
+        install_doc = None
+        if a.origin:
+            answers, peer_spki = fetch_origin(a.origin, ["/room/attestation", "/room/hotel-key-install-key"])
+            need(answers[0][0] == 200, f"GET /room/attestation answered {answers[0][0]}")
+            att = json.loads(answers[0][1])
+            install_doc = json.loads(answers[1][1]) if answers[1][0] == 200 else None
+            doc = json.load(open(a.receipts)) if a.receipts else []
+        elif a.broker:
             key = open(a.key_file).read().strip()
             att = get(f"{a.broker}/v1/hotels/{a.hotel}/attestation", key)
             if a.sandbox:
@@ -377,10 +503,17 @@ def main() -> int:
             # hotel name. Asking for a measurement means asking for SNP.
             raise Fail("the hotel answered a level 1 (unsealed) binding; an SEV-SNP attestation was asked for")
         if is_hotel_level(att):
+            need(not (a.require_tls or a.origin or peer_spki), "a level 1 binding has no attested guest TLS")
             attestation_out = verify_hotel_attestation(att)
         else:
             attestation_out = verify_attestation(att, a.expected_measurement, a.product, a.kds_cache,
                                                  a.ark_sha256, a.skip_amd)
+            guest_tls = verify_guest_tls(att, peer_spki, require=bool(a.require_tls or a.origin))
+            if guest_tls is not None:
+                if a.origin:
+                    need(install_doc is not None, "the hotel did not answer GET /room/hotel-key-install-key")
+                    guest_tls["install_key_checked"] = verify_install_key(install_doc, att) is not None
+                attestation_out["guest_tls"] = guest_tls
         out = {"attestation": attestation_out,
                "chain": verify_receipts(att, receipts, head),
                "policy_timeline": policy_timeline(receipts), "room_tunables": room_tunables(receipts), "verdict": "PASS",
