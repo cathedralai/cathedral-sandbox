@@ -42,7 +42,7 @@ sizes the challenge from claimed vCPUs and memory, so the prober must size it
 with ``spec_for`` from ``probe_capacity``, never from ``capacity``.
 
 The prober verifies the registration, probes the box through its front door,
-and only then admits it (docs/MINER_BOX_RUNBOOK.md).
+and only then admits it.
 
 One box, one hotkey. The certificate pin and IP are public, so a registration
 proves only that its signer holds the key it seals. ``box_id`` is per hotkey;
