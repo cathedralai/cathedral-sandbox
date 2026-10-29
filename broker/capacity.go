@@ -15,7 +15,8 @@
 // runtime is matched by class and label with no policy edit.
 //
 // When a guest has a policy, the policy replaces its "hotels" list and its
-// "default_sealed" flag. A guest with no policy behaves as before.
+// "default_sealed" flag. Miner hotels are denied unless the guest policy
+// explicitly selects the miner=true label; broad sealed selectors do not opt in.
 //
 // A hotel can be reserved for one guest (hotel field "reserved_for", in the
 // config or by PATCH /v1/broker/hotels/<id>). Every other guest treats it as
@@ -94,6 +95,11 @@ func anyMatch(list []selector, h *hotel) bool {
 
 // tier is "prefer", "allow" or "" (the policy does not reach h). Deny wins.
 func (p *guestPolicy) tier(h *hotel) string {
+	// Miner hotels require an explicit miner selector. A broad sealed class
+	// or an absent policy must never opt an existing customer guest in.
+	if h.cfg.MinerHotkey != "" && !p.minerOptIn(h) {
+		return ""
+	}
 	switch {
 	case anyMatch(p.Deny, h):
 		return ""
@@ -103,6 +109,20 @@ func (p *guestPolicy) tier(h *hotel) string {
 		return tierAllow
 	}
 	return ""
+}
+
+func (p *guestPolicy) minerOptIn(h *hotel) bool {
+	if p == nil {
+		return false
+	}
+	for _, list := range [][]selector{p.Prefer, p.Allow} {
+		for _, s := range list {
+			if s.Label["miner"] == "true" && s.matches(h) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func validSelectors(field string, list []selector) error {
@@ -238,14 +258,18 @@ func (b *broker) addTotals(t map[string]*classTotals, e capacityEntry, now time.
 
 var tierRank = map[string]int{tierPrefer: 0, tierAllow: 1, "hotels": 2}
 
-// handleCapacity serves GET /v1/broker/capacity. g is nil for the operator.
-func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState) {
+// handleCapacity serves GET /v1/broker/capacity. g is nil for operator and
+// miner enroller views. The enroller sees only miner hotels.
+func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly bool) {
 	b.mu.Lock()
 	now := time.Now()
 	out := []map[string]any{}
 	var guest map[string]any
 	totals := map[string]*classTotals{classSealed: {}, classUnsealed: {}}
 	for _, e := range b.capacityEntries() {
+		if minerOnly && e.h.cfg.MinerHotkey == "" {
+			continue
+		}
 		if g == nil {
 			out = append(out, b.capacityDoc(e, now))
 			b.addTotals(totals, e, now)
@@ -275,6 +299,21 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState) {
 	doc := map[string]any{"hotels": out, "classes": totals}
 	if guest != nil {
 		doc["guest"] = guest
+	} else {
+		sealedAdmission := b.cfg.SealedAdmission
+		if sealedAdmission == "" {
+			sealedAdmission = "on"
+		}
+		// Scoped joins verify the observed guest key against SNP REPORT_DATA,
+		// and every subsequent miner call pins that key on both clients.
+		doc["admission_policy"] = map[string]any{
+			"sealed_admission":    sealedAdmission,
+			"amd_verifier":        b.cfg.AMDVerifier != nil,
+			"sealed_measurements": append([]string{}, b.cfg.SealedMeasurements...),
+			"miner_hotkey_caps":   b.cfg.MinerHotkeyCaps,
+			"miner_max_hotels":    b.cfg.MinerMaxHotels,
+			"miner_tls_pin":       true,
+		}
 	}
 	writeJSON(w, 200, doc)
 }

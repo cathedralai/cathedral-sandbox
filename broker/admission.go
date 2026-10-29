@@ -11,9 +11,11 @@
 //     checks again every attest_every_seconds (default 60), and at once after
 //     the hotel was down: a reboot gives a new binding.
 //
-// Hotels from the config file are not gated: their behavior is unchanged.
+// Operator hotels from the config file are not gated. Miner hotels are gated
+// whether they came from the config or a runtime join.
 // Config "sealed_admission": "off" turns the attestation gate off for joined
-// hotels too (a rollback lever, not a mode to run in).
+// operator hotels only. Miner hotels always require attestation and the AMD
+// chain; the rollback lever must not admit an unverified miner.
 //
 // What the broker checks is the check verify_receipts.py makes before the AMD
 // signature: binding_sha256 is the SHA-256 of the binding as served, the
@@ -103,15 +105,29 @@ func (b *broker) attestEvery() time.Duration {
 	return defaultAttestEvery
 }
 
-// needsAttestation reports whether h must pass the attestation gate: a
-// joined hotel of class sealed. Caller holds b.mu.
+// needsAttestation reports whether h must pass the attestation gate: every
+// miner hotel, and a joined operator hotel of class sealed. Caller holds b.mu.
 func (b *broker) needsAttestation(h *hotel) bool {
-	return h.runtime && b.cfg.SealedAdmission != "off" && hotelClass(h) == classSealed
+	return h.cfg.MinerHotkey != "" || (h.runtime && b.cfg.SealedAdmission != "off" && hotelClass(h) == classSealed)
 }
 
 // admitted reports whether h passed admission. Health is h.ok, checked by
 // admissibleFree; this is the attestation part. Caller holds b.mu.
 func (b *broker) admitted(h *hotel, now time.Time) bool {
+	if h.cfg.MinerHotkey != "" && len(b.cfg.SealedMeasurements) == 0 {
+		return false
+	}
+	// Older state may contain an unsealed miner or a runtime hotel that claimed
+	// a sealed label. Keep both out of placement after a restart as well.
+	if h.cfg.MinerHotkey != "" && !h.cfg.Sealed {
+		return false
+	}
+	if h.cfg.MinerHotkey != "" && h.tlsPinErr != nil {
+		return false
+	}
+	if h.runtime && !h.cfg.Sealed && h.labels()["sealed"] == "true" {
+		return false
+	}
 	if !b.needsAttestation(h) {
 		return true
 	}
@@ -173,6 +189,9 @@ type attestFetchErr struct{ error }
 
 // checkAttestation fetches and checks h's attestation. It does not lock.
 func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, error) {
+	if h.cfg.MinerHotkey != "" && len(b.cfg.SealedMeasurements) == 0 {
+		return admission{}, errors.New("a miner hotel needs a nonempty sealed_measurements allowlist")
+	}
 	var att struct {
 		Binding    json.RawMessage `json:"binding"`
 		BindingSHA string          `json:"binding_sha256"`
@@ -185,6 +204,11 @@ func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, err
 	res, err := verifyAttestation(att.Binding, att.BindingSHA, att.Report, b.cfg.SealedMeasurements, b.cfg.SealedHostData)
 	if err != nil {
 		return res, err
+	}
+	if h.cfg.MinerHotkey != "" {
+		if err := verifyMinerTLSBinding(att.Binding, h.cfg.TLSSPKISHA256); err != nil {
+			return admission{}, err
+		}
 	}
 	if b.cfg.AMDVerifier == nil && h.cfg.MinerHotkey == "" {
 		return res, nil // chain not checked: an operator hotel with no verifier configured
@@ -207,14 +231,54 @@ func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, err
 
 // snpBinding is the part of a sealed hotel's binding the broker compares.
 type snpBinding struct {
-	Level         string `json:"level"`
-	Measurement   string `json:"measurement"`
-	ChipID        string `json:"chip_id"`
-	ReportedTCB   string `json:"reported_tcb"`
-	Policy        string `json:"policy"`
-	HostData      string `json:"host_data"`
-	KernelCmdline string `json:"kernel_cmdline"`
-	ReceiptKeyB64 string `json:"receipt_key_ed25519_b64"`
+	Level          string `json:"level"`
+	Measurement    string `json:"measurement"`
+	ChipID         string `json:"chip_id"`
+	ReportedTCB    string `json:"reported_tcb"`
+	Policy         string `json:"policy"`
+	HostData       string `json:"host_data"`
+	KernelCmdline  string `json:"kernel_cmdline"`
+	ReceiptKeyB64  string `json:"receipt_key_ed25519_b64"`
+	TLSSPKISHA256  string `json:"tls_spki_sha256"`
+	HotelKeySource string `json:"hotel_key_source"`
+}
+
+func verifyMinerTLSBinding(rawBinding []byte, peerSPKI string) error {
+	var bd snpBinding
+	if json.Unmarshal(rawBinding, &bd) != nil || len(peerSPKI) != 64 || bd.TLSSPKISHA256 != peerSPKI {
+		return errors.New("miner guest TLS key does not match its SNP binding")
+	}
+	if bd.HotelKeySource != "install" {
+		return errors.New("miner hotel key was not installed inside the guest")
+	}
+	return nil
+}
+
+// verifyMinerBootstrap checks a keyless HTTPS attestation before the broker
+// constructs any client that holds the hotel key.
+func (b *broker) verifyMinerBootstrap(ctx context.Context, raw []byte, peerSPKI string) error {
+	if len(b.cfg.SealedMeasurements) == 0 {
+		return errors.New("a miner hotel needs a nonempty sealed_measurements allowlist")
+	}
+	var att struct {
+		Binding    json.RawMessage `json:"binding"`
+		BindingSHA string          `json:"binding_sha256"`
+		Report     string          `json:"report_b64"`
+	}
+	if json.Unmarshal(raw, &att) != nil {
+		return errors.New("miner attestation is not JSON")
+	}
+	if _, err := verifyAttestation(att.Binding, att.BindingSHA, att.Report, b.cfg.SealedMeasurements, b.cfg.SealedHostData); err != nil {
+		return err
+	}
+	if err := verifyMinerTLSBinding(att.Binding, peerSPKI); err != nil {
+		return err
+	}
+	if b.cfg.AMDVerifier == nil {
+		return errors.New("a miner hotel needs the AMD chain check")
+	}
+	_, err := b.verifyAMDChain(ctx, raw)
+	return err
 }
 
 // verifyAttestation is the check of the package comment. rawBinding is the

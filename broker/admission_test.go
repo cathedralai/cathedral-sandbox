@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -107,6 +108,7 @@ func snpAttestation(t testing.TB, o attestOpts) []byte {
 type minerHotel struct {
 	*fakeHotel
 	slots atomic.Int64
+	cert  *x509.Certificate
 }
 
 func (m *minerHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -124,6 +126,9 @@ func (m *minerHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (m *minerHotel) setAttestation(b []byte) {
 	m.mu.Lock()
+	if b != nil && m.cert != nil {
+		b = testAttestationWithTLSPin(m.t, b, m.cert)
+	}
 	m.attestation = b
 	m.mu.Unlock()
 }
@@ -138,9 +143,65 @@ func newMinerHotel(t *testing.T, slots int, att []byte) (*minerHotel, string) {
 	t.Helper()
 	m := &minerHotel{fakeHotel: &fakeHotel{t: t, snaps: map[string]map[string]any{}, attestation: att}}
 	m.slots.Store(int64(slots))
+	if att == nil {
+		hs := httptest.NewServer(m)
+		t.Cleanup(hs.Close)
+		return m, hs.URL
+	}
+	hs := httptest.NewTLSServer(m)
+	m.cert = hs.Certificate()
+	m.attestation = testAttestationWithTLSPin(t, att, hs.Certificate())
+	t.Cleanup(hs.Close)
+	return m, hs.URL
+}
+
+// Operator hotel fixtures use HTTP; miner fixtures use guest TLS with an SNP-bound key.
+func newOperatorHotel(t *testing.T, slots int, att []byte) (*minerHotel, string) {
+	t.Helper()
+	m := &minerHotel{fakeHotel: &fakeHotel{t: t, snaps: map[string]map[string]any{}, attestation: att}}
+	m.slots.Store(int64(slots))
 	hs := httptest.NewServer(m)
 	t.Cleanup(hs.Close)
 	return m, hs.URL
+}
+
+func testAttestationWithTLSPin(t *testing.T, raw []byte, cert *x509.Certificate) []byte {
+	t.Helper()
+	var doc struct {
+		Binding    json.RawMessage `json:"binding"`
+		BindingSHA string          `json:"binding_sha256"`
+		Report     string          `json:"report_b64"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	var binding map[string]any
+	if err := json.Unmarshal(doc.Binding, &binding); err != nil {
+		t.Fatal(err)
+	}
+	oldSum := sha256.Sum256(doc.Binding)
+	oldSHA := hex.EncodeToString(oldSum[:])
+	spki := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+	binding["tls_spki_sha256"] = hex.EncodeToString(spki[:])
+	binding["hotel_key_source"] = "install"
+	newBinding, _ := json.Marshal(binding)
+	newSum := sha256.Sum256(newBinding)
+	if doc.BindingSHA == oldSHA {
+		doc.BindingSHA = hex.EncodeToString(newSum[:])
+	}
+	if doc.Report != "" {
+		report, err := base64.StdEncoding.DecodeString(doc.Report)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Equal(report[0x50:0x70], oldSum[:]) {
+			copy(report[0x50:0x70], newSum[:])
+		}
+		doc.Report = base64.StdEncoding.EncodeToString(report)
+	}
+	doc.Binding = newBinding
+	out, _ := json.Marshal(doc)
+	return out
 }
 
 // chipOf is a CHIP_ID seed per hotel id: each test hotel is its own machine.
@@ -152,8 +213,8 @@ func chipOf(id string) byte {
 	return s
 }
 
-// joinMiner joins a miner hotel through the operator route and runs one sync
-// step, as the sync loop would: health, then the attestation check.
+// joinMiner joins a sealed miner, or an unsealed operator hotel used by legacy
+// placement tests, and runs one sync step.
 func joinMiner(t *testing.T, tc *testChain, id string, sealed bool, slots int, extra map[string]any) *minerHotel {
 	t.Helper()
 	var att []byte
@@ -162,7 +223,10 @@ func joinMiner(t *testing.T, tc *testChain, id string, sealed bool, slots int, e
 	}
 	m, url := newMinerHotel(t, slots, att)
 	tc.hotels[id] = m.fakeHotel
-	body := map[string]any{"id": id, "api": url, "key": joinKey, "sealed": sealed, "miner_hotkey": minerHotkey}
+	body := map[string]any{"id": id, "api": url, "key": joinKey, "sealed": sealed}
+	if sealed {
+		body["miner_hotkey"] = minerHotkey
+	}
 	for k, v := range extra {
 		body[k] = v
 	}
@@ -204,6 +268,13 @@ func setPolicy(t *testing.T, tc *testChain, guest string, policy map[string]any)
 	}
 }
 
+func optInMiner(t *testing.T, tc *testChain, guest string) {
+	setPolicy(t, tc, guest, map[string]any{
+		"prefer": []any{map[string]any{"label": map[string]string{"miner": "true"}}},
+		"allow":  []any{map[string]any{"class": "sealed"}, map[string]any{"class": "unsealed"}},
+	})
+}
+
 func reasonOf(doc map[string]any) map[string]any {
 	r, _ := doc["reason"].(map[string]any)
 	return r
@@ -241,6 +312,7 @@ func TestJoinedMinerHotelPersistsAcrossRestartAndMustPassAgain(t *testing.T) {
 	}
 
 	tc.start(t) // restart: same config, same state_dir
+	optInMiner(t, tc, "g1")
 	h := tc.b.hotelByID("m1")
 	if h == nil || h.cfg.MinerHotkey != minerHotkey || h.cfg.MaxSlots != 2 || h.reservedFor() != "g1" || h.labels()["zone"] != "eu" || h.labels()["miner"] != "true" {
 		t.Fatalf("hotel after restart: %+v", h)
@@ -289,7 +361,7 @@ func TestSealedJoinPassesAttestationBeforePlacement(t *testing.T) {
 		"binding hash":  {badSHA: true},
 	}
 	for name, o := range bad {
-		_, url := newMinerHotel(t, 5, snpAttestation(t, o))
+		_, url := newOperatorHotel(t, 5, snpAttestation(t, o))
 		status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "bad", "api": url, "key": joinKey, "sealed": true})
 		if status != 422 || errCode(doc) != "attestation_failed" {
 			t.Fatalf("%s: %d %v", name, status, doc)
@@ -299,13 +371,13 @@ func TestSealedJoinPassesAttestationBeforePlacement(t *testing.T) {
 		}
 	}
 	// No attestation endpoint at all: refused too.
-	_, url := newMinerHotel(t, 5, nil)
+	_, url := newOperatorHotel(t, 5, nil)
 	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "bad", "api": url, "key": joinKey, "sealed": true}); status != 422 {
 		t.Fatalf("no attestation: %d %v", status, doc)
 	}
 
 	// verify false: the hotel joins pending and takes no room until it passes.
-	m, url := newMinerHotel(t, 5, nil)
+	m, url := newOperatorHotel(t, 5, nil)
 	tc.hotels["p"] = m.fakeHotel
 	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "p", "api": url, "key": joinKey, "sealed": true, "verify": false}); status != 201 {
 		t.Fatalf("join pending: %d %v", status, doc)
@@ -400,6 +472,7 @@ func TestVerifyAttestationKeepsTheReceiptKey(t *testing.T) {
 
 func TestUnhealthyOrExpiredHotelLeavesPlacementAndComesBack(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
+	optInMiner(t, tc, "g1")
 	m := joinMiner(t, tc, "m1", true, 5, nil)
 	onM1 := map[string]any{"image": "alpine:3.20", "hotels": []string{"m1"}}
 	tc.room(t, "key1", onM1)
@@ -478,7 +551,7 @@ func TestUnhealthyOrExpiredHotelLeavesPlacementAndComesBack(t *testing.T) {
 // ---------------------------------------------------------------- spill and reasons
 
 var sealedFirst = map[string]any{
-	"prefer": []any{map[string]any{"class": "sealed"}},
+	"prefer": []any{map[string]any{"class": "sealed"}, map[string]any{"label": map[string]string{"miner": "true"}}},
 	"allow":  []any{map[string]any{"class": "unsealed"}},
 }
 
@@ -543,10 +616,36 @@ func TestSpillFromJoinedSealedToUnsealedAndClearReasons(t *testing.T) {
 
 // ---------------------------------------------------------------- isolation
 
+func TestMinerPlacementRequiresExplicitGuestOptIn(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	joinMiner(t, tc, "m1", true, 2, nil)
+	onM1 := map[string]any{"image": "alpine:3.20", "hotels": []string{"m1"}, "sealed": true}
+	for _, policy := range []map[string]any{
+		nil,
+		{"prefer": []any{map[string]any{"class": "sealed"}}},
+	} {
+		if policy != nil {
+			setPolicy(t, tc, "g1", policy)
+		}
+		if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", onM1); status != 409 {
+			t.Fatalf("miner reached without explicit opt-in: %d %v", status, doc)
+		}
+		_, cat := tc.call(t, "key1", "GET", "/v1/broker/capacity", nil)
+		if listed(cat, "m1") {
+			t.Fatalf("miner appeared in guest capacity without opt-in: %v", cat)
+		}
+	}
+	optInMiner(t, tc, "g1")
+	if id := tc.room(t, "key1", onM1); !strings.HasPrefix(id, "m1.") {
+		t.Fatalf("explicit canary guest did not reach miner: %s", id)
+	}
+}
+
 func TestMinerHotelIsolationDenyAndReserve(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
+	optInMiner(t, tc, "g1")
 	joinMiner(t, tc, "m1", true, 10, nil)
-	joinMiner(t, tc, "m2", false, 10, nil)
+	joinMiner(t, tc, "m2", true, 10, nil)
 	// g2 denies miner hotels. Its only other hotels are draining: a miner
 	// hotel is the only free room, and it must still not get g2's create.
 	setPolicy(t, tc, "g2", map[string]any{
@@ -628,9 +727,9 @@ func TestCapacityClassTotalsIncludeJoinedHotels(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	joinMiner(t, tc, "m1", true, 7, nil)
 	joinMiner(t, tc, "m2", false, 4, nil)
-	pm, url := newMinerHotel(t, 9, nil)
+	pm, url := newOperatorHotel(t, 9, nil)
 	tc.hotels["m3"] = pm.fakeHotel
-	tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "m3", "api": url, "key": joinKey, "sealed": true, "verify": false, "miner_hotkey": minerHotkey})
+	tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "m3", "api": url, "key": joinKey, "sealed": true, "verify": false})
 	syncNow(tc, "m3")
 	status, doc := tc.call(t, "operator-key", "GET", "/v1/broker/capacity", nil)
 	classes, _ := doc["classes"].(map[string]any)
@@ -656,7 +755,7 @@ func TestCapacityClassTotalsIncludeJoinedHotels(t *testing.T) {
 	classes, _ = doc["classes"].(map[string]any)
 	sealed, _ = classes["sealed"].(map[string]any)
 	unsealed, _ = classes["unsealed"].(map[string]any)
-	if sealed["hotels"] != float64(1) || sealed["free_rooms"] != float64(100) || unsealed["hotels"] != float64(0) {
+	if sealed["hotels"] != float64(2) || sealed["pending_admission"] != float64(1) || sealed["free_rooms"] != float64(100) || unsealed["hotels"] != float64(0) {
 		t.Fatalf("guest totals: %v", classes)
 	}
 }
@@ -665,6 +764,7 @@ func TestCapacityClassTotalsIncludeJoinedHotels(t *testing.T) {
 // not start there after the hotel lost admission (Codex P1 on #340).
 func TestQueuedCreateDoesNotStartOnAHotelThatLostAdmission(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
+	optInMiner(t, tc, "g1")
 	m := joinMiner(t, tc, "m1", true, 5, nil)
 	m.mu.Lock()
 	m.createDelay = 500 * time.Millisecond

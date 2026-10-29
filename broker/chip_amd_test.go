@@ -49,6 +49,7 @@ func recheck(t *testing.T, tc *testChain, id string) {
 
 func TestOneHotelPerChip(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
+	optInMiner(t, tc, "g1")
 	sameChip := attestOpts{chip: 7}
 	m1, url1 := newMinerHotel(t, 5, snpAttestation(t, sameChip))
 	tc.hotels["m1"] = m1.fakeHotel
@@ -66,19 +67,15 @@ func TestOneHotelPerChip(t *testing.T) {
 	if tc.b.hotelByID("m2") != nil {
 		t.Fatalf("refused hotel is in the set")
 	}
-	// Joined without verify, it is held refused with the reason, and gets no room.
-	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "m2", "api": url2, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey, "verify": false}); status != 201 {
-		t.Fatalf("join m2 unverified: %d %v", status, doc)
-	}
-	syncNow(tc, "m2")
-	if a := admissionOf(t, tc, "m2"); a["state"] != "refused" || !strings.Contains(fmt.Sprint(a["reason"]), "already hotel m1") {
-		t.Fatalf("m2 admission: %v", a)
+	// A miner cannot bypass the duplicate check by disabling verification.
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "m2", "api": url2, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey, "verify": false}); status != 409 || errCode(doc) != "guest_tls_required" {
+		t.Fatalf("unverified miner join: %d %v", status, doc)
 	}
 	onM2 := map[string]any{"image": "alpine:3.20", "hotels": []string{"m2"}}
-	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", onM2); status != 503 || errCode(doc) != "hotels_not_admitted" {
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", onM2); status != 409 || errCode(doc) != "unknown_hotel" {
 		t.Fatalf("create on the duplicate: %d %v", status, doc)
 	}
-	// m1 goes down: m2 may take the chip; m1 back is then the duplicate.
+	// m1 goes down: m2 may join and take the chip; m1 back is then the duplicate.
 	m1.setHealthFail(true)
 	h1 := tc.b.hotelByID("m1")
 	tc.b.mu.Lock()
@@ -86,6 +83,10 @@ func TestOneHotelPerChip(t *testing.T) {
 	tc.b.mu.Unlock()
 	h1.lastAnswer.Store(0)
 	syncNow(tc, "m1")
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "m2", "api": url2, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey}); status != 201 {
+		t.Fatalf("m2 join after m1 down: %d %v", status, doc)
+	}
+	syncNow(tc, "m2")
 	recheck(t, tc, "m2")
 	if id := tc.room(t, "key1", onM2); !strings.HasPrefix(id, "m2.") {
 		t.Fatalf("m2 after m1 left: %s", id)
@@ -145,17 +146,48 @@ func TestConcurrentJoinsOnOneChipAdmitOne(t *testing.T) {
 	}
 }
 
+func TestConcurrentMinerJoinsRespectHotkeyCap(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.MinerHotkeyCaps[minerHotkey] = 2
+	const n = 8
+	urls := make([]string, n)
+	for i := range urls {
+		_, urls[i] = newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: byte(i + 1)}))
+	}
+	var wg sync.WaitGroup
+	results := make(chan string, n)
+	for i := range urls {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+				"id": fmt.Sprintf("cap-%d", i), "api": urls[i], "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
+			})
+			results <- fmt.Sprintf("%d:%s", status, errCode(doc))
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	counts := map[string]int{}
+	for result := range results {
+		counts[result]++
+	}
+	if counts["201:"] != 2 || counts["409:miner_cap_reached"] != n-2 {
+		t.Fatalf("concurrent cap results: %v", counts)
+	}
+}
+
 func TestAMDChainRequiredForMinerHotels(t *testing.T) {
 	// No verifier configured (set before any sync loop runs).
 	tc := newChainState(t, t.TempDir())
 	tc.b.cfg.AMDVerifier = nil
 	_, url := newMinerHotel(t, 5, snpAttestation(t, attestOpts{chip: 1}))
 	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "m1", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey})
-	if status != 422 || !strings.Contains(fmt.Sprint(doc), "amd_verifier") {
+	if status != 422 || !strings.Contains(fmt.Sprint(doc), "AMD chain check") {
 		t.Fatalf("miner hotel with no chain verifier: %d %v", status, doc)
 	}
 	// An operator hotel (no miner_hotkey) is not chain-checked without a verifier.
-	_, url = newMinerHotel(t, 5, snpAttestation(t, attestOpts{chip: 2}))
+	_, url = newOperatorHotel(t, 5, snpAttestation(t, attestOpts{chip: 2}))
 	status, doc = tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "op1", "api": url, "key": joinKey, "sealed": true})
 	if a, _ := doc["admission"].(map[string]any); status != 201 || a["attested_at"] == nil || a["amd_chain_required"] != false || a["amd_chain"] != nil {
 		t.Fatalf("operator hotel: %d %v", status, doc)
@@ -163,6 +195,7 @@ func TestAMDChainRequiredForMinerHotels(t *testing.T) {
 
 	// With the verifier: FAIL refuses with its reason, PASS admits.
 	tc = newChainState(t, t.TempDir())
+	optInMiner(t, tc, "g1")
 	setAMDVerdict(t, tc.amdDir, `{"verdict": "FAIL", "reason": "report signature does not verify with the VCEK"}`)
 	m, url := newMinerHotel(t, 5, snpAttestation(t, attestOpts{chip: 3}))
 	tc.hotels["m1"] = m.fakeHotel
@@ -207,6 +240,169 @@ func TestAMDChainRequiredForMinerHotels(t *testing.T) {
 	}
 	setAMDVerdict(t, tc.amdDir, amdPass)
 	admitNow(t, tc, "m1")
+}
+
+func TestMinerAdmissionCannotBeDisabled(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.SealedAdmission = "off"
+	_, url := newMinerHotel(t, 5, snpAttestation(t, attestOpts{debugPolicy: true}))
+	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+		"id": "m1", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
+	})
+	if status != 422 || errCode(doc) != "attestation_failed" {
+		t.Fatalf("unverified miner admitted while sealed_admission=off: %d %v", status, doc)
+	}
+	if tc.b.hotelByID("m1") != nil {
+		t.Fatal("refused miner was stored")
+	}
+}
+
+func TestMinerAdmissionRequiresMeasurementAllowlist(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.SealedMeasurements = nil
+	_, url := newMinerHotel(t, 5, snpAttestation(t, attestOpts{}))
+	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+		"id": "m1", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
+	})
+	if status != 422 || errCode(doc) != "attestation_failed" || !strings.Contains(fmt.Sprint(doc), "sealed_measurements") {
+		t.Fatalf("miner admitted without measurement policy: %d %v", status, doc)
+	}
+	if tc.b.hotelByID("m1") != nil {
+		t.Fatal("refused miner was stored")
+	}
+}
+
+func TestMinerHotkeyCapRefusesNextMachine(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.MinerHotkeyCaps[minerHotkey] = 2
+	joinMiner(t, tc, "m1", true, 1, nil)
+	joinMiner(t, tc, "m2", true, 1, nil)
+	_, url := newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: chipOf("m3")}))
+	third := map[string]any{"id": "m3", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey}
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", third); status != 409 || errCode(doc) != "miner_cap_reached" {
+		t.Fatalf("third miner machine exceeded cap: %d %v", status, doc)
+	}
+	if tc.b.hotelByID("m3") != nil {
+		t.Fatal("over-cap machine was stored")
+	}
+	if status, doc := tc.call(t, "operator-key", "DELETE", "/v1/broker/hotels/m1", nil); status != 204 {
+		t.Fatalf("leave first machine: %d %v", status, doc)
+	}
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", third); status != 201 {
+		t.Fatalf("replacement machine under cap: %d %v", status, doc)
+	}
+
+	tc.b.cfg.MinerHotkeyCaps[minerHotkey] = 0
+	_, url = newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: chipOf("m4")}))
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+		"id": "m4", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
+	}); status != 403 || errCode(doc) != "miner_not_approved" {
+		t.Fatalf("unapproved hotkey joined: %d %v", status, doc)
+	}
+}
+
+func TestMinerGlobalCapCountsAllHotkeysAndDrainingHotels(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	otherHotkey := strings.Repeat("7", len(minerHotkey))
+	tc.b.cfg.MinerHotkeyCaps[minerHotkey] = 2
+	tc.b.cfg.MinerHotkeyCaps[otherHotkey] = 2
+	tc.b.cfg.MinerMaxHotels = 2
+	joinMiner(t, tc, "m1", true, 1, nil)
+	joinMiner(t, tc, "m2", true, 1, map[string]any{"miner_hotkey": otherHotkey})
+	_, url := newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: chipOf("m3")}))
+	third := map[string]any{"id": "m3", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey}
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", third); status != 409 || errCode(doc) != "miner_global_cap_reached" {
+		t.Fatalf("global cap across hotkeys: %d %v", status, doc)
+	}
+	if status, _ := tc.call(t, "operator-key", "PATCH", "/v1/broker/hotels/m1", map[string]any{"drain": true}); status != 200 {
+		t.Fatalf("drain first miner: %d", status)
+	}
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", third); status != 409 || errCode(doc) != "miner_global_cap_reached" {
+		t.Fatalf("draining miner freed cap: %d %v", status, doc)
+	}
+	if status, _ := tc.call(t, "operator-key", "DELETE", "/v1/broker/hotels/m1", nil); status != 204 {
+		t.Fatalf("leave first miner: %d", status)
+	}
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", third); status != 201 {
+		t.Fatalf("replacement under global cap: %d %v", status, doc)
+	}
+	tc.b.cfg.MinerMaxHotels = 0
+	_, url = newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: chipOf("m4")}))
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+		"id": "m4", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": otherHotkey,
+	}); status != 403 || errCode(doc) != "miner_global_cap_unset" {
+		t.Fatalf("unset global cap allowed miner: %d %v", status, doc)
+	}
+}
+
+func TestConcurrentMinerJoinsRespectGlobalCap(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	otherHotkey := strings.Repeat("7", len(minerHotkey))
+	tc.b.cfg.MinerHotkeyCaps[minerHotkey] = 8
+	tc.b.cfg.MinerHotkeyCaps[otherHotkey] = 8
+	tc.b.cfg.MinerMaxHotels = 3
+	const n = 8
+	urls := make([]string, n)
+	for i := range urls {
+		_, urls[i] = newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: byte(i + 1)}))
+	}
+	var wg sync.WaitGroup
+	results := make(chan string, n)
+	for i := range urls {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			hotkey := minerHotkey
+			if i%2 == 1 {
+				hotkey = otherHotkey
+			}
+			status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+				"id": fmt.Sprintf("global-%d", i), "api": urls[i], "key": joinKey, "sealed": true, "miner_hotkey": hotkey,
+			})
+			results <- fmt.Sprintf("%d:%s", status, errCode(doc))
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	counts := map[string]int{}
+	for outcome := range results {
+		counts[outcome]++
+	}
+	if counts["201:"] != 3 || counts["409:miner_global_cap_reached"] != n-3 {
+		t.Fatalf("concurrent global cap outcomes: %v", counts)
+	}
+}
+
+func TestLegacyUnsealedMinerCannotTakeRooms(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	h := newHotel(hotelConfig{ID: "old-miner", MinerHotkey: minerHotkey, MaxSlots: 5}, joinKey)
+	h.runtime, h.ok, h.slots = true, true, 5
+	if err := tc.b.addHotel(h); err != nil {
+		t.Fatal(err)
+	}
+	tc.b.mu.Lock()
+	free := tc.b.admissibleFree(h, time.Now())
+	tc.b.mu.Unlock()
+	if free != 0 {
+		t.Fatalf("legacy unsealed miner offers %d rooms", free)
+	}
+}
+
+func TestConfiguredMinerStillNeedsAttestation(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.SealedAdmission = "off"
+	h := newHotel(hotelConfig{ID: "configured-miner", Sealed: true, MinerHotkey: minerHotkey, MaxSlots: 5}, joinKey)
+	h.ok, h.slots = true, 5
+	if err := tc.b.addHotel(h); err != nil {
+		t.Fatal(err)
+	}
+	tc.b.mu.Lock()
+	free := tc.b.admissibleFree(h, time.Now())
+	required := tc.b.needsAttestation(h)
+	tc.b.mu.Unlock()
+	if !required || free != 0 {
+		t.Fatalf("configured miner bypassed admission: required=%t free=%d", required, free)
+	}
 }
 
 func TestAMDVerifierConfigNeedsAPinnedARK(t *testing.T) {

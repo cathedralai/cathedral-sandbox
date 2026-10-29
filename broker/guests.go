@@ -5,7 +5,7 @@
 //	"max_rooms": 1000              rooms running or starting at one time (0 or absent: 1,000)
 //	"max_creates_per_minute": 600  rooms the guest may ask for in any 60 s (0 or absent: no limit)
 //	"default_sealed": true         a create with no hotel choice goes to sealed hotels only
-//	"hotels": ["a", "b"]           the guest may use only these hotels (absent: all hotels)
+//	"hotels": ["a", "b"]           the guest may use only these hotels (absent: all non-miner hotels)
 //	"policy": {prefer, allow, deny} hotels by selector; replaces "hotels" and "default_sealed" (capacity.go)
 //	"ops": true                    the guest may run the probe and reset the broker counters
 //
@@ -58,6 +58,9 @@ func (l guestLimits) maxRooms() int {
 // reach.
 // It does not look at hotel reservations; guestState.tierOf does.
 func (l guestLimits) tierOf(h *hotel) string {
+	if h.cfg.MinerHotkey != "" && !l.Policy.minerOptIn(h) {
+		return ""
+	}
 	if l.Policy != nil {
 		return l.Policy.tier(h)
 	}
@@ -67,7 +70,8 @@ func (l guestLimits) tierOf(h *hotel) string {
 	return ""
 }
 
-// allows reports whether the hotel list (no policy) allows hotel id.
+// allows reports whether the hotel list (no policy) allows hotel id. Miner
+// hotels are separately denied by tierOf without an explicit miner policy.
 func (l guestLimits) allows(id string) bool {
 	if len(l.Hotels) == 0 {
 		return true

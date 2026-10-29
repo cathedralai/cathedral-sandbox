@@ -70,6 +70,9 @@ type placement struct {
 }
 
 func (pl placement) selects(h *hotel) bool {
+	if h.cfg.MinerHotkey != "" && !pl.policy.minerOptIn(h) {
+		return false
+	}
 	if len(pl.allowed) > 0 && !pl.allowed[h.cfg.ID] {
 		return false
 	}

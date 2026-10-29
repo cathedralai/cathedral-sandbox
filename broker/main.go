@@ -64,6 +64,9 @@ type hotelConfig struct {
 	// The hotel then carries the labels miner=true and miner_hotkey=<key>,
 	// so a guest policy can deny miner hotels ({"label": {"miner": "true"}}).
 	MinerHotkey string `json:"miner_hotkey,omitempty"`
+	// TLSSPKISHA256 is derived from a miner hotel's verified SNP binding at
+	// join and persisted for safe reconnect after a broker restart.
+	TLSSPKISHA256 string `json:"tls_spki_sha256,omitempty"`
 }
 
 type guestConfig struct {
@@ -94,8 +97,17 @@ type config struct {
 	// OperatorKeySHA256 is the SHA-256 of the operator key. It allows hotel
 	// join, change and leave at runtime (hotels.go). Empty: no operator routes.
 	OperatorKeySHA256 string `json:"operator_key_sha256"`
+	// MinerEnrollKeySHA256 permits only verified miner joins, miner reads,
+	// drain=true, and empty miner leaves through the hotel admin routes.
+	MinerEnrollKeySHA256 string `json:"miner_enroll_key_sha256,omitempty"`
+	// MinerHotkeyCaps is the operator-approved maximum number of joined hotels
+	// per miner hotkey. Miner joins without an entry are refused.
+	MinerHotkeyCaps map[string]int `json:"miner_hotkey_caps,omitempty"`
+	// MinerMaxHotels is the operator-approved maximum across all miner hotkeys.
+	// Zero refuses miner joins; pending and draining hotels count.
+	MinerMaxHotels int `json:"miner_max_hotels,omitempty"`
 	// Admission of joined hotels (admission.go). SealedAdmission "off" turns
-	// the attestation gate off; anything else ("" or "enforce") keeps it.
+	// the attestation gate off for operator hotels, never miner hotels.
 	SealedAdmission    string   `json:"sealed_admission,omitempty"`
 	SealedMeasurements []string `json:"sealed_measurements,omitempty"`  // non-empty: a joined sealed hotel's measurement must be one of these
 	SealedHostData     []string `json:"sealed_host_data,omitempty"`     // non-empty: its HOST_DATA must be one of these
@@ -148,12 +160,13 @@ type room struct {
 type latencies struct{ hotel, queue, overhead []float64 }
 
 type hotel struct {
-	cfg    hotelConfig
-	key    string
-	client *http.Client
-	ctl    *http.Client // sync loop and hotel documents
-	cfgMu  sync.RWMutex // guards cfg.Labels, cfg.Drain and cfg.ReservedFor, which PATCH changes while creates read them
-	sem    chan struct{}
+	cfg       hotelConfig
+	key       string
+	client    *http.Client
+	ctl       *http.Client // sync loop and hotel documents
+	tlsPinErr error        // non-nil: miner calls must not send the hotel key
+	cfgMu     sync.RWMutex // guards cfg.Labels, cfg.Drain and cfg.ReservedFor, which PATCH changes while creates read them
+	sem       chan struct{}
 
 	// Guarded by broker.mu.
 	slots        int
@@ -203,18 +216,18 @@ type guestState struct {
 }
 
 type broker struct {
-	cfg          config
-	mu           sync.Mutex
-	hset         atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
-	hotelsMu     sync.Mutex               // serialises joins and leaves
-	hotelsSaveMu sync.Mutex               // serialises writes of state_dir/hotels.json
-	guests       map[string]*guestState
-	capsOnDisk   map[string]map[string]any // probe results read from state_dir at start
-	byKey        map[string]*guestState    // sha256(key) -> guest
-	byUUID       map[string]*room
-	compat       *compatState
-	prefetch     prefetchJobs
-	started      time.Time
+	cfg              config
+	mu               sync.Mutex
+	hset             atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
+	hotelsMu         sync.Mutex               // serialises joins and leaves
+	hotelsMutationMu sync.Mutex               // keeps runtime mutations and their saves in order
+	guests           map[string]*guestState
+	capsOnDisk       map[string]map[string]any // probe results read from state_dir at start
+	byKey            map[string]*guestState    // sha256(key) -> guest
+	byUUID           map[string]*room
+	compat           *compatState
+	prefetch         prefetchJobs
+	started          time.Time
 
 	// Durable client state (state.go).
 	savedUUIDs map[string]string // broker room id -> client id, from the state file
@@ -278,8 +291,28 @@ func loadBroker(path string) (*broker, error) {
 	if err := refusePlaintextEscapeNonce(c.EscapeNonceAllowPlaintext); err != nil {
 		return nil, err
 	}
+	if c.MinerEnrollKeySHA256 != "" {
+		hash, err := hex.DecodeString(c.MinerEnrollKeySHA256)
+		if err != nil || len(hash) != sha256.Size {
+			return nil, errors.New("config: miner_enroll_key_sha256 must be a SHA-256 hex digest")
+		}
+	}
+	if c.MinerEnrollKeySHA256 != "" && strings.EqualFold(c.MinerEnrollKeySHA256, c.OperatorKeySHA256) {
+		return nil, errors.New("config: miner enrollment key must differ from the operator key")
+	}
+	for hotkey, cap := range c.MinerHotkeyCaps {
+		if !ss58RE.MatchString(hotkey) || cap < 1 {
+			return nil, fmt.Errorf("config: miner_hotkey_caps requires an SS58 hotkey and a positive machine cap")
+		}
+	}
+	if c.MinerMaxHotels < 0 {
+		return nil, errors.New("config: miner_max_hotels must be positive when miner hotels are allowed")
+	}
 	b := &broker{cfg: c, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), started: time.Now()}
 	for _, hc := range c.Hotels {
+		if hc.MinerHotkey != "" {
+			return nil, fmt.Errorf("config: miner hotel %q must join with attested guest TLS", hc.ID)
+		}
 		if strings.Contains(hc.ID, ".") || hc.ID == "" {
 			return nil, fmt.Errorf("hotel id %q: must be non-empty and have no dot", hc.ID)
 		}
@@ -296,6 +329,9 @@ func loadBroker(path string) (*broker, error) {
 		}
 	}
 	for _, gc := range c.Guests {
+		if c.MinerEnrollKeySHA256 != "" && (strings.EqualFold(c.MinerEnrollKeySHA256, gc.KeySHA256) || strings.EqualFold(c.MinerEnrollKeySHA256, gc.ViewTokenSHA256)) {
+			return nil, errors.New("config: miner enrollment key must differ from guest keys and view tokens")
+		}
 		if gc.ID == "" {
 			return nil, errors.New("config: a guest has no id (rooms with no broker_guest label would be its own)")
 		}
@@ -342,6 +378,14 @@ func (h *hotel) doBase(ctx context.Context, base, method, path string, query url
 // doHeaders is doBase with extra request headers (the guest id of
 // guestcalls.go).
 func (h *hotel) doHeaders(ctx context.Context, base, method, path string, query url.Values, body []byte, timeout time.Duration, extra http.Header) (int, http.Header, []byte, error) {
+	if h.cfg.MinerHotkey != "" {
+		if h.tlsPinErr != nil {
+			return 0, nil, nil, h.tlsPinErr
+		}
+		if !strings.HasPrefix(base, "https://") {
+			return 0, nil, nil, errors.New("miner hotel API requires attested HTTPS")
+		}
+	}
 	u := base + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
@@ -374,6 +418,14 @@ func (h *hotel) doHeaders(ctx context.Context, base, method, path string, query 
 }
 
 func (h *hotel) getJSON(ctx context.Context, base, path string, query url.Values, v any) error {
+	if h.cfg.MinerHotkey != "" {
+		if h.tlsPinErr != nil {
+			return h.tlsPinErr
+		}
+		if !strings.HasPrefix(base, "https://") {
+			return errors.New("miner hotel API requires attested HTTPS")
+		}
+	}
 	u := base + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
@@ -1826,7 +1878,11 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if p == "/v1/broker/capacity" && r.Method == "GET" && b.isOperator(r) {
-		b.handleCapacity(w, nil) // every hotel; a guest key gets its own view (serveNative)
+		b.handleCapacity(w, nil, false) // every hotel; a guest key gets its own view (serveNative)
+		return
+	}
+	if p == "/v1/broker/capacity" && r.Method == "GET" && b.isMinerEnroller(r) {
+		b.handleCapacity(w, nil, true) // miner hotels only
 		return
 	}
 	if p == "/v1/broker/guests" || strings.HasPrefix(p, "/v1/broker/guests/") {
@@ -1905,7 +1961,7 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 		case p == "/v1/broker/hotels" && r.Method == "GET":
 			b.handleHotels(w, g)
 		case p == "/v1/broker/capacity" && r.Method == "GET":
-			b.handleCapacity(w, g)
+			b.handleCapacity(w, g, false)
 		case p == "/v1/broker/stats":
 			b.handleStats(w, r, g)
 		case p == "/v1/broker/probe" && r.Method == "POST":

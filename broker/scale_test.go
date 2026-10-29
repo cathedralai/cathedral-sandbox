@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -105,14 +104,14 @@ func TestFillingA600HotelPoolRespectsEveryRule(t *testing.T) {
 		case "down":
 			h.ok = false
 		case "pending":
-			h.runtime, h.cfg.Labels = true, map[string]string{"sealed": "true"}
+			h.runtime, h.cfg.Sealed, h.cfg.Labels = true, true, map[string]string{"sealed": "true"}
 		case "reserved":
 			h.cfg.ReservedFor = "other"
 		case "denied":
-			h.runtime, h.cfg.Labels = true, map[string]string{"sealed": "true", "miner": "true"}
+			h.runtime, h.cfg.Sealed, h.cfg.Labels = true, true, map[string]string{"sealed": "true", "miner": "true"}
 			h.adm.attestedAt = time.Now()
 		case "sealed":
-			h.runtime, h.cfg.Labels = true, map[string]string{"sealed": "true", "miner": "true", "pool": "open"}
+			h.runtime, h.cfg.Sealed, h.cfg.Labels = true, true, map[string]string{"sealed": "true", "miner": "true", "pool": "open"}
 			h.adm.attestedAt = time.Now()
 		}
 	})
@@ -193,7 +192,11 @@ func TestConcurrentJoinsLeavesAndCreates(t *testing.T) {
 	miners := make([]*minerHotel, joins)
 	urls := make([]string, joins)
 	for i := range miners {
-		miners[i], urls[i] = newMinerHotel(t, 3, snpAttestation(t, attestOpts{chip: byte(i)}))
+		if i%2 == 0 {
+			miners[i], urls[i] = newMinerHotel(t, 3, snpAttestation(t, attestOpts{chip: byte(i)}))
+		} else {
+			miners[i], urls[i] = newOperatorHotel(t, 3, snpAttestation(t, attestOpts{chip: byte(i)}))
+		}
 	}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -207,8 +210,11 @@ func TestConcurrentJoinsLeavesAndCreates(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < joins; i++ {
 			id := fmt.Sprintf("j%02d", i)
-			status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
-				"id": id, "api": urls[i], "key": joinKey, "sealed": i%2 == 0, "miner_hotkey": minerHotkey})
+			join := map[string]any{"id": id, "api": urls[i], "key": joinKey, "sealed": i%2 == 0}
+			if i%2 == 0 {
+				join["miner_hotkey"] = minerHotkey
+			}
+			status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", join)
 			if status != 201 {
 				note(fmt.Sprintf("join %s: %d %v", id, status, doc))
 				continue
@@ -288,7 +294,8 @@ func TestConcurrentJoinsLeavesAndCreates(t *testing.T) {
 		t.Fatalf("hotels.json has %d hotels, want %d", len(saved), joins-len(left))
 	}
 	for _, hc := range saved {
-		if left[hc.ID] || !strings.HasPrefix(hc.ID, "j") || hc.MinerHotkey != minerHotkey {
+		var index int
+		if _, err := fmt.Sscanf(hc.ID, "j%02d", &index); err != nil || left[hc.ID] || hc.Sealed != (index%2 == 0) || (hc.MinerHotkey != "") != hc.Sealed {
 			t.Fatalf("hotels.json entry %+v", hc)
 		}
 	}

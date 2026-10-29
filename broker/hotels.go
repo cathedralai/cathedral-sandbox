@@ -22,6 +22,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -39,6 +40,13 @@ type hotelSet struct {
 	list []*hotel
 	byID map[string]*hotel
 }
+
+var (
+	errMinerNotApproved      = errors.New("miner hotkey is not approved for broker hotels")
+	errMinerCapReached       = errors.New("miner hotkey hotel cap reached")
+	errMinerGlobalCapUnset   = errors.New("miner global hotel cap is not configured")
+	errMinerGlobalCapReached = errors.New("miner global hotel cap reached")
+)
 
 func (b *broker) hotelList() []*hotel {
 	if s := b.hset.Load(); s != nil {
@@ -63,7 +71,9 @@ func newHotel(hc hotelConfig, key string) *hotel {
 	// The sync loop (health, quota, list) uses its own small pool: when one
 	// guest's long execs hold every data connection, the hotel must not look down.
 	ctl := &http.Transport{MaxIdleConns: 8, MaxIdleConnsPerHost: 8, MaxConnsPerHost: 8, IdleConnTimeout: 90 * time.Second}
-	return &hotel{cfg: hc, key: key, client: &http.Client{Transport: tr}, ctl: &http.Client{Transport: ctl}, sem: make(chan struct{}, hc.Concurrency), rooms: map[string]*room{}}
+	h := &hotel{cfg: hc, key: key, client: &http.Client{Transport: tr}, ctl: &http.Client{Transport: ctl}, sem: make(chan struct{}, hc.Concurrency), rooms: map[string]*room{}}
+	h.tlsPinErr = pinMinerHotel(h)
+	return h
 }
 
 // fixedLabels is labels plus the labels a hotel always carries: sealed=true
@@ -110,6 +120,16 @@ func (h *hotel) drain() bool {
 
 // addHotel adds h to the hotel set. The caller starts its sync loop.
 func (b *broker) addHotel(h *hotel) error {
+	return b.addHotelWithCapCheck(h, true)
+}
+
+// addHotelRestored retains an existing runtime hotel even if admission caps
+// have since tightened. Caps govern new joins, not recovery of live hotels.
+func (b *broker) addHotelRestored(h *hotel) error {
+	return b.addHotelWithCapCheck(h, false)
+}
+
+func (b *broker) addHotelWithCapCheck(h *hotel, checkCaps bool) error {
 	if strings.Contains(h.cfg.ID, ".") || h.cfg.ID == "" {
 		return fmt.Errorf("hotel id %q: must be non-empty and have no dot", h.cfg.ID)
 	}
@@ -121,6 +141,32 @@ func (b *broker) addHotel(h *hotel) error {
 	b.hotelsMu.Lock()
 	defer b.hotelsMu.Unlock()
 	old := b.hset.Load()
+	if hotkey := h.cfg.MinerHotkey; checkCaps && hotkey != "" {
+		cap := b.cfg.MinerHotkeyCaps[hotkey]
+		if cap < 1 {
+			return errMinerNotApproved
+		}
+		if b.cfg.MinerMaxHotels < 1 {
+			return errMinerGlobalCapUnset
+		}
+		used, total := 0, 0
+		if old != nil {
+			for _, existing := range old.list {
+				if existing.cfg.MinerHotkey != "" {
+					total++
+				}
+				if existing.cfg.MinerHotkey == hotkey {
+					used++
+				}
+			}
+		}
+		if used >= cap {
+			return fmt.Errorf("%w (%d)", errMinerCapReached, cap)
+		}
+		if total >= b.cfg.MinerMaxHotels {
+			return fmt.Errorf("%w (%d)", errMinerGlobalCapReached, b.cfg.MinerMaxHotels)
+		}
+	}
 	next := &hotelSet{byID: map[string]*hotel{}}
 	if old != nil {
 		if old.byID[h.cfg.ID] != nil {
@@ -137,6 +183,32 @@ func (b *broker) addHotel(h *hotel) error {
 	return nil
 }
 
+// minerOverCap reports whether an existing miner hotel falls outside today's
+// caps, in stable hotel order. A drained hotel still consumes a cap slot.
+func (b *broker) minerOverCap(h *hotel) bool {
+	hotkey := h.cfg.MinerHotkey
+	if hotkey == "" {
+		return false
+	}
+	cap := b.cfg.MinerHotkeyCaps[hotkey]
+	if cap < 1 || b.cfg.MinerMaxHotels < 1 {
+		return true
+	}
+	used, total := 0, 0
+	for _, existing := range b.hotelList() {
+		if existing == h {
+			return used >= cap || total >= b.cfg.MinerMaxHotels
+		}
+		if existing.cfg.MinerHotkey != "" {
+			total++
+		}
+		if existing.cfg.MinerHotkey == hotkey {
+			used++
+		}
+	}
+	return true
+}
+
 func (b *broker) dropHotel(id string) {
 	b.hotelsMu.Lock()
 	defer b.hotelsMu.Unlock()
@@ -151,6 +223,26 @@ func (b *broker) dropHotel(id string) {
 	b.hset.Store(next)
 }
 
+// dropHotelIf avoids removing a replacement that joined under the same id
+// while an earlier leave was waiting for room state to settle.
+func (b *broker) dropHotelIf(id string, expected *hotel) bool {
+	b.hotelsMu.Lock()
+	defer b.hotelsMu.Unlock()
+	old := b.hset.Load()
+	if old == nil || old.byID[id] != expected {
+		return false
+	}
+	next := &hotelSet{byID: map[string]*hotel{}}
+	for _, h := range old.list {
+		if h != expected {
+			next.list = append(next.list, h)
+			next.byID[h.cfg.ID] = h
+		}
+	}
+	b.hset.Store(next)
+	return true
+}
+
 // startSync runs the sync loop of h until the hotel leaves.
 func (b *broker) startSync(ctx context.Context, h *hotel) {
 	ctx, cancel := context.WithCancel(ctx)
@@ -162,6 +254,15 @@ func (b *broker) startSync(ctx context.Context, h *hotel) {
 
 func (b *broker) isOperator(r *http.Request) bool {
 	want := strings.ToLower(b.cfg.OperatorKeySHA256)
+	a := r.Header.Get("Authorization")
+	if want == "" || len(a) < 8 || !strings.EqualFold(a[:7], "bearer ") {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(sha(strings.TrimSpace(a[7:]))), []byte(want)) == 1
+}
+
+func (b *broker) isMinerEnroller(r *http.Request) bool {
+	want := strings.ToLower(b.cfg.MinerEnrollKeySHA256)
 	a := r.Header.Get("Authorization")
 	if want == "" || len(a) < 8 || !strings.EqualFold(a[:7], "bearer ") {
 		return false
@@ -186,12 +287,18 @@ func validURL(s string) bool {
 }
 
 func (b *broker) handleHotelAdmin(w http.ResponseWriter, r *http.Request, id string) {
-	if !b.isOperator(r) {
-		writeErr(w, 401, "unauthorized", "the operator key is required")
+	operator := b.isOperator(r)
+	enroller := !operator && b.isMinerEnroller(r)
+	if !operator && !enroller {
+		writeErr(w, 401, "unauthorized", "a hotel administration key is required")
 		return
 	}
 	hotelID, action, hadAction := strings.Cut(id, "/")
 	if hadAction && action == "escape-nonce" && hotelID != "" && r.Method == "POST" {
+		if !operator {
+			writeErr(w, 403, "enroller_scope", "miner enrollment cannot plant Escape nonces")
+			return
+		}
 		b.handleEscapeNoncePlant(w, r, hotelID)
 		return
 	}
@@ -202,19 +309,23 @@ func (b *broker) handleHotelAdmin(w http.ResponseWriter, r *http.Request, id str
 			writeErr(w, 404, "hotel_not_found", "no hotel "+id)
 			return
 		}
+		if enroller && h.cfg.MinerHotkey == "" {
+			writeErr(w, 403, "enroller_scope", "miner enrollment can read only miner hotels")
+			return
+		}
 		writeJSON(w, 200, b.hotelDoc(h))
 	case id == "" && r.Method == "POST":
-		b.joinHotel(w, r)
+		b.joinHotel(w, r, enroller)
 	case id != "" && r.Method == "PATCH":
-		b.patchHotel(w, r, id)
+		b.patchHotel(w, r, id, enroller)
 	case id != "" && r.Method == "DELETE":
-		b.leaveHotel(w, id)
+		b.leaveHotel(w, id, enroller)
 	default:
 		writeErr(w, 404, "route_not_found", "central booking does not route "+r.Method+" "+r.URL.Path)
 	}
 }
 
-func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
+func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool) {
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	var req joinRequest
 	if json.Unmarshal(raw, &req) != nil {
@@ -222,6 +333,14 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hc := req.hotelConfig
+	if enroller {
+		if hc.MinerHotkey == "" || !hc.Sealed || (req.Verify != nil && !*req.Verify) ||
+			hc.ReservedFor != "" || hc.Labels != nil ||
+			!strings.HasPrefix(hc.API, "https://") || (hc.Health != "" && !strings.HasPrefix(hc.Health, "https://")) {
+			writeErr(w, 403, "enroller_scope", "miner enrollment requires a verified HTTPS sealed miner hotel without custom labels or reservation")
+			return
+		}
+	}
 	switch {
 	case hc.ID == "" || strings.Contains(hc.ID, ".") || len(hc.ID) > 64:
 		writeErr(w, 400, "invalid_hotel", "id must be 1 to 64 characters with no dot")
@@ -238,6 +357,12 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 	case hc.MinerHotkey != "" && !ss58RE.MatchString(hc.MinerHotkey):
 		writeErr(w, 400, "invalid_hotel", "miner_hotkey must be an SS58 address")
 		return
+	case hc.MinerHotkey != "" && !hc.Sealed:
+		writeErr(w, 400, "invalid_hotel", "miner hotels must be sealed")
+		return
+	case !hc.Sealed && hc.Labels["sealed"] == "true":
+		writeErr(w, 400, "invalid_hotel", "unsealed hotels cannot claim the sealed label")
+		return
 	case hc.MaxSlots < 0:
 		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
 		return
@@ -248,6 +373,26 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 	}
 	if hc.Health == "" {
 		hc.Health = hc.API
+	}
+	if hc.MinerHotkey != "" {
+		if hc.TLSSPKISHA256 != "" || (req.Verify != nil && !*req.Verify) ||
+			!strings.HasPrefix(hc.API, "https://") || !strings.HasPrefix(hc.Health, "https://") {
+			writeErr(w, 409, "guest_tls_required", "miner join needs verified guest HTTPS; the broker derives its TLS pin from attestation")
+			return
+		}
+		// This request has no bearer key. Verify that the observed TLS key is
+		// committed by the AMD-verified SNP report before constructing a hotel
+		// client that holds the key supplied in the join body.
+		rawAtt, peerSPKI, err := fetchMinerAttestation(r.Context(), hc.Health)
+		if err != nil {
+			writeErr(w, 422, "attestation_failed", "the miner guest did not answer keyless HTTPS attestation")
+			return
+		}
+		if err := b.verifyMinerBootstrap(r.Context(), rawAtt, peerSPKI); err != nil {
+			writeErr(w, 422, "attestation_failed", "the miner guest TLS attestation did not pass: "+err.Error())
+			return
+		}
+		hc.TLSSPKISHA256 = peerSPKI
 	}
 	if hc.Name == "" {
 		hc.Name = hc.ID
@@ -294,6 +439,8 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.cfg.KeyFile = filepath.Join(keyDir, hc.ID+".key")
+	b.hotelsMutationMu.Lock()
+	defer b.hotelsMutationMu.Unlock()
 	// The stop function is set before the hotel is in the set, so a leave
 	// that races this join reads it set.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -305,6 +452,22 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 	h.leaving = true
 	if err := b.addHotel(h); err != nil {
 		cancel()
+		if errors.Is(err, errMinerNotApproved) {
+			writeErr(w, 403, "miner_not_approved", err.Error())
+			return
+		}
+		if errors.Is(err, errMinerCapReached) {
+			writeErr(w, 409, "miner_cap_reached", err.Error())
+			return
+		}
+		if errors.Is(err, errMinerGlobalCapUnset) {
+			writeErr(w, 403, "miner_global_cap_unset", err.Error())
+			return
+		}
+		if errors.Is(err, errMinerGlobalCapReached) {
+			writeErr(w, 409, "miner_global_cap_reached", err.Error())
+			return
+		}
 		writeErr(w, 409, "hotel_exists", err.Error())
 		return
 	}
@@ -313,9 +476,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 	if h.adm.chipFull != "" && !h.adm.attestedAt.IsZero() {
 		holder = b.chipHolder(h, h.adm.chipFull, time.Now())
 	}
-	if holder == nil {
-		h.leaving = false
-	} else {
+	if holder != nil {
 		h.adm.attestedAt = time.Time{}
 	}
 	b.mu.Unlock()
@@ -331,17 +492,34 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "state_write_failed", "cannot keep the hotel key")
 		return
 	}
-	if err := b.saveRuntimeHotels(); err != nil {
+	b.mu.Lock()
+	err := b.saveRuntimeHotelsLocked()
+	if err == nil {
+		h.leaving = false
+	}
+	b.mu.Unlock()
+	if err != nil {
 		log.Printf("runtime hotels not saved: %v", err)
+		b.dropHotel(h.cfg.ID)
+		cancel()
+		_ = os.Remove(h.cfg.KeyFile)
+		writeErr(w, 500, "state_write_failed", "cannot keep the runtime hotel list")
+		return
 	}
 	go b.syncLoop(ctx, h)
 	writeJSON(w, 201, b.hotelDoc(h))
 }
 
-func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string) {
+func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, enroller bool) {
+	b.hotelsMutationMu.Lock()
+	defer b.hotelsMutationMu.Unlock()
 	h := b.hotelByID(id)
 	if h == nil {
 		writeErr(w, 404, "hotel_not_found", "no hotel "+id)
+		return
+	}
+	if enroller && h.cfg.MinerHotkey == "" {
+		writeErr(w, 403, "enroller_scope", "miner enrollment can drain only miner hotels")
 		return
 	}
 	var req struct {
@@ -355,8 +533,20 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string) {
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
 	}
+	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0) {
+		writeErr(w, 403, "enroller_scope", "miner enrollment may only set drain=true")
+		return
+	}
+	if req.Drain != nil && !*req.Drain && b.minerOverCap(h) {
+		writeErr(w, 409, "miner_cap_reached", "hotel is outside the current miner admission caps")
+		return
+	}
 	if req.MaxSlots != nil && *req.MaxSlots < 0 {
 		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
+		return
+	}
+	if h.runtime && !h.cfg.Sealed && req.Labels["sealed"] == "true" {
+		writeErr(w, 400, "invalid_hotel", "unsealed hotels cannot claim the sealed label")
 		return
 	}
 	var reserve *string
@@ -376,6 +566,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	b.mu.Lock()
 	h.cfgMu.Lock()
+	oldCfg := h.cfg
 	if req.Drain != nil {
 		h.cfg.Drain = *req.Drain
 	}
@@ -384,29 +575,45 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string) {
 		h.cfg.Labels = fixedLabels(h.cfg, req.Labels)
 	}
 	if req.MaxSlots != nil {
-		// A lower cap applies now; a higher one at the next health answer.
 		h.cfg.MaxSlots = *req.MaxSlots
-		if h.cfg.MaxSlots > 0 && h.slots > h.cfg.MaxSlots {
-			h.resize(h.cfg.MaxSlots)
-		}
 	}
 	if reserve != nil {
 		h.cfg.ReservedFor = *reserve
 	}
 	h.cfgMu.Unlock()
-	b.mu.Unlock()
 	if h.runtime {
-		if err := b.saveRuntimeHotels(); err != nil {
+		if err := b.saveRuntimeHotelsLocked(); err != nil {
 			log.Printf("runtime hotels not saved: %v", err)
+			h.cfgMu.Lock()
+			h.cfg.Drain = oldCfg.Drain
+			h.cfg.Labels = oldCfg.Labels
+			h.cfg.MaxSlots = oldCfg.MaxSlots
+			h.cfg.ReservedFor = oldCfg.ReservedFor
+			h.cfgMu.Unlock()
+			b.mu.Unlock()
+			writeErr(w, 500, "state_write_failed", "cannot keep the runtime hotel update")
+			return
 		}
 	}
+	if req.MaxSlots != nil {
+		if h.cfg.MaxSlots > 0 && h.slots > h.cfg.MaxSlots {
+			h.resize(h.cfg.MaxSlots)
+		}
+	}
+	b.mu.Unlock()
 	writeJSON(w, 200, b.hotelDoc(h))
 }
 
-func (b *broker) leaveHotel(w http.ResponseWriter, id string) {
+func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller bool) {
+	b.hotelsMutationMu.Lock()
+	defer b.hotelsMutationMu.Unlock()
 	h := b.hotelByID(id)
 	if h == nil {
 		writeErr(w, 404, "hotel_not_found", "no hotel "+id)
+		return
+	}
+	if enroller && h.cfg.MinerHotkey == "" {
+		writeErr(w, 403, "enroller_scope", "miner enrollment can leave only miner hotels")
 		return
 	}
 	if !h.runtime {
@@ -430,12 +637,26 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string) {
 		writeErr(w, 409, "hotel_not_empty", fmt.Sprintf("hotel %s has %d rooms; drain it and wait until they are gone", id, busy))
 		return
 	}
-	b.dropHotel(id)
+	if !b.dropHotelIf(id, h) {
+		writeErr(w, 409, "hotel_changed", "hotel changed during leave; retry")
+		return
+	}
+	b.mu.Lock()
+	err := b.saveRuntimeHotelsLocked()
+	b.mu.Unlock()
+	if err != nil {
+		log.Printf("runtime hotels not saved: %v", err)
+		if addErr := b.addHotelRestored(h); addErr != nil {
+			log.Printf("runtime hotel %s could not be restored after failed save: %v", id, addErr)
+		}
+		b.mu.Lock()
+		h.leaving = false
+		b.mu.Unlock()
+		writeErr(w, 500, "state_write_failed", "cannot keep the runtime hotel removal")
+		return
+	}
 	if h.stop != nil {
 		h.stop()
-	}
-	if err := b.saveRuntimeHotels(); err != nil {
-		log.Printf("runtime hotels not saved: %v", err)
 	}
 	_ = os.Remove(h.cfg.KeyFile)
 	w.WriteHeader(204)
@@ -468,18 +689,15 @@ func (b *broker) guestExists(id string) bool {
 
 const runtimeHotelsFile = "hotels.json"
 
-func (b *broker) saveRuntimeHotels() error {
-	// One save at a time: concurrent joins share the temporary file.
-	b.hotelsSaveMu.Lock()
-	defer b.hotelsSaveMu.Unlock()
+// saveRuntimeHotelsLocked keeps the current runtime snapshot stable through
+// the atomic file replacement. Callers hold b.mu and hotelsMutationMu.
+func (b *broker) saveRuntimeHotelsLocked() error {
 	var list []hotelConfig
-	b.mu.Lock()
 	for _, h := range b.hotelList() {
 		if h.runtime {
 			list = append(list, h.cfg)
 		}
 	}
-	b.mu.Unlock()
 	raw, err := json.MarshalIndent(list, "", "  ")
 	if err != nil {
 		return err
@@ -509,6 +727,10 @@ func (b *broker) loadRuntimeHotels() error {
 		return err
 	}
 	for _, hc := range list {
+		if hc.MinerHotkey != "" && hc.TLSSPKISHA256 == "" {
+			log.Printf("runtime miner hotel %s skipped: no attested TLS pin", hc.ID)
+			continue
+		}
 		k, err := os.ReadFile(hc.KeyFile)
 		if err != nil {
 			log.Printf("runtime hotel %s skipped: key: %v", hc.ID, err)
@@ -516,8 +738,18 @@ func (b *broker) loadRuntimeHotels() error {
 		}
 		h := newHotel(hc, strings.TrimSpace(string(k)))
 		h.runtime = true
-		if err := b.addHotel(h); err != nil {
+		if err := b.addHotelRestored(h); err != nil {
 			log.Printf("runtime hotel %s skipped: %v", hc.ID, err)
+		}
+	}
+	// Keep every restored hotel in the snapshot, but stop new placement on any
+	// miner hotel outside the current per-hotkey or global admission limits.
+	for _, h := range b.hotelList() {
+		if b.minerOverCap(h) {
+			h.cfgMu.Lock()
+			h.cfg.Drain = true
+			h.cfgMu.Unlock()
+			log.Printf("runtime miner hotel %s retained but drained: admission cap changed", h.cfg.ID)
 		}
 	}
 	return nil
