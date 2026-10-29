@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -107,10 +108,16 @@ func TestMinerEnrollmentKeyCannotOperateOutsideMinerScope(t *testing.T) {
 			t.Fatalf("out-of-scope join %v: %d %v", body, status, doc)
 		}
 	}
+	var contacted atomic.Int32
+	tlsHotel := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contacted.Add(1)
+		w.WriteHeader(200)
+	}))
+	defer tlsHotel.Close()
 	if status, doc := tc.call(t, "enroller-key", "POST", "/v1/broker/hotels", map[string]any{
-		"id": "x", "api": "https://127.0.0.1:1", "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
-	}); status != 502 || errCode(doc) != "hotel_unreachable" {
-		t.Fatalf("in-scope join did not reach hotel verification: %d %v", status, doc)
+		"id": "x", "api": tlsHotel.URL, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
+	}); status != 409 || errCode(doc) != "guest_tls_required" || contacted.Load() != 0 {
+		t.Fatalf("scoped join sent key before attested TLS: %d %v contacts=%d", status, doc, contacted.Load())
 	}
 	if status, doc := tc.call(t, "enroller-key", "GET", "/v1/broker/hotels/m1", nil); status != 200 || doc["miner_hotkey"] != minerHotkey {
 		t.Fatalf("read miner hotel: %d %v", status, doc)

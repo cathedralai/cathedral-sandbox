@@ -291,6 +291,12 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 			writeErr(w, 403, "enroller_scope", "miner enrollment requires a verified HTTPS sealed miner hotel without custom labels or reservation")
 			return
 		}
+		// The current sealed room kit sends the API key through host fw_cfg and
+		// serves plain HTTP. A public-CA HTTPS URL alone does not bind the peer
+		// to the SNP report. Do not send the key to /v1/status until that pin
+		// and guest-only key handoff exist.
+		writeErr(w, 409, "guest_tls_required", "attested guest TLS and guest-only key handoff are required before scoped miner enrollment")
+		return
 	}
 	switch {
 	case hc.ID == "" || strings.Contains(hc.ID, ".") || len(hc.ID) > 64:
