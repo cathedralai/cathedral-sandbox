@@ -1,6 +1,6 @@
 # Shared and dedicated sealed hotels
 
-Status: design, not built. Owner of the broker changes: Eng.
+Status: design. Built since: `reserved_for` on a hotel (in place of `dedicated_to` below), `drain`, and lend and reclaim (last section, `broker/lend.go`). Owner of the broker changes: Eng.
 
 ## Two options for a customer
 
@@ -47,3 +47,30 @@ We cannot see inside a sealed machine, so reclaim means: stop new work, let the 
 ## Rollout
 
 Config and restart of the broker. Do it in an agreed quiet window, together with other broker changes, so a live guest sees one restart, not several.
+
+## Lend an idle dedicated machine, and take it back
+
+A dedicated machine with no rooms is idle capacity. Lending it to the shared pool uses that capacity, but a sealed machine is one SEV-SNP guest: inside it only the room runtime separates rooms, and the chip keeps out the host, not co-tenants. A plain `reserved_for: null` and back would put the owner's rooms next to pool rooms, or next to what pool rooms left behind. The broker enforces these rules (review of #309, rules 1, 2 and 4):
+
+1. **Whole machines only.** A lent hotel never takes the owner's rooms. The owner's creates go to its other reserved machines. A create that names the lent hotel, or that only the lent hotel would match, gets `403 hotel_lent`. The broker lends only when the owner has no rooms or creates on the machine.
+2. **Reclaim means drain, destroy, re-seal, re-admit.** The broker gives the machine back only when it has no rooms and runs a new SNP launch: a `REPORT_ID` other than the one recorded at lend time. The AMD firmware sets `REPORT_ID` when it launches the guest, so a new value means a new guest VM. Nothing a pool guest left in memory, on disk or in a workspace survives.
+3. **Owner in HOST_DATA.** Not built. A dedicated machine would launch with `HOST_DATA = sha256("dedicated:" + guest + ":" + epoch)` and the pool machines with the shared value, so a customer verifies "only mine" from the attestation it already fetches. It needs the host launch tooling to set HOST_DATA per machine. Until then, dedication is a broker claim, not an attested fact.
+4. **No workspaces on lent machines.** Workspace creates skip a lent hotel. Reclaim destroys the machine, so a pool workspace there would end early.
+
+### Steps (operator key)
+
+| Step | How | Refused when |
+|---|---|---|
+| Lend | `PATCH /v1/broker/hotels/<id> {"lend": true}` | owner rooms or creates on it (`409 owner_rooms_active`); not reserved; not sealed; attestation fails or has no `REPORT_ID` |
+| Stop new pool rooms | `PATCH {"drain": true}` | |
+| Wait | Pool rooms end or are deleted | |
+| Destroy and re-seal | On the host: stop the sealed guest VM and launch a fresh one with the existing tooling | |
+| Re-admit | A joined hotel passes admission again (health and attestation) | |
+| Reclaim | `PATCH {"reserved_for": "<owner>", "drain": false}` | rooms or creates on it (`409 rooms_active`); same `REPORT_ID` as at lend (`409 reseal_required`) |
+
+The hotel document and the operator capacity catalog show `lent_from`; the hotel document also shows `lent_report_id` and, once attested, `admission.report_id`. Guests never see whose machine it is.
+
+### Before a lend
+
+- The broker checks rooms only. Workspaces, snapshots and egress secrets the owner keeps on that machine stay in it while pool guests run there, and reclaim destroys them. The owner moves them off first.
+- A joined hotel keeps the lend in `state_dir/hotels.json`. A hotel from the broker config file keeps it only until restart: write `lent_from` and `lent_report_id` in its config entry and remove `reserved_for`, or a restart gives the machine back to the owner with pool rooms still in it.
