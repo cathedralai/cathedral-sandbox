@@ -1,0 +1,283 @@
+name: Publish Library LFM3 images
+
+# Builds images/library-lfm3 once per Library environment: the environment's
+# own image with llama.cpp and Liquid AI LFM3-1.7B added, so the environment
+# and its model share one sandbox. Pushes
+# ghcr.io/cathedralai/library-<slug>-lfm3:sha-<commit>. The launch pin is the
+# digest each job prints in its summary.
+
+on:
+  push:
+    branches:
+      - main
+      - feature/library-lfm3-images
+    paths:
+      - .github/workflows/publish-library-lfm3.yml
+      - images/library-lfm3/**
+  workflow_dispatch:
+    inputs:
+      image_refs:
+        description: Space-separated image@sha256 refs to check for anonymous pull after GHCR visibility is public
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  publish:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: openenv-echo
+            base: ghcr.io/huggingface/openenv-echo-env@sha256:14de5b939182026ea247589f16c7dbba7d22e26ca921557bc19c37af0b9cc972
+          - slug: openenv-coding
+            base: ghcr.io/huggingface/openenv-coding-env@sha256:995ebc9b443c29a14882a0ad1b37ed26d5e9086bd85500e49e9d06c18295bda6
+          - slug: openenv-wordle
+            base: ghcr.io/huggingface/openenv-textarena-env@sha256:6659db69111c03e4303875ddd0bbc2217bc6c4b46921b15389cc0937391d917b
+            # TextArena fetches NLTK data at start; bake it in (see the Dockerfile).
+            textarena_offline: "1"
+          - slug: openenv-openspiel
+            base: ghcr.io/huggingface/openenv-openspiel-env@sha256:4e0b22f1c64d2593cdd6438ae4bbc8fa163b031c756d8c37bd6514f83e3ad6d6
+    concurrency:
+      group: library-lfm3-${{ matrix.slug }}-${{ github.sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      IMAGE_PATH: ghcr.io/cathedralai/library-${{ matrix.slug }}-lfm3
+      BASE_IMAGE: ${{ matrix.base }}
+    steps:
+      - name: Check out the reviewed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the immutable source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BASE_IMAGE" =~ ^[a-z0-9./-]+@sha256:[0-9a-f]{64}$ ]]
+
+      # The OpenSpiel base is over 1 GB compressed; the build, the pushed image
+      # and the smoke pull all land on this runner.
+      - name: Free runner disk
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          version: v0.36.1
+          driver-opts: >-
+            image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # with-lfm3 starts the environment with the base image's own command,
+      # so read it from the base instead of copying it by hand.
+      - name: Read the environment command from the base image
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect --format '{{json .Image}}' "$BASE_IMAGE" > base-image.json
+          env_cmd="$(python3 - base-image.json <<'PY'
+          import json, shlex, sys
+          doc = json.load(open(sys.argv[1]))
+          image = doc if "config" in doc else doc["linux/amd64"]
+          cmd = image["config"].get("Cmd") or []
+          if image["config"].get("Entrypoint"):
+              sys.exit("base image has an ENTRYPOINT; with-lfm3 expects CMD only")
+          if len(cmd) == 3 and cmd[0] in ("sh", "/bin/sh") and cmd[1] == "-c":
+              print(cmd[2])
+          else:
+              print(shlex.join(cmd))
+          PY
+          )"
+          rm -f base-image.json
+          [[ "$env_cmd" == *uvicorn* && "$env_cmd" == *8000* ]] || {
+            echo "::error::unexpected environment command: $env_cmd"
+            exit 1
+          }
+          echo "env_cmd=${env_cmd}" >> "$GITHUB_OUTPUT"
+          echo "Environment command: \`${env_cmd}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve the commit tag
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_ref="${IMAGE_PATH}:sha-${GITHUB_SHA}"
+          echo "tag_ref=${tag_ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to overwrite the commit tag
+        shell: bash
+        env:
+          TAG_REF: ${{ steps.image.outputs.tag_ref }}
+        run: |
+          set -euo pipefail
+          set +e
+          inspection="$(docker buildx imagetools inspect "$TAG_REF" 2>&1)"
+          inspection_status=$?
+          set -e
+          if [[ $inspection_status -eq 0 ]]; then
+            echo "::error::Immutable image tag already exists: $TAG_REF"
+            exit 1
+          fi
+          if grep -Eiq 'manifest unknown|not found|denied' <<< "$inspection"; then
+            exit 0
+          fi
+          echo "::error::Could not prove the immutable image tag is unused"
+          printf '%s\n' "$inspection"
+          exit 1
+
+      - name: Build and publish linux/amd64 image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ./images/library-lfm3
+          file: ./images/library-lfm3/Dockerfile
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: ${{ steps.image.outputs.tag_ref }}
+          build-args: |
+            BASE_IMAGE=${{ matrix.base }}
+            ENV_CMD=${{ steps.base.outputs.env_cmd }}
+            TEXTARENA_OFFLINE=${{ matrix.textarena_offline }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          provenance: mode=max
+
+      - name: Capture the digest launch pin
+        id: pin
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG_REF: ${{ steps.image.outputs.tag_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          image_ref="${IMAGE_PATH}@${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image_ref=${image_ref}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### ${{ matrix.slug }} with LFM3-1.7B"
+            echo
+            echo "Base: \`${BASE_IMAGE}\`"
+            echo
+            echo "Commit tag: \`${TAG_REF}\`"
+            echo
+            echo "Pin: \`${image_ref}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Run the published digest the way a sandbox does: network none and the
+      # keepalive command. Both servers must answer, the model must answer
+      # through lfm3-ask and through the OpenAI-compatible endpoint, and the
+      # environment must reset.
+      - name: Smoke test the published digest
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.pin.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          docker pull --quiet "$IMAGE_REF"
+          docker image inspect --format '{{.Size}}' "$IMAGE_REF" | awk '{ printf "Unpacked size: %.0f MB\n", $1 / 1e6 }' | tee -a "$GITHUB_STEP_SUMMARY"
+          docker run -d --name smoke --network none "$IMAGE_REF" sleep infinity
+          trap 'docker rm -f smoke >/dev/null 2>&1 || true' EXIT
+          ready=""
+          for _ in $(seq 1 240); do
+            if docker exec smoke curl -fsS -o /dev/null http://127.0.0.1:8080/health \
+              && docker exec smoke curl -fsS -o /dev/null http://127.0.0.1:8000/health; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ -z "$ready" ]]; then
+            docker exec smoke sh -c 'tail -n 40 /tmp/library/lfm3.log /tmp/library/env.log' || true
+            echo "::error::model or environment server did not answer in 240 s"
+            exit 1
+          fi
+          ask="$(docker exec smoke lfm3-ask 'What is 2+2? Answer in one word.')"
+          printf '%s\n' "$ask"
+          grep -Eiq '\b(4|four)\b' <<< "$ask"
+          grep -Eq '^lfm3-timing load_ms=[0-9]+ prompt_tok_s=[0-9.]+ gen_tok_s=[0-9.]+ ' <<< "$ask"
+          chat="$(docker exec smoke sh -c 'curl -fsS "$MODEL_BASE_URL/chat/completions" \
+            -H "Content-Type: application/json" -H "Authorization: Bearer $MODEL_API_KEY" \
+            -d "{\"model\": \"$MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"What is 2+2? Answer in one word.\"}], \"max_tokens\": 32, \"temperature\": 0}"')"
+          answer="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["choices"][0]["message"]["content"].strip())' "$chat")"
+          printf 'chat/completions: %s\n' "$answer"
+          grep -Eiq '\b(4|four)\b' <<< "$answer"
+          health="$(docker exec smoke curl -fsS http://127.0.0.1:8000/health)"
+          printf 'environment /health: %s\n' "$health"
+          reset="$(docker exec smoke curl -fsS -X POST http://127.0.0.1:8000/reset -H 'Content-Type: application/json' -d '{}')"
+          printf 'environment /reset: %.300s\n' "$reset"
+          {
+            echo
+            echo '```'
+            printf '%s\n' "$ask"
+            printf 'chat/completions: %s\n' "$answer"
+            printf 'environment /health: %s\n' "$health"
+            printf 'environment /reset: %.300s\n' "$reset"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest the published digest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_PATH }}
+          subject-digest: ${{ steps.pin.outputs.digest }}
+          push-to-registry: true
+
+      - name: Log out of GHCR
+        if: always()
+        shell: bash
+        run: docker logout ghcr.io
+
+  # A sealed hotel pulls with no credentials. Run this with the pins to prove
+  # the packages are public (an owner flips any that come up private).
+  verify-public:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          version: v0.36.1
+          driver-opts: >-
+            image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+
+      - name: Verify anonymous digest access
+        shell: bash
+        env:
+          IMAGE_REFS: ${{ inputs.image_refs }}
+        run: |
+          set -euo pipefail
+          for ref in $IMAGE_REFS; do
+            [[ "$ref" =~ ^ghcr\.io/cathedralai/library-[a-z0-9-]+-lfm3@sha256:[0-9a-f]{64}$ ]]
+            docker buildx imagetools inspect "$ref" > /dev/null
+            echo "Anonymous GHCR access passed for \`${ref}\`." >> "$GITHUB_STEP_SUMMARY"
+          done

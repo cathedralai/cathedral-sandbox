@@ -1,0 +1,47 @@
+#!/bin/sh
+# with-lfm3 [command ...]: start LFM3-1.7B and the Library environment in this
+# sandbox, then run the command.
+#
+#   model        llama-server, OpenAI-compatible, on 127.0.0.1:8080/v1, model
+#                "lfm3-1.7b" ($MODEL_BASE_URL, $MODEL, $MODEL_API_KEY)
+#   environment  $LIBRARY_ENV_CMD (the base image's own command), port 8000
+#
+# No command: the environment runs in the foreground, as in the base image.
+# A command that starts the environment itself (it names uvicorn) runs as
+# given, with no second copy. Any other command, such as the sandbox
+# keepalive "sleep infinity", runs after the environment starts in the
+# background.
+#
+# Logs: $LIBRARY_LOG_DIR (default /tmp/library), lfm3.log and env.log.
+#
+# Environment:
+#   LFM3_THREADS     CPU threads (default: all cores)
+#   LFM3_SERVER_CTX  server context size in tokens (default 4096)
+#   LFM3_REASONING   off (default, short answers) or on
+set -eu
+
+log_dir=${LIBRARY_LOG_DIR:-/tmp/library}
+mkdir -p "$log_dir"
+
+llama-server \
+  -m "${LFM3_MODEL:-/opt/lfm3/LFM3-1.7B-Q4_K_M.gguf}" \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --alias lfm3-1.7b \
+  --threads "${LFM3_THREADS:-$(nproc)}" \
+  --ctx-size "${LFM3_SERVER_CTX:-4096}" \
+  --parallel 1 \
+  --reasoning "${LFM3_REASONING:-off}" \
+  --no-ui \
+  >"$log_dir/lfm3.log" 2>&1 &
+
+if [ "$#" -eq 0 ]; then
+  exec sh -c "$LIBRARY_ENV_CMD"
+fi
+
+case " $* " in
+  *uvicorn*) ;;
+  *) sh -c "$LIBRARY_ENV_CMD" >"$log_dir/env.log" 2>&1 & ;;
+esac
+
+exec "$@"
