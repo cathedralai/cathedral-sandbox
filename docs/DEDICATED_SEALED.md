@@ -73,4 +73,9 @@ The hotel document and the operator capacity catalog show `lent_from`; the hotel
 ### Before a lend
 
 - The broker checks rooms only. Workspaces, snapshots and egress secrets the owner keeps on that machine stay in it while pool guests run there, and reclaim destroys them. The owner moves them off first.
-- A joined hotel keeps the lend in `state_dir/hotels.json`. A hotel from the broker config file keeps it only until restart: write `lent_from` and `lent_report_id` in its config entry and remove `reserved_for`, or a restart gives the machine back to the owner with pool rooms still in it.
+
+### Restarts and the fail-closed check
+
+- A lend survives a broker restart. A joined hotel keeps it in `state_dir/hotels.json`; a hotel from the broker config file (`nc-sealed` today) keeps it in `state_dir/hotel-lends.json`, and that state wins over the config file's `reserved_for`. The broker refuses to lend a config hotel without `state_dir`, and refuses to start when `hotel-lends.json` does not parse.
+- A sealed hotel reserved for an owner whose room list shows another guest's room is not the owner's alone, whatever the reason (a lost lend state, a reservation set while pool rooms ran). The broker makes it lent from the owner, logs `FAIL CLOSED`, and records the running launch's `REPORT_ID` at the next attestation, so giving it back still takes drain and a re-seal.
+- After a restart, a reserved hotel takes no rooms until its first room list has passed that check.

@@ -172,7 +172,7 @@ func (p *guestPolicy) validate() error {
 // capacity catalog both use it, so the catalog never lists a hotel with free
 // rooms that the placer would refuse. Caller holds b.mu.
 func (b *broker) admissibleFree(h *hotel, now time.Time) int {
-	if !h.ok || h.leaving || h.drain() || now.Before(h.backoffUntil) || !b.admitted(h, now) {
+	if !h.ok || h.leaving || h.drain() || now.Before(h.backoffUntil) || !b.admitted(h, now) || b.awaitsRoomCheck(h) {
 		return 0
 	}
 	if f := b.freeFor(h); f > 0 {
@@ -249,7 +249,7 @@ func (b *broker) addTotals(t map[string]*classTotals, e capacityEntry, now time.
 	switch {
 	case h.drain():
 		c.Draining++
-	case h.ok && !b.admitted(h, now):
+	case h.ok && (!b.admitted(h, now) || b.awaitsRoomCheck(h)):
 		c.Pending++
 	case h.ok && !now.Before(h.backoffUntil):
 		c.Placeable++

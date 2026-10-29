@@ -32,7 +32,7 @@ func launchID(fill byte) string {
 
 func lendChain(t *testing.T) *testChain {
 	t.Helper()
-	tc := reservedChain(t)
+	tc := reservedChainState(t, t.TempDir())
 	addFakeHotel(t, tc, "nc2", true)
 	reserve(t, tc, "nc2", "g2")
 	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g2", map[string]any{"hotels": []string{"nc", "nc2"}}); status != 200 {
@@ -139,6 +139,12 @@ func TestLendValidation(t *testing.T) {
 			t.Fatalf("config %+v accepted", hc)
 		}
 	}
+	// A hotel from the config file is lent only when state_dir can keep it.
+	nostate := reservedChain(t)
+	setLaunch(t, nostate, "nc", 0x11)
+	if status, doc := nostate.call(t, "operator-key", "PATCH", "/v1/broker/hotels/nc", map[string]any{"lend": true}); status != 409 || errCode(doc) != "no_state_dir" {
+		t.Fatalf("lend with no state_dir: %d %v", status, doc)
+	}
 }
 
 func TestLendRefusedWhileTheOwnerHasRooms(t *testing.T) {
@@ -239,7 +245,7 @@ func addWSHotel(t *testing.T, tc *testChain, id string) *wsHotel {
 }
 
 func TestWorkspaceCreateSkipsALentHotel(t *testing.T) {
-	tc := newChain(t)
+	tc := newChainState(t, t.TempDir())
 	tc.b.hotelByID("a").cfg.Sealed = true
 	setPolicy(t, tc, "g1", map[string]any{"prefer": []any{map[string]any{"class": "sealed"}}})
 	lent := addWSHotel(t, tc, "nc")
@@ -351,5 +357,204 @@ func TestLendStateOfAJoinedHotelSurvivesARestart(t *testing.T) {
 	admitNow(t, tc, "m1")
 	if a := admissionOf(t, tc, "m1"); a["report_id"] != launchID(0x11) {
 		t.Fatalf("admission doc report_id: %v", a)
+	}
+}
+
+// ---------------------------------------------------------------- restart
+
+// editConfig changes the chain's config file and restarts the broker on it.
+func editConfig(t *testing.T, tc *testChain, fn func(c *config)) {
+	t.Helper()
+	raw, err := os.ReadFile(tc.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var c config
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatal(err)
+	}
+	fn(&c)
+	if raw, err = json.Marshal(c); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tc.cfgPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tc.start(t)
+}
+
+// configReserved is a chain with state_dir whose config file reserves the
+// sealed config hotel "a" for g2, as /etc/thin-broker/config.json does for
+// nc-sealed.
+func configReserved(t *testing.T, dir string) *testChain {
+	t.Helper()
+	tc := newChainState(t, dir)
+	editConfig(t, tc, func(c *config) { c.Hotels[0].ReservedFor = "g2" })
+	return tc
+}
+
+// listSync runs one sync step of id (room list and fail-closed check) and
+// gives the hotel its slots back (the fake health reports none).
+func listSync(tc *testChain, id string) {
+	syncNow(tc, id)
+	setHotel(tc, id, func(h *hotel) { h.slots = 100 })
+}
+
+func ownerOnA(tc *testChain, t *testing.T) (int, map[string]any) {
+	return tc.call(t, "key2", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+}
+
+func TestLentConfigHotelStaysLentAcrossARestart(t *testing.T) {
+	dir := t.TempDir()
+	tc := configReserved(t, dir)
+	listSync(tc, "a")
+	setLaunch(t, tc, "a", 0x11)
+	lend(t, tc, "a")
+	raw, _ := os.ReadFile(filepath.Join(dir, lendsFile))
+	if !strings.Contains(string(raw), `"a"`) || !strings.Contains(string(raw), launchID(0x11)) {
+		t.Fatalf("%s: %s", lendsFile, raw)
+	}
+
+	tc.start(t) // restart: the config file still says reserved_for g2
+	h := tc.b.hotelByID("a")
+	if h.lentFrom() != "g2" || h.lentReportID() != launchID(0x11) || h.reservedFor() != "" {
+		t.Fatalf("config hotel after restart: %+v", h.cfg)
+	}
+	if status, doc := ownerOnA(tc, t); status != 403 || errCode(doc) != "hotel_lent" {
+		t.Fatalf("owner create after restart: %d %v", status, doc)
+	}
+	if _, doc := tc.call(t, "operator-key", "GET", "/v1/broker/hotels/a", nil); doc["lent_from"] != "g2" || doc["reserved_for"] != nil {
+		t.Fatalf("hotel doc after restart: %v", doc)
+	}
+	reclaim := func() (int, map[string]any) {
+		return tc.call(t, "operator-key", "PATCH", "/v1/broker/hotels/a", map[string]any{"reserved_for": "g2"})
+	}
+	if status, doc := reclaim(); status != 409 || errCode(doc) != "reseal_required" {
+		t.Fatalf("reclaim after restart, same launch: %d %v", status, doc)
+	}
+	setLaunch(t, tc, "a", 0x22)
+	if status, doc := reclaim(); status != 200 || doc["reserved_for"] != "g2" || doc["lent_from"] != nil {
+		t.Fatalf("reclaim after a re-seal: %d %v", status, doc)
+	}
+	if raw, _ := os.ReadFile(filepath.Join(dir, lendsFile)); strings.Contains(string(raw), `"a"`) {
+		t.Fatalf("%s keeps a reclaimed hotel: %s", lendsFile, raw)
+	}
+
+	tc.start(t) // reclaimed: the config file's reserved_for applies again
+	if h := tc.b.hotelByID("a"); h.reservedFor() != "g2" || h.lentFrom() != "" {
+		t.Fatalf("reclaimed hotel after restart: %+v", h.cfg)
+	}
+	listSync(tc, "a")
+	if status, doc := ownerOnA(tc, t); status != 202 || doc["hotel"] != "a" {
+		t.Fatalf("owner create after reclaim and restart: %d %v", status, doc)
+	}
+
+	// A state file that does not parse stops the broker; the config file
+	// cannot set the lend fields.
+	if err := os.WriteFile(filepath.Join(dir, lendsFile), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadBroker(tc.cfgPath); err == nil || !strings.Contains(err.Error(), lendsFile) {
+		t.Fatalf("broker started with a bad %s: %v", lendsFile, err)
+	}
+	_ = os.Remove(filepath.Join(dir, lendsFile))
+	raw, _ = os.ReadFile(tc.cfgPath)
+	var c config
+	_ = json.Unmarshal(raw, &c)
+	c.Hotels[0].ReservedFor, c.Hotels[0].LentFrom, c.Hotels[0].LentReportID = "", "g2", launchID(0x11)
+	raw, _ = json.Marshal(c)
+	_ = os.WriteFile(tc.cfgPath, raw, 0o600)
+	if _, err := loadBroker(tc.cfgPath); err == nil || !strings.Contains(err.Error(), "lent_from") {
+		t.Fatalf("config file set lent_from: %v", err)
+	}
+}
+
+func TestReservedHotelWithForeignRoomsFailsClosedAtRestart(t *testing.T) {
+	dir := t.TempDir()
+	tc := configReserved(t, dir)
+	// The hotel runs a room of pool guest g1, as after a lend whose state
+	// was lost, and its attestation does not answer yet.
+	f := tc.hotels["a"]
+	f.mu.Lock()
+	f.rooms = append(f.rooms, map[string]any{"id": "sbx_pool", "state": "running", "labels": map[string]any{guestLabel: "g1"}})
+	f.mu.Unlock()
+	tc.start(t)
+
+	// Before its first room list, a reserved hotel takes no rooms.
+	if status, doc := ownerOnA(tc, t); status != 503 || errCode(doc) != "hotels_not_admitted" {
+		t.Fatalf("owner create before the room check: %d %v", status, doc)
+	}
+	if n := creates(tc, "a"); n != 0 {
+		t.Fatalf("hotel a got %d creates before its room check", n)
+	}
+	listSync(tc, "a")
+	h := tc.b.hotelByID("a")
+	if h.lentFrom() != "g2" || h.reservedFor() != "" || h.lentReportID() != lentReportUnknown {
+		t.Fatalf("hotel after the room check: %+v", h.cfg)
+	}
+	if status, doc := ownerOnA(tc, t); status != 403 || errCode(doc) != "hotel_lent" {
+		t.Fatalf("owner create next to a pool room: %d %v", status, doc)
+	}
+	raw, _ := os.ReadFile(filepath.Join(dir, lendsFile))
+	if !strings.Contains(string(raw), `"g2"`) || !strings.Contains(string(raw), lentReportUnknown) {
+		t.Fatalf("%s: %s", lendsFile, raw)
+	}
+	// No baseline yet: no reclaim, even with no rooms.
+	f.mu.Lock()
+	f.rooms = nil
+	f.mu.Unlock()
+	dropRoom(tc, "a", "a.sbx_pool")
+	reclaim := func() (int, map[string]any) {
+		return tc.call(t, "operator-key", "PATCH", "/v1/broker/hotels/a", map[string]any{"reserved_for": "g2"})
+	}
+	if status, doc := reclaim(); status != 409 || errCode(doc) != "reseal_required" {
+		t.Fatalf("reclaim with no baseline: %d %v", status, doc)
+	}
+
+	// Still lent after another restart (state_dir), and the next sync
+	// records the running launch as the baseline.
+	tc.start(t)
+	h = tc.b.hotelByID("a")
+	if h.lentFrom() != "g2" || h.reservedFor() != "" {
+		t.Fatalf("force-lent hotel after restart: %+v", h.cfg)
+	}
+	setLaunch(t, tc, "a", 0x11)
+	listSync(tc, "a")
+	if h.lentReportID() != launchID(0x11) {
+		t.Fatalf("baseline after sync: %q", h.lentReportID())
+	}
+	if status, doc := reclaim(); status != 409 || errCode(doc) != "reseal_required" {
+		t.Fatalf("reclaim in the launch pool rooms ran in: %d %v", status, doc)
+	}
+	setLaunch(t, tc, "a", 0x22)
+	if status, doc := reclaim(); status != 200 || doc["reserved_for"] != "g2" {
+		t.Fatalf("reclaim after a re-seal: %d %v", status, doc)
+	}
+	if status, doc := ownerOnA(tc, t); status != 202 || doc["hotel"] != "a" {
+		t.Fatalf("owner create after reclaim: %d %v", status, doc)
+	}
+}
+
+func TestReservedConfigHotelWithOnlyOwnerRoomsIsUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	tc := configReserved(t, dir)
+	f := tc.hotels["a"]
+	f.mu.Lock()
+	f.rooms = append(f.rooms, map[string]any{"id": "sbx_own", "state": "running", "labels": map[string]any{guestLabel: "g2"}})
+	f.mu.Unlock()
+	tc.start(t)
+	listSync(tc, "a")
+	listSync(tc, "a")
+	if h := tc.b.hotelByID("a"); h.reservedFor() != "g2" || h.lentFrom() != "" {
+		t.Fatalf("reserved hotel with owner rooms: %+v", h.cfg)
+	}
+	if status, doc := ownerOnA(tc, t); status != 202 || doc["hotel"] != "a" {
+		t.Fatalf("owner create: %d %v", status, doc)
+	}
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}}); status != 409 || errCode(doc) != "unknown_hotel" {
+		t.Fatalf("pool named the reserved hotel: %d %v", status, doc)
+	}
+	if _, err := os.Stat(filepath.Join(dir, lendsFile)); !os.IsNotExist(err) {
+		t.Fatalf("%s written for a hotel that is not lent: %v", lendsFile, err)
 	}
 }

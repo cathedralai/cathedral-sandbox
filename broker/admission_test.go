@@ -327,6 +327,7 @@ func TestJoinedMinerHotelPersistsAcrossRestartAndMustPassAgain(t *testing.T) {
 		t.Fatalf("create before admission: %d %v", status, doc)
 	}
 	admitNow(t, tc, "m1")
+	syncNow(tc, "m1") // a reserved hotel also waits for its first room list after a restart (lend.go)
 	if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"m1"}, "sealed": true}); !strings.HasPrefix(id, "m1.") {
 		t.Fatalf("room on %s", id)
 	}

@@ -602,21 +602,26 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		h.cfg.ReservedFor = *reserve
 	}
 	h.cfgMu.Unlock()
-	if h.runtime {
-		if err := b.saveRuntimeHotelsLocked(); err != nil {
-			log.Printf("runtime hotels not saved: %v", err)
-			h.cfgMu.Lock()
-			h.cfg.Drain = oldCfg.Drain
-			h.cfg.Labels = oldCfg.Labels
-			h.cfg.MaxSlots = oldCfg.MaxSlots
-			h.cfg.ReservedFor = oldCfg.ReservedFor
-			h.cfg.LentFrom = oldCfg.LentFrom
-			h.cfg.LentReportID = oldCfg.LentReportID
-			h.cfgMu.Unlock()
-			b.mu.Unlock()
-			writeErr(w, 500, "state_write_failed", "cannot keep the runtime hotel update")
-			return
-		}
+	var err error
+	switch {
+	case lc.lend || lc.reclaim:
+		err = b.saveLendStateLocked(h) // the lend state must survive a restart (lend.go)
+	case h.runtime:
+		err = b.saveRuntimeHotelsLocked()
+	}
+	if err != nil {
+		log.Printf("hotel %s update not saved: %v", h.cfg.ID, err)
+		h.cfgMu.Lock()
+		h.cfg.Drain = oldCfg.Drain
+		h.cfg.Labels = oldCfg.Labels
+		h.cfg.MaxSlots = oldCfg.MaxSlots
+		h.cfg.ReservedFor = oldCfg.ReservedFor
+		h.cfg.LentFrom = oldCfg.LentFrom
+		h.cfg.LentReportID = oldCfg.LentReportID
+		h.cfgMu.Unlock()
+		b.mu.Unlock()
+		writeErr(w, 500, "state_write_failed", "cannot keep the hotel update; nothing changed")
+		return
 	}
 	if req.MaxSlots != nil {
 		if h.cfg.MaxSlots > 0 && h.slots > h.cfg.MaxSlots {
@@ -772,6 +777,7 @@ func (b *broker) loadRuntimeHotels() error {
 		}
 		h := newHotel(hc, strings.TrimSpace(string(k)))
 		h.runtime = true
+		h.roomsUnchecked = true // a reserved hotel waits for its first room list (lend.go)
 		if err := b.addHotelRestored(h); err != nil {
 			log.Printf("runtime hotel %s skipped: %v", hc.ID, err)
 		}

@@ -184,12 +184,22 @@ a re-seal (`lend.go`, design in `docs/DEDICATED_SEALED.md`).
   `attestation_failed` (also for a report with no REPORT_ID), 502
   `hotel_unreachable`, 400 `invalid_lend` (`lend: false`, or `lend` with
   `reserved_for`). A refused lend or reclaim applies none of the PATCH.
-- Restart: a joined hotel keeps `lent_from` and `lent_report_id` in
-  `state_dir/hotels.json`, like `reserved_for` and `drain`. A hotel from the
-  config file keeps a PATCH only until restart, so after a lend write
-  `lent_from` and `lent_report_id` in its config entry and remove
-  `reserved_for`; otherwise a restart gives the hotel back to X with pool
-  rooms still in it.
+- Restart: the lend survives it. A joined hotel keeps `lent_from` and
+  `lent_report_id` in `state_dir/hotels.json`; a hotel from the config file
+  keeps them in `state_dir/hotel-lends.json`, and that state wins over the
+  config file's `reserved_for` at load. Lending a config hotel needs
+  `state_dir` (409 `no_state_dir`). The config file cannot set the lend
+  fields, and a `hotel-lends.json` that does not parse stops the broker. A
+  reclaim removes the entry; the `reserved_for` it sets on a config hotel
+  lasts until restart like any `reserved_for` PATCH, so reclaim to the guest
+  the config file names.
+- Fail closed: a sealed hotel reserved for X whose room list shows a room of
+  another guest (or an unlabeled room) becomes lent from X with
+  `lent_report_id: "unknown"`, and the broker logs `FAIL CLOSED`. X gets
+  `hotel_lent`; pool guests keep placing there. The next attestation
+  records the running launch as the baseline; until then a reclaim is 409
+  `reseal_required`. After a restart a reserved hotel takes no rooms until
+  its first room list (503 `hotels_not_admitted` meanwhile).
 
 ### Capacity catalog
 

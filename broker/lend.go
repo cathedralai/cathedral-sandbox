@@ -29,18 +29,45 @@
 // guest may be named; the re-seal is what makes it safe. "reserved_for": null
 // on a lent hotel is refused (409 hotel_lent): reclaim is the only way out.
 //
-// The lend state lives in the hotel config fields lent_from and
-// lent_report_id. Like reserved_for and drain, a PATCH of a joined hotel is
-// kept in state_dir/hotels.json; a PATCH of a hotel from the config file lasts
-// until restart, so write the same fields in the config file to keep it.
+// The lend state lives in the hotel fields lent_from and lent_report_id and
+// survives a restart. A joined hotel keeps them in state_dir/hotels.json with
+// the rest of its PATCH state. A hotel from the config file keeps them in
+// state_dir/hotel-lends.json, and that state wins over the config file's
+// reserved_for at load: a restart never gives a lent machine back to its
+// owner. Lending a config hotel needs state_dir (else 409 no_state_dir). The
+// config file itself cannot set the lend fields.
+//
+// Fail closed. A sealed hotel reserved for X whose room list shows a room of
+// another guest (or an unlabeled room) is not X's alone. The sync loop then
+// makes it lent from X with lent_report_id "unknown" and logs it loudly:
+// X's creates get hotel_lent, never a room next to a stranger's. The next
+// attestation records the running launch as the baseline, so the reclaim
+// still needs drain and a re-seal. After a restart, a reserved hotel takes no
+// rooms until its first room list has passed this check.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"time"
 )
+
+// lentReportUnknown is lent_report_id of a hotel the fail-closed check made
+// lent: no REPORT_ID was recorded yet. Reclaim waits for a real one.
+const lentReportUnknown = "unknown"
+
+// lendsFile keeps the lend state of hotels from the config file.
+const lendsFile = "hotel-lends.json"
+
+type lendEntry struct {
+	LentFrom     string `json:"lent_from"`
+	LentReportID string `json:"lent_report_id"`
+}
 
 // lentFrom is the guest the hotel is lent from, or "" when it is not lent.
 func (h *hotel) lentFrom() string {
@@ -124,11 +151,18 @@ func (b *broker) prepareLend(ctx context.Context, h *hotel, lend bool, reserve *
 		if hotelClass(h) != classSealed {
 			return c, &apiErr{409, "hotel_not_sealed", "only a sealed hotel can be lent: reclaim needs a new SNP launch"}
 		}
+		if !h.runtime && b.cfg.StateDir == "" {
+			return c, &apiErr{409, "no_state_dir", "set state_dir in the config to lend a hotel from the config file: the lend must survive a restart"}
+		}
 	case reserve != nil && lent != "" && *reserve == "":
 		return c, &apiErr{409, "hotel_lent", "hotel " + h.cfg.ID + " is lent from " + lent +
 			" and already in the pool; to give it back, drain it, re-seal it and PATCH reserved_for"}
 	case reserve != nil && lent != "":
 		c.reclaim, c.owner, c.lentID = true, *reserve, h.lentReportID()
+		if c.lentID == lentReportUnknown {
+			return c, &apiErr{409, "reseal_required", "hotel " + h.cfg.ID + " was made lent by the fail-closed room check and has no REPORT_ID " +
+				"yet; the broker records the running launch at its next attestation. Then drain, re-seal and reclaim"}
+		}
 	default:
 		return c, nil
 	}
@@ -190,9 +224,6 @@ func (c lendChange) applyLend(h *hotel) *apiErr {
 	if c.lend {
 		h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor = c.owner, c.reportID, ""
 		log.Printf("hotel %s lent from %s (REPORT_ID %s)", h.cfg.ID, c.owner, short(c.reportID))
-		if !h.runtime {
-			log.Printf("hotel %s is in the config file: the lend lasts until restart unless the config file sets lent_from and lent_report_id", h.cfg.ID)
-		}
 		return nil
 	}
 	log.Printf("hotel %s reclaimed for %s (REPORT_ID %s, lent with %s)", h.cfg.ID, c.owner, short(c.reportID), short(c.lentID))
@@ -225,4 +256,181 @@ func short(id string) string {
 		return id[:16] + "..."
 	}
 	return id
+}
+
+// awaitsRoomCheck reports whether h is a reserved hotel whose rooms were not
+// listed since start: it takes no rooms until the fail-closed check ran.
+// Caller holds b.mu.
+func (b *broker) awaitsRoomCheck(h *hotel) bool {
+	return h.roomsUnchecked && h.reservedFor() != ""
+}
+
+// foreignRooms is the number of rooms on h that are not owner's. A room with
+// no guest label counts: the broker labels every room it starts. Caller
+// holds b.mu.
+func foreignRooms(h *hotel, owner string) int {
+	n := 0
+	for _, rm := range h.rooms {
+		if rm.guest != owner {
+			n++
+		}
+	}
+	return n
+}
+
+// checkReservedRooms is the fail-closed check of the sync loop, after a room
+// list. A sealed hotel reserved for X with a room of another guest becomes
+// lent from X (lent_report_id unknown). It reports whether it changed h.
+// Caller holds b.mu.
+func (b *broker) checkReservedRooms(h *hotel) bool {
+	owner := h.reservedFor()
+	if owner == "" || hotelClass(h) != classSealed {
+		return false
+	}
+	n := foreignRooms(h, owner)
+	if n == 0 {
+		return false
+	}
+	h.cfgMu.Lock()
+	changed := h.cfg.ReservedFor == owner && h.cfg.LentFrom == ""
+	if changed {
+		h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor = owner, lentReportUnknown, ""
+	}
+	h.cfgMu.Unlock()
+	if changed {
+		log.Printf("FAIL CLOSED: hotel %s is reserved_for %s but lists %d rooms of other guests; it is now lent from %s "+
+			"(%s gets 403 hotel_lent). To give it back: drain, re-seal, reclaim", h.cfg.ID, owner, n, owner, owner)
+	}
+	return changed
+}
+
+// fillLentBaseline records the running launch's REPORT_ID for a hotel the
+// fail-closed check made lent. A launch seen after that check is the one
+// pool rooms ran in, or a later one; either way reclaim needs a newer one.
+func (b *broker) fillLentBaseline(ctx context.Context, h *hotel, healthOK bool) {
+	if !healthOK || h.lentReportID() != lentReportUnknown {
+		return
+	}
+	now := time.Now()
+	b.mu.Lock()
+	due := now.Sub(h.baselineTry) >= attestRetry
+	if due {
+		h.baselineTry = now
+	}
+	b.mu.Unlock()
+	if !due {
+		return
+	}
+	id, e := b.launchReportID(ctx, h)
+	if e != nil {
+		return // tried again at attestRetry; reclaim stays refused meanwhile
+	}
+	b.mu.Lock()
+	h.cfgMu.Lock()
+	set := h.cfg.LentReportID == lentReportUnknown
+	if set {
+		h.cfg.LentReportID = id
+	}
+	h.cfgMu.Unlock()
+	b.mu.Unlock()
+	if set {
+		log.Printf("hotel %s: lent baseline REPORT_ID %s recorded", h.cfg.ID, short(id))
+		b.saveLendStateLogged(h)
+	}
+}
+
+// saveLendStateLocked writes the lend state of h where it survives a
+// restart: state_dir/hotels.json for a joined hotel,
+// state_dir/hotel-lends.json for a hotel from the config file. Callers hold
+// b.mu and hotelsMutationMu, as for saveRuntimeHotelsLocked.
+func (b *broker) saveLendStateLocked(h *hotel) error {
+	if h.runtime {
+		return b.saveRuntimeHotelsLocked()
+	}
+	return b.saveConfigLendsLocked()
+}
+
+// saveLendStateLogged is saveLendStateLocked for the sync loop, which holds
+// no lock and has no caller to answer.
+func (b *broker) saveLendStateLogged(h *hotel) {
+	b.hotelsMutationMu.Lock()
+	defer b.hotelsMutationMu.Unlock()
+	b.mu.Lock()
+	err := b.saveLendStateLocked(h)
+	b.mu.Unlock()
+	if err != nil {
+		log.Printf("LEND STATE NOT SAVED: hotel %s: %v; a restart would lose it", h.cfg.ID, err)
+	}
+}
+
+// saveConfigLendsLocked writes state_dir/hotel-lends.json: the lent hotels
+// from the config file, and the entries of hotels not in the config now.
+// Callers hold b.mu and hotelsMutationMu.
+func (b *broker) saveConfigLendsLocked() error {
+	if b.cfg.StateDir == "" {
+		return errors.New("no state_dir")
+	}
+	out := map[string]lendEntry{}
+	for id, e := range b.lendsOnDisk {
+		out[id] = e
+	}
+	for _, h := range b.hotelList() {
+		if h.runtime {
+			continue
+		}
+		if l := h.lentFrom(); l != "" {
+			out[h.cfg.ID] = lendEntry{LentFrom: l, LentReportID: h.lentReportID()}
+		}
+	}
+	raw, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(b.cfg.StateDir, 0o700); err != nil {
+		return err
+	}
+	tmp := filepath.Join(b.cfg.StateDir, lendsFile+".tmp")
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(b.cfg.StateDir, lendsFile))
+}
+
+// loadConfigLends applies state_dir/hotel-lends.json to the hotels from the
+// config file. The state wins over reserved_for: a lent hotel stays lent. A
+// file that does not parse stops the broker: starting without it could give
+// a lent machine back to its owner.
+func (b *broker) loadConfigLends() error {
+	if b.cfg.StateDir == "" {
+		return nil
+	}
+	path := filepath.Join(b.cfg.StateDir, lendsFile)
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var entries map[string]lendEntry
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return fmt.Errorf("%s does not parse (%v); fix or remove it only after the lent machines are re-sealed", path, err)
+	}
+	b.lendsOnDisk = map[string]lendEntry{}
+	for id, e := range entries {
+		if err := lendConfigError(hotelConfig{LentFrom: e.LentFrom, LentReportID: e.LentReportID}); err != nil || e.LentFrom == "" {
+			return fmt.Errorf("%s: hotel %q: lent_from and lent_report_id must both be set", path, id)
+		}
+		h := b.hotelByID(id)
+		if h == nil {
+			b.lendsOnDisk[id] = e // kept for a hotel that comes back to the config file
+			log.Printf("lend state for hotel %s kept: the hotel is not in the config file", id)
+			continue
+		}
+		if r := h.cfg.ReservedFor; r != "" {
+			log.Printf("hotel %s is lent from %s (state_dir); config reserved_for %s waits for a reclaim", id, e.LentFrom, r)
+		}
+		h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor = e.LentFrom, e.LentReportID, ""
+	}
+	return nil
 }

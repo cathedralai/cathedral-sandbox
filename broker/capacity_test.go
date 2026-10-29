@@ -388,9 +388,12 @@ func reserve(t *testing.T, tc *testChain, hotelID string, owner any) {
 
 // reservedChain: g1 on the polaris-sealed policy with no deny, g2 the owner
 // of sealed hotel "nc" through a hotel list (the const shape).
-func reservedChain(t *testing.T) *testChain {
+func reservedChain(t *testing.T) *testChain { return reservedChainState(t, "") }
+
+// reservedChainState is reservedChain with a broker state_dir.
+func reservedChainState(t *testing.T, stateDir string) *testChain {
 	t.Helper()
-	tc := newChain(t)
+	tc := newChainState(t, stateDir)
 	tc.b.hotelByID("a").cfg.Sealed = true
 	addFakeHotel(t, tc, "nc", true)
 	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{"policy": map[string]any{

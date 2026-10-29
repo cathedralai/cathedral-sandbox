@@ -201,12 +201,18 @@ type hotel struct {
 	failed       int
 	rejected     int
 	lat          latencies
-	createEWMA   float64            // seconds, moving average of the hotel create call (placement.go)
-	moved        int                // creates that left this hotel's queue for another hotel
-	runtime      bool               // joined at runtime (hotels.go), not from the config file
-	adm          admission          // attestation gate of a joined sealed hotel (admission.go)
-	leaving      bool               // a leave passed its empty check; no new rooms (hotels.go)
-	stop         context.CancelFunc // stops the sync loop when the hotel leaves
+	createEWMA   float64   // seconds, moving average of the hotel create call (placement.go)
+	moved        int       // creates that left this hotel's queue for another hotel
+	runtime      bool      // joined at runtime (hotels.go), not from the config file
+	adm          admission // attestation gate of a joined sealed hotel (admission.go)
+	// roomsUnchecked: loaded at start and no room list has answered since. A
+	// reserved hotel takes no rooms until one has passed the fail-closed
+	// check (lend.go). baselineTry: last REPORT_ID fetch for an unknown
+	// lend baseline (lend.go).
+	roomsUnchecked bool
+	baselineTry    time.Time
+	leaving        bool               // a leave passed its empty check; no new rooms (hotels.go)
+	stop           context.CancelFunc // stops the sync loop when the hotel leaves
 }
 
 type guestState struct {
@@ -226,10 +232,11 @@ type broker struct {
 	mu               sync.Mutex
 	hset             atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
 	hotelsMu         sync.Mutex               // serialises joins and leaves
-	hotelsMutationMu sync.Mutex               // keeps runtime mutations and their saves in order
+	hotelsMutationMu sync.Mutex               // keeps runtime mutations and their saves in order (hotels.json and hotel-lends.json)
 	stateSaveMu      sync.Mutex               // one client-state save at a time, snapshot through rename (state.go)
 	guests           map[string]*guestState
 	capsOnDisk       map[string]map[string]any // probe results read from state_dir at start
+	lendsOnDisk      map[string]lendEntry      // lend state of hotels not in the config file now (lend.go); guarded by mu
 	byKey            map[string]*guestState    // sha256(key) -> guest
 	byUUID           map[string]*room
 	compat           *compatState
@@ -368,12 +375,14 @@ func loadBroker(path string) (*broker, error) {
 		if r := h.cfg.ReservedFor; r != "" && b.guests[r] == nil {
 			return nil, fmt.Errorf("config: hotel %q is reserved_for unknown guest %q", h.cfg.ID, r)
 		}
-		if l := h.cfg.LentFrom; l != "" && b.guests[l] == nil {
-			return nil, fmt.Errorf("config: hotel %q is lent_from unknown guest %q", h.cfg.ID, l)
+		if h.cfg.LentFrom != "" || h.cfg.LentReportID != "" {
+			return nil, fmt.Errorf("config: hotel %q: lent_from and lent_report_id are set by PATCH {\"lend\": true} and kept in state_dir, not in the config file", h.cfg.ID)
 		}
-		if err := lendConfigError(h.cfg); err != nil {
-			return nil, fmt.Errorf("config: hotel %q: %w", h.cfg.ID, err)
-		}
+		h.roomsUnchecked = true
+	}
+	// The lend state in state_dir wins over reserved_for in the config file.
+	if err := b.loadConfigLends(); err != nil {
+		return nil, fmt.Errorf("state: %w", err)
 	}
 	return b, nil
 }
@@ -1589,7 +1598,14 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		} `json:"sandboxes"`
 	}
 	lerr := h.getJSON(ctx, h.cfg.API, "/v1/sandboxes", nil, &list)
+	defer b.fillLentBaseline(ctx, h, herr == nil)
 	defer b.syncAdmission(ctx, h, herr == nil) // after the health state below is stored
+	forced := false                            // the fail-closed check below made the hotel lent: save it once b.mu is free
+	defer func() {
+		if forced {
+			b.saveLendStateLogged(h)
+		}
+	}()
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1691,6 +1707,8 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			h.grid[i] = nil
 		}
 	}
+	forced = b.checkReservedRooms(h)
+	h.roomsUnchecked = false
 }
 
 func (b *broker) syncLoop(ctx context.Context, h *hotel) {

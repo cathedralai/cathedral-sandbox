@@ -187,7 +187,7 @@ func (b *broker) noRoomReason(pl placement) createResult {
 			draining++
 		case now.Before(h.backoffUntil):
 			resting++
-		case !b.admitted(h, now):
+		case !b.admitted(h, now) || b.awaitsRoomCheck(h):
 			pending++
 		case b.freeFor(h) > 0:
 			free++
