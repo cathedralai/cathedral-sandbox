@@ -24,6 +24,86 @@ import (
 
 const joinKey = "hotel-d-key-0123456789abcdefghijklmnop"
 
+func TestRuntimeMinerHotelsSurviveTightenedCaps(t *testing.T) {
+	stateDir := t.TempDir()
+	tc := newChainState(t, stateDir)
+	for _, id := range []string{"m1", "m2", "m3"} {
+		joinMiner(t, tc, id, true, 1, nil)
+	}
+
+	setCaps := func(perHotkey, global int) {
+		t.Helper()
+		raw, err := os.ReadFile(tc.cfgPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cfg config
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		if perHotkey == 0 {
+			delete(cfg.MinerHotkeyCaps, minerHotkey)
+		} else {
+			cfg.MinerHotkeyCaps[minerHotkey] = perHotkey
+		}
+		cfg.MinerMaxHotels = global
+		raw, err = json.Marshal(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(tc.cfgPath, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		tc.start(t)
+	}
+	checkRetained := func(wantDrain map[string]bool) {
+		t.Helper()
+		for id, drained := range wantDrain {
+			h := tc.b.hotelByID(id)
+			if h == nil || h.drain() != drained || h.cfg.TLSSPKISHA256 == "" {
+				t.Fatalf("restored %s: hotel=%+v want drain=%t", id, h, drained)
+			}
+			if _, err := os.Stat(h.cfg.KeyFile); err != nil {
+				t.Fatalf("restored %s key: %v", id, err)
+			}
+		}
+		tc.b.mu.Lock()
+		err := tc.b.saveRuntimeHotelsLocked()
+		tc.b.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := os.ReadFile(filepath.Join(stateDir, runtimeHotelsFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var saved []hotelConfig
+		if err := json.Unmarshal(raw, &saved); err != nil {
+			t.Fatal(err)
+		}
+		if len(saved) != 3 {
+			t.Fatalf("state save lost restored miner hotels: %v", saved)
+		}
+	}
+
+	setCaps(1, 2)
+	checkRetained(map[string]bool{"m1": false, "m2": true, "m3": true})
+	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/hotels/m2", map[string]any{"drain": false}); status != 409 || errCode(doc) != "miner_cap_reached" {
+		t.Fatalf("over-cap miner undrained: %d %v", status, doc)
+	}
+	setCaps(0, 0)
+	checkRetained(map[string]bool{"m1": true, "m2": true, "m3": true})
+	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/hotels/m1", map[string]any{"drain": false}); status != 409 || errCode(doc) != "miner_cap_reached" {
+		t.Fatalf("unapproved miner undrained: %d %v", status, doc)
+	}
+	_, url := newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: chipOf("m4")}))
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+		"id": "m4", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
+	}); status != 403 || errCode(doc) != "miner_not_approved" {
+		t.Fatalf("new join under removed cap: %d %v", status, doc)
+	}
+}
+
 func TestOperatorAddsChangesAndRemovesAHotelAtRuntime(t *testing.T) {
 	dir := t.TempDir()
 	tc := newChainState(t, dir)

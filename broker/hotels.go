@@ -120,6 +120,16 @@ func (h *hotel) drain() bool {
 
 // addHotel adds h to the hotel set. The caller starts its sync loop.
 func (b *broker) addHotel(h *hotel) error {
+	return b.addHotelWithCapCheck(h, true)
+}
+
+// addHotelRestored retains an existing runtime hotel even if admission caps
+// have since tightened. Caps govern new joins, not recovery of live hotels.
+func (b *broker) addHotelRestored(h *hotel) error {
+	return b.addHotelWithCapCheck(h, false)
+}
+
+func (b *broker) addHotelWithCapCheck(h *hotel, checkCaps bool) error {
 	if strings.Contains(h.cfg.ID, ".") || h.cfg.ID == "" {
 		return fmt.Errorf("hotel id %q: must be non-empty and have no dot", h.cfg.ID)
 	}
@@ -131,7 +141,7 @@ func (b *broker) addHotel(h *hotel) error {
 	b.hotelsMu.Lock()
 	defer b.hotelsMu.Unlock()
 	old := b.hset.Load()
-	if hotkey := h.cfg.MinerHotkey; hotkey != "" {
+	if hotkey := h.cfg.MinerHotkey; checkCaps && hotkey != "" {
 		cap := b.cfg.MinerHotkeyCaps[hotkey]
 		if cap < 1 {
 			return errMinerNotApproved
@@ -171,6 +181,32 @@ func (b *broker) addHotel(h *hotel) error {
 	next.byID[h.cfg.ID] = h
 	b.hset.Store(next)
 	return nil
+}
+
+// minerOverCap reports whether an existing miner hotel falls outside today's
+// caps, in stable hotel order. A drained hotel still consumes a cap slot.
+func (b *broker) minerOverCap(h *hotel) bool {
+	hotkey := h.cfg.MinerHotkey
+	if hotkey == "" {
+		return false
+	}
+	cap := b.cfg.MinerHotkeyCaps[hotkey]
+	if cap < 1 || b.cfg.MinerMaxHotels < 1 {
+		return true
+	}
+	used, total := 0, 0
+	for _, existing := range b.hotelList() {
+		if existing == h {
+			return used >= cap || total >= b.cfg.MinerMaxHotels
+		}
+		if existing.cfg.MinerHotkey != "" {
+			total++
+		}
+		if existing.cfg.MinerHotkey == hotkey {
+			used++
+		}
+	}
+	return true
 }
 
 func (b *broker) dropHotel(id string) {
@@ -501,6 +537,10 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		writeErr(w, 403, "enroller_scope", "miner enrollment may only set drain=true")
 		return
 	}
+	if req.Drain != nil && !*req.Drain && b.minerOverCap(h) {
+		writeErr(w, 409, "miner_cap_reached", "hotel is outside the current miner admission caps")
+		return
+	}
 	if req.MaxSlots != nil && *req.MaxSlots < 0 {
 		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
 		return
@@ -606,7 +646,7 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller bool) {
 	b.mu.Unlock()
 	if err != nil {
 		log.Printf("runtime hotels not saved: %v", err)
-		if addErr := b.addHotel(h); addErr != nil {
+		if addErr := b.addHotelRestored(h); addErr != nil {
 			log.Printf("runtime hotel %s could not be restored after failed save: %v", id, addErr)
 		}
 		b.mu.Lock()
@@ -698,8 +738,18 @@ func (b *broker) loadRuntimeHotels() error {
 		}
 		h := newHotel(hc, strings.TrimSpace(string(k)))
 		h.runtime = true
-		if err := b.addHotel(h); err != nil {
+		if err := b.addHotelRestored(h); err != nil {
 			log.Printf("runtime hotel %s skipped: %v", hc.ID, err)
+		}
+	}
+	// Keep every restored hotel in the snapshot, but stop new placement on any
+	// miner hotel outside the current per-hotkey or global admission limits.
+	for _, h := range b.hotelList() {
+		if b.minerOverCap(h) {
+			h.cfgMu.Lock()
+			h.cfg.Drain = true
+			h.cfgMu.Unlock()
+			log.Printf("runtime miner hotel %s retained but drained: admission cap changed", h.cfg.ID)
 		}
 	}
 	return nil
