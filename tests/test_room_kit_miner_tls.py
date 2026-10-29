@@ -47,8 +47,9 @@ vr = _load("verify_receipts_miner_t", KIT / "verify_receipts.py")
 INTERNAL = b"guest-internal-key-" + b"i" * 24  # the API's own key: made in the guest, never sent out
 CONTROL = Ed25519PrivateKey.generate()  # the control plane install key
 CONTROL_B64 = base64.b64encode(CONTROL.public_key().public_bytes_raw()).decode()
+# "tenancy" is "shared" here; a dedicated machine adds its owner fields (test_room_kit_dedicated_owner.py).
 CONFIG_BINDING_KEYS = {"schema", "hotel", "boot_id", "created_at", "receipt_key_ed25519_b64", "measurement", "chip_id",
-                       "reported_tcb", "policy", "host_data", "kernel_cmdline", "kernel_release", "software"}
+                       "reported_tcb", "policy", "host_data", "kernel_cmdline", "kernel_release", "software", "tenancy"}
 
 
 def canonical(doc) -> bytes:

@@ -62,7 +62,8 @@ Inside the guest, `sealed-hotel.service` runs at every boot:
 | Room images (for example `alpine:3.20`) | No | Pulled at create. The receipt records the image reference and the image id |
 | Hotel API key | No | Config hotel: fw_cfg. It authenticates the broker. The host gives it, so the host can call the API too; each create, exec, process start, network change and delete gets a receipt. Miner hotel: never from the host (see "Miner hotel") |
 | Miner hotel settings (`ROOM_MINER`, TLS port, install signers) | Yes | In the guest `room.env`, and the HTTPS port rule in the guest firewall; only when `SEALED_MINER=1` |
-| HOST_DATA | No (host chooses it) | It carries the sha256 of `manifest.json`, so a report names the build it claims |
+| HOST_DATA | No (host chooses it at launch; the chip signs it and nobody can change it after) | Shared machine: the sha256 of `manifest.json`, so a report names the build it claims. Dedicated machine: also the owner key (see "Dedicated machine") |
+| Owner key and manifest digest (dedicated only) | No | fw_cfg. The guest checks them against HOST_DATA and stops if they differ |
 
 ## What the host cannot do
 
@@ -84,9 +85,127 @@ keeps the key and the traffic from the host; see "Miner hotel"):
   not: the host can read or plant a file in a room with no receipt.
 - The broker reaches the API over plain HTTP on the tap link. The host can
   read that traffic (commands, outputs, files) without leaving a receipt.
+- On a dedicated machine the host still holds the hotel key, but it cannot
+  start a room or an image build that the owner did not sign (see below).
 
 The host still controls availability: it can stop the guest, drop the
 network, or refuse the scratch disk.
+
+## Dedicated machine (one owner)
+
+A shared sealed machine keeps the host and Cathedral out; gVisor separates
+the customers inside it. A dedicated machine also proves to its one customer
+that no other customer's rooms run in it, without trusting Cathedral, the
+broker or the host.
+
+Set `SEALED_OWNER_PUBKEY_FILE` in `sealed.env` to a file with the 32 raw bytes
+of the owner's Ed25519 public key. The owner keeps the private key.
+
+```
+openssl genpkey -algorithm ed25519 -out owner.pem          # the owner, on their side
+python3 owner_sign.py --key owner.pem --public --raw-out owner.pub
+```
+
+### The trust chain
+
+1. **AMD signs the report.** The verifier checks ARK, ASK, VCEK and the report
+   signature, as for any sealed hotel.
+2. **MEASUREMENT covers the gate.** `room_receipts.py` is in the measured
+   initrd. It is the only listener the host can reach in the guest
+   (`sealed-guard.nft` lets in port 18090 on the uplink, and the room API
+   listens on 127.0.0.1). Check the measurement with `--expected-measurement`
+   against the published build.
+3. **HOST_DATA names the owner.** `launch-guest.sh` sets
+   `HOST_DATA = sha256("cathedral-dedicated-v1\0" || sha256(manifest.json) || owner key)`
+   and puts the key and the manifest digest in fw_cfg
+   (`opt/cathedral/owner-pubkey`, `opt/cathedral/manifest-sha256`). At start the
+   front recomputes HOST_DATA from those two files and compares it with its
+   own report. A mismatch, a key that is not 32 bytes, or a key with no
+   manifest digest: the front does not start (`REFUSING TO SERVE` on the guest
+   console, the serial log on the host), so the hotel stays down. No key in
+   fw_cfg: a shared machine.
+4. **Every create is owner-signed.** On a dedicated machine the front refuses
+   `POST /v1/sandboxes` and `POST /v1/images/build` (a build runs Dockerfile
+   steps in the guest) with 403 `owner_signature_required` or
+   `owner_signature_invalid` unless they carry `X-Cathedral-Owner-Timestamp`
+   (unix seconds, within 300 s of the guest clock) and
+   `X-Cathedral-Owner-Signature` (base64 Ed25519 by the owner key) over
+   `"cathedral-owner-<create|build>-v1\n" || timestamp || "\n" || owner_request_sha256`.
+   The refused request never reaches the room API. A refused create still
+   gets a receipt (status 403).
+5. **The binding says so.** It carries `"tenancy": "dedicated"`,
+   `owner_ed25519_b64` and `manifest_sha256` (shared machines: `"tenancy": "shared"`),
+   so anyone can recompute HOST_DATA from published fields. REPORT_DATA
+   commits to the binding as before.
+6. **Each create receipt shows the signature.** A create receipt carries
+   `owner_request_sha256`, `owner_timestamp` and `owner_signature_b64`.
+
+### What the owner signs
+
+`owner_request_sha256` is the sha256 of the canonical JSON (sorted keys, no
+spaces, whole numbers without `.0`) of the create as the hotel receives it,
+minus the `broker_batch` label. The broker changes a create on the way:
+
+| Broker change | In the signed document |
+|---|---|
+| Removes `hotels`, `hotel_labels`, `exclude_hotel_labels`, `sealed`, `placement`, `count` | No (removed first) |
+| Sets `network` to `deny_all` when it is missing | Yes, as `deny_all` |
+| Adds label `broker_guest: <guest id>` | Yes: the room cannot be moved to another guest's workspaces or secrets |
+| Adds label `broker_batch: <random id>` | No (the hotel leaves it out) |
+| Rewrites a `<hotel>.<name>` workspace to `<name>` | Yes, as `<name>` |
+| Rewrites `template` and `snapshot_id` | Not signable yet: name the image; no snapshot forks |
+
+`owner_sign.py` makes these changes and prints the two headers:
+
+```
+python3 owner_sign.py --key owner.pem --guest <broker guest id> --body create.json
+curl -H @<(python3 owner_sign.py --key owner.pem --guest acme --body create.json) \
+  -H "Authorization: Bearer $KEY" --data @create.json https://<broker>/v1/sandboxes
+```
+
+One signature covers every room of a `count` batch (each room gets the same
+body) and any repeat of the same create within 300 s.
+
+### The customer's check
+
+```
+python3 verify_receipts.py --broker https://<broker> --key-file KEY --hotel <id> \
+  --owner-pubkey <base64 key> --expected-measurement <published build> --ark-sha256 <pin>
+```
+
+It fails unless the binding says dedicated and names this key, the report's
+HOST_DATA equals the recomputed value, and every successful create receipt
+carries an owner signature that verifies.
+
+### What the broker or host can and cannot do on a dedicated machine
+
+Cannot:
+- Start a room or an image build the owner did not sign. A signature covers
+  the image, command, env, resources, network, workspace, labels and count.
+- Name another owner without a relaunch. HOST_DATA is fixed at launch; a
+  relaunch is a new guest (new memory, new receipt key, new REPORT_ID) whose
+  binding names the other key, so the owner's check fails.
+- Hide the owner check: a key in fw_cfg that HOST_DATA does not name stops
+  the front; no key while HOST_DATA names the owner gives a binding that says
+  shared; a changed front changes MEASUREMENT.
+
+Can:
+- Replay a signed create within 300 s (the tap link is plain HTTP). The guest
+  clock comes from the host, so a host that moves it can replay later too.
+  Either way it only starts more copies of a room the owner asked for.
+- Run the other room operations with the hotel key: exec, process start,
+  files, tar, terminals, network change, snapshot, delete, workspaces and
+  secrets are not gated.
+- Stop the guest or refuse to route creates (availability).
+
+The broker passes the two headers through on `POST /v1/sandboxes` only.
+Image builds through the broker are not signed, so a dedicated machine
+refuses them; build elsewhere and push to a registry. The broker's capability
+probe (`POST /v1/broker/probe`) is also refused there.
+
+The broker admits the machine only if its HOST_DATA is in `sealed_host_data`
+(when that list is set). `install.sh --sealed` prints the value
+(`tenancy dedicated host_data <hex>`); add it to the broker config.
 
 ## Receipts
 
@@ -143,6 +262,9 @@ build (`cathedral.debug=1` on the measured command line fails), the AMD chain
 report signature (ECDSA P-384), each receipt signature (Ed25519) and the
 chain links. It prints the policy timeline of each room
 (`policy_timeline`) and checks each policy sha256.
+
+A dedicated machine's create receipts also carry `owner_request_sha256`,
+`owner_timestamp` and `owner_signature_b64`; `--owner-pubkey` checks them.
 
 ### Not covered yet
 

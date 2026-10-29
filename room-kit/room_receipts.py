@@ -48,6 +48,18 @@ accepts a bearer only when it equals the installed key. The API behind the
 front knows only a guest-internal key (ROOM_API_KEY_PATH, made at boot inside
 the guest), which the front puts on each request it passes on.
 
+Dedicated sealed machine (one owner). The host launches the guest with the
+owner's Ed25519 public key and the manifest digest in fw_cfg, and with
+HOST_DATA = sha256("cathedral-dedicated-v1\\0" || manifest sha256 || owner key).
+At start this front recomputes that value and compares it with HOST_DATA in
+its own SNP report. A key that the report does not name stops the front: it
+does not serve. A match turns on the owner gate: every room create (and image
+build) must carry X-Cathedral-Owner-Timestamp and X-Cathedral-Owner-Signature,
+an Ed25519 signature by the owner key over
+  "cathedral-owner-<action>-v1\\n" || timestamp || "\\n" || owner_request_sha256
+where owner_request_sha256 is owner_request_sha256(body) below. No key in
+fw_cfg: a shared machine, no gate. The binding says which ("tenancy").
+
 Canonical JSON: sort_keys, separators (",", ":"), ensure_ascii=False, UTF-8.
 Verify offline with verify_receipts.py.
 """
@@ -70,7 +82,7 @@ import time
 import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature, InvalidTag
@@ -118,6 +130,18 @@ INSTALL_MAX_SIGNERS = 4
 HOTEL_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")  # the broker's hotel key rule, bounded
 BROKER_HOTEL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 KEY_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# Dedicated sealed machines (one owner). fw_cfg files are host-given and not
+# measured; HOST_DATA (chip-signed, fixed at launch) is what makes them count.
+OWNER_FW_CFG = "/sys/firmware/qemu_fw_cfg/by_name/opt/cathedral"
+DEDICATED_HOST_DATA_DOMAIN = b"cathedral-dedicated-v1\0"
+OWNER_SIGNATURE_HEADER = "X-Cathedral-Owner-Signature"
+OWNER_TIMESTAMP_HEADER = "X-Cathedral-Owner-Timestamp"
+OWNER_MAX_SKEW_SECONDS = 300
+# The one field the broker adds per request that the owner cannot know in
+# advance (a random id per create request). Everything else is signed.
+OWNER_UNSIGNED_LABELS = ("broker_batch",)
+OWNER_TIMESTAMP_RE = re.compile(r"^[0-9]{1,12}$")
+GUEST_HEADER = "X-Cathedral-Guest"
 
 
 class PlantError(ValueError):
@@ -272,6 +296,123 @@ def read(path: str, default: str = "") -> str:
             return f.read().strip()
     except OSError:
         return default
+
+
+# ---------------------------------------------------------------- dedicated owner
+
+class OwnerBindingError(RuntimeError):
+    """fw_cfg names an owner that HOST_DATA does not. The front must not serve."""
+
+
+def dedicated_host_data(manifest_sha256: bytes, owner_key: bytes) -> bytes:
+    """HOST_DATA of a dedicated machine (launch-guest.sh computes the same)."""
+    return hashlib.sha256(DEDICATED_HOST_DATA_DOMAIN + manifest_sha256 + owner_key).digest()
+
+
+def _fw_cfg(name: str) -> bytes | None:
+    try:
+        with open(os.path.join(OWNER_FW_CFG, name, "raw"), "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def owner_tenancy(host_data_hex: str) -> tuple[bytes, bytes] | None:
+    """(owner key, manifest sha256) on a dedicated machine; None on a shared one.
+
+    No owner key in fw_cfg: shared. A key that this report's HOST_DATA does
+    not commit to raises OwnerBindingError: the host gave the guest an owner
+    the chip did not sign, and serving would claim an owner nobody can check.
+    """
+    key = _fw_cfg("owner-pubkey")
+    if key is None:
+        return None
+    if len(key) != 32:
+        raise OwnerBindingError(f"fw_cfg owner-pubkey is {len(key)} bytes, expected a 32-byte raw Ed25519 public key")
+    try:
+        Ed25519PublicKey.from_public_bytes(key)
+    except ValueError as exc:
+        raise OwnerBindingError("fw_cfg owner-pubkey is not an Ed25519 public key") from exc
+    manifest = _fw_cfg("manifest-sha256")
+    if manifest is None or len(manifest) != 32:
+        raise OwnerBindingError("fw_cfg has an owner key but no 32-byte manifest-sha256")
+    if not hmac.compare_digest(dedicated_host_data(manifest, key), bytes.fromhex(host_data_hex)):
+        raise OwnerBindingError("HOST_DATA in the SNP report does not commit to the fw_cfg owner key")
+    return key, manifest
+
+
+def _whole_numbers(doc):
+    """2.0 -> 2, recursively. The broker (Go) re-encodes every JSON number as a float64."""
+    if isinstance(doc, float) and doc.is_integer():
+        return int(doc)
+    if isinstance(doc, dict):
+        return {k: _whole_numbers(v) for k, v in doc.items()}
+    if isinstance(doc, list):
+        return [_whole_numbers(v) for v in doc]
+    return doc
+
+
+def owner_request_sha256(body: bytes) -> str:
+    """The digest an owner signs: canonical JSON of the request body as the
+    hotel receives it, without the broker's per-request batch label.
+
+    The broker changes a create before the hotel sees it (placement fields
+    and count removed, a default network, the broker_guest and broker_batch
+    labels); owner_sign.py makes the same changes, so both sides hash the
+    same document. Only broker_batch, a random id per request, is left out
+    here; "count" and every other field count. Raises ValueError when the
+    body is not a JSON object.
+    """
+    return sha(canonical(_whole_numbers(_signed_document(body))))
+
+
+def _signed_document(body: bytes) -> dict:
+    doc = json.loads(body)
+    if not isinstance(doc, dict):
+        raise ValueError("the request body is not a JSON object")
+    labels = doc.get("labels")
+    if isinstance(labels, dict):
+        for k in OWNER_UNSIGNED_LABELS:
+            labels.pop(k, None)
+    return doc
+
+
+def owner_message(action: str, timestamp: str, request_sha256: str) -> bytes:
+    return f"cathedral-owner-{action}-v1\n{timestamp}\n{request_sha256}".encode()
+
+
+def check_owner_signature(owner_key: bytes, action: str, headers, body: bytes | None,
+                          now: float) -> tuple[str | None, str, dict]:
+    """(error code or None, message, receipt fields) for one gated request."""
+    sig_b64 = (headers.get(OWNER_SIGNATURE_HEADER) or "").strip()
+    ts = (headers.get(OWNER_TIMESTAMP_HEADER) or "").strip()
+    if not sig_b64 or not ts:
+        return ("owner_signature_required",
+                f"this is a dedicated machine: a {action} needs {OWNER_TIMESTAMP_HEADER} and "
+                f"{OWNER_SIGNATURE_HEADER} signed by the owner key in the attestation", {})
+    if not OWNER_TIMESTAMP_RE.fullmatch(ts):
+        return "owner_signature_invalid", "the owner timestamp is not unix seconds", {}
+    if abs(now - int(ts)) > OWNER_MAX_SKEW_SECONDS:
+        return "owner_signature_invalid", f"the owner timestamp is more than {OWNER_MAX_SKEW_SECONDS} s from the hotel clock", {}
+    try:
+        sig = base64.b64decode(sig_b64, validate=True)
+        doc = _signed_document(body or b"")
+        digest = sha(canonical(_whole_numbers(doc)))
+    except (ValueError, RecursionError):  # binascii.Error, JSONDecodeError and UnicodeDecodeError are ValueErrors
+        return "owner_signature_invalid", "the owner signature or the request body does not parse", {}
+    try:
+        Ed25519PublicKey.from_public_bytes(owner_key).verify(sig, owner_message(action, ts, digest))
+    except InvalidSignature:
+        return "owner_signature_invalid", "the owner signature does not verify over this request", {}
+    if action == "create":
+        # The API takes a room's guest (whose workspaces and secrets it gets)
+        # from X-Cathedral-Guest before the signed broker_guest label. The
+        # broker sends no such header on a create; any copy must equal the label.
+        labels = doc.get("labels") if isinstance(doc.get("labels"), dict) else {}
+        all_values = headers.get_all(GUEST_HEADER) if hasattr(headers, "get_all") else [headers.get(GUEST_HEADER)]
+        if any(v and v != labels.get("broker_guest") for v in all_values or []):
+            return "owner_signature_invalid", "X-Cathedral-Guest differs from the signed broker_guest label", {}
+    return None, "", {"owner_request_sha256": digest, "owner_timestamp": int(ts), "owner_signature_b64": b64(sig)}
 
 
 def escape_plant_open(ledger: "Ledger") -> bool:
@@ -534,6 +675,8 @@ class Ledger:
 
     def __init__(self, hotel: str, store: str, miner: MinerHotel | None = None):
         self.miner = miner
+        # Raw Ed25519 owner key on a dedicated sealed machine, else None (no gate).
+        self.owner_key: bytes | None = None
         if tsm_provider() == "sev_guest":
             self._init_sealed(hotel, store)
         elif miner is not None:
@@ -576,6 +719,9 @@ class Ledger:
         pub = self.key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         # A first report (zero REPORT_DATA) gives the launch facts the binding names.
         facts = report_fields(snp_report(bytes(64)))
+        # Before any key or binding exists: a dedicated machine whose fw_cfg
+        # owner HOST_DATA does not name raises here and never serves.
+        owner = owner_tenancy(facts["host_data"])
         self.binding = {
             "schema": BINDING_SCHEMA,
             "hotel": hotel,
@@ -593,14 +739,24 @@ class Ledger:
                 "room_kit": read("/opt/room-kit/KIT_COMMIT", "unknown"),
                 "cathedral": read("/opt/pool-room/src/COMMIT", "unknown"),
             },
+            "tenancy": "shared",
         }
         if self.miner is not None:
             # TLS key, install key and pinned signers: REPORT_DATA commits to them.
             self.binding.update(self.miner.binding_fields())
+        if owner is not None:
+            # Enough to recompute HOST_DATA from published fields:
+            # sha256(domain || manifest_sha256 || owner key) == host_data.
+            self.owner_key, manifest = owner
+            self.binding.update({"tenancy": "dedicated", "owner_ed25519_b64": b64(self.owner_key),
+                                 "manifest_sha256": manifest.hex()})
         self.binding_sha256 = sha(canonical(self.binding))
         self.report = snp_report(bytes.fromhex(self.binding_sha256) + bytes(32))
-        if report_fields(self.report)["measurement"] != facts["measurement"]:
+        second = report_fields(self.report)
+        if second["measurement"] != facts["measurement"]:
             raise RuntimeError("measurement changed between the two reports")
+        if second["host_data"] != facts["host_data"]:
+            raise RuntimeError("HOST_DATA changed between the two reports")
         self._open_store(store)
 
     def install_key_document(self) -> dict | None:
@@ -795,6 +951,13 @@ SIGNED = [  # (method, path pattern, action)
     ("PATCH", re.compile("^" + ROOM + r"/network$"), "network_set"),
     ("DELETE", re.compile(r"^/v1/sandboxes$"), "bulk_delete"),
 ]
+# Dedicated machine: the requests that start code need the owner signature.
+# A build runs Dockerfile steps in the guest, and the broker sends builds to
+# every hotel, so it is gated like a create.
+OWNER_GATED = [  # (method, path pattern, action in the signed message)
+    ("POST", re.compile(r"^/v1/sandboxes$"), "create"),
+    ("POST", re.compile(r"^/v1/images/build$"), "build"),
+]
 HEX64 = re.compile(r"[0-9a-fA-F]{128}")
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
        "proxy-authenticate", "content-length", "host"}
@@ -954,18 +1117,41 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(400, b'{"error":{"code":"invalid_request","message":"the body holds a lone surrogate escape"}}')
             except ValueError:
                 pass  # not JSON: the API answers
-        status, headers, out = self.upstream(self.server.api_port, body)
+        refusal, owner_fields = self.owner_gate(ledger, body)
+        if refusal is not None:
+            status, headers, out = 403, [], refusal
+        else:
+            status, headers, out = self.upstream(self.server.api_port, body)
         extra = {}
         if action and self.authorized():
             try:
-                extra["X-Room-Receipt"] = base64.urlsafe_b64encode(
-                    canonical(ledger.sign(self.fields(action, path, body, status, out)))).decode()
+                extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(ledger.sign(
+                    {**self.fields(action, path, body, status, out), **owner_fields}))).decode()
             except Exception as exc:  # noqa: BLE001 the action ran: answer, and say the receipt is missing
                 traceback.print_exc()
                 extra["X-Room-Receipt-Error"] = type(exc).__name__
         ctype = next((v for k, v in headers if k.lower() == "content-type"), "application/json")
         passthrough = {k: v for k, v in headers if k.lower() not in HOP and k.lower() != "content-type"}
         return self.reply(status, out, {**passthrough, **extra}, ctype)
+
+    def owner_gate(self, ledger: "Ledger", body: bytes | None) -> tuple[bytes | None, dict]:
+        """Dedicated machine: (403 body, {}) for a gated request without a
+        valid owner signature, else (None, owner fields for a create receipt).
+
+        The path is parsed as the API parses it (urlparse, which drops a
+        ";params" suffix), so no spelling reaches the API's create route
+        without passing here.
+        """
+        if ledger.owner_key is None:
+            return None, {}
+        api_path = urlparse(self.path).path
+        action = next((a for meth, pat, a in OWNER_GATED if meth == self.command and pat.match(api_path)), None)
+        if action is None:
+            return None, {}
+        code, msg, fields = check_owner_signature(ledger.owner_key, action, self.headers, body, time.time())
+        if code:
+            return canonical({"error": {"code": code, "message": msg}}), {}
+        return None, (fields if action == "create" else {})
 
     def handle_attest(self, ledger: "Ledger", body: bytes | None):
         """POST /room/attest {"report_data_hex": <128 hex>}: a fresh SNP report.
@@ -1291,9 +1477,22 @@ def main() -> int:
     if mode == "1":
         miner = MinerHotel(env["ROOM_HOTEL_NAME"], parse_install_signers(env.get("ROOM_HOTEL_KEY_INSTALL_SIGNERS", "")))
     store = env.get("ROOM_RECEIPTS_DIR", "/run/room-receipts")
-    ledger = Ledger(env["ROOM_HOTEL_NAME"], store, miner=miner)
+    try:
+        ledger = Ledger(env["ROOM_HOTEL_NAME"], store, miner=miner)
+    except OwnerBindingError as exc:
+        # Fail closed: nothing listens, so the broker sees the hotel down.
+        # The console is the guest serial port, the one log the host operator can read.
+        msg = f"room-receipts: REFUSING TO SERVE (dedicated owner check): {exc}"
+        print(msg, file=sys.stderr, flush=True)
+        try:
+            with open("/dev/console", "w") as console:
+                console.write(msg + "\n")
+        except OSError:
+            pass
+        return 2
     if ledger.sealed:
-        print(f"room-receipts: binding {ledger.binding_sha256} measurement {ledger.binding['measurement']}", flush=True)
+        print(f"room-receipts: binding {ledger.binding_sha256} measurement {ledger.binding['measurement']} "
+              f"tenancy {ledger.binding['tenancy']}", flush=True)
     else:
         print(f"room-receipts: binding {ledger.binding_sha256} level hotel", flush=True)
     args = (ledger, int(env.get("ROOM_API_PORT", "18090")), int(env.get("ROOM_HEALTH_PORT", "18091")), api_key,
