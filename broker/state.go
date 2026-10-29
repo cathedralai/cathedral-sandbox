@@ -79,6 +79,11 @@ func (b *broker) saveCompat() error {
 	if b.cfg.StateDir == "" {
 		return nil
 	}
+	// One save at a time, from the snapshot to the rename: the save loop and a
+	// direct save (the operator forget) share the temporary file, and a later
+	// save must never be overwritten by an older snapshot.
+	b.stateSaveMu.Lock()
+	defer b.stateSaveMu.Unlock()
 	st := savedState{
 		UUIDs: map[string]string{}, Idem: map[string]savedIdem{}, Tombs: map[string]savedTomb{},
 		Images: map[string]*compatImage{}, GuestRooms: map[string]map[string]map[string]bool{},
@@ -149,12 +154,17 @@ func (b *broker) saveCompat() error {
 	if err := os.MkdirAll(b.cfg.StateDir, 0o700); err != nil {
 		return err
 	}
+	afterStateSnapshot()
 	tmp := filepath.Join(b.cfg.StateDir, stateFile+".tmp")
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(b.cfg.StateDir, stateFile))
 }
+
+// afterStateSnapshot runs between a save's snapshot and its write. Tests use
+// it to hold one save there while another starts.
+var afterStateSnapshot = func() {}
 
 // saveBuildContext writes a build context file. Caller holds b.compat.mu.
 func (b *broker) saveBuildContext(img *compatImage) {
