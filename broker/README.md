@@ -387,6 +387,13 @@ The observed TLS key must match the AMD-verified binding before the broker
 sends the hotel key. Miner calls pin the guest key on both data and control
 connections. Plain HTTP, a client-supplied pin, and `verify=false` are refused.
 The guest must install its hotel key inside the attested room before join.
+A miner guest keeps its rooms in memory, so a dead or rebooted guest takes
+them with it, but the broker cannot see that: its pinned calls fail, and a
+new attested guest at the same origin does not prove the old one stopped (a
+host can run both on one chip). So the broker never forgets rooms on its own.
+A person with the operator key does, with `forget_rooms=true` on the leave of
+a drained miner hotel that has been down for 10 minutes. This also frees the
+hotkey cap slot of a machine that is gone for good.
 The operator and miner-only capacity views report `admission_policy` with the
 configured measurement allowlist and hotkey caps. `miner_tls_pin` is `true`
 for this broker build; customer guests never
@@ -397,7 +404,7 @@ receive this policy document.
 | `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey` and `admission`. |
 | `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?}`. A miner hotel must set `"sealed": true` and use HTTPS with attested guest TLS; the broker pins that key before its first keyed call. `"verify": false` is refused for miners. For operator hotels, the broker calls `GET /v1/status` with the key and checks attestation for sealed hotels; `"verify": false` skips both and joins pending. An unsealed join cannot claim `labels.sealed=true`. `miner_hotkey` (SS58) adds `miner=true` and `miner_hotkey` labels, which a PATCH cannot remove. |
 | `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). An unsealed runtime hotel cannot gain the sealed label. |
-| `DELETE /v1/broker/hotels/<id>` | Removes a runtime hotel that has no rooms. Drain it first. |
+| `DELETE /v1/broker/hotels/<id>` | Removes a runtime hotel that has no rooms. Drain it first. `?forget_rooms=true` (operator key only, miner hotels only): when the hotel is drained, has been down for 10 minutes and has no create in flight, it asks the old guest once more on its attested key (an answer refuses and starts the 10 minutes again), writes the rooms' `deleted` tombstones to disk, removes the hotel from the runtime list, and only then releases the rooms. A failed write answers 500 and leaves every room, client id and tombstone as before. Otherwise 409 `forget_refused` with the reason. |
 
 The broker keeps runtime hotels in `state_dir/hotels.json` and their keys in
 `state_dir/hotel-keys/<id>.key` (mode 0600). A hotel from the config file

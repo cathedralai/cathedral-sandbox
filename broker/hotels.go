@@ -319,7 +319,7 @@ func (b *broker) handleHotelAdmin(w http.ResponseWriter, r *http.Request, id str
 	case id != "" && r.Method == "PATCH":
 		b.patchHotel(w, r, id, enroller)
 	case id != "" && r.Method == "DELETE":
-		b.leaveHotel(w, id, enroller)
+		b.leaveHotel(w, id, enroller, r.URL.Query().Get("forget_rooms") == "true")
 	default:
 		writeErr(w, 404, "route_not_found", "central booking does not route "+r.Method+" "+r.URL.Path)
 	}
@@ -604,7 +604,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	writeJSON(w, 200, b.hotelDoc(h))
 }
 
-func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller bool) {
+func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller, forget bool) {
 	b.hotelsMutationMu.Lock()
 	defer b.hotelsMutationMu.Unlock()
 	h := b.hotelByID(id)
@@ -616,8 +616,16 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller bool) {
 		writeErr(w, 403, "enroller_scope", "miner enrollment can leave only miner hotels")
 		return
 	}
+	if forget && enroller {
+		writeErr(w, 403, "enroller_scope", "only the operator key can forget rooms")
+		return
+	}
 	if !h.runtime {
 		writeErr(w, 409, "hotel_in_config", "hotel "+id+" is in the config file; remove it there")
+		return
+	}
+	if forget {
+		b.forgetAndLeave(w, h, id)
 		return
 	}
 	// The check and the mark are one step under b.mu: pick holds b.mu, so
