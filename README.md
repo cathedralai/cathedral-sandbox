@@ -111,11 +111,13 @@ Reuse the signer, not a second hotkey or a second signing key.
 
 ## Founding miners
 
-This repository has no published founding-miner program: no eligibility rules,
-application path, rewards, dates or guarantees. Closest material is the SNP
-onboarding and hardware-proof path in the [mining guide](docs/MINING.md#founding-miners).
-Do not treat testnet Join notes or internal evidence templates as a public
-program.
+Cathedral is admitting a small group of operators first. Apply with the
+[Founding Miner Application](https://docs.google.com/forms/d/e/1FAIpQLScxnX15Hb70AnkeZcHBI53cv_yN7aen4_h95njQvMzBxBiMpQ/viewform).
+Cathedral acknowledges every application within 48 hours.
+
+Registration alone does not admit a machine to the sealed customer pool
+or place customer jobs. After Cathedral accepts you, follow the
+[mining guide](docs/MINING.md#founding-miners).
 
 ## Validators
 

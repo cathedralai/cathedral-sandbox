@@ -34,9 +34,10 @@ order.
 
 ## Founding miners
 
-There is no published founding-miner program in this repository. See
-[Founding miners](MINING.md#founding-miners) for the honest stub and the
-list of terms Cathedral still needs to publish.
+The public SN94 Founding Miner Application is live. Apply with the
+[Founding Miner Application](https://docs.google.com/forms/d/e/1FAIpQLScxnX15Hb70AnkeZcHBI53cv_yN7aen4_h95njQvMzBxBiMpQ/viewform).
+See [Founding miners](MINING.md#founding-miners). Registration alone does
+not admit a machine to the sealed customer pool or place customer jobs.
 
 ## Validators
 

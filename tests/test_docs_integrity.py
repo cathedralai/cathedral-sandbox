@@ -36,7 +36,8 @@ def test_mining_guide_is_the_single_current_operator_path() -> None:
         # not keep a historical-SN39 identity or UID-specific admission story.
         "SN94 admission remains unverified",
         "Founding miners",
-        "no published founding-miner program",
+        "Founding Miner Application",
+        "Registration alone does not admit a machine to the sealed customer pool",
         "7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b",
         "3e1cb9144417e1e0d526445a43245e305e772cae0568202a332183071ef0c584",
         "current migration bridge",
@@ -50,7 +51,7 @@ def test_mining_guide_is_the_single_current_operator_path() -> None:
 
     assert "single current mining guide" in mining
     assert "only active operator guide" in " ".join(map_text.split())
-    assert "founding-miner terms" in mining.lower()
+    assert "founding miners apply" in mining.lower()
     assert len(mining.splitlines()) <= 8
 
 
@@ -293,7 +294,12 @@ def test_readme_is_a_short_mission_first_miner_entrypoint() -> None:
     assert "There is no self-serve sealed capacity" in readme
     assert "Cathedral does not own" in readme
     assert "The Escape Room is coming, but it is not open" in readme
-    assert "no published founding-miner program" in readme
+    assert "Founding Miner Application" in readme
+    assert (
+        "Registration alone does not admit a machine to the sealed customer pool"
+        in readme
+    )
+    assert "no published founding-miner program" not in readme
     assert "Do not install or run a validator from this repository" in readme
     assert "—" not in readme
 
@@ -324,12 +330,20 @@ def test_operator_docs_name_cathedral_as_sn94_not_sn39() -> None:
         "subnet 39",
         "netuid 39",
         "Subnet 39",
+        "no published founding-miner program",
+        "no application path",
+    )
+    form = (
+        "https://docs.google.com/forms/d/e/"
+        "1FAIpQLScxnX15Hb70AnkeZcHBI53cv_yN7aen4_h95njQvMzBxBiMpQ/viewform"
     )
     for relative in operator_paths:
         text = (REPO_ROOT / relative).read_text()
         for phrase in forbidden:
             assert phrase not in text, f"{relative}: {phrase}"
         assert "—" not in text, relative
+    for relative in ("README.md", "docs/README.md", "docs/MINING.md"):
+        assert form in (REPO_ROOT / relative).read_text(), relative
 
 
 OPERATOR_LINK_DOCUMENTS = [

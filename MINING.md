@@ -4,5 +4,5 @@ The single current mining guide is [Mining Cathedral](docs/MINING.md).
 Start at the [repository overview](README.md) for requirements and support.
 
 This file preserves older links; do not use obsolete publisher, enrollment,
-burn or UID-specific instructions. Founding-miner terms are not published;
-see [Founding miners](docs/MINING.md#founding-miners).
+burn or UID-specific instructions. Founding miners apply from
+[Founding miners](docs/MINING.md#founding-miners).

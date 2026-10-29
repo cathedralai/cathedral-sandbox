@@ -612,22 +612,16 @@ zero for the round.
 
 ## Founding miners
 
-This repository has no published founding-miner program. There are no
-eligibility rules, application steps, rewards, dates or guarantees here.
-Do not treat testnet 584 Join notes or internal evidence templates as a
-public offer.
+Cathedral is admitting a small group of operators first. Apply with the
+[Founding Miner Application](https://docs.google.com/forms/d/e/1FAIpQLScxnX15Hb70AnkeZcHBI53cv_yN7aen4_h95njQvMzBxBiMpQ/viewform).
+Cathedral acknowledges every application within 48 hours.
 
-Until Cathedral publishes those terms, an outside operator can only:
+Registration alone does not admit a machine to the sealed customer pool
+or place customer jobs. After Cathedral accepts you, follow this guide
+and the [AMD SEV-SNP](AMD_SEV_SNP_FRIEND_TEST.md) hardware-proof path.
 
-- follow this mining guide and the [AMD SEV-SNP](AMD_SEV_SNP_FRIEND_TEST.md)
-  hardware-proof path;
-- ask each validator operator whether they will review a measurement and TCB;
-- ask Cathedral whether a founding-miner intake exists, and wait for written
-  terms before spending or registering for that program.
-
-Needed from Cathedral before this section can be more than a stub: who
-qualifies, how to apply, what hardware is accepted, what is paid or reserved,
-how long the program lasts, and who confirms admission.
+Do not treat testnet 584 Join notes or internal evidence templates as the
+application.
 
 ## Reference
 
