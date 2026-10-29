@@ -94,7 +94,7 @@ limits without a restart:
 | Route (operator key) | What it does |
 |---|---|
 | `GET /v1/broker/guests` | Every guest with its limits and active rooms. No key hashes. |
-| `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed`, `hotels` and `policy` (`"policy": null` removes it). `max_rooms: 0` and `hotels: []` get 400: in config they mean 1,000 rooms and every hotel. A bad policy gets 400 `invalid_policy`. |
+| `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed`, `hotels` and `policy` (`"policy": null` removes it). `max_rooms: 0` and `hotels: []` get 400: in config they mean 1,000 rooms and every non-miner hotel. A bad policy gets 400 `invalid_policy`. |
 
 A runtime change stays in memory. A restart goes back to the config file.
 
@@ -130,7 +130,13 @@ with no config edit.
 - Named `hotels` must be in the policy's reach (prefer or allow, minus deny),
   else 409 `unknown_hotel`. Tiers still apply among them.
 - `max_rooms` is still the cap: at the cap a create gets 429 `room_limit`.
-- A guest with no policy keeps `hotels` and `default_sealed` exactly as before.
+- A miner hotel is denied unless the guest policy explicitly selects
+  `{"label": {"miner": "true"}}` in `prefer` or `allow`. A broad sealed
+  selector, a named hotel, and a guest with no policy cannot opt in. This
+  protects existing customer and Escape guests from newly joined miners.
+  Do not opt a customer guest in until the miner-host data isolation and
+  attested guest TLS path are proven.
+- A guest with no policy keeps `hotels` and `default_sealed` for non-miner hotels.
 
 Example: `polaris-sealed` gets sealed rooms first, unsealed rooms when sealed
 is full, never `nc-sealed`, at most 10 rooms:
@@ -408,7 +414,7 @@ Config (all optional):
 
 | Field | Meaning |
 |---|---|
-| `sealed_measurements` | A joined sealed hotel's measurement must be in this list. |
+| `sealed_measurements` | A joined sealed hotel's measurement must be in this list. A miner hotel requires a nonempty list and is refused if it is empty. |
 | `sealed_host_data` | Its HOST_DATA must be in this list. |
 | `attest_ttl_seconds`, `attest_every_seconds` | As above. |
 | `sealed_admission` | `"off"` turns the attestation gate off for joined operator hotels only. Miner hotels always require the SEV-SNP and AMD chain checks. |

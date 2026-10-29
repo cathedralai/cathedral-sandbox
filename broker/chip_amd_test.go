@@ -49,6 +49,7 @@ func recheck(t *testing.T, tc *testChain, id string) {
 
 func TestOneHotelPerChip(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
+	optInMiner(t, tc, "g1")
 	sameChip := attestOpts{chip: 7}
 	m1, url1 := newMinerHotel(t, 5, snpAttestation(t, sameChip))
 	tc.hotels["m1"] = m1.fakeHotel
@@ -163,6 +164,7 @@ func TestAMDChainRequiredForMinerHotels(t *testing.T) {
 
 	// With the verifier: FAIL refuses with its reason, PASS admits.
 	tc = newChainState(t, t.TempDir())
+	optInMiner(t, tc, "g1")
 	setAMDVerdict(t, tc.amdDir, `{"verdict": "FAIL", "reason": "report signature does not verify with the VCEK"}`)
 	m, url := newMinerHotel(t, 5, snpAttestation(t, attestOpts{chip: 3}))
 	tc.hotels["m1"] = m.fakeHotel
@@ -218,6 +220,21 @@ func TestMinerAdmissionCannotBeDisabled(t *testing.T) {
 	})
 	if status != 422 || errCode(doc) != "attestation_failed" {
 		t.Fatalf("unverified miner admitted while sealed_admission=off: %d %v", status, doc)
+	}
+	if tc.b.hotelByID("m1") != nil {
+		t.Fatal("refused miner was stored")
+	}
+}
+
+func TestMinerAdmissionRequiresMeasurementAllowlist(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.SealedMeasurements = nil
+	_, url := newMinerHotel(t, 5, snpAttestation(t, attestOpts{}))
+	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+		"id": "m1", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
+	})
+	if status != 422 || errCode(doc) != "attestation_failed" || !strings.Contains(fmt.Sprint(doc), "sealed_measurements") {
+		t.Fatalf("miner admitted without measurement policy: %d %v", status, doc)
 	}
 	if tc.b.hotelByID("m1") != nil {
 		t.Fatal("refused miner was stored")

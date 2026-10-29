@@ -15,7 +15,8 @@
 // runtime is matched by class and label with no policy edit.
 //
 // When a guest has a policy, the policy replaces its "hotels" list and its
-// "default_sealed" flag. A guest with no policy behaves as before.
+// "default_sealed" flag. Miner hotels are denied unless the guest policy
+// explicitly selects the miner=true label; broad sealed selectors do not opt in.
 //
 // A hotel can be reserved for one guest (hotel field "reserved_for", in the
 // config or by PATCH /v1/broker/hotels/<id>). Every other guest treats it as
@@ -94,6 +95,11 @@ func anyMatch(list []selector, h *hotel) bool {
 
 // tier is "prefer", "allow" or "" (the policy does not reach h). Deny wins.
 func (p *guestPolicy) tier(h *hotel) string {
+	// Miner hotels require an explicit miner selector. A broad sealed class
+	// or an absent policy must never opt an existing customer guest in.
+	if h.cfg.MinerHotkey != "" && !p.minerOptIn(h) {
+		return ""
+	}
 	switch {
 	case anyMatch(p.Deny, h):
 		return ""
@@ -103,6 +109,20 @@ func (p *guestPolicy) tier(h *hotel) string {
 		return tierAllow
 	}
 	return ""
+}
+
+func (p *guestPolicy) minerOptIn(h *hotel) bool {
+	if p == nil {
+		return false
+	}
+	for _, list := range [][]selector{p.Prefer, p.Allow} {
+		for _, s := range list {
+			if s.Label["miner"] == "true" && s.matches(h) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func validSelectors(field string, list []selector) error {

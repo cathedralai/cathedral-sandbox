@@ -114,6 +114,9 @@ func (b *broker) needsAttestation(h *hotel) bool {
 // admitted reports whether h passed admission. Health is h.ok, checked by
 // admissibleFree; this is the attestation part. Caller holds b.mu.
 func (b *broker) admitted(h *hotel, now time.Time) bool {
+	if h.cfg.MinerHotkey != "" && len(b.cfg.SealedMeasurements) == 0 {
+		return false
+	}
 	// Older state may contain an unsealed miner or a runtime hotel that claimed
 	// a sealed label. Keep both out of placement after a restart as well.
 	if h.cfg.MinerHotkey != "" && !h.cfg.Sealed {
@@ -183,6 +186,9 @@ type attestFetchErr struct{ error }
 
 // checkAttestation fetches and checks h's attestation. It does not lock.
 func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, error) {
+	if h.cfg.MinerHotkey != "" && len(b.cfg.SealedMeasurements) == 0 {
+		return admission{}, errors.New("a miner hotel needs a nonempty sealed_measurements allowlist")
+	}
 	var att struct {
 		Binding    json.RawMessage `json:"binding"`
 		BindingSHA string          `json:"binding_sha256"`

@@ -207,6 +207,13 @@ func setPolicy(t *testing.T, tc *testChain, guest string, policy map[string]any)
 	}
 }
 
+func optInMiner(t *testing.T, tc *testChain, guest string) {
+	setPolicy(t, tc, guest, map[string]any{
+		"prefer": []any{map[string]any{"label": map[string]string{"miner": "true"}}},
+		"allow":  []any{map[string]any{"class": "sealed"}, map[string]any{"class": "unsealed"}},
+	})
+}
+
 func reasonOf(doc map[string]any) map[string]any {
 	r, _ := doc["reason"].(map[string]any)
 	return r
@@ -244,6 +251,7 @@ func TestJoinedMinerHotelPersistsAcrossRestartAndMustPassAgain(t *testing.T) {
 	}
 
 	tc.start(t) // restart: same config, same state_dir
+	optInMiner(t, tc, "g1")
 	h := tc.b.hotelByID("m1")
 	if h == nil || h.cfg.MinerHotkey != minerHotkey || h.cfg.MaxSlots != 2 || h.reservedFor() != "g1" || h.labels()["zone"] != "eu" || h.labels()["miner"] != "true" {
 		t.Fatalf("hotel after restart: %+v", h)
@@ -403,6 +411,7 @@ func TestVerifyAttestationKeepsTheReceiptKey(t *testing.T) {
 
 func TestUnhealthyOrExpiredHotelLeavesPlacementAndComesBack(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
+	optInMiner(t, tc, "g1")
 	m := joinMiner(t, tc, "m1", true, 5, nil)
 	onM1 := map[string]any{"image": "alpine:3.20", "hotels": []string{"m1"}}
 	tc.room(t, "key1", onM1)
@@ -481,7 +490,7 @@ func TestUnhealthyOrExpiredHotelLeavesPlacementAndComesBack(t *testing.T) {
 // ---------------------------------------------------------------- spill and reasons
 
 var sealedFirst = map[string]any{
-	"prefer": []any{map[string]any{"class": "sealed"}},
+	"prefer": []any{map[string]any{"class": "sealed"}, map[string]any{"label": map[string]string{"miner": "true"}}},
 	"allow":  []any{map[string]any{"class": "unsealed"}},
 }
 
@@ -546,8 +555,34 @@ func TestSpillFromJoinedSealedToUnsealedAndClearReasons(t *testing.T) {
 
 // ---------------------------------------------------------------- isolation
 
+func TestMinerPlacementRequiresExplicitGuestOptIn(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	joinMiner(t, tc, "m1", true, 2, nil)
+	onM1 := map[string]any{"image": "alpine:3.20", "hotels": []string{"m1"}, "sealed": true}
+	for _, policy := range []map[string]any{
+		nil,
+		{"prefer": []any{map[string]any{"class": "sealed"}}},
+	} {
+		if policy != nil {
+			setPolicy(t, tc, "g1", policy)
+		}
+		if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", onM1); status != 409 {
+			t.Fatalf("miner reached without explicit opt-in: %d %v", status, doc)
+		}
+		_, cat := tc.call(t, "key1", "GET", "/v1/broker/capacity", nil)
+		if listed(cat, "m1") {
+			t.Fatalf("miner appeared in guest capacity without opt-in: %v", cat)
+		}
+	}
+	optInMiner(t, tc, "g1")
+	if id := tc.room(t, "key1", onM1); !strings.HasPrefix(id, "m1.") {
+		t.Fatalf("explicit canary guest did not reach miner: %s", id)
+	}
+}
+
 func TestMinerHotelIsolationDenyAndReserve(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
+	optInMiner(t, tc, "g1")
 	joinMiner(t, tc, "m1", true, 10, nil)
 	joinMiner(t, tc, "m2", true, 10, nil)
 	// g2 denies miner hotels. Its only other hotels are draining: a miner
@@ -668,6 +703,7 @@ func TestCapacityClassTotalsIncludeJoinedHotels(t *testing.T) {
 // not start there after the hotel lost admission (Codex P1 on #340).
 func TestQueuedCreateDoesNotStartOnAHotelThatLostAdmission(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
+	optInMiner(t, tc, "g1")
 	m := joinMiner(t, tc, "m1", true, 5, nil)
 	m.mu.Lock()
 	m.createDelay = 500 * time.Millisecond
