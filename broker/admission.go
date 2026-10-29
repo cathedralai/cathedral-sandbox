@@ -11,9 +11,11 @@
 //     checks again every attest_every_seconds (default 60), and at once after
 //     the hotel was down: a reboot gives a new binding.
 //
-// Hotels from the config file are not gated: their behavior is unchanged.
+// Operator hotels from the config file are not gated. Miner hotels are gated
+// whether they came from the config or a runtime join.
 // Config "sealed_admission": "off" turns the attestation gate off for joined
-// hotels too (a rollback lever, not a mode to run in).
+// operator hotels only. Miner hotels always require attestation and the AMD
+// chain; the rollback lever must not admit an unverified miner.
 //
 // What the broker checks is the check verify_receipts.py makes before the AMD
 // signature: binding_sha256 is the SHA-256 of the binding as served, the
@@ -103,15 +105,23 @@ func (b *broker) attestEvery() time.Duration {
 	return defaultAttestEvery
 }
 
-// needsAttestation reports whether h must pass the attestation gate: a
-// joined hotel of class sealed. Caller holds b.mu.
+// needsAttestation reports whether h must pass the attestation gate: every
+// miner hotel, and a joined operator hotel of class sealed. Caller holds b.mu.
 func (b *broker) needsAttestation(h *hotel) bool {
-	return h.runtime && b.cfg.SealedAdmission != "off" && hotelClass(h) == classSealed
+	return h.cfg.MinerHotkey != "" || (h.runtime && b.cfg.SealedAdmission != "off" && hotelClass(h) == classSealed)
 }
 
 // admitted reports whether h passed admission. Health is h.ok, checked by
 // admissibleFree; this is the attestation part. Caller holds b.mu.
 func (b *broker) admitted(h *hotel, now time.Time) bool {
+	// Older state may contain an unsealed miner or a runtime hotel that claimed
+	// a sealed label. Keep both out of placement after a restart as well.
+	if h.cfg.MinerHotkey != "" && !h.cfg.Sealed {
+		return false
+	}
+	if h.runtime && !h.cfg.Sealed && h.labels()["sealed"] == "true" {
+		return false
+	}
 	if !b.needsAttestation(h) {
 		return true
 	}

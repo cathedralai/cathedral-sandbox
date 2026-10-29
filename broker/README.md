@@ -371,8 +371,8 @@ the config, an operator adds and removes hotels without a restart:
 | Route (operator key) | What it does |
 |---|---|
 | `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey` and `admission`. |
-| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?}`. `"sealed": true` is what makes a hotel sealed; a `sealed` label alone leaves it taking unsealed creates. The broker first calls `GET /v1/status` on the hotel with the key and, for a hotel of class sealed, checks its attestation (422 `attestation_failed`); `"verify": false` skips both and the hotel joins pending. `miner_hotkey` (SS58) adds the labels `miner=true` and `miner_hotkey`, which a PATCH cannot remove. |
-| `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). |
+| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?}`. A miner hotel must set `"sealed": true`; an unsealed join cannot claim `labels.sealed=true`. The broker first calls `GET /v1/status` on the hotel with the key and, for a hotel of class sealed, checks its attestation (422 `attestation_failed`); `"verify": false` skips both and the hotel joins pending. `miner_hotkey` (SS58) adds the labels `miner=true` and `miner_hotkey`, which a PATCH cannot remove. |
+| `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). An unsealed runtime hotel cannot gain the sealed label. |
 | `DELETE /v1/broker/hotels/<id>` | Removes a runtime hotel that has no rooms. Drain it first. |
 
 The broker keeps runtime hotels in `state_dir/hotels.json` and their keys in
@@ -382,7 +382,8 @@ cannot be removed at runtime.
 ### Admission of joined hotels
 
 A joined hotel takes rooms only after it passes admission (`admission.go`);
-config hotels are not gated.
+miner hotels are gated even when loaded from the config file. Other config
+hotels are not gated.
 
 - Health: a good `/room/health` answer. A hotel that goes down leaves
   placement and must pass again (attestation too, for a sealed hotel).
@@ -410,7 +411,7 @@ Config (all optional):
 | `sealed_measurements` | A joined sealed hotel's measurement must be in this list. |
 | `sealed_host_data` | Its HOST_DATA must be in this list. |
 | `attest_ttl_seconds`, `attest_every_seconds` | As above. |
-| `sealed_admission` | `"off"` turns the attestation gate off (rollback lever). |
+| `sealed_admission` | `"off"` turns the attestation gate off for joined operator hotels only. Miner hotels always require the SEV-SNP and AMD chain checks. |
 | `amd_verifier` | `{"command": ["python3", "/opt/room-kit/verify_receipts.py"], "ark_sha256": "<AMD ARK DER sha256>", "kds_cache"?: "<dir>", "timeout_seconds"?: 120}`. `ark_sha256` is one pin or a list (one per product: Milan, Genoa, Turin; values in `amd_chain.go`); the verifier passes if the report's product chain has any listed ARK, in one run. The host needs Python with `cryptography` and HTTPS to `kdsintf.amd.com` (or a filled KDS cache). |
 
 `admission.state` in the hotel document and the catalog is `admitted`,

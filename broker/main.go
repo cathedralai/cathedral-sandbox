@@ -95,7 +95,7 @@ type config struct {
 	// join, change and leave at runtime (hotels.go). Empty: no operator routes.
 	OperatorKeySHA256 string `json:"operator_key_sha256"`
 	// Admission of joined hotels (admission.go). SealedAdmission "off" turns
-	// the attestation gate off; anything else ("" or "enforce") keeps it.
+	// the attestation gate off for operator hotels, never miner hotels.
 	SealedAdmission    string   `json:"sealed_admission,omitempty"`
 	SealedMeasurements []string `json:"sealed_measurements,omitempty"`  // non-empty: a joined sealed hotel's measurement must be one of these
 	SealedHostData     []string `json:"sealed_host_data,omitempty"`     // non-empty: its HOST_DATA must be one of these

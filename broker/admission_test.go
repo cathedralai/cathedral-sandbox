@@ -152,8 +152,8 @@ func chipOf(id string) byte {
 	return s
 }
 
-// joinMiner joins a miner hotel through the operator route and runs one sync
-// step, as the sync loop would: health, then the attestation check.
+// joinMiner joins a sealed miner, or an unsealed operator hotel used by legacy
+// placement tests, and runs one sync step.
 func joinMiner(t *testing.T, tc *testChain, id string, sealed bool, slots int, extra map[string]any) *minerHotel {
 	t.Helper()
 	var att []byte
@@ -162,7 +162,10 @@ func joinMiner(t *testing.T, tc *testChain, id string, sealed bool, slots int, e
 	}
 	m, url := newMinerHotel(t, slots, att)
 	tc.hotels[id] = m.fakeHotel
-	body := map[string]any{"id": id, "api": url, "key": joinKey, "sealed": sealed, "miner_hotkey": minerHotkey}
+	body := map[string]any{"id": id, "api": url, "key": joinKey, "sealed": sealed}
+	if sealed {
+		body["miner_hotkey"] = minerHotkey
+	}
 	for k, v := range extra {
 		body[k] = v
 	}
@@ -546,7 +549,7 @@ func TestSpillFromJoinedSealedToUnsealedAndClearReasons(t *testing.T) {
 func TestMinerHotelIsolationDenyAndReserve(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	joinMiner(t, tc, "m1", true, 10, nil)
-	joinMiner(t, tc, "m2", false, 10, nil)
+	joinMiner(t, tc, "m2", true, 10, nil)
 	// g2 denies miner hotels. Its only other hotels are draining: a miner
 	// hotel is the only free room, and it must still not get g2's create.
 	setPolicy(t, tc, "g2", map[string]any{

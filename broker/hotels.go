@@ -238,6 +238,12 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 	case hc.MinerHotkey != "" && !ss58RE.MatchString(hc.MinerHotkey):
 		writeErr(w, 400, "invalid_hotel", "miner_hotkey must be an SS58 address")
 		return
+	case hc.MinerHotkey != "" && !hc.Sealed:
+		writeErr(w, 400, "invalid_hotel", "miner hotels must be sealed")
+		return
+	case !hc.Sealed && hc.Labels["sealed"] == "true":
+		writeErr(w, 400, "invalid_hotel", "unsealed hotels cannot claim the sealed label")
+		return
 	case hc.MaxSlots < 0:
 		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
 		return
@@ -357,6 +363,10 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	if req.MaxSlots != nil && *req.MaxSlots < 0 {
 		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
+		return
+	}
+	if h.runtime && !h.cfg.Sealed && req.Labels["sealed"] == "true" {
+		writeErr(w, 400, "invalid_hotel", "unsealed hotels cannot claim the sealed label")
 		return
 	}
 	var reserve *string

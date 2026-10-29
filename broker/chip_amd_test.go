@@ -209,6 +209,53 @@ func TestAMDChainRequiredForMinerHotels(t *testing.T) {
 	admitNow(t, tc, "m1")
 }
 
+func TestMinerAdmissionCannotBeDisabled(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.SealedAdmission = "off"
+	_, url := newMinerHotel(t, 5, nil)
+	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+		"id": "m1", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
+	})
+	if status != 422 || errCode(doc) != "attestation_failed" {
+		t.Fatalf("unverified miner admitted while sealed_admission=off: %d %v", status, doc)
+	}
+	if tc.b.hotelByID("m1") != nil {
+		t.Fatal("refused miner was stored")
+	}
+}
+
+func TestLegacyUnsealedMinerCannotTakeRooms(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	h := newHotel(hotelConfig{ID: "old-miner", MinerHotkey: minerHotkey, MaxSlots: 5}, joinKey)
+	h.runtime, h.ok, h.slots = true, true, 5
+	if err := tc.b.addHotel(h); err != nil {
+		t.Fatal(err)
+	}
+	tc.b.mu.Lock()
+	free := tc.b.admissibleFree(h, time.Now())
+	tc.b.mu.Unlock()
+	if free != 0 {
+		t.Fatalf("legacy unsealed miner offers %d rooms", free)
+	}
+}
+
+func TestConfiguredMinerStillNeedsAttestation(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.SealedAdmission = "off"
+	h := newHotel(hotelConfig{ID: "configured-miner", Sealed: true, MinerHotkey: minerHotkey, MaxSlots: 5}, joinKey)
+	h.ok, h.slots = true, 5
+	if err := tc.b.addHotel(h); err != nil {
+		t.Fatal(err)
+	}
+	tc.b.mu.Lock()
+	free := tc.b.admissibleFree(h, time.Now())
+	required := tc.b.needsAttestation(h)
+	tc.b.mu.Unlock()
+	if !required || free != 0 {
+		t.Fatalf("configured miner bypassed admission: required=%t free=%d", required, free)
+	}
+}
+
 func TestAMDVerifierConfigNeedsAPinnedARK(t *testing.T) {
 	for _, c := range []*amdVerifierConfig{
 		{Command: nil, ARKSHA256: arkPins{testARKPin}},
