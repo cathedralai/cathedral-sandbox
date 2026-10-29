@@ -22,7 +22,12 @@ SNP_MEASURE_VERSION=0.0.12
 # ---------------------------------------------------------------- 1. assess
 [ "$(cat /sys/module/kvm_amd/parameters/sev_snp 2>/dev/null)" = Y ] || { echo "SEV-SNP is not enabled in kvm_amd" >&2; exit 1; }
 [ -c /dev/sev ] || { echo "/dev/sev missing" >&2; exit 1; }
-[ -r "$SEALED_API_KEY_FILE" ] || { echo "hotel key file $SEALED_API_KEY_FILE missing (the kit does not make keys)" >&2; exit 1; }
+if [ "${SEALED_MINER:-0}" = 1 ]; then
+  # Miner hotel: the host holds no hotel key; the control plane installs one in the guest.
+  [ -n "${SEALED_HOTEL_KEY_INSTALL_SIGNERS:-}" ] || { echo "SEALED_MINER=1 needs SEALED_HOTEL_KEY_INSTALL_SIGNERS (the control plane install keys)" >&2; exit 1; }
+else
+  [ -r "$SEALED_API_KEY_FILE" ] || { echo "hotel key file $SEALED_API_KEY_FILE missing (the kit does not make keys)" >&2; exit 1; }
+fi
 mkdir -p "$SEALED_DIR/images" "$SEALED_DIR/run"
 FREE_GIB=$(( $(df -B1 --output=avail "$SEALED_DIR" | tail -1) / 1073741824 ))
 HAVE_GIB=0; [ -f "$SEALED_DIR/scratch.raw" ] && HAVE_GIB=$(( $(du -B1 "$SEALED_DIR/scratch.raw" | cut -f1) / 1073741824 ))
@@ -114,6 +119,12 @@ systemctl enable -q --now "${UNIT%.service}-net.timer"
 refuse_sealed_restart_with_rooms() {
   systemctl is-active -q "$UNIT" || return 0
   [ "${SEALED_RESTART_WITH_ROOMS:-0}" = 1 ] && return 0
+  if [ "${SEALED_MINER:-0}" = 1 ]; then
+    # The host holds no hotel key, and the guest's plain HTTP port answers
+    # nothing but the attestation, so the host cannot count rooms.
+    echo "sealed: miner hotel: the host holds no hotel key, so live rooms cannot be counted; drain the hotel through the control plane, then set SEALED_RESTART_WITH_ROOMS=1" >&2
+    exit 1
+  fi
   local live
   live=$(curl -fsS -m 10 -H "Authorization: Bearer $(tr -d ' \r\n' < "$SEALED_API_KEY_FILE")" \
     "http://$SEALED_GUEST_IP:18090/v1/sandboxes" 2>/dev/null | python3 -c 'import json,sys;print(len(json.load(sys.stdin).get("sandboxes",[])))' 2>/dev/null || echo "?")
@@ -152,4 +163,8 @@ else
   [ -n "$PREV_IMG" ] && [ "$PREV_IMG" != "$IMG" ] && ln -sfn "$PREV_IMG" "$SEALED_DIR/images/current"
   exit 1
 fi
-log "done. hotel API (receipts front) http://$SEALED_GUEST_IP:18090, attestation $ATT"
+if [ "${SEALED_MINER:-0}" = 1 ]; then
+  log "done. miner hotel: HTTPS https://$SEALED_GUEST_IP:${SEALED_MINER_TLS_PORT:-18443} (public port ${SEALED_MINER_PUBLIC_PORT:-9443}), tls_spki_sha256 $(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["binding"].get("tls_spki_sha256"))' "$ATT"), attestation $ATT"
+else
+  log "done. hotel API (receipts front) http://$SEALED_GUEST_IP:18090, attestation $ATT"
+fi

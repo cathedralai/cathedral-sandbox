@@ -12,6 +12,14 @@ mkdir -p "$RUN"
 HOST_DATA=$(python3 -c 'import base64,hashlib,sys;print(base64.b64encode(hashlib.sha256(open(sys.argv[1],"rb").read()).digest()).decode())' "$IMG/manifest.json")
 [ -f "$SEALED_DIR/scratch.raw" ] || truncate -s "${SEALED_SCRATCH_GIB}G" "$SEALED_DIR/scratch.raw"
 ln -sfn "$IMG" "$RUN/booted-image"
+# Config hotel: the broker's hotel key goes in through fw_cfg. Miner hotel: the
+# host holds no hotel key; the control plane installs it in the guest over the
+# guest's attested TLS, and the guest would ignore a fw_cfg key anyway.
+if [ "${SEALED_MINER:-0}" = 1 ]; then
+  FW_CFG=()
+else
+  FW_CFG=(-fw_cfg "name=opt/cathedral/room-api-key,file=$SEALED_API_KEY_FILE")
+fi
 exec /usr/bin/qemu-system-x86_64 -no-user-config -nodefaults -name "sealed-$SEALED_NAME" \
   -enable-kvm -cpu "$SEALED_CPU_MODEL" -smp "$SEALED_VCPUS" -m "${SEALED_MEM_GIB}G" \
   -machine q35,confidential-guest-support=sev0,memory-backend=ram1 \
@@ -22,5 +30,5 @@ exec /usr/bin/qemu-system-x86_64 -no-user-config -nodefaults -name "sealed-$SEAL
   -device virtio-blk-pci,drive=scratch,serial=sealed-scratch,disable-legacy=on,iommu_platform=true \
   -netdev "tap,id=net0,ifname=$SEALED_TAP,script=no,downscript=no,vhost=on" \
   -device "virtio-net-pci,netdev=net0,mac=$SEALED_GUEST_MAC,disable-legacy=on,iommu_platform=true,romfile=" \
-  -fw_cfg "name=opt/cathedral/room-api-key,file=$SEALED_API_KEY_FILE" \
+  ${FW_CFG[@]+"${FW_CFG[@]}"} \
   -display none -vga none -monitor none -serial "file:$RUN/serial.log"
