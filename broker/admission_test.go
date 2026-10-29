@@ -37,6 +37,7 @@ type attestOpts struct {
 	measurement   byte   // fill byte of the measurement (default 0xab)
 	chip          byte   // CHIP_ID seed: hotels with one seed are one machine
 	receiptKey    []byte // 32-byte Ed25519 public key; default is the placeholder "AAAA"
+	reportID      byte   // fill byte of REPORT_ID (0x140, 32 bytes); 0 leaves it all zeros
 }
 
 // snpAttestation builds a GET /room/attestation body the way room_receipts.py
@@ -66,6 +67,9 @@ func snpAttestation(t testing.TB, o attestOpts) []byte {
 	}
 	for i := 0x1A0; i < 0x1E0; i++ {
 		rep[i] = byte(i) + o.chip
+	}
+	for i := 0x140; i < 0x160; i++ {
+		rep[i] = o.reportID
 	}
 	cmdline := "console=ttyS0 root=/dev/vda"
 	if o.debugCmdline {

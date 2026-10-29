@@ -74,6 +74,10 @@ type admission struct {
 	bindingSHA  string
 	chipID      string // first 16 hex characters
 	chipFull    string // the whole CHIP_ID (128 hex characters): one hotel per chip
+	// reportID is the REPORT_ID of the report (64 hex characters): the
+	// firmware sets it at SNP launch, so a new value means a new launch
+	// (lend.go). Empty when the report carries all zeros there.
+	reportID string
 	// amd is the AMD chain result (product, ark_sha256, tcb) of the binding
 	// amdBinding; nil when the chain was not checked.
 	amd        map[string]any
@@ -166,6 +170,9 @@ func (b *broker) admissionDoc(h *hotel, now time.Time) map[string]any {
 		d["measurement"] = h.adm.measurement
 		d["binding_sha256"] = h.adm.bindingSHA
 		d["chip_id"] = h.adm.chipID
+		if h.adm.reportID != "" {
+			d["report_id"] = h.adm.reportID
+		}
 	}
 	return d
 }
@@ -349,7 +356,21 @@ func verifyAttestation(rawBinding []byte, bindingSHA, reportB64 string, measurem
 	if raw, decErr := base64.StdEncoding.DecodeString(bd.ReceiptKeyB64); decErr == nil && len(raw) == 32 {
 		receiptKey = raw
 	}
-	return admission{measurement: measurement, bindingSHA: bsha, chipID: chip[:16], chipFull: chip, receiptKey: receiptKey}, nil
+	return admission{measurement: measurement, bindingSHA: bsha, chipID: chip[:16], chipFull: chip, receiptKey: receiptKey,
+		reportID: snpReportID(report)}, nil
+}
+
+// snpReportID is the REPORT_ID of an SEV-SNP attestation report as hex, or
+// "" when it is all zeros. AMD SEV-SNP ABI, ATTESTATION_REPORT: REPORT_ID is
+// at offset 0x140, 32 bytes, after HOST_DATA 0xC0 (32), ID_KEY_DIGEST 0xE0
+// (48) and AUTHOR_KEY_DIGEST 0x110 (48), and before REPORT_ID_MA 0x160 (32)
+// and REPORTED_TCB 0x180. (0x50 is REPORT_DATA, not REPORT_ID.)
+func snpReportID(report []byte) string {
+	id := report[0x140:0x160]
+	if bytes.Equal(id, make([]byte, len(id))) {
+		return ""
+	}
+	return hex.EncodeToString(id)
 }
 
 func inFold(list []string, v string) bool {

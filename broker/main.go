@@ -60,6 +60,12 @@ type hotelConfig struct {
 	// ReservedFor: a guest id. Only that guest may use the hotel; every other
 	// guest treats it as denied (capacity.go). Empty: a pool hotel.
 	ReservedFor string `json:"reserved_for,omitempty"`
+	// LentFrom: the guest a reserved hotel was lent from (lend.go). The hotel
+	// is in the pool, and that guest's rooms never go there until reclaim.
+	// LentReportID: the SEV-SNP REPORT_ID of the launch at lend time; reclaim
+	// needs a different one (a new launch). Set by PATCH {"lend": true}.
+	LentFrom     string `json:"lent_from,omitempty"`
+	LentReportID string `json:"lent_report_id,omitempty"`
 	// MinerHotkey: the SS58 hotkey of the SN94 miner that runs the hotel.
 	// The hotel then carries the labels miner=true and miner_hotkey=<key>,
 	// so a guest policy can deny miner hotels ({"label": {"miner": "true"}}).
@@ -165,7 +171,7 @@ type hotel struct {
 	client    *http.Client
 	ctl       *http.Client // sync loop and hotel documents
 	tlsPinErr error        // non-nil: miner calls must not send the hotel key
-	cfgMu     sync.RWMutex // guards cfg.Labels, cfg.Drain and cfg.ReservedFor, which PATCH changes while creates read them
+	cfgMu     sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.ReservedFor, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
 	sem       chan struct{}
 
 	// Guarded by broker.mu.
@@ -361,6 +367,12 @@ func loadBroker(path string) (*broker, error) {
 	for _, h := range b.hotelList() {
 		if r := h.cfg.ReservedFor; r != "" && b.guests[r] == nil {
 			return nil, fmt.Errorf("config: hotel %q is reserved_for unknown guest %q", h.cfg.ID, r)
+		}
+		if l := h.cfg.LentFrom; l != "" && b.guests[l] == nil {
+			return nil, fmt.Errorf("config: hotel %q is lent_from unknown guest %q", h.cfg.ID, l)
+		}
+		if err := lendConfigError(h.cfg); err != nil {
+			return nil, fmt.Errorf("config: hotel %q: %w", h.cfg.ID, err)
 		}
 	}
 	return b, nil

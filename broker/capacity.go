@@ -23,6 +23,8 @@
 // denied and does not see it in the catalog; its owner reaches it through its
 // own policy or hotel list as before. PATCH "reserved_for": null releases it
 // to the pool: from then on every policy matches it by class and label.
+// PATCH "lend": true lends an idle reserved sealed hotel to the pool until a
+// reclaim after a re-seal; the owner does not reach it meanwhile (lend.go).
 //
 // GET /v1/broker/capacity lists the capacity the caller can reach: every
 // hotel for the operator key, the hotels the guest's policy reaches (with
@@ -271,7 +273,13 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 			continue
 		}
 		if g == nil {
-			out = append(out, b.capacityDoc(e, now))
+			d := b.capacityDoc(e, now)
+			var lent any // operator view only: a guest never sees whose hotel it is
+			if l := e.h.lentFrom(); l != "" {
+				lent = l
+			}
+			d["lent_from"] = lent
+			out = append(out, d)
 			b.addTotals(totals, e, now)
 			continue
 		}

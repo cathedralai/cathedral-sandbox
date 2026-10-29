@@ -171,6 +171,7 @@ func (b *broker) handleWorkspaces(w http.ResponseWriter, r *http.Request, g *gue
 		writeErr(w, e.status, e.code, e.msg)
 		return
 	}
+	pl.noLent = true // reclaim destroys a lent hotel and its workspaces (lend.go)
 	// One name for each guest across the chain, so a bare name finds one hotel.
 	if _, _, e := b.findWorkspace(r.Context(), g, name); e == nil {
 		writeErr(w, 409, "workspace_exists", "workspace "+name+" exists")

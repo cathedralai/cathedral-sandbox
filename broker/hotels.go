@@ -5,7 +5,7 @@
 //
 //	GET    /v1/broker/hotels/<id>   the hotel document with its admission state
 //	POST   /v1/broker/hotels        {id, name, api, health, key, concurrency, labels, threads, ram_gib, sealed, max_slots, reserved_for, miner_hotkey}
-//	PATCH  /v1/broker/hotels/<id>   {drain, labels, reserved_for, max_slots}  (reserved_for null: back to the pool)
+//	PATCH  /v1/broker/hotels/<id>   {drain, labels, reserved_for, max_slots, lend}  (reserved_for null: back to the pool; lend and reclaim: lend.go)
 //	DELETE /v1/broker/hotels/<id>   (only a hotel with no rooms; drain it first)
 //
 // A hotel added at runtime is kept in state_dir/hotels.json, and its key in
@@ -366,6 +366,9 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	case hc.MaxSlots < 0:
 		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
 		return
+	case hc.LentFrom != "" || hc.LentReportID != "":
+		writeErr(w, 400, "invalid_hotel", `lent_from and lent_report_id are set by PATCH {"lend": true}, not at join`)
+		return
 	}
 	if b.cfg.StateDir == "" {
 		writeErr(w, 409, "no_state_dir", "set state_dir in the config to add hotels at runtime")
@@ -526,14 +529,15 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		Drain       *bool             `json:"drain"`
 		MaxSlots    *int              `json:"max_slots"` // per-hotel room cap; 0: the hotel's own slots
 		Labels      map[string]string `json:"labels"`
-		ReservedFor json.RawMessage   `json:"reserved_for"` // a guest id, or null to release
+		ReservedFor json.RawMessage   `json:"reserved_for"` // a guest id, or null to release; on a lent hotel, the reclaim (lend.go)
+		Lend        *bool             `json:"lend"`         // true: lend the reserved hotel to the pool (lend.go)
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if json.Unmarshal(raw, &req) != nil {
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
 	}
-	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0) {
+	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0 || req.Lend != nil) {
 		writeErr(w, 403, "enroller_scope", "miner enrollment may only set drain=true")
 		return
 	}
@@ -564,9 +568,26 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		}
 		reserve = &v
 	}
+	if req.Lend != nil && (!*req.Lend || reserve != nil) {
+		writeErr(w, 400, "invalid_lend", "lend takes true and no reserved_for; to take a lent hotel back, PATCH reserved_for")
+		return
+	}
+	lc, e := b.prepareLend(r.Context(), h, req.Lend != nil, reserve)
+	if e != nil {
+		writeErr(w, e.status, e.code, e.msg)
+		return
+	}
 	b.mu.Lock()
 	h.cfgMu.Lock()
 	oldCfg := h.cfg
+	// The lend or reclaim is checked again under the locks pick takes, and
+	// the other fields apply only when it passes.
+	if e := lc.applyLend(h); e != nil {
+		h.cfgMu.Unlock()
+		b.mu.Unlock()
+		writeErr(w, e.status, e.code, e.msg)
+		return
+	}
 	if req.Drain != nil {
 		h.cfg.Drain = *req.Drain
 	}
@@ -577,7 +598,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	if req.MaxSlots != nil {
 		h.cfg.MaxSlots = *req.MaxSlots
 	}
-	if reserve != nil {
+	if reserve != nil && !lc.reclaim { // a reclaim set reserved_for in applyLend
 		h.cfg.ReservedFor = *reserve
 	}
 	h.cfgMu.Unlock()
@@ -589,6 +610,8 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 			h.cfg.Labels = oldCfg.Labels
 			h.cfg.MaxSlots = oldCfg.MaxSlots
 			h.cfg.ReservedFor = oldCfg.ReservedFor
+			h.cfg.LentFrom = oldCfg.LentFrom
+			h.cfg.LentReportID = oldCfg.LentReportID
 			h.cfgMu.Unlock()
 			b.mu.Unlock()
 			writeErr(w, 500, "state_write_failed", "cannot keep the runtime hotel update")
@@ -675,15 +698,18 @@ func (b *broker) hotelDoc(h *hotel) map[string]any {
 	if labels == nil {
 		labels = map[string]string{}
 	}
-	var reserved any
+	var reserved, lent, lentReport any
 	if r := h.reservedFor(); r != "" {
 		reserved = r
+	}
+	if l := h.lentFrom(); l != "" {
+		lent, lentReport = l, h.lentReportID()
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := time.Now()
 	return map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime,
-		"reserved_for": reserved, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
+		"reserved_for": reserved, "lent_from": lent, "lent_report_id": lentReport, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
 		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now)}
 }
 

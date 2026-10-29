@@ -310,9 +310,13 @@ func (g *guestState) allowsHotel(h *hotel) bool {
 }
 
 // tierOf is guestLimits.tierOf behind the hotel reservation: a hotel
-// reserved for another guest is out of reach, as if denied. Caller holds b.mu.
+// reserved for another guest is out of reach, as if denied, and so is a
+// hotel lent from this guest to the pool (lend.go). Caller holds b.mu.
 func (g *guestState) tierOf(h *hotel) string {
 	if r := h.reservedFor(); r != "" && r != g.cfg.ID {
+		return ""
+	}
+	if h.lentFrom() == g.cfg.ID {
 		return ""
 	}
 	return g.limits.tierOf(h)
