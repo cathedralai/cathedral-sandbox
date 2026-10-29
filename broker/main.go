@@ -70,6 +70,11 @@ type hotelConfig struct {
 	// The hotel then carries the labels miner=true and miner_hotkey=<key>,
 	// so a guest policy can deny miner hotels ({"label": {"miner": "true"}}).
 	MinerHotkey string `json:"miner_hotkey,omitempty"`
+	// RequireAttestation: a sealed hotel takes rooms only after it passes the
+	// SEV-SNP attestation gate with the AMD chain, like a miner hotel
+	// (admission.go). It lets a config file hotel opt in; default false
+	// leaves a config hotel ungated.
+	RequireAttestation bool `json:"require_attestation,omitempty"`
 	// TLSSPKISHA256 is derived from a miner hotel's verified SNP binding at
 	// join and persisted for safe reconnect after a broker restart.
 	TLSSPKISHA256 string `json:"tls_spki_sha256,omitempty"`
@@ -331,6 +336,9 @@ func loadBroker(path string) (*broker, error) {
 	for _, hc := range c.Hotels {
 		if hc.MinerHotkey != "" {
 			return nil, fmt.Errorf("config: miner hotel %q must join with attested guest TLS", hc.ID)
+		}
+		if hc.RequireAttestation && !hc.Sealed {
+			return nil, fmt.Errorf("config: hotel %q: require_attestation needs \"sealed\": true", hc.ID)
 		}
 		if strings.Contains(hc.ID, ".") || hc.ID == "" {
 			return nil, fmt.Errorf("hotel id %q: must be non-empty and have no dot", hc.ID)

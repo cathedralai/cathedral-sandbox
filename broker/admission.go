@@ -11,11 +11,14 @@
 //     checks again every attest_every_seconds (default 60), and at once after
 //     the hotel was down: a reboot gives a new binding.
 //
-// Operator hotels from the config file are not gated. Miner hotels are gated
-// whether they came from the config or a runtime join.
+// Operator hotels from the config file are not gated, unless the hotel sets
+// "require_attestation": true. Miner hotels are gated whether they came from
+// the config or a runtime join.
 // Config "sealed_admission": "off" turns the attestation gate off for joined
-// operator hotels only. Miner hotels always require attestation and the AMD
-// chain; the rollback lever must not admit an unverified miner.
+// operator hotels only. Miner hotels and require_attestation hotels always
+// require attestation, a nonempty sealed_measurements and the AMD chain; the
+// rollback lever must not admit an unverified miner, and a hotel that opted
+// in is ungated only by removing the field.
 //
 // What the broker checks is the check verify_receipts.py makes before the AMD
 // signature: binding_sha256 is the SHA-256 of the binding as served, the
@@ -30,16 +33,21 @@
 // hotel served it, with --require-sealed and the pinned ARK (amd_chain.go).
 // The broker adds no new cryptography. The chain check runs once per binding
 // (a new binding comes only with a reboot). It is required for a miner hotel
-// (miner_hotkey set): without amd_verifier a miner sealed hotel is refused.
-// A joined sealed hotel without miner_hotkey is chain-checked when
-// amd_verifier is set.
+// (miner_hotkey set) and a require_attestation hotel: without amd_verifier
+// such a hotel is refused. A joined sealed hotel without either is
+// chain-checked when amd_verifier is set.
+//
+// Guest TLS: only a miner hotel binds the broker's TLS channel to its
+// attestation (tls_spki_sha256, miner_tls.go). An operator hotel, joined or
+// require_attestation, is reached over its configured address as before.
 //
 // One hotel per chip: a hotel whose report carries the CHIP_ID of another
-// admitted hotel is refused (at join, 409 chip_in_use) or held refused (in
-// the sync loop) with the other hotel's id as reason. It is admitted when the
-// other hotel leaves placement and its own next check passes. Every SNP guest
-// on one host reports the same CHIP_ID, so two hotels with one chip are one
-// machine counted twice.
+// admitted gated hotel is refused (at join, 409 chip_in_use) or held refused
+// (in the sync loop) with the other hotel's id as reason. It is admitted when
+// the other hotel leaves placement and its own next check passes. Every SNP
+// guest on one host reports the same CHIP_ID, so two hotels with one chip are
+// one machine counted twice. An ungated hotel has no attested chip and never
+// holds one: a config hotel can share a machine with a gated hotel.
 package main
 
 import (
@@ -109,16 +117,32 @@ func (b *broker) attestEvery() time.Duration {
 	return defaultAttestEvery
 }
 
+// strictAttestation reports whether h must pass the gate with a nonempty
+// sealed_measurements and the AMD chain, whatever sealed_admission says: a
+// miner hotel, or a hotel that set require_attestation.
+func strictAttestation(h *hotel) bool {
+	return h.cfg.MinerHotkey != "" || h.cfg.RequireAttestation
+}
+
+// strictKind names a strict hotel in a refusal reason.
+func strictKind(h *hotel) string {
+	if h.cfg.MinerHotkey != "" {
+		return "a miner hotel"
+	}
+	return "a require_attestation hotel"
+}
+
 // needsAttestation reports whether h must pass the attestation gate: every
-// miner hotel, and a joined operator hotel of class sealed. Caller holds b.mu.
+// strict hotel (strictAttestation), and a joined operator hotel of class
+// sealed. Caller holds b.mu.
 func (b *broker) needsAttestation(h *hotel) bool {
-	return h.cfg.MinerHotkey != "" || (h.runtime && b.cfg.SealedAdmission != "off" && hotelClass(h) == classSealed)
+	return strictAttestation(h) || (h.runtime && b.cfg.SealedAdmission != "off" && hotelClass(h) == classSealed)
 }
 
 // admitted reports whether h passed admission. Health is h.ok, checked by
 // admissibleFree; this is the attestation part. Caller holds b.mu.
 func (b *broker) admitted(h *hotel, now time.Time) bool {
-	if h.cfg.MinerHotkey != "" && len(b.cfg.SealedMeasurements) == 0 {
+	if strictAttestation(h) && len(b.cfg.SealedMeasurements) == 0 {
 		return false
 	}
 	// Older state may contain an unsealed miner or a runtime hotel that claimed
@@ -158,7 +182,7 @@ func (b *broker) admissionState(h *hotel, now time.Time) string {
 // admissionDoc is the admission part of a hotel document. Caller holds b.mu.
 func (b *broker) admissionDoc(h *hotel, now time.Time) map[string]any {
 	d := map[string]any{"state": b.admissionState(h, now), "attestation_required": b.needsAttestation(h),
-		"amd_chain_required": h.cfg.MinerHotkey != "" && b.needsAttestation(h)}
+		"amd_chain_required": strictAttestation(h)}
 	if h.adm.amd != nil && h.adm.amdBinding == h.adm.bindingSHA {
 		d["amd_chain"] = h.adm.amd
 	}
@@ -196,8 +220,8 @@ type attestFetchErr struct{ error }
 
 // checkAttestation fetches and checks h's attestation. It does not lock.
 func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, error) {
-	if h.cfg.MinerHotkey != "" && len(b.cfg.SealedMeasurements) == 0 {
-		return admission{}, errors.New("a miner hotel needs a nonempty sealed_measurements allowlist")
+	if strictAttestation(h) && len(b.cfg.SealedMeasurements) == 0 {
+		return admission{}, errors.New(strictKind(h) + " needs a nonempty sealed_measurements allowlist")
 	}
 	var att struct {
 		Binding    json.RawMessage `json:"binding"`
@@ -217,11 +241,11 @@ func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, err
 			return admission{}, err
 		}
 	}
-	if b.cfg.AMDVerifier == nil && h.cfg.MinerHotkey == "" {
+	if b.cfg.AMDVerifier == nil && !strictAttestation(h) {
 		return res, nil // chain not checked: an operator hotel with no verifier configured
 	}
 	if b.cfg.AMDVerifier == nil {
-		return admission{}, errors.New("a miner hotel needs the AMD chain check; set amd_verifier in the broker config")
+		return admission{}, errors.New(strictKind(h) + " needs the AMD chain check; set amd_verifier in the broker config")
 	}
 	b.mu.Lock()
 	known := h.adm.amd != nil && h.adm.amdBinding == res.bindingSHA
@@ -382,11 +406,12 @@ func inFold(list []string, v string) bool {
 	return false
 }
 
-// chipHolder is the admitted hotel other than h whose chip is chip, or nil.
-// Caller holds b.mu.
+// chipHolder is the admitted gated hotel other than h whose chip is chip, or
+// nil. An ungated hotel (a config hotel without require_attestation) holds no
+// chip: it was never attested. Caller holds b.mu.
 func (b *broker) chipHolder(h *hotel, chip string, now time.Time) *hotel {
 	for _, o := range b.hotelList() {
-		if o != h && !o.leaving && o.adm.chipFull == chip && !o.adm.attestedAt.IsZero() && b.admitted(o, now) {
+		if o != h && !o.leaving && b.needsAttestation(o) && o.adm.chipFull == chip && !o.adm.attestedAt.IsZero() && b.admitted(o, now) {
 			return o
 		}
 	}

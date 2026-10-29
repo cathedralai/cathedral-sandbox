@@ -4,8 +4,9 @@
 // removes hotels with the operator key (config "operator_key_sha256"):
 //
 //	GET    /v1/broker/hotels/<id>   the hotel document with its admission state
-//	POST   /v1/broker/hotels        {id, name, api, health, key, concurrency, labels, threads, ram_gib, sealed, max_slots, reserved_for, miner_hotkey}
+//	POST   /v1/broker/hotels        {id, name, api, health, key, concurrency, labels, threads, ram_gib, sealed, max_slots, reserved_for, miner_hotkey, require_attestation}
 //	PATCH  /v1/broker/hotels/<id>   {drain, labels, reserved_for, max_slots, lend}  (reserved_for null: back to the pool; lend and reclaim: lend.go)
+
 //	DELETE /v1/broker/hotels/<id>   (only a hotel with no rooms; drain it first)
 //
 // A hotel added at runtime is kept in state_dir/hotels.json, and its key in
@@ -362,6 +363,9 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		return
 	case !hc.Sealed && hc.Labels["sealed"] == "true":
 		writeErr(w, 400, "invalid_hotel", "unsealed hotels cannot claim the sealed label")
+		return
+	case hc.RequireAttestation && !hc.Sealed:
+		writeErr(w, 400, "invalid_hotel", "require_attestation needs a sealed hotel")
 		return
 	case hc.MaxSlots < 0:
 		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
