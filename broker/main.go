@@ -64,6 +64,9 @@ type hotelConfig struct {
 	// The hotel then carries the labels miner=true and miner_hotkey=<key>,
 	// so a guest policy can deny miner hotels ({"label": {"miner": "true"}}).
 	MinerHotkey string `json:"miner_hotkey,omitempty"`
+	// TLSSPKISHA256 is derived from a miner hotel's verified SNP binding at
+	// join and persisted for safe reconnect after a broker restart.
+	TLSSPKISHA256 string `json:"tls_spki_sha256,omitempty"`
 }
 
 type guestConfig struct {
@@ -157,12 +160,13 @@ type room struct {
 type latencies struct{ hotel, queue, overhead []float64 }
 
 type hotel struct {
-	cfg    hotelConfig
-	key    string
-	client *http.Client
-	ctl    *http.Client // sync loop and hotel documents
-	cfgMu  sync.RWMutex // guards cfg.Labels, cfg.Drain and cfg.ReservedFor, which PATCH changes while creates read them
-	sem    chan struct{}
+	cfg       hotelConfig
+	key       string
+	client    *http.Client
+	ctl       *http.Client // sync loop and hotel documents
+	tlsPinErr error        // non-nil: miner calls must not send the hotel key
+	cfgMu     sync.RWMutex // guards cfg.Labels, cfg.Drain and cfg.ReservedFor, which PATCH changes while creates read them
+	sem       chan struct{}
 
 	// Guarded by broker.mu.
 	slots        int
@@ -306,6 +310,9 @@ func loadBroker(path string) (*broker, error) {
 	}
 	b := &broker{cfg: c, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), started: time.Now()}
 	for _, hc := range c.Hotels {
+		if hc.MinerHotkey != "" {
+			return nil, fmt.Errorf("config: miner hotel %q must join with attested guest TLS", hc.ID)
+		}
 		if strings.Contains(hc.ID, ".") || hc.ID == "" {
 			return nil, fmt.Errorf("hotel id %q: must be non-empty and have no dot", hc.ID)
 		}
@@ -371,6 +378,14 @@ func (h *hotel) doBase(ctx context.Context, base, method, path string, query url
 // doHeaders is doBase with extra request headers (the guest id of
 // guestcalls.go).
 func (h *hotel) doHeaders(ctx context.Context, base, method, path string, query url.Values, body []byte, timeout time.Duration, extra http.Header) (int, http.Header, []byte, error) {
+	if h.cfg.MinerHotkey != "" {
+		if h.tlsPinErr != nil {
+			return 0, nil, nil, h.tlsPinErr
+		}
+		if !strings.HasPrefix(base, "https://") {
+			return 0, nil, nil, errors.New("miner hotel API requires attested HTTPS")
+		}
+	}
 	u := base + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
@@ -403,6 +418,14 @@ func (h *hotel) doHeaders(ctx context.Context, base, method, path string, query 
 }
 
 func (h *hotel) getJSON(ctx context.Context, base, path string, query url.Values, v any) error {
+	if h.cfg.MinerHotkey != "" {
+		if h.tlsPinErr != nil {
+			return h.tlsPinErr
+		}
+		if !strings.HasPrefix(base, "https://") {
+			return errors.New("miner hotel API requires attested HTTPS")
+		}
+	}
 	u := base + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()

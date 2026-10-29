@@ -304,15 +304,15 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 		if sealedAdmission == "" {
 			sealedAdmission = "on"
 		}
-		// Guest-bound TLS pinning is not implemented yet. Keep this false
-		// until the broker verifies the observed peer against SNP REPORT_DATA.
+		// Scoped joins verify the observed guest key against SNP REPORT_DATA,
+		// and every subsequent miner call pins that key on both clients.
 		doc["admission_policy"] = map[string]any{
 			"sealed_admission":    sealedAdmission,
 			"amd_verifier":        b.cfg.AMDVerifier != nil,
 			"sealed_measurements": append([]string{}, b.cfg.SealedMeasurements...),
 			"miner_hotkey_caps":   b.cfg.MinerHotkeyCaps,
 			"miner_max_hotels":    b.cfg.MinerMaxHotels,
-			"miner_tls_pin":       false,
+			"miner_tls_pin":       true,
 		}
 	}
 	writeJSON(w, 200, doc)

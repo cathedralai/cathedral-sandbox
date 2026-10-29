@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -107,6 +108,7 @@ func snpAttestation(t testing.TB, o attestOpts) []byte {
 type minerHotel struct {
 	*fakeHotel
 	slots atomic.Int64
+	cert  *x509.Certificate
 }
 
 func (m *minerHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -124,6 +126,9 @@ func (m *minerHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (m *minerHotel) setAttestation(b []byte) {
 	m.mu.Lock()
+	if b != nil && m.cert != nil {
+		b = testAttestationWithTLSPin(m.t, b, m.cert)
+	}
 	m.attestation = b
 	m.mu.Unlock()
 }
@@ -138,9 +143,65 @@ func newMinerHotel(t *testing.T, slots int, att []byte) (*minerHotel, string) {
 	t.Helper()
 	m := &minerHotel{fakeHotel: &fakeHotel{t: t, snaps: map[string]map[string]any{}, attestation: att}}
 	m.slots.Store(int64(slots))
+	if att == nil {
+		hs := httptest.NewServer(m)
+		t.Cleanup(hs.Close)
+		return m, hs.URL
+	}
+	hs := httptest.NewTLSServer(m)
+	m.cert = hs.Certificate()
+	m.attestation = testAttestationWithTLSPin(t, att, hs.Certificate())
+	t.Cleanup(hs.Close)
+	return m, hs.URL
+}
+
+// Operator hotel fixtures use HTTP; miner fixtures use guest TLS with an SNP-bound key.
+func newOperatorHotel(t *testing.T, slots int, att []byte) (*minerHotel, string) {
+	t.Helper()
+	m := &minerHotel{fakeHotel: &fakeHotel{t: t, snaps: map[string]map[string]any{}, attestation: att}}
+	m.slots.Store(int64(slots))
 	hs := httptest.NewServer(m)
 	t.Cleanup(hs.Close)
 	return m, hs.URL
+}
+
+func testAttestationWithTLSPin(t *testing.T, raw []byte, cert *x509.Certificate) []byte {
+	t.Helper()
+	var doc struct {
+		Binding    json.RawMessage `json:"binding"`
+		BindingSHA string          `json:"binding_sha256"`
+		Report     string          `json:"report_b64"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	var binding map[string]any
+	if err := json.Unmarshal(doc.Binding, &binding); err != nil {
+		t.Fatal(err)
+	}
+	oldSum := sha256.Sum256(doc.Binding)
+	oldSHA := hex.EncodeToString(oldSum[:])
+	spki := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+	binding["tls_spki_sha256"] = hex.EncodeToString(spki[:])
+	binding["hotel_key_source"] = "install"
+	newBinding, _ := json.Marshal(binding)
+	newSum := sha256.Sum256(newBinding)
+	if doc.BindingSHA == oldSHA {
+		doc.BindingSHA = hex.EncodeToString(newSum[:])
+	}
+	if doc.Report != "" {
+		report, err := base64.StdEncoding.DecodeString(doc.Report)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Equal(report[0x50:0x70], oldSum[:]) {
+			copy(report[0x50:0x70], newSum[:])
+		}
+		doc.Report = base64.StdEncoding.EncodeToString(report)
+	}
+	doc.Binding = newBinding
+	out, _ := json.Marshal(doc)
+	return out
 }
 
 // chipOf is a CHIP_ID seed per hotel id: each test hotel is its own machine.
@@ -300,7 +361,7 @@ func TestSealedJoinPassesAttestationBeforePlacement(t *testing.T) {
 		"binding hash":  {badSHA: true},
 	}
 	for name, o := range bad {
-		_, url := newMinerHotel(t, 5, snpAttestation(t, o))
+		_, url := newOperatorHotel(t, 5, snpAttestation(t, o))
 		status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "bad", "api": url, "key": joinKey, "sealed": true})
 		if status != 422 || errCode(doc) != "attestation_failed" {
 			t.Fatalf("%s: %d %v", name, status, doc)
@@ -310,13 +371,13 @@ func TestSealedJoinPassesAttestationBeforePlacement(t *testing.T) {
 		}
 	}
 	// No attestation endpoint at all: refused too.
-	_, url := newMinerHotel(t, 5, nil)
+	_, url := newOperatorHotel(t, 5, nil)
 	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "bad", "api": url, "key": joinKey, "sealed": true}); status != 422 {
 		t.Fatalf("no attestation: %d %v", status, doc)
 	}
 
 	// verify false: the hotel joins pending and takes no room until it passes.
-	m, url := newMinerHotel(t, 5, nil)
+	m, url := newOperatorHotel(t, 5, nil)
 	tc.hotels["p"] = m.fakeHotel
 	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "p", "api": url, "key": joinKey, "sealed": true, "verify": false}); status != 201 {
 		t.Fatalf("join pending: %d %v", status, doc)
@@ -666,9 +727,9 @@ func TestCapacityClassTotalsIncludeJoinedHotels(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	joinMiner(t, tc, "m1", true, 7, nil)
 	joinMiner(t, tc, "m2", false, 4, nil)
-	pm, url := newMinerHotel(t, 9, nil)
+	pm, url := newOperatorHotel(t, 9, nil)
 	tc.hotels["m3"] = pm.fakeHotel
-	tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "m3", "api": url, "key": joinKey, "sealed": true, "verify": false, "miner_hotkey": minerHotkey})
+	tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "m3", "api": url, "key": joinKey, "sealed": true, "verify": false})
 	syncNow(tc, "m3")
 	status, doc := tc.call(t, "operator-key", "GET", "/v1/broker/capacity", nil)
 	classes, _ := doc["classes"].(map[string]any)
@@ -694,7 +755,7 @@ func TestCapacityClassTotalsIncludeJoinedHotels(t *testing.T) {
 	classes, _ = doc["classes"].(map[string]any)
 	sealed, _ = classes["sealed"].(map[string]any)
 	unsealed, _ = classes["unsealed"].(map[string]any)
-	if sealed["hotels"] != float64(1) || sealed["free_rooms"] != float64(100) || unsealed["hotels"] != float64(0) {
+	if sealed["hotels"] != float64(2) || sealed["pending_admission"] != float64(1) || sealed["free_rooms"] != float64(100) || unsealed["hotels"] != float64(0) {
 		t.Fatalf("guest totals: %v", classes)
 	}
 }

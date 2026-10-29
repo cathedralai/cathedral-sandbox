@@ -71,7 +71,9 @@ func newHotel(hc hotelConfig, key string) *hotel {
 	// The sync loop (health, quota, list) uses its own small pool: when one
 	// guest's long execs hold every data connection, the hotel must not look down.
 	ctl := &http.Transport{MaxIdleConns: 8, MaxIdleConnsPerHost: 8, MaxConnsPerHost: 8, IdleConnTimeout: 90 * time.Second}
-	return &hotel{cfg: hc, key: key, client: &http.Client{Transport: tr}, ctl: &http.Client{Transport: ctl}, sem: make(chan struct{}, hc.Concurrency), rooms: map[string]*room{}}
+	h := &hotel{cfg: hc, key: key, client: &http.Client{Transport: tr}, ctl: &http.Client{Transport: ctl}, sem: make(chan struct{}, hc.Concurrency), rooms: map[string]*room{}}
+	h.tlsPinErr = pinMinerHotel(h)
+	return h
 }
 
 // fixedLabels is labels plus the labels a hotel always carries: sealed=true
@@ -302,12 +304,6 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 			writeErr(w, 403, "enroller_scope", "miner enrollment requires a verified HTTPS sealed miner hotel without custom labels or reservation")
 			return
 		}
-		// The current sealed room kit sends the API key through host fw_cfg and
-		// serves plain HTTP. A public-CA HTTPS URL alone does not bind the peer
-		// to the SNP report. Do not send the key to /v1/status until that pin
-		// and guest-only key handoff exist.
-		writeErr(w, 409, "guest_tls_required", "attested guest TLS and guest-only key handoff are required before scoped miner enrollment")
-		return
 	}
 	switch {
 	case hc.ID == "" || strings.Contains(hc.ID, ".") || len(hc.ID) > 64:
@@ -341,6 +337,26 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	}
 	if hc.Health == "" {
 		hc.Health = hc.API
+	}
+	if hc.MinerHotkey != "" {
+		if hc.TLSSPKISHA256 != "" || (req.Verify != nil && !*req.Verify) ||
+			!strings.HasPrefix(hc.API, "https://") || !strings.HasPrefix(hc.Health, "https://") {
+			writeErr(w, 409, "guest_tls_required", "miner join needs verified guest HTTPS; the broker derives its TLS pin from attestation")
+			return
+		}
+		// This request has no bearer key. Verify that the observed TLS key is
+		// committed by the AMD-verified SNP report before constructing a hotel
+		// client that holds the key supplied in the join body.
+		rawAtt, peerSPKI, err := fetchMinerAttestation(r.Context(), hc.Health)
+		if err != nil {
+			writeErr(w, 422, "attestation_failed", "the miner guest did not answer keyless HTTPS attestation")
+			return
+		}
+		if err := b.verifyMinerBootstrap(r.Context(), rawAtt, peerSPKI); err != nil {
+			writeErr(w, 422, "attestation_failed", "the miner guest TLS attestation did not pass: "+err.Error())
+			return
+		}
+		hc.TLSSPKISHA256 = peerSPKI
 	}
 	if hc.Name == "" {
 		hc.Name = hc.ID
@@ -637,6 +653,10 @@ func (b *broker) loadRuntimeHotels() error {
 		return err
 	}
 	for _, hc := range list {
+		if hc.MinerHotkey != "" && hc.TLSSPKISHA256 == "" {
+			log.Printf("runtime miner hotel %s skipped: no attested TLS pin", hc.ID)
+			continue
+		}
 		k, err := os.ReadFile(hc.KeyFile)
 		if err != nil {
 			log.Printf("runtime hotel %s skipped: key: %v", hc.ID, err)

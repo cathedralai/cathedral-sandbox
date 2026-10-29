@@ -221,7 +221,7 @@ func catalogEntry(doc map[string]any, id string) (map[string]any, bool) {
 	return nil, false
 }
 
-func TestMinerEnrollerCapacityIsScopedAndReportsUnmetTLSPin(t *testing.T) {
+func TestMinerEnrollerCapacityIsScopedAndReportsTLSPin(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	joinMiner(t, tc, "m1", true, 1, nil)
 	status, scoped := tc.call(t, "enroller-key", "GET", "/v1/broker/capacity", nil)
@@ -229,8 +229,8 @@ func TestMinerEnrollerCapacityIsScopedAndReportsUnmetTLSPin(t *testing.T) {
 		t.Fatalf("scoped miner catalog: %d %v", status, scoped)
 	}
 	policy, ok := scoped["admission_policy"].(map[string]any)
-	if !ok || policy["amd_verifier"] != true || policy["miner_tls_pin"] != false {
-		t.Fatalf("scoped policy must report the missing TLS pin: %v", policy)
+	if !ok || policy["amd_verifier"] != true || policy["miner_tls_pin"] != true {
+		t.Fatalf("scoped policy must report guest TLS pinning: %v", policy)
 	}
 	measurements, _ := policy["sealed_measurements"].([]any)
 	caps, _ := policy["miner_hotkey_caps"].(map[string]any)

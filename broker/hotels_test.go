@@ -1,7 +1,16 @@
 package main
 
 import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -109,15 +118,19 @@ func TestMinerEnrollmentKeyCannotOperateOutsideMinerScope(t *testing.T) {
 		}
 	}
 	var contacted atomic.Int32
+	var sentKey atomic.Bool
 	tlsHotel := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		contacted.Add(1)
+		if r.Header.Get("Authorization") != "" {
+			sentKey.Store(true)
+		}
 		w.WriteHeader(200)
 	}))
 	defer tlsHotel.Close()
 	if status, doc := tc.call(t, "enroller-key", "POST", "/v1/broker/hotels", map[string]any{
 		"id": "x", "api": tlsHotel.URL, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
-	}); status != 409 || errCode(doc) != "guest_tls_required" || contacted.Load() != 0 {
-		t.Fatalf("scoped join sent key before attested TLS: %d %v contacts=%d", status, doc, contacted.Load())
+	}); status != 422 || errCode(doc) != "attestation_failed" || contacted.Load() != 1 || sentKey.Load() {
+		t.Fatalf("scoped join sent key before attested TLS: %d %v contacts=%d key=%t", status, doc, contacted.Load(), sentKey.Load())
 	}
 	if status, doc := tc.call(t, "enroller-key", "GET", "/v1/broker/hotels/m1", nil); status != 200 || doc["miner_hotkey"] != minerHotkey {
 		t.Fatalf("read miner hotel: %d %v", status, doc)
@@ -133,6 +146,138 @@ func TestMinerEnrollmentKeyCannotOperateOutsideMinerScope(t *testing.T) {
 	if status, doc := tc.call(t, "enroller-key", "DELETE", "/v1/broker/hotels/m1", nil); status != 204 {
 		t.Fatalf("leave empty miner hotel: %d %v", status, doc)
 	}
+}
+
+func TestScopedMinerJoinPinsAttestedGuestBeforeSendingHotelKey(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	m, url := newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: 77}))
+	join := map[string]any{"id": "pinned", "api": url, "health": url, "key": joinKey,
+		"sealed": true, "miner_hotkey": minerHotkey}
+	if status, doc := tc.call(t, "enroller-key", "POST", "/v1/broker/hotels", join); status != 201 {
+		t.Fatalf("attested guest join: %d %v", status, doc)
+	}
+	h := tc.b.hotelByID("pinned")
+	if h == nil || h.cfg.TLSSPKISHA256 == "" || h.tlsPinErr != nil {
+		t.Fatalf("joined miner lacks peer pin: %+v", h)
+	}
+	var impostorSawKey atomic.Bool
+	impostor := newDistinctTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			impostorSawKey.Store(true)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(m.attestation)
+	}))
+	defer impostor.Close()
+	join["id"], join["api"], join["health"] = "impostor", impostor.URL, impostor.URL
+	if status, doc := tc.call(t, "enroller-key", "POST", "/v1/broker/hotels", join); status != 422 || errCode(doc) != "attestation_failed" || impostorSawKey.Load() {
+		t.Fatalf("host TLS key accepted or saw hotel key: %d %v key=%t", status, doc, impostorSawKey.Load())
+	}
+	if tc.b.hotelByID("impostor") != nil {
+		t.Fatal("impostor joined")
+	}
+	// The same pin guards both data and control calls, including after restart.
+	for _, pinned := range []*hotel{h} {
+		if _, _, _, err := pinned.doBase(context.Background(), impostor.URL, "GET", "/v1/status", nil, nil, time.Second); err == nil {
+			t.Fatal("data client accepted a changed miner TLS key")
+		}
+		var status map[string]any
+		if err := pinned.getJSON(context.Background(), impostor.URL, "/v1/status", nil, &status); err == nil {
+			t.Fatal("control client accepted a changed miner TLS key")
+		}
+		if impostorSawKey.Load() {
+			t.Fatal("changed miner TLS peer received hotel key")
+		}
+	}
+	tc.start(t)
+	restored := tc.b.hotelByID("pinned")
+	if restored == nil || restored.cfg.TLSSPKISHA256 != h.cfg.TLSSPKISHA256 || restored.tlsPinErr != nil {
+		t.Fatalf("restart lost miner TLS pin: %+v", restored)
+	}
+	if _, _, _, err := restored.doBase(context.Background(), impostor.URL, "GET", "/v1/status", nil, nil, time.Second); err == nil || impostorSawKey.Load() {
+		t.Fatalf("restored broker sent key to changed peer: %v", err)
+	}
+	if code, _, _, err := restored.do(context.Background(), "GET", "/v1/status", nil, nil, time.Second); err != nil || code != 200 {
+		t.Fatalf("restored broker could not reach pinned peer: %d %v", code, err)
+	}
+}
+
+func TestMinerHotelDoesNotFollowRedirectWithKey(t *testing.T) {
+	var targetSawKey atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			targetSawKey.Store(true)
+		}
+	}))
+	defer target.Close()
+	redirect := newDistinctTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/stolen", http.StatusFound)
+	}))
+	defer redirect.Close()
+	sum := sha256.Sum256(redirect.Certificate().RawSubjectPublicKeyInfo)
+	h := newHotel(hotelConfig{ID: "redirect", API: redirect.URL, Health: redirect.URL,
+		MinerHotkey: minerHotkey, TLSSPKISHA256: hex.EncodeToString(sum[:])}, joinKey)
+	if h.tlsPinErr != nil {
+		t.Fatal(h.tlsPinErr)
+	}
+	if code, _, _, err := h.do(context.Background(), "GET", "/v1/status", nil, nil, time.Second); err != nil || code != http.StatusFound || targetSawKey.Load() {
+		t.Fatalf("miner data client followed redirect: %d %v target_key=%t", code, err, targetSawKey.Load())
+	}
+	var doc map[string]any
+	if err := h.getJSON(context.Background(), redirect.URL, "/v1/status", nil, &doc); err == nil || targetSawKey.Load() {
+		t.Fatalf("miner control client followed redirect: %v target_key=%t", err, targetSawKey.Load())
+	}
+}
+
+func TestMinerHotelWithoutPersistedPinIsSkippedOnRestart(t *testing.T) {
+	dir := t.TempDir()
+	tc := newChainState(t, dir)
+	_, origin := newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: 91}))
+	if status, doc := tc.call(t, "enroller-key", "POST", "/v1/broker/hotels", map[string]any{
+		"id": "old-miner", "api": origin, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
+	}); status != 201 {
+		t.Fatalf("miner join: %d %v", status, doc)
+	}
+	path := dir + "/" + runtimeHotelsFile
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved []hotelConfig
+	if err := json.Unmarshal(raw, &saved); err != nil || len(saved) != 1 || saved[0].TLSSPKISHA256 == "" {
+		t.Fatalf("pin not persisted: %v %+v", err, saved)
+	}
+	saved[0].TLSSPKISHA256 = "" // model a runtime record from before pinning existed
+	raw, _ = json.Marshal(saved)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tc.start(t)
+	if tc.b.hotelByID("old-miner") != nil {
+		t.Fatal("runtime miner without an attested TLS pin was loaded")
+	}
+}
+
+func newDistinctTLSServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}, &x509.Certificate{
+		SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := httptest.NewUnstartedServer(handler)
+	s.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}
+	s.StartTLS()
+	return s
 }
 
 func TestMinerEnrollmentKeyConfigRejectsReuse(t *testing.T) {

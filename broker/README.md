@@ -382,18 +382,20 @@ and leave an empty miner hotel. It cannot read or change operator hotels,
 change guest policy, plant Escape nonces, opt out of join verification, set
 custom labels or reservations, or undo a drain. The digest must differ from
 the operator key and every guest key or view token. The approved hotkey cap
-still applies. Scoped joins currently fail closed with `guest_tls_required`
-before sending the hotel key to the remote endpoint. Room-kit guest-bound
-TLS and guest-only key custody must land before this route can enroll miners.
+still applies. Scoped joins require guest HTTPS and keyless SNP attestation.
+The observed TLS key must match the AMD-verified binding before the broker
+sends the hotel key. Miner calls pin the guest key on both data and control
+connections. Plain HTTP, a client-supplied pin, and `verify=false` are refused.
+The guest must install its hotel key inside the attested room before join.
 The operator and miner-only capacity views report `admission_policy` with the
-configured measurement allowlist and hotkey caps. `miner_tls_pin` is `false`
-until attested guest TLS peer pinning is implemented; customer guests never
+configured measurement allowlist and hotkey caps. `miner_tls_pin` is `true`
+for this broker build; customer guests never
 receive this policy document.
 
 | Route (operator key) | What it does |
 |---|---|
 | `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey` and `admission`. |
-| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?}`. A miner hotel must set `"sealed": true`; an unsealed join cannot claim `labels.sealed=true`. The broker first calls `GET /v1/status` on the hotel with the key and, for a hotel of class sealed, checks its attestation (422 `attestation_failed`); `"verify": false` skips both and the hotel joins pending. `miner_hotkey` (SS58) adds the labels `miner=true` and `miner_hotkey`, which a PATCH cannot remove. |
+| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?}`. A miner hotel must set `"sealed": true` and use HTTPS with attested guest TLS; the broker pins that key before its first keyed call. `"verify": false` is refused for miners. For operator hotels, the broker calls `GET /v1/status` with the key and checks attestation for sealed hotels; `"verify": false` skips both and joins pending. An unsealed join cannot claim `labels.sealed=true`. `miner_hotkey` (SS58) adds `miner=true` and `miner_hotkey` labels, which a PATCH cannot remove. |
 | `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). An unsealed runtime hotel cannot gain the sealed label. |
 | `DELETE /v1/broker/hotels/<id>` | Removes a runtime hotel that has no rooms. Drain it first. |
 
