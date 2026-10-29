@@ -33,6 +33,43 @@ tokens, 8192 for d1), video input (llama.cpp needs `ffmpeg`, not in the
 image) and speech output (`llama-tts`, `/v1/realtime`), which are not
 shipped or tested here.
 
+## Pins and sealed proof
+
+Published from commit `08a476a` (run summary has the commit tags). All six
+packages are public; anonymous pull checked.
+
+| Model | Pin |
+|---|---|
+| `lfm3-1.7b-base` | `ghcr.io/cathedralai/room-lfm3-1.7b-base@sha256:c7fc0f7f5ee18e915b1086fab27d076c391a408085efdd89cb89cb10e4623278` |
+| `lfm3-vl-2b` | `ghcr.io/cathedralai/room-lfm3-vl-2b@sha256:ad586f04ff7aca83d82355ee5df960497b569c6a4ca198741a25b054627140f5` |
+| `lfm3-audio-2b` | `ghcr.io/cathedralai/room-lfm3-audio-2b@sha256:6058d091f4ed9f3770da38b68ce5237a33e05bcf3037f5a2e5eef2b45d212a49` |
+| `lfm3-omni-2b` | `ghcr.io/cathedralai/room-lfm3-omni-2b@sha256:3b1f0900656856de8511adb09b9816c740cd33f4df5b5c32a6596b794b2611ff` |
+| `d1-2b` | `ghcr.io/cathedralai/room-d1-2b@sha256:2e92f09e8572f34d1ef27b8f7835410dba9f221ad994f8f3e004c5c4f4512f3c` |
+| `d1-omni-2b` | `ghcr.io/cathedralai/room-d1-omni-2b@sha256:17791b80a0e21005321754439c219712274541561bcb83848794a33c16f90002` |
+
+The converted `LFM3-1.7B-Base-Q4_K_M.gguf` in that image has sha256
+`d4c9ebb5aa08999083bf939042087b6379547c5729163ce556902d8c06111fd5`.
+
+One sealed room per image on prod, 29 Oct: `amd_sev_snp`, `deny_all`,
+`sealed-2x4` (2 vCPU, 4 GiB, 10 GiB), `max_spend_usd` 0.1, created and
+deleted through the public API, no prefetch. Each ran `lfm3-selftest` check by
+check and one request to the endpoint contract from inside the room.
+Generation rate is a 256-token `/v1/chat/completions` answer; d1 times are
+`lfm3-decide` wall time. Receipts are create, each exec, and delete.
+
+| Model | Create to running | Rate or decision time | Sample answer | Server RSS | Receipts |
+|---|---|---|---|---|---|
+| `lfm3-1.7b-base` | 4.9 s (23.3 s on the first pull) | 23.7 tok/s | raw "The capital of France is" gives " Paris."; 2+2 gives "4" | 1.9 GB | 8 |
+| `lfm3-vl-2b` | 84.4 s | 19.9 tok/s; picture answered in 4.2 s | test picture: "Blue" | 2.3 GB | 8 |
+| `lfm3-audio-2b` | 40.2 s | 23.5 tok/s; clip in 1.7 s | clip: "The train to Paris leaves at 9 in the morning." | 2.4 GB | 8 |
+| `lfm3-omni-2b` | 102.6 s | 19.4 tok/s; picture 4.5 s, clip 2.2 s | picture "Blue"; clip transcribed exactly | 2.7 GB | 9 |
+| `d1-2b` | 60.6 s | text 0.8 s, picture 4.4 s | refund 0.996, picture "blue" 0.9996 | 2.3 GB | 8 |
+| `d1-omni-2b` | 60.0 s | text 0.8 s, picture 4.4 s, clip 1.5 s | refund 0.95, picture "blue" 0.97, clip "paris" 0.95 | 2.5 GB | 9 |
+
+At least 1.5 GB of the 4 GiB stayed available after the checks in every room.
+The first two `d1-2b` creates failed at the API ("Sealed pool did not answer:
+ReadTimeout", while the image pulled); the third ran.
+
 ## What runs in the room
 
 The entrypoint is `lfm3-serve`. It starts `llama-server` on `127.0.0.1:8080`,
