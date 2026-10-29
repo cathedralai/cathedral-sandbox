@@ -316,7 +316,10 @@ and the client routes) carries an `isolation` object:
 
 `hotel_sealed` is true when the room's hotel is a sealed (SEV-SNP) guest;
 `hotel_tee` is the TEE kind, or null on an unsealed hotel. `room_runtime` is
-what the hotel reports (`runsc`, `docker`, `kata`). `attested_per_room` is
+the `runtime` of the room document when it has one, else the runtime the
+hotel last reported in `/room/health` (`runsc`, `docker`, `kata`), else
+`unknown`. The broker never guesses it; a failed health fetch keeps the last
+known value. The operator stats view lists it per hotel as `runtime`. `attested_per_room` is
 always false: a TEE covers the hotel VM, rooms on it are separated by the
 room runtime, and the hotel's attestation is at `attestation_of_host`. A
 guest reads the level from this object, never from the hotel id.

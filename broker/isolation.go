@@ -16,6 +16,11 @@ func isolationDoc(h *hotel, roomDoc map[string]any) map[string]any {
 	}
 	runtime, _ := roomDoc["runtime"].(string)
 	if runtime == "" {
+		// The hotel's room documents carry no runtime; the room kit reports
+		// it in /room/health, which syncHotel stores.
+		runtime = h.hotelRuntime()
+	}
+	if runtime == "" {
 		runtime = "unknown"
 	}
 	mode := ""
@@ -30,4 +35,10 @@ func isolationDoc(h *hotel, roomDoc map[string]any) map[string]any {
 		"network_mode":        mode,
 		"attestation_of_host": "/v1/hotels/" + h.cfg.ID + "/attestation",
 	}
+}
+
+// hotelRuntime is the runtime the hotel last reported in /room/health, or "".
+func (h *hotel) hotelRuntime() string {
+	rt, _ := h.healthRuntime.Load().(string)
+	return rt
 }

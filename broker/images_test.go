@@ -18,32 +18,33 @@ import (
 
 // fakeHotel is a minimal hotel /v1 API: rooms, snapshots and prefetch.
 type fakeHotel struct {
-	t           *testing.T
-	mu          sync.Mutex
-	creates     []map[string]any
-	authFail    bool                      // answer creates 401, like a hotel whose API key changed
-	pullOutage  bool                      // answer creates 502 image_pull_failed for a registry outage
-	calls       []string                  // "METHOD /path?query" of every request
-	snaps       map[string]map[string]any // hotel snapshot id -> document
-	prefetch    []map[string]any
-	pushes      []map[string]any
-	deleted     []string
-	failPull    bool
-	pullDelay   time.Duration
-	n           int
-	execs       []map[string]any
-	builds      []map[string]any
-	failBuild   bool
-	createDelay time.Duration
-	healthFail  bool
-	rooms       []map[string]any // id + labels, for the room list
-	networks    []map[string]any // bodies of PUT /v1/sandboxes/{id}/network
-	receipts    []byte           // body of GET /room/receipts
-	attestIn    [][]byte         // bodies of POST /room/attest
-	attestAuth  []string         // Authorization of POST /room/attest
-	attestGuest []string         // X-Cathedral-Guest of POST /room/attest
-	roomDeletes []string         // room ids of DELETE /v1/sandboxes/{id}
-	bulkDeletes [][]string       // label filters of DELETE /v1/sandboxes
+	t             *testing.T
+	mu            sync.Mutex
+	creates       []map[string]any
+	authFail      bool                      // answer creates 401, like a hotel whose API key changed
+	pullOutage    bool                      // answer creates 502 image_pull_failed for a registry outage
+	calls         []string                  // "METHOD /path?query" of every request
+	snaps         map[string]map[string]any // hotel snapshot id -> document
+	prefetch      []map[string]any
+	pushes        []map[string]any
+	deleted       []string
+	failPull      bool
+	pullDelay     time.Duration
+	n             int
+	execs         []map[string]any
+	builds        []map[string]any
+	failBuild     bool
+	createDelay   time.Duration
+	healthFail    bool
+	healthRuntime string           // "runtime" in the /room/health answer; empty: omitted
+	rooms         []map[string]any // id + labels, for the room list
+	networks      []map[string]any // bodies of PUT /v1/sandboxes/{id}/network
+	receipts      []byte           // body of GET /room/receipts
+	attestIn      [][]byte         // bodies of POST /room/attest
+	attestAuth    []string         // Authorization of POST /room/attest
+	attestGuest   []string         // X-Cathedral-Guest of POST /room/attest
+	roomDeletes   []string         // room ids of DELETE /v1/sandboxes/{id}
+	bulkDeletes   [][]string       // label filters of DELETE /v1/sandboxes
 	// getStatus overrides GET /v1/sandboxes/{id} when set (e.g. 409 while deleting).
 	getStatus map[string]int
 	// attestation is the body of GET /room/attestation (admission_test.go); nil: 404.
@@ -232,6 +233,8 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(f.attestation)
 	case p == "/room/health" && f.healthFail:
 		writeErr(w, 503, "busy", "health did not answer")
+	case p == "/room/health" && f.healthRuntime != "":
+		writeJSON(w, 200, map[string]any{"runtime": f.healthRuntime, "kernel_isolation": true})
 	case p == "/room/health" || p == "/v1/quota" || p == "/v1/status":
 		writeJSON(w, 200, map[string]any{})
 	case strings.HasSuffix(p, "/network") && r.Method == "PUT":
@@ -320,8 +323,12 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, rm := range f.rooms {
 			if rm["id"] == id {
-				writeJSON(w, 200, map[string]any{"id": id, "state": "running", "labels": rm["labels"], "runtime": "docker",
-					"network": map[string]any{"mode": "deny_all", "allow": []any{}}})
+				doc := map[string]any{"id": id, "state": "running", "labels": rm["labels"], "runtime": "docker",
+					"network": map[string]any{"mode": "deny_all", "allow": []any{}}}
+				if f.healthRuntime != "" {
+					delete(doc, "runtime") // the real hotel's room document has none
+				}
+				writeJSON(w, 200, doc)
 				return
 			}
 		}

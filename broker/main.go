@@ -187,24 +187,29 @@ type hotel struct {
 	downSince    time.Time    // when ok last went false; zero while ok
 	lastAnswer   atomic.Int64 // unix ns of the last room call the hotel answered (status < 500)
 	healthMs     float64      // duration of the last /room/health call
-	listOK       bool         // last room list answered
-	lastErr      string
-	caps         map[string]any // capability probe results (probe.go)
-	cpuPct       float64
-	memPct       float64
-	memGiB       float64
-	load1        float64
-	containers   int
-	apiRunning   int
-	apiDeleting  int
-	created      int
-	failed       int
-	rejected     int
-	lat          latencies
-	createEWMA   float64   // seconds, moving average of the hotel create call (placement.go)
-	moved        int       // creates that left this hotel's queue for another hotel
-	runtime      bool      // joined at runtime (hotels.go), not from the config file
-	adm          admission // attestation gate of a joined sealed hotel (admission.go)
+	// healthRuntime: the room runtime the hotel last reported in /room/health
+	// ("runsc"...), or "" when it reported none. Atomic because isolationDoc
+	// reads it with or without b.mu held.
+	healthRuntime   atomic.Value // string
+	kernelIsolation *bool        // kernel_isolation of the last good /room/health; nil when absent
+	listOK          bool         // last room list answered
+	lastErr         string
+	caps            map[string]any // capability probe results (probe.go)
+	cpuPct          float64
+	memPct          float64
+	memGiB          float64
+	load1           float64
+	containers      int
+	apiRunning      int
+	apiDeleting     int
+	created         int
+	failed          int
+	rejected        int
+	lat             latencies
+	createEWMA      float64   // seconds, moving average of the hotel create call (placement.go)
+	moved           int       // creates that left this hotel's queue for another hotel
+	runtime         bool      // joined at runtime (hotels.go), not from the config file
+	adm             admission // attestation gate of a joined sealed hotel (admission.go)
 	// roomsUnchecked: loaded at start and no room list has answered since. A
 	// reserved hotel takes no rooms until one has passed the fail-closed
 	// check (lend.go). baselineTry: last REPORT_ID fetch for an unknown
@@ -1563,6 +1568,7 @@ func (b *broker) handleStats(w http.ResponseWriter, r *http.Request, g *guestSta
 		hotels = append(hotels, map[string]any{
 			"id": h.cfg.ID, "ok": h.ok, "drain": h.drain(), "sealed": h.cfg.Sealed, "slots": h.slots, "broker_running": running, "queued": h.queued, "creating": h.creating,
 			"api_running": h.apiRunning, "api_deleting": h.apiDeleting, "containers": h.containers,
+			"runtime": h.hotelRuntime(), "kernel_isolation": h.kernelIsolation,
 			"cpu_pct": h.cpuPct, "mem_pct": h.memPct, "mem_gib": h.memGiB, "load1": h.load1, "mem_full": b.memFull(h),
 			"created": h.created, "failed": h.failed, "rejected_429": h.rejected,
 			"hotel_ms": pct(h.lat.hotel), "queue_ms": pct(h.lat.queue), "overhead_ms": pct(h.lat.overhead),
@@ -1574,8 +1580,10 @@ func (b *broker) handleStats(w http.ResponseWriter, r *http.Request, g *guestSta
 // ---------------------------------------------------------------- sync loop
 
 type healthDoc struct {
-	Slots            int  `json:"slots"`
-	SandboxesRunning *int `json:"sandboxes_running"`
+	Slots            int    `json:"slots"`
+	SandboxesRunning *int   `json:"sandboxes_running"`
+	Runtime          string `json:"runtime"`
+	KernelIsolation  *bool  `json:"kernel_isolation"`
 	Live             struct {
 		CPU    *float64 `json:"host_cpu_pct"`
 		MemPct float64  `json:"host_mem_used_pct"`
@@ -1657,6 +1665,11 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		if hd.SandboxesRunning != nil {
 			h.containers = *hd.SandboxesRunning
 		}
+		// Only a good health answer moves the runtime: a failed fetch keeps
+		// the last known value, and a good answer without one clears it (the
+		// hotel may have rebooted into a kit that does not report it).
+		h.healthRuntime.Store(hd.Runtime)
+		h.kernelIsolation = hd.KernelIsolation
 	}
 	if qerr == nil {
 		h.apiRunning = int(quota.Usage["running_sandboxes"] + quota.Usage["frozen_sandboxes"])
