@@ -51,6 +51,7 @@ def test_suite_model_pins_are_digest_hex() -> None:
 def test_catalog_names_match_suite_images() -> None:
     catalog = CATALOG.read_text(encoding="utf-8")
     assert "amd_sev_snp" in catalog
+    assert "lfm3-1.7b" in catalog and "sealedReady" in catalog
     assert '"tdx_cpu"' not in catalog
     assert "hardware_class\": \"tdx_cpu\"" not in catalog
     for name in SUITE_MODELS:
@@ -61,7 +62,10 @@ def test_catalog_names_match_suite_images() -> None:
             for line in env.splitlines()
             if line.startswith("IMAGE_NAME=")
         )
-        assert f"ghcr.io/cathedralai/{image_name}:unpublished" in catalog
+        # #363: suite images are published digests, still sealed pending until prefetch.
+        assert f"ghcr.io/cathedralai/{image_name}:unpublished" not in catalog
+        assert f"ghcr.io/cathedralai/{image_name}" in catalog
+        assert "sha256:" in catalog
 
 
 def test_base_image_pins_safetensors() -> None:
