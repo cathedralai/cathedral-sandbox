@@ -455,3 +455,41 @@ def test_cli_run_success_never_prints_keys(
     ]:
         assert GUEST_KEY not in text, root
         assert signing_b64 not in text and bytes(range(32)).hex() not in text, root
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/tmp/x.json",
+        "/work",
+        "/work/../etc/x",
+        "/work/claims-in/../../etc/x",
+        "/workfoo/x",
+        "/work/claims-in/paper.pdf",
+        "/work//claims-in/./paper.pdf",
+        "/work/claims-in/source_payload.json",
+        "/work/claims-out/agent_output.json",
+    ],
+)
+def test_bad_upload_destination_is_refused_before_any_room(tmp_path: Path, path: str) -> None:
+    broker = FakeBroker(_writes_output())
+    stage = _stage(extra_uploads=((path, b"x"),))
+    with pytest.raises(claims_room.ClaimsRunError):
+        _run(broker, tmp_path, stage=stage)
+    assert broker.calls == []
+
+
+def test_parse_uploads_refuses_path_outside_work(tmp_path: Path) -> None:
+    (tmp_path / "f").write_bytes(b"x")
+    with pytest.raises(claims_room.ClaimsRunError):
+        claims_room.parse_uploads([f"{tmp_path / 'f'}=/tmp/f"])
+    assert claims_room.parse_uploads([f"{tmp_path / 'f'}=/work/claims-in/f"]) == (
+        ("/work/claims-in/f", b"x"),
+    )
+
+
+@pytest.mark.parametrize("url", ["http://broker.example", "http://127.0.0.1:8080", "ftp://x", "broker"])
+def test_broker_url_must_be_https(url: str) -> None:
+    with pytest.raises(claims_room.ClaimsRunError):
+        claims_room.HttpBrokerTransport(url)
+    claims_room.HttpBrokerTransport("https://broker.example")
