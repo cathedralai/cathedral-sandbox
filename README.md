@@ -1,11 +1,30 @@
-# Cathedral Sandbox
+<p align="center"><img src="docs/assets/cathedral-mark.png" alt="Cathedral" width="112"></p>
+<h1 align="center">Cathedral Sandbox</h1>
+<p align="center"><em>Cathedral&ensp;turns&ensp;independently&ensp;operated&ensp;machines&ensp;into&ensp;a&ensp;verifiable&ensp;compute&ensp;network</em></p>
+<p align="center"><sub>27 October 2026</sub></p>
+
+## Contents
+<p><sub><strong>Overview</strong></sub><br>
+<strong>1. <a href="#how-mining-works">How mining works</a></strong><br>
+<strong>2. <a href="#current-support">Current support</a></strong><br>
+<strong>3. <a href="#customer-products">Customer products</a></strong><br><br>
+<sub><strong>Operator path</strong></sub><br>
+<strong>4. <a href="#what-you-need">What you need</a></strong><br>
+<strong>5. <a href="#install-and-start">Install and start</a></strong><br>
+<strong>6. <a href="#verify">Verify</a></strong><br>
+<strong>7. <a href="#founding-miners">Founding miners</a></strong><br>
+<strong>8. <a href="#validators">Validators</a></strong><br><br>
+<sub><strong>Support</strong></sub><br>
+<strong>9. <a href="#stop-and-get-help">Stop and get help</a></strong><br>
+<strong>10. <a href="#public-leak-guard">Public leak guard</a></strong></p>
 
 Cathedral turns independently operated machines from trusted operators into a
 verifiable compute network. Miners supply the machines; validators check their
 confidential-computing evidence, test their work and score the results.
 
 This repository is for miners running compute workers on Bittensor SN94.
-For validator operators, use [Cathedral Validator](https://github.com/cathedralai/cathedral-validator).
+For validator operators, use
+[Cathedral Validator](https://github.com/cathedralai/cathedral-validator).
 
 ## How mining works
 
@@ -22,19 +41,29 @@ This mining path is not a customer sandbox API.
 
 | Machine | Current boundary |
 |---|---|
+| AMD SEV-SNP guest | Validator source supports it. Each validator must admit the live measurement and TCB. SN94 admission remains unverified. |
 | Intel TDX confidential VM | Mainnet live testing; fresh TDX evidence and SAT must pass. |
-| AMD SEV-SNP guest | Requires each validator's reviewed measurement and TCB policy; SN94 admission remains unverified. |
 | More machines on one UID | Each must independently pass verification; duplicate hardware scores zero. |
 | GPU | Not a qualified mining path; see the [development contract](docs/GPU_WORK.md). |
 
 A machine quote does not remotely prove its container image digest or continuous
 runtime integrity after boot. See the [mining guide](docs/MINING.md#current-support)
-for the exact evidence boundary and historical observations.
+for the exact evidence boundary.
+
+## Customer products
+
+Cathedral's lease and sandbox products are live on SN94. The public sealed
+tier runs on AMD SEV-SNP hosts that Cathedral leases. Cathedral does not own
+those hosts. There is no self-serve sealed capacity; access is by request.
+This repository does not sell or provision that product.
+
+The Escape Room is coming, but it is not open. Do not treat bounties or prizes
+as live.
 
 ## What you need
 
-- A Linux Intel TDX VM with `/sys/kernel/config/tsm/report`, or an AMD SEV-SNP
-  guest with `/dev/sev-guest`. Ordinary SEV and a vTPM are not SNP.
+- A Linux AMD SEV-SNP guest with `/dev/sev-guest`, or an Intel TDX VM with
+  `/sys/kernel/config/tsm/report`. Ordinary SEV and a vTPM are not SNP.
 - Python 3.12 with `venv`, Git, Docker, `nft`, and `curl` inside the guest.
 - Public IPv4 and inbound TCP `8081`.
 - A miner-owned control host with Python 3.12 and Git to refresh signed
@@ -53,8 +82,8 @@ Follow the single [mining guide](docs/MINING.md) in order:
 1. [Rehearse locally](docs/MINING.md#rehearse-before-renting-or-registering)
    three times before spending or registering. Python 3.11+ is enough for this
    rehearsal; its synthetic evidence proves protocol wiring, not hardware.
-2. Choose the [Intel TDX](docs/MINING.md#run-one-intel-tdx-machine) or
-   [AMD SEV-SNP](docs/MINING.md#run-one-amd-sev-snp-machine) instructions.
+2. Choose the [AMD SEV-SNP](docs/MINING.md#run-one-amd-sev-snp-machine) or
+   [Intel TDX](docs/MINING.md#run-one-intel-tdx-machine) instructions.
    Use their pinned image and root-owned launcher; do not run a writable
    checkout as root.
 3. Set up the miner-owned signer and
@@ -79,6 +108,22 @@ ask the validator operator for the matching verification result.
 For another machine on the same UID, follow
 [Add more machines](docs/MINING.md#add-more-machines-to-one-uid).
 Reuse the signer, not a second hotkey or a second signing key.
+
+## Founding miners
+
+Cathedral is admitting a small group of operators first. Apply with the
+[Founding Miner Application](https://docs.google.com/forms/d/e/1FAIpQLScxnX15Hb70AnkeZcHBI53cv_yN7aen4_h95njQvMzBxBiMpQ/viewform).
+Cathedral acknowledges every application within 48 hours.
+
+Registration alone does not admit a machine to the sealed customer pool
+or place customer jobs. After Cathedral accepts you, follow the
+[mining guide](docs/MINING.md#founding-miners).
+
+## Validators
+
+Do not install or run a validator from this repository. The operator guide,
+signed installer, SNP policy template and weight-write runbook live in
+[cathedral-validator](https://github.com/cathedralai/cathedral-validator).
 
 ## Stop and get help
 

@@ -32,14 +32,12 @@ def test_mining_guide_is_the_single_current_operator_path() -> None:
         "each distinct verified machine",
         "Intel TDX",
         "AMD SEV-SNP",
-        # Updated 2026-09-09. UID30 admitted its first live AMD machine on
-        # 2026-09-08, so the previous "live hardware policy pending" wording
-        # became false. This guard is what kept it in place, so it moves with
-        # the claim rather than pinning a stale one. Updated 2026-09-28: that
-        # admission was on SN39, and SN94 has not been verified yet. The block
-        # is observed on chain and not recorded in-repo, so it stays marked.
-        "One admission observed on SN39 at block 9025398 (observed on chain; unverified in-repo)",
-        "SN94 status pending verification",
+        # Updated 2026-10-27: Cathedral is SN94, not SN39. Operator docs must
+        # not keep a historical-SN39 identity or UID-specific admission story.
+        "SN94 admission remains unverified",
+        "Founding miners",
+        "Founding Miner Application",
+        "Registration alone does not admit a machine to the sealed customer pool",
         "7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b",
         "3e1cb9144417e1e0d526445a43245e305e772cae0568202a332183071ef0c584",
         "current migration bridge",
@@ -53,6 +51,7 @@ def test_mining_guide_is_the_single_current_operator_path() -> None:
 
     assert "single current mining guide" in mining
     assert "only active operator guide" in " ".join(map_text.split())
+    assert "founding miners apply" in mining.lower()
     assert len(mining.splitlines()) <= 8
 
 
@@ -137,6 +136,8 @@ def test_current_guide_proves_reachability_before_paid_registration() -> None:
     assert "btcli --network finney query uid" in readme
     assert "btcli --network finney --json query weights --netuid 94" in readme
     assert "There is not yet a public validator-result feed" in readme
+    assert "This repository does not publish which SN94 validator UIDs" in readme
+    assert 'An unsigned `POST /v1/evidence` with `{}` must return HTTP 401' in readme
 
 
 def test_public_repo_has_no_invite_only_miner_form() -> None:
@@ -275,7 +276,7 @@ def test_runtime_help_does_not_point_at_deleted_documents() -> None:
 
 def test_readme_is_a_short_mission_first_miner_entrypoint() -> None:
     readme = (REPO_ROOT / "README.md").read_text()
-    assert len(readme.splitlines()) <= 120
+    assert len(readme.splitlines()) <= 160
     assert "trusted operators" in readme
     assert "This repository is for miners" in readme
     assert "This mining path is not a customer sandbox API" in readme
@@ -286,6 +287,63 @@ def test_readme_is_a_short_mission_first_miner_entrypoint() -> None:
     assert "scripts/run_sn94_signed_fleet_miner.sh" not in readme
     assert "docs/MINING.md#5-confirm-chain-state" in readme
     assert "docs/MINING.md#stop-and-get-help" in readme
+    assert "Bittensor SN94" in readme
+    assert '<img src="docs/assets/cathedral-mark.png"' in readme
+    assert "## Contents" in readme
+    assert "Cathedral&ensp;turns" in readme
+    assert "There is no self-serve sealed capacity" in readme
+    assert "Cathedral does not own" in readme
+    assert "The Escape Room is coming, but it is not open" in readme
+    assert "Founding Miner Application" in readme
+    assert (
+        "Registration alone does not admit a machine to the sealed customer pool"
+        in readme
+    )
+    assert "no published founding-miner program" not in readme
+    assert "Do not install or run a validator from this repository" in readme
+    assert "—" not in readme
+
+
+def test_operator_docs_name_cathedral_as_sn94_not_sn39() -> None:
+    operator_paths = (
+        "README.md",
+        "MINING.md",
+        "docs/README.md",
+        "docs/MINING.md",
+        "docs/AMD_SEV_SNP_FRIEND_TEST.md",
+        "docs/CAPACITY.md",
+        "docs/MINER_BOX_RUNBOOK.md",
+        "docs/SN94_AUDIT_MINER_IMAGE.md",
+        "docs/SN94_SNP_MINER_IMAGE.md",
+        "docs/SNP_OWN_SERVER_ONBOARDING.md",
+        "docs/TEE_BOX.md",
+    )
+    forbidden = (
+        "SN39 is historical",
+        "historical SN39",
+        "On SN39",
+        "admission observed on SN39",
+        "GitHub description still says SN39",
+        "Cathedral runs SN39",
+        "validators on SN39",
+        "--netuid 39",
+        "subnet 39",
+        "netuid 39",
+        "Subnet 39",
+        "no published founding-miner program",
+        "no application path",
+    )
+    form = (
+        "https://docs.google.com/forms/d/e/"
+        "1FAIpQLScxnX15Hb70AnkeZcHBI53cv_yN7aen4_h95njQvMzBxBiMpQ/viewform"
+    )
+    for relative in operator_paths:
+        text = (REPO_ROOT / relative).read_text()
+        for phrase in forbidden:
+            assert phrase not in text, f"{relative}: {phrase}"
+        assert "—" not in text, relative
+    for relative in ("README.md", "docs/README.md", "docs/MINING.md"):
+        assert form in (REPO_ROOT / relative).read_text(), relative
 
 
 OPERATOR_LINK_DOCUMENTS = [
@@ -311,6 +369,8 @@ def test_operating_step_references_follow_the_moved_guide() -> None:
         assert reference in (REPO_ROOT / relative).read_text(), relative
     amd = (REPO_ROOT / "docs/AMD_SEV_SNP_FRIEND_TEST.md").read_text()
     assert "Do not run the mining guide's TDX host or image steps" in amd
+    assert 'test "$HEALTH_STATUS" = 401' in amd
+    assert '{"error":"unauthorized"}' in amd
 
 
 def test_current_operator_markdown_links_resolve() -> None:

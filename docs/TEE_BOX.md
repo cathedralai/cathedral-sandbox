@@ -1,10 +1,14 @@
 # TEE sandbox box design
 
-Status: design proposal, 2026-09-28, revised 2026-09-29. Nothing in this page
-has run on live hardware. Each section separates **Existing** (code on `main`,
-or an open PR named by number) from **Proposal** (not built). Citations are
-`file:line`. Paths without a repository name are in this repository. Files
-that exist only in an open PR are named with that PR's number.
+Status: design proposal for a miner-run TEE box, 2026-09-28, revised
+2026-09-29. This page is not a mining path and not a self-serve product
+install. Cathedral's customer lease and sealed sandbox products are live on
+SN94 on leased AMD SEV-SNP hosts, by request. That live product is separate
+from the miner-box design below. Each section here separates **Existing**
+(code on `main`, or an open PR named by number) from **Proposal** (not
+built). Citations are `file:line`. Paths without a repository name are in
+this repository. Files that exist only in an open PR are named with that
+PR's number.
 
 ## Owner decisions this design keeps
 
@@ -19,7 +23,7 @@ that exist only in an open PR are named with that PR's number.
   is `install-runtime-host.sh:422`.)
 - Weights follow a signed market price table with separate TEE rates. The
   minimum box shape comes from SN120/Affine and SN81. The SN94 owner runs the
-  prober; validators on SN39 and SN94 verify receipts. No netuid is hard-coded.
+  prober; validators on SN94 verify receipts. No netuid is hard-coded.
 
 The v1 decisions on this design itself are at the end of the page, in "Owner
 decisions for v1".

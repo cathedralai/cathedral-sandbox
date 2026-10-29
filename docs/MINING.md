@@ -1,7 +1,33 @@
-# Mining Cathedral
+<p align="center"><img src="assets/cathedral-mark.png" alt="Cathedral" width="112"></p>
+<h1 align="center">Mining Cathedral</h1>
+<p align="center"><em>Cathedral&ensp;turns&ensp;independently&ensp;operated&ensp;machines&ensp;into&ensp;a&ensp;verifiable&ensp;compute&ensp;network</em></p>
+<p align="center"><sub>27 October 2026</sub></p>
 
-The single current mining guide for operators on Bittensor SN94. Start at the
-[repository overview](../README.md); follow the instructions here in order.
+## Contents
+<p><sub><strong>Overview</strong></sub><br>
+<strong>1. <a href="#how-mining-works">How mining works</a></strong><br>
+<strong>2. <a href="#current-support">Current support</a></strong><br>
+<strong>3. <a href="#what-you-need">What you need</a></strong><br><br>
+<sub><strong>Operator path</strong></sub><br>
+<strong>4. <a href="#rehearse-before-renting-or-registering">Rehearse before renting or registering</a></strong><br>
+<strong>5. <a href="#run-one-amd-sev-snp-machine">Run one AMD SEV-SNP machine</a></strong><br>
+<strong>6. <a href="#run-one-intel-tdx-machine">Run one Intel TDX machine</a></strong><br>
+<strong>7. <a href="#add-more-machines-to-one-uid">Add more machines to one UID</a></strong><br>
+<strong>8. <a href="#founding-miners">Founding miners</a></strong><br><br>
+<sub><strong>Support</strong></sub><br>
+<strong>9. <a href="#reference">Reference</a></strong><br>
+<strong>10. <a href="#stop-and-get-help">Stop and get help</a></strong></p>
+
+Cathedral turns independently operated machines from trusted operators into a
+verifiable compute network. Miners supply the machines; validators check their
+confidential-computing evidence, test their work and score the results.
+
+This is the single current mining guide for operators on Bittensor SN94. Start
+at the [repository overview](../README.md); follow the instructions here in
+order.
+
+Published GHCR image names still contain `sn39`. Those images are labeled
+`org.cathedral.image-chain=finney-94` and refuse any other chain.
 
 ## How mining works
 
@@ -27,24 +53,14 @@ guarantee TAO. The subnet must have positive emission.
 
 | Path | Status | Weight |
 |---|---|---|
+| AMD SEV-SNP on Linux | Validator source supports it. SN94 admission remains unverified | Eligible after that validator's policy admits the measurement and TCB, then fresh evidence and SAT pass |
 | Intel TDX on Linux | Mainnet live testing | Eligible after fresh TDX and SAT verification |
-| More Intel TDX machines on one UID | Mainnet live testing | Each distinct verified machine adds to that UID's score |
-| AMD SEV-SNP on Linux | One admission observed on SN39 at block 9025398 (observed on chain; unverified in-repo); SN94 status pending verification | Eligible after that validator's policy admits the measurement and TCB, then fresh evidence and SAT pass |
+| More machines on one UID | Mainnet live testing for TDX; SNP follows the same fleet rules once admitted | Each distinct verified machine adds to that UID's score |
 
 The current direct validator source supports Intel TDX and AMD SEV-SNP. Each
 validator owns its SNP measurement and TCB allowlist. An AMD machine earns zero
 from that validator until its live hardware run is admitted by the policy and
-fresh evidence and SAT pass.
-
-On SN39, UID30 admitted its first live AMD machine on 2026-09-08 and recorded
-the weight row `[(68, 1.0)]` at block 9025398. Both are observed on chain and
-reported by the operator; neither this repository nor cathedral-validator
-records them, so treat them as unverified in-repo. That was one observed cycle
-on one validator, not a standing payout and not a promise about any other
-validator. Cathedral moved to SN94 on 2026-09-28 (this repository's #215,
-`a66d7c4`, and cathedral-validator #261, `28a2779`), and no SN94 AMD admission
-has been verified yet, so the SN94 AMD status is pending verification. Every
-validator still owns its own policy, so admission by UID30 says nothing about
+fresh evidence and SAT pass. Admission by one validator says nothing about
 whether another validator will admit the same machine.
 
 For AMD, the validator proves an admitted guest measurement, distinct hardware,
@@ -58,8 +74,8 @@ runtime in this repository is not the SN94 weight-writing path.
 
 ## What you need
 
-- A Linux Intel TDX confidential VM with `/sys/kernel/config/tsm/report`, or an
-  AMD SEV-SNP guest with `/dev/sev-guest`. For AMD, check with your target
+- A Linux AMD SEV-SNP guest with `/dev/sev-guest`, or an Intel TDX confidential
+  VM with `/sys/kernel/config/tsm/report`. For AMD, check with your target
   validator whether it requires the `SINGLE_SOCKET` guest policy bit, which a
   multi-socket Linux KVM host cannot set. It is an owner policy option that
   defaults to required. See the
@@ -145,6 +161,12 @@ only after its configured owner-controlled SNP policy admits the exact
 measurement and TCB, then verifies fresh HTTPS-bound evidence and canonical SAT. Follow
 [AMD SEV-SNP miner](AMD_SEV_SNP_FRIEND_TEST.md). The published image pin
 does not prove that a specific SNP host is online or receiving weight.
+
+The SNP image is signed-validator only. It is not the TDX migration bridge.
+An unsigned `POST /v1/evidence` with `{}` must return HTTP 401 and
+`{"error":"unauthorized"}`. That proves only that the intended HTTPS worker
+answers and requires a validator signature. It does not prove AMD evidence,
+admission, SAT, weight or emission.
 
 The launcher checks the immutable image locally. That image digest is not a
 field in the remote SNP report.
@@ -522,8 +544,10 @@ btcli --network finney query uid \
 btcli --network finney --json query weights --netuid 94
 ```
 
-After UID 30 submits and any commit-reveal delay completes, row `"30"` must
-contain your miner UID with a positive fraction.
+After a scoring validator submits and any commit-reveal delay completes, that
+validator's weight row must contain your miner UID with a positive fraction.
+This repository does not publish which SN94 validator UIDs currently write
+weights. Ask the validator operator you expect to score you.
 
 All of these must also be true:
 
@@ -534,9 +558,7 @@ All of these must also be true:
 - the on-chain weight row changes only after the validator submits it.
 
 There is not yet a public validator-result feed for the TDX, SPKI, and SAT
-checks. Until the private telemetry projection reaches the Cathedral
-leaderboard, a miner must ask the validator operator for that final result.
-This is an open self-service gap.
+checks. Ask the validator operator for that final result.
 
 A healthy server is not proof of weight. A weight is not proof of emission.
 
@@ -587,6 +609,19 @@ file. A worker still refuses to start with a bad or missing `fleet.json`.
 Add up to 31 secondary origins. Reusing an endpoint, hardware
 identity, or TLS key causes every verified claimant in that collision to score
 zero for the round.
+
+## Founding miners
+
+Cathedral is admitting a small group of operators first. Apply with the
+[Founding Miner Application](https://docs.google.com/forms/d/e/1FAIpQLScxnX15Hb70AnkeZcHBI53cv_yN7aen4_h95njQvMzBxBiMpQ/viewform).
+Cathedral acknowledges every application within 48 hours.
+
+Registration alone does not admit a machine to the sealed customer pool
+or place customer jobs. After Cathedral accepts you, follow this guide
+and the [AMD SEV-SNP](AMD_SEV_SNP_FRIEND_TEST.md) hardware-proof path.
+
+Do not treat testnet 584 Join notes or internal evidence templates as the
+application.
 
 ## Reference
 
