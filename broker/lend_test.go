@@ -607,3 +607,36 @@ func TestReservingASealedHotelWithForeignRoomsIsRefused(t *testing.T) {
 	}
 	reserve(t, tc, "b", "g2")
 }
+
+// A lend or reclaim that state_dir cannot keep changes nothing: a restart
+// would otherwise hand a lent machine back, or lend one the owner uses.
+func TestLendThatCannotBeSavedChangesNothing(t *testing.T) {
+	dir := t.TempDir()
+	tc := configReserved(t, dir)
+	listSync(tc, "a")
+	setLaunch(t, tc, "a", 0x11)
+	block := filepath.Join(dir, lendsFile+".tmp")
+	if err := os.Mkdir(block, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/hotels/a", map[string]any{"lend": true}); status != 500 || errCode(doc) != "state_write_failed" {
+		t.Fatalf("unsaved lend: %d %v", status, doc)
+	}
+	if h := tc.b.hotelByID("a"); h.reservedFor() != "g2" || h.lentFrom() != "" || h.lentReportID() != "" {
+		t.Fatalf("unsaved lend changed the hotel: %+v", h.cfg)
+	}
+	if err := os.Remove(block); err != nil {
+		t.Fatal(err)
+	}
+	lend(t, tc, "a")
+	setLaunch(t, tc, "a", 0x22)
+	if err := os.Mkdir(block, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/hotels/a", map[string]any{"reserved_for": "g2"}); status != 500 || errCode(doc) != "state_write_failed" {
+		t.Fatalf("unsaved reclaim: %d %v", status, doc)
+	}
+	if h := tc.b.hotelByID("a"); h.lentFrom() != "g2" || h.lentReportID() != launchID(0x11) || h.reservedFor() != "" {
+		t.Fatalf("unsaved reclaim changed the hotel: %+v", h.cfg)
+	}
+}

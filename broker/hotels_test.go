@@ -276,7 +276,7 @@ func TestMinerEnrollmentKeyCannotOperateOutsideMinerScope(t *testing.T) {
 	if status, doc := tc.call(t, "enroller-key", "GET", "/v1/broker/hotels/m1", nil); status != 200 || doc["miner_hotkey"] != minerHotkey {
 		t.Fatalf("read miner hotel: %d %v", status, doc)
 	}
-	for _, body := range []map[string]any{{"drain": false}, {"labels": map[string]string{"zone": "x"}}, {"max_slots": 1}, {"reserved_for": "g1"}} {
+	for _, body := range []map[string]any{{"drain": false}, {"labels": map[string]string{"zone": "x"}}, {"max_slots": 1}, {"reserved_for": "g1"}, {"drain": true, "lend": true}} {
 		if status, doc := tc.call(t, "enroller-key", "PATCH", "/v1/broker/hotels/m1", body); status != 403 || errCode(doc) != "enroller_scope" {
 			t.Fatalf("out-of-scope miner patch %v: %d %v", body, status, doc)
 		}
