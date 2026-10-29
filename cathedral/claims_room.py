@@ -23,6 +23,7 @@ signing key.
 from __future__ import annotations
 
 import json
+import posixpath
 import shlex
 import shutil
 import socket
@@ -97,6 +98,12 @@ class BrokerTransport(Protocol):
 @dataclass(frozen=True)
 class HttpBrokerTransport:
     base_url: str
+
+    def __post_init__(self) -> None:
+        # The guest key rides in a header on every call, so plain http would leak it.
+        # Same rule as the evidence fetches in cli.py.
+        if urllib.parse.urlparse(self.base_url).scheme != "https":
+            raise ClaimsRunError("input", "broker url must use https")
 
     def request(
         self,
@@ -450,6 +457,16 @@ def run_claims_stage_and_issue(
     for label, path in (("input_dir", stage.input_dir), ("output_path", stage.output_path)):
         if not path.startswith("/work/") or ".." in path.split("/"):
             raise ClaimsRunError("policy", f"{label} must be a path under /work")
+    # Uploads land after the source files, so one on a reserved path would silently
+    # swap the PDF the signed evidence names. Refuse before any room exists.
+    reserved = {
+        posixpath.normpath(p)
+        for p in (stage.source_pdf_path(), stage.source_payload_path(), stage.output_path)
+    }
+    for upload_path, _data in stage.extra_uploads:
+        checked = check_upload_path(upload_path)
+        if checked in reserved:
+            raise ClaimsRunError("input", f"--upload may not overwrite reserved path {checked}")
 
     result = ClaimsRunResult(terminal_status="failed", out_dir=out_dir)
     started = monotonic()
@@ -700,6 +717,17 @@ def _finish(
     return result
 
 
+def check_upload_path(remote: str) -> str:
+    """Normalised upload destination, which must sit under /work."""
+
+    if ".." in remote.split("/"):
+        raise ClaimsRunError("input", f"--upload path may not contain '..': {remote!r}")
+    normal = posixpath.normpath(remote)
+    if not normal.startswith("/work/"):
+        raise ClaimsRunError("input", f"--upload path must be under /work/: {remote!r}")
+    return normal
+
+
 def parse_uploads(specs: Sequence[str]) -> tuple[tuple[str, bytes], ...]:
     """``LOCAL=REMOTE`` pairs into (remote path, bytes)."""
 
@@ -708,5 +736,6 @@ def parse_uploads(specs: Sequence[str]) -> tuple[tuple[str, bytes], ...]:
         local, sep, remote = spec.partition("=")
         if not sep or not local or not remote.startswith("/"):
             raise ClaimsRunError("input", f"--upload must be LOCAL=/abs/remote/path: {spec!r}")
+        check_upload_path(remote)
         uploads.append((remote, Path(local).read_bytes()))
     return tuple(uploads)
