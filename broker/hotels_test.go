@@ -176,6 +176,18 @@ func TestScopedMinerJoinPinsAttestedGuestBeforeSendingHotelKey(t *testing.T) {
 	if tc.b.hotelByID("impostor") != nil {
 		t.Fatal("impostor joined")
 	}
+	for name, change := range map[string]any{
+		"verify":          false,
+		"tls_spki_sha256": h.cfg.TLSSPKISHA256,
+		"api":             "http://127.0.0.1:1",
+	} {
+		operatorJoin := map[string]any{"id": "operator-" + name, "api": url, "health": url,
+			"key": joinKey, "sealed": true, "miner_hotkey": minerHotkey}
+		operatorJoin[name] = change
+		if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", operatorJoin); status != 409 || errCode(doc) != "guest_tls_required" {
+			t.Fatalf("operator bypass %s: %d %v", name, status, doc)
+		}
+	}
 	// The same pin guards both data and control calls, including after restart.
 	for _, pinned := range []*hotel{h} {
 		if _, _, _, err := pinned.doBase(context.Background(), impostor.URL, "GET", "/v1/status", nil, nil, time.Second); err == nil {
@@ -255,6 +267,28 @@ func TestMinerHotelWithoutPersistedPinIsSkippedOnRestart(t *testing.T) {
 	tc.start(t)
 	if tc.b.hotelByID("old-miner") != nil {
 		t.Fatal("runtime miner without an attested TLS pin was loaded")
+	}
+}
+
+func TestStaticMinerHotelCannotBypassTLSBootstrap(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	raw, err := os.ReadFile(tc.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Hotels = append(cfg.Hotels, hotelConfig{ID: "static-miner", API: "http://127.0.0.1:1",
+		Health: "http://127.0.0.1:1", Sealed: true, MinerHotkey: minerHotkey})
+	raw, _ = json.Marshal(cfg)
+	path := t.TempDir() + "/config.json"
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadBroker(path); err == nil || !strings.Contains(err.Error(), "must join with attested guest TLS") {
+		t.Fatalf("static miner bypassed guest TLS bootstrap: %v", err)
 	}
 }
 
