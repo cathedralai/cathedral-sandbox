@@ -16,7 +16,7 @@ func TestCatalogListsRoomSizesThenLFM3(t *testing.T) {
 		t.Fatalf("room sizes must stay at the front of the catalog: %v", names[:3])
 	}
 	lfm, ok := templateByName("lfm3-1.7b")
-	if !ok || !lfm.Live || lfm.Sealed != sealedPending || !lfm.SealedOnly {
+	if !ok || !lfm.Live || lfm.Sealed != sealedReady || !lfm.SealedOnly {
 		t.Fatalf("lfm3-1.7b: %+v", lfm)
 	}
 	want := pinnedImage(lfm31_7bRepo, lfm31_7bDigest)
@@ -60,34 +60,34 @@ func TestUnknownTemplateIs404OnCompatAndNative(t *testing.T) {
 
 func TestLFM3CreateHasNoUnsealedPath(t *testing.T) {
 	tc := newChain(t)
-	for _, body := range []map[string]any{
-		{"template": "lfm3-1.7b"},
-		{"template": "lfm3-1.7b", "sealed": false},
-		{"template": "lfm3-1.7b", "sealed": true},
-	} {
-		status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(body), nil)
-		if status != 503 && status != 409 {
-			t.Fatalf("compat %v: %d %v", body, status, doc)
-		}
-		if errDetail(doc) != "template_sealed_pending" && errDetail(doc) != "template_sealed_only" {
-			t.Fatalf("compat %v: %d %v", body, status, doc)
-		}
-		status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", body)
-		if status != 503 && status != 409 {
-			t.Fatalf("native %v: %d %v", body, status, doc)
-		}
-		if errCode(doc) != "template_sealed_pending" && errCode(doc) != "template_sealed_only" {
+	// sealed: false is refused before any hotel.
+	body := map[string]any{"template": "lfm3-1.7b", "sealed": false}
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(body), nil)
+	if status != 409 || errDetail(doc) != "template_sealed_only" {
+		t.Fatalf("compat %v: %d %v", body, status, doc)
+	}
+	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", body)
+	if status != 409 || errCode(doc) != "template_sealed_only" {
+		t.Fatalf("native %v: %d %v", body, status, doc)
+	}
+	if n := createsOn(tc); n["a"]+n["b"]+n["c"] != 0 {
+		t.Fatalf("refused LFM create reached a hotel: %v", n)
+	}
+	// Ready and sealed only: with or without sealed: true it lands on the sealed hotel, never elsewhere.
+	for _, body := range []map[string]any{{"template": "lfm3-1.7b"}, {"template": "lfm3-1.7b", "sealed": true}} {
+		status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", body)
+		if status >= 300 {
 			t.Fatalf("native %v: %d %v", body, status, doc)
 		}
 	}
-	if n := createsOn(tc); n["a"]+n["b"]+n["c"] != 0 {
-		t.Fatalf("LFM create reached a hotel: %v", n)
+	if n := createsOn(tc); n["a"] != 2 || n["b"]+n["c"] != 0 {
+		t.Fatalf("LFM creates must land on the sealed hotel only: %v", n)
 	}
 }
 
 func TestLFM3PendingErrorDoesNotOfferUnsealed(t *testing.T) {
 	tc := newChain(t)
-	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "lfm3-1.7b"}), nil)
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "lfm3-vl-2b"}), nil)
 	if status != 503 || errDetail(doc) != "template_sealed_pending" {
 		t.Fatalf("pending: %d %v", status, doc)
 	}
@@ -119,20 +119,27 @@ func TestUnpublishedLFM3SuiteIsNotCreated(t *testing.T) {
 func TestLFM3SuiteCatalogIsSealedOnlyAndGHCR(t *testing.T) {
 	wantImages := map[string]string{
 		"lfm3-1.7b":      pinnedImage(lfm31_7bRepo, lfm31_7bDigest),
-		"lfm3-vl-2b":     "ghcr.io/cathedralai/room-lfm3-vl-2b:unpublished",
-		"lfm3-omni-2b":   "ghcr.io/cathedralai/room-lfm3-omni-2b:unpublished",
-		"d1-2b":          "ghcr.io/cathedralai/room-d1-2b:unpublished",
-		"lfm3-audio-2b":  "ghcr.io/cathedralai/room-lfm3-audio-2b:unpublished",
-		"d1-omni-2b":     "ghcr.io/cathedralai/room-d1-omni-2b:unpublished",
-		"lfm3-1.7b-base": "ghcr.io/cathedralai/room-lfm3-1.7b-base:unpublished",
+		"lfm3-vl-2b":     pinnedImage("ghcr.io/cathedralai/room-lfm3-vl-2b", "sha256:ad586f04ff7aca83d82355ee5df960497b569c6a4ca198741a25b054627140f5"),
+		"lfm3-omni-2b":   pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:3b1f0900656856de8511adb09b9816c740cd33f4df5b5c32a6596b794b2611ff"),
+		"d1-2b":          pinnedImage("ghcr.io/cathedralai/room-d1-2b", "sha256:2e92f09e8572f34d1ef27b8f7835410dba9f221ad994f8f3e004c5c4f4512f3c"),
+		"lfm3-audio-2b":  pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:6058d091f4ed9f3770da38b68ce5237a33e05bcf3037f5a2e5eef2b45d212a49"),
+		"d1-omni-2b":     pinnedImage("ghcr.io/cathedralai/room-d1-omni-2b", "sha256:17791b80a0e21005321754439c219712274541561bcb83848794a33c16f90002"),
+		"lfm3-1.7b-base": pinnedImage("ghcr.io/cathedralai/room-lfm3-1.7b-base", "sha256:c7fc0f7f5ee18e915b1086fab27d076c391a408085efdd89cb89cb10e4623278"),
 	}
 	for name, image := range wantImages {
 		tpl, ok := templateByName(name)
 		if !ok {
 			t.Fatalf("missing template %s", name)
 		}
-		if !tpl.SealedOnly || tpl.Sealed != sealedPending {
-			t.Fatalf("%s: sealed_only=%v sealed=%s", name, tpl.SealedOnly, tpl.Sealed)
+		wantSealed := sealedPending
+		if name == "lfm3-1.7b" {
+			wantSealed = sealedReady // prefetched on every shared sealed hotel, 29 Oct 2026
+		}
+		if !tpl.SealedOnly || tpl.Sealed != wantSealed || !tpl.Live {
+			t.Fatalf("%s: sealed_only=%v sealed=%s live=%v", name, tpl.SealedOnly, tpl.Sealed, tpl.Live)
+		}
+		if name != "lfm3-1.7b" && (tpl.CPU != 2 || tpl.MemoryGiB != 4 || tpl.Rate != "0.035") {
+			t.Fatalf("%s must use the sealed 2 vCPU / 4 GiB shape at $0.035: %+v", name, tpl)
 		}
 		if tpl.Image != image {
 			t.Fatalf("%s image %q want %q", name, tpl.Image, image)
@@ -142,8 +149,8 @@ func TestLFM3SuiteCatalogIsSealedOnlyAndGHCR(t *testing.T) {
 		}
 	}
 	d1, _ := templateByName("d1-2b")
-	if d1.MemoryGiB != 8 || !strings.Contains(d1.Description, "llama.cpp") {
-		t.Fatalf("d1-2b should be GGUF on llama.cpp at 8 GiB: %+v", d1)
+	if d1.MemoryGiB != 4 || !strings.Contains(d1.Description, "llama.cpp") {
+		t.Fatalf("d1-2b should be GGUF on llama.cpp at 4 GiB: %+v", d1)
 	}
 }
 
@@ -152,7 +159,7 @@ func TestCatalogAdvertisesLFM3LiveAndSealedPending(t *testing.T) {
 	_, cat := tc.clientCall(t, "GET", "/v1/sandboxes/catalog", nil, nil)
 	byName := catalogByName(t, cat)
 	lfm := byName["lfm3-1.7b"]
-	if lfm["live"] != true || lfm["sealed"] != "pending" || lfm["sealed_only"] != true {
+	if lfm["live"] != true || lfm["sealed"] != "ready" || lfm["sealed_only"] != true {
 		t.Fatalf("lfm3 catalog: %v", lfm)
 	}
 	if lfm["hardware_class"] != sealedHardwareClass {
@@ -161,8 +168,8 @@ func TestCatalogAdvertisesLFM3LiveAndSealedPending(t *testing.T) {
 	if lfm["image"] != pinnedImage(lfm31_7bRepo, lfm31_7bDigest) {
 		t.Fatalf("catalog image: %v", lfm["image"])
 	}
-	if byName["lfm3-vl-2b"]["live"] != false || byName["lfm3-vl-2b"]["sealed"] != "pending" {
-		t.Fatalf("unpublished catalog: %v", byName["lfm3-vl-2b"])
+	if byName["lfm3-vl-2b"]["live"] != true || byName["lfm3-vl-2b"]["sealed"] != "pending" {
+		t.Fatalf("published but not prefetched catalog: %v", byName["lfm3-vl-2b"])
 	}
 	if byName["room-1x4"]["sealed_only"] != nil {
 		t.Fatalf("room-1x4 must not be sealed-only: %v", byName["room-1x4"])
