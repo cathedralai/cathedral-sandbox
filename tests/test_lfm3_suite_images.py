@@ -62,7 +62,7 @@ def test_catalog_names_match_suite_images() -> None:
             for line in env.splitlines()
             if line.startswith("IMAGE_NAME=")
         )
-        # #363: suite images are published digests, still sealed pending until prefetch.
+        # #363 pinned the published digests; #364 marks them sealed ready after the 29 Oct prefetch.
         assert f"ghcr.io/cathedralai/{image_name}:unpublished" not in catalog
         assert f"ghcr.io/cathedralai/{image_name}" in catalog
         assert "sha256:" in catalog

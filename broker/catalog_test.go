@@ -86,12 +86,12 @@ func TestLFM3CreateHasNoUnsealedPath(t *testing.T) {
 }
 
 func TestLFM3PendingErrorDoesNotOfferUnsealed(t *testing.T) {
-	tc := newChain(t)
-	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "lfm3-vl-2b"}), nil)
-	if status != 503 || errDetail(doc) != "template_sealed_pending" {
-		t.Fatalf("pending: %d %v", status, doc)
+	pending := catalogTemplate{Name: "lfm3-next", Live: true, Sealed: sealedPending, SealedOnly: true}
+	e := templateCreateErr(pending, false, false)
+	if e == nil || e.status != 503 || e.code != "template_sealed_pending" {
+		t.Fatalf("pending: %+v", e)
 	}
-	msg := errMessage(doc)
+	msg := e.msg
 	if strings.Contains(strings.ToLower(msg), "standard") || strings.Contains(msg, "sealed\": false") || strings.Contains(msg, "without sealed") {
 		t.Fatalf("pending error still offers an unsealed path: %q", msg)
 	}
@@ -100,19 +100,20 @@ func TestLFM3PendingErrorDoesNotOfferUnsealed(t *testing.T) {
 	}
 }
 
-func TestUnpublishedLFM3SuiteIsNotCreated(t *testing.T) {
+func TestLFM3SuiteCreatesLandOnTheSealedHotelOnly(t *testing.T) {
 	tc := newChain(t)
 	for _, name := range []string{"lfm3-1.7b-base", "lfm3-vl-2b", "lfm3-audio-2b", "lfm3-omni-2b", "d1-2b", "d1-omni-2b"} {
-		status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": name}), nil)
-		if status != 503 {
+		status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"template": name})
+		if status >= 300 {
 			t.Fatalf("%s: %d %v", name, status, doc)
 		}
-		if errDetail(doc) != "template_unavailable" && errDetail(doc) != "template_sealed_pending" {
-			t.Fatalf("%s: %d %v", name, status, doc)
+		status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"template": name, "sealed": false})
+		if status != 409 || errCode(doc) != "template_sealed_only" {
+			t.Fatalf("%s sealed false: %d %v", name, status, doc)
 		}
 	}
-	if n := createsOn(tc); n["a"]+n["b"]+n["c"] != 0 {
-		t.Fatalf("unpublished template reached a hotel: %v", n)
+	if n := createsOn(tc); n["a"] != 6 || n["b"]+n["c"] != 0 {
+		t.Fatalf("suite creates must land on the sealed hotel only: %v", n)
 	}
 }
 
@@ -131,10 +132,7 @@ func TestLFM3SuiteCatalogIsSealedOnlyAndGHCR(t *testing.T) {
 		if !ok {
 			t.Fatalf("missing template %s", name)
 		}
-		wantSealed := sealedPending
-		if name == "lfm3-1.7b" {
-			wantSealed = sealedReady // prefetched on every shared sealed hotel, 29 Oct 2026
-		}
+		wantSealed := sealedReady // every LFM3 image is prefetched on the shared sealed hotels, 29 Oct 2026
 		if !tpl.SealedOnly || tpl.Sealed != wantSealed || !tpl.Live {
 			t.Fatalf("%s: sealed_only=%v sealed=%s live=%v", name, tpl.SealedOnly, tpl.Sealed, tpl.Live)
 		}
@@ -168,8 +166,8 @@ func TestCatalogAdvertisesLFM3LiveAndSealedPending(t *testing.T) {
 	if lfm["image"] != pinnedImage(lfm31_7bRepo, lfm31_7bDigest) {
 		t.Fatalf("catalog image: %v", lfm["image"])
 	}
-	if byName["lfm3-vl-2b"]["live"] != true || byName["lfm3-vl-2b"]["sealed"] != "pending" {
-		t.Fatalf("published but not prefetched catalog: %v", byName["lfm3-vl-2b"])
+	if byName["lfm3-vl-2b"]["live"] != true || byName["lfm3-vl-2b"]["sealed"] != "ready" {
+		t.Fatalf("prefetched suite catalog: %v", byName["lfm3-vl-2b"])
 	}
 	if byName["room-1x4"]["sealed_only"] != nil {
 		t.Fatalf("room-1x4 must not be sealed-only: %v", byName["room-1x4"])
