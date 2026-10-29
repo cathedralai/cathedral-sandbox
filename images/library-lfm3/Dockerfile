@@ -80,8 +80,8 @@ ARG TEXTARENA_OFFLINE=""
 RUN if [ "${TEXTARENA_OFFLINE}" = 1 ]; then \
       python -m nltk.downloader --quiet --exit-on-error -d /usr/share/nltk_data words averaged_perceptron_tagger_eng \
       && module="$(python -c 'import textarena_env.server.environment as m; print(m.__file__)')" \
-      && grep -q '^_NLTK_DOWNLOADED = False$' "$module" \
-      && sed -i 's/^_NLTK_DOWNLOADED = False$/_NLTK_DOWNLOADED = True/' "$module" \
+      && grep -Eq '^_NLTK_DOWNLOADED(: bool)? = False$' "$module" \
+      && sed -i -E 's/^(_NLTK_DOWNLOADED(: bool)?) = False$/\1 = True/' "$module" \
       && rm -f "$(dirname "$module")"/__pycache__/environment.*.pyc \
       && python -c 'import nltk, textarena_env.server.environment as m; assert m._NLTK_DOWNLOADED; nltk.data.find("corpora/words"); nltk.data.find("taggers/averaged_perceptron_tagger_eng")'; \
     fi
