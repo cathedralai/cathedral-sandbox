@@ -28,6 +28,10 @@ if [ "${SEALED_MINER:-0}" = 1 ]; then
 else
   [ -r "$SEALED_API_KEY_FILE" ] || { echo "hotel key file $SEALED_API_KEY_FILE missing (the kit does not make keys)" >&2; exit 1; }
 fi
+# Dedicated machine: the owner's raw 32-byte Ed25519 public key (launch-guest.sh).
+if [ -n "${SEALED_OWNER_PUBKEY_FILE:-}" ]; then
+  [ "$(stat -c %s "$SEALED_OWNER_PUBKEY_FILE" 2>/dev/null)" = 32 ] || { echo "SEALED_OWNER_PUBKEY_FILE $SEALED_OWNER_PUBKEY_FILE must hold the 32 raw bytes of an Ed25519 public key" >&2; exit 1; }
+fi
 mkdir -p "$SEALED_DIR/images" "$SEALED_DIR/run"
 FREE_GIB=$(( $(df -B1 --output=avail "$SEALED_DIR" | tail -1) / 1073741824 ))
 HAVE_GIB=0; [ -f "$SEALED_DIR/scratch.raw" ] && HAVE_GIB=$(( $(du -B1 "$SEALED_DIR/scratch.raw" | cut -f1) / 1073741824 ))
@@ -152,6 +156,8 @@ GOT=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["binding"][
 cp "$ATT" "$IMG/attestation-$(date -u +%Y%m%dT%H%M%SZ).json"
 if [ "$GOT" = "$EXPECTED" ]; then
   log "measurement matches the build: $GOT"
+  # A dedicated machine's HOST_DATA names its owner: add it to the broker's sealed_host_data.
+  log "$(python3 -c 'import json,sys;b=json.load(open(sys.argv[1]))["binding"];print("tenancy", b.get("tenancy"), "host_data", b["host_data"])' "$ATT")"
   # Boot the guest again at the next host start (an unattended reboot left
   # sealed guests off until a manual start). Only a verified image is enabled.
   systemctl enable -q "$UNIT"

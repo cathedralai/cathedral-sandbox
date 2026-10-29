@@ -39,6 +39,14 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      from the guest itself, takes the peer SPKI from that connection, and also
      checks GET /room/hotel-key-install-key: signed by the binding's receipt
      key, for this binding, and the X25519 key the binding names.
+  8. owner (--owner-pubkey <base64 of the 32-byte Ed25519 key>): a dedicated
+     machine of that owner. The binding says tenancy "dedicated" and names
+     that key; the report's HOST_DATA (chip-signed, fixed at launch) equals
+     sha256("cathedral-dedicated-v1\0" || manifest_sha256 || key), with
+     manifest_sha256 from the binding; and each successful create receipt
+     carries an owner signature that verifies with the key. Pair it with
+     --expected-measurement: the measurement is what proves the guest runs
+     the build whose front refuses creates the owner did not sign.
 
 Not checked here (by design, today): that the measurement is an approved image.
 Image approval is a signed policy release; that is a later step.
@@ -47,6 +55,7 @@ Usage:
   verify_receipts.py --attestation att.json --receipts chain.json [--receipt-header B64 ...]
   verify_receipts.py --broker https://<broker> --key-file KEY --hotel <hotel id> [--sandbox ID]
   verify_receipts.py --origin https://<miner ip>:<port> --require-sealed [--expected-measurement M]
+  add --owner-pubkey B64 --expected-measurement HEX for a dedicated machine
 """
 from __future__ import annotations
 
@@ -77,6 +86,7 @@ INSTALL_ALGORITHM = "x25519-hkdf-sha256-aes256gcm-v1"
 INSTALL_PURPOSE = "hotel-key-install"
 HEX64 = re.compile(r"[0-9a-f]{64}")
 ORIGIN_MAX_BYTES = 64 * 1024
+DEDICATED_HOST_DATA_DOMAIN = b"cathedral-dedicated-v1\0"
 
 
 def canonical(doc) -> bytes:
@@ -331,6 +341,62 @@ def fetch_origin(origin: str, paths: list[str], timeout: float = 30.0) -> tuple[
         conn.close()
 
 
+def owner_key_bytes(owner_b64: str) -> bytes:
+    try:
+        key = base64.b64decode(owner_b64.strip(), validate=True)
+    except ValueError as exc:
+        raise Fail("--owner-pubkey is not base64") from exc
+    need(len(key) == 32, f"--owner-pubkey is {len(key)} bytes, expected a 32-byte Ed25519 public key")
+    return key
+
+
+def verify_owner(att: dict, owner: bytes) -> dict:
+    """The binding and the chip-signed HOST_DATA name this owner (check 8).
+
+    Run after verify_attestation, which checks the report against the
+    binding and REPORT_DATA against the binding's sha256.
+    """
+    binding = att["binding"]
+    need(binding.get("tenancy") == "dedicated",
+         f"the binding says tenancy {binding.get('tenancy')!r}, not \"dedicated\": other customers may share this machine")
+    try:
+        named = base64.b64decode(binding.get("owner_ed25519_b64") or "", validate=True)
+    except ValueError as exc:
+        raise Fail("the binding's owner_ed25519_b64 is not base64") from exc
+    need(named == owner, "the binding names another owner key")
+    manifest = binding.get("manifest_sha256") or ""
+    need(isinstance(manifest, str) and len(manifest) == 64, "the binding has no manifest_sha256")
+    try:
+        manifest_raw = bytes.fromhex(manifest)
+    except ValueError as exc:
+        raise Fail("the binding's manifest_sha256 is not hex") from exc
+    rep = parse_report(base64.b64decode(att["report_b64"]))
+    want = hashlib.sha256(DEDICATED_HOST_DATA_DOMAIN + manifest_raw + owner).hexdigest()
+    need(rep["host_data"] == want, "report HOST_DATA does not commit to this owner key and manifest")
+    return {"tenancy": "dedicated", "owner_ed25519_b64": base64.b64encode(owner).decode(),
+            "manifest_sha256": manifest, "host_data": rep["host_data"]}
+
+
+def owner_signed_creates(receipts: list[dict], owner: bytes) -> int:
+    """Every successful create receipt carries a valid owner signature (check 8)."""
+    key = Ed25519PublicKey.from_public_bytes(owner)
+    n = 0
+    for rc in receipts:
+        st = rc["statement"]
+        if st.get("action") != "create" or not 200 <= int(st.get("status") or 0) < 300:
+            continue
+        seq = st.get("sequence")
+        ts, digest, sig = st.get("owner_timestamp"), st.get("owner_request_sha256"), st.get("owner_signature_b64")
+        need(isinstance(ts, int) and isinstance(digest, str) and isinstance(sig, str),
+             f"receipt {seq}: a create with no owner signature")
+        try:
+            key.verify(base64.b64decode(sig, validate=True), f"cathedral-owner-create-v1\n{ts}\n{digest}".encode())
+        except (InvalidSignature, ValueError) as exc:
+            raise Fail(f"receipt {seq}: the owner signature does not verify") from exc
+        n += 1
+    return n
+
+
 def verify_receipts(att: dict, receipts: list[dict], head: str | None = None) -> dict:
     binding = att["binding"]
     bsha = att["binding_sha256"]
@@ -456,6 +522,7 @@ def main() -> int:
     ap.add_argument("--kds-cache", default=os.path.expanduser("~/.cache/amd-kds"))
     ap.add_argument("--skip-amd", action="store_true", help="skip the AMD chain (offline smoke test only)")
     ap.add_argument("--require-sealed", action="store_true", help="fail unless the hotel answers an SEV-SNP binding")
+    ap.add_argument("--owner-pubkey", help="base64 Ed25519 public key: fail unless this is a dedicated machine of this owner")
     ap.add_argument("--save", help="with --broker: write the fetched attestation and receipts here")
     ap.add_argument("--tls-spki-sha256", help="SPKI sha256 of the TLS peer that served the attestation; "
                                               "fails unless the binding names this key")
@@ -497,7 +564,8 @@ def main() -> int:
         head = doc.get("head") if whole else None
         for h in a.receipt_header:
             receipts.append(json.loads(base64.urlsafe_b64decode(h + "=" * (-len(h) % 4))))
-        sealed_asked = a.require_sealed or a.expected_measurement or a.ark_sha256 or a.product
+        owner = owner_key_bytes(a.owner_pubkey) if a.owner_pubkey else None
+        sealed_asked = a.require_sealed or a.expected_measurement or a.ark_sha256 or a.product or owner
         if is_hotel_level(att) and sealed_asked:
             # A sealed guest whose TSM is missing runs level 1 under the same
             # hotel name. Asking for a measurement means asking for SNP.
@@ -514,6 +582,9 @@ def main() -> int:
                     need(install_doc is not None, "the hotel did not answer GET /room/hotel-key-install-key")
                     guest_tls["install_key_checked"] = verify_install_key(install_doc, att) is not None
                 attestation_out["guest_tls"] = guest_tls
+            if owner is not None:
+                attestation_out["owner"] = verify_owner(att, owner)
+                attestation_out["owner"]["signed_creates"] = owner_signed_creates(receipts, owner)
         out = {"attestation": attestation_out,
                "chain": verify_receipts(att, receipts, head),
                "policy_timeline": policy_timeline(receipts), "room_tunables": room_tunables(receipts), "verdict": "PASS",
