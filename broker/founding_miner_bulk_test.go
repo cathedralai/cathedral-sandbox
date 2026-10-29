@@ -8,7 +8,7 @@ import (
 // This exercises the broker side after an operator has supplied a room service
 // and its key for each machine. It does not simulate the signed-roster watcher.
 func TestSealedMinerHotelsReceiveDynamicCustomerWork(t *testing.T) {
-	for _, count := range []int{20, 32} {
+	for _, count := range []int{20, 32, 256} {
 		t.Run(fmt.Sprintf("miners-%d", count), func(t *testing.T) {
 			tc := newChainState(t, t.TempDir())
 			if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{
@@ -21,7 +21,16 @@ func TestSealedMinerHotelsReceiveDynamicCustomerWork(t *testing.T) {
 			}
 			for i := 0; i < count; i++ {
 				id := fmt.Sprintf("miner-%02d", i)
-				joinMiner(t, tc, id, true, 1, map[string]any{"max_slots": 1})
+				miner, url := newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: byte(i)}))
+				tc.hotels[id] = miner.fakeHotel
+				status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+					"id": id, "api": url, "key": joinKey, "sealed": true,
+					"miner_hotkey": minerHotkey, "max_slots": 1,
+				})
+				if status != 201 {
+					t.Fatalf("join %s: %d %v", id, status, doc)
+				}
+				syncNow(tc, id)
 				if a := admissionOf(t, tc, id); a["state"] != "admitted" {
 					t.Fatalf("%s admission: %v", id, a)
 				}
