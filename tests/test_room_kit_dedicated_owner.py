@@ -126,6 +126,21 @@ def test_level1_binding_is_unchanged(tmp_path, monkeypatch) -> None:
     assert "tenancy" not in ledger.binding
 
 
+def test_a_dedicated_miner_hotel_names_the_owner_and_its_tls_key(tmp_path, monkeypatch) -> None:
+    # Miner mode (#366) and the owner check build one binding; REPORT_DATA covers both.
+    m = Machine(tmp_path, monkeypatch)
+    signer = base64.b64encode(_raw_pub(Ed25519PrivateKey.generate())).decode()
+    ledger = rr.Ledger("dedicated-1", str(m.store), miner=rr.MinerHotel("dedicated-1", rr.parse_install_signers(signer)))
+    b = ledger.binding
+    assert ledger.owner_key == m.pub and b["tenancy"] == "dedicated"
+    assert b["tls_spki_sha256"] == ledger.miner.tls_spki_sha256
+    assert ledger.report[0x50:0x90] == bytes.fromhex(ledger.binding_sha256) + bytes(32)
+    # A key the report does not name still stops a miner hotel.
+    other = Machine(tmp_path / "other", monkeypatch, host_data=bytes(32))
+    with pytest.raises(rr.OwnerBindingError):
+        rr.Ledger("dedicated-1", str(other.store), miner=rr.MinerHotel("dedicated-1", rr.parse_install_signers(signer)))
+
+
 @pytest.mark.parametrize("case", ["shared_host_data", "other_key", "other_manifest", "short_key", "no_manifest"])
 def test_an_owner_key_the_report_does_not_name_fails_closed(tmp_path, monkeypatch, case) -> None:
     other = _raw_pub(Ed25519PrivateKey.generate())
