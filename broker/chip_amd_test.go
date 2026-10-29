@@ -301,6 +301,78 @@ func TestMinerHotkeyCapRefusesNextMachine(t *testing.T) {
 	}
 }
 
+func TestMinerGlobalCapCountsAllHotkeysAndDrainingHotels(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	otherHotkey := strings.Repeat("7", len(minerHotkey))
+	tc.b.cfg.MinerHotkeyCaps[minerHotkey] = 2
+	tc.b.cfg.MinerHotkeyCaps[otherHotkey] = 2
+	tc.b.cfg.MinerMaxHotels = 2
+	joinMiner(t, tc, "m1", true, 1, nil)
+	joinMiner(t, tc, "m2", true, 1, map[string]any{"miner_hotkey": otherHotkey})
+	_, url := newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: chipOf("m3")}))
+	third := map[string]any{"id": "m3", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey}
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", third); status != 409 || errCode(doc) != "miner_global_cap_reached" {
+		t.Fatalf("global cap across hotkeys: %d %v", status, doc)
+	}
+	if status, _ := tc.call(t, "operator-key", "PATCH", "/v1/broker/hotels/m1", map[string]any{"drain": true}); status != 200 {
+		t.Fatalf("drain first miner: %d", status)
+	}
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", third); status != 409 || errCode(doc) != "miner_global_cap_reached" {
+		t.Fatalf("draining miner freed cap: %d %v", status, doc)
+	}
+	if status, _ := tc.call(t, "operator-key", "DELETE", "/v1/broker/hotels/m1", nil); status != 204 {
+		t.Fatalf("leave first miner: %d", status)
+	}
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", third); status != 201 {
+		t.Fatalf("replacement under global cap: %d %v", status, doc)
+	}
+	tc.b.cfg.MinerMaxHotels = 0
+	_, url = newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: chipOf("m4")}))
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+		"id": "m4", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": otherHotkey,
+	}); status != 403 || errCode(doc) != "miner_global_cap_unset" {
+		t.Fatalf("unset global cap allowed miner: %d %v", status, doc)
+	}
+}
+
+func TestConcurrentMinerJoinsRespectGlobalCap(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	otherHotkey := strings.Repeat("7", len(minerHotkey))
+	tc.b.cfg.MinerHotkeyCaps[minerHotkey] = 8
+	tc.b.cfg.MinerHotkeyCaps[otherHotkey] = 8
+	tc.b.cfg.MinerMaxHotels = 3
+	const n = 8
+	urls := make([]string, n)
+	for i := range urls {
+		_, urls[i] = newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: byte(i + 1)}))
+	}
+	var wg sync.WaitGroup
+	results := make(chan string, n)
+	for i := range urls {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			hotkey := minerHotkey
+			if i%2 == 1 {
+				hotkey = otherHotkey
+			}
+			status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+				"id": fmt.Sprintf("global-%d", i), "api": urls[i], "key": joinKey, "sealed": true, "miner_hotkey": hotkey,
+			})
+			results <- fmt.Sprintf("%d:%s", status, errCode(doc))
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	counts := map[string]int{}
+	for outcome := range results {
+		counts[outcome]++
+	}
+	if counts["201:"] != 3 || counts["409:miner_global_cap_reached"] != n-3 {
+		t.Fatalf("concurrent global cap outcomes: %v", counts)
+	}
+}
+
 func TestLegacyUnsealedMinerCannotTakeRooms(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	h := newHotel(hotelConfig{ID: "old-miner", MinerHotkey: minerHotkey, MaxSlots: 5}, joinKey)

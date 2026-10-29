@@ -100,6 +100,9 @@ type config struct {
 	// MinerHotkeyCaps is the operator-approved maximum number of joined hotels
 	// per miner hotkey. Miner joins without an entry are refused.
 	MinerHotkeyCaps map[string]int `json:"miner_hotkey_caps,omitempty"`
+	// MinerMaxHotels is the operator-approved maximum across all miner hotkeys.
+	// Zero refuses miner joins; pending and draining hotels count.
+	MinerMaxHotels int `json:"miner_max_hotels,omitempty"`
 	// Admission of joined hotels (admission.go). SealedAdmission "off" turns
 	// the attestation gate off for operator hotels, never miner hotels.
 	SealedAdmission    string   `json:"sealed_admission,omitempty"`
@@ -297,6 +300,9 @@ func loadBroker(path string) (*broker, error) {
 		if !ss58RE.MatchString(hotkey) || cap < 1 {
 			return nil, fmt.Errorf("config: miner_hotkey_caps requires an SS58 hotkey and a positive machine cap")
 		}
+	}
+	if c.MinerMaxHotels < 0 {
+		return nil, errors.New("config: miner_max_hotels must be positive when miner hotels are allowed")
 	}
 	b := &broker{cfg: c, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), started: time.Now()}
 	for _, hc := range c.Hotels {

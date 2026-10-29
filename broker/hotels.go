@@ -42,8 +42,10 @@ type hotelSet struct {
 }
 
 var (
-	errMinerNotApproved = errors.New("miner hotkey is not approved for broker hotels")
-	errMinerCapReached  = errors.New("miner hotkey hotel cap reached")
+	errMinerNotApproved      = errors.New("miner hotkey is not approved for broker hotels")
+	errMinerCapReached       = errors.New("miner hotkey hotel cap reached")
+	errMinerGlobalCapUnset   = errors.New("miner global hotel cap is not configured")
+	errMinerGlobalCapReached = errors.New("miner global hotel cap reached")
 )
 
 func (b *broker) hotelList() []*hotel {
@@ -132,9 +134,15 @@ func (b *broker) addHotel(h *hotel) error {
 		if cap < 1 {
 			return errMinerNotApproved
 		}
-		used := 0
+		if b.cfg.MinerMaxHotels < 1 {
+			return errMinerGlobalCapUnset
+		}
+		used, total := 0, 0
 		if old != nil {
 			for _, existing := range old.list {
+				if existing.cfg.MinerHotkey != "" {
+					total++
+				}
 				if existing.cfg.MinerHotkey == hotkey {
 					used++
 				}
@@ -142,6 +150,9 @@ func (b *broker) addHotel(h *hotel) error {
 		}
 		if used >= cap {
 			return fmt.Errorf("%w (%d)", errMinerCapReached, cap)
+		}
+		if total >= b.cfg.MinerMaxHotels {
+			return fmt.Errorf("%w (%d)", errMinerGlobalCapReached, b.cfg.MinerMaxHotels)
 		}
 	}
 	next := &hotelSet{byID: map[string]*hotel{}}
@@ -393,6 +404,14 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		}
 		if errors.Is(err, errMinerCapReached) {
 			writeErr(w, 409, "miner_cap_reached", err.Error())
+			return
+		}
+		if errors.Is(err, errMinerGlobalCapUnset) {
+			writeErr(w, 403, "miner_global_cap_unset", err.Error())
+			return
+		}
+		if errors.Is(err, errMinerGlobalCapReached) {
+			writeErr(w, 409, "miner_global_cap_reached", err.Error())
 			return
 		}
 		writeErr(w, 409, "hotel_exists", err.Error())

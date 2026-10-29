@@ -234,7 +234,7 @@ func TestMinerEnrollerCapacityIsScopedAndReportsUnmetTLSPin(t *testing.T) {
 	}
 	measurements, _ := policy["sealed_measurements"].([]any)
 	caps, _ := policy["miner_hotkey_caps"].(map[string]any)
-	if len(measurements) == 0 || caps[minerHotkey] != float64(256) {
+	if len(measurements) == 0 || caps[minerHotkey] != float64(256) || policy["miner_max_hotels"] != float64(256) {
 		t.Fatalf("scoped policy lacks the broker allowlist or cap: %v", policy)
 	}
 	status, operator := tc.call(t, "operator-key", "GET", "/v1/broker/capacity", nil)

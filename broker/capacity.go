@@ -311,6 +311,7 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 			"amd_verifier":        b.cfg.AMDVerifier != nil,
 			"sealed_measurements": append([]string{}, b.cfg.SealedMeasurements...),
 			"miner_hotkey_caps":   b.cfg.MinerHotkeyCaps,
+			"miner_max_hotels":    b.cfg.MinerMaxHotels,
 			"miner_tls_pin":       false,
 		}
 	}
