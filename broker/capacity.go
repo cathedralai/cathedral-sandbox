@@ -23,6 +23,8 @@
 // denied and does not see it in the catalog; its owner reaches it through its
 // own policy or hotel list as before. PATCH "reserved_for": null releases it
 // to the pool: from then on every policy matches it by class and label.
+// PATCH "lend": true lends an idle reserved sealed hotel to the pool until a
+// reclaim after a re-seal; the owner does not reach it meanwhile (lend.go).
 //
 // GET /v1/broker/capacity lists the capacity the caller can reach: every
 // hotel for the operator key, the hotels the guest's policy reaches (with
@@ -170,7 +172,7 @@ func (p *guestPolicy) validate() error {
 // capacity catalog both use it, so the catalog never lists a hotel with free
 // rooms that the placer would refuse. Caller holds b.mu.
 func (b *broker) admissibleFree(h *hotel, now time.Time) int {
-	if !h.ok || h.leaving || h.drain() || now.Before(h.backoffUntil) || !b.admitted(h, now) {
+	if !h.ok || h.leaving || h.drain() || now.Before(h.backoffUntil) || !b.admitted(h, now) || b.awaitsRoomCheck(h) {
 		return 0
 	}
 	if f := b.freeFor(h); f > 0 {
@@ -247,7 +249,7 @@ func (b *broker) addTotals(t map[string]*classTotals, e capacityEntry, now time.
 	switch {
 	case h.drain():
 		c.Draining++
-	case h.ok && !b.admitted(h, now):
+	case h.ok && (!b.admitted(h, now) || b.awaitsRoomCheck(h)):
 		c.Pending++
 	case h.ok && !now.Before(h.backoffUntil):
 		c.Placeable++
@@ -271,7 +273,13 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 			continue
 		}
 		if g == nil {
-			out = append(out, b.capacityDoc(e, now))
+			d := b.capacityDoc(e, now)
+			var lent any // operator view only: a guest never sees whose hotel it is
+			if l := e.h.lentFrom(); l != "" {
+				lent = l
+			}
+			d["lent_from"] = lent
+			out = append(out, d)
 			b.addTotals(totals, e, now)
 			continue
 		}

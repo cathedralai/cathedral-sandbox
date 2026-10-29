@@ -65,8 +65,12 @@ type placement struct {
 	policy *guestPolicy
 	tier   string
 	// guest: the guest id (set by scope). A hotel reserved for another
-	// guest never matches; an empty guest matches no reserved hotel.
+	// guest never matches; an empty guest matches no reserved hotel. A hotel
+	// lent from this guest never matches either (lend.go).
 	guest string
+	// noLent: a workspace create. A lent hotel is destroyed at reclaim, so it
+	// never holds a workspace (lend.go).
+	noLent bool
 }
 
 func (pl placement) selects(h *hotel) bool {
@@ -83,6 +87,9 @@ func (pl placement) selects(h *hotel) bool {
 		return false
 	}
 	if r := h.reservedFor(); r != "" && r != pl.guest {
+		return false
+	}
+	if l := h.lentFrom(); l != "" && (l == pl.guest || pl.noLent) {
 		return false
 	}
 	if pl.policy != nil {
@@ -180,7 +187,7 @@ func (b *broker) noRoomReason(pl placement) createResult {
 			draining++
 		case now.Before(h.backoffUntil):
 			resting++
-		case !b.admitted(h, now):
+		case !b.admitted(h, now) || b.awaitsRoomCheck(h):
 			pending++
 		case b.freeFor(h) > 0:
 			free++
@@ -259,6 +266,9 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 		pl.ids = map[string]bool{}
 		for _, x := range list {
 			id, _ := x.(string)
+			if h := b.hotelByID(id); h != nil && h.lentFrom() == g.cfg.ID {
+				return pl, errHotelLent(id)
+			}
 			if b.hotelByID(id) == nil || !g.limitsAllow(b, id) {
 				return pl, &apiErr{409, "unknown_hotel", fmt.Sprintf("no hotel %q", fmt.Sprint(x))}
 			}
@@ -310,6 +320,9 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 		if pl.selects(h) {
 			return pl, nil
 		}
+	}
+	if b.lentAway(pl) {
+		return pl, &apiErr{403, "hotel_lent", "the hotels that match are lent to the pool; your rooms go to your other hotels until they are reclaimed"}
 	}
 	return pl, &apiErr{409, "no_matching_hotel", "no hotel matches the hotel selection"}
 }
@@ -364,7 +377,7 @@ func (b *broker) placementFor(ctx context.Context, g *guestState, payload map[st
 func (b *broker) snapshotPlacement(ctx context.Context, g *guestState, payload map[string]any) (placement, *apiErr) {
 	ref, _ := payload["snapshot_id"].(string)
 	pl, e := b.parseSelection(g, payload)
-	if e != nil && !(ref != "" && e.code == "no_matching_hotel") {
+	if e != nil && !(ref != "" && (e.code == "no_matching_hotel" || e.code == "hotel_lent")) {
 		return pl, e
 	}
 	if ref == "" {

@@ -161,13 +161,59 @@ gets 409 `unknown_guest`.
 `nc-sealed` (const today) is the first candidate: the operator sets
 `reserved_for: "const"` on it. This change does not do that.
 
+### Lend and reclaim
+
+An idle reserved sealed hotel can go to the pool and come back only after
+a re-seal (`lend.go`, design in `docs/DEDICATED_SEALED.md`).
+
+- Lend: `PATCH {"lend": true}` on a sealed hotel reserved for guest X, when
+  X has no rooms or creates there (else 409 `owner_rooms_active`). The
+  broker checks the hotel's attestation now and records `lent_from: X` and
+  `lent_report_id` (the SNP REPORT_ID of the running launch), and clears
+  `reserved_for`. Pool guests place there by their policies. X's creates
+  never go there: naming it, or a selection only it matches, gets 403
+  `hotel_lent`; X's other hotels work as before. Workspace creates skip a
+  lent hotel.
+- Reclaim: `PATCH {"reserved_for": "X", "drain": false}` on the lent hotel.
+  It needs no rooms or creates on the hotel (else 409 `rooms_active`: set
+  `drain` first) and a fresh attestation with a REPORT_ID other than
+  `lent_report_id` (else 409 `reseal_required`: destroy and relaunch the
+  sealed machine first). `reserved_for: null` on a lent hotel is 409
+  `hotel_lent`: reclaim is the only way back.
+- Other refusals: 409 `hotel_not_reserved`, 409 `hotel_not_sealed`, 422
+  `attestation_failed` (also for a report with no REPORT_ID), 502
+  `hotel_unreachable`, 400 `invalid_lend` (`lend: false`, or `lend` with
+  `reserved_for`). A refused lend or reclaim applies none of the PATCH. A
+  lend or reclaim that `state_dir` cannot keep answers 500
+  `state_write_failed` and changes nothing.
+- Restart: the lend survives it. A joined hotel keeps `lent_from` and
+  `lent_report_id` in `state_dir/hotels.json`; a hotel from the config file
+  keeps them in `state_dir/hotel-lends.json`, and that state wins over the
+  config file's `reserved_for` at load. Lending a config hotel needs
+  `state_dir` (409 `no_state_dir`). The config file cannot set the lend
+  fields, and a `hotel-lends.json` that does not parse stops the broker. A
+  reclaim removes the entry; the `reserved_for` it sets on a config hotel
+  lasts until restart like any `reserved_for` PATCH, so reclaim to the guest
+  the config file names.
+- Fail closed: a sealed hotel reserved for X whose room list shows a room of
+  another guest (or an unlabeled room) becomes lent from X with
+  `lent_report_id: "unknown"`, and the broker logs `FAIL CLOSED`. X gets
+  `hotel_lent`; pool guests keep placing there. The next attestation
+  records the running launch as the baseline; until then a reclaim is 409
+  `reseal_required`. After a restart a reserved hotel takes no rooms until
+  its first room list (503 `hotels_not_admitted` meanwhile).
+- Reserve: `PATCH {"reserved_for": "X"}` on a sealed hotel is 409
+  `rooms_active` while another guest's room or any create is on it: drain
+  it and wait until they are gone. Otherwise X's creates would land next to
+  those rooms before the next room list.
+
 ### Capacity catalog
 
 `GET /v1/broker/capacity`:
 
 - Operator key: every hotel with `id`, `class`, `labels`, `up`, `drain`,
-  `free_rooms`, `slots`, `reserved_for`, `down_since`, `source` and
-  `admission`, plus `classes`: per class (`sealed`, `unsealed`) the totals
+  `free_rooms`, `slots`, `reserved_for`, `lent_from`, `down_since`, `source`
+  and `admission`, plus `classes`: per class (`sealed`, `unsealed`) the totals
   `hotels`, `joined`, `up`, `placeable`, `pending_admission`, `draining`,
   `slots` and `free_rooms`.
 - Guest key: only the hotels the guest can reach, each with `tier`
@@ -401,9 +447,9 @@ receive this policy document.
 
 | Route (operator key) | What it does |
 |---|---|
-| `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey` and `admission`. |
+| `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey`, `reserved_for`, `lent_from`, `lent_report_id` and `admission` (with `report_id` once attested). |
 | `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?}`. A miner hotel must set `"sealed": true` and use HTTPS with attested guest TLS; the broker pins that key before its first keyed call. `"verify": false` is refused for miners. For operator hotels, the broker calls `GET /v1/status` with the key and checks attestation for sealed hotels; `"verify": false` skips both and joins pending. An unsealed join cannot claim `labels.sealed=true`. `miner_hotkey` (SS58) adds `miner=true` and `miner_hotkey` labels, which a PATCH cannot remove. |
-| `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). An unsealed runtime hotel cannot gain the sealed label. |
+| `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). An unsealed runtime hotel cannot gain the sealed label. `lend: true` lends a reserved sealed hotel to the pool; `reserved_for` on a lent hotel reclaims it (see Lend and reclaim). |
 | `DELETE /v1/broker/hotels/<id>` | Removes a runtime hotel that has no rooms. Drain it first. `?forget_rooms=true` (operator key only, miner hotels only): when the hotel is drained, has been down for 10 minutes and has no create in flight, it asks the old guest once more on its attested key (an answer refuses and starts the 10 minutes again), writes the rooms' `deleted` tombstones to disk, removes the hotel from the runtime list, and only then releases the rooms. A failed write answers 500 and leaves every room, client id and tombstone as before. Otherwise 409 `forget_refused` with the reason. |
 
 The broker keeps runtime hotels in `state_dir/hotels.json` and their keys in
