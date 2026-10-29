@@ -284,9 +284,11 @@ jobs:
             printf '%s\n' "$contract"
             jq -e '.answers.refund.noul > 0.5' <<< "$decision" > /dev/null
           else
+            # 256 tokens as in lfm3-ask: LFM3-Audio-2B reasons before a text
+            # answer (its template has no switch for it), about 60 tokens here.
             chat="$(docker exec smoke sh -c 'curl -fsS "$MODEL_BASE_URL/chat/completions" \
               -H "Content-Type: application/json" -H "Authorization: Bearer $MODEL_API_KEY" \
-              -d "{\"model\": \"$MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"What is 2+2? Answer in one word.\"}], \"max_tokens\": 32, \"temperature\": 0}"')"
+              -d "{\"model\": \"$MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"What is 2+2? Answer in one word.\"}], \"max_tokens\": 256, \"temperature\": 0}"')"
             answer="$(jq -r '.choices[0].message.content' <<< "$chat")"
             contract="chat/completions: ${answer}"
             printf '%s\n' "$contract"

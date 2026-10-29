@@ -67,6 +67,12 @@ lfm3-timing load_ms=812 prompt_tok_s=118.0 gen_tok_s=52.8 wall_ms=1530 threads=2
 Over HTTP, a picture is an `image_url` part with a data URI and a clip an
 `input_audio` part (base64 WAV or MP3), in `/v1/chat/completions`.
 
+LFM3-Audio-2B reasons before a text answer even with `LFM3_REASONING=off`:
+its chat template has no switch for it. The reasoning comes back in
+`reasoning_content`; leave room for it in `max_tokens` (about 60 tokens for
+"What is 2+2?"). Speech recognition (system prompt `Perform ASR in
+English.`) answers directly.
+
 d1 does not generate text. It answers typed questions (`noul`, `choice`,
 `score`) about a state in one forward pass at `$MODEL_BASE_URL/systemone`;
 `/v1/chat/completions` answers 501. `lfm3-decide` wraps it:
