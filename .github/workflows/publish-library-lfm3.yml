@@ -255,8 +255,8 @@ jobs:
         shell: bash
         run: docker logout ghcr.io
 
-  # New GHCR packages start private. After an owner makes them public, run
-  # this with the pins to prove a hotel can pull them with no credentials.
+  # A sealed hotel pulls with no credentials. Run this with the pins to prove
+  # the packages are public (an owner flips any that come up private).
   verify-public:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04

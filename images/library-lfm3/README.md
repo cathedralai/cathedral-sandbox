@@ -78,9 +78,10 @@ TextArena's "already downloaded" flag. The build fails if that flag is gone.
 
 ## Visibility
 
-New GHCR packages start private. A sealed hotel pulls with no credentials, so
-an owner makes each package public, then runs the workflow by hand with the
-pins to check anonymous pull.
+A sealed hotel pulls with no credentials, so every package must be public. The
+four packages came up public, linked to this repository. If a new one comes up
+private, an owner makes it public, then runs the workflow by hand with the pins
+to check anonymous pull.
 
 ## Adding an environment
 
