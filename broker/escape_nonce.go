@@ -176,8 +176,9 @@ func (b *broker) sealEscapePlant(ctx context.Context, h *hotel, req escapePlantR
 // The key is trusted only when the AMD chain passed for this exact binding
 // and the launch measurement is on sealed_measurements. That holds for
 // every hotel kind: joined miners, joined non-miners, and config hotels
-// (which skip the admission loop). Admission still defaults AMD-required
-// to miner hotels only; the plant path reuses checkAttestation /
+// (which skip the admission loop unless they set require_attestation).
+// Admission requires the AMD chain only for miner and require_attestation
+// hotels; the plant path reuses checkAttestation /
 // verifyAMDChain and fails closed if those checks have not passed.
 func (b *broker) escapeReceiptKey(ctx context.Context, h *hotel) ([]byte, string, error) {
 	if b.cfg.AMDVerifier == nil || len(b.cfg.SealedMeasurements) == 0 {
