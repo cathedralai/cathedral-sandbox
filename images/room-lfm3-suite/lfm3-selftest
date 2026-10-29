@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# lfm3-selftest [check ...]: ask this room's model questions with known
+# answers, using the files in /opt/lfm3/test. With no check it runs every
+# check in $LFM3_CHECKS (set per model in the image). Prints each answer and
+# its timing line, then "ok <check>"; exits 1 on the first wrong answer.
+#
+#   text          lfm3-ask "What is 2+2? Answer in one word."      4
+#   raw           lfm3-ask --raw "The capital of France is"        Paris
+#   image         lfm3-ask --image test-image.png, circle color    blue
+#   audio         lfm3-ask --audio test-speech.wav, ASR            Paris
+#   decide-text   lfm3-decide, refund request (noul)               yes
+#   decide-image  lfm3-decide --image test-image.png, circle color blue
+#   decide-audio  lfm3-decide --audio test-speech.wav, train city  paris
+#
+# test-speech.wav says "The train to Paris leaves at nine in the morning."
+set -euo pipefail
+
+dir=${LFM3_TEST_DIR:-/opt/lfm3/test}
+checks=("$@")
+if [ "${#checks[@]}" -eq 0 ]; then
+  read -r -a checks <<<"${LFM3_CHECKS:-}"
+fi
+if [ "${#checks[@]}" -eq 0 ]; then
+  echo "lfm3-selftest: no checks (set LFM3_CHECKS or name them)" >&2
+  exit 2
+fi
+
+# The answer is every line but the last (the timing line).
+answer_is() { # check pattern output
+  printf '%s\n' "$3"
+  if sed '$d' <<<"$3" | grep -Eiq "$2"; then
+    echo "ok $1"
+  else
+    echo "FAIL $1: the answer does not match /$2/"
+    exit 1
+  fi
+}
+
+decision_is() { # check jq-filter output
+  printf '%s\n' "$3"
+  if head -n 1 <<<"$3" | jq -e "$2" >/dev/null; then
+    echo "ok $1"
+  else
+    echo "FAIL $1: the answers do not satisfy $2"
+    exit 1
+  fi
+}
+
+refund='{"state": "I was charged twice this month, please refund one of them.",
+  "questions": {"refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"}}}'
+color='{"state": null, "questions": {"color": {"type": "choice", "instructions": "What color is the circle?",
+  "criteria": {"red": "Red", "green": "Green", "blue": "Blue"}}}}'
+city='{"state": null, "questions": {"city": {"type": "choice", "instructions": "Which city is the train going to?",
+  "criteria": {"paris": "Paris", "london": "London", "tokyo": "Tokyo"}}}}'
+
+for check in "${checks[@]}"; do
+  case "$check" in
+    text) answer_is "$check" '\b(4|four)\b' "$(lfm3-ask 'What is 2+2? Answer in one word.')" ;;
+    raw) answer_is "$check" 'paris' "$(LFM3_MAX_TOKENS=16 lfm3-ask --raw 'The capital of France is')" ;;
+    image) answer_is "$check" 'blue' "$(lfm3-ask --image "$dir/test-image.png" 'What color is the circle? Answer in one word.')" ;;
+    audio) answer_is "$check" 'paris' "$(lfm3-ask --system 'Perform ASR in English.' --audio "$dir/test-speech.wav")" ;;
+    decide-text) decision_is "$check" '.refund.noul > 0.5' "$(lfm3-decide "$refund")" ;;
+    decide-image) decision_is "$check" '.color.choice == "blue"' "$(lfm3-decide --image "$dir/test-image.png" "$color")" ;;
+    decide-audio) decision_is "$check" '.city.choice == "paris"' "$(lfm3-decide --audio "$dir/test-speech.wav" "$city")" ;;
+    *)
+      echo "lfm3-selftest: unknown check $check" >&2
+      exit 2
+      ;;
+  esac
+done

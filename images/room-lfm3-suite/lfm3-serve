@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# lfm3-serve [command ...]: start the model this room carries, then run the
+# command. With no command the server runs in the foreground.
+#
+#   llama-server on 127.0.0.1:8080, OpenAI-compatible at /v1, model "$MODEL"
+#   ($MODEL_BASE_URL, $MODEL, $MODEL_API_KEY). A decision model (d1) answers
+#   typed questions at /v1/systemone instead of /v1/chat/completions.
+#
+# With a command, such as the sandbox keepalive "sleep infinity", the server
+# starts in the background and logs to $LFM3_LOG_DIR/server.log (default
+# /tmp/lfm3). Its /health answers 200 once the model is loaded.
+#
+# Environment:
+#   LFM3_THREADS     CPU threads (default: all cores)
+#   LFM3_SERVER_CTX  context size in tokens (default 4096, 8192 for d1)
+#   LFM3_REASONING   off (default, short answers) or on
+#   LFM3_CACHE_RAM   prompt cache in MiB (default 256; the server's own
+#                    default of 8 GiB does not fit a 4 GiB room)
+#   LFM3_BATCH       d1 only: batch and micro-batch size (default 4096). A
+#                    question is read in one batch; a picture takes at most
+#                    half of it.
+set -euo pipefail
+
+args=(
+  -m "$LFM3_MODEL"
+  --host 127.0.0.1
+  --port 8080
+  --alias "$MODEL"
+  --threads "${LFM3_THREADS:-$(nproc)}"
+  --parallel 1
+  --no-ui
+)
+if [ -n "${LFM3_MMPROJ:-}" ]; then
+  args+=(--mmproj "$LFM3_MMPROJ")
+fi
+if [ "${LFM3_KIND:-chat}" = decision ]; then
+  batch=${LFM3_BATCH:-4096}
+  args+=(--ctx-size "${LFM3_SERVER_CTX:-8192}" --batch-size "$batch" --ubatch-size "$batch")
+else
+  args+=(
+    --ctx-size "${LFM3_SERVER_CTX:-4096}"
+    --reasoning "${LFM3_REASONING:-off}"
+    --cache-ram "${LFM3_CACHE_RAM:-256}"
+  )
+fi
+
+if [ "$#" -eq 0 ]; then
+  exec llama-server "${args[@]}"
+fi
+
+log_dir=${LFM3_LOG_DIR:-/tmp/lfm3}
+mkdir -p "$log_dir"
+llama-server "${args[@]}" >"$log_dir/server.log" 2>&1 &
+exec "$@"

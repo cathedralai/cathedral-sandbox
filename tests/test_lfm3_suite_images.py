@@ -28,7 +28,7 @@ def test_published_1_7b_recipe_is_b11960() -> None:
 
 def test_suite_recipe_is_b11960_and_builds_server() -> None:
     text = (SUITE / "Dockerfile").read_text(encoding="utf-8")
-    assert "LLAMA_CPP_TAG=b11960" in text
+    # #361 pins b11960 by commit (same as the 1.7B room), not LLAMA_CPP_TAG.
     assert "8642541b255bfb5dc39cd351a178be09013a55d6" in text
     assert "llama-server" in text
     assert "tdx_cpu" not in text

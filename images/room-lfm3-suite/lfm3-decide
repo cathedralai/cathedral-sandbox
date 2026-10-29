@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# lfm3-decide [--image FILE] [--audio FILE] REQUEST: ask the d1 decision
+# model this room serves typed questions about a state. REQUEST is a
+# /v1/systemone body ("state" and "questions"), or "-" to read stdin.
+# Prints the answers as JSON, then one timing line:
+#   lfm3-timing load_ms=812 input_tokens=104 wall_ms=530 threads=2
+#
+#   lfm3-decide '{"state": "I was charged twice, please refund one.",
+#     "questions": {"refund": {"type": "noul", "instructions": "Is this a refund request?"}}}'
+#
+# --image adds a picture to "images" and --audio an audio clip to "files"
+# (d1-Omni only), both as data URIs; the state can then be null.
+#
+# Environment:
+#   LFM3_WAIT     seconds to wait for the server (default 120)
+#   LFM3_TIMEOUT  seconds for the request (default 600)
+set -euo pipefail
+
+usage() {
+  echo 'usage: lfm3-decide [--image FILE] [--audio FILE] REQUEST_JSON   (or "-" to read stdin)' >&2
+  exit 2
+}
+
+if [ "${LFM3_KIND:-}" != decision ]; then
+  echo "lfm3-decide: $MODEL is not a decision model; use lfm3-ask" >&2
+  exit 2
+fi
+
+BASE_URL=${MODEL_BASE_URL:-http://127.0.0.1:8080/v1}
+LOG=${LFM3_LOG_DIR:-/tmp/lfm3}/server.log
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+echo '[]' >"$work/images"
+echo '[]' >"$work/files"
+
+add_media() { # list file mime
+  [ -r "$2" ] || { echo "lfm3-decide: cannot read $2" >&2; exit 2; }
+  base64 -w0 "$2" >"$work/b64"
+  jq --rawfile d "$work/b64" --arg m "$3" '. + [("data:" + $m + ";base64," + $d)]' \
+    "$work/$1" >"$work/$1.new"
+  mv "$work/$1.new" "$work/$1"
+}
+
+request=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h | --help) usage ;;
+    --image)
+      [ "$#" -ge 2 ] || usage
+      case "${2,,}" in
+        *.jpg | *.jpeg) mime=image/jpeg ;;
+        *.webp) mime=image/webp ;;
+        *) mime=image/png ;;
+      esac
+      add_media images "$2" "$mime"
+      shift 2
+      ;;
+    --audio)
+      [ "$#" -ge 2 ] || usage
+      case "${2,,}" in
+        *.mp3) mime=audio/mpeg ;;
+        *) mime=audio/wav ;;
+      esac
+      add_media files "$2" "$mime"
+      shift 2
+      ;;
+    -)
+      request=$(cat)
+      shift
+      ;;
+    *)
+      [ "$#" -eq 1 ] || usage
+      request=$1
+      shift
+      ;;
+  esac
+done
+[ -n "$request" ] || usage
+printf '%s' "$request" >"$work/request"
+if ! jq -e 'type == "object" and has("questions")' "$work/request" >/dev/null 2>&1; then
+  echo 'lfm3-decide: REQUEST must be a JSON object with "questions"' >&2
+  exit 2
+fi
+jq --slurpfile images "$work/images" --slurpfile files "$work/files" '
+  (if ($images[0] | length) > 0 then .images = ((.images // []) + $images[0]) else . end)
+  | (if ($files[0] | length) > 0 then .files = ((.files // []) + $files[0]) else . end)
+  | (if has("state") then . else .state = null end)' "$work/request" >"$work/body"
+
+ready=""
+for _ in $(seq 1 "${LFM3_WAIT:-120}"); do
+  if curl -fsS -o /dev/null "${BASE_URL%/v1}/health" 2>/dev/null; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+if [ -z "$ready" ]; then
+  echo "lfm3-decide: the model server at $BASE_URL is not up (log: $LOG)" >&2
+  exit 1
+fi
+
+start_ns=$(date +%s%N)
+status=0
+curl -sS --max-time "${LFM3_TIMEOUT:-600}" -o "$work/out" -w '%{http_code}' \
+  -H 'Content-Type: application/json' -H "Authorization: Bearer ${MODEL_API_KEY:-local}" \
+  --data-binary @"$work/body" "$BASE_URL/systemone" >"$work/code" || status=$?
+wall_ms=$(( ($(date +%s%N) - start_ns) / 1000000 ))
+code=$(cat "$work/code" 2>/dev/null || true)
+if [ "$status" -ne 0 ] || [ "$code" != 200 ]; then
+  head -c 2000 "$work/out" >&2 2>/dev/null || true
+  echo >&2
+  echo "lfm3-decide: $BASE_URL/systemone answered ${code:-nothing} (curl exit $status)" >&2
+  exit 1
+fi
+
+jq -c '.answers' "$work/out"
+
+load_ms=unknown
+if [ -r "$LOG" ]; then
+  load_ms=$(awk '
+    function ms(t,   p) { split(t, p, "."); return (p[1] * 60 + p[2]) * 1000 + p[3] + p[4] / 1000 }
+    /load_model: loading model/ { a = ms($1) }
+    /server_run_i: model loaded/ { b = ms($1) }
+    END { if (a != "" && b != "") printf "%d", b - a + 0.5; else printf "unknown" }
+  ' "$LOG")
+fi
+echo "lfm3-timing load_ms=$load_ms input_tokens=$(jq -r '.usage.input_tokens // "unknown"' "$work/out") wall_ms=$wall_ms threads=${LFM3_THREADS:-$(nproc)}"

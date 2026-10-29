@@ -1,0 +1,21 @@
+This image contains the following third-party works.
+
+@DISPLAY_NAME@
+  Copyright Liquid AI, Inc.
+  https://huggingface.co/@HF_REPO@ (revision @HF_REVISION@)
+  Licensed under the LFM Open License v1.0. The license text is in
+  /opt/lfm3/LICENSE. @CHANGES@
+
+llama.cpp
+  Copyright the ggml authors.
+  https://github.com/ggml-org/llama.cpp
+  Licensed under the MIT License. The license text is in
+  /opt/lfm3/licenses/llama.cpp-LICENSE.
+
+Use of @DISPLAY_NAME@ is subject to the LFM Open License v1.0, including its
+commercial-use revenue threshold (Section 5).
+
+The files in /opt/lfm3/test were made by Cathedral for the self test:
+test-image.png was drawn with ffmpeg, and test-speech.wav ("The train to
+Paris leaves at nine in the morning.") was spoken by LFM3-Omni-2B through
+llama.cpp's llama-tts.
