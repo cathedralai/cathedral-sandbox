@@ -259,7 +259,7 @@ jobs:
           trap 'docker rm -f smoke >/dev/null 2>&1 || true' EXIT
           ready=""
           for _ in $(seq 1 240); do
-            if docker exec smoke curl -fsS -o /dev/null http://127.0.0.1:8080/health; then
+            if docker exec smoke curl -fsS -o /dev/null http://127.0.0.1:8080/health 2>/dev/null; then
               ready=1
               break
             fi
@@ -277,20 +277,21 @@ jobs:
           }
           printf '%s\n' "$selftest"
           if [[ "$KIND" == decision ]]; then
-            contract="$(docker exec smoke sh -c 'curl -fsS "$MODEL_BASE_URL/systemone" \
+            decision="$(docker exec smoke sh -c 'curl -fsS "$MODEL_BASE_URL/systemone" \
               -H "Content-Type: application/json" -H "Authorization: Bearer $MODEL_API_KEY" \
               -d "{\"state\": \"Order 1182 arrived broken, I want my money back.\", \"questions\": {\"refund\": {\"type\": \"noul\", \"instructions\": \"Is the customer asking for a refund?\"}}}"')"
-            jq -e '.answers.refund.noul > 0.5' <<< "$contract" > /dev/null
-            contract="systemone: $(jq -c '.answers' <<< "$contract")"
+            contract="systemone: $(jq -c '.answers' <<< "$decision")"
+            printf '%s\n' "$contract"
+            jq -e '.answers.refund.noul > 0.5' <<< "$decision" > /dev/null
           else
             chat="$(docker exec smoke sh -c 'curl -fsS "$MODEL_BASE_URL/chat/completions" \
               -H "Content-Type: application/json" -H "Authorization: Bearer $MODEL_API_KEY" \
-              -d "{\"model\": \"$MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"What is the capital of France? Answer in one word.\"}], \"max_tokens\": 32, \"temperature\": 0}"')"
+              -d "{\"model\": \"$MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"What is 2+2? Answer in one word.\"}], \"max_tokens\": 32, \"temperature\": 0}"')"
             answer="$(jq -r '.choices[0].message.content' <<< "$chat")"
-            grep -Eiq 'paris' <<< "$answer"
             contract="chat/completions: ${answer}"
+            printf '%s\n' "$contract"
+            grep -Eiq '\b(4|four)\b' <<< "$answer"
           fi
-          printf '%s\n' "$contract"
           mem="$(docker stats --no-stream --format '{{.MemUsage}}' smoke)"
           sums="$(docker exec smoke cat /opt/lfm3/SHA256SUMS)"
           {
