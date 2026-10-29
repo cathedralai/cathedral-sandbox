@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -83,6 +84,66 @@ func TestOperatorAddsChangesAndRemovesAHotelAtRuntime(t *testing.T) {
 	tc.start(t)
 	if tc.b.hotelByID("d") != nil {
 		t.Fatalf("hotel came back")
+	}
+}
+
+func TestRuntimeHotelMutationsRefuseFailedStateSave(t *testing.T) {
+	newHotelToJoin := func(t *testing.T) map[string]any {
+		t.Helper()
+		_, origin := newOperatorHotel(t, 1, nil)
+		return map[string]any{"id": "durable", "api": origin, "key": joinKey}
+	}
+	blockSave := func(t *testing.T, dir string) {
+		t.Helper()
+		if err := os.Mkdir(filepath.Join(dir, runtimeHotelsFile+".tmp"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("join", func(t *testing.T) {
+		dir := t.TempDir()
+		tc := newChainState(t, dir)
+		join := newHotelToJoin(t)
+		blockSave(t, dir)
+		if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", join); status != 500 || errCode(doc) != "state_write_failed" {
+			t.Fatalf("join acknowledged without state save: %d %v", status, doc)
+		}
+		if tc.b.hotelByID("durable") != nil {
+			t.Fatal("failed join remained placeable")
+		}
+		if _, err := os.Stat(filepath.Join(dir, "hotel-keys", "durable.key")); !os.IsNotExist(err) {
+			t.Fatalf("failed join kept key: %v", err)
+		}
+	})
+	for _, action := range []string{"patch", "leave"} {
+		t.Run(action, func(t *testing.T) {
+			dir := t.TempDir()
+			tc := newChainState(t, dir)
+			join := newHotelToJoin(t)
+			if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", join); status != 201 {
+				t.Fatalf("initial join: %d %v", status, doc)
+			}
+			if action == "patch" {
+				if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/hotels/durable", map[string]any{"drain": true}); status != 200 {
+					t.Fatalf("initial drain: %d %v", status, doc)
+				}
+			}
+			blockSave(t, dir)
+			method, body := "PATCH", any(map[string]any{"drain": false, "max_slots": 1})
+			if action == "leave" {
+				method, body = "DELETE", nil
+			}
+			if status, doc := tc.call(t, "operator-key", method, "/v1/broker/hotels/durable", body); status != 500 || errCode(doc) != "state_write_failed" {
+				t.Fatalf("%s acknowledged without state save: %d %v", action, status, doc)
+			}
+			h := tc.b.hotelByID("durable")
+			if h == nil || h.drain() != (action == "patch") || h.cfg.MaxSlots != 0 || h.leaving {
+				t.Fatalf("%s failure changed live hotel: %+v", action, h)
+			}
+			tc.start(t)
+			if h = tc.b.hotelByID("durable"); h == nil || h.drain() != (action == "patch") || h.cfg.MaxSlots != 0 {
+				t.Fatalf("%s failure changed saved hotel: %+v", action, h)
+			}
+		})
 	}
 }
 

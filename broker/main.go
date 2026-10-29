@@ -216,18 +216,18 @@ type guestState struct {
 }
 
 type broker struct {
-	cfg          config
-	mu           sync.Mutex
-	hset         atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
-	hotelsMu     sync.Mutex               // serialises joins and leaves
-	hotelsSaveMu sync.Mutex               // serialises writes of state_dir/hotels.json
-	guests       map[string]*guestState
-	capsOnDisk   map[string]map[string]any // probe results read from state_dir at start
-	byKey        map[string]*guestState    // sha256(key) -> guest
-	byUUID       map[string]*room
-	compat       *compatState
-	prefetch     prefetchJobs
-	started      time.Time
+	cfg              config
+	mu               sync.Mutex
+	hset             atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
+	hotelsMu         sync.Mutex               // serialises joins and leaves
+	hotelsMutationMu sync.Mutex               // keeps runtime mutations and their saves in order
+	guests           map[string]*guestState
+	capsOnDisk       map[string]map[string]any // probe results read from state_dir at start
+	byKey            map[string]*guestState    // sha256(key) -> guest
+	byUUID           map[string]*room
+	compat           *compatState
+	prefetch         prefetchJobs
+	started          time.Time
 
 	// Durable client state (state.go).
 	savedUUIDs map[string]string // broker room id -> client id, from the state file

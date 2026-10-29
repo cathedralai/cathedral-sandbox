@@ -403,6 +403,8 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		return
 	}
 	h.cfg.KeyFile = filepath.Join(keyDir, hc.ID+".key")
+	b.hotelsMutationMu.Lock()
+	defer b.hotelsMutationMu.Unlock()
 	// The stop function is set before the hotel is in the set, so a leave
 	// that races this join reads it set.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -438,9 +440,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	if h.adm.chipFull != "" && !h.adm.attestedAt.IsZero() {
 		holder = b.chipHolder(h, h.adm.chipFull, time.Now())
 	}
-	if holder == nil {
-		h.leaving = false
-	} else {
+	if holder != nil {
 		h.adm.attestedAt = time.Time{}
 	}
 	b.mu.Unlock()
@@ -456,14 +456,27 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		writeErr(w, 500, "state_write_failed", "cannot keep the hotel key")
 		return
 	}
-	if err := b.saveRuntimeHotels(); err != nil {
+	b.mu.Lock()
+	err := b.saveRuntimeHotelsLocked()
+	if err == nil {
+		h.leaving = false
+	}
+	b.mu.Unlock()
+	if err != nil {
 		log.Printf("runtime hotels not saved: %v", err)
+		b.dropHotel(h.cfg.ID)
+		cancel()
+		_ = os.Remove(h.cfg.KeyFile)
+		writeErr(w, 500, "state_write_failed", "cannot keep the runtime hotel list")
+		return
 	}
 	go b.syncLoop(ctx, h)
 	writeJSON(w, 201, b.hotelDoc(h))
 }
 
 func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, enroller bool) {
+	b.hotelsMutationMu.Lock()
+	defer b.hotelsMutationMu.Unlock()
 	h := b.hotelByID(id)
 	if h == nil {
 		writeErr(w, 404, "hotel_not_found", "no hotel "+id)
@@ -513,6 +526,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	}
 	b.mu.Lock()
 	h.cfgMu.Lock()
+	oldCfg := h.cfg
 	if req.Drain != nil {
 		h.cfg.Drain = *req.Drain
 	}
@@ -521,26 +535,38 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		h.cfg.Labels = fixedLabels(h.cfg, req.Labels)
 	}
 	if req.MaxSlots != nil {
-		// A lower cap applies now; a higher one at the next health answer.
 		h.cfg.MaxSlots = *req.MaxSlots
-		if h.cfg.MaxSlots > 0 && h.slots > h.cfg.MaxSlots {
-			h.resize(h.cfg.MaxSlots)
-		}
 	}
 	if reserve != nil {
 		h.cfg.ReservedFor = *reserve
 	}
 	h.cfgMu.Unlock()
-	b.mu.Unlock()
 	if h.runtime {
-		if err := b.saveRuntimeHotels(); err != nil {
+		if err := b.saveRuntimeHotelsLocked(); err != nil {
 			log.Printf("runtime hotels not saved: %v", err)
+			h.cfgMu.Lock()
+			h.cfg.Drain = oldCfg.Drain
+			h.cfg.Labels = oldCfg.Labels
+			h.cfg.MaxSlots = oldCfg.MaxSlots
+			h.cfg.ReservedFor = oldCfg.ReservedFor
+			h.cfgMu.Unlock()
+			b.mu.Unlock()
+			writeErr(w, 500, "state_write_failed", "cannot keep the runtime hotel update")
+			return
 		}
 	}
+	if req.MaxSlots != nil {
+		if h.cfg.MaxSlots > 0 && h.slots > h.cfg.MaxSlots {
+			h.resize(h.cfg.MaxSlots)
+		}
+	}
+	b.mu.Unlock()
 	writeJSON(w, 200, b.hotelDoc(h))
 }
 
 func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller bool) {
+	b.hotelsMutationMu.Lock()
+	defer b.hotelsMutationMu.Unlock()
 	h := b.hotelByID(id)
 	if h == nil {
 		writeErr(w, 404, "hotel_not_found", "no hotel "+id)
@@ -575,11 +601,22 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller bool) {
 		writeErr(w, 409, "hotel_changed", "hotel changed during leave; retry")
 		return
 	}
+	b.mu.Lock()
+	err := b.saveRuntimeHotelsLocked()
+	b.mu.Unlock()
+	if err != nil {
+		log.Printf("runtime hotels not saved: %v", err)
+		if addErr := b.addHotel(h); addErr != nil {
+			log.Printf("runtime hotel %s could not be restored after failed save: %v", id, addErr)
+		}
+		b.mu.Lock()
+		h.leaving = false
+		b.mu.Unlock()
+		writeErr(w, 500, "state_write_failed", "cannot keep the runtime hotel removal")
+		return
+	}
 	if h.stop != nil {
 		h.stop()
-	}
-	if err := b.saveRuntimeHotels(); err != nil {
-		log.Printf("runtime hotels not saved: %v", err)
 	}
 	_ = os.Remove(h.cfg.KeyFile)
 	w.WriteHeader(204)
@@ -612,18 +649,15 @@ func (b *broker) guestExists(id string) bool {
 
 const runtimeHotelsFile = "hotels.json"
 
-func (b *broker) saveRuntimeHotels() error {
-	// One save at a time: concurrent joins share the temporary file.
-	b.hotelsSaveMu.Lock()
-	defer b.hotelsSaveMu.Unlock()
+// saveRuntimeHotelsLocked keeps the current runtime snapshot stable through
+// the atomic file replacement. Callers hold b.mu and hotelsMutationMu.
+func (b *broker) saveRuntimeHotelsLocked() error {
 	var list []hotelConfig
-	b.mu.Lock()
 	for _, h := range b.hotelList() {
 		if h.runtime {
 			list = append(list, h.cfg)
 		}
 	}
-	b.mu.Unlock()
 	raw, err := json.MarshalIndent(list, "", "  ")
 	if err != nil {
 		return err

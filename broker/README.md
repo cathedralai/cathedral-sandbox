@@ -401,7 +401,10 @@ receive this policy document.
 
 The broker keeps runtime hotels in `state_dir/hotels.json` and their keys in
 `state_dir/hotel-keys/<id>.key` (mode 0600). A hotel from the config file
-cannot be removed at runtime.
+cannot be removed at runtime. Runtime join, PATCH and leave return
+`state_write_failed` if `hotels.json` cannot be saved. A failed join cannot
+take rooms; a failed PATCH restores the previous values, and a failed leave
+keeps the hotel and its key.
 
 ### Admission of joined hotels
 
