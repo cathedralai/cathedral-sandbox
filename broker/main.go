@@ -94,6 +94,9 @@ type config struct {
 	// OperatorKeySHA256 is the SHA-256 of the operator key. It allows hotel
 	// join, change and leave at runtime (hotels.go). Empty: no operator routes.
 	OperatorKeySHA256 string `json:"operator_key_sha256"`
+	// MinerEnrollKeySHA256 permits only verified miner joins, miner reads,
+	// drain=true, and empty miner leaves through the hotel admin routes.
+	MinerEnrollKeySHA256 string `json:"miner_enroll_key_sha256,omitempty"`
 	// MinerHotkeyCaps is the operator-approved maximum number of joined hotels
 	// per miner hotkey. Miner joins without an entry are refused.
 	MinerHotkeyCaps map[string]int `json:"miner_hotkey_caps,omitempty"`
@@ -281,6 +284,15 @@ func loadBroker(path string) (*broker, error) {
 	if err := refusePlaintextEscapeNonce(c.EscapeNonceAllowPlaintext); err != nil {
 		return nil, err
 	}
+	if c.MinerEnrollKeySHA256 != "" {
+		hash, err := hex.DecodeString(c.MinerEnrollKeySHA256)
+		if err != nil || len(hash) != sha256.Size {
+			return nil, errors.New("config: miner_enroll_key_sha256 must be a SHA-256 hex digest")
+		}
+	}
+	if c.MinerEnrollKeySHA256 != "" && strings.EqualFold(c.MinerEnrollKeySHA256, c.OperatorKeySHA256) {
+		return nil, errors.New("config: miner enrollment key must differ from the operator key")
+	}
 	for hotkey, cap := range c.MinerHotkeyCaps {
 		if !ss58RE.MatchString(hotkey) || cap < 1 {
 			return nil, fmt.Errorf("config: miner_hotkey_caps requires an SS58 hotkey and a positive machine cap")
@@ -304,6 +316,9 @@ func loadBroker(path string) (*broker, error) {
 		}
 	}
 	for _, gc := range c.Guests {
+		if c.MinerEnrollKeySHA256 != "" && (strings.EqualFold(c.MinerEnrollKeySHA256, gc.KeySHA256) || strings.EqualFold(c.MinerEnrollKeySHA256, gc.ViewTokenSHA256)) {
+			return nil, errors.New("config: miner enrollment key must differ from guest keys and view tokens")
+		}
 		if gc.ID == "" {
 			return nil, errors.New("config: a guest has no id (rooms with no broker_guest label would be its own)")
 		}

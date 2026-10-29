@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -72,6 +73,89 @@ func TestOperatorAddsChangesAndRemovesAHotelAtRuntime(t *testing.T) {
 	tc.start(t)
 	if tc.b.hotelByID("d") != nil {
 		t.Fatalf("hotel came back")
+	}
+}
+
+func TestMinerEnrollmentKeyCannotOperateOutsideMinerScope(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	joinMiner(t, tc, "m1", true, 1, nil)
+	for _, path := range []string{"/v1/broker/hotels/a", "/v1/broker/hotels/b"} {
+		if status, doc := tc.call(t, "enroller-key", "GET", path, nil); status != 403 || errCode(doc) != "enroller_scope" {
+			t.Fatalf("read operator hotel %s: %d %v", path, status, doc)
+		}
+		if status, doc := tc.call(t, "enroller-key", "PATCH", path, map[string]any{"drain": true}); status != 403 || errCode(doc) != "enroller_scope" {
+			t.Fatalf("drain operator hotel %s: %d %v", path, status, doc)
+		}
+		if status, doc := tc.call(t, "enroller-key", "DELETE", path, nil); status != 403 || errCode(doc) != "enroller_scope" {
+			t.Fatalf("leave operator hotel %s: %d %v", path, status, doc)
+		}
+	}
+	if status, doc := tc.call(t, "enroller-key", "PATCH", "/v1/broker/guests/g1", map[string]any{"max_rooms": 1}); status != 401 {
+		t.Fatalf("enroller changed guest policy: %d %v", status, doc)
+	}
+	if status, doc := tc.call(t, "enroller-key", "POST", "/v1/broker/hotels/m1/escape-nonce", map[string]any{}); status != 403 || errCode(doc) != "enroller_scope" {
+		t.Fatalf("enroller planted nonce: %d %v", status, doc)
+	}
+	for _, body := range []map[string]any{
+		{"id": "x", "api": "https://127.0.0.1:1", "key": joinKey, "sealed": true},
+		{"id": "x", "api": "http://127.0.0.1:1", "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey},
+		{"id": "x", "api": "https://127.0.0.1:1", "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey, "verify": false},
+		{"id": "x", "api": "https://127.0.0.1:1", "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey, "reserved_for": "g1"},
+		{"id": "x", "api": "https://127.0.0.1:1", "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey, "labels": map[string]string{"zone": "x"}},
+	} {
+		if status, doc := tc.call(t, "enroller-key", "POST", "/v1/broker/hotels", body); status != 403 || errCode(doc) != "enroller_scope" {
+			t.Fatalf("out-of-scope join %v: %d %v", body, status, doc)
+		}
+	}
+	if status, doc := tc.call(t, "enroller-key", "POST", "/v1/broker/hotels", map[string]any{
+		"id": "x", "api": "https://127.0.0.1:1", "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
+	}); status != 502 || errCode(doc) != "hotel_unreachable" {
+		t.Fatalf("in-scope join did not reach hotel verification: %d %v", status, doc)
+	}
+	if status, doc := tc.call(t, "enroller-key", "GET", "/v1/broker/hotels/m1", nil); status != 200 || doc["miner_hotkey"] != minerHotkey {
+		t.Fatalf("read miner hotel: %d %v", status, doc)
+	}
+	for _, body := range []map[string]any{{"drain": false}, {"labels": map[string]string{"zone": "x"}}, {"max_slots": 1}, {"reserved_for": "g1"}} {
+		if status, doc := tc.call(t, "enroller-key", "PATCH", "/v1/broker/hotels/m1", body); status != 403 || errCode(doc) != "enroller_scope" {
+			t.Fatalf("out-of-scope miner patch %v: %d %v", body, status, doc)
+		}
+	}
+	if status, doc := tc.call(t, "enroller-key", "PATCH", "/v1/broker/hotels/m1", map[string]any{"drain": true}); status != 200 || doc["drain"] != true {
+		t.Fatalf("drain miner hotel: %d %v", status, doc)
+	}
+	if status, doc := tc.call(t, "enroller-key", "DELETE", "/v1/broker/hotels/m1", nil); status != 204 {
+		t.Fatalf("leave empty miner hotel: %d %v", status, doc)
+	}
+}
+
+func TestMinerEnrollmentKeyConfigRejectsReuse(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	raw, err := os.ReadFile(tc.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var original config
+	if err := json.Unmarshal(raw, &original); err != nil {
+		t.Fatal(err)
+	}
+	for name, digest := range map[string]string{
+		"operator":  original.OperatorKeySHA256,
+		"guest":     original.Guests[0].KeySHA256,
+		"view":      original.Guests[0].ViewTokenSHA256,
+		"malformed": "not-a-digest",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := original
+			cfg.MinerEnrollKeySHA256 = digest
+			body, _ := json.Marshal(cfg)
+			path := t.TempDir() + "/config.json"
+			if err := os.WriteFile(path, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadBroker(path); err == nil {
+				t.Fatal("reused or malformed miner enrollment key was accepted")
+			}
+		})
 	}
 }
 

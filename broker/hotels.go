@@ -174,6 +174,26 @@ func (b *broker) dropHotel(id string) {
 	b.hset.Store(next)
 }
 
+// dropHotelIf avoids removing a replacement that joined under the same id
+// while an earlier leave was waiting for room state to settle.
+func (b *broker) dropHotelIf(id string, expected *hotel) bool {
+	b.hotelsMu.Lock()
+	defer b.hotelsMu.Unlock()
+	old := b.hset.Load()
+	if old == nil || old.byID[id] != expected {
+		return false
+	}
+	next := &hotelSet{byID: map[string]*hotel{}}
+	for _, h := range old.list {
+		if h != expected {
+			next.list = append(next.list, h)
+			next.byID[h.cfg.ID] = h
+		}
+	}
+	b.hset.Store(next)
+	return true
+}
+
 // startSync runs the sync loop of h until the hotel leaves.
 func (b *broker) startSync(ctx context.Context, h *hotel) {
 	ctx, cancel := context.WithCancel(ctx)
@@ -185,6 +205,15 @@ func (b *broker) startSync(ctx context.Context, h *hotel) {
 
 func (b *broker) isOperator(r *http.Request) bool {
 	want := strings.ToLower(b.cfg.OperatorKeySHA256)
+	a := r.Header.Get("Authorization")
+	if want == "" || len(a) < 8 || !strings.EqualFold(a[:7], "bearer ") {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(sha(strings.TrimSpace(a[7:]))), []byte(want)) == 1
+}
+
+func (b *broker) isMinerEnroller(r *http.Request) bool {
+	want := strings.ToLower(b.cfg.MinerEnrollKeySHA256)
 	a := r.Header.Get("Authorization")
 	if want == "" || len(a) < 8 || !strings.EqualFold(a[:7], "bearer ") {
 		return false
@@ -209,12 +238,18 @@ func validURL(s string) bool {
 }
 
 func (b *broker) handleHotelAdmin(w http.ResponseWriter, r *http.Request, id string) {
-	if !b.isOperator(r) {
-		writeErr(w, 401, "unauthorized", "the operator key is required")
+	operator := b.isOperator(r)
+	enroller := !operator && b.isMinerEnroller(r)
+	if !operator && !enroller {
+		writeErr(w, 401, "unauthorized", "a hotel administration key is required")
 		return
 	}
 	hotelID, action, hadAction := strings.Cut(id, "/")
 	if hadAction && action == "escape-nonce" && hotelID != "" && r.Method == "POST" {
+		if !operator {
+			writeErr(w, 403, "enroller_scope", "miner enrollment cannot plant Escape nonces")
+			return
+		}
 		b.handleEscapeNoncePlant(w, r, hotelID)
 		return
 	}
@@ -225,19 +260,23 @@ func (b *broker) handleHotelAdmin(w http.ResponseWriter, r *http.Request, id str
 			writeErr(w, 404, "hotel_not_found", "no hotel "+id)
 			return
 		}
+		if enroller && h.cfg.MinerHotkey == "" {
+			writeErr(w, 403, "enroller_scope", "miner enrollment can read only miner hotels")
+			return
+		}
 		writeJSON(w, 200, b.hotelDoc(h))
 	case id == "" && r.Method == "POST":
-		b.joinHotel(w, r)
+		b.joinHotel(w, r, enroller)
 	case id != "" && r.Method == "PATCH":
-		b.patchHotel(w, r, id)
+		b.patchHotel(w, r, id, enroller)
 	case id != "" && r.Method == "DELETE":
-		b.leaveHotel(w, id)
+		b.leaveHotel(w, id, enroller)
 	default:
 		writeErr(w, 404, "route_not_found", "central booking does not route "+r.Method+" "+r.URL.Path)
 	}
 }
 
-func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
+func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool) {
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	var req joinRequest
 	if json.Unmarshal(raw, &req) != nil {
@@ -245,6 +284,14 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hc := req.hotelConfig
+	if enroller {
+		if hc.MinerHotkey == "" || !hc.Sealed || (req.Verify != nil && !*req.Verify) ||
+			hc.ReservedFor != "" || hc.Labels != nil ||
+			!strings.HasPrefix(hc.API, "https://") || (hc.Health != "" && !strings.HasPrefix(hc.Health, "https://")) {
+			writeErr(w, 403, "enroller_scope", "miner enrollment requires a verified HTTPS sealed miner hotel without custom labels or reservation")
+			return
+		}
+	}
 	switch {
 	case hc.ID == "" || strings.Contains(hc.ID, ".") || len(hc.ID) > 64:
 		writeErr(w, 400, "invalid_hotel", "id must be 1 to 64 characters with no dot")
@@ -375,10 +422,14 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, b.hotelDoc(h))
 }
 
-func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string) {
+func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, enroller bool) {
 	h := b.hotelByID(id)
 	if h == nil {
 		writeErr(w, 404, "hotel_not_found", "no hotel "+id)
+		return
+	}
+	if enroller && h.cfg.MinerHotkey == "" {
+		writeErr(w, 403, "enroller_scope", "miner enrollment can drain only miner hotels")
 		return
 	}
 	var req struct {
@@ -390,6 +441,10 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string) {
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if json.Unmarshal(raw, &req) != nil {
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
+		return
+	}
+	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0) {
+		writeErr(w, 403, "enroller_scope", "miner enrollment may only set drain=true")
 		return
 	}
 	if req.MaxSlots != nil && *req.MaxSlots < 0 {
@@ -444,10 +499,14 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, 200, b.hotelDoc(h))
 }
 
-func (b *broker) leaveHotel(w http.ResponseWriter, id string) {
+func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller bool) {
 	h := b.hotelByID(id)
 	if h == nil {
 		writeErr(w, 404, "hotel_not_found", "no hotel "+id)
+		return
+	}
+	if enroller && h.cfg.MinerHotkey == "" {
+		writeErr(w, 403, "enroller_scope", "miner enrollment can leave only miner hotels")
 		return
 	}
 	if !h.runtime {
@@ -471,7 +530,10 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string) {
 		writeErr(w, 409, "hotel_not_empty", fmt.Sprintf("hotel %s has %d rooms; drain it and wait until they are gone", id, busy))
 		return
 	}
-	b.dropHotel(id)
+	if !b.dropHotelIf(id, h) {
+		writeErr(w, 409, "hotel_changed", "hotel changed during leave; retry")
+		return
+	}
 	if h.stop != nil {
 		h.stop()
 	}

@@ -374,6 +374,16 @@ Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
 With `operator_key_sha256` (SHA-256 of the operator key) and `state_dir` in
 the config, an operator adds and removes hotels without a restart:
 
+`miner_enroll_key_sha256` is a separate control-plane key for the miner
+reconciler. It can read miner hotel documents, join verified sealed miner
+hotels with HTTPS API and health endpoints, set `drain=true` on a miner hotel,
+and leave an empty miner hotel. It cannot read or change operator hotels,
+change guest policy, plant Escape nonces, opt out of join verification, set
+custom labels or reservations, or undo a drain. The digest must differ from
+the operator key and every guest key or view token. The approved hotkey cap
+still applies. This scope is not a substitute for guest-bound TLS and
+guest-only hotel key custody; those remain required before miner customer work.
+
 | Route (operator key) | What it does |
 |---|---|
 | `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey` and `admission`. |
