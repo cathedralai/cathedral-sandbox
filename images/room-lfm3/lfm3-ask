@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# lfm3-ask "prompt": one LFM3-1.7B turn on CPU. Prints the answer, then one
+# timing line:
+#   lfm3-timing load_ms=1203 prompt_tok_s=118.0 gen_tok_s=52.8 wall_ms=1530 ...
+# load_ms is the model load inside llama-cli, wall_ms the whole run.
+#
+# Environment:
+#   LFM3_MAX_TOKENS  tokens to generate at most (default 256)
+#   LFM3_REASONING   off (default, short answers) or on (LFM3 thinks first)
+#   LFM3_THREADS     CPU threads (default: all cores)
+#   LFM3_CTX         context size (default 2048)
+set -euo pipefail
+
+usage() {
+  echo 'usage: lfm3-ask "prompt"   (or: echo "prompt" | lfm3-ask -)' >&2
+  exit 2
+}
+
+LLAMA_CLI=${LFM3_LLAMA_CLI:-/opt/llama/bin/llama-cli}
+MODEL=${LFM3_MODEL:-/opt/lfm3/LFM3-1.7B-Q4_K_M.gguf}
+MAX_TOKENS=${LFM3_MAX_TOKENS:-256}
+REASONING=${LFM3_REASONING:-off}
+THREADS=${LFM3_THREADS:-$(nproc)}
+CTX=${LFM3_CTX:-2048}
+
+[ "$#" -ge 1 ] || usage
+case "$1" in
+  -h | --help) usage ;;
+  -) prompt=$(cat) ;;
+  *) prompt="$*" ;;
+esac
+[ -n "$prompt" ] || usage
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+start_ns=$(date +%s%N)
+set +e
+"$LLAMA_CLI" -m "$MODEL" -p "$prompt" -st -n "$MAX_TOKENS" -t "$THREADS" -c "$CTX" \
+  --temp 0 --no-display-prompt --simple-io --reasoning "$REASONING" \
+  --log-timestamps -lv 3 </dev/null >"$work/out" 2>"$work/err"
+status=$?
+set -e
+wall_ms=$(( ($(date +%s%N) - start_ns) / 1000000 ))
+
+if [ "$status" -ne 0 ]; then
+  tail -n 20 "$work/err" >&2
+  echo "lfm3-ask: llama-cli exited $status" >&2
+  exit "$status"
+fi
+
+# Log lines start with M.SS.mmm.uuu (elapsed since process start).
+load_ms=$(awk '
+  function ms(t,   p) { split(t, p, "."); return (p[1] * 60 + p[2]) * 1000 + p[3] + p[4] / 1000 }
+  /load_model: loading model/ { a = ms($1) }
+  /server_run_i: model loaded/ { b = ms($1) }
+  END { if (a != "" && b != "") printf "%d", b - a + 0.5; else printf "unknown" }
+' "$work/err")
+
+stats=$(grep -o '\[ Prompt: [0-9.]* t/s | Generation: [0-9.]* t/s \]' "$work/out" | tail -n 1 || true)
+prompt_tok_s=$(echo "$stats" | awk '{ print ($3 == "" ? "unknown" : $3) }')
+gen_tok_s=$(echo "$stats" | awk '{ print ($7 == "" ? "unknown" : $7) }')
+
+# Stdout is a banner, then "> <prompt>", the answer, a blank line and the
+# stats line. Cut on the echoed prompt and on the stats line.
+text=$(cat "$work/out")
+marker=$'\n> '"$prompt"$'\n'
+answer=${text#*"$marker"}
+if [ "$answer" = "$text" ]; then
+  answer=$text
+else
+  answer=${answer%%$'\n\n[ Prompt:'*}
+fi
+printf '%s\n' "$answer"
+echo "lfm3-timing load_ms=$load_ms prompt_tok_s=$prompt_tok_s gen_tok_s=$gen_tok_s wall_ms=$wall_ms threads=$THREADS max_tokens=$MAX_TOKENS reasoning=$REASONING"

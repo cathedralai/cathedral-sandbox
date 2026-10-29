@@ -352,7 +352,7 @@ func TestCreateWaitsBehindAnotherGuestsExecs(t *testing.T) {
 		t.Fatalf("precondition: hotel b went down behind the held data connections; the sync loop must keep it up")
 	}
 	old := hotelCreateTimeout
-	hotelCreateTimeout = time.Second // production: 5 minutes
+	hotelCreateTimeout = time.Second // production: 12 minutes
 	t.Cleanup(func() { hotelCreateTimeout = old })
 	before := createsOn(tc)["b"]
 	t0 := time.Now()

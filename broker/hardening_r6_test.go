@@ -120,7 +120,7 @@ func TestRoomListedAgainStaysDeleting(t *testing.T) {
 // A create whose answer is lost after the hotel committed the room is
 // retried on another hotel. The first room stays, labelled with the guest,
 // and the next sync adopts it: one create, two rooms. Production triggers:
-// an SSH tunnel drop, or the broker's 5 minute create timeout during a cold
+// an SSH tunnel drop, or the broker's create timeout during a cold
 // image pull (the hotel allows the pull 600 s and finishes the create).
 func TestLostCreateAnswerLeavesAnOrphanRoom(t *testing.T) {
 	tc := newChain(t)

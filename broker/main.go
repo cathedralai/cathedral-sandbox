@@ -893,9 +893,13 @@ func tunablesApplied(doc map[string]any) bool {
 // hotelFailBackoff rests a hotel after a failed room start.
 const hotelFailBackoff = 10 * time.Second
 
-// hotelCreateTimeout bounds one create call to a hotel: a cold image pull
-// can take minutes. A variable, not a constant, so a test can shorten it.
-var hotelCreateTimeout = 5 * time.Minute
+// hotelCreateTimeout bounds one create call to a hotel. The hotel docker
+// pull itself is 600s (sandbox_guest.py). A cold LFM3 pull on a sealed
+// hotel (GHCR, about 1.2 GiB onto LUKS scratch) was dying as
+// hotel_unreachable when this was 5 minutes. Prefetch is 30 minutes
+// (images.go). 12 minutes covers the hotel pull plus start. A variable,
+// not a constant, so a test can shorten it.
+var hotelCreateTimeout = 12 * time.Minute
 
 func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestState) {
 	tRecv := time.Now()
