@@ -77,5 +77,6 @@ The hotel document and the operator capacity catalog show `lent_from`; the hotel
 ### Restarts and the fail-closed check
 
 - A lend survives a broker restart. A joined hotel keeps it in `state_dir/hotels.json`; a hotel from the broker config file (`nc-sealed` today) keeps it in `state_dir/hotel-lends.json`, and that state wins over the config file's `reserved_for`. The broker refuses to lend a config hotel without `state_dir`, and refuses to start when `hotel-lends.json` does not parse.
-- A sealed hotel reserved for an owner whose room list shows another guest's room is not the owner's alone, whatever the reason (a lost lend state, a reservation set while pool rooms ran). The broker makes it lent from the owner, logs `FAIL CLOSED`, and records the running launch's `REPORT_ID` at the next attestation, so giving it back still takes drain and a re-seal.
+- A sealed hotel reserved for an owner whose room list shows another guest's room is not the owner's alone, whatever the reason (a lost lend state, a room list the broker had not seen). The broker makes it lent from the owner, logs `FAIL CLOSED`, and records the running launch's `REPORT_ID` at the next attestation, so giving it back still takes drain and a re-seal.
 - After a restart, a reserved hotel takes no rooms until its first room list has passed that check.
+- Reserving a sealed hotel (`PATCH reserved_for`) while another guest's room or any create is on it is refused (`409 rooms_active`), so the owner's creates never land next to those rooms in the time before the next room list.

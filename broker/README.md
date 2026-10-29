@@ -183,7 +183,9 @@ a re-seal (`lend.go`, design in `docs/DEDICATED_SEALED.md`).
 - Other refusals: 409 `hotel_not_reserved`, 409 `hotel_not_sealed`, 422
   `attestation_failed` (also for a report with no REPORT_ID), 502
   `hotel_unreachable`, 400 `invalid_lend` (`lend: false`, or `lend` with
-  `reserved_for`). A refused lend or reclaim applies none of the PATCH.
+  `reserved_for`). A refused lend or reclaim applies none of the PATCH. A
+  lend or reclaim that `state_dir` cannot keep answers 500
+  `state_write_failed` and changes nothing.
 - Restart: the lend survives it. A joined hotel keeps `lent_from` and
   `lent_report_id` in `state_dir/hotels.json`; a hotel from the config file
   keeps them in `state_dir/hotel-lends.json`, and that state wins over the
@@ -200,6 +202,10 @@ a re-seal (`lend.go`, design in `docs/DEDICATED_SEALED.md`).
   records the running launch as the baseline; until then a reclaim is 409
   `reseal_required`. After a restart a reserved hotel takes no rooms until
   its first room list (503 `hotels_not_admitted` meanwhile).
+- Reserve: `PATCH {"reserved_for": "X"}` on a sealed hotel is 409
+  `rooms_active` while another guest's room or any create is on it: drain
+  it and wait until they are gone. Otherwise X's creates would land next to
+  those rooms before the next room list.
 
 ### Capacity catalog
 

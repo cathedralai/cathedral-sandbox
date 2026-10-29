@@ -278,6 +278,22 @@ func foreignRooms(h *hotel, owner string) int {
 	return n
 }
 
+// reserveErr refuses to reserve a sealed hotel for owner while another
+// guest's rooms or any create are on it. The fail-closed check below would
+// make the hotel lent only at the next room list; until then the owner's
+// creates would land next to those rooms and stay there. Caller holds b.mu
+// and not h.cfgMu.
+func reserveErr(h *hotel, owner string) *apiErr {
+	if owner == "" || owner == h.reservedFor() || hotelClass(h) != classSealed {
+		return nil
+	}
+	if n := foreignRooms(h, owner) + h.creating + h.queued; n > 0 {
+		return &apiErr{409, "rooms_active", fmt.Sprintf("hotel %s has %d rooms or creates that are not %s's; "+
+			"drain it and wait until they are gone, then reserve it", h.cfg.ID, n, owner)}
+	}
+	return nil
+}
+
 // checkReservedRooms is the fail-closed check of the sync loop, after a room
 // list. A sealed hotel reserved for X with a room of another guest becomes
 // lent from X (lent_report_id unknown). It reports whether it changed h.

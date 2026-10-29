@@ -578,6 +578,13 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		return
 	}
 	b.mu.Lock()
+	if reserve != nil && !lc.reclaim {
+		if e := reserveErr(h, *reserve); e != nil {
+			b.mu.Unlock()
+			writeErr(w, e.status, e.code, e.msg)
+			return
+		}
+	}
 	h.cfgMu.Lock()
 	oldCfg := h.cfg
 	// The lend or reclaim is checked again under the locks pick takes, and

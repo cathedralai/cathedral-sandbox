@@ -558,3 +558,52 @@ func TestReservedConfigHotelWithOnlyOwnerRoomsIsUnchanged(t *testing.T) {
 		t.Fatalf("%s written for a hotel that is not lent: %v", lendsFile, err)
 	}
 }
+
+// Reserving a sealed hotel while another guest's room runs there is refused.
+// Before, the PATCH passed and the owner's creates landed next to that room
+// until the next room list made the hotel lent, and stayed there after.
+func TestReservingASealedHotelWithForeignRoomsIsRefused(t *testing.T) {
+	tc := reservedChainState(t, t.TempDir())
+	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g2", map[string]any{"hotels": []string{"nc", "a"}}); status != 200 {
+		t.Fatalf("g2 list: %d %v", status, doc)
+	}
+	h, _, room := createdOn(t, tc, map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+	if h != "a" {
+		t.Fatalf("pool room on %s, want a", h)
+	}
+	status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/hotels/a", map[string]any{"reserved_for": "g2"})
+	if status != 409 || errCode(doc) != "rooms_active" {
+		t.Fatalf("reserve with a g1 room: %d %v", status, doc)
+	}
+	if hh := tc.b.hotelByID("a"); hh.reservedFor() != "" || hh.lentFrom() != "" {
+		t.Fatalf("refused reservation changed the hotel: %+v", hh.cfg)
+	}
+	// A create in flight is refused too: its guest is not known yet.
+	if status, _ := tc.call(t, "key1", "DELETE", "/v1/sandboxes/"+room, nil); status != 204 {
+		t.Fatalf("delete: %d", status)
+	}
+	dropRoom(tc, "a", room)
+	setHotel(tc, "a", func(h *hotel) { h.queued = 1 })
+	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/hotels/a", map[string]any{"reserved_for": "g2"}); status != 409 || errCode(doc) != "rooms_active" {
+		t.Fatalf("reserve with a create in flight: %d %v", status, doc)
+	}
+	setHotel(tc, "a", func(h *hotel) { h.queued = 0 })
+	reserve(t, tc, "a", "g2")
+	syncNow(tc, "a") // the startup gate: a reserved config hotel waits for its first room list
+	if hh := tc.b.hotelByID("a"); hh.reservedFor() != "g2" {
+		t.Fatalf("reserved hotel with no foreign rooms changed at sync: %+v", hh.cfg)
+	}
+	// The owner's own rooms do not block a repeat, and an owner change counts them as foreign.
+	if h, _, _ := createdOn2(t, tc, map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}}); h != "a" {
+		t.Fatalf("owner create on %s, want a", h)
+	}
+	reserve(t, tc, "a", "g2")
+	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/hotels/a", map[string]any{"reserved_for": "g1"}); status != 409 || errCode(doc) != "rooms_active" {
+		t.Fatalf("owner change with g2's room: %d %v", status, doc)
+	}
+	// An unsealed hotel is unchanged: the fail-closed check covers sealed hotels.
+	if h, _, _ := createdOn(t, tc, map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}}); h != "b" {
+		t.Fatalf("pool room on %s, want b", h)
+	}
+	reserve(t, tc, "b", "g2")
+}
