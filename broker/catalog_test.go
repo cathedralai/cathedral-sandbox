@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCatalogListsRoomSizesThenLFM3(t *testing.T) {
@@ -15,7 +16,7 @@ func TestCatalogListsRoomSizesThenLFM3(t *testing.T) {
 		t.Fatalf("room sizes must stay at the front of the catalog: %v", names[:3])
 	}
 	lfm, ok := templateByName("lfm3-1.7b")
-	if !ok || !lfm.Live || lfm.Sealed != sealedPending {
+	if !ok || !lfm.Live || lfm.Sealed != sealedPending || !lfm.SealedOnly {
 		t.Fatalf("lfm3-1.7b: %+v", lfm)
 	}
 	want := pinnedImage(lfm31_7bRepo, lfm31_7bDigest)
@@ -57,51 +58,45 @@ func TestUnknownTemplateIs404OnCompatAndNative(t *testing.T) {
 	}
 }
 
-func TestLFM3CreateUsesTheSameCompatPathAsRoom1x4(t *testing.T) {
+func TestLFM3CreateHasNoUnsealedPath(t *testing.T) {
 	tc := newChain(t)
-	status, room := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4"}), nil)
-	if status != 201 {
-		t.Fatalf("room-1x4: %d %v", status, room)
-	}
-	status, lfm := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "lfm3-1.7b"}), nil)
-	if status != 201 {
-		t.Fatalf("lfm3-1.7b: %d %v", status, lfm)
-	}
-	if lfm["id"] == nil || lfm["id"] == room["id"] {
-		t.Fatalf("lfm3 create id: %v", lfm["id"])
-	}
-	var found map[string]any
-	for _, h := range tc.hotels {
-		for _, c := range h.creates {
-			if img, _ := c["image"].(string); img == pinnedImage(lfm31_7bRepo, lfm31_7bDigest) {
-				found = c
-			}
+	for _, body := range []map[string]any{
+		{"template": "lfm3-1.7b"},
+		{"template": "lfm3-1.7b", "sealed": false},
+		{"template": "lfm3-1.7b", "sealed": true},
+	} {
+		status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(body), nil)
+		if status != 503 && status != 409 {
+			t.Fatalf("compat %v: %d %v", body, status, doc)
+		}
+		if errDetail(doc) != "template_sealed_pending" && errDetail(doc) != "template_sealed_only" {
+			t.Fatalf("compat %v: %d %v", body, status, doc)
+		}
+		status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", body)
+		if status != 503 && status != 409 {
+			t.Fatalf("native %v: %d %v", body, status, doc)
+		}
+		if errCode(doc) != "template_sealed_pending" && errCode(doc) != "template_sealed_only" {
+			t.Fatalf("native %v: %d %v", body, status, doc)
 		}
 	}
-	if found == nil {
-		t.Fatal("lfm3-1.7b create never reached a hotel")
-	}
-	if found["image"] == "alpine:3.20" {
-		t.Fatal("lfm3-1.7b must not fall through to the alpine room image")
-	}
-	res := found["resources"].(map[string]any)
-	if res["vcpu"].(float64) != 2 || res["memory_gib"].(float64) != 8 {
-		t.Fatalf("lfm3 resources: %v", res)
+	if n := createsOn(tc); n["a"]+n["b"]+n["c"] != 0 {
+		t.Fatalf("LFM create reached a hotel: %v", n)
 	}
 }
 
-func TestNativeLFM3TemplateCreateSucceedsLikeAnImageCreate(t *testing.T) {
+func TestLFM3PendingErrorDoesNotOfferUnsealed(t *testing.T) {
 	tc := newChain(t)
-	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"template": "lfm3-1.7b"})
-	if status != 202 {
-		t.Fatalf("native lfm3: %d %v", status, doc)
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "lfm3-1.7b"}), nil)
+	if status != 503 || errDetail(doc) != "template_sealed_pending" {
+		t.Fatalf("pending: %d %v", status, doc)
 	}
-	created := lastLFM3Create(t, tc)
-	if created["image"] != pinnedImage(lfm31_7bRepo, lfm31_7bDigest) {
-		t.Fatalf("hotel image: %v", created["image"])
+	msg := errMessage(doc)
+	if strings.Contains(strings.ToLower(msg), "standard") || strings.Contains(msg, "sealed\": false") || strings.Contains(msg, "without sealed") {
+		t.Fatalf("pending error still offers an unsealed path: %q", msg)
 	}
-	if _, ok := created["template"]; ok {
-		t.Fatalf("hotel must not see template: %v", created)
+	if !strings.Contains(msg, "no unsealed path") {
+		t.Fatalf("pending error must say there is no unsealed path: %q", msg)
 	}
 }
 
@@ -109,7 +104,10 @@ func TestUnpublishedLFM3SuiteIsNotCreated(t *testing.T) {
 	tc := newChain(t)
 	for _, name := range []string{"lfm3-1.7b-base", "lfm3-vl-2b", "lfm3-audio-2b", "lfm3-omni-2b", "d1-2b", "d1-omni-2b"} {
 		status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": name}), nil)
-		if status != 503 || errDetail(doc) != "template_unavailable" {
+		if status != 503 {
+			t.Fatalf("%s: %d %v", name, status, doc)
+		}
+		if errDetail(doc) != "template_unavailable" && errDetail(doc) != "template_sealed_pending" {
 			t.Fatalf("%s: %d %v", name, status, doc)
 		}
 	}
@@ -118,37 +116,34 @@ func TestUnpublishedLFM3SuiteIsNotCreated(t *testing.T) {
 	}
 }
 
-func TestLFM3SealedCreateIsPending(t *testing.T) {
-	tc := newChain(t)
-	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "lfm3-1.7b", "sealed": true}), nil)
-	if status != 503 || errDetail(doc) != "template_sealed_pending" {
-		t.Fatalf("compat sealed: %d %v", status, doc)
+func TestLFM3SuiteCatalogIsSealedOnlyAndGHCR(t *testing.T) {
+	wantImages := map[string]string{
+		"lfm3-1.7b":      pinnedImage(lfm31_7bRepo, lfm31_7bDigest),
+		"lfm3-vl-2b":     "ghcr.io/cathedralai/room-lfm3-vl-2b:unpublished",
+		"lfm3-omni-2b":   "ghcr.io/cathedralai/room-lfm3-omni-2b:unpublished",
+		"d1-2b":          "ghcr.io/cathedralai/room-d1-2b:unpublished",
+		"lfm3-audio-2b":  "ghcr.io/cathedralai/room-lfm3-audio-2b:unpublished",
+		"d1-omni-2b":     "ghcr.io/cathedralai/room-d1-omni-2b:unpublished",
+		"lfm3-1.7b-base": "ghcr.io/cathedralai/room-lfm3-1.7b-base:unpublished",
 	}
-	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"template": "lfm3-1.7b", "sealed": true})
-	if status != 503 || errCode(doc) != "template_sealed_pending" {
-		t.Fatalf("native sealed: %d %v", status, doc)
+	for name, image := range wantImages {
+		tpl, ok := templateByName(name)
+		if !ok {
+			t.Fatalf("missing template %s", name)
+		}
+		if !tpl.SealedOnly || tpl.Sealed != sealedPending {
+			t.Fatalf("%s: sealed_only=%v sealed=%s", name, tpl.SealedOnly, tpl.Sealed)
+		}
+		if tpl.Image != image {
+			t.Fatalf("%s image %q want %q", name, tpl.Image, image)
+		}
+		if strings.Contains(tpl.Description, "Standard") || strings.Contains(tpl.Description, "tdx_cpu") {
+			t.Fatalf("%s description still names Standard or tdx_cpu: %q", name, tpl.Description)
+		}
 	}
-	if n := createsOn(tc); n["a"]+n["b"]+n["c"] != 0 {
-		t.Fatalf("sealed lfm3 reached a hotel: %v", n)
-	}
-}
-
-func TestLFM3StandardCreateStaysOffSealedHotels(t *testing.T) {
-	tc := newChain(t)
-	status, _ := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "lfm3-1.7b"}), nil)
-	if status != 201 {
-		t.Fatalf("create: %d", status)
-	}
-	created := lastLFM3Create(t, tc)
-	if created == nil {
-		t.Fatal("no lfm3 create")
-	}
-	// Hotel "a" carries the sealed label. A standard LFM3 create must not land there.
-	if len(tc.hotels["a"].creates) != 0 {
-		t.Fatalf("standard lfm3 landed on the sealed-labelled hotel: %v", tc.hotels["a"].creates)
-	}
-	if len(tc.hotels["b"].creates)+len(tc.hotels["c"].creates) == 0 {
-		t.Fatal("standard lfm3 did not land on an unsealed hotel")
+	d1, _ := templateByName("d1-2b")
+	if d1.MemoryGiB != 8 || !strings.Contains(d1.Description, "llama.cpp") {
+		t.Fatalf("d1-2b should be GGUF on llama.cpp at 8 GiB: %+v", d1)
 	}
 }
 
@@ -157,8 +152,11 @@ func TestCatalogAdvertisesLFM3LiveAndSealedPending(t *testing.T) {
 	_, cat := tc.clientCall(t, "GET", "/v1/sandboxes/catalog", nil, nil)
 	byName := catalogByName(t, cat)
 	lfm := byName["lfm3-1.7b"]
-	if lfm["live"] != true || lfm["sealed"] != "pending" {
+	if lfm["live"] != true || lfm["sealed"] != "pending" || lfm["sealed_only"] != true {
 		t.Fatalf("lfm3 catalog: %v", lfm)
+	}
+	if lfm["hardware_class"] != sealedHardwareClass {
+		t.Fatalf("lfm3 hardware_class: %v", lfm["hardware_class"])
 	}
 	if lfm["image"] != pinnedImage(lfm31_7bRepo, lfm31_7bDigest) {
 		t.Fatalf("catalog image: %v", lfm["image"])
@@ -166,8 +164,8 @@ func TestCatalogAdvertisesLFM3LiveAndSealedPending(t *testing.T) {
 	if byName["lfm3-vl-2b"]["live"] != false || byName["lfm3-vl-2b"]["sealed"] != "pending" {
 		t.Fatalf("unpublished catalog: %v", byName["lfm3-vl-2b"])
 	}
-	if _, ok := byName["room-1x4"]; !ok {
-		t.Fatal("room-1x4 missing from catalog")
+	if byName["room-1x4"]["sealed_only"] != nil {
+		t.Fatalf("room-1x4 must not be sealed-only: %v", byName["room-1x4"])
 	}
 	status, native := tc.call(t, "key1", "GET", "/v1/sandboxes/catalog", nil)
 	if status != 200 {
@@ -175,6 +173,76 @@ func TestCatalogAdvertisesLFM3LiveAndSealedPending(t *testing.T) {
 	}
 	if _, ok := catalogByName(t, native)["lfm3-1.7b"]; !ok {
 		t.Fatalf("native catalog missing lfm3-1.7b: %v", native)
+	}
+}
+
+func TestLFM3ReadyCreateForcesSealedAndStaysOnSealedHotels(t *testing.T) {
+	idx := lfm31_7bIndex(t)
+	old := catalogTemplates[idx]
+	catalogTemplates[idx].Sealed = sealedReady
+	t.Cleanup(func() { catalogTemplates[idx] = old })
+
+	tc := newChain(t)
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "lfm3-1.7b"}), nil)
+	if status != 201 {
+		t.Fatalf("ready create: %d %v", status, doc)
+	}
+	created := lastLFM3Create(t, tc)
+	if created["image"] != pinnedImage(lfm31_7bRepo, lfm31_7bDigest) {
+		t.Fatalf("hotel image: %v", created["image"])
+	}
+	if _, ok := created["template"]; ok {
+		t.Fatalf("hotel must not see template: %v", created)
+	}
+	res := created["resources"].(map[string]any)
+	if res["vcpu"].(float64) != 2 || res["memory_gib"].(float64) != 8 {
+		t.Fatalf("lfm3 resources: %v", res)
+	}
+	if len(tc.hotels["a"].creates) == 0 {
+		t.Fatal("ready LFM did not land on the sealed hotel")
+	}
+	if len(tc.hotels["b"].creates)+len(tc.hotels["c"].creates) != 0 {
+		t.Fatalf("ready LFM leaked to an unsealed hotel: b=%v c=%v", tc.hotels["b"].creates, tc.hotels["c"].creates)
+	}
+}
+
+func TestLFM3ReadyCreateRefusesSealedFalse(t *testing.T) {
+	idx := lfm31_7bIndex(t)
+	old := catalogTemplates[idx]
+	catalogTemplates[idx].Sealed = sealedReady
+	t.Cleanup(func() { catalogTemplates[idx] = old })
+
+	tc := newChain(t)
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "lfm3-1.7b", "sealed": false}), nil)
+	if status != 409 || errDetail(doc) != "template_sealed_only" {
+		t.Fatalf("compat sealed false: %d %v", status, doc)
+	}
+	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"template": "lfm3-1.7b", "sealed": false})
+	if status != 409 || errCode(doc) != "template_sealed_only" {
+		t.Fatalf("native sealed false: %d %v", status, doc)
+	}
+	if n := createsOn(tc); n["a"]+n["b"]+n["c"] != 0 {
+		t.Fatalf("sealed=false LFM reached a hotel: %v", n)
+	}
+}
+
+func TestRoomTemplateStillCreatesWithoutSealed(t *testing.T) {
+	tc := newChain(t)
+	status, room := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4"}), nil)
+	if status != 201 {
+		t.Fatalf("room-1x4: %d %v", status, room)
+	}
+	if n := createsOn(tc); n["a"]+n["b"]+n["c"] != 1 {
+		t.Fatalf("room-1x4 should create one sandbox: %v", n)
+	}
+}
+
+func TestHotelCreateTimeoutCoversHotelImagePull(t *testing.T) {
+	// Hotel docker pull is 600s (sandbox_guest.py). A cold LFM3 pull on a
+	// sealed hotel (GHCR, about 1.2 GiB, LUKS scratch) was dying as
+	// hotel_unreachable when the broker gave up at 5 minutes.
+	if hotelCreateTimeout < 10*time.Minute {
+		t.Fatalf("hotelCreateTimeout %s is shorter than the hotel docker pull (600s)", hotelCreateTimeout)
 	}
 }
 
@@ -210,8 +278,35 @@ func lastLFM3Create(t *testing.T, tc *testChain) map[string]any {
 	return last
 }
 
+func lfm31_7bIndex(t *testing.T) int {
+	t.Helper()
+	for i, tpl := range catalogTemplates {
+		if tpl.Name == "lfm3-1.7b" {
+			return i
+		}
+	}
+	t.Fatal("lfm3-1.7b missing")
+	return -1
+}
+
 func errDetail(doc map[string]any) string {
 	d, _ := doc["detail"].(map[string]any)
 	e, _ := d["error"].(string)
 	return e
+}
+
+func errMessage(doc map[string]any) string {
+	if e, _ := doc["error"].(map[string]any); e != nil {
+		msg, _ := e["message"].(string)
+		if msg != "" {
+			return msg
+		}
+	}
+	d, _ := doc["detail"].(map[string]any)
+	msg, _ := d["message"].(string)
+	if msg != "" {
+		return msg
+	}
+	msg, _ = doc["message"].(string)
+	return msg
 }

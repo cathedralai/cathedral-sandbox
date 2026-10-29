@@ -1,0 +1,210 @@
+name: Publish LFM3 suite images
+
+# Builds one (or every) unpublished LFM3 GGUF image from images/room-lfm3-suite.
+# Manual only: these images are 1 GiB plus and must not run on every push.
+# Pin the printed digest in broker/catalog.go after a green run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Catalog template to publish
+        required: true
+        type: choice
+        options:
+          - lfm3-vl-2b
+          - lfm3-omni-2b
+          - d1-2b
+          - lfm3-audio-2b
+          - d1-omni-2b
+          - all
+
+permissions: {}
+
+jobs:
+  select:
+    runs-on: ubuntu-24.04
+    outputs:
+      models: ${{ steps.pick.outputs.models }}
+    steps:
+      - id: pick
+        shell: bash
+        env:
+          MODEL: ${{ inputs.model }}
+        run: |
+          set -euo pipefail
+          if [ "$MODEL" = all ]; then
+            echo 'models=["lfm3-vl-2b","lfm3-omni-2b","d1-2b","lfm3-audio-2b","d1-omni-2b"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "models=[\"${MODEL}\"]" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    needs: select
+    strategy:
+      fail-fast: false
+      matrix:
+        model: ${{ fromJSON(needs.select.outputs.models) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    concurrency:
+      group: room-lfm3-suite-${{ matrix.model }}-${{ github.sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Check out the reviewed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Load model pins
+        id: pins
+        shell: bash
+        env:
+          MODEL: ${{ matrix.model }}
+        run: |
+          set -euo pipefail
+          envf="images/room-lfm3-suite/models/${MODEL}.env"
+          test -f "$envf"
+          set -a
+          # shellcheck disable=SC1090
+          . "$envf"
+          set +a
+          image_path="ghcr.io/cathedralai/${IMAGE_NAME}"
+          commit_tag="sha-${GITHUB_SHA}"
+          {
+            echo "image_path=${image_path}"
+            echo "commit_tag=${commit_tag}"
+            echo "tag_ref=${image_path}:${commit_tag}"
+            echo "gguf_repo=${GGUF_REPO}"
+            echo "gguf_revision=${GGUF_REVISION}"
+            echo "gguf_file=${GGUF_FILE}"
+            echo "gguf_sha256=${GGUF_SHA256}"
+            echo "mmproj_file=${MMPROJ_FILE:-}"
+            echo "mmproj_sha256=${MMPROJ_SHA256:-}"
+            echo "license_sha256=${LICENSE_SHA256}"
+            echo "alias=${LFM3_ALIAS}"
+            echo "reasoning=${LFM3_REASONING}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          version: v0.36.1
+          driver-opts: >-
+            image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse to overwrite the commit tag
+        shell: bash
+        env:
+          TAG_REF: ${{ steps.pins.outputs.tag_ref }}
+        run: |
+          set -euo pipefail
+          set +e
+          inspection="$(docker buildx imagetools inspect "$TAG_REF" 2>&1)"
+          inspection_status=$?
+          set -e
+          if [[ $inspection_status -eq 0 ]]; then
+            echo "::error::Immutable image tag already exists: $TAG_REF"
+            exit 1
+          fi
+          if grep -Eiq 'manifest unknown|not found' <<< "$inspection"; then
+            exit 0
+          fi
+          echo "::error::Could not prove the immutable image tag is unused"
+          printf '%s\n' "$inspection"
+          exit 1
+
+      - name: Build and publish linux/amd64 image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ./images/room-lfm3-suite
+          file: ./images/room-lfm3-suite/Dockerfile
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: ${{ steps.pins.outputs.tag_ref }}
+          build-args: |
+            GGUF_REPO=${{ steps.pins.outputs.gguf_repo }}
+            GGUF_REVISION=${{ steps.pins.outputs.gguf_revision }}
+            GGUF_FILE=${{ steps.pins.outputs.gguf_file }}
+            GGUF_SHA256=${{ steps.pins.outputs.gguf_sha256 }}
+            MMPROJ_FILE=${{ steps.pins.outputs.mmproj_file }}
+            MMPROJ_SHA256=${{ steps.pins.outputs.mmproj_sha256 }}
+            LICENSE_SHA256=${{ steps.pins.outputs.license_sha256 }}
+            LFM3_ALIAS=${{ steps.pins.outputs.alias }}
+            LFM3_REASONING=${{ steps.pins.outputs.reasoning }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          provenance: mode=max
+
+      - name: Capture the digest launch pin
+        id: pin
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG_REF: ${{ steps.pins.outputs.tag_ref }}
+          IMAGE_PATH: ${{ steps.pins.outputs.image_path }}
+          MODEL: ${{ matrix.model }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          image_ref="${IMAGE_PATH}@${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image_ref=${image_ref}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### ${MODEL} publication"
+            echo
+            echo "Commit tag: \`${TAG_REF}\`"
+            echo
+            echo "Catalog pin: \`${image_ref}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke test the published digest
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.pin.outputs.image_ref }}
+          MODEL: ${{ matrix.model }}
+        run: |
+          set -euo pipefail
+          docker pull --quiet "$IMAGE_REF"
+          docker run --rm --network none --entrypoint /bin/sh "$IMAGE_REF" -c \
+            'test -s /opt/lfm3/LICENSE && test -s /opt/lfm3/NOTICE && test -x /usr/local/bin/llama-server && test -s "$LFM3_MODEL"'
+          case "$MODEL" in
+            d1-*)
+              echo "d1 image: file check only (decision model, not a chat smoke)"
+              ;;
+            *)
+              docker run --rm --network none --entrypoint /usr/local/bin/lfm3-ask "$IMAGE_REF" \
+                'What is 2+2? Answer in one word.' | tee /tmp/lfm3-out
+              grep -Eiq '\b(4|four)\b' /tmp/lfm3-out
+              grep -Eq '^lfm3-timing load_ms=' /tmp/lfm3-out
+              ;;
+          esac
+
+      - name: Attest the published digest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.pins.outputs.image_path }}
+          subject-digest: ${{ steps.pin.outputs.digest }}
+          push-to-registry: true
+
+      - name: Log out of GHCR
+        if: always()
+        shell: bash
+        run: docker logout ghcr.io

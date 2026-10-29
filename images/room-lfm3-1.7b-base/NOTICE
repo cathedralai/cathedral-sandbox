@@ -1,0 +1,10 @@
+This image contains the following third-party works.
+
+LFM3-1.7B-Base (safetensors, BF16)
+  Copyright Liquid AI, Inc.
+  https://huggingface.co/LiquidAI/LFM3-1.7B-Base
+  Licensed under the LFM Open License v1.0. The license text is in
+  /opt/lfm3/LICENSE. The weights are redistributed unmodified.
+
+Use of LFM3-1.7B-Base is subject to the LFM Open License v1.0, including
+its commercial-use revenue threshold (Section 5).
