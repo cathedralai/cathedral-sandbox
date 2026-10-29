@@ -146,6 +146,37 @@ func TestConcurrentJoinsOnOneChipAdmitOne(t *testing.T) {
 	}
 }
 
+func TestConcurrentMinerJoinsRespectHotkeyCap(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.MinerHotkeyCaps[minerHotkey] = 2
+	const n = 8
+	urls := make([]string, n)
+	for i := range urls {
+		_, urls[i] = newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: byte(i + 1)}))
+	}
+	var wg sync.WaitGroup
+	results := make(chan string, n)
+	for i := range urls {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+				"id": fmt.Sprintf("cap-%d", i), "api": urls[i], "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
+			})
+			results <- fmt.Sprintf("%d:%s", status, errCode(doc))
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	counts := map[string]int{}
+	for result := range results {
+		counts[result]++
+	}
+	if counts["201:"] != 2 || counts["409:miner_cap_reached"] != n-2 {
+		t.Fatalf("concurrent cap results: %v", counts)
+	}
+}
+
 func TestAMDChainRequiredForMinerHotels(t *testing.T) {
 	// No verifier configured (set before any sync loop runs).
 	tc := newChainState(t, t.TempDir())
@@ -238,6 +269,35 @@ func TestMinerAdmissionRequiresMeasurementAllowlist(t *testing.T) {
 	}
 	if tc.b.hotelByID("m1") != nil {
 		t.Fatal("refused miner was stored")
+	}
+}
+
+func TestMinerHotkeyCapRefusesNextMachine(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.MinerHotkeyCaps[minerHotkey] = 2
+	joinMiner(t, tc, "m1", true, 1, nil)
+	joinMiner(t, tc, "m2", true, 1, nil)
+	_, url := newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: chipOf("m3")}))
+	third := map[string]any{"id": "m3", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey}
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", third); status != 409 || errCode(doc) != "miner_cap_reached" {
+		t.Fatalf("third miner machine exceeded cap: %d %v", status, doc)
+	}
+	if tc.b.hotelByID("m3") != nil {
+		t.Fatal("over-cap machine was stored")
+	}
+	if status, doc := tc.call(t, "operator-key", "DELETE", "/v1/broker/hotels/m1", nil); status != 204 {
+		t.Fatalf("leave first machine: %d %v", status, doc)
+	}
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", third); status != 201 {
+		t.Fatalf("replacement machine under cap: %d %v", status, doc)
+	}
+
+	tc.b.cfg.MinerHotkeyCaps[minerHotkey] = 0
+	_, url = newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: chipOf("m4")}))
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+		"id": "m4", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
+	}); status != 403 || errCode(doc) != "miner_not_approved" {
+		t.Fatalf("unapproved hotkey joined: %d %v", status, doc)
 	}
 }
 

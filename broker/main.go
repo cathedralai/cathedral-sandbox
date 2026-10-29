@@ -94,6 +94,9 @@ type config struct {
 	// OperatorKeySHA256 is the SHA-256 of the operator key. It allows hotel
 	// join, change and leave at runtime (hotels.go). Empty: no operator routes.
 	OperatorKeySHA256 string `json:"operator_key_sha256"`
+	// MinerHotkeyCaps is the operator-approved maximum number of joined hotels
+	// per miner hotkey. Miner joins without an entry are refused.
+	MinerHotkeyCaps map[string]int `json:"miner_hotkey_caps,omitempty"`
 	// Admission of joined hotels (admission.go). SealedAdmission "off" turns
 	// the attestation gate off for operator hotels, never miner hotels.
 	SealedAdmission    string   `json:"sealed_admission,omitempty"`
@@ -277,6 +280,11 @@ func loadBroker(path string) (*broker, error) {
 	}
 	if err := refusePlaintextEscapeNonce(c.EscapeNonceAllowPlaintext); err != nil {
 		return nil, err
+	}
+	for hotkey, cap := range c.MinerHotkeyCaps {
+		if !ss58RE.MatchString(hotkey) || cap < 1 {
+			return nil, fmt.Errorf("config: miner_hotkey_caps requires an SS58 hotkey and a positive machine cap")
+		}
 	}
 	b := &broker{cfg: c, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), started: time.Now()}
 	for _, hc := range c.Hotels {

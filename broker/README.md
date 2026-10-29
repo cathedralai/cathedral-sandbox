@@ -415,6 +415,7 @@ Config (all optional):
 | Field | Meaning |
 |---|---|
 | `sealed_measurements` | A joined sealed hotel's measurement must be in this list. A miner hotel requires a nonempty list and is refused if it is empty. |
+| `miner_hotkey_caps` | Operator-approved map from miner SS58 hotkey to maximum joined hotels. Missing hotkeys are refused. The broker counts all joined hotels for a hotkey, including pending or draining ones, and refuses the next join at the cap. Changing a cap requires a config restart; the broker has no cap hot reload yet. |
 | `sealed_host_data` | Its HOST_DATA must be in this list. |
 | `attest_ttl_seconds`, `attest_every_seconds` | As above. |
 | `sealed_admission` | `"off"` turns the attestation gate off for joined operator hotels only. Miner hotels always require the SEV-SNP and AMD chain checks. |

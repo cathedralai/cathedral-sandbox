@@ -363,7 +363,7 @@ func newChainState(t *testing.T, stateDir string) *testChain {
 		t.Fatal(err)
 	}
 	tc := &testChain{hotels: map[string]*fakeHotel{}, amdDir: fakeAMDVerifier(t)}
-	cfg := config{StateDir: stateDir, OperatorKeySHA256: sha("operator-key"), InsecureCookie: true, SealedMeasurements: []string{strings.Repeat("ab", 48), strings.Repeat("22", 48)}, Guests: []guestConfig{{ID: "g1", KeySHA256: sha("key1"), ViewTokenSHA256: sha("view1")}, {ID: "g2", KeySHA256: sha("key2")}},
+	cfg := config{StateDir: stateDir, OperatorKeySHA256: sha("operator-key"), InsecureCookie: true, SealedMeasurements: []string{strings.Repeat("ab", 48), strings.Repeat("22", 48)}, MinerHotkeyCaps: map[string]int{minerHotkey: 256}, Guests: []guestConfig{{ID: "g1", KeySHA256: sha("key1"), ViewTokenSHA256: sha("view1")}, {ID: "g2", KeySHA256: sha("key2")}},
 		AMDVerifier: &amdVerifierConfig{Command: []string{"/bin/sh", filepath.Join(tc.amdDir, "verify.sh")}, ARKSHA256: arkPins{testARKPin}}}
 	for _, id := range []string{"a", "b", "c"} {
 		f := &fakeHotel{t: t, snaps: map[string]map[string]any{}}

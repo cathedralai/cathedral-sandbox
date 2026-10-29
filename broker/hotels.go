@@ -22,6 +22,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -39,6 +40,11 @@ type hotelSet struct {
 	list []*hotel
 	byID map[string]*hotel
 }
+
+var (
+	errMinerNotApproved = errors.New("miner hotkey is not approved for broker hotels")
+	errMinerCapReached  = errors.New("miner hotkey hotel cap reached")
+)
 
 func (b *broker) hotelList() []*hotel {
 	if s := b.hset.Load(); s != nil {
@@ -121,6 +127,23 @@ func (b *broker) addHotel(h *hotel) error {
 	b.hotelsMu.Lock()
 	defer b.hotelsMu.Unlock()
 	old := b.hset.Load()
+	if hotkey := h.cfg.MinerHotkey; hotkey != "" {
+		cap := b.cfg.MinerHotkeyCaps[hotkey]
+		if cap < 1 {
+			return errMinerNotApproved
+		}
+		used := 0
+		if old != nil {
+			for _, existing := range old.list {
+				if existing.cfg.MinerHotkey == hotkey {
+					used++
+				}
+			}
+		}
+		if used >= cap {
+			return fmt.Errorf("%w (%d)", errMinerCapReached, cap)
+		}
+	}
 	next := &hotelSet{byID: map[string]*hotel{}}
 	if old != nil {
 		if old.byID[h.cfg.ID] != nil {
@@ -311,6 +334,14 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request) {
 	h.leaving = true
 	if err := b.addHotel(h); err != nil {
 		cancel()
+		if errors.Is(err, errMinerNotApproved) {
+			writeErr(w, 403, "miner_not_approved", err.Error())
+			return
+		}
+		if errors.Is(err, errMinerCapReached) {
+			writeErr(w, 409, "miner_cap_reached", err.Error())
+			return
+		}
 		writeErr(w, 409, "hotel_exists", err.Error())
 		return
 	}
