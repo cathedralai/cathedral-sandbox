@@ -38,6 +38,8 @@ jobs:
             base: ghcr.io/huggingface/openenv-coding-env@sha256:995ebc9b443c29a14882a0ad1b37ed26d5e9086bd85500e49e9d06c18295bda6
           - slug: openenv-wordle
             base: ghcr.io/huggingface/openenv-textarena-env@sha256:6659db69111c03e4303875ddd0bbc2217bc6c4b46921b15389cc0937391d917b
+            # TextArena fetches NLTK data at start; bake it in (see the Dockerfile).
+            textarena_offline: "1"
           - slug: openenv-openspiel
             base: ghcr.io/huggingface/openenv-openspiel-env@sha256:4e0b22f1c64d2593cdd6438ae4bbc8fa163b031c756d8c37bd6514f83e3ad6d6
     concurrency:
@@ -162,6 +164,7 @@ jobs:
           build-args: |
             BASE_IMAGE=${{ matrix.base }}
             ENV_CMD=${{ steps.base.outputs.env_cmd }}
+            TEXTARENA_OFFLINE=${{ matrix.textarena_offline }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
           provenance: mode=max
@@ -189,8 +192,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Run the published digest the way a sandbox does: network none and the
-      # keepalive command. Both servers must answer, and the model must answer
-      # through lfm3-ask and through the OpenAI-compatible endpoint.
+      # keepalive command. Both servers must answer, the model must answer
+      # through lfm3-ask and through the OpenAI-compatible endpoint, and the
+      # environment must reset.
       - name: Smoke test the published digest
         shell: bash
         env:
@@ -227,12 +231,15 @@ jobs:
           grep -Eiq '\b(4|four)\b' <<< "$answer"
           health="$(docker exec smoke curl -fsS http://127.0.0.1:8000/health)"
           printf 'environment /health: %s\n' "$health"
+          reset="$(docker exec smoke curl -fsS -X POST http://127.0.0.1:8000/reset -H 'Content-Type: application/json' -d '{}')"
+          printf 'environment /reset: %.300s\n' "$reset"
           {
             echo
             echo '```'
             printf '%s\n' "$ask"
             printf 'chat/completions: %s\n' "$answer"
             printf 'environment /health: %s\n' "$health"
+            printf 'environment /reset: %.300s\n' "$reset"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

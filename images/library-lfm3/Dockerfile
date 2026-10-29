@@ -72,6 +72,20 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libgomp1 libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
+# TextArena (Wordle) downloads two NLTK packages every time it starts, which
+# fails with network deny_all. TEXTARENA_OFFLINE=1 bakes them into
+# /usr/share/nltk_data and marks them present, so the environment starts
+# sealed. The build fails if the module no longer has that flag.
+ARG TEXTARENA_OFFLINE=""
+RUN if [ "${TEXTARENA_OFFLINE}" = 1 ]; then \
+      python -m nltk.downloader --quiet --exit-on-error -d /usr/share/nltk_data words averaged_perceptron_tagger_eng \
+      && module="$(python -c 'import textarena_env.server.environment as m; print(m.__file__)')" \
+      && grep -q '^_NLTK_DOWNLOADED = False$' "$module" \
+      && sed -i 's/^_NLTK_DOWNLOADED = False$/_NLTK_DOWNLOADED = True/' "$module" \
+      && rm -f "$(dirname "$module")"/__pycache__/environment.*.pyc \
+      && python -c 'import nltk, textarena_env.server.environment as m; assert m._NLTK_DOWNLOADED; nltk.data.find("corpora/words"); nltk.data.find("taggers/averaged_perceptron_tagger_eng")'; \
+    fi
+
 COPY --from=build /opt/llama /opt/llama
 COPY --from=room /opt/lfm3 /opt/lfm3
 COPY --from=room /usr/local/bin/lfm3-ask /usr/local/bin/lfm3-ask

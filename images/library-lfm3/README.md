@@ -68,7 +68,13 @@ not match their sha256.
 
 Each job smoke tests the published digest with network none and the keepalive
 command: both servers must answer, `lfm3-ask` must say 4, and so must
-`/v1/chat/completions`.
+`/v1/chat/completions`, and the environment must answer `/reset`.
+
+Wordle (TextArena) downloads two NLTK packages every time it starts, so the
+plain OpenEnv image does not start with network `deny_all`. Its matrix entry
+sets `TEXTARENA_OFFLINE=1`: the build bakes `words` and
+`averaged_perceptron_tagger_eng` into `/usr/share/nltk_data` and sets
+TextArena's "already downloaded" flag. The build fails if that flag is gone.
 
 ## Visibility
 
