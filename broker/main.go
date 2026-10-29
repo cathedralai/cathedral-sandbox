@@ -1849,7 +1849,11 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if p == "/v1/broker/capacity" && r.Method == "GET" && b.isOperator(r) {
-		b.handleCapacity(w, nil) // every hotel; a guest key gets its own view (serveNative)
+		b.handleCapacity(w, nil, false) // every hotel; a guest key gets its own view (serveNative)
+		return
+	}
+	if p == "/v1/broker/capacity" && r.Method == "GET" && b.isMinerEnroller(r) {
+		b.handleCapacity(w, nil, true) // miner hotels only
 		return
 	}
 	if p == "/v1/broker/guests" || strings.HasPrefix(p, "/v1/broker/guests/") {
@@ -1928,7 +1932,7 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 		case p == "/v1/broker/hotels" && r.Method == "GET":
 			b.handleHotels(w, g)
 		case p == "/v1/broker/capacity" && r.Method == "GET":
-			b.handleCapacity(w, g)
+			b.handleCapacity(w, g, false)
 		case p == "/v1/broker/stats":
 			b.handleStats(w, r, g)
 		case p == "/v1/broker/probe" && r.Method == "POST":

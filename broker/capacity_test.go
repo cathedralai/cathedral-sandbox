@@ -221,6 +221,32 @@ func catalogEntry(doc map[string]any, id string) (map[string]any, bool) {
 	return nil, false
 }
 
+func TestMinerEnrollerCapacityIsScopedAndReportsUnmetTLSPin(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	joinMiner(t, tc, "m1", true, 1, nil)
+	status, scoped := tc.call(t, "enroller-key", "GET", "/v1/broker/capacity", nil)
+	if status != 200 || !listed(scoped, "m1") || listed(scoped, "a") || listed(scoped, "b") {
+		t.Fatalf("scoped miner catalog: %d %v", status, scoped)
+	}
+	policy, ok := scoped["admission_policy"].(map[string]any)
+	if !ok || policy["amd_verifier"] != true || policy["miner_tls_pin"] != false {
+		t.Fatalf("scoped policy must report the missing TLS pin: %v", policy)
+	}
+	measurements, _ := policy["sealed_measurements"].([]any)
+	caps, _ := policy["miner_hotkey_caps"].(map[string]any)
+	if len(measurements) == 0 || caps[minerHotkey] != float64(256) {
+		t.Fatalf("scoped policy lacks the broker allowlist or cap: %v", policy)
+	}
+	status, operator := tc.call(t, "operator-key", "GET", "/v1/broker/capacity", nil)
+	if status != 200 || !listed(operator, "a") || !listed(operator, "m1") || operator["admission_policy"] == nil {
+		t.Fatalf("operator catalog: %d %v", status, operator)
+	}
+	status, guest := tc.call(t, "key1", "GET", "/v1/broker/capacity", nil)
+	if status != 200 || guest["admission_policy"] != nil {
+		t.Fatalf("guest saw operator policy: %d %v", status, guest)
+	}
+}
+
 func TestCatalogTruth(t *testing.T) {
 	tc := policyChain(t, "")
 	addFakeHotel(t, tc, "s2", true)

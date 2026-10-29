@@ -375,7 +375,8 @@ With `operator_key_sha256` (SHA-256 of the operator key) and `state_dir` in
 the config, an operator adds and removes hotels without a restart:
 
 `miner_enroll_key_sha256` is a separate control-plane key for the miner
-reconciler. It can read miner hotel documents, request sealed miner hotel
+reconciler. It can read miner hotel documents and a miner-only capacity view,
+request sealed miner hotel
 joins with HTTPS API and health endpoints, set `drain=true` on a miner hotel,
 and leave an empty miner hotel. It cannot read or change operator hotels,
 change guest policy, plant Escape nonces, opt out of join verification, set
@@ -384,6 +385,10 @@ the operator key and every guest key or view token. The approved hotkey cap
 still applies. Scoped joins currently fail closed with `guest_tls_required`
 before sending the hotel key to the remote endpoint. Room-kit guest-bound
 TLS and guest-only key custody must land before this route can enroll miners.
+The operator and miner-only capacity views report `admission_policy` with the
+configured measurement allowlist and hotkey caps. `miner_tls_pin` is `false`
+until attested guest TLS peer pinning is implemented; customer guests never
+receive this policy document.
 
 | Route (operator key) | What it does |
 |---|---|

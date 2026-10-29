@@ -258,14 +258,18 @@ func (b *broker) addTotals(t map[string]*classTotals, e capacityEntry, now time.
 
 var tierRank = map[string]int{tierPrefer: 0, tierAllow: 1, "hotels": 2}
 
-// handleCapacity serves GET /v1/broker/capacity. g is nil for the operator.
-func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState) {
+// handleCapacity serves GET /v1/broker/capacity. g is nil for operator and
+// miner enroller views. The enroller sees only miner hotels.
+func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly bool) {
 	b.mu.Lock()
 	now := time.Now()
 	out := []map[string]any{}
 	var guest map[string]any
 	totals := map[string]*classTotals{classSealed: {}, classUnsealed: {}}
 	for _, e := range b.capacityEntries() {
+		if minerOnly && e.h.cfg.MinerHotkey == "" {
+			continue
+		}
 		if g == nil {
 			out = append(out, b.capacityDoc(e, now))
 			b.addTotals(totals, e, now)
@@ -295,6 +299,20 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState) {
 	doc := map[string]any{"hotels": out, "classes": totals}
 	if guest != nil {
 		doc["guest"] = guest
+	} else {
+		sealedAdmission := b.cfg.SealedAdmission
+		if sealedAdmission == "" {
+			sealedAdmission = "on"
+		}
+		// Guest-bound TLS pinning is not implemented yet. Keep this false
+		// until the broker verifies the observed peer against SNP REPORT_DATA.
+		doc["admission_policy"] = map[string]any{
+			"sealed_admission":    sealedAdmission,
+			"amd_verifier":        b.cfg.AMDVerifier != nil,
+			"sealed_measurements": append([]string{}, b.cfg.SealedMeasurements...),
+			"miner_hotkey_caps":   b.cfg.MinerHotkeyCaps,
+			"miner_tls_pin":       false,
+		}
 	}
 	writeJSON(w, 200, doc)
 }
