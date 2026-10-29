@@ -1,7 +1,7 @@
 # Pinned inputs. install.sh refuses any download whose checksum differs.
-GVISOR_RELEASE=20260928.0
-GVISOR_URL=https://storage.googleapis.com/gvisor/releases/release/20260928.0/x86_64/gvisor.tar.bz2
-GVISOR_SHA512=c8d3a9fd4d4c4f5b8ff213caa4517356be128d18659ec4cde37828fe797f61a9725a602a846c81a8ed19c057a996515d31c081eba343ed4613a89951ba32ed59
+GVISOR_RELEASE=20261026.0
+GVISOR_URL=https://storage.googleapis.com/gvisor/releases/release/20261026.0/x86_64/gvisor.tar.bz2
+GVISOR_SHA512=26e4a327565f5da0f73261a6387e2c20f4695a232e330095a3111b70efd604fdf09d734e8cc8f714dbb5c5607ce8c87ea80b26df549d83a146f2efd5a1af448a
 UV_VERSION=0.12.24
 UV_URL=https://github.com/astral-sh/uv/releases/download/0.12.24/uv-x86_64-unknown-linux-gnu.tar.gz
 UV_SHA256=b4dfaef47d491a7296981f8374a4595f55dbf84e8937c8ecd2983574d8bb3da6
