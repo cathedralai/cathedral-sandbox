@@ -75,6 +75,13 @@ from cathedral.claims_evidence import (
     parse_claims_evidence_trusted_keys_json,
     verify_claims_evidence,
 )
+from cathedral.claims_room import (
+    ClaimsRunError,
+    ClaimsStageSpec,
+    HttpBrokerTransport,
+    parse_uploads,
+    run_claims_stage_and_issue,
+)
 from cathedral.affine_claim_cvm import (
     cvm_instance_from_running_document,
     issue_affine_claim_from_cvm,
@@ -966,6 +973,80 @@ def cmd_claims_evidence_issue(args: argparse.Namespace) -> int:
         return 1
     print(json.dumps({"issued": True, "out": args.out, "bytes": len(evidence)}, sort_keys=True))
     return 0
+
+
+def cmd_claims_evidence_run(args: argparse.Namespace) -> int:
+    try:
+        job = json.loads(
+            _read_bounded_claims_file(
+                args.job, "claims job", maximum_bytes=MAX_CLAIMS_EVIDENCE_BYTES, category="schema"
+            ).decode("utf-8")
+        )
+        source_pdf = _read_bounded_claims_file(
+            args.source_pdf,
+            "source PDF",
+            maximum_bytes=MAX_CLAIMS_OBSERVED_PDF_BYTES,
+            category="schema",
+        )
+        source_payload = _read_bounded_claims_file(
+            args.source_payload,
+            "source_payload",
+            maximum_bytes=MAX_CLAIMS_OBSERVED_JSON_BYTES,
+            category="schema",
+        )
+        trusted_keys = parse_claims_evidence_trusted_keys_json(
+            _read_bounded_claims_file(
+                args.trusted_keys,
+                "claims evidence trusted keys",
+                maximum_bytes=MAX_CLAIMS_TRUSTED_KEYS_BYTES,
+                category="key",
+            )
+        )
+        key_bytes = Path(args.signing_key).read_bytes()
+        if len(key_bytes) != 32:
+            raise ClaimsEvidenceError("key", "signing key must be 32 raw ed25519 bytes")
+        private_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
+        guest_key = Path(args.guest_key_file).read_text(encoding="utf-8").strip()
+        if not guest_key:
+            raise ClaimsRunError("key", "broker guest key file is empty")
+        stage = ClaimsStageSpec(
+            image=args.image,
+            command=args.command,
+            workload_commit_ref=args.workload_commit,
+            output_path=args.output_path,
+            input_dir=args.input_dir,
+            timeout_seconds=args.timeout_seconds,
+            sealed=not args.unsealed,
+            network_mode=args.network_mode,
+            extra_uploads=parse_uploads(args.upload or ()),
+            forbidden_hotels=tuple(args.forbid_hotel or ()),
+        )
+        result = run_claims_stage_and_issue(
+            transport=HttpBrokerTransport(args.broker_url),
+            guest_key=guest_key,
+            job=job,
+            source_pdf=source_pdf,
+            source_payload=source_payload,
+            stage=stage,
+            private_key=private_key,
+            signing_key_id=args.signing_key_id,
+            trusted_keys=trusted_keys,
+            out_dir=Path(args.out_dir),
+        )
+    except (
+        ClaimsEvidenceError,
+        ClaimsRunError,
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        category = getattr(exc, "category", "input")
+        print(json.dumps({"ok": False, "category": category, "error": str(exc)}, sort_keys=True))
+        return 1
+    print(json.dumps(result.summary(), sort_keys=True))
+    if result.ok:
+        return 0
+    return 2 if result.terminal_status == "succeeded" else 1
 
 
 def cmd_claims_evidence_verify(args: argparse.Namespace) -> int:
@@ -5478,6 +5559,43 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("succeeded", "failed", "cancelled"),
     )
     p_claims_issue.set_defaults(func=cmd_claims_evidence_issue)
+
+    p_claims_run = claims_evidence_sub.add_parser(
+        "run",
+        help="run one Claims stage in a broker room, then issue and self-verify evidence",
+    )
+    p_claims_run.add_argument("--broker-url", required=True)
+    p_claims_run.add_argument("--guest-key-file", required=True, help="broker guest Bearer key")
+    p_claims_run.add_argument("--job", required=True, help="Claims job ids JSON")
+    p_claims_run.add_argument("--source-pdf", required=True)
+    p_claims_run.add_argument("--source-payload", required=True)
+    p_claims_run.add_argument("--image", required=True, help="room image (pin @sha256 to bind)")
+    p_claims_run.add_argument(
+        "--command",
+        required=True,
+        help="sh -c command; must write agent_output JSON to --output-path",
+    )
+    p_claims_run.add_argument("--workload-commit", required=True, help="Claims workload commit")
+    p_claims_run.add_argument("--output-path", default="/work/claims-out/agent_output.json")
+    p_claims_run.add_argument("--input-dir", default="/work/claims-in")
+    p_claims_run.add_argument("--timeout-seconds", type=int, default=1800)
+    p_claims_run.add_argument(
+        "--upload", action="append", help="extra input LOCAL=/abs/room/path (repeatable)"
+    )
+    p_claims_run.add_argument(
+        "--unsealed", action="store_true", help="allow an unsealed room (default sealed)"
+    )
+    p_claims_run.add_argument(
+        "--network-mode", default="deny_all", choices=("deny_all", "internet")
+    )
+    p_claims_run.add_argument(
+        "--forbid-hotel", action="append", help="fail closed if the room lands here"
+    )
+    p_claims_run.add_argument("--signing-key", required=True, help="32-byte raw ed25519 key")
+    p_claims_run.add_argument("--signing-key-id", required=True)
+    p_claims_run.add_argument("--trusted-keys", required=True, help="for the self-verify")
+    p_claims_run.add_argument("--out-dir", required=True)
+    p_claims_run.set_defaults(func=cmd_claims_evidence_run)
 
     p_claims_verify = claims_evidence_sub.add_parser(
         "verify",
