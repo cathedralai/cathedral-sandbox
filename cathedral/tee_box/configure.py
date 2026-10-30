@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 from cathedral.common import ChannelBinding
 from cathedral.tee_box import measured_root
+from cathedral.tee_box.attest import DEFAULT_ATTEST_PER_MINUTE, GuestAttestor
 from cathedral.tee_box.boot import BootError, BootGuard, SysfsRtmr3, marker_path_for
 from cathedral.tee_box.egress import (
     DEFAULT_BANDWIDTH_MBIT,
@@ -44,6 +45,13 @@ from cathedral.tee_box.executor import (
     ExecutorError,
     RunscExecutor,
     Shape,
+)
+from cathedral.tee_box.daemon_reload import DaemonReloader, DaemonReloadError
+from cathedral.tee_box.tunables import (
+    Tunables,
+    TunablesError,
+    default_tunables,
+    load_tunables_file,
 )
 from cathedral.tee_box.storage import (
     StorageError,
@@ -76,6 +84,9 @@ OPTIONAL = (
     "tee_box_bandwidth_mbit",
     "tee_box_id",
     "tee_box_no_disk_quota",
+    "tee_box_tunables",
+    "tee_box_daemon_json",
+    "tee_box_attest_per_minute",
 )
 
 
@@ -146,6 +157,31 @@ def add_tee_box_arguments(command: argparse.ArgumentParser) -> None:
     )
     group.add_argument("--tee-box-id", help="container label for this box (default: default)")
     group.add_argument(
+        "--tee-box-tunables",
+        help=(
+            "start-up tunables file (JSON, docs/TEE_BOX_TUNABLES.md): runsc flags, log driver, "
+            "image priming, warm pool, create concurrency. Unknown keys are refused; "
+            "no file means today's behaviour"
+        ),
+    )
+    group.add_argument(
+        "--tee-box-daemon-json",
+        help=(
+            "absolute path of the Docker daemon.json. With it, tunables.apply may change the "
+            "runsc flags while the box holds no sandbox (rewrites the runsc entry, then "
+            "systemctl reload docker), and a start whose daemon flags differ from the "
+            "tunables file syncs them. Without it a runsc change needs a worker restart"
+        ),
+    )
+    group.add_argument(
+        "--tee-box-attest-per-minute",
+        type=int,
+        help=(
+            "attest.report: fresh SEV-SNP reports over caller REPORT_DATA allowed per 60 s "
+            f"(default {DEFAULT_ATTEST_PER_MINUTE})"
+        ),
+    )
+    group.add_argument(
         "--tee-box-no-disk-quota",
         action="store_true",
         default=None,
@@ -167,6 +203,10 @@ class TeeBoxConfig:
     bandwidth_mbit: int
     box_id: str
     disk_quota: bool
+    tunables: Tunables
+    tunables_source: str = "default"
+    daemon_json: str | None = None
+    attest_per_minute: int = DEFAULT_ATTEST_PER_MINUTE
 
 
 def tee_box_config(args: argparse.Namespace) -> TeeBoxConfig | None:
@@ -198,6 +238,16 @@ def tee_box_config(args: argparse.Namespace) -> TeeBoxConfig | None:
         value = getattr(args, name, None)
         return default if value is None else value
 
+    tunables_path = getattr(args, "tee_box_tunables", None)
+    try:
+        tunables = (
+            default_tunables() if tunables_path is None else load_tunables_file(tunables_path)
+        )
+    except TunablesError as exc:
+        raise ValueError(f"--tee-box-tunables: {exc}") from exc
+    attest_per_minute = pick("tee_box_attest_per_minute", DEFAULT_ATTEST_PER_MINUTE)
+    if not 1 <= attest_per_minute <= 600:
+        raise ValueError("--tee-box-attest-per-minute must be 1 to 600")
     return TeeBoxConfig(
         central_state=args.tee_box_central_state,
         executor=args.tee_box_executor,
@@ -211,6 +261,10 @@ def tee_box_config(args: argparse.Namespace) -> TeeBoxConfig | None:
         bandwidth_mbit=pick("tee_box_bandwidth_mbit", DEFAULT_BANDWIDTH_MBIT),
         box_id=pick("tee_box_id", "default"),
         disk_quota=not bool(getattr(args, "tee_box_no_disk_quota", None)),
+        tunables=tunables,
+        tunables_source="default" if tunables_path is None else "file",
+        daemon_json=getattr(args, "tee_box_daemon_json", None),
+        attest_per_minute=attest_per_minute,
     )
 
 
@@ -347,8 +401,24 @@ def build_tee_box_api(
         storage_quota=config.disk_quota,
         runner=runner,
         box_id=config.box_id,
+        tunables=config.tunables,
+        warm_shape=config.default_shape,
     )
+    reloader = None
+    if config.daemon_json is not None:
+        try:
+            reloader = DaemonReloader(config.daemon_json, runner=runner)
+        except ValueError as exc:
+            raise ValueError(f"--tee-box-daemon-json: {exc}") from exc
     registered, runtime_detail = executor.runtime_check()
+    if not registered and reloader is not None:
+        # A tunables.apply before the last restart may have left other runsc flags in the
+        # daemon: put back the ones this start's tunables file names, then check again.
+        try:
+            reloader.sync(executor.daemon_runtime_config(), executor.runtime_check)
+        except DaemonReloadError as exc:
+            raise ValueError(f"TEE box runtime: {runtime_detail}; daemon sync: {exc}") from exc
+        registered, runtime_detail = executor.runtime_check()
     if not registered:
         raise ValueError(f"TEE box runtime: {runtime_detail}")
     try:
@@ -373,6 +443,11 @@ def build_tee_box_api(
         capacity=config.capacity,
         default_shape=config.default_shape,
         boot=boot,
+        create_concurrency=config.tunables.create_concurrency,
+        tunables_source=config.tunables_source,
+        daemon_reloader=reloader,
+        # Answers only on an SEV-SNP guest (TSM provider sev_guest); elsewhere a 503.
+        attestor=GuestAttestor(per_minute=config.attest_per_minute),
     )
     facts = {
         "central_root_keys": measured_root.CENTRAL_ROOT_KEYS_PATH,
@@ -390,6 +465,12 @@ def build_tee_box_api(
             "swap": swap,
             "docker_root": docker_root,
             "scratch": scratch,
+        },
+        "tunables": {
+            "sha256": config.tunables.sha256,
+            "source": config.tunables_source,
+            "values": config.tunables.nested(),
+            "daemon_json": config.daemon_json,
         },
         "capacity": config.capacity.view(),
         "default_shape": config.default_shape.view(),

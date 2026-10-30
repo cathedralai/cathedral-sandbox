@@ -153,7 +153,8 @@ Citations are `file:line` in this repository.
 - **API** (`cathedral/tee_box/service.py:314`). The routes are listed in
   `cathedral/tee_box/service.py:88`, and the central-access scope each needs
   in `cathedral/tee_box/service.py:123`. Only `GET /v1/box`, the revocation
-  push and the lease routes run without a lease
+  push, the lease routes, `GET /v1/box/tunables` and `POST /v1/box/attest`
+  run without a lease
   (`cathedral/tee_box/service.py:473`).
 
 | Call | Route | Scope |
@@ -161,6 +162,8 @@ Citations are `file:line` in this repository.
 | Box contract | `GET /v1/box` | `tee-box:box` |
 | Revocation list | `POST /v1/box/revocations` (the root-signed list) | `tee-box:revocations` |
 | Lease | `GET`, `POST` (`ttl_seconds`), `DELETE /v1/lease` | `tee-box:lease` |
+| Tunables (`tunables.get`, `tunables.apply`) | `GET /v1/box/tunables`; `POST /v1/box/tunables` (body: a tunables document) | `tee-box:tunables` |
+| Attestation (`attest.report`) | `POST /v1/box/attest` (`report_data_hex`) | `tee-box:attest` |
 | Image import | `POST /v1/images/import` (`digest`, `reference`), `GET /v1/images/{digest}` | `tee-box:image-import` |
 | Create | `POST /v1/sandboxes` (`image_id`, `network`, `lifetime_seconds`, optional `shape`, `labels`, `env`) | `tee-box:create` |
 | List | `GET /v1/sandboxes?label=k=v` | `tee-box:list` |
@@ -171,6 +174,11 @@ Citations are `file:line` in this repository.
 | Files | `PUT`/`GET .../files?path=&mode=`, `PUT`/`GET .../tar?path=&exclude=`, `GET .../stat?path=` | `tee-box:files` |
 
 v1 has no snapshot, fork, port or Docker-in-Docker routes.
+
+The tunables and attestation verbs are described in
+[TEE_BOX_TUNABLES.md](TEE_BOX_TUNABLES.md#verbs) and
+[TEE_BOX_ATTEST.md](TEE_BOX_ATTEST.md). A central delegation reaches them
+only when the root signs it with the new scopes.
 
 Every sandbox reports `"hardware": "standard"`
 (`cathedral/tee_box/service.py:430`). Exec takes `env`, `user`, `cwd` and

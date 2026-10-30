@@ -15,6 +15,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from cathedral.common import (
@@ -331,6 +332,45 @@ def _collect_configfs_tsm_quote(
                 if blob:
                     cert_chain.append(blob)
         return quote, cert_chain
+    finally:
+        report_dir.rmdir()
+
+
+@dataclass(frozen=True)
+class TsmReport:
+    """One configfs-tsm report: the provider name, ``outblob`` and ``auxblob``."""
+
+    provider: str
+    outblob: bytes
+    auxblob: bytes
+
+
+def read_configfs_tsm_report(
+    report_data_bytes: bytes, *, root: Path = _DEFAULT_TSM_REPORT_ROOT
+) -> TsmReport:
+    """Ask configfs-tsm for one report whose REPORT_DATA is exactly these 64 bytes.
+
+    The bytes go to ``inblob`` verbatim, never hashed. ``auxblob`` is the host's
+    certificate table on SEV-SNP when the host stored one (empty otherwise). A fresh
+    report directory per call avoids generation-counter races, as in
+    ``_collect_configfs_tsm_quote``.
+    """
+
+    if len(report_data_bytes) != 64:
+        raise ValueError("REPORT_DATA must be exactly 64 bytes")
+    if not root.exists():
+        raise FileNotFoundError(f"configfs-tsm report root not found: {root}")
+    report_dir = root / f"cathedral-{os.getpid()}-{secrets.token_hex(8)}"
+    report_dir.mkdir(mode=0o700, exist_ok=False)
+    try:
+        (report_dir / "inblob").write_bytes(report_data_bytes)
+        outblob = (report_dir / "outblob").read_bytes()
+        provider = (report_dir / "provider").read_text().strip()
+        try:
+            auxblob = (report_dir / "auxblob").read_bytes()
+        except OSError:
+            auxblob = b""
+        return TsmReport(provider=provider, outblob=outblob, auxblob=auxblob)
     finally:
         report_dir.rmdir()
 

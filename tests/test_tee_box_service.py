@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from cathedral import central_access as ca
+from cathedral.attest import TsmReport
 from cathedral.policy_registry import canonical_json
 from cathedral.tee_box import (
     FakeExecutor,
@@ -30,6 +31,7 @@ from cathedral.tee_box import (
     build_egress_policy,
     route_scope,
 )
+from cathedral.tee_box.attest import GuestAttestor
 from cathedral.tee_box.boot import BootGuard, rtmr_extend
 from cathedral.tee_box.executor import ExecResult
 from cathedral.worker import WorkerServer
@@ -209,8 +211,32 @@ def _boot(boot_ids=None, marker=None, clock=None) -> BootGuard:
     )
 
 
+def fake_snp_report(report_data: bytes, measurement: bytes = bytes(range(48))) -> bytes:
+    """1184 bytes in the SNP layout: REPORT_DATA, MEASUREMENT, CHIP_ID and a signature set."""
+
+    report = bytearray(1184)
+    report[0:4] = (2).to_bytes(4, "little")
+    report[0x50:0x90] = report_data
+    report[0x90:0xC0] = measurement
+    report[0x1A0:0x1E0] = b"\xc1" * 64
+    report[0x2A0 : 0x2A0 + 512] = b"\x01" * 512  # nonempty, unverified
+    return bytes(report)
+
+
+def _fake_attestor() -> GuestAttestor:
+    return GuestAttestor(reader=lambda data: TsmReport("sev_guest", fake_snp_report(data), b""))
+
+
 def _api(
-    tmp_path: Path, binding, *, clock=None, executor=None, ready=True, boot_ids=None, marker=None
+    tmp_path: Path,
+    binding,
+    *,
+    clock=None,
+    executor=None,
+    ready=True,
+    boot_ids=None,
+    marker=None,
+    attestor=None,
 ):
     fake = executor or FakeExecutor()
     kwargs = {} if clock is None else {"clock": clock}
@@ -221,6 +247,7 @@ def _api(
         capacity=CAPACITY,
         default_shape=DEFAULT_SHAPE,
         boot=_boot(boot_ids, marker, clock),
+        attestor=attestor or _fake_attestor(),
         **kwargs,
     )
     if ready:
@@ -769,6 +796,9 @@ _SCOPED_ROUTES = (
     ("tee-box:box", "GET", "/v1/box", None),
     ("tee-box:lease", "GET", "/v1/lease", None),
     ("tee-box:lease", "POST", "/v1/lease", {"ttl_seconds": 600}),
+    ("tee-box:tunables", "GET", "/v1/box/tunables", None),
+    ("tee-box:tunables", "POST", "/v1/box/tunables", {"schema": 1}),
+    ("tee-box:attest", "POST", "/v1/box/attest", {"report_data_hex": "ab" * 64}),
     (
         "tee-box:image-import",
         "POST",

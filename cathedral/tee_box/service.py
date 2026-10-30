@@ -27,9 +27,10 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from urllib.parse import parse_qsl
 
@@ -39,7 +40,9 @@ from cathedral.central_access import (
     CentralAccessError,
 )
 from cathedral.policy_registry import canonical_json, parse_registry_json
+from cathedral.tee_box.attest import AttestRateLimited, AttestUnavailable, GuestAttestor
 from cathedral.tee_box.boot import BootError, BootGuard, RelaunchRequired, RtmrError
+from cathedral.tee_box.daemon_reload import DaemonReloader, DaemonReloadError
 from cathedral.tee_box.egress import EgressPolicy
 from cathedral.tee_box.executor import (
     MAX_FILE_BYTES,
@@ -64,6 +67,7 @@ from cathedral.tee_box.lease import (
     LeaseDraining,
     LeaseRequired,
 )
+from cathedral.tee_box.tunables import Tunables, TunablesError, default_tunables, parse_tunables
 
 TEE_BOX_API_SCHEMA = "cathedral_tee_box_v1"
 HARDWARE_CLASS = "standard"
@@ -90,6 +94,9 @@ _ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = tuple(
     for method, pattern, name in (
         ("GET", r"/v1/box", "box"),
         ("POST", r"/v1/box/revocations", "revocations"),
+        ("GET", r"/v1/box/tunables", "tunables_get"),
+        ("POST", r"/v1/box/tunables", "tunables_apply"),
+        ("POST", r"/v1/box/attest", "attest_report"),
         ("GET", r"/v1/lease", "lease_get"),
         ("POST", r"/v1/lease", "lease_acquire"),
         ("DELETE", r"/v1/lease", "lease_release"),
@@ -123,6 +130,9 @@ _ROUTES: tuple[tuple[str, re.Pattern[str], str], ...] = tuple(
 ROUTE_SCOPES: Mapping[str, str] = {
     "box": "tee-box:box",
     "revocations": "tee-box:revocations",
+    "tunables_get": "tee-box:tunables",
+    "tunables_apply": "tee-box:tunables",
+    "attest_report": "tee-box:attest",
     "lease_get": "tee-box:lease",
     "lease_acquire": "tee-box:lease",
     "lease_release": "tee-box:lease",
@@ -144,7 +154,17 @@ ROUTE_SCOPES: Mapping[str, str] = {
     "stat": "tee-box:files",
 }
 _PREFIXES = ("/v1/box", "/v1/lease", "/v1/images", "/v1/sandboxes")
-_NO_LEASE_ROUTES = frozenset({"box", "revocations", "lease_get", "lease_acquire", "lease_release"})
+_NO_LEASE_ROUTES = frozenset(
+    {
+        "box",
+        "revocations",
+        "lease_get",
+        "lease_acquire",
+        "lease_release",
+        "tunables_get",
+        "attest_report",
+    }
+)
 # Routes served before the control plane has pushed a revocation list.
 _NO_REVOCATIONS_ROUTES = frozenset({"box", "revocations"})
 MAX_REVOCATIONS_BODY = 512 * 1024
@@ -161,6 +181,7 @@ _LABEL_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 _USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,31})?$")
 _REFERENCE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*(?::[0-9]{1,5})?(?:/[a-z0-9][a-z0-9._-]*)+$")
 _DIGEST_RE = re.compile(rf"^{_DIGEST}$")
+_REPORT_DATA_HEX_RE = re.compile(r"[0-9a-fA-F]{128}")
 
 
 def owns_path(path: str) -> bool:
@@ -325,6 +346,10 @@ class TeeBoxSandboxApi:
         boot: BootGuard,
         max_lease_seconds: int = DEFAULT_MAX_LEASE_SECONDS,
         clock: Callable[[], float] = time.time,
+        create_concurrency: int = 1,
+        tunables_source: str = "default",
+        daemon_reloader: DaemonReloader | None = None,
+        attestor: GuestAttestor | None = None,
     ) -> None:
         if not isinstance(authorizer, CentralAccessAuthorizer):
             raise ValueError("the sandbox API requires a central access authorizer")
@@ -345,6 +370,28 @@ class TeeBoxSandboxApi:
         # pushed, and again whenever it is no longer fresh.
         self._revocations_issued_at: float | None = None
         self.boot = boot
+        if (
+            isinstance(create_concurrency, bool)
+            or not isinstance(create_concurrency, int)
+            or not 1 <= create_concurrency <= 16
+        ):
+            raise ValueError("create concurrency must be 1 to 16")
+        # Creates run outside the lease lock, up to this many at once. What an in-flight create
+        # will take is reserved under the lock first (so admission cannot overcommit), and a
+        # drain waits for every in-flight create (so none lands after the hand-over).
+        self._create_slots = threading.BoundedSemaphore(create_concurrency)
+        # What the box runs now: the start-up file until a tunables.apply replaces it.
+        current = getattr(executor, "tunables", None)
+        self.tunables: Tunables = current if isinstance(current, Tunables) else default_tunables()
+        self._tunables_source = tunables_source
+        self._tunables_applied_at: int | None = None
+        self._daemon_reloader = daemon_reloader
+        self._daemon_confirmed = True
+        self._attestor = attestor
+        self._reserved = Shape(0, 0, 0)
+        self._reserved_count = 0
+        self._inflight = 0
+        self._inflight_cv = threading.Condition(threading.Lock())
         self.lease = CustomerLease(
             self._drain_owner, max_seconds=max_lease_seconds, clock=clock, boot=boot
         )
@@ -361,6 +408,14 @@ class TeeBoxSandboxApi:
         owner also blocks the hand-over.
         """
 
+        # The pool belongs to no customer: it goes at every hand-over. A create already past
+        # admission finishes first, so its sandbox is in the list when the deletes run.
+        discard = getattr(self.executor, "discard_warm", None)
+        if callable(discard):
+            discard()
+        with self._inflight_cv:
+            if not self._inflight_cv.wait_for(lambda: self._inflight == 0, timeout=300):
+                return False
         for info in self.executor.list():
             if info.spec.owner == owner:
                 try:
@@ -409,12 +464,45 @@ class TeeBoxSandboxApi:
                     self.executor.delete(info.sandbox_id)
                 except ExecutorError:
                     pass
+        self._maintain_pool()
+
+    def _maintain_pool(self) -> None:
+        """Keep the warm pool full while a customer holds the lease; empty it otherwise."""
+
+        maintain = getattr(self.executor, "maintain_pool", None)
+        if not callable(maintain):
+            return
+        # current() may run a drain, which must not happen under the lease lock.
+        held = self.lease.current() is not None and not self.lease.draining
+        with self.lease.locked():
+            room = self._room_locked() if held else 0
+        try:
+            maintain(enabled=held, room=room)
+        except ExecutorError:
+            pass
+
+    def _room_locked(self) -> int:
+        """How many more default-shape sandboxes fit, counting warm and in-flight ones."""
+
+        shape = self.default_shape
+        used = self._allocated().plus(self._reserved)
+        count = len(self.executor.list()) + self._reserved_count + self._warm_count()
+        fits = [
+            (getattr(self.capacity, name) - getattr(used, name)) // getattr(shape, name)
+            for name in ("vcpus", "memory_mib", "disk_mib")
+        ]
+        return max(0, min(*fits, MAX_SANDBOXES - count))
+
+    def _warm_count(self) -> int:
+        count = getattr(self.executor, "warm_count", None)
+        return count() if callable(count) else 0
 
     def _allocated(self) -> Shape:
         total = Shape(0, 0, 0)
         for info in self.executor.list():
             total = total.plus(info.spec.shape)
-        return total
+        usage = getattr(self.executor, "warm_usage", None)
+        return total.plus(usage()) if callable(usage) else total
 
     def _owned(self, caller: str, sandbox_id: str) -> SandboxInfo:
         info = self.executor.get(sandbox_id)
@@ -685,6 +773,133 @@ class TeeBoxSandboxApi:
             },
         )
 
+    # -- tunables ----------------------------------------------------------
+
+    def _tunables_view(self) -> dict[str, object]:
+        return {
+            "sha256": self.tunables.sha256,
+            "source": self._tunables_source,
+            "applied_at": self._tunables_applied_at,
+            "values": self.tunables.nested(),
+            "daemon_reload": self._daemon_reloader is not None,
+            "daemon_confirmed": self._daemon_confirmed,
+        }
+
+    def _tunables_get(self, caller, body, fields) -> Response:  # noqa: ANN001
+        self._query(fields, frozenset())
+        return _json(200, self._tunables_view())
+
+    def _tunables_apply(self, caller, body, fields) -> Response:  # noqa: ANN001
+        """Replace the box tunables with the document in ``body`` (tunables.apply).
+
+        Same validation as the start-up file. Running sandboxes are never touched: every
+        tunable acts when a container starts or an image is imported. Refused while a create
+        is in flight. A change of runsc flags reloads the Docker daemon, so it is refused
+        unless the box holds no sandbox (warm containers are discarded first) and the worker
+        was started with ``--tee-box-daemon-json``.
+        """
+
+        self._query(fields, frozenset())
+        try:
+            new = parse_tunables(body)
+        except TunablesError as exc:
+            raise _bad(f"tunables refused: {exc}") from exc
+        previous = self.tunables.sha256
+        reloaded = False
+        with self.lease.locked():
+            self.lease.require_locked(caller)
+            if new.sha256 != previous:
+                with self._inflight_cv:
+                    if self._inflight:
+                        raise _Refusal(
+                            409,
+                            "a sandbox create is in flight; apply tunables between bursts",
+                            "creates_in_flight",
+                        )
+                if new.runtime_args() != self.tunables.runtime_args():
+                    self._reload_daemon_locked(new)
+                    reloaded = True
+                else:
+                    self._set_tunables_locked(new)
+                self._tunables_source = "applied"
+                self._tunables_applied_at = int(self._clock())
+        view = self._tunables_view()
+        view.update(
+            {"previous_sha256": previous, "changed": new.sha256 != previous, "reloaded": reloaded}
+        )
+        return _json(200, view)
+
+    def _set_tunables_locked(self, new: Tunables) -> None:
+        apply = getattr(self.executor, "apply_tunables", None)
+        if callable(apply):
+            apply(new)
+        # A create holds the semaphore it acquired; none is in flight here.
+        self._create_slots = threading.BoundedSemaphore(new.create_concurrency)
+        self.tunables = new
+
+    def _reload_daemon_locked(self, new: Tunables) -> None:
+        if self._daemon_reloader is None:
+            raise _Refusal(
+                409,
+                "runsc flags live in the Docker daemon and this box has no daemon reload "
+                "(--tee-box-daemon-json); restart the worker with the new tunables file",
+                "runsc_change_needs_restart",
+            )
+        if self.executor.list():
+            raise _Refusal(
+                409,
+                "changing runsc flags reloads the Docker daemon; delete every sandbox first",
+                "sandboxes_live",
+            )
+        old = self.tunables
+        self._set_tunables_locked(new)  # empties the warm pool: the start arguments changed
+        render = getattr(self.executor, "daemon_runtime_config", None)
+        check = getattr(self.executor, "runtime_check", None)
+        if not (callable(render) and callable(check)):
+            self._set_tunables_locked(old)
+            raise _Refusal(409, "this executor has no Docker daemon", "runsc_change_needs_restart")
+        try:
+            self._daemon_reloader.sync(render(), check)
+        except DaemonReloadError as exc:
+            self._set_tunables_locked(old)
+            self._daemon_confirmed = exc.restored
+            raise _Refusal(503, f"daemon reload failed: {exc}", "daemon_reload_failed") from exc
+        self._daemon_confirmed = True
+        # The reaper refills the pool outside the lease lock, so a warm container may have
+        # started while the daemon still had the old flags. Bump the generation (a start
+        # still in flight never joins) and empty the pool; the next tick refills it.
+        self._set_tunables_locked(new)
+        discard = getattr(self.executor, "discard_warm", None)
+        if callable(discard):
+            discard()
+
+    # -- attestation -------------------------------------------------------
+
+    def _attest_report(self, caller, body, fields) -> Response:  # noqa: ANN001
+        """A fresh SEV-SNP report whose REPORT_DATA is the caller's 64 bytes (attest.report)."""
+
+        self._query(fields, frozenset())
+        document = _body(body, frozenset({"report_data_hex"}), frozenset({"report_data_hex"}))
+        raw = document["report_data_hex"]
+        if not isinstance(raw, str) or _REPORT_DATA_HEX_RE.fullmatch(raw) is None:
+            raise _bad("report_data_hex must be 128 hex characters (64 bytes)")
+        if self._attestor is None:
+            raise _Refusal(503, "this box has no SEV-SNP attestation report", "attest_unavailable")
+        try:
+            report = self._attestor.report(bytes.fromhex(raw))
+        except AttestRateLimited as exc:
+            return _json(
+                429,
+                {
+                    "error": "too many attestation reports; retry later",
+                    "reason": "attest_rate_limit",
+                    "retry_after_seconds": exc.retry_after,
+                },
+            )
+        except AttestUnavailable as exc:
+            raise _Refusal(503, str(exc), "attest_unavailable") from exc
+        return _json(200, report)
+
     # -- images ----------------------------------------------------------
 
     def _image_import(self, caller, body, fields) -> Response:  # noqa: ANN001
@@ -761,15 +976,14 @@ class TeeBoxSandboxApi:
             raise _Refusal(404, "image not imported")
         labels = _labels(document.get("labels"))
         env = _env(document.get("env"))
-        # Hold the lease lock so a drain cannot miss this sandbox.
+        # Admission and reservation happen under the lease lock; the create itself does not,
+        # so up to ``create_concurrency`` run at once. The reservation counts the new sandbox
+        # against the count and capacity until the executor has recorded it, and a drain waits
+        # for ``_inflight`` to reach zero, so a create cannot land after a hand-over.
+        warm = ""
         with self.lease.locked():
             self.lease.require_locked(caller)
-            sandboxes = self.executor.list()
-            if len(sandboxes) >= MAX_SANDBOXES or not self._allocated().plus(shape).fits_within(
-                self.capacity
-            ):
-                raise _Refusal(409, "the box has no room for this shape", "box_capacity_full")
-            spec = SandboxSpec(
+            probe = SandboxSpec(
                 sandbox_id="sbx-" + secrets.token_hex(12),
                 owner=caller,
                 image=image,
@@ -779,8 +993,54 @@ class TeeBoxSandboxApi:
                 env=env,
                 labels=labels,
             )
-            info = self.executor.create(spec)
+            reserve = getattr(self.executor, "reserve_warm", None)
+            if callable(reserve):
+                warm = reserve(probe)
+            try:
+                self._admit_locked(shape, warm)
+            except _Refusal:
+                if warm:
+                    self.executor.release_warm(warm, image.digest)  # type: ignore[attr-defined]
+                raise
+            spec = replace(probe, warm=warm)
+            self._reserved = self._reserved.plus(shape)
+            self._reserved_count += 1
+            with self._inflight_cv:
+                self._inflight += 1
+        try:
+            with self._create_slots:
+                info = self.executor.create(spec)
+        finally:
+            with self.lease.locked():
+                self._reserved = Shape(
+                    self._reserved.vcpus - shape.vcpus,
+                    self._reserved.memory_mib - shape.memory_mib,
+                    self._reserved.disk_mib - shape.disk_mib,
+                )
+                self._reserved_count -= 1
+            with self._inflight_cv:
+                self._inflight -= 1
+                self._inflight_cv.notify_all()
+        if warm:
+            # Replace the claimed warm container, within the room left after every reservation.
+            self._maintain_pool()
         return _json(201, self._sandbox_view(info))
+
+    def _admit_locked(self, shape: Shape, warm: str) -> None:
+        """Refuse unless the box has room for ``shape`` beyond what is listed, warm and in flight.
+
+        A reserved warm container has already left the pool, so it no longer counts as warm;
+        its slot is what the new sandbox takes. Idle warm containers are evicted to make room.
+        """
+
+        while True:
+            count = len(self.executor.list()) + self._reserved_count + self._warm_count()
+            used = self._allocated().plus(self._reserved)
+            if count < MAX_SANDBOXES and used.plus(shape).fits_within(self.capacity):
+                return
+            evict = getattr(self.executor, "evict_warm", None)
+            if not (callable(evict) and evict()):
+                raise _Refusal(409, "the box has no room for this shape", "box_capacity_full")
 
     def _get(self, caller, body, fields, sid: str) -> Response:  # noqa: ANN001
         return _json(200, self._sandbox_view(self._owned(caller, sid)))
