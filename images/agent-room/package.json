@@ -1,0 +1,9 @@
+{
+  "name": "cathedral-agent-room-tools",
+  "private": true,
+  "description": "Pinned agent CLIs for the agent-room image. npm ci installs them from package-lock.json.",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.312",
+    "@openai/codex": "0.157.1"
+  }
+}

@@ -1,0 +1,13 @@
+#!/bin/sh
+# Entrypoint: make sure HOME is a directory the agent can write, then run the
+# room command (the hotel passes `sleep infinity`).
+#
+# A workspace mounted at /workspace comes up owned by root, so its first room
+# needs agent-home-init (root, through sudo). Later rooms on the same
+# workspace find HOME in place. A failure here must not stop the room: it
+# warns and goes on.
+if [ ! -d "$HOME" ] || [ ! -w "$HOME" ]; then
+    sudo -n /usr/local/sbin/agent-home-init \
+        || echo "agent-room-init: could not make $HOME for the agent" >&2
+fi
+exec "$@"

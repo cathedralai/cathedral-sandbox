@@ -1,0 +1,214 @@
+name: Publish agent room image
+
+# Builds images/agent-room (Claude Code and Codex CLI as a non-root agent,
+# HOME on the workspace) and pushes ghcr.io/cathedralai/agent-room:sha-<commit>.
+# A pull request builds and smoke tests the image without pushing it. A push
+# to main, or a run by hand on a reviewed branch, publishes it. The pin for a
+# room is the digest the run prints in its summary.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/publish-agent-room.yml
+      - images/agent-room/**
+  pull_request:
+    paths:
+      - .github/workflows/publish-agent-room.yml
+      - images/agent-room/**
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  IMAGE_PATH: ghcr.io/cathedralai/agent-room
+
+jobs:
+  check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          version: v0.36.1
+          driver-opts: >-
+            image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+
+      - name: Build the linux/amd64 image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ./images/agent-room
+          file: ./images/agent-room/Dockerfile
+          platforms: linux/amd64
+          pull: true
+          push: false
+          load: true
+          tags: agent-room:check
+
+      - name: Smoke test the image
+        shell: bash
+        run: ./images/agent-room/smoke-test.sh agent-room:check
+
+  publish:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: agent-room-${{ github.sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    outputs:
+      digest: ${{ steps.pin.outputs.digest }}
+      image_ref: ${{ steps.pin.outputs.image_ref }}
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the immutable source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          version: v0.36.1
+          driver-opts: >-
+            image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve the commit tag
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit_tag="sha-${GITHUB_SHA}"
+          echo "commit_tag=${commit_tag}" >> "$GITHUB_OUTPUT"
+          echo "tag_ref=${IMAGE_PATH}:${commit_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to overwrite the commit tag
+        shell: bash
+        env:
+          TAG_REF: ${{ steps.image.outputs.tag_ref }}
+        run: |
+          set -euo pipefail
+          set +e
+          inspection="$(docker buildx imagetools inspect "$TAG_REF" 2>&1)"
+          inspection_status=$?
+          set -e
+          if [[ $inspection_status -eq 0 ]]; then
+            echo "::error::Immutable image tag already exists: $TAG_REF"
+            exit 1
+          fi
+          if grep -Eiq 'manifest unknown|not found' <<< "$inspection"; then
+            exit 0
+          fi
+          echo "::error::Could not prove the immutable image tag is unused"
+          printf '%s\n' "$inspection"
+          exit 1
+
+      - name: Build and publish linux/amd64 image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ./images/agent-room
+          file: ./images/agent-room/Dockerfile
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: ${{ steps.image.outputs.tag_ref }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          provenance: mode=max
+
+      - name: Capture the digest pin
+        id: pin
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG_REF: ${{ steps.image.outputs.tag_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          image_ref="${IMAGE_PATH}@${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image_ref=${image_ref}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Agent room publication"
+            echo
+            echo "Commit tag: \`${TAG_REF}\`"
+            echo
+            echo "Room pin: \`${image_ref}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke test the published digest
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.pin.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          docker pull --quiet "$IMAGE_REF"
+          ./images/agent-room/smoke-test.sh "$IMAGE_REF"
+
+      - name: Attest the published digest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_PATH }}
+          subject-digest: ${{ steps.pin.outputs.digest }}
+          push-to-registry: true
+
+      - name: Log out of GHCR
+        if: always()
+        shell: bash
+        run: docker logout ghcr.io
+
+  verify-public:
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          version: v0.36.1
+          driver-opts: >-
+            image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+
+      # A sealed hotel pulls with no credentials.
+      - name: Verify anonymous digest access
+        shell: bash
+        env:
+          IMAGE_REF: ${{ needs.publish.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "$IMAGE_REF"
+          echo "Anonymous GHCR access passed for \`${IMAGE_REF}\`." >> "$GITHUB_STEP_SUMMARY"
