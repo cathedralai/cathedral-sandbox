@@ -30,6 +30,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -132,6 +133,11 @@ type config struct {
 	// true is refused so a leftover "on" cannot start a broker. The nonce
 	// is never sent in the clear.
 	EscapeNonceAllowPlaintext *bool `json:"escape_nonce_allow_plaintext,omitempty"`
+	// TerminalHotels names the operator hotels whose room kit runs a terminal
+	// line through the runtime's exec, in the room (B154, hotel API b1739d0).
+	// Room terminal routes reach only these hotels. Empty: no hotel. A miner
+	// hotel never gets them, listed or not (terminalsRefused).
+	TerminalHotels []string `json:"terminal_hotels,omitempty"`
 }
 
 func (b *broker) maxExec() int {
@@ -331,6 +337,11 @@ func loadBroker(path string) (*broker, error) {
 	}
 	if c.MinerMaxHotels < 0 {
 		return nil, errors.New("config: miner_max_hotels must be positive when miner hotels are allowed")
+	}
+	for _, id := range c.TerminalHotels {
+		if id == "" || strings.Contains(id, ".") {
+			return nil, fmt.Errorf("config: terminal_hotels entry %q must be a hotel id (non-empty, no dot)", id)
+		}
 	}
 	b := &broker{cfg: c, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), started: time.Now()}
 	for _, hc := range c.Hotels {
@@ -1084,13 +1095,37 @@ func (b *broker) finishCreate(w http.ResponseWriter, res createResult, tRecv tim
 
 // ---------------------------------------------------------------- route
 
+// terminalsRefused says why the terminal routes of room bid stay closed, or
+// "" when they may go on to its hotel. The broker cannot see which room kit a
+// hotel runs, so only operator hotels named in terminal_hotels pass. A miner
+// runs a kit the operator did not install, so a miner hotel never passes.
+func (b *broker) terminalsRefused(bid string) string {
+	hotelID, _, _ := strings.Cut(bid, ".")
+	if h := b.hotelByID(hotelID); h != nil && isMinerHotel(h) {
+		return "room terminals are disabled on miner hotels; use exec"
+	}
+	if !slices.Contains(b.cfg.TerminalHotels, hotelID) {
+		return "room terminals are disabled on this hotel (not on the broker terminal allowlist); use exec"
+	}
+	return ""
+}
+
+// isMinerHotel reports whether an SN94 miner runs h. The hotkey is the mark;
+// the miner label and the id prefix of miner joins (miner-<hex>) also count,
+// so a miner machine joined without a hotkey stays closed.
+func isMinerHotel(h *hotel) bool {
+	return h.cfg.MinerHotkey != "" || h.labels()["miner"] == "true" || strings.HasPrefix(h.cfg.ID, "miner-")
+}
+
 func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestState, rest string) {
 	bid, tail, _ := strings.Cut(rest, "/")
-	// Room terminals stay closed until every hotel runs a package where a
+	// Room terminals open only on hotels known to run a package where a
 	// terminal line goes through the runtime's exec (B154).
 	if tail == "terminals" || strings.HasPrefix(tail, "terminals/") {
-		writeErr(w, 403, "terminals_disabled", "room terminals are disabled on this broker; use exec")
-		return
+		if why := b.terminalsRefused(bid); why != "" {
+			writeErr(w, 403, "terminals_disabled", why)
+			return
+		}
 	}
 	// The tail goes to the hotel as part of its path. A dot segment would
 	// climb out of this room if anything between us and the hotel normalized it.

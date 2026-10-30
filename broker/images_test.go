@@ -251,6 +251,8 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.execs = append(f.execs, req)
 		w.Header().Set("X-Room-Receipt", "signed-exec")
 		writeJSON(w, 200, map[string]any{"exit_code": 0, "stdout": "", "stderr": "", "timed_out": false})
+	case strings.HasPrefix(p, "/v1/sandboxes/") && strings.Contains(p, "/terminals"):
+		writeJSON(w, 200, map[string]any{"terminal_route": r.Method + " " + p})
 	case p == "/v1/images/build" && r.Method == "POST":
 		f.builds = append(f.builds, req)
 		if f.failBuild {
