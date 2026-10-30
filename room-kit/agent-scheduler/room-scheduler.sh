@@ -32,9 +32,13 @@ run_job() {
   name=$1; cmd=$2; lock=$STATE/$name.lock
   if ! take_lock "$lock" "$$"; then log "job=$name event=skip reason=locked holder=$(cat "$lock/pid" 2>/dev/null)"; return; fi
   trap 'rm -rf "$lock"' EXIT
+  if command -v flock >/dev/null 2>&1; then
+    # Second guard when flock exists. Orphaned children of a killed job keep the
+    # kernel lock, so a new run waits for them even though the pid-file lock is free.
+    if ! flock -n "$STATE/$name.flock" true; then log "job=$name event=skip reason=flock_held"; return; fi
+  fi
   t0=$(now); log "job=$name event=start pid=$$"
   if command -v flock >/dev/null 2>&1; then
-    # Second guard when flock exists: the kernel drops it even if the pid file is wrong.
     flock -n "$STATE/$name.flock" sh -c "$cmd" >> "$SCHED_DIR/$name.out" 2>&1
   else
     sh -c "$cmd" >> "$SCHED_DIR/$name.out" 2>&1
