@@ -7,6 +7,7 @@ import copy
 import importlib.util
 import json
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -46,6 +47,18 @@ producer = _load_script(
 
 IMAGE = publisher.ACTIVATION_IMAGE
 NOW = datetime(2026, 8, 29, 8, 0, 0, tzinfo=UTC)
+
+
+def _patch_publisher_sleep(monkeypatch, replacement) -> None:
+    # `publisher.time` is the process-wide time module, so patching its sleep
+    # also captured time.sleep(1.0) calls from unrelated threads (for example a
+    # leaked dockerd wait loop), giving sleeps like [1, 300, 1]. Give the
+    # publisher its own time shim instead.
+    monkeypatch.setattr(
+        publisher,
+        "time",
+        SimpleNamespace(monotonic=time.monotonic, sleep=replacement),
+    )
 SNAPSHOT_SEED = b"s" * 32
 SNAPSHOT_KEY_ID = "cathedral-validator-access-1"
 
@@ -908,7 +921,7 @@ def test_instance_window_discovery_retries_one_transient_read(capsys, monkeypatc
         return instances
 
     monkeypatch.setattr(publisher, "verify_running_instances", verify)
-    monkeypatch.setattr(publisher.time, "sleep", sleeps.append)
+    _patch_publisher_sleep(monkeypatch, sleeps.append)
 
     assert publisher.discover_instance_window_deadline(image=IMAGE) == NOW + timedelta(
         seconds=publisher.MAX_RUN_SECONDS
@@ -942,7 +955,7 @@ def test_publish_loop_retries_refused_cycle_and_finishes_bounded_window(
         publisher, "verify_running_instances", lambda **_kwargs: instances
     )
     monkeypatch.setattr(publisher, "_utc_now", lambda: next(clock))
-    monkeypatch.setattr(publisher.time, "sleep", sleeps.append)
+    _patch_publisher_sleep(monkeypatch, sleeps.append)
 
     def publish(**_kwargs):
         attempts.append(True)
@@ -996,9 +1009,8 @@ def test_publish_loop_does_not_schedule_past_earliest_instance_deadline(
         publisher, "verify_running_instances", lambda **_kwargs: instances
     )
     monkeypatch.setattr(publisher, "_utc_now", lambda: near_deadline)
-    monkeypatch.setattr(
-        publisher.time,
-        "sleep",
+    _patch_publisher_sleep(
+        monkeypatch,
         lambda _seconds: pytest.fail("publisher slept past the instance window"),
     )
     monkeypatch.setattr(
