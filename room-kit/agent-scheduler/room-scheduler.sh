@@ -35,7 +35,7 @@ run_job() {
   t0=$(now); log "job=$name event=start pid=$$"
   if command -v flock >/dev/null 2>&1; then
     # Second guard when flock exists: the kernel drops it even if the pid file is wrong.
-    flock -n -E 99 "$STATE/$name.flock" sh -c "$cmd" >> "$SCHED_DIR/$name.out" 2>&1
+    flock -n "$STATE/$name.flock" sh -c "$cmd" >> "$SCHED_DIR/$name.out" 2>&1
   else
     sh -c "$cmd" >> "$SCHED_DIR/$name.out" 2>&1
   fi
