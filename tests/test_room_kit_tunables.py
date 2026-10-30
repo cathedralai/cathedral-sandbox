@@ -147,6 +147,8 @@ def test_tunables_apply_to_their_room_only(fake: FakeDocker) -> None:
         assert cold["tunables"]["runtime_args"] == ["--platform=systrap", "--net-raw", "--directfs=false",
                                                      "--overlay2=all:self", "--num-network-channels=1"]
         assert fast["tunables"]["values"]["runsc"]["net_channels"] == 4
+        # AB#238: every runsc room, tuned or not, keeps its sentry out of the host OOM killer's reach.
+        assert all(_opt(argv, "--oom-score-adj") == "-1000" for argv in (plain_argv, cold_argv, fast_argv))
         # A read reports each room's own tunables; the plain room still has none.
         assert provider.get(cold["id"])["tunables"] == cold["tunables"]
         assert provider.get(fast["id"])["tunables"] == fast["tunables"]

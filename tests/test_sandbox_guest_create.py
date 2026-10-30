@@ -224,6 +224,36 @@ def test_status_reports_kernel_isolation_for_runsc_and_kata(
         provider.close()
 
 
+@pytest.mark.parametrize(
+    ("default_runtime", "explicit", "guarded"),
+    [("runsc", None, True), ("runc", "runsc", True), ("runc", "runsc-netraw", True),
+     ("runc", None, False), ("runsc", "runc", False), ("runc", "kata-runtime", False)],
+)
+def test_gvisor_room_shields_its_kernel_from_the_host_oom_killer(
+    fake: FakeDocker, monkeypatch, default_runtime: str, explicit: str | None, guarded: bool
+) -> None:
+    """AB#238: under runsc the room's sentry and gofer get oom_score_adj -1000.
+
+    The host OOM killer then ends the runaway application's stub, not the
+    room. A runc room gets no such flag: there every process would inherit
+    it and nothing in the room could be OOM-killed.
+    """
+    fake.set(default_runtime=default_runtime)
+    if explicit:
+        monkeypatch.setenv("CATHEDRAL_DOCKER_RUNTIME", explicit)
+    fake.add_image("alpine:3.20")
+    provider = DockerGuestProvider()
+    try:
+        _create(provider)
+        (run,) = fake.calls_of("run")
+        if guarded:
+            assert run[run.index("--oom-score-adj") + 1] == "-1000"
+        else:
+            assert "--oom-score-adj" not in run
+    finally:
+        provider.close()
+
+
 def test_explicit_guest_runtime_is_passed_to_docker_run(fake: FakeDocker, monkeypatch) -> None:
     monkeypatch.setenv("CATHEDRAL_DOCKER_RUNTIME", "runsc")
     fake.add_image("alpine:3.20")

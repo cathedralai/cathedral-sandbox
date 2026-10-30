@@ -350,11 +350,23 @@ def main(argv):
                     with open(rule["append"], "a") as f:
                         f.write("ran\n")
                 print(rule.get("stdout", ""), end="")
+                if rule.get("sleep"):
+                    time.sleep(rule["sleep"])
                 if rule.get("kill_container"):
                     # A room killed by the host cgroup: the container ends and docker exec gives 128.
+                    # inspect_lag: docker still says running (OOMKilled already true) for that many inspects.
                     with Locked() as st:
                         for c in st["containers"].values():
-                            c.update(status="exited", exit_code=rule.get("container_exit", 137), oom_killed=rule.get("oom_killed", True))
+                            c.update(exit_code=rule.get("container_exit", 137), oom_killed=rule.get("oom_killed", True))
+                            if rule.get("inspect_lag"):
+                                c["dying_inspects"] = rule["inspect_lag"]
+                            else:
+                                c["status"] = "exited"
+                if rule.get("oom_kill_process"):
+                    # The host OOM killer ended one process; the room runs on, docker records the OOM.
+                    with Locked() as st:
+                        for c in st["containers"].values():
+                            c["oom_killed"] = True
                 return rule.get("exit", 0)
         return 0
 
@@ -368,6 +380,11 @@ def main(argv):
         with Locked() as st:
             cid = find(st, argv[-1])
             c = st["containers"].get(cid) if cid else None
+            if c is not None and c.get("dying_inspects"):
+                c["dying_inspects"] -= 1
+                if not c["dying_inspects"]:
+                    c["status"] = "exited"
+                c = {**c, "status": "running"}
         if c is None:
             print(f"Error: No such object: {argv[-1]}", file=sys.stderr)
             return 1
