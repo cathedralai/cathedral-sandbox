@@ -917,18 +917,26 @@ class ExecResult:
     duration_ms: int
     timed_out: bool
     truncated: bool = False
+    # Set only when the room's container died during the exec. ``oom_killed``
+    # names the cause (the room ran out of memory); ``room_alive`` False tells
+    # the caller the room itself is gone and later execs will fail.
+    oom_killed: bool = False
+    room_alive: bool = True
 
     def to_document(self) -> Mapping[str, object]:
-        return MappingProxyType(
-            {
-                "exit_code": self.exit_code,
-                "stdout": self.stdout,
-                "stderr": self.stderr,
-                "duration_ms": self.duration_ms,
-                "timed_out": self.timed_out,
-                "truncated": self.truncated,
-            }
-        )
+        doc: dict[str, object] = {
+            "exit_code": self.exit_code,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "duration_ms": self.duration_ms,
+            "timed_out": self.timed_out,
+            "truncated": self.truncated,
+        }
+        if self.oom_killed:
+            doc["oom_killed"] = True
+        if not self.room_alive:
+            doc["room_alive"] = False
+        return MappingProxyType(doc)
 
 
 @dataclass(frozen=True)

@@ -350,6 +350,11 @@ def main(argv):
                     with open(rule["append"], "a") as f:
                         f.write("ran\n")
                 print(rule.get("stdout", ""), end="")
+                if rule.get("kill_container"):
+                    # A room killed by the host cgroup: the container ends and docker exec gives 128.
+                    with Locked() as st:
+                        for c in st["containers"].values():
+                            c.update(status="exited", exit_code=rule.get("container_exit", 137), oom_killed=rule.get("oom_killed", True))
                 return rule.get("exit", 0)
         return 0
 
@@ -366,7 +371,8 @@ def main(argv):
         if c is None:
             print(f"Error: No such object: {argv[-1]}", file=sys.stderr)
             return 1
-        print(f"false {c.get('exit_code') or 0}" if c.get("status") == "exited" else "true 0")
+        extra = f" {'true' if c.get('oom_killed') else 'false'}" if "OOMKilled" in argv[argv.index("--format") + 1] else ""
+        print((f"false {c.get('exit_code') or 0}" if c.get("status") == "exited" else "true 0") + extra)
         return 0
 
     if cmd == "save":
