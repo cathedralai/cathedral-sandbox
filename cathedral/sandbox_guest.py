@@ -158,6 +158,29 @@ def runtime_has_kernel_isolation(runtime: str) -> bool:
     return name.startswith("runsc") or "kata" in name
 
 
+def runtime_is_gvisor(runtime: str | None) -> bool:
+    """True for runsc and its variants (per-room tunables, runsc-netraw)."""
+    return bool(runtime) and runtime.strip().lower().startswith("runsc")
+
+
+# A gVisor room is one host cgroup holding the sentry (runsc-sandbox), the
+# gofer and one systrap stub process per application address space. The
+# sentry writes the bytes a read() returns into the application's memory
+# itself, so a process that reads a lot (`head -c 6G /dev/zero | tail`)
+# grows the sentry's resident set, not its own stub's. At the room's memory
+# limit the host OOM killer then picks the sentry and the whole room dies
+# (AB#238). Inside gVisor nothing can stop that: its memory cgroup files are
+# stubs and it has no OOM killer of its own. runsc copies the room's
+# oom_score_adj to the sentry and the gofer only; the stubs keep their own
+# (1), so with -1000 the host kills the runaway application's stub, gVisor
+# ends that process, and the room lives on.
+ROOM_KERNEL_OOM_GUARD = ("--oom-score-adj", "-1000")
+# How long an exec answer waits for docker to catch up with a room killed
+# under it, and how often it asks (DockerClient.container_death).
+ROOM_DEATH_SETTLE_SECONDS = 3.0
+ROOM_DEATH_POLL_SECONDS = 0.25
+
+
 def is_dind_image(image: str) -> bool:
     """True when the image is a Docker-in-Docker base used for compose tasks."""
     lowered = image.lower()
@@ -663,7 +686,10 @@ class DockerClient:
         mounts: Iterable[tuple[Path, str]] = (),
         runtime: str | None = None,
         run_args: Iterable[str] = (),
+        default_runtime: str = "",
     ) -> str:
+        """Start one room. ``default_runtime`` is the daemon's default OCI runtime,
+        the room's runtime when no ``--runtime`` is passed."""
         work_dir.mkdir(parents=True, exist_ok=True)
         argv = [
             "docker",
@@ -690,15 +716,20 @@ class DockerClient:
             argv.extend(["--mount", f"type=bind,source={source.resolve()},target={target}"])
         if user:
             argv.extend(["--user", user])
+        chosen = None
         if use_kata:
-            argv.extend(["--runtime", self.kata_runtime])
+            chosen = self.kata_runtime
         elif runtime:
             # Per-room tunables: a runsc variant the provider checked against the daemon.
-            argv.extend(["--runtime", runtime])
+            chosen = runtime
         elif dind and self.dind.runtime:
-            argv.extend(["--runtime", self.dind.runtime])
+            chosen = self.dind.runtime
         elif self.guest_runtime:
-            argv.extend(["--runtime", self.guest_runtime])
+            chosen = self.guest_runtime
+        if chosen:
+            argv.extend(["--runtime", chosen])
+        if runtime_is_gvisor(chosen or default_runtime):
+            argv.extend(ROOM_KERNEL_OOM_GUARD)
         if dind:
             if os.environ.get("CATHEDRAL_ALLOW_PRIVILEGED_DIND") != "1":
                 raise SandboxOpError(
@@ -862,8 +893,8 @@ class DockerClient:
         except ValueError:
             return None
 
-    def container_death(self, container_id: str) -> tuple[bool, int] | None:
-        """(oom_killed, exit code) of a container that is no longer running, else None."""
+    def container_state(self, container_id: str) -> tuple[bool, int, bool] | None:
+        """(running, exit code, oom_killed) as docker reports them, None when unreadable."""
         try:
             r = self.run(
                 ["docker", "inspect", "--format", "{{.State.Running}} {{.State.ExitCode}} {{.State.OOMKilled}}", container_id],
@@ -872,12 +903,33 @@ class DockerClient:
         except SandboxOpError:
             return None
         parts = r.stdout.split()
-        if r.returncode != 0 or len(parts) != 3 or parts[0] != "false":
+        if r.returncode != 0 or len(parts) != 3 or parts[0] not in {"true", "false"}:
             return None
         try:
-            return parts[2] == "true", int(parts[1])
+            return parts[0] == "true", int(parts[1]), parts[2] == "true"
         except ValueError:
             return None
+
+    def container_death(self, container_id: str, *, settle_seconds: float = 0.0) -> tuple[bool, int] | None:
+        """(oom_killed, exit code) of a container that is no longer running, else None.
+
+        When runsc's sandbox is OOM-killed, docker exec returns at once but
+        docker still reports the container running, with OOMKilled already
+        true, for about a quarter second (AB#238). While docker says both,
+        ask again for up to ``settle_seconds``. A room whose process alone was
+        OOM-killed stays running and is answered None after the wait.
+        """
+        deadline = time.monotonic() + settle_seconds
+        while True:
+            state = self.container_state(container_id)
+            if state is None:
+                return None
+            running, exit_code, oom_killed = state
+            if not running:
+                return oom_killed, exit_code
+            if not oom_killed or time.monotonic() >= deadline:
+                return None
+            time.sleep(ROOM_DEATH_POLL_SECONDS)
 
     def remove(self, container_id: str) -> None:
         """Best-effort removal. The result is not checked; use remove_confirmed for GC."""
@@ -1718,6 +1770,7 @@ class DockerGuestProvider:
             mounts=mounts,
             runtime=tunables[0] if tunables is not None else None,
             run_args=tunables[1] if tunables is not None else (),
+            default_runtime=self._oci_runtime,
         )
 
     def _after_start(self, doc: dict[str, Any], sandbox_id: str, container_id: str, dind: bool) -> dict[str, Any]:
@@ -1766,14 +1819,17 @@ class DockerGuestProvider:
             stdin=request.stdin,
             user=request.user,
         )
-        # A room that outgrows its memory limit is killed whole by the host
-        # cgroup: the sandbox process dies, so `docker exec` cannot read the
-        # command's status and returns 128 ("waiting on PID ... WaitPID failed:
-        # EOF" under runsc). A dead container after a 128/137 is that kill.
+        # The command's own time, before any look at the container below.
+        elapsed = time.perf_counter() - t0
+        # A room that outgrows its memory limit can still be killed whole by
+        # the host cgroup (a runc room, or memory no process owns): the sandbox
+        # process dies, so `docker exec` cannot read the command's status and
+        # returns 128 ("waiting on PID ... WaitPID failed: EOF" under runsc) or
+        # 137. A dead container after a 128/137 is that kill.
         oom_killed = False
         room_alive = True
         if not timed_out and code in {128, 137}:
-            death = self._client.container_death(guest.container_id)
+            death = self._client.container_death(guest.container_id, settle_seconds=ROOM_DEATH_SETTLE_SECONDS)
             if death is not None:
                 room_alive = False
                 oom_killed = death[0] or death[1] == 137
@@ -1783,9 +1839,12 @@ class DockerGuestProvider:
                 else:
                     err += f"\nthe room's container exited during the command (exit code {death[1]}); the room is gone\n"
         # GNU timeout → 124; BusyBox/KILL → 137/143; client-side timeout flag.
-        if not oom_killed and (code in {124, 137, 143} or timed_out):
+        # A 137 that came before the limit is a SIGKILL from something else,
+        # most often the host OOM killer ending the process (AB#238).
+        killed_early = code == 137 and elapsed < timeout_seconds
+        if not oom_killed and not killed_early and code in {124, 137, 143}:
             timed_out = True
-        duration_ms = int((time.perf_counter() - t0) * 1000)
+        duration_ms = int(elapsed * 1000)
         with self._inner._lock:  # noqa: SLF001
             sandbox = self._inner._require_active(sandbox_id)  # noqa: SLF001
             sandbox.exec_history.append(

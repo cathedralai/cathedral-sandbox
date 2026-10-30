@@ -203,3 +203,54 @@ def test_room_that_died_without_oom_keeps_its_exit_code(fake: FakeDocker) -> Non
         assert result.exit_code == 128 and result.oom_killed is False and result.room_alive is False
     finally:
         provider.close()
+
+
+@pytest.fixture
+def quick_settle(monkeypatch) -> None:
+    import cathedral.sandbox_guest as guest
+
+    monkeypatch.setattr(guest, "ROOM_DEATH_SETTLE_SECONDS", 2.0)
+    monkeypatch.setattr(guest, "ROOM_DEATH_POLL_SECONDS", 0.05)
+
+
+def test_room_death_is_named_when_docker_reports_it_late(fake: FakeDocker, quick_settle) -> None:
+    """AB#238: runsc's sandbox dies, docker exec returns 128, and docker still
+    says running (OOMKilled already true) for a moment. Local runsc: 3 of 3."""
+    fake.set(exec_rules=[{"contains": "lag-marker", "exit": 128, "kill_container": True, "inspect_lag": 3}])
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        result = provider.exec(sid, ExecRequest(cmd=["sh", "-c", "lag-marker"]))
+        assert result.exit_code == 137
+        assert result.oom_killed is True and result.room_alive is False
+        assert result.timed_out is False
+    finally:
+        provider.close()
+
+
+def test_process_killed_by_oom_leaves_the_room_alive_and_is_no_timeout(fake: FakeDocker, quick_settle) -> None:
+    """With the sentry shielded, the host OOM killer ends the process only:
+    exit 137 long before the limit, the room runs on."""
+    fake.set(exec_rules=[{"contains": "hog-marker", "exit": 137, "oom_kill_process": True}])
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        result = provider.exec(sid, ExecRequest(cmd=["sh", "-c", "hog-marker"], timeout_seconds=40))
+        assert result.exit_code == 137
+        assert result.room_alive is True and result.oom_killed is False
+        assert result.timed_out is False
+        assert "room_alive" not in result.to_document()
+    finally:
+        provider.close()
+
+
+def test_137_at_the_limit_is_still_a_timeout(fake: FakeDocker) -> None:
+    """BusyBox timeout sends KILL at the limit: that 137 stays a timeout."""
+    fake.set(timeout_form="busybox", exec_rules=[{"contains": "slow-marker", "exit": 137, "sleep": 1.2}])
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        result = provider.exec(sid, ExecRequest(cmd=["sh", "-c", "slow-marker"], timeout_seconds=1))
+        assert result.exit_code == 137 and result.timed_out is True
+    finally:
+        provider.close()
