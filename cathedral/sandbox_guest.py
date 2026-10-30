@@ -862,6 +862,23 @@ class DockerClient:
         except ValueError:
             return None
 
+    def container_death(self, container_id: str) -> tuple[bool, int] | None:
+        """(oom_killed, exit code) of a container that is no longer running, else None."""
+        try:
+            r = self.run(
+                ["docker", "inspect", "--format", "{{.State.Running}} {{.State.ExitCode}} {{.State.OOMKilled}}", container_id],
+                timeout=15.0,
+            )
+        except SandboxOpError:
+            return None
+        parts = r.stdout.split()
+        if r.returncode != 0 or len(parts) != 3 or parts[0] != "false":
+            return None
+        try:
+            return parts[2] == "true", int(parts[1])
+        except ValueError:
+            return None
+
     def remove(self, container_id: str) -> None:
         """Best-effort removal. The result is not checked; use remove_confirmed for GC."""
         self.run(["docker", "rm", "-f", container_id], timeout=60.0)
@@ -1749,8 +1766,24 @@ class DockerGuestProvider:
             stdin=request.stdin,
             user=request.user,
         )
+        # A room that outgrows its memory limit is killed whole by the host
+        # cgroup: the sandbox process dies, so `docker exec` cannot read the
+        # command's status and returns 128 ("waiting on PID ... WaitPID failed:
+        # EOF" under runsc). A dead container after a 128/137 is that kill.
+        oom_killed = False
+        room_alive = True
+        if not timed_out and code in {128, 137}:
+            death = self._client.container_death(guest.container_id)
+            if death is not None:
+                room_alive = False
+                oom_killed = death[0] or death[1] == 137
+                if oom_killed:
+                    code = 137
+                    err += "\nout of memory: the room exceeded its memory limit and was killed; the room is gone\n"
+                else:
+                    err += f"\nthe room's container exited during the command (exit code {death[1]}); the room is gone\n"
         # GNU timeout → 124; BusyBox/KILL → 137/143; client-side timeout flag.
-        if code in {124, 137, 143} or timed_out:
+        if not oom_killed and (code in {124, 137, 143} or timed_out):
             timed_out = True
         duration_ms = int((time.perf_counter() - t0) * 1000)
         with self._inner._lock:  # noqa: SLF001
@@ -1781,6 +1814,8 @@ class DockerGuestProvider:
             duration_ms=duration_ms,
             timed_out=timed_out,
             truncated=truncated,
+            oom_killed=oom_killed,
+            room_alive=room_alive,
         )
 
     def _has_bash(self, guest: GuestRecord) -> bool:

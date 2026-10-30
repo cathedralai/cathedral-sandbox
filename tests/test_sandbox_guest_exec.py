@@ -161,3 +161,45 @@ def test_file_paths_outside_work_are_refused(fake: FakeDocker, path: str) -> Non
         assert provider.stat(sid, "/work").is_dir
     finally:
         provider.close()
+
+
+def test_memory_bomb_names_the_oom_kill_and_the_dead_room(fake: FakeDocker) -> None:
+    """AB#235: the host cgroup kills the whole room; docker exec answers 128."""
+    fake.set(exec_rules=[{"contains": "bomb-marker", "exit": 128, "kill_container": True}])
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        result = provider.exec(sid, ExecRequest(cmd=["sh", "-c", "bomb-marker"]))
+        assert result.exit_code == 137
+        assert result.oom_killed is True
+        assert result.room_alive is False
+        assert result.timed_out is False
+        assert "out of memory" in result.stderr
+        doc = result.to_document()
+        assert doc["oom_killed"] is True and doc["room_alive"] is False
+    finally:
+        provider.close()
+
+
+def test_exit_128_from_a_live_room_is_left_alone(fake: FakeDocker) -> None:
+    fake.set(exec_rules=[{"contains": "plain-128", "exit": 128}])
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        result = provider.exec(sid, ExecRequest(cmd=["sh", "-c", "plain-128"]))
+        assert result.exit_code == 128
+        assert result.oom_killed is False and result.room_alive is True
+        assert "oom_killed" not in result.to_document()
+    finally:
+        provider.close()
+
+
+def test_room_that_died_without_oom_keeps_its_exit_code(fake: FakeDocker) -> None:
+    fake.set(exec_rules=[{"contains": "died-marker", "exit": 128, "kill_container": True, "container_exit": 2, "oom_killed": False}])
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        result = provider.exec(sid, ExecRequest(cmd=["sh", "-c", "died-marker"]))
+        assert result.exit_code == 128 and result.oom_killed is False and result.room_alive is False
+    finally:
+        provider.close()
