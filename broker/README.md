@@ -280,6 +280,17 @@ not keep it: the broker deletes the room and tries the next eligible hotel,
 without resting the first. With none left the answer is 409
 `tunables_unavailable`.
 
+## Room terminals
+
+Room terminal routes (`/v1/sandboxes/<id>/terminals` and below) reach a hotel
+only when the config lists the hotel id in `"terminal_hotels": [...]`. List
+only operator hotels whose room kit carries the B154 fix (hotel API b1739d0 or
+later: a terminal line runs through the runtime's exec, in the room). A miner
+hotel (a `miner_hotkey`, the `miner=true` label or a `miner-` id) never gets
+them, listed or not. Everything else answers 403 `terminals_disabled` and the
+message says why. The default is an empty list: no hotel. The broker refuses
+unknown config keys, so set the key only after the broker binary knows it.
+
 ## Room network policy
 
 A create takes `"network": {"mode": "internet" | "deny_all" | "allowlist", "allow": [...]}`.
