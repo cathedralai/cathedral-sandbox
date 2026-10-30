@@ -338,6 +338,9 @@ def main(argv):
                 print("timeout: invalid usage", file=sys.stderr)
                 return 125 if form == "gnu" else 1
             rest = rest[3:] if busybox else rest[2:]
+        if rest[:1] == ["bash"] and b.get("no_bash"):
+            print("exec: \"bash\": executable file not found in $PATH", file=sys.stderr)
+            return 127
         if rest == ["true"]:
             return 0
         line = " ".join(rest)

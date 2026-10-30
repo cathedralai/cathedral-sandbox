@@ -46,6 +46,50 @@ def test_command_that_exits_127_runs_once(fake: FakeDocker, tmp_path, form: str)
         provider.close()
 
 
+def _ran_argv0(fake: FakeDocker, marker: str) -> str:
+    (call,) = _guest_execs(fake, marker)
+    rest = call[call.index("timeout"):] if "timeout" in call else call
+    return next(p for p in rest if p in ("bash", "sh"))
+
+
+def test_bash_argv_runs_bash_when_the_image_has_it(fake: FakeDocker) -> None:
+    fake.set(exec_rules=[{"contains": "pipefail-marker", "stdout": "5.2", "exit": 0}])
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        provider.exec(sid, ExecRequest(cmd=["bash", "-c", "set -o pipefail; echo pipefail-marker"]))
+        assert _ran_argv0(fake, "pipefail-marker") == "bash"
+    finally:
+        provider.close()
+
+
+def test_string_cmd_runs_bash_when_the_image_has_it(fake: FakeDocker) -> None:
+    fake.set(exec_rules=[{"contains": "string-marker", "exit": 0}])
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        provider.exec(sid, ExecRequest(cmd="echo string-marker"))
+        assert _ran_argv0(fake, "string-marker") == "bash"
+    finally:
+        provider.close()
+
+
+def test_bash_argv_falls_back_to_sh_when_the_image_has_no_bash(fake: FakeDocker) -> None:
+    fake.set(no_bash=True, exec_rules=[{"contains": "nobash-marker", "exit": 0}])
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        for _ in range(2):
+            provider.exec(sid, ExecRequest(cmd=["bash", "-c", "echo nobash-marker"]))
+        runs = _guest_execs(fake, "nobash-marker")
+        assert len(runs) == 2
+        assert all("sh" in c and "bash" not in c for c in runs)
+        probes = [c for c in fake.calls_of("exec") if c[-3:] == ["bash", "-c", ":"]]
+        assert len(probes) == 1  # probed once per room
+    finally:
+        provider.close()
+
+
 def test_timeout_form_is_probed_once_per_room(fake: FakeDocker) -> None:
     fake.set(timeout_form="busybox", exec_rules=[{"contains": "hello", "stdout": "hi", "exit": 0}])
     provider = DockerGuestProvider()
