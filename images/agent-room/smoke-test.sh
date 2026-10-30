@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Check an agent-room image: the tools at the pinned versions, the non-root
-# agent, and HOME on a workspace that comes up owned by root, as on a hotel.
+# agent, and HOME on a workspace owned by the hotel, as on a hotel.
 #
 #   smoke-test.sh IMAGE_REF
 #
-# Needs docker, and sudo to give the test workspace to root.
+# Needs docker, and sudo to give the test workspace to another user.
 set -euo pipefail
 
 image="${1:?usage: smoke-test.sh IMAGE_REF}"
@@ -27,11 +27,12 @@ mapfile -t line <<< "$out"
 [[ "${line[3]}" == "$want_claude" ]] || fail "claude --version is ${line[3]}"
 [[ "${line[4]}" == "$want_codex" ]] || fail "codex --version is ${line[4]}"
 
-# The room as a hotel starts it: /work and a workspace that root owns, the
-# command `sleep infinity`, execs in /work.
+# The room as a hotel starts it: /work and a workspace owned by the hotel's
+# service user (991 on a sealed hotel), the command `sleep infinity`, execs in
+# /work. The room's creator makes HOME with one exec as root.
 workspace="$(mktemp -d)"
 work="$(mktemp -d)"
-sudo chown root:root "$workspace" "$work"
+sudo chown 991:991 "$workspace" "$work"
 sudo chmod 0755 "$workspace" "$work"
 cid=""
 cleanup() {
@@ -44,30 +45,33 @@ start_room() {
     cid="$(docker run -d --network none -v "$work:/work" -w /work \
         --mount "type=bind,source=$workspace,target=/workspace" "$image" sleep infinity)"
     for _ in $(seq 1 20); do
-        if docker exec "$cid" test -w /workspace/home; then
+        if [[ "$(docker inspect -f '{{.State.Running}}' "$cid")" == true ]]; then
             return 0
         fi
         sleep 0.5
     done
     docker logs "$cid" >&2 || true
-    fail "HOME did not come up writable on the workspace"
+    fail "the room did not start"
 }
 
 start_room
+if docker exec "$cid" test -e /workspace/home; then
+    fail "HOME exists on a new workspace before the root exec"
+fi
+docker exec -u root "$cid" install -d -o agent -g agent -m 0700 /workspace/home
 out="$(docker exec "$cid" sh -c 'id -un; pwd; stat -c "%U %a" "$HOME"; echo kept > "$HOME/marker"')"
 printf '%s\n' "$out"
 mapfile -t line <<< "$out"
 [[ "${line[0]}" == agent ]] || fail "exec user is ${line[0]}"
 [[ "${line[1]}" == /work ]] || fail "exec cwd is ${line[1]}"
 [[ "${line[2]}" == "agent 700" ]] || fail "HOME on the workspace is ${line[2]}"
-# The sudo rule allows agent-home-init and nothing else.
-if docker exec "$cid" sudo -n true 2>/dev/null; then
-    fail "the agent can run other commands with sudo"
+if docker exec "$cid" sh -c 'command -v sudo' >/dev/null; then
+    fail "sudo is in the image"
 fi
 docker rm -f "$cid" >/dev/null
 cid=""
 
-# A new room on the same workspace finds HOME and its files.
+# A new room on the same workspace finds HOME and its files with no root exec.
 start_room
 [[ "$(docker exec "$cid" cat /workspace/home/marker)" == kept ]] || fail "HOME did not persist on the workspace"
 

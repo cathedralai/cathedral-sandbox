@@ -13,23 +13,36 @@ No credentials are in the image. Claude Code and Codex log in at run time.
 
 `HOME` is `/workspace/home`. In a sealed room `/workspace` is the persistent
 workspace (create with `"workspace": "<name>"`); `/work` is scratch and goes
-with the room.
+with the room. A room with no workspace uses the `/workspace/home` in the
+image.
 
-The hotel makes a new workspace owned by root, so the agent cannot make its
-own `HOME` there. At room start the entrypoint (`agent-room-init`) runs
-`agent-home-init` through sudo when `HOME` is missing or not writable. That
-helper makes `/workspace/home`, owned by `agent`, mode 0700. The sudo rule
-allows that one command with no arguments and nothing else. A room with no
-workspace uses the `/workspace/home` in the image.
+A new workspace comes up owned by the hotel's service user, mode 0755, so the
+agent cannot make `HOME` there, and a sealed hotel ignores setuid bits, so sudo
+cannot either. The room's creator runs one exec as root after the create:
 
-Execs run in `/work` unless the exec names a `cwd`, as in every room; `/work`
-is owned by root. Pass `"cwd": "/workspace/home"` or `cd` first.
+```json
+{"cmd": ["install", "-d", "-o", "agent", "-g", "agent", "-m", "0700", "/workspace/home"], "user": "root"}
+```
+
+It is safe on every create: on a workspace that has `HOME` it only sets the
+owner and mode of the directory. Until it runs, the entrypoint
+(`agent-room-init`) writes a warning and the room runs without `HOME`.
+
+Execs run in `/work` unless the exec names a `cwd`, as in every room. Pass
+`"cwd": "/workspace/home"` or `cd` first.
+
+The hotel mounts workspaces `noexec`. Scripts in `HOME` run (`sh`, `python3`,
+`node`, git hooks), but an ELF binary on the workspace dies with SIGSEGV
+(exit 139) under gVisor, so keep compiled tools in the image or under `/tmp`.
+For the same reason Claude Code must not update itself into `~/.local/bin`.
 
 ## Use
 
 ```json
 {"image": "ghcr.io/cathedralai/agent-room@sha256:<digest>", "workspace": "<name>"}
 ```
+
+then the root exec above.
 
 ```sh
 claude --version   # 2.1.312 (Claude Code)
@@ -54,10 +67,11 @@ print the pinned version.
 ## Check
 
 `smoke-test.sh IMAGE_REF` runs on every pull request and on every publish. It
-checks the versions, the user and `HOME`, starts the image the way a hotel
-does (`/work` and a workspace owned by root, `sleep infinity`), checks that
-the agent can run nothing else with sudo, and that a second room on the same
-workspace finds `HOME` with its files.
+checks the versions, the user and `HOME`, then starts the image the way a
+hotel does (`/work` and a workspace owned by uid 991, `-w /work`,
+`sleep infinity`), runs the root exec, checks `HOME` is `agent 700` and that
+sudo is not in the image, and that a second room on the same workspace finds
+`HOME` with its files.
 
 ## Visibility
 

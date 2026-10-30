@@ -4,9 +4,9 @@
 # Claude Code refuses --dangerously-skip-permissions as root, so the agent is
 # uid 1000. HOME is /workspace/home: in a sealed room /workspace is the
 # persistent workspace mount and /work is scratch that goes with the room.
-# The hotel makes a new workspace owned by root, so the agent cannot make its
-# own HOME there; agent-home-init does it at room start through a sudo rule
-# that allows that one command and nothing else.
+# A workspace comes up owned by the hotel's service user, so the room's
+# creator makes HOME there with one exec as root (README.md). A sealed hotel
+# ignores setuid bits, so sudo cannot do it from inside the room.
 #
 # No credentials are in the image. Claude Code and Codex log in at run time.
 
@@ -23,10 +23,9 @@ LABEL org.opencontainers.image.title="Cathedral room: agent" \
       org.cathedral.agent-room.claude-code="${CLAUDE_CODE_VERSION}" \
       org.cathedral.agent-room.codex="${CODEX_VERSION}"
 
-# tini reaps the processes that execs and tmux leave behind; sudo runs
-# agent-home-init only.
+# tini reaps the processes that execs and tmux leave behind.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git python3 sudo tini tmux \
+    && apt-get install -y --no-install-recommends ca-certificates curl git python3 tini tmux \
     && rm -rf /var/lib/apt/lists/*
 
 # The node image's user "node" holds uid 1000; the agent takes it.
@@ -51,12 +50,7 @@ RUN cd /opt/agent-tools \
     && test "$(HOME="$check_home" codex --version)" = "codex-cli ${CODEX_VERSION}" \
     && rm -rf "$check_home" /root/.npm
 
-COPY agent-home-init /usr/local/sbin/agent-home-init
-COPY agent-room-init /usr/local/bin/agent-room-init
-RUN chmod 0755 /usr/local/sbin/agent-home-init /usr/local/bin/agent-room-init \
-    && echo 'agent ALL=(root) NOPASSWD: /usr/local/sbin/agent-home-init ""' > /etc/sudoers.d/agent-home \
-    && chmod 0440 /etc/sudoers.d/agent-home \
-    && visudo -cf /etc/sudoers.d/agent-home
+COPY --chmod=0755 agent-room-init /usr/local/bin/agent-room-init
 
 # DISABLE_AUTOUPDATER keeps Claude Code at the pinned version.
 ENV HOME=/workspace/home \
