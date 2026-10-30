@@ -1,0 +1,12 @@
+#!/bin/sh
+# Entrypoint: make HOME if the agent can, then run the room command (the hotel
+# passes `sleep infinity`).
+#
+# A room with no workspace has the image's /workspace/home. A workspace comes
+# up owned by the hotel's service user, so the agent cannot make HOME there:
+# the room's creator runs one exec as root (see README.md). A missing HOME
+# must not stop the room, so this only warns.
+if [ ! -d "$HOME" ] && ! mkdir -p "$HOME" 2>/dev/null; then
+    echo "agent-room-init: $HOME is missing; make it with an exec as root (README.md)" >&2
+fi
+exec "$@"
