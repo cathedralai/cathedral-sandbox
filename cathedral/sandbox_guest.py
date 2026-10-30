@@ -314,6 +314,8 @@ class GuestRecord:
     # How this guest's image runs a command under a time limit: "gnu"
     # (timeout N), "busybox" (timeout -t N) or "none". None: not probed yet.
     timeout_form: str | None = None
+    # Whether the image can run ``bash``. None: not probed yet.
+    has_bash: bool | None = None
     # (owner, name, path, version_on_delete) of the mounted workspace (#305).
     workspace: tuple[str, str, str, bool] | None = None
     # Owner of the room (sandbox_owner.owner_id). The egress proxy reads the
@@ -1719,8 +1721,9 @@ class DockerGuestProvider:
         cwd = request.cwd or "/work"
         argv = list(request.argv)
         # Portable shell: ExecRequest maps string cmds to bash -c; many customer images
-        # (alpine, slim) only ship sh. Prefer sh when bash is not the guest's shell.
-        if argv and argv[0] == "bash":
+        # (alpine, slim) only ship sh. Fall back to sh only when the image has no bash.
+        # An unconditional sh rewrite ran dash on ubuntu/debian, where sh is not bash.
+        if argv and argv[0] == "bash" and not self._has_bash(guest):
             argv[0] = "sh"
         timeout_seconds = request.timeout_seconds or 60
         # Enforce timeout inside the guest so the container stays alive (§3.2).
@@ -1779,6 +1782,15 @@ class DockerGuestProvider:
             timed_out=timed_out,
             truncated=truncated,
         )
+
+    def _has_bash(self, guest: GuestRecord) -> bool:
+        """True when the guest image can run ``bash``. Probe once; the probe has no side effect."""
+        if guest.has_bash is None:
+            code, _, _, _ = self._client.exec(
+                guest.container_id, ["bash", "-c", ":"], cwd=None, env={}, timeout_seconds=20, stdin=None
+            )
+            guest.has_bash = code == 0
+        return guest.has_bash
 
     def _timeout_form(self, guest: GuestRecord) -> str:
         """Return "gnu", "busybox" or "none" for the guest image. Probe once.
