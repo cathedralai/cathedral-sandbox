@@ -132,14 +132,20 @@ def test_a_policy_the_api_accepts_is_the_policy_the_daemon_enforces(mode, allow)
         assert not policy.get("allow")
         return
     for e in policy["allow"]:
-        if e.startswith("*."):
-            assert parsed.allows_name("sub." + e[2:]), (e, parsed)
-            assert not parsed.allows_name(e[2:]) or e[2:] in parsed.hosts
-        elif _is_net(e):
+        if _is_net(e):
             net = ipaddress.ip_network(e, strict=False)
             assert any(net.subnet_of(ipaddress.ip_network(n)) for n in parsed.nets), (e, parsed.nets)
-        else:
-            assert parsed.allows_name(e), (e, parsed)
+            continue
+        # A named entry may carry ":80" or ":443". allows_name takes the
+        # port as its own argument (the proxy splits SNI/Host from the
+        # destination port), so split the entry the way the daemon does.
+        kind, name, ports = egress.classify(e)
+        probe = "sub." + name if kind == "wild" else name
+        assert parsed.allows_name(probe), (e, parsed)
+        for p in ports or (80, 443):
+            assert parsed.allows_name(probe, p), (e, p, parsed)
+        if kind == "wild":
+            assert not parsed.allows_name(name) or name in parsed.hosts
 
 
 @settings(max_examples=2 * N, deadline=None)
