@@ -11,7 +11,7 @@ The prober, the sandbox it probes and every validator use the same code. Citatio
 - **Prober (run by the SN94 owner):** each round, for each box: creates a sandbox through the
   box's front door, runs the challenge in it, checks the answer, deletes the sandbox, and signs
   a receipt. It runs in a measured TDX guest.
-- **Validators (any netuid; Cathedral runs SN39 and SN94):** fetch their own receipts, verify
+- **Validators (any netuid; Cathedral's subnet is SN94):** fetch their own receipts, verify
   them with the prober keys they pin, and pay each box the market value of its verified
   capacity. They never contact miner boxes.
 

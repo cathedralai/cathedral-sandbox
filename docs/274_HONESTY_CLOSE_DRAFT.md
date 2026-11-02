@@ -27,8 +27,9 @@ close without waiting on every parallel track:
 ## Evidence
 
 - `docs/TEE_BOX_SNP_E2E_RESULTS.md`
-- `docs/evidence/snp-bf-report-*.json`, `snp-bf-efg-20261011T1414Z.json`
-- `docs/evidence/fred-signing-batch-bf-fg-20261012.md` (ready for Fred)
+- Live SNP bf/efg JSON and the Fred signing batch stayed out of public history
+  (this PR's leak-guard scrub); keep them in the private ops store, not under
+  `docs/evidence/` on main.
 - Measurement-list draft (96-hex MEASUREMENT filled)
 - Branch: `feat/tee-box-snp-startup-gates` (rebased on main after #253)
 
