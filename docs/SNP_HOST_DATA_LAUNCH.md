@@ -99,7 +99,7 @@ Attached: snp report dump / snpguest output
 2. Evidence pack above posted on #274 with **Match = YES** and **Inject = NO**.
 3. Optional: sealed SNP e2e on that guest without `E2E_HOST_DATA_HEX`.
 
-**Status 2026-10-08:** items 1–2 **PASS** on Genoa host `84.32.220.48` /
+**Status 2026-10-08:** items 1–2 **PASS** on Genoa host `<host>` /
 guest `snp-guest-official` (digest `551df92e…71c9885e`, #275 gate STARTED /
 wrong key REFUSED). Root+launch seats filled; image owner still TBD. Re-check:
 `python scripts/tee_box_snp_e2e/phase_a_launch_bind.py`. Item 3 (full B–F)

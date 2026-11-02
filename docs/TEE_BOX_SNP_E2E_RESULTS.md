@@ -15,7 +15,7 @@ worker smoke tip **`e622448`**, measurement-list draft
 
 | Role | Address |
 | --- | --- |
-| Host | `ssh root@84.32.220.48` |
+| Host | `ssh root@<host>` |
 | Stock guest (untouched) | `:2222` |
 | **Measured official (B–F)** | `:2225` |
 | Measured dev | `:2224` |
@@ -73,7 +73,7 @@ Next: **@skyrocket2026** publishes the signed measurement-list registry entry fr
 ## Re-run clearout / worker smoke
 
 ```bash
-ssh -p 2225 root@84.32.220.48
+ssh -p 2225 root@<host>
 cd /opt/cathedral/sandbox
 git fetch && git reset --hard origin/feat/tee-box-snp-startup-gates
 export PYTHONPATH=$PWD TEE=snp PATH=$HOME/.local/bin:$PATH

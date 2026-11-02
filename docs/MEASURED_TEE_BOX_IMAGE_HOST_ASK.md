@@ -5,7 +5,7 @@ dev `:2224` measured images up (see `TEE_BOX_SNP_E2E_RESULTS.md`). Kept as
 the historical ask + inventory.
 
 **Why (original):** Phase A (HOST_DATA stamp + #275 gate) was **PASS** on
-`84.32.220.48` while the guest was still **stock Ubuntu cloudimg** with
+`<host>` while the guest was still **stock Ubuntu cloudimg** with
 `central-root-keys.json` copied in after boot.
 
 Related: `CATHEDRAL_ROOT_AND_IMAGE_OWNERSHIP.md`, `TEE_BOX_SNP_E2E_RESULTS.md`,
@@ -33,7 +33,7 @@ Both are required for honest sealed language; only HOST_DATA is green today.
 
 ```text
 We need to build and boot a Cathedral tee-box SNP guest image on
-84.32.220.48 so the image-owner row can close for #274.
+<host> so the image-owner row can close for #274.
 
 Already true on this host (do not redo):
 - Official root file sha256 551df92ecea4e1fa67bd10c3d2b097d775c4beaf8b68ec4e005ff66d71c9885e
@@ -72,7 +72,7 @@ Deliverables back to #274:
 
 ## Host inventory (2026-10-08)
 
-| Item | Status on `84.32.220.48` |
+| Item | Status on `<host>` |
 | --- | --- |
 | QEMU / OVMF / cloud-localds | Present |
 | `launch-snp-guest.sh` + official root json | Present |

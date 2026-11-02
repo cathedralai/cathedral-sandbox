@@ -15,7 +15,7 @@ output back (or approve Smart Mode when the agent SSHs).
 ## 0) On `:2225` — fix A, re-run clearout
 
 ```bash
-ssh -p 2225 root@84.32.220.48
+ssh -p 2225 root@<host>
 cd /opt/cathedral/sandbox
 git fetch origin && git reset --hard origin/feat/tee-box-snp-startup-gates
 export PYTHONPATH=/opt/cathedral/sandbox TEE=snp
@@ -97,4 +97,4 @@ B.d stays BLOCKED (no RTMR3-class register on SNP).
 
 ## Agent note
 
-Approve Smart Mode SSH to `84.32.220.48` if you want the agent to drive the guest.
+Approve Smart Mode SSH to `<host>` if you want the agent to drive the guest.
