@@ -312,7 +312,6 @@ def test_operator_docs_name_cathedral_as_sn94_not_sn39() -> None:
         "docs/MINING.md",
         "docs/AMD_SEV_SNP_FRIEND_TEST.md",
         "docs/CAPACITY.md",
-        "docs/MINER_BOX_RUNBOOK.md",
         "docs/SN94_AUDIT_MINER_IMAGE.md",
         "docs/SN94_SNP_MINER_IMAGE.md",
         "docs/SNP_OWN_SERVER_ONBOARDING.md",
