@@ -443,6 +443,13 @@ change guest policy, plant Escape nonces, opt out of join verification, set
 custom labels or reservations, or undo a drain. The digest must differ from
 the operator key and every guest key or view token. The approved hotkey cap
 still applies. Scoped joins require guest HTTPS and keyless SNP attestation.
+
+`operator_read_key_sha256` is a read-only operator key for dashboards such as
+the admin fleet feed. It allows `GET /v1/broker/capacity` with the operator
+view (every hotel and the admission policy) and no other route: it cannot
+read hotel documents, join, change or leave hotels, read or change guests, or
+open rooms. The digest must differ from the operator key, the miner
+enrollment key, and every guest key or view token.
 The observed TLS key must match the AMD-verified binding before the broker
 sends the hotel key. Miner calls pin the guest key on both data and control
 connections. Plain HTTP, a client-supplied pin, and `verify=false` are refused.

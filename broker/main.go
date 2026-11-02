@@ -112,6 +112,11 @@ type config struct {
 	// MinerEnrollKeySHA256 permits only verified miner joins, miner reads,
 	// drain=true, and empty miner leaves through the hotel admin routes.
 	MinerEnrollKeySHA256 string `json:"miner_enroll_key_sha256,omitempty"`
+	// OperatorReadKeySHA256 is the SHA-256 of a read-only operator key. It
+	// allows only GET /v1/broker/capacity with the operator view (every
+	// hotel). It cannot join, change or leave hotels or touch guests. The
+	// admin fleet feed uses it, so a leaked feed key cannot change the fleet.
+	OperatorReadKeySHA256 string `json:"operator_read_key_sha256,omitempty"`
 	// MinerHotkeyCaps is the operator-approved maximum number of joined hotels
 	// per miner hotkey. Miner joins without an entry are refused.
 	MinerHotkeyCaps map[string]int `json:"miner_hotkey_caps,omitempty"`
@@ -330,6 +335,15 @@ func loadBroker(path string) (*broker, error) {
 	if c.MinerEnrollKeySHA256 != "" && strings.EqualFold(c.MinerEnrollKeySHA256, c.OperatorKeySHA256) {
 		return nil, errors.New("config: miner enrollment key must differ from the operator key")
 	}
+	if c.OperatorReadKeySHA256 != "" {
+		hash, err := hex.DecodeString(c.OperatorReadKeySHA256)
+		if err != nil || len(hash) != sha256.Size {
+			return nil, errors.New("config: operator_read_key_sha256 must be a SHA-256 hex digest")
+		}
+		if strings.EqualFold(c.OperatorReadKeySHA256, c.OperatorKeySHA256) || strings.EqualFold(c.OperatorReadKeySHA256, c.MinerEnrollKeySHA256) {
+			return nil, errors.New("config: operator read key must differ from the operator key and the miner enrollment key")
+		}
+	}
 	for hotkey, cap := range c.MinerHotkeyCaps {
 		if !ss58RE.MatchString(hotkey) || cap < 1 {
 			return nil, fmt.Errorf("config: miner_hotkey_caps requires an SS58 hotkey and a positive machine cap")
@@ -369,6 +383,9 @@ func loadBroker(path string) (*broker, error) {
 	for _, gc := range c.Guests {
 		if c.MinerEnrollKeySHA256 != "" && (strings.EqualFold(c.MinerEnrollKeySHA256, gc.KeySHA256) || strings.EqualFold(c.MinerEnrollKeySHA256, gc.ViewTokenSHA256)) {
 			return nil, errors.New("config: miner enrollment key must differ from guest keys and view tokens")
+		}
+		if c.OperatorReadKeySHA256 != "" && (strings.EqualFold(c.OperatorReadKeySHA256, gc.KeySHA256) || strings.EqualFold(c.OperatorReadKeySHA256, gc.ViewTokenSHA256)) {
+			return nil, errors.New("config: operator read key must differ from guest keys and view tokens")
 		}
 		if gc.ID == "" {
 			return nil, errors.New("config: a guest has no id (rooms with no broker_guest label would be its own)")
@@ -1973,6 +1990,10 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if p == "/v1/broker/capacity" && r.Method == "GET" && b.isMinerEnroller(r) {
 		b.handleCapacity(w, nil, true) // miner hotels only
+		return
+	}
+	if p == "/v1/broker/capacity" && r.Method == "GET" && b.isOperatorReader(r) {
+		b.handleCapacity(w, nil, false) // read-only key: operator view, no other route
 		return
 	}
 	if p == "/v1/broker/guests" || strings.HasPrefix(p, "/v1/broker/guests/") {
