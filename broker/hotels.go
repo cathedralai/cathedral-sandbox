@@ -271,6 +271,17 @@ func (b *broker) isMinerEnroller(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(sha(strings.TrimSpace(a[7:]))), []byte(want)) == 1
 }
 
+// isOperatorReader is true for the read-only operator key. ServeHTTP checks
+// it on one route only (GET /v1/broker/capacity); every other route ignores it.
+func (b *broker) isOperatorReader(r *http.Request) bool {
+	want := strings.ToLower(b.cfg.OperatorReadKeySHA256)
+	a := r.Header.Get("Authorization")
+	if want == "" || len(a) < 8 || !strings.EqualFold(a[:7], "bearer ") {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(sha(strings.TrimSpace(a[7:]))), []byte(want)) == 1
+}
+
 var (
 	hotelKeyRE = regexp.MustCompile(`^[A-Za-z0-9_-]{32,}$`)
 	ss58RE     = regexp.MustCompile(`^[1-9A-HJ-NP-Za-km-z]{46,48}$`)
