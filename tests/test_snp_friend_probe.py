@@ -223,6 +223,7 @@ def _report(family: int, model: int, tcbs: tuple[int, int, int, int], policy: in
         cpuid_step=1,
         report_data=b"\x00" * 64,
         measurement="ab" * 48,
+        host_data=b"\x00" * 32,
         chip_id="cd" * 64,
         tcb=SnpTcb(current=tcbs[0], reported=tcbs[1], committed=tcbs[2], launch=tcbs[3]),
         signature=b"",

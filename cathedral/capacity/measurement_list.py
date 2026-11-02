@@ -39,7 +39,10 @@ follow; they cannot be listed unpaired or mismatched. The profile's own
 ``measurements`` list must equal exactly the derived values of its images, so
 the registry's other readers (``PolicyRegistrySnapshot.to_policy``, the
 verifier's own allowlist) see the same set. A SEV-SNP image is
-``{"id", "measurement": <96 hex>}``; SNP has no RTMR, so it has one value.
+``{"id", "measurement": <96 hex>}`` or, for root honesty,
+``{"id", "measurement", "host_data": <64 hex>}`` where ``host_data`` is
+``sha256(central-root-keys.json)`` (same pin ``admit(..., expected_root_digest=)``
+checks). SNP has no RTMR, so it has one measurement value.
 
 **Revocation.** Only profiles eligible at the evaluation time contribute
 (``PolicyProfile.eligible_at``: active, or retiring before ``retire_at``, and
@@ -93,7 +96,11 @@ from cathedral.policy_registry import (
 )
 from cathedral.common import Policy
 from cathedral.tee_box.boot import RTMR3_CONSUMED, RTMR3_FRESH
-from cathedral.tee_box.measured_root import MeasuredRootError, root_digest_from_mrconfigid
+from cathedral.tee_box.measured_root import (
+    MeasuredRootError,
+    root_digest_from_host_data,
+    root_digest_from_mrconfigid,
+)
 
 TEE_BOX_METADATA_KEY = "tee_box"
 TEE_BOX_SCHEMA = "cathedral_tee_box_images_v1"
@@ -116,7 +123,9 @@ TDX_IMAGE_FIELDS = (
     ("rtmr2", 48),
 )
 _TDX_IMAGE_KEYS = frozenset({"id", *(name for name, _ in TDX_IMAGE_FIELDS)})
-_SNP_IMAGE_KEYS = frozenset({"id", "measurement"})
+_SNP_IMAGE_KEYS_BASE = frozenset({"id", "measurement"})
+_SNP_IMAGE_KEYS_WITH_HOST = frozenset({"id", "measurement", "host_data"})
+_SNP_HOST_DATA = re.compile(r"[0-9a-f]{64}")
 _TEE_BOX_KEYS = frozenset({"schema", "images"})
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _SNP_MEASUREMENT = re.compile(r"[0-9a-f]{96}")
@@ -205,10 +214,16 @@ def _profile_images(
         )
     images: list[TeeBoxImage] = []
     for raw in raw_images:
-        expected_keys = _TDX_IMAGE_KEYS if kind == "tdx" else _SNP_IMAGE_KEYS
-        if not isinstance(raw, Mapping) or frozenset(raw) != expected_keys:
+        keys = frozenset(raw) if isinstance(raw, Mapping) else frozenset()
+        if kind == "tdx":
+            expected_ok = keys == _TDX_IMAGE_KEYS
+            expected_desc = sorted(_TDX_IMAGE_KEYS)
+        else:
+            expected_ok = keys in {_SNP_IMAGE_KEYS_BASE, _SNP_IMAGE_KEYS_WITH_HOST}
+            expected_desc = sorted(_SNP_IMAGE_KEYS_BASE) + ["optional host_data"]
+        if not isinstance(raw, Mapping) or not expected_ok:
             raise MeasurementListError(
-                f"{where}: each {kind} image must contain exactly {sorted(expected_keys)}"
+                f"{where}: each {kind} image must contain exactly {expected_desc}"
             )
         image_id = raw["id"]
         if not isinstance(image_id, str) or _ID_RE.fullmatch(image_id) is None:
@@ -241,6 +256,23 @@ def _profile_images(
             measurement = raw["measurement"]
             if not isinstance(measurement, str) or _SNP_MEASUREMENT.fullmatch(measurement) is None:
                 raise MeasurementListError(f"{at}: measurement must be 96 lowercase hex")
+            root_digest = None
+            host_data_hex = raw.get("host_data")
+            if host_data_hex is not None:
+                if not isinstance(host_data_hex, str) or _SNP_HOST_DATA.fullmatch(host_data_hex) is None:
+                    raise MeasurementListError(f"{at}: host_data must be 64 lowercase hex")
+                try:
+                    root_digest = root_digest_from_host_data(bytes.fromhex(host_data_hex))
+                except MeasuredRootError as exc:
+                    raise MeasurementListError(f"{at}: {exc}") from exc
+                if expected_root_digest is not None and root_digest != expected_root_digest:
+                    raise MeasurementListError(
+                        f"{at}: HOST_DATA binds {root_digest}, not the pinned central root"
+                    )
+            elif expected_root_digest is not None:
+                raise MeasurementListError(
+                    f"{at}: host_data is required when expected_root_digest is pinned"
+                )
             images.append(
                 TeeBoxImage(
                     kind=kind,
@@ -249,7 +281,7 @@ def _profile_images(
                     fresh=measurement,
                     consumed=None,
                     mrconfigid=None,
-                    root_digest=None,
+                    root_digest=root_digest,
                 )
             )
     ids = [image.image_id for image in images]

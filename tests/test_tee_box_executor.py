@@ -43,7 +43,7 @@ from cathedral.tee_box.executor import (
     _check_argv,
 )
 
-BOX_IPS = ("34.120.1.2", "2600:1900:4000::7/128")
+BOX_IPS = ("<public-endpoint-ip>", "2600:1900:4000::7/128")
 DIGEST = "sha256:" + "ab" * 32
 IMAGE_ID = "sha256:" + "cd" * 32
 IMAGE = ImageInfo(DIGEST, "registry.example/tasks/base", IMAGE_ID)
@@ -91,7 +91,7 @@ def _spec(network: str = "deny_all", sid: str = "sbx-" + "1" * 24) -> SandboxSpe
         "::ffff:10.0.0.1",
         "64:ff9b::a00:1",
         "2002:a00:1::1",
-        "34.120.1.2",
+        "<public-endpoint-ip>",
         "2600:1900:4000::7",
     ],
 )
@@ -99,7 +99,7 @@ def test_denied_destinations(address: str):
     assert _policy().denies(address)
 
 
-@pytest.mark.parametrize("address", ["1.1.1.1", "8.8.8.8", "34.120.1.3", "2606:4700:4700::1111"])
+@pytest.mark.parametrize("address", ["1.1.1.1", "8.8.8.8", "<public-lb-ip>", "2606:4700:4700::1111"])
 def test_the_public_internet_stays_reachable(address: str):
     assert not _policy().denies(address)
 
@@ -109,9 +109,9 @@ def test_deny_list_names_metadata_and_the_box_itself():
     rendered = {str(net) for net in policy.denied}
     for text in (*DENIED_IPV4, *DENIED_IPV6, *METADATA_ADDRESSES):
         assert str(ipaddress.ip_network(text)) in rendered
-    assert {"169.254.169.254/32", "34.120.1.2/32", "2600:1900:4000::7/128"} <= rendered
+    assert {"169.254.169.254/32", "<public-endpoint-ip>/32", "2600:1900:4000::7/128"} <= rendered
     assert policy.box_addresses == (
-        ipaddress.ip_network("34.120.1.2"),
+        ipaddress.ip_network("<public-endpoint-ip>"),
         ipaddress.ip_network("2600:1900:4000::7"),
     )
     # Every fixed range is non-global unicast except three blocks Python's
@@ -137,7 +137,7 @@ def test_nft_rendering_blocks_the_ranges_and_the_box():
         "100.64.0.0/10",
         "10.0.0.0/8",
         "168.63.129.16/32",
-        "34.120.1.2/32",
+        "<public-endpoint-ip>/32",
         "fc00::/7",
         "2600:1900:4000::7/128",
         "fe80::/9",
@@ -203,7 +203,7 @@ def test_invalid_policy_inputs_are_refused(kwargs):
         _policy(**kwargs)
 
 
-@pytest.mark.parametrize("addresses", [[], "34.120.1.2", ["34.120.1.0/23"], ["not-an-ip"]])
+@pytest.mark.parametrize("addresses", [[], "<public-endpoint-ip>", ["<public-lb-cidr>"], ["not-an-ip"]])
 def test_box_addresses_are_required_and_exact(addresses):
     with pytest.raises(EgressPolicyError):
         build_egress_policy(addresses)
@@ -1194,19 +1194,29 @@ def test_the_exec_wrapper_and_kill_script_really_end_a_process_tree(tmp_path):
     )
     try:
         deadline = time.monotonic() + 10
+        recorded = ""
         tree_pids: set[int] = set()
+        separate: list[int] = []
         while time.monotonic() < deadline:
             try:
                 recorded = (tmp_path / "exec.pid").read_text().strip()
             except FileNotFoundError:
                 recorded = ""
             tree_pids = _descendants(process.pid)
-            if recorded and len(tree_pids) >= 5:  # 4 sleeps and the inner sh
+            separate = []
+            for pid in tree_pids:
+                try:
+                    sid = os.getsid(pid)
+                except ProcessLookupError:
+                    continue
+                if sid != process.pid:
+                    separate.append(pid)
+            # The four sleeps can exist before setsid has moved the grandchild.
+            if recorded and len(tree_pids) >= 5 and separate:
                 break
             time.sleep(0.05)
-        assert int(recorded) == process.pid
+        assert recorded and int(recorded) == process.pid
         assert len(tree_pids) >= 5
-        separate = [pid for pid in tree_pids if os.getsid(pid) != process.pid]
         assert separate, "the setsid grandchild did not leave the session"
         killed = subprocess.run(
             ["/bin/sh", "-c", executor_module._KILL_SCRIPT, "cathedral-sandbox", pid_file],

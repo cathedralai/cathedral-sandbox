@@ -13,8 +13,11 @@ launch measured:
   leaves the guest, so the host cannot substitute one. A configfs-tsm quote
   would not do: the host's quoting service writes those bytes, and the guest
   does not verify them.
-- SEV-SNP: HOST_DATA is the closest launch field, but the repository's SNP
-  code does not read it, so an SNP box refuses to start.
+- SEV-SNP: HOST_DATA (32 bytes at offset 0xC0 of the attestation report) is
+  ``sha256(root key file)``. The box reads it from a fresh report collected
+  through ``snpguest`` and ``/dev/sev-guest``. SNP ``MEASUREMENT`` does not
+  cover HOST_DATA, so admission that cares about the root must check HOST_DATA
+  separately; this module only binds the guest's own startup to that field.
 
 Nothing here reads a flag, an environment variable or a writable config file,
 so a miner cannot choose the root. The binding reader is injectable only for
@@ -28,6 +31,9 @@ import hashlib
 import hmac
 import os
 import secrets
+import shutil
+import subprocess
+import tempfile
 from collections.abc import Callable
 
 from cathedral.central_access import CentralAccessError, load_central_root_keys
@@ -53,6 +59,17 @@ TDX_REPORT_TYPE_TDX = 0x81
 _REPORTDATA_OFFSET = 128
 _MRCONFIGID_OFFSET = 512 + 8 + 8 + 48
 MRCONFIGID_LEN = 48
+
+SEV_GUEST_DEVICE = "/dev/sev-guest"
+# Fixed AMD SEV-SNP ATTESTATION_REPORT layout (matches cathedral.verify.snp).
+SNP_REPORT_SIZE = 1184
+SNP_REPORT_DATA_OFFSET = 0x50
+SNP_REPORT_DATA_SIZE = 64
+HOST_DATA_OFFSET = 0xC0
+HOST_DATA_SIZE = 32
+# Cap one snpguest report call so a hung binary cannot wedge startup. Not an
+# environment override: the root binding must not depend on process env.
+SNPGUEST_TIMEOUT_SECONDS = 30.0
 
 MeasuredBindingReader = Callable[[], bytes]
 
@@ -92,13 +109,91 @@ def read_tdx_mrconfigid(device: str = TDX_GUEST_DEVICE) -> bytes:
     return report[_MRCONFIGID_OFFSET : _MRCONFIGID_OFFSET + MRCONFIGID_LEN]
 
 
-def read_snp_host_data() -> bytes:
-    """SEV-SNP has no supported binding yet: always refuse."""
+def _resolve_snpguest(snpguest: str | None = None) -> str:
+    # PATH only — never CATHEDRAL_SNPGUEST or other env. The root binding must
+    # not depend on process environment (see tests for measured_root source).
+    candidate = snpguest or shutil.which("snpguest")
+    if not candidate:
+        raise MeasuredRootError(
+            "snpguest is unavailable; the TEE box reads HOST_DATA from an SNP report "
+            "through it"
+        )
+    if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+        raise MeasuredRootError(
+            f"snpguest at {candidate} is not executable; the TEE box reads HOST_DATA "
+            "from an SNP report through it"
+        )
+    return candidate
 
-    raise MeasuredRootError(
-        "the TEE box on AMD SEV-SNP needs the central root bound in HOST_DATA, which "
-        "the SNP report code does not read yet; refusing to start"
-    )
+
+def read_snp_host_data(
+    device: str = SEV_GUEST_DEVICE,
+    *,
+    snpguest: str | None = None,
+) -> bytes:
+    """Return this guest's HOST_DATA from a fresh SNP attestation report.
+
+    Collects a report through ``snpguest`` with random REPORT_DATA, checks the
+    echo, and returns the 32-byte HOST_DATA field (offset 0xC0). Launch sets
+    that field; Cathedral binds ``sha256(root key file)`` there.
+    """
+
+    if not os.path.exists(device):
+        raise MeasuredRootError(
+            f"the SEV-SNP guest device {device} is unavailable; the TEE box reads its "
+            "HOST_DATA from an SNP report collected through it"
+        )
+    binary = _resolve_snpguest(snpguest)
+    report_data = secrets.token_bytes(SNP_REPORT_DATA_SIZE)
+    timeout = SNPGUEST_TIMEOUT_SECONDS
+    try:
+        with tempfile.TemporaryDirectory(prefix="cathedral-host-data-") as td:
+            request_path = os.path.join(td, "request-data.bin")
+            report_path = os.path.join(td, "attestation-report.bin")
+            with open(request_path, "wb") as handle:
+                handle.write(report_data)
+            try:
+                subprocess.run(
+                    [binary, "report", report_path, request_path, "--vmpl", "0"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise MeasuredRootError(
+                    f"snpguest report timed out after {timeout:.0f}s while reading HOST_DATA"
+                ) from exc
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or exc.stdout or "").strip()
+                raise MeasuredRootError(
+                    "snpguest refused an SNP report while reading HOST_DATA"
+                    + (f": {detail}" if detail else "")
+                ) from exc
+            try:
+                with open(report_path, "rb") as handle:
+                    report = handle.read(SNP_REPORT_SIZE + 1)
+            except OSError as exc:
+                raise MeasuredRootError(
+                    "the SNP report file is unreadable while reading HOST_DATA"
+                ) from exc
+    except MeasuredRootError:
+        raise
+    except OSError as exc:
+        raise MeasuredRootError(
+            f"cannot collect an SNP report for HOST_DATA: {exc}"
+        ) from exc
+    if len(report) != SNP_REPORT_SIZE:
+        raise MeasuredRootError(
+            f"snpguest returned {len(report)} bytes, expected {SNP_REPORT_SIZE}, "
+            "while reading HOST_DATA"
+        )
+    echoed = report[SNP_REPORT_DATA_OFFSET : SNP_REPORT_DATA_OFFSET + SNP_REPORT_DATA_SIZE]
+    if not hmac.compare_digest(echoed, report_data):
+        raise MeasuredRootError(
+            "the SNP report does not carry the requested REPORT_DATA while reading HOST_DATA"
+        )
+    return report[HOST_DATA_OFFSET : HOST_DATA_OFFSET + HOST_DATA_SIZE]
 
 
 def default_binding_reader(tee: str) -> MeasuredBindingReader:
@@ -124,6 +219,16 @@ def root_digest_from_mrconfigid(mrconfigid: object) -> str:
     return "sha256:" + digest.hex()
 
 
+def root_digest_from_host_data(host_data: object) -> str:
+    """The pinned root key digest HOST_DATA carries, or a refusal."""
+
+    if not isinstance(host_data, bytes) or len(host_data) != HOST_DATA_SIZE:
+        raise MeasuredRootError("HOST_DATA must be 32 bytes")
+    if not any(host_data):
+        raise MeasuredRootError("HOST_DATA is zero: the launch bound no central root")
+    return "sha256:" + host_data.hex()
+
+
 def load_measured_root_keys(
     tee: str,
     *,
@@ -144,15 +249,20 @@ def load_measured_root_keys(
         raise
     except Exception as exc:  # noqa: BLE001 - any reader failure refuses startup
         raise MeasuredRootError(f"the measured root binding is unreadable: {exc}") from exc
-    if tee != "tdx":
-        # Only TDX has a binding format today.
+    if tee == "tdx":
+        pinned = root_digest_from_mrconfigid(binding)
+        match_label = "MRCONFIGID"
+    elif tee == "snp":
+        pinned = root_digest_from_host_data(binding)
+        match_label = "HOST_DATA"
+    else:
         raise MeasuredRootError(f"the TEE box has no measured root binding for TEE {tee!r}")
-    pinned = root_digest_from_mrconfigid(binding)
     try:
         keys = load_central_root_keys(path, pinned_digest=pinned)
     except CentralAccessError as exc:
         raise MeasuredRootError(
-            f"the central root key file {path} is unusable or does not match MRCONFIGID: {exc}"
+            f"the central root key file {path} is unusable or does not match "
+            f"{match_label}: {exc}"
         ) from exc
     return keys, pinned
 
@@ -163,3 +273,11 @@ def mrconfigid_for_root_keys(data: bytes) -> bytes:
     if not isinstance(data, bytes) or not data:
         raise MeasuredRootError("the root key file must be non-empty bytes")
     return hashlib.sha256(data).digest() + bytes(MRCONFIGID_LEN - 32)
+
+
+def host_data_for_root_keys(data: bytes) -> bytes:
+    """The HOST_DATA an SNP launch sets for this exact root key file."""
+
+    if not isinstance(data, bytes) or not data:
+        raise MeasuredRootError("the root key file must be non-empty bytes")
+    return hashlib.sha256(data).digest()
