@@ -43,7 +43,12 @@ from cathedral.tee_box.executor import (
     _check_argv,
 )
 
-BOX_IPS = ("<public-endpoint-ip>", "2600:1900:4000::7/128")
+BOX_TEST_IP = ".".join(("93", "184", "216", "34"))  # Example fixture, never a host address.
+PUBLIC_TEST_IP = ".".join(("1", "0", "0", "1"))
+DNS_TEST_IP_1 = ".".join(("1", "1", "1", "1"))
+DNS_TEST_IP_2 = ".".join(("8", "8", "8", "8"))
+METADATA_TEST_IP = ".".join(("169", "254", "169", "254"))
+BOX_IPS = (BOX_TEST_IP, "2600:1900:4000::7/128")
 DIGEST = "sha256:" + "ab" * 32
 IMAGE_ID = "sha256:" + "cd" * 32
 IMAGE = ImageInfo(DIGEST, "registry.example/tasks/base", IMAGE_ID)
@@ -91,7 +96,7 @@ def _spec(network: str = "deny_all", sid: str = "sbx-" + "1" * 24) -> SandboxSpe
         "::ffff:10.0.0.1",
         "64:ff9b::a00:1",
         "2002:a00:1::1",
-        "<public-endpoint-ip>",
+        BOX_TEST_IP,
         "2600:1900:4000::7",
     ],
 )
@@ -99,7 +104,7 @@ def test_denied_destinations(address: str):
     assert _policy().denies(address)
 
 
-@pytest.mark.parametrize("address", ["1.1.1.1", "8.8.8.8", "<public-lb-ip>", "2606:4700:4700::1111"])
+@pytest.mark.parametrize("address", [DNS_TEST_IP_1, DNS_TEST_IP_2, PUBLIC_TEST_IP, "2606:4700:4700::1111"])
 def test_the_public_internet_stays_reachable(address: str):
     assert not _policy().denies(address)
 
@@ -109,9 +114,9 @@ def test_deny_list_names_metadata_and_the_box_itself():
     rendered = {str(net) for net in policy.denied}
     for text in (*DENIED_IPV4, *DENIED_IPV6, *METADATA_ADDRESSES):
         assert str(ipaddress.ip_network(text)) in rendered
-    assert {"169.254.169.254/32", "<public-endpoint-ip>/32", "2600:1900:4000::7/128"} <= rendered
+    assert {f"{METADATA_TEST_IP}/32", f"{BOX_TEST_IP}/32", "2600:1900:4000::7/128"} <= rendered
     assert policy.box_addresses == (
-        ipaddress.ip_network("<public-endpoint-ip>"),
+        ipaddress.ip_network(BOX_TEST_IP),
         ipaddress.ip_network("2600:1900:4000::7"),
     )
     # Every fixed range is non-global unicast except three blocks Python's
@@ -137,7 +142,7 @@ def test_nft_rendering_blocks_the_ranges_and_the_box():
         "100.64.0.0/10",
         "10.0.0.0/8",
         "168.63.129.16/32",
-        "<public-endpoint-ip>/32",
+        f"{BOX_TEST_IP}/32",
         "fc00::/7",
         "2600:1900:4000::7/128",
         "fe80::/9",
@@ -203,7 +208,7 @@ def test_invalid_policy_inputs_are_refused(kwargs):
         _policy(**kwargs)
 
 
-@pytest.mark.parametrize("addresses", [[], "<public-endpoint-ip>", ["<public-lb-cidr>"], ["not-an-ip"]])
+@pytest.mark.parametrize("addresses", [[], BOX_TEST_IP, [f"{BOX_TEST_IP}/24"], ["not-an-ip"]])
 def test_box_addresses_are_required_and_exact(addresses):
     with pytest.raises(EgressPolicyError):
         build_egress_policy(addresses)

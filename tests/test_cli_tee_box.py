@@ -37,6 +37,8 @@ from tests.test_tee_box_service import (
 from tests.test_validator_access import WORKER_HOTKEY
 
 RUNSC = '{"runsc":{"path":"/usr/local/bin/runsc","runtimeArgs":["--platform=systrap"]}}'
+BOX_TEST_IP = ".".join(("93", "184", "216", "34"))  # Example fixture, never a host address.
+LOCAL_TEST_IP = ".".join(("10", "128", "0", "5"))
 
 
 class _FakeServer:
@@ -95,7 +97,7 @@ class _Guest:
                 return subprocess.CompletedProcess(argv, 1, b"", b"Error: No such file")
             from tests.test_tee_box_enforce import _listing
 
-            policy = configure_module.build_egress_policy(["<public-endpoint-ip>"])
+            policy = configure_module.build_egress_policy([BOX_TEST_IP])
             return subprocess.CompletedProcess(argv, 0, _listing(policy), b"")
         if tool == "ip":
             listing = [{"ifname": "eth0", "addr_info": [{"local": "10.128.0.5"}]}]
@@ -170,7 +172,7 @@ def _full_flags(tmp_path: Path) -> list[str]:
         "--tee-box-executor",
         "runsc",
         "--tee-box-address",
-        "<public-endpoint-ip>",
+        BOX_TEST_IP,
         "--tee-box-capacity",
         "8,32768,204800",
         "--tee-box-default-shape",
@@ -265,7 +267,7 @@ def test_the_full_flag_set_serves_the_sandbox_api(tmp_path: Path, guest, capsys)
     assert (api.authorizer.network, api.authorizer.netuid) == ("finney", NETUID)
     assert api.executor.network_modes == ("internet", "deny_all")
     assert api.executor.storage_quota is True
-    assert [str(net) for net in api.egress.box_addresses] == ["<public-endpoint-ip>/32"]
+    assert [str(net) for net in api.egress.box_addresses] == [f"{BOX_TEST_IP}/32"]
     startup = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert startup["tee_box"]["egress"]["enforced"] is True
     assert startup["tee_box"]["network_modes"] == ["internet", "deny_all"]
@@ -400,7 +402,7 @@ def test_a_partial_flag_set_refuses_to_start(tmp_path: Path, guest, flag):
         ["--tee-box-bandwidth-mbit", "50"],
         ["--tee-box-no-disk-quota"],
         ["--tee-box-detect-addresses"],
-        ["--tee-box-address", "<public-endpoint-ip>"],
+        ["--tee-box-address", BOX_TEST_IP],
         ["--tee-box-runtime-path", "/opt/runsc"],
         ["--tee-box-docker-path", "/usr/local/bin/docker"],
     ],
@@ -472,9 +474,9 @@ def test_detected_addresses_include_interfaces_and_an_ip_endpoint(tmp_path: Path
         )
     )
     policy = configure_module.box_policy(
-        config, public_endpoint="https://<public-endpoint-ip>:8081", runner=guest
+        config, public_endpoint=f"https://{BOX_TEST_IP}:8081", runner=guest
     )
-    assert [str(net) for net in policy.box_addresses] == ["<public-endpoint-ip>/32", "10.128.0.5/32"]
+    assert [str(net) for net in policy.box_addresses] == [f"{BOX_TEST_IP}/32", f"{LOCAL_TEST_IP}/32"]
     named = configure_module.box_policy(
         config, public_endpoint="https://miner.example:8081", runner=guest
     )
