@@ -401,8 +401,11 @@ It checks, and reports every failure together (`admission.py:437-457`):
   bytes (`boot_consumed`), in shadow as in enforce. This is the check the owner's guarantee (no
   customer's escape persists into the next allocation) rests on. The control plane must admit the
   box with `require_fresh_boot=True` after every relaunch, before each new customer, and pin that
-  admission's TLS SPKI for the connection it hands the customer. SEV-SNP has no RTMR, so asking
-  for it there is an `AdmissionError`; its equivalent (a vTPM PCR) is open. The default, `False`,
+  admission's TLS SPKI for the connection it hands the customer. SEV-SNP has no
+  RTMR3-class field in the attestation report, so asking for fresh-boot there is
+  an `AdmissionError` (#274 B.d **BLOCKED**; written reason in
+  `docs/TEE_BOX_SERVICE.md`). Guest-local `SoftwareLeaseRegister` is not a
+  substitute. The default, `False`,
   keeps every existing call's result.
 
   **List both measurements.** The Cathedral TDX measurement covers the RTMRs

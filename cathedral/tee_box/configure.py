@@ -27,7 +27,14 @@ from dataclasses import dataclass
 
 from cathedral.common import ChannelBinding
 from cathedral.tee_box import measured_root
-from cathedral.tee_box.boot import BootError, BootGuard, SysfsRtmr3, marker_path_for
+from cathedral.tee_box.boot import (
+    BootError,
+    BootGuard,
+    SoftwareLeaseRegister,
+    SysfsRtmr3,
+    lease_register_path_for,
+    marker_path_for,
+)
 from cathedral.tee_box.egress import (
     DEFAULT_BANDWIDTH_MBIT,
     EgressPolicy,
@@ -272,8 +279,8 @@ def build_tee_box_api(
     """Build the sandbox API or refuse to start.
 
     Refuses first when the central root keys at the fixed image path do not
-    hash to the launch's measured binding (MRCONFIGID on TDX; SNP has none
-    yet), then when the central state is not on tmpfs or ramfs, any swap is
+    hash to the launch's measured binding (MRCONFIGID on TDX; HOST_DATA on
+    SNP), then when the central state is not on tmpfs or ramfs, any swap is
     on, the central state is unusable, the runsc
     runtime is not registered, Docker's data root is neither in memory nor
     on dm-crypt with integrity, or disk quotas are unsupported without the
@@ -281,15 +288,17 @@ def build_tee_box_api(
     starts with ``deny_all`` only and reports the error, and the reaper
     retries.
 
-    It also refuses when the kernel's boot id, boot time or RTMR3 cannot be
-    read, and on any TEE but TDX, which has no RTMR3 to extend: the box
-    records the one customer each boot may serve next to the central state,
-    and extends RTMR3 before the first lease (cathedral/tee_box/boot.py).
+    It also refuses when the kernel's boot id, boot time or fresh-boot
+    register cannot be read. On TDX the register is RTMR3; on SNP it is a
+    guest-local :class:`SoftwareLeaseRegister` (not hardware-backed, not in
+    the quote). The box records the one customer each boot may serve next to
+    the central state, and extends that register before the first lease
+    (cathedral/tee_box/boot.py). Other TEEs refuse.
 
     ``read_binding``, ``storage_probe`` and ``boot_options`` (``rtmr``,
     ``read_boot_id`` and ``read_booted_at`` keyword arguments for
-    ``BootGuard``) replace the TD report reader, the storage probes, RTMR3
-    and the boot readers in tests only.
+    ``BootGuard``) replace the binding reader, the storage probes, the
+    fresh-boot register and the boot readers in tests only.
     """
 
     from cathedral.central_access import (
@@ -314,10 +323,19 @@ def build_tee_box_api(
         swap = require_no_swap(probe)
     except (StorageError, OSError) as exc:
         raise ValueError(f"TEE box storage: {exc}") from exc
-    if tee != "tdx":
-        # SEV-SNP has no RTMR; its equivalent (a vTPM PCR) is not built.
-        raise ValueError(f"TEE box boot identity: TEE {tee!r} has no RTMR3 for the lease extend")
-    options = {"rtmr": SysfsRtmr3(), **(boot_options or {})}
+    if tee == "tdx":
+        default_rtmr = SysfsRtmr3()
+        fresh_boot_register = "tdx_rtmr3"
+        hardware_backed = True
+    elif tee == "snp":
+        default_rtmr = SoftwareLeaseRegister(lease_register_path_for(config.central_state))
+        fresh_boot_register = "software_lease_register"
+        hardware_backed = False
+    else:
+        raise ValueError(
+            f"TEE box boot identity: TEE {tee!r} has no fresh-boot register for the lease extend"
+        )
+    options = {"rtmr": default_rtmr, **(boot_options or {})}
     try:
         boot = BootGuard(marker_path_for(config.central_state), **options)
     except BootError as exc:
@@ -399,6 +417,8 @@ def build_tee_box_api(
             "consumed": boot.record.consumed_by is not None,
             "rtmr3_extended": boot.rtmr3_extended,
             "record": boot.marker_path,
+            "fresh_boot_register": fresh_boot_register,
+            "fresh_boot_hardware_backed": hardware_backed,
         },
     }
     return api, facts

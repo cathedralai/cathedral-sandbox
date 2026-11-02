@@ -184,9 +184,12 @@ step_collect() {
 
 step_summary() {
   local dest=${1:-$(cat "$STAMP_FILE")}
-  local baseline=()
-  [ -d "$BASELINE_DIR" ] && baseline=("$BASELINE_DIR")
-  python3 "$T/summarize.py" "$dest" "${baseline[@]}" | tee "$dest/RESULTS.txt"
+  # macOS bash with `set -u` rejects "${arr[@]}" when arr is empty.
+  if [ -d "$BASELINE_DIR" ]; then
+    python3 "$T/summarize.py" "$dest" "$BASELINE_DIR" | tee "$dest/RESULTS.txt"
+  else
+    python3 "$T/summarize.py" "$dest" | tee "$dest/RESULTS.txt"
+  fi
 }
 
 main() {
