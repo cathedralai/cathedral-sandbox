@@ -130,9 +130,17 @@ lfm3-agent --history                                     # the conversation so f
   tool and when not to, and never to claim a command it did not run.
   `--system` replaces it.
 - **Memory.** The conversation is kept in `/tmp/lfm3/agent`. Older turns are
-  dropped whole once the conversation passes 8,000 characters (the server
-  holds 4,096 tokens). The last picture or clip is sent again with later
-  turns while its turn is kept; older ones stay as a note only.
+  dropped whole once the conversation passes 4,000 characters. The last
+  picture or clip is sent again with later turns while its turn is kept;
+  older ones stay as a note only.
+- **Why the memory is short.** Every turn re-reads the whole conversation.
+  llama-server keeps no prompt cache for LFM3's hybrid layers: `cache_n` is 0
+  even for a request sent twice (b11960, with or without
+  `--checkpoint-min-step 0`). A turn reads hundreds to thousands of tokens
+  and writes tens, so reading is most of the wait. On two Apple M4 CPU threads
+  it runs at 145 tok/s, generation at 55 tok/s: 4,000 characters (about
+  1,600 tokens with the system prompt and tools) keeps the worst case near
+  11 s there. A sealed 2 vCPU room is not measured and will be slower.
 - **Defaults.** Greedy decoding (temperature 0, as Liquid AI's model card
   uses for Omni text), 512 tokens a reply. d1 rooms refuse it: use
   `lfm3-decide`.

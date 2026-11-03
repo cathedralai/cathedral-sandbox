@@ -33,7 +33,11 @@
 #   LFM3_AGENT_CMD_TIMEOUT    seconds per command (default 60)
 #   LFM3_AGENT_OUTPUT_CHARS   tool output kept per call (default 2000)
 #   LFM3_AGENT_CONTEXT_CHARS  older turns are dropped past this size (default
-#                             8000; the server holds 4096 tokens)
+#                             4000). Every turn re-reads the whole conversation:
+#                             llama-server keeps no prompt cache for LFM3's
+#                             hybrid layers (cache_n 0 even on a repeated
+#                             request, b11960), so a longer memory is a slower
+#                             reply.
 #   LFM3_MAX_TOKENS           tokens per reply (default 512)
 #   LFM3_WAIT, LFM3_TIMEOUT   as in lfm3-ask
 set -euo pipefail
@@ -55,7 +59,7 @@ MAX_TOKENS=${LFM3_MAX_TOKENS:-512}
 STEPS=${LFM3_AGENT_STEPS:-4}
 CMD_TIMEOUT=${LFM3_AGENT_CMD_TIMEOUT:-60}
 OUTPUT_CHARS=${LFM3_AGENT_OUTPUT_CHARS:-2000}
-CONTEXT_CHARS=${LFM3_AGENT_CONTEXT_CHARS:-8000}
+CONTEXT_CHARS=${LFM3_AGENT_CONTEXT_CHARS:-4000}
 LOG=${LFM3_LOG_DIR:-/tmp/lfm3}/server.log
 DIR=${LFM3_AGENT_DIR:-/tmp/lfm3/agent}
 # lfm3-serve makes /tmp/lfm3 as the image user; an exec as another user keeps
