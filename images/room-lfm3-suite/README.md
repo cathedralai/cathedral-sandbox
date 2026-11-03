@@ -35,22 +35,24 @@ shipped or tested here.
 
 ## Pins and sealed proof
 
-Published from commit `08a476a` (run summary has the commit tags). All six
+VL, Audio, Omni and d1-Omni are published from commit `0938d82` (#384, the
+images with `lfm3-agent` and `liquid`, run 41611679006); Base and d1 stay on
+the `08a476a` images. Run summaries have the commit tags. All six
 packages are public; anonymous pull checked.
 
 | Model | Pin |
 |---|---|
 | `lfm3-1.7b-base` | `ghcr.io/cathedralai/room-lfm3-1.7b-base@sha256:c7fc0f7f5ee18e915b1086fab27d076c391a408085efdd89cb89cb10e4623278` |
-| `lfm3-vl-2b` | `ghcr.io/cathedralai/room-lfm3-vl-2b@sha256:ad586f04ff7aca83d82355ee5df960497b569c6a4ca198741a25b054627140f5` |
-| `lfm3-audio-2b` | `ghcr.io/cathedralai/room-lfm3-audio-2b@sha256:6058d091f4ed9f3770da38b68ce5237a33e05bcf3037f5a2e5eef2b45d212a49` |
-| `lfm3-omni-2b` | `ghcr.io/cathedralai/room-lfm3-omni-2b@sha256:3b1f0900656856de8511adb09b9816c740cd33f4df5b5c32a6596b794b2611ff` |
+| `lfm3-vl-2b` | `ghcr.io/cathedralai/room-lfm3-vl-2b@sha256:9bda02b8d1ffbd33de95417b35fa35208e772a07158513383c48ce15d0c7a433` |
+| `lfm3-audio-2b` | `ghcr.io/cathedralai/room-lfm3-audio-2b@sha256:c2b5d7e1e15b97a220f0d0fe8613b5ad4023efc64713b376892f339f5a520f82` |
+| `lfm3-omni-2b` | `ghcr.io/cathedralai/room-lfm3-omni-2b@sha256:06031206b7c36c2158549b850000a981c126c0fd287125f7c280b51ca68562da` |
 | `d1-2b` | `ghcr.io/cathedralai/room-d1-2b@sha256:2e92f09e8572f34d1ef27b8f7835410dba9f221ad994f8f3e004c5c4f4512f3c` |
-| `d1-omni-2b` | `ghcr.io/cathedralai/room-d1-omni-2b@sha256:17791b80a0e21005321754439c219712274541561bcb83848794a33c16f90002` |
+| `d1-omni-2b` | `ghcr.io/cathedralai/room-d1-omni-2b@sha256:4bfb1f4287e2bc937e3c1524b10aa49c547089613e471b6395b9c36280242c9b` |
 
 The converted `LFM3-1.7B-Base-Q4_K_M.gguf` in that image has sha256
 `d4c9ebb5aa08999083bf939042087b6379547c5729163ce556902d8c06111fd5`.
 
-One sealed room per image on prod, 29 Oct: `amd_sev_snp`, `deny_all`,
+The table below is the 29 Oct proof of the `08a476a` images. One sealed room per image on prod, 29 Oct: `amd_sev_snp`, `deny_all`,
 `sealed-2x4` (2 vCPU, 4 GiB, 10 GiB), `max_spend_usd` 0.1, created and
 deleted through the public API, no prefetch. Each ran `lfm3-selftest` check by
 check and one request to the endpoint contract from inside the room.
