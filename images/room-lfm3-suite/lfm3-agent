@@ -52,6 +52,14 @@ if [ "${LFM3_KIND:-chat}" = decision ]; then
   echo "lfm3-agent: ${MODEL:-this model} is a decision model; ask it typed questions with lfm3-decide" >&2
   exit 2
 fi
+# A base (pretrained) model continues text: it calls no tools and makes up
+# answers about the sandbox, so it gets no chat harness.
+case "${MODEL:-}" in
+  *-base)
+    echo "lfm3-agent: $MODEL is a base model and cannot chat or use tools; continue text with lfm3-ask --raw \"...\"" >&2
+    exit 2
+    ;;
+esac
 
 BASE_URL=${MODEL_BASE_URL:-http://127.0.0.1:8080/v1}
 MODEL_NAME=${MODEL:-lfm3}

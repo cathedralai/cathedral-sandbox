@@ -134,8 +134,18 @@ liquid --new                    # starts over
 ```
 
 Quote the message when it has characters the shell reads itself, such as an
-apostrophe, `?` or `*`: `liquid "what's in /work?"`. d1 rooms refuse
-`liquid` as they refuse `lfm3-agent`.
+apostrophe, `?` or `*`: `liquid "what's in /work?"`. The greeting's
+attachment example follows `MODEL`: `--image` in VL and Omni rooms, `--audio`
+in Audio rooms.
+
+`liquid` and `lfm3-agent` refuse with exit 2 and a one-line pointer in two
+kinds of room:
+
+- **d1.** It answers typed questions; use `lfm3-decide`.
+- **LFM3-1.7B-Base.** It only continues text; use `lfm3-ask --raw`. Checked on
+  the published GGUF through `lfm3-agent`: it called no tool for any of 8
+  questions about the sandbox, answered them from nothing ("the sandbox ...
+  doesn't have CPUs") and leaked a `</think>` tag.
 
 - **Tools.** The model may call `run` (a bash command in `/work`, else
   `/workspace` or `/tmp`, 60 s timeout) and `read_file` (the start of a text

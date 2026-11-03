@@ -314,6 +314,42 @@ def test_liquid_joins_its_words_into_one_message(fake: FakeModel, room: Any) -> 
     assert messages(fake.requests[2])[-1]["content"] == "hey what can you do"
 
 
+@pytest.mark.parametrize(
+    ("model", "example"),
+    [
+        ("lfm3-omni-2b", "liquid --image photo.png"),
+        ("lfm3-vl-2b", "liquid --image photo.png"),
+        ("lfm3-audio-2b", "liquid --audio clip.wav"),
+        ("some-text-model", None),
+    ],
+)
+def test_liquid_greeting_shows_the_attachment_this_room_takes(
+    fake: FakeModel, room: Any, model: str, example: str | None
+) -> None:
+    out = room(script=LIQUID, MODEL=model)
+    assert out.returncode == 0, out.stderr
+    assert model in out.stdout and "liquid what is in /work" in out.stdout
+    attachments = [line.strip() for line in out.stdout.splitlines() if "--image" in line or "--audio" in line]
+    if example is None:
+        assert attachments == []
+    else:
+        assert len(attachments) == 1 and attachments[0].startswith(example)
+    assert fake.requests == []
+
+
+@pytest.mark.parametrize("script", [LIQUID, AGENT], ids=["liquid", "lfm3-agent"])
+def test_base_models_are_refused_with_a_pointer_to_lfm3_ask(fake: FakeModel, room: Any, script: Path) -> None:
+    # LFM3-1.7B-Base called no tool for 8 sandbox questions and made answers up
+    # (checked on the published GGUF), so it gets no chat harness.
+    for args in ((), ("what", "is", "in", "/work")):
+        out = room(*args, script=script, MODEL="lfm3-1.7b-base")
+        assert out.returncode == 2, out.stderr
+        assert "base model" in out.stderr and "lfm3-ask --raw" in out.stderr
+        assert len(out.stderr.strip().splitlines()) == 1
+    assert fake.requests == []
+    assert not (room.state / "history.json").exists()
+
+
 def test_liquid_refuses_decision_models(fake: FakeModel, room: Any) -> None:
     for args in ((), ("what", "is", "this")):
         out = room(*args, script=LIQUID, LFM3_KIND="decision")

@@ -9,6 +9,9 @@
 #   liquid hey, what can you do     a leading "hey" is just part of the message
 #   liquid --new write a haiku      lfm3-agent's options work the same way
 #
+# d1 (decision) and base models refuse it with exit 2: d1 answers typed
+# questions (lfm3-decide) and a base model only continues text (lfm3-ask --raw).
+#
 # Quote the message when it has characters the shell reads itself, such as an
 # apostrophe, "?" or "*": liquid "what's in /work?"
 set -euo pipefail
@@ -17,15 +20,25 @@ if [ "${LFM3_KIND:-chat}" = decision ]; then
   echo "liquid: ${MODEL:-this model} is a decision model; ask it typed questions with lfm3-decide" >&2
   exit 2
 fi
+case "${MODEL:-}" in
+  *-base)
+    echo "liquid: $MODEL is a base model and cannot chat or use tools; continue text with lfm3-ask --raw \"...\"" >&2
+    exit 2
+    ;;
+esac
 
 if [ "$#" -eq 0 ] && [ ! -t 0 ]; then
-  cat <<GREETING
-Hi, I am ${MODEL:-the model in this room}, running inside this sandbox. Ask me anything:
-  liquid what can you do
-  liquid what is in /work
-  liquid --image photo.png what is in this picture
-I remember the conversation; liquid --new starts over. On a terminal, liquid alone opens a chat.
-GREETING
+  # The attachment example follows what this room's model takes (the image sets MODEL).
+  case "${MODEL:-}" in
+    *omni* | *-vl-*) attach="liquid --image photo.png what is in this picture" ;;
+    *audio*) attach="liquid --audio clip.wav what is said in this clip" ;;
+    *) attach="" ;;
+  esac
+  echo "Hi, I am ${MODEL:-the model in this room}, running inside this sandbox. Ask me anything:"
+  echo "  liquid what can you do"
+  echo "  liquid what is in /work"
+  [ -z "$attach" ] || echo "  $attach"
+  echo "I remember the conversation; liquid --new starts over. On a terminal, liquid alone opens a chat."
   exit 0
 fi
 
