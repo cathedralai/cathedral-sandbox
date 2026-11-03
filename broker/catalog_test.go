@@ -120,12 +120,12 @@ func TestLFM3SuiteCreatesLandOnTheSealedHotelOnly(t *testing.T) {
 func TestLFM3SuiteCatalogIsSealedOnlyAndGHCR(t *testing.T) {
 	wantImages := map[string]string{
 		"lfm3-1.7b":      pinnedImage(lfm31_7bRepo, lfm31_7bDigest),
-		"lfm3-vl-2b":     pinnedImage("ghcr.io/cathedralai/room-lfm3-vl-2b", "sha256:9bda02b8d1ffbd33de95417b35fa35208e772a07158513383c48ce15d0c7a433"),
-		"lfm3-omni-2b":   pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:06031206b7c36c2158549b850000a981c126c0fd287125f7c280b51ca68562da"),
-		"d1-2b":          pinnedImage("ghcr.io/cathedralai/room-d1-2b", "sha256:2e92f09e8572f34d1ef27b8f7835410dba9f221ad994f8f3e004c5c4f4512f3c"),
-		"lfm3-audio-2b":  pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:c2b5d7e1e15b97a220f0d0fe8613b5ad4023efc64713b376892f339f5a520f82"),
-		"d1-omni-2b":     pinnedImage("ghcr.io/cathedralai/room-d1-omni-2b", "sha256:4bfb1f4287e2bc937e3c1524b10aa49c547089613e471b6395b9c36280242c9b"),
-		"lfm3-1.7b-base": pinnedImage("ghcr.io/cathedralai/room-lfm3-1.7b-base", "sha256:c7fc0f7f5ee18e915b1086fab27d076c391a408085efdd89cb89cb10e4623278"),
+		"lfm3-vl-2b":     pinnedImage("ghcr.io/cathedralai/room-lfm3-vl-2b", "sha256:894eaecff312e0aaa317ff955663490895b330618810e26f91430799ba664cfa"),
+		"lfm3-omni-2b":   pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:12f4959b25dfaf7350411c8c4d1a96a8c442d06e6784369abe16b7514eec81ca"),
+		"d1-2b":          pinnedImage("ghcr.io/cathedralai/room-d1-2b", "sha256:2cec8e184f141063b134bfc2a94bddb928d678c5fd6934b92a63316696474427"),
+		"lfm3-audio-2b":  pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:7c5ad91bccdd6d9cdaa25417573f171d44f3a4932b46ba7d1f885184a41ea27a"),
+		"d1-omni-2b":     pinnedImage("ghcr.io/cathedralai/room-d1-omni-2b", "sha256:16838d8720c8c4cf881b2474662935e2541a2e4273fe493702b0a16ea0705656"),
+		"lfm3-1.7b-base": pinnedImage("ghcr.io/cathedralai/room-lfm3-1.7b-base", "sha256:57ff645c1685f0c117f73c4c6bfcea4c10b519efef6af784d5de10b2f7ef64e4"),
 	}
 	for name, image := range wantImages {
 		tpl, ok := templateByName(name)
