@@ -16,7 +16,7 @@
 # --no-tools answers without them. The answer is printed on stdout.
 #
 # Options:
-#   --new          forget the conversation first
+#   --new          forget the conversation first (with no message, just forget it)
 #   --reset        forget the conversation and exit
 #   --history      print the conversation so far and exit
 #   --image FILE   add a picture to this message (VL and Omni)
@@ -397,7 +397,7 @@ one_turn() { # message
 
 if [ -z "$prompt" ] && [ "$(jq length "$work/parts")" -eq 0 ]; then
   if [ -t 0 ]; then
-    echo "lfm3-agent: chatting with $MODEL_NAME. /new starts over, /exit or Ctrl-D ends." >&2
+    echo "${LFM3_AGENT_NAME:-lfm3-agent}: chatting with $MODEL_NAME. /new starts over, /exit or Ctrl-D ends." >&2
     while IFS= read -r -e -p "you> " line; do
       case "$line" in
         "") continue ;;
@@ -413,6 +413,10 @@ if [ -z "$prompt" ] && [ "$(jq length "$work/parts")" -eq 0 ]; then
       (one_turn "$line") || true
       echo
     done
+    exit 0
+  fi
+  if [ -n "$fresh" ]; then
+    echo "${LFM3_AGENT_NAME:-lfm3-agent}: new conversation" >&2
     exit 0
   fi
   usage

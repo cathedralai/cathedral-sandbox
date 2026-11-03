@@ -121,6 +121,20 @@ lfm3-agent --new "Write a haiku about the sea."          # starts over
 lfm3-agent --history                                     # the conversation so far
 ```
 
+`liquid` is the short name for the same harness, installed beside it. Its
+words are the message, so quotes are not needed:
+
+```sh
+liquid                          # on a terminal: the chat; in the console terminal: a greeting
+liquid what is in /work         # one turn of the same conversation
+liquid hey, what can you do     # a leading "hey" is just part of the message
+liquid --new                    # starts over
+```
+
+Quote the message when it has characters the shell reads itself, such as an
+apostrophe, `?` or `*`: `liquid "what's in /work?"`. d1 rooms refuse
+`liquid` as they refuse `lfm3-agent`.
+
 - **Tools.** The model may call `run` (a bash command in `/work`, else
   `/workspace` or `/tmp`, 60 s timeout) and `read_file` (the start of a text
   file). Each call is printed on stderr as it runs (`$ ls -la`); the output

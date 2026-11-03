@@ -11,7 +11,9 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator
@@ -21,6 +23,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SUITE = ROOT / "images" / "room-lfm3-suite"
 AGENT = SUITE / "lfm3-agent"
+LIQUID = SUITE / "liquid"
 
 
 def _bash_ok() -> bool:
@@ -106,24 +109,25 @@ def room(tmp_path: Path, fake: FakeModel):
     work.mkdir()
     state = tmp_path / "state"
 
-    def run(*args: str, stdin: str | None = None, **env: str) -> subprocess.CompletedProcess[str]:
-        full = {
-            "PATH": os.environ["PATH"],
-            "HOME": str(tmp_path),
-            "MODEL_BASE_URL": fake.base_url,
-            "MODEL": "lfm3-omni-2b",
-            "LFM3_AGENT_DIR": str(state),
-            "LFM3_AGENT_CWD": str(work),
-            "LFM3_WAIT": "5",
-            **env,
-        }
+    base_env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "MODEL_BASE_URL": fake.base_url,
+        "MODEL": "lfm3-omni-2b",
+        "LFM3_AGENT_DIR": str(state),
+        "LFM3_AGENT_CWD": str(work),
+        "LFM3_WAIT": "5",
+    }
+
+    def run(*args: str, stdin: str | None = None, script: Path = AGENT, **env: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["bash", str(AGENT), *args], input=stdin if stdin is not None else "",
-            capture_output=True, text=True, env=full, timeout=60,
+            ["bash", str(script), *args], input=stdin if stdin is not None else "",
+            capture_output=True, text=True, env={**base_env, **env}, timeout=60,
         )
 
     run.work = work  # type: ignore[attr-defined]
     run.state = state  # type: ignore[attr-defined]
+    run.env = base_env  # type: ignore[attr-defined]
     return run
 
 
@@ -272,7 +276,94 @@ def test_decision_models_are_sent_to_lfm3_decide(fake: FakeModel, room: Any) -> 
     assert fake.requests == []
 
 
-def test_image_ships_the_agent() -> None:
+def test_new_with_no_message_just_forgets(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("4")]
+    assert room("What is 2+2?").returncode == 0
+    out = room("--new")
+    assert out.returncode == 0 and "new conversation" in out.stderr
+    assert history(room) == []
+    assert len(fake.requests) == 1
+
+
+def test_image_ships_the_agent_and_liquid() -> None:
     dockerfile = (SUITE / "Dockerfile").read_text(encoding="utf-8")
-    assert "lfm3-agent" in dockerfile.split("COPY lfm3-serve", 1)[1].splitlines()[0]
-    assert "/usr/local/bin/lfm3-agent" in dockerfile
+    copied = dockerfile.split("COPY lfm3-serve", 1)[1].splitlines()[0].split()
+    assert "lfm3-agent" in copied and "liquid" in copied
+    assert "/usr/local/bin/lfm3-agent" in dockerfile and "/usr/local/bin/liquid" in dockerfile
+
+
+# liquid: the friendly name for lfm3-agent.
+
+
+def test_liquid_alone_without_a_terminal_greets_and_exits(fake: FakeModel, room: Any) -> None:
+    out = room(script=LIQUID)
+    assert out.returncode == 0, out.stderr
+    assert "lfm3-omni-2b" in out.stdout and "liquid what can you do" in out.stdout
+    assert fake.requests == []
+
+
+def test_liquid_joins_its_words_into_one_message(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("Two files."), answer("notes.txt."), answer("Hello.")]
+    assert room("what", "is", "in", "/work", script=LIQUID).stdout.strip() == "Two files."
+    assert room("which one is larger", script=LIQUID).stdout.strip() == "notes.txt."
+    first, second = fake.requests[0], fake.requests[1]
+    assert messages(first)[-1] == {"role": "user", "content": "what is in /work"}
+    assert [m["content"] for m in messages(second)[1:]] == ["what is in /work", "Two files.", "which one is larger"]
+    # A leading "hey" is only part of the message.
+    assert room("hey", "what", "can", "you", "do", script=LIQUID).returncode == 0
+    assert messages(fake.requests[2])[-1]["content"] == "hey what can you do"
+
+
+def test_liquid_refuses_decision_models(fake: FakeModel, room: Any) -> None:
+    for args in ((), ("what", "is", "this")):
+        out = room(*args, script=LIQUID, LFM3_KIND="decision")
+        assert out.returncode == 2 and "liquid:" in out.stderr and "lfm3-decide" in out.stderr
+    assert fake.requests == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs a pseudo-terminal")
+def test_liquid_alone_on_a_terminal_opens_the_chat(fake: FakeModel, room: Any) -> None:
+    import pty
+    import select
+
+    fake.replies = [answer("Hi there.")]
+    # openpty and Popen, not pty.fork: forking this multi-threaded process (the
+    # fake server runs in a thread) can deadlock the child before it execs.
+    fd, terminal = pty.openpty()
+    child = subprocess.Popen(
+        ["bash", str(LIQUID)], stdin=terminal, stdout=terminal, stderr=terminal,
+        env={**room.env, "TERM": "dumb"}, start_new_session=True,
+    )
+    os.close(terminal)
+    seen = b""
+
+    def read_until(marker: bytes, seconds: float = 20) -> None:
+        # Keep draining the terminal: liquid blocks if nobody reads it.
+        nonlocal seen
+        deadline = time.monotonic() + seconds
+        while marker not in seen and time.monotonic() < deadline:
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if ready:
+                try:
+                    seen += os.read(fd, 4096)
+                except OSError:
+                    return
+
+    try:
+        read_until(b"you> ")
+        os.write(fd, b"hello\n")
+        read_until(b"Hi there.")
+        os.write(fd, b"/exit\n")
+        deadline = time.monotonic() + 20
+        while child.poll() is None and time.monotonic() < deadline:
+            read_until(b"\0", 0.2)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+        os.close(fd)
+    text = seen.decode(errors="replace")
+    assert child.returncode == 0, f"liquid did not exit cleanly after /exit: {text!r}"
+    assert "liquid: chatting with lfm3-omni-2b" in text
+    assert "Hi there." in text
+    assert messages(fake.requests[0])[-1] == {"role": "user", "content": "hello"}
