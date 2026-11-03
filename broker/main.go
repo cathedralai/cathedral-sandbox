@@ -82,8 +82,12 @@ type hotelConfig struct {
 }
 
 type guestConfig struct {
-	ID              string `json:"id"`
-	KeySHA256       string `json:"key_sha256"`        // empty: the guest has a view only
+	ID        string `json:"id"`
+	KeySHA256 string `json:"key_sha256"` // empty: the guest has a view only
+	// NextKeySHA256 is accepted alongside key_sha256 for the same guest while
+	// a key rotates: the client moves to the new key, then the old hash is
+	// removed. Rooms stay with the guest throughout, so nothing is cut off.
+	NextKeySHA256   string `json:"next_key_sha256,omitempty"`
 	ViewTokenSHA256 string `json:"view_token_sha256"` // token for /<id>/live
 	Ops             bool   `json:"ops"`               // may run the probe and reset the broker counters
 	guestLimits            // max_rooms, max_creates_per_minute, default_sealed, hotels (guests.go)
@@ -381,10 +385,10 @@ func loadBroker(path string) (*broker, error) {
 		}
 	}
 	for _, gc := range c.Guests {
-		if c.MinerEnrollKeySHA256 != "" && (strings.EqualFold(c.MinerEnrollKeySHA256, gc.KeySHA256) || strings.EqualFold(c.MinerEnrollKeySHA256, gc.ViewTokenSHA256)) {
+		if c.MinerEnrollKeySHA256 != "" && (strings.EqualFold(c.MinerEnrollKeySHA256, gc.KeySHA256) || strings.EqualFold(c.MinerEnrollKeySHA256, gc.NextKeySHA256) || strings.EqualFold(c.MinerEnrollKeySHA256, gc.ViewTokenSHA256)) {
 			return nil, errors.New("config: miner enrollment key must differ from guest keys and view tokens")
 		}
-		if c.OperatorReadKeySHA256 != "" && (strings.EqualFold(c.OperatorReadKeySHA256, gc.KeySHA256) || strings.EqualFold(c.OperatorReadKeySHA256, gc.ViewTokenSHA256)) {
+		if c.OperatorReadKeySHA256 != "" && (strings.EqualFold(c.OperatorReadKeySHA256, gc.KeySHA256) || strings.EqualFold(c.OperatorReadKeySHA256, gc.NextKeySHA256) || strings.EqualFold(c.OperatorReadKeySHA256, gc.ViewTokenSHA256)) {
 			return nil, errors.New("config: operator read key must differ from guest keys and view tokens")
 		}
 		if gc.ID == "" {
@@ -403,6 +407,25 @@ func loadBroker(path string) (*broker, error) {
 		b.guests[gc.ID] = g
 		if gc.KeySHA256 != "" {
 			k := strings.ToLower(gc.KeySHA256)
+			if other := b.byKey[k]; other != nil {
+				return nil, fmt.Errorf("config: guests %q and %q share one key hash", other.cfg.ID, gc.ID)
+			}
+			b.byKey[k] = g
+		}
+		if gc.NextKeySHA256 != "" {
+			k := strings.ToLower(gc.NextKeySHA256)
+			if raw, err := hex.DecodeString(k); err != nil || len(raw) != sha256.Size {
+				return nil, fmt.Errorf("config: guest %q: next_key_sha256 must be a SHA-256 hex digest", gc.ID)
+			}
+			if gc.KeySHA256 == "" {
+				return nil, fmt.Errorf("config: guest %q: next_key_sha256 needs key_sha256 (it is a rotation, not a first key)", gc.ID)
+			}
+			if strings.EqualFold(k, gc.KeySHA256) {
+				return nil, fmt.Errorf("config: guest %q: next_key_sha256 equals key_sha256", gc.ID)
+			}
+			if strings.EqualFold(k, c.OperatorKeySHA256) {
+				return nil, fmt.Errorf("config: guest %q: next_key_sha256 must differ from the operator key", gc.ID)
+			}
 			if other := b.byKey[k]; other != nil {
 				return nil, fmt.Errorf("config: guests %q and %q share one key hash", other.cfg.ID, gc.ID)
 			}
