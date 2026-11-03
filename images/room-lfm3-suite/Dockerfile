@@ -150,7 +150,7 @@ COPY --from=llama /opt/lfm3/licenses /opt/lfm3/licenses
 COPY --from=weights /opt/lfm3 /opt/lfm3
 COPY NOTICE.in /tmp/NOTICE.in
 COPY test /opt/lfm3/test
-COPY lfm3-serve lfm3-ask lfm3-decide lfm3-selftest /usr/local/bin/
+COPY lfm3-serve lfm3-ask lfm3-agent lfm3-decide lfm3-selftest /usr/local/bin/
 
 # NOTICE names this model and says whether the weights are Liquid AI's files
 # unmodified or converted here (LFM Open License 4(b)). SHA256SUMS records
@@ -166,7 +166,7 @@ RUN set -eu; \
         /tmp/NOTICE.in > /opt/lfm3/NOTICE; \
     rm /tmp/NOTICE.in; \
     ! grep -q '@[A-Z_]*@' /opt/lfm3/NOTICE; \
-    chmod 0755 /usr/local/bin/lfm3-serve /usr/local/bin/lfm3-ask /usr/local/bin/lfm3-decide /usr/local/bin/lfm3-selftest; \
+    chmod 0755 /usr/local/bin/lfm3-serve /usr/local/bin/lfm3-ask /usr/local/bin/lfm3-agent /usr/local/bin/lfm3-decide /usr/local/bin/lfm3-selftest; \
     ln -s /opt/llama/bin/llama-cli /usr/local/bin/llama-cli; \
     ln -s /opt/llama/bin/llama-server /usr/local/bin/llama-server; \
     chmod -R a+rX /opt/llama /opt/lfm3; \

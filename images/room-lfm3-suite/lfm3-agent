@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+# lfm3-agent [options] ["message"]: talk to the model this room serves, with
+# memory and tools. Each call is one turn of the same conversation, so a
+# one-command-at-a-time terminal works as a chat:
+#
+#   lfm3-agent "What is in /work?"
+#   lfm3-agent "Which of those files is the largest?"    # remembers the last turn
+#   lfm3-agent --image photo.png "What is in this picture?"
+#   lfm3-agent --new "Write a haiku about the sea."      # starts over
+#
+# With no message on a terminal (SSH or a PTY) it is an interactive chat.
+#
+# The model may call two tools; each call is printed on stderr as it runs:
+#   run        a bash command in the sandbox ($LFM3_AGENT_CWD), with a timeout
+#   read_file  the start of a text file
+# --no-tools answers without them. The answer is printed on stdout.
+#
+# Options:
+#   --new          forget the conversation first
+#   --reset        forget the conversation and exit
+#   --history      print the conversation so far and exit
+#   --image FILE   add a picture to this message (VL and Omni)
+#   --audio FILE   add an audio clip, WAV or MP3, to this message (Audio and Omni)
+#   --system TEXT  use this system prompt from now on (default: a short one
+#                  about this sandbox and the tools)
+#   --no-tools     answer without running anything
+#   -              read the message from stdin
+#
+# Environment:
+#   LFM3_AGENT_DIR            where the conversation is kept (default /tmp/lfm3/agent)
+#   LFM3_AGENT_CWD            where commands run (default /work, /workspace or /tmp)
+#   LFM3_AGENT_STEPS          tool rounds per message at most (default 4)
+#   LFM3_AGENT_CMD_TIMEOUT    seconds per command (default 60)
+#   LFM3_AGENT_OUTPUT_CHARS   tool output kept per call (default 2000)
+#   LFM3_AGENT_CONTEXT_CHARS  older turns are dropped past this size (default
+#                             8000; the server holds 4096 tokens)
+#   LFM3_MAX_TOKENS           tokens per reply (default 512)
+#   LFM3_WAIT, LFM3_TIMEOUT   as in lfm3-ask
+set -euo pipefail
+
+usage() {
+  echo 'usage: lfm3-agent [--new] [--image FILE] [--audio FILE] [--system TEXT] [--no-tools] "message"   (or "-" for stdin)' >&2
+  echo '       lfm3-agent --reset | --history' >&2
+  exit 2
+}
+
+if [ "${LFM3_KIND:-chat}" = decision ]; then
+  echo "lfm3-agent: ${MODEL:-this model} is a decision model; ask it typed questions with lfm3-decide" >&2
+  exit 2
+fi
+
+BASE_URL=${MODEL_BASE_URL:-http://127.0.0.1:8080/v1}
+MODEL_NAME=${MODEL:-lfm3}
+MAX_TOKENS=${LFM3_MAX_TOKENS:-512}
+STEPS=${LFM3_AGENT_STEPS:-4}
+CMD_TIMEOUT=${LFM3_AGENT_CMD_TIMEOUT:-60}
+OUTPUT_CHARS=${LFM3_AGENT_OUTPUT_CHARS:-2000}
+CONTEXT_CHARS=${LFM3_AGENT_CONTEXT_CHARS:-8000}
+LOG=${LFM3_LOG_DIR:-/tmp/lfm3}/server.log
+DIR=${LFM3_AGENT_DIR:-/tmp/lfm3/agent}
+# lfm3-serve makes /tmp/lfm3 as the image user; an exec as another user keeps
+# its conversation beside it instead.
+if ! mkdir -p "$DIR" 2>/dev/null || [ ! -w "$DIR" ]; then
+  if [ -n "${LFM3_AGENT_DIR:-}" ]; then
+    echo "lfm3-agent: cannot write $DIR" >&2
+    exit 1
+  fi
+  DIR=/tmp/lfm3-agent-$(id -u)
+  mkdir -p "$DIR"
+fi
+HISTORY=$DIR/history.json
+SYSTEM_FILE=$DIR/system.txt
+# The last picture or clip, sent again with later turns so follow-up questions
+# about it see it. Older media stay in the history as a note only.
+MEDIA_FILE=$DIR/media.json
+
+if [ -n "${LFM3_AGENT_CWD:-}" ]; then
+  CWD=$LFM3_AGENT_CWD
+elif [ -d /work ]; then
+  CWD=/work
+elif [ -d /workspace ]; then
+  CWD=/workspace
+else
+  CWD=/tmp
+fi
+
+default_system() {
+  cat <<PROMPT
+You are $MODEL_NAME, a small assistant inside a Cathedral sandbox: a sealed Linux container on an AMD SEV-SNP host. Answer briefly and directly.
+Tools: run executes a bash command here (working directory $CWD) and returns its exit code and output. read_file returns the start of a text file.
+Use a tool for questions about this machine: its files, programs, memory, disk, CPUs, processes or network, or to run code. Answer everything else yourself, without a tool: facts, math, writing, translation.
+The network may be off. Never say you ran a command unless you called run and saw the result.
+PROMPT
+}
+
+TOOLS='[
+  {"type": "function", "function": {"name": "run",
+    "description": "Run a bash command in this sandbox. Returns the exit code and the output.",
+    "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The bash command line"}}, "required": ["command"]}}},
+  {"type": "function", "function": {"name": "read_file",
+    "description": "Read the start of a text file in this sandbox.",
+    "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Path of the file"}}, "required": ["path"]}}}
+]'
+
+chmod 700 "$DIR"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+# One conversation, one writer: two calls at once would interleave turns.
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$DIR/lock"
+  flock -w 600 9 || { echo "lfm3-agent: another lfm3-agent is still answering" >&2; exit 1; }
+fi
+
+forget() { rm -f "$HISTORY" "$SYSTEM_FILE" "$MEDIA_FILE"; }
+
+show_history() {
+  [ -s "$HISTORY" ] || { echo "(no conversation yet)"; return; }
+  jq -r '.[] |
+    if .role == "user" then "you: " + (.content | tostring)
+    elif .role == "assistant" and ((.tool_calls // []) | length) > 0 then
+      (.tool_calls[] | "  [" + .function.name + "] " + (.function.arguments | tostring))
+    elif .role == "assistant" then "model: " + (.content // "")
+    elif .role == "tool" then "  -> " + ((.content // "") | split("\n") | first)
+    else empty end' "$HISTORY"
+}
+
+echo '[]' >"$work/parts"
+echo '[]' >"$work/names"
+echo '[]' >"$work/no_media"
+system=""
+prompt=""
+tools=1
+fresh=""
+
+add_part() { # kind file
+  [ -r "$2" ] || { echo "lfm3-agent: cannot read $2" >&2; exit 2; }
+  base64 <"$2" | tr -d '\n' >"$work/b64"
+  case "$1" in
+    image)
+      case "${2,,}" in
+        *.jpg | *.jpeg) mime=image/jpeg ;;
+        *.webp) mime=image/webp ;;
+        *.gif) mime=image/gif ;;
+        *) mime=image/png ;;
+      esac
+      jq --rawfile d "$work/b64" --arg m "$mime" \
+        '. + [{type: "image_url", image_url: {url: ("data:" + $m + ";base64," + $d)}}]' \
+        "$work/parts" >"$work/parts.new"
+      ;;
+    audio)
+      case "${2,,}" in
+        *.mp3) format=mp3 ;;
+        *) format=wav ;;
+      esac
+      jq --rawfile d "$work/b64" --arg f "$format" \
+        '. + [{type: "input_audio", input_audio: {data: $d, format: $f}}]' \
+        "$work/parts" >"$work/parts.new"
+      ;;
+  esac
+  mv "$work/parts.new" "$work/parts"
+  # The conversation keeps a note of the file, not its bytes.
+  jq --arg n "$1: ${2##*/}" '. + [$n]' "$work/names" >"$work/names.new"
+  mv "$work/names.new" "$work/names"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h | --help) usage ;;
+    --reset)
+      forget
+      echo "lfm3-agent: conversation cleared" >&2
+      exit 0
+      ;;
+    --history)
+      show_history
+      exit 0
+      ;;
+    --new)
+      fresh=1
+      shift
+      ;;
+    --no-tools)
+      tools=""
+      shift
+      ;;
+    --image | --audio)
+      [ "$#" -ge 2 ] || usage
+      add_part "${1#--}" "$2"
+      shift 2
+      ;;
+    --system)
+      [ "$#" -ge 2 ] || usage
+      system=$2
+      shift 2
+      ;;
+    -)
+      prompt=$(cat)
+      shift
+      ;;
+    -*) usage ;;
+    *)
+      prompt="$*"
+      break
+      ;;
+  esac
+done
+
+[ -z "$fresh" ] || forget
+[ -s "$HISTORY" ] || echo '[]' >"$HISTORY"
+if [ -n "$system" ]; then
+  printf '%s' "$system" >"$SYSTEM_FILE"
+elif [ ! -s "$SYSTEM_FILE" ]; then
+  default_system >"$SYSTEM_FILE"
+fi
+
+wait_for_server() {
+  for _ in $(seq 1 "${LFM3_WAIT:-120}"); do
+    if curl -fsS -o /dev/null "${BASE_URL%/v1}/health" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "lfm3-agent: the model server at $BASE_URL is not up (log: $LOG)" >&2
+  exit 1
+}
+
+with_timeout() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout -k 5 "$CMD_TIMEOUT" "$@"
+  else
+    "$@"
+  fi
+}
+
+clip() { # file: the first OUTPUT_CHARS characters, and how much was cut
+  local size
+  size=$(wc -c <"$1" | tr -d ' ')
+  head -c "$OUTPUT_CHARS" "$1"
+  if [ "$size" -gt "$OUTPUT_CHARS" ]; then
+    printf '\n[... %s more bytes not shown]' "$((size - OUTPUT_CHARS))"
+  fi
+}
+
+run_tool() { # name arguments-json: prints the result the model reads
+  local name=$1 args=$2 value status
+  if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$args"; then
+    echo "error: the arguments are not a JSON object: $args"
+    return
+  fi
+  case "$name" in
+    run)
+      value=$(jq -r '.command // empty | tostring' <<<"$args")
+      [ -n "$value" ] || { echo "error: run needs a command"; return; }
+      printf '$ %s\n' "$value" >&2
+      status=0
+      (cd "$CWD" && with_timeout bash -c "$value") </dev/null >"$work/tool_out" 2>&1 || status=$?
+      if [ "$status" -eq 124 ]; then
+        printf 'exit code: 124 (stopped after %ss)\n' "$CMD_TIMEOUT"
+      else
+        printf 'exit code: %s\n' "$status"
+      fi
+      clip "$work/tool_out"
+      ;;
+    read_file)
+      value=$(jq -r '.path // empty | tostring' <<<"$args")
+      [ -n "$value" ] || { echo "error: read_file needs a path"; return; }
+      case "$value" in /*) ;; *) value=$CWD/$value ;; esac
+      printf '[read_file] %s\n' "$value" >&2
+      if [ -f "$value" ] && [ -r "$value" ]; then
+        clip "$value"
+      else
+        echo "error: cannot read $value"
+      fi
+      ;;
+    *)
+      echo "error: there is no tool named $name; use run or read_file"
+      ;;
+  esac
+}
+
+# The messages for one request: the system prompt, as many earlier turns as
+# fit CONTEXT_CHARS (whole turns, oldest dropped first), this message with its
+# media, and the tool calls of this turn so far. Without new media, the last
+# picture or clip goes back on the message that brought it, if that is kept.
+build_body() { # with-tools
+  local media=$MEDIA_FILE
+  [ -s "$media" ] || media=$work/no_media
+  jq -n --rawfile sys "$SYSTEM_FILE" --slurpfile hist "$HISTORY" \
+    --slurpfile stored "$work/user_stored" --slurpfile sent "$work/user_sent" \
+    --slurpfile turn "$work/turn" --slurpfile media "$media" --slurpfile parts "$work/parts" \
+    --argjson room "$CONTEXT_CHARS" --arg model "$MODEL_NAME" --argjson n "$MAX_TOKENS" \
+    --argjson tools "$TOOLS" --arg with_tools "$1" '
+    def drop_turn: (.[1:] | map(.role == "user") | index(true)) as $i
+      | if $i == null then [] else .[($i + 1):] end;
+    def fit($room): if length == 0 or (tojson | length) <= $room then . else (drop_turn | fit($room)) end;
+    def attach($m): ([to_entries[] | select(.value.role == "user" and .value.media == true) | .key] | last) as $i
+      | if ($m | length) == 0 or $i == null then .
+        else .[$i].content = ($m + [{type: "text", text: (.[$i].content | tostring)}]) end;
+    ([{role: "system", content: $sys}] + $stored[0] + $turn[0] | tojson | length) as $fixed
+    | ($hist[0] | fit($room - $fixed)
+       | if ($parts[0] | length) == 0 then attach($media[0]) else . end
+       | map(del(.media))) as $kept
+    | {
+        model: $model,
+        messages: ([{role: "system", content: $sys}] + $kept + ($sent[0] | map(del(.media))) + $turn[0]),
+        max_tokens: $n,
+        temperature: 0
+      }
+    + (if $with_tools == "1" then {tools: $tools} else {} end)' >"$work/body"
+}
+
+ask_model() { # with-tools: the reply message goes to $work/msg
+  local status=0 code
+  build_body "$1"
+  curl -sS --max-time "${LFM3_TIMEOUT:-600}" -o "$work/out" -w '%{http_code}' \
+    -H 'Content-Type: application/json' -H "Authorization: Bearer ${MODEL_API_KEY:-local}" \
+    --data-binary @"$work/body" "$BASE_URL/chat/completions" >"$work/code" || status=$?
+  code=$(cat "$work/code" 2>/dev/null || true)
+  if [ "$status" -ne 0 ] || [ "$code" != 200 ]; then
+    head -c 2000 "$work/out" >&2 2>/dev/null || true
+    echo >&2
+    echo "lfm3-agent: $BASE_URL/chat/completions answered ${code:-nothing} (curl exit $status)" >&2
+    if grep -qi 'context' "$work/out" 2>/dev/null; then
+      echo "lfm3-agent: the conversation is too long for the model; start over with --new" >&2
+    fi
+    exit 1
+  fi
+  jq '.choices[0].message' "$work/out" >"$work/msg"
+}
+
+one_turn() { # message
+  local text=$1 round=0 calls i id name args result
+  if [ -z "$text" ] && [ "$(jq length "$work/parts")" -eq 0 ]; then
+    usage
+  fi
+  jq -n --arg t "$text" --slurpfile names "$work/names" '
+    ($names[0] | map("[" + . + "]") | join(" ")) as $n
+    | [{role: "user", content: ([$n, $t] | map(select(. != "")) | join(" "))}
+       + (if $n == "" then {} else {media: true} end)]' >"$work/user_stored"
+  jq -n --arg t "$text" --slurpfile parts "$work/parts" '
+    [{role: "user", content: (if ($parts[0] | length) == 0 then $t
+      else $parts[0] + (if $t == "" then [] else [{type: "text", text: $t}] end) end)}]' >"$work/user_sent"
+  echo '[]' >"$work/turn"
+
+  wait_for_server
+  while :; do
+    if [ -n "$tools" ] && [ "$round" -lt "$STEPS" ]; then
+      ask_model 1
+    else
+      ask_model 0
+    fi
+    calls=$(jq '(.tool_calls // []) | length' "$work/msg")
+    if [ "$calls" -eq 0 ] || [ -z "$tools" ] || [ "$round" -ge "$STEPS" ]; then
+      break
+    fi
+    round=$((round + 1))
+    jq --slurpfile m "$work/msg" \
+      '. + [{role: "assistant", content: ($m[0].content // ""), tool_calls: $m[0].tool_calls}]' \
+      "$work/turn" >"$work/turn.new"
+    mv "$work/turn.new" "$work/turn"
+    for ((i = 0; i < calls; i++)); do
+      id=$(jq -r --argjson i "$i" '.tool_calls[$i].id // ("call_" + ($i | tostring))' "$work/msg")
+      name=$(jq -r --argjson i "$i" '.tool_calls[$i].function.name // ""' "$work/msg")
+      args=$(jq -r --argjson i "$i" '.tool_calls[$i].function.arguments // "{}"
+        | if type == "string" then . else tojson end' "$work/msg")
+      result=$(run_tool "$name" "$args")
+      jq --arg id "$id" --arg name "$name" --arg r "$result" \
+        '. + [{role: "tool", tool_call_id: $id, name: $name, content: $r}]' \
+        "$work/turn" >"$work/turn.new"
+      mv "$work/turn.new" "$work/turn"
+    done
+  done
+
+  jq -r '.content // ""' "$work/msg" >"$work/answer"
+  [ -s "$work/answer" ] || echo "(the model gave no answer)" >"$work/answer"
+  # Keep the turn: history (trimmed the same way), this message, the tool
+  # calls and the answer. Written whole, so a failed request leaves no half turn.
+  jq --slurpfile stored "$work/user_stored" --slurpfile turn "$work/turn" \
+    --rawfile answer "$work/answer" --argjson room "$CONTEXT_CHARS" '
+    def drop_turn: (.[1:] | map(.role == "user") | index(true)) as $i
+      | if $i == null then [] else .[($i + 1):] end;
+    def fit($room): if length == 0 or (tojson | length) <= $room then . else (drop_turn | fit($room)) end;
+    ($stored[0] + $turn[0] + [{role: "assistant", content: ($answer | rtrimstr("\n"))}]) as $new
+    | fit($room - ($new | tojson | length)) + $new' \
+    "$HISTORY" >"$HISTORY.new"
+  mv "$HISTORY.new" "$HISTORY"
+  if [ "$(jq length "$work/parts")" -gt 0 ]; then
+    cp "$work/parts" "$MEDIA_FILE"
+  fi
+  cat "$work/answer"
+}
+
+if [ -z "$prompt" ] && [ "$(jq length "$work/parts")" -eq 0 ]; then
+  if [ -t 0 ]; then
+    echo "lfm3-agent: chatting with $MODEL_NAME. /new starts over, /exit or Ctrl-D ends." >&2
+    while IFS= read -r -e -p "you> " line; do
+      case "$line" in
+        "") continue ;;
+        /exit | /quit | exit | quit) break ;;
+        /new)
+          forget
+          default_system >"$SYSTEM_FILE"
+          echo '[]' >"$HISTORY"
+          echo "(new conversation)" >&2
+          continue
+          ;;
+      esac
+      (one_turn "$line") || true
+      echo
+    done
+    exit 0
+  fi
+  usage
+fi
+
+one_turn "$prompt"

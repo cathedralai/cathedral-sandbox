@@ -104,6 +104,66 @@ lfm3-timing load_ms=812 prompt_tok_s=118.0 gen_tok_s=52.8 wall_ms=1530 threads=2
 Over HTTP, a picture is an `image_url` part with a data URI and a clip an
 `input_audio` part (base64 WAV or MP3), in `/v1/chat/completions`.
 
+### Talk to it: `lfm3-agent`
+
+`lfm3-ask` is one question with no memory. `lfm3-agent` is the harness for a
+conversation: each call is one turn of the same conversation, so the console's
+one-command-at-a-time terminal works as a chat, and with no message on a
+terminal (SSH or a PTY) it is an interactive chat.
+
+```sh
+lfm3-agent "What files are in /work?"
+lfm3-agent "Which of those is the largest?"              # remembers the last turn
+lfm3-agent --image photo.png "What is in this picture?"  # VL, Omni
+lfm3-agent "And in the background?"                      # the picture is sent again
+lfm3-agent --audio clip.wav "Transcribe this."           # Audio, Omni
+lfm3-agent --new "Write a haiku about the sea."          # starts over
+lfm3-agent --history                                     # the conversation so far
+```
+
+- **Tools.** The model may call `run` (a bash command in `/work`, else
+  `/workspace` or `/tmp`, 60 s timeout) and `read_file` (the start of a text
+  file). Each call is printed on stderr as it runs (`$ ls -la`); the output
+  the model reads is cut at 2,000 characters. At most 4 tool rounds a
+  message, then the model must answer. `--no-tools` answers without them.
+- **System prompt.** A short default says what the sandbox is, when to use a
+  tool and when not to, and never to claim a command it did not run.
+  `--system` replaces it.
+- **Memory.** The conversation is kept in `/tmp/lfm3/agent`. Older turns are
+  dropped whole once the conversation passes 8,000 characters (the server
+  holds 4,096 tokens). The last picture or clip is sent again with later
+  turns while its turn is kept; older ones stay as a note only.
+- **Defaults.** Greedy decoding (temperature 0, as Liquid AI's model card
+  uses for Omni text), 512 tokens a reply. d1 rooms refuse it: use
+  `lfm3-decide`.
+
+`LFM3_AGENT_DIR`, `LFM3_AGENT_CWD`, `LFM3_AGENT_STEPS`,
+`LFM3_AGENT_CMD_TIMEOUT`, `LFM3_AGENT_OUTPUT_CHARS`,
+`LFM3_AGENT_CONTEXT_CHARS` and `LFM3_MAX_TOKENS` change those defaults.
+`lfm3-selftest agent` asks for the hostname, which the model can only learn by
+calling `run`; the Omni image gates on it.
+
+### Which model to talk to
+
+Omni is the default chat model. Its language model is LFM3-1.7B (same 1.10 GB
+Q4_K_M weights size), with Liquid AI's vision and audio encoders on top, so it
+takes text, pictures and clips in one room. Checked locally on the pinned
+GGUFs and llama.cpp commit (Apple M4, not a sealed host), greedy, reasoning
+off:
+
+| Check | `lfm3-omni-2b` | `lfm3-1.7b` |
+|---|---|---|
+| 16 short questions with a known answer | 15 | 15 |
+| `lfm3-agent` tool choice (8 need the sandbox, 6 do not) | 14 of 14 | 13 of 14 |
+| Tokens for six short answers | 71 | 763 (two hit the 256 cap) |
+
+LFM3-1.7B is a reasoning model; with reasoning off it thinks out loud in the
+answer ("17 * 23, number only" runs to the token cap). Omni is not a
+reasoning model and answers in a few tokens. On a sealed room Omni generates
+19.4 tok/s, holds 2.7 GB and pulls 1.6 GB (table above), more than the text
+models. Omni in this image does not speak or watch video: speech output and
+video input are not shipped (see above).
+
 LFM3-Audio-2B reasons before a text answer even with `LFM3_REASONING=off`:
 its chat template has no switch for it. The reasoning comes back in
 `reasoning_content`; leave room for it in `max_tokens` (about 60 tokens for
