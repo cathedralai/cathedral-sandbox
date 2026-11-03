@@ -90,13 +90,13 @@ var catalogTemplates = []catalogTemplate{
 	},
 	{
 		Name: "lfm3-vl-2b", DisplayName: "LFM3 VL 2B (CPU)",
-		Description: "LFM3 1.92B on CPU via llama.cpp b11960 (LFM3-VL-2B-Q4_K_M.gguf). Sandbox inputs: text, image, video. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
+		Description: "LFM3 1.92B on CPU via llama.cpp b11960 (LFM3-VL-2B-Q4_K_M.gguf). Sandbox inputs: text, image. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
 		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-vl-2b", "sha256:ad586f04ff7aca83d82355ee5df960497b569c6a4ca198741a25b054627140f5"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "lfm3-omni-2b", DisplayName: "LFM3 Omni 2B (CPU)",
-		Description: "LFM3 2.17B on CPU via llama.cpp b11960 (LFM3-Omni-2B-Q4_K_M.gguf). Sandbox inputs: text, image, video, audio. Sandbox outputs: text, speech. Sealed AMD SEV-SNP only.",
+		Description: "LFM3 2.17B on CPU via llama.cpp b11960 (LFM3-Omni-2B-Q4_K_M.gguf). Sandbox inputs: text, image, audio. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
 		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:3b1f0900656856de8511adb09b9816c740cd33f4df5b5c32a6596b794b2611ff"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
@@ -108,7 +108,7 @@ var catalogTemplates = []catalogTemplate{
 	},
 	{
 		Name: "lfm3-audio-2b", DisplayName: "LFM3 Audio 2B (CPU)",
-		Description: "LFM3 2B on CPU via llama.cpp b11960 (LFM3-Audio-2B-Q4_K_M.gguf). Sandbox inputs: text, audio. Sandbox outputs: text, speech. Sealed AMD SEV-SNP only.",
+		Description: "LFM3 2B on CPU via llama.cpp b11960 (LFM3-Audio-2B-Q4_K_M.gguf). Sandbox inputs: text, audio. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
 		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:6058d091f4ed9f3770da38b68ce5237a33e05bcf3037f5a2e5eef2b45d212a49"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
