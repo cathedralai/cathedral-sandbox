@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# liquid [message ...]: the short way to talk to the model in this room. It is
+# lfm3-agent under a friendlier name, so every turn joins the same kept
+# conversation.
+#
+#   liquid                          on a terminal: an interactive chat
+#   liquid                          anywhere else (one exec): a greeting and examples
+#   liquid what is in /work         one turn; the words are the message, no quotes needed
+#   liquid hey, what can you do     a leading "hey" is just part of the message
+#   liquid --new write a haiku      lfm3-agent's options work the same way
+#
+# Quote the message when it has characters the shell reads itself, such as an
+# apostrophe, "?" or "*": liquid "what's in /work?"
+set -euo pipefail
+
+if [ "${LFM3_KIND:-chat}" = decision ]; then
+  echo "liquid: ${MODEL:-this model} is a decision model; ask it typed questions with lfm3-decide" >&2
+  exit 2
+fi
+
+if [ "$#" -eq 0 ] && [ ! -t 0 ]; then
+  cat <<GREETING
+Hi, I am ${MODEL:-the model in this room}, running inside this sandbox. Ask me anything:
+  liquid what can you do
+  liquid what is in /work
+  liquid --image photo.png what is in this picture
+I remember the conversation; liquid --new starts over. On a terminal, liquid alone opens a chat.
+GREETING
+  exit 0
+fi
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+agent=$here/lfm3-agent
+[ -x "$agent" ] || agent=lfm3-agent
+LFM3_AGENT_NAME=liquid exec "$agent" "$@"

@@ -11,6 +11,8 @@
 #   decide-text   lfm3-decide, refund request (noul)               yes
 #   decide-image  lfm3-decide --image test-image.png, circle color blue
 #   decide-audio  lfm3-decide --audio test-speech.wav, train city  paris
+#   agent         lfm3-agent, "What is the hostname?"              the hostname,
+#                 which the model can only learn by calling run
 #
 # test-speech.wav says "The train to Paris leaves at nine in the morning."
 set -euo pipefail
@@ -62,6 +64,21 @@ for check in "${checks[@]}"; do
     decide-text) decision_is "$check" '.refund.noul > 0.5' "$(lfm3-decide "$refund")" ;;
     decide-image) decision_is "$check" '.color.choice == "blue"' "$(lfm3-decide --image "$dir/test-image.png" "$color")" ;;
     decide-audio) decision_is "$check" '.city.choice == "paris"' "$(lfm3-decide --audio "$dir/test-speech.wav" "$city")" ;;
+    agent)
+      # The answer must hold the real hostname and a run call must show on
+      # stderr: the model cannot guess it, so this proves the tool loop.
+      host=$(cat /proc/sys/kernel/hostname)
+      agent_dir=$(mktemp -d)
+      out=$(LFM3_AGENT_DIR=$agent_dir lfm3-agent 'What is the hostname of this machine?' 2>"$agent_dir/stderr") || true
+      cat "$agent_dir/stderr"
+      printf '%s\n' "$out"
+      if grep -q '^\$ ' "$agent_dir/stderr" && grep -qF "$host" <<<"$out"; then
+        echo "ok $check"
+      else
+        echo "FAIL $check: no run call, or the answer does not hold the hostname $host"
+        exit 1
+      fi
+      ;;
     *)
       echo "lfm3-selftest: unknown check $check" >&2
       exit 2
