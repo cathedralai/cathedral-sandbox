@@ -7,8 +7,8 @@
 // LFM3 names and images match cathedralai/cathedral sandbox_models/catalog.py. Suite digests
 // from cathedral-sandbox #361 (each proven sealed on prod at 2 vCPU / 4 GiB, 29 Oct 2026);
 // Base, VL, Omni, d1 and d1-Omni are the #392 builds (per-model sampling, loop guard, tool-call
-// markup parsed; ADO 523); Audio stays on its #387 build. Prefetched on c46-sealed-2, nc-sealed-2
-// and nc-sealed-3 before this pin (4 Nov 2026).
+// markup parsed; ADO 523); Audio is its #394 build (same agent, json check advisory, ADO 547).
+// Prefetched on c46-sealed-2, nc-sealed-2 and nc-sealed-3 before each pin (4 Nov 2026).
 // A suite model is sealed ready only once its image is prefetched on every shared sealed hotel
 // (all six: c46-sealed-2, nc-sealed-2, nc-sealed-3, 6 of 6 each, 29 Oct 2026 11:40Z).
 // LFM templates are sealed-only (AMD SEV-SNP). A pending sealed offer refuses
@@ -113,7 +113,7 @@ var catalogTemplates = []catalogTemplate{
 		Name: "lfm3-audio-2b", DisplayName: "LFM3 Audio 2B (CPU)",
 		Description: "LFM3 2B on CPU via llama.cpp b11960 (LFM3-Audio-2B-Q4_K_M.gguf). Sandbox inputs: text, audio. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
-		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:7c5ad91bccdd6d9cdaa25417573f171d44f3a4932b46ba7d1f885184a41ea27a"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:bd793dfb9aaa7aecca630c7d24ad76af7f176e3a1cc87a62e12c048dcf33efef"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "d1-omni-2b", DisplayName: "d1 Omni 2B (CPU)",
