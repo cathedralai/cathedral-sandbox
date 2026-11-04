@@ -78,7 +78,10 @@ ReadTimeout", while the image pulled); the third ran.
 
 The entrypoint is `lfm3-serve`. It starts `llama-server` on `127.0.0.1:8080`,
 OpenAI-compatible at `/v1`, then runs the sandbox command (the keepalive
-`sleep infinity`); with no command the server runs in the foreground. The
+`sleep infinity`); with no command the server runs in the foreground. For a
+chat model it also reads `lfm3-agent`'s system prompt and tools into the
+server's cache once the model is loaded (`lfm3-agent --warm`, log
+`/tmp/lfm3/warm.log`). The
 log is `/tmp/lfm3/server.log`; `/health` answers 200 once the model is
 loaded. The image sets the variables an agent reads to find its model, as the
 LFM3-1.7B images do:
@@ -161,14 +164,20 @@ kinds of room:
   dropped whole once the conversation passes 4,000 characters. The last
   picture or clip is sent again with later turns while its turn is kept;
   older ones stay as a note only.
-- **Why the memory is short.** Every turn re-reads the whole conversation.
-  llama-server keeps no prompt cache for LFM3's hybrid layers: `cache_n` is 0
-  even for a request sent twice (b11960, with or without
-  `--checkpoint-min-step 0`). A turn reads hundreds to thousands of tokens
-  and writes tens, so reading is most of the wait. On two Apple M4 CPU threads
-  it runs at 145 tok/s, generation at 55 tok/s: 4,000 characters (about
-  1,600 tokens with the system prompt and tools) keeps the worst case near
-  11 s there. A sealed 2 vCPU room is not measured and will be slower.
+- **The prompt cache.** A turn reads only what is new since the last request:
+  the system prompt, the tools and the kept turns come from llama-server's
+  cache. LFM3 attends over a 256-token sliding window, and with the default
+  window-sized cache llama-server b11960 judged every saved state unusable,
+  so each request re-read the whole prompt (`cache_n` 0 even for a request
+  sent twice). `lfm3-serve` runs the server with `--swa-full`, which keeps
+  those states usable, and runs `lfm3-agent --warm` once at boot so the first
+  message starts from the cached system prompt and tools. Measured in a
+  sealed 2 vCPU room (4 Nov 2026), reading runs at about 65 tok/s and
+  generation at about 22 tok/s: a repeated 385-token prompt went from 5 s to
+  0.1 s, a follow-up turn from about 7 s to 1 s, and the first turn after boot
+  reads 14 tokens instead of 287. The server takes about 340 MB more memory
+  (2.94 GB resident against 2.60 GB). Once old turns are dropped past 4,000
+  characters the prefix changes and that turn reads the conversation again.
 - **Sampling**, per model, from Liquid AI's `generation_config.json` for each
   model, with one measured exception. 512 tokens a reply.
   `LFM3_AGENT_SAMPLING` (a JSON object) replaces it.
