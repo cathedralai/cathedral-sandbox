@@ -6,8 +6,9 @@
 //
 // LFM3 names and images match cathedralai/cathedral sandbox_models/catalog.py. Suite digests
 // from cathedral-sandbox #361 (each proven sealed on prod at 2 vCPU / 4 GiB, 29 Oct 2026);
-// All six suite images are the #387 builds (lfm3-agent and liquid; Base and d1 refuse liquid),
-// prefetched on c46-sealed-2, nc-sealed-2 and nc-sealed-3 before this pin (3 Nov 2026).
+// Base, VL, Omni, d1 and d1-Omni are the #392 builds (per-model sampling, loop guard, tool-call
+// markup parsed; ADO 523); Audio stays on its #387 build. Prefetched on c46-sealed-2, nc-sealed-2
+// and nc-sealed-3 before this pin (4 Nov 2026).
 // A suite model is sealed ready only once its image is prefetched on every shared sealed hotel
 // (all six: c46-sealed-2, nc-sealed-2, nc-sealed-3, 6 of 6 each, 29 Oct 2026 11:40Z).
 // LFM templates are sealed-only (AMD SEV-SNP). A pending sealed offer refuses
@@ -94,19 +95,19 @@ var catalogTemplates = []catalogTemplate{
 		Name: "lfm3-vl-2b", DisplayName: "LFM3 VL 2B (CPU)",
 		Description: "LFM3 1.92B on CPU via llama.cpp b11960 (LFM3-VL-2B-Q4_K_M.gguf). Sandbox inputs: text, image. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
-		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-vl-2b", "sha256:894eaecff312e0aaa317ff955663490895b330618810e26f91430799ba664cfa"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-vl-2b", "sha256:ef5c553961e5a6d9eba616fe4f5b2d68d46ec996f651e2011e5a09ae67f9cdc1"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "lfm3-omni-2b", DisplayName: "LFM3 Omni 2B (CPU)",
 		Description: "LFM3 2.17B on CPU via llama.cpp b11960 (LFM3-Omni-2B-Q4_K_M.gguf). Sandbox inputs: text, image, audio. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
-		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:12f4959b25dfaf7350411c8c4d1a96a8c442d06e6784369abe16b7514eec81ca"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:ae491ca68c27b9379a56af39ceac1a09db07be8b164dbc9788f8b338311789ae"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "d1-2b", DisplayName: "d1 2B (CPU)",
 		Description: "d1 1.92B on CPU via llama.cpp b11960 (d1-2B-Q8_0.gguf). Sandbox outputs: decision (yes/no, choice, score). Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
-		Image: pinnedImage("ghcr.io/cathedralai/room-d1-2b", "sha256:2cec8e184f141063b134bfc2a94bddb928d678c5fd6934b92a63316696474427"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-d1-2b", "sha256:f95d88c7144642328fe85bd7f52e95e434979e64a220550fac3d0e965aca35c6"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "lfm3-audio-2b", DisplayName: "LFM3 Audio 2B (CPU)",
@@ -118,13 +119,13 @@ var catalogTemplates = []catalogTemplate{
 		Name: "d1-omni-2b", DisplayName: "d1 Omni 2B (CPU)",
 		Description: "d1 2.17B on CPU via llama.cpp b11960 (d1-Omni-2B-Q8_0.gguf). Sandbox outputs: decision (yes/no, choice, score). Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
-		Image: pinnedImage("ghcr.io/cathedralai/room-d1-omni-2b", "sha256:16838d8720c8c4cf881b2474662935e2541a2e4273fe493702b0a16ea0705656"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-d1-omni-2b", "sha256:3cb800de3d2f9bfcc69d24ab2fc659fc51eb7ed3aae2abe46d46a23f10b57abd"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "lfm3-1.7b-base", DisplayName: "LFM3 1.7B Base (CPU)",
 		Description: "LFM3 1.73B on CPU via llama.cpp b11960 (converted from LiquidAI/LFM3-1.7B-Base safetensors to Q4_K_M). Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
-		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-1.7b-base", "sha256:57ff645c1685f0c117f73c4c6bfcea4c10b519efef6af784d5de10b2f7ef64e4"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-1.7b-base", "sha256:810911016ac6ea1ddeba1bba4dc157e0c3d4252201e64d3279876e57dce344a8"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 }
 
