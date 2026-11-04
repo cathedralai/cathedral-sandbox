@@ -39,6 +39,8 @@
 #                             request, b11960), so a longer memory is a slower
 #                             reply.
 #   LFM3_MAX_TOKENS           tokens per reply (default 512)
+#   LFM3_AGENT_SAMPLING       sampling fields for llama-server, a JSON object
+#                             (default: Liquid's LFM3 text settings, see SAMPLING)
 #   LFM3_WAIT, LFM3_TIMEOUT   as in lfm3-ask
 set -euo pipefail
 
@@ -64,11 +66,22 @@ esac
 BASE_URL=${MODEL_BASE_URL:-http://127.0.0.1:8080/v1}
 MODEL_NAME=${MODEL:-lfm3}
 MAX_TOKENS=${LFM3_MAX_TOKENS:-512}
+# Sampling (ADO 523). Liquid's LFM3 text settings (LFM3-1.7B and LFM3-VL-2B model
+# cards and generation_config.json: temperature 0.1, top_k 50, repetition
+# penalty 1.1) plus llama.cpp's DRY sampler, which penalises a repeated phrase
+# more each time it grows. On Omni, 30 rhyme requests twice each: greedy hit the
+# 512-token cap 4 times in 30, the card settings alone once in 60 ("high, high,
+# high, ..."), card settings with DRY 0 in 60. Tool choice stayed 28 of 28.
+SAMPLING=${LFM3_AGENT_SAMPLING:-'{"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1, "dry_multiplier": 0.8, "dry_base": 1.75, "dry_allowed_length": 2}'}
 STEPS=${LFM3_AGENT_STEPS:-4}
 CMD_TIMEOUT=${LFM3_AGENT_CMD_TIMEOUT:-60}
 OUTPUT_CHARS=${LFM3_AGENT_OUTPUT_CHARS:-2000}
 CONTEXT_CHARS=${LFM3_AGENT_CONTEXT_CHARS:-4000}
 LOG=${LFM3_LOG_DIR:-/tmp/lfm3}/server.log
+if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$SAMPLING"; then
+  echo "lfm3-agent: LFM3_AGENT_SAMPLING must be a JSON object" >&2
+  exit 2
+fi
 DIR=${LFM3_AGENT_DIR:-/tmp/lfm3/agent}
 # lfm3-serve makes /tmp/lfm3 as the image user; an exec as another user keeps
 # its conversation beside it instead.
@@ -302,7 +315,7 @@ build_body() { # with-tools
     --slurpfile stored "$work/user_stored" --slurpfile sent "$work/user_sent" \
     --slurpfile turn "$work/turn" --slurpfile media "$media" --slurpfile parts "$work/parts" \
     --argjson room "$CONTEXT_CHARS" --arg model "$MODEL_NAME" --argjson n "$MAX_TOKENS" \
-    --argjson tools "$TOOLS" --arg with_tools "$1" '
+    --argjson tools "$TOOLS" --arg with_tools "$1" --argjson sampling "$SAMPLING" '
     def drop_turn: (.[1:] | map(.role == "user") | index(true)) as $i
       | if $i == null then [] else .[($i + 1):] end;
     def fit($room): if length == 0 or (tojson | length) <= $room then . else (drop_turn | fit($room)) end;
@@ -316,9 +329,9 @@ build_body() { # with-tools
     | {
         model: $model,
         messages: ([{role: "system", content: $sys}] + $kept + ($sent[0] | map(del(.media))) + $turn[0]),
-        max_tokens: $n,
-        temperature: 0
+        max_tokens: $n
       }
+    + $sampling
     + (if $with_tools == "1" then {tools: $tools} else {} end)' >"$work/body"
 }
 
@@ -338,11 +351,68 @@ ask_model() { # with-tools: the reply message goes to $work/msg
     fi
     exit 1
   fi
-  jq '.choices[0].message' "$work/out" >"$work/msg"
+  # A tool call the server did not parse stays in the text as markup. Parse it
+  # the way Liquid's model card does (<tool_call><function=NAME><parameter=KEY>
+  # VALUE</parameter></function></tool_call>, or a JSON body), and never show
+  # raw markup: what cannot be parsed becomes one clean line.
+  jq '
+    def strip: sub("^\\s+"; "") | sub("\\s+$"; "");
+    def value: . as $s | try ($s | fromjson) catch $s;
+    def xml_calls: [scan("<tool_call>\\s*<function=([^>\\n]+)>([\\s\\S]*?)</function>\\s*</tool_call>")]
+      | map(. as [$name, $body] | {name: ($name | strip),
+          arguments: ([$body | scan("<parameter=([^>\\n]+)>\\n?([\\s\\S]*?)\\n?</parameter>")]
+            | map(. as [$k, $v] | {key: ($k | strip), value: ($v | value)}) | from_entries)});
+    def json_calls: [scan("<tool_call>\\s*(\\{[\\s\\S]*?\\})\\s*</tool_call>")]
+      | map(.[0] | try fromjson catch null | select(type == "object" and (.name | type) == "string")
+        | {name, arguments: (.arguments // .parameters // {})});
+    .choices[0].message
+    | if ((.tool_calls // []) | length) == 0 and ((.content // "") | test("</?tool_call>|<function=")) then
+        (.content | xml_calls + json_calls) as $calls
+        | (.content | gsub("<tool_call>[\\s\\S]*?</tool_call>"; "") | gsub("<tool_call>[\\s\\S]*$"; "")
+           | gsub("</?(tool_call|function|parameter)[^>]*>"; "") | strip) as $rest
+        | if ($calls | length) > 0 then
+            .content = $rest
+            | .tool_calls = [$calls | to_entries[]
+                | {id: ("call_text_" + (.key | tostring)), type: "function",
+                   function: {name: .value.name, arguments: (.value.arguments | tojson)}}]
+          elif $rest == "" then .content = "(The model tried to call a tool, but the call could not be read.)"
+          else .content = $rest end
+      else . end' "$work/out" >"$work/msg"
+}
+
+# The answer, cut where it starts to repeat. A loop is one unit repeated many
+# times that fills much of the answer: a clause (text between newlines and
+# . , ; ! ?) seen 6 times, or a 4-word run seen 10 times, covering at least 40%
+# of it. A short refrain does not count. Keep the text up to the unit's second
+# copy and say so in one line. jq 1.6 indexes strings by byte, so the cut is
+# found with split, which counts characters.
+loop_guard() { # answer-file: rewrites it; prints "looped" when it cut
+  jq -rn --rawfile t "$1" '
+    def strip: sub("^\\s+"; "") | sub("\\s+$"; "");
+    ($t | ascii_downcase) as $low
+    | ([$low | splits("[\\n.,;!?]+") | gsub("[*_#>`\"]"; "") | strip | select(length >= 3)]
+       | group_by(.) | map({u: .[0], n: length}) | max_by(.n * (.u | length)) // {u: "", n: 0}) as $c
+    | ([$low | scan("[a-z0-9\u0027]+")]) as $w
+    | ([range(0; ($w | length) - 3) as $i | $w[$i:$i + 4] | join(" ")]
+       | group_by(.) | map({u: .[0], n: length}) | max_by(.n) // {u: "", n: 0}) as $g
+    | (($c.n >= 6 and $c.n * ($c.u | length) * 10 >= ($t | length) * 4)
+       or ($g.n >= 10 and $g.n * 40 >= ($w | length) * 10)) as $loop
+    | if $loop then
+        ($low | split($c.u)) as $parts
+        | (if $c.n >= 3 and ($parts | length) >= 3
+           then $t[0:(($parts[0] | length) + ($c.u | length) + ($parts[1] | length))]
+           else $t[0:300] end | strip | sub("[\\s,;:]+$"; "")) as $kept
+        | "looped", $kept
+      else "ok", $t end' >"$1.guard"
+  if [ "$(head -n 1 "$1.guard")" = looped ]; then
+    sed '1d' "$1.guard" >"$1"
+    echo looped
+  fi
+  rm -f "$1.guard"
 }
 
 one_turn() { # message
-  local text=$1 round=0 calls i id name args result
+  local text=$1 round=0 calls i id name args result looped
   if [ -z "$text" ] && [ "$(jq length "$work/parts")" -eq 0 ]; then
     usage
   fi
@@ -386,6 +456,7 @@ one_turn() { # message
 
   jq -r '.content // ""' "$work/msg" >"$work/answer"
   [ -s "$work/answer" ] || echo "(the model gave no answer)" >"$work/answer"
+  looped=$(loop_guard "$work/answer")
   # Keep the turn: history (trimmed the same way), this message, the tool
   # calls and the answer. Written whole, so a failed request leaves no half turn.
   jq --slurpfile stored "$work/user_stored" --slurpfile turn "$work/turn" \
@@ -401,6 +472,9 @@ one_turn() { # message
     cp "$work/parts" "$MEDIA_FILE"
   fi
   cat "$work/answer"
+  if [ -n "$looped" ]; then
+    echo "(Stopped: the model kept repeating itself. Ask again, or start over with --new.)"
+  fi
 }
 
 if [ -z "$prompt" ] && [ "$(jq length "$work/parts")" -eq 0 ]; then
