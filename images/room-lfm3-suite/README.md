@@ -133,6 +133,7 @@ liquid                          # on a terminal: the chat; in the console termin
 liquid what is in /work         # one turn of the same conversation
 liquid hey, what can you do     # a leading "hey" is just part of the message
 liquid --new                    # starts over
+liquid --json list 5 fruits     # JSON only, held to JSON syntax by the server; no tools
 ```
 
 Quote the message when it has characters the shell reads itself, such as an
@@ -154,6 +155,13 @@ kinds of room:
   file). Each call is printed on stderr as it runs (`$ ls -la`); the output
   the model reads is cut at 2,000 characters. At most 4 tool rounds a
   message, then the model must answer. `--no-tools` answers without them.
+- **JSON.** `--json` sends a JSON schema (an object or an array) as
+  `response_format`, which llama-server turns into a grammar, plus one system
+  line asking for valid JSON with no comments, and no tools. The grammar fixes
+  the syntax, not the count: Audio, which comments repeated list items
+  (ADO 547), wrote a number in place of a comment and closed the list early
+  until the line was added. A reply cut at the token cap does not parse. The
+  loop guard leaves a `--json` answer that parses whole.
 - **System prompt.** A short default says what the sandbox is, when to use a
   tool and when not to, and never to claim a command it did not run.
   `--system` replaces it.
@@ -174,8 +182,11 @@ kinds of room:
   `LFM3_AGENT_SAMPLING` (a JSON object) replaces it.
   - VL (and any other): temperature 0.1, top_k 50, repetition penalty 1.1 (the
     LFM3-VL-2B and LFM3-1.7B cards).
-  - Audio: greedy (its card config). Other settings made it call a tool
-    instead of answering what a clip says.
+  - Audio: greedy (its card config) plus Omni's frequency penalty of 0.3. The
+    card settings made it call a tool instead of answering what a clip says;
+    the penalty answered the clip question 3 of 3 (greedy alone 1 of 3) and
+    hit the token cap less often on rhyme requests. Its JSON lists can carry
+    `//` comments (ADO 547), so ask Audio for JSON with `--json`.
   - Omni: greedy (its card config) plus a frequency penalty of 0.3. Greedy
     alone looped on rhyme requests until the token cap (ADO 523): 4 of 30
     rhyme prompts locally, 1 of 30 with the penalty, and the loop guard cuts
@@ -205,8 +216,9 @@ under greedy decoding, with `--no-tools`, and fails if one loops twice.
 `lfm3-selftest agent-audio` sends the test clip with no message (tools on; no
 raw tool-call markup allowed), then with "What is said in this clip?" (it must
 answer Paris). `lfm3-selftest json` asks for a JSON array of 15 objects and
-fails unless it parses. The publish matrix says which image gates on which
-check.
+fails unless it parses; `json-flag` sends the same request through
+`liquid --json` and fails unless the whole answer parses. The publish matrix
+says which image gates on which check.
 
 ### Which model to talk to
 
