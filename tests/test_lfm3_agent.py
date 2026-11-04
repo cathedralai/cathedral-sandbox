@@ -148,7 +148,7 @@ def test_runs_the_tool_the_model_asks_for_and_returns_the_answer(fake: FakeModel
 
     first, second = fake.requests
     assert [t["function"]["name"] for t in first["tools"]] == ["run", "read_file"]
-    assert first["temperature"] == 0.1 and first["max_tokens"] == 512
+    assert first["temperature"] == 0 and first["frequency_penalty"] == 0.3 and first["max_tokens"] == 512
     system = messages(first)[0]
     assert system["role"] == "system" and "lfm3-omni-2b" in system["content"] and str(room.work) in system["content"]
     tool = messages(second)[-1]
@@ -160,7 +160,7 @@ def test_runs_the_tool_the_model_asks_for_and_returns_the_answer(fake: FakeModel
 @pytest.mark.parametrize(
     ("model", "sampling"),
     [
-        ("lfm3-omni-2b", {"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1, "frequency_penalty": 0.3}),
+        ("lfm3-omni-2b", {"temperature": 0, "frequency_penalty": 0.3}),
         ("lfm3-audio-2b", {"temperature": 0}),
         ("lfm3-vl-2b", {"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1}),
     ],

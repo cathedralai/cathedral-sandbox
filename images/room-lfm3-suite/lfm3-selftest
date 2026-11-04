@@ -17,6 +17,9 @@
 #                 looped under greedy decoding (ADO 523)           retry each)
 #   agent-audio   lfm3-agent --audio test-speech.wav: no message   no raw tool-call
 #                 (tools on), then "what is said" (--no-tools)     markup; Paris
+#   json          lfm3-agent --no-tools, a JSON array of 15        it parses: 15
+#                 objects (a repeat penalty can break long         objects with id,
+#                 structured output)                               name and color
 #
 # test-speech.wav says "The train to Paris leaves at nine in the morning."
 set -euo pipefail
@@ -93,6 +96,23 @@ for check in "${checks[@]}"; do
         fi
       done
       echo "ok $check"
+      ;;
+    json)
+      # A count-based repeat penalty is hardest on long structured output
+      # (repeated keys, braces and commas), so the array must still parse. It
+      # may sit in a code fence: take the text from the first [ to the last ].
+      agent_dir=$(mktemp -d) && mkdir "$agent_dir/work"
+      out=$(LFM3_AGENT_DIR=$agent_dir LFM3_AGENT_CWD=$agent_dir/work LFM3_MAX_TOKENS=900 lfm3-agent --no-tools \
+        'Return a JSON array of 15 objects. Each object has "id" (1 to 15), "name" (a fruit) and "color". Reply with the JSON only.' 2>&1) || true
+      printf '%s\n' "$out"
+      if jq -e -Rs 'capture("(?<a>\\[[\\s\\S]*\\])").a | fromjson
+          | type == "array" and length == 15
+            and all(.[]; type == "object" and has("id") and has("name") and has("color"))' >/dev/null 2>&1 <<<"$out"; then
+        echo "ok $check"
+      else
+        echo "FAIL $check: the answer is not a JSON array of 15 objects with id, name and color"
+        exit 1
+      fi
       ;;
     agent-audio)
       # A clip with no message, tools on: any answer, never raw tool-call

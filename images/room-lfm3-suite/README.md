@@ -174,10 +174,13 @@ kinds of room:
     LFM3-VL-2B and LFM3-1.7B cards).
   - Audio: greedy (its card config). Other settings made it call a tool
     instead of answering what a clip says.
-  - Omni: the VL settings plus a frequency penalty of 0.3. Its card says
-    greedy, but greedy looped on rhyme requests until the token cap (ADO 523):
-    "what rhymes with time" ran to the cap 9 times in 10 with the VL settings,
-    0 in 10 with the frequency penalty.
+  - Omni: greedy (its card config) plus a frequency penalty of 0.3. Greedy
+    alone looped on rhyme requests until the token cap (ADO 523): 4 of 30
+    rhyme prompts locally, 1 of 30 with the penalty, and the loop guard cuts
+    what is left. Sampling at temperature 0.1 also stopped loops but made
+    Omni's tool choice vary (it ran `hostname -I` for the hostname in 4 of 8
+    runs and made the answer up). A JSON array of 30 objects and a 31-line
+    script came out identical with and without the penalty.
   - llama.cpp's DRY sampler also stopped loops, but with the repetition penalty
     it broke verbatim copies (a hostname or ID came back with its last
     character changed), so it is not used.
@@ -199,7 +202,9 @@ calling `run`. `lfm3-selftest rhyme` sends three rhyme requests that looped
 under greedy decoding, with `--no-tools`, and fails if one loops twice.
 `lfm3-selftest agent-audio` sends the test clip with no message (tools on; no
 raw tool-call markup allowed), then with "What is said in this clip?" (it must
-answer Paris). The publish matrix says which image gates on which check.
+answer Paris). `lfm3-selftest json` asks for a JSON array of 15 objects and
+fails unless it parses. The publish matrix says which image gates on which
+check.
 
 ### Which model to talk to
 
