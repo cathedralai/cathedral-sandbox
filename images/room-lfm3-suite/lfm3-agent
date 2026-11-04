@@ -40,7 +40,7 @@
 #                             reply.
 #   LFM3_MAX_TOKENS           tokens per reply (default 512)
 #   LFM3_AGENT_SAMPLING       sampling fields for llama-server, a JSON object
-#                             (default: Liquid's LFM3 text settings, see SAMPLING)
+#                             (default: per model, see SAMPLING)
 #   LFM3_WAIT, LFM3_TIMEOUT   as in lfm3-ask
 set -euo pipefail
 
@@ -66,13 +66,25 @@ esac
 BASE_URL=${MODEL_BASE_URL:-http://127.0.0.1:8080/v1}
 MODEL_NAME=${MODEL:-lfm3}
 MAX_TOKENS=${LFM3_MAX_TOKENS:-512}
-# Sampling (ADO 523). Liquid's LFM3 text settings (LFM3-1.7B and LFM3-VL-2B model
-# cards and generation_config.json: temperature 0.1, top_k 50, repetition
-# penalty 1.1) plus llama.cpp's DRY sampler, which penalises a repeated phrase
-# more each time it grows. On Omni, 30 rhyme requests twice each: greedy hit the
-# 512-token cap 4 times in 30, the card settings alone once in 60 ("high, high,
-# high, ..."), card settings with DRY 0 in 60. Tool choice stayed 28 of 28.
-SAMPLING=${LFM3_AGENT_SAMPLING:-'{"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1, "dry_multiplier": 0.8, "dry_base": 1.75, "dry_allowed_length": 2}'}
+# Sampling (ADO 523), per model, from Liquid AI's generation_config.json for
+# each model we ship, with one measured exception:
+#   VL and any other: temperature 0.1, top_k 50, repetition penalty 1.1 (the
+#     LFM3-VL-2B and LFM3-1.7B cards).
+#   Audio: greedy (its card config). It did not loop under greedy, and with the
+#     card settings it stopped answering what a clip says (0 of 4, greedy 4 of 4).
+#   Omni: its card says greedy, but greedy looped on rhyme requests until the
+#     512-token cap (prod, 4 Nov). The VL/1.7B settings alone still looped on
+#     "what rhymes with time" 9 times in 10; adding a frequency penalty of 0.3
+#     (it grows with each repeat of a token in the last 64) made it 0 in 10.
+#     llama.cpp's DRY sampler also stopped the loops, but with the repetition
+#     penalty it broke verbatim copies (the hostname 4c3157c1875d came back with
+#     an Arabic letter for its last "d", 0 of 6), so it is not used.
+case "${MODEL:-}" in
+  *omni*) default_sampling='{"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1, "frequency_penalty": 0.3}' ;;
+  *audio*) default_sampling='{"temperature": 0}' ;;
+  *) default_sampling='{"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1}' ;;
+esac
+SAMPLING=${LFM3_AGENT_SAMPLING:-$default_sampling}
 STEPS=${LFM3_AGENT_STEPS:-4}
 CMD_TIMEOUT=${LFM3_AGENT_CMD_TIMEOUT:-60}
 OUTPUT_CHARS=${LFM3_AGENT_OUTPUT_CHARS:-2000}
