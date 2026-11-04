@@ -20,6 +20,8 @@
 #   json          lfm3-agent --no-tools, a JSON array of 15        it parses: 15
 #                 objects (a repeat penalty can break long         objects with id,
 #                 structured output)                               name and color
+#   json-flag     liquid --json, the same request (Audio: its      the whole answer
+#                 lists can carry // comments, ADO 547)            parses, as in json
 #
 # test-speech.wav says "The train to Paris leaves at nine in the morning."
 set -euo pipefail
@@ -108,6 +110,22 @@ for check in "${checks[@]}"; do
       if jq -e -Rs 'capture("(?<a>\\[[\\s\\S]*\\])").a | fromjson
           | type == "array" and length == 15
             and all(.[]; type == "object" and has("id") and has("name") and has("color"))' >/dev/null 2>&1 <<<"$out"; then
+        echo "ok $check"
+      else
+        echo "FAIL $check: the answer is not a JSON array of 15 objects with id, name and color"
+        exit 1
+      fi
+      ;;
+    json-flag)
+      # The same request through liquid --json, which holds the reply to JSON
+      # syntax. The whole answer must parse, with no fence or text around it.
+      agent_dir=$(mktemp -d) && mkdir "$agent_dir/work"
+      out=$(LFM3_AGENT_DIR=$agent_dir LFM3_AGENT_CWD=$agent_dir/work LFM3_MAX_TOKENS=900 liquid --json \
+        'Return a JSON array of 15 objects. Each object has "id" (1 to 15), "name" (a fruit) and "color". Reply with the JSON only.' 2>"$agent_dir/stderr") || true
+      cat "$agent_dir/stderr"
+      printf '%s\n' "$out"
+      if jq -e 'type == "array" and length == 15
+          and all(.[]; type == "object" and has("id") and has("name") and has("color"))' >/dev/null 2>&1 <<<"$out"; then
         echo "ok $check"
       else
         echo "FAIL $check: the answer is not a JSON array of 15 objects with id, name and color"
