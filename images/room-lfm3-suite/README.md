@@ -205,8 +205,11 @@ under greedy decoding, with `--no-tools`, and fails if one loops twice.
 `lfm3-selftest agent-audio` sends the test clip with no message (tools on; no
 raw tool-call markup allowed), then with "What is said in this clip?" (it must
 answer Paris). `lfm3-selftest json` asks for a JSON array of 15 objects and
-fails unless it parses. The publish matrix says which image gates on which
-check.
+fails unless it parses. A check written `name?` is advisory: it runs and its
+result is printed (a failure prints `WARN name` and a workflow warning) but it
+does not fail the selftest. Audio runs `json?`: its build put a `//` comment
+inside the array, under the same greedy decoding it used before ADO 523. The
+publish matrix says which image gates on which check.
 
 ### Which model to talk to
 
