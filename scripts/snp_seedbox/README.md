@@ -10,7 +10,6 @@ Host-only. Does **not** invent QEMU argv, image digests, or policy pins.
 | `../../docs/SNP_SEEDBOX_JOIN_HOST.md` | Full recipe |
 | `../../docs/SNP_SEEDBOX_CONTABO_OFFLINE_PREP.md` | Fill-in Contabo prep sheet |
 | `../../docs/SNP_SEEDBOX_CONTABO_PREFLIGHT.md` | Short checklist before live proof |
-| `../../docs/SNP_SEEDBOX_JOIN_PROOF_EVIDENCE.md` | Evidence template for Contabo §10 proof |
 
 ```bash
 python3 -m pytest tests/test_snp_seedbox_supervise.py -q
