@@ -17,9 +17,6 @@
 #                 looped under greedy decoding (ADO 523)           retry each)
 #   agent-audio   lfm3-agent --audio test-speech.wav: no message   no raw tool-call
 #                 (tools on), then "what is said" (--no-tools)     markup; Paris
-# A check written "name?" (for example json?) is advisory: its result is
-# printed, and a failure prints "WARN name" instead of failing the selftest.
-#
 #   json          lfm3-agent --no-tools, a JSON array of 15        it parses: 15
 #                 objects (a repeat penalty can break long         objects with id,
 #                 structured output)                               name and color
@@ -66,17 +63,6 @@ city='{"state": null, "questions": {"city": {"type": "choice", "instructions": "
   "criteria": {"paris": "Paris", "london": "London", "tokyo": "Tokyo"}}}}'
 
 for check in "${checks[@]}"; do
-  # A check written "name?" is advisory: it runs and prints its result, and a
-  # failure prints "WARN name" instead of failing the selftest.
-  if [ "${check%\?}" != "$check" ]; then
-    if out=$("$0" "${check%\?}" 2>&1); then
-      printf '%s\n' "$out"
-    else
-      printf '%s\n' "$out"
-      echo "WARN ${check%\?}: failed (advisory, does not fail the selftest)"
-    fi
-    continue
-  fi
   case "$check" in
     text) answer_is "$check" '\b(4|four)\b' "$(lfm3-ask 'What is 2+2? Answer in one word.')" ;;
     raw) answer_is "$check" 'paris' "$(LFM3_MAX_TOKENS=16 lfm3-ask --raw 'The capital of France is')" ;;

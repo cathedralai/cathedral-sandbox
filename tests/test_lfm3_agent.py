@@ -487,22 +487,3 @@ def test_liquid_alone_on_a_terminal_opens_the_chat(fake: FakeModel, room: Any) -
     assert "liquid: chatting with lfm3-omni-2b" in text
     assert "Hi there." in text
     assert messages(fake.requests[0])[-1] == {"role": "user", "content": "hello"}
-
-
-SELFTEST = SUITE / "lfm3-selftest"
-
-
-@pytest.mark.parametrize(("check", "code", "warned"), [("json?", 0, True), ("json", 1, False)])
-def test_an_advisory_check_warns_instead_of_failing(
-    fake: FakeModel, room: Any, check: str, code: int, warned: bool
-) -> None:
-    # Audio's real answer: valid-looking JSON with a // comment inside the array.
-    bad = '[\n  {"id": 1, "name": "Apple", "color": "red"},  // a comment\n  {"id": 2, "name": "Kiwi", "color": "green"}\n]'
-    fake.replies = [answer(bad)]
-    out = subprocess.run(
-        ["bash", str(SELFTEST), check], capture_output=True, text=True, timeout=60,
-        env={**room.env, "PATH": f"{SUITE}:{os.environ['PATH']}"},
-    )
-    assert out.returncode == code, out.stdout + out.stderr
-    assert ("WARN json" in out.stdout) is warned
-    assert "FAIL json" in out.stdout
