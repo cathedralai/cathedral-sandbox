@@ -167,12 +167,20 @@ kinds of room:
   it runs at 145 tok/s, generation at 55 tok/s: 4,000 characters (about
   1,600 tokens with the system prompt and tools) keeps the worst case near
   11 s there. A sealed 2 vCPU room is not measured and will be slower.
-- **Sampling.** Liquid AI's LFM3 text settings (the LFM3-1.7B and LFM3-VL-2B
-  model cards: temperature 0.1, top_k 50, repetition penalty 1.1) plus
-  llama.cpp's DRY sampler (multiplier 0.8, base 1.75, allowed length 2), 512
-  tokens a reply. `LFM3_AGENT_SAMPLING` (a JSON object) replaces it. Greedy
-  decoding, the earlier default, looped on rhyme requests until the token cap
-  (ADO 523); the numbers are in the table below.
+- **Sampling**, per model, from Liquid AI's `generation_config.json` for each
+  model, with one measured exception. 512 tokens a reply.
+  `LFM3_AGENT_SAMPLING` (a JSON object) replaces it.
+  - VL (and any other): temperature 0.1, top_k 50, repetition penalty 1.1 (the
+    LFM3-VL-2B and LFM3-1.7B cards).
+  - Audio: greedy (its card config). Other settings made it call a tool
+    instead of answering what a clip says.
+  - Omni: the VL settings plus a frequency penalty of 0.3. Its card says
+    greedy, but greedy looped on rhyme requests until the token cap (ADO 523):
+    "what rhymes with time" ran to the cap 9 times in 10 with the VL settings,
+    0 in 10 with the frequency penalty.
+  - llama.cpp's DRY sampler also stopped loops, but with the repetition penalty
+    it broke verbatim copies (a hostname or ID came back with its last
+    character changed), so it is not used.
 - **Loops.** An answer in which one clause repeats 6 times, or one 4-word run
   10 times, and the repeats fill at least 40% of it, is cut at the second
   copy, followed by one line: "(Stopped: the model kept repeating itself. ...)".
@@ -188,10 +196,10 @@ kinds of room:
 `LFM3_AGENT_CONTEXT_CHARS` and `LFM3_MAX_TOKENS` change those defaults.
 `lfm3-selftest agent` asks for the hostname, which the model can only learn by
 calling `run`. `lfm3-selftest rhyme` sends three rhyme requests that looped
-under greedy decoding and fails if any loops. `lfm3-selftest agent-audio`
-sends the test clip with no message and fails without "Paris" in the answer or
-with raw tool-call markup in it. The publish matrix says which image gates on
-which check.
+under greedy decoding, with `--no-tools`, and fails if one loops twice.
+`lfm3-selftest agent-audio` sends the test clip with no message (tools on; no
+raw tool-call markup allowed), then with "What is said in this clip?" (it must
+answer Paris). The publish matrix says which image gates on which check.
 
 ### Which model to talk to
 

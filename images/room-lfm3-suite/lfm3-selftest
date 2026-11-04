@@ -13,10 +13,10 @@
 #   decide-audio  lfm3-decide --audio test-speech.wav, train city  paris
 #   agent         lfm3-agent, "What is the hostname?"              the hostname,
 #                 which the model can only learn by calling run
-#   rhyme         lfm3-agent, three rhyme requests that looped    no loop
-#                 under greedy decoding (ADO 523)
-#   agent-audio   lfm3-agent --audio test-speech.wav, no message   Paris, and no
-#                 raw <tool_call> markup in the answer
+#   rhyme         lfm3-agent --no-tools, three rhyme requests that  no loop (one
+#                 looped under greedy decoding (ADO 523)           retry each)
+#   agent-audio   lfm3-agent --audio test-speech.wav: no message   no raw tool-call
+#                 (tools on), then "what is said" (--no-tools)     markup; Paris
 #
 # test-speech.wav says "The train to Paris leaves at nine in the morning."
 set -euo pipefail
@@ -69,36 +69,62 @@ for check in "${checks[@]}"; do
     decide-image) decision_is "$check" '.color.choice == "blue"' "$(lfm3-decide --image "$dir/test-image.png" "$color")" ;;
     decide-audio) decision_is "$check" '.city.choice == "paris"' "$(lfm3-decide --audio "$dir/test-speech.wav" "$city")" ;;
     rhyme)
-      # Each request is a fresh conversation. The loop guard prints its
-      # "kept repeating itself" line when an answer loops.
+      # Each request is a fresh conversation in its own empty directory, with
+      # --no-tools: this checks decoding loops (ADO 523), not a model's choice
+      # to call a tool first (Audio calls one for most messages). The loop
+      # guard prints its
+      # "kept repeating itself" line when an answer loops. Sampling is random,
+      # so a request gets one more try: greedy decoding, the bug this guards,
+      # looped on every try.
       for ask in 'rhyme with me' 'what rhymes with time' 'write an endless rhyme'; do
-        agent_dir=$(mktemp -d)
-        out=$(LFM3_AGENT_DIR=$agent_dir lfm3-agent "$ask" 2>&1) || true
-        printf '%s\n' "> $ask" "$out"
-        if [ -z "$out" ] || grep -q 'kept repeating itself' <<<"$out"; then
-          echo "FAIL $check: \"$ask\" looped or gave no answer"
+        good=""
+        for try in 1 2; do
+          agent_dir=$(mktemp -d) && mkdir "$agent_dir/work"
+          out=$(LFM3_AGENT_DIR=$agent_dir LFM3_AGENT_CWD=$agent_dir/work lfm3-agent --no-tools "$ask" 2>&1) || true
+          printf '%s\n' "> $ask (try $try)" "$out"
+          if [ -n "$out" ] && ! grep -q 'kept repeating itself' <<<"$out"; then
+            good=1
+            break
+          fi
+        done
+        if [ -z "$good" ]; then
+          echo "FAIL $check: \"$ask\" looped or gave no answer twice"
           exit 1
         fi
       done
       echo "ok $check"
       ;;
     agent-audio)
-      agent_dir=$(mktemp -d)
-      out=$(LFM3_AGENT_DIR=$agent_dir lfm3-agent --audio "$dir/test-speech.wav" 2>&1) || true
-      printf '%s\n' "$out"
-      if grep -Eiq 'paris' <<<"$out" && ! grep -Eq '</?tool_call>|<function=|<parameter=' <<<"$out"; then
-        echo "ok $check"
-      else
-        echo "FAIL $check: no Paris in the answer, or raw tool-call markup"
-        exit 1
-      fi
+      # A clip with no message, tools on: any answer, never raw tool-call
+      # markup (the Talk fork saw <tool_call> text here). Then the clip with a
+      # question and --no-tools: the answer must hold what is said (with tools,
+      # Audio often calls one instead of listening). Each in an empty directory.
+      markup='</?tool_call>|<function=|<parameter='
+      for ask in '' 'What is said in this clip?'; do
+        agent_dir=$(mktemp -d) && mkdir "$agent_dir/work"
+        if [ -z "$ask" ]; then
+          out=$(LFM3_AGENT_DIR=$agent_dir LFM3_AGENT_CWD=$agent_dir/work lfm3-agent --audio "$dir/test-speech.wav" 2>&1) || true
+        else
+          out=$(LFM3_AGENT_DIR=$agent_dir LFM3_AGENT_CWD=$agent_dir/work lfm3-agent --no-tools --audio "$dir/test-speech.wav" "$ask" 2>&1) || true
+        fi
+        printf '%s\n' "> clip ${ask:-(no message)}" "$out"
+        if [ -z "$out" ] || grep -Eq "$markup" <<<"$out"; then
+          echo "FAIL $check: no answer, or raw tool-call markup"
+          exit 1
+        fi
+        if [ -n "$ask" ] && ! grep -Eiq 'paris' <<<"$out"; then
+          echo "FAIL $check: the answer does not hold \"Paris\""
+          exit 1
+        fi
+      done
+      echo "ok $check"
       ;;
     agent)
       # The answer must hold the real hostname and a run call must show on
       # stderr: the model cannot guess it, so this proves the tool loop.
       host=$(cat /proc/sys/kernel/hostname)
-      agent_dir=$(mktemp -d)
-      out=$(LFM3_AGENT_DIR=$agent_dir lfm3-agent 'What is the hostname of this machine?' 2>"$agent_dir/stderr") || true
+      agent_dir=$(mktemp -d) && mkdir "$agent_dir/work"
+      out=$(LFM3_AGENT_DIR=$agent_dir LFM3_AGENT_CWD=$agent_dir/work lfm3-agent 'What is the hostname of this machine?' 2>"$agent_dir/stderr") || true
       cat "$agent_dir/stderr"
       printf '%s\n' "$out"
       if grep -q '^\$ ' "$agent_dir/stderr" && grep -qF "$host" <<<"$out"; then

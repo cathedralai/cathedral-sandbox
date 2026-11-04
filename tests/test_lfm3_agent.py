@@ -157,12 +157,26 @@ def test_runs_the_tool_the_model_asks_for_and_returns_the_answer(fake: FakeModel
     assert messages(second)[-2]["tool_calls"][0]["function"]["name"] == "run"
 
 
-def test_requests_use_liquid_sampling_not_greedy(fake: FakeModel, room: Any) -> None:
+@pytest.mark.parametrize(
+    ("model", "sampling"),
+    [
+        ("lfm3-omni-2b", {"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1, "frequency_penalty": 0.3}),
+        ("lfm3-audio-2b", {"temperature": 0}),
+        ("lfm3-vl-2b", {"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1}),
+    ],
+)
+def test_sampling_follows_the_model(fake: FakeModel, room: Any, model: str, sampling: dict[str, Any]) -> None:
+    fake.replies = [answer("Hi.")]
+    assert room("Hello.", MODEL=model).returncode == 0
+    body = fake.requests[0]
+    assert {k: body[k] for k in body if k in ("temperature", "top_k", "repeat_penalty", "frequency_penalty", "min_p")} == sampling
+    # DRY with the repetition penalty broke verbatim copies of IDs (ADO 523).
+    assert not any(key.startswith("dry_") for key in body)
+
+
+def test_sampling_can_be_replaced(fake: FakeModel, room: Any) -> None:
     fake.replies = [answer("Hi."), answer("Hi again.")]
     assert room("Hello.").returncode == 0
-    body = fake.requests[0]
-    assert (body["temperature"], body["top_k"], body["repeat_penalty"]) == (0.1, 50, 1.1)
-    assert (body["dry_multiplier"], body["dry_base"], body["dry_allowed_length"]) == (0.8, 1.75, 2)
     assert room("Hello.", LFM3_AGENT_SAMPLING='{"temperature": 0.7}').returncode == 0
     assert fake.requests[1]["temperature"] == 0.7 and "top_k" not in fake.requests[1]
     out = room("Hello.", LFM3_AGENT_SAMPLING="[1]")
