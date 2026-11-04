@@ -148,13 +148,83 @@ def test_runs_the_tool_the_model_asks_for_and_returns_the_answer(fake: FakeModel
 
     first, second = fake.requests
     assert [t["function"]["name"] for t in first["tools"]] == ["run", "read_file"]
-    assert first["temperature"] == 0 and first["max_tokens"] == 512
+    assert first["temperature"] == 0.1 and first["max_tokens"] == 512
     system = messages(first)[0]
     assert system["role"] == "system" and "lfm3-omni-2b" in system["content"] and str(room.work) in system["content"]
     tool = messages(second)[-1]
     assert tool["role"] == "tool" and tool["tool_call_id"] == "call_1"
     assert tool["content"].startswith("exit code: 0\n") and "cathedral-42" in tool["content"]
     assert messages(second)[-2]["tool_calls"][0]["function"]["name"] == "run"
+
+
+def test_requests_use_liquid_sampling_not_greedy(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("Hi."), answer("Hi again.")]
+    assert room("Hello.").returncode == 0
+    body = fake.requests[0]
+    assert (body["temperature"], body["top_k"], body["repeat_penalty"]) == (0.1, 50, 1.1)
+    assert (body["dry_multiplier"], body["dry_base"], body["dry_allowed_length"]) == (0.8, 1.75, 2)
+    assert room("Hello.", LFM3_AGENT_SAMPLING='{"temperature": 0.7}').returncode == 0
+    assert fake.requests[1]["temperature"] == 0.7 and "top_k" not in fake.requests[1]
+    out = room("Hello.", LFM3_AGENT_SAMPLING="[1]")
+    assert out.returncode == 2 and "JSON object" in out.stderr
+
+
+LOOP_NOTE = "(Stopped: the model kept repeating itself. Ask again, or start over with --new.)"
+
+
+def test_a_looping_answer_is_cut_and_said_once(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("Glow, shine, sing, bloom, " + "bloom, " * 200)]
+    out = room("rhyme with me")
+    assert out.returncode == 0
+    lines = out.stdout.strip().splitlines()
+    assert lines == ["Glow, shine, sing, bloom", LOOP_NOTE]
+    assert history(room)[-1]["content"] == "Glow, shine, sing, bloom"
+
+
+def test_a_looping_line_keeps_its_first_copy(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("Here is a chorus:\n\n" + "We'll sing it loud and clear,\n" * 30)]
+    out = room("write a chorus")
+    assert out.stdout.strip().splitlines() == ["Here is a chorus:", "", "We'll sing it loud and clear", LOOP_NOTE]
+
+
+def test_a_poem_with_a_short_refrain_is_left_alone(fake: FakeModel, room: Any) -> None:
+    poem = ("The sea is wide, the sea is deep,\nRow, row, row the boat,\nThe stars above us softly sleep,\n"
+            "Row, row, row the boat.\nThe moon is high, the tide is low,\nRow, row, row the boat.")
+    fake.replies = [answer(poem)]
+    out = room("a poem please")
+    assert out.stdout.strip() == poem and LOOP_NOTE not in out.stdout
+
+
+def test_tool_call_markup_the_server_missed_is_run(fake: FakeModel, room: Any) -> None:
+    raw = "<tool_call>\n<function=run>\n<parameter=command>\necho raw-ok\n</parameter>\n</function>\n</tool_call>"
+    fake.replies = [{"role": "assistant", "content": raw}, answer("It printed raw-ok.")]
+    out = room("Transcribe and act.")
+    assert out.returncode == 0 and out.stdout.strip() == "It printed raw-ok."
+    assert "$ echo raw-ok" in out.stderr and "<tool_call>" not in out.stdout
+    tool = messages(fake.requests[1])[-1]
+    assert tool["role"] == "tool" and "raw-ok" in tool["content"]
+    assert json.loads(messages(fake.requests[1])[-2]["tool_calls"][0]["function"]["arguments"]) == {"command": "echo raw-ok"}
+
+
+def test_json_tool_call_markup_is_run(fake: FakeModel, room: Any) -> None:
+    raw = 'Let me check. <tool_call>{"name": "run", "arguments": {"command": "echo json-ok"}}</tool_call>'
+    fake.replies = [{"role": "assistant", "content": raw}, answer("json-ok")]
+    out = room("Check.")
+    assert "$ echo json-ok" in out.stderr and out.stdout.strip() == "json-ok"
+
+
+def test_unreadable_tool_call_markup_becomes_one_clean_line(fake: FakeModel, room: Any) -> None:
+    fake.replies = [{"role": "assistant", "content": "<tool_call>\n<function=run>\n<parameter=command>\nls"}]
+    out = room("Do it.")
+    assert out.stdout.strip() == "(The model tried to call a tool, but the call could not be read.)"
+    assert len(fake.requests) == 1
+
+
+def test_markup_after_text_shows_only_the_text_when_tools_are_off(fake: FakeModel, room: Any) -> None:
+    raw = "Sure, here you go.\n<tool_call>\n<function=run>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>"
+    fake.replies = [{"role": "assistant", "content": raw}]
+    out = room("--no-tools", "List files.")
+    assert out.stdout.strip() == "Sure, here you go."
 
 
 def test_each_call_continues_the_conversation_until_new(fake: FakeModel, room: Any) -> None:
