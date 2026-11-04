@@ -3,7 +3,6 @@
 Do **not** set `CATHEDRAL_SEEDBOX_LIVE_OK=yes` or touch Ditto `:8444` until seal end **2026-10-23** (or Fred frees the slot).
 
 **Fill-in sheet:** `SNP_SEEDBOX_CONTABO_OFFLINE_PREP.md`  
-**Proof evidence:** `SNP_SEEDBOX_JOIN_PROOF_EVIDENCE.md`  
 **Step 9 stub:** `scripts/snp_seedbox/run_customer_guest_beside_miner.sh`
 
 ## Before live proof
@@ -25,5 +24,5 @@ Do **not** set `CATHEDRAL_SEEDBOX_LIVE_OK=yes` or touch Ditto `:8444` until seal
 2. Wait wipe / spare.  
 3. API discovers → test org sealed create → auto admit.  
 4. `ditto_full_test.py`.  
-5. Fill `SNP_SEEDBOX_JOIN_PROOF_EVIDENCE.md`.  
+5. Record the proof evidence (the public template was removed in #341).  
 6. Acceptance: no Railway vars, no redeploy, no operator admission script.

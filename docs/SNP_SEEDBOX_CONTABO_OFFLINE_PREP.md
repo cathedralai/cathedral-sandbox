@@ -106,4 +106,4 @@ Copy from `scripts/snp_seedbox/seedbox.example.env` and fill:
 | Ditto slot free / seal ended | Fred / calendar | [ ] |
 | Contabo go | Fred | [ ] |
 
-When all checked → use `SNP_SEEDBOX_JOIN_PROOF_EVIDENCE.md` and launcher/supervise path.
+When all checked → use the launcher/supervise path.
