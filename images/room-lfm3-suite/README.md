@@ -35,19 +35,21 @@ shipped or tested here.
 
 ## Pins and sealed proof
 
-All six are published from commit `0ec5e52` (#387: the `liquid` greeting
-follows the room, Base refuses; run 41733033602). Run summaries have the
-commit tags. All six
+Base, VL, Omni, d1 and d1-Omni are published from commit `01f56b8` (#392:
+per-model sampling, the loop guard, tool-call markup parsed; run
+41887832793). Audio stays on the `0ec5e52` image (#387, run 41733033602): its
+#392 build failed the `json` check (a `//` comment inside the array). Run
+summaries have the commit tags. All six
 packages are public; anonymous pull checked.
 
 | Model | Pin |
 |---|---|
-| `lfm3-1.7b-base` | `ghcr.io/cathedralai/room-lfm3-1.7b-base@sha256:57ff645c1685f0c117f73c4c6bfcea4c10b519efef6af784d5de10b2f7ef64e4` |
-| `lfm3-vl-2b` | `ghcr.io/cathedralai/room-lfm3-vl-2b@sha256:894eaecff312e0aaa317ff955663490895b330618810e26f91430799ba664cfa` |
+| `lfm3-1.7b-base` | `ghcr.io/cathedralai/room-lfm3-1.7b-base@sha256:810911016ac6ea1ddeba1bba4dc157e0c3d4252201e64d3279876e57dce344a8` |
+| `lfm3-vl-2b` | `ghcr.io/cathedralai/room-lfm3-vl-2b@sha256:ef5c553961e5a6d9eba616fe4f5b2d68d46ec996f651e2011e5a09ae67f9cdc1` |
 | `lfm3-audio-2b` | `ghcr.io/cathedralai/room-lfm3-audio-2b@sha256:7c5ad91bccdd6d9cdaa25417573f171d44f3a4932b46ba7d1f885184a41ea27a` |
-| `lfm3-omni-2b` | `ghcr.io/cathedralai/room-lfm3-omni-2b@sha256:12f4959b25dfaf7350411c8c4d1a96a8c442d06e6784369abe16b7514eec81ca` |
-| `d1-2b` | `ghcr.io/cathedralai/room-d1-2b@sha256:2cec8e184f141063b134bfc2a94bddb928d678c5fd6934b92a63316696474427` |
-| `d1-omni-2b` | `ghcr.io/cathedralai/room-d1-omni-2b@sha256:16838d8720c8c4cf881b2474662935e2541a2e4273fe493702b0a16ea0705656` |
+| `lfm3-omni-2b` | `ghcr.io/cathedralai/room-lfm3-omni-2b@sha256:ae491ca68c27b9379a56af39ceac1a09db07be8b164dbc9788f8b338311789ae` |
+| `d1-2b` | `ghcr.io/cathedralai/room-d1-2b@sha256:f95d88c7144642328fe85bd7f52e95e434979e64a220550fac3d0e965aca35c6` |
+| `d1-omni-2b` | `ghcr.io/cathedralai/room-d1-omni-2b@sha256:3cb800de3d2f9bfcc69d24ab2fc659fc51eb7ed3aae2abe46d46a23f10b57abd` |
 
 The converted `LFM3-1.7B-Base-Q4_K_M.gguf` in that image has sha256
 `d4c9ebb5aa08999083bf939042087b6379547c5729163ce556902d8c06111fd5`.
