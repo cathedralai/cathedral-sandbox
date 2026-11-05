@@ -8,7 +8,7 @@
 // from cathedral-sandbox #361 (each proven sealed on prod at 2 vCPU / 4 GiB, 29 Oct 2026);
 // Base, VL, d1 and d1-Omni are the #392 builds (per-model sampling, loop guard, tool-call
 // markup parsed; ADO 523); Audio is its #397 build (liquid --json, greedy plus frequency 0.3, ADO 547);
-// Omni is its #398 build (llama-server --swa-full and a boot warm-up, ADO 549).
+// Omni is its #401 build (--swa-full and a boot warm-up, ADO 549; sampled answers, ADO 550).
 // Prefetched on c46-sealed-2, nc-sealed-2 and nc-sealed-3 before each pin (4 Nov 2026).
 // A suite model is sealed ready only once its image is prefetched on every shared sealed hotel
 // (all six: c46-sealed-2, nc-sealed-2, nc-sealed-3, 6 of 6 each, 29 Oct 2026 11:40Z).
@@ -102,7 +102,7 @@ var catalogTemplates = []catalogTemplate{
 		Name: "lfm3-omni-2b", DisplayName: "LFM3 Omni 2B (CPU)",
 		Description: "LFM3 2.17B on CPU via llama.cpp b11960 (LFM3-Omni-2B-Q4_K_M.gguf). Sandbox inputs: text, image, audio. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
-		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:c1cd3dc515402f2d5f3f7a845eac057fff3695860e7af989eee43c174bbb3eb2"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:03083042a84d67094bddbeea06bf9eeedbe41f13194b9325aeb3fe166e603d2d"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "d1-2b", DisplayName: "d1 2B (CPU)",
