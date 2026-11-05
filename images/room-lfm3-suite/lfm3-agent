@@ -24,6 +24,9 @@
 #   --system TEXT  use this system prompt from now on (default: a short one
 #                  about this sandbox and the tools)
 #   --no-tools     answer without running anything
+#   --json         answer in JSON only, with no tools: the server holds the reply
+#                  to JSON syntax (a grammar), so it parses unless it hits the
+#                  token cap (LFM3_MAX_TOKENS)
 #   --warm         read the default system prompt and tools into the model
 #                  server's cache and exit (lfm3-serve runs it once at boot)
 #   -              read the message from stdin
@@ -46,7 +49,7 @@
 set -euo pipefail
 
 usage() {
-  echo 'usage: lfm3-agent [--new] [--image FILE] [--audio FILE] [--system TEXT] [--no-tools] "message"   (or "-" for stdin)' >&2
+  echo 'usage: lfm3-agent [--new] [--image FILE] [--audio FILE] [--system TEXT] [--no-tools] [--json] "message"   (or "-" for stdin)' >&2
   echo '       lfm3-agent --reset | --history' >&2
   exit 2
 }
@@ -71,8 +74,12 @@ MAX_TOKENS=${LFM3_MAX_TOKENS:-512}
 # each model we ship, with one measured exception:
 #   VL and any other: temperature 0.1, top_k 50, repetition penalty 1.1 (the
 #     LFM3-VL-2B and LFM3-1.7B cards).
-#   Audio: greedy (its card config). With the card settings it stopped answering
-#     what a clip says when tools were on (0 of 4, greedy 4 of 4).
+#   Audio: greedy (its card config) plus the same frequency penalty as Omni.
+#     With the card settings it stopped answering what a clip says when tools
+#     were on (0 of 4). With the penalty it answered 3 of 3 (greedy alone 1 of
+#     3) and hit the token cap less often on rhyme requests (14 capped requests
+#     in 6 runs, greedy 20). It still adds // comments to some JSON lists
+#     (ADO 547), so JSON from Audio needs --json.
 #   Omni: greedy (its card config) plus a frequency penalty of 0.3, which grows
 #     with each repeat of a token in the last 64. Greedy alone looped on rhyme
 #     requests until the 512-token cap (prod, 4 Nov; 4 of 30 rhyme prompts
@@ -84,11 +91,20 @@ MAX_TOKENS=${LFM3_MAX_TOKENS:-512}
 #     not used. A JSON array of 30 objects and a 31-line script came out
 #     identical with and without the penalty.
 case "${MODEL:-}" in
-  *omni*) default_sampling='{"temperature": 0, "frequency_penalty": 0.3}' ;;
-  *audio*) default_sampling='{"temperature": 0}' ;;
+  *omni* | *audio*) default_sampling='{"temperature": 0, "frequency_penalty": 0.3}' ;;
   *) default_sampling='{"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1}' ;;
 esac
 SAMPLING=${LFM3_AGENT_SAMPLING:-$default_sampling}
+# --json: llama-server turns a schema into a grammar and samples only tokens
+# that keep the reply valid JSON. An empty schema would mean an object only, so
+# the schema allows an array too. The grammar fixes the syntax, not the count
+# asked for, so a --json request also carries JSON_LINE in its system prompt.
+# Measured on Audio, the pinned GGUF on b11960 (ADO 547), the selftest's
+# 15-object request from 12 sandbox paths: 10 of 12 parsed as 15 objects with
+# the grammar alone (where Audio wanted a // comment it wrote a number and
+# closed the list), 12 of 12 with the line too. The line alone: 5 of 6.
+JSON_FORMAT='{"type": "json_schema", "json_schema": {"name": "answer", "schema": {"type": ["object", "array"]}}}'
+JSON_LINE='When you are asked for JSON, output valid JSON only, no comments.'
 STEPS=${LFM3_AGENT_STEPS:-4}
 CMD_TIMEOUT=${LFM3_AGENT_CMD_TIMEOUT:-60}
 OUTPUT_CHARS=${LFM3_AGENT_OUTPUT_CHARS:-2000}
@@ -172,6 +188,7 @@ echo '[]' >"$work/no_media"
 system=""
 prompt=""
 tools=1
+json=""
 fresh=""
 warm=""
 
@@ -227,6 +244,11 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     --no-tools)
+      tools=""
+      shift
+      ;;
+    --json)
+      json=1
       tools=""
       shift
       ;;
@@ -340,7 +362,8 @@ build_body() { # with-tools [max-tokens]
     --slurpfile stored "$work/user_stored" --slurpfile sent "$work/user_sent" \
     --slurpfile turn "$work/turn" --slurpfile media "$media" --slurpfile parts "$work/parts" \
     --argjson room "$CONTEXT_CHARS" --arg model "$MODEL_NAME" --argjson n "$n" \
-    --argjson tools "$TOOLS" --arg with_tools "$1" --argjson sampling "$SAMPLING" '
+    --argjson tools "$TOOLS" --arg with_tools "$1" --argjson sampling "$SAMPLING" \
+    --arg json "$json" --argjson format "$JSON_FORMAT" --arg json_line "$JSON_LINE" '
     def drop_turn: (.[1:] | map(.role == "user") | index(true)) as $i
       | if $i == null then [] else .[($i + 1):] end;
     def fit($room): if length == 0 or (tojson | length) <= $room then . else (drop_turn | fit($room)) end;
@@ -353,11 +376,12 @@ build_body() { # with-tools [max-tokens]
        | map(del(.media))) as $kept
     | {
         model: $model,
-        messages: ([{role: "system", content: $sys}] + $kept + ($sent[0] | map(del(.media))) + $turn[0]),
+        messages: ([{role: "system", content: ($sys + (if $json == "1" then "\n" + $json_line else "" end))}] + $kept + ($sent[0] | map(del(.media))) + $turn[0]),
         max_tokens: $n
       }
     + $sampling
-    + (if $with_tools == "1" then {tools: $tools} else {} end)' >"$work/body"
+    + (if $with_tools == "1" then {tools: $tools} else {} end)
+    + (if $json == "1" then {response_format: $format} else {} end)' >"$work/body"
 }
 
 ask_model() { # with-tools: the reply message goes to $work/msg
@@ -497,7 +521,12 @@ one_turn() { # message
 
   jq -r '.content // ""' "$work/msg" >"$work/answer"
   [ -s "$work/answer" ] || echo "(the model gave no answer)" >"$work/answer"
-  looped=$(loop_guard "$work/answer")
+  # A --json answer that parses is kept whole: a list repeats its keys, and a
+  # list with one value in every item reads as a loop and would be cut.
+  looped=""
+  if [ -z "$json" ] || ! jq empty "$work/answer" >/dev/null 2>&1; then
+    looped=$(loop_guard "$work/answer")
+  fi
   # Keep the turn: history (trimmed the same way), this message, the tool
   # calls and the answer. Written whole, so a failed request leaves no half turn.
   jq --slurpfile stored "$work/user_stored" --slurpfile turn "$work/turn" \

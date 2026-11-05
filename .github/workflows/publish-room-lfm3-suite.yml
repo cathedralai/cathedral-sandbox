@@ -73,10 +73,11 @@ jobs:
             kind: chat
             # agent, agent-audio: one tool question, and a clip with no message
             # (no raw tool-call markup) then with a question (Paris). No rhyme:
-            # Audio stays on greedy decoding (its card config) to keep clip
-            # answers, and greedy loops on "rhyme with me"; lfm3-agent's loop
-            # guard cuts that answer (ADO 523).
-            checks: text audio agent agent-audio json
+            # Audio still loops on some rhyme requests with greedy decoding and
+            # the frequency penalty, and lfm3-agent's loop guard cuts them
+            # (ADO 523). json-flag: Audio's JSON goes through liquid --json,
+            # because its lists can carry // comments (ADO 547).
+            checks: text audio agent agent-audio json-flag
             weights: download
             hf_repo: LiquidAI/LFM3-Audio-2B-GGUF
             hf_revision: 642697a5597a675cb819ed236ac415c1e60a4f6f

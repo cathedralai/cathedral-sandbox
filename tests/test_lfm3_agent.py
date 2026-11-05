@@ -161,7 +161,7 @@ def test_runs_the_tool_the_model_asks_for_and_returns_the_answer(fake: FakeModel
     ("model", "sampling"),
     [
         ("lfm3-omni-2b", {"temperature": 0, "frequency_penalty": 0.3}),
-        ("lfm3-audio-2b", {"temperature": 0}),
+        ("lfm3-audio-2b", {"temperature": 0, "frequency_penalty": 0.3}),
         ("lfm3-vl-2b", {"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1}),
     ],
 )
@@ -207,6 +207,41 @@ def test_a_poem_with_a_short_refrain_is_left_alone(fake: FakeModel, room: Any) -
     fake.replies = [answer(poem)]
     out = room("a poem please")
     assert out.stdout.strip() == poem and LOOP_NOTE not in out.stdout
+
+
+JSON_LINE = "When you are asked for JSON, output valid JSON only, no comments."
+
+
+def test_json_asks_the_server_for_json_with_no_tools(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer('["apple", "pear"]'), answer("Pears are green.")]
+    out = room("--json", "list", "2", "fruits", script=LIQUID, MODEL="lfm3-audio-2b")
+    assert out.returncode == 0, out.stderr
+    assert json.loads(out.stdout) == ["apple", "pear"]
+    body = fake.requests[0]
+    assert "tools" not in body
+    # An empty schema means an object only on llama-server; the list must be allowed.
+    assert body["response_format"] == {
+        "type": "json_schema", "json_schema": {"name": "answer", "schema": {"type": ["object", "array"]}}}
+    assert body["temperature"] == 0 and body["frequency_penalty"] == 0.3
+    assert messages(body)[0]["content"].endswith("\n" + JSON_LINE)
+    assert messages(body)[-1] == {"role": "user", "content": "list 2 fruits"}
+
+    # The flag is for that message only: the next turn has tools again and no JSON line.
+    assert room("which is green", script=LIQUID, MODEL="lfm3-audio-2b").returncode == 0
+    later = fake.requests[1]
+    assert "response_format" not in later and "tools" in later
+    assert JSON_LINE not in messages(later)[0]["content"]
+    assert [m["content"] for m in messages(later)[1:]] == ["list 2 fruits", '["apple", "pear"]', "which is green"]
+
+
+def test_a_json_answer_that_parses_is_never_cut(fake: FakeModel, room: Any) -> None:
+    # One value in every item reads as a loop to the guard.
+    listing = "[\n" + ",\n".join(f'  {{"id": {i}, "country": "Japan"}}' for i in range(1, 16)) + "\n]"
+    fake.replies = [answer(listing), answer(listing)]
+    out = room("--json", "15 cars from Japan")
+    assert out.stdout.rstrip("\n") == listing and LOOP_NOTE not in out.stdout
+    assert history(room)[-1]["content"] == listing
+    assert LOOP_NOTE in room("--no-tools", "15 cars from Japan").stdout
 
 
 def test_tool_call_markup_the_server_missed_is_run(fake: FakeModel, room: Any) -> None:

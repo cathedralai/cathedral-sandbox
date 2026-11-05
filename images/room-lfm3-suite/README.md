@@ -37,16 +37,16 @@ shipped or tested here.
 
 Base, VL, Omni, d1 and d1-Omni are published from commit `01f56b8` (#392:
 per-model sampling, the loop guard, tool-call markup parsed; run
-41887832793). Audio is published from commit `96724c5` (#394, run 41906280501),
-with `json` advisory for it (ADO 547). Run summaries have the commit tags. All
-six
+41887832793). Audio is published from commit `8d2e02c` (#397, run 41935145792):
+`liquid --json`, greedy plus frequency penalty 0.3, and its blocking
+`json-flag` gate (ADO 547). Run summaries have the commit tags. All six
 packages are public; anonymous pull checked.
 
 | Model | Pin |
 |---|---|
 | `lfm3-1.7b-base` | `ghcr.io/cathedralai/room-lfm3-1.7b-base@sha256:810911016ac6ea1ddeba1bba4dc157e0c3d4252201e64d3279876e57dce344a8` |
 | `lfm3-vl-2b` | `ghcr.io/cathedralai/room-lfm3-vl-2b@sha256:ef5c553961e5a6d9eba616fe4f5b2d68d46ec996f651e2011e5a09ae67f9cdc1` |
-| `lfm3-audio-2b` | `ghcr.io/cathedralai/room-lfm3-audio-2b@sha256:bd793dfb9aaa7aecca630c7d24ad76af7f176e3a1cc87a62e12c048dcf33efef` |
+| `lfm3-audio-2b` | `ghcr.io/cathedralai/room-lfm3-audio-2b@sha256:e08490ce97f35e1cfbaf9b2d0d224268576db1a4c7ae719f903c823aa0dce8ae` |
 | `lfm3-omni-2b` | `ghcr.io/cathedralai/room-lfm3-omni-2b@sha256:ae491ca68c27b9379a56af39ceac1a09db07be8b164dbc9788f8b338311789ae` |
 | `d1-2b` | `ghcr.io/cathedralai/room-d1-2b@sha256:f95d88c7144642328fe85bd7f52e95e434979e64a220550fac3d0e965aca35c6` |
 | `d1-omni-2b` | `ghcr.io/cathedralai/room-d1-omni-2b@sha256:3cb800de3d2f9bfcc69d24ab2fc659fc51eb7ed3aae2abe46d46a23f10b57abd` |
@@ -136,6 +136,7 @@ liquid                          # on a terminal: the chat; in the console termin
 liquid what is in /work         # one turn of the same conversation
 liquid hey, what can you do     # a leading "hey" is just part of the message
 liquid --new                    # starts over
+liquid --json list 5 fruits     # JSON only, held to JSON syntax by the server; no tools
 ```
 
 Quote the message when it has characters the shell reads itself, such as an
@@ -157,6 +158,13 @@ kinds of room:
   file). Each call is printed on stderr as it runs (`$ ls -la`); the output
   the model reads is cut at 2,000 characters. At most 4 tool rounds a
   message, then the model must answer. `--no-tools` answers without them.
+- **JSON.** `--json` sends a JSON schema (an object or an array) as
+  `response_format`, which llama-server turns into a grammar, plus one system
+  line asking for valid JSON with no comments, and no tools. The grammar fixes
+  the syntax, not the count: Audio, which comments repeated list items
+  (ADO 547), wrote a number in place of a comment and closed the list early
+  until the line was added. A reply cut at the token cap does not parse. The
+  loop guard leaves a `--json` answer that parses whole.
 - **System prompt.** A short default says what the sandbox is, when to use a
   tool and when not to, and never to claim a command it did not run.
   `--system` replaces it.
@@ -183,8 +191,11 @@ kinds of room:
   `LFM3_AGENT_SAMPLING` (a JSON object) replaces it.
   - VL (and any other): temperature 0.1, top_k 50, repetition penalty 1.1 (the
     LFM3-VL-2B and LFM3-1.7B cards).
-  - Audio: greedy (its card config). Other settings made it call a tool
-    instead of answering what a clip says.
+  - Audio: greedy (its card config) plus Omni's frequency penalty of 0.3. The
+    card settings made it call a tool instead of answering what a clip says;
+    the penalty answered the clip question 3 of 3 (greedy alone 1 of 3) and
+    hit the token cap less often on rhyme requests. Its JSON lists can carry
+    `//` comments (ADO 547), so ask Audio for JSON with `--json`.
   - Omni: greedy (its card config) plus a frequency penalty of 0.3. Greedy
     alone looped on rhyme requests until the token cap (ADO 523): 4 of 30
     rhyme prompts locally, 1 of 30 with the penalty, and the loop guard cuts
@@ -214,8 +225,9 @@ under greedy decoding, with `--no-tools`, and fails if one loops twice.
 `lfm3-selftest agent-audio` sends the test clip with no message (tools on; no
 raw tool-call markup allowed), then with "What is said in this clip?" (it must
 answer Paris). `lfm3-selftest json` asks for a JSON array of 15 objects and
-fails unless it parses. The publish matrix says which image gates on which
-check.
+fails unless it parses; `json-flag` sends the same request through
+`liquid --json` and fails unless the whole answer parses. The publish matrix
+says which image gates on which check.
 
 ### Which model to talk to
 
