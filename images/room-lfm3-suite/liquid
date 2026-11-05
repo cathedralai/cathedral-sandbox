@@ -9,6 +9,7 @@
 #   liquid hey, what can you do     a leading "hey" is just part of the message
 #   liquid --new write a haiku      lfm3-agent's options work the same way
 #   liquid --json list 5 fruits     JSON only, held to JSON syntax by the server; no tools
+#   liquid --speak reply.wav hello  the answer in text, then spoken into reply.wav (Audio, Omni)
 #
 # d1 (decision) and base models refuse it with exit 2: d1 answers typed
 # questions (lfm3-decide) and a base model only continues text (lfm3-ask --raw).

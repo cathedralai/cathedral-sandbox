@@ -22,6 +22,9 @@
 #                 structured output)                               name and color
 #   json-flag     liquid --json, the same request (Audio: its      the whole answer
 #                 lists can carry // comments, ADO 547)            parses, as in json
+#   speak         liquid --speak: say one fixed sentence, then     a WAV that Audio
+#                 hear the WAV back (ASR, lfm3-ask)                or Omni hears as
+#                                                                  the same words
 #
 # test-speech.wav says "The train to Paris leaves at nine in the morning."
 set -euo pipefail
@@ -129,6 +132,36 @@ for check in "${checks[@]}"; do
         echo "ok $check"
       else
         echo "FAIL $check: the answer is not a JSON array of 15 objects with id, name and color"
+        exit 1
+      fi
+      ;;
+    speak)
+      # The Talk path: an answer in text, then its speech (llama-server /tts)
+      # as a WAV, heard back by the same model. Words are compared after
+      # number words become digits (ASR writes "9" for "nine"): 90% of the
+      # answer's words must be heard and 90% of what is heard must be in the
+      # answer, so a cut or babbling WAV fails.
+      agent_dir=$(mktemp -d) && mkdir "$agent_dir/work"
+      wav=$agent_dir/work/reply.wav
+      out=$(LFM3_AGENT_DIR=$agent_dir LFM3_AGENT_CWD=$agent_dir/work liquid --no-tools --speak "$wav" \
+        'Repeat this sentence exactly, and say nothing else: The train to Paris leaves at nine in the morning.' 2>"$agent_dir/stderr") || true
+      cat "$agent_dir/stderr"
+      printf '%s\n' "> said" "$out"
+      heard=""
+      if [ "$(head -c 4 "$wav" 2>/dev/null)" = RIFF ]; then
+        heard=$(lfm3-ask --system 'Perform ASR in English.' --audio "$wav" 2>/dev/null | sed '$d') || true
+      fi
+      printf '%s\n' "> heard" "$heard"
+      if [ -n "$heard" ] && jq -en --arg said "$out" --arg heard "$heard" '
+          def words: ascii_downcase | [scan("[a-z0-9]+")]
+            | map({"zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6",
+                   "seven": "7", "eight": "8", "nine": "9", "ten": "10", "twenty": "20"}[.] // .);
+          def share($a; $b): ([$a[] | select(. as $w | any($b[]; . == $w))] | length) * 10 >= ($a | length) * 9;
+          ($said | words) as $s | ($heard | words) as $h
+          | ($s | length) > 0 and any($s[]; . == "paris") and share($s; $h) and share($h; $s)' >/dev/null; then
+        echo "ok $check"
+      else
+        echo "FAIL $check: no WAV, or the speech does not hold the answer's words"
         exit 1
       fi
       ;;
