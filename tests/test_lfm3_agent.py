@@ -7,6 +7,7 @@ no model.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator
@@ -53,6 +55,20 @@ def answer(text: str) -> dict[str, Any]:
     return {"role": "assistant", "content": text}
 
 
+def fake_wav(seconds: float = 0.1) -> bytes:
+    """A real PCM 16-bit mono 24 kHz WAV of silence, like llama-server's /tts."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(24000)
+        w.writeframes(b"\0\0" * int(24000 * seconds))
+    return buf.getvalue()
+
+
+FAKE_WAV = fake_wav()
+
+
 class FakeModel:
     def __init__(self) -> None:
         self.replies: list[Any] = []
@@ -63,6 +79,9 @@ class FakeModel:
         # /slots/0?action=save|restore calls, and the status they answer.
         self.slot_calls: list[str] = []
         self.slot_status = 200
+        # POST /tts: the requests, and the next reply (WAV bytes, or a status code).
+        self.tts_requests: list[dict[str, Any]] = []
+        self.tts_reply: Any = FAKE_WAV
         model = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -85,6 +104,18 @@ class FakeModel:
                 if self.path.startswith("/slots/"):
                     model.slot_calls.append(f"{self.path} {body.get('filename')}")
                     self._send(model.slot_status, {"id_slot": 0})
+                    return
+                if self.path == "/tts":
+                    model.tts_requests.append(body)
+                    reply = model.tts_reply
+                    if isinstance(reply, int):
+                        self._send(reply, {"error": {"code": reply, "message": "this server does not support audio generation"}})
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "audio/wav")
+                    self.send_header("Content-Length", str(len(reply)))
+                    self.end_headers()
+                    self.wfile.write(reply)
                     return
                 if body.get("max_tokens") == 2:
                     # Answer like llama-server: the first two tokens of the next scripted reply.
@@ -334,6 +365,65 @@ def test_a_poem_with_a_short_refrain_is_left_alone(fake: FakeModel, room: Any) -
 
 
 JSON_LINE = "When you are asked for JSON, output valid JSON only, no comments."
+
+
+def test_speak_writes_the_answer_as_a_wav(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("The yellow fruit is the **banana**.\n- `mango`\n## Done")]
+    wav = room.work / "talk-reply.wav"
+    out = room("--speak", str(wav), "which", "fruit", "is", "yellow", script=LIQUID, MODEL="lfm3-audio-2b")
+    assert out.returncode == 0, out.stderr
+    # The text answer is printed exactly as without --speak.
+    assert out.stdout == "The yellow fruit is the **banana**.\n- `mango`\n## Done\n"
+    assert "no speech" not in out.stderr
+    assert wav.read_bytes() == FAKE_WAV
+    # Markdown marks are not spoken; each line is a phrase. The frame cap is 60 s.
+    assert fake.tts_requests == [{"input": "The yellow fruit is the banana. mango. Done.", "n_predict": 750}]
+    assert not list(room.work.glob("*.partial.*"))
+
+
+def test_speak_says_only_what_the_guard_kept(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("Glow, shine, sing, bloom, " + "bloom, " * 200)]
+    wav = room.work / "r.wav"
+    out = room("--no-tools", "--speak", str(wav), "rhyme with me", LFM3_SPEAK_FRAMES="100")
+    assert out.stdout.strip().splitlines() == ["Glow, shine, sing, bloom", LOOP_NOTE]
+    assert fake.tts_requests == [{"input": "Glow, shine, sing, bloom.", "n_predict": 100}]
+
+
+@pytest.mark.parametrize(
+    ("reply", "reason"),
+    [
+        (501, "the model server answered 501: this server does not support audio generation"),
+        (b"<html>busy</html>", "the model server did not send a WAV"),
+    ],
+    ids=["no-tts", "not-a-wav"],
+)
+def test_failed_speech_keeps_the_text_and_says_why_once(fake: FakeModel, room: Any, reply: Any, reason: str) -> None:
+    fake.replies = [answer("Hello there.")]
+    fake.tts_reply = reply
+    wav = room.work / "reply.wav"
+    wav.write_bytes(b"an older reply")
+    out = room("--speak", str(wav), "hello", script=LIQUID, MODEL="lfm3-vl-2b")
+    assert out.returncode == 0
+    assert out.stdout == "Hello there.\n"
+    assert out.stderr.strip().splitlines() == [f"liquid: no speech: {reason}"]
+    # FILE holds this answer's speech or nothing, never an older reply.
+    assert not wav.exists()
+    assert len(history(room)) == 2
+
+
+def test_speech_that_cannot_be_written_keeps_the_text(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("Hello.")]
+    out = room("--speak", str(room.work / "no-such-dir" / "r.wav"), "hello")
+    assert out.returncode == 0 and out.stdout == "Hello.\n"
+    assert out.stderr.strip() == f"lfm3-agent: no speech: cannot write {room.work / 'no-such-dir' / 'r.wav'}"
+
+
+def test_speech_with_no_server_keeps_the_text(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("Hello.")]
+    fake.tts_reply = 404
+    out = room("--speak", str(room.work / "r.wav"), "hello")
+    assert out.returncode == 0 and out.stdout == "Hello.\n"
+    assert out.stderr.strip().startswith("lfm3-agent: no speech: the model server answered 404")
 
 
 def test_json_asks_the_server_for_json_with_no_tools(fake: FakeModel, room: Any) -> None:

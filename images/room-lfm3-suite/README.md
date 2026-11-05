@@ -30,8 +30,8 @@ matrix. The build fails if a download does not match.
 What a 4 GiB room does not give: the BF16 checkpoints (3.5 GB of weights
 before any cache), the full 128K or 256K context (the server runs 4096
 tokens, 8192 for d1), video input (llama.cpp needs `ffmpeg`, not in the
-image) and speech output (`llama-tts`, `/v1/realtime`), which are not
-shipped or tested here.
+image) and live speech (`/v1/realtime`), which are not shipped or tested
+here. Spoken answers are: `liquid --speak` in Audio and Omni rooms (below).
 
 ## Pins and sealed proof
 
@@ -144,6 +144,7 @@ liquid what is in /work         # one turn of the same conversation
 liquid hey, what can you do     # a leading "hey" is just part of the message
 liquid --new                    # starts over
 liquid --json list 5 fruits     # JSON only, held to JSON syntax by the server; no tools
+liquid --speak reply.wav hello  # the answer in text, then spoken into reply.wav (Audio, Omni)
 ```
 
 Quote the message when it has characters the shell reads itself, such as an
@@ -172,6 +173,17 @@ kinds of room:
   (ADO 547), wrote a number in place of a comment and closed the list early
   until the line was added. A reply cut at the token cap does not parse. The
   loop guard leaves a `--json` answer that parses whole.
+- **Speech.** `--speak FILE` answers in text as usual, then sends the answer
+  to llama-server's `/tts` and writes the WAV to FILE: RIFF, PCM 16-bit,
+  mono, 24,000 Hz, default (female) voice. Markdown marks are taken out
+  first: Audio read a `## ` heading as made-up words. If speech fails, FILE
+  is removed, one line `liquid: no speech: <reason>` goes to stderr, and the
+  text answer and exit code stand. VL and the text-only models cannot speak
+  and say so on that line. Speech stops at `LFM3_SPEAK_FRAMES` 80 ms frames
+  (default 750, 60 s). Measured in sealed 2 vCPU rooms (5 Nov 2026): one
+  sentence (about 3 s of speech) took 5.5 to 6.2 s on Audio and 4.5 to 5.2 s
+  on Omni, three sentences (about 9 s) 15.7 s and 11.1 s, plus 65 to 85 MB of
+  memory while it runs. Audio heard every WAV back as the words sent.
 - **System prompt.** A short default says what the sandbox is, when to use a
   tool and when not to, and never to claim a command it did not run.
   `--system` replaces it.
@@ -233,7 +245,9 @@ under greedy decoding, with `--no-tools`, and fails if one loops twice.
 raw tool-call markup allowed), then with "What is said in this clip?" (it must
 answer Paris). `lfm3-selftest json` asks for a JSON array of 15 objects and
 fails unless it parses; `json-flag` sends the same request through
-`liquid --json` and fails unless the whole answer parses. The publish matrix
+`liquid --json` and fails unless the whole answer parses. `speak` has the
+model say one fixed sentence through `liquid --speak` and hear the WAV back
+(ASR); 90% of the words must match both ways. The publish matrix
 says which image gates on which check.
 
 ### Which model to talk to
@@ -254,8 +268,8 @@ LFM3-1.7B is a reasoning model; with reasoning off it thinks out loud in the
 answer ("17 * 23, number only" runs to the token cap). Omni is not a
 reasoning model and answers in a few tokens. On a sealed room Omni generates
 19.4 tok/s, holds 2.7 GB and pulls 1.6 GB (table above), more than the text
-models. Omni in this image does not speak or watch video: speech output and
-video input are not shipped (see above).
+models. Omni in this image does not watch video (see above); it speaks
+through `liquid --speak`.
 
 LFM3-Audio-2B reasons before a text answer even with `LFM3_REASONING=off`:
 its chat template has no switch for it. The reasoning comes back in

@@ -76,8 +76,9 @@ jobs:
             # Audio still loops on some rhyme requests with greedy decoding and
             # the frequency penalty, and lfm3-agent's loop guard cuts them
             # (ADO 523). json-flag: Audio's JSON goes through liquid --json,
-            # because its lists can carry // comments (ADO 547).
-            checks: text audio agent agent-audio json-flag
+            # because its lists can carry // comments (ADO 547). speak: liquid
+            # --speak says one sentence and Audio must hear it back (ADO 552).
+            checks: text audio agent agent-audio json-flag speak
             weights: download
             hf_repo: LiquidAI/LFM3-Audio-2B-GGUF
             hf_revision: 642697a5597a675cb819ed236ac415c1e60a4f6f
@@ -91,8 +92,9 @@ jobs:
             kind: chat
             # agent: lfm3-agent must call run to learn the hostname. rhyme and
             # agent-audio: the regressions from ADO 523 (a rhyme loop, raw
-            # tool-call markup after a clip with no message).
-            checks: text image audio agent rhyme agent-audio json
+            # tool-call markup after a clip with no message). speak: liquid
+            # --speak says one sentence and Omni must hear it back (ADO 552).
+            checks: text image audio agent rhyme agent-audio json speak
             weights: download
             hf_repo: LiquidAI/LFM3-Omni-2B-GGUF
             hf_revision: 2918dd47cfceb4f260cd1734cd1aac1b22bbe4b6

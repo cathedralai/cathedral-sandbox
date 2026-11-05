@@ -27,6 +27,11 @@
 #   --json         answer in JSON only, with no tools: the server holds the reply
 #                  to JSON syntax (a grammar), so it parses unless it hits the
 #                  token cap (LFM3_MAX_TOKENS)
+#   --speak FILE   after the answer, say it: llama-server's /tts turns the
+#                  answer into a WAV (PCM 16-bit, mono, 24 kHz) at FILE. Audio
+#                  and Omni. If speech fails, FILE is removed, one line
+#                  "<name>: no speech: <reason>" goes to stderr, and the text
+#                  answer and exit code stand.
 #   --warm         read the default system prompt and tools into the model
 #                  server's cache and exit (lfm3-serve runs it once at boot)
 #   -              read the message from stdin
@@ -43,6 +48,9 @@
 #                             with --swa-full), so only new text costs time,
 #                             until old turns are dropped.
 #   LFM3_MAX_TOKENS           tokens per reply (default 512)
+#   LFM3_SPEAK_FRAMES         most speech for --speak, in 80 ms audio frames
+#                             (default 750: 60 s, which takes about 80 to 115 s
+#                             to make on a sealed 2 vCPU room)
 #   LFM3_AGENT_SAMPLING       sampling fields for llama-server, a JSON object
 #                             (default: per model, see SAMPLING)
 #   LFM3_AGENT_ANSWER_SAMPLING  sampling for a reply that is not a tool call, a
@@ -52,7 +60,7 @@
 set -euo pipefail
 
 usage() {
-  echo 'usage: lfm3-agent [--new] [--image FILE] [--audio FILE] [--system TEXT] [--no-tools] [--json] "message"   (or "-" for stdin)' >&2
+  echo 'usage: lfm3-agent [--new] [--image FILE] [--audio FILE] [--system TEXT] [--no-tools] [--json] [--speak FILE] "message"   (or "-" for stdin)' >&2
   echo '       lfm3-agent --reset | --history' >&2
   exit 2
 }
@@ -223,6 +231,7 @@ tools=1
 json=""
 fresh=""
 warm=""
+speak_file=""
 
 add_part() { # kind file
   [ -r "$2" ] || { echo "lfm3-agent: cannot read $2" >&2; exit 2; }
@@ -274,6 +283,11 @@ while [ "$#" -gt 0 ]; do
     --warm)
       warm=1
       shift
+      ;;
+    --speak)
+      [ "$#" -ge 2 ] || usage
+      speak_file=$2
+      shift 2
       ;;
     --no-tools)
       tools=""
@@ -571,6 +585,53 @@ loop_guard() { # answer-file: rewrites it; prints "looped" when it cut
   rm -f "$1.guard"
 }
 
+# --speak: the answer as speech. Markdown marks are taken out first: the model
+# reads a "## " heading as made-up words, while * and ` are silent. Each line
+# becomes a phrase. FILE holds this answer's speech or nothing; it is written
+# whole (a temporary file, then a rename), so a reader never gets half a WAV.
+SPEAK_FRAMES=${LFM3_SPEAK_FRAMES:-750}
+speak_answer() { # answer-file out-file
+  local out=$2 tmp reason="" status=0 code msg
+  rm -f "$out" 2>/dev/null || true
+  jq -n --rawfile t "$1" --argjson n "$SPEAK_FRAMES" '
+    def speakable:
+      split("\n")
+      | map(gsub("```[A-Za-z0-9_-]*"; "") | gsub("[*`#>|~]+"; "") | gsub("_+"; " ")
+            | sub("^\\s+"; "") | sub("^[-+]\\s+"; "") | sub("\\s+$"; "")
+            | select(length > 0)
+            | if test("[.!?:;,]$") then . else . + "." end)
+      | join(" ");
+    {input: ($t | speakable), n_predict: $n}' >"$work/tts_body" 2>/dev/null || reason="cannot read the answer"
+  if [ -z "$reason" ] && [ "$(jq -r '.input' "$work/tts_body")" = "" ]; then
+    reason="the answer has no words to say"
+  fi
+  if [ -z "$reason" ]; then
+    curl -sS --max-time "${LFM3_TIMEOUT:-600}" -o "$work/speech" -w '%{http_code}' \
+      -H 'Content-Type: application/json' -H "Authorization: Bearer ${MODEL_API_KEY:-local}" \
+      --data-binary @"$work/tts_body" "${BASE_URL%/v1}/tts" >"$work/tts_code" 2>/dev/null || status=$?
+    code=$(cat "$work/tts_code" 2>/dev/null || true)
+    if [ "$status" -ne 0 ]; then
+      reason="the model server did not answer (curl exit $status)"
+    elif [ "$code" != 200 ]; then
+      msg=$(jq -r '.error.message // empty' "$work/speech" 2>/dev/null) || msg=$(head -c 200 "$work/speech" 2>/dev/null | tr -d '\n') || msg=""
+      reason="the model server answered ${code:-nothing}${msg:+: ${msg:0:200}}"
+    elif [ "$(head -c 4 "$work/speech")" != RIFF ] || [ "$(wc -c <"$work/speech")" -le 44 ]; then
+      reason="the model server did not send a WAV"
+    fi
+  fi
+  if [ -z "$reason" ]; then
+    tmp=$out.partial.$$
+    if ! { cp "$work/speech" "$tmp" && mv -f "$tmp" "$out"; } 2>/dev/null; then
+      rm -f "$tmp" 2>/dev/null || true
+      reason="cannot write $out"
+    fi
+  fi
+  if [ -n "$reason" ]; then
+    echo "${LFM3_AGENT_NAME:-lfm3-agent}: no speech: $reason" >&2
+  fi
+  return 0
+}
+
 one_turn() { # message
   local text=$1 round=0 with calls i id name args result looped
   if [ -z "$text" ] && [ "$(jq length "$work/parts")" -eq 0 ]; then
@@ -644,6 +705,9 @@ one_turn() { # message
   cat "$work/answer"
   if [ -n "$looped" ]; then
     echo "(Stopped: the model kept repeating itself. Ask again, or start over with --new.)"
+  fi
+  if [ -n "$speak_file" ]; then
+    speak_answer "$work/answer" "$speak_file"
   fi
 }
 
