@@ -176,11 +176,14 @@ kinds of room:
 - **Speech.** `--speak FILE` answers in text as usual, then sends the answer
   to llama-server's `/tts` and writes the WAV to FILE: RIFF, PCM 16-bit,
   mono, 24,000 Hz, default (female) voice. Markdown marks are taken out
-  first: Audio read a `## ` heading as made-up words. If speech fails, FILE
+  first: Audio read a `## ` heading as made-up words. Each sentence is its own
+  `/tts` request and the pieces are joined into one WAV with real sizes: spoken
+  in one request, Omni's 138-word rap came back 71% heard and cut at 60 s,
+  against 98% heard and 51 s one sentence at a time. If speech fails, FILE
   is removed, one line `liquid: no speech: <reason>` goes to stderr, and the
   text answer and exit code stand. VL and the text-only models cannot speak
   and say so on that line. Speech stops at `LFM3_SPEAK_FRAMES` 80 ms frames
-  (default 750, 60 s). Measured in sealed 2 vCPU rooms (5 Nov 2026): one
+  for the whole answer (default 750, 60 s). Measured in sealed 2 vCPU rooms (5 Nov 2026): one
   sentence (about 3 s of speech) took 5.5 to 6.2 s on Audio and 4.5 to 5.2 s
   on Omni, three sentences (about 9 s) 15.7 s and 11.1 s, plus 65 to 85 MB of
   memory while it runs. Audio heard every WAV back as the words sent.

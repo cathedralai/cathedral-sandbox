@@ -79,7 +79,8 @@ class FakeModel:
         # /slots/0?action=save|restore calls, and the status they answer.
         self.slot_calls: list[str] = []
         self.slot_status = 200
-        # POST /tts: the requests, and the next reply (WAV bytes, or a status code).
+        # POST /tts: the requests, and the reply (WAV bytes or a status code; a
+        # list gives one reply per request, then FAKE_WAV).
         self.tts_requests: list[dict[str, Any]] = []
         self.tts_reply: Any = FAKE_WAV
         model = self
@@ -108,6 +109,8 @@ class FakeModel:
                 if self.path == "/tts":
                     model.tts_requests.append(body)
                     reply = model.tts_reply
+                    if isinstance(reply, list):
+                        reply = reply.pop(0) if reply else FAKE_WAV
                     if isinstance(reply, int):
                         self._send(reply, {"error": {"code": reply, "message": "this server does not support audio generation"}})
                         return
@@ -367,7 +370,15 @@ def test_a_poem_with_a_short_refrain_is_left_alone(fake: FakeModel, room: Any) -
 JSON_LINE = "When you are asked for JSON, output valid JSON only, no comments."
 
 
-def test_speak_writes_the_answer_as_a_wav(fake: FakeModel, room: Any) -> None:
+def wav_info(path: Path) -> tuple[int, int, int, int]:
+    """rate, channels, sample width and frames, read by Python's wave module (real sizes only)."""
+    raw = path.read_bytes()
+    assert int.from_bytes(raw[4:8], "little") == len(raw) - 8 and int.from_bytes(raw[40:44], "little") == len(raw) - 44
+    with wave.open(str(path)) as w:
+        return w.getframerate(), w.getnchannels(), w.getsampwidth(), w.getnframes()
+
+
+def test_speak_writes_the_answer_as_one_wav_made_one_sentence_at_a_time(fake: FakeModel, room: Any) -> None:
     fake.replies = [answer("The yellow fruit is the **banana**.\n- `mango`\n## Done")]
     wav = room.work / "talk-reply.wav"
     out = room("--speak", str(wav), "which", "fruit", "is", "yellow", script=LIQUID, MODEL="lfm3-audio-2b")
@@ -375,10 +386,32 @@ def test_speak_writes_the_answer_as_a_wav(fake: FakeModel, room: Any) -> None:
     # The text answer is printed exactly as without --speak.
     assert out.stdout == "The yellow fruit is the **banana**.\n- `mango`\n## Done\n"
     assert "no speech" not in out.stderr
-    assert wav.read_bytes() == FAKE_WAV
-    # Markdown marks are not spoken; each line is a phrase. The frame cap is 60 s.
-    assert fake.tts_requests == [{"input": "The yellow fruit is the banana. mango. Done.", "n_predict": 750}]
+    # Markdown marks are not spoken; each line is a phrase; one request per
+    # sentence, under one 750-frame (60 s) cap: a 0.1 s piece uses 2 frames.
+    assert fake.tts_requests == [
+        {"input": "The yellow fruit is the banana.", "n_predict": 750},
+        {"input": "mango.", "n_predict": 748},
+        {"input": "Done.", "n_predict": 746},
+    ]
+    # One WAV with real sizes: the three pieces' samples, back to back.
+    assert wav_info(wav) == (24000, 1, 2, 3 * 2400)
+    assert wav.read_bytes()[44:] == FAKE_WAV[44:] * 3
     assert not list(room.work.glob("*.partial.*"))
+
+
+def test_speak_keeps_numbers_and_file_names_in_one_sentence(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("The file data.csv is 4.5 KB! Next: run it")]
+    assert room("--speak", str(room.work / "r.wav"), "--no-tools", "size?").returncode == 0
+    assert [r["input"] for r in fake.tts_requests] == ["The file data.csv is 4.5 KB!", "Next:", "run it."]
+
+
+def test_speak_stops_at_the_frame_cap(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("One. Two. Three.")]
+    wav = room.work / "r.wav"
+    assert room("--speak", str(wav), "--no-tools", "count", LFM3_SPEAK_FRAMES="3").returncode == 0
+    # 3 frames: the first piece uses 2, the second gets the last 1, the third is not asked for.
+    assert [(r["input"], r["n_predict"]) for r in fake.tts_requests] == [("One.", 3), ("Two.", 1)]
+    assert wav_info(wav)[3] == 2 * 2400
 
 
 def test_speak_says_only_what_the_guard_kept(fake: FakeModel, room: Any) -> None:
@@ -387,6 +420,16 @@ def test_speak_says_only_what_the_guard_kept(fake: FakeModel, room: Any) -> None
     out = room("--no-tools", "--speak", str(wav), "rhyme with me", LFM3_SPEAK_FRAMES="100")
     assert out.stdout.strip().splitlines() == ["Glow, shine, sing, bloom", LOOP_NOTE]
     assert fake.tts_requests == [{"input": "Glow, shine, sing, bloom.", "n_predict": 100}]
+
+
+def test_a_failed_sentence_fails_the_whole_speech(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("One. Two. Three.")]
+    fake.tts_reply = [FAKE_WAV, 500]
+    wav = room.work / "r.wav"
+    out = room("--speak", str(wav), "--no-tools", "count")
+    assert out.returncode == 0 and out.stdout == "One. Two. Three.\n"
+    assert out.stderr.strip().startswith("lfm3-agent: no speech: the model server answered 500")
+    assert len(fake.tts_requests) == 2 and not wav.exists()
 
 
 @pytest.mark.parametrize(
