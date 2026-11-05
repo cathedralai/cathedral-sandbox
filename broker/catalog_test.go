@@ -121,7 +121,7 @@ func TestLFM3SuiteCatalogIsSealedOnlyAndGHCR(t *testing.T) {
 	wantImages := map[string]string{
 		"lfm3-1.7b":      pinnedImage(lfm31_7bRepo, lfm31_7bDigest),
 		"lfm3-vl-2b":     pinnedImage("ghcr.io/cathedralai/room-lfm3-vl-2b", "sha256:ef5c553961e5a6d9eba616fe4f5b2d68d46ec996f651e2011e5a09ae67f9cdc1"),
-		"lfm3-omni-2b":   pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:ae491ca68c27b9379a56af39ceac1a09db07be8b164dbc9788f8b338311789ae"),
+		"lfm3-omni-2b":   pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:c1cd3dc515402f2d5f3f7a845eac057fff3695860e7af989eee43c174bbb3eb2"),
 		"d1-2b":          pinnedImage("ghcr.io/cathedralai/room-d1-2b", "sha256:f95d88c7144642328fe85bd7f52e95e434979e64a220550fac3d0e965aca35c6"),
 		"lfm3-audio-2b":  pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:e08490ce97f35e1cfbaf9b2d0d224268576db1a4c7ae719f903c823aa0dce8ae"),
 		"d1-omni-2b":     pinnedImage("ghcr.io/cathedralai/room-d1-omni-2b", "sha256:3cb800de3d2f9bfcc69d24ab2fc659fc51eb7ed3aae2abe46d46a23f10b57abd"),
