@@ -60,6 +60,9 @@ class FakeModel:
         # The two-token tool checks (max_tokens 2), kept apart from the requests.
         self.checks: list[dict[str, Any]] = []
         self.check_status = 200
+        # /slots/0?action=save|restore calls, and the status they answer.
+        self.slot_calls: list[str] = []
+        self.slot_status = 200
         model = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -79,6 +82,10 @@ class FakeModel:
 
             def do_POST(self) -> None:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.path.startswith("/slots/"):
+                    model.slot_calls.append(f"{self.path} {body.get('filename')}")
+                    self._send(model.slot_status, {"id_slot": 0})
+                    return
                 if body.get("max_tokens") == 2:
                     # Answer like llama-server: the first two tokens of the next scripted reply.
                     model.checks.append(body)
@@ -94,6 +101,9 @@ class FakeModel:
                 reply = model.replies.pop(0) if model.replies else answer("(script ended)")
                 if isinstance(reply, int):
                     self._send(reply, {"error": {"message": "scripted failure"}})
+                    return
+                if isinstance(reply, tuple):
+                    self._send(reply[0], {"error": {"code": reply[0], "message": reply[1]}})
                     return
                 self._send(200, {"choices": [{"index": 0, "message": reply, "finish_reason": "stop"}]})
 
@@ -260,6 +270,42 @@ def test_other_models_are_not_checked(fake: FakeModel, room: Any) -> None:
     fake.replies = [answer("Hi.")]
     assert room("Hello.", MODEL="lfm3-vl-2b").returncode == 0
     assert fake.checks == []
+
+
+FINAL_LINE = "Now answer my message in text, without tools."
+
+
+def test_the_last_round_after_tools_asks_for_text_and_does_not_keep_the_ask(fake: FakeModel, room: Any) -> None:
+    fake.replies = [tool_call("run", {"command": "true"}), tool_call("run", {"command": "true"}), answer("Done.")]
+    out = room("Keep going.", LFM3_AGENT_STEPS="2")
+    assert out.returncode == 0 and out.stdout.strip() == "Done."
+    first, second, final = fake.requests
+    assert "tools" not in final and messages(final)[-1] == {"role": "user", "content": FINAL_LINE}
+    assert all(m.get("content") != FINAL_LINE for m in messages(first) + messages(second))
+    assert all(m.get("content") != FINAL_LINE for m in history(room))
+
+
+def test_a_tool_call_the_server_cannot_parse_is_answered_without_tools(fake: FakeModel, room: Any) -> None:
+    # A heredoc that looped to the token cap leaves the call's JSON unclosed (ADO 551).
+    fake.replies = [(500, "Failed to parse tool call arguments as JSON: missing closing quote"), answer("Here is your rap.")]
+    out = room("make a rap and say it out loud")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "Here is your rap."
+    failed, final = fake.requests
+    assert "tools" in failed and "tools" not in final
+    assert history(room)[-1] == {"role": "assistant", "content": "Here is your rap."}
+
+
+def test_other_server_errors_still_fail_the_turn(fake: FakeModel, room: Any) -> None:
+    fake.replies = [(500, "something else")]
+    out = room("Hello.")
+    assert out.returncode == 1 and "answered 500" in out.stderr
+
+
+def test_a_blank_answer_says_so(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("  \n\n ")]
+    out = room("Hello.")
+    assert out.returncode == 0 and out.stdout.strip() == "(the model gave no answer)"
 
 LOOP_NOTE = "(Stopped: the model kept repeating itself. Ask again, or start over with --new.)"
 
@@ -514,6 +560,42 @@ def test_warm_leaves_an_existing_conversation_alone(fake: FakeModel, room: Any) 
     before = (history(room), (room.state / "system.txt").read_text())
     assert room("--warm").returncode == 0
     assert (history(room), (room.state / "system.txt").read_text()) == before
+
+
+def test_warm_saves_the_state_at_build_and_restores_it_at_boot(fake: FakeModel, room: Any, tmp_path: Path) -> None:
+    slots = tmp_path / "cache"
+    slots.mkdir()
+    out = room("--warm", LFM3_SLOT_DIR=str(slots), LFM3_WARM_SAVE="1")
+    assert out.returncode == 0 and "saved" in out.stdout, out.stderr
+    assert len(fake.requests) == 1 and fake.slot_calls == ["/slots/0?action=save warm.bin"]
+    assert len((slots / "warm.sha256").read_text().strip()) == 64
+
+    (slots / "warm.bin").write_bytes(b"state")  # llama-server writes this file on save
+    fake.slot_calls.clear()
+    out = room("--warm", LFM3_SLOT_DIR=str(slots))
+    assert out.returncode == 0 and "restored" in out.stdout
+    assert fake.slot_calls == ["/slots/0?action=restore warm.bin"] and len(fake.requests) == 1  # nothing read again
+
+
+def test_warm_reads_the_prompt_when_the_saved_state_is_for_another_request(fake: FakeModel, room: Any, tmp_path: Path) -> None:
+    slots = tmp_path / "cache"
+    slots.mkdir()
+    (slots / "warm.bin").write_bytes(b"state")
+    (slots / "warm.sha256").write_text("0" * 64 + "\n")
+    out = room("--warm", LFM3_SLOT_DIR=str(slots))
+    assert out.returncode == 0 and "HTTP 200" in out.stdout
+    assert fake.slot_calls == [] and len(fake.requests) == 1
+
+
+def test_warm_reads_the_prompt_when_the_restore_fails(fake: FakeModel, room: Any, tmp_path: Path) -> None:
+    slots = tmp_path / "cache"
+    slots.mkdir()
+    assert room("--warm", LFM3_SLOT_DIR=str(slots), LFM3_WARM_SAVE="1").returncode == 0
+    (slots / "warm.bin").write_bytes(b"state")
+    fake.slot_status = 500
+    out = room("--warm", LFM3_SLOT_DIR=str(slots))
+    assert out.returncode == 0 and "restore answered 500" in out.stdout and "HTTP 200" in out.stdout
+    assert len(fake.requests) == 2
 
 # liquid: the friendly name for lfm3-agent.
 

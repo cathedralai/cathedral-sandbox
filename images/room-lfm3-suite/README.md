@@ -82,9 +82,13 @@ ReadTimeout", while the image pulled); the third ran.
 The entrypoint is `lfm3-serve`. It starts `llama-server` on `127.0.0.1:8080`,
 OpenAI-compatible at `/v1`, then runs the sandbox command (the keepalive
 `sleep infinity`); with no command the server runs in the foreground. For a
-chat model it also reads `lfm3-agent`'s system prompt and tools into the
+chat model it also puts `lfm3-agent`'s system prompt and tools in the
 server's cache once the model is loaded (`lfm3-agent --warm`, log
-`/tmp/lfm3/warm.log`). The
+`/tmp/lfm3/warm.log`). The image carries that cache, saved at build by
+`lfm3-prewarm` in `/opt/lfm3/cache`, and the warm-up restores it in about
+15 ms when its request is the same (the request's sha256 is saved beside it).
+Otherwise it reads the prompt, about 4.7 s on 2 vCPUs. Measured in a sealed
+room (5 Nov 2026): ready 2.4 s after the server starts instead of 7 to 10 s. The
 log is `/tmp/lfm3/server.log`; `/health` answers 200 once the model is
 loaded. The image sets the variables an agent reads to find its model, as the
 LFM3-1.7B images do:

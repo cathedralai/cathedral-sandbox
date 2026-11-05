@@ -65,3 +65,25 @@ def test_decision_models_keep_their_flags_and_are_not_warmed(tmp_path: Path) -> 
     args, agent = _serve(tmp_path, MODEL="d1-2b", LFM3_KIND="decision")
     assert "--swa-full" not in args and "--batch-size" in args
     assert agent == ""
+
+
+def test_chat_models_serve_the_saved_prompt_cache_directory(tmp_path: Path) -> None:
+    slots = tmp_path / "cache"
+    slots.mkdir()
+    args, _ = _serve(tmp_path, MODEL="lfm3-omni-2b", LFM3_KIND="chat", LFM3_SLOT_DIR=str(slots))
+    assert args[args.index("--slot-save-path") + 1] == str(slots)
+
+
+def test_no_slot_directory_means_no_slot_flag(tmp_path: Path) -> None:
+    args, _ = _serve(tmp_path, MODEL="lfm3-omni-2b", LFM3_KIND="chat", LFM3_SLOT_DIR=str(tmp_path / "missing"))
+    assert "--slot-save-path" not in args
+
+
+def test_the_image_saves_the_warm_cache_for_chat_models_only() -> None:
+    dockerfile = (SERVE.parent / "Dockerfile").read_text(encoding="utf-8")
+    assert "lfm3-prewarm" in dockerfile.split("COPY lfm3-serve", 1)[1].splitlines()[0]
+    step = "\n      lfm3-prewarm; \\"
+    run = dockerfile.split(step, 1)[0].rsplit("RUN", 1)[1]
+    assert '"${LFM3_KIND}" = chat' in run and '"${MODEL_NAME%-base}" = "${MODEL_NAME}"' in run
+    # The model settings the room boots with are in place before the cache is saved.
+    assert dockerfile.index("ENV LFM3_MODEL=") < dockerfile.index(step)
