@@ -37,11 +37,11 @@ here. Spoken answers are: `liquid --speak` in Audio and Omni rooms (below).
 
 Base, VL, Omni, d1 and d1-Omni are published from commit `01f56b8` (#392:
 per-model sampling, the loop guard, tool-call markup parsed; run
-41887832793). Audio is published from commit `8d2e02c` (#397, run 41935145792):
-`liquid --json`, greedy plus frequency penalty 0.3, and its blocking
-`json-flag` gate (ADO 547). Omni is published from commit `393bd3f` (#401, run
-41945050466): llama-server `--swa-full` and the boot warm-up (ADO 549), and
-answers sampled after a greedy tool check (ADO 550). Run
+41887832793). Audio and Omni are published from commit `8bd4290` (#405, run
+41961230734): `liquid --speak` with its blocking `speak` gate (ADO 552) and
+the warm cache saved in the image (#403, #405), on top of `liquid --json` and
+greedy plus frequency penalty 0.3 for Audio (ADO 547) and `--swa-full` with
+answers sampled after a greedy tool check for Omni (ADO 549, 550). Run
 summaries have the commit tags. All six packages are public; anonymous pull
 checked.
 
@@ -49,8 +49,8 @@ checked.
 |---|---|
 | `lfm3-1.7b-base` | `ghcr.io/cathedralai/room-lfm3-1.7b-base@sha256:810911016ac6ea1ddeba1bba4dc157e0c3d4252201e64d3279876e57dce344a8` |
 | `lfm3-vl-2b` | `ghcr.io/cathedralai/room-lfm3-vl-2b@sha256:ef5c553961e5a6d9eba616fe4f5b2d68d46ec996f651e2011e5a09ae67f9cdc1` |
-| `lfm3-audio-2b` | `ghcr.io/cathedralai/room-lfm3-audio-2b@sha256:e08490ce97f35e1cfbaf9b2d0d224268576db1a4c7ae719f903c823aa0dce8ae` |
-| `lfm3-omni-2b` | `ghcr.io/cathedralai/room-lfm3-omni-2b@sha256:03083042a84d67094bddbeea06bf9eeedbe41f13194b9325aeb3fe166e603d2d` |
+| `lfm3-audio-2b` | `ghcr.io/cathedralai/room-lfm3-audio-2b@sha256:b341f80f3301cceef05b59ddaf058210a92b58b920e013fc4a8fbb402eda2772` |
+| `lfm3-omni-2b` | `ghcr.io/cathedralai/room-lfm3-omni-2b@sha256:860d50d453718e380b11f2b377e0617c5c95c43c25d421b236ea57adacd90b03` |
 | `d1-2b` | `ghcr.io/cathedralai/room-d1-2b@sha256:f95d88c7144642328fe85bd7f52e95e434979e64a220550fac3d0e965aca35c6` |
 | `d1-omni-2b` | `ghcr.io/cathedralai/room-d1-omni-2b@sha256:3cb800de3d2f9bfcc69d24ab2fc659fc51eb7ed3aae2abe46d46a23f10b57abd` |
 
