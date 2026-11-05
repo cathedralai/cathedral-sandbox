@@ -7,9 +7,10 @@
 // LFM3 names and images match cathedralai/cathedral sandbox_models/catalog.py. Suite digests
 // from cathedral-sandbox #361 (each proven sealed on prod at 2 vCPU / 4 GiB, 29 Oct 2026);
 // Base, VL, d1 and d1-Omni are the #392 builds (per-model sampling, loop guard, tool-call
-// markup parsed; ADO 523); Audio is its #397 build (liquid --json, greedy plus frequency 0.3, ADO 547);
-// Omni is its #401 build (--swa-full and a boot warm-up, ADO 549; sampled answers, ADO 550).
-// Prefetched on c46-sealed-2, nc-sealed-2 and nc-sealed-3 before each pin (4 Nov 2026).
+// markup parsed; ADO 523); Audio and Omni are their #405 builds (main 8bd4290): liquid --speak
+// (ADO 552) and the warm cache saved in the image (#403, #405) on top of liquid --json for Audio
+// (ADO 547) and --swa-full with sampled answers for Omni (ADO 549, 550).
+// Prefetched on c46-sealed-2, nc-sealed-2 and nc-sealed-3 before each pin (5 Nov 2026).
 // A suite model is sealed ready only once its image is prefetched on every shared sealed hotel
 // (all six: c46-sealed-2, nc-sealed-2, nc-sealed-3, 6 of 6 each, 29 Oct 2026 11:40Z).
 // LFM templates are sealed-only (AMD SEV-SNP). A pending sealed offer refuses
@@ -102,7 +103,7 @@ var catalogTemplates = []catalogTemplate{
 		Name: "lfm3-omni-2b", DisplayName: "LFM3 Omni 2B (CPU)",
 		Description: "LFM3 2.17B on CPU via llama.cpp b11960 (LFM3-Omni-2B-Q4_K_M.gguf). Sandbox inputs: text, image, audio. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
-		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:03083042a84d67094bddbeea06bf9eeedbe41f13194b9325aeb3fe166e603d2d"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:860d50d453718e380b11f2b377e0617c5c95c43c25d421b236ea57adacd90b03"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "d1-2b", DisplayName: "d1 2B (CPU)",
@@ -114,7 +115,7 @@ var catalogTemplates = []catalogTemplate{
 		Name: "lfm3-audio-2b", DisplayName: "LFM3 Audio 2B (CPU)",
 		Description: "LFM3 2B on CPU via llama.cpp b11960 (LFM3-Audio-2B-Q4_K_M.gguf). Sandbox inputs: text, audio. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
-		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:e08490ce97f35e1cfbaf9b2d0d224268576db1a4c7ae719f903c823aa0dce8ae"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:b341f80f3301cceef05b59ddaf058210a92b58b920e013fc4a8fbb402eda2772"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "d1-omni-2b", DisplayName: "d1 Omni 2B (CPU)",
