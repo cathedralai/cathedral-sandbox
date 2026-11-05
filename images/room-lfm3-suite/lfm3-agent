@@ -127,6 +127,11 @@ ANSWER_SAMPLING=${LFM3_AGENT_ANSWER_SAMPLING-$default_answer}
 # the grammar alone (where Audio wanted a // comment it wrote a number and
 # closed the list), 12 of 12 with the line too. The line alone: 5 of 6.
 JSON_FORMAT='{"type": "json_schema", "json_schema": {"name": "answer", "schema": {"type": ["object", "array"]}}}'
+# The last round of a turn that ran tools offers no tools. Without a word, Omni
+# often answered it with nothing after four rounds of looking for a speech tool
+# (ADO 551), so that request ends with this line. It is not kept in the
+# conversation.
+FINAL_LINE='Now answer my message in text, without tools.'
 JSON_LINE='When you are asked for JSON, output valid JSON only, no comments.'
 STEPS=${LFM3_AGENT_STEPS:-4}
 CMD_TIMEOUT=${LFM3_AGENT_CMD_TIMEOUT:-60}
@@ -390,7 +395,7 @@ build_body() { # with-tools [max-tokens] [sampling]
     --slurpfile turn "$work/turn" --slurpfile media "$media" --slurpfile parts "$work/parts" \
     --argjson room "$CONTEXT_CHARS" --arg model "$MODEL_NAME" --argjson n "$n" \
     --argjson tools "$TOOLS" --arg with_tools "$1" --argjson sampling "$sampling" \
-    --arg json "$json" --argjson format "$JSON_FORMAT" --arg json_line "$JSON_LINE" '
+    --arg json "$json" --argjson format "$JSON_FORMAT" --arg json_line "$JSON_LINE" --arg final_line "$FINAL_LINE" '
     def drop_turn: (.[1:] | map(.role == "user") | index(true)) as $i
       | if $i == null then [] else .[($i + 1):] end;
     def fit($room): if length == 0 or (tojson | length) <= $room then . else (drop_turn | fit($room)) end;
@@ -403,7 +408,8 @@ build_body() { # with-tools [max-tokens] [sampling]
        | map(del(.media))) as $kept
     | {
         model: $model,
-        messages: ([{role: "system", content: ($sys + (if $json == "1" then "\n" + $json_line else "" end))}] + $kept + ($sent[0] | map(del(.media))) + $turn[0]),
+        messages: ([{role: "system", content: ($sys + (if $json == "1" then "\n" + $json_line else "" end))}] + $kept + ($sent[0] | map(del(.media))) + $turn[0]
+          + (if $with_tools != "1" and ($turn[0] | length) > 0 then [{role: "user", content: $final_line}] else [] end)),
         max_tokens: $n
       }
     + $sampling
@@ -418,6 +424,11 @@ ask_model() { # with-tools [sampling]: the reply message goes to $work/msg
     -H 'Content-Type: application/json' -H "Authorization: Bearer ${MODEL_API_KEY:-local}" \
     --data-binary @"$work/body" "$BASE_URL/chat/completions" >"$work/code" || status=$?
   code=$(cat "$work/code" 2>/dev/null || true)
+  # A tool call whose arguments ran past the token cap (a looping heredoc, ADO
+  # 551) comes back as a 500. The caller answers without tools instead.
+  if [ "$1" = 1 ] && [ "$code" = 500 ] && grep -q 'parse tool call' "$work/out" 2>/dev/null; then
+    return 3
+  fi
   if [ "$status" -ne 0 ] || [ "$code" != 200 ]; then
     head -c 2000 "$work/out" >&2 2>/dev/null || true
     echo >&2
@@ -456,9 +467,20 @@ ask_model() { # with-tools [sampling]: the reply message goes to $work/msg
       else . end' "$work/out" >"$work/msg"
 }
 
+slot_call() { # save | restore: the server's slot 0 and $LFM3_SLOT_DIR/warm.bin; prints the HTTP status
+  curl -sS --max-time 60 -o /dev/null -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/json' -H "Authorization: Bearer ${MODEL_API_KEY:-local}" \
+    -d '{"filename": "warm.bin"}' "${BASE_URL%/v1}/slots/0?action=$1" 2>/dev/null || true
+}
+
 # --warm: read the default system prompt and the tool list into the server's
 # cache. The next message shares that prefix, so only its own words are read.
+# lfm3-prewarm (image build, LFM3_WARM_SAVE=1) saves the state with the
+# request's sha256; at boot the same request restores it in about 15 ms
+# instead of reading the prompt (about 4.7 s in a sealed 2 vCPU room, 5 Nov
+# 2026). A different request (another system prompt, model or sampling) reads.
 warm_cache() {
+  local slot_dir=${LFM3_SLOT_DIR:-/opt/lfm3/cache} sum code
   SYSTEM_FILE=$work/system HISTORY=$work/history MEDIA_FILE=$work/no_media
   default_system >"$SYSTEM_FILE"
   echo '[]' >"$HISTORY"
@@ -467,9 +489,27 @@ warm_cache() {
   echo '[]' >"$work/turn"
   wait_for_server
   build_body 1 1
+  sum=$(sha256sum "$work/body" | cut -d' ' -f1)
+  if [ -z "${LFM3_WARM_SAVE:-}" ] && [ -s "$slot_dir/warm.bin" ] && [ "$(cat "$slot_dir/warm.sha256" 2>/dev/null)" = "$sum" ]; then
+    code=$(slot_call restore)
+    if [ "$code" = 200 ]; then
+      echo "lfm3-agent --warm: restored"
+      return
+    fi
+    echo "lfm3-agent --warm: restore answered $code; reading the prompt"
+  fi
   echo "lfm3-agent --warm: HTTP $(curl -sS --max-time "${LFM3_TIMEOUT:-600}" -o /dev/null -w '%{http_code}' \
     -H 'Content-Type: application/json' -H "Authorization: Bearer ${MODEL_API_KEY:-local}" \
     --data-binary @"$work/body" "$BASE_URL/chat/completions" || true)"
+  if [ -n "${LFM3_WARM_SAVE:-}" ]; then
+    code=$(slot_call save)
+    if [ "$code" != 200 ]; then
+      echo "lfm3-agent --warm: save answered $code" >&2
+      exit 1
+    fi
+    echo "$sum" >"$slot_dir/warm.sha256"
+    echo "lfm3-agent --warm: saved"
+  fi
 }
 
 # Does this round start with a tool call? Two greedy tokens tell: Omni starts
@@ -552,7 +592,10 @@ one_turn() { # message
     else
       with=0
     fi
-    ask_model "$with" "$(round_sampling "$with")"
+    if ! ask_model "$with" "$(round_sampling "$with")"; then
+      round=$STEPS
+      continue
+    fi
     calls=$(jq '(.tool_calls // []) | length' "$work/msg")
     if [ "$calls" -eq 0 ] || [ -z "$tools" ] || [ "$round" -ge "$STEPS" ]; then
       break
@@ -576,7 +619,8 @@ one_turn() { # message
   done
 
   jq -r '.content // ""' "$work/msg" >"$work/answer"
-  [ -s "$work/answer" ] || echo "(the model gave no answer)" >"$work/answer"
+  # A reply of only spaces or newlines is no answer either (ADO 551).
+  grep -q '[^[:space:]]' "$work/answer" || echo "(the model gave no answer)" >"$work/answer"
   # A --json answer that parses is kept whole: a list repeats its keys, and a
   # list with one value in every item reads as a loop and would be cut.
   looped=""

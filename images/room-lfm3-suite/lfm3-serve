@@ -16,6 +16,8 @@
 #   LFM3_REASONING   off (default, short answers) or on
 #   LFM3_CACHE_RAM   prompt cache in MiB (default 256; the server's own
 #                    default of 8 GiB does not fit a 4 GiB room)
+#   LFM3_SLOT_DIR    saved prompt cache (default /opt/lfm3/cache, written at
+#                    image build by lfm3-prewarm)
 #   LFM3_BATCH       d1 only: batch and micro-batch size (default 4096). A
 #                    question is read in one batch; a picture takes at most
 #                    half of it.
@@ -49,6 +51,13 @@ else
     --cache-ram "${LFM3_CACHE_RAM:-256}"
     --swa-full
   )
+fi
+
+# lfm3-prewarm saves the warm prompt cache here at image build; lfm3-agent
+# --warm restores it at boot.
+slot_dir=${LFM3_SLOT_DIR:-/opt/lfm3/cache}
+if [ "${LFM3_KIND:-chat}" = chat ] && [ -d "$slot_dir" ]; then
+  args+=(--slot-save-path "$slot_dir")
 fi
 
 if [ "$#" -eq 0 ]; then
