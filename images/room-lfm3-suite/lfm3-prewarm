@@ -10,7 +10,28 @@ set -euo pipefail
 slot_dir=${LFM3_SLOT_DIR:-/opt/lfm3/cache}
 mkdir -p "$slot_dir"
 tmp=$(mktemp -d)
-LFM3_SLOT_DIR=$slot_dir lfm3-serve >"$tmp/server.log" 2>&1 &
+
+# Compute the cache with the CPU code and thread count the sealed hotels run:
+# their guests have AVX2 without AVX-512, so llama.cpp loads its haswell
+# variant there, on 2 vCPUs. A state computed by the build machine's own
+# variant has slightly different numbers, and on 5 Nov that tipped Omni's
+# greedy tool-or-answer choice on "write a four line rap" (a heredoc first,
+# 8.0 s, instead of the answer, 3.4 s). llama.cpp loads CPU variants from the
+# directory of the running binary, so the server runs from a copy of
+# /opt/llama/bin that holds only that variant.
+variant=${LFM3_PREWARM_CPU:-haswell}
+bin=$tmp/bin
+mkdir -p "$bin"
+for f in /opt/llama/bin/*; do
+  name=${f##*/}
+  case "$name" in
+    libggml-cpu-*.so) [ "$name" = "libggml-cpu-$variant.so" ] || continue ;;
+  esac
+  cp -a "$f" "$bin/"
+done
+test -e "$bin/libggml-cpu-$variant.so"
+
+PATH=$bin:$PATH LFM3_THREADS=${LFM3_PREWARM_THREADS:-2} LFM3_SLOT_DIR=$slot_dir lfm3-serve >"$tmp/server.log" 2>&1 &
 pid=$!
 trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
 
@@ -20,3 +41,5 @@ if ! LFM3_SLOT_DIR=$slot_dir LFM3_WARM_SAVE=1 LFM3_AGENT_DIR=$tmp/agent LFM3_AGE
   exit 1
 fi
 test -s "$slot_dir/warm.bin" && test -s "$slot_dir/warm.sha256"
+# The build log shows which CPU code computed the state.
+grep -i -E "cpu.*(variant|backend)|libggml-cpu" "$tmp/server.log" | head -n 3 || true
