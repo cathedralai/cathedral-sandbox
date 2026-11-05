@@ -27,6 +27,8 @@
 #   --json         answer in JSON only, with no tools: the server holds the reply
 #                  to JSON syntax (a grammar), so it parses unless it hits the
 #                  token cap (LFM3_MAX_TOKENS)
+#   --warm         read the default system prompt and tools into the model
+#                  server's cache and exit (lfm3-serve runs it once at boot)
 #   -              read the message from stdin
 #
 # Environment:
@@ -36,11 +38,10 @@
 #   LFM3_AGENT_CMD_TIMEOUT    seconds per command (default 60)
 #   LFM3_AGENT_OUTPUT_CHARS   tool output kept per call (default 2000)
 #   LFM3_AGENT_CONTEXT_CHARS  older turns are dropped past this size (default
-#                             4000). Every turn re-reads the whole conversation:
-#                             llama-server keeps no prompt cache for LFM3's
-#                             hybrid layers (cache_n 0 even on a repeated
-#                             request, b11960), so a longer memory is a slower
-#                             reply.
+#                             4000). The kept conversation is read from
+#                             llama-server's prompt cache (lfm3-serve runs it
+#                             with --swa-full), so only new text costs time,
+#                             until old turns are dropped.
 #   LFM3_MAX_TOKENS           tokens per reply (default 512)
 #   LFM3_AGENT_SAMPLING       sampling fields for llama-server, a JSON object
 #                             (default: per model, see SAMPLING)
@@ -189,6 +190,7 @@ prompt=""
 tools=1
 json=""
 fresh=""
+warm=""
 
 add_part() { # kind file
   [ -r "$2" ] || { echo "lfm3-agent: cannot read $2" >&2; exit 2; }
@@ -237,6 +239,10 @@ while [ "$#" -gt 0 ]; do
       fresh=1
       shift
       ;;
+    --warm)
+      warm=1
+      shift
+      ;;
     --no-tools)
       tools=""
       shift
@@ -268,12 +274,15 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-[ -z "$fresh" ] || forget
-[ -s "$HISTORY" ] || echo '[]' >"$HISTORY"
-if [ -n "$system" ]; then
-  printf '%s' "$system" >"$SYSTEM_FILE"
-elif [ ! -s "$SYSTEM_FILE" ]; then
-  default_system >"$SYSTEM_FILE"
+# --warm (lfm3-serve, once at boot) leaves the kept conversation alone.
+if [ -z "$warm" ]; then
+  [ -z "$fresh" ] || forget
+  [ -s "$HISTORY" ] || echo '[]' >"$HISTORY"
+  if [ -n "$system" ]; then
+    printf '%s' "$system" >"$SYSTEM_FILE"
+  elif [ ! -s "$SYSTEM_FILE" ]; then
+    default_system >"$SYSTEM_FILE"
+  fi
 fi
 
 wait_for_server() {
@@ -345,13 +354,14 @@ run_tool() { # name arguments-json: prints the result the model reads
 # fit CONTEXT_CHARS (whole turns, oldest dropped first), this message with its
 # media, and the tool calls of this turn so far. Without new media, the last
 # picture or clip goes back on the message that brought it, if that is kept.
-build_body() { # with-tools
+build_body() { # with-tools [max-tokens]
+  local n=${2:-$MAX_TOKENS}
   local media=$MEDIA_FILE
   [ -s "$media" ] || media=$work/no_media
   jq -n --rawfile sys "$SYSTEM_FILE" --slurpfile hist "$HISTORY" \
     --slurpfile stored "$work/user_stored" --slurpfile sent "$work/user_sent" \
     --slurpfile turn "$work/turn" --slurpfile media "$media" --slurpfile parts "$work/parts" \
-    --argjson room "$CONTEXT_CHARS" --arg model "$MODEL_NAME" --argjson n "$MAX_TOKENS" \
+    --argjson room "$CONTEXT_CHARS" --arg model "$MODEL_NAME" --argjson n "$n" \
     --argjson tools "$TOOLS" --arg with_tools "$1" --argjson sampling "$SAMPLING" \
     --arg json "$json" --argjson format "$JSON_FORMAT" --arg json_line "$JSON_LINE" '
     def drop_turn: (.[1:] | map(.role == "user") | index(true)) as $i
@@ -417,6 +427,22 @@ ask_model() { # with-tools: the reply message goes to $work/msg
           elif $rest == "" then .content = "(The model tried to call a tool, but the call could not be read.)"
           else .content = $rest end
       else . end' "$work/out" >"$work/msg"
+}
+
+# --warm: read the default system prompt and the tool list into the server's
+# cache. The next message shares that prefix, so only its own words are read.
+warm_cache() {
+  SYSTEM_FILE=$work/system HISTORY=$work/history MEDIA_FILE=$work/no_media
+  default_system >"$SYSTEM_FILE"
+  echo '[]' >"$HISTORY"
+  echo '[{"role": "user", "content": "hi"}]' >"$work/user_stored"
+  cp "$work/user_stored" "$work/user_sent"
+  echo '[]' >"$work/turn"
+  wait_for_server
+  build_body 1 1
+  echo "lfm3-agent --warm: HTTP $(curl -sS --max-time "${LFM3_TIMEOUT:-600}" -o /dev/null -w '%{http_code}' \
+    -H 'Content-Type: application/json' -H "Authorization: Bearer ${MODEL_API_KEY:-local}" \
+    --data-binary @"$work/body" "$BASE_URL/chat/completions" || true)"
 }
 
 # The answer, cut where it starts to repeat. A loop is one unit repeated many
@@ -520,6 +546,11 @@ one_turn() { # message
     echo "(Stopped: the model kept repeating itself. Ask again, or start over with --new.)"
   fi
 }
+
+if [ -n "$warm" ]; then
+  warm_cache
+  exit 0
+fi
 
 if [ -z "$prompt" ] && [ "$(jq length "$work/parts")" -eq 0 ]; then
   if [ -t 0 ]; then

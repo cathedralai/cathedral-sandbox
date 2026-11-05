@@ -411,6 +411,32 @@ def test_image_ships_the_agent_and_liquid() -> None:
     assert "/usr/local/bin/lfm3-agent" in dockerfile and "/usr/local/bin/liquid" in dockerfile
 
 
+
+def test_warm_reads_the_first_message_prefix_and_keeps_no_conversation(fake: FakeModel, room: Any) -> None:
+    """lfm3-serve runs --warm at boot so the first message starts from the server's cache."""
+    out = room("--warm")
+    assert out.returncode == 0, out.stderr
+    assert "HTTP 200" in out.stdout
+    assert not (room.state / "history.json").exists() and not (room.state / "system.txt").exists()
+
+    fake.replies = [answer("Hello.")]
+    assert room("What can you do?").returncode == 0
+    warm, first = fake.requests
+    assert warm["max_tokens"] == 1 and first["max_tokens"] == 512
+    # The cached prefix is the system prompt and the tool list; only the user's words differ.
+    assert messages(warm)[0] == messages(first)[0]
+    assert warm["tools"] == first["tools"]
+    assert [m["role"] for m in messages(warm)] == ["system", "user"]
+    assert history(room) == [{"role": "user", "content": "What can you do?"}, {"role": "assistant", "content": "Hello."}]
+
+
+def test_warm_leaves_an_existing_conversation_alone(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("Hi.")]
+    assert room("--system", "Answer in French.", "Hello.").returncode == 0
+    before = (history(room), (room.state / "system.txt").read_text())
+    assert room("--warm").returncode == 0
+    assert (history(room), (room.state / "system.txt").read_text()) == before
+
 # liquid: the friendly name for lfm3-agent.
 
 

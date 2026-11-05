@@ -37,10 +37,17 @@ if [ "${LFM3_KIND:-chat}" = decision ]; then
   batch=${LFM3_BATCH:-4096}
   args+=(--ctx-size "${LFM3_SERVER_CTX:-8192}" --batch-size "$batch" --ubatch-size "$batch")
 else
+  # --swa-full: LFM3 attends over a 256-token sliding window, and with the
+  # default window-sized cache llama-server b11960 judges every saved state of
+  # the prompt unusable, so it read the whole prompt again on each request
+  # (cache_n 0 even on an identical request: 385 tokens, about 5 s on 2 CPUs,
+  # sealed room, 4 Nov 2026). With the full-size cache a repeated prefix costs
+  # a few tokens.
   args+=(
     --ctx-size "${LFM3_SERVER_CTX:-4096}"
     --reasoning "${LFM3_REASONING:-off}"
     --cache-ram "${LFM3_CACHE_RAM:-256}"
+    --swa-full
   )
 fi
 
@@ -51,4 +58,12 @@ fi
 log_dir=${LFM3_LOG_DIR:-/tmp/lfm3}
 mkdir -p "$log_dir"
 llama-server "${args[@]}" >"$log_dir/server.log" 2>&1 &
+# Read lfm3-agent's system prompt and tools into the cache once, so the first
+# liquid in a new room starts from it (about 4 s on 2 CPUs otherwise).
+if [ "${LFM3_KIND:-chat}" = chat ] && [[ "${MODEL:-}" != *-base ]]; then
+  here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  agent=$here/lfm3-agent
+  [ -x "$agent" ] || agent=lfm3-agent
+  "$agent" --warm >"$log_dir/warm.log" 2>&1 </dev/null &
+fi
 exec "$@"
