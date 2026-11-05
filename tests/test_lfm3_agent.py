@@ -57,6 +57,9 @@ class FakeModel:
     def __init__(self) -> None:
         self.replies: list[Any] = []
         self.requests: list[dict[str, Any]] = []
+        # The two-token tool checks (max_tokens 2), kept apart from the requests.
+        self.checks: list[dict[str, Any]] = []
+        self.check_status = 200
         model = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -76,6 +79,17 @@ class FakeModel:
 
             def do_POST(self) -> None:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if body.get("max_tokens") == 2:
+                    # Answer like llama-server: the first two tokens of the next scripted reply.
+                    model.checks.append(body)
+                    if model.check_status != 200:
+                        self._send(model.check_status, {"error": {"message": "scripted failure"}})
+                        return
+                    nxt = model.replies[0] if model.replies else answer("(script ended)")
+                    calls = isinstance(nxt, dict) and (nxt.get("tool_calls") or "<tool_call>" in (nxt.get("content") or ""))
+                    text = "<tool_call>\n" if calls else " ".join(str((nxt or {}).get("content") or "").split()[:1])
+                    self._send(200, {"choices": [{"index": 0, "message": answer(text), "finish_reason": "length"}]})
+                    return
                 model.requests.append(body)
                 reply = model.replies.pop(0) if model.replies else answer("(script ended)")
                 if isinstance(reply, int):
@@ -160,7 +174,8 @@ def test_runs_the_tool_the_model_asks_for_and_returns_the_answer(fake: FakeModel
 @pytest.mark.parametrize(
     ("model", "sampling"),
     [
-        ("lfm3-omni-2b", {"temperature": 0, "frequency_penalty": 0.3}),
+        # Omni's answers are sampled after a greedy tool check (ADO 550).
+        ("lfm3-omni-2b", {"temperature": 0.5, "top_k": 40, "min_p": 0.05, "frequency_penalty": 0.3}),
         ("lfm3-audio-2b", {"temperature": 0, "frequency_penalty": 0.3}),
         ("lfm3-vl-2b", {"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1}),
     ],
@@ -182,6 +197,69 @@ def test_sampling_can_be_replaced(fake: FakeModel, room: Any) -> None:
     out = room("Hello.", LFM3_AGENT_SAMPLING="[1]")
     assert out.returncode == 2 and "JSON object" in out.stderr
 
+
+
+GREEDY = {"temperature": 0, "frequency_penalty": 0.3}
+ANSWER = {"temperature": 0.5, "top_k": 40, "min_p": 0.05, "frequency_penalty": 0.3}
+
+
+def sampling_of(body: dict[str, Any]) -> dict[str, Any]:
+    return {k: body[k] for k in body if k in ("temperature", "top_k", "repeat_penalty", "frequency_penalty", "min_p")}
+
+
+def test_omni_checks_for_a_tool_call_greedily_then_samples_the_answer(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("Grit in the grind.")]
+    out = room("write a rap")
+    assert out.returncode == 0 and out.stdout.strip() == "Grit in the grind."
+    (check,) = fake.checks
+    assert check["max_tokens"] == 2 and sampling_of(check) == GREEDY and "tools" in check
+    (reply,) = fake.requests
+    assert sampling_of(reply) == ANSWER and "tools" in reply
+    # The check and the reply read the same prompt, so the second read comes from the cache.
+    assert messages(check) == messages(reply)
+
+
+def test_a_tool_call_runs_greedily_and_the_answer_after_it_is_sampled(fake: FakeModel, room: Any) -> None:
+    fake.replies = [tool_call("run", {"command": "hostname"}), answer("It is box-1.")]
+    out = room("What is the hostname?")
+    assert out.returncode == 0 and out.stdout.strip() == "It is box-1."
+    call, final = fake.requests
+    assert sampling_of(call) == GREEDY and sampling_of(final) == ANSWER
+    assert len(fake.checks) == 2
+
+
+def test_a_failed_check_runs_the_round_greedily(fake: FakeModel, room: Any) -> None:
+    fake.check_status = 500
+    fake.replies = [answer("Hi.")]
+    assert room("Hello.").returncode == 0
+    assert sampling_of(fake.requests[0]) == GREEDY
+
+
+def test_pictures_and_json_stay_greedy_without_a_check(fake: FakeModel, room: Any, tmp_path: Path) -> None:
+    picture = tmp_path / "pic.png"
+    picture.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    fake.replies = [answer("A cat."), answer("Still a cat."), answer('{"a": 1}')]
+    assert room("--image", str(picture), "What is this?").returncode == 0
+    assert room("And now?").returncode == 0  # the picture is still in the conversation
+    assert room("--new", "--json", "Give me JSON.").returncode == 0
+    assert fake.checks == []
+    assert [sampling_of(r) for r in fake.requests] == [GREEDY, GREEDY, GREEDY]
+
+
+def test_answer_sampling_can_be_turned_off_or_follows_a_hand_set_sampling(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("Hi."), answer("Hi again.")]
+    assert room("Hello.", LFM3_AGENT_ANSWER_SAMPLING="").returncode == 0
+    assert room("Hello.", LFM3_AGENT_SAMPLING='{"temperature": 0.7}').returncode == 0
+    assert fake.checks == []
+    assert sampling_of(fake.requests[0]) == GREEDY and sampling_of(fake.requests[1]) == {"temperature": 0.7}
+    out = room("Hello.", LFM3_AGENT_ANSWER_SAMPLING="[1]")
+    assert out.returncode == 2 and "JSON object or empty" in out.stderr
+
+
+def test_other_models_are_not_checked(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("Hi.")]
+    assert room("Hello.", MODEL="lfm3-vl-2b").returncode == 0
+    assert fake.checks == []
 
 LOOP_NOTE = "(Stopped: the model kept repeating itself. Ask again, or start over with --new.)"
 

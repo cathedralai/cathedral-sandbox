@@ -45,6 +45,9 @@
 #   LFM3_MAX_TOKENS           tokens per reply (default 512)
 #   LFM3_AGENT_SAMPLING       sampling fields for llama-server, a JSON object
 #                             (default: per model, see SAMPLING)
+#   LFM3_AGENT_ANSWER_SAMPLING  sampling for a reply that is not a tool call, a
+#                             JSON object, or empty to use LFM3_AGENT_SAMPLING
+#                             (default: per model, see ANSWER_SAMPLING)
 #   LFM3_WAIT, LFM3_TIMEOUT   as in lfm3-ask
 set -euo pipefail
 
@@ -95,6 +98,26 @@ case "${MODEL:-}" in
   *) default_sampling='{"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1}' ;;
 esac
 SAMPLING=${LFM3_AGENT_SAMPLING:-$default_sampling}
+# Omni's answers (ADO 550). Greedy decoding picks tools reliably (above), but it
+# also gives every room the same words: ten new rooms asked for a rap wrote one
+# rap ten times. So when tools are on, a round first reads two greedy tokens: a
+# tool call ("<tool_call>") runs greedily as before, and an answer is written
+# with this sampling, so each room writes its own. A picture or clip in the
+# conversation and --json stay greedy. top_k must be set: Omni's GGUF makes
+# llama-server default to top_k 1, which is greedy at any temperature.
+# Measured in a sealed room (4 Nov 2026, 5 runs each, random seeds): at
+# temperature 0.5, top_k 40, min_p 0.05 a four line rap and three rhyme prompts
+# came out 5 of 5 different with no loop, while "17 times 23" (391) and "the
+# capital of Australia" (Canberra) came out the same and right 5 of 5. At 0.7
+# one rhyme answer started repeating; at 1.5 the text broke down.
+case "${MODEL:-}" in
+  *omni*) default_answer='{"temperature": 0.5, "top_k": 40, "min_p": 0.05, "frequency_penalty": 0.3}' ;;
+  *) default_answer="" ;;
+esac
+# A sampling set by hand (LFM3_AGENT_SAMPLING) applies to answers too, unless
+# LFM3_AGENT_ANSWER_SAMPLING is also set.
+[ -z "${LFM3_AGENT_SAMPLING:-}" ] || default_answer=""
+ANSWER_SAMPLING=${LFM3_AGENT_ANSWER_SAMPLING-$default_answer}
 # --json: llama-server turns a schema into a grammar and samples only tokens
 # that keep the reply valid JSON. An empty schema would mean an object only, so
 # the schema allows an array too. The grammar fixes the syntax, not the count
@@ -112,6 +135,10 @@ CONTEXT_CHARS=${LFM3_AGENT_CONTEXT_CHARS:-4000}
 LOG=${LFM3_LOG_DIR:-/tmp/lfm3}/server.log
 if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$SAMPLING"; then
   echo "lfm3-agent: LFM3_AGENT_SAMPLING must be a JSON object" >&2
+  exit 2
+fi
+if [ -n "$ANSWER_SAMPLING" ] && ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$ANSWER_SAMPLING"; then
+  echo "lfm3-agent: LFM3_AGENT_ANSWER_SAMPLING must be a JSON object or empty" >&2
   exit 2
 fi
 DIR=${LFM3_AGENT_DIR:-/tmp/lfm3/agent}
@@ -354,15 +381,15 @@ run_tool() { # name arguments-json: prints the result the model reads
 # fit CONTEXT_CHARS (whole turns, oldest dropped first), this message with its
 # media, and the tool calls of this turn so far. Without new media, the last
 # picture or clip goes back on the message that brought it, if that is kept.
-build_body() { # with-tools [max-tokens]
-  local n=${2:-$MAX_TOKENS}
+build_body() { # with-tools [max-tokens] [sampling]
+  local n=${2:-$MAX_TOKENS} sampling=${3:-$SAMPLING}
   local media=$MEDIA_FILE
   [ -s "$media" ] || media=$work/no_media
   jq -n --rawfile sys "$SYSTEM_FILE" --slurpfile hist "$HISTORY" \
     --slurpfile stored "$work/user_stored" --slurpfile sent "$work/user_sent" \
     --slurpfile turn "$work/turn" --slurpfile media "$media" --slurpfile parts "$work/parts" \
     --argjson room "$CONTEXT_CHARS" --arg model "$MODEL_NAME" --argjson n "$n" \
-    --argjson tools "$TOOLS" --arg with_tools "$1" --argjson sampling "$SAMPLING" \
+    --argjson tools "$TOOLS" --arg with_tools "$1" --argjson sampling "$sampling" \
     --arg json "$json" --argjson format "$JSON_FORMAT" --arg json_line "$JSON_LINE" '
     def drop_turn: (.[1:] | map(.role == "user") | index(true)) as $i
       | if $i == null then [] else .[($i + 1):] end;
@@ -384,9 +411,9 @@ build_body() { # with-tools [max-tokens]
     + (if $json == "1" then {response_format: $format} else {} end)' >"$work/body"
 }
 
-ask_model() { # with-tools: the reply message goes to $work/msg
+ask_model() { # with-tools [sampling]: the reply message goes to $work/msg
   local status=0 code
-  build_body "$1"
+  build_body "$1" "" "${2:-}"
   curl -sS --max-time "${LFM3_TIMEOUT:-600}" -o "$work/out" -w '%{http_code}' \
     -H 'Content-Type: application/json' -H "Authorization: Bearer ${MODEL_API_KEY:-local}" \
     --data-binary @"$work/body" "$BASE_URL/chat/completions" >"$work/code" || status=$?
@@ -445,6 +472,34 @@ warm_cache() {
     --data-binary @"$work/body" "$BASE_URL/chat/completions" || true)"
 }
 
+# Does this round start with a tool call? Two greedy tokens tell: Omni starts
+# a call with "<tool_call>". Unclear, empty or failed counts as a call, so the
+# round runs greedily as it did before ANSWER_SAMPLING.
+starts_tool_call() {
+  local code
+  build_body 1 2
+  code=$(curl -sS --max-time "${LFM3_TIMEOUT:-600}" -o "$work/probe" -w '%{http_code}' \
+    -H 'Content-Type: application/json' -H "Authorization: Bearer ${MODEL_API_KEY:-local}" \
+    --data-binary @"$work/body" "$BASE_URL/chat/completions" 2>/dev/null) || return 0
+  [ "$code" = 200 ] || return 0
+  [ "$(jq -r '.choices[0].message
+    | if ((.tool_calls // []) | length) > 0
+         or ((.content // "") | test("^\\s*$|<tool_call|<function=|<\\|tool"))
+      then "tool" else "answer" end' "$work/probe" 2>/dev/null)" != answer ]
+}
+
+# The sampling for this round: ANSWER_SAMPLING for an answer, SAMPLING for a
+# tool call, a picture or clip in the conversation, or --json.
+round_sampling() { # with-tools
+  if [ -z "$ANSWER_SAMPLING" ] || [ -n "$json" ] || [ "$(jq length "$work/parts")" -gt 0 ] || [ -s "$MEDIA_FILE" ]; then
+    echo "$SAMPLING"
+  elif [ "$1" = 1 ] && starts_tool_call; then
+    echo "$SAMPLING"
+  else
+    echo "$ANSWER_SAMPLING"
+  fi
+}
+
 # The answer, cut where it starts to repeat. A loop is one unit repeated many
 # times that fills much of the answer: a clause (text between newlines and
 # . , ; ! ?) seen 6 times, or a 4-word run seen 10 times, covering at least 40%
@@ -477,7 +532,7 @@ loop_guard() { # answer-file: rewrites it; prints "looped" when it cut
 }
 
 one_turn() { # message
-  local text=$1 round=0 calls i id name args result looped
+  local text=$1 round=0 with calls i id name args result looped
   if [ -z "$text" ] && [ "$(jq length "$work/parts")" -eq 0 ]; then
     usage
   fi
@@ -493,10 +548,11 @@ one_turn() { # message
   wait_for_server
   while :; do
     if [ -n "$tools" ] && [ "$round" -lt "$STEPS" ]; then
-      ask_model 1
+      with=1
     else
-      ask_model 0
+      with=0
     fi
+    ask_model "$with" "$(round_sampling "$with")"
     calls=$(jq '(.tool_calls // []) | length' "$work/msg")
     if [ "$calls" -eq 0 ] || [ -z "$tools" ] || [ "$round" -ge "$STEPS" ]; then
       break
