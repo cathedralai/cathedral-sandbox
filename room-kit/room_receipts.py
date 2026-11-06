@@ -33,6 +33,13 @@ Routes it adds:
                                    by the attested receipt key
   POST /room/hotel-key             miner hotels only: install the per-hotel API key, sealed
                                    to the install key and signed by a pinned control plane key
+  POST /v1/sandboxes/<id>/sealed-secrets
+                                   ROOM_SEALED_SECRETS=1 on a sealed guest only: one customer
+                                   secret, sealed to the binding's sealed_secrets key,
+                                   written read-only at /run/secrets/<name> in that room
+                                   (never echoed; the receipt signs the envelope sha256)
+  GET /v1/sandboxes/<id>/sealed-secrets
+                                   names, versions and envelope sha256 of that room's secrets
 Response header on a signed operation:
   X-Room-Receipt: base64url(canonical(receipt))
 
@@ -47,6 +54,18 @@ the control plane installs it with POST /room/hotel-key, and the front
 accepts a bearer only when it equals the installed key. The API behind the
 front knows only a guest-internal key (ROOM_API_KEY_PATH, made at boot inside
 the guest), which the front puts on each request it passes on.
+
+Sealed secrets (ROOM_SEALED_SECRETS=1, sealed only; AB#417). The front makes,
+at start and in memory, an X25519 key and names it in the binding
+(sealed_secrets.x25519_public_b64), so the boot's REPORT_DATA commits to it. A
+customer who has checked the attestation seals a secret to that key with the
+envelope the plant and the hotel key use (X25519, HKDF-SHA256, AES-256-GCM),
+under its own HKDF info and an AAD that names this binding, the room, the
+secret name and its version. Only this guest can open it. The front writes the value into the room's directory under
+ROOM_SEALED_SECRETS_DIR (tmpfs, guest memory), which the room API bind-mounts
+read-only at /run/secrets. A version at or below the last one accepted for
+that room and name is refused, so an older envelope cannot roll a secret back.
+Flag off: the binding is byte for byte what it was, and the routes answer 403.
 
 Dedicated sealed machine (one owner). The host launches the guest with the
 owner's Ed25519 public key and the manifest digest in fw_cfg, and with
@@ -74,6 +93,7 @@ import json
 import os
 import re
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -142,6 +162,27 @@ OWNER_MAX_SKEW_SECONDS = 300
 OWNER_UNSIGNED_LABELS = ("broker_batch",)
 OWNER_TIMESTAMP_RE = re.compile(r"^[0-9]{1,12}$")
 GUEST_HEADER = "X-Cathedral-Guest"
+# Customer-sealed secrets (AB#417 Mode B). The client side is ctcli (cathedral-pool
+# cli/sealed_secrets.py) and, later, the browser; keep all three in step.
+SECRETS_SCHEMA = "cathedral_sealed_secret_v1"
+# One envelope construction in the guest: the plant one, with its own HKDF info and AAD.
+# WebCrypto has every step (X25519, HKDF, AES-GCM), so the browser seals the same way.
+SECRETS_ALGORITHM = PLANT_ALGORITHM
+SECRETS_HKDF_INFO = b"cathedral.sealed-secret.v1"
+SECRETS_AAD_LABEL = b"cathedral.sealed-secret.v1\n"
+SECRETS_ACTION = "sealed_secret_write"
+SECRETS_HEADER = ("schema", "algorithm", "binding_sha256", "sandbox_id", "name", "version")
+SECRETS_FIELDS = frozenset(SECRETS_HEADER + ("ephemeral_public_b64", "nonce_b64", "ciphertext_b64"))
+SECRETS_IN_ROOM = "/run/secrets"
+DEFAULT_SECRETS_DIR = "/run/room-secrets"
+SECRET_VALUE_MAX_BYTES = 64 * 1024
+SECRETS_MAX_BYTES = 128 * 1024  # one request: base64 of the largest envelope plus the header
+SECRETS_MAX_PER_ROOM = 64
+SECRETS_MAX_TRACKED = 65536  # (room, name) versions kept for the boot; never dropped, so never replayable
+SECRET_VERSION_MAX = 2**53 - 1  # an integer a browser can hold exactly
+SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")  # a file name: no slash, no leading dot
+SECRETS_ROOM_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+SECRETS_ROUTE = re.compile(r"^/v1/sandboxes/(?P<id>[^/]+)/sealed-secrets$")
 
 
 class PlantError(ValueError):
@@ -466,7 +507,8 @@ def _seal_envelope(plaintext: bytes, recipient: X25519PublicKey, info: bytes, aa
     }
 
 
-def _open_envelope(doc: dict, private: X25519PrivateKey, info: bytes, aad: bytes) -> bytes:
+def _open_envelope(doc: dict, private: X25519PrivateKey, info: bytes, aad: bytes,
+                   max_ciphertext: int = 2048) -> bytes:
     """Open an envelope of _seal_envelope. Raises PlantError, which never names the plaintext."""
     if not isinstance(doc, dict) or doc.get("algorithm") != PLANT_ALGORITHM:
         raise PlantError("ciphertext does not open")
@@ -474,7 +516,7 @@ def _open_envelope(doc: dict, private: X25519PrivateKey, info: bytes, aad: bytes
         raw_eph = base64.b64decode(doc["ephemeral_public_b64"], validate=True)
         aes_n = base64.b64decode(doc["nonce_b64"], validate=True)
         ct = base64.b64decode(doc["ciphertext_b64"], validate=True)
-        if len(raw_eph) != 32 or len(aes_n) != 12 or not (16 <= len(ct) <= 2048):
+        if len(raw_eph) != 32 or len(aes_n) != 12 or not (16 <= len(ct) <= max_ciphertext):
             raise PlantError("ciphertext does not open")
         ephemeral = X25519PublicKey.from_public_bytes(raw_eph)
         # from_public_bytes accepts low-order points; a trial exchange rejects them.
@@ -498,6 +540,125 @@ def open_plant_nonce(doc: dict, private: X25519PrivateKey, hotel: str, window_id
         return opened.decode("ascii")
     except UnicodeDecodeError as exc:
         raise PlantError("ciphertext does not open") from exc
+
+
+# ---------------------------------------------------------------- sealed secrets (AB#417)
+
+class SecretRefused(Exception):
+    """A sealed secret write refused. The code is short and never names the value."""
+
+    def __init__(self, status: int, code: str):
+        super().__init__(code)
+        self.status, self.code = status, code
+
+
+def sealed_secrets_wanted() -> bool:
+    """ROOM_SEALED_SECRETS=1. Unset or any other value: off."""
+    return os.environ.get("ROOM_SEALED_SECRETS") == "1"
+
+
+def secret_header(binding_sha256: str, sandbox_id: str, name: str, version: int) -> dict:
+    """The fields of an envelope that its AAD authenticates (all but the three envelope values)."""
+    return {"schema": SECRETS_SCHEMA, "algorithm": SECRETS_ALGORITHM, "binding_sha256": binding_sha256,
+            "sandbox_id": sandbox_id, "name": name, "version": version}
+
+
+def secret_aad(header: dict) -> bytes:
+    """A label and canonical(header): HKDF salt and AES-GCM AAD. Any change to a header field fails the open."""
+    return SECRETS_AAD_LABEL + canonical(header)
+
+
+def seal_secret(value: bytes, recipient: X25519PublicKey, *, binding_sha256: str, sandbox_id: str, name: str,
+                version: int) -> dict:
+    """The customer's envelope (ctcli, tests). The guest only opens."""
+    header = secret_header(binding_sha256, sandbox_id, name, version)
+    return {**header, **_seal_envelope(value, recipient, SECRETS_HKDF_INFO, secret_aad(header))}
+
+
+def open_secret(doc: dict, private: X25519PrivateKey) -> bytes:
+    """Open an envelope of seal_secret. Raises SecretRefused, which never names the value."""
+    header = {k: doc[k] for k in SECRETS_HEADER}
+    try:
+        # The tag is 16 bytes: an empty value is a 16-byte ciphertext.
+        return _open_envelope(doc, private, SECRETS_HKDF_INFO, secret_aad(header),
+                              max_ciphertext=SECRET_VALUE_MAX_BYTES + 16)
+    except PlantError:
+        raise SecretRefused(400, "sealed_secret_does_not_open") from None
+
+
+class SealedSecrets:
+    """The per-boot secrets key and what this boot accepted. Memory only.
+
+    The private key never leaves this process. The binding names the public
+    key (binding_fields), so the boot's SNP report commits to it. state maps
+    (room, name) to (version, envelope sha256) and is never pruned: a room
+    deleted and made again under the same id still refuses an old envelope.
+    """
+
+    def __init__(self, root: str):
+        self.root = root
+        self.private = X25519PrivateKey.generate()
+        self.public_b64 = b64(_raw_x25519(self.private.public_key()))
+        self.lock = threading.Lock()
+        self.state: dict[tuple[str, str], tuple[int, str]] = {}
+
+    def __repr__(self) -> str:
+        return f"SealedSecrets(x25519_public_b64={self.public_b64})"
+
+    def binding_fields(self) -> dict:
+        return {"sealed_secrets": {"schema": SECRETS_SCHEMA, "algorithm": SECRETS_ALGORITHM,
+                                   "x25519_public_b64": self.public_b64, "path": SECRETS_IN_ROOM}}
+
+    def room_dir(self, room: str) -> int:
+        """A directory fd for the room's secrets, or SecretRefused 404.
+
+        The room API makes ROOM_SEALED_SECRETS_DIR/<room> at create and mounts
+        it read-only at /run/secrets; no directory means no such room on this
+        boot (or one made before the API had the mount). A link is refused.
+        """
+        try:
+            return os.open(os.path.join(self.root, room), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            raise SecretRefused(404, "sealed_secret_room_not_found") from None
+
+    def listing(self, room: str) -> list[dict]:
+        with self.lock:
+            items = sorted((name, v) for (r, name), v in self.state.items() if r == room)
+        return [{"name": name, "version": version, "envelope_sha256": digest, "path": f"{SECRETS_IN_ROOM}/{name}"}
+                for name, (version, digest) in items]
+
+
+def _secret_file_present(dir_fd: int, name: str) -> bool:
+    try:
+        return stat.S_ISREG(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
+def _write_secret_file(dir_fd: int, name: str, value: bytes) -> None:
+    """Write name in the room directory as a whole new file (temp, then rename), mode 0444.
+
+    0444 because the room's own user may not be root; only this room mounts
+    the directory. The temp name starts with a dot, which no secret name can.
+    """
+    tmp = f".tmp-{uuid.uuid4().hex}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    try:
+        view = memoryview(value)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fchmod(fd, 0o444)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------- miner hotel: guest TLS and key install
@@ -673,8 +834,11 @@ def _replace_private_file(directory: str, path: str, data: bytes, mode: int) -> 
 class Ledger:
     """The receipt key, the binding and the chain of this boot."""
 
-    def __init__(self, hotel: str, store: str, miner: MinerHotel | None = None):
+    def __init__(self, hotel: str, store: str, miner: MinerHotel | None = None,
+                 secrets: SealedSecrets | None = None):
         self.miner = miner
+        # A secrets key means something only under an SNP report: level 1 drops it below.
+        self.secrets = secrets
         # Raw Ed25519 owner key on a dedicated sealed machine, else None (no gate).
         self.owner_key: bytes | None = None
         if tsm_provider() == "sev_guest":
@@ -683,6 +847,7 @@ class Ledger:
             # A miner hotel's TLS key means something only under an SNP report.
             raise RuntimeError("miner mode needs a sealed guest (TSM provider sev_guest)")
         else:
+            self.secrets = None
             self._init_hotel(hotel, store)
         # Runtime guest key. Not in the binding: adding it there would change
         # REPORT_DATA. Authenticated by an Ed25519 signature over the plant-key
@@ -744,6 +909,10 @@ class Ledger:
         if self.miner is not None:
             # TLS key, install key and pinned signers: REPORT_DATA commits to them.
             self.binding.update(self.miner.binding_fields())
+        if self.secrets is not None:
+            # One added key, only with the flag on: a binding without it is unchanged,
+            # and verifiers hash the binding whole, so they check this one as before.
+            self.binding.update(self.secrets.binding_fields())
         if owner is not None:
             # Enough to recompute HOST_DATA from published fields:
             # sha256(domain || manifest_sha256 || owner key) == host_data.
@@ -843,6 +1012,91 @@ class Ledger:
             "status": 200,
         })
         return answer("installed"), receipt
+
+    def write_sealed_secret(self, room: str, doc) -> tuple[dict, dict | None]:
+        """POST /v1/sandboxes/<room>/sealed-secrets. Returns (answer, receipt); raises SecretRefused.
+
+        Checked in this order: the fields, this boot's binding, the room in
+        the path, the name and version, the room's directory, the version
+        against the last one accepted (the exact request that wrote the
+        current value answers again with no change), then the envelope opens
+        with this boot's key. The receipt signs the envelope sha256 and never
+        a digest of the value: secrets are often guessable.
+        """
+        secrets = self.secrets
+        if secrets is None:
+            raise SecretRefused(403, "sealed_secrets_disabled")
+        if not isinstance(doc, dict) or set(doc) != SECRETS_FIELDS:
+            raise SecretRefused(400, "sealed_secret_fields_invalid")
+        if doc["schema"] != SECRETS_SCHEMA or doc["algorithm"] != SECRETS_ALGORITHM:
+            raise SecretRefused(400, "sealed_secret_algorithm_unsupported")
+        if doc["binding_sha256"] != self.binding_sha256:
+            # Sealed for another boot or guest: the client fetches the attestation again and reseals.
+            raise SecretRefused(409, "sealed_secret_wrong_binding")
+        if doc["sandbox_id"] != room or not SECRETS_ROOM_RE.fullmatch(room):
+            raise SecretRefused(400, "sealed_secret_wrong_room")
+        name, version = doc["name"], doc["version"]
+        if not isinstance(name, str) or not SECRET_NAME_RE.fullmatch(name):
+            raise SecretRefused(400, "sealed_secret_name_invalid")
+        if type(version) is not int or not 1 <= version <= SECRET_VERSION_MAX:
+            raise SecretRefused(400, "sealed_secret_version_invalid")
+        envelope_sha256 = sha(canonical(doc))
+        path = f"{SECRETS_IN_ROOM}/{name}"
+
+        def answer(status: str) -> dict:
+            return {"sandbox_id": room, "name": name, "version": version, "envelope_sha256": envelope_sha256,
+                    "path": path, "status": status}
+
+        def check_order() -> bool:
+            """True when this exact request already wrote the value now in place. Caller holds the lock."""
+            current = secrets.state.get((room, name))
+            if current is not None:
+                if current == (version, envelope_sha256) and _secret_file_present(dir_fd, name):
+                    return True
+                if version <= current[0]:
+                    # Older, or the same request into a room made again under this id.
+                    raise SecretRefused(409, "sealed_secret_replayed")
+            elif sum(1 for r, _ in secrets.state if r == room) >= SECRETS_MAX_PER_ROOM:
+                raise SecretRefused(409, "sealed_secrets_room_full")
+            elif len(secrets.state) >= SECRETS_MAX_TRACKED:
+                raise SecretRefused(503, "sealed_secrets_full")
+            return False
+
+        dir_fd = secrets.room_dir(room)
+        try:
+            with secrets.lock:
+                if check_order():
+                    return answer("unchanged"), None
+            value = open_secret(doc, secrets.private)
+            with secrets.lock:
+                # A newer write may have landed while this one opened.
+                if check_order():
+                    return answer("unchanged"), None
+                try:
+                    _write_secret_file(dir_fd, name, value)
+                except OSError:
+                    traceback.print_exc()
+                    raise SecretRefused(500, "sealed_secret_write_failed") from None
+                finally:
+                    value = None
+                secrets.state[(room, name)] = (version, envelope_sha256)
+        finally:
+            os.close(dir_fd)
+        try:
+            receipt = self.sign({
+                "action": SECRETS_ACTION,
+                "target": f"POST /v1/sandboxes/{room}/sealed-secrets",
+                "sandbox_id": room,
+                "secret_name": name,
+                "secret_version": version,
+                "envelope_sha256": envelope_sha256,
+                "path": path,
+                "status": 200,
+            })
+        except Exception:  # noqa: BLE001 the file is written: answer, and say the receipt is missing
+            traceback.print_exc()
+            receipt = None
+        return answer("written"), receipt
 
     def _init_hotel(self, hotel: str, store: str) -> None:
         """Level 1: an Ed25519 hotel chain. No SNP report and no measurement."""
@@ -1105,6 +1359,10 @@ class Handler(BaseHTTPRequestHandler):
                 # The API behind accepts the internal key the front adds, so the
                 # front is the gate for every call it passes on.
                 return self.reply(401, b'{"error":"unauthorized"}')
+        m = SECRETS_ROUTE.match(path)
+        if m:
+            # Never passed to the API: the envelope stops here, opened or refused.
+            return self.handle_sealed_secrets(ledger, m["id"], body)
         action = next((a for meth, pat, a in SIGNED if meth == self.command and pat.match(path)), None)
         if action and body:
             # A JSON escape of a lone surrogate parses, but cannot be encoded
@@ -1221,6 +1479,36 @@ class Handler(BaseHTTPRequestHandler):
         extra = {}
         if receipt is not None:
             extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(receipt)).decode()
+        return self.reply(200, canonical(out), extra)
+
+    def handle_sealed_secrets(self, ledger: "Ledger", room: str, body: bytes | None):
+        """POST: write one customer-sealed secret. GET: names and versions. Never echoes a value."""
+        if self.command not in ("GET", "POST"):
+            return self.reply(405, b'{"error":"method_not_allowed"}', {"Allow": "GET, POST"})
+        if not self.authorized():
+            return self.reply(401, b'{"error":"unauthorized"}')
+        if ledger.secrets is None:
+            return self.reply(403, b'{"error":{"code":"sealed_secrets_disabled","message":"this hotel does not accept sealed secrets"}}')
+        if not SECRETS_ROOM_RE.fullmatch(room):
+            return self.reply(400, b'{"error":{"code":"sealed_secret_wrong_room","message":"not a room id"}}')
+        if self.command == "GET":
+            return self.reply(200, canonical({"sandbox_id": room, "binding_sha256": ledger.binding_sha256,
+                                              "secrets": ledger.secrets.listing(room)}))
+        if body is None or len(body) > SECRETS_MAX_BYTES:
+            return self.reply(413, b'{"error":{"code":"sealed_secret_too_large","message":"the request is too large"}}')
+        try:
+            doc = json.loads(body)
+        except ValueError:
+            doc = None
+        try:
+            out, receipt = ledger.write_sealed_secret(room, doc)
+        except SecretRefused as exc:
+            return self.reply(exc.status, canonical({"error": {"code": exc.code, "message": exc.code.replace("_", " ")}}))
+        extra = {}
+        if receipt is not None:
+            extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(receipt)).decode()
+        elif out["status"] == "written":
+            extra["X-Room-Receipt-Error"] = "sign_failed"
         return self.reply(200, canonical(out), extra)
 
     def handle_escape_plant_key(self, ledger: "Ledger"):
@@ -1477,8 +1765,9 @@ def main() -> int:
     if mode == "1":
         miner = MinerHotel(env["ROOM_HOTEL_NAME"], parse_install_signers(env.get("ROOM_HOTEL_KEY_INSTALL_SIGNERS", "")))
     store = env.get("ROOM_RECEIPTS_DIR", "/run/room-receipts")
+    secrets = SealedSecrets(env.get("ROOM_SEALED_SECRETS_DIR") or DEFAULT_SECRETS_DIR) if sealed_secrets_wanted() else None
     try:
-        ledger = Ledger(env["ROOM_HOTEL_NAME"], store, miner=miner)
+        ledger = Ledger(env["ROOM_HOTEL_NAME"], store, miner=miner, secrets=secrets)
     except OwnerBindingError as exc:
         # Fail closed: nothing listens, so the broker sees the hotel down.
         # The console is the guest serial port, the one log the host operator can read.
@@ -1493,6 +1782,11 @@ def main() -> int:
     if ledger.sealed:
         print(f"room-receipts: binding {ledger.binding_sha256} measurement {ledger.binding['measurement']} "
               f"tenancy {ledger.binding['tenancy']}", flush=True)
+        if ledger.secrets is not None:
+            print(f"room-receipts: sealed secrets on: key {ledger.secrets.public_b64} in the binding; "
+                  f"room directories under {ledger.secrets.root}", flush=True)
+    elif secrets is not None:
+        print("room-receipts: ROOM_SEALED_SECRETS=1 ignored: level 1 has no SNP report to bind the key", flush=True)
     else:
         print(f"room-receipts: binding {ledger.binding_sha256} level hotel", flush=True)
     args = (ledger, int(env.get("ROOM_API_PORT", "18090")), int(env.get("ROOM_HEALTH_PORT", "18091")), api_key,

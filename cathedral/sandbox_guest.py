@@ -88,6 +88,8 @@ def docker_daemon_ready(*, timeout_seconds: float = 2.0) -> bool:
 # containers that have no live sandbox record.
 LABEL_OWNER = "cathedral.sandbox.owner"
 LABEL_SANDBOX_ID = "cathedral.sandbox.id"
+# Customer-sealed secrets inside a room (AB#417); room-kit room_receipts.SECRETS_IN_ROOM.
+SECRETS_IN_ROOM = "/run/secrets"
 
 
 def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
@@ -687,6 +689,7 @@ class DockerClient:
         runtime: str | None = None,
         run_args: Iterable[str] = (),
         default_runtime: str = "",
+        secrets_dir: Path | None = None,
     ) -> str:
         """Start one room. ``default_runtime`` is the daemon's default OCI runtime,
         the room's runtime when no ``--runtime`` is passed."""
@@ -714,6 +717,10 @@ class DockerClient:
         # The source is a hotel path the API built, never a request value.
         for source, target in mounts:
             argv.extend(["--mount", f"type=bind,source={source.resolve()},target={target}"])
+        if secrets_dir is not None:
+            # Customer-sealed secrets (AB#417): the room's tmpfs directory, read-only
+            # inside. The receipts front writes it; the room only reads.
+            argv.extend(["--mount", f"type=bind,source={secrets_dir.resolve()},target={SECRETS_IN_ROOM},readonly"])
         if user:
             argv.extend(["--user", user])
         chosen = None
@@ -1259,6 +1266,9 @@ class DockerGuestProvider:
         self._egress = EgressClient.from_env()
         # Persistent workspaces (#305). None: CATHEDRAL_WORKSPACE_ROOT is unset.
         self._workspaces = WorkspaceStore.from_env(self._client)
+        # Customer-sealed secrets (AB#417). None: CATHEDRAL_SEALED_SECRETS_DIR is unset.
+        secrets_root = os.environ.get("CATHEDRAL_SEALED_SECRETS_DIR", "").strip()
+        self._secrets_root = Path(secrets_root) if secrets_root else None
         self._doomed_ws: dict[str, tuple[str, str, str, bool]] = {}  # sandbox_id -> workspace of a queued removal
         self._doomed_nets: dict[str, str | None] = {}  # sandbox_id -> network of a queued removal
         self._net_pending: dict[str, str] = {}  # sandbox_id -> network while docker run runs
@@ -1601,11 +1611,55 @@ class DockerGuestProvider:
             data = self._workspaces.mount(owner, spec.name, doc["id"])
             workspace = (owner, spec.name, spec.path, spec.version_on_delete, data)
         try:
+            self._make_secrets_dir(doc["id"])
             return self._start_guest_mounted(doc, request, workspace, owner)
         except BaseException:
+            self._drop_secrets_dir(doc["id"])
             if workspace is not None:
                 self._workspaces.unmount(workspace[0], workspace[1], doc["id"])
             raise
+
+    def _secrets_dir(self, sandbox_id: str) -> Path | None:
+        if self._secrets_root is None:
+            return None
+        return self._secrets_root / sandbox_id
+
+    def _make_secrets_dir(self, sandbox_id: str) -> None:
+        """A new, empty secrets directory for the room (AB#417). Nothing from an earlier room survives."""
+        path = self._secrets_dir(sandbox_id)
+        if path is None:
+            return
+        shutil.rmtree(path, ignore_errors=True)
+        try:
+            path.mkdir(mode=0o755)
+            path.chmod(0o755)  # the room's own user may not be root
+        except OSError as exc:
+            raise SandboxOpError("sealed_secrets_unavailable", 503,
+                                 "this hotel could not make the room's /run/secrets directory",
+                                 retry_after=30) from exc
+
+    def _drop_secrets_dir(self, sandbox_id: str) -> None:
+        """Remove the room's secrets at once. Idempotent; the next boot starts with none (tmpfs)."""
+        path = self._secrets_dir(sandbox_id)
+        if path is not None:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _sweep_secrets_dirs(self) -> int:
+        """Drop the secrets directory of every room with no record (AB#417). Returns how many.
+
+        A directory is made only after its record, and a retire drops it, so one
+        with no record belongs to a room this API lost (a restart, an orphan).
+        """
+        if self._secrets_root is None:
+            return 0
+        try:
+            names = os.listdir(self._secrets_root)
+        except OSError:
+            return 0
+        stale = [name for name in names if not self._inner.has_record(name)]
+        for name in stale:
+            self._drop_secrets_dir(name)
+        return len(stale)
 
     def _start_guest_mounted(
         self, doc: dict[str, Any], request: CreateSandboxRequest, workspace: tuple | None, owner: str | None = None
@@ -1653,6 +1707,7 @@ class DockerGuestProvider:
                 entrypoint=entrypoint, network=network, attach=attach,
                 mounts=[(workspace[4], workspace[2])] if workspace is not None else (),
                 tunables=room_tunables,
+                secrets_dir=self._secrets_dir(sandbox_id),
             )
         except BaseException:
             self._release_pending(sandbox_id)
@@ -1742,6 +1797,7 @@ class DockerGuestProvider:
         attach: bool | None = None,
         mounts: Iterable[tuple[Path, str]] = (),
         tunables: tuple[str, list[str], dict[str, Any]] | None = None,
+        secrets_dir: Path | None = None,
     ) -> str:
         resolv_conf = None
         if network and self._net_pool is not None and self._net_pool.dns:
@@ -1771,6 +1827,7 @@ class DockerGuestProvider:
             runtime=tunables[0] if tunables is not None else None,
             run_args=tunables[1] if tunables is not None else (),
             default_runtime=self._oci_runtime,
+            secrets_dir=secrets_dir,
         )
 
     def _after_start(self, doc: dict[str, Any], sandbox_id: str, container_id: str, dind: bool) -> dict[str, Any]:
@@ -2211,6 +2268,8 @@ class DockerGuestProvider:
         """
         if not self._inner.begin_delete(sandbox_id):
             return False
+        # A room on its way out keeps no secrets, even while its container lingers.
+        self._drop_secrets_dir(sandbox_id)
         guest = self._guests.pop(sandbox_id, None)
         if guest is None:
             cid = self._find_labeled_container(sandbox_id)
@@ -2359,6 +2418,7 @@ class DockerGuestProvider:
             if sid not in queued and not (sid and self._inner.has_record(sid))
         ]
         removed = sum(1 for gone in self._remove_many(orphans) if gone)
+        self._sweep_secrets_dirs()
         self._reconcile_snapshot_images()
         if self._net_pool is not None:
             # Drift guard: count ports from what this API holds now.

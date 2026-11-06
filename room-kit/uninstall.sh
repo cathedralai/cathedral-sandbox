@@ -58,6 +58,7 @@ grep -q '^user:poolroom' "$STATE" 2>/dev/null && userdel poolroom 2>/dev/null
 # dockerd leaves an nsfs bind mount under its exec root; unmount before delete.
 for m in $(grep " /run/pool-room" /proc/mounts | cut -d" " -f2 | sort -r); do umount "$m" 2>/dev/null; done
 rm -rf /var/lib/pool-room /var/lib/private/pool-room-caddy /var/lib/pool-room-caddy /run/pool-room
+rm -rf /run/room-secrets /etc/tmpfiles.d/pool-room-secrets.conf
 if [ $KEEP_RUNTIME = 1 ]; then
   find $ROOM_OPT -mindepth 1 -maxdepth 1 ! -name 'gvisor*' -exec rm -rf {} +
   log "kept $ROOM_OPT/gvisor (runsc)"
