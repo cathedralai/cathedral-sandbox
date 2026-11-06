@@ -1042,6 +1042,26 @@ def test_build_miner_hotel_opens_its_https_port_and_pins_the_signers(host: FakeH
                         f'ROOM_HOTEL_KEY_INSTALL_SIGNERS="{MINER_SIGNER}"\n')
 
 
+@pytest.mark.parametrize("miner", [False, True])
+def test_sealed_guest_runs_no_dind_and_gives_rooms_no_raw_sockets(host: FakeHost, miner: bool) -> None:
+    # AB#576: sealed v1 excludes Docker in Docker until it is tested. The guest's
+    # API must refuse a DinD image (no --privileged room), and no runsc runtime
+    # of the room daemon, tunable variants included, may give a room raw sockets.
+    sealed = {"SEALED_MINER": "1", "SEALED_HOTEL_KEY_INSTALL_SIGNERS": MINER_SIGNER} if miner else {}
+    proc, root = _guest_config(host, False, **sealed)
+    assert proc.returncode == 0, proc.stderr
+    # As the guest's install.sh reads it: room.env, then the v1 profile and the runtimes.
+    script = (f'set -eo pipefail\nsource "{root}/opt/room-kit/room.env"\nsource "{host.kit}/profiles/v1.sh"\n'
+              f'profile_env\npython3 "{host.kit}/lib/tunable_runtimes.py" /opt/pool-room/gvisor/runsc '
+              '"$ROOM_RUNSC_FLAGS"\n')
+    out = subprocess.run([BASH, "-c", script], capture_output=True, text=True, check=True, timeout=60,
+                         env={"PATH": BIN_PATH, "LC_ALL": "C"}).stdout.splitlines()
+    assert "CATHEDRAL_ALLOW_PRIVILEGED_DIND=0" in out
+    runtimes = json.loads(out[-1])
+    assert runtimes["runsc"]["runtimeArgs"] == ["--platform=systrap", "--overlay2=none"]
+    assert len(runtimes) == 17 and not [n for n, r in runtimes.items() if "--net-raw" in r["runtimeArgs"]]
+
+
 @pytest.mark.parametrize("sealed,message", [
     ({"SEALED_MINER": "1"}, "needs SEALED_HOTEL_KEY_INSTALL_SIGNERS"),
     ({"SEALED_MINER": "1", "SEALED_HOTEL_KEY_INSTALL_SIGNERS": "not-a-key"}, "needs SEALED_HOTEL_KEY_INSTALL_SIGNERS"),

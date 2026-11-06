@@ -21,7 +21,7 @@ from tests.fake_docker_cli import FakeDocker, install
 
 KIT = Path(__file__).resolve().parents[1] / "room-kit"
 RUNSC = "/opt/pool-room/gvisor/runsc"
-HOTEL_FLAGS = "--platform=systrap --overlay2=none --net-raw"  # room.env.example and the sealed guest
+HOTEL_FLAGS = "--platform=systrap --overlay2=none --net-raw"  # room.env.example; the sealed guest drops --net-raw (AB#576)
 DEFAULT_SHA = "e187a847a2c9d715078c086429fe1f29bc2eb4447aa47d89b628fd08e7caa547"
 COLD = {"schema": 1, "runsc": {"directfs": False, "overlay2": "all:self"}}  # gt-challenge baselines/cold
 

@@ -860,9 +860,13 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			// at fault and must rest so the create moves on.
 			guestImage := status == 502 && errCodeOf(out) == "image_pull_failed" && guestImageFault(out)
 			// A dedicated machine refusing a create the owner did not sign
-			// (owner_signature_*) is the guest's error, not a broken hotel.
+			// (owner_signature_*) is the guest's error, not a broken hotel. So
+			// is a hotel that runs no privileged rooms refusing a Docker-in-
+			// Docker image (privileged_dind_disabled; sealed hotels run none,
+			// AB#576): resting it would let one guest's image empty the pool.
 			ownerRefused := status == 403 && strings.HasPrefix(errCodeOf(out), "owner_signature_")
-			if err != nil || (status >= 500 && !guestImage) || status == 401 || (status == 403 && !ownerRefused) {
+			dindRefused := status == 403 && errCodeOf(out) == "privileged_dind_disabled"
+			if err != nil || (status >= 500 && !guestImage) || status == 401 || (status == 403 && !ownerRefused && !dindRefused) {
 				h.failed++
 				h.backoffUntil = time.Now().Add(hotelFailBackoff)
 			}

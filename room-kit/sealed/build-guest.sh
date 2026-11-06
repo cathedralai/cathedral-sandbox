@@ -167,6 +167,9 @@ fi
 mkdir -p "$R/opt/room-kit/dist"
 install -m 0644 "$KIT/$CATHEDRAL_TARBALL" "$R/opt/room-kit/dist/"
 { cat "$KIT/KIT_COMMIT" 2>/dev/null || ( cd "$KIT" && git rev-parse HEAD 2>/dev/null ) || echo unknown; } > "$R/opt/room-kit/KIT_COMMIT"
+# Sealed v1 runs no Docker in Docker until it is tested (AB#576): no privileged
+# rooms (ROOM_ALLOW_DIND=0) and no raw sockets in rooms (runsc without
+# --net-raw). The ROOM_DIND_* lines only apply with ROOM_ALLOW_DIND=1.
 cat > "$R/opt/room-kit/room.env" <<EOF
 # Sealed hotel $SEALED_NAME: written by sealed/build-guest.sh, part of the measured initrd.
 ROOM_ID=room-sealed
@@ -189,8 +192,8 @@ ROOM_DATA_SIZE_GB=0
 ROOM_BRIDGE=rmbr0
 ROOM_BRIDGE_CIDR=10.213.0.1/21
 ROOM_DNS="$SEALED_DNS"
-ROOM_RUNSC_FLAGS="--platform=systrap --overlay2=none --net-raw"
-ROOM_ALLOW_DIND=1
+ROOM_RUNSC_FLAGS="--platform=systrap --overlay2=none"
+ROOM_ALLOW_DIND=0
 SHAPE_VCPU=1
 SHAPE_MEM_GIB=4
 SHAPE_DISK_GIB=10

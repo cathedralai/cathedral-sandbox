@@ -272,6 +272,25 @@ def _dind_run(fake: FakeDocker) -> list[str]:
     return run
 
 
+def test_dind_is_refused_without_the_privileged_switch(fake: FakeDocker, monkeypatch) -> None:
+    # A sealed guest runs with CATHEDRAL_ALLOW_PRIVILEGED_DIND=0 (AB#576): no
+    # privileged room starts, and the refused create leaves no sandbox behind.
+    monkeypatch.setenv("CATHEDRAL_ALLOW_PRIVILEGED_DIND", "0")
+    fake.add_image("docker:28-dind")
+    provider = DockerGuestProvider()
+    try:
+        with pytest.raises(SandboxOpError) as err:
+            _create(provider, image="docker:28-dind")
+        assert (err.value.code, err.value.http_status) == ("privileged_dind_disabled", 403)
+        assert fake.calls_of("run") == []
+        assert provider.list(labels=[], state=None) == []
+        _create(provider, digest="c")  # a plain image still starts
+        (run,) = fake.calls_of("run")
+        assert "--privileged" not in run
+    finally:
+        provider.close()
+
+
 def test_dind_defaults_are_unchanged(fake: FakeDocker, monkeypatch) -> None:
     monkeypatch.setenv("CATHEDRAL_ALLOW_PRIVILEGED_DIND", "1")
     fake.add_image("docker:28-dind")
