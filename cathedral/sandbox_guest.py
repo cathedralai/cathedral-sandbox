@@ -90,6 +90,7 @@ LABEL_OWNER = "cathedral.sandbox.owner"
 LABEL_SANDBOX_ID = "cathedral.sandbox.id"
 # Customer-sealed secrets inside a room (AB#417); room-kit room_receipts.SECRETS_IN_ROOM.
 SECRETS_IN_ROOM = "/run/secrets"
+SECRETS_DROP_TRIES = 5  # rmtree again while a write of the receipts front races a retire
 
 
 def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
@@ -1639,10 +1640,20 @@ class DockerGuestProvider:
                                  retry_after=30) from exc
 
     def _drop_secrets_dir(self, sandbox_id: str) -> None:
-        """Remove the room's secrets at once. Idempotent; the next boot starts with none (tmpfs)."""
+        """Remove the room's secrets at once. Idempotent; the next boot starts with none (tmpfs).
+
+        The receipts front may rename a file in while rmtree runs, and then the
+        last rmdir fails (ENOTEMPTY, ignored). Try again a few times; reconcile
+        drops whatever is still left, and a delete through the front removes it
+        once its receipt is signed.
+        """
         path = self._secrets_dir(sandbox_id)
-        if path is not None:
+        if path is None:
+            return
+        for _ in range(SECRETS_DROP_TRIES):
             shutil.rmtree(path, ignore_errors=True)
+            if not os.path.lexists(path):
+                return
 
     def _sweep_secrets_dirs(self) -> int:
         """Drop the secrets directory of every room with no record (AB#417). Returns how many.

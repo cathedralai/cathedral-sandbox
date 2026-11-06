@@ -91,7 +91,7 @@ func snpAttestation(t testing.TB, o attestOpts) []byte {
 		binding["policy"] = "0xb0000"
 	}
 	if o.sealedSecrets {
-		binding["sealed_secrets"] = map[string]any{"schema": "cathedral_sealed_secret_v1",
+		binding["sealed_secrets"] = map[string]any{"schema": "cathedral_sealed_secret_v2",
 			"algorithm": "x25519-hkdf-sha256-aes256gcm-v1", "path": "/run/secrets",
 			"x25519_public_b64": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))}
 	}

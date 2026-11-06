@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from cathedral import sandbox_guest
 from cathedral.sandbox_guest import DockerGuestProvider
 from cathedral.sandbox_server import SandboxApplication
 from tests.fake_docker_cli import FakeDocker, install
@@ -95,6 +96,37 @@ def test_delete_removes_the_directory_at_once(fake, tmp_path, monkeypatch) -> No
         status, _ = call(app, "DELETE", f"/v1/sandboxes/{doc['id']}")
         assert status == 204
         assert not room.exists()
+    finally:
+        provider.close()
+
+
+def test_delete_retries_when_a_front_write_races_the_rmtree(fake, tmp_path, monkeypatch) -> None:
+    """Review finding 5: the front renames a file in while rmtree runs, so its rmdir fails (ignored).
+
+    The directory must still be gone when the retire returns, not left for the
+    next reconcile.
+    """
+    root = tmp_path / "room-secrets"
+    provider, app = _app(monkeypatch, root)
+    try:
+        _, doc = call(app, "POST", "/v1/sandboxes", ROOM)
+        room = root / doc["id"]
+        (room / "OPENAI_API_KEY").write_text("written before the delete")
+        real, calls = sandbox_guest.shutil.rmtree, []
+
+        def racing_rmtree(path, ignore_errors=False, **kw):
+            calls.append(path)
+            real(path, ignore_errors=ignore_errors, **kw)
+            if len(calls) == 1:
+                # The front's rename landed after rmtree listed the directory: rmdir saw ENOTEMPTY.
+                Path(path).mkdir(exist_ok=True)
+                (Path(path) / "OPENAI_API_KEY").write_text("renamed in during the rmtree")
+
+        monkeypatch.setattr(sandbox_guest.shutil, "rmtree", racing_rmtree)
+        status, _ = call(app, "DELETE", f"/v1/sandboxes/{doc['id']}")
+        assert status == 204
+        assert not room.exists()
+        assert len(calls) >= 2
     finally:
         provider.close()
 
