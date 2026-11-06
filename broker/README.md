@@ -300,6 +300,12 @@ policy outside the room (see `room-kit/README.md`, "Room egress policy") and
 answers with the canonical policy and its sha256. A sealed hotel also signs a
 receipt for the switch (`X-Room-Receipt`).
 
+A create that names no mode gets `deny_all`: no `network`, `null`, `""`,
+`{}`, or an object whose `mode` is missing, `null` or `""`. The hotel reads a
+missing mode as `internet`, so the broker sets it first. A mode other than
+`internet`, `deny_all`, `allowlist` (or the old names `public` and `none`) is
+a 400 `invalid_network_mode` before any hotel is asked.
+
 Clients (Harbor plugin, ctcli) send `"network": "allowlist"` with
 `"network_allow": [...]`, and the same PUT with `{"mode", "allow"}`. The
 catalog shows `dynamic_network_policy: true` and the entry types in

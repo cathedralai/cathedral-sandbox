@@ -127,3 +127,97 @@ func TestNativeSwitchPassesThroughWithReceipt(t *testing.T) {
 		t.Fatalf("switch: %d %v %s", resp.StatusCode, resp.Header, raw)
 	}
 }
+
+// AB#574: a native create whose network names no mode fails closed to
+// deny_all, in every spelling of "no mode". The hotel reads a missing mode as
+// internet, so the broker must not pass any of these through as they came.
+func TestNativeCreateWithEmptyNetworkModeIsDenyAll(t *testing.T) {
+	cases := []struct {
+		name string
+		body map[string]any
+	}{
+		{"no network", map[string]any{"image": "alpine:3.20"}},
+		{"null network", map[string]any{"image": "alpine:3.20", "network": nil}},
+		{"empty string", map[string]any{"image": "alpine:3.20", "network": ""}},
+		{"empty object", map[string]any{"image": "alpine:3.20", "network": map[string]any{}}},
+		{"null mode", map[string]any{"image": "alpine:3.20", "network": map[string]any{"mode": nil}}},
+		{"empty mode", map[string]any{"image": "alpine:3.20", "network": map[string]any{"mode": ""}}},
+		{"allow without mode", map[string]any{"image": "alpine:3.20", "network": map[string]any{"allow": []any{}}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tc := newChain(t)
+			status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", c.body)
+			if status != 202 {
+				t.Fatalf("create: %d %v", status, doc)
+			}
+			net, ok := tc.lastCreate(t)["network"].(map[string]any)
+			if !ok || net["mode"] != "deny_all" {
+				t.Fatalf("hotel network: %v", tc.lastCreate(t)["network"])
+			}
+			if allow, ok := net["allow"].([]any); !ok || len(allow) != 0 {
+				t.Fatalf("hotel network allow: %v", net)
+			}
+		})
+	}
+}
+
+// A native create that names a mode the hotel knows keeps it as sent.
+func TestNativeCreateKeepsANamedNetworkMode(t *testing.T) {
+	cases := []struct {
+		network any
+		mode    string
+	}{
+		{"internet", "internet"},
+		{"deny_all", "deny_all"},
+		{"public", "public"},
+		{"none", "none"},
+		{map[string]any{"mode": "internet"}, "internet"},
+		{map[string]any{"mode": "deny_all", "allow": []any{}}, "deny_all"},
+		{map[string]any{"mode": "allowlist", "allow": []any{"pypi.org"}}, "allowlist"},
+	}
+	for _, c := range cases {
+		tc := newChain(t)
+		status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "network": c.network})
+		if status != 202 {
+			t.Fatalf("%v: create %d %v", c.network, status, doc)
+		}
+		got := tc.lastCreate(t)["network"]
+		if s, ok := got.(string); ok {
+			if s != c.mode {
+				t.Fatalf("%v: hotel network %v", c.network, got)
+			}
+			continue
+		}
+		if m, _ := got.(map[string]any); m["mode"] != c.mode {
+			t.Fatalf("%v: hotel network %v", c.network, got)
+		}
+	}
+}
+
+// A native create that names a mode nobody knows is refused before any hotel
+// is asked, with a code that says what was wrong.
+func TestNativeCreateRefusesAnUnknownNetworkMode(t *testing.T) {
+	for _, bad := range []any{
+		"open",
+		"Internet",
+		map[string]any{"mode": "open"},
+		map[string]any{"mode": 5},
+		map[string]any{"mode": true},
+		map[string]any{"mode": map[string]any{}},
+		5,
+		true,
+		[]any{"internet"},
+	} {
+		tc := newChain(t)
+		status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "network": bad})
+		if status != 400 || errCode(doc) != "invalid_network_mode" {
+			t.Fatalf("%v: want 400 invalid_network_mode, got %d %v", bad, status, doc)
+		}
+		for _, f := range tc.hotels {
+			if len(f.creates) != 0 {
+				t.Fatalf("%v: a refused create reached a hotel: %v", bad, f.creates)
+			}
+		}
+	}
+}

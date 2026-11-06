@@ -15,6 +15,8 @@ as the hotel receives it (room_receipts.owner_request_sha256). The broker
 changes a create before the hotel sees it, so this script makes the same
 changes first:
   - a missing or null "network" becomes {"mode": "deny_all", "allow": []};
+  - a "network" object whose "mode" is missing, null or "" gets mode
+    "deny_all" (and "allow": [] when it has no list);
   - "count" and the placement fields ("hotels", "hotel_labels",
     "exclude_hotel_labels", "sealed", "placement") are removed;
   - a workspace named "<hotel>.<name>" becomes "<name>";
@@ -84,8 +86,11 @@ def hotel_form(doc: dict, guest: str) -> dict:
         raise ValueError("name the image: the broker rewrites a template create, so the hotel would not see this body")
     if out.get("snapshot_id"):
         raise ValueError("a snapshot fork is rewritten by the broker (hotel snapshot id); not signable yet")
-    if out.get("network") in (None, ""):
+    net = out.get("network")
+    if net in (None, ""):
         out["network"] = {"mode": "deny_all", "allow": []}
+    elif isinstance(net, dict) and net.get("mode") in (None, ""):  # broker/main.go nativeNetwork
+        out["network"] = {**net, "mode": "deny_all", "allow": [] if net.get("allow") is None else net["allow"]}
     ws = out.get("workspace")
     name = ws if isinstance(ws, str) else (ws.get("name") if isinstance(ws, dict) else None)
     if isinstance(name, str) and "." in name:  # the broker cuts "<hotel>." off and sends the hotel's name
