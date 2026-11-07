@@ -253,3 +253,24 @@ def test_builds_use_the_room_daemon_default_runtime(fake, monkeypatch) -> None:
     (work / "Dockerfile").write_text("FROM alpine:3.20\n")
     DockerClient().build(tag="cathedral-build-test:latest", context_dir=work)
     assert seen["env"].get("DOCKER_BUILDKIT") == "0"
+
+
+def test_a_sealed_exec_stays_out_of_the_history_and_the_log(fake) -> None:
+    # AB#417 sealed commands: GET .../logs serves the exec history and the log to
+    # whoever holds the hotel key, so an exec the front opened from an envelope
+    # must leave its command and output to its client only.
+    fake.set(exec_model=True, exec_rules=[{"contains": "sealed-plaintext-out", "stdout": "sealed-plaintext-out\n"},
+                                          {"contains": "plain-out", "stdout": "plain-out\n"}])
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        sealed = provider.exec(sid, ExecRequest(cmd=["echo", "sealed-plaintext-out"], timeout_seconds=10, sealed=True))
+        assert sealed.exit_code == 0 and "sealed-plaintext-out" in sealed.stdout
+        record = provider.logs(sid)
+        assert record["exec_history"] == [] and "sealed-plaintext-out" not in record["stdout"]
+        provider.exec(sid, ExecRequest(cmd=["echo", "plain-out"], timeout_seconds=10))
+        record = provider.logs(sid)
+        assert [r["command"] for r in record["exec_history"]] == ["echo plain-out"]
+        assert "plain-out" in record["stdout"] and "sealed-plaintext-out" not in record["stdout"]
+    finally:
+        provider.close()

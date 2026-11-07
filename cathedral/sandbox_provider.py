@@ -630,11 +630,13 @@ class InMemorySandboxProvider:
             sandbox.network_bytes += len(out) + len(err)
             sandbox.memory_peak_bytes = max(sandbox.memory_peak_bytes, peak_rss)
             self._touch(sandbox)
-            sandbox.exec_history.append(
-                ExecRecord(command=_render_cmd(request), exit_code=code, duration_ms=int(duration), at=_now())
-            )
-            sandbox.container_stdout.extend(out)
-            sandbox.container_stderr.extend(err)
+            if not request.sealed:
+                # A sealed exec's command and output reach only its client (sealed answer).
+                sandbox.exec_history.append(
+                    ExecRecord(command=_render_cmd(request), exit_code=code, duration_ms=int(duration), at=_now())
+                )
+                sandbox.container_stdout.extend(out)
+                sandbox.container_stderr.extend(err)
         return ExecResult(
             exit_code=code,
             stdout=out.decode("utf-8", "replace"),

@@ -41,6 +41,11 @@ Routes it adds:
                                    an exact retry answers unchanged with that receipt)
   GET /v1/sandboxes/<id>/sealed-secrets
                                    names, versions and envelope sha256 of that room's secrets
+  POST /v1/sandboxes/<id>/sealed-exec
+                                   ROOM_SEALED_EXEC=1 on a sealed guest only: one customer exec,
+                                   sealed to the binding's sealed_exec key; the answer is sealed to
+                                   a key the client made for it (the receipt signs sha256 of the
+                                   plaintext command, as for any exec, and of both envelopes)
 Response header on a signed operation:
   X-Room-Receipt: base64url(canonical(receipt))
 
@@ -70,6 +75,18 @@ read-only at /run/secrets. A version at or below the last one accepted for
 that room incarnation and name is refused, so an older envelope cannot roll a
 secret back. A room's entries go with the room. Flag off: the binding is byte
 for byte what it was, and the routes answer 403.
+
+Sealed commands (ROOM_SEALED_EXEC=1, sealed only; AB#417). The same pattern
+for exec, with its own per-boot X25519 key (sealed_exec.x25519_public_b64 in
+the binding). The envelope holds cmd, env, stdin, cwd and user; its AAD names
+the binding, the room, its incarnation, issued_at, the timeout and the key the
+answer is sealed to. The front opens it, runs it through the room API inside
+the guest (which keeps it out of the exec history and logs), and seals the
+room API's whole answer (status, exit code, output) to the client's key. An
+envelope runs once: its ephemeral key is kept while issued_at is in the
+window, and one outside the window is refused. The receipt is an exec receipt
+that signs sha256 of the plaintext command, as for any exec, and the sha256 of
+both envelopes, which is how the client knows the answer is the guest's.
 
 Dedicated sealed machine (one owner). The host launches the guest with the
 owner's Ed25519 public key and the manifest digest in fw_cfg, and with
@@ -107,7 +124,7 @@ import time
 import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse, urlsplit
+from urllib.parse import parse_qs, unquote, urlparse, urlsplit
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature, InvalidTag
@@ -195,6 +212,38 @@ SECRET_VERSION_MAX = 2**53 - 1  # an integer a browser can hold exactly
 SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")  # a file name: no slash, no leading dot
 SECRETS_ROOM_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 SECRETS_ROUTE = re.compile(r"^/v1/sandboxes/(?P<id>[^/]+)/sealed-secrets$")
+# Customer-sealed commands (AB#417, docs/SEALED_COMMANDS.md). The client side is ctcli
+# (cathedral-pool cli/sealed_exec.py); keep the two in step. The same envelope as sealed
+# secrets, with its own key, HKDF info and AAD, in both directions: the request is sealed
+# to this boot's sealed_exec key, the answer to a key the client made for this one exec.
+EXEC_SCHEMA = "cathedral_sealed_exec_v1"
+EXEC_ALGORITHM = PLANT_ALGORITHM
+EXEC_HKDF_INFO = b"cathedral.sealed-exec.v1"
+EXEC_AAD_LABEL = b"cathedral.sealed-exec.v1\n"
+EXEC_RESPONSE_SCHEMA = "cathedral_sealed_exec_response_v1"
+EXEC_RESPONSE_HKDF_INFO = b"cathedral.sealed-exec-response.v1"
+EXEC_RESPONSE_AAD_LABEL = b"cathedral.sealed-exec-response.v1\n"
+EXEC_HEADER = ("schema", "algorithm", "binding_sha256", "sandbox_id", "room_create_receipt_sha256", "issued_at",
+               "timeout_seconds", "response_public_b64")
+EXEC_FIELDS = frozenset(EXEC_HEADER + SECRETS_ENVELOPE)
+EXEC_STRING_FIELDS = ("response_public_b64",) + SECRETS_ENVELOPE  # hashed or decoded before any other check
+# What the envelope opens to: the exec request the room API takes, less the timeout (in the header).
+EXEC_REQUEST_KEYS = frozenset({"cmd", "env", "stdin", "cwd", "user"})
+EXEC_PLAINTEXT_MAX_BYTES = 6 * 1024 * 1024  # 1 MiB of stdin and the env, with JSON escapes
+EXEC_MAX_BYTES = 9 * 1024 * 1024  # one request: base64 of the largest envelope plus the header
+EXEC_TIMEOUT_MAX = 14400  # the room API's own limit (cathedral.sandbox_api EXEC_MAX_TIMEOUT_SECONDS)
+# Replay: each accepted envelope's ephemeral key is kept until its issued_at leaves the window,
+# and an envelope outside the window is refused, so a kept key is never needed after that.
+EXEC_MAX_AGE_SECONDS = 120
+EXEC_FUTURE_SKEW_SECONDS = 30
+EXEC_MAX_PER_ROOM = 4096  # accepted in one window by one room incarnation (about 27 a second)
+EXEC_MAX_TRACKED = 131072  # across rooms
+EXEC_ROUTE = re.compile(r"^/v1/sandboxes/(?P<id>[^/]+)/sealed-exec$")
+# The room API's route for an exec this front opened: it runs as /exec does and keeps the
+# command and its output out of the exec history and the container log, which GET .../logs
+# serves to the relay. An API without the route answers 404 and runs nothing (fail closed).
+# Only this front calls it: a caller's request that names it in any spelling is refused.
+EXEC_API_TAIL = "exec-sealed"
 
 
 class PlantError(ValueError):
@@ -758,6 +807,198 @@ def _write_secret_file(dir_fd: int, name: str, value: bytes) -> None:
         raise
 
 
+# ---------------------------------------------------------------- sealed commands (AB#417)
+
+class ExecRefused(Exception):
+    """A sealed exec refused before it ran. The code is short and never names the command."""
+
+    def __init__(self, status: int, code: str, extra: dict | None = None):
+        super().__init__(code)
+        self.status, self.code, self.extra = status, code, extra or {}
+
+
+def sealed_exec_wanted() -> bool:
+    """ROOM_SEALED_EXEC=1. Unset or any other value: off."""
+    return os.environ.get("ROOM_SEALED_EXEC") == "1"
+
+
+def exec_header(binding_sha256: str, sandbox_id: str, room_create_receipt_sha256: str, issued_at: int,
+                timeout_seconds: int, response_public_b64: str) -> dict:
+    """The fields of a sealed exec that its AAD authenticates (all but the three envelope values).
+
+    Relays read them (the timeout sizes their own waits) and cannot change
+    them: any change fails the open.
+    """
+    return {"schema": EXEC_SCHEMA, "algorithm": EXEC_ALGORITHM, "binding_sha256": binding_sha256,
+            "sandbox_id": sandbox_id, "room_create_receipt_sha256": room_create_receipt_sha256,
+            "issued_at": issued_at, "timeout_seconds": timeout_seconds, "response_public_b64": response_public_b64}
+
+
+def exec_aad(header: dict) -> bytes:
+    return EXEC_AAD_LABEL + canonical(header)
+
+
+def exec_response_header(header: dict, request_sha256: str) -> dict:
+    """What the answer's AAD names: this boot, this room incarnation, this exact request and its answer key."""
+    return {"schema": EXEC_RESPONSE_SCHEMA, "algorithm": EXEC_ALGORITHM, "binding_sha256": header["binding_sha256"],
+            "sandbox_id": header["sandbox_id"], "room_create_receipt_sha256": header["room_create_receipt_sha256"],
+            "request_sha256": request_sha256, "response_public_b64": header["response_public_b64"]}
+
+
+def exec_response_aad(header: dict, request_sha256: str) -> bytes:
+    return EXEC_RESPONSE_AAD_LABEL + canonical(exec_response_header(header, request_sha256))
+
+
+def seal_exec_request(request: dict, recipient: X25519PublicKey, *, binding_sha256: str, sandbox_id: str,
+                      room_create_receipt_sha256: str, issued_at: int, timeout_seconds: int,
+                      response_public_b64: str) -> dict:
+    """The customer's sealed exec (ctcli, tests). The guest only opens."""
+    header = exec_header(binding_sha256, sandbox_id, room_create_receipt_sha256, issued_at, timeout_seconds,
+                         response_public_b64)
+    return {**header, **_seal_envelope(canonical(request), recipient, EXEC_HKDF_INFO, exec_aad(header))}
+
+
+def open_exec_request(doc: dict, private: X25519PrivateKey) -> bytes:
+    """Open a sealed exec. Raises ExecRefused, which never names the command."""
+    header = {k: doc[k] for k in EXEC_HEADER}
+    try:
+        return _open_envelope(doc, private, EXEC_HKDF_INFO, exec_aad(header),
+                              max_ciphertext=EXEC_PLAINTEXT_MAX_BYTES + 16)
+    except PlantError:
+        raise ExecRefused(400, "sealed_exec_does_not_open") from None
+
+
+def seal_exec_response(plaintext: bytes, header: dict, request_sha256: str) -> dict:
+    """The answer, sealed to the key the request names: only the client that made the request opens it."""
+    recipient = X25519PublicKey.from_public_bytes(base64.b64decode(header["response_public_b64"], validate=True))
+    sealed = _seal_envelope(plaintext, recipient, EXEC_RESPONSE_HKDF_INFO, exec_response_aad(header, request_sha256))
+    return {"schema": EXEC_RESPONSE_SCHEMA, "request_sha256": request_sha256, **sealed}
+
+
+def open_exec_response(doc: dict, response_private: X25519PrivateKey, request_doc: dict) -> bytes:
+    """Open an answer of seal_exec_response (ctcli, tests). Raises PlantError."""
+    header = {k: request_doc[k] for k in EXEC_HEADER}
+    request_sha256 = sha(canonical(request_doc))
+    if not isinstance(doc, dict) or doc.get("schema") != EXEC_RESPONSE_SCHEMA \
+            or doc.get("request_sha256") != request_sha256:
+        raise PlantError("ciphertext does not open")
+    return _open_envelope(doc, response_private, EXEC_RESPONSE_HKDF_INFO, exec_response_aad(header, request_sha256),
+                          max_ciphertext=1 << 31)
+
+
+def _usable_x25519(raw_b64) -> bool:
+    """32 bytes of base64 that make a shared key (low-order points do not)."""
+    try:
+        raw = base64.b64decode(raw_b64, validate=True)
+        if len(raw) != 32 or b64(raw) != raw_b64:
+            return False
+        X25519PrivateKey.generate().exchange(X25519PublicKey.from_public_bytes(raw))
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _exec_request_problem(request) -> str | None:
+    """None when the opened request has the room API's exec shape (the API checks the values)."""
+    if not isinstance(request, dict) or "cmd" not in request or not set(request) <= EXEC_REQUEST_KEYS:
+        return "fields"
+    cmd = request["cmd"]
+    if isinstance(cmd, str):
+        if not cmd.strip():
+            return "cmd"
+    elif not (isinstance(cmd, list) and cmd and all(isinstance(p, str) and p for p in cmd)):
+        return "cmd"
+    env = request.get("env")
+    if env is not None and not (isinstance(env, dict) and all(isinstance(k, str) and isinstance(v, str)
+                                                              for k, v in env.items())):
+        return "env"
+    for key in ("stdin", "cwd", "user"):
+        if request.get(key) is not None and not isinstance(request[key], str):
+            return key
+    return None
+
+
+class SealedExec:
+    """The per-boot sealed exec key and the ephemeral keys this boot ran. Memory only.
+
+    rooms maps a room id to (incarnation, {ephemeral_public_b64: issued_at}).
+    An envelope's ephemeral key is its identity: it is in the ECDH and the HKDF
+    info, so a relay cannot change it without breaking the open. A room's
+    entries go when a delete of it passes this front, when it is made again,
+    or when its issued_at leaves the window; none of that lets an envelope run
+    twice, because the window and the incarnation refuse it first.
+    """
+
+    def __init__(self):
+        self.private = X25519PrivateKey.generate()
+        self.public_b64 = b64(_raw_x25519(self.private.public_key()))
+        self.lock = threading.Lock()
+        self.rooms: dict[str, tuple[str, dict[str, int]]] = {}
+        self.tracked = 0
+        self.swept_at = float("-inf")
+
+    def __repr__(self) -> str:
+        return f"SealedExec(x25519_public_b64={self.public_b64})"
+
+    def binding_fields(self) -> dict:
+        return {"sealed_exec": {"schema": EXEC_SCHEMA, "algorithm": EXEC_ALGORITHM,
+                                "x25519_public_b64": self.public_b64}}
+
+    def _prune(self, room: str, now: float) -> dict[str, int]:
+        """The room's live entries; those whose issued_at left the window go. Caller holds the lock."""
+        _, seen = self.rooms[room]
+        stale = [eph for eph, at in seen.items() if at < now - EXEC_MAX_AGE_SECONDS]
+        for eph in stale:
+            del seen[eph]
+        self.tracked -= len(stale)
+        return seen
+
+    def forget(self, room: str) -> None:
+        """Drop the room's entries. Caller holds the lock."""
+        held = self.rooms.pop(room, None)
+        if held is not None:
+            self.tracked -= len(held[1])
+
+    def ran(self, room: str, incarnation: str, ephemeral: str) -> bool:
+        """True when this envelope already ran in the room's incarnation. Caller holds the lock."""
+        held = self.rooms.get(room)
+        return held is not None and held[0] == incarnation and ephemeral in held[1]
+
+    def admit(self, room: str, incarnation: str, ephemeral: str, issued_at: int, now: float, incarnation_of) -> None:
+        """Record the envelope as run, or raise ExecRefused. Caller holds the lock."""
+        held = self.rooms.get(room)
+        if held is None or held[0] != incarnation:
+            self.forget(room)
+            self.rooms[room] = (incarnation, {})
+        seen = self._prune(room, now)
+        if ephemeral in seen:
+            raise ExecRefused(409, "sealed_exec_replayed")
+        if len(seen) >= EXEC_MAX_PER_ROOM:
+            raise ExecRefused(429, "sealed_exec_room_busy", {"retry_after_s": EXEC_MAX_AGE_SECONDS})
+        if self.tracked >= EXEC_MAX_TRACKED:
+            self.sweep(incarnation_of, now)
+            if self.tracked >= EXEC_MAX_TRACKED:
+                raise ExecRefused(503, "sealed_exec_full", {"retry_after_s": EXEC_MAX_AGE_SECONDS})
+        seen[ephemeral] = issued_at
+        self.tracked += 1
+
+    def retire(self, room: str) -> None:
+        """A delete of the room passed this front."""
+        with self.lock:
+            self.forget(room)
+
+    def sweep(self, incarnation_of, now: float) -> None:
+        """Drop rooms that are gone or made again, and entries out of the window. At most once a second."""
+        if now - self.swept_at < SECRETS_SWEEP_SECONDS:
+            return
+        self.swept_at = now
+        for room, (incarnation, _) in list(self.rooms.items()):
+            if incarnation_of(room) != incarnation:
+                self.forget(room)
+            else:
+                self._prune(room, now)
+
+
 # ---------------------------------------------------------------- miner hotel: guest TLS and key install
 
 def install_aad(binding_sha256: str) -> bytes:
@@ -932,10 +1173,11 @@ class Ledger:
     """The receipt key, the binding and the chain of this boot."""
 
     def __init__(self, hotel: str, store: str, miner: MinerHotel | None = None,
-                 secrets: SealedSecrets | None = None):
+                 secrets: SealedSecrets | None = None, sealed_exec: SealedExec | None = None):
         self.miner = miner
-        # A secrets key means something only under an SNP report: level 1 drops it below.
+        # A secrets or sealed exec key means something only under an SNP report: level 1 drops both below.
         self.secrets = secrets
+        self.sealed_exec = sealed_exec
         # Raw Ed25519 owner key on a dedicated sealed machine, else None (no gate).
         self.owner_key: bytes | None = None
         if tsm_provider() == "sev_guest":
@@ -945,6 +1187,7 @@ class Ledger:
             raise RuntimeError("miner mode needs a sealed guest (TSM provider sev_guest)")
         else:
             self.secrets = None
+            self.sealed_exec = None
             self._init_hotel(hotel, store)
         # Runtime guest key. Not in the binding: adding it there would change
         # REPORT_DATA. Authenticated by an Ed25519 signature over the plant-key
@@ -1010,6 +1253,9 @@ class Ledger:
             # One added key, only with the flag on: a binding without it is unchanged,
             # and verifiers hash the binding whole, so they check this one as before.
             self.binding.update(self.secrets.binding_fields())
+        if self.sealed_exec is not None:
+            # The same rule for the sealed exec key: one added key, only with its flag on.
+            self.binding.update(self.sealed_exec.binding_fields())
         if owner is not None:
             # Enough to recompute HOST_DATA from published fields:
             # sha256(domain || manifest_sha256 || owner key) == host_data.
@@ -1231,6 +1477,70 @@ class Ledger:
             os.close(dir_fd)
         return answer("written"), receipt
 
+    def open_sealed_exec(self, room: str, doc, now: float | None = None) -> tuple[dict, dict]:
+        """POST /v1/sandboxes/<room>/sealed-exec, up to the run. Returns (header, request); raises ExecRefused.
+
+        Checked in this order: the fields, this boot's binding, the room in
+        the path, the incarnation, timeout and issued_at formats, freshness,
+        the answer key, the room's current incarnation, a replay, then the
+        envelope opens with this boot's key and its request has the room
+        API's exec shape. Then, under the lock, the envelope is recorded as
+        run: a second copy (a replay, or two racing) is refused.
+        """
+        box = self.sealed_exec
+        if box is None:
+            raise ExecRefused(403, "sealed_exec_disabled")
+        if not isinstance(doc, dict) or set(doc) != EXEC_FIELDS:
+            raise ExecRefused(400, "sealed_exec_fields_invalid")
+        if not all(isinstance(doc[k], str) and doc[k].isascii() for k in EXEC_STRING_FIELDS):
+            # Base64 is ASCII; a lone surrogate escape would parse and then fail the hash below.
+            raise ExecRefused(400, "sealed_exec_fields_invalid")
+        if doc["schema"] != EXEC_SCHEMA or doc["algorithm"] != EXEC_ALGORITHM:
+            raise ExecRefused(400, "sealed_exec_algorithm_unsupported")
+        if doc["binding_sha256"] != self.binding_sha256:
+            # Sealed for another boot or guest: the client fetches the evidence again and reseals.
+            raise ExecRefused(409, "sealed_exec_wrong_binding")
+        if doc["sandbox_id"] != room or not SECRETS_ROOM_RE.fullmatch(room):
+            raise ExecRefused(400, "sealed_exec_wrong_room")
+        incarnation, timeout, issued = doc["room_create_receipt_sha256"], doc["timeout_seconds"], doc["issued_at"]
+        if not isinstance(incarnation, str) or not KEY_SHA256_RE.fullmatch(incarnation):
+            raise ExecRefused(400, "sealed_exec_incarnation_invalid")
+        if type(timeout) is not int or not 1 <= timeout <= EXEC_TIMEOUT_MAX:
+            raise ExecRefused(400, "sealed_exec_timeout_invalid")
+        if type(issued) is not int or not 0 <= issued <= SECRET_VERSION_MAX:
+            raise ExecRefused(400, "sealed_exec_issued_at_invalid")
+        now = time.time() if now is None else now
+        if not now - EXEC_MAX_AGE_SECONDS <= issued <= now + EXEC_FUTURE_SKEW_SECONDS:
+            # The guest's clock is not secret, and naming it lets the client see its own skew.
+            raise ExecRefused(409, "sealed_exec_not_fresh", {"guest_time": int(now)})
+        if not _usable_x25519(doc["response_public_b64"]):
+            raise ExecRefused(400, "sealed_exec_response_key_invalid")
+        ephemeral = doc["ephemeral_public_b64"]
+
+        def check_incarnation() -> None:
+            current = self.room_incarnation(room)
+            if current is None:
+                raise ExecRefused(404, "sealed_exec_room_not_found")
+            if current != incarnation:
+                raise ExecRefused(409, "sealed_exec_wrong_incarnation")
+
+        check_incarnation()
+        with box.lock:
+            if box.ran(room, incarnation, ephemeral):
+                raise ExecRefused(409, "sealed_exec_replayed")
+        opened = open_exec_request(doc, box.private)
+        try:
+            request = json.loads(opened)
+        except ValueError:
+            request = None
+        opened = None
+        if _exec_request_problem(request) is not None:
+            raise ExecRefused(400, "sealed_exec_request_invalid")
+        with box.lock:
+            check_incarnation()  # deleted or made again while this one opened
+            box.admit(room, incarnation, ephemeral, issued, now, self.room_incarnation)
+        return {k: doc[k] for k in EXEC_HEADER}, request
+
     def _init_hotel(self, hotel: str, store: str) -> None:
         """Level 1: an Ed25519 hotel chain. No SNP report and no measurement."""
         self.sealed = False
@@ -1405,20 +1715,25 @@ class Handler(BaseHTTPRequestHandler):
             return miner.authorized(raw[7:].strip().encode())
         return hmac.compare_digest(raw[7:].strip().encode(), self.server.api_key)
 
-    def upstream(self, port: int, body: bytes | None):
+    def upstream(self, port: int, body: bytes | None, *, method: str | None = None, path: str | None = None,
+                 extra: dict | None = None):
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+        if extra:
+            headers = {k: v for k, v in headers.items() if k.lower() not in {e.lower() for e in extra}}
+            headers.update(extra)
         if getattr(self.server.ledger, "miner", None) is not None:
             # The caller's key was checked against the installed key before this
             # call. The API knows only the guest-internal key.
             headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
             headers["Authorization"] = "Bearer " + self.server.api_key.decode()
-        if self.command not in ("GET", "HEAD"):
+        method, path = method or self.command, path or self.path
+        if method not in ("GET", "HEAD"):
             # A write may have run before its answer was lost, so it is never
             # sent twice: a fresh connection (no stale keep-alive) and no
             # retry. A lost answer is a 502, and the receipt records it.
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=1800)
             try:
-                c.request(self.command, self.path, body=body, headers=headers)
+                c.request(method, path, body=body, headers=headers)
                 r = c.getresponse()
                 return r.status, r.getheaders(), r.read()
             except (http.client.HTTPException, OSError):
@@ -1428,7 +1743,7 @@ class Handler(BaseHTTPRequestHandler):
         for attempt in (1, 2):
             c = UP.conn(port)
             try:
-                c.request(self.command, self.path, body=body, headers=headers)
+                c.request(method, path, body=body, headers=headers)
                 r = c.getresponse()
                 return r.status, r.getheaders(), r.read()
             except (http.client.HTTPException, OSError):
@@ -1511,6 +1826,15 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             # Never passed to the API: the envelope stops here, opened or refused.
             return self.handle_sealed_secrets(ledger, m["id"], body)
+        m = EXEC_ROUTE.match(path)
+        if m:
+            # Opened here; only the plaintext exec goes on, inside the guest, to the room API.
+            return self.handle_sealed_exec(ledger, m["id"], body)
+        if EXEC_API_TAIL in unquote(urlparse(self.path).path):
+            # The room API's sealed exec route runs an exec that leaves no history or log, and
+            # it is not a signed route here: no caller may reach it. Parsed as the API parses
+            # it (urlparse drops a ";params" suffix), and decoded, so no spelling gets past.
+            return self.reply(404, b'{"error":{"code":"route_not_found","message":"no such route"}}')
         action = next((a for meth, pat, a in SIGNED if meth == self.command and pat.match(path)), None)
         if action and body:
             # A JSON escape of a lone surrogate parses, but cannot be encoded
@@ -1540,6 +1864,8 @@ class Handler(BaseHTTPRequestHandler):
             if deleted and ledger.secrets is not None:
                 # After the receipt, which ends the room's incarnation: no write lands from here on.
                 ledger.secrets.retire(deleted["id"])
+            if deleted and ledger.sealed_exec is not None:
+                ledger.sealed_exec.retire(deleted["id"])
         ctype = next((v for k, v in headers if k.lower() == "content-type"), "application/json")
         passthrough = {k: v for k, v in headers if k.lower() not in HOP and k.lower() != "content-type"}
         return self.reply(status, out, {**passthrough, **extra}, ctype)
@@ -1665,6 +1991,84 @@ class Handler(BaseHTTPRequestHandler):
         else:
             extra["X-Room-Receipt-Error"] = "sign_failed"
         return self.reply(200, canonical(out), extra)
+
+    def handle_sealed_exec(self, ledger: "Ledger", room: str, body: bytes | None):
+        """POST: open one customer-sealed exec, run it in the room, seal the room API's answer back.
+
+        The answer is 200 whenever the exec ran, whatever the room API said:
+        its status, exit code and output are all inside the sealed answer.
+        Only a room that died under the command is said in the clear
+        (room_alive, oom_killed), because the API stops billing on it.
+        """
+        if self.command != "POST":
+            return self.reply(405, b'{"error":"method_not_allowed"}', {"Allow": "POST"})
+        if not self.authorized():
+            return self.reply(401, b'{"error":"unauthorized"}')
+        if ledger.sealed_exec is None:
+            return self.reply(403, b'{"error":{"code":"sealed_exec_disabled","message":"this hotel does not accept sealed commands"}}')
+        if not SECRETS_ROOM_RE.fullmatch(room):
+            return self.reply(400, b'{"error":{"code":"sealed_exec_wrong_room","message":"not a room id"}}')
+        if body is None or len(body) > EXEC_MAX_BYTES:
+            return self.reply(413, b'{"error":{"code":"sealed_exec_too_large","message":"the request is too large"}}')
+        try:
+            doc = json.loads(body)
+        except ValueError:
+            doc = None
+        try:
+            header, request = ledger.open_sealed_exec(room, doc)
+        except ExecRefused as exc:
+            return self.reply(exc.status, canonical({"error": {"code": exc.code, "message": exc.code.replace("_", " "),
+                                                               **exc.extra}}),
+                              {"Retry-After": str(exc.extra["retry_after_s"])} if "retry_after_s" in exc.extra else None)
+        request_sha256 = sha(canonical(doc))
+        command_sha256 = sha(canonical(request["cmd"]))
+        inner = canonical({"cmd": request["cmd"], "env": request.get("env") or {}, "stdin": request.get("stdin"),
+                           "cwd": request.get("cwd"), "user": request.get("user"),
+                           "timeout_seconds": header["timeout_seconds"]})
+        request = None
+        status, _headers, out = self.upstream(
+            self.server.api_port, inner, method="POST", path=f"/v1/sandboxes/{room}/{EXEC_API_TAIL}",
+            extra={"Content-Type": "application/json"})
+        inner = None
+        try:
+            answer = json.loads(out) if out else None
+        except ValueError:
+            answer = None
+        plain = {"status": status, "answer": answer}
+        if answer is None and out:
+            plain["answer_b64"] = b64(out)
+        sealed = seal_exec_response(canonical(plain), header, request_sha256)
+        plain = out = None
+        fate = {}
+        if status == 200 and isinstance(answer, dict) and answer.get("room_alive") is False:
+            # The API ends a dead room's billing on these two (cathedral_broker_sealed.room_fate).
+            fate = {"room_alive": False, "oom_killed": answer.get("oom_killed") is True}
+        answer = None
+        reply = canonical({"sealed_response": sealed, **fate})
+        extra = {}
+        try:
+            receipt = ledger.sign({
+                "action": "exec",
+                "target": f"{self.command} {self.path}",
+                "sandbox_id": room,
+                "customer_request_sha256": sha(body),
+                # As for every exec: sha256 of the command the room ran, here the opened one.
+                "command_sha256": command_sha256,
+                "image": None,
+                "image_digest": None,
+                # The front's answer. The room API's own status is inside the sealed answer.
+                "status": 200,
+                "result_sha256": sha(reply),
+                "sealed": True,
+                "room_create_receipt_sha256": header["room_create_receipt_sha256"],
+                "sealed_request_sha256": request_sha256,
+                "sealed_response_sha256": sha(canonical(sealed)),
+            })
+            extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(receipt)).decode()
+        except Exception as exc:  # noqa: BLE001 the command ran: answer, and say the receipt is missing
+            traceback.print_exc()
+            extra["X-Room-Receipt-Error"] = type(exc).__name__
+        return self.reply(200, reply, extra)
 
     def handle_escape_plant_key(self, ledger: "Ledger"):
         """GET /room/escape-plant-key: the guest X25519 public key (Escape hotels only)."""
@@ -1921,8 +2325,9 @@ def main() -> int:
         miner = MinerHotel(env["ROOM_HOTEL_NAME"], parse_install_signers(env.get("ROOM_HOTEL_KEY_INSTALL_SIGNERS", "")))
     store = env.get("ROOM_RECEIPTS_DIR", "/run/room-receipts")
     secrets = SealedSecrets(env.get("ROOM_SEALED_SECRETS_DIR") or DEFAULT_SECRETS_DIR) if sealed_secrets_wanted() else None
+    sealed_exec = SealedExec() if sealed_exec_wanted() else None
     try:
-        ledger = Ledger(env["ROOM_HOTEL_NAME"], store, miner=miner, secrets=secrets)
+        ledger = Ledger(env["ROOM_HOTEL_NAME"], store, miner=miner, secrets=secrets, sealed_exec=sealed_exec)
     except OwnerBindingError as exc:
         # Fail closed: nothing listens, so the broker sees the hotel down.
         # The console is the guest serial port, the one log the host operator can read.
@@ -1940,8 +2345,11 @@ def main() -> int:
         if ledger.secrets is not None:
             print(f"room-receipts: sealed secrets on: key {ledger.secrets.public_b64} in the binding; "
                   f"room directories under {ledger.secrets.root}", flush=True)
-    elif secrets is not None:
-        print("room-receipts: ROOM_SEALED_SECRETS=1 ignored: level 1 has no SNP report to bind the key", flush=True)
+        if ledger.sealed_exec is not None:
+            print(f"room-receipts: sealed commands on: key {ledger.sealed_exec.public_b64} in the binding", flush=True)
+    elif secrets is not None or sealed_exec is not None:
+        print("room-receipts: ROOM_SEALED_SECRETS=1 and ROOM_SEALED_EXEC=1 are ignored: level 1 has no SNP report "
+              "to bind the key", flush=True)
     else:
         print(f"room-receipts: binding {ledger.binding_sha256} level hotel", flush=True)
     args = (ledger, int(env.get("ROOM_API_PORT", "18090")), int(env.get("ROOM_HEALTH_PORT", "18091")), api_key,
