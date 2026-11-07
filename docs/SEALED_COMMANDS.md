@@ -52,7 +52,7 @@ Request (`POST /v1/sandboxes/<room>/sealed-exec` at the front; the customer send
 - **The relay can still run its own commands.** Plaintext exec, files, processes and terminals stay open to whoever holds the hotel bearer (our API, broker), so they can read what a sealed exec wrote to disk or `/run/secrets`. Every such exec is in the guest-signed chain: seen, not stopped. Closing it needs a sealed-only room mode plus a customer key named in the create receipt that signs each request (the slice 1 section 7 gap).
 - **No sender authentication.** Anyone with the attestation can seal an exec to the guest key, as for sealed secrets. This adds confidentiality for the customer's own commands, not authorization.
 - **Sync only.** Background execs (`/execs`), process starts and terminals are plaintext. Through cathedral.computer that limits a sealed exec to 45 s.
-- **Withholding and delay.** A relay can drop an exec or hold it up to the 120 s window. The client sees a missing or unsigned answer (exit 3), never a fake one.
+- **Withholding and delay.** A relay can drop an exec or hold it up to the 120 s window. The client sees a missing or unsigned answer, or an unsigned refusal, as unverified (ctcli exits 125 and names when the envelope stops being runnable), never a fake answer and never a false "nothing ran".
 - **Room identity on shared hotels** and **measurement trust**: as for sealed secrets (our API serves the bundle; the customer pins the measurement).
 - **Inside the guest** the plaintext exists in memory (front, room API, the `docker exec` argv and env), which SNP encrypts. Room to room is gVisor only.
 
