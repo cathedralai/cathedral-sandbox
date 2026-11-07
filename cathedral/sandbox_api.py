@@ -873,6 +873,10 @@ class ExecRequest:
     user: str | None = None
     timeout_seconds: int | None = None
     stdin: str | None = None
+    # A sealed exec (room-kit sealed commands, AB#417): the receipts front opened it
+    # inside the sealed guest. Its command and output stay out of the exec history
+    # and the container log, which GET /v1/sandboxes/{id}/logs serves to the relay.
+    sealed: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.cmd, str):

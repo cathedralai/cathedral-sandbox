@@ -64,7 +64,7 @@
 
 ## 7. What this does NOT protect
 
-- **Commands, outputs and files** still pass through the API and broker in clear (and the host on config hotels until AB#378).
+- **Commands, outputs and files** still pass through the API and broker in clear (and the host on config hotels until AB#378). With `ROOM_SEALED_EXEC=1`, a customer's sync exec and its output do not: `docs/SEALED_COMMANDS.md`. Files, background execs and terminals still do.
 - **Exec reads the file.** Whoever can send an exec to the room (our API and broker can) can `cat /run/secrets/<name>`. The exec lands in the guest-signed chain (`command_sha256`), so it can be seen, not stopped. Stopping it needs customer-signed commands or the encrypted link below.
 - **Room identity on shared hotels.** The client learns its room, and which create receipt is the room's, from our API. A dishonest operator could point it at a room it made on the same attested guest. Dedicated machines close this with the owner gate (`--owner-pubkey`): the create receipt then carries the owner's signature over the create.
 - **No sender authentication (slice 1 limitation).** The guest checks only that an envelope is sealed to its key for a live room incarnation. Anyone who reads the public attestation and holds the hotel bearer (our API and broker) can seal their own value at a higher version, or burn a name's version space with `2^53 - 1`. This adds nothing in slice 1, because the same relay can exec in the room. It must close before slice 3 closes exec: a customer key named in the create request (so the create receipt commits to it) that signs each envelope. So the rule in section 6 stops rollback by replay only: it does not stop a relay sealing an old value again at a new version.
