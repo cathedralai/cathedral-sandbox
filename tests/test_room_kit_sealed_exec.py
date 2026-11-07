@@ -821,3 +821,19 @@ def test_a_spelling_the_api_does_not_route_reaches_it_and_runs_nothing(real_room
     status, _, body = _request(port, "POST", f"/v1/sandboxes/{room}/exec-sealed/", canonical({"cmd": ["true"]}))
     assert (status, _code(body)) == (404, "route_not_found")
     assert json.loads(_request(port, "GET", f"/v1/sandboxes/{room}/logs")[2])["exec_history"] == []
+
+
+def test_a_clock_stepped_back_never_reopens_the_window_of_a_pruned_envelope(guest) -> None:
+    # Review finding 6: an envelope's entry goes once its issued_at leaves the window. A host
+    # that then steps the guest clock back must not make it fresh again.
+    ledger, _, _, client = guest
+    t0 = time.time()
+    first, _ = client.seal(issued_at=int(t0))
+    ledger.open_sealed_exec(ROOM, first, now=t0)
+    later = t0 + rr.EXEC_MAX_AGE_SECONDS + 80
+    ledger.open_sealed_exec(ROOM, client.seal(issued_at=int(later))[0], now=later)
+    assert ledger.sealed_exec.tracked == 1  # the first envelope's entry is gone
+    with pytest.raises(rr.ExecRefused) as refused:
+        ledger.open_sealed_exec(ROOM, first, now=t0 + 10)  # the clock went back
+    assert refused.value.code == "sealed_exec_not_fresh"
+    assert refused.value.extra["guest_time"] == int(later)

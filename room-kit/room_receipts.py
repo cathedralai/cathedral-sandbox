@@ -980,9 +980,17 @@ class SealedExec:
         self.rooms: dict[str, tuple[str, dict[str, int]]] = {}
         self.tracked = 0
         self.swept_at = float("-inf")
+        self.latest = float("-inf")  # the highest time this boot has used
 
     def __repr__(self) -> str:
         return f"SealedExec(x25519_public_b64={self.public_b64})"
+
+    def clock(self, now: float) -> float:
+        """now, never below a time already used: a host that steps the guest clock back after
+        an envelope's entry was dropped must not make that envelope fresh again."""
+        with self.lock:
+            self.latest = max(self.latest, now)
+            return self.latest
 
     def binding_fields(self) -> dict:
         return {"sealed_exec": {"schema": EXEC_SCHEMA, "algorithm": EXEC_ALGORITHM,
@@ -1560,7 +1568,7 @@ class Ledger:
             raise ExecRefused(400, "sealed_exec_timeout_too_long")
         if type(issued) is not int or not 0 <= issued <= SECRET_VERSION_MAX:
             raise ExecRefused(400, "sealed_exec_issued_at_invalid")
-        now = time.time() if now is None else now
+        now = box.clock(time.time() if now is None else now)
         if not now - EXEC_MAX_AGE_SECONDS <= issued <= now + EXEC_FUTURE_SKEW_SECONDS:
             # The guest's clock is not secret, and naming it lets the client see its own skew.
             raise ExecRefused(409, "sealed_exec_not_fresh", {"guest_time": int(now)})
