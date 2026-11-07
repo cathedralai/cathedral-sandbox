@@ -195,6 +195,12 @@ SECRET_VERSION_MAX = 2**53 - 1  # an integer a browser can hold exactly
 SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")  # a file name: no slash, no leading dot
 SECRETS_ROOM_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 SECRETS_ROUTE = re.compile(r"^/v1/sandboxes/(?P<id>[^/]+)/sealed-secrets$")
+# AB#389: the Cathedral API names the sandbox a create is for in this label
+# (the id its customer holds, a UUID) and refuses it from customers. The create
+# receipt signs it, so the customer can tie that id to this room without the
+# API's word. Any other value is not signed: the receipt then names no sandbox.
+SANDBOX_LINK_LABEL = "cathedral_sandbox_id"
+SANDBOX_LINK_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 class PlantError(ValueError):
@@ -1760,6 +1766,7 @@ class Handler(BaseHTTPRequestHandler):
             image = None
         policy = self.network_policy(action, status, res)
         tunables = self.room_tunables(action, status, res)
+        link = self.sandbox_link(action, req)
         return {
             "action": action,
             "target": f"{self.command} {self.path}",
@@ -1780,7 +1787,18 @@ class Handler(BaseHTTPRequestHandler):
             # copied from the API. The receipt key is in the binding, whose sha256 is the
             # boot report's REPORT_DATA, so a sealed hotel's SNP report covers this field.
             **(tunables or {}),
+            # Create: the Cathedral sandbox id the request's labels name (AB#389). Read from
+            # the request as this guest received it, so customer_request_sha256 covers it too.
+            **({"cathedral_sandbox_id": link} if link else {}),
         }
+
+    @staticmethod
+    def sandbox_link(action: str, req) -> str | None:
+        """The Cathedral sandbox id a create's labels name, when it is a lower-case UUID."""
+        if action != "create" or not isinstance(req, dict) or not isinstance(req.get("labels"), dict):
+            return None
+        value = req["labels"].get(SANDBOX_LINK_LABEL)
+        return value if isinstance(value, str) and SANDBOX_LINK_RE.fullmatch(value) else None
 
     @staticmethod
     def room_tunables(action: str, status: int, res) -> dict | None:
