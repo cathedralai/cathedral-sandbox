@@ -886,6 +886,26 @@ def open_exec_response(doc: dict, response_private: X25519PrivateKey, request_do
                           max_ciphertext=1 << 31)
 
 
+def _canonical_b64(value) -> bytes | None:
+    """The bytes of a base64 string written the one way b64encode writes them, else None.
+
+    A 32-byte key has 2 spare bits in its last character, so four strings decode to one key.
+    """
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (TypeError, ValueError):
+        return None
+    return raw if b64(raw) == value else None
+
+
+def _replay_key(ephemeral_b64: str) -> str:
+    """The replay table's name for an envelope: its ephemeral key's bytes, base64 as b64encode writes them."""
+    raw = _canonical_b64(ephemeral_b64)
+    if raw is None:
+        raw = base64.b64decode(ephemeral_b64, validate=True)
+    return b64(raw)
+
+
 def _usable_x25519(raw_b64) -> bool:
     """32 bytes of base64 that make a shared key (low-order points do not)."""
     try:
@@ -962,10 +982,11 @@ class SealedExec:
     def ran(self, room: str, incarnation: str, ephemeral: str) -> bool:
         """True when this envelope already ran in the room's incarnation. Caller holds the lock."""
         held = self.rooms.get(room)
-        return held is not None and held[0] == incarnation and ephemeral in held[1]
+        return held is not None and held[0] == incarnation and _replay_key(ephemeral) in held[1]
 
     def admit(self, room: str, incarnation: str, ephemeral: str, issued_at: int, now: float, incarnation_of) -> None:
         """Record the envelope as run, or raise ExecRefused. Caller holds the lock."""
+        ephemeral = _replay_key(ephemeral)
         held = self.rooms.get(room)
         if held is None or held[0] != incarnation:
             self.forget(room)
@@ -1494,6 +1515,10 @@ class Ledger:
             raise ExecRefused(400, "sealed_exec_fields_invalid")
         if not all(isinstance(doc[k], str) and doc[k].isascii() for k in EXEC_STRING_FIELDS):
             # Base64 is ASCII; a lone surrogate escape would parse and then fail the hash below.
+            raise ExecRefused(400, "sealed_exec_fields_invalid")
+        if any(_canonical_b64(doc[k]) is None for k in SECRETS_ENVELOPE):
+            # One spelling per value: a relay must not make one envelope look like another
+            # (the ephemeral key names the envelope in the replay table).
             raise ExecRefused(400, "sealed_exec_fields_invalid")
         if doc["schema"] != EXEC_SCHEMA or doc["algorithm"] != EXEC_ALGORITHM:
             raise ExecRefused(400, "sealed_exec_algorithm_unsupported")

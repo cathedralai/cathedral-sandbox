@@ -676,3 +676,59 @@ def test_the_timeout_in_the_header_is_the_one_the_room_enforces(real_room) -> No
     opened = client.open(_post(port, doc, room)[2], doc, key)
     assert time.monotonic() - t0 < 4
     assert opened["answer"]["timed_out"] is True
+
+
+# ---------------------------------------------------------------- review of 58f95a3
+
+def _respellings(value: str) -> list[str]:
+    """Every base64 spelling of the same bytes: the last character before the padding varies in its unused bits."""
+    raw = base64.b64decode(value, validate=True)
+    pad = len(value) - len(value.rstrip("="))
+    head, last = value.rstrip("=")[:-1], value.rstrip("=")[-1]
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    out = []
+    for c in alphabet:
+        candidate = head + c + "=" * pad
+        if candidate != value and base64.b64decode(candidate, validate=True) == raw:
+            out.append(candidate)
+    return out
+
+
+def test_a_respelled_ephemeral_key_is_not_a_new_envelope(guest) -> None:
+    # Review finding 1 (HIGH): the 43rd character of a 32-byte key has 2 unused bits. A relay that
+    # rewrites them keeps the same key (it still opens) and, keyed on the string, ran it again.
+    ledger, api, port, client = guest
+    doc, _ = client.seal()
+    spellings = _respellings(doc["ephemeral_public_b64"])
+    assert len(spellings) == 3
+    assert _post(port, doc)[0] == 200
+    for spelling in spellings:
+        status, _, body = _post(port, {**doc, "ephemeral_public_b64": spelling})
+        assert status in (400, 409), body
+    assert len(api.execs()) == 1
+
+
+def test_the_replay_table_is_keyed_on_the_decoded_key(guest) -> None:
+    # Even past the spelling check, the table names the key by its bytes.
+    ledger, api, _, client = guest
+    doc, _ = client.seal()
+    ledger.open_sealed_exec(ROOM, doc)
+    raw = base64.b64decode(doc["ephemeral_public_b64"])
+    [(incarnation, seen)] = ledger.sealed_exec.rooms.values()
+    assert list(seen) == [base64.b64encode(raw).decode()]
+    assert ledger.sealed_exec.ran(ROOM, incarnation, _respellings(doc["ephemeral_public_b64"])[0])
+
+
+@pytest.mark.parametrize("field", ["ephemeral_public_b64", "ciphertext_b64"])
+def test_a_non_canonical_base64_spelling_is_refused_before_anything_runs(guest, field) -> None:
+    # A 12-byte nonce has no spare bits; a ciphertext has them when its length is not a multiple of 3.
+    ledger, api, port, client = guest
+    for pad in range(3):
+        doc, _ = client.seal(request={"cmd": COMMAND, "stdin": "x" * pad})
+        respelled = _respellings(doc[field])
+        if respelled:
+            break
+    assert respelled, field
+    status, _, body = _post(port, {**doc, field: respelled[0]})
+    assert (status, _code(body)) == (400, "sealed_exec_fields_invalid")
+    assert api.execs() == [] and ledger.sealed_exec.tracked == 0
