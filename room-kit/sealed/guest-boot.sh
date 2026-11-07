@@ -41,7 +41,9 @@ if grep -qx 'ROOM_MINER=1' /opt/room-kit/room.env; then
     [ -s "$DATA/hotel/internal-api-key" ] || {
       install -m 0600 /dev/null "$DATA/hotel/internal-api-key.tmp"
       head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' > "$DATA/hotel/internal-api-key.tmp"
+      sync "$DATA/hotel/internal-api-key.tmp"          # on disk before the rename, so a crash never leaves it empty
       mv "$DATA/hotel/internal-api-key.tmp" "$DATA/hotel/internal-api-key"
+      sync "$DATA/hotel"                               # persist the rename
     }
     cat "$DATA/hotel/internal-api-key" > /run/room-api-key
   else

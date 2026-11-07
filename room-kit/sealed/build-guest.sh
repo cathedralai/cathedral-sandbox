@@ -66,6 +66,18 @@ R=$B/rootfs
 rm -rf "$R"
 cp -a "$B/base-$BASE_ID" "$R"
 
+# The data volume's header is verified at boot, but a cryptsetup older than 2.8.1
+# would still open a null-cipher key slot, so refuse to ship one with the volume on.
+if [ "$DATA_GIB" != 0 ]; then
+  CRYPTVER=$(chroot "$R" cryptsetup --version 2>/dev/null | awk 'NR==1{print $2}')
+  python3 -c 'import sys
+raw=sys.argv[1].split("-")[0]
+cur=tuple(int(x) for x in raw.split(".")[:3]) if raw else ()
+cur=cur+(0,)*(3-len(cur))
+sys.exit(0 if cur>=(2,8,1) else 1)' "$CRYPTVER" \
+    || { echo "cryptsetup ${CRYPTVER:-unknown} in the base rootfs is older than 2.8.1; use a newer suite or pin cryptsetup (SEALED_DATA_GIB needs it)" >&2; exit 1; }
+fi
+
 # ---------------------------------------------------------------- 2. kernel out, boot files gone
 KVER=$(ls "$R/lib/modules" | sort -V | tail -1)
 install -m 0644 "$R/boot/vmlinuz-$KVER" "$OUT/vmlinuz"

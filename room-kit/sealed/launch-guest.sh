@@ -32,6 +32,10 @@ EOF
 else
   HOST_DATA=$(python3 -c 'import base64,hashlib,sys;print(base64.b64encode(hashlib.sha256(open(sys.argv[1],"rb").read()).digest()).decode())' "$IMG/manifest.json")
 fi
+# install-sealed.sh asks for the HOST_DATA this build would launch with, to decide
+# whether a new build can open the data volume. Print it and stop before any disk
+# or QEMU, so the two never disagree on the value.
+if [ "${LAUNCH_PRINT_HOST_DATA:-0}" = 1 ]; then printf '%s\n' "$HOST_DATA"; exit 0; fi
 [ -f "$SEALED_DIR/scratch.raw" ] || truncate -s "${SEALED_SCRATCH_GIB}G" "$SEALED_DIR/scratch.raw"
 # Persistent data volume (SEALED_DATA_GIB > 0): the guest formats it once (LUKS2)
 # and opens it at every boot with a key only it can make. The host keeps the

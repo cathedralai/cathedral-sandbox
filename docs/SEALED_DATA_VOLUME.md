@@ -42,19 +42,34 @@ encrypted data could not persist.
 
 ## Threat model
 
-Protects against: anyone who reads the host's disk. The host operator, a
-host backup or snapshot, the provider's storage layer, a disk that leaves the
-machine. They get the LUKS2 header and ciphertext.
+Protects the confidentiality of workspace data against anyone who reads the
+host's disk: the host operator, a host backup or snapshot, the provider's
+storage layer, a disk that leaves the machine. They get the LUKS2 header and
+ciphertext.
 
-The header holds public values only: cipher, sector size, the key slot (the
-volume key encrypted under the derived passphrase), and a token with the
-build's measurement and a `key_id` label.
+The host can also write the disk, and the LUKS2 header lives on it, so the
+host can edit the header. The header carries the key slot (the volume key
+encrypted under the derived passphrase, which the host cannot read without the
+key), the segment cipher and sector size, and a cathedral token (the build's
+launch identity and a `key_id` label, not the key). None of these reveal the
+data, but a host could edit the cipher to a null cipher (Trail of Bits,
+2025-10-30) to make the guest write in clear. So the guest does not trust the
+header: after open, `verify_header()` proves the mapping is our
+`aes-xts-plain64` / 4096-byte-sector / 512-bit layout (device-mapper table and
+header JSON), refuses a key slot or segment with a null cipher, refuses to
+format a decrypted device that already holds a file system, and requires
+cryptsetup 2.8.1 or newer. On any mismatch the volume is closed and left
+untouched (status `tampered`). A sparse `data.raw` still reveals which blocks
+were written (we issue no discards, so it does not leak the free map, but the
+backing file's allocation does), which is metadata, not content.
 
 Trusted: the AMD secure processor and its firmware, the measured guest build
-(OVMF, kernel, initrd, command line), and the people who publish a build.
+(OVMF, kernel, initrd, command line), cryptsetup and dm-crypt in that build,
+and the people who publish a build.
 
 Not protected (see "Still not covered"): availability, integrity and
-freshness of the disk, and what the host can do through the hotel API.
+freshness of the data (the host can corrupt or roll back ciphertext blocks;
+XTS has no authentication), and what the host can do through the hotel API.
 
 ## Key source
 
@@ -89,8 +104,11 @@ Why these fields and not others:
 
 LUKS2 settings: `aes-xts-plain64`, 512-bit key, 4 KiB sectors, one key slot,
 PBKDF2 with 1,000 iterations. The passphrase is a uniform 256-bit key, so a
-slow KDF adds nothing. No discards: the host does not learn which blocks are
-free.
+slow KDF adds nothing. We issue no discards, so the mapping does not pass the
+free-block map to the host; the sparse backing file still shows which blocks
+were ever written, which is metadata, not content. At boot the guest verifies
+the header against this layout before it trusts the device (see the threat
+model).
 
 The key goes to stdout only. `sealed-data.sh` keeps it in a 0600 file on
 `/run` (tmpfs, so guest memory) while cryptsetup runs, then removes it. No
@@ -104,12 +122,13 @@ log, status file or receipt holds it.
 | State | Meaning | Workspaces this boot |
 |---|---|---|
 | `new` | Blank disk: formatted now | Data volume |
-| `open` | Opened with this build's key | Data volume |
+| `open` | Opened with this build's key, header verified | Data volume |
 | `locked` | A LUKS2 volume no key slot of which opens with this key (another build, chip or HOST_DATA). Left untouched | Scratch (gone at next boot) |
+| `tampered` | The header is not our layout (null cipher, wrong sector, extra segment), or the device holds a file system with no cathedral token. Closed, left untouched | Scratch |
 | `broken` | A LUKS header cryptsetup cannot read, or xfs does not mount. Left untouched | Scratch |
 | `absent` | No data disk attached | Scratch |
 | `nokey` | The secure processor gave no key | Scratch |
-| `error` | A step failed (serial log); the boot goes on | Scratch |
+| `error` | A step failed, or cryptsetup is older than 2.8.1 (serial log); the boot goes on | Scratch |
 
 Rules:
 
@@ -135,21 +154,29 @@ A roll changes the measurement, so the new build cannot open the old volume.
 
 ### Phase 1 (this change): explicit choice at every roll
 
-`install.sh --sealed` compares the new build's measurement with the booted
-image's. When they differ and `data.raw` exists, it stops unless:
+`install.sh --sealed` reads the launch identity (measurement, policy and
+HOST_DATA) from `data.raw`'s own LUKS token and compares it with the launch
+identity the new build would run with. It gets the new build's HOST_DATA from
+`launch-guest.sh` itself, so the two never disagree. When the identities match,
+the new build opens the volume and the roll proceeds. When they differ, it
+stops unless the operator has written a one-line choice to
+`$SEALED_DIR/data-on-new-build` (consumed by the run that uses it, so it never
+silently applies to a later roll):
 
-- `SEALED_DATA_ON_NEW_BUILD=reset`: `data.raw` becomes `data.raw.prev`. The
-  new build starts an empty volume. If the new guest then fails its
-  measurement check, the installer puts `data.raw.prev` back with the old
-  image. Remove `data.raw.prev` when the new build is good.
-- `SEALED_DATA_ON_NEW_BUILD=keep`: `data.raw` stays. The new build boots
-  `locked` and keeps workspaces on the scratch. Rolling back to the old
-  image opens it again.
+- `reset`: `data.raw` becomes `data.raw.prev` and the new build starts an empty
+  volume. It refuses to overwrite an existing `data.raw.prev` unless
+  `SEALED_DATA_OVERWRITE_PREV=1`, so an earlier owner's volume is never lost.
+  Until the new build's measurement checks, an EXIT trap puts the owner's
+  volume back on every failure path (a measurement mismatch, a guest that never
+  attests, any error), not only a mismatch. On success `data.raw.prev` stays
+  for the operator to remove once the new build is vouched for.
+- `keep`: `data.raw` stays. The new build boots `locked` and keeps workspaces
+  on the scratch. Rolling back to the old build opens it again.
 
 So in phase 1, workspaces outlive restarts of the same build (host reboot,
 guest crash, unit restart, `SEALED_SKIP_BUILD=1` reinstall), not a roll.
 That is better than before (nothing outlived a restart) and a roll can no
-longer drop data without the operator saying so.
+longer drop or strand data without the operator saying so.
 
 ### Phase 2 (proposal, not built): attested rekey before a roll
 
@@ -195,10 +222,12 @@ Rejected:
 
 ## Still not covered
 
-- **Integrity and freshness.** XTS has no authentication. The host can
-  corrupt sectors (the guest reads garbage) or put back an older copy of the
-  whole disk, and the guest does not notice. dm-integrity or AEAD would catch
-  corruption, not an old copy.
+- **Integrity and freshness (tracked separately, see AB#396).** XTS has no
+  authentication. `verify_header()` checks the LUKS2 header layout, but not the
+  data blocks: the host can corrupt sectors (the guest reads garbage) or put
+  back an older copy of the whole disk, and the guest does not notice.
+  dm-integrity or AEAD would catch corruption, not an old copy; a generation
+  counter is needed for rollback.
 - **Availability.** The host can delete `data.raw`. There is no backup and
   no replica.
 - **The hotel API.** On a config hotel the host holds the hotel key and can
@@ -329,3 +358,15 @@ four other guests on c48 were not touched.
 
 Not shown on hardware: the miner hotel path, the `install-sealed.sh` roll
 guard (both unit-tested), and a host firmware update.
+
+### Review round 1 (header verification and the roll-guard rework)
+
+The fixes from the first independent review (header verification against a
+null-cipher edit, the cryptsetup 2.8.1 floor, the `blkid` guard, the one-time
+reset choice with the EXIT-trap restore, launch-identity ownership, the
+`persistent` field, the miner-key fsync) are covered by
+`tests/test_room_kit_sealed_data.py`. They were not re-run on c48: the next c48
+window fell inside the 15:00 to 17:00 UTC escape rehearsal on 7 Nov, which is
+off limits. The planned hardware check is a `cipher_null` header edit on a
+throwaway `data.raw`, confirming `verify_header()` reports `tampered` and does
+not mkfs or mount; it runs after 17:15 UTC or in the next free window.
