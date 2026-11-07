@@ -71,7 +71,7 @@ func TestPreferMovesASealedCreateToTheGuestsOtherSealedHotel(t *testing.T) {
 	tc := limitedChain(t, guestLimits{Hotels: []string{"a", "c"}})
 	setHotel(tc, "c", func(h *hotel) {
 		h.cfgMu.Lock()
-		h.cfg.Sealed, h.cfg.Labels = true, map[string]string{"sealed": "true"}
+		h.cfg.Sealed, h.cfg.SealedAdmission, h.cfg.Labels = true, sealedAdmissionOff, map[string]string{"sealed": "true"} // past the gate: placement only
 		h.cfgMu.Unlock()
 	})
 	downHotel(tc, "a")
@@ -155,7 +155,7 @@ func TestPreferKeepsTheCallersOwnSealedLabelRules(t *testing.T) {
 func makeSealed(tc *testChain, id string) {
 	setHotel(tc, id, func(h *hotel) {
 		h.cfgMu.Lock()
-		h.cfg.Sealed, h.cfg.Labels = true, map[string]string{"sealed": "true"}
+		h.cfg.Sealed, h.cfg.SealedAdmission, h.cfg.Labels = true, sealedAdmissionOff, map[string]string{"sealed": "true"} // past the gate: placement only
 		h.cfgMu.Unlock()
 	})
 }

@@ -71,11 +71,15 @@ type hotelConfig struct {
 	// The hotel then carries the labels miner=true and miner_hotkey=<key>,
 	// so a guest policy can deny miner hotels ({"label": {"miner": "true"}}).
 	MinerHotkey string `json:"miner_hotkey,omitempty"`
-	// RequireAttestation: a sealed hotel takes rooms only after it passes the
-	// SEV-SNP attestation gate with the AMD chain, like a miner hotel
-	// (admission.go). It lets a config file hotel opt in; default false
-	// leaves a config hotel ungated.
+	// RequireAttestation was the config file hotel's opt-in to the SEV-SNP
+	// gate. Since AB#596 every sealed hotel is gated (admission.go), so it is
+	// redundant; it still loads, needs "sealed": true, and logs once.
 	RequireAttestation bool `json:"require_attestation,omitempty"`
+	// SealedAdmission: absent or "gate" (default) gates a sealed hotel.
+	// "off" skips the gate, for an operator hotel in the config file only:
+	// the emergency ops escape. A miner hotel or a joined hotel with "off"
+	// is refused (admission.go).
+	SealedAdmission string `json:"sealed_admission,omitempty"`
 	// TLSSPKISHA256 is derived from a miner hotel's verified SNP binding at
 	// join and persisted for safe reconnect after a broker restart.
 	TLSSPKISHA256 string `json:"tls_spki_sha256,omitempty"`
@@ -127,10 +131,12 @@ type config struct {
 	// MinerMaxHotels is the operator-approved maximum across all miner hotkeys.
 	// Zero refuses miner joins; pending and draining hotels count.
 	MinerMaxHotels int `json:"miner_max_hotels,omitempty"`
-	// Admission of joined hotels (admission.go). SealedAdmission "off" turns
-	// the attestation gate off for operator hotels, never miner hotels.
+	// Admission of sealed hotels (admission.go). The top-level
+	// SealedAdmission loads only as absent or "on": the gate cannot be
+	// turned off for every hotel or for joined hotels. The ops escape is
+	// "sealed_admission": "off" on one operator hotel's entry.
 	SealedAdmission    string   `json:"sealed_admission,omitempty"`
-	SealedMeasurements []string `json:"sealed_measurements,omitempty"`  // non-empty: a joined sealed hotel's measurement must be one of these
+	SealedMeasurements []string `json:"sealed_measurements,omitempty"`  // a gated hotel's measurement must be one of these; empty refuses every gated hotel
 	SealedHostData     []string `json:"sealed_host_data,omitempty"`     // non-empty: its HOST_DATA must be one of these
 	AttestTTLSeconds   float64  `json:"attest_ttl_seconds,omitempty"`   // a pass is good this long (default 600)
 	AttestEverySeconds float64  `json:"attest_every_seconds,omitempty"` // check a passed hotel again this often (default 60)
@@ -267,6 +273,9 @@ type broker struct {
 	compat           *compatState
 	prefetch         prefetchJobs
 	started          time.Time
+	// requireAttestationNoted logs the require_attestation deprecation once
+	// per broker, from the config file or a join (admission.go).
+	requireAttestationNoted sync.Once
 
 	// Durable client state (state.go).
 	savedUUIDs map[string]string // broker room id -> client id, from the state file
@@ -361,13 +370,30 @@ func loadBroker(path string) (*broker, error) {
 			return nil, fmt.Errorf("config: terminal_hotels entry %q must be a hotel id (non-empty, no dot)", id)
 		}
 	}
+	switch c.SealedAdmission {
+	case "", "on":
+	case sealedAdmissionOff:
+		return nil, errors.New(`config: top-level "sealed_admission": "off" is refused (AB#596): joined and miner hotels are always gated; to skip the gate for one operator hotel, set "sealed_admission": "off" on its entry in hotels`)
+	default:
+		return nil, fmt.Errorf(`config: sealed_admission %q: the top-level value can only be "on" (or absent)`, c.SealedAdmission)
+	}
 	b := &broker{cfg: c, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), started: time.Now()}
+	var optedIn []string // require_attestation hotels, for one deprecation line
 	for _, hc := range c.Hotels {
+		if err := validateSealedAdmission(hc); err != nil {
+			return nil, err
+		}
 		if hc.MinerHotkey != "" {
 			return nil, fmt.Errorf("config: miner hotel %q must join with attested guest TLS", hc.ID)
 		}
 		if hc.RequireAttestation && !hc.Sealed {
 			return nil, fmt.Errorf("config: hotel %q: require_attestation needs \"sealed\": true", hc.ID)
+		}
+		if hc.RequireAttestation {
+			optedIn = append(optedIn, hc.ID)
+		}
+		if hc.SealedAdmission == sealedAdmissionOff {
+			log.Printf("config: hotel %s: sealed_admission off: the SEV-SNP admission gate is OFF for this hotel (ops escape, AB#596)", hc.ID)
 		}
 		if strings.Contains(hc.ID, ".") || hc.ID == "" {
 			return nil, fmt.Errorf("hotel id %q: must be non-empty and have no dot", hc.ID)
@@ -383,6 +409,9 @@ func loadBroker(path string) (*broker, error) {
 		if err := b.addHotel(h); err != nil {
 			return nil, err
 		}
+	}
+	if len(optedIn) > 0 {
+		b.noteRequireAttestation(strings.Join(optedIn, ", "))
 	}
 	for _, gc := range c.Guests {
 		if c.MinerEnrollKeySHA256 != "" && (strings.EqualFold(c.MinerEnrollKeySHA256, gc.KeySHA256) || strings.EqualFold(c.MinerEnrollKeySHA256, gc.NextKeySHA256) || strings.EqualFold(c.MinerEnrollKeySHA256, gc.ViewTokenSHA256)) {

@@ -754,7 +754,7 @@ func TestSealedHotelTakesOnlySealedCreates(t *testing.T) {
 	tc := newChain(t)
 	// Make "b" a config-sealed hotel: exclusive, label added by the broker.
 	h := tc.b.hotelByID("b")
-	h.cfg.Sealed = true
+	h.cfg.Sealed, h.cfg.SealedAdmission = true, sealedAdmissionOff // past the gate: placement only
 	h.cfg.Labels = map[string]string{"sealed": "true"}
 	for i := 0; i < 20; i++ {
 		if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"}); strings.HasPrefix(id, "b.") {

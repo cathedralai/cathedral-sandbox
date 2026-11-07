@@ -29,7 +29,11 @@ func addFakeHotel(t *testing.T, tc *testChain, id string, sealed bool) {
 	hs := httptest.NewServer(f)
 	t.Cleanup(hs.Close)
 	tc.hotels[id] = f
-	h := newHotel(hotelConfig{ID: id, Name: id, API: hs.URL, Health: hs.URL, Concurrency: 4, Sealed: sealed}, "hotel-key")
+	hc := hotelConfig{ID: id, Name: id, API: hs.URL, Health: hs.URL, Concurrency: 4, Sealed: sealed}
+	if sealed {
+		hc.SealedAdmission = sealedAdmissionOff // placement fixture, past the gate (sealed_admission_test.go)
+	}
+	h := newHotel(hc, "hotel-key")
 	if err := tc.b.addHotel(h); err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +45,7 @@ func addFakeHotel(t *testing.T, tc *testChain, id string, sealed bool) {
 func policyChain(t *testing.T, stateDir string) *testChain {
 	t.Helper()
 	tc := newChainState(t, stateDir)
-	tc.b.hotelByID("a").cfg.Sealed = true
+	ungatedSealed(tc.b.hotelByID("a"))
 	addFakeHotel(t, tc, "nc", true)
 	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", polarisSealed); status != 200 {
 		t.Fatalf("set policy: %d %v", status, doc)
@@ -172,7 +176,7 @@ func TestAutoFreeCapacityUsesEveryHotelOfTheClass(t *testing.T) {
 	hs := httptest.NewServer(f)
 	t.Cleanup(hs.Close)
 	tc.hotels["s3"] = f
-	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "s3", "api": hs.URL, "key": joinKey, "sealed": true, "verify": false}); status != 201 {
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "s3", "api": hs.URL, "key": joinKey, "sealed": true}); status != 201 {
 		t.Fatalf("join s3: %d %v", status, doc)
 	}
 	setHotel(tc, "s3", func(h *hotel) { h.ok, h.slots = true, 10 })
@@ -394,7 +398,7 @@ func reservedChain(t *testing.T) *testChain { return reservedChainState(t, "") }
 func reservedChainState(t *testing.T, stateDir string) *testChain {
 	t.Helper()
 	tc := newChainState(t, stateDir)
-	tc.b.hotelByID("a").cfg.Sealed = true
+	ungatedSealed(tc.b.hotelByID("a"))
 	addFakeHotel(t, tc, "nc", true)
 	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{"policy": map[string]any{
 		"prefer": []any{map[string]any{"class": "sealed"}},

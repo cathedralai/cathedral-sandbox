@@ -14,9 +14,12 @@
 // cannot be removed at runtime; change the config file instead.
 //
 // A joined hotel takes rooms only after it passes admission (admission.go):
-// health, and for a sealed hotel an SEV-SNP attestation check. A join with
-// verify (the default) checks the attestation of a sealed hotel at once and
-// refuses the hotel (422 attestation_failed) when the check fails.
+// health, and for a sealed hotel the SEV-SNP, pinned measurement and AMD
+// chain check. A join with verify (the default) checks the attestation of a
+// sealed hotel at once and refuses the hotel (422 attestation_failed) when
+// the check fails. A sealed join with "verify": false is refused (400
+// verify_required; a miner: 409 guest_tls_required), and so is a join with
+// "sealed_admission": "off": a joined hotel is always gated.
 package main
 
 import (
@@ -378,6 +381,17 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	case hc.RequireAttestation && !hc.Sealed:
 		writeErr(w, 400, "invalid_hotel", "require_attestation needs a sealed hotel")
 		return
+	case hc.SealedAdmission == sealedAdmissionOff:
+		writeErr(w, 400, "invalid_hotel", `sealed_admission "off" is only for an operator hotel in the config file; a joined hotel is always gated`)
+		return
+	case hc.SealedAdmission != "" && hc.SealedAdmission != sealedAdmissionGate:
+		writeErr(w, 400, "invalid_hotel", `sealed_admission must be "gate" or absent`)
+		return
+	case hc.Sealed && hc.MinerHotkey == "" && req.Verify != nil && !*req.Verify:
+		// A miner gets 409 guest_tls_required below. An operator sealed hotel
+		// joined unverified would sit pending with its key kept (AB#596).
+		writeErr(w, 400, "verify_required", "a sealed hotel joins only with verify: the broker checks its SEV-SNP attestation before it adds the hotel")
+		return
 	case hc.MaxSlots < 0:
 		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
 		return
@@ -391,6 +405,10 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	}
 	if hc.Health == "" {
 		hc.Health = hc.API
+	}
+	hc.SealedAdmission = "" // "gate" is the default; hotels.json never carries the field
+	if hc.RequireAttestation {
+		b.noteRequireAttestation(hc.ID)
 	}
 	if hc.MinerHotkey != "" {
 		if hc.TLSSPKISHA256 != "" || (req.Verify != nil && !*req.Verify) ||

@@ -381,12 +381,10 @@ func TestSealedJoinPassesAttestationBeforePlacement(t *testing.T) {
 		t.Fatalf("no attestation: %d %v", status, doc)
 	}
 
-	// verify false: the hotel joins pending and takes no room until it passes.
-	m, url := newOperatorHotel(t, 5, nil)
-	tc.hotels["p"] = m.fakeHotel
-	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "p", "api": url, "key": joinKey, "sealed": true, "verify": false}); status != 201 {
-		t.Fatalf("join pending: %d %v", status, doc)
-	}
+	// A joined hotel back after a broker restart is pending and takes no room
+	// until it passes. (A sealed join with "verify": false, the old way to
+	// get here, is refused since AB#596: sealed_admission_test.go.)
+	m := addPendingSealed(t, tc, "p", 5, nil)
 	syncNow(tc, "p") // health passes, attestation does not answer
 	sealedOnP := map[string]any{"image": "alpine:3.20", "hotels": []string{"p"}}
 	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", sealedOnP)
@@ -568,12 +566,8 @@ func TestSpillFromJoinedSealedToUnsealedAndClearReasons(t *testing.T) {
 	setHotel(tc, "c", func(h *hotel) { h.slots = 1 })
 	joinMiner(t, tc, "m1", true, 1, nil)
 	joinMiner(t, tc, "m2", true, 1, nil)
-	// A sealed miner hotel that has not passed admission: never a candidate.
-	pm, url := newMinerHotel(t, 10, nil)
-	tc.hotels["m3"] = pm.fakeHotel
-	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "m3", "api": url, "key": joinKey, "sealed": true, "verify": false}); status != 201 {
-		t.Fatalf("join m3: %d %v", status, doc)
-	}
+	// A joined sealed hotel that has not passed admission: never a candidate.
+	addPendingSealed(t, tc, "m3", 10, nil)
 	syncNow(tc, "m3")
 
 	seen := map[string]bool{}
@@ -732,9 +726,7 @@ func TestCapacityClassTotalsIncludeJoinedHotels(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	joinMiner(t, tc, "m1", true, 7, nil)
 	joinMiner(t, tc, "m2", false, 4, nil)
-	pm, url := newOperatorHotel(t, 9, nil)
-	tc.hotels["m3"] = pm.fakeHotel
-	tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "m3", "api": url, "key": joinKey, "sealed": true, "verify": false})
+	addPendingSealed(t, tc, "m3", 9, nil) // joined sealed, not admitted
 	syncNow(tc, "m3")
 	status, doc := tc.call(t, "operator-key", "GET", "/v1/broker/capacity", nil)
 	classes, _ := doc["classes"].(map[string]any)

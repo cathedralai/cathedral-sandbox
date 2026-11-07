@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -115,6 +116,7 @@ func TestFillingA600HotelPoolRespectsEveryRule(t *testing.T) {
 			h.adm.attestedAt = time.Now()
 		}
 	})
+	b.cfg.SealedMeasurements = []string{strings.Repeat("ab", 48)} // a gated hotel needs a pin list (AB#596)
 	// The denied hotels are denied by id, one selector each (a deny list
 	// that grows with the pool).
 	pol := &guestPolicy{
