@@ -62,17 +62,23 @@ Design, threat model, upgrade path and the proof on an SNP host:
 [docs/SEALED_DATA_VOLUME.md](../../docs/SEALED_DATA_VOLUME.md).
 
 - Boot states (health `workspaces_storage`, the serial log `[sealed-data]`):
-  `new`, `open`, `locked` (a volume this build cannot open; left untouched),
-  `broken`, `absent`, `nokey`. In every state but `new` and `open`, this boot
+  `new`, `open`, `locked` (a volume this build cannot open), `tampered` (the
+  header is not our layout, or a file system with no cathedral token), `broken`,
+  `absent`, `nokey`, `error`. In every state but `new` and `open`, this boot
   keeps workspaces on the scratch disk.
-- The guest never formats a disk that holds a LUKS volume. To start empty,
-  stop the guest and remove `$SEALED_DIR/data.raw`.
-- A new build: `install.sh --sealed` stops unless `SEALED_DATA_ON_NEW_BUILD`
-  is `reset` (the old volume becomes `data.raw.prev`, which only the old build
-  opens; a measurement mismatch puts it back) or `keep` (leave it; the new
-  build runs with workspaces on the scratch disk).
+- After open, the guest verifies the LUKS2 header (cipher, sector size, key
+  slot) and refuses a null-cipher edit; it needs cryptsetup 2.8.1 or newer.
+- The guest never formats a disk that holds a LUKS header or a file system. To
+  start empty, stop the guest and remove `$SEALED_DIR/data.raw`.
+- A roll to a new launch identity: `install.sh --sealed` stops unless a one-line
+  choice is in `$SEALED_DIR/data-on-new-build`: `reset` (the old volume becomes
+  `data.raw.prev`, restored on any failure until the measurement checks; refuses
+  to overwrite an existing `data.raw.prev` without `SEALED_DATA_OVERWRITE_PREV=1`)
+  or `keep` (leave it; the new build runs with workspaces on the scratch disk).
 - A miner hotel keeps its guest-internal API key on the volume, so workspace
   owners (a hash of that key) are the same after a restart.
+- The `/v1/workspaces` answer carries `persistent` on a sealed hotel: false when
+  the volume did not open, so a customer sees that a restart would drop it.
 
 ## What the measurement covers
 

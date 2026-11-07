@@ -172,21 +172,38 @@ def test_tsm_report_reads_the_outblob_and_removes_its_entry(tmp_path: Path, monk
 KEY_A = "a1" * 32
 KEY_B = "b2" * 32
 
+# The fake cryptsetup models a LUKS2 volume: key slot 0, a header JSON the test
+# can edit (as a host editing the on-disk header would), tokens, and the active
+# device-mapper cipher that open would build from the header. It is enough to
+# exercise verify_header's control flow. It does NOT prove the kernel enforces
+# the cipher: only a real cryptsetup and dm-crypt do (see the c48 note in the PR).
 FAKE_CRYPTSETUP = r"""#!@BASH@
-# Fake cryptsetup: one LUKS2 volume in a regular file, one key slot, a token in the state dir.
 printf 'cryptsetup %s\n' "$*" >> "$FAKE_LOG"
-args=("$@"); keyfile=""; dev=""
+args=("$@"); keyfile=""
 for ((i = 0; i < ${#args[@]}; i++)); do [ "${args[$i]}" = --key-file ] && keyfile=${args[$((i + 1))]}; done
+H=$FAKE_STATE/header.json
 case "$1" in
+  --version) echo "cryptsetup ${FAKE_CRYPTSETUP_VERSION:-2.8.1} flags: UDEV BLKID" ;;
   isLuks) [ -e "$FAKE_STATE/isluks-broken" ] && exit 1
-          [ "$(head -c 6 "$2" | od -An -tx1 | tr -d ' \n')" = 4c554b53babe ] ;;
-  luksFormat) dev=${args[-1]}
-              [ "$(wc -c < "$keyfile" | tr -d ' ')" = 32 ] || exit 3
-              printf 'LUKS\xba\xbe' | dd of="$dev" conv=notrunc 2>/dev/null
-              od -An -tx1 "$keyfile" | tr -d ' \n' > "$FAKE_STATE/slot0" ;;
-  open) dev=${args[-2]}
-        [ "$(od -An -tx1 "$keyfile" | tr -d ' \n')" = "$(cat "$FAKE_STATE/slot0" 2>/dev/null)" ] || exit 2
-        touch "$FAKE_STATE/opened" ;;
+          [ "$(head -c 6 "${args[-1]}" | od -An -tx1 | tr -d ' \n')" = 4c554b53babe ] ;;
+  luksFormat)
+    dev=${args[-1]}
+    [ "$(wc -c < "$keyfile" | tr -d ' ')" = 32 ] || exit 3
+    printf 'LUKS\xba\xbe' | dd of="$dev" conv=notrunc 2>/dev/null
+    od -An -tx1 "$keyfile" | tr -d ' \n' > "$FAKE_STATE/slot0"
+    python3 -c 'import json,sys; json.dump({
+      "keyslots":{"0":{"type":"luks2","key_size":64,"area":{"encryption":"aes-xts-plain64"},"kdf":{"type":"pbkdf2","hash":"sha256"}}},
+      "segments":{"0":{"type":"crypt","offset":"16777216","size":"dynamic","encryption":"aes-xts-plain64","sector_size":4096}},
+      "tokens":{}}, open(sys.argv[1],"w"))' "$H" ;;
+  open)
+    [ "$(od -An -tx1 "$keyfile" | tr -d ' \n')" = "$(cat "$FAKE_STATE/slot0" 2>/dev/null)" ] || exit 2
+    # Build the active mapping from the (host-controlled) header segment.
+    python3 -c 'import json,sys; s=json.load(open(sys.argv[1]))["segments"]["0"]
+open(sys.argv[2]+"-cipher","w").write(s.get("encryption",""))
+open(sys.argv[2]+"-sector","w").write(str(s.get("sector_size","")))' "$H" "$FAKE_STATE/map"
+    touch "$SEALED_DATA_MAP" ;;
+  close) rm -f "$SEALED_DATA_MAP" "$FAKE_STATE/map-cipher" "$FAKE_STATE/map-sector" ;;
+  luksDump) [ "$2" = --dump-json-metadata ] && cat "$H" ;;
   token) case "$2" in
            export) cat "$FAKE_STATE/token" 2>/dev/null || exit 1 ;;
            import) cat > "$FAKE_STATE/token" ;;
@@ -199,7 +216,8 @@ FAKE_KEYTOOL = r"""#!@BASH@
 # Fake sealed_data_key.py: FAKE_KEY is the key in hex, FAKE_KEY_FAILS makes it fail.
 [ -n "${FAKE_KEY_FAILS:-}" ] && { echo "sealed_data_key: cannot open /dev/sev-guest" >&2; exit 1; }
 case "$1" in
-  info) printf '{"key_id": "id-%s", "measurement": "%s"}\n' "${FAKE_KEY:0:8}" "${FAKE_MEASUREMENT:-ab}" ;;
+  info) printf '{"key_id": "id-%s", "measurement": "%s", "policy": "%s", "host_data": "%s"}\n' \
+          "${FAKE_KEY:0:8}" "${FAKE_MEASUREMENT:-ab}" "${FAKE_POLICY:-0x30000}" "${FAKE_HOST_DATA:-1133}" ;;
   key) python3 -c 'import os, sys; sys.stdout.buffer.write(bytes.fromhex(os.environ["FAKE_KEY"]))' ;;
 esac
 """
@@ -209,6 +227,13 @@ FAKE_SIMPLE = {
     "mount": 'printf "mount %s\\n" "$*" >> "$FAKE_LOG"; [ -z "${FAKE_MOUNT_FAILS:-}" ] || exit 32; touch "$FAKE_STATE/mounted"',
     "mountpoint": '[ -e "$FAKE_STATE/mounted" ]',
     "df": 'echo " Size"; echo " 4211081216"',
+    # The active device-mapper table: cipher from the header the open built.
+    "dmsetup": 'printf "dmsetup %s\\n" "$*" >> "$FAKE_LOG"; [ "$1" = table ] || exit 0; '
+               'c=$(cat "$FAKE_STATE/map-cipher" 2>/dev/null); s=$(cat "$FAKE_STATE/map-sector" 2>/dev/null); '
+               '[ -n "$c" ] || exit 1; echo "0 8216576 crypt $c 0000 0 7:0 32768 1 sector_size:$s"',
+    # blkid -p -u filesystem <map>: a file system is present only when planted.
+    "blkid": '[ -e "$FAKE_STATE/planted-fs" ] && { echo "TYPE=ext4"; exit 0; }; exit 2',
+    "sync": 'printf "sync %s\\n" "$*" >> "$FAKE_LOG"',
 }
 
 
@@ -230,6 +255,7 @@ def disk(tmp_path: Path):
     run.mkdir()
     dev = tmp_path / "data.raw"
     dev.write_bytes(bytes(1 << 16))
+    mapfile = tmp_path / "mapper-sealed-data"
     script = tmp_path / "sealed-data.sh"
     text = (SEALED / "sealed-data.sh").read_text()
     script.write_text(f"#!{BASH}\n" + text[len("#!/bin/bash\n"):])
@@ -238,15 +264,24 @@ def disk(tmp_path: Path):
     class Disk:
         def __init__(self) -> None:
             self.dev, self.state, self.run_dir, self.mnt = dev, state, run, tmp_path / "srv" / "sealed-data"
+            self.map = mapfile
             self.log = state / "calls.log"
 
+        def header(self) -> dict:
+            return json.loads((state / "header.json").read_text())
+
+        def write_header(self, h: dict) -> None:
+            (state / "header.json").write_text(json.dumps(h))
+
         def boot(self, key: str = KEY_A, **env: str) -> tuple[subprocess.CompletedProcess, dict]:
-            (state / "mounted").unlink(missing_ok=True)  # a new boot: nothing mounted
-            (state / "opened").unlink(missing_ok=True)
+            for f in ("mounted", "map-cipher", "map-sector"):  # a new boot: fresh mapping
+                (state / f).unlink(missing_ok=True)
+            mapfile.unlink(missing_ok=True)
             self.log.write_text("")
             proc = subprocess.run([str(script)], capture_output=True, text=True, timeout=60, env={
                 "PATH": f"{bin_}:/usr/bin:/bin:/usr/sbin:/sbin", "FAKE_LOG": str(self.log), "FAKE_STATE": str(state),
                 "FAKE_KEY": key, "SEALED_DATA_DEV": str(dev), "SEALED_DATA_MNT": str(self.mnt),
+                "SEALED_DATA_MAP": str(mapfile),
                 "SEALED_DATA_STATUS": str(run / "sealed-data.status"), "SEALED_DATA_KEYTOOL": str(bin_ / "keytool"),
                 "SEALED_DATA_RUNDIR": str(run), "SEALED_DATA_FAKE_DISK": "1", **env})
             status = json.loads((run / "sealed-data.status").read_text()) if (run / "sealed-data.status").exists() else {}
@@ -267,8 +302,8 @@ def test_a_blank_disk_gets_one_luks2_volume_with_xfs_mounted_safely(disk) -> Non
     for opt in ("--type luks2", "--cipher aes-xts-plain64", "--key-size 512", "--sector-size 4096",
                 "--pbkdf pbkdf2", "--keyfile-size 32"):
         assert opt in fmt[0]
-    assert disk.calls("mkfs.xfs") == ["mkfs.xfs -f -q /dev/mapper/sealed-data"]
-    assert disk.calls("mount") == [f"mount -t xfs -o nosuid,nodev,noexec,noatime /dev/mapper/sealed-data {disk.mnt}"]
+    assert disk.calls("mkfs.xfs") == [f"mkfs.xfs -f -q {disk.map}"]
+    assert disk.calls("mount") == [f"mount -t xfs -o nosuid,nodev,noexec,noatime {disk.map} {disk.mnt}"]
     assert json.loads((disk.state / "token").read_text())["fs"] == "xfs"
     assert (disk.mnt / "workspaces").is_dir() and (disk.mnt / "hotel").is_dir()
     assert oct((disk.mnt / "workspaces").stat().st_mode & 0o777) == "0o700"
@@ -311,7 +346,7 @@ def test_no_data_disk_and_no_key_fall_back_without_formatting(disk) -> None:
     proc, status = disk.boot(FAKE_KEY_FAILS="1")
     assert proc.returncode == 0 and status["state"] == "nokey"
     assert "cannot open /dev/sev-guest" in status["detail"]
-    assert not disk.calls("cryptsetup") and not disk.calls("mkfs.xfs")
+    assert not disk.calls("cryptsetup luksFormat") and not disk.calls("cryptsetup open") and not disk.calls("mkfs.xfs")
 
 
 def test_a_first_boot_that_stopped_before_mkfs_formats_the_file_system_once(disk) -> None:
@@ -350,6 +385,93 @@ def test_a_failing_step_reports_error_and_still_removes_the_key(disk) -> None:
 def test_the_disk_check_accepts_a_regular_file_only_in_tests() -> None:
     text = (SEALED / "sealed-data.sh").read_text()
     assert '[ -b "$1" ] || { [ "${SEALED_DATA_FAKE_DISK:-0}" = 1 ] && [ -f "$1" ]; }' in text
+
+
+# ---------------------------------------------------------------- sealed-data.sh header checks (Finding 1)
+#
+# The fake cryptsetup proves the script's control flow: it reads the device-mapper
+# table and the LUKS2 header JSON after open, and refuses (closes, does not mkfs or
+# mount) on any mismatch. It does NOT prove the kernel enforces the cipher; only a
+# real cryptsetup and dm-crypt do. The c48 note in the PR covers the real check.
+
+def test_the_token_records_the_full_launch_identity(disk) -> None:
+    proc, _ = disk.boot(FAKE_MEASUREMENT="aa", FAKE_POLICY="0x30000", FAKE_HOST_DATA="dead")
+    assert proc.returncode == 0, proc.stderr
+    slot = json.loads((disk.state / "token").read_text())["slots"]["0"]
+    assert slot["measurement"] == "aa" and slot["policy"] == "0x30000" and slot["host_data"] == "dead"
+    import hashlib
+    assert slot["launch_id"] == hashlib.sha256(b"aa:0x30000:dead").hexdigest()
+
+
+def test_a_cryptsetup_older_than_2_8_1_opens_nothing(disk) -> None:
+    proc, status = disk.boot(FAKE_CRYPTSETUP_VERSION="2.7.5")
+    assert proc.returncode == 0 and status["state"] == "error"
+    assert "2.7.5" in status["detail"] and "2.8.1" in status["detail"]
+    assert not disk.calls("cryptsetup luksFormat") and not disk.calls("cryptsetup open") and not disk.calls("mkfs.xfs")
+    # 2.8.1 exactly is accepted.
+    proc, status = disk.boot(FAKE_CRYPTSETUP_VERSION="2.8.1")
+    assert status["state"] == "new"
+
+
+def test_a_header_edited_to_a_null_cipher_segment_is_refused(disk) -> None:
+    disk.boot()  # makes the volume
+    h = disk.header()
+    h["segments"]["0"]["encryption"] = "cipher_null-ecb"  # a host edits the on-disk header
+    disk.write_header(h)
+    proc, status = disk.boot()
+    assert proc.returncode == 0 and status["state"] == "tampered"
+    assert not disk.calls("mkfs.xfs") and not disk.calls("mount")
+    assert "cryptsetup close sealed-data" in disk.calls("cryptsetup close") or disk.calls("cryptsetup close")
+
+
+def test_a_key_slot_with_a_null_cipher_area_is_refused(disk) -> None:
+    disk.boot()
+    h = disk.header()
+    h["keyslots"]["0"]["area"]["encryption"] = "cipher_null-ecb"
+    disk.write_header(h)
+    proc, status = disk.boot()
+    assert proc.returncode == 0 and status["state"] == "tampered"
+    assert not disk.calls("mkfs.xfs")
+
+
+def test_an_extra_segment_in_the_header_is_refused(disk) -> None:
+    disk.boot()
+    h = disk.header()
+    h["segments"]["1"] = dict(h["segments"]["0"])
+    disk.write_header(h)
+    proc, status = disk.boot()
+    assert proc.returncode == 0 and status["state"] == "tampered"
+
+
+def test_a_wrong_sector_size_is_refused(disk) -> None:
+    disk.boot()
+    h = disk.header()
+    h["segments"]["0"]["sector_size"] = 512
+    disk.write_header(h)
+    proc, status = disk.boot()
+    assert proc.returncode == 0 and status["state"] == "tampered"
+    assert not disk.calls("mkfs.xfs")
+
+
+def test_a_volume_with_a_file_system_but_no_token_is_not_formatted(disk) -> None:
+    disk.boot()
+    (disk.state / "token").unlink()      # the token is gone
+    (disk.state / "planted-fs").touch()  # but a file system is present
+    proc, status = disk.boot()
+    assert proc.returncode == 0 and status["state"] == "tampered"
+    assert not disk.calls("mkfs.xfs")
+
+
+def test_the_verified_fresh_volume_is_formatted_and_mounted(disk) -> None:
+    # The header checks and the blkid guard must not block the normal first boot.
+    proc, status = disk.boot()
+    assert proc.returncode == 0 and status["state"] == "new"
+    assert disk.calls("dmsetup table") and disk.calls("cryptsetup luksDump")
+    assert len(disk.calls("mkfs.xfs")) == 1 and disk.calls("mount -t xfs")
+
+
+def test_the_by_id_device_wait_is_30_seconds() -> None:
+    assert "for _ in $(seq 30); do is_disk" in (SEALED / "sealed-data.sh").read_text()
 
 
 # ---------------------------------------------------------------- room-data.sh
@@ -491,71 +613,129 @@ def test_launch_attaches_the_data_disk_only_when_asked() -> None:
     assert '${DATA_DRIVE[@]+"${DATA_DRIVE[@]}"}' in text[text.index("exec /usr/bin/qemu-system-x86_64"):]
 
 
-# ---------------------------------------------------------------- install-sealed.sh roll guard
+# ---------------------------------------------------------------- install-sealed.sh roll guard (Findings 2 and 3)
+#
+# Ownership is decided from the launch identity in the volume's own LUKS token
+# (measurement, policy, HOST_DATA), the choice comes from a one-time file, a
+# reset keeps exactly one data.raw.prev, and an EXIT trap restores it on every
+# failure path (not only a measurement mismatch).
 
-def _step5_with_data(host: FakeHost, booted: str | None, **env: str):
-    """Step 5 with a data volume made by the booted build (measurement *booted*)."""
+MANIFEST = b"MANIFEST-BYTES"
+OWNER = b"OWNER-CIPHERTEXT"
+
+
+def _owner_launch_id(expected: str = "ab" * 48, manifest: bytes = MANIFEST) -> str:
+    import hashlib
+    hd_hex = hashlib.sha256(manifest).hexdigest()
+    return hashlib.sha256(f"{expected}:0x30000:{hd_hex}".encode()).hexdigest()
+
+
+def _roll(host: FakeHost, *, token_launch_id: str | None, choice: str | None = None,
+          measurement: str = "ab" * 48, expected: str = "ab" * 48, prev: bytes | None = None,
+          **env: str):
+    """Run step 5 with a data volume whose token records *token_launch_id*.
+
+    Plants what section 4 and the guest would have left: the installed
+    launch-guest.sh and sealed.env, the build's manifest.json, the owner's
+    data.raw and its token, an optional earlier data.raw.prev, and an optional
+    one-time data-on-new-build file.
+    """
     sealed = host.tmp / "sealed"
-    # _sealed_step5 makes the sealed dir afresh; plant the volume just before it runs the slice.
     orig_run = host.run
+    # Fake cryptsetup for the host side: token export reads <dev>.token.
+    (host.bin / "cryptsetup").write_text(
+        f"#!{BASH}\n" + 'if [ "$1 $2" = "token export" ]; then d=${*: -1}; cat "$d.token" 2>/dev/null || exit 1; fi\n')
+    (host.bin / "cryptsetup").chmod(0o755)
 
     def run(script, *args, env=None):
-        (sealed / "data.raw").write_bytes(b"ciphertext")
-        if booted is not None:
-            old = sealed / "images" / "20260101T000000Z"
-            (old / "expected-measurement").write_text(booted + "\n")
-            (sealed / "run" / "booted-image").symlink_to(old)
+        (sealed / "launch-guest.sh").write_text((host.kit / "sealed" / "launch-guest.sh").read_text())
+        (sealed / "launch-guest.sh").chmod(0o755)
+        (sealed / "sealed.env").write_text((host.tmp / "sealed.env").read_text())
+        (sealed / "images" / "20260102T000000Z" / "manifest.json").write_bytes(MANIFEST)
+        (sealed / "data.raw").write_bytes(OWNER)
+        if token_launch_id is not None:
+            (sealed / "data.raw.token").write_text(json.dumps(
+                {"type": "cathedral-sealed-data", "slots": {"0": {"launch_id": token_launch_id}}}))
+        if prev is not None:
+            (sealed / "data.raw.prev").write_bytes(prev)
+        if choice is not None:
+            (sealed / "data-on-new-build").write_text(choice + "\n")
         return orig_run(script, *args, env=env)
 
     host.run = run
     try:
-        return _sealed_step5(host, "ab" * 48, sealed={"SEALED_DATA_GIB": "4"}, **env)
+        return _sealed_step5(host, measurement, expected=expected, sealed={"SEALED_DATA_GIB": "4"}, **env)
     finally:
         host.run = orig_run
 
 
-def test_a_new_build_with_a_data_volume_stops_until_the_operator_chooses(host: FakeHost) -> None:
-    proc, _ = _step5_with_data(host, "cd" * 48)
+def test_a_new_launch_identity_stops_until_the_operator_writes_a_choice(host: FakeHost) -> None:
+    proc, _ = _roll(host, token_launch_id="feed" * 16)
     assert proc.returncode == 1
-    assert "cannot open the data volume of the booted build" in proc.stderr and "SEALED_DATA_ON_NEW_BUILD=reset" in proc.stderr
+    assert "cannot open the data volume its current owner made" in proc.stderr
+    assert "data-on-new-build" in proc.stderr and "reset" in proc.stderr and "keep" in proc.stderr
     assert not host.calls("systemctl restart")
-    assert (host.tmp / "sealed" / "data.raw").read_bytes() == b"ciphertext"
+    assert (host.tmp / "sealed" / "data.raw").read_bytes() == OWNER
 
 
-def test_reset_keeps_the_old_volume_aside_and_keep_leaves_it(host: FakeHost) -> None:
-    proc, _ = _step5_with_data(host, "cd" * 48, SEALED_DATA_ON_NEW_BUILD="reset")
+def test_the_same_launch_identity_restarts_with_no_choice(host: FakeHost) -> None:
+    proc, _ = _roll(host, token_launch_id=_owner_launch_id())
     assert proc.returncode == 0, proc.stderr[-3000:]
     sealed = host.tmp / "sealed"
-    assert (sealed / "data.raw.prev").read_bytes() == b"ciphertext" and not (sealed / "data.raw").exists()
-    proc, _ = _step5_with_data(host, "cd" * 48, SEALED_DATA_ON_NEW_BUILD="keep")
+    assert (sealed / "data.raw").read_bytes() == OWNER and not (sealed / "data.raw.prev").exists()
+    assert "systemctl restart room-sealed-sealed-1.service" in host.calls("systemctl")
+
+
+def test_reset_sets_the_owner_volume_aside_and_consumes_the_choice_file(host: FakeHost) -> None:
+    proc, _ = _roll(host, token_launch_id="feed" * 16, choice="reset")
     assert proc.returncode == 0, proc.stderr[-3000:]
-    assert (sealed / "data.raw").read_bytes() == b"ciphertext" and not (sealed / "data.raw.prev").exists()
-
-
-def test_the_same_build_restarts_with_its_volume_and_no_choice(host: FakeHost) -> None:
-    proc, _ = _step5_with_data(host, "ab" * 48)
-    assert proc.returncode == 0, proc.stderr[-3000:]
-    assert (host.tmp / "sealed" / "data.raw").read_bytes() == b"ciphertext"
-
-
-def test_a_reset_build_that_fails_its_measurement_gets_the_old_volume_back(host: FakeHost) -> None:
     sealed = host.tmp / "sealed"
-    orig_run = host.run
+    assert (sealed / "data.raw.prev").read_bytes() == OWNER and not (sealed / "data.raw").exists()
+    assert not (sealed / "data-on-new-build").exists(), "the one-time choice is consumed"
 
-    def run(script, *args, env=None):
-        (sealed / "data.raw").write_bytes(b"ciphertext")
-        old = sealed / "images" / "20260101T000000Z"
-        (old / "expected-measurement").write_text("cd" * 48 + "\n")
-        (sealed / "run" / "booted-image").symlink_to(old)
-        return orig_run(script, *args, env=env)
 
-    host.run = run
-    try:
-        proc, images = _sealed_step5(host, "ee" * 48, sealed={"SEALED_DATA_GIB": "4"}, SEALED_DATA_ON_NEW_BUILD="reset")
-    finally:
-        host.run = orig_run
+def test_keep_leaves_the_volume_and_consumes_the_choice_file(host: FakeHost) -> None:
+    proc, _ = _roll(host, token_launch_id="feed" * 16, choice="keep")
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    sealed = host.tmp / "sealed"
+    assert (sealed / "data.raw").read_bytes() == OWNER and not (sealed / "data.raw.prev").exists()
+    assert not (sealed / "data-on-new-build").exists()
+
+
+def test_reset_refuses_to_overwrite_an_existing_prev_without_the_flag(host: FakeHost) -> None:
+    proc, _ = _roll(host, token_launch_id="feed" * 16, choice="reset", prev=b"EARLIER-PREV")
+    assert proc.returncode == 1
+    assert "data.raw.prev already exists" in proc.stderr and "SEALED_DATA_OVERWRITE_PREV=1" in proc.stderr
+    sealed = host.tmp / "sealed"
+    assert (sealed / "data.raw").read_bytes() == OWNER and (sealed / "data.raw.prev").read_bytes() == b"EARLIER-PREV"
+    # With the explicit flag it overwrites.
+    proc, _ = _roll(host, token_launch_id="feed" * 16, choice="reset", prev=b"EARLIER-PREV", SEALED_DATA_OVERWRITE_PREV="1")
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert (host.tmp / "sealed" / "data.raw.prev").read_bytes() == OWNER
+
+
+def test_a_reset_roll_that_fails_its_measurement_restores_the_owner_volume(host: FakeHost) -> None:
+    proc, _ = _roll(host, token_launch_id="feed" * 16, choice="reset", measurement="ee" * 48)
     assert proc.returncode == 1 and "MEASUREMENT DIFFERS" in proc.stdout
-    assert (sealed / "data.raw").read_bytes() == b"ciphertext" and not (sealed / "data.raw.prev").exists()
+    sealed = host.tmp / "sealed"
+    assert (sealed / "data.raw").read_bytes() == OWNER and not (sealed / "data.raw.prev").exists()
+
+
+def test_a_reset_roll_whose_guest_never_answers_also_restores_the_owner_volume(host: FakeHost) -> None:
+    # An early exit (guest stopped) before the measurement check: the trap, not
+    # the old manual restore, must put the owner's volume back.
+    proc, _ = _roll(host, token_launch_id="feed" * 16, choice="reset",
+                    FAKE_ATT_FAILS="999", FAKE_RESTART_KILLS="room-sealed-sealed-1.service")
+    assert proc.returncode == 1 and "guest stopped" in proc.stderr
+    sealed = host.tmp / "sealed"
+    assert (sealed / "data.raw").read_bytes() == OWNER and not (sealed / "data.raw.prev").exists()
+
+
+def test_the_roll_guard_reads_the_token_not_the_booted_image() -> None:
+    text = (SEALED / "install-sealed.sh").read_text()
+    body = text[text.index("data_volume_new_build()"):text.index("refuse_sealed_restart_with_rooms\ndata_volume_new_build")]
+    assert "data_volume_owner_id" in body and "booted-image" not in body
+    assert 'cryptsetup token export --token-id 0 "$SEALED_DIR/data.raw"' in text
 
 
 # ---------------------------------------------------------------- health
@@ -574,3 +754,50 @@ def test_health_reports_where_workspaces_live(tmp_path: Path, monkeypatch) -> No
     assert room_health.workspaces_storage(env, status)["state"] == "unknown"
     status.write_text(json.dumps({"state": "locked", "persistent": False, "key_id": "k", "detail": "d", "x": 1}))
     assert room_health.workspaces_storage(env, status) == {"state": "locked", "persistent": False, "key_id": "k", "detail": "d"}
+
+
+# ---------------------------------------------------------------- build-time cryptsetup gate (Finding 1)
+
+def test_build_requires_cryptsetup_2_8_1_when_the_data_volume_is_on() -> None:
+    text = (SEALED / "build-guest.sh").read_text()
+    assert 'if [ "$DATA_GIB" != 0 ]; then' in text
+    assert 'chroot "$R" cryptsetup --version' in text and "(2,8,1)" in text
+    assert text.index('CRYPTVER=$(chroot "$R" cryptsetup --version') < text.index("# ---------------------------------------------------------------- 2. kernel out")
+
+
+# ---------------------------------------------------------------- workspace create answer (Finding 4)
+
+from cathedral.sandbox_workspaces import LocalCopier, WorkspaceStore, workspace_persistence  # noqa: E402
+
+
+def test_workspace_persistence_reads_the_sealed_data_status(tmp_path: Path) -> None:
+    status = tmp_path / "sealed-data.status"
+    assert workspace_persistence({}, status) is None, "no sealed data volume: the API claims nothing"
+    env = {"ROOM_WORKSPACES_SOURCE": "/srv/sealed-data/workspaces"}
+    assert workspace_persistence(env, status) is False, "a data-volume build with no status: not persistent"
+    status.write_text(json.dumps({"persistent": True, "state": "open"}))
+    assert workspace_persistence(env, status) is True
+    status.write_text(json.dumps({"persistent": False, "state": "locked"}))
+    assert workspace_persistence(env, status) is False
+
+
+def test_workspace_create_answer_shows_persistent_only_when_known(tmp_path: Path) -> None:
+    def store(name: str, persistent: bool | None) -> WorkspaceStore:
+        root = tmp_path / name
+        root.mkdir()
+        return WorkspaceStore(root, LocalCopier(), check_mount=False, persistent=persistent)
+
+    assert store("a", False).create("owner", "w")["persistent"] is False
+    assert store("b", True).create("owner", "w")["persistent"] is True
+    assert "persistent" not in store("c", None).create("owner", "w"), "unsealed/unknown: no claim"
+
+
+# ---------------------------------------------------------------- miner key durability (Finding 5)
+
+def test_the_miner_internal_key_is_synced_before_and_after_the_rename() -> None:
+    text = (SEALED / "guest-boot.sh").read_text()
+    block = text[text.index("internal-api-key.tmp"):text.index('cat "$DATA/hotel/internal-api-key" > /run/room-api-key')]
+    assert 'sync "$DATA/hotel/internal-api-key.tmp"' in block
+    assert block.index('sync "$DATA/hotel/internal-api-key.tmp"') < block.index('mv "$DATA/hotel/internal-api-key.tmp"')
+    assert 'sync "$DATA/hotel"' in block
+    assert block.index('mv "$DATA/hotel/internal-api-key.tmp"') < block.index('sync "$DATA/hotel"')
