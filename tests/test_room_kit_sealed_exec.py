@@ -575,7 +575,7 @@ def test_a_changed_envelope_does_not_open(guest, field) -> None:
 
 @pytest.mark.parametrize("request_doc", [
     {"cmd": []}, {"cmd": ""}, {"cmd": ["ok", ""]}, {"cmd": ["ok"], "env": {"A": 1}}, {"cmd": ["ok"], "stdin": 3},
-    {"cmd": ["ok"], "extra": "x"}, {"env": {}}, ["ok"], "ok",
+    {"cmd": ["ok"], "extra": "x"}, {"env": {}}, ["ok"], "ok", {"cmd": 5}, {"cmd": None}, {"cmd": {"a": "b"}},
 ])
 def test_an_opened_request_must_have_the_exec_shape(guest, request_doc) -> None:
     _, api, port, client = guest
@@ -731,4 +731,48 @@ def test_a_non_canonical_base64_spelling_is_refused_before_anything_runs(guest, 
     assert respelled, field
     status, _, body = _post(port, {**doc, field: respelled[0]})
     assert (status, _code(body)) == (400, "sealed_exec_fields_invalid")
+    assert api.execs() == [] and ledger.sealed_exec.tracked == 0
+
+
+def _seal_plaintext(client: "Client", plaintext: bytes, room: str = ROOM) -> dict:
+    """An envelope over exact plaintext bytes: what a client that never calls canonical() could send."""
+    answer_key = X25519PrivateKey.generate()
+    header = rr.exec_header(client.binding_sha256, room, client.ledger.room_incarnation(room), int(time.time()), 30,
+                            base64.b64encode(answer_key.public_key().public_bytes_raw()).decode())
+    return {**header, **rr._seal_envelope(plaintext, client.recipient, rr.EXEC_HKDF_INFO, rr.exec_aad(header))}
+
+
+@pytest.mark.parametrize("plaintext", [
+    b'{"cmd":["sh","-c","\\ud800"]}',
+    b'{"cmd":"echo \\udfff"}',
+    b'{"cmd":["true"],"stdin":"\\ud800"}',
+    b'{"cmd":["true"],"env":{"A":"\\ud800"}}',
+    b'{"cmd":["true"],"env":{"\\ud800":"v"}}',
+    b'{"cmd":["true"],"cwd":"/\\ud800"}',
+    b'{"cmd":["true"],"user":"\\ud800"}',
+])
+def test_a_lone_surrogate_in_the_opened_request_is_400_and_burns_nothing(guest, plaintext) -> None:
+    # Review finding 2: it parsed, passed the shape check, was recorded as run, and then the
+    # front failed to hash it: the connection dropped and the envelope was spent with nothing run.
+    ledger, api, port, client = guest
+    status, _, body = _post(port, _seal_plaintext(client, plaintext))
+    assert (status, _code(body)) == (400, "sealed_exec_request_invalid")
+    assert api.execs() == [] and ledger.sealed_exec.tracked == 0
+    assert _post(port, client.seal()[0])[0] == 200
+
+
+def test_a_deeply_nested_body_is_400_and_the_front_keeps_serving(guest) -> None:
+    # Review finding 3: json.loads raises RecursionError, which is not a ValueError.
+    _, api, port, client = guest
+    deep = b"[" * 200_000 + b"]" * 200_000
+    status, _, body = _request(port, "POST", f"/v1/sandboxes/{ROOM}/sealed-exec", deep)
+    assert (status, _code(body)) == (400, "sealed_exec_fields_invalid")
+    assert api.seen == [] and _post(port, client.seal()[0])[0] == 200
+
+
+def test_a_deeply_nested_opened_request_is_400_and_burns_nothing(guest) -> None:
+    ledger, api, port, client = guest
+    plaintext = b'{"cmd":["true"],"env":' + b"[" * 200_000 + b"]" * 200_000 + b"}"
+    status, _, body = _post(port, _seal_plaintext(client, plaintext))
+    assert (status, _code(body)) == (400, "sealed_exec_request_invalid")
     assert api.execs() == [] and ledger.sealed_exec.tracked == 0

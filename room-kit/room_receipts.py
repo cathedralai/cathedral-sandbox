@@ -918,8 +918,21 @@ def _usable_x25519(raw_b64) -> bool:
         return False
 
 
+def _utf8(value) -> bool:
+    """A string that encodes as UTF-8: a lone surrogate escape parses as JSON and does not."""
+    try:
+        value.encode("utf-8")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
 def _exec_request_problem(request) -> str | None:
-    """None when the opened request has the room API's exec shape (the API checks the values)."""
+    """None when the opened request has the room API's exec shape (the API checks the values).
+
+    Every string must encode as UTF-8, or the front could not hash the command or send the
+    request on after recording the envelope as run.
+    """
     if not isinstance(request, dict) or "cmd" not in request or not set(request) <= EXEC_REQUEST_KEYS:
         return "fields"
     cmd = request["cmd"]
@@ -935,6 +948,12 @@ def _exec_request_problem(request) -> str | None:
     for key in ("stdin", "cwd", "user"):
         if request.get(key) is not None and not isinstance(request[key], str):
             return key
+    # The types are checked above: every value here is a string or None.
+    strings = [cmd] if isinstance(cmd, str) else list(cmd)
+    strings += [request[k] for k in ("stdin", "cwd", "user") if request.get(k) is not None]
+    strings += [x for kv in (env or {}).items() for x in kv]
+    if not all(_utf8(x) for x in strings):
+        return "encoding"
     return None
 
 
@@ -1556,7 +1575,7 @@ class Ledger:
         opened = open_exec_request(doc, box.private)
         try:
             request = json.loads(opened)
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: nesting past the parser's depth
             request = None
         opened = None
         if _exec_request_problem(request) is not None:
@@ -2037,7 +2056,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(413, b'{"error":{"code":"sealed_exec_too_large","message":"the request is too large"}}')
         try:
             doc = json.loads(body)
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: nesting past the parser's depth
             doc = None
         try:
             header, request = ledger.open_sealed_exec(room, doc)
