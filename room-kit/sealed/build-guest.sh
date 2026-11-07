@@ -3,8 +3,9 @@
 # system (Ubuntu minbase + Docker + the room kit), and one kernel command line.
 # OVMF (AmdSev build) hashes all three into the SNP launch measurement, so the
 # measurement covers every file the guest boots from. Nothing is read from an
-# unmeasured root disk. The only disk is the scratch disk, which the guest
-# encrypts with a key it makes at boot.
+# unmeasured root disk. The scratch disk is encrypted with a key the guest makes
+# at boot. With SEALED_DATA_GIB > 0 a second disk holds persistent workspaces
+# (LUKS2, a key only this build on this machine can make; sealed-data.sh).
 #
 # Usage: build-guest.sh sealed.env   (run as root on the host)
 # Output: $SEALED_DIR/images/<stamp>/{vmlinuz,initrd.cpio.zst,cmdline,manifest.json}
@@ -36,6 +37,16 @@ print(" ".join(dict.fromkeys(keys)) if ok else "")' "${SEALED_HOTEL_KEY_INSTALL_
   [ -n "$MINER_SIGNERS" ] || { echo "SEALED_MINER=1 needs SEALED_HOTEL_KEY_INSTALL_SIGNERS: 1 to 4 base64 Ed25519 public keys" >&2; exit 1; }
 fi
 
+# Persistent data volume (docs/SEALED_DATA_VOLUME.md): checked before the long
+# build. It holds workspaces only, so it needs them on.
+DATA_GIB=${SEALED_DATA_GIB:-0}
+[[ "$DATA_GIB" =~ ^(0|[1-9][0-9]{0,5})$ ]] || { echo "SEALED_DATA_GIB must be a whole number of GiB (0: no data disk)" >&2; exit 1; }
+DATA_WS=""
+if [ "$DATA_GIB" != 0 ]; then
+  [ "${SEALED_ROOM_WORKSPACES:-0}" = 1 ] || { echo "SEALED_DATA_GIB > 0 needs SEALED_ROOM_WORKSPACES=1: the data disk holds workspaces only" >&2; exit 1; }
+  DATA_WS=/srv/sealed-data/workspaces
+fi
+
 B=$SEALED_DIR/build
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 OUT=$SEALED_DIR/images/$STAMP
@@ -54,6 +65,18 @@ fi
 R=$B/rootfs
 rm -rf "$R"
 cp -a "$B/base-$BASE_ID" "$R"
+
+# The data volume's header is verified at boot, but a cryptsetup older than 2.8.1
+# would still open a null-cipher key slot, so refuse to ship one with the volume on.
+if [ "$DATA_GIB" != 0 ]; then
+  CRYPTVER=$(chroot "$R" cryptsetup --version 2>/dev/null | awk 'NR==1{print $2}')
+  python3 -c 'import sys
+raw=sys.argv[1].split("-")[0]
+cur=tuple(int(x) for x in raw.split(".")[:3]) if raw else ()
+cur=cur+(0,)*(3-len(cur))
+sys.exit(0 if cur>=(2,8,1) else 1)' "$CRYPTVER" \
+    || { echo "cryptsetup ${CRYPTVER:-unknown} in the base rootfs is older than 2.8.1; use a newer suite or pin cryptsetup (SEALED_DATA_GIB needs it)" >&2; exit 1; }
+fi
 
 # ---------------------------------------------------------------- 2. kernel out, boot files gone
 KVER=$(ls "$R/lib/modules" | sort -V | tail -1)
@@ -135,6 +158,8 @@ WantedBy=sysinit.target
 EOF
 
 install -m 0755 "$KIT/sealed/guest-boot.sh" "$R/usr/local/sbin/sealed-hotel-boot.sh"
+install -m 0755 "$KIT/sealed/sealed-data.sh" "$R/usr/local/sbin/sealed-data.sh"
+install -m 0755 "$KIT/sealed/sealed_data_key.py" "$R/usr/local/sbin/sealed_data_key.py"
 cat > "$R/etc/systemd/system/sealed-hotel.service" <<'EOF'
 [Unit]
 Description=Sealed hotel: encrypt scratch, then install the room kit
@@ -212,6 +237,7 @@ ROOM_RECEIPTS=1
 ROOM_RECEIPTS_LISTEN=$SEALED_GUEST_IP:18090
 ROOM_SECRETS_PERSIST=0
 ROOM_WORKSPACES=${SEALED_ROOM_WORKSPACES:-0}
+ROOM_WORKSPACES_SOURCE=$DATA_WS
 ROOM_ESCAPE=${SEALED_ROOM_ESCAPE:-0}
 ROOM_ESCAPE_ALLOW_PLAINTEXT=${SEALED_ROOM_ESCAPE_ALLOW_PLAINTEXT:-0}
 ROOM_HOTEL_NAME=$SEALED_NAME
@@ -260,9 +286,9 @@ printf '%s' "$CMDLINE" > "$OUT/cmdline"
 install -m 0644 "$SEALED_OVMF" "$OUT/OVMF.amdsev.fd"
 
 python3 - "$OUT" "$SEALED_NAME" "$SEALED_VCPUS" "$SEALED_CPU_MODEL" "$KVER" "$DEBUG" "$BASE_ID" \
-  "$MINER" "${MINER_TLS_PORT:-}" "${MINER_SIGNERS:-}" <<'EOF'
+  "$MINER" "${MINER_TLS_PORT:-}" "${MINER_SIGNERS:-}" "$DATA_WS" <<'EOF'
 import hashlib, json, os, sys
-out, name, vcpus, cpu, kver, debug, base, miner, tls_port, signers = sys.argv[1:]
+out, name, vcpus, cpu, kver, debug, base, miner, tls_port, signers, data_ws = sys.argv[1:]
 def sha(p):
     h = hashlib.sha256()
     with open(os.path.join(out, p), "rb") as f:
@@ -276,6 +302,9 @@ m = {"schema": "cathedral_sealed_hotel_guest_v1", "hotel": name, "vcpus": int(vc
      "bytes": {p: os.path.getsize(os.path.join(out, p)) for p in ("OVMF.amdsev.fd", "vmlinuz", "initrd.cpio.zst")}}
 if miner == "1":  # a config hotel's manifest keeps its old fields only
     m["miner"] = {"tls_port": int(tls_port), "hotel_key_install_signers_ed25519_b64": signers.split()}
+if data_ws:  # likewise: only a build with the persistent data volume names it
+    m["data_volume"] = {"format": "luks2", "cipher": "aes-xts-plain64", "key": "snp-derived",
+                        "root_key": "vcek", "guest_field_select": 9, "mixes_host_data": True, "holds": ["workspaces"]}
 json.dump(m, open(os.path.join(out, "manifest.json"), "w"), indent=1, sort_keys=True)
 EOF
 ln -sfn "$STAMP" "$SEALED_DIR/images/current"

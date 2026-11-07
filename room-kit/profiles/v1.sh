@@ -34,6 +34,12 @@ EOV
   # nosuid,nodev,noexec.
   if [ "${ROOM_WORKSPACES:-0}" = 1 ]; then
     echo "CATHEDRAL_WORKSPACE_ROOT=$ROOM_DATA_DIR/workspaces"
+    # Sealed data volume (sealed/README.md): let the API say in a workspace answer
+    # whether it survives a restart, from the boot-time status sealed-data.sh wrote.
+    if [ -n "${ROOM_WORKSPACES_SOURCE:-}" ]; then
+      echo "ROOM_WORKSPACES_SOURCE=$ROOM_WORKSPACES_SOURCE"
+      echo "ROOM_SEALED_DATA_STATUS=${ROOM_SEALED_DATA_STATUS:-/run/sealed-data.status}"
+    fi
   fi
   # Egress policy per room through the hotel egress daemon (room_egress.py).
   if [ "${ROOM_EGRESS:-1}" = 1 ]; then

@@ -32,7 +32,20 @@ EOF
 else
   HOST_DATA=$(python3 -c 'import base64,hashlib,sys;print(base64.b64encode(hashlib.sha256(open(sys.argv[1],"rb").read()).digest()).decode())' "$IMG/manifest.json")
 fi
+# install-sealed.sh asks for the HOST_DATA this build would launch with, to decide
+# whether a new build can open the data volume. Print it and stop before any disk
+# or QEMU, so the two never disagree on the value.
+if [ "${LAUNCH_PRINT_HOST_DATA:-0}" = 1 ]; then printf '%s\n' "$HOST_DATA"; exit 0; fi
 [ -f "$SEALED_DIR/scratch.raw" ] || truncate -s "${SEALED_SCRATCH_GIB}G" "$SEALED_DIR/scratch.raw"
+# Persistent data volume (SEALED_DATA_GIB > 0): the guest formats it once (LUKS2)
+# and opens it at every boot with a key only it can make. The host keeps the
+# file; it holds ciphertext only. The size is fixed when the file is made.
+DATA_DRIVE=()
+if [ "${SEALED_DATA_GIB:-0}" != 0 ]; then
+  [ -f "$SEALED_DIR/data.raw" ] || truncate -s "${SEALED_DATA_GIB}G" "$SEALED_DIR/data.raw"
+  DATA_DRIVE=(-drive "if=none,id=data,format=raw,file=$SEALED_DIR/data.raw,cache=none,aio=io_uring"
+              -device "virtio-blk-pci,drive=data,serial=sealed-data,disable-legacy=on,iommu_platform=true")
+fi
 ln -sfn "$IMG" "$RUN/booted-image"
 # Config hotel: the broker's hotel key goes in through fw_cfg. Miner hotel: the
 # host holds no hotel key; the control plane installs it in the guest over the
@@ -50,6 +63,7 @@ exec /usr/bin/qemu-system-x86_64 -no-user-config -nodefaults -name "sealed-$SEAL
   -bios "$IMG/OVMF.amdsev.fd" -kernel "$IMG/vmlinuz" -initrd "$IMG/initrd.cpio.zst" -append "$(cat "$IMG/cmdline")" \
   -drive "if=none,id=scratch,format=raw,file=$SEALED_DIR/scratch.raw,cache=none,aio=io_uring" \
   -device virtio-blk-pci,drive=scratch,serial=sealed-scratch,disable-legacy=on,iommu_platform=true \
+  ${DATA_DRIVE[@]+"${DATA_DRIVE[@]}"} \
   -netdev "tap,id=net0,ifname=$SEALED_TAP,script=no,downscript=no,vhost=on" \
   -device "virtio-net-pci,netdev=net0,mac=$SEALED_GUEST_MAC,disable-legacy=on,iommu_platform=true,romfile=" \
   ${FW_CFG[@]+"${FW_CFG[@]}"} ${OWNER_FW_CFG[@]+"${OWNER_FW_CFG[@]}"} \
