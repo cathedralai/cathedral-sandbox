@@ -38,6 +38,7 @@ type attestOpts struct {
 	chip          byte   // CHIP_ID seed: hotels with one seed are one machine
 	receiptKey    []byte // 32-byte Ed25519 public key; default is the placeholder "AAAA"
 	reportID      byte   // fill byte of REPORT_ID (0x140, 32 bytes); 0 leaves it all zeros
+	sealedSecrets bool   // the binding names a sealed secrets key (room-kit ROOM_SEALED_SECRETS=1, AB#417)
 }
 
 // snpAttestation builds a GET /room/attestation body the way room_receipts.py
@@ -88,6 +89,11 @@ func snpAttestation(t testing.TB, o attestOpts) []byte {
 	}
 	if o.debugPolicy {
 		binding["policy"] = "0xb0000"
+	}
+	if o.sealedSecrets {
+		binding["sealed_secrets"] = map[string]any{"schema": "cathedral_sealed_secret_v2",
+			"algorithm": "x25519-hkdf-sha256-aes256gcm-v1", "path": "/run/secrets",
+			"x25519_public_b64": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))}
 	}
 	if o.level1 {
 		binding = map[string]any{"schema": "cathedral.hotel-binding.v1", "level": "hotel", "hotel": "miner"}
@@ -442,6 +448,37 @@ func TestVerifyAttestationAllowlists(t *testing.T) {
 	tampered := []byte(strings.Replace(string(att.Binding), `"miner"`, `"minor"`, 1))
 	if _, err := verifyAttestation(tampered, att.BindingSHA, att.Report, nil, nil); err == nil {
 		t.Fatalf("tampered binding passed")
+	}
+}
+
+// A guest with sealed secrets on adds one binding key. The broker hashes the
+// binding as served and reads only the fields it compares, so admission, the
+// measurement allowlist and the receipt key are as for any sealed hotel.
+func TestVerifyAttestationAdmitsABindingWithASealedSecretsKey(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var att struct {
+		Binding    json.RawMessage `json:"binding"`
+		BindingSHA string          `json:"binding_sha256"`
+		Report     string          `json:"report_b64"`
+	}
+	_ = json.Unmarshal(snpAttestation(t, attestOpts{sealedSecrets: true, receiptKey: pub}), &att)
+	if !bytes.Contains(att.Binding, []byte(`"sealed_secrets":{`)) {
+		t.Fatalf("binding has no sealed_secrets: %s", att.Binding)
+	}
+	res, err := verifyAttestation(att.Binding, att.BindingSHA, att.Report, []string{strings.Repeat("ab", 48)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(res.receiptKey, pub) || res.measurement != strings.Repeat("ab", 48) {
+		t.Fatalf("admission %+v", res)
+	}
+	// The key is covered like every other field: a swapped key breaks the hash.
+	swapped := bytes.Replace(att.Binding, []byte("CQkJ"), []byte("AAAA"), 1)
+	if _, err := verifyAttestation(swapped, att.BindingSHA, att.Report, nil, nil); err == nil {
+		t.Fatalf("binding with a swapped sealed secrets key passed")
 	}
 }
 

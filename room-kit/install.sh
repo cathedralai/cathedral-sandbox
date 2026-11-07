@@ -104,7 +104,7 @@ python3 "$KIT/assess.py" --data-dir "$ROOM_DATA_DIR" --room-socket "$SOCK" --out
 log "assess: $ROOM_ETC/machine.json"
 
 # Resolved copy of the config (values only, no comments) for units and health.
-ROOM_KEYS="ROOM_TLS ROOM_REGISTRY_MIRRORS ROOM_ID ROOM_HOSTNAME ROOM_ACME_EMAIL ROOM_CUSTOMER ROOM_REGION API_PROFILE ROOM_API_PORT ROOM_HEALTH_PORT ROOM_PUBLIC_PORT ROOM_DATA_DIR ROOM_DATA_DEVICE ROOM_DATA_IMG ROOM_DATA_SIZE_GB ROOM_BRIDGE ROOM_BRIDGE_CIDR ROOM_DNS ROOM_RUNSC_FLAGS ROOM_ALLOW_DIND ROOM_CREATES_PER_MINUTE ROOM_GC_PARALLELISM ROOM_DIND_DOCKERD_ARGS ROOM_DIND_ENV ROOM_BRIDGE_PORT_CAP ROOM_NETS ROOM_NETS_POOL ROOM_NET_SIZE ROOM_NET_BRIDGE_PREFIX SHAPE_VCPU SHAPE_MEM_GIB SHAPE_DISK_GIB RESERVE_RAM_PCT RESERVE_THREADS DISK_MAX_FILL_PCT CPU_OVERCOMMIT MEM_OVERCOMMIT DISK_OVERCOMMIT ROOM_MAX_SLOTS ROOM_RECEIPTS ROOM_RECEIPTS_LISTEN ROOM_HOTEL_NAME ROOM_EGRESS ROOM_WORKSPACES ROOM_SECRETS_PERSIST ROOM_ESCAPE ROOM_ESCAPE_ALLOW_PLAINTEXT"
+ROOM_KEYS="ROOM_TLS ROOM_REGISTRY_MIRRORS ROOM_ID ROOM_HOSTNAME ROOM_ACME_EMAIL ROOM_CUSTOMER ROOM_REGION API_PROFILE ROOM_API_PORT ROOM_HEALTH_PORT ROOM_PUBLIC_PORT ROOM_DATA_DIR ROOM_DATA_DEVICE ROOM_DATA_IMG ROOM_DATA_SIZE_GB ROOM_BRIDGE ROOM_BRIDGE_CIDR ROOM_DNS ROOM_RUNSC_FLAGS ROOM_ALLOW_DIND ROOM_CREATES_PER_MINUTE ROOM_GC_PARALLELISM ROOM_DIND_DOCKERD_ARGS ROOM_DIND_ENV ROOM_BRIDGE_PORT_CAP ROOM_NETS ROOM_NETS_POOL ROOM_NET_SIZE ROOM_NET_BRIDGE_PREFIX SHAPE_VCPU SHAPE_MEM_GIB SHAPE_DISK_GIB RESERVE_RAM_PCT RESERVE_THREADS DISK_MAX_FILL_PCT CPU_OVERCOMMIT MEM_OVERCOMMIT DISK_OVERCOMMIT ROOM_MAX_SLOTS ROOM_RECEIPTS ROOM_RECEIPTS_LISTEN ROOM_HOTEL_NAME ROOM_EGRESS ROOM_WORKSPACES ROOM_SECRETS_PERSIST ROOM_ESCAPE ROOM_ESCAPE_ALLOW_PLAINTEXT ROOM_SEALED_SECRETS"
 write_room_env() {
   for k in $ROOM_KEYS; do printf '%s="%s"\n' "$k" "${!k:-}"; done > "$ROOM_ETC/room.env"
   chmod 0644 "$ROOM_ETC/room.env"
@@ -283,6 +283,15 @@ if [ "${ROOM_WORKSPACES:-0}" = 1 ]; then
   mountpoint -q "$ROOM_DATA_DIR/workspaces" || { echo "workspaces mount missing" >&2; exit 1; }
   chown poolroom:poolroom "$ROOM_DATA_DIR/workspaces"
   chmod 0700 "$ROOM_DATA_DIR/workspaces"
+fi
+if [ "${ROOM_SEALED_SECRETS:-0}" = 1 ]; then
+  # Customer-sealed secrets (AB#417): one directory per room, made by the API at
+  # create and mounted read-only at /run/secrets; the receipts front (root) writes
+  # into it. /run is tmpfs, so values live in guest memory only. tmpfiles makes
+  # the root again at every boot; it outlives an API restart while rooms run.
+  mkdir -p "${ROOM_DESTDIR:-}/etc/tmpfiles.d"
+  printf 'd /run/room-secrets 0700 poolroom poolroom -\n' > "${ROOM_DESTDIR:-}/etc/tmpfiles.d/pool-room-secrets.conf"
+  systemd-tmpfiles --create "${ROOM_DESTDIR:-}/etc/tmpfiles.d/pool-room-secrets.conf"
 fi
 # Assess again now that the volume is mounted: the first pass saw the parent
 # file system, and the disk leg of the sizing differed between a first
@@ -466,6 +475,13 @@ if [ "${ROOM_MINER:-0}" = 1 ]; then
 cat >> "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF
 Environment=ROOM_MINER=1 ROOM_RECEIPTS_TLS_LISTEN=$ROOM_RECEIPTS_TLS_LISTEN
 Environment="ROOM_HOTEL_KEY_INSTALL_SIGNERS=$ROOM_HOTEL_KEY_INSTALL_SIGNERS"
+EOF
+fi
+if [ "${ROOM_SEALED_SECRETS:-0}" = 1 ]; then
+# Customer-sealed secrets (AB#417): the front opens envelopes sealed to its
+# per-boot key and writes each room's directory. Off: the unit is as before.
+cat >> "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF
+Environment=ROOM_SEALED_SECRETS=1 ROOM_SEALED_SECRETS_DIR=/run/room-secrets
 EOF
 fi
 cat >> "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF

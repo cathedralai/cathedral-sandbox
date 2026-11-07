@@ -136,6 +136,7 @@ src=$FAKE_WWW/${url##*/} # a pinned download: a directory of files stands in for
 cp "$src" "$out"
 """,
     "sleep": "exit 0",
+    "systemd-tmpfiles": "exit 0",
     "df": r"""printf '%s\n%s\n' 1B-blocks "${FAKE_DISK_BYTES:-3758096384000}" """,
     "du": r"""printf '0\t%s\n' "${2:-}" """,
     "ufw": r"""[ "${1:-}" = status ] && echo "Status: inactive"; exit 0""",
@@ -928,6 +929,25 @@ def test_install_config_hotel_receipts_unit_is_unchanged(host: FakeHost) -> None
     assert "ROOM_MINER" not in unit and "ROOM_HOTEL_KEY_INSTALL_SIGNERS" not in unit
     env_line, exec_line = unit.splitlines()[5:7]
     assert env_line.startswith("Environment=ROOM_RECEIPTS_LISTEN=") and exec_line.startswith("ExecStart=")
+    # Sealed secrets off (the default): no secrets setting anywhere (AB#417).
+    assert "ROOM_SEALED_SECRETS" not in unit
+    assert "CATHEDRAL_SEALED_SECRETS_DIR" not in (host.etc / "api.env").read_text()
+    assert not (host.root / "etc" / "tmpfiles.d" / "pool-room-secrets.conf").exists()
+    assert not host.calls("systemd-tmpfiles")
+
+
+def test_install_sealed_secrets_wires_the_front_the_api_and_the_tmpfs_root(host: FakeHost) -> None:
+    proc = host.install(str(host.room_env(ROOM_SEALED_SECRETS="1")))
+    assert proc.returncode == 0, proc.stdout + proc.stderr[-4000:]
+    unit = host.unit("room-a-receipts.service")
+    assert "Environment=ROOM_SEALED_SECRETS=1 ROOM_SEALED_SECRETS_DIR=/run/room-secrets\n" in unit
+    assert unit.index("ROOM_SEALED_SECRETS=1") < unit.index("ExecStart=")
+    assert "CATHEDRAL_SEALED_SECRETS_DIR=/run/room-secrets\n" in (host.etc / "api.env").read_text()
+    conf = host.root / "etc" / "tmpfiles.d" / "pool-room-secrets.conf"
+    # Root and the API's user only; /run is tmpfs, so the values never touch the scratch disk.
+    assert conf.read_text() == "d /run/room-secrets 0700 poolroom poolroom -\n"
+    assert host.calls("systemd-tmpfiles") == [f"systemd-tmpfiles --create {conf}"]
+    assert 'ROOM_SEALED_SECRETS="1"' in (host.etc / "room.env").read_text()
 
 
 @pytest.mark.parametrize("overrides,message", [

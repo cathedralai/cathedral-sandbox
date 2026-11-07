@@ -35,6 +35,11 @@ EOV
   if [ "${ROOM_WORKSPACES:-0}" = 1 ]; then
     echo "CATHEDRAL_WORKSPACE_ROOT=$ROOM_DATA_DIR/workspaces"
   fi
+  # Customer-sealed secrets (AB#417): a per-room directory mounted read-only at
+  # /run/secrets. The receipts front opens the envelopes and writes the files.
+  if [ "${ROOM_SEALED_SECRETS:-0}" = 1 ]; then
+    echo "CATHEDRAL_SEALED_SECRETS_DIR=/run/room-secrets"
+  fi
   # Egress policy per room through the hotel egress daemon (room_egress.py).
   if [ "${ROOM_EGRESS:-1}" = 1 ]; then
     echo "CATHEDRAL_ROOM_EGRESS_SOCKET=/run/pool-room-egress/control.sock"
