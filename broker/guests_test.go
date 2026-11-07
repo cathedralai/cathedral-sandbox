@@ -12,7 +12,7 @@ import (
 func limitedChain(t *testing.T, lim guestLimits) *testChain {
 	t.Helper()
 	tc := newChain(t)
-	tc.b.hotelByID("a").cfg.Sealed = true
+	ungatedSealed(tc.b.hotelByID("a"))
 	tc.b.mu.Lock()
 	tc.b.guests["g1"].limits = lim
 	tc.b.mu.Unlock()

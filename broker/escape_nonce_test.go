@@ -43,8 +43,10 @@ func admitEscapeHotel(tc *testChain, h *hotel, receiptPub ed25519.PublicKey, bin
 	tc.b.cfg.SealedMeasurements = []string{h.adm.measurement}
 }
 
+// enableEscapeHotel makes h an Escape hotel past the admission gate
+// (sealed_admission off), so these tests reach the plant path's own checks.
 func enableEscapeHotel(h *hotel) {
-	h.cfg.Sealed = true
+	h.cfg.Sealed, h.cfg.SealedAdmission = true, sealedAdmissionOff
 	h.cfg.Labels = map[string]string{"sealed": "true", "escape": "true"}
 }
 

@@ -92,7 +92,7 @@ func TestEmptyGuestIDOwnsUnlabeledRooms(t *testing.T) {
 // label newHotel forced is gone: no create can select the hotel any more.
 func TestPatchLabelsDropsTheSealedLabel(t *testing.T) {
 	tc := newChain(t)
-	tc.b.hotelByID("a").cfg.Sealed = true
+	ungatedSealed(tc.b.hotelByID("a"))
 	// Sanity: a sealed create lands on a.
 	if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "sealed": true}); hotelOf(id) != "a" {
 		t.Fatalf("sealed create on %s before the patch", id)

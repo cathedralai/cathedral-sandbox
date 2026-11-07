@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -134,60 +135,78 @@ func TestConfigHotelOptInWithAnUnlistedMeasurementGetsNoRooms(t *testing.T) {
 	}
 }
 
-// Live, c46-sealed and c46-sealed-2 are two guests on one machine (one
-// CHIP_ID), and so are nc-sealed (const), nc-sealed-2 and nc-sealed-3. Opting
-// in one hotel must not refuse it, or any neighbour, for its chip.
-func TestConfigHotelOptInSharesAChipWithUngatedConfigHotels(t *testing.T) {
+// The live topology (7 Nov 2026, AB#596): nc-sealed (const), nc-sealed-2 and
+// nc-sealed-3 are three guests on one machine (one CHIP_ID), and c46-sealed,
+// c46-sealed-2 and a joined miner hotel are three on another. Every one is
+// gated now, and none is refused for its chip: one hotel per chip holds only
+// between miner hotels.
+func TestGatedSealedHotelsShareAChipLikeLive(t *testing.T) {
 	tc, guests := newConfigHotelChain(t, []configHotel{
-		{id: "c46-sealed", att: attestOpts{chip: 46}},
-		{id: "c46-sealed-2", att: attestOpts{chip: 46}, optIn: true},
+		{id: "c46-sealed", att: attestOpts{chip: 46}, reserve: "g1"},
+		{id: "c46-sealed-2", att: attestOpts{chip: 46}},
 		{id: "nc-sealed", att: attestOpts{chip: 47}, reserve: "const"},
-		{id: "nc-sealed-2", att: attestOpts{chip: 47}},
-	}, nil)
-	ungated := []string{"c46-sealed", "nc-sealed", "nc-sealed-2"}
+		{id: "nc-sealed-2", att: attestOpts{chip: 47}, optIn: true},
+		{id: "nc-sealed-3", att: attestOpts{chip: 47}},
+	}, func(c *config) {
+		c.StateDir = t.TempDir()
+		c.MinerHotkeyCaps, c.MinerMaxHotels = map[string]int{minerHotkey: 2}, 2
+	})
+	sealed := []string{"c46-sealed", "c46-sealed-2", "nc-sealed", "nc-sealed-2", "nc-sealed-3"}
 	for round := 0; round < 2; round++ {
-		for _, id := range append(ungated, "c46-sealed-2") {
+		for _, id := range sealed {
 			recheckNow(tc, id)
 		}
 	}
-	if a := admissionOf(t, tc, "c46-sealed-2"); a["state"] != "admitted" || a["reason"] != nil || a["chip_id"] == nil {
-		t.Fatalf("opted-in hotel next to an ungated hotel on its chip: %v", a)
+	if n := len(amdCalls(tc.amdDir)); n != len(sealed) {
+		t.Fatalf("AMD chain ran %d times, want %d (once per hotel and binding)", n, len(sealed))
 	}
-	for _, id := range ungated {
+	// A miner on the c46 machine joins next to the two operator hotels.
+	m, url := newMinerHotel(t, 5, snpAttestation(t, attestOpts{chip: 46, measurement: 0x22}))
+	tc.hotels["miner-1"] = m.fakeHotel
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "miner-1", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey}); status != 201 {
+		t.Fatalf("miner join on an operator chip: %d %v", status, doc)
+	}
+	syncNow(tc, "miner-1")
+	for _, id := range append(sealed, "miner-1") {
+		recheckNow(tc, id)
 		a := admissionOf(t, tc, id)
-		if a["state"] != "admitted" || a["attestation_required"] != false || a["amd_chain_required"] != false || a["attested_at"] != nil || a["reason"] != nil {
-			t.Fatalf("ungated config hotel %s: %v", id, a)
+		if a["state"] != "admitted" || a["attestation_required"] != true || a["amd_chain_required"] != true || a["reason"] != nil || a["chip_id"] == nil {
+			t.Fatalf("gated hotel %s on a shared chip: %v", id, a)
 		}
-		if attestationAsked(tc, id) {
-			t.Fatalf("ungated config hotel %s was asked for an attestation", id)
+		if !attestationAsked(tc, id) {
+			t.Fatalf("gated hotel %s was never asked for its attestation", id)
 		}
 	}
-	if !attestationAsked(tc, "c46-sealed-2") {
-		t.Fatal("opted-in hotel was never asked for its attestation")
-	}
-	if n := len(amdCalls(tc.amdDir)); n != 1 {
-		t.Fatalf("AMD chain ran %d times, want once (only the opted-in hotel, once per binding)", n)
-	}
-	for _, id := range []string{"c46-sealed", "c46-sealed-2", "nc-sealed-2"} {
+	for _, id := range []string{"c46-sealed-2", "nc-sealed-2", "nc-sealed-3"} {
 		if got := tc.room(t, "key1", sealedOn(id)); !strings.HasPrefix(got, id+".") {
 			t.Fatalf("room for %s on %s", id, got)
 		}
+	}
+	if got := tc.room(t, "key1", sealedOn("c46-sealed")); !strings.HasPrefix(got, "c46-sealed.") {
+		t.Fatalf("reserved room on %s", got)
 	}
 	if got := tc.room(t, "key-const", sealedOn("nc-sealed")); !strings.HasPrefix(got, "nc-sealed.") {
 		t.Fatalf("const room on %s", got)
 	}
 
-	// The opted-in hotel loses its pass; its chip neighbour keeps taking rooms.
-	guests["c46-sealed-2"].setAttestation(snpAttestation(t, attestOpts{chip: 46, measurement: 0x33}))
-	recheckNow(tc, "c46-sealed-2")
-	if a := admissionOf(t, tc, "c46-sealed-2"); a["state"] != "refused" {
-		t.Fatalf("opted-in hotel after a bad attestation: %v", a)
+	// A second miner on the same machine is still refused: one miner per chip.
+	_, url2 := newMinerHotel(t, 5, snpAttestation(t, attestOpts{chip: 46, measurement: 0x22}))
+	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "miner-2", "api": url2, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey})
+	if status != 409 || errCode(doc) != "chip_in_use" || !strings.Contains(fmt.Sprint(doc), "hotel miner-1") {
+		t.Fatalf("second miner on one chip: %d %v", status, doc)
 	}
-	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", sealedOn("c46-sealed-2")); status != 503 || errCode(doc) != "hotels_not_admitted" {
+
+	// One hotel loses its pass; its chip neighbours keep taking rooms.
+	guests["nc-sealed-3"].setAttestation(snpAttestation(t, attestOpts{chip: 47, measurement: 0x33}))
+	recheckNow(tc, "nc-sealed-3")
+	if a := admissionOf(t, tc, "nc-sealed-3"); a["state"] != "refused" {
+		t.Fatalf("hotel after a bad attestation: %v", a)
+	}
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", sealedOn("nc-sealed-3")); status != 503 || errCode(doc) != "hotels_not_admitted" {
 		t.Fatalf("create on the refused hotel: %d %v", status, doc)
 	}
-	if got := tc.room(t, "key1", sealedOn("c46-sealed")); !strings.HasPrefix(got, "c46-sealed.") {
-		t.Fatalf("room on the chip neighbour went to %s", got)
+	if got := tc.room(t, "key-const", sealedOn("nc-sealed")); !strings.HasPrefix(got, "nc-sealed.") {
+		t.Fatalf("const room on the chip neighbour went to %s", got)
 	}
 }
 
@@ -250,12 +269,15 @@ func TestConfigHotelOptInFailsClosed(t *testing.T) {
 		setAMDVerdict(t, tc.amdDir, `{"verdict": "FAIL", "reason": "report signature does not verify with the VCEK"}`)
 		refused(t, tc, "AMD chain: report signature")
 	})
-	t.Run("sealed_admission off keeps the gate", func(t *testing.T) {
-		tc, _ := newConfigHotelChain(t, optIn, func(c *config) { c.SealedAdmission = "off" })
-		if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", sealedOn("s1")); status != 503 || errCode(doc) != "hotels_not_admitted" {
-			t.Fatalf("create before admission with sealed_admission off: %d %v", status, doc)
+	t.Run("top-level sealed_admission off does not load", func(t *testing.T) {
+		tc, _ := newConfigHotelChain(t, optIn, nil)
+		var c config
+		raw, _ := os.ReadFile(tc.cfgPath)
+		_ = json.Unmarshal(raw, &c)
+		c.SealedAdmission = "off"
+		if _, err := loadBroker(writeConfig(t, c)); err == nil || !strings.Contains(err.Error(), `top-level "sealed_admission": "off" is refused`) {
+			t.Fatalf("top-level sealed_admission off loaded: %v", err)
 		}
-		admitNow(t, tc, "s1")
 	})
 	t.Run("unsealed config hotel", func(t *testing.T) {
 		tc, _ := newConfigHotelChain(t, optIn, nil)

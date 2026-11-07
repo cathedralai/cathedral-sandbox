@@ -186,10 +186,10 @@ func TestAMDChainRequiredForMinerHotels(t *testing.T) {
 	if status != 422 || !strings.Contains(fmt.Sprint(doc), "AMD chain check") {
 		t.Fatalf("miner hotel with no chain verifier: %d %v", status, doc)
 	}
-	// An operator hotel (no miner_hotkey) is not chain-checked without a verifier.
+	// A sealed operator hotel takes the same check since AB#596: refused too.
 	_, url = newOperatorHotel(t, 5, snpAttestation(t, attestOpts{chip: 2}))
 	status, doc = tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "op1", "api": url, "key": joinKey, "sealed": true})
-	if a, _ := doc["admission"].(map[string]any); status != 201 || a["attested_at"] == nil || a["amd_chain_required"] != false || a["amd_chain"] != nil {
+	if status != 422 || !strings.Contains(fmt.Sprint(doc), "a sealed hotel needs the AMD chain check") || tc.b.hotelByID("op1") != nil {
 		t.Fatalf("operator hotel: %d %v", status, doc)
 	}
 

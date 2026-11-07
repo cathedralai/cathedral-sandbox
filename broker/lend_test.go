@@ -236,7 +236,8 @@ func addWSHotel(t *testing.T, tc *testChain, id string) *wsHotel {
 	hs := httptest.NewServer(wh)
 	t.Cleanup(hs.Close)
 	tc.hotels[id] = f
-	h := newHotel(hotelConfig{ID: id, Name: id, API: hs.URL, Health: hs.URL, Concurrency: 4, Sealed: true}, "hotel-key")
+	// Past the gate (sealed_admission off): this fixture covers workspaces and lend, not admission.
+	h := newHotel(hotelConfig{ID: id, Name: id, API: hs.URL, Health: hs.URL, Concurrency: 4, Sealed: true, SealedAdmission: sealedAdmissionOff}, "hotel-key")
 	if err := tc.b.addHotel(h); err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +247,7 @@ func addWSHotel(t *testing.T, tc *testChain, id string) *wsHotel {
 
 func TestWorkspaceCreateSkipsALentHotel(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	tc.b.hotelByID("a").cfg.Sealed = true
+	ungatedSealed(tc.b.hotelByID("a"))
 	setPolicy(t, tc, "g1", map[string]any{"prefer": []any{map[string]any{"class": "sealed"}}})
 	lent := addWSHotel(t, tc, "nc")
 	reserve(t, tc, "nc", "g2")
