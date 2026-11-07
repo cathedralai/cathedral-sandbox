@@ -330,7 +330,7 @@ def test_every_seal_draws_fresh_keys_and_nonces_both_ways(guest) -> None:
     f"/v1/sandboxes/{ROOM}/exec-sealed;x=1",      # urlparse, as the API parses, drops ";params"
     f"/v1/sandboxes/{ROOM}/exec%2Dsealed",
     f"/v1/sandboxes/{ROOM}/exec-sealed?cmd=true",
-    f"/v1/sandboxes/{ROOM}/exec-sealed/",
+    "/v1/sandboxes/a%2Fb/exec-sealed",              # the API's raw match takes a%2Fb as one id
 ])
 def test_no_caller_reaches_the_room_apis_sealed_route(guest, path) -> None:
     # That route runs an exec with no history or log, and the front signs no receipt for it.
@@ -803,3 +803,21 @@ def test_the_front_waits_past_the_commands_own_limit(guest, monkeypatch) -> None
     assert _post(port, client.seal(timeout_seconds=rr.EXEC_TIMEOUT_MAX)[0])[0] == 200
     # The room API's own exec limit is the timeout plus 15 s for docker exec; the front waits longer.
     assert waits == [rr.EXEC_TIMEOUT_MAX + rr.EXEC_ANSWER_MARGIN_SECONDS] and rr.EXEC_ANSWER_MARGIN_SECONDS > 15
+
+
+@pytest.mark.parametrize("path", ["/v1/workspaces/my-exec-sealed-data", "/v1/images/ghcr.io/acme/exec-sealed:1",
+                                  f"/v1/sandboxes/{ROOM}/files?path=/work/exec-sealed"])
+def test_other_routes_that_name_exec_sealed_still_pass_with_the_flag_off(tmp_path, monkeypatch, path) -> None:
+    # Review finding 5: the guard matched the word anywhere, so flag off was not byte for byte as before.
+    ledger, _ = _ledger(tmp_path, monkeypatch, sealed_exec=False)
+    api = Api()
+    port = _front(ledger, api.port)
+    status, _, _ = _request(port, "GET", path)
+    assert status == 200 and [p for _, p, _, _ in api.seen] == [path]
+
+
+def test_a_spelling_the_api_does_not_route_reaches_it_and_runs_nothing(real_room) -> None:
+    _, port, room, _ = real_room
+    status, _, body = _request(port, "POST", f"/v1/sandboxes/{room}/exec-sealed/", canonical({"cmd": ["true"]}))
+    assert (status, _code(body)) == (404, "route_not_found")
+    assert json.loads(_request(port, "GET", f"/v1/sandboxes/{room}/logs")[2])["exec_history"] == []

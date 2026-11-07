@@ -248,6 +248,7 @@ EXEC_ROUTE = re.compile(r"^/v1/sandboxes/(?P<id>[^/]+)/sealed-exec$")
 # serves to the relay. An API without the route answers 404 and runs nothing (fail closed).
 # Only this front calls it: a caller's request that names it in any spelling is refused.
 EXEC_API_TAIL = "exec-sealed"
+EXEC_API_ROUTE = re.compile(r"^/v1/sandboxes/[^/]+/exec-sealed$")  # the room API's own pattern
 
 
 class PlantError(ValueError):
@@ -1880,10 +1881,12 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             # Opened here; only the plaintext exec goes on, inside the guest, to the room API.
             return self.handle_sealed_exec(ledger, m["id"], body)
-        if EXEC_API_TAIL in unquote(urlparse(self.path).path):
+        api_path = urlparse(self.path).path
+        if any(EXEC_API_ROUTE.match(p) for p in (api_path, unquote(api_path))):
             # The room API's sealed exec route runs an exec that leaves no history or log, and
-            # it is not a signed route here: no caller may reach it. Parsed as the API parses
-            # it (urlparse drops a ";params" suffix), and decoded, so no spelling gets past.
+            # it is not a signed route here: no caller may reach it. Matched as the API matches
+            # it (urlparse drops a ";params" suffix, then the raw path), and decoded too; any
+            # other path, flag on or off, passes as before.
             return self.reply(404, b'{"error":{"code":"route_not_found","message":"no such route"}}')
         action = next((a for meth, pat, a in SIGNED if meth == self.command and pat.match(path)), None)
         if action and body:
