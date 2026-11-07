@@ -205,7 +205,7 @@ esac
 """
 
 FAKE_SIMPLE = {
-    "mkfs.xfs": 'printf "mkfs.xfs %s\\n" "$*" >> "$FAKE_LOG"',
+    "mkfs.xfs": 'printf "mkfs.xfs %s\\n" "$*" >> "$FAKE_LOG"; [ ! -e "$FAKE_STATE/mkfs-fails" ]',
     "mount": 'printf "mount %s\\n" "$*" >> "$FAKE_LOG"; [ -z "${FAKE_MOUNT_FAILS:-}" ] || exit 32; touch "$FAKE_STATE/mounted"',
     "mountpoint": '[ -e "$FAKE_STATE/mounted" ]',
     "df": 'echo " Size"; echo " 4211081216"',
@@ -339,6 +339,14 @@ def test_a_volume_whose_file_system_does_not_mount_is_reported_broken(disk) -> N
     assert not disk.calls("mkfs.xfs")
 
 
+def test_a_failing_step_reports_error_and_still_removes_the_key(disk) -> None:
+    (disk.state / "mkfs-fails").touch()
+    proc, status = disk.boot()
+    assert proc.returncode != 0, "the boot script logs it and goes on without the volume"
+    assert status["state"] == "error" and status["persistent"] is False
+    assert not list(disk.run_dir.glob("sealed-data.key.*"))
+
+
 def test_the_disk_check_accepts_a_regular_file_only_in_tests() -> None:
     text = (SEALED / "sealed-data.sh").read_text()
     assert '[ -b "$1" ] || { [ "${SEALED_DATA_FAKE_DISK:-0}" = 1 ] && [ -f "$1" ]; }' in text
@@ -431,8 +439,8 @@ def test_build_puts_both_tools_in_the_measured_initrd_and_the_switch_in_room_env
 
 def test_guest_boot_opens_the_volume_only_when_the_measured_env_asks() -> None:
     text = (SEALED / "guest-boot.sh").read_text()
-    assert "if grep -q '^ROOM_WORKSPACES_SOURCE=/' /opt/room-kit/room.env; then\n  /usr/local/sbin/sealed-data.sh" in text
-    call = text.index("  /usr/local/sbin/sealed-data.sh\n")
+    assert "if grep -q '^ROOM_WORKSPACES_SOURCE=/' /opt/room-kit/room.env; then\n" in text
+    call = text.index("  /usr/local/sbin/sealed-data.sh || log ")
     assert call < text.index("/opt/room-kit/install.sh /opt/room-kit/room.env")
     # The scratch stays per boot: it is opened with /dev/urandom before the data volume.
     assert text.index("--key-file /dev/urandom") < call

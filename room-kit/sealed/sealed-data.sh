@@ -15,6 +15,7 @@
 #   broken  the volume opened but its file system did not mount: left untouched
 #   absent  no data disk
 #   nokey   the secure processor gave no key (not an SNP guest?)
+#   error   a step failed (see the serial log); this script then exits non-zero
 # In every state but new and open the volume is not mounted and room-data.sh
 # keeps workspaces on the scratch disk, which is gone at the next boot.
 # A disk that holds a LUKS volume is never formatted.
@@ -33,11 +34,20 @@ TOKEN_TYPE=cathedral-sealed-data
 export DM_DISABLE_UDEV=1
 
 KEY_ID=""
+KEYFILE=""
+STATUS_SET=0
 status() { # status <state> <detail>
   python3 -c 'import json,sys; s,d,k=sys.argv[1:]; print(json.dumps({"state": s, "persistent": s in ("new", "open"), "key_id": k or None, "detail": d}, sort_keys=True))' \
     "$1" "$2" "$KEY_ID" > "$STATUS"
+  STATUS_SET=1
   log "$1: $2"
 }
+on_exit() {
+  local rc=$?
+  [ -z "$KEYFILE" ] || rm -f "$KEYFILE"
+  if [ "$rc" != 0 ] && [ "$STATUS_SET" = 0 ]; then status error "a step failed (exit $rc); see [sealed-data] in the serial log"; fi
+}
+trap on_exit EXIT
 
 # A block device; the tests (tests/test_room_kit_sealed_data.py) use a regular file.
 is_disk() { [ -b "$1" ] || { [ "${SEALED_DATA_FAKE_DISK:-0}" = 1 ] && [ -f "$1" ]; }; }
@@ -47,8 +57,7 @@ if ! is_disk "$DEV"; then
   exit 0
 fi
 
-KEYFILE=$(mktemp "$RUNDIR/sealed-data.key.XXXXXX")  # /run is tmpfs: guest memory only
-trap 'rm -f "$KEYFILE"' EXIT
+KEYFILE=$(mktemp "$RUNDIR/sealed-data.key.XXXXXX")  # /run is tmpfs: guest memory only; mode 0600
 INFO=$("$KEYTOOL" info 2>&1) && "$KEYTOOL" key > "$KEYFILE" || {
   status nokey "the secure processor gave no key: $(echo "$INFO" | tail -1)"
   exit 0
