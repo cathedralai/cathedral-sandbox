@@ -189,7 +189,14 @@ case "$1" in
   luksFormat)
     dev=${args[-1]}
     [ "$(wc -c < "$keyfile" | tr -d ' ')" = 32 ] || exit 3
-    printf 'LUKS\xba\xbe' | dd of="$dev" conv=notrunc 2>/dev/null
+    # A LUKS2 layout as luksFormat writes it: primary signature at 0, its JSON area at 4 KiB,
+    # the secondary signature at 16 KiB, and key slot bytes at 32 KiB.
+    python3 -c 'import os,sys
+with open(sys.argv[1], "r+b") as f:
+    f.seek(0); f.write(b"LUKS\xba\xbe\x00\x02")
+    f.seek(4096); f.write(b"{\"keyslots\":{\"0\":{}},\"segments\":{\"0\":{}}}")
+    f.seek(16384); f.write(b"SKUL\xba\xbe\x00\x02")
+    f.seek(32768); f.write(os.urandom(4096))' "$dev"
     od -An -tx1 "$keyfile" | tr -d ' \n' > "$FAKE_STATE/slot0"
     python3 -c 'import json,sys; json.dump({
       "keyslots":{"0":{"type":"luks2","key_size":64,"area":{"encryption":"aes-xts-plain64"},"kdf":{"type":"pbkdf2","hash":"sha256"}}},
@@ -380,6 +387,51 @@ def test_a_failing_step_reports_error_and_still_removes_the_key(disk) -> None:
     assert proc.returncode != 0, "the boot script logs it and goes on without the volume"
     assert status["state"] == "error" and status["persistent"] is False
     assert not list(disk.run_dir.glob("sealed-data.key.*"))
+
+
+def test_damaged_dual_luks2_signatures_are_never_formatted(disk) -> None:
+    # SpockChaser's HOLD on #413: both 6-byte LUKS2 signatures (offset 0 and 16 KiB) zeroed,
+    # the rest of the header and the key slots intact. A backup restore could still use them.
+    disk.boot()
+    with open(disk.dev, "r+b") as f:
+        f.seek(0)
+        f.write(bytes(6))
+        f.seek(16384)
+        f.write(bytes(6))
+    before = disk.dev.read_bytes()
+    proc, status = disk.boot()
+    assert proc.returncode == 0, "a disk it will not format must not stop the hotel"
+    assert status["state"] == "broken" and status["persistent"] is False
+    assert "holds data that is not a LUKS2 volume" in status["detail"]
+    assert not disk.calls("cryptsetup luksFormat") and not disk.calls("mkfs.xfs") and not disk.calls("mount")
+    assert disk.dev.read_bytes() == before, "left byte for byte untouched"
+
+
+def test_a_random_non_luks_disk_is_never_formatted(disk) -> None:
+    disk.dev.write_bytes(b"NOTLUKS" + os.urandom((1 << 16) - 7))
+    proc, status = disk.boot()
+    assert proc.returncode == 0 and status["state"] == "broken"
+    assert not disk.calls("cryptsetup luksFormat") and not disk.calls("mkfs.xfs")
+
+
+def test_one_nonzero_byte_anywhere_in_the_first_16_mib_blocks_the_format(disk) -> None:
+    # The virgin check covers both LUKS2 header areas and the key slots: the first 16 MiB.
+    with open(disk.dev, "wb") as f:
+        f.truncate(32 << 20)               # sparse, reads as zero
+        f.seek((16 << 20) - 1)
+        f.write(b"\x01")                   # the last byte of the 16 MiB window
+    proc, status = disk.boot()
+    assert status["state"] == "broken" and not disk.calls("cryptsetup luksFormat")
+
+
+def test_a_fresh_all_zero_disk_still_formats(disk) -> None:
+    with open(disk.dev, "wb") as f:
+        f.truncate(32 << 20)               # a fresh sparse data.raw, as launch-guest.sh makes it
+        f.seek(16 << 20)
+        f.write(b"\x01")                   # past the 16 MiB window: not part of the virgin check
+    proc, status = disk.boot()
+    assert proc.returncode == 0, proc.stderr
+    assert status["state"] == "new" and len(disk.calls("cryptsetup luksFormat")) == 1
 
 
 def test_the_disk_check_accepts_a_regular_file_only_in_tests() -> None:

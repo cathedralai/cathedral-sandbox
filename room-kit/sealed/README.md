@@ -68,8 +68,9 @@ Design, threat model, upgrade path and the proof on an SNP host:
   keeps workspaces on the scratch disk.
 - After open, the guest verifies the LUKS2 header (cipher, sector size, key
   slot) and refuses a null-cipher edit; it needs cryptsetup 2.8.1 or newer.
-- The guest never formats a disk that holds a LUKS header or a file system. To
-  start empty, stop the guest and remove `$SEALED_DIR/data.raw`.
+- The guest formats only a blank disk (its first 16 MiB all zero); any other
+  non-LUKS content, such as damaged LUKS2 signatures, is `broken` and left
+  untouched. To start empty, stop the guest and remove `$SEALED_DIR/data.raw`.
 - A roll to a new launch identity: `install.sh --sealed` stops unless a one-line
   choice is in `$SEALED_DIR/data-on-new-build`: `reset` (the old volume becomes
   `data.raw.prev`, restored on any failure until the measurement checks; refuses

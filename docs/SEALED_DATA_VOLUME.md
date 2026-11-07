@@ -121,20 +121,24 @@ log, status file or receipt holds it.
 
 | State | Meaning | Workspaces this boot |
 |---|---|---|
-| `new` | Blank disk: formatted now | Data volume |
+| `new` | A blank disk (first 16 MiB all zero): formatted now | Data volume |
 | `open` | Opened with this build's key, header verified | Data volume |
 | `locked` | A LUKS2 volume no key slot of which opens with this key (another build, chip or HOST_DATA). Left untouched | Scratch (gone at next boot) |
 | `tampered` | The header is not our layout (null cipher, wrong sector, extra segment), or the device holds a file system with no cathedral token. Closed, left untouched | Scratch |
-| `broken` | A LUKS header cryptsetup cannot read, or xfs does not mount. Left untouched | Scratch |
+| `broken` | The disk holds data that is not a LUKS2 volume (not all zero, for example damaged LUKS2 signatures), a LUKS header cryptsetup cannot read, or xfs does not mount. Left untouched | Scratch |
 | `absent` | No data disk attached | Scratch |
 | `nokey` | The secure processor gave no key | Scratch |
 | `error` | A step failed, or cryptsetup is older than 2.8.1 (serial log); the boot goes on | Scratch |
 
 Rules:
 
-- The guest never formats a disk that holds a LUKS header. It runs mkfs only
-  when the volume's token does not yet say `fs: xfs` (a first boot that
-  stopped between luksFormat and mkfs).
+- The guest formats only on positive evidence of a blank disk: the first
+  16 MiB (both LUKS2 header areas and the key slots) read as zero, as a fresh
+  sparse `data.raw` does. Anything else that is not LUKS (for example a header
+  whose two signatures were damaged but whose key slots a backup could still
+  use) is `broken` and left untouched. It runs mkfs only when the volume's
+  token does not yet say `fs: xfs` (a first boot that stopped between
+  luksFormat and mkfs).
 - A locked or broken volume does not stop the hotel. Rooms without a
   workspace work; a create that names an old workspace answers 404
   `workspace_not_found`.
