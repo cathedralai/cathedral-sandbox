@@ -1915,16 +1915,19 @@ class DockerGuestProvider:
         duration_ms = int(elapsed * 1000)
         with self._inner._lock:  # noqa: SLF001
             sandbox = self._inner._require_active(sandbox_id)  # noqa: SLF001
-            sandbox.exec_history.append(
-                ExecRecord(
-                    command=_render_cmd(request),
-                    exit_code=code,
-                    duration_ms=duration_ms,
-                    at=_now(),
+            if not request.sealed:
+                # A sealed exec (AB#417) leaves its command and output to its client only:
+                # GET .../logs serves this record to whoever holds the hotel key.
+                sandbox.exec_history.append(
+                    ExecRecord(
+                        command=_render_cmd(request),
+                        exit_code=code,
+                        duration_ms=duration_ms,
+                        at=_now(),
+                    )
                 )
-            )
-            sandbox.container_stdout.extend(out.encode("utf-8", "replace"))
-            sandbox.container_stderr.extend(err.encode("utf-8", "replace"))
+                sandbox.container_stdout.extend(out.encode("utf-8", "replace"))
+                sandbox.container_stderr.extend(err.encode("utf-8", "replace"))
             # The log record keeps the last EXEC_OUTPUT_CAP bytes: a room that
             # prints without end must not grow the API's memory without end.
             del sandbox.container_stdout[:-EXEC_OUTPUT_CAP]

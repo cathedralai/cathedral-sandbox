@@ -60,6 +60,11 @@ type fakeHotel struct {
 	// appliesTunables: answer a create with "tunables" like a room kit with
 	// per-room tunables (the view, sha256 of the document as sent).
 	appliesTunables bool
+	// Sealed commands (room-kit POST /v1/sandboxes/{id}/sealed-exec, AB#417): the
+	// paths and exact bodies the hotel got, and the exact answer it gives.
+	sealedExecPaths  []string
+	sealedExecBodies [][]byte
+	sealedExecAnswer []byte
 }
 
 func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -247,6 +252,13 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		policy := map[string]any{"mode": req["mode"], "allow": req["allow"]}
 		writeJSON(w, 200, map[string]any{"sandbox_id": strings.Split(p, "/")[3],
 			"network": map[string]any{"mode": req["mode"], "allow": req["allow"], "policy": policy, "policy_sha256": "abc"}})
+	case strings.HasSuffix(p, "/sealed-exec") && r.Method == "POST":
+		f.sealedExecPaths = append(f.sealedExecPaths, p)
+		f.sealedExecBodies = append(f.sealedExecBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Room-Receipt", "signed-sealed-exec")
+		w.WriteHeader(200)
+		_, _ = w.Write(f.sealedExecAnswer)
 	case strings.HasSuffix(p, "/exec") && r.Method == "POST":
 		f.execs = append(f.execs, req)
 		w.Header().Set("X-Room-Receipt", "signed-exec")

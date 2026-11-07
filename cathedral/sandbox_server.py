@@ -258,6 +258,9 @@ class SandboxApplication:
         self._add("PATCH", s + r"/(?P<id>[^/]+)", self.patch_sandbox)
         self._add("POST", s + r"/(?P<id>[^/]+)/wait", self.wait)
         self._add("POST", s + r"/(?P<id>[^/]+)/exec", self.exec_)
+        # The receipts front's own route for an exec it opened from a sealed envelope (AB#417);
+        # the front refuses it to every caller. An API without it answers 404 and runs nothing.
+        self._add("POST", s + r"/(?P<id>[^/]+)/exec-sealed", self.exec_sealed)
         self._add("POST", s + r"/(?P<id>[^/]+)/heartbeat", self.heartbeat)
         self._add("POST", s + r"/(?P<id>[^/]+)/lifetime", self.heartbeat)
         self._add("PATCH", s + r"/(?P<id>[^/]+)/lifetime", self.heartbeat)
@@ -492,7 +495,7 @@ class SandboxApplication:
         return Response.json(200, self.provider.wait(id, timeout))
 
     # ------------------------------------------------------------------ §3.2 exec / processes
-    def exec_(self, *, id, body, **_):
+    def exec_(self, *, id, body, sealed: bool = False, **_):
         payload = self._json(body)
         cmd = payload.get("cmd")
         if cmd is None:
@@ -504,9 +507,14 @@ class SandboxApplication:
             user=payload.get("user"),
             timeout_seconds=payload.get("timeout_seconds"),
             stdin=payload.get("stdin"),
+            sealed=sealed,
         )
         result = self.provider.exec(id, req)
         return Response.json(200, result.to_document())
+
+    def exec_sealed(self, *, id, body, **_):
+        """An exec as /exec runs it, with its command and output kept out of the history and the log."""
+        return self.exec_(id=id, body=body, sealed=True)
 
     def start_process(self, *, id, body, **_):
         payload = self._json(body)
