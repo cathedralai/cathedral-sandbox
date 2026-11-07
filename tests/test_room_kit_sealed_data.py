@@ -415,7 +415,7 @@ def test_a_random_non_luks_disk_is_never_formatted(disk) -> None:
 
 
 def test_one_nonzero_byte_anywhere_in_the_first_16_mib_blocks_the_format(disk) -> None:
-    # The virgin check covers both LUKS2 header areas and the key slots: the first 16 MiB.
+    # The header areas and the key slots: the first 16 MiB.
     with open(disk.dev, "wb") as f:
         f.truncate(32 << 20)               # sparse, reads as zero
         f.seek((16 << 20) - 1)
@@ -424,14 +424,80 @@ def test_one_nonzero_byte_anywhere_in_the_first_16_mib_blocks_the_format(disk) -
     assert status["state"] == "broken" and not disk.calls("cryptsetup luksFormat")
 
 
+def test_a_zeroed_header_over_a_payload_is_never_formatted(disk) -> None:
+    # SpockChaser's second HOLD on #413: the first 16 MiB zeroed, the encrypted payload still there.
+    # A header backup could restore it, so a format here would destroy recoverable data.
+    with open(disk.dev, "wb") as f:
+        f.truncate(32 << 20)
+        f.seek(16 << 20)
+        f.write(b"\x01")                   # the first byte past the header window
+    before = disk.dev.read_bytes()
+    proc, status = disk.boot()
+    assert proc.returncode == 0, proc.stderr
+    assert status["state"] == "broken" and "holds data that is not a LUKS2 volume" in status["detail"]
+    assert not disk.calls("cryptsetup luksFormat") and not disk.calls("mkfs.xfs") and not disk.calls("mount")
+    assert disk.dev.read_bytes() == before, "left byte for byte untouched"
+
+
+def test_a_nonzero_last_byte_of_the_disk_blocks_the_format(disk) -> None:
+    with open(disk.dev, "wb") as f:
+        f.seek((32 << 20) + 4)             # 32 MiB + 5 bytes: the last chunk is 5 bytes long
+        f.write(b"\x01")                   # the very last byte of the disk
+    proc, status = disk.boot()
+    assert status["state"] == "broken" and not disk.calls("cryptsetup luksFormat")
+
+
 def test_a_fresh_all_zero_disk_still_formats(disk) -> None:
     with open(disk.dev, "wb") as f:
         f.truncate(32 << 20)               # a fresh sparse data.raw, as launch-guest.sh makes it
-        f.seek(16 << 20)
-        f.write(b"\x01")                   # past the 16 MiB window: not part of the virgin check
     proc, status = disk.boot()
     assert proc.returncode == 0, proc.stderr
     assert status["state"] == "new" and len(disk.calls("cryptsetup luksFormat")) == 1
+    assert "the data disk is blank (read in" in proc.stdout
+
+
+def test_an_empty_disk_is_not_proven_blank(disk) -> None:
+    disk.dev.write_bytes(b"")
+    proc, status = disk.boot()
+    assert proc.returncode == 0, proc.stderr
+    assert status["state"] == "broken" and "could not be read to its end" in status["detail"]
+    assert not disk.calls("cryptsetup luksFormat")
+
+
+def _virgin_program() -> str:
+    """The Python that virgin_disk() runs, cut from sealed-data.sh, so the read loop can be driven directly."""
+    text = (SEALED / "sealed-data.sh").read_text()
+    body = text[text.index("virgin_disk() {"):]
+    start = body.index("python3 -c '") + len("python3 -c '")
+    return body[start:body.index("' \"$DEV\"", start)]
+
+
+@pytest.mark.parametrize("fault, why", [
+    ("return _real(fd, n) if calls[0] == 1 else b''", "short read: the device ends before its size"),
+    ("raise OSError(5, 'Input/output error')", "an I/O error part way"),
+])
+def test_the_virgin_check_fails_closed_when_the_disk_cannot_be_read_whole(tmp_path: Path, fault: str, why: str) -> None:
+    dev = tmp_path / "data.raw"
+    with open(dev, "wb") as f:
+        f.truncate(24 << 20)               # all zero, three 8 MiB chunks
+    prelude = ("import os\n_real = os.read\ncalls = [0]\n"
+               "def _read(fd, n):\n    calls[0] += 1\n"
+               f"    if calls[0] == 1:\n        return _real(fd, n)\n    {fault}\n"
+               "os.read = _read\n")
+    proc = subprocess.run([sys.executable, "-c", prelude + _virgin_program(), str(dev)], capture_output=True, text=True)
+    assert proc.returncode == 2, (why, proc.stderr)
+
+
+@pytest.mark.parametrize("payload, code", [(None, 0), ((24 << 20) - 1, 1), (8 << 20, 1)])
+def test_the_virgin_check_reads_every_chunk(tmp_path: Path, payload, code: int) -> None:
+    dev = tmp_path / "data.raw"
+    with open(dev, "wb") as f:
+        f.truncate(24 << 20)
+        if payload is not None:
+            f.seek(payload)
+            f.write(b"\x01")
+    proc = subprocess.run([sys.executable, "-c", _virgin_program(), str(dev)], capture_output=True, text=True)
+    assert proc.returncode == code, proc.stderr
 
 
 def test_the_disk_check_accepts_a_regular_file_only_in_tests() -> None:

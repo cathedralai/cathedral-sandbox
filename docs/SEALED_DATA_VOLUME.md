@@ -121,22 +121,25 @@ log, status file or receipt holds it.
 
 | State | Meaning | Workspaces this boot |
 |---|---|---|
-| `new` | A blank disk (first 16 MiB all zero): formatted now | Data volume |
+| `new` | A blank disk (every byte zero): formatted now | Data volume |
 | `open` | Opened with this build's key, header verified | Data volume |
 | `locked` | A LUKS2 volume no key slot of which opens with this key (another build, chip or HOST_DATA). Left untouched | Scratch (gone at next boot) |
 | `tampered` | The header is not our layout (null cipher, wrong sector, extra segment), or the device holds a file system with no cathedral token. Closed, left untouched | Scratch |
-| `broken` | The disk holds data that is not a LUKS2 volume (not all zero, for example damaged LUKS2 signatures), a LUKS header cryptsetup cannot read, or xfs does not mount. Left untouched | Scratch |
+| `broken` | The disk holds data that is not a LUKS2 volume (not all zero, for example damaged LUKS2 signatures or a zeroed header over a payload), a disk that could not be read to its end, a LUKS header cryptsetup cannot read, or xfs does not mount. Left untouched | Scratch |
 | `absent` | No data disk attached | Scratch |
 | `nokey` | The secure processor gave no key | Scratch |
 | `error` | A step failed, or cryptsetup is older than 2.8.1 (serial log); the boot goes on | Scratch |
 
 Rules:
 
-- The guest formats only on positive evidence of a blank disk: the first
-  16 MiB (both LUKS2 header areas and the key slots) read as zero, as a fresh
-  sparse `data.raw` does. Anything else that is not LUKS (for example a header
-  whose two signatures were damaged but whose key slots a backup could still
-  use) is `broken` and left untouched. It runs mkfs only when the volume's
+- The guest formats only on positive evidence of a blank disk: every byte of
+  the device reads as zero, as a fresh sparse `data.raw` does. A zero header is
+  not enough: a disk whose first 16 MiB were zeroed can still hold a payload
+  that a header backup would restore. Anything else that is not LUKS (for
+  example damaged LUKS2 signatures, or a zeroed header over a payload), and a
+  disk that cannot be read to its end, is `broken` and left untouched. A disk
+  with data stops the read at its first nonzero byte; only a blank disk is
+  read whole, once, at its first boot. It runs mkfs only when the volume's
   token does not yet say `fs: xfs` (a first boot that stopped between
   luksFormat and mkfs).
 - A locked or broken volume does not stop the hotel. Rooms without a
@@ -249,6 +252,11 @@ Rejected:
   hotel's key hides its workspaces (true on unsealed hotels too).
 - **Size.** Fixed when `data.raw` is made; no grow. No byte quota per
   workspace (as before).
+- **First boot time.** The first boot reads the whole blank disk before it
+  formats it, before the room API starts, so the time grows with
+  `SEALED_DATA_GIB`. `install.sh --sealed` waits 15 min for the first
+  attestation. The read rate inside an SNP guest is not measured yet: measure
+  it on the canary before a large disk.
 - **The `poolroom` uid.** It is stable across restarts of one build. Phase 2
   must pin it, because a new build could give it another uid.
 - **Miner hotel path.** Unit-tested only; the proof below is a config hotel.

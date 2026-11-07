@@ -17,21 +17,22 @@
 # writes.
 #
 # State in /run/sealed-data.status (JSON, read by room_health.py):
-#   new       the disk was blank (its first 16 MiB all zero): made a volume now
+#   new       the disk was blank (every byte zero): made a volume now
 #   open      the volume opened: workspaces persist across restarts of this build
 #   locked    a volume is there but no key slot opens with this build's key
 #             (another build, another machine, another HOST_DATA): left untouched
 #   tampered  the volume opened but its header is not our layout, or it holds a
 #             file system with no cathedral token: closed, left untouched
 #   broken    the disk holds data that is not a LUKS2 volume (not all zero, for example
-#             damaged LUKS2 signatures), a LUKS header cryptsetup cannot read, or a volume
-#             whose file system did not mount: left untouched
+#             damaged LUKS2 signatures or a zeroed header over a payload), a disk that
+#             could not be read to its end, a LUKS header cryptsetup cannot read, or a
+#             volume whose file system did not mount: left untouched
 #   absent    no data disk
 #   nokey     the secure processor gave no key (not an SNP guest?)
 #   error     a step failed, or cryptsetup is too old (serial log); exits non-zero
 # In every state but new and open the volume is not mounted and room-data.sh
 # keeps workspaces on the scratch disk, which is gone at the next boot.
-# A disk is formatted only when its first 16 MiB read as zero (a fresh sparse data.raw).
+# A disk is formatted only when every byte reads as zero (a fresh sparse data.raw).
 set -euo pipefail
 log() { echo "[sealed-data] $*"; }
 
@@ -151,19 +152,30 @@ luks_magic() { # a LUKS header (primary at 0, LUKS2 secondary at 16 KiB), even o
     || [ "$(dd if="$DEV" bs=16384 skip=1 count=1 2>/dev/null | head -c 6 | od -An -tx1 | tr -d ' \n')" = 534b554cbabe ]
 }
 
-virgin_disk() { # positive evidence of a blank disk: the first 16 MiB (both LUKS2 header areas and the key slots) read as zero
-  # Bounded read: never the whole disk. A fresh sparse data.raw from truncate reads as zeros. A disk whose two
-  # LUKS2 signatures were damaged still has its JSON areas and key slots, so it is not virgin.
-  python3 -c 'import sys
-left = 16 << 20
-with open(sys.argv[1], "rb") as f:
-    while left > 0:
-        b = f.read(min(1 << 20, left))
+virgin_disk() { # positive evidence of a blank disk: every byte of the device reads as zero
+  # A disk whose first 16 MiB were zeroed can still hold an encrypted payload that a header backup would restore,
+  # so a zero header is not proof the disk is new: the whole device is read. A disk with data stops at its first
+  # nonzero byte. Only a blank disk is read to its end, once, at its first boot (the time grows with SEALED_DATA_GIB).
+  # Exit 0: all zero. 1: a nonzero byte. 2: the device could not be read to its end (short read, I/O error).
+  python3 -c 'import os, sys
+CHUNK = 8 << 20
+ZERO = bytes(CHUNK)
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY)
+    size = os.lseek(fd, 0, os.SEEK_END)
+    os.lseek(fd, 0, os.SEEK_SET)
+    if size <= 0:
+        sys.exit(2)
+    done = 0
+    while done < size:
+        b = os.read(fd, min(CHUNK, size - done))
         if not b:
-            break
-        if b.count(0) != len(b):
+            sys.exit(2)  # the device ended before its size: not proven blank
+        if b != ZERO[:len(b)]:
             sys.exit(1)
-        left -= len(b)' "$DEV"
+        done += len(b)
+except OSError:
+    sys.exit(2)' "$DEV"
 }
 
 STATE=open
@@ -183,11 +195,18 @@ if [ ! -e "$MAP" ]; then
     # Format only on positive evidence of a blank disk. Not LUKS and not all zero (for example a
     # header whose two signatures were damaged but whose key slots a backup could still use): never
     # format it.
-    if ! virgin_disk; then
+    log "no LUKS2 volume on the data disk: reading all of it to prove it is blank before the first format"
+    started=$SECONDS
+    vrc=0
+    virgin_disk || vrc=$?
+    if [ "$vrc" = 2 ]; then
+      status broken "the data disk could not be read to its end, so it is not proven blank; left untouched"
+      exit 0
+    elif [ "$vrc" != 0 ]; then
       status broken "the data disk holds data that is not a LUKS2 volume; left untouched"
       exit 0
     fi
-    log "no volume on the data disk: making one (key_id $KEY_ID)"
+    log "the data disk is blank (read in $((SECONDS - started)) s): making a volume (key_id $KEY_ID)"
     cryptsetup luksFormat --type luks2 --batch-mode --cipher "$ENC" --key-size 512 --sector-size "$SECTOR" \
       --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --hash sha256 --label cathedral-sealed-data \
       --key-file "$KEYFILE" --keyfile-size 32 "$DEV"
