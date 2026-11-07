@@ -47,6 +47,10 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      carries an owner signature that verifies with the key. Pair it with
      --expected-measurement: the measurement is what proves the guest runs
      the build whose front refuses creates the owner did not sign.
+  9. sandbox link (AB#389): a create receipt that carries cathedral_sandbox_id
+     must carry a lower-case UUID. The output maps each room to the Cathedral
+     sandbox id its successful create receipt signed. --cathedral-sandbox <id>
+     fails unless a successful create receipt names that id.
 
 Not checked here (by design, today): that the measurement is an approved image.
 Image approval is a signed policy release; that is a later step.
@@ -87,6 +91,7 @@ INSTALL_PURPOSE = "hotel-key-install"
 HEX64 = re.compile(r"[0-9a-f]{64}")
 ORIGIN_MAX_BYTES = 64 * 1024
 DEDICATED_HOST_DATA_DOMAIN = b"cathedral-dedicated-v1\0"
+SANDBOX_LINK_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")  # room_receipts.py
 
 
 def canonical(doc) -> bytes:
@@ -452,6 +457,23 @@ def room_tunables(receipts: list[dict]) -> dict:
     return out
 
 
+def room_links(receipts: list[dict]) -> dict:
+    """Room id -> the Cathedral sandbox id its signed successful create receipt names (AB#389).
+
+    Receipts from guests before AB#389 carry no cathedral_sandbox_id: their rooms are not listed."""
+    out: dict[str, str] = {}
+    for rc in receipts:
+        st = rc["statement"]
+        if st.get("action") != "create" or "cathedral_sandbox_id" not in st:
+            continue
+        linked = st["cathedral_sandbox_id"]
+        need(isinstance(linked, str) and SANDBOX_LINK_RE.fullmatch(linked) is not None,
+             f"receipt {st['sequence']}: cathedral_sandbox_id is not a lower-case UUID")
+        if st.get("sandbox_id") and 200 <= int(st.get("status") or 0) < 300:
+            out[st["sandbox_id"]] = linked
+    return out
+
+
 def policy_timeline(receipts: list[dict]) -> dict:
     """Room id -> the signed policy events of that room, in chain order.
 
@@ -529,6 +551,8 @@ def main() -> int:
     ap.add_argument("--require-tls", action="store_true", help="fail unless the binding names a guest TLS key")
     ap.add_argument("--origin", help="a miner hotel's https://<ip>:<port>: fetch the attestation from the guest "
                                      "and check the TLS peer and the install key")
+    ap.add_argument("--cathedral-sandbox", help="a Cathedral sandbox id (UUID): fail unless a successful create "
+                                                "receipt names it")
     a = ap.parse_args()
     if a.broker and not a.hotel:
         ap.error("--hotel is required with --broker (no default: a wrong hotel is a wrong chain)")
@@ -587,11 +611,16 @@ def main() -> int:
                 attestation_out["owner"]["signed_creates"] = owner_signed_creates(receipts, owner)
         out = {"attestation": attestation_out,
                "chain": verify_receipts(att, receipts, head),
-               "policy_timeline": policy_timeline(receipts), "room_tunables": room_tunables(receipts), "verdict": "PASS",
+               "policy_timeline": policy_timeline(receipts), "room_tunables": room_tunables(receipts),
+               "room_links": room_links(receipts), "verdict": "PASS",
                # head is named by the server, not signed: even a whole chain does
                # not prove that nothing was cut from its end.
                "checked": ("whole chain to the head the server named" if head is not None
                            else "each receipt; not that none are missing")}
+        if a.cathedral_sandbox:
+            rooms = sorted(room for room, linked in out["room_links"].items() if linked == a.cathedral_sandbox)
+            need(rooms, f"no successful create receipt names Cathedral sandbox {a.cathedral_sandbox}")
+            out["sandbox_link"] = {"cathedral_sandbox_id": a.cathedral_sandbox, "rooms": rooms}
         print(json.dumps(out, indent=1))
         return 0
     except Fail as exc:

@@ -228,6 +228,12 @@ The broker admits the machine only if its HOST_DATA is in `sealed_host_data`
   canonical policy the hotel applied: mode and sorted allowlist) and
   `network_policy_sha256`. The egress rules run inside the guest, so the host
   cannot change them.
+- A create receipt also carries `cathedral_sandbox_id` when the create's
+  labels name one as a lower-case UUID (AB#389). The Cathedral API sets that
+  label to the sandbox id its customer holds, and refuses it from customers,
+  so the customer can check that the room was created for their sandbox
+  without taking the API's word. Any other value is not signed. Receipts
+  without the field (older guests, other callers) stay valid.
 
 Routes (through the broker):
 
@@ -253,7 +259,9 @@ python3 verify_receipts.py --attestation attestation.json --receipts chain.json 
 Through the broker: `--broker https://<broker> --key-file KEY --hotel <id>`
 (`--hotel` has no default). Add `--require-sealed` so a level 1 (unsealed)
 binding fails even without `--expected-measurement`. `--sandbox <id>` lists
-one room's receipts while the room exists.
+one room's receipts while the room exists. `--cathedral-sandbox <id>` fails
+unless a successful create receipt names that Cathedral sandbox id; the
+output's `room_links` maps each room to the id its create receipt signed.
 
 It checks the binding digest, REPORT_DATA, that the guest is not a debug
 build (`cathedral.debug=1` on the measured command line fails), the AMD chain
