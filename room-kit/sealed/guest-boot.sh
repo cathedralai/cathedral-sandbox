@@ -27,7 +27,9 @@ if [ ! -e /dev/mapper/sealed-scratch ]; then
 fi
 log "scratch encrypted: $(blockdev --getsize64 /dev/mapper/sealed-scratch) bytes"
 if grep -q '^ROOM_WORKSPACES_SOURCE=/' /opt/room-kit/room.env; then
-  /usr/local/sbin/sealed-data.sh
+  # A data volume that fails must not keep the hotel down: workspaces then
+  # stay on the scratch disk for this boot, and health says why.
+  /usr/local/sbin/sealed-data.sh || log "sealed-data.sh failed (exit $?): workspaces stay on the scratch disk this boot"
 fi
 
 KEY=/sys/firmware/qemu_fw_cfg/by_name/opt/cathedral/room-api-key/raw
