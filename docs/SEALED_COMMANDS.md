@@ -19,7 +19,7 @@ Request (`POST /v1/sandboxes/<room>/sealed-exec` at the front; the customer send
 | `sandbox_id` | the guest's room id (its create receipt's `sandbox_id`) |
 | `room_create_receipt_sha256` | the room incarnation, as for sealed secrets |
 | `issued_at` | unix seconds; the guest takes 120 s back to 30 s ahead |
-| `timeout_seconds` | 1 to 14,400; the one the room enforces |
+| `timeout_seconds` | 1 to 1,800; the one the room enforces. The answer exists only in the front's reply, so the front must outwait it (it waits 120 s more); longer is `400 sealed_exec_timeout_too_long` |
 | `response_public_b64` | X25519 key the client made for this exec; the answer is sealed to it |
 | `ephemeral_public_b64`, `nonce_b64`, `ciphertext_b64` | the envelope |
 

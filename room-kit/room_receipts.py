@@ -231,7 +231,11 @@ EXEC_STRING_FIELDS = ("response_public_b64",) + SECRETS_ENVELOPE  # hashed or de
 EXEC_REQUEST_KEYS = frozenset({"cmd", "env", "stdin", "cwd", "user"})
 EXEC_PLAINTEXT_MAX_BYTES = 6 * 1024 * 1024  # 1 MiB of stdin and the env, with JSON escapes
 EXEC_MAX_BYTES = 9 * 1024 * 1024  # one request: base64 of the largest envelope plus the header
-EXEC_TIMEOUT_MAX = 14400  # the room API's own limit (cathedral.sandbox_api EXEC_MAX_TIMEOUT_SECONDS)
+# A sealed exec's answer exists only in the front's one reply (it is kept out of the room API's
+# log), so the front must be able to wait for it: at most 1,800 s, and the front waits that plus
+# EXEC_ANSWER_MARGIN_SECONDS (the room API adds 15 s for docker exec past the command's limit).
+EXEC_TIMEOUT_MAX = 1800
+EXEC_ANSWER_MARGIN_SECONDS = 120
 # Replay: each accepted envelope's ephemeral key is kept until its issued_at leaves the window,
 # and an envelope outside the window is refused, so a kept key is never needed after that.
 EXEC_MAX_AGE_SECONDS = 120
@@ -1549,8 +1553,10 @@ class Ledger:
         incarnation, timeout, issued = doc["room_create_receipt_sha256"], doc["timeout_seconds"], doc["issued_at"]
         if not isinstance(incarnation, str) or not KEY_SHA256_RE.fullmatch(incarnation):
             raise ExecRefused(400, "sealed_exec_incarnation_invalid")
-        if type(timeout) is not int or not 1 <= timeout <= EXEC_TIMEOUT_MAX:
+        if type(timeout) is not int or timeout < 1:
             raise ExecRefused(400, "sealed_exec_timeout_invalid")
+        if timeout > EXEC_TIMEOUT_MAX:
+            raise ExecRefused(400, "sealed_exec_timeout_too_long")
         if type(issued) is not int or not 0 <= issued <= SECRET_VERSION_MAX:
             raise ExecRefused(400, "sealed_exec_issued_at_invalid")
         now = time.time() if now is None else now
@@ -1760,7 +1766,7 @@ class Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(raw[7:].strip().encode(), self.server.api_key)
 
     def upstream(self, port: int, body: bytes | None, *, method: str | None = None, path: str | None = None,
-                 extra: dict | None = None):
+                 extra: dict | None = None, timeout: float = 1800):
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
         if extra:
             headers = {k: v for k, v in headers.items() if k.lower() not in {e.lower() for e in extra}}
@@ -1775,7 +1781,7 @@ class Handler(BaseHTTPRequestHandler):
             # A write may have run before its answer was lost, so it is never
             # sent twice: a fresh connection (no stale keep-alive) and no
             # retry. A lost answer is a 502, and the receipt records it.
-            c = http.client.HTTPConnection("127.0.0.1", port, timeout=1800)
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
             try:
                 c.request(method, path, body=body, headers=headers)
                 r = c.getresponse()
@@ -2072,7 +2078,8 @@ class Handler(BaseHTTPRequestHandler):
         request = None
         status, _headers, out = self.upstream(
             self.server.api_port, inner, method="POST", path=f"/v1/sandboxes/{room}/{EXEC_API_TAIL}",
-            extra={"Content-Type": "application/json"})
+            extra={"Content-Type": "application/json"},
+            timeout=header["timeout_seconds"] + EXEC_ANSWER_MARGIN_SECONDS)
         inner = None
         try:
             answer = json.loads(out) if out else None

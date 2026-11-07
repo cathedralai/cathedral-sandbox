@@ -543,7 +543,7 @@ def _made_again(ledger, doc: dict) -> dict:
 
 
 TAMPER = {
-    "timeout_seconds": lambda ledger, doc: {**doc, "timeout_seconds": 14400},  # would run longer
+    "timeout_seconds": lambda ledger, doc: {**doc, "timeout_seconds": rr.EXEC_TIMEOUT_MAX},  # would run longer
     "issued_at": lambda ledger, doc: {**doc, "issued_at": doc["issued_at"] - 1},  # would refresh a replay
     "response_public_b64": lambda ledger, doc: {**doc, "response_public_b64": _relay_key()},  # would read the answer
     "sandbox_id": _other_room,
@@ -776,3 +776,30 @@ def test_a_deeply_nested_opened_request_is_400_and_burns_nothing(guest) -> None:
     status, _, body = _post(port, _seal_plaintext(client, plaintext))
     assert (status, _code(body)) == (400, "sealed_exec_request_invalid")
     assert api.execs() == [] and ledger.sealed_exec.tracked == 0
+
+
+@pytest.mark.parametrize("timeout", [1801, 14400])
+def test_a_timeout_the_front_cannot_wait_for_is_refused_before_it_runs(guest, timeout) -> None:
+    # Review finding 4: the front's wait on the room API is 1,800 s. A longer sealed exec got a
+    # sealed 502 while it ran on, and its output was gone: sealed execs are kept out of the log.
+    _, api, port, client = guest
+    status, _, body = _post(port, client.seal(timeout_seconds=timeout)[0])
+    assert (status, _code(body)) == (400, "sealed_exec_timeout_too_long")
+    assert api.execs() == []
+
+
+def test_the_front_waits_past_the_commands_own_limit(guest, monkeypatch) -> None:
+    _, api, port, client = guest
+    waits = []
+    real = rr.http.client.HTTPConnection
+
+    class Recording(real):
+        def __init__(self, host, port=None, timeout=None, **kw):
+            if port == api.port:
+                waits.append(timeout)
+            super().__init__(host, port, timeout=timeout, **kw)
+
+    monkeypatch.setattr(rr.http.client, "HTTPConnection", Recording)
+    assert _post(port, client.seal(timeout_seconds=rr.EXEC_TIMEOUT_MAX)[0])[0] == 200
+    # The room API's own exec limit is the timeout plus 15 s for docker exec; the front waits longer.
+    assert waits == [rr.EXEC_TIMEOUT_MAX + rr.EXEC_ANSWER_MARGIN_SECONDS] and rr.EXEC_ANSWER_MARGIN_SECONDS > 15
