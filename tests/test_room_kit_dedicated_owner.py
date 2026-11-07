@@ -212,8 +212,11 @@ def front(tmp_path, monkeypatch):
 def _broker_form(guest_body: dict, guest: str = GUEST) -> bytes:
     """What broker/main.go sends the hotel for one guest create (Go re-encoding)."""
     doc = json.loads(json.dumps(guest_body))
-    if doc.get("network") in (None, ""):
+    net = doc.get("network")
+    if net in (None, ""):
         doc["network"] = {"mode": "deny_all", "allow": []}
+    elif isinstance(net, dict) and net.get("mode") in (None, ""):  # AB#574
+        doc["network"] = {**net, "mode": "deny_all", "allow": [] if net.get("allow") is None else net["allow"]}
     for k in ("hotels", "hotel_labels", "exclude_hotel_labels", "sealed", "placement", "count"):
         doc.pop(k, None)
     labels = doc.get("labels") if isinstance(doc.get("labels"), dict) else {}
@@ -272,6 +275,33 @@ def test_count_batch_rooms_share_one_signature(front) -> None:
         status, doc, _ = _post(port, "/v1/sandboxes", _broker_form(body_in), headers)
         assert status == 202, doc
     assert len(seen) == 3
+
+
+@pytest.mark.parametrize("network, want", [
+    (None, {"mode": "deny_all", "allow": []}),
+    ("", {"mode": "deny_all", "allow": []}),
+    ({}, {"mode": "deny_all", "allow": []}),
+    ({"mode": None}, {"mode": "deny_all", "allow": []}),
+    ({"mode": ""}, {"mode": "deny_all", "allow": []}),
+    ({"allow": None}, {"mode": "deny_all", "allow": []}),
+    ({"mode": "internet"}, {"mode": "internet"}),
+    ("internet", "internet"),
+])
+def test_the_signed_form_of_a_network_without_a_mode_is_deny_all(network, want) -> None:
+    # AB#574: the broker sends a network that names no mode as deny_all, so the
+    # signed body must say the same or the hotel refuses the signature.
+    assert osign.hotel_form({**GUEST_CREATE, "network": network}, GUEST)["network"] == want
+
+
+def test_a_signed_create_with_an_empty_network_object_runs_as_deny_all(front) -> None:
+    port, seen, _ledger, m = front
+    body_in = {**GUEST_CREATE, "network": {}}
+    headers = osign.sign_create(m.key, json.dumps(body_in).encode(), GUEST)
+    body = _broker_form(body_in)
+    assert json.loads(body)["network"] == {"mode": "deny_all", "allow": []}
+    status, doc, _ = _post(port, "/v1/sandboxes", body, headers)
+    assert status == 202, doc
+    assert seen == [("POST", "/v1/sandboxes", body)]
 
 
 def _refused(port, seen, path, body, headers, code) -> dict:

@@ -1042,6 +1042,51 @@ const hotelFailBackoff = 10 * time.Second
 // not a constant, so a test can shorten it.
 var hotelCreateTimeout = 12 * time.Minute
 
+// nativeNetworkModes are the modes a native create may name. The hotel knows
+// "public" (the old name of internet) and "none" as well (sandbox_api.py
+// NETWORK_MODES), so those still pass through as before.
+var nativeNetworkModes = map[string]bool{"internet": true, "deny_all": true, "allowlist": true, "public": true, "none": true}
+
+// nativeNetwork is the network a native create sends the hotel. Same rule as
+// the compat path (compatNetwork): a create that names no mode fails closed to
+// deny_all. That covers no network, null, "", {} and an object whose mode is
+// missing, null or "". Without this the hotel's own default (internet)
+// applies, because sandbox_server.py reads a missing mode as "public" (AB#574).
+// A mode the hotel does not know is refused before any hotel is asked. An
+// object keeps its other fields; the hotel checks them.
+func nativeNetwork(v any) (any, *apiErr) {
+	switch n := v.(type) {
+	case nil:
+		return map[string]any{"mode": "deny_all", "allow": []any{}}, nil
+	case string:
+		if n == "" {
+			return map[string]any{"mode": "deny_all", "allow": []any{}}, nil
+		}
+		if !nativeNetworkModes[n] {
+			return nil, &apiErr{400, "invalid_network_mode", fmt.Sprintf("network must be internet, deny_all or allowlist, not %q", n)}
+		}
+		return n, nil
+	case map[string]any:
+		mode, ok := n["mode"]
+		if !ok || mode == nil || mode == "" {
+			out := make(map[string]any, len(n)+2)
+			for k, x := range n {
+				out[k] = x
+			}
+			out["mode"] = "deny_all"
+			if out["allow"] == nil {
+				out["allow"] = []any{}
+			}
+			return out, nil
+		}
+		if s, ok := mode.(string); !ok || !nativeNetworkModes[s] {
+			return nil, &apiErr{400, "invalid_network_mode", fmt.Sprintf("network mode must be internet, deny_all or allowlist, not %v", mode)}
+		}
+		return n, nil
+	}
+	return nil, &apiErr{400, "invalid_network_mode", "network must be an object {\"mode\", \"allow\"} or a mode name"}
+}
+
 func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestState) {
 	tRecv := time.Now()
 	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
@@ -1058,11 +1103,12 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, e.status, e.code, e.msg)
 		return
 	}
-	// Same rule as the compat path: a create that names no network fails
-	// closed. Without this the hotel's own default (internet) applies.
-	if v, ok := payload["network"]; !ok || v == nil || v == "" {
-		payload["network"] = map[string]any{"mode": "deny_all", "allow": []any{}}
+	net, nerr := nativeNetwork(payload["network"])
+	if nerr != nil {
+		writeErr(w, nerr.status, nerr.code, nerr.msg)
+		return
 	}
+	payload["network"] = net
 	count := 1
 	if c, ok := payload["count"].(float64); ok {
 		count = int(c)

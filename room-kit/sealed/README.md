@@ -149,7 +149,7 @@ minus the `broker_batch` label. The broker changes a create on the way:
 | Broker change | In the signed document |
 |---|---|
 | Removes `hotels`, `hotel_labels`, `exclude_hotel_labels`, `sealed`, `placement`, `count` | No (removed first) |
-| Sets `network` to `deny_all` when it is missing | Yes, as `deny_all` |
+| Sets `network` to `deny_all` when it is missing or names no mode (`{}`, `"mode": null`) | Yes, as `deny_all` |
 | Adds label `broker_guest: <guest id>` | Yes: the room cannot be moved to another guest's workspaces or secrets |
 | Adds label `broker_batch: <random id>` | No (the hotel leaves it out) |
 | Rewrites a `<hotel>.<name>` workspace to `<name>` | Yes, as `<name>` |
