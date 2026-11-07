@@ -17,7 +17,7 @@ sudo ./install.sh --sealed sealed.env
 
 1. **Assess.** It checks that SEV-SNP is on (`kvm_amd sev_snp=Y`, `/dev/sev`),
    that the hotel key file exists, and that the host keeps
-   `SEALED_MIN_HOST_FREE_GIB` free after the scratch disk is full.
+   `SEALED_MIN_HOST_FREE_GIB` free after the scratch and data disks are full.
 2. **Host packages.** QEMU with `sev-snp-guest`, OVMF (AmdSev build),
    mmdebstrap, zstd, cpio, python3-venv.
 3. **Build** (`build-guest.sh`). It makes three files:
@@ -31,7 +31,7 @@ sudo ./install.sh --sealed sealed.env
    - `host-net.sh up`: a tap device with a /30, NAT to the internet, own
      iptables chains only.
    - `launch-guest.sh`: QEMU with `kernel-hashes=on`, the scratch disk, the
-     tap link and the hotel key in fw_cfg.
+     data disk (`SEALED_DATA_GIB` > 0), the tap link and the hotel key in fw_cfg.
 5. **Check.** Before the restart it refuses to go on while the running guest
    has rooms (`SEALED_RESTART_WITH_ROOMS=1` overrides). It waits for
    `GET /room/attestation` from the guest and compares the measurement in
@@ -44,9 +44,35 @@ Inside the guest, `sealed-hotel.service` runs at every boot:
 
 1. It encrypts the scratch disk with dm-crypt (plain, AES-XTS-512) and a random
    key from the guest's `/dev/urandom`. The key exists only in guest memory.
-2. It reads the hotel key from fw_cfg.
-3. It runs `install.sh` with the guest `room.env` (`ROOM_RECEIPTS=1`). This
+   Docker, the room file systems and `/work` live there; all of it ends at
+   the next boot.
+2. With a data disk (`SEALED_DATA_GIB` > 0, which needs
+   `SEALED_ROOM_WORKSPACES=1`), `sealed-data.sh` opens the persistent data
+   volume: LUKS2 (AES-XTS-512) with a key the AMD secure processor derives
+   for this chip, this measurement and this policy, mixed with HOST_DATA
+   (`sealed_data_key.py`). Workspaces live there and outlive a restart of the
+   same build. A new build cannot open it (see "Data volume" below).
+3. It reads the hotel key from fw_cfg.
+4. It runs `install.sh` with the guest `room.env` (`ROOM_RECEIPTS=1`). This
    is the same installer as on an unsealed hotel.
+
+### Data volume
+
+Design, threat model, upgrade path and the proof on an SNP host:
+[docs/SEALED_DATA_VOLUME.md](../../docs/SEALED_DATA_VOLUME.md).
+
+- Boot states (health `workspaces_storage`, the serial log `[sealed-data]`):
+  `new`, `open`, `locked` (a volume this build cannot open; left untouched),
+  `broken`, `absent`, `nokey`. In every state but `new` and `open`, this boot
+  keeps workspaces on the scratch disk.
+- The guest never formats a disk that holds a LUKS volume. To start empty,
+  stop the guest and remove `$SEALED_DIR/data.raw`.
+- A new build: `install.sh --sealed` stops unless `SEALED_DATA_ON_NEW_BUILD`
+  is `reset` (the old volume becomes `data.raw.prev`, which only the old build
+  opens; a measurement mismatch puts it back) or `keep` (leave it; the new
+  build runs with workspaces on the scratch disk).
+- A miner hotel keeps its guest-internal API key on the volume, so workspace
+  owners (a hash of that key) are the same after a restart.
 
 ## What the measurement covers
 
@@ -69,7 +95,9 @@ Inside the guest, `sealed-hotel.service` runs at every boot:
 
 - It cannot read room memory or the receipt key. SEV-SNP encrypts guest memory.
 - It cannot read room data on disk. The scratch disk is encrypted with a key
-  from inside the guest.
+  from inside the guest, made at each boot. The data volume is encrypted with
+  a key that only this build on this chip can make; the host holds only
+  ciphertext and the LUKS2 header.
 - It cannot log in. A production build has no SSH, no console login and no
   getty. `cathedral.debug=1` (a debug build) adds root SSH from the host on
   the tap link, and the measurement shows it.
@@ -89,7 +117,8 @@ keeps the key and the traffic from the host; see "Miner hotel"):
   start a room or an image build that the owner did not sign (see below).
 
 The host still controls availability: it can stop the guest, drop the
-network, or refuse the scratch disk.
+network, or refuse the scratch disk. It can also delete, corrupt or roll back
+the data disk: XTS has no integrity and the volume has no freshness check.
 
 ## Dedicated machine (one owner)
 
@@ -443,7 +472,7 @@ sudo systemctl disable --now room-sealed-<name>-net.timer # or it puts the host 
 sudo systemctl disable --now room-sealed-<name>.service   # stops the guest, removes the host link rules
 sudo rm -f /etc/systemd/system/room-sealed-<name>.service /etc/systemd/system/room-sealed-<name>-net.{service,timer}
 sudo systemctl daemon-reload
-sudo rm -rf $SEALED_DIR                                    # images, scratch disk, venv
+sudo rm -rf $SEALED_DIR                                    # images, scratch and data disks, venv
 ```
 
 Remove the hotel from the broker config. The apt packages stay.

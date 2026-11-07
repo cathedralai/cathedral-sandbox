@@ -1,7 +1,7 @@
 #!/bin/bash
 # Room kit, sealed mode: make this host run ONE sealed hotel (an AMD SEV-SNP
 # guest with the room kit inside). Called as: install.sh --sealed sealed.env
-#   1. assess: SEV-SNP on, free SNP ASIDs, free disk after the scratch disk
+#   1. assess: SEV-SNP on, free SNP ASIDs, free disk after the scratch and data disks
 #   2. host packages: QEMU (SNP), OVMF AmdSev, mmdebstrap, zstd, cpio
 #   3. build the measured guest (build-guest.sh) and compute the expected
 #      launch measurement (sev-snp-measure, pinned, in a venv)
@@ -35,9 +35,11 @@ fi
 mkdir -p "$SEALED_DIR/images" "$SEALED_DIR/run"
 FREE_GIB=$(( $(df -B1 --output=avail "$SEALED_DIR" | tail -1) / 1073741824 ))
 HAVE_GIB=0; [ -f "$SEALED_DIR/scratch.raw" ] && HAVE_GIB=$(( $(du -B1 "$SEALED_DIR/scratch.raw" | cut -f1) / 1073741824 ))
-LEFT=$(( FREE_GIB - (SEALED_SCRATCH_GIB - HAVE_GIB) ))
-log "free ${FREE_GIB} GiB; after a full ${SEALED_SCRATCH_GIB} GiB scratch: ${LEFT} GiB (minimum ${SEALED_MIN_HOST_FREE_GIB})"
-[ "$LEFT" -ge "$SEALED_MIN_HOST_FREE_GIB" ] || { echo "not enough disk: lower SEALED_SCRATCH_GIB" >&2; exit 1; }
+DATA_GIB=${SEALED_DATA_GIB:-0}
+HAVE_DATA_GIB=0; [ -f "$SEALED_DIR/data.raw" ] && HAVE_DATA_GIB=$(( $(du -B1 "$SEALED_DIR/data.raw" | cut -f1) / 1073741824 ))
+LEFT=$(( FREE_GIB - (SEALED_SCRATCH_GIB - HAVE_GIB) - (DATA_GIB - HAVE_DATA_GIB) ))
+log "free ${FREE_GIB} GiB; after a full ${SEALED_SCRATCH_GIB} GiB scratch and ${DATA_GIB} GiB data disk: ${LEFT} GiB (minimum ${SEALED_MIN_HOST_FREE_GIB})"
+[ "$LEFT" -ge "$SEALED_MIN_HOST_FREE_GIB" ] || { echo "not enough disk: lower SEALED_SCRATCH_GIB or SEALED_DATA_GIB" >&2; exit 1; }
 MEM_FREE_GIB=$(( $(awk '/MemAvailable/ {print $2}' /proc/meminfo) / 1048576 ))
 systemctl is-active -q "$UNIT" || [ "$MEM_FREE_GIB" -gt $(( SEALED_MEM_GIB + 32 )) ] || { echo "only ${MEM_FREE_GIB} GiB RAM available" >&2; exit 1; }
 
@@ -141,7 +143,33 @@ refuse_sealed_restart_with_rooms() {
     exit 1
   fi
 }
+# The data volume's key needs the build's measurement, so a new build cannot
+# open the volume the booted build made. Never let a roll drop or strand
+# workspaces without the operator saying which (docs/SEALED_DATA_VOLUME.md).
+DATA_RESET=0
+data_volume_new_build() {
+  { [ "${SEALED_DATA_GIB:-0}" != 0 ] && [ -f "$SEALED_DIR/data.raw" ]; } || return 0
+  local booted
+  booted=$(cat "$SEALED_DIR/run/booted-image/expected-measurement" 2>/dev/null || true)
+  [ "$booted" = "$EXPECTED" ] && return 0
+  case "${SEALED_DATA_ON_NEW_BUILD:-}" in
+    reset)
+      mv -f "$SEALED_DIR/data.raw" "$SEALED_DIR/data.raw.prev"
+      DATA_RESET=1
+      log "data volume: new build; the booted build's volume is now data.raw.prev (only that build opens it); the new build starts an empty one"
+      ;;
+    keep)
+      log "data volume: new build; data.raw kept, the new build cannot open it, so workspaces stay on the scratch disk (state locked in health) until a reset or a rekey"
+      ;;
+    *)
+      echo "sealed: the new build (measurement $EXPECTED) cannot open the data volume of the booted build (${booted:-unknown}): its workspaces would not come back." >&2
+      echo "sealed: set SEALED_DATA_ON_NEW_BUILD=reset (keep it as data.raw.prev, start empty) or keep (leave it, workspaces on scratch until a reset or a rekey)." >&2
+      exit 1
+      ;;
+  esac
+}
 refuse_sealed_restart_with_rooms
+data_volume_new_build
 systemctl restart "$UNIT"
 log "guest starting; serial log $SEALED_DIR/run/serial.log"
 ATT=$SEALED_DIR/run/attestation.json
@@ -167,6 +195,8 @@ else
   log "MEASUREMENT DIFFERS: report $GOT, build $EXPECTED"
   systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
   [ -n "$PREV_IMG" ] && [ "$PREV_IMG" != "$IMG" ] && ln -sfn "$PREV_IMG" "$SEALED_DIR/images/current"
+  # The previous image opens only its own volume: put it back.
+  [ "$DATA_RESET" = 1 ] && mv -f "$SEALED_DIR/data.raw.prev" "$SEALED_DIR/data.raw"
   exit 1
 fi
 if [ "${SEALED_MINER:-0}" = 1 ]; then

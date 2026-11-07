@@ -265,10 +265,16 @@ read-write when its create has `"workspace": "<name>"` (or
 - Limits: `CATHEDRAL_WORKSPACE_MAX_PER_OWNER` (default 10) and
   `CATHEDRAL_WORKSPACE_MAX_VERSIONS` (default 20). There is no byte quota yet.
 - Sealed hotels: off by default. `SEALED_ROOM_WORKSPACES=1` in `sealed.env`
-  turns them on. The guest data dir is on the dm-crypt scratch whose key is
-  made at boot in guest memory, so only the guest holds the key (#305 design)
-  and a workspace lives until the guest restarts. The switch is in the
-  measured room.env, so turning it on gives the hotel a new measurement.
+  turns them on. Without a data disk the workspaces are on the dm-crypt
+  scratch whose key is made at boot in guest memory, so a workspace lives
+  until the guest restarts. With `SEALED_DATA_GIB` > 0 they are on the
+  sealed data volume (LUKS2, a key only that build on that chip can make):
+  a workspace outlives a restart of the same build, not yet a new build
+  (`sealed/README.md` "Data volume"). Both switches are in the measured
+  room.env, so turning one on gives the hotel a new measurement.
+- `ROOM_WORKSPACES_SOURCE`: a directory on a volume of its own that
+  `room-data.sh` binds at `$ROOM_DATA_DIR/workspaces` instead. When it is
+  missing or on the root file system, workspaces stay on the data volume.
 ## Egress credentials
 
 A room can use a secret without holding its value (#304). The egress
