@@ -22,7 +22,11 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # workspaces #306 and egress credentials #307) on c48, Contabo and c46.
 # Rolled 2026-10-27 to 20d81fb (#339 per-room Escape start-up tunables) for the sealed
 # hotels nc-sealed-2 and c46-sealed.
-CATHEDRAL_COMMIT=20d81fb
-CATHEDRAL_TARBALL=dist/cathedral-20d81fb.tar.gz
-CATHEDRAL_TARBALL_SHA256=deb0f1a4e3c51cda369c87ec2ee4b5d2015b4e0d8b0c8123c23fd9a3fc91eeef
+# Pinned 2026-11-08 to c0aa096 for the combined sealed guest: customer-sealed secrets
+# (#410, /run/secrets), customer-sealed commands (#412 via #416, exec-sealed) and the
+# signed sandbox-to-room link (#415, cathedral_sandbox_id in the create receipt). c0aa096
+# is the head of #416 and holds main 8eb5dce plus #412.
+CATHEDRAL_COMMIT=c0aa096
+CATHEDRAL_TARBALL=dist/cathedral-c0aa096.tar.gz
+CATHEDRAL_TARBALL_SHA256=163887c132059fdf962e2be730609175c735734a1d9401c7cf1af8c3be9bb40d
 PROBE_IMAGE=alpine:3.20
