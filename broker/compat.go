@@ -263,6 +263,10 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 		compatErr(w, 400, "invalid_image", "image is required", 0)
 		return
 	}
+	if e := localImageRefusal(req.Image); e != nil {
+		compatErr(w, e.status, e.code, e.msg, 0)
+		return
+	}
 	num := func(k string, d float64) float64 {
 		if v, ok := req.Resources[k].(float64); ok && v > 0 {
 			return v
@@ -336,6 +340,12 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	if json.Unmarshal(raw, &req) != nil {
 		compatErr(w, 400, "invalid_json", "request body is not JSON", 0)
 		return
+	}
+	if ref, _ := req["image"].(string); ref != "" {
+		if e := localImageRefusal(ref); e != nil {
+			compatErr(w, e.status, e.code, e.msg, 0)
+			return
+		}
 	}
 	if e := applyCatalogTemplate(req); e != nil {
 		compatErr(w, e.status, e.code, e.msg, 0)
