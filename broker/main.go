@@ -1128,6 +1128,12 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
 	}
+	if ref, _ := payload["image"].(string); ref != "" {
+		if e := localImageRefusal(ref); e != nil {
+			writeErr(w, e.status, e.code, e.msg)
+			return
+		}
+	}
 	if e := applyCatalogTemplate(payload); e != nil {
 		writeErr(w, e.status, e.code, e.msg)
 		return
