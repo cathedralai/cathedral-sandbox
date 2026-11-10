@@ -508,6 +508,7 @@ class SandboxApplication:
             timeout_seconds=payload.get("timeout_seconds"),
             stdin=payload.get("stdin"),
             sealed=sealed,
+            spill_token=payload.get("spill_token"),
         )
         result = self.provider.exec(id, req)
         return Response.json(200, result.to_document())
