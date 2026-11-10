@@ -29,8 +29,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
+from cathedral.exec_spill import StreamSpill, close_spill, open_spill, read_spill, spill_path_parts
 from cathedral.sandbox_api import (
     CreateSandboxRequest,
     ExecRecord,
@@ -380,8 +381,23 @@ def _guest_start_fault(stderr: str) -> str | None:
     return None
 
 
-def _run_bounded(argv, *, timeout, input_bytes, env, cap: int) -> subprocess.CompletedProcess[bytes]:
-    """subprocess.run with each output stream kept to cap + 1 bytes."""
+def _run_bounded(
+    argv,
+    *,
+    timeout,
+    input_bytes,
+    env,
+    cap: int,
+    on_stdout: Callable[[bytes], None] | None = None,
+    on_stderr: Callable[[bytes], None] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """subprocess.run with each output stream kept to cap + 1 bytes.
+
+    ``on_stdout`` and ``on_stderr`` see each retained chunk up to ``cap`` bytes,
+    not the extra overflow byte, while the process is still running.
+    ``read1`` returns a short pipe read. ``BufferedReader.read`` waits until the
+    buffer fills or the process exits, which would hide a line until the command ends.
+    """
     proc = subprocess.Popen(
         argv,
         stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
@@ -390,12 +406,18 @@ def _run_bounded(argv, *, timeout, input_bytes, env, cap: int) -> subprocess.Com
         env=env,
     )
     kept: dict[str, bytes] = {}
+    hooks = {"out": on_stdout, "err": on_stderr}
 
     def drain(name: str, stream) -> None:
         buf = bytearray()
-        for chunk in iter(lambda: stream.read(65536), b""):
+        hook = hooks[name]
+        for chunk in iter(lambda: stream.read1(65536), b""):
             if len(buf) <= cap:
+                before = len(buf)
                 buf.extend(chunk[: cap + 1 - len(buf)])
+                publish_end = min(len(buf), cap)
+                if hook is not None and publish_end > before:
+                    hook(bytes(buf[before:publish_end]))
         kept[name] = bytes(buf)
 
     readers = [threading.Thread(target=drain, args=(n, st), daemon=True) for n, st in (("out", proc.stdout), ("err", proc.stderr))]
@@ -468,6 +490,8 @@ class DockerClient:
         input_bytes: bytes | None = None,
         env: Mapping[str, str] | None = None,
         output_cap: int | None = None,
+        on_stdout: Callable[[bytes], None] | None = None,
+        on_stderr: Callable[[bytes], None] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run argv. Output is decoded with replacement: a room's bytes are
         not always UTF-8, and a decode error must not drop the request.
@@ -479,7 +503,10 @@ class DockerClient:
             if output_cap is None:
                 raw = subprocess.run(argv, capture_output=True, timeout=timeout, input=input_bytes, check=False, env=merged)
             else:
-                raw = _run_bounded(argv, timeout=timeout, input_bytes=input_bytes, env=merged, cap=output_cap)
+                raw = _run_bounded(
+                    argv, timeout=timeout, input_bytes=input_bytes, env=merged, cap=output_cap,
+                    on_stdout=on_stdout, on_stderr=on_stderr,
+                )
             return subprocess.CompletedProcess(
                 raw.args, raw.returncode, raw.stdout.decode("utf-8", "replace"), raw.stderr.decode("utf-8", "replace")
             )
@@ -857,6 +884,7 @@ class DockerClient:
         stdin: str | None,
         detach: bool = False,
         user: str | None = None,
+        spill: StreamSpill | None = None,
     ) -> tuple[int, str, str, bool]:
         cmd = ["docker", "exec"]
         if detach:
@@ -877,6 +905,8 @@ class DockerClient:
                 timeout=float(timeout_seconds),
                 input_bytes=(stdin.encode() if stdin is not None else None),
                 output_cap=EXEC_OUTPUT_CAP,
+                on_stdout=None if spill is None else lambda data: spill.add("stdout", data),
+                on_stderr=None if spill is None else lambda data: spill.add("stderr", data),
             )
         except SandboxOpError as exc:
             if exc.code == "docker_timeout":
@@ -1878,15 +1908,21 @@ class DockerGuestProvider:
         else:
             wrapped = argv
         t0 = time.perf_counter()
-        code, out, err, timed_out = self._client.exec(
-            guest.container_id,
-            wrapped,
-            cwd=cwd,
-            env={**dict(request.env)},
-            timeout_seconds=timeout_seconds + 15 if wrapped is not argv else timeout_seconds,
-            stdin=request.stdin,
-            user=request.user,
-        )
+        spill = open_spill(sandbox_id, request.spill_token, EXEC_OUTPUT_CAP) if request.spill_token else None
+        try:
+            code, out, err, timed_out = self._client.exec(
+                guest.container_id,
+                wrapped,
+                cwd=cwd,
+                env={**dict(request.env)},
+                timeout_seconds=timeout_seconds + 15 if wrapped is not argv else timeout_seconds,
+                stdin=request.stdin,
+                user=request.user,
+                spill=spill,
+            )
+        finally:
+            if request.spill_token:
+                close_spill(sandbox_id, request.spill_token)
         # The command's own time, before any look at the container below.
         elapsed = time.perf_counter() - t0
         # A room that outgrows its memory limit can still be killed whole by
@@ -2031,6 +2067,22 @@ class DockerGuestProvider:
         self._inner.write_file(sandbox_id, _in_work(path), data, mode)
 
     def read_file(self, sandbox_id: str, spec: FileGet) -> tuple[bytes, int]:
+        parts = spill_path_parts(spec.path)
+        if parts is not None:
+            data = read_spill(sandbox_id, parts[0], parts[1])
+            if data is None:
+                raise SandboxOpError("file_not_found", 404, f"no file {spec.path}")
+            total = len(data)
+            if spec.max_bytes is not None and total > spec.max_bytes:
+                raise SandboxOpError(
+                    "file_too_large", 413, f"{spec.path} is {total} bytes, over max_bytes {spec.max_bytes}",
+                )
+            if spec.range_start is not None:
+                if spec.range_start >= total:
+                    return b"", total
+                end = spec.range_end if spec.range_end is not None else total - 1
+                return data[spec.range_start:min(end, total - 1) + 1], total
+            return data, total
         _in_work(spec.path)
         return self._inner.read_file(sandbox_id, spec)
 

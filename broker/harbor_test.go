@@ -119,6 +119,54 @@ func TestExecTimeoutOfFourHoursPassesToTheHotel(t *testing.T) {
 	}
 }
 
+func TestSpillTokenReachesTheHotelOnNativeAndCompat(t *testing.T) {
+	tc := newChain(t)
+	token := "0123456789abcdef0123456789abcdef"
+	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+id+"/exec", map[string]any{
+		"cmd": []string{"true"}, "spill_token": token,
+	})
+	if status != 200 {
+		t.Fatalf("native exec: %d %v", status, doc)
+	}
+	if got := latestSpill(tc); got != token {
+		t.Fatalf("native hotel spill_token %q", got)
+	}
+
+	status, doc = tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4"}), nil)
+	if status != 201 && status != 202 {
+		t.Fatalf("compat create: %d %v", status, doc)
+	}
+	uuid, _ := doc["id"].(string)
+	status, doc = tc.clientCall(t, "POST", "/v1/sandboxes/"+uuid+"/exec", mustMarshal(map[string]any{
+		"cmd": []string{"true"}, "spill_token": "not-a-token",
+	}), nil)
+	if status != 400 {
+		t.Fatalf("bad spill token: %d %v", status, doc)
+	}
+	status, doc = tc.clientCall(t, "POST", "/v1/sandboxes/"+uuid+"/exec", mustMarshal(map[string]any{
+		"cmd": []string{"true"}, "spill_token": token,
+	}), nil)
+	if status != 200 {
+		t.Fatalf("compat exec: %d %v", status, doc)
+	}
+	if got := latestSpill(tc); got != token {
+		t.Fatalf("compat hotel spill_token %q", got)
+	}
+}
+
+func latestSpill(tc *testChain) string {
+	var token string
+	for _, f := range tc.hotels {
+		for _, ex := range f.execs {
+			if s, ok := ex["spill_token"].(string); ok {
+				token = s
+			}
+		}
+	}
+	return token
+}
+
 func buildForm(t *testing.T, dockerfile string, ctx []byte) ([]byte, string) {
 	t.Helper()
 	var buf bytes.Buffer
