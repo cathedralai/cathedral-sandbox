@@ -795,6 +795,19 @@ func (b *broker) flushCompat(w http.ResponseWriter, c *capture, rm *room) {
 }
 
 // compatExecBody translates a client exec body to a hotel exec body.
+func spillToken(v any) (string, bool) {
+	s, ok := v.(string)
+	if !ok || len(s) != 32 {
+		return "", false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", false
+		}
+	}
+	return s, true
+}
+
 func compatExecBody(raw []byte, maxExec int) (map[string]any, int, error) {
 	var req map[string]any
 	if json.Unmarshal(raw, &req) != nil {
@@ -824,6 +837,13 @@ func compatExecBody(raw []byte, maxExec int) (map[string]any, int, error) {
 		if v, ok := req[k]; ok && v != nil {
 			body[k] = v
 		}
+	}
+	if v, ok := req["spill_token"]; ok && v != nil {
+		token, good := spillToken(v)
+		if !good {
+			return nil, 0, fmt.Errorf("spill_token must be 32 lowercase hex characters")
+		}
+		body["spill_token"] = token
 	}
 	timeout := maxExec
 	if v, ok := req["timeout_seconds"].(float64); ok && v > 0 {
