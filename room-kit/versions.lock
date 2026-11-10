@@ -26,7 +26,10 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # (#410, /run/secrets), customer-sealed commands (#412 via #416, exec-sealed) and the
 # signed sandbox-to-room link (#415, cathedral_sandbox_id in the create receipt). c0aa096
 # is the head of #416 and holds main 8eb5dce plus #412.
-CATHEDRAL_COMMIT=c0aa096
-CATHEDRAL_TARBALL=dist/cathedral-c0aa096.tar.gz
-CATHEDRAL_TARBALL_SHA256=163887c132059fdf962e2be730609175c735734a1d9401c7cf1af8c3be9bb40d
+# Pinned 2026-11-10 to 4e7040f (main after #421: sealed exec follow publishes capped
+# output while the command runs, cathedral/exec_spill.py; AB#654). Same make-dist.sh; the
+# c0aa096 tarball rebuilds to its pinned sha with the same tool, so the method is unchanged.
+CATHEDRAL_COMMIT=4e7040f
+CATHEDRAL_TARBALL=dist/cathedral-4e7040f.tar.gz
+CATHEDRAL_TARBALL_SHA256=026d3790c7bdd9581870e463881b2bc0a094da236efc1f68b5daef884b642ade
 PROBE_IMAGE=alpine:3.20
