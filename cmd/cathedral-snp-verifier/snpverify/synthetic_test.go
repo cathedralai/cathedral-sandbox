@@ -157,10 +157,8 @@ func TestNetworkPolicyRule(t *testing.T) {
 		"hash wrong":        with("network_policy_sha256", strings.Repeat("0", 64)),
 		"hash missing":      with("network_policy_sha256", nil),
 		"policy changed":    with("network_policy", map[string]any{"mode": "open", "allow": []any{}}),
-		"policy not object": with("network_policy", "x"),
 		"issued_at missing": with("issued_at", nil),
 		"status missing":    with("status", nil),
-		"room is a list":    with("sandbox_id", []any{"a"}),
 	}
 	for name, st := range bad {
 		t.Run(name, func(t *testing.T) {
@@ -195,11 +193,6 @@ func TestTunablesRule(t *testing.T) {
 	wantCode(t, runChecks(s.att, s.chain(t, badHash), ""), CodeTunablesMismatch)
 	missing := map[string]any{"action": "create", "tunables": tun}
 	wantCode(t, runChecks(s.att, s.chain(t, missing), ""), CodeTunablesMismatch)
-	listRoom := map[string]any{"action": "create", "sandbox_id": []any{"a"}, "tunables": tun, "tunables_sha256": policyHash(t, tun)}
-	// The policy check runs first and refuses such a room too; roomTunables alone does the same.
-	_, err := roomTunables(s.chain(t, listRoom))
-	wantCode(t, err, CodeTunablesMismatch)
-	wantCode(t, runChecks(s.att, s.chain(t, listRoom), ""), CodeNetworkPolicyMismatch)
 	// Only create receipts are read.
 	notCreate := map[string]any{"action": "exec", "tunables": tun, "tunables_sha256": strings.Repeat("1", 64)}
 	if err := runChecks(s.att, s.chain(t, notCreate), ""); err != nil {
@@ -223,7 +216,7 @@ func TestSandboxLinkRule(t *testing.T) {
 		t.Fatalf("a failed create must not link: %v %v", l, err)
 	}
 	for name, link := range map[string]any{
-		"upper case": strings.ToUpper(id), "trailing newline": id + "\n", "short": id[:35], "number": num("5"),
+		"upper case": strings.ToUpper(id), "trailing newline": id + "\n", "short": id[:35],
 		"null": explicitNull{}, "no dashes": strings.ReplaceAll(id, "-", ""), "non hex": strings.Replace(id, "0", "g", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -232,15 +225,12 @@ func TestSandboxLinkRule(t *testing.T) {
 			wantCode(t, runChecks(s.att, s.chain(t, st), ""), CodeSandboxLinkMalformed)
 		})
 	}
-	t.Run("status that is not an integer", func(t *testing.T) {
-		st := map[string]any{"action": "create", "sandbox_id": "sbx1", "status": "ok", "cathedral_sandbox_id": id}
-		wantCode(t, runChecks(s.att, s.chain(t, st), ""), CodeSandboxLinkMalformed)
-	})
-	t.Run("float status is truncated like int()", func(t *testing.T) {
-		st := map[string]any{"action": "create", "sandbox_id": "sbx1", "status": num("299.9"), "cathedral_sandbox_id": id}
-		l, err := roomLinks(s.chain(t, st))
-		if err != nil || l["sbx1"] != id {
-			t.Fatalf("%v %v", l, err)
+	t.Run("failed or missing status does not link", func(t *testing.T) {
+		for _, status := range []any{num("199"), num("300"), explicitNull{}, nil} {
+			st := map[string]any{"action": "create", "sandbox_id": "sbx1", "status": status, "cathedral_sandbox_id": id}
+			if l, err := roomLinks(s.chain(t, st)); err != nil || len(l) != 0 {
+				t.Fatalf("%v: %v %v", status, l, err)
+			}
 		}
 	})
 }
@@ -348,4 +338,71 @@ func TestVerifyAllOnRealFixtures(t *testing.T) {
 	bad.ARKPins = []string{milanPin}
 	_, err = VerifyAll(loadAtt(t, "attestation-proof.json"), rcs, "", bad)
 	wantCode(t, err, CodeARKNotPinned)
+}
+
+// Every statement field a check reads has one JSON type; anything else fails
+// up front, so no check has to guess how Python would treat true, 1.0 or "200".
+func TestStatementFieldTypeRules(t *testing.T) {
+	s := newSynth(t, nil)
+	wrong := map[string]any{"true": true, "float": num("1.0"), "int": num("1"), "string": "123", "list": []any{}, "object": map[string]any{}}
+	rules := map[string][]string{ // field -> the wrong types to try
+		"sandbox_id":            {"true", "float", "int", "list", "object"},
+		"cathedral_sandbox_id":  {"true", "float", "int", "list", "object"},
+		"network_policy_sha256": {"true", "float", "int", "list", "object"},
+		"tunables_sha256":       {"true", "float", "int", "list", "object"},
+		"network_policy":        {"true", "float", "int", "string", "list"},
+		"tunables":              {"true", "float", "int", "string", "list"},
+		"status":                {"true", "float", "string", "list", "object"},
+		"issued_at":             {"true", "float", "string", "list", "object"},
+	}
+	for field, kinds := range rules {
+		for _, kind := range kinds {
+			t.Run(field+"/"+kind, func(t *testing.T) {
+				rcs := s.chain(t, map[string]any{field: wrong[kind]})
+				_, err := VerifyReceipts(s.att, rcs, "")
+				wantCode(t, err, CodeReceiptMalformed)
+			})
+		}
+	}
+	t.Run("issued_at null", func(t *testing.T) {
+		_, err := VerifyReceipts(s.att, s.chain(t, map[string]any{"issued_at": explicitNull{}}), "")
+		wantCode(t, err, CodeReceiptMalformed)
+	})
+	t.Run("status beyond int64", func(t *testing.T) {
+		_, err := VerifyReceipts(s.att, s.chain(t, map[string]any{"status": num("9223372036854775808")}), "")
+		wantCode(t, err, CodeReceiptMalformed)
+	})
+	t.Run("allowed types pass", func(t *testing.T) {
+		ok := map[string]any{"sandbox_id": "r", "cathedral_sandbox_id": explicitNull{}, "network_policy": explicitNull{},
+			"tunables": explicitNull{}, "status": num("200"), "issued_at": num("3"), "network_policy_sha256": explicitNull{}}
+		if _, err := VerifyReceipts(s.att, s.chain(t, ok), ""); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("reviewer counterexample: room true then room 1 delete", func(t *testing.T) {
+		policy := map[string]any{"mode": "open", "allow": []any{}}
+		rcs := s.chain(t,
+			map[string]any{"sandbox_id": true, "action": "create", "status": num("200"), "issued_at": num("1"),
+				"network_policy": policy, "network_policy_sha256": policyHash(t, policy)},
+			map[string]any{"sandbox_id": num("1"), "action": "delete"})
+		wantCode(t, runChecks(s.att, rcs, ""), CodeReceiptMalformed)
+	})
+	t.Run("reviewer counterexample: 4301 digit status string", func(t *testing.T) {
+		rcs := s.chain(t, map[string]any{"action": "create", "sandbox_id": "r", "status": strings.Repeat("9", 4301),
+			"cathedral_sandbox_id": "0123abcd-4567-89ab-cdef-0123456789ab"})
+		wantCode(t, runChecks(s.att, rcs, ""), CodeReceiptMalformed)
+	})
+	t.Run("delete without issued_at for a room that has a policy event", func(t *testing.T) {
+		policy := map[string]any{"mode": "open", "allow": []any{}}
+		rcs := s.chain(t,
+			map[string]any{"sandbox_id": "r", "action": "create", "status": num("200"), "issued_at": num("1"),
+				"network_policy": policy, "network_policy_sha256": policyHash(t, policy)},
+			map[string]any{"sandbox_id": "r", "action": "delete", "status": num("200")})
+		wantCode(t, runChecks(s.att, rcs, ""), CodeNetworkPolicyMismatch)
+		rcs = s.chain(t,
+			map[string]any{"sandbox_id": "r", "action": "create", "status": num("200"), "issued_at": num("1"),
+				"network_policy": policy, "network_policy_sha256": policyHash(t, policy)},
+			map[string]any{"sandbox_id": "r", "action": "delete", "issued_at": num("2")})
+		wantCode(t, runChecks(s.att, rcs, ""), CodeNetworkPolicyMismatch)
+	})
 }

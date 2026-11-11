@@ -3,10 +3,7 @@ package snpverify
 import (
 	"encoding/base64"
 	"encoding/json"
-	"math"
-	"math/big"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -62,60 +59,6 @@ func VerifyAll(att Attestation, receipts []Receipt, head string, opts Options) (
 	return out, nil
 }
 
-// pyTruthy is Python truthiness of a parsed JSON value.
-func pyTruthy(v any) bool {
-	switch t := v.(type) {
-	case nil:
-		return false
-	case bool:
-		return t
-	case string:
-		return t != ""
-	case []any:
-		return len(t) > 0
-	case map[string]any:
-		return len(t) > 0
-	case json.Number:
-		if isIntLiteral(string(t)) {
-			n, ok := new(big.Int).SetString(string(t), 10)
-			return ok && n.Sign() != 0
-		}
-		f, err := strconv.ParseFloat(string(t), 64)
-		return err == nil && f != 0
-	}
-	return true
-}
-
-func isIntLiteral(s string) bool { return !strings.ContainsAny(s, ".eE") }
-
-// roomKey gives a dict-key identity: ok is false for an unhashable value (list
-// or object), where Python raises TypeError. Numbers compare by value and True
-// equals 1, as Python dict keys do.
-func roomKey(v any) (key, display string, ok bool) {
-	switch t := v.(type) {
-	case []any, map[string]any:
-		return "", "", false
-	case string:
-		return "s:" + t, t, true
-	case bool:
-		if t {
-			return "n:1", "true", true
-		}
-		return "n:0", "false", true
-	case json.Number:
-		r := new(big.Rat)
-		if isIntLiteral(string(t)) {
-			r.SetString(string(t))
-		} else {
-			f, _ := strconv.ParseFloat(string(t), 64)
-			r.SetFloat64(f)
-		}
-		d, _ := pythonNumber(t)
-		return "n:" + r.String(), d, true
-	}
-	return "z:", "null", true
-}
-
 func sha256Canonical(v any) (string, error) {
 	c, err := Canonical(v)
 	if err != nil {
@@ -134,24 +77,21 @@ func sortedBySequence(receipts []Receipt) []Receipt {
 	return out
 }
 
+// roomOf returns the receipt's room id; an absent, null or empty id means no room.
+func roomOf(st map[string]any) string {
+	room, _ := st["sandbox_id"].(string)
+	return room
+}
+
 func policyTimeline(receipts []Receipt) (map[string][]PolicyEvent, error) {
-	type room struct {
-		display string
-		events  []PolicyEvent
-	}
-	rooms := map[string]*room{}
-	var order []string
+	out := map[string][]PolicyEvent{}
 	for _, rc := range sortedBySequence(receipts) {
 		st := rc.Statement
-		raw := st["sandbox_id"]
-		if !pyTruthy(raw) {
+		room := roomOf(st)
+		if room == "" {
 			continue
 		}
 		seq, _ := sequenceOf(st)
-		key, display, ok := roomKey(raw)
-		if !ok {
-			return nil, fail(CodeNetworkPolicyMismatch, "receipt %d: sandbox_id is not a usable room id", seq)
-		}
 		action, _ := st["action"].(string)
 		issued, hasIssued := st["issued_at"]
 		status, hasStatus := st["status"]
@@ -163,34 +103,20 @@ func policyTimeline(receipts []Receipt) (map[string][]PolicyEvent, error) {
 			if stored, _ := st["network_policy_sha256"].(string); stored != sum {
 				return nil, fail(CodeNetworkPolicyMismatch, "receipt %d: network_policy_sha256 does not match the policy", seq)
 			}
-			obj, isObj := policy.(map[string]any)
-			var mode, allow any
-			var hasMode, hasAllow bool
-			if isObj {
-				mode, hasMode = obj["mode"]
-				allow, hasAllow = obj["allow"]
-			}
+			obj := policy.(map[string]any) // an object, by the receipt type rules
+			mode, hasMode := obj["mode"]
+			allow, hasAllow := obj["allow"]
 			if !hasIssued || !hasStatus || !hasMode || !hasAllow {
 				return nil, fail(CodeNetworkPolicyMismatch, "receipt %d: policy event is missing issued_at, status, mode or allow", seq)
 			}
-			r := rooms[key]
-			if r == nil {
-				r = &room{display: display}
-				rooms[key] = r
-				order = append(order, key)
-			}
-			r.events = append(r.events, PolicyEvent{Sequence: seq, IssuedAt: issued, Action: action, Status: status,
+			out[room] = append(out[room], PolicyEvent{Sequence: seq, IssuedAt: issued, Action: action, Status: status,
 				Mode: mode, Allow: allow, PolicySHA256: sum})
-		} else if r := rooms[key]; r != nil && action == "delete" {
+		} else if _, known := out[room]; known && action == "delete" {
 			if !hasIssued || !hasStatus {
 				return nil, fail(CodeNetworkPolicyMismatch, "receipt %d: delete event is missing issued_at or status", seq)
 			}
-			r.events = append(r.events, PolicyEvent{Sequence: seq, IssuedAt: issued, Action: "delete", Status: status})
+			out[room] = append(out[room], PolicyEvent{Sequence: seq, IssuedAt: issued, Action: "delete", Status: status})
 		}
-	}
-	out := map[string][]PolicyEvent{}
-	for _, k := range order {
-		out[rooms[k].display] = rooms[k].events
 	}
 	return out, nil
 }
@@ -214,12 +140,8 @@ func roomTunables(receipts []Receipt) (map[string]string, error) {
 		if stored, _ := st["tunables_sha256"].(string); stored != sum {
 			return nil, fail(CodeTunablesMismatch, "receipt %d: tunables_sha256 does not match the tunables", seq)
 		}
-		if raw := st["sandbox_id"]; pyTruthy(raw) {
-			_, display, ok := roomKey(raw)
-			if !ok {
-				return nil, fail(CodeTunablesMismatch, "receipt %d: sandbox_id is not a usable room id", seq)
-			}
-			out[display] = sum
+		if room := roomOf(st); room != "" {
+			out[room] = sum
 		}
 	}
 	return out, nil
@@ -243,40 +165,6 @@ func isLowerUUID(s string) bool {
 	return true
 }
 
-// statusIs2xx mirrors 200 <= int(status or 0) < 300. ok is false where Python
-// would raise (or where this checker does not read the value the same way).
-func statusIs2xx(v any) (in2xx, ok bool) {
-	if !pyTruthy(v) {
-		return false, true
-	}
-	var n *big.Int
-	switch t := v.(type) {
-	case bool:
-		n = big.NewInt(1)
-	case json.Number:
-		if isIntLiteral(string(t)) {
-			n, _ = new(big.Int).SetString(string(t), 10)
-		} else {
-			f, err := strconv.ParseFloat(string(t), 64)
-			if err != nil {
-				return false, false
-			}
-			n, _ = new(big.Float).SetFloat64(math.Trunc(f)).Int(nil)
-		}
-	case string:
-		if t == "" || strings.Trim(t, "0123456789") != "" {
-			return false, false
-		}
-		n, _ = new(big.Int).SetString(t, 10)
-	default:
-		return false, false
-	}
-	if n == nil {
-		return false, false
-	}
-	return n.Cmp(big.NewInt(200)) >= 0 && n.Cmp(big.NewInt(300)) < 0, true
-}
-
 func roomLinks(receipts []Receipt) (map[string]string, error) {
 	out := map[string]string{}
 	for _, rc := range receipts {
@@ -293,22 +181,19 @@ func roomLinks(receipts []Receipt) (map[string]string, error) {
 		if !isStr || !isLowerUUID(link) {
 			return nil, fail(CodeSandboxLinkMalformed, "receipt %d: cathedral_sandbox_id is not a lower-case UUID", seq)
 		}
-		raw := st["sandbox_id"]
-		if !pyTruthy(raw) {
+		room := roomOf(st)
+		if room == "" {
 			continue
 		}
-		ok2xx, ok := statusIs2xx(st["status"])
-		if !ok {
-			return nil, fail(CodeSandboxLinkMalformed, "receipt %d: status cannot be read as an integer", seq)
+		// status is an integer or null by the receipt type rules; null reads as 0.
+		status := int64(0)
+		if n, ok := st["status"].(json.Number); ok {
+			status, _ = n.Int64()
 		}
-		if !ok2xx {
+		if status < 200 || status >= 300 {
 			continue
 		}
-		_, display, hashable := roomKey(raw)
-		if !hashable {
-			return nil, fail(CodeSandboxLinkMalformed, "receipt %d: sandbox_id is not a usable room id", seq)
-		}
-		out[display] = link
+		out[room] = link
 	}
 	return out, nil
 }

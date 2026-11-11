@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"strconv"
 	"strings"
 )
 
@@ -60,7 +61,63 @@ func validateReceipt(rc Receipt) error {
 	if seq, ok := sequenceOf(st); !ok || seq < 1 {
 		return fail(CodeReceiptMalformed, "statement sequence is missing or not an integer of 1 or more")
 	}
+	// Fixed JSON types for every field a later check reads. Python would accept
+	// true, 1.0 or "200" in several of these and treat them alike; refusing them
+	// here keeps the checks below free of that guesswork.
+	for _, f := range []struct {
+		key  string
+		kind fieldKind
+	}{
+		{"sandbox_id", kindStringOrNull}, {"cathedral_sandbox_id", kindStringOrNull},
+		{"network_policy_sha256", kindStringOrNull}, {"tunables_sha256", kindStringOrNull},
+		{"network_policy", kindObjectOrNull}, {"tunables", kindObjectOrNull},
+		{"status", kindIntOrNull}, {"issued_at", kindInt},
+	} {
+		v, present := st[f.key]
+		if !present {
+			continue
+		}
+		if !f.kind.ok(v) {
+			return fail(CodeReceiptMalformed, "statement %s must be %s", f.key, f.kind.describe())
+		}
+	}
 	return nil
+}
+
+type fieldKind int
+
+const (
+	kindStringOrNull fieldKind = iota
+	kindObjectOrNull
+	kindIntOrNull
+	kindInt
+)
+
+func (k fieldKind) describe() string {
+	return [...]string{"a string or null", "an object or null", "an integer or null", "an integer"}[k]
+}
+
+func isInt64(v any) bool {
+	n, ok := v.(json.Number)
+	if !ok {
+		return false
+	}
+	_, err := strconv.ParseInt(string(n), 10, 64)
+	return err == nil
+}
+
+func (k fieldKind) ok(v any) bool {
+	switch k {
+	case kindStringOrNull:
+		_, isStr := v.(string)
+		return v == nil || isStr
+	case kindObjectOrNull:
+		_, isObj := v.(map[string]any)
+		return v == nil || isObj
+	case kindIntOrNull:
+		return v == nil || isInt64(v)
+	}
+	return isInt64(v)
 }
 
 // isBase64URL accepts only the URL-safe alphabet with optional trailing "=".

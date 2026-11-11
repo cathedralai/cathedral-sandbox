@@ -19,6 +19,22 @@ type multiFlag []string
 func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 
+// onceFlag takes one value; a second use is a usage error, because Python keeps
+// only the last one and a repeat must not silently widen the check.
+type onceFlag struct {
+	value string
+	set   bool
+}
+
+func (o *onceFlag) String() string { return o.value }
+func (o *onceFlag) Set(v string) error {
+	if o.set {
+		return errors.New("given more than once")
+	}
+	o.value, o.set = v, true
+	return nil
+}
+
 type verdict struct {
 	Verdict            string                             `json:"verdict"`
 	Code               string                             `json:"code,omitempty"`
@@ -47,11 +63,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 	vcekFile := fs.String("vcek", "", "VCEK certificate (DER)")
 	product := fs.String("product", "", "Genoa or Milan (default: from the report CPUID, version 3 and later)")
 	requireMeasurement := fs.Bool("require-measurement", false, "fail unless --expected-measurement is given")
-	head := fs.String("head", "", "head receipt sha256 the server named")
-	var headers, pins, measurements multiFlag
+	var headers, pins, allowed multiFlag
+	var expected onceFlag
 	fs.Var(&headers, "receipt-header", "X-Room-Receipt header value (repeatable)")
 	fs.Var(&pins, "ark-sha256", "pinned sha256 of the ARK DER (repeatable, required)")
-	fs.Var(&measurements, "expected-measurement", "approved measurement hex (repeatable)")
+	fs.Var(&expected, "expected-measurement", "expected measurement hex (at most once, as in the Python tool)")
+	fs.Var(&allowed, "allowed-measurement", "approved measurement hex, any match passes (repeatable; no Python counterpart)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -65,6 +82,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	if *attFile == "" || *arkFile == "" || *askFile == "" || *vcekFile == "" {
 		return usage("--attestation, --ark, --ask and --vcek are required")
+	}
+	if expected.set && len(allowed) > 0 {
+		return usage("use --expected-measurement or --allowed-measurement, not both")
+	}
+	measurements := []string(allowed)
+	if expected.set {
+		measurements = []string{expected.value}
 	}
 	if len(pins) == 0 {
 		return usage("at least one --ark-sha256 is required")
@@ -128,8 +152,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		receipts = append(receipts, rc)
 	}
 	// Python only trusts the file's own head for a whole chain with no extra headers.
-	wantHead := *head
-	if wantHead == "" && len(headers) == 0 {
+	wantHead := ""
+	if len(headers) == 0 {
 		wantHead = docHead
 	}
 

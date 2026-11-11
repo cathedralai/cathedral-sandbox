@@ -6,6 +6,8 @@ It is a second implementation of `room-kit/verify_receipts.py` and must stay in 
 
 The guarantee, and no wider: with the same pins and expected measurement, this checker says PASS only when the Python checker, run with its default options, says PASS. It can say FAIL where Python says PASS; those cases are listed under "Differences from the Python checker" and in the tests.
 
+Precise scope: the comparison is this CLI given `--attestation`, `--receipts` or `--receipt-header`, `--ark-sha256` pins and at most one `--expected-measurement`, against `verify_receipts.py --attestation ... --receipts/--receipt-header ... --ark-sha256 ... [--expected-measurement ...]`. `--allowed-measurement` has no Python counterpart; the parity statement does not cover it.
+
 Scope: binding schema `cathedral_sealed_hotel_binding_v1` only. A level 1 "hotel" binding is refused with `not_sealed`.
 
 ## What it checks, in order
@@ -52,7 +54,7 @@ go run . \
   --ark-sha256 4c6598d19c18719c5dfd4a7d335f674e5bfe1d8f800cea2cf270c10d103db2f1
 ```
 
-Flags: `--attestation FILE`, `--receipts FILE` (list, or object with a `receipts` list), `--receipt-header B64` (repeatable), `--ark`, `--ask`, `--vcek` (DER), `--ark-sha256 HEX` (repeatable, required, no default), `--expected-measurement HEX` (repeatable), `--require-measurement`, `--product Genoa|Milan`, `--head HEX`. Without `--head`, a `head` in an unfiltered receipts object is used, as in the Python tool, unless `--receipt-header` is given. Positional arguments are refused (exit 2).
+Flags: `--attestation FILE`, `--receipts FILE` (list, or object with a `receipts` list), `--receipt-header B64` (repeatable), `--ark`, `--ask`, `--vcek` (DER), `--ark-sha256 HEX` (repeatable, required, no default), `--expected-measurement HEX` (at most once; a repeat exits 2), `--allowed-measurement HEX` (repeatable, any match passes, no Python counterpart; not combinable with `--expected-measurement`), `--require-measurement` (satisfied by either measurement flag), `--product Genoa|Milan`. As in the Python tool, a `head` in an unfiltered receipts object is the head, unless `--receipt-header` is given; there is no `--head` flag. Positional arguments are refused (exit 2).
 
 Output is one JSON object on stdout with `verdict` PASS or FAIL, and `code` and `detail` on FAIL. Exit 0 on PASS, 1 on FAIL, 2 on usage error.
 
@@ -85,8 +87,10 @@ if errors.As(err, &ve) && ve.Code() == snpverify.CodeMeasurementNotAllowed { /* 
 - `kernel_cmdline`, when present, must be a string (Python crashes or treats falsy values as empty).
 - Product: same rule as Python (CPUID family 0x19, model 0x10 or more is Genoa, else Milan; version 3 and later), but certificates are supplied, not fetched. Other products fail with `unsupported_product`. An override (`--product`) is used only when the report does not name the product; one that disagrees with the report fails.
 - Where Python would crash on a missing or mistyped field in the policy, tunables, link or TLS checks (for example a policy that is not an object, or a room id that is a list), this checker fails with the code of that check.
-- The status of a create receipt is read as an integer for the sandbox link; a string status other than ASCII digits fails here.
+- A create receipt with a non-integer status fails, rather than being read the way Python `int()` reads it.
 - Receipts documents: a list, or an object whose `receipts` is a list; anything else fails. `head`, when present, must be a non-empty string; `filtered`, when present, must be a boolean. Each receipt needs string `receipt_sha256`, `signature_b64`, `binding_sha256`, `previous_receipt_sha256`, `action`, and an integer `sequence` of 1 or more.
+- Statement fields have fixed JSON types here, and a wrong type fails with `receipt_malformed` where Python may accept it: `sandbox_id`, `cathedral_sandbox_id`, `network_policy_sha256`, `tunables_sha256` are a string or null; `network_policy` and `tunables` are an object or null; `status` is an integer that fits int64, or null; `issued_at`, when present, is an integer that fits int64; `sequence` is an integer of 1 or more.
+- `--allowed-measurement` exists only here. There is no `--head` flag, and `--expected-measurement` may be given once.
 - Receipt headers decode only the base64url alphabet (`A-Z a-z 0-9 - _`) with optional `=` padding and no trimming. Python also takes `+` and `/` and drops other bytes.
 - Report and receipt-signature base64 uses the standard alphabet with padding; Go rejects stray bytes, Python drops them.
 - Positional command-line arguments are refused.

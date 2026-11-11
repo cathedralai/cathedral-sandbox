@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/cathedralai/cathedralconfidential/cmd/cathedral-snp-verifier/snpverify"
@@ -92,5 +93,47 @@ func TestCLIPositionalAndFlags(t *testing.T) {
 	json.Unmarshal(out.Bytes(), &f)
 	if code != 1 || f.Code != snpverify.CodeUnsupportedProduct {
 		t.Fatalf("exit %d %s", code, out.String())
+	}
+}
+
+func TestCLIMeasurementFlags(t *testing.T) {
+	const good = "631d0410eace72dcdd26cf086f5e03715cefdcb871e0ed8cdb9dcff364db9d572ebb571b71e68264b183386ee4992dfc"
+	bad := strings.Repeat("0", 96)
+	pin := cliArgs("--ark-sha256", genoaPin)
+	type verdictOut struct {
+		Verdict            string
+		Code               string
+		MeasurementChecked bool `json:"measurement_checked"`
+	}
+	runWith := func(extra ...string) (int, verdictOut, string) {
+		var out, errb bytes.Buffer
+		code := run(append(append([]string{}, pin...), extra...), &out, &errb)
+		var v verdictOut
+		json.Unmarshal(out.Bytes(), &v)
+		return code, v, errb.String()
+	}
+	if code, _, _ := runWith("--expected-measurement", good, "--expected-measurement", bad); code != 2 {
+		t.Fatalf("a repeated --expected-measurement must exit 2, got %d", code)
+	}
+	if code, _, _ := runWith("--expected-measurement", bad, "--expected-measurement", good); code != 2 {
+		t.Fatalf("a repeated --expected-measurement must exit 2, got %d", code)
+	}
+	if code, v, _ := runWith("--expected-measurement", good); code != 0 || !v.MeasurementChecked {
+		t.Fatalf("%d %+v", code, v)
+	}
+	if code, v, _ := runWith("--allowed-measurement", bad, "--allowed-measurement", good); code != 0 || !v.MeasurementChecked {
+		t.Fatalf("%d %+v", code, v)
+	}
+	if code, v, _ := runWith("--allowed-measurement", bad); code != 1 || v.Code != snpverify.CodeMeasurementNotAllowed {
+		t.Fatalf("%d %+v", code, v)
+	}
+	if code, v, _ := runWith("--require-measurement", "--allowed-measurement", good); code != 0 || !v.MeasurementChecked {
+		t.Fatalf("%d %+v", code, v)
+	}
+	if code, _, _ := runWith("--expected-measurement", good, "--allowed-measurement", good); code != 2 {
+		t.Fatalf("both flags must exit 2, got %d", code)
+	}
+	if code, _, _ := runWith("--head", good); code != 2 {
+		t.Fatalf("--head no longer exists, got %d", code)
 	}
 }

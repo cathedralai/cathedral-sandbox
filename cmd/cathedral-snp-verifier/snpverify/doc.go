@@ -21,8 +21,10 @@
 //
 // The guarantee, and no wider: with the same pins and expected measurement,
 // VerifyAll says PASS only when verify_receipts.py, run with its default
-// options, says PASS. It can fail where Python passes (duplicate keys, huge
-// numbers, deep nesting and the other cases in the README). Canonical formats
+// options, says PASS. The comparison is the CLI given an attestation, receipts
+// or receipt headers, ARK pins and at most one expected measurement, against
+// verify_receipts.py with the same inputs. It can fail where Python passes (duplicate keys, huge
+// numbers, deep nesting, statement fields of an unexpected JSON type and the other cases in the README). Canonical formats
 // numbers as Python's json.dumps does after json.loads.
 //
 // VerifyAll runs the attestation, the guest TLS fields, the receipts, and the
