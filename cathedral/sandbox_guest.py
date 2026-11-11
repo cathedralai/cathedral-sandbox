@@ -2368,6 +2368,14 @@ class DockerGuestProvider:
             self._client.run(["docker", "image", "rm", image], timeout=60.0)
         return {"snapshot_id": snap_id, "image": image, "digest": digest, "includes_work": False}
 
+    def expose(self, sandbox_id: str, request: Any) -> dict[str, Any]:
+        # The inherited in-memory expose builds a URL from the hotel's own
+        # loopback base URL, and nothing serves it. Refuse until the token-gated
+        # port URL (AB#605, ports/{port}/http) is the supported way in.
+        raise SandboxOpError(
+            "expose_not_supported", 501, "this hotel does not serve exposed port URLs"
+        )
+
     def set_network(self, sandbox_id: str, patch: NetworkPatch) -> dict[str, Any]:
         self._require_credentials_support(patch.credentials)
         guest = self._guests.get(sandbox_id)
