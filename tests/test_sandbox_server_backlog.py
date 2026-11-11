@@ -8,9 +8,8 @@ pool, 11 Nov 2026: 100 commands at once, 15 to 24 of them held for 1 s or more).
 
 from __future__ import annotations
 
-import http.client
+import socket
 import threading
-import time
 
 from cathedral.sandbox_server import Response, serve
 
@@ -30,39 +29,35 @@ def test_listener_asks_for_a_backlog_of_1024() -> None:
         httpd.server_close()
 
 
-def test_a_burst_of_new_connections_is_answered_without_a_connect_retry() -> None:
+def test_the_listen_queue_holds_a_burst_while_nothing_accepts() -> None:
     # The listener is bound and listening but nothing accepts yet, so every
-    # connection of the burst has to fit in the listen queue. With a backlog of
-    # 5 the kernel drops or resets the rest: on Linux they come back 1 s later.
+    # connection has to fit in the listen queue. They are opened one at a time,
+    # so the kernel's count of queued connections is exact for each attempt.
+    # With a backlog of 5 the queue is full after a handful and the next
+    # connect gets no answer. No timing bound: only whether each one connects.
     httpd = serve(_StubApp())
     host, port = httpd.server_address
-    results: list[tuple[int | None, float]] = [(None, 0.0)] * BURST
-
-    def one(i: int) -> None:
-        start = time.monotonic()
-        status = None
-        try:
-            conn = http.client.HTTPConnection(host, port, timeout=5)
-            conn.request("GET", "/v1/status")
-            status = conn.getresponse().status
-            conn.close()
-        except OSError:
-            pass
-        results[i] = (status, time.monotonic() - start)
-
-    callers = [threading.Thread(target=one, args=(i,)) for i in range(BURST)]
+    conns: list[socket.socket] = []
     server = threading.Thread(target=httpd.serve_forever, daemon=True)
+    started = False
     try:
-        for t in callers:
-            t.start()
-        time.sleep(0.1)
-        server.start()
-        for t in callers:
-            t.join(timeout=10)
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
+        for _ in range(BURST):
+            try:
+                conns.append(socket.create_connection((host, port), timeout=2))
+            except OSError:
+                break
+        assert len(conns) == BURST, f"the listen queue held only {len(conns)} of {BURST} connections"
 
-    answered = [seconds for status, seconds in results if status == 200]
-    assert len(answered) == BURST, f"{BURST - len(answered)} of {BURST} connections got no answer"
-    assert max(answered) < 0.7, f"slowest answer took {max(answered):.2f} s: a connect retry"
+        for conn in conns:
+            conn.sendall(b"GET /v1/status HTTP/1.0\r\n\r\n")
+        server.start()
+        started = True
+        for conn in conns:
+            conn.settimeout(30)
+            assert conn.recv(64).startswith(b"HTTP/1.0 200"), "a queued connection was not answered"
+    finally:
+        for conn in conns:
+            conn.close()
+        if started:
+            httpd.shutdown()
+        httpd.server_close()
