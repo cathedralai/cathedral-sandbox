@@ -431,12 +431,19 @@ def _run_bounded(
             except (BrokenPipeError, OSError):
                 pass
         threading.Thread(target=feed, daemon=True).start()
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    exited = threading.Event()
+
+    def reap() -> None:
+        try:
+            proc.wait()  # blocks until the child ends; wait(timeout=...) polls with sleeps of up to 50 ms
+        finally:
+            exited.set()
+
+    threading.Thread(target=reap, daemon=True).start()
+    if not exited.wait(timeout):
         proc.kill()
-        proc.wait()
-        raise
+        exited.wait()
+        raise subprocess.TimeoutExpired(argv, timeout)
     for t in readers:
         t.join()
     return subprocess.CompletedProcess(argv, proc.returncode, kept.get("out", b""), kept.get("err", b""))
