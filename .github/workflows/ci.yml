@@ -155,3 +155,32 @@ jobs:
             exit 1
           fi
           test ! -s rejected.stdout
+
+  snp-verifier:
+    name: SNP receipt verifier (Go)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # Standard library only: there is no go.sum to key a cache on.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.11"
+          cache: false
+
+      - name: Test
+        working-directory: cmd/cathedral-snp-verifier
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          test "$(go env GOVERSION)" = go1.26.11
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -race ./...
+
+      - name: Vulnerability scan
+        working-directory: cmd/cathedral-snp-verifier
+        env:
+          GOTOOLCHAIN: local
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
