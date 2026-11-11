@@ -27,6 +27,43 @@ Shipped source:
 A hotel roll of the measured guest is required; broker-only roll is not enough
 for hotel ownership. Keep Draft until Spock live paste.
 
+## Where the owner table lives
+
+- File: `$ROOM_DATA_DIR/image-owners/image-owners.json`
+  (`CATHEDRAL_IMAGE_OWNERS_PATH`, set by `room-kit/profiles/v1.sh`).
+- Directory: `$ROOM_DATA_DIR/image-owners`, mode 0700, owner `poolroom`, made by
+  `room-kit/install.sh`. The API replaces the file through a temp file in the
+  same directory, so the API user must own the directory, not only the file.
+- It sits on the data volume, beside the Docker store (`$ROOM_DATA_DIR/docker`),
+  so the table and the images always have the same lifetime.
+- API restart: the table is read again from disk. Grants survive.
+- Guest restart (sealed hotel): the scratch disk gets a new key and a new file
+  system at every boot. The table is gone, and so is every image. No image can
+  be left without an owner entry, so "no entry, no start" still holds.
+- A write that fails answers 503 `image_owner_store_failed` and changes nothing
+  in memory. The create or snapshot of that request is undone, and a retry is
+  judged again from the table on disk.
+- Startup check: when `CATHEDRAL_IMAGE_OWNERS_PATH` is set, the API creates and
+  removes a probe file in the directory before it serves. If that fails, the API
+  does not start and the error names the path. The final check of `install.sh`
+  then fails, so a hotel that cannot record ownership never takes rooms.
+
+## Found on the canary, 11 Nov 2026
+
+Hotel nc-sealed-3, first roll of this change (pin 3d107e9). Two defects, both
+fixed in the follow-up change:
+
+1. The table path was `$ROOM_DATA_DIR/image-owners.json`, in the volume root that
+   belongs to root. The API runs as `poolroom` and could not write there. Every
+   create or snapshot that needed a new grant answered 503
+   `image_owner_store_failed` (6 of 6). Creates from the default image worked.
+2. The failed grant stayed in memory. The same guest's retry passed, and that
+   guest could then start the image by id. The grant was never on disk.
+
+The cause of 1 was read from source; the guest could not be inspected. The next
+canary must show a custom registry create, a snapshot, the cross-guest refusals
+and an API restart with the grant still in place.
+
 ## Spock live paste checklist (Gate S.1)
 
 Keep AB#604 HOLD until every box below is pasted on the card. Do **not** set
