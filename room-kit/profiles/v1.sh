@@ -43,7 +43,7 @@ EOV
   # AB#650 Gate S.1: per-guest image ownership on the hotel Docker store, and
   # Option A — refuse hotel-side builds on shared sealed hotels.
   if [ -n "${ROOM_DATA_DIR:-}" ]; then
-    echo "CATHEDRAL_IMAGE_OWNERS_PATH=$ROOM_DATA_DIR/image-owners.json"
+    echo "CATHEDRAL_IMAGE_OWNERS_PATH=$ROOM_DATA_DIR/image-owners/image-owners.json"
   fi
   if [ "${ROOM_RECEIPTS:-0}" = 1 ] || [ "${ROOM_SHARED_HOTEL_BUILDS:-}" = "refuse" ]; then
     echo "CATHEDRAL_SHARED_HOTEL_BUILDS=${ROOM_SHARED_HOTEL_BUILDS:-refuse}"

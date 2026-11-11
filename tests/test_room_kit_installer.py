@@ -52,3 +52,15 @@ def test_the_api_unit_has_a_stop_budget_for_a_full_hotel() -> None:
 def test_the_final_check_needs_a_200_with_the_hotels_own_key() -> None:
     tail = TEXT[TEXT.index("13. start"):]
     assert '-H "@$ROOM_ETC/reaper.headers"' in tail and '[ "$API_CODE" = 200 ] ||' in tail
+
+
+def test_the_image_owner_table_has_a_directory_the_api_can_write() -> None:
+    # AB#650 canary, 11 Nov 2026: the table sat in the root-owned volume root,
+    # the API (poolroom) could not write beside it, and every new grant was a 503.
+    made = 'install -d -m 0700 -o poolroom -g poolroom "$ROOM_DATA_DIR/image-owners"'
+    assert made in TEXT
+    # After the volume is mounted, before the API unit is written.
+    assert TEXT.index('mountpoint -q "$ROOM_DATA_DIR"') < TEXT.index(made) < TEXT.index("10. API unit")
+    assert "ReadWritePaths=$ROOM_DATA_DIR/work $ROOM_DATA_DIR/image-owners /var/lib/pool-room\n" in TEXT
+    profile = (KIT / "profiles" / "v1.sh").read_text()
+    assert 'echo "CATHEDRAL_IMAGE_OWNERS_PATH=$ROOM_DATA_DIR/image-owners/image-owners.json"' in profile
