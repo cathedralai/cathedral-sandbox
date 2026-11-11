@@ -1431,17 +1431,31 @@ class DockerGuestProvider:
             return True
         return False
 
-    def _authorize_image(self, image: str, owner: str, *, registry_auth: Mapping[str, str] | None = None) -> str:
+    def _authorize_image(
+        self,
+        image: str,
+        owner: str,
+        *,
+        registry_auth: Mapping[str, str] | None = None,
+        refresh: bool = False,
+    ) -> str:
         """Ensure *owner* may start *image*; pull to earn a registry grant if needed.
 
         Returns the immutable image id that was authorized. Never falls back to
         a cached local image when registry authorization fails. Snapshot and
         build artifacts cannot be earned by renaming them and pulling.
+        Callers must not call ``_ensure_image`` again for the same create/prefetch.
         """
+        force_refresh = (
+            refresh
+            or registry_auth is not None
+            or image in self._auth_pulled
+            or self._pull_policy == "always"
+        )
         local_id = self._image_id_of(image) if self._client.image_exists(image) else None
         if local_id and self._image_owners.owns(local_id, owner):
-            # Preserve credential rechecks for private images and pull-policy always.
-            if registry_auth is not None or image in self._auth_pulled or self._pull_policy == "always":
+            # Preserve credential rechecks, pull-policy always, and prefetch refresh.
+            if force_refresh:
                 self._ensure_image(image, registry_auth=registry_auth, refresh=True)
             return local_id
         if self._looks_like_image_id(image):
@@ -2762,7 +2776,9 @@ class DockerGuestProvider:
         for image in request.images:
             # Prefetch is the explicit refresh path: it always pulls, then grants.
             # _authorize_image refreshes; a single inspect fills the operation result.
-            self._authorize_image(image, effective_owner, registry_auth=request.registry_auth)
+            self._authorize_image(
+                image, effective_owner, registry_auth=request.registry_auth, refresh=True
+            )
             inspected = self._client.image_inspect(image)
             entry = {
                 "ref": image,
