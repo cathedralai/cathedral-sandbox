@@ -1197,10 +1197,18 @@ class _Handler(BaseHTTPRequestHandler):
             pass
 
 
+class _Server(ThreadingHTTPServer):
+    # Every call is a new connection (HTTP/1.0, no keep-alive). The stdlib listen
+    # backlog is 5 on Python 3.11 to 3.14, so a burst of calls overflows it: the
+    # kernel drops the connection attempt and the caller retries 1 s later.
+    # room_receipts.py's front sets the same value for the same reason.
+    request_queue_size = 1024
+
+
 def serve(app: SandboxApplication, host: str = "127.0.0.1", port: int = 0) -> ThreadingHTTPServer:
     """Bind the application to a real HTTP listener (used by integration checks)."""
     handler = type("_BoundHandler", (_Handler,), {"app": app})
-    httpd = ThreadingHTTPServer((host, port), handler)
+    httpd = _Server((host, port), handler)
     return httpd
 
 

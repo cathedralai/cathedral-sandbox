@@ -14,7 +14,7 @@ customer never holds a hotel key; the broker and ops do.
 
 ## Server model (facts)
 
-- `ThreadingHTTPServer` (stdlib). One OS thread per connection, `daemon_threads=True`, unbounded thread count. `request_queue_size` = socketserver default 128 (listen backlog); not overridden.
+- `ThreadingHTTPServer` (stdlib). One OS thread per connection, `daemon_threads=True`, unbounded thread count. `request_queue_size` = 1024 (listen backlog), set on `_Server`. The socketserver default is 5 on Python 3.11 to 3.14, and a burst of new connections overflowed it (1 s connect retries, measured 11 Nov 2026).
 - `_Handler` does NOT set `protocol_version`, so it is HTTP/1.0: the connection closes after each response (no server keep-alive). room_receipts.py's own handler sets HTTP/1.1 + `request_queue_size=1024`.
 - `_Handler.timeout` = None (stdlib default). No per-connection socket read timeout on the API. Only the two WS loops call `self.connection.settimeout(120.0)`. A slow client on the request path blocks its thread with no timeout (bounded in prod by Caddy's 15 m and the proxy's 1800 s dial timeout).
 - Header/line size bounded by stdlib: `http.client._MAXLINE`=65536, `_MAXHEADERS`=100 -> 414/431 before the handler runs.
