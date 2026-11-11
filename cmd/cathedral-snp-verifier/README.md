@@ -30,7 +30,7 @@ Scope: binding schema `cathedral_sealed_hotel_binding_v1` only. A level 1 "hotel
 15. Tunables: each create receipt that carries `tunables` has `tunables_sha256` equal to sha256 of the canonical tunables (`tunables_mismatch`).
 16. Sandbox link: a create receipt that carries `cathedral_sandbox_id` carries a lower-case UUID (`sandbox_link_malformed`).
 
-Steps 13 to 16 run in the same order as the Python `main()`, after the receipts. `VerifyAll` runs steps 1 to 16 in that order; the CLI uses it.
+The order at run time is Python's: the guest TLS check (step 13) runs after the attestation and before the receipts; steps 14 to 16 run after the receipts. `VerifyAll` runs all of them in that order; the CLI uses it.
 
 Malformed input gives `bad_input` or `receipt_malformed`. Every failure returns exactly one code. The PASS verdict says what was not checked: `measurement_checked` is false without `--expected-measurement`, `receipts_checked` is false without receipts.
 
@@ -42,7 +42,7 @@ Malformed input gives `bad_input` or `receipt_malformed`. Every failure returns 
 - That the receipts shown are all the receipts of a room. A head is named by the server and is not signed, so even a whole chain does not prove that nothing was cut from its end. A new boot or a restart of the receipts service makes a new key and a new chain. Rooms removed by the TTL reaper or a bulk delete get no delete receipt.
 - Isolation of any sandbox.
 - A minimum TCB. The reported TCB must match the VCEK and the binding, but there is no floor on it yet.
-- Policy, tunables, TLS, owner and sandbox-link checks. The Python checker has them; this one does not.
+- The owner check for a dedicated machine, and the TLS modes that compare a peer key. The Python checker has them as options; this one does not.
 
 ## Run
 
@@ -56,7 +56,7 @@ go run . \
 
 Flags: `--attestation FILE`, `--receipts FILE` (list, or object with a `receipts` list), `--receipt-header B64` (repeatable), `--ark`, `--ask`, `--vcek` (DER), `--ark-sha256 HEX` (repeatable, required, no default), `--expected-measurement HEX` (at most once; a repeat exits 2), `--allowed-measurement HEX` (repeatable, any match passes, no Python counterpart; not combinable with `--expected-measurement`), `--require-measurement` (satisfied by either measurement flag), `--product Genoa|Milan`. As in the Python tool, a `head` in an unfiltered receipts object is the head, unless `--receipt-header` is given; there is no `--head` flag. Positional arguments are refused (exit 2).
 
-Output is one JSON object on stdout with `verdict` PASS or FAIL, and `code` and `detail` on FAIL. Exit 0 on PASS, 1 on FAIL, 2 on usage error.
+On PASS or FAIL the output is one JSON object on stdout with `verdict`, and `code` and `detail` on FAIL. Exit 0 on PASS, 1 on FAIL. A usage error prints a message on stderr, no JSON, and exits 2.
 
 ```
 go test -race -count=1 ./...
@@ -86,13 +86,13 @@ if errors.As(err, &ve) && ve.Code() == snpverify.CodeMeasurementNotAllowed { /* 
 - Unpaired UTF-16 surrogate escapes in JSON strings are refused; Python fails on them when it encodes.
 - `kernel_cmdline`, when present, must be a string (Python crashes or treats falsy values as empty).
 - Product: same rule as Python (CPUID family 0x19, model 0x10 or more is Genoa, else Milan; version 3 and later), but certificates are supplied, not fetched. Other products fail with `unsupported_product`. An override (`--product`) is used only when the report does not name the product; one that disagrees with the report fails.
-- Where Python would crash on a missing or mistyped field in the policy, tunables, link or TLS checks (for example a policy that is not an object, or a room id that is a list), this checker fails with the code of that check.
+- Where Python would crash on a missing or mistyped field in the policy, tunables, link or TLS checks (for example a policy that is not an object, or a room id that is a list), this checker fails: with `receipt_malformed` when a statement field has the wrong type, otherwise with the code of that check.
 - A create receipt with a non-integer status fails, rather than being read the way Python `int()` reads it.
 - Receipts documents: a list, or an object whose `receipts` is a list; anything else fails. `head`, when present, must be a non-empty string; `filtered`, when present, must be a boolean. Each receipt needs string `receipt_sha256`, `signature_b64`, `binding_sha256`, `previous_receipt_sha256`, `action`, and an integer `sequence` of 1 or more.
 - Statement fields have fixed JSON types here, and a wrong type fails with `receipt_malformed` where Python may accept it: `sandbox_id`, `cathedral_sandbox_id`, `network_policy_sha256`, `tunables_sha256` are a string or null; `network_policy` and `tunables` are an object or null; `status` is an integer that fits int64, or null; `issued_at`, when present, is an integer that fits int64; `sequence` is an integer of 1 or more.
 - `--allowed-measurement` exists only here. There is no `--head` flag, and `--expected-measurement` may be given once.
 - Receipt headers decode only the base64url alphabet (`A-Z a-z 0-9 - _`) with optional `=` padding and no trimming. Python also takes `+` and `/` and drops other bytes.
-- Report and receipt-signature base64 uses the standard alphabet with padding; Go rejects stray bytes, Python drops them.
+- Report and receipt-signature base64 uses the standard alphabet with padding; Go's decoder ignores CR and LF and rejects any other stray byte; Python drops every byte outside the alphabet.
 - Positional command-line arguments are refused.
 - At least one ARK pin is required; Python makes the pin optional.
 - The receipt schema field is not checked (as in Python).
