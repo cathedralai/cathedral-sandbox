@@ -278,6 +278,8 @@ class SandboxApplication:
         self._add("POST", s + r"/(?P<id>[^/]+)/network", self.set_network)
         self._add("PATCH", s + r"/(?P<id>[^/]+)/network", self.set_network)
         self._add("POST", s + r"/(?P<id>[^/]+)/expose", self.expose)
+        # AB#605: hotel-mediated HTTP dial to 127.0.0.1:<port> inside the room.
+        self._add("POST", s + r"/(?P<id>[^/]+)/ports/(?P<port>[0-9]+)/http", self.guest_port_http)
         self._add("POST", s + r"/(?P<id>[^/]+)/freeze", self.freeze)
         self._add("POST", s + r"/(?P<id>[^/]+)/thaw", self.thaw)
         self._add("POST", s + r"/(?P<id>[^/]+)/access-tickets", self.mint_access_ticket)
@@ -631,6 +633,37 @@ class SandboxApplication:
         payload = self._json(body)
         return Response.json(200, self.provider.expose(id, ExposeRequest(port=payload.get("port"))))
 
+    def guest_port_http(self, *, id, port, headers, body, **_):
+        """POST /v1/sandboxes/{id}/ports/{port}/http — AB#605 guest localhost dial.
+
+        Caller sends the guest method and target in ``X-Guest-Method`` /
+        ``X-Guest-Target`` (path?query). Body and remaining headers are
+        forwarded into the room. Answer is the guest HTTP status, headers and
+        body (broker still buffers today).
+        """
+        try:
+            port_num = int(port)
+        except (TypeError, ValueError) as exc:
+            raise api.SandboxContractError("invalid_port", "port must be an integer") from exc
+        method = (headers.get("X-Guest-Method") or headers.get("x-guest-method") or "GET").strip().upper()
+        target = headers.get("X-Guest-Target") or headers.get("x-guest-target") or "/"
+        if "?" in target:
+            path, _, query = target.partition("?")
+        else:
+            path, query = target, ""
+        result = self.provider.guest_port_http(
+            id,
+            port_num,
+            method=method,
+            path=path or "/",
+            query=query,
+            headers=dict(headers),
+            body=body or b"",
+        )
+        out_headers = {name: value for name, value in result.headers}
+        out_headers["Content-Length"] = str(len(result.body))
+        return Response(result.status, result.body, out_headers)
+
     # ------------------------------------------------------------------ Agent IDE freeze / thaw
     def freeze(self, *, id, **_):
         return Response.json(200, self.provider.freeze(id))
@@ -819,6 +852,7 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/sandboxes/{id}/network", "post", "Set network policy", "§3.6"),
     ("/v1/sandboxes/{id}/network", "patch", "Patch network policy", "§3.6"),
     ("/v1/sandboxes/{id}/expose", "post", "Expose a port", "§3.7"),
+    ("/v1/sandboxes/{id}/ports/{port}/http", "post", "HTTP dial guest localhost port", "AB#605"),
     ("/v1/sandboxes/{id}/freeze", "post", "Freeze (pause) a sandbox", "Agent IDE; state → frozen"),
     ("/v1/sandboxes/{id}/thaw", "post", "Thaw a frozen sandbox", "Agent IDE; state → running"),
     ("/v1/sandboxes/{id}/access-tickets", "post", "Mint access ticket", "Agent IDE G4; single-use"),
