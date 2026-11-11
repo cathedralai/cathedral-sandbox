@@ -222,14 +222,13 @@ def test_credentialed_pulls_are_remembered_across_a_restart(fake, tmp_path) -> N
     second = DockerGuestProvider()
     try:
         assert private in second._auth_pulled  # noqa: SLF001
-        # A key without credentials pulls again, so the registry refuses it
-        # instead of the local copy starting for free.
+        # A key without credentials must not start the local copy for free.
+        # AB#650 maps a failed re-pull against a hotel-local image to
+        # image_not_owned (never fall back to the cached private layers).
         fake.set(pull_fail=[private])
         with pytest.raises(SandboxOpError) as err:
             second.create(CreateSandboxRequest(image=ImageSource(image=private), resources=RES),
                           api_key="other", idempotency=None, body_digest="y")
-        # Local copy exists from the first key; Option A remaps a failed
-        # unauthenticated refresh to image_not_owned (not image_pull_failed).
         assert err.value.code == "image_not_owned"
     finally:
         second.close()
