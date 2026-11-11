@@ -201,30 +201,40 @@ func TestBuildThroughTheBrokerAndCreateOnlyWhereBuilt(t *testing.T) {
 	if status != 200 || doc["image_id"] == nil {
 		t.Fatalf("build: %d %v", status, doc)
 	}
+	// AB#650 Option A: sealed hotel a is skipped. With b draining and c failing,
+	// the build cannot become ready until an unsealed hotel can build.
 	view := waitImage(t, tc, doc["image_id"].(string))
-	if view["state"] != "ready" || view["image"] != "cathedral-build-0123456789abcdef:latest" {
-		t.Fatalf("view: %v", view)
+	if view["state"] == "ready" {
+		t.Fatalf("build ready with only sealed/draining/failed hotels: %v", view)
 	}
-	got := tc.hotels["a"].builds[0]
-	if got["dockerfile"] != "FROM alpine:3.20\n" || got["context_tar_b64"] != "Z3ppcC1ieXRlcw==" {
-		t.Fatalf("hotel build body: %v", got)
+	if len(tc.hotels["a"].builds) != 0 {
+		t.Fatalf("sealed hotel a must not build under Option A: %v", tc.hotels["a"].builds)
 	}
 	if len(tc.hotels["b"].builds) != 0 {
 		t.Fatalf("draining hotel built")
 	}
 	tc.b.hotelByID("b").cfg.Drain = false
+	_, _ = tc.clientCall(t, "GET", "/v1/images/"+doc["image_id"].(string), nil, nil)
+	view = waitImage(t, tc, doc["image_id"].(string))
+	if view["state"] != "ready" || view["image"] != "cathedral-build-0123456789abcdef:latest" {
+		t.Fatalf("view after unsealing b: %v", view)
+	}
+	got := tc.hotels["b"].builds[0]
+	if got["dockerfile"] != "FROM alpine:3.20\n" || got["context_tar_b64"] != "Z3ppcC1ieXRlcw==" {
+		t.Fatalf("hotel build body: %v", got)
+	}
 	before := createsOn(tc)
 	for i := 0; i < 4; i++ {
-		status, doc = tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": view["image_id"]}), nil)
+		status, doc = tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": view["image_id"], "sealed": false}), nil)
 		if status != 201 {
 			t.Fatalf("create: %d %v", status, doc)
 		}
 	}
 	after := createsOn(tc)
-	if after["a"]-before["a"] != 4 {
+	if after["b"]-before["b"] != 4 {
 		t.Fatalf("creates went to hotels without the image: %v -> %v", before, after)
 	}
-	last := tc.hotels["a"].creates[len(tc.hotels["a"].creates)-1]
+	last := tc.hotels["b"].creates[len(tc.hotels["b"].creates)-1]
 	if res := last["resources"].(map[string]any); res["vcpu"].(float64) != 2 || last["image"] != "cathedral-build-0123456789abcdef:latest" {
 		t.Fatalf("create body: %v", last)
 	}

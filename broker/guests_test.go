@@ -309,24 +309,20 @@ func TestBuiltImageObeysSealedDefaultAndHotelSet(t *testing.T) {
 	if status != 201 || createsOn(tc)["b"] != before["b"]+1 {
 		t.Fatalf("unsealed create from the image: %d %v", status, doc)
 	}
-	// The sealed hotel builds on the next try; then a plain create goes there.
+	// AB#650 Option A: shared sealed hotels never build. Clearing failBuild on
+	// hotel a must not produce a sealed build or a sealed-default create.
 	tc.hotels["a"].mu.Lock()
 	tc.hotels["a"].failBuild = false
 	tc.hotels["a"].mu.Unlock()
-	tc.b.compat.mu.Lock()
-	tc.b.compat.images[imgID].failedAt["a"] = time.Now().Add(-2 * time.Minute)
-	tc.b.compat.mu.Unlock()
-	status, _ = tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": imgID}), nil)
-	if status != 409 {
-		t.Fatalf("create while the sealed build runs: %d", status)
+	_, _ = tc.clientCall(t, "GET", "/v1/images/"+imgID, nil, nil)
+	time.Sleep(50 * time.Millisecond)
+	if len(tc.hotels["a"].builds) != 0 {
+		t.Fatalf("sealed hotel a received a build under Option A: %v", tc.hotels["a"].builds)
 	}
-	if v := waitImage(t, tc, imgID); v["state"] != "ready" {
-		t.Fatalf("view after the sealed build: %v", v)
-	}
-	before = createsOn(tc)
 	status, doc = tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": imgID}), nil)
-	if status != 201 || createsOn(tc)["a"] != before["a"]+1 {
-		t.Fatalf("sealed create from the image: %d %v", status, doc)
+	detail, _ = doc["detail"].(map[string]any)
+	if status != 409 || detail["error"] != "image_not_ready" {
+		t.Fatalf("sealed-default create must stay image_not_ready without a sealed build: %d %v", status, doc)
 	}
 }
 

@@ -771,9 +771,18 @@ func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guest
 }
 
 // prefetchOn pulls the images on one hotel. A pull can take minutes, so it
-// does not use the guest request context.
+// does not use the guest request context. The guest id is forwarded so the
+// hotel grants ownership of the pulled image ids to this guest (AB#650).
 func (b *broker) prefetchOn(h *hotel, job *prefetchJob, body []byte) {
-	status, _, out, err := h.do(context.Background(), "POST", "/v1/images/prefetch", nil, body, 30*time.Minute)
+	g := b.guests[job.guest]
+	var status int
+	var out []byte
+	var err error
+	if g != nil {
+		status, _, out, err = h.doGuest(context.Background(), g, "POST", "/v1/images/prefetch", nil, body, 30*time.Minute)
+	} else {
+		status, _, out, err = h.do(context.Background(), "POST", "/v1/images/prefetch", nil, body, 30*time.Minute)
+	}
 	var doc map[string]any
 	_ = json.Unmarshal(out, &doc)
 	now := time.Now().UTC()

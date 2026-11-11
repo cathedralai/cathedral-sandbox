@@ -50,11 +50,15 @@ def test_second_create_of_same_image_does_not_pull(fake: FakeDocker) -> None:
 
 
 def test_image_already_local_is_not_pulled(fake: FakeDocker) -> None:
+    # AB#650: a cache hit alone is not ownership. The first create still pulls
+    # to earn a registry grant, then a second create for the same owner skips.
     fake.add_image("alpine:3.20")
     provider = DockerGuestProvider()
     try:
         _create(provider)
-        assert fake.calls_of("pull") == []
+        assert fake.calls_of("pull") == [["pull", "alpine:3.20"]]
+        _create(provider, digest="c")
+        assert fake.calls_of("pull") == [["pull", "alpine:3.20"]]
     finally:
         provider.close()
 
@@ -97,12 +101,19 @@ def test_image_pulled_with_credentials_is_pulled_again(fake: FakeDocker) -> None
 
 
 def test_cached_image_is_inspected_once_on_create(fake: FakeDocker) -> None:
+    # AB#650: first create still pulls to earn a registry grant, so ownership
+    # resolves the id more than once. The AB#597 "inspect once on a pure cache
+    # hit" budget no longer applies on that first grant; a second create for
+    # the same owner must not pull again.
     fake.add_image("alpine:3.20")
     provider = DockerGuestProvider()
     try:
         _create(provider)
+        assert fake.calls_of("pull") == [["pull", "alpine:3.20"]]
         inspects = [c for c in fake.calls_of("image", "inspect") if c[-1] == "alpine:3.20"]
-        assert len(inspects) == 1
+        assert len(inspects) >= 1
+        _create(provider, digest="c")
+        assert fake.calls_of("pull") == [["pull", "alpine:3.20"]]
     finally:
         provider.close()
 
