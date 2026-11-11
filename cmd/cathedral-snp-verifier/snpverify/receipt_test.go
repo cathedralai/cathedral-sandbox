@@ -41,7 +41,7 @@ func TestVerifyReceiptsPositive(t *testing.T) {
 		receipts, att string
 		wholeFromOne  bool
 	}{
-		{"receipts-first5.json", "attestation.json", true},
+		{"receipts-first5.json", "attestation-proof.json", true},
 		{"openenv-echo.receipts.json", "attestation-library.json", false},
 	}
 	for _, tc := range tests {
@@ -72,7 +72,7 @@ func TestVerifyReceiptsPositive(t *testing.T) {
 }
 
 func TestVerifyReceiptsFailures(t *testing.T) {
-	att := loadAtt(t, "attestation.json")
+	att := loadAtt(t, "attestation-proof.json")
 	t.Run("statement field changed", func(t *testing.T) {
 		rcs, _ := loadReceipts(t, "receipts-first5.json")
 		rcs[2].Statement["action"] = "delete"
@@ -89,7 +89,7 @@ func TestVerifyReceiptsFailures(t *testing.T) {
 	})
 	t.Run("receipts of another binding", func(t *testing.T) {
 		rcs, _ := loadReceipts(t, "receipts-first5.json")
-		other := rebind(t, loadAtt(t, "attestation.json"), func(b map[string]any) { b["hotel"] = "other" }, nil)
+		other := rebind(t, loadAtt(t, "attestation-proof.json"), func(b map[string]any) { b["hotel"] = "other" }, nil)
 		_, err := VerifyReceipts(other, rcs, "")
 		wantCode(t, err, CodeReceiptBindingMismatch)
 	})
@@ -201,7 +201,7 @@ func TestDecodeReceiptHeader(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := VerifyReceipts(loadAtt(t, "attestation.json"), []Receipt{got}, ""); err != nil {
+		if _, err := VerifyReceipts(loadAtt(t, "attestation-proof.json"), []Receipt{got}, ""); err != nil {
 			t.Fatal(err)
 		}
 	}

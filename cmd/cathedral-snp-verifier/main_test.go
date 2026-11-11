@@ -14,7 +14,7 @@ const (
 )
 
 func cliArgs(extra ...string) []string {
-	base := []string{"--attestation", "snpverify/testdata/attestation.json", "--ark", "snpverify/testdata/amd/ark.der",
+	base := []string{"--attestation", "snpverify/testdata/attestation-proof.json", "--ark", "snpverify/testdata/amd/ark.der",
 		"--ask", "snpverify/testdata/amd/ask.der", "--vcek", "snpverify/testdata/amd/vcek.der"}
 	return append(base, extra...)
 }

@@ -35,13 +35,13 @@ func TestHasDebugFlag(t *testing.T) {
 func TestKernelCmdlineRules(t *testing.T) {
 	t.Run("not a string", func(t *testing.T) {
 		for _, v := range []any{nil, true, []any{}, map[string]any{}} {
-			att := rebind(t, loadAtt(t, "attestation.json"), func(b map[string]any) { b["kernel_cmdline"] = v }, nil)
+			att := rebind(t, loadAtt(t, "attestation-proof.json"), func(b map[string]any) { b["kernel_cmdline"] = v }, nil)
 			_, err := VerifyAttestation(att, goodOpts(t))
 			wantCode(t, err, CodeBadInput)
 		}
 	})
 	t.Run("debug after a Python-only separator", func(t *testing.T) {
-		att := rebind(t, loadAtt(t, "attestation.json"), func(b map[string]any) { b["kernel_cmdline"] = "a\u001fcathedral.debug=1" }, nil)
+		att := rebind(t, loadAtt(t, "attestation-proof.json"), func(b map[string]any) { b["kernel_cmdline"] = "a\u001fcathedral.debug=1" }, nil)
 		_, err := VerifyAttestation(att, goodOpts(t))
 		wantCode(t, err, CodeDebugEnabled)
 	})
@@ -58,12 +58,12 @@ func setReport(t *testing.T, att Attestation, mut func([]byte)) Attestation {
 func TestProduct(t *testing.T) {
 	v2 := func(r []byte) { binary.LittleEndian.PutUint32(r[0:4], 2) }
 	t.Run("version 2 report without product fails", func(t *testing.T) {
-		att := setReport(t, loadAtt(t, "attestation.json"), v2)
+		att := setReport(t, loadAtt(t, "attestation-proof.json"), v2)
 		_, err := VerifyAttestation(att, goodOpts(t))
 		wantCode(t, err, CodeUnsupportedProduct)
 	})
 	t.Run("version 2 report with product proceeds", func(t *testing.T) {
-		att := setReport(t, loadAtt(t, "attestation.json"), v2)
+		att := setReport(t, loadAtt(t, "attestation-proof.json"), v2)
 		o := goodOpts(t)
 		o.Product = "Genoa"
 		_, err := VerifyAttestation(att, o)
@@ -73,11 +73,11 @@ func TestProduct(t *testing.T) {
 	t.Run("unknown product string", func(t *testing.T) {
 		o := goodOpts(t)
 		o.Product = "Turin"
-		_, err := VerifyAttestation(loadAtt(t, "attestation.json"), o)
+		_, err := VerifyAttestation(loadAtt(t, "attestation-proof.json"), o)
 		wantCode(t, err, CodeUnsupportedProduct)
 	})
 	t.Run("unknown family", func(t *testing.T) {
-		att := setReport(t, loadAtt(t, "attestation.json"), func(r []byte) { r[0x188] = 0x17 })
+		att := setReport(t, loadAtt(t, "attestation-proof.json"), func(r []byte) { r[0x188] = 0x17 })
 		_, err := VerifyAttestation(att, goodOpts(t))
 		wantCode(t, err, CodeUnsupportedProduct)
 	})
@@ -97,7 +97,7 @@ func TestProduct(t *testing.T) {
 		}
 	})
 	t.Run("real report reads as Genoa", func(t *testing.T) {
-		res, err := VerifyAttestation(loadAtt(t, "attestation.json"), goodOpts(t))
+		res, err := VerifyAttestation(loadAtt(t, "attestation-proof.json"), goodOpts(t))
 		if err != nil || res.AMD.Product != "Genoa" {
 			t.Fatalf("%v %+v", err, res.AMD)
 		}
@@ -109,7 +109,7 @@ func TestCorruptARKSignature(t *testing.T) {
 	ark := append([]byte(nil), o.ARK...)
 	ark[len(ark)-1] ^= 1
 	o.ARK = ark
-	_, err := VerifyAttestation(loadAtt(t, "attestation.json"), o)
+	_, err := VerifyAttestation(loadAtt(t, "attestation-proof.json"), o)
 	wantCode(t, err, CodeARKSignature)
 }
 
@@ -158,7 +158,7 @@ func TestParseReceiptsDocumentShapes(t *testing.T) {
 }
 
 func TestStatementFieldTypes(t *testing.T) {
-	att := loadAtt(t, "attestation.json")
+	att := loadAtt(t, "attestation-proof.json")
 	mutate := map[string]func(map[string]any){
 		"binding_sha256 number": func(s map[string]any) { s["binding_sha256"] = 1 },
 		"previous missing":      func(s map[string]any) { delete(s, "previous_receipt_sha256") },
@@ -229,7 +229,7 @@ func TestNumberSpellingsPythonRewrites(t *testing.T) {
 	if string(got) != `[1e5,1.50,1E5]` {
 		t.Fatalf("literals changed: %s", got)
 	}
-	att := loadAtt(t, "attestation.json")
+	att := loadAtt(t, "attestation-proof.json")
 	b := att.BindingSHA256
 	// Python canonical: {"action":"exec",...,"m":1.5,"n":100000.0,...} computed with python3 json.dumps.
 	const pythonHash = "ac88fd58dc1baf908f44697b07e6e67d5f3f550cc21741b7506856b8c72a8e28"

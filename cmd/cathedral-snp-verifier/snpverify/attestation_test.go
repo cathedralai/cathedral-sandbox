@@ -97,7 +97,7 @@ func TestARKPinIsKnownAMDRoot(t *testing.T) {
 }
 
 func TestVerifyAttestationPositive(t *testing.T) {
-	for _, name := range []string{"attestation.json", "attestation-library.json"} {
+	for _, name := range []string{"attestation-proof.json", "attestation-library.json"} {
 		t.Run(name, func(t *testing.T) {
 			att := loadAtt(t, name)
 			opts := goodOpts(t)
@@ -115,7 +115,7 @@ func TestVerifyAttestationPositive(t *testing.T) {
 }
 
 func TestVerifyAttestationFailures(t *testing.T) {
-	genuine := "attestation.json"
+	genuine := "attestation-proof.json"
 	tests := []struct {
 		name string
 		code string
@@ -234,7 +234,7 @@ func TestParseReportRejectsShort(t *testing.T) {
 }
 
 func TestBindingHashCrossCheck(t *testing.T) {
-	for _, name := range []string{"attestation.json", "attestation-library.json"} {
+	for _, name := range []string{"attestation-proof.json", "attestation-library.json"} {
 		att := loadAtt(t, name)
 		canon, err := Canonical(att.Binding)
 		if err != nil {

@@ -37,7 +37,7 @@ Malformed input gives `bad_input` or `receipt_malformed`. Every failure returns 
 
 ```
 go run . \
-  --attestation snpverify/testdata/attestation.json \
+  --attestation snpverify/testdata/attestation-proof.json \
   --receipts snpverify/testdata/receipts-first5.json \
   --ark snpverify/testdata/amd/ark.der --ask snpverify/testdata/amd/ask.der --vcek snpverify/testdata/amd/vcek.der \
   --ark-sha256 4c6598d19c18719c5dfd4a7d335f674e5bfe1d8f800cea2cf270c10d103db2f1
