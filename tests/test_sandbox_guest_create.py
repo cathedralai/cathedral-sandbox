@@ -96,6 +96,54 @@ def test_image_pulled_with_credentials_is_pulled_again(fake: FakeDocker) -> None
         provider.close()
 
 
+def test_cached_image_is_inspected_once_on_create(fake: FakeDocker) -> None:
+    fake.add_image("alpine:3.20")
+    provider = DockerGuestProvider()
+    try:
+        _create(provider)
+        inspects = [c for c in fake.calls_of("image", "inspect") if c[-1] == "alpine:3.20"]
+        assert len(inspects) == 1
+    finally:
+        provider.close()
+
+
+def test_absent_image_is_pulled_then_inspected(fake: FakeDocker) -> None:
+    fake.set(image_sizes={"alpine:3.20": 4321})
+    provider = DockerGuestProvider()
+    try:
+        _create(provider)
+        assert fake.calls_of("pull") == [["pull", "alpine:3.20"]]
+        record = provider._inner._images["alpine:3.20"]  # noqa: SLF001
+        assert record["size_bytes"] == 4321
+        assert record["digest"] == "alpine:3.20@sha256:" + "cd" * 32
+    finally:
+        provider.close()
+
+
+def test_auth_marker_is_set_when_the_inspect_after_a_pull_raises(fake: FakeDocker, tmp_path, monkeypatch) -> None:
+    # The authenticated-pull marker is recorded right after the pull, before any inspect.
+    monkeypatch.setenv("CATHEDRAL_SANDBOX_AUTH_PULLED_FILE", str(tmp_path / "auth-pulled.json"))
+    private = "ghcr.io/acme/private:1"
+    provider = DockerGuestProvider()
+    assert private not in provider._auth_pulled  # noqa: SLF001
+    try:
+        def boom(image):
+            raise RuntimeError("inspect failed")
+
+        provider._client.image_inspect = boom  # noqa: SLF001
+        auth = {"username": "u", "password": "p"}
+        request = CreateSandboxRequest(
+            image=ImageSource(image=private, registry_auth=auth),
+            resources=Resources(vcpu=1, memory_gib=1, disk_gib=5),
+        )
+        with pytest.raises(RuntimeError):
+            provider.create(request, api_key="k", idempotency=None, body_digest="1")
+        assert fake.calls_of("pull") == [["pull", private]]
+        assert private in provider._auth_pulled  # noqa: SLF001
+    finally:
+        provider.close()
+
+
 def test_registry_mirror_is_used_for_docker_hub(fake: FakeDocker, monkeypatch) -> None:
     monkeypatch.setenv("CATHEDRAL_SANDBOX_REGISTRY_MIRROR", "mirror.gcr.io")
     provider = DockerGuestProvider()
