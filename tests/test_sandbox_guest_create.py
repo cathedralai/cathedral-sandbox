@@ -50,11 +50,15 @@ def test_second_create_of_same_image_does_not_pull(fake: FakeDocker) -> None:
 
 
 def test_image_already_local_is_not_pulled(fake: FakeDocker) -> None:
+    # AB#650: a cache hit alone is not ownership. The first create still pulls
+    # to earn a registry grant, then a second create for the same owner skips.
     fake.add_image("alpine:3.20")
     provider = DockerGuestProvider()
     try:
         _create(provider)
-        assert fake.calls_of("pull") == []
+        assert fake.calls_of("pull") == [["pull", "alpine:3.20"]]
+        _create(provider, digest="c")
+        assert fake.calls_of("pull") == [["pull", "alpine:3.20"]]
     finally:
         provider.close()
 

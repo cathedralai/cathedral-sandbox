@@ -598,19 +598,28 @@ class SandboxApplication:
         # snapshot idempotency is a pass-through marker; the provider dedups creates.
         return None
 
-    def list_snapshots(self, *, query, **_):
-        return Response.json(200, {"snapshots": self.provider.list_snapshots(labels=query.get("label", []))})
+    def list_snapshots(self, *, query, headers, api_key, **_):
+        owner = self._owner(headers, api_key) if getattr(self.provider, "takes_owner", False) else None
+        return Response.json(
+            200,
+            {"snapshots": self.provider.list_snapshots(labels=query.get("label", []), owner=owner)},
+        )
 
-    def push_snapshot(self, *, id, body, **_):
+    def push_snapshot(self, *, id, headers, body, api_key, **_):
         payload = self._json(body)
         push = getattr(self.provider, "push_snapshot", None)
         if push is None:
             return Response.error(501, "push_not_supported", "this runtime cannot push a snapshot to a registry")
         image = ImageSource(image=payload.get("image") or "", registry_auth=payload.get("registry_auth"))
-        return Response.json(200, push(id, image=image.image, registry_auth=image.registry_auth))
+        owner = self._owner(headers, api_key) if getattr(self.provider, "takes_owner", False) else None
+        return Response.json(
+            200,
+            push(id, image=image.image, registry_auth=image.registry_auth, owner=owner),
+        )
 
-    def delete_snapshot(self, *, id, **_):
-        existed = self.provider.delete_snapshot(id)
+    def delete_snapshot(self, *, id, headers, api_key, **_):
+        owner = self._owner(headers, api_key) if getattr(self.provider, "takes_owner", False) else None
+        existed = self.provider.delete_snapshot(id, owner=owner)
         return Response.json(200, {"deleted": existed}) if existed else Response.error(404, "snapshot_not_found", f"no snapshot {id}")
 
     # ------------------------------------------------------------------ §3.4 lifecycle
@@ -739,8 +748,10 @@ class SandboxApplication:
     def prefetch(self, *, headers, body, api_key, **_):
         payload = self._json(body)
         idem = headers.get("Idempotency-Key") or headers.get("idempotency-key")
+        owner = self._owner(headers, api_key) if getattr(self.provider, "takes_owner", False) else None
         op = self.provider.prefetch(
-            PrefetchRequest(images=tuple(payload.get("images", ())), registry_auth=payload.get("registry_auth"))
+            PrefetchRequest(images=tuple(payload.get("images", ())), registry_auth=payload.get("registry_auth")),
+            owner=owner,
         )
         result = self.provider.get_operation(op)
         return Response.json(

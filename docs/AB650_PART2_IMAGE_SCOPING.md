@@ -1,46 +1,58 @@
 # AB650 part 2: hotel image ownership (Gate S.1)
 
-Status: **PLAN COMPLETE; IMPLEMENTATION BLOCKED ON BUILD POLICY**.
+Status: **IMPLEMENTED (source); LIVE PASTE STILL REQUIRED**.
 
-Reviewed offline on 2026-11-10 at `7f91405b9e8374004d7116493336af9372655f79`,
-branch `feature/ab650-part2-image-scoping`. No deployment or live qualification
-is claimed. The supplied broker live-proof transcript is historical evidence,
-not a fresh check. AB604 must remain on hold.
+Eng default (fail closed): **Option A** — refuse hotel-side builds on shared
+sealed hotels, and enforce per-guest ownership of hotel-local image ids.
+AB#604 stays HOLD until Spock pastes live proof below. No snapshot flags.
 
-## Decision required before implementation
+## Decision taken (Eng Toby, 2026-11-11)
 
-The brief explicitly says: "If a design choice needs a product decision, stop
-coding there, finish the plan with the options and your recommendation."
-This is that branch of the task. No product code has been changed.
-
-A create/fork guard alone leaves a supported route to the same private data:
-an arbitrary Dockerfile can consume a foreign local snapshot through `FROM`
-or external `COPY --from`, then produce a new image. Assigning the output to
-the builder does not authorize the input. Both inline builds and the build API
-use the shared classic Docker daemon (`cathedral/sandbox_guest.py:673`,
-`:1410`, `:1453`, `:1485`). This is a source-level finding; it has not been
-executed against a real Docker daemon or hotel.
-
-Builds are reachable on shared sealed hotels. The broker routes authenticated
-compatibility clients to builds (`broker/main.go:2107`, `broker/compat.go:205`)
-and dispatches to allowed hotels without excluding sealed hotels
-(`broker/build.go:90`). `broker/guests_test.go:285` explicitly tests successful
-sealed builds. The dedicated-machine signature gate does not apply when the
-hotel has no dedicated owner (`room-kit/room_receipts.py:1949`;
-`room-kit/sealed/README.md:201`). Disabling these builds changes an existing
-product capability, not just an undocumented implementation detail.
-
-| Option | Consequence | Recommendation |
+| Option | Consequence | Decision |
 | --- | --- | --- |
-| A. Refuse both hotel-side build routes on shared sealed hotels until their inputs are isolated. Customers build elsewhere and use registry images. | Smallest sound boundary; removes currently supported shared sealed builds. Refuse before Docker runs, including inline builds, with a clear 4xx such as `shared_hotel_build_refused`. | **Recommended for Gate S.1**, subject to product approval of this compatibility change. |
-| B. Keep builds by isolating the builder's accessible images and credentials per owner. | Preserves Dockerfile behavior but adds runtime/storage design and qualification beyond the brief's minimal change and no-new-image-store scope. | Separate approved implementation scope; keep AB604 off meanwhile. |
-| C. Support only a constrained Dockerfile language with complete source authorization. | Needs an explicit supported-language contract, including variables, stages, external copies and inherited build triggers. Handwritten string checks are insufficient. | Do not choose for this minimal fix. |
+| **A. Refuse shared sealed hotel builds** | Customers build elsewhere / use registry images. Hotel answers 403 `shared_hotel_build_refused` before Docker; broker skips sealed hotels in `ensureBuilds`. | **TAKEN** — smallest sound boundary for Gate S.1. |
+| B. Isolate builder inputs per owner | Preserves Dockerfile builds; larger design. | Deferred. |
+| C. Constrained Dockerfile language | Incomplete without a full language contract. | Rejected for this slice. |
 
-The concrete decision is whether to accept option A's loss of shared sealed
-hotel-side builds, or expand the work to preserve them safely. This plan does
-not silently choose a restriction. There is no proposed flag that permits
-unscoped image access. Any shared/dedicated deployment policy must come from
-trusted hotel configuration, never a customer's label or request header.
+Shipped source:
+
+- `cathedral/sandbox_image_owners.py` — durable grant table by immutable image id.
+- `DockerGuestProvider` authorize-before-start; snapshot grants from room owner;
+  foreign snap/alias/id → 403 `image_not_owned` / 404 `snapshot_not_found`.
+- Broker: skip sealed hotels for builds; forward `X-Cathedral-Guest` on build + prefetch.
+- Sealed room-kit profile sets `CATHEDRAL_IMAGE_OWNERS_PATH` and
+  `CATHEDRAL_SHARED_HOTEL_BUILDS=refuse`.
+- Unit tests: `tests/test_ab650_image_ownership.py`.
+
+A hotel roll of the measured guest is required; broker-only roll is not enough
+for hotel ownership. Keep Draft until Spock live paste.
+
+## Spock live paste checklist (Gate S.1)
+
+Keep AB#604 HOLD until every box below is pasted on the card. Do **not** set
+`CATHEDRAL_SEALED_SNAPSHOTS_ENABLED` or pilot scopes during this paste.
+
+1. **Roll** measured hotel guest that includes this PR (new seal + measurement
+   list entry) onto one staging sealed hotel; confirm `CATHEDRAL_IMAGE_OWNERS_PATH`
+   and `CATHEDRAL_SHARED_HOTEL_BUILDS=refuse` in the hotel API env. Broker binary
+   from the same PR (or main after merge) so sealed hotels are skipped for builds
+   and prefetch/build forward `X-Cathedral-Guest`.
+2. **Positive** (broker native API): two ordinary guests A/B on that hotel —
+   create → exec marker → snapshot → own fork → exec shows each guest's marker.
+   Paste HTTP status lines + hotel id + serving commit/measurement.
+3. **Broker negatives**: A forks B's `snapshot_id` → 404 `snapshot_not_found`.
+   A creates with B's snapshot image name / image id / non-snap alias → 4xx with
+   `snapshot_image_by_name` | `image_reference_refused` | `image_not_owned`.
+   Alias case must be hotel `image_not_owned` (403) once fixture alias exists.
+4. **Hotel HTTP** (operator key + `X-Cathedral-Guest`, not a customer): A cannot
+   start B's image id/alias (`image_not_owned`); B can; A can fork A's snapshot.
+5. **Option A builds**: hotel `POST /v1/images/build` and inline create build →
+   403 `shared_hotel_build_refused`. Broker build against sealed-only placement
+   fails with `shared_hotel_build_refused` in the image poll message.
+6. **Cleanup** every room/snapshot from the evidence TSVs; paste cleanup statuses.
+
+Full curl script: sections 1–5 under **Live proof** below. After this paste,
+AB#604 HOLD may clear for the switch-on checklist (pilot flag still separate).
 
 ## Who can name what today
 

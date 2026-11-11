@@ -87,13 +87,23 @@ func (b *broker) compatBuild(w http.ResponseWriter, r *http.Request, g *guestSta
 
 // ensureBuilds starts a build on each hotel that takes new rooms and has no
 // build state for img yet. A failed hotel is tried again after a minute.
+//
+// AB#650 Option A: shared sealed hotels never build. A Dockerfile can FROM or
+// COPY --from a foreign local snapshot on the hotel's one Docker store. Guests
+// build on unsealed hotels or push a registry image instead.
 func (b *broker) ensureBuilds(img *compatImage, g *guestState) {
 	b.mu.Lock()
 	var hotels []*hotel
+	sawAllowed := false
 	for _, h := range b.hotelList() {
-		if !h.drain() && g.allowsHotel(h) {
-			hotels = append(hotels, h)
+		if h.drain() || !g.allowsHotel(h) {
+			continue
 		}
+		sawAllowed = true
+		if h.labels()["sealed"] == "true" {
+			continue
+		}
+		hotels = append(hotels, h)
 	}
 	b.mu.Unlock()
 	b.compat.mu.Lock()
@@ -104,6 +114,18 @@ func (b *broker) ensureBuilds(img *compatImage, g *guestState) {
 	if img.ctxMissing {
 		return
 	}
+	if len(hotels) == 0 {
+		if sawAllowed {
+			// Every allowed hotel is sealed: stable failure for imageView.
+			entry := &buildHotel{State: "failed", Err: "shared_hotel_build_refused: this shared hotel does not build images"}
+			img.builds["shared_hotel_build_refused"] = entry
+			if img.failedAt == nil {
+				img.failedAt = map[string]time.Time{}
+			}
+			img.failedAt["shared_hotel_build_refused"] = time.Now()
+		}
+		return
+	}
 	for _, h := range hotels {
 		st := img.builds[h.cfg.ID]
 		if st != nil && (st.State != "failed" || time.Since(img.failedAt[h.cfg.ID]) < time.Minute) {
@@ -111,14 +133,14 @@ func (b *broker) ensureBuilds(img *compatImage, g *guestState) {
 		}
 		entry := &buildHotel{State: "building"}
 		img.builds[h.cfg.ID] = entry
-		go b.buildOn(h, img, entry)
+		go b.buildOn(h, img, entry, g)
 	}
 }
 
 // buildOn runs one build on h and records the result in st, the entry it was
 // started for. A newer entry means a newer build replaced this one: its
 // result is stale and is dropped.
-func (b *broker) buildOn(h *hotel, img *compatImage, st *buildHotel) {
+func (b *broker) buildOn(h *hotel, img *compatImage, st *buildHotel, g *guestState) {
 	b.compat.mu.Lock()
 	payload := map[string]any{"dockerfile": img.Dockerfile}
 	if len(img.buildCtx) > 0 {
@@ -126,7 +148,7 @@ func (b *broker) buildOn(h *hotel, img *compatImage, st *buildHotel) {
 	}
 	b.compat.mu.Unlock()
 	body, _ := json.Marshal(payload)
-	status, _, out, err := h.do(context.Background(), "POST", "/v1/images/build", nil, body, 30*time.Minute)
+	status, _, out, err := h.doGuest(context.Background(), g, "POST", "/v1/images/build", nil, body, 30*time.Minute)
 	var doc map[string]any
 	_ = json.Unmarshal(out, &doc)
 	b.compat.mu.Lock()

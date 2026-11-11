@@ -50,8 +50,9 @@ from cathedral.sandbox_api import (
     TarGet,
 )
 from cathedral.sandbox_egress import EgressClient
+from cathedral.sandbox_image_owners import ImageOwnerStore, normalize_image_id, refuse_shared_hotel_build
 from cathedral.sandbox_workspaces import WorkspaceStore
-from cathedral.sandbox_owner import owner_hash
+from cathedral.sandbox_owner import owner_hash, owner_id
 from cathedral.sandbox_provider import (
     InMemorySandboxProvider,
     SandboxOpError,
@@ -1287,6 +1288,7 @@ class DockerGuestProvider:
         self._guests: dict[str, GuestRecord] = {}
         self._snapshot_images: dict[str, str] = {}
         self._snapshot_meta: dict[str, dict[str, Any]] = {}  # snapshot id -> sizes and image
+        self._snapshot_owners: dict[str, str] = {}  # snapshot id -> owner_id (AB#650)
         self._built_images: dict[str, str] = {}  # content_hash -> tag
         self._build_locks: dict[str, threading.Lock] = {}  # tag -> lock; one build per tag
         self._build_locks_guard = threading.Lock()
@@ -1304,6 +1306,9 @@ class DockerGuestProvider:
         self._egress = EgressClient.from_env()
         # Persistent workspaces (#305). None: CATHEDRAL_WORKSPACE_ROOT is unset.
         self._workspaces = WorkspaceStore.from_env(self._client)
+        # Per-guest image ownership (AB#650 Gate S.1). Fail closed when metadata
+        # is missing: a local image with no grant cannot start.
+        self._image_owners = ImageOwnerStore()
         # Customer-sealed secrets (AB#417). None: CATHEDRAL_SEALED_SECRETS_DIR is unset.
         secrets_root = os.environ.get("CATHEDRAL_SEALED_SECRETS_DIR", "").strip()
         self._secrets_root = Path(secrets_root) if secrets_root else None
@@ -1400,6 +1405,86 @@ class DockerGuestProvider:
     def _owner_key(self, owner: str | None) -> str:
         return owner_hash(owner) if owner else ""
 
+    def _image_id_of(self, ref: str) -> str | None:
+        inspected = self._client.image_inspect(ref)
+        return normalize_image_id(str(inspected.get("Id") or ""))
+
+    def _require_snapshot_owner(self, snapshot_ref: str, owner: str) -> None:
+        """Refuse a fork of another guest's snapshot on the same hotel key."""
+        snap_id = self._resolve_snapshot(snapshot_ref)
+        if snap_id is None:
+            # Inner visibility (per api_key) still answers snapshot_not_found.
+            return
+        recorded = self._snapshot_owners.get(snap_id)
+        if recorded is None:
+            # Legacy snapshot with no guest grant: fail closed for a new fork.
+            raise SandboxOpError("snapshot_not_found", 404, f"no snapshot {snapshot_ref}")
+        if recorded != owner:
+            raise SandboxOpError("snapshot_not_found", 404, f"no snapshot {snapshot_ref}")
+
+    def _looks_like_image_id(self, ref: str) -> bool:
+        raw = ref.strip().lower()
+        if normalize_image_id(raw):
+            return True
+        # Bare 64-hex or short docker ids have no registry fallback (AB#650).
+        if len(raw) in (12, 64) and all(c in "0123456789abcdef" for c in raw):
+            return True
+        return False
+
+    def _authorize_image(self, image: str, owner: str, *, registry_auth: Mapping[str, str] | None = None) -> str:
+        """Ensure *owner* may start *image*; pull to earn a registry grant if needed.
+
+        Returns the immutable image id that was authorized. Never falls back to
+        a cached local image when registry authorization fails. Snapshot and
+        build artifacts cannot be earned by renaming them and pulling.
+        """
+        local_id = self._image_id_of(image) if self._client.image_exists(image) else None
+        if local_id and self._image_owners.owns(local_id, owner):
+            # Preserve credential rechecks for private images and pull-policy always.
+            if registry_auth is not None or image in self._auth_pulled or self._pull_policy == "always":
+                self._ensure_image(image, registry_auth=registry_auth, refresh=True)
+            return local_id
+        if self._looks_like_image_id(image):
+            raise SandboxOpError(
+                "image_not_owned",
+                403,
+                "this guest cannot use that image on this hotel",
+            )
+        if local_id is not None:
+            prov = self._image_owners.provenance(local_id)
+            if prov in ("snapshot", "build"):
+                raise SandboxOpError(
+                    "image_not_owned",
+                    403,
+                    "this guest cannot use that image on this hotel",
+                )
+        # Registry authorization: a successful pull under this caller's credentials
+        # (or anonymous access). A cache hit alone is not enough.
+        try:
+            self._ensure_image(image, registry_auth=registry_auth, refresh=True)
+        except SandboxOpError:
+            if local_id is not None:
+                raise SandboxOpError(
+                    "image_not_owned",
+                    403,
+                    "this guest cannot use that image on this hotel",
+                ) from None
+            raise
+        image_id = self._image_id_of(image)
+        if image_id is None:
+            raise SandboxOpError("image_pull_failed", 502, f"image {image} has no docker id after pull")
+        # A pull that still resolves to a snapshot/build id did not authorize it.
+        if self._image_owners.provenance(image_id) in ("snapshot", "build") and not self._image_owners.owns(
+            image_id, owner
+        ):
+            raise SandboxOpError(
+                "image_not_owned",
+                403,
+                "this guest cannot use that image on this hotel",
+            )
+        self._image_owners.grant(image_id, owner, provenance="registry", ref=image)
+        return image_id
+
     def _require_credentials_support(self, credentials) -> None:
         if credentials and self._egress is None:
             raise SandboxOpError(
@@ -1420,7 +1505,11 @@ class DockerGuestProvider:
         The tag is cathedral-build-<hash>:latest, where the hash covers the
         Dockerfile and the context bytes. A second build of the same content
         only checks that the image is present.
+
+        On a shared sealed hotel (Option A / AB#650) this refuses before Docker
+        runs: a Dockerfile can ``FROM`` or ``COPY --from`` a foreign local image.
         """
+        refuse_shared_hotel_build()
         if not dockerfile.strip():
             raise SandboxContractError("invalid_build", "dockerfile must not be empty")
         digest = hashlib.sha256(dockerfile.encode("utf-8") + b"\0" + (context or b"")).hexdigest()
@@ -1456,6 +1545,7 @@ class DockerGuestProvider:
 
     def _build_image(self, request: CreateSandboxRequest) -> str:
         assert request.build is not None
+        refuse_shared_hotel_build()
         content_hash = request.build.content_hash
         cached = self._built_images.get(content_hash)
         if cached and self._client.image_exists(cached):
@@ -1533,18 +1623,27 @@ class DockerGuestProvider:
         owner: str | None = None,
     ) -> dict[str, Any]:
         self._require_credentials_support(request.network.credentials)
+        # Absence of guest identity is its own scope, never a wildcard (AB#650).
+        if owner is None:
+            owner = owner_id(api_key, None)
+        if request.build is not None:
+            refuse_shared_hotel_build()
         if request.snapshot_id is not None:
             # Fail before any record exists. A fork never starts another image.
+            self._require_snapshot_owner(request.snapshot_id, owner)
             self._snapshot_image(request.snapshot_id)
         if request.workspace is not None:
             # Fail before any record exists: 404 for a workspace of another owner.
             if self._workspaces is None:
                 raise SandboxOpError("workspaces_unavailable", 501, "this hotel has no workspaces")
-            if owner is None:
-                raise SandboxOpError("workspace_not_found", 404, f"no workspace {request.workspace.name}")
             self._workspaces.check(owner, request.workspace.name)
+        # Scope Idempotency-Key by owner so two guests on one hotel key cannot
+        # replay each other's successful creates.
+        scoped_idem = None
+        if idempotency is not None:
+            scoped_idem = f"{owner_hash(owner)}:{idempotency}"
         docs = self._inner.create(
-            request, api_key=api_key, idempotency=idempotency, body_digest=body_digest
+            request, api_key=api_key, idempotency=scoped_idem, body_digest=body_digest
         )
         batch = docs["sandboxes"] if "sandboxes" in docs else [docs]
         started: list[dict[str, Any]] = []
@@ -1561,11 +1660,11 @@ class DockerGuestProvider:
             # Idempotency-Key so a retry creates again.
             for doc in batch:
                 self.delete(doc["id"])
-            if idempotency is not None:
+            if scoped_idem is not None:
                 with self._inner._lock:  # noqa: SLF001
-                    seen = self._inner._idempotency.get((api_key, idempotency))  # noqa: SLF001
+                    seen = self._inner._idempotency.get((api_key, scoped_idem))  # noqa: SLF001
                     if seen is not None and seen[1] is docs:
-                        del self._inner._idempotency[(api_key, idempotency)]  # noqa: SLF001
+                        del self._inner._idempotency[(api_key, scoped_idem)]  # noqa: SLF001
             raise
         if "sandboxes" in docs:
             return {"sandboxes": started, "count": len(started)}
@@ -1726,10 +1825,20 @@ class DockerGuestProvider:
             if record is None or record.state in ("deleting", "deleted"):
                 # An Idempotency-Key replay of a sandbox that is gone or going.
                 raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
+        effective_owner = owner if owner is not None else owner_id(None, None)
         image = self._image_for(request)
         if request.snapshot_id is not None:
-            pass  # _image_for returned the committed snapshot image or raised.
+            # Snapshot image must already be granted to the source room's owner.
+            image_id = self._image_id_of(image)
+            if image_id is None:
+                raise SandboxOpError(
+                    "snapshot_image_missing",
+                    409,
+                    f"snapshot {request.snapshot_id} has no committed image on this host",
+                )
+            self._image_owners.require(image_id, effective_owner)
         elif request.image is not None:
+            self._authorize_image(image, effective_owner, registry_auth=request.image.registry_auth)
             inspected = self._ensure_image(image, registry_auth=request.image.registry_auth)
             self._inner._images[image] = {  # noqa: SLF001
                 "ref": image,
@@ -1738,6 +1847,10 @@ class DockerGuestProvider:
                 "digest": (inspected.get("RepoDigests") or [None])[0],
             }
         elif request.build is not None:
+            # Option A refused earlier; when builds are allowed, grant the result.
+            image_id = self._image_id_of(image)
+            if image_id is not None:
+                self._image_owners.grant(image_id, effective_owner, provenance="build", ref=image)
             self._inner._images[image] = {  # noqa: SLF001
                 "ref": image,
                 "cached": True,
@@ -2136,7 +2249,21 @@ class DockerGuestProvider:
             # Drop the record, so no fork can find a snapshot without an image.
             self._inner.delete_snapshot(snap_id)
             raise
+        # Ownership comes from the source room, not the snapshot request labels.
+        snap_owner = guest.owner if guest.owner is not None else owner_id(None, None)
+        image_id = self._image_id_of(image_name)
+        if image_id is None:
+            self._inner.delete_snapshot(snap_id)
+            self._client.run(["docker", "image", "rm", image_name], timeout=60.0)
+            raise SandboxOpError("snapshot_image_missing", 409, f"snapshot {snap_id} has no docker id after commit")
+        try:
+            self._image_owners.grant(image_id, snap_owner, provenance="snapshot", ref=image_name)
+        except SandboxOpError:
+            self._inner.delete_snapshot(snap_id)
+            self._client.run(["docker", "image", "rm", image_name], timeout=60.0)
+            raise
         self._snapshot_images[snap_id] = image_name
+        self._snapshot_owners[snap_id] = snap_owner
         sizes = self._snapshot_sizes(snap_id, image_name, guest.image, int(result.get("size_bytes") or 0))
         self._snapshot_meta[snap_id] = sizes
         with self._inner._lock:  # noqa: SLF001
@@ -2167,33 +2294,60 @@ class DockerGuestProvider:
             "image": image_name,
         }
 
-    def list_snapshots(self, labels: Iterable[str] = ()) -> list[dict[str, Any]]:
+    def list_snapshots(self, labels: Iterable[str] = (), *, owner: str | None = None) -> list[dict[str, Any]]:
         out = self._inner.list_snapshots(labels)
+        filtered = []
         for doc in out:
-            doc.update(self._snapshot_meta.get(doc["snapshot_id"], {}))
-        return out
+            snap_id = doc["snapshot_id"]
+            if owner is not None:
+                recorded = self._snapshot_owners.get(snap_id)
+                if recorded is not None and recorded != owner:
+                    continue
+                if recorded is None:
+                    # Legacy: hide from guest-scoped callers (fail closed).
+                    continue
+            doc = dict(doc)
+            doc.update(self._snapshot_meta.get(snap_id, {}))
+            filtered.append(doc)
+        return filtered
 
-    def delete_snapshot(self, snapshot_id: str) -> bool:
+    def delete_snapshot(self, snapshot_id: str, *, owner: str | None = None) -> bool:
+        snap_id = self._resolve_snapshot(snapshot_id) or snapshot_id
+        if owner is not None:
+            recorded = self._snapshot_owners.get(snap_id)
+            if recorded is None or recorded != owner:
+                return False
         existed = self._inner.delete_snapshot(snapshot_id)
         if not existed:
             # Unknown to the caller, or another key's: the image stays with
             # its record. One whose record expired meanwhile loses its image
             # in the next sweep.
             return False
-        self._snapshot_meta.pop(snapshot_id, None)
-        image = self._snapshot_images.pop(snapshot_id, None)
+        self._snapshot_meta.pop(snap_id, None)
+        self._snapshot_owners.pop(snap_id, None)
+        image = self._snapshot_images.pop(snap_id, None)
         if image:
+            image_id = self._image_id_of(image)
+            if image_id is not None and owner is not None:
+                self._image_owners.drop_owner(image_id, owner)
             self._client.run(["docker", "image", "rm", image], timeout=60.0)
         return existed
 
     def push_snapshot(
-        self, snapshot_id: str, *, image: str, registry_auth: Mapping[str, str] | None = None
+        self,
+        snapshot_id: str,
+        *,
+        image: str,
+        registry_auth: Mapping[str, str] | None = None,
+        owner: str | None = None,
     ) -> dict[str, Any]:
         """Push the committed image of a snapshot to a registry as *image*.
 
         Any host can then start rooms from *image*. The image holds the root
         file system only. /work is a bind mount and is not in the image.
         """
+        if owner is not None:
+            self._require_snapshot_owner(snapshot_id, owner)
         local = self._snapshot_image(snapshot_id)
         snap_id = self._resolve_snapshot(snapshot_id) or snapshot_id
         digest = self._client.push(local, image, registry_auth=registry_auth)
@@ -2556,6 +2710,7 @@ class DockerGuestProvider:
                 self._client.run(["docker", "image", "rm", image], timeout=60.0)
                 self._snapshot_images.pop(sid, None)
                 self._snapshot_meta.pop(sid, None)
+                self._snapshot_owners.pop(sid, None)
 
     def _reconcile_snapshot_images(self) -> None:
         """Remove cathedral-snap-* images no snapshot record names (left by a restart)."""
@@ -2589,10 +2744,13 @@ class DockerGuestProvider:
             network_allowlist_enforced=self._egress is not None,
         )
 
-    def prefetch(self, request: PrefetchRequest) -> str:
+    def prefetch(self, request: PrefetchRequest, *, owner: str | None = None) -> str:
         pulled: list[dict[str, Any]] = []
+        # Prefetch grants only the calling guest (or the empty-guest scope).
+        effective_owner = owner if owner is not None else owner_id(None, None)
         for image in request.images:
-            # Prefetch is the explicit refresh path: it always pulls.
+            # Prefetch is the explicit refresh path: it always pulls, then grants.
+            self._authorize_image(image, effective_owner, registry_auth=request.registry_auth)
             inspected = self._ensure_image(image, registry_auth=request.registry_auth, refresh=True)
             entry = {
                 "ref": image,
