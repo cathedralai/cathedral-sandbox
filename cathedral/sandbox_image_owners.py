@@ -22,6 +22,7 @@ Settings:
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -78,14 +79,36 @@ class ImageOwnerStore:
     """Durable map of image id -> allowed owner hashes.
 
     Writes replace the whole file under an exclusive lock. A failed write fails
-    the calling operation; a missing or corrupt file grants nothing.
+    the calling operation and changes nothing in memory; a missing or corrupt
+    file grants nothing.
+
+    When CATHEDRAL_IMAGE_OWNERS_PATH is set, the store checks at start that it
+    can write in the table's directory and refuses to start when it cannot. A
+    hotel that cannot record ownership would answer 503 to every new image
+    (AB#650 canary, 11 Nov 2026), so it must not come up at all.
     """
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or owners_path()
         self._lock = threading.Lock()
         self._grants: dict[str, dict[str, Any]] = {}
+        if os.environ.get("CATHEDRAL_IMAGE_OWNERS_PATH", "").strip():
+            self._check_writable()
         self._load()
+
+    def _check_writable(self) -> None:
+        """Create and remove a probe file beside the table, the way a flush does."""
+        probe = self.path.with_name(f"{self.path.name}.probe-{os.getpid()}")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            probe.write_text("")
+            probe.unlink()
+        except OSError as exc:
+            raise RuntimeError(
+                f"image owner store is not writable: cannot create a file in {self.path.parent} "
+                f"for CATHEDRAL_IMAGE_OWNERS_PATH={self.path} ({exc.__class__.__name__}: {exc.strerror or exc}); "
+                "the directory must exist and belong to the user the hotel API runs as"
+            ) from exc
 
     def _load(self) -> None:
         try:
@@ -122,11 +145,17 @@ class ImageOwnerStore:
             }
         self._grants = out
 
-    def _flush_locked(self) -> None:
-        payload = {"version": FORMAT_VERSION, "images": self._grants}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def _commit_locked(self, grants: dict[str, dict[str, Any]]) -> None:
+        """Write ``grants`` to disk, then make it the table in memory.
+
+        The caller passes a copy. A failed write raises and leaves the table in
+        memory as it was, so a grant that is not on disk never authorizes a
+        retry and never vanishes at a restart.
+        """
+        payload = {"version": FORMAT_VERSION, "images": grants}
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
             os.replace(tmp, self.path)
         except OSError as exc:
@@ -140,6 +169,7 @@ class ImageOwnerStore:
                 "this hotel could not record image ownership",
                 retry_after=30,
             ) from exc
+        self._grants = grants
 
     @staticmethod
     def _scope(owner: str) -> str:
@@ -184,10 +214,11 @@ class ImageOwnerStore:
             raise SandboxOpError("image_owner_store_failed", 500, "unknown image provenance")
         scope = self._scope(owner)
         with self._lock:
-            entry = self._grants.get(nid)
+            grants = copy.deepcopy(self._grants)
+            entry = grants.get(nid)
             if entry is None:
                 entry = {"owners": [], "provenance": provenance, "refs": []}
-                self._grants[nid] = entry
+                grants[nid] = entry
             if scope not in entry["owners"]:
                 entry["owners"] = sorted([*entry["owners"], scope])
             if ref and ref not in entry["refs"]:
@@ -195,7 +226,7 @@ class ImageOwnerStore:
             # Prefer the stronger local provenance when a snapshot overwrites a pull.
             if provenance == "snapshot" or entry.get("provenance") not in PROVENANCE:
                 entry["provenance"] = provenance
-            self._flush_locked()
+            self._commit_locked(grants)
         return nid
 
     def drop_owner(self, image_id: str, owner: str) -> None:
@@ -204,15 +235,16 @@ class ImageOwnerStore:
             return
         scope = self._scope(owner)
         with self._lock:
-            entry = self._grants.get(nid)
+            grants = copy.deepcopy(self._grants)
+            entry = grants.get(nid)
             if entry is None:
                 return
             owners = [o for o in entry["owners"] if o != scope]
             if not owners:
-                self._grants.pop(nid, None)
+                grants.pop(nid, None)
             else:
                 entry["owners"] = owners
-            self._flush_locked()
+            self._commit_locked(grants)
 
 
 __all__ = [
