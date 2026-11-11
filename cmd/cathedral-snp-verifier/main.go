@@ -20,16 +20,19 @@ func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 
 type verdict struct {
-	Verdict            string                    `json:"verdict"`
-	Code               string                    `json:"code,omitempty"`
-	Detail             string                    `json:"detail,omitempty"`
-	Measurement        string                    `json:"measurement,omitempty"`
-	MeasurementChecked *bool                     `json:"measurement_checked,omitempty"`
-	ReceiptsChecked    *bool                     `json:"receipts_checked,omitempty"`
-	Receipts           *int                      `json:"receipts,omitempty"`
-	Attestation        *snpverify.Result         `json:"attestation,omitempty"`
-	Chain              *snpverify.ReceiptsResult `json:"chain,omitempty"`
-	Checked            string                    `json:"checked,omitempty"`
+	Verdict            string                             `json:"verdict"`
+	Code               string                             `json:"code,omitempty"`
+	Detail             string                             `json:"detail,omitempty"`
+	Measurement        string                             `json:"measurement,omitempty"`
+	MeasurementChecked *bool                              `json:"measurement_checked,omitempty"`
+	ReceiptsChecked    *bool                              `json:"receipts_checked,omitempty"`
+	Receipts           *int                               `json:"receipts,omitempty"`
+	Attestation        *snpverify.Result                  `json:"attestation,omitempty"`
+	Chain              *snpverify.ReceiptsResult          `json:"chain,omitempty"`
+	PolicyTimeline     map[string][]snpverify.PolicyEvent `json:"policy_timeline,omitempty"`
+	RoomTunables       map[string]string                  `json:"room_tunables,omitempty"`
+	RoomLinks          map[string]string                  `json:"room_links,omitempty"`
+	Checked            string                             `json:"checked,omitempty"`
 }
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -130,17 +133,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		wantHead = docHead
 	}
 
-	res, err := snpverify.VerifyAttestation(att, snpverify.Options{
+	all, err := snpverify.VerifyAll(att, receipts, wantHead, snpverify.Options{
 		ExpectedMeasurements: measurements, RequireMeasurement: *requireMeasurement, Product: *product,
 		ARK: ark, ASK: ask, VCEK: vcek, ARKPins: pins,
 	})
 	if err != nil {
 		return failed(err)
 	}
-	chain, err := snpverify.VerifyReceipts(att, receipts, wantHead)
-	if err != nil {
-		return failed(err)
-	}
+	res, chain := all.Attestation, all.Chain
 	checked := "each receipt; not that none are missing"
 	if wantHead != "" {
 		checked = "whole chain to the head the server named"
@@ -148,5 +148,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 	n := chain.Receipts
 	measChecked, recChecked := len(measurements) > 0, len(receipts) > 0
 	return out(verdict{Verdict: "PASS", Measurement: res.Measurement, Receipts: &n, MeasurementChecked: &measChecked, ReceiptsChecked: &recChecked,
-		Attestation: &res, Chain: &chain, Checked: checked}, 0)
+		Attestation: &res, Chain: &chain, PolicyTimeline: all.PolicyTimeline,
+		RoomTunables: all.RoomTunables, RoomLinks: all.RoomLinks, Checked: checked}, 0)
 }

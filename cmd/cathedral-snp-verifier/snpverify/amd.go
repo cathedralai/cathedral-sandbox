@@ -64,6 +64,16 @@ func requireP384(pub *ecdsa.PublicKey, isECDSA bool) error {
 // only Milan and Genoa are handled, because their TCB byte layout is the one used here.
 func product(rep Report, override string) (string, error) {
 	prod := override
+	// An override cannot contradict a product the report itself names.
+	if override != "" && rep.HasCPUID && rep.Family == 0x19 {
+		detected := "Milan"
+		if rep.Model >= 0x10 {
+			detected = "Genoa"
+		}
+		if override != detected {
+			return "", fail(CodeUnsupportedProduct, "product override %q disagrees with the report (%s)", override, detected)
+		}
+	}
 	if prod == "" {
 		switch {
 		case !rep.HasCPUID:

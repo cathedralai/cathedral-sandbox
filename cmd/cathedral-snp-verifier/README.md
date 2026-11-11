@@ -2,7 +2,9 @@
 
 Offline verifier for Cathedral sealed-hotel attestations and receipts on AMD SEV-SNP. Go standard library only. It never touches the network: the caller supplies the AMD certificates.
 
-It is a second implementation of `room-kit/verify_receipts.py` and must stay in step with it. For documents the measured front produces, the canonical bytes are the same as Python's. For other input this checker is stricter and can say FAIL where the Python checker says PASS. It is designed never to say PASS where the Python checker says FAIL; the tests list the known cases.
+It is a second implementation of `room-kit/verify_receipts.py` and must stay in step with it.
+
+The guarantee, and no wider: with the same pins and expected measurement, this checker says PASS only when the Python checker, run with its default options, says PASS. It can say FAIL where Python says PASS; those cases are listed under "Differences from the Python checker" and in the tests.
 
 Scope: binding schema `cathedral_sealed_hotel_binding_v1` only. A level 1 "hotel" binding is refused with `not_sealed`.
 
@@ -20,6 +22,13 @@ Scope: binding schema `cathedral_sealed_hotel_binding_v1` only. A level 1 "hotel
 10. The report signature, ECDSA P-384 SHA-384 over the first 0x2A0 bytes, verifies with a P-384 VCEK key (`report_signature`).
 11. Receipts: each statement names this binding (`receipt_binding_mismatch`), `receipt_sha256` equals sha256 of the canonical statement (`receipt_hash_mismatch`), the Ed25519 signature verifies with the binding's `receipt_key_ed25519_b64` (`receipt_signature`).
 12. Chain: receipt 1 links to the binding and each next receipt links to the one before it when present (`chain_link`). With a head: the chain starts at 1 with no gap (`chain_gap`) and ends at the head (`chain_head`).
+
+13. Guest TLS fields (Python default mode): a binding that names `tls_spki_sha256` must name 64 lower-case hex, a base64 32-byte install key, a non-empty list of base64 32-byte install signers, and `hotel_key_source` `install` (`guest_tls_malformed`). No TLS key means nothing to check.
+14. Network policy: each receipt that carries `network_policy` for a room has `network_policy_sha256` equal to sha256 of the canonical policy (`network_policy_mismatch`).
+15. Tunables: each create receipt that carries `tunables` has `tunables_sha256` equal to sha256 of the canonical tunables (`tunables_mismatch`).
+16. Sandbox link: a create receipt that carries `cathedral_sandbox_id` carries a lower-case UUID (`sandbox_link_malformed`).
+
+Steps 13 to 16 run in the same order as the Python `main()`, after the receipts. `VerifyAll` runs steps 1 to 16 in that order; the CLI uses it.
 
 Malformed input gives `bad_input` or `receipt_malformed`. Every failure returns exactly one code. The PASS verdict says what was not checked: `measurement_checked` is false without `--expected-measurement`, `receipts_checked` is false without receipts.
 
@@ -70,10 +79,13 @@ if errors.As(err, &ve) && ve.Code() == snpverify.CodeMeasurementNotAllowed { /* 
 ## Differences from the Python checker
 
 - Duplicate object keys are refused here; Python keeps the last one.
-- Number literals are kept as written and are not re-floated (only `-0` becomes `0`). A receipt with `1E5` or `1.50` in its statement fails here with `receipt_hash_mismatch` when its hash was made the Python way.
+- Numbers are canonicalised as Python does: an integer literal stays an integer (`-0` becomes `0`), a literal with `.`, `e` or `E` is a float printed with Python's repr (`1E5` is `100000.0`, `1.50` is `1.5`, `1e-5` is `1e-05`). A receipt whose hash was made over a literal-preserving form fails here, as it does in Python.
+- Refused here, where Python would fail or print something else: an integer with more than 4300 digits (Python's limit), a float that overflows (Python prints `Infinity`), nesting deeper than 100 levels (Python's recursion limit), receipt sequences more than 10,000,000 apart (Python runs out of memory).
 - Unpaired UTF-16 surrogate escapes in JSON strings are refused; Python fails on them when it encodes.
 - `kernel_cmdline`, when present, must be a string (Python crashes or treats falsy values as empty).
-- Product: same rule as Python (CPUID family 0x19, model 0x10 or more is Genoa, else Milan; version 3 and later), but certificates are supplied, not fetched. Other products fail with `unsupported_product`.
+- Product: same rule as Python (CPUID family 0x19, model 0x10 or more is Genoa, else Milan; version 3 and later), but certificates are supplied, not fetched. Other products fail with `unsupported_product`. An override (`--product`) is used only when the report does not name the product; one that disagrees with the report fails.
+- Where Python would crash on a missing or mistyped field in the policy, tunables, link or TLS checks (for example a policy that is not an object, or a room id that is a list), this checker fails with the code of that check.
+- The status of a create receipt is read as an integer for the sandbox link; a string status other than ASCII digits fails here.
 - Receipts documents: a list, or an object whose `receipts` is a list; anything else fails. `head`, when present, must be a non-empty string; `filtered`, when present, must be a boolean. Each receipt needs string `receipt_sha256`, `signature_b64`, `binding_sha256`, `previous_receipt_sha256`, `action`, and an integer `sequence` of 1 or more.
 - Receipt headers decode only the base64url alphabet (`A-Z a-z 0-9 - _`) with optional `=` padding and no trimming. Python also takes `+` and `/` and drops other bytes.
 - Report and receipt-signature base64 uses the standard alphabet with padding; Go rejects stray bytes, Python drops them.
@@ -81,8 +93,11 @@ if errors.As(err, &ve) && ve.Code() == snpverify.CodeMeasurementNotAllowed { /* 
 - At least one ARK pin is required; Python makes the pin optional.
 - The receipt schema field is not checked (as in Python).
 - Certificate validity dates and revocation are not checked (as in Python).
-- Hotel-level bindings, owner, TLS and sandbox-link checks are not implemented here.
+
+### Not implemented
+
+Owner and dedicated checks (`--owner-pubkey`), the peer-SPKI and `--require-tls` modes of the TLS check, `--origin` and `--broker` fetching, hotel-level bindings, and the `--cathedral-sandbox` option are not implemented. They are options a Python user must ask for, so their absence cannot turn a Python FAIL into a Go PASS under default options. Python's `--skip-amd` (not a default) is not offered either.
 
 ## Canonical JSON
 
-`Canonical` follows Python `json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()` for the documents the measured front produces. Fixtures are in `snpverify/testdata/` (see its README).
+`Canonical` follows Python `json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()` as Python does, with the refusals listed above. Fixtures are in `snpverify/testdata/` (see its README).

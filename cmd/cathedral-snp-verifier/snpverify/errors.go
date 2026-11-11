@@ -25,6 +25,10 @@ const (
 	CodeReceiptSignature       = "receipt_signature"
 	CodeChainLink              = "chain_link"
 	CodeChainGap               = "chain_gap"
+	CodeNetworkPolicyMismatch  = "network_policy_mismatch"
+	CodeTunablesMismatch       = "tunables_mismatch"
+	CodeSandboxLinkMalformed   = "sandbox_link_malformed"
+	CodeGuestTLSMalformed      = "guest_tls_malformed"
 	CodeChainHead              = "chain_head"
 )
 

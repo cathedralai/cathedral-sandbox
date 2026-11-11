@@ -152,6 +152,8 @@ func sequenceOf(st map[string]any) (int64, bool) {
 	return i, err == nil
 }
 
+const maxSequenceSpan = 10_000_000
+
 // VerifyReceipts mirrors verify_receipts() in verify_receipts.py. head is the
 // hotel's head as the server named it: not signed, so it proves no completeness.
 // Pass "" for "check each receipt only".
@@ -216,6 +218,10 @@ func VerifyReceipts(att Attestation, receipts []Receipt, head string) (ReceiptsR
 		for j := i; j > 0 && seqs[j] < seqs[j-1]; j-- {
 			seqs[j], seqs[j-1] = seqs[j-1], seqs[j]
 		}
+	}
+	// Python builds list(range(first, last+1)) here and runs out of memory on a huge span.
+	if len(seqs) > 0 && seqs[len(seqs)-1]-seqs[0] > maxSequenceSpan {
+		return res, fail(CodeChainGap, "receipt sequences span more than %d", maxSequenceSpan)
 	}
 	contiguous := len(seqs) > 0
 	for i := 1; i < len(seqs); i++ {

@@ -1,10 +1,8 @@
 package snpverify
 
 import (
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
-	"encoding/hex"
 	"strings"
 	"testing"
 )
@@ -215,36 +213,5 @@ func TestReceiptHeaderAlphabet(t *testing.T) {
 			_, err := DecodeReceiptHeader(h)
 			wantCode(t, err, CodeReceiptMalformed)
 		})
-	}
-}
-
-// Python parses 1E5 as the float 100000.0 and prints it that way; this
-// checker keeps the literal, so such a receipt fails here (stricter, by design).
-func TestNumberSpellingsPythonRewrites(t *testing.T) {
-	v, err := ParseKeepingNumbers([]byte(`[1e5,1.50,1E5]`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, _ := Canonical(v)
-	if string(got) != `[1e5,1.50,1E5]` {
-		t.Fatalf("literals changed: %s", got)
-	}
-	att := loadAtt(t, "attestation-proof.json")
-	b := att.BindingSHA256
-	// Python canonical: {"action":"exec",...,"m":1.5,"n":100000.0,...} computed with python3 json.dumps.
-	const pythonHash = "ac88fd58dc1baf908f44697b07e6e67d5f3f550cc21741b7506856b8c72a8e28"
-	doc := `[{"receipt_sha256":"` + pythonHash + `","signature_b64":"AA==","statement":{"action":"exec","binding_sha256":"` + b +
-		`","m":1.50,"n":1E5,"previous_receipt_sha256":"` + b + `","sequence":1}}]`
-	rcs, _, err := ParseReceipts([]byte(doc))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = VerifyReceipts(att, rcs, "")
-	wantCode(t, err, CodeReceiptHashMismatch)
-	// Sanity: the stored hash really is sha256 of the Python bytes.
-	py := `{"action":"exec","binding_sha256":"` + b + `","m":1.5,"n":100000.0,"previous_receipt_sha256":"` + b + `","sequence":1}`
-	sum := sha256.Sum256([]byte(py))
-	if hex.EncodeToString(sum[:]) != pythonHash {
-		t.Fatal("python hash literal does not match the python bytes")
 	}
 }

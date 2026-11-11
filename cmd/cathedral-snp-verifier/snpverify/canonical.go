@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -23,7 +25,7 @@ func ParseKeepingNumbers(data []byte) (any, error) {
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
-	v, err := parseValue(dec)
+	v, err := parseValue(dec, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -33,13 +35,25 @@ func ParseKeepingNumbers(data []byte) (any, error) {
 	return v, nil
 }
 
-func parseValue(dec *json.Decoder) (any, error) {
+// maxDepth is far below Python's recursion limit, so a document this parser
+// accepts cannot make json.loads or json.dumps fail there.
+const maxDepth = 100
+
+func parseValue(dec *json.Decoder, depth int) (any, error) {
+	if depth > maxDepth {
+		return nil, errors.New("JSON nesting is too deep")
+	}
 	tok, err := dec.Token()
 	if err != nil {
 		return nil, err
 	}
 	d, isDelim := tok.(json.Delim)
 	if !isDelim {
+		if n, ok := tok.(json.Number); ok {
+			if _, err := pythonNumber(n); err != nil {
+				return nil, err
+			}
+		}
 		return tok, nil // string, json.Number, bool, nil
 	}
 	switch d {
@@ -57,7 +71,7 @@ func parseValue(dec *json.Decoder) (any, error) {
 			if _, dup := obj[key]; dup {
 				return nil, fmt.Errorf("duplicate object key %q", key)
 			}
-			val, err := parseValue(dec)
+			val, err := parseValue(dec, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -70,7 +84,7 @@ func parseValue(dec *json.Decoder) (any, error) {
 	case '[':
 		arr := []any{}
 		for dec.More() {
-			val, err := parseValue(dec)
+			val, err := parseValue(dec, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -105,15 +119,11 @@ func writeCanonical(buf *bytes.Buffer, v any) error {
 			buf.WriteString("false")
 		}
 	case json.Number:
-		if t == "" {
-			return errors.New("empty number")
+		out, err := pythonNumber(t)
+		if err != nil {
+			return err
 		}
-		if t == "-0" {
-			// Python parses -0 as the int 0 and prints "0".
-			buf.WriteString("0")
-			return nil
-		}
-		buf.WriteString(string(t))
+		buf.WriteString(out)
 	case string:
 		return writeString(buf, t)
 	case []any:
@@ -247,4 +257,50 @@ func checkSurrogates(data []byte) error {
 		}
 	}
 	return nil
+}
+
+// maxIntDigits is Python's default int string conversion limit: json.loads
+// fails on an integer literal with more digits.
+const maxIntDigits = 4300
+
+// pythonNumber returns what json.dumps(json.loads(literal)) prints. An integer
+// literal stays an integer (-0 becomes 0). A literal with ".", "e" or "E" is a
+// float, printed with Python's repr. Overflow to infinity is refused here;
+// Python would print Infinity, so this is stricter.
+func pythonNumber(n json.Number) (string, error) {
+	lit := string(n)
+	if lit == "" {
+		return "", errors.New("empty number")
+	}
+	if !strings.ContainsAny(lit, ".eE") {
+		digits := strings.TrimPrefix(lit, "-")
+		if len(digits) > maxIntDigits {
+			return "", fmt.Errorf("integer literal has %d digits, more than %d", len(digits), maxIntDigits)
+		}
+		if lit == "-0" {
+			return "0", nil
+		}
+		return lit, nil
+	}
+	f, err := strconv.ParseFloat(lit, 64)
+	if err != nil {
+		return "", fmt.Errorf("number %q does not fit a float: %v", lit, err)
+	}
+	return pythonFloatRepr(f), nil
+}
+
+// pythonFloatRepr follows repr(float): shortest round-trip digits; scientific
+// form when the decimal exponent is below -4 or at least 16, with at least two
+// exponent digits; otherwise fixed form with ".0" when there is no fraction.
+func pythonFloatRepr(f float64) string {
+	sci := strconv.FormatFloat(f, 'e', -1, 64)
+	exp, _ := strconv.Atoi(sci[strings.IndexByte(sci, 'e')+1:])
+	if exp < -4 || exp >= 16 {
+		return sci
+	}
+	fixed := strconv.FormatFloat(f, 'f', -1, 64)
+	if !strings.Contains(fixed, ".") {
+		fixed += ".0"
+	}
+	return fixed
 }

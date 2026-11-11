@@ -15,11 +15,17 @@
 // (DER) and the ARK pins.
 //
 // ParseAttestation, ParseReport, ParseReceipts, DecodeReceiptHeader,
-// VerifyAttestation, VerifyAMDChain and VerifyReceipts return a *VerifyError
+// VerifyAttestation, VerifyAMDChain, VerifyReceipts and VerifyAll return a *VerifyError
 // with one stable Code on failure. ParseKeepingNumbers and Canonical return
 // plain errors.
 //
-// For documents the measured front produces, Canonical gives the same bytes as
-// Python. For other input this package is stricter and can fail where the Python
-// checker passes; it is designed never to pass where the Python checker fails.
+// The guarantee, and no wider: with the same pins and expected measurement,
+// VerifyAll says PASS only when verify_receipts.py, run with its default
+// options, says PASS. It can fail where Python passes (duplicate keys, huge
+// numbers, deep nesting and the other cases in the README). Canonical formats
+// numbers as Python's json.dumps does after json.loads.
+//
+// VerifyAll runs the attestation, the guest TLS fields, the receipts, and the
+// network policy, tunables and sandbox link checks, in the order of the Python
+// main(). Use it rather than the parts.
 package snpverify
