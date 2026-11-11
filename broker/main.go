@@ -2038,7 +2038,7 @@ func (b *broker) snapshot(g *guestState) map[string]any {
 			"id": h.cfg.ID, "name": h.cfg.Name, "threads": h.cfg.Threads, "ram_gib": h.cfg.RAMGiB, "slots": h.slots, "ok": h.ok, "drain": h.drain(), "sealed": h.cfg.Sealed,
 			"grid": string(grid), "cpu": h.cpuPct, "mem_pct": h.memPct, "mem_gib": h.memGiB, "load1": h.load1,
 			"containers": h.containers,
-			"queued": h.queued, "creating": h.creating,
+			"queued":     h.queued, "creating": h.creating,
 			"seen_age_s": seenAge(h.lastOK, now), "down_since": downSince(h), "health_late": h.healthLate, "health_ms": h.healthMs, "list_ok": h.listOK, "caps": h.caps,
 			"mine": map[string]int{"running": mine[stRunning], "creating": mine[stCreating], "deleting": mine[stDeleting], "failed": mine[stFailed]},
 		}
