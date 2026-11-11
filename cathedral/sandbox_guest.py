@@ -1619,18 +1619,26 @@ class DockerGuestProvider:
 
     def _ensure_image(
         self, image: str, *, registry_auth: Mapping[str, str] | None = None, refresh: bool = False
-    ) -> None:
+    ) -> dict[str, Any]:
+        """Make *image* present and return its inspect document ({} when none)."""
         if registry_auth is not None or image in self._auth_pulled or self._pull_policy == "always":
             refresh = True
-        self._client.ensure_image(
-            image,
-            registry_auth=registry_auth,
-            refresh=refresh,
-            mirror=self._registry_mirror,
-        )
-        if registry_auth is not None:
-            self._auth_pulled.add(image)
-            _save_auth_pulled(self._auth_pulled)
+        # One inspect answers both "is it here" and "what is it" on a cache hit.
+        inspected = {} if refresh else self._client.image_inspect(image)
+        if not inspected.get("Id"):
+            self._client.ensure_image(
+                image,
+                registry_auth=registry_auth,
+                refresh=refresh,
+                mirror=self._registry_mirror,
+            )
+            # Record the marker right after the pull and before any inspect, so a
+            # failed inspect after a pull still leaves it set.
+            if registry_auth is not None:
+                self._auth_pulled.add(image)
+                _save_auth_pulled(self._auth_pulled)
+            inspected = self._client.image_inspect(image)
+        return inspected
 
     def _start_guest(
         self, doc: dict[str, Any], request: CreateSandboxRequest, owner: str | None = None
@@ -1715,8 +1723,7 @@ class DockerGuestProvider:
         if request.snapshot_id is not None:
             pass  # _image_for returned the committed snapshot image or raised.
         elif request.image is not None:
-            self._ensure_image(image, registry_auth=request.image.registry_auth)
-            inspected = self._client.image_inspect(image)
+            inspected = self._ensure_image(image, registry_auth=request.image.registry_auth)
             self._inner._images[image] = {  # noqa: SLF001
                 "ref": image,
                 "cached": True,
