@@ -63,14 +63,18 @@ Design, threat model, upgrade path and the proof on an SNP host:
 
 - Boot states (health `workspaces_storage`, the serial log `[sealed-data]`):
   `new`, `open`, `locked` (a volume this build cannot open), `tampered` (the
-  header is not our layout, or a file system with no cathedral token), `broken`,
+  header is not our layout), `broken` (including an existing volume with no `fs: xfs` token),
   `absent`, `nokey`, `error`. In every state but `new` and `open`, this boot
   keeps workspaces on the scratch disk.
 - After open, the guest verifies the LUKS2 header (cipher, sector size, key
   slot) and refuses a null-cipher edit; it needs cryptsetup 2.8.1 or newer.
 - The guest formats only a blank disk (every byte zero, read whole at the
   first boot); any other non-LUKS content, such as damaged LUKS2 signatures or
-  a zeroed header over a payload, is `broken` and left untouched. To start empty, stop the guest and remove `$SEALED_DIR/data.raw`.
+  a zeroed header over a payload, is `broken` and left untouched. mkfs runs only in the
+  same boot that proved the disk blank, ran luksFormat and opened the new volume; an
+  existing volume with no `fs: xfs` token is `broken`, whatever `blkid` says. If a
+  first boot stopped before the token was written, the next boot is `broken`: the
+  operator removes `$SEALED_DIR/data.raw` and boots again. To start empty, stop the guest and remove `$SEALED_DIR/data.raw`.
 - A roll to a new launch identity: `install.sh --sealed` stops unless a one-line
   choice is in `$SEALED_DIR/data-on-new-build`: `reset` (the old volume becomes
   `data.raw.prev`, restored on any failure until the measurement checks; refuses

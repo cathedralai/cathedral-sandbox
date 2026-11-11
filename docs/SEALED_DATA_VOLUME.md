@@ -124,8 +124,8 @@ log, status file or receipt holds it.
 | `new` | A blank disk (every byte zero): formatted now | Data volume |
 | `open` | Opened with this build's key, header verified | Data volume |
 | `locked` | A LUKS2 volume no key slot of which opens with this key (another build, chip or HOST_DATA). Left untouched | Scratch (gone at next boot) |
-| `tampered` | The header is not our layout (null cipher, wrong sector, extra segment), or the device holds a file system with no cathedral token. Closed, left untouched | Scratch |
-| `broken` | The disk holds data that is not a LUKS2 volume (not all zero, for example damaged LUKS2 signatures or a zeroed header over a payload), a disk that could not be read to its end, a LUKS header cryptsetup cannot read, or xfs does not mount. Left untouched | Scratch |
+| `tampered` | The header is not our layout (null cipher, wrong sector, extra segment). Closed, left untouched | Scratch |
+| `broken` | The disk holds data that is not a LUKS2 volume (not all zero, for example damaged LUKS2 signatures or a zeroed header over a payload), a disk that could not be read to its end, a LUKS header cryptsetup cannot read, an existing volume whose token does not say `fs: xfs` (closed, never formatted, whatever `blkid` says), or xfs does not mount. Left untouched | Scratch |
 | `absent` | No data disk attached | Scratch |
 | `nokey` | The secure processor gave no key | Scratch |
 | `error` | A step failed, or cryptsetup is older than 2.8.1 (serial log); the boot goes on | Scratch |
@@ -139,9 +139,15 @@ Rules:
   example damaged LUKS2 signatures, or a zeroed header over a payload), and a
   disk that cannot be read to its end, is `broken` and left untouched. A disk
   with data stops the read at its first nonzero byte; only a blank disk is
-  read whole, once, at its first boot. It runs mkfs only when the volume's
-  token does not yet say `fs: xfs` (a first boot that stopped between
-  luksFormat and mkfs).
+  read whole, once, at its first boot. It runs mkfs only in the same boot that
+  proved the disk blank, ran luksFormat and opened the new volume. A volume
+  from an earlier boot whose token does not say `fs: xfs` is `broken`: it is
+  closed and nothing is written, because the token sits in the host-held LUKS
+  header and a lost token must not turn into a format of customer data.
+- Recovery after a first boot that stopped between luksFormat and the token
+  (power loss, mkfs failure): the next boot reports `broken`. Such a volume never
+  served a room, so an operator stops the guest, removes `data.raw` and boots
+  again. A person decides; the guest never does.
 - A locked or broken volume does not stop the hotel. Rooms without a
   workspace work; a create that names an old workspace answers 404
   `workspace_not_found`.

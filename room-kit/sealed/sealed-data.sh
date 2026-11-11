@@ -179,6 +179,7 @@ except OSError:
 }
 
 STATE=open
+CREATED_HERE=0  # 1 only in the boot that proved the disk blank, ran luksFormat and opened the new volume
 if [ ! -e "$MAP" ]; then
   if ! cryptsetup isLuks "$DEV" && luks_magic; then
     status broken "the data disk has a LUKS header that cryptsetup cannot read; left untouched"
@@ -212,6 +213,7 @@ if [ ! -e "$MAP" ]; then
       --key-file "$KEYFILE" --keyfile-size 32 "$DEV"
     cryptsetup open --type luks2 --key-file "$KEYFILE" --keyfile-size 32 "$DEV" "$NAME"
     STATE=new
+    CREATED_HERE=1
   fi
 fi
 
@@ -221,14 +223,14 @@ if [ -e "$MAP" ] && ! verify_header; then
   close_untouched tampered "the opened volume is not our $ENC / ${SECTOR}-byte / 512-bit layout; the LUKS2 header was changed on the host (null-cipher attack?); closed, left untouched"
 fi
 
-# mkfs only before the token says the file system exists: a first boot that
-# stopped between luksFormat and mkfs. An opened volume with the token is never
-# formatted again, whatever blkid says.
+# mkfs runs only in the boot that created this volume (CREATED_HERE). A volume
+# from an earlier boot with no xfs token is never formatted, whatever blkid says:
+# the token lives in the host-held LUKS header, so a lost token plus a damaged
+# xfs signature would otherwise send customer workspaces to mkfs. Recovery is a
+# person: a volume that never served a room is removed (data.raw) and rebooted.
 if [ "$(fs_token)" != xfs ]; then
-  # No cathedral token, yet a file system is already here: tamper, or a format
-  # interrupted between mkfs and the token import. Never format over it.
-  if blkid -p -u filesystem "$MAP" >/dev/null 2>&1; then
-    close_untouched tampered "the opened volume carries a file system but no cathedral token; not formatting (tamper, or an interrupted first format: remove data.raw to start fresh)"
+  if [ "$CREATED_HERE" != 1 ]; then
+    close_untouched broken "an existing volume has no file system token; not formatting (if it never served a room, remove data.raw to start fresh; see docs/SEALED_DATA_VOLUME.md)"
   fi
   mkfs.xfs -f -q "$MAP"
   python3 -c 'import json,sys

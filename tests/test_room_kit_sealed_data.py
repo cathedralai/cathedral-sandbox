@@ -356,14 +356,54 @@ def test_no_data_disk_and_no_key_fall_back_without_formatting(disk) -> None:
     assert not disk.calls("cryptsetup luksFormat") and not disk.calls("cryptsetup open") and not disk.calls("mkfs.xfs")
 
 
-def test_a_first_boot_that_stopped_before_mkfs_formats_the_file_system_once(disk) -> None:
+def test_a_second_boot_with_no_token_is_broken_and_never_formats(disk) -> None:
+    # A first boot that stopped between luksFormat and the token import no longer repairs itself: only
+    # the boot that proved the disk blank may run mkfs. A person removes data.raw (see the recovery step).
     disk.boot()
     (disk.state / "token").unlink()  # luksFormat done, mkfs and the token not
+    before = disk.dev.read_bytes()
     proc, status = disk.boot()
-    assert proc.returncode == 0 and status["state"] == "new"
-    assert not disk.calls("cryptsetup luksFormat") and len(disk.calls("mkfs.xfs")) == 1
+    assert proc.returncode == 0 and status["state"] == "broken" and status["persistent"] is False
+    assert not disk.calls("cryptsetup luksFormat") and not disk.calls("mkfs.xfs") and not disk.calls("mount")
+    assert disk.calls("cryptsetup close")
+    assert disk.dev.read_bytes() == before
+
+
+def test_an_existing_volume_with_no_token_and_no_blkid_hit_is_never_formatted(disk) -> None:
+    # AB#598 reviewer regression: a lost token plus a damaged xfs signature (blkid sees nothing).
+    disk.boot()
+    (disk.state / "token").unlink()
+    assert not (disk.state / "planted-fs").exists()  # the fake blkid fails: "no file system here"
+    before = disk.dev.read_bytes()
     proc, status = disk.boot()
-    assert status["state"] == "open" and not disk.calls("mkfs.xfs")
+    assert proc.returncode == 0 and status["state"] == "broken"
+    assert not disk.calls("mkfs.xfs") and not disk.calls("mount") and not disk.calls("cryptsetup token import")
+    assert disk.dev.read_bytes() == before
+
+
+@pytest.mark.parametrize("token", [
+    {"type": "other-type", "fs": "xfs"},
+    {"type": "cathedral-sealed-data", "fs": "ext4"},
+    {"type": "cathedral-sealed-data"},
+], ids=["wrong-type", "fs-not-xfs", "no-fs-field"])
+def test_an_existing_volume_whose_token_is_not_the_xfs_token_is_never_formatted(disk, token) -> None:
+    disk.boot()
+    (disk.state / "token").write_text(json.dumps(token))
+    before = disk.dev.read_bytes()
+    proc, status = disk.boot()
+    assert proc.returncode == 0 and status["state"] == "broken"
+    assert not disk.calls("mkfs.xfs") and not disk.calls("mount")
+    assert disk.dev.read_bytes() == before
+
+
+def test_a_first_boot_whose_mkfs_failed_does_not_format_on_the_next_boot(disk) -> None:
+    (disk.state / "mkfs-fails").touch()
+    proc, status = disk.boot()
+    assert status["state"] == "error" and len(disk.calls("mkfs.xfs")) == 1
+    (disk.state / "mkfs-fails").unlink()
+    proc, status = disk.boot()
+    assert proc.returncode == 0 and status["state"] == "broken"
+    assert not disk.calls("mkfs.xfs") and not disk.calls("mount")
 
 
 def test_a_luks_header_cryptsetup_cannot_read_is_never_formatted(disk) -> None:
@@ -576,7 +616,7 @@ def test_a_volume_with_a_file_system_but_no_token_is_not_formatted(disk) -> None
     (disk.state / "token").unlink()      # the token is gone
     (disk.state / "planted-fs").touch()  # but a file system is present
     proc, status = disk.boot()
-    assert proc.returncode == 0 and status["state"] == "tampered"
+    assert proc.returncode == 0 and status["state"] == "broken"
     assert not disk.calls("mkfs.xfs")
 
 
