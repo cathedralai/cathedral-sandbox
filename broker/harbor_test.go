@@ -119,6 +119,54 @@ func TestExecTimeoutOfFourHoursPassesToTheHotel(t *testing.T) {
 	}
 }
 
+func TestSpillTokenReachesTheHotelOnNativeAndCompat(t *testing.T) {
+	tc := newChain(t)
+	token := "0123456789abcdef0123456789abcdef"
+	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+id+"/exec", map[string]any{
+		"cmd": []string{"true"}, "spill_token": token,
+	})
+	if status != 200 {
+		t.Fatalf("native exec: %d %v", status, doc)
+	}
+	if got := latestSpill(tc); got != token {
+		t.Fatalf("native hotel spill_token %q", got)
+	}
+
+	status, doc = tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4"}), nil)
+	if status != 201 && status != 202 {
+		t.Fatalf("compat create: %d %v", status, doc)
+	}
+	uuid, _ := doc["id"].(string)
+	status, doc = tc.clientCall(t, "POST", "/v1/sandboxes/"+uuid+"/exec", mustMarshal(map[string]any{
+		"cmd": []string{"true"}, "spill_token": "not-a-token",
+	}), nil)
+	if status != 400 {
+		t.Fatalf("bad spill token: %d %v", status, doc)
+	}
+	status, doc = tc.clientCall(t, "POST", "/v1/sandboxes/"+uuid+"/exec", mustMarshal(map[string]any{
+		"cmd": []string{"true"}, "spill_token": token,
+	}), nil)
+	if status != 200 {
+		t.Fatalf("compat exec: %d %v", status, doc)
+	}
+	if got := latestSpill(tc); got != token {
+		t.Fatalf("compat hotel spill_token %q", got)
+	}
+}
+
+func latestSpill(tc *testChain) string {
+	var token string
+	for _, f := range tc.hotels {
+		for _, ex := range f.execs {
+			if s, ok := ex["spill_token"].(string); ok {
+				token = s
+			}
+		}
+	}
+	return token
+}
+
 func buildForm(t *testing.T, dockerfile string, ctx []byte) ([]byte, string) {
 	t.Helper()
 	var buf bytes.Buffer
@@ -153,30 +201,40 @@ func TestBuildThroughTheBrokerAndCreateOnlyWhereBuilt(t *testing.T) {
 	if status != 200 || doc["image_id"] == nil {
 		t.Fatalf("build: %d %v", status, doc)
 	}
+	// AB#650 Option A: sealed hotel a is skipped. With b draining and c failing,
+	// the build cannot become ready until an unsealed hotel can build.
 	view := waitImage(t, tc, doc["image_id"].(string))
-	if view["state"] != "ready" || view["image"] != "cathedral-build-0123456789abcdef:latest" {
-		t.Fatalf("view: %v", view)
+	if view["state"] == "ready" {
+		t.Fatalf("build ready with only sealed/draining/failed hotels: %v", view)
 	}
-	got := tc.hotels["a"].builds[0]
-	if got["dockerfile"] != "FROM alpine:3.20\n" || got["context_tar_b64"] != "Z3ppcC1ieXRlcw==" {
-		t.Fatalf("hotel build body: %v", got)
+	if len(tc.hotels["a"].builds) != 0 {
+		t.Fatalf("sealed hotel a must not build under Option A: %v", tc.hotels["a"].builds)
 	}
 	if len(tc.hotels["b"].builds) != 0 {
 		t.Fatalf("draining hotel built")
 	}
 	tc.b.hotelByID("b").cfg.Drain = false
+	_, _ = tc.clientCall(t, "GET", "/v1/images/"+doc["image_id"].(string), nil, nil)
+	view = waitImage(t, tc, doc["image_id"].(string))
+	if view["state"] != "ready" || view["image"] != "cathedral-build-0123456789abcdef:latest" {
+		t.Fatalf("view after unsealing b: %v", view)
+	}
+	got := tc.hotels["b"].builds[0]
+	if got["dockerfile"] != "FROM alpine:3.20\n" || got["context_tar_b64"] != "Z3ppcC1ieXRlcw==" {
+		t.Fatalf("hotel build body: %v", got)
+	}
 	before := createsOn(tc)
 	for i := 0; i < 4; i++ {
-		status, doc = tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": view["image_id"]}), nil)
+		status, doc = tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": view["image_id"], "sealed": false}), nil)
 		if status != 201 {
 			t.Fatalf("create: %d %v", status, doc)
 		}
 	}
 	after := createsOn(tc)
-	if after["a"]-before["a"] != 4 {
+	if after["b"]-before["b"] != 4 {
 		t.Fatalf("creates went to hotels without the image: %v -> %v", before, after)
 	}
-	last := tc.hotels["a"].creates[len(tc.hotels["a"].creates)-1]
+	last := tc.hotels["b"].creates[len(tc.hotels["b"].creates)-1]
 	if res := last["resources"].(map[string]any); res["vcpu"].(float64) != 2 || last["image"] != "cathedral-build-0123456789abcdef:latest" {
 		t.Fatalf("create body: %v", last)
 	}

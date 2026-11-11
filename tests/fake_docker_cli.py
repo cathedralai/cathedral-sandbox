@@ -84,15 +84,31 @@ def main(argv):
         ref = argv[-1]
         with Locked() as st:
             present = ref in st["images"]
+            # Distinct immutable ids per ref so ownership tests can prove an
+            # ID-based boundary (AB#650). Operators may override via behaviour.
+            ids = b.get("image_ids") or {}
+            image_id = ids.get(ref)
+            if not image_id:
+                import hashlib
+                image_id = "sha256:" + hashlib.sha256(ref.encode()).hexdigest()
+            aliases = b.get("image_aliases") or {}
+            # Aliases resolve to another ref's id (retag / secondary name).
+            if ref in aliases and aliases[ref] in (ids or {}):
+                image_id = ids[aliases[ref]]
+            elif ref in aliases:
+                image_id = "sha256:" + hashlib.sha256(aliases[ref].encode()).hexdigest()
         if not present:
             print(f"Error: No such image: {ref}", file=sys.stderr)
             return 1
         fmt = argv[argv.index("--format") + 1]
         if fmt == "{{.Id}}":
-            print("sha256:" + "ab" * 32)
+            print(image_id)
         else:
             size = b.get("image_sizes", {}).get(ref, 1234)
-            print(json.dumps({"Id": "sha256:" + "ab" * 32, "Size": size, "RepoDigests": [ref + "@sha256:" + "cd" * 32]}))
+            digests = b.get("image_digests", {}).get(ref)
+            if digests is None:
+                digests = [ref + "@sha256:" + "cd" * 32]
+            print(json.dumps({"Id": image_id, "Size": size, "RepoDigests": digests}))
         return 0
 
     if cmd == "image" and argv[1] == "rm":
@@ -152,7 +168,12 @@ def main(argv):
             if argv[1] not in st["images"]:
                 print(f"Error: No such image: {argv[1]}", file=sys.stderr)
                 return 1
-            st["images"].append(argv[2])
+            if argv[2] not in st["images"]:
+                st["images"].append(argv[2])
+            st.setdefault("behaviour", {}).setdefault("image_aliases", {})[argv[2]] = argv[1]
+            ids = st["behaviour"].setdefault("image_ids", {})
+            if argv[1] in ids:
+                ids[argv[2]] = ids[argv[1]]
         return 0
 
     if cmd == "network" and argv[1] == "create":
@@ -435,9 +456,19 @@ class FakeDocker:
         state["behaviour"].update(behaviour)
         self._save(state)
 
-    def add_image(self, ref: str) -> None:
+    def add_image(self, ref: str, *, image_id: str | None = None, alias_of: str | None = None) -> None:
         state = self._load()
-        state["images"].append(ref)
+        if ref not in state["images"]:
+            state["images"].append(ref)
+        if image_id:
+            state.setdefault("behaviour", {}).setdefault("image_ids", {})[ref] = image_id
+        if alias_of:
+            state.setdefault("behaviour", {}).setdefault("image_aliases", {})[ref] = alias_of
+        self._save(state)
+
+    def set_image_id(self, ref: str, image_id: str) -> None:
+        state = self._load()
+        state.setdefault("behaviour", {}).setdefault("image_ids", {})[ref] = image_id
         self._save(state)
 
     def add_container(self, cid: str, *, name: str, labels: dict[str, str]) -> None:
@@ -512,6 +543,11 @@ def install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeDocker:
         "CATHEDRAL_WORKSPACE_MAX_VERSIONS",
         "CATHEDRAL_WORKSPACE_HELPER_IMAGE",
         "CATHEDRAL_WORKSPACE_MOUNT_CHECK",
+        "CATHEDRAL_IMAGE_OWNERS_PATH",
+        "CATHEDRAL_SHARED_HOTEL_BUILDS",
     ):
         monkeypatch.delenv(name, raising=False)
+    # AB#650 ownership store: isolated per test under tmp_path.
+    monkeypatch.setenv("CATHEDRAL_IMAGE_OWNERS_PATH", str(tmp_path / "image-owners.json"))
+    monkeypatch.setenv("CATHEDRAL_SHARED_HOTEL_BUILDS", "allow")
     return FakeDocker(state_path)

@@ -263,6 +263,10 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 		compatErr(w, 400, "invalid_image", "image is required", 0)
 		return
 	}
+	if e := localImageRefusal(req.Image); e != nil {
+		compatErr(w, e.status, e.code, e.msg, 0)
+		return
+	}
 	num := func(k string, d float64) float64 {
 		if v, ok := req.Resources[k].(float64); ok && v > 0 {
 			return v
@@ -336,6 +340,12 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	if json.Unmarshal(raw, &req) != nil {
 		compatErr(w, 400, "invalid_json", "request body is not JSON", 0)
 		return
+	}
+	if ref, _ := req["image"].(string); ref != "" {
+		if e := localImageRefusal(ref); e != nil {
+			compatErr(w, e.status, e.code, e.msg, 0)
+			return
+		}
 	}
 	if e := applyCatalogTemplate(req); e != nil {
 		compatErr(w, e.status, e.code, e.msg, 0)
@@ -785,6 +795,19 @@ func (b *broker) flushCompat(w http.ResponseWriter, c *capture, rm *room) {
 }
 
 // compatExecBody translates a client exec body to a hotel exec body.
+func spillToken(v any) (string, bool) {
+	s, ok := v.(string)
+	if !ok || len(s) != 32 {
+		return "", false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", false
+		}
+	}
+	return s, true
+}
+
 func compatExecBody(raw []byte, maxExec int) (map[string]any, int, error) {
 	var req map[string]any
 	if json.Unmarshal(raw, &req) != nil {
@@ -814,6 +837,13 @@ func compatExecBody(raw []byte, maxExec int) (map[string]any, int, error) {
 		if v, ok := req[k]; ok && v != nil {
 			body[k] = v
 		}
+	}
+	if v, ok := req["spill_token"]; ok && v != nil {
+		token, good := spillToken(v)
+		if !good {
+			return nil, 0, fmt.Errorf("spill_token must be 32 lowercase hex characters")
+		}
+		body["spill_token"] = token
 	}
 	timeout := maxExec
 	if v, ok := req["timeout_seconds"].(float64); ok && v > 0 {

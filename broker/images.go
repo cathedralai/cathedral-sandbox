@@ -234,6 +234,53 @@ type apiErr struct {
 
 func (e *apiErr) Error() string { return e.code + ": " + e.msg }
 
+// localImageRefusal refuses an image reference a guest sends that names a
+// hotel-local artifact instead of a registry image. A hotel keeps every
+// guest's snapshot images (cathedral-snap-<id>) in its one Docker image
+// store, and a create resolves a local image before it pulls, so naming a
+// snapshot image would start that snapshot whoever made it. Snapshots are
+// scoped to their guest on snapshot_id (findSnapshot): a fork goes there, and
+// a snapshot meant for other hotels is pushed to a registry first. An image
+// id (sha256:..., or a bare hex id) can name any local image the same way.
+func localImageRefusal(ref string) *apiErr {
+	r := strings.ToLower(strings.TrimSpace(ref))
+	if strings.HasPrefix(r, "sha256:") || isImageID(r) {
+		return &apiErr{422, "image_reference_refused", "name an image by repository and tag, not by image id"}
+	}
+	if strings.HasPrefix(imageRepoName(r), "cathedral-snap-") {
+		return &apiErr{422, "snapshot_image_by_name", "start from a snapshot with snapshot_id; a snapshot image cannot be named in image"}
+	}
+	return nil
+}
+
+// imageRepoName is the last path part of an image reference without its
+// registry, tag or digest: "docker.io/library/x:1@sha256:..." is "x".
+func imageRepoName(ref string) string {
+	if i := strings.Index(ref, "@"); i >= 0 {
+		ref = ref[:i]
+	}
+	name := ref
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	if i := strings.Index(name, ":"); i >= 0 {
+		name = name[:i]
+	}
+	return name
+}
+
+func isImageID(ref string) bool {
+	if len(ref) < 12 || len(ref) > 64 {
+		return false
+	}
+	for _, c := range ref {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func stringMap(v any, field string) (map[string]string, *apiErr) {
 	if v == nil {
 		return nil, nil
@@ -724,9 +771,18 @@ func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guest
 }
 
 // prefetchOn pulls the images on one hotel. A pull can take minutes, so it
-// does not use the guest request context.
+// does not use the guest request context. The guest id is forwarded so the
+// hotel grants ownership of the pulled image ids to this guest (AB#650).
 func (b *broker) prefetchOn(h *hotel, job *prefetchJob, body []byte) {
-	status, _, out, err := h.do(context.Background(), "POST", "/v1/images/prefetch", nil, body, 30*time.Minute)
+	g := b.guests[job.guest]
+	var status int
+	var out []byte
+	var err error
+	if g != nil {
+		status, _, out, err = h.doGuest(context.Background(), g, "POST", "/v1/images/prefetch", nil, body, 30*time.Minute)
+	} else {
+		status, _, out, err = h.do(context.Background(), "POST", "/v1/images/prefetch", nil, body, 30*time.Minute)
+	}
 	var doc map[string]any
 	_ = json.Unmarshal(out, &doc)
 	now := time.Now().UTC()

@@ -278,6 +278,8 @@ class SandboxApplication:
         self._add("POST", s + r"/(?P<id>[^/]+)/network", self.set_network)
         self._add("PATCH", s + r"/(?P<id>[^/]+)/network", self.set_network)
         self._add("POST", s + r"/(?P<id>[^/]+)/expose", self.expose)
+        # AB#605: hotel-mediated HTTP dial to 127.0.0.1:<port> inside the room.
+        self._add("POST", s + r"/(?P<id>[^/]+)/ports/(?P<port>[0-9]+)/http", self.guest_port_http)
         self._add("POST", s + r"/(?P<id>[^/]+)/freeze", self.freeze)
         self._add("POST", s + r"/(?P<id>[^/]+)/thaw", self.thaw)
         self._add("POST", s + r"/(?P<id>[^/]+)/access-tickets", self.mint_access_ticket)
@@ -508,6 +510,7 @@ class SandboxApplication:
             timeout_seconds=payload.get("timeout_seconds"),
             stdin=payload.get("stdin"),
             sealed=sealed,
+            spill_token=payload.get("spill_token"),
         )
         result = self.provider.exec(id, req)
         return Response.json(200, result.to_document())
@@ -595,19 +598,28 @@ class SandboxApplication:
         # snapshot idempotency is a pass-through marker; the provider dedups creates.
         return None
 
-    def list_snapshots(self, *, query, **_):
-        return Response.json(200, {"snapshots": self.provider.list_snapshots(labels=query.get("label", []))})
+    def list_snapshots(self, *, query, headers, api_key, **_):
+        owner = self._owner(headers, api_key) if getattr(self.provider, "takes_owner", False) else None
+        return Response.json(
+            200,
+            {"snapshots": self.provider.list_snapshots(labels=query.get("label", []), owner=owner)},
+        )
 
-    def push_snapshot(self, *, id, body, **_):
+    def push_snapshot(self, *, id, headers, body, api_key, **_):
         payload = self._json(body)
         push = getattr(self.provider, "push_snapshot", None)
         if push is None:
             return Response.error(501, "push_not_supported", "this runtime cannot push a snapshot to a registry")
         image = ImageSource(image=payload.get("image") or "", registry_auth=payload.get("registry_auth"))
-        return Response.json(200, push(id, image=image.image, registry_auth=image.registry_auth))
+        owner = self._owner(headers, api_key) if getattr(self.provider, "takes_owner", False) else None
+        return Response.json(
+            200,
+            push(id, image=image.image, registry_auth=image.registry_auth, owner=owner),
+        )
 
-    def delete_snapshot(self, *, id, **_):
-        existed = self.provider.delete_snapshot(id)
+    def delete_snapshot(self, *, id, headers, api_key, **_):
+        owner = self._owner(headers, api_key) if getattr(self.provider, "takes_owner", False) else None
+        existed = self.provider.delete_snapshot(id, owner=owner)
         return Response.json(200, {"deleted": existed}) if existed else Response.error(404, "snapshot_not_found", f"no snapshot {id}")
 
     # ------------------------------------------------------------------ §3.4 lifecycle
@@ -629,6 +641,37 @@ class SandboxApplication:
     def expose(self, *, id, body, **_):
         payload = self._json(body)
         return Response.json(200, self.provider.expose(id, ExposeRequest(port=payload.get("port"))))
+
+    def guest_port_http(self, *, id, port, headers, body, **_):
+        """POST /v1/sandboxes/{id}/ports/{port}/http — AB#605 guest localhost dial.
+
+        Caller sends the guest method and target in ``X-Guest-Method`` /
+        ``X-Guest-Target`` (path?query). Body and remaining headers are
+        forwarded into the room. Answer is the guest HTTP status, headers and
+        body (broker still buffers today).
+        """
+        try:
+            port_num = int(port)
+        except (TypeError, ValueError) as exc:
+            raise api.SandboxContractError("invalid_port", "port must be an integer") from exc
+        method = (headers.get("X-Guest-Method") or headers.get("x-guest-method") or "GET").strip().upper()
+        target = headers.get("X-Guest-Target") or headers.get("x-guest-target") or "/"
+        if "?" in target:
+            path, _, query = target.partition("?")
+        else:
+            path, query = target, ""
+        result = self.provider.guest_port_http(
+            id,
+            port_num,
+            method=method,
+            path=path or "/",
+            query=query,
+            headers=dict(headers),
+            body=body or b"",
+        )
+        out_headers = {name: value for name, value in result.headers}
+        out_headers["Content-Length"] = str(len(result.body))
+        return Response(result.status, result.body, out_headers)
 
     # ------------------------------------------------------------------ Agent IDE freeze / thaw
     def freeze(self, *, id, **_):
@@ -705,8 +748,10 @@ class SandboxApplication:
     def prefetch(self, *, headers, body, api_key, **_):
         payload = self._json(body)
         idem = headers.get("Idempotency-Key") or headers.get("idempotency-key")
+        owner = self._owner(headers, api_key) if getattr(self.provider, "takes_owner", False) else None
         op = self.provider.prefetch(
-            PrefetchRequest(images=tuple(payload.get("images", ())), registry_auth=payload.get("registry_auth"))
+            PrefetchRequest(images=tuple(payload.get("images", ())), registry_auth=payload.get("registry_auth")),
+            owner=owner,
         )
         result = self.provider.get_operation(op)
         return Response.json(
@@ -717,7 +762,7 @@ class SandboxApplication:
     # Largest build context, after base64 decoding.
     BUILD_CONTEXT_MAX_BYTES = 256 * 1024 * 1024
 
-    def build_image(self, *, body, **_):
+    def build_image(self, *, headers, body, api_key, **_):
         payload = self._json(body)
         build = getattr(self.provider, "build_image", None)
         if build is None:
@@ -734,7 +779,8 @@ class SandboxApplication:
                 raise api.SandboxContractError("invalid_build_context", "context_tar_b64 is not base64") from exc
             if len(context) > self.BUILD_CONTEXT_MAX_BYTES:
                 return Response.error(413, "build_context_too_large", "build context is larger than 256 MiB")
-        return Response.json(200, build(dockerfile, context))
+        owner = self._owner(headers, api_key) if getattr(self.provider, "takes_owner", False) else None
+        return Response.json(200, build(dockerfile, context, owner=owner))
 
     def image_lookup(self, *, ref, **_):
         return Response.json(200, dict(self.provider.image_status(ref)))
@@ -818,6 +864,7 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/sandboxes/{id}/network", "post", "Set network policy", "§3.6"),
     ("/v1/sandboxes/{id}/network", "patch", "Patch network policy", "§3.6"),
     ("/v1/sandboxes/{id}/expose", "post", "Expose a port", "§3.7"),
+    ("/v1/sandboxes/{id}/ports/{port}/http", "post", "HTTP dial guest localhost port", "AB#605"),
     ("/v1/sandboxes/{id}/freeze", "post", "Freeze (pause) a sandbox", "Agent IDE; state → frozen"),
     ("/v1/sandboxes/{id}/thaw", "post", "Thaw a frozen sandbox", "Agent IDE; state → running"),
     ("/v1/sandboxes/{id}/access-tickets", "post", "Mint access ticket", "Agent IDE G4; single-use"),
@@ -1196,10 +1243,18 @@ class _Handler(BaseHTTPRequestHandler):
             pass
 
 
+class _Server(ThreadingHTTPServer):
+    # Every call is a new connection (HTTP/1.0, no keep-alive). The stdlib listen
+    # backlog is 5 on Python 3.11 to 3.14, so a burst of calls overflows it: the
+    # kernel drops the connection attempt and the caller retries 1 s later.
+    # room_receipts.py's front sets the same value for the same reason.
+    request_queue_size = 1024
+
+
 def serve(app: SandboxApplication, host: str = "127.0.0.1", port: int = 0) -> ThreadingHTTPServer:
     """Bind the application to a real HTTP listener (used by integration checks)."""
     handler = type("_BoundHandler", (_Handler,), {"app": app})
-    httpd = ThreadingHTTPServer((host, port), handler)
+    httpd = _Server((host, port), handler)
     return httpd
 
 

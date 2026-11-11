@@ -507,6 +507,14 @@ def test_a_clean_host_gets_the_units_the_key_store_and_the_daemon_config(host: F
     assert "User=poolroom" in api and f"EnvironmentFile={host.etc}/secret.env" in api
     assert re.search(r"^ExecStart=\S+/opt/pool-room/venv/bin/python \S+/opt/pool-room/bin/room_api.py sandbox serve --host 127.0.0.1 --port 18090 --runtime docker$", api, re.M)
     assert re.search(f"^TMPDIR={re.escape(str(host.data_dir))}/work$", (host.etc / "api.env").read_text(), re.M)
+    # Image owner table (AB#650): a directory of its own that the API user owns,
+    # and the path points into it. The fake host cannot chown: the owner is read
+    # from the install(1) call, the mode from the directory itself.
+    owners = host.data_dir / "image-owners"
+    assert f"CATHEDRAL_IMAGE_OWNERS_PATH={owners}/image-owners.json\n" in (host.etc / "api.env").read_text()
+    assert owners.is_dir() and _mode(owners) == 0o700
+    assert f"install -d -m 0700 -o poolroom -g poolroom {owners}" in host.calls("install")
+    assert re.search(f"^ReadWritePaths={re.escape(str(host.data_dir))}/work {re.escape(str(owners))} /var/lib/pool-room$", api, re.M)
     assert (host.etc / "secret.env").read_text() == f"CATHEDRAL_SANDBOX_KEYS={KEY}:{CUSTOMER}:{SLOTS}\n"
     assert (host.etc / "api.key").read_text() == KEY + "\n"
     assert (host.etc / "reaper.headers").read_text() == f"Authorization: Bearer {KEY}\n"
@@ -593,8 +601,12 @@ def test_auto_room_networks_skip_cidrs_other_host_routes_use(host: FakeHost) -> 
 def test_a_rerun_downloads_nothing_and_restarts_only_the_api(host: FakeHost) -> None:
     _clean_install(host)
     host.live_socket()
+    table = host.data_dir / "image-owners" / "image-owners.json"
+    table.write_text("{}\n")
     proc = host.install(str(host.room_env()), env={"FAKE_DOCKER_PS": "0"})
     assert proc.returncode == 0, proc.stderr[-3000:]
+    # The image owner table (AB#650) outlives a second run.
+    assert table.read_text() == "{}\n" and _mode(table.parent) == 0o700
     assert not [c for c in host.calls("curl") if "--retry" in c], "cached archives with the pinned sums are not fetched again"
     assert "room daemon config changed" not in proc.stdout
     sysd = host.calls("systemctl")

@@ -275,6 +275,10 @@ xfs_info "$ROOM_DATA_DIR" >/dev/null
 grep -E " $ROOM_DATA_DIR " /proc/mounts | grep -q prjquota || { echo "prjquota missing on $ROOM_DATA_DIR" >&2; exit 1; }
 mkdir -p "$ROOM_DATA_DIR/work" "$ROOM_DATA_DIR/docker"
 chown poolroom:poolroom "$ROOM_DATA_DIR/work"
+# Image owner table (AB#650). The API replaces the file through a temp file in
+# the same directory, so it needs a directory of its own: the volume root is
+# root's. It sits on the data volume so it lives exactly as long as the images.
+install -d -m 0700 -o poolroom -g poolroom "$ROOM_DATA_DIR/image-owners"
 if [ "${ROOM_WORKSPACES:-0}" = 1 ]; then
   # On a re-run that turns workspaces on, the data unit is already active, so
   # enable --now did not run it again. Its "up" is idempotent: run it to make
@@ -383,7 +387,7 @@ TasksMax=infinity
 NoNewPrivileges=yes
 ProtectSystem=full
 PrivateTmp=yes
-ReadWritePaths=$ROOM_DATA_DIR/work /var/lib/pool-room
+ReadWritePaths=$ROOM_DATA_DIR/work $ROOM_DATA_DIR/image-owners /var/lib/pool-room
 [Install]
 WantedBy=multi-user.target
 EOF

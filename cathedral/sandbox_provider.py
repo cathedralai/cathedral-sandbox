@@ -132,15 +132,27 @@ class SandboxProvider(Protocol):
     def process_logs(self, sandbox_id: str, process_id: str) -> str: ...
     def stop_process(self, sandbox_id: str, process_id: str) -> None: ...
     def snapshot(self, sandbox_id: str, *, ttl_seconds: int | None = None, name: str | None = None, labels: dict[str, str] | None = None) -> str: ...
-    def list_snapshots(self, labels: Iterable[str] = ()) -> list[dict[str, Any]]: ...
-    def delete_snapshot(self, snapshot_id: str) -> bool: ...
+    def list_snapshots(self, labels: Iterable[str] = (), *, owner: str | None = None) -> list[dict[str, Any]]: ...
+    def delete_snapshot(self, snapshot_id: str, *, owner: str | None = None) -> bool: ...
     def heartbeat(self, sandbox_id: str, ttl_seconds: int | None) -> dict[str, Any]: ...
     def delete(self, sandbox_id: str) -> None: ...
     def list(self, *, labels: Iterable[str], state: str | None) -> list[dict[str, Any]]: ...
     def bulk_delete(self, labels: Iterable[str]) -> int: ...
     def set_network(self, sandbox_id: str, patch: NetworkPatch) -> dict[str, Any]: ...
     def expose(self, sandbox_id: str, request: ExposeRequest) -> dict[str, Any]: ...
-    def prefetch(self, request: PrefetchRequest) -> str: ...
+    def guest_port_http(
+        self,
+        sandbox_id: str,
+        port: int,
+        *,
+        method: str,
+        path: str,
+        query: str = "",
+        headers: Mapping[str, str] | None = None,
+        body: bytes = b"",
+        timeout_seconds: float = 30.0,
+    ) -> Any: ...
+    def prefetch(self, request: PrefetchRequest, *, owner: str | None = None) -> str: ...
     def image_status(self, ref: str) -> dict[str, Any]: ...
     def quota(self) -> dict[str, Any]: ...
     def usage(self, *, group_by: str | None, labels: Iterable[str]) -> dict[str, Any]: ...
@@ -829,7 +841,7 @@ class InMemorySandboxProvider:
             self._snapshot_owner.pop(sid, None)
             Path(path).unlink(missing_ok=True)
 
-    def list_snapshots(self, labels: Iterable[str] = ()) -> list[dict[str, Any]]:
+    def list_snapshots(self, labels: Iterable[str] = (), *, owner: str | None = None) -> list[dict[str, Any]]:
         want = _parse_label_filters(labels)
         with self._lock:
             self._sweep_snapshots_locked()
@@ -851,7 +863,7 @@ class InMemorySandboxProvider:
                 )
             return out
 
-    def delete_snapshot(self, snapshot_id: str) -> bool:
+    def delete_snapshot(self, snapshot_id: str, *, owner: str | None = None) -> bool:
         with self._lock:
             if snapshot_id not in self._snapshots or not self._snapshot_visible(snapshot_id):
                 return False
@@ -1096,6 +1108,33 @@ class InMemorySandboxProvider:
             url = f"https://{sandbox_id}-{request.port}.{_host_of(self._base_url)}"
             sandbox.exposed[request.port] = url
             return {"port": request.port, "url": url, "status": "exposed"}
+
+    def guest_port_http(
+        self,
+        sandbox_id: str,
+        port: int,
+        *,
+        method: str,
+        path: str,
+        query: str = "",
+        headers: Mapping[str, str] | None = None,
+        body: bytes = b"",
+        timeout_seconds: float = 30.0,
+    ):
+        """AB#605: dial 127.0.0.1:<port> on the hotel host (in-memory rooms share it)."""
+        from cathedral.guest_port_http import dial_loopback
+
+        with self._lock:
+            self._require_running(sandbox_id)
+        return dial_loopback(
+            port,
+            method=method,
+            path=path,
+            query=query,
+            headers=headers,
+            body=body,
+            timeout_seconds=timeout_seconds,
+        )
 
     # ------------------------------------------------------------------ Agent IDE freeze / thaw (G2)
     def freeze(self, sandbox_id: str) -> dict[str, Any]:
@@ -1377,7 +1416,7 @@ class InMemorySandboxProvider:
         }
 
     # ------------------------------------------------------------------ §3.9 images
-    def prefetch(self, request: PrefetchRequest) -> str:
+    def prefetch(self, request: PrefetchRequest, *, owner: str | None = None) -> str:
         with self._lock:
             for ref in request.images:
                 self._images.setdefault(ref, {"cached": True, "size_bytes": 0, "digest": None})

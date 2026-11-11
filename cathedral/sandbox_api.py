@@ -837,6 +837,11 @@ def exec_max_timeout_seconds() -> int:
 # §3.2: output must be streamed or capped at a stated size >= 10 MiB with a truncated flag.
 STDOUT_MIN_CAP_BYTES = 10 * 1024 * 1024
 STDOUT_CAP_BYTES = 16 * 1024 * 1024
+_SPILL_TOKEN = re.compile(r"^[0-9a-f]{32}$")
+
+
+def spill_token_ok(value: object) -> bool:
+    return isinstance(value, str) and _SPILL_TOKEN.fullmatch(value) is not None
 PROCESS_LOG_RETENTION_HOURS = 24
 
 
@@ -877,6 +882,10 @@ class ExecRequest:
     # inside the sealed guest. Its command and output stay out of the exec history
     # and the container log, which GET /v1/sandboxes/{id}/logs serves to the relay.
     sealed: bool = False
+    # When set, the guest publishes capped stdout and stderr while the command
+    # runs, for a follow client to read through the files route. Absent on a
+    # sync exec. 32 lowercase hex characters.
+    spill_token: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.cmd, str):
@@ -899,6 +908,12 @@ class ExecRequest:
                 and 1 <= self.timeout_seconds <= exec_max_timeout_seconds(),
                 "invalid_timeout",
                 f"timeout_seconds must be between 1 and {exec_max_timeout_seconds()}",
+            )
+        if self.spill_token is not None:
+            _require(
+                spill_token_ok(self.spill_token),
+                "invalid_exec",
+                "spill_token must be 32 lowercase hex characters",
             )
 
     @property

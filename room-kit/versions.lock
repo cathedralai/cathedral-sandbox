@@ -22,7 +22,22 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # workspaces #306 and egress credentials #307) on c48, Contabo and c46.
 # Rolled 2026-10-27 to 20d81fb (#339 per-room Escape start-up tunables) for the sealed
 # hotels nc-sealed-2 and c46-sealed.
-CATHEDRAL_COMMIT=20d81fb
-CATHEDRAL_TARBALL=dist/cathedral-20d81fb.tar.gz
-CATHEDRAL_TARBALL_SHA256=deb0f1a4e3c51cda369c87ec2ee4b5d2015b4e0d8b0c8123c23fd9a3fc91eeef
+# Pinned 2026-11-08 to c0aa096 for the combined sealed guest: customer-sealed secrets
+# (#410, /run/secrets), customer-sealed commands (#412 via #416, exec-sealed) and the
+# signed sandbox-to-room link (#415, cathedral_sandbox_id in the create receipt). c0aa096
+# is the head of #416 and holds main 8eb5dce plus #412.
+# Pinned 2026-11-10 to 4e7040f (main after #421: sealed exec follow publishes capped
+# output while the command runs, cathedral/exec_spill.py; AB#654). Same make-dist.sh; the
+# c0aa096 tarball rebuilds to its pinned sha with the same tool, so the method is unchanged.
+# Pinned 2026-11-11 to 3d107e9 (main after #424, #425, #426, #427 and #423: room API listen
+# backlog 1024, exec waits on an event, one image inspect on create, hotel HTTP dial for guest
+# localhost ports (AB#605), per-guest image ownership with hotel-side builds refused on shared
+# sealed hotels (AB#650 Option A)). Same make-dist.sh; the 4e7040f tarball rebuilds to its
+# pinned sha 026d3790... with the same tool, so the method is unchanged.
+# Pinned 2026-11-11 (second pin of the day) to 0b396fa: main after #430, the image owner store fix found
+# by the nc-sealed-3 canary (table in a directory the API user owns, no grant kept after a failed write,
+# writability check at start; AB#650). Same make-dist.sh; the 3d107e9 tarball rebuilds to its pinned sha.
+CATHEDRAL_COMMIT=0b396fa
+CATHEDRAL_TARBALL=dist/cathedral-0b396fa.tar.gz
+CATHEDRAL_TARBALL_SHA256=6b2bf2cd3dffcfa3781cad1d76facbcc5e50cac74e0793a6e0832b223456c252
 PROBE_IMAGE=alpine:3.20
