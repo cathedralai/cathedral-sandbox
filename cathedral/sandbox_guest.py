@@ -2586,8 +2586,7 @@ class DockerGuestProvider:
         pulled: list[dict[str, Any]] = []
         for image in request.images:
             # Prefetch is the explicit refresh path: it always pulls.
-            self._ensure_image(image, registry_auth=request.registry_auth, refresh=True)
-            inspected = self._client.image_inspect(image)
+            inspected = self._ensure_image(image, registry_auth=request.registry_auth, refresh=True)
             entry = {
                 "ref": image,
                 "cached": True,
