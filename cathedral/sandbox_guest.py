@@ -2620,6 +2620,36 @@ class DockerGuestProvider:
     def wait(self, sandbox_id: str, timeout_seconds: int) -> dict[str, Any]:
         return self._with_tunables(self._inner.wait(sandbox_id, timeout_seconds))
 
+    def guest_port_http(
+        self,
+        sandbox_id: str,
+        port: int,
+        *,
+        method: str,
+        path: str,
+        query: str = "",
+        headers: Mapping[str, str] | None = None,
+        body: bytes = b"",
+        timeout_seconds: float = 30.0,
+    ):
+        """AB#605: dial 127.0.0.1:<port> inside the room's network namespace."""
+        from cathedral.guest_port_http import dial_container_loopback
+
+        guest = self._guests.get(sandbox_id)
+        if guest is None:
+            raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
+        self._inner._require_running(sandbox_id)  # noqa: SLF001 — same running fence as other mutators
+        return dial_container_loopback(
+            guest.container_id,
+            port,
+            method=method,
+            path=path,
+            query=query,
+            headers=headers,
+            body=body,
+            timeout_seconds=timeout_seconds,
+        )
+
     def _with_tunables(self, doc: dict[str, Any]) -> dict[str, Any]:
         """The room's own tunables on a read, so a caller can check what the room runs."""
         guest = self._guests.get(doc.get("id")) if isinstance(doc, dict) else None

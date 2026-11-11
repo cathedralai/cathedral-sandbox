@@ -140,6 +140,18 @@ class SandboxProvider(Protocol):
     def bulk_delete(self, labels: Iterable[str]) -> int: ...
     def set_network(self, sandbox_id: str, patch: NetworkPatch) -> dict[str, Any]: ...
     def expose(self, sandbox_id: str, request: ExposeRequest) -> dict[str, Any]: ...
+    def guest_port_http(
+        self,
+        sandbox_id: str,
+        port: int,
+        *,
+        method: str,
+        path: str,
+        query: str = "",
+        headers: Mapping[str, str] | None = None,
+        body: bytes = b"",
+        timeout_seconds: float = 30.0,
+    ) -> Any: ...
     def prefetch(self, request: PrefetchRequest) -> str: ...
     def image_status(self, ref: str) -> dict[str, Any]: ...
     def quota(self) -> dict[str, Any]: ...
@@ -1096,6 +1108,33 @@ class InMemorySandboxProvider:
             url = f"https://{sandbox_id}-{request.port}.{_host_of(self._base_url)}"
             sandbox.exposed[request.port] = url
             return {"port": request.port, "url": url, "status": "exposed"}
+
+    def guest_port_http(
+        self,
+        sandbox_id: str,
+        port: int,
+        *,
+        method: str,
+        path: str,
+        query: str = "",
+        headers: Mapping[str, str] | None = None,
+        body: bytes = b"",
+        timeout_seconds: float = 30.0,
+    ):
+        """AB#605: dial 127.0.0.1:<port> on the hotel host (in-memory rooms share it)."""
+        from cathedral.guest_port_http import dial_loopback
+
+        with self._lock:
+            self._require_running(sandbox_id)
+        return dial_loopback(
+            port,
+            method=method,
+            path=path,
+            query=query,
+            headers=headers,
+            body=body,
+            timeout_seconds=timeout_seconds,
+        )
 
     # ------------------------------------------------------------------ Agent IDE freeze / thaw (G2)
     def freeze(self, sandbox_id: str) -> dict[str, Any]:
