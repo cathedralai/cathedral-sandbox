@@ -34,7 +34,10 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # localhost ports (AB#605), per-guest image ownership with hotel-side builds refused on shared
 # sealed hotels (AB#650 Option A)). Same make-dist.sh; the 4e7040f tarball rebuilds to its
 # pinned sha 026d3790... with the same tool, so the method is unchanged.
-CATHEDRAL_COMMIT=3d107e9
-CATHEDRAL_TARBALL=dist/cathedral-3d107e9.tar.gz
-CATHEDRAL_TARBALL_SHA256=8a6cec3fb401ce509cd53e097b06f38f27c868edab1df247c95c04c53b94f90e
+# Pinned 2026-11-11 (second pin of the day) to 0b396fa: main after #430, the image owner store fix found
+# by the nc-sealed-3 canary (table in a directory the API user owns, no grant kept after a failed write,
+# writability check at start; AB#650). Same make-dist.sh; the 3d107e9 tarball rebuilds to its pinned sha.
+CATHEDRAL_COMMIT=0b396fa
+CATHEDRAL_TARBALL=dist/cathedral-0b396fa.tar.gz
+CATHEDRAL_TARBALL_SHA256=6b2bf2cd3dffcfa3781cad1d76facbcc5e50cac74e0793a6e0832b223456c252
 PROBE_IMAGE=alpine:3.20
