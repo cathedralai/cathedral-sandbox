@@ -581,7 +581,7 @@ cookie for that guest path and redirects to `/<guest>/live`. The older link
 to the page and to its data stream (`/<guest>/live/events`, server-sent
 events, 1 per second) needs that cookie. A wrong token and an unknown guest
 both get 401. The page shows hotel names, threads and RAM from the config,
-never addresses. Squares of other guests are grey.
+never addresses. Squares of other guests are grey. The page lists only the hotels that guest may use (the same rule as its capacity view). `rooms_all` and `deleting_all` are sent only for a hotel where the guest owns a room.
 
 ## Run
 

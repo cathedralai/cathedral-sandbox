@@ -305,9 +305,9 @@ footer { margin-top: 18px; font-size: 14px; color: var(--muted); max-width: 80ch
       t.el.querySelector(".ram").textContent = `${Math.round(h.mem_pct)}% · ${Math.round(h.mem_gib)} GiB`;
       setMeter(t.el, ".fcpu", h.cpu); setMeter(t.el, ".fram", h.mem_pct);
       t.el.querySelector(".mine").textContent = fmt.format(h.mine.running);
-      t.el.querySelector(".all").textContent = fmt.format(h.rooms_all);
+      t.el.querySelector(".all").textContent = h.rooms_all == null ? "-" : fmt.format(h.rooms_all);
       t.el.querySelector(".cont").textContent = fmt.format(h.containers);
-      t.el.querySelector(".del").textContent = fmt.format(h.deleting_all);
+      t.el.querySelector(".del").textContent = h.deleting_all == null ? "-" : fmt.format(h.deleting_all);
       t.el.querySelector(".q").textContent = fmt.format(h.queued);
       t.canvas.setAttribute("aria-label", `${h.name}: ${h.mine.running} of your rooms running, ${h.slots} rooms in total`);
       const now = performance.now();

@@ -2012,6 +2012,11 @@ func (b *broker) snapshot(g *guestState) map[string]any {
 	tot := map[string]int{"running": 0, "creating": 0, "deleting": 0, "failed_now": 0}
 	hotels := []any{}
 	for _, h := range b.hotelList() {
+		// Same reach rule as the guest capacity view: a hotel the guest may
+		// not use (list, reservation, lend, miner opt-in) is not shown (AB#577).
+		if g.tierOf(h) == "" {
+			continue
+		}
 		grid := make([]byte, len(h.grid))
 		mine := map[byte]int{}
 		for i, rm := range h.grid {
@@ -2029,14 +2034,19 @@ func (b *broker) snapshot(g *guestState) map[string]any {
 		tot["creating"] += mine[stCreating]
 		tot["deleting"] += mine[stDeleting]
 		tot["failed_now"] += mine[stFailed]
-		hotels = append(hotels, map[string]any{
+		doc := map[string]any{
 			"id": h.cfg.ID, "name": h.cfg.Name, "threads": h.cfg.Threads, "ram_gib": h.cfg.RAMGiB, "slots": h.slots, "ok": h.ok, "drain": h.drain(), "sealed": h.cfg.Sealed,
 			"grid": string(grid), "cpu": h.cpuPct, "mem_pct": h.memPct, "mem_gib": h.memGiB, "load1": h.load1,
-			"containers": h.containers, "rooms_all": h.apiRunning, "deleting_all": h.apiDeleting,
+			"containers": h.containers,
 			"queued": h.queued, "creating": h.creating,
 			"seen_age_s": seenAge(h.lastOK, now), "down_since": downSince(h), "health_late": h.healthLate, "health_ms": h.healthMs, "list_ok": h.listOK, "caps": h.caps,
 			"mine": map[string]int{"running": mine[stRunning], "creating": mine[stCreating], "deleting": mine[stDeleting], "failed": mine[stFailed]},
-		})
+		}
+		// All-guest counts only where this guest owns a room (AB#577).
+		if mine[stRunning]+mine[stCreating]+mine[stDeleting]+mine[stFailed] > 0 {
+			doc["rooms_all"], doc["deleting_all"] = h.apiRunning, h.apiDeleting
+		}
+		hotels = append(hotels, doc)
 	}
 	return map[string]any{
 		"t": now.UnixMilli(), "guest": g.cfg.ID, "hotels": hotels,
