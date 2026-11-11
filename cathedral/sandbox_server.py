@@ -762,7 +762,7 @@ class SandboxApplication:
     # Largest build context, after base64 decoding.
     BUILD_CONTEXT_MAX_BYTES = 256 * 1024 * 1024
 
-    def build_image(self, *, body, **_):
+    def build_image(self, *, body, headers, api_key, **_):
         payload = self._json(body)
         build = getattr(self.provider, "build_image", None)
         if build is None:
@@ -779,6 +779,9 @@ class SandboxApplication:
                 raise api.SandboxContractError("invalid_build_context", "context_tar_b64 is not base64") from exc
             if len(context) > self.BUILD_CONTEXT_MAX_BYTES:
                 return Response.error(413, "build_context_too_large", "build context is larger than 256 MiB")
+        owner = self._owner(headers, api_key) if getattr(self.provider, "takes_owner", False) else None
+        if owner is not None:
+            return Response.json(200, build(dockerfile, context, owner=owner))
         return Response.json(200, build(dockerfile, context))
 
     def image_lookup(self, *, ref, **_):

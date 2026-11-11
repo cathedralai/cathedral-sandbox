@@ -100,13 +100,19 @@ def test_image_pulled_with_credentials_is_pulled_again(fake: FakeDocker) -> None
         provider.close()
 
 
-def test_cached_image_is_inspected_once_on_create(fake: FakeDocker) -> None:
+def test_owned_cached_image_is_inspected_once_on_reuse(fake: FakeDocker) -> None:
+    # First create earns a registry grant (may inspect several times). The second
+    # create for the same owner must not pull and should inspect the image once.
     fake.add_image("alpine:3.20")
     provider = DockerGuestProvider()
     try:
         _create(provider)
+        before = len([c for c in fake.calls_of("image", "inspect") if c[-1] == "alpine:3.20"])
+        pulls_before = len(fake.calls_of("pull"))
+        _create(provider, digest="c")
         inspects = [c for c in fake.calls_of("image", "inspect") if c[-1] == "alpine:3.20"]
-        assert len(inspects) == 1
+        assert len(fake.calls_of("pull")) == pulls_before
+        assert len(inspects) - before == 1
     finally:
         provider.close()
 

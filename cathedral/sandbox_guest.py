@@ -1431,19 +1431,34 @@ class DockerGuestProvider:
             return True
         return False
 
-    def _authorize_image(self, image: str, owner: str, *, registry_auth: Mapping[str, str] | None = None) -> str:
+    def _authorize_image(
+        self,
+        image: str,
+        owner: str,
+        *,
+        registry_auth: Mapping[str, str] | None = None,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
         """Ensure *owner* may start *image*; pull to earn a registry grant if needed.
 
-        Returns the immutable image id that was authorized. Never falls back to
-        a cached local image when registry authorization fails. Snapshot and
-        build artifacts cannot be earned by renaming them and pulling.
+        Returns the inspect document for *image* after authorization. Never falls
+        back to a cached local image when registry authorization fails. Snapshot
+        and build artifacts cannot be earned by renaming them and pulling.
+        Callers must not call ``_ensure_image`` again for the same create/prefetch.
         """
-        local_id = self._image_id_of(image) if self._client.image_exists(image) else None
+        force_refresh = (
+            refresh
+            or registry_auth is not None
+            or image in self._auth_pulled
+            or self._pull_policy == "always"
+        )
+        inspected = self._client.image_inspect(image)
+        local_id = normalize_image_id(str(inspected.get("Id") or ""))
         if local_id and self._image_owners.owns(local_id, owner):
             # Preserve credential rechecks for private images and pull-policy always.
-            if registry_auth is not None or image in self._auth_pulled or self._pull_policy == "always":
-                self._ensure_image(image, registry_auth=registry_auth, refresh=True)
-            return local_id
+            if force_refresh:
+                return self._ensure_image(image, registry_auth=registry_auth, refresh=True)
+            return inspected
         if self._looks_like_image_id(image):
             raise SandboxOpError(
                 "image_not_owned",
@@ -1458,10 +1473,10 @@ class DockerGuestProvider:
                     403,
                     "this guest cannot use that image on this hotel",
                 )
-        # Registry authorization: a successful pull under this caller's credentials
+        # Registry authorization: a successful pull under the caller's credentials
         # (or anonymous access). A cache hit alone is not enough.
         try:
-            self._ensure_image(image, registry_auth=registry_auth, refresh=True)
+            inspected = self._ensure_image(image, registry_auth=registry_auth, refresh=True)
         except SandboxOpError:
             if local_id is not None:
                 raise SandboxOpError(
@@ -1470,7 +1485,7 @@ class DockerGuestProvider:
                     "this guest cannot use that image on this hotel",
                 ) from None
             raise
-        image_id = self._image_id_of(image)
+        image_id = normalize_image_id(str(inspected.get("Id") or "")) or self._image_id_of(image)
         if image_id is None:
             raise SandboxOpError("image_pull_failed", 502, f"image {image} has no docker id after pull")
         # A pull that still resolves to a snapshot/build id did not authorize it.
@@ -1483,7 +1498,7 @@ class DockerGuestProvider:
                 "this guest cannot use that image on this hotel",
             )
         self._image_owners.grant(image_id, owner, provenance="registry", ref=image)
-        return image_id
+        return inspected
 
     def _require_credentials_support(self, credentials) -> None:
         if credentials and self._egress is None:
@@ -1499,12 +1514,15 @@ class DockerGuestProvider:
     def authorize(self, api_key: str | None) -> None:
         self._inner.authorize(api_key)
 
-    def build_image(self, dockerfile: str, context: bytes | None = None) -> dict[str, Any]:
+    def build_image(
+        self, dockerfile: str, context: bytes | None = None, *, owner: str | None = None
+    ) -> dict[str, Any]:
         """Build *dockerfile* with an optional gzip tar *context*. Cached by content.
 
         The tag is cathedral-build-<hash>:latest, where the hash covers the
         Dockerfile and the context bytes. A second build of the same content
-        only checks that the image is present.
+        only checks that the image is present. The calling owner receives a
+        build grant so a later create of the same tag does not registry-pull.
 
         On a shared sealed hotel (Option A / AB#650) this refuses before Docker
         runs: a Dockerfile can ``FROM`` or ``COPY --from`` a foreign local image.
@@ -1536,6 +1554,10 @@ class DockerGuestProvider:
                     self._client.build(tag=tag, context_dir=work)
                 finally:
                     shutil.rmtree(work, ignore_errors=True)
+        effective_owner = owner if owner is not None else owner_id(None, None)
+        image_id = self._image_id_of(tag)
+        if image_id is not None:
+            self._image_owners.grant(image_id, effective_owner, provenance="build", ref=tag)
         return {
             "image": tag,
             "content_hash": "sha256:" + digest,
@@ -1838,8 +1860,9 @@ class DockerGuestProvider:
                 )
             self._image_owners.require(image_id, effective_owner)
         elif request.image is not None:
-            self._authorize_image(image, effective_owner, registry_auth=request.image.registry_auth)
-            inspected = self._ensure_image(image, registry_auth=request.image.registry_auth)
+            inspected = self._authorize_image(
+                image, effective_owner, registry_auth=request.image.registry_auth
+            )
             self._inner._images[image] = {  # noqa: SLF001
                 "ref": image,
                 "cached": True,
@@ -2750,8 +2773,9 @@ class DockerGuestProvider:
         effective_owner = owner if owner is not None else owner_id(None, None)
         for image in request.images:
             # Prefetch is the explicit refresh path: it always pulls, then grants.
-            self._authorize_image(image, effective_owner, registry_auth=request.registry_auth)
-            inspected = self._ensure_image(image, registry_auth=request.registry_auth, refresh=True)
+            inspected = self._authorize_image(
+                image, effective_owner, registry_auth=request.registry_auth, refresh=True
+            )
             entry = {
                 "ref": image,
                 "cached": True,
