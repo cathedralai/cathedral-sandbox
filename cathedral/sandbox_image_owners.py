@@ -78,7 +78,8 @@ class ImageOwnerStore:
     """Durable map of image id -> allowed owner hashes.
 
     Writes replace the whole file under an exclusive lock. A failed write fails
-    the calling operation; a missing or corrupt file grants nothing.
+    the calling operation and leaves the in-memory table unchanged; a missing
+    or corrupt file grants nothing.
     """
 
     def __init__(self, path: Path | None = None) -> None:
@@ -122,11 +123,22 @@ class ImageOwnerStore:
             }
         self._grants = out
 
-    def _flush_locked(self) -> None:
-        payload = {"version": FORMAT_VERSION, "images": self._grants}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def _copy_grants(self) -> dict[str, dict[str, Any]]:
+        """Independent grant table so a failed flush can be discarded."""
+        return {
+            image_id: {
+                "owners": list(entry["owners"]),
+                "provenance": entry["provenance"],
+                "refs": list(entry["refs"]),
+            }
+            for image_id, entry in self._grants.items()
+        }
+
+    def _flush_locked(self, grants: dict[str, dict[str, Any]]) -> None:
+        payload = {"version": FORMAT_VERSION, "images": grants}
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
             os.replace(tmp, self.path)
         except OSError as exc:
@@ -184,10 +196,11 @@ class ImageOwnerStore:
             raise SandboxOpError("image_owner_store_failed", 500, "unknown image provenance")
         scope = self._scope(owner)
         with self._lock:
-            entry = self._grants.get(nid)
+            grants = self._copy_grants()
+            entry = grants.get(nid)
             if entry is None:
                 entry = {"owners": [], "provenance": provenance, "refs": []}
-                self._grants[nid] = entry
+                grants[nid] = entry
             if scope not in entry["owners"]:
                 entry["owners"] = sorted([*entry["owners"], scope])
             if ref and ref not in entry["refs"]:
@@ -195,7 +208,10 @@ class ImageOwnerStore:
             # Prefer the stronger local provenance when a snapshot overwrites a pull.
             if provenance == "snapshot" or entry.get("provenance") not in PROVENANCE:
                 entry["provenance"] = provenance
-            self._flush_locked()
+            # Publish only after the file replace. A failed flush re-raises
+            # SandboxOpError and leaves the in-memory table unchanged.
+            self._flush_locked(grants)
+            self._grants = grants
         return nid
 
     def drop_owner(self, image_id: str, owner: str) -> None:
@@ -204,15 +220,17 @@ class ImageOwnerStore:
             return
         scope = self._scope(owner)
         with self._lock:
-            entry = self._grants.get(nid)
-            if entry is None:
+            if self._grants.get(nid) is None:
                 return
+            grants = self._copy_grants()
+            entry = grants[nid]
             owners = [o for o in entry["owners"] if o != scope]
             if not owners:
-                self._grants.pop(nid, None)
+                grants.pop(nid, None)
             else:
                 entry["owners"] = owners
-            self._flush_locked()
+            self._flush_locked(grants)
+            self._grants = grants
 
 
 __all__ = [

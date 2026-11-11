@@ -12,6 +12,7 @@ import pytest
 
 from cathedral.sandbox_api import CreateSandboxRequest, ImageSource, Resources
 from cathedral.sandbox_guest import DockerGuestProvider
+from cathedral.sandbox_image_owners import ImageOwnerStore
 from cathedral.sandbox_owner import owner_id
 from cathedral.sandbox_provider import SandboxOpError
 from cathedral.sandbox_server import SandboxApplication
@@ -178,3 +179,36 @@ def test_idempotency_is_scoped_per_guest(fake, provider) -> None:
         owner=_owner("gb"),
     )
     assert a["id"] != b["id"]
+
+
+def test_grant_flush_failure_leaves_no_phantom_owner(tmp_path) -> None:
+    """A non-writable owners directory must not keep a grant that never hit disk."""
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    blocked.chmod(0o555)
+    image_id = "sha256:" + ("ab" * 32)
+    store = ImageOwnerStore(blocked / "image-owners.json")
+    try:
+        with pytest.raises(SandboxOpError) as err:
+            store.grant(image_id, "guest-a", provenance="registry", ref="alpine:3.20")
+        assert (err.value.code, err.value.http_status) == ("image_owner_store_failed", 503)
+        assert store.owns(image_id, "guest-a") is False
+    finally:
+        blocked.chmod(0o755)
+
+
+def test_drop_owner_flush_failure_keeps_the_grant(tmp_path) -> None:
+    """A failed drop must not open an in-memory hole for an owner still on disk."""
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    image_id = "sha256:" + ("cd" * 32)
+    store = ImageOwnerStore(blocked / "image-owners.json")
+    store.grant(image_id, "guest-a", provenance="snapshot")
+    blocked.chmod(0o555)
+    try:
+        with pytest.raises(SandboxOpError) as err:
+            store.drop_owner(image_id, "guest-a")
+        assert err.value.code == "image_owner_store_failed"
+        assert store.owns(image_id, "guest-a") is True
+    finally:
+        blocked.chmod(0o755)
