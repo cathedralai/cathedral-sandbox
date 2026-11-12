@@ -174,14 +174,19 @@ func TestNativeBackgroundExecFinishedResultSurvivesBrokerRestart(t *testing.T) {
 
 func TestNativeBackgroundExecRunningAtRestartIsLostWithReason(t *testing.T) {
 	dir := t.TempDir()
-	tc, _ := execChain(t, dir)
+	tc, release := execChain(t, dir)
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
 	eid := startBG(t, tc, "key1", bid, "job")
+	old := tc.b
 	tc.restart(t)
 	status, _, doc := tc.rawCall(t, "key1", "GET", "/v1/sandboxes/"+bid+"/execs/"+eid, nil)
 	if status != 200 || doc["state"] != "lost" || doc["reason"] != "broker_restarted" {
 		t.Fatalf("after restart: %d %v", status, doc)
 	}
+	// Unblock the old broker's held hotel /exec and wait for its saveNativeExecs
+	// so TempDir cleanup does not race a late write (directory not empty).
+	release()
+	old.drainNativeExecs(5 * time.Second)
 }
 
 func TestNativeBackgroundExecDrainWaitsForRunningExecs(t *testing.T) {
