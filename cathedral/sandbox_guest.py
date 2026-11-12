@@ -2246,6 +2246,15 @@ class DockerGuestProvider:
     def stat(self, sandbox_id: str, path: str) -> StatResult:
         return self._inner.stat(sandbox_id, _in_work(path))
 
+    def list_dir(self, sandbox_id: str, path: str) -> list[dict[str, Any]]:
+        return self._inner.list_dir(sandbox_id, _in_work(path))
+
+    def make_dir(self, sandbox_id: str, path: str) -> None:
+        self._inner.make_dir(sandbox_id, _in_work(path))
+
+    def delete_path(self, sandbox_id: str, path: str, recursive: bool) -> None:
+        self._inner.delete_path(sandbox_id, _in_work(path), recursive)
+
     def snapshot(
         self,
         sandbox_id: str,

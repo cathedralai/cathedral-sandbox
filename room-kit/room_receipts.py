@@ -1744,6 +1744,11 @@ SIGNED = [  # (method, path pattern, action)
     ("POST", re.compile("^" + ROOM + r"/network$"), "network_set"),
     ("PATCH", re.compile("^" + ROOM + r"/network$"), "network_set"),
     ("DELETE", re.compile(r"^/v1/sandboxes$"), "bulk_delete"),
+    # AB#408: the target in the receipt holds the raw path query and result_sha256
+    # covers the listing or the refusal, so a read or a delete is provable.
+    ("GET", re.compile("^" + ROOM + r"/list$"), "dir_list"),
+    ("POST", re.compile("^" + ROOM + r"/mkdir$"), "dir_make"),
+    ("DELETE", re.compile("^" + ROOM + r"/files$"), "file_delete"),
 ]
 # Dedicated machine: the requests that start code need the owner signature.
 # A build runs Dockerfile steps in the guest, and the broker sends builds to

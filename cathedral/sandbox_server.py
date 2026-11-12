@@ -273,6 +273,9 @@ class SandboxApplication:
         self._add("PUT", s + r"/(?P<id>[^/]+)/tar", self.put_tar)
         self._add("GET", s + r"/(?P<id>[^/]+)/tar", self.get_tar)
         self._add("GET", s + r"/(?P<id>[^/]+)/stat", self.stat)
+        self._add("GET", s + r"/(?P<id>[^/]+)/list", self.list_dir)
+        self._add("POST", s + r"/(?P<id>[^/]+)/mkdir", self.make_dir)
+        self._add("DELETE", s + r"/(?P<id>[^/]+)/files", self.delete_path)
         self._add("POST", s + r"/(?P<id>[^/]+)/snapshot", self.snapshot)
         self._add("PUT", s + r"/(?P<id>[^/]+)/network", self.set_network)
         self._add("POST", s + r"/(?P<id>[^/]+)/network", self.set_network)
@@ -581,6 +584,21 @@ class SandboxApplication:
         path = _require_param(query, "path")
         return Response.json(200, self.provider.stat(id, path).to_document())
 
+    def list_dir(self, *, id, query, **_):
+        path = _require_param(query, "path")
+        return Response.json(200, {"path": path, "entries": self.provider.list_dir(id, path)})
+
+    def make_dir(self, *, id, query, **_):
+        path = _require_param(query, "path")
+        self.provider.make_dir(id, path)
+        return Response.json(200, {"path": path, "created": True})
+
+    def delete_path(self, *, id, query, **_):
+        path = _require_param(query, "path")
+        recursive = (query.get("recursive") or ["0"])[0] in ("1", "true")
+        self.provider.delete_path(id, path, recursive)
+        return Response.json(200, {"path": path, "deleted": True})
+
     # ------------------------------------------------------------------ §3.5 snapshot
     def snapshot(self, *, id, headers, body, api_key, **_):
         idem = headers.get("Idempotency-Key") or headers.get("idempotency-key")
@@ -859,6 +877,9 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/sandboxes/{id}/tar", "put", "Write a tar archive", "§3.3"),
     ("/v1/sandboxes/{id}/tar", "get", "Read a tar archive", "§3.3"),
     ("/v1/sandboxes/{id}/stat", "get", "Stat a path", "§3.3"),
+    ("/v1/sandboxes/{id}/list", "get", "List a directory under /work", "AB#408"),
+    ("/v1/sandboxes/{id}/mkdir", "post", "Make a directory under /work", "AB#408"),
+    ("/v1/sandboxes/{id}/files", "delete", "Delete a file or directory under /work", "AB#408; recursive=1 for a full directory"),
     ("/v1/sandboxes/{id}/snapshot", "post", "Snapshot a sandbox", "§3.5; TTL + fork"),
     ("/v1/sandboxes/{id}/network", "put", "Set network policy (live switch)", "§3.6"),
     ("/v1/sandboxes/{id}/network", "post", "Set network policy", "§3.6"),
