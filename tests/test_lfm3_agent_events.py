@@ -637,6 +637,23 @@ def test_non_credential_env_prefixes_are_held_across_stream_pieces(model: Stream
     assert events[-1]["type"] == "answer" and events[-1]["text"] == "[redacted]"
 
 
+def test_model_api_key_prefixes_are_held_despite_model_infra_exclusion(model: StreamModel, room: Any) -> None:
+    # SpockChaser HOLD: MODEL_API_KEY / LFM3_API_KEY match infra prefixes, but
+    # credentials must still be held across stream pieces.
+    secret = "abcdefghijklmno"
+    model.replies = [{"pieces": ["abcde", "fghij", "klmno"]}]
+    done, events = turn(room, "go", MODEL_API_KEY=secret)
+    assert done.returncode == 0
+    deltas = "".join(ev["text"] for ev in events if ev["type"] == "delta")
+    assert secret not in deltas and secret.encode() not in done.stdout
+    assert events[-1]["type"] == "answer" and secret not in events[-1]["text"]
+    model.replies = [{"pieces": ["abcde", "fghij", "klmno"]}]
+    done, events = turn(room, "again", LFM3_API_KEY=secret)
+    deltas = "".join(ev["text"] for ev in events if ev["type"] == "delta")
+    assert secret not in deltas and secret.encode() not in done.stdout
+    assert events[-1]["type"] == "answer" and secret not in events[-1]["text"]
+
+
 def test_the_plain_path_does_not_echo_the_key_or_request_headers(model: StreamModel, room: Any) -> None:
     short = "k7q"
     model.replies = [{"status": 500, "body": {"error": {"message": "scripted failure"}}}]

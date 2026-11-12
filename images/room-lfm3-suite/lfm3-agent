@@ -844,16 +844,14 @@ def secrets:
   ([$ENV[] | select(type == "string" and length >= 8)] + credentials) | unique | sort_by(length) | reverse;
 # Infra keys are always present in the room; holding their prefixes would make
 # delta boundaries depend on PATH/MODEL and break the chat-events contract.
+# Credential-named keys (including MODEL_API_KEY) stay in hold via credentials.
 def infra_key: test("^(PATH|HOME|PWD|USER|LOGNAME|SHELL|TERM|LANG|LC_|TMPDIR|TMP|TEMP|SHLVL|_|HOSTNAME|OLDPWD|MODEL|MODEL_|LFM3_)");
 def hold_secrets:
-  [$ENV | to_entries[]
-   | select(.value | type == "string" and length > 0)
-   | select(.key | infra_key | not)
-   | select(
-       (.key | test("key|token|secret|passw|pass|auth|cred|private|cookie|session"; "i"))
-       or (.value | length >= 8)
-     )
-   | .value] | unique | sort_by(length) | reverse;
+  (credentials
+   + [$ENV | to_entries[]
+      | select(.value | type == "string" and length >= 8)
+      | select(.key | infra_key | not)
+      | .value]) | unique | sort_by(length) | reverse;
 def redact($S): reduce $S[] as $v (.; split($v) | join("[redacted]"));
 JQ
 
