@@ -315,3 +315,25 @@ def test_symlinked_window_dir_is_refused(tmp_path, monkeypatch) -> None:
     (plant_dir / "win-x").symlink_to(outside)
     assert _plant(port, "win-x", NONCE)[0] == 500
     assert list(outside.iterdir()) == []
+
+
+def test_symlinked_base_leaves_target_untouched(tmp_path, monkeypatch) -> None:
+    """A symlinked ROOM_ESCAPE_NONCE_DIR must not prune (or write) through to its target."""
+    port, ledger, plant_dir = _front(tmp_path, monkeypatch, escape="1", sealed=True, plaintext="1")
+    outside = tmp_path / "outside-escape"
+    outside.mkdir()
+    old = outside / "old-win"
+    old.mkdir()
+    sentinel = old / "sentinel"
+    sentinel.write_text("keep-me")
+    aged = time.time() - 26 * 3600
+    os.utime(old, (aged, aged))
+    plant_dir.symlink_to(outside)
+    assert _plant(port, "new-win", NONCE)[0] == 500
+    assert sentinel.read_text() == "keep-me"
+    assert old.is_dir()
+    assert not (outside / "new-win").exists()
+    assert ledger.chain == []
+    # prune alone must also refuse a linked base
+    rr.prune_escape_windows(str(plant_dir), "new-win")
+    assert sentinel.read_text() == "keep-me"

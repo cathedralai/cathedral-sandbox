@@ -1258,8 +1258,12 @@ def prune_escape_windows(base_dir: str, keep_window_id: str, now: float | None =
     """Remove window directories older than the keep time. Never raises: a plant must not fail on it.
 
     An ended room's file stays until this age, so the AB#677 grace needs no extra rule.
+    Refuses a symlinked or non-directory base so prune cannot delete outside the nonce directory.
     """
     try:
+        base_st = os.lstat(base_dir)
+        if stat.S_ISLNK(base_st.st_mode) or not stat.S_ISDIR(base_st.st_mode):
+            return
         cutoff = (time.time() if now is None else now) - escape_nonce_keep_seconds()
         for name in os.listdir(base_dir):
             if name == keep_window_id or not WINDOW_DIR_RE.fullmatch(name):
@@ -2253,6 +2257,15 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(nonce, str) or not NONCE_RE.fullmatch(nonce):
             return self.reply(400, b'{"error":{"code":"invalid_request","message":"nonce must be 16 to 512 of [A-Za-z0-9+/=_-]"}}')
         base_dir = escape_nonce_dir()
+        # Reject a symlinked or non-directory base before prune: listdir/rmtree would otherwise
+        # follow the link and delete matching directories in an outside target.
+        try:
+            if os.path.lexists(base_dir):
+                base_st = os.lstat(base_dir)
+                if stat.S_ISLNK(base_st.st_mode) or not stat.S_ISDIR(base_st.st_mode):
+                    return self.reply(500, b'{"error":{"code":"plant_failed","message":"the nonce file could not be written"}}')
+        except OSError:
+            return self.reply(500, b'{"error":{"code":"plant_failed","message":"the nonce file could not be written"}}')
         prune_escape_windows(base_dir, window_id)
         try:
             path = write_escape_nonce(base_dir, window_id, nonce)
