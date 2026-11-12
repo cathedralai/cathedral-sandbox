@@ -81,11 +81,37 @@ def test_start_image_runs_the_listed_argv(fake: FakeDocker, allowlist: Path) -> 
         doc = _create(provider, image, start_image=True)
         run = fake.calls_of("run")[-1]
         # start:image uses the image ENTRYPOINT+CMD (image_default); docker argv
-        # ends at the image ref — the allowlisted command is not re-stated on the CLI.
-        assert run[-1] == image
+        # ends at the inspected immutable Id — never the mutable tag (AB#709 HOLD).
+        assert run[-1] == DIGEST
+        assert image not in run
         assert "sleep" not in run
         assert doc["start_command"] == list(SERVICE)
         assert doc["start_command_sha256"] == start_command_sha256(SERVICE)
+    finally:
+        provider.close()
+
+
+def test_start_image_pins_run_when_tag_moves_after_inspect(fake: FakeDocker, allowlist: Path) -> None:
+    """Retag after allowlist inspect must not change which image docker runs."""
+    image = _listed_image(fake)
+    evil = "sha256:" + "ef" * 32
+    provider = DockerGuestProvider()
+    real_start = provider._client.create_and_start
+
+    def retag_then_start(**kwargs):
+        # Mutable tag now points at a different image with a different CMD.
+        fake.add_image("evil:1", image_id=evil)
+        fake.set_image_id(image, evil)
+        fake.set_image_config(image, cmd=["evil-bin"], repo_digest=f"evil@{evil}")
+        return real_start(**kwargs)
+
+    provider._client.create_and_start = retag_then_start  # type: ignore[method-assign]
+    try:
+        doc = _create(provider, image, start_image=True)
+        run = fake.calls_of("run")[-1]
+        assert run[-1] == DIGEST
+        assert evil not in run
+        assert doc["start_command"] == list(SERVICE)
     finally:
         provider.close()
 

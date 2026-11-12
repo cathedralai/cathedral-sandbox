@@ -1931,6 +1931,10 @@ class DockerGuestProvider:
             }
         dind = is_dind_image(image)
         inspected = self._client.image_inspect(image)
+        # Pin docker run to the inspected Id. Allowlist / start:image decisions
+        # were made against this inspect; running the mutable tag would race a
+        # retag between inspect and create (AB#709 HOLD).
+        run_image = normalize_image_id(str(inspected.get("Id") or "")) or image
         room_tunables = self._tunables_for(request, image, dind)
         work = Path(self._inner._sandboxes[sandbox_id].root) / "work"  # noqa: SLF001
         name = f"cathedral-{sandbox_id}"
@@ -1946,7 +1950,7 @@ class DockerGuestProvider:
                 self._net_pending[sandbox_id] = network
         try:
             container_id = self._start_container(
-                request, sandbox_id=sandbox_id, image=image, name=name, work=work, dind=dind,
+                request, sandbox_id=sandbox_id, image=run_image, name=name, work=work, dind=dind,
                 entrypoint=entrypoint, image_default=image_default, network=network, attach=attach,
                 mounts=[(workspace[4], workspace[2])] if workspace is not None else (),
                 tunables=room_tunables,
