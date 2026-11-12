@@ -2137,6 +2137,10 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.handleCapacity(w, nil, false) // read-only key: operator view, no other route
 		return
 	}
+	if strings.HasPrefix(p, "/v1/broker/bindings/") && r.Method == "GET" && b.isOperator(r) {
+		b.handleBindingGet(w, strings.TrimPrefix(p, "/v1/broker/bindings/")) // operator key only
+		return
+	}
 	if p == "/v1/broker/guests" || strings.HasPrefix(p, "/v1/broker/guests/") {
 		b.handleGuestAdmin(w, r, strings.TrimPrefix(strings.TrimPrefix(p, "/v1/broker/guests"), "/"))
 		return

@@ -295,6 +295,7 @@ func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, err
 		}
 	}
 	if b.cfg.AMDVerifier == nil && !strictAttestation(h) {
+		b.archiveAttested(h, att.Binding, att.BindingSHA)
 		return res, nil // chain not checked: an ungated hotel (sealed_admission off) asked by lend.go, no verifier configured
 	}
 	if b.cfg.AMDVerifier == nil {
@@ -310,6 +311,9 @@ func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, err
 		}
 	}
 	res.amd, res.amdBinding = prev, res.bindingSHA
+	// Archive only after the AMD chain passed: a binding the chip did not vouch
+	// for must not be able to fill state_dir.
+	b.archiveAttested(h, att.Binding, att.BindingSHA)
 	return res, nil
 }
 
