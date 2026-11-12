@@ -45,7 +45,8 @@ For each UID, the validator:
 6. sends one bounded SAT task to each remaining machine; and
 7. assigns weight from the verified work those machines returned.
 
-The Cathedral validator uses zero burn. Registration, uptime, a quote, or a
+The Cathedral validator pays only owner-approved hotkeys and burns the rest.
+Registration, uptime, a quote, or a
 self-reported machine count earns nothing by itself. Weight also does not
 guarantee TAO. The subnet must have positive emission.
 
@@ -612,9 +613,9 @@ zero for the round.
 
 ## Founding miners
 
-Cathedral is admitting a small group of operators first. Apply with the
-[Founding Miner Application](https://docs.google.com/forms/d/e/1FAIpQLScxnX15Hb70AnkeZcHBI53cv_yN7aen4_h95njQvMzBxBiMpQ/viewform).
-Cathedral acknowledges every application within 48 hours.
+Compute mining is gated. Cathedral is not adding compute right now and there
+is no application. Cathedral will post an announcement when mining opens, and
+it will admit a small group of operators first.
 
 Registration alone does not admit a machine to the sealed customer pool
 or place customer jobs. After Cathedral accepts you, follow this guide

@@ -1,7 +1,14 @@
 <p align="center"><img src="docs/assets/cathedral-mark.png" alt="Cathedral" width="112"></p>
 <h1 align="center">Cathedral Sandbox</h1>
 <p align="center"><em>Cathedral&ensp;turns&ensp;independently&ensp;operated&ensp;machines&ensp;into&ensp;a&ensp;verifiable&ensp;compute&ensp;network</em></p>
-<p align="center"><sub>27 October 2026</sub></p>
+<p align="center"><sub>12 November 2026</sub></p>
+
+> [!IMPORTANT]
+> **Compute mining is closed to new miners right now.** Only approved operators
+> earn; any other machine earns nothing, even if it passes every check. There is
+> no application. Cathedral will post an announcement when mining opens.
+> **Earn today with no hardware:** the [Cathedral Escape Room](https://github.com/cathedralai/cathedral-escape-room)
+> is open to any hotkey registered on SN94.
 
 ## Contents
 <p><sub><strong>Overview</strong></sub><br>
@@ -22,19 +29,27 @@ Cathedral turns independently operated machines from trusted operators into a
 verifiable compute network. Miners supply the machines; validators check their
 confidential-computing evidence, test their work and score the results.
 
-This repository is for miners running compute workers on Bittensor SN94.
-For validator operators, use
-[Cathedral Validator](https://github.com/cathedralai/cathedral-validator).
+## The Cathedral map
+
+| Repository | What it is | Read it when |
+|---|---|---|
+| **cathedral-sandbox** (this one) | The sandbox, the sealed host code, and compute mining | You want to mine with a machine, or study the target |
+| [cathedral-escape-room](https://github.com/cathedralai/cathedral-escape-room) | The contest: break out of a sealed sandbox, prove it, earn | You want to attack the sandbox for a reward |
+| [cathedral-validator](https://github.com/cathedralai/cathedral-validator) | The SN94 validator: how weights are set, with signed updates | You want to validate, or check how miners and breaks are paid |
+
+This repository is for miners running compute workers on Bittensor SN94. It builds the wall, the escape room pays people to break it, and the validator pays both:
+about 10% of its weight to approved compute miners, about 10% to proven escapes, and the rest is burned.
 
 ## How mining works
 
 Validators verify fresh machine evidence, bind it to the live HTTPS key, reject
 duplicate machines, and run a bounded SAT task. Each distinct verified machine
-adds to its UID's score. The direct validator uses zero burn; it does not use a
-weight relay.
+adds to its UID's score, if the hotkey is on the approved list. The validator
+does not use a weight relay.
 
 Registration, uptime, an attestation quote or an advertised machine count alone
-earns nothing. Weight does not guarantee TAO: the subnet needs positive emission.
+earns nothing. Verification alone earns nothing too: the hotkey must also be
+approved ([Gated compute](https://github.com/cathedralai/cathedral-validator/blob/main/docs/GATED_COMPUTE.md)). Weight does not guarantee TAO: the subnet needs positive emission.
 This mining path is not a customer sandbox API.
 
 ## Current support
@@ -57,8 +72,8 @@ tier runs on AMD SEV-SNP hosts that Cathedral leases. Cathedral does not own
 those hosts. There is no self-serve sealed capacity; access is by request.
 This repository does not sell or provision that product.
 
-The Escape Room is coming, but it is not open. Do not treat bounties or prizes
-as live.
+The Escape Room is open, with no cash prize. Rules and a practice harness are in
+[cathedral-escape-room](https://github.com/cathedralai/cathedral-escape-room).
 
 ## What you need
 
@@ -111,13 +126,9 @@ Reuse the signer, not a second hotkey or a second signing key.
 
 ## Founding miners
 
-Cathedral is admitting a small group of operators first. Apply with the
-[Founding Miner Application](https://docs.google.com/forms/d/e/1FAIpQLScxnX15Hb70AnkeZcHBI53cv_yN7aen4_h95njQvMzBxBiMpQ/viewform).
-Cathedral acknowledges every application within 48 hours.
-
+Compute mining is gated and there is no application right now. Cathedral will post an announcement when mining opens.
 Registration alone does not admit a machine to the sealed customer pool
-or place customer jobs. After Cathedral accepts you, follow the
-[mining guide](docs/MINING.md#founding-miners).
+or place customer jobs. See the [mining guide](docs/MINING.md#founding-miners).
 
 ## Validators
 
