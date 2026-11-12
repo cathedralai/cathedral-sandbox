@@ -191,10 +191,13 @@ def test_broker_path_checks_archived_receipts(fixtures) -> None:
         "h1",
         "--skip-amd",
     )
-    assert out["verdict"] == "PASS", out
+    # Archived sealed bindings have no SNP report: signatures check, attestation
+    # is NOT PROVEN (AB#381 HOLD). Do not fold them into an attested PASS.
+    assert out["verdict"] == "NOT PROVEN", out
     assert out["chain"]["receipts"] == 2
     assert fixtures["old_bsha"] in out["chain"]["bindings"]
     assert out["attestation"]["archived_chains"][0]["signatures_ok"] == 1
+    assert "no SNP report" in out["not_proven"][0]
 
 
 def test_mismatched_archive_refused(fixtures) -> None:

@@ -542,16 +542,25 @@ def partition_receipts(receipts: list[dict]) -> dict[str, list[dict]]:
 
 
 def verify_archived_binding(att: dict) -> dict:
-    """An archived binding (no SNP report). Receipt signatures can still be checked."""
+    """An archived binding (no SNP report). Receipt signatures can still be checked.
+
+    Archived sealed bindings are NOT PROVEN for attestation: the broker archive
+    stores the binding JSON (self-hash + Ed25519 receipt key) but not the live
+    SNP report. Callers must not fold these into an attested PASS.
+    """
     binding = att["binding"]
     bsha = att["binding_sha256"]
     need(sha(canonical(binding)) == bsha, "binding_sha256 does not match the binding")
     if is_hotel_level(att):
-        return verify_hotel_attestation(att)
+        out = verify_hotel_attestation(att)
+        out["archived_binding"] = True
+        out["attestation_proven"] = True
+        return out
     need(isinstance(binding.get("receipt_key_ed25519_b64"), str), "the archived binding has no receipt key")
     _b64_key(binding["receipt_key_ed25519_b64"], "receipt key")
-    return {"binding_sha256": bsha, "archived_binding": True,
-            "measurement": binding.get("measurement"), "hotel": binding.get("hotel")}
+    return {"binding_sha256": bsha, "archived_binding": True, "attestation_proven": False,
+            "measurement": binding.get("measurement"), "hotel": binding.get("hotel"),
+            "note": "archived binding verifies signatures only; no SNP report is archived"}
 
 
 PAGE = 10000  # the hotel's largest page
@@ -691,19 +700,32 @@ def main() -> int:
                          "live": chain_out}
         checked = ("whole chain to the head the server named" if chain_head is not None
                    else "each receipt; not that none are missing")
-        if archive_chains:
-            checked += "; archived bindings verify signatures only"
+        # Sealed archives have no SNP report. Signature checks on those receipts
+        # are useful, but they must not turn an overall attested PASS into a claim
+        # that every receipt's binding was SNP-proven (AB#381 HOLD).
+        sealed_archive = bool(archive_chains) and not is_hotel_level(att)
+        if sealed_archive:
+            checked += "; archived sealed bindings verify signatures only (NOT PROVEN for attestation)"
+            verdict = "NOT PROVEN"
+        else:
+            if archive_chains:
+                checked += "; archived bindings verify signatures only"
+            verdict = "PASS"
         out = {"attestation": attestation_out,
                "chain": chain_out,
                "policy_timeline": policy_timeline(receipts), "room_tunables": room_tunables(receipts),
-               "room_links": room_links(receipts), "verdict": "PASS",
+               "room_links": room_links(receipts), "verdict": verdict,
                "checked": checked}
+        if sealed_archive:
+            out["not_proven"] = [
+                "archived sealed bindings have no SNP report; receipt signatures checked, attestation not proven"
+            ]
         if a.cathedral_sandbox:
             rooms = sorted(room for room, linked in out["room_links"].items() if linked == a.cathedral_sandbox)
             need(rooms, f"no successful create receipt names Cathedral sandbox {a.cathedral_sandbox}")
             out["sandbox_link"] = {"cathedral_sandbox_id": a.cathedral_sandbox, "rooms": rooms}
         print(json.dumps(out, indent=1))
-        return 0
+        return 3 if verdict == "NOT PROVEN" else 0
     except Fail as exc:
         print(json.dumps({"verdict": "FAIL", "reason": str(exc)}))
         return 1
