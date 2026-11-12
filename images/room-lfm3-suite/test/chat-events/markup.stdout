@@ -1,0 +1,8 @@
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":1,"type":"start","model":"lfm3-vl-2b","tools":true}
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":2,"type":"thinking","round":1,"phase":"working"}
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":3,"type":"delta","round":1,"text":"Checking. "}
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":4,"type":"tool_call","round":1,"call_id":"call_text_0","name":"run","summary":"echo hi","redacted":false}
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":5,"type":"tool_result","round":1,"call_id":"call_text_0","status":"ok","exit_code":0,"duration_ms":0,"output_bytes":3,"output_cut":false}
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":6,"type":"thinking","round":2,"phase":"working"}
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":7,"type":"delta","round":2,"text":"Done."}
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":8,"type":"answer","text":"Done.","stop_reason":"stop","rounds":2,"tool_calls":1}

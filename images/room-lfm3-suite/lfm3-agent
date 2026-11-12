@@ -35,6 +35,10 @@
 #   --warm         read the default system prompt and tools into the model
 #                  server's cache and exit (lfm3-serve runs it once at boot)
 #   -              read the message from stdin
+#   --events       write the turn as chat events instead of plain text (AB#541,
+#                  the AB#542 contract): one ASCII JSON object per line on
+#                  stdout, the model streamed as it writes. Needs --turn.
+#   --turn UUID    the turn id, written on every event line (with --events)
 #
 # Environment:
 #   LFM3_AGENT_DIR            where the conversation is kept (default /tmp/lfm3/agent)
@@ -59,6 +63,114 @@
 #   LFM3_WAIT, LFM3_TIMEOUT   as in lfm3-ask
 set -euo pipefail
 
+# --events (AB#541): chat events for the console, as the AB#542 contract
+# defines them. One ASCII JSON object per line on stdout; the model is streamed
+# so words arrive as they are written. Redaction happens here, before a byte
+# reaches stdout, because stdout is stored and receipted. Without --events none
+# of this runs and the output is the plain text it always was.
+events=""
+turn_id=""
+ev_seq=0
+ev_done=""
+ev_code=""
+ev_round=0
+ev_calls=0
+ev_used_ids=" "
+prescan() { # the options that decide the mode, before any other check runs
+  local a
+  while [ "$#" -gt 0 ]; do
+    a=$1
+    case "$a" in
+      --events) events=1 ;;
+      --turn) turn_id=${2:-}; [ "$#" -lt 2 ] || shift ;;
+      --image | --audio | --system | --speak) [ "$#" -lt 2 ] || shift ;;
+      -*) ;;
+      *) break ;;
+    esac
+    shift
+  done
+}
+prescan "$@"
+NIL_TURN=00000000-0000-0000-0000-000000000000
+ev_error_text() { # code: the fixed message and whether a retry can help
+  case "$1" in
+    not_chat_model) ev_msg="This model does not chat."; ev_retry=false ;;
+    model_unavailable) ev_msg="The model server is not ready."; ev_retry=true ;;
+    model_failed) ev_msg="The model server failed."; ev_retry=true ;;
+    context_too_long) ev_msg="The conversation is too long for the model."; ev_retry=false ;;
+    bad_request) ev_msg="The request is not valid."; ev_retry=false ;;
+    *) ev_msg="The agent failed."; ev_retry=false ;;
+  esac
+}
+ev_emit() { # json-object-without-envelope: one line, one write, seq +1
+  local obj=$1 line limit=16384
+  case "$obj" in '{"type":"answer"'*) limit=262144 ;; esac
+  line="{\"version\":1,\"turn_id\":\"$turn_id\",\"seq\":$((ev_seq + 1)),${obj#\{}"
+  if [ "$((${#line} + 1))" -gt "$limit" ]; then
+    return 1
+  fi
+  ev_seq=$((ev_seq + 1))
+  printf '%s\n' "$line"
+}
+ev_error() { # code: the terminal error line; the one fatal line on stderr follows
+  local code=$1
+  [ -z "$ev_done" ] || return 0
+  ev_done=1
+  ev_error_text "$code"
+  ev_emit "{\"type\":\"error\",\"code\":\"$code\",\"message\":\"$ev_msg\",\"retryable\":$ev_retry}" || true
+  # Allowed by the contract: one diagnostic line, 200 bytes at most, after the error line.
+  echo "${LFM3_AGENT_NAME:-lfm3-agent}: $code" >&8 2>/dev/null || true
+}
+ev_fail() { # code exit-status
+  ev_code=$1
+  exit "$2"
+}
+ev() { # jq options and program for one event: builds it and writes the line
+  local obj
+  obj=$(jq -nc -a "$@") || return 1
+  ev_emit "$obj" || return 1
+}
+ev_clock() { # milliseconds
+  if [ -n "${EPOCHREALTIME:-}" ]; then
+    local t=${EPOCHREALTIME//[^0-9]/}
+    echo $((t / 1000))
+  else
+    echo $(($(date +%s) * 1000))
+  fi
+}
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  if [ -n "$events" ] && [ -z "$ev_done" ]; then
+    # Every turn ends with exactly one terminal line, even when the script dies.
+    if [ -n "$ev_code" ]; then
+      ev_error "$ev_code"
+    elif [ "$rc" -eq 2 ]; then
+      ev_error bad_request
+    else
+      ev_error internal
+    fi
+    [ "$rc" -ne 0 ] || rc=1
+  fi
+  [ -z "${work:-}" ] || rm -rf "$work"
+  exit "$rc"
+}
+trap on_exit EXIT
+if [ -n "$events" ]; then
+  # Nothing but event lines on stdout and at most one fatal line on stderr: fd 8
+  # keeps the real stderr for that line, every other message is dropped.
+  exec 8>&2 2>/dev/null
+  turn_id=${turn_id,,}
+  case "$turn_id" in
+    ????????-????-????-????-????????????) [[ $turn_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || turn_id="" ;;
+    *) turn_id="" ;;
+  esac
+  if [ -z "$turn_id" ]; then
+    turn_id=$NIL_TURN
+    ev_fail bad_request 2
+  fi
+fi
+
 usage() {
   echo 'usage: lfm3-agent [--new] [--image FILE] [--audio FILE] [--system TEXT] [--no-tools] [--json] [--speak FILE] "message"   (or "-" for stdin)' >&2
   echo '       lfm3-agent --reset | --history' >&2
@@ -66,6 +178,7 @@ usage() {
 }
 
 if [ "${LFM3_KIND:-chat}" = decision ]; then
+  [ -z "$events" ] || ev_fail not_chat_model 2
   echo "lfm3-agent: ${MODEL:-this model} is a decision model; ask it typed questions with lfm3-decide" >&2
   exit 2
 fi
@@ -73,6 +186,7 @@ fi
 # answers about the sandbox, so it gets no chat harness.
 case "${MODEL:-}" in
   *-base)
+    [ -z "$events" ] || ev_fail not_chat_model 2
     echo "lfm3-agent: $MODEL is a base model and cannot chat or use tools; continue text with lfm3-ask --raw \"...\"" >&2
     exit 2
     ;;
@@ -201,7 +315,6 @@ TOOLS='[
 
 chmod 700 "$DIR"
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
 
 # One conversation, one writer: two calls at once would interleave turns.
 if command -v flock >/dev/null 2>&1; then
@@ -267,12 +380,21 @@ add_part() { # kind file
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h | --help) usage ;;
+    --events)
+      shift
+      ;;
+    --turn)
+      [ "$#" -ge 2 ] || usage
+      shift 2
+      ;;
     --reset)
+      [ -z "$events" ] || usage
       forget
       echo "lfm3-agent: conversation cleared" >&2
       exit 0
       ;;
     --history)
+      [ -z "$events" ] || usage
       show_history
       exit 0
       ;;
@@ -320,6 +442,14 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# Voice and JSON turns stay on the plain path in v1 (AB#542 section 9), and an
+# events turn is never interactive.
+[ -n "$events" ] || [ -z "$turn_id" ] || usage
+if [ -n "$events" ]; then
+  if [ -n "$json" ] || [ -n "$speak_file" ] || [ -n "$warm" ]; then usage; fi
+  if [ -z "$prompt" ] && [ "$(jq length "$work/parts")" -eq 0 ]; then usage; fi
+fi
+
 # --warm (lfm3-serve, once at boot) leaves the kept conversation alone.
 if [ -z "$warm" ]; then
   [ -z "$fresh" ] || forget
@@ -359,38 +489,54 @@ clip() { # file: the first OUTPUT_CHARS characters, and how much was cut
   fi
 }
 
+# What a tool call did, for the tool_result event (--events): status, exit code
+# or null, output bytes before clipping, and whether the model got a clipped copy.
+tool_meta() { # status exit-code output-bytes
+  [ -n "$events" ] || return 0
+  local cut=false
+  [ "$3" -le "$OUTPUT_CHARS" ] || cut=true
+  printf '%s %s %s %s\n' "$1" "$2" "$3" "$cut" >"$work/tool_meta"
+}
+
 run_tool() { # name arguments-json: prints the result the model reads
-  local name=$1 args=$2 value status
+  local name=$1 args=$2 value status size
   if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$args"; then
+    tool_meta refused null 0
     echo "error: the arguments are not a JSON object: $args"
     return
   fi
   case "$name" in
     run)
       value=$(jq -r '.command // empty | tostring' <<<"$args")
-      [ -n "$value" ] || { echo "error: run needs a command"; return; }
+      [ -n "$value" ] || { tool_meta refused null 0; echo "error: run needs a command"; return; }
       printf '$ %s\n' "$value" >&2
       status=0
-      (cd "$CWD" && with_timeout bash -c "$value") </dev/null >"$work/tool_out" 2>&1 || status=$?
+      (cd "$CWD" && with_timeout bash -c "$value") </dev/null >"$work/tool_out" 2>&1 8>&- || status=$?
+      size=$(wc -c <"$work/tool_out" | tr -d ' ')
       if [ "$status" -eq 124 ]; then
+        tool_meta timeout 124 "$size"
         printf 'exit code: 124 (stopped after %ss)\n' "$CMD_TIMEOUT"
       else
+        if [ "$status" -eq 0 ]; then tool_meta ok 0 "$size"; else tool_meta error "$status" "$size"; fi
         printf 'exit code: %s\n' "$status"
       fi
       clip "$work/tool_out"
       ;;
     read_file)
       value=$(jq -r '.path // empty | tostring' <<<"$args")
-      [ -n "$value" ] || { echo "error: read_file needs a path"; return; }
+      [ -n "$value" ] || { tool_meta refused null 0; echo "error: read_file needs a path"; return; }
       case "$value" in /*) ;; *) value=$CWD/$value ;; esac
       printf '[read_file] %s\n' "$value" >&2
       if [ -f "$value" ] && [ -r "$value" ]; then
+        tool_meta ok null "$(wc -c <"$value" | tr -d ' ')"
         clip "$value"
       else
+        tool_meta error null 0
         echo "error: cannot read $value"
       fi
       ;;
     *)
+      tool_meta refused null 0
       echo "error: there is no tool named $name; use run or read_file"
       ;;
   esac
@@ -431,27 +577,7 @@ build_body() { # with-tools [max-tokens] [sampling]
     + (if $json == "1" then {response_format: $format} else {} end)' >"$work/body"
 }
 
-ask_model() { # with-tools [sampling]: the reply message goes to $work/msg
-  local status=0 code
-  build_body "$1" "" "${2:-}"
-  curl -sS --max-time "${LFM3_TIMEOUT:-600}" -o "$work/out" -w '%{http_code}' \
-    -H 'Content-Type: application/json' -H "Authorization: Bearer ${MODEL_API_KEY:-local}" \
-    --data-binary @"$work/body" "$BASE_URL/chat/completions" >"$work/code" || status=$?
-  code=$(cat "$work/code" 2>/dev/null || true)
-  # A tool call whose arguments ran past the token cap (a looping heredoc, ADO
-  # 551) comes back as a 500. The caller answers without tools instead.
-  if [ "$1" = 1 ] && [ "$code" = 500 ] && grep -q 'parse tool call' "$work/out" 2>/dev/null; then
-    return 3
-  fi
-  if [ "$status" -ne 0 ] || [ "$code" != 200 ]; then
-    head -c 2000 "$work/out" >&2 2>/dev/null || true
-    echo >&2
-    echo "lfm3-agent: $BASE_URL/chat/completions answered ${code:-nothing} (curl exit $status)" >&2
-    if grep -qi 'context' "$work/out" 2>/dev/null; then
-      echo "lfm3-agent: the conversation is too long for the model; start over with --new" >&2
-    fi
-    exit 1
-  fi
+normalize_reply() { # $work/out holds a chat completion: the reply message goes to $work/msg
   # A tool call the server did not parse stays in the text as markup. Parse it
   # the way Liquid's model card does (<tool_call><function=NAME><parameter=KEY>
   # VALUE</parameter></function></tool_call>, or a JSON body), and never show
@@ -480,6 +606,31 @@ ask_model() { # with-tools [sampling]: the reply message goes to $work/msg
           else .content = $rest end
       else . end' "$work/out" >"$work/msg"
 }
+
+ask_model() { # with-tools [sampling]: the reply message goes to $work/msg
+  local status=0 code
+  build_body "$1" "" "${2:-}"
+  curl -sS --max-time "${LFM3_TIMEOUT:-600}" -o "$work/out" -w '%{http_code}' \
+    -H 'Content-Type: application/json' -H "Authorization: Bearer ${MODEL_API_KEY:-local}" \
+    --data-binary @"$work/body" "$BASE_URL/chat/completions" >"$work/code" || status=$?
+  code=$(cat "$work/code" 2>/dev/null || true)
+  # A tool call whose arguments ran past the token cap (a looping heredoc, ADO
+  # 551) comes back as a 500. The caller answers without tools instead.
+  if [ "$1" = 1 ] && [ "$code" = 500 ] && grep -q 'parse tool call' "$work/out" 2>/dev/null; then
+    return 3
+  fi
+  if [ "$status" -ne 0 ] || [ "$code" != 200 ]; then
+    head -c 2000 "$work/out" >&2 2>/dev/null || true
+    echo >&2
+    echo "lfm3-agent: $BASE_URL/chat/completions answered ${code:-nothing} (curl exit $status)" >&2
+    if grep -qi 'context' "$work/out" 2>/dev/null; then
+      echo "lfm3-agent: the conversation is too long for the model; start over with --new" >&2
+    fi
+    exit 1
+  fi
+  normalize_reply
+}
+
 
 slot_call() { # save | restore: the server's slot 0 and $LFM3_SLOT_DIR/warm.bin; prints the HTTP status
   curl -sS --max-time 60 -o /dev/null -w '%{http_code}' -X POST \
@@ -670,8 +821,183 @@ speak_answer() { # answer-file out-file
   return 0
 }
 
+# --events: the model's reply, streamed. llama-server answers with SSE
+# (stream: true). One jq reads the stream as it arrives and writes a delta line
+# per piece of answer text. It holds text back from a "<" until the next
+# characters rule out the start of tool-call markup or reasoning (AB#542
+# section 5.6), so none of that is ever a delta; the tool call itself and the
+# full text are collected and handled like a non-streaming reply. Streamed
+# tool-call fragments and reasoning_content are never forwarded.
+read -r -d '' STREAM_JQ <<'JQ' || true
+def toks: ["<tool_call", "</tool_call", "<function=", "<parameter=", "<|", "<think"];
+def chunks: if length == 0 then empty else .[0:1024], (.[1024:] | chunks) end;
+def drain:
+  if .mode == "drop" then .buf = ""
+  elif .mode == "think" then
+    (.buf | split("</think>")) as $p
+    | if ($p | length) > 1 then .buf = ($p[1:] | join("</think>")) | .mode = "text" | drain
+      else .buf = (if (.buf | length) > 8 then .buf[(.buf | length) - 8:] else .buf end) end
+  else
+    (.buf | split("<")[0]) as $h
+    | .out += $h
+    | .buf = .buf[($h | length):]
+    | if .buf == "" then .
+      else
+        .buf as $r
+        | ([toks[] | . as $t | select($r | startswith($t))] | first // null) as $m
+        | if $m != null then
+            (if $m == "<think" then .mode = "think" | .buf = $r[6:] else .mode = "drop" | .buf = "" end) | drain
+          elif any(toks[]; startswith($r)) then .
+          else .out += "<" | .buf = $r[1:] | drain end
+      end
+  end;
+def parse:
+  if startswith("data:") then
+    (ltrimstr("data:") | sub("^ "; "")) as $d
+    | if $d == "[DONE]" then {done: true}
+      else ((try ($d | fromjson) catch {skip: true}) | if type == "object" then . else {skip: true} end) end
+  else {skip: true} end;
+def apply($c):
+  if $c.done then .done = true
+  elif $c.error != null then .err = true
+  else
+    (($c.choices // [])[0] // {}) as $ch
+    | ($ch.delta // {}) as $d
+    | (if ($d.content | type) == "string" then $d.content else "" end) as $t
+    | reduce (($d.tool_calls // [])[]) as $tc (.;
+        ($tc.index // 0 | tostring) as $k
+        | .calls[$k].id = ($tc.id // .calls[$k].id // null)
+        | .calls[$k].name = ($tc.function.name // .calls[$k].name // null)
+        | .calls[$k].args = ((.calls[$k].args // "") + (($tc.function.arguments // "") | if type == "string" then . else tojson end)))
+    | if $ch.finish_reason != null then .finish = $ch.finish_reason else . end
+    | if $t != "" then .text += $t | .buf += $t | drain else . end
+    | if .out != "" then .emit = [.out | chunks] | .out = "" else . end
+  end;
+foreach ((inputs | {line: rtrimstr("\r")}), {end: true}) as $x (
+  {buf: "", out: "", mode: "text", text: "", calls: {}, finish: null, done: false, err: false, emit: [], final: false};
+  .emit = [] | if $x.end then .final = true else apply($x.line | parse) end;
+  (.emit[] | {type: "delta", round: $round, text: .}),
+  (select(.final) | {_end: {
+    content: .text, finish: .finish, err: .err, done: (.done or .finish != null),
+    tool_calls: (.calls | to_entries | sort_by(.key | tonumber)
+      | map({id: (.value.id // ("call_s" + .key)), type: "function",
+             function: {name: (.value.name // ""), arguments: (.value.args // "")}})) }}))
+JQ
+
+# What a tool call may show on the Chat surface (AB#542 section 6): a one-line
+# summary with secrets removed. Applied here, before stdout.
+read -r -d '' SUMMARY_JQ <<'JQ' || true
+def u16: explode | map(if . >= 65536 then 2 else 1 end) | add // 0;
+def one_line: explode | reduce .[] as $c ({o: [], p: false};
+    if $c < 32 or ($c >= 127 and $c <= 159) then (if .p then . else .o += [32] | .p = true end)
+    else .o += [$c] | .p = false end) | .o | implode;
+def names: "key|token|secret|passw|pass|auth|cred|private|cookie|session";
+def scrub:
+  . as $in
+  | ([$ENV[] | select(type == "string" and length >= 8)] | unique | sort_by(length) | reverse) as $secrets
+  | gsub("-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)"; "[redacted]")
+  | reduce $secrets[] as $v (.; split($v) | join("[redacted]"))
+  | gsub("(?<n>authorization\\s*[:=]\\s*)(?:(?:bearer|basic|token)\\s+)?[^\\s'\"]+"; "\(.n)[redacted]"; "i")
+  | gsub("(?<n>\\bbearer\\s+)[^\\s'\"]+"; "\(.n)[redacted]"; "i")
+  | gsub("(?<n>[A-Za-z0-9_.-]*(?:" + names + ")[A-Za-z0-9_.-]*)=(?:\"[^\"]*\"|'[^']*'|[^\\s'\"]+)"; "\(.n)=[redacted]"; "i")
+  | gsub("(?<n>--[A-Za-z0-9_-]*(?:" + names + ")[A-Za-z0-9_-]*)(?<s>=|\\s+)(?!-)(?:\"[^\"]*\"|'[^']*'|[^\\s'\"]+)"; "\(.n)\(.s)[redacted]"; "i")
+  | gsub("(?<![A-Za-z0-9])(?:sk-|ghp_|gho_|ghs_|github_pat_|xox[abpr]-|AKIA|ASIA)[A-Za-z0-9_-]*"; "[redacted]")
+  | gsub("[A-Za-z0-9+/=_-]{32,}"; "[redacted]");
+def summarize:
+  tostring | one_line | . as $flat | scrub as $s
+  | {r: ($s != $flat),
+     t: (if ($s | u16) > 160 then ($s | .[0:157] | until(u16 <= 157; .[0:(length - 1)])) + "..." else $s end)};
+JQ
+
+ev_pick_id() { # the model's call id: the id shown, unique in this turn and safe to match on
+  local want=$1
+  ev_calls=$((ev_calls + 1))
+  if [[ $want =~ ^[A-Za-z0-9_-]{1,64}$ ]] && [[ $ev_used_ids != *" $want "* ]]; then
+    ev_cid=$want
+  else
+    ev_cid=call_$ev_calls
+    while [[ $ev_used_ids == *" $ev_cid "* ]]; do ev_cid+=_; done
+  fi
+  ev_used_ids+="$ev_cid "
+}
+
+ev_tool_call() { # name arguments-json
+  ev --arg id "$ev_cid" --arg n "$1" --arg a "$2" --argjson r "$ev_round" "$SUMMARY_JQ"'
+    ($a | (try fromjson catch {}) | if type == "object" then . else {} end) as $o
+    | (if $n == "run" then $o.command elif $n == "read_file" then $o.path else $n end // "") as $raw
+    | ($raw | summarize) as $s
+    | {type: "tool_call", round: $r, call_id: $id, name: (if $n == "run" or $n == "read_file" then $n else "other" end),
+       summary: $s.t, redacted: $s.r}'
+}
+
+ev_tool_result() { # duration-ms: from the facts run_tool left in $work/tool_meta
+  local status=error code=null bytes=0 cut=false
+  read -r status code bytes cut <"$work/tool_meta" 2>/dev/null || true
+  ev --arg id "$ev_cid" --arg s "$status" --argjson e "$code" --argjson d "$1" --argjson b "$bytes" --argjson c "$cut" \
+    --argjson r "$ev_round" '{type: "tool_result", round: $r, call_id: $id, status: $s, exit_code: $e,
+      duration_ms: $d, output_bytes: $b, output_cut: $c}'
+}
+
+ev_answer() { # stop-reason: the terminal line, text cut to the contract's caps
+  ev --rawfile t "$work/answer" --arg sr "$1" --argjson rounds "$ev_round" --argjson tc "$ev_calls" '
+    def u16: explode | map(if . >= 65536 then 2 else 1 end) | add // 0;
+    def wire: explode | map(if . < 128 then (if . == 34 or . == 92 or . < 32 then 6 else 1 end) elif . < 65536 then 6 else 12 end) | add // 0;
+    ($t | rtrimstr("\n") | .[0:32768]
+      | until(u16 <= 32768 and wire <= 260000; .[0:((length * 9 / 10) | floor)])) as $x
+    | {type: "answer", text: $x, stop_reason: $sr, rounds: $rounds, tool_calls: $tc}'
+  ev_done=1
+}
+
+wait_for_server_events() {
+  if curl -fsS -o /dev/null "${BASE_URL%/v1}/health" 2>/dev/null; then
+    return 0
+  fi
+  ev '{type: "thinking", round: 1, phase: "warming"}'
+  for _ in $(seq 1 "${LFM3_WAIT:-120}"); do
+    if curl -fsS -o /dev/null "${BASE_URL%/v1}/health" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  ev_fail model_unavailable 1
+}
+
+ask_model_stream() { # with-tools [sampling]: the reply message goes to $work/msg, delta lines to stdout
+  local line rc code
+  build_body "$1" "" "${2:-}"
+  jq '. + {stream: true}' "$work/body" >"$work/body.stream"
+  rm -f "$work/end" "$work/curl_rc" "$work/hdr" "$work/raw"
+  while IFS= read -r line; do
+    case "$line" in
+      '{"_end":'*) printf '%s' "$line" >"$work/end" ;;
+      *) ev_emit "$line" || ev_fail internal 1 ;;
+    esac
+  done < <({ curl -sS -N -D "$work/hdr" --max-time "${LFM3_TIMEOUT:-600}" \
+      -H 'Content-Type: application/json' -H "Authorization: Bearer ${MODEL_API_KEY:-local}" \
+      --data-binary @"$work/body.stream" "$BASE_URL/chat/completions" 2>/dev/null
+    echo "$?" >"$work/curl_rc"; } | tee "$work/raw" | jq -n -R -c -a --unbuffered --argjson round "$ev_round" "$STREAM_JQ")
+  rc=$(cat "$work/curl_rc" 2>/dev/null || echo 1)
+  code=$(grep -a '^HTTP/' "$work/hdr" 2>/dev/null | tail -n 1 | cut -d' ' -f2 | tr -d '\r' || true)
+  if [ "$rc" -ne 0 ] || [ "$code" != 200 ] || ! jq -e '._end.done == true and (._end.err | not)' "$work/end" >/dev/null 2>&1; then
+    # As in the plain path: a tool call that ran past the token cap is answered without tools.
+    if [ "$1" = 1 ] && grep -aq 'parse tool call' "$work/raw" 2>/dev/null; then
+      return 3
+    fi
+    if [ "$code" != 200 ] && [ -n "$code" ] && grep -aqi 'context' "$work/raw" 2>/dev/null; then
+      ev_fail context_too_long 1
+    fi
+    ev_fail model_failed 1
+  fi
+  # Reasoning blocks are not part of the reply (section 6).
+  jq '._end | {choices: [{message: {role: "assistant", tool_calls: .tool_calls,
+      content: (.content | if test("<think") then (gsub("<think>[\\s\\S]*?</think>"; "") | gsub("<think[\\s\\S]*$"; "") | sub("^\\s+"; "")) else . end)},
+      finish_reason: .finish}]}' "$work/end" >"$work/out"
+  jq -r '._end.finish // ""' "$work/end" >"$work/finish"
+  normalize_reply
+}
+
 one_turn() { # message
-  local text=$1 round=0 with calls i id name args result looped
+  local text=$1 round=0 with calls i id name args result looped ask stop_reason started finished tool_rounds=0
   if [ -z "$text" ] && [ "$(jq length "$work/parts")" -eq 0 ]; then
     usage
   fi
@@ -684,14 +1010,26 @@ one_turn() { # message
       else $parts[0] + (if $t == "" then [] else [{type: "text", text: $t}] end) end)}]' >"$work/user_sent"
   echo '[]' >"$work/turn"
 
-  wait_for_server
+  ask=ask_model
+  if [ -n "$events" ]; then
+    ask=ask_model_stream
+    ev --arg m "$MODEL_NAME" --argjson t "$([ -n "$tools" ] && echo true || echo false)" \
+      '{type: "start", model: ($m | .[0:64]), tools: $t}'
+    wait_for_server_events
+  else
+    wait_for_server
+  fi
   while :; do
     if [ -n "$tools" ] && [ "$round" -lt "$STEPS" ]; then
       with=1
     else
       with=0
     fi
-    if ! ask_model "$with" "$(round_sampling "$with")"; then
+    if [ -n "$events" ]; then
+      ev_round=$((ev_round + 1))
+      ev --argjson r "$ev_round" '{type: "thinking", round: $r, phase: "working"}'
+    fi
+    if ! "$ask" "$with" "$(round_sampling "$with")"; then
       round=$STEPS
       continue
     fi
@@ -700,6 +1038,7 @@ one_turn() { # message
       break
     fi
     round=$((round + 1))
+    tool_rounds=$((tool_rounds + 1))
     jq --slurpfile m "$work/msg" \
       '. + [{role: "assistant", content: ($m[0].content // ""), tool_calls: $m[0].tool_calls}]' \
       "$work/turn" >"$work/turn.new"
@@ -709,7 +1048,17 @@ one_turn() { # message
       name=$(jq -r --argjson i "$i" '.tool_calls[$i].function.name // ""' "$work/msg")
       args=$(jq -r --argjson i "$i" '.tool_calls[$i].function.arguments // "{}"
         | if type == "string" then . else tojson end' "$work/msg")
+      if [ -n "$events" ]; then
+        ev_pick_id "$id"
+        ev_tool_call "$name" "$args"
+        started=$(ev_clock)
+        rm -f "$work/tool_meta"
+      fi
       result=$(run_tool "$name" "$args")
+      if [ -n "$events" ]; then
+        finished=$(ev_clock)
+        ev_tool_result "$((finished - started))"
+      fi
       jq --arg id "$id" --arg name "$name" --arg r "$result" \
         '. + [{role: "tool", tool_call_id: $id, name: $name, content: $r}]' \
         "$work/turn" >"$work/turn.new"
@@ -739,6 +1088,16 @@ one_turn() { # message
   mv "$HISTORY.new" "$HISTORY"
   if [ "$(jq length "$work/parts")" -gt 0 ]; then
     cp "$work/parts" "$MEDIA_FILE"
+  fi
+  if [ -n "$events" ]; then
+    # The loop explanation is a stop reason, not text; length wins over steps.
+    stop_reason=stop
+    if [ -n "$looped" ]; then stop_reason=loop
+    elif [ "$(cat "$work/finish" 2>/dev/null)" = length ]; then stop_reason=length
+    elif [ "$tool_rounds" -ge "$STEPS" ] && [ "$tool_rounds" -gt 0 ]; then stop_reason=steps
+    fi
+    ev_answer "$stop_reason"
+    return 0
   fi
   cat "$work/answer"
   if [ -n "$looped" ]; then

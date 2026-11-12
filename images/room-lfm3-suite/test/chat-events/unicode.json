@@ -1,0 +1,15 @@
+{
+  "args": [
+    "say it"
+  ],
+  "replies": [
+    {
+      "pieces": [
+        "caf\u00e9 na\u00efve ",
+        "\ud83d\ude00 done"
+      ]
+    }
+  ],
+  "env": {},
+  "exit": 0
+}

@@ -1,0 +1,21 @@
+{
+  "args": [
+    "go"
+  ],
+  "replies": [
+    {
+      "pieces": [
+        "Checking. <tool",
+        "_call>\n<function=",
+        "run>\n<parameter=command>\necho hi\n</parameter>\n</function>\n</tool_call>"
+      ]
+    },
+    {
+      "pieces": [
+        "Done."
+      ]
+    }
+  ],
+  "env": {},
+  "exit": 0
+}

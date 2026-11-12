@@ -1,0 +1,5 @@
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":1,"type":"start","model":"lfm3-vl-2b","tools":true}
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":2,"type":"thinking","round":1,"phase":"working"}
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":3,"type":"delta","round":1,"text":"caf\u00e9 na\u00efve "}
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":4,"type":"delta","round":1,"text":"\ud83d\ude00 done"}
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":5,"type":"answer","text":"caf\u00e9 na\u00efve \ud83d\ude00 done","stop_reason":"stop","rounds":1,"tool_calls":0}
