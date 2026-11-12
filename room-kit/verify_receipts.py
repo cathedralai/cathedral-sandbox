@@ -58,8 +58,13 @@ Image approval is a signed policy release; that is a later step.
 Usage:
   verify_receipts.py --attestation att.json --receipts chain.json [--receipt-header B64 ...]
   verify_receipts.py --broker https://<broker> --key-file KEY --hotel <hotel id> [--sandbox ID]
+  verify_receipts.py --broker ... --operator-key-file OP --hotel <id>   # receipts from earlier boots
   verify_receipts.py --origin https://<miner ip>:<port> --require-sealed [--expected-measurement M]
   add --owner-pubkey B64 --expected-measurement HEX for a dedicated machine
+
+When receipts name a binding_sha256 other than the live attestation, pass --broker and
+--operator-key-file so GET /v1/broker/bindings/<sha> can load each archived binding.
+The archive holds binding JSON only (no SNP report); those checks cover signatures only.
 """
 from __future__ import annotations
 
@@ -507,6 +512,48 @@ def get(url: str, key: str) -> dict:
         return json.loads(resp.read())
 
 
+def fetch_archived_binding(broker: str, operator_key: str, binding_sha256: str) -> dict:
+    """GET /v1/broker/bindings/<sha256>: binding JSON the broker archived after admission."""
+    want = binding_sha256.lower()
+    need(HEX64.fullmatch(want) is not None, "binding_sha256 is not 64 lower-case hex")
+    binding = get(f"{broker.rstrip('/')}/v1/broker/bindings/{want}", operator_key)
+    need(isinstance(binding, dict), "the archived binding is not a JSON object")
+    got = sha(canonical(binding))
+    need(got == want, "the archived binding does not hash to its name")
+    return {"binding": binding, "binding_sha256": got}
+
+
+def receipt_binding_shas(receipts: list[dict]) -> set[str]:
+    out: set[str] = set()
+    for rc in receipts:
+        st = rc.get("statement") if isinstance(rc, dict) else None
+        if isinstance(st, dict) and isinstance(st.get("binding_sha256"), str):
+            out.add(st["binding_sha256"].lower())
+    return out
+
+
+def partition_receipts(receipts: list[dict]) -> dict[str, list[dict]]:
+    groups: dict[str, list[dict]] = {}
+    for rc in receipts:
+        st = rc["statement"]
+        bsha = st["binding_sha256"].lower()
+        groups.setdefault(bsha, []).append(rc)
+    return groups
+
+
+def verify_archived_binding(att: dict) -> dict:
+    """An archived binding (no SNP report). Receipt signatures can still be checked."""
+    binding = att["binding"]
+    bsha = att["binding_sha256"]
+    need(sha(canonical(binding)) == bsha, "binding_sha256 does not match the binding")
+    if is_hotel_level(att):
+        return verify_hotel_attestation(att)
+    need(isinstance(binding.get("receipt_key_ed25519_b64"), str), "the archived binding has no receipt key")
+    _b64_key(binding["receipt_key_ed25519_b64"], "receipt key")
+    return {"binding_sha256": bsha, "archived_binding": True,
+            "measurement": binding.get("measurement"), "hotel": binding.get("hotel")}
+
+
 PAGE = 10000  # the hotel's largest page
 
 
@@ -537,6 +584,8 @@ def main() -> int:
     ap.add_argument("--receipt-header", action="append", default=[], help="X-Room-Receipt header value")
     ap.add_argument("--broker", help="broker base URL; fetches attestation and receipts itself")
     ap.add_argument("--key-file", help="guest API key file for --broker")
+    ap.add_argument("--operator-key-file",
+                    help="broker operator key file; fetches archived bindings for receipts from earlier boots")
     ap.add_argument("--hotel", required=False, default=None, help="hotel id (required with --broker)")
     ap.add_argument("--sandbox", help="with --broker: one room's receipts instead of the whole chain")
     ap.add_argument("--expected-measurement")
@@ -596,9 +645,23 @@ def main() -> int:
             # A sealed guest whose TSM is missing runs level 1 under the same
             # hotel name. Asking for a measurement means asking for SNP.
             raise Fail("the hotel answered a level 1 (unsealed) binding; an SEV-SNP attestation was asked for")
+        live_bsha = att["binding_sha256"].lower()
+        stale_shas = receipt_binding_shas(receipts) - {live_bsha}
+        if stale_shas and not a.broker:
+            raise Fail("some receipts name an earlier binding than the attestation's; "
+                       "pass --broker and --operator-key-file to load archived bindings")
+        if stale_shas and not a.operator_key_file:
+            raise Fail(f"{len(stale_shas)} receipt binding(s) differ from the live attestation; "
+                       "pass --operator-key-file to fetch archived bindings from the broker")
+        operator_key = open(a.operator_key_file).read().strip() if a.operator_key_file else ""
+        groups = partition_receipts(receipts)
+        live_receipts = groups.get(live_bsha, [])
+        chain_head = head if not stale_shas else None
+        archive_chains: list[dict] = []
         if is_hotel_level(att):
             need(not (a.require_tls or a.origin or peer_spki), "a level 1 binding has no attested guest TLS")
             attestation_out = verify_hotel_attestation(att)
+            chain_out = verify_receipts(att, live_receipts, chain_head)
         else:
             attestation_out = verify_attestation(att, a.expected_measurement, a.product, a.kds_cache,
                                                  a.ark_sha256, a.skip_amd)
@@ -610,15 +673,31 @@ def main() -> int:
                 attestation_out["guest_tls"] = guest_tls
             if owner is not None:
                 attestation_out["owner"] = verify_owner(att, owner)
-                attestation_out["owner"]["signed_creates"] = owner_signed_creates(receipts, owner)
+                attestation_out["owner"]["signed_creates"] = owner_signed_creates(live_receipts, owner)
+            chain_out = verify_receipts(att, live_receipts, chain_head)
+        for bsha in sorted(stale_shas):
+            att_old = fetch_archived_binding(a.broker, operator_key, bsha)
+            verify_archived_binding(att_old)
+            if owner is not None:
+                owner_signed_creates(groups[bsha], owner)
+            part = verify_receipts(att_old, groups[bsha], None)
+            part["binding_sha256"] = bsha
+            archive_chains.append(part)
+        if archive_chains:
+            attestation_out["archived_chains"] = archive_chains
+            chain_out = {"receipts": len(receipts), "signatures_ok": chain_out.get("signatures_ok", 0)
+                         + sum(p["signatures_ok"] for p in archive_chains),
+                         "bindings": [live_bsha, *[p["binding_sha256"] for p in archive_chains]],
+                         "live": chain_out}
+        checked = ("whole chain to the head the server named" if chain_head is not None
+                   else "each receipt; not that none are missing")
+        if archive_chains:
+            checked += "; archived bindings verify signatures only"
         out = {"attestation": attestation_out,
-               "chain": verify_receipts(att, receipts, head),
+               "chain": chain_out,
                "policy_timeline": policy_timeline(receipts), "room_tunables": room_tunables(receipts),
                "room_links": room_links(receipts), "verdict": "PASS",
-               # head is named by the server, not signed: even a whole chain does
-               # not prove that nothing was cut from its end.
-               "checked": ("whole chain to the head the server named" if head is not None
-                           else "each receipt; not that none are missing")}
+               "checked": checked}
         if a.cathedral_sandbox:
             rooms = sorted(room for room, linked in out["room_links"].items() if linked == a.cathedral_sandbox)
             need(rooms, f"no successful create receipt names Cathedral sandbox {a.cathedral_sandbox}")
