@@ -243,6 +243,22 @@ EXEC_MAX_BYTES = 9 * 1024 * 1024  # one request: base64 of the largest envelope 
 # EXEC_ANSWER_MARGIN_SECONDS (the room API adds 15 s for docker exec past the command's limit).
 EXEC_TIMEOUT_MAX = 1800
 EXEC_ANSWER_MARGIN_SECONDS = 120
+# The room API's own limit on a plain exec (cathedral/sandbox_api.py EXEC_MAX_TIMEOUT_SECONDS). The front
+# waits for a plain exec's answer up to the command's timeout, so it must not stop waiting before the
+# API does: a flat 1800 s wait answered 502 for any command running past 30 minutes (AB#696).
+EXEC_API_MAX_SECONDS = 14400
+
+
+def plain_exec_wait(body: bytes | None) -> float:
+    """How long the front waits for the room API's answer to a plain exec: its timeout plus the margin."""
+    try:
+        timeout = json.loads(body or b"").get("timeout_seconds")
+    except (ValueError, RecursionError, AttributeError):
+        timeout = None
+    if type(timeout) is not int or not 1 <= timeout <= EXEC_API_MAX_SECONDS:
+        # The API refuses a timeout it cannot use at once, and one it takes has no other bound than its maximum.
+        timeout = EXEC_API_MAX_SECONDS
+    return timeout + EXEC_ANSWER_MARGIN_SECONDS
 # Replay: each accepted envelope's ephemeral key is kept until its issued_at leaves the window,
 # and an envelope outside the window is refused, so a kept key is never needed after that.
 EXEC_MAX_AGE_SECONDS = 120
@@ -1919,7 +1935,9 @@ class Handler(BaseHTTPRequestHandler):
         if refusal is not None:
             status, headers, out = 403, [], refusal
         else:
-            status, headers, out = self.upstream(self.server.api_port, body)
+            status, headers, out = self.upstream(
+                self.server.api_port, body,
+                **({"timeout": plain_exec_wait(body)} if action == "exec" else {}))
         extra = {}
         if action and self.authorized():
             try:
