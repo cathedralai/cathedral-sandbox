@@ -96,7 +96,7 @@ dynamic_network_policy true; allowlist entry types (hostnames, wildcards,
 ipv4, cidrs, no ipv6, ports 80 and 443); max_lifetime_seconds 23 h;
 cleanup_margin 0; exec_output_limit_bytes 16 MiB (matches
 sandbox_guest.py:1459 cap); max_exec_seconds from config; templates with
-hourly_rate_usd "0.05", "0.10", "0.20". Locks b.mu. Callers: serveCompat
+no rate field (the API owns the price, AB#308). Locks b.mu. Callers: serveCompat
 189. Invariant: the catalog describes what this guest can get (it does
 not: see hazards 6, 23).
 

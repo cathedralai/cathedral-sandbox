@@ -43,7 +43,6 @@ type catalogTemplate struct {
 	CPU         int
 	MemoryGiB   int
 	DiskGiB     int
-	Rate        string
 	// Image is the hotel create image. Live model templates are pinned by
 	// digest (repository@sha256:hex). Unpublished suite templates keep a
 	// GHCR tag until those images exist.
@@ -73,61 +72,61 @@ var catalogTemplates = []catalogTemplate{
 	{
 		Name: "room-1x4", DisplayName: "room-1x4",
 		Description: "1 vCPU, 4 GiB room",
-		CPU:         1, MemoryGiB: 4, DiskGiB: 10, Rate: "0.05",
+		CPU:         1, MemoryGiB: 4, DiskGiB: 10,
 		Image: "alpine:3.20", Live: true, Sealed: sealedReady,
 	},
 	{
 		Name: "room-2x8", DisplayName: "room-2x8",
 		Description: "2 vCPU, 8 GiB room",
-		CPU:         2, MemoryGiB: 8, DiskGiB: 10, Rate: "0.10",
+		CPU:         2, MemoryGiB: 8, DiskGiB: 10,
 		Image: "alpine:3.20", Live: true, Sealed: sealedReady,
 	},
 	{
 		Name: "room-4x16", DisplayName: "room-4x16",
 		Description: "4 vCPU, 16 GiB room",
-		CPU:         4, MemoryGiB: 16, DiskGiB: 10, Rate: "0.20",
+		CPU:         4, MemoryGiB: 16, DiskGiB: 10,
 		Image: "alpine:3.20", Live: true, Sealed: sealedReady,
 	},
 	{
 		Name: "lfm3-1.7b", DisplayName: "LFM3 1.7B (CPU)",
 		Description: "LFM3 1.73B on CPU via llama.cpp (LFM3-1.7B-Q4_K_M.gguf). Sandbox inputs: text. Sandbox outputs: text. GPU is not required. Sealed AMD SEV-SNP only.",
-		CPU:         2, MemoryGiB: 8, DiskGiB: 10, Rate: "0.10",
+		CPU:         2, MemoryGiB: 8, DiskGiB: 10,
 		Image: pinnedImage(lfm31_7bRepo, lfm31_7bDigest), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "lfm3-vl-2b", DisplayName: "LFM3 VL 2B (CPU)",
 		Description: "LFM3 1.92B on CPU via llama.cpp b11960 (LFM3-VL-2B-Q4_K_M.gguf). Sandbox inputs: text, image. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
-		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
+		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
 		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-vl-2b", "sha256:ef5c553961e5a6d9eba616fe4f5b2d68d46ec996f651e2011e5a09ae67f9cdc1"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "lfm3-omni-2b", DisplayName: "LFM3 Omni 2B (CPU)",
 		Description: "LFM3 2.17B on CPU via llama.cpp b11960 (LFM3-Omni-2B-Q4_K_M.gguf). Sandbox inputs: text, image, audio. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
-		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
+		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
 		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:df5cea815abd5ba5be781c07558dc72dc45a1334c5b97d0b5a93a907bc9911d6"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "d1-2b", DisplayName: "d1 2B (CPU)",
 		Description: "d1 1.92B on CPU via llama.cpp b11960 (d1-2B-Q8_0.gguf). Sandbox outputs: decision (yes/no, choice, score). Sealed AMD SEV-SNP only.",
-		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
+		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
 		Image: pinnedImage("ghcr.io/cathedralai/room-d1-2b", "sha256:f95d88c7144642328fe85bd7f52e95e434979e64a220550fac3d0e965aca35c6"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "lfm3-audio-2b", DisplayName: "LFM3 Audio 2B (CPU)",
 		Description: "LFM3 2B on CPU via llama.cpp b11960 (LFM3-Audio-2B-Q4_K_M.gguf). Sandbox inputs: text, audio. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
-		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
+		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
 		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:78c2c7d7b6d577c48da6254be23764c5a2be97f4cd2cbe5a7988bb4b4c64a1f5"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "d1-omni-2b", DisplayName: "d1 Omni 2B (CPU)",
 		Description: "d1 2.17B on CPU via llama.cpp b11960 (d1-Omni-2B-Q8_0.gguf). Sandbox outputs: decision (yes/no, choice, score). Sealed AMD SEV-SNP only.",
-		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
+		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
 		Image: pinnedImage("ghcr.io/cathedralai/room-d1-omni-2b", "sha256:3cb800de3d2f9bfcc69d24ab2fc659fc51eb7ed3aae2abe46d46a23f10b57abd"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "lfm3-1.7b-base", DisplayName: "LFM3 1.7B Base (CPU)",
 		Description: "LFM3 1.73B on CPU via llama.cpp b11960 (converted from LiquidAI/LFM3-1.7B-Base safetensors to Q4_K_M). Sealed AMD SEV-SNP only.",
-		CPU:         2, MemoryGiB: 4, DiskGiB: 10, Rate: "0.035",
+		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
 		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-1.7b-base", "sha256:810911016ac6ea1ddeba1bba4dc157e0c3d4252201e64d3279876e57dce344a8"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 }
@@ -155,17 +154,16 @@ func templateByName(name string) (catalogTemplate, bool) {
 
 func (t catalogTemplate) catalogView() map[string]any {
 	view := map[string]any{
-		"name":            t.Name,
-		"display_name":    t.DisplayName,
-		"description":     t.Description,
-		"image":           t.Image,
-		"resources":       map[string]any{"cpu": t.CPU, "memory_gib": t.MemoryGiB},
-		"disk_gib":        t.DiskGiB,
-		"hourly_rate_usd": t.Rate,
-		"network_modes":   []string{"internet", "deny_all", "allowlist"},
-		"egress_allow":    []string{},
-		"live":            t.Live,
-		"sealed":          string(t.Sealed),
+		"name":          t.Name,
+		"display_name":  t.DisplayName,
+		"description":   t.Description,
+		"image":         t.Image,
+		"resources":     map[string]any{"cpu": t.CPU, "memory_gib": t.MemoryGiB},
+		"disk_gib":      t.DiskGiB,
+		"network_modes": []string{"internet", "deny_all", "allowlist"},
+		"egress_allow":  []string{},
+		"live":          t.Live,
+		"sealed":        string(t.Sealed),
 	}
 	if t.SealedOnly {
 		view["sealed_only"] = true
