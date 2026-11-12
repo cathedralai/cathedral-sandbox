@@ -60,9 +60,10 @@ def _create(provider: DockerGuestProvider, image: str, **kwargs):
 
 
 def test_default_create_still_runs_sleep_infinity(fake: FakeDocker, allowlist: Path) -> None:
+    fake.add_image("alpine:3.20")
     provider = DockerGuestProvider()
     try:
-        doc = _create(provider)
+        doc = _create(provider, "alpine:3.20")
         run = [c for c in fake.calls_of("run") if c[-1] == "infinity"][-1]
         assert "sleep" in run and doc["start_command"] is None
     finally:
@@ -75,8 +76,11 @@ def test_start_image_runs_the_listed_argv(fake: FakeDocker, allowlist: Path) -> 
     try:
         doc = _create(provider, image, start_image=True)
         run = fake.calls_of("run")[-1]
-        assert run[-len(SERVICE) :] == SERVICE
-        assert doc["start_command"] == SERVICE
+        # start:image uses the image ENTRYPOINT+CMD (image_default); docker argv
+        # ends at the image ref — the allowlisted command is not re-stated on the CLI.
+        assert run[-1] == image
+        assert "sleep" not in run
+        assert doc["start_command"] == list(SERVICE)
         assert doc["start_command_sha256"] == start_command_sha256(SERVICE)
     finally:
         provider.close()
