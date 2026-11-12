@@ -136,8 +136,8 @@ func TestLFM3SuiteCatalogIsSealedOnlyAndGHCR(t *testing.T) {
 		if !tpl.SealedOnly || tpl.Sealed != wantSealed || !tpl.Live {
 			t.Fatalf("%s: sealed_only=%v sealed=%s live=%v", name, tpl.SealedOnly, tpl.Sealed, tpl.Live)
 		}
-		if name != "lfm3-1.7b" && (tpl.CPU != 2 || tpl.MemoryGiB != 4 || tpl.Rate != "0.035") {
-			t.Fatalf("%s must use the sealed 2 vCPU / 4 GiB shape at $0.035: %+v", name, tpl)
+		if name != "lfm3-1.7b" && (tpl.CPU != 2 || tpl.MemoryGiB != 4) {
+			t.Fatalf("%s must use the sealed 2 vCPU / 4 GiB shape: %+v", name, tpl)
 		}
 		if tpl.Image != image {
 			t.Fatalf("%s image %q want %q", name, tpl.Image, image)
@@ -314,4 +314,27 @@ func errMessage(doc map[string]any) string {
 	}
 	msg, _ = doc["message"].(string)
 	return msg
+}
+
+// The price lives in the API's sealed size rule (AB#308). The broker catalog
+// must not carry a second, disagreeing rate.
+func TestCatalogPayloadCarriesNoRate(t *testing.T) {
+	tc := newChain(t)
+	_, cat := tc.clientCall(t, "GET", "/v1/sandboxes/catalog", nil, nil)
+	byName := catalogByName(t, cat)
+	if len(byName) == 0 {
+		t.Fatal("catalog returned no templates")
+	}
+	for name, tpl := range byName {
+		for _, key := range []string{"hourly_rate_usd", "rate"} {
+			if _, ok := tpl[key]; ok {
+				t.Fatalf("%s: catalog template carries %q", name, key)
+			}
+		}
+	}
+	for _, view := range catalogTemplateViews() {
+		if _, ok := view.(map[string]any)["hourly_rate_usd"]; ok {
+			t.Fatal("catalogView carries hourly_rate_usd")
+		}
+	}
 }
