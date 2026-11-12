@@ -25,6 +25,8 @@ confidential-computing evidence, test their work and score the results.
 This repository is for miners running compute workers on Bittensor SN94.
 For validator operators, use
 [Cathedral Validator](https://github.com/cathedralai/cathedral-validator).
+To attack the sandbox for a reward, use
+[Cathedral Escape Room](https://github.com/cathedralai/cathedral-escape-room).
 
 ## How mining works
 
@@ -57,8 +59,10 @@ tier runs on AMD SEV-SNP hosts that Cathedral leases. Cathedral does not own
 those hosts. There is no self-serve sealed capacity; access is by request.
 This repository does not sell or provision that product.
 
-The Escape Room is coming, but it is not open. Do not treat bounties or prizes
-as live.
+The Escape Room is open: break out of a sealed sandbox and earn on SN94 with
+no hardware. Rules, history and a local practice harness are in
+[cathedral-escape-room](https://github.com/cathedralai/cathedral-escape-room).
+There is no cash prize.
 
 ## What you need
 
