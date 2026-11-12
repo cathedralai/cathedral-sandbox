@@ -81,8 +81,8 @@ FIELDS = (
         "enum",
         DEFAULT_LOG_DRIVER,
         "create_argv",
-        "docker run --log-driver. The sandbox command is `sleep infinity`; customer output "
-        "is read through exec, not logs.",
+        "docker run --log-driver. The default sandbox command is `sleep infinity`; an allowlisted "
+        "image may start with `start: \"image\"`. Customer output is read through exec, not logs.",
         choices=("json-file", "local", "none"),
     ),
     Field(
@@ -145,7 +145,8 @@ PINNED = (
     "sandbox shape: --cpus, --memory, --memory-swap, --pids-limit, --storage-opt size",
     "--security-opt no-new-privileges, the network mode, DNS and the egress rules",
     "the image: imported by digest, started by local image id with --pull never",
-    "the entrypoint (`sleep infinity`), labels, container naming and cleanup",
+    "the default entrypoint (`sleep infinity`) or an allowlisted image start command, labels, "
+    "container naming and cleanup",
     "MAX_SANDBOXES, the lease, receipts, and the measured boot of the confidential VM (RTMR3)",
 )
 

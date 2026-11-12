@@ -130,6 +130,11 @@ def _create_request(payload: dict[str, Any]) -> CreateSandboxRequest:
         ImageSource(image=payload["image"]) if payload.get("image") else None
     )
     build = BuildSpec(**payload["build"]) if isinstance(payload.get("build"), dict) else None
+    start = payload.get("start")
+    if start is not None and start != "image":
+        raise api.SandboxContractError("invalid_start", 'start must be "image" when set')
+    if start == "image" and "entrypoint" in payload:
+        raise api.SandboxContractError("start_conflict", 'send either start: "image" or entrypoint, not both')
     entrypoint = tuple(payload["entrypoint"]) if payload.get("entrypoint") else ("sleep", "infinity")
     kwargs: dict[str, Any] = {
         "resources": resources,
@@ -147,6 +152,7 @@ def _create_request(payload: dict[str, Any]) -> CreateSandboxRequest:
         "count": payload.get("count", 1),
         "workspace": api.WorkspaceSpec.parse(payload.get("workspace")),
         "tunables": payload.get("tunables"),
+        "start_image": start == "image",
     }
     return CreateSandboxRequest(**kwargs)
 

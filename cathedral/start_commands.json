@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "image_digest": "sha256:e128515e1cf4c7648a50412832a1b5418ac002da4a2b5b118adf75d643840014",
+      "argv": ["desktop-up", "--tunnel", "--foreground"],
+      "note": "cathedral-desktop published pin (AB#699); image CMD must match before start:image works"
+    }
+  ]
+}

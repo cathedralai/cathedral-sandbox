@@ -564,6 +564,8 @@ class CreateSandboxRequest:
     labels: Mapping[str, str] = field(default_factory=dict)
     ttl_seconds: int = TTL_DEFAULT_SECONDS
     entrypoint: tuple[str, ...] = ("sleep", "infinity")
+    # AB#709: when true, start the image ENTRYPOINT+CMD instead of entrypoint / sleep infinity.
+    start_image: bool = False
     user: str | None = None
     workdir: str | None = None
     image: ImageSource | None = None

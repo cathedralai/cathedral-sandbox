@@ -437,6 +437,7 @@ def verify_receipts(att: dict, receipts: list[dict], head: str | None = None) ->
     elif head is not None:  # a whole chain (GET .../receipts from 0): no gap, ends at the head
         need(seqs[0] == 1 and contiguous, "the chain has a gap or does not start at receipt 1")
         need(by_seq[seqs[-1]]["receipt_sha256"] == head, "the chain does not end at the hotel's head")
+    check_start_commands(receipts)
     actions = {}
     for rc in receipts:
         actions[rc["statement"]["action"]] = actions.get(rc["statement"]["action"], 0) + 1
@@ -474,6 +475,26 @@ def room_links(receipts: list[dict]) -> dict:
         if st.get("sandbox_id") and 200 <= int(st.get("status") or 0) < 300:
             out[st["sandbox_id"]] = linked
     return out
+
+
+def check_start_commands(receipts: list[dict]) -> None:
+    """Each create's start_command_sha256 matches its start_command (AB#709).
+
+    Receipts without start_command are the default ``sleep infinity`` (old or default creates).
+    """
+    for rc in receipts:
+        st = rc["statement"]
+        if st.get("action") != "create" or "start_command" not in st:
+            continue
+        cmd = st.get("start_command")
+        if cmd is None:
+            need(st.get("start_command_sha256") is None,
+                 f"receipt {st['sequence']}: start_command_sha256 must be absent when start_command is null")
+            continue
+        need(isinstance(cmd, list) and all(isinstance(part, str) for part in cmd),
+             f"receipt {st['sequence']}: start_command must be a list of strings")
+        need(st.get("start_command_sha256") == sha(canonical(cmd)),
+             f"receipt {st['sequence']}: start_command_sha256 does not match the start command")
 
 
 def policy_timeline(receipts: list[dict]) -> dict:
