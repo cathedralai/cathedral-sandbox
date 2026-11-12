@@ -364,6 +364,9 @@ def main(argv):
             return 127
         if rest == ["true"]:
             return 0
+        if rest[:3] == ["sh", "-c", ":"] and b.get("no_sh"):
+            print("exec: \"sh\": executable file not found in $PATH", file=sys.stderr)
+            return 127
         line = " ".join(rest)
         for rule in b.get("exec_rules", []):
             if rule["contains"] in line:
@@ -373,6 +376,11 @@ def main(argv):
                 print(rule.get("stdout", ""), end="")
                 if rule.get("sleep"):
                     time.sleep(rule["sleep"])
+                if rule.get("wait_for"):
+                    # A long-running command that ends once another call creates the file.
+                    deadline = time.time() + 20
+                    while not os.path.exists(rule["wait_for"]) and time.time() < deadline:
+                        time.sleep(0.02)
                 if rule.get("kill_container"):
                     # A room killed by the host cgroup: the container ends and docker exec gives 128.
                     # inspect_lag: docker still says running (OOMKilled already true) for that many inspects.

@@ -886,6 +886,10 @@ class ExecRequest:
     # runs, for a follow client to read through the files route. Absent on a
     # sync exec. 32 lowercase hex characters.
     spill_token: str | None = None
+    # Epoch seconds after which the API no longer wants this exec to start (AB#406). The
+    # hotel refuses a later start, so a cancel that came first cannot be undone by a slow
+    # dispatch. Absent from an older API.
+    launch_by: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.cmd, str):
@@ -915,6 +919,12 @@ class ExecRequest:
                 "invalid_exec",
                 "spill_token must be 32 lowercase hex characters",
             )
+        if self.launch_by is not None:
+            _require(
+                isinstance(self.launch_by, int) and not isinstance(self.launch_by, bool) and self.launch_by > 0,
+                "invalid_exec",
+                "launch_by must be a positive integer of epoch seconds",
+            )
 
     @property
     def is_shell(self) -> bool:
@@ -941,6 +951,10 @@ class ExecResult:
     # the caller the room itself is gone and later execs will fail.
     oom_killed: bool = False
     room_alive: bool = True
+    # True only when the hotel sent a cancel signal that passed its pid file guard and the
+    # exec call then returned (AB#406). Never inferred from the exit code: a BusyBox timeout
+    # also exits 143.
+    cancelled: bool = False
 
     def to_document(self) -> Mapping[str, object]:
         doc: dict[str, object] = {
@@ -955,6 +969,8 @@ class ExecResult:
             doc["oom_killed"] = True
         if not self.room_alive:
             doc["room_alive"] = False
+        if self.cancelled:
+            doc["cancelled"] = True
         return MappingProxyType(doc)
 
 
