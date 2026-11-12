@@ -16,7 +16,11 @@ from cathedral.start_commands import (
     load_start_commands,
     start_command_sha256,
 )
-from tests.fake_docker_cli import FakeDocker, install
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fake_docker_cli import FakeDocker, install
 
 RES = Resources(vcpu=1, memory_gib=1, disk_gib=5)
 DIGEST = "sha256:" + "ab" * 32
