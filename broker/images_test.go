@@ -420,6 +420,7 @@ func (tc *testChain) start(t *testing.T) {
 	if err := b.loadCompat(); err != nil {
 		t.Fatal(err)
 	}
+	b.loadNativeExecs()
 	if err := b.loadRuntimeHotels(); err != nil {
 		t.Fatal(err)
 	}
