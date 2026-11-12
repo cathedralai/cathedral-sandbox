@@ -392,7 +392,15 @@ def test_systemd_analyze_accepts_the_units(tmp_path):
     # The bootstrap installs the shim, and the operator supplies the page hook,
     # so on a build machine both are absent.
     absent = (str(HostPaths().shim), "/usr/local/sbin/cathedral-miner-update-page")
-    unexpected = [line for line in complaints if not any(path in line for path in absent)]
+    # verify also loads the host's own vendor units (the CI image ships ones that
+    # use directives its systemd has since deprecated). Those warnings are not
+    # about our files, so only lines that are not about a vendor unit count.
+    vendor_prefixes = ("/usr/lib/systemd/", "/lib/systemd/", "/etc/systemd/")
+    unexpected = [
+        line
+        for line in complaints
+        if not any(path in line for path in absent) and not line.startswith(vendor_prefixes)
+    ]
     assert unexpected == [], complaints
 
 
