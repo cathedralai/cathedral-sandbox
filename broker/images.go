@@ -68,6 +68,8 @@ type placement struct {
 	// guest never matches; an empty guest matches no reserved hotel. A hotel
 	// lent from this guest never matches either (lend.go).
 	guest string
+	// image: the image the create runs, for the warm preference (prewarm.go).
+	image string
 	// noLent: a workspace create. A lent hotel is destroyed at reclaim, so it
 	// never holds a workspace (lend.go).
 	noLent bool
