@@ -535,8 +535,12 @@ https://$ROOM_HOSTNAME:$ROOM_PUBLIC_PORT {
 		reverse_proxy $ROOM_API_UPSTREAM {
 			flush_interval -1
 			transport http {
-				read_timeout 15m
-				write_timeout 15m
+				# Why 4h15m: the broker caps one exec at 14400 s (4 h) and holds the request
+				# open for that long, plus a 120 s margin. A transport read_timeout or
+				# write_timeout below 14400 + 120 s = 14520 s cuts long held exec requests.
+				# 4h15m = 15300 s covers the cap and the margin. (AB#725)
+				read_timeout 4h15m
+				write_timeout 4h15m
 			}
 		}
 	}

@@ -1,0 +1,25 @@
+# Live copy of /etc/thin-broker-caddy/Caddyfile on Frankfurt (unit
+# thin-broker-caddy). Hand-made, so this file is the record. No secrets in it.
+{
+	auto_https disable_redirects
+	admin off
+}
+https://live.cathedral.computer:443 {
+	tls {
+		issuer acme {
+			disable_http_challenge
+		}
+	}
+	encode gzip
+	reverse_proxy 127.0.0.1:18100 {
+		flush_interval -1
+		transport http {
+			# Why 4h15m: the broker caps one exec at 14400 s (4 h) and holds the request
+	# open for that long, plus a 120 s margin. A transport read_timeout or
+	# write_timeout below 14400 + 120 s = 14520 s cuts long held exec requests.
+	# 4h15m = 15300 s covers the cap and the margin. (AB#725)
+			read_timeout 4h15m
+			write_timeout 4h15m
+		}
+	}
+}
