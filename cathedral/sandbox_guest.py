@@ -1464,7 +1464,26 @@ class DockerGuestProvider:
             # Preserve credential rechecks for private images and pull-policy always.
             if registry_auth is not None or image in self._auth_pulled or self._pull_policy == "always":
                 self._ensure_image(image, registry_auth=registry_auth, refresh=True)
+                # Refresh may land a newer Id under the same tag; grant that Id
+                # so the post-authorize require() on the run Id can pass.
+                refreshed = self._image_id_of(image)
+                if refreshed is None:
+                    raise SandboxOpError(
+                        "image_pull_failed", 502, f"image {image} has no docker id after pull"
+                    )
+                if refreshed != local_id:
+                    if self._image_owners.provenance(refreshed) in ("snapshot", "build") and not self._image_owners.owns(
+                        refreshed, owner
+                    ):
+                        raise SandboxOpError(
+                            "image_not_owned",
+                            403,
+                            "this guest cannot use that image on this hotel",
+                        )
+                    self._image_owners.grant(refreshed, owner, provenance="registry", ref=image)
+                    return refreshed
             return local_id
+
         if self._looks_like_image_id(image):
             raise SandboxOpError(
                 "image_not_owned",
@@ -1934,7 +1953,18 @@ class DockerGuestProvider:
         # Pin docker run to the inspected Id. Allowlist / start:image decisions
         # were made against this inspect; running the mutable tag would race a
         # retag between inspect and create (AB#709 HOLD).
-        run_image = normalize_image_id(str(inspected.get("Id") or "")) or image
+        run_image = normalize_image_id(str(inspected.get("Id") or ""))
+        if run_image is None:
+            # Fail closed: falling back to the mutable tag would reopen the race.
+            raise SandboxOpError(
+                "image_id_unavailable",
+                409,
+                f"image {image} has no valid immutable Id on this host; nothing started",
+            )
+        if request.image is not None:
+            # The grant above was made against an earlier inspect; the tag may
+            # have moved to another owner's Id since. Re-check the Id that runs.
+            self._image_owners.require(run_image, effective_owner)
         room_tunables = self._tunables_for(request, image, dind)
         work = Path(self._inner._sandboxes[sandbox_id].root) / "work"  # noqa: SLF001
         name = f"cathedral-{sandbox_id}"
