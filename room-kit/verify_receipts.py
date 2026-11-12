@@ -77,6 +77,7 @@ import os
 import re
 import ssl
 import sys
+import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 
@@ -516,7 +517,13 @@ def fetch_archived_binding(broker: str, operator_key: str, binding_sha256: str) 
     """GET /v1/broker/bindings/<sha256>: binding JSON the broker archived after admission."""
     want = binding_sha256.lower()
     need(HEX64.fullmatch(want) is not None, "binding_sha256 is not 64 lower-case hex")
-    binding = get(f"{broker.rstrip('/')}/v1/broker/bindings/{want}", operator_key)
+    try:
+        binding = get(f"{broker.rstrip('/')}/v1/broker/bindings/{want}", operator_key)
+    except urllib.error.HTTPError as exc:
+        # Same wording as binding_archive.fetch_archived_binding.
+        if exc.code == 404:
+            raise Fail(f"no archived binding with hash {want[:16]}...") from exc
+        raise Fail(f"broker binding archive answered {exc.code}") from exc
     need(isinstance(binding, dict), "the archived binding is not a JSON object")
     got = sha(canonical(binding))
     need(got == want, "the archived binding does not hash to its name")
@@ -667,6 +674,7 @@ def main() -> int:
         live_receipts = groups.get(live_bsha, [])
         chain_head = head if not stale_shas else None
         archive_chains: list[dict] = []
+        unproven_archives: list[str] = []
         if is_hotel_level(att):
             need(not (a.require_tls or a.origin or peer_spki), "a level 1 binding has no attested guest TLS")
             attestation_out = verify_hotel_attestation(att)
@@ -686,7 +694,9 @@ def main() -> int:
             chain_out = verify_receipts(att, live_receipts, chain_head)
         for bsha in sorted(stale_shas):
             att_old = fetch_archived_binding(a.broker, operator_key, bsha)
-            verify_archived_binding(att_old)
+            archived_out = verify_archived_binding(att_old)
+            if not archived_out.get("attestation_proven"):
+                unproven_archives.append(bsha)
             if owner is not None:
                 owner_signed_creates(groups[bsha], owner)
             part = verify_receipts(att_old, groups[bsha], None)
@@ -703,7 +713,10 @@ def main() -> int:
         # Sealed archives have no SNP report. Signature checks on those receipts
         # are useful, but they must not turn an overall attested PASS into a claim
         # that every receipt's binding was SNP-proven (AB#381 HOLD).
-        sealed_archive = bool(archive_chains) and not is_hotel_level(att)
+        # Decide on the archived bindings themselves: the live binding says
+        # nothing about an earlier boot (a sealed guest whose TSM went missing
+        # reboots as level 1 under the same hotel name).
+        sealed_archive = bool(unproven_archives)
         if sealed_archive:
             checked += "; archived sealed bindings verify signatures only (NOT PROVEN for attestation)"
             verdict = "NOT PROVEN"
