@@ -2027,29 +2027,53 @@ func (b *broker) snapshot(g *guestState) map[string]any {
 	for _, h := range b.hotelList() {
 		grid := make([]byte, len(h.grid))
 		mine := map[byte]int{}
+		seen := map[*room]bool{}
 		for i, rm := range h.grid {
 			switch {
 			case rm == nil:
 				grid[i] = stFree
 			case rm.guest == g.cfg.ID:
 				grid[i] = rm.state
+				seen[rm] = true
 				mine[rm.state]++
 			default:
 				grid[i] = stOther
 			}
 		}
+		// A room can be in h.rooms with no square (slot -1 after a grid
+		// shrink or a failed place). It still counts as the guest's, once
+		// (AB#577).
+		for _, rm := range h.rooms {
+			if rm.guest == g.cfg.ID && !seen[rm] {
+				seen[rm] = true
+				mine[rm.state]++
+			}
+		}
+		owned := mine[stRunning] + mine[stCreating] + mine[stDeleting] + mine[stFailed]
+		// Same reach rule as the guest capacity view (allowed list,
+		// reservation, lend, miner opt-in), except a hotel that still holds
+		// the guest's rooms stays visible after the operator narrows the
+		// guest's list (AB#577).
+		if owned == 0 && g.tierOf(h) == "" {
+			continue
+		}
 		tot["running"] += mine[stRunning]
 		tot["creating"] += mine[stCreating]
 		tot["deleting"] += mine[stDeleting]
 		tot["failed_now"] += mine[stFailed]
-		hotels = append(hotels, map[string]any{
+		doc := map[string]any{
 			"id": h.cfg.ID, "name": h.cfg.Name, "threads": h.cfg.Threads, "ram_gib": h.cfg.RAMGiB, "slots": h.slots, "ok": h.ok, "drain": h.drain(), "sealed": h.cfg.Sealed,
 			"grid": string(grid), "cpu": h.cpuPct, "mem_pct": h.memPct, "mem_gib": h.memGiB, "load1": h.load1,
-			"containers": h.containers, "rooms_all": h.apiRunning, "deleting_all": h.apiDeleting,
-			"queued": h.queued, "creating": h.creating,
+			"containers": h.containers,
+			"queued":     h.queued, "creating": h.creating,
 			"seen_age_s": seenAge(h.lastOK, now), "down_since": downSince(h), "health_late": h.healthLate, "health_ms": h.healthMs, "list_ok": h.listOK, "caps": h.caps,
 			"mine": map[string]int{"running": mine[stRunning], "creating": mine[stCreating], "deleting": mine[stDeleting], "failed": mine[stFailed]},
-		})
+		}
+		// All-guest counts only where this guest owns a room (AB#577).
+		if owned > 0 {
+			doc["rooms_all"], doc["deleting_all"] = h.apiRunning, h.apiDeleting
+		}
+		hotels = append(hotels, doc)
 	}
 	return map[string]any{
 		"t": now.UnixMilli(), "guest": g.cfg.ID, "hotels": hotels,
