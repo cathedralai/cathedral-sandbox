@@ -258,6 +258,7 @@ class SandboxApplication:
         self._add("PATCH", s + r"/(?P<id>[^/]+)", self.patch_sandbox)
         self._add("POST", s + r"/(?P<id>[^/]+)/wait", self.wait)
         self._add("POST", s + r"/(?P<id>[^/]+)/exec", self.exec_)
+        self._add("POST", s + r"/(?P<id>[^/]+)/exec/cancel", self.exec_cancel)
         # The receipts front's own route for an exec it opened from a sealed envelope (AB#417);
         # the front refuses it to every caller. An API without it answers 404 and runs nothing.
         self._add("POST", s + r"/(?P<id>[^/]+)/exec-sealed", self.exec_sealed)
@@ -511,9 +512,27 @@ class SandboxApplication:
             stdin=payload.get("stdin"),
             sealed=sealed,
             spill_token=payload.get("spill_token"),
+            launch_by=payload.get("launch_by"),
         )
         result = self.provider.exec(id, req)
         return Response.json(200, result.to_document())
+
+    def exec_cancel(self, *, id, body, **_):
+        """Stop the exec that started with this spill_token (AB#406).
+
+        The answer names no room, so the receipts front's result_sha256 can be checked
+        against these bytes after the broker rewrites ids in other answers.
+        """
+        token = self._json(body).get("spill_token")
+        if not api.spill_token_ok(token):
+            raise api.SandboxContractError("invalid_exec", "spill_token must be 32 lowercase hex characters")
+        cancel = getattr(self.provider, "cancel_exec", None)
+        result = cancel(id, token) if callable(cancel) else "unsupported"
+        answer = {"result": result, "token_sha256": hashlib.sha256(token.encode()).hexdigest()}
+        if result == "refused":
+            # The pid file failed the guard and no signal was sent. A repeat may succeed.
+            answer.update(reason="pid_file_invalid", cancelled=False, retryable=True)
+        return Response.json(200, answer)
 
     def exec_sealed(self, *, id, body, **_):
         """An exec as /exec runs it, with its command and output kept out of the history and the log."""

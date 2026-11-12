@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from cathedral import exec_cancel
 from cathedral.exec_spill import StreamSpill, close_spill, open_spill, read_spill, spill_path_parts
 from cathedral.sandbox_api import (
     CreateSandboxRequest,
@@ -344,6 +345,8 @@ class GuestRecord:
     timeout_form: str | None = None
     # Whether the image can run ``bash``. None: not probed yet.
     has_bash: bool | None = None
+    # Whether the image can run ``sh`` (the cancel wrapper needs it). None: not probed yet.
+    has_sh: bool | None = None
     # (owner, name, path, version_on_delete) of the mounted workspace (#305).
     workspace: tuple[str, str, str, bool] | None = None
     # Owner of the room (sandbox_owner.owner_id). The egress proxy reads the
@@ -2057,12 +2060,30 @@ class DockerGuestProvider:
                     "or run the command without a limit.",
                 )
             wrapped = argv
+        token = request.spill_token
+        run_argv = wrapped
+        registered = False
+        if token:
+            # A start that carries a token can be cancelled (AB#406). The wrapper writes the
+            # pid of the process that becomes the command; an image with no sh runs unwrapped
+            # and its cancel answers `unsupported`.
+            wrap = self._has_sh(guest)
+            registered = exec_cancel.registry.begin(
+                sandbox_id, token, request.launch_by, request.user, ("gnu" if form == "gnu" else "busybox") if wrap else None
+            )
+            if not registered:
+                return ExecResult(
+                    exit_code=143, stdout="", stderr="cancelled before it started\n", duration_ms=0, timed_out=False, cancelled=True
+                )
+            if wrap:
+                run_argv = ["sh", "-c", exec_cancel.WRAP_SCRIPT, "sh", exec_cancel.pid_file(token), *wrapped]
+        cancelled = False
         t0 = time.perf_counter()
         spill = open_spill(sandbox_id, request.spill_token, EXEC_OUTPUT_CAP) if request.spill_token else None
         try:
             code, out, err, timed_out = self._client.exec(
                 guest.container_id,
-                wrapped,
+                run_argv,
                 cwd=cwd,
                 env={**dict(request.env)},
                 timeout_seconds=timeout_seconds + 15 if wrapped is not argv else timeout_seconds,
@@ -2073,6 +2094,8 @@ class DockerGuestProvider:
         finally:
             if request.spill_token:
                 close_spill(sandbox_id, request.spill_token)
+            if registered:
+                cancelled = exec_cancel.registry.finish(sandbox_id, token)
         # The command's own time, before any look at the container below.
         elapsed = time.perf_counter() - t0
         # A room that outgrows its memory limit can still be killed whole by
@@ -2098,6 +2121,9 @@ class DockerGuestProvider:
         killed_early = code == 137 and elapsed < timeout_seconds
         if not oom_killed and not killed_early and code in {124, 137, 143}:
             timed_out = True
+        if cancelled:
+            # Our own TERM or KILL ended it: a cancel, never a timeout.
+            timed_out = False
         duration_ms = int(elapsed * 1000)
         with self._inner._lock:  # noqa: SLF001
             sandbox = self._inner._require_active(sandbox_id)  # noqa: SLF001
@@ -2132,7 +2158,66 @@ class DockerGuestProvider:
             truncated=truncated,
             oom_killed=oom_killed,
             room_alive=room_alive,
+            cancelled=cancelled,
         )
+
+    def cancel_exec(self, sandbox_id: str, token: str) -> str:
+        """Stop the exec that started with ``token``. The answer is a word, see AB#406 spec 3.1."""
+        with self._inner._lock:  # noqa: SLF001
+            self._inner._require_active(sandbox_id)  # noqa: SLF001
+        guest = self._guests.get(sandbox_id)
+        registry = exec_cancel.registry
+        entry = registry.entry(sandbox_id, token)
+        if entry is None:
+            held = registry.result(sandbox_id, token)
+            if held is not None:
+                return "already_stopped" if held == "cancelled" else "finished_before_cancel"
+            registry.tombstone(sandbox_id, token)
+            return "cancelled_before_start"
+        if guest is None or entry.form is None:
+            return "unsupported"
+        deadline = time.monotonic() + exec_cancel.CANCEL_WINDOW_SECONDS
+        for sig in ("TERM", "KILL"):
+            # Marked before the signal: the exec call can return before this thread reads the script's exit code.
+            entry.signalled = True
+            rc = self._signal_exec_group(guest, entry, token, sig)
+            if rc != 0:
+                entry.signalled = False
+                if rc == exec_cancel.NO_PID_FILE:
+                    return "unsupported"
+                # A guard refusal on the first signal means nothing was sent: not progress.
+                if rc == exec_cancel.REFUSED and sig == "TERM":
+                    return "refused"
+                return "signalled"
+            wait = exec_cancel.TERM_WAIT_SECONDS if sig == "TERM" else deadline - time.monotonic()
+            # `stopped` only when the exec call itself returned.
+            if entry.done.wait(max(0.0, min(wait, deadline - time.monotonic()))):
+                return "stopped"
+        return "signalled"
+
+    def _signal_exec_group(self, guest: GuestRecord, entry: Any, token: str, sig: str) -> int:
+        try:
+            code, _, _, timed_out = self._client.exec(
+                guest.container_id,
+                ["sh", "-c", exec_cancel.KILL_SCRIPT, "sh", exec_cancel.pid_file(token), entry.form, sig],
+                cwd=None,
+                env={},
+                timeout_seconds=20,
+                stdin=None,
+                user=entry.user,
+            )
+        except SandboxOpError:
+            return exec_cancel.SIGNAL_FAILED
+        return exec_cancel.SIGNAL_FAILED if timed_out and code != 0 else code
+
+    def _has_sh(self, guest: GuestRecord) -> bool:
+        """True when the guest image can run ``sh``. Probe once; the probe has no side effect."""
+        if guest.has_sh is None:
+            code, _, _, _ = self._client.exec(
+                guest.container_id, ["sh", "-c", ":"], cwd=None, env={}, timeout_seconds=20, stdin=None
+            )
+            guest.has_sh = code == 0
+        return guest.has_sh
 
     def _has_bash(self, guest: GuestRecord) -> bool:
         """True when the guest image can run ``bash``. Probe once; the probe has no side effect."""
