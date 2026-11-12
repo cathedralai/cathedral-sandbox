@@ -622,6 +622,21 @@ def test_a_header_style_secret_is_redacted_without_any_configured_value(model: S
     assert b"short-real-secret" not in done.stdout and call["redacted"] is True
 
 
+def test_non_credential_env_prefixes_are_held_across_stream_pieces(model: StreamModel, room: Any) -> None:
+    # SpockChaser HOLD: FOO is in secrets (>=8) but was not in credentials, so
+    # hold() emitted prefixes as deltas before the full value assembled.
+    secret = "abcdefghijklmno"
+    model.replies = [{"pieces": ["abcde", "fghij", "klmno"]}]
+    done, events = turn(room, "go", FOO=secret)
+    assert done.returncode == 0
+    deltas = "".join(ev["text"] for ev in events if ev["type"] == "delta")
+    assert secret not in deltas
+    assert secret.encode() not in done.stdout
+    for line in done.stdout.splitlines():
+        assert secret.encode() not in line
+    assert events[-1]["type"] == "answer" and events[-1]["text"] == "[redacted]"
+
+
 def test_the_plain_path_does_not_echo_the_key_or_request_headers(model: StreamModel, room: Any) -> None:
     short = "k7q"
     model.replies = [{"status": 500, "body": {"error": {"message": "scripted failure"}}}]
