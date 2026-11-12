@@ -40,6 +40,7 @@ import os
 import shutil
 import threading
 import time
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -161,6 +162,25 @@ def _not_found(name: str) -> SandboxOpError:
     return SandboxOpError("workspace_not_found", 404, f"no workspace {name}")
 
 
+def workspace_persistence(env: Mapping[str, str] | None = None, status_path: str | Path | None = None) -> bool | None:
+    """Do workspaces survive a hotel restart? (sealed/README.md, SEALED_DATA_VOLUME.md).
+
+    On a sealed guest built with the data volume (``ROOM_WORKSPACES_SOURCE`` set),
+    this is the ``persistent`` flag that ``sealed-data.sh`` wrote at boot: false
+    when the volume did not open (locked, absent, tampered, ...), so workspaces
+    live on the scratch disk and end at the next boot. None when this build has
+    no sealed data volume, so the API does not claim one way or the other.
+    """
+    env = os.environ if env is None else env
+    if not env.get("ROOM_WORKSPACES_SOURCE"):
+        return None
+    path = Path(status_path or env.get("ROOM_SEALED_DATA_STATUS", "/run/sealed-data.status"))
+    try:
+        return bool(json.loads(path.read_text()).get("persistent"))
+    except (OSError, ValueError):
+        return False
+
+
 class WorkspaceStore:
     def __init__(
         self,
@@ -170,11 +190,14 @@ class WorkspaceStore:
         max_per_owner: int = 10,
         max_versions: int = 20,
         check_mount: bool = True,
+        persistent: bool | None = None,
     ) -> None:
         self.root = Path(root)
         self.copier = copier
         self.max_per_owner = max(1, max_per_owner)
         self.max_versions = max(1, max_versions)
+        # Do workspaces survive a hotel restart? None: not a sealed data volume.
+        self.persistent = persistent
         self._lock = threading.RLock()
         # (owner, name) -> sandbox ids that mount it now
         self._mounts: dict[tuple[str, str], set[str]] = {}
@@ -205,6 +228,7 @@ class WorkspaceStore:
             max_per_owner=env_int("CATHEDRAL_WORKSPACE_MAX_PER_OWNER", 10),
             max_versions=env_int("CATHEDRAL_WORKSPACE_MAX_VERSIONS", 20),
             check_mount=os.environ.get("CATHEDRAL_WORKSPACE_MOUNT_CHECK", "1").strip() != "0",
+            persistent=workspace_persistence(),
         )
 
     # ------------------------------------------------------------ paths
@@ -237,13 +261,18 @@ class WorkspaceStore:
 
     def _doc(self, owner: str, name: str, meta: dict[str, Any]) -> dict[str, Any]:
         rooms = sorted(h for h in self._mounts.get((owner, name), ()) if h != "rollback")
-        return {
+        doc = {
             "name": name,
             "created_at": meta.get("created_at"),
             "versions": [dict(v) for v in meta.get("versions", [])],
             "rooms": rooms,
             "in_use": bool(rooms),
         }
+        # On a sealed hotel, say whether this workspace survives a restart, so a
+        # customer is never surprised that a locked data volume dropped it.
+        if self.persistent is not None:
+            doc["persistent"] = self.persistent
+        return doc
 
     # ------------------------------------------------------------ API
     def create(self, owner: str, name: str) -> dict[str, Any]:
@@ -411,4 +440,5 @@ __all__ = [
     "mount_options_safe",
     "owner_id",
     "validate_name",
+    "workspace_persistence",
 ]

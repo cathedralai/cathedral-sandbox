@@ -1,7 +1,7 @@
 #!/bin/bash
 # Room kit, sealed mode: make this host run ONE sealed hotel (an AMD SEV-SNP
 # guest with the room kit inside). Called as: install.sh --sealed sealed.env
-#   1. assess: SEV-SNP on, free SNP ASIDs, free disk after the scratch disk
+#   1. assess: SEV-SNP on, free SNP ASIDs, free disk after the scratch and data disks
 #   2. host packages: QEMU (SNP), OVMF AmdSev, mmdebstrap, zstd, cpio
 #   3. build the measured guest (build-guest.sh) and compute the expected
 #      launch measurement (sev-snp-measure, pinned, in a venv)
@@ -35,9 +35,11 @@ fi
 mkdir -p "$SEALED_DIR/images" "$SEALED_DIR/run"
 FREE_GIB=$(( $(df -B1 --output=avail "$SEALED_DIR" | tail -1) / 1073741824 ))
 HAVE_GIB=0; [ -f "$SEALED_DIR/scratch.raw" ] && HAVE_GIB=$(( $(du -B1 "$SEALED_DIR/scratch.raw" | cut -f1) / 1073741824 ))
-LEFT=$(( FREE_GIB - (SEALED_SCRATCH_GIB - HAVE_GIB) ))
-log "free ${FREE_GIB} GiB; after a full ${SEALED_SCRATCH_GIB} GiB scratch: ${LEFT} GiB (minimum ${SEALED_MIN_HOST_FREE_GIB})"
-[ "$LEFT" -ge "$SEALED_MIN_HOST_FREE_GIB" ] || { echo "not enough disk: lower SEALED_SCRATCH_GIB" >&2; exit 1; }
+DATA_GIB=${SEALED_DATA_GIB:-0}
+HAVE_DATA_GIB=0; [ -f "$SEALED_DIR/data.raw" ] && HAVE_DATA_GIB=$(( $(du -B1 "$SEALED_DIR/data.raw" | cut -f1) / 1073741824 ))
+LEFT=$(( FREE_GIB - (SEALED_SCRATCH_GIB - HAVE_GIB) - (DATA_GIB - HAVE_DATA_GIB) ))
+log "free ${FREE_GIB} GiB; after a full ${SEALED_SCRATCH_GIB} GiB scratch and ${DATA_GIB} GiB data disk: ${LEFT} GiB (minimum ${SEALED_MIN_HOST_FREE_GIB})"
+[ "$LEFT" -ge "$SEALED_MIN_HOST_FREE_GIB" ] || { echo "not enough disk: lower SEALED_SCRATCH_GIB or SEALED_DATA_GIB" >&2; exit 1; }
 MEM_FREE_GIB=$(( $(awk '/MemAvailable/ {print $2}' /proc/meminfo) / 1048576 ))
 systemctl is-active -q "$UNIT" || [ "$MEM_FREE_GIB" -gt $(( SEALED_MEM_GIB + 32 )) ] || { echo "only ${MEM_FREE_GIB} GiB RAM available" >&2; exit 1; }
 
@@ -49,6 +51,8 @@ command -v mmdebstrap >/dev/null || need+=(mmdebstrap)
 command -v zstd >/dev/null || need+=(zstd)
 command -v cpio >/dev/null || need+=(cpio)
 python3 -c 'import venv' 2>/dev/null && python3 -c 'import ensurepip' 2>/dev/null || need+=(python3-venv)
+# The roll guard reads the data volume's owner token on the host (data_volume_owner_id).
+{ [ "${SEALED_DATA_GIB:-0}" = 0 ] || command -v cryptsetup >/dev/null; } || need+=(cryptsetup-bin)
 if [ ${#need[@]} -gt 0 ]; then
   log "apt install ${need[*]}"
   DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "${need[@]}"
@@ -141,7 +145,78 @@ refuse_sealed_restart_with_rooms() {
     exit 1
   fi
 }
+# The data volume's key is bound to the build's launch identity (measurement,
+# policy and HOST_DATA), so a new build cannot open the volume an older build
+# made. Decide ownership from the launch identity recorded in the volume's own
+# LUKS token, not a side file, and never drop or strand workspaces without the
+# operator saying which (docs/SEALED_DATA_VOLUME.md).
+SEALED_DATA_POLICY=0x30000   # must match the policy in launch-guest.sh
+DATA_RESET=0
+DATA_ROLL_OK=0
+data_volume_restore_on_exit() {
+  # A reset roll is reversible until the new build's measurement checks: stop the
+  # guest, discard the fresh empty volume, and put the owner's volume back.
+  if [ "$DATA_RESET" = 1 ] && [ "$DATA_ROLL_OK" = 0 ] && [ -f "$SEALED_DIR/data.raw.prev" ]; then
+    systemctl stop "$UNIT" 2>/dev/null || true
+    rm -f "$SEALED_DIR/data.raw"
+    mv -f "$SEALED_DIR/data.raw.prev" "$SEALED_DIR/data.raw"
+    log "data volume: roll not confirmed; restored the owner's volume from data.raw.prev"
+  fi
+}
+trap data_volume_restore_on_exit EXIT
+data_volume_launch_id() { # launch id of the build we are about to start: <host_data hex>
+  python3 -c 'import hashlib,sys; print(hashlib.sha256((":".join(sys.argv[1:4])).encode()).hexdigest())' \
+    "$EXPECTED" "$SEALED_DATA_POLICY" "$1"
+}
+data_volume_owner_id() { # the launch id in data.raw's token, or empty
+  cryptsetup token export --token-id 0 "$SEALED_DIR/data.raw" 2>/dev/null | python3 -c 'import json,sys
+try:
+    t=json.load(sys.stdin)
+    print(t.get("slots",{}).get("0",{}).get("launch_id","") if t.get("type")=="cathedral-sealed-data" else "")
+except Exception:
+    print("")' 2>/dev/null || true
+}
+data_volume_new_build() {
+  { [ "${SEALED_DATA_GIB:-0}" != 0 ] && [ -f "$SEALED_DIR/data.raw" ]; } || return 0
+  local new_hd_b64 new_hd_hex new_id owner_id choice
+  # Without the binary the owner id would read as empty, which looks like another build's volume and
+  # offers a reset that sets a readable customer volume aside. Stop before any choice instead.
+  command -v cryptsetup >/dev/null || {
+    echo "sealed: cryptsetup is not installed on this host, so the owner token of $SEALED_DIR/data.raw cannot be read. Nothing was changed and no reset or keep choice is asked. Install it (apt-get install cryptsetup-bin) and re-run." >&2
+    exit 1
+  }
+  new_hd_b64=$(LAUNCH_PRINT_HOST_DATA=1 "$SEALED_DIR/launch-guest.sh" "$SEALED_DIR/sealed.env") \
+    || { echo "sealed: could not compute the new build's HOST_DATA (launch-guest.sh)" >&2; exit 1; }
+  new_hd_hex=$(python3 -c 'import base64,sys;print(base64.b64decode(sys.argv[1]).hex())' "$new_hd_b64")
+  new_id=$(data_volume_launch_id "$new_hd_hex")
+  owner_id=$(data_volume_owner_id)
+  [ -n "$owner_id" ] && [ "$owner_id" = "$new_id" ] && return 0   # same launch identity: the new build opens it
+  choice=""
+  [ -f "$SEALED_DIR/data-on-new-build" ] && choice=$(tr -d ' \r\n' < "$SEALED_DIR/data-on-new-build")
+  case "$choice" in
+    reset)
+      if [ -f "$SEALED_DIR/data.raw.prev" ] && [ "${SEALED_DATA_OVERWRITE_PREV:-0}" != 1 ]; then
+        echo "sealed: data.raw.prev already exists from an earlier reset roll. Save or remove it, or set SEALED_DATA_OVERWRITE_PREV=1 to overwrite it." >&2
+        exit 1
+      fi
+      rm -f "$SEALED_DIR/data-on-new-build"
+      mv -f "$SEALED_DIR/data.raw" "$SEALED_DIR/data.raw.prev"
+      DATA_RESET=1
+      log "data volume: new launch identity; the owner's volume is now data.raw.prev (only that build opens it); the new build starts empty. data.raw.prev is restored if this roll is not confirmed."
+      ;;
+    keep)
+      rm -f "$SEALED_DIR/data-on-new-build"
+      log "data volume: new launch identity; data.raw kept, the new build cannot open it, so workspaces stay on the scratch disk (state locked in health) until a reset or a rekey"
+      ;;
+    *)
+      echo "sealed: the new build cannot open the data volume its current owner made (launch identity ${owner_id:-unknown} vs $new_id): its workspaces would not come back." >&2
+      echo "sealed: write the choice to $SEALED_DIR/data-on-new-build (one line), then re-run: reset (set the owner's volume aside as data.raw.prev and start empty) or keep (leave it; workspaces on the scratch disk until a reset or a rekey). The file is consumed by the run that uses it." >&2
+      exit 1
+      ;;
+  esac
+}
 refuse_sealed_restart_with_rooms
+data_volume_new_build
 systemctl restart "$UNIT"
 log "guest starting; serial log $SEALED_DIR/run/serial.log"
 ATT=$SEALED_DIR/run/attestation.json
@@ -156,6 +231,10 @@ GOT=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["binding"][
 cp "$ATT" "$IMG/attestation-$(date -u +%Y%m%dT%H%M%SZ).json"
 if [ "$GOT" = "$EXPECTED" ]; then
   log "measurement matches the build: $GOT"
+  # The roll is confirmed: keep the new (empty) data volume and leave the owner's
+  # volume as data.raw.prev for the operator to remove once the new build is good.
+  DATA_ROLL_OK=1
+  [ "$DATA_RESET" = 1 ] && log "data volume: reset confirmed; the previous owner's volume is kept at $SEALED_DIR/data.raw.prev (remove it when the new build is vouched for)"
   # A dedicated machine's HOST_DATA names its owner: add it to the broker's sealed_host_data.
   log "$(python3 -c 'import json,sys;b=json.load(open(sys.argv[1]))["binding"];print("tenancy", b.get("tenancy"), "host_data", b["host_data"])' "$ATT")"
   # Boot the guest again at the next host start (an unattended reboot left
@@ -167,6 +246,8 @@ else
   log "MEASUREMENT DIFFERS: report $GOT, build $EXPECTED"
   systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
   [ -n "$PREV_IMG" ] && [ "$PREV_IMG" != "$IMG" ] && ln -sfn "$PREV_IMG" "$SEALED_DIR/images/current"
+  # The EXIT trap restores the owner's data volume from data.raw.prev (it also
+  # covers the early exits above, which the old manual restore here did not).
   exit 1
 fi
 if [ "${SEALED_MINER:-0}" = 1 ]; then
