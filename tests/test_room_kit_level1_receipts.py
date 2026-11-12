@@ -357,6 +357,28 @@ def test_sealed_flags_refuse_a_level1_answer(tmp_path, monkeypatch) -> None:
         assert "level 1" in json.loads(proc.stdout)["reason"], proc.stdout
 
 
+def test_sealed_verifier_rejects_a_level1_statement_schema(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "tsm_provider", lambda: "sev_guest")
+    monkeypatch.setattr(rr, "snp_report", lambda data: _fake_report())
+    real_isdir = os.path.isdir
+
+    def isdir(path: str) -> bool:
+        return path == rr.TSM or real_isdir(path)
+
+    monkeypatch.setattr(rr.os.path, "isdir", isdir)
+    ledger = rr.Ledger("room-a", str(tmp_path / "sealed"))
+    ledger.sign({"action": "create", "status": 201})
+    good = ledger.chain[0]
+    statement = {**good["statement"], "schema": vr.HOTEL_RECEIPT_SCHEMA}
+    bad = {
+        "statement": statement,
+        "signature_b64": base64.b64encode(ledger.key.sign(vr.canonical(statement))).decode(),
+        "receipt_sha256": vr.sha(vr.canonical(statement)),
+    }
+    with pytest.raises(vr.Fail, match="not a sealed hotel receipt"):
+        vr.verify_receipts(ledger.attestation(), [bad])
+
+
 def test_a_repeated_receipt_fails_and_is_not_counted_twice(tmp_path, monkeypatch) -> None:
     ledger = _chain(tmp_path / "good", monkeypatch)
     chain = json.loads(json.dumps(ledger.chain))

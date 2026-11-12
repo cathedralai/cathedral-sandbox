@@ -86,6 +86,7 @@ KDS = "https://kdsintf.amd.com/vcek/v1"
 SIGNED_LEN = 0x2A0
 HOTEL_BINDING_SCHEMA = "cathedral_hotel_binding_v1"
 HOTEL_RECEIPT_SCHEMA = "cathedral_hotel_receipt_v1"
+SEALED_RECEIPT_SCHEMA = "cathedral_sealed_hotel_receipt_v1"
 INSTALL_ALGORITHM = "x25519-hkdf-sha256-aes256gcm-v1"
 INSTALL_PURPOSE = "hotel-key-install"
 HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -412,6 +413,9 @@ def verify_receipts(att: dict, receipts: list[dict], head: str | None = None) ->
         st = rc["statement"]
         if hotel:
             need(st.get("schema") == HOTEL_RECEIPT_SCHEMA, f"receipt {st.get('sequence')}: not a hotel receipt")
+        else:
+            need(st.get("schema") == SEALED_RECEIPT_SCHEMA,
+                 f"receipt {st.get('sequence')}: not a sealed hotel receipt")
         need(st["binding_sha256"] == bsha, f"receipt {st.get('sequence')} names another binding")
         need(rc["receipt_sha256"] == sha(canonical(st)), f"receipt {st['sequence']}: receipt_sha256 mismatch")
         try:
