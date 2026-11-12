@@ -2012,11 +2012,6 @@ func (b *broker) snapshot(g *guestState) map[string]any {
 	tot := map[string]int{"running": 0, "creating": 0, "deleting": 0, "failed_now": 0}
 	hotels := []any{}
 	for _, h := range b.hotelList() {
-		// Same reach rule as the guest capacity view: a hotel the guest may
-		// not use (list, reservation, lend, miner opt-in) is not shown (AB#577).
-		if g.tierOf(h) == "" {
-			continue
-		}
 		grid := make([]byte, len(h.grid))
 		mine := map[byte]int{}
 		for i, rm := range h.grid {
@@ -2029,6 +2024,14 @@ func (b *broker) snapshot(g *guestState) map[string]any {
 			default:
 				grid[i] = stOther
 			}
+		}
+		owned := mine[stRunning] + mine[stCreating] + mine[stDeleting] + mine[stFailed]
+		// Same reach rule as the guest capacity view (allowed list,
+		// reservation, lend, miner opt-in), except a hotel that still holds
+		// the guest's rooms stays visible after the operator narrows the
+		// guest's list (AB#577).
+		if owned == 0 && g.tierOf(h) == "" {
+			continue
 		}
 		tot["running"] += mine[stRunning]
 		tot["creating"] += mine[stCreating]
@@ -2043,7 +2046,7 @@ func (b *broker) snapshot(g *guestState) map[string]any {
 			"mine": map[string]int{"running": mine[stRunning], "creating": mine[stCreating], "deleting": mine[stDeleting], "failed": mine[stFailed]},
 		}
 		// All-guest counts only where this guest owns a room (AB#577).
-		if mine[stRunning]+mine[stCreating]+mine[stDeleting]+mine[stFailed] > 0 {
+		if owned > 0 {
 			doc["rooms_all"], doc["deleting_all"] = h.apiRunning, h.apiDeleting
 		}
 		hotels = append(hotels, doc)

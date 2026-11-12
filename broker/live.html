@@ -175,7 +175,8 @@ footer { margin-top: 18px; font-size: 14px; color: var(--muted); max-width: 80ch
     el.querySelector("h2").textContent = h.name;
     el.querySelector(".spec").textContent = `${h.threads} threads · ${fmt.format(h.ram_gib)} GiB`;
     tiles.set(h.id, t);
-    new ResizeObserver(() => { t.dirty = true; kick(); }).observe(el);
+    t.ro = new ResizeObserver(() => { t.dirty = true; kick(); });
+    t.ro.observe(el);
     return t;
   }
 
@@ -296,6 +297,12 @@ footer { margin-top: 18px; font-size: 14px; color: var(--muted); max-width: 80ch
     $("rejected").textContent = fmt.format(T.rejected);
     const slots = d.hotels.reduce((a, h) => a + h.slots, 0), up = d.hotels.filter((h) => h.ok).length;
     $("chain").textContent = `${up} of ${d.hotels.length} hotels in the chain answer · ${fmt.format(slots)} rooms`;
+    // The visible set can shrink while the page is open (the operator narrows
+    // the guest's hotels): drop tiles absent from this snapshot (AB#577).
+    const present = new Set(d.hotels.map((h) => h.id));
+    for (const [id, t] of tiles) {
+      if (!present.has(id)) { t.ro.disconnect(); t.el.remove(); tiles.delete(id); }
+    }
     for (const h of d.hotels) {
       const t = tileFor(h);
       t.el.style.setProperty("--w", Math.max(1, h.slots / 100).toFixed(2));
