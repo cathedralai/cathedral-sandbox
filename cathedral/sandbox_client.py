@@ -261,6 +261,18 @@ class SandboxClient:
         query = _query(path=path)
         return self._json("GET", f"/v1/sandboxes/{sandbox_id}/stat{query}", None, headers=self._headers())
 
+    def list_dir(self, sandbox_id: str, path: str) -> dict[str, Any]:
+        query = _query(path=path)
+        return self._json("GET", f"/v1/sandboxes/{sandbox_id}/list{query}", None, headers=self._headers())
+
+    def make_dir(self, sandbox_id: str, path: str) -> dict[str, Any]:
+        query = _query(path=path)
+        return self._call("POST", f"/v1/sandboxes/{sandbox_id}/mkdir{query}", headers=self._headers())[0]
+
+    def delete_path(self, sandbox_id: str, path: str, *, recursive: bool = False) -> dict[str, Any]:
+        query = _query(path=path, recursive="1" if recursive else None)
+        return self._call("DELETE", f"/v1/sandboxes/{sandbox_id}/files{query}", headers=self._headers())[0]
+
     # ------------------------------------------------------------------ §3.4 lifecycle
     def heartbeat(self, sandbox_id: str, ttl_seconds: int | None = None) -> dict[str, Any]:
         return self._json(

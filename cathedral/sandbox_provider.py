@@ -128,6 +128,9 @@ class SandboxProvider(Protocol):
     def write_tar(self, sandbox_id: str, path: str, tarball: bytes) -> None: ...
     def read_tar(self, sandbox_id: str, spec: TarGet) -> bytes: ...
     def stat(self, sandbox_id: str, path: str) -> StatResult: ...
+    def list_dir(self, sandbox_id: str, path: str) -> list[dict[str, Any]]: ...
+    def make_dir(self, sandbox_id: str, path: str) -> None: ...
+    def delete_path(self, sandbox_id: str, path: str, recursive: bool) -> None: ...
     def start_process(self, sandbox_id: str, request: ExecRequest) -> ProcessHandle: ...
     def process_logs(self, sandbox_id: str, process_id: str) -> str: ...
     def stop_process(self, sandbox_id: str, process_id: str) -> None: ...
@@ -783,6 +786,49 @@ class InMemorySandboxProvider:
             os.close(fd)
         return StatResult(is_dir=stat.S_ISDIR(st.st_mode), is_file=stat.S_ISREG(st.st_mode),
                           size=st.st_size, mode=st.st_mode & 0o7777)
+
+    # ------------------------------------------------------------------ AB#408 list / mkdir / delete
+    def list_dir(self, sandbox_id: str, path: str) -> list[dict[str, Any]]:
+        with self._lock:
+            sandbox = self._require_active(sandbox_id)
+            self._touch(sandbox)
+        self._host(sandbox, path)
+        fd = _open_dir_beneath(sandbox.root, path)
+        try:
+            entries: list[dict[str, Any]] = []
+            with os.scandir(fd) as it:
+                for entry in it:
+                    st = entry.stat(follow_symlinks=False)
+                    kind = "symlink" if stat.S_ISLNK(st.st_mode) else "dir" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "other"
+                    entries.append({"name": entry.name, "type": kind, "size": st.st_size, "mode": st.st_mode & 0o7777})
+                    if len(entries) > DIR_LIST_CAP:
+                        raise SandboxOpError("dir_too_large", 413, f"{path} holds more than {DIR_LIST_CAP} entries")
+            return sorted(entries, key=lambda e: e["name"])
+        finally:
+            os.close(fd)
+
+    def make_dir(self, sandbox_id: str, path: str) -> None:
+        with self._lock:
+            sandbox = self._require_running(sandbox_id)
+            self._touch(sandbox)
+        self._host(sandbox, path)
+        os.close(_open_dir_beneath(sandbox.root, path, make_dirs=True))
+
+    def delete_path(self, sandbox_id: str, path: str, recursive: bool) -> None:
+        with self._lock:
+            sandbox = self._require_running(sandbox_id)
+            self._touch(sandbox)
+        # No _host() here: it resolves links, and deleting a link must remove the link.
+        api._validated_abs_path(path)
+        parts = [p for p in path.strip("/").split("/") if p not in ("", ".")]
+        if len(parts) < 2:
+            # Never the room's top directory (/work) or the root itself.
+            raise SandboxOpError("path_protected", 400, f"refusing to delete {path}")
+        parent = _open_dir_beneath(sandbox.root, "/" + "/".join(parts[:-1]))
+        try:
+            _remove_entry(parent, parts[-1], recursive, path)
+        finally:
+            os.close(parent)
 
     # ------------------------------------------------------------------ §3.5 snapshot / fork primitives
     def snapshot(self, sandbox_id: str, *, ttl_seconds: int | None = None, name: str | None = None, labels: dict[str, str] | None = None) -> str:
@@ -1623,6 +1669,63 @@ def _open_beneath(root: Path, path: str, flags: int, *, make_dirs: bool = False)
             raise SandboxOpError("path_escape", 400, f"path ends in a link or cannot be opened: {path}") from exc
     finally:
         os.close(dirfd)
+
+
+DIR_LIST_CAP = 10000
+
+
+def _open_dir_beneath(root: Path, path: str, *, make_dirs: bool = False) -> int:
+    """Open a directory below root, one component at a time, never following a link (AB#408).
+
+    The room writes the same tree through its bind mount, so every component is
+    opened O_NOFOLLOW against the fd of its parent. mkdir -p is done here for the
+    same reason: a path check followed by a second walk leaves a swap window.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for name in (p for p in path.strip("/").split("/") if p not in ("", ".")):
+            try:
+                if make_dirs:
+                    try:
+                        os.mkdir(name, 0o755, dir_fd=dirfd)
+                    except FileExistsError:
+                        pass
+                next_fd = os.open(name, flags, dir_fd=dirfd)
+            except FileNotFoundError:
+                raise SandboxOpError("dir_not_found", 404, f"no directory {path}") from None
+            except OSError as exc:  # ELOOP or ENOTDIR: a link or a file in the chain
+                raise SandboxOpError("path_escape", 400, f"path is not a plain directory chain: {path}") from exc
+            os.close(dirfd)
+            dirfd = next_fd
+        return dirfd
+    except BaseException:
+        os.close(dirfd)
+        raise
+
+
+def _remove_entry(parent_fd: int, name: str, recursive: bool, path: str) -> None:
+    try:
+        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        raise SandboxOpError("path_not_found", 404, f"no path {path}") from None
+    if not stat.S_ISDIR(st.st_mode):
+        os.unlink(name, dir_fd=parent_fd)  # a link is removed itself, never its target
+        return
+    if recursive:
+        try:
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        except OSError as exc:
+            raise SandboxOpError("path_escape", 400, f"path is not a plain directory chain: {path}") from exc
+        try:
+            for entry in os.listdir(child):
+                _remove_entry(child, entry, True, path)
+        finally:
+            os.close(child)
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+    except OSError:
+        raise SandboxOpError("dir_not_empty", 409, f"{path} is not empty; pass recursive=1") from None
 
 
 def _render_cmd(request: ExecRequest) -> str:
