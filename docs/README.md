@@ -34,8 +34,8 @@ order.
 
 ## Founding miners
 
-The public SN94 Founding Miner Application is live. Apply with the
-[Founding Miner Application](https://docs.google.com/forms/d/e/1FAIpQLScxnX15Hb70AnkeZcHBI53cv_yN7aen4_h95njQvMzBxBiMpQ/viewform).
+Compute mining is closed to new miners and there is no application right now.
+Cathedral will post an announcement when mining opens.
 See [Founding miners](MINING.md#founding-miners). Registration alone does
 not admit a machine to the sealed customer pool or place customer jobs.
 
