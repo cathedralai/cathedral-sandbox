@@ -27,8 +27,10 @@ Routes it adds:
   GET /v1/sandboxes/<id>/receipts  the receipts of one room
   GET /room/escape-plant-key       sealed Escape hotels only: the guest X25519 public
                                    key, signed by the attested receipt key
-  POST /room/escape-nonce          sealed Escape hotels only: plant the window nonce
-                                   (never echoed; receipt signs the plant without the value)
+  POST /room/escape-nonce          sealed Escape hotels only: plant the window nonce at
+                                   /run/escape-room/<window_id>/nonce, one file per window
+                                   (never echoed; the signed receipt and the answer carry that
+                                   path, not the value)
   GET /room/hotel-key-install-key  miner hotels only: the guest X25519 install key, signed
                                    by the attested receipt key
   POST /room/hotel-key             miner hotels only: install the per-hotel API key, sealed
@@ -151,8 +153,12 @@ PLANT_ACTION = "escape_nonce_plant"
 PLANT_ALGORITHM = "x25519-hkdf-sha256-aes256gcm-v1"
 PLANT_KEY_PURPOSE = "escape-plant-key"
 PLANT_HKDF_INFO = b"cathedral.escape-nonce-plant.v1"
-DEFAULT_ESCAPE_NONCE_PATH = "/run/escape-room/nonce"
+DEFAULT_ESCAPE_NONCE_DIR = "/run/escape-room"
+# Kept for 25 h: longer than a window plus the AB#677 grace. Age, not count, so a create flood cannot evict live windows.
+DEFAULT_ESCAPE_NONCE_KEEP_SECONDS = 25 * 3600
 WINDOW_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+# A window id becomes a directory name: no ".", "..", or hidden names.
+WINDOW_DIR_RE = re.compile(r"^[A-Za-z0-9_:-][A-Za-z0-9._:-]{0,127}$")
 NONCE_RE = re.compile(r"^[A-Za-z0-9+/=_-]{16,512}$")
 # Miner hotel key install (the control plane side is polariscomputer
 # cathedral_hotel_reconciler.RoomKitKeyInstaller; keep the two in step).
@@ -550,8 +556,20 @@ def escape_plant_open(ledger: "Ledger") -> bool:
     return os.environ.get("ROOM_ESCAPE") == "1" and bool(getattr(ledger, "sealed", False))
 
 
-def escape_nonce_path() -> str:
-    return os.environ.get("ROOM_ESCAPE_NONCE_PATH") or DEFAULT_ESCAPE_NONCE_PATH
+def escape_nonce_dir() -> str:
+    return os.environ.get("ROOM_ESCAPE_NONCE_DIR") or DEFAULT_ESCAPE_NONCE_DIR
+
+
+def escape_nonce_path(window_id: str) -> str:
+    """One secret file per window, so a second plant cannot overwrite the first."""
+    return os.path.join(escape_nonce_dir(), window_id, "nonce")
+
+
+def escape_nonce_keep_seconds() -> float:
+    try:
+        return float(os.environ.get("ROOM_ESCAPE_NONCE_KEEP_SECONDS") or DEFAULT_ESCAPE_NONCE_KEEP_SECONDS)
+    except ValueError:
+        return float(DEFAULT_ESCAPE_NONCE_KEEP_SECONDS)
 
 
 def plant_key_statement(hotel: str, x25519_public_b64: str, binding_sha256: str) -> dict:
@@ -1216,13 +1234,46 @@ class MinerHotel:
         return None
 
 
-def write_escape_nonce(path: str, nonce: str, window_id: str) -> None:
-    """Write the nonce as a root-only file. The window id sits beside it and is not secret."""
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    os.chmod(directory, 0o700)
-    _replace_private_file(directory, os.path.join(directory, "window"), window_id.encode() + b"\n", 0o444)
-    _replace_private_file(directory, path, nonce.encode() + b"\n", 0o400)
+def write_escape_nonce(base_dir: str, window_id: str, nonce: str) -> str:
+    """Write <base>/<window_id>/nonce (0400 root) and return its path. Touches no other window."""
+    if not WINDOW_DIR_RE.fullmatch(window_id):
+        raise OSError("window id is not a safe directory name")
+    if os.path.islink(base_dir):
+        raise OSError("nonce base directory is a symlink")
+    os.makedirs(base_dir, mode=0o700, exist_ok=True)
+    os.chmod(base_dir, 0o700)
+    window_dir = os.path.join(base_dir, window_id)
+    if os.path.islink(window_dir):
+        raise OSError("window directory is a symlink")
+    os.makedirs(window_dir, mode=0o700, exist_ok=True)
+    os.chmod(window_dir, 0o700)
+    path = os.path.join(window_dir, "nonce")
+    if os.path.islink(path):
+        raise OSError("nonce file is a symlink")
+    _replace_private_file(window_dir, path, nonce.encode() + b"\n", 0o400)
+    return path
+
+
+def prune_escape_windows(base_dir: str, keep_window_id: str, now: float | None = None) -> None:
+    """Remove window directories older than the keep time. Never raises: a plant must not fail on it.
+
+    An ended room's file stays until this age, so the AB#677 grace needs no extra rule.
+    """
+    try:
+        cutoff = (time.time() if now is None else now) - escape_nonce_keep_seconds()
+        for name in os.listdir(base_dir):
+            if name == keep_window_id or not WINDOW_DIR_RE.fullmatch(name):
+                continue
+            entry = os.path.join(base_dir, name)
+            try:
+                st = os.lstat(entry)
+                if not stat.S_ISDIR(st.st_mode) or st.st_mtime >= cutoff:
+                    continue
+                shutil.rmtree(entry)
+            except OSError:
+                continue
+    except OSError:
+        pass
 
 
 def _replace_private_file(directory: str, path: str, data: bytes, mode: int) -> None:
@@ -2183,8 +2234,8 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(doc, dict):
             return self.reply(400, b'{"error":{"code":"invalid_request","message":"request body is not JSON"}}')
         window_id = doc.get("window_id")
-        if not isinstance(window_id, str) or not WINDOW_ID_RE.fullmatch(window_id):
-            return self.reply(400, b'{"error":{"code":"invalid_request","message":"window_id must be 1 to 128 of [A-Za-z0-9._:-]"}}')
+        if not isinstance(window_id, str) or not WINDOW_ID_RE.fullmatch(window_id) or not WINDOW_DIR_RE.fullmatch(window_id):
+            return self.reply(400, b'{"error":{"code":"invalid_request","message":"window_id must be 1 to 128 of [A-Za-z0-9._:-], not starting with a dot"}}')
         encrypted = False
         nonce = None
         if doc.get("ciphertext_b64"):
@@ -2201,9 +2252,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(400, b'{"error":{"code":"invalid_request","message":"ciphertext_b64 or nonce is required"}}')
         if not isinstance(nonce, str) or not NONCE_RE.fullmatch(nonce):
             return self.reply(400, b'{"error":{"code":"invalid_request","message":"nonce must be 16 to 512 of [A-Za-z0-9+/=_-]"}}')
-        path = escape_nonce_path()
+        base_dir = escape_nonce_dir()
+        prune_escape_windows(base_dir, window_id)
         try:
-            write_escape_nonce(path, nonce, window_id)
+            path = write_escape_nonce(base_dir, window_id, nonce)
         except OSError:
             traceback.print_exc()
             return self.reply(500, b'{"error":{"code":"plant_failed","message":"the nonce file could not be written"}}')
