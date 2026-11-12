@@ -831,8 +831,9 @@ speak_answer() { # answer-file out-file
 # Values removed by value (AB#541). A value whose variable is named like a
 # credential goes at any length (a short key is still a key); any other value
 # goes from 8 characters up. Longest first so a value that contains another is
-# removed whole. Every secrets value is also held back across stream pieces,
-# so a non-credential env value cannot leak as deltas before the next chunk.
+# removed whole. Stream hold uses hold_secrets (credentials + non-infra env
+# values of length >= 8) so a FOO=... style secret cannot leak as deltas, while
+# PATH/HOME/MODEL/LFM3_* do not reshape every host's stream.
 read -r -d '' SECRETS_JQ <<'JQ' || true
 def credentials:
   [$ENV | to_entries[]
@@ -841,6 +842,18 @@ def credentials:
    | .value] | unique;
 def secrets:
   ([$ENV[] | select(type == "string" and length >= 8)] + credentials) | unique | sort_by(length) | reverse;
+# Infra keys are always present in the room; holding their prefixes would make
+# delta boundaries depend on PATH/MODEL and break the chat-events contract.
+def infra_key: test("^(PATH|HOME|PWD|USER|LOGNAME|SHELL|TERM|LANG|LC_|TMPDIR|TMP|TEMP|SHLVL|_|HOSTNAME|OLDPWD|MODEL|MODEL_|LFM3_)");
+def hold_secrets:
+  [$ENV | to_entries[]
+   | select(.value | type == "string" and length > 0)
+   | select(.key | infra_key | not)
+   | select(
+       (.key | test("key|token|secret|passw|pass|auth|cred|private|cookie|session"; "i"))
+       or (.value | length >= 8)
+     )
+   | .value] | unique | sort_by(length) | reverse;
 def redact($S): reduce $S[] as $v (.; split($v) | join("[redacted]"));
 JQ
 
@@ -874,15 +887,15 @@ def parse:
     | if $d == "[DONE]" then {done: true}
       else ((try ($d | fromjson) catch {skip: true}) | if type == "object" then . else {skip: true} end) end
   else {skip: true} end;
-# Text is held back while its tail could be the start of any secrets value, so
-# a value split across stream pieces never reaches a delta.
+# Text is held back while its tail could be the start of a hold_secrets value,
+# so a user/credential secret split across stream pieces never reaches a delta.
 def tail_len($C): . as $r
   | ([$C[] | length] | max // 0) as $m
   | ([range(1; ([$m, ($r | length) + 1] | min)) as $k
       | select(any($C[]; length > $k and startswith($r[($r | length) - $k:]))) | $k] | max) // 0;
 def hold($t; $S):
   ((.sbuf + $t) | redact($S)) as $r
-  | ($r | tail_len($S)) as $n
+  | ($r | tail_len(hold_secrets)) as $n
   | .sbuf = $r[($r | length) - $n:]
   | .buf += $r[0:($r | length) - $n]
   | drain;

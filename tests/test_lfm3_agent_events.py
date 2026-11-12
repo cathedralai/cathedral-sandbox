@@ -623,8 +623,8 @@ def test_a_header_style_secret_is_redacted_without_any_configured_value(model: S
 
 
 def test_non_credential_env_prefixes_are_held_across_stream_pieces(model: StreamModel, room: Any) -> None:
-    # SpockChaser HOLD: FOO is in secrets (>=8) but was not in credentials, so
-    # hold() emitted prefixes as deltas before the full value assembled.
+    # SpockChaser HOLD: FOO is hold_secrets (>=8, non-infra) so prefixes must
+    # not reach deltas before the full value is assembled and redacted.
     secret = "abcdefghijklmno"
     model.replies = [{"pieces": ["abcde", "fghij", "klmno"]}]
     done, events = turn(room, "go", FOO=secret)
