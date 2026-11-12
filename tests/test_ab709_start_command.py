@@ -266,3 +266,41 @@ def test_tag_moving_to_another_owners_id_after_authorize_is_refused(fake: FakeDo
         assert fake.calls_of("run") == []
     finally:
         provider.close()
+
+
+def test_owned_tag_refresh_grants_the_new_id(fake: FakeDocker, monkeypatch) -> None:
+    """Already-owned tag + pull_policy=always must grant the refreshed Id (Bugbot/Codex)."""
+    from cathedral.sandbox_owner import owner_id
+
+    old_id = "sha256:" + "ab" * 32
+    new_id = "sha256:" + "cd" * 32
+    fake.add_image("svc:1", image_id=old_id)
+    monkeypatch.setenv("CATHEDRAL_SANDBOX_PULL_POLICY", "always")
+    provider = DockerGuestProvider()
+    mine = owner_id("k", "mine")
+    provider._image_owners.grant(old_id, mine, provenance="registry", ref="svc:1")
+
+    pulls = {"n": 0}
+    real_ensure = provider._ensure_image
+
+    def refresh_to_new(image, **kw):
+        pulls["n"] += 1
+        fake.set_image_id(image, new_id)
+        return real_ensure(image, **kw)
+
+    provider._ensure_image = refresh_to_new  # type: ignore[method-assign]
+    try:
+        doc = provider.create(
+            CreateSandboxRequest(image=ImageSource(image="svc:1"), resources=RES),
+            api_key="k",
+            idempotency=None,
+            body_digest="d",
+            owner=mine,
+        )
+        assert pulls["n"] == 1
+        assert provider._image_owners.owns(new_id, mine)
+        run = fake.calls_of("run")[-1]
+        assert run[-1] == new_id
+        assert doc["sandbox_id"]
+    finally:
+        provider.close()

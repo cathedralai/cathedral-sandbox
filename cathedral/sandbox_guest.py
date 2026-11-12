@@ -1464,7 +1464,26 @@ class DockerGuestProvider:
             # Preserve credential rechecks for private images and pull-policy always.
             if registry_auth is not None or image in self._auth_pulled or self._pull_policy == "always":
                 self._ensure_image(image, registry_auth=registry_auth, refresh=True)
+                # Refresh may land a newer Id under the same tag; grant that Id
+                # so the post-authorize require() on the run Id can pass.
+                refreshed = self._image_id_of(image)
+                if refreshed is None:
+                    raise SandboxOpError(
+                        "image_pull_failed", 502, f"image {image} has no docker id after pull"
+                    )
+                if refreshed != local_id:
+                    if self._image_owners.provenance(refreshed) in ("snapshot", "build") and not self._image_owners.owns(
+                        refreshed, owner
+                    ):
+                        raise SandboxOpError(
+                            "image_not_owned",
+                            403,
+                            "this guest cannot use that image on this hotel",
+                        )
+                    self._image_owners.grant(refreshed, owner, provenance="registry", ref=image)
+                    return refreshed
             return local_id
+
         if self._looks_like_image_id(image):
             raise SandboxOpError(
                 "image_not_owned",
