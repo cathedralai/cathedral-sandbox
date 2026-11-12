@@ -7,7 +7,7 @@
 > **Compute mining is closed to new miners right now.** Only approved operators
 > earn; any other machine earns nothing, even if it passes every check. There is
 > no application. Cathedral will post an announcement when mining opens.
-> **Earn today with no hardware:** the [Cathedral Escape Room](https://github.com/cathedralai/cathedral-escape-room)
+> **Earn today with no hardware:** the [Cathedral Escape Room](https://github.com/cathedralai/cathedral-escape)
 > is open to any hotkey registered on SN94.
 
 ## Contents
@@ -34,7 +34,7 @@ confidential-computing evidence, test their work and score the results.
 | Repository | What it is | Read it when |
 |---|---|---|
 | **cathedral-sandbox** (this one) | The sandbox, the sealed host code, and compute mining | You want to mine with a machine, or study the target |
-| [cathedral-escape-room](https://github.com/cathedralai/cathedral-escape-room) | The contest: break out of a sealed sandbox, prove it, earn | You want to attack the sandbox for a reward |
+| [cathedral-escape](https://github.com/cathedralai/cathedral-escape) | The contest: break out of a sealed sandbox, prove it, earn | You want to attack the sandbox for a reward |
 | [cathedral-validator](https://github.com/cathedralai/cathedral-validator) | The SN94 validator: how weights are set, with signed updates | You want to validate, or check how miners and breaks are paid |
 
 This repository is for miners running compute workers on Bittensor SN94. It builds the wall, the escape room pays people to break it, and the validator pays both:
@@ -73,7 +73,7 @@ those hosts. There is no self-serve sealed capacity; access is by request.
 This repository does not sell or provision that product.
 
 The Escape Room is open, with no cash prize. Rules and a practice harness are in
-[cathedral-escape-room](https://github.com/cathedralai/cathedral-escape-room).
+[cathedral-escape](https://github.com/cathedralai/cathedral-escape).
 
 ## What you need
 
