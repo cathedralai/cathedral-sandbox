@@ -299,8 +299,9 @@ def test_owned_tag_refresh_grants_the_new_id(fake: FakeDocker, monkeypatch) -> N
         )
         assert pulls["n"] == 1
         assert provider._image_owners.owns(new_id, mine)
-        run = fake.calls_of("run")[-1]
-        assert run[-1] == new_id
-        assert doc["sandbox_id"]
+        run = [c for c in fake.calls_of("run") if c[-1] == "infinity"][-1]
+        assert new_id in run
+        assert "svc:1" not in run
+        assert doc["id"]
     finally:
         provider.close()
