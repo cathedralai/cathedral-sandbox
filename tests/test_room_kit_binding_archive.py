@@ -219,3 +219,52 @@ def test_mismatched_archive_refused(fixtures) -> None:
     assert out["verdict"] == "FAIL"
     assert "does not hash" in out["reason"]
     Broker.archives[key] = saved
+
+
+def _broker_args(fixtures) -> list[str]:
+    return ["--broker", fixtures["base"], "--key-file", str(fixtures["guest"]),
+            "--operator-key-file", str(fixtures["operator"]), "--hotel", "h1", "--skip-amd"]
+
+
+def _run(*argv: str) -> tuple[int, dict]:
+    proc = subprocess.run([sys.executable, str(KIT / "verify_receipts.py"), *argv],
+                          capture_output=True, text=True)
+    assert proc.stdout.strip(), proc.stderr
+    return proc.returncode, json.loads(proc.stdout)
+
+
+def test_live_level1_with_archived_sealed_receipts_is_not_proven(fixtures) -> None:
+    """A sealed guest rebooted unsealed (level 1): old sealed receipts are never PASS."""
+    live = {"schema": vr.HOTEL_BINDING_SCHEMA, "level": "hotel", "hotel": "h1", "boot_id": "boot-l1",
+            "receipt_key_ed25519_b64": base64.b64encode(_raw_pub(Ed25519PrivateKey.generate())).decode()}
+    live_sha = vr.sha(vr.canonical(live))
+    old_rc = json.loads(fixtures["chain"].read_text())["receipts"][0]
+    Broker.live_att = {"binding": live, "binding_sha256": live_sha}
+    Broker.chain_page = {"binding_sha256": live_sha, "head": None, "receipts": [old_rc], "scanned": 1}
+    rc, out = _run(*_broker_args(fixtures))
+    assert out["verdict"] == "NOT PROVEN", out
+    assert rc == 3
+    assert out["not_proven"]
+    assert out["attestation"]["archived_chains"][0]["signatures_ok"] == 1
+
+
+def test_broker_path_exit_code_is_3_for_sealed_live_plus_archive(fixtures) -> None:
+    rc, out = _run(*_broker_args(fixtures))
+    assert (rc, out["verdict"]) == (3, "NOT PROVEN")
+
+
+def test_missing_archive_is_a_fail_verdict_not_a_traceback(fixtures) -> None:
+    Broker.archives = {}
+    proc = subprocess.run([sys.executable, str(KIT / "verify_receipts.py"), *_broker_args(fixtures)],
+                          capture_output=True, text=True)
+    out = json.loads(proc.stdout)
+    assert proc.returncode == 1
+    assert out["verdict"] == "FAIL"
+    assert f"no archived binding with hash {fixtures['old_bsha'][:16]}..." in out["reason"]
+    assert "Traceback" not in proc.stderr
+
+
+def test_file_only_older_boot_bundle_fails(fixtures) -> None:
+    rc, out = _run("--attestation", str(fixtures["att"]), "--receipts", str(fixtures["chain"]), "--skip-amd")
+    assert rc == 1 and out["verdict"] == "FAIL"
+
