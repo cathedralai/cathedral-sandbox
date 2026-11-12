@@ -114,6 +114,10 @@ type config struct {
 	// install-time sizing with memory overcommit, so they cannot see rooms
 	// that use their full memory limit.
 	MemFullPct float64 `json:"mem_full_pct"`
+	// PrewarmCatalog (default off): when a hotel comes up, pull the live
+	// catalog images on it, and prefer hotels that hold a create's image.
+	// The scratch disk of a sealed hotel is wiped every boot (AB#532).
+	PrewarmCatalog bool `json:"prewarm_catalog"`
 	// OperatorKeySHA256 is the SHA-256 of the operator key. It allows hotel
 	// join, change and leave at runtime (hotels.go). Empty: no operator routes.
 	OperatorKeySHA256 string `json:"operator_key_sha256"`
@@ -207,12 +211,14 @@ type hotel struct {
 	queued       int
 	creating     int
 	backoffUntil time.Time
-	ok           bool         // health answered within okWindow, or room calls did (see syncHotel)
-	healthLate   bool         // ok only because room calls answer; health is late
-	lastOK       time.Time    // last good /room/health answer
-	downSince    time.Time    // when ok last went false; zero while ok
-	lastAnswer   atomic.Int64 // unix ns of the last room call the hotel answered (status < 500)
-	healthMs     float64      // duration of the last /room/health call
+	ok           bool            // health answered within okWindow, or room calls did (see syncHotel)
+	warm         map[string]bool // catalog images pulled since the hotel last came up (prewarm.go)
+	warmGen      int             // bumped when the hotel goes down, so a stale prewarm marks nothing
+	healthLate   bool            // ok only because room calls answer; health is late
+	lastOK       time.Time       // last good /room/health answer
+	downSince    time.Time       // when ok last went false; zero while ok
+	lastAnswer   atomic.Int64    // unix ns of the last room call the hotel answered (status < 500)
+	healthMs     float64         // duration of the last /room/health call
 	// healthRuntime: the room runtime the hotel last reported in /room/health
 	// ("runsc"...), or "" when it reported none. Atomic because isolationDoc
 	// reads it with or without b.mu held.
@@ -641,6 +647,7 @@ func (b *broker) pickIn(exclude map[*hotel]bool, pl placement) *hotel {
 			total += weight[i]
 		}
 	}
+	total = b.preferWarm(hotels, weight, total, pl.image)
 	if total <= 0 {
 		return nil
 	}
@@ -1158,6 +1165,7 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		return
 	}
 	pl.apply(payload)
+	pl.image, _ = payload["image"].(string)
 	if e, retry := b.admit(g, count); e != nil {
 		writeLimitErr(w, e, retry)
 		return
@@ -1801,6 +1809,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	wasOK := h.ok
 	h.ok = healthOK || (callsOK && !h.lastOK.IsZero())
 	h.healthLate = !healthOK && h.ok
+	cameUp := h.ok && !wasOK
 	switch {
 	case h.ok:
 		if !h.downSince.IsZero() {
@@ -1809,12 +1818,16 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		h.downSince = time.Time{}
 	case h.downSince.IsZero():
 		h.downSince = now
+		b.hotelWentDown(h)
 		// A hotel that comes back must pass attestation again: it may have
 		// rebooted into another binding.
 		h.adm.attestedAt, h.adm.checkedAt = time.Time{}, time.Time{}
 		if wasOK {
 			log.Printf("hotel %s down: %s", h.cfg.ID, h.lastErr)
 		}
+	}
+	if cameUp && b.cfg.PrewarmCatalog {
+		go b.prewarmHotel(h)
 	}
 	if herr == nil {
 		slots := hd.Slots
