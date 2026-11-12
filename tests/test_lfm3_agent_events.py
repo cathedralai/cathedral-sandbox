@@ -568,3 +568,63 @@ def test_conformance_fixture(model: StreamModel, room: Any, name: str) -> None:
 def test_the_fixture_set_covers_the_room_checks() -> None:
     wanted = {"plain", "unicode", "tool-round", "redaction", "markup", "length", "loop", "steps", "model-down", "not-chat-model"}
     assert wanted <= set(fixture_names())
+
+
+def sse(delta: dict[str, Any], finish: str | None = None) -> str:
+    return "data: " + json.dumps({"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+
+
+@pytest.mark.parametrize("tail", [["data: [DONE]  "], ["data: [DONE]\r"], ["data:[DONE]"], ["data: [DONE]", ""]])
+def test_done_sentinel_is_a_normal_end_of_stream(model: StreamModel, room: Any, tail: list[str]) -> None:
+    # No finish_reason chunk: the sentinel alone ends the stream, with or without
+    # trailing spaces, a carriage return or a final newline.
+    model.replies = [{"raw": [sse({"content": "hi"}), "", *tail]}]
+    done, events = turn(room, "hi")
+    assert done.returncode == 0
+    check_envelope(events)
+    assert events[-1]["type"] == "answer" and events[-1]["text"] == "hi"
+
+
+def test_held_back_text_is_drained_at_end_of_stream(model: StreamModel, room: Any) -> None:
+    model.replies = [{"pieces": ["a ", "b <"], "finish": "length"}, {"pieces": ["x <to"]}]
+    done, events = turn(room, "hi")
+    deltas = "".join(ev["text"] for ev in events if ev["type"] == "delta")
+    assert deltas == "a b <" == events[-1]["text"]
+    model.replies = [{"pieces": ["see <tool_c"]}]
+    _, events = turn(room, "again")
+    deltas = "".join(ev["text"] for ev in events if ev["type"] == "delta")
+    assert deltas == events[-1]["text"] == "see <tool_c"
+
+
+def test_a_short_key_value_never_reaches_stdout(model: StreamModel, room: Any) -> None:
+    short = "k7q"
+    command = f"curl -H 'X-API-Key: {short}' https://x; echo {short}; curl -H 'X-Auth-Thing: other-short' https://y"
+    model.replies = [
+        {"tool_calls": [{"id": "h1", "name": "run", "arguments": {"command": command}}]},
+        {"pieces": ["the key is k", "7q and again ", "k7", "q"]},
+    ]
+    done, events = turn(room, "go", MODEL_API_KEY=short)
+    call = next(ev for ev in events if ev["type"] == "tool_call")
+    assert call["redacted"] is True
+    assert short.encode() not in done.stdout
+    assert b"other-short" not in done.stdout
+    assert "X-API-Key: [redacted]" in call["summary"]
+    assert events[-1]["type"] == "answer" and short not in events[-1]["text"]
+
+
+def test_a_header_style_secret_is_redacted_without_any_configured_value(model: StreamModel, room: Any) -> None:
+    model.replies = [
+        {"tool_calls": [{"id": "h2", "name": "run", "arguments": {"command": "curl -H \"X-API-Key: short-real-secret\" https://x"}}]},
+        {"pieces": ["done"]},
+    ]
+    done, events = turn(room, "go")
+    call = next(ev for ev in events if ev["type"] == "tool_call")
+    assert b"short-real-secret" not in done.stdout and call["redacted"] is True
+
+
+def test_the_plain_path_does_not_echo_the_key_or_request_headers(model: StreamModel, room: Any) -> None:
+    short = "k7q"
+    model.replies = [{"status": 500, "body": {"error": {"message": "scripted failure"}}}]
+    done = room("hello", MODEL_API_KEY=short)
+    assert short.encode() not in done.stdout and b"Authorization" not in done.stdout
+    assert b"Authorization" not in done.stderr

@@ -177,7 +177,7 @@ RUN set -eu; \
     if [ -n "${GGUF_SHA256}" ]; then echo "${GGUF_SHA256}  /opt/lfm3/${GGUF}" | sha256sum -c -; fi; \
     test -n "${MODEL_NAME}" && test -n "${LFM3_CHECKS}"; \
     case "${LFM3_KIND}" in chat | decision) ;; *) exit 1 ;; esac; \
-    cd /opt/lfm3 && sha256sum *.gguf LICENSE test/* > SHA256SUMS
+    cd /opt/lfm3 && { sha256sum *.gguf LICENSE; find test -type f | LC_ALL=C sort | xargs sha256sum; } > SHA256SUMS
 
 # MODEL_* is the OpenAI-compatible contract agents read to find their model.
 ENV LFM3_MODEL=/opt/lfm3/${GGUF} \

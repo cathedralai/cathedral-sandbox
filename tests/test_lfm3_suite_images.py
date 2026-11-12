@@ -80,3 +80,21 @@ def test_prefetch_script_targets_sealed_only() -> None:
     assert "sealed" in script
     assert "b1ba8837ea388c8c98720772b0f41af5813d4cebf214637fde20aae58a1ea761" in script
     assert "/v1/images/prefetch" in script
+
+
+def test_checksum_step_copes_with_nested_fixture_directories(tmp_path) -> None:
+    import re
+    import shutil
+    import subprocess
+
+    text = (Path(__file__).resolve().parents[1] / "images" / "room-lfm3-suite" / "Dockerfile").read_text()
+    step = re.search(r"cd /opt/lfm3 && (.*> SHA256SUMS)", text)
+    assert step, "the image checksum step moved"
+    (tmp_path / "test" / "chat-events").mkdir(parents=True)
+    (tmp_path / "test" / "chat-events" / "plain.json").write_text("{}")
+    (tmp_path / "test" / "test-image.png").write_text("png")
+    (tmp_path / "m.gguf").write_text("w")
+    (tmp_path / "LICENSE").write_text("l")
+    done = subprocess.run([shutil.which("bash"), "-c", "set -e; cd \"$1\" && " + step.group(1), "_", str(tmp_path)], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    assert "test/chat-events/plain.json" in (tmp_path / "SHA256SUMS").read_text()
