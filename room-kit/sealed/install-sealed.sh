@@ -51,6 +51,8 @@ command -v mmdebstrap >/dev/null || need+=(mmdebstrap)
 command -v zstd >/dev/null || need+=(zstd)
 command -v cpio >/dev/null || need+=(cpio)
 python3 -c 'import venv' 2>/dev/null && python3 -c 'import ensurepip' 2>/dev/null || need+=(python3-venv)
+# The roll guard reads the data volume's owner token on the host (data_volume_owner_id).
+{ [ "${SEALED_DATA_GIB:-0}" = 0 ] || command -v cryptsetup >/dev/null; } || need+=(cryptsetup-bin)
 if [ ${#need[@]} -gt 0 ]; then
   log "apt install ${need[*]}"
   DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "${need[@]}"
@@ -177,6 +179,12 @@ except Exception:
 data_volume_new_build() {
   { [ "${SEALED_DATA_GIB:-0}" != 0 ] && [ -f "$SEALED_DIR/data.raw" ]; } || return 0
   local new_hd_b64 new_hd_hex new_id owner_id choice
+  # Without the binary the owner id would read as empty, which looks like another build's volume and
+  # offers a reset that sets a readable customer volume aside. Stop before any choice instead.
+  command -v cryptsetup >/dev/null || {
+    echo "sealed: cryptsetup is not installed on this host, so the owner token of $SEALED_DIR/data.raw cannot be read. Nothing was changed and no reset or keep choice is asked. Install it (apt-get install cryptsetup-bin) and re-run." >&2
+    exit 1
+  }
   new_hd_b64=$(LAUNCH_PRINT_HOST_DATA=1 "$SEALED_DIR/launch-guest.sh" "$SEALED_DIR/sealed.env") \
     || { echo "sealed: could not compute the new build's HOST_DATA (launch-guest.sh)" >&2; exit 1; }
   new_hd_hex=$(python3 -c 'import base64,sys;print(base64.b64decode(sys.argv[1]).hex())' "$new_hd_b64")

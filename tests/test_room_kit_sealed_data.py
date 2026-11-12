@@ -16,6 +16,7 @@ import ctypes
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -790,7 +791,7 @@ def _owner_launch_id(expected: str = "ab" * 48, manifest: bytes = MANIFEST) -> s
 
 def _roll(host: FakeHost, *, token_launch_id: str | None, choice: str | None = None,
           measurement: str = "ab" * 48, expected: str = "ab" * 48, prev: bytes | None = None,
-          **env: str):
+          host_cryptsetup: bool = True, **env: str):
     """Run step 5 with a data volume whose token records *token_launch_id*.
 
     Plants what section 4 and the guest would have left: the installed
@@ -801,9 +802,10 @@ def _roll(host: FakeHost, *, token_launch_id: str | None, choice: str | None = N
     sealed = host.tmp / "sealed"
     orig_run = host.run
     # Fake cryptsetup for the host side: token export reads <dev>.token.
-    (host.bin / "cryptsetup").write_text(
-        f"#!{BASH}\n" + 'if [ "$1 $2" = "token export" ]; then d=${*: -1}; cat "$d.token" 2>/dev/null || exit 1; fi\n')
-    (host.bin / "cryptsetup").chmod(0o755)
+    if host_cryptsetup:
+        (host.bin / "cryptsetup").write_text(
+            f"#!{BASH}\n" + 'if [ "$1 $2" = "token export" ]; then d=${*: -1}; cat "$d.token" 2>/dev/null || exit 1; fi\n')
+        (host.bin / "cryptsetup").chmod(0o755)
 
     def run(script, *args, env=None):
         (sealed / "launch-guest.sh").write_text((host.kit / "sealed" / "launch-guest.sh").read_text())
@@ -834,6 +836,21 @@ def test_a_new_launch_identity_stops_until_the_operator_writes_a_choice(host: Fa
     assert "data-on-new-build" in proc.stderr and "reset" in proc.stderr and "keep" in proc.stderr
     assert not host.calls("systemctl restart")
     assert (host.tmp / "sealed" / "data.raw").read_bytes() == OWNER
+
+
+def test_a_host_without_cryptsetup_stops_before_any_choice_and_names_the_cause(host: FakeHost) -> None:
+    # Bugbot, 8 Nov: with no host cryptsetup the owner id read as empty, so a same-build reinstall was told
+    # the new build cannot open the volume and offered reset, which sets a readable customer volume aside.
+    if shutil.which("cryptsetup", path="/usr/bin:/bin:/usr/sbin:/sbin"):
+        pytest.skip("a system cryptsetup is on the fixed test PATH")
+    for choice in (None, "reset"):
+        proc, _ = _roll(host, token_launch_id="feed" * 16, choice=choice, host_cryptsetup=False)
+        assert proc.returncode == 1
+        assert "cryptsetup is not installed on this host" in proc.stderr and "cryptsetup-bin" in proc.stderr
+        assert "cannot open the data volume its current owner made" not in proc.stderr
+        assert not host.calls("systemctl restart")
+        sealed = host.tmp / "sealed"
+        assert (sealed / "data.raw").read_bytes() == OWNER and not (sealed / "data.raw.prev").exists()
 
 
 def test_the_same_launch_identity_restarts_with_no_choice(host: FakeHost) -> None:
@@ -959,3 +976,9 @@ def test_the_miner_internal_key_is_synced_before_and_after_the_rename() -> None:
     assert block.index('sync "$DATA/hotel/internal-api-key.tmp"') < block.index('mv "$DATA/hotel/internal-api-key.tmp"')
     assert 'sync "$DATA/hotel"' in block
     assert block.index('mv "$DATA/hotel/internal-api-key.tmp"') < block.index('sync "$DATA/hotel"')
+
+
+def test_the_installer_adds_cryptsetup_to_the_host_packages_when_a_data_volume_is_on() -> None:
+    text = (SEALED / "install-sealed.sh").read_text()
+    assert '[ "${SEALED_DATA_GIB:-0}" = 0 ] || command -v cryptsetup' in text and "need+=(cryptsetup-bin)" in text
+    assert text.index("need+=(cryptsetup-bin)") < text.index('apt-get install -y -q')

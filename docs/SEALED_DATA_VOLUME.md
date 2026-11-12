@@ -170,7 +170,13 @@ A roll changes the measurement, so the new build cannot open the old volume.
 `install.sh --sealed` reads the launch identity (measurement, policy and
 HOST_DATA) from `data.raw`'s own LUKS token and compares it with the launch
 identity the new build would run with. It gets the new build's HOST_DATA from
-`launch-guest.sh` itself, so the two never disagree. When the identities match,
+`launch-guest.sh` itself, so the two never disagree. The read runs `cryptsetup
+token export` on the host, so the host needs `cryptsetup` (the installer adds
+`cryptsetup-bin` to its apt packages when a data volume is configured). If the
+binary is still missing, the installer stops before any choice, changes nothing
+and says to install it: an unreadable token is never treated as another build's
+volume, so `reset` is never offered for a volume that could not be read. When
+the identities match,
 the new build opens the volume and the roll proceeds. When they differ, it
 stops unless the operator has written a one-line choice to
 `$SEALED_DIR/data-on-new-build` (consumed by the run that uses it, so it never
