@@ -8,6 +8,7 @@ Defects from the 2026-10-20 pool qualification run:
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -339,7 +340,10 @@ def test_dind_defaults_are_unchanged(fake: FakeDocker, monkeypatch) -> None:
         _create(provider, image="docker:28-dind")
         run = _dind_run(fake)
         assert "--runtime" not in run
-        assert run[run.index("docker:28-dind") + 1 :] == [
+        # docker run is pinned to the inspected Id, not the mutable tag (AB#709).
+        pinned = "sha256:" + hashlib.sha256(b"docker:28-dind").hexdigest()
+        assert "docker:28-dind" not in run
+        assert run[run.index(pinned) + 1 :] == [
             "dockerd-entrypoint.sh",
             "dockerd",
             "--host=unix:///var/run/docker.sock",
