@@ -134,5 +134,5 @@ def load_start_commands(path: Path | None = None) -> StartCommandAllowlist:
 
 def start_command_sha256(argv: Iterable[str]) -> str:
     """sha256 hex of the canonical JSON encoding of the argv list (matches receipts)."""
-    raw = json.dumps(list(argv), separators=(",", ":"), ensure_ascii=False).encode()
+    raw = json.dumps(list(argv), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return hashlib.sha256(raw).hexdigest()

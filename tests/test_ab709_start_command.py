@@ -59,7 +59,7 @@ def _create(provider: DockerGuestProvider, image: str, **kwargs):
     return provider.create(request, api_key="k", idempotency=None, body_digest="d")
 
 
-def test_default_create_still_runs_sleep_infinity(fake: FakeDocker, allowlist: Path) -> None:
+def test_default_create_still_runs_sleep_infinity(fake: FakeDocker, allowlist: Path) -> None:  # noqa: ARG001
     fake.add_image("alpine:3.20")
     provider = DockerGuestProvider()
     try:
@@ -141,11 +141,10 @@ def test_start_conflict_is_refused() -> None:
     assert err.value.code == "start_conflict"
 
 
-def test_malformed_allowlist_refuses_provider_startup(tmp_path, monkeypatch) -> None:
+def test_malformed_allowlist_refuses_provider_startup(tmp_path, monkeypatch, fake: FakeDocker) -> None:  # noqa: ARG001
     bad = tmp_path / "bad.json"
     bad.write_text("{", encoding="utf-8")
     monkeypatch.setenv("CATHEDRAL_START_COMMANDS_PATH", str(bad))
-    install(tmp_path, monkeypatch)
     with pytest.raises(SandboxOpError) as err:
         DockerGuestProvider()
     assert err.value.code == "runtime_unavailable"
