@@ -2014,15 +2014,26 @@ func (b *broker) snapshot(g *guestState) map[string]any {
 	for _, h := range b.hotelList() {
 		grid := make([]byte, len(h.grid))
 		mine := map[byte]int{}
+		seen := map[*room]bool{}
 		for i, rm := range h.grid {
 			switch {
 			case rm == nil:
 				grid[i] = stFree
 			case rm.guest == g.cfg.ID:
 				grid[i] = rm.state
+				seen[rm] = true
 				mine[rm.state]++
 			default:
 				grid[i] = stOther
+			}
+		}
+		// A room can be in h.rooms with no square (slot -1 after a grid
+		// shrink or a failed place). It still counts as the guest's, once
+		// (AB#577).
+		for _, rm := range h.rooms {
+			if rm.guest == g.cfg.ID && !seen[rm] {
+				seen[rm] = true
+				mine[rm.state]++
 			}
 		}
 		owned := mine[stRunning] + mine[stCreating] + mine[stDeleting] + mine[stFailed]
