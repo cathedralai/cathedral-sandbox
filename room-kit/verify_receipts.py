@@ -22,10 +22,11 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      equal the report; the report's ECDSA P-384 signature verifies with the VCEK.
      Optional --ark-sha256 pins the ARK certificate; repeat it to accept
      any of several roots (one per product: Milan, Genoa, ...).
-  4. receipts: each statement names this binding, receipt_sha256 =
-     sha256(canonical(statement)), the Ed25519 signature verifies with the
-     binding's receipt key, and the chain links (sequence 1 links to the
-     binding; each next receipt links to the one before).
+  4. receipts: each statement names this binding and the sealed hotel receipt
+     schema, receipt_sha256 = sha256(canonical(statement)), the Ed25519
+     signature verifies with the binding's receipt key, and the chain links
+     (sequence 1 links to the binding; each next receipt links to the one
+     before).
   5. network policy: each create and network_set receipt that carries
      network_policy has network_policy_sha256 = sha256(canonical(policy)).
      The output has the policy timeline of each room, in chain order.
@@ -86,6 +87,7 @@ KDS = "https://kdsintf.amd.com/vcek/v1"
 SIGNED_LEN = 0x2A0
 HOTEL_BINDING_SCHEMA = "cathedral_hotel_binding_v1"
 HOTEL_RECEIPT_SCHEMA = "cathedral_hotel_receipt_v1"
+SEALED_RECEIPT_SCHEMA = "cathedral_sealed_hotel_receipt_v1"
 INSTALL_ALGORITHM = "x25519-hkdf-sha256-aes256gcm-v1"
 INSTALL_PURPOSE = "hotel-key-install"
 HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -406,12 +408,13 @@ def verify_receipts(att: dict, receipts: list[dict], head: str | None = None) ->
     binding = att["binding"]
     bsha = att["binding_sha256"]
     hotel = is_hotel_level(att)
+    want_schema = HOTEL_RECEIPT_SCHEMA if hotel else SEALED_RECEIPT_SCHEMA
     key = Ed25519PublicKey.from_public_bytes(base64.b64decode(binding["receipt_key_ed25519_b64"]))
     by_seq = {}
     for rc in receipts:
         st = rc["statement"]
-        if hotel:
-            need(st.get("schema") == HOTEL_RECEIPT_SCHEMA, f"receipt {st.get('sequence')}: not a hotel receipt")
+        need(st.get("schema") == want_schema,
+             f"receipt {st.get('sequence')}: not a {want_schema} statement")
         need(st["binding_sha256"] == bsha, f"receipt {st.get('sequence')} names another binding")
         need(rc["receipt_sha256"] == sha(canonical(st)), f"receipt {st['sequence']}: receipt_sha256 mismatch")
         try:

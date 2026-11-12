@@ -357,6 +357,37 @@ def test_sealed_flags_refuse_a_level1_answer(tmp_path, monkeypatch) -> None:
         assert "level 1" in json.loads(proc.stdout)["reason"], proc.stdout
 
 
+def _sealed_ledger(tmp_path: Path, monkeypatch) -> rr.Ledger:
+    monkeypatch.setattr(rr, "tsm_provider", lambda: "sev_guest")
+    monkeypatch.setattr(rr, "snp_report", lambda _data: _fake_report())
+    ledger = rr.Ledger("room-a", str(tmp_path))
+    ledger.sign({
+        "action": "create", "target": "POST /v1/sandboxes", "sandbox_id": "sbx_1", "status": 201,
+        "customer_request_sha256": "aa" * 32, "command_sha256": None, "image": "alpine:3.20",
+        "image_digest": None, "result_sha256": "bb" * 32,
+    })
+    ledger.sign({
+        "action": "exec", "target": "POST /v1/sandboxes/sbx_1/exec", "sandbox_id": "sbx_1", "status": 200,
+        "customer_request_sha256": "cc" * 32, "command_sha256": "dd" * 32, "image": None,
+        "image_digest": None, "result_sha256": "ee" * 32,
+    })
+    return ledger
+
+
+def test_sealed_chain_rejects_a_level1_statement_schema(tmp_path, monkeypatch) -> None:
+    """A signed receipt that swaps in the level 1 statement schema must fail, as ctcli verify_bundle does."""
+    ledger = _sealed_ledger(tmp_path, monkeypatch)
+    att = ledger.attestation()
+    assert vr.verify_receipts(att, ledger.chain)["receipts"] == 2
+    chain = json.loads(json.dumps(ledger.chain))
+    st = chain[1]["statement"]
+    st["schema"] = vr.HOTEL_RECEIPT_SCHEMA
+    body = rr.canonical(st)
+    chain[1] = {"statement": st, "signature_b64": rr.b64(ledger.key.sign(body)), "receipt_sha256": rr.sha(body)}
+    with pytest.raises(vr.Fail, match="not a cathedral_sealed_hotel_receipt_v1 statement"):
+        vr.verify_receipts(att, chain)
+
+
 def test_a_repeated_receipt_fails_and_is_not_counted_twice(tmp_path, monkeypatch) -> None:
     ledger = _chain(tmp_path / "good", monkeypatch)
     chain = json.loads(json.dumps(ledger.chain))
