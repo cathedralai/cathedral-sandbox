@@ -432,6 +432,10 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		}
 	}
 	b.scope(g, &pl, false, sealedField)
+	// The warm preference (prewarm.go) reads pl.image; the native path sets it
+	// in handleCreate. Only catalog images are ever marked warm, so any other
+	// ref leaves placement unchanged.
+	pl.image, _ = native["image"].(string)
 	if len(pl.images) > 0 && !b.anyHotel(pl) {
 		// Built, but not on a hotel this create may use (for example only on
 		// an unsealed hotel for a sealed create). Build it there and say so.

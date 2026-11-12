@@ -92,3 +92,46 @@ func TestPrewarmMarksCatalogImagesWarmAndDownClearsThem(t *testing.T) {
 		t.Fatal("warm set not cleared when the hotel went down")
 	}
 }
+
+func compatWarmCreates(t *testing.T, tc *testChain, n int) map[string]int {
+	t.Helper()
+	got := map[string]int{}
+	for i := 0; i < n; i++ {
+		setHotel(tc, "b", func(h *hotel) { h.createEWMA = 1 })
+		setHotel(tc, "c", func(h *hotel) { h.createEWMA = 1 })
+		before := map[string]int{"b": creates(tc, "b"), "c": creates(tc, "c")}
+		status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4"}), nil)
+		if status != 201 {
+			t.Fatalf("compat create: %d %v", status, doc)
+		}
+		for _, id := range []string{"b", "c"} {
+			got[id] += creates(tc, id) - before[id]
+		}
+	}
+	return got
+}
+
+func TestCompatCreatePrefersWarmHotel(t *testing.T) {
+	tc := newChain(t)
+	warmUp(tc, true, "b")
+	if got := compatWarmCreates(t, tc, 30); got["b"] != 30 {
+		t.Fatalf("want all 30 compat creates on warm hotel b, got %v", got)
+	}
+}
+
+func TestCompatCreateIgnoresWarmWhenTheFlagIsOff(t *testing.T) {
+	tc := newChain(t)
+	warmUp(tc, false, "b")
+	if got := compatWarmCreates(t, tc, 40); got["b"] == 0 || got["c"] == 0 {
+		t.Fatalf("flag off: want compat creates on both hotels, got %v", got)
+	}
+}
+
+func TestCompatCreateFallsBackToColdWhenWarmIsFull(t *testing.T) {
+	tc := newChain(t)
+	warmUp(tc, true, "b")
+	setHotel(tc, "b", func(h *hotel) { h.slots = 0 })
+	if got := compatWarmCreates(t, tc, 5); got["c"] != 5 {
+		t.Fatalf("want all 5 on cold hotel c, got %v", got)
+	}
+}
