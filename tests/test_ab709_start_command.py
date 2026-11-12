@@ -207,3 +207,62 @@ def test_start_commands_json_ships_with_cathedral() -> None:
     path = Path(__file__).resolve().parents[1] / "cathedral" / "start_commands.json"
     assert path.is_file()
     load_start_commands(path)
+
+
+def test_inspect_without_valid_id_is_refused_and_nothing_runs(fake: FakeDocker) -> None:
+    for bad in ("", "not-an-id"):
+        fake.add_image("plain:1")
+        provider = DockerGuestProvider()
+        real = provider._client.image_inspect
+        real_authorize = provider._authorize_image
+        state = {"after_authorize": False}
+
+        def no_id(ref, _real=real, _bad=bad, _st=state):
+            doc = dict(_real(ref))
+            if _st["after_authorize"]:
+                doc["Id"] = _bad
+            return doc
+
+        def authorize_then_lose_id(image, owner, _st=state, **kw):
+            out = real_authorize(image, owner, **kw)
+            _st["after_authorize"] = True
+            return out
+
+        provider._client.image_inspect = no_id  # type: ignore[method-assign]
+        provider._authorize_image = authorize_then_lose_id  # type: ignore[method-assign]
+        try:
+            with pytest.raises(SandboxOpError) as err:
+                _create(provider, "plain:1")
+            assert err.value.code == "image_id_unavailable"
+            assert err.value.http_status == 409
+            assert fake.calls_of("run") == []
+        finally:
+            provider.close()
+
+
+def test_tag_moving_to_another_owners_id_after_authorize_is_refused(fake: FakeDocker) -> None:
+    from cathedral.sandbox_owner import owner_id
+
+    fake.add_image("shared:1")
+    other_id = "sha256:" + "cd" * 32
+    provider = DockerGuestProvider()
+    real_authorize = provider._authorize_image
+
+    def authorize_then_retag(image, owner, **kw):
+        out = real_authorize(image, owner, **kw)
+        # Another owner's image now sits under the same tag.
+        provider._image_owners.grant(other_id, owner_id("k", "other"), provenance="registry", ref=image)
+        fake.set_image_id(image, other_id)
+        return out
+
+    provider._authorize_image = authorize_then_retag  # type: ignore[method-assign]
+    try:
+        request = CreateSandboxRequest(image=ImageSource(image="shared:1"), resources=RES)
+        with pytest.raises(SandboxOpError) as err:
+            provider.create(request, api_key="k", idempotency=None, body_digest="d",
+                            owner=owner_id("k", "mine"))
+        assert err.value.code == "image_not_owned"
+        assert err.value.http_status == 403
+        assert fake.calls_of("run") == []
+    finally:
+        provider.close()

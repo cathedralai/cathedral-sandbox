@@ -1934,7 +1934,18 @@ class DockerGuestProvider:
         # Pin docker run to the inspected Id. Allowlist / start:image decisions
         # were made against this inspect; running the mutable tag would race a
         # retag between inspect and create (AB#709 HOLD).
-        run_image = normalize_image_id(str(inspected.get("Id") or "")) or image
+        run_image = normalize_image_id(str(inspected.get("Id") or ""))
+        if run_image is None:
+            # Fail closed: falling back to the mutable tag would reopen the race.
+            raise SandboxOpError(
+                "image_id_unavailable",
+                409,
+                f"image {image} has no valid immutable Id on this host; nothing started",
+            )
+        if request.image is not None:
+            # The grant above was made against an earlier inspect; the tag may
+            # have moved to another owner's Id since. Re-check the Id that runs.
+            self._image_owners.require(run_image, effective_owner)
         room_tunables = self._tunables_for(request, image, dind)
         work = Path(self._inner._sandboxes[sandbox_id].root) / "work"  # noqa: SLF001
         name = f"cathedral-{sandbox_id}"
