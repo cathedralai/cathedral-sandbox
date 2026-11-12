@@ -36,6 +36,8 @@ def test_signed_routes_include_the_network_switch() -> None:
     assert action("POST", "/v1/sandboxes/sbx_1/network") == "network_set"
     assert action("POST", "/v1/sandboxes") == "create"
     assert action("GET", "/v1/sandboxes/sbx_1/network") is None
+    assert action("PUT", "/v1/sandboxes/sbx_1/files") == "file_put"
+    assert action("GET", "/v1/sandboxes/sbx_1/files") == "file_get"
 
 
 def test_policy_from_the_hotel_answer() -> None:

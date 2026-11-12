@@ -257,8 +257,8 @@ The broker admits the machine only if its HOST_DATA is in `sealed_host_data`
   HOST_DATA, kernel command line, kit and API commits.
 - It asks the AMD secure processor for a report with
   `REPORT_DATA = sha256(canonical(binding)) || 32 zero bytes`.
-- For each create, exec, background process start, delete and network
-  policy switch, it signs a statement. The statement has the same core fields as the staging lane:
+- For each create, exec, background process start, delete, network
+  policy switch, and file read/write (`GET`/`PUT` …/files), it signs a statement. The statement has the same core fields as the staging lane:
   `operation_id`, `action`, `target`, `customer_request_sha256`,
   `command_sha256`, `result_sha256`, `sequence`, `previous_receipt_sha256`,
   `issued_at`. It adds `hotel`, `sandbox_id`, `image`, `image_digest`,

@@ -1744,6 +1744,8 @@ SIGNED = [  # (method, path pattern, action)
     ("POST", re.compile("^" + ROOM + r"/network$"), "network_set"),
     ("PATCH", re.compile("^" + ROOM + r"/network$"), "network_set"),
     ("DELETE", re.compile(r"^/v1/sandboxes$"), "bulk_delete"),
+    ("PUT", re.compile("^" + ROOM + r"/files$"), "file_put"),
+    ("GET", re.compile("^" + ROOM + r"/files$"), "file_get"),
 ]
 # Dedicated machine: the requests that start code need the owner signature.
 # A build runs Dockerfile steps in the guest, and the broker sends builds to
