@@ -37,7 +37,12 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # Pinned 2026-11-11 (second pin of the day) to 0b396fa: main after #430, the image owner store fix found
 # by the nc-sealed-3 canary (table in a directory the API user owns, no grant kept after a failed write,
 # writability check at start; AB#650). Same make-dist.sh; the 3d107e9 tarball rebuilds to its pinned sha.
-CATHEDRAL_COMMIT=0b396fa
-CATHEDRAL_TARBALL=dist/cathedral-0b396fa.tar.gz
-CATHEDRAL_TARBALL_SHA256=6b2bf2cd3dffcfa3781cad1d76facbcc5e50cac74e0793a6e0832b223456c252
+# Pinned 2026-11-12 to 0245e8d: main after #432 (expose answers 501 on a guest hotel, AB#488),
+# #437 (guest API over HTTP/1.1 keepalive, chunked bodies refused, AB#534), #439 (a timed command
+# is refused when the image has no timeout program, AB#458) and #413 (workspace source for the
+# sealed data volume, AB#598; off unless SEALED_DATA_GIB > 0). Same make-dist.sh; the 0b396fa
+# tarball rebuilds to its pinned sha 6b2bf2cd... with the same tool.
+CATHEDRAL_COMMIT=0245e8d
+CATHEDRAL_TARBALL=dist/cathedral-0245e8d.tar.gz
+CATHEDRAL_TARBALL_SHA256=22fd4d0edfb6745c3de59c526e2c16c09e979e59c43602ae88e3c299b9b012e1
 PROBE_IMAGE=alpine:3.20
