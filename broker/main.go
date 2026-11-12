@@ -277,6 +277,7 @@ type broker struct {
 	byKey            map[string]*guestState    // sha256(key) -> guest
 	byUUID           map[string]*room
 	compat           *compatState
+	nexec            *nativeExecs // background execs on the native route (nativeexec.go)
 	prefetch         prefetchJobs
 	started          time.Time
 	// requireAttestationNoted logs the require_attestation deprecation once
@@ -383,7 +384,7 @@ func loadBroker(path string) (*broker, error) {
 	default:
 		return nil, fmt.Errorf(`config: sealed_admission %q: the top-level value can only be "on" (or absent)`, c.SealedAdmission)
 	}
-	b := &broker{cfg: c, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), started: time.Now()}
+	b := &broker{cfg: c, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), nexec: newNativeExecs(), started: time.Now()}
 	var optedIn []string // require_attestation hotels, for one deprecation line
 	for _, hc := range c.Hotels {
 		if err := validateSealedAdmission(hc); err != nil {
@@ -1286,6 +1287,9 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	}
 	if r.Method == "POST" && tail == "snapshot" {
 		b.roomSnapshot(w, r, g, h, hid, body)
+		return
+	}
+	if b.routeNativeExec(w, r, g, rm, bid, tail, body) {
 		return
 	}
 	// Hotel ids (nc-sealed.sbx_…) proxy the body as-is. Reject a string cmd
@@ -2265,6 +2269,7 @@ func main() {
 	if err := b.loadCompat(); err != nil {
 		log.Printf("client state not loaded: %v", err)
 	}
+	b.loadNativeExecs()
 	if err := b.loadRuntimeHotels(); err != nil {
 		log.Printf("runtime hotels not loaded: %v", err)
 	}
@@ -2302,6 +2307,7 @@ func main() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
+		b.drainNativeExecs(nativeExecDrain) // background execs get time to finish and be saved
 		stopLoops()
 		<-saved // saveLoop writes dirty state on its way out
 		os.Exit(0)
