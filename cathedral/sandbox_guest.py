@@ -2044,6 +2044,18 @@ class DockerGuestProvider:
         elif form == "busybox":
             wrapped = ["timeout", "-s", "KILL", "-t", str(timeout_seconds), *argv]
         else:
+            # Without a timeout program only the docker exec client dies at the
+            # limit and the command keeps running in the room. A caller that asked
+            # for a limit gets a refusal before anything starts, not a limit that
+            # is not kept. A call with no limit keeps the old default.
+            if request.timeout_seconds is not None:
+                raise SandboxOpError(
+                    "exec_timeout_unsupported",
+                    422,
+                    "this image has no timeout program, so a command limit cannot be kept; "
+                    "the command was not started. Add timeout (coreutils or busybox) to the image "
+                    "or run the command without a limit.",
+                )
             wrapped = argv
         t0 = time.perf_counter()
         spill = open_spill(sandbox_id, request.spill_token, EXEC_OUTPUT_CAP) if request.spill_token else None
