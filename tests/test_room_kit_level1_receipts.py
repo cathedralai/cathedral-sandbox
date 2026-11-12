@@ -355,3 +355,18 @@ def test_sealed_flags_refuse_a_level1_answer(tmp_path, monkeypatch) -> None:
                               capture_output=True, text=True, check=False)
         assert proc.returncode == 1, flags
         assert "level 1" in json.loads(proc.stdout)["reason"], proc.stdout
+
+
+def test_a_repeated_receipt_fails_and_is_not_counted_twice(tmp_path, monkeypatch) -> None:
+    ledger = _chain(tmp_path / "good", monkeypatch)
+    chain = json.loads(json.dumps(ledger.chain))
+    clean = _verify_cli(tmp_path / "clean", ledger.attestation(), {"receipts": chain})
+    assert clean.returncode == 0
+    assert json.loads(clean.stdout)["chain"]["receipts"] == 2
+    # Same sequence twice, with or without a head to check against.
+    for name, extra in (("nohead", {}), ("head", {"head": ledger.head})):
+        proc = _verify_cli(tmp_path / name, ledger.attestation(), {"receipts": chain + [chain[1]], **extra})
+        assert proc.returncode == 1
+        out = json.loads(proc.stdout)
+        assert out["verdict"] == "FAIL"
+        assert out["reason"] == "receipt 2: sequence appears more than once"
