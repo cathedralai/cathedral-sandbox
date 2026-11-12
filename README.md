@@ -37,7 +37,7 @@ confidential-computing evidence, test their work and score the results.
 | [cathedral-escape-room](https://github.com/cathedralai/cathedral-escape-room) | The contest: break out of a sealed sandbox, prove it, earn | You want to attack the sandbox for a reward |
 | [cathedral-validator](https://github.com/cathedralai/cathedral-validator) | The SN94 validator: how weights are set, with signed updates | You want to validate, or check how miners and breaks are paid |
 
-This repository is for miners running compute workers. It builds the wall, the escape room pays people to break it, and the validator pays both:
+This repository is for miners running compute workers on Bittensor SN94. It builds the wall, the escape room pays people to break it, and the validator pays both:
 about 10% of its weight to approved compute miners, about 10% to proven escapes, and the rest is burned.
 
 ## How mining works
