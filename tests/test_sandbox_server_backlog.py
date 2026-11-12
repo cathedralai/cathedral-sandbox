@@ -1,6 +1,6 @@
 """The API listener must hold a burst of new connections.
 
-Every call to the API is a new TCP connection (HTTP/1.0). With the stdlib
+Callers that do not reuse a connection open a new TCP connection per call. With the stdlib
 listen backlog of 5, a burst overflowed the queue: Linux dropped the extra
 connection attempts and each caller retried 1 s later (measured on the sealed
 pool, 11 Nov 2026: 100 commands at once, 15 to 24 of them held for 1 s or more).
@@ -54,7 +54,7 @@ def test_the_listen_queue_holds_a_burst_while_nothing_accepts() -> None:
         started = True
         for conn in conns:
             conn.settimeout(30)
-            assert conn.recv(64).startswith(b"HTTP/1.0 200"), "a queued connection was not answered"
+            assert conn.recv(64).startswith(b"HTTP/1.1 200"), "a queued connection was not answered"
     finally:
         for conn in conns:
             conn.close()

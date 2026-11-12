@@ -996,6 +996,13 @@ _ERROR_SCHEMA: dict[str, Any] = {
 # ------------------------------------------------------------------ stdlib listener
 class _Handler(BaseHTTPRequestHandler):
     app: SandboxApplication
+    # Keepalive: a caller reuses one connection instead of paying a new TCP
+    # connect per call. Safe only because _send and _ws_fail always set
+    # Content-Length.
+    protocol_version = "HTTP/1.1"
+    # An idle kept-alive connection holds a thread; free it after a minute.
+    # The websocket handlers set their own longer timeout.
+    timeout = 60
 
     def _run(self, method: str) -> None:
         try:
@@ -1003,10 +1010,18 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError:
             length = -1
         if length < 0 or length > MAX_BODY_BYTES:
-            # Refuse before reading: the body stays on the wire and the
-            # connection closes (HTTP/1.0, no keep-alive).
+            # Refuse before reading: the body stays on the wire, so the
+            # connection must close or those bytes would be parsed as the next
+            # request.
             self.close_connection = True
             resp = Response.error(413, "request_too_large", f"the request body is over {MAX_BODY_BYTES} bytes")
+            resp.headers["Connection"] = "close"
+        elif self.headers.get("Transfer-Encoding"):
+            # Only Content-Length bodies are read. A chunked body would be left
+            # on the wire and parsed as the next request.
+            self.close_connection = True
+            resp = Response.error(400, "chunked_not_supported", "send a Content-Length body, not Transfer-Encoding")
+            resp.headers["Connection"] = "close"
         else:
             body = self.rfile.read(length) if length else b""
             resp = self.app.dispatch(method, self.path, dict(self.headers), body)
@@ -1023,6 +1038,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if (self.headers.get("Upgrade") or "").lower() == "websocket":
+            # The socket is not HTTP after this, whatever the handler did.
+            self.close_connection = True
             self._handle_websocket()
             return
         self._run("GET")
@@ -1244,9 +1261,9 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class _Server(ThreadingHTTPServer):
-    # Every call is a new connection (HTTP/1.0, no keep-alive). The stdlib listen
-    # backlog is 5 on Python 3.11 to 3.14, so a burst of calls overflows it: the
-    # kernel drops the connection attempt and the caller retries 1 s later.
+    # The stdlib listen backlog is 5 on Python 3.11 to 3.14, so a burst of new
+    # connections overflows it: the kernel drops the connection attempt and the
+    # caller retries 1 s later.
     # room_receipts.py's front sets the same value for the same reason.
     request_queue_size = 1024
 
