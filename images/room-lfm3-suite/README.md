@@ -153,6 +153,22 @@ apostrophe, `?` or `*`: `liquid "what's in /work?"`. The greeting's
 attachment example follows `MODEL`: `--image` in VL and Omni rooms, `--audio`
 in Audio rooms.
 
+### Chat events: `--events` (AB#541, AB#542)
+
+`liquid --events --turn <uuid> "message"` writes the turn as chat events for
+the console instead of text, and streams the model (`stream: true` to
+llama-server) so words arrive as they are written. One ASCII JSON object per
+line on stdout: `start`, `thinking`, `delta`, `tool_call`, `tool_result`, then
+exactly one `answer` or `error`. Each line carries `version`, `turn_id` and a
+`seq` from 1. Tool events show a redacted one-line summary, status, exit code,
+duration and output size, never raw arguments, output, env or keys. Nothing
+else goes to stdout, and stderr gets at most one line after an `error`. The
+`--json`, `--speak`, `--history` and `--reset` options are refused with
+`bad_request` in this mode, and without the flag nothing changes. The contract
+is `AB#542` (liquid chat stream contract v1); its room-side conformance
+fixtures are in `test/chat-events/` (`<name>.json` scripts a fake model,
+`<name>.stdout` is the expected stdout, with `duration_ms` set to 0).
+
 `liquid` and `lfm3-agent` refuse with exit 2 and a one-line pointer in two
 kinds of room:
 

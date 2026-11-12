@@ -1,0 +1,36 @@
+{
+  "args": [
+    "go"
+  ],
+  "env": {
+    "LFM3_TEST_PRIVATE": "hunter2hunter2"
+  },
+  "planted": [
+    "xyzbearertoken",
+    "pw-in-flag",
+    "AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJ",
+    "abc123secretvalue",
+    "hunter2hunter2",
+    "sk-live-9999",
+    "ghp_abcdefghij"
+  ],
+  "replies": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "run",
+          "arguments": {
+            "command": "curl -H 'Authorization: Bearer xyzbearertoken' --api-key pw-in-flag https://x/?k=AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJ; API_KEY=abc123secretvalue run.sh; echo hunter2hunter2 sk-live-9999 ghp_abcdefghij"
+          }
+        }
+      ]
+    },
+    {
+      "pieces": [
+        "Finished."
+      ]
+    }
+  ],
+  "exit": 0
+}

@@ -1,0 +1,27 @@
+{
+  "args": [
+    "go"
+  ],
+  "env": {
+    "LFM3_AGENT_STEPS": "1"
+  },
+  "replies": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "run",
+          "arguments": {
+            "command": "true"
+          }
+        }
+      ]
+    },
+    {
+      "pieces": [
+        "Enough looking."
+      ]
+    }
+  ],
+  "exit": 0
+}

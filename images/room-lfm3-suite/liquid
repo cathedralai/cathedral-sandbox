@@ -10,6 +10,7 @@
 #   liquid --new write a haiku      lfm3-agent's options work the same way
 #   liquid --json list 5 fruits     JSON only, held to JSON syntax by the server; no tools
 #   liquid --speak reply.wav hello  the answer in text, then spoken into reply.wav (Audio, Omni)
+#   liquid --events --turn ID hi    chat events, one JSON line each, for the console (lfm3-agent --events)
 #
 # d1 (decision) and base models refuse it with exit 2: d1 answers typed
 # questions (lfm3-decide) and a base model only continues text (lfm3-ask --raw).
@@ -17,6 +18,15 @@
 # Quote the message when it has characters the shell reads itself, such as an
 # apostrophe, "?" or "*": liquid "what's in /work?"
 set -euo pipefail
+
+# --events (AB#541): the chat stream for the console. lfm3-agent owns it, refusals
+# included: a model that does not chat gets one error line there, not text here.
+if [ "${1:-}" = --events ]; then
+  here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  agent=$here/lfm3-agent
+  [ -x "$agent" ] || agent=lfm3-agent
+  LFM3_AGENT_NAME=liquid exec "$agent" "$@"
+fi
 
 if [ "${LFM3_KIND:-chat}" = decision ]; then
   echo "liquid: ${MODEL:-this model} is a decision model; ask it typed questions with lfm3-decide" >&2
