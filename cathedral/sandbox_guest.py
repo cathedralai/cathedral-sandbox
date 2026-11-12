@@ -51,6 +51,13 @@ from cathedral.sandbox_api import (
 )
 from cathedral.sandbox_egress import EgressClient
 from cathedral.sandbox_image_owners import ImageOwnerStore, normalize_image_id, refuse_shared_hotel_build
+from cathedral.start_commands import (
+    StartCommandsError,
+    image_config_argv,
+    image_digest_for_allowlist,
+    load_start_commands,
+    start_command_sha256,
+)
 from cathedral.sandbox_workspaces import WorkspaceStore
 from cathedral.sandbox_owner import owner_hash, owner_id
 from cathedral.sandbox_provider import (
@@ -351,6 +358,8 @@ class GuestRecord:
     owner: str | None = None
     # Per-room tunables the room started under (room_tunables.room_view), or None.
     tunables: dict[str, Any] | None = None
+    # AB#709: argv the hotel started when start:image was used; None for sleep infinity.
+    start_command: tuple[str, ...] | None = None
 
 
 # A room's exec output, process log and the API's own log record are capped
@@ -726,6 +735,7 @@ class DockerClient:
         run_args: Iterable[str] = (),
         default_runtime: str = "",
         secrets_dir: Path | None = None,
+        image_default: bool = False,
     ) -> str:
         """Start one room. ``default_runtime`` is the daemon's default OCI runtime,
         the room's runtime when no ``--runtime`` is passed."""
@@ -804,6 +814,8 @@ class DockerClient:
             argv.extend(["-e", f"{key}={value}"])
         if dind:
             argv.extend([image, "dockerd-entrypoint.sh", "dockerd", *self.dind.dockerd_args])
+        elif image_default:
+            argv.append(image)
         elif entrypoint:
             argv.append(image)
             argv.extend(list(entrypoint))
@@ -1329,6 +1341,15 @@ class DockerGuestProvider:
         # Images pulled with registry credentials. A create of one of these always
         # pulls, so the registry still checks the caller's credentials.
         self._auth_pulled: set[str] = _load_auth_pulled()
+        try:
+            self._start_commands = load_start_commands()
+        except StartCommandsError as exc:
+            raise SandboxOpError(
+                "runtime_unavailable",
+                503,
+                f"the hotel's start-command allowlist is unusable: {exc}",
+                retry_after=30,
+            ) from exc
         if not self._client.info_ok():
             raise SandboxOpError(
                 "runtime_unavailable",
@@ -1697,6 +1718,12 @@ class DockerGuestProvider:
         if guest.workspace is not None:
             enriched["workspace"] = {"name": guest.workspace[1], "path": guest.workspace[2],
                                      "version_on_delete": guest.workspace[3]}
+        if guest.start_command is not None:
+            enriched["start_command"] = list(guest.start_command)
+            enriched["start_command_sha256"] = start_command_sha256(guest.start_command)
+        else:
+            enriched["start_command"] = None
+            enriched["start_command_sha256"] = None
         net = dict(enriched.get("network") or {"mode": guest.network_mode, "allow": []})
         net.update(self._policy_doc(guest))
         enriched["network"] = net
@@ -1730,6 +1757,40 @@ class DockerGuestProvider:
         if mode == "none":
             return False
         return mode == "internet" or self._egress is not None
+
+    def _resolve_start(
+        self,
+        request: CreateSandboxRequest,
+        *,
+        dind: bool,
+        inspected: Mapping[str, Any],
+    ) -> tuple[tuple[str, ...] | None, bool, tuple[str, ...] | None]:
+        """Return (docker entrypoint argv, image_default, receipt start_command)."""
+        if dind:
+            if request.start_image:
+                raise SandboxOpError(
+                    "start_unsupported_image",
+                    400,
+                    'start: "image" is not allowed for DinD images',
+                )
+            return None, False, None
+        if request.start_image:
+            argv = image_config_argv(dict(inspected))
+            if argv is None:
+                raise SandboxOpError(
+                    "start_command_unavailable",
+                    400,
+                    "this image has no ENTRYPOINT or CMD in its config",
+                )
+            digest = image_digest_for_allowlist(dict(inspected))
+            if digest is None or not self._start_commands.allows(digest, argv):
+                raise SandboxOpError(
+                    "start_command_not_allowed",
+                    400,
+                    "this image's start command is not on the hotel allowlist",
+                )
+            return None, True, argv
+        return tuple(request.entrypoint), False, None
 
     def _ensure_image(
         self, image: str, *, registry_auth: Mapping[str, str] | None = None, refresh: bool = False
@@ -1869,10 +1930,13 @@ class DockerGuestProvider:
                 "digest": request.build.content_hash,
             }
         dind = is_dind_image(image)
+        inspected = self._client.image_inspect(image)
         room_tunables = self._tunables_for(request, image, dind)
         work = Path(self._inner._sandboxes[sandbox_id].root) / "work"  # noqa: SLF001
         name = f"cathedral-{sandbox_id}"
-        entrypoint = None if dind else (tuple(request.entrypoint) if request.entrypoint else ("sleep", "infinity"))
+        entrypoint, image_default, start_command = self._resolve_start(
+            request, dind=dind, inspected=inspected,
+        )
         network = None
         attach = self._attach_for(request.network.mode)
         if self._net_pool is not None and attach:
@@ -1883,7 +1947,7 @@ class DockerGuestProvider:
         try:
             container_id = self._start_container(
                 request, sandbox_id=sandbox_id, image=image, name=name, work=work, dind=dind,
-                entrypoint=entrypoint, network=network, attach=attach,
+                entrypoint=entrypoint, image_default=image_default, network=network, attach=attach,
                 mounts=[(workspace[4], workspace[2])] if workspace is not None else (),
                 tunables=room_tunables,
                 secrets_dir=self._secrets_dir(sandbox_id),
@@ -1906,9 +1970,11 @@ class DockerGuestProvider:
                 if exited is not None:
                     # The daemon found no running container: the entrypoint
                     # ended at once. That is the request's fault, not ours.
+                    which = f"start command {list(start_command)!r}" if start_command else "entrypoint"
                     raise SandboxOpError(
                         "entrypoint_exited", 400,
-                        f"the room's entrypoint ended at once with exit code {exited}; a room needs a long-running entrypoint",
+                        f"the room's {which} ended at once with exit code {exited}; "
+                        "a room needs a long-running start process",
                     ) from exc
                 raise
         if not self._inner.has_record(sandbox_id):
@@ -1933,6 +1999,7 @@ class DockerGuestProvider:
             workspace=workspace[:4] if workspace is not None else None,
             owner=owner,
             tunables=room_tunables[2] if room_tunables is not None else None,
+            start_command=start_command,
         )
         return self._after_start(doc, sandbox_id, container_id, dind)
 
@@ -1972,7 +2039,8 @@ class DockerGuestProvider:
         work: Path,
         dind: bool,
         entrypoint: tuple[str, ...] | None,
-        network: str | None,
+        image_default: bool = False,
+        network: str | None = None,
         attach: bool | None = None,
         mounts: Iterable[tuple[Path, str]] = (),
         tunables: tuple[str, list[str], dict[str, Any]] | None = None,
@@ -1996,6 +2064,7 @@ class DockerGuestProvider:
             dind=dind,
             use_kata=self._use_kata,
             entrypoint=entrypoint,
+            image_default=image_default,
             workdir=request.workdir,
             user=request.user,
             labels={LABEL_OWNER: self._owner, LABEL_SANDBOX_ID: sandbox_id},

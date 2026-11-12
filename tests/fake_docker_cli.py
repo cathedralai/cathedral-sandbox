@@ -108,7 +108,12 @@ def main(argv):
             digests = b.get("image_digests", {}).get(ref)
             if digests is None:
                 digests = [ref + "@sha256:" + "cd" * 32]
-            print(json.dumps({"Id": image_id, "Size": size, "RepoDigests": digests}))
+            cfg = (b.get("image_configs") or {}).get(ref, {})
+            config = {
+                "Entrypoint": cfg.get("Entrypoint"),
+                "Cmd": cfg.get("Cmd"),
+            }
+            print(json.dumps({"Id": image_id, "Size": size, "RepoDigests": digests, "Config": config}))
         return 0
 
     if cmd == "image" and argv[1] == "rm":
@@ -469,6 +474,24 @@ class FakeDocker:
     def set_image_id(self, ref: str, image_id: str) -> None:
         state = self._load()
         state.setdefault("behaviour", {}).setdefault("image_ids", {})[ref] = image_id
+        self._save(state)
+
+    def set_image_config(
+        self,
+        ref: str,
+        *,
+        entrypoint: list[str] | None = None,
+        cmd: list[str] | None = None,
+        repo_digest: str | None = None,
+    ) -> None:
+        state = self._load()
+        behaviour = state.setdefault("behaviour", {})
+        behaviour.setdefault("image_configs", {})[ref] = {
+            "Entrypoint": entrypoint,
+            "Cmd": cmd,
+        }
+        if repo_digest is not None:
+            behaviour.setdefault("image_digests", {})[ref] = [repo_digest]
         self._save(state)
 
     def add_container(self, cid: str, *, name: str, labels: dict[str, str]) -> None:

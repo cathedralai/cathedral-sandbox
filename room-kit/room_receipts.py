@@ -2252,6 +2252,13 @@ class Handler(BaseHTTPRequestHandler):
         policy = self.network_policy(action, status, res)
         tunables = self.room_tunables(action, status, res)
         link = self.sandbox_link(action, req)
+        start_command = None
+        start_command_sha256 = None
+        if action == "create" and isinstance(res, dict) and 200 <= status < 300:
+            raw_start = res.get("start_command")
+            if isinstance(raw_start, list) and all(isinstance(part, str) for part in raw_start):
+                start_command = raw_start
+                start_command_sha256 = sha(canonical(start_command))
         return {
             "action": action,
             "target": f"{self.command} {self.path}",
@@ -2275,6 +2282,8 @@ class Handler(BaseHTTPRequestHandler):
             # Create: the Cathedral sandbox id the request's labels name (AB#389). Read from
             # the request as this guest received it, so customer_request_sha256 covers it too.
             **({"cathedral_sandbox_id": link} if link else {}),
+            **({"start_command": start_command, "start_command_sha256": start_command_sha256}
+               if action == "create" else {}),
         }
 
     @staticmethod
