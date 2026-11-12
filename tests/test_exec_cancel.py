@@ -342,7 +342,7 @@ def test_a_refused_pid_file_is_never_stopped_and_the_exec_is_not_called_cancelle
         sid = _room(provider)
         t, out = _start(provider, sid, ExecRequest(cmd=["sh", "-c", "hold-marker"], timeout_seconds=300, spill_token=TOKEN))
         _wait_running(TOKEN, sid)
-        assert provider.cancel_exec(sid, TOKEN) == "signalled"
+        assert provider.cancel_exec(sid, TOKEN) == "refused"
         assert t.is_alive()
         release.write_text("x")
         t.join(5)
@@ -508,3 +508,53 @@ def test_wrapper_and_kill_script_work_together_on_a_gnu_timeout_chain(tmp_path):
     assert pidfile.read_text().strip() == str(proc.pid)
     assert _kill(pidfile, "gnu", "TERM") == 0
     assert _dead(proc)
+
+
+@pytest.mark.parametrize("content", ["1", "abc", "pgid-mismatch"])
+def test_refused_pid_file_answers_refused_and_runs_no_kill(content, tmp_path, bystander):
+    """Forged 1, non-digit, and a pgid mismatch: the guard refuses, so the answer is `refused`, not `signalled`."""
+    pidfile = tmp_path / "p"
+    child = None
+    if content == "pgid-mismatch":
+        child = subprocess.Popen(["sleep", "60"])  # shares this test's group, so pgid != pid
+        content = str(child.pid)
+    try:
+        pidfile.write_text(content)
+        assert _kill(pidfile) == exec_cancel.REFUSED
+        assert bystander.poll() is None
+        if child is not None:
+            assert child.poll() is None
+    finally:
+        if child is not None:
+            child.kill()
+            child.wait()
+
+
+def test_refused_answer_fields_and_no_kill_call(fake, tmp_path):
+    release = tmp_path / "release"
+    fake.set(
+        timeout_form="gnu",
+        exec_rules=[
+            {"contains": "gnu TERM", "exit": exec_cancel.REFUSED},
+            {"contains": "gnu KILL", "exit": exec_cancel.REFUSED},
+            {"contains": "hold-marker", "wait_for": str(release), "exit": 0},
+        ],
+    )
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        t, out = _start(provider, sid, ExecRequest(cmd=["sh", "-c", "hold-marker"], timeout_seconds=300, spill_token=TOKEN))
+        _wait_running(TOKEN, sid)
+        app = SandboxApplication(provider)
+        resp = app.exec_cancel(id=sid, body=json.dumps({"spill_token": TOKEN}).encode())
+        doc = json.loads(resp.body)
+        assert doc["result"] == "refused"
+        assert doc["reason"] == "pid_file_invalid"
+        assert doc["cancelled"] is False
+        assert doc["retryable"] is True
+        # Only the first signal was tried: no KILL escalation after a refusal.
+        assert len(_guest_calls(fake, "gnu KILL")) == 0
+        release.write_text("x")
+        t.join(5)
+    finally:
+        provider.close()

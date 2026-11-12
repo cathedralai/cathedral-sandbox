@@ -2171,7 +2171,12 @@ class DockerGuestProvider:
             rc = self._signal_exec_group(guest, entry, token, sig)
             if rc != 0:
                 entry.signalled = False
-                return "unsupported" if rc == exec_cancel.NO_PID_FILE else "signalled"
+                if rc == exec_cancel.NO_PID_FILE:
+                    return "unsupported"
+                # A guard refusal on the first signal means nothing was sent: not progress.
+                if rc == exec_cancel.REFUSED and sig == "TERM":
+                    return "refused"
+                return "signalled"
             wait = exec_cancel.TERM_WAIT_SECONDS if sig == "TERM" else deadline - time.monotonic()
             # `stopped` only when the exec call itself returned.
             if entry.done.wait(max(0.0, min(wait, deadline - time.monotonic()))):

@@ -528,7 +528,11 @@ class SandboxApplication:
             raise api.SandboxContractError("invalid_exec", "spill_token must be 32 lowercase hex characters")
         cancel = getattr(self.provider, "cancel_exec", None)
         result = cancel(id, token) if callable(cancel) else "unsupported"
-        return Response.json(200, {"result": result, "token_sha256": hashlib.sha256(token.encode()).hexdigest()})
+        answer = {"result": result, "token_sha256": hashlib.sha256(token.encode()).hexdigest()}
+        if result == "refused":
+            # The pid file failed the guard and no signal was sent. A repeat may succeed.
+            answer.update(reason="pid_file_invalid", cancelled=False, retryable=True)
+        return Response.json(200, answer)
 
     def exec_sealed(self, *, id, body, **_):
         """An exec as /exec runs it, with its command and output kept out of the history and the log."""
