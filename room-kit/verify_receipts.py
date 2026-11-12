@@ -418,6 +418,8 @@ def verify_receipts(att: dict, receipts: list[dict], head: str | None = None) ->
             key.verify(base64.b64decode(rc["signature_b64"]), canonical(st))
         except InvalidSignature as exc:
             raise Fail(f"receipt {st['sequence']}: signature does not verify") from exc
+        # A repeated sequence would be counted twice in the totals below; a chain has one receipt per sequence.
+        need(st["sequence"] not in by_seq, f"receipt {st['sequence']}: sequence appears more than once")
         by_seq[st["sequence"]] = rc
     links = 0
     for seq, rc in by_seq.items():
