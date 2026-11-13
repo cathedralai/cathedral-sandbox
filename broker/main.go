@@ -83,6 +83,9 @@ type hotelConfig struct {
 	// TLSSPKISHA256 is derived from a miner hotel's verified SNP binding at
 	// join and persisted for safe reconnect after a broker restart.
 	TLSSPKISHA256 string `json:"tls_spki_sha256,omitempty"`
+	// AlertChatID: the miner operator's Telegram chat for the first missed
+	// heartbeat of this hotel (alerts.go). Empty: a log line only.
+	AlertChatID string `json:"alert_chat_id,omitempty"`
 }
 
 type guestConfig struct {
@@ -157,6 +160,9 @@ type config struct {
 	// Room terminal routes reach only these hotels. Empty: no hotel. A miner
 	// hotel never gets them, listed or not (terminalsRefused).
 	TerminalHotels []string `json:"terminal_hotels,omitempty"`
+	// Alerts: where the missed heartbeat and customer drop alerts go
+	// (alerts.go). Absent: log lines only.
+	Alerts *alertsConfig `json:"alerts,omitempty"`
 }
 
 func (b *broker) maxExec() int {
@@ -250,6 +256,7 @@ type hotel struct {
 	baselineTry    time.Time
 	leaving        bool               // a leave passed its empty check; no new rooms (hotels.go)
 	stop           context.CancelFunc // stops the sync loop when the hotel leaves
+	alerts         hotelAlerts        // missed heartbeat and drop alerts sent (alerts.go)
 }
 
 type guestState struct {
@@ -280,6 +287,7 @@ type broker struct {
 	nexec            *nativeExecs // background execs on the native route (nativeexec.go)
 	prefetch         prefetchJobs
 	started          time.Time
+	alerts           *alerter // missed heartbeat and drop alerts (alerts.go)
 	// requireAttestationNoted logs the require_attestation deprecation once
 	// per broker, from the config file or a join (admission.go).
 	requireAttestationNoted sync.Once
@@ -384,7 +392,11 @@ func loadBroker(path string) (*broker, error) {
 	default:
 		return nil, fmt.Errorf(`config: sealed_admission %q: the top-level value can only be "on" (or absent)`, c.SealedAdmission)
 	}
-	b := &broker{cfg: c, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), nexec: newNativeExecs(), started: time.Now()}
+	alerts, err := newAlerter(c.Alerts)
+	if err != nil {
+		return nil, err
+	}
+	b := &broker{cfg: c, alerts: alerts, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), nexec: newNativeExecs(), started: time.Now()}
 	var optedIn []string // require_attestation hotels, for one deprecation line
 	for _, hc := range c.Hotels {
 		if err := validateSealedAdmission(hc); err != nil {
@@ -404,6 +416,9 @@ func loadBroker(path string) (*broker, error) {
 		}
 		if strings.Contains(hc.ID, ".") || hc.ID == "" {
 			return nil, fmt.Errorf("hotel id %q: must be non-empty and have no dot", hc.ID)
+		}
+		if !validAlertChat(hc.AlertChatID) {
+			return nil, fmt.Errorf("config: hotel %q: alert_chat_id must be a Telegram chat id (digits) or @channel", hc.ID)
 		}
 		k, err := os.ReadFile(hc.KeyFile)
 		if err != nil {
@@ -1802,6 +1817,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		h.lastErr = err.Error()
 	}
 	h.listOK = lerr == nil
+	hadHealth := !h.lastOK.IsZero()
 	if herr == nil {
 		h.lastOK, h.healthMs = now, healthMs
 	}
@@ -1830,6 +1846,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			log.Printf("hotel %s down: %s", h.cfg.ID, h.lastErr)
 		}
 	}
+	b.alertHealth(h, herr, hadHealth, wasOK)
 	if cameUp && b.cfg.PrewarmCatalog {
 		go b.prewarmHotel(h)
 	}
@@ -2290,6 +2307,7 @@ func main() {
 		b.saveLoop(ctx)
 		close(saved)
 	}()
+	go b.alerts.run(ctx)
 	for _, h := range b.hotelList() {
 		b.startSync(ctx, h)
 	}
