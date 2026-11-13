@@ -394,3 +394,29 @@ window fell inside the 15:00 to 17:00 UTC escape rehearsal on 7 Nov, which is
 off limits. The planned hardware check is a `cipher_null` header edit on a
 throwaway `data.raw`, confirming `verify_header()` reports `tampered` and does
 not mkfs or mount; it runs after 17:15 UTC or in the next free window.
+
+## Volume head log and shred receipts (AB#398, format only)
+
+`cathedral/volume_log.py` defines the append-only log of volume heads
+(Decision 6, 4 Nov) and the shred receipt. Nothing writes or publishes it yet:
+the volume agent, the commit timer, the lease and the scoped tokens come from
+AB#395.
+
+- Entry `cathedral_volume_log_entry_v1`: `seq`, `prev_entry_sha256`, `kind`
+  (`head` or `shred`), `volume_id`, `generation`, `manifest_sha256`,
+  `commit_receipt_sha256` (the 395 commit receipt), `logged_at`.
+- `verify_log`: contiguous `seq`, hash chain, a volume's heads run 1, 2, 3
+  with no repeat or skip (head+1), a shred names the current head and is the
+  volume's last entry.
+- `verify_extends(old, new)`: the new log holds the old one as its exact
+  prefix. A reader who kept an older copy sees a rollback or a rewrite here.
+- `verify_extends_checkpoint(checkpoint, entries)`: the same check for a
+  reader who kept only an older signed checkpoint.
+- `check_restore`: only the latest logged head restores; a shredded volume
+  never does.
+- Checkpoint `cathedral_volume_log_checkpoint_v1` and shred receipt
+  `cathedral_volume_shred_receipt_v1`: Ed25519 over canonical JSON.
+
+Not covered by the format: a log operator showing two readers two different
+logs. Readers comparing checkpoints (`verify_extends_checkpoint`) catch it; where the
+log and checkpoints are published is still open.
