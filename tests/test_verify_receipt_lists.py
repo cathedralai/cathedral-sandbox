@@ -122,9 +122,9 @@ def test_room_numbering_function_keeps_one_room_id_under_two_bindings_apart() ->
 
 def test_serial_words_are_only_printed_when_a_serial_room_is_present() -> None:
     _, out, _ = _run_pack_case("good/numbered_rooms_interleaved")
-    assert len(out["chain"]["room_numbering"]["does_not_prove"]) == 1
+    assert len(out["chain"]["room_numbering"]["does_not_show"]) == 1
     _, out, _ = _run_pack_case("good/serial_room_closed_by_file_put")
-    assert len(out["chain"]["room_numbering"]["does_not_prove"]) == 4
+    assert len(out["chain"]["room_numbering"]["does_not_show"]) == 4
 
 
 def test_empty_per_room_list_cannot_claim_receipts_or_head() -> None:
@@ -221,7 +221,7 @@ def test_the_synthetic_chain_verifies_offline_and_a_changed_report_does_not() ->
 def test_run_mode_takes_no_hotel_flags_and_a_missing_oneshot_file_is_a_json_fail() -> None:
     code, _, err = _run_cli("--oneshot", "x.json", "--receipts", "y.json")
     assert code == 2 and "--oneshot checks one file" in err
-    folder = PACK / "good" / "run_held_output_proven_exit_code"
+    folder = PACK / "good" / "run_held_output_confirmed_exit_code"
     code, out, _ = _run_cli("--oneshot", str(folder / "missing.json"), "--recipe", str(folder / "recipe.json"),
                             "--no-context", "--ark-sha256", "00" * 32, "--expected-measurement", "ab" * 48)
     assert code == 1 and json.loads(out) == {"verdict": "FAIL",
@@ -302,7 +302,7 @@ def test_a_value_of_the_wrong_type_is_a_clean_fail_never_a_traceback(name: str, 
     import shutil
 
     folder = tmp_path / "case"
-    shutil.copytree(PACK / "good" / "run_held_output_proven_exit_code", folder)
+    shutil.copytree(PACK / "good" / "run_held_output_confirmed_exit_code", folder)
     which, edit = _confused_documents()[name]
     doc = json.loads((folder / which).read_text())
     doc = [] if edit is None else edit(doc)
@@ -458,3 +458,92 @@ def test_each_form_rule_refuses_one_step_past_its_bound(rule, case, knobs, reaso
     """The evidence is signed and consistent with the recipe: only the form rule can fail the run."""
     code, out = _generated(tmp_path, **knobs)
     assert code == 1 and out == {"verdict": "FAIL", "reason": reason}, (rule, case, out)
+
+
+RECIPE_PREFIX, FILE_PREFIX = "recipe: ", "check 8: the file's request: "
+
+
+def _valid_request() -> dict:
+    return {"image": "images.example.test/app@sha256:" + "a" * 64, "command": ["true"], "env": {}, "size": "sealed-1x2",
+            "timeout_seconds": 5, "network": "deny_all", "max_spend_usd": 1, "inputs": [], "outputs": []}
+
+
+def _nested(arrays: int):
+    value = 1
+    for _ in range(arrays):
+        value = [value]
+    return value
+
+
+REQUEST_LIMIT_CASES = [
+    ("image_id form", {"image_id": "sha256:xyz"}, "image_id must be sha256: and 64 lower-case hex"),
+    ("image_id case", {"image_id": "sha256:" + "A" * 64}, "image_id must be sha256: and 64 lower-case hex"),
+    ("timeout is not a boolean", {"timeout_seconds": True}, "timeout_seconds must be an integer"),
+    ("max_spend is not a boolean", {"max_spend_usd": True}, "max_spend_usd must be an integer"),
+    ("max_bytes is not a boolean", {"outputs": [{"path": "/work/out/x", "max_bytes": True}]},
+     "an output max_bytes must be an integer"),
+    ("input sha256 case", {"inputs": [{"path": "/work/in/x", "sha256": "A" * 64}]},
+     "an input sha256 must be 64 lower-case hex"),
+    ("input sha256 length", {"inputs": [{"path": "/work/in/x", "sha256": "a" * 63}]},
+     "an input sha256 must be 64 lower-case hex"),
+    ("context float", {"context": {"a": [{"b": 1.5}]}}, "context must hold no floating point number"),
+    ("context depth", {"context": {"a": _nested(32)}}, "context nests deeper than 32 levels"),
+    ("context depth 600", {"context": {"a": _nested(600)}}, "context nests deeper than 32 levels"),
+]
+
+
+@pytest.mark.parametrize("prefix", [RECIPE_PREFIX, FILE_PREFIX], ids=["recipe", "file"])
+@pytest.mark.parametrize("rule, members, reason", REQUEST_LIMIT_CASES, ids=[c[0] for c in REQUEST_LIMIT_CASES])
+def test_request_limits_alone_refuses_each_form_for_both_callers(rule, members, reason, prefix) -> None:
+    """The one function is complete by itself: no later check is needed to refuse these values."""
+    vr = _load_checker()
+    vr.request_limits({**_valid_request(), "image_id": "sha256:" + "a" * 64}, prefix)
+    with pytest.raises(vr.Fail) as caught:
+        vr.request_limits({**_valid_request(), **members}, prefix)
+    assert str(caught.value) == prefix + reason
+
+
+def test_request_limits_accepts_a_context_at_32_levels_and_floats_nowhere() -> None:
+    vr = _load_checker()
+    for prefix in (RECIPE_PREFIX, FILE_PREFIX):
+        vr.request_limits({**_valid_request(), "context": {"a": _nested(31)}}, prefix)
+
+
+def test_a_deep_structure_never_reaches_a_recursion_error_in_run_mode(tmp_path: Path) -> None:
+    folder = PACK / "good" / "run_held_output_confirmed_exit_code"
+    case = json.loads((folder / "case.json").read_text())
+    for name in ("bundle.json", "recipe.json", "context.json"):
+        import shutil
+
+        work = tmp_path / name
+        shutil.copytree(folder, work)
+        (work / name).write_text("[" * 5000 + "]" * 5000)
+        code, out, err = _run_cli(*[a.replace("{dir}", str(work)) for a in case["args"]])
+        assert "Traceback" not in err and code == 1, (name, err)
+        assert json.loads(out)["reason"].endswith("nests too deeply to read"), (name, out)
+
+
+def test_the_words_a_customer_reads_say_shows_and_confirmed_never_proves() -> None:
+    import re
+
+    word = re.compile(r"\b(prove[sdn]?|proving|proof|unproven)\b", re.IGNORECASE)
+    for name in ("good/run_held_output_confirmed_exit_code", "good/serial_room_closed_by_file_put",
+                 "good/pool_room_claimed", "good/run_exit_code_not_confirmed"):
+        _, out, _ = _run_pack_case(name)
+        added = {k: out[k] for k in ("run", "pool_rooms") if k in out}
+        added["room_numbering"] = out["chain"].get("room_numbering")
+        assert not word.search(json.dumps(added)), name
+        assert "proves" not in json.dumps(added) and "does_not_prove" not in json.dumps(added)
+    _, out, _ = _run_pack_case("good/run_held_output_confirmed_exit_code")
+    assert out["run"]["exit_code"] == {"status": "confirmed", "value": 0} and "shows" in out["run"]
+    _, out, _ = _run_pack_case("good/run_exit_code_not_confirmed")
+    assert out["run"]["exit_code"] == {"status": "not confirmed"}
+
+
+def test_a_name_that_ends_in_a_newline_inside_a_label_is_refused_where_the_producer_accepts_it() -> None:
+    """The producer's label pattern uses match with a $ anchor, so a label ending in a newline slips through it;
+    the checker's copy uses fullmatch and refuses it."""
+    vr = _load_checker()
+    with pytest.raises(vr.Fail):
+        vr.canonical_policy("allowlist", ["a\n.org"])
+    assert vr.canonical_policy("allowlist", ["A.org\n"]) == {"mode": "allowlist", "allow": ["a.org"]}
