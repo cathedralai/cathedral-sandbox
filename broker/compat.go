@@ -296,7 +296,14 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 
 // compatIdem runs fn at most once per guest + Idempotency-Key and replays its answer.
 func (b *broker) compatIdem(w http.ResponseWriter, r *http.Request, g *guestState, fn func(http.ResponseWriter, []byte)) {
-	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	b.compatIdemLimit(w, r, g, 1<<20, fn)
+}
+
+// compatIdemLimit is compatIdem for a body of up to limit bytes. The native
+// exec start passes a body handleRoom already read whole (up to 256 MiB), as
+// the sync exec route does; cutting it at 1 MiB would refuse a large stdin.
+func (b *broker) compatIdemLimit(w http.ResponseWriter, r *http.Request, g *guestState, limit int64, fn func(http.ResponseWriter, []byte)) {
+	body, _ := io.ReadAll(io.LimitReader(r.Body, limit))
 	key := r.Header.Get("Idempotency-Key")
 	if key == "" {
 		fn(w, body)

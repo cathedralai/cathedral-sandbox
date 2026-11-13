@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -29,6 +31,8 @@ const (
 	nativeExecMax      = 256            // count bound for kept execs
 	nativeExecMaxBytes = 64 << 20       // size bound for the saved file's results
 )
+
+var errNoExecStore = errors.New("no state_dir")
 
 // nativeExecDrain is how long a stopping broker waits for running execs.
 var nativeExecDrain = 60 * time.Second
@@ -64,10 +68,14 @@ func (b *broker) loadNativeExecs() {
 	}
 	raw, err := os.ReadFile(filepath.Join(b.cfg.StateDir, nativeExecFile))
 	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("native execs: %s not read (%v); earlier exec ids will read 404", nativeExecFile, err)
+		}
 		return
 	}
 	var saved []*nativeExec
-	if json.Unmarshal(raw, &saved) != nil {
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		log.Printf("native execs: %s does not parse (%v); earlier exec ids will read 404", nativeExecFile, err)
 		return
 	}
 	n := b.nexec
@@ -89,16 +97,11 @@ func (b *broker) loadNativeExecs() {
 	}
 }
 
-// saveNativeExecs prunes by age and count, then writes the file atomically.
-func (b *broker) saveNativeExecs() {
-	if b.cfg.StateDir == "" {
-		return
-	}
-	n := b.nexec
-	n.saveMu.Lock()
-	defer n.saveMu.Unlock()
-	now := time.Now()
-	n.mu.Lock()
+// pruneNativeExecsLocked drops finished execs past the age bound and, newest
+// first, past the count and size bounds. A running exec is never dropped or
+// left out: start refuses past nativeExecMax running, so every accepted id is
+// in the list it returns (AB#733). Call with n.mu held.
+func (n *nativeExecs) pruneNativeExecsLocked(now time.Time) []*nativeExec {
 	list := make([]*nativeExec, 0, len(n.execs))
 	for id, e := range n.execs {
 		if e.State != "running" && now.Sub(e.DoneAt) > nativeExecKeep {
@@ -108,43 +111,56 @@ func (b *broker) saveNativeExecs() {
 		list = append(list, e)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Started.After(list[j].Started) })
-	if len(list) > nativeExecMax {
-		for _, e := range list[nativeExecMax:] {
-			if e.State != "running" {
-				delete(n.execs, e.ID)
-			}
-		}
-		list = list[:nativeExecMax]
-	}
-	// Newest first: keep results while the file stays under the size bound.
 	kept := list[:0:0]
-	total := 0
+	count, total := 0, 0
 	for _, e := range list {
+		if e.State == "running" {
+			kept = append(kept, e)
+			count++
+			continue
+		}
 		size := 0
 		for _, v := range e.Result {
 			if s, ok := v.(string); ok {
 				size += len(s)
 			}
 		}
-		if e.State != "running" && total+size > nativeExecMaxBytes {
+		if count >= nativeExecMax || total+size > nativeExecMaxBytes {
+			delete(n.execs, e.ID)
 			continue
 		}
+		count++
 		total += size
 		kept = append(kept, e)
+	}
+	return kept
+}
+
+// saveNativeExecs prunes, then writes the file atomically. It prunes memory
+// even without state_dir. An error means the file on disk is not current.
+func (b *broker) saveNativeExecs() error {
+	n := b.nexec
+	n.saveMu.Lock()
+	defer n.saveMu.Unlock()
+	n.mu.Lock()
+	kept := n.pruneNativeExecsLocked(time.Now())
+	if b.cfg.StateDir == "" {
+		n.mu.Unlock()
+		return errNoExecStore
 	}
 	raw, err := json.Marshal(kept)
 	n.mu.Unlock()
 	if err != nil {
-		return
+		return err
 	}
-	if os.MkdirAll(b.cfg.StateDir, 0o700) != nil {
-		return
+	if err := os.MkdirAll(b.cfg.StateDir, 0o700); err != nil {
+		return err
 	}
 	tmp := filepath.Join(b.cfg.StateDir, nativeExecFile+".tmp")
-	if os.WriteFile(tmp, raw, 0o600) != nil {
-		return
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
 	}
-	_ = os.Rename(tmp, filepath.Join(b.cfg.StateDir, nativeExecFile))
+	return os.Rename(tmp, filepath.Join(b.cfg.StateDir, nativeExecFile))
 }
 
 // nativeExecStart runs the command in the background on the room's hotel.
@@ -173,12 +189,40 @@ func (b *broker) nativeExecStart(w http.ResponseWriter, g *guestState, rm *room,
 	if v, ok := body["timeout_seconds"].(float64); ok && v > 0 {
 		timeout = int(v)
 	}
+	// A 202 promises a result or lost/broker_restarted after a restart, never
+	// 404. So the running entry is on disk before anything goes to the hotel,
+	// and a broker that cannot write it refuses (AB#733).
+	if b.cfg.StateDir == "" {
+		writeErr(w, 503, "exec_store_unavailable", "this broker has no state_dir, so a background exec would not survive a restart; use POST .../exec")
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	ex := &nativeExec{ID: newUUID(), Guest: g.cfg.ID, Room: bid, State: "running", Started: time.Now(), done: make(chan struct{}), cancel: cancel}
 	n := b.nexec
 	n.mu.Lock()
+	running := 0
+	for _, e := range n.execs {
+		if e.State == "running" {
+			running++
+		}
+	}
+	if running >= nativeExecMax {
+		n.mu.Unlock()
+		cancel()
+		w.Header().Set("Retry-After", "30")
+		writeErr(w, 429, "too_many_execs", fmt.Sprintf("%d background execs are running on this broker; try again shortly", running))
+		return
+	}
 	n.execs[ex.ID] = ex
 	n.mu.Unlock()
+	if err := b.saveNativeExecs(); err != nil {
+		n.mu.Lock()
+		delete(n.execs, ex.ID)
+		n.mu.Unlock()
+		cancel()
+		writeErr(w, 503, "exec_store_unavailable", "the broker could not save the exec, so nothing was started")
+		return
+	}
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
@@ -202,9 +246,10 @@ func (b *broker) nativeExecStart(w http.ResponseWriter, g *guestState, rm *room,
 			copyRoomHeaders(http.Header(ex.Headers), hdr)
 		}
 		n.mu.Unlock()
-		b.saveNativeExecs()
+		// A failed write leaves the entry running on disk: after a restart it
+		// reads lost/broker_restarted, and until then the result is in memory.
+		_ = b.saveNativeExecs()
 	}()
-	b.saveNativeExecs()
 	writeJSON(w, 202, map[string]any{"exec_id": ex.ID, "state": "running"})
 }
 
@@ -224,12 +269,13 @@ func (b *broker) nativeExecPoll(w http.ResponseWriter, r *http.Request, g *guest
 		killed := ex.State == "running"
 		if killed {
 			ex.State = "killed"
+			ex.DoneAt = time.Now() // the age bound counts from here
 			ex.Result = map[string]any{"message": "stopped on request; the command may run on inside the room until its timeout"}
 		}
 		n.mu.Unlock()
 		ex.cancel()
 		if killed {
-			b.saveNativeExecs()
+			_ = b.saveNativeExecs()
 		}
 	} else if wait, _ := strconv.Atoi(r.URL.Query().Get("wait")); wait > 0 {
 		if wait > 25 {
@@ -263,7 +309,7 @@ func (b *broker) drainNativeExecs(d time.Duration) {
 	case <-idle:
 	case <-time.After(d):
 	}
-	b.saveNativeExecs()
+	_ = b.saveNativeExecs()
 }
 
 // routeNativeExec handles the exec start and poll tails; it reports whether it took the request.
@@ -271,7 +317,7 @@ func (b *broker) routeNativeExec(w http.ResponseWriter, r *http.Request, g *gues
 	switch {
 	case tail == "execs" && r.Method == "POST":
 		r.Body = io.NopCloser(bytes.NewReader(body))
-		b.compatIdem(w, r, g, func(w http.ResponseWriter, raw []byte) { b.nativeExecStart(w, g, rm, bid, raw) })
+		b.compatIdemLimit(w, r, g, 256<<20, func(w http.ResponseWriter, raw []byte) { b.nativeExecStart(w, g, rm, bid, raw) })
 		return true
 	case strings.HasPrefix(tail, "execs/") && !strings.Contains(strings.TrimPrefix(tail, "execs/"), "/"):
 		b.nativeExecPoll(w, r, g, bid, strings.TrimPrefix(tail, "execs/"))
