@@ -240,6 +240,13 @@ func TestPartialChainArchiveKeepsHeadAcrossRestart(t *testing.T) {
 	if doc = getArchive(t, dir, bind); len(doc.Receipts) != 5 || doc.Complete == nil || !*doc.Complete || doc.Head != h5 {
 		t.Fatalf("stale page: receipts=%d head=%q complete=%v", len(doc.Receipts), doc.Head, doc.Complete)
 	}
+	// A first-page retry may be shorter than the archive even though the
+	// hotel's chain has grown. The new head must make the archive incomplete.
+	h6 := fmt.Sprintf("%064x", 6)
+	b2.archiveHotelPage(h, 0, headPage(bind, 0, 2, h6))
+	if doc = getArchive(t, dir, bind); len(doc.Receipts) != 5 || doc.Complete == nil || *doc.Complete || doc.Head != h6 {
+		t.Fatalf("grown chain on short page: receipts=%d head=%q complete=%v", len(doc.Receipts), doc.Head, doc.Complete)
+	}
 	// The chain grew past the archive: incomplete again, with the new head.
 	h7 := fmt.Sprintf("%064x", 7)
 	b2.archiveHotelPage(h, 5, headPage(bind, 5, 1, h7))

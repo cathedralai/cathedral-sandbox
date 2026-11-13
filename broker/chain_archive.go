@@ -80,12 +80,17 @@ func (b *broker) archiveChainPage(binding string, after int, body []byte) error 
 	doc := archivedChain{Binding: binding, Receipts: merged}
 	last := receiptSHA(merged[len(merged)-1])
 	switch {
+	case page.Head != "" && !chainHolds(merged, page.Head):
+		// A short page can still report a newer hotel head. Never let an
+		// earlier complete archive hide growth that this page revealed.
+		doc.Head = page.Head
+	case have.Head != "" && !chainHolds(merged, have.Head):
+		// A stale page must not erase a previously observed, unarchived head.
+		doc.Head = have.Head
 	case last != "" && (page.Head == last || have.Head == last):
 		doc.Head, doc.Complete = last, true
-	case page.Head == "" || chainHolds(merged, page.Head):
-		doc.Head = have.Head // a page read before the archive's end: its head is older
 	default:
-		doc.Head = page.Head // the chain runs on past what is archived
+		doc.Head = have.Head // the page has not shown a newer head
 	}
 	out, err := marshalRaw(doc)
 	if err != nil {
