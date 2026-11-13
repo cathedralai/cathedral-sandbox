@@ -22,6 +22,7 @@ Validator operators do not install from this repository; they use
 - [AMD SEV-SNP miner and first hardware proof](AMD_SEV_SNP_FRIEND_TEST.md)
 - [AMD SEV-SNP image contract](SN94_SNP_MINER_IMAGE.md)
 - [Run an SNP miner on your own server, in order](SNP_OWN_SERVER_ONBOARDING.md)
+- [Add a shared sealed hotel on a rented host](SEALED_CAPACITY_ADD_HOTEL.md)
 - [Intel TDX image contract](SN94_AUDIT_MINER_IMAGE.md)
 - [Validator access and multi-machine fleet protocol](WORK_REQUEST_V2.md)
 - [Intel TDX verifier release](TDX_VERIFIER_RELEASE.md)

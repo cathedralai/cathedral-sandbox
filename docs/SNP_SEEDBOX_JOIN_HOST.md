@@ -4,6 +4,8 @@
 **Working decisions:** `Cathedral/docs/PR1469_DECISIONS_WORKING_2026-10-16.md`  
 **Issue:** https://github.com/bigailabs/polariscomputer/issues/1469
 
+This is the miner seed-box path. To add operator sealed capacity (a shared sealed hotel on a rented host), see [SEALED_CAPACITY_ADD_HOTEL.md](SEALED_CAPACITY_ADD_HOTEL.md).
+
 ## Goal
 
 On one SNP host: miner keeps earning; a **warm** customer guest is already wiped and listening on `:8444` so a listed chip seals in about **one minute** after the first sealed create (not ~29 min wipe + 15 min admission).
