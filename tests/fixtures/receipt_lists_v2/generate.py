@@ -1402,6 +1402,8 @@ def _file_side(**edits):
 
 _IMG = "images.example.test/"
 _DIGEST = "@sha256:" + "a" * 64
+USER_FORM = ("recipe: user must be digits only, or a name of letters, digits, _ and - that starts with a letter or _ "
+             "and may end in $")
 IN_PATH = "an input path"
 OUT_PATH = "an output path"
 
@@ -1465,14 +1467,10 @@ def build_form_rules():
         ("user_length", _knobs(user="a" * 64),
          [("65", _knobs(user="a" * 65), "recipe: user must be at most 64 characters")]),
         ("user_form", _knobs(user="_svc-1$"), [
-            ("dollar_inside", _knobs(user="svc$x"), "recipe: user must be digits only, or a name of letters, digits, "
-                                                    "_ and - that starts with a letter or _ and may end in $"),
-            ("digit_first", _knobs(user="1abc"), "recipe: user must be digits only, or a name of letters, digits, "
-                                                 "_ and - that starts with a letter or _ and may end in $"),
-            ("space", _knobs(user="a b"), "recipe: user must be digits only, or a name of letters, digits, "
-                                          "_ and - that starts with a letter or _ and may end in $"),
-            ("empty", _knobs(user=""), "recipe: user must be digits only, or a name of letters, digits, "
-                                       "_ and - that starts with a letter or _ and may end in $")]),
+            ("dollar_inside", _knobs(user="svc$x"), USER_FORM),
+            ("digit_first", _knobs(user="1abc"), USER_FORM),
+            ("space", _knobs(user="a b"), USER_FORM),
+            ("empty", _knobs(user=""), USER_FORM)]),
         ("user_digits", _knobs(user="1000"), []),
         ("output_max_bytes_at_least_one", _outs({"path": "/work/out/x", "max_bytes": 1, "optional": False}),
          [("zero", _outs({"path": "/work/out/x", "max_bytes": 0, "optional": False}),
