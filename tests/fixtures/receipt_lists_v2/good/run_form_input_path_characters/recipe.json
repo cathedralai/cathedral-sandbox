@@ -1,0 +1,48 @@
+{
+ "create": {
+  "broker_guest": "guest-1",
+  "ttl_seconds": 300
+ },
+ "file_modes": {
+  "context": "644",
+  "end_marker": "644"
+ },
+ "request": {
+  "command": [
+   "python",
+   "/work/in/run.py"
+  ],
+  "cwd": "/work",
+  "env": {
+   "MODE": "check"
+  },
+  "image": "images.example.test/app@sha256:0fa8c07c0290a5b6cabd28f6caea5286b2765609366af76373ca191c022c72bb",
+  "image_id": "sha256:aae1a0b67cd0da30a034563ef9ea0665cb1ccb289ee21e54edead462f531b112",
+  "inputs": [
+   {
+    "mode": "644",
+    "path": "/work/in/A-z_0.9"
+   }
+  ],
+  "max_spend_usd": 5,
+  "network": {
+   "allow": [],
+   "mode": "deny_all"
+  },
+  "outputs": [
+   {
+    "max_bytes": 1048576,
+    "optional": false,
+    "path": "/work/out/result.json"
+   },
+   {
+    "max_bytes": 65536,
+    "optional": true,
+    "path": "/work/out/log.txt"
+   }
+  ],
+  "size": "sealed-1x2",
+  "timeout_seconds": 60
+ },
+ "schema": "cathedral_oneshot_recipe_v1"
+}
