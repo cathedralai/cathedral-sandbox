@@ -27,15 +27,36 @@ const (
 
 var chainArchiveMu sync.Mutex
 
+// archivedChain is the file under chains/. Head is the newest hotel head
+// seen for this binding. Complete is true only when the archived receipts end
+// at a head the hotel named; a prefix (say, the first page read before a
+// restart) stays complete=false, so it cannot pass for the whole chain.
+type archivedChain struct {
+	Binding  string            `json:"binding_sha256"`
+	Head     string            `json:"head,omitempty"`
+	Complete bool              `json:"complete"`
+	Receipts []json.RawMessage `json:"receipts"`
+}
+
+func receiptSHA(raw json.RawMessage) string {
+	var rc struct {
+		SHA string `json:"receipt_sha256"`
+	}
+	_ = json.Unmarshal(raw, &rc)
+	return rc.SHA
+}
+
 // archiveChainPage merges one hotel /room/receipts page that started at
-// offset after. A page that would leave a gap is skipped: the next read from
-// offset 0 fills it. Failure never refuses the caller.
+// offset after into the archive of binding. The caller has checked that
+// binding is the hotel's attested one. A page that would leave a gap is
+// skipped: the next read from offset 0 fills it.
 func (b *broker) archiveChainPage(binding string, after int, body []byte) error {
 	binding = strings.ToLower(binding)
 	if b.cfg.StateDir == "" || !sha256HexRE.MatchString(binding) || after < 0 {
 		return nil
 	}
 	var page struct {
+		Head     string            `json:"head"`
 		Receipts []json.RawMessage `json:"receipts"`
 	}
 	if err := json.Unmarshal(body, &page); err != nil || len(page.Receipts) == 0 {
@@ -45,9 +66,7 @@ func (b *broker) archiveChainPage(binding string, after int, body []byte) error 
 	defer chainArchiveMu.Unlock()
 	dir := filepath.Join(b.cfg.StateDir, chainsDir)
 	name := filepath.Join(dir, binding+".json")
-	var have struct {
-		Receipts []json.RawMessage `json:"receipts"`
-	}
+	var have archivedChain
 	if raw, err := os.ReadFile(name); err == nil {
 		_ = json.Unmarshal(raw, &have)
 	}
@@ -58,7 +77,17 @@ func (b *broker) archiveChainPage(binding string, after int, body []byte) error 
 	if len(merged) < len(have.Receipts) {
 		merged = have.Receipts // a short re-read must not shrink the archive
 	}
-	out, err := marshalRaw(map[string]any{"binding_sha256": binding, "receipts": merged})
+	doc := archivedChain{Binding: binding, Receipts: merged}
+	last := receiptSHA(merged[len(merged)-1])
+	switch {
+	case last != "" && (page.Head == last || have.Head == last):
+		doc.Head, doc.Complete = last, true
+	case page.Head == "" || chainHolds(merged, page.Head):
+		doc.Head = have.Head // a page read before the archive's end: its head is older
+	default:
+		doc.Head = page.Head // the chain runs on past what is archived
+	}
+	out, err := marshalRaw(doc)
 	if err != nil {
 		return err
 	}
@@ -73,6 +102,16 @@ func (b *broker) archiveChainPage(binding string, after int, body []byte) error 
 	}
 	pruneChains(dir)
 	return nil
+}
+
+// chainHolds reports whether a receipt in chain has the hash sha.
+func chainHolds(chain []json.RawMessage, sha string) bool {
+	for _, rc := range chain {
+		if receiptSHA(rc) == sha {
+			return true
+		}
+	}
+	return false
 }
 
 // pruneChains drops chains older than chainMaxAge, then the oldest beyond
@@ -102,13 +141,31 @@ func pruneChains(dir string) {
 }
 
 // archiveHotelPage is the hook for the two places the broker reads the hotel
-// chain. It logs and moves on.
+// chain. The archive is named by the binding the hotel passed attestation
+// with (h.adm.bindingSHA), never by the binding_sha256 its body claims: a
+// hotel with no current pass, or a page naming another binding, writes
+// nothing, so it can neither overwrite another chain nor push one out by
+// prune. It logs and moves on.
 func (b *broker) archiveHotelPage(h *hotel, after int, body []byte) {
-	var head struct {
+	b.mu.Lock()
+	attested := ""
+	if !h.adm.attestedAt.IsZero() && b.admitted(h, time.Now()) {
+		attested = strings.ToLower(h.adm.bindingSHA)
+	}
+	b.mu.Unlock()
+	if attested == "" {
+		return
+	}
+	var claim struct {
 		Binding string `json:"binding_sha256"`
 	}
-	_ = json.Unmarshal(body, &head)
-	if err := b.archiveChainPage(head.Binding, after, body); err != nil {
+	_ = json.Unmarshal(body, &claim)
+	if strings.ToLower(claim.Binding) != attested {
+		log.Printf("hotel %s: %s: page names binding %.16s..., attested %.16s...; not archived",
+			h.cfg.ID, chainArchiveGuard, claim.Binding, attested)
+		return
+	}
+	if err := b.archiveChainPage(attested, after, body); err != nil {
 		log.Printf("hotel %s: %s: %v", h.cfg.ID, chainArchiveGuard, err)
 	}
 }

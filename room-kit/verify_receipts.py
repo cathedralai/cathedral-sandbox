@@ -675,7 +675,12 @@ def main() -> int:
         receipts = doc["receipts"] if isinstance(doc, dict) else doc
         # A guest's chain from the broker is filtered to its own rooms, so it
         # has gaps by design: check each receipt, not a whole chain to the head.
-        whole = isinstance(doc, dict) and not doc.get("filtered") and not a.sandbox and not a.receipt_header
+        # The broker's chain archive (GET /v1/broker/bindings/<sha>/receipts)
+        # says complete=false when it holds only a prefix of the chain it saw
+        # (AB#386): check each receipt, and never call that the whole chain.
+        incomplete = isinstance(doc, dict) and doc.get("complete") is False
+        whole = (isinstance(doc, dict) and not doc.get("filtered") and not incomplete
+                 and not a.sandbox and not a.receipt_header)
         head = doc.get("head") if whole else None
         for h in a.receipt_header:
             receipts.append(json.loads(base64.urlsafe_b64decode(h + "=" * (-len(h) % 4))))
@@ -748,15 +753,22 @@ def main() -> int:
             if archive_chains:
                 checked += "; archived bindings verify signatures only"
             verdict = "PASS"
+        if incomplete:
+            checked += "; INCOMPLETE archive: a prefix of the chain, not shown to reach the hotel's head"
+            verdict = "NOT PROVEN"
         out = {"attestation": attestation_out,
                "chain": chain_out,
                "policy_timeline": policy_timeline(receipts), "room_tunables": room_tunables(receipts),
                "room_links": room_links(receipts), "verdict": verdict,
                "checked": checked}
+        not_proven = []
         if sealed_archive:
-            out["not_proven"] = [
-                "archived sealed bindings have no SNP report; receipt signatures checked, attestation not proven"
-            ]
+            not_proven.append(
+                "archived sealed bindings have no SNP report; receipt signatures checked, attestation not proven")
+        if incomplete:
+            not_proven.append("the archived chain is incomplete; receipts after the last one archived are missing")
+        if not_proven:
+            out["not_proven"] = not_proven
         if a.cathedral_sandbox:
             rooms = sorted(room for room, linked in out["room_links"].items() if linked == a.cathedral_sandbox)
             need(rooms, f"no successful create receipt names Cathedral sandbox {a.cathedral_sandbox}")
