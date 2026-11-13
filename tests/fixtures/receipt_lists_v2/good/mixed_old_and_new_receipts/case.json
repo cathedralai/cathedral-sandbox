@@ -13,7 +13,7 @@
   "exit_code": 0,
   "pointers": {
    "/chain/room_numbering/rooms/room-new/receipts": 2,
-   "/checked": "whole chain to the head the server named; room room-old has receipts with and without numbering: no numbering claim for it"
+   "/checked": "whole chain to the head the server named; each numbered room: its receipts run 1 to n with no gap and every link right; room room-old has receipts with and without numbering: no numbering claim for it"
   },
   "verdict": "PASS"
  }

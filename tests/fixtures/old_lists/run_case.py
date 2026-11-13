@@ -52,7 +52,7 @@ def run_case(name: str) -> tuple[bytes, int]:
     try:
         base = f"http://127.0.0.1:{server.server_address[1]}" if server else ""
         args = [a.replace("{dir}", str(case)).replace("{broker}", base) for a in spec["args"]]
-        proc = subprocess.run([sys.executable, str(CHECKER), *args], capture_output=True)
+        proc = subprocess.run([sys.executable, str(CHECKER), *args], capture_output=True, check=False)
         return proc.stdout, proc.returncode
     finally:
         if server:

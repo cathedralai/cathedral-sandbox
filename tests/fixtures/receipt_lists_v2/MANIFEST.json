@@ -58,7 +58,7 @@
   "bad/serial_second_create/case.json": "dc885f15899a8bf43c044f647dbe82881c0ad2879eb49d30002033983ede4a0c",
   "bad/serial_second_create/receipts.json": "3555036adc33142932fa85a49c48371f0310b1d5ed95ad490a852ccec831ab95",
   "good/mixed_old_and_new_receipts/attestation_doc.json": "bc1ed043d4191edf50f11565805a6c81654bfbde1c89bcaeafbaf357684e3167",
-  "good/mixed_old_and_new_receipts/case.json": "31c6c3ad4130934baee33c6548b4addf4ece241c75f7d970d2bb5085da310874",
+  "good/mixed_old_and_new_receipts/case.json": "6dd46daf55dfc4e1a03d172ff27c9129b31b6ef6aec5af81aa6700fee14c3f7d",
   "good/mixed_old_and_new_receipts/receipts.json": "6da71bfdd79aa94ccd3ab41b39a858653b20e2c1d698eaf571f1b80d2ef14c8a",
   "good/numbered_list_reordered/attestation_doc.json": "bc1ed043d4191edf50f11565805a6c81654bfbde1c89bcaeafbaf357684e3167",
   "good/numbered_list_reordered/case.json": "081411bf3fc8ae2f22681bef5b3ac802bac2ab8ae7f0da776c57059bad677706",
@@ -95,5 +95,5 @@
   "source/trust.json": "ba26cab8bfe820365a2629fb3a59d631fcfb2c9fb458d5554bfd9009f879570e"
  },
  "root_rule": "sha256 of '<path> <sha256>' lines, sorted by path, MANIFEST.json excluded",
- "root_sha256": "754101375298916fbaad64ca9c14b96762ebed495f3df7466e6faf927196cdfe"
+ "root_sha256": "e796e7b0b75421080deaa50afc12f2dc687b4ddf7db3aa3352dbc61b832c10db"
 }

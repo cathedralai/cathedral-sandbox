@@ -170,7 +170,7 @@ class Pack:
         self.key = signing_key()
         self.files: dict[str, bytes] = {}
 
-    def new_hotel(self) -> "Hotel":
+    def new_hotel(self) -> Hotel:
         return Hotel(self)
 
     def add(self, kind: str, name: str, files: dict[str, bytes], case: dict) -> None:
@@ -290,7 +290,8 @@ def numbering_cases(pack: Pack) -> None:
                "claim for that room. Another room is numbered in full.",
                whole(h), {"pointers": {
                    f"{room}/room-new/receipts": 2,
-                   "/checked": "whole chain to the head the server named; room room-old has receipts with and "
+                   "/checked": "whole chain to the head the server named; each numbered room: its receipts run "
+                               "1 to n with no gap and every link right; room room-old has receipts with and "
                                "without numbering: no numbering claim for it"}})
 
     h = pack.new_hotel()
@@ -310,7 +311,7 @@ def numbering_cases(pack: Pack) -> None:
                                        f"{room}/room-a/receipts": 3}})
 
     # --- bad numbering
-    def bad_hotel(*rooms_actions):
+    def bad_hotel():
         hh = pack.new_hotel()
         hh.sign("create", "room-a", 202)
         hh.sign("exec", "room-a")
