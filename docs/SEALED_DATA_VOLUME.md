@@ -409,13 +409,14 @@ AB#395.
   with no repeat or skip (head+1), a shred names the current head and is the
   volume's last entry.
 - `verify_extends(old, new)`: the new log holds the old one as its exact
-  prefix. A reader who kept an older copy or checkpoint sees a rollback or a
-  rewrite here.
+  prefix. A reader who kept an older copy sees a rollback or a rewrite here.
+- `verify_extends_checkpoint(checkpoint, entries)`: the same check for a
+  reader who kept only an older signed checkpoint.
 - `check_restore`: only the latest logged head restores; a shredded volume
   never does.
 - Checkpoint `cathedral_volume_log_checkpoint_v1` and shred receipt
   `cathedral_volume_shred_receipt_v1`: Ed25519 over canonical JSON.
 
 Not covered by the format: a log operator showing two readers two different
-logs. Readers comparing checkpoints (`verify_extends`) catch it; where the
+logs. Readers comparing checkpoints (`verify_extends_checkpoint`) catch it; where the
 log and checkpoints are published is still open.

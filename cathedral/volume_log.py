@@ -336,6 +336,31 @@ def verify_checkpoint(
             raise VolumeLogError("checkpoint_mismatch")
 
 
+def verify_extends_checkpoint(
+    checkpoint: Mapping[str, Any],
+    *,
+    public_keys_by_id: Mapping[str, bytes],
+    entries: Sequence[Mapping[str, Any]],
+) -> None:
+    """The log must hold the checkpointed log as its exact prefix.
+
+    The rollback check for a reader who kept only an earlier signed checkpoint,
+    not the entries: the hash chain makes a matching size and last hash at that
+    point cover every entry before it.
+    """
+    doc = _exact_fields(checkpoint, _CHECKPOINT_FIELDS, "checkpoint")
+    size = _int(doc["size"], "size", 0)
+    verify_log(entries)
+    if len(entries) < size:
+        raise VolumeLogError("log_shrank")
+    try:
+        verify_checkpoint(doc, public_keys_by_id=public_keys_by_id, entries=entries[:size])
+    except VolumeLogError as exc:
+        if str(exc) == "checkpoint_mismatch":
+            raise VolumeLogError("log_rewritten") from exc
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Shred receipts
 # ---------------------------------------------------------------------------

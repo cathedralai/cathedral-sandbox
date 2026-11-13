@@ -203,3 +203,20 @@ def test_shred_receipt(log):
     # A log that does not hold the shred (rolled back to before it) fails the receipt.
     with pytest.raises(vl.VolumeLogError, match="shred_not_in_log"):
         vl.verify_shred_receipt(receipt, public_keys_by_id=keys, entries=log)
+
+
+def test_rollback_is_visible_against_a_kept_checkpoint(log):
+    private, public = _keypair()
+    keys = {"log-1": public}
+    cp = vl.sign_checkpoint(log, log_key_id="log-1", issued_at=T, private_key=private)
+    newer = _head(log, "vol-a", 3, 3)
+    vl.verify_extends_checkpoint(cp, public_keys_by_id=keys, entries=newer)
+    vl.verify_extends_checkpoint(cp, public_keys_by_id=keys, entries=log)
+    with pytest.raises(vl.VolumeLogError, match="log_shrank"):
+        vl.verify_extends_checkpoint(cp, public_keys_by_id=keys, entries=log[:2])
+    forked = _head(log[:2], "vol-a", 2, 77)
+    forked = _head(forked, "vol-a", 3, 3)
+    with pytest.raises(vl.VolumeLogError, match="log_rewritten"):
+        vl.verify_extends_checkpoint(cp, public_keys_by_id=keys, entries=forked)
+    with pytest.raises(vl.VolumeLogError, match="bad_signature"):
+        vl.verify_extends_checkpoint(dict(cp, size=2), public_keys_by_id=keys, entries=newer)
