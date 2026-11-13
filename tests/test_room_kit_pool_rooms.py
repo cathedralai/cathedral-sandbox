@@ -472,3 +472,63 @@ def test_the_sealed_env_handler_is_refused_on_an_unclaimed_room_and_reaches_the_
     # Claimed: an ordinary room, so the request reaches the handler (this hotel has the feature off).
     assert front.call("GET", f"/v1/sandboxes/{room}/sealed-env")[0] == 403
     assert_idle(front.ledger)
+
+
+# ---------------------------------------------------------------- the exact shape, a write before the flag, the claim method
+
+@pytest.mark.parametrize("missing", ["image", "resources", "network", "ttl_seconds"])
+def test_a_pool_create_with_any_other_key_missing_is_refused_unsent(front, missing) -> None:
+    body = {k: v for k, v in POOL.items() if k != missing}
+    status, headers, out = front.create(body)
+    assert status == 400 and code(out) == "pool_create_invalid" and "X-Room-Receipt" not in headers
+    assert front.api.seen == [] and front.ledger.chain == []
+
+
+@pytest.mark.parametrize("changes", [
+    {"resources": {}}, {"resources": []}, {"resources": None}, {"resources": "big"},
+    {"ttl_seconds": 0}, {"ttl_seconds": -5}, {"ttl_seconds": True}, {"ttl_seconds": False}, {"ttl_seconds": 1.5},
+    {"ttl_seconds": None}, {"ttl_seconds": "900"},
+    {"image": None}, {"image": ["x"]}, {"network": []},
+])
+def test_a_pool_create_with_a_wrong_value_is_refused_unsent(front, changes) -> None:
+    status, _headers, out = front.create({**POOL, **changes})
+    assert status == 400 and code(out) == "pool_create_invalid"
+    assert front.api.seen == []
+
+
+def test_a_pool_create_with_all_five_keys_right_is_flagged(front) -> None:
+    assert pool_room(front, ttl_seconds=1, resources={"cpu": 1}) in front.ledger.pool
+
+
+def test_an_unsigned_write_before_the_pool_create_is_signed_withholds_the_flag(front) -> None:
+    front.api.new_ids = ["sbx_t"]
+    hold = front.api.hold(r"POST /v1/sandboxes")
+    t, box = in_thread(front.create, POOL)
+    hold.wait_entered()
+    assert front.call("PUT", "/v1/sandboxes/sbx_t/tar?path=/work", b"tar-bytes")[0] == 200
+    hold.release.set()
+    status, headers, _out = finish(t, box)
+    assert status == 200 and "pool" not in receipt_of(headers)["statement"]
+    assert "sbx_t" not in front.ledger.pool
+    assert_idle(front.ledger)
+
+
+def test_a_read_before_the_pool_create_is_signed_keeps_the_flag(front) -> None:
+    front.api.new_ids = ["sbx_t"]
+    front.api.rooms.add("sbx_t")
+    hold = front.api.hold(r"POST /v1/sandboxes")
+    t, box = in_thread(front.create, POOL)
+    hold.wait_entered()
+    assert front.call("GET", "/v1/sandboxes/sbx_t")[0] == 200
+    hold.release.set()
+    assert receipt_of(finish(t, box)[1])["statement"]["pool"] is True
+    assert_idle(front.ledger)
+
+
+@pytest.mark.parametrize("method", ["GET", "PUT", "DELETE", "PATCH"])
+def test_a_claim_route_answers_405_for_any_method_but_post_even_on_an_unclaimed_room(front, method) -> None:
+    room = pool_room(front)
+    status, headers, out = front.call(method, f"/v1/sandboxes/{room}/claim")
+    assert status == 405 and headers["Allow"] == "POST" and code(out) == "method_not_allowed"
+    assert room in front.ledger.pool
+    assert_idle(front.ledger)
