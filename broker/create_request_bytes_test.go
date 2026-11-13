@@ -8,14 +8,15 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"sync/atomic"
 	"testing"
 )
 
 // The caller of a native create can ask for the exact bytes the broker sent
 // to the hotel (X-Broker-Return-Create-Request: 1), so it can check them
 // against what the hotel signed. These tests pin that the returned bytes are
-// the bytes the hotel received, through every path a create can take.
+// the bytes the hotel received: a plain create, the broker's own labels, a
+// retry on a second hotel and a tunables reap. Other retry causes send the
+// same slice by the same code and have no case of their own here.
 
 // createWithAsk posts a native create. ask sets the request header; extra
 // headers are added as given.
@@ -149,8 +150,8 @@ func TestCreateRequestBytesAfterTunablesReap(t *testing.T) {
 		}
 		raw := decodeCreateRequest(t, doc)
 		sameBytes(t, raw, lastCreateBody(tc.hotels["c"]))
-		if len(tc.hotels["b"].createBodies) > 0 {
-			sameBytes(t, raw, lastCreateBody(tc.hotels["b"]))
+		if onB := lastCreateBody(tc.hotels["b"]); onB != nil {
+			sameBytes(t, raw, onB)
 			return
 		}
 	}
@@ -201,7 +202,6 @@ func TestCreateRequestBytesIgnoredOnCompat(t *testing.T) {
 	if _, ok := doc["create_request_b64"]; ok {
 		t.Fatalf("compat answer carries create_request_b64: %v", doc)
 	}
-	_ = atomic.LoadInt32
 }
 
 // oneshot_create_keys.json lists the keys a one-shot create may hold as the
