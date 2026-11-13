@@ -5,6 +5,8 @@ import base64
 import http.client
 import importlib.util
 import json
+import os
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
@@ -49,7 +51,7 @@ def _front(tmp_path, monkeypatch, *, escape: str | None, sealed: bool, plaintext
     else:
         monkeypatch.setenv("ROOM_ESCAPE_ALLOW_PLAINTEXT", plaintext)
     plant_dir = tmp_path / "escape-room"
-    monkeypatch.setenv("ROOM_ESCAPE_NONCE_PATH", str(plant_dir / "nonce"))
+    monkeypatch.setenv("ROOM_ESCAPE_NONCE_DIR", str(plant_dir))
     if sealed:
         ledger = _sealed_ledger(tmp_path / "store", monkeypatch)
     else:
@@ -108,7 +110,7 @@ def test_plant_is_refused_when_escape_is_off(tmp_path, monkeypatch) -> None:
                                      json.dumps({"window_id": "win-1", "nonce": NONCE}).encode())
     assert status == 403 and b"escape_disabled" in out
     assert ledger.chain == []
-    assert not (plant_dir / "nonce").exists()
+    assert not plant_dir.exists()
 
 
 def test_plant_is_refused_on_a_level1_hotel(tmp_path, monkeypatch) -> None:
@@ -118,7 +120,7 @@ def test_plant_is_refused_on_a_level1_hotel(tmp_path, monkeypatch) -> None:
     assert status == 403 and b"escape_disabled" in out
     assert ledger.sealed is False
     assert ledger.chain == []
-    assert not (plant_dir / "nonce").exists()
+    assert not plant_dir.exists()
 
 
 def test_plant_requires_the_hotel_key(tmp_path, monkeypatch) -> None:
@@ -140,7 +142,7 @@ def test_plaintext_is_refused_unless_flagged(tmp_path, monkeypatch) -> None:
                                      json.dumps({"window_id": "win-1", "nonce": NONCE}).encode())
     assert status == 409 and b"plaintext_forbidden" in out
     assert ledger.chain == []
-    assert not (plant_dir / "nonce").exists()
+    assert not plant_dir.exists()
 
 
 def _plant_statement(doc: dict) -> dict:
@@ -165,7 +167,7 @@ def test_encrypted_plant_writes_root_only_and_never_echoes(tmp_path, monkeypatch
     status, headers, out = _request(port, "POST", "/room/escape-nonce", json.dumps(env).encode())
     assert status == 200
     body = json.loads(out)
-    assert body == {"encrypted": True, "ok": True, "path": str(plant_dir / "nonce"), "window_id": "win-1"}
+    assert body == {"encrypted": True, "ok": True, "path": str(plant_dir / "win-1" / "nonce"), "window_id": "win-1"}
     dumped = json.dumps({"body": body, "headers": headers, "chain": ledger.chain})
     assert NONCE not in dumped
     assert NONCE not in out.decode()
@@ -176,15 +178,15 @@ def test_encrypted_plant_writes_root_only_and_never_echoes(tmp_path, monkeypatch
     assert st["sandbox_id"] is None
     assert st["encrypted"] is True
     assert st["nonce_sha256"] == rr.sha(NONCE.encode())
-    assert st["path"] == str(plant_dir / "nonce")
+    assert st["path"] == str(plant_dir / "win-1" / "nonce")
     assert "nonce" not in st
     assert NONCE not in json.dumps(st)
-    nonce_path = plant_dir / "nonce"
+    nonce_path = plant_dir / "win-1" / "nonce"
     assert nonce_path.read_bytes() == (NONCE + "\n").encode()
     assert nonce_path.stat().st_mode & 0o777 == 0o400
     assert plant_dir.stat().st_mode & 0o777 == 0o700
-    assert (plant_dir / "window").read_text() == "win-1\n"
-    assert (plant_dir / "window").stat().st_mode & 0o777 == 0o444
+    assert (plant_dir / "win-1").stat().st_mode & 0o777 == 0o700
+    assert sorted(p.name for p in plant_dir.rglob("*")) == ["nonce", "win-1"]  # no shared "window" file
 
 
 def test_plaintext_plant_when_flagged_still_omits_nonce_from_receipt(tmp_path, monkeypatch) -> None:
@@ -198,8 +200,9 @@ def test_plaintext_plant_when_flagged_still_omits_nonce_from_receipt(tmp_path, m
     st = _receipt(headers)["statement"]
     assert st["action"] == rr.PLANT_ACTION and st["encrypted"] is False
     assert "nonce" not in st and NONCE not in json.dumps(st)
-    assert (plant_dir / "nonce").read_text() == NONCE + "\n"
-    assert (plant_dir / "nonce").stat().st_mode & 0o777 == 0o400
+    assert (plant_dir / "win-2" / "nonce").read_text() == NONCE + "\n"
+    assert (plant_dir / "win-2" / "nonce").stat().st_mode & 0o777 == 0o400
+    assert st["path"] == str(plant_dir / "win-2" / "nonce") and body["path"] == st["path"]
 
 
 def test_wrong_ciphertext_does_not_write(tmp_path, monkeypatch) -> None:
@@ -211,7 +214,7 @@ def test_wrong_ciphertext_does_not_write(tmp_path, monkeypatch) -> None:
     assert status == 400 and b"ciphertext does not open" in out
     assert NONCE not in out.decode()
     assert ledger.chain == []
-    assert not (plant_dir / "nonce").exists()
+    assert not plant_dir.exists()
 
 
 def test_plant_key_is_hidden_when_escape_is_off(tmp_path, monkeypatch) -> None:
@@ -243,3 +246,94 @@ def test_plant_key_signature_is_bound_to_hotel_and_binding(tmp_path, monkeypatch
     other_key = Ed25519PrivateKey.generate().public_key()
     with pytest.raises(InvalidSignature):
         other_key.verify(base64.b64decode(doc["signature_b64"]), rr.canonical(_plant_statement(doc)))
+
+
+def _plant(port: int, window_id: str, nonce: str):
+    return _request(port, "POST", "/room/escape-nonce",
+                    json.dumps({"window_id": window_id, "nonce": nonce}).encode())
+
+
+def test_two_windows_keep_their_own_secret(tmp_path, monkeypatch) -> None:
+    port, ledger, plant_dir = _front(tmp_path, monkeypatch, escape="1", sealed=True, plaintext="1")
+    assert _plant(port, "win-a", NONCE)[0] == 200
+    first = plant_dir / "win-a" / "nonce"
+    before = (first.read_bytes(), first.stat().st_mtime_ns)
+    other = "another-control-plane-nonce"
+    assert _plant(port, "win-b", other)[0] == 200
+    assert (first.read_bytes(), first.stat().st_mtime_ns) == before
+    assert (plant_dir / "win-b" / "nonce").read_text() == other + "\n"
+    paths = [r["statement"]["path"] for r in ledger.chain if r["statement"].get("action") == rr.PLANT_ACTION]
+    assert paths == [str(first), str(plant_dir / "win-b" / "nonce")]
+
+
+def test_replant_touches_only_that_window(tmp_path, monkeypatch) -> None:
+    port, _ledger, plant_dir = _front(tmp_path, monkeypatch, escape="1", sealed=True, plaintext="1")
+    _plant(port, "win-a", NONCE)
+    _plant(port, "win-b", "second-control-plane-nonce")
+    a, b = plant_dir / "win-a" / "nonce", plant_dir / "win-b" / "nonce"
+    a_before = (a.read_bytes(), a.stat().st_mtime_ns)
+    assert _plant(port, "win-b", "third-control-plane-nonce")[0] == 200
+    assert b.read_text() == "third-control-plane-nonce\n"
+    assert (a.read_bytes(), a.stat().st_mtime_ns) == a_before
+
+
+@pytest.mark.parametrize("bad", [".", "..", ".hidden", "..x"])
+def test_dot_window_ids_are_refused(tmp_path, monkeypatch, bad) -> None:
+    port, ledger, plant_dir = _front(tmp_path, monkeypatch, escape="1", sealed=True, plaintext="1")
+    status, _h, _out = _plant(port, bad, NONCE)
+    assert status == 400
+    assert ledger.chain == []
+    assert not plant_dir.exists()
+    assert sorted(p.name for p in tmp_path.rglob("nonce")) == []
+
+
+def test_prune_removes_old_windows_and_ignores_symlinks(tmp_path, monkeypatch) -> None:
+    port, _ledger, plant_dir = _front(tmp_path, monkeypatch, escape="1", sealed=True, plaintext="1")
+    _plant(port, "old-win", NONCE)
+    _plant(port, "fresh-win", "fresh-control-plane-nonce")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep").write_text("x")
+    link = plant_dir / "link-win"
+    link.symlink_to(outside)
+    (plant_dir / ".hidden").mkdir()
+    old = time.time() - 26 * 3600
+    for p in (plant_dir / "old-win", link, plant_dir / ".hidden"):
+        os.utime(p, (old, old), follow_symlinks=False)
+    assert _plant(port, "new-win", "new-control-plane-nonce")[0] == 200
+    assert not (plant_dir / "old-win").exists()
+    assert (plant_dir / "fresh-win" / "nonce").exists()
+    assert link.is_symlink() and (outside / "keep").exists()
+    assert (plant_dir / ".hidden").exists()
+
+
+def test_symlinked_window_dir_is_refused(tmp_path, monkeypatch) -> None:
+    port, _ledger, plant_dir = _front(tmp_path, monkeypatch, escape="1", sealed=True, plaintext="1")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    plant_dir.mkdir()
+    (plant_dir / "win-x").symlink_to(outside)
+    assert _plant(port, "win-x", NONCE)[0] == 500
+    assert list(outside.iterdir()) == []
+
+
+def test_symlinked_base_leaves_target_untouched(tmp_path, monkeypatch) -> None:
+    """A symlinked ROOM_ESCAPE_NONCE_DIR must not prune (or write) through to its target."""
+    port, ledger, plant_dir = _front(tmp_path, monkeypatch, escape="1", sealed=True, plaintext="1")
+    outside = tmp_path / "outside-escape"
+    outside.mkdir()
+    old = outside / "old-win"
+    old.mkdir()
+    sentinel = old / "sentinel"
+    sentinel.write_text("keep-me")
+    aged = time.time() - 26 * 3600
+    os.utime(old, (aged, aged))
+    plant_dir.symlink_to(outside)
+    assert _plant(port, "new-win", NONCE)[0] == 500
+    assert sentinel.read_text() == "keep-me"
+    assert old.is_dir()
+    assert not (outside / "new-win").exists()
+    assert ledger.chain == []
+    # prune alone must also refuse a linked base
+    rr.prune_escape_windows(str(plant_dir), "new-win")
+    assert sentinel.read_text() == "keep-me"
