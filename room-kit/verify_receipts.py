@@ -92,6 +92,14 @@ caller expects, in eight checks. The AMD certificates come from the file (amd_ce
      reported as receipt_only; the end marker put carries the hash of no bytes.
   8. the request in the file equals the recipe (image, command, env, cwd, user, size, timeout, network, outputs,
      input paths and hashes, context) and holds no key that is not a request field.
+The recipe (cathedral_oneshot_recipe_v1) is strict: a member the checker does not know, at any level, is
+refused. request must hold image, command, env, size, timeout_seconds, network, outputs, inputs and
+max_spend_usd (env and inputs may be empty); cwd, user and image_id are optional, and must agree between the
+recipe and the file (absent on both is fine, absent on one is a difference). create holds ttl_seconds and,
+optionally, broker_guest. size must be a sealed size; it fixes the create's resources (the table is the one in
+broker/oneshot_create_keys.json). An output's optional is a JSON boolean and false when absent. The network is
+a mode name (deny_all, internet, allowlist) or an object {mode, allow}; it is compared as the machine API
+canonicalises it (names lower case, merged, sorted). The context is checked through its signed put (check 5).
 The output adds "run": the outputs, the exit code (proven only when exec_response_b64 hashes to the signed
 result; otherwise "not proven", and the verdict does not change), what the file proves, and what it does not.
 
@@ -118,6 +126,7 @@ import argparse
 import base64
 import hashlib
 import http.client
+import ipaddress
 import itertools
 import json
 import os
@@ -152,11 +161,22 @@ ONESHOT_RECIPE_SCHEMA = "cathedral_oneshot_recipe_v1"
 # a test fails when the two differ.
 ONESHOT_CREATE_KEYS = ("image", "resources", "network", "ttl_seconds", "labels")
 ONESHOT_LABEL_KEYS = ("cathedral_sandbox_id", "cathedral_serial", "broker_guest", "broker_batch")
+# The sealed sizes and the resources the broker sends the machine for each (broker/oneshot_create_keys.json).
+ONESHOT_SIZES = {
+    "sealed-1x2": {"vcpu": 1, "memory_gib": 2, "disk_gib": 10},
+    "sealed-2x4": {"vcpu": 2, "memory_gib": 4, "disk_gib": 10},
+    "sealed-4x8": {"vcpu": 4, "memory_gib": 8, "disk_gib": 10},
+    "sealed-8x16": {"vcpu": 8, "memory_gib": 16, "disk_gib": 10},
+}
 ROOM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 FILE_MODE_RE = re.compile(r"^[0-7]{3,4}$")
 CONTEXT_PATH = "/work/in/.context.json"
 END_MARKER_PATH = "/work/.cathedral-end"
+# Spec G4 5.1: these must be present, with the right type, in the recipe and in the file's request. The others
+# (cwd, user, image_id) may be absent in both; absent in one only is a difference.
+REQUIRED_REQUEST_FIELDS = ("image", "command", "env", "size", "timeout_seconds", "network", "outputs", "inputs",
+                           "max_spend_usd")
 REQUEST_FIELDS = ("image", "image_id", "command", "env", "cwd", "user", "size", "timeout_seconds", "network",
                   "outputs", "inputs", "context", "max_spend_usd")
 RUN_PROVES = [
@@ -1022,32 +1042,133 @@ def same_json(a, b) -> bool:
     return a == b
 
 
-def recipe_network(value) -> tuple[object, dict]:
-    """The recipe's network as the broker writes it into the create, and the policy the machine signs for it.
+_NON_PUBLIC_V4 = tuple(ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+    "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4"))
+_HOST_LABEL_RE = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
 
-    Absent, null, "", {} and an object with no mode mean deny_all (broker nativeNetwork). A mode name stays the
-    text it is. An object with a mode stays as written. A form that maps to no policy is refused."""
-    default = {"mode": "deny_all", "allow": []}
-    if value is None or value == "":
-        return default, dict(default)
+
+def _allow_entry(entry) -> str:
+    """One allowlist entry in the machine API's canonical form (a copy of its rule; a test compares the two).
+
+    A hostname (lower case, no trailing dot), optional :80 or :443, a leading wildcard, an IPv4 address or an IPv4
+    CIDR in network form. IPv6, URLs, paths, other hostname ports and non-public ranges are refused."""
+    def bad():
+        raise Fail(f"recipe: network allow entry {entry!r} is not a valid allowlist entry")
+
+    if not (isinstance(entry, str) and 1 <= len(entry) <= 255):
+        bad()
+    value = entry.strip().lower().rstrip(".")
+    if not value:
+        bad()
+    port = None
+    if value.count(":") == 1 and not value.startswith("[") and "/" not in value:
+        host_part, port_part = value.rsplit(":", 1)
+        if port_part.isdigit():
+            port = int(port_part)
+            if not 1 <= port <= 65535:
+                bad()
+            try:
+                ipaddress.ip_address(host_part)
+            except ValueError:
+                if port not in (80, 443):
+                    bad()
+                value = host_part
+            else:
+                bad()
+    if "/" in value:
+        try:
+            net = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            bad()
+        if net.version != 4 or any(net.overlaps(n) for n in _NON_PUBLIC_V4):
+            bad()
+        return str(net)
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        addr = None
+    if addr is not None:
+        if addr.version != 4 or any(addr in n for n in _NON_PUBLIC_V4):
+            bad()
+        return str(addr)
+    if ":" in value or "[" in value:
+        bad()
+    name = value.removeprefix("*.")
+    labels = name.split(".")
+    if not (len(name) <= 253 and len(labels) >= 2 and all(_HOST_LABEL_RE.match(lb) for lb in labels)):
+        bad()
+    if labels[-1].isdigit():
+        bad()
+    return value if port is None else f"{value}:{port}"
+
+
+def _merge_allow_ports(entries) -> list[str]:
+    """Collapse host and host:port rows: a bare host means ports 80 and 443; the sorted, unique result."""
+    hosts: dict[str, set[int]] = {}
+    wilds: dict[str, set[int]] = {}
+    others: list[str] = []
+    for raw in entries:
+        e = _allow_entry(raw)
+        port = None
+        value = e
+        if e.count(":") == 1 and not e.startswith("[") and "/" not in e:
+            host_part, port_part = e.rsplit(":", 1)
+            if port_part.isdigit():
+                value, port = host_part, int(port_part)
+        try:
+            ipaddress.ip_network(value, strict=False) if "/" in value else ipaddress.ip_address(value)
+        except ValueError:
+            pass
+        else:
+            others.append(e)
+            continue
+        bucket = wilds if value.startswith("*.") else hosts
+        ports = bucket.setdefault(value.removeprefix("*."), set())
+        if port is None:
+            ports.update((80, 443))
+        else:
+            ports.add(port)
+    out = list(others)
+    for name, ports in hosts.items():
+        out.extend([name] if ports >= {80, 443} else [f"{name}:{p}" for p in sorted(ports)])
+    for name, ports in wilds.items():
+        out.extend([f"*.{name}"] if ports >= {80, 443} else [f"*.{name}:{p}" for p in sorted(ports)])
+    return sorted(set(out))
+
+
+def canonical_policy(mode: str, allow) -> dict:
+    """The policy document the machine API signs: the mode name and, for an allowlist only, the canonical names."""
+    mode = {"public": "internet"}.get(mode, mode)
+    return {"mode": mode, "allow": _merge_allow_ports(allow) if mode == "allowlist" else []}
+
+
+def network_policy(value, default_ok: bool = False) -> dict:
+    """The canonical policy of a network setting (the recipe's, or the one in the create bytes).
+
+    default_ok lets absent-like values mean deny_all, as the broker reads a create (nativeNetwork). A mode name,
+    or an object with a mode and names, is mapped; a form that maps to no policy is refused."""
+    if default_ok and (value is None or value == ""):
+        return canonical_policy("deny_all", [])
     if isinstance(value, str):
         need(value in NETWORK_MODES, f"recipe: network mode {value} is not deny_all, internet or allowlist")
-        return value, {"mode": value, "allow": []}
-    need(isinstance(value, dict), "recipe: network is not an object or a mode name")
-    for key in value:
-        need(key in ("mode", "allow"), f"recipe: unknown member {key}")
-    allow = value.get("allow")
-    need(allow is None or (isinstance(allow, list) and all(isinstance(n, str) for n in allow)),
-         "recipe: network allow is not a list of names")
-    mode = value.get("mode")
-    if mode is None or mode == "":
-        body = dict(value)
-        body["mode"] = "deny_all"
-        body["allow"] = [] if allow is None else allow
-        return body, {"mode": "deny_all", "allow": body["allow"]}
-    need(isinstance(mode, str) and mode in NETWORK_MODES,
-         f"recipe: network mode {mode} is not deny_all, internet or allowlist")
-    return value, {"mode": mode, "allow": [] if allow is None else allow}
+        mode, allow = value, []
+    else:
+        need(isinstance(value, dict), "recipe: network is not an object or a mode name")
+        for key in value:
+            need(key in ("mode", "allow"), f"recipe: unknown member {key}")
+        allow = value.get("allow")
+        need(allow is None or (isinstance(allow, list) and all(isinstance(n, str) for n in allow)),
+             "recipe: network allow is not a list of names")
+        allow = [] if allow is None else allow
+        mode = value.get("mode")
+        if mode is None or mode == "":
+            mode = "deny_all"
+        need(isinstance(mode, str) and mode in NETWORK_MODES,
+             f"recipe: network mode {mode} is not deny_all, internet or allowlist")
+    if mode == "allowlist":
+        need(bool(allow), "recipe: an allowlist network needs at least one name")
+    return canonical_policy(mode, allow)
 
 
 def _members(doc: dict, allowed: tuple[str, ...]) -> None:
@@ -1069,11 +1190,10 @@ def load_recipe(doc) -> dict:
     need(isinstance(req, dict) and isinstance(create, dict), "recipe: request and create must be objects")
     _members(req, ("image", "image_id", "command", "env", "cwd", "user", "size", "timeout_seconds", "network",
                    "outputs", "inputs", "max_spend_usd"))
-    _members(create, ("resources", "ttl_seconds", "broker_guest"))
-    for key in ("image", "command", "env", "size", "timeout_seconds", "outputs", "inputs"):
+    _members(create, ("ttl_seconds", "broker_guest"))
+    for key in REQUIRED_REQUEST_FIELDS:
         need(key in req, f"recipe: the request has no {key}")
-    for key in ("resources", "ttl_seconds"):
-        need(key in create, f"recipe: create has no {key}")
+    need("ttl_seconds" in create, "recipe: create has no ttl_seconds")
     is_text = isinstance
     _typed(req, "image", "a string", lambda v: is_text(v, str))
     _typed(req, "command", "a list of strings",
@@ -1085,14 +1205,12 @@ def load_recipe(doc) -> dict:
     for key in ("cwd", "user"):
         if key in req:
             _typed(req, key, "a string", lambda v: isinstance(v, str))
-    if "max_spend_usd" in req:
-        _typed(req, "max_spend_usd", "an integer", _is_int)
+    _typed(req, "max_spend_usd", "an integer", _is_int)
     if "image_id" in req:
         _typed(req, "image_id", "sha256: and 64 lower-case hex",
                lambda v: isinstance(v, str) and IMAGE_DIGEST_RE.fullmatch(v) is not None)
     _typed(req, "outputs", "a list", lambda v: isinstance(v, list))
     _typed(req, "inputs", "a list", lambda v: isinstance(v, list))
-    _typed(create, "resources", "an object", lambda v: isinstance(v, dict))
     _typed(create, "ttl_seconds", "an integer", _is_int)
     if "broker_guest" in create:
         _typed(create, "broker_guest", "a string", lambda v: isinstance(v, str))
@@ -1118,9 +1236,8 @@ def load_recipe(doc) -> dict:
     for mode in [i["mode"] for i in inputs] + [modes.get("context", "644"), modes.get("end_marker", "644")]:
         need(isinstance(mode, str) and FILE_MODE_RE.fullmatch(mode) is not None,
              "recipe: a file mode is not an octal string")
-    body, policy = recipe_network(req.get("network"))
-    return {"request": req, "create": create, "outputs": outputs, "inputs": inputs, "network_body": body,
-            "network_policy": policy, "context_mode": modes.get("context", "644"),
+    policy = network_policy(req["network"])
+    return {"request": req, "create": create, "outputs": outputs, "inputs": inputs, "network_policy": policy, "context_mode": modes.get("context", "644"),
             "end_mode": modes.get("end_marker", "644")}
 
 
@@ -1222,7 +1339,6 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     need(isinstance(digest, str) and IMAGE_DIGEST_RE.fullmatch(digest) is not None,
          "check 4: image_digest is not sha256: and 64 lower-case hex")
     need(not created.get("pool"), "check 4: the create is a pool create")
-    network = recipe["network_body"]
     need(same_json(created.get("network_policy"), recipe["network_policy"]),
          "check 4: the signed network rule is not the recipe's")
     need(created.get("cathedral_sandbox_id") == run_id,
@@ -1241,9 +1357,16 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     missing = [k for k in ONESHOT_CREATE_KEYS if k not in body]
     need(not missing, f"check 4: the create lacks the key {missing[0] if missing else ''}")
     need(same_json(body["image"], req["image"]), "check 4: the create's image is not the recipe's")
-    need(same_json(body["resources"], create["resources"]), "check 4: the create's resources are not the recipe's")
+    need(req["size"] in ONESHOT_SIZES, f"check 4: the size {req['size']} is not a sealed size")
+    need(same_json(body["resources"], ONESHOT_SIZES[req["size"]]),
+         "check 4: the create's resources are not those of the recipe's size")
     need(same_json(body["ttl_seconds"], create["ttl_seconds"]), "check 4: the create's ttl_seconds is not the recipe's")
-    need(same_json(body["network"], network), "check 4: the create's network is not the broker's form of the recipe's")
+    try:
+        in_bytes = network_policy(body["network"], default_ok=True)
+    except Fail:
+        in_bytes = None
+    need(same_json(in_bytes, recipe["network_policy"]),
+         "check 4: the create's network is not the broker's form of the recipe's")
     labels = body["labels"]
     need(isinstance(labels, dict), "check 4: the create's labels are not an object")
     extra, missing = sorted(set(labels) - set(ONESHOT_LABEL_KEYS)), [k for k in ONESHOT_LABEL_KEYS if k not in labels]
@@ -1358,12 +1481,12 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     wanted["outputs"] = recipe["outputs"]
     wanted["inputs"] = [{"path": i["path"], "mode": i["mode"], "sha256": caller["input_hashes"][i["path"]]}
                         for i in recipe["inputs"]]
-    wanted["context"] = caller["context"]
     got = {k: v for k, v in shown.items() if k not in ("inputs", "outputs")}
     got["outputs"] = entries(shown.get("outputs"), ("path", "max_bytes", "optional"), {"optional": False})
     got["inputs"] = entries(shown.get("inputs"), ("path", "mode", "sha256"), {"mode": "644"})
-    got.setdefault("context", {})
     for field in REQUEST_FIELDS:
+        if field == "context":
+            continue  # the context is checked through its signed put (check 5), not through this member
         need(same_json(got.get(field, MISSING), wanted.get(field, MISSING)),
              f"check 8: the request in the file differs from the recipe in {field}")
 

@@ -611,17 +611,20 @@ FILE_BYTES = {RUN_PATH: b"print('ok')\n", DATA_PATH: b"a,b\n1,2\n", UNICODE_PATH
 DEL = object()  # an override value that removes the field
 
 
+SIZES = json.loads((HERE.parents[2] / "broker" / "oneshot_create_keys.json").read_text())["sizes"]
+
+
 def base_recipe() -> dict:
     return {
         "schema": "cathedral_oneshot_recipe_v1",
         "request": {
             "image": IMAGE_REF, "command": ["python", RUN_PATH], "env": {"MODE": "check"}, "cwd": "/work",
-            "size": "small", "timeout_seconds": 60, "network": {"mode": "deny_all", "allow": []},
+            "size": "sealed-1x2", "timeout_seconds": 60, "network": {"mode": "deny_all", "allow": []},
             "image_id": IMAGE_ID, "max_spend_usd": 5,
             "outputs": [{"path": RESULT_PATH, "max_bytes": 1048576, "optional": False},
                         {"path": LOG_PATH, "max_bytes": 65536, "optional": True}],
             "inputs": [{"path": RUN_PATH, "mode": "755"}, {"path": DATA_PATH, "mode": "644"}]},
-        "create": {"resources": {"cpus": 1, "memory_mb": 512}, "ttl_seconds": 300, "broker_guest": "guest-1"},
+        "create": {"ttl_seconds": 300, "broker_guest": "guest-1"},
         "file_modes": {"context": "644", "end_marker": "644"}}
 
 
@@ -675,7 +678,7 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
     labels = {"cathedral_sandbox_id": RUN_ID, "cathedral_serial": "1",
               "broker_guest": cr.get("broker_guest", "guest-2"), "broker_batch": BATCH_ID}
     network_body, policy = broker_form(req.get("network"))
-    body = {"image": req["image"], "resources": cr["resources"], "network": network_body,
+    body = {"image": req["image"], "resources": SIZES.get(req["size"], SIZES["sealed-1x2"]), "network": network_body,
             "ttl_seconds": cr["ttl_seconds"], "labels": labels}
     if create_body:
         body = create_body(body)
@@ -823,12 +826,11 @@ def run_good_cases(pack: Pack) -> None:
              truth_context={}, no_context_arg=True)
 
     def no_network_no_guest(r):
-        r["request"].pop("network")
         r["create"].pop("broker_guest")
         r["request"].pop("image_id")
-    run_case(pack, "good", "run_network_left_out_no_image_id",
-             "A recipe with no network, no broker_guest and no image_id: the network is deny_all in the broker's "
-             "form, the signed image_digest is reported and not compared.",
+    run_case(pack, "good", "run_no_broker_guest_no_image_id",
+             "A recipe with no broker_guest and no image_id: any id-safe guest label is accepted, the signed "
+             "image_digest is reported and not compared.",
              {"pointers": {f"{run}/image/compared_with_recipe": False}}, truth_edit=no_network_no_guest)
     def net(value):
         return lambda r: r["request"].update(network=value)
@@ -1028,8 +1030,9 @@ def run_bad_cases(pack: Pack) -> None:
         create_body=lambda body: {k: v for k, v in body.items() if k != "ttl_seconds"})
     bad("run_c4_image", "The create's image is not the recipe's.", fail(4, "the create's image is not the recipe's"),
         create_body=lambda body: {**body, "image": "images.example.test/other@sha256:" + "33" * 32})
-    bad("run_c4_size", "The create's resources are not the recipe's.", fail(4, "the create's resources are not the recipe's"),
-        create_body=lambda body: {**body, "resources": {"cpus": 4, "memory_mb": 512}})
+    bad("run_c4_size", "The create's resources are not those of the recipe's size.",
+        fail(4, "the create's resources are not those of the recipe's size"),
+        create_body=lambda body: {**body, "resources": SIZES["sealed-4x8"]})
     bad("run_c4_ttl", "The create's ttl_seconds is not the recipe's.", fail(4, "the create's ttl_seconds is not the recipe's"),
         create_body=lambda body: {**body, "ttl_seconds": 600})
     bad("run_c4_network_in_bytes", "The create's network is not the broker's form of the recipe's.",
@@ -1132,9 +1135,6 @@ def run_bad_cases(pack: Pack) -> None:
     bad("run_c8_input_hash", "The request in the file names another hash for an input.",
         fail(8, "the request in the file differs from the recipe in inputs"),
         bundle_edit=lambda b: b["request"]["inputs"][0].update(sha256="55" * 32))
-    bad("run_c8_context", "The request in the file holds another context.",
-        fail(8, "the request in the file differs from the recipe in context"),
-        bundle_edit=lambda b: b["request"].update(context={"submission": "another"}))
     bad("run_c8_unknown_key", "The request holds a key that is not a request field.",
         fail(8, "the request holds a key that is not a request field: extra"),
         bundle_edit=lambda b: b["request"].update(extra=1))
@@ -1246,7 +1246,7 @@ def run_hardening_cases(pack: Pack) -> None:
         {"reason": "inputs: the one-shot file repeats the key 'oneshot_id'"}, bundle_raw=twice("oneshot_id", RUN_ID))
     bad("run_shape_file_repeats_a_nested_key", "The one-shot file repeats a key inside its request.",
         {"reason": "inputs: the one-shot file repeats the key 'size'"},
-        bundle_raw=lambda raw: raw.replace(b'  "size": "small",\n', b'  "size": "small",\n  "size": "small",\n', 1))
+        bundle_raw=lambda raw: raw.replace(b'  "size": "sealed-1x2",\n', b'  "size": "sealed-1x2",\n  "size": "sealed-1x2",\n', 1))
     bad("run_shape_recipe_repeats_a_key", "The recipe repeats a key.", {"reason": "inputs: the recipe repeats the key 'schema'"},
         recipe_raw=lambda raw: raw.replace(b' "schema": "cathedral_oneshot_recipe_v1"',
                                            b' "schema": "cathedral_oneshot_recipe_v1",\n "schema": '
@@ -1395,9 +1395,11 @@ def main() -> int:
         print(f"ok: {len(files)} files rebuilt byte for byte")
         return 0
     for path in sorted(on_disk_case_dirs()):
-        for f in path.rglob("*"):
+        for f in sorted(path.rglob("*"), reverse=True):
             if f.is_file():
                 f.unlink()
+            elif f.is_dir():
+                f.rmdir()  # an emptied case folder must not outlive its case
     for path, data in files.items():
         target = HERE / path
         target.parent.mkdir(parents=True, exist_ok=True)

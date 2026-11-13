@@ -2,10 +2,6 @@
  "create": {
   "broker_guest": "guest-1",
   "image_id": "sha256:aae1a0b67cd0da30a034563ef9ea0665cb1ccb289ee21e54edead462f531b112",
-  "resources": {
-   "cpus": 1,
-   "memory_mb": 512
-  },
   "ttl_seconds": 300
  },
  "file_modes": {
@@ -50,7 +46,7 @@
     "path": "/work/out/log.txt"
    }
   ],
-  "size": "small",
+  "size": "sealed-1x2",
   "timeout_seconds": 60
  },
  "schema": "cathedral_oneshot_recipe_v1"
