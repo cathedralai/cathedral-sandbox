@@ -33,7 +33,7 @@ Routes the broker and customers reach on a hotel. Status is what `SIGNED` in
 | POST | `/v1/sandboxes/{id}/sealed-env` | `sealed_env_set` | Signed on receipts front (AB#414), not in `SIGNED` table |
 | any | `/v1/sandboxes/{id}/env-sealed` | none | Refused at front (404); the front's own route to the room API (AB#414) |
 | POST | `/v1/images/build` | — | Owner-gated; not in `SIGNED` |
-| GET | `/v1/sandboxes`, `/v1/sandboxes/{id}`, logs, workspaces, … | — | Read-only broker paths; unsigned |
+| GET | `/v1/sandboxes`, `/v1/sandboxes/{id}`, logs, workspaces, … | none | Read-only broker paths; unsigned |
 | GET | `/v1/sandboxes/{id}/desktop`, `/v1/sandboxes/{id}/desktop/ws` | none | Refused by the broker (403 `desktop_disabled`, AB#121) |
 
 ## TTL reaper (follow-up)
