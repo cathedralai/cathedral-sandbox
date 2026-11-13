@@ -653,7 +653,7 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
              drop=(), create_body=None, exec_body=None, bundle_edit=None, args_edit=None, absent=(),
              held=(RESULT_PATH,), inline=(LOG_PATH,), held_bytes=None, caller_hashes=None, exec_response="proven",
              numbered=True, room=RUN_ROOM, no_context_arg=False, input_files=(), truth_context=None,
-             extra_files=None):
+             extra_files=None, bundle_raw=None, recipe_raw=None, context_raw=None):
     recipe = base_recipe()
     if truth_edit:
         truth_edit(recipe)
@@ -757,6 +757,9 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
             hashes[path] = given
     files["inputs.json"] = pretty(hashes)
     files.update(extra_files or {})
+    for name, edit in (("bundle.json", bundle_raw), ("recipe.json", recipe_raw), ("context.json", context_raw)):
+        if edit and name in files:
+            files[name] = edit(files[name])
     for path in held:
         name = path.rsplit("/", 1)[-1]
         data = (held_bytes or {}).get(path, outputs_bytes.get(path) if path in outputs_bytes else b"held\n")
@@ -1123,7 +1126,126 @@ def run_bad_cases(pack: Pack) -> None:
         bundle_edit=lambda b: b.pop("request"))
 
 
-CASE_SETS = [numbering_cases, serial_cases, pool_cases, run_good_cases, run_bad_cases]
+def run_hardening_cases(pack: Pack) -> None:
+    """Lists a caller's pin, the inline copies, the network form, the exact request and the file's shape."""
+    def bad(name, description, expect, **kw):
+        run_case(pack, "bad", name, description, expect, **kw)
+
+    def pin_in_request(r, digest=IMAGE_ID):
+        r["create"].pop("image_id", None)
+        r["request"]["image_id"] = digest
+
+    def drop_file_image_id(b):
+        b["request"].pop("image_id", None)
+
+    # ---- the image pin lives in the recipe's request, once
+    bad("run_c4_image_id_in_request_differs", "The image_id in the recipe's request is not the signed image_digest.",
+        fail(4, "the create's image_digest is not the recipe's image_id"),
+        recipe_edit=lambda r: pin_in_request(r, "sha256:" + "22" * 32), bundle_edit=drop_file_image_id)
+    bad("run_c8_image_id_missing_from_file", "The recipe pins the image, the file's request omits the pin.",
+        fail(8, "the request in the file differs from the recipe in image_id"),
+        recipe_edit=pin_in_request, bundle_edit=drop_file_image_id)
+    bad("run_recipe_image_id_in_create", "image_id is in the recipe's create, where it is not a member.",
+        {"reason": "recipe: unknown member image_id"},
+        recipe_edit=lambda r: r["create"].update(image_id=IMAGE_ID))
+    bad("run_recipe_unknown_member_top", "The recipe has a member at its top level that the checker does not know.",
+        {"reason": "recipe: unknown member extra"}, recipe_edit=lambda r: r.update(extra=1))
+    bad("run_recipe_unknown_member_request", "The recipe's request has a member the checker does not know.",
+        {"reason": "recipe: unknown member pin"}, recipe_edit=lambda r: r["request"].update(pin=1))
+    bad("run_recipe_unknown_member_create", "The recipe's create has a member the checker does not know.",
+        {"reason": "recipe: unknown member pool"}, recipe_edit=lambda r: r["create"].update(pool=True))
+    bad("run_recipe_unknown_member_file_modes", "The recipe's file_modes has a member the checker does not know.",
+        {"reason": "recipe: unknown member mode"}, recipe_edit=lambda r: r["file_modes"].update(mode="644"))
+    bad("run_recipe_unknown_member_output", "An output entry in the recipe has a member the checker does not know.",
+        {"reason": "recipe: unknown member required"},
+        recipe_edit=lambda r: r["request"]["outputs"][0].update(required=True))
+    bad("run_recipe_unknown_member_input", "An input entry in the recipe has a member the checker does not know.",
+        {"reason": "recipe: unknown member sha256"},
+        recipe_edit=lambda r: r["request"]["inputs"][0].update(sha256="x"))
+
+    # ---- every copy of an output in the file is checked
+    inline = "/work/out/"
+    bad("run_c7_inline_disagrees_with_held_file", "The caller holds the right file; the file's inline copy is other bytes.",
+        fail(7, f"the inline bytes of {RESULT_PATH} do not hash to the receipt's result_sha256"),
+        bundle_edit=lambda b: b["inline_outputs"].update({RESULT_PATH: b64(b"other\n")}))
+    bad("run_c7_inline_for_absent_output", "An inline copy for an optional output whose get answered 404.",
+        fail(7, f"the inline bytes of {LOG_PATH} are given, but the receipt says it was absent"), absent=(LOG_PATH,),
+        held=(RESULT_PATH,), inline=(), bundle_edit=lambda b: b["inline_outputs"].update({LOG_PATH: b64(b"done\n")}))
+    bad("run_c7_inline_for_undeclared_path", "An inline copy for a path the recipe does not declare.",
+        fail(7, f"inline_outputs names {inline}other.txt, which is not an output of the recipe"),
+        bundle_edit=lambda b: b["inline_outputs"].update({f"{inline}other.txt": b64(b"x")}))
+    bad("run_c7_inline_not_a_string", "An inline value that is a number.",
+        fail(7, f"the inline bytes of {LOG_PATH} are not a base64 string"),
+        bundle_edit=lambda b: b["inline_outputs"].update({LOG_PATH: 123}))
+    bad("run_c7_inline_not_an_object", "inline_outputs is a list.", fail(7, "inline_outputs is not an object"),
+        bundle_edit=lambda b: b.update(inline_outputs=[]))
+
+    # ---- the network: each form the request allows has one policy
+    def network_both(value):
+        def recipe(r):
+            r["request"]["network"] = value
+        return recipe, (lambda b: b["request"].update(network=value))
+    r_edit, b_edit = network_both("internet")
+    bad("run_c4_network_internet_in_recipe", "The recipe and the file say internet; the signed create is deny_all.",
+        fail(4, "the signed network rule is not the recipe's"), recipe_edit=r_edit, bundle_edit=b_edit)
+    r_edit, b_edit = network_both({"mode": "allowlist", "allow": ["example.org"]})
+    bad("run_c4_network_allowlist_in_recipe", "The recipe and the file name an allowlist; the signed create is deny_all.",
+        fail(4, "the signed network rule is not the recipe's"), recipe_edit=r_edit, bundle_edit=b_edit)
+    r_edit, b_edit = network_both(5)
+    bad("run_recipe_network_not_a_mode", "The recipe's network is a number.",
+        {"reason": "recipe: network is not an object or a mode name"}, recipe_edit=r_edit, bundle_edit=b_edit)
+    r_edit, b_edit = network_both("bogus")
+    bad("run_recipe_network_unknown_mode", "The recipe's network names a mode that is not deny_all, internet or allowlist.",
+        {"reason": "recipe: network mode bogus is not deny_all, internet or allowlist"}, recipe_edit=r_edit,
+        bundle_edit=b_edit)
+
+    # ---- check 8 compares the request as it is
+    bad("run_c8_input_list_holds_a_number", "The file's input list holds a number besides the inputs.",
+        fail(8, "the request in the file differs from the recipe in inputs"),
+        bundle_edit=lambda b: b["request"]["inputs"].append(7))
+    bad("run_c8_input_has_unknown_member", "An input entry in the file has a member besides path, mode and sha256.",
+        fail(8, "the request in the file differs from the recipe in inputs"),
+        bundle_edit=lambda b: b["request"]["inputs"][0].update(note="x"))
+    bad("run_c8_input_carries_content", "An input entry in the file carries content_b64.",
+        fail(8, "the request holds content_b64, which a file must not carry"),
+        bundle_edit=lambda b: b["request"]["inputs"][0].update(content_b64="eA=="))
+    bad("run_c8_output_list_holds_a_string", "The file's output list holds a string besides the outputs.",
+        fail(8, "the request in the file differs from the recipe in outputs"),
+        bundle_edit=lambda b: b["request"]["outputs"].append("x"))
+    bad("run_c8_optional_is_a_string", "An output's optional is the text false.",
+        fail(8, "the request in the file differs from the recipe in outputs"),
+        bundle_edit=lambda b: b["request"]["outputs"][1].update(optional="false"))
+    bad("run_c8_outputs_not_a_list", "The file's outputs is a number.",
+        fail(8, "the request in the file differs from the recipe in outputs"),
+        bundle_edit=lambda b: b["request"].update(outputs=123))
+    bad("run_c8_max_spend_differs", "The recipe's max_spend_usd is 1; the file says 5.",
+        fail(8, "the request in the file differs from the recipe in max_spend_usd"),
+        recipe_edit=lambda r: r["request"].update(max_spend_usd=1))
+
+    # ---- shape: repeated keys at any level, wrong types
+    def twice(key, value):
+        old = f' "{key}": "{value}",\n'.encode()
+        return lambda raw: raw.replace(old, old + old, 1)
+    bad("run_shape_file_repeats_a_key", "The one-shot file repeats a key at its top level.",
+        {"reason": "inputs: the one-shot file repeats the key 'oneshot_id'"}, bundle_raw=twice("oneshot_id", RUN_ID))
+    bad("run_shape_file_repeats_a_nested_key", "The one-shot file repeats a key inside its request.",
+        {"reason": "inputs: the one-shot file repeats the key 'size'"},
+        bundle_raw=lambda raw: raw.replace(b'  "size": "small",\n', b'  "size": "small",\n  "size": "small",\n', 1))
+    bad("run_shape_recipe_repeats_a_key", "The recipe repeats a key.", {"reason": "inputs: the recipe repeats the key 'schema'"},
+        recipe_raw=lambda raw: raw.replace(b' "schema": "cathedral_oneshot_recipe_v1"',
+                                           b' "schema": "cathedral_oneshot_recipe_v1",\n "schema": '
+                                           b'"cathedral_oneshot_recipe_v1"', 1))
+    bad("run_shape_context_repeats_a_key", "The context file repeats a key.",
+        {"reason": "inputs: the context file repeats the key 'a'"}, context_raw=lambda raw: b'{"a":1,"a":2}\n')
+    bad("run_shape_recipe_outputs_not_a_list", "The recipe's outputs is a number.",
+        {"reason": "recipe: outputs is not a list"}, recipe_edit=lambda r: r["request"].update(outputs=123))
+    bad("run_shape_file_receipts_not_a_list", "The file's receipts is a text.", fail(1, "the file holds no receipts"),
+        bundle_edit=lambda b: b.update(receipts="none"))
+    bad("run_shape_file_not_an_object", "The one-shot file is a JSON list.",
+        fail(1, "the file is not a cathedral_oneshot_bundle_v1"), bundle_raw=lambda raw: b"[]\n")
+
+
+CASE_SETS = [numbering_cases, serial_cases, pool_cases, run_good_cases, run_bad_cases, run_hardening_cases]
 
 
 def build(amd: dict[str, bytes]) -> dict[str, bytes]:
