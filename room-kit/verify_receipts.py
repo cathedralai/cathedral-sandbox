@@ -1173,7 +1173,8 @@ def network_policy(value, default_ok: bool = False) -> dict:
     return canonical_policy(mode, allow)
 
 
-IMAGE_PIN_RE = re.compile(r"^.+@sha256:[0-9a-f]{64}$", re.DOTALL)
+IMAGE_PIN_RE = re.compile(r".+@sha256:[0-9a-f]{64}")
+CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f]")
 COMMAND_MAX, ENV_MAX, INPUTS_MAX = 128, 64, 8
 OUTPUT_MAX_BYTES = 200 * 1024 * 1024
 CONTEXT_MAX_BYTES = 4 * 1024
@@ -1243,6 +1244,7 @@ def request_limits(req: dict, prefix: str) -> None:
     API's to enforce: none is invented here."""
     image, command, env = req.get("image"), req.get("command"), req.get("env")
     if isinstance(image, str):
+        need(CONTROL_CHARACTER_RE.search(image) is None, f"{prefix}image must hold no control character")
         need(len(image) <= IMAGE_MAX, f"{prefix}image must be at most {IMAGE_MAX} characters")
         need(IMAGE_PIN_RE.fullmatch(image) is not None, f"{prefix}image must end in @sha256: and 64 lower-case hex")
     if isinstance(command, list):
