@@ -14,8 +14,12 @@ KIT=$(cd "$(dirname "$0")/.." && pwd)
 ENV_FILE=$(readlink -f "${1:?usage: install-sealed.sh sealed.env}")
 # shellcheck disable=SC1090
 source "$ENV_FILE"
+# shellcheck disable=SC1091
+source "$KIT/sealed/guest-constants.sh"
 log() { echo "[sealed] $*"; }
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+# Same cap as launch-guest.sh and guest-boot.sh, checked before the image build.
+[[ "${SEALED_NAME:-}" =~ ^[a-z0-9][a-z0-9-]{0,58}$ ]] || { echo "SEALED_NAME must match ^[a-z0-9][a-z0-9-]{0,58}$ (59 bytes max)" >&2; exit 1; }
 UNIT=room-sealed-$SEALED_NAME.service
 SNP_MEASURE_VERSION=0.0.12
 
@@ -79,6 +83,7 @@ log "expected measurement $EXPECTED"
 
 # ---------------------------------------------------------------- 4. unit
 install -m 0755 "$KIT/sealed/host-net.sh" "$KIT/sealed/launch-guest.sh" -t "$SEALED_DIR/"
+install -m 0644 "$KIT/sealed/guest-constants.sh" -t "$SEALED_DIR/"
 # A rerun may pass the installed copy itself.
 [ "$ENV_FILE" -ef "$SEALED_DIR/sealed.env" ] || install -m 0600 "$ENV_FILE" "$SEALED_DIR/sealed.env"
 # The host link rules are set by ExecStartPre only; a host firewall reload

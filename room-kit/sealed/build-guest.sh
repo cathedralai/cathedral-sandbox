@@ -15,6 +15,8 @@ umask 022
 KIT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck disable=SC1090
 source "$(readlink -f "${1:?usage: build-guest.sh sealed.env}")"
+# shellcheck disable=SC1091
+source "$(dirname "$(readlink -f "$0")")/guest-constants.sh"
 log() { echo "[sealed-build] $*"; }
 
 # Miner hotel (SEALED_MINER=1, README "Miner hotel"): checked before the long
@@ -85,7 +87,8 @@ rm -rf "${R:?}/boot"/* "$R/var/cache/apt/archives"/*.deb "$R/var/lib/apt/lists"/
 
 # ---------------------------------------------------------------- 3. guest configuration
 ln -sfn usr/lib/systemd/systemd "$R/init"
-echo "room-$SEALED_NAME" > "$R/etc/hostname"
+# The hotel name is not in the image: guest-boot.sh sets the hostname from fw_cfg.
+echo "room-sealed" > "$R/etc/hostname"
 : > "$R/etc/machine-id"
 : > "$R/etc/fstab"
 rm -f "$R/etc/resolv.conf"
@@ -193,7 +196,7 @@ mkdir -p "$R/opt/room-kit/dist"
 install -m 0644 "$KIT/$CATHEDRAL_TARBALL" "$R/opt/room-kit/dist/"
 { cat "$KIT/KIT_COMMIT" 2>/dev/null || ( cd "$KIT" && git rev-parse HEAD 2>/dev/null ) || echo unknown; } > "$R/opt/room-kit/KIT_COMMIT"
 cat > "$R/opt/room-kit/room.env" <<EOF
-# Sealed hotel $SEALED_NAME: written by sealed/build-guest.sh, part of the measured initrd.
+# Sealed hotel: written by sealed/build-guest.sh, part of the measured initrd.
 ROOM_ID=room-sealed
 ROOM_HOSTNAME=room-sealed.local
 ROOM_ACME_EMAIL=
@@ -242,7 +245,7 @@ ROOM_ESCAPE=${SEALED_ROOM_ESCAPE:-0}
 ROOM_ESCAPE_ALLOW_PLAINTEXT=${SEALED_ROOM_ESCAPE_ALLOW_PLAINTEXT:-0}
 ROOM_SEALED_SECRETS=${SEALED_ROOM_SEALED_SECRETS:-0}
 ROOM_SEALED_EXEC=${SEALED_ROOM_SEALED_EXEC:-0}
-ROOM_HOTEL_NAME=$SEALED_NAME
+# ROOM_HOTEL_NAME is not set here: guest-boot.sh exports it from fw_cfg (opt/cathedral/hotel-name).
 EOF
 if [ "$MINER" = 1 ]; then
   cat >> "$R/opt/room-kit/room.env" <<EOF
@@ -283,21 +286,21 @@ rm -f "$R"/etc/ssh/ssh_host_*
 log "packing initrd"
 ( cd "$R" && find . -mindepth 1 \( -path './proc/*' -o -path './sys/*' -o -path './dev/*' \) -prune -o -print0 \
   | LC_ALL=C sort -z | cpio --null -o -H newc --reproducible --quiet ) | zstd -q -T0 -10 > "$OUT/initrd.cpio.zst"
-CMDLINE="console=ttyS0 loglevel=7 systemd.show_status=error panic=-1 rdinit=/init cathedral.hotel=$SEALED_NAME cathedral.debug=$DEBUG"
+CMDLINE="console=ttyS0 loglevel=7 systemd.show_status=error panic=-1 rdinit=/init cathedral.debug=$DEBUG"
 printf '%s' "$CMDLINE" > "$OUT/cmdline"
 install -m 0644 "$SEALED_OVMF" "$OUT/OVMF.amdsev.fd"
 
-python3 - "$OUT" "$SEALED_NAME" "$SEALED_VCPUS" "$SEALED_CPU_MODEL" "$KVER" "$DEBUG" "$BASE_ID" \
+python3 - "$OUT" "$SEALED_VCPUS" "$SEALED_CPU_MODEL" "$KVER" "$DEBUG" "$BASE_ID" \
   "$MINER" "${MINER_TLS_PORT:-}" "${MINER_SIGNERS:-}" "$DATA_WS" <<'EOF'
 import hashlib, json, os, sys
-out, name, vcpus, cpu, kver, debug, base, miner, tls_port, signers, data_ws = sys.argv[1:]
+out, vcpus, cpu, kver, debug, base, miner, tls_port, signers, data_ws = sys.argv[1:]
 def sha(p):
     h = hashlib.sha256()
     with open(os.path.join(out, p), "rb") as f:
         for b in iter(lambda: f.read(1 << 20), b""):
             h.update(b)
     return h.hexdigest()
-m = {"schema": "cathedral_sealed_hotel_guest_v1", "hotel": name, "vcpus": int(vcpus), "cpu_model": cpu,
+m = {"schema": "cathedral_sealed_hotel_guest_v1", "vcpus": int(vcpus), "cpu_model": cpu,
      "kernel_release": kver, "debug": debug == "1", "base_rootfs": base,
      "cmdline": open(os.path.join(out, "cmdline")).read(),
      "sha256": {p: sha(p) for p in ("OVMF.amdsev.fd", "vmlinuz", "initrd.cpio.zst", "cmdline")},
