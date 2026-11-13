@@ -83,6 +83,9 @@ type hotelConfig struct {
 	// TLSSPKISHA256 is derived from a miner hotel's verified SNP binding at
 	// join and persisted for safe reconnect after a broker restart.
 	TLSSPKISHA256 string `json:"tls_spki_sha256,omitempty"`
+	// DrainNotice: the miner's signed planned-maintenance notice, set by
+	// PATCH {"drain": true, "drain_notice": ...} (drain_notice.go).
+	DrainNotice *drainNoticeRecord `json:"drain_notice,omitempty"`
 }
 
 type guestConfig struct {
@@ -201,7 +204,7 @@ type hotel struct {
 	client    *http.Client
 	ctl       *http.Client // sync loop and hotel documents
 	tlsPinErr error        // non-nil: miner calls must not send the hotel key
-	cfgMu     sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.ReservedFor, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
+	cfgMu     sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.DrainNotice, cfg.ReservedFor, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
 	sem       chan struct{}
 
 	// Guarded by broker.mu.
