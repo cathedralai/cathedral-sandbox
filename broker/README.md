@@ -291,6 +291,33 @@ them, listed or not. Everything else answers 403 `terminals_disabled` and the
 message says why. The default is an empty list: no hotel. The broker refuses
 unknown config keys, so set the key only after the broker binary knows it.
 
+## Room desktop and streams
+
+One policy for every hotel in the pool, sealed or shared, operator or miner:
+
+| Path | Who gets it | What the broker answers |
+|------|-------------|-------------------------|
+| `exec`, `processes` | every hotel | passed to the hotel; a sealed hotel signs a receipt |
+| PTY: `/terminals` and below, incl. `/terminals/<tid>/ws` | operator hotels in `terminal_hotels` only (see Room terminals) | passed to the hotel; elsewhere 403 `terminals_disabled` |
+| Desktop: `/desktop` and below, incl. `/desktop/ws` | no hotel | 403 `desktop_disabled`, before the hotel or the room lookup |
+| `/access-tickets` | every hotel | passed to the hotel |
+| `/processes/<pid>/attach` | every hotel | passed to the hotel, which refuses it |
+
+- The broker forwards plain HTTP requests and never upgrades a WebSocket.
+  A ticketed WebSocket route (`/terminals/<tid>/ws`, `/desktop/ws`) that
+  reaches a hotel arrives as a plain GET. A ticket minted through
+  `/access-tickets` opens no stream through the broker.
+- The hotel's `/desktop` answer names the hotel's own address in `ws_url`.
+  The broker keeps it from guests for that reason too.
+- A desktop in a room runs over exec: the Desktop template starts
+  `desktop-up` with an exec, and a computer-use agent drives it with
+  receipted exec (cathedral-desktop). This gate does not close that path,
+  nor `/expose` and `/ports/<port>/http`, which reach any server the room
+  runs, a desktop web server included.
+- Opening the desktop routes needs WebSocket forwarding in the broker and an
+  allowlist of hotels whose kit runs the desktop through the runtime, like
+  `terminal_hotels`. Neither exists, so there is no config key.
+
 ## Room network policy
 
 A create takes `"network": {"mode": "internet" | "deny_all" | "allowlist", "allow": [...]}`.
