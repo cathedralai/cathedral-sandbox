@@ -2048,10 +2048,12 @@ class Ledger:
         self.broken: set[str] = set()
         # The flag of a serial create needs that nothing ran in the room before the create was signed. The
         # in-flight count sees a request still running; touched sees one that finished without a receipt (an
-        # unsigned write, or a request the API refused). creates_in_flight counts the creates forwarded and not
-        # yet signed; when it returns to zero touched is cleared, since an id touched while no create was
-        # pending cannot belong to a room whose create is still unsigned. overflow withholds every flag while
-        # touched is full.
+        # unsigned write, or a request the API refused): a non-read request for an id with no create receipt is
+        # recorded at enter and again at leave when a create is pending at that moment, so any request whose
+        # life overlapped the time between a create being sent and its receipt being signed is in it.
+        # creates_in_flight counts the creates forwarded and not yet signed; when it returns to zero touched is
+        # cleared, since a request that ended before any create was pending cannot have run in a room whose
+        # create was not yet sent. overflow withholds every flag while touched is full.
         self.creates_in_flight = 0
         self.touched: set[str] = set()
         self.overflow = False
@@ -2123,15 +2125,21 @@ class Ledger:
                     return None, (409, "room_serial_unsigned", "a serial room accepts signed requests and reads only")
             if token and room in self.busy:
                 return None, (409, "room_busy", "this room is running another request")
-            if self.creates_in_flight and kind not in ("read", "record_read") and room not in self.by_room:
-                if len(self.touched) >= TOUCHED_CAP:
-                    self.overflow = True
-                else:
-                    self.touched.add(room)
+            nonread = kind not in ("read", "record_read")
+            if nonread:
+                self._touch(room)
             if token:
                 self.busy.add(room)
             self.in_flight[room] = self.in_flight.get(room, 0) + 1
-            return Turn(room, token, len(self.by_room.get(room, [])), room in self.serial), None
+            return Turn(room, token, len(self.by_room.get(room, [])), room in self.serial, nonread), None
+
+    def _touch(self, room: str) -> None:
+        """Remember a non-read request for an id with no create receipt while a create is pending. Caller holds self.lock."""
+        if self.creates_in_flight and room not in self.by_room:
+            if len(self.touched) >= TOUCHED_CAP:
+                self.overflow = True
+            else:
+                self.touched.add(room)
 
     def begin_create(self) -> None:
         with self.lock:
@@ -2148,6 +2156,8 @@ class Ledger:
         """End a turn: break a serial room that lost an answer or left an action unsigned, free the token, lower the count."""
         with self.lock:
             room = turn.room
+            if turn.nonread:
+                self._touch(room)  # it may have run while a create was pending, though it entered before
             if turn.token and room in self.serial:
                 signed = len(self.by_room.get(room, [])) > turn.receipts_before
                 if turn.lost or (turn.called and not signed):
@@ -2281,10 +2291,12 @@ def route_kind(method: str, path: str) -> str:
 class Turn:
     """One authorized request between Ledger.enter and Ledger.leave."""
 
-    __slots__ = ("room", "token", "receipts_before", "serial", "called", "lost")
+    __slots__ = ("room", "token", "receipts_before", "serial", "nonread", "called", "lost")
 
-    def __init__(self, room: str, token: bool, receipts_before: int, serial: bool = False) -> None:
+    def __init__(self, room: str, token: bool, receipts_before: int, serial: bool = False,
+                 nonread: bool = False) -> None:
         self.room, self.token, self.receipts_before, self.serial = room, token, receipts_before, serial
+        self.nonread = nonread  # not a read: it may change the room
         self.called = False  # a request went to the API
         self.lost = False  # the API gave no answer
 
