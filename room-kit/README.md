@@ -202,14 +202,16 @@ table is empty and no end is signed for earlier rooms.
 ### Pre-made rooms
 
 A create whose labels carry `cathedral_pool` = `"1"` makes a pre-made room. It
-holds only `image` (a non-empty string), `resources` (an object), `network`
-(exactly `{"mode":"deny_all","allow":[]}`), `labels` (without
-`cathedral_sandbox_id` or `cathedral_serial`) and `ttl_seconds` (an integer),
-and carries no `Idempotency-Key`: otherwise 400 `pool_create_invalid`,
+holds exactly five keys, all present: `image` (a non-empty string),
+`resources` (a non-empty object), `network` (exactly
+`{"mode":"deny_all","allow":[]}`), `labels` (without `cathedral_sandbox_id` or
+`cathedral_serial`) and `ttl_seconds` (a positive integer, not a boolean), and
+carries no `Idempotency-Key`: otherwise 400 `pool_create_invalid`,
 `reserved_label_invalid` or `idempotency_key_refused`. Its create receipt carries
-`pool: true` when it is the room's receipt 1, nothing was in flight for it,
-the API's answer shows `deny_all` and an `expires_at` with an offset that falls
-within 48 hours.
+`pool: true` when it is the room's receipt 1, nothing was in flight for it, no
+request other than a read was forwarded for that id while the create was
+pending, the API's answer shows `deny_all`, and its `expires_at` has an offset
+and falls after now and no later than 48 hours and 60 seconds from now.
 
 An unclaimed room accepts delete, claim and reads of its record (GET of the
 room, `/wait`) only; every other route, the sealed handlers included, is
@@ -225,7 +227,7 @@ answers 200 with the receipt. Any other result signs the claim with its status,
 breaks the room (delete only) and answers 409 `pool_claim_failed`: one try per
 room. The same id claiming again gets the stored answer and receipt; another id
 gets 409 `pool_room_claimed`. A delete meanwhile gets 409 `room_busy`.
-Other refusals: 405 for a method but POST, 400 `claim_request_invalid`, 409
+Other refusals: 405 for any method but POST (checked before the gate), 400 `claim_request_invalid`, 409
 `pool_room_stale`, `pool_room_gone`, `room_not_pool`, `pool_room_used`,
 `pool_room_expiring`.
 

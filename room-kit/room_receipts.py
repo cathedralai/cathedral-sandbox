@@ -2649,6 +2649,9 @@ class Handler(BaseHTTPRequestHandler):
                 # The API behind accepts the internal key the front adds, so the
                 # front is the gate for every call it passes on.
                 return self.reply(401, b'{"error":"unauthorized"}')
+        if CLAIM_ROUTE.match(path) and self.command != "POST":
+            # Checked before the gate, so an unclaimed room answers a wrong method as every room does.
+            return self.reply(405, b'{"error":{"code":"method_not_allowed","message":"method not allowed"}}', {"Allow": "POST"})
         room = room_of(path)
         if room and self.authorized():
             # Callers without the key are not counted: they never hold a token, and the API refuses them.
@@ -2772,10 +2775,12 @@ class Handler(BaseHTTPRequestHandler):
             return ("idempotency_key_refused", "a pool room is made without an Idempotency-Key"), None
         if SANDBOX_LINK_LABEL in labels or not set(doc) <= POOL_CREATE_KEYS:
             return invalid, None
-        image, resources, ttl = doc.get("image"), doc.get("resources", {}), doc.get("ttl_seconds", 0)
-        if not isinstance(image, str) or not image or not isinstance(resources, dict) or type(ttl) is not int:
+        if not set(doc) == POOL_CREATE_KEYS:
             return invalid, None
-        if doc.get("network") != DENY_ALL:
+        image, resources, ttl = doc["image"], doc["resources"], doc["ttl_seconds"]
+        if not isinstance(image, str) or not image or not isinstance(resources, dict) or not resources:
+            return invalid, None
+        if type(ttl) is not int or ttl < 1 or doc["network"] != DENY_ALL:
             return invalid, None
         return None, {"pool": True}
 
