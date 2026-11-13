@@ -99,7 +99,7 @@ recipe and the file (absent on both is fine, absent on one is a difference). cre
 optionally, broker_guest. size must be a sealed size; it fixes the create's resources (the table is the one in
 broker/oneshot_create_keys.json). An output's optional is a JSON boolean and false when absent. The network is
 a mode name (deny_all, internet, allowlist) or an object {mode, allow}; it is compared as the machine API
-canonicalises it (names lower case, merged, sorted). The context is checked through its signed put (check 5).
+canonicalises it (names lower case, merged, sorted). The context is bound by its signed put (check 5); a context member in the file's request must equal it too.
 The output adds "run": the outputs, the exit code (proven only when exec_response_b64 hashes to the signed
 result; otherwise "not proven", and the verdict does not change), what the file proves, and what it does not.
 
@@ -1486,9 +1486,14 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     got["inputs"] = entries(shown.get("inputs"), ("path", "mode", "sha256"), {"mode": "644"})
     for field in REQUEST_FIELDS:
         if field == "context":
-            continue  # the context is checked through its signed put (check 5), not through this member
+            continue  # compared below, against the caller's expected context
         need(same_json(got.get(field, MISSING), wanted.get(field, MISSING)),
              f"check 8: the request in the file differs from the recipe in {field}")
+    # The signed context put (check 5) is the binding. A context member in the file's request, when there is one,
+    # is one more copy, so it must be the expected context too.
+    if "context" in shown:
+        need(same_json(shown["context"], caller["context"]),
+             "check 8: the file's request.context is not the expected context")
 
     # The exit code is proven only by an answer whose hash the exec receipt signed. It never changes the verdict.
     exit_code: dict = {"status": "not proven"}
@@ -1502,6 +1507,8 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
         if sha(answer) == exec_rc.get("result_sha256") and isinstance(doc, dict) and _is_int(doc.get("exit_code")):
             exit_code = {"status": "proven", "value": doc["exit_code"]}
 
+    context_check = ("the signed context file and the request in the file" if "context" in shown
+                     else "the signed context file only")
     numbering = room_numbering(receipts)
     if numbering["rooms"]:
         chain_out["room_numbering"] = numbering_words(numbering["rooms"])
@@ -1514,7 +1521,7 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     return {"attestation": attestation_out, "chain": chain_out, "policy_timeline": policy_timeline(receipts),
             "room_tunables": room_tunables(receipts), "room_links": room_links(receipts), "verdict": "PASS",
             "checked": RUN_CHECKED,
-            "run": {"oneshot_id": run_id, "room": room, "image": image, "outputs": outputs_out,
+            "run": {"oneshot_id": run_id, "room": room, "image": image, "context_check": context_check, "outputs": outputs_out,
                     "exit_code": exit_code, "proves": RUN_PROVES, "does_not_prove": does_not}}
 
 
