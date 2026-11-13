@@ -459,3 +459,16 @@ def test_receipts_of_a_pool_room_pass_the_rules_a_checker_applies(front) -> None
     assert s[1]["action"] == "claim" and s[1]["room_sequence"] == 2 and s[1]["pooled_from"] == receipts[0]["receipt_sha256"]
     assert not any("pool" in x for x in s[1:]) and not any("pooled_from" in x for x in s if x["action"] != "claim")
     assert [x["room_sequence"] for x in s] == [1, 2, 3]
+
+
+def test_the_sealed_env_handler_is_refused_on_an_unclaimed_room_and_reaches_the_handler_once_claimed(front) -> None:
+    room = pool_room(front)
+    seen = len(front.api.seen)
+    for method in ("POST", "GET"):
+        status, headers, out = front.call(method, f"/v1/sandboxes/{room}/sealed-env", b"{}" if method == "POST" else None)
+        assert status == 409 and code(out) == "pool_room_unclaimed" and "X-Room-Receipt" not in headers
+    assert len(front.api.seen) == seen
+    assert claim(front, room)[0] == 200
+    # Claimed: an ordinary room, so the request reaches the handler (this hotel has the feature off).
+    assert front.call("GET", f"/v1/sandboxes/{room}/sealed-env")[0] == 403
+    assert_idle(front.ledger)
