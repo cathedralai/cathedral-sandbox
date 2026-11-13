@@ -1,4 +1,10 @@
 {
   "keys": ["image", "resources", "network", "ttl_seconds", "labels"],
-  "label_keys": ["cathedral_sandbox_id", "cathedral_serial", "broker_guest", "broker_batch"]
+  "label_keys": ["cathedral_sandbox_id", "cathedral_serial", "broker_guest", "broker_batch"],
+  "sizes": {
+    "sealed-1x2": {"vcpu": 1, "memory_gib": 2, "disk_gib": 10},
+    "sealed-2x4": {"vcpu": 2, "memory_gib": 4, "disk_gib": 10},
+    "sealed-4x8": {"vcpu": 4, "memory_gib": 8, "disk_gib": 10},
+    "sealed-8x16": {"vcpu": 8, "memory_gib": 16, "disk_gib": 10}
+  }
 }

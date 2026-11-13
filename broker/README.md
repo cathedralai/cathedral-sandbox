@@ -294,7 +294,9 @@ the `X-Room-Receipt` of the same 202. With `count` above 1 the broker answers
 no key. The compat route ignores the header, and a broker without this feature
 ignores it too, so a missing key means "not supported". The keys a one-shot
 create may hold are listed in `oneshot_create_keys.json`, which a test checks
-against the broker's output.
+against the broker's output. The same file holds `sizes`: the `resources`
+object a one-shot create carries for each sealed size name, so the receipt
+checker and the caller read one table.
 
 ## Room terminals
 
