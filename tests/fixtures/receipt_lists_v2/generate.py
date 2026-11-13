@@ -1490,7 +1490,16 @@ def build_form_rules():
             ("big_600_levels", {"truth_context": {"a": _nest(600)}}, "inputs: context nests deeper than 32 levels"),
             ("big_in_the_files_request", {"truth_context": {"a": 1}, **_file_side(context={"a": _nest(600)})},
              "check 8: the file's request: context nests deeper than 32 levels")]),
+        ("image_control_character", _knobs(image=_IMG + "app" + _DIGEST), [
+            ("tab", _knobs(image=_IMG + "a\tpp" + _DIGEST), "recipe: image must hold no control character"),
+            ("newline_inside", _knobs(image=_IMG + "a\npp" + _DIGEST), "recipe: image must hold no control character"),
+            ("nul", _knobs(image=_IMG + "a\x00pp" + _DIGEST), "recipe: image must hold no control character"),
+            ("del", _knobs(image=_IMG + "a\x7fpp" + _DIGEST), "recipe: image must hold no control character")]),
         ("file_request_forms", {}, [
+            ("image_has_a_tab", _file_side(image=_IMG + "a\tpp" + _DIGEST),
+             "check 8: the file's request: image must hold no control character"),
+            ("image_has_a_nul", _file_side(image=_IMG + "a\x00pp" + _DIGEST),
+             "check 8: the file's request: image must hold no control character"),
             ("image_id_malformed", _file_side(image_id="sha256:ABC"),
              "check 8: the file's request: image_id must be sha256: and 64 lower-case hex"),
             ("timeout_is_a_boolean", _file_side(timeout_seconds=True),
