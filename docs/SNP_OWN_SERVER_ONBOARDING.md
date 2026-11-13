@@ -24,6 +24,8 @@ The verifier accepts AMD attestation report versions 3, 4 and 5 from the
 Milan, Genoa-family and Turin processor generations, through native
 `/dev/sev-guest`. Plain AMD SEV and vTPM attestation are not accepted. Details:
 [Supported hardware](AMD_SEV_SNP_FRIEND_TEST.md#supported-hardware).
+Which rented servers fit, what one slot costs on each, and which are proven:
+[SNP miner hardware list](SNP_MINER_HARDWARE.md).
 
 Plan for these facts the code enforces:
 
