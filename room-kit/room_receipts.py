@@ -43,6 +43,14 @@ Routes it adds:
                                    an exact retry answers unchanged with that receipt)
   GET /v1/sandboxes/<id>/sealed-secrets
                                    names, versions and envelope sha256 of that room's secrets
+  POST /v1/sandboxes/<id>/sealed-env
+                                   ROOM_SEALED_SECRETS=1 on a sealed guest only (AB#414): the
+                                   room's whole env overlay, sealed to the same sealed_secrets
+                                   key, merged under each later exec and process start's own env
+                                   (never echoed; the receipt signs the names and the envelope
+                                   sha256; an exact retry answers unchanged with that receipt)
+  GET /v1/sandboxes/<id>/sealed-env
+                                   names, version and envelope sha256 of that room's overlay
   POST /v1/sandboxes/<id>/sealed-exec
                                    ROOM_SEALED_EXEC=1 on a sealed guest only: one customer exec,
                                    sealed to the binding's sealed_exec key; the answer is sealed to
@@ -278,6 +286,38 @@ EXEC_ROUTE = re.compile(r"^/v1/sandboxes/(?P<id>[^/]+)/sealed-exec$")
 # Only this front calls it: a caller's request that names it in any spelling is refused.
 EXEC_API_TAIL = "exec-sealed"
 EXEC_API_ROUTE = re.compile(r"^/v1/sandboxes/[^/]+/exec-sealed$")  # the room API's own pattern
+
+# Customer-sealed env overlay (AB#414, docs/SEALED_SECRETS.md). The room's env after
+# create: one envelope holds the whole overlay ({"env": {name: value}}, {} clears it),
+# sealed to this boot's sealed_secrets key under its own HKDF info and AAD, so it is on
+# whenever sealed secrets are and the binding does not change. The front opens it and
+# puts it on the room API over loopback; every later exec and process start in the room
+# runs with it under its own env. The receipt signs the names and the envelope sha256,
+# never a digest of a value (values are often guessable), as for a sealed secret.
+ENV_SCHEMA = "cathedral_sealed_env_v1"
+ENV_ALGORITHM = PLANT_ALGORITHM
+ENV_HKDF_INFO = b"cathedral.sealed-env.v1"
+ENV_AAD_LABEL = b"cathedral.sealed-env.v1\n"
+ENV_ACTION = "sealed_env_set"
+ENV_HEADER = ("schema", "algorithm", "binding_sha256", "sandbox_id", "room_create_receipt_sha256", "version")
+ENV_FIELDS = frozenset(ENV_HEADER + SECRETS_ENVELOPE)
+# The rules of the room API (cathedral/sandbox_api.py env_overlay_problem); keep the two in step.
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+ENV_MAX_NAMES = 64
+ENV_MAX_BYTES_SET = 64 * 1024  # names and values, UTF-8
+ENV_RESERVED = ("PATH",)
+ENV_RESERVED_PREFIXES = ("LD_",)
+ENV_PLAINTEXT_MAX_BYTES = 6 * ENV_MAX_BYTES_SET + 1024  # the overlay as JSON, every byte escaped at worst
+ENV_MAX_BYTES = 4 * ENV_PLAINTEXT_MAX_BYTES // 3 + 4096  # one request: base64 of the envelope plus the header
+ENV_MAX_TRACKED = 65536  # rooms with an overlay on this boot
+ENV_APPLY_STRIPES = 64  # one write at a time per room; rooms share a stripe, never a wait past the timeout
+ENV_APPLY_TIMEOUT_SECONDS = 30  # the room API sets a dict in memory: a slow answer is a broken API
+ENV_ROUTE = re.compile(r"^/v1/sandboxes/(?P<id>[^/]+)/sealed-env$")
+# The room API's route for an overlay this front opened. Only this front calls it: a caller's
+# request that names it in any spelling is refused, as for exec-sealed.
+ENV_API_TAIL = "env-sealed"
+ENV_API_ROUTE = re.compile(r"^/v1/sandboxes/[^/]+/env-sealed$")
+INTERNAL_API_ROUTES = (EXEC_API_ROUTE, ENV_API_ROUTE)
 
 
 class PlantError(ValueError):
@@ -853,6 +893,130 @@ def _write_secret_file(dir_fd: int, name: str, value: bytes) -> None:
         raise
 
 
+# ---------------------------------------------------------------- sealed env overlay (AB#414)
+
+class EnvRefused(Exception):
+    """A sealed env write refused. The code is short and never names a value."""
+
+    def __init__(self, status: int, code: str):
+        super().__init__(code)
+        self.status, self.code = status, code
+
+
+def env_header(binding_sha256: str, sandbox_id: str, room_create_receipt_sha256: str, version: int) -> dict:
+    """The fields of an env envelope that its AAD authenticates (all but the three envelope values)."""
+    return {"schema": ENV_SCHEMA, "algorithm": ENV_ALGORITHM, "binding_sha256": binding_sha256,
+            "sandbox_id": sandbox_id, "room_create_receipt_sha256": room_create_receipt_sha256, "version": version}
+
+
+def env_aad(header: dict) -> bytes:
+    return ENV_AAD_LABEL + canonical(header)
+
+
+def seal_env(env: dict, recipient: X25519PublicKey, *, binding_sha256: str, sandbox_id: str,
+             room_create_receipt_sha256: str, version: int) -> dict:
+    """The customer's envelope (ctcli, tests): the whole overlay. The guest only opens."""
+    header = env_header(binding_sha256, sandbox_id, room_create_receipt_sha256, version)
+    return {**header, **_seal_envelope(canonical({"env": env}), recipient, ENV_HKDF_INFO, env_aad(header))}
+
+
+def open_env(doc: dict, private: X25519PrivateKey) -> bytes:
+    """Open an envelope of seal_env. Raises EnvRefused, which never names a value."""
+    header = {k: doc[k] for k in ENV_HEADER}
+    try:
+        return _open_envelope(doc, private, ENV_HKDF_INFO, env_aad(header),
+                              max_ciphertext=ENV_PLAINTEXT_MAX_BYTES + 16)
+    except PlantError:
+        raise EnvRefused(400, "sealed_env_does_not_open") from None
+
+
+def env_overlay_problem(env) -> str | None:
+    """None when *env* is an overlay the room API takes. The answer never names a value."""
+    if not isinstance(env, dict) or len(env) > ENV_MAX_NAMES:
+        return "shape"
+    size = 0
+    for name, value in env.items():
+        if not isinstance(name, str) or not ENV_NAME_RE.fullmatch(name):
+            return "name"
+        if name in ENV_RESERVED or name.startswith(ENV_RESERVED_PREFIXES):
+            return "reserved"
+        if not isinstance(value, str) or not _utf8(value) or "\0" in value:
+            # A lone surrogate escape parses as JSON and cannot be sent on; NUL cannot be in an env.
+            return "value"
+        size += len(name) + len(value.encode("utf-8"))
+    return "size" if size > ENV_MAX_BYTES_SET else None
+
+
+class AcceptedEnv:
+    """The overlay this boot put on one room incarnation: names and digests, never values."""
+
+    __slots__ = ("version", "envelope_sha256", "ephemeral_public_b64", "names", "receipt")
+
+    def __init__(self, version: int, envelope_sha256: str, ephemeral_public_b64: str, names: list[str],
+                 receipt: dict | None):
+        self.version, self.envelope_sha256, self.ephemeral_public_b64 = version, envelope_sha256, ephemeral_public_b64
+        self.names, self.receipt = names, receipt
+
+
+class SealedEnv:
+    """What this boot accepted for each room's env overlay. Memory only; the key is the sealed secrets key.
+
+    rooms maps a room id to (incarnation, AcceptedEnv). lock guards rooms. A
+    write holds its room's stripe for the whole check, apply, sign and record,
+    so two writes to one room never cross, and the clear of a room made again
+    (reconcile) never lands between a write's apply and its record.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.rooms: dict[str, tuple[str, AcceptedEnv]] = {}
+        self.stripes = [threading.Lock() for _ in range(ENV_APPLY_STRIPES)]
+        self.swept_at = float("-inf")
+
+    def stripe(self, room: str) -> threading.Lock:
+        return self.stripes[int(sha(room.encode())[:8], 16) % ENV_APPLY_STRIPES]
+
+    def held(self, room: str, incarnation: str) -> AcceptedEnv | None:
+        """The room's entry for *incarnation*, else None. Caller holds the lock."""
+        entry = self.rooms.get(room)
+        return entry[1] if entry is not None and entry[0] == incarnation else None
+
+    def forget(self, room: str) -> None:
+        """Caller holds the lock."""
+        self.rooms.pop(room, None)
+
+    def retire(self, room: str) -> None:
+        """A delete of the room passed this front; the room API dropped the overlay with the room."""
+        with self.lock:
+            self.forget(room)
+
+    def sweep(self, incarnation_of, room_present, now: float) -> None:
+        """Drop rooms that are gone (deleted, or reaped past this front). At most once a second. Caller holds the lock.
+
+        A room made again under the same id keeps its entry until reconcile
+        clears its overlay on the room API: dropping it here would leave the
+        old overlay in force with nothing to say so.
+        """
+        if now - self.swept_at < SECRETS_SWEEP_SECONDS:
+            return
+        self.swept_at = now
+        for room in list(self.rooms):
+            if incarnation_of(room) is None or not room_present(room):
+                self.forget(room)
+
+    def stale(self, incarnation_of) -> list[str]:
+        """Rooms whose overlay names an incarnation that is no longer the room's own."""
+        with self.lock:
+            return [room for room, (incarnation, _) in self.rooms.items() if incarnation_of(room) != incarnation]
+
+    def listing(self, room: str, incarnation: str | None) -> dict:
+        with self.lock:
+            entry = self.held(room, incarnation) if incarnation else None
+            if entry is None:
+                return {"version": None, "envelope_sha256": None, "names": []}
+            return {"version": entry.version, "envelope_sha256": entry.envelope_sha256, "names": list(entry.names)}
+
+
 # ---------------------------------------------------------------- sealed commands (AB#417)
 
 class ExecRefused(Exception):
@@ -1309,6 +1473,8 @@ class Ledger:
         # A secrets or sealed exec key means something only under an SNP report: level 1 drops both below.
         self.secrets = secrets
         self.sealed_exec = sealed_exec
+        # The env overlay (AB#414) opens with the secrets key: on with sealed secrets, off without.
+        self.sealed_env = SealedEnv() if secrets is not None else None
         # Raw Ed25519 owner key on a dedicated sealed machine, else None (no gate).
         self.owner_key: bytes | None = None
         if tsm_provider() == "sev_guest":
@@ -1319,6 +1485,7 @@ class Ledger:
         else:
             self.secrets = None
             self.sealed_exec = None
+            self.sealed_env = None
             self._init_hotel(hotel, store)
         # Runtime guest key. Not in the binding: adding it there would change
         # REPORT_DATA. Authenticated by an Ed25519 signature over the plant-key
@@ -1607,6 +1774,162 @@ class Ledger:
         finally:
             os.close(dir_fd)
         return answer("written"), receipt
+
+    def write_sealed_env(self, room: str, doc, apply) -> tuple[dict, dict | None]:
+        """POST /v1/sandboxes/<room>/sealed-env. Returns (answer, receipt); raises EnvRefused.
+
+        apply(env) puts the overlay on the room API and returns (status, error
+        code or None). Checked in this order: the fields, this boot's binding,
+        the room, the version and incarnation formats, the room's current
+        incarnation, the version against the last one accepted (the exact
+        request that set the current overlay answers again with no change and
+        its receipt), a fresh ephemeral key, then the envelope opens with this
+        boot's secrets key to an overlay the room API takes. Nothing is
+        recorded unless the room API took it, so a client retries the same
+        envelope after any failure; the overlay is replaced whole, so a retry
+        of one that did land changes nothing.
+        """
+        box, secrets = self.sealed_env, self.secrets
+        if box is None or secrets is None:
+            raise EnvRefused(403, "sealed_env_disabled")
+        if not isinstance(doc, dict) or set(doc) != ENV_FIELDS:
+            raise EnvRefused(400, "sealed_env_fields_invalid")
+        if not all(isinstance(doc[k], str) and doc[k].isascii() and _canonical_b64(doc[k]) is not None
+                   for k in SECRETS_ENVELOPE):
+            # Base64 written one way only: one envelope has one sha256 and one ephemeral key.
+            raise EnvRefused(400, "sealed_env_fields_invalid")
+        if doc["schema"] != ENV_SCHEMA or doc["algorithm"] != ENV_ALGORITHM:
+            raise EnvRefused(400, "sealed_env_algorithm_unsupported")
+        if doc["binding_sha256"] != self.binding_sha256:
+            raise EnvRefused(409, "sealed_env_wrong_binding")
+        if doc["sandbox_id"] != room or not SECRETS_ROOM_RE.fullmatch(room):
+            raise EnvRefused(400, "sealed_env_wrong_room")
+        version, incarnation = doc["version"], doc["room_create_receipt_sha256"]
+        if type(version) is not int or not 1 <= version <= SECRET_VERSION_MAX:
+            raise EnvRefused(400, "sealed_env_version_invalid")
+        if not isinstance(incarnation, str) or not KEY_SHA256_RE.fullmatch(incarnation):
+            raise EnvRefused(400, "sealed_env_incarnation_invalid")
+
+        def check_incarnation() -> None:
+            current = self.room_incarnation(room)
+            if current is None:
+                raise EnvRefused(404, "sealed_env_room_not_found")
+            if current != incarnation:
+                raise EnvRefused(409, "sealed_env_wrong_incarnation")
+
+        check_incarnation()
+        envelope_sha256 = sha(canonical(doc))
+
+        def answer(status: str, names: list[str]) -> dict:
+            return {"sandbox_id": room, "room_create_receipt_sha256": incarnation, "version": version,
+                    "envelope_sha256": envelope_sha256, "names": names, "status": status}
+
+        def applied(env: dict) -> None:
+            status, code = apply(env)
+            if 200 <= status < 300:
+                return
+            if status == 501 or (status == 404 and code == "route_not_found"):
+                # A room API from before AB#414 has no route: nothing was set.
+                raise EnvRefused(501, "sealed_env_unsupported")
+            if status == 404:
+                raise EnvRefused(404, "sealed_env_room_not_found")
+            if status == 409:
+                raise EnvRefused(409, "sealed_env_room_not_ready")
+            raise EnvRefused(502, "sealed_env_apply_failed")
+
+        with box.stripe(room):
+            with box.lock:
+                check_incarnation()
+                held = box.held(room, incarnation)
+                if held is not None:
+                    if (held.version, held.envelope_sha256) == (version, envelope_sha256):
+                        return answer("unchanged", list(held.names)), held.receipt
+                    if version <= held.version:
+                        raise EnvRefused(409, "sealed_env_replayed")
+                    if held.ephemeral_public_b64 == doc["ephemeral_public_b64"]:
+                        raise EnvRefused(400, "sealed_env_ephemeral_reused")
+                elif room not in box.rooms and len(box.rooms) >= ENV_MAX_TRACKED:
+                    box.sweep(self.room_incarnation, lambda r: _is_dir(os.path.join(secrets.root, r)),
+                              time.monotonic())
+                    if len(box.rooms) >= ENV_MAX_TRACKED:
+                        raise EnvRefused(503, "sealed_env_full")
+            opened = open_env(doc, secrets.private)
+            try:
+                request = json.loads(opened)
+            except (ValueError, RecursionError):
+                request = None
+            opened = None
+            env = request.get("env") if isinstance(request, dict) and set(request) == {"env"} else None
+            request = None
+            if env_overlay_problem(env) is not None:
+                raise EnvRefused(400, "sealed_env_request_invalid")
+            names = sorted(env)
+            try:
+                applied(env)
+            finally:
+                env = None
+            with box.lock:
+                refusal = None
+                try:
+                    check_incarnation()  # deleted or made again while the API set it
+                except EnvRefused as exc:
+                    refusal = exc
+                if refusal is None:
+                    # Signed under the lock, so an exact retry finds this write's receipt with its entry.
+                    try:
+                        receipt = self.sign({
+                            "action": ENV_ACTION,
+                            "target": f"POST /v1/sandboxes/{room}/sealed-env",
+                            "sandbox_id": room,
+                            "room_create_receipt_sha256": incarnation,
+                            "env_version": version,
+                            "env_names": names,
+                            "envelope_sha256": envelope_sha256,
+                            "status": 200,
+                        })
+                    except Exception:  # noqa: BLE001 the overlay is set: answer, and say the receipt is missing
+                        traceback.print_exc()
+                        receipt = None
+                    box.rooms[room] = (incarnation, AcceptedEnv(version, envelope_sha256,
+                                                                doc["ephemeral_public_b64"], names, receipt))
+            if refusal is not None:
+                # The overlay may now sit on a room made again under this id: take it off (still
+                # under the room's stripe, so no newer write to that room lands in between).
+                try:
+                    apply({})
+                except Exception:  # noqa: BLE001 the refusal is the answer either way
+                    traceback.print_exc()
+                raise refusal
+        return answer("set", names), receipt
+
+    def reconcile_sealed_env(self, apply_for) -> None:
+        """After a create: clear the overlay of each room whose incarnation moved under it.
+
+        A create answered again for the same Idempotency-Key signs a new
+        create receipt for a room the API kept, overlay and all. The front's
+        entry names the old incarnation, so it must not stay in force unseen.
+        apply_for(room) returns the apply of sealed-env for that room.
+        """
+        box = self.sealed_env
+        if box is None:
+            return
+        for room in box.stale(self.room_incarnation):
+            with box.stripe(room):
+                with box.lock:
+                    entry = box.rooms.get(room)
+                    current = self.room_incarnation(room)
+                    if entry is None or current == entry[0]:
+                        continue
+                    box.forget(room)
+                if current is None:
+                    continue  # deleted: the API dropped the overlay with the room
+                try:
+                    status, _code = apply_for(room)({})
+                except Exception:  # noqa: BLE001 log and go on: the next room still needs its clear
+                    traceback.print_exc()
+                    continue
+                if not 200 <= status < 300 and status != 404:
+                    print(f"room-receipts: sealed env clear of {room} answered {status}", file=sys.stderr, flush=True)
 
     def open_sealed_exec(self, room: str, doc, now: float | None = None) -> tuple[dict, dict]:
         """POST /v1/sandboxes/<room>/sealed-exec, up to the run. Returns (header, request); raises ExecRefused.
@@ -1969,11 +2292,16 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             # Opened here; only the plaintext exec goes on, inside the guest, to the room API.
             return self.handle_sealed_exec(ledger, m["id"], body)
+        m = ENV_ROUTE.match(path)
+        if m:
+            # Opened here; only the opened overlay goes on, inside the guest, to the room API.
+            return self.handle_sealed_env(ledger, m["id"], body)
         api_path = urlparse(self.path).path
-        if any(EXEC_API_ROUTE.match(p) for p in (api_path, unquote(api_path))):
+        if any(route.match(p) for route in INTERNAL_API_ROUTES for p in (api_path, unquote(api_path))):
             # The room API's sealed exec route runs an exec that leaves no history or log, and
-            # it is not a signed route here: no caller may reach it. Matched as the API matches
-            # it (urlparse drops a ";params" suffix, then the raw path), and decoded too; any
+            # its env-sealed route sets a room's env from an envelope this front opened; neither
+            # is a signed route here: no caller may reach them. Matched as the API matches
+            # them (urlparse drops a ";params" suffix, then the raw path), and decoded too; any
             # other path, flag on or off, passes as before.
             return self.reply(404, b'{"error":{"code":"route_not_found","message":"no such route"}}')
         action = next((a for meth, pat, a in SIGNED if meth == self.command and pat.match(path)), None)
@@ -2003,12 +2331,18 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:  # noqa: BLE001 the action ran: answer, and say the receipt is missing
                 traceback.print_exc()
                 extra["X-Room-Receipt-Error"] = type(exc).__name__
+            if action == "create" and 200 <= status < 300 and ledger.sealed_env is not None:
+                # A create answered again for a room the API kept moves its incarnation: an
+                # overlay set under the old one comes off before the room is used again.
+                ledger.reconcile_sealed_env(self.env_apply)
             deleted = re.match("^" + ROOM + "$", path) if action == "delete" and 200 <= status < 300 else None
             if deleted and ledger.secrets is not None:
                 # After the receipt, which ends the room's incarnation: no write lands from here on.
                 ledger.secrets.retire(deleted["id"])
             if deleted and ledger.sealed_exec is not None:
                 ledger.sealed_exec.retire(deleted["id"])
+            if deleted and ledger.sealed_env is not None:
+                ledger.sealed_env.retire(deleted["id"])
         ctype = next((v for k, v in headers if k.lower() == "content-type"), "application/json")
         passthrough = {k: v for k, v in headers if k.lower() not in HOP and k.lower() != "content-type"}
         return self.reply(status, out, {**passthrough, **extra}, ctype)
@@ -2130,6 +2464,57 @@ class Handler(BaseHTTPRequestHandler):
         extra = {}
         if receipt is not None:
             # written: this write's receipt. unchanged: the receipt of the write that put this envelope in place.
+            extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(receipt)).decode()
+        else:
+            extra["X-Room-Receipt-Error"] = "sign_failed"
+        return self.reply(200, canonical(out), extra)
+
+    def env_apply(self, room: str):
+        """The apply of a sealed env write: PUT the opened overlay on the room API over loopback.
+
+        Returns (status, error code or None). The API's answer is never passed to
+        the caller: its messages could name what it was sent.
+        """
+        def apply(env: dict) -> tuple[int, str | None]:
+            status, _headers, out = self.upstream(
+                self.server.api_port, canonical({"env": env}), method="PUT",
+                path=f"/v1/sandboxes/{room}/{ENV_API_TAIL}", extra={"Content-Type": "application/json"},
+                timeout=ENV_APPLY_TIMEOUT_SECONDS)
+            try:
+                code = json.loads(out)["error"]["code"]
+            except (ValueError, TypeError, KeyError, RecursionError):
+                code = None
+            return status, code if isinstance(code, str) else None
+        return apply
+
+    def handle_sealed_env(self, ledger: "Ledger", room: str, body: bytes | None):
+        """POST: set a room's env overlay from one customer-sealed envelope. GET: names and version. Never a value."""
+        if self.command not in ("GET", "POST"):
+            return self.reply(405, b'{"error":"method_not_allowed"}', {"Allow": "GET, POST"})
+        if not self.authorized():
+            return self.reply(401, b'{"error":"unauthorized"}')
+        if ledger.sealed_env is None:
+            return self.reply(403, b'{"error":{"code":"sealed_env_disabled","message":"this hotel does not accept a sealed env"}}')
+        if not SECRETS_ROOM_RE.fullmatch(room):
+            return self.reply(400, b'{"error":{"code":"sealed_env_wrong_room","message":"not a room id"}}')
+        if self.command == "GET":
+            incarnation = ledger.room_incarnation(room)
+            return self.reply(200, canonical({"sandbox_id": room, "binding_sha256": ledger.binding_sha256,
+                                              "room_create_receipt_sha256": incarnation,
+                                              **ledger.sealed_env.listing(room, incarnation)}))
+        if body is None or len(body) > ENV_MAX_BYTES:
+            return self.reply(413, b'{"error":{"code":"sealed_env_too_large","message":"the request is too large"}}')
+        try:
+            doc = json.loads(body)
+        except (ValueError, RecursionError):  # RecursionError: nesting past the parser's depth
+            doc = None
+        try:
+            out, receipt = ledger.write_sealed_env(room, doc, self.env_apply(room))
+        except EnvRefused as exc:
+            return self.reply(exc.status, canonical({"error": {"code": exc.code, "message": exc.code.replace("_", " ")}}))
+        extra = {}
+        if receipt is not None:
+            # set: this write's receipt. unchanged: the receipt of the write that set this overlay.
             extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(receipt)).decode()
         else:
             extra["X-Room-Receipt-Error"] = "sign_failed"

@@ -47,6 +47,7 @@ from cathedral.sandbox_api import (
     SandboxContractError,
     StatResult,
     StatusReport,
+    validated_env_overlay,
     TarGet,
 )
 from cathedral.sandbox_egress import EgressClient
@@ -360,6 +361,9 @@ class GuestRecord:
     tunables: dict[str, Any] | None = None
     # AB#709: argv the hotel started when start:image was used; None for sleep infinity.
     start_command: tuple[str, ...] | None = None
+    # AB#414: the room's env overlay, set after create only through a sealed envelope
+    # the receipts front opened. Merged under each exec's own env; never in a doc or log.
+    env_overlay: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 # A room's exec output, process log and the API's own log record are capped
@@ -2167,7 +2171,7 @@ class DockerGuestProvider:
                 guest.container_id,
                 wrapped,
                 cwd=cwd,
-                env={**dict(request.env)},
+                env={**guest.env_overlay, **dict(request.env)},
                 timeout_seconds=timeout_seconds + 15 if wrapped is not argv else timeout_seconds,
                 stdin=request.stdin,
                 user=request.user,
@@ -2264,6 +2268,26 @@ class DockerGuestProvider:
         guest.timeout_form = form
         return form
 
+    def set_env_overlay(self, sandbox_id: str, env: Mapping[str, str]) -> list[str]:
+        """Replace the room's env overlay (AB#414). Returns the names set, never a value.
+
+        Only the receipts front calls this, with an overlay it opened from a sealed
+        envelope, and only a hotel with sealed secrets has that front in place
+        (CATHEDRAL_SEALED_SECRETS_DIR); elsewhere the route would carry values in
+        the clear past the host, so it is refused. Each later exec and process
+        start gets it under its own env; running processes keep what they had.
+        """
+        if self._secrets_root is None:
+            raise SandboxOpError("env_overlay_not_supported", 501, "this hotel does not take a sealed env overlay")
+        overlay = validated_env_overlay(env)
+        with self._inner._lock:  # noqa: SLF001
+            self._inner._require_active(sandbox_id)  # noqa: SLF001
+            guest = self._guests.get(sandbox_id)
+            if guest is None:
+                raise SandboxOpError("sandbox_not_found", 404, f"sandbox {sandbox_id} not found")
+            guest.env_overlay = overlay
+        return sorted(overlay)
+
     def start_process(self, sandbox_id: str, request: ExecRequest) -> ProcessHandle:
         guest = self._guests.get(sandbox_id)
         if guest is None:
@@ -2278,7 +2302,7 @@ class DockerGuestProvider:
             guest.container_id,
             starter,
             cwd=request.cwd or "/work",
-            env={**dict(request.env)},
+            env={**guest.env_overlay, **dict(request.env)},
             timeout_seconds=30,
             stdin=None,
             detach=True,
