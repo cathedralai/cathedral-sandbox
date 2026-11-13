@@ -14,7 +14,7 @@
 #
 # Config (env, no secrets in the repo; keys are read at runtime from these paths):
 #   ROLL_HOME (default ~/.cathedral-roll)  plans, state, logs, evidence
-#   ROLL_HOTELS_CONF                       hotel table (default hotels.conf next to this script)
+#   ROLL_HOTELS_CONF                       hotel table (default hotels.conf next to this script, untracked; copy hotels.conf.example)
 #   ROLL_OPERATOR_KEY_FILE                 broker operator key
 #   ROLL_SSH_KEY                           ssh key for hotel and broker hosts
 #   ROLL_GUARD                             const guard script; last output line must say GREEN
@@ -57,6 +57,10 @@ opkey() { tr -d '\n\r' < "$OPKEY_FILE"; }
 valid_hotel() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]; }
 valid_commit() { [[ "$1" =~ ^[0-9a-f]{7,40}$ ]]; }
 valid_meas() { [[ "$1" =~ ^[0-9a-f]{96}$ ]]; }
+
+require_conf() {
+  [ -r "$HOTELS_CONF" ] || { echo "hotel table not found: $HOTELS_CONF. Copy ops/roll/hotels.conf.example to ops/roll/hotels.conf and fill in the real hosts, or set ROLL_HOTELS_CONF." >&2; exit 2; }
+}
 
 # hotels.conf lookup: sets HOST D FLAGS
 hotel_conf() {
@@ -523,9 +527,9 @@ cmd_status() {
 }
 
 case "${1:-}" in
-  stage) shift; cmd_stage "$@" ;;
+  stage) shift; require_conf; cmd_stage "$@" ;;
   pin-patch) shift; cmd_pin_patch "$@" ;;
-  apply) shift; cmd_apply "$@" ;;
+  apply) shift; require_conf; cmd_apply "$@" ;;
   status) cmd_status ;;
   *) usage ;;
 esac
