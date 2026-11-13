@@ -647,8 +647,10 @@ def broker_form(net):
         return net, {"mode": net, "allow": []}
     if not net.get("mode"):
         body = {**net, "mode": "deny_all", "allow": net.get("allow") or []}
-        return body, {"mode": "deny_all", "allow": body["allow"]}
-    return net, {"mode": net["mode"], "allow": net.get("allow") or []}
+        return body, {"mode": "deny_all", "allow": []}
+    # The machine signs the canonical policy: names lower case, unique, sorted; only an allowlist keeps any.
+    names = sorted({n.lower() for n in net.get("allow") or []}) if net["mode"] == "allowlist" else []
+    return net, {"mode": net["mode"], "allow": names}
 
 
 def step(role: str, action: str, target: str, status: int = 200, **fields) -> dict:
@@ -1259,7 +1261,49 @@ def run_hardening_cases(pack: Pack) -> None:
         fail(1, "the file is not a cathedral_oneshot_bundle_v1"), bundle_raw=lambda raw: b"[]\n")
 
 
-CASE_SETS = [numbering_cases, serial_cases, pool_cases, run_good_cases, run_bad_cases, run_hardening_cases]
+def run_second_review_cases(pack: Pack) -> None:
+    """The size fixes the resources, each required request field is required, names are compared canonically."""
+    def bad(name, description, expect, **kw):
+        run_case(pack, "bad", name, description, expect, **kw)
+
+    def good(name, description, expect, **kw):
+        run_case(pack, "good", name, description, expect, **kw)
+
+    # ---- size: the checker owns the table of sealed sizes
+    def both_sizes(value):
+        return (lambda r: r["request"].update(size=value)), (lambda b: b["request"].update(size=value))
+    r_edit, b_edit = both_sizes("this-is-not-a-size")
+    bad("run_c4_size_unknown", "A size that is not a sealed size, in the recipe and in the file.",
+        fail(4, "the size this-is-not-a-size is not a sealed size"), recipe_edit=r_edit, bundle_edit=b_edit)
+    r_edit, b_edit = both_sizes("sealed-2x4")
+    bad("run_c4_size_resources_of_another_size", "A known size whose signed resources are another size's.",
+        fail(4, "the create's resources are not those of the recipe's size"), recipe_edit=r_edit, bundle_edit=b_edit)
+    bad("run_recipe_create_resources_present", "The recipe carries resources: the size fixes them.",
+        {"reason": "recipe: unknown member resources"},
+        recipe_edit=lambda r: r["create"].update(resources={"vcpu": 1, "memory_gib": 2, "disk_gib": 10}))
+
+    # ---- every required request field is required, in the recipe and in the file
+    for field in ("image", "command", "env", "size", "timeout_seconds", "network", "outputs", "inputs",
+                  "max_spend_usd"):
+        bad(f"run_recipe_missing_{field}", f"The recipe's request and the file's request both lack {field}.",
+            {"reason": f"recipe: the request has no {field}"},
+            recipe_edit=lambda r, f=field: r["request"].pop(f), bundle_edit=lambda b, f=field: b["request"].pop(f))
+
+    # ---- the network is compared as the machine canonicalises it
+    names = {"mode": "allowlist", "allow": ["example.org", "Example.NET"]}
+    good("run_network_names_in_other_order_and_case", "An allowlist written with other order and case than the signed "
+         "policy: the same names.", {}, truth_edit=lambda r: r["request"].update(network=names))
+    good("run_network_create_bytes_in_another_order", "The create bytes list the same names in another order and case "
+         "than the recipe does.", {}, truth_edit=lambda r: r["request"].update(
+             network={"mode": "allowlist", "allow": ["example.org", "example.net"]}),
+         create_body=lambda body: {**body, "network": {"mode": "allowlist", "allow": ["EXAMPLE.net", "example.org"]}})
+    bad("run_c4_network_create_bytes_other_name", "The create bytes name another host than the recipe does.",
+        fail(4, "the create's network is not the broker's form of the recipe's"),
+        truth_edit=lambda r: r["request"].update(network={"mode": "allowlist", "allow": ["example.org"]}),
+        create_body=lambda body: {**body, "network": {"mode": "allowlist", "allow": ["other.net"]}})
+
+
+CASE_SETS = [numbering_cases, serial_cases, pool_cases, run_good_cases, run_bad_cases, run_hardening_cases, run_second_review_cases]
 
 
 def build(amd: dict[str, bytes]) -> dict[str, bytes]:
