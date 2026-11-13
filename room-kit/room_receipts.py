@@ -2089,25 +2089,36 @@ class Ledger:
 
     def sign(self, fields: dict) -> dict:
         with self.lock:
-            statement = {"schema": self.receipt_schema, "binding_sha256": self.binding_sha256, "hotel": self.hotel,
-                         "operation_id": str(uuid.uuid4()), "sequence": len(self.chain) + 1,
-                         "previous_receipt_sha256": self.head, "issued_at": int(time.time()), **fields}
-            receipt = {"statement": statement, "signature_b64": b64(self.key.sign(canonical(statement))),
-                       "receipt_sha256": sha(canonical(statement))}
-            self.head = receipt["receipt_sha256"]
-            self.chain.append(receipt)
-            room = statement.get("sandbox_id")
-            if room:
-                self.by_room.setdefault(room, []).append(len(self.chain) - 1)
-                status, action = statement.get("status"), statement.get("action")
-                if isinstance(status, int) and 200 <= status < 300:
-                    # The same rule as create_receipt(): the last successful create names the room.
-                    if action == "create":
-                        self.incarnations[room] = receipt["receipt_sha256"]
-                    elif action == "delete":
-                        self.incarnations.pop(room, None)
-            self.store.write(canonical(receipt) + b"\n")
-            return receipt
+            return self._sign_locked(fields)
+
+    def _sign_locked(self, fields: dict) -> dict:
+        """Sign and append one receipt. The caller holds self.lock."""
+        statement = {"schema": self.receipt_schema, "binding_sha256": self.binding_sha256, "hotel": self.hotel,
+                     "operation_id": str(uuid.uuid4()), "sequence": len(self.chain) + 1,
+                     "previous_receipt_sha256": self.head, "issued_at": int(time.time()), **fields}
+        named = fields.get("sandbox_id")
+        if isinstance(named, str) and named:
+            # A room's own count and link, taken after **fields so no statement field can set them. A
+            # list that holds every number from 1 shows that no receipt of that room is missing from it.
+            earlier = self.by_room.get(named, [])
+            statement["room_sequence"] = len(earlier) + 1
+            statement["room_previous_receipt_sha256"] = self.chain[earlier[-1]]["receipt_sha256"] if earlier else None
+        receipt = {"statement": statement, "signature_b64": b64(self.key.sign(canonical(statement))),
+                   "receipt_sha256": sha(canonical(statement))}
+        self.head = receipt["receipt_sha256"]
+        self.chain.append(receipt)
+        room = statement.get("sandbox_id")
+        if room:
+            self.by_room.setdefault(room, []).append(len(self.chain) - 1)
+            status, action = statement.get("status"), statement.get("action")
+            if isinstance(status, int) and 200 <= status < 300:
+                # The same rule as create_receipt(): the last successful create names the room.
+                if action == "create":
+                    self.incarnations[room] = receipt["receipt_sha256"]
+                elif action == "delete":
+                    self.incarnations.pop(room, None)
+        self.store.write(canonical(receipt) + b"\n")
+        return receipt
 
 
 # ---------------------------------------------------------------- proxy
@@ -2257,7 +2268,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(401, b'{"error":"unauthorized"}')
             with ledger.lock:
                 page = [ledger.chain[i] for i in ledger.by_room.get(m["id"], [])]
+            # count and room_head are read with the page, so a reader can hold the list against them.
             return self.reply(200, canonical({"sandbox_id": m["id"], "binding_sha256": ledger.binding_sha256,
+                                              "count": len(page),
+                                              "room_head": page[-1]["receipt_sha256"] if page else None,
                                               "receipts": page}))
         if path == "/room/health":
             # Served from the cache that health_loop fills. No upstream call,
@@ -2317,6 +2331,10 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 pass  # not JSON: the API answers
         refusal, owner_fields = self.owner_gate(ledger, body)
+        if refusal is None and action == "create" and self.asks_for_other_than_one_room(body):
+            # One create, one room, so each room's list holds its own create. Refused unsent and unsigned,
+            # as the surrogate refusal above is.
+            return self.reply(400, b'{"error":{"code":"create_count_refused","message":"a create makes one room"}}')
         if refusal is not None:
             status, headers, out = 403, [], refusal
         else:
@@ -2346,6 +2364,14 @@ class Handler(BaseHTTPRequestHandler):
         ctype = next((v for k, v in headers if k.lower() == "content-type"), "application/json")
         passthrough = {k: v for k, v in headers if k.lower() not in HOP and k.lower() != "content-type"}
         return self.reply(status, out, {**passthrough, **extra}, ctype)
+
+    @staticmethod
+    def asks_for_other_than_one_room(body: bytes | None) -> bool:
+        try:
+            doc = json.loads(body or b"")
+        except (ValueError, RecursionError):
+            return False  # not JSON: the API answers
+        return isinstance(doc, dict) and "count" in doc and not (type(doc["count"]) is int and doc["count"] == 1)
 
     def owner_gate(self, ledger: "Ledger", body: bytes | None) -> tuple[bytes | None, dict]:
         """Dedicated machine: (403 body, {}) for a gated request without a
