@@ -266,13 +266,16 @@ def finish(t: threading.Thread, box: dict, timeout: float = 20):
 
 
 def assert_idle(ledger) -> None:
-    """No request still counted and no token held: a turn never leaks."""
+    """No request still counted, no token held, no create pending and nothing touched: a turn never leaks."""
     deadline = time.time() + 5
     while time.time() < deadline:
         with ledger.lock:
-            if not getattr(ledger, "in_flight", {}) and not getattr(ledger, "busy", set()):
+            if (not getattr(ledger, "in_flight", {}) and not getattr(ledger, "busy", set())
+                    and not getattr(ledger, "touched", set()) and not getattr(ledger, "creates_in_flight", 0)):
                 return
         time.sleep(0.01)
     with ledger.lock:
         assert getattr(ledger, "in_flight", {}) == {}, "an in-flight count leaked"
         assert getattr(ledger, "busy", set()) == set(), "a token stayed held"
+        assert getattr(ledger, "touched", set()) == set(), "the touched set was not cleared"
+        assert getattr(ledger, "creates_in_flight", 0) == 0, "a create stayed counted"

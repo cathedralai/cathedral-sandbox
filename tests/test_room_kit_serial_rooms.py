@@ -409,3 +409,93 @@ def test_a_request_for_a_busy_serial_room_returns_at_once(front) -> None:
     held.release.set()
     finish(t, box)
     assert_idle(front.ledger)
+
+
+# ---------------------------------------------------------------- an unsigned write before the create is signed
+
+def _held_create(front: Front, ids: list[str]):
+    front.api.new_ids = list(ids)
+    hold = front.api.hold(r"POST /v1/sandboxes")
+    t, box = in_thread(front.create, SERIAL)
+    hold.wait_entered()
+    return hold, t, box
+
+
+def test_an_unsigned_write_that_completes_before_the_create_is_signed_withholds_the_flag(front) -> None:
+    hold, t, box = _held_create(front, ["sbx_t"])
+    assert front.call("PUT", "/v1/sandboxes/sbx_t/tar?path=/work", b"tar-bytes")[0] == 200  # no receipt, no longer in flight
+    with front.ledger.lock:
+        assert front.ledger.in_flight == {}
+    hold.release.set()
+    status, headers, _out = finish(t, box)
+    statement = receipt_of(headers)["statement"]
+    assert status == 200 and "serial" not in statement and statement["room_sequence"] == 1
+    assert "sbx_t" not in front.ledger.serial
+    assert_idle(front.ledger)
+
+
+def test_a_post_the_api_answers_404_before_the_create_is_signed_withholds_the_flag(front) -> None:
+    front.api.reply(r"POST /v1/sandboxes/sbx_t/exec", 404, {"error": {"code": "sandbox_not_found"}})
+    hold, t, box = _held_create(front, ["sbx_t"])
+    assert front.exec("sbx_t")[0] == 404
+    hold.release.set()
+    _status, headers, _out = finish(t, box)
+    assert "serial" not in receipt_of(headers)["statement"] and "sbx_t" not in front.ledger.serial
+    assert_idle(front.ledger)
+
+
+def test_a_read_of_the_new_id_before_the_create_is_signed_keeps_the_flag(front) -> None:
+    hold, t, box = _held_create(front, ["sbx_t"])
+    front.api.rooms.add("sbx_t")  # the API lists a new room before the front has signed its create
+    assert front.call("GET", "/v1/sandboxes/sbx_t")[0] == 200
+    assert front.call("GET", "/v1/sandboxes/sbx_t/logs")[0] == 200
+    hold.release.set()
+    _status, headers, _out = finish(t, box)
+    assert receipt_of(headers)["statement"]["serial"] is True and "sbx_t" in front.ledger.serial
+    assert front.delete("sbx_t")[0] == 200
+    assert_idle(front.ledger)
+
+
+def _wait_creates(front: Front, n: int) -> None:
+    deadline = time.time() + 10
+    while front.api.count(r"POST /v1/sandboxes") < n and time.time() < deadline:
+        time.sleep(0.01)
+    assert front.api.count(r"POST /v1/sandboxes") == n
+
+
+def test_overlapping_creates_keep_their_flags_when_an_unrelated_id_is_touched(front) -> None:
+    front.api.new_ids = ["sbx_a", "sbx_b"]
+    hold = front.api.hold(r"POST /v1/sandboxes")
+    a, abox = in_thread(front.create, SERIAL)
+    b, bbox = in_thread(front.create, SERIAL)
+    _wait_creates(front, 2)
+    assert front.exec("sbx_unrelated")[0] == 200
+    hold.release.set()
+    for t, box in ((a, abox), (b, bbox)):
+        assert receipt_of(finish(t, box)[1])["statement"]["serial"] is True
+    assert {"sbx_a", "sbx_b"} <= front.ledger.serial
+    assert_idle(front.ledger)
+
+
+def test_a_full_touched_set_withholds_every_flag_until_the_creates_end(front, monkeypatch) -> None:
+    from room_front_support import rr
+
+    monkeypatch.setattr(rr, "TOUCHED_CAP", 2)
+    front.api.new_ids = ["sbx_a", "sbx_b"]
+    hold = front.api.hold(r"POST /v1/sandboxes")
+    a, abox = in_thread(front.create, SERIAL)
+    b, bbox = in_thread(front.create, SERIAL)
+    _wait_creates(front, 2)
+    for unknown in ("u1", "u2", "u3"):
+        assert front.exec(unknown)[0] == 200
+    with front.ledger.lock:
+        assert len(front.ledger.touched) == 2 and front.ledger.overflow
+    hold.release.set()
+    for t, box in ((a, abox), (b, bbox)):
+        assert "serial" not in receipt_of(finish(t, box)[1])["statement"]
+    assert_idle(front.ledger)
+    with front.ledger.lock:
+        assert not front.ledger.overflow
+    front.api.new_ids = ["sbx_c"]
+    assert receipt_of(front.create(SERIAL)[1])["statement"]["serial"] is True
+    assert_idle(front.ledger)
