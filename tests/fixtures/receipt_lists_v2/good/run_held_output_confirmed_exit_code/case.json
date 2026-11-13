@@ -26,7 +26,7 @@
    "/room_links/run-room-1": "7d9c3a5e-1b2f-4c6d-8e0a-9f1b2c3d4e5f",
    "/run/does_not_show/6": "That the machine's disk was left unaltered by its host: the receipts do not show it either way.",
    "/run/does_not_show/7": "That the approved build is the same as the published source: the allowed measurements are your own list.",
-   "/run/exit_code/status": "proven",
+   "/run/exit_code/status": "confirmed",
    "/run/exit_code/value": 0,
    "/run/image/compared_with_recipe": true,
    "/run/oneshot_id": "7d9c3a5e-1b2f-4c6d-8e0a-9f1b2c3d4e5f",

@@ -509,6 +509,9 @@ def test_request_limits_accepts_a_context_at_32_levels_and_floats_nowhere() -> N
         vr.request_limits({**_valid_request(), "context": {"a": _nested(31)}}, prefix)
 
 
+DEPTH = 1_000_000  # far past the interpreter's own limit
+
+
 def test_a_deep_structure_never_reaches_a_recursion_error_in_run_mode(tmp_path: Path) -> None:
     folder = PACK / "good" / "run_held_output_confirmed_exit_code"
     case = json.loads((folder / "case.json").read_text())
@@ -517,7 +520,7 @@ def test_a_deep_structure_never_reaches_a_recursion_error_in_run_mode(tmp_path: 
 
         work = tmp_path / name
         shutil.copytree(folder, work)
-        (work / name).write_text("[" * 5000 + "]" * 5000)
+        (work / name).write_text("[" * DEPTH + "]" * DEPTH)
         code, out, err = _run_cli(*[a.replace("{dir}", str(work)) for a in case["args"]])
         assert "Traceback" not in err and code == 1, (name, err)
         assert json.loads(out)["reason"].endswith("nests too deeply to read"), (name, out)

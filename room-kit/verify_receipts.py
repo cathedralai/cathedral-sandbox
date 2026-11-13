@@ -100,8 +100,8 @@ optionally, broker_guest. size must be a sealed size; it fixes the create's reso
 broker/oneshot_create_keys.json). An output's optional is a JSON boolean and false when absent. The network is
 a mode name (deny_all, internet, allowlist) or an object {mode, allow}; it is compared as the machine API
 canonicalises it (names lower case, merged, sorted). The context is bound by its signed put (check 5); a context member in the file's request must equal it too.
-The output adds "run": the outputs, the exit code (proven only when exec_response_b64 hashes to the signed
-result; otherwise "not proven", and the verdict does not change), what the file proves, and what it does not.
+The output adds "run": the outputs, the exit code (confirmed only when exec_response_b64 hashes to the signed
+result; otherwise "not confirmed", and the verdict does not change), what the file shows, and what it does not.
 
 Not checked here (by design, today): that the measurement is an approved image.
 Image approval is a signed policy release; that is a later step.
@@ -179,7 +179,7 @@ REQUIRED_REQUEST_FIELDS = ("image", "command", "env", "size", "timeout_seconds",
                            "max_spend_usd")
 REQUEST_FIELDS = ("image", "image_id", "command", "env", "cwd", "user", "size", "timeout_seconds", "network",
                   "outputs", "inputs", "context", "max_spend_usd")
-RUN_PROVES = [
+RUN_SHOWS = [
     "A machine with this measurement started this image, with nothing added at create.",
     ("These input files and this context were written. This command ran with this environment on top of the "
      "image's own."),
@@ -187,7 +187,7 @@ RUN_PROVES = [
      "the end marker, no other request that can run something in the room, write to it or change its limit "
      "reached it through the machine's front."),
 ]
-RUN_DOES_NOT_PROVE = [
+RUN_DOES_NOT_SHOW = [
     "That a second run gives the same output.",
     "The exit code, unless the exec answer in the file hashes to the signed result (see exit_code).",
     "That the room is gone: the delete is clean-up.",
@@ -589,7 +589,7 @@ def room_tunables(receipts: list[dict]) -> dict:
     return out
 
 
-POOL_CLAIM_PROVES = (
+POOL_CLAIM_SHOWS = (
     "Nothing ran in this room before the claim except the machine's own main process, and no request reached it "
     "through the front. This rests on the rules of the measured front, so it holds only for the measurements you "
     "allowed.")
@@ -649,7 +649,7 @@ def _check_pool_rooms(receipts: list[dict]) -> dict[str, dict]:
                      f"{where}: cathedral_sandbox_id is not a lower-case UUID")
                 need(_is_int(st.get("lifetime_seconds")) and st["lifetime_seconds"] > 0,
                      f"{where}: lifetime_seconds is not a positive integer")
-                entry.update(state="claimed", proves=[POOL_CLAIM_PROVES], _link=linked)
+                entry.update(state="claimed", shows=[POOL_CLAIM_SHOWS], _link=linked)
             else:
                 entry["state"] = "closed"
         elif len(ordered) > 1:
@@ -690,14 +690,14 @@ def room_links(receipts: list[dict]) -> dict:
     return out
 
 
-ORDINARY_ROOM_PROVES = "No receipt of this room is missing from this list, between its first receipt and its last."
-ORDINARY_ROOM_DOES_NOT_PROVE = (
+ORDINARY_ROOM_SHOWS = "No receipt of this room is missing from this list, between its first receipt and its last."
+ORDINARY_ROOM_DOES_NOT_SHOW = (
     "That nothing was still running in the room when the list was read, or that no receipt was signed after it. "
     "There is no closed verdict for an ordinary room.")
-SERIAL_ROOM_PROVES = (
+SERIAL_ROOM_SHOWS = (
     "Every request on a signed route that named the room and reached it through the front before the last receipt "
     "was signed is in this list, in the order it ran, and none was still running.")
-SERIAL_ROOM_DOES_NOT_PROVE = [
+SERIAL_ROOM_DOES_NOT_SHOW = [
     ("Reads leave no receipt. A plain heartbeat sent just before the room was marked serial leaves none."),
     ("A bulk delete, the reaper and an API restart can remove the room without a receipt. A last action that is a "
      "successful exec, file put or file get shows the room was alive when it ran."),
@@ -857,9 +857,9 @@ def numbering_words(rooms: dict[str, dict]) -> dict:
     """What a numbered list shows, and what it does not, in the words the output carries."""
     serial = [e for e in rooms.values() if e.get("serial")]
     ordinary = [e for e in rooms.values() if not e.get("serial")]
-    proves = ([ORDINARY_ROOM_PROVES] if ordinary else []) + ([SERIAL_ROOM_PROVES] if serial else [])
-    does_not = ([ORDINARY_ROOM_DOES_NOT_PROVE] if ordinary else []) + (SERIAL_ROOM_DOES_NOT_PROVE if serial else [])
-    return {"rooms": rooms, "proves": proves, "does_not_prove": does_not}
+    shows = ([ORDINARY_ROOM_SHOWS] if ordinary else []) + ([SERIAL_ROOM_SHOWS] if serial else [])
+    does_not = ([ORDINARY_ROOM_DOES_NOT_SHOW] if ordinary else []) + (SERIAL_ROOM_DOES_NOT_SHOW if serial else [])
+    return {"rooms": rooms, "shows": shows, "does_not_show": does_not}
 
 
 
@@ -1010,7 +1010,9 @@ def strict_json(raw: bytes, prefix: str, what: str, plural: bool = False, floats
 
     try:
         return json.loads(raw, object_pairs_hook=pairs, parse_float=float if floats else refuse, parse_constant=refuse)
-    except (ValueError, RecursionError) as exc:
+    except RecursionError as exc:
+        raise Fail(f"{prefix}: {what} {'nest' if plural else 'nests'} too deeply to read") from exc
+    except ValueError as exc:
         raise Fail(f"{prefix}: {what} {'are' if plural else 'is'} not JSON") from exc
 
 
@@ -1096,7 +1098,7 @@ def _allow_entry(entry) -> str:
         bad()
     name = value.removeprefix("*.")
     labels = name.split(".")
-    if not (len(name) <= 253 and len(labels) >= 2 and all(_HOST_LABEL_RE.match(lb) for lb in labels)):
+    if not (len(name) <= 253 and len(labels) >= 2 and all(_HOST_LABEL_RE.fullmatch(lb) for lb in labels)):
         bad()
     if labels[-1].isdigit():
         bad()
@@ -1184,13 +1186,37 @@ MODE_RE = re.compile(r"[0-7]{3,4}")
 INPUT_PREFIX, OUTPUT_PREFIX = "/work/in/", "/work/out/"
 
 
+CONTEXT_MAX_DEPTH = 32
+
+
+def _depth(value) -> int:
+    """How many levels of objects and lists nest in value (a plain value is 0). Walks with a stack: a deep
+    document must be measured, not recursed into."""
+    deepest, stack = 0, [(value, 0)]
+    while stack:
+        node, level = stack.pop()
+        if isinstance(node, dict):
+            level += 1
+            deepest = max(deepest, level)
+            stack.extend((v, level) for v in node.values())
+        elif isinstance(node, list):
+            level += 1
+            deepest = max(deepest, level)
+            stack.extend((v, level) for v in node)
+    return deepest
+
+
 def _has_float(value) -> bool:
-    if isinstance(value, float):
-        return True
-    if isinstance(value, dict):
-        return any(_has_float(v) for v in value.values())
-    if isinstance(value, list):
-        return any(_has_float(v) for v in value)
+    """Whether a float is anywhere inside value (call only after the depth is bounded or with a stack)."""
+    stack = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, float):
+            return True
+        if isinstance(node, dict):
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
     return False
 
 
@@ -1207,7 +1233,7 @@ def _path_form(path: str, kind: str, prefix: str, prefix_error: str) -> None:
              f"{prefix_error}{noun} may hold only letters, digits, . _ and - in a segment")
 
 
-def request_limits(req: dict, prefix: str, from_file: bool = False) -> None:
+def request_limits(req: dict, prefix: str) -> None:
     """The rules spec G4 5.1 states for a one-shot request (and its Forms block), for the recipe and for the
     file's request alike.
 
@@ -1236,6 +1262,12 @@ def request_limits(req: dict, prefix: str, from_file: bool = False) -> None:
         need(len(user) <= USER_MAX, f"{prefix}user must be at most {USER_MAX} characters")
         need(USER_RE.fullmatch(user) is not None, f"{prefix}user must be digits only, or a name of letters, digits, "
                                                   "_ and - that starts with a letter or _ and may end in $")
+    for key in ("timeout_seconds", "max_spend_usd"):
+        if key in req:
+            need(_is_int(req[key]), f"{prefix}{key} must be an integer")
+    if "image_id" in req:
+        need(isinstance(req["image_id"], str) and IMAGE_DIGEST_RE.fullmatch(req["image_id"]) is not None,
+             f"{prefix}image_id must be sha256: and 64 lower-case hex")
     timeout = req.get("timeout_seconds")
     if _is_int(timeout):
         need(timeout >= 1, f"{prefix}timeout_seconds must be at least 1")
@@ -1255,9 +1287,8 @@ def request_limits(req: dict, prefix: str, from_file: bool = False) -> None:
             if "mode" in entry:
                 need(isinstance(entry["mode"], str) and MODE_RE.fullmatch(entry["mode"]) is not None,
                      f"{prefix}an input mode must be 3 or 4 octal digits")
-            digest = entry.get("sha256") if from_file else None
-            if digest is not None:
-                need(isinstance(digest, str) and HEX64.fullmatch(digest) is not None,
+            if "sha256" in entry:
+                need(isinstance(entry["sha256"], str) and HEX64.fullmatch(entry["sha256"]) is not None,
                      f"{prefix}an input sha256 must be 64 lower-case hex")
     if isinstance(outputs, list):
         seen = set()
@@ -1269,11 +1300,15 @@ def request_limits(req: dict, prefix: str, from_file: bool = False) -> None:
                 _path_form(path, "output", OUTPUT_PREFIX, prefix)
                 need(path not in seen, f"{prefix}an output path is given twice")
                 seen.add(path)
+            if "max_bytes" in entry:
+                need(_is_int(limit), f"{prefix}an output max_bytes must be an integer")
             if _is_int(limit):
                 need(limit >= 1, f"{prefix}an output max_bytes must be at least 1")
                 need(limit <= OUTPUT_MAX_BYTES, f"{prefix}an output max_bytes must be at most 200 MiB")
-    if from_file and _has_float(req.get("context")):
-        raise Fail(f"{prefix}context must hold no floating point number")
+    if "context" in req:
+        need(_depth(req["context"]) <= CONTEXT_MAX_DEPTH,
+             f"{prefix}context nests deeper than {CONTEXT_MAX_DEPTH} levels")
+        need(not _has_float(req["context"]), f"{prefix}context must hold no floating point number")
 
 
 def _members(doc: dict, allowed: tuple[str, ...]) -> None:
@@ -1311,12 +1346,18 @@ def load_recipe(doc) -> dict:
         if key in req:
             _typed(req, key, "a string", lambda v: isinstance(v, str))
     _typed(req, "max_spend_usd", "an integer", _is_int)
-    request_limits(req, "recipe: ")
     if "image_id" in req:
         _typed(req, "image_id", "sha256: and 64 lower-case hex",
                lambda v: isinstance(v, str) and IMAGE_DIGEST_RE.fullmatch(v) is not None)
     _typed(req, "outputs", "a list", lambda v: isinstance(v, list))
     _typed(req, "inputs", "a list", lambda v: isinstance(v, list))
+    for out in req["outputs"]:
+        need(isinstance(out, dict), "recipe: an output is not an object")
+        _members(out, ("path", "max_bytes", "optional"))
+    for inp in req["inputs"]:
+        need(isinstance(inp, dict), "recipe: an input is not an object")
+        _members(inp, ("path", "mode"))
+    request_limits(req, "recipe: ")
     _typed(create, "ttl_seconds", "an integer", _is_int)
     if "broker_guest" in create:
         _typed(create, "broker_guest", "a string", lambda v: isinstance(v, str))
@@ -1573,7 +1614,7 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     for entry in shown.get("inputs") if isinstance(shown.get("inputs"), list) else []:
         need(not (isinstance(entry, dict) and "content_b64" in entry),
              "check 8: the request holds content_b64, which a file must not carry")
-    request_limits(shown, "check 8: the file's request: ", from_file=True)
+    request_limits(shown, "check 8: the file's request: ")
 
     def entries(items, keys, defaults):
         """Entries as objects with exactly the allowed members, defaults filled; None for anything else."""
@@ -1604,8 +1645,8 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
         need(same_json(shown["context"], caller["context"]),
              "check 8: the file's request.context is not the expected context")
 
-    # The exit code is proven only by an answer whose hash the exec receipt signed. It never changes the verdict.
-    exit_code: dict = {"status": "not proven"}
+    # The exit code is confirmed only by an answer whose hash the exec receipt signed. It never changes the verdict.
+    exit_code: dict = {"status": "not confirmed"}
     raw = bundle.get("exec_response_b64")
     if isinstance(raw, str):
         try:
@@ -1614,7 +1655,7 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
         except ValueError:
             answer, doc = b"", None
         if sha(answer) == exec_rc.get("result_sha256") and isinstance(doc, dict) and _is_int(doc.get("exit_code")):
-            exit_code = {"status": "proven", "value": doc["exit_code"]}
+            exit_code = {"status": "confirmed", "value": doc["exit_code"]}
 
     context_check = ("the signed context file and the request in the file" if "context" in shown
                      else "the signed context file only")
@@ -1624,14 +1665,14 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     image = {"image_digest": digest, "compared_with_recipe": image_compared}
     if not image_compared:
         image["note"] = "The signed image_digest is the image's own id; the recipe gave no image_id, so it was not compared."
-    does_not = list(RUN_DOES_NOT_PROVE)
+    does_not = list(RUN_DOES_NOT_SHOW)
     if any(o["bytes"] == "receipt_only" for o in outputs_out):
         does_not.append("The length of an output whose bytes were not given to the checker (receipt only).")
     return {"attestation": attestation_out, "chain": chain_out, "policy_timeline": policy_timeline(receipts),
             "room_tunables": room_tunables(receipts), "room_links": room_links(receipts), "verdict": "PASS",
             "checked": RUN_CHECKED,
             "run": {"oneshot_id": run_id, "room": room, "image": image, "context_check": context_check, "outputs": outputs_out,
-                    "exit_code": exit_code, "proves": RUN_PROVES, "does_not_prove": does_not}}
+                    "exit_code": exit_code, "shows": RUN_SHOWS, "does_not_show": does_not}}
 
 
 def split_known(entry: str, known: list[str], flag: str, kind: str) -> tuple[str, str]:
@@ -1669,6 +1710,7 @@ def run_mode(a) -> int:
         recipe = load_recipe(strict_json(read_file(a.recipe, "the recipe"), "inputs", "the recipe"))
         context = {} if a.no_context else strict_json(read_file(a.context, "the context file"), "inputs",
                                                       "the context file")
+        need(_depth(context) <= CONTEXT_MAX_DEPTH, f"inputs: context nests deeper than {CONTEXT_MAX_DEPTH} levels")
         need(isinstance(context, dict), "inputs: the context is not a JSON object")
         need(len(canonical(context)) <= CONTEXT_MAX_BYTES,
              f"inputs: the context is larger than 4 KiB ({CONTEXT_MAX_BYTES} canonical bytes)")

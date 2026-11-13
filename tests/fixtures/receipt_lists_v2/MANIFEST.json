@@ -756,19 +756,19 @@
   "bad/run_form_cwd_length_empty/outputs/result.json": "e5f1eb4d806641698a35efe20e098efd20d7d57a9b90ee69079d5bb650920726",
   "bad/run_form_cwd_length_empty/recipe.json": "8e8ca061fd3911d97fc20ed7a6ea1963791498e833d39dc254b18b35f08c9090",
   "bad/run_form_deep_context_file/bundle.json": "d1460dde6c654fd4c23f9b00ef682b57251b7e475124544ae7c6bbff386d6039",
-  "bad/run_form_deep_context_file/case.json": "f989d455e70311c1d5d1e7e40270043fe6f996895f53f44fc475d5ef4cd5d39c",
+  "bad/run_form_deep_context_file/case.json": "71925e5f975f4b2addb125c00ed9de336023135d8ed5245d26ab4b3feb823a03",
   "bad/run_form_deep_context_file/context.json": "bb0fe1604ba08f14daa9daf72e5db17b282e6e357c43d7b85b56f2d68334fedb",
   "bad/run_form_deep_context_file/inputs.json": "5fa7bc146aba98be4e8afc9c4f50a9d3ae10c52dc78ef47fe14f127c54cad0b6",
   "bad/run_form_deep_context_file/outputs/result.json": "e5f1eb4d806641698a35efe20e098efd20d7d57a9b90ee69079d5bb650920726",
   "bad/run_form_deep_context_file/recipe.json": "72ece533d37745ed5204af0a0a4af5e5134ba08d0aad49c1e8f059af3ac6c64c",
   "bad/run_form_deep_one_shot_file/bundle.json": "bb0fe1604ba08f14daa9daf72e5db17b282e6e357c43d7b85b56f2d68334fedb",
-  "bad/run_form_deep_one_shot_file/case.json": "b292ed84931bf3f60b036374f3025f09c417606b955f43d6a86031172eb2bfba",
+  "bad/run_form_deep_one_shot_file/case.json": "e3b4faff720e0acd2bc30fecf526fd791e945f26096070ea01236520c78a7d56",
   "bad/run_form_deep_one_shot_file/context.json": "a58c8e25a1ca24b16e4e0bcc4fb9d4d4d73540b0d7aeb5a97d0461c847fa6125",
   "bad/run_form_deep_one_shot_file/inputs.json": "5fa7bc146aba98be4e8afc9c4f50a9d3ae10c52dc78ef47fe14f127c54cad0b6",
   "bad/run_form_deep_one_shot_file/outputs/result.json": "e5f1eb4d806641698a35efe20e098efd20d7d57a9b90ee69079d5bb650920726",
   "bad/run_form_deep_one_shot_file/recipe.json": "72ece533d37745ed5204af0a0a4af5e5134ba08d0aad49c1e8f059af3ac6c64c",
   "bad/run_form_deep_recipe/bundle.json": "d1460dde6c654fd4c23f9b00ef682b57251b7e475124544ae7c6bbff386d6039",
-  "bad/run_form_deep_recipe/case.json": "c0206fbfa46c6cbb12c3658d0d14e7cf280dab46024cdb8065aaf42a828084cf",
+  "bad/run_form_deep_recipe/case.json": "8a40a658602faacaf366a3d1d4d8d4aff923a06383122b55e8708ca99c5138a8",
   "bad/run_form_deep_recipe/context.json": "a58c8e25a1ca24b16e4e0bcc4fb9d4d4d73540b0d7aeb5a97d0461c847fa6125",
   "bad/run_form_deep_recipe/inputs.json": "5fa7bc146aba98be4e8afc9c4f50a9d3ae10c52dc78ef47fe14f127c54cad0b6",
   "bad/run_form_deep_recipe/outputs/result.json": "e5f1eb4d806641698a35efe20e098efd20d7d57a9b90ee69079d5bb650920726",
@@ -1489,7 +1489,7 @@
   "good/run_form_user_length/outputs/result.json": "e5f1eb4d806641698a35efe20e098efd20d7d57a9b90ee69079d5bb650920726",
   "good/run_form_user_length/recipe.json": "a5613ff455d33692413ec5e8f2f5fa74bb893ac0e3417766ed31978461f8139b",
   "good/run_held_output_confirmed_exit_code/bundle.json": "d1460dde6c654fd4c23f9b00ef682b57251b7e475124544ae7c6bbff386d6039",
-  "good/run_held_output_confirmed_exit_code/case.json": "e0b316e24a8a5214e8e6cba6bb738976963cf08f27704f9346dbe1a383dfff54",
+  "good/run_held_output_confirmed_exit_code/case.json": "c67fbe404529d257eba5ed924d98da9ad3a24823a6370f649b7b17807d80c48d",
   "good/run_held_output_confirmed_exit_code/context.json": "a58c8e25a1ca24b16e4e0bcc4fb9d4d4d73540b0d7aeb5a97d0461c847fa6125",
   "good/run_held_output_confirmed_exit_code/inputs.json": "5fa7bc146aba98be4e8afc9c4f50a9d3ae10c52dc78ef47fe14f127c54cad0b6",
   "good/run_held_output_confirmed_exit_code/outputs/result.json": "e5f1eb4d806641698a35efe20e098efd20d7d57a9b90ee69079d5bb650920726",
@@ -1620,5 +1620,5 @@
   "source/trust.json": "ba26cab8bfe820365a2629fb3a59d631fcfb2c9fb458d5554bfd9009f879570e"
  },
  "root_rule": "sha256 of '<path> <sha256>' lines, sorted by path, MANIFEST.json excluded",
- "root_sha256": "d28271b83790e4ebd861b5472b7582477c5240518acdd83ebdedbe3793c98360"
+ "root_sha256": "642891ef01f58399a86928784f7c6687904eb1ab8f1c5e3fc76d6788fbb0d8db"
 }
