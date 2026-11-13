@@ -267,6 +267,9 @@ class SandboxApplication:
         # The receipts front's own route for an exec it opened from a sealed envelope (AB#417);
         # the front refuses it to every caller. An API without it answers 404 and runs nothing.
         self._add("POST", s + r"/(?P<id>[^/]+)/exec-sealed", self.exec_sealed)
+        # The receipts front's own route for an env overlay it opened from a sealed envelope
+        # (AB#414); the front refuses it to every caller, as it does exec-sealed.
+        self._add("PUT", s + r"/(?P<id>[^/]+)/env-sealed", self.set_env_sealed)
         self._add("POST", s + r"/(?P<id>[^/]+)/heartbeat", self.heartbeat)
         self._add("POST", s + r"/(?P<id>[^/]+)/lifetime", self.heartbeat)
         self._add("PATCH", s + r"/(?P<id>[^/]+)/lifetime", self.heartbeat)
@@ -524,6 +527,16 @@ class SandboxApplication:
     def exec_sealed(self, *, id, body, **_):
         """An exec as /exec runs it, with its command and output kept out of the history and the log."""
         return self.exec_(id=id, body=body, sealed=True)
+
+    def set_env_sealed(self, *, id, body, **_):
+        """Replace the room's env overlay with the one the front opened. Answers names, never values."""
+        payload = self._json(body)
+        env = api.validated_env_overlay(payload.get("env") if isinstance(payload, dict) else None)
+        setter = getattr(self.provider, "set_env_overlay", None)
+        if not callable(setter):
+            return Response.error(501, "env_overlay_not_supported", "this runtime has no env overlay")
+        names = setter(id, env)
+        return Response.json(200, {"sandbox_id": id, "names": names})
 
     def start_process(self, *, id, body, **_):
         payload = self._json(body)
