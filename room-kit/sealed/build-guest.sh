@@ -284,8 +284,11 @@ rm -f "$R"/etc/ssh/ssh_host_*
 
 # ---------------------------------------------------------------- 4. initrd = whole root, cmdline
 log "packing initrd"
-( cd "$R" && find . -mindepth 1 \( -path './proc/*' -o -path './sys/*' -o -path './dev/*' \) -prune -o -print0 \
-  | LC_ALL=C sort -z | cpio --null -o -H newc --reproducible --quiet ) | zstd -q -T0 -10 > "$OUT/initrd.cpio.zst"
+# SOURCE_DATE_EPOCH: the kit commit time, so the same kit gives the same bytes on any host.
+# shellcheck disable=SC1091
+source "$KIT/sealed/pack-initrd.sh"
+SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$KIT" log -1 --format=%ct 2>/dev/null || echo 0)}
+pack_initrd "$R" "$OUT/initrd.cpio.zst" "$SOURCE_DATE_EPOCH"
 CMDLINE="console=ttyS0 loglevel=7 systemd.show_status=error panic=-1 rdinit=/init cathedral.debug=$DEBUG"
 printf '%s' "$CMDLINE" > "$OUT/cmdline"
 install -m 0644 "$SEALED_OVMF" "$OUT/OVMF.amdsev.fd"
