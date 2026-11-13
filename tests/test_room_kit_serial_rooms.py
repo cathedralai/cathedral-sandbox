@@ -546,3 +546,100 @@ def test_a_read_spanning_the_create_leaves_the_flag(front) -> None:
     assert receipt_of(headers)["statement"]["serial"] is True
     assert front.delete("sbx_x")[0] == 200
     assert_idle(front.ledger)
+
+
+# ---------------------------------------------------------------- a bulk delete by label
+
+SERIAL_TEAM = {"image": "repo/app:1", "labels": {"cathedral_serial": "1", "team": "a"}}
+BULK = "/v1/sandboxes?label=team%3Da"
+
+
+def test_a_bulk_delete_that_removes_the_room_while_its_create_is_unsigned_withholds_the_flag(front) -> None:
+    front.api.new_ids = ["sbx_x"]
+    answer = front.api.hold_create_answers()  # the API made the room; its create is not signed yet
+    c, cbox = in_thread(front.create, SERIAL_TEAM)
+    answer.wait_entered()
+    assert front.call("DELETE", BULK)[0] == 200
+    assert "sbx_x" not in front.api.rooms  # the fake really deleted it
+    answer.release.set()
+    status, headers, _out = finish(c, cbox)
+    statement = receipt_of(headers)["statement"]
+    assert status == 200 and "serial" not in statement and "sbx_x" not in front.ledger.serial
+    assert_idle(front.ledger)
+
+
+def test_a_bulk_delete_that_starts_before_the_create_and_ends_while_it_is_pending_withholds_the_flag(front) -> None:
+    bulk_hold = front.api.hold(r"DELETE /v1/sandboxes")
+    b, bbox = in_thread(front.call, "DELETE", BULK)
+    bulk_hold.wait_entered()
+    front.api.new_ids = ["sbx_x"]
+    answer = front.api.hold_create_answers()
+    c, cbox = in_thread(front.create, SERIAL_TEAM)
+    answer.wait_entered()
+    bulk_hold.release.set()
+    finish(b, bbox)
+    answer.release.set()
+    assert "serial" not in receipt_of(finish(c, cbox)[1])["statement"]
+    assert_idle(front.ledger)
+
+
+def test_a_bulk_delete_that_ended_before_the_create_was_sent_leaves_the_flag(front) -> None:
+    assert front.call("DELETE", BULK)[0] == 200
+    with front.ledger.lock:
+        assert not front.ledger.overflow and front.ledger.bulk_in_flight == 0
+    assert receipt_of(front.create(SERIAL_TEAM)[1])["statement"]["serial"] is True
+    assert_idle(front.ledger)
+
+
+def test_a_bulk_delete_while_no_create_is_pending_leaves_overflow_false(front) -> None:
+    held = front.api.hold(r"DELETE /v1/sandboxes")
+    b, bbox = in_thread(front.call, "DELETE", BULK)
+    held.wait_entered()
+    with front.ledger.lock:
+        assert front.ledger.bulk_in_flight == 1 and not front.ledger.overflow
+    held.release.set()
+    finish(b, bbox)
+    assert_idle(front.ledger)
+
+
+def test_a_bulk_delete_is_not_held_back_by_a_busy_serial_room(front) -> None:
+    room = serial_room(front)
+    held = front.api.hold(rf"POST /v1/sandboxes/{room}/exec")
+    t, box = in_thread(front.exec, room)
+    held.wait_entered()
+    started = time.monotonic()
+    assert front.call("DELETE", BULK)[0] == 200
+    assert time.monotonic() - started < 1.0
+    held.release.set()
+    finish(t, box)
+    assert_idle(front.ledger)
+
+
+# ---------------------------------------------------------------- what a broken room answers
+
+def test_every_request_naming_a_broken_room_but_a_delete_gets_room_broken_and_its_receipts_still_read(front) -> None:
+    room = serial_room(front)
+    front.api.drop(rf"POST /v1/sandboxes/{room}/exec", times=1)
+    assert front.exec(room)[0] == 502
+    seen = len(front.api.seen)
+    base = f"/v1/sandboxes/{room}"
+    for method, path in [("GET", base), ("GET", base + "/logs"), ("POST", base + "/wait"), ("POST", base + "/exec"),
+                         ("PUT", base + "/files"), ("GET", base + "/files"), ("POST", base + "/heartbeat")]:
+        status, _headers, out = front.call(method, path, b"{}" if method in ("POST", "PUT") else None)
+        assert status == 409 and code(out) == "room_broken", (method, path)
+    assert len(front.api.seen) == seen
+    listing = front.room_receipts(room)  # the room's receipt list is answered before the gate
+    assert listing["count"] == 2 and listing["receipts"][-1]["statement"]["status"] == 502
+    assert front.delete(room)[0] == 200
+    assert_idle(front.ledger)
+
+
+def test_a_read_whose_answer_is_lost_answers_502_signs_nothing_and_does_not_break_the_room(front) -> None:
+    room = serial_room(front)
+    front.api.drop(rf"GET /v1/sandboxes/{room}/logs", times=1)
+    status, headers, _out = front.call("GET", f"/v1/sandboxes/{room}/logs")
+    assert status == 502 and "X-Room-Receipt" not in headers
+    assert room not in front.ledger.broken
+    assert front.exec(room)[0] == 200
+    assert [s["action"] for s in front.statements(room)] == ["create", "exec"]
+    assert_idle(front.ledger)

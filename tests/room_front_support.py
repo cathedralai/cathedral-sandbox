@@ -43,6 +43,8 @@ class FakeApi:
         self.lock = threading.Lock()
         self.seen: list[tuple[str, str, bytes]] = []
         self.rooms: set[str] = set()
+        self.labels: dict[str, dict] = {}
+        self.answer_holds: list[Hold] = []
         self.new_ids: list[str] = []
         self.counter = 0
         self.holds: list[tuple[re.Pattern, Hold]] = []
@@ -61,6 +63,12 @@ class FakeApi:
     def hold(self, pattern: str) -> Hold:
         h = Hold()
         self.holds.append((re.compile(pattern), h))
+        return h
+
+    def hold_create_answers(self) -> Hold:
+        """Hold each create after the API made the room and before it answers."""
+        h = Hold()
+        self.answer_holds.append(h)
         return h
 
     def drop(self, pattern: str, times: int | None = None) -> None:
@@ -108,6 +116,8 @@ class FakeApi:
                 return self._send(h, status, out)
         if line == "POST /v1/sandboxes":
             return self._create(h, body)
+        if line == "DELETE /v1/sandboxes":
+            return self._bulk_delete(h)
         if line == "GET /v1/sandboxes":
             if self.list_body is not None:
                 return self._send(h, self.list_status, self.list_body)
@@ -131,11 +141,31 @@ class FakeApi:
             return self._send(h, 200, b'{"exit_code":0}')
         return self._send(h, 200, b"{}")
 
+    def _bulk_delete(self, h) -> None:
+        """Really delete each room whose labels match every label=key=value of the query."""
+        from urllib.parse import parse_qs, urlsplit
+
+        wanted = [item.split("=", 1) for item in parse_qs(urlsplit(h.path).query).get("label", [])]
+        with self.lock:
+            for room in list(self.rooms):
+                labels = self.labels.get(room, {})
+                if all(len(kv) == 2 and str(labels.get(kv[0])) == kv[1] for kv in wanted):
+                    self.rooms.discard(room)
+        self._send(h, 200, b"{}")
+
     def _create(self, h, body: bytes) -> None:
+        try:
+            labels = json.loads(body).get("labels")
+        except (ValueError, AttributeError):
+            labels = None
         with self.lock:
             self.counter += 1
             room = self.new_ids.pop(0) if self.new_ids else f"sbx_{self.counter}"
             self.rooms.add(room)
+            self.labels[room] = labels if isinstance(labels, dict) else {}
+        for hold in list(self.answer_holds):
+            hold.entered.set()
+            hold.release.wait(30)
         doc = {"id": room}
         if self.network_policy is not None:
             doc["network"] = {"policy": self.network_policy}
@@ -174,6 +204,8 @@ class FakeApi:
 
     def release_all(self) -> None:
         for _rx, hold in self.holds:
+            hold.release.set()
+        for hold in self.answer_holds:
             hold.release.set()
 
     def stop(self) -> None:
@@ -272,7 +304,7 @@ def assert_idle(ledger) -> None:
         with ledger.lock:
             if (not getattr(ledger, "in_flight", {}) and not getattr(ledger, "busy", set())
                     and not getattr(ledger, "touched", set()) and not getattr(ledger, "creates_in_flight", 0)
-                    and not getattr(ledger, "overflow", False)):
+                    and not getattr(ledger, "overflow", False) and not getattr(ledger, "bulk_in_flight", 0)):
                 return
         time.sleep(0.01)
     with ledger.lock:
@@ -281,3 +313,4 @@ def assert_idle(ledger) -> None:
         assert getattr(ledger, "touched", set()) == set(), "the touched set was not cleared"
         assert getattr(ledger, "creates_in_flight", 0) == 0, "a create stayed counted"
         assert not getattr(ledger, "overflow", False), "the overflow mark stayed set"
+        assert getattr(ledger, "bulk_in_flight", 0) == 0, "a bulk delete stayed counted"
