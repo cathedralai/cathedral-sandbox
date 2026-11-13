@@ -180,6 +180,33 @@ def test_delete_is_path_based_when_room_replaces_the_final_entry(app: SandboxApp
     assert replaced and not target.exists()
 
 
+def test_delete_unlinks_replacement_symlink_without_touching_its_target(
+    app: SandboxApplication, monkeypatch, tmp_path,
+) -> None:
+    sid = _create(app)
+    target = app.provider._sandboxes[sid].root / "work" / "race-link"
+    outside = tmp_path / "outside"
+    outside.write_text("keep")
+    target.write_text("first")
+    original_stat = os.stat
+    replaced = False
+
+    def replace_after_stat(path, *args, **kwargs):
+        nonlocal replaced
+        result = original_stat(path, *args, **kwargs)
+        if path == "race-link" and kwargs.get("dir_fd") is not None and not replaced:
+            replaced = True
+            target.unlink()
+            target.symlink_to(outside)
+        return result
+
+    monkeypatch.setattr(os, "stat", replace_after_stat)
+    response = app.dispatch("DELETE", f"/v1/sandboxes/{sid}/entries?path=/work/race-link", AUTH, b"")
+    assert response.status == 200 and json.loads(response.body)["deleted"] is True
+    assert replaced and not target.exists()
+    assert outside.read_text() == "keep"
+
+
 # ------------------------------------------------------------------ §3.3 Range / max_bytes codes
 def test_get_file_range_returns_206(app: SandboxApplication) -> None:
     sid = _create(app)
