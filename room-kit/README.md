@@ -168,8 +168,8 @@ signed request at a time, so the order of its receipts is the order things ran.
   still be read. A 2xx delete ends the room and every mark kept for it.
 - Limit: a bulk delete by label (`DELETE /v1/sandboxes?label=...`) names no
   room and is not held back by a busy serial room, so clean-up by label keeps
-  working. A room it removes ends with a `room_end` receipt at a later look,
-  and any create whose pending time it overlaps gets no flag.
+  working. A room it removes gets no receipt of its own, and any create whose
+  pending time it overlaps gets no flag.
 
 An ordinary room runs requests side by side, as before.
 
