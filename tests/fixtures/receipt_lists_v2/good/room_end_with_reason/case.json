@@ -1,0 +1,20 @@
+{
+ "args": [
+  "--attestation",
+  "{dir}/attestation_doc.json",
+  "--receipts",
+  "{dir}/receipts.json",
+  "--skip-amd",
+  "--expected-measurement",
+  "9b148da6715f6a68fd6314d9015f54413c261a0b1b25075b568e0b5106687a2b434d7661f26d036700090ca1917a9ed1"
+ ],
+ "description": "A room_end receipt names why the room ended; it is reported and nothing is said about later receipts.",
+ "expect": {
+  "exit_code": 0,
+  "pointers": {
+   "/chain/room_numbering/rooms/room-a/ended/reason": "reaped after its lifetime",
+   "/chain/room_numbering/rooms/room-a/receipts": 3
+  },
+  "verdict": "PASS"
+ }
+}
