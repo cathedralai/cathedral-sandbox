@@ -73,10 +73,17 @@ type placement struct {
 	// noLent: a workspace create. A lent hotel is destroyed at reclaim, so it
 	// never holds a workspace (lend.go).
 	noLent bool
+	// ownHostsOnly: "own_hosts_only": true. No miner hotel (isMinerHotel)
+	// matches, whatever the guest policy says, so no retry, fallback or
+	// queue move can reach one either.
+	ownHostsOnly bool
 }
 
 func (pl placement) selects(h *hotel) bool {
 	if h.cfg.MinerHotkey != "" && !pl.policy.minerOptIn(h) {
+		return false
+	}
+	if pl.ownHostsOnly && isMinerHotel(h) {
 		return false
 	}
 	if len(pl.allowed) > 0 && !pl.allowed[h.cfg.ID] {
@@ -144,6 +151,7 @@ func (pl placement) apply(payload map[string]any) {
 	delete(payload, "exclude_hotel_labels")
 	delete(payload, "sealed")
 	delete(payload, "placement")
+	delete(payload, "own_hosts_only")
 	if pl.hotelSnap != "" {
 		payload["snapshot_id"] = pl.hotelSnap
 	}
@@ -361,6 +369,14 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 		default:
 			return pl, &apiErr{400, "invalid_hotel_selection", `placement must be "require" or "prefer"`}
 		}
+	}
+	// "own_hosts_only": true keeps the create off miner hotels.
+	if v, ok := payload["own_hosts_only"]; ok && v != nil {
+		own, ok := v.(bool)
+		if !ok {
+			return pl, &apiErr{400, "invalid_hotel_selection", "own_hosts_only must be true or false"}
+		}
+		pl.ownHostsOnly = own
 	}
 	_, named := payload["hotels"]
 	_, sealedField := payload["sealed"]
