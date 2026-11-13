@@ -231,6 +231,11 @@ Other refusals: 405 for any method but POST (checked before the gate), 400 `clai
 `pool_room_stale`, `pool_room_gone`, `room_not_pool`, `pool_room_used`,
 `pool_room_expiring`.
 
+Limit: a bulk delete by label names no room and is not held back by a claim in
+flight, so clean-up by label keeps working. A room it removes ends with a
+`room_end` receipt at a later look, and any create whose pending time it
+overlaps gets no `pool` flag.
+
 ### Fresh report over caller data (sealed only)
 
 `POST /room/attest` on the receipt front asks the processor for a new SNP

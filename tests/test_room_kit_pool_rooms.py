@@ -549,3 +549,24 @@ def test_a_write_in_flight_before_the_pool_create_that_ends_before_it_is_signed_
     assert status == 200 and "pool" not in receipt_of(headers)["statement"]
     assert "sbx_x" not in front.ledger.pool
     assert_idle(front.ledger)
+
+
+def test_a_bulk_delete_that_removes_the_room_while_its_pool_create_is_unsigned_withholds_the_flag(front) -> None:
+    front.api.new_ids = ["sbx_x"]
+    answer = front.api.hold_create_answers()
+    pool_body = {**POOL, "labels": {"cathedral_pool": "1", "team": "a"}}
+    c, cbox = in_thread(front.create, pool_body)
+    answer.wait_entered()
+    assert front.call("DELETE", "/v1/sandboxes?label=team%3Da")[0] == 200
+    assert "sbx_x" not in front.api.rooms
+    answer.release.set()
+    status, headers, _out = finish(c, cbox)
+    assert status == 200 and "pool" not in receipt_of(headers)["statement"]
+    assert "sbx_x" not in front.ledger.pool
+    assert_idle(front.ledger)
+
+
+def test_a_bulk_delete_that_ended_before_the_pool_create_was_sent_leaves_the_flag(front) -> None:
+    assert front.call("DELETE", "/v1/sandboxes?label=team%3Da")[0] == 200
+    assert pool_room(front) in front.ledger.pool
+    assert_idle(front.ledger)
