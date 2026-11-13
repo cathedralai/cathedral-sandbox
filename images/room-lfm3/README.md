@@ -23,6 +23,11 @@ lfm3-timing load_ms=1203 prompt_tok_s=118.0 gen_tok_s=52.8 wall_ms=1530 threads=
 answers; the default `off` gives short answers), `LFM3_THREADS` and `LFM3_CTX`
 change the run. `llama-cli` is on `PATH` for anything else.
 
+A long prompt can come on stdin (`echo "..." | lfm3-ask -`) and still prints
+the answer only. The prompt goes to the model as typed (backslashes are not
+unescaped). A prompt longer than `LFM3_CTX` tokens exits 1 with llama-cli's
+error on stderr.
+
 ## Pins
 
 | What | Pin |
