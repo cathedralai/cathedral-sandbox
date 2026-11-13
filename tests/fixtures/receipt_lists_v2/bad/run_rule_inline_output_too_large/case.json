@@ -1,0 +1,26 @@
+{
+ "args": [
+  "--oneshot",
+  "{dir}/bundle.json",
+  "--recipe",
+  "{dir}/recipe.json",
+  "--context",
+  "{dir}/context.json",
+  "--ark-sha256",
+  "2f0cd3780ee3b0ce55c3e76ccd7f23727bca28326bb24cb8b7588ed2f78b3bc5",
+  "--expected-measurement",
+  "9b148da6715f6a68fd6314d9015f54413c261a0b1b25075b568e0b5106687a2b434d7661f26d036700090ca1917a9ed1",
+  "--input-sha256",
+  "/work/in/run.py=ad64355106bb158b020ecf9702be48f7730fc091dd4bb6a2f092b40393495b3d",
+  "--input-sha256",
+  "/work/in/data.csv=492d5ea496056f1a6a6592241032fab764c321596317930b4fa0e1e8bc3b7470",
+  "--output-file",
+  "/work/out/result.json={dir}/outputs/result.json"
+ ],
+ "description": "An inline output of 64 KiB plus one byte; the recipe allows more.",
+ "expect": {
+  "exit_code": 1,
+  "reason": "check 7: the inline bytes of /work/out/log.txt are 65537 bytes, over the 64 KiB an inline output may have",
+  "verdict": "FAIL"
+ }
+}
