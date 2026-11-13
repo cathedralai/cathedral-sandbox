@@ -32,6 +32,11 @@ class Retired:
         self.rooms.append(room)
 
 
+class RetiredEnv(Retired):
+    def stale(self, _incarnation_of) -> list[str]:  # the create path asks which overlays moved
+        return []
+
+
 def make_room(front: Front) -> tuple[str, str]:
     status, headers, out = front.create()
     assert status == 200
@@ -272,3 +277,15 @@ def test_the_loop_ends_a_reaped_room_and_stops_with_the_server(tmp_path, monkeyp
 def test_the_loop_is_off_unless_asked_for(front) -> None:
     assert front.server.look_thread is None
     assert not any(t.name == "room-look" for t in threading.enumerate())
+
+
+def test_a_delete_and_a_room_end_each_retire_the_rooms_sealed_env_state(front) -> None:
+    front.ledger.secrets, front.ledger.sealed_exec, front.ledger.sealed_env = Retired(), Retired(), RetiredEnv()
+    deleted, _sha = make_room(front)
+    gone, _sha = make_room(front)
+    assert front.delete(deleted)[0] == 200
+    assert front.ledger.sealed_env.rooms == [deleted]
+    front.api.rooms.discard(gone)
+    front.server.look_all()
+    assert front.ledger.sealed_env.rooms == [deleted, gone]
+    assert front.ledger.secrets.rooms == front.ledger.sealed_exec.rooms == [deleted, gone]
