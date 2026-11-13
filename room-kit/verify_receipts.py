@@ -174,6 +174,8 @@ RUN_DOES_NOT_PROVE = [
     "Which build the measurement stands for: it is checked against the measurements you allowed.",
     "The request headers of file calls: they are in neither the signed target nor any hash.",
     "Reads (logs, for one): they leave no receipt.",
+    "That the machine's disk was left unaltered by its host: the receipts do not show it either way.",
+    "That the approved build is the same as the published source: the allowed measurements are your own list.",
 ]
 RUN_CHECKED = "run mode: checks 1 to 8 of the one-shot file"
 
@@ -972,8 +974,10 @@ def fetch_chain(broker: str, hotel: str, key: str) -> dict:
                     "filtered": bool(page.get("filtered")), "count": len(receipts), "receipts": receipts}
 
 
-def strict_json(raw: bytes, prefix: str, what: str, plural: bool = False):
-    """Parse JSON the way the Go checker does: a repeated key and a non-integer number are refused."""
+def strict_json(raw: bytes, prefix: str, what: str, plural: bool = False, floats: bool = False):
+    """Parse JSON the way the Go checker does: a repeated key, at any level, and a non-integer number are refused.
+
+    floats=True lets numbers with a fraction through (a receipt can hold one); repeated keys are still refused."""
     def pairs(items):
         out: dict = {}
         for key, value in items:
@@ -985,8 +989,8 @@ def strict_json(raw: bytes, prefix: str, what: str, plural: bool = False):
         raise Fail(f"{prefix}: {what} {'hold' if plural else 'holds'} the number {text}, which is not an integer")
 
     try:
-        return json.loads(raw, object_pairs_hook=pairs, parse_float=refuse, parse_constant=refuse)
-    except ValueError as exc:
+        return json.loads(raw, object_pairs_hook=pairs, parse_float=float if floats else refuse, parse_constant=refuse)
+    except (ValueError, RecursionError) as exc:
         raise Fail(f"{prefix}: {what} {'are' if plural else 'is'} not JSON") from exc
 
 
@@ -1003,38 +1007,121 @@ def get_target(room: str, max_bytes: int, path: str) -> str:
     return f"GET /v1/sandboxes/{room}/files?{file_query({'max_bytes': str(max_bytes), 'path': path})}"
 
 
-def broker_network(network) -> dict:
-    """The network the broker writes into a create: absent, null, empty or modeless means deny_all."""
-    if isinstance(network, dict) and network.get("mode"):
-        return network
-    return {"mode": "deny_all", "allow": []}
+NETWORK_MODES = ("deny_all", "internet", "allowlist")
+MISSING = object()
+
+
+def same_json(a, b) -> bool:
+    """Equal with exact types: true is not 1, and a list is not a tuple of its parts."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(same_json(a[k], b[k]) for k in a)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(same_json(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def recipe_network(value) -> tuple[object, dict]:
+    """The recipe's network as the broker writes it into the create, and the policy the machine signs for it.
+
+    Absent, null, "", {} and an object with no mode mean deny_all (broker nativeNetwork). A mode name stays the
+    text it is. An object with a mode stays as written. A form that maps to no policy is refused."""
+    default = {"mode": "deny_all", "allow": []}
+    if value is None or value == "":
+        return default, dict(default)
+    if isinstance(value, str):
+        need(value in NETWORK_MODES, f"recipe: network mode {value} is not deny_all, internet or allowlist")
+        return value, {"mode": value, "allow": []}
+    need(isinstance(value, dict), "recipe: network is not an object or a mode name")
+    for key in value:
+        need(key in ("mode", "allow"), f"recipe: unknown member {key}")
+    allow = value.get("allow")
+    need(allow is None or (isinstance(allow, list) and all(isinstance(n, str) for n in allow)),
+         "recipe: network allow is not a list of names")
+    mode = value.get("mode")
+    if mode is None or mode == "":
+        body = dict(value)
+        body["mode"] = "deny_all"
+        body["allow"] = [] if allow is None else allow
+        return body, {"mode": "deny_all", "allow": body["allow"]}
+    need(isinstance(mode, str) and mode in NETWORK_MODES,
+         f"recipe: network mode {mode} is not deny_all, internet or allowlist")
+    return value, {"mode": mode, "allow": [] if allow is None else allow}
+
+
+def _members(doc: dict, allowed: tuple[str, ...]) -> None:
+    for key in doc:
+        need(key in allowed, f"recipe: unknown member {key}")
+
+
+def _typed(doc: dict, key: str, kind: str, ok) -> None:
+    need(ok(doc[key]), f"recipe: {key} is not {kind}")
 
 
 def load_recipe(doc) -> dict:
-    """The expected run, as the caller wrote it. Anything the checks need and the recipe lacks is a refusal."""
+    """The expected run, as the caller wrote it. The recipe is strict: a member the checker does not know, at any
+    level, is a refusal, so a misplaced field can never be dropped without notice."""
     need(isinstance(doc, dict) and doc.get("schema") == ONESHOT_RECIPE_SCHEMA,
-         f"inputs: the recipe is not a {ONESHOT_RECIPE_SCHEMA}")
+         f"recipe: the document is not a {ONESHOT_RECIPE_SCHEMA}")
+    _members(doc, ("schema", "request", "create", "file_modes"))
     req, create = doc.get("request"), doc.get("create")
-    need(isinstance(req, dict) and isinstance(create, dict), "inputs: the recipe needs request and create")
+    need(isinstance(req, dict) and isinstance(create, dict), "recipe: request and create must be objects")
+    _members(req, ("image", "image_id", "command", "env", "cwd", "user", "size", "timeout_seconds", "network",
+                   "outputs", "inputs", "max_spend_usd"))
+    _members(create, ("resources", "ttl_seconds", "broker_guest"))
     for key in ("image", "command", "env", "size", "timeout_seconds", "outputs", "inputs"):
-        need(key in req, f"inputs: the recipe's request has no {key}")
+        need(key in req, f"recipe: the request has no {key}")
     for key in ("resources", "ttl_seconds"):
-        need(key in create, f"inputs: the recipe's create has no {key}")
-    modes = doc.get("file_modes") or {}
+        need(key in create, f"recipe: create has no {key}")
+    is_text = isinstance
+    _typed(req, "image", "a string", lambda v: is_text(v, str))
+    _typed(req, "command", "a list of strings",
+           lambda v: isinstance(v, list) and v and all(isinstance(x, str) for x in v))
+    _typed(req, "env", "an object of strings",
+           lambda v: isinstance(v, dict) and all(isinstance(x, str) for x in v.values()))
+    _typed(req, "size", "a string", lambda v: isinstance(v, str))
+    _typed(req, "timeout_seconds", "an integer", _is_int)
+    for key in ("cwd", "user"):
+        if key in req:
+            _typed(req, key, "a string", lambda v: isinstance(v, str))
+    if "max_spend_usd" in req:
+        _typed(req, "max_spend_usd", "an integer", _is_int)
+    if "image_id" in req:
+        _typed(req, "image_id", "sha256: and 64 lower-case hex",
+               lambda v: isinstance(v, str) and IMAGE_DIGEST_RE.fullmatch(v) is not None)
+    _typed(req, "outputs", "a list", lambda v: isinstance(v, list))
+    _typed(req, "inputs", "a list", lambda v: isinstance(v, list))
+    _typed(create, "resources", "an object", lambda v: isinstance(v, dict))
+    _typed(create, "ttl_seconds", "an integer", _is_int)
+    if "broker_guest" in create:
+        _typed(create, "broker_guest", "a string", lambda v: isinstance(v, str))
+    modes = doc.get("file_modes", {})
+    need(isinstance(modes, dict), "recipe: file_modes is not an object")
+    _members(modes, ("context", "end_marker"))
     outputs = []
     for out in req["outputs"]:
-        need(isinstance(out, dict) and isinstance(out.get("path"), str) and _is_int(out.get("max_bytes")),
-             "inputs: each recipe output needs a path and an integer max_bytes")
-        outputs.append({"path": out["path"], "max_bytes": out["max_bytes"], "optional": bool(out.get("optional", False))})
+        need(isinstance(out, dict), "recipe: an output is not an object")
+        _members(out, ("path", "max_bytes", "optional"))
+        need(isinstance(out.get("path"), str) and _is_int(out.get("max_bytes")),
+             "recipe: each output needs a path and an integer max_bytes")
+        need(isinstance(out.get("optional", False), bool), "recipe: optional is not a boolean")
+        outputs.append({"path": out["path"], "max_bytes": out["max_bytes"], "optional": out.get("optional", False)})
     inputs = []
     for inp in req["inputs"]:
-        need(isinstance(inp, dict) and isinstance(inp.get("path"), str), "inputs: each recipe input needs a path")
+        need(isinstance(inp, dict), "recipe: an input is not an object")
+        _members(inp, ("path", "mode"))
+        need(isinstance(inp.get("path"), str), "recipe: each input needs a path")
         inputs.append({"path": inp["path"], "mode": inp.get("mode", "644")})
+    for kind, items in (("output", outputs), ("input", inputs)):
+        need(len({i["path"] for i in items}) == len(items), f"recipe: a {kind} path is given twice")
     for mode in [i["mode"] for i in inputs] + [modes.get("context", "644"), modes.get("end_marker", "644")]:
         need(isinstance(mode, str) and FILE_MODE_RE.fullmatch(mode) is not None,
-             "inputs: a file mode in the recipe is not an octal string")
-    return {"request": req, "create": create, "outputs": outputs, "inputs": inputs,
-            "context_mode": modes.get("context", "644"), "end_mode": modes.get("end_marker", "644")}
+             "recipe: a file mode is not an octal string")
+    body, policy = recipe_network(req.get("network"))
+    return {"request": req, "create": create, "outputs": outputs, "inputs": inputs, "network_body": body,
+            "network_policy": policy, "context_mode": modes.get("context", "644"),
+            "end_mode": modes.get("end_marker", "644")}
 
 
 def expected_steps(room: str, recipe: dict) -> list[tuple[str, str]]:
@@ -1135,8 +1222,8 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     need(isinstance(digest, str) and IMAGE_DIGEST_RE.fullmatch(digest) is not None,
          "check 4: image_digest is not sha256: and 64 lower-case hex")
     need(not created.get("pool"), "check 4: the create is a pool create")
-    network = broker_network(req.get("network"))
-    need(created.get("network_policy") == {"mode": network["mode"], "allow": network.get("allow", [])},
+    network = recipe["network_body"]
+    need(same_json(created.get("network_policy"), recipe["network_policy"]),
          "check 4: the signed network rule is not the recipe's")
     need(created.get("cathedral_sandbox_id") == run_id,
          f"check 4: the create names sandbox {created.get('cathedral_sandbox_id')}, not the file's oneshot_id {run_id}")
@@ -1153,10 +1240,10 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     need(not extra, f"check 4: the create has a key it should not have: {extra[0] if extra else ''}")
     missing = [k for k in ONESHOT_CREATE_KEYS if k not in body]
     need(not missing, f"check 4: the create lacks the key {missing[0] if missing else ''}")
-    need(body["image"] == req["image"], "check 4: the create's image is not the recipe's")
-    need(body["resources"] == create["resources"], "check 4: the create's resources are not the recipe's")
-    need(body["ttl_seconds"] == create["ttl_seconds"], "check 4: the create's ttl_seconds is not the recipe's")
-    need(body["network"] == network, "check 4: the create's network is not the broker's form of the recipe's")
+    need(same_json(body["image"], req["image"]), "check 4: the create's image is not the recipe's")
+    need(same_json(body["resources"], create["resources"]), "check 4: the create's resources are not the recipe's")
+    need(same_json(body["ttl_seconds"], create["ttl_seconds"]), "check 4: the create's ttl_seconds is not the recipe's")
+    need(same_json(body["network"], network), "check 4: the create's network is not the broker's form of the recipe's")
     labels = body["labels"]
     need(isinstance(labels, dict), "check 4: the create's labels are not an object")
     extra, missing = sorted(set(labels) - set(ONESHOT_LABEL_KEYS)), [k for k in ONESHOT_LABEL_KEYS if k not in labels]
@@ -1172,9 +1259,9 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
              "check 4: the label broker_guest is not an id-safe string")
     need(isinstance(labels["broker_batch"], str) and SANDBOX_LINK_RE.fullmatch(labels["broker_batch"]) is not None,
          "check 4: the label broker_batch is not a lower-case UUID")
-    image_compared = "image_id" in create
+    image_compared = "image_id" in req
     if image_compared:
-        need(digest == create["image_id"], "check 4: the create's image_digest is not the recipe's image_id")
+        need(digest == req["image_id"], "check 4: the create's image_digest is not the recipe's image_id")
 
     # 5. the context and each input were written, and are the ones the caller holds
     need(_succeeded(ctx_rc), f"check 5: the put of the context did not succeed (status {ctx_rc.get('status')})")
@@ -1202,56 +1289,83 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     missing = [k for k in values if k not in ebody]
     need(not missing, f"check 6: the exec lacks the key {missing[0] if missing else ''}")
     for key, value in values.items():
-        need(ebody[key] == value, f"check 6: the exec's {key} is not the recipe's")
+        need(same_json(ebody[key], value), f"check 6: the exec's {key} is not the recipe's")
 
-    # 7. each output was read whole (exactly 200); the end marker came after the last read
-    inline = bundle.get("inline_outputs") if isinstance(bundle.get("inline_outputs"), dict) else {}
+    # 7. each output was read whole (exactly 200); every copy of it in the file is checked; the end marker
+    #    came after the last read
+    inline = bundle.get("inline_outputs", {})
+    need(isinstance(inline, dict), "check 7: inline_outputs is not an object")
+    declared = {o["path"] for o in recipe["outputs"]}
+    for path in inline:
+        need(path in declared, f"check 7: inline_outputs names {path}, which is not an output of the recipe")
+
+    def check_copy(lead: str, size_lead: str, path: str, data: bytes, result_sha: str, limit: int) -> None:
+        need(sha(data) == result_sha, f"check 7: {lead} {path} do not hash to the receipt's result_sha256")
+        need(len(data) <= limit, f"check 7: {size_lead.format(path=path)} is {len(data)} bytes, over its max_bytes "
+                                 f"{limit}")
+
     outputs_out = []
     for out, st in zip(recipe["outputs"], get_rcs):
         path, status = out["path"], st.get("status")
         held = caller["output_bytes"].get(path)
         if status == 404 and out["optional"]:
             need(held is None, f"check 7: bytes are held for {path}, but the receipt says it was absent")
+            need(path not in inline, f"check 7: the inline bytes of {path} are given, but the receipt says it "
+                                     "was absent")
             outputs_out.append({"path": path, "state": "absent", "sha256": None, "bytes": None})
             continue
         need(status != 404, f"check 7: the required output {path} was not found (404)")
         need(status == 200, f"check 7: the get of {path} answered {status}, not 200")
-        data = held
-        if data is None and isinstance(inline.get(path), str):
+        copies = 0
+        if path in inline:
+            need(isinstance(inline[path], str), f"check 7: the inline bytes of {path} are not a base64 string")
             try:
                 data = base64.b64decode(inline[path], validate=True)
             except ValueError as exc:
                 raise Fail(f"check 7: the inline bytes of {path} are not base64") from exc
-        if data is not None:
-            need(sha(data) == st.get("result_sha256"),
-                 f"check 7: the bytes held for {path} do not hash to the receipt's result_sha256")
-            need(len(data) <= out["max_bytes"], f"check 7: {path} is {len(data)} bytes, over its max_bytes "
-                                                f"{out['max_bytes']}")
+            check_copy("the inline bytes of", "the inline copy of {path}", path, data, st.get("result_sha256"),
+                       out["max_bytes"])
+            copies += 1
+        if held is not None:
+            check_copy("the bytes held for", "{path}", path, held, st.get("result_sha256"), out["max_bytes"])
+            copies += 1
         outputs_out.append({"path": path, "state": "present", "sha256": st.get("result_sha256"),
-                            "bytes": "held" if data is not None else "receipt_only"})
+                            "bytes": "held" if copies else "receipt_only"})
     need(_succeeded(end_rc), f"check 7: the end marker put did not succeed (status {end_rc.get('status')})")
     need(end_rc.get("customer_request_sha256") == sha(b""), "check 7: the end marker put does not carry empty bytes")
 
-    # 8. the request the file shows is the recipe
+    # 8. the request the file shows is the recipe's request, member for member, with exact types
     shown = bundle.get("request")
     need(isinstance(shown, dict), "check 8: the file holds no request")
     for key in sorted(shown):
         need(key in REQUEST_FIELDS, f"check 8: the request holds a key that is not a request field: {key}")
-    wanted_inputs = [{"path": i["path"], "mode": i["mode"], "sha256": caller["input_hashes"][i["path"]]}
-                     for i in recipe["inputs"]]
-    compare = [("image", shown.get("image"), req["image"]), ("image_id", shown.get("image_id"), create.get("image_id")),
-               ("command", shown.get("command"), req["command"]), ("env", shown.get("env"), req["env"]),
-               ("cwd", shown.get("cwd"), req.get("cwd")), ("user", shown.get("user"), req.get("user")),
-               ("size", shown.get("size"), req["size"]),
-               ("timeout_seconds", shown.get("timeout_seconds"), req["timeout_seconds"]),
-               ("network", shown.get("network"), req.get("network")),
-               ("outputs", [{"path": o.get("path"), "max_bytes": o.get("max_bytes"),
-                             "optional": bool(o.get("optional", False))} for o in shown.get("outputs") or []
-                            if isinstance(o, dict)], recipe["outputs"]),
-               ("inputs", _normal_inputs(shown.get("inputs") or []), wanted_inputs),
-               ("context", shown.get("context", {}), caller["context"])]
-    for field, got, expected in compare:
-        need(got == expected, f"check 8: the request in the file differs from the recipe in {field}")
+    for entry in shown.get("inputs") if isinstance(shown.get("inputs"), list) else []:
+        need(not (isinstance(entry, dict) and "content_b64" in entry),
+             "check 8: the request holds content_b64, which a file must not carry")
+
+    def entries(items, keys, defaults):
+        """Entries as objects with exactly the allowed members, defaults filled; None for anything else."""
+        if not isinstance(items, list):
+            return None
+        out = []
+        for item in items:
+            if not isinstance(item, dict) or not set(item) <= set(keys):
+                return None
+            out.append({**defaults, **item})
+        return out
+
+    wanted = {k: v for k, v in req.items() if k not in ("inputs", "outputs")}
+    wanted["outputs"] = recipe["outputs"]
+    wanted["inputs"] = [{"path": i["path"], "mode": i["mode"], "sha256": caller["input_hashes"][i["path"]]}
+                        for i in recipe["inputs"]]
+    wanted["context"] = caller["context"]
+    got = {k: v for k, v in shown.items() if k not in ("inputs", "outputs")}
+    got["outputs"] = entries(shown.get("outputs"), ("path", "max_bytes", "optional"), {"optional": False})
+    got["inputs"] = entries(shown.get("inputs"), ("path", "mode", "sha256"), {"mode": "644"})
+    got.setdefault("context", {})
+    for field in REQUEST_FIELDS:
+        need(same_json(got.get(field, MISSING), wanted.get(field, MISSING)),
+             f"check 8: the request in the file differs from the recipe in {field}")
 
     # The exit code is proven only by an answer whose hash the exec receipt signed. It never changes the verdict.
     exit_code: dict = {"status": "not proven"}
@@ -1306,16 +1420,14 @@ def run_mode(a) -> int:
         need(bool(a.context) != bool(a.no_context), "inputs: run mode needs --context FILE or --no-context")
         measurements = list(a.expected_measurement or [])
         if a.allowed_measurements:
-            listed = json.loads(read_file(a.allowed_measurements, "the allowed measurements file"))
+            listed = strict_json(read_file(a.allowed_measurements, "the allowed measurements file"), "inputs",
+                                 "the allowed measurements file")
             need(isinstance(listed, list) and all(isinstance(m, str) for m in listed),
                  "inputs: the allowed measurements file is not a JSON list of strings")
             measurements += listed
         need(measurements, "inputs: run mode needs --expected-measurement or --allowed-measurements")
-        try:
-            bundle = json.loads(read_file(a.oneshot, "the one-shot file"))
-            recipe = load_recipe(json.loads(read_file(a.recipe, "the recipe")))
-        except ValueError as exc:
-            raise Fail("inputs: the one-shot file or the recipe is not JSON") from exc
+        bundle = strict_json(read_file(a.oneshot, "the one-shot file"), "inputs", "the one-shot file", floats=True)
+        recipe = load_recipe(strict_json(read_file(a.recipe, "the recipe"), "inputs", "the recipe"))
         context = {} if a.no_context else strict_json(read_file(a.context, "the context file"), "inputs",
                                                       "the context file")
         need(isinstance(context, dict), "inputs: the context is not a JSON object")
@@ -1341,6 +1453,11 @@ def run_mode(a) -> int:
                                               "ark_sha256": a.ark_sha256}, caller)
         print(json.dumps(out, indent=1))
         return 0
+    except (KeyError, TypeError, AttributeError, IndexError, ValueError, OverflowError, RecursionError):
+        # A member of the wrong type that no check named: a refusal, never a traceback.
+        print(json.dumps({"verdict": "FAIL", "reason": "inputs: the file or the recipe has a member of the wrong "
+                                                         "type or shape"}))
+        return 1
     except Fail as exc:
         print(json.dumps({"verdict": "FAIL", "reason": str(exc)}))
         return 1

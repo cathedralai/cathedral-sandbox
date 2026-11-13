@@ -30,6 +30,7 @@
     "path": "/work/in/data.csv"
    }
   ],
+  "max_spend_usd": 5,
   "outputs": [
    {
     "max_bytes": 1048576,
