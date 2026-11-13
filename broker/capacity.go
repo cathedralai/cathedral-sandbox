@@ -284,7 +284,7 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 			continue
 		}
 		t := g.tierOf(e.h)
-		if t == "" {
+		if t == "" || (g.limits.OwnHostsOnly && isMinerHotel(e.h)) { // placement skips it too (scope)
 			continue
 		}
 		b.addTotals(totals, e, now)

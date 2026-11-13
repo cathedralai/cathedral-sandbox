@@ -7,6 +7,7 @@
 //	"default_sealed": true         a create with no hotel choice goes to sealed hotels only
 //	"hotels": ["a", "b"]           the guest may use only these hotels (absent: all non-miner hotels)
 //	"policy": {prefer, allow, deny} hotels by selector; replaces "hotels" and "default_sealed" (capacity.go)
+//	"own_hosts_only": true         never a miner hotel, whatever the policy says (reserved customers)
 //	"ops": true                    the guest may run the probe and reset the broker counters
 //
 // With "default_sealed", a create gets an unsealed room only when it says
@@ -16,7 +17,7 @@
 // An operator (operator key) reads and changes limits at runtime:
 //
 //	GET   /v1/broker/guests        every guest with its limits and room counts
-//	PATCH /v1/broker/guests/<id>   {"max_rooms", "max_creates_per_minute", "default_sealed", "hotels", "policy"}
+//	PATCH /v1/broker/guests/<id>   {"max_rooms", "max_creates_per_minute", "default_sealed", "hotels", "policy", "own_hosts_only"}
 //
 // A runtime change stays in memory only. A restart goes back to the config
 // file, so change the config file to keep a limit.
@@ -44,6 +45,11 @@ type guestLimits struct {
 	// Policy, when set, replaces Hotels and DefaultSealed (capacity.go). It
 	// is never changed in place: a PATCH stores a new value.
 	Policy *guestPolicy `json:"policy,omitempty"`
+	// OwnHostsOnly keeps every room of the guest on Cathedral's own hotels:
+	// placement never picks a miner hotel (isMinerHotel), even when the
+	// policy opts into miner hotels. For reserved customers (const). It is
+	// the guest-wide form of the create flag "own_hosts_only" (images.go).
+	OwnHostsOnly bool `json:"own_hosts_only,omitempty"`
 }
 
 func (l guestLimits) maxRooms() int {
@@ -155,6 +161,9 @@ func (b *broker) scope(g *guestState, pl *placement, named, sealedField bool) {
 	lim := g.limits
 	b.mu.Unlock()
 	pl.guest = g.cfg.ID // a hotel reserved for another guest is never a candidate
+	// OR, not assign: the create may already have set the flag, and the
+	// policy branch below returns early.
+	pl.ownHostsOnly = pl.ownHostsOnly || lim.OwnHostsOnly
 	if lim.Policy != nil {
 		// The policy replaces the hotel list and the sealed default: it
 		// names the classes the guest may use, in order (pick).
@@ -187,7 +196,7 @@ func (b *broker) guestView(g *guestState) map[string]any {
 	return map[string]any{
 		"id": g.cfg.ID, "max_rooms": lim.maxRooms(), "max_creates_per_minute": lim.MaxCreatesPerMinute,
 		"default_sealed": lim.DefaultSealed, "hotels": hotels, "ops": g.cfg.Ops,
-		"active_rooms": b.activeRooms(g), "policy": lim.Policy,
+		"active_rooms": b.activeRooms(g), "policy": lim.Policy, "own_hosts_only": lim.OwnHostsOnly,
 	}
 }
 
@@ -220,12 +229,13 @@ func (b *broker) patchGuest(w http.ResponseWriter, r *http.Request, id string) {
 		DefaultSealed       *bool           `json:"default_sealed"`
 		Hotels              *[]string       `json:"hotels"`
 		Policy              json.RawMessage `json:"policy"` // null clears the policy
+		OwnHostsOnly        *bool           `json:"own_hosts_only"`
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		writeErr(w, 400, "invalid_json", "body must be a JSON object with max_rooms, max_creates_per_minute, default_sealed, hotels or policy")
+		writeErr(w, 400, "invalid_json", "body must be a JSON object with max_rooms, max_creates_per_minute, default_sealed, hotels, policy or own_hosts_only")
 		return
 	}
 	if (req.MaxRooms != nil && *req.MaxRooms < 0) || (req.MaxCreatesPerMinute != nil && *req.MaxCreatesPerMinute < 0) {
@@ -286,6 +296,9 @@ func (b *broker) patchGuest(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	if policy != nil || clearPolicy {
 		g.limits.Policy = policy
+	}
+	if req.OwnHostsOnly != nil {
+		g.limits.OwnHostsOnly = *req.OwnHostsOnly
 	}
 	writeJSON(w, 200, b.guestView(g))
 }
