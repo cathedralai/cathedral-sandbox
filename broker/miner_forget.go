@@ -153,6 +153,7 @@ func (b *broker) forgetAndLeave(w http.ResponseWriter, h *hotel, id string) {
 		h.stop()
 	}
 	_ = os.Remove(h.cfg.KeyFile)
+	b.saveProbationLogged()
 	log.Printf("hotel %s: the operator forgot %d rooms of a dead miner guest and the hotel left", id, n)
 	w.WriteHeader(204)
 }

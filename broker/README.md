@@ -118,6 +118,7 @@ with no config edit.
 | `prefer` | Tried first. |
 | `allow` | Tried only when no preferred hotel has a free room. |
 | `deny` | Never used. Wins over `prefer`, `allow` and named `hotels`. |
+| `miner_probation` | `true`: the guest sends test traffic, so its `miner=true` opt-in also reaches miner hotels on probation (`miner_probation_seconds`). Without it a guest reaches graduated miner hotels only. Needs a `prefer` or `allow` selector with the label `miner=true`. |
 
 - A create with no hotel choice goes to a preferred hotel while one has a
   free room, else to an allowed hotel. Inside a tier the pick is the usual
@@ -554,6 +555,8 @@ Config (all optional):
 | `sealed_measurements` | A gated hotel's measurement must be in this list. Empty: every gated hotel is refused. |
 | `miner_hotkey_caps` | Operator-approved map from miner SS58 hotkey to maximum joined hotels. Missing hotkeys are refused. The broker counts all joined hotels for a hotkey, including pending or draining ones, and refuses the next join at the cap. Changing a cap requires a config restart; the broker has no cap hot reload yet. |
 | `miner_max_hotels` | Operator-approved maximum joined miner hotels across all hotkeys. Zero refuses miner joins. Pending and draining hotels count; the next join is refused with `miner_global_cap_reached`. The approved founding cut is 64; configure it explicitly before enabling enrollment. Changing it requires a restart. |
+| `miner_probation_seconds` | Miner probation (AB#334, `probation.go`). 0 or absent: off. Otherwise a joined miner hotel takes test traffic only until the broker has observed it for this many seconds; it graduates to the shared pool when it was up (health, fresh attestation, not draining) for at least `miner_probation_min_uptime_pct` of that time, else a new window starts. Only a guest whose policy opts in to `miner=true` and sets `"miner_probation": true` reaches a hotel on probation. State is in `state_dir/miner-probation.json`; turning it on for the first time (no file) grandfathers the miner hotels already serving. Hotels and capacity entries show a `probation` object. A miner hotel off probation (or every miner hotel, with probation off) carries the computed label `graduated=true`; a stored `graduated` label is ignored while on probation. |
+| `miner_probation_min_uptime_pct` | Minimum verified uptime to graduate, in percent, (0, 100]. Absent or 0: 99. Exactly the minimum graduates. |
 | `sealed_host_data` | Its HOST_DATA must be in this list. A dedicated sealed machine (one owner, `SEALED_OWNER_PUBKEY_FILE`) has its own HOST_DATA, which names the owner key: add that value (the sealed install prints it). On `POST /v1/sandboxes` the broker passes `X-Cathedral-Owner-Signature` and `X-Cathedral-Owner-Timestamp` to the hotel unchanged; the machine checks them (`room-kit/sealed/README.md`, "Dedicated machine"). Its 403 `owner_signature_*` does not rest the hotel. |
 | `attest_ttl_seconds`, `attest_every_seconds` | As above. |
 | `sealed_admission` | Top level: `"on"` or absent; `"off"` is refused. Per hotel entry: `"gate"` (default) or `"off"`, the ops escape for one operator hotel (above). |
