@@ -125,3 +125,23 @@ def test_serial_words_are_only_printed_when_a_serial_room_is_present() -> None:
     assert len(out["chain"]["room_numbering"]["does_not_prove"]) == 1
     _, out, _ = _run_pack_case("good/serial_room_closed_by_file_put")
     assert len(out["chain"]["room_numbering"]["does_not_prove"]) == 4
+
+
+def test_room_links_reads_no_link_from_an_unchecked_claim() -> None:
+    vr = _load_checker()
+    claimed = _case_receipts("good/pool_room_claimed")
+    assert vr.room_links(claimed) == {"pool-1": "5b7c1a2e-9d3f-4e6a-8b10-2c4d6e8f0a1b"}
+    with pytest.raises(vr.Fail, match="pooled_from"):
+        vr.room_links(_case_receipts("bad/pool_claim_pooled_from_wrong"))
+    with pytest.raises(vr.Fail, match="needs numbered receipts"):
+        vr.room_links(_case_receipts("bad/pool_claim_without_numbering"))
+
+
+def test_pool_rooms_function_reports_states_and_stays_empty_without_a_pool_create() -> None:
+    vr = _load_checker()
+    states = {name: vr.pool_rooms(_case_receipts(f"good/{name}"))["pool-1"]["state"]
+              for name in ("pool_room_claimed", "pool_room_unclaimed", "pool_room_claim_failed",
+                           "pool_room_retired_unclaimed")}
+    assert states == {"pool_room_claimed": "claimed", "pool_room_unclaimed": "unclaimed",
+                      "pool_room_claim_failed": "closed", "pool_room_retired_unclaimed": "retired"}
+    assert vr.pool_rooms(_case_receipts("good/numbered_rooms_interleaved")) == {}
