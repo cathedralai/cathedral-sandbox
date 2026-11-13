@@ -9,13 +9,18 @@ result.
 How the result is bound to a signed receipt: Cathedral's exec receipt carries
 stdout_sha256 of the exact stdout bytes, and the room's guest signs the
 command_sha256. This script saves each run's stdout byte for byte, finds the
-Cathedral receipt whose stdout_sha256 matches, and records its number. Anyone
-can then check a run with:
+Cathedral receipt whose stdout_sha256 matches, and records its number. Each receipt
+is used for at most one run, and must carry the same command hash as the run.
+Before exit 0 the script itself runs the offline check:
 
-    ctcli receipt verify --bundle <bundle> --stdout <n>=<run stdout file>
+    ctcli receipt verify --bundle <bundle> --json --require-outputs \
+        --cathedral-key <hex> --expected-measurement <96 hex> --stdout <n>=<file> ...
 
-The numbers are only as good as that check: a run with no matching receipt is
-written with "receipt_n": null and the script exits 3.
+and requires PASS. The Cathedral key (or a trusted keys file) and the guest
+measurement are required flags: with no pins there is nothing to verify against,
+so the script refuses to start (exit 2) rather than report unverified numbers.
+A run with no matching receipt is written with "receipt_n": null (exit 3). A
+verify verdict other than PASS is an error (exit 1) and the result says why.
 
 Not in this slice: time to first token (needs an in-image harness, so a
 re-seal), image digest / model sha256 inside a signed statement, a signed
@@ -23,9 +28,11 @@ summary of the whole run. See ab444-plan.md.
 
 Usage:
   CATHEDRAL_API_KEY=... sealed_bench.py --image ghcr.io/cathedralai/room-lfm3-omni-2b@sha256:<64 hex> \
-      --template sealed-2x4 --prompts bench/prompts.json --out-dir out/ [--runs 3]
+      --template sealed-2x4 --prompts bench/prompts.json --out-dir out/ [--runs 3] \
+      --cathedral-key <hex> --expected-measurement <96 hex>
 Env: CATHEDRAL_API_URL (default https://cathedral.computer), CTCLI (default ctcli).
-Exit: 0 all runs bound to a receipt, 1 failure, 2 bad usage, 3 ran but a run has no matching receipt.
+Exit: 0 all runs bound to a receipt and the offline verify PASSed, 1 failure, 2 bad usage,
+3 ran but a run has no matching receipt.
 """
 from __future__ import annotations
 
@@ -46,7 +53,8 @@ HARNESS_VERSION = "sealed-bench-1"
 DIGEST_IMAGE = re.compile(r"^[a-z0-9./_-]+@sha256:[0-9a-f]{64}$")
 TIMING = re.compile(r"^lfm3-timing (.*)$", re.M)
 EXEC_TIMEOUT_SECONDS = 45  # the API cuts a longer foreground exec off
-EXEC_ACTIONS = {"sandbox.exec", "exec"}
+EXEC_ACTIONS = {"sandbox.exec", "sandbox.exec.finish", "exec"}
+USER_AGENT = "cathedral-sealed-bench/1.0"
 
 
 class BenchError(Exception):
@@ -62,7 +70,9 @@ class Api:
         self.base, self.key, self.timeout = base.rstrip("/"), key, timeout
 
     def call(self, method: str, path: str, body: dict | None = None, idem: str | None = None, timeout: int | None = None):
-        headers = {"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"}
+        # The public edge refuses urllib's default User-Agent.
+        headers = {"Authorization": f"Bearer {self.key}", "Content-Type": "application/json",
+                   "User-Agent": USER_AGENT}
         if idem:
             headers["Idempotency-Key"] = idem
         data = None if body is None else json.dumps(body).encode()
@@ -95,14 +105,42 @@ def parse_timing(stdout: str) -> dict:
     return fields
 
 
-def find_receipt_n(bundle: dict, stdout_bytes: bytes) -> int | None:
+def command_sha256(command: list[str]) -> str:
+    return sha256_hex(json.dumps(command, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode())
+
+
+def find_receipt_n(bundle: dict, stdout_bytes: bytes, command_hash: str, used: set[int]) -> int | None:
+    """The lowest unused exec receipt with this stdout hash AND this command hash.
+
+    A finish receipt has no command of its own: it takes it from its start receipt (exec_id).
+    A receipt with no command hash never matches, and a receipt number is returned once,
+    so two identical outputs map to two different receipts.
+    """
     want = sha256_hex(stdout_bytes)
-    receipts = (bundle.get("cathedral_receipts") or {}).get("receipts") or []
-    for doc in receipts:
-        if isinstance(doc, dict) and doc.get("action") in EXEC_ACTIONS and doc.get("stdout_sha256") == want \
-                and isinstance(doc.get("n"), int):
+    receipts = [d for d in ((bundle.get("cathedral_receipts") or {}).get("receipts") or []) if isinstance(d, dict)]
+    starts = {d.get("exec_id"): d for d in receipts if d.get("action") == "sandbox.exec.start"}
+    for doc in sorted((d for d in receipts if isinstance(d.get("n"), int)), key=lambda d: d["n"]):
+        if doc.get("action") not in EXEC_ACTIONS or doc.get("stdout_sha256") != want or doc["n"] in used:
+            continue
+        source = starts.get(doc.get("exec_id")) if doc.get("action") == "sandbox.exec.finish" else doc
+        if source and source.get("command_sha256") == command_hash:
             return doc["n"]
     return None
+
+
+def verify_offline(ctcli: list[str], args, bundle_path: Path, sandbox_id: str, bound: list[tuple[int, str]]) -> dict:
+    """Run `ctcli receipt verify` on the bundle with the pins. Returns the verdict and exit code."""
+    argv = [*ctcli, "receipt", "verify", "--bundle", str(bundle_path), "--json", "--require-outputs",
+            "--sandbox", sandbox_id, "--expected-measurement", args.expected_measurement]
+    argv += ["--cathedral-key", args.cathedral_key] if args.cathedral_key else ["--trusted-keys-file", args.trusted_keys_file]
+    for n, path in bound:
+        argv += ["--stdout", f"{n}={path}"]
+    done = subprocess.run(argv, capture_output=True, text=True, timeout=300)
+    try:
+        verdict = json.loads(done.stdout).get("verdict")
+    except (ValueError, AttributeError):
+        verdict = None
+    return {"verdict": verdict, "exit_code": done.returncode}
 
 
 def run(args, api: Api, ctcli: list[str]) -> tuple[dict, int]:
@@ -118,9 +156,11 @@ def run(args, api: Api, ctcli: list[str]) -> tuple[dict, int]:
         "image": args.image, "template": args.template,
         "prompt_set_sha256": sha256_hex(prompts_bytes), "max_tokens": args.max_tokens,
         "sandbox_id": None, "runs": [], "bundle_path": None, "deleted": False, "error": None,
+        "verification": None,
     }
     sandbox_id = None
     try:
+        create_started = time.monotonic()  # before the POST: provisioning time counts
         created = api.call("POST", "/v1/sandboxes", {
             "image": args.image, "template": args.template, "required_hardware": "amd_sev_snp",
             "network": "deny_all", "lifetime_seconds": args.lifetime_seconds,
@@ -130,14 +170,14 @@ def run(args, api: Api, ctcli: list[str]) -> tuple[dict, int]:
         if not isinstance(sandbox_id, str):
             raise BenchError("create returned no sandbox id")
         result["sandbox_id"] = sandbox_id
-        deadline = time.monotonic() + args.ready_timeout
+        deadline = create_started + args.ready_timeout
         state = created.get("state")
         while state != "running":
             if state in ("failed", "deleted", "deleting") or time.monotonic() > deadline:
                 raise BenchError(f"sandbox did not reach running (state {state})")
             time.sleep(args.poll_seconds)
             state = api.call("GET", f"/v1/sandboxes/{sandbox_id}").get("state")
-        result["create_to_running_s"] = round(time.monotonic() - (deadline - args.ready_timeout), 3)
+        result["create_to_running_s"] = round(time.monotonic() - create_started, 3)
 
         stdouts: list[bytes] = []
         for rep in range(args.runs):
@@ -160,8 +200,7 @@ def run(args, api: Api, ctcli: list[str]) -> tuple[dict, int]:
                     "prompt_tok_s": timing["prompt_tok_s"], "decode_tok_s": timing["gen_tok_s"],
                     "model_wall_ms": timing["wall_ms"], "load_ms": timing.get("load_ms"),
                     "threads": timing.get("threads"), "stdout_file": str(path),
-                    "stdout_sha256": sha256_hex(raw), "command_sha256": sha256_hex(
-                        json.dumps(command, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()),
+                    "stdout_sha256": sha256_hex(raw), "command_sha256": command_sha256(command),
                     "room_receipt_id": answer.get("room_receipt_id"), "receipt_n": None,
                 })
 
@@ -173,10 +212,20 @@ def run(args, api: Api, ctcli: list[str]) -> tuple[dict, int]:
             raise BenchError("ctcli sandbox evidence failed: " + (done.stderr or "").strip()[:200])
         result["bundle_path"] = str(bundle_path)
         bundle = json.loads(bundle_path.read_text())
+        used: set[int] = set()
         for entry, raw in zip(result["runs"], stdouts):
-            entry["receipt_n"] = find_receipt_n(bundle, raw)
-    except BenchError as exc:
-        result["error"] = str(exc)
+            entry["receipt_n"] = find_receipt_n(bundle, raw, entry["command_sha256"], used)
+            if entry["receipt_n"] is not None:
+                used.add(entry["receipt_n"])
+        if all(e["receipt_n"] is not None for e in result["runs"]):
+            bound = [(e["receipt_n"], e["stdout_file"]) for e in result["runs"]]
+            result["verification"] = verify_offline(ctcli, args, bundle_path, sandbox_id, bound)
+            if result["verification"]["verdict"] != "PASS" or result["verification"]["exit_code"] != 0:
+                raise BenchError("ctcli receipt verify did not PASS (verdict %s, exit %s); the numbers are unverified"
+                                 % (result["verification"]["verdict"], result["verification"]["exit_code"]))
+    except (BenchError, subprocess.TimeoutExpired, OSError) as exc:
+        # A timeout or a missing ctcli must not skip the result file: the room is deleted below.
+        result["error"] = str(exc) if isinstance(exc, BenchError) else f"{type(exc).__name__}: {exc}"
     finally:
         if sandbox_id:
             try:
@@ -201,10 +250,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lifetime-seconds", type=int, default=900)
     p.add_argument("--max-spend-usd", default="0.50")
     p.add_argument("--ready-timeout", type=int, default=300)
+    p.add_argument("--cathedral-key", help="Cathedral receipt public key (hex), pinned for the offline verify")
+    p.add_argument("--trusted-keys-file", help="Local trusted keys file, alternative to --cathedral-key")
+    p.add_argument("--expected-measurement", help="Guest measurement (96 hex) the offline verify must see")
     p.add_argument("--poll-seconds", type=float, default=3.0)
     args = p.parse_args(argv)
     if not DIGEST_IMAGE.match(args.image) or args.runs < 1:
         print("--image must be name@sha256:<64 hex> (never a tag) and --runs at least 1", file=sys.stderr)
+        return 2
+    if not (args.cathedral_key or args.trusted_keys_file) or not args.expected_measurement:
+        print("--expected-measurement and one of --cathedral-key / --trusted-keys-file are required: "
+              "the result is only signed evidence after an offline PASS", file=sys.stderr)
         return 2
     key = os.environ.get("CATHEDRAL_API_KEY")
     if not key:
