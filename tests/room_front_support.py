@@ -46,7 +46,7 @@ class FakeApi:
         self.new_ids: list[str] = []
         self.counter = 0
         self.holds: list[tuple[re.Pattern, Hold]] = []
-        self.drops: list[re.Pattern] = []
+        self.drops: list[list] = []  # [pattern, answers still to drop or None for all]
         self.replies: list[tuple[re.Pattern, int, bytes]] = []
         self.network_policy: dict | None = DENY_ALL
         self.expires_in = 3600.0
@@ -63,8 +63,9 @@ class FakeApi:
         self.holds.append((re.compile(pattern), h))
         return h
 
-    def drop(self, pattern: str) -> None:
-        self.drops.append(re.compile(pattern))
+    def drop(self, pattern: str, times: int | None = None) -> None:
+        """Read the request, then close without an answer: for the next *times* matches, or for all."""
+        self.drops.append([re.compile(pattern), times])
 
     def reply(self, pattern: str, status: int, body: bytes | dict = b"{}") -> None:
         self.replies.append((re.compile(pattern), status, body if isinstance(body, bytes) else json.dumps(body).encode()))
@@ -90,7 +91,15 @@ class FakeApi:
             if rx.fullmatch(line):
                 hold.entered.set()
                 hold.release.wait(30)
-        if any(rx.fullmatch(line) for rx in self.drops):
+        with self.lock:
+            dropping = False
+            for entry in self.drops:
+                if entry[0].fullmatch(line) and entry[1] != 0:
+                    dropping = True
+                    if entry[1] is not None:
+                        entry[1] -= 1
+                    break
+        if dropping:
             h.close_connection = True
             h.connection.shutdown(socket.SHUT_RDWR)
             return

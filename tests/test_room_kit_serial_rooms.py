@@ -372,3 +372,40 @@ def test_the_sealed_env_handler_is_refused_on_a_serial_room_and_its_read_passes(
     # An ordinary room reaches the handler for both.
     assert front.call("POST", f"/v1/sandboxes/{ordinary}/sealed-env", {"x": 1})[0] == 403
     assert_idle(front.ledger)
+
+
+def test_a_signed_get_on_a_serial_room_is_sent_once_and_a_lost_answer_signs_502_and_breaks_the_room(front) -> None:
+    room = serial_room(front)
+    front.api.drop(rf"GET /v1/sandboxes/{room}/files", times=1)  # the API receives it, then no answer
+    status, headers, _out = front.get_file(room)
+    assert status == 502 and receipt_of(headers)["statement"]["status"] == 502
+    assert front.api.count(rf"GET /v1/sandboxes/{room}/files") == 1, "one receipt, one request"
+    status, _headers, out = front.exec(room)
+    assert status == 409 and code(out) == "room_broken"
+    assert room in front.ledger.broken
+    assert front.delete(room)[0] == 200
+    assert_idle(front.ledger)
+
+
+def test_on_an_ordinary_room_a_lost_get_answer_is_retried_and_signs_one_success(front) -> None:
+    room = plain_room(front)
+    front.api.drop(rf"GET /v1/sandboxes/{room}/files", times=1)
+    status, headers, _out = front.get_file(room)
+    assert status == 200 and receipt_of(headers)["statement"]["status"] == 200
+    assert front.api.count(rf"GET /v1/sandboxes/{room}/files") == 2
+    assert [s["action"] for s in front.statements(room)] == ["create", "file_get"]
+    assert_idle(front.ledger)
+
+
+def test_a_request_for_a_busy_serial_room_returns_at_once(front) -> None:
+    room = serial_room(front)
+    held = front.api.hold(rf"POST /v1/sandboxes/{room}/exec")
+    t, box = in_thread(front.exec, room)
+    held.wait_entered()
+    started = time.monotonic()
+    status, _headers, out = front.exec(room, "second")
+    assert status == 409 and code(out) == "room_busy"
+    assert time.monotonic() - started < 1.0, "the second request waited for the first"
+    held.release.set()
+    finish(t, box)
+    assert_idle(front.ledger)
