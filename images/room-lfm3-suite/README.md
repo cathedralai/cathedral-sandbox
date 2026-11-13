@@ -209,6 +209,17 @@ kinds of room:
   file). Each call is printed on stderr as it runs (`$ ls -la`); the output
   the model reads is cut at 2,000 characters. At most 4 tool rounds a
   message, then the model must answer. `--no-tools` answers without them.
+- **Audio's tool choice (AB#545).** Offered tools, LFM3-Audio-2B called one
+  for every message, even "What is 2+2?": its first token was `<tool_call>`
+  at 0.89 to 1.00 whatever the question, so neither sampling nor a reworded
+  system prompt changed it. In Audio rooms a round that offers tools starts
+  with three fixed example turns after the system prompt: a sum and a
+  translation answered in text, and "Is cowsay installed on this machine?"
+  answered with `run`. They are not kept in the conversation, never shown,
+  count against the 4,000-character budget, and are not sent with
+  `--no-tools`, `--json` or the last round. The tool example names a program
+  nobody asks about: an example with a real fact (an IP address) came back as
+  Audio's answer to "What is the hostname?" with no call.
 - **JSON.** `--json` sends a JSON schema (an object or an array) as
   `response_format`, which llama-server turns into a grammar, plus one system
   line asking for valid JSON with no comments, and no tools. The grammar fixes
