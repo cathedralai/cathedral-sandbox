@@ -2261,7 +2261,14 @@ func (c *countingWriter) Flush() {
 
 func main() {
 	cfgPath := flag.String("config", "/etc/thin-broker/config.json", "private config file")
+	printDigest := flag.Bool("print-catalog-digest", false, "print the compiled-in catalog digest and exit; reads no config (AB#546 swap check)")
 	flag.Parse()
+	if *printDigest {
+		if err := printCatalogDigest(os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	b, err := loadBroker(*cfgPath)
 	if err != nil {
 		log.Fatal(err)
