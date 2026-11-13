@@ -125,6 +125,7 @@ class SandboxProvider(Protocol):
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult: ...
     def write_file(self, sandbox_id: str, path: str, data: bytes, mode: int | None) -> None: ...
     def read_file(self, sandbox_id: str, spec: FileGet) -> tuple[bytes, int]: ...
+    def list_directory(self, sandbox_id: str, path: str) -> list[dict[str, str]]: ...
     def write_tar(self, sandbox_id: str, path: str, tarball: bytes) -> None: ...
     def read_tar(self, sandbox_id: str, spec: TarGet) -> bytes: ...
     def stat(self, sandbox_id: str, path: str) -> StatResult: ...
@@ -731,6 +732,38 @@ class InMemorySandboxProvider:
                 length = (spec.range_end - spec.range_start + 1) if spec.range_end is not None else None
                 return fh.read(length), total
             return fh.read(), total
+
+    def list_directory(self, sandbox_id: str, path: str) -> list[dict[str, str]]:
+        """List plain entries through a directory fd, without following room links."""
+        with self._lock:
+            sandbox = self._require_active(sandbox_id)
+            self._touch(sandbox)
+        self._host(sandbox, path)
+        try:
+            fd = _open_beneath(sandbox.root, path, os.O_RDONLY | os.O_DIRECTORY)
+        except FileNotFoundError:
+            raise SandboxOpError("directory_not_found", 404, f"no directory {path}") from None
+        entries: list[dict[str, str]] = []
+        try:
+            with os.scandir(fd) as scan:
+                scanned = 0
+                for entry in scan:
+                    scanned += 1
+                    if scanned > 1000:
+                        raise SandboxOpError(
+                            "directory_too_large", 413, "directory has more than 1000 entries"
+                        )
+                    # Links and special files are not navigable through this API.
+                    if entry.is_dir(follow_symlinks=False):
+                        kind = "directory"
+                    elif entry.is_file(follow_symlinks=False):
+                        kind = "file"
+                    else:
+                        continue
+                    entries.append({"name": entry.name, "kind": kind})
+        finally:
+            os.close(fd)
+        return sorted(entries, key=lambda entry: entry["name"])
 
     def write_tar(self, sandbox_id: str, path: str, tarball: bytes) -> None:
         with self._lock:

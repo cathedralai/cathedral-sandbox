@@ -82,6 +82,44 @@ def test_stat_endpoint(app: SandboxApplication) -> None:
     assert st == {"is_dir": False, "is_file": True, "size": 3, "mode": st["mode"]}
 
 
+def test_directory_entries_preserve_names_and_refuse_links(app: SandboxApplication) -> None:
+    sid = _create(app)
+    root = app.provider._sandboxes[sid].root  # create a hostile room filesystem
+    (root / "work" / "sub").mkdir()
+    (root / "work" / "line\nbreak.txt").write_text("x")
+    (root / "work" / "outside").symlink_to("/etc", target_is_directory=True)
+
+    response = app.dispatch("GET", f"/v1/sandboxes/{sid}/entries?path=/work", AUTH, b"")
+    assert response.status == 200
+    assert json.loads(response.body) == {
+        "path": "/work",
+        "entries": [
+            {"name": "line\nbreak.txt", "kind": "file"},
+            {"name": "sub", "kind": "directory"},
+        ],
+    }
+    outside = app.dispatch("GET", f"/v1/sandboxes/{sid}/entries?path=/work/outside", AUTH, b"")
+    assert outside.status == 400
+    assert json.loads(outside.body)["error"]["code"] == "path_escape"
+    missing = app.dispatch("GET", f"/v1/sandboxes/{sid}/entries?path=/work/missing", AUTH, b"")
+    assert missing.status == 404
+    assert app.dispatch("GET", f"/v1/sandboxes/{sid}/entries?path=/work", {}, b"").status == 401
+    other = app.dispatch(
+        "GET", f"/v1/sandboxes/{sid}/entries?path=/work", {"Authorization": "Bearer k2"}, b""
+    )
+    assert other.status == 404
+
+
+def test_directory_entries_refuse_unbounded_output(app: SandboxApplication) -> None:
+    sid = _create(app)
+    root = app.provider._sandboxes[sid].root  # fill the room filesystem
+    for index in range(1001):
+        (root / "work" / f"file-{index}").touch()
+    response = app.dispatch("GET", f"/v1/sandboxes/{sid}/entries?path=/work", AUTH, b"")
+    assert response.status == 413
+    assert json.loads(response.body)["error"]["code"] == "directory_too_large"
+
+
 # ------------------------------------------------------------------ §3.3 Range / max_bytes codes
 def test_get_file_range_returns_206(app: SandboxApplication) -> None:
     sid = _create(app)
