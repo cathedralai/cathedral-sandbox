@@ -52,6 +52,10 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      must carry a lower-case UUID. The output maps each room to the Cathedral
      sandbox id its successful create receipt signed. --cathedral-sandbox <id>
      fails unless a successful create receipt names that id.
+ 10. guest ingress (AB#422): a sealed binding that names guest_ingress must
+     name a cathedral_guest_ingress_v1 object with a well-formed
+     tls_spki_sha256: the key Preview URLs will be served with, made in the
+     guest. The output reports it; nothing serves on it yet.
 
 Not checked here (by design, today): that the measurement is an approved image.
 Image approval is a signed policy release; that is a later step.
@@ -294,6 +298,35 @@ def verify_guest_tls(att: dict, peer_spki_sha256: str | None = None, require: bo
     return {"tls_spki_sha256": tls, "peer_checked": peer_spki_sha256 is not None,
             "hotel_key_install_x25519_b64": base64.b64encode(install).decode(),
             "hotel_key_install_signers_ed25519_b64": signers, "hotel_key_source": "install"}
+
+
+INGRESS_SCHEMA = "cathedral_guest_ingress_v1"
+
+
+def verify_guest_ingress(att: dict, peer_spki_sha256: str | None = None, require: bool = False) -> dict | None:
+    """The guest ingress key a sealed binding names (room_receipts.GuestIngress, AB#422).
+
+    The binding is covered by REPORT_DATA, so the key it names was made in the
+    guest. peer_spki_sha256 is the SPKI sha256 of the TLS peer that served a
+    Preview URL: equal means that session ended in the guest. Returns None for
+    a binding with no ingress key. A level 1 binding has no SNP report, so
+    nothing it names is attested.
+    """
+    binding = att["binding"]
+    need(not is_hotel_level(att), "a level 1 binding has no attested guest ingress key")
+    ingress = binding.get("guest_ingress")
+    if ingress is None:
+        need(not require and peer_spki_sha256 is None,
+             "the binding names no guest ingress key: a Preview URL's TLS is not attested")
+        return None
+    need(isinstance(ingress, dict) and ingress.get("schema") == INGRESS_SCHEMA,
+         "binding guest_ingress is not a cathedral_guest_ingress_v1 object")
+    tls = ingress.get("tls_spki_sha256")
+    need(isinstance(tls, str) and HEX64.fullmatch(tls) is not None,
+         "binding guest_ingress.tls_spki_sha256 is not 64 lower-case hex")
+    if peer_spki_sha256 is not None:
+        need(peer_spki_sha256.lower() == tls, "the Preview URL peer is not the key the binding names (the host answered?)")
+    return {"schema": INGRESS_SCHEMA, "tls_spki_sha256": tls, "peer_checked": peer_spki_sha256 is not None}
 
 
 def verify_install_key(doc: dict, att: dict) -> str:
@@ -712,6 +745,9 @@ def main() -> int:
                     need(install_doc is not None, "the hotel did not answer GET /room/hotel-key-install-key")
                     guest_tls["install_key_checked"] = verify_install_key(install_doc, att) is not None
                 attestation_out["guest_tls"] = guest_tls
+            guest_ingress = verify_guest_ingress(att)
+            if guest_ingress is not None:
+                attestation_out["guest_ingress"] = guest_ingress
             if owner is not None:
                 attestation_out["owner"] = verify_owner(att, owner)
                 attestation_out["owner"]["signed_creates"] = owner_signed_creates(live_receipts, owner)

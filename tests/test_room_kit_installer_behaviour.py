@@ -978,6 +978,22 @@ def test_install_sealed_exec_wires_the_front_only(host: FakeHost) -> None:
     assert 'ROOM_SEALED_EXEC="1"' in (host.etc / "room.env").read_text()
 
 
+def test_install_guest_ingress_wires_the_front_only(host: FakeHost) -> None:
+    default = host.install(str(host.room_env()))
+    assert default.returncode == 0, default.stdout + default.stderr[-4000:]
+    assert "ROOM_GUEST_INGRESS" not in host.unit("room-a-receipts.service")
+    assert 'ROOM_GUEST_INGRESS="0"' in (host.etc / "room.env").read_text()
+    proc = host.install(str(host.room_env(ROOM_GUEST_INGRESS="1")))
+    assert proc.returncode == 0, proc.stdout + proc.stderr[-4000:]
+    unit = host.unit("room-a-receipts.service")
+    assert "Environment=ROOM_GUEST_INGRESS=1\n" in unit
+    assert unit.index("ROOM_GUEST_INGRESS=1") < unit.index("ExecStart=")
+    # Only the front changes (AB#422): no API setting, no other sealed flag.
+    assert "INGRESS" not in (host.etc / "api.env").read_text()
+    assert "ROOM_SEALED_EXEC=1" not in unit and "ROOM_SEALED_SECRETS=1" not in unit
+    assert 'ROOM_GUEST_INGRESS="1"' in (host.etc / "room.env").read_text()
+
+
 @pytest.mark.parametrize("overrides,message", [
     ({"ROOM_MINER": "1", "ROOM_RECEIPTS_TLS_LISTEN": "10.215.0.2:18443"}, "ROOM_HOTEL_KEY_INSTALL_SIGNERS"),
     ({"ROOM_MINER": "1", "ROOM_HOTEL_KEY_INSTALL_SIGNERS": MINER_SIGNER}, "ROOM_RECEIPTS_TLS_LISTEN"),
