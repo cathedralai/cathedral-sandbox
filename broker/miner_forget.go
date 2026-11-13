@@ -137,6 +137,7 @@ func (b *broker) forgetAndLeave(w http.ResponseWriter, h *hotel, id string) {
 	for _, byHotel := range b.guestRooms {
 		delete(byHotel, id)
 	}
+	b.noteMinerForgotten(id, time.Now())
 	b.mu.Unlock()
 	b.compat.mu.Lock()
 	for eid, ex := range b.compat.execs { // results of a forgotten room have no reader
