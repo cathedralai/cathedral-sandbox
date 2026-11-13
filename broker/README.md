@@ -443,7 +443,8 @@ the config, an operator adds and removes hotels without a restart:
 `miner_enroll_key_sha256` is a separate control-plane key for the miner
 reconciler. It can read miner hotel documents and a miner-only capacity view,
 request sealed miner hotel
-joins with HTTPS API and health endpoints, set `drain=true` on a miner hotel,
+joins with HTTPS API and health endpoints, set `drain=true` (optionally with a
+signed `drain_notice`) on a miner hotel,
 and leave an empty miner hotel. It cannot read or change operator hotels,
 change guest policy, plant Escape nonces, opt out of join verification, set
 custom labels or reservations, or undo a drain. The digest must differ from
@@ -476,7 +477,7 @@ receive this policy document.
 |---|---|
 | `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey`, `reserved_for`, `lent_from`, `lent_report_id` and `admission` (with `report_id` once attested). |
 | `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?, "require_attestation"?}`. A miner hotel must set `"sealed": true` and use HTTPS with attested guest TLS; the broker pins that key before its first keyed call. `"verify": false` is refused for miners (409 `guest_tls_required`). For operator hotels, the broker calls `GET /v1/status` with the key and checks attestation for sealed hotels; `"verify": false` skips both for an unsealed hotel and is refused for a sealed one (400 `verify_required`). `"sealed_admission": "off"` is refused at join (400 `invalid_hotel`): a joined hotel is always gated. An unsealed join cannot claim `labels.sealed=true` or set `require_attestation`. `miner_hotkey` (SS58) adds `miner=true` and `miner_hotkey` labels, which a PATCH cannot remove. |
-| `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). An unsealed runtime hotel cannot gain the sealed label. `lend: true` lends a reserved sealed hotel to the pool; `reserved_for` on a lent hotel reclaims it (see Lend and reclaim). |
+| `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). An unsealed runtime hotel cannot gain the sealed label. `lend: true` lends a reserved sealed hotel to the pool; `reserved_for` on a lent hotel reclaims it (see Lend and reclaim). `drain_notice` (with `drain: true`, miner hotels only) records a miner-signed planned-maintenance notice and drains the hotel at once; see `drain_notice.go`. |
 
 | `DELETE /v1/broker/hotels/<id>` | Removes a runtime hotel that has no rooms. Drain it first. `?forget_rooms=true` (operator key only, miner hotels only): when the hotel is drained, has been down for 10 minutes and has no create in flight, it asks the old guest once more on its attested key (an answer refuses and starts the 10 minutes again), writes the rooms' `deleted` tombstones to disk, removes the hotel from the runtime list, and only then releases the rooms. A failed write answers 500 and leaves every room, client id and tombstone as before. Otherwise 409 `forget_refused` with the reason. |
 

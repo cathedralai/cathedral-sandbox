@@ -5,7 +5,7 @@
 //
 //	GET    /v1/broker/hotels/<id>   the hotel document with its admission state
 //	POST   /v1/broker/hotels        {id, name, api, health, key, concurrency, labels, threads, ram_gib, sealed, max_slots, reserved_for, miner_hotkey, require_attestation}
-//	PATCH  /v1/broker/hotels/<id>   {drain, labels, reserved_for, max_slots, lend}  (reserved_for null: back to the pool; lend and reclaim: lend.go)
+//	PATCH  /v1/broker/hotels/<id>   {drain, drain_notice, labels, reserved_for, max_slots, lend}  (reserved_for null: back to the pool; lend and reclaim: lend.go; drain_notice: drain_notice.go)
 
 //	DELETE /v1/broker/hotels/<id>   (only a hotel with no rooms; drain it first)
 //
@@ -398,6 +398,9 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	case hc.LentFrom != "" || hc.LentReportID != "":
 		writeErr(w, 400, "invalid_hotel", `lent_from and lent_report_id are set by PATCH {"lend": true}, not at join`)
 		return
+	case hc.DrainNotice != nil:
+		writeErr(w, 400, "invalid_hotel", `drain_notice is set by PATCH {"drain": true, "drain_notice": ...}, not at join`)
+		return
 	}
 	if b.cfg.StateDir == "" {
 		writeErr(w, 409, "no_state_dir", "set state_dir in the config to add hotels at runtime")
@@ -564,6 +567,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		Labels      map[string]string `json:"labels"`
 		ReservedFor json.RawMessage   `json:"reserved_for"` // a guest id, or null to release; on a lent hotel, the reclaim (lend.go)
 		Lend        *bool             `json:"lend"`         // true: lend the reserved hotel to the pool (lend.go)
+		DrainNotice json.RawMessage   `json:"drain_notice"` // a signed planned-maintenance notice; needs drain=true (drain_notice.go)
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if json.Unmarshal(raw, &req) != nil {
@@ -571,8 +575,28 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		return
 	}
 	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0 || req.Lend != nil) {
-		writeErr(w, 403, "enroller_scope", "miner enrollment may only set drain=true")
+		writeErr(w, 403, "enroller_scope", "miner enrollment may only set drain=true, with or without a drain_notice")
 		return
+	}
+	var notice *drainNotice
+	if len(req.DrainNotice) > 0 && string(req.DrainNotice) != "null" {
+		if h.cfg.MinerHotkey == "" {
+			writeErr(w, 400, "invalid_drain_notice", "a drain_notice is only for a miner hotel")
+			return
+		}
+		if req.Drain == nil || !*req.Drain {
+			writeErr(w, 400, "invalid_drain_notice", "a drain_notice needs drain=true in the same request")
+			return
+		}
+		n, err := parseDrainNotice(req.DrainNotice)
+		if err == nil {
+			err = checkDrainNotice(n, h, time.Now())
+		}
+		if err != nil {
+			writeErr(w, 400, "invalid_drain_notice", err.Error())
+			return
+		}
+		notice = &n
 	}
 	if req.Drain != nil && !*req.Drain && b.minerOverCap(h) {
 		writeErr(w, 409, "miner_cap_reached", "hotel is outside the current miner admission caps")
@@ -620,6 +644,23 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	}
 	h.cfgMu.Lock()
 	oldCfg := h.cfg
+	// A resent notice (same notice_id) keeps its first received_at, so a
+	// retry cannot shorten its lead. A new notice may not replace one whose
+	// window is still open.
+	var newNotice *drainNoticeRecord
+	if notice != nil {
+		cur := h.cfg.DrainNotice
+		switch {
+		case cur != nil && cur.Notice.NoticeID == notice.NoticeID:
+		case cur != nil && time.Now().Unix() < cur.Notice.Until:
+			h.cfgMu.Unlock()
+			b.mu.Unlock()
+			writeErr(w, 409, "drain_notice_active", fmt.Sprintf("hotel %s has an open maintenance window until %d", h.cfg.ID, cur.Notice.Until))
+			return
+		default:
+			newNotice = &drainNoticeRecord{Notice: *notice, ReceivedAt: time.Now().Unix()}
+		}
+	}
 	// The lend or reclaim is checked again under the locks pick takes, and
 	// the other fields apply only when it passes.
 	if e := lc.applyLend(h); e != nil {
@@ -630,6 +671,12 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	}
 	if req.Drain != nil {
 		h.cfg.Drain = *req.Drain
+		if !*req.Drain {
+			h.cfg.DrainNotice = nil // the operator ended the maintenance
+		}
+	}
+	if newNotice != nil {
+		h.cfg.DrainNotice = newNotice
 	}
 	if req.Labels != nil {
 		// The sealed and miner labels stay: guests select and deny by them.
@@ -643,7 +690,14 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	}
 	h.cfgMu.Unlock()
 	var err error
+	if newNotice != nil {
+		// The log line goes first: it is the record that outlives the hotel.
+		// If the hotel save then fails, the PATCH fails and the line stays as
+		// evidence that the miner sent the notice at received_at.
+		err = b.appendDrainNotice(*newNotice)
+	}
 	switch {
+	case err != nil:
 	case lc.lend || lc.reclaim:
 		err = b.saveLendStateLocked(h) // the lend state must survive a restart (lend.go)
 	case h.runtime:
@@ -653,6 +707,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		log.Printf("hotel %s update not saved: %v", h.cfg.ID, err)
 		h.cfgMu.Lock()
 		h.cfg.Drain = oldCfg.Drain
+		h.cfg.DrainNotice = oldCfg.DrainNotice
 		h.cfg.Labels = oldCfg.Labels
 		h.cfg.MaxSlots = oldCfg.MaxSlots
 		h.cfg.ReservedFor = oldCfg.ReservedFor
@@ -755,7 +810,7 @@ func (b *broker) hotelDoc(h *hotel) map[string]any {
 	now := time.Now()
 	return map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime,
 		"reserved_for": reserved, "lent_from": lent, "lent_report_id": lentReport, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
-		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now)}
+		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now), "drain_notice": h.drainNotice()}
 }
 
 func (b *broker) guestExists(id string) bool {
