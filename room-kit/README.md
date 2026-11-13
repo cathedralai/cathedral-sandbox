@@ -199,6 +199,36 @@ looks at that room, with one GET.
 Limits: only rooms the front signed a create for; after a front restart the
 table is empty and no end is signed for earlier rooms.
 
+### Pre-made rooms
+
+A create whose labels carry `cathedral_pool` = `"1"` makes a pre-made room. It
+holds only `image` (a non-empty string), `resources` (an object), `network`
+(exactly `{"mode":"deny_all","allow":[]}`), `labels` (without
+`cathedral_sandbox_id` or `cathedral_serial`) and `ttl_seconds` (an integer),
+and carries no `Idempotency-Key`: otherwise 400 `pool_create_invalid`,
+`reserved_label_invalid` or `idempotency_key_refused`. Its create receipt carries
+`pool: true` when it is the room's receipt 1, nothing was in flight for it,
+the API's answer shows `deny_all` and an `expires_at` with an offset that falls
+within 48 hours.
+
+An unclaimed room accepts delete, claim and reads of its record (GET of the
+room, `/wait`) only; every other route, the sealed handlers included, is
+refused with 409 `pool_room_unclaimed`.
+
+`POST /v1/sandboxes/<id>/claim` with exactly `{"cathedral_sandbox_id": <lower-case
+UUID>, "lifetime_seconds": 1..172800}` binds the room. It needs: an unclaimed pool
+room this boot has the create receipt of, a list holding the create alone, and
+at least 300 s before the room's `expires_at`. It sets the lifetime through the
+API (10 s wait) and signs `claim` (`cathedral_sandbox_id`, `lifetime_seconds`,
+`pooled_from` = the create receipt's hash, `status`, `expires_at`). Success
+answers 200 with the receipt. Any other result signs the claim with its status,
+breaks the room (delete only) and answers 409 `pool_claim_failed`: one try per
+room. The same id claiming again gets the stored answer and receipt; another id
+gets 409 `pool_room_claimed`. A delete meanwhile gets 409 `room_busy`.
+Other refusals: 405 for a method but POST, 400 `claim_request_invalid`, 409
+`pool_room_stale`, `pool_room_gone`, `room_not_pool`, `pool_room_used`,
+`pool_room_expiring`.
+
 ### Fresh report over caller data (sealed only)
 
 `POST /room/attest` on the receipt front asks the processor for a new SNP

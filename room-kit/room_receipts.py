@@ -2046,7 +2046,7 @@ class Ledger:
         self.busy: set[str] = set()
         self.serial: set[str] = set()
         self.broken: set[str] = set()
-        # The flag of a serial create needs that nothing ran in the room before the create was signed. The
+        # The flag of a serial or pool create needs that nothing ran in the room before the create was signed. The
         # in-flight count sees a request still running; touched sees one that finished without a receipt (an
         # unsigned write, or a request the API refused): a non-read request for an id with no create receipt is
         # recorded at enter and again at leave when a create is pending at that moment, so any request whose
@@ -2060,6 +2060,10 @@ class Ledger:
         # A bulk delete by label names no room, so it cannot be matched to a pending create. One that is in
         # flight at any moment while a create is pending withholds every flag (it sets overflow, at both ends).
         self.bulk_in_flight = 0
+        # Pre-made rooms: pool maps an unclaimed room to its expires_at (epoch); claimed maps a claimed room to
+        # (the sandbox id it was claimed for, the answer sent, the claim receipt) so a repeat gets the same answer.
+        self.pool: dict[str, float] = {}
+        self.claimed: dict[str, tuple[str, bytes, dict]] = {}
         self.head = self.binding_sha256
         os.makedirs(store, mode=0o700, exist_ok=True)
         self.store = open(os.path.join(store, f"chain-{self.binding['boot_id']}.jsonl"), "ab", buffering=0)
@@ -2124,8 +2128,13 @@ class Ledger:
             elif room in self.serial:
                 if kind in ("signed", "delete"):
                     token = True
-                elif kind != "read":
+                elif kind not in ("read", "record_read"):
                     return None, (409, "room_serial_unsigned", "a serial room accepts signed requests and reads only")
+            elif room in self.pool:
+                if kind in ("delete", "claim"):
+                    token = True
+                elif kind != "record_read":
+                    return None, (409, "pool_room_unclaimed", "this room is not claimed yet")
             if token and room in self.busy:
                 return None, (409, "room_busy", "this room is running another request")
             nonread = kind not in ("read", "record_read")
@@ -2176,7 +2185,7 @@ class Ledger:
             room = turn.room
             if turn.nonread:
                 self._touch(room)  # it may have run while a create was pending, though it entered before
-            if turn.token and room in self.serial:
+            if turn.token and (room in self.serial or room in self.pool):
                 signed = len(self.by_room.get(room, [])) > turn.receipts_before
                 if turn.lost or (turn.called and not signed):
                     self.broken.add(room)
@@ -2193,6 +2202,8 @@ class Ledger:
         self.incarnations.pop(room, None)
         self.serial.discard(room)
         self.broken.discard(room)
+        self.pool.pop(room, None)
+        self.claimed.pop(room, None)
 
     def end_room(self, room: str, incarnation: str, status: int, reason: str, result_sha256: str) -> dict | None:
         """Sign room_end for *room* if it is still the incarnation that was looked at and nothing is in flight for it.
@@ -2207,6 +2218,47 @@ class Ledger:
                 "room_create_receipt_sha256": incarnation, "status": status, "reason": reason,
                 "result_sha256": result_sha256,
             })
+
+    def claim_check(self, room: str, cathedral_id: str, now: float) -> tuple[tuple[int, bytes, dict] | None, tuple[str, str] | None, str | None]:
+        """What a claim of *room* may do now: (stored answer, refusal, create receipt hash).
+
+        A stored answer (status, body, receipt) is for the same sandbox id claiming again. Otherwise exactly
+        one of refusal (code, message) or the hash of the room's create receipt is set. One locked step.
+        """
+        with self.lock:
+            held = self.claimed.get(room)
+            if held is not None:
+                if held[0] == cathedral_id:
+                    return (200, held[1], held[2]), None, None
+                return None, ("pool_room_claimed", "this room is claimed for another sandbox"), None
+            history = self.by_room.get(room, [])
+            if not history:
+                return None, ("pool_room_stale", "this front has no receipt for the room"), None
+            if room not in self.incarnations:
+                return None, ("pool_room_gone", "the room has ended"), None
+            if room not in self.pool:
+                return None, ("room_not_pool", "this room is not a pre-made room"), None
+            if len(history) != 1:
+                return None, ("pool_room_used", "the room has receipts besides its create"), None
+            if now > self.pool[room] - POOL_CLAIM_MARGIN_SECONDS:
+                return None, ("pool_room_expiring", "the room is too close to its time limit"), None
+            return None, None, self.chain[history[0]]["receipt_sha256"]
+
+    def sign_claim(self, room: str, fields: dict, answer: dict) -> dict:
+        """Sign the claim and, when its lifetime call succeeded, open the room: one locked step.
+
+        A 2xx claim clears the pool mark and stores the answer for a repeat. Any other ends the room's one
+        try: the room is broken, so only a delete is accepted from then on.
+        """
+        with self.lock:
+            receipt = self._sign_locked(fields)
+            status = receipt["statement"]["status"]
+            if isinstance(status, int) and 200 <= status < 300:
+                self.pool.pop(room, None)
+                self.claimed[room] = (fields["cathedral_sandbox_id"], canonical(answer), receipt)
+            else:
+                self.broken.add(room)
+            return receipt
 
     def sign(self, fields: dict, create: dict | None = None) -> dict:
         with self.lock:
@@ -2232,9 +2284,13 @@ class Ledger:
         status = statement.get("status")
         ok = isinstance(status, int) and 200 <= status < 300
         if create and ok and statement.get("action") == "create" and isinstance(named, str) and named:
-            if create.get("serial") and not self.in_flight.get(named) and named not in self.by_room \
-                    and named not in self.touched and not self.overflow:
+            fresh = not self.in_flight.get(named) and named not in self.by_room \
+                and named not in self.touched and not self.overflow
+            if create.get("serial") and fresh:
                 statement["serial"] = True
+            elif create.get("pool") and fresh and statement.get("network_policy") == DENY_ALL \
+                    and isinstance(create.get("expires_at"), float):
+                statement["pool"] = True
         receipt = {"statement": statement, "signature_b64": b64(self.key.sign(canonical(statement))),
                    "receipt_sha256": sha(canonical(statement))}
         self.head = receipt["receipt_sha256"]
@@ -2249,6 +2305,8 @@ class Ledger:
                     self.incarnations[room] = receipt["receipt_sha256"]
                     if statement.get("serial"):
                         self.serial.add(room)
+                    if statement.get("pool"):
+                        self.pool[room] = create["expires_at"]
                 elif action == "delete":
                     self._room_gone(room)
             if action == "room_end":
@@ -2284,6 +2342,20 @@ OWNER_GATED = [  # (method, path pattern, action in the signed message)
 # from customers.
 SERIAL_LABEL = "cathedral_serial"
 POOL_LABEL = "cathedral_pool"
+CLAIM_ROUTE = re.compile("^" + ROOM + r"/claim$")
+DENY_ALL = {"mode": "deny_all", "allow": []}  # the network a pool room is made with, in the form the broker sends
+POOL_CREATE_KEYS = frozenset({"image", "resources", "network", "labels", "ttl_seconds"})
+# A claim is let in only this long before the room's own limit, so the API's clean-up of a room past its
+# limit (which acts a while after it) cannot reach a claimed room. The lifetime call waits at most CLAIM_WAIT.
+POOL_CLAIM_MARGIN_SECONDS = 300
+CLAIM_WAIT_SECONDS = 10
+CLAIM_LIFETIME_MAX = 172800
+EXPIRES_MAX_SECONDS = 48 * 3600 + 60
+# What an unclaimed pool room lets through unsigned: reads of the room's record.
+RECORD_READS = [
+    ("GET", re.compile("^" + ROOM + r"$")),
+    ("POST", re.compile("^" + ROOM + r"/wait$")),
+]
 ROOM_PATH = re.compile(r"^/v1/sandboxes/(?P<id>[^/]+)(?:/|$)")
 # What a serial room lets through unsigned: requests that read the room and change nothing. A route on no
 # list here is refused, so a route added later is closed until it is listed. A terminal's output is not a
@@ -2331,11 +2403,19 @@ def room_of(path: str) -> str | None:
 
 
 def route_kind(method: str, path: str) -> str:
-    """How the gate sees a request that names a room: delete, signed (a row of SIGNED), read or other."""
+    """How the gate sees a request that names a room.
+
+    delete, claim, signed (a row of SIGNED), record_read (the reads an unclaimed pool room allows), read, or
+    other (anything on no list).
+    """
     if method == "DELETE" and re.match("^" + ROOM + "$", path):
         return "delete"
+    if method == "POST" and CLAIM_ROUTE.match(path):
+        return "claim"
     if any(meth == method and pat.match(path) for meth, pat, _action in SIGNED):
         return "signed"
+    if any(meth == method and pat.match(path) for meth, pat in RECORD_READS):
+        return "record_read"
     if any(meth == method and pat.match(path) for meth, pat in READS):
         return "read"
     return "other"
@@ -2351,6 +2431,20 @@ def api_request_path(raw_target: str) -> tuple[str, str]:
     path = parsed.path
     forward = path + (f"?{parsed.query}" if parsed.query else "")
     return path, forward
+
+
+def parse_expires_at(value, now: float) -> float | None:
+    """The epoch of the API's expires_at (an ISO time with an offset), or None unless it lies in (now, now + 48 h + 60 s]."""
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        return None
+    epoch = moment.timestamp()
+    return epoch if now < epoch <= now + EXPIRES_MAX_SECONDS else None
 
 
 class Turn:
@@ -2574,6 +2668,9 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             # Opened here; only the opened overlay goes on, inside the guest, to the room API.
             return self.handle_sealed_env(ledger, m["id"], body)
+        m = CLAIM_ROUTE.match(path)
+        if m:
+            return self.handle_claim(ledger, m["id"], body)
         if any(route.match(p) for route in INTERNAL_API_ROUTES for p in (path, unquote(path))):
             # The room API's sealed exec route runs an exec that leaves no history or log, and
             # its env-sealed route sets a room's env from an envelope this front opened; neither
@@ -2617,6 +2714,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.api_port, body, path=forward_path,
                 **({"timeout": plain_exec_wait(body)} if action == "exec" else {}))
         extra = {}
+        if create_ask and create_ask.get("pool"):
+            # The API's own answer says when the room's limit falls; the claim's time-left rule reads it.
+            try:
+                expiry = json.loads(out).get("expires_at")
+            except (ValueError, RecursionError, AttributeError):
+                expiry = None
+            create_ask = {**create_ask, "expires_at": parse_expires_at(expiry, time.time())}
         if action and self.authorized():
             try:
                 extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(ledger.sign(
@@ -2648,13 +2752,32 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, RecursionError):
             return None, None
         labels = doc.get("labels") if isinstance(doc, dict) else None
-        if not isinstance(labels, dict) or SERIAL_LABEL not in labels:
+        if not isinstance(labels, dict):
             return None, None
+        if SERIAL_LABEL not in labels:
+            return self.pool_create_check(doc, labels) if POOL_LABEL in labels else (None, None)
         if labels[SERIAL_LABEL] != "1" or type(labels[SERIAL_LABEL]) is not str or POOL_LABEL in labels:
             return ("reserved_label_invalid", f"{SERIAL_LABEL} must be the string 1 and not set with {POOL_LABEL}"), None
         if self.headers.get_all("Idempotency-Key") is not None:
             return ("idempotency_key_refused", "a serial room is made without an Idempotency-Key"), None
         return None, {"serial": True}
+
+    def pool_create_check(self, doc: dict, labels: dict) -> tuple[tuple[str, str] | None, dict | None]:
+        """The rules of a pre-made room's create. The room runs nothing at create but the machine's own main process."""
+        invalid = ("pool_create_invalid", "a pool create has an image, resources, the deny_all network, labels and "
+                                          "ttl_seconds, and nothing else")
+        if labels[POOL_LABEL] != "1" or type(labels[POOL_LABEL]) is not str:
+            return ("reserved_label_invalid", f"{POOL_LABEL} must be the string 1"), None
+        if self.headers.get_all("Idempotency-Key") is not None:
+            return ("idempotency_key_refused", "a pool room is made without an Idempotency-Key"), None
+        if SANDBOX_LINK_LABEL in labels or not set(doc) <= POOL_CREATE_KEYS:
+            return invalid, None
+        image, resources, ttl = doc.get("image"), doc.get("resources", {}), doc.get("ttl_seconds", 0)
+        if not isinstance(image, str) or not image or not isinstance(resources, dict) or type(ttl) is not int:
+            return invalid, None
+        if doc.get("network") != DENY_ALL:
+            return invalid, None
+        return None, {"pool": True}
 
     @staticmethod
     def asks_for_other_than_one_room(body: bytes | None) -> bool:
@@ -2836,6 +2959,67 @@ class Handler(BaseHTTPRequestHandler):
         else:
             extra["X-Room-Receipt-Error"] = "sign_failed"
         return self.reply(200, canonical(out), extra)
+
+    def handle_claim(self, ledger: "Ledger", room: str, body: bytes | None):
+        """POST /v1/sandboxes/<room>/claim {"cathedral_sandbox_id", "lifetime_seconds"}: bind a pre-made room to a sandbox.
+
+        The gate holds the room's token, so no delete and no second claim runs beside this one. One try per
+        room: if the lifetime call does not succeed the claim is signed as failed and the room is broken.
+        """
+        if self.command != "POST":
+            return self.reply(405, b'{"error":{"code":"method_not_allowed","message":"method not allowed"}}', {"Allow": "POST"})
+        if not self.authorized():
+            return self.reply(401, b'{"error":"unauthorized"}')
+
+        def refuse(status: int, code: str, message: str, extra: dict | None = None):
+            return self.reply(status, canonical({"error": {"code": code, "message": message}}), extra)
+
+        try:
+            doc = json.loads(body or b"")
+        except (ValueError, RecursionError):
+            doc = None
+        cid = doc.get("cathedral_sandbox_id") if isinstance(doc, dict) else None
+        lifetime = doc.get("lifetime_seconds") if isinstance(doc, dict) else None
+        if not (isinstance(doc, dict) and set(doc) == {"cathedral_sandbox_id", "lifetime_seconds"}
+                and isinstance(cid, str) and SANDBOX_LINK_RE.fullmatch(cid)
+                and type(lifetime) is int and 1 <= lifetime <= CLAIM_LIFETIME_MAX):
+            return refuse(400, "claim_request_invalid", "the body is exactly cathedral_sandbox_id (a lower-case UUID) "
+                                                         "and lifetime_seconds (1 to 172800)")
+        stored, refusal, create_sha = ledger.claim_check(room, cid, time.time())
+        if stored is not None:
+            status, answer_body, receipt = stored
+            return self.reply(status, answer_body, {"X-Room-Receipt": base64.urlsafe_b64encode(canonical(receipt)).decode()})
+        if refusal is not None:
+            return refuse(409, *refusal)
+        try:
+            status, _headers, out = self.upstream(
+                self.server.api_port, canonical({"ttl_seconds": lifetime}), method="POST",
+                path=f"/v1/sandboxes/{room}/lifetime", extra={"Content-Type": "application/json"},
+                timeout=CLAIM_WAIT_SECONDS)
+            try:
+                result = json.loads(out)
+            except (ValueError, RecursionError):
+                result = None
+            expires = result.get("expires_at") if isinstance(result, dict) else None
+            expires = expires if isinstance(expires, str) else None
+            answer = {"sandbox_id": room, "cathedral_sandbox_id": cid, "lifetime_seconds": lifetime,
+                      "pooled_from": create_sha, "expires_at": expires, "status": "claimed"}
+            receipt = ledger.sign_claim(room, {
+                "action": "claim", "target": f"POST /v1/sandboxes/{room}/claim", "sandbox_id": room,
+                "customer_request_sha256": sha(body or b""), "cathedral_sandbox_id": cid,
+                "lifetime_seconds": lifetime, "pooled_from": create_sha, "status": status,
+                "result_sha256": sha(out), "expires_at": expires}, answer)
+        except BaseException:
+            # The lifetime call may have run: the room must not be left open to a second try.
+            with ledger.lock:
+                ledger.broken.add(room)
+            traceback.print_exc()
+            return refuse(409, "pool_claim_failed", "the claim could not be recorded; delete the room",
+                          {"X-Room-Receipt-Error": "sign_failed"})
+        header = {"X-Room-Receipt": base64.urlsafe_b64encode(canonical(receipt)).decode()}
+        if 200 <= status < 300:
+            return self.reply(200, canonical(answer), header)
+        return refuse(409, "pool_claim_failed", "the room's lifetime could not be set; delete the room", header)
 
     def handle_sealed_exec(self, ledger: "Ledger", room: str, body: bytes | None):
         """POST: open one customer-sealed exec, run it in the room, seal the room API's answer back.
