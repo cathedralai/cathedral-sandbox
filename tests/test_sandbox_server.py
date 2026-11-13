@@ -9,6 +9,7 @@ opening a socket.  A couple of integration checks bind the same app to a real li
 from __future__ import annotations
 
 import json
+import os
 import threading
 
 import pytest
@@ -118,6 +119,65 @@ def test_directory_entries_refuse_unbounded_output(app: SandboxApplication) -> N
     response = app.dispatch("GET", f"/v1/sandboxes/{sid}/entries?path=/work", AUTH, b"")
     assert response.status == 413
     assert json.loads(response.body)["error"]["code"] == "directory_too_large"
+
+
+def test_directory_mutations_are_one_entry_only_and_guest_scoped(app: SandboxApplication, tmp_path) -> None:
+    sid = _create(app)
+    root = app.provider._sandboxes[sid].root
+    base = f"/v1/sandboxes/{sid}"
+
+    def mutate(method: str, route: str, path: str, auth=AUTH):
+        return app.dispatch(method, f"{base}/{route}?path={path}", auth, b"")
+
+    assert mutate("PUT", "directories", "/work/a").status == 200
+    created = mutate("PUT", "directories", "/work/a")
+    assert json.loads(created.body) == {"path": "/work/a", "created": False}
+    nested = mutate("PUT", "directories", "/work/a/b")
+    assert json.loads(nested.body) == {"path": "/work/a/b", "created": True}
+    assert mutate("DELETE", "entries", "/work/a").status == 409  # nonempty, never recursive
+    (root / "work" / "a" / "b" / "x").write_text("data")
+    assert json.loads(mutate("DELETE", "entries", "/work/a/b/x").body)["deleted"] is True
+    assert json.loads(mutate("DELETE", "entries", "/work/a/b/x").body)["deleted"] is False
+    assert json.loads(mutate("DELETE", "entries", "/work/a/b").body)["deleted"] is True
+    assert (root / "work" / "a").is_dir()
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "work" / "link").symlink_to(outside, target_is_directory=True)
+    assert mutate("PUT", "directories", "/work/link").status == 409
+    assert mutate("DELETE", "entries", "/work/link").status == 409
+    assert mutate("PUT", "directories", "/work/link/child").status == 400
+    assert not (outside / "child").exists()
+    assert mutate("DELETE", "entries", "/work").status == 400
+    for bad in ("/etc/out", "/work/a/../other", "/work//other"):
+        assert mutate("PUT", "directories", bad).status == 400
+        assert mutate("DELETE", "entries", bad).status == 400
+    assert mutate("PUT", "directories", "/work/no/parent").status == 404
+    assert mutate("DELETE", "entries", "/work/a", {"Authorization": "Bearer k2"}).status == 404
+    assert mutate("PUT", "directories", "/work/new", {}).status == 401
+    assert not (root / "work" / "new").exists()
+
+
+def test_delete_is_path_based_when_room_replaces_the_final_entry(app: SandboxApplication, monkeypatch) -> None:
+    sid = _create(app)
+    target = app.provider._sandboxes[sid].root / "work" / "race"
+    target.write_text("first")
+    original_stat = os.stat
+    replaced = False
+
+    def replace_after_stat(path, *args, **kwargs):
+        nonlocal replaced
+        result = original_stat(path, *args, **kwargs)
+        if path == "race" and kwargs.get("dir_fd") is not None and not replaced:
+            replaced = True
+            target.unlink()
+            target.write_text("replacement")
+        return result
+
+    monkeypatch.setattr(os, "stat", replace_after_stat)
+    response = app.dispatch("DELETE", f"/v1/sandboxes/{sid}/entries?path=/work/race", AUTH, b"")
+    assert response.status == 200 and json.loads(response.body)["deleted"] is True
+    assert replaced and not target.exists()
 
 
 # ------------------------------------------------------------------ §3.3 Range / max_bytes codes

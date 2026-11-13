@@ -24,7 +24,9 @@ reference and is not treated as an isolation boundary.
 
 from __future__ import annotations
 
+import errno
 import os
+import posixpath
 import shutil
 import signal
 import stat
@@ -126,6 +128,8 @@ class SandboxProvider(Protocol):
     def write_file(self, sandbox_id: str, path: str, data: bytes, mode: int | None) -> None: ...
     def read_file(self, sandbox_id: str, spec: FileGet) -> tuple[bytes, int]: ...
     def list_directory(self, sandbox_id: str, path: str) -> list[dict[str, str]]: ...
+    def make_directory(self, sandbox_id: str, path: str) -> bool: ...
+    def remove_entry(self, sandbox_id: str, path: str) -> bool: ...
     def write_tar(self, sandbox_id: str, path: str, tarball: bytes) -> None: ...
     def read_tar(self, sandbox_id: str, spec: TarGet) -> bytes: ...
     def stat(self, sandbox_id: str, path: str) -> StatResult: ...
@@ -764,6 +768,68 @@ class InMemorySandboxProvider:
         finally:
             os.close(fd)
         return sorted(entries, key=lambda entry: entry["name"])
+
+    def make_directory(self, sandbox_id: str, path: str) -> bool:
+        """Create one directory beneath /work, without following room links."""
+        parent, name = _work_entry_parent(path)
+        with self._lock:
+            sandbox = self._require_running(sandbox_id)
+            self._touch(sandbox)
+        try:
+            parent_fd = _open_beneath(sandbox.root, parent, os.O_RDONLY | os.O_DIRECTORY)
+        except FileNotFoundError:
+            raise SandboxOpError("directory_not_found", 404, f"no directory {parent}") from None
+        try:
+            try:
+                os.mkdir(name, 0o755, dir_fd=parent_fd)
+            except FileExistsError:
+                try:
+                    entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    raise SandboxOpError("entry_changed", 409, f"entry {path} changed during create") from None
+                if stat.S_ISDIR(entry.st_mode):
+                    return False
+                raise SandboxOpError("entry_exists", 409, f"{path} is not a plain directory") from None
+        finally:
+            os.close(parent_fd)
+        return True
+
+    def remove_entry(self, sandbox_id: str, path: str) -> bool:
+        """Remove one plain file or empty directory by path; never recurse."""
+        parent, name = _work_entry_parent(path)
+        with self._lock:
+            sandbox = self._require_running(sandbox_id)
+            self._touch(sandbox)
+        try:
+            parent_fd = _open_beneath(sandbox.root, parent, os.O_RDONLY | os.O_DIRECTORY)
+        except FileNotFoundError:
+            raise SandboxOpError("directory_not_found", 404, f"no directory {parent}") from None
+        try:
+            try:
+                entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            if stat.S_ISDIR(entry.st_mode):
+                try:
+                    os.rmdir(name, dir_fd=parent_fd)
+                except OSError as exc:
+                    if exc.errno == errno.ENOENT:
+                        return False
+                    if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                        raise SandboxOpError("directory_not_empty", 409, f"directory {path} is not empty") from exc
+                    raise SandboxOpError("entry_changed", 409, f"entry {path} changed during delete") from exc
+            elif stat.S_ISREG(entry.st_mode):
+                try:
+                    os.unlink(name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    return False
+                except OSError as exc:
+                    raise SandboxOpError("entry_changed", 409, f"entry {path} changed during delete") from exc
+            else:
+                raise SandboxOpError("entry_not_plain", 409, f"{path} is not a plain file or directory")
+        finally:
+            os.close(parent_fd)
+        return True
 
     def write_tar(self, sandbox_id: str, path: str, tarball: bytes) -> None:
         with self._lock:
@@ -1621,6 +1687,21 @@ class InMemorySandboxProvider:
             "snapshot_gib_month_usd": self._pricing.snapshot_gib_month_usd,
             "reference": self._pricing.reference_comparisons(),
         }
+
+
+def _work_entry_parent(path: str) -> tuple[str, str]:
+    if (
+        not isinstance(path, str)
+        or len(path) > 2048
+        or "\x00" in path
+        or not path.startswith("/work/")
+        or posixpath.normpath(path) != path
+    ):
+        raise SandboxOpError("invalid_path", 400, "entry path must be normalized and beneath /work")
+    parent, name = posixpath.split(path)
+    if not name or name in (".", ".."):
+        raise SandboxOpError("invalid_path", 400, "entry name is invalid")
+    return parent, name
 
 
 def _open_beneath(root: Path, path: str, flags: int, *, make_dirs: bool = False) -> int:

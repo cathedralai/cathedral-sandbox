@@ -277,6 +277,8 @@ class SandboxApplication:
         self._add("PUT", s + r"/(?P<id>[^/]+)/files", self.put_file)
         self._add("GET", s + r"/(?P<id>[^/]+)/files", self.get_file)
         self._add("GET", s + r"/(?P<id>[^/]+)/entries", self.list_directory)
+        self._add("DELETE", s + r"/(?P<id>[^/]+)/entries", self.remove_entry)
+        self._add("PUT", s + r"/(?P<id>[^/]+)/directories", self.make_directory)
         self._add("PUT", s + r"/(?P<id>[^/]+)/tar", self.put_tar)
         self._add("GET", s + r"/(?P<id>[^/]+)/tar", self.get_tar)
         self._add("GET", s + r"/(?P<id>[^/]+)/stat", self.stat)
@@ -581,6 +583,14 @@ class SandboxApplication:
         path = _require_param(query, "path")
         return Response.json(200, {"path": path, "entries": self.provider.list_directory(id, path)})
 
+    def make_directory(self, *, id, query, **_):
+        path = _require_param(query, "path")
+        return Response.json(200, {"path": path, "created": self.provider.make_directory(id, path)})
+
+    def remove_entry(self, *, id, query, **_):
+        path = _require_param(query, "path")
+        return Response.json(200, {"path": path, "deleted": self.provider.remove_entry(id, path)})
+
     def get_tar(self, *, id, query, **_):
         path = _require_param(query, "path")
         exclude = tuple(query.get("exclude", []))
@@ -868,6 +878,8 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/sandboxes/{id}/files", "put", "Write a file", "§3.3"),
     ("/v1/sandboxes/{id}/files", "get", "Read a file", "§3.3; Range → 206"),
     ("/v1/sandboxes/{id}/entries", "get", "List directory entries", "AB#409; max 1000"),
+    ("/v1/sandboxes/{id}/entries", "delete", "Delete one plain file or empty directory", "AB#409; no recursive delete"),
+    ("/v1/sandboxes/{id}/directories", "put", "Create one directory", "AB#409; parent must exist"),
     ("/v1/sandboxes/{id}/tar", "put", "Write a tar archive", "§3.3"),
     ("/v1/sandboxes/{id}/tar", "get", "Read a tar archive", "§3.3"),
     ("/v1/sandboxes/{id}/stat", "get", "Stat a path", "§3.3"),
