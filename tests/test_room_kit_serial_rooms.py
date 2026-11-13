@@ -477,25 +477,41 @@ def test_overlapping_creates_keep_their_flags_when_an_unrelated_id_is_touched(fr
     assert_idle(front.ledger)
 
 
-def test_a_full_touched_set_withholds_every_flag_until_the_creates_end(front, monkeypatch) -> None:
+def _touch_while_pending(front: Front, monkeypatch, cap: int, ids: list[str]):
+    """Hold a create, run one non-read request for each id (each enters and leaves), and return the held create."""
     from room_front_support import rr
 
-    monkeypatch.setattr(rr, "TOUCHED_CAP", 2)
-    front.api.new_ids = ["sbx_a", "sbx_b"]
+    monkeypatch.setattr(rr, "TOUCHED_CAP", cap)
+    front.api.new_ids = ["sbx_fresh"]
     hold = front.api.hold(r"POST /v1/sandboxes")
-    a, abox = in_thread(front.create, SERIAL)
-    b, bbox = in_thread(front.create, SERIAL)
-    _wait_creates(front, 2)
-    for unknown in ("u1", "u2", "u3"):
-        assert front.exec(unknown)[0] == 200
+    c, cbox = in_thread(front.create, SERIAL)
+    hold.wait_entered()
+    for unknown in ids:  # an unsigned write: no receipt, so the id stays unknown to the ledger
+        assert front.call("PUT", f"/v1/sandboxes/{unknown}/tar?path=/work", b"x")[0] == 200
+    return hold, c, cbox
+
+
+def test_a_touched_set_exactly_at_its_cap_keeps_the_flag(front, monkeypatch) -> None:
+    hold, c, cbox = _touch_while_pending(front, monkeypatch, 3, ["u1", "u2", "u3"])
     with front.ledger.lock:
-        assert len(front.ledger.touched) == 2 and front.ledger.overflow
+        assert len(front.ledger.touched) == 3 and not front.ledger.overflow
     hold.release.set()
-    for t, box in ((a, abox), (b, bbox)):
-        assert "serial" not in receipt_of(finish(t, box)[1])["statement"]
+    assert receipt_of(finish(c, cbox)[1])["statement"]["serial"] is True
+    assert front.delete("sbx_fresh")[0] == 200
     assert_idle(front.ledger)
+
+
+def test_one_id_past_the_cap_withholds_every_flag_until_the_creates_end(front, monkeypatch) -> None:
+    hold, c, cbox = _touch_while_pending(front, monkeypatch, 3, ["u1", "u2", "u3", "u4"])
     with front.ledger.lock:
-        assert not front.ledger.overflow
+        assert len(front.ledger.touched) == 3 and front.ledger.overflow
+    # An id already held does not add anything new.
+    assert front.call("PUT", "/v1/sandboxes/u1/tar?path=/work", b"x")[0] == 200
+    with front.ledger.lock:
+        assert front.ledger.overflow and len(front.ledger.touched) == 3
+    hold.release.set()
+    assert "serial" not in receipt_of(finish(c, cbox)[1])["statement"]
+    assert_idle(front.ledger)
     front.api.new_ids = ["sbx_c"]
     assert receipt_of(front.create(SERIAL)[1])["statement"]["serial"] is True
     assert_idle(front.ledger)
@@ -642,4 +658,73 @@ def test_a_read_whose_answer_is_lost_answers_502_signs_nothing_and_does_not_brea
     assert room not in front.ledger.broken
     assert front.exec(room)[0] == 200
     assert [s["action"] for s in front.statements(room)] == ["create", "exec"]
+    assert_idle(front.ledger)
+
+
+# ---------------------------------------------------------------- each bulk guard alone, and a bulk delete's release
+
+def test_a_create_signed_while_an_earlier_bulk_delete_is_still_pending_gets_no_flag(front) -> None:
+    bulk_hold = front.api.hold(r"DELETE /v1/sandboxes")
+    b, bbox = in_thread(front.call, "DELETE", BULK)
+    bulk_hold.wait_entered()
+    front.api.new_ids = ["sbx_x"]
+    status, headers, _out = front.create(SERIAL_TEAM)  # signed while the bulk delete is held
+    assert status == 200 and "serial" not in receipt_of(headers)["statement"]
+    bulk_hold.release.set()
+    finish(b, bbox)
+    assert_idle(front.ledger)
+
+
+def test_a_create_signed_while_a_bulk_delete_that_started_after_it_is_still_pending_gets_no_flag(front) -> None:
+    front.api.new_ids = ["sbx_x"]
+    answer = front.api.hold_create_answers()
+    c, cbox = in_thread(front.create, SERIAL_TEAM)
+    answer.wait_entered()
+    bulk_hold = front.api.hold(r"DELETE /v1/sandboxes")
+    b, bbox = in_thread(front.call, "DELETE", BULK)
+    bulk_hold.wait_entered()
+    answer.release.set()
+    status, headers, _out = finish(c, cbox)  # signed while the bulk delete is held
+    assert status == 200 and "serial" not in receipt_of(headers)["statement"]
+    bulk_hold.release.set()
+    finish(b, bbox)
+    assert_idle(front.ledger)
+
+
+def _counting_end_bulk(front: Front, monkeypatch) -> list[int]:
+    calls: list[int] = []
+    real = front.ledger.end_bulk
+    monkeypatch.setattr(front.ledger, "end_bulk", lambda: (calls.append(1), real())[1])
+    return calls
+
+
+def test_a_bulk_delete_whose_upstream_call_raises_is_released_once(front, monkeypatch) -> None:
+    calls = _counting_end_bulk(front, monkeypatch)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(front.server.RequestHandlerClass, "upstream", boom)
+    lost_call(front, "DELETE", BULK)
+    assert_idle(front.ledger)
+    assert len(calls) == 1
+    monkeypatch.undo()
+    assert receipt_of(front.create(SERIAL)[1])["statement"]["serial"] is True
+    assert_idle(front.ledger)
+
+
+def test_a_client_that_hangs_up_during_a_bulk_delete_releases_it_once(front, monkeypatch) -> None:
+    calls = _counting_end_bulk(front, monkeypatch)
+    held = front.api.hold(r"DELETE /v1/sandboxes")
+    s = socket.create_connection(("127.0.0.1", front.port), timeout=10)
+    s.sendall(f"DELETE {BULK} HTTP/1.1\r\nHost: x\r\nAuthorization: {AUTH['Authorization']}\r\n"
+              f"Content-Length: 0\r\n\r\n".encode())
+    held.wait_entered()
+    with front.ledger.lock:
+        assert front.ledger.bulk_in_flight == 1
+    s.close()
+    held.release.set()
+    assert_idle(front.ledger)
+    assert len(calls) == 1
+    assert receipt_of(front.create(SERIAL)[1])["statement"]["serial"] is True
     assert_idle(front.ledger)
