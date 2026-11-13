@@ -476,6 +476,14 @@ def _nested(arrays: int):
 
 
 REQUEST_LIMIT_CASES = [
+    ("image holds a tab", {"image": "images.example.test/a\tpp@sha256:" + "a" * 64},
+     "image must hold no control character"),
+    ("image holds a newline", {"image": "images.example.test/a\npp@sha256:" + "a" * 64},
+     "image must hold no control character"),
+    ("image holds a NUL", {"image": "images.example.test/a\x00pp@sha256:" + "a" * 64},
+     "image must hold no control character"),
+    ("image holds 0x7f", {"image": "images.example.test/a\x7fpp@sha256:" + "a" * 64},
+     "image must hold no control character"),
     ("image_id form", {"image_id": "sha256:xyz"}, "image_id must be sha256: and 64 lower-case hex"),
     ("image_id case", {"image_id": "sha256:" + "A" * 64}, "image_id must be sha256: and 64 lower-case hex"),
     ("timeout is not a boolean", {"timeout_seconds": True}, "timeout_seconds must be an integer"),
