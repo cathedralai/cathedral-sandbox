@@ -532,3 +532,20 @@ def test_a_claim_route_answers_405_for_any_method_but_post_even_on_an_unclaimed_
     assert status == 405 and headers["Allow"] == "POST" and code(out) == "method_not_allowed"
     assert room in front.ledger.pool
     assert_idle(front.ledger)
+
+
+def test_a_write_in_flight_before_the_pool_create_that_ends_before_it_is_signed_withholds_the_flag(front) -> None:
+    front.api.new_ids = ["sbx_x"]
+    request_hold = front.api.hold(r"PUT /v1/sandboxes/sbx_x/tar")
+    r, rbox = in_thread(front.call, "PUT", "/v1/sandboxes/sbx_x/tar?path=/work", b"tar")
+    request_hold.wait_entered()
+    create_hold = front.api.hold(r"POST /v1/sandboxes")
+    c, cbox = in_thread(front.create, POOL)
+    create_hold.wait_entered()
+    request_hold.release.set()
+    finish(r, rbox)
+    create_hold.release.set()
+    status, headers, _out = finish(c, cbox)
+    assert status == 200 and "pool" not in receipt_of(headers)["statement"]
+    assert "sbx_x" not in front.ledger.pool
+    assert_idle(front.ledger)
