@@ -172,10 +172,24 @@ func (p *guestPolicy) validate() error {
 // capacity catalog both use it, so the catalog never lists a hotel with free
 // rooms that the placer would refuse. Caller holds b.mu.
 func (b *broker) admissibleFree(h *hotel, now time.Time) int {
+	var mb *minerBudget
+	if h.cfg.MinerHotkey != "" {
+		mb = b.minerBudgetNow()
+	}
+	return b.admissibleFreeIn(h, now, mb)
+}
+
+// admissibleFreeIn is admissibleFree with the miner caps (placement.go) read
+// once by the caller; mb nil is no cap. Caller holds b.mu.
+func (b *broker) admissibleFreeIn(h *hotel, now time.Time, mb *minerBudget) int {
 	if !h.ok || h.leaving || h.drain() || now.Before(h.backoffUntil) || !b.admitted(h, now) || b.awaitsRoomCheck(h) {
 		return 0
 	}
-	if f := b.freeFor(h); f > 0 {
+	f := b.freeFor(h)
+	if l := mb.limit(h); l >= 0 && l < f {
+		f = l
+	}
+	if f > 0 {
 		return f
 	}
 	return 0
@@ -205,7 +219,7 @@ func (b *broker) capacityEntries() []capacityEntry {
 	return out
 }
 
-func (b *broker) capacityDoc(e capacityEntry, now time.Time) map[string]any {
+func (b *broker) capacityDoc(e capacityEntry, now time.Time, mb *minerBudget) map[string]any {
 	h := e.h
 	labels := h.labels()
 	if labels == nil {
@@ -217,7 +231,7 @@ func (b *broker) capacityDoc(e capacityEntry, now time.Time) map[string]any {
 	}
 	return map[string]any{
 		"id": h.cfg.ID, "class": hotelClass(h), "labels": labels, "up": h.ok, "drain": h.drain(),
-		"free_rooms": b.admissibleFree(h, now), "source": e.source, "down_since": downSince(h),
+		"free_rooms": b.admissibleFreeIn(h, now, mb), "source": e.source, "down_since": downSince(h),
 		"reserved_for": reserved, "slots": h.slots, "admission": b.admissionDoc(h, now),
 	}
 }
@@ -235,8 +249,9 @@ type classTotals struct {
 	FreeRooms int `json:"free_rooms"`
 }
 
-// addTotals adds h to the class totals. Caller holds b.mu.
-func (b *broker) addTotals(t map[string]*classTotals, e capacityEntry, now time.Time) {
+// addTotals adds h to the class totals. It takes h's free rooms from mb, so
+// the totals never count one miner cap twice. Caller holds b.mu.
+func (b *broker) addTotals(t map[string]*classTotals, e capacityEntry, now time.Time, mb *minerBudget) {
 	h := e.h
 	c := t[hotelClass(h)]
 	c.Hotels++
@@ -255,7 +270,9 @@ func (b *broker) addTotals(t map[string]*classTotals, e capacityEntry, now time.
 		c.Placeable++
 	}
 	c.Slots += h.slots
-	c.FreeRooms += b.admissibleFree(h, now)
+	f := b.admissibleFreeIn(h, now, mb)
+	mb.consume(h, f)
+	c.FreeRooms += f
 }
 
 var tierRank = map[string]int{tierPrefer: 0, tierAllow: 1, "hotels": 2}
@@ -268,27 +285,29 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 	out := []map[string]any{}
 	var guest map[string]any
 	totals := map[string]*classTotals{classSealed: {}, classUnsealed: {}}
+	// docs: what one hotel can take now; sum: a budget the totals use up.
+	docs, sum := b.minerBudgetNow(), b.minerBudgetNow()
 	for _, e := range b.capacityEntries() {
 		if minerOnly && e.h.cfg.MinerHotkey == "" {
 			continue
 		}
 		if g == nil {
-			d := b.capacityDoc(e, now)
+			d := b.capacityDoc(e, now, docs)
 			var lent any // operator view only: a guest never sees whose hotel it is
 			if l := e.h.lentFrom(); l != "" {
 				lent = l
 			}
 			d["lent_from"] = lent
 			out = append(out, d)
-			b.addTotals(totals, e, now)
+			b.addTotals(totals, e, now, sum)
 			continue
 		}
 		t := g.tierOf(e.h)
 		if t == "" {
 			continue
 		}
-		b.addTotals(totals, e, now)
-		d := b.capacityDoc(e, now)
+		b.addTotals(totals, e, now, sum)
+		d := b.capacityDoc(e, now, docs)
 		d["tier"] = t
 		out = append(out, d)
 	}
@@ -325,6 +344,12 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 			"miner_hotkey_caps":    b.cfg.MinerHotkeyCaps,
 			"miner_max_hotels":     b.cfg.MinerMaxHotels,
 			"miner_tls_pin":        true,
+			// Room caps (placement.go, AB#335); 0 is off.
+			"miner_max_rooms_per_hotkey": b.cfg.MinerMaxRoomsPerHotkey,
+			"miner_pool_share":           b.cfg.MinerPoolShare,
+		}
+		if docs != nil && b.cfg.MinerPoolShare > 0 {
+			doc["miner_pool"] = map[string]any{"own_slots": docs.ownPoolSlots, "miner_room_cap": docs.poolCap, "miner_rooms": docs.poolMinerRooms}
 		}
 	}
 	writeJSON(w, 200, doc)

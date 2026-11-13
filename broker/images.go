@@ -176,7 +176,8 @@ func (b *broker) noRoomReason(pl placement) createResult {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := time.Now()
-	var matching, down, draining, resting, pending, full, free int
+	var matching, down, draining, resting, pending, full, free, capped int
+	mb := b.minerBudgetNow()
 	for _, h := range b.hotelList() {
 		if !pl.allows(h) {
 			continue
@@ -191,6 +192,9 @@ func (b *broker) noRoomReason(pl placement) createResult {
 			resting++
 		case !b.admitted(h, now) || b.awaitsRoomCheck(h):
 			pending++
+		case b.freeFor(h) > 0 && mb.limit(h) == 0:
+			full++ // a miner cap (placement.go) takes no more rooms here
+			capped++
 		case b.freeFor(h) > 0:
 			free++
 		default:
@@ -200,6 +204,9 @@ func (b *broker) noRoomReason(pl placement) createResult {
 	unavailable := down + draining + resting + pending
 	reason := map[string]int{"matching": matching, "down": down, "draining": draining, "resting": resting,
 		"pending_admission": pending, "full": full}
+	if capped > 0 {
+		reason["miner_capped"] = capped
+	}
 	ra := http.Header{"Retry-After": {"5"}}
 	answer := func(status int, code, msg string) createResult {
 		doc := errDoc(code, msg)

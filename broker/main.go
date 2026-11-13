@@ -135,6 +135,12 @@ type config struct {
 	// MinerMaxHotels is the operator-approved maximum across all miner hotkeys.
 	// Zero refuses miner joins; pending and draining hotels count.
 	MinerMaxHotels int `json:"miner_max_hotels,omitempty"`
+	// Room caps on miner hotels (placement.go, AB#335). Both are off at 0.
+	// MinerMaxRoomsPerHotkey caps the rooms of one miner hotkey across all
+	// its hotels. MinerPoolShare (0 < x < 1) caps the rooms on miner hotels
+	// in the shared sealed pool at that share of the pool when it is full.
+	MinerMaxRoomsPerHotkey int     `json:"miner_max_rooms_per_hotkey,omitempty"`
+	MinerPoolShare         float64 `json:"miner_pool_share,omitempty"`
 	// Admission of sealed hotels (admission.go). The top-level
 	// SealedAdmission loads only as absent or "on": the gate cannot be
 	// turned off for every hotel or for joined hotels. The ops escape is
@@ -371,6 +377,12 @@ func loadBroker(path string) (*broker, error) {
 	}
 	if c.MinerMaxHotels < 0 {
 		return nil, errors.New("config: miner_max_hotels must be positive when miner hotels are allowed")
+	}
+	if c.MinerMaxRoomsPerHotkey < 0 {
+		return nil, errors.New("config: miner_max_rooms_per_hotkey must be 0 (no cap) or more")
+	}
+	if c.MinerPoolShare != 0 && !(c.MinerPoolShare > 0 && c.MinerPoolShare < 1) {
+		return nil, errors.New("config: miner_pool_share must be 0 (no cap) or between 0 and 1, exclusive")
 	}
 	for _, id := range c.TerminalHotels {
 		if id == "" || strings.Contains(id, ".") {
@@ -620,21 +632,22 @@ func (h *hotel) used() int { return len(h.rooms) + h.creating + h.queued }
 // candidate only when no preferred hotel has a free room (capacity.go).
 // Caller holds b.mu.
 func (b *broker) pick(exclude map[*hotel]bool, pl placement) *hotel {
+	mb := b.minerBudgetNow() // the miner caps (placement.go), read once
 	if pl.policy != nil && pl.tier == "" {
 		for _, t := range []string{tierPrefer, tierAllow} {
 			tp := pl
 			tp.tier = t
-			if h := b.pickIn(exclude, tp); h != nil {
+			if h := b.pickIn(exclude, tp, mb); h != nil {
 				return h
 			}
 		}
 		return nil
 	}
-	return b.pickIn(exclude, pl)
+	return b.pickIn(exclude, pl, mb)
 }
 
 // pickIn is pick inside one candidate set.
-func (b *broker) pickIn(exclude map[*hotel]bool, pl placement) *hotel {
+func (b *broker) pickIn(exclude map[*hotel]bool, pl placement, mb *minerBudget) *hotel {
 	now := time.Now()
 	hotels := b.hotelList()
 	total := 0.0
@@ -643,7 +656,7 @@ func (b *broker) pickIn(exclude map[*hotel]bool, pl placement) *hotel {
 		if exclude[h] || !pl.allows(h) {
 			continue
 		}
-		if f := b.admissibleFree(h, now); f > 0 {
+		if f := b.admissibleFreeIn(h, now, mb); f > 0 {
 			weight[i] = h.weight(f)
 			total += weight[i]
 		}
