@@ -39,7 +39,10 @@ def make_room(front: Front) -> tuple[str, str]:
 
 
 def ends(front: Front, room: str) -> list[dict]:
-    return [s for s in front.statements(room) if s["action"] == "room_end"]
+    """The room_end receipts in the ledger. Read from memory: a read over HTTP looks at the room first."""
+    with front.ledger.lock:
+        return [front.ledger.chain[i]["statement"] for i in front.ledger.by_room.get(room, [])
+                if front.ledger.chain[i]["statement"]["action"] == "room_end"]
 
 
 def test_a_room_the_api_no_longer_lists_gets_one_end_receipt(front) -> None:
@@ -95,7 +98,9 @@ def test_a_delete_whose_answer_was_lost_is_ended_at_the_next_look(front) -> None
     assert status == 502
     front.api.rooms.discard(room)  # the delete ran
     front.server.look_all()
-    actions = [(s["action"], s["status"]) for s in front.statements(room)]
+    with front.ledger.lock:
+        actions = [(front.ledger.chain[i]["statement"]["action"], front.ledger.chain[i]["statement"]["status"])
+                   for i in front.ledger.by_room[room]]
     assert actions == [("create", 200), ("delete", 502), ("room_end", 404)]
     assert_idle(front.ledger)
 
@@ -206,7 +211,8 @@ def test_a_delete_in_flight_during_a_look_is_not_ended_by_it(front) -> None:
     held.release.set()
     assert finish(d, dbox)[0] == 200
     front.server.look_all()
-    assert [s["action"] for s in front.statements(room)] == ["create", "delete"]
+    with front.ledger.lock:
+        assert [front.ledger.chain[i]["statement"]["action"] for i in front.ledger.by_room[room]] == ["create", "delete"]
     assert_idle(front.ledger)
 
 

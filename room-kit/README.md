@@ -183,6 +183,22 @@ signed request at a time, so the order of its receipts is the order things ran.
 
 An ordinary room runs requests side by side, as before.
 
+### Receipts when a room ends without a request
+
+The front keeps a table of live rooms (a room enters with its 2xx create and
+leaves with a 2xx delete or a `room_end`). Every `ROOM_LOOK_SECONDS` (default
+15, 0 turns it off) it copies the table, asks the room API for its list, and
+for each copied room the list lacks asks for that one room. Only 404
+`sandbox_not_found` and 409 `sandbox_deleting` end a room: one `room_end`
+receipt with `status`, `reason` (the API's code), `result_sha256` and
+`room_create_receipt_sha256`, which ends the room's incarnation as a delete
+does. A room with a request in flight, a room made after the copy, a failed
+list and any other answer end nothing. A read of one room's receipts first
+looks at that room, with one GET.
+
+Limits: only rooms the front signed a create for; after a front restart the
+table is empty and no end is signed for earlier rooms.
+
 ### Fresh report over caller data (sealed only)
 
 `POST /room/attest` on the receipt front asks the processor for a new SNP
