@@ -136,8 +136,8 @@ func TestLFM3SuiteCatalogIsSealedOnlyAndGHCR(t *testing.T) {
 		if !tpl.SealedOnly || tpl.Sealed != wantSealed || !tpl.Live {
 			t.Fatalf("%s: sealed_only=%v sealed=%s live=%v", name, tpl.SealedOnly, tpl.Sealed, tpl.Live)
 		}
-		if name != "lfm3-1.7b" && (tpl.CPU != 2 || tpl.MemoryGiB != 4) {
-			t.Fatalf("%s must use the sealed 2 vCPU / 4 GiB shape: %+v", name, tpl)
+		if tpl.CPU != 2 || tpl.MemoryGiB != 4 {
+			t.Fatalf("%s must use the sealed 2 vCPU / 4 GiB shape (AB#310): %+v", name, tpl)
 		}
 		if tpl.Image != image {
 			t.Fatalf("%s image %q want %q", name, tpl.Image, image)
@@ -200,8 +200,8 @@ func TestLFM3ReadyCreateForcesSealedAndStaysOnSealedHotels(t *testing.T) {
 		t.Fatalf("hotel must not see template: %v", created)
 	}
 	res := created["resources"].(map[string]any)
-	if res["vcpu"].(float64) != 2 || res["memory_gib"].(float64) != 8 {
-		t.Fatalf("lfm3 resources: %v", res)
+	if res["vcpu"].(float64) != 2 || res["memory_gib"].(float64) != 4 {
+		t.Fatalf("lfm3 resources (AB#310 base shape): %v", res)
 	}
 	if len(tc.hotels["a"].creates) == 0 {
 		t.Fatal("ready LFM did not land on the sealed hotel")
