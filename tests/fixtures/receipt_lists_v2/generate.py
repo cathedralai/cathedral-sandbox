@@ -590,7 +590,529 @@ def pool_cases(pack: Pack) -> None:
                {"reason": "room pool-1: receipt 2: lifetime_seconds is not a positive integer"})
 
 
-CASE_SETS = [numbering_cases, serial_cases, pool_cases]
+# ---------------------------------------------------------------- run mode (a one-shot's file)
+
+RUN_ID = "7d9c3a5e-1b2f-4c6d-8e0a-9f1b2c3d4e5f"
+RUN_ROOM = "run-room-1"
+BATCH_ID = "0b1c2d3e-4f50-4162-8384-95a6b7c8d9e0"
+IMAGE_REF = "images.example.test/app@sha256:" + sha(b"receipt-lists-v2 image reference")
+IMAGE_ID = "sha256:" + sha(b"receipt-lists-v2 image id")
+CONTEXT_PATH = "/work/in/.context.json"
+END_PATH = "/work/.cathedral-end"
+RESULT_PATH = "/work/out/result.json"
+LOG_PATH = "/work/out/log.txt"
+RUN_PATH = "/work/in/run.py"
+DATA_PATH = "/work/in/data.csv"
+UNICODE_PATH = "/work/in/a b+c&d=e%f~ü.txt"
+CONTEXT = {"submission": "sub-0001", "note": "café"}
+FILE_BYTES = {RUN_PATH: b"print('ok')\n", DATA_PATH: b"a,b\n1,2\n", UNICODE_PATH: b"unicode path input\n",
+              RESULT_PATH: b'{"ok":true}\n', LOG_PATH: b"done\n"}
+DEL = object()  # an override value that removes the field
+
+
+def base_recipe() -> dict:
+    return {
+        "schema": "cathedral_oneshot_recipe_v1",
+        "request": {
+            "image": IMAGE_REF, "command": ["python", RUN_PATH], "env": {"MODE": "check"}, "cwd": "/work",
+            "size": "small", "timeout_seconds": 60, "network": {"mode": "deny_all", "allow": []},
+            "outputs": [{"path": RESULT_PATH, "max_bytes": 1048576, "optional": False},
+                        {"path": LOG_PATH, "max_bytes": 65536, "optional": True}],
+            "inputs": [{"path": RUN_PATH, "mode": "755"}, {"path": DATA_PATH, "mode": "644"}]},
+        "create": {"resources": {"cpus": 1, "memory_mb": 512}, "ttl_seconds": 300, "broker_guest": "guest-1",
+                   "image_id": IMAGE_ID},
+        "file_modes": {"context": "644", "end_marker": "644"}}
+
+
+def enc(pairs: dict[str, str]) -> str:
+    """The query as the machine's front signs it: sorted keys, quote_plus values (Go's url.Values.Encode)."""
+    from urllib.parse import quote_plus
+    return "&".join(f"{quote_plus(k)}={quote_plus(v)}" for k, v in sorted(pairs.items()))
+
+
+def put_target(room: str, mode: str, path: str) -> str:
+    return f"PUT /v1/sandboxes/{room}/files?{enc({'mode': mode, 'path': path})}"
+
+
+def get_target(room: str, max_bytes: int, path: str) -> str:
+    return f"GET /v1/sandboxes/{room}/files?{enc({'max_bytes': str(max_bytes), 'path': path})}"
+
+
+def normal_network(net) -> dict:
+    if isinstance(net, dict) and net.get("mode"):
+        return net
+    return {"mode": "deny_all", "allow": []}
+
+
+def step(role: str, action: str, target: str, status: int = 200, **fields) -> dict:
+    return {"role": role, "action": action, "target": target, "status": status, "fields": fields}
+
+
+def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, overrides=None, steps_edit=None,
+             drop=(), create_body=None, exec_body=None, bundle_edit=None, args_edit=None, absent=(),
+             held=(RESULT_PATH,), inline=(LOG_PATH,), held_bytes=None, caller_hashes=None, exec_response="proven",
+             numbered=True, room=RUN_ROOM, no_context_arg=False, input_files=(), truth_context=None,
+             extra_files=None):
+    recipe = base_recipe()
+    if truth_edit:
+        truth_edit(recipe)
+    checker_recipe = json.loads(json.dumps(recipe))
+    if recipe_edit:
+        recipe_edit(checker_recipe)
+    req, cr, modes = recipe["request"], recipe["create"], recipe["file_modes"]
+    ctx = CONTEXT if truth_context is None else truth_context
+    outputs_bytes = {o["path"]: (None if o["path"] in absent else FILE_BYTES.get(o["path"], b"output\n"))
+                     for o in req["outputs"]}
+    labels = {"cathedral_sandbox_id": RUN_ID, "cathedral_serial": "1",
+              "broker_guest": cr.get("broker_guest", "guest-2"), "broker_batch": BATCH_ID}
+    body = {"image": req["image"], "resources": cr["resources"], "network": normal_network(req.get("network")),
+            "ttl_seconds": cr["ttl_seconds"], "labels": labels}
+    if create_body:
+        body = create_body(body)
+    create_bytes = body if isinstance(body, bytes) else canonical(body)
+    ebody = {"cmd": req["command"], "timeout_seconds": req["timeout_seconds"], "env": req["env"]}
+    for key in ("cwd", "user"):
+        if key in req:
+            ebody[key] = req[key]
+    if exec_body:
+        ebody = exec_body(ebody)
+    exec_bytes = ebody if isinstance(ebody, bytes) else canonical(ebody)
+    exec_resp = canonical({"exit_code": 0, "stdout": "", "stderr": ""})
+    policy = normal_network(req.get("network"))
+    policy = {"mode": policy["mode"], "allow": policy.get("allow", [])}
+    steps = [step("create", "create", "POST /v1/sandboxes", 202, image=req["image"], image_digest=IMAGE_ID,
+                  network_policy=policy, network_policy_sha256=sha(canonical(policy)),
+                  cathedral_sandbox_id=RUN_ID, serial=True, customer_request_sha256=sha(create_bytes)),
+             step("context", "file_put", put_target(room, modes.get("context", "644"), CONTEXT_PATH), 200,
+                  customer_request_sha256=sha(canonical(ctx)))]
+    for i, inp in enumerate(req["inputs"]):
+        steps.append(step(f"in{i}", "file_put", put_target(room, inp.get("mode", "644"), inp["path"]), 200,
+                          customer_request_sha256=sha(FILE_BYTES.get(inp["path"], b"input\n"))))
+    steps.append(step("exec", "exec", f"POST /v1/sandboxes/{room}/exec", 200, customer_request_sha256=sha(exec_bytes),
+                      result_sha256=sha(exec_resp if exec_response != "mismatch" else b"other answer")))
+    for j, out in enumerate(req["outputs"]):
+        data = outputs_bytes[out["path"]]
+        steps.append(step(f"get{j}", "file_get", get_target(room, out["max_bytes"], out["path"]),
+                          404 if data is None else 200,
+                          result_sha256=sha(b'{"error":"not found"}' if data is None else data)))
+    steps.append(step("end", "file_put", put_target(room, modes.get("end_marker", "644"), END_PATH), 200,
+                      customer_request_sha256=sha(b"")))
+    for role, over in (overrides or {}).items():
+        target = next(s for s in steps if s["role"] == role)
+        for key, value in over.items():
+            if key in ("action", "target", "status"):
+                target[key] = value
+            elif value is DEL:
+                target["fields"].pop(key, None)
+            else:
+                target["fields"][key] = value
+    if steps_edit:
+        steps_edit(steps)
+    hotel = pack.new_hotel()
+    receipts = {}
+    for s in steps:
+        receipts[s["role"]] = hotel.sign(s["action"], room, s["status"], numbered=numbered, target=s["target"],
+                                         **s["fields"])
+    chain = [r for role, r in receipts.items() if role not in drop]
+
+    in_hash = {i["path"]: sha(FILE_BYTES.get(i["path"], b"input\n")) for i in req["inputs"]}
+    request = {"image": req["image"], "command": req["command"], "env": req["env"], "size": req["size"],
+               "timeout_seconds": req["timeout_seconds"], "outputs": req["outputs"], "context": ctx,
+               "inputs": [{"path": i["path"], "mode": i.get("mode", "644"), "sha256": in_hash[i["path"]]}
+                          for i in req["inputs"]], "max_spend_usd": 5}
+    for key in ("cwd", "user", "network"):
+        if key in req:
+            request[key] = req[key]
+    if "image_id" in cr:
+        request["image_id"] = cr["image_id"]
+    bundle = {"schema": "cathedral_oneshot_bundle_v1", "oneshot_id": RUN_ID, "request": request,
+              "attestation": pack.attestation, "amd_certs": pack.certs, "receipts": chain,
+              "create_request_b64": b64(create_bytes), "exec_request_b64": b64(exec_bytes),
+              "inline_outputs": {p: b64(outputs_bytes[p]) for p in inline if outputs_bytes.get(p) is not None}}
+    if exec_response != "unproven":
+        bundle["exec_response_b64"] = b64(exec_resp)
+    if bundle_edit:
+        bundle_edit(bundle)
+
+    files = {"bundle.json": pretty(bundle), "recipe.json": pretty(checker_recipe)}
+    args = ["--oneshot", "{dir}/bundle.json", "--recipe", "{dir}/recipe.json"]
+    if no_context_arg:
+        args.append("--no-context")
+    else:
+        files["context.json"] = pretty(context if context is not None else ctx)
+        args += ["--context", "{dir}/context.json"]
+    args += ["--ark-sha256", pack.ark, "--expected-measurement", MEASUREMENT]
+    hashes = {}
+    for path, digest in in_hash.items():
+        if path in input_files:
+            files[f"inputs/{len(hashes)}.bin"] = FILE_BYTES.get(path, b"input\n")
+            args += ["--input-file", f"{path}={{dir}}/inputs/{len(hashes)}.bin"]
+            hashes[path] = digest
+            continue
+        given = (caller_hashes or {}).get(path, digest)
+        if given is not None:
+            args += ["--input-sha256", f"{path}={given}"]
+            hashes[path] = given
+    files["inputs.json"] = pretty(hashes)
+    files.update(extra_files or {})
+    for path in held:
+        name = path.rsplit("/", 1)[-1]
+        data = (held_bytes or {}).get(path, outputs_bytes.get(path) if path in outputs_bytes else b"held\n")
+        files[f"outputs/{name}"] = data if data is not None else b"held for an absent output\n"
+        args += ["--output-file", f"{path}={{dir}}/outputs/{name}"]
+    if args_edit:
+        args_edit(args)
+    return files, args
+
+
+def run_case(pack: Pack, kind: str, name: str, description: str, expect: dict, **kw) -> None:
+    files, args = make_run(pack, **kw)
+    exp = {"exit_code": 0, "verdict": "PASS"} if kind == "good" else {"exit_code": 1, "verdict": "FAIL"}
+    exp.update(expect)
+    pack.add(kind, name, files, {"description": description, "args": args, "expect": exp})
+
+
+def fail(n: int, text: str) -> dict:
+    return {"reason": f"check {n}: {text}"}
+
+
+def run_good_cases(pack: Pack) -> None:
+    run = "/run"
+    run_case(pack, "good", "run_held_output_proven_exit_code",
+             "A run whose result file is held by the checker, whose log is in the file, and whose exec answer proves "
+             "the exit code.", {"pointers": {
+                 f"{run}/oneshot_id": RUN_ID, f"{run}/room": RUN_ROOM, f"{run}/outputs/0/state": "present",
+                 f"{run}/outputs/0/sha256": sha(FILE_BYTES[RESULT_PATH]), f"{run}/outputs/0/bytes": "held",
+                 f"{run}/outputs/1/bytes": "held", f"{run}/exit_code/status": "proven", f"{run}/exit_code/value": 0,
+                 f"{run}/image/compared_with_recipe": True, "/room_links/run-room-1": RUN_ID,
+                 "/chain/room_numbering/rooms/run-room-1/serial": True,
+                 "/chain/room_numbering/rooms/run-room-1/receipts": 8}})
+    run_case(pack, "good", "run_output_receipt_only",
+             "No output bytes are held: each output line says receipt only.",
+             {"pointers": {f"{run}/outputs/0/bytes": "receipt_only", f"{run}/outputs/1/bytes": "receipt_only"}},
+             held=(), inline=())
+    run_case(pack, "good", "run_optional_output_absent", "An optional output the run did not write: reported absent.",
+             {"pointers": {f"{run}/outputs/1/state": "absent", f"{run}/outputs/0/state": "present"}},
+             absent=(LOG_PATH,), inline=())
+    run_case(pack, "good", "run_exit_code_not_proven",
+             "The file holds no exec answer: the exit code is not proven and the verdict is still PASS.",
+             {"pointers": {f"{run}/exit_code/status": "not proven"}}, exec_response="unproven")
+    run_case(pack, "good", "run_exit_code_answer_not_the_signed_one",
+             "An exec answer that does not hash to the receipt's result: not proven, still PASS.",
+             {"pointers": {f"{run}/exit_code/status": "not proven"}}, exec_response="mismatch")
+
+    def unicode_input(r):
+        r["request"]["inputs"].append({"path": UNICODE_PATH, "mode": "600"})
+    run_case(pack, "good", "run_path_with_space_and_unicode",
+             "An input whose path holds a space, +, &, =, %, ~ and a non-ASCII letter: the signed target is the "
+             "sorted, plus-for-space form.", {}, truth_edit=unicode_input)
+    run_case(pack, "good", "run_input_given_as_file", "The caller gives an input as a file, not a hash.", {},
+             input_files=(RUN_PATH,))
+    run_case(pack, "good", "run_no_context", "A run with no context: the checker is told --no-context.", {},
+             truth_context={}, no_context_arg=True)
+
+    def no_network_no_guest(r):
+        r["request"].pop("network")
+        r["create"].pop("broker_guest")
+        r["create"].pop("image_id")
+    run_case(pack, "good", "run_network_left_out_no_image_id",
+             "A recipe with no network, no broker_guest and no image_id: the network is deny_all in the broker's "
+             "form, the signed image_digest is reported and not compared.",
+             {"pointers": {f"{run}/image/compared_with_recipe": False}}, truth_edit=no_network_no_guest)
+    run_case(pack, "good", "run_run_id_flag_agrees", "The caller's run id, the file's and the create's agree.", {},
+             args_edit=lambda a: a.extend(["--run-id", RUN_ID]))
+
+    def two_measurements(a):
+        a[a.index("--expected-measurement") + 1] = OTHER_MEASUREMENT
+        a.append("--expected-measurement")
+        a.append(MEASUREMENT)
+    run_case(pack, "good", "run_two_allowed_measurements", "Two measurements are allowed; the machine has the second.",
+             {}, args_edit=two_measurements)
+
+    def measurements_file(a):
+        i = a.index("--expected-measurement")
+        del a[i:i + 2]
+        a.extend(["--allowed-measurements", "{dir}/allowed.json"])
+    run_case(pack, "good", "run_allowed_measurements_file", "The allowed measurements come as a file holding a list.",
+             {}, args_edit=measurements_file, extra_files={"allowed.json": pretty([OTHER_MEASUREMENT, MEASUREMENT])})
+
+
+def edit_report(pack: Pack, flip: int):
+    def edit(bundle):
+        raw = bytearray(base64.b64decode(bundle["attestation"]["report_b64"]))
+        raw[flip] ^= 0x01
+        bundle["attestation"] = {**bundle["attestation"], "report_b64": b64(bytes(raw))}
+    return edit
+
+
+def run_bad_cases(pack: Pack) -> None:
+    def bad(name, description, expect, **kw):
+        run_case(pack, "bad", name, description, expect, **kw)
+
+    def drop_arg(flag, count=2):
+        def edit(args):
+            i = args.index(flag)
+            del args[i:i + count]
+        return edit
+
+    # ---- inputs the checker is given
+    bad("run_input_no_pin", "No --ark-sha256: run mode has no AMD root to trust.",
+        {"reason": "inputs: run mode needs --ark-sha256"}, args_edit=drop_arg("--ark-sha256"))
+    bad("run_input_no_recipe", "No recipe.", {"reason": "inputs: run mode needs --recipe"},
+        args_edit=drop_arg("--recipe"))
+    bad("run_input_no_context_choice", "Neither --context nor --no-context.",
+        {"reason": "inputs: run mode needs --context FILE or --no-context"}, args_edit=drop_arg("--context"))
+    bad("run_input_no_measurement", "No allowed measurement.",
+        {"reason": "inputs: run mode needs --expected-measurement or --allowed-measurements"},
+        args_edit=drop_arg("--expected-measurement"))
+    bad("run_input_for_a_path_the_recipe_lacks", "An input hash for a path that is not an input of the recipe.",
+        {"reason": "inputs: --input-sha256 names /work/in/other.bin, which is not an input of the recipe"},
+        args_edit=lambda a: a.extend(["--input-sha256", "/work/in/other.bin=" + "ab" * 32]))
+    bad("run_output_file_for_a_path_the_recipe_lacks", "An output file for a path that is not an output of the recipe.",
+        {"reason": "inputs: --output-file names /work/out/other.bin, which is not an output of the recipe"},
+        args_edit=lambda a: a.extend(["--output-file", "/work/out/other.bin={dir}/outputs/result.json"]))
+
+    # ---- check 1: attestation, AMD chain, measurement, receipt signatures
+    bad("run_c1_measurement_not_allowed", "The machine's measurement is not the one allowed.",
+        fail(1, "measurement differs from the expected build"),
+        args_edit=lambda a: a.__setitem__(a.index("--expected-measurement") + 1, OTHER_MEASUREMENT))
+
+    def two_other(a):
+        i = a.index("--expected-measurement")
+        a[i + 1] = OTHER_MEASUREMENT
+        a.extend(["--expected-measurement", hashlib.sha384(b"a third measurement").hexdigest()])
+    bad("run_c1_measurement_not_in_allowed_list", "The machine's measurement is in neither of two allowed ones.",
+        fail(1, "measurement is not one of the allowed measurements"), args_edit=two_other)
+    bad("run_c1_pin_differs", "The ARK is not the pinned one.",
+        fail(1, f"ARK sha256 {pack.ark} differs from the pinned value"),
+        args_edit=lambda a: a.__setitem__(a.index("--ark-sha256") + 1, "00" * 32))
+    bad("run_c1_report_signature", "One byte of the chip signature is changed.",
+        fail(1, "report signature does not verify with the VCEK"), bundle_edit=edit_report(pack, 0x2A0 + 10))
+    bad("run_c1_report_does_not_commit_to_binding", "One byte of the report data is changed.",
+        fail(1, "REPORT_DATA does not commit to the binding"), bundle_edit=edit_report(pack, 0x50 + 3))
+
+    def other_binding(steps):
+        next(s for s in steps if s["role"] == "in0")["fields"]["binding_sha256"] = "11" * 32
+    bad("run_c1_receipt_names_another_binding", "A receipt names another binding than the attestation's.",
+        fail(1, "receipt 3 names another binding"), steps_edit=other_binding)
+    bad("run_c1_no_certificates", "The file holds no AMD certificates.",
+        fail(1, "the file holds no AMD certificates (amd_certs)"), bundle_edit=lambda b: b.pop("amd_certs"))
+    bad("run_c1_skip_amd_refused", "--skip-amd is refused in run mode.",
+        fail(1, "--skip-amd is not allowed in run mode"), args_edit=lambda a: a.append("--skip-amd"))
+
+    def changed(bundle):
+        bundle["receipts"][1]["statement"]["status"] = 201
+    bad("run_c1_receipt_changed_after_signing", "A receipt's statement is changed after it was signed.",
+        fail(1, "receipt 2: receipt_sha256 mismatch"), bundle_edit=changed)
+
+    # ---- check 2: the room's numbers, the create, no lost answer
+    gap = {"drop": ("in0",)}
+    bad("run_c2_gap", "A receipt is missing from the middle of the list.",
+        fail(2, f"room {RUN_ROOM}: room_sequence jumps from 2 to 4: a receipt is missing"), **gap)
+    bad("run_c2_duplicate", "Two receipts carry room_sequence 2.",
+        fail(2, f"room {RUN_ROOM}: room_sequence 2 appears more than once"),
+        overrides={"in0": {"room_sequence": 2}})
+    bad("run_c2_bad_link", "A room receipt links to the wrong receipt.",
+        fail(2, f"room {RUN_ROOM}: room receipt 3 does not link to room receipt 2"),
+        overrides={"in0": {"room_previous_receipt_sha256": "00" * 32}})
+    bad("run_c2_no_numbering", "The receipts carry no room numbering.",
+        fail(2, f"room {RUN_ROOM}: the receipts are not numbered (room_sequence)"), numbered=False)
+    bad("run_c2_receipt_one_is_not_a_create", "Receipt 1 is not a create.", fail(2, "receipt 1 is not a successful create"),
+        overrides={"create": {"action": "exec"}})
+    bad("run_c2_no_serial_flag", "The create does not say serial: true.", fail(2, "receipt 1 does not say serial: true"),
+        overrides={"create": {"serial": DEL}})
+    bad("run_c2_serial_flag_false", "The create says serial: false.", fail(2, "receipt 1 does not say serial: true"),
+        overrides={"create": {"serial": False}})
+    bad("run_c2_lost_answer", "A receipt records a lost answer (status 502).",
+        fail(2, "receipt 6 is a lost answer (status 502)"), overrides={"get0": {"status": 502}})
+    bad("run_c2_other_room", "A receipt names another room.", fail(2, f"receipt 4 names room other-room, not {RUN_ROOM}"),
+        overrides={"in1": {"sandbox_id": "other-room"}})
+    bad("run_c2_room_id_not_safe", "The room id has a space and a bang.", fail(2, "the room id is not a safe id"),
+        room="bad room!")
+
+    # ---- check 3: the exact list of actions
+    bad("run_c3_extra_receipt", "A request after the end marker.", fail(3, "the list has 9 receipts, the recipe needs 8"),
+        steps_edit=lambda s: s.append(step("extra", "exec", f"POST /v1/sandboxes/{RUN_ROOM}/exec", 200)))
+    bad("run_c3_missing_receipt", "The end marker is missing.", fail(3, "the list has 7 receipts, the recipe needs 8"),
+        drop=("end",))
+    in0 = put_target(RUN_ROOM, "755", RUN_PATH)
+    bad("run_c3_wrong_action", "An input put is an exec.",
+        fail(3, f"receipt 3 is exec {in0}, the recipe needs file_put {in0}"), overrides={"in0": {"action": "exec"}})
+    bad("run_c3_wrong_mode", "An input is put with mode 600, the recipe says 755.",
+        fail(3, f"receipt 3 is file_put {put_target(RUN_ROOM, '600', RUN_PATH)}, the recipe needs file_put {in0}"),
+        overrides={"in0": {"target": put_target(RUN_ROOM, "600", RUN_PATH)}})
+    extra = in0 + "&x=1"
+    bad("run_c3_extra_query_key", "A put target with one more query key.",
+        fail(3, f"receipt 3 is file_put {extra}, the recipe needs file_put {in0}"), overrides={"in0": {"target": extra}})
+    other_path = put_target(RUN_ROOM, "755", "/work/in/other.py")
+    bad("run_c3_wrong_path", "An input put to another path.",
+        fail(3, f"receipt 3 is file_put {other_path}, the recipe needs file_put {in0}"),
+        overrides={"in0": {"target": other_path}})
+    get0 = get_target(RUN_ROOM, 1048576, RESULT_PATH)
+    big = get_target(RUN_ROOM, 2097152, RESULT_PATH)
+    bad("run_c3_wrong_max_bytes", "A get with a larger max_bytes than the recipe's.",
+        fail(3, f"receipt 6 is file_get {big}, the recipe needs file_get {get0}"), overrides={"get0": {"target": big}})
+    other_exec = "POST /v1/sandboxes/other-room/exec"
+    bad("run_c3_other_room_in_target", "The exec's target names another room.",
+        fail(3, f"receipt 5 is exec {other_exec}, the recipe needs exec POST /v1/sandboxes/{RUN_ROOM}/exec"),
+        overrides={"exec": {"target": other_exec}})
+
+    def delete_before_end(steps):
+        steps.insert(len(steps) - 1, step("del", "delete", f"DELETE /v1/sandboxes/{RUN_ROOM}", 200))
+    end_t = put_target(RUN_ROOM, "644", END_PATH)
+    bad("run_c3_delete_before_the_end", "A delete before the end marker.",
+        fail(3, f"receipt 8 is delete DELETE /v1/sandboxes/{RUN_ROOM}, the recipe needs file_put {end_t}"),
+        steps_edit=delete_before_end)
+
+    # ---- check 4: the create
+    bad("run_c4_status", "The create did not succeed.", fail(4, "the create did not succeed (status 500)"),
+        overrides={"create": {"status": 500}})
+    bad("run_c4_no_image_digest", "The create has no image_digest.", fail(4, "the create receipt has no image_digest"),
+        overrides={"create": {"image_digest": None}})
+    bad("run_c4_image_digest_malformed", "The image_digest is not sha256: and 64 hex.",
+        fail(4, "image_digest is not sha256: and 64 lower-case hex"), overrides={"create": {"image_digest": "sha256:abc"}})
+    bad("run_c4_image_id_differs", "The recipe's image_id is not the signed image_digest.",
+        fail(4, "the create's image_digest is not the recipe's image_id"),
+        recipe_edit=lambda r: r["create"].update(image_id="sha256:" + "22" * 32))
+    bad("run_c4_pool_create", "The create is a pool create.", fail(4, "the create is a pool create"),
+        overrides={"create": {"pool": True}})
+    off = {"mode": "internet", "allow": []}
+    bad("run_c4_network", "The signed network rule is not the recipe's.",
+        fail(4, "the signed network rule is not the recipe's"),
+        overrides={"create": {"network_policy": off, "network_policy_sha256": sha(canonical(off))}})
+    bad("run_c4_run_id", "The file's oneshot_id is not the id the create names.",
+        fail(4, f"the create names sandbox {RUN_ID}, not the file's oneshot_id {RUN_ID[:-1]}0"),
+        bundle_edit=lambda b: b.update(oneshot_id=RUN_ID[:-1] + "0"))
+    bad("run_c4_run_id_flag_differs", "The run id the caller was sent is not the file's.",
+        fail(4, "the run id you gave is not the file's oneshot_id"),
+        args_edit=lambda a: a.extend(["--run-id", RUN_ID[:-1] + "0"]))
+    bad("run_c4_no_create_bytes", "The file holds no create bytes.",
+        fail(4, "the file holds no create bytes (create_request_b64): the broker that made this run does not hand "
+                "them back"), bundle_edit=lambda b: b.pop("create_request_b64"))
+    bad("run_c4_create_bytes_hash", "The create bytes are not the bytes the receipt hashed.",
+        fail(4, "the create bytes do not hash to the receipt's customer_request_sha256"),
+        bundle_edit=lambda b: b.update(create_request_b64=b64(b'{"image":"x"}')))
+    bad("run_c4_unknown_key", "The create holds a key that is not a create key.",
+        fail(4, "the create has a key it should not have: env"), create_body=lambda body: {**body, "env": {}})
+    bad("run_c4_key_missing", "The create lacks a key.", fail(4, "the create lacks the key ttl_seconds"),
+        create_body=lambda body: {k: v for k, v in body.items() if k != "ttl_seconds"})
+    bad("run_c4_image", "The create's image is not the recipe's.", fail(4, "the create's image is not the recipe's"),
+        create_body=lambda body: {**body, "image": "images.example.test/other@sha256:" + "33" * 32})
+    bad("run_c4_size", "The create's resources are not the recipe's.", fail(4, "the create's resources are not the recipe's"),
+        create_body=lambda body: {**body, "resources": {"cpus": 4, "memory_mb": 512}})
+    bad("run_c4_ttl", "The create's ttl_seconds is not the recipe's.", fail(4, "the create's ttl_seconds is not the recipe's"),
+        create_body=lambda body: {**body, "ttl_seconds": 600})
+    bad("run_c4_network_in_bytes", "The create's network is not the broker's form of the recipe's.",
+        fail(4, "the create's network is not the broker's form of the recipe's"),
+        create_body=lambda body: {**body, "network": {"mode": "internet", "allow": []}})
+
+    def labels(**over):
+        return lambda body: {**body, "labels": {**body["labels"], **over}}
+    bad("run_c4_label_serial", "The serial label is not 1.", fail(4, "the label cathedral_serial is not 1"),
+        create_body=labels(cathedral_serial="2"))
+    bad("run_c4_label_broker_guest_not_the_recipes", "The broker_guest label is not the recipe's.",
+        fail(4, "the label broker_guest is not the recipe's"), create_body=labels(broker_guest="guest-9"))
+    bad("run_c4_label_broker_guest_not_id_safe", "With no broker_guest in the recipe, the label is not an id-safe string.",
+        fail(4, "the label broker_guest is not an id-safe string"),
+        truth_edit=lambda r: r["create"].pop("broker_guest"), create_body=labels(broker_guest="has space"))
+    bad("run_c4_label_broker_batch", "The broker_batch label is not a lower-case UUID.",
+        fail(4, "the label broker_batch is not a lower-case UUID"), create_body=labels(broker_batch="BATCH"))
+    bad("run_c4_label_extra", "The create carries a fifth label.",
+        fail(4, "the labels are not exactly the four expected (extra: customer)"), create_body=labels(customer="x"))
+    bad("run_c4_label_missing", "The create lacks the broker_batch label.",
+        fail(4, "the labels are not exactly the four expected (missing: broker_batch)"),
+        create_body=lambda body: {**body, "labels": {k: v for k, v in body["labels"].items() if k != "broker_batch"}})
+    bad("run_c4_label_run_id", "The sandbox id label is not the run id.", fail(4, "the label cathedral_sandbox_id is not the run id"),
+        create_body=labels(cathedral_sandbox_id="11111111-2222-4333-8444-555555555555"))
+    dup = (b'{"image":"' + IMAGE_REF.encode() + b'","image":"' + IMAGE_REF.encode() + b'"}')
+    bad("run_c4_duplicate_key", "The create bytes repeat a key.", fail(4, "the create bytes repeat the key 'image'"),
+        create_body=lambda body: dup)
+    bad("run_c4_float", "The create bytes hold a number with a decimal point.",
+        fail(4, "the create bytes hold the number 300.0, which is not an integer"),
+        create_body=lambda body: canonical(body).replace(b'"ttl_seconds":300', b'"ttl_seconds":300.0'))
+
+    # ---- check 5: the context and the inputs
+    bad("run_c5_context_put_status", "The put of the context failed.",
+        fail(5, "the put of the context did not succeed (status 500)"), overrides={"context": {"status": 500}})
+    bad("run_c5_context_hash", "The context the caller expects is not the one written.",
+        fail(5, "the context put does not carry the expected context (its hash differs)"),
+        context={"submission": "another"})
+    bad("run_c5_input_put_status", "The put of an input failed.",
+        fail(5, f"the put of input {RUN_PATH} did not succeed (status 500)"), overrides={"in0": {"status": 500}})
+    bad("run_c5_input_hash", "The caller's hash for an input is not what was written.",
+        fail(5, f"the put of input {RUN_PATH} does not carry the bytes whose hash you gave"),
+        caller_hashes={RUN_PATH: "44" * 32})
+    bad("run_c5_input_not_given", "The caller gives no hash and no file for an input.",
+        fail(5, f"no hash or file was given for input {DATA_PATH}"), caller_hashes={DATA_PATH: None})
+
+    # ---- check 6: the exec
+    bad("run_c6_status", "The exec did not answer 200.", fail(6, "the exec did not return 200 (status 500)"),
+        overrides={"exec": {"status": 500}})
+    bad("run_c6_no_exec_bytes", "The file holds no exec bytes.", fail(6, "the file holds no exec bytes (exec_request_b64)"),
+        bundle_edit=lambda b: b.pop("exec_request_b64"))
+    bad("run_c6_bytes_hash", "The exec bytes are not the bytes the receipt hashed.",
+        fail(6, "the exec bytes do not hash to the receipt's customer_request_sha256"),
+        bundle_edit=lambda b: b.update(exec_request_b64=b64(b'{"cmd":["true"]}')))
+    bad("run_c6_extra_key", "The exec holds a key the recipe does not have.",
+        fail(6, "the exec has a key it should not have: user"), exec_body=lambda body: {**body, "user": "root"})
+    bad("run_c6_key_missing", "The exec lacks the cwd the recipe has.", fail(6, "the exec lacks the key cwd"),
+        exec_body=lambda body: {k: v for k, v in body.items() if k != "cwd"})
+    bad("run_c6_cmd", "The exec's command is not the recipe's.", fail(6, "the exec's cmd is not the recipe's"),
+        recipe_edit=lambda r: r["request"].update(command=["python", "/work/in/other.py"]))
+    bad("run_c6_env", "The exec's environment is not the recipe's.", fail(6, "the exec's env is not the recipe's"),
+        recipe_edit=lambda r: r["request"].update(env={"MODE": "other"}))
+    bad("run_c6_timeout", "The exec's timeout is not the recipe's.", fail(6, "the exec's timeout_seconds is not the recipe's"),
+        recipe_edit=lambda r: r["request"].update(timeout_seconds=61))
+    bad("run_c6_cwd", "The exec's cwd is not the recipe's.", fail(6, "the exec's cwd is not the recipe's"),
+        recipe_edit=lambda r: r["request"].update(cwd="/other"))
+
+    # ---- check 7: the gets and the end marker
+    bad("run_c7_partial_answer", "A get answered 206.", fail(7, f"the get of {RESULT_PATH} answered 206, not 200"),
+        overrides={"get0": {"status": 206}})
+    bad("run_c7_too_large", "A get answered 413.", fail(7, f"the get of {RESULT_PATH} answered 413, not 200"),
+        overrides={"get0": {"status": 413}})
+    bad("run_c7_server_error", "A get answered 500.", fail(7, f"the get of {RESULT_PATH} answered 500, not 200"),
+        overrides={"get0": {"status": 500}})
+    bad("run_c7_held_bytes_hash", "The bytes the caller holds are not the bytes the get returned.",
+        fail(7, f"the bytes held for {RESULT_PATH} do not hash to the receipt's result_sha256"),
+        held_bytes={RESULT_PATH: b"other bytes\n"})
+    bad("run_c7_inline_bytes_hash", "The inline bytes in the file are not the bytes the get returned.",
+        fail(7, f"the bytes held for {LOG_PATH} do not hash to the receipt's result_sha256"),
+        bundle_edit=lambda b: b["inline_outputs"].update({LOG_PATH: b64(b"other\n")}))
+
+    def small_output(r):
+        r["request"]["outputs"][0]["max_bytes"] = 4
+    bad("run_c7_length_over_max_bytes", "The held output is longer than its max_bytes.",
+        fail(7, f"{RESULT_PATH} is {len(FILE_BYTES[RESULT_PATH])} bytes, over its max_bytes 4"), truth_edit=small_output)
+    bad("run_c7_required_output_missing", "A required output answered 404.",
+        fail(7, f"the required output {RESULT_PATH} was not found (404)"), absent=(RESULT_PATH,), held=(), inline=())
+    bad("run_c7_held_file_for_absent_output", "The caller holds a file for an optional output the receipt says is absent.",
+        fail(7, f"bytes are held for {LOG_PATH}, but the receipt says it was absent"), absent=(LOG_PATH,),
+        held=(RESULT_PATH, LOG_PATH), inline=())
+    bad("run_c7_end_marker_hash", "The end marker put does not carry empty bytes.",
+        fail(7, "the end marker put does not carry empty bytes"),
+        overrides={"end": {"customer_request_sha256": sha(b"x")}})
+    bad("run_c7_end_marker_status", "The end marker put failed.", fail(7, "the end marker put did not succeed (status 500)"),
+        overrides={"end": {"status": 500}})
+
+    # ---- check 8: the request in the file equals the recipe
+    bad("run_c8_field", "The request in the file has another size than the recipe.",
+        fail(8, "the request in the file differs from the recipe in size"),
+        bundle_edit=lambda b: b["request"].update(size="large"))
+    bad("run_c8_input_hash", "The request in the file names another hash for an input.",
+        fail(8, "the request in the file differs from the recipe in inputs"),
+        bundle_edit=lambda b: b["request"]["inputs"][0].update(sha256="55" * 32))
+    bad("run_c8_context", "The request in the file holds another context.",
+        fail(8, "the request in the file differs from the recipe in context"),
+        bundle_edit=lambda b: b["request"].update(context={"submission": "another"}))
+    bad("run_c8_unknown_key", "The request holds a key that is not a request field.",
+        fail(8, "the request holds a key that is not a request field: extra"),
+        bundle_edit=lambda b: b["request"].update(extra=1))
+    bad("run_c8_no_request", "The file holds no request.", fail(8, "the file holds no request"),
+        bundle_edit=lambda b: b.pop("request"))
+
+
+CASE_SETS = [numbering_cases, serial_cases, pool_cases, run_good_cases, run_bad_cases]
 
 
 def build(amd: dict[str, bytes]) -> dict[str, bytes]:
