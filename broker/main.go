@@ -903,9 +903,16 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 				h.failed++
 				h.backoffUntil = time.Now().Add(hotelFailBackoff)
 			}
-			if err != nil {
-				// The hotel may have started the room before the answer was lost.
+			// The hotel may hold a room it did not report: its answer was
+			// lost, or it (or a proxy in front of it, as on a miner hotel)
+			// failed after the room started. Its rooms of this request are
+			// reaped before the guest gets an answer, so a create that moves
+			// on to another hotel never leaves a second billed room. A 4xx or
+			// the guest's own image fault is a refusal: no room was started.
+			if err != nil || ((status < 400 || status >= 500) && !guestImage) {
 				lost = append(lost, h)
+			}
+			if err != nil {
 				last = createResult{status: 502, doc: map[string]any{"error": map[string]string{"code": "hotel_unreachable", "message": "hotel " + h.cfg.ID + " did not answer"}}}
 			} else {
 				last = createResult{status: status, body: out, header: http.Header{"X-Broker-Hotel": {h.cfg.ID}}}
@@ -1002,7 +1009,8 @@ func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[s
 		}
 		var list struct {
 			Sandboxes []struct {
-				ID string `json:"id"`
+				ID     string         `json:"id"`
+				Labels map[string]any `json:"labels"`
 			} `json:"sandboxes"`
 		}
 		if json.Unmarshal(out, &list) != nil {
@@ -1011,6 +1019,11 @@ func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[s
 		ok := true
 		for _, s := range list.Sandboxes {
 			if keep[s.ID] {
+				continue
+			}
+			// A hotel that ignores the label filter (a miner hotel is
+			// third-party code) must not get another request's rooms deleted.
+			if s.Labels[batchLabel] != batchID || s.Labels[guestLabel] != g.cfg.ID {
 				continue
 			}
 			st, _, _, derr := h.do(ctx, "DELETE", "/v1/sandboxes/"+url.PathEscape(s.ID), nil, nil, timeout)

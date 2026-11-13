@@ -69,6 +69,12 @@ type fakeHotel struct {
 	// X-Cathedral-Guest header, as a hotel with per-guest ownership does
 	// (cathedral/sandbox_guest.py list_snapshots and delete_snapshot, AB#650).
 	ownerScoped bool
+
+	// createFail: answer creates with this status and no room id (AB#338).
+	// createFailAfterStart: start the room first, as a hotel or a proxy in
+	// front of it that fails after the room exists.
+	createFail           int
+	createFailAfterStart bool
 }
 
 // snapGuestOK is whether a snapshot call may see snapshot doc d.
@@ -109,6 +115,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 401, "unauthorized", "bad hotel key")
 			return
 		}
+		if f.createFail != 0 && !f.createFailAfterStart {
+			writeErr(w, f.createFail, "create_failed", "the hotel could not start the room")
+			return
+		}
 		if nw, ok := req["network"].(map[string]any); ok && nw["mode"] == "allowlist" {
 			if allow, _ := nw["allow"].([]any); len(allow) > 0 && allow[0] == "bad.example:9" {
 				writeErr(w, 400, "invalid_network_allowlist", "port 9 is not allowed")
@@ -124,6 +134,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.n++
 		id := fmt.Sprintf("sbx_%d", f.n)
 		f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": req["labels"]})
+		if f.createFail != 0 {
+			writeErr(w, f.createFail, "create_failed", "the room started but the answer is an error")
+			return
+		}
 		w.Header().Set("X-Room-Receipt", "signed-create")
 		out := map[string]any{"id": id, "state": "running", "snapshot_id": req["snapshot_id"]}
 		if t, ok := req["tunables"]; ok && t != nil && f.appliesTunables {
