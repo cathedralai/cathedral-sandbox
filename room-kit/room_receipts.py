@@ -98,6 +98,14 @@ window, and one outside the window is refused. The receipt is an exec receipt
 that signs sha256 of the plaintext command, as for any exec, and the sha256 of
 both envelopes, which is how the client knows the answer is the guest's.
 
+Guest ingress key (ROOM_GUEST_INGRESS=1, sealed only; AB#422). The front
+makes, at start and in memory, a P-256 TLS key for customer Preview URLs and
+names its SPKI sha256 in the binding (guest_ingress.tls_spki_sha256), so the
+boot's REPORT_DATA commits to it. It is not the miner hotel's control-plane
+TLS key (tls_spki_sha256). Nothing serves on it yet: the certificate (AB#423),
+the host DNAT to the guest and the signed expose come next. Flag off: the
+binding is byte for byte what it was.
+
 Dedicated sealed machine (one owner). The host launches the guest with the
 owner's Ed25519 public key and the manifest digest in fw_cfg, and with
 HOST_DATA = sha256("cathedral-dedicated-v1\\0" || manifest sha256 || owner key).
@@ -1320,6 +1328,35 @@ def make_tls_identity(hotel: str) -> tuple[bytes, bytes, str]:
     return cert.public_bytes(Encoding.PEM), key_pem, spki_sha256(key.public_key())
 
 
+INGRESS_SCHEMA = "cathedral_guest_ingress_v1"
+
+
+def guest_ingress_wanted() -> bool:
+    """ROOM_GUEST_INGRESS=1. Unset or any other value: off."""
+    return os.environ.get("ROOM_GUEST_INGRESS") == "1"
+
+
+class GuestIngress:
+    """The per-boot TLS key for customer Preview URLs (AB#422). Memory only.
+
+    Made here, inside the guest, so the host never holds it. The binding names
+    its SPKI sha256 (binding_fields), so the boot's SNP report commits to it,
+    and a client that pins that value knows the TLS session ends in this guest.
+    The certificate is self-issued for now; a publicly trusted one for the same
+    key waits on AB#423. Kept apart from MinerHotel's key: that one is the
+    control plane's channel, this one faces customers.
+    """
+
+    def __init__(self, hotel: str):
+        self.cert_pem, self._key_pem, self.tls_spki_sha256 = make_tls_identity(hotel)
+
+    def __repr__(self) -> str:
+        return f"GuestIngress(tls_spki_sha256={self.tls_spki_sha256})"
+
+    def binding_fields(self) -> dict:
+        return {"guest_ingress": {"schema": INGRESS_SCHEMA, "tls_spki_sha256": self.tls_spki_sha256}}
+
+
 class InstallRefused(Exception):
     """POST /room/hotel-key refused. The code is short and never names the key."""
 
@@ -1468,8 +1505,11 @@ class Ledger:
     """The receipt key, the binding and the chain of this boot."""
 
     def __init__(self, hotel: str, store: str, miner: MinerHotel | None = None,
-                 secrets: SealedSecrets | None = None, sealed_exec: SealedExec | None = None):
+                 secrets: SealedSecrets | None = None, sealed_exec: SealedExec | None = None,
+                 ingress: GuestIngress | None = None):
         self.miner = miner
+        # Like the secrets key, the ingress key means something only under an SNP report.
+        self.ingress = ingress
         # A secrets or sealed exec key means something only under an SNP report: level 1 drops both below.
         self.secrets = secrets
         self.sealed_exec = sealed_exec
@@ -1486,6 +1526,7 @@ class Ledger:
             self.secrets = None
             self.sealed_exec = None
             self.sealed_env = None
+            self.ingress = None
             self._init_hotel(hotel, store)
         # Runtime guest key. Not in the binding: adding it there would change
         # REPORT_DATA. Authenticated by an Ed25519 signature over the plant-key
@@ -1554,6 +1595,9 @@ class Ledger:
         if self.sealed_exec is not None:
             # The same rule for the sealed exec key: one added key, only with its flag on.
             self.binding.update(self.sealed_exec.binding_fields())
+        if self.ingress is not None:
+            # The same rule for the guest ingress key (AB#422).
+            self.binding.update(self.ingress.binding_fields())
         if owner is not None:
             # Enough to recompute HOST_DATA from published fields:
             # sha256(domain || manifest_sha256 || owner key) == host_data.
@@ -2886,8 +2930,10 @@ def main() -> int:
     store = env.get("ROOM_RECEIPTS_DIR", "/run/room-receipts")
     secrets = SealedSecrets(env.get("ROOM_SEALED_SECRETS_DIR") or DEFAULT_SECRETS_DIR) if sealed_secrets_wanted() else None
     sealed_exec = SealedExec() if sealed_exec_wanted() else None
+    ingress = GuestIngress(env["ROOM_HOTEL_NAME"]) if guest_ingress_wanted() else None
     try:
-        ledger = Ledger(env["ROOM_HOTEL_NAME"], store, miner=miner, secrets=secrets, sealed_exec=sealed_exec)
+        ledger = Ledger(env["ROOM_HOTEL_NAME"], store, miner=miner, secrets=secrets, sealed_exec=sealed_exec,
+                        ingress=ingress)
     except OwnerBindingError as exc:
         # Fail closed: nothing listens, so the broker sees the hotel down.
         # The console is the guest serial port, the one log the host operator can read.
@@ -2907,8 +2953,13 @@ def main() -> int:
                   f"room directories under {ledger.secrets.root}", flush=True)
         if ledger.sealed_exec is not None:
             print(f"room-receipts: sealed commands on: key {ledger.sealed_exec.public_b64} in the binding", flush=True)
-    elif secrets is not None or sealed_exec is not None:
-        print("room-receipts: ROOM_SEALED_SECRETS=1 and ROOM_SEALED_EXEC=1 are ignored: level 1 has no SNP report "
+        if ledger.ingress is not None:
+            print(f"room-receipts: guest ingress key on: tls_spki_sha256 {ledger.ingress.tls_spki_sha256} "
+                  "in the binding (nothing serves on it yet)", flush=True)
+    elif secrets is not None or sealed_exec is not None or ingress is not None:
+        flags = [name for name, box in (("ROOM_SEALED_SECRETS", secrets), ("ROOM_SEALED_EXEC", sealed_exec),
+                                        ("ROOM_GUEST_INGRESS", ingress)) if box is not None]
+        print(f"room-receipts: {' and '.join(f'{f}=1' for f in flags)} ignored: level 1 has no SNP report "
               "to bind the key", flush=True)
     else:
         print(f"room-receipts: binding {ledger.binding_sha256} level hotel", flush=True)
