@@ -558,3 +558,14 @@ def test_a_name_that_ends_in_a_newline_inside_a_label_is_refused_where_the_produ
     with pytest.raises(vr.Fail):
         vr.canonical_policy("allowlist", ["a\n.org"])
     assert vr.canonical_policy("allowlist", ["A.org\n"]) == {"mode": "allowlist", "allow": ["a.org"]}
+
+
+def test_json_depth_is_counted_on_the_raw_text_and_skips_strings() -> None:
+    vr = _load_checker()
+    assert vr.json_depth('{"a": [1, {"b": []}]}') == 4
+    assert vr.json_depth('"[[[[" ') == 0
+    assert vr.json_depth('{"k": "[[[[[[[["}') == 1
+    assert vr.json_depth('{"k": "a\\"[[["}') == 1          # an escaped quote does not end the string
+    assert vr.json_depth('{"k": "a\\\\", "j": [[1]]}') == 3  # an escaped backslash does not escape the quote
+    assert vr.json_depth("[" * 100_000) == 100_000
+    assert vr.JSON_MAX_DEPTH == 64

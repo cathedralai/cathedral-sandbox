@@ -1536,13 +1536,24 @@ def run_form_cases(pack: Pack) -> None:
                 continue  # too large to keep as a saved list; the table test builds it in memory
             run_case(pack, "bad", f"run_form_{rule}_{case}", f"One step past the form rule {rule}: {case}.",
                      {"reason": reason}, **knobs)
-    deep = b"[" * 5000 + b"]" * 5000
-    run_case(pack, "bad", "run_form_deep_one_shot_file", "The one-shot file is a list nested 5,000 levels deep.",
-             {"reason": "check 1: the file is not a cathedral_oneshot_bundle_v1"}, bundle_raw=lambda raw: deep)
-    run_case(pack, "bad", "run_form_deep_recipe", "The recipe is a list nested 5,000 levels deep.",
-             {"reason": "recipe: the document is not a cathedral_oneshot_recipe_v1"}, recipe_raw=lambda raw: deep)
-    run_case(pack, "bad", "run_form_deep_context_file", "The context file is a list nested 5,000 levels deep.",
-             {"reason": "inputs: context nests deeper than 32 levels"}, context_raw=lambda raw: deep)
+    # Nesting is counted on the raw text before any parse, so the answer is the same on every interpreter.
+    def nested(n):
+        return b"[" * n + b"]" * n
+    inputs = [("one_shot_file", "bundle_raw", "inputs: the one-shot file nests too deeply to read",
+               "check 1: the file is not a cathedral_oneshot_bundle_v1"),
+              ("recipe", "recipe_raw", "inputs: the recipe nests too deeply to read",
+               "recipe: the document is not a cathedral_oneshot_recipe_v1"),
+              ("context_file", "context_raw", "inputs: the context file nests too deeply to read",
+               "inputs: context nests deeper than 32 levels")]
+    for name, knob, too_deep, real in inputs:
+        for depth, reason in ((64, real), (65, too_deep), (5000, too_deep)):
+            run_case(pack, "bad", f"run_form_depth_{depth}_{name}",
+                     f"The {name.replace('_', ' ')} is a list nested {depth} levels deep.", {"reason": reason},
+                     **{knob: (lambda raw, d=depth: nested(d))})
+    run_case(pack, "good", "run_form_brackets_in_a_string", "A context string of 4,000 opening brackets is a string, "
+             "not nesting.", {}, truth_context={"k": "[" * 4000})
+    run_case(pack, "good", "run_form_brackets_and_quotes_in_a_string", "A context string with quotes, backslashes and "
+             "brackets is read as a string.", {}, truth_context={"k": '"' + "[" * 200 + "\\" + "]" * 200 + '\\"{'})
     run_case(pack, "bad", "run_form_input_sha256_upper_case", "The file's request holds an upper-case input sha256.",
              {"reason": "check 8: the file's request: an input sha256 must be 64 lower-case hex"},
              bundle_edit=lambda b: b["request"]["inputs"][0].update(sha256=b["request"]["inputs"][0]["sha256"].upper()))

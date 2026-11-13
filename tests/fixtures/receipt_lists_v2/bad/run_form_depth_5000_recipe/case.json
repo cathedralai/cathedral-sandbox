@@ -17,10 +17,10 @@
   "--output-file",
   "/work/out/result.json={dir}/outputs/result.json"
  ],
- "description": "The recipe is a list nested 5,000 levels deep.",
+ "description": "The recipe is a list nested 5000 levels deep.",
  "expect": {
   "exit_code": 1,
-  "reason": "recipe: the document is not a cathedral_oneshot_recipe_v1",
+  "reason": "inputs: the recipe nests too deeply to read",
   "verdict": "FAIL"
  }
 }

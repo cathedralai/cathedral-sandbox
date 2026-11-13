@@ -17,10 +17,9 @@
   "--output-file",
   "/work/out/result.json={dir}/outputs/result.json"
  ],
- "description": "The context file is a list nested 5,000 levels deep.",
+ "description": "A context string of 4,000 opening brackets is a string, not nesting.",
  "expect": {
-  "exit_code": 1,
-  "reason": "inputs: context nests deeper than 32 levels",
-  "verdict": "FAIL"
+  "exit_code": 0,
+  "verdict": "PASS"
  }
 }
