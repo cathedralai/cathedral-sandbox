@@ -84,6 +84,7 @@ Each guest in the config can have limits (`guests.go`):
 | `default_sealed` | `true`: a create with no hotel choice goes to sealed hotels only. The guest gets an unsealed room only when the create says `"sealed": false`, names hotels with `"hotels"`, or excludes sealed hotels with `"exclude_hotel_labels"`. A fork goes to the hotel of its snapshot. |
 | `hotels` | The hotel ids the guest may use. Absent: all hotels. Other hotels are not in the guest's hotel list, and a create that names one gets 409 `unknown_hotel`. |
 | `policy` | Hotels by selector, in order: `prefer`, `allow`, `deny`. Replaces `hotels` and `default_sealed`. See "Guest policy and capacity catalog". |
+| `own_hosts_only` | `true`: every create of the guest stays on Cathedral's own hotels, never a miner hotel (the same rule as the create flag `"own_hosts_only": true`), even when its `policy` opts into miner hotels. A create cannot turn it off. Miner hotels also leave the guest's capacity catalog. For reserved customers (const). |
 | `ops` | `true`: the guest may run `POST /v1/broker/probe` and reset the counters with `POST /v1/broker/stats`. Other guests get 403. |
 
 The limits apply to the native routes and to the client (Harbor, ctcli)
@@ -95,7 +96,7 @@ limits without a restart:
 | Route (operator key) | What it does |
 |---|---|
 | `GET /v1/broker/guests` | Every guest with its limits and active rooms. No key hashes. |
-| `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed`, `hotels` and `policy` (`"policy": null` removes it). `max_rooms: 0` and `hotels: []` get 400: in config they mean 1,000 rooms and every non-miner hotel. A bad policy gets 400 `invalid_policy`. |
+| `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed`, `hotels`, `policy` (`"policy": null` removes it) and `own_hosts_only`. `max_rooms: 0` and `hotels: []` get 400: in config they mean 1,000 rooms and every non-miner hotel. A bad policy gets 400 `invalid_policy`. |
 
 A runtime change stays in memory. A restart goes back to the config file.
 
@@ -147,6 +148,31 @@ is full, never `nc-sealed`, at most 10 rooms:
  "policy": {"prefer": [{"class": "sealed"}], "allow": [{"class": "unsealed"}],
             "deny": [{"hotel": "nc-sealed"}]}}
 ```
+
+### Placement policy for miner hotels (AB#336)
+
+- Reserved customers stay on Cathedral hosts. A broker guest such as const
+  sets `"own_hosts_only": true` in its guest config. A customer on the
+  shared Polaris guest (Reliquary) gets `"own_hosts_only": true` on each
+  create from the API.
+- The shared pool uses graduated miner hotels first and falls back to the
+  own fleet. A miner in probation has no `graduated=true` label, so no
+  selector opts into it:
+
+```json
+"policy": {
+  "prefer": [{"label": {"miner": "true", "graduated": "true"}}],
+  "allow":  [{"class": "sealed"}]
+}
+```
+
+- The operator adds `graduated=true` to the hotel labels at graduation
+  (AB#334). An operator label PATCH replaces the whole label map, so send the
+  other labels with it. A miner cannot set its own labels: the enroller join
+  and PATCH refuse labels. A hotel that leaves and joins again comes back
+  without the label, so it is back in probation.
+- A policy replaces the guest's `hotels` list: check what `{"class":
+  "sealed"}` reaches before setting it on a live guest.
 
 ### Reserved hotels
 
