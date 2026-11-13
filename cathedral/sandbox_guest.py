@@ -2342,6 +2342,15 @@ class DockerGuestProvider:
     def write_tar(self, sandbox_id: str, path: str, tarball: bytes) -> None:
         self._inner.write_tar(sandbox_id, _in_work(path), tarball)
 
+    def list_directory(self, sandbox_id: str, path: str) -> list[dict[str, str]]:
+        return self._inner.list_directory(sandbox_id, _in_work(path))
+
+    def make_directory(self, sandbox_id: str, path: str) -> bool:
+        return self._inner.make_directory(sandbox_id, _in_work(path))
+
+    def remove_entry(self, sandbox_id: str, path: str) -> bool:
+        return self._inner.remove_entry(sandbox_id, _in_work(path))
+
     def read_tar(self, sandbox_id: str, spec: TarGet) -> bytes:
         _in_work(spec.path)
         return self._inner.read_tar(sandbox_id, spec)
