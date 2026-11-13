@@ -17,11 +17,11 @@
   "--output-file",
   "/work/out/result.json={dir}/outputs/result.json"
  ],
- "description": "An exec answer that does not hash to the receipt's result: not proven, still PASS.",
+ "description": "An exec answer that does not hash to the receipt's result: not confirmed, still PASS.",
  "expect": {
   "exit_code": 0,
   "pointers": {
-   "/run/exit_code/status": "not proven"
+   "/run/exit_code/status": "not confirmed"
   },
   "verdict": "PASS"
  }

@@ -240,8 +240,8 @@ def whole(hotel: Hotel, receipts=None) -> dict:
     return {"receipts": hotel.chain if receipts is None else receipts, "head": hotel.head}
 
 
-NUMBERING_PROVES = "No receipt of this room is missing from this list, between its first receipt and its last."
-NUMBERING_DOES_NOT_PROVE = ("That nothing was still running in the room when the list was read, or that no receipt "
+NUMBERING_SHOWS = "No receipt of this room is missing from this list, between its first receipt and its last."
+NUMBERING_DOES_NOT_SHOW = ("That nothing was still running in the room when the list was read, or that no receipt "
                             "was signed after it. There is no closed verdict for an ordinary room.")
 
 
@@ -260,8 +260,8 @@ def numbering_cases(pack: Pack) -> None:
                whole(h), {"pointers": {
                    f"{room}/room-a/receipts": 3, f"{room}/room-b/receipts": 3, f"{room}/room-a/first": 1,
                    f"{room}/room-a/last": 5, f"{room}/room-a/head": h.room("room-a")[-1]["receipt_sha256"],
-                   "/chain/room_numbering/proves/0": NUMBERING_PROVES,
-                   "/chain/room_numbering/does_not_prove/0": NUMBERING_DOES_NOT_PROVE}})
+                   "/chain/room_numbering/shows/0": NUMBERING_SHOWS,
+                   "/chain/room_numbering/does_not_show/0": NUMBERING_DOES_NOT_SHOW}})
     hotel_case(pack, "good", "numbered_list_reordered",
                "The same room's receipts in a shuffled order: they are sorted by room_sequence before they are checked.",
                {"receipts": [h.room("room-a")[2], h.room("room-a")[0], h.room("room-a")[1]]},
@@ -391,7 +391,7 @@ def serial_cases(pack: Pack) -> None:
                "A serial room whose last action is a successful file put: closed to that action, alive when it ran.",
                whole(h), {"pointers": {
                    f"{room}/room-s/serial": True, f"{room}/room-s/closed_to": "file_put",
-                   f"{room}/room-s/alive_at_last_action": True, "/chain/room_numbering/proves/0": sentence}})
+                   f"{room}/room-s/alive_at_last_action": True, "/chain/room_numbering/shows/0": sentence}})
 
     h = pack.new_hotel()
     h.sign("create", "room-s", 202, serial=True)
@@ -486,7 +486,7 @@ def pool_cases(pack: Pack) -> None:
                "A pre-made room: receipt 1 is a pool create, receipt 2 is the claim made from it. The claim's id is the link.",
                whole(h), {"pointers": {
                    f"{pools}/pool-1/state": "claimed", f"{pools}/pool-1/pooled_from": c["receipt_sha256"],
-                   f"{pools}/pool-1/proves/0": POOL_WORDS, "/room_links/pool-1": CLAIM_ID,
+                   f"{pools}/pool-1/shows/0": POOL_WORDS, "/room_links/pool-1": CLAIM_ID,
                    "/sandbox_link/rooms/0": "pool-1"}},
                extra_args=["--cathedral-sandbox", CLAIM_ID])
 
@@ -663,7 +663,7 @@ def step(role: str, action: str, target: str, status: int = 200, **fields) -> di
 
 def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, overrides=None, steps_edit=None,
              drop=(), create_body=None, exec_body=None, bundle_edit=None, args_edit=None, absent=(),
-             held=(RESULT_PATH,), inline=(LOG_PATH,), held_bytes=None, caller_hashes=None, exec_response="proven",
+             held=(RESULT_PATH,), inline=(LOG_PATH,), held_bytes=None, caller_hashes=None, exec_response="confirmed",
              numbered=True, room=RUN_ROOM, no_context_arg=False, input_files=(), truth_context=None,
              extra_files=None, bundle_raw=None, recipe_raw=None, context_raw=None, file_bytes=None):
     fb = {**FILE_BYTES, **(file_bytes or {})}
@@ -738,7 +738,7 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
               "receipts": chain,
               "create_request_b64": b64(create_bytes), "exec_request_b64": b64(exec_bytes),
               "inline_outputs": {p: b64(outputs_bytes[p]) for p in inline if outputs_bytes.get(p) is not None}}
-    if exec_response != "unproven":
+    if exec_response != "unconfirmed":
         bundle["exec_response_b64"] = b64(exec_resp)
     if bundle_edit:
         bundle_edit(bundle)
@@ -790,16 +790,16 @@ def fail(n: int, text: str) -> dict:
 
 def run_good_cases(pack: Pack) -> None:
     run = "/run"
-    run_case(pack, "good", "run_held_output_proven_exit_code",
-             "A run whose result file is held by the checker, whose log is in the file, and whose exec answer proves "
+    run_case(pack, "good", "run_held_output_confirmed_exit_code",
+             "A run whose result file is held by the checker, whose log is in the file, and whose exec answer confirms "
              "the exit code.", {"pointers": {
                  f"{run}/oneshot_id": RUN_ID, f"{run}/room": RUN_ROOM, f"{run}/outputs/0/state": "present",
                  f"{run}/outputs/0/sha256": sha(FILE_BYTES[RESULT_PATH]), f"{run}/outputs/0/bytes": "held",
                  f"{run}/outputs/1/bytes": "held", f"{run}/exit_code/status": "proven", f"{run}/exit_code/value": 0,
                  f"{run}/image/compared_with_recipe": True, "/room_links/run-room-1": RUN_ID,
-                 f"{run}/does_not_prove/6": "That the machine's disk was left unaltered by its host: the receipts do "
+                 f"{run}/does_not_show/6": "That the machine's disk was left unaltered by its host: the receipts do "
                                             "not show it either way.",
-                 f"{run}/does_not_prove/7": "That the approved build is the same as the published source: the "
+                 f"{run}/does_not_show/7": "That the approved build is the same as the published source: the "
                                             "allowed measurements are your own list.",
                  "/chain/room_numbering/rooms/run-room-1/serial": True,
                  "/chain/room_numbering/rooms/run-room-1/receipts": 8}})
@@ -810,12 +810,12 @@ def run_good_cases(pack: Pack) -> None:
     run_case(pack, "good", "run_optional_output_absent", "An optional output the run did not write: reported absent.",
              {"pointers": {f"{run}/outputs/1/state": "absent", f"{run}/outputs/0/state": "present"}},
              absent=(LOG_PATH,), inline=())
-    run_case(pack, "good", "run_exit_code_not_proven",
-             "The file holds no exec answer: the exit code is not proven and the verdict is still PASS.",
-             {"pointers": {f"{run}/exit_code/status": "not proven"}}, exec_response="unproven")
+    run_case(pack, "good", "run_exit_code_not_confirmed",
+             "The file holds no exec answer: the exit code is not confirmed and the verdict is still PASS.",
+             {"pointers": {f"{run}/exit_code/status": "not confirmed"}}, exec_response="unconfirmed")
     run_case(pack, "good", "run_exit_code_answer_not_the_signed_one",
-             "An exec answer that does not hash to the receipt's result: not proven, still PASS.",
-             {"pointers": {f"{run}/exit_code/status": "not proven"}}, exec_response="mismatch")
+             "An exec answer that does not hash to the receipt's result: not confirmed, still PASS.",
+             {"pointers": {f"{run}/exit_code/status": "not confirmed"}}, exec_response="mismatch")
 
     def nested_input(r):
         r["request"]["inputs"].append({"path": NESTED_PATH, "mode": "600"})
@@ -1379,6 +1379,14 @@ def run_validity_cases(pack: Pack) -> None:
          file_bytes={LOG_PATH: b"x" * 65536})
 
 
+def _nest(arrays: int):
+    """The integer 1 inside the given number of lists."""
+    value = 1
+    for _ in range(arrays):
+        value = [value]
+    return value
+
+
 def _knobs(**members):
     return {"truth_edit": lambda r: r["request"].update(members)}
 
@@ -1477,6 +1485,21 @@ def build_form_rules():
            "recipe: an output max_bytes must be at least 1"),
           ("negative", _outs({"path": "/work/out/x", "max_bytes": -1, "optional": False}),
            "recipe: an output max_bytes must be at least 1")]),
+        ("context_depth", {"truth_context": {"a": _nest(31)}}, [
+            ("33_levels", {"truth_context": {"a": _nest(32)}}, "inputs: context nests deeper than 32 levels"),
+            ("big_600_levels", {"truth_context": {"a": _nest(600)}}, "inputs: context nests deeper than 32 levels"),
+            ("big_in_the_files_request", {"truth_context": {"a": 1}, **_file_side(context={"a": _nest(600)})},
+             "check 8: the file's request: context nests deeper than 32 levels")]),
+        ("file_request_forms", {}, [
+            ("image_id_malformed", _file_side(image_id="sha256:ABC"),
+             "check 8: the file's request: image_id must be sha256: and 64 lower-case hex"),
+            ("timeout_is_a_boolean", _file_side(timeout_seconds=True),
+             "check 8: the file's request: timeout_seconds must be an integer"),
+            ("max_spend_is_a_boolean", _file_side(max_spend_usd=True),
+             "check 8: the file's request: max_spend_usd must be an integer")]),
+        ("network_name_label_newline", _knobs(network={"mode": "allowlist", "allow": ["a.org"]}), [
+            ("inner_newline", _knobs(network={"mode": "allowlist", "allow": ["a\n.org"]}),
+             "recipe: network allow entry 'a\\n.org' is not a valid allowlist entry")]),
         ("context_no_floats", {"truth_context": {"a": {"b": 1, "c": [1, 2]}}}, [
             ("deep_float", {"truth_context": {"a": {"b": 1.5}}},
              "inputs: the context file holds the number 1.5, which is not an integer"),
@@ -1496,10 +1519,21 @@ def build_form_rules():
 def run_form_cases(pack: Pack) -> None:
     """One good list at each bound and the bad lists past it (spec G4 5.1, Forms)."""
     for rule, at, past in build_form_rules():
+        if rule == "file_request_forms":
+            continue
         run_case(pack, "good", f"run_form_{rule}", f"The bound of the form rule {rule}: it is accepted.", {}, **at)
         for case, knobs, reason in past:
+            if case.startswith("big_"):
+                continue  # too large to keep as a saved list; the table test builds it in memory
             run_case(pack, "bad", f"run_form_{rule}_{case}", f"One step past the form rule {rule}: {case}.",
                      {"reason": reason}, **knobs)
+    deep = b"[" * 5000 + b"]" * 5000
+    run_case(pack, "bad", "run_form_deep_one_shot_file", "The one-shot file is a document nested 5,000 levels deep.",
+             {"reason": "inputs: the one-shot file nests too deeply to read"}, bundle_raw=lambda raw: deep)
+    run_case(pack, "bad", "run_form_deep_recipe", "The recipe is a document nested 5,000 levels deep.",
+             {"reason": "inputs: the recipe nests too deeply to read"}, recipe_raw=lambda raw: deep)
+    run_case(pack, "bad", "run_form_deep_context_file", "The context file is a document nested 5,000 levels deep.",
+             {"reason": "inputs: the context file nests too deeply to read"}, context_raw=lambda raw: deep)
     run_case(pack, "bad", "run_form_input_sha256_upper_case", "The file's request holds an upper-case input sha256.",
              {"reason": "check 8: the file's request: an input sha256 must be 64 lower-case hex"},
              bundle_edit=lambda b: b["request"]["inputs"][0].update(sha256=b["request"]["inputs"][0]["sha256"].upper()))
