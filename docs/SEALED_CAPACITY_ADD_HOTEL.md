@@ -33,16 +33,23 @@ The broker admits a sealed hotel only if its measurement is in `sealed_measureme
 its HOST_DATA is in `sealed_host_data` (`broker/README.md`, "Admission of sealed hotels").
 Reuse the live pin instead of adding a new one:
 
-- Build from the same kit commit as the live shared sealed hotels (the initrd is
-  reproducible from the commit time, `build-guest.sh` `SOURCE_DATE_EPOCH`), with the same
-  pinned API tarball.
-- Copy the measured settings from a live shared hotel's `sealed.env`: `SEALED_VCPUS`,
-  `SEALED_CPU_MODEL`, `SEALED_DEBUG_SSH_PUBKEY` (empty) and every `SEALED_ROOM_*` value,
-  since they go into the measured `room.env`.
-- Use the same OVMF AmdSev firmware build: its bytes are in the measurement and in
-  `manifest.json`.
+- Do not rebuild. A fresh `build-guest.sh` run does not give the live bytes: the base
+  root file system and the kernel come from `mmdebstrap` against the live mirror
+  (`SEALED_SUITE`, `SEALED_MIRROR`), so a later build picks up newer packages.
+  `SOURCE_DATE_EPOCH` only fixes the timestamps in the initrd pack, and builds are not
+  yet reproducible (`docs/SEALED_SECRETS.md`, AB#380).
+- Copy the live image instead: the whole `images/<stamp>/` directory of a live shared
+  sealed hotel (`vmlinuz`, `initrd.cpio.zst`, `cmdline`, `OVMF.amdsev.fd`,
+  `manifest.json`) to `$SEALED_DIR/images/<stamp>/` on the new host, point
+  `$SEALED_DIR/images/current` at it, and set `SEALED_SKIP_BUILD=1` in `sealed.env` (step 3).
+  The install then computes the expected measurement from those files.
+- Copy the measured settings from that hotel's `sealed.env` too: `SEALED_VCPUS` and
+  `SEALED_CPU_MODEL` are inputs to the measurement at launch, and the rest
+  (`SEALED_DEBUG_SSH_PUBKEY` empty, `SEALED_DATA_GIB`, `SEALED_MINER=0`, every
+  `SEALED_ROOM_*`) must agree with the copied image.
 - Shared machine: leave `SEALED_OWNER_PUBKEY_FILE` empty. HOST_DATA is then
-  `sha256(manifest.json)` (`launch-guest.sh`), so the same build gives the same HOST_DATA.
+  `sha256(manifest.json)` (`launch-guest.sh`), so the copied `manifest.json` gives the
+  same HOST_DATA.
 - Change only what is not measured: `SEALED_NAME` (the new hotel id),
   `SEALED_API_KEY_FILE`, `SEALED_SCRATCH_GIB`, `SEALED_MIN_HOST_FREE_GIB`, `SEALED_DIR`.
 
@@ -56,7 +63,9 @@ a broker change: plan it, do not improvise it.
 sudo ./install.sh --sealed sealed.env
 ```
 
-The install builds, prints the expected measurement, boots the guest, compares the
+With `SEALED_SKIP_BUILD=1` in `sealed.env` and `images/current` in place the install skips the build
+(`install-sealed.sh` step 3); without them it builds a new image, which needs a new pin.
+It prints the expected measurement, boots the guest, compares the
 measurement in the guest's report with the build and logs `host_data`. Check both
 against the broker's pins before going on.
 
