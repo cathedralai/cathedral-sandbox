@@ -152,9 +152,12 @@ signed request at a time, so the order of its receipts is the order things ran.
   pass without a token and leave no receipt. Every other route that is not a
   signed route or a delete, the front's own sealed secrets and sealed exec
   included, is refused with 409 `room_serial_unsigned`.
-- A request that reached the API and was not answered, or whose receipt was
-  not signed, breaks the room: every later request but a delete gets 409
-  `room_broken`. A 2xx delete ends the room and every mark kept for it.
+- On a serial room each request is sent to the API once, a read or a signed
+  GET included (an ordinary room retries a GET whose answer was lost). A
+  request that reached the API and was not answered is signed as a 502, and a
+  request whose receipt was not signed leaves no receipt: either breaks the
+  serial room, so every later request but a delete gets 409 `room_broken`. A
+  2xx delete ends the room and every mark kept for it.
 
 An ordinary room runs requests side by side, as before.
 

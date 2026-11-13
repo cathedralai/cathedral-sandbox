@@ -2117,7 +2117,7 @@ class Ledger:
             if token:
                 self.busy.add(room)
             self.in_flight[room] = self.in_flight.get(room, 0) + 1
-            return Turn(room, token, len(self.by_room.get(room, []))), None
+            return Turn(room, token, len(self.by_room.get(room, [])), room in self.serial), None
 
     def leave(self, turn: Turn) -> None:
         """End a turn: break a serial room that lost an answer or left an action unsigned, free the token, lower the count."""
@@ -2252,10 +2252,10 @@ def route_kind(method: str, path: str) -> str:
 class Turn:
     """One authorized request between Ledger.enter and Ledger.leave."""
 
-    __slots__ = ("room", "token", "receipts_before", "called", "lost")
+    __slots__ = ("room", "token", "receipts_before", "serial", "called", "lost")
 
-    def __init__(self, room: str, token: bool, receipts_before: int) -> None:
-        self.room, self.token, self.receipts_before = room, token, receipts_before
+    def __init__(self, room: str, token: bool, receipts_before: int, serial: bool = False) -> None:
+        self.room, self.token, self.receipts_before, self.serial = room, token, receipts_before, serial
         self.called = False  # a request went to the API
         self.lost = False  # the API gave no answer
 
@@ -2332,10 +2332,11 @@ class Handler(BaseHTTPRequestHandler):
         method, path = method or self.command, path or self.path
         if self.turn is not None:
             self.turn.called = True
-        if method not in ("GET", "HEAD"):
+        if method not in ("GET", "HEAD") or (self.turn is not None and self.turn.serial):
             # A write may have run before its answer was lost, so it is never
             # sent twice: a fresh connection (no stale keep-alive) and no
-            # retry. A lost answer is a 502, and the receipt records it.
+            # retry. A lost answer is a 502, and the receipt records it. On a serial room every
+            # request is sent once, so one receipt stands for exactly one request at the API.
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
             try:
                 c.request(method, path, body=body, headers=headers)
