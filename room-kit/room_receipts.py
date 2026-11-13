@@ -2188,6 +2188,26 @@ class Ledger:
             else:
                 self.in_flight.pop(room, None)
 
+    def _room_gone(self, room: str) -> None:
+        """A signed delete or room_end ends the room's incarnation and every mark kept for it. Caller holds self.lock."""
+        self.incarnations.pop(room, None)
+        self.serial.discard(room)
+        self.broken.discard(room)
+
+    def end_room(self, room: str, incarnation: str, status: int, reason: str, result_sha256: str) -> dict | None:
+        """Sign room_end for *room* if it is still the incarnation that was looked at and nothing is in flight for it.
+
+        One locked step, so two looks sign one end, and a room made again since the look is never ended.
+        """
+        with self.lock:
+            if self.incarnations.get(room) != incarnation or self.in_flight.get(room):
+                return None
+            return self._sign_locked({
+                "action": "room_end", "target": None, "sandbox_id": room,
+                "room_create_receipt_sha256": incarnation, "status": status, "reason": reason,
+                "result_sha256": result_sha256,
+            })
+
     def sign(self, fields: dict, create: dict | None = None) -> dict:
         with self.lock:
             return self._sign_locked(fields, create)
@@ -2230,9 +2250,9 @@ class Ledger:
                     if statement.get("serial"):
                         self.serial.add(room)
                 elif action == "delete":
-                    self.incarnations.pop(room, None)
-                    self.serial.discard(room)
-                    self.broken.discard(room)
+                    self._room_gone(room)
+            if action == "room_end":
+                self._room_gone(room)
         self.store.write(canonical(receipt) + b"\n")
         return receipt
 
@@ -2287,6 +2307,16 @@ TOUCHED_CAP = 4096
 HEX64 = re.compile(r"[0-9a-fA-F]{128}")
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
        "proxy-authenticate", "content-length", "host"}
+
+
+def retire_room(ledger: "Ledger", room: str) -> None:
+    """Drop what the front keeps for a room whose incarnation a signed delete or room_end ended."""
+    if ledger.secrets is not None:
+        ledger.secrets.retire(room)
+    if ledger.sealed_exec is not None:
+        ledger.sealed_exec.retire(room)
+    if ledger.sealed_env is not None:
+        ledger.sealed_env.retire(room)
 
 
 def room_of(path: str) -> str | None:
@@ -2470,6 +2500,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and m:
             if not self.authorized():
                 return self.reply(401, b'{"error":"unauthorized"}')
+            try:
+                self.server.look_one(m["id"])
+            except Exception:  # noqa: BLE001 a look that fails must not fail the read
+                traceback.print_exc()
             with ledger.lock:
                 page = [ledger.chain[i] for i in ledger.by_room.get(m["id"], [])]
             # count and room_head are read with the page, so a reader can hold the list against them.
@@ -2577,13 +2611,9 @@ class Handler(BaseHTTPRequestHandler):
                 # overlay set under the old one comes off before the room is used again.
                 ledger.reconcile_sealed_env(self.env_apply)
             deleted = re.match("^" + ROOM + "$", path) if action == "delete" and 200 <= status < 300 else None
-            if deleted and ledger.secrets is not None:
+            if deleted:
                 # After the receipt, which ends the room's incarnation: no write lands from here on.
-                ledger.secrets.retire(deleted["id"])
-            if deleted and ledger.sealed_exec is not None:
-                ledger.sealed_exec.retire(deleted["id"])
-            if deleted and ledger.sealed_env is not None:
-                ledger.sealed_env.retire(deleted["id"])
+                retire_room(ledger, deleted["id"])
         ctype = next((v for k, v in headers if k.lower() == "content-type"), "application/json")
         passthrough = {k: v for k, v in headers if k.lower() not in HOP and k.lower() != "content-type"}
         return self.reply(status, out, {**passthrough, **extra}, ctype)
@@ -3055,7 +3085,9 @@ class Server(ThreadingHTTPServer):
     request_queue_size = 1024
 
     def __init__(self, addr, ledger, api_port, health_port, api_key, docker_sock, attest_per_minute=30, *,
-                 attestation_only=False):
+                 attestation_only=False, look_seconds=None):
+        self._stop_look = threading.Event()
+        self.look_thread = None
         super().__init__(addr, Handler)
         self.attest_per_minute = max(1, int(attest_per_minute))
         self.ledger, self.api_port, self.health_port, self.api_key = ledger, api_port, health_port, api_key
@@ -3066,6 +3098,85 @@ class Server(ThreadingHTTPServer):
         self.health: tuple[int, bytes | None, float] = (503, None, 0.0)
         if not attestation_only:
             threading.Thread(target=self.health_loop, daemon=True).start()
+            if look_seconds is not None:
+                self.look_thread = threading.Thread(target=self.look_loop, args=(look_seconds,), daemon=True,
+                                                    name="room-look")
+                self.look_thread.start()
+
+    def server_close(self) -> None:
+        self._stop_look.set()
+        super().server_close()
+
+    def look_loop(self, seconds: float) -> None:
+        """Look for rooms the API no longer has, every *seconds*, until the server closes."""
+        while not self._stop_look.wait(seconds):
+            try:
+                self.look_all()
+            except Exception:  # noqa: BLE001 one failed look must not end the loop
+                traceback.print_exc()
+
+    def api_get(self, path: str, timeout: float) -> tuple[int, bytes] | None:
+        """One GET to the room API with the front's own key; None when it gave no answer."""
+        c = http.client.HTTPConnection("127.0.0.1", self.api_port, timeout=timeout)
+        try:
+            c.request("GET", path, headers={"Authorization": "Bearer " + self.api_key.decode()})
+            r = c.getresponse()
+            return r.status, r.read()
+        except (http.client.HTTPException, OSError):
+            return None
+        finally:
+            c.close()
+
+    def look_all(self) -> None:
+        """End each live room the API no longer lists.
+
+        The table is copied before the list is asked for, so a room made while the answer was on its way is
+        not in the copy and is never ended by this look. A failed list or an unexpected answer ends nothing.
+        """
+        with self.ledger.lock:
+            live = dict(self.ledger.incarnations)
+        if not live:
+            return
+        listed = self.api_get("/v1/sandboxes", 60)
+        if listed is None or listed[0] != 200:
+            return
+        try:
+            rooms = json.loads(listed[1])["sandboxes"]
+            present = {doc["id"] for doc in rooms}
+        except (ValueError, RecursionError, KeyError, TypeError):
+            return
+        for room, incarnation in live.items():
+            if room not in present:
+                self.look_at(room, incarnation)
+
+    def look_one(self, room: str) -> None:
+        """The same look for one room: one GET, no list. Run before a read of the room's receipts."""
+        with self.ledger.lock:
+            incarnation = self.ledger.incarnations.get(room)
+        if incarnation is not None:
+            self.look_at(room, incarnation)
+
+    def look_at(self, room: str, incarnation: str) -> None:
+        """Ask the API for one room and sign room_end when it says the room is gone or going.
+
+        Only 404 sandbox_not_found and 409 sandbox_deleting end a room: any other answer proves nothing. A room
+        with a request in flight is left to that request's own receipt.
+        """
+        with self.ledger.lock:
+            if self.ledger.in_flight.get(room):
+                return
+        got = self.api_get(f"/v1/sandboxes/{room}", 30)
+        if got is None:
+            return
+        status, out = got
+        try:
+            reason = json.loads(out)["error"]["code"]
+        except (ValueError, RecursionError, KeyError, TypeError):
+            return
+        if (status, reason) not in ((404, "sandbox_not_found"), (409, "sandbox_deleting")):
+            return
+        if self.ledger.end_room(room, incarnation, status, reason, sha(out)) is not None:
+            retire_room(self.ledger, room)
 
     def health_loop(self) -> None:
         """Build the health answer once a second, off the request path."""
@@ -3180,14 +3291,15 @@ def main() -> int:
               "to bind the key", flush=True)
     else:
         print(f"room-receipts: binding {ledger.binding_sha256} level hotel", flush=True)
+    look = float(env.get("ROOM_LOOK_SECONDS", "15"))  # 0 turns the look off
     args = (ledger, int(env.get("ROOM_API_PORT", "18090")), int(env.get("ROOM_HEALTH_PORT", "18091")), api_key,
             env.get("ROOM_DOCKER_SOCK", "/run/pool-room/docker.sock"), int(env.get("ROOM_ATTEST_PER_MINUTE", "30")))
     if miner is None:
-        srv = Server((host, int(port)), *args)
+        srv = Server((host, int(port)), *args, look_seconds=look or None)
         srv.serve_forever()
         return 0
     tls_host, tls_port = env["ROOM_RECEIPTS_TLS_LISTEN"].rsplit(":", 1)
-    tls = TLSServer((tls_host, int(tls_port)), *args, tls_context=miner.tls_context(store))
+    tls = TLSServer((tls_host, int(tls_port)), *args, tls_context=miner.tls_context(store), look_seconds=look or None)
     plain = Server((host, int(port)), *args, attestation_only=True)
     threading.Thread(target=plain.serve_forever, daemon=True).start()
     print(f"room-receipts: miner hotel: HTTPS {tls_host}:{tls_port} tls_spki_sha256 {miner.tls_spki_sha256}; "
