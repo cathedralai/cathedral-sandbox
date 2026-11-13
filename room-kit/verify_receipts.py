@@ -994,6 +994,35 @@ def fetch_chain(broker: str, hotel: str, key: str) -> dict:
                     "filtered": bool(page.get("filtered")), "count": len(receipts), "receipts": receipts}
 
 
+# How deep a JSON document may nest before run mode refuses to read it. The depth is counted on the raw text,
+# before any parse, so the answer is the same on every Python version (the parsers give up at different depths).
+# The documents run mode reads are a few levels deep and the context rule is 32, so 64 leaves room.
+JSON_MAX_DEPTH = 64
+
+
+def json_depth(text: str) -> int:
+    """The deepest nesting of [ and { in a JSON text. Characters inside strings are skipped (an escaped quote and
+    an escaped backslash are handled); the walk is a loop, not a recursion."""
+    depth = deepest = 0
+    in_string = escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+            deepest = max(deepest, depth)
+        elif ch in "]}":
+            depth -= 1
+    return deepest
+
+
 def strict_json(raw: bytes, prefix: str, what: str, plural: bool = False, floats: bool = False):
     """Parse JSON the way the Go checker does: a repeated key, at any level, and a non-integer number are refused.
 
@@ -1008,6 +1037,12 @@ def strict_json(raw: bytes, prefix: str, what: str, plural: bool = False, floats
     def refuse(text):
         raise Fail(f"{prefix}: {what} {'hold' if plural else 'holds'} the number {text}, which is not an integer")
 
+    try:
+        text = raw.decode(json.detect_encoding(raw), "surrogatepass")
+    except (UnicodeDecodeError, LookupError):
+        text = None  # not decodable: the parse below says so
+    if text is not None and json_depth(text) > JSON_MAX_DEPTH:
+        raise Fail(f"{prefix}: {what} {'nest' if plural else 'nests'} too deeply to read")
     try:
         return json.loads(raw, object_pairs_hook=pairs, parse_float=float if floats else refuse, parse_constant=refuse)
     except RecursionError as exc:

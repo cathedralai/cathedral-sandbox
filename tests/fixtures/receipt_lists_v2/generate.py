@@ -1487,9 +1487,14 @@ def build_form_rules():
            "recipe: an output max_bytes must be at least 1")]),
         ("context_depth", {"truth_context": {"a": _nest(31)}}, [
             ("33_levels", {"truth_context": {"a": _nest(32)}}, "inputs: context nests deeper than 32 levels"),
-            ("big_600_levels", {"truth_context": {"a": _nest(600)}}, "inputs: context nests deeper than 32 levels"),
+            ("40_levels", {"truth_context": {"a": _nest(39)}}, "inputs: context nests deeper than 32 levels"),
+            ("62_levels", {"truth_context": {"a": _nest(61)}}, "inputs: context nests deeper than 32 levels"),
+            ("big_600_levels", {"truth_context": {"a": _nest(600)}},
+             "inputs: the one-shot file nests too deeply to read"),  # the bundle's request holds it too, and loads first
+            ("40_levels_in_the_files_request", {"truth_context": {"a": 1}, **_file_side(context={"a": _nest(39)})},
+             "check 8: the file's request: context nests deeper than 32 levels"),
             ("big_in_the_files_request", {"truth_context": {"a": 1}, **_file_side(context={"a": _nest(600)})},
-             "check 8: the file's request: context nests deeper than 32 levels")]),
+             "inputs: the one-shot file nests too deeply to read")]),
         ("image_control_character", _knobs(image=_IMG + "app" + _DIGEST), [
             ("tab", _knobs(image=_IMG + "a\tpp" + _DIGEST), "recipe: image must hold no control character"),
             ("newline_inside", _knobs(image=_IMG + "a\npp" + _DIGEST), "recipe: image must hold no control character"),
