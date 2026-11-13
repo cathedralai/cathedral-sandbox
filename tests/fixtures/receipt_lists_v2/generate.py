@@ -1289,6 +1289,22 @@ def run_second_review_cases(pack: Pack) -> None:
             {"reason": f"recipe: the request has no {field}"},
             recipe_edit=lambda r, f=field: r["request"].pop(f), bundle_edit=lambda b, f=field: b["request"].pop(f))
 
+    # ---- the context in the file's request, when it is there, is the expected one
+    bad("run_c8_context_differs", "The file's request.context is not the context the caller expects; the signed "
+        "context file is right.", fail(8, "the file's request.context is not the expected context"),
+        bundle_edit=lambda b: b["request"].update(context={"submission": "another"}))
+    bad("run_c8_context_is_a_number", "The file's request.context is a number.",
+        fail(8, "the file's request.context is not the expected context"),
+        bundle_edit=lambda b: b["request"].update(context=7))
+    bad("run_c8_context_present_when_none_expected", "The caller expects no context; the file's request holds one.",
+        fail(8, "the file's request.context is not the expected context"), truth_context={}, no_context_arg=True,
+        bundle_edit=lambda b: b["request"].update(context={"submission": "sub-0001"}))
+    good("run_c8_context_equal_in_request", "request.context is present and equal to the expected context.",
+         {"pointers": {"/run/context_check": "the signed context file and the request in the file"}})
+    good("run_c8_context_not_in_request", "The request in the file has no context member: the signed file put binds it.",
+         {"pointers": {"/run/context_check": "the signed context file only"}},
+         bundle_edit=lambda b: b["request"].pop("context"))
+
     # ---- the network is compared as the machine canonicalises it
     names = {"mode": "allowlist", "allow": ["example.org", "Example.NET"]}
     good("run_network_names_in_other_order_and_case", "An allowlist written with other order and case than the signed "
