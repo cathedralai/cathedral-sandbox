@@ -795,7 +795,7 @@ def run_good_cases(pack: Pack) -> None:
              "the exit code.", {"pointers": {
                  f"{run}/oneshot_id": RUN_ID, f"{run}/room": RUN_ROOM, f"{run}/outputs/0/state": "present",
                  f"{run}/outputs/0/sha256": sha(FILE_BYTES[RESULT_PATH]), f"{run}/outputs/0/bytes": "held",
-                 f"{run}/outputs/1/bytes": "held", f"{run}/exit_code/status": "proven", f"{run}/exit_code/value": 0,
+                 f"{run}/outputs/1/bytes": "held", f"{run}/exit_code/status": "confirmed", f"{run}/exit_code/value": 0,
                  f"{run}/image/compared_with_recipe": True, "/room_links/run-room-1": RUN_ID,
                  f"{run}/does_not_show/6": "That the machine's disk was left unaltered by its host: the receipts do "
                                             "not show it either way.",
@@ -1528,12 +1528,12 @@ def run_form_cases(pack: Pack) -> None:
             run_case(pack, "bad", f"run_form_{rule}_{case}", f"One step past the form rule {rule}: {case}.",
                      {"reason": reason}, **knobs)
     deep = b"[" * 5000 + b"]" * 5000
-    run_case(pack, "bad", "run_form_deep_one_shot_file", "The one-shot file is a document nested 5,000 levels deep.",
-             {"reason": "inputs: the one-shot file nests too deeply to read"}, bundle_raw=lambda raw: deep)
-    run_case(pack, "bad", "run_form_deep_recipe", "The recipe is a document nested 5,000 levels deep.",
-             {"reason": "inputs: the recipe nests too deeply to read"}, recipe_raw=lambda raw: deep)
-    run_case(pack, "bad", "run_form_deep_context_file", "The context file is a document nested 5,000 levels deep.",
-             {"reason": "inputs: the context file nests too deeply to read"}, context_raw=lambda raw: deep)
+    run_case(pack, "bad", "run_form_deep_one_shot_file", "The one-shot file is a list nested 5,000 levels deep.",
+             {"reason": "check 1: the file is not a cathedral_oneshot_bundle_v1"}, bundle_raw=lambda raw: deep)
+    run_case(pack, "bad", "run_form_deep_recipe", "The recipe is a list nested 5,000 levels deep.",
+             {"reason": "recipe: the document is not a cathedral_oneshot_recipe_v1"}, recipe_raw=lambda raw: deep)
+    run_case(pack, "bad", "run_form_deep_context_file", "The context file is a list nested 5,000 levels deep.",
+             {"reason": "inputs: context nests deeper than 32 levels"}, context_raw=lambda raw: deep)
     run_case(pack, "bad", "run_form_input_sha256_upper_case", "The file's request holds an upper-case input sha256.",
              {"reason": "check 8: the file's request: an input sha256 must be 64 lower-case hex"},
              bundle_edit=lambda b: b["request"]["inputs"][0].update(sha256=b["request"]["inputs"][0]["sha256"].upper()))

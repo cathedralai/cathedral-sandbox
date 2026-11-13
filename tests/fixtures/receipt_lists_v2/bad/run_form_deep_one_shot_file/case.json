@@ -17,10 +17,10 @@
   "--output-file",
   "/work/out/result.json={dir}/outputs/result.json"
  ],
- "description": "The one-shot file is a document nested 5,000 levels deep.",
+ "description": "The one-shot file is a list nested 5,000 levels deep.",
  "expect": {
   "exit_code": 1,
-  "reason": "inputs: the one-shot file nests too deeply to read",
+  "reason": "check 1: the file is not a cathedral_oneshot_bundle_v1",
   "verdict": "FAIL"
  }
 }
