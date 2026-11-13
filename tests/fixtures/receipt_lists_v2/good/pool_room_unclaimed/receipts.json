@@ -1,0 +1,30 @@
+{
+ "head": "9eb4fec6aa95656224194845f31a523e7d2d5f814857c4a253ed6824651bcbbb",
+ "receipts": [
+  {
+   "receipt_sha256": "9eb4fec6aa95656224194845f31a523e7d2d5f814857c4a253ed6824651bcbbb",
+   "signature_b64": "vODSIQUawzyaIN2Kyc73mSUIPstbEkGsSOjUMQrkHu+Bd6Rysq3N/ANrbCwjQo3APJTGtyoHSa4vVBEaYgQ0Bw==",
+   "statement": {
+    "action": "create",
+    "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
+    "command_sha256": null,
+    "customer_request_sha256": "ad1b9de910513527b407147d7a05569066c1a50cceaba3e118df6b13f49e749c",
+    "hotel": "pack-hotel",
+    "image": null,
+    "image_digest": null,
+    "issued_at": 1700000001,
+    "operation_id": "6a7098ee-602f-b0f8-a645-46d9f49c5eeb",
+    "pool": true,
+    "previous_receipt_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
+    "result_sha256": "400a936d0ac7637324413df9aaf2067ff68468e602a5446af1e454878b5bad1e",
+    "room_previous_receipt_sha256": null,
+    "room_sequence": 1,
+    "sandbox_id": "pool-1",
+    "schema": "cathedral_sealed_hotel_receipt_v1",
+    "sequence": 1,
+    "status": 202,
+    "target": "POST /v1/sandboxes/pool-1/create"
+   }
+  }
+ ]
+}
