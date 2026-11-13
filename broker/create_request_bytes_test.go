@@ -132,19 +132,23 @@ func TestCreateRequestBytesAfterRetryOnSecondHotel(t *testing.T) {
 }
 
 func TestCreateRequestBytesAfterTunablesReap(t *testing.T) {
-	tc := newChain(t)
-	tc.hotels["c"].appliesTunables = true
 	// b starts the room without applying tunables, so the broker reaps it and
-	// moves on. Placement is random: go on until b was the first try.
+	// sends the same bytes to c. Placement is random and a hotel that holds the
+	// image is preferred, so only the first create of a fresh chain can start
+	// on b: go on with a new chain until it did.
 	for i := 0; i < 40; i++ {
-		before := len(tc.hotels["b"].createBodies)
+		tc := newChain(t)
+		tc.hotels["c"].appliesTunables = true
+		tc.b.mu.Lock()
+		tc.b.hotelByID("c").slots = 1 // make b the likely first try
+		tc.b.mu.Unlock()
 		resp, doc := createWithAsk(t, tc, map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}, "tunables": coldTunables()}, true, "")
 		if resp.StatusCode != 202 || doc["hotel"] != "c" {
 			t.Fatalf("create %d: %d %v", i, resp.StatusCode, doc)
 		}
 		raw := decodeCreateRequest(t, doc)
 		sameBytes(t, raw, lastCreateBody(tc.hotels["c"]))
-		if len(tc.hotels["b"].createBodies) > before {
+		if len(tc.hotels["b"].createBodies) > 0 {
 			sameBytes(t, raw, lastCreateBody(tc.hotels["b"]))
 			return
 		}
