@@ -53,6 +53,7 @@ class FakeApi:
         self.network_policy: dict | None = DENY_ALL
         self.expires_in = 3600.0
         self.expires_at: str | None = None
+        self.omit_expires = False
         self.create_answer: dict = {}
         self.get_replies: dict[str, tuple[int, bytes]] = {}
         self.list_status = 200
@@ -169,7 +170,8 @@ class FakeApi:
         doc = {"id": room}
         if self.network_policy is not None:
             doc["network"] = {"policy": self.network_policy}
-        doc["expires_at"] = self.expires_at or self._stamp(self.expires_in)
+        if not self.omit_expires:
+            doc["expires_at"] = self.expires_at or self._stamp(self.expires_in)
         doc.update(self.create_answer)
         self._send(h, 200, json.dumps(doc).encode())
 
