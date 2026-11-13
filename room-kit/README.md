@@ -141,9 +141,13 @@ signed request at a time, so the order of its receipts is the order things ran.
 - The label value must be the string `1`, and not set together with
   `cathedral_pool`: 400 `reserved_label_invalid`. A serial create carries no
   `Idempotency-Key` header (an empty one counts): 400 `idempotency_key_refused`.
-- The create receipt carries `serial: true` when it is the room's receipt 1 and
-  no request for that room id was in flight when it was signed. Otherwise the
-  room is an ordinary room.
+- The create receipt carries `serial: true` when it is the room's receipt 1, no
+  request for that room id was in flight when it was signed, and no request
+  other than a read was forwarded for that id while the create was pending
+  (an unsigned write counts, and so does a request the API refused). Otherwise
+  the room is an ordinary room. The front remembers such ids only while a
+  create is pending; if more than 4,096 pile up, no create is flagged until the
+  pending creates end.
 - A second signed request while one runs is refused at once with 409
   `room_busy` and is not sent on. The turn ends after the receipt is signed and
   before the answer is written.

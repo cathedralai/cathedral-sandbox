@@ -2046,6 +2046,15 @@ class Ledger:
         self.busy: set[str] = set()
         self.serial: set[str] = set()
         self.broken: set[str] = set()
+        # The flag of a serial create needs that nothing ran in the room before the create was signed. The
+        # in-flight count sees a request still running; touched sees one that finished without a receipt (an
+        # unsigned write, or a request the API refused). creates_in_flight counts the creates forwarded and not
+        # yet signed; when it returns to zero touched is cleared, since an id touched while no create was
+        # pending cannot belong to a room whose create is still unsigned. overflow withholds every flag while
+        # touched is full.
+        self.creates_in_flight = 0
+        self.touched: set[str] = set()
+        self.overflow = False
         self.head = self.binding_sha256
         os.makedirs(store, mode=0o700, exist_ok=True)
         self.store = open(os.path.join(store, f"chain-{self.binding['boot_id']}.jsonl"), "ab", buffering=0)
@@ -2114,10 +2123,26 @@ class Ledger:
                     return None, (409, "room_serial_unsigned", "a serial room accepts signed requests and reads only")
             if token and room in self.busy:
                 return None, (409, "room_busy", "this room is running another request")
+            if self.creates_in_flight and kind not in ("read", "record_read") and room not in self.by_room:
+                if len(self.touched) >= TOUCHED_CAP:
+                    self.overflow = True
+                else:
+                    self.touched.add(room)
             if token:
                 self.busy.add(room)
             self.in_flight[room] = self.in_flight.get(room, 0) + 1
             return Turn(room, token, len(self.by_room.get(room, [])), room in self.serial), None
+
+    def begin_create(self) -> None:
+        with self.lock:
+            self.creates_in_flight += 1
+
+    def end_create(self) -> None:
+        with self.lock:
+            self.creates_in_flight = max(0, self.creates_in_flight - 1)
+            if not self.creates_in_flight:
+                self.touched.clear()
+                self.overflow = False
 
     def leave(self, turn: Turn) -> None:
         """End a turn: break a serial room that lost an answer or left an action unsigned, free the token, lower the count."""
@@ -2159,7 +2184,8 @@ class Ledger:
         status = statement.get("status")
         ok = isinstance(status, int) and 200 <= status < 300
         if create and ok and statement.get("action") == "create" and isinstance(named, str) and named:
-            if create.get("serial") and not self.in_flight.get(named) and named not in self.by_room:
+            if create.get("serial") and not self.in_flight.get(named) and named not in self.by_room \
+                    and named not in self.touched and not self.overflow:
                 statement["serial"] = True
         receipt = {"statement": statement, "signature_b64": b64(self.key.sign(canonical(statement))),
                    "receipt_sha256": sha(canonical(statement))}
@@ -2227,6 +2253,9 @@ READS = [  # (method, path pattern)
     ("GET", re.compile("^" + ROOM + r"/sealed-env$")),
     ("GET", re.compile("^" + ROOM + r"/entries$")),
 ]
+# Room ids the front forwarded a non-read request for while it held no create receipt for them and a create
+# was in flight (see Ledger.touched). Past this many, no create is flagged until the creates end.
+TOUCHED_CAP = 4096
 HEX64 = re.compile(r"[0-9a-fA-F]{128}")
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
        "proxy-authenticate", "content-length", "host"}
@@ -2281,19 +2310,24 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     turn: Turn | None = None
+    create_open = False  # a create was forwarded and its receipt is not yet signed
 
     def handle_one_request(self):
         self.turn = None
+        self.create_open = False
         try:
             super().handle_one_request()
         finally:
             self.release_turn()
 
     def release_turn(self) -> None:
-        """Give back the request's count and token. Safe to call twice."""
+        """Give back the request's count and token, and its place among the creates in flight. Safe to call twice."""
         turn, self.turn = self.turn, None
         if turn is not None:
             self.server.ledger.leave(turn)
+        if self.create_open:
+            self.create_open = False
+            self.server.ledger.end_create()
 
     # -- helpers
     def reply(self, status: int, body: bytes, headers: dict | None = None, ctype="application/json"):
@@ -2485,6 +2519,9 @@ class Handler(BaseHTTPRequestHandler):
         if refusal is not None:
             status, headers, out = 403, [], refusal
         else:
+            if action == "create" and self.authorized():
+                ledger.begin_create()
+                self.create_open = True
             status, headers, out = self.upstream(
                 self.server.api_port, body,
                 **({"timeout": plain_exec_wait(body)} if action == "exec" else {}))
