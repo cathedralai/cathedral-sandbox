@@ -89,7 +89,7 @@ Deliverables back to #274:
 1. Copy official `central-root-keys.json` into image build context (public file only).
 2. Clone `guest-dryrun.qcow2` or rebuild from Ubuntu cloudimg + bake script.
 3. Install tee-box package set; freeze; record package digests.
-4. `sev-snp-measure` with the same OVMF, vCPU type (`EPYC-v4`), and launch
+4. `sev-snp-measure` with the same OVMF, vCPU type (`EPYC-Genoa-v1`, or `EPYC-v4` for a baseline hotel), and launch
    shape as `launch-snp-guest.sh`.
 5. Boot with existing script (same HOST_DATA).
 6. Confirm: file digest == HOST_DATA; report MEASUREMENT == expected; #275 gate PASS.
