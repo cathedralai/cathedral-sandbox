@@ -50,7 +50,7 @@
     "path": "/work/out/log.txt"
    }
   ],
-  "size": "small",
+  "size": "sealed-1x2",
   "timeout_seconds": 60
  },
  "schema": "cathedral_oneshot_recipe_v1"

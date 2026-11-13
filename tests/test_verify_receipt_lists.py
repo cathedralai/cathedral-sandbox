@@ -181,6 +181,7 @@ def test_python_create_keys_equal_the_shared_key_list() -> None:
     vr = _load_checker()
     assert list(vr.ONESHOT_CREATE_KEYS) == shared["keys"]
     assert list(vr.ONESHOT_LABEL_KEYS) == shared["label_keys"]
+    assert vr.ONESHOT_SIZES == shared["sizes"]
 
 
 def test_a_path_with_space_plus_amp_equals_percent_tilde_and_a_non_ascii_letter_has_the_go_query_form() -> None:
@@ -273,7 +274,7 @@ def _confused_documents() -> dict[str, tuple[str, object]]:
         ("inline_list", ["inline_outputs"], [1]),
         ("request_text", ["request"], "x"), ("request_outputs_number", ["request", "outputs"], 123),
         ("request_inputs_object", ["request", "inputs"], {}), ("request_env_list", ["request", "env"], []),
-        ("request_command_number", ["request", "command"], 1), ("request_context_list", ["request", "context"], []),
+        ("request_command_number", ["request", "command"], 1),
         ("oneshot_id_number", ["oneshot_id"], 5), ("schema_list", ["schema"], []),
     ]:
         cases[f"bundle_{name}"] = ("bundle.json", at(path, value))
@@ -311,3 +312,49 @@ def test_a_value_of_the_wrong_type_is_a_clean_fail_never_a_traceback(name: str, 
     assert code == 1, (out, err)
     result = json.loads(out)
     assert result["verdict"] == "FAIL" and isinstance(result["reason"], str) and result["reason"]
+
+
+NETWORK_TABLE = [
+    [], ["pypi.org"], ["PyPI.org"], ["pypi.org", "files.pythonhosted.org"], ["files.pythonhosted.org", "pypi.org"],
+    ["pypi.org", "pypi.org"], ["pypi.org:443"], ["pypi.org:80", "pypi.org:443"], ["pypi.org:80"], ["pypi.org", "pypi.org:80"],
+    ["*.pythonhosted.org"], ["*.PythonHosted.org."], ["*.pythonhosted.org:443", "*.pythonhosted.org:80"],
+    ["example.org.", " Example.Org "], ["203.0.113.8"], ["203.0.113.0/24"], ["203.0.113.9/24"], ["203.0.113.8", "198.51.100.1", "192.0.2.0/24"],
+    ["10.0.0.1"], ["192.168.0.0/16"], ["127.0.0.1"], ["::1"], ["2001:db8::/32"], ["https://pypi.org"], ["pypi.org/path"],
+    ["pypi.org:8080"], ["203.0.113.8:80"], ["localhost"], ["a..b"], ["-a.org"], ["a.123"], [""], ["x" * 300], [5],
+    ["*.*.org"], ["*org"], ["a.b", "A.B", "a.b:443", "*.a.b", "*.a.b:80"],
+]
+
+
+@pytest.mark.parametrize("mode", ["allowlist", "deny_all", "internet", "public"])
+def test_the_checkers_copy_of_the_network_rule_equals_the_machine_apis(mode: str) -> None:
+    """The checker is one file and cannot import the producer, so it copies the rule; this keeps the copies equal."""
+    from cathedral import sandbox_api
+
+    vr = _load_checker()
+    for allow in NETWORK_TABLE:
+        try:
+            want = sandbox_api.canonical_network_policy(mode, allow)
+        except sandbox_api.SandboxContractError:
+            want = None
+        except (TypeError, AttributeError):
+            want = None
+        try:
+            got = vr.canonical_policy(mode, allow)
+        except (vr.Fail, TypeError, AttributeError):
+            got = None
+        if want is not None and mode != "allowlist":
+            want = {"mode": want["mode"], "allow": want["allow"]}
+        assert got == want, (mode, allow, got, want)
+
+
+def test_the_recipe_network_forms_map_to_one_canonical_policy_each() -> None:
+    vr = _load_checker()
+    assert vr.network_policy("internet") == {"mode": "internet", "allow": []}
+    assert vr.network_policy({}, default_ok=True) == {"mode": "deny_all", "allow": []}
+    assert vr.network_policy(None, default_ok=True) == {"mode": "deny_all", "allow": []}
+    assert vr.network_policy({"mode": "allowlist", "allow": ["B.org", "a.org"]}) == {
+        "mode": "allowlist", "allow": ["a.org", "b.org"]}
+    for bad in (None, "", 5, [], "public", "none", "bogus", {"mode": "allowlist"}, {"mode": "allowlist", "allow": []},
+                {"mode": "internet", "allow": [3]}, {"mode": "internet", "extra": 1}):
+        with pytest.raises(vr.Fail):
+            vr.network_policy(bad)

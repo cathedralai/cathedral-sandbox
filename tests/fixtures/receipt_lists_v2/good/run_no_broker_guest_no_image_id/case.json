@@ -17,7 +17,7 @@
   "--output-file",
   "/work/out/result.json={dir}/outputs/result.json"
  ],
- "description": "A recipe with no network, no broker_guest and no image_id: the network is deny_all in the broker's form, the signed image_digest is reported and not compared.",
+ "description": "A recipe with no broker_guest and no image_id: any id-safe guest label is accepted, the signed image_digest is reported and not compared.",
  "expect": {
   "exit_code": 0,
   "pointers": {

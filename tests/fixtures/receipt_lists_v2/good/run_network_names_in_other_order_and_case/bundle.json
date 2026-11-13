@@ -19,7 +19,7 @@
   "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
   "report_b64": "AwAAAAAAAAAAAAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACth/IPSuaUjfCHRuFDpcfxQpvqbCZVdZbMmAV/W78aJwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAmxSNpnFfamj9YxTZAV9UQTwmGgsbJQdbVo4LUQZoeitDTXZh8m0DZwAJDKGRep7RM9NKVy+OAenTHT0sklQTQLgvk6wW7kzerjGsdgmKnN0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwAAAAAACHMZAQAAAAAAAAAAAAAAAAAAAAAAAAAAAACocRAF63SE/Q3T1I90cFAns9QDeFtdGn41vd3GtR4NHSkxifjuATdHJSkr0DxPMIx6ddmIHu7Hzgo8St+VFANBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANL8lPR5jXR3Hmu2y+H6lPHdJQEqI/wnsF23NPPnYgeVl4FqbwZ7gjxaubru8vlLrAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+W4SGEztsW0UWx4NKCJWcIN8/GOSaQirPA2PwDh98s2FeHCX0O2IjqRdfBB2iErkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
  },
- "create_request_b64": "eyJpbWFnZSI6ImltYWdlcy5leGFtcGxlLnRlc3QvYXBwQHNoYTI1NjowZmE4YzA3YzAyOTBhNWI2Y2FiZDI4ZjZjYWVhNTI4NmIyNzY1NjA5MzY2YWY3NjM3M2NhMTkxYzAyMmM3MmJiIiwibGFiZWxzIjp7ImJyb2tlcl9iYXRjaCI6IjBiMWMyZDNlLTRmNTAtNDE2Mi04Mzg0LTk1YTZiN2M4ZDllMCIsImJyb2tlcl9ndWVzdCI6Imd1ZXN0LTEiLCJjYXRoZWRyYWxfc2FuZGJveF9pZCI6IjdkOWMzYTVlLTFiMmYtNGM2ZC04ZTBhLTlmMWIyYzNkNGU1ZiIsImNhdGhlZHJhbF9zZXJpYWwiOiIxIn0sIm5ldHdvcmsiOnsiYWxsb3ciOlsiZXhhbXBsZS5vcmciLCJFeGFtcGxlLk5FVCJdLCJtb2RlIjoiYWxsb3dsaXN0In0sInJlc291cmNlcyI6eyJjcHVzIjoxLCJtZW1vcnlfbWIiOjUxMn0sInR0bF9zZWNvbmRzIjozMDB9",
+ "create_request_b64": "eyJpbWFnZSI6ImltYWdlcy5leGFtcGxlLnRlc3QvYXBwQHNoYTI1NjowZmE4YzA3YzAyOTBhNWI2Y2FiZDI4ZjZjYWVhNTI4NmIyNzY1NjA5MzY2YWY3NjM3M2NhMTkxYzAyMmM3MmJiIiwibGFiZWxzIjp7ImJyb2tlcl9iYXRjaCI6IjBiMWMyZDNlLTRmNTAtNDE2Mi04Mzg0LTk1YTZiN2M4ZDllMCIsImJyb2tlcl9ndWVzdCI6Imd1ZXN0LTEiLCJjYXRoZWRyYWxfc2FuZGJveF9pZCI6IjdkOWMzYTVlLTFiMmYtNGM2ZC04ZTBhLTlmMWIyYzNkNGU1ZiIsImNhdGhlZHJhbF9zZXJpYWwiOiIxIn0sIm5ldHdvcmsiOnsiYWxsb3ciOlsiZXhhbXBsZS5vcmciLCJFeGFtcGxlLk5FVCJdLCJtb2RlIjoiYWxsb3dsaXN0In0sInJlc291cmNlcyI6eyJkaXNrX2dpYiI6MTAsIm1lbW9yeV9naWIiOjIsInZjcHUiOjF9LCJ0dGxfc2Vjb25kcyI6MzAwfQ==",
  "exec_request_b64": "eyJjbWQiOlsicHl0aG9uIiwiL3dvcmsvaW4vcnVuLnB5Il0sImN3ZCI6Ii93b3JrIiwiZW52Ijp7Ik1PREUiOiJjaGVjayJ9LCJ0aW1lb3V0X3NlY29uZHMiOjYwfQ==",
  "exec_response_b64": "eyJleGl0X2NvZGUiOjAsInN0ZGVyciI6IiIsInN0ZG91dCI6IiJ9",
  "inline_outputs": {
@@ -28,14 +28,14 @@
  "oneshot_id": "7d9c3a5e-1b2f-4c6d-8e0a-9f1b2c3d4e5f",
  "receipts": [
   {
-   "receipt_sha256": "ae5d565a6f9ccab899aceeb65080dfe3d92707407f5fd3a5d5a981ce49f96855",
-   "signature_b64": "bd1k/t/dvLcnKLJEt1+gj2dxm9zY++QV0K4/NJudywLHVYJ6s5BbN/3SF70m/TVBCOuwuchm7nrlvDV5FRMDDA==",
+   "receipt_sha256": "0963cdf1cbb235e7cf8d2c6f3814a022e4a4caed70e09cd9c6bfea6cf4d5be1a",
+   "signature_b64": "rM438w72kW2jgiqJJVSY24XVQC7Ed67H59ozRJOs4iWHt4d7FWIkfVzltwFCLfx5rEkCfdFdSMXOTcUc+Fh8Bw==",
    "statement": {
     "action": "create",
     "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
     "cathedral_sandbox_id": "7d9c3a5e-1b2f-4c6d-8e0a-9f1b2c3d4e5f",
     "command_sha256": null,
-    "customer_request_sha256": "f73f34bec9d808edee167aa95cbbdea3961cee211dae8687018efeec4e30209b",
+    "customer_request_sha256": "fabc3a86821df40c0bb36fae3d8a33f449d643c7ffca39c7044da2ea3398fca6",
     "hotel": "pack-hotel",
     "image": "images.example.test/app@sha256:0fa8c07c0290a5b6cabd28f6caea5286b2765609366af76373ca191c022c72bb",
     "image_digest": "sha256:aae1a0b67cd0da30a034563ef9ea0665cb1ccb289ee21e54edead462f531b112",
@@ -62,8 +62,8 @@
    }
   },
   {
-   "receipt_sha256": "e8ceebc38af5e831a2bd8cc9fdf9754df4ec759f66760a4c25592b72a86e026c",
-   "signature_b64": "lpf5dp5e324InXczQRJNyIWmR1P78Y2YQscJ54ewEX3T/x2PI96nJ9imcl9PKbEff9VEzv79n0kp+u+zfhWvCQ==",
+   "receipt_sha256": "cdd5638a9ec7e2e6e4d7687271941262317bcdf3588606f0769b0b0b2217d277",
+   "signature_b64": "zsrH7LyDs0m0wnXXhkWsb0pKGkZovZtgiTLgohO1SKWRQgeoRyQ2doUxeFK3+kDPhdvTr1OuDqab/WXJREavBw==",
    "statement": {
     "action": "file_put",
     "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
@@ -74,9 +74,9 @@
     "image_digest": null,
     "issued_at": 1700000002,
     "operation_id": "81b3464a-8f46-451e-e17b-915979a074b9",
-    "previous_receipt_sha256": "ae5d565a6f9ccab899aceeb65080dfe3d92707407f5fd3a5d5a981ce49f96855",
+    "previous_receipt_sha256": "0963cdf1cbb235e7cf8d2c6f3814a022e4a4caed70e09cd9c6bfea6cf4d5be1a",
     "result_sha256": "096e929abe31157e5a522fecfe1333bb96b3252e9ee74923b6e9027206c4d068",
-    "room_previous_receipt_sha256": "ae5d565a6f9ccab899aceeb65080dfe3d92707407f5fd3a5d5a981ce49f96855",
+    "room_previous_receipt_sha256": "0963cdf1cbb235e7cf8d2c6f3814a022e4a4caed70e09cd9c6bfea6cf4d5be1a",
     "room_sequence": 2,
     "sandbox_id": "run-room-1",
     "schema": "cathedral_sealed_hotel_receipt_v1",
@@ -86,8 +86,8 @@
    }
   },
   {
-   "receipt_sha256": "946f3a34d7e986295d72feda4929bf5b2e14f704d07bd7d8cfb3e1484832b182",
-   "signature_b64": "4KItNH/gf7AK3l3OzIxCMfnHziLXLeN6q+zDcLLsQAs4KbeUHs2yIxcSFGvl/MgHHS8NsLq7KMMyGF0X+/21Cw==",
+   "receipt_sha256": "cbf84338fb2f9713327196e589e79d98087f444e03c803bea899e5785c66df39",
+   "signature_b64": "qiKvFJ5wLdDx0Gl+/43G2kRgHC5Vhrf4p/Tgm8tZ7lp+0QOs6haaBWVDMT6sW0sFr47skXvR2RPa22pEG+bEBQ==",
    "statement": {
     "action": "file_put",
     "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
@@ -98,9 +98,9 @@
     "image_digest": null,
     "issued_at": 1700000003,
     "operation_id": "9df30fe8-5efe-4c66-f357-27f09114eafa",
-    "previous_receipt_sha256": "e8ceebc38af5e831a2bd8cc9fdf9754df4ec759f66760a4c25592b72a86e026c",
+    "previous_receipt_sha256": "cdd5638a9ec7e2e6e4d7687271941262317bcdf3588606f0769b0b0b2217d277",
     "result_sha256": "8820375044723d31ea806186b0a729943dfbc2f1a594579823d2f6d9e07749c0",
-    "room_previous_receipt_sha256": "e8ceebc38af5e831a2bd8cc9fdf9754df4ec759f66760a4c25592b72a86e026c",
+    "room_previous_receipt_sha256": "cdd5638a9ec7e2e6e4d7687271941262317bcdf3588606f0769b0b0b2217d277",
     "room_sequence": 3,
     "sandbox_id": "run-room-1",
     "schema": "cathedral_sealed_hotel_receipt_v1",
@@ -110,8 +110,8 @@
    }
   },
   {
-   "receipt_sha256": "1c4008e56261cfc38abef3afb9cf870f50abff92fe6a0d4253d5fd6a418e2d2c",
-   "signature_b64": "ht+qJHQ0OWnpDxg3q+JeTYhb3u7R8jn/D7+Wpn9TMhzwU/+SC1nZUjUIGMmDIadUN6GCJxaoQAJLLBw2+VUwDA==",
+   "receipt_sha256": "20d9cee7a4e6a1a8b75bc4a38fcaf5a87e73e72fa63c8e0f7868903c5da10900",
+   "signature_b64": "gZgyWj6Akt8T+Rjg8/CpibGt1LMcXtjzUGpwE7IxIl0imyhBkb1Ug+YmH0Iw84Jrcn1fDRsKOyo+qJRXcZukDw==",
    "statement": {
     "action": "file_put",
     "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
@@ -122,9 +122,9 @@
     "image_digest": null,
     "issued_at": 1700000004,
     "operation_id": "c2a42972-a335-57eb-7cd5-a6e8152f71ff",
-    "previous_receipt_sha256": "946f3a34d7e986295d72feda4929bf5b2e14f704d07bd7d8cfb3e1484832b182",
+    "previous_receipt_sha256": "cbf84338fb2f9713327196e589e79d98087f444e03c803bea899e5785c66df39",
     "result_sha256": "cbc48443813dad8f0918dcb489d7cf560db31473b8b1e5fa932b9394d7f7b278",
-    "room_previous_receipt_sha256": "946f3a34d7e986295d72feda4929bf5b2e14f704d07bd7d8cfb3e1484832b182",
+    "room_previous_receipt_sha256": "cbf84338fb2f9713327196e589e79d98087f444e03c803bea899e5785c66df39",
     "room_sequence": 4,
     "sandbox_id": "run-room-1",
     "schema": "cathedral_sealed_hotel_receipt_v1",
@@ -134,8 +134,8 @@
    }
   },
   {
-   "receipt_sha256": "011b2add98c1ea641fe4a1aefbf56daacc2fac5192482c5563ff2fe1b3f2097c",
-   "signature_b64": "E3NwIwRqsN2+WHFvScHzcygQTda5KJjIZ9IUUBLHoNH6+U0GON0NBaV89ULbJOWwm33EH+hikWTVQiYFxrMFCg==",
+   "receipt_sha256": "bbadc554d759601ce5619afd079418ef1394fad5c9e01bbd340e21c3ae598645",
+   "signature_b64": "OSE89FAdqTwRgFM6G5OZw02Nr2BY43ZOO8NdKKMT3ZxrRe0sPDLLYCNog5geVRKwGKdsakfWrXcKHnKEsTRvAw==",
    "statement": {
     "action": "exec",
     "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
@@ -146,9 +146,9 @@
     "image_digest": null,
     "issued_at": 1700000005,
     "operation_id": "e777ac9b-be54-f481-88bb-5f0dd6a2f158",
-    "previous_receipt_sha256": "1c4008e56261cfc38abef3afb9cf870f50abff92fe6a0d4253d5fd6a418e2d2c",
+    "previous_receipt_sha256": "20d9cee7a4e6a1a8b75bc4a38fcaf5a87e73e72fa63c8e0f7868903c5da10900",
     "result_sha256": "834bd866d4de57d467f58d46ba410997908d107c3e81e4e8857b94199e1ea5c3",
-    "room_previous_receipt_sha256": "1c4008e56261cfc38abef3afb9cf870f50abff92fe6a0d4253d5fd6a418e2d2c",
+    "room_previous_receipt_sha256": "20d9cee7a4e6a1a8b75bc4a38fcaf5a87e73e72fa63c8e0f7868903c5da10900",
     "room_sequence": 5,
     "sandbox_id": "run-room-1",
     "schema": "cathedral_sealed_hotel_receipt_v1",
@@ -158,8 +158,8 @@
    }
   },
   {
-   "receipt_sha256": "9660db0c6cd04ab07d750f002813e1b75b8198959f22baa898c996ff01eec2eb",
-   "signature_b64": "WLsivtoI5J1W6AcFAYOuBu0k0PfxbN2i4c9J4s925qK4mweMrHNsU3Taz2ORUPssxYzsnWr+ce43+JJ/QFGqDQ==",
+   "receipt_sha256": "b680e2bf9c70a15cd90f45a1d48b60fe8974b0d1265e93c3264734f9c174ac34",
+   "signature_b64": "zR8krIH+CB8kxwY6vAyEwXGFGprRyQhp2ysAOhf40fnHZuBMNb9jjkzSNONlFGyEPku43HJzK4TwOSMi/gyQDg==",
    "statement": {
     "action": "file_get",
     "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
@@ -170,9 +170,9 @@
     "image_digest": null,
     "issued_at": 1700000006,
     "operation_id": "827f67de-0993-794b-ba55-0603c2e8ddcf",
-    "previous_receipt_sha256": "011b2add98c1ea641fe4a1aefbf56daacc2fac5192482c5563ff2fe1b3f2097c",
+    "previous_receipt_sha256": "bbadc554d759601ce5619afd079418ef1394fad5c9e01bbd340e21c3ae598645",
     "result_sha256": "e5f1eb4d806641698a35efe20e098efd20d7d57a9b90ee69079d5bb650920726",
-    "room_previous_receipt_sha256": "011b2add98c1ea641fe4a1aefbf56daacc2fac5192482c5563ff2fe1b3f2097c",
+    "room_previous_receipt_sha256": "bbadc554d759601ce5619afd079418ef1394fad5c9e01bbd340e21c3ae598645",
     "room_sequence": 6,
     "sandbox_id": "run-room-1",
     "schema": "cathedral_sealed_hotel_receipt_v1",
@@ -182,8 +182,8 @@
    }
   },
   {
-   "receipt_sha256": "1e6b062824c10889ed2436a6398dbfd9c5adac430d88bdd5acb1df0c4f975362",
-   "signature_b64": "kYtCoxSk5IYNJEbS4OcVLaWH1OYlXP9XFXYmnoyHE0bE/mQiyYdH0HzV9f6UwDbqro+kCfAcVu6GQoVF46HiAg==",
+   "receipt_sha256": "81ed9abe08912a99a4734f5532f4567fdb75f28af4f830fc45c697ad6c64374b",
+   "signature_b64": "+ld2cZ7fNfiTye8WGJUATWPDwCWGRFsJftrasyIE73zznmq+HnizXGpy8MOQN7NgrElYKnUaM+leHW6SNxm2Bg==",
    "statement": {
     "action": "file_get",
     "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
@@ -194,9 +194,9 @@
     "image_digest": null,
     "issued_at": 1700000007,
     "operation_id": "6a48a62e-6342-91b3-487a-181608370f16",
-    "previous_receipt_sha256": "9660db0c6cd04ab07d750f002813e1b75b8198959f22baa898c996ff01eec2eb",
+    "previous_receipt_sha256": "b680e2bf9c70a15cd90f45a1d48b60fe8974b0d1265e93c3264734f9c174ac34",
     "result_sha256": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2",
-    "room_previous_receipt_sha256": "9660db0c6cd04ab07d750f002813e1b75b8198959f22baa898c996ff01eec2eb",
+    "room_previous_receipt_sha256": "b680e2bf9c70a15cd90f45a1d48b60fe8974b0d1265e93c3264734f9c174ac34",
     "room_sequence": 7,
     "sandbox_id": "run-room-1",
     "schema": "cathedral_sealed_hotel_receipt_v1",
@@ -206,8 +206,8 @@
    }
   },
   {
-   "receipt_sha256": "90b03d75337005c3784223b65215922b0df432c2efc0643c120f447a5903ec14",
-   "signature_b64": "5tLgTUBYgU02h48f6iVDjpxl2KFSG1pjDxOL3vgMBX9HIgCErRnkZ1Rt9f98Kj8d+qynKLz4NAgtu08QE+3kAg==",
+   "receipt_sha256": "dd3c0f2ba9f5501bb5d5daefa5a87ebf7f0b3a9949b684490b69e60640d47ac7",
+   "signature_b64": "ZPHoKl1I+XJ4wP6tLEh8p5rn++Tzc45szwOtJcl/rje4snenO9yVbJOqCIqAgmndPNpoAn0SYPAX9punzEXXAQ==",
    "statement": {
     "action": "file_put",
     "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
@@ -218,9 +218,9 @@
     "image_digest": null,
     "issued_at": 1700000008,
     "operation_id": "e3ba1398-b533-84fc-b414-075da093b9b4",
-    "previous_receipt_sha256": "1e6b062824c10889ed2436a6398dbfd9c5adac430d88bdd5acb1df0c4f975362",
+    "previous_receipt_sha256": "81ed9abe08912a99a4734f5532f4567fdb75f28af4f830fc45c697ad6c64374b",
     "result_sha256": "91d69c1d413d96f4b65fd20a789896f9073f2234ae0e0fc8f52dba5d2a81d59b",
-    "room_previous_receipt_sha256": "1e6b062824c10889ed2436a6398dbfd9c5adac430d88bdd5acb1df0c4f975362",
+    "room_previous_receipt_sha256": "81ed9abe08912a99a4734f5532f4567fdb75f28af4f830fc45c697ad6c64374b",
     "room_sequence": 8,
     "sandbox_id": "run-room-1",
     "schema": "cathedral_sealed_hotel_receipt_v1",
@@ -277,7 +277,7 @@
     "path": "/work/out/log.txt"
    }
   ],
-  "size": "small",
+  "size": "sealed-1x2",
   "timeout_seconds": 60
  },
  "schema": "cathedral_oneshot_bundle_v1"
