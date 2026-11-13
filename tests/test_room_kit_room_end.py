@@ -231,6 +231,7 @@ def test_two_looks_on_a_held_list_sign_one_end(front) -> None:
     deadline = time.time() + 10
     while front.api.count(r"GET /v1/sandboxes") < 2 and time.time() < deadline:
         time.sleep(0.01)
+    assert front.api.count(r"GET /v1/sandboxes") == 2, "the two looks never overlapped on the held list"
     held.release.set()
     finish(a, abox)
     finish(b, bbox)
