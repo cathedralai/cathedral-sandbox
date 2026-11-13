@@ -13,6 +13,7 @@
 
 ARG DEBIAN_IMAGE=debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 ARG PYTHON_IMAGE=python:3.12-slim-bookworm@sha256:e697c81897302a4c4333bade000d98038fbb21eb064f8ee1fd42d02ebcd9d337
+ARG GOLANG_IMAGE=golang:1.26.11-bookworm@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0
 ARG WEIGHTS=download
 
 FROM ${DEBIAN_IMAGE} AS llama
@@ -113,6 +114,21 @@ RUN set -eu; \
 
 FROM weights-${WEIGHTS} AS weights
 
+# lfm3-gateway (AB#539): the Polaris runtime chat contract on 127.0.0.1:8642,
+# one static Go binary with no dependencies outside the standard library, so
+# the room gains no interpreter or package. Its tests replay the chat event
+# fixtures before it is built.
+FROM ${GOLANG_IMAGE} AS gateway
+ENV CGO_ENABLED=0 GOTOOLCHAIN=local GOFLAGS=-trimpath
+COPY gateway /src/gateway
+COPY test/chat-events /src/test/chat-events
+WORKDIR /src/gateway
+RUN test -z "$(gofmt -l .)" \
+    && go vet ./... \
+    && go test -count=1 ./... \
+    && go build -buildvcs=false -ldflags='-s -w' -o /out/lfm3-gateway . \
+    && ! ldd /out/lfm3-gateway
+
 FROM ${DEBIAN_IMAGE}
 
 ARG WEIGHTS
@@ -151,6 +167,7 @@ COPY --from=weights /opt/lfm3 /opt/lfm3
 COPY NOTICE.in /tmp/NOTICE.in
 COPY test /opt/lfm3/test
 COPY lfm3-serve lfm3-ask lfm3-agent liquid lfm3-decide lfm3-selftest lfm3-prewarm /usr/local/bin/
+COPY --from=gateway /out/lfm3-gateway /usr/local/bin/lfm3-gateway
 
 # NOTICE names this model and says whether the weights are Liquid AI's files
 # unmodified or converted here (LFM Open License 4(b)). SHA256SUMS records
@@ -172,6 +189,8 @@ RUN set -eu; \
     chmod -R a+rX /opt/llama /opt/lfm3; \
     ! ldd /opt/llama/bin/llama-server | grep 'not found'; \
     ! ldd /opt/llama/bin/llama-cli | grep 'not found'; \
+    chmod 0755 /usr/local/bin/lfm3-gateway; \
+    ! ldd /usr/local/bin/lfm3-gateway >/dev/null 2>&1; \
     test -s "/opt/lfm3/${GGUF}" && test -s /opt/lfm3/LICENSE; \
     if [ -n "${MMPROJ}" ]; then test -s "/opt/lfm3/${MMPROJ}"; fi; \
     if [ -n "${GGUF_SHA256}" ]; then echo "${GGUF_SHA256}  /opt/lfm3/${GGUF}" | sha256sum -c -; fi; \
