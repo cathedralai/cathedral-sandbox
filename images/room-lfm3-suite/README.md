@@ -35,25 +35,25 @@ here. Spoken answers are: `liquid --speak` in Audio and Omni rooms (below).
 
 ## Pins and sealed proof
 
-Base, VL, Omni, d1 and d1-Omni are published from commit `01f56b8` (#392:
-per-model sampling, the loop guard, tool-call markup parsed; run
-41887832793). Audio and Omni are published from commit `f9f9a19` (#407, run
-41970923674): `liquid --speak`, one sentence per `/tts` request, with its
-blocking `speak` gate (ADO 552) and
-the warm cache saved in the image (#403, #405), on top of `liquid --json` and
-greedy plus frequency penalty 0.3 for Audio (ADO 547) and `--swa-full` with
-answers sampled after a greedy tool check for Omni (ADO 549, 550). Run
+All six are published from commit `3339b9f` (run 43467170286, 13 Nov
+2026): `lfm3-agent --events` streaming chat events (#440, ADO 541) and the
+static Go chat gateway (#478, ADO 539), on top of per-model sampling, the
+loop guard and tool-call markup parsed (#392, ADO 523), `liquid --speak` one
+sentence per `/tts` request with its blocking `speak` gate (#407, ADO 552),
+the warm cache saved in the image (#403, #405), `liquid --json` and greedy
+plus frequency penalty 0.3 for Audio (ADO 547) and `--swa-full` with answers
+sampled after a greedy tool check for Omni (ADO 549, 550). Run
 summaries have the commit tags. All six packages are public; anonymous pull
 checked.
 
 | Model | Pin |
 |---|---|
-| `lfm3-1.7b-base` | `ghcr.io/cathedralai/room-lfm3-1.7b-base@sha256:810911016ac6ea1ddeba1bba4dc157e0c3d4252201e64d3279876e57dce344a8` |
-| `lfm3-vl-2b` | `ghcr.io/cathedralai/room-lfm3-vl-2b@sha256:ef5c553961e5a6d9eba616fe4f5b2d68d46ec996f651e2011e5a09ae67f9cdc1` |
-| `lfm3-audio-2b` | `ghcr.io/cathedralai/room-lfm3-audio-2b@sha256:78c2c7d7b6d577c48da6254be23764c5a2be97f4cd2cbe5a7988bb4b4c64a1f5` |
-| `lfm3-omni-2b` | `ghcr.io/cathedralai/room-lfm3-omni-2b@sha256:df5cea815abd5ba5be781c07558dc72dc45a1334c5b97d0b5a93a907bc9911d6` |
-| `d1-2b` | `ghcr.io/cathedralai/room-d1-2b@sha256:f95d88c7144642328fe85bd7f52e95e434979e64a220550fac3d0e965aca35c6` |
-| `d1-omni-2b` | `ghcr.io/cathedralai/room-d1-omni-2b@sha256:3cb800de3d2f9bfcc69d24ab2fc659fc51eb7ed3aae2abe46d46a23f10b57abd` |
+| `lfm3-1.7b-base` | `ghcr.io/cathedralai/room-lfm3-1.7b-base@sha256:b48013ae60249c18cc756d6b449e3320ec63e5861dd0e3cb87c38be11e775e08` |
+| `lfm3-vl-2b` | `ghcr.io/cathedralai/room-lfm3-vl-2b@sha256:d787ed7937cf0b1dad424bb614fd655ccd66ec635d21ac85f72d7a6f77c6583d` |
+| `lfm3-audio-2b` | `ghcr.io/cathedralai/room-lfm3-audio-2b@sha256:b91ef21e68d17fbafcdc2b2eb9d195f02c00a9b5325c7711680eaf1b2d0df336` |
+| `lfm3-omni-2b` | `ghcr.io/cathedralai/room-lfm3-omni-2b@sha256:4fc6e0682a2f563c5e0fb862c7a4968cdfd509a4d7bc73fee860c3592d214b41` |
+| `d1-2b` | `ghcr.io/cathedralai/room-d1-2b@sha256:4aed662bc5292e6c8813fefb178a471630d6122994b0cb2e4371f2439e18895f` |
+| `d1-omni-2b` | `ghcr.io/cathedralai/room-d1-omni-2b@sha256:57f9038bf8198e6a9fa52e37260a48b56ddf6b6a89c83dbf84b9b74838168cfd` |
 
 The converted `LFM3-1.7B-Base-Q4_K_M.gguf` in that image has sha256
 `d4c9ebb5aa08999083bf939042087b6379547c5729163ce556902d8c06111fd5`.
