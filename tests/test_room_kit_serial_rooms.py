@@ -359,3 +359,16 @@ def test_a_turn_is_released_when_the_handler_raises_before_the_api(front, monkey
     monkeypatch.undo()
     assert front.exec(room)[0] == 200
     assert_idle(front.ledger)
+
+
+def test_the_sealed_env_handler_is_refused_on_a_serial_room_and_its_read_passes(front) -> None:
+    serial, ordinary = serial_room(front), plain_room(front)
+    seen = len(front.api.seen)
+    status, headers, out = front.call("POST", f"/v1/sandboxes/{serial}/sealed-env", {"x": 1})
+    assert status == 409 and code(out) == "room_serial_unsigned" and "X-Room-Receipt" not in headers
+    assert len(front.api.seen) == seen
+    # The read is on the reads list: it reaches the handler (this hotel has the feature off).
+    assert front.call("GET", f"/v1/sandboxes/{serial}/sealed-env")[0] == 403
+    # An ordinary room reaches the handler for both.
+    assert front.call("POST", f"/v1/sandboxes/{ordinary}/sealed-env", {"x": 1})[0] == 403
+    assert_idle(front.ledger)
