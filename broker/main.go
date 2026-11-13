@@ -83,6 +83,9 @@ type hotelConfig struct {
 	// TLSSPKISHA256 is derived from a miner hotel's verified SNP binding at
 	// join and persisted for safe reconnect after a broker restart.
 	TLSSPKISHA256 string `json:"tls_spki_sha256,omitempty"`
+	// Commitment: the slots and daily hours a miner hotel declares at join
+	// (commitment.go). Nil: none declared.
+	Commitment *capacityCommitment `json:"commitment,omitempty"`
 }
 
 type guestConfig struct {
@@ -135,6 +138,9 @@ type config struct {
 	// MinerMaxHotels is the operator-approved maximum across all miner hotkeys.
 	// Zero refuses miner joins; pending and draining hotels count.
 	MinerMaxHotels int `json:"miner_max_hotels,omitempty"`
+	// MinerMinCommitment is the floor a miner join's commitment must meet
+	// (commitment.go). Nil or zero: a commitment is optional.
+	MinerMinCommitment *capacityCommitment `json:"miner_min_commitment,omitempty"`
 	// Admission of sealed hotels (admission.go). The top-level
 	// SealedAdmission loads only as absent or "on": the gate cannot be
 	// turned off for every hotel or for joined hotels. The ops escape is
@@ -242,6 +248,7 @@ type hotel struct {
 	moved           int       // creates that left this hotel's queue for another hotel
 	runtime         bool      // joined at runtime (hotels.go), not from the config file
 	adm             admission // attestation gate of a joined sealed hotel (admission.go)
+	delivery        delivery  // delivered capacity against the commitment (commitment.go)
 	// roomsUnchecked: loaded at start and no room list has answered since. A
 	// reserved hotel takes no rooms until one has passed the fail-closed
 	// check (lend.go). baselineTry: last REPORT_ID fetch for an unknown
@@ -372,6 +379,9 @@ func loadBroker(path string) (*broker, error) {
 	if c.MinerMaxHotels < 0 {
 		return nil, errors.New("config: miner_max_hotels must be positive when miner hotels are allowed")
 	}
+	if err := validateMinCommitment(c.MinerMinCommitment); err != nil {
+		return nil, err
+	}
 	for _, id := range c.TerminalHotels {
 		if id == "" || strings.Contains(id, ".") {
 			return nil, fmt.Errorf("config: terminal_hotels entry %q must be a hotel id (non-empty, no dot)", id)
@@ -392,6 +402,9 @@ func loadBroker(path string) (*broker, error) {
 		}
 		if hc.MinerHotkey != "" {
 			return nil, fmt.Errorf("config: miner hotel %q must join with attested guest TLS", hc.ID)
+		}
+		if hc.Commitment != nil {
+			return nil, fmt.Errorf("config: hotel %q: only a miner hotel declares a commitment, and miner hotels join at runtime", hc.ID)
 		}
 		if hc.RequireAttestation && !hc.Sealed {
 			return nil, fmt.Errorf("config: hotel %q: require_attestation needs \"sealed\": true", hc.ID)
@@ -1833,11 +1846,13 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	if cameUp && b.cfg.PrewarmCatalog {
 		go b.prewarmHotel(h)
 	}
+	offered := h.slots // health late: the slots placement still uses
 	if herr == nil {
 		slots := hd.Slots
 		if h.cfg.MaxSlots > 0 && slots > h.cfg.MaxSlots {
 			slots = h.cfg.MaxSlots
 		}
+		offered = max(slots, 0) // this tick's answer, even 0, which resize ignores
 		h.resize(slots)
 		if hd.Live.CPU != nil {
 			h.cpuPct = *hd.Live.CPU
@@ -1856,6 +1871,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		h.apiRunning = int(quota.Usage["running_sandboxes"] + quota.Usage["frozen_sandboxes"])
 		h.apiDeleting = int(quota.Usage["deleting_sandboxes"])
 	}
+	b.recordDelivery(h, offered, now) // before the room list return: a failed list does not stop the count
 	if lerr != nil {
 		return
 	}
