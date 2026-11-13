@@ -115,6 +115,24 @@ does not enter that path.
 
 `ROOM_HOTEL_NAME` empty means the installer uses `ROOM_ID`.
 
+### Receipt numbers per room
+
+Every statement that names a room carries `room_sequence` (1, 2, 3 for that
+room id under this boot's key) and `room_previous_receipt_sha256` (null for the
+first). A room id used again continues its numbers. A bulk delete names no room
+and takes no number. A retried sealed secret returns its stored receipt and
+takes no new number.
+
+`GET /v1/sandboxes/<id>/receipts` answers with `count` (how many receipts the
+room holds) and `room_head` (the `receipt_sha256` of the last one, null when
+there are none) beside the receipts. A list numbered 1 to `count`, linked, with
+that head, holds every receipt the room had when it was read. An action still
+running, or signed after the read, is not in it.
+
+A create that asks for more than one room (`count` other than the integer 1)
+is refused with 400 `create_count_refused`, unsent and unsigned, so each room's
+list holds its own create.
+
 ### Fresh report over caller data (sealed only)
 
 `POST /room/attest` on the receipt front asks the processor for a new SNP
