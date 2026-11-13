@@ -604,9 +604,10 @@ RESULT_PATH = "/work/out/result.json"
 LOG_PATH = "/work/out/log.txt"
 RUN_PATH = "/work/in/run.py"
 DATA_PATH = "/work/in/data.csv"
-UNICODE_PATH = "/work/in/a b+c&d=e%f~ü.txt"
+UNICODE_PATH = "/work/in/a b+c&d=e%f~ü.txt"  # not a valid path form: used by a bad list
+NESTED_PATH = "/work/in/dir/a-b_c.d.txt"
 CONTEXT = {"submission": "sub-0001", "note": "café"}
-FILE_BYTES = {RUN_PATH: b"print('ok')\n", DATA_PATH: b"a,b\n1,2\n", UNICODE_PATH: b"unicode path input\n",
+FILE_BYTES = {RUN_PATH: b"print('ok')\n", DATA_PATH: b"a,b\n1,2\n", UNICODE_PATH: b"unicode path input\n", NESTED_PATH: b"nested input\n",
               RESULT_PATH: b'{"ok":true}\n', LOG_PATH: b"done\n"}
 DEL = object()  # an override value that removes the field
 
@@ -816,11 +817,11 @@ def run_good_cases(pack: Pack) -> None:
              "An exec answer that does not hash to the receipt's result: not proven, still PASS.",
              {"pointers": {f"{run}/exit_code/status": "not proven"}}, exec_response="mismatch")
 
-    def unicode_input(r):
-        r["request"]["inputs"].append({"path": UNICODE_PATH, "mode": "600"})
-    run_case(pack, "good", "run_path_with_space_and_unicode",
-             "An input whose path holds a space, +, &, =, %, ~ and a non-ASCII letter: the signed target is the "
-             "sorted, plus-for-space form.", {}, truth_edit=unicode_input)
+    def nested_input(r):
+        r["request"]["inputs"].append({"path": NESTED_PATH, "mode": "600"})
+    run_case(pack, "good", "run_path_with_a_folder_dots_dashes_and_underscores",
+             "An input in a folder, with dots, dashes and underscores in its path: the signed target is the "
+             "sorted, escaped form.", {}, truth_edit=nested_input)
     run_case(pack, "good", "run_input_given_as_file", "The caller gives an input as a file, not a hash.", {},
              input_files=(RUN_PATH,))
     run_case(pack, "good", "run_no_context", "A run with no context: the checker is told --no-context.", {},
@@ -1378,7 +1379,135 @@ def run_validity_cases(pack: Pack) -> None:
          file_bytes={LOG_PATH: b"x" * 65536})
 
 
-CASE_SETS = [numbering_cases, serial_cases, pool_cases, run_good_cases, run_bad_cases, run_hardening_cases, run_second_review_cases, run_validity_cases]
+def _knobs(**members):
+    return {"truth_edit": lambda r: r["request"].update(members)}
+
+
+def _ins(*items):
+    return _knobs(inputs=[{"path": p, "mode": "644"} if isinstance(p, str) else p for p in items])
+
+
+def _outs(*items):
+    out = [{"path": p, "max_bytes": 9, "optional": False} if isinstance(p, str) else p for p in items]
+    return {**_knobs(outputs=out), "held": (), "inline": ()}
+
+
+def _roomy_log(r):
+    r["request"]["outputs"][1]["max_bytes"] = 1048576
+
+
+def _file_side(**edits):
+    return {"bundle_edit": lambda b: b["request"].update(edits)}
+
+
+_IMG = "images.example.test/"
+_DIGEST = "@sha256:" + "a" * 64
+IN_PATH = "an input path"
+OUT_PATH = "an output path"
+
+
+def _path_rules(kind, prefix, make):
+    """The path forms (spec G4 5.1, Forms) for inputs or outputs: one entry per rule, with the cases past it."""
+    noun = f"an {kind} path"
+    p = f"recipe: {noun} "
+    long_ok, long_bad = prefix + "a" * (1024 - len(prefix)), prefix + "a" * (1025 - len(prefix))
+    return [
+        (f"{kind}_path_length", make(long_ok), [("1025", make(long_bad), p + "must be at most 1024 characters")]),
+        (f"{kind}_path_dots", make(prefix + "a..b"), [
+            ("dotdot", make(prefix + "../x"), p + "must not hold a . or .. segment"),
+            ("dot", make(prefix + "./x"), p + "must not hold a . or .. segment"),
+            ("dotdot_last", make(prefix + "d/.."), p + "must not hold a . or .. segment")]),
+        (f"{kind}_path_segments", make(prefix + "a/b"), [
+            ("empty", make(prefix + "a//b"), p + "must not hold an empty segment"),
+            ("trailing_slash", make(prefix + "a/"), p + "must not hold an empty segment")]),
+        (f"{kind}_path_characters", make(prefix + "A-z_0.9"), [
+            ("space", make(prefix + "a b"), p + "may hold only letters, digits, . _ and - in a segment"),
+            ("non_ascii", make(prefix + "caf\u00e9"), p + "may hold only letters, digits, . _ and - in a segment"),
+            ("percent", make(prefix + "a%2Fb"), p + "may hold only letters, digits, . _ and - in a segment"),
+            ("old_vector", make(UNICODE_PATH if kind == "input" else "/work/out/a b+c&d=e%f~\u00fc.txt"),
+             p + "may hold only letters, digits, . _ and - in a segment")]),
+        (f"{kind}_path_twice", make(prefix + "a", prefix + "b"),
+         [("duplicate", make(prefix + "a", prefix + "a"), f"recipe: {noun} is given twice")]),
+    ]
+
+
+def build_form_rules():
+    """Every form rule of spec G4 5.1: (id, knobs at the bound that pass, [(case, knobs past it, reason)])."""
+    rules = _path_rules("input", "/work/in/", lambda *ps: _ins(*ps))
+    rules += _path_rules("output", "/work/out/", lambda *ps: _outs(*ps))
+    rules += [
+        ("input_not_the_context_path", _ins("/work/in/.context.jsonx"),
+         [("context_path", _ins("/work/in/.context.json"), "recipe: an input path must not be /work/in/.context.json")]),
+        ("input_mode", _ins({"path": "/work/in/x", "mode": "0644"}), [
+            ("eight", _ins({"path": "/work/in/x", "mode": "8"}), "recipe: an input mode must be 3 or 4 octal digits"),
+            ("two_digits", _ins({"path": "/work/in/x", "mode": "64"}),
+             "recipe: an input mode must be 3 or 4 octal digits"),
+            ("five_digits", _ins({"path": "/work/in/x", "mode": "00644"}),
+             "recipe: an input mode must be 3 or 4 octal digits"),
+            ("not_octal", _ins({"path": "/work/in/x", "mode": "0689"}),
+             "recipe: an input mode must be 3 or 4 octal digits")]),
+        ("image_length", _knobs(image=_IMG + "a" * (512 - len(_IMG) - len(_DIGEST)) + _DIGEST),
+         [("513", _knobs(image=_IMG + "a" * (513 - len(_IMG) - len(_DIGEST)) + _DIGEST),
+           "recipe: image must be at most 512 characters")]),
+        ("env_name", _knobs(env={"A" * 128: "v", "_x1": "v"}), [
+            ("129", _knobs(env={"A" * 129: "v"}), "recipe: an env name must be a letter or _, then up to 127 letters, digits or _"),
+            ("digit_first", _knobs(env={"1A": "v"}),
+             "recipe: an env name must be a letter or _, then up to 127 letters, digits or _"),
+            ("dash", _knobs(env={"A-B": "v"}),
+             "recipe: an env name must be a letter or _, then up to 127 letters, digits or _"),
+            ("empty", _knobs(env={"": "v"}),
+             "recipe: an env name must be a letter or _, then up to 127 letters, digits or _")]),
+        ("env_value_length", _knobs(env={"K": "v" * 8192}),
+         [("8193", _knobs(env={"K": "v" * 8193}), "recipe: an env value must be at most 8192 characters")]),
+        ("cwd_length", _knobs(cwd="/" + "a" * 1023), [
+            ("1025", _knobs(cwd="/" + "a" * 1024), "recipe: cwd must be 1 to 1024 characters"),
+            ("empty", _knobs(cwd=""), "recipe: cwd must be 1 to 1024 characters")]),
+        ("user_length", _knobs(user="a" * 64),
+         [("65", _knobs(user="a" * 65), "recipe: user must be at most 64 characters")]),
+        ("user_form", _knobs(user="_svc-1$"), [
+            ("dollar_inside", _knobs(user="svc$x"), "recipe: user must be digits only, or a name of letters, digits, "
+                                                    "_ and - that starts with a letter or _ and may end in $"),
+            ("digit_first", _knobs(user="1abc"), "recipe: user must be digits only, or a name of letters, digits, "
+                                                 "_ and - that starts with a letter or _ and may end in $"),
+            ("space", _knobs(user="a b"), "recipe: user must be digits only, or a name of letters, digits, "
+                                          "_ and - that starts with a letter or _ and may end in $"),
+            ("empty", _knobs(user=""), "recipe: user must be digits only, or a name of letters, digits, "
+                                       "_ and - that starts with a letter or _ and may end in $")]),
+        ("user_digits", _knobs(user="1000"), []),
+        ("output_max_bytes_at_least_one", _outs({"path": "/work/out/x", "max_bytes": 1, "optional": False}),
+         [("zero", _outs({"path": "/work/out/x", "max_bytes": 0, "optional": False}),
+           "recipe: an output max_bytes must be at least 1"),
+          ("negative", _outs({"path": "/work/out/x", "max_bytes": -1, "optional": False}),
+           "recipe: an output max_bytes must be at least 1")]),
+        ("context_no_floats", {"truth_context": {"a": {"b": 1, "c": [1, 2]}}}, [
+            ("deep_float", {"truth_context": {"a": {"b": 1.5}}},
+             "inputs: the context file holds the number 1.5, which is not an integer"),
+            ("one_point_zero", {"truth_context": {"a": {"b": 1.0}}},
+             "inputs: the context file holds the number 1.0, which is not an integer"),
+            ("exponent", {"truth_context": {"a": {"b": 1}}, "context_raw": lambda raw: b'{"a":{"b":1e3}}'},
+             "inputs: the context file holds the number 1e3, which is not an integer"),
+            ("in_a_list", {"truth_context": {"a": [1]}, "context_raw": lambda raw: b'{"a":[1,[2.5]]}'},
+             "inputs: the context file holds the number 2.5, which is not an integer"),
+            ("float_in_the_files_request", {"truth_context": {"a": {"b": 1}},
+                                            **_file_side(context={"a": {"b": 1.5}})},
+             "check 8: the file's request: context must hold no floating point number")]),
+    ]
+    return rules
+
+
+def run_form_cases(pack: Pack) -> None:
+    """One good list at each bound and the bad lists past it (spec G4 5.1, Forms)."""
+    for rule, at, past in build_form_rules():
+        run_case(pack, "good", f"run_form_{rule}", f"The bound of the form rule {rule}: it is accepted.", {}, **at)
+        for case, knobs, reason in past:
+            run_case(pack, "bad", f"run_form_{rule}_{case}", f"One step past the form rule {rule}: {case}.",
+                     {"reason": reason}, **knobs)
+    run_case(pack, "bad", "run_form_input_sha256_upper_case", "The file's request holds an upper-case input sha256.",
+             {"reason": "check 8: the file's request: an input sha256 must be 64 lower-case hex"},
+             bundle_edit=lambda b: b["request"]["inputs"][0].update(sha256=b["request"]["inputs"][0]["sha256"].upper()))
+
+
+CASE_SETS = [numbering_cases, serial_cases, pool_cases, run_good_cases, run_bad_cases, run_hardening_cases, run_second_review_cases, run_validity_cases, run_form_cases]
 
 
 def build(amd: dict[str, bytes]) -> dict[str, bytes]:

@@ -361,14 +361,20 @@ def test_the_recipe_network_forms_map_to_one_canonical_policy_each() -> None:
             vr.network_policy(bad)
 
 
-def _generated(tmp_path: Path, **knobs) -> tuple[int, dict]:
-    """Build a signed run in memory with the pack generator, write it out, and run the checker on it."""
+def _generator():
     import importlib.util
 
-    spec = importlib.util.spec_from_file_location("pack_generate_t", PACK / "generate.py")
-    gen = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = gen
-    spec.loader.exec_module(gen)
+    if "pack_generate_t" not in sys.modules:
+        spec = importlib.util.spec_from_file_location("pack_generate_t", PACK / "generate.py")
+        gen = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = gen
+        spec.loader.exec_module(gen)
+    return sys.modules["pack_generate_t"]
+
+
+def _generated(tmp_path: Path, **knobs) -> tuple[int, dict]:
+    """Build a signed run in memory with the pack generator, write it out, and run the checker on it."""
+    gen = _generator()
     files, args = gen.make_run(gen.Pack(gen.read_amd()), **knobs)
     for name, data in files.items():
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
@@ -432,3 +438,23 @@ def test_each_request_rule_passes_at_its_bound_and_fails_one_step_past_it(rule, 
     assert code == 0 and out["verdict"] == "PASS", (rule, out)
     code, out = _generated(tmp_path / "past", **past)
     assert code == 1 and out == {"verdict": "FAIL", "reason": reason}, (rule, out)
+
+
+FORM_CASES = [(rule, case, at, knobs, reason)
+              for rule, at, past in _generator().build_form_rules() for case, knobs, reason in past]
+
+
+@pytest.mark.parametrize("rule", sorted({c[0] for c in FORM_CASES}))
+def test_each_form_rule_accepts_its_bound(rule: str, tmp_path: Path) -> None:
+    """Spec G4 5.1, Forms: a run at the bound of every form rule passes."""
+    at = next(c[2] for c in FORM_CASES if c[0] == rule)
+    code, out = _generated(tmp_path, **at)
+    assert code == 0 and out["verdict"] == "PASS", (rule, out)
+
+
+@pytest.mark.parametrize("rule, case, knobs, reason", [(c[0], c[1], c[3], c[4]) for c in FORM_CASES],
+                         ids=[f"{c[0]}-{c[1]}" for c in FORM_CASES])
+def test_each_form_rule_refuses_one_step_past_its_bound(rule, case, knobs, reason, tmp_path) -> None:
+    """The evidence is signed and consistent with the recipe: only the form rule can fail the run."""
+    code, out = _generated(tmp_path, **knobs)
+    assert code == 1 and out == {"verdict": "FAIL", "reason": reason}, (rule, case, out)
