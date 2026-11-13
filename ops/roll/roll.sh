@@ -178,22 +178,45 @@ diff <(grep -vE '^SEALED_DIR=' "$D/sealed.env" | sort) <(grep -vE '^SEALED_DIR='
 [ -d "$D/images/$NEWIMG" ] || cp -a "$S/images/$NEWIMG" "$D/images/" || { cp -a "$D/sealed.env.bak-$TS" "$D/sealed.env"; echo "RESULT=nochange image copy failed"; exit 0; }
 ln -sfn "$NEWIMG" "$D/images/current"
 echo "current now $(readlink "$D/images/current")"
-( cd "$KIT" && SEALED_SKIP_BUILD=1 ./install.sh --sealed "$D/sealed.env" ) > "/root/sealed-roll-$(basename "$D")-$TS.log" 2>&1
+# A reset roll moves the owner's volume to data.raw.prev (mv keeps the inode). Record it so a later
+# rollback to OLDIMG puts that volume back: the old build cannot open the new empty one.
+prev_ino() { stat -c %i "$D/data.raw.prev" 2>/dev/null || echo none; }
+PREV0=$(prev_ino)
+LOGF=${ROLL_REMOTE_LOGDIR:-/root}/sealed-roll-$(basename "$D")-$TS.log
+( cd "$KIT" && SEALED_SKIP_BUILD=1 ./install.sh --sealed "$D/sealed.env" ) > "$LOGF" 2>&1
 rc=$?
-grep -E "expected measurement|measurement matches|MEASUREMENT DIFFERS|no attestation|guest stopped|live room" "/root/sealed-roll-$(basename "$D")-$TS.log" | cut -c1-200
-if [ "$rc" = 0 ]; then echo "RESULT=installed"; exit 0; fi
+grep -E "expected measurement|measurement matches|MEASUREMENT DIFFERS|no attestation|guest stopped|live room|guest starting" "$LOGF" | cut -c1-200
+if [ "$rc" = 0 ]; then
+  [ "$(prev_ino)" != none ] && [ "$(prev_ino)" != "$PREV0" ] && { touch "$D/roll-reset-$TS"; echo "data volume was reset; data.raw.prev is the owner's volume for $OLDIMG"; }
+  echo "RESULT=installed"; exit 0
+fi
 echo "install exit $rc: rolling back to $OLDIMG"
 ln -sfn "$OLDIMG" "$D/images/current"
 cp -a "$D/sealed.env.bak-$TS" "$D/sealed.env"
+# install-sealed.sh logs "guest starting" right after it restarts the guest. Before that line the old
+# guest was never touched (a live-room refusal, a disk check): a restart here would end live rooms.
+if ! grep -q "guest starting" "$LOGF"; then
+  echo "RESULT=refused installer stopped before the guest restart; guest untouched unit=$(systemctl is-active "$UNIT") current=$(readlink "$D/images/current")"
+  exit 0
+fi
 systemctl restart "$UNIT"; sleep 5
 echo "RESULT=rolledback unit=$(systemctl is-active "$UNIT") current=$(readlink "$D/images/current")"
 REMOTE
 }
 
-# Idempotent: image back to OLDIMG, env back from the backup if one exists, restart the guest.
+# Idempotent: image back to OLDIMG, env back from the backup if one exists, the owner's data volume
+# back if this run reset it, restart the guest. RESULT=held: not restarted, the hotel must stay drained.
 host_rollback() {
   ssh "${SSHO[@]}" "root@$HOST" bash -s -- "$D" "$UNIT" "$OLDIMG" "$1" <<'REMOTE' 2>&1
 D=$1 UNIT=$2 OLDIMG=$3 TS=$4
+if [ -e "$D/roll-reset-$TS" ]; then
+  [ -f "$D/data.raw.prev" ] || { echo "RESULT=held this run reset the data volume but data.raw.prev is gone; not booting $OLDIMG on the wrong volume"; exit 0; }
+  systemctl stop "$UNIT"
+  { [ ! -e "$D/data.raw" ] || mv -f "$D/data.raw" "$D/data.raw.rolled-back-$TS"; } && mv -f "$D/data.raw.prev" "$D/data.raw" \
+    || { echo "RESULT=held could not restore data.raw from data.raw.prev; guest stopped"; exit 0; }
+  rm -f "$D/roll-reset-$TS"
+  echo "data volume: owner's volume restored from data.raw.prev; the new build's volume is data.raw.rolled-back-$TS"
+fi
 ln -sfn "$OLDIMG" "$D/images/current"
 [ -e "$D/sealed.env.bak-$TS" ] && cp -a "$D/sealed.env.bak-$TS" "$D/sealed.env"
 systemctl restart "$UNIT"; sleep 5
@@ -216,21 +239,38 @@ wait_admitted() {
   done
 }
 RECOVERING=0
+# A PATCH can apply at the broker and still answer 503 or time out: trust the readback, not the code.
+undrain() {
+  local code up adm meas dr sl fr; code=$(drain false)
+  [ "$code" = 200 ] && return 0
+  read -r up adm meas dr sl fr <<< "$(hotel_state)"
+  log "undrain PATCH answered ${code:-nothing}; broker reads drain=$dr"
+  [ "$dr" = False ]
+}
 recover() {
   [ $RECOVERING = 1 ] && return; RECOVERING=1
   local phase; phase=$(st_get PHASE)
   case "$phase" in
+    draining)
+      local up adm meas dr sl fr
+      read -r up adm meas dr sl fr <<< "$(hotel_state)"
+      if [ "$dr" = False ]; then st_set PHASE aborted; log "recovery: broker reads drain=False; the drain did not apply, nothing to undo"; return; fi
+      log "recovery: broker reads drain=$dr after an uncertain drain PATCH; nothing installed, undraining" ;;
     drained|installing|installed|admitted) ;;
     *) return ;;  # nothing of ours is drained yet, or already undrained
   esac
-  if [ "$phase" != drained ] && [ "$(st_get NEW_GOOD)" != 1 ] && [ "$(st_get HOST_ROLLED_BACK)" != 1 ]; then
+  if [ "$phase" != drained ] && [ "$phase" != draining ] && [ "$(st_get NEW_GOOD)" != 1 ] && [ "$(st_get HOST_ROLLED_BACK)" != 1 ]; then
     log "recovery: rolling the host back to $OLDIMG"
-    host_rollback "$(st_get TS)" | while read -r l; do log "host: $l"; done
+    local rb; rb=$(host_rollback "$(st_get TS)")
+    while read -r l; do log "host: $l"; done <<< "$rb"
+    case "$rb" in
+      *RESULT=rolledback*) st_set HOST_ROLLED_BACK 1 ;;
+      *RESULT=held*) st_set PHASE stuck_drained
+        log "STUCK DRAINED: $HOTEL host rollback held (data volume); kept drained. Inspect ${D}/data.raw* on $HOST"; return ;;
+    esac
   fi
   if wait_admitted "$CUR" "$NEW"; then
-    local code; code=$(drain false)
-    if [ "$code" = 200 ]; then st_set PHASE rolled_back; log "recovery: undrained on ${ADMITTED_ON:0:16}"; return; fi
-    log "recovery: undrain PATCH answered $code"
+    if undrain; then st_set PHASE rolled_back; log "recovery: undrained on ${ADMITTED_ON:0:16}"; return; fi
   fi
   st_set PHASE stuck_drained
   log "STUCK DRAINED: $HOTEL is drained and no known build is admitted. Inspect, then: roll.sh apply $HOTEL (resumes) or PATCH drain=false by hand"
@@ -302,11 +342,16 @@ run_apply() {
   OLDIMG=${OLDIMG:-$(st_get OLDIMG)}
   # drained: the hotel is closed to new rooms
   if [ "$phase" = preflight_ok ]; then
-    [ "$(drain true)" = 200 ] || die "drain PATCH did not answer 200"
+    st_set PHASE draining; phase=draining
+    local code; code=$(drain true)
+    [ "$code" = 200 ] || die "drain PATCH answered ${code:-nothing}; the drain may have applied"
     st_set PHASE drained; phase=drained; log "drained at broker"; sleep "$DRAIN_SETTLE"
     local r; r=$(rooms)
     [ "$r" = 0 ] || die "$HOTEL has rooms=$r after the drain; undrained, nothing installed"
     log "0 rooms"
+  fi
+  if [ "$phase" = draining ]; then
+    die "resuming an interrupted drain; reading the drain state back"
   fi
   if [ "$phase" = stuck_drained ]; then
     # resumed after a failed recovery: try recovery again
@@ -320,6 +365,7 @@ run_apply() {
     case "$out" in
       *RESULT=installed*) st_set PHASE installed; phase=installed ;;
       *RESULT=nochange*) st_set PHASE drained; die "host step changed nothing: $(grep -o 'RESULT=nochange.*' <<< "$out")" ;;
+      *RESULT=refused*) st_set HOST_ROLLED_BACK 1; die "the installer refused before restarting the guest (live room or a check); files back to $OLDIMG, guest not restarted" ;;
       *RESULT=rolledback*) st_set HOST_ROLLED_BACK 1; die "install failed and was rolled back to $OLDIMG" ;;
       *) die "host step did not finish cleanly; read /root/sealed-roll-*-$TS.log on $HOST" ;;
     esac
@@ -451,7 +497,7 @@ REMOTE
     [ "$(date +%s)" -lt "$deadline" ] || { log "build did not finish in ${STAGE_TIMEOUT}s"; return 1; }
     sleep "$POLL"
   done
-  local col; col=$(ssh -n "${SSHO[@]}" "root@$HOST" bash -s -- "$N" "$HOTEL" "$D" <<'REMOTE' 2>&1
+  local col; col=$(ssh "${SSHO[@]}" "root@$HOST" bash -s -- "$N" "$HOTEL" "$D" <<'REMOTE' 2>&1
 N=$1 H=$2 L=$3
 I=$(readlink -f "$N/$H/images/current"); LI=$(readlink -f "$L/images/current")
 NEW=$(tr -d '\n' < "$I/expected-measurement")
@@ -501,7 +547,7 @@ cmd_stage() {
   API=$(sed -n 's/^CATHEDRAL_COMMIT=//p' "$src/room-kit/versions.lock" | head -1)
   [[ "$API" =~ ^[0-9a-f]{7,40}$ ]] || { log "no CATHEDRAL_COMMIT in versions.lock"; exit 1; }
   BUNDLE=$src.bundle
-  git -C "$src" bundle create "$BUNDLE" main -q 2>/dev/null || { log "bundle failed"; exit 1; }
+  git -C "$src" bundle create -q "$BUNDLE" main 2>/dev/null || { log "bundle failed"; exit 1; }
   local rc=0
   for h in "$@"; do HOTEL=$h; hotel_conf "$h"; stage_hotel || rc=1; done
   rm -rf "$src" "$BUNDLE"
