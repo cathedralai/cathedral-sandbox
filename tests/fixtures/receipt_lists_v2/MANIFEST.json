@@ -912,16 +912,14 @@
   "bad/run_rule_inputs_too_many/outputs/result.json": "e5f1eb4d806641698a35efe20e098efd20d7d57a9b90ee69079d5bb650920726",
   "bad/run_rule_inputs_too_many/recipe.json": "eac7509d1637c9e50af8edb8dee712230a65775242c824b9c1258b0fde055205",
   "bad/run_rule_output_max_bytes_too_large/bundle.json": "ae19c33167afe737f38dbc4f12b485fb1b481d1f5e498e8ff8d03c63004de3ce",
-  "bad/run_rule_output_max_bytes_too_large/case.json": "03560e4f3113eae6312950f5480134720d9e07c74a1e50e43033c949ea38f39f",
+  "bad/run_rule_output_max_bytes_too_large/case.json": "9bd048d00b76fae46292ffa9d205c94b4b6d693c8c03da42d95c73613aa94ae2",
   "bad/run_rule_output_max_bytes_too_large/context.json": "a58c8e25a1ca24b16e4e0bcc4fb9d4d4d73540b0d7aeb5a97d0461c847fa6125",
   "bad/run_rule_output_max_bytes_too_large/inputs.json": "5fa7bc146aba98be4e8afc9c4f50a9d3ae10c52dc78ef47fe14f127c54cad0b6",
-  "bad/run_rule_output_max_bytes_too_large/outputs/result.json": "e5f1eb4d806641698a35efe20e098efd20d7d57a9b90ee69079d5bb650920726",
   "bad/run_rule_output_max_bytes_too_large/recipe.json": "c1ad759bd44e35f6e9d304d0e456acf014c771c868391ffef37397641885ab2f",
   "bad/run_rule_output_path_outside/bundle.json": "a9004859fcee6b51b93249eb1b7d943542e04619fc79363279de10f35dbfc26f",
-  "bad/run_rule_output_path_outside/case.json": "26c46c05c5ff2151d2074199cafefad0b86df2b516d49fcd47827601f5a595eb",
+  "bad/run_rule_output_path_outside/case.json": "c7f7a86d031a65b4c5ffab6850b62cd8772a4c0cb754430550a07b167928cb3f",
   "bad/run_rule_output_path_outside/context.json": "a58c8e25a1ca24b16e4e0bcc4fb9d4d4d73540b0d7aeb5a97d0461c847fa6125",
   "bad/run_rule_output_path_outside/inputs.json": "5fa7bc146aba98be4e8afc9c4f50a9d3ae10c52dc78ef47fe14f127c54cad0b6",
-  "bad/run_rule_output_path_outside/outputs/result.json": "ba8b22dd0d5397b17ffd605cde668d40929fced62697b44d90beaac07459c0f7",
   "bad/run_rule_output_path_outside/recipe.json": "d4b779d7bb8fb07dffa89609a409b1979df6dce66d8a6fa9e5ae2a94b5d66f2e",
   "bad/run_rule_timeout_zero/bundle.json": "dc24b5ececade0b930cb54b6834607baf9a7fd0a6aa031fb5fb60e716d9d7ebc",
   "bad/run_rule_timeout_zero/case.json": "0dae822e8e33f831aadd161de15a892e9d79437af7c1073ba8982706429b2537",
@@ -1149,10 +1147,9 @@
   "good/run_rule_inputs_8/outputs/result.json": "e5f1eb4d806641698a35efe20e098efd20d7d57a9b90ee69079d5bb650920726",
   "good/run_rule_inputs_8/recipe.json": "b7641abbe3a6664b17ec2014f3ea4f03a9dd5efa6b1ea9713a372bf0aaecb2de",
   "good/run_rule_output_max_bytes_200_mib/bundle.json": "dc30c080b1dab27d657fe75c67516569aa0749dc994cb1aaf2385abe5cd306e9",
-  "good/run_rule_output_max_bytes_200_mib/case.json": "f0f31c8e365d292337312d5234fa8732339d2187a452e61f7186cab77196f290",
+  "good/run_rule_output_max_bytes_200_mib/case.json": "b74ad934a36b783b34c3dc8df01220fdae0166801ed5a0bec48c764613fe9463",
   "good/run_rule_output_max_bytes_200_mib/context.json": "a58c8e25a1ca24b16e4e0bcc4fb9d4d4d73540b0d7aeb5a97d0461c847fa6125",
   "good/run_rule_output_max_bytes_200_mib/inputs.json": "5fa7bc146aba98be4e8afc9c4f50a9d3ae10c52dc78ef47fe14f127c54cad0b6",
-  "good/run_rule_output_max_bytes_200_mib/outputs/result.json": "e5f1eb4d806641698a35efe20e098efd20d7d57a9b90ee69079d5bb650920726",
   "good/run_rule_output_max_bytes_200_mib/recipe.json": "6b62a410cce51fa602ab57de3cd42ccda860ecb8a0fd7a48e06b835c3f157939",
   "good/run_run_id_flag_agrees/bundle.json": "d1460dde6c654fd4c23f9b00ef682b57251b7e475124544ae7c6bbff386d6039",
   "good/run_run_id_flag_agrees/case.json": "e9dbee4fbd459359a5cc99aad61b95878a4797bfd4281d87088a65bf2193d4a9",
@@ -1186,5 +1183,5 @@
   "source/trust.json": "ba26cab8bfe820365a2629fb3a59d631fcfb2c9fb458d5554bfd9009f879570e"
  },
  "root_rule": "sha256 of '<path> <sha256>' lines, sorted by path, MANIFEST.json excluded",
- "root_sha256": "577b8094b2572b1a098f41e2b6052d480e959134c1b364ac4a2bbdb0e80cd986"
+ "root_sha256": "7d89c9cbbe7795e934df920a3b44bf1f9ca8bf8a22de674cde59ab157a020226"
 }

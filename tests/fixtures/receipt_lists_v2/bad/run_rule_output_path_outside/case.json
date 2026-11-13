@@ -13,9 +13,7 @@
   "--input-sha256",
   "/work/in/run.py=ad64355106bb158b020ecf9702be48f7730fc091dd4bb6a2f092b40393495b3d",
   "--input-sha256",
-  "/work/in/data.csv=492d5ea496056f1a6a6592241032fab764c321596317930b4fa0e1e8bc3b7470",
-  "--output-file",
-  "/work/out/result.json={dir}/outputs/result.json"
+  "/work/in/data.csv=492d5ea496056f1a6a6592241032fab764c321596317930b4fa0e1e8bc3b7470"
  ],
  "description": "An output path outside /work/out/.",
  "expect": {
