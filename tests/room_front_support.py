@@ -271,7 +271,8 @@ def assert_idle(ledger) -> None:
     while time.time() < deadline:
         with ledger.lock:
             if (not getattr(ledger, "in_flight", {}) and not getattr(ledger, "busy", set())
-                    and not getattr(ledger, "touched", set()) and not getattr(ledger, "creates_in_flight", 0)):
+                    and not getattr(ledger, "touched", set()) and not getattr(ledger, "creates_in_flight", 0)
+                    and not getattr(ledger, "overflow", False)):
                 return
         time.sleep(0.01)
     with ledger.lock:
@@ -279,3 +280,4 @@ def assert_idle(ledger) -> None:
         assert getattr(ledger, "busy", set()) == set(), "a token stayed held"
         assert getattr(ledger, "touched", set()) == set(), "the touched set was not cleared"
         assert getattr(ledger, "creates_in_flight", 0) == 0, "a create stayed counted"
+        assert not getattr(ledger, "overflow", False), "the overflow mark stayed set"

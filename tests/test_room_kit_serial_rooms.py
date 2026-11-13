@@ -499,3 +499,50 @@ def test_a_full_touched_set_withholds_every_flag_until_the_creates_end(front, mo
     front.api.new_ids = ["sbx_c"]
     assert receipt_of(front.create(SERIAL)[1])["statement"]["serial"] is True
     assert_idle(front.ledger)
+
+
+# ---------------------------------------------------------------- a request that spans the create
+
+def _spanning(front: Front, request, hold_pattern: str, create_body: dict, create_id: str, request_id: str = ""):
+    """request enters and is held inside the API; the create is then sent and held; request is released and
+    completes while the create is unsigned; then the create is released. Returns the create's answer."""
+    front.api.new_ids = [create_id]
+    request_hold = front.api.hold(hold_pattern)
+    r, rbox = in_thread(request)
+    request_hold.wait_entered()
+    create_hold = front.api.hold(r"POST /v1/sandboxes")
+    c, cbox = in_thread(front.create, create_body)
+    create_hold.wait_entered()
+    request_hold.release.set()
+    finish(r, rbox)
+    create_hold.release.set()
+    return finish(c, cbox)
+
+
+def test_a_write_in_flight_before_the_create_that_ends_before_it_is_signed_withholds_the_flag(front) -> None:
+    status, headers, _out = _spanning(
+        front, lambda: front.call("PUT", "/v1/sandboxes/sbx_x/tar?path=/work", b"tar"),
+        r"PUT /v1/sandboxes/sbx_x/tar", SERIAL, "sbx_x", "sbx_x")
+    statement = receipt_of(headers)["statement"]
+    assert status == 200 and "serial" not in statement and statement["room_sequence"] == 1
+    assert "sbx_x" not in front.ledger.serial
+    assert_idle(front.ledger)
+
+
+def test_an_unrelated_request_spanning_the_create_leaves_the_new_rooms_flag(front) -> None:
+    _status, headers, _out = _spanning(
+        front, lambda: front.call("PUT", "/v1/sandboxes/sbx_other/tar?path=/work", b"tar"),
+        r"PUT /v1/sandboxes/sbx_other/tar", SERIAL, "sbx_new", "sbx_other")
+    assert receipt_of(headers)["statement"]["serial"] is True and "sbx_new" in front.ledger.serial
+    assert front.delete("sbx_new")[0] == 200
+    assert_idle(front.ledger)
+
+
+def test_a_read_spanning_the_create_leaves_the_flag(front) -> None:
+    front.api.rooms.add("sbx_x")
+    _status, headers, _out = _spanning(
+        front, lambda: front.call("GET", "/v1/sandboxes/sbx_x/logs"),
+        r"GET /v1/sandboxes/sbx_x/logs", SERIAL, "sbx_x", "sbx_x")
+    assert receipt_of(headers)["statement"]["serial"] is True
+    assert front.delete("sbx_x")[0] == 200
+    assert_idle(front.ledger)
