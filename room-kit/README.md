@@ -146,8 +146,8 @@ signed request at a time, so the order of its receipts is the order things ran.
   request for that room's id was in flight at any moment between the create
   being sent and its receipt being signed (an unsigned write counts, and so
   does a request the API refused). Otherwise the room is an ordinary room. The
-  front remembers such ids only while a create is pending; if more than 4,096
-  pile up, no create is flagged until the pending creates end.
+  front remembers such ids only while a create is pending; once 4,096 are held,
+  the next one withholds every flag until the pending creates end.
 - A second signed request while one runs is refused at once with 409
   `room_busy` and is not sent on. The turn ends after the receipt is signed and
   before the answer is written.
@@ -157,11 +157,19 @@ signed request at a time, so the order of its receipts is the order things ran.
   signed route or a delete, the front's own sealed secrets and sealed exec
   included, is refused with 409 `room_serial_unsigned`.
 - On a serial room each request is sent to the API once, a read or a signed
-  GET included (an ordinary room retries a GET whose answer was lost). A
-  request that reached the API and was not answered is signed as a 502, and a
-  request whose receipt was not signed leaves no receipt: either breaks the
-  serial room, so every later request but a delete gets 409 `room_broken`. A
-  2xx delete ends the room and every mark kept for it.
+  GET included (an ordinary room retries a GET whose answer was lost). A read
+  whose answer is lost answers 502, signs nothing and does not break the room
+  (a read holds no token). A signed request or a delete that reached the API
+  and was not answered is signed as a 502, and a signed request whose receipt
+  could not be signed leaves none: either breaks the room.
+- Once a room is broken, every request that names it, a read included, gets
+  409 `room_broken` and is not sent on, except a delete. The room's receipt
+  list (`GET /v1/sandboxes/<id>/receipts`) is answered before that and can
+  still be read. A 2xx delete ends the room and every mark kept for it.
+- Limit: a bulk delete by label (`DELETE /v1/sandboxes?label=...`) names no
+  room and is not held back by a busy serial room, so clean-up by label keeps
+  working. A room it removes ends with a `room_end` receipt at a later look,
+  and any create whose pending time it overlaps gets no flag.
 
 An ordinary room runs requests side by side, as before.
 

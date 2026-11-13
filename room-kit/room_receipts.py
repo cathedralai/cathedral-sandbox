@@ -2057,6 +2057,9 @@ class Ledger:
         self.creates_in_flight = 0
         self.touched: set[str] = set()
         self.overflow = False
+        # A bulk delete by label names no room, so it cannot be matched to a pending create. One that is in
+        # flight at any moment while a create is pending withholds every flag (it sets overflow, at both ends).
+        self.bulk_in_flight = 0
         self.head = self.binding_sha256
         os.makedirs(store, mode=0o700, exist_ok=True)
         self.store = open(os.path.join(store, f"chain-{self.binding['boot_id']}.jsonl"), "ab", buffering=0)
@@ -2144,6 +2147,20 @@ class Ledger:
     def begin_create(self) -> None:
         with self.lock:
             self.creates_in_flight += 1
+            if self.bulk_in_flight:
+                self.overflow = True
+
+    def begin_bulk(self) -> None:
+        with self.lock:
+            self.bulk_in_flight += 1
+            if self.creates_in_flight:
+                self.overflow = True
+
+    def end_bulk(self) -> None:
+        with self.lock:
+            self.bulk_in_flight = max(0, self.bulk_in_flight - 1)
+            if self.creates_in_flight:
+                self.overflow = True
 
     def end_create(self) -> None:
         with self.lock:
@@ -2323,10 +2340,12 @@ class Handler(BaseHTTPRequestHandler):
 
     turn: Turn | None = None
     create_open = False  # a create was forwarded and its receipt is not yet signed
+    bulk_open = False  # a bulk delete was forwarded and has not been answered
 
     def handle_one_request(self):
         self.turn = None
         self.create_open = False
+        self.bulk_open = False
         try:
             super().handle_one_request()
         finally:
@@ -2340,6 +2359,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.create_open:
             self.create_open = False
             self.server.ledger.end_create()
+        if self.bulk_open:
+            self.bulk_open = False
+            self.server.ledger.end_bulk()
 
     # -- helpers
     def reply(self, status: int, body: bytes, headers: dict | None = None, ctype="application/json"):
@@ -2534,6 +2556,9 @@ class Handler(BaseHTTPRequestHandler):
             if action == "create" and self.authorized():
                 ledger.begin_create()
                 self.create_open = True
+            elif action == "bulk_delete" and self.authorized():
+                ledger.begin_bulk()
+                self.bulk_open = True
             status, headers, out = self.upstream(
                 self.server.api_port, body,
                 **({"timeout": plain_exec_wait(body)} if action == "exec" else {}))
