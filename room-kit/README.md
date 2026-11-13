@@ -146,8 +146,9 @@ signed request at a time, so the order of its receipts is the order things ran.
   request for that room's id was in flight at any moment between the create
   being sent and its receipt being signed (an unsigned write counts, and so
   does a request the API refused). Otherwise the room is an ordinary room. The
-  front remembers such ids only while a create is pending; once 4,096 are held,
-  the next one withholds every flag until the pending creates end.
+  front remembers such ids only while a create is pending; the set holds at
+  most 4,096 ids, and a further id that has to be remembered withholds every
+  flag until the pending creates end.
 - A second signed request while one runs is refused at once with 409
   `room_busy` and is not sent on. The turn ends after the receipt is signed and
   before the answer is written.
@@ -170,6 +171,15 @@ signed request at a time, so the order of its receipts is the order things ran.
   room and is not held back by a busy serial room, so clean-up by label keeps
   working. A room it removes gets no receipt of its own, and any create whose
   pending time it overlaps gets no flag.
+- Limit: routes that name no room are not room requests. They are not held
+  back by a serial room and are not in its list. That covers secrets (`PUT`
+  and `DELETE /v1/secrets/<name>` change what the later outbound requests of
+  a room whose network policy references that secret carry), workspaces (a
+  room that mounts a shared workspace can be changed through another room of
+  the same owner that mounts it), and listing calls (`GET /v1/sandboxes` and
+  `GET /v1/quota` run the API's own expiry collection). A serial room that
+  needs its list to be everything that could change it mounts no shared
+  workspace and references no hotel secret.
 
 An ordinary room runs requests side by side, as before.
 

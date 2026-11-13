@@ -2138,11 +2138,12 @@ class Ledger:
 
     def _touch(self, room: str) -> None:
         """Remember a non-read request for an id with no create receipt while a create is pending. Caller holds self.lock."""
-        if self.creates_in_flight and room not in self.by_room:
-            if len(self.touched) >= TOUCHED_CAP:
-                self.overflow = True
-            else:
-                self.touched.add(room)
+        if not self.creates_in_flight or room in self.by_room or room in self.touched:
+            return
+        if len(self.touched) >= TOUCHED_CAP:
+            self.overflow = True  # a further id has to be remembered and does not fit
+        else:
+            self.touched.add(room)
 
     def begin_create(self) -> None:
         with self.lock:
