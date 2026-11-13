@@ -1344,7 +1344,7 @@ def run_validity_cases(pack: Pack) -> None:
     good("run_rule_command_128", "A command of 128 strings.", truth_edit=req(command=["true"] * 128))
     bad("run_rule_env_too_many", "An environment of 65 entries.", {"reason": "recipe: env must hold at most 64 entries"},
         truth_edit=req(env={f"K{i}": "v" for i in range(65)}))
-    ins = lambda n: [{"path": f"/work/in/f{i}.bin", "mode": "644"} for i in range(n)]  # noqa: E731
+    ins = lambda n: [{"path": f"/work/in/f{i}.bin", "mode": "644"} for i in range(n)]
     bad("run_rule_inputs_too_many", "Nine inputs.", {"reason": "recipe: inputs must hold at most 8 entries"},
         truth_edit=req(inputs=ins(9)))
     good("run_rule_inputs_8", "Eight inputs.", truth_edit=req(inputs=ins(8)))
