@@ -1,0 +1,4 @@
+{
+  "keys": ["image", "resources", "network", "ttl_seconds", "labels"],
+  "label_keys": ["cathedral_sandbox_id", "cathedral_serial", "broker_guest", "broker_batch"]
+}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"sync/atomic"
 	"testing"
 )
@@ -201,4 +202,51 @@ func TestCreateRequestBytesIgnoredOnCompat(t *testing.T) {
 		t.Fatalf("compat answer carries create_request_b64: %v", doc)
 	}
 	_ = atomic.LoadInt32
+}
+
+// oneshot_create_keys.json lists the keys a one-shot create may hold as the
+// hotel receives it. The verifier of the returned bytes reads the same list,
+// so a key the broker adds must be added there in the same change.
+func TestOneshotCreateKeysMatchBrokerOutput(t *testing.T) {
+	raw, err := os.ReadFile("oneshot_create_keys.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var list struct {
+		Keys      []string `json:"keys"`
+		LabelKeys []string `json:"label_keys"`
+	}
+	if err := json.Unmarshal(raw, &list); err != nil {
+		t.Fatal(err)
+	}
+	tc := newChain(t)
+	resp, doc := createWithAsk(t, tc, map[string]any{
+		"image":       "alpine:3.20",
+		"hotels":      []string{"b"},
+		"resources":   map[string]any{"vcpu": 1, "memory_gib": 1},
+		"network":     "deny_all",
+		"ttl_seconds": 600,
+		"labels":      map[string]any{"cathedral_sandbox_id": "sbx-test", "cathedral_serial": "1"},
+	}, true, "")
+	if resp.StatusCode != 202 {
+		t.Fatalf("create: %d %v", resp.StatusCode, doc)
+	}
+	var sent map[string]any
+	if err := json.Unmarshal(lastCreateBody(tc.hotels["b"]), &sent); err != nil {
+		t.Fatal(err)
+	}
+	allowed := func(have map[string]any, names []string, what string) {
+		ok := map[string]bool{}
+		for _, n := range names {
+			ok[n] = true
+		}
+		for k := range have {
+			if !ok[k] {
+				t.Errorf("the hotel got %s %q, which is not in oneshot_create_keys.json", what, k)
+			}
+		}
+	}
+	allowed(sent, list.Keys, "key")
+	labels, _ := sent["labels"].(map[string]any)
+	allowed(labels, list.LabelKeys, "label")
 }
