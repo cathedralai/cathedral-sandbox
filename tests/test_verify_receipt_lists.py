@@ -166,3 +166,86 @@ def test_pool_rooms_function_reports_states_and_stays_empty_without_a_pool_creat
     assert states == {"pool_room_claimed": "claimed", "pool_room_unclaimed": "unclaimed",
                       "pool_room_claim_failed": "closed", "pool_room_retired_unclaimed": "retired"}
     assert vr.pool_rooms(_case_receipts("good/numbered_rooms_interleaved")) == {}
+
+
+def _run_cli(*argv: str) -> tuple[int, str, str]:
+    import subprocess
+
+    proc = subprocess.run([sys.executable, str(CHECKER), *argv], capture_output=True, text=True, check=False)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def test_python_create_keys_equal_the_shared_key_list() -> None:
+    """The broker and every checker read one list of create keys; a missing list fails, it does not skip."""
+    shared = json.loads((ROOT / "broker" / "oneshot_create_keys.json").read_text())
+    vr = _load_checker()
+    assert list(vr.ONESHOT_CREATE_KEYS) == shared["keys"]
+    assert list(vr.ONESHOT_LABEL_KEYS) == shared["label_keys"]
+
+
+def test_a_path_with_space_plus_amp_equals_percent_tilde_and_a_non_ascii_letter_has_the_go_query_form() -> None:
+    """Go's url.Values.Encode: sorted keys, upper-case hex, space as +, ~ kept. The same string is in the Go pack."""
+    vr = _load_checker()
+    path = "/work/in/a b+c&d=e%f~ü.txt"
+    want = "path=%2Fwork%2Fin%2Fa+b%2Bc%26d%3De%25f~%C3%BC.txt"
+    assert vr.file_query({"path": path, "mode": "600"}) == "mode=600&" + want
+    assert vr.put_target("r1", "644", path) == "PUT /v1/sandboxes/r1/files?mode=644&" + want
+    assert vr.get_target("r1", 10, path) == "GET /v1/sandboxes/r1/files?max_bytes=10&" + want
+
+
+def test_the_synthetic_chain_verifies_offline_and_a_changed_report_does_not() -> None:
+    """verify_amd with the certificates from a file: the first offline test of the chain and report signature."""
+    import base64
+    import copy
+
+    vr = _load_checker()
+    amd = PACK / "source" / "amd"
+    certs = json.loads((amd / "certs.json").read_text())
+    report = base64.b64decode(json.loads((amd / "report.json").read_text())["report_b64"])
+    pin = (amd / "ark_sha256.txt").read_text().strip()
+    out = vr.verify_amd(report, vr.parse_report(report), "Milan", "", [pin], certs)
+    assert out["ark_sha256"] == pin
+    with pytest.raises(vr.Fail, match="differs from the pinned value"):
+        vr.verify_amd(report, vr.parse_report(report), "Milan", "", ["00" * 32], certs)
+    forged = bytearray(report)
+    forged[0x2A0 + 5] ^= 1
+    with pytest.raises(vr.Fail, match="report signature does not verify"):
+        vr.verify_amd(bytes(forged), vr.parse_report(bytes(forged)), "Milan", "", [pin], certs)
+    swapped = copy.deepcopy(certs)
+    swapped["vcek"] = swapped["ask"]
+    with pytest.raises((vr.Fail, vr.InvalidSignature)):
+        vr.verify_amd(report, vr.parse_report(report), "Milan", "", [pin], swapped)
+
+
+def test_run_mode_takes_no_hotel_flags_and_a_missing_oneshot_file_is_a_json_fail() -> None:
+    code, _, err = _run_cli("--oneshot", "x.json", "--receipts", "y.json")
+    assert code == 2 and "--oneshot checks one file" in err
+    folder = PACK / "good" / "run_held_output_proven_exit_code"
+    code, out, _ = _run_cli("--oneshot", str(folder / "missing.json"), "--recipe", str(folder / "recipe.json"),
+                            "--no-context", "--ark-sha256", "00" * 32, "--expected-measurement", "ab" * 48)
+    assert code == 1 and json.loads(out) == {"verdict": "FAIL",
+                                              "reason": f"inputs: cannot read the one-shot file {folder}/missing.json"}
+
+
+def test_strict_json_refuses_repeated_keys_and_numbers_that_are_not_integers() -> None:
+    vr = _load_checker()
+    assert vr.strict_json(b'{"a":1,"b":[2,3]}', "p", "x") == {"a": 1, "b": [2, 3]}
+    for raw, text in ((b'{"a":1,"a":2}', "repeats the key 'a'"), (b'{"a":1.5}', "holds the number 1.5"),
+                      (b'{"a":1e3}', "holds the number 1e3"), (b'{"a":NaN}', "holds the number NaN"),
+                      (b"{", "is not JSON")):
+        with pytest.raises(vr.Fail, match=text):
+            vr.strict_json(raw, "p", "x")
+
+
+def test_a_single_expected_measurement_keeps_its_message_and_several_use_the_list_message() -> None:
+    folder = PACK / "good" / "numbered_rooms_interleaved"
+    base = ["--attestation", str(folder / "attestation_doc.json"), "--receipts", str(folder / "receipts.json"),
+            "--skip-amd"]
+    code, out, _ = _run_cli(*base, "--expected-measurement", "00" * 48)
+    assert code == 1 and json.loads(out)["reason"] == "measurement differs from the expected build"
+    code, out, _ = _run_cli(*base, "--expected-measurement", "00" * 48, "--expected-measurement", "11" * 48)
+    assert code == 1 and json.loads(out)["reason"] == "measurement is not one of the allowed measurements"
+    trust = json.loads((PACK / "source" / "trust.json").read_text())
+    code, out, _ = _run_cli(*base, "--expected-measurement", "00" * 48, "--expected-measurement",
+                            trust["measurements"][0])
+    assert code == 0 and json.loads(out)["verdict"] == "PASS"
