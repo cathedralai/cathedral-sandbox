@@ -18,6 +18,8 @@ source "$ENV_FILE"
 source "$KIT/sealed/guest-constants.sh"
 log() { echo "[sealed] $*"; }
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+# Same cap as launch-guest.sh and guest-boot.sh, checked before the image build.
+[[ "${SEALED_NAME:-}" =~ ^[a-z0-9][a-z0-9-]{0,58}$ ]] || { echo "SEALED_NAME must match ^[a-z0-9][a-z0-9-]{0,58}$ (59 bytes max)" >&2; exit 1; }
 UNIT=room-sealed-$SEALED_NAME.service
 SNP_MEASURE_VERSION=0.0.12
 

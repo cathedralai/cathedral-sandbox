@@ -25,7 +25,7 @@ read_hotel_name() {
   for _ in $(seq 30); do [ -r "$f" ] && break; sleep 1; done
   [ -r "$f" ] || { log "no hotel name in fw_cfg (opt/cathedral/hotel-name); refusing to start"; return 1; }
   name=$(cat "$f")
-  [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { log "hotel name in fw_cfg is not valid (want ^[a-z0-9][a-z0-9-]{0,62}$); refusing to start"; return 1; }
+  [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,58}$ ]] || { log "hotel name in fw_cfg is not valid (want ^[a-z0-9][a-z0-9-]{0,58}$); refusing to start"; return 1; }
   printf '%s' "$name"
 }
 ROOM_HOTEL_NAME=$(read_hotel_name /sys/firmware/qemu_fw_cfg/by_name/opt/cathedral/hotel-name/raw)

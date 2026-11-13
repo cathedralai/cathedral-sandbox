@@ -100,13 +100,13 @@ def test_guest_boot_reads_and_exports_the_name_before_install() -> None:
     assert text.index("export ROOM_HOTEL_NAME") < text.index("/opt/room-kit/install.sh /opt/room-kit/room.env")
 
 
-@pytest.mark.parametrize("raw", [b"hotel-a", b"hotel-a\n", b"c46-sealed"])
+@pytest.mark.parametrize("raw", [b"hotel-a", b"hotel-a\n", b"c46-sealed", b"a" * 59])
 def test_guest_boot_accepts_a_valid_name(tmp_path: Path, raw: bytes) -> None:
     proc = _read_hotel_name(tmp_path, raw)
     assert proc.returncode == 0 and proc.stdout == raw.decode().strip()
 
 
-@pytest.mark.parametrize("raw", [None, b"", b"Hotel", b"-a", b"a b", b"a;rm", b"a" * 64, b"a\nb"])
+@pytest.mark.parametrize("raw", [None, b"", b"Hotel", b"-a", b"a b", b"a;rm", b"a" * 60, b"a" * 64, b"a\nb"])
 def test_guest_boot_fails_closed_without_a_valid_name(tmp_path: Path, raw: bytes | None) -> None:
     proc = _read_hotel_name(tmp_path, raw)
     assert proc.returncode == 1 and proc.stdout == ""
@@ -127,3 +127,25 @@ def test_the_name_lands_in_the_attested_binding(tmp_path: Path, monkeypatch) -> 
     assert a.binding["measurement"] == b.binding["measurement"]
     assert a.binding_sha256 != b.binding_sha256
     assert a.report[0x50:0x70] == bytes.fromhex(a.binding_sha256)
+
+
+def _launch_name_check(name: str) -> subprocess.CompletedProcess[str]:
+    line = next(l for l in (SEALED / "launch-guest.sh").read_text().splitlines() if l.startswith('[[ "${SEALED_NAME:-}"'))
+    return subprocess.run([BASH, "-c", f"set -euo pipefail\nSEALED_NAME={name}\n{line}\necho ok"], capture_output=True, text=True, timeout=30)
+
+
+def test_launch_accepts_a_59_byte_name_and_refuses_60() -> None:
+    ok = _launch_name_check("a" * 59)
+    assert ok.returncode == 0 and ok.stdout.strip() == "ok"
+    bad = _launch_name_check("a" * 60)
+    assert bad.returncode == 1 and "SEALED_NAME must match" in bad.stderr
+
+
+def test_a_59_byte_name_gives_a_hostname_within_the_limit() -> None:
+    assert len("room-" + "a" * 59) == 64
+
+
+def test_install_checks_the_name_cap_before_the_build() -> None:
+    text = (SEALED / "install-sealed.sh").read_text()
+    assert "{0,58}$" in text and "{0,62}" not in text
+    assert text.index("SEALED_NAME must match") < text.index("\"$KIT/sealed/build-guest.sh\"")

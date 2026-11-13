@@ -7,7 +7,8 @@ source "$(readlink -f "${1:?sealed.env}")"
 # shellcheck disable=SC1091
 source "$(dirname "$(readlink -f "$0")")/guest-constants.sh"
 # The name is the broker hotel id and rides fw_cfg, never the measured image.
-[[ "${SEALED_NAME:-}" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "SEALED_NAME must match ^[a-z0-9][a-z0-9-]{0,62}$" >&2; exit 1; }
+# Max 59 bytes so "room-" + name fits the 64 byte hostname limit.
+[[ "${SEALED_NAME:-}" =~ ^[a-z0-9][a-z0-9-]{0,58}$ ]] || { echo "SEALED_NAME must match ^[a-z0-9][a-z0-9-]{0,58}$" >&2; exit 1; }
 IMG=$(readlink -f "$SEALED_DIR/images/current")
 RUN=$SEALED_DIR/run
 mkdir -p "$RUN"
