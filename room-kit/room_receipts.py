@@ -2038,6 +2038,14 @@ class Ledger:
         # Room id -> receipt_sha256 of its last successful create receipt, until a
         # successful delete of the room is signed (sealed secrets bind to it).
         self.incarnations: dict[str, str] = {}
+        # Serial rooms (all guarded by self.lock). in_flight counts the authorized requests between enter and
+        # leave; busy is the per-room token (taken without waiting, so nothing queues and nothing can deadlock),
+        # always a subset of the in_flight keys; serial holds the rooms whose create was signed serial; broken the
+        # rooms that lost or never signed an action. Marks go when a 2xx delete is signed.
+        self.in_flight: dict[str, int] = {}
+        self.busy: set[str] = set()
+        self.serial: set[str] = set()
+        self.broken: set[str] = set()
         self.head = self.binding_sha256
         os.makedirs(store, mode=0o700, exist_ok=True)
         self.store = open(os.path.join(store, f"chain-{self.binding['boot_id']}.jsonl"), "ab", buffering=0)
@@ -2087,12 +2095,57 @@ class Ledger:
         with self.lock:
             return self.incarnations.get(room)
 
-    def sign(self, fields: dict) -> dict:
-        with self.lock:
-            return self._sign_locked(fields)
+    def enter(self, room: str, kind: str) -> tuple[Turn | None, tuple[int, str, str] | None]:
+        """Admit one authorized request for *room*: (turn, None), or (None, (status, code, message)).
 
-    def _sign_locked(self, fields: dict) -> dict:
-        """Sign and append one receipt. The caller holds self.lock."""
+        One locked step checks the room's marks, takes the token when the room needs one and counts the
+        request. A busy room is refused at once, never waited on.
+        """
+        with self.lock:
+            token = False
+            if room in self.broken:
+                if kind != "delete":
+                    return None, (409, "room_broken", "this room lost an answer; only a delete is accepted")
+                token = True
+            elif room in self.serial:
+                if kind in ("signed", "delete"):
+                    token = True
+                elif kind != "read":
+                    return None, (409, "room_serial_unsigned", "a serial room accepts signed requests and reads only")
+            if token and room in self.busy:
+                return None, (409, "room_busy", "this room is running another request")
+            if token:
+                self.busy.add(room)
+            self.in_flight[room] = self.in_flight.get(room, 0) + 1
+            return Turn(room, token, len(self.by_room.get(room, []))), None
+
+    def leave(self, turn: Turn) -> None:
+        """End a turn: break a serial room that lost an answer or left an action unsigned, free the token, lower the count."""
+        with self.lock:
+            room = turn.room
+            if turn.token and room in self.serial:
+                signed = len(self.by_room.get(room, [])) > turn.receipts_before
+                if turn.lost or (turn.called and not signed):
+                    self.broken.add(room)
+            if turn.token:
+                self.busy.discard(room)
+            left = self.in_flight.get(room, 0) - 1
+            if left > 0:
+                self.in_flight[room] = left
+            else:
+                self.in_flight.pop(room, None)
+
+    def sign(self, fields: dict, create: dict | None = None) -> dict:
+        with self.lock:
+            return self._sign_locked(fields, create)
+
+    def _sign_locked(self, fields: dict, create: dict | None = None) -> dict:
+        """Sign and append one receipt. The caller holds self.lock.
+
+        *create* is what the create request asked for. A 2xx create that asked for a serial room is signed
+        serial only as the room's receipt 1 with no request in flight for it, so no request ran in the room
+        before the flag.
+        """
         statement = {"schema": self.receipt_schema, "binding_sha256": self.binding_sha256, "hotel": self.hotel,
                      "operation_id": str(uuid.uuid4()), "sequence": len(self.chain) + 1,
                      "previous_receipt_sha256": self.head, "issued_at": int(time.time()), **fields}
@@ -2103,6 +2156,11 @@ class Ledger:
             earlier = self.by_room.get(named, [])
             statement["room_sequence"] = len(earlier) + 1
             statement["room_previous_receipt_sha256"] = self.chain[earlier[-1]]["receipt_sha256"] if earlier else None
+        status = statement.get("status")
+        ok = isinstance(status, int) and 200 <= status < 300
+        if create and ok and statement.get("action") == "create" and isinstance(named, str) and named:
+            if create.get("serial") and not self.in_flight.get(named) and named not in self.by_room:
+                statement["serial"] = True
         receipt = {"statement": statement, "signature_b64": b64(self.key.sign(canonical(statement))),
                    "receipt_sha256": sha(canonical(statement))}
         self.head = receipt["receipt_sha256"]
@@ -2110,13 +2168,17 @@ class Ledger:
         room = statement.get("sandbox_id")
         if room:
             self.by_room.setdefault(room, []).append(len(self.chain) - 1)
-            status, action = statement.get("status"), statement.get("action")
-            if isinstance(status, int) and 200 <= status < 300:
+            action = statement.get("action")
+            if ok:
                 # The same rule as create_receipt(): the last successful create names the room.
                 if action == "create":
                     self.incarnations[room] = receipt["receipt_sha256"]
+                    if statement.get("serial"):
+                        self.serial.add(room)
                 elif action == "delete":
                     self.incarnations.pop(room, None)
+                    self.serial.discard(room)
+                    self.broken.discard(room)
         self.store.write(canonical(receipt) + b"\n")
         return receipt
 
@@ -2143,9 +2205,59 @@ OWNER_GATED = [  # (method, path pattern, action in the signed message)
     ("POST", re.compile(r"^/v1/sandboxes$"), "create"),
     ("POST", re.compile(r"^/v1/images/build$"), "build"),
 ]
+# Serial rooms. A create that carries SERIAL_LABEL = "1" makes a room that runs one signed request at a
+# time, so the order of its receipts is the order things ran. The labels are ours: the API refuses them
+# from customers.
+SERIAL_LABEL = "cathedral_serial"
+POOL_LABEL = "cathedral_pool"
+ROOM_PATH = re.compile(r"^/v1/sandboxes/(?P<id>[^/]+)(?:/|$)")
+# What a serial room lets through unsigned: requests that read the room and change nothing. A route on no
+# list here is refused, so a route added later is closed until it is listed. A terminal's output is not a
+# read: reading it clears its buffer.
+READS = [  # (method, path pattern)
+    ("GET", re.compile("^" + ROOM + r"$")),
+    ("POST", re.compile("^" + ROOM + r"/wait$")),
+    ("GET", re.compile("^" + ROOM + r"/logs$")),
+    ("GET", re.compile("^" + ROOM + r"/stat$")),
+    ("GET", re.compile("^" + ROOM + r"/tar$")),
+    ("GET", re.compile("^" + ROOM + r"/desktop$")),
+    ("GET", re.compile("^" + ROOM + r"/terminals$")),
+    ("GET", re.compile("^" + ROOM + r"/processes/[^/]+/logs$")),
+    ("GET", re.compile("^" + ROOM + r"/sealed-secrets$")),
+    ("GET", re.compile("^" + ROOM + r"/sealed-env$")),
+    ("GET", re.compile("^" + ROOM + r"/entries$")),
+]
 HEX64 = re.compile(r"[0-9a-fA-F]{128}")
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
        "proxy-authenticate", "content-length", "host"}
+
+
+def room_of(path: str) -> str | None:
+    """The room id a request path names, or None for a path with no room."""
+    m = ROOM_PATH.match(path)
+    return m["id"] if m else None
+
+
+def route_kind(method: str, path: str) -> str:
+    """How the gate sees a request that names a room: delete, signed (a row of SIGNED), read or other."""
+    if method == "DELETE" and re.match("^" + ROOM + "$", path):
+        return "delete"
+    if any(meth == method and pat.match(path) for meth, pat, _action in SIGNED):
+        return "signed"
+    if any(meth == method and pat.match(path) for meth, pat in READS):
+        return "read"
+    return "other"
+
+
+class Turn:
+    """One authorized request between Ledger.enter and Ledger.leave."""
+
+    __slots__ = ("room", "token", "receipts_before", "called", "lost")
+
+    def __init__(self, room: str, token: bool, receipts_before: int) -> None:
+        self.room, self.token, self.receipts_before = room, token, receipts_before
+        self.called = False  # a request went to the API
+        self.lost = False  # the API gave no answer
 
 
 class Upstreams(threading.local):
@@ -2168,8 +2280,26 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # no request logs
         pass
 
+    turn: Turn | None = None
+
+    def handle_one_request(self):
+        self.turn = None
+        try:
+            super().handle_one_request()
+        finally:
+            self.release_turn()
+
+    def release_turn(self) -> None:
+        """Give back the request's count and token. Safe to call twice."""
+        turn, self.turn = self.turn, None
+        if turn is not None:
+            self.server.ledger.leave(turn)
+
     # -- helpers
     def reply(self, status: int, body: bytes, headers: dict | None = None, ctype="application/json"):
+        # The turn ends after the receipt is signed and before the answer is written, so a caller that
+        # sends its next request on seeing this answer finds the room free.
+        self.release_turn()
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -2200,6 +2330,8 @@ class Handler(BaseHTTPRequestHandler):
             headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
             headers["Authorization"] = "Bearer " + self.server.api_key.decode()
         method, path = method or self.command, path or self.path
+        if self.turn is not None:
+            self.turn.called = True
         if method not in ("GET", "HEAD"):
             # A write may have run before its answer was lost, so it is never
             # sent twice: a fresh connection (no stale keep-alive) and no
@@ -2210,6 +2342,8 @@ class Handler(BaseHTTPRequestHandler):
                 r = c.getresponse()
                 return r.status, r.getheaders(), r.read()
             except (http.client.HTTPException, OSError):
+                if self.turn is not None:
+                    self.turn.lost = True
                 return 502, [], b'{"error":{"code":"hotel_api_no_answer","message":"the API did not answer; the request may have run"}}'
             finally:
                 c.close()
@@ -2298,6 +2432,13 @@ class Handler(BaseHTTPRequestHandler):
                 # The API behind accepts the internal key the front adds, so the
                 # front is the gate for every call it passes on.
                 return self.reply(401, b'{"error":"unauthorized"}')
+        room = room_of(path)
+        if room and self.authorized():
+            # Callers without the key are not counted: they never hold a token, and the API refuses them.
+            self.turn, refusal = ledger.enter(room, route_kind(self.command, path))
+            if refusal is not None:
+                status, code, message = refusal
+                return self.reply(status, canonical({"error": {"code": code, "message": message}}))
         m = SECRETS_ROUTE.match(path)
         if m:
             # Never passed to the API: the envelope stops here, opened or refused.
@@ -2335,6 +2476,11 @@ class Handler(BaseHTTPRequestHandler):
             # One create, one room, so each room's list holds its own create. Refused unsent and unsigned,
             # as the surrogate refusal above is.
             return self.reply(400, b'{"error":{"code":"create_count_refused","message":"a create makes one room"}}')
+        create_ask = None
+        if refusal is None and action == "create":
+            problem, create_ask = self.reserved_label_check(body)
+            if problem is not None:
+                return self.reply(400, canonical({"error": {"code": problem[0], "message": problem[1]}}))
         if refusal is not None:
             status, headers, out = 403, [], refusal
         else:
@@ -2345,7 +2491,8 @@ class Handler(BaseHTTPRequestHandler):
         if action and self.authorized():
             try:
                 extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(ledger.sign(
-                    {**self.fields(action, path, body, status, out), **owner_fields}))).decode()
+                    {**self.fields(action, path, body, status, out), **owner_fields},
+                    **({"create": create_ask} if create_ask else {})))).decode()
             except Exception as exc:  # noqa: BLE001 the action ran: answer, and say the receipt is missing
                 traceback.print_exc()
                 extra["X-Room-Receipt-Error"] = type(exc).__name__
@@ -2364,6 +2511,25 @@ class Handler(BaseHTTPRequestHandler):
         ctype = next((v for k, v in headers if k.lower() == "content-type"), "application/json")
         passthrough = {k: v for k, v in headers if k.lower() not in HOP and k.lower() != "content-type"}
         return self.reply(status, out, {**passthrough, **extra}, ctype)
+
+    def reserved_label_check(self, body: bytes | None) -> tuple[tuple[str, str] | None, dict | None]:
+        """(refusal, ask) for a create. The ask says what the create requested, for the signing step.
+
+        The serial label must be the string "1", alone (not with the pool label). A serial create always
+        makes a new room, so it carries no Idempotency-Key.
+        """
+        try:
+            doc = json.loads(body or b"")
+        except (ValueError, RecursionError):
+            return None, None
+        labels = doc.get("labels") if isinstance(doc, dict) else None
+        if not isinstance(labels, dict) or SERIAL_LABEL not in labels:
+            return None, None
+        if labels[SERIAL_LABEL] != "1" or type(labels[SERIAL_LABEL]) is not str or POOL_LABEL in labels:
+            return ("reserved_label_invalid", f"{SERIAL_LABEL} must be the string 1 and not set with {POOL_LABEL}"), None
+        if self.headers.get_all("Idempotency-Key") is not None:
+            return ("idempotency_key_refused", "a serial room is made without an Idempotency-Key"), None
+        return None, {"serial": True}
 
     @staticmethod
     def asks_for_other_than_one_room(body: bytes | None) -> bool:

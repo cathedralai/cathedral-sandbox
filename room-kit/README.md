@@ -133,6 +133,31 @@ A create that asks for more than one room (`count` other than the integer 1)
 is refused with 400 `create_count_refused`, unsent and unsigned, so each room's
 list holds its own create.
 
+### Serial rooms
+
+A create whose labels carry `cathedral_serial` = `"1"` makes a serial room: one
+signed request at a time, so the order of its receipts is the order things ran.
+
+- The label value must be the string `1`, and not set together with
+  `cathedral_pool`: 400 `reserved_label_invalid`. A serial create carries no
+  `Idempotency-Key` header (an empty one counts): 400 `idempotency_key_refused`.
+- The create receipt carries `serial: true` when it is the room's receipt 1 and
+  no request for that room id was in flight when it was signed. Otherwise the
+  room is an ordinary room.
+- A second signed request while one runs is refused at once with 409
+  `room_busy` and is not sent on. The turn ends after the receipt is signed and
+  before the answer is written.
+- Reads (GET of the room, `/wait`, `/logs`, `/stat`, `/tar`, `/desktop`,
+  `/terminals`, a process's `/logs`, `sealed-secrets`, `sealed-env`, `/entries`)
+  pass without a token and leave no receipt. Every other route that is not a
+  signed route or a delete, the front's own sealed secrets and sealed exec
+  included, is refused with 409 `room_serial_unsigned`.
+- A request that reached the API and was not answered, or whose receipt was
+  not signed, breaks the room: every later request but a delete gets 409
+  `room_broken`. A 2xx delete ends the room and every mark kept for it.
+
+An ordinary room runs requests side by side, as before.
+
 ### Fresh report over caller data (sealed only)
 
 `POST /room/attest` on the receipt front asks the processor for a new SNP
