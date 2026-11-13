@@ -664,7 +664,8 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
              drop=(), create_body=None, exec_body=None, bundle_edit=None, args_edit=None, absent=(),
              held=(RESULT_PATH,), inline=(LOG_PATH,), held_bytes=None, caller_hashes=None, exec_response="proven",
              numbered=True, room=RUN_ROOM, no_context_arg=False, input_files=(), truth_context=None,
-             extra_files=None, bundle_raw=None, recipe_raw=None, context_raw=None):
+             extra_files=None, bundle_raw=None, recipe_raw=None, context_raw=None, file_bytes=None):
+    fb = {**FILE_BYTES, **(file_bytes or {})}
     recipe = base_recipe()
     if truth_edit:
         truth_edit(recipe)
@@ -673,7 +674,7 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
         recipe_edit(checker_recipe)
     req, cr, modes = recipe["request"], recipe["create"], recipe["file_modes"]
     ctx = CONTEXT if truth_context is None else truth_context
-    outputs_bytes = {o["path"]: (None if o["path"] in absent else FILE_BYTES.get(o["path"], b"output\n"))
+    outputs_bytes = {o["path"]: (None if o["path"] in absent else fb.get(o["path"], b"output\n"))
                      for o in req["outputs"]}
     labels = {"cathedral_sandbox_id": RUN_ID, "cathedral_serial": "1",
               "broker_guest": cr.get("broker_guest", "guest-2"), "broker_batch": BATCH_ID}
@@ -698,7 +699,7 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
                   customer_request_sha256=sha(canonical(ctx)))]
     for i, inp in enumerate(req["inputs"]):
         steps.append(step(f"in{i}", "file_put", put_target(room, inp.get("mode", "644"), inp["path"]), 200,
-                          customer_request_sha256=sha(FILE_BYTES.get(inp["path"], b"input\n"))))
+                          customer_request_sha256=sha(fb.get(inp["path"], b"input\n"))))
     steps.append(step("exec", "exec", f"POST /v1/sandboxes/{room}/exec", 200, customer_request_sha256=sha(exec_bytes),
                       result_sha256=sha(exec_resp if exec_response != "mismatch" else b"other answer")))
     for j, out in enumerate(req["outputs"]):
@@ -726,7 +727,7 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
                                          **s["fields"])
     chain = [r for role, r in receipts.items() if role not in drop]
 
-    in_hash = {i["path"]: sha(FILE_BYTES.get(i["path"], b"input\n")) for i in req["inputs"]}
+    in_hash = {i["path"]: sha(fb.get(i["path"], b"input\n")) for i in req["inputs"]}
     request = {k: v for k, v in req.items() if k not in ("inputs", "outputs")}
     request.update(outputs=req["outputs"], context=ctx,
                    inputs=[{"path": i["path"], "mode": i.get("mode", "644"), "sha256": in_hash[i["path"]]}
@@ -752,7 +753,7 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
     hashes = {}
     for path, digest in in_hash.items():
         if path in input_files:
-            files[f"inputs/{len(hashes)}.bin"] = FILE_BYTES.get(path, b"input\n")
+            files[f"inputs/{len(hashes)}.bin"] = fb.get(path, b"input\n")
             args += ["--input-file", f"{path}={{dir}}/inputs/{len(hashes)}.bin"]
             hashes[path] = digest
             continue
@@ -1319,7 +1320,65 @@ def run_second_review_cases(pack: Pack) -> None:
         create_body=lambda body: {**body, "network": {"mode": "allowlist", "allow": ["other.net"]}})
 
 
-CASE_SETS = [numbering_cases, serial_cases, pool_cases, run_good_cases, run_bad_cases, run_hardening_cases, run_second_review_cases]
+IMAGE_RULE = "image must end in @sha256: and 64 lower-case hex"
+
+
+def run_validity_cases(pack: Pack) -> None:
+    """A recipe must be a valid one-shot request (spec G4 5.1) and an inline output at most 64 KiB (5.5)."""
+    def bad(name, description, expect, **kw):
+        run_case(pack, "bad", name, description, expect, **kw)
+
+    def good(name, description, **kw):
+        run_case(pack, "good", name, description, {}, **kw)
+
+    def req(**members):
+        return lambda r: r["request"].update(members)
+
+    bad("run_rule_image_unpinned", "The image is a tag, not a digest.", {"reason": f"recipe: {IMAGE_RULE}"},
+        truth_edit=req(image="images.example.test/app:latest", image_id=IMAGE_ID))
+    bad("run_rule_image_unpinned_in_file_only", "The recipe is valid; the file's request names an unpinned image.",
+        {"reason": f"check 8: the file's request: {IMAGE_RULE}"},
+        bundle_edit=lambda b: b["request"].update(image="images.example.test/app:latest"))
+    bad("run_rule_command_too_long", "A command of 129 strings.", {"reason": "recipe: command must hold 1 to 128 strings"},
+        truth_edit=req(command=["true"] * 129))
+    good("run_rule_command_128", "A command of 128 strings.", truth_edit=req(command=["true"] * 128))
+    bad("run_rule_env_too_many", "An environment of 65 entries.", {"reason": "recipe: env must hold at most 64 entries"},
+        truth_edit=req(env={f"K{i}": "v" for i in range(65)}))
+    ins = lambda n: [{"path": f"/work/in/f{i}.bin", "mode": "644"} for i in range(n)]  # noqa: E731
+    bad("run_rule_inputs_too_many", "Nine inputs.", {"reason": "recipe: inputs must hold at most 8 entries"},
+        truth_edit=req(inputs=ins(9)))
+    good("run_rule_inputs_8", "Eight inputs.", truth_edit=req(inputs=ins(8)))
+    bad("run_rule_input_path_outside", "An input path outside /work/in/.",
+        {"reason": "recipe: an input path must be under /work/in/"},
+        truth_edit=req(inputs=[{"path": "/tmp/data.csv", "mode": "644"}]))
+    bad("run_rule_input_path_is_the_folder", "An input path that is the folder itself.",
+        {"reason": "recipe: an input path must be under /work/in/"},
+        truth_edit=req(inputs=[{"path": "/work/in/", "mode": "644"}]))
+    bad("run_rule_output_path_outside", "An output path outside /work/out/.",
+        {"reason": "recipe: an output path must be under /work/out/"},
+        truth_edit=req(outputs=[{"path": "/tmp/log.txt", "max_bytes": 65536, "optional": False}]))
+    bad("run_rule_output_max_bytes_too_large", "An output max_bytes of 200 MiB plus one.",
+        {"reason": "recipe: an output max_bytes must be at most 200 MiB"},
+        truth_edit=req(outputs=[{"path": RESULT_PATH, "max_bytes": 209715201, "optional": False}]))
+    good("run_rule_output_max_bytes_200_mib", "An output max_bytes of exactly 200 MiB.",
+         truth_edit=req(outputs=[{"path": RESULT_PATH, "max_bytes": 209715200, "optional": False}]))
+    bad("run_rule_timeout_zero", "A timeout of 0 seconds.", {"reason": "recipe: timeout_seconds must be at least 1"},
+        truth_edit=req(timeout_seconds=0))
+    bad("run_rule_context_too_large", "A context of 4097 canonical bytes.",
+        {"reason": "inputs: the context is larger than 4 KiB (4096 canonical bytes)"},
+        truth_context={"k": "a" * 4089})
+    good("run_rule_context_4_kib", "A context of exactly 4096 canonical bytes.", truth_context={"k": "a" * 4088})
+
+    def roomy_log(r):
+        r["request"]["outputs"][1]["max_bytes"] = 1048576
+    bad("run_rule_inline_output_too_large", "An inline output of 64 KiB plus one byte; the recipe allows more.",
+        fail(7, f"the inline bytes of {LOG_PATH} are 65537 bytes, over the 64 KiB an inline output may have"),
+        truth_edit=roomy_log, file_bytes={LOG_PATH: b"x" * 65537})
+    good("run_rule_inline_output_64_kib", "An inline output of exactly 64 KiB.", truth_edit=roomy_log,
+         file_bytes={LOG_PATH: b"x" * 65536})
+
+
+CASE_SETS = [numbering_cases, serial_cases, pool_cases, run_good_cases, run_bad_cases, run_hardening_cases, run_second_review_cases, run_validity_cases]
 
 
 def build(amd: dict[str, bytes]) -> dict[str, bytes]:

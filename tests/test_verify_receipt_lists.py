@@ -359,3 +359,76 @@ def test_the_recipe_network_forms_map_to_one_canonical_policy_each() -> None:
                 {"mode": "internet", "allow": [3]}, {"mode": "internet", "extra": 1}):
         with pytest.raises(vr.Fail):
             vr.network_policy(bad)
+
+
+def _generated(tmp_path: Path, **knobs) -> tuple[int, dict]:
+    """Build a signed run in memory with the pack generator, write it out, and run the checker on it."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("pack_generate_t", PACK / "generate.py")
+    gen = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = gen
+    spec.loader.exec_module(gen)
+    files, args = gen.make_run(gen.Pack(gen.read_amd()), **knobs)
+    for name, data in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes(data)
+    code, out, err = _run_cli(*[a.replace("{dir}", str(tmp_path)) for a in args])
+    assert "Traceback" not in err, err
+    return code, json.loads(out)
+
+
+def _edit(**members):
+    return lambda r: r["request"].update(members)
+
+
+def _log_roomy(r):
+    r["request"]["outputs"][1]["max_bytes"] = 1048576
+
+
+# (rule, knobs exactly at the bound, knobs one step past it, the reason the past case must give)
+BOUNDS = [
+    ("image is pinned by digest", {}, {"truth_edit": _edit(image="images.example.test/app:latest")},
+     "recipe: image must end in @sha256: and 64 lower-case hex"),
+    ("image digest is lower case", {}, {"truth_edit": _edit(image="images.example.test/app@sha256:" + "A" * 64)},
+     "recipe: image must end in @sha256: and 64 lower-case hex"),
+    ("image digest is 64 hex", {}, {"truth_edit": _edit(image="images.example.test/app@sha256:" + "a" * 63)},
+     "recipe: image must end in @sha256: and 64 lower-case hex"),
+    ("command 1 to 128 strings", {"truth_edit": _edit(command=["true"] * 128)},
+     {"truth_edit": _edit(command=["true"] * 129)}, "recipe: command must hold 1 to 128 strings"),
+    ("command has at least one string", {"truth_edit": _edit(command=["true"])},
+     {"truth_edit": _edit(command=[])}, "recipe: command is not a list of strings"),
+    ("env at most 64 entries", {"truth_edit": _edit(env={f"K{i}": "v" for i in range(64)})},
+     {"truth_edit": _edit(env={f"K{i}": "v" for i in range(65)})}, "recipe: env must hold at most 64 entries"),
+    ("at most 8 inputs",
+     {"truth_edit": _edit(inputs=[{"path": f"/work/in/f{i}", "mode": "644"} for i in range(8)])},
+     {"truth_edit": _edit(inputs=[{"path": f"/work/in/f{i}", "mode": "644"} for i in range(9)])},
+     "recipe: inputs must hold at most 8 entries"),
+    ("input path under /work/in/", {"truth_edit": _edit(inputs=[{"path": "/work/in/x", "mode": "644"}])},
+     {"truth_edit": _edit(inputs=[{"path": "/tmp/data.csv", "mode": "644"}])},
+     "recipe: an input path must be under /work/in/"),
+    ("output path under /work/out/",
+     {"truth_edit": _edit(outputs=[{"path": "/work/out/x", "max_bytes": 9, "optional": False}])},
+     {"truth_edit": _edit(outputs=[{"path": "/tmp/log.txt", "max_bytes": 9, "optional": False}])},
+     "recipe: an output path must be under /work/out/"),
+    ("output max_bytes at most 200 MiB",
+     {"truth_edit": _edit(outputs=[{"path": "/work/out/x", "max_bytes": 209715200, "optional": False}])},
+     {"truth_edit": _edit(outputs=[{"path": "/work/out/x", "max_bytes": 209715201, "optional": False}])},
+     "recipe: an output max_bytes must be at most 200 MiB"),
+    ("timeout_seconds at least 1", {"truth_edit": _edit(timeout_seconds=1)}, {"truth_edit": _edit(timeout_seconds=0)},
+     "recipe: timeout_seconds must be at least 1"),
+    ("context at most 4 KiB", {"truth_context": {"k": "a" * 4088}}, {"truth_context": {"k": "a" * 4089}},
+     "inputs: the context is larger than 4 KiB (4096 canonical bytes)"),
+    ("inline output at most 64 KiB", {"truth_edit": _log_roomy, "file_bytes": {"/work/out/log.txt": b"x" * 65536}},
+     {"truth_edit": _log_roomy, "file_bytes": {"/work/out/log.txt": b"x" * 65537}},
+     "check 7: the inline bytes of /work/out/log.txt are 65537 bytes, over the 64 KiB an inline output may have"),
+]
+
+
+@pytest.mark.parametrize("rule, at, past, reason", BOUNDS, ids=[b[0] for b in BOUNDS])
+def test_each_request_rule_passes_at_its_bound_and_fails_one_step_past_it(rule, at, past, reason, tmp_path) -> None:
+    """The evidence is signed and consistent with the recipe in both cases: only the rule can fail the second."""
+    code, out = _generated(tmp_path / "at", **at)
+    assert code == 0 and out["verdict"] == "PASS", (rule, out)
+    code, out = _generated(tmp_path / "past", **past)
+    assert code == 1 and out == {"verdict": "FAIL", "reason": reason}, (rule, out)
