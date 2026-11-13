@@ -103,10 +103,31 @@ func fixedLabels(hc hotelConfig, labels map[string]string) map[string]string {
 }
 
 // labels and drain read the fields an operator PATCH may change at any time.
+// A miner hotel also carries the computed label graduated=true once it is off
+// probation (probation.go; with probation off, at once), so a shared-pool
+// policy can select graduated miners by label. A stored "graduated" label is
+// dropped while the hotel is on probation: the label cannot be set by hand.
 func (h *hotel) labels() map[string]string {
 	h.cfgMu.RLock()
-	defer h.cfgMu.RUnlock()
-	return h.cfg.Labels
+	l := h.cfg.Labels
+	h.cfgMu.RUnlock()
+	if h.cfg.MinerHotkey == "" {
+		return l
+	}
+	on := h.inProbation()
+	if (on && l["graduated"] == "") || (!on && l["graduated"] == "true") {
+		return l
+	}
+	out := make(map[string]string, len(l)+1)
+	for k, v := range l {
+		out[k] = v
+	}
+	if on {
+		delete(out, "graduated")
+	} else {
+		out["graduated"] = "true"
+	}
+	return out
 }
 
 // reservedFor is the guest the hotel is reserved for, or "" for a pool hotel.
@@ -141,6 +162,7 @@ func (b *broker) addHotelWithCapCheck(h *hotel, checkCaps bool) error {
 	if h.caps == nil && b.capsOnDisk[h.cfg.ID] != nil { // a runtime hotel keeps its probe results
 		h.caps = b.capsOnDisk[h.cfg.ID]
 	}
+	b.initProbation(h)
 	b.mu.Unlock()
 	b.hotelsMu.Lock()
 	defer b.hotelsMu.Unlock()
@@ -542,6 +564,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		writeErr(w, 500, "state_write_failed", "cannot keep the runtime hotel list")
 		return
 	}
+	b.saveProbationLogged() // a rejoin under an old id must not inherit its saved probation
 	go b.syncLoop(ctx, h)
 	writeJSON(w, 201, b.hotelDoc(h))
 }
@@ -735,6 +758,7 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller, forget b
 		h.stop()
 	}
 	_ = os.Remove(h.cfg.KeyFile)
+	b.saveProbationLogged()
 	w.WriteHeader(204)
 }
 
@@ -753,9 +777,13 @@ func (b *broker) hotelDoc(h *hotel) map[string]any {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := time.Now()
-	return map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime,
+	d := map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime,
 		"reserved_for": reserved, "lent_from": lent, "lent_report_id": lentReport, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
 		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now)}
+	if p := b.probationDoc(h); p != nil {
+		d["probation"] = p
+	}
+	return d
 }
 
 func (b *broker) guestExists(id string) bool {
@@ -788,9 +816,21 @@ func (b *broker) saveRuntimeHotelsLocked() error {
 	return os.Rename(tmp, filepath.Join(b.cfg.StateDir, runtimeHotelsFile))
 }
 
-// loadRuntimeHotels adds the hotels that joined at runtime before a restart.
-// The caller starts their sync loops.
+// loadRuntimeHotels adds the hotels that joined at runtime before a restart,
+// with their miner probation state (probation.go). The caller starts their
+// sync loops.
 func (b *broker) loadRuntimeHotels() error {
+	if err := b.loadRuntimeHotelList(); err != nil {
+		return err
+	}
+	if err := b.loadProbation(); err != nil {
+		// Fail closed: the restored miner hotels stay on probation (fresh).
+		log.Printf("miner probation state not loaded: %v", err)
+	}
+	return nil
+}
+
+func (b *broker) loadRuntimeHotelList() error {
 	if b.cfg.StateDir == "" {
 		return nil
 	}
