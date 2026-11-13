@@ -20,7 +20,7 @@
  "description": "The inline bytes in the file are not the bytes the get returned.",
  "expect": {
   "exit_code": 1,
-  "reason": "check 7: the bytes held for /work/out/log.txt do not hash to the receipt's result_sha256",
+  "reason": "check 7: the inline bytes of /work/out/log.txt do not hash to the receipt's result_sha256",
   "verdict": "FAIL"
  }
 }

@@ -249,3 +249,65 @@ def test_a_single_expected_measurement_keeps_its_message_and_several_use_the_lis
     code, out, _ = _run_cli(*base, "--expected-measurement", "00" * 48, "--expected-measurement",
                             trust["measurements"][0])
     assert code == 0 and json.loads(out)["verdict"] == "PASS"
+
+
+def _confused_documents() -> dict[str, tuple[str, object]]:
+    """(file, mutation) pairs: each puts a value of the wrong type or shape somewhere in the bundle or recipe."""
+    def at(path, value):
+        def edit(doc):
+            node = doc
+            for part in path[:-1]:
+                node = node[part]
+            node[path[-1]] = value
+            return doc
+        return edit
+
+    cases = {}
+    for name, path, value in [
+        ("receipts_ints", ["receipts"], [1, 2]), ("receipt_statement_text", ["receipts", 0, "statement"], "x"),
+        ("receipt_sequence_text", ["receipts", 1, "statement", "sequence"], "two"),
+        ("receipt_status_list", ["receipts", 2, "statement", "status"], []),
+        ("attestation_text", ["attestation"], "x"), ("binding_list", ["attestation", "binding"], []),
+        ("certs_list", ["amd_certs"], []), ("cert_number", ["amd_certs", "ark"], 5),
+        ("create_bytes_number", ["create_request_b64"], 5), ("exec_bytes_list", ["exec_request_b64"], []),
+        ("inline_list", ["inline_outputs"], [1]),
+        ("request_text", ["request"], "x"), ("request_outputs_number", ["request", "outputs"], 123),
+        ("request_inputs_object", ["request", "inputs"], {}), ("request_env_list", ["request", "env"], []),
+        ("request_command_number", ["request", "command"], 1), ("request_context_list", ["request", "context"], []),
+        ("oneshot_id_number", ["oneshot_id"], 5), ("schema_list", ["schema"], []),
+    ]:
+        cases[f"bundle_{name}"] = ("bundle.json", at(path, value))
+    for name, path, value in [
+        ("request_outputs_number", ["request", "outputs"], 123), ("request_inputs_text", ["request", "inputs"], "x"),
+        ("request_command_text", ["request", "command"], "run"), ("request_env_list", ["request", "env"], []),
+        ("request_timeout_text", ["request", "timeout_seconds"], "60"),
+        ("request_timeout_bool", ["request", "timeout_seconds"], True),
+        ("request_network_list", ["request", "network"], []), ("request_image_id_number", ["request", "image_id"], 1),
+        ("request_max_spend_text", ["request", "max_spend_usd"], "5"), ("request", ["request"], []),
+        ("create_resources_text", ["create", "resources"], "x"), ("create_ttl_bool", ["create", "ttl_seconds"], False),
+        ("file_modes_list", ["file_modes"], []), ("output_entry_number", ["request", "outputs", 0], 4),
+        ("output_optional_text", ["request", "outputs", 0, "optional"], "no"),
+        ("output_max_bytes_bool", ["request", "outputs", 0, "max_bytes"], True),
+        ("input_entry_list", ["request", "inputs", 0], []), ("input_mode_number", ["request", "inputs", 0, "mode"], 644),
+        ("top_level_list", [], None),
+    ]:
+        cases[f"recipe_{name}"] = ("recipe.json", None if not path else at(path, value))
+    return cases
+
+
+@pytest.mark.parametrize("name", sorted(_confused_documents()))
+def test_a_value_of_the_wrong_type_is_a_clean_fail_never_a_traceback(name: str, tmp_path: Path) -> None:
+    import shutil
+
+    folder = tmp_path / "case"
+    shutil.copytree(PACK / "good" / "run_held_output_proven_exit_code", folder)
+    which, edit = _confused_documents()[name]
+    doc = json.loads((folder / which).read_text())
+    doc = [] if edit is None else edit(doc)
+    (folder / which).write_text(json.dumps(doc))
+    case = json.loads((folder / "case.json").read_text())
+    code, out, err = _run_cli(*[a.replace("{dir}", str(folder)) for a in case["args"]])
+    assert "Traceback" not in err, err
+    assert code == 1, (out, err)
+    result = json.loads(out)
+    assert result["verdict"] == "FAIL" and isinstance(result["reason"], str) and result["reason"]

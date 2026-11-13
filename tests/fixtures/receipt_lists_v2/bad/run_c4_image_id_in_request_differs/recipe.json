@@ -32,6 +32,7 @@
     "path": "/work/in/data.csv"
    }
   ],
+  "max_spend_usd": 5,
   "network": {
    "allow": [],
    "mode": "deny_all"

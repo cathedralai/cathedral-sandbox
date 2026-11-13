@@ -617,11 +617,11 @@ def base_recipe() -> dict:
         "request": {
             "image": IMAGE_REF, "command": ["python", RUN_PATH], "env": {"MODE": "check"}, "cwd": "/work",
             "size": "small", "timeout_seconds": 60, "network": {"mode": "deny_all", "allow": []},
+            "image_id": IMAGE_ID, "max_spend_usd": 5,
             "outputs": [{"path": RESULT_PATH, "max_bytes": 1048576, "optional": False},
                         {"path": LOG_PATH, "max_bytes": 65536, "optional": True}],
             "inputs": [{"path": RUN_PATH, "mode": "755"}, {"path": DATA_PATH, "mode": "644"}]},
-        "create": {"resources": {"cpus": 1, "memory_mb": 512}, "ttl_seconds": 300, "broker_guest": "guest-1",
-                   "image_id": IMAGE_ID},
+        "create": {"resources": {"cpus": 1, "memory_mb": 512}, "ttl_seconds": 300, "broker_guest": "guest-1"},
         "file_modes": {"context": "644", "end_marker": "644"}}
 
 
@@ -639,10 +639,16 @@ def get_target(room: str, max_bytes: int, path: str) -> str:
     return f"GET /v1/sandboxes/{room}/files?{enc({'max_bytes': str(max_bytes), 'path': path})}"
 
 
-def normal_network(net) -> dict:
-    if isinstance(net, dict) and net.get("mode"):
-        return net
-    return {"mode": "deny_all", "allow": []}
+def broker_form(net):
+    """The network the broker writes into the create, and the policy the machine signs for it."""
+    if net is None or net == "":
+        return {"mode": "deny_all", "allow": []}, {"mode": "deny_all", "allow": []}
+    if isinstance(net, str):
+        return net, {"mode": net, "allow": []}
+    if not net.get("mode"):
+        body = {**net, "mode": "deny_all", "allow": net.get("allow") or []}
+        return body, {"mode": "deny_all", "allow": body["allow"]}
+    return net, {"mode": net["mode"], "allow": net.get("allow") or []}
 
 
 def step(role: str, action: str, target: str, status: int = 200, **fields) -> dict:
@@ -666,7 +672,8 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
                      for o in req["outputs"]}
     labels = {"cathedral_sandbox_id": RUN_ID, "cathedral_serial": "1",
               "broker_guest": cr.get("broker_guest", "guest-2"), "broker_batch": BATCH_ID}
-    body = {"image": req["image"], "resources": cr["resources"], "network": normal_network(req.get("network")),
+    network_body, policy = broker_form(req.get("network"))
+    body = {"image": req["image"], "resources": cr["resources"], "network": network_body,
             "ttl_seconds": cr["ttl_seconds"], "labels": labels}
     if create_body:
         body = create_body(body)
@@ -679,8 +686,6 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
         ebody = exec_body(ebody)
     exec_bytes = ebody if isinstance(ebody, bytes) else canonical(ebody)
     exec_resp = canonical({"exit_code": 0, "stdout": "", "stderr": ""})
-    policy = normal_network(req.get("network"))
-    policy = {"mode": policy["mode"], "allow": policy.get("allow", [])}
     steps = [step("create", "create", "POST /v1/sandboxes", 202, image=req["image"], image_digest=IMAGE_ID,
                   network_policy=policy, network_policy_sha256=sha(canonical(policy)),
                   cathedral_sandbox_id=RUN_ID, serial=True, customer_request_sha256=sha(create_bytes)),
@@ -717,15 +722,10 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
     chain = [r for role, r in receipts.items() if role not in drop]
 
     in_hash = {i["path"]: sha(FILE_BYTES.get(i["path"], b"input\n")) for i in req["inputs"]}
-    request = {"image": req["image"], "command": req["command"], "env": req["env"], "size": req["size"],
-               "timeout_seconds": req["timeout_seconds"], "outputs": req["outputs"], "context": ctx,
-               "inputs": [{"path": i["path"], "mode": i.get("mode", "644"), "sha256": in_hash[i["path"]]}
-                          for i in req["inputs"]], "max_spend_usd": 5}
-    for key in ("cwd", "user", "network"):
-        if key in req:
-            request[key] = req[key]
-    if "image_id" in cr:
-        request["image_id"] = cr["image_id"]
+    request = {k: v for k, v in req.items() if k not in ("inputs", "outputs")}
+    request.update(outputs=req["outputs"], context=ctx,
+                   inputs=[{"path": i["path"], "mode": i.get("mode", "644"), "sha256": in_hash[i["path"]]}
+                           for i in req["inputs"]])
     bundle = {"schema": "cathedral_oneshot_bundle_v1", "oneshot_id": RUN_ID, "request": request,
               "attestation": json.loads(json.dumps(pack.attestation)), "amd_certs": dict(pack.certs),
               "receipts": chain,
@@ -790,6 +790,10 @@ def run_good_cases(pack: Pack) -> None:
                  f"{run}/outputs/0/sha256": sha(FILE_BYTES[RESULT_PATH]), f"{run}/outputs/0/bytes": "held",
                  f"{run}/outputs/1/bytes": "held", f"{run}/exit_code/status": "proven", f"{run}/exit_code/value": 0,
                  f"{run}/image/compared_with_recipe": True, "/room_links/run-room-1": RUN_ID,
+                 f"{run}/does_not_prove/6": "That the machine's disk was left unaltered by its host: the receipts do "
+                                            "not show it either way.",
+                 f"{run}/does_not_prove/7": "That the approved build is the same as the published source: the "
+                                            "allowed measurements are your own list.",
                  "/chain/room_numbering/rooms/run-room-1/serial": True,
                  "/chain/room_numbering/rooms/run-room-1/receipts": 8}})
     run_case(pack, "good", "run_output_receipt_only",
@@ -819,11 +823,21 @@ def run_good_cases(pack: Pack) -> None:
     def no_network_no_guest(r):
         r["request"].pop("network")
         r["create"].pop("broker_guest")
-        r["create"].pop("image_id")
+        r["request"].pop("image_id")
     run_case(pack, "good", "run_network_left_out_no_image_id",
              "A recipe with no network, no broker_guest and no image_id: the network is deny_all in the broker's "
              "form, the signed image_digest is reported and not compared.",
              {"pointers": {f"{run}/image/compared_with_recipe": False}}, truth_edit=no_network_no_guest)
+    def net(value):
+        return lambda r: r["request"].update(network=value)
+    run_case(pack, "good", "run_network_internet_by_name",
+             "The recipe names the network by its mode name: the create carries the name, the signed policy is internet.",
+             {}, truth_edit=net("internet"))
+    run_case(pack, "good", "run_network_allowlist_with_names",
+             "An allowlist with names: the create carries the object as written, the policy lists the names.",
+             {}, truth_edit=net({"mode": "allowlist", "allow": ["example.org", "example.net"]}))
+    run_case(pack, "good", "run_network_empty_object_is_deny_all",
+             "An empty network object is the broker's deny_all.", {}, truth_edit=net({}))
     run_case(pack, "good", "run_run_id_flag_agrees", "The caller's run id, the file's and the create's agree.", {},
              args_edit=lambda a: a.extend(["--run-id", RUN_ID]))
 
@@ -987,7 +1001,7 @@ def run_bad_cases(pack: Pack) -> None:
         fail(4, "image_digest is not sha256: and 64 lower-case hex"), overrides={"create": {"image_digest": "sha256:abc"}})
     bad("run_c4_image_id_differs", "The recipe's image_id is not the signed image_digest.",
         fail(4, "the create's image_digest is not the recipe's image_id"),
-        recipe_edit=lambda r: r["create"].update(image_id="sha256:" + "22" * 32))
+        recipe_edit=lambda r: r["request"].update(image_id="sha256:" + "22" * 32))
     bad("run_c4_pool_create", "The create is a pool create.", fail(4, "the create is a pool create"),
         overrides={"create": {"pool": True}})
     off = {"mode": "internet", "allow": []}
@@ -1091,7 +1105,7 @@ def run_bad_cases(pack: Pack) -> None:
         fail(7, f"the bytes held for {RESULT_PATH} do not hash to the receipt's result_sha256"),
         held_bytes={RESULT_PATH: b"other bytes\n"})
     bad("run_c7_inline_bytes_hash", "The inline bytes in the file are not the bytes the get returned.",
-        fail(7, f"the bytes held for {LOG_PATH} do not hash to the receipt's result_sha256"),
+        fail(7, f"the inline bytes of {LOG_PATH} do not hash to the receipt's result_sha256"),
         bundle_edit=lambda b: b["inline_outputs"].update({LOG_PATH: b64(b"other\n")}))
 
     def small_output(r):
