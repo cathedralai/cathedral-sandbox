@@ -42,7 +42,10 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # is refused when the image has no timeout program, AB#458) and #413 (workspace source for the
 # sealed data volume, AB#598; off unless SEALED_DATA_GIB > 0). Same make-dist.sh; the 0b396fa
 # tarball rebuilds to its pinned sha 6b2bf2cd... with the same tool.
-CATHEDRAL_COMMIT=0245e8d
-CATHEDRAL_TARBALL=dist/cathedral-0245e8d.tar.gz
-CATHEDRAL_TARBALL_SHA256=22fd4d0edfb6745c3de59c526e2c16c09e979e59c43602ae88e3c299b9b012e1
+# Pinned 2026-11-13 to 400892e: main after #455 (allowlisted image start commands for sealed rooms,
+# AB#709) and #457 (docker run pinned to the inspected image Id, AB#709). Same make-dist.sh; the
+# 0245e8d tarball rebuilds to its pinned sha 22fd4d0e... with the same tool.
+CATHEDRAL_COMMIT=400892e
+CATHEDRAL_TARBALL=dist/cathedral-400892e.tar.gz
+CATHEDRAL_TARBALL_SHA256=88f93feef4f78baa16d7d5da47764bd5d321539f96dc5699195ee7d53a8ab017
 PROBE_IMAGE=alpine:3.20
