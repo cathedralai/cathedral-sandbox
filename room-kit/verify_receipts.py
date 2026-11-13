@@ -1171,6 +1171,54 @@ def network_policy(value, default_ok: bool = False) -> dict:
     return canonical_policy(mode, allow)
 
 
+IMAGE_PIN_RE = re.compile(r"^.+@sha256:[0-9a-f]{64}$", re.DOTALL)
+COMMAND_MAX, ENV_MAX, INPUTS_MAX = 128, 64, 8
+OUTPUT_MAX_BYTES = 200 * 1024 * 1024
+CONTEXT_MAX_BYTES = 4 * 1024
+INLINE_OUTPUT_MAX_BYTES = 64 * 1024
+
+
+def request_limits(req: dict, prefix: str, from_file: bool = False) -> None:
+    """The rules spec G4 5.1 states for a one-shot request, for the recipe and for the file's request alike.
+
+    One function serves both, so they cannot drift. Wrong types are not this function's business (the recipe
+    loader refuses them, and the file's request must equal the recipe in check 8); a member of the wrong type is
+    skipped here. A rule the spec states no bound for is not invented: timeout_seconds has no upper bound here
+    because its cap is a setting, and outputs have no count bound because the spec lets a setting raise it."""
+    image, command, env = req.get("image"), req.get("command"), req.get("env")
+    if isinstance(image, str):
+        need(IMAGE_PIN_RE.fullmatch(image) is not None, f"{prefix}image must end in @sha256: and 64 lower-case hex")
+    if isinstance(command, list):
+        need(1 <= len(command) <= COMMAND_MAX, f"{prefix}command must hold 1 to {COMMAND_MAX} strings")
+    if isinstance(env, dict):
+        need(len(env) <= ENV_MAX, f"{prefix}env must hold at most {ENV_MAX} entries")
+    timeout = req.get("timeout_seconds")
+    if _is_int(timeout):
+        need(timeout >= 1, f"{prefix}timeout_seconds must be at least 1")
+    inputs, outputs = req.get("inputs"), req.get("outputs")
+    if isinstance(inputs, list):
+        need(len(inputs) <= INPUTS_MAX, f"{prefix}inputs must hold at most {INPUTS_MAX} entries")
+        for entry in inputs:
+            path = entry.get("path") if isinstance(entry, dict) else None
+            if isinstance(path, str):
+                need(path.startswith("/work/in/") and len(path) > len("/work/in/"),
+                     f"{prefix}an input path must be under /work/in/")
+            digest = entry.get("sha256") if isinstance(entry, dict) and from_file else None
+            if digest is not None:
+                need(isinstance(digest, str) and HEX64.fullmatch(digest) is not None,
+                     f"{prefix}an input sha256 must be 64 lower-case hex")
+    if isinstance(outputs, list):
+        for entry in outputs:
+            if not isinstance(entry, dict):
+                continue
+            path, limit = entry.get("path"), entry.get("max_bytes")
+            if isinstance(path, str):
+                need(path.startswith("/work/out/") and len(path) > len("/work/out/"),
+                     f"{prefix}an output path must be under /work/out/")
+            if _is_int(limit):
+                need(limit <= OUTPUT_MAX_BYTES, f"{prefix}an output max_bytes must be at most 200 MiB")
+
+
 def _members(doc: dict, allowed: tuple[str, ...]) -> None:
     for key in doc:
         need(key in allowed, f"recipe: unknown member {key}")
@@ -1206,6 +1254,7 @@ def load_recipe(doc) -> dict:
         if key in req:
             _typed(req, key, "a string", lambda v: isinstance(v, str))
     _typed(req, "max_spend_usd", "an integer", _is_int)
+    request_limits(req, "recipe: ")
     if "image_id" in req:
         _typed(req, "image_id", "sha256: and 64 lower-case hex",
                lambda v: isinstance(v, str) and IMAGE_DIGEST_RE.fullmatch(v) is not None)
@@ -1446,6 +1495,8 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
                 data = base64.b64decode(inline[path], validate=True)
             except ValueError as exc:
                 raise Fail(f"check 7: the inline bytes of {path} are not base64") from exc
+            need(len(data) <= INLINE_OUTPUT_MAX_BYTES, f"check 7: the inline bytes of {path} are {len(data)} bytes, "
+                 f"over the {INLINE_OUTPUT_MAX_BYTES // 1024} KiB an inline output may have")
             check_copy("the inline bytes of", "the inline copy of {path}", path, data, st.get("result_sha256"),
                        out["max_bytes"])
             copies += 1
@@ -1465,6 +1516,7 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     for entry in shown.get("inputs") if isinstance(shown.get("inputs"), list) else []:
         need(not (isinstance(entry, dict) and "content_b64" in entry),
              "check 8: the request holds content_b64, which a file must not carry")
+    request_limits(shown, "check 8: the file's request: ", from_file=True)
 
     def entries(items, keys, defaults):
         """Entries as objects with exactly the allowed members, defaults filled; None for anything else."""
@@ -1561,6 +1613,8 @@ def run_mode(a) -> int:
         context = {} if a.no_context else strict_json(read_file(a.context, "the context file"), "inputs",
                                                       "the context file")
         need(isinstance(context, dict), "inputs: the context is not a JSON object")
+        need(len(canonical(context)) <= CONTEXT_MAX_BYTES,
+             f"inputs: the context is larger than 4 KiB ({CONTEXT_MAX_BYTES} canonical bytes)")
         in_paths = [i["path"] for i in recipe["inputs"]]
         hashes: dict[str, str] = {}
         for entry in a.input_sha256:

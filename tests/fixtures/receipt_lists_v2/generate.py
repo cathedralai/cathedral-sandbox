@@ -1356,12 +1356,12 @@ def run_validity_cases(pack: Pack) -> None:
         truth_edit=req(inputs=[{"path": "/work/in/", "mode": "644"}]))
     bad("run_rule_output_path_outside", "An output path outside /work/out/.",
         {"reason": "recipe: an output path must be under /work/out/"},
-        truth_edit=req(outputs=[{"path": "/tmp/log.txt", "max_bytes": 65536, "optional": False}]))
+        truth_edit=req(outputs=[{"path": "/tmp/log.txt", "max_bytes": 65536, "optional": False}]), held=(), inline=())
     bad("run_rule_output_max_bytes_too_large", "An output max_bytes of 200 MiB plus one.",
         {"reason": "recipe: an output max_bytes must be at most 200 MiB"},
-        truth_edit=req(outputs=[{"path": RESULT_PATH, "max_bytes": 209715201, "optional": False}]))
+        truth_edit=req(outputs=[{"path": RESULT_PATH, "max_bytes": 209715201, "optional": False}]), held=(), inline=())
     good("run_rule_output_max_bytes_200_mib", "An output max_bytes of exactly 200 MiB.",
-         truth_edit=req(outputs=[{"path": RESULT_PATH, "max_bytes": 209715200, "optional": False}]))
+         truth_edit=req(outputs=[{"path": RESULT_PATH, "max_bytes": 209715200, "optional": False}]), held=(), inline=())
     bad("run_rule_timeout_zero", "A timeout of 0 seconds.", {"reason": "recipe: timeout_seconds must be at least 1"},
         truth_edit=req(timeout_seconds=0))
     bad("run_rule_context_too_large", "A context of 4097 canonical bytes.",
