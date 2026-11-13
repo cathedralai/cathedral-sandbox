@@ -20,11 +20,14 @@ Routes the broker and customers reach on a hotel. Status is what `SIGNED` in
 | DELETE | `/v1/sandboxes` | `bulk_delete` | |
 | **PUT** | `/v1/sandboxes/{id}/files` | **`file_put`** | **This slice** |
 | **GET** | `/v1/sandboxes/{id}/files` | **`file_get`** | **This slice** |
-| PUT/GET | `/v1/sandboxes/{id}/tar` | — | Follow-up |
+| PUT | `/v1/sandboxes/{id}/tar` | `tar_put` | Slice 2 (AB#726); archive body not parsed as JSON |
+| GET | `/v1/sandboxes/{id}/tar` | `tar_get` | Slice 2 (AB#726); `result_sha256` is over the archive bytes |
 | GET | `/v1/sandboxes/{id}/stat` | — | Follow-up |
-| POST | `/v1/sandboxes/{id}/snapshot` | — | Follow-up |
-| POST/PATCH | `/v1/sandboxes/{id}/…` (heartbeat, lifetime, wait, freeze, thaw, expose, ports, …) | — | Follow-up |
-| DELETE | `/v1/sandboxes/{id}/processes/{pid}` | — | Follow-up |
+| POST | `/v1/sandboxes/{id}/snapshot` | `snapshot` | Slice 2 (AB#726) |
+| POST | `/v1/sandboxes/{id}/freeze`, `/thaw`, `/expose` | `freeze`, `thaw`, `expose` | Slice 2 (AB#726) |
+| POST/PATCH | `/v1/sandboxes/{id}/heartbeat`, `/lifetime`, `PATCH /v1/sandboxes/{id}` | none | Unsigned on purpose: broker keepalives; each receipt stays on the chain |
+| POST | `/v1/sandboxes/{id}/…` (wait, ports, access-tickets, publish, …) | none | Follow-up |
+| DELETE | `/v1/sandboxes/{id}/processes/{pid}` | `process_stop` | Slice 2 (AB#726); not a room delete, the incarnation stays |
 | POST/GET/DELETE | `/v1/sandboxes/{id}/terminals/…` | — | Follow-up (incl. WebSocket attach) |
 | POST | `/v1/sandboxes/{id}/terminals/{id}/input` | — | Follow-up |
 | GET | `/v1/sandboxes/{id}/terminals/{id}/output` | — | Follow-up |
@@ -34,6 +37,16 @@ Routes the broker and customers reach on a hotel. Status is what `SIGNED` in
 | any | `/v1/sandboxes/{id}/env-sealed` | none | Refused at front (404); the front's own route to the room API (AB#414) |
 | POST | `/v1/images/build` | — | Owner-gated; not in `SIGNED` |
 | GET | `/v1/sandboxes`, `/v1/sandboxes/{id}`, logs, desktop, workspaces, … | — | Read-only broker paths; unsigned |
+
+## Path matching (slice 2)
+
+The front matches `SIGNED` on `urlparse(path).path`, the path the room API routes on.
+Before slice 2 it used `urlsplit`, which keeps a `;params` suffix, so `PUT …/files;x`
+ran on the API with no receipt. `target` still records the path as sent.
+
+The broker's cloud-API compat tar routes (`broker/compat.go` `compatPutTar` /
+`compatGetTar`) run `tar` through an exec, so those calls carry an `exec` receipt,
+not `tar_put` / `tar_get`. Native broker passthrough and direct callers reach `…/tar`.
 
 ## TTL reaper (follow-up)
 

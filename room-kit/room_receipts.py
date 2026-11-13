@@ -2124,7 +2124,19 @@ SIGNED = [  # (method, path pattern, action)
     ("DELETE", re.compile(r"^/v1/sandboxes$"), "bulk_delete"),
     ("PUT", re.compile("^" + ROOM + r"/files$"), "file_put"),
     ("GET", re.compile("^" + ROOM + r"/files$"), "file_get"),
+    # AB#385 slice 2. Heartbeat, lifetime and PATCH /v1/sandboxes/{id} (also a heartbeat) stay
+    # unsigned: the broker sends them as keepalives, and each receipt stays on the chain.
+    ("PUT", re.compile("^" + ROOM + r"/tar$"), "tar_put"),
+    ("GET", re.compile("^" + ROOM + r"/tar$"), "tar_get"),
+    ("DELETE", re.compile("^" + ROOM + r"/processes/[^/]+$"), "process_stop"),
+    ("POST", re.compile("^" + ROOM + r"/snapshot$"), "snapshot"),
+    ("POST", re.compile("^" + ROOM + r"/freeze$"), "freeze"),
+    ("POST", re.compile("^" + ROOM + r"/thaw$"), "thaw"),
+    ("POST", re.compile("^" + ROOM + r"/expose$"), "expose"),
 ]
+# Archive bodies are never JSON. Not parsing them keeps a large plain tar from
+# being decoded into a str on every pass.
+OPAQUE_BODY = {"tar_put", "tar_get"}
 # Dedicated machine: the requests that start code need the owner signature.
 # A build runs Dockerfile steps in the guest, and the broker sends builds to
 # every hotel, so it is gated like a create.
@@ -2304,8 +2316,11 @@ class Handler(BaseHTTPRequestHandler):
             # them (urlparse drops a ";params" suffix, then the raw path), and decoded too; any
             # other path, flag on or off, passes as before.
             return self.reply(404, b'{"error":{"code":"route_not_found","message":"no such route"}}')
+        # Matched on the path the API routes on (urlparse drops a ";params" suffix), so no
+        # spelling of a signed route reaches the API unsigned.
+        path = api_path
         action = next((a for meth, pat, a in SIGNED if meth == self.command and pat.match(path)), None)
-        if action and body:
+        if action and body and action not in OPAQUE_BODY:
             # A JSON escape of a lone surrogate parses, but cannot be encoded
             # when the statement is signed. Refuse it before the API runs
             # the action: an action with no receipt is the one thing this
@@ -2684,12 +2699,13 @@ class Handler(BaseHTTPRequestHandler):
     def fields(self, action: str, path: str, body: bytes | None, status: int, out: bytes) -> dict:
         req = {}
         try:
-            req = json.loads(body) if body else {}
+            req = json.loads(body) if body and action not in OPAQUE_BODY else {}
         except ValueError:
             pass
         res = {}
         try:
-            res = json.loads(out) if out else {}
+            # tar_get answers an archive on success and a JSON error otherwise.
+            res = json.loads(out) if out and not (action in OPAQUE_BODY and 200 <= status < 300) else {}
         except ValueError:
             pass
         m = re.match("^" + ROOM, path)
