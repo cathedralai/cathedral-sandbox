@@ -228,11 +228,11 @@ HOTEL_ARGS = ["--attestation", "{dir}/attestation_doc.json", "--receipts", "{dir
               "--expected-measurement", MEASUREMENT]
 
 
-def hotel_case(pack: Pack, kind: str, name: str, description: str, doc, expect: dict) -> None:
+def hotel_case(pack: Pack, kind: str, name: str, description: str, doc, expect: dict, extra_args=()) -> None:
     exp = {"exit_code": 0, "verdict": "PASS"} if kind == "good" else {"exit_code": 1, "verdict": "FAIL"}
     exp.update(expect)
     pack.add(kind, name, {"attestation_doc.json": pretty(pack.attestation), "receipts.json": pretty(doc)},
-             {"description": description, "args": HOTEL_ARGS, "expect": exp})
+             {"description": description, "args": [*HOTEL_ARGS, *extra_args], "expect": exp})
 
 
 def whole(hotel: Hotel, receipts=None) -> dict:
@@ -462,7 +462,135 @@ def serial_cases(pack: Pack) -> None:
                {"reason": "room room-a: receipt 2: room_end has no reason"})
 
 
-CASE_SETS = [numbering_cases, serial_cases]
+CLAIM_ID = "5b7c1a2e-9d3f-4e6a-8b10-2c4d6e8f0a1b"
+POOL_WORDS = ("Nothing ran in this room before the claim except the machine's own main process, and no request "
+              "reached it through the front. This rests on the rules of the measured front, so it holds only for "
+              "the measurements you allowed.")
+
+
+def claim_fields(create: dict, **over) -> dict:
+    fields = {"cathedral_sandbox_id": CLAIM_ID, "lifetime_seconds": 3600, "pooled_from": create["receipt_sha256"]}
+    fields.update(over)
+    return fields
+
+
+def pool_cases(pack: Pack) -> None:
+    pools = "/pool_rooms"
+
+    h = pack.new_hotel()
+    c = h.sign("create", "pool-1", 202, pool=True)
+    h.sign("claim", "pool-1", 200, **claim_fields(c))
+    h.sign("exec", "pool-1")
+    hotel_case(pack, "good", "pool_room_claimed",
+               "A pre-made room: receipt 1 is a pool create, receipt 2 is the claim made from it. The claim's id is the link.",
+               whole(h), {"pointers": {
+                   f"{pools}/pool-1/state": "claimed", f"{pools}/pool-1/pooled_from": c["receipt_sha256"],
+                   f"{pools}/pool-1/proves/0": POOL_WORDS, "/room_links/pool-1": CLAIM_ID,
+                   "/sandbox_link/rooms/0": "pool-1"}},
+               extra_args=["--cathedral-sandbox", CLAIM_ID])
+
+    h = pack.new_hotel()
+    h.sign("create", "pool-1", 202, pool=True)
+    hotel_case(pack, "good", "pool_room_unclaimed",
+               "A pre-made room that has not been claimed: reported as unclaimed, and it names no link.",
+               whole(h), {"pointers": {f"{pools}/pool-1/state": "unclaimed", "/room_links": {}}})
+
+    h = pack.new_hotel()
+    c = h.sign("create", "pool-1", 202, pool=True)
+    h.sign("claim", "pool-1", 409, **claim_fields(c))
+    hotel_case(pack, "good", "pool_room_claim_failed",
+               "A claim that failed: the room is closed and gives no link.",
+               whole(h), {"pointers": {f"{pools}/pool-1/state": "closed", "/room_links": {}}})
+
+    h = pack.new_hotel()
+    h.sign("create", "pool-1", 202, pool=True)
+    h.sign("delete", "pool-1")
+    hotel_case(pack, "good", "pool_room_retired_unclaimed",
+               "A pre-made room deleted before any claim: retired, no link.",
+               whole(h), {"pointers": {f"{pools}/pool-1/state": "retired", "/room_links": {}}})
+
+    h = pack.new_hotel()
+    h.sign("create", "pool-1", 202, pool=True)
+    hotel_case(pack, "bad", "pool_unclaimed_has_no_link",
+               "An unclaimed pre-made room never matches a sandbox id.", whole(h),
+               {"reason": f"no successful create receipt names Cathedral sandbox {CLAIM_ID}"},
+               extra_args=["--cathedral-sandbox", CLAIM_ID])
+
+    h = pack.new_hotel()
+    c = h.sign("create", "pool-1", 202, numbered=False, pool=True)
+    h.sign("claim", "pool-1", 200, numbered=False, **claim_fields(c))
+    hotel_case(pack, "bad", "pool_claim_without_numbering",
+               "A claim in a room whose receipts are not numbered: nothing shows that no receipt sits between "
+               "create and claim.", whole(h),
+               {"reason": "room pool-1: receipt 2: a claim needs numbered receipts: cannot show nothing sits "
+                          "between create and claim"})
+
+    h = pack.new_hotel()
+    c = h.sign("create", "pool-1", 202, pool=True)
+    h.sign("claim", "pool-1", 200, **claim_fields(c, pooled_from="00" * 32))
+    hotel_case(pack, "bad", "pool_claim_pooled_from_wrong",
+               "The claim names a different create than the room's receipt 1.", whole(h),
+               {"reason": "room pool-1: receipt 2: pooled_from is not the pool create's receipt hash"})
+
+    h = pack.new_hotel()
+    h.sign("create", "room-n", 202)
+    c = h.chain[0]
+    h.sign("claim", "room-n", 200, **claim_fields(c))
+    hotel_case(pack, "bad", "pool_claim_without_pool_create",
+               "A claim in a room whose receipt 1 is an ordinary create.", whole(h),
+               {"reason": "room room-n: receipt 2: a claim in a room that was not made as a pool room"})
+
+    h = pack.new_hotel()
+    c = h.sign("create", "pool-1", 202, pool=True)
+    h.sign("exec", "pool-1")
+    h.sign("claim", "pool-1", 200, **claim_fields(c))
+    hotel_case(pack, "bad", "pool_claim_not_receipt_two",
+               "A request reached the room between create and claim.", whole(h),
+               {"reason": "room pool-1: receipt 3: a claim must be receipt 2 of a pool room"})
+
+    h = pack.new_hotel()
+    h.sign("create", "pool-1", 202, pool=True)
+    h.sign("exec", "pool-1")
+    hotel_case(pack, "bad", "pool_receipt_two_is_not_a_claim",
+               "Receipt 2 of a pre-made room is an exec.", whole(h),
+               {"reason": "room pool-1: receipt 2: receipt 2 of a pool room is not a claim"})
+
+    h = pack.new_hotel()
+    h.sign("create", "pool-1", 202, pool=True, cathedral_sandbox_id=CLAIM_ID)
+    hotel_case(pack, "bad", "pool_create_names_a_link", "A pool create that already names a sandbox id.", whole(h),
+               {"reason": "room pool-1: receipt 1: a pool create names a sandbox link"})
+
+    h = pack.new_hotel()
+    h.sign("create", "pool-1", 202, pool=True, serial=True)
+    hotel_case(pack, "bad", "pool_create_is_serial", "A create that is both pool and serial.", whole(h),
+               {"reason": "room pool-1: receipt 1: a pool create cannot also be serial"})
+
+    h = pack.new_hotel()
+    h.sign("create", "pool-1", 202)
+    h.sign("exec", "pool-1", pool=True)
+    hotel_case(pack, "bad", "pool_flag_on_exec", "The pool flag is on an exec.", whole(h),
+               {"reason": "room pool-1: receipt 2: pool is set on a receipt that is not a successful create"})
+
+    h = pack.new_hotel()
+    c = h.sign("create", "pool-1", 202, pool=True)
+    h.sign("claim", "pool-1", 200, target="POST /v1/sandboxes/other-room/claim", **claim_fields(c))
+    hotel_case(pack, "bad", "pool_claim_target_names_another_room", "The claim's signed target names another room.",
+               whole(h), {"reason": "room pool-1: receipt 2: the claim's target is not POST /v1/sandboxes/pool-1/claim"})
+
+    h = pack.new_hotel()
+    c = h.sign("create", "pool-1", 202, pool=True)
+    h.sign("claim", "pool-1", 200, **claim_fields(c, cathedral_sandbox_id=CLAIM_ID.upper()))
+    hotel_case(pack, "bad", "pool_claim_id_not_lower_case_uuid", "The claim's sandbox id is not a lower-case UUID.",
+               whole(h), {"reason": "room pool-1: receipt 2: cathedral_sandbox_id is not a lower-case UUID"})
+
+    h = pack.new_hotel()
+    c = h.sign("create", "pool-1", 202, pool=True)
+    h.sign("claim", "pool-1", 200, **claim_fields(c, lifetime_seconds=0))
+    hotel_case(pack, "bad", "pool_claim_lifetime_not_positive", "The claim's lifetime is zero.", whole(h),
+               {"reason": "room pool-1: receipt 2: lifetime_seconds is not a positive integer"})
+
+
+CASE_SETS = [numbering_cases, serial_cases, pool_cases]
 
 
 def build(amd: dict[str, bytes]) -> dict[str, bytes]:
