@@ -20,7 +20,7 @@
  "description": "Receipt 1 is not a create.",
  "expect": {
   "exit_code": 1,
-  "reason": "check 2: receipt 1 is not a successful create",
+  "reason": "check 2: receipt 1 is not a create",
   "verdict": "FAIL"
  }
 }

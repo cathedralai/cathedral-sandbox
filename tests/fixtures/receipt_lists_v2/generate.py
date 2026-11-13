@@ -19,7 +19,8 @@ sorted by path. A checker that copies this folder records that hash and refreshe
 Usage:
   generate.py            write every file
   generate.py --check    rebuild in memory, fail on any file that differs, is missing or is extra, and
-                         re-verify the synthetic AMD chain with the checker
+                         re-verify the synthetic AMD chain with the checker (verify_amd, from the bundle's
+                         certificates)
   generate.py --amd      make the synthetic AMD chain and the one signed report (their signatures are
                          random, so they are made once, committed, and only re-verified)
 
@@ -726,7 +727,8 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
     if "image_id" in cr:
         request["image_id"] = cr["image_id"]
     bundle = {"schema": "cathedral_oneshot_bundle_v1", "oneshot_id": RUN_ID, "request": request,
-              "attestation": pack.attestation, "amd_certs": pack.certs, "receipts": chain,
+              "attestation": json.loads(json.dumps(pack.attestation)), "amd_certs": dict(pack.certs),
+              "receipts": chain,
               "create_request_b64": b64(create_bytes), "exec_request_b64": b64(exec_bytes),
               "inline_outputs": {p: b64(outputs_bytes[p]) for p in inline if outputs_bytes.get(p) is not None}}
     if exec_response != "unproven":
@@ -897,6 +899,15 @@ def run_bad_cases(pack: Pack) -> None:
         fail(1, "receipt 3 names another binding"), steps_edit=other_binding)
     bad("run_c1_no_certificates", "The file holds no AMD certificates.",
         fail(1, "the file holds no AMD certificates (amd_certs)"), bundle_edit=lambda b: b.pop("amd_certs"))
+    bad("run_c1_certificate_not_signed_by_issuer", "The VCEK slot holds the ASK: the chain does not verify.",
+        fail(1, "an AMD certificate is not signed by the one above it in the chain"),
+        bundle_edit=lambda b: b["amd_certs"].update(vcek=b["amd_certs"]["ask"]))
+    bad("run_c1_certificates_not_der", "The certificates are not base64 DER.",
+        fail(1, "the AMD certificates are not base64 DER certificates (vcek, ask, ark)"),
+        bundle_edit=lambda b: b["amd_certs"].update(vcek="not base64!"))
+    bad("run_c1_hotel_level_attestation", "A level 1 (unsealed) binding in a one-shot's file.",
+        fail(1, "an SEV-SNP attestation is required"),
+        bundle_edit=lambda b: b["attestation"].update(binding={**b["attestation"]["binding"], "level": "hotel"}))
     bad("run_c1_skip_amd_refused", "--skip-amd is refused in run mode.",
         fail(1, "--skip-amd is not allowed in run mode"), args_edit=lambda a: a.append("--skip-amd"))
 
@@ -917,7 +928,7 @@ def run_bad_cases(pack: Pack) -> None:
         overrides={"in0": {"room_previous_receipt_sha256": "00" * 32}})
     bad("run_c2_no_numbering", "The receipts carry no room numbering.",
         fail(2, f"room {RUN_ROOM}: the receipts are not numbered (room_sequence)"), numbered=False)
-    bad("run_c2_receipt_one_is_not_a_create", "Receipt 1 is not a create.", fail(2, "receipt 1 is not a successful create"),
+    bad("run_c2_receipt_one_is_not_a_create", "Receipt 1 is not a create.", fail(2, "receipt 1 is not a create"),
         overrides={"create": {"action": "exec"}})
     bad("run_c2_no_serial_flag", "The create does not say serial: true.", fail(2, "receipt 1 does not say serial: true"),
         overrides={"create": {"serial": DEL}})
@@ -1165,6 +1176,11 @@ def verify_amd_material(files: dict[str, bytes]) -> None:
                                           ec.ECDSA(hashes.SHA384()))
     except InvalidSignature:
         raise SystemExit("the signed report does not verify with the VCEK") from None
+    # The checker's own offline path, the one a one-shot's file uses.
+    try:
+        vr.verify_amd(report, rep, "Milan", "", [ark_fp], json.loads(files["source/amd/certs.json"]))
+    except vr.Fail as exc:
+        raise SystemExit(f"the checker does not accept the synthetic chain: {exc}") from None
 
 
 def main() -> int:

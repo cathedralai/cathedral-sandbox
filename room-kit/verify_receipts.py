@@ -70,6 +70,31 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      --cathedral-sandbox finds it; an unclaimed room, a retired one and a room
      whose claim failed name no link. The output's pool_rooms gives each state.
 
+Run mode (--oneshot FILE, a cathedral_oneshot_bundle_v1) checks one run's file offline against what the
+caller expects, in eight checks. The AMD certificates come from the file (amd_certs) and must match
+--ark-sha256, which run mode requires; --skip-amd is refused. Any missing input is a FAIL, never a guess.
+  1. attestation, AMD chain, measurement (--expected-measurement, repeatable, or --allowed-measurements FILE),
+     every receipt's signature, one binding.
+  2. the room's receipts run 1 to m with every link right, receipt 1 is the create and says serial: true,
+     no receipt is a lost answer (502).
+  3. the actions are exactly: create, put of the context, put of each input, exec, get of each output, put of
+     the end marker; each signed target is the exact string the recipe gives (paths, modes, max_bytes).
+  4. the create succeeded and names the file's oneshot_id (and --run-id, when given); its bytes (hashed in the
+     receipt) hold exactly the create keys of broker/oneshot_create_keys.json, with the recipe's image,
+     resources, ttl_seconds, the broker's form of the recipe's network, and the four labels; a repeated key or a
+     number that is not an integer is refused; image_digest equals the recipe's image_id when it gives one.
+  5. the context put carries the hash of --context (or {} with --no-context); each input put carries the hash
+     given by --input-sha256 or --input-file.
+  6. the exec returned 200; its bytes hold cmd, timeout_seconds, env (and cwd, user when the recipe has them)
+     and nothing else, equal to the recipe's.
+  7. each output get returned exactly 200 (an optional output may answer 404 and is then absent); bytes held
+     (--output-file, or inline_outputs) must hash to the signed result and fit max_bytes, else the output is
+     reported as receipt_only; the end marker put carries the hash of no bytes.
+  8. the request in the file equals the recipe (image, command, env, cwd, user, size, timeout, network, outputs,
+     input paths and hashes, context) and holds no key that is not a request field.
+The output adds "run": the outputs, the exit code (proven only when exec_response_b64 hashes to the signed
+result; otherwise "not proven", and the verdict does not change), what the file proves, and what it does not.
+
 Not checked here (by design, today): that the measurement is an approved image.
 Image approval is a signed policy release; that is a later step.
 
@@ -79,6 +104,9 @@ Usage:
   verify_receipts.py --broker ... --operator-key-file OP --hotel <id>   # receipts from earlier boots
   verify_receipts.py --origin https://<miner ip>:<port> --require-sealed [--expected-measurement M]
   add --owner-pubkey B64 --expected-measurement HEX for a dedicated machine
+  verify_receipts.py --oneshot run.json --recipe recipe.json (--context ctx.json | --no-context) \\
+      --ark-sha256 HEX --expected-measurement HEX [--run-id UUID] [--input-sha256 PATH=HEX | --input-file PATH=FILE] \\
+      [--output-file PATH=FILE]
 
 When receipts name a binding_sha256 other than the live attestation, pass --broker and
 --operator-key-file so GET /v1/broker/bindings/<sha> can load each archived binding.
@@ -98,7 +126,7 @@ import ssl
 import sys
 import urllib.error
 import urllib.request
-from urllib.parse import urlsplit
+from urllib.parse import quote_plus, urlencode, urlsplit
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
@@ -118,6 +146,37 @@ HEX64 = re.compile(r"[0-9a-f]{64}")
 ORIGIN_MAX_BYTES = 64 * 1024
 DEDICATED_HOST_DATA_DOMAIN = b"cathedral-dedicated-v1\0"
 SANDBOX_LINK_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")  # room_receipts.py
+ONESHOT_BUNDLE_SCHEMA = "cathedral_oneshot_bundle_v1"
+ONESHOT_RECIPE_SCHEMA = "cathedral_oneshot_recipe_v1"
+# The keys the broker puts in a one-shot create, and its labels. Copied from broker/oneshot_create_keys.json;
+# a test fails when the two differ.
+ONESHOT_CREATE_KEYS = ("image", "resources", "network", "ttl_seconds", "labels")
+ONESHOT_LABEL_KEYS = ("cathedral_sandbox_id", "cathedral_serial", "broker_guest", "broker_batch")
+ROOM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+FILE_MODE_RE = re.compile(r"^[0-7]{3,4}$")
+CONTEXT_PATH = "/work/in/.context.json"
+END_MARKER_PATH = "/work/.cathedral-end"
+REQUEST_FIELDS = ("image", "image_id", "command", "env", "cwd", "user", "size", "timeout_seconds", "network",
+                  "outputs", "inputs", "context", "max_spend_usd")
+RUN_PROVES = [
+    "A machine with this measurement started this image, with nothing added at create.",
+    ("These input files and this context were written. This command ran with this environment on top of the "
+     "image's own."),
+    ("These output files were then read, and the room was still there after the last read. Between its start and "
+     "the end marker, no other request that can run something in the room, write to it or change its limit "
+     "reached it through the machine's front."),
+]
+RUN_DOES_NOT_PROVE = [
+    "That a second run gives the same output.",
+    "The exit code, unless the exec answer in the file hashes to the signed result (see exit_code).",
+    "That the room is gone: the delete is clean-up.",
+    "Which build the measurement stands for: it is checked against the measurements you allowed.",
+    "The request headers of file calls: they are in neither the signed target nor any hash.",
+    "Reads (logs, for one): they leave no receipt.",
+]
+RUN_CHECKED = "run mode: checks 1 to 8 of the one-shot file"
+
 
 
 def canonical(doc) -> bytes:
@@ -196,14 +255,29 @@ def ext_int(cert: x509.Certificate, oid: str) -> int:
     return int.from_bytes(raw[2:2 + raw[1]], "big")
 
 
-def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str | list[str] | None) -> dict:
+def load_bundle_certs(certs: dict) -> tuple[x509.Certificate, x509.Certificate, x509.Certificate]:
+    """VCEK, ASK and ARK from base64 DER, as a one-shot's file carries them."""
+    try:
+        return tuple(x509.load_der_x509_certificate(base64.b64decode(certs[k], validate=True))
+                     for k in ("vcek", "ask", "ark"))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Fail("the AMD certificates are not base64 DER certificates (vcek, ask, ark)") from exc
+
+
+def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str | list[str] | None,
+               certs: dict | None = None) -> dict:
+    """The AMD chain. certs (base64 DER vcek, ask, ark) replace the KDS fetch; every other check is the same."""
     tcb = rep["reported_tcb"]
     need(prod in ("Genoa", "Milan"), "only Milan and Genoa TCB layouts are handled")
     bl, tee, snp, ucode = tcb[0], tcb[1], tcb[6], tcb[7]
-    chain_pem = fetch(f"{KDS}/{prod}/cert_chain", cache, f"{prod}-cert_chain.pem")
-    certs = x509.load_pem_x509_certificates(chain_pem)
-    need(len(certs) == 2, "KDS cert_chain should hold ASK and ARK")
-    ask, ark = certs
+    if certs is None:
+        chain_pem = fetch(f"{KDS}/{prod}/cert_chain", cache, f"{prod}-cert_chain.pem")
+        loaded = x509.load_pem_x509_certificates(chain_pem)
+        need(len(loaded) == 2, "KDS cert_chain should hold ASK and ARK")
+        ask, ark = loaded
+        vcek = None
+    else:
+        vcek, ask, ark = load_bundle_certs(certs)
     pss_verify(ark, ark)
     pss_verify(ark, ask)
     ark_fp = sha(ark.public_bytes(serialization.Encoding.DER))
@@ -213,8 +287,9 @@ def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str 
         pins = [ark_sha256] if isinstance(ark_sha256, str) else ark_sha256
         need(ark_fp in {p.lower() for p in pins}, f"ARK sha256 {ark_fp} differs from the pinned value")
     chip = rep["chip_id"].hex()
-    vcek_url = f"{KDS}/{prod}/{chip}?blSPL={bl}&teeSPL={tee}&snpSPL={snp}&ucodeSPL={ucode}"
-    vcek = x509.load_der_x509_certificate(fetch(vcek_url, cache, f"vcek-{chip[:16]}-{tcb.hex()}.der"))
+    if vcek is None:
+        vcek_url = f"{KDS}/{prod}/{chip}?blSPL={bl}&teeSPL={tee}&snpSPL={snp}&ucodeSPL={ucode}"
+        vcek = x509.load_der_x509_certificate(fetch(vcek_url, cache, f"vcek-{chip[:16]}-{tcb.hex()}.der"))
     pss_verify(ask, vcek)
     hwid = vcek.extensions.get_extension_for_oid(x509.ObjectIdentifier("1.3.6.1.4.1.3704.1.4")).value.value
     need(hwid[-64:] == rep["chip_id"], "VCEK hwID differs from the report chip id")
@@ -249,8 +324,8 @@ def verify_hotel_attestation(att: dict) -> dict:
     return {"level": "hotel", "binding_sha256": bsha, "hotel": binding.get("hotel")}
 
 
-def verify_attestation(att: dict, expected_measurement: str | None, prod: str | None, cache: str,
-                       ark_sha256: str | list[str] | None, skip_amd: bool) -> dict:
+def verify_attestation(att: dict, expected_measurement: str | list[str] | None, prod: str | None, cache: str,
+                       ark_sha256: str | list[str] | None, skip_amd: bool, certs: dict | None = None) -> dict:
     binding = att["binding"]
     bsha = sha(canonical(binding))
     need(bsha == att["binding_sha256"], "binding_sha256 does not match the binding")
@@ -268,12 +343,17 @@ def verify_attestation(att: dict, expected_measurement: str | None, prod: str | 
     cmdline = binding.get("kernel_cmdline") or ""
     need("cathedral.debug=1" not in cmdline.split(), "debug build: the host can log in to this guest")
     if expected_measurement:
-        need(rep["measurement"] == expected_measurement.lower(), "measurement differs from the expected build")
+        allowed = [expected_measurement] if isinstance(expected_measurement, str) else list(expected_measurement)
+        allowed = [m.lower() for m in allowed]
+        if len(allowed) == 1:
+            need(rep["measurement"] == allowed[0], "measurement differs from the expected build")
+        else:
+            need(rep["measurement"] in allowed, "measurement is not one of the allowed measurements")
     out = {"binding_sha256": bsha, "measurement": rep["measurement"], "chip_id": rep["chip_id"].hex()[:16] + "...",
            "policy": hex(rep["policy"]), "host_data": rep["host_data"], "report_version": rep["version"],
            "kernel_cmdline": cmdline}
     if not skip_amd:
-        out["amd"] = verify_amd(report, rep, product(rep, prod), cache, ark_sha256)
+        out["amd"] = verify_amd(report, rep, product(rep, prod), cache, ark_sha256, certs)
     return out
 
 
@@ -892,6 +972,380 @@ def fetch_chain(broker: str, hotel: str, key: str) -> dict:
                     "filtered": bool(page.get("filtered")), "count": len(receipts), "receipts": receipts}
 
 
+def strict_json(raw: bytes, prefix: str, what: str, plural: bool = False):
+    """Parse JSON the way the Go checker does: a repeated key and a non-integer number are refused."""
+    def pairs(items):
+        out: dict = {}
+        for key, value in items:
+            need(key not in out, f"{prefix}: {what} {'repeat' if plural else 'repeats'} the key {key!r}")
+            out[key] = value
+        return out
+
+    def refuse(text):
+        raise Fail(f"{prefix}: {what} {'hold' if plural else 'holds'} the number {text}, which is not an integer")
+
+    try:
+        return json.loads(raw, object_pairs_hook=pairs, parse_float=refuse, parse_constant=refuse)
+    except ValueError as exc:
+        raise Fail(f"{prefix}: {what} {'are' if plural else 'is'} not JSON") from exc
+
+
+def file_query(pairs: dict[str, str]) -> str:
+    """A query as the machine's front signs it: keys sorted, values quote_plus encoded (Go's url.Values.Encode)."""
+    return urlencode(sorted(pairs.items()), quote_via=quote_plus)
+
+
+def put_target(room: str, mode: str, path: str) -> str:
+    return f"PUT /v1/sandboxes/{room}/files?{file_query({'mode': mode, 'path': path})}"
+
+
+def get_target(room: str, max_bytes: int, path: str) -> str:
+    return f"GET /v1/sandboxes/{room}/files?{file_query({'max_bytes': str(max_bytes), 'path': path})}"
+
+
+def broker_network(network) -> dict:
+    """The network the broker writes into a create: absent, null, empty or modeless means deny_all."""
+    if isinstance(network, dict) and network.get("mode"):
+        return network
+    return {"mode": "deny_all", "allow": []}
+
+
+def load_recipe(doc) -> dict:
+    """The expected run, as the caller wrote it. Anything the checks need and the recipe lacks is a refusal."""
+    need(isinstance(doc, dict) and doc.get("schema") == ONESHOT_RECIPE_SCHEMA,
+         f"inputs: the recipe is not a {ONESHOT_RECIPE_SCHEMA}")
+    req, create = doc.get("request"), doc.get("create")
+    need(isinstance(req, dict) and isinstance(create, dict), "inputs: the recipe needs request and create")
+    for key in ("image", "command", "env", "size", "timeout_seconds", "outputs", "inputs"):
+        need(key in req, f"inputs: the recipe's request has no {key}")
+    for key in ("resources", "ttl_seconds"):
+        need(key in create, f"inputs: the recipe's create has no {key}")
+    modes = doc.get("file_modes") or {}
+    outputs = []
+    for out in req["outputs"]:
+        need(isinstance(out, dict) and isinstance(out.get("path"), str) and _is_int(out.get("max_bytes")),
+             "inputs: each recipe output needs a path and an integer max_bytes")
+        outputs.append({"path": out["path"], "max_bytes": out["max_bytes"], "optional": bool(out.get("optional", False))})
+    inputs = []
+    for inp in req["inputs"]:
+        need(isinstance(inp, dict) and isinstance(inp.get("path"), str), "inputs: each recipe input needs a path")
+        inputs.append({"path": inp["path"], "mode": inp.get("mode", "644")})
+    for mode in [i["mode"] for i in inputs] + [modes.get("context", "644"), modes.get("end_marker", "644")]:
+        need(isinstance(mode, str) and FILE_MODE_RE.fullmatch(mode) is not None,
+             "inputs: a file mode in the recipe is not an octal string")
+    return {"request": req, "create": create, "outputs": outputs, "inputs": inputs,
+            "context_mode": modes.get("context", "644"), "end_mode": modes.get("end_marker", "644")}
+
+
+def expected_steps(room: str, recipe: dict) -> list[tuple[str, str]]:
+    """The room's actions and signed targets, in order, from the recipe alone."""
+    steps = [("create", "POST /v1/sandboxes"), ("file_put", put_target(room, recipe["context_mode"], CONTEXT_PATH))]
+    steps += [("file_put", put_target(room, i["mode"], i["path"])) for i in recipe["inputs"]]
+    steps.append(("exec", f"POST /v1/sandboxes/{room}/exec"))
+    steps += [("file_get", get_target(room, o["max_bytes"], o["path"])) for o in recipe["outputs"]]
+    steps.append(("file_put", put_target(room, recipe["end_mode"], END_MARKER_PATH)))
+    return steps
+
+
+def _bytes_member(bundle: dict, name: str, missing: str) -> bytes:
+    raw = bundle.get(name)
+    need(isinstance(raw, str), missing)
+    try:
+        return base64.b64decode(raw, validate=True)
+    except ValueError as exc:
+        raise Fail(f"{missing.split(':')[0]}: {name} is not base64") from exc
+
+
+def _normal_inputs(items) -> list[dict]:
+    return [{"path": i.get("path"), "mode": i.get("mode", "644"), "sha256": i.get("sha256")}
+            for i in items if isinstance(i, dict)]
+
+
+def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
+    """The eight checks of a one-shot's file (spec: one run, one receipt).
+
+    bundle is the file; recipe comes from load_recipe; trust holds the AMD root pins ("ark_sha256") and the
+    allowed measurements; caller holds what the caller knows: "context", "run_id" (or None), "input_hashes" and
+    "output_bytes" (path -> bytes). Nothing is believed because the file says so: each part is checked against
+    a signature, a hash or the recipe. Returns the PASS output; raises Fail("check N: ...") otherwise."""
+    need(isinstance(bundle, dict) and bundle.get("schema") == ONESHOT_BUNDLE_SCHEMA,
+         f"check 1: the file is not a {ONESHOT_BUNDLE_SCHEMA}")
+    req, create = recipe["request"], recipe["create"]
+
+    # 1. attestation, AMD chain, measurement, every receipt's signature, one binding
+    att, certs, receipts = bundle.get("attestation"), bundle.get("amd_certs"), bundle.get("receipts")
+    need(isinstance(att, dict) and isinstance(att.get("binding"), dict), "check 1: the file holds no attestation")
+    need(isinstance(receipts, list) and receipts and all(isinstance(r, dict) and isinstance(r.get("statement"), dict)
+                                                         for r in receipts), "check 1: the file holds no receipts")
+    need(not is_hotel_level(att), "check 1: an SEV-SNP attestation is required")
+    need(isinstance(certs, dict) and all(isinstance(certs.get(k), str) for k in ("vcek", "ask", "ark")),
+         "check 1: the file holds no AMD certificates (amd_certs)")
+    try:
+        attestation_out = verify_attestation(att, trust["measurements"], None, "", trust["ark_sha256"], False, certs)
+        chain_out = verify_receipts(att, receipts, None)
+    except Fail as exc:
+        raise Fail(f"check 1: {exc}") from exc
+    except InvalidSignature as exc:
+        raise Fail("check 1: an AMD certificate is not signed by the one above it in the chain") from exc
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise Fail("check 1: the attestation or a receipt is malformed") from exc
+
+    # 2. the room's own numbers, a serial create first, no lost answer
+    first = min(receipts, key=lambda r: r["statement"]["sequence"])
+    room = first["statement"].get("sandbox_id")
+    need(isinstance(room, str) and ROOM_ID_RE.fullmatch(room) is not None, "check 2: the room id is not a safe id")
+    for rc in receipts:
+        st = rc["statement"]
+        need(st.get("sandbox_id") == room, f"check 2: receipt {st['sequence']} names room {st.get('sandbox_id')}, "
+                                           f"not {room}")
+    need(all(_has_numbering(rc["statement"]) for rc in receipts),
+         f"check 2: room {room}: the receipts are not numbered (room_sequence)")
+    try:
+        ordered = check_room_chain(room, receipts)
+    except Fail as exc:
+        raise Fail(f"check 2: {exc}") from exc
+    created = ordered[0]["statement"]
+    need(created.get("action") == "create", "check 2: receipt 1 is not a create")
+    need(created.get("serial") is True, "check 2: receipt 1 does not say serial: true")
+    for rc in ordered:
+        need(rc["statement"].get("status") != 502,
+             f"check 2: receipt {rc['statement']['sequence']} is a lost answer (status 502)")
+
+    # 3. exactly the actions the recipe gives, with the exact signed target of each
+    want = expected_steps(room, recipe)
+    for i, (action, target) in enumerate(want):
+        if i < len(ordered):
+            st = ordered[i]["statement"]
+            need(st.get("action") == action and st.get("target") == target,
+                 f"check 3: receipt {i + 1} is {st.get('action')} {st.get('target')}, the recipe needs {action} {target}")
+    need(len(ordered) == len(want), f"check 3: the list has {len(ordered)} receipts, the recipe needs {len(want)}")
+    n_in = len(recipe["inputs"])
+    ctx_rc, in_rcs = ordered[1]["statement"], [r["statement"] for r in ordered[2:2 + n_in]]
+    exec_rc = ordered[2 + n_in]["statement"]
+    get_rcs = [r["statement"] for r in ordered[3 + n_in:3 + n_in + len(recipe["outputs"])]]
+    end_rc = ordered[-1]["statement"]
+
+    # 4. the create: it succeeded, names this run, and its bytes are the recipe's
+    run_id = bundle.get("oneshot_id")
+    need(isinstance(run_id, str) and SANDBOX_LINK_RE.fullmatch(run_id) is not None,
+         "check 4: the file's oneshot_id is not a lower-case UUID")
+    need(_succeeded(created), f"check 4: the create did not succeed (status {created.get('status')})")
+    digest = created.get("image_digest")
+    need(digest is not None, "check 4: the create receipt has no image_digest")
+    need(isinstance(digest, str) and IMAGE_DIGEST_RE.fullmatch(digest) is not None,
+         "check 4: image_digest is not sha256: and 64 lower-case hex")
+    need(not created.get("pool"), "check 4: the create is a pool create")
+    network = broker_network(req.get("network"))
+    need(created.get("network_policy") == {"mode": network["mode"], "allow": network.get("allow", [])},
+         "check 4: the signed network rule is not the recipe's")
+    need(created.get("cathedral_sandbox_id") == run_id,
+         f"check 4: the create names sandbox {created.get('cathedral_sandbox_id')}, not the file's oneshot_id {run_id}")
+    need(caller["run_id"] is None or caller["run_id"] == run_id,
+         "check 4: the run id you gave is not the file's oneshot_id")
+    create_bytes = _bytes_member(bundle, "create_request_b64",
+                                 "check 4: the file holds no create bytes (create_request_b64): the broker that "
+                                 "made this run does not hand them back")
+    need(sha(create_bytes) == created.get("customer_request_sha256"),
+         "check 4: the create bytes do not hash to the receipt's customer_request_sha256")
+    body = strict_json(create_bytes, "check 4", "the create bytes", plural=True)
+    need(isinstance(body, dict), "check 4: the create bytes are not a JSON object")
+    extra = sorted(set(body) - set(ONESHOT_CREATE_KEYS))
+    need(not extra, f"check 4: the create has a key it should not have: {extra[0] if extra else ''}")
+    missing = [k for k in ONESHOT_CREATE_KEYS if k not in body]
+    need(not missing, f"check 4: the create lacks the key {missing[0] if missing else ''}")
+    need(body["image"] == req["image"], "check 4: the create's image is not the recipe's")
+    need(body["resources"] == create["resources"], "check 4: the create's resources are not the recipe's")
+    need(body["ttl_seconds"] == create["ttl_seconds"], "check 4: the create's ttl_seconds is not the recipe's")
+    need(body["network"] == network, "check 4: the create's network is not the broker's form of the recipe's")
+    labels = body["labels"]
+    need(isinstance(labels, dict), "check 4: the create's labels are not an object")
+    extra, missing = sorted(set(labels) - set(ONESHOT_LABEL_KEYS)), [k for k in ONESHOT_LABEL_KEYS if k not in labels]
+    need(not extra and not missing, "check 4: the labels are not exactly the four expected ("
+                                    + (f"extra: {', '.join(extra)}" if extra else f"missing: {', '.join(missing)}") + ")")
+    need(labels["cathedral_sandbox_id"] == run_id, "check 4: the label cathedral_sandbox_id is not the run id")
+    need(labels["cathedral_serial"] == "1", "check 4: the label cathedral_serial is not 1")
+    guest = labels["broker_guest"]
+    if "broker_guest" in create:
+        need(guest == create["broker_guest"], "check 4: the label broker_guest is not the recipe's")
+    else:
+        need(isinstance(guest, str) and ROOM_ID_RE.fullmatch(guest) is not None,
+             "check 4: the label broker_guest is not an id-safe string")
+    need(isinstance(labels["broker_batch"], str) and SANDBOX_LINK_RE.fullmatch(labels["broker_batch"]) is not None,
+         "check 4: the label broker_batch is not a lower-case UUID")
+    image_compared = "image_id" in create
+    if image_compared:
+        need(digest == create["image_id"], "check 4: the create's image_digest is not the recipe's image_id")
+
+    # 5. the context and each input were written, and are the ones the caller holds
+    need(_succeeded(ctx_rc), f"check 5: the put of the context did not succeed (status {ctx_rc.get('status')})")
+    need(ctx_rc.get("customer_request_sha256") == sha(canonical(caller["context"])),
+         "check 5: the context put does not carry the expected context (its hash differs)")
+    for inp, st in zip(recipe["inputs"], in_rcs):
+        path = inp["path"]
+        need(_succeeded(st), f"check 5: the put of input {path} did not succeed (status {st.get('status')})")
+        given = caller["input_hashes"].get(path)
+        need(given is not None, f"check 5: no hash or file was given for input {path}")
+        need(st.get("customer_request_sha256") == given,
+             f"check 5: the put of input {path} does not carry the bytes whose hash you gave")
+
+    # 6. the exec: this command, this environment
+    need(exec_rc.get("status") == 200, f"check 6: the exec did not return 200 (status {exec_rc.get('status')})")
+    exec_bytes = _bytes_member(bundle, "exec_request_b64", "check 6: the file holds no exec bytes (exec_request_b64)")
+    need(sha(exec_bytes) == exec_rc.get("customer_request_sha256"),
+         "check 6: the exec bytes do not hash to the receipt's customer_request_sha256")
+    ebody = strict_json(exec_bytes, "check 6", "the exec bytes", plural=True)
+    need(isinstance(ebody, dict), "check 6: the exec bytes are not a JSON object")
+    values = {"cmd": req["command"], "timeout_seconds": req["timeout_seconds"], "env": req["env"]}
+    values.update({k: req[k] for k in ("cwd", "user") if k in req})
+    extra = sorted(set(ebody) - set(values))
+    need(not extra, f"check 6: the exec has a key it should not have: {extra[0] if extra else ''}")
+    missing = [k for k in values if k not in ebody]
+    need(not missing, f"check 6: the exec lacks the key {missing[0] if missing else ''}")
+    for key, value in values.items():
+        need(ebody[key] == value, f"check 6: the exec's {key} is not the recipe's")
+
+    # 7. each output was read whole (exactly 200); the end marker came after the last read
+    inline = bundle.get("inline_outputs") if isinstance(bundle.get("inline_outputs"), dict) else {}
+    outputs_out = []
+    for out, st in zip(recipe["outputs"], get_rcs):
+        path, status = out["path"], st.get("status")
+        held = caller["output_bytes"].get(path)
+        if status == 404 and out["optional"]:
+            need(held is None, f"check 7: bytes are held for {path}, but the receipt says it was absent")
+            outputs_out.append({"path": path, "state": "absent", "sha256": None, "bytes": None})
+            continue
+        need(status != 404, f"check 7: the required output {path} was not found (404)")
+        need(status == 200, f"check 7: the get of {path} answered {status}, not 200")
+        data = held
+        if data is None and isinstance(inline.get(path), str):
+            try:
+                data = base64.b64decode(inline[path], validate=True)
+            except ValueError as exc:
+                raise Fail(f"check 7: the inline bytes of {path} are not base64") from exc
+        if data is not None:
+            need(sha(data) == st.get("result_sha256"),
+                 f"check 7: the bytes held for {path} do not hash to the receipt's result_sha256")
+            need(len(data) <= out["max_bytes"], f"check 7: {path} is {len(data)} bytes, over its max_bytes "
+                                                f"{out['max_bytes']}")
+        outputs_out.append({"path": path, "state": "present", "sha256": st.get("result_sha256"),
+                            "bytes": "held" if data is not None else "receipt_only"})
+    need(_succeeded(end_rc), f"check 7: the end marker put did not succeed (status {end_rc.get('status')})")
+    need(end_rc.get("customer_request_sha256") == sha(b""), "check 7: the end marker put does not carry empty bytes")
+
+    # 8. the request the file shows is the recipe
+    shown = bundle.get("request")
+    need(isinstance(shown, dict), "check 8: the file holds no request")
+    for key in sorted(shown):
+        need(key in REQUEST_FIELDS, f"check 8: the request holds a key that is not a request field: {key}")
+    wanted_inputs = [{"path": i["path"], "mode": i["mode"], "sha256": caller["input_hashes"][i["path"]]}
+                     for i in recipe["inputs"]]
+    compare = [("image", shown.get("image"), req["image"]), ("image_id", shown.get("image_id"), create.get("image_id")),
+               ("command", shown.get("command"), req["command"]), ("env", shown.get("env"), req["env"]),
+               ("cwd", shown.get("cwd"), req.get("cwd")), ("user", shown.get("user"), req.get("user")),
+               ("size", shown.get("size"), req["size"]),
+               ("timeout_seconds", shown.get("timeout_seconds"), req["timeout_seconds"]),
+               ("network", shown.get("network"), req.get("network")),
+               ("outputs", [{"path": o.get("path"), "max_bytes": o.get("max_bytes"),
+                             "optional": bool(o.get("optional", False))} for o in shown.get("outputs") or []
+                            if isinstance(o, dict)], recipe["outputs"]),
+               ("inputs", _normal_inputs(shown.get("inputs") or []), wanted_inputs),
+               ("context", shown.get("context", {}), caller["context"])]
+    for field, got, expected in compare:
+        need(got == expected, f"check 8: the request in the file differs from the recipe in {field}")
+
+    # The exit code is proven only by an answer whose hash the exec receipt signed. It never changes the verdict.
+    exit_code: dict = {"status": "not proven"}
+    raw = bundle.get("exec_response_b64")
+    if isinstance(raw, str):
+        try:
+            answer = base64.b64decode(raw, validate=True)
+            doc = json.loads(answer)
+        except ValueError:
+            answer, doc = b"", None
+        if sha(answer) == exec_rc.get("result_sha256") and isinstance(doc, dict) and _is_int(doc.get("exit_code")):
+            exit_code = {"status": "proven", "value": doc["exit_code"]}
+
+    numbering = room_numbering(receipts)
+    if numbering["rooms"]:
+        chain_out["room_numbering"] = numbering_words(numbering["rooms"])
+    image = {"image_digest": digest, "compared_with_recipe": image_compared}
+    if not image_compared:
+        image["note"] = "The signed image_digest is the image's own id; the recipe gave no image_id, so it was not compared."
+    does_not = list(RUN_DOES_NOT_PROVE)
+    if any(o["bytes"] == "receipt_only" for o in outputs_out):
+        does_not.append("The length of an output whose bytes were not given to the checker (receipt only).")
+    return {"attestation": attestation_out, "chain": chain_out, "policy_timeline": policy_timeline(receipts),
+            "room_tunables": room_tunables(receipts), "room_links": room_links(receipts), "verdict": "PASS",
+            "checked": RUN_CHECKED,
+            "run": {"oneshot_id": run_id, "room": room, "image": image, "outputs": outputs_out,
+                    "exit_code": exit_code, "proves": RUN_PROVES, "does_not_prove": does_not}}
+
+
+def split_known(entry: str, known: list[str], flag: str, kind: str) -> tuple[str, str]:
+    """PATH=VALUE where PATH is one of the recipe's paths (a path may hold '=', so match by prefix)."""
+    for path in sorted(known, key=len, reverse=True):
+        if entry.startswith(path + "="):
+            return path, entry[len(path) + 1:]
+    raise Fail(f"inputs: {flag} names {entry.split('=', 1)[0]}, which is not an {kind} of the recipe")
+
+
+def read_file(path: str, what: str) -> bytes:
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError as exc:
+        raise Fail(f"inputs: cannot read {what} {path}") from exc
+
+
+def run_mode(a) -> int:
+    """--oneshot: check one file against what the caller expects. Missing caller input is a FAIL, never a guess."""
+    try:
+        need(not a.skip_amd, "check 1: --skip-amd is not allowed in run mode")
+        need(a.ark_sha256, "inputs: run mode needs --ark-sha256")
+        need(a.recipe, "inputs: run mode needs --recipe")
+        need(bool(a.context) != bool(a.no_context), "inputs: run mode needs --context FILE or --no-context")
+        measurements = list(a.expected_measurement or [])
+        if a.allowed_measurements:
+            listed = json.loads(read_file(a.allowed_measurements, "the allowed measurements file"))
+            need(isinstance(listed, list) and all(isinstance(m, str) for m in listed),
+                 "inputs: the allowed measurements file is not a JSON list of strings")
+            measurements += listed
+        need(measurements, "inputs: run mode needs --expected-measurement or --allowed-measurements")
+        try:
+            bundle = json.loads(read_file(a.oneshot, "the one-shot file"))
+            recipe = load_recipe(json.loads(read_file(a.recipe, "the recipe")))
+        except ValueError as exc:
+            raise Fail("inputs: the one-shot file or the recipe is not JSON") from exc
+        context = {} if a.no_context else strict_json(read_file(a.context, "the context file"), "inputs",
+                                                      "the context file")
+        need(isinstance(context, dict), "inputs: the context is not a JSON object")
+        in_paths = [i["path"] for i in recipe["inputs"]]
+        hashes: dict[str, str] = {}
+        for entry in a.input_sha256:
+            path, value = split_known(entry, in_paths, "--input-sha256", "input")
+            need(HEX64.fullmatch(value) is not None, f"inputs: the hash for {path} is not 64 lower-case hex")
+            need(path not in hashes, f"inputs: {path} is given twice")
+            hashes[path] = value
+        for entry in a.input_file:
+            path, value = split_known(entry, in_paths, "--input-file", "input")
+            need(path not in hashes, f"inputs: {path} is given twice")
+            hashes[path] = sha(read_file(value, "the input file"))
+        out_paths = [o["path"] for o in recipe["outputs"]]
+        held: dict[str, bytes] = {}
+        for entry in a.output_file:
+            path, value = split_known(entry, out_paths, "--output-file", "output")
+            need(path not in held, f"inputs: {path} is given twice")
+            held[path] = read_file(value, "the output file")
+        caller = {"context": context, "run_id": a.run_id, "input_hashes": hashes, "output_bytes": held}
+        out = verify_oneshot(bundle, recipe, {"measurements": list(dict.fromkeys(measurements)),
+                                              "ark_sha256": a.ark_sha256}, caller)
+        print(json.dumps(out, indent=1))
+        return 0
+    except Fail as exc:
+        print(json.dumps({"verdict": "FAIL", "reason": str(exc)}))
+        return 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--attestation", help="JSON from GET /room/attestation (or the broker's /v1/hotels/<id>/attestation)")
@@ -903,7 +1357,20 @@ def main() -> int:
                     help="broker operator key file; fetches archived bindings for receipts from earlier boots")
     ap.add_argument("--hotel", required=False, default=None, help="hotel id (required with --broker)")
     ap.add_argument("--sandbox", help="with --broker: one room's receipts instead of the whole chain")
-    ap.add_argument("--expected-measurement")
+    ap.add_argument("--expected-measurement", action="append",
+                    help="the measurement to accept; repeat it to accept any of several")
+    ap.add_argument("--allowed-measurements", help="run mode: a JSON list of measurements to accept")
+    ap.add_argument("--oneshot", help="run mode: a one-shot's file (cathedral_oneshot_bundle_v1) to check")
+    ap.add_argument("--recipe", help="run mode: the expected run (cathedral_oneshot_recipe_v1)")
+    ap.add_argument("--run-id", help="run mode: the run id you were sent; it must be the file's oneshot_id")
+    ap.add_argument("--context", help="run mode: the context you submitted (a JSON file)")
+    ap.add_argument("--no-context", action="store_true", help="run mode: you submitted no context")
+    ap.add_argument("--input-sha256", action="append", default=[], metavar="PATH=HEX",
+                    help="run mode: the sha256 of an input file you submitted; repeat per input")
+    ap.add_argument("--input-file", action="append", default=[], metavar="PATH=FILE",
+                    help="run mode: an input file you submitted; repeat per input")
+    ap.add_argument("--output-file", action="append", default=[], metavar="PATH=FILE",
+                    help="run mode: an output file you hold, to check against the receipts; repeat per output")
     ap.add_argument("--ark-sha256", action="append",
                     help="pin the AMD ARK certificate (sha256 of its DER); repeat to accept any of several")
     ap.add_argument("--product", help="Milan or Genoa (default: from the report)")
@@ -920,6 +1387,12 @@ def main() -> int:
     ap.add_argument("--cathedral-sandbox", help="a Cathedral sandbox id (UUID): fail unless a successful create "
                                                 "receipt names it")
     a = ap.parse_args()
+    if a.oneshot:
+        clash = [flag for flag, value in (("--receipts", a.receipts), ("--attestation", a.attestation),
+                                          ("--broker", a.broker), ("--origin", a.origin)) if value]
+        if clash:
+            ap.error(f"--oneshot checks one file; it takes no {', '.join(clash)}")
+        return run_mode(a)
     if a.broker and not a.hotel:
         ap.error("--hotel is required with --broker (no default: a wrong hotel is a wrong chain)")
     if a.origin and (a.broker or a.attestation or a.tls_spki_sha256):
