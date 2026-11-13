@@ -97,6 +97,8 @@ Design, threat model, upgrade path and the proof on an SNP host:
 | Debug access | Yes | `cathedral.debug=0/1` in the command line |
 | Files the kit downloads at boot (gVisor, uv, Python, Caddy, the pinned API wheel set) | No, but pinned | The installer refuses a file whose sha256 or sha512 differs from `versions.lock` and `requirements.lock`, which are in the measured initrd |
 | Room images (for example `alpine:3.20`) | No | Pulled at create. The receipt records the image reference and the image id |
+| Hotel name | No | QEMU fw_cfg `opt/cathedral/hotel-name`, checked against `^[a-z0-9][a-z0-9-]{0,62}$`; the guest refuses to start without it. The receipts front puts it in the attested binding (REPORT_DATA covers the binding). Two hotels of one build share one measurement |
+| Host IP, guest IP, guest MAC, DNS | Yes, as image constants | `guest-constants.sh`; the same on every host, not read from `sealed.env` |
 | Hotel API key | No | Config hotel: fw_cfg. It authenticates the broker. The host gives it, so the host can call the API too; each create, exec, process start, network change and delete gets a receipt. Miner hotel: never from the host (see "Miner hotel") |
 | Miner hotel settings (`ROOM_MINER`, TLS port, install signers) | Yes | In the guest `room.env`, and the HTTPS port rule in the guest firewall; only when `SEALED_MINER=1` |
 | HOST_DATA | No (host chooses it at launch; the chip signs it and nobody can change it after) | Shared machine: the sha256 of `manifest.json`, so a report names the build it claims. Dedicated machine: also the owner key (see "Dedicated machine") |

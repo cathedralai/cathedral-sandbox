@@ -4,6 +4,10 @@
 set -euo pipefail
 # shellcheck disable=SC1090
 source "$(readlink -f "${1:?sealed.env}")"
+# shellcheck disable=SC1091
+source "$(dirname "$(readlink -f "$0")")/guest-constants.sh"
+# The name is the broker hotel id and rides fw_cfg, never the measured image.
+[[ "${SEALED_NAME:-}" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "SEALED_NAME must match ^[a-z0-9][a-z0-9-]{0,62}$" >&2; exit 1; }
 IMG=$(readlink -f "$SEALED_DIR/images/current")
 RUN=$SEALED_DIR/run
 mkdir -p "$RUN"
@@ -55,6 +59,7 @@ if [ "${SEALED_MINER:-0}" = 1 ]; then
 else
   FW_CFG=(-fw_cfg "name=opt/cathedral/room-api-key,file=$SEALED_API_KEY_FILE")
 fi
+FW_CFG+=(-fw_cfg "name=opt/cathedral/hotel-name,string=$SEALED_NAME")
 exec /usr/bin/qemu-system-x86_64 -no-user-config -nodefaults -name "sealed-$SEALED_NAME" \
   -enable-kvm -cpu "$SEALED_CPU_MODEL" -smp "$SEALED_VCPUS" -m "${SEALED_MEM_GIB}G" \
   -machine q35,confidential-guest-support=sev0,memory-backend=ram1 \

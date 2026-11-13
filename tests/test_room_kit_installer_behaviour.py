@@ -1074,7 +1074,7 @@ def test_build_config_hotel_guard_and_room_env_have_no_miner_lines(host: FakeHos
     ssh = 'iifname "uplink" ip saddr 10.215.0.1 tcp dport 22 accept' if debug else ""
     assert (root / "etc" / "sealed-guard.nft").read_text() == CONFIG_GUARD.replace("@RULES@", ssh)
     env = (root / "opt" / "room-kit" / "room.env").read_text()
-    assert "ROOM_MINER" not in env and env.rstrip().endswith("ROOM_HOTEL_NAME=sealed-1")
+    assert "ROOM_MINER" not in env and "ROOM_HOTEL_NAME" not in env.replace("# ROOM_HOTEL_NAME is not set here", "")
 
 
 @pytest.mark.parametrize("debug", [False, True])
