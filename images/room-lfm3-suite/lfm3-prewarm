@@ -31,7 +31,8 @@ for f in /opt/llama/bin/*; do
 done
 test -e "$bin/libggml-cpu-$variant.so"
 
-PATH=$bin:$PATH LFM3_THREADS=${LFM3_PREWARM_THREADS:-2} LFM3_SLOT_DIR=$slot_dir lfm3-serve >"$tmp/server.log" 2>&1 &
+# LFM3_GATEWAY=off: no chat gateway at image build, and no log of it left in the image.
+PATH=$bin:$PATH LFM3_THREADS=${LFM3_PREWARM_THREADS:-2} LFM3_SLOT_DIR=$slot_dir LFM3_GATEWAY=off lfm3-serve >"$tmp/server.log" 2>&1 &
 pid=$!
 trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
 

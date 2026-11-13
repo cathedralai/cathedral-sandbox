@@ -155,3 +155,35 @@ jobs:
             exit 1
           fi
           test ! -s rejected.stdout
+
+  room-gateway:
+    name: LFM3 room chat gateway (Go)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.11"
+          cache: false # standard library only, so there is no go.sum
+
+      - name: Test
+        working-directory: images/room-lfm3-suite/gateway
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -race ./...
+
+      - name: Build static and reject a dynamic loader
+        working-directory: images/room-lfm3-suite/gateway
+        env:
+          CGO_ENABLED: "0"
+          GOTOOLCHAIN: local
+        run: |
+          go build -trimpath -buildvcs=false -ldflags='-s -w' -o lfm3-gateway .
+          file lfm3-gateway | grep -q 'statically linked'
+          ! readelf -l lfm3-gateway | grep -q ' INTERP '
+          ! readelf -l lfm3-gateway | grep -q ' DYNAMIC '

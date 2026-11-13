@@ -265,6 +265,7 @@ jobs:
         env:
           IMAGE_REF: ${{ steps.pin.outputs.image_ref }}
           KIND: ${{ matrix.kind }}
+          NAME: ${{ matrix.name }}
         run: |
           set -euo pipefail
           docker pull --quiet "$IMAGE_REF"
@@ -307,6 +308,23 @@ jobs:
             contract="chat/completions: ${answer}"
             printf '%s\n' "$contract"
             grep -Eiq '\b(4|four)\b' <<< "$answer"
+          fi
+          # The chat gateway (AB#539): chat models that are not base serve the
+          # Polaris runtime contract on 127.0.0.1:8642. One streamed turn must
+          # end with the finish chunk and data: [DONE], with no error event.
+          if [[ "$KIND" == chat && "$NAME" != *-base ]]; then
+            docker exec smoke curl -fsS -o /dev/null http://127.0.0.1:8642/health
+            stream="$(docker exec smoke curl -fsSN --max-time 300 http://127.0.0.1:8642/v1/chat/completions \
+              -H "Content-Type: application/json" \
+              -d '{"stream": true, "messages": [{"role": "user", "content": "What is 2+2? Answer in one word."}]}')"
+            if grep -q '^event: error' <<< "$stream" || ! grep -qx 'data: \[DONE\]' <<< "$stream"; then
+              printf '%s\n' "$stream" | tail -n 20
+              docker exec smoke tail -n 40 /tmp/lfm3/gateway.log || true
+              echo "::error::the chat gateway did not finish a streamed turn"
+              exit 1
+            fi
+            contract="${contract}
+          gateway: $(grep -c '^data: {' <<< "$stream") chunks, then [DONE]"
           fi
           mem="$(docker stats --no-stream --format '{{.MemUsage}}' smoke)"
           sums="$(docker exec smoke cat /opt/lfm3/SHA256SUMS)"
