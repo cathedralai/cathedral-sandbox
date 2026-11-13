@@ -4,6 +4,7 @@ Nothing here touches a network or a host. The fakes read canned answers from a s
 and log every call, so each test can assert both the refusal and what was (not) done.
 """
 import base64
+import hashlib
 import json
 import os
 import subprocess
@@ -58,6 +59,10 @@ host_exec() {
   exit $?
 }
 case "$args" in
+  *roll-host-image*) echo "ssh image" >> "$F/calls.log"
+    if [ "${FAKE_HOST_EXEC:-0}" = 1 ]; then bash -c "${rest[*]}"
+    else cat "$F/host_image.txt" 2>/dev/null || echo "roll-host-image current=old booted=old"; fi
+    exit 0 ;;
   *build-status-*) echo "ssh build-status" >> "$F/calls.log"; cat "$F/build-status.txt"; exit 0 ;;
   *sealed_measurements*) echo "ssh pins" >> "$F/calls.log"; cat "$F/pins.txt"; exit 0 ;;
   *post_hotel.sh*)
@@ -145,6 +150,10 @@ def calls(fake):
     return p.read_text().splitlines() if p.exists() else []
 
 
+def plan_sha(home):
+    return hashlib.sha256((home / "plans" / f"{HOTEL}.env").read_bytes()).hexdigest()
+
+
 def no_mutation(fake):
     c = calls(fake)
     assert not any(x.startswith("PATCH") for x in c), c
@@ -207,7 +216,7 @@ def test_resume_from_installed_skips_install_and_undrains(env):
     e, fake, home = env
     (fake / "capacity.json").write_text(capacity(NEW, drain=True))
     (home / "state" / f"{HOTEL}.env").write_text(
-        f"PHASE=installed\nTS=20260101T000000Z\nOLDIMG=old\nCOMMIT=1234567\n")
+        f"PHASE=installed\nTS=20260101T000000Z\nOLDIMG=old\nCOMMIT=1234567\nPLAN_SHA={plan_sha(home)}\n")
     r = run(e, "apply", HOTEL)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "resume from phase installed" in r.stdout
@@ -337,7 +346,7 @@ def test_drain_error_that_did_not_apply_aborts_without_undrain(env):
 def test_resume_of_interrupted_drain_reads_back_and_undrains(env):
     e, fake, home = env
     (fake / "capacity.json").write_text(capacity(CUR, drain=True))
-    (home / "state" / f"{HOTEL}.env").write_text("PHASE=draining\nTS=20260101T000000Z\nOLDIMG=old\nCOMMIT=1234567\n")
+    (home / "state" / f"{HOTEL}.env").write_text(f"PHASE=draining\nTS=20260101T000000Z\nOLDIMG=old\nCOMMIT=1234567\nPLAN_SHA={plan_sha(home)}\n")
     r = run(e, "apply", HOTEL)
     assert patches(fake) == ["false}"], r.stdout
     assert "ssh install" not in calls(fake)
@@ -370,6 +379,8 @@ def host(env, tmp_path):
     for p in (d / "images" / "old", s / "images" / "20260101T000000Z", kit):
         p.mkdir(parents=True)
     (d / "images" / "current").symlink_to("old")
+    (d / "run").mkdir()
+    (d / "run" / "booted-image").symlink_to(d / "images" / "old")
     (d / "sealed.env").write_text(f"SEALED_DIR={d}\nSEALED_NAME={HOTEL}\n")
     (s / "sealed.env").write_text(f"SEALED_DIR={s}\nSEALED_NAME={HOTEL}\nSEALED_ROOM_SEALED_SECRETS=1\nSEALED_ROOM_SEALED_EXEC=1\n")
     (d / "data.raw").write_text("owner\n")
@@ -378,6 +389,7 @@ def host(env, tmp_path):
         f"COMMIT=1234567\nSTAGE={stage}\nNEWIMG=20260101T000000Z\nCUR={CUR}\nNEW={NEW}\n")
     sysctl = tmp_path / "bin" / "systemctl"
     sysctl.write_text(f'#!/bin/bash\n[ "$1" = is-active ] && {{ echo active; exit 0; }}\n'
+                      f'[ "$1" = restart ] && ln -sfn "$(readlink -f {d}/images/current)" {d}/run/booted-image\n'
                       f'echo "systemctl $* data=$(cat {d}/data.raw 2>/dev/null)" >> "$FAKE_DIR/calls.log"\n')
     sysctl.chmod(0o755)
     e.update({"FAKE_HOST_EXEC": "1", "ROLL_REMOTE_LOGDIR": str(root)})
@@ -443,3 +455,116 @@ def test_reset_roll_rollback_holds_drained_when_prev_volume_is_gone(host):
     assert os.readlink(d / "images" / "current") == "20260101T000000Z"
     assert patches(fake) == ["true}"]
     assert "PHASE=stuck_drained" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+# ---- #472 HOLD round 2 ----------------------------------------------------------------------------
+def capacity_by_step(fake, drain=None, install=None, rollback=None):
+    """Serve capacity.json until the run reaches a step, then that step's view (latest step wins)."""
+    for name, body in (("drain", drain), ("install", install), ("rollback", rollback)):
+        if body is not None:
+            (fake / f"capacity.{name}").write_text(body)
+    curl = fake.parent / "bin" / "curl"
+    curl.write_text(curl.read_text().replace(
+        '*/v1/broker/capacity) cat "$F/capacity.json" ;;',
+        '*/v1/broker/capacity) c=$F/capacity.json; L=$F/calls.log\n'
+        '    grep -q "^PATCH" "$L" 2>/dev/null && [ -f "$F/capacity.drain" ] && c=$F/capacity.drain\n'
+        '    grep -qx "ssh install" "$L" 2>/dev/null && [ -f "$F/capacity.install" ] && c=$F/capacity.install\n'
+        '    grep -qx "ssh rollback" "$L" 2>/dev/null && [ -f "$F/capacity.rollback" ] && c=$F/capacity.rollback\n'
+        '    cat "$c" ;;'))
+
+
+MISSING = json.dumps({"hotels": []})
+
+
+# Finding 1: after a host rollback, recovery undrains only on CUR admitted and the host proven on OLDIMG.
+@pytest.mark.parametrize("after_rollback,host_image,undrains", [
+    ("stale_new", "current=old booted=old", False),        # broker still caches NEW
+    ("cur", "current=20260101T000000Z booted=20260101T000000Z", False),  # host never left NEW
+    ("cur", "current=old booted=old", True),               # control: a real rollback
+])
+def test_rollback_undrains_only_on_cur_admission_and_old_host_image(env, after_rollback, host_image, undrains):
+    e, fake, home = env
+    bad = json.loads(attestation()); bad["binding"] = {}
+    (fake / "attestation.json").write_text(json.dumps(bad))
+    (fake / "host_image.txt").write_text(f"roll-host-image {host_image}\n")
+    after = capacity(NEW, drain=True) if after_rollback == "stale_new" else capacity(CUR, drain=True)
+    capacity_by_step(fake, drain=capacity(CUR, drain=True), install=capacity(NEW, drain=True), rollback=after)
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "ssh rollback" in calls(fake)
+    state = (home / "state" / f"{HOTEL}.env").read_text()
+    if undrains:
+        assert patches(fake) == ["true}", "false}"], r.stdout
+        assert "PHASE=rolled_back" in state
+    else:
+        assert patches(fake) == ["true}"], r.stdout
+        assert "PHASE=stuck_drained" in state
+
+
+# Finding 2: a drain-only stuck hotel resumes as drain-only and is never restarted.
+def test_drain_only_stuck_resume_never_restarts_the_guest(env):
+    e, fake, home = env
+    (fake / "patch_codes").write_text("503\n")
+    capacity_by_step(fake, drain=MISSING)
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "PHASE=stuck_drained" in (home / "state" / f"{HOTEL}.env").read_text(), r.stdout
+    (fake / "rooms.txt").write_text("1")
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    c = calls(fake)
+    assert "ssh rollback" not in c and "ssh install" not in c, c
+    assert "false}" not in patches(fake)
+    assert "PHASE=stuck_drained" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+# Finding 2: a stuck install resume rolls back only once drain=true and zero rooms are read back.
+@pytest.mark.parametrize("cap,rooms", [(MISSING, "0"), (capacity(NEW, drain=True), "1"),
+                                       (capacity(NEW, drain=False), "0"), (capacity(NEW, drain=True), "?")])
+def test_stuck_install_resume_needs_drain_and_zero_rooms_before_rollback(env, cap, rooms):
+    e, fake, home = env
+    (fake / "capacity.json").write_text(cap)
+    (fake / "rooms.txt").write_text(rooms if rooms != "?" else "x")
+    (home / "state" / f"{HOTEL}.env").write_text(
+        f"PHASE=stuck_drained\nSTUCK_FROM=installed\nTS=20260101T000000Z\nOLDIMG=old\nCOMMIT=1234567\n"
+        f"PLAN_SHA={plan_sha(home)}\n")
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "ssh rollback" not in calls(fake), r.stdout
+    assert patches(fake) == []
+    assert "PHASE=stuck_drained" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+# Finding 3: a resumed run is bound to the plan it preflighted.
+def test_resume_refuses_a_replaced_plan(env):
+    e, fake, home = env
+    (fake / "capacity.json").write_text(capacity(CUR, drain=True))
+    (home / "state" / f"{HOTEL}.env").write_text(
+        f"PHASE=drained\nTS=20260101T000000Z\nOLDIMG=old\nCOMMIT=1234567\nPLAN_SHA={plan_sha(home)}\n")
+    other = "d" * 96
+    (home / "plans" / f"{HOTEL}.env").write_text(
+        f"COMMIT=1234567\nSTAGE=/root/stage-1234567\nNEWIMG=20260202T000000Z\nCUR={CUR}\nNEW={other}\n")
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "plan" in r.stdout + r.stderr
+    c = calls(fake)
+    assert "ssh install" not in c and "ssh rollback" not in c, c
+    assert patches(fake) == []
+    assert "PHASE=drained" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+# Finding 4: two hotels on the same current build with different new builds keep both new pins.
+def test_pin_patch_keeps_every_new_build_for_a_shared_current(env, tmp_path):
+    e, _, home = env
+    other = "d" * 96
+    (home / "plans" / "hotel-y.env").write_text(
+        f"COMMIT=1234567\nSTAGE=/root/stage-1234567\nNEWIMG=20260101T000000Z\nCUR={CUR}\nNEW={other}\n")
+    r = run(e, "pin-patch", "1234567")
+    assert r.returncode == 0, r.stdout + r.stderr
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"amd_verifier": "x", "sealed_measurements": [CUR]}))
+    out = subprocess.run(["python3", "-I", str(home / "plans" / "pin-1234567.py"), str(cfg)],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    pins = json.loads(cfg.read_text())["sealed_measurements"]
+    assert sorted(pins) == sorted([CUR, NEW, other]), pins

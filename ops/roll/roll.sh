@@ -224,6 +224,18 @@ echo "RESULT=rolledback unit=$(systemctl is-active "$UNIT") current=$(readlink "
 REMOTE
 }
 
+# "current=<image> booted=<image>": images/current and the image launch-guest.sh last booted. Read only.
+host_image() {
+  local q; q=$(printf %q "$D")
+  # shellcheck disable=SC2029  # D comes from the local hotel table, quoted with printf %q
+  ssh -n "${SSHO[@]}" "root@$HOST" "echo roll-host-image current=\$(readlink $q/images/current) booted=\$(basename \"\$(readlink -f $q/run/booted-image 2>/dev/null)\" 2>/dev/null)" 2>/dev/null | sed -n 's/^roll-host-image //p' | tail -1
+}
+# host_on <image>: 0 only when the host both points at and booted that image.
+host_on() {
+  HOST_IMAGE=$(host_image)
+  [ -n "$1" ] && [ "$HOST_IMAGE" = "current=$1 booted=$1" ]
+}
+
 # ---- recovery: never leave a hotel drained when a known build is admitted ------------------------
 # wait_admitted <build...>: 0 once the broker shows the hotel up and admitted on one of them.
 wait_admitted() {
@@ -247,12 +259,16 @@ undrain() {
   log "undrain PATCH answered ${code:-nothing}; broker reads drain=$dr"
   [ "$dr" = False ]
 }
+# stuck <why>: keep the hotel drained and remember the phase, so a resume repeats the same recovery.
+stuck() {
+  st_set STUCK_FROM "$1"; st_set PHASE stuck_drained
+  log "STUCK DRAINED: $HOTEL kept drained: $2. Inspect, then: roll.sh apply $HOTEL (resumes) or PATCH drain=false by hand"
+}
 recover() {
   [ $RECOVERING = 1 ] && return; RECOVERING=1
-  local phase; phase=$(st_get PHASE)
+  local phase up adm meas dr sl fr; phase=$(st_get PHASE)
   case "$phase" in
     draining)
-      local up adm meas dr sl fr
       read -r up adm meas dr sl fr <<< "$(hotel_state)"
       if [ "$dr" = False ]; then st_set PHASE aborted; log "recovery: broker reads drain=False; the drain did not apply, nothing to undo"; return; fi
       log "recovery: broker reads drain=$dr after an uncertain drain PATCH; nothing installed, undraining" ;;
@@ -260,20 +276,30 @@ recover() {
     *) return ;;  # nothing of ours is drained yet, or already undrained
   esac
   if [ "$phase" != drained ] && [ "$phase" != draining ] && [ "$(st_get NEW_GOOD)" != 1 ] && [ "$(st_get HOST_ROLLED_BACK)" != 1 ]; then
-    log "recovery: rolling the host back to $OLDIMG"
+    # The rollback restarts the guest: only on a hotel read back as drained with 0 live rooms.
+    local r; read -r up adm meas dr sl fr <<< "$(hotel_state)"; r=$(rooms)
+    if [ "$dr" != True ] || [ "$r" != 0 ]; then
+      stuck "$phase" "0 rooms not proven before the host rollback (drain=$dr rooms=$r); guest not restarted"; return
+    fi
+    log "recovery: drain=True rooms=0; rolling the host back to $OLDIMG"
     local rb; rb=$(host_rollback "$(st_get TS)")
     while read -r l; do log "host: $l"; done <<< "$rb"
     case "$rb" in
       *RESULT=rolledback*) st_set HOST_ROLLED_BACK 1 ;;
-      *RESULT=held*) st_set PHASE stuck_drained
-        log "STUCK DRAINED: $HOTEL host rollback held (data volume); kept drained. Inspect ${D}/data.raw* on $HOST"; return ;;
+      *RESULT=held*) stuck "$phase" "host rollback held (data volume). Inspect ${D}/data.raw* on $HOST"; return ;;
     esac
   fi
-  if wait_admitted "$CUR" "$NEW"; then
-    if undrain; then st_set PHASE rolled_back; log "recovery: undrained on ${ADMITTED_ON:0:16}"; return; fi
+  # Undrain only on the build the host is proven to run: NEW if it was verified and never rolled back,
+  # else CUR on OLDIMG. The broker can still cache NEW after a rollback, so it alone is not proof.
+  local want img
+  if [ "$(st_get NEW_GOOD)" = 1 ] && [ "$(st_get HOST_ROLLED_BACK)" != 1 ]; then want=$NEW img=$NEWIMG; else want=$CUR img=$OLDIMG; fi
+  if wait_admitted "$want"; then
+    if ! host_on "$img"; then
+      stuck "$phase" "the broker admits ${want:0:16} but the host reads ${HOST_IMAGE:-nothing}, not $img"; return
+    fi
+    if undrain; then st_set PHASE rolled_back; log "recovery: undrained on ${ADMITTED_ON:0:16} ($HOST_IMAGE)"; return; fi
   fi
-  st_set PHASE stuck_drained
-  log "STUCK DRAINED: $HOTEL is drained and no known build is admitted. Inspect, then: roll.sh apply $HOTEL (resumes) or PATCH drain=false by hand"
+  stuck "$phase" "no proven build is admitted (want ${want:0:16} on $img)"
 }
 die() { log "STOP: $*"; recover; exit 1; }
 # Refusals before any change to the hotel: no recovery needed.
@@ -287,6 +313,14 @@ load_plan() {
   valid_commit "$COMMIT" && valid_meas "$CUR" && valid_meas "$NEW" && [ -n "$STAGE" ] && [ -n "$NEWIMG" ] \
     || { echo "plan for $HOTEL is incomplete" >&2; return 1; }
   S=$STAGE/$HOTEL; KIT=$STAGE/kit/room-kit; UNIT=room-sealed-$HOTEL.service
+}
+# A run is bound to the exact plan it preflighted. A resume refuses if the plan file changed since.
+plan_sha() { sha256sum < "$PLANS/$HOTEL.env" | cut -c1-64; }
+bind_plan() { st_set PLAN_SHA "$(plan_sha)"; st_set COMMIT "$COMMIT"; st_set NEWIMG "$NEWIMG"; }
+require_bound_plan() {
+  [ -n "$(st_get PLAN_SHA)" ] && [ "$(st_get PLAN_SHA)" = "$(plan_sha)" ] && return 0
+  echo "REFUSE: the plan for $HOTEL is not the one run $(st_get TS) preflighted (state commit=$(st_get COMMIT) image=$(st_get NEWIMG); plan commit=$COMMIT image=$NEWIMG). Restore that plan to resume; nothing changed" >&2
+  return 1
 }
 
 # ---- apply ---------------------------------------------------------------------------------------
@@ -330,12 +364,13 @@ run_apply() {
   local phase; phase=$(st_get PHASE)
   case "$phase" in
     ""|done|aborted|rolled_back) [ -n "$phase" ] && mv "$STATE/$HOTEL.env" "$STATE/$HOTEL.env.prev-$TS"
-      st_set PHASE preflight; st_set TS "$TS"; st_set COMMIT "$COMMIT"; st_set STARTED "$TS"
+      st_set PHASE preflight; st_set TS "$TS"; bind_plan; st_set STARTED "$TS"
       log "start: image $NEWIMG, current ${CUR:0:16}, new ${NEW:0:16}"
       preflight; st_set PHASE preflight_ok; phase=preflight_ok ;;
-    preflight|preflight_ok) st_set TS "$TS"; log "restart after an interrupted preflight"
+    preflight|preflight_ok) st_set TS "$TS"; bind_plan; log "restart after an interrupted preflight"
       preflight; st_set PHASE preflight_ok; phase=preflight_ok ;;
-    *) TS=$(st_get TS); OLDIMG=$(st_get OLDIMG)
+    *) require_bound_plan || exit 1
+      TS=$(st_get TS); OLDIMG=$(st_get OLDIMG)
       log "resume from phase $phase (run $TS)"
       guard || { log "REFUSE: const guard not GREEN; resume later"; exit 1; } ;;
   esac
@@ -350,12 +385,15 @@ run_apply() {
     [ "$r" = 0 ] || die "$HOTEL has rooms=$r after the drain; undrained, nothing installed"
     log "0 rooms"
   fi
+  if [ "$phase" = stuck_drained ]; then
+    # resumed after a failed recovery: repeat the recovery of the phase that got stuck. A drain-only
+    # stuck run stays drain-only; an older state without STUCK_FROM is treated as installing.
+    phase=$(st_get STUCK_FROM)
+    case "$phase" in draining|drained|installing|installed|admitted) ;; *) phase=installing ;; esac
+    st_set PHASE "$phase"; die "resuming a stuck hotel (recovery of phase $phase)"
+  fi
   if [ "$phase" = draining ]; then
     die "resuming an interrupted drain; reading the drain state back"
-  fi
-  if [ "$phase" = stuck_drained ]; then
-    # resumed after a failed recovery: try recovery again
-    st_set PHASE installing; die "resuming a stuck hotel"
   fi
   if [ "$phase" = drained ] && [ "$(rooms)" != 0 ]; then die "$HOTEL has rooms after resume; nothing installed"; fi
   if [ "$phase" = drained ]; then
@@ -410,7 +448,7 @@ cmd_apply() {
     # Read-only refusals first so the caller sees them; then the mutating part detaches so a killed
     # turn cannot strand a drained hotel.
     local ph; ph=$(st_get PHASE)
-    case "$ph" in ""|done|aborted|rolled_back|preflight|preflight_ok) CTX="apply $HOTEL"; preflight ;; esac
+    case "$ph" in ""|done|aborted|rolled_back|preflight|preflight_ok) CTX="apply $HOTEL"; preflight ;; *) require_bound_plan || exit 1 ;; esac
     systemd-run --unit="roll-apply-$HOTEL-$TS" --collect -E HOME="$HOME" -E ROLL_DETACHED=1 \
       -E ROLL_HOME="$ROLL_HOME" -E ROLL_HOTELS_CONF="$HOTELS_CONF" -E ROLL_GUARD="$GUARD" \
       -E ROLL_OPERATOR_KEY_FILE="$OPKEY_FILE" -E ROLL_SSH_KEY="$SSH_KEY" -E HOLD_DRAINED="${HOLD_DRAINED:-0}" \
@@ -427,7 +465,7 @@ cmd_pin_patch() {
   valid_commit "$commit" || usage
   for f in "$PLANS"/*.env; do
     [ -f "$f" ] && [ "$(kv_get "$f" COMMIT)" = "$commit" ] || continue
-    pairs="$pairs    \"$(kv_get "$f" CUR)\": \"$(kv_get "$f" NEW)\",  # $(basename "$f" .env)
+    pairs="$pairs    (\"$(kv_get "$f" CUR)\", \"$(kv_get "$f" NEW)\"),  # $(basename "$f" .env)
 "
     n=$((n + 1))
   done
@@ -440,10 +478,10 @@ for m in re.findall(r'"([0-9a-f]+)"', pairs):
     if len(m) != 96:
         sys.exit("bad measurement in plan: " + m[:16])
 src = open(tpl).read()
-marker = "PAIRS = {}  # __PAIRS__"
+marker = "PAIRS = []  # __PAIRS__"
 if marker not in src:
     sys.exit("template marker missing")
-open(out, "w").write(src.replace(marker, "PAIRS = {  # current (must already be pinned) -> new\n" + pairs + "}"))
+open(out, "w").write(src.replace(marker, "PAIRS = [  # (current: must already be pinned, new), one per staged hotel\n" + pairs + "]"))
 PY
   python3 -I -m py_compile "$out" || exit 1
   echo "wrote $out ($n hotels). Use: broker_swap_config.sh [--apply] <broker-binary> $out"

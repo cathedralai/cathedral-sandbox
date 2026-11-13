@@ -3,7 +3,8 @@
 import json
 import sys
 
-PAIRS = {}  # __PAIRS__
+# (current, new) per staged hotel. A list, not a dict: hotels sharing a current build keep every new one.
+PAIRS = []  # __PAIRS__
 path = sys.argv[1]
 c = json.load(open(path))
 frozen = json.dumps({k: v for k, v in c.items() if k != "sealed_measurements"}, sort_keys=True)
@@ -11,12 +12,12 @@ pins = c.get("sealed_measurements")
 if not isinstance(pins, list) or not c.get("amd_verifier"):
     sys.exit("refuse: no pin list or no amd_verifier")
 have = {str(x).strip().lower() for x in pins}
-missing = [cur[:8] for cur in PAIRS if cur not in have]
+missing = sorted({cur[:8] for cur, _ in PAIRS if cur not in have})
 if missing:
     sys.exit("refuse: a current build is not pinned (%s); re-read the baseline" % ", ".join(missing))
 before = len(pins)
-for new in PAIRS.values():
-    if new not in have:
+for _, new in PAIRS:
+    if new not in {str(x).strip().lower() for x in pins}:
         pins.append(new)
 if json.dumps({k: v for k, v in c.items() if k != "sealed_measurements"}, sort_keys=True) != frozen:
     sys.exit("refuse: the patch changed more than sealed_measurements")
