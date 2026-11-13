@@ -1176,47 +1176,104 @@ COMMAND_MAX, ENV_MAX, INPUTS_MAX = 128, 64, 8
 OUTPUT_MAX_BYTES = 200 * 1024 * 1024
 CONTEXT_MAX_BYTES = 4 * 1024
 INLINE_OUTPUT_MAX_BYTES = 64 * 1024
+IMAGE_MAX, PATH_MAX, ENV_VALUE_MAX, CWD_MAX, USER_MAX = 512, 1024, 8192, 1024, 64
+PATH_SEGMENT_RE = re.compile(r"[A-Za-z0-9._-]+")
+ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+USER_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_-]*[$]?|[0-9]+")
+MODE_RE = re.compile(r"[0-7]{3,4}")
+INPUT_PREFIX, OUTPUT_PREFIX = "/work/in/", "/work/out/"
+
+
+def _has_float(value) -> bool:
+    if isinstance(value, float):
+        return True
+    if isinstance(value, dict):
+        return any(_has_float(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_float(v) for v in value)
+    return False
+
+
+def _path_form(path: str, kind: str, prefix: str, prefix_error: str) -> None:
+    """One path: under its prefix, at most 1,024 characters, and every segment after the prefix is one or more
+    of A-Z a-z 0-9 . _ - and is not . or .. (so no empty segment and no trailing slash)."""
+    noun = f"an {kind} path"
+    need(path.startswith(prefix) and len(path) > len(prefix), f"{prefix_error}{noun} must be under {prefix}")
+    need(len(path) <= PATH_MAX, f"{prefix_error}{noun} must be at most {PATH_MAX} characters")
+    for segment in path[len(prefix):].split("/"):
+        need(segment != "", f"{prefix_error}{noun} must not hold an empty segment")
+        need(segment not in (".", ".."), f"{prefix_error}{noun} must not hold a . or .. segment")
+        need(PATH_SEGMENT_RE.fullmatch(segment) is not None,
+             f"{prefix_error}{noun} may hold only letters, digits, . _ and - in a segment")
 
 
 def request_limits(req: dict, prefix: str, from_file: bool = False) -> None:
-    """The rules spec G4 5.1 states for a one-shot request, for the recipe and for the file's request alike.
+    """The rules spec G4 5.1 states for a one-shot request (and its Forms block), for the recipe and for the
+    file's request alike.
 
     One function serves both, so they cannot drift. Wrong types are not this function's business (the recipe
     loader refuses them, and the file's request must equal the recipe in check 8); a member of the wrong type is
-    skipped here. A rule the spec states no bound for is not invented: timeout_seconds has no upper bound here
-    because its cap is a setting, and outputs have no count bound because the spec lets a setting raise it."""
+    skipped here. Bounds that are settings (the timeout cap, the output count, the total input size) are the
+    API's to enforce: none is invented here."""
     image, command, env = req.get("image"), req.get("command"), req.get("env")
     if isinstance(image, str):
+        need(len(image) <= IMAGE_MAX, f"{prefix}image must be at most {IMAGE_MAX} characters")
         need(IMAGE_PIN_RE.fullmatch(image) is not None, f"{prefix}image must end in @sha256: and 64 lower-case hex")
     if isinstance(command, list):
         need(1 <= len(command) <= COMMAND_MAX, f"{prefix}command must hold 1 to {COMMAND_MAX} strings")
     if isinstance(env, dict):
         need(len(env) <= ENV_MAX, f"{prefix}env must hold at most {ENV_MAX} entries")
+        for name in env:
+            need(ENV_NAME_RE.fullmatch(name) is not None,
+                 f"{prefix}an env name must be a letter or _, then up to 127 letters, digits or _")
+        for value in env.values():
+            if isinstance(value, str):
+                need(len(value) <= ENV_VALUE_MAX, f"{prefix}an env value must be at most {ENV_VALUE_MAX} characters")
+    cwd, user = req.get("cwd"), req.get("user")
+    if isinstance(cwd, str):
+        need(1 <= len(cwd) <= CWD_MAX, f"{prefix}cwd must be 1 to {CWD_MAX} characters")
+    if isinstance(user, str):
+        need(len(user) <= USER_MAX, f"{prefix}user must be at most {USER_MAX} characters")
+        need(USER_RE.fullmatch(user) is not None, f"{prefix}user must be digits only, or a name of letters, digits, "
+                                                  "_ and - that starts with a letter or _ and may end in $")
     timeout = req.get("timeout_seconds")
     if _is_int(timeout):
         need(timeout >= 1, f"{prefix}timeout_seconds must be at least 1")
     inputs, outputs = req.get("inputs"), req.get("outputs")
     if isinstance(inputs, list):
         need(len(inputs) <= INPUTS_MAX, f"{prefix}inputs must hold at most {INPUTS_MAX} entries")
+        seen = set()
         for entry in inputs:
-            path = entry.get("path") if isinstance(entry, dict) else None
+            if not isinstance(entry, dict):
+                continue
+            path = entry.get("path")
             if isinstance(path, str):
-                need(path.startswith("/work/in/") and len(path) > len("/work/in/"),
-                     f"{prefix}an input path must be under /work/in/")
-            digest = entry.get("sha256") if isinstance(entry, dict) and from_file else None
+                _path_form(path, "input", INPUT_PREFIX, prefix)
+                need(path != CONTEXT_PATH, f"{prefix}an input path must not be {CONTEXT_PATH}")
+                need(path not in seen, f"{prefix}an input path is given twice")
+                seen.add(path)
+            if "mode" in entry:
+                need(isinstance(entry["mode"], str) and MODE_RE.fullmatch(entry["mode"]) is not None,
+                     f"{prefix}an input mode must be 3 or 4 octal digits")
+            digest = entry.get("sha256") if from_file else None
             if digest is not None:
                 need(isinstance(digest, str) and HEX64.fullmatch(digest) is not None,
                      f"{prefix}an input sha256 must be 64 lower-case hex")
     if isinstance(outputs, list):
+        seen = set()
         for entry in outputs:
             if not isinstance(entry, dict):
                 continue
             path, limit = entry.get("path"), entry.get("max_bytes")
             if isinstance(path, str):
-                need(path.startswith("/work/out/") and len(path) > len("/work/out/"),
-                     f"{prefix}an output path must be under /work/out/")
+                _path_form(path, "output", OUTPUT_PREFIX, prefix)
+                need(path not in seen, f"{prefix}an output path is given twice")
+                seen.add(path)
             if _is_int(limit):
+                need(limit >= 1, f"{prefix}an output max_bytes must be at least 1")
                 need(limit <= OUTPUT_MAX_BYTES, f"{prefix}an output max_bytes must be at most 200 MiB")
+    if from_file and _has_float(req.get("context")):
+        raise Fail(f"{prefix}context must hold no floating point number")
 
 
 def _members(doc: dict, allowed: tuple[str, ...]) -> None:
