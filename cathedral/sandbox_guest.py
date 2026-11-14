@@ -1309,6 +1309,11 @@ class DockerGuestProvider:
         self._built_images: dict[str, str] = {}  # content_hash -> tag
         self._build_locks: dict[str, threading.Lock] = {}  # tag -> lock; one build per tag
         self._build_locks_guard = threading.Lock()
+        # Anonymous pulls run once per image at a time (AB#534). A waiter whose
+        # generation moved while it waited reuses that pull instead of pulling.
+        self._pull_locks: dict[str, threading.Lock] = {}
+        self._pull_gen: dict[str, int] = {}
+        self._pull_guard = threading.Lock()
         # GC state. A sandbox id in _doomed has a "deleting" record and a container
         # that is not yet confirmed gone. Only one drain runs at a time.
         self._owner = os.environ.get("CATHEDRAL_SANDBOX_OWNER", "").strip() or "default"
@@ -1825,12 +1830,16 @@ class DockerGuestProvider:
         # One inspect answers both "is it here" and "what is it" on a cache hit.
         inspected = {} if refresh else self._client.image_inspect(image)
         if not inspected.get("Id"):
-            self._client.ensure_image(
-                image,
-                registry_auth=registry_auth,
-                refresh=refresh,
-                mirror=self._registry_mirror,
-            )
+            if registry_auth is not None:
+                # Each caller's credentials must reach the registry: never shared.
+                self._client.ensure_image(
+                    image,
+                    registry_auth=registry_auth,
+                    refresh=refresh,
+                    mirror=self._registry_mirror,
+                )
+            else:
+                self._pull_anonymous_once(image, refresh=refresh)
             # Record the marker right after the pull and before any inspect, so a
             # failed inspect after a pull still leaves it set.
             if registry_auth is not None:
@@ -1838,6 +1847,25 @@ class DockerGuestProvider:
                 _save_auth_pulled(self._auth_pulled)
             inspected = self._client.image_inspect(image)
         return inspected
+
+    def _pull_anonymous_once(self, image: str, *, refresh: bool) -> None:
+        """Singleflight for anonymous pulls of *image* (AB#534).
+
+        A burst of cold creates for one image runs one docker pull; the others
+        wait and reuse it. An anonymous pull that succeeded proves anyone may
+        fetch the image, so sharing it does not weaken the per-caller check in
+        _authorize_image. A failed pull is not shared: the next waiter pulls.
+        """
+        with self._pull_guard:
+            lock = self._pull_locks.setdefault(image, threading.Lock())
+            before = self._pull_gen.get(image, 0)
+        with lock:
+            with self._pull_guard:
+                if self._pull_gen.get(image, 0) != before:
+                    return
+            self._client.ensure_image(image, refresh=refresh, mirror=self._registry_mirror)
+            with self._pull_guard:
+                self._pull_gen[image] = before + 1
 
     def _start_guest(
         self, doc: dict[str, Any], request: CreateSandboxRequest, owner: str | None = None
@@ -2963,27 +2991,33 @@ class DockerGuestProvider:
             return self._inner.create_terminal(sandbox_id, cols=cols, rows=rows, mode=mode)
         # Probe the shell now, not at connect: connect holds the provider
         # lock and the probe is a docker exec.
-        argv, env = self._terminal_command(guest)
+        argv, overlay = self._terminal_command(guest)
 
         def spawn(c: int, r: int, on_output, on_exit) -> PtyProcess:
-            return PtyProcess(argv, cols=c, rows=r, on_output=on_output, on_exit=on_exit, env=env)
+            return _spawn_room_terminal(argv, overlay, cols=c, rows=r, on_output=on_output, on_exit=on_exit)
 
         return self._inner.create_terminal(sandbox_id, cols=cols, rows=rows, mode=mode, spawn=spawn)
 
     def _terminal_command(self, guest: GuestRecord) -> tuple[list[str], dict[str, str]]:
-        """docker exec -it argv for an interactive login shell in the room, and its env.
+        """docker exec -it argv for an interactive login shell in the room, and the overlay it gets.
 
-        The room's env overlay goes to the docker client's own environment and
-        is named on the argv by key only (-e KEY), so its values never show in
-        the hotel's process list.
+        The overlay is the customer's, so it must never reach the hotel's own
+        docker client (DOCKER_HOST, DOCKER_CONFIG, HTTPS_PROXY would steer it).
+        _spawn_room_terminal hands it to the container through --env-file,
+        which keeps its values off both the client env and the process list.
         """
-        shell = "bash" if self._has_bash(guest) else "sh"
-        argv = ["docker", "exec", "-it", "-w", "/work", "-e", "TERM=xterm-256color"]
         overlay = {k: v for k, v in guest.env_overlay.items() if k != "TERM"}
-        for key in overlay:
-            argv.extend(["-e", key])
-        argv.extend([guest.container_id, shell, "-l"])
-        return argv, {**os.environ, **overlay}
+        for key, value in overlay.items():
+            # An env file is one KEY=VALUE per line, and docker drops a trailing CR.
+            if "\n" in value or "\r" in value:
+                raise SandboxOpError(
+                    "terminal_env_unsupported",
+                    422,
+                    f"the value of {key} holds a line break, which a PTY terminal cannot pass; use mode line",
+                )
+        shell = "bash" if self._has_bash(guest) else "sh"
+        argv = ["docker", "exec", "-it", "-w", "/work", "-e", "TERM=xterm-256color", guest.container_id, shell, "-l"]
+        return argv, overlay
 
     def get(self, sandbox_id: str) -> dict[str, Any]:
         return self._with_tunables(self._inner.get(sandbox_id))
@@ -3039,6 +3073,52 @@ class DockerGuestProvider:
         self._remove_many(refs)
         self._guests.clear()
         self._inner.close()
+
+
+def _spawn_room_terminal(
+    argv: list[str],
+    overlay: Mapping[str, str],
+    *,
+    cols: int,
+    rows: int,
+    on_output: Callable[[bytes], None],
+    on_exit: Callable[[int], None],
+) -> PtyProcess:
+    """Start a room terminal's docker exec -it with the hotel's own env only.
+
+    The overlay goes in a 0600 env file in a private temp dir, named on the argv
+    by path. The docker client reads it before it calls the daemon, so the file
+    goes at the first output or at exit, whichever comes first.
+    """
+    if not overlay:
+        return PtyProcess(argv, cols=cols, rows=rows, on_output=on_output, on_exit=on_exit)
+    env_dir = tempfile.mkdtemp(prefix="cathedral-pty-env-")
+    removed = False
+
+    def remove_env_file() -> None:
+        nonlocal removed
+        if not removed:
+            removed = True
+            shutil.rmtree(env_dir, ignore_errors=True)
+
+    def output(chunk: bytes) -> None:
+        remove_env_file()
+        on_output(chunk)
+
+    def exited(code: int) -> None:
+        remove_env_file()
+        on_exit(code)
+
+    try:
+        env_file = os.path.join(env_dir, "env")
+        fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.writelines(f"{key}={value}\n" for key, value in overlay.items())
+        full = [*argv[:3], "--env-file", env_file, *argv[3:]]
+        return PtyProcess(full, cols=cols, rows=rows, on_output=output, on_exit=exited)
+    except BaseException:
+        remove_env_file()
+        raise
 
 
 def shlex_quote(value: str) -> str:

@@ -22,12 +22,26 @@ import (
 // A command still running at a restart has no reader left (the answer lives
 // only on the broker's open hotel call), so it comes back as "lost" and the
 // reason says the outcome is unknown. Results are never logged.
+//
+// What the broker holds for finished commands is bounded in memory, not only
+// in the file (AB#748). The bound always wins: when it is passed, older
+// results are evicted first and a guest's newest result last. An evicted
+// entry keeps its state, exit code, timing and receipt; only its large output
+// text is dropped, and it says so.
 
 const (
-	nativeExecFile     = "native-execs.json"
-	nativeExecKeep     = 24 * time.Hour // age bound for a finished result
-	nativeExecMax      = 256            // count bound for kept execs
-	nativeExecMaxBytes = 64 << 20       // size bound for the saved file's results
+	nativeExecFile = "native-execs.json"
+	nativeExecKeep = 24 * time.Hour // age bound for a finished result
+)
+
+// Bounds. Variables so tests can use small values.
+var (
+	nativeExecMax         = 256       // finished execs kept, whole broker
+	nativeExecMaxPerGuest = 64        // finished execs kept, one guest
+	nativeExecGuestBytes  = 64 << 20  // result output held in memory, one guest
+	nativeExecTotalBytes  = 256 << 20 // result output held in memory, whole broker
+	nativeExecFileBytes   = 64 << 20  // result output written to the saved file
+	nativeExecMaxRunning  = 32        // execs one guest may have running
 )
 
 // nativeExecDrain is how long a stopping broker waits for running execs.
@@ -85,48 +99,195 @@ func (b *broker) loadNativeExecs() {
 			e.Result = map[string]any{"message": "the broker restarted while the command ran; the outcome is unknown", "reason": "broker_restarted"}
 			e.DoneAt = time.Now()
 		}
+		if e.DoneAt.IsZero() { // a file from before every end state had a finish time
+			e.DoneAt = time.Now()
+		}
 		n.execs[e.ID] = e
 	}
+	n.pruneLocked(time.Now())
 }
 
-// saveNativeExecs prunes by age and count, then writes the file atomically.
-func (b *broker) saveNativeExecs() {
-	if b.cfg.StateDir == "" {
-		return
+// execOutputFields are the output of a command in a hotel exec answer. They
+// are the only large values in it, each clipped at execOutputCapBytes.
+var execOutputFields = []string{"stdout", "stderr"}
+
+// execOutputBytes is the size of a result's output: every byte of stdout and
+// stderr. It is what the bounds count and what an eviction frees.
+func execOutputBytes(e *nativeExec) int {
+	size := 0
+	for _, k := range execOutputFields {
+		if str, ok := e.Result[k].(string); ok {
+			size += len(str)
+		}
 	}
-	n := b.nexec
-	n.saveMu.Lock()
-	defer n.saveMu.Unlock()
-	now := time.Now()
-	n.mu.Lock()
-	list := make([]*nativeExec, 0, len(n.execs))
+	return size
+}
+
+// evictedResult is the result without its output, marked as evicted. It is a
+// new map: the caller decides whether it replaces the live result or only
+// goes to the saved file. The receipt headers are kept by the caller; they
+// sign the hotel's original answer, not this shortened one.
+func evictedResult(result map[string]any) map[string]any {
+	out := make(map[string]any, len(result)+4)
+	for k, v := range result {
+		out[k] = v
+	}
+	for _, k := range execOutputFields {
+		delete(out, k)
+	}
+	out["evicted"] = true
+	out["reason"] = "result_evicted"
+	out["message"] = "the output of this command was dropped to stay inside the memory kept for finished commands; poll soon after a command ends"
+	out["receipt_covers"] = "original_result"
+	return out
+}
+
+// execOlder orders finished execs by finish time (id breaks a tie).
+func execOlder(a, b *nativeExec) bool {
+	if !a.DoneAt.Equal(b.DoneAt) {
+		return a.DoneAt.Before(b.DoneAt)
+	}
+	return a.ID < b.ID
+}
+
+// pruneLocked applies every bound. The caller holds n.mu. It rescans the map
+// each time (up to nativeExecMax finished entries plus the running ones), so
+// there is no counter to drift. Each loop pass deletes an entry or drops
+// output from a result that has some, so every loop ends.
+func (n *nativeExecs) pruneLocked(now time.Time) {
+	byGuest := map[string][]*nativeExec{} // finished, oldest first
+	finished := 0
 	for id, e := range n.execs {
-		if e.State != "running" && now.Sub(e.DoneAt) > nativeExecKeep {
+		if e.State == "running" {
+			continue
+		}
+		if now.Sub(e.DoneAt) > nativeExecKeep {
 			delete(n.execs, id)
 			continue
 		}
+		byGuest[e.Guest] = append(byGuest[e.Guest], e)
+		finished++
+	}
+	for g, list := range byGuest {
+		sort.Slice(list, func(i, j int) bool { return execOlder(list[i], list[j]) })
+		for len(list) > nativeExecMaxPerGuest {
+			delete(n.execs, list[0].ID)
+			list = list[1:]
+			finished--
+		}
+		byGuest[g] = list
+	}
+	// Whole broker count: take from the guest holding the most, so a guest
+	// with one result loses it only when there are more guests than places.
+	for finished > nativeExecMax {
+		most, count := "", 0
+		for g, list := range byGuest {
+			if len(list) > count || (len(list) == count && count > 0 && g < most) {
+				most, count = g, len(list)
+			}
+		}
+		if count == 0 {
+			break // no finished entry is left to take
+		}
+		delete(n.execs, byGuest[most][0].ID)
+		byGuest[most] = byGuest[most][1:]
+		finished--
+	}
+	// Output per guest: oldest first, so the newest goes last.
+	total := 0
+	for _, list := range byGuest {
+		held := 0
+		for _, e := range list {
+			held += execOutputBytes(e)
+		}
+		for _, e := range list {
+			if held <= nativeExecGuestBytes {
+				break
+			}
+			if size := execOutputBytes(e); size > 0 {
+				e.Result = evictedResult(e.Result)
+				held -= size
+			}
+		}
+		total += held
+	}
+	// Output for the whole broker. Only results that still have output are
+	// candidates. First the older results of the guest whose older results
+	// hold the most; a guest's newest result only when no older output is left.
+	for total > nativeExecTotalBytes {
+		var victim *nativeExec
+		most := -1
+		for _, list := range byGuest {
+			older, first := 0, (*nativeExec)(nil)
+			for _, e := range list[:max(len(list)-1, 0)] {
+				if size := execOutputBytes(e); size > 0 {
+					older += size
+					if first == nil {
+						first = e
+					}
+				}
+			}
+			if first != nil && (older > most || (older == most && execOlder(first, victim))) {
+				most, victim = older, first
+			}
+		}
+		if victim == nil {
+			for _, list := range byGuest {
+				if len(list) == 0 {
+					continue
+				}
+				if e := list[len(list)-1]; execOutputBytes(e) > 0 && (victim == nil || execOlder(e, victim)) {
+					victim = e
+				}
+			}
+		}
+		if victim == nil {
+			return // nothing with output is left; cannot happen while total > 0
+		}
+		total -= execOutputBytes(victim)
+		victim.Result = evictedResult(victim.Result)
+	}
+}
+
+// saveNativeExecs prunes, then writes the file atomically. With no state
+// directory it still prunes.
+func (b *broker) saveNativeExecs() {
+	n := b.nexec
+	n.saveMu.Lock()
+	defer n.saveMu.Unlock()
+	n.mu.Lock()
+	n.pruneLocked(time.Now())
+	if b.cfg.StateDir == "" {
+		n.mu.Unlock()
+		return
+	}
+	list := make([]*nativeExec, 0, len(n.execs))
+	for _, e := range n.execs {
 		list = append(list, e)
 	}
-	sort.Slice(list, func(i, j int) bool { return list[i].Started.After(list[j].Started) })
-	if len(list) > nativeExecMax {
-		for _, e := range list[nativeExecMax:] {
-			if e.State != "running" {
-				delete(n.execs, e.ID)
-			}
+	// Newest first: results keep their output while the file stays under its
+	// bound. Past it an entry is written as an evicted copy, so after a
+	// restart it reads as evicted, not as missing. The live entry is untouched.
+	when := func(e *nativeExec) time.Time {
+		if e.State == "running" {
+			return e.Started
 		}
-		list = list[:nativeExecMax]
+		return e.DoneAt
 	}
-	// Newest first: keep results while the file stays under the size bound.
-	kept := list[:0:0]
+	sort.Slice(list, func(i, j int) bool {
+		if !when(list[i]).Equal(when(list[j])) {
+			return when(list[i]).After(when(list[j]))
+		}
+		return list[i].ID > list[j].ID
+	})
+	kept := make([]*nativeExec, 0, len(list))
 	total := 0
 	for _, e := range list {
-		size := 0
-		for _, v := range e.Result {
-			if s, ok := v.(string); ok {
-				size += len(s)
-			}
-		}
-		if e.State != "running" && total+size > nativeExecMaxBytes {
+		size := execOutputBytes(e)
+		if e.State != "running" && size > 0 && total+size > nativeExecFileBytes {
+			shadow := *e
+			shadow.Result = evictedResult(e.Result)
+			kept = append(kept, &shadow)
 			continue
 		}
 		total += size
@@ -177,6 +338,20 @@ func (b *broker) nativeExecStart(w http.ResponseWriter, g *guestState, rm *room,
 	ex := &nativeExec{ID: newUUID(), Guest: g.cfg.ID, Room: bid, State: "running", Started: time.Now(), done: make(chan struct{}), cancel: cancel}
 	n := b.nexec
 	n.mu.Lock()
+	n.pruneLocked(time.Now())
+	running := 0
+	for _, e := range n.execs {
+		if e.Guest == g.cfg.ID && e.State == "running" {
+			running++
+		}
+	}
+	if running >= nativeExecMaxRunning {
+		n.mu.Unlock()
+		cancel()
+		w.Header().Set("Retry-After", "5")
+		writeErr(w, 429, "exec_capacity", fmt.Sprintf("this key may have %d background commands running at one time; wait for one to end", nativeExecMaxRunning))
+		return
+	}
 	n.execs[ex.ID] = ex
 	n.mu.Unlock()
 	n.wg.Add(1)
@@ -185,7 +360,9 @@ func (b *broker) nativeExecStart(w http.ResponseWriter, g *guestState, rm *room,
 		defer close(ex.done)
 		status, hdr, doc, herr := b.hotelExecH(ctx, rm, body, timeout)
 		n.mu.Lock()
-		ex.DoneAt = time.Now()
+		if ex.DoneAt.IsZero() { // a stop on request already set it; it does not move
+			ex.DoneAt = time.Now()
+		}
 		switch {
 		case ex.State == "killed":
 		case herr != nil:
@@ -201,6 +378,8 @@ func (b *broker) nativeExecStart(w http.ResponseWriter, g *guestState, rm *room,
 			ex.Headers = map[string][]string{}
 			copyRoomHeaders(http.Header(ex.Headers), hdr)
 		}
+		// The result and the bounds in one locked step, before any file work.
+		n.pruneLocked(time.Now())
 		n.mu.Unlock()
 		b.saveNativeExecs()
 	}()
@@ -224,6 +403,7 @@ func (b *broker) nativeExecPoll(w http.ResponseWriter, r *http.Request, g *guest
 		killed := ex.State == "running"
 		if killed {
 			ex.State = "killed"
+			ex.DoneAt = time.Now()
 			ex.Result = map[string]any{"message": "stopped on request; the command may run on inside the room until its timeout"}
 		}
 		n.mu.Unlock()

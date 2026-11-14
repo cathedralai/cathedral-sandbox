@@ -246,16 +246,105 @@ def test_the_docker_guest_runs_an_interactive_login_shell_in_the_room(tmp_path, 
         sid = provider.create(req, api_key="k", idempotency=None, body_digest="x")["id"]
         guest = provider._guests[sid]  # noqa: SLF001
         guest.env_overlay = {"API_TOKEN": "s3cret-value"}
-        argv, env = provider._terminal_command(guest)  # noqa: SLF001
+        argv, overlay = provider._terminal_command(guest)  # noqa: SLF001
         shell = "bash" if guest.has_bash else "sh"
         assert argv[:3] == ["docker", "exec", "-it"]
         assert argv[-3:] == [guest.container_id, shell, "-l"]
         assert "TERM=xterm-256color" in argv and "/work" in argv
-        # The secret is named by key on the argv, its value only in the env.
-        assert "API_TOKEN" in argv and not any("s3cret-value" in a for a in argv)
-        assert env["API_TOKEN"] == "s3cret-value"
+        # The overlay is not on the argv at all; spawn hands it over in an env file.
+        assert not any("API_TOKEN" in a or "s3cret-value" in a for a in argv)
+        assert overlay == {"API_TOKEN": "s3cret-value"}
         doc = provider.create_terminal(sid, mode="pty")
         assert doc["mode"] == "pty"
+        assert provider.create_terminal(sid)["mode"] == "line"
+    finally:
+        provider.close()
+
+
+def _docker_room(tmp_path, monkeypatch):
+    from cathedral.sandbox_guest import DockerGuestProvider
+    from tests.fake_docker_cli import install
+
+    docker = install(tmp_path, monkeypatch)
+    docker.add_image("alpine:3.20")
+    docker.set(exec_model=True)
+    monkeypatch.setenv("CATHEDRAL_SANDBOX_AUTH_PULLED_FILE", str(tmp_path / "auth-pulled.json"))
+    provider = DockerGuestProvider()
+    req = CreateSandboxRequest(image=ImageSource(image="alpine:3.20"), resources=Resources(vcpu=1, memory_gib=1, disk_gib=5))
+    sid = provider.create(req, api_key="k", idempotency=None, body_digest="x")["id"]
+    return provider, sid
+
+
+def test_the_room_env_overlay_never_reaches_the_hotels_docker_client(tmp_path, monkeypatch) -> None:
+    """A customer overlay with DOCKER_HOST must not steer the hotel's docker exec.
+
+    The overlay reaches the container through a private 0600 env file, so its
+    values are in neither the client's env nor its argv.
+    """
+    import os
+    import stat as stat_mod
+
+    import cathedral.sandbox_guest as guest_mod
+
+    seen: dict = {}
+
+    class _Recorder:
+        def __init__(self, argv, *, cols, rows, on_output, on_exit, env=None):
+            seen["argv"] = list(argv)
+            seen["env"] = env
+            seen["on_output"] = on_output
+            seen["on_exit"] = on_exit
+            if "--env-file" in argv:
+                path = argv[argv.index("--env-file") + 1]
+                seen["env_file"] = path
+                seen["file_mode"] = stat_mod.S_IMODE(os.stat(path).st_mode)
+                seen["dir_mode"] = stat_mod.S_IMODE(os.stat(os.path.dirname(path)).st_mode)
+                with open(path, encoding="utf-8") as handle:
+                    seen["file_lines"] = handle.read().splitlines()
+            self.exit_code = None
+            self.pid = 0
+
+        def write(self, data):
+            return len(data)
+
+        def resize(self, cols, rows):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(guest_mod, "PtyProcess", _Recorder)
+    hostile = "tcp://203.0.113.7:2375"
+    provider, sid = _docker_room(tmp_path, monkeypatch)
+    try:
+        provider._guests[sid].env_overlay = {"DOCKER_HOST": hostile, "API_TOKEN": "s3cret-value"}  # noqa: SLF001
+        tid = provider.create_terminal(sid, mode="pty")["id"]
+        provider.connect_terminal(sid, tid, ticket=provider.mint_access_ticket(sid)["ticket"])
+        client_env = os.environ if seen["env"] is None else seen["env"]
+        assert client_env.get("DOCKER_HOST") != hostile
+        assert "s3cret-value" not in client_env.values()
+        assert not any(hostile in a or "s3cret-value" in a for a in seen["argv"])
+        # The values still reach the container, from a file only the hotel can read.
+        assert seen["argv"][:3] == ["docker", "exec", "-it"]
+        assert sorted(seen["file_lines"]) == ["API_TOKEN=s3cret-value", f"DOCKER_HOST={hostile}"]
+        assert (seen["file_mode"], seen["dir_mode"]) == (0o600, 0o700)
+        # Gone once the exec has started (first output), and stays gone at exit.
+        seen["on_output"](b"$ ")
+        assert not os.path.exists(seen["env_file"])
+        assert not os.path.exists(os.path.dirname(seen["env_file"]))
+        seen["on_exit"](0)
+    finally:
+        provider.close()
+
+
+def test_a_pty_terminal_refuses_an_overlay_value_an_env_file_cannot_carry(tmp_path, monkeypatch) -> None:
+    provider, sid = _docker_room(tmp_path, monkeypatch)
+    try:
+        provider._guests[sid].env_overlay = {"PEM": "line one\nline two"}  # noqa: SLF001
+        with pytest.raises(SandboxOpError) as exc:
+            provider.create_terminal(sid, mode="pty")
+        assert (exc.value.code, exc.value.http_status) == ("terminal_env_unsupported", 422)
+        assert "line one" not in str(exc.value)
         assert provider.create_terminal(sid)["mode"] == "line"
     finally:
         provider.close()
