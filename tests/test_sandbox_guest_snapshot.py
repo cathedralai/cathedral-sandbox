@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -185,7 +186,7 @@ def _bytes_writer(fake: FakeDocker, payload: bytes = b"the tar bytes the fake pr
                   entered: threading.Event | None = None):
     """A stand-in for the /work archive writer: it logs a TAR marker among the docker calls."""
 
-    def write(src: Path, dest: Path) -> None:
+    def write(src: Path, dest: Path, **kw) -> None:
         fake.mark("TAR")
         if entered is not None:
             entered.set()
@@ -217,7 +218,7 @@ def test_the_tar_is_taken_while_the_room_is_paused(fake, provider, monkeypatch) 
     sid = _source(provider)
     seen = []
 
-    def write(src, dest):
+    def write(src, dest, **kw):
         seen.append(fake.status_of(sid))
         dest.write_bytes(b"x")
 
@@ -241,7 +242,7 @@ def _hash_fails(path):
     raise RuntimeError("disk read error while hashing")
 
 
-def _tar_fails(src, dest):
+def _tar_fails(src, dest, **kw):
     dest.write_bytes(b"half")  # a partial file the code must not leave behind
     raise OSError("no space left on device")
 
@@ -338,12 +339,12 @@ def test_snapshots_of_different_rooms_run_side_by_side(fake, provider, monkeypat
     real = sandbox_provider._write_work_archive
     calls = []
 
-    def write(src, dest):
+    def write(src, dest, **kw):
         calls.append(src)
         if len(calls) == 1:
             entered.set()
             assert gate.wait(10)
-        real(src, dest)
+        real(src, dest, **kw)
 
     monkeypatch.setattr(sandbox_provider, "_write_work_archive", write)
     worker = threading.Thread(target=lambda: provider.snapshot(a), daemon=True)
@@ -398,7 +399,7 @@ def test_an_old_caller_that_reads_the_old_fields_still_works(fake, provider) -> 
 
 # ---------------------------------------------------------------- caps
 def _sparse_writer(size: int):
-    def write(src, dest):
+    def write(src, dest, **kw):
         with open(dest, "wb") as fh:
             fh.truncate(size)
     return write
@@ -732,7 +733,7 @@ def test_a_write_already_in_flight_finishes_before_the_tar_begins(fake, provider
     seen: list[str] = []
     _slow_write(monkeypatch, write_gate, write_started)
 
-    def tar(src, dest):
+    def tar(src, dest, **kw):
         tar_started.set()
         seen.append((src / "slow.txt").read_text())
         dest.write_bytes(b"t")
@@ -1066,3 +1067,291 @@ def test_a_snapshot_delete_that_could_not_remove_the_image_says_so_over_http(fak
     other, _, _ = _captured(provider)  # a clean delete keeps the old answer exactly
     clean = app.dispatch("DELETE", f"/v1/snapshots/{other['snapshot_id']}", {"Authorization": "Bearer k"}, b"")
     assert json.loads(clean.body) == {"deleted": True}
+
+# ======================================================================== CS-1 review 1 fixes
+import time as _time
+
+
+def _hold_first(provider, name: str):
+    """Hold the first call of a docker client method (pause, unpause) after the caller was admitted."""
+    gate, entered, calls = threading.Event(), threading.Event(), []
+    real = getattr(provider._client, name)  # noqa: SLF001
+
+    def wrapped(*a, **kw):
+        calls.append(a)
+        if len(calls) == 1:
+            entered.set()
+            assert gate.wait(10)
+        return real(*a, **kw)
+
+    setattr(provider._client, name, wrapped)  # noqa: SLF001
+    return gate, entered
+
+
+def test_a_freeze_admitted_before_the_capture_finishes_before_the_tar_and_the_room_stays_frozen(fake, provider, monkeypatch) -> None:
+    sid = _source(provider)
+    gate, entered = _hold_first(provider, "pause")
+    tar_started = threading.Event()
+
+    def tar(src, dest, **kw):
+        tar_started.set()
+        dest.write_bytes(b"t")
+
+    monkeypatch.setattr(sandbox_provider, "_write_work_archive", tar)
+    outcome: list = []
+    freezer = threading.Thread(target=lambda: provider.freeze(sid), daemon=True)
+    freezer.start()
+    assert entered.wait(10)  # the freeze is admitted and held inside the engine call
+    snap = threading.Thread(target=lambda: outcome.append(provider.snapshot(sid)), daemon=True)
+    snap.start()
+    try:
+        assert not tar_started.wait(0.5), "the capture went ahead of a freeze that was already admitted"
+    finally:
+        gate.set()
+    freezer.join(10)
+    snap.join(10)
+    assert len(outcome) == 1  # the snapshot succeeded, on a room that is frozen
+    assert fake.status_of(sid) == "paused" and provider.get(sid)["state"] == "frozen"
+    assert len(fake.calls_of("pause")) == 1 and fake.calls_of("unpause") == []  # no second pause, no stray unpause
+
+
+def test_a_thaw_admitted_before_the_capture_finishes_before_the_tar_so_the_tar_sees_a_paused_room(fake, provider, monkeypatch) -> None:
+    sid = _source(provider)
+    provider.freeze(sid)
+    gate, entered = _hold_first(provider, "unpause")
+    seen: list = []
+    tar_started = threading.Event()
+
+    def tar(src, dest, **kw):
+        tar_started.set()
+        seen.append(fake.status_of(sid))
+        dest.write_bytes(b"t")
+
+    monkeypatch.setattr(sandbox_provider, "_write_work_archive", tar)
+    thawer = threading.Thread(target=lambda: provider.thaw(sid), daemon=True)
+    thawer.start()
+    assert entered.wait(10)
+    snap = threading.Thread(target=lambda: provider.snapshot(sid), daemon=True)
+    snap.start()
+    try:
+        assert not tar_started.wait(0.5), "the capture started its tar while a thaw was in flight"
+    finally:
+        gate.set()
+    thawer.join(10)
+    snap.join(10)
+    assert seen == ["paused"]  # the thaw finished first, then the capture paused the room itself
+    assert fake.status_of(sid) == "running" and provider.get(sid)["state"] == "running"
+
+
+# ---------------------------------------------------------------- item 2: a pause attempted is always undone
+def test_a_pause_that_timed_out_but_took_effect_is_undone(fake, provider) -> None:
+    sid = _source(provider)
+    real = provider._client.pause  # noqa: SLF001
+
+    def pause(cid):
+        real(cid)
+        raise SandboxOpError("guest_pause_failed", 502, "docker pause timed out")
+
+    provider._client.pause = pause  # noqa: SLF001
+    with pytest.raises(SandboxOpError) as err:
+        provider.snapshot(sid)
+    assert err.value.code == "guest_pause_failed"
+    assert fake.status_of(sid) == "running" and len(fake.calls_of("unpause")) == 1
+    assert provider.pending_unpauses() == {}
+
+
+def test_a_pause_that_timed_out_and_did_not_take_effect_leaves_a_running_room_and_no_debt(fake, provider) -> None:
+    sid = _source(provider)
+
+    def pause(cid):
+        raise SandboxOpError("guest_pause_failed", 502, "docker pause timed out")
+
+    provider._client.pause = pause  # noqa: SLF001
+    with pytest.raises(SandboxOpError) as err:
+        provider.snapshot(sid)
+    assert err.value.code == "guest_pause_failed"  # the unpause of a running container ("is not paused") is harmless
+    assert len(fake.calls_of("unpause")) == 1 and fake.status_of(sid) == "running"
+    assert provider.pending_unpauses() == {} and provider.get(sid)["state"] == "running"
+
+
+def test_a_failed_unpause_is_owed_reported_truthfully_logged_and_retried_by_the_sweep(fake, provider, capsys) -> None:
+    sid = _source(provider)
+    fake.set(unpause_fail_times=2)  # the capture's unpause fails, and so does the sweep's first retry
+    with pytest.raises(SandboxOpError) as err:
+        provider.snapshot(sid)
+    assert err.value.code == "guest_unpause_failed"
+    assert provider.list_snapshots() == []
+    assert fake.status_of(sid) == "paused"
+    assert provider.get(sid)["state"] == "frozen"  # not "running" over a paused room
+    assert list(provider.pending_unpauses()) == [sid]
+    first = [ln for ln in capsys.readouterr().err.splitlines() if "unpause" in ln and sid in ln]
+    assert len(first) == 1
+    provider.sweep()  # fails again: still owed, one more line
+    assert fake.status_of(sid) == "paused" and provider.get(sid)["state"] == "frozen"
+    assert len([ln for ln in capsys.readouterr().err.splitlines() if "unpause" in ln and sid in ln]) == 1
+    provider.sweep()  # succeeds
+    assert fake.status_of(sid) == "running" and provider.get(sid)["state"] == "running"
+    assert provider.pending_unpauses() == {}
+
+
+def test_an_owed_unpause_is_dropped_when_the_room_is_gone(fake, provider) -> None:
+    sid = _source(provider)
+    fake.set(unpause_fail_times=1)
+    with pytest.raises(SandboxOpError):
+        provider.snapshot(sid)
+    provider.delete(sid)
+    provider.sweep()
+    assert provider.pending_unpauses() == {}
+
+
+def test_the_tar_has_a_deadline_and_a_byte_limit_that_the_provider_passes(fake, provider, monkeypatch) -> None:
+    sid = _source(provider)
+    seen: dict = {}
+
+    def tar(src, dest, **kw):
+        seen.update(kw)
+        dest.write_bytes(b"t")
+
+    monkeypatch.setattr(sandbox_provider, "_write_work_archive", tar)
+    _snapshot(provider, sid)
+    assert seen["max_bytes"] == 5 * GIB and seen["deadline"] > _time.monotonic()
+
+
+def test_the_real_tar_stops_at_its_deadline(tmp_path) -> None:
+    work = tmp_path / "w"
+    work.mkdir()
+    (work / "a").write_bytes(b"x" * 100)
+    with pytest.raises(SandboxOpError) as err:
+        sandbox_provider._write_work_archive(work, tmp_path / "t.tgz", deadline=_time.monotonic() - 1)
+    assert err.value.code == "snapshot_timeout"
+
+
+# ---------------------------------------------------------------- item 3: the reaper leaves a capture's image alone
+def test_a_sweep_between_the_commit_and_the_record_does_not_remove_the_image(fake, provider, monkeypatch) -> None:
+    sid = _source(provider)
+    gate, entered = threading.Event(), threading.Event()
+    real = sandbox_provider._sha256_file
+
+    def slow_hash(path):
+        entered.set()
+        assert gate.wait(10)
+        return real(path)
+
+    monkeypatch.setattr(sandbox_provider, "_sha256_file", slow_hash)
+    outcome: list = []
+    worker = threading.Thread(target=lambda: outcome.append(provider.get_operation(provider.snapshot(sid))["result"]), daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(10)  # committed, unpaused, not yet recorded
+        provider._reconcile_interval = 0  # noqa: SLF001
+        provider._last_reconcile = None  # noqa: SLF001
+        provider.sweep()
+        assert [i for i in fake.state["images"] if i.startswith("cathedral-snap-")], "the sweep removed an image mid-capture"
+        assert provider.list_snapshots() == []
+    finally:
+        gate.set()
+        worker.join(10)
+    (result,) = outcome
+    assert _fork(provider, result["snapshot_id"])["guest"]["image"] == f"cathedral-snap-{result['snapshot_id']}:latest"
+    assert provider._snapshot_images[result["snapshot_id"]]  # noqa: SLF001
+
+
+# ---------------------------------------------------------------- item 4: cleanup holes
+def test_a_commit_that_succeeded_but_failed_to_report_leaves_no_image(fake, provider) -> None:
+    sid = _source(provider)
+    real = provider._client.commit  # noqa: SLF001
+
+    def commit(cid, image_name, **kw):
+        real(cid, image_name, **kw)
+        raise SandboxOpError("snapshot_failed", 502, "docker image inspect timed out")
+
+    provider._client.commit = commit  # noqa: SLF001
+    with pytest.raises(SandboxOpError):
+        provider.snapshot(sid)
+    assert not [i for i in fake.state["images"] if i.startswith("cathedral-snap-")]
+    assert fake.status_of(sid) == "running"
+
+
+def test_a_failure_while_the_record_is_inserted_leaves_no_replayable_record(fake, provider, monkeypatch) -> None:
+    sid = _source(provider)
+    from cathedral import sandbox_api
+
+    real = sandbox_api.operation_id
+    state = {"armed": True}
+
+    def op_id():
+        if state["armed"]:
+            state["armed"] = False
+            raise RuntimeError("injected failure while the record is written")
+        return real()
+
+    monkeypatch.setattr(sandbox_api, "operation_id", op_id)
+    with pytest.raises(RuntimeError):
+        provider.snapshot(sid, name="n")
+    assert provider.list_snapshots() == [] and provider._inner._snapshot_capture == {}  # noqa: SLF001
+    assert not [i for i in fake.state["images"] if i.startswith("cathedral-snap-")]
+    assert not list(provider._inner._base.glob("snap_*"))  # noqa: SLF001
+    again = _snapshot(provider, sid, name="n")  # the name is free and nothing stale is replayed
+    assert len(fake.calls_of("commit")) == 2 and again["snapshot_id"]
+
+
+# ---------------------------------------------------------------- item 5: limits before allocation
+def test_the_tar_stops_at_the_cap_and_never_writes_past_it(tmp_path) -> None:
+    work = tmp_path / "w"
+    work.mkdir()
+    (work / "big").write_bytes(os.urandom(400_000))
+    dest = tmp_path / "t.tgz"
+    with pytest.raises(SandboxOpError) as err:
+        sandbox_provider._write_work_archive(work, dest, max_bytes=50_000)
+    assert (err.value.code, err.value.http_status) == ("snapshot_too_large", 413)
+    assert dest.stat().st_size <= 50_000
+
+
+def test_two_concurrent_captures_that_together_exceed_the_store_are_not_both_started(fake, monkeypatch) -> None:
+    p = DockerGuestProvider(inner=InMemorySandboxProvider(max_snapshot_bytes=8 * GIB, enforce_disk=True))
+    try:
+        a, b = _room(p, "a"), _room(p, "b")  # each room may write up to 5 GiB: 10 GiB would not fit in 8
+        gate, entered = threading.Event(), threading.Event()
+        limits: list = []
+
+        def tar(src, dest, **kw):
+            limits.append(kw.get("max_bytes"))
+            entered.set()
+            assert gate.wait(10)
+            dest.write_bytes(b"t")
+
+        monkeypatch.setattr(sandbox_provider, "_write_work_archive", tar)
+        worker = threading.Thread(target=lambda: p.snapshot(a), daemon=True)
+        worker.start()
+        try:
+            assert entered.wait(10)
+            with pytest.raises(SandboxOpError) as err:
+                p.snapshot(b)
+            assert (err.value.code, err.value.http_status) == ("snapshot_store_sold_out", 429)
+            assert fake.status_of(b) == "running" and len(fake.calls_of("pause")) == 1
+        finally:
+            gate.set()
+            worker.join(10)
+        assert limits == [5 * GIB]
+        assert _snapshot(p, b)["snapshot_id"]  # the reservation went away with the first capture
+    finally:
+        p.close()
+
+
+# ---------------------------------------------------------------- item 6: no unlink under the provider lock
+def test_the_aborted_captures_tar_is_removed_outside_the_provider_lock(fake, provider, monkeypatch) -> None:
+    sid = _source(provider)
+    monkeypatch.setattr(sandbox_provider, "_write_work_archive", _tar_fails)
+    owned: list[bool] = []
+    real_unlink = Path.unlink
+
+    def unlink(self, *a, **kw):
+        if self.name.startswith("snap_"):
+            owned.append(provider._inner._lock._is_owned())  # noqa: SLF001
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(SandboxOpError):
+        provider.snapshot(sid)
+    assert owned and not any(owned)
+    assert not list(provider._inner._base.glob("snap_*"))  # noqa: SLF001
