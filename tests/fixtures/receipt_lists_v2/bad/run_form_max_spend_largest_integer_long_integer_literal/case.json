@@ -20,7 +20,7 @@
  "description": "One step past the form rule max_spend_largest_integer: long_integer_literal.",
  "expect": {
   "exit_code": 1,
-  "reason": "inputs: the recipe holds a number of more than 100 digits",
+  "reason": "inputs: the recipe holds a number literal of more than 100 characters",
   "verdict": "FAIL"
  }
 }

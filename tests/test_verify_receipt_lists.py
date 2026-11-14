@@ -324,6 +324,11 @@ NETWORK_TABLE = [
     ["10.0.0.1"], ["192.168.0.0/16"], ["127.0.0.1"], ["::1"], ["2001:db8::/32"], ["https://pypi.org"], ["pypi.org/path"],
     ["pypi.org:8080"], ["203.0.113.8:80"], ["localhost"], ["a..b"], ["-a.org"], ["a.123"], [""], ["x" * 300], [5],
     ["*.*.org"], ["*org"], ["a.b", "A.B", "a.b:443", "*.a.b", "*.a.b:80"],
+    # zero-padded and out-of-range ports: the machine API has no cap on the digits (an entry is at most 255 characters)
+    *([f"example.org:{value}"] for value in (
+        "000443", "00443", "443".zfill(20), "443".zfill(240), "80".zfill(6), "80".zfill(20), "80".zfill(240), "0",
+        "0".zfill(20), "0".zfill(240), "65536", "65536".zfill(20), "9" * 5, "9" * 20, "9" * 243, "9" * 244)),
+    ["*.example.org:" + "443".zfill(20)], ["203.0.113.8:" + "443".zfill(20)],
 ]
 
 
@@ -604,6 +609,7 @@ def assemble_bundle(case: Path) -> dict:
     """The reference assembler: what the one-shot file must be, built only from what the machine and the broker
     gave the API (machine/) and what the caller sent (caller/). The API's own assembler must give the same file."""
     import base64
+    import hashlib
     import re
 
     machine, caller = case / "machine", case / "caller"
@@ -623,9 +629,35 @@ def assemble_bundle(case: Path) -> dict:
     post = exact(json.loads((caller / "post_body.json").read_text()), (
         "image", "image_id", "command", "env", "size", "timeout_seconds", "network", "inputs", "outputs", "context",
         "max_spend_usd"), "POST body")
+    is_int = lambda v: isinstance(v, int) and not isinstance(v, bool)
+    for member, ok in (("image", lambda v: isinstance(v, str)), ("image_id", lambda v: isinstance(v, str)),
+                       ("command", lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v)),
+                       ("env", lambda v: isinstance(v, dict) and all(isinstance(x, str) for x in v.values())),
+                       ("size", lambda v: isinstance(v, str)), ("timeout_seconds", is_int),
+                       ("network", lambda v: isinstance(v, (str, dict))), ("inputs", lambda v: isinstance(v, list)),
+                       ("outputs", lambda v: isinstance(v, list)), ("context", lambda v: isinstance(v, dict)),
+                       ("max_spend_usd", lambda v: is_int(v) or isinstance(v, str))):
+        assert ok(post[member]), f"POST body: {member} has the wrong type"
+
+    def input_entry(i):
+        exact(i, ("path", "sha256", "content_b64", "mode"), "POST input")
+        assert isinstance(i["path"], str) and isinstance(i["mode"], str) and re.fullmatch(r"[0-7]{3,4}", i["mode"])
+        assert isinstance(i["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", i["sha256"])
+        assert isinstance(i["content_b64"], str), "POST input: content_b64 is not a string"
+        content = base64.b64decode(i["content_b64"], validate=True)   # raises on text that is not base64
+        assert hashlib.sha256(content).hexdigest() == i["sha256"], "POST input: content_b64 is not the sha256"
+        return {k: v for k, v in i.items() if k != "content_b64"}
+
+    def output_entry(o):
+        assert isinstance(o, dict) and set(o) <= {"path", "max_bytes", "optional"} and {"path", "max_bytes"} <= set(o), \
+            f"POST output: {o} has a member outside path, max_bytes and optional"
+        assert isinstance(o["path"], str) and is_int(o["max_bytes"]) and isinstance(o.get("optional", False), bool)
+        return o
+
+    for o in post["outputs"]:
+        output_entry(o)
     request = {k: v for k, v in post.items() if k != "inputs"}
-    request["inputs"] = [{k: v for k, v in exact(i, ("path", "sha256", "content_b64", "mode"), "POST input").items()
-                          if k != "content_b64"} for i in post["inputs"]]
+    request["inputs"] = [input_entry(i) for i in post["inputs"]]
     broker_answer = exact(json.loads((machine / "01_create.response").read_text()), (
         "id", "state", "network", "hotel", "isolation", "create_request_b64"), "broker 202")
     exact(broker_answer["isolation"], ("hotel_sealed", "hotel_tee", "room_runtime", "attested_per_room",
@@ -839,15 +871,60 @@ def test_the_exchange_file_with_reasons_in_not_proven_still_passes(tmp_path) -> 
 
 def test_digit_runs_and_depth_are_counted_on_the_raw_text() -> None:
     vr = _load_checker()
-    assert vr.json_shape('{"a": 12345, "b": "99999999", "c": [1.25e10]}') == (2, 5)
+    assert vr.json_shape('{"a": 12345, "b": "99999999", "c": [1.25e10]}') == (2, 8)
     assert vr.json_shape("[" * 7 + "1" * 300 + "]" * 7) == (7, 300)
-    for text, what in (("[" + "1" * 101 + "]", "holds a number of more than 100 digits"),):
+    assert vr.json_shape("[true, false, null]") == (1, 1)          # the e of true and false is one character
+    what = "holds a number literal of more than 100 characters"
+    for token in ("1" * 101, "9" * 50 + "." + "9" * 51, "1e" + "0" * 99, "-" + "1" * 49 + "e+" + "0" * 50,
+                  "0." + "0" * 99, "1" * 100 + "e5"):
         with pytest.raises(vr.Fail, match=what):
-            vr.strict_json(text.encode(), "p", "x")
-    assert vr.strict_json(("[" + "1" * 100 + "]").encode(), "p", "x") == [int("1" * 100)]
+            vr.strict_json(f"[{token}]".encode(), "p", "x")
+    for token in ("1" * 100, "9" * 49 + "." + "9" * 50, "1e" + "0" * 98, "-" + "1" * 99):
+        assert len(token) == 100 and vr.strict_json(f"[{token}, 2]".encode(), "p", "x", floats=True)
 
 
 def test_a_port_of_thousands_of_digits_is_a_clean_refusal() -> None:
     vr = _load_checker()
     with pytest.raises(vr.Fail, match="not a valid allowlist entry"):
-        vr.canonical_policy("allowlist", ["a.org:" + "9" * 5000])
+        vr.canonical_policy("allowlist", ["a.org:" + "9" * 5000])      # past the 255 characters of an entry
+
+
+def test_a_zero_padded_port_is_accepted_as_the_machine_api_accepts_it() -> None:
+    vr = _load_checker()
+    for padded in ("000443", "443".zfill(20), "443".zfill(240)):
+        assert vr.canonical_policy("allowlist", [f"example.org:{padded}"]) == {
+            "mode": "allowlist", "allow": ["example.org:443"]}
+
+
+@pytest.mark.parametrize("edit", [
+    lambda d: d["inputs"][0].update(content_b64=None),
+    lambda d: d["inputs"][0].update(content_b64=5),
+    lambda d: d["inputs"][0].update(content_b64=["eA=="]),
+    lambda d: d["inputs"][0].update(content_b64="not base64!"),
+    lambda d: d["inputs"][0].update(content_b64="eA=="),                      # base64, but not the input's bytes
+    lambda d: d["inputs"][0].update(path=5),
+    lambda d: d["inputs"][0].update(mode=644),
+    lambda d: d["inputs"][0].update(sha256="A" * 64),
+    lambda d: d["inputs"][0].update(sha256=None),
+    lambda d: d["outputs"][0].update(extra=1),
+    lambda d: d["outputs"][0].update(max_bytes=True),
+    lambda d: d["outputs"][0].update(max_bytes="65536"),
+    lambda d: d["outputs"][0].update(optional="no"),
+    lambda d: d["outputs"][0].update(path=7),
+    lambda d: d["outputs"][0].pop("max_bytes"),
+    lambda d: d["outputs"].append(5),
+    lambda d: d.update(env={"A": 1}),
+    lambda d: d.update(timeout_seconds=True),
+    lambda d: d.update(context=[]),
+    lambda d: d.update(command="run"),
+    lambda d: d.update(max_spend_usd=1.5),
+    lambda d: d.update(inputs={}),
+], ids=["content-null", "content-number", "content-list", "content-not-base64", "content-other-bytes", "path-number",
+        "mode-number", "sha256-upper", "sha256-null", "output-extra", "output-max-bool", "output-max-text",
+        "output-optional-text", "output-path-number", "output-no-max", "output-not-object", "env-number",
+        "timeout-bool", "context-list", "command-text", "spend-float", "inputs-object"])
+def test_the_reference_assembler_refuses_a_caller_value_of_the_wrong_type_or_shape(edit, tmp_path) -> None:
+    case = _copy_exchange(tmp_path)
+    _rewrite(case / "caller" / "post_body.json", edit)
+    with pytest.raises((AssertionError, ValueError)):
+        assemble_bundle(case)
