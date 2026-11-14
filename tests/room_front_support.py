@@ -45,6 +45,9 @@ class FakeApi:
         self.rooms: set[str] = set()
         self.labels: dict[str, dict] = {}
         self.answer_holds: list[Hold] = []
+        self.lost_bulks: list[threading.Event] = []
+        self.trickles: list[tuple[re.Pattern, float]] = []
+        self.raw_trickles: list[tuple[re.Pattern, float, str, str]] = []
         self.new_ids: list[str] = []
         self.counter = 0
         self.holds: list[tuple[re.Pattern, Hold]] = []
@@ -53,6 +56,7 @@ class FakeApi:
         self.network_policy: dict | None = DENY_ALL
         self.expires_in = 3600.0
         self.expires_at: str | None = None
+        self.omit_expires = False
         self.create_answer: dict = {}
         self.get_replies: dict[str, tuple[int, bytes]] = {}
         self.list_status = 200
@@ -64,6 +68,23 @@ class FakeApi:
         h = Hold()
         self.holds.append((re.compile(pattern), h))
         return h
+
+    def lose_bulk(self) -> threading.Event:
+        """The next bulk delete is read and its targets are picked, then no answer is sent: it keeps running and
+        removes its targets only when the returned event is set (a bulk the front gave up on)."""
+        release = threading.Event()
+        self.lost_bulks.append(release)
+        return release
+
+    def trickle(self, pattern: str, gap: float) -> None:
+        """Answer the matching request in three pieces with *gap* seconds between them."""
+        self.trickles.append((re.compile(pattern), gap))
+
+    def trickle_raw(self, pattern: str, gap: float, status_line: str, mode: str) -> None:
+        """Answer the matching request byte-wise slowly. mode "headers": the headers arrive one at a time, *gap*
+        seconds apart, and the Content-Length last. mode "close_body": the headers (Connection: close, no length)
+        arrive at once and the body in three pieces, *gap* apart, then the connection closes."""
+        self.raw_trickles.append((re.compile(pattern), gap, status_line, mode))
 
     def hold_create_answers(self) -> Hold:
         """Hold each create after the API made the room and before it answers."""
@@ -107,10 +128,29 @@ class FakeApi:
                     if entry[1] is not None:
                         entry[1] -= 1
                     break
+        if line == "DELETE /v1/sandboxes" and self.lost_bulks:
+            release = self.lost_bulks.pop(0)
+            targets = self._targets(h)
+
+            def finish_later() -> None:
+                release.wait(30)
+                with self.lock:
+                    self.rooms.difference_update(targets)
+
+            threading.Thread(target=finish_later, daemon=True).start()
+            h.close_connection = True
+            h.connection.shutdown(socket.SHUT_RDWR)
+            return
         if dropping:
             h.close_connection = True
             h.connection.shutdown(socket.SHUT_RDWR)
             return
+        for rx, gap in self.trickles:
+            if rx.fullmatch(line):
+                return self._send_slowly(h, gap)
+        for rx, gap, status_line, mode in self.raw_trickles:
+            if rx.fullmatch(line):
+                return self._send_raw_slowly(h, gap, status_line, mode)
         for rx, status, out in self.replies:
             if rx.fullmatch(line):
                 return self._send(h, status, out)
@@ -136,22 +176,73 @@ class FakeApi:
                 return self._send(h, 200, json.dumps({"id": room}).encode())
             return self._send(h, 404, b'{"error":{"code":"sandbox_not_found","message":"no such room"}}')
         if re.fullmatch(r"POST /v1/sandboxes/[^/]+/lifetime", line):
+            if line.split("/")[3] not in rooms_now:
+                return self._send(h, 404, b'{"error":{"code":"sandbox_not_found","message":"no such room"}}')
             return self._send(h, 200, json.dumps({"expires_at": self._stamp(self.expires_in)}).encode())
         if re.fullmatch(r"POST /v1/sandboxes/[^/]+/exec", line):
             return self._send(h, 200, b'{"exit_code":0}')
         return self._send(h, 200, b"{}")
 
-    def _bulk_delete(self, h) -> None:
-        """Really delete each room whose labels match every label=key=value of the query."""
+    def _targets(self, h) -> set[str]:
+        """The rooms whose labels match every label=key=value of the query, picked once, now."""
         from urllib.parse import parse_qs, urlsplit
 
         wanted = [item.split("=", 1) for item in parse_qs(urlsplit(h.path).query).get("label", [])]
         with self.lock:
-            for room in list(self.rooms):
-                labels = self.labels.get(room, {})
-                if all(len(kv) == 2 and str(labels.get(kv[0])) == kv[1] for kv in wanted):
-                    self.rooms.discard(room)
+            return {room for room in self.rooms
+                    if all(len(kv) == 2 and str(self.labels.get(room, {}).get(kv[0])) == kv[1] for kv in wanted)}
+
+    def _bulk_delete(self, h) -> None:
+        """Really delete each room whose labels match every label=key=value of the query."""
+        targets = self._targets(h)
+        with self.lock:
+            self.rooms.difference_update(targets)
         self._send(h, 200, b"{}")
+
+    @staticmethod
+    def _send_raw_slowly(h, gap: float, status_line: str, mode: str) -> None:
+        w = h.wfile
+        h.close_connection = True
+        body = b'{"expires_at": "2030-01-01T00:00:00+00:00", "ttl_seconds": 600}'
+        try:
+            if mode == "headers":
+                w.write(f"{status_line}\r\n".encode())
+                w.flush()
+                for header in ("Content-Type: application/json", "X-Pad-One: 1", "X-Pad-Two: 2"):
+                    time.sleep(gap)
+                    w.write(f"{header}\r\n".encode())
+                    w.flush()
+                time.sleep(gap)
+                w.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+            else:
+                w.write(f"{status_line}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n".encode())
+                w.flush()
+                third = len(body) // 3
+                for piece in (body[:third], body[third:2 * third], body[2 * third:]):
+                    time.sleep(gap)
+                    w.write(piece)
+                    w.flush()
+            w.flush()
+        except OSError:
+            pass  # the front cut the connection
+        try:
+            h.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _send_slowly(h, gap: float) -> None:
+        out = b'{"expires_at": "2030-01-01T00:00:00+00:00", "ttl_seconds": 600, "padding": "xxxxxxxxxx"}'
+        h.send_response(200)
+        h.send_header("Content-Type", "application/json")
+        h.send_header("Content-Length", str(len(out)))
+        h.end_headers()
+        h.wfile.flush()
+        third = len(out) // 3
+        for piece in (out[:third], out[third:2 * third], out[2 * third:]):
+            time.sleep(gap)
+            h.wfile.write(piece)
+            h.wfile.flush()
 
     def _create(self, h, body: bytes) -> None:
         try:
@@ -169,7 +260,8 @@ class FakeApi:
         doc = {"id": room}
         if self.network_policy is not None:
             doc["network"] = {"policy": self.network_policy}
-        doc["expires_at"] = self.expires_at or self._stamp(self.expires_in)
+        if not self.omit_expires:
+            doc["expires_at"] = self.expires_at or self._stamp(self.expires_in)
         doc.update(self.create_answer)
         self._send(h, 200, json.dumps(doc).encode())
 
@@ -304,11 +396,14 @@ def assert_idle(ledger) -> None:
         with ledger.lock:
             if (not getattr(ledger, "in_flight", {}) and not getattr(ledger, "busy", set())
                     and not getattr(ledger, "touched", set()) and not getattr(ledger, "creates_in_flight", 0)
-                    and not getattr(ledger, "overflow", False) and not getattr(ledger, "bulk_in_flight", 0)):
+                    and not getattr(ledger, "overflow", False) and not getattr(ledger, "bulk_in_flight", 0)
+                    and not getattr(ledger, "claims_in_flight", 0) and not getattr(ledger, "bulk_pending", 0)):
                 return
         time.sleep(0.01)
     with ledger.lock:
         assert getattr(ledger, "in_flight", {}) == {}, "an in-flight count leaked"
+        assert getattr(ledger, "claims_in_flight", 0) == 0, "a claim count leaked"
+        assert getattr(ledger, "bulk_pending", 0) == 0, "a waiting or running bulk delete stayed counted"
         assert getattr(ledger, "busy", set()) == set(), "a token stayed held"
         assert getattr(ledger, "touched", set()) == set(), "the touched set was not cleared"
         assert getattr(ledger, "creates_in_flight", 0) == 0, "a create stayed counted"
