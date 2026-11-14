@@ -874,7 +874,7 @@ def test_a_pause_that_timed_out_but_took_effect_is_undone(fake, provider) -> Non
         provider.snapshot(sid)
     assert err.value.code == "guest_pause_failed"
     assert fake.status_of(sid) == "running" and len(fake.calls_of("unpause")) == 1
-    assert provider.pending_unpauses() == {}
+    assert provider.pending_reconciles() == {}
 
 
 def test_a_pause_that_timed_out_and_did_not_take_effect_leaves_a_running_room_and_no_debt(fake, provider) -> None:
@@ -888,7 +888,7 @@ def test_a_pause_that_timed_out_and_did_not_take_effect_leaves_a_running_room_an
         provider.snapshot(sid)
     assert err.value.code == "guest_pause_failed"  # the unpause of a running container ("is not paused") is harmless
     assert len(fake.calls_of("unpause")) == 1 and fake.status_of(sid) == "running"
-    assert provider.pending_unpauses() == {} and provider.get(sid)["state"] == "running"
+    assert provider.pending_reconciles() == {} and provider.get(sid)["state"] == "running"
 
 
 def test_a_failed_unpause_is_owed_reported_truthfully_logged_and_retried_by_the_sweep(fake, provider, capsys) -> None:
@@ -900,7 +900,7 @@ def test_a_failed_unpause_is_owed_reported_truthfully_logged_and_retried_by_the_
     assert provider.list_snapshots() == []
     assert fake.status_of(sid) == "paused"
     assert provider.get(sid)["state"] == "frozen"  # not "running" over a paused room
-    assert list(provider.pending_unpauses()) == [sid]
+    assert list(provider.pending_reconciles()) == [sid]
     first = [ln for ln in capsys.readouterr().err.splitlines() if "unpause" in ln and sid in ln]
     assert len(first) == 1
     provider.sweep()  # fails again: still owed, one more line
@@ -908,7 +908,7 @@ def test_a_failed_unpause_is_owed_reported_truthfully_logged_and_retried_by_the_
     assert len([ln for ln in capsys.readouterr().err.splitlines() if "unpause" in ln and sid in ln]) == 1
     provider.sweep()  # succeeds
     assert fake.status_of(sid) == "running" and provider.get(sid)["state"] == "running"
-    assert provider.pending_unpauses() == {}
+    assert provider.pending_reconciles() == {}
 
 
 def test_an_owed_unpause_is_dropped_when_the_room_is_gone(fake, provider) -> None:
@@ -918,7 +918,7 @@ def test_an_owed_unpause_is_dropped_when_the_room_is_gone(fake, provider) -> Non
         provider.snapshot(sid)
     provider.delete(sid)
     provider.sweep()
-    assert provider.pending_unpauses() == {}
+    assert provider.pending_reconciles() == {}
 
 
 def test_the_tar_has_a_deadline_and_a_byte_limit_that_the_provider_passes(fake, provider, monkeypatch) -> None:
@@ -1151,3 +1151,185 @@ def test_kept_exec_results_are_untouched_by_a_capture_and_are_not_in_the_tar(fak
         assert not [n for n in tf.getnames() if "cathedral-spill" in n]
     assert exec_spill.read_spill(sid, token, "stdout") == b"kept"  # still there after the capture
     exec_spill.close_spill(sid, token)
+
+
+# ======================================================================== review 2: reconcile instead of guessing
+def _fail_unpause_after_capture(fake, provider, sid) -> None:
+    """Leave a room paused with a reconcile owed: the capture's unpause fails once."""
+    fake.set(unpause_fail_times=1)
+    with pytest.raises(SandboxOpError):
+        provider.snapshot(sid)
+    assert fake.status_of(sid) == "paused" and sid in provider.pending_reconciles()
+
+
+def test_a_sweep_cannot_unpause_a_room_while_a_second_capture_tars_it(fake, provider, monkeypatch) -> None:
+    sid = _source(provider)
+    _fail_unpause_after_capture(fake, provider, sid)
+    with provider._inner._lock:  # noqa: SLF001
+        provider._reconcile_pending[sid] = None  # noqa: SLF001  a debt still marked while the next capture runs
+    gate, entered = threading.Event(), threading.Event()
+    monkeypatch.setattr(sandbox_provider, "_write_work_archive", _bytes_writer(fake, gate=gate, entered=entered))
+    worker = threading.Thread(target=lambda: provider.snapshot(sid), daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(10)
+        unpauses = len(fake.calls_of("unpause"))
+        with provider._inner._lock:  # noqa: SLF001
+            provider._reconcile_pending[sid] = None  # noqa: SLF001
+        provider.sweep()  # the sweep only triggers a reconcile; admission refuses it during a capture
+        assert len(fake.calls_of("unpause")) == unpauses and fake.status_of(sid) == "paused"
+    finally:
+        gate.set()
+        worker.join(10)
+    assert fake.status_of(sid) == "running"
+
+
+def test_an_unpause_that_took_effect_but_timed_out_is_not_reported_frozen_and_the_next_capture_pauses(fake, provider, monkeypatch) -> None:
+    sid = _source(provider)
+    real = provider._client.unpause  # noqa: SLF001
+    provider._client.unpause = lambda cid: (real(cid), (_ for _ in ()).throw(SandboxOpError("guest_unpause_failed", 502, "docker unpause timed out")))[0]  # noqa: SLF001
+    with pytest.raises(SandboxOpError):
+        provider.snapshot(sid)
+    provider._client.unpause = real  # noqa: SLF001
+    assert fake.status_of(sid) == "running" and provider.get(sid)["state"] == "running"  # read from the engine, not assumed
+    seen: list = []
+
+    def tar(src, dest, **kw):
+        seen.append(fake.status_of(sid))
+        dest.write_bytes(b"t")
+
+    monkeypatch.setattr(sandbox_provider, "_write_work_archive", tar)
+    _snapshot(provider, sid)
+    assert seen == ["paused"]  # the capture paused it: it did not trust a stale "frozen" record
+    assert provider.pending_reconciles() == {} and fake.status_of(sid) == "running"
+
+
+def test_a_stale_debt_cannot_unpause_a_room_the_customer_froze(fake, provider) -> None:
+    sid = _source(provider)
+    _fail_unpause_after_capture(fake, provider, sid)
+    provider.freeze(sid)  # the room is already paused: that is the customer's wish, not an error
+    assert provider.pending_reconciles() == {} and provider.get(sid)["state"] == "frozen"
+    for _ in range(3):
+        provider.sweep()
+    assert fake.status_of(sid) == "paused" and provider.get(sid)["state"] == "frozen"
+
+
+def test_a_failed_thaw_does_not_report_running_over_a_paused_room(fake, provider) -> None:
+    sid = _source(provider)
+    provider.freeze(sid)
+    fake.set(unpause_fail_times=1)
+    with pytest.raises(SandboxOpError):
+        provider.thaw(sid)
+    assert fake.status_of(sid) == "paused" and provider.get(sid)["state"] == "frozen"
+    provider.sweep()  # the customer's wish is still "frozen": nothing to undo
+    assert fake.status_of(sid) == "paused" and provider.pending_reconciles() == {}
+    provider.thaw(sid)
+    assert fake.status_of(sid) == "running" and provider.get(sid)["state"] == "running"
+
+
+def test_a_capture_waits_for_a_reconcile_in_flight(fake, provider, monkeypatch) -> None:
+    sid = _source(provider)
+    _fail_unpause_after_capture(fake, provider, sid)
+    gate, entered = _hold_first(provider, "unpause")
+    tar_started = threading.Event()
+
+    def tar(src, dest, **kw):
+        tar_started.set()
+        dest.write_bytes(b"t")
+
+    monkeypatch.setattr(sandbox_provider, "_write_work_archive", tar)
+    reconciler = threading.Thread(target=lambda: provider._reconcile_room(sid), daemon=True)  # noqa: SLF001
+    reconciler.start()
+    assert entered.wait(10)
+    snap = threading.Thread(target=lambda: provider.snapshot(sid), daemon=True)
+    snap.start()
+    try:
+        assert not tar_started.wait(0.5), "a capture started while a reconcile was in flight"
+    finally:
+        gate.set()
+    reconciler.join(10)
+    snap.join(10)
+    assert tar_started.is_set() and fake.status_of(sid) == "running"
+
+
+def test_a_reconcile_and_a_customer_freeze_do_not_cross(fake, provider) -> None:
+    sid = _source(provider)
+    _fail_unpause_after_capture(fake, provider, sid)
+    gate, entered = _hold_first(provider, "unpause")
+    reconciler = threading.Thread(target=lambda: provider._reconcile_room(sid), daemon=True)  # noqa: SLF001
+    reconciler.start()
+    assert entered.wait(10)
+    freezer = threading.Thread(target=lambda: provider.freeze(sid), daemon=True)
+    freezer.start()
+    freezer.join(0.5)
+    assert freezer.is_alive(), "the freeze ran in the middle of a reconcile"
+    gate.set()
+    reconciler.join(10)
+    freezer.join(10)
+    assert fake.status_of(sid) == "paused" and provider.get(sid)["state"] == "frozen"  # the customer's freeze is last
+    assert provider.pending_reconciles() == {}
+
+
+def test_two_reconciles_at_once_make_one_engine_call(fake, provider) -> None:
+    sid = _source(provider)
+    _fail_unpause_after_capture(fake, provider, sid)
+    gate, entered = _hold_first(provider, "unpause")
+    before = len(fake.calls_of("unpause"))
+    first = threading.Thread(target=lambda: provider._reconcile_room(sid), daemon=True)  # noqa: SLF001
+    first.start()
+    assert entered.wait(10)
+    second = threading.Thread(target=lambda: provider._reconcile_room(sid), daemon=True)  # noqa: SLF001
+    second.start()
+    second.join(5)
+    gate.set()
+    first.join(10)
+    assert len(fake.calls_of("unpause")) == before + 1 and fake.status_of(sid) == "running"
+
+
+def test_a_room_deleted_while_a_reconcile_is_pending_drops_it_without_touching_the_engine(fake, provider) -> None:
+    sid = _source(provider)
+    _fail_unpause_after_capture(fake, provider, sid)
+    provider.delete(sid)
+    unpauses = len(fake.calls_of("unpause"))
+    provider.sweep()
+    assert provider.pending_reconciles() == {} and len(fake.calls_of("unpause")) == unpauses
+
+
+# ---------------------------------------------------------------- review 2, item 2 and 3: an exec refused by a paused room
+def test_a_probe_refused_by_a_paused_room_is_not_cached_as_no_timeout_tool(fake, provider) -> None:
+    from cathedral.sandbox_api import ExecRequest
+
+    sid = _source(provider)
+    fake.set(exec_model=None)
+    provider.freeze(sid)  # the engine refuses any exec on a paused container, as docker does
+    with pytest.raises(SandboxOpError) as err:
+        provider.exec(sid, ExecRequest(argv=["echo", "x"], timeout_seconds=5))
+    assert err.value.code == "sandbox_paused"
+    assert provider._guests[sid].timeout_form is None and provider._guests[sid].has_bash is None  # noqa: SLF001
+    provider.thaw(sid)
+    # After the room runs again the probe reads the image: with the fake's default exec it finds a timeout tool.
+    result = provider.exec(sid, ExecRequest(argv=["echo", "x"], timeout_seconds=5))
+    assert provider._guests[sid].timeout_form in ("gnu", "busybox") and result.exit_code == 0  # noqa: SLF001
+
+
+def test_a_terminal_line_written_during_a_capture_is_refused_by_the_engine_not_hung(fake, provider, monkeypatch) -> None:
+    sid = _source(provider)
+    tid = provider.create_terminal(sid)["id"]
+    provider.connect_terminal(sid, tid, ticket=provider.mint_access_ticket(sid)["ticket"])
+    gate, entered = threading.Event(), threading.Event()
+    monkeypatch.setattr(sandbox_provider, "_write_work_archive", _bytes_writer(fake, gate=gate, entered=entered))
+    worker = threading.Thread(target=lambda: provider.snapshot(sid), daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(10)
+        answer: list = []
+        t = threading.Thread(target=lambda: answer.append(provider.terminal_write(sid, tid, "echo hi\n")), daemon=True)
+        t.start()
+        t.join(10)
+        assert answer and not t.is_alive(), "a terminal line hung during the capture"
+        out = provider.terminal_read(sid, tid)
+        # What really happens: the exec is refused by the paused container, and the terminal shows docker's own message.
+        assert "is paused" in json.dumps(out)
+    finally:
+        gate.set()
+        worker.join(10)

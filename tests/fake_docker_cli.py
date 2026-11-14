@@ -353,6 +353,16 @@ def main(argv):
                     print(f"{cid} {c['labels'].get('cathedral.sandbox.id', '')}")
         return 0
 
+    if cmd == "exec":
+        # Docker refuses to exec into a paused container. Match by exact id or name only.
+        with Locked() as st:
+            hit = next((c for cid, c in st["containers"].items() for a in argv[1:] if a == cid or a == c["name"]), None)
+            paused = hit is not None and hit["status"] == "paused"
+            cid_hit = next((cid for cid, c in st["containers"].items() if c is hit), "")
+        if paused:
+            print(f"Error response from daemon: Container {cid_hit} is paused, unpause the container before exec", file=sys.stderr)
+            return 1
+
     if cmd == "exec" and b.get("exec_model"):
         # The guest command is everything after the container id.
         with Locked() as st:
@@ -410,6 +420,16 @@ def main(argv):
 
     if cmd == "exec" and "info" in argv:
         print("27.0.0-fake")  # inner dockerd of a DinD guest is ready
+        return 0
+
+    if cmd == "inspect" and "--format" in argv and "{{.State.Status}}" == argv[argv.index("--format") + 1]:
+        with Locked() as st:
+            cid = find(st, argv[-1])
+            status = st["containers"][cid]["status"] if cid else None
+        if status is None:
+            print(f"Error: No such object: {argv[-1]}", file=sys.stderr)
+            return 1
+        print(status)
         return 0
 
     if cmd == "inspect" and "--format" in argv and ".State.Running" in argv[argv.index("--format") + 1]:
