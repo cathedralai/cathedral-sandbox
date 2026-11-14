@@ -381,6 +381,9 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	case hc.RequireAttestation && !hc.Sealed:
 		writeErr(w, 400, "invalid_hotel", "require_attestation needs a sealed hotel")
 		return
+	case hc.GuestTLS && !hc.Sealed:
+		writeErr(w, 400, "invalid_hotel", "guest_tls needs a sealed hotel")
+		return
 	case hc.SealedAdmission == sealedAdmissionOff:
 		writeErr(w, 400, "invalid_hotel", `sealed_admission "off" is only for an operator hotel in the config file; a joined hotel is always gated`)
 		return
@@ -410,12 +413,15 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	if hc.RequireAttestation {
 		b.noteRequireAttestation(hc.ID)
 	}
-	if hc.MinerHotkey != "" {
+	// A miner hotel, a "guest_tls" hotel and, with require_sealed_guest_tls,
+	// every sealed hotel join over the guest's attested TLS key (AB#378).
+	if hc.MinerHotkey != "" || (hc.Sealed && (hc.GuestTLS || b.cfg.RequireSealedGuestTLS)) {
 		if hc.TLSSPKISHA256 != "" || (req.Verify != nil && !*req.Verify) ||
 			!strings.HasPrefix(hc.API, "https://") || !strings.HasPrefix(hc.Health, "https://") {
-			writeErr(w, 409, "guest_tls_required", "miner join needs verified guest HTTPS; the broker derives its TLS pin from attestation")
+			writeErr(w, 409, "guest_tls_required", "this join needs verified guest HTTPS; the broker derives its TLS pin from attestation")
 			return
 		}
+		hc.GuestTLS = hc.GuestTLS || hc.MinerHotkey == ""
 		// This request has no bearer key. Verify that the observed TLS key is
 		// committed by the AMD-verified SNP report before constructing a hotel
 		// client that holds the key supplied in the join body.

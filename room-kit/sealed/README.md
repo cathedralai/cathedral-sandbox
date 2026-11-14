@@ -473,15 +473,33 @@ attestation and the install key, and checks:
 With a saved attestation, use `--tls-spki-sha256 <peer SPKI sha256>`, or
 `--require-tls` to fail a binding that names no TLS key.
 
-### Still open (broker)
+### Config hotel on guest TLS (AB#378)
 
-- **TLS pin.** The broker must reach miner hotels over HTTPS pinned to the
-  attested `tls_spki_sha256`, check it on every connection, refuse `http://`
-  miner APIs, and re-admit the hotel when the binding changes. Until then,
-  #365 refuses scoped miner joins with `guest_tls_required` before it sends
-  the key.
-- **Admission checks.** For miner hotels, the broker's admission must require
-  `tls_spki_sha256` and `hotel_key_source: "install"`, and pass
+Nothing in this mode is miner specific: `ROOM_MINER=1` turns on the guest TLS
+key, the install key and the installed hotel key. A config (operator) hotel
+uses it to keep the hotel key off the host too:
+
+1. Build and install with `SEALED_MINER=1` and
+   `SEALED_HOTEL_KEY_INSTALL_SIGNERS`; no `SEALED_API_KEY_FILE`. The host
+   never holds the hotel key, and a key in fw_cfg is ignored.
+2. In the broker config entry set `"sealed": true, "guest_tls": true` and
+   point `api` and `health` at the guest's `https://` port. The broker pins
+   the attested key (`broker/README.md`, "Guest TLS for config hotels").
+3. Install the hotel key the broker's `key_file` holds with
+   `POST /room/hotel-key`, signed by an install signer, after every boot.
+4. `install-sealed.sh` cannot count rooms (no key on the host): drain the
+   hotel before a restart and set `SEALED_RESTART_WITH_ROOMS=1`.
+
+### Still open
+
+- **Installer for config hotels.** Who signs the `POST /room/hotel-key`
+  envelope for a config hotel (the control plane, as for miners in #1588, or
+  an ops tool beside the broker key file) is not decided.
+- **fw_cfg hotel key.** The config-hotel path that reads the hotel key from
+  fw_cfg (`guest-boot.sh`, `launch-guest.sh`, `install-sealed.sh`) goes once
+  every config hotel runs guest TLS. It is a measured change: a re-seal.
+- **`amd_verifier` TLS flag.** The broker checks `tls_spki_sha256` and
+  `hotel_key_source` itself (`verifyMinerTLSBinding`); it does not yet pass
   `--tls-spki-sha256 <peer>` to the `amd_verifier` command.
 - **`admission_policy`.** The broker must report it in operator capacity
   (#1588 checklist).
