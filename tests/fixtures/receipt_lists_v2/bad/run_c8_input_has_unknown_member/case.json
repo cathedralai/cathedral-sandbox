@@ -20,7 +20,7 @@
  "description": "An input entry in the file has a member besides path, mode and sha256.",
  "expect": {
   "exit_code": 1,
-  "reason": "check 8: the request in the file differs from the recipe in inputs",
+  "reason": "check 8: the file's request: an input must hold exactly path, sha256 and mode",
   "verdict": "FAIL"
  }
 }

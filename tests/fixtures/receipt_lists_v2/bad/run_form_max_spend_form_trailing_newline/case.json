@@ -20,7 +20,7 @@
  "description": "One step past the form rule max_spend_form: trailing_newline.",
  "expect": {
   "exit_code": 1,
-  "reason": "recipe: max_spend_usd must be an integer of at least 1 or a decimal string greater than zero",
+  "reason": "recipe: max_spend_usd must be an integer from 1 to 999999999999, or a decimal string of 1 to 12 digits and up to 6 decimals, greater than zero",
   "verdict": "FAIL"
  }
 }

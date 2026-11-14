@@ -669,7 +669,7 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
              drop=(), create_body=None, exec_body=None, bundle_edit=None, args_edit=None, absent=(),
              held=(RESULT_PATH,), inline=(LOG_PATH,), held_bytes=None, caller_hashes=None, exec_response="confirmed",
              numbered=True, room=RUN_ROOM, no_context_arg=False, input_files=(), truth_context=None,
-             extra_files=None, bundle_raw=None, recipe_raw=None, context_raw=None, file_bytes=None):
+             extra_files=None, bundle_raw=None, recipe_raw=None, context_raw=None, file_bytes=None, exec_answer=None):
     fb = {**FILE_BYTES, **(file_bytes or {})}
     recipe = base_recipe()
     if truth_edit:
@@ -703,7 +703,7 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
     if exec_body:
         ebody = exec_body(ebody)
     exec_bytes = ebody if isinstance(ebody, bytes) else canonical(ebody)
-    exec_resp = canonical({"exit_code": 0, "stdout": "", "stderr": ""})
+    exec_resp = exec_answer if exec_answer is not None else canonical({"exit_code": 0, "stdout": "", "stderr": ""})
     steps = [step("create", "create", "POST /v1/sandboxes", 202, image=req["image"], image_digest=IMAGE_ID,
                   network_policy=policy, network_policy_sha256=sha(canonical(policy)),
                   cathedral_sandbox_id=RUN_ID, serial=True, customer_request_sha256=sha(create_bytes)),
@@ -746,7 +746,7 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
                            for i in req["inputs"]])
     bundle = {"schema": "cathedral_oneshot_bundle_v1", "oneshot_id": RUN_ID, "request": request,
               "attestation": json.loads(json.dumps(pack.attestation)), "amd_certs": dict(pack.certs),
-              "receipts": chain,
+              "receipts": chain, "not_proven": [],
               "create_request_b64": b64(create_bytes), "exec_request_b64": b64(exec_bytes),
               "inline_outputs": {p: b64(outputs_bytes[p]) for p in inline if outputs_bytes.get(p) is not None}}
     if exec_response != "unconfirmed":
@@ -1231,10 +1231,10 @@ def run_hardening_cases(pack: Pack) -> None:
 
     # ---- check 8 compares the request as it is
     bad("run_c8_input_list_holds_a_number", "The file's input list holds a number besides the inputs.",
-        fail(8, "the request in the file differs from the recipe in inputs"),
+        fail(8, "the file's request: an input must hold exactly path, sha256 and mode"),
         bundle_edit=lambda b: b["request"]["inputs"].append(7))
     bad("run_c8_input_has_unknown_member", "An input entry in the file has a member besides path, mode and sha256.",
-        fail(8, "the request in the file differs from the recipe in inputs"),
+        fail(8, "the file's request: an input must hold exactly path, sha256 and mode"),
         bundle_edit=lambda b: b["request"]["inputs"][0].update(note="x"))
     bad("run_c8_input_carries_content", "An input entry in the file carries content_b64.",
         fail(8, "the request holds content_b64, which a file must not carry"),
@@ -1303,6 +1303,68 @@ def run_second_review_cases(pack: Pack) -> None:
             {"reason": f"recipe: the request has no {field}"},
             recipe_edit=lambda r, f=field: r["request"].pop(f), bundle_edit=lambda b, f=field: b["request"].pop(f))
 
+    # ---- the shapes of the file are exact (spec G4 5.5)
+    def drop(*path):
+        def edit(b):
+            node = b
+            for part in path[:-1]:
+                node = node[part]
+            del node[path[-1]]
+        return edit
+
+    def put(value, *path):
+        def edit(b):
+            node = b
+            for part in path[:-1]:
+                node = node[part]
+            node[path[-1]] = value
+        return edit
+
+    def shape(reason):
+        return {"reason": "check 1: " + reason}
+
+    bad("run_shape_unknown_top_member", "The file has a member the shapes do not name.",
+        shape("the file has an unknown member extra"), bundle_edit=put(1, "extra"))
+    bad("run_shape_no_not_proven", "The file has no not_proven.", shape("the file has no not_proven"),
+        bundle_edit=drop("not_proven"))
+    for case, value in (("null", None), ("string", "none"), ("list_of_numbers", [1]), ("object", {})):
+        bad(f"run_shape_not_proven_{case}", f"not_proven is {case.replace('_', ' ')}.",
+            shape("not_proven is not a list of strings"), bundle_edit=put(value, "not_proven"))
+    good("run_shape_not_proven_with_reasons", "not_proven holds reasons; every check holds, so the file passes.",
+         {}, bundle_edit=put(["the API saw a slow answer"], "not_proven"))
+    bad("run_shape_no_inline_outputs", "The file has no inline_outputs.", shape("the file has no inline_outputs"),
+        bundle_edit=drop("inline_outputs"))
+    bad("run_shape_attestation_extra_member", "The attestation holds a member besides the three.",
+        shape("attestation has an unknown member extra"), bundle_edit=put(1, "attestation", "extra"))
+    bad("run_shape_attestation_missing_member", "The attestation lacks report_b64.",
+        shape("attestation has no report_b64"), bundle_edit=drop("attestation", "report_b64"))
+    bad("run_shape_amd_certs_extra_member", "amd_certs holds a fourth member.",
+        shape("amd_certs has an unknown member extra"), bundle_edit=put("x", "amd_certs", "extra"))
+    bad("run_shape_receipt_extra_member", "A receipt object holds a member besides the three.",
+        shape("a receipt has an unknown member extra"), bundle_edit=put(1, "receipts", 0, "extra"))
+    bad("run_shape_receipt_missing_member", "A receipt object lacks its signature.",
+        shape("a receipt has no signature_b64"), bundle_edit=drop("receipts", 0, "signature_b64"))
+    bad("run_shape_input_without_mode", "An input in the file's request has no mode.",
+        fail(8, "the file's request: an input must hold exactly path, sha256 and mode"),
+        bundle_edit=drop("request", "inputs", 0, "mode"))
+    bad("run_shape_receipts_swapped", "Two receipts are swapped in the file; each is signed.",
+        fail(2, f"room {RUN_ROOM}: the receipts are not in the order of their room numbers"),
+        bundle_edit=lambda b: b["receipts"].insert(1, b["receipts"].pop(2)))
+    bad("run_shape_receipts_reversed", "The receipts are in reverse order.",
+        fail(2, f"room {RUN_ROOM}: the receipts are not in the order of their room numbers"),
+        bundle_edit=lambda b: b["receipts"].reverse())
+
+    # ---- the exec answer is read only when its hash is the signed one
+    deep = b"[" * 1100 + b"]" * 1100
+    good("run_exec_answer_unmatched_and_deep", "An exec answer that does not hash to the signed result, nested 1,100 "
+         "levels: not confirmed, never read, still PASS.", {"pointers": {"/run/exit_code/status": "not confirmed"}},
+         bundle_edit=put(b64(deep), "exec_response_b64"))
+    bad("run_exec_answer_matched_and_deep", "An exec answer that is the signed one, nested past the limit.",
+        fail(6, "the exec answer nests too deeply to read"), exec_answer=b"[" * 100 + b"]" * 100)
+    good("run_exec_answer_matched_and_shallow", "An exec answer that is the signed one and is read.",
+         {"pointers": {"/run/exit_code/status": "confirmed", "/run/exit_code/value": 3}},
+         exec_answer=canonical({"exit_code": 3}))
+
     # ---- the context in the file's request, when it is there, is the expected one
     bad("run_c8_context_differs", "The file's request.context is not the context the caller expects; the signed "
         "context file is right.", fail(8, "the file's request.context is not the expected context"),
@@ -1370,11 +1432,11 @@ def run_validity_cases(pack: Pack) -> None:
     bad("run_rule_output_path_outside", "An output path outside /work/out/.",
         {"reason": "recipe: an output path must be under /work/out/"},
         truth_edit=req(outputs=[{"path": "/tmp/log.txt", "max_bytes": 65536, "optional": False}]), held=(), inline=())
-    bad("run_rule_output_max_bytes_too_large", "An output max_bytes of 200 MiB plus one.",
-        {"reason": "recipe: an output max_bytes must be at most 200 MiB"},
-        truth_edit=req(outputs=[{"path": RESULT_PATH, "max_bytes": 209715201, "optional": False}]), held=(), inline=())
-    good("run_rule_output_max_bytes_200_mib", "An output max_bytes of exactly 200 MiB.",
-         truth_edit=req(outputs=[{"path": RESULT_PATH, "max_bytes": 209715200, "optional": False}]), held=(), inline=())
+    bad("run_rule_output_max_bytes_too_large", "An output max_bytes of 64 KiB plus one.",
+        {"reason": "recipe: an output max_bytes must be at most 65536"},
+        truth_edit=req(outputs=[{"path": RESULT_PATH, "max_bytes": 65537, "optional": False}]), held=(), inline=())
+    good("run_rule_output_max_bytes_64_kib", "An output max_bytes of exactly 64 KiB.",
+         truth_edit=req(outputs=[{"path": RESULT_PATH, "max_bytes": 65536, "optional": False}]), held=(), inline=())
     bad("run_rule_timeout_zero", "A timeout of 0 seconds.", {"reason": "recipe: timeout_seconds must be at least 1"},
         truth_edit=req(timeout_seconds=0))
     bad("run_rule_context_too_large", "A context of 4097 canonical bytes.",
@@ -1382,12 +1444,10 @@ def run_validity_cases(pack: Pack) -> None:
         truth_context={"k": "a" * 4089})
     good("run_rule_context_4_kib", "A context of exactly 4096 canonical bytes.", truth_context={"k": "a" * 4088})
 
-    def roomy_log(r):
-        r["request"]["outputs"][1]["max_bytes"] = 1048576
-    bad("run_rule_inline_output_too_large", "An inline output of 64 KiB plus one byte; the recipe allows more.",
+    bad("run_rule_inline_output_too_large", "An inline output of 64 KiB plus one byte.",
         fail(7, f"the inline bytes of {LOG_PATH} are 65537 bytes, over the 64 KiB an inline output may have"),
-        truth_edit=roomy_log, file_bytes={LOG_PATH: b"x" * 65537})
-    good("run_rule_inline_output_64_kib", "An inline output of exactly 64 KiB.", truth_edit=roomy_log,
+        file_bytes={LOG_PATH: b"x" * 65537})
+    good("run_rule_inline_output_64_kib", "An inline output of exactly 64 KiB.",
          file_bytes={LOG_PATH: b"x" * 65536})
 
 
@@ -1412,10 +1472,6 @@ def _outs(*items):
     return {**_knobs(outputs=out), "held": (), "inline": ()}
 
 
-def _roomy_log(r):
-    r["request"]["outputs"][1]["max_bytes"] = 1048576
-
-
 def _file_side(**edits):
     return {"bundle_edit": lambda b: b["request"].update(edits)}
 
@@ -1424,7 +1480,8 @@ _IMG = "images.example.test/"
 _DIGEST = "@sha256:" + "a" * 64
 USER_FORM = ("recipe: user must be digits only, or a name of letters, digits, _ and - that starts with a letter or _ "
              "and may end in $")
-MAX_SPEND_RULE = "max_spend_usd must be an integer of at least 1 or a decimal string greater than zero"
+MAX_SPEND_RULE = ("max_spend_usd must be an integer from 1 to 999999999999, or a decimal string of 1 to 12 digits "
+                  "and up to 6 decimals, greater than zero")
 IN_PATH = "an input path"
 OUT_PATH = "an output path"
 
@@ -1505,6 +1562,15 @@ def build_form_rules():
              "recipe: create.ttl_seconds must be timeout_seconds + 600"),
             ("the_old_value", {"truth_edit": lambda r: r["create"].update(ttl_seconds=300)},
              "recipe: create.ttl_seconds must be timeout_seconds + 600")]),
+        ("max_spend_largest_integer", _knobs(max_spend_usd=999999999999), [
+            ("one_more", _knobs(max_spend_usd=1000000000000), "recipe: " + MAX_SPEND_RULE),
+            ("long_integer_literal", {"recipe_raw": lambda raw: raw.replace(
+                b'"max_spend_usd": "0.50"', b'"max_spend_usd": 1' + b"0" * 5000)},
+             "inputs: the recipe holds a number of more than 100 digits")]),
+        ("max_spend_twelve_digit_string", _knobs(max_spend_usd="999999999999.999999"), [
+            ("thirteen_digits", _knobs(max_spend_usd="1000000000000"), "recipe: " + MAX_SPEND_RULE),
+            ("double_zero_whole", _knobs(max_spend_usd="00.50"), "recipe: " + MAX_SPEND_RULE),
+            ("long_string", _knobs(max_spend_usd="1" * 5000), "recipe: " + MAX_SPEND_RULE)]),
         ("max_spend_integer", _knobs(max_spend_usd=1), []),
         ("max_spend_small_decimal", _knobs(max_spend_usd="0.000001"), []),
         ("max_spend_long_decimal", _knobs(max_spend_usd="100.123456"), []),

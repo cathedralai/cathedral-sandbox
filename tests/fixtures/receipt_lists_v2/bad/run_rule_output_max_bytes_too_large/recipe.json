@@ -35,7 +35,7 @@
   },
   "outputs": [
    {
-    "max_bytes": 209715201,
+    "max_bytes": 65537,
     "optional": false,
     "path": "/work/out/result.json"
    }

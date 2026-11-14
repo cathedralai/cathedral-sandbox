@@ -40,7 +40,7 @@
     "path": "/work/out/result.json"
    },
    {
-    "max_bytes": 1048576,
+    "max_bytes": 65536,
     "optional": true,
     "path": "/work/out/log.txt"
    }

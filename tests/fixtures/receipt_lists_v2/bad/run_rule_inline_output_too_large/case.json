@@ -17,7 +17,7 @@
   "--output-file",
   "/work/out/result.json={dir}/outputs/result.json"
  ],
- "description": "An inline output of 64 KiB plus one byte; the recipe allows more.",
+ "description": "An inline output of 64 KiB plus one byte.",
  "expect": {
   "exit_code": 1,
   "reason": "check 7: the inline bytes of /work/out/log.txt are 65537 bytes, over the 64 KiB an inline output may have",

@@ -15,10 +15,10 @@
   "--input-sha256",
   "/work/in/data.csv=492d5ea496056f1a6a6592241032fab764c321596317930b4fa0e1e8bc3b7470"
  ],
- "description": "An output max_bytes of 200 MiB plus one.",
+ "description": "An output max_bytes of 64 KiB plus one.",
  "expect": {
   "exit_code": 1,
-  "reason": "recipe: an output max_bytes must be at most 200 MiB",
+  "reason": "recipe: an output max_bytes must be at most 65536",
   "verdict": "FAIL"
  }
 }
