@@ -6,5 +6,6 @@
     "sealed-2x4": {"vcpu": 2, "memory_gib": 4, "disk_gib": 10},
     "sealed-4x8": {"vcpu": 4, "memory_gib": 8, "disk_gib": 10},
     "sealed-8x16": {"vcpu": 8, "memory_gib": 16, "disk_gib": 10}
-  }
+  },
+  "room_margin_seconds": 600
 }

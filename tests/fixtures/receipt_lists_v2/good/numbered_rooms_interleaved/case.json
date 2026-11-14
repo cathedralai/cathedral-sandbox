@@ -12,13 +12,13 @@
  "expect": {
   "exit_code": 0,
   "pointers": {
-   "/chain/room_numbering/does_not_prove/0": "That nothing was still running in the room when the list was read, or that no receipt was signed after it. There is no closed verdict for an ordinary room.",
-   "/chain/room_numbering/proves/0": "No receipt of this room is missing from this list, between its first receipt and its last.",
+   "/chain/room_numbering/does_not_show/0": "That nothing was still running in the room when the list was read, or that no receipt was signed after it. There is no closed verdict for an ordinary room.",
    "/chain/room_numbering/rooms/room-a/first": 1,
    "/chain/room_numbering/rooms/room-a/head": "e56ba0bc6626e93abb32495c4fe178511ff81523028af1dcf1dd06ae8dff91ed",
    "/chain/room_numbering/rooms/room-a/last": 5,
    "/chain/room_numbering/rooms/room-a/receipts": 3,
-   "/chain/room_numbering/rooms/room-b/receipts": 3
+   "/chain/room_numbering/rooms/room-b/receipts": 3,
+   "/chain/room_numbering/shows/0": "No receipt of this room is missing from this list, between its first receipt and its last."
   },
   "verdict": "PASS"
  }
