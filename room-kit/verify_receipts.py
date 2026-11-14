@@ -84,7 +84,13 @@ list-mode checks; run mode does not do them.
 --product: a report with CPUID fields (version 3 on) names its own product. A family with no layout fails whatever
 --product says, and a --product that names another product than the report fails. Only a version 2 report, which
 has no CPUID fields, takes the product from --product; there nothing in the report can contradict the name, and
-Milan and Genoa share the layout.
+Milan and Genoa share the layout. A report of version 0 or 1, or of a version above 5, fails whatever --product
+says ("the report is version N, which has no layout here"); the flag is read for no version but 2. List mode
+reads the product the same way.
+List mode also refuses, with a reason and never an uncaught error, a receipt that is not an object with a
+statement, a statement whose sequence, binding, action, status or room id has the wrong type, a network_policy
+that is not an object with a string mode and a list allow, and a receipt that carries a policy (or closes a policy
+timeline) without an integer issued_at and status.
   1. attestation, AMD chain, measurement (--expected-measurement, repeatable, or --allowed-measurements FILE),
      every receipt's signature, one binding.
   2. the room's receipts run 1 to m with every link right, receipt 1 is the create and says serial: true,
