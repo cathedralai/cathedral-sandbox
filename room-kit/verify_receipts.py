@@ -68,7 +68,8 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      positive lifetime_seconds, pooled_from the create's receipt hash), which
      needs numbered receipts. The claim's id is the room's link, so
      --cathedral-sandbox finds it; an unclaimed room, a retired one and a room
-     whose claim failed name no link. The output's pool_rooms gives each state.
+     whose claim failed name no link. A failed delete leaves the room's state
+     unknown, not retired. The output's pool_rooms gives each state.
 
 Not checked here (by design, today): that the measurement is an approved image.
 Image approval is a signed policy release; that is a later step.
