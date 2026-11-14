@@ -1,0 +1,17 @@
+{
+ "args": [
+  "--attestation",
+  "{dir}/attestation_doc.json",
+  "--receipts",
+  "{dir}/receipts.json",
+  "--skip-amd",
+  "--expected-measurement",
+  "9b148da6715f6a68fd6314d9015f54413c261a0b1b25075b568e0b5106687a2b434d7661f26d036700090ca1917a9ed1"
+ ],
+ "description": "A list that names a room_head but holds receipts of two rooms.",
+ "expect": {
+  "exit_code": 1,
+  "reason": "the list names a room_head but holds receipts of 2 rooms",
+  "verdict": "FAIL"
+ }
+}
