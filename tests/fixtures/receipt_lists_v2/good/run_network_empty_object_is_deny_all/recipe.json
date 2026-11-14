@@ -28,7 +28,7 @@
     "path": "/work/in/data.csv"
    }
   ],
-  "max_spend_usd": 5,
+  "max_spend_usd": "0.50",
   "network": {},
   "outputs": [
    {

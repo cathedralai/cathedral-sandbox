@@ -461,6 +461,7 @@ def test_each_form_rule_refuses_one_step_past_its_bound(rule, case, knobs, reaso
 
 
 RECIPE_PREFIX, FILE_PREFIX = "recipe: ", "check 8: the file's request: "
+MAX_SPEND_RULE = "max_spend_usd must be an integer of at least 1 or a decimal string greater than zero"
 
 
 def _valid_request() -> dict:
@@ -487,7 +488,14 @@ REQUEST_LIMIT_CASES = [
     ("image_id form", {"image_id": "sha256:xyz"}, "image_id must be sha256: and 64 lower-case hex"),
     ("image_id case", {"image_id": "sha256:" + "A" * 64}, "image_id must be sha256: and 64 lower-case hex"),
     ("timeout is not a boolean", {"timeout_seconds": True}, "timeout_seconds must be an integer"),
-    ("max_spend is not a boolean", {"max_spend_usd": True}, "max_spend_usd must be an integer"),
+    ("max_spend is not a boolean", {"max_spend_usd": True}, MAX_SPEND_RULE),
+    ("max_spend zero", {"max_spend_usd": 0}, MAX_SPEND_RULE),
+    ("max_spend a float", {"max_spend_usd": 1.5}, MAX_SPEND_RULE),
+    ("max_spend zero string", {"max_spend_usd": "0.0"}, MAX_SPEND_RULE),
+    ("max_spend exponent", {"max_spend_usd": "1e3"}, MAX_SPEND_RULE),
+    ("max_spend leading zero", {"max_spend_usd": "01"}, MAX_SPEND_RULE),
+    ("max_spend trailing newline", {"max_spend_usd": "1\n"}, MAX_SPEND_RULE),
+    ("max_spend seven decimals", {"max_spend_usd": "0.1234567"}, MAX_SPEND_RULE),
     ("max_bytes is not a boolean", {"outputs": [{"path": "/work/out/x", "max_bytes": True}]},
      "an output max_bytes must be an integer"),
     ("input sha256 case", {"inputs": [{"path": "/work/in/x", "sha256": "A" * 64}]},
@@ -569,3 +577,10 @@ def test_json_depth_is_counted_on_the_raw_text_and_skips_strings() -> None:
     assert vr.json_depth('{"k": "a\\\\", "j": [[1]]}') == 3  # an escaped backslash does not escape the quote
     assert vr.json_depth("[" * 100_000) == 100_000
     assert vr.JSON_MAX_DEPTH == 64
+
+
+@pytest.mark.parametrize("value", [1, 7, "0.50", "12", "0.000001", "100.123456", "0.1", "9"])
+def test_request_limits_accepts_each_max_spend_form(value) -> None:
+    vr = _load_checker()
+    for prefix in (RECIPE_PREFIX, FILE_PREFIX):
+        vr.request_limits({**_valid_request(), "max_spend_usd": value}, prefix)

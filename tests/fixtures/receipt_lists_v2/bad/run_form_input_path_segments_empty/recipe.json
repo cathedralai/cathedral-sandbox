@@ -24,7 +24,7 @@
     "path": "/work/in/a//b"
    }
   ],
-  "max_spend_usd": 5,
+  "max_spend_usd": "0.50",
   "network": {
    "allow": [],
    "mode": "deny_all"
