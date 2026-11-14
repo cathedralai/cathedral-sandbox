@@ -1632,3 +1632,203 @@ def test_a_chain_of_many_receipts_is_checked_in_proportion_to_their_number(tmp_p
     started = time.perf_counter()
     out = vr.verify_receipts(att, receipts, hotel.head)
     assert time.perf_counter() - started < 20.0 and out["contiguous"] is True
+
+
+# ---- the shared verifier checks every receipt's shape before any ordering, neighbour or link logic runs
+
+BAD_SEQUENCES = {"a fraction": 1.5, "a whole float": 2.0, "text": "1", "a boolean": True, "null": None, "a list": [],
+                 "an object": {}}
+
+
+def _resign(gen, pack, receipt: dict, edit) -> None:
+    statement = receipt["statement"]
+    edit(statement)
+    receipt["receipt_sha256"] = gen.sha(gen.canonical(statement))
+    receipt["signature_b64"] = gen.b64(pack.key.sign(gen.canonical(statement)))
+
+
+def _run_mode_resigned(tmp_path: Path, index: int, edit) -> tuple[int, dict, str]:
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    files, args = gen.make_run(pack, bundle_edit=lambda b: _resign(gen, pack, b["receipts"][index], edit))
+    for name, data in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes(data)
+    code, out, err = _run_cli(*[a.replace("{dir}", str(tmp_path)) for a in args])
+    return code, json.loads(out), err
+
+
+@pytest.mark.parametrize("where", ["first", "middle", "last"])
+@pytest.mark.parametrize("kind", sorted(BAD_SEQUENCES))
+@pytest.mark.parametrize("mode", ["run", "list"])
+def test_a_sequence_that_is_not_an_integer_is_refused_with_a_reason_in_both_modes(mode, kind, where, tmp_path) -> None:
+    value = BAD_SEQUENCES[kind]
+    if mode == "run":
+        count = 8
+        index = {"first": 0, "middle": 3, "last": count - 1}[where]
+        code, out, err = _run_mode_resigned(tmp_path, index, lambda st: st.update(sequence=value))
+        reason = f"check 1: receipt {index + 1} of the list: sequence is not an integer"
+    else:
+        gen = _generator()
+        pack = gen.Pack(gen.read_amd())
+        receipts = _room(gen, pack, "ordinary", 99, {})
+        index = {"first": 0, "middle": 2, "last": len(receipts) - 1}[where]
+        _resign(gen, pack, receipts[index], lambda st: st.update(sequence=value))
+        code, raw, err = _list_mode_with(tmp_path, receipts, "list", "ordinary")
+        out = json.loads(raw)
+        reason = f"receipt {index + 1} of the list: sequence is not an integer"
+    assert "Traceback" not in err, err[-300:]
+    assert code == 1 and out == {"verdict": "FAIL", "reason": reason}, out
+
+
+def test_the_reviewers_input_a_fractional_first_sequence_with_a_wrong_predecessor_fails_in_run_mode(tmp_path) -> None:
+    code, out, err = _run_mode_resigned(
+        tmp_path, 0, lambda st: st.update(sequence=1.5, previous_receipt_sha256="wrong"))
+    assert code == 1 and out == {"verdict": "FAIL",
+                                 "reason": "check 1: receipt 1 of the list: sequence is not an integer"}
+
+
+@pytest.mark.parametrize("edit, reason", [
+    (lambda st: st.update(action=["exec"]), "receipt 3 of the list: action is not a string"),
+    (lambda st: st.pop("action"), "receipt 3 of the list: action is not a string"),
+    (lambda st: st.pop("binding_sha256"), "receipt 3 of the list: binding_sha256 is not a string"),
+    (lambda st: st.update(binding_sha256=5), "receipt 3 of the list: binding_sha256 is not a string"),
+    (lambda st: st.pop("previous_receipt_sha256"), "receipt 3 of the list has no previous_receipt_sha256"),
+    (lambda st: st.update(previous_receipt_sha256=5),
+     "receipt 3 of the list: previous_receipt_sha256 is not a string or null"),
+    (lambda st: st.pop("sequence"), "receipt 3 of the list: sequence is not an integer"),
+], ids=["action-list", "action-missing", "binding-missing", "binding-number", "previous-missing", "previous-number",
+        "sequence-missing"])
+def test_run_mode_names_a_malformed_statement_member_in_a_specific_reason(edit, reason, tmp_path) -> None:
+    code, out, err = _run_mode_resigned(tmp_path, 2, edit)
+    assert "Traceback" not in err and code == 1 and out == {"verdict": "FAIL", "reason": "check 1: " + reason}, out
+
+
+@pytest.mark.parametrize("member, value, reason", [
+    ("signature_b64", "abc", "receipt 3 of the list: signature_b64 is not base64"),
+    ("signature_b64", None, "receipt 3 of the list has no string signature_b64"),
+    ("signature_b64", 5, "receipt 3 of the list has no string signature_b64"),
+    ("receipt_sha256", None, "receipt 3 of the list has no string receipt_sha256"),
+])
+def test_run_mode_names_a_malformed_signature_or_hash_in_a_specific_reason(member, value, reason, tmp_path) -> None:
+    gen = _generator()
+    files, args = gen.make_run(gen.Pack(gen.read_amd()), bundle_edit=lambda b: b["receipts"][2].update({member: value}))
+    for name, data in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes(data)
+    code, out, err = _run_cli(*[a.replace("{dir}", str(tmp_path)) for a in args])
+    assert "Traceback" not in err and code == 1
+    assert json.loads(out) == {"verdict": "FAIL", "reason": "check 1: " + reason}
+
+
+# ---- list mode reads under the same raw-text limits as run mode
+
+def _list_mode_raw(tmp_path: Path, receipts_text: bytes | None = None, headers: tuple = (),
+                   attestation_text: bytes | None = None) -> tuple[int, dict, str]:
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    (tmp_path / "att.json").write_bytes(attestation_text if attestation_text is not None else gen.pretty(pack.attestation))
+    args = ["--attestation", str(tmp_path / "att.json"), "--skip-amd", "--expected-measurement", gen.MEASUREMENT]
+    if receipts_text is not None:
+        (tmp_path / "r.json").write_bytes(receipts_text)
+        args += ["--receipts", str(tmp_path / "r.json")]
+    for header in headers:
+        args += ["--receipt-header", header]
+    code, out, err = _run_cli(*args)
+    return code, json.loads(out) if out.strip() else {}, err
+
+
+def _doc_with(member: bytes) -> bytes:
+    return b'{"receipts": [{"statement": {"x": ' + member + b'}, "signature_b64": "", "receipt_sha256": ""}]}'
+
+
+LIMIT_INPUTS = {
+    "nests too deeply to read": b"[" * 1200 + b"]" * 1200,
+    "holds a number literal of more than 100 characters": b"1" * 5000,
+    "holds an unpaired surrogate": b'"\\ud800"',
+}
+
+
+@pytest.mark.parametrize("limit", sorted(LIMIT_INPUTS))
+def test_list_mode_refuses_a_receipts_file_over_a_limit_with_that_limit(limit, tmp_path) -> None:
+    code, out, err = _list_mode_raw(tmp_path, _doc_with(LIMIT_INPUTS[limit]))
+    assert "Traceback" not in err, err[-300:]
+    assert code == 1 and out == {"verdict": "FAIL", "reason": f"inputs: the receipts file {limit}"}, out
+
+
+@pytest.mark.parametrize("limit", sorted(LIMIT_INPUTS))
+def test_list_mode_refuses_a_receipt_header_over_a_limit_with_that_limit(limit, tmp_path) -> None:
+    import base64
+
+    body = b'{"statement": {"x": ' + LIMIT_INPUTS[limit] + b'}, "signature_b64": "", "receipt_sha256": ""}'
+    code, out, err = _list_mode_raw(tmp_path, headers=(base64.urlsafe_b64encode(body).decode(),))
+    assert "Traceback" not in err, err[-300:]
+    assert code == 1 and out == {"verdict": "FAIL", "reason": f"inputs: a receipt header {limit}"}, out
+
+
+@pytest.mark.parametrize("limit", sorted(LIMIT_INPUTS))
+def test_list_mode_refuses_an_attestation_file_over_a_limit_with_that_limit(limit, tmp_path) -> None:
+    code, out, err = _list_mode_raw(tmp_path, b"[]", attestation_text=b'{"binding": {"x": ' + LIMIT_INPUTS[limit] + b"}}")
+    assert "Traceback" not in err, err[-300:]
+    assert code == 1 and out == {"verdict": "FAIL", "reason": f"inputs: the attestation file {limit}"}, out
+
+
+def test_a_deep_policy_in_a_small_receipt_is_refused_before_anything_is_printed(tmp_path) -> None:
+    code, out, err = _list_mode_raw(tmp_path, _doc_with(b'{"allow": ' + b"[" * 13000 + b"]" * 13000 + b"}"))
+    assert code == 1 and out["reason"] == "inputs: the receipts file nests too deeply to read"
+
+
+@pytest.mark.parametrize("text, reason", [
+    (b"{}", "the receipts document has no receipts"),
+    (b'{"head": null}', "the receipts document has no receipts"),
+    (b"5", "the receipts document is not a list or an object with receipts"),
+    (b'"x"', "the receipts document is not a list or an object with receipts"),
+    (b"null", "the receipts document is not a list or an object with receipts"),
+    (b'{"receipts": 5}', "the receipts are not a list"),
+])
+def test_a_receipts_document_without_receipts_gets_its_own_reason(text, reason, tmp_path) -> None:
+    code, out, err = _list_mode_raw(tmp_path, text)
+    assert "Traceback" not in err and code == 1 and out == {"verdict": "FAIL", "reason": reason}, out
+
+
+# ---- the last-line catch is narrow: input faults are named, internal defects say so, nothing else is swallowed
+
+def _main_with(monkeypatch, capsys, tmp_path, target: str, raising: BaseException):
+    vr = _load_checker()
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    (tmp_path / "att.json").write_bytes(gen.pretty(pack.attestation))
+    (tmp_path / "r.json").write_text(json.dumps({"receipts": _room(gen, pack, "ordinary", 99, {})}))
+
+    def boom(*args, **kwargs):
+        raise raising
+
+    monkeypatch.setattr(vr, target, boom)
+    monkeypatch.setattr(sys, "argv", ["verify_receipts.py", "--attestation", str(tmp_path / "att.json"), "--receipts",
+                                      str(tmp_path / "r.json"), "--skip-amd", "--expected-measurement", gen.MEASUREMENT])
+    return vr
+
+
+@pytest.mark.parametrize("raising", [MemoryError(), SystemExit(7), KeyboardInterrupt()],
+                         ids=["MemoryError", "SystemExit", "KeyboardInterrupt"])
+def test_the_final_net_never_swallows_memory_exit_or_interrupt(raising, monkeypatch, capsys, tmp_path) -> None:
+    vr = _main_with(monkeypatch, capsys, tmp_path, "verify_receipts", raising)
+    with pytest.raises(type(raising)):
+        vr.main()
+
+
+@pytest.mark.parametrize("raising", [AttributeError("x"), IndexError("x"), KeyError("x"), TypeError("x")])
+def test_an_internal_defect_in_the_verifier_ends_in_exit_one_and_says_internal_error(raising, monkeypatch, capsys,
+                                                                                   tmp_path) -> None:
+    vr = _main_with(monkeypatch, capsys, tmp_path, "verify_receipts", raising)
+    assert vr.main() == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "FAIL" and out["reason"].startswith("internal error: ")
+    assert "wrong type or shape" not in out["reason"]
+
+
+def test_a_malformed_attestation_is_named_as_input_and_not_as_an_internal_error(tmp_path) -> None:
+    code, out, err = _list_mode_raw(tmp_path, b"[]", attestation_text=b'{"binding": 5, "binding_sha256": "x"}')
+    assert "Traceback" not in err and code == 1
+    assert out == {"verdict": "FAIL", "reason": "the attestation is not an object with a binding object and a "
+                                                "binding_sha256 string"}
