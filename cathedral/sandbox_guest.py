@@ -1285,6 +1285,15 @@ def _sweep_stale_bases(own: Path) -> None:
         return
 
 
+def _runs_on_overlay(guest: GuestRecord) -> bool:
+    """True when the room's tunables set a runsc overlay (root:self or all:self), whose root file
+    system writes a snapshot does not see. A room without tunables runs the hotel's own default."""
+    if guest.tunables is None:
+        return False
+    overlay = ((guest.tunables.get("values") or {}).get("runsc") or {}).get("overlay2")
+    return overlay is not None and str(overlay) != "none"
+
+
 class DockerGuestProvider:
     """SandboxProvider that runs each sandbox as a real Linux Docker (or Kata) guest."""
 
@@ -2409,48 +2418,86 @@ class DockerGuestProvider:
         name: str | None = None,
         labels: dict[str, str] | None = None,
     ) -> str:
-        op_id = self._inner.snapshot(
-            sandbox_id, ttl_seconds=ttl_seconds, name=name, labels=labels
-        )
-        result = self._inner.get_operation(op_id)["result"]
-        snap_id = result["snapshot_id"]
-        if snap_id in self._snapshot_images:
-            # A named snapshot is get-or-create: keep the first commit unchanged.
-            return op_id
+        """Capture one moment of a room (AB#604): pause, tar /work, commit, unpause.
+
+        Lock order: only self._inner._lock, taken for short steps inside the inner provider's
+        begin / finish / abort calls; docker, the tar and the hash run with no lock held.
+        A running room is paused for the tar and the commit only and runs again on every exit path;
+        a room that was already paused stays paused. Nothing is recorded until the capture is whole.
+        """
         guest = self._guests.get(sandbox_id)
-        if guest is None:
-            return op_id
+        if guest is not None and _runs_on_overlay(guest):
+            raise SandboxOpError(
+                "snapshot_overlay_unsupported", 422,
+                "this room runs with a runsc overlay, which keeps root file system writes out of a snapshot",
+            )
+        done, capture = self._inner.begin_snapshot(sandbox_id, ttl_seconds=ttl_seconds, name=name, labels=labels)
+        if capture is None:
+            return done  # type: ignore[return-value]  # a repeat from the same room: the stored record
+        snap_id = capture.snapshot_id
         image_name = f"cathedral-snap-{snap_id}:latest"
+        committed = False
+        granted: tuple[str, str] | None = None
         try:
-            self._client.commit(guest.container_id, image_name)
-        except SandboxOpError:
-            # Drop the record, so no fork can find a snapshot without an image.
-            self._inner.delete_snapshot(snap_id)
-            raise
-        # Ownership comes from the source room, not the snapshot request labels.
-        snap_owner = guest.owner if guest.owner is not None else owner_id(None, None)
-        image_id = self._image_id_of(image_name)
-        if image_id is None:
-            self._inner.delete_snapshot(snap_id)
-            self._client.run(["docker", "image", "rm", image_name], timeout=60.0)
-            raise SandboxOpError("snapshot_image_missing", 409, f"snapshot {snap_id} has no docker id after commit")
-        try:
+            if guest is None:
+                # No guest, no image: a tar alone is not a snapshot a fork could start.
+                raise SandboxOpError("snapshot_image_missing", 409, f"sandbox {sandbox_id} has no guest to commit")
+            self._inner.wait_for_api_writes(capture)
+            paused = False
+            if not capture.was_frozen:
+                self._client.pause(guest.container_id)
+                paused = True
+            try:
+                size = self._inner.write_snapshot_archive(capture)
+                self._client.commit(guest.container_id, image_name)
+                committed = True
+                image_id = self._image_id_of(image_name)
+                if image_id is None:
+                    raise SandboxOpError("snapshot_image_missing", 409, f"snapshot {snap_id} has no docker id after commit")
+            except BaseException:
+                if paused:
+                    self._unpause_after_capture(guest, sandbox_id, strict=False)
+                raise
+            if paused:
+                self._unpause_after_capture(guest, sandbox_id, strict=True)
+            sha = self._inner.hash_snapshot_archive(capture)
+            # Ownership comes from the source room, not the snapshot request labels.
+            snap_owner = guest.owner if guest.owner is not None else owner_id(None, None)
             self._image_owners.grant(image_id, snap_owner, provenance="snapshot", ref=image_name)
-        except SandboxOpError:
-            self._inner.delete_snapshot(snap_id)
-            self._client.run(["docker", "image", "rm", image_name], timeout=60.0)
+            granted = (image_id, snap_owner)
+            meta = {**self._snapshot_sizes(snap_id, image_name, guest.image, size), "committed_image_id": image_id,
+                    "work_archive_sha256": sha}
+            self._snapshot_images[snap_id] = image_name
+            self._snapshot_owners[snap_id] = snap_owner
+            self._snapshot_meta[snap_id] = meta
+            extra = {k: v for k, v in meta.items() if k not in ("size_bytes", "work_archive_bytes", "work_archive_sha256")}
+            return self._inner.finish_snapshot(
+                capture, size_bytes=meta["size_bytes"], work_archive_bytes=size, work_archive_sha256=sha, extra=extra
+            )
+        except BaseException:
+            self._snapshot_images.pop(snap_id, None)
+            self._snapshot_owners.pop(snap_id, None)
+            self._snapshot_meta.pop(snap_id, None)
+            if granted is not None:
+                try:
+                    self._image_owners.drop_owner(*granted)
+                except Exception:  # noqa: BLE001  cleanup must not hide the first error
+                    pass
+            if committed:
+                self._client.run(["docker", "image", "rm", image_name], timeout=60.0)
             raise
-        self._snapshot_images[snap_id] = image_name
-        self._snapshot_owners[snap_id] = snap_owner
-        sizes = self._snapshot_sizes(snap_id, image_name, guest.image, int(result.get("size_bytes") or 0))
-        self._snapshot_meta[snap_id] = sizes
-        with self._inner._lock:  # noqa: SLF001
-            entry = self._inner._snapshots.get(snap_id)  # noqa: SLF001
-            if entry is not None:
-                path, rec = entry
-                self._inner._snapshots[snap_id] = (path, replace(rec, size_bytes=sizes["size_bytes"]))  # noqa: SLF001
-            self._inner._operations[op_id]["result"].update(sizes)  # noqa: SLF001
-        return op_id
+        finally:
+            self._inner.abort_snapshot(capture)
+
+    def _unpause_after_capture(self, guest: GuestRecord, sandbox_id: str, *, strict: bool) -> None:
+        """Run the room again. A room deleted meanwhile has nothing to run; with an error already
+        on its way out (strict False) the unpause error is not allowed to hide it."""
+        try:
+            self._client.unpause(guest.container_id)
+        except SandboxOpError:
+            if not strict or self._guests.get(sandbox_id) is None:
+                return
+            raise
 
     def _snapshot_sizes(self, snap_id: str, image_name: str, base_image: str, work_archive_bytes: int) -> dict[str, Any]:
         """Sizes of one snapshot, in bytes.
@@ -2601,12 +2648,18 @@ class DockerGuestProvider:
         return doc
 
     def freeze(self, sandbox_id: str) -> dict[str, Any]:
+        self._refuse_during_capture(sandbox_id)
         guest = self._guests.get(sandbox_id)
         if guest is not None:
             self._client.pause(guest.container_id)
         return self._inner.freeze(sandbox_id)
 
+    def _refuse_during_capture(self, sandbox_id: str) -> None:
+        if self._inner.snapshot_is_capturing(sandbox_id):
+            raise SandboxOpError("snapshot_in_progress", 409, f"sandbox {sandbox_id} is being snapshotted")
+
     def thaw(self, sandbox_id: str) -> dict[str, Any]:
+        self._refuse_during_capture(sandbox_id)
         guest = self._guests.get(sandbox_id)
         doc = self._inner.thaw(sandbox_id)
         if guest is not None:

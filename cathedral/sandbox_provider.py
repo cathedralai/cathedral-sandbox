@@ -24,6 +24,7 @@ reference and is not treated as an isolation boundary.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import signal
@@ -82,6 +83,45 @@ class SandboxOpError(Exception):
         self.code = code
         self.http_status = http_status
         self.retry_after = retry_after
+
+
+# AB#604: per-machine cap on stored snapshot bytes (/work archives plus committed layers).
+# The operator sets it with CATHEDRAL_SANDBOX_SNAPSHOT_MAX_BYTES; this is the default.
+DEFAULT_MAX_SNAPSHOT_BYTES = 100 << 30
+# AB#604: how long a capture waits for API writes already in flight before it gives up.
+SNAPSHOT_WRITE_WAIT_SECONDS = 30.0
+
+
+def _write_work_archive(src: Path, dest: Path) -> None:
+    """Write the gzip tar of a room's /work to *dest*. A seam: tests replace it."""
+    with tarfile.open(dest, "w:gz") as tf:
+        tf.add(src, arcname=".")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+@dataclass
+class SnapshotCapture:
+    """One capture in progress: the reserved id, the room, and where its tar goes (AB#604)."""
+
+    snapshot_id: str
+    sandbox_id: str
+    path: Path
+    work: Path
+    ttl_seconds: int
+    name: str | None
+    labels: dict[str, str]
+    api_key: str | None
+    name_key: tuple[str | None, str] | None
+    max_bytes: int  # one snapshot at most the room's disk_gib
+    was_frozen: bool
+    done: bool = False
 
 
 # AB#534: how stale a room's disk_bytes may be in a list answer.
@@ -205,6 +245,7 @@ class InMemorySandboxProvider:
         pricing: Pricing | None = None,
         require_known_keys: bool = False,
         max_snapshots: int = api.MIN_SNAPSHOTS,
+        max_snapshot_bytes: int | None = None,
         creates_per_minute: int = api.MIN_CREATES_PER_MINUTE,
         region: str | None = None,
         enforce_disk: bool = False,
@@ -229,6 +270,24 @@ class InMemorySandboxProvider:
         self._require_known_keys = require_known_keys
         # §3.5: the store guarantees at least MIN_SNAPSHOTS (1,000) retained images.
         self._max_snapshots = max_snapshots
+        if max_snapshot_bytes is None:
+            raw = os.environ.get("CATHEDRAL_SANDBOX_SNAPSHOT_MAX_BYTES", "").strip()
+            try:
+                max_snapshot_bytes = int(raw) if raw else DEFAULT_MAX_SNAPSHOT_BYTES
+            except ValueError:
+                raise api.SandboxContractError(
+                    "invalid_snapshot_cap", f"CATHEDRAL_SANDBOX_SNAPSHOT_MAX_BYTES {raw!r} is not an integer"
+                ) from None
+        self._max_snapshot_bytes = max_snapshot_bytes
+        # AB#604 capture state, all under self._lock (no second lock). A room with an entry in
+        # _captures takes no API writes and no second capture; _reserved_names holds the names of
+        # captures that run; _snapshot_capture holds the finished record's source room and answer.
+        self._captures: dict[str, SnapshotCapture] = {}
+        self._reserved_names: dict[tuple[str | None, str], str] = {}
+        self._snapshot_capture: dict[str, dict[str, Any]] = {}
+        self._writes_in_flight: dict[str, int] = {}
+        self._writes_done = threading.Condition(self._lock)
+        self._snapshot_write_wait = SNAPSHOT_WRITE_WAIT_SECONDS
         self._base_url = (base_url or api.CATHEDRAL_API_URL).rstrip("/")
         self._pricing = pricing or Pricing()
         # §3.10/§3.11 create pacing: trailing 60-second window of created sandboxes.
@@ -729,19 +788,45 @@ class InMemorySandboxProvider:
                     handle.terminate()
 
     # ------------------------------------------------------------------ §3.3 files / tar / stat
+    def _begin_api_write(self, sandbox_id: str) -> _Sandbox:
+        """Admit one write from outside the room, or refuse it while the room is being captured (AB#604).
+
+        Call with self._lock held. The caller must call _end_api_write when the write is over.
+        """
+        sandbox = self._require_running(sandbox_id)
+        if sandbox_id in self._captures:
+            raise SandboxOpError(
+                "snapshot_in_progress", 409, f"sandbox {sandbox_id} is being snapshotted; writes resume when it ends"
+            )
+        self._writes_in_flight[sandbox_id] = self._writes_in_flight.get(sandbox_id, 0) + 1
+        return sandbox
+
+    def _end_api_write(self, sandbox_id: str) -> None:
+        with self._lock:
+            left = self._writes_in_flight.get(sandbox_id, 0) - 1
+            if left > 0:
+                self._writes_in_flight[sandbox_id] = left
+            else:
+                self._writes_in_flight.pop(sandbox_id, None)
+            self._writes_done.notify_all()
+
     def write_file(self, sandbox_id: str, path: str, data: bytes, mode: int | None) -> None:
         with self._lock:
-            sandbox = self._require_running(sandbox_id)
-            self._touch(sandbox)
-            self._assert_disk_room(sandbox, extra_bytes=len(data), replacing=path)
-        self._host(sandbox, path)
-        fd = _open_beneath(sandbox.root, path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, make_dirs=True)
-        with os.fdopen(fd, "wb") as fh:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise SandboxOpError("not_a_file", 400, f"{path} is not a regular file")
-            fh.write(data)
-            if mode is not None:
-                os.fchmod(fd, mode)
+            sandbox = self._begin_api_write(sandbox_id)
+        try:
+            with self._lock:
+                self._touch(sandbox)
+                self._assert_disk_room(sandbox, extra_bytes=len(data), replacing=path)
+            self._host(sandbox, path)
+            fd = _open_beneath(sandbox.root, path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, make_dirs=True)
+            with os.fdopen(fd, "wb") as fh:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise SandboxOpError("not_a_file", 400, f"{path} is not a regular file")
+                fh.write(data)
+                if mode is not None:
+                    os.fchmod(fd, mode)
+        finally:
+            self._end_api_write(sandbox_id)
 
     def read_file(self, sandbox_id: str, spec: FileGet) -> tuple[bytes, int]:
         with self._lock:
@@ -768,20 +853,24 @@ class InMemorySandboxProvider:
 
     def write_tar(self, sandbox_id: str, path: str, tarball: bytes) -> None:
         with self._lock:
-            sandbox = self._require_running(sandbox_id)
-            self._touch(sandbox)
-            # Bound by compressed size as a conservative pre-check; post-extract
-            # recheck catches expansion past disk_gib.
-            self._assert_disk_room(sandbox, extra_bytes=len(tarball), replacing=None)
-        target = self._host(sandbox, path)
-        target.mkdir(parents=True, exist_ok=True)
-        import io
+            sandbox = self._begin_api_write(sandbox_id)
+        try:
+            with self._lock:
+                self._touch(sandbox)
+                # Bound by compressed size as a conservative pre-check; post-extract
+                # recheck catches expansion past disk_gib.
+                self._assert_disk_room(sandbox, extra_bytes=len(tarball), replacing=None)
+            target = self._host(sandbox, path)
+            target.mkdir(parents=True, exist_ok=True)
+            import io
 
-        with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as tf:
-            _safe_extract(tf, target)
-        with self._lock:
-            sandbox = self._require_active(sandbox_id)
-            self._assert_disk_room(sandbox, extra_bytes=0, replacing=None)
+            with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as tf:
+                _safe_extract(tf, target)
+            with self._lock:
+                sandbox = self._require_active(sandbox_id)
+                self._assert_disk_room(sandbox, extra_bytes=0, replacing=None)
+        finally:
+            self._end_api_write(sandbox_id)
 
     def read_tar(self, sandbox_id: str, spec: TarGet) -> bytes:
         with self._lock:
@@ -820,6 +909,28 @@ class InMemorySandboxProvider:
 
     # ------------------------------------------------------------------ §3.5 snapshot / fork primitives
     def snapshot(self, sandbox_id: str, *, ttl_seconds: int | None = None, name: str | None = None, labels: dict[str, str] | None = None) -> str:
+        """Capture /work to a tar (no image: the in-memory runtime has none). DockerGuestProvider drives
+        the same begin / write / finish steps around its pause and commit."""
+        done, capture = self.begin_snapshot(sandbox_id, ttl_seconds=ttl_seconds, name=name, labels=labels)
+        if capture is None:
+            return done  # type: ignore[return-value]
+        try:
+            self.wait_for_api_writes(capture)
+            size = self.write_snapshot_archive(capture)
+            return self.finish_snapshot(
+                capture, size_bytes=size, work_archive_bytes=size, work_archive_sha256=self.hash_snapshot_archive(capture)
+            )
+        finally:
+            self.abort_snapshot(capture)
+
+    def begin_snapshot(
+        self, sandbox_id: str, *, ttl_seconds: int | None = None, name: str | None = None, labels: dict[str, str] | None = None
+    ) -> tuple[str | None, SnapshotCapture | None]:
+        """Start a capture: check, reserve the id and the name, and close the room to API writes.
+
+        Returns (operation id, None) for a repeat of a finished capture from the same room, else
+        (None, capture). Nothing is recorded as a snapshot until finish_snapshot.
+        """
         if ttl_seconds is None:
             ttl_seconds = api.SNAPSHOT_TTL_DEFAULT_SECONDS
         if not (1 <= ttl_seconds <= api.SNAPSHOT_TTL_MAX_SECONDS):
@@ -828,39 +939,116 @@ class InMemorySandboxProvider:
             )
         with self._lock:
             self._sweep_snapshots_locked()
-            # §3.5: named snapshots are get-or-create -- re-snapshotting under an
-            # existing name returns that snapshot rather than duplicating it.
-            if name:
+            name_key = (self._caller_key(), name) if name else None
+            if name_key is not None:
+                if name_key in self._reserved_names:
+                    raise SandboxOpError("snapshot_in_progress", 409, f"a snapshot named {name!r} is being captured")
+                # §3.5: named snapshots are get-or-create -- the same room asking again gets the stored
+                # record. Another room asking for the name is refused, never given the first room's record.
                 for sid, (_, rec) in self._snapshots.items():
                     if rec.name == name and self._snapshot_visible(sid):
+                        stored = self._snapshot_capture[sid]
+                        if stored["source_sandbox_id"] != sandbox_id:
+                            raise SandboxOpError(
+                                "snapshot_name_taken", 409, f"a snapshot named {name!r} already exists from another room"
+                            )
                         op_id = api.operation_id()
-                        self._operations[op_id] = {
-                            "status": "done",
-                            "result": {"snapshot_id": sid, "size_bytes": rec.size_bytes, "name": name},
-                        }
-                        return op_id
-            if len(self._snapshots) >= self._max_snapshots:
+                        self._operations[op_id] = {"status": "done", "result": dict(stored["result"])}
+                        return op_id, None
+            if len(self._snapshots) + len(self._captures) >= self._max_snapshots or self._stored_bytes_locked() >= self._max_snapshot_bytes:
                 raise SandboxOpError(
-                    "snapshot_quota", 429, f"snapshot store is full ({self._max_snapshots})", retry_after=30
+                    "snapshot_store_sold_out", 429, "the snapshot store is sold out; try again later", retry_after=30
                 )
             sandbox = self._require_active(sandbox_id)
+            if sandbox_id in self._captures:
+                raise SandboxOpError("snapshot_in_progress", 409, f"sandbox {sandbox_id} is already being snapshotted")
             snap_id = "snap_" + uuid.uuid4().hex[:12]
-            path = self._base / f"{snap_id}.tar.gz"
-            with tarfile.open(path, "w:gz") as tf:
-                tf.add(sandbox.root / "work", arcname=".")
-            size = path.stat().st_size
-            record = SnapshotRecord(
-                snapshot_id=snap_id, size_bytes=size, ttl_seconds=ttl_seconds, created_at=_now(),
-                name=name or None, labels=dict(labels or {}),
+            capture = SnapshotCapture(
+                snapshot_id=snap_id, sandbox_id=sandbox_id, path=self._base / f"{snap_id}.tar.gz", work=sandbox.root / "work",
+                ttl_seconds=ttl_seconds, name=name or None, labels=dict(labels or {}), api_key=sandbox.api_key,
+                name_key=name_key, max_bytes=sandbox.resources.disk_gib << 30, was_frozen=sandbox.state == "frozen",
             )
-            self._snapshots[snap_id] = (path, record)
-            self._snapshot_owner[snap_id] = sandbox.api_key
-            op_id = api.operation_id()
-            self._operations[op_id] = {
-                "status": "done",
-                "result": {"snapshot_id": snap_id, "size_bytes": size, **({"name": name} if name else {})},
+            self._captures[sandbox_id] = capture  # from here new API writes to the room answer 409
+            if name_key is not None:
+                self._reserved_names[name_key] = snap_id
+            return None, capture
+
+    def _stored_bytes_locked(self) -> int:
+        return sum(rec.size_bytes for _, rec in self._snapshots.values())
+
+    def wait_for_api_writes(self, capture: SnapshotCapture) -> None:
+        """Wait, bounded, for API writes that were in flight when the capture started."""
+        deadline = time.monotonic() + self._snapshot_write_wait
+        with self._lock:
+            while self._writes_in_flight.get(capture.sandbox_id, 0) > 0:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise SandboxOpError(
+                        "snapshot_writes_pending", 503, f"writes to sandbox {capture.sandbox_id} did not finish in time", retry_after=5
+                    )
+                self._writes_done.wait(left)
+
+    def write_snapshot_archive(self, capture: SnapshotCapture) -> int:
+        """Tar /work to the capture's path. Runs outside the provider lock. Returns the archive size."""
+        try:
+            _write_work_archive(capture.work, capture.path)
+            size = capture.path.stat().st_size
+        except (OSError, tarfile.TarError) as exc:
+            raise SandboxOpError("snapshot_failed", 502, f"could not archive /work: {exc}"[:300]) from exc
+        if size > capture.max_bytes:
+            raise SandboxOpError("snapshot_too_large", 413, f"the /work archive is {size} bytes, over the room's disk ({capture.max_bytes})")
+        return size
+
+    def hash_snapshot_archive(self, capture: SnapshotCapture) -> str:
+        return _sha256_file(capture.path)
+
+    def snapshot_is_capturing(self, sandbox_id: str) -> bool:
+        with self._lock:
+            return sandbox_id in self._captures
+
+    def finish_snapshot(
+        self, capture: SnapshotCapture, *, size_bytes: int, work_archive_bytes: int, work_archive_sha256: str,
+        extra: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Write the record in one step. It is complete here and never changed after."""
+        with self._lock:
+            sandbox = self._require_active(capture.sandbox_id)  # a room deleted meanwhile: 409/404, no record
+            if size_bytes > capture.max_bytes:
+                raise SandboxOpError("snapshot_too_large", 413, f"the snapshot is {size_bytes} bytes, over the room's disk ({capture.max_bytes})")
+            if len(self._snapshots) >= self._max_snapshots or self._stored_bytes_locked() + size_bytes > self._max_snapshot_bytes:
+                raise SandboxOpError(
+                    "snapshot_store_sold_out", 429, "the snapshot store is sold out; try again later", retry_after=30
+                )
+            record = SnapshotRecord(
+                snapshot_id=capture.snapshot_id, size_bytes=size_bytes, ttl_seconds=capture.ttl_seconds, created_at=_now(),
+                name=capture.name, labels=dict(capture.labels),
+            )
+            result = {
+                "snapshot_id": capture.snapshot_id, "size_bytes": size_bytes, "work_archive_bytes": work_archive_bytes,
+                "work_archive_sha256": work_archive_sha256, "source_sandbox_id": capture.sandbox_id,
+                **({"name": capture.name} if capture.name else {}), **dict(extra or {}),
             }
+            self._snapshots[capture.snapshot_id] = (capture.path, record)
+            self._snapshot_owner[capture.snapshot_id] = sandbox.api_key
+            self._snapshot_capture[capture.snapshot_id] = {"source_sandbox_id": capture.sandbox_id, "result": result}
+            op_id = api.operation_id()
+            self._operations[op_id] = {"status": "done", "result": dict(result)}
+            capture.done = True
+            self._end_capture_locked(capture)
             return op_id
+
+    def abort_snapshot(self, capture: SnapshotCapture) -> None:
+        """End a capture that did not finish; after a finished one it only releases nothing. Idempotent."""
+        with self._lock:
+            self._end_capture_locked(capture)
+            if not capture.done:
+                capture.path.unlink(missing_ok=True)
+
+    def _end_capture_locked(self, capture: SnapshotCapture) -> None:
+        if self._captures.get(capture.sandbox_id) is capture:
+            del self._captures[capture.sandbox_id]
+        if capture.name_key is not None and self._reserved_names.get(capture.name_key) == capture.snapshot_id:
+            del self._reserved_names[capture.name_key]
 
     def _sweep_snapshots_locked(self) -> None:
         """§3.5: drop snapshots whose retention TTL has elapsed (deletes the tar)."""
@@ -873,6 +1061,7 @@ class InMemorySandboxProvider:
         for sid in expired:
             path, _ = self._snapshots.pop(sid)
             self._snapshot_owner.pop(sid, None)
+            self._snapshot_capture.pop(sid, None)
             Path(path).unlink(missing_ok=True)
 
     def list_snapshots(self, labels: Iterable[str] = (), *, owner: str | None = None) -> list[dict[str, Any]]:
@@ -903,6 +1092,7 @@ class InMemorySandboxProvider:
                 return False
             meta = self._snapshots.pop(snapshot_id)
             self._snapshot_owner.pop(snapshot_id, None)
+            self._snapshot_capture.pop(snapshot_id, None)
             Path(meta[0]).unlink(missing_ok=True)
             return True
 
@@ -1189,6 +1379,8 @@ class InMemorySandboxProvider:
         """
         with self._lock:
             sandbox = self._require_active(sandbox_id)
+            if sandbox_id in self._captures:
+                raise SandboxOpError("snapshot_in_progress", 409, f"sandbox {sandbox_id} is being snapshotted")
             if sandbox.state == "frozen":
                 return self._get_doc(sandbox)
             if sandbox.state != "running":
@@ -1214,6 +1406,8 @@ class InMemorySandboxProvider:
         """Restore a frozen sandbox to running."""
         with self._lock:
             sandbox = self._require_active(sandbox_id)
+            if sandbox_id in self._captures:
+                raise SandboxOpError("snapshot_in_progress", 409, f"sandbox {sandbox_id} is being snapshotted")
             if sandbox.state == "running":
                 return self._get_doc(sandbox)
             if sandbox.state != "frozen":

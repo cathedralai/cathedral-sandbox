@@ -249,16 +249,17 @@ def _tar_fails(src, dest):
 @pytest.mark.parametrize("path", ["tar_fails", "commit_fails", "hash_fails", "exception_between"])
 def test_a_running_room_runs_again_on_every_exit_path(fake, provider, monkeypatch, path) -> None:
     sid = _source(provider)
+    patch = pytest.MonkeyPatch()  # a local one: undoing it must not undo the fake docker on PATH
     if path == "tar_fails":
-        monkeypatch.setattr(sandbox_provider, "_write_work_archive", _tar_fails)
+        patch.setattr(sandbox_provider, "_write_work_archive", _tar_fails)
     elif path == "commit_fails":
         fake.set(commit_fail=True)
     elif path == "hash_fails":
-        monkeypatch.setattr(sandbox_provider, "_sha256_file", _hash_fails)
+        patch.setattr(sandbox_provider, "_sha256_file", _hash_fails)
     else:  # an exception no one planned for, between the pause and the unpause
         def boom(ref):
             raise RuntimeError("unexpected")
-        monkeypatch.setattr(provider, "_image_id_of", boom)
+        patch.setattr(provider, "_image_id_of", boom)
     with pytest.raises(Exception):
         provider.snapshot(sid)
     assert fake.status_of(sid) == "running"
@@ -267,7 +268,7 @@ def test_a_running_room_runs_again_on_every_exit_path(fake, provider, monkeypatc
     assert provider.list_snapshots() == []
     assert not [i for i in fake.state["images"] if i.startswith("cathedral-snap-")]
     assert not list(provider._inner._base.glob("snap_*"))  # noqa: SLF001
-    monkeypatch.undo()
+    patch.undo()
     fake.set(commit_fail=False)
     assert _snapshot(provider, sid)["snapshot_id"].startswith("snap_")
 
@@ -564,7 +565,13 @@ def test_an_api_restart_mid_snapshot_does_not_leave_a_room_paused_for_ever(fake,
     sid = _source(provider)
     gate, entered = threading.Event(), threading.Event()
     monkeypatch.setattr(sandbox_provider, "_write_work_archive", _bytes_writer(fake, gate=gate, entered=entered))
-    worker = threading.Thread(target=lambda: provider.snapshot(sid), daemon=True)
+    def old_process():
+        try:
+            provider.snapshot(sid)
+        except SandboxOpError:
+            pass  # its room is gone under it: the capture fails
+
+    worker = threading.Thread(target=old_process, daemon=True)
     worker.start()
     try:
         assert entered.wait(10)
@@ -609,7 +616,12 @@ def test_two_captures_under_one_name_from_two_rooms_let_one_through(fake, provid
     a, c = _room(provider, "a"), _room(provider, "c")
     gate, entered, committed = _gate_first_commit(provider)
     outcome: list = []
-    worker = threading.Thread(target=lambda: outcome.append(provider.get_operation(provider.snapshot(a, name="shared"))["result"]), daemon=True)
+    def first():
+        provider.authorize("k")  # a request thread carries its key, as the server sets it per request
+        outcome.append(provider.get_operation(provider.snapshot(a, name="shared"))["result"])
+
+    provider.authorize("k")
+    worker = threading.Thread(target=first, daemon=True)
     worker.start()
     try:
         assert entered.wait(10)
