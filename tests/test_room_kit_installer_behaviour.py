@@ -911,6 +911,59 @@ def test_host_net_config_hotel_adds_no_forward(host: FakeHost) -> None:
     assert not [c for c in host.calls("iptables") if "PREROUTING" in c]
 
 
+
+# ---------------------------------------------------------------- Preview URL ingress (SEALED_GUEST_INGRESS=1, AB#423)
+
+INGRESS = {"SEALED_GUEST_INGRESS": "1"}
+INGRESS_DNAT = ("iptables -t nat -A PREROUTING -p tcp --dport 443 -m addrtype --dst-type LOCAL -m comment "
+                "--comment sealed-hotel:sealed-1 -j DNAT --to-destination 10.215.0.2:8443")
+
+
+def test_host_net_ingress_forwards_443_to_the_guest_ingress_port(host: FakeHost) -> None:
+    proc = _run_host_net(host, "up", INGRESS)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    ipt = host.calls("iptables")
+    fwd = [c.split("SEALED-SNP0-FWD ")[1] for c in ipt if c.startswith("iptables -A SEALED-SNP0-FWD ")]
+    assert fwd == [
+        "-i snp0 -s 10.215.0.2 -p tcp --sport 8443 -m conntrack --ctstate ESTABLISHED -j ACCEPT",
+        "-i snp0 -d 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,169.254.0.0/16 -j DROP",
+        "-i snp0 -s 10.215.0.2 -j ACCEPT", "-i snp0 -j DROP",
+        "-o snp0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
+        "-o snp0 -d 10.215.0.2 -p tcp --dport 8443 -m conntrack --ctstate NEW -j ACCEPT",
+        "-o snp0 -j DROP"]
+    assert INGRESS_DNAT in ipt
+    assert not [c for c in ipt if "9443" in c or "18443" in c], "ingress alone adds no miner port"
+    proc = _run_host_net(host, "check", INGRESS, FAKE_IPTABLES_RULES="present")
+    assert proc.returncode == 0 and "were missing; restoring" in proc.stderr  # the fake lists 5 rules, ingress needs 7
+    assert any(c.startswith("iptables -t nat -C PREROUTING -p tcp --dport 443 ") for c in host.calls("iptables"))
+    proc = _run_host_net(host, "down", INGRESS)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert INGRESS_DNAT.replace(" -A ", " -D ") in host.calls("iptables")
+
+
+def test_host_net_miner_with_ingress_keeps_both_ways_in(host: FakeHost) -> None:
+    proc = _run_host_net(host, "up", {**MINER, **INGRESS})
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    ipt = host.calls("iptables")
+    fwd = [c.split("SEALED-SNP0-FWD ")[1] for c in ipt if c.startswith("iptables -A SEALED-SNP0-FWD ")]
+    assert len(fwd) == 9
+    assert fwd.index("-i snp0 -s 10.215.0.2 -p tcp --sport 8443 -m conntrack --ctstate ESTABLISHED -j ACCEPT") < fwd.index(
+        "-i snp0 -d 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,169.254.0.0/16 -j DROP")
+    assert fwd[-1] == "-o snp0 -j DROP"
+    assert INGRESS_DNAT in ipt and any("--dport 9443" in c and "PREROUTING" in c for c in ipt)
+
+
+def test_host_net_ingress_refuses_clashing_ports_but_down_still_runs(host: FakeHost) -> None:
+    for bad in ({"SEALED_INGRESS_TLS_PORT": "18090"}, {"SEALED_INGRESS_TLS_PORT": "70000"},
+                {"SEALED_INGRESS_PUBLIC_PORT": "0"}, {**MINER, "SEALED_INGRESS_PUBLIC_PORT": "9443"},
+                {**MINER, "SEALED_INGRESS_TLS_PORT": "18443"}):
+        proc = _run_host_net(host, "up", {**INGRESS, **bad})
+        assert proc.returncode == 1 and "SEALED_INGRESS_TLS_PORT" in proc.stderr, bad
+    assert not [c for c in host.calls("iptables") if " -A " in c or " -I " in c]
+    proc = _run_host_net(host, "down", {**INGRESS, "SEALED_INGRESS_TLS_PORT": "18090"})
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert host.calls("ip link del") == ["ip link del snp0"]
+
 def test_sealed_miner_restart_never_sends_a_key_and_needs_the_override(host: FakeHost) -> None:
     (host.state / "active-units").write_text("room-sealed-sealed-1.service\n")
     proc, _ = _sealed_step5(host, "ab" * 48, sealed=MINER)

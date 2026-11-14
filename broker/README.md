@@ -563,6 +563,34 @@ Config (all optional):
 `pending` or `refused` (with `reason`). `GET /v1/broker/hotels` (guest key) lists all
 hotels with labels and free rooms.
 
+## Preview URL certificates (DNS-01 challenge service)
+
+AB#423. One Let's Encrypt wildcard per sealed hotel, `*.<hotel id>.<zone>`,
+with the private key made in the guest. The guest's ACME client proves the
+name over DNS-01 through the broker, which lets each hotel set only its own
+record: `_acme-challenge.<hotel id>.<zone>`.
+
+`PUT /v1/broker/acme-challenge` takes no Bearer key. Body:
+
+```json
+{"purpose": "cathedral-acme-dns01-v1", "zone": "<zone>", "hotel": "<hotel id>",
+ "binding_sha256": "<current binding>", "values": ["<43 char base64url>"], "ts": <unix seconds>}
+```
+
+Header `X-Cathedral-Hotel-Signature`: standard base64 of the Ed25519
+signature, by the receipt key the hotel's binding names, over
+`cathedral-acme-dns01-v1\n` followed by the raw body. The broker uses the key
+it stored at admission, and only when the AMD chain passed for that binding,
+the measurement is on `sealed_measurements` and the hotel is admitted now.
+Every untrusted request gets the same `403 forbidden`. After that: up to 2
+values (the wildcard and the bare name share the record), `[]` removes the
+record, `ts` within 120 s of the broker clock and later than the last accepted
+one from that hotel. The record is replaced as a whole (TTL 60).
+
+| Key | Meaning |
+|---|---|
+| `acme_dns` | Absent: the route answers `404 not_enabled`. `{"zone": "hotels.example.com", "cloudflare_zone_id": "<32 hex>", "token_file": "<path>"}`. The zone must hold hotel names only (miners choose their hotel id). The token needs DNS edit on that zone only; it is read at each call and never logged. Hotel ids must be one lower-case DNS label to get a name. |
+
 ## Secrets
 
 - The config file is private (not in git). It holds hotel addresses, the

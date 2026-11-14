@@ -486,6 +486,28 @@ With a saved attestation, use `--tls-spki-sha256 <peer SPKI sha256>`, or
 - **`admission_policy`.** The broker must report it in operator capacity
   (#1588 checklist).
 
+## Preview URL ingress on the host (AB#423)
+
+`SEALED_GUEST_INGRESS=1` in `sealed.env` makes `host-net.sh` add, the same
+way as the miner port:
+
+- a DNAT of `SEALED_INGRESS_PUBLIC_PORT` (default 443) on this host's own
+  addresses to the guest's ingress port `SEALED_INGRESS_TLS_PORT` (default
+  8443);
+- a FORWARD accept for new connections to that port, and the answers on them.
+
+Host side only: not measured, no re-seal. TLS ends in the guest, with a key
+made there; the certificate is the hotel's Let's Encrypt wildcard, proven over
+DNS-01 through the broker (broker README, "Preview URL certificates"). Before
+turning it on: nothing else on the host may need port 443 on its own
+addresses, the port must be open in any outer firewall, and `*.<hotel
+id>.<zone>` must point at this host. Turn it off only with the guest stopped:
+`down` removes only the rules the current `sealed.env` names.
+
+Still open: the guest side (an nft accept for the ingress port, the server on
+it, the ACME client that signs its challenge with the receipt key). It is in
+the measured image and needs a re-seal.
+
 ## Remove
 
 ```
