@@ -296,6 +296,10 @@ type broker struct {
 	// tombs is guest id -> recent deletes by label, which also catch creates
 	// in flight (inflight.go). Guarded by b.mu.
 	tombs map[string][]tombstone
+
+	// minerExits: miner hotels that went down holding customer rooms
+	// (miner_exits.go). Guarded by b.mu.
+	minerExits []*minerExit
 }
 
 // A hotel counts as answering while its last good health answer is younger than okWindow.
@@ -1823,12 +1827,16 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	case h.downSince.IsZero():
 		h.downSince = now
 		b.hotelWentDown(h)
+		b.noteMinerDown(h, now)
 		// A hotel that comes back must pass attestation again: it may have
 		// rebooted into another binding.
 		h.adm.attestedAt, h.adm.checkedAt = time.Time{}, time.Time{}
 		if wasOK {
 			log.Printf("hotel %s down: %s", h.cfg.ID, h.lastErr)
 		}
+	}
+	if cameUp {
+		b.noteMinerUp(h, now)
 	}
 	if cameUp && b.cfg.PrewarmCatalog {
 		go b.prewarmHotel(h)
@@ -1878,6 +1886,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		b.register(rm)
 		h.place(rm)
 	}
+	b.checkMinerExitRooms(h, seen)
 	var deleting []*room
 	for hid, rm := range h.rooms {
 		if !seen[hid] && rm.state == stRunning && now.Sub(rm.since) > 5*time.Second {
@@ -2143,6 +2152,10 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(p, "/v1/broker/bindings/") && r.Method == "GET" && b.isOperator(r) {
 		b.handleBindingGet(w, strings.TrimPrefix(p, "/v1/broker/bindings/")) // operator key only
+		return
+	}
+	if p == "/v1/broker/miner-exits" && r.Method == "GET" && (b.isOperator(r) || b.isOperatorReader(r)) {
+		b.handleMinerExits(w, r) // miner hotels that went down with customer rooms
 		return
 	}
 	if p == "/v1/broker/guests" || strings.HasPrefix(p, "/v1/broker/guests/") {
