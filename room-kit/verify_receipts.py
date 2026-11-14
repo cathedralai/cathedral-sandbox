@@ -70,6 +70,27 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      --cathedral-sandbox finds it; an unclaimed room, a retired one and a room
      whose claim failed name no link. A failed delete leaves the room's state
      unknown, not retired. The output's pool_rooms gives each state.
+ 12. snapshots and forks, inside one binding. A successful snapshot receipt
+     names snapshot_id, snapshot_image_id (sha256: and 64 hex),
+     snapshot_work_archive_sha256, snapshot_size_bytes and
+     snapshot_content_sha256, together or not at all; a snapshot that did not
+     succeed carries none. The content hash is recomputed from the image id
+     and the work archive hash (the tar of /work); the image's layers are not
+     hashed again at a fork. A fork's successful create carries snapshot_id,
+     snapshot_content_sha256, snapshot_receipt_sha256 and
+     snapshot_source_sandbox_id, together or not at all. Repeat snapshot
+     receipts for one id agree on hash and source room. A fork whose
+     snapshot_receipt_sha256 is in the list must name an earlier successful
+     snapshot receipt of that source room with the same id and hash, under the
+     same binding (earlier by signed sequence, not by place in the list), and
+     it must be the first receipt to sign that snapshot. A snapshot receipt
+     and a fork's create carry a sandbox_id string; a snapshot_delete carries
+     sandbox_id as an explicit null. snapshot_id and
+     snapshot_source_sandbox_id are non-empty strings. A fork whose snapshot
+     receipt is not in the list is named
+     fork_source: not_in_list, not refused. A fork after a successful
+     snapshot_delete of the same id in the same binding is refused. The
+     output's chain.forks has one entry per fork.
 
 Run mode (--oneshot FILE, a cathedral_oneshot_bundle_v1) checks one run's file offline against what the
 caller expects, in eight checks. The AMD certificates come from the file (amd_certs) and must match
@@ -773,6 +794,189 @@ def _is_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+# Snapshots and forks (AB#604). A snapshot receipt names the snapshot and the two parts of its content hash; a
+# fork's create receipt names the snapshot receipt it was made from. Check 11 reads the edge between them.
+SNAPSHOT_MEMBERS = ("snapshot_id", "snapshot_image_id", "snapshot_work_archive_sha256", "snapshot_size_bytes",
+                    "snapshot_content_sha256")
+FORK_MEMBERS = ("snapshot_id", "snapshot_content_sha256", "snapshot_receipt_sha256", "snapshot_source_sandbox_id")
+HEX64_RE = re.compile(r"[0-9a-f]{64}")
+SNAPSHOT_CHECKED = ("snapshots: each content hash recomputes from its two parts, and each fork's link to a snapshot "
+                    "receipt in the list matches it (a snapshot receipt not in the list is named, not checked)")
+
+
+def snapshot_content_sha256(image_id: str, work_archive_sha256: str) -> str:
+    """sha256 of the canonical document of the snapshot's two parts."""
+    return sha(canonical({"schema": "cathedral_snapshot_content_v1", "image_id": image_id,
+                          "work_archive_sha256": work_archive_sha256}))
+
+
+def _check_snapshot_member(st: dict, name: str, where: str) -> None:
+    value = st.get(name)
+    if name in ("snapshot_id", "snapshot_source_sandbox_id"):
+        need(isinstance(value, str), f"{where}: {name} is not a string")
+        need(value != "", f"{where}: {name} is empty")
+    elif name == "snapshot_image_id":
+        need(isinstance(value, str) and IMAGE_DIGEST_RE.fullmatch(value) is not None,
+             f"{where}: snapshot_image_id is not sha256: and 64 lower-case hex")
+    elif name == "snapshot_size_bytes":
+        need(_is_int(value) and value >= 0, f"{where}: snapshot_size_bytes is not an integer of 0 or more")
+    else:
+        need(isinstance(value, str) and HEX64_RE.fullmatch(value) is not None,
+             f"{where}: {name} is not 64 lower-case hex")
+
+
+def _check_snapshot_presence(st: dict, where: str) -> None:
+    """Which snapshot members a statement carries, and that none the later checks read is missing. Kept apart from
+    the forms so that the form checks can be switched off in a test without the graph code reading a gap."""
+    action = st["action"]
+    if action == "snapshot":
+        present = [m for m in SNAPSHOT_MEMBERS if m in st]
+        if _succeeded(st) and present:
+            need(len(present) == len(SNAPSHOT_MEMBERS),
+                 f"{where}: a snapshot receipt has some of its five snapshot members and not all")
+            need("sandbox_id" in st, f"{where}: a snapshot receipt has no sandbox_id string")
+    elif action == "create":
+        present = [m for m in FORK_MEMBERS if m in st]
+        if present and _succeeded(st):
+            need(len(present) == len(FORK_MEMBERS),
+                 f"{where}: a create has some of its four snapshot fork members and not all")
+            need("sandbox_id" in st, f"{where}: a fork's create has no sandbox_id string")
+    elif action == "snapshot_delete":
+        need("sandbox_id" in st, f"{where}: a snapshot_delete has no sandbox_id member: it must be null, not left out")
+        need("snapshot_id" in st, f"{where}: snapshot_id is not a string")
+
+
+def _check_snapshot_forms(st: dict, where: str) -> None:
+    """The form of each snapshot member, and which statements may carry them. Absent members are left out, never null."""
+    action = st["action"]
+    if action == "snapshot":
+        present = [m for m in SNAPSHOT_MEMBERS if m in st]
+        if not _succeeded(st):
+            need(not present, f"{where}: a snapshot receipt that did not succeed carries snapshot members")
+        elif present:
+            for name in SNAPSHOT_MEMBERS:
+                _check_snapshot_member(st, name, where)
+            need(isinstance(st.get("sandbox_id"), str), f"{where}: a snapshot receipt has no sandbox_id string")
+    elif action == "create":
+        present = [m for m in FORK_MEMBERS if m in st]
+        if present:
+            need(_succeeded(st), f"{where}: a create that did not succeed carries snapshot fork members")
+            for name in FORK_MEMBERS:
+                _check_snapshot_member(st, name, where)
+            need(isinstance(st.get("sandbox_id"), str), f"{where}: a fork's create has no sandbox_id string")
+    elif action == "snapshot_delete":
+        need(st["sandbox_id"] is None, f"{where}: a snapshot_delete has a sandbox_id: it must be null")
+        _check_snapshot_member(st, "snapshot_id", where)
+        if "snapshot_source_sandbox_id" in st:
+            _check_snapshot_member(st, "snapshot_source_sandbox_id", where)
+
+
+def check_snapshot_shapes(st: dict, where: str) -> None:
+    """The snapshot members of one statement, by action: presence first, then form."""
+    _check_snapshot_presence(st, where)
+    _check_snapshot_forms(st, where)
+
+
+# Check 11 is made of small rules, each its own function so that a test can switch one off and see that every
+# bad case breaks exactly one rule (tests/test_verify_receipt_lists.py).
+def _check_content_hashes(snapshots: list[dict]) -> None:
+    for rc in snapshots:
+        st = rc["statement"]
+        need(st["snapshot_content_sha256"] == snapshot_content_sha256(st["snapshot_image_id"],
+                                                                      st["snapshot_work_archive_sha256"]),
+             f"receipt {st['sequence']}: snapshot_content_sha256 does not recompute from snapshot_image_id and "
+             "snapshot_work_archive_sha256")
+
+
+def _first_snapshots(snapshots: list[dict]) -> dict[tuple[str, str], dict]:
+    """The earliest successful snapshot receipt of each snapshot id, per binding (snapshots are in sequence order)."""
+    first_of: dict[tuple[str, str], dict] = {}
+    for rc in snapshots:
+        st = rc["statement"]
+        first_of.setdefault((st["binding_sha256"], st["snapshot_id"]), rc)
+    return first_of
+
+
+def _check_repeats(snapshots: list[dict], first_of: dict[tuple[str, str], dict]) -> None:
+    for rc in snapshots:
+        st = rc["statement"]
+        first = first_of[(st["binding_sha256"], st["snapshot_id"])]
+        if first is rc:
+            continue
+        said = first["statement"]
+        here = f"snapshot {st['snapshot_id']}: receipt {said['sequence']} and receipt {st['sequence']} disagree on"
+        need(said["snapshot_content_sha256"] == st["snapshot_content_sha256"], f"{here} snapshot_content_sha256")
+        need(said["sandbox_id"] == st["sandbox_id"], f"{here} the source room")
+
+
+def _check_fork_matches_snapshot(st: dict, target: dict, first_of: dict[tuple[str, str], dict]) -> None:
+    """A fork whose snapshot receipt is in the list: same binding, a successful snapshot receipt that states the
+    same snapshot, from the source room, earlier by signed sequence, and the first to sign that snapshot."""
+    where, tst = f"receipt {st['sequence']}", target["statement"]
+    need(tst["binding_sha256"] == st["binding_sha256"],
+         f"{where}: snapshot_receipt_sha256 names a receipt under another binding")
+    need(tst["action"] == "snapshot" and _succeeded(tst),
+         f"{where}: the fork names a receipt that is not a successful snapshot receipt")
+    need("snapshot_id" in tst, f"{where}: the fork names a snapshot receipt that states no snapshot")
+    need(tst["snapshot_id"] == st["snapshot_id"],
+         f"{where}: the fork names a snapshot receipt with another snapshot_id")
+    need(tst["snapshot_content_sha256"] == st["snapshot_content_sha256"],
+         f"{where}: the fork names a snapshot receipt with another snapshot_content_sha256")
+    need(tst["sandbox_id"] == st["snapshot_source_sandbox_id"],
+         f"{where}: the fork names a snapshot receipt of another room than snapshot_source_sandbox_id")
+    need(tst["sequence"] < st["sequence"], f"{where}: the fork names a snapshot receipt that does not come before it")
+    first = first_of[(tst["binding_sha256"], tst["snapshot_id"])]
+    need(first is target, f"{where}: the fork names a snapshot receipt that is not the first to sign that snapshot "
+                          f"(receipt {first['statement']['sequence']} signed it first)")
+
+
+def _check_fork_not_after_delete(st: dict, first_delete: dict[tuple[str, str], dict]) -> None:
+    gone = first_delete.get((st["binding_sha256"], st["snapshot_id"]))
+    need(gone is None or gone["statement"]["sequence"] > st["sequence"],
+         f"receipt {st['sequence']}: the fork is of snapshot {st['snapshot_id']}, which receipt "
+         f"{gone['statement']['sequence'] if gone else ''} deleted before it")
+
+
+def check_snapshot_edges(receipts: list[dict]) -> dict | None:
+    """Check 11, on receipts whose shapes, hashes, signatures and sequences are already checked.
+
+    Everything is scoped by binding: a snapshot id means something only inside one binding, and an edge from a
+    fork to a snapshot receipt must lie inside one. Order is the signed sequence, never the place in the list.
+    The work is in the number of receipts: deletes and first snapshots are indexed once.
+    Returns {"forks": [...]}, or None when the list holds no snapshot, snapshot_delete or fork receipt."""
+    by_hash = {rc["receipt_sha256"]: rc for rc in receipts}
+    snapshots, forks, first_delete, seen = [], [], {}, False
+    for rc in sorted(receipts, key=lambda r: (r["statement"]["binding_sha256"], r["statement"]["sequence"])):
+        st = rc["statement"]
+        if st["action"] in ("snapshot", "snapshot_delete"):
+            seen = True
+        if st["action"] == "snapshot" and _succeeded(st) and "snapshot_id" in st:
+            snapshots.append(rc)
+        elif st["action"] == "snapshot_delete" and _succeeded(st):
+            first_delete.setdefault((st["binding_sha256"], st["snapshot_id"]), rc)
+        elif st["action"] == "create" and "snapshot_receipt_sha256" in st:
+            forks.append(rc)
+    if not (seen or forks):
+        return None
+    _check_content_hashes(snapshots)
+    first_of = _first_snapshots(snapshots)
+    _check_repeats(snapshots, first_of)
+    entries = []
+    for rc in forks:
+        st = rc["statement"]
+        target = by_hash.get(st["snapshot_receipt_sha256"])
+        if target is not None:
+            _check_fork_matches_snapshot(st, target, first_of)
+        _check_fork_not_after_delete(st, first_delete)
+        entry = {"room": st["sandbox_id"], "snapshot_id": st["snapshot_id"],
+                 "snapshot_content_sha256": st["snapshot_content_sha256"],
+                 "source_room": st["snapshot_source_sandbox_id"], "in_list": target is not None}
+        if target is None:
+            entry["fork_source"] = "not_in_list"
+        entries.append(entry)
+    return {"forks": entries}
+
+
 def _succeeded(st: dict) -> bool:
     status = st.get("status")
     return _is_int(status) and 200 <= status < 300
@@ -974,6 +1178,7 @@ def check_receipt_shapes(receipts) -> None:
              f"{where}: previous_receipt_sha256 is not a string or null")
         need(st.get("status") is None or _is_int(st["status"]), f"{where}: status is not an integer")
         need(st.get("sandbox_id") is None or isinstance(st["sandbox_id"], str), f"{where}: sandbox_id is not a string")
+        check_snapshot_shapes(st, where)
 
 
 def check_attestation_shape(att) -> None:
@@ -1730,6 +1935,9 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
         attestation_out = verify_attestation(att, trust["measurements"], trust.get("product"), "", trust["ark_sha256"],
                                              False, certs)
         chain_out = verify_receipts(att, receipts, None)
+        edges = check_snapshot_edges(receipts)
+        if edges is not None:
+            chain_out["forks"] = edges["forks"]
     except Fail as exc:
         raise Fail(f"check 1: {exc}") from exc
     except InvalidSignature as exc:
@@ -2222,8 +2430,13 @@ def main() -> int:
                          + sum(p["signatures_ok"] for p in archive_chains),
                          "bindings": [live_bsha, *[p["binding_sha256"] for p in archive_chains]],
                          "live": chain_out}
+        edges = check_snapshot_edges(receipts)
+        if edges is not None:
+            chain_out["forks"] = edges["forks"]
         checked = ("whole chain to the head the server named" if chain_head is not None
                    else "each receipt; not that none are missing")
+        if edges is not None:
+            checked += "; " + SNAPSHOT_CHECKED
         numbering = room_numbering(receipts, doc if isinstance(doc, dict) else None)
         if numbering["rooms"]:
             chain_out["room_numbering"] = numbering_words(numbering["rooms"])

@@ -106,6 +106,15 @@ health does not say `sealed`. Verify a chain offline with
 `verify_receipts.py`: signature, link to the previous receipt, and head. A
 level 1 chain has no SNP report.
 
+For snapshots and forks, `verify_receipts.py` also reads each snapshot receipt and each fork's create receipt (in
+list mode, header mode and run mode alike; run mode adds the prefix `check 1: `). It recomputes
+`snapshot_content_sha256` from `snapshot_image_id` and `snapshot_work_archive_sha256`, and, when a fork's
+`snapshot_receipt_sha256` is in the list, checks that it names an earlier successful snapshot receipt in the same
+binding with the same snapshot id, content hash and source room, and is the first receipt to sign that snapshot. A snapshot that was deleted and made again under the same id is treated as one id, so a fork of the second one fails the first-receipt rule; the machine gives every snapshot a fresh id, so this does not happen with an honest machine. A fork whose snapshot receipt is not in the list is
+reported as `fork_source: not_in_list` in `chain.forks`, not refused. A fork after a successful delete of its
+snapshot is refused. The content hash covers the image id and the hash of the tar of `/work`; the image's layers are
+not hashed again at a fork.
+
 `verify_receipts.py --oneshot FILE` checks one one-shot run's file offline (run mode). It takes `--recipe`,
 `--context` or `--no-context`, `--run-id`, `--input-sha256`, `--input-file`, `--output-file`,
 `--expected-measurement`, `--allowed-measurements`, `--ark-sha256`, `--product` and `--require-sealed`. The other
