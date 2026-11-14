@@ -1847,7 +1847,8 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		go b.prewarmHotel(h)
 	}
 	offered := h.slots // health late: the slots placement still uses
-	if herr == nil {
+	slotsTrusted := herr == nil
+	if slotsTrusted {
 		slots := hd.Slots
 		if h.cfg.MaxSlots > 0 && slots > h.cfg.MaxSlots {
 			slots = h.cfg.MaxSlots
@@ -1871,7 +1872,8 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		h.apiRunning = int(quota.Usage["running_sandboxes"] + quota.Usage["frozen_sandboxes"])
 		h.apiDeleting = int(quota.Usage["deleting_sandboxes"])
 	}
-	b.recordDelivery(h, offered, now) // before the room list return: a failed list does not stop the count
+	// Slot delivery credits only a trusted health report this tick (AB#331).
+	b.recordDelivery(h, offered, now, slotsTrusted) // before the room list return: a failed list does not stop the count
 	if lerr != nil {
 		return
 	}

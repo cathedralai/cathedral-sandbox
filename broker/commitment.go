@@ -137,8 +137,10 @@ func (b *broker) checkJoinCommitment(hc hotelConfig) error {
 }
 
 // recordDelivery credits one sync tick to h's delivery. offered is the slots
-// the hotel offers this tick (max_slots applied). Caller holds b.mu.
-func (b *broker) recordDelivery(h *hotel, offered int, now time.Time) {
+// the hotel offers this tick (max_slots applied). slotsTrusted is true only
+// when this tick got a fresh /room/health slot report; a health miss must not
+// credit stale last-known slots (AB#331). Caller holds b.mu.
+func (b *broker) recordDelivery(h *hotel, offered int, now time.Time, slotsTrusted bool) {
 	c := h.cfg.Commitment
 	if c == nil {
 		return
@@ -163,6 +165,11 @@ func (b *broker) recordDelivery(h *hotel, offered int, now time.Time) {
 		return
 	}
 	d.today.upSec += dt
+	if !slotsTrusted {
+		// Room calls can keep h.ok true while health is late; uptime still
+		// counts, but slot delivery needs a trusted report this tick.
+		return
+	}
 	if offered >= c.Slots {
 		d.today.atCommitSec += dt
 	}

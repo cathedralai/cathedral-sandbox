@@ -135,7 +135,7 @@ func TestDeliveryIsMeasuredAgainstTheCommitment(t *testing.T) {
 		b.mu.Lock()
 		defer b.mu.Unlock()
 		h.ok = ok
-		b.recordDelivery(h, offered, t0.Add(after))
+		b.recordDelivery(h, offered, t0.Add(after), true)
 	}
 	tick(0, 8, true)                // first tick: nothing to credit yet
 	tick(30*time.Second, 8, true)   // 30 s at commitment, 4 slots counted (capped)
@@ -197,5 +197,39 @@ func TestSyncLoopCountsReportedSlots(t *testing.T) {
 	c, _ := doc["commitment"].(map[string]any)
 	if c["today"] == nil {
 		t.Fatalf("hotel document lacks today's delivery: %v", doc)
+	}
+}
+
+// TestHealthFailDoesNotCreditStaleSlots: room calls can keep the hotel up
+// while /room/health fails; delivery must not credit the last known slot count.
+func TestHealthFailDoesNotCreditStaleSlots(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	m := joinMiner(t, tc, "m1", true, 8, map[string]any{"commitment": map[string]any{"slots": 4, "daily_hours": 12}})
+	time.Sleep(20 * time.Millisecond)
+	syncNow(tc, "m1")
+	h := tc.b.hotelByID("m1")
+	tc.b.mu.Lock()
+	first := *h.delivery.today
+	tc.b.mu.Unlock()
+	if first.atCommitSec <= 0 {
+		t.Fatalf("expected initial slot credit: %+v", first)
+	}
+	// Health stops; room calls still answer so h.ok stays true (healthLate).
+	m.healthFail = true
+	h.lastAnswer.Store(time.Now().UnixNano())
+	time.Sleep(20 * time.Millisecond)
+	syncNow(tc, "m1")
+	tc.b.mu.Lock()
+	second := *h.delivery.today
+	ok, late := h.ok, h.healthLate
+	tc.b.mu.Unlock()
+	if !ok || !late {
+		t.Fatalf("expected up via room calls with late health: ok=%v late=%v", ok, late)
+	}
+	if second.atCommitSec != first.atCommitSec || second.slotSec != first.slotSec {
+		t.Fatalf("stale slots credited after health fail: %+v then %+v", first, second)
+	}
+	if second.upSec <= first.upSec {
+		t.Fatalf("uptime should still count while room calls answer: %+v then %+v", first, second)
 	}
 }
