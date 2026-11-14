@@ -1713,11 +1713,26 @@ def test_a_fork_never_starts_an_image_other_than_the_verified_one_when_the_tag_m
     assert a in argv and b not in argv  # started from the verified id
 
 
-def test_a_fork_whose_tag_moved_before_the_start_is_snapshot_corrupt_and_leaves_nothing(fake, provider, monkeypatch) -> None:
+def test_a_tag_that_moves_after_the_one_check_does_not_change_the_image_a_fork_starts(fake, provider, monkeypatch) -> None:
+    # The fork looks at the name once, to pin the verified id, and starts that id: a later move of the tag is not seen.
     result, _, _ = _captured(provider)
     name, a, b = f"cathedral-snap-{result['snapshot_id']}:latest", result["committed_image_id"], "sha256:" + "ab" * 32
     _count_by_name(provider, monkeypatch, name, [a], b)  # only the first look is A
+    doc = _fork(provider, result["snapshot_id"])
+    argv = _fork_argv(fake, doc)
+    assert a in argv and b not in argv
+
+
+def test_a_record_whose_image_id_changed_before_the_start_is_snapshot_corrupt_and_leaves_nothing(fake, provider) -> None:
+    result, _, _ = _captured(provider)
     runs = len(fake.calls_of("run"))
+    real_unpack = provider._inner._unpack_snapshot  # noqa: SLF001
+
+    def unpack_then_change(*a, **kw):
+        real_unpack(*a, **kw)
+        provider._snapshot_meta[result["snapshot_id"]]["committed_image_id"] = "sha256:" + "cd" * 32  # noqa: SLF001
+
+    provider._inner._unpack_snapshot = unpack_then_change  # noqa: SLF001
     with pytest.raises(SandboxOpError) as err:
         _fork(provider, result["snapshot_id"])
     assert (err.value.code, err.value.http_status) == ("snapshot_corrupt", 409)

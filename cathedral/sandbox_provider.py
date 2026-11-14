@@ -168,14 +168,19 @@ def _open_snapshot_archive(path: Path):
 
 
 class _HashingReader:
-    """Pass bytes through and hash every byte read, so what is unpacked is what is hashed."""
+    """Pass bytes through, hash every byte read, and refuse to read more than *limit* bytes."""
 
-    def __init__(self, fh) -> None:
+    def __init__(self, fh, limit: int | None = None) -> None:
         self._fh = fh
         self._digest = hashlib.sha256()
+        self._limit = limit
+        self._count = 0
 
     def read(self, n: int = -1) -> bytes:
         data = self._fh.read(n)
+        self._count += len(data)
+        if self._limit is not None and self._count > self._limit:
+            raise SandboxOpError("snapshot_corrupt", 409, "the stored snapshot is longer than its record says")
         self._digest.update(data)
         return data
 
@@ -185,6 +190,18 @@ class _HashingReader:
 
     def hexdigest(self) -> str:
         return self._digest.hexdigest()
+
+
+@dataclass
+class _DeferredFork:
+    """A fork whose rooms are registered as "creating" while their files are unpacked outside the lock."""
+
+    sandboxes: list
+    entry: tuple  # the stored (tar path, record) the fork was admitted against
+    digest: str | None
+    expected_bytes: int | None
+    disk_cap: int | None
+    now: datetime
 
 
 @dataclass
@@ -203,6 +220,7 @@ class SnapshotCapture:
     max_bytes: int  # one snapshot at most the room's disk_gib
     was_frozen: bool
     store_limited: bool = False  # max_bytes came from the store's remaining room, not the room's disk
+    disk_cap: int = 0  # the room's disk_gib in bytes: what a fork may unpack
     env_names: tuple[str, ...] = ()  # create-time variables of the room, blanked in the commit
     done: bool = False
 
@@ -376,6 +394,8 @@ class InMemorySandboxProvider:
         self._writes_done = threading.Condition(self._lock)
         self._snapshot_write_wait = SNAPSHOT_WRITE_WAIT_SECONDS
         self._snapshot_tar_timeout = SNAPSHOT_TAR_TIMEOUT_SECONDS
+        # Idempotency keys of forks whose files are still being unpacked (outside the lock).
+        self._idem_inflight: set[tuple[str | None, str]] = set()
         self._base_url = (base_url or api.CATHEDRAL_API_URL).rstrip("/")
         self._pricing = pricing or Pricing()
         # §3.10/§3.11 create pacing: trailing 60-second window of created sandboxes.
@@ -567,6 +587,8 @@ class InMemorySandboxProvider:
                     if seen[0] != body_digest:
                         raise SandboxOpError("idempotency_conflict", 409, "Idempotency-Key reused with a different body")
                     return seen[1]
+                if (api_key, idempotency) in self._idem_inflight:
+                    raise SandboxOpError("idempotency_in_progress", 409, "a create with this Idempotency-Key is still running", retry_after=1)
 
             started = time.perf_counter()
             try:
@@ -576,11 +598,53 @@ class InMemorySandboxProvider:
                 raise
             finally:
                 self._create_latencies_ms.append((time.perf_counter() - started) * 1000)
+            if not isinstance(docs, _DeferredFork):
+                if idempotency is not None:
+                    self._idempotency[(api_key, idempotency)] = (body_digest, docs)
+                return docs
+            deferred = docs
             if idempotency is not None:
-                self._idempotency[(api_key, idempotency)] = (body_digest, docs)
+                self._idem_inflight.add((api_key, idempotency))
+        # The fork's rooms are reserved ("creating", counted in quota). Unpack and hash with no lock held,
+        # then publish under the lock after checking the snapshot and the rooms are still as admitted.
+        try:
+            for sandbox in deferred.sandboxes:
+                self._unpack_snapshot(
+                    deferred.entry[0], sandbox.root, deferred.digest, deferred.expected_bytes, deferred.disk_cap
+                )
+            with self._lock:
+                docs = self._publish_deferred(deferred)
+                if idempotency is not None:
+                    self._idempotency[(api_key, idempotency)] = (body_digest, docs)
             return docs
+        except BaseException:
+            with self._lock:
+                for sandbox in deferred.sandboxes:
+                    if self._sandboxes.get(sandbox.id) is sandbox and sandbox.state == "creating":
+                        del self._sandboxes[sandbox.id]
+            for sandbox in deferred.sandboxes:
+                shutil.rmtree(sandbox.root, ignore_errors=True)
+            raise
+        finally:
+            if idempotency is not None:
+                with self._lock:
+                    self._idem_inflight.discard((api_key, idempotency))
 
-    def _create_locked(self, request: CreateSandboxRequest, api_key: str | None) -> dict[str, Any]:
+    def _publish_deferred(self, d: _DeferredFork) -> dict[str, Any]:
+        """Self._lock held. The fork's files are in place: check the snapshot and the rooms, then run them."""
+        if self._snapshots.get(d.entry[1].snapshot_id) is not d.entry:
+            raise SandboxOpError("snapshot_corrupt", 409, "the snapshot changed while it was unpacked")
+        for sandbox in d.sandboxes:
+            if self._sandboxes.get(sandbox.id) is not sandbox or sandbox.state != "creating":
+                raise SandboxOpError("sandbox_deleting", 409, f"sandbox {sandbox.id} was removed while it was created")
+        for sandbox in d.sandboxes:
+            sandbox.state = "running"
+            sandbox.started_at = d.now
+        if len(d.sandboxes) == 1:
+            return self._get_doc(d.sandboxes[0])
+        return {"sandboxes": [self._get_doc(s) for s in d.sandboxes], "count": len(d.sandboxes)}
+
+    def _create_locked(self, request: CreateSandboxRequest, api_key: str | None) -> Any:
         # §3.10/§3.11 pacing: at most ``creates_per_minute`` sandbox-creates in any
         # trailing 60-second window (a fork of N counts as N creates), per API key.
         now = _now()
@@ -645,7 +709,7 @@ class InMemorySandboxProvider:
         created: list[_Sandbox] = []
         try:
             for _ in range(request.count):
-                sandbox = self._materialize(request, now, api_key, image_id, snap)
+                sandbox = self._materialize(request, now, api_key, image_id, snap, defer=snap is not None)
                 created.append(sandbox)
         except BaseException:
             # One failed fork fails the batch: no record and no folder of it is left.
@@ -655,6 +719,13 @@ class InMemorySandboxProvider:
             raise
         self._create_times_by_key.setdefault(rate_key, []).extend(now for _ in created)
         self._create_times.extend(now for _ in created)
+        if snap is not None:
+            stored = self._snapshot_capture.get(snap[1].snapshot_id) or {}
+            result = stored.get("result") or {}
+            return _DeferredFork(
+                created, snap, result.get("work_archive_sha256"), result.get("work_archive_bytes"),
+                stored.get("disk_cap_bytes"), now,
+            )
         if len(created) == 1:
             return self._get_doc(created[0])
         return {"sandboxes": [self._get_doc(s) for s in created], "count": len(created)}
@@ -700,22 +771,17 @@ class InMemorySandboxProvider:
         return None
 
     def _materialize(
-        self, request: CreateSandboxRequest, now: datetime, api_key: str | None, image_id: str | None, snap
+        self, request: CreateSandboxRequest, now: datetime, api_key: str | None, image_id: str | None, snap,
+        defer: bool = False,
     ) -> _Sandbox:
         sid = "sbx_" + uuid.uuid4().hex[:12]
         root = self._base / sid
         root.mkdir(parents=True, exist_ok=True)
         (root / "work").mkdir(exist_ok=True)
-        if snap is not None:
-            try:
-                self._unpack_snapshot(snap[0], root, self._snapshot_digest(snap[1].snapshot_id))
-            except BaseException:
-                shutil.rmtree(root, ignore_errors=True)
-                raise
         sandbox = _Sandbox(
             id=sid,
             root=root,
-            state="running",
+            state="creating" if defer else "running",
             created_at=now,
             expires_at=now + timedelta(seconds=request.ttl_seconds),
             ttl_seconds=request.ttl_seconds,
@@ -1099,7 +1165,7 @@ class InMemorySandboxProvider:
             capture = SnapshotCapture(
                 snapshot_id=snap_id, sandbox_id=sandbox_id, path=self._base / f"{snap_id}.tar.gz", work=sandbox.root / "work",
                 ttl_seconds=ttl_seconds, name=name or None, labels=dict(labels or {}), api_key=sandbox.api_key,
-                name_key=name_key, max_bytes=min(each, left), store_limited=left < each, was_frozen=sandbox.state == "frozen",
+                name_key=name_key, max_bytes=min(each, left), store_limited=left < each, disk_cap=each, was_frozen=sandbox.state == "frozen",
                 env_names=tuple(sorted(sandbox.env)),
             )
             self._captures[sandbox_id] = capture  # from here new API writes to the room answer 409
@@ -1182,7 +1248,9 @@ class InMemorySandboxProvider:
             sid = capture.snapshot_id
             self._snapshots[sid] = (capture.path, record)
             self._snapshot_owner[sid] = sandbox.api_key
-            self._snapshot_capture[sid] = {"source_sandbox_id": capture.sandbox_id, "result": result}
+            self._snapshot_capture[sid] = {
+                "source_sandbox_id": capture.sandbox_id, "result": result, "disk_cap_bytes": capture.disk_cap,
+            }
             self._operations[op_id] = {"status": "done", "result": dict(result)}
             try:
                 if publish is not None:
@@ -1267,7 +1335,10 @@ class InMemorySandboxProvider:
         stored = self._snapshot_capture.get(snapshot_id)
         return stored["result"].get("work_archive_sha256") if stored else None
 
-    def _unpack_snapshot(self, tar_path: Path, root: Path, expected_sha256: str | None) -> None:
+    def _unpack_snapshot(
+        self, tar_path: Path, root: Path, expected_sha256: str | None, expected_bytes: int | None = None,
+        disk_cap: int | None = None,
+    ) -> None:
         """Unpack a stored tar into root/work in one pass over one open file (AB#604).
 
         The bytes that are unpacked are the bytes that are hashed. The files land in a staging
@@ -1280,11 +1351,17 @@ class InMemorySandboxProvider:
         staging = root / ".incoming"
         staging.mkdir()
         try:
-            reader = _HashingReader(_open_snapshot_archive(tar_path))
+            reader = _HashingReader(_open_snapshot_archive(tar_path), limit=expected_bytes)
+            members_total = 0
             try:
                 with tarfile.open(fileobj=reader, mode="r|gz") as tf:
                     for member in tf:
                         _check_member(member)
+                        if member.isreg():
+                            members_total += member.size
+                            if disk_cap is not None and members_total > disk_cap:
+                                # A tiny archive can claim a huge member: stop before it is extracted.
+                                raise corrupt
                         try:
                             tf.extract(member, path=staging, filter="data")
                         except TypeError:  # Python < 3.12 without filter=: links were refused above
@@ -2365,6 +2442,8 @@ def _check_member(member: tarfile.TarInfo) -> None:
     name = member.name
     if name.startswith("/") or ".." in Path(name).parts:
         raise SandboxOpError("unsafe_tar", 400, f"tar member escapes target: {name}")
+    if member.isdev():
+        raise SandboxOpError("unsafe_tar", 400, f"tar member is a device node: {name}")
     if member.issym() or member.islnk():
         link = member.linkname or ""
         if link.startswith("/") or ".." in Path(link).parts:
