@@ -260,11 +260,14 @@ Callers: _reconcile_locked.
 
 ### pause, unpause (757-773)
 Purpose: `docker pause|unpause` (30 s); nonzero -> 502.
-Callers: freeze, thaw.
+Callers: freeze, thaw, snapshot.
 
 ### commit (775-787)
 Purpose: `docker commit <cid> <image>` (300 s) then `image inspect {{.Id}}`;
-nonzero commit -> 502 snapshot_failed. The room is not paused during commit.
+nonzero commit -> 502 snapshot_failed. Since AB#604 the snapshot caller pauses a
+running room for the tar and the commit, and the room runs again after, on every
+exit path. A room that was already paused stays paused. Uploads to the room
+(file and tar PUT) are refused with 409 snapshot_in_progress while the capture runs.
 Callers: snapshot.
 
 ### wait_dind_ready (789-810)
