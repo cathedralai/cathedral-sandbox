@@ -98,6 +98,9 @@ def main(argv):
     if cmd == "image" and argv[1] == "inspect":
         ref = argv[-1]
         with Locked() as st:
+            if ref not in st["images"] and ref.startswith("sha256:"):
+                # An image id names the image whose id it is (docker resolves ids as well as names).
+                ref = next((r for r in st["images"] if image_id_for(r, b) == ref), ref)
             present = ref in st["images"]
             # Distinct immutable ids per ref so ownership tests can prove an
             # ID-based boundary (AB#650). Operators may override via behaviour.

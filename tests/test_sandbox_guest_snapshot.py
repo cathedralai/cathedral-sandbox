@@ -1666,3 +1666,231 @@ def test_a_terminal_line_written_during_a_capture_is_refused_by_the_engine_not_h
     finally:
         gate.set()
         worker.join(10)
+
+
+# ======================================================================== review 2: fork safety
+def _count_by_name(provider, monkeypatch, name: str, first_ids, then_id):
+    """The first len(first_ids) answers for *name* are the verified id; later answers are then_id (a moved tag)."""
+    calls = {"n": 0}
+    real_id, real_inspect = provider._image_id_of, provider._client.image_inspect  # noqa: SLF001
+
+    def which() -> str:
+        calls["n"] += 1
+        return first_ids[calls["n"] - 1] if calls["n"] <= len(first_ids) else then_id
+
+    def image_id_of(ref):
+        return which() if ref == name else real_id(ref)
+
+    def image_inspect(ref):
+        if ref == name:
+            doc = dict(real_inspect(ref))
+            doc["Id"] = which()
+            return doc
+        return real_inspect(ref)
+
+    monkeypatch.setattr(provider, "_image_id_of", image_id_of)
+    monkeypatch.setattr(provider._client, "image_inspect", image_inspect)  # noqa: SLF001
+    return calls
+
+
+def _fork_argv(fake, doc) -> list[str]:
+    return next(c["argv"] for c in fake.state["containers"].values() if c["labels"].get("cathedral.sandbox.id") == doc["id"])
+
+
+def test_a_fork_never_starts_an_image_other_than_the_verified_one_when_the_tag_moves(fake, provider, monkeypatch) -> None:
+    result, _, _ = _captured(provider)
+    name, a, b = f"cathedral-snap-{result['snapshot_id']}:latest", result["committed_image_id"], "sha256:" + "ab" * 32
+    _count_by_name(provider, monkeypatch, name, [a, a], b)  # A, A, then B for every later look at the name
+    runs = len(fake.calls_of("run"))
+    try:
+        doc = _fork(provider, result["snapshot_id"])
+    except SandboxOpError as err:
+        assert err.code == "snapshot_corrupt"
+        assert len(fake.calls_of("run")) == runs
+        return
+    argv = _fork_argv(fake, doc)
+    assert a in argv and b not in argv  # started from the verified id
+
+
+def test_a_fork_whose_tag_moved_before_the_start_is_snapshot_corrupt_and_leaves_nothing(fake, provider, monkeypatch) -> None:
+    result, _, _ = _captured(provider)
+    name, a, b = f"cathedral-snap-{result['snapshot_id']}:latest", result["committed_image_id"], "sha256:" + "ab" * 32
+    _count_by_name(provider, monkeypatch, name, [a], b)  # only the first look is A
+    runs = len(fake.calls_of("run"))
+    with pytest.raises(SandboxOpError) as err:
+        _fork(provider, result["snapshot_id"])
+    assert (err.value.code, err.value.http_status) == ("snapshot_corrupt", 409)
+    _nothing_started(fake, provider, runs)
+
+
+def test_a_snapshot_name_deleted_and_made_again_during_the_unpack_is_not_mixed_with_the_original_tar(fake, provider, monkeypatch) -> None:
+    src, payload = _room_with_file(provider)
+    first = _snapshot(provider, src, name="n")
+    other = _room(provider, "other")
+    real_open = sandbox_provider._open_snapshot_archive
+    swapped = []
+
+    def open_then_replace(path):
+        fh = real_open(path)
+        if not swapped:
+            swapped.append(1)
+            provider.delete_snapshot(first["snapshot_id"])
+            _snapshot(provider, other, name="n")  # the same name now names another snapshot, with another image
+        return fh
+
+    monkeypatch.setattr(sandbox_provider, "_open_snapshot_archive", open_then_replace)
+    runs = len(fake.calls_of("run"))
+    with pytest.raises(SandboxOpError) as err:
+        _fork(provider, "n")
+    assert err.value.code == "snapshot_corrupt"
+    assert len(fake.calls_of("run")) == runs  # no container started from the replacement's image
+    assert len([p for p in provider._inner._base.iterdir() if p.name.startswith("sbx_")]) == 2  # noqa: SLF001  the two source rooms only
+
+
+# ---------------------------------------------------------------- D8: only a safe name goes into --change
+@pytest.mark.parametrize("bad", ["A=\nUSER root\nENV PAD", "A=B", "A B", 'A"B', "A$B", "", "X" * 300, "1ABC", "A-B"],
+                         ids=["newline", "equals", "space", "quote", "dollar", "empty", "long", "leading_digit", "dash"])
+def test_a_variable_name_that_cannot_go_into_a_change_refuses_the_snapshot_before_anything_is_paused(fake, provider, bad) -> None:
+    sid, _ = _room_with_file(provider, env={"OK_NAME": "1"})
+    provider._inner._sandboxes[sid].env[bad] = "v"  # noqa: SLF001  create accepts odd keys; the commit must not
+    with pytest.raises(SandboxOpError) as err:
+        provider.snapshot(sid)
+    assert (err.value.code, err.value.http_status) == ("snapshot_env_name_unsupported", 422)
+    assert fake.calls_of("pause") == [] and fake.calls_of("commit") == [] and fake.status_of(sid) == "running"
+    assert provider._inner._captures == {} and provider.list_snapshots() == []  # noqa: SLF001  nothing stays reserved
+
+
+def test_a_good_name_reaches_the_engine_as_exactly_one_change_argument(fake, provider) -> None:
+    sid, _ = _room_with_file(provider, env={"API_TOKEN": "s", "_x1": "y"})
+    result = _snapshot(provider, sid)
+    (argv,) = fake.calls_of("commit")
+    cid = provider._guests[sid].container_id  # noqa: SLF001
+    assert argv == ["commit", "--change", "ENV API_TOKEN=", "--change", "ENV _x1=", cid, f"cathedral-snap-{result['snapshot_id']}:latest"]
+
+
+# ---------------------------------------------------------------- extraction is bounded and unlocked
+def _replace_tar(provider, snap_id: str, path: Path, data: bytes) -> None:
+    """Put another tar in the store and make the record say it is the captured one (the digest and size match)."""
+    path.write_bytes(data)
+    record = provider._inner._snapshot_capture[snap_id]["result"]  # noqa: SLF001
+    record["work_archive_sha256"] = hashlib.sha256(data).hexdigest()
+    record["work_archive_bytes"] = len(data)
+
+
+def test_a_member_larger_than_the_capture_cap_is_refused_before_it_is_extracted(fake, provider, monkeypatch) -> None:
+    result, _, _ = _captured(provider)  # a real capture
+    big, path, _ = (lambda r: (r, Path(provider._inner._snapshots[r["snapshot_id"]][0]), None))(_snapshot(provider, _room_with_file(provider, payload=bytes(1 << 20))[0]))  # noqa: SLF001
+    snap_id = big["snapshot_id"]
+    provider._inner._snapshot_capture[snap_id]["disk_cap_bytes"] = 100_000  # noqa: SLF001  the cap the capture enforced
+    extracted: list = []
+    real = _tarfile.TarFile.extract
+
+    def spy(self, member, *a, **kw):
+        extracted.append(getattr(member, "name", member))
+        return real(self, member, *a, **kw)
+
+    monkeypatch.setattr(_tarfile.TarFile, "extract", spy)
+    with pytest.raises(SandboxOpError) as err:
+        _fork(provider, snap_id)
+    assert err.value.code == "snapshot_corrupt"
+    assert not [n for n in extracted if str(n).endswith("a.txt")], "the oversized member reached extraction"
+    assert not list(provider._inner._base.glob("sbx_*/.incoming"))  # noqa: SLF001
+
+
+def test_a_tar_longer_than_the_record_says_is_refused(fake, provider) -> None:
+    result, _, _ = _captured(provider)
+    provider._inner._snapshot_capture[result["snapshot_id"]]["result"]["work_archive_bytes"] -= 10  # noqa: SLF001
+    runs = len(fake.calls_of("run"))
+    with pytest.raises(SandboxOpError) as err:
+        _fork(provider, result["snapshot_id"])
+    assert err.value.code == "snapshot_corrupt"
+    _nothing_started(fake, provider, runs)
+
+
+@pytest.mark.parametrize("old_python", [False, True], ids=["data_filter", "no_filter_fallback"])
+def test_a_device_node_in_the_tar_is_refused_on_every_python(fake, provider, monkeypatch, old_python) -> None:
+    import io
+
+    result, path, _ = _captured(provider)
+    buf = io.BytesIO()
+    with _tarfile.open(fileobj=buf, mode="w:gz") as t:
+        dev = _tarfile.TarInfo("dev0")
+        dev.type, dev.devmajor, dev.devminor = _tarfile.CHRTYPE, 1, 3
+        t.addfile(dev)
+    _replace_tar(provider, result["snapshot_id"], path, buf.getvalue())
+    if old_python:
+        real = _tarfile.TarFile.extract
+
+        def no_filter(self, member, path=".", *a, **kw):
+            if "filter" in kw:
+                raise TypeError("extract() got an unexpected keyword argument 'filter'")
+            return real(self, member, path, *a, **kw)
+
+        monkeypatch.setattr(_tarfile.TarFile, "extract", no_filter)
+    runs = len(fake.calls_of("run"))
+    with pytest.raises(SandboxOpError) as err:
+        _fork(provider, result["snapshot_id"])
+    assert err.value.code in ("unsafe_tar", "snapshot_corrupt")
+    _nothing_started(fake, provider, runs)
+
+
+def test_the_unpack_and_the_hash_run_outside_the_provider_lock(fake, provider, monkeypatch) -> None:
+    result, _, _ = _captured(provider)
+    other = _room(provider, "other")
+    gate = threading.Event()
+    owned: list[bool] = []
+
+    def slow_open(path):
+        reader = _SlowReader(path, lambda: (owned.append(provider._inner._lock._is_owned()), gate.wait(10)))  # noqa: SLF001
+        return reader
+
+    monkeypatch.setattr(sandbox_provider, "_open_snapshot_archive", slow_open)
+    worker = threading.Thread(target=lambda: _fork(provider, result["snapshot_id"]), daemon=True)
+    worker.start()
+    try:
+        deadline = _time.monotonic() + 10
+        while not owned and _time.monotonic() < deadline:
+            _time.sleep(0.01)
+        answered: list = []
+        reader = threading.Thread(target=lambda: answered.append(provider.get(other)["id"]), daemon=True)
+        reader.start()
+        reader.join(5)
+        assert answered == [other], "another room's call waited for a fork's unpack"
+        assert owned and not any(owned)
+    finally:
+        gate.set()
+        worker.join(10)
+
+
+# ---------------------------------------------------------------- order of refusals and removal timeouts
+def test_an_expired_snapshot_is_not_found_even_when_its_image_is_also_missing(fake, provider) -> None:
+    from dataclasses import replace
+
+    result, path, _ = _captured(provider)
+    snap_id = result["snapshot_id"]
+    _, rec = provider._inner._snapshots[snap_id]  # noqa: SLF001
+    provider._inner._snapshots[snap_id] = (path, replace(rec, created_at=rec.created_at - timedelta(seconds=rec.ttl_seconds + 1)))  # noqa: SLF001
+    state = fake.state
+    state["images"].remove(f"cathedral-snap-{snap_id}:latest")
+    fake._save(state)  # noqa: SLF001
+    with pytest.raises(SandboxOpError) as err:
+        _fork(provider, snap_id)
+    assert (err.value.code, err.value.http_status) == ("snapshot_not_found", 404)
+
+
+def test_an_image_removal_that_times_out_is_still_queued_for_the_sweep(fake, provider) -> None:
+    result, _, _ = _captured(provider)
+    image = f"cathedral-snap-{result['snapshot_id']}:latest"
+    real = provider._client.run  # noqa: SLF001
+
+    def run(argv, **kw):
+        if argv[:3] == ["docker", "image", "rm"]:
+            raise SandboxOpError("docker_timeout", 502, "docker image rm timed out")
+        return real(argv, **kw)
+
+    provider._client.run = run  # noqa: SLF001
+    deleted, pending = provider.delete_snapshot_ex(result["snapshot_id"])
+    provider._client.run = real  # noqa: SLF001
+    assert deleted is True and pending is True and image in provider.pending_image_removals()
+    provider.sweep()
+    assert image not in fake.state["images"] and provider.pending_image_removals() == {}
