@@ -181,6 +181,7 @@ func (b *broker) filterGuestHotelReceipts(ctx context.Context, h *hotel, guest s
 		if status != 200 {
 			return nil, fmt.Errorf("hotel receipts HTTP %d", status)
 		}
+		b.archiveHotelPage(h, hotelAfter, out)
 		pageKept, pageScanned, pageHead, pageBinding, err := takeOwnedReceipts(out, owned, guest)
 		if err != nil {
 			return nil, err

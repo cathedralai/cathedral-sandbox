@@ -401,3 +401,25 @@ def test_a_repeated_receipt_fails_and_is_not_counted_twice(tmp_path, monkeypatch
         out = json.loads(proc.stdout)
         assert out["verdict"] == "FAIL"
         assert out["reason"] == "receipt 2: sequence appears more than once"
+
+
+def test_incomplete_broker_archive_is_not_called_the_whole_chain(tmp_path, monkeypatch) -> None:
+    # AB#386 HOLD: the broker archived the first page before a restart. It
+    # keeps the hotel's head and complete=false; the verifier checks each
+    # receipt and must not report a whole chain or a PASS.
+    ledger = _chain(tmp_path, monkeypatch)
+    prefix = {"binding_sha256": ledger.binding_sha256, "head": ledger.head, "complete": False,
+              "receipts": ledger.chain[:1]}
+    proc = _verify_cli(tmp_path / "prefix", ledger.attestation(), prefix)
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["verdict"] == "NOT PROVEN"
+    assert "INCOMPLETE" in out["checked"] and "whole chain" not in out["checked"]
+    assert any("incomplete" in r for r in out["not_proven"])
+
+    # The same archive once complete: the whole chain to its head, PASS.
+    whole = {"binding_sha256": ledger.binding_sha256, "head": ledger.head, "complete": True,
+             "receipts": ledger.chain}
+    proc = _verify_cli(tmp_path / "whole", ledger.attestation(), whole)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(proc.stdout)["checked"] == "whole chain to the head the server named"

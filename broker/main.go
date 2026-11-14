@@ -1478,6 +1478,10 @@ func (b *broker) handleHotelDoc(w http.ResponseWriter, r *http.Request, rest str
 		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
 		return
 	}
+	if status == 200 && doc == "receipts" {
+		after, _ := strconv.Atoi(r.URL.Query().Get("after"))
+		b.archiveHotelPage(h, after, out)
+	}
 	if v := hdr.Get("Content-Type"); v != "" {
 		w.Header().Set("Content-Type", v)
 	}
@@ -2142,7 +2146,12 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(p, "/v1/broker/bindings/") && r.Method == "GET" && b.isOperator(r) {
-		b.handleBindingGet(w, strings.TrimPrefix(p, "/v1/broker/bindings/")) // operator key only
+		id := strings.TrimPrefix(p, "/v1/broker/bindings/")
+		if sha, ok := strings.CutSuffix(id, "/receipts"); ok {
+			b.handleChainGet(w, sha) // operator key only
+			return
+		}
+		b.handleBindingGet(w, id) // operator key only
 		return
 	}
 	if p == "/v1/broker/guests" || strings.HasPrefix(p, "/v1/broker/guests/") {
