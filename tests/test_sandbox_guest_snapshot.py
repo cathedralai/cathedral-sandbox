@@ -1697,10 +1697,11 @@ def _fork_argv(fake, doc) -> list[str]:
     return next(c["argv"] for c in fake.state["containers"].values() if c["labels"].get("cathedral.sandbox.id") == doc["id"])
 
 
-def test_a_fork_never_starts_an_image_other_than_the_verified_one_when_the_tag_moves(fake, provider, monkeypatch) -> None:
+@pytest.mark.parametrize("looks_at_a", [1, 2, 3, 4, 5])
+def test_a_fork_never_starts_an_image_other_than_the_verified_one_when_the_tag_moves(fake, provider, monkeypatch, looks_at_a) -> None:
     result, _, _ = _captured(provider)
     name, a, b = f"cathedral-snap-{result['snapshot_id']}:latest", result["committed_image_id"], "sha256:" + "ab" * 32
-    _count_by_name(provider, monkeypatch, name, [a, a], b)  # A, A, then B for every later look at the name
+    _count_by_name(provider, monkeypatch, name, [a] * looks_at_a, b)  # A for the first looks, then B for every later look at the name
     runs = len(fake.calls_of("run"))
     try:
         doc = _fork(provider, result["snapshot_id"])
