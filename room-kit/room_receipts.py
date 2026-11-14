@@ -123,7 +123,9 @@ import http.client
 import json
 import os
 import re
+import select
 import shutil
+import socket
 import ssl
 import stat
 import subprocess
@@ -2039,6 +2041,7 @@ class Ledger:
 
     def _open_store(self, store: str) -> None:
         self.lock = threading.Lock()
+        self.idle = threading.Condition(self.lock)  # signalled when the last claim in flight ends
         self.attest_lock = threading.Lock()
         # Fresh-report slots keyed by guest id (X-Cathedral-Guest). A shared
         # hotel serves many guests; a per-hotel counter let one guest starve
@@ -2072,8 +2075,12 @@ class Ledger:
         # flight at any moment while a create is pending withholds every flag (it sets overflow, at both ends).
         self.bulk_in_flight = 0
         # A bulk delete does not name its rooms until the API runs it. Keep it and claims mutually exclusive so
-        # a delayed successful lifetime answer cannot hand over a room the bulk delete already removed.
+        # a delayed successful lifetime answer cannot hand over a room the bulk delete already removed: a bulk
+        # delete waits for the claims in flight (claims_in_flight) and then runs; bulk_pending counts the bulk
+        # deletes that are waiting or running, and a new claim is refused while there is one. A repeat claim of an
+        # already claimed room never calls the API, so it is answered either way.
         self.claims_in_flight = 0
+        self.bulk_pending = 0
         # Pre-made rooms: pool maps an unclaimed room to its expires_at (epoch); claimed maps a claimed room to
         # (the sandbox id it was claimed for, the answer sent, the claim receipt) so a repeat gets the same answer.
         self.pool: dict[str, float] = {}
@@ -2134,8 +2141,9 @@ class Ledger:
         request. A busy room is refused at once, never waited on.
         """
         with self.lock:
-            if kind == "claim" and self.bulk_in_flight:
-                return None, (409, "pool_bulk_delete_busy", "a bulk delete is running; retry the claim")
+            new_claim = kind == "claim" and room not in self.claimed
+            if new_claim and self.bulk_pending:
+                return None, (409, "pool_bulk_delete_busy", "a bulk delete is waiting or running; the room is not handed over")
             token = False
             if room in self.broken:
                 if kind != "delete":
@@ -2158,11 +2166,11 @@ class Ledger:
                 self._touch(room)
             if token:
                 self.busy.add(room)
-            if kind == "claim":
+            if new_claim:
                 self.claims_in_flight += 1
             self.in_flight[room] = self.in_flight.get(room, 0) + 1
             return Turn(room, token, len(self.by_room.get(room, [])), room in self.serial, nonread,
-                        kind == "claim"), None
+                        new_claim), None
 
     def _touch(self, room: str) -> None:
         """Remember a non-read request for an id with no create receipt while a create is pending. Caller holds self.lock."""
@@ -2179,8 +2187,16 @@ class Ledger:
             if self.bulk_in_flight:
                 self.overflow = True
 
-    def begin_bulk(self) -> bool:
+    def bulk_arrive(self) -> None:
+        """A bulk delete reached the front: from now on a new claim is refused, so the wait cannot be starved."""
         with self.lock:
+            self.bulk_pending += 1
+
+    def bulk_try_start(self, wait: float) -> bool:
+        """Start the bulk delete when no claim is in flight, else wait up to *wait* seconds for one to end."""
+        with self.idle:
+            if self.claims_in_flight:
+                self.idle.wait(wait)
             if self.claims_in_flight:
                 return False
             self.bulk_in_flight += 1
@@ -2188,9 +2204,15 @@ class Ledger:
                 self.overflow = True
             return True
 
+    def bulk_abandon(self) -> None:
+        """A bulk delete that never ran (refused, or its caller left) stops counting."""
+        with self.lock:
+            self.bulk_pending = max(0, self.bulk_pending - 1)
+
     def end_bulk(self) -> None:
         with self.lock:
             self.bulk_in_flight = max(0, self.bulk_in_flight - 1)
+            self.bulk_pending = max(0, self.bulk_pending - 1)
             if self.creates_in_flight:
                 self.overflow = True
 
@@ -2207,6 +2229,8 @@ class Ledger:
             room = turn.room
             if turn.claim:
                 self.claims_in_flight -= 1
+                if not self.claims_in_flight:
+                    self.idle.notify_all()
             if turn.nonread:
                 self._touch(room)  # it may have run while a create was pending, though it entered before
             if turn.token and (room in self.serial or room in self.pool):
@@ -2373,6 +2397,11 @@ POOL_CREATE_KEYS = frozenset({"image", "resources", "network", "labels", "ttl_se
 # limit (which acts a while after it) cannot reach a claimed room. The lifetime call waits at most CLAIM_WAIT.
 POOL_CLAIM_MARGIN_SECONDS = 300
 CLAIM_WAIT_SECONDS = 10
+# A bulk delete that arrives while a claim is in flight waits for it. A claim ends within its lifetime call, which
+# waits at most CLAIM_WAIT_SECONDS (the upstream timeout in handle_claim), plus a margin for signing it and storing
+# its answer. The wait checks every BULK_POLL_SECONDS whether the caller is still there.
+BULK_CLAIM_WAIT_SECONDS = CLAIM_WAIT_SECONDS + 5
+BULK_POLL_SECONDS = 0.2
 CLAIM_LIFETIME_MAX = 172800
 EXPIRES_MAX_SECONDS = 48 * 3600 + 60
 # What an unclaimed pool room lets through unsigned: reads of the room's record.
@@ -2516,15 +2545,55 @@ class Handler(BaseHTTPRequestHandler):
     turn: Turn | None = None
     create_open = False  # a create was forwarded and its receipt is not yet signed
     bulk_open = False  # a bulk delete was forwarded and has not been answered
+    bulk_wait_open = False  # a bulk delete is counted as pending and has not started
 
     def handle_one_request(self):
         self.turn = None
         self.create_open = False
         self.bulk_open = False
+        self.bulk_wait_open = False
         try:
             super().handle_one_request()
         finally:
             self.release_turn()
+
+    def client_gone(self) -> bool:
+        """True when the caller closed its connection (a pipelined next request is data, not a close)."""
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+        except ValueError:
+            return False  # a TLS socket takes no peek flags: the wait runs to its bound
+        except BlockingIOError:
+            return False
+        except OSError:
+            return True
+
+    def hold_bulk_for_claims(self, ledger: "Ledger") -> bool:
+        """Count the bulk delete, wait for the claims in flight, and start it. False: it is answered or dropped here.
+
+        A new claim is refused from the moment the bulk delete is counted. If the caller leaves, nothing is
+        forwarded. If a claim is still in flight after BULK_CLAIM_WAIT_SECONDS (it should not be), the bulk delete
+        is refused with 409 bulk_delete_claim_busy and a log line.
+        """
+        ledger.bulk_arrive()
+        self.bulk_wait_open = True
+        deadline = time.monotonic() + BULK_CLAIM_WAIT_SECONDS
+        while not ledger.bulk_try_start(BULK_POLL_SECONDS):
+            if self.client_gone():
+                self.close_connection = True
+                return False
+            if time.monotonic() >= deadline:
+                with ledger.lock:
+                    claims = ledger.claims_in_flight
+                print(f"room-receipts: bulk delete refused: {claims} claim(s) still in flight after "
+                      f"{BULK_CLAIM_WAIT_SECONDS} s", file=sys.stderr, flush=True)
+                self.reply(409, canonical({"error": {"code": "bulk_delete_claim_busy",
+                                                      "message": "a room claim is still running; retry the bulk delete"}}))
+                return False
+        self.bulk_wait_open = False
+        self.bulk_open = True
+        return True
 
     def release_turn(self) -> None:
         """Give back the request's count and token, and its place among the creates in flight. Safe to call twice."""
@@ -2536,7 +2605,11 @@ class Handler(BaseHTTPRequestHandler):
             self.server.ledger.end_create()
         if self.bulk_open:
             self.bulk_open = False
+            self.bulk_wait_open = False
             self.server.ledger.end_bulk()
+        elif self.bulk_wait_open:
+            self.bulk_wait_open = False
+            self.server.ledger.bulk_abandon()
 
     # -- helpers
     def reply(self, status: int, body: bytes, headers: dict | None = None, ctype="application/json"):
@@ -2743,10 +2816,8 @@ class Handler(BaseHTTPRequestHandler):
                 ledger.begin_create()
                 self.create_open = True
             elif action == "bulk_delete" and self.authorized():
-                if not ledger.begin_bulk():
-                    return self.reply(409, canonical({"error": {"code": "bulk_delete_claim_busy",
-                                                               "message": "a room claim is running; retry the bulk delete"}}))
-                self.bulk_open = True
+                if not self.hold_bulk_for_claims(ledger):
+                    return
             # Forward the canonical path (no ";params") so gate, receipt and API agree.
             status, headers, out = self.upstream(
                 self.server.api_port, body, path=forward_path,
