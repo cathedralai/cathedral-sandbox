@@ -182,6 +182,7 @@ def test_python_create_keys_equal_the_shared_key_list() -> None:
     assert list(vr.ONESHOT_CREATE_KEYS) == shared["keys"]
     assert list(vr.ONESHOT_LABEL_KEYS) == shared["label_keys"]
     assert vr.ONESHOT_SIZES == shared["sizes"]
+    assert vr.ONESHOT_ROOM_MARGIN_SECONDS == shared["room_margin_seconds"] == 600
 
 
 def test_a_path_with_space_plus_amp_equals_percent_tilde_and_a_non_ascii_letter_has_the_go_query_form() -> None:
@@ -613,12 +614,12 @@ def assemble_bundle(case: Path) -> dict:
     answer = (machine / "05_get_output.response").read_bytes()
     return {
         "schema": "cathedral_oneshot_bundle_v1",
-        "oneshot_id": json.loads((caller / "response_202.json").read_text())["id"],
+        "oneshot_id": json.loads((caller / "response_202.json").read_text())["oneshot_id"],
         "request": request,
         "attestation": json.loads((machine / "hotel_attestation_answer.json").read_text()),
         "amd_certs": {"vcek": b64((machine / "amd" / "vcek_der.bin").read_bytes()), "ask": ask, "ark": ark},
         "receipts": receipts,
-        "create_request_b64": (machine / "create_request.b64").read_text(),
+        "create_request_b64": json.loads((machine / "01_create.response").read_text())["create_request_b64"],
         "exec_request_b64": b64((machine / "exec_request.json").read_bytes()),
         "exec_response_b64": b64((machine / "04_exec.response").read_bytes()),
         "inline_outputs": {o["path"]: b64(answer) for o in post["outputs"] if len(answer) <= 64 * 1024},
@@ -662,3 +663,35 @@ def test_the_exchange_manifest_names_every_file() -> None:
         assert hashlib.sha256((EXCHANGE / path).read_bytes()).hexdigest() == digest, path
     lines = "".join(f"{p} {d}\n" for p, d in sorted(manifest["files"].items()))
     assert hashlib.sha256(lines.encode()).hexdigest() == manifest["root_sha256"]
+
+
+def test_the_exchange_create_answer_is_the_brokers_and_the_202_is_the_apis() -> None:
+    """The API talks to the broker: its create answer is the broker's 202 document (broker/main.go: id with the
+    hotel prefix, hotel, isolation, create_request_b64 when asked). The caller gets oneshot_id, state, status_url
+    and reserved_usd."""
+    answer = json.loads((EXCHANGE / "machine" / "01_create.response").read_text())
+    assert answer["id"].startswith(answer["hotel"] + ".") and answer["hotel"] == "pack-hotel"
+    assert set(answer["isolation"]) == {"hotel_sealed", "hotel_tee", "room_runtime", "attested_per_room",
+                                        "network_mode", "attestation_of_host"}
+    assert answer["isolation"]["attestation_of_host"] == "/v1/hotels/pack-hotel/attestation"
+    assert answer["create_request_b64"] == json.loads((EXCHANGE / "expected" / "bundle.json").read_text())[
+        "create_request_b64"]
+    assert not (EXCHANGE / "machine" / "create_request.b64").exists()       # one source: the member above
+    accepted = json.loads((EXCHANGE / "caller" / "response_202.json").read_text())
+    assert set(accepted) == {"oneshot_id", "state", "status_url", "reserved_usd"}
+
+
+def test_the_exchange_recipe_stays_inline_and_its_lifetime_is_the_timeout_plus_the_margin() -> None:
+    recipe = json.loads((EXCHANGE / "caller" / "recipe.json").read_text())
+    assert all(o["max_bytes"] <= 65536 for o in recipe["request"]["outputs"])
+    assert recipe["create"]["ttl_seconds"] == recipe["request"]["timeout_seconds"] + 600
+    assert recipe["request"]["network"] == {"mode": "deny_all", "allow": []}
+
+
+def test_ordinary_good_runs_keep_outputs_at_or_under_the_inline_size() -> None:
+    """Outputs are inline only in this version: only a list that is about a larger limit may go past 64 KiB."""
+    for folder in sorted((PACK / "good").glob("run_*")):
+        if folder.name.startswith(("run_rule_", "run_form_")):
+            continue
+        recipe = json.loads((folder / "recipe.json").read_text())
+        assert all(o["max_bytes"] <= 65536 for o in recipe["request"]["outputs"]), folder.name
