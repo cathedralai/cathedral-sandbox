@@ -45,6 +45,8 @@ class FakeApi:
         self.rooms: set[str] = set()
         self.labels: dict[str, dict] = {}
         self.answer_holds: list[Hold] = []
+        self.lost_bulks: list[threading.Event] = []
+        self.trickles: list[tuple[re.Pattern, float]] = []
         self.new_ids: list[str] = []
         self.counter = 0
         self.holds: list[tuple[re.Pattern, Hold]] = []
@@ -65,6 +67,17 @@ class FakeApi:
         h = Hold()
         self.holds.append((re.compile(pattern), h))
         return h
+
+    def lose_bulk(self) -> threading.Event:
+        """The next bulk delete is read and its targets are picked, then no answer is sent: it keeps running and
+        removes its targets only when the returned event is set (a bulk the front gave up on)."""
+        release = threading.Event()
+        self.lost_bulks.append(release)
+        return release
+
+    def trickle(self, pattern: str, gap: float) -> None:
+        """Answer the matching request in three pieces with *gap* seconds between them."""
+        self.trickles.append((re.compile(pattern), gap))
 
     def hold_create_answers(self) -> Hold:
         """Hold each create after the API made the room and before it answers."""
@@ -108,10 +121,26 @@ class FakeApi:
                     if entry[1] is not None:
                         entry[1] -= 1
                     break
+        if line == "DELETE /v1/sandboxes" and self.lost_bulks:
+            release = self.lost_bulks.pop(0)
+            targets = self._targets(h)
+
+            def finish_later() -> None:
+                release.wait(30)
+                with self.lock:
+                    self.rooms.difference_update(targets)
+
+            threading.Thread(target=finish_later, daemon=True).start()
+            h.close_connection = True
+            h.connection.shutdown(socket.SHUT_RDWR)
+            return
         if dropping:
             h.close_connection = True
             h.connection.shutdown(socket.SHUT_RDWR)
             return
+        for rx, gap in self.trickles:
+            if rx.fullmatch(line):
+                return self._send_slowly(h, gap)
         for rx, status, out in self.replies:
             if rx.fullmatch(line):
                 return self._send(h, status, out)
@@ -144,17 +173,35 @@ class FakeApi:
             return self._send(h, 200, b'{"exit_code":0}')
         return self._send(h, 200, b"{}")
 
-    def _bulk_delete(self, h) -> None:
-        """Really delete each room whose labels match every label=key=value of the query."""
+    def _targets(self, h) -> set[str]:
+        """The rooms whose labels match every label=key=value of the query, picked once, now."""
         from urllib.parse import parse_qs, urlsplit
 
         wanted = [item.split("=", 1) for item in parse_qs(urlsplit(h.path).query).get("label", [])]
         with self.lock:
-            for room in list(self.rooms):
-                labels = self.labels.get(room, {})
-                if all(len(kv) == 2 and str(labels.get(kv[0])) == kv[1] for kv in wanted):
-                    self.rooms.discard(room)
+            return {room for room in self.rooms
+                    if all(len(kv) == 2 and str(self.labels.get(room, {}).get(kv[0])) == kv[1] for kv in wanted)}
+
+    def _bulk_delete(self, h) -> None:
+        """Really delete each room whose labels match every label=key=value of the query."""
+        targets = self._targets(h)
+        with self.lock:
+            self.rooms.difference_update(targets)
         self._send(h, 200, b"{}")
+
+    @staticmethod
+    def _send_slowly(h, gap: float) -> None:
+        out = b'{"expires_at": "2030-01-01T00:00:00+00:00", "ttl_seconds": 600, "padding": "xxxxxxxxxx"}'
+        h.send_response(200)
+        h.send_header("Content-Type", "application/json")
+        h.send_header("Content-Length", str(len(out)))
+        h.end_headers()
+        h.wfile.flush()
+        third = len(out) // 3
+        for piece in (out[:third], out[third:2 * third], out[2 * third:]):
+            time.sleep(gap)
+            h.wfile.write(piece)
+            h.wfile.flush()
 
     def _create(self, h, body: bytes) -> None:
         try:

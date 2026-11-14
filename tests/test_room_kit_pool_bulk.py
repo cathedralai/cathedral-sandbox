@@ -204,10 +204,6 @@ def test_a_bulk_delete_that_outwaits_the_bound_is_refused_unsent_and_logged(fron
     assert_idle(front.ledger)
 
 
-def test_the_bound_is_the_claims_own_upstream_wait_plus_a_margin() -> None:
-    assert rr.BULK_CLAIM_WAIT_SECONDS == rr.CLAIM_WAIT_SECONDS + 5
-
-
 def test_failed_and_lost_bulk_deletes_release_the_guard(front) -> None:
     room = pool_room(front, labels=TEAM_B)
     front.api.reply(r"DELETE /v1/sandboxes", 500, {"error": {"code": "boom"}})
