@@ -28,7 +28,7 @@ class Retired:
     def __init__(self) -> None:
         self.rooms: list[str] = []
 
-    def retire(self, room: str) -> None:
+    def retire(self, room: str, incarnation_of=None) -> None:
         self.rooms.append(room)
 
 
