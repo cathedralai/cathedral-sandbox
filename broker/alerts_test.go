@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -319,5 +320,115 @@ func TestConfigFileHotelRefusesAlertChatPatch(t *testing.T) {
 	tc := newChain(t)
 	if status, _ := tc.call(t, "operator-key", "PATCH", "/v1/broker/hotels/a", map[string]any{"alert_chat_id": "1"}); status != 409 {
 		t.Fatalf("PATCH of a config file hotel's alert chat: %d", status)
+	}
+}
+
+// TestFullQueueKeepsMissRetryable: a saturated alert queue must not consume
+// the miss streak, so a later sync can still notify the operator (AB#330).
+func TestFullQueueKeepsMissRetryable(t *testing.T) {
+	tc := newChain(t)
+	clk := &alertClock{t: time.Now()}
+	a := tc.b.alerts
+	a.now = clk.now
+	a.post = func(context.Context, alertMsg) error { return nil }
+	a.opsChat = "-100200"
+	// Fill the queue so the next send drops.
+	for i := 0; i < alertQueueSize; i++ {
+		a.queue <- alertMsg{ChatID: "fill", Text: "x"}
+	}
+	setHotel(tc, "a", func(h *hotel) { h.cfg.AlertChatID = "4242" })
+	syncNow(tc, "a")
+	setHealthFail(tc, "a", true)
+	syncNow(tc, "a")
+	var missSent bool
+	setHotel(tc, "a", func(h *hotel) { missSent = h.alerts.missSent })
+	if missSent {
+		t.Fatal("missSent set after a full-queue drop")
+	}
+	// Drain the filler so a retry can queue.
+	for {
+		select {
+		case <-a.queue:
+		default:
+			goto drained
+		}
+	}
+drained:
+	syncNow(tc, "a") // hotel still unhealthy: retry must queue the operator alert
+	var got []alertMsg
+	for {
+		select {
+		case m := <-a.queue:
+			got = append(got, m)
+		default:
+			goto done
+		}
+	}
+done:
+	if len(got) != 1 || got[0].ChatID != "4242" {
+		t.Fatalf("retry after queue drain: %+v", got)
+	}
+	setHotel(tc, "a", func(h *hotel) { missSent = h.alerts.missSent })
+	if !missSent {
+		t.Fatal("missSent still false after a successful queue")
+	}
+}
+
+// TestWebhookFailureRetriesThenDelivers: a failed first POST must still
+// deliver once the webhook recovers, while the hotel stays down (AB#330).
+func TestWebhookFailureRetriesThenDelivers(t *testing.T) {
+	tc := newChain(t)
+	var mu sync.Mutex
+	var posts []alertMsg
+	fail := true
+	a := tc.b.alerts
+	a.opsChat = "-100200"
+	a.post = func(_ context.Context, m alertMsg) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if fail {
+			fail = false
+			return errors.New("status 503")
+		}
+		posts = append(posts, m)
+		return nil
+	}
+	setHotel(tc, "a", func(h *hotel) { h.cfg.AlertChatID = "4242" })
+	syncNow(tc, "a")
+	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+	_ = id
+	alertGoDown(tc, "a")
+	syncNow(tc, "a")
+	// Drain queue into run with short deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { a.run(ctx); close(done) }()
+	// Give run time to fail once, back off, and succeed.
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(posts)
+		mu.Unlock()
+		if n >= 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	var op, ops int
+	for _, m := range posts {
+		if m.ChatID == "4242" {
+			op++
+		}
+		if m.ChatID == "-100200" {
+			ops++
+		}
+	}
+	if op != 1 || ops != 1 {
+		t.Fatalf("want one operator and one ops delivery after recovery, got op=%d ops=%d posts=%+v", op, ops, posts)
 	}
 }

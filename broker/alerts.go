@@ -125,7 +125,14 @@ func newAlerter(c *alertsConfig) (*alerter, error) {
 	return a, nil
 }
 
-// run sends queued alerts one at a time until ctx ends.
+// alertPostBackoff is the base wait before retrying a failed webhook POST.
+const alertPostBackoff = time.Second
+
+const alertPostMaxAttempts = 8
+
+// run sends queued alerts one at a time until ctx ends. A failed POST is
+// retried with bounded backoff so a transient Telegram 429/503 still delivers
+// once the webhook recovers (AB#330).
 func (a *alerter) run(ctx context.Context) {
 	for {
 		select {
@@ -135,26 +142,48 @@ func (a *alerter) run(ctx context.Context) {
 			if a.post == nil {
 				continue
 			}
-			sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			if err := a.post(sctx, m); err != nil {
+			for attempt := 0; attempt < alertPostMaxAttempts; attempt++ {
+				sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				err := a.post(sctx, m)
+				cancel()
+				if err == nil {
+					break
+				}
 				log.Printf("alert not delivered: %v", err)
+				if attempt+1 >= alertPostMaxAttempts {
+					break
+				}
+				wait := alertPostBackoff << attempt
+				if wait > 30*time.Second {
+					wait = 30 * time.Second
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(wait):
+				}
 			}
-			cancel()
 		}
 	}
 }
 
 // send logs the alert and queues it for delivery. It never blocks: a full
-// queue drops the delivery (the log line stays). Safe under broker.mu.
-func (a *alerter) send(tag, chat, text string) {
+// queue drops the delivery (the log line stays) and returns false so the
+// caller can leave the alert unmarked and retry on a later sync (AB#330).
+// Safe under broker.mu.
+func (a *alerter) send(tag, chat, text string) bool {
 	log.Printf("[%s] %s", tag, text)
 	if a == nil || chat == "" || a.post == nil {
-		return
+		// Log-only: no webhook or chat. Treat as delivered so the streak is
+		// consumed; only a full queue must stay retryable.
+		return true
 	}
 	select {
 	case a.queue <- alertMsg{ChatID: chat, Text: text}:
+		return true
 	default:
 		log.Printf("alert queue full: %s alert not delivered", tag)
+		return false
 	}
 }
 
@@ -203,11 +232,16 @@ func (b *broker) alertHealth(h *hotel, herr error, hadHealth, wasOK bool) {
 	if herr == nil {
 		st.missSent = false
 	} else if hadHealth && !st.missSent {
-		st.missSent = true
 		if st.operatorLast.IsZero() || now.Sub(st.operatorLast) >= alertCooldown {
-			st.operatorLast = now
-			a.send("OPERATOR-ALERT", h.alertChat(), fmt.Sprintf("Cathedral: %s missed a heartbeat (no /room/health answer for %s). Check the machine.",
-				hotelAlertName(h), now.Sub(h.lastOK).Round(time.Second)))
+			// Mark sent only after the queue accepts the alert. A full queue
+			// leaves missSent false so a later sync can retry (AB#330).
+			if a.send("OPERATOR-ALERT", h.alertChat(), fmt.Sprintf("Cathedral: %s missed a heartbeat (no /room/health answer for %s). Check the machine.",
+				hotelAlertName(h), now.Sub(h.lastOK).Round(time.Second))) {
+				st.missSent = true
+				st.operatorLast = now
+			}
+		} else {
+			st.missSent = true // cooldown: one attempt per streak
 		}
 	}
 	if h.ok {
@@ -215,11 +249,14 @@ func (b *broker) alertHealth(h *hotel, herr error, hadHealth, wasOK bool) {
 		return
 	}
 	if wasOK && !st.dropSent {
-		st.dropSent = true
 		load := customerLoad(h)
-		if load > 0 && (st.opsLast.IsZero() || now.Sub(st.opsLast) >= alertCooldown) {
+		if load <= 0 || (!st.opsLast.IsZero() && now.Sub(st.opsLast) < alertCooldown) {
+			st.dropSent = true // no ops audience, or cooldown for this episode
+			return
+		}
+		if a.send("OPS-ALERT", a.opsChat, fmt.Sprintf("Cathedral: %s is down with %d customer rooms or creates on it.", hotelAlertName(h), load)) {
+			st.dropSent = true
 			st.opsLast = now
-			a.send("OPS-ALERT", a.opsChat, fmt.Sprintf("Cathedral: %s is down with %d customer rooms or creates on it.", hotelAlertName(h), load))
 		}
 	}
 }
