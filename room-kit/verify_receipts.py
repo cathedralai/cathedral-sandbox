@@ -184,6 +184,10 @@ END_MARKER_PATH = "/work/.cathedral-end"
 # (cwd, user, image_id) may be absent in both; absent in one only is a difference.
 REQUIRED_REQUEST_FIELDS = ("image", "command", "env", "size", "timeout_seconds", "network", "outputs", "inputs",
                            "max_spend_usd")
+BUNDLE_MEMBERS = ("schema", "oneshot_id", "request", "attestation", "amd_certs", "receipts", "create_request_b64",
+                  "exec_request_b64", "exec_response_b64", "inline_outputs", "not_proven")
+ATTESTATION_MEMBERS = ("binding", "binding_sha256", "report_b64")
+RECEIPT_MEMBERS = ("statement", "signature_b64", "receipt_sha256")
 REQUEST_FIELDS = ("image", "image_id", "command", "env", "cwd", "user", "size", "timeout_seconds", "network",
                   "outputs", "inputs", "context", "max_spend_usd")
 RUN_SHOWS = [
@@ -733,7 +737,7 @@ def _has_complete_numbering(st: dict) -> bool:
     return "room_sequence" in st and "room_previous_receipt_sha256" in st
 
 
-def check_room_chain(room: str, rcs: list[dict]) -> list[dict]:
+def check_room_chain(room: str, rcs: list[dict], in_order: bool = False) -> list[dict]:
     """One room's numbered receipts: 1 to n, no gap, no repeat, each linked to the one before.
 
     Returns the receipts in room order. Every receipt must carry the numbering fields."""
@@ -744,6 +748,9 @@ def check_room_chain(room: str, rcs: list[dict]) -> list[dict]:
         prev = st.get("room_previous_receipt_sha256")
         need(prev is None or (isinstance(prev, str) and HEX64.fullmatch(prev) is not None),
              f"{where}: room_previous_receipt_sha256 is neither null nor 64 lower-case hex")
+    if in_order:  # a one-shot's file lists the receipts by their room numbers: check the order as given
+        given = [rc["statement"]["room_sequence"] for rc in rcs]
+        need(given == sorted(given), f"room {room}: the receipts are not in the order of their room numbers")
     ordered = sorted(rcs, key=lambda rc: rc["statement"]["room_sequence"])
     seqs = [rc["statement"]["room_sequence"] for rc in ordered]
     for n in seqs:
@@ -1007,10 +1014,22 @@ def fetch_chain(broker: str, hotel: str, key: str) -> dict:
 JSON_MAX_DEPTH = 64
 
 
-def json_depth(text: str) -> int:
-    """The deepest nesting of [ and { in a JSON text. Characters inside strings are skipped (an escaped quote and
-    an escaped backslash are handled); the walk is a loop, not a recursion."""
-    depth = deepest = 0
+# The longest run of digits a number in a read document may have. Python 3.11 and later refuse an integer of
+# more than 4,300 digits and earlier versions do not, so a fixed bound, counted on the raw text, keeps the answer
+# the same on every version. No number the run mode reads comes near it.
+JSON_MAX_DIGITS = 100
+
+
+class Unreadable(Fail):
+    """A document run mode refuses to read because of its nesting or a number's length."""
+
+
+def json_shape(text: str) -> tuple[int, int]:
+    """(the deepest nesting of [ and {, the longest run of digits outside strings) of a JSON text.
+
+    Characters inside strings are skipped (an escaped quote and an escaped backslash are handled); the walk is a
+    loop, not a recursion."""
+    depth = deepest = run = longest = 0
     in_string = escaped = False
     for ch in text:
         if in_string:
@@ -1020,14 +1039,25 @@ def json_depth(text: str) -> int:
                 escaped = True
             elif ch == '"':
                 in_string = False
-        elif ch == '"':
+            continue
+        if "0" <= ch <= "9":
+            run += 1
+            longest = max(longest, run)
+            continue
+        run = 0
+        if ch == '"':
             in_string = True
         elif ch in "[{":
             depth += 1
             deepest = max(deepest, depth)
         elif ch in "]}":
             depth -= 1
-    return deepest
+    return deepest, longest
+
+
+def json_depth(text: str) -> int:
+    """The deepest nesting of [ and { in a JSON text, counted on the raw text."""
+    return json_shape(text)[0]
 
 
 def strict_json(raw: bytes, prefix: str, what: str, plural: bool = False, floats: bool = False):
@@ -1048,12 +1078,17 @@ def strict_json(raw: bytes, prefix: str, what: str, plural: bool = False, floats
         text = raw.decode(json.detect_encoding(raw), "surrogatepass")
     except (UnicodeDecodeError, LookupError):
         text = None  # not decodable: the parse below says so
-    if text is not None and json_depth(text) > JSON_MAX_DEPTH:
-        raise Fail(f"{prefix}: {what} {'nest' if plural else 'nests'} too deeply to read")
+    if text is not None:
+        deepest, longest = json_shape(text)
+        if deepest > JSON_MAX_DEPTH:
+            raise Unreadable(f"{prefix}: {what} {'nest' if plural else 'nests'} too deeply to read")
+        if longest > JSON_MAX_DIGITS:
+            raise Unreadable(f"{prefix}: {what} {'hold' if plural else 'holds'} a number of more than "
+                             f"{JSON_MAX_DIGITS} digits")
     try:
         return json.loads(raw, object_pairs_hook=pairs, parse_float=float if floats else refuse, parse_constant=refuse)
     except RecursionError as exc:
-        raise Fail(f"{prefix}: {what} {'nest' if plural else 'nests'} too deeply to read") from exc
+        raise Unreadable(f"{prefix}: {what} {'nest' if plural else 'nests'} too deeply to read") from exc
     except ValueError as exc:
         raise Fail(f"{prefix}: {what} {'are' if plural else 'is'} not JSON") from exc
 
@@ -1109,6 +1144,8 @@ def _allow_entry(entry) -> str:
     if value.count(":") == 1 and not value.startswith("[") and "/" not in value:
         host_part, port_part = value.rsplit(":", 1)
         if port_part.isdigit():
+            if len(port_part) > 5:
+                bad()  # also keeps a long digit run from reaching int(), which some Pythons refuse
             port = int(port_part)
             if not 1 <= port <= 65535:
                 bad()
@@ -1218,7 +1255,7 @@ def network_policy(value, default_ok: bool = False) -> dict:
 IMAGE_PIN_RE = re.compile(r".+@sha256:[0-9a-f]{64}")
 CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f]")
 COMMAND_MAX, ENV_MAX, INPUTS_MAX = 128, 64, 8
-OUTPUT_MAX_BYTES = 200 * 1024 * 1024
+OUTPUT_MAX_BYTES = 64 * 1024  # outputs are kept inline in this version
 CONTEXT_MAX_BYTES = 4 * 1024
 INLINE_OUTPUT_MAX_BYTES = 64 * 1024
 IMAGE_MAX, PATH_MAX, ENV_VALUE_MAX, CWD_MAX, USER_MAX = 512, 1024, 8192, 1024, 64
@@ -1228,7 +1265,8 @@ USER_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_-]*[$]?|[0-9]+")
 MODE_RE = re.compile(r"[0-7]{3,4}")
 # max_spend_usd as a string: digits, an optional point and 1 to 6 more digits (a run costs cents, so a fraction is
 # sent as text, never as a float); the value must also be greater than zero.
-MAX_SPEND_RE = re.compile(r"(0|[1-9][0-9]*)(\.[0-9]{1,6})?")
+MAX_SPEND_RE = re.compile(r"(0|[1-9][0-9]{0,11})(\.[0-9]{1,6})?")
+MAX_SPEND_INTEGER_MAX = 999_999_999_999
 INPUT_PREFIX, OUTPUT_PREFIX = "/work/in/", "/work/out/"
 
 
@@ -1313,9 +1351,10 @@ def request_limits(req: dict, prefix: str) -> None:
         need(_is_int(req["timeout_seconds"]), f"{prefix}timeout_seconds must be an integer")
     if "max_spend_usd" in req:
         spend = req["max_spend_usd"]
-        ok = (spend >= 1 if _is_int(spend) else
+        ok = (1 <= spend <= MAX_SPEND_INTEGER_MAX if _is_int(spend) else
               isinstance(spend, str) and MAX_SPEND_RE.fullmatch(spend) is not None and spend.strip("0.") != "")
-        need(ok, f"{prefix}max_spend_usd must be an integer of at least 1 or a decimal string greater than zero")
+        need(ok, f"{prefix}max_spend_usd must be an integer from 1 to 999999999999, or a decimal string of 1 to 12 digits "
+              "and up to 6 decimals, greater than zero")
     if "image_id" in req:
         need(isinstance(req["image_id"], str) and IMAGE_DIGEST_RE.fullmatch(req["image_id"]) is not None,
              f"{prefix}image_id must be sha256: and 64 lower-case hex")
@@ -1355,7 +1394,7 @@ def request_limits(req: dict, prefix: str) -> None:
                 need(_is_int(limit), f"{prefix}an output max_bytes must be an integer")
             if _is_int(limit):
                 need(limit >= 1, f"{prefix}an output max_bytes must be at least 1")
-                need(limit <= OUTPUT_MAX_BYTES, f"{prefix}an output max_bytes must be at most 200 MiB")
+                need(limit <= OUTPUT_MAX_BYTES, f"{prefix}an output max_bytes must be at most {OUTPUT_MAX_BYTES}")
     if "context" in req:
         need(_depth(req["context"]) <= CONTEXT_MAX_DEPTH,
              f"{prefix}context nests deeper than {CONTEXT_MAX_DEPTH} levels")
@@ -1475,12 +1514,32 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     need(isinstance(bundle, dict) and bundle.get("schema") == ONESHOT_BUNDLE_SCHEMA,
          f"check 1: the file is not a {ONESHOT_BUNDLE_SCHEMA}")
     req, create = recipe["request"], recipe["create"]
+    # The shapes of the file are exact (spec G4 5.5): the members it names, no others.
+    for key in sorted(bundle):
+        need(key in BUNDLE_MEMBERS, f"check 1: the file has an unknown member {key}")
+    need("not_proven" in bundle, "check 1: the file has no not_proven")
+    need(isinstance(bundle["not_proven"], list) and all(isinstance(r, str) for r in bundle["not_proven"]),
+         "check 1: not_proven is not a list of strings")
+    need("inline_outputs" in bundle, "check 1: the file has no inline_outputs")
 
     # 1. attestation, AMD chain, measurement, every receipt's signature, one binding
     att, certs, receipts = bundle.get("attestation"), bundle.get("amd_certs"), bundle.get("receipts")
     need(isinstance(att, dict) and isinstance(att.get("binding"), dict), "check 1: the file holds no attestation")
-    need(isinstance(receipts, list) and receipts and all(isinstance(r, dict) and isinstance(r.get("statement"), dict)
-                                                         for r in receipts), "check 1: the file holds no receipts")
+    need(isinstance(receipts, list) and receipts and all(isinstance(r, dict) for r in receipts),
+         "check 1: the file holds no receipts")
+    for key in sorted(att):
+        need(key in ATTESTATION_MEMBERS, f"check 1: attestation has an unknown member {key}")
+    for key in ATTESTATION_MEMBERS:
+        need(key in att, f"check 1: attestation has no {key}")
+    if isinstance(certs, dict):
+        for key in sorted(certs):
+            need(key in ("vcek", "ask", "ark"), f"check 1: amd_certs has an unknown member {key}")
+    for receipt in receipts:
+        for key in sorted(receipt):
+            need(key in RECEIPT_MEMBERS, f"check 1: a receipt has an unknown member {key}")
+        for key in RECEIPT_MEMBERS:
+            need(key in receipt, f"check 1: a receipt has no {key}")
+    need(all(isinstance(r["statement"], dict) for r in receipts), "check 1: the file holds no receipts")
     need(not is_hotel_level(att), "check 1: an SEV-SNP attestation is required")
     need(isinstance(certs, dict) and all(isinstance(certs.get(k), str) for k in ("vcek", "ask", "ark")),
          "check 1: the file holds no AMD certificates (amd_certs)")
@@ -1505,7 +1564,7 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     need(all(_has_numbering(rc["statement"]) for rc in receipts),
          f"check 2: room {room}: the receipts are not numbered (room_sequence)")
     try:
-        ordered = check_room_chain(room, receipts)
+        ordered = check_room_chain(room, receipts, in_order=True)
     except Fail as exc:
         raise Fail(f"check 2: {exc}") from exc
     created = ordered[0]["statement"]
@@ -1667,6 +1726,9 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     for entry in shown.get("inputs") if isinstance(shown.get("inputs"), list) else []:
         need(not (isinstance(entry, dict) and "content_b64" in entry),
              "check 8: the request holds content_b64, which a file must not carry")
+    for entry in shown.get("inputs") if isinstance(shown.get("inputs"), list) else []:
+        need(isinstance(entry, dict) and set(entry) == {"path", "sha256", "mode"},
+             "check 8: the file's request: an input must hold exactly path, sha256 and mode")
     request_limits(shown, "check 8: the file's request: ")
 
     def entries(items, keys, defaults):
@@ -1704,11 +1766,18 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     if isinstance(raw, str):
         try:
             answer = base64.b64decode(raw, validate=True)
-            doc = json.loads(answer)
         except ValueError:
-            answer, doc = b"", None
-        if sha(answer) == exec_rc.get("result_sha256") and isinstance(doc, dict) and _is_int(doc.get("exit_code")):
-            exit_code = {"status": "confirmed", "value": doc["exit_code"]}
+            answer = None
+        # The hash comes first: an answer that is not the signed one is not read at all.
+        if answer is not None and sha(answer) == exec_rc.get("result_sha256"):
+            try:
+                doc = strict_json(answer, "check 6", "the exec answer", floats=True)
+            except Unreadable:
+                raise
+            except Fail:
+                doc = None
+            if isinstance(doc, dict) and _is_int(doc.get("exit_code")):
+                exit_code = {"status": "confirmed", "value": doc["exit_code"]}
 
     context_check = ("the signed context file and the request in the file" if "context" in shown
                      else "the signed context file only")
