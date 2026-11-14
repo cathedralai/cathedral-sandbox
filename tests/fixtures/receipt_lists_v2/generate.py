@@ -1687,7 +1687,6 @@ def run_form_cases(pack: Pack) -> None:
         "high_alone": b"\\ud800", "low_alone": b"\\udc00", "low_before_high": b"\\udc00\\ud800",
         "high_then_other_escape": b"\\ud800\\u0041", "high_then_plain_char": b"\\ud800x",
         "high_then_high": b"\\ud800\\ud800", "raw_utf8_bytes": b"\xed\xa0\x80"}
-    holds = {"one_shot_file": "the one-shot file", "recipe": "the recipe", "context_file": "the context file"}
     for form, payload in surrogate.items():
         for where, raw in (("value", b'{"k": "' + payload + b'"}'), ("key", b'{"' + payload + b'": 1}')):
             run_case(pack, "bad", f"run_form_surrogate_{form}_in_a_{where}_of_the_context_file",
