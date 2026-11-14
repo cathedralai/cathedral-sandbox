@@ -2586,7 +2586,7 @@ class Handler(BaseHTTPRequestHandler):
         if action and self.authorized():
             try:
                 extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(ledger.sign(
-                    {**self.fields(action, path, body, status, out), **owner_fields},
+                    {**self.fields(action, path, forward_path, body, status, out), **owner_fields},
                     **({"create": create_ask} if create_ask else {})))).decode()
             except Exception as exc:  # noqa: BLE001 the action ran: answer, and say the receipt is missing
                 traceback.print_exc()
@@ -2865,7 +2865,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             receipt = ledger.sign({
                 "action": "exec",
-                "target": f"{self.command} {self.path}",
+                "target": f"{self.command} {api_request_path(self.path)[1]}",
                 "sandbox_id": room,
                 "customer_request_sha256": sha(body),
                 # As for every exec: sha256 of the command the room ran, here the opened one.
@@ -2968,7 +2968,7 @@ class Handler(BaseHTTPRequestHandler):
             "ok": True, "window_id": window_id, "path": path, "encrypted": encrypted,
         }), extra)
 
-    def fields(self, action: str, path: str, body: bytes | None, status: int, out: bytes) -> dict:
+    def fields(self, action: str, path: str, forward_path: str, body: bytes | None, status: int, out: bytes) -> dict:
         req = {}
         try:
             req = json.loads(body) if body else {}
@@ -3000,8 +3000,8 @@ class Handler(BaseHTTPRequestHandler):
                 start_command_sha256 = sha(canonical(start_command))
         return {
             "action": action,
-            # *path* is the API form (urlparse); never the raw client target with ";params".
-            "target": f"{self.command} {path}",
+            # Bind the file path query, while dropping any ";params" that the API ignores.
+            "target": f"{self.command} {forward_path}",
             "sandbox_id": sandbox if isinstance(sandbox, str) else None,
             "customer_request_sha256": sha(body or b""),
             "command_sha256": sha(canonical(command)) if command is not None else None,
