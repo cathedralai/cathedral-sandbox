@@ -133,6 +133,56 @@ A create that asks for more than one room (`count` other than the integer 1)
 is refused with 400 `create_count_refused`, unsent and unsigned, so each room's
 list holds its own create.
 
+### Serial rooms
+
+A create whose labels carry `cathedral_serial` = `"1"` makes a serial room: one
+signed request at a time, so the order of its receipts is the order things ran.
+
+- The label value must be the string `1`, and not set together with
+  `cathedral_pool`: 400 `reserved_label_invalid`. A serial create carries no
+  `Idempotency-Key` header (an empty one counts): 400 `idempotency_key_refused`.
+- The create receipt carries `serial: true` when it is the room's receipt 1, no
+  request for that room id was in flight when it was signed, and no non-read
+  request for that room's id was in flight at any moment between the create
+  being sent and its receipt being signed (an unsigned write counts, and so
+  does a request the API refused). Otherwise the room is an ordinary room. The
+  front remembers such ids only while a create is pending; the set holds at
+  most 4,096 ids, and a further id that has to be remembered withholds every
+  flag until the pending creates end.
+- A second signed request while one runs is refused at once with 409
+  `room_busy` and is not sent on. The turn ends after the receipt is signed and
+  before the answer is written.
+- Reads (GET of the room, `/wait`, `/logs`, `/stat`, `/tar`, `/desktop`,
+  `/terminals`, a process's `/logs`, `sealed-secrets`, `sealed-env`, `/entries`)
+  pass without a token and leave no receipt. Every other route that is not a
+  signed route or a delete, the front's own sealed secrets and sealed exec
+  included, is refused with 409 `room_serial_unsigned`.
+- On a serial room each request is sent to the API once, a read or a signed
+  GET included (an ordinary room retries a GET whose answer was lost). A read
+  whose answer is lost answers 502, signs nothing and does not break the room
+  (a read holds no token). A signed request or a delete that reached the API
+  and was not answered is signed as a 502, and a signed request whose receipt
+  could not be signed leaves none: either breaks the room.
+- Once a room is broken, every request that names it, a read included, gets
+  409 `room_broken` and is not sent on, except a delete. The room's receipt
+  list (`GET /v1/sandboxes/<id>/receipts`) is answered before that and can
+  still be read. A 2xx delete ends the room and every mark kept for it.
+- Limit: a bulk delete by label (`DELETE /v1/sandboxes?label=...`) names no
+  room and is not held back by a busy serial room, so clean-up by label keeps
+  working. A room it removes gets no receipt of its own, and any create whose
+  pending time it overlaps gets no flag.
+- Limit: routes that name no room are not room requests. They are not held
+  back by a serial room and are not in its list. That covers secrets (`PUT`
+  and `DELETE /v1/secrets/<name>` change what the later outbound requests of
+  a room whose network policy references that secret carry), workspaces (a
+  room that mounts a shared workspace can be changed through another room of
+  the same owner that mounts it), and listing calls (`GET /v1/sandboxes` and
+  `GET /v1/quota` run the API's own expiry collection). A serial room that
+  needs its list to be everything that could change it mounts no shared
+  workspace and references no hotel secret.
+
+An ordinary room runs requests side by side, as before.
+
 ### Fresh report over caller data (sealed only)
 
 `POST /room/attest` on the receipt front asks the processor for a new SNP

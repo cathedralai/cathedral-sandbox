@@ -43,10 +43,12 @@ class FakeApi:
         self.lock = threading.Lock()
         self.seen: list[tuple[str, str, bytes]] = []
         self.rooms: set[str] = set()
+        self.labels: dict[str, dict] = {}
+        self.answer_holds: list[Hold] = []
         self.new_ids: list[str] = []
         self.counter = 0
         self.holds: list[tuple[re.Pattern, Hold]] = []
-        self.drops: list[re.Pattern] = []
+        self.drops: list[list] = []  # [pattern, answers still to drop or None for all]
         self.replies: list[tuple[re.Pattern, int, bytes]] = []
         self.network_policy: dict | None = DENY_ALL
         self.expires_in = 3600.0
@@ -63,8 +65,15 @@ class FakeApi:
         self.holds.append((re.compile(pattern), h))
         return h
 
-    def drop(self, pattern: str) -> None:
-        self.drops.append(re.compile(pattern))
+    def hold_create_answers(self) -> Hold:
+        """Hold each create after the API made the room and before it answers."""
+        h = Hold()
+        self.answer_holds.append(h)
+        return h
+
+    def drop(self, pattern: str, times: int | None = None) -> None:
+        """Read the request, then close without an answer: for the next *times* matches, or for all."""
+        self.drops.append([re.compile(pattern), times])
 
     def reply(self, pattern: str, status: int, body: bytes | dict = b"{}") -> None:
         self.replies.append((re.compile(pattern), status, body if isinstance(body, bytes) else json.dumps(body).encode()))
@@ -90,7 +99,15 @@ class FakeApi:
             if rx.fullmatch(line):
                 hold.entered.set()
                 hold.release.wait(30)
-        if any(rx.fullmatch(line) for rx in self.drops):
+        with self.lock:
+            dropping = False
+            for entry in self.drops:
+                if entry[0].fullmatch(line) and entry[1] != 0:
+                    dropping = True
+                    if entry[1] is not None:
+                        entry[1] -= 1
+                    break
+        if dropping:
             h.close_connection = True
             h.connection.shutdown(socket.SHUT_RDWR)
             return
@@ -99,6 +116,8 @@ class FakeApi:
                 return self._send(h, status, out)
         if line == "POST /v1/sandboxes":
             return self._create(h, body)
+        if line == "DELETE /v1/sandboxes":
+            return self._bulk_delete(h)
         if line == "GET /v1/sandboxes":
             if self.list_body is not None:
                 return self._send(h, self.list_status, self.list_body)
@@ -122,11 +141,31 @@ class FakeApi:
             return self._send(h, 200, b'{"exit_code":0}')
         return self._send(h, 200, b"{}")
 
+    def _bulk_delete(self, h) -> None:
+        """Really delete each room whose labels match every label=key=value of the query."""
+        from urllib.parse import parse_qs, urlsplit
+
+        wanted = [item.split("=", 1) for item in parse_qs(urlsplit(h.path).query).get("label", [])]
+        with self.lock:
+            for room in list(self.rooms):
+                labels = self.labels.get(room, {})
+                if all(len(kv) == 2 and str(labels.get(kv[0])) == kv[1] for kv in wanted):
+                    self.rooms.discard(room)
+        self._send(h, 200, b"{}")
+
     def _create(self, h, body: bytes) -> None:
+        try:
+            labels = json.loads(body).get("labels")
+        except (ValueError, AttributeError):
+            labels = None
         with self.lock:
             self.counter += 1
             room = self.new_ids.pop(0) if self.new_ids else f"sbx_{self.counter}"
             self.rooms.add(room)
+            self.labels[room] = labels if isinstance(labels, dict) else {}
+        for hold in list(self.answer_holds):
+            hold.entered.set()
+            hold.release.wait(30)
         doc = {"id": room}
         if self.network_policy is not None:
             doc["network"] = {"policy": self.network_policy}
@@ -165,6 +204,8 @@ class FakeApi:
 
     def release_all(self) -> None:
         for _rx, hold in self.holds:
+            hold.release.set()
+        for hold in self.answer_holds:
             hold.release.set()
 
     def stop(self) -> None:
@@ -257,13 +298,19 @@ def finish(t: threading.Thread, box: dict, timeout: float = 20):
 
 
 def assert_idle(ledger) -> None:
-    """No request still counted and no token held: a turn never leaks."""
+    """No request still counted, no token held, no create pending and nothing touched: a turn never leaks."""
     deadline = time.time() + 5
     while time.time() < deadline:
         with ledger.lock:
-            if not getattr(ledger, "in_flight", {}) and not getattr(ledger, "busy", set()):
+            if (not getattr(ledger, "in_flight", {}) and not getattr(ledger, "busy", set())
+                    and not getattr(ledger, "touched", set()) and not getattr(ledger, "creates_in_flight", 0)
+                    and not getattr(ledger, "overflow", False) and not getattr(ledger, "bulk_in_flight", 0)):
                 return
         time.sleep(0.01)
     with ledger.lock:
         assert getattr(ledger, "in_flight", {}) == {}, "an in-flight count leaked"
         assert getattr(ledger, "busy", set()) == set(), "a token stayed held"
+        assert getattr(ledger, "touched", set()) == set(), "the touched set was not cleared"
+        assert getattr(ledger, "creates_in_flight", 0) == 0, "a create stayed counted"
+        assert not getattr(ledger, "overflow", False), "the overflow mark stayed set"
+        assert getattr(ledger, "bulk_in_flight", 0) == 0, "a bulk delete stayed counted"
