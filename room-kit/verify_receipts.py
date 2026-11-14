@@ -258,14 +258,20 @@ def parse_report(r: bytes) -> dict:
 
 
 def product(rep: dict, override: str | None) -> str:
-    if override:
-        return override
+    """The product the report names. A report with CPUID fields (version 3 on) names its own: a family with no
+    layout here fails whatever --product says, and a different --product fails. Only a version 2 report, which
+    has no CPUID fields, takes the product from --product."""
     fam, mod = rep["cpuid_fam"], rep["cpuid_mod"]
-    if fam == 0x19 and mod is not None and mod >= 0x10:
-        return "Genoa"
-    if fam == 0x19:
-        return "Milan"
-    raise Fail(f"cannot tell the product from cpuid family {fam} model {mod}; pass --product")
+    if fam is None:
+        if override is not None:
+            return override
+        raise Fail(f"cannot tell the product from cpuid family {fam} model {mod}; pass --product")
+    if fam != 0x19:
+        raise Fail(f"the report names cpuid family {fam} model {mod}, which has no layout here")
+    shown = "Genoa" if mod is not None and mod >= 0x10 else "Milan"
+    if override is not None and override != shown:
+        raise Fail(f"--product {override}: the report names the product {shown}")
+    return shown
 
 
 def fetch(url: str, cache: str, name: str) -> bytes:
@@ -1960,12 +1966,15 @@ def main() -> int:
     if a.oneshot:
         # Every flag run mode does not act on is refused, so no caller believes a check ran that did not.
         # --require-sealed is accepted: run mode always requires an SEV-SNP attestation.
+        # A flag counts as given when it differs from the parser's own default (None, False or an empty list), so
+        # an empty string, or a value equal to an old default, is still a flag the caller passed.
         clash = [flag for flag, value in (
             ("--receipts", a.receipts), ("--attestation", a.attestation), ("--broker", a.broker),
             ("--origin", a.origin), ("--owner-pubkey", a.owner_pubkey), ("--tls-spki-sha256", a.tls_spki_sha256),
             ("--require-tls", a.require_tls), ("--kds-cache", a.kds_cache), ("--sandbox", a.sandbox),
             ("--hotel", a.hotel), ("--operator-key-file", a.operator_key_file), ("--save", a.save),
-            ("--receipt-header", a.receipt_header), ("--cathedral-sandbox", a.cathedral_sandbox)) if value]
+            ("--receipt-header", a.receipt_header), ("--cathedral-sandbox", a.cathedral_sandbox),
+            ("--key-file", a.key_file)) if value is not None and value is not False and value != []]
         if clash:
             ap.error(f"--oneshot checks one file; it takes no {', '.join(clash)}")
         return run_mode(a)
