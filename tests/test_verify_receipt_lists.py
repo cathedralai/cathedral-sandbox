@@ -584,3 +584,81 @@ def test_request_limits_accepts_each_max_spend_form(value) -> None:
     vr = _load_checker()
     for prefix in (RECIPE_PREFIX, FILE_PREFIX):
         vr.request_limits({**_valid_request(), "max_spend_usd": value}, prefix)
+
+
+# ---- the exchange case: one good run, held byte for byte in both repositories
+
+EXCHANGE = ROOT / "tests" / "fixtures" / "oneshot_exchange" / "good_basic"
+
+
+def _canonical(doc) -> bytes:
+    return json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def assemble_bundle(case: Path) -> dict:
+    """The reference assembler: what the one-shot file must be, built only from what the machine and the broker
+    gave the API (machine/) and what the caller sent (caller/). The API's own assembler must give the same file."""
+    import base64
+    import re
+
+    machine, caller = case / "machine", case / "caller"
+    b64 = lambda raw: base64.b64encode(raw).decode()  # noqa: E731
+    receipts = [json.loads(base64.urlsafe_b64decode(p.read_text())) for p in sorted(machine.glob("[0-9][0-9]_*.header"))]
+    pem = (machine / "amd" / "cert_chain_pem.txt").read_text()
+    blocks = re.findall(r"-----BEGIN CERTIFICATE-----\n(.*?)\n-----END CERTIFICATE-----", pem, re.DOTALL)
+    ask, ark = (b64(base64.b64decode("".join(block.split()))) for block in blocks)
+    post = json.loads((caller / "post_body.json").read_text())
+    request = {k: v for k, v in post.items() if k != "inputs"}
+    request["inputs"] = [{"path": i["path"], "sha256": i["sha256"], "mode": i["mode"]} for i in post["inputs"]]
+    answer = (machine / "05_get_output.response").read_bytes()
+    return {
+        "schema": "cathedral_oneshot_bundle_v1",
+        "oneshot_id": json.loads((caller / "response_202.json").read_text())["id"],
+        "request": request,
+        "attestation": json.loads((machine / "hotel_attestation_answer.json").read_text()),
+        "amd_certs": {"vcek": b64((machine / "amd" / "vcek_der.bin").read_bytes()), "ask": ask, "ark": ark},
+        "receipts": receipts,
+        "create_request_b64": (machine / "create_request.b64").read_text(),
+        "exec_request_b64": b64((machine / "exec_request.json").read_bytes()),
+        "exec_response_b64": b64((machine / "04_exec.response").read_bytes()),
+        "inline_outputs": {o["path"]: b64(answer) for o in post["outputs"] if len(answer) <= 64 * 1024},
+        "not_proven": [],
+    }
+
+
+def test_the_exchange_run_passes_and_prints_exactly_the_expected_check() -> None:
+    case = json.loads((EXCHANGE / "case.json").read_text())
+    code, out, err = _run_cli(*[a.replace("{dir}", str(EXCHANGE)) for a in case["args"]])
+    assert code == 0 and "Traceback" not in err
+    assert out.encode() == (EXCHANGE / "expected" / "check.json").read_bytes()
+
+
+def test_the_exchange_bundle_is_rebuilt_from_what_the_machine_and_the_caller_gave() -> None:
+    expected = json.loads((EXCHANGE / "expected" / "bundle.json").read_text())
+    assert _canonical(assemble_bundle(EXCHANGE)) == _canonical(expected)
+    assert (EXCHANGE / "expected" / "bundle.json").read_bytes() == _canonical(expected)
+
+
+def test_the_exchange_case_holds_the_forms_the_spec_names() -> None:
+    expected = json.loads((EXCHANGE / "expected" / "bundle.json").read_text())
+    request = expected["request"]
+    assert "cwd" not in request and "user" not in request          # absent, never null
+    assert isinstance(request["max_spend_usd"], str) and len(request["env"]) == 1 and len(request["inputs"]) == 1
+    assert all("content_b64" not in i for i in request["inputs"]) and "context" in request
+    assert all(isinstance(r, dict) and set(r) == {"statement", "signature_b64", "receipt_sha256"}
+               for r in expected["receipts"])
+    assert set(expected["amd_certs"]) == {"vcek", "ask", "ark"} and len(expected["inline_outputs"]) == 1
+    post = json.loads((EXCHANGE / "caller" / "post_body.json").read_text())
+    assert "content_b64" in post["inputs"][0]
+
+
+def test_the_exchange_manifest_names_every_file() -> None:
+    import hashlib
+
+    manifest = json.loads((EXCHANGE / "MANIFEST.json").read_text())
+    on_disk = {p.relative_to(EXCHANGE).as_posix() for p in EXCHANGE.rglob("*") if p.is_file()} - {"MANIFEST.json"}
+    assert on_disk == set(manifest["files"])
+    for path, digest in manifest["files"].items():
+        assert hashlib.sha256((EXCHANGE / path).read_bytes()).hexdigest() == digest, path
+    lines = "".join(f"{p} {d}\n" for p, d in sorted(manifest["files"].items()))
+    assert hashlib.sha256(lines.encode()).hexdigest() == manifest["root_sha256"]
