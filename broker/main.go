@@ -157,6 +157,9 @@ type config struct {
 	// Room terminal routes reach only these hotels. Empty: no hotel. A miner
 	// hotel never gets them, listed or not (terminalsRefused).
 	TerminalHotels []string `json:"terminal_hotels,omitempty"`
+	// ACMEDNS turns on the DNS-01 challenge service for Preview URL
+	// certificates (acme_dns.go, AB#423). Absent: off.
+	ACMEDNS *acmeDNSConfig `json:"acme_dns,omitempty"`
 }
 
 func (b *broker) maxExec() int {
@@ -269,6 +272,7 @@ type broker struct {
 	mu               sync.Mutex
 	hset             atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
 	hotelsMu         sync.Mutex               // serialises joins and leaves
+	acmeDNS          acmeDNSState             // DNS-01 challenge records (acme_dns.go)
 	hotelsMutationMu sync.Mutex               // keeps runtime mutations and their saves in order (hotels.json and hotel-lends.json)
 	stateSaveMu      sync.Mutex               // one client-state save at a time, snapshot through rename (state.go)
 	guests           map[string]*guestState
@@ -470,6 +474,9 @@ func loadBroker(path string) (*broker, error) {
 	}
 	if err := c.AMDVerifier.validate(); err != nil {
 		return nil, fmt.Errorf("config: amd_verifier: %w", err)
+	}
+	if err := c.ACMEDNS.validate(); err != nil {
+		return nil, fmt.Errorf("config: acme_dns: %w", err)
 	}
 	for _, h := range b.hotelList() {
 		if r := h.cfg.ReservedFor; r != "" && b.guests[r] == nil {
@@ -2143,6 +2150,10 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(p, "/v1/broker/bindings/") && r.Method == "GET" && b.isOperator(r) {
 		b.handleBindingGet(w, strings.TrimPrefix(p, "/v1/broker/bindings/")) // operator key only
+		return
+	}
+	if p == "/v1/broker/acme-challenge" {
+		b.handleACMEChallenge(w, r) // signed by the hotel's attested receipt key, no Bearer key
 		return
 	}
 	if p == "/v1/broker/guests" || strings.HasPrefix(p, "/v1/broker/guests/") {
