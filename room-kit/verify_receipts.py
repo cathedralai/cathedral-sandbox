@@ -87,6 +87,11 @@ has no CPUID fields, takes the product from --product; there nothing in the repo
 Milan and Genoa share the layout. A report of version 0 or 1, or of a version above 5, fails whatever --product
 says ("the report is version N, which has no layout here"); the flag is read for no version but 2. List mode
 reads the product the same way.
+List mode reads the receipts file, each receipt header and the attestation file under the same raw-text limits as
+run mode (nesting at most 64, number literals of at most 100 characters, no unpaired surrogate), each with its own
+reason, and every receipt's sequence must be an integer before any ordering or link check runs, in both modes. A
+fault that no check names ends in exit 1 with "internal error: <exception name>"; it is not reported as malformed
+input.
 List mode also refuses, with a reason and never an uncaught error, a receipt that is not an object with a
 statement, a statement whose sequence, binding, action, status or room id has the wrong type, a network_policy
 that is not an object with a string mode and a list allow, and a receipt that carries a policy (or closes a policy
