@@ -1062,7 +1062,7 @@ class DockerClient:
                 f"docker unpause failed: {(result.stderr or result.stdout or '')[:200]}",
             )
 
-    def container_state(self, container_id: str) -> str:
+    def engine_status(self, container_id: str) -> str:
         """The container's engine status ("running", "paused", "exited", ...), or "gone" when it does not exist.
         Raises 502 when the engine cannot be read."""
         result = self.run(["docker", "inspect", "--format", "{{.State.Status}}", container_id], timeout=15.0)
@@ -2557,7 +2557,7 @@ class DockerGuestProvider:
     def _read_state(self, guest: GuestRecord) -> str | None:
         """The container's engine status ("running", "paused", "exited", "gone"), None when unreadable."""
         try:
-            return self._client.container_state(guest.container_id)
+            return self._client.engine_status(guest.container_id)
         except SandboxOpError:
             return None
 
