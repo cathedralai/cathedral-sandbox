@@ -52,6 +52,16 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      must carry a lower-case UUID. The output maps each room to the Cathedral
      sandbox id its successful create receipt signed. --cathedral-sandbox <id>
      fails unless a successful create receipt names that id.
+ 10. room numbering: a room whose receipts all carry room_sequence and
+     room_previous_receipt_sha256 has them run 1 to n with no gap and no repeat,
+     each linked to the one before; a per-room list that names room_head and
+     count must match them. A room with only some of the fields gets a warning
+     in "checked" and no numbering claim; a room with none is read as before.
+     A receipt with serial: true must be a successful create and receipt 1 of
+     its room, the room has no second create and no lost answer (502), and the
+     output says the room is closed to its last action. room_end needs a
+     reason. The output's chain.room_numbering lists each room and says what
+     the numbering shows and what it does not.
 
 Not checked here (by design, today): that the measurement is an approved image.
 Image approval is a signed policy release; that is a later step.
@@ -73,6 +83,7 @@ import argparse
 import base64
 import hashlib
 import http.client
+import itertools
 import json
 import os
 import re
@@ -486,6 +497,169 @@ def room_links(receipts: list[dict]) -> dict:
     return out
 
 
+ORDINARY_ROOM_PROVES = "No receipt of this room is missing from this list, between its first receipt and its last."
+ORDINARY_ROOM_DOES_NOT_PROVE = (
+    "That nothing was still running in the room when the list was read, or that no receipt was signed after it. "
+    "There is no closed verdict for an ordinary room.")
+SERIAL_ROOM_PROVES = (
+    "Every request on a signed route that named the room and reached it through the front before the last receipt "
+    "was signed is in this list, in the order it ran, and none was still running.")
+SERIAL_ROOM_DOES_NOT_PROVE = [
+    ("Reads leave no receipt. A plain heartbeat sent just before the room was marked serial leaves none."),
+    ("A bulk delete, the reaper and an API restart can remove the room without a receipt. A last action that is a "
+     "successful exec, file put or file get shows the room was alive when it ran."),
+    ("Programs left running inside the room: its main process, a program an earlier exec left behind, a process "
+     "started by process_start."),
+    ("A front restart loses the serial mark and the key; a run that spans one fails."),
+]
+NUMBERED_CHECKED = "each numbered room: its receipts run 1 to n with no gap and every link right"
+LIVE_ACTIONS = ("exec", "file_put", "file_get")
+
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _succeeded(st: dict) -> bool:
+    status = st.get("status")
+    return _is_int(status) and 200 <= status < 300
+
+
+def _has_numbering(st: dict) -> bool:
+    return "room_sequence" in st or "room_previous_receipt_sha256" in st
+
+
+def _has_complete_numbering(st: dict) -> bool:
+    return "room_sequence" in st and "room_previous_receipt_sha256" in st
+
+
+def check_room_chain(room: str, rcs: list[dict]) -> list[dict]:
+    """One room's numbered receipts: 1 to n, no gap, no repeat, each linked to the one before.
+
+    Returns the receipts in room order. Every receipt must carry the numbering fields."""
+    for rc in rcs:
+        st = rc["statement"]
+        where = f"room {room}: receipt {st.get('sequence')}"
+        need(_is_int(st.get("room_sequence")), f"{where}: room_sequence is not an integer")
+        prev = st.get("room_previous_receipt_sha256")
+        need(prev is None or (isinstance(prev, str) and HEX64.fullmatch(prev) is not None),
+             f"{where}: room_previous_receipt_sha256 is neither null nor 64 lower-case hex")
+    ordered = sorted(rcs, key=lambda rc: rc["statement"]["room_sequence"])
+    seqs = [rc["statement"]["room_sequence"] for rc in ordered]
+    for n in seqs:
+        need(seqs.count(n) == 1, f"room {room}: room_sequence {n} appears more than once")
+    need(seqs[0] == 1, f"room {room}: room_sequence does not start at 1 (first is {seqs[0]})")
+    for before, after in itertools.pairwise(seqs):
+        need(after == before + 1, f"room {room}: room_sequence jumps from {before} to {after}: a receipt is missing")
+    for i, rc in enumerate(ordered):
+        prev = rc["statement"]["room_previous_receipt_sha256"]
+        if i == 0:
+            need(prev is None, f"room {room}: room receipt 1 must have a null room_previous_receipt_sha256")
+        else:
+            need(prev == ordered[i - 1]["receipt_sha256"],
+                 f"room {room}: room receipt {i + 1} does not link to room receipt {i}")
+    return ordered
+
+
+def check_serial_room(room: str, ordered: list[dict]) -> None:
+    """A serial room: its one create is receipt 1, and no receipt is for a lost answer (502)."""
+    for rc in ordered:
+        st = rc["statement"]
+        if st.get("serial") is True:
+            need(st["room_sequence"] == 1, f"room {room}: receipt {st['sequence']}: "
+                                           "a serial create must be receipt 1 of its room")
+    for rc in ordered:
+        st = rc["statement"]
+        where = f"room {room}: receipt {st['sequence']}"
+        need(st.get("serial") is True or st.get("action") != "create", f"{where}: a second create in a serial room")
+        need(st.get("status") != 502, f"{where}: a lost answer (status 502) in a serial room")
+
+
+def room_numbering(receipts: list[dict], list_doc: dict | None = None) -> dict:
+    """Per-room numbering and serial rooms (the receipts' room_sequence, serial and room_end fields).
+
+    A room whose receipts all carry the numbering fields is checked in full. A room with some of them
+    gets a warning and no claim; a room with none is left as it was. Returns the rooms that were
+    checked and the warnings. list_doc is a per-room list answer: its room_head and count are checked."""
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for rc in receipts:
+        st = rc["statement"]
+        room = st.get("sandbox_id")
+        if isinstance(room, str) and room:
+            groups.setdefault((str(st.get("binding_sha256")), room), []).append(rc)
+    rooms: dict[str, dict] = {}
+    warnings: list[str] = []
+    for (bsha, room), rcs in groups.items():
+        serial_seen = False
+        for rc in rcs:
+            st = rc["statement"]
+            where = f"room {room}: receipt {st.get('sequence')}"
+            if "serial" in st:
+                need(isinstance(st["serial"], bool), f"{where}: serial is not a boolean")
+                if st["serial"]:
+                    need(st.get("action") == "create" and _succeeded(st),
+                         f"{where}: serial is set on a receipt that is not a successful create")
+                    serial_seen = True
+            if st.get("action") == "room_end":
+                reason = st.get("reason")
+                need(isinstance(reason, str) and reason != "", f"{where}: room_end has no reason")
+        flags = [_has_numbering(rc["statement"]) for rc in rcs]
+        complete = [_has_complete_numbering(rc["statement"]) for rc in rcs]
+        if serial_seen:
+            for rc in rcs:
+                if rc["statement"].get("serial") is True:
+                    need(all(complete), f"room {room}: receipt {rc['statement']['sequence']}: "
+                                     "a serial create needs numbered receipts")
+        if not any(flags):
+            continue
+        if not all(complete):
+            kind = "with and without numbering" if not all(flags) else "with incomplete numbering"
+            warnings.append(f"room {room} has receipts {kind}: no numbering claim for it")
+            continue
+        ordered = check_room_chain(room, rcs)
+        if serial_seen:
+            check_serial_room(room, ordered)
+        last = ordered[-1]["statement"]
+        entry = {"receipts": len(ordered), "first": ordered[0]["statement"]["sequence"], "last": last["sequence"],
+                 "head": ordered[-1]["receipt_sha256"]}
+        if serial_seen:
+            entry["serial"] = True
+            entry["closed_to"] = last.get("action")
+            entry["alive_at_last_action"] = True if last.get("action") in LIVE_ACTIONS and _succeeded(last) else None
+        ends = [rc["statement"] for rc in ordered if rc["statement"].get("action") == "room_end"]
+        if ends:
+            entry["ended"] = {"reason": ends[-1]["reason"]}
+        # The same room id under two bindings has two chains: name them apart.
+        key = room if sum(1 for _, r in groups if r == room) == 1 else f"{room}@{bsha[:12]}"
+        rooms[key] = entry
+    if list_doc is not None and "room_head" in list_doc:
+        need(len(groups) <= 1, f"the list names a room_head but holds receipts of {len(groups)} rooms")
+        if not groups:
+            need(list_doc["room_head"] is None, "an empty room list names a nonempty room_head")
+            if "count" in list_doc:
+                need(list_doc["count"] == 0, "an empty room list names a nonzero count")
+        if groups:
+            (_, room), rcs = next(iter(groups.items()))
+            order_key = "room_sequence" if all(_has_complete_numbering(rc["statement"]) for rc in rcs) else "sequence"
+            last_rc = max(rcs, key=lambda rc: rc["statement"][order_key])
+            need(last_rc["receipt_sha256"] == list_doc["room_head"],
+                 f"room {room}: the last receipt is not the room_head the list names")
+            if "count" in list_doc:
+                need(list_doc["count"] == len(rcs), f"room {room}: the list names {list_doc['count']} receipts "
+                                                    f"but holds {len(rcs)}")
+    return {"rooms": rooms, "warnings": warnings}
+
+
+def numbering_words(rooms: dict[str, dict]) -> dict:
+    """What a numbered list shows, and what it does not, in the words the output carries."""
+    serial = [e for e in rooms.values() if e.get("serial")]
+    ordinary = [e for e in rooms.values() if not e.get("serial")]
+    proves = ([ORDINARY_ROOM_PROVES] if ordinary else []) + ([SERIAL_ROOM_PROVES] if serial else [])
+    does_not = ([ORDINARY_ROOM_DOES_NOT_PROVE] if ordinary else []) + (SERIAL_ROOM_DOES_NOT_PROVE if serial else [])
+    return {"rooms": rooms, "proves": proves, "does_not_prove": does_not}
+
+
+
 def check_start_commands(receipts: list[dict]) -> None:
     """Each create's start_command_sha256 matches its start_command (AB#709).
 
@@ -734,6 +908,12 @@ def main() -> int:
                          "live": chain_out}
         checked = ("whole chain to the head the server named" if chain_head is not None
                    else "each receipt; not that none are missing")
+        numbering = room_numbering(receipts, doc if isinstance(doc, dict) else None)
+        if numbering["rooms"]:
+            chain_out["room_numbering"] = numbering_words(numbering["rooms"])
+            checked += "; " + NUMBERED_CHECKED
+        for warning in numbering["warnings"]:
+            checked += "; " + warning
         # Sealed archives have no SNP report. Signature checks on those receipts
         # are useful, but they must not turn an overall attested PASS into a claim
         # that every receipt's binding was SNP-proven (AB#381 HOLD).

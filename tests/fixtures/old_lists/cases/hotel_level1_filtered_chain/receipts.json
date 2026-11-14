@@ -1,0 +1,103 @@
+{
+ "filtered": true,
+ "receipts": [
+  {
+   "receipt_sha256": "f3012e954fa9f2aa1ad9ddd042648be47f44747cf6314b5c55d7bae93d63454e",
+   "signature_b64": "CVPUjB+kSRd38s2sYKFBrUMsK5/MWEc0ZfxrCqzHV4yiXLXLt2+eJUICQT3vFIM4QKv5Gf2MEVwW733Sm5LDDg==",
+   "statement": {
+    "action": "create",
+    "binding_sha256": "e15a571b541f506c3b6d6534a0b7772b1971c4eb31b1f4d222d383a5027acd2b",
+    "command_sha256": null,
+    "customer_request_sha256": "c84a09757ebaad3dbdc07d455da0b62427fff0f874c83fd5d961f5d4503523a1",
+    "hotel": "h1",
+    "image": "alpine:3.20",
+    "image_digest": null,
+    "issued_at": 1700000001,
+    "network_policy": {
+     "allow": [],
+     "mode": "deny_all"
+    },
+    "network_policy_sha256": "b1dad3cb08025f5fd7a1c2419631a24729952344bc0d9cc898afa04e92415f68",
+    "operation_id": "764bcaf2-4462-5d2a-dd51-cd87a44185b0",
+    "previous_receipt_sha256": "e15a571b541f506c3b6d6534a0b7772b1971c4eb31b1f4d222d383a5027acd2b",
+    "result_sha256": "0e405b9869cefa2cf895ca31bfc1f078fa18d539b5c9881beb1dbc18b5884c96",
+    "sandbox_id": "r1",
+    "schema": "cathedral_hotel_receipt_v1",
+    "sequence": 1,
+    "status": 202,
+    "target": "POST /v1/sandboxes/r1"
+   }
+  },
+  {
+   "receipt_sha256": "8d366252ec910053e7f8744c4069fb0994fc370777cae3b4a7ed8418bdfba8e4",
+   "signature_b64": "OoFZx2dapyWeImzoCbtcIGN5yX95kiq1HbCC/26KVebQYRv/mfkIVewkCn7Xx5e8m66wvBVw2ZDQBexzFr11Bw==",
+   "statement": {
+    "action": "exec",
+    "binding_sha256": "e15a571b541f506c3b6d6534a0b7772b1971c4eb31b1f4d222d383a5027acd2b",
+    "command_sha256": "04dc5b2136328a0dcb189df97734c7c72e5e1227fa0c03469a6ce608f32f1b66",
+    "customer_request_sha256": "d2be038545ec6e30cb7e7d9088b3d68f4d0823529fb8b129a396a625c767273d",
+    "hotel": "h1",
+    "image": null,
+    "image_digest": null,
+    "issued_at": 1700000003,
+    "operation_id": "800be84b-1116-e917-7fe3-fca65655e619",
+    "previous_receipt_sha256": "37e3cda06654d94217e8343e2ca9c7ec33cc415ab709bbc634cd807b49dbb0ca",
+    "result_sha256": "1d648848fd3c789c19809e198d2f1607120532808ae0ad5c3fcb9d180c27d82a",
+    "sandbox_id": "r1",
+    "schema": "cathedral_hotel_receipt_v1",
+    "sequence": 3,
+    "status": 200,
+    "target": "POST /v1/sandboxes/r1"
+   }
+  },
+  {
+   "receipt_sha256": "7563bc60245b460287438e509982b516463fb4d047c2927bcc2f2570b5a9daba",
+   "signature_b64": "YzeX5oW/GNE42SoE3Dr+Ma9wORVFN1jr1IbjT2YnR/YOVaxojKhs3j2zpmHakWFSmB/Ig3hMaahvj8ow5UBPBw==",
+   "statement": {
+    "action": "network_set",
+    "binding_sha256": "e15a571b541f506c3b6d6534a0b7772b1971c4eb31b1f4d222d383a5027acd2b",
+    "command_sha256": null,
+    "customer_request_sha256": "fe53a3874e0ce698a53d5936aa4a12825ed878df3010c3ef9bf69ef2207b2ce0",
+    "hotel": "h1",
+    "image": null,
+    "image_digest": null,
+    "issued_at": 1700000004,
+    "network_policy": {
+     "allow": [],
+     "mode": "deny_all"
+    },
+    "network_policy_sha256": "b1dad3cb08025f5fd7a1c2419631a24729952344bc0d9cc898afa04e92415f68",
+    "operation_id": "dad2dd3a-9e8a-334e-9d7a-4932dc714a61",
+    "previous_receipt_sha256": "8d366252ec910053e7f8744c4069fb0994fc370777cae3b4a7ed8418bdfba8e4",
+    "result_sha256": "4643486dc7fa9dca2eeefc63e847948e4ec7052c6d8335a6e7749234d58f0a45",
+    "sandbox_id": "r2",
+    "schema": "cathedral_hotel_receipt_v1",
+    "sequence": 4,
+    "status": 200,
+    "target": "POST /v1/sandboxes/r2"
+   }
+  },
+  {
+   "receipt_sha256": "104f6cab5c55b544f407bba83ebef78ef8ca7d7df4b7c1d5ac73a59ae518327f",
+   "signature_b64": "D6nfHyKQ8J36+64bdFM0S4M0rg6GC5/d6ie4lDxZAU+V3WzZRqM99VJbD49xxekrVPyr1UZXp0wP2MYu+4vcCQ==",
+   "statement": {
+    "action": "delete",
+    "binding_sha256": "e15a571b541f506c3b6d6534a0b7772b1971c4eb31b1f4d222d383a5027acd2b",
+    "command_sha256": null,
+    "customer_request_sha256": "076daa07749ea3741cc9405d2f7d0c7f6fb604f0cbfc9cd6bf888bbc10b34a31",
+    "hotel": "h1",
+    "image": null,
+    "image_digest": null,
+    "issued_at": 1700000005,
+    "operation_id": "83a0f2af-739d-2c4e-8836-c92e92c5101b",
+    "previous_receipt_sha256": "7563bc60245b460287438e509982b516463fb4d047c2927bcc2f2570b5a9daba",
+    "result_sha256": "f742667927fe6a489c2d30596454c13758742dec1d7e9c4f859f3ad582607d83",
+    "sandbox_id": "r1",
+    "schema": "cathedral_hotel_receipt_v1",
+    "sequence": 5,
+    "status": 200,
+    "target": "POST /v1/sandboxes/r1"
+   }
+  }
+ ]
+}
