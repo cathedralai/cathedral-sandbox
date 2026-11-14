@@ -79,7 +79,7 @@ def test_fork_of_snapshot_without_committed_image_is_409(fake, provider) -> None
     runs_before = len(fake.calls_of("run"))
     with pytest.raises(SandboxOpError) as err:
         _fork(provider, snap_id)
-    assert (err.value.code, err.value.http_status) == ("snapshot_image_missing", 409)
+    assert (err.value.code, err.value.http_status) == ("snapshot_corrupt", 409)  # AB#604 D5: was snapshot_image_missing
     assert len(fake.calls_of("run")) == runs_before
 
 
@@ -782,3 +782,287 @@ def test_a_capture_that_commits_no_image_is_an_error_with_no_record_and_no_file(
     assert (err.value.code, err.value.http_status) == ("snapshot_image_missing", 409)
     assert provider.list_snapshots() == [] and not list(provider._inner._base.glob("snap_*"))  # noqa: SLF001
     assert fake.calls_of("pause") == [] and fake.calls_of("commit") == []
+
+
+# ======================================================================== AB#604 CS-2: fork safety (plan section 8, D5 to D8)
+import os
+import tarfile as _tarfile
+from datetime import timedelta
+
+
+def _room_with_file(provider, payload: bytes | None = None, **create):
+    payload = payload if payload is not None else os.urandom(4000)  # random: it does not compress, so the tar is not tiny
+    req = CreateSandboxRequest(image=ImageSource(image="alpine:3.20"), resources=RES, **create)
+    sid = provider.create(req, api_key="k", idempotency=None, body_digest="src")["id"]
+    provider.write_file(sid, "/work/a.txt", payload, None)
+    return sid, payload
+
+
+def _captured(provider, **create):
+    sid, payload = _room_with_file(provider, **create)
+    result = _snapshot(provider, sid)
+    path, _ = provider._inner._snapshots[result["snapshot_id"]]  # noqa: SLF001
+    return result, Path(path), payload
+
+
+def _other_tar() -> bytes:
+    import io
+
+    buf = io.BytesIO()
+    with _tarfile.open(fileobj=buf, mode="w:gz") as t:
+        info = _tarfile.TarInfo("evil.txt")
+        info.size = 4
+        t.addfile(info, io.BytesIO(b"evil"))
+    return buf.getvalue()
+
+
+def _fork_root(provider, doc) -> Path:
+    return Path(provider._inner._sandboxes[doc["id"]].root) / "work"  # noqa: SLF001
+
+
+def _nothing_started(fake, provider, runs_before: int) -> None:
+    assert len(fake.calls_of("run")) == runs_before
+    assert provider.quota()["usage"]["resident_sandboxes"] == 1  # the source room only
+    assert len([p for p in provider._inner._base.iterdir() if p.name.startswith("sbx_")]) == 1  # noqa: SLF001
+
+
+# ---------------------------------------------------------------- D5: one read, one digest
+def test_a_good_tar_starts_the_fork_with_the_files(fake, provider) -> None:
+    result, path, payload = _captured(provider)
+    doc = _fork(provider, result["snapshot_id"])
+    assert (_fork_root(provider, doc) / "a.txt").read_bytes() == payload
+
+
+def _tamper_one_byte(path: Path) -> None:
+    data = bytearray(path.read_bytes())
+    data[len(data) // 2] ^= 0x01
+    path.write_bytes(bytes(data))
+
+
+@pytest.mark.parametrize("tamper", [
+    _tamper_one_byte,
+    lambda p: p.write_bytes(p.read_bytes()[: len(p.read_bytes()) // 2]),  # truncated
+    lambda p: p.write_bytes(_other_tar()),  # a valid tar of other files
+], ids=["one_byte", "truncated", "other_valid_tar"])
+def test_a_tar_changed_on_disk_after_the_capture_never_starts_a_room(fake, provider, tamper) -> None:
+    result, path, _ = _captured(provider)
+    tamper(path)
+    runs = len(fake.calls_of("run"))
+    with pytest.raises(SandboxOpError) as err:
+        _fork(provider, result["snapshot_id"])
+    assert (err.value.code, err.value.http_status) == ("snapshot_corrupt", 409)
+    _nothing_started(fake, provider, runs)
+
+
+class _SlowReader:
+    """A reader that gives 64 bytes, then lets the test act, then gives the rest."""
+
+    def __init__(self, path: Path, between) -> None:
+        self._fh = open(path, "rb")
+        self._between = between
+        self._reads = 0
+
+    def read(self, n: int = -1) -> bytes:
+        self._reads += 1
+        if self._reads == 1:
+            return self._fh.read(64)
+        if self._reads == 2:
+            self._between()
+        return self._fh.read(n)
+
+    def close(self) -> None:
+        self._fh.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def test_a_tar_changed_in_place_during_the_read_never_starts_a_room(fake, provider, monkeypatch) -> None:
+    result, path, _ = _captured(provider)
+
+    def flip() -> None:
+        with open(path, "r+b") as fh:
+            fh.seek(300)
+            fh.write(b"\xff")
+
+    monkeypatch.setattr(sandbox_provider, "_open_snapshot_archive", lambda p: _SlowReader(p, flip))
+    runs = len(fake.calls_of("run"))
+    with pytest.raises(SandboxOpError) as err:
+        _fork(provider, result["snapshot_id"])
+    assert err.value.code == "snapshot_corrupt"
+    _nothing_started(fake, provider, runs)
+
+
+def test_a_tar_swapped_by_path_during_the_read_cannot_put_other_files_in_the_fork(fake, provider, monkeypatch) -> None:
+    result, path, payload = _captured(provider)
+
+    def swap() -> None:
+        other = path.with_name("swap.tmp")
+        other.write_bytes(_other_tar())
+        os.replace(other, path)
+
+    monkeypatch.setattr(sandbox_provider, "_open_snapshot_archive", lambda p: _SlowReader(p, swap))
+    try:
+        doc = _fork(provider, result["snapshot_id"])
+    except SandboxOpError as err:
+        assert err.code == "snapshot_corrupt"
+        return
+    # If it started, it started from the bytes the digest covered: the first file, not the swapped one.
+    assert (_fork_root(provider, doc) / "a.txt").read_bytes() == payload
+    assert not (_fork_root(provider, doc) / "evil.txt").exists()
+
+
+def test_a_fork_opens_the_stored_tar_once(fake, provider, monkeypatch) -> None:
+    result, path, _ = _captured(provider)
+    opened = []
+    real = sandbox_provider._open_snapshot_archive
+    monkeypatch.setattr(sandbox_provider, "_open_snapshot_archive", lambda p: (opened.append(p), real(p))[1])
+    _fork(provider, result["snapshot_id"])
+    assert opened == [path]
+
+
+def test_the_fork_starts_the_records_committed_image(fake, provider) -> None:
+    result, _, _ = _captured(provider)
+    doc = _fork(provider, result["snapshot_id"])
+    argv = next(c["argv"] for c in fake.state["containers"].values() if c["labels"].get("cathedral.sandbox.id") == doc["id"])
+    assert result["committed_image_id"] in argv
+
+
+def test_an_image_with_another_id_is_snapshot_corrupt(fake, provider) -> None:
+    result, _, _ = _captured(provider)
+    fake.set_image_id(f"cathedral-snap-{result['snapshot_id']}:latest", "sha256:" + "ab" * 32)
+    runs = len(fake.calls_of("run"))
+    with pytest.raises(SandboxOpError) as err:
+        _fork(provider, result["snapshot_id"])
+    assert (err.value.code, err.value.http_status) == ("snapshot_corrupt", 409)
+    _nothing_started(fake, provider, runs)
+
+
+def test_a_missing_image_is_snapshot_corrupt(fake, provider) -> None:
+    result, _, _ = _captured(provider)
+    state = fake.state
+    state["images"].remove(f"cathedral-snap-{result['snapshot_id']}:latest")
+    fake._save(state)  # noqa: SLF001
+    runs = len(fake.calls_of("run"))
+    with pytest.raises(SandboxOpError) as err:
+        _fork(provider, result["snapshot_id"])
+    assert err.value.code == "snapshot_corrupt"
+    _nothing_started(fake, provider, runs)
+
+
+# ---------------------------------------------------------------- D6: a fork checks the expiry itself
+def test_a_fork_of_an_expired_snapshot_is_refused_before_the_sweep_runs(fake, provider) -> None:
+    # The code's own name for a snapshot that is not usable is 404 snapshot_not_found; there is no separate "expired" error.
+    result, path, _ = _captured(provider)
+    snap_id = result["snapshot_id"]
+    _, rec = provider._inner._snapshots[snap_id]  # noqa: SLF001
+    from dataclasses import replace
+
+    provider._inner._snapshots[snap_id] = (path, replace(rec, created_at=rec.created_at - timedelta(seconds=rec.ttl_seconds + 1)))  # noqa: SLF001
+    runs = len(fake.calls_of("run"))
+    with pytest.raises(SandboxOpError) as err:
+        _fork(provider, snap_id)
+    assert (err.value.code, err.value.http_status) == ("snapshot_not_found", 404)
+    assert len(fake.calls_of("run")) == runs
+
+
+# ---------------------------------------------------------------- D7: only the fork call starts a snapshot image
+def _create_image(provider, ref: str):
+    return provider.create(CreateSandboxRequest(image=ImageSource(image=ref), resources=RES), api_key="k", idempotency=None, body_digest="plain:" + ref)
+
+
+def test_a_plain_create_from_a_snapshot_image_is_refused_in_every_form(fake, provider) -> None:
+    result, _, _ = _captured(provider)
+    name = f"cathedral-snap-{result['snapshot_id']}:latest"
+    image_id = result["committed_image_id"]
+    fake.add_image("retagged:1", alias_of=name)  # another tag on the same image
+    forms = [image_id, image_id.removeprefix("sha256:"), name, f"cathedral-snap-{result['snapshot_id']}",
+             f"cathedral-snap-{result['snapshot_id']}@{image_id}", "retagged:1"]
+    runs = len(fake.calls_of("run"))
+    for ref in forms:
+        with pytest.raises(SandboxOpError) as err:
+            _create_image(provider, ref)
+        assert (err.value.code, err.value.http_status) == ("snapshot_image_fork_only", 400), ref
+    assert len(fake.calls_of("run")) == runs
+    # The image with a digest field of its own: refused too.
+    with pytest.raises(SandboxOpError) as err:
+        provider.create(CreateSandboxRequest(image=ImageSource(image=name, digest=image_id), resources=RES), api_key="k", idempotency=None, body_digest="d")
+    assert err.value.code == "snapshot_image_fork_only"
+
+
+def test_the_fork_call_still_starts_a_snapshot_image_and_an_ordinary_image_is_untouched(fake, provider) -> None:
+    result, _, _ = _captured(provider)
+    assert _fork(provider, result["snapshot_id"])["guest"]["image"] == f"cathedral-snap-{result['snapshot_id']}:latest"
+    assert _create_image(provider, "alpine:3.20")["guest"]["image"] == "alpine:3.20"
+
+
+# ---------------------------------------------------------------- D8: create-time env is blanked in the fork
+def _commit_changes(fake) -> list[str]:
+    (argv,) = fake.calls_of("commit")
+    return [argv[i + 1] for i, a in enumerate(argv) if a == "--change"]
+
+
+def test_the_commit_blanks_each_create_time_variable_and_only_those(fake, provider) -> None:
+    # The fake shows the docker argv only. Whether docker keeps -e values in a commit at all, and
+    # whether --change ENV NAME= blanks them under runsc, is real-machine step T2. The name stays, with an empty value.
+    _captured(provider, env={"API_TOKEN": "s3cret", "MODE": "x"})
+    assert sorted(_commit_changes(fake)) == ["ENV API_TOKEN=", "ENV MODE="]
+
+
+def test_a_room_without_create_time_env_commits_with_no_change(fake, provider) -> None:
+    _captured(provider)
+    assert _commit_changes(fake) == []  # a variable the image sets itself is not named, so it is not blanked
+
+
+def test_the_forks_own_env_wins_and_the_first_rooms_values_are_not_passed_on(fake, provider) -> None:
+    result, _, _ = _captured(provider, env={"API_TOKEN": "s3cret", "MODE": "x"})
+    src_id = next(iter(provider._guests))  # noqa: SLF001
+    provider._guests[src_id].env_overlay = {"SEALED": "v"}  # noqa: SLF001  a sealed overlay on the first room
+    req = CreateSandboxRequest(snapshot_id=result["snapshot_id"], resources=RES, env={"API_TOKEN": "fork-own"})
+    doc = provider.create(req, api_key="k", idempotency=None, body_digest="f")
+    argv = next(c["argv"] for c in fake.state["containers"].values() if c["labels"].get("cathedral.sandbox.id") == doc["id"])
+    passed = [argv[i + 1] for i, a in enumerate(argv) if a == "-e"]
+    assert "API_TOKEN=fork-own" in passed
+    assert not [e for e in passed if e.startswith(("MODE=", "SEALED=")) or e == "API_TOKEN=s3cret"]
+    assert provider._guests[doc["id"]].env_overlay == {}  # noqa: SLF001
+    assert not any(src_id in " ".join(a) for a in [argv] if "-v" in a and f"{src_id}/secrets" in " ".join(a))
+
+
+# ---------------------------------------------------------------- the sweep that retries image removal
+def test_an_image_whose_removal_failed_is_retried_by_later_sweeps(fake, provider) -> None:
+    result, _, _ = _captured(provider)
+    snap_id, image = result["snapshot_id"], f"cathedral-snap-{result['snapshot_id']}:latest"
+    fake.set(image_rm_fail_times=2)
+    assert provider.delete_snapshot(snap_id) is True
+    assert image in fake.state["images"] and image in provider.pending_image_removals()
+    for _ in range(4):
+        provider.sweep()
+    assert image not in fake.state["images"] and provider.pending_image_removals() == {}
+
+
+def test_an_expired_snapshots_image_is_retried_too(fake, provider) -> None:
+    result, path, _ = _captured(provider)
+    snap_id, image = result["snapshot_id"], f"cathedral-snap-{result['snapshot_id']}:latest"
+    _, rec = provider._inner._snapshots[snap_id]  # noqa: SLF001
+    from dataclasses import replace
+
+    provider._inner._snapshots[snap_id] = (path, replace(rec, created_at=rec.created_at - timedelta(seconds=rec.ttl_seconds + 1)))  # noqa: SLF001
+    fake.set(image_rm_fail_times=1)
+    provider.sweep()
+    assert image in fake.state["images"] and image in provider.pending_image_removals()
+    provider.sweep()
+    assert image not in fake.state["images"] and provider.pending_image_removals() == {}
+
+
+def test_a_snapshot_delete_that_could_not_remove_the_image_says_so_over_http(fake, provider) -> None:
+    app = SandboxApplication(provider)
+    result, _, _ = _captured(provider)
+    fake.set(image_rm_fail_times=1)
+    response = app.dispatch("DELETE", f"/v1/snapshots/{result['snapshot_id']}", {"Authorization": "Bearer k"}, b"")
+    assert response.status == 200 and json.loads(response.body) == {"deleted": True, "image_removal": "pending"}
+    other, _, _ = _captured(provider)  # a clean delete keeps the old answer exactly
+    clean = app.dispatch("DELETE", f"/v1/snapshots/{other['snapshot_id']}", {"Authorization": "Bearer k"}, b"")
+    assert json.loads(clean.body) == {"deleted": True}

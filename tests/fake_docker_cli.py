@@ -123,6 +123,12 @@ def main(argv):
 
     if cmd == "image" and argv[1] == "rm":
         with Locked() as st:
+            # image_rm_fail_times: the next N removals fail (an image a running room still uses).
+            left = st["behaviour"].get("image_rm_fail_times", 0)
+            if left:
+                st["behaviour"]["image_rm_fail_times"] = left - 1
+                print(f"Error response from daemon: conflict: unable to delete {argv[-1]} (image is being used)", file=sys.stderr)
+                return 1
             if argv[-1] in st["images"]:
                 st["images"].remove(argv[-1])
         return 0
