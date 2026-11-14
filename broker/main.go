@@ -224,6 +224,7 @@ type hotel struct {
 	queued       int
 	creating     int
 	backoffUntil time.Time
+	restFull     bool            // the current rest (backoffUntil) is a 429 from the hotel: it said it is full; read only by snapshotNoRoom
 	ok           bool            // health answered within okWindow, or room calls did (see syncHotel)
 	warm         map[string]bool // catalog images pulled since the hotel last came up (prewarm.go)
 	warmGen      int             // bumped when the hotel goes down, so a stale prewarm marks nothing
@@ -917,6 +918,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 				ra = 2
 			}
 			h.backoffUntil = time.Now().Add(time.Duration(ra) * time.Second)
+			h.restFull = true
 			b.mu.Unlock()
 			last = createResult{status: 429, header: http.Header{"Retry-After": {strconv.Itoa(ra)}}, body: out}
 			continue // try another hotel
@@ -940,6 +942,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			if err != nil || (status >= 500 && !guestImage) || status == 401 || (status == 403 && !ownerRefused) {
 				h.failed++
 				h.backoffUntil = time.Now().Add(hotelFailBackoff)
+				h.restFull = false
 			}
 			if err != nil {
 				// The hotel may have started the room before the answer was lost.

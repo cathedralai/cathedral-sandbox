@@ -579,7 +579,7 @@ func TestForkWaitsForTheOwnerHotelInsteadOfScattering(t *testing.T) {
 	tc.b.mu.Unlock()
 	before := createsOn(tc)
 	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"snapshot_id": snapID})
-	if status != 503 || errCode(doc) != "snapshot_hotel_unavailable" {
+	if status != 503 || errCode(doc) != "snapshot_hotel_sold_out" {
 		t.Fatalf("fork to a draining owner: %d %v", status, doc)
 	}
 	if after := createsOn(tc); after["a"] != before["a"] || after["b"] != before["b"] {
