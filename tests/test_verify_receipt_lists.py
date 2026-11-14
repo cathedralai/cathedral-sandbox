@@ -389,10 +389,6 @@ def _edit(**members):
     return lambda r: r["request"].update(members)
 
 
-def _log_roomy(r):
-    r["request"]["outputs"][1]["max_bytes"] = 1048576
-
-
 # (rule, knobs exactly at the bound, knobs one step past it, the reason the past case must give)
 BOUNDS = [
     ("image is pinned by digest", {}, {"truth_edit": _edit(image="images.example.test/app:latest")},
@@ -418,16 +414,16 @@ BOUNDS = [
      {"truth_edit": _edit(outputs=[{"path": "/work/out/x", "max_bytes": 9, "optional": False}]), "held": (), "inline": ()},
      {"truth_edit": _edit(outputs=[{"path": "/tmp/log.txt", "max_bytes": 9, "optional": False}]), "held": (), "inline": ()},
      "recipe: an output path must be under /work/out/"),
-    ("output max_bytes at most 200 MiB",
-     {"truth_edit": _edit(outputs=[{"path": "/work/out/x", "max_bytes": 209715200, "optional": False}]), "held": (), "inline": ()},
-     {"truth_edit": _edit(outputs=[{"path": "/work/out/x", "max_bytes": 209715201, "optional": False}]), "held": (), "inline": ()},
-     "recipe: an output max_bytes must be at most 200 MiB"),
+    ("output max_bytes at most 64 KiB",
+     {"truth_edit": _edit(outputs=[{"path": "/work/out/x", "max_bytes": 65536, "optional": False}]), "held": (), "inline": ()},
+     {"truth_edit": _edit(outputs=[{"path": "/work/out/x", "max_bytes": 65537, "optional": False}]), "held": (), "inline": ()},
+     "recipe: an output max_bytes must be at most 65536"),
     ("timeout_seconds at least 1", {"truth_edit": _edit(timeout_seconds=1)}, {"truth_edit": _edit(timeout_seconds=0)},
      "recipe: timeout_seconds must be at least 1"),
     ("context at most 4 KiB", {"truth_context": {"k": "a" * 4088}}, {"truth_context": {"k": "a" * 4089}},
      "inputs: the context is larger than 4 KiB (4096 canonical bytes)"),
-    ("inline output at most 64 KiB", {"truth_edit": _log_roomy, "file_bytes": {"/work/out/log.txt": b"x" * 65536}},
-     {"truth_edit": _log_roomy, "file_bytes": {"/work/out/log.txt": b"x" * 65537}},
+    ("inline output at most 64 KiB", {"file_bytes": {"/work/out/log.txt": b"x" * 65536}},
+     {"file_bytes": {"/work/out/log.txt": b"x" * 65537}},
      "check 7: the inline bytes of /work/out/log.txt are 65537 bytes, over the 64 KiB an inline output may have"),
 ]
 
@@ -462,7 +458,8 @@ def test_each_form_rule_refuses_one_step_past_its_bound(rule, case, knobs, reaso
 
 
 RECIPE_PREFIX, FILE_PREFIX = "recipe: ", "check 8: the file's request: "
-MAX_SPEND_RULE = "max_spend_usd must be an integer of at least 1 or a decimal string greater than zero"
+MAX_SPEND_RULE = ("max_spend_usd must be an integer from 1 to 999999999999, or a decimal string of 1 to 12 digits "
+                  "and up to 6 decimals, greater than zero")
 
 
 def _valid_request() -> dict:
@@ -491,6 +488,12 @@ REQUEST_LIMIT_CASES = [
     ("timeout is not a boolean", {"timeout_seconds": True}, "timeout_seconds must be an integer"),
     ("max_spend is not a boolean", {"max_spend_usd": True}, MAX_SPEND_RULE),
     ("max_spend zero", {"max_spend_usd": 0}, MAX_SPEND_RULE),
+    ("max_spend 13 digit integer", {"max_spend_usd": 1000000000000}, MAX_SPEND_RULE),
+    ("max_spend 13 digit string", {"max_spend_usd": "1000000000000"}, MAX_SPEND_RULE),
+    ("max_spend double zero", {"max_spend_usd": "00.50"}, MAX_SPEND_RULE),
+    ("max_spend long string", {"max_spend_usd": "9" * 5000}, MAX_SPEND_RULE),
+    ("output max_bytes 65537", {"outputs": [{"path": "/work/out/x", "max_bytes": 65537}]},
+     "an output max_bytes must be at most 65536"),
     ("max_spend a float", {"max_spend_usd": 1.5}, MAX_SPEND_RULE),
     ("max_spend zero string", {"max_spend_usd": "0.0"}, MAX_SPEND_RULE),
     ("max_spend exponent", {"max_spend_usd": "1e3"}, MAX_SPEND_RULE),
@@ -580,7 +583,8 @@ def test_json_depth_is_counted_on_the_raw_text_and_skips_strings() -> None:
     assert vr.JSON_MAX_DEPTH == 64
 
 
-@pytest.mark.parametrize("value", [1, 7, "0.50", "12", "0.000001", "100.123456", "0.1", "9"])
+@pytest.mark.parametrize("value", [1, 7, "0.50", "12", "0.000001", "100.123456", "0.1", "9", 999999999999,
+                                   "999999999999.999999", "0"+".5"])
 def test_request_limits_accepts_each_max_spend_form(value) -> None:
     vr = _load_checker()
     for prefix in (RECIPE_PREFIX, FILE_PREFIX):
@@ -604,22 +608,40 @@ def assemble_bundle(case: Path) -> dict:
 
     machine, caller = case / "machine", case / "caller"
     b64 = lambda raw: base64.b64encode(raw).decode()
-    receipts = [json.loads(base64.urlsafe_b64decode(p.read_text())) for p in sorted(machine.glob("[0-9][0-9]_*.header"))]
+
+    def exact(doc, members, what):
+        """The assembler reads only what it knows: an unknown or missing member is a failure, not a silent skip."""
+        assert isinstance(doc, dict) and set(doc) == set(members), f"{what}: {sorted(doc)} is not {sorted(members)}"
+        return doc
+
+    receipts = [exact(json.loads(base64.urlsafe_b64decode(p.read_text())), ("statement", "signature_b64",
+                                                                            "receipt_sha256"), "receipt")
+                for p in sorted(machine.glob("[0-9][0-9]_*.header"))]
     pem = (machine / "amd" / "cert_chain_pem.txt").read_text()
     blocks = re.findall(r"-----BEGIN CERTIFICATE-----\n(.*?)\n-----END CERTIFICATE-----", pem, re.DOTALL)
     ask, ark = (b64(base64.b64decode("".join(block.split()))) for block in blocks)
-    post = json.loads((caller / "post_body.json").read_text())
+    post = exact(json.loads((caller / "post_body.json").read_text()), (
+        "image", "image_id", "command", "env", "size", "timeout_seconds", "network", "inputs", "outputs", "context",
+        "max_spend_usd"), "POST body")
     request = {k: v for k, v in post.items() if k != "inputs"}
-    request["inputs"] = [{"path": i["path"], "sha256": i["sha256"], "mode": i["mode"]} for i in post["inputs"]]
+    request["inputs"] = [{k: v for k, v in exact(i, ("path", "sha256", "content_b64", "mode"), "POST input").items()
+                          if k != "content_b64"} for i in post["inputs"]]
+    broker_answer = exact(json.loads((machine / "01_create.response").read_text()), (
+        "id", "state", "network", "hotel", "isolation", "create_request_b64"), "broker 202")
+    exact(broker_answer["isolation"], ("hotel_sealed", "hotel_tee", "room_runtime", "attested_per_room",
+                                       "network_mode", "attestation_of_host"), "isolation")
+    accepted = exact(json.loads((caller / "response_202.json").read_text()), (
+        "oneshot_id", "state", "status_url", "reserved_usd"), "API 202")
     answer = (machine / "05_get_output.response").read_bytes()
     return {
         "schema": "cathedral_oneshot_bundle_v1",
-        "oneshot_id": json.loads((caller / "response_202.json").read_text())["oneshot_id"],
+        "oneshot_id": accepted["oneshot_id"],
         "request": request,
-        "attestation": json.loads((machine / "hotel_attestation_answer.json").read_text()),
+        "attestation": exact(json.loads((machine / "hotel_attestation_answer.json").read_text()),
+                             ("binding", "binding_sha256", "report_b64"), "attestation"),
         "amd_certs": {"vcek": b64((machine / "amd" / "vcek_der.bin").read_bytes()), "ask": ask, "ark": ark},
         "receipts": receipts,
-        "create_request_b64": json.loads((machine / "01_create.response").read_text())["create_request_b64"],
+        "create_request_b64": broker_answer["create_request_b64"],
         "exec_request_b64": b64((machine / "exec_request.json").read_bytes()),
         "exec_response_b64": b64((machine / "04_exec.response").read_bytes()),
         "inline_outputs": {o["path"]: b64(answer) for o in post["outputs"] if len(answer) <= 64 * 1024},
@@ -695,3 +717,137 @@ def test_ordinary_good_runs_keep_outputs_at_or_under_the_inline_size() -> None:
             continue
         recipe = json.loads((folder / "recipe.json").read_text())
         assert all(o["max_bytes"] <= 65536 for o in recipe["request"]["outputs"]), folder.name
+
+
+def _copy_exchange(tmp_path: Path) -> Path:
+    import shutil
+
+    target = tmp_path / "case"
+    shutil.copytree(EXCHANGE, target)
+    return target
+
+
+def _rewrite(path: Path, edit) -> None:
+    doc = json.loads(path.read_text())
+    edit(doc)
+    path.write_text(json.dumps(doc))
+
+
+@pytest.mark.parametrize("path, edit", [
+    ("machine/01_create.response", lambda d: d.update(extra=1)),
+    ("machine/01_create.response", lambda d: d["isolation"].update(extra=1)),
+    ("machine/01_create.response", lambda d: d.pop("hotel")),
+    ("machine/hotel_attestation_answer.json", lambda d: d.update(extra=1)),
+    ("caller/post_body.json", lambda d: d.update(extra=1)),
+    ("caller/post_body.json", lambda d: d["inputs"][0].update(extra=1)),
+    ("caller/post_body.json", lambda d: d["inputs"][0].pop("mode")),
+    ("caller/response_202.json", lambda d: d.update(extra=1)),
+    ("caller/response_202.json", lambda d: d.pop("reserved_usd")),
+], ids=["create-extra", "isolation-extra", "create-missing", "attestation-extra", "post-extra", "input-extra",
+        "input-missing", "202-extra", "202-missing"])
+def test_the_reference_assembler_fails_on_a_member_it_does_not_know(path, edit, tmp_path) -> None:
+    """A reader that skips what it does not know would pass a changed shape: this one must not."""
+    case = _copy_exchange(tmp_path)
+    _rewrite(case / path, edit)
+    with pytest.raises(AssertionError):
+        assemble_bundle(case)
+
+
+def test_the_reference_assembler_fails_on_a_receipt_header_with_another_member(tmp_path) -> None:
+    import base64
+
+    case = _copy_exchange(tmp_path)
+    header = case / "machine" / "01_create.header"
+    doc = json.loads(base64.urlsafe_b64decode(header.read_text()))
+    doc["extra"] = 1
+    header.write_text(base64.urlsafe_b64encode(_canonical(doc)).decode())
+    with pytest.raises(AssertionError):
+        assemble_bundle(case)
+
+
+def _run_exchange_with(tmp_path: Path, bundle: dict) -> tuple[int, dict]:
+    case = json.loads((EXCHANGE / "case.json").read_text())
+    path = tmp_path / "bundle.json"
+    path.write_text(json.dumps(bundle))
+    args = [a.replace("{dir}/expected/bundle.json", str(path)).replace("{dir}", str(EXCHANGE)) for a in case["args"]]
+    code, out, err = _run_cli(*args)
+    assert "Traceback" not in err, err
+    return code, json.loads(out)
+
+
+def _bundle() -> dict:
+    return json.loads((EXCHANGE / "expected" / "bundle.json").read_text())
+
+
+def _set(*path_and_value):
+    *path, value = path_and_value
+
+    def edit(b):
+        node = b
+        for part in path[:-1]:
+            node = node[part]
+        node[path[-1]] = value
+    return edit
+
+
+def _pop(*path):
+    def edit(b):
+        node = b
+        for part in path[:-1]:
+            node = node[part]
+        del node[path[-1]]
+    return edit
+
+
+SHAPE_MUTATIONS = [
+    ("top-level member", _set("extra", 1), "check 1: the file has an unknown member extra"),
+    ("not_proven missing", _pop("not_proven"), "check 1: the file has no not_proven"),
+    ("not_proven null", _set("not_proven", None), "check 1: not_proven is not a list of strings"),
+    ("not_proven string", _set("not_proven", "none"), "check 1: not_proven is not a list of strings"),
+    ("not_proven numbers", _set("not_proven", [1]), "check 1: not_proven is not a list of strings"),
+    ("inline_outputs missing", _pop("inline_outputs"), "check 1: the file has no inline_outputs"),
+    ("attestation member", _set("attestation", "extra", 1), "check 1: attestation has an unknown member extra"),
+    ("attestation missing", _pop("attestation", "binding_sha256"), "check 1: attestation has no binding_sha256"),
+    ("amd_certs member", _set("amd_certs", "extra", "x"), "check 1: amd_certs has an unknown member extra"),
+    ("receipt member", _set("receipts", 0, "extra", 1), "check 1: a receipt has an unknown member extra"),
+    ("receipt missing", _pop("receipts", 2, "receipt_sha256"), "check 1: a receipt has no receipt_sha256"),
+    ("input without mode", _pop("request", "inputs", 0, "mode"),
+     "check 8: the file's request: an input must hold exactly path, sha256 and mode"),
+    ("input member", _set("request", "inputs", 0, "extra", 1),
+     "check 8: the file's request: an input must hold exactly path, sha256 and mode"),
+    ("receipts swapped", lambda b: b["receipts"].insert(1, b["receipts"].pop(2)),
+     "check 2: room run-room-1: the receipts are not in the order of their room numbers"),
+    ("receipts rotated", lambda b: b["receipts"].append(b["receipts"].pop(0)),
+     "check 2: room run-room-1: the receipts are not in the order of their room numbers"),
+]
+
+
+@pytest.mark.parametrize("rule, edit, reason", SHAPE_MUTATIONS, ids=[m[0] for m in SHAPE_MUTATIONS])
+def test_a_changed_exchange_file_is_refused_for_the_member_it_names(rule, edit, reason, tmp_path) -> None:
+    bundle = _bundle()
+    edit(bundle)
+    code, out = _run_exchange_with(tmp_path, bundle)
+    assert code == 1 and out == {"verdict": "FAIL", "reason": reason}, (rule, out)
+
+
+def test_the_exchange_file_with_reasons_in_not_proven_still_passes(tmp_path) -> None:
+    bundle = _bundle()
+    bundle["not_proven"] = ["a plain reason the API saw"]
+    code, out = _run_exchange_with(tmp_path, bundle)
+    assert code == 0 and out["verdict"] == "PASS"
+
+
+def test_digit_runs_and_depth_are_counted_on_the_raw_text() -> None:
+    vr = _load_checker()
+    assert vr.json_shape('{"a": 12345, "b": "99999999", "c": [1.25e10]}') == (2, 5)
+    assert vr.json_shape("[" * 7 + "1" * 300 + "]" * 7) == (7, 300)
+    for text, what in (("[" + "1" * 101 + "]", "holds a number of more than 100 digits"),):
+        with pytest.raises(vr.Fail, match=what):
+            vr.strict_json(text.encode(), "p", "x")
+    assert vr.strict_json(("[" + "1" * 100 + "]").encode(), "p", "x") == [int("1" * 100)]
+
+
+def test_a_port_of_thousands_of_digits_is_a_clean_refusal() -> None:
+    vr = _load_checker()
+    with pytest.raises(vr.Fail, match="not a valid allowlist entry"):
+        vr.canonical_policy("allowlist", ["a.org:" + "9" * 5000])

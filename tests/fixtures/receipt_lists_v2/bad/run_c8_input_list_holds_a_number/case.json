@@ -20,7 +20,7 @@
  "description": "The file's input list holds a number besides the inputs.",
  "expect": {
   "exit_code": 1,
-  "reason": "check 8: the request in the file differs from the recipe in inputs",
+  "reason": "check 8: the file's request: an input must hold exactly path, sha256 and mode",
   "verdict": "FAIL"
  }
 }

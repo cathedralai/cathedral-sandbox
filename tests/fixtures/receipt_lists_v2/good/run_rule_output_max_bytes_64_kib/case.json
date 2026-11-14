@@ -15,7 +15,7 @@
   "--input-sha256",
   "/work/in/data.csv=492d5ea496056f1a6a6592241032fab764c321596317930b4fa0e1e8bc3b7470"
  ],
- "description": "An output max_bytes of exactly 200 MiB.",
+ "description": "An output max_bytes of exactly 64 KiB.",
  "expect": {
   "exit_code": 0,
   "verdict": "PASS"

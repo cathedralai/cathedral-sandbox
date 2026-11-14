@@ -28,16 +28,21 @@
     "path": "/work/in/data.csv"
    }
   ],
-  "max_spend_usd": "0.50",
+  "max_spend_usd": "00.50",
   "network": {
    "allow": [],
    "mode": "deny_all"
   },
   "outputs": [
    {
-    "max_bytes": 209715200,
+    "max_bytes": 65536,
     "optional": false,
     "path": "/work/out/result.json"
+   },
+   {
+    "max_bytes": 65536,
+    "optional": true,
+    "path": "/work/out/log.txt"
    }
   ],
   "size": "sealed-1x2",
