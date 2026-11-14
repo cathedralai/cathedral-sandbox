@@ -183,10 +183,11 @@ def test_heartbeat_stays_unsigned(front) -> None:
 
 
 def test_a_params_suffix_does_not_skip_signing(front) -> None:
-    # The API routes on urlparse(path).path, which drops ";p"; the front must match the same path.
+    # The API routes on urlparse(path).path, which drops ";p"; the front matches that path and, as on main,
+    # forwards and records the canonical path (gate, receipt and API agree).
     port, seen, _ledger, _ = front
     status, headers, _out = _call(port, "PUT", "/v1/sandboxes/sbx_9/tar;p?path=/work", _tar("x"))
-    assert status == 200 and seen[-1][1] == "/v1/sandboxes/sbx_9/tar;p?path=/work"
+    assert status == 200 and seen[-1][1] == "/v1/sandboxes/sbx_9/tar?path=/work"
     st = _statement(headers)
     assert st["action"] == "tar_put" and st["sandbox_id"] == "sbx_9"
-    assert st["target"] == "PUT /v1/sandboxes/sbx_9/tar;p?path=/work"
+    assert st["target"] == "PUT /v1/sandboxes/sbx_9/tar?path=/work"
