@@ -1460,3 +1460,28 @@ def test_kept_exec_results_are_untouched_by_a_capture_and_are_not_in_the_tar(fak
         assert not [n for n in tf.getnames() if "cathedral-spill" in n]
     assert exec_spill.read_spill(sid, token, "stdout") == b"kept"  # still there after the capture
     exec_spill.close_spill(sid, token)
+
+
+def test_a_fork_carries_no_terminals_no_pty_and_no_kept_exec_results_of_the_source(fake, provider) -> None:
+    # Terminals, PTY sessions and kept (spill) exec results are keyed by room id in memory
+    # (provider._terminals[room_id], exec_spill._spills[(room_id, token)]). A fork has a new id and
+    # starts empty. Native exec holds and re-attach state are the broker's, keyed by its own room name.
+    from cathedral import exec_spill
+    from cathedral.sandbox_api import FileGet
+
+    result, _, _ = _captured(provider)
+    src = result["source_sandbox_id"]
+    provider.create_terminal(src)
+    token = "cd" * 16
+    exec_spill.open_spill(src, token, 1024).add("stdout", b"kept")
+    try:
+        doc = _fork(provider, result["snapshot_id"])
+        assert doc["id"] != src
+        assert provider.list_terminals(doc["id"]) == []
+        assert exec_spill.read_spill(doc["id"], token, "stdout") is None
+        with pytest.raises(SandboxOpError) as err:
+            provider.read_file(doc["id"], FileGet(path=f"/work/.cathedral-spill/{token}/stdout"))
+        assert err.value.code == "file_not_found"
+        assert len(provider.list_terminals(src)) == 1  # the source keeps its own
+    finally:
+        exec_spill.close_spill(src, token)
