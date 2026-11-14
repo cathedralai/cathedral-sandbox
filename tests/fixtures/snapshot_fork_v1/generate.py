@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import importlib.util
 import itertools
@@ -55,11 +56,14 @@ def load(name: str, path: Path):
     return mod
 
 
-def build() -> bytes:
+def build(front_patch=None) -> bytes:
+    """The file's bytes. *front_patch* (tests only) gets the front's module to change before it runs."""
     sys.path.insert(0, str(ROOT / "tests"))
     support = load("snapshot_fork_v1_support", ROOT / "tests" / "room_front_support.py")
     pack = load("snapshot_fork_v1_pack", PACK / "generate.py")
     rr = support.rr
+    if front_patch is not None:
+        front_patch(rr)
     attestation = json.loads((PACK / "source" / "attestation_doc.json").read_text())
     trust = json.loads((PACK / "source" / "trust.json").read_text())
 
@@ -88,6 +92,8 @@ def build() -> bytes:
             api.new_ids = [ROOM_A, ROOM_B]
             port = server.server_address[1]
 
+            delivered: list[dict] = []
+
             def call(method, path, body=None):
                 import http.client
                 clock["now"] += 1
@@ -98,6 +104,10 @@ def build() -> bytes:
                 out = r.read()
                 c.close()
                 assert 200 <= r.status < 300, (method, path, r.status, out)
+                header = r.getheader("X-Room-Receipt")
+                if header is None:
+                    raise SystemExit(f"{method} {path}: the answer carried no X-Room-Receipt header")
+                delivered.append(json.loads(base64.urlsafe_b64decode(header + "=" * (-len(header) % 4))))
 
             call("POST", "/v1/sandboxes", {"image": "repo/app:1"})
             api.reply(rf"POST /v1/sandboxes/{ROOM_A}/snapshot", 202, {
@@ -109,6 +119,9 @@ def build() -> bytes:
             api.reply(r"DELETE /v1/snapshots/[^/]+", 200, {"deleted": True})
             call("DELETE", f"/v1/snapshots/{SNAPSHOT_ID}")
             receipts = list(ledger.chain)
+            if delivered != receipts:
+                raise SystemExit("the receipt headers the callers received (decoded X-Room-Receipt) differ from "
+                                 "the front's chain")
     finally:
         if server is not None:
             server.shutdown()
@@ -146,21 +159,29 @@ def run_checker(data: bytes) -> None:
         raise SystemExit(f"the checker gave exit {run.returncode}, verdict {verdict}\n{run.stdout}\n{run.stderr}")
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--check", action="store_true")
-    args = ap.parse_args()
-    data = build()
-    if not args.check:
-        OUT.write_bytes(data)
-        print(f"wrote {OUT.name} sha256 {hashlib.sha256(data).hexdigest()}")
-        return 0
+def check(front_patch=None) -> int:
+    """Rebuild and compare: the file, the receipt headers the callers got, and the checker's verdict."""
+    data = build(front_patch)
     if not OUT.exists() or OUT.read_bytes() != data:
         print(f"{OUT.name} differs from a rebuild (or is missing): run generate.py", file=sys.stderr)
         return 1
     run_checker(data)
-    print(f"{OUT.name} is current and the checker gives the expected verdict")
     return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--check", action="store_true")
+    args = ap.parse_args()
+    if not args.check:
+        data = build()
+        OUT.write_bytes(data)
+        print(f"wrote {OUT.name} sha256 {hashlib.sha256(data).hexdigest()}")
+        return 0
+    status = check()
+    if status == 0:
+        print(f"{OUT.name} is current, the receipt headers match it and the checker gives the expected verdict")
+    return status
 
 
 if __name__ == "__main__":

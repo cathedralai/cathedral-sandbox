@@ -2042,6 +2042,10 @@ class Ledger:
         # for it, until a 2xx snapshot_delete is signed. Guarded by self.lock, like every table here, and never
         # held across a call to the room API, so the lock order of this file does not change.
         self.snapshots: dict[str, dict] = {}
+        # Ids deleted through this front (id -> delete_seq of that delete), so a capture that began before its
+        # snapshot was deleted and is answered after it is not remembered. delete_seq counts 2xx deletes.
+        self.deleted_snapshots: dict[str, int] = {}
+        self.delete_seq = 0
         # Serial rooms (all guarded by self.lock). in_flight counts the authorized requests between enter and
         # leave; busy is the per-room token (taken without waiting, so nothing queues and nothing can deadlock),
         # always a subset of the in_flight keys; serial holds the rooms whose create was signed serial; broken the
@@ -2202,20 +2206,34 @@ class Ledger:
             held = self.snapshots.get(snapshot_id)
             return dict(held) if held is not None else None
 
-    def sign_snapshot(self, fields: dict, refused: dict, record: dict) -> tuple[dict, bool]:
+    def begin_snapshot(self) -> int:
+        """Mark the start of a capture: the count of snapshot deletes signed so far."""
+        with self.lock:
+            return self.delete_seq
+
+    def forget_snapshot(self, snapshot_id: str) -> None:
+        with self.lock:
+            self.snapshots.pop(snapshot_id, None)
+
+    def sign_snapshot(self, fields: dict, refused: dict, record: dict, began: int = 0) -> tuple[dict, bool]:
         """Sign a snapshot receipt and remember the snapshot, in one locked step: (receipt, signed).
 
         An id already held for another source room or other content is not signed: *refused* (status 502, no
         snapshot member) is signed instead and the held entry stays. A repeat that agrees is signed and the
-        first receipt stays the one forks name.
+        first receipt stays the one forks name. An id whose delete was signed after this capture began (*began*
+        is Ledger.begin_snapshot() at its start) is not signed either: the delete won.
         """
         with self.lock:
             held = self.snapshots.get(record["snapshot_id"])
             if held is not None and (held["content"] != record["snapshot_content_sha256"]
                                      or held["source"] != record["source"]):
                 return self._sign_locked(refused), False
+            if self.deleted_snapshots.get(record["snapshot_id"], 0) > began:
+                return self._sign_locked(refused), False
             receipt = self._sign_locked(fields)
             if held is None:
+                while len(self.snapshots) >= SNAPSHOT_MAP_CAP:
+                    del self.snapshots[next(iter(self.snapshots))]
                 self.snapshots[record["snapshot_id"]] = {
                     "content": record["snapshot_content_sha256"], "source": record["source"],
                     "receipt_sha256": receipt["receipt_sha256"]}
@@ -2262,8 +2280,14 @@ class Ledger:
                     self.incarnations.pop(room, None)
                     self.serial.discard(room)
                     self.broken.discard(room)
-        if ok and statement.get("action") == "snapshot_delete":
-            self.snapshots.pop(statement.get("snapshot_id"), None)
+        if ok and statement.get("action") == "snapshot_delete" and isinstance(statement.get("snapshot_id"), str):
+            gone = statement["snapshot_id"]
+            self.snapshots.pop(gone, None)
+            self.delete_seq += 1
+            self.deleted_snapshots.pop(gone, None)
+            while len(self.deleted_snapshots) >= SNAPSHOT_MAP_CAP:
+                del self.deleted_snapshots[next(iter(self.deleted_snapshots))]
+            self.deleted_snapshots[gone] = self.delete_seq
         self.store.write(canonical(receipt) + b"\n")
         return receipt
 
@@ -2303,6 +2327,9 @@ SNAPSHOT_CONTENT_SCHEMA = "cathedral_snapshot_content_v1"
 SNAPSHOT_ID_RE = re.compile(r"snap_[0-9A-Za-z]{1,64}")
 SNAPSHOT_IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
 SNAPSHOT_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+# At most this many snapshots are remembered, and this many deleted ids, oldest first out. Eviction fails
+# closed: a fork of a snapshot that is no longer remembered is refused unsent (404 snapshot_not_found).
+SNAPSHOT_MAP_CAP = 4096
 SNAPSHOT_PUSH = re.compile(r"^/v1/snapshots/[^/]+/push$")
 SNAPSHOT_DELETE_PATH = re.compile(r"^/v1/snapshots/(?P<id>[^/]+)$")
 SNAPSHOT_UNSIGNED_BODY = (b'{"error":{"code":"snapshot_unsigned","message":"the machine answer did not name a complete '
@@ -2647,6 +2674,9 @@ class Handler(BaseHTTPRequestHandler):
             if problem is not None:
                 return self.reply(400, canonical({"error": {"code": problem[0], "message": problem[1]}}))
         fork = None
+        began = 0
+        if refusal is None and action == "snapshot" and self.authorized():
+            began = ledger.begin_snapshot()
         if refusal is None and action == "create" and self.authorized():
             fork_id = self.fork_snapshot_id(body)
             if fork_id is not None:
@@ -2673,7 +2703,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if action == "snapshot":
                     receipt, status, headers, out = self.sign_snapshot(ledger, path, forward_path, body, status,
-                                                                       headers, out, owner_fields)
+                                                                       headers, out, owner_fields, began)
                 else:
                     receipt = ledger.sign(
                         {**self.fields(action, path, body, status, out, target_path=forward_path, fork=fork),
@@ -2683,6 +2713,9 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:  # noqa: BLE001 the action ran: answer, and say the receipt is missing
                 traceback.print_exc()
                 extra["X-Room-Receipt-Error"] = type(exc).__name__
+            if fork is not None and status == 404 and self.machine_error_code(out) == "snapshot_not_found":
+                # The machine no longer has it (expiry, its own delete): stop offering it.
+                ledger.forget_snapshot(fork["snapshot_id"])
             if action == "create" and 200 <= status < 300 and ledger.sealed_env is not None:
                 # A create answered again for a room the API kept moves its incarnation: an
                 # overlay set under the old one comes off before the room is used again.
@@ -2700,6 +2733,14 @@ class Handler(BaseHTTPRequestHandler):
         return self.reply(status, out, {**passthrough, **extra}, ctype)
 
     @staticmethod
+    def machine_error_code(out: bytes) -> str | None:
+        try:
+            code = json.loads(out)["error"]["code"]
+        except (ValueError, TypeError, KeyError, RecursionError):
+            return None
+        return code if isinstance(code, str) else None
+
+    @staticmethod
     def fork_snapshot_id(body: bytes | None) -> str | None:
         """The snapshot id a create asks to fork, or None when it names none the machine could accept."""
         try:
@@ -2710,7 +2751,7 @@ class Handler(BaseHTTPRequestHandler):
         return value if isinstance(value, str) and value else None
 
     def sign_snapshot(self, ledger: "Ledger", path: str, forward_path: str, body: bytes | None, status: int,
-                      headers, out: bytes, owner_fields: dict):
+                      headers, out: bytes, owner_fields: dict, began: int = 0):
         """Sign a snapshot action: (receipt, status, headers, out) with the answer the caller now gets.
 
         A 2xx answer that does not name a complete snapshot for this room is answered 502 snapshot_unsigned
@@ -2727,7 +2768,7 @@ class Handler(BaseHTTPRequestHandler):
                      **owner_fields}
         refused = {**self.fields("snapshot", path, body, 502, SNAPSHOT_UNSIGNED_BODY, target_path=forward_path),
                    **owner_fields}
-        receipt, signed = ledger.sign_snapshot(ok_fields, refused, record)
+        receipt, signed = ledger.sign_snapshot(ok_fields, refused, record, began)
         if not signed:
             status, headers, out = 502, [], SNAPSHOT_UNSIGNED_BODY
         return receipt, status, headers, out
