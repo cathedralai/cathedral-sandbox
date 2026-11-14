@@ -214,8 +214,11 @@ func TestHealthFailDoesNotCreditStaleSlots(t *testing.T) {
 	if first.atCommitSec <= 0 {
 		t.Fatalf("expected initial slot credit: %+v", first)
 	}
-	// Health stops; room calls still answer so h.ok stays true (healthLate).
-	m.healthFail = true
+	// Health is late (past okWindow) but room calls still answer: hotel stays up.
+	m.setHealthFail(true)
+	tc.b.mu.Lock()
+	h.lastOK = time.Now().Add(-time.Minute)
+	tc.b.mu.Unlock()
 	h.lastAnswer.Store(time.Now().UnixNano())
 	time.Sleep(20 * time.Millisecond)
 	syncNow(tc, "m1")
