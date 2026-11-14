@@ -94,8 +94,8 @@ def snapshot_ok(front: Front, source: str, snap: str = SNAP, **over) -> dict:
     return receipt_of(headers)
 
 
-def fork(front: Front, snap: str = SNAP, **extra):
-    return front.call("POST", "/v1/sandboxes", {"snapshot_id": snap, **extra})
+def fork(front: Front, snap: str = SNAP, headers: dict | None = None, **extra):
+    return front.call("POST", "/v1/sandboxes", {"snapshot_id": snap, **extra}, headers)
 
 
 def snapshot_delete(front: Front, snap: str = SNAP, status: int = 200, body=None):
@@ -704,7 +704,9 @@ def test_a_delete_marks_every_capture_in_flight_and_only_those(front) -> None:
     assert fork(front)[0] == 200
 
 
-def test_a_late_not_found_does_not_remove_a_replacement_entry(front) -> None:
+def test_a_late_not_found_leaves_the_entry_alone(front) -> None:
+    # The second review's schedule. Its premise (a machine 404 may remove an entry, so it must not remove a
+    # replacement) is gone: a machine answer to a fork never changes the record, so the replacement stays.
     a = room(front)
     snapshot_ok(front, a)
     held = front.api.hold(r"POST /v1/sandboxes")
@@ -723,22 +725,38 @@ def test_a_late_not_found_does_not_remove_a_replacement_entry(front) -> None:
     assert_idle(front.ledger)
 
 
-def test_a_machine_answer_snapshot_not_found_to_a_fork_drops_the_entry(front) -> None:
+def test_another_guest_s_denied_fork_is_a_machine_404_and_the_owner_s_next_fork_still_works(front) -> None:
+    # On a shared machine the machine answers a stranger's fork as 404 snapshot_not_found (ownership denial).
+    # The front never changes its record on a machine answer to a fork.
+    a = room(front)
+    snap = snapshot_ok(front, a)
+    front.api.replies.clear()
+    front.api.reply(r"POST /v1/sandboxes", 404, {"error": {"code": "snapshot_not_found", "message": "no snapshot"}})
+    status, headers, _out = fork(front, headers={"X-Cathedral-Guest": "guest-b"})
+    st = receipt_of(headers)["statement"]
+    assert status == 404 and st["action"] == "create" and st["status"] == 404 and members(st) == {}
+    front.api.replies.clear()
+    status, headers, _out = fork(front, headers={"X-Cathedral-Guest": "guest-a"})
+    assert status == 200
+    assert members(receipt_of(headers)["statement"]) == {
+        "snapshot_id": SNAP, "snapshot_content_sha256": content_sha(),
+        "snapshot_receipt_sha256": snap["receipt_sha256"], "snapshot_source_sandbox_id": a}
+
+
+def test_a_snapshot_the_machine_really_no_longer_has_is_forwarded_and_answered_404_every_time(front) -> None:
     a = room(front)
     snapshot_ok(front, a)
     front.api.replies.clear()
     front.api.reply(r"POST /v1/sandboxes", 404, {"error": {"code": "snapshot_not_found", "message": "no snapshot"}})
-    status, headers, _out = fork(front)
-    assert status == 404 and members(receipt_of(headers)["statement"]) == {}  # the failed create is signed
-    front.api.replies.clear()
     sent = front.api.count(r"POST /v1/sandboxes")
-    status, headers, out = fork(front)
-    assert status == 404 and code(out) == "snapshot_not_found" and "X-Room-Receipt" not in headers
-    assert front.api.count(r"POST /v1/sandboxes") == sent  # now refused by the front, unsent
+    for n in (1, 2, 3):
+        status, headers, _out = fork(front)
+        assert status == 404 and members(receipt_of(headers)["statement"]) == {}
+        assert front.api.count(r"POST /v1/sandboxes") == sent + n  # forwarded each time, signed as a failed create
 
 
 @pytest.mark.parametrize("status,error", [(404, "sandbox_not_found"), (409, "snapshot_deleting"), (500, "boom"),
-                                          (503, "snapshot_not_found")])
+                                          (404, "snapshot_not_found"), (503, "snapshot_not_found")])
 def test_any_other_machine_answer_to_a_fork_keeps_the_entry(front, status, error) -> None:
     a = room(front)
     snapshot_ok(front, a)
