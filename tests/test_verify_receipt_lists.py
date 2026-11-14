@@ -1001,3 +1001,80 @@ def test_the_order_of_faults_is_depth_number_length_surrogate_then_the_parse(nam
         (work / name).write_bytes(raw)
         code, out, err = _run_cli(*[a.replace("{dir}", str(work)) for a in case["args"]])
         assert code == 1 and "Traceback" not in err and json.loads(out)["reason"] == reason, (i, out)
+
+
+# ---- a receipt that carries only ONE of the two numbering fields (PR 529's rule, in every mode)
+
+ONE_FIELD = {"only room_sequence": {"numbered": False, "room_sequence": "SEQ"},
+             "only room_previous_receipt_sha256": {"numbered": False, "room_previous_receipt_sha256": "PREV"}}
+
+
+def _room_with_one_field(gen, pack, variant: str, which: int, pool: bool):
+    """A room's list (pre-made or ordinary) whose receipt number `which` has one numbering field only."""
+    hotel = pack.new_hotel()
+    steps = ([("create", 202, {"pool": True}), ("claim", 200, None), ("exec", 200, {})] if pool
+             else [("create", 202, {}), ("exec", 200, {}), ("exec", 200, {})])
+    receipts = []
+    for i, (action, status, extra) in enumerate(steps):
+        extra = gen.claim_fields(receipts[0]) if action == "claim" else dict(extra)
+        if i == which:
+            extra.update({"numbered": False, **({"room_sequence": i + 1} if variant == "only room_sequence" else
+                                                {"room_previous_receipt_sha256": receipts[-1]["receipt_sha256"]
+                                                 if receipts else None})})
+        receipts.append(hotel.sign(action, "pool-1" if pool else "room-a", status, **extra))
+    return {"receipts": receipts, "head": hotel.head}
+
+
+def _list_mode(tmp_path: Path, doc: dict, *more: str) -> tuple[int, dict, str]:
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    (tmp_path / "att.json").write_bytes(gen.pretty(pack.attestation))
+    (tmp_path / "r.json").write_text(json.dumps(doc))
+    code, out, err = _run_cli("--attestation", str(tmp_path / "att.json"), "--receipts", str(tmp_path / "r.json"),
+                              "--skip-amd", "--expected-measurement", gen.MEASUREMENT, *more)
+    return code, json.loads(out) if out.strip() else {}, err
+
+
+@pytest.mark.parametrize("which", [0, 1, 2])
+@pytest.mark.parametrize("variant", sorted(ONE_FIELD))
+def test_a_pre_made_room_with_a_one_field_receipt_ends_in_a_reason_and_gives_no_link(variant, which, tmp_path) -> None:
+    gen = _generator()
+    doc = _room_with_one_field(gen, gen.Pack(gen.read_amd()), variant, which, pool=True)
+    code, out, err = _list_mode(tmp_path, doc, "--cathedral-sandbox", gen.CLAIM_ID)
+    assert "Traceback" not in err, err
+    assert code == 1 and out["verdict"] == "FAIL" and out["reason"], out
+    assert "room_links" not in out and "sandbox_link" not in out
+
+
+@pytest.mark.parametrize("which", [0, 1, 2])
+@pytest.mark.parametrize("variant", sorted(ONE_FIELD))
+def test_an_ordinary_room_with_a_one_field_receipt_gets_the_warning_and_no_numbering_claim(variant, which,
+                                                                                         tmp_path) -> None:
+    gen = _generator()
+    doc = _room_with_one_field(gen, gen.Pack(gen.read_amd()), variant, which, pool=False)
+    code, out, err = _list_mode(tmp_path, doc)
+    assert "Traceback" not in err, err
+    assert code == 0 and out["verdict"] == "PASS"
+    assert "room-a has receipts with incomplete numbering: no numbering claim for it" in out["checked"]
+    assert "room_numbering" not in out["chain"]
+
+
+@pytest.mark.parametrize("drop", ["room_previous_receipt_sha256", "room_sequence"])
+def test_run_mode_fails_with_a_reason_when_a_receipt_carries_one_numbering_field(drop, tmp_path) -> None:
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+
+    def resign_last(bundle):
+        receipt = bundle["receipts"][-1]
+        receipt["statement"].pop(drop)
+        receipt["receipt_sha256"] = gen.sha(gen.canonical(receipt["statement"]))
+        receipt["signature_b64"] = gen.b64(pack.key.sign(gen.canonical(receipt["statement"])))
+
+    files, args = gen.make_run(pack, bundle_edit=resign_last)
+    for name, data in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes(data)
+    code, out, err = _run_cli(*[a.replace("{dir}", str(tmp_path)) for a in args])
+    assert "Traceback" not in err, err
+    assert code == 1 and json.loads(out) == {
+        "verdict": "FAIL", "reason": "check 2: room run-room-1: the receipts are not numbered (room_sequence)"}
