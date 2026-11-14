@@ -1078,3 +1078,57 @@ def test_run_mode_fails_with_a_reason_when_a_receipt_carries_one_numbering_field
     assert "Traceback" not in err, err
     assert code == 1 and json.loads(out) == {
         "verdict": "FAIL", "reason": "check 2: room run-room-1: the receipts are not numbered (room_sequence)"}
+
+
+# ---- the list's count is an integer as written (a boolean or a float equals 0 or 1 in Python, not in Go)
+
+COUNT_REASON = "the list's count is not an integer"
+
+
+def _one_receipt_list(extra: dict, count_member: dict) -> dict:
+    gen = _generator()
+    hotel = gen.Pack(gen.read_amd()).new_hotel()
+    receipt = hotel.sign("create", "room-a", 202)
+    return {"receipts": [receipt], **extra(receipt), **count_member}
+
+
+@pytest.mark.parametrize("count", [False, True, 0.0, 1.0, "1", None, [], {}], ids=repr)
+@pytest.mark.parametrize("with_head", [True, False], ids=["head", "no-head"])
+@pytest.mark.parametrize("shape", ["empty", "one"])
+def test_a_count_that_is_not_an_integer_fails_with_one_reason(shape, with_head, count, tmp_path) -> None:
+    if shape == "empty":
+        doc = {"receipts": [], **({"room_head": None} if with_head else {}), "count": count}
+    else:
+        doc = _one_receipt_list(lambda rc: {"room_head": rc["receipt_sha256"]} if with_head else {}, {"count": count})
+    code, out, err = _list_mode(tmp_path, doc)
+    assert "Traceback" not in err, err
+    assert code == 1 and out == {"verdict": "FAIL", "reason": COUNT_REASON}, out
+
+
+@pytest.mark.parametrize("with_head", [True, False], ids=["head", "no-head"])
+def test_the_right_integer_count_passes_and_a_wrong_integer_keeps_the_numbering_reason(with_head, tmp_path) -> None:
+    head = {"room_head": None} if with_head else {}
+    assert _list_mode(tmp_path, {"receipts": [], **head, "count": 0})[0] == 0
+    doc = _one_receipt_list(lambda rc: {"room_head": rc["receipt_sha256"]} if with_head else {}, {"count": 1})
+    assert _list_mode(tmp_path, doc)[0] == 0
+    code, out, _ = _list_mode(tmp_path, {"receipts": [], **head, "count": 5})
+    if with_head:
+        assert code == 1 and out["reason"] == "an empty room list names a nonzero count"
+    else:
+        assert code == 0                        # without a room_head the value is still ignored
+    doc = _one_receipt_list(lambda rc: {"room_head": rc["receipt_sha256"]} if with_head else {}, {"count": 5})
+    code, out, _ = _list_mode(tmp_path, doc)
+    if with_head:
+        assert code == 1 and out["reason"] == "room room-a: the list names 5 receipts but holds 1"
+    else:
+        assert code == 0
+
+
+def test_the_count_check_is_in_the_function_too() -> None:
+    vr = _load_checker()
+    for bad in (False, True, 0.0, 1.0, "1", None, [], {}):
+        with pytest.raises(vr.Fail, match="the list's count is not an integer"):
+            vr.room_numbering([], {"count": bad})
+        with pytest.raises(vr.Fail, match="the list's count is not an integer"):
+            vr.room_numbering([], {"room_head": None, "count": bad})
+    assert vr.room_numbering([], {"count": 7}) == {"rooms": {}, "warnings": []}
