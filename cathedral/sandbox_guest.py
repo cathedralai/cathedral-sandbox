@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from cathedral.agent_pty import PtyProcess
 from cathedral.exec_spill import StreamSpill, close_spill, open_spill, read_spill, spill_path_parts
 from cathedral.sandbox_api import (
     CreateSandboxRequest,
@@ -2939,10 +2940,50 @@ class DockerGuestProvider:
             self._inner._images[ref] = entry  # noqa: SLF001
         return entry
 
-    def terminal_write(self, sandbox_id: str, terminal_id: str, data: str) -> dict[str, Any]:
+    def terminal_write(self, sandbox_id: str, terminal_id: str, data: str | bytes) -> dict[str, Any]:
         # The inner provider keeps the terminal's buffers; each complete line
         # runs through this provider's exec, in the room's container (B154).
+        # A PTY terminal writes raw bytes to its docker exec -it instead.
         return self._inner.terminal_write(sandbox_id, terminal_id, data, executor=self.exec)
+
+    def create_terminal(
+        self,
+        sandbox_id: str,
+        *,
+        cols: int | None = None,
+        rows: int | None = None,
+        mode: str | None = None,
+    ) -> dict[str, Any]:
+        if mode != "pty":
+            return self._inner.create_terminal(sandbox_id, cols=cols, rows=rows, mode=mode)
+        guest = self._guests.get(sandbox_id)
+        if guest is None:
+            # No container (yet, or any more): the inner provider answers
+            # with its own state error, or refuses PTY for want of a room.
+            return self._inner.create_terminal(sandbox_id, cols=cols, rows=rows, mode=mode)
+        # Probe the shell now, not at connect: connect holds the provider
+        # lock and the probe is a docker exec.
+        argv, env = self._terminal_command(guest)
+
+        def spawn(c: int, r: int, on_output, on_exit) -> PtyProcess:
+            return PtyProcess(argv, cols=c, rows=r, on_output=on_output, on_exit=on_exit, env=env)
+
+        return self._inner.create_terminal(sandbox_id, cols=cols, rows=rows, mode=mode, spawn=spawn)
+
+    def _terminal_command(self, guest: GuestRecord) -> tuple[list[str], dict[str, str]]:
+        """docker exec -it argv for an interactive login shell in the room, and its env.
+
+        The room's env overlay goes to the docker client's own environment and
+        is named on the argv by key only (-e KEY), so its values never show in
+        the hotel's process list.
+        """
+        shell = "bash" if self._has_bash(guest) else "sh"
+        argv = ["docker", "exec", "-it", "-w", "/work", "-e", "TERM=xterm-256color"]
+        overlay = {k: v for k, v in guest.env_overlay.items() if k != "TERM"}
+        for key in overlay:
+            argv.extend(["-e", key])
+        argv.extend([guest.container_id, shell, "-l"])
+        return argv, {**os.environ, **overlay}
 
     def get(self, sandbox_id: str) -> dict[str, Any]:
         return self._with_tunables(self._inner.get(sandbox_id))
