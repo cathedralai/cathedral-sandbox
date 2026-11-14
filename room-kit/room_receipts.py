@@ -2042,10 +2042,11 @@ class Ledger:
         # for it, until a 2xx snapshot_delete is signed. Guarded by self.lock, like every table here, and never
         # held across a call to the room API, so the lock order of this file does not change.
         self.snapshots: dict[str, dict] = {}
-        # Ids deleted through this front (id -> delete_seq of that delete), so a capture that began before its
-        # snapshot was deleted and is answered after it is not remembered. delete_seq counts 2xx deletes.
-        self.deleted_snapshots: dict[str, int] = {}
-        self.delete_seq = 0
+        # Captures in flight: token -> ids whose delete was signed since that capture began. A capture whose
+        # answer names one of them is not remembered (the delete won), however many deletes came after. The id is
+        # known only from the answer, so a delete marks every capture then in flight. Guarded by self.lock.
+        self.captures: dict[int, set[str]] = {}
+        self.capture_next = 0
         # Serial rooms (all guarded by self.lock). in_flight counts the authorized requests between enter and
         # leave; busy is the per-room token (taken without waiting, so nothing queues and nothing can deadlock),
         # always a subset of the in_flight keys; serial holds the rooms whose create was signed serial; broken the
@@ -2207,28 +2208,37 @@ class Ledger:
             return dict(held) if held is not None else None
 
     def begin_snapshot(self) -> int:
-        """Mark the start of a capture: the count of snapshot deletes signed so far."""
+        """Register a capture in flight; the token is passed to sign_snapshot and end_capture."""
         with self.lock:
-            return self.delete_seq
+            self.capture_next += 1
+            self.captures[self.capture_next] = set()
+            return self.capture_next
 
-    def forget_snapshot(self, snapshot_id: str) -> None:
+    def end_capture(self, token: int) -> None:
         with self.lock:
-            self.snapshots.pop(snapshot_id, None)
+            self.captures.pop(token, None)
 
-    def sign_snapshot(self, fields: dict, refused: dict, record: dict, began: int = 0) -> tuple[dict, bool]:
+    def forget_snapshot(self, snapshot_id: str, receipt_sha256: str) -> None:
+        """Drop the entry only if it is still the one a fork was admitted against (a replacement stays)."""
+        with self.lock:
+            held = self.snapshots.get(snapshot_id)
+            if held is not None and held["receipt_sha256"] == receipt_sha256:
+                del self.snapshots[snapshot_id]
+
+    def sign_snapshot(self, fields: dict, refused: dict, record: dict, token: int = 0) -> tuple[dict, bool]:
         """Sign a snapshot receipt and remember the snapshot, in one locked step: (receipt, signed).
 
         An id already held for another source room or other content is not signed: *refused* (status 502, no
         snapshot member) is signed instead and the held entry stays. A repeat that agrees is signed and the
-        first receipt stays the one forks name. An id whose delete was signed after this capture began (*began*
-        is Ledger.begin_snapshot() at its start) is not signed either: the delete won.
+        first receipt stays the one forks name. An id whose delete was signed after this capture began (*token*
+        is the token from Ledger.begin_snapshot()) is not signed either: the delete won.
         """
         with self.lock:
             held = self.snapshots.get(record["snapshot_id"])
             if held is not None and (held["content"] != record["snapshot_content_sha256"]
                                      or held["source"] != record["source"]):
                 return self._sign_locked(refused), False
-            if self.deleted_snapshots.get(record["snapshot_id"], 0) > began:
+            if record["snapshot_id"] in self.captures.get(token, ()):
                 return self._sign_locked(refused), False
             receipt = self._sign_locked(fields)
             if held is None:
@@ -2283,11 +2293,8 @@ class Ledger:
         if ok and statement.get("action") == "snapshot_delete" and isinstance(statement.get("snapshot_id"), str):
             gone = statement["snapshot_id"]
             self.snapshots.pop(gone, None)
-            self.delete_seq += 1
-            self.deleted_snapshots.pop(gone, None)
-            while len(self.deleted_snapshots) >= SNAPSHOT_MAP_CAP:
-                del self.deleted_snapshots[next(iter(self.deleted_snapshots))]
-            self.deleted_snapshots[gone] = self.delete_seq
+            for marked in self.captures.values():
+                marked.add(gone)
         self.store.write(canonical(receipt) + b"\n")
         return receipt
 
@@ -2327,7 +2334,7 @@ SNAPSHOT_CONTENT_SCHEMA = "cathedral_snapshot_content_v1"
 SNAPSHOT_ID_RE = re.compile(r"snap_[0-9A-Za-z]{1,64}")
 SNAPSHOT_IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
 SNAPSHOT_SHA256_RE = re.compile(r"[0-9a-f]{64}")
-# At most this many snapshots are remembered, and this many deleted ids, oldest first out. Eviction fails
+# At most this many snapshots are remembered, oldest first out. Eviction fails
 # closed: a fork of a snapshot that is no longer remembered is refused unsent (404 snapshot_not_found).
 SNAPSHOT_MAP_CAP = 4096
 SNAPSHOT_PUSH = re.compile(r"^/v1/snapshots/[^/]+/push$")
@@ -2458,11 +2465,13 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     turn: Turn | None = None
+    capture_token: int | None = None  # a snapshot capture in flight (Ledger.captures)
     create_open = False  # a create was forwarded and its receipt is not yet signed
     bulk_open = False  # a bulk delete was forwarded and has not been answered
 
     def handle_one_request(self):
         self.turn = None
+        self.capture_token = None
         self.create_open = False
         self.bulk_open = False
         try:
@@ -2472,6 +2481,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def release_turn(self) -> None:
         """Give back the request's count and token, and its place among the creates in flight. Safe to call twice."""
+        token, self.capture_token = self.capture_token, None
+        if token is not None:
+            self.server.ledger.end_capture(token)
         turn, self.turn = self.turn, None
         if turn is not None:
             self.server.ledger.leave(turn)
@@ -2676,7 +2688,7 @@ class Handler(BaseHTTPRequestHandler):
         fork = None
         began = 0
         if refusal is None and action == "snapshot" and self.authorized():
-            began = ledger.begin_snapshot()
+            began = self.capture_token = ledger.begin_snapshot()
         if refusal is None and action == "create" and self.authorized():
             fork_id = self.fork_snapshot_id(body)
             if fork_id is not None:
@@ -2715,7 +2727,7 @@ class Handler(BaseHTTPRequestHandler):
                 extra["X-Room-Receipt-Error"] = type(exc).__name__
             if fork is not None and status == 404 and self.machine_error_code(out) == "snapshot_not_found":
                 # The machine no longer has it (expiry, its own delete): stop offering it.
-                ledger.forget_snapshot(fork["snapshot_id"])
+                ledger.forget_snapshot(fork["snapshot_id"], fork["receipt_sha256"])
             if action == "create" and 200 <= status < 300 and ledger.sealed_env is not None:
                 # A create answered again for a room the API kept moves its incarnation: an
                 # overlay set under the old one comes off before the room is used again.
