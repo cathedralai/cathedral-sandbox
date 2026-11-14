@@ -17,6 +17,7 @@ Where the plan is silent the tests pin the choice made here, and say so:
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import itertools
 import json
 import subprocess
@@ -35,7 +36,7 @@ GENERATOR = FIXTURES / "generate.py"
 # sha256 of snapshot_fork_v1.json. Filled in when the generator exists (step two of CS-3).
 FIXTURE_SHA256 = "4b57e2329e5a7588f9869e9e63a4ccd58e35c13e4dc4b15b1746f9ed542483b0"
 # sha256 of the receipts a fixed scripted run of the old actions makes on main (see scripted_old_actions).
-OLD_ACTIONS_SHA256 = "fad368fc68779bfb7ce563ccf6e0a8b7dc55c4c0b88ef109d06fd4610834e2c9"
+OLD_ACTIONS_SHA256 = "5e48a051f02c9ba0d898ae5a8491bfae6e369c198cc088efa14b1074a2400d1c"
 
 SERIAL = {"image": "repo/app:1", "labels": {"cathedral_serial": "1"}}
 SNAP_MEMBERS = ["snapshot_id", "snapshot_image_id", "snapshot_work_archive_sha256", "snapshot_size_bytes",
@@ -414,9 +415,17 @@ def test_a_failed_fork_create_has_no_source_members(front) -> None:
 
 
 @pytest.mark.parametrize("value", [None, 5, ["snap_a"], {"id": "snap_a"}, ""])
-def test_a_create_with_no_usable_snapshot_id_is_an_ordinary_create_with_no_source_members(front, value) -> None:
-    status, headers, _out = front.create({"image": "repo/app:1", "snapshot_id": value})
-    assert status == 200 and members(receipt_of(headers)["statement"]) == {}
+def test_a_create_with_no_usable_snapshot_id_is_forwarded_as_sent_and_has_no_source_members(front, value) -> None:
+    # The real API: snapshot_id null is no source, so image alone is one source and the create is made (200);
+    # any other value next to an image is two sources, or a blank or non-string id, and answers 422.
+    if value is not None:
+        front.api.reply(r"POST /v1/sandboxes", 422, {"error": {"code": "invalid_source", "message": "x"}})
+    body = {"image": "repo/app:1", "snapshot_id": value}
+    status, headers, _out = front.create(body)
+    st = receipt_of(headers)["statement"]
+    assert status == (200 if value is None else 422) and st["status"] == status and members(st) == {}
+    assert json.loads(front.api.seen[-1][2]) == body  # forwarded as sent, never lost in the front
+    assert front.api.count(r"POST /v1/sandboxes") == 1
 
 
 def test_an_ordinary_create_carries_no_source_members(front) -> None:
@@ -604,6 +613,90 @@ def test_a_fork_racing_a_snapshot_delete_the_snapshot_is_forgotten_only_when_the
     assert_idle(front.ledger)
 
 
+def test_a_capture_answer_that_arrives_after_its_snapshot_was_deleted_is_502_and_the_entry_stays_gone(front) -> None:
+    # Schedule: capture of X sent, its answer delayed, DELETE X succeeds, the answer arrives.
+    a = room(front)
+    front.api.replies.clear()
+    front.api.reply(rf"POST /v1/sandboxes/{a}/snapshot", 202, answer())
+    front.api.reply(r"DELETE /v1/snapshots/[^/]+", 200, {"deleted": True})
+    held = front.api.hold(rf"POST /v1/sandboxes/{a}/snapshot")
+    t, box = in_thread(front.call, "POST", f"/v1/sandboxes/{a}/snapshot", {})
+    held.wait_entered()
+    assert front.call("DELETE", f"/v1/snapshots/{SNAP}")[0] == 200
+    held.release.set()
+    status, headers, out = finish(t, box)
+    assert status == 502 and code(out) == "snapshot_unsigned" and members(receipt_of(headers)["statement"]) == {}
+    before = front.api.count(r"POST /v1/sandboxes")
+    status, headers, out = fork(front)
+    assert status == 404 and code(out) == "snapshot_not_found" and "X-Room-Receipt" not in headers
+    assert front.api.count(r"POST /v1/sandboxes") == before
+    assert_idle(front.ledger)
+
+
+def test_a_capture_begun_after_the_delete_is_remembered_even_though_the_id_was_deleted_before(front) -> None:
+    a = room(front)
+    snapshot_ok(front, a)
+    snapshot_delete(front)
+    again = snapshot_ok(front, a)
+    assert receipt_of(fork(front)[1])["statement"]["snapshot_receipt_sha256"] == again["receipt_sha256"]
+
+
+def test_the_map_caps_are_a_module_constant_of_4096() -> None:
+    assert rr.SNAPSHOT_MAP_CAP == 4096
+
+
+def test_the_snapshot_map_evicts_the_oldest_first_and_a_fork_of_an_evicted_one_is_refused_unsent(front, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "SNAPSHOT_MAP_CAP", 3)
+    a = room(front)
+    ids = [f"snap_00000000000{n}" for n in range(1, 6)]
+    for sid in ids:
+        snapshot_ok(front, a, sid)
+    sent = front.api.count(r"POST /v1/sandboxes")
+    status, headers, out = fork(front, ids[0])
+    assert status == 404 and code(out) == "snapshot_not_found" and "X-Room-Receipt" not in headers
+    assert fork(front, ids[1])[0] == 404
+    assert front.api.count(r"POST /v1/sandboxes") == sent  # nothing was sent for the evicted two
+    for sid in ids[2:]:  # the newest three are kept
+        assert fork(front, sid)[0] == 200
+
+
+def test_the_deleted_ids_record_has_the_same_cap(front, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "SNAPSHOT_MAP_CAP", 2)
+    a = room(front)
+    for n in range(1, 6):
+        sid = f"snap_00000000000{n}"
+        snapshot_ok(front, a, sid)
+        assert snapshot_delete(front, sid)[0] == 200
+    with front.ledger.lock:
+        assert len(front.ledger.deleted_snapshots) == 2 and len(front.ledger.snapshots) == 0
+
+
+def test_a_machine_answer_snapshot_not_found_to_a_fork_drops_the_entry(front) -> None:
+    a = room(front)
+    snapshot_ok(front, a)
+    front.api.replies.clear()
+    front.api.reply(r"POST /v1/sandboxes", 404, {"error": {"code": "snapshot_not_found", "message": "no snapshot"}})
+    status, headers, _out = fork(front)
+    assert status == 404 and members(receipt_of(headers)["statement"]) == {}  # the failed create is signed
+    front.api.replies.clear()
+    sent = front.api.count(r"POST /v1/sandboxes")
+    status, headers, out = fork(front)
+    assert status == 404 and code(out) == "snapshot_not_found" and "X-Room-Receipt" not in headers
+    assert front.api.count(r"POST /v1/sandboxes") == sent  # now refused by the front, unsent
+
+
+@pytest.mark.parametrize("status,error", [(404, "sandbox_not_found"), (409, "snapshot_deleting"), (500, "boom"),
+                                          (503, "snapshot_not_found")])
+def test_any_other_machine_answer_to_a_fork_keeps_the_entry(front, status, error) -> None:
+    a = room(front)
+    snapshot_ok(front, a)
+    front.api.replies.clear()
+    front.api.reply(r"POST /v1/sandboxes", status, {"error": {"code": error, "message": "x"}})
+    assert fork(front)[0] == status
+    front.api.replies.clear()
+    assert fork(front)[0] == 200
+
+
 # ---------------------------------------------------------------- serial rooms
 
 def test_a_serial_room_takes_a_snapshot_as_a_signed_request_in_its_turn(front) -> None:
@@ -665,8 +758,11 @@ def test_a_fork_is_never_serial_unless_it_asks_and_a_serial_fork_is_flagged_like
 # ---------------------------------------------------------------- old callers
 
 def scripted_old_actions(front: Front, monkeypatch) -> bytes:
-    """A fixed run of create, exec, file put and get, a second create and a delete, with a fixed key,
-    clock and ids, and the receipts' canonical bytes, one per line."""
+    """A fixed run of old actions with a fixed key, clock and ids; the receipts' canonical bytes, one per line.
+
+    Ordinary creates (no snapshot_id, null, blank, an unrelated member named snapshot_note), a failed action,
+    exec, file put and get, a process start, a network change, a delete and a bulk delete.
+    """
     led = front.ledger
     led.key = Ed25519PrivateKey.from_private_bytes(hashlib.sha256(b"snapshot-fork old-caller pin key").digest())
     led.hotel = "pin-hotel"
@@ -677,27 +773,138 @@ def scripted_old_actions(front: Front, monkeypatch) -> bytes:
     monkeypatch.setattr(rr.time, "time", lambda: 1_700_000_000)
     monkeypatch.setattr(front.server, "image_digest", lambda ref: None)
     front.api.expires_at = "2023-11-14T22:13:20+00:00"
-    front.api.new_ids = ["sbx_pin_1", "sbx_pin_2"]
+    front.api.new_ids = ["sbx_pin_1", "sbx_pin_2", "sbx_pin_3", "sbx_pin_4"]
     assert front.create({"image": "repo/app:1"})[0] == 200
+    assert front.create({"image": "repo/other:2", "labels": {"k": "v"}})[0] == 200
+    assert front.create({"image": "repo/app:1", "snapshot_id": None})[0] == 200
+    assert front.create({"image": "repo/app:1", "snapshot_note": "x", "labels": {"snapshot_k": "v"}})[0] == 200
+    front.api.reply(r"POST /v1/sandboxes", 422, {"error": {"code": "invalid_source", "message": "x"}})
+    assert front.create({"image": "repo/app:1", "snapshot_id": ""})[0] == 422
+    front.api.replies.clear()
     assert front.exec("sbx_pin_1", "echo hi")[0] == 200
+    front.api.reply(r"POST /v1/sandboxes/sbx_pin_2/exec", 500, {"error": {"code": "boom", "message": "x"}})
+    assert front.exec("sbx_pin_2", "false")[0] == 500
+    front.api.replies.clear()
     assert front.put("sbx_pin_1", b"data")[0] == 200
     assert front.get_file("sbx_pin_1")[0] == 200
-    assert front.create({"image": "repo/other:2", "labels": {"k": "v"}})[0] == 200
+    assert front.call("POST", "/v1/sandboxes/sbx_pin_1/processes", {"cmd": ["sleep", "1"]})[0] == 200
+    assert front.call("PUT", "/v1/sandboxes/sbx_pin_1/network", {"mode": "deny_all"})[0] == 200
     assert front.delete("sbx_pin_1")[0] == 200
+    assert front.call("DELETE", "/v1/sandboxes?label=k%3Dv")[0] == 200
     return b"".join(rr.canonical(r) + b"\n" for r in led.chain)
 
 
 def test_actions_other_than_snapshot_and_fork_make_the_same_bytes_as_main(front, monkeypatch) -> None:
     out = scripted_old_actions(front, monkeypatch)
-    assert out.count(b"\n") == 6
+    assert out.count(b"\n") == 13
     assert hashlib.sha256(out).hexdigest() == OLD_ACTIONS_SHA256
 
 
-def test_an_old_action_receipt_has_no_snapshot_member_and_no_new_member_at_all(front) -> None:
+# The member names of each old receipt on main, for the same calls: nothing was added to any of them.
+MAIN_MEMBERS = {'create': ['action',
+            'binding_sha256',
+            'command_sha256',
+            'customer_request_sha256',
+            'hotel',
+            'image',
+            'image_digest',
+            'issued_at',
+            'network_policy',
+            'network_policy_sha256',
+            'operation_id',
+            'previous_receipt_sha256',
+            'result_sha256',
+            'room_previous_receipt_sha256',
+            'room_sequence',
+            'sandbox_id',
+            'schema',
+            'sequence',
+            'start_command',
+            'start_command_sha256',
+            'status',
+            'target'],
+ 'delete': ['action',
+            'binding_sha256',
+            'command_sha256',
+            'customer_request_sha256',
+            'hotel',
+            'image',
+            'image_digest',
+            'issued_at',
+            'operation_id',
+            'previous_receipt_sha256',
+            'result_sha256',
+            'room_previous_receipt_sha256',
+            'room_sequence',
+            'sandbox_id',
+            'schema',
+            'sequence',
+            'status',
+            'target'],
+ 'exec': ['action',
+          'binding_sha256',
+          'command_sha256',
+          'customer_request_sha256',
+          'hotel',
+          'image',
+          'image_digest',
+          'issued_at',
+          'operation_id',
+          'previous_receipt_sha256',
+          'result_sha256',
+          'room_previous_receipt_sha256',
+          'room_sequence',
+          'sandbox_id',
+          'schema',
+          'sequence',
+          'status',
+          'target'],
+ 'file_get': ['action',
+              'binding_sha256',
+              'command_sha256',
+              'customer_request_sha256',
+              'hotel',
+              'image',
+              'image_digest',
+              'issued_at',
+              'operation_id',
+              'previous_receipt_sha256',
+              'result_sha256',
+              'room_previous_receipt_sha256',
+              'room_sequence',
+              'sandbox_id',
+              'schema',
+              'sequence',
+              'status',
+              'target'],
+ 'file_put': ['action',
+              'binding_sha256',
+              'command_sha256',
+              'customer_request_sha256',
+              'hotel',
+              'image',
+              'image_digest',
+              'issued_at',
+              'operation_id',
+              'previous_receipt_sha256',
+              'result_sha256',
+              'room_previous_receipt_sha256',
+              'room_sequence',
+              'sandbox_id',
+              'schema',
+              'sequence',
+              'status',
+              'target']}
+
+
+def test_an_old_action_receipt_has_exactly_the_members_main_gives_it(front) -> None:
     a = room(front)
-    for _status, headers, _out in [front.exec(a), front.put(a), front.get_file(a), front.delete(a)]:
-        assert members(receipt_of(headers)["statement"]) == {}
-    assert members(front.statements(a)[0]) == {}
+    got = {}
+    for name, (_status, headers, _out) in {"exec": front.exec(a), "file_put": front.put(a),
+                                           "file_get": front.get_file(a), "delete": front.delete(a)}.items():
+        got[name] = sorted(receipt_of(headers)["statement"])
+    got["create"] = sorted(front.statements(a)[0])
+    assert got == MAIN_MEMBERS
 
 
 # ---------------------------------------------------------------- the fixture and its generator
@@ -705,6 +912,48 @@ def test_an_old_action_receipt_has_no_snapshot_member_and_no_new_member_at_all(f
 def test_the_generator_check_rebuilds_the_fixture_byte_for_byte() -> None:
     run = subprocess.run([sys.executable, str(GENERATOR), "--check"], capture_output=True, text=True, timeout=300)
     assert run.returncode == 0, run.stdout + run.stderr
+
+
+def _load_generator():
+    spec = importlib.util.spec_from_file_location("snapshot_fork_v1_generate_t", GENERATOR)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_check_fails_when_the_front_stops_returning_the_receipt_header() -> None:
+    gen = _load_generator()
+
+    def strip_headers(rr_module) -> None:
+        reply = rr_module.Handler.reply
+
+        def without_receipt(self, status, out, extra=None, *args, **kwargs):
+            extra = {k: v for k, v in (extra or {}).items() if k != "X-Room-Receipt"}
+            return reply(self, status, out, extra, *args, **kwargs)
+
+        rr_module.Handler.reply = without_receipt
+
+    assert gen.check(None) == 0
+    with pytest.raises(SystemExit) as raised:
+        gen.check(strip_headers)
+    assert "header" in str(raised.value)
+
+
+def test_check_fails_when_a_returned_receipt_header_differs_from_the_chain() -> None:
+    gen = _load_generator()
+
+    def alter(rr_module) -> None:
+        sign = rr_module.Ledger._sign_locked
+
+        def other(self, fields, create=None):
+            receipt = sign(self, fields, create)
+            return {**receipt, "signature_b64": receipt["signature_b64"][::-1]} if fields.get("action") == "snapshot" else receipt
+
+        rr_module.Ledger._sign_locked = other
+
+    with pytest.raises(SystemExit):
+        gen.check(alter)
 
 
 def test_the_fixture_file_sha256_is_pinned() -> None:
