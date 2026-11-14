@@ -596,11 +596,13 @@ func (b *broker) roomSnapshot(w http.ResponseWriter, r *http.Request, g *guestSt
 		payload["name"] = snapshotName(g, name)
 	}
 	out, _ := json.Marshal(payload)
-	status, _, resp, err := h.do(r.Context(), "POST", "/v1/sandboxes/"+url.PathEscape(hid)+"/snapshot", nil, out, 10*time.Minute)
+	status, hdr, resp, err := h.do(r.Context(), "POST", "/v1/sandboxes/"+url.PathEscape(hid)+"/snapshot", nil, out, 10*time.Minute)
 	if err != nil {
 		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
 		return
 	}
+	// The machine's signed receipt travels in X-Room-* headers, as on every other room route.
+	copyRoomHeaders(w.Header(), hdr)
 	var doc map[string]any
 	if json.Unmarshal(resp, &doc) != nil {
 		writeRaw(w, status, resp)
@@ -671,11 +673,12 @@ func (b *broker) handleSnapshot(w http.ResponseWriter, r *http.Request, g *guest
 		arg = body
 	}
 	// Delete and push are owner-scoped on the hotel too (AB#650).
-	status, _, out, err := h.doGuest(r.Context(), g, r.Method, path, nil, arg, timeout)
+	status, hdr, out, err := h.doGuest(r.Context(), g, r.Method, path, nil, arg, timeout)
 	if err != nil {
 		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
 		return
 	}
+	copyRoomHeaders(w.Header(), hdr)
 	var doc map[string]any
 	if json.Unmarshal(out, &doc) == nil && doc["error"] == nil {
 		if _, ok := doc["snapshot_id"]; ok {
