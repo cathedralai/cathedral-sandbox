@@ -1500,3 +1500,135 @@ def test_run_mode_refuses_a_create_without_an_integer_issued_at_with_a_reason(fa
     code, out, err = _run_mode_with_create(tmp_path, {"issued_at": value})
     assert "Traceback" not in err and code == 1, (out, err)
     assert out == {"verdict": "FAIL", "reason": "receipt 1: issued_at is not an integer"}
+
+
+# ---- the work depends on the number of receipts, never on the size of the sequence numbers
+
+HUGE_GAPS = [5, 2**63 + 3, 10**12, 10**30]
+ALLOWED_SECONDS = 3.0      # a process start included; the work itself is a few milliseconds
+
+
+def _timed_cli(*args: str) -> tuple[int, str, str, float]:
+    import subprocess
+    import time
+
+    started = time.perf_counter()
+    proc = subprocess.run([sys.executable, str(CHECKER), *args], capture_output=True, text=True, check=False,
+                          timeout=60)
+    return proc.returncode, proc.stdout, proc.stderr, time.perf_counter() - started
+
+
+def _pool_pair(gen, pack, claim_sequence: int, **claim_extra) -> list[dict]:
+    hotel = pack.new_hotel()
+    create = hotel.sign("create", "pool-1", 202, pool=True, sequence=3)
+    claim = hotel.sign("claim", "pool-1", 200, sequence=claim_sequence, **gen.claim_fields(create), **claim_extra)
+    return [create, claim]
+
+
+def _header_args(gen, pack, receipts: list[dict], tmp_path: Path) -> list[str]:
+    import base64
+
+    (tmp_path / "att.json").write_bytes(gen.pretty(pack.attestation))
+    args = ["--attestation", str(tmp_path / "att.json"), "--skip-amd", "--expected-measurement", gen.MEASUREMENT,
+            "--cathedral-sandbox", gen.CLAIM_ID]
+    for rc in receipts:
+        args += ["--receipt-header", base64.urlsafe_b64encode(gen.canonical(rc)).decode()]
+    return args
+
+
+@pytest.mark.parametrize("gap", HUGE_GAPS)
+def test_a_valid_pre_made_pair_gives_the_same_result_whatever_the_gap_between_host_sequences(gap, tmp_path) -> None:
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    code, out, err, seconds = _timed_cli(*_header_args(gen, pack, _pool_pair(gen, pack, 3 + gap), tmp_path))
+    assert "Traceback" not in err, err[-300:]
+    assert code == 0 and json.loads(out)["verdict"] == "PASS", out
+    assert json.loads(out)["room_links"] == {"pool-1": gen.CLAIM_ID}
+    assert seconds < ALLOWED_SECONDS, seconds
+
+
+@pytest.mark.parametrize("gap", [2**63 + 3, 10**30])
+def test_a_list_claimed_complete_with_a_huge_gap_keeps_its_reason_and_builds_no_span(gap, tmp_path) -> None:
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    hotel = pack.new_hotel()
+    first = hotel.sign("create", "room-a", 202)
+    last = hotel.sign("exec", "room-a", sequence=1 + gap)
+    (tmp_path / "att.json").write_bytes(gen.pretty(pack.attestation))
+    (tmp_path / "r.json").write_text(json.dumps({"receipts": [first, last], "head": last["receipt_sha256"]}))
+    code, out, err, seconds = _timed_cli("--attestation", str(tmp_path / "att.json"), "--receipts",
+                                         str(tmp_path / "r.json"), "--skip-amd", "--expected-measurement",
+                                         gen.MEASUREMENT)
+    assert "Traceback" not in err, err[-300:]
+    assert code == 1 and json.loads(out) == {"verdict": "FAIL",
+                                              "reason": "the chain has a gap or does not start at receipt 1"}
+    assert seconds < ALLOWED_SECONDS, seconds
+
+
+@pytest.mark.parametrize("gap", [2**63 + 3, 10**30])
+def test_run_mode_gives_the_same_result_whatever_the_gap_between_host_sequences(gap, tmp_path) -> None:
+    gen = _generator()
+    files, args = gen.make_run(gen.Pack(gen.read_amd()), overrides={"in0": {"sequence": 3 + gap}})
+    for name, data in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes(data)
+    code, out, err, seconds = _timed_cli(*[a.replace("{dir}", str(tmp_path)) for a in args])
+    assert "Traceback" not in err, err[-300:]
+    assert code == 0 and json.loads(out)["verdict"] == "PASS", out
+    assert seconds < ALLOWED_SECONDS, seconds
+
+
+@pytest.mark.parametrize("gap", [2**63 + 3, 10**30])
+def test_a_huge_gap_between_room_sequences_names_the_two_numbers_and_builds_no_span(gap, tmp_path) -> None:
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    hotel = pack.new_hotel()
+    create = hotel.sign("create", "pool-1", 202, pool=True)
+    claim = hotel.sign("claim", "pool-1", 200, room_sequence=1 + gap, **gen.claim_fields(create))
+    code, out, err, seconds = _timed_cli(*_header_args(gen, pack, [create, claim], tmp_path))
+    assert "Traceback" not in err, err[-300:]
+    assert code == 1 and json.loads(out) == {
+        "verdict": "FAIL", "reason": f"room pool-1: room_sequence jumps from 1 to {1 + gap}: a receipt is missing"}
+    assert seconds < ALLOWED_SECONDS, seconds
+
+
+def _bulk(count: int, rooms: int) -> list[dict]:
+    """Numbered statements without signatures (room_numbering reads none): `rooms` rooms, round robin."""
+    previous: dict[int, str | None] = {}
+    seen: dict[int, int] = {}
+    receipts = []
+    for i in range(count):
+        room = i % rooms
+        seen[room] = seen.get(room, 0) + 1
+        digest = f"{i:064x}"
+        receipts.append({"receipt_sha256": digest, "statement": {
+            "binding_sha256": "b" * 64, "sequence": i + 1, "sandbox_id": f"room-{room}", "action": "exec",
+            "status": 200, "room_sequence": seen[room], "room_previous_receipt_sha256": previous.get(room)}})
+        previous[room] = digest
+    return receipts
+
+
+@pytest.mark.parametrize("count, rooms", [(30000, 1), (30000, 30000)], ids=["one-room", "many-rooms"])
+def test_room_numbering_takes_time_in_proportion_to_the_receipts(count, rooms) -> None:
+    import time
+
+    vr = _load_checker()
+    receipts = _bulk(count, rooms)
+    started = time.perf_counter()
+    out = vr.room_numbering(receipts)
+    assert time.perf_counter() - started < 5.0
+    assert len(out["rooms"]) == rooms
+
+
+def test_a_chain_of_many_receipts_is_checked_in_proportion_to_their_number(tmp_path) -> None:
+    import time
+
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    hotel = pack.new_hotel()
+    receipts = [hotel.sign("exec", "room-a") for _ in range(20000)]
+    vr = _load_checker()
+    att = pack.attestation
+    started = time.perf_counter()
+    out = vr.verify_receipts(att, receipts, hotel.head)
+    assert time.perf_counter() - started < 20.0 and out["contiguous"] is True
