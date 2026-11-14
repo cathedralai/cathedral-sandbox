@@ -120,10 +120,11 @@ What the host of a config hotel can do besides availability (a miner hotel
 keeps the key and the traffic from the host; see "Miner hotel"):
 
 - It holds the hotel API key, so it can create rooms, run commands and read
-  files through the API. Create, exec, process start, network change, delete
-  and bulk delete pass the signing front and get a receipt. File read and
-  write, tar, stat, snapshot, fork, wait, process logs and process stop do
-  not: the host can read or plant a file in a room with no receipt.
+  files through the API. Create (a fork is a create), exec, process start,
+  network change, delete, bulk delete, file read and write, snapshot and
+  snapshot delete pass the signing front and get a receipt. Tar, stat, wait,
+  process logs and process stop do not: the host can read or plant a file in
+  a room with no receipt.
 - The broker reaches the API over plain HTTP on the tap link. The host can
   read that traffic (commands, outputs, files) without leaving a receipt.
 - On a dedicated machine the host still holds the hotel key, but it cannot
@@ -276,6 +277,30 @@ The broker admits the machine only if its HOST_DATA is in `sealed_host_data`
   so the customer can check that the room was created for their sandbox
   without taking the API's word. Any other value is not signed. Receipts
   without the field (older guests, other callers) stay valid.
+- A snapshot receipt (`POST /v1/sandboxes/<id>/snapshot`, action `snapshot`) takes
+  the room's next number. On a 2xx answer it carries `snapshot_id`,
+  `snapshot_image_id`, `snapshot_work_archive_sha256`, `snapshot_size_bytes` and
+  `snapshot_content_sha256`. The front computes the last one as the sha256 of
+  the canonical document `cathedral_snapshot_content_v1` with the image id and
+  the tar hash. It covers the image id and the hash of the tar of `/work`; the
+  image's layers are not hashed again at a fork. The front signs it only from a
+  complete machine answer for that room. Any other 2xx answer is answered 502
+  `snapshot_unsigned`, signed with status 502 and no snapshot member, and the
+  snapshot is not remembered. A failed snapshot carries none of the members.
+- A fork is a create that names `snapshot_id`. If it succeeds, its create
+  receipt carries `snapshot_id`, `snapshot_content_sha256`,
+  `snapshot_receipt_sha256` (the `receipt_sha256` of the first snapshot
+  receipt that signed it) and `snapshot_source_sandbox_id`. The front takes
+  them from its own memory of the snapshots it signed, not from the request.
+  The fork's room starts its own numbering at 1. A fork of a snapshot this
+  front did not sign since it started (for example after a restart) is refused
+  unsent with 404 `snapshot_not_found`; a fork that carries the `cathedral_pool`
+  label is refused with 400 `reserved_label_invalid`.
+- `DELETE /v1/snapshots/<id>` is signed as `snapshot_delete`, with a null
+  `sandbox_id` and `snapshot_id`; `snapshot_source_sandbox_id` is there when the
+  front still remembers the snapshot. A delete is a delete request, not a
+  statement that bytes are erased. A push of a snapshot to a registry is refused
+  with 403 `snapshot_push_refused`, unsent.
 
 Routes (through the broker):
 

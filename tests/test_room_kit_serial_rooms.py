@@ -208,7 +208,7 @@ def test_file_receipt_target_keeps_the_query_that_selects_the_file(front) -> Non
 
 
 @pytest.mark.parametrize("method,tail", [
-    ("POST", "/terminals"), ("PUT", "/directories"), ("POST", "/snapshot"), ("POST", "/expose"),
+    ("POST", "/terminals"), ("PUT", "/directories"), ("POST", "/expose"),
     ("POST", "/terminals/t1/input"), ("DELETE", "/processes/1"), ("PUT", "/tar"),
     ("POST", "/freeze"), ("GET", "/terminals/t1/output"), ("PATCH", ""),
 ])
