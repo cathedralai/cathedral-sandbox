@@ -72,12 +72,19 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
 
 Run mode (--oneshot FILE, a cathedral_oneshot_bundle_v1) checks one run's file offline against what the
 caller expects, in eight checks. The AMD certificates come from the file (amd_certs) and must match
---ark-sha256, which run mode requires; --skip-amd is refused. Any missing input is a FAIL, never a guess.
+--ark-sha256, which run mode requires. Any missing input is a FAIL, never a guess.
 Run mode takes --oneshot, --recipe, --context or --no-context, --run-id, --input-sha256, --input-file,
 --output-file, --expected-measurement, --allowed-measurements, --ark-sha256, --product and --require-sealed (which
-changes nothing: run mode always requires an SEV-SNP attestation). Every other flag is refused with exit 2. The
-owner check (--owner-pubkey) and the guest TLS key check (--tls-spki-sha256, --require-tls) are list-mode checks;
-run mode does not do them.
+changes nothing: run mode always requires an SEV-SNP attestation). These flags are usage errors with exit 2:
+--receipts, --attestation, --broker, --origin, --key-file, --operator-key-file, --hotel, --sandbox,
+--receipt-header, --cathedral-sandbox, --save, --owner-pubkey, --tls-spki-sha256, --require-tls and --kds-cache,
+whether given with a value, an empty value or the old default. --skip-amd is a failed check 1 (exit 1). --help
+exits 0. The owner check (--owner-pubkey) and the guest TLS key check (--tls-spki-sha256, --require-tls) are
+list-mode checks; run mode does not do them.
+--product: a report with CPUID fields (version 3 on) names its own product. A family with no layout fails whatever
+--product says, and a --product that names another product than the report fails. Only a version 2 report, which
+has no CPUID fields, takes the product from --product; there nothing in the report can contradict the name, and
+Milan and Genoa share the layout.
   1. attestation, AMD chain, measurement (--expected-measurement, repeatable, or --allowed-measurements FILE),
      every receipt's signature, one binding.
   2. the room's receipts run 1 to m with every link right, receipt 1 is the create and says serial: true,

@@ -108,9 +108,14 @@ level 1 chain has no SNP report.
 
 `verify_receipts.py --oneshot FILE` checks one one-shot run's file offline (run mode). It takes `--recipe`,
 `--context` or `--no-context`, `--run-id`, `--input-sha256`, `--input-file`, `--output-file`,
-`--expected-measurement`, `--allowed-measurements`, `--ark-sha256`, `--product` and `--require-sealed`; any other
-flag is refused with exit 2. The owner check and the guest TLS key check are list-mode checks that run mode does
-not do. The module's header documents the eight checks.
+`--expected-measurement`, `--allowed-measurements`, `--ark-sha256`, `--product` and `--require-sealed`. The other
+flags of the list-mode commands (`--receipts`, `--attestation`, `--broker`, `--origin`, `--key-file`,
+`--operator-key-file`, `--hotel`, `--sandbox`, `--receipt-header`, `--cathedral-sandbox`, `--save`,
+`--owner-pubkey`, `--tls-spki-sha256`, `--require-tls`, `--kds-cache`) are usage errors with exit 2, even with an
+empty value. `--skip-amd` is a failed check 1 (exit 1), and `--help` exits 0. `--product` names the product only
+for a version 2 report, which has no CPUID fields; a report with CPUID fields names its own product, a family with
+no layout fails, and a different `--product` fails. The owner check and the guest TLS key check are list-mode
+checks that run mode does not do. The module's header documents the eight checks.
 
 Sealed SNP receipts are a separate path and stay opt-in. `install.sh --sealed`
 builds a guest that sets `ROOM_RECEIPTS=1` and its own listen address. Inside
