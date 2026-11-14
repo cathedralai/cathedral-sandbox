@@ -276,11 +276,41 @@ Rejected:
 ## Rollout (Toby)
 
 1. Review and merge. Nothing changes on a hotel until it is rebuilt.
-2. Canary, one hotel, in an approved window: set `SEALED_DATA_GIB` (the disk
-   check counts it), rebuild, roll. The first roll needs no
-   `SEALED_DATA_ON_NEW_BUILD`: there is no `data.raw` yet. Check health
-   `workspaces_storage.state` is `new`; restart the guest; check `open` and
-   that a workspace file is still there.
+2. Canary, one hotel, in an approved window. Pick a shared config hotel (the
+   proof drives the hotel API with the host's hotel key, so not a miner hotel
+   and not a dedicated one). Steps:
+   - Set `SEALED_DATA_GIB` and `SEALED_ROOM_WORKSPACES=1` (the disk check counts
+     the data disk). Size it so the first boot fits the 15 min attestation wait
+     of `install.sh --sealed`: the first boot reads the whole blank disk.
+   - Rebuild and measure. Both settings are in the measured `room.env`, so the
+     measurement and the shared HOST_DATA change: the new measurement goes into
+     `approved-measurements.json` (cathedral-site PR) and the broker's
+     `sealed_host_data` before the roll.
+   - Cordon or drain the canary in the broker, then roll. The first roll needs
+     no `data-on-new-build` choice: there is no `data.raw` yet.
+   - Copy `scripts/sealed_data_proof.py` to the host (one file, standard
+     library only), run the restart proof and paste its output on the card:
+
+     ```
+     sudo python3 scripts/sealed_data_proof.py restart --env /srv/sealed-hotel/sealed.env
+     ```
+
+     It refuses (exit 2, nothing done) on a miner or dedicated hotel, with the
+     data volume off, when health `workspaces_storage` is not `new` or `open`,
+     or with live rooms (`--allow-live-rooms` overrides; those rooms end with
+     no delete receipt). It then writes a random marker and 20,000 marker lines
+     to a new workspace and a copy onto the room's own root file system (the
+     scratch disk), waits 45 s for writeback (a unit stop is a power cut for
+     the guest), restarts `room-sealed-<name>.service`, waits for a new
+     `boot_id`, and checks: the same measurement and HOST_DATA, health `open`,
+     `persistent` true, the same `key_id`, the workspace listed, a new room
+     reading the marker and the 20,000 lines back. On the host it counts the
+     marker in the allocated extents of `data.raw` and `scratch.raw` (must be
+     0), checks the LUKS2 magic and samples the entropy of the written sectors
+     after the header. It deletes its rooms and the workspace (unless
+     `--keep-workspace`). Exit 0 and `Result: PASS` only if every step passes.
+     The hotel key is never printed.
+   - Uncordon.
 3. Copy for customers: workspaces on sealed hotels last until the next
    re-seal (phase 1), not forever.
 
@@ -391,6 +421,33 @@ reset choice with the EXIT-trap restore, launch-identity ownership, the
 `persistent` field, the miner-key fsync) are covered by
 `tests/test_room_kit_sealed_data.py`. They were not re-run on c48: the next c48
 window fell inside the 15:00 to 17:00 UTC escape rehearsal on 7 Nov, which is
-off limits. The planned hardware check is a `cipher_null` header edit on a
-throwaway `data.raw`, confirming `verify_header()` reports `tampered` and does
-not mkfs or mount; it runs after 17:15 UTC or in the next free window.
+off limits. The real-kernel `cipher_null` check runs on a throwaway non-production guest
+(c48), never on a hotel that holds customer workspaces. Boot the build once so
+its volume is `open`, then:
+
+```
+sudo python3 scripts/sealed_data_proof.py null-cipher --throwaway --env sd/sealed.env \
+  --stop-cmd 'systemctl stop diskproof-guest' --start-cmd '<the systemd-run line>'
+```
+
+It refuses a guest that holds workspaces (`--allow-workspaces` overrides) or
+has live rooms. It stops the guest, saves both LUKS2 headers to
+`data.raw.luks-header-<stamp>`, sets segment 0 to `cipher_null-ecb` in both
+headers with valid checksums, hashes the allocated extents of `data.raw`,
+boots, and reads health. Verdicts:
+
+| State after the boot | Verdict |
+|---|---|
+| `tampered`, persistent false | PASS: `verify_header()` refused the header |
+| `locked` or `broken` | SAFE, `verify_header()` not exercised: cryptsetup refused the edited header itself |
+| `new`, `open` or `unknown` | FAIL |
+
+It then stops the guest again and requires the hash of `data.raw` to be
+unchanged (no mkfs, no write). The paste carries the `[sealed-data]` serial
+lines, which show the branch the guest took. `--target keyslot` edits key slot
+0's area instead; that is a negative control (a null key slot area never
+decrypts the key, so `locked` is expected with or without the 2.8.1 refusal).
+Restore with `sealed_data_proof.py edit-header data.raw --restore <backup>`.
+`edit-header` alone edits or restores a header in place (both copies,
+checksums recomputed; it refuses anything but two equal, valid sha256 LUKS2
+headers, so cryptsetup has nothing to repair on the next open).
