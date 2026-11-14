@@ -116,7 +116,7 @@ empty value. `--skip-amd` is a failed check 1 (exit 1), and `--help` exits 0. `-
 for a version 2 report, which has no CPUID fields; no other version reads the flag, a version 0, 1 or above 5
 report fails, a report with CPUID fields names its own product, a family with no layout fails, and a different
 `--product` fails. The owner check and the guest TLS key check are list-mode
-checks that run mode does not do. The module's header documents the eight checks.
+checks that run mode does not do. The module's header documents the eight checks. Both modes name an attestation whose `kernel_cmdline` is not a string, whose receipt key is not base64 of 32 bytes, or whose `report_b64` is not base64 as an input fault, with the same reason (run mode adds the prefix `check 1: `).
 
 Sealed SNP receipts are a separate path and stay opt-in. `install.sh --sealed`
 builds a guest that sets `ROOM_RECEIPTS=1` and its own listen address. Inside

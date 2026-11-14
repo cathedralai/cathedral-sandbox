@@ -96,6 +96,10 @@ List mode also refuses, with a reason and never an uncaught error, a receipt tha
 statement, a statement whose sequence, binding, action, status or room id has the wrong type, a network_policy
 that is not an object with a string mode and a list allow, and a receipt that carries a policy (or closes a policy
 timeline) without an integer issued_at and status.
+Both modes refuse, as a named input fault (in run mode with the prefix "check 1: "), an attestation whose binding
+has a kernel_cmdline that is not a string ("the attestation's binding kernel_cmdline is not a string"), a receipt
+key that is not base64 of exactly 32 bytes ("the attestation's binding receipt_key is not base64 of a 32-byte
+key"), or a report_b64 that is not base64 ("the attestation's report_b64 is not base64").
   1. attestation, AMD chain, measurement (--expected-measurement, repeatable, or --allowed-measurements FILE),
      every receipt's signature, one binding.
   2. the room's receipts run 1 to m with every link right, receipt 1 is the create and says serial: true,
@@ -972,9 +976,21 @@ def check_attestation_shape(att) -> None:
     need(isinstance(att, dict) and isinstance(att.get("binding"), dict) and isinstance(att.get("binding_sha256"), str),
          "the attestation is not an object with a binding object and a binding_sha256 string")
     binding = att["binding"]
-    need(isinstance(binding.get("receipt_key_ed25519_b64"), str), "the attestation's binding has no receipt_key string")
+    key = binding.get("receipt_key_ed25519_b64")
+    need(isinstance(key, str), "the attestation's binding has no receipt_key string")
+    try:
+        valid_key = len(base64.b64decode(key, validate=True)) == 32
+    except ValueError:
+        valid_key = False
+    need(valid_key, "the attestation's binding receipt_key is not base64 of a 32-byte key")
+    need(binding.get("kernel_cmdline") is None or isinstance(binding["kernel_cmdline"], str),
+         "the attestation's binding kernel_cmdline is not a string")
     if not is_hotel_level(att):
         need(isinstance(att.get("report_b64"), str), "the attestation has no report_b64 string")
+        try:
+            base64.b64decode(att["report_b64"], validate=True)
+        except ValueError as exc:
+            raise Fail("the attestation's report_b64 is not base64") from exc
         for key in ("measurement", "chip_id", "reported_tcb", "policy", "host_data"):
             need(isinstance(binding.get(key), str), f"the attestation's binding has no {key} string")
 
@@ -1699,6 +1715,10 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
             need(key in receipt, f"check 1: a receipt has no {key}")
     need(all(isinstance(r["statement"], dict) for r in receipts), "check 1: the file holds no receipts")
     need(not is_hotel_level(att), "check 1: an SEV-SNP attestation is required")
+    try:
+        check_attestation_shape(att)
+    except Fail as exc:
+        raise Fail(f"check 1: {exc}") from exc
     need(isinstance(certs, dict) and all(isinstance(certs.get(k), str) for k in ("vcek", "ask", "ark")),
          "check 1: the file holds no AMD certificates (amd_certs)")
     try:
