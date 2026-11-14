@@ -614,6 +614,35 @@ def _claim_with_lifetime_held(front: Front):
     return held, t, box
 
 
+def test_repeat_claim_by_same_id_during_bulk_gets_stored_answer(front) -> None:
+    room = pool_room(front, labels={"cathedral_pool": "1", "team": "b"})
+    status, headers, _out = claim(front, room)
+    assert status == 200
+    first = receipt_of(headers)
+    held = front.api.hold(r"DELETE /v1/sandboxes")
+    t, box = in_thread(front.call, "DELETE", BULK)  # team=a cannot match this room
+    held.wait_entered()
+    try:
+        status, headers, out = claim(front, room)
+        assert status == 200, (status, out)
+        assert receipt_of(headers) == first
+    finally:
+        held.release.set()
+        finish(t, box)
+    assert_idle(front.ledger)
+
+
+def test_bulk_delete_completed_before_claim_does_not_claim_removed_room(front) -> None:
+    room = pool_room(front, labels={"cathedral_pool": "1", "team": "a"})
+    assert front.call("DELETE", BULK)[0] == 200
+    assert room not in front.api.rooms
+    status, headers, out = claim(front, room)
+    assert status == 409 and code(out) == "pool_claim_failed"
+    assert receipt_of(headers)["statement"]["status"] == 404
+    assert room not in front.ledger.claimed
+    assert_idle(front.ledger)
+
+
 def test_claim_refuses_while_a_bulk_delete_is_in_flight(front) -> None:
     room = pool_room(front, labels={"cathedral_pool": "1", "team": "a"})
     held = front.api.hold(r"DELETE /v1/sandboxes")
