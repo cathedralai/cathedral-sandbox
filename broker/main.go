@@ -1279,6 +1279,7 @@ func isMinerHotel(h *hotel) bool {
 }
 
 func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestState, rest string) {
+	tRecv := time.Now()
 	bid, tail, _ := strings.Cut(rest, "/")
 	// Room terminals open only on hotels known to run a package where a
 	// terminal line goes through the runtime's exec (B154).
@@ -1352,7 +1353,15 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	if r.Method != "GET" && r.Method != "DELETE" {
 		bodyArg = body
 	}
+	tDispatch := time.Now()
 	status, hdr, out, err := h.do(r.Context(), r.Method, path, r.URL.Query(), bodyArg, timeout)
+	// AB#741: the same split as a create (X-Broker-Queue-Ms, X-Broker-Hotel-Ms) on
+	// every answer that went to the hotel, failures included, so a burst of execs
+	// can be split into broker and hotel time per request. Here the "queue" is the
+	// broker's own time before the hotel call (reading the body, the room lookup);
+	// this path has no wait slot. An answer without them was refused by the broker
+	// before the hotel was asked.
+	setBrokerTiming(w.Header(), h.cfg.ID, tDispatch.Sub(tRecv), time.Since(tDispatch))
 	if err != nil {
 		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
 		return
@@ -1392,6 +1401,14 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	}
 	w.WriteHeader(status)
 	_, _ = w.Write(out)
+}
+
+// setBrokerTiming names the hotel and splits the broker's time into the wait
+// before the hotel call (queue) and the hotel call itself, in milliseconds.
+func setBrokerTiming(dst http.Header, hotelID string, queue, call time.Duration) {
+	dst.Set("X-Broker-Hotel", hotelID)
+	dst.Set("X-Broker-Queue-Ms", strconv.FormatFloat(ms(queue), 'f', 1, 64))
+	dst.Set("X-Broker-Hotel-Ms", strconv.FormatFloat(ms(call), 'f', 1, 64))
 }
 
 // copyRoomHeaders passes the hotel's X-Room-* headers (for example the signed
