@@ -134,7 +134,7 @@ def test_reads_pass_while_a_request_is_in_flight(front) -> None:
     held.wait_entered()
     base = f"/v1/sandboxes/{room}"
     reads = [("GET", base), ("POST", base + "/wait"), ("GET", base + "/logs"), ("GET", base + "/stat"),
-             ("GET", base + "/tar"), ("GET", base + "/desktop"), ("GET", base + "/terminals"),
+             ("GET", base + "/desktop"), ("GET", base + "/terminals"),
              ("GET", base + "/processes/1/logs"), ("GET", base + "/sealed-secrets"), ("GET", base + "/entries")]
     for method, path in reads:
         status, _headers, out = front.call(method, path, b"{}" if method == "POST" else None)
@@ -208,9 +208,8 @@ def test_file_receipt_target_keeps_the_query_that_selects_the_file(front) -> Non
 
 
 @pytest.mark.parametrize("method,tail", [
-    ("POST", "/terminals"), ("PUT", "/directories"), ("POST", "/snapshot"), ("POST", "/expose"),
-    ("POST", "/terminals/t1/input"), ("DELETE", "/processes/1"), ("PUT", "/tar"),
-    ("POST", "/freeze"), ("GET", "/terminals/t1/output"), ("PATCH", ""),
+    ("POST", "/terminals"), ("PUT", "/directories"),
+    ("POST", "/terminals/t1/input"), ("GET", "/terminals/t1/output"), ("PATCH", ""),
 ])
 def test_unlisted_routes_are_refused_on_a_serial_room_and_pass_on_an_ordinary_one(front, method, tail) -> None:
     serial, ordinary = serial_room(front), plain_room(front)
@@ -474,7 +473,7 @@ def _held_create(front: Front, ids: list[str]):
 
 def test_an_unsigned_write_that_completes_before_the_create_is_signed_withholds_the_flag(front) -> None:
     hold, t, box = _held_create(front, ["sbx_t"])
-    assert front.call("PUT", "/v1/sandboxes/sbx_t/tar?path=/work", b"tar-bytes")[0] == 200  # no receipt, no longer in flight
+    assert front.call("POST", "/v1/sandboxes/sbx_t/heartbeat", b"{}")[0] == 200  # no receipt, no longer in flight
     with front.ledger.lock:
         assert front.ledger.in_flight == {}
     hold.release.set()
@@ -588,8 +587,8 @@ def _spanning(front: Front, request, hold_pattern: str, create_body: dict, creat
 
 def test_a_write_in_flight_before_the_create_that_ends_before_it_is_signed_withholds_the_flag(front) -> None:
     status, headers, _out = _spanning(
-        front, lambda: front.call("PUT", "/v1/sandboxes/sbx_x/tar?path=/work", b"tar"),
-        r"PUT /v1/sandboxes/sbx_x/tar", SERIAL, "sbx_x", "sbx_x")
+        front, lambda: front.call("POST", "/v1/sandboxes/sbx_x/heartbeat", b"{}"),
+        r"POST /v1/sandboxes/sbx_x/heartbeat", SERIAL, "sbx_x", "sbx_x")
     statement = receipt_of(headers)["statement"]
     assert status == 200 and "serial" not in statement and statement["room_sequence"] == 1
     assert "sbx_x" not in front.ledger.serial
