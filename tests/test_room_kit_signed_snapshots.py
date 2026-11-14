@@ -660,15 +660,67 @@ def test_the_snapshot_map_evicts_the_oldest_first_and_a_fork_of_an_evicted_one_i
         assert fork(front, sid)[0] == 200
 
 
-def test_the_deleted_ids_record_has_the_same_cap(front, monkeypatch) -> None:
+def test_a_delete_during_a_capture_wins_however_many_other_deletes_follow(front, monkeypatch) -> None:
+    # The in-flight capture is tracked directly, so no cap on anything can let the deleted id come back.
     monkeypatch.setattr(rr, "SNAPSHOT_MAP_CAP", 2)
+    a, b = room(front), room(front)
+
+    def machine(other: str) -> None:
+        front.api.replies.clear()
+        front.api.reply(rf"POST /v1/sandboxes/{a}/snapshot", 202, answer())
+        front.api.reply(rf"POST /v1/sandboxes/{b}/snapshot", 202, answer(other))
+        front.api.reply(r"DELETE /v1/snapshots/[^/]+", 200, {"deleted": True})
+
+    machine("snap_00000000000f")
+    held = front.api.hold(rf"POST /v1/sandboxes/{a}/snapshot")
+    t, box = in_thread(front.call, "POST", f"/v1/sandboxes/{a}/snapshot", {})
+    held.wait_entered()
+    assert front.call("DELETE", f"/v1/snapshots/{SNAP}")[0] == 200
+    for n in range(1, 6):  # five other captures and deletes: past a cap of 2
+        other = f"snap_00000000000{n}"
+        machine(other)
+        assert front.call("POST", f"/v1/sandboxes/{b}/snapshot", {})[0] == 202
+        assert front.call("DELETE", f"/v1/snapshots/{other}")[0] == 200
+    held.release.set()
+    status, headers, out = finish(t, box)
+    assert status == 502 and code(out) == "snapshot_unsigned" and members(receipt_of(headers)["statement"]) == {}
+    sent = front.api.count(r"POST /v1/sandboxes")
+    assert fork(front)[0] == 404 and front.api.count(r"POST /v1/sandboxes") == sent
+    assert_idle(front.ledger)
+
+
+def test_a_delete_marks_every_capture_in_flight_and_only_those(front) -> None:
+    a, b = room(front), room(front)
+    front.api.replies.clear()
+    front.api.reply(rf"POST /v1/sandboxes/{a}/snapshot", 202, answer())
+    front.api.reply(rf"POST /v1/sandboxes/{b}/snapshot", 202, answer("snap_0000000000bb"))
+    front.api.reply(r"DELETE /v1/snapshots/[^/]+", 200, {"deleted": True})
+    held = front.api.hold(rf"POST /v1/sandboxes/{a}/snapshot")
+    ta, boxa = in_thread(front.call, "POST", f"/v1/sandboxes/{a}/snapshot", {})
+    held.wait_entered()
+    assert front.call("DELETE", "/v1/snapshots/snap_0000000000bb")[0] == 200  # another id: A's capture is unmarked
+    held.release.set()
+    assert finish(ta, boxa)[0] == 202
+    assert fork(front)[0] == 200
+
+
+def test_a_late_not_found_does_not_remove_a_replacement_entry(front) -> None:
     a = room(front)
-    for n in range(1, 6):
-        sid = f"snap_00000000000{n}"
-        snapshot_ok(front, a, sid)
-        assert snapshot_delete(front, sid)[0] == 200
-    with front.ledger.lock:
-        assert len(front.ledger.deleted_snapshots) == 2 and len(front.ledger.snapshots) == 0
+    snapshot_ok(front, a)
+    held = front.api.hold(r"POST /v1/sandboxes")
+    t, box = in_thread(fork, front)  # admitted against the first X
+    held.wait_entered()
+    assert snapshot_delete(front)[0] == 200
+    replacement = snapshot_ok(front, a)  # a new X, a new receipt
+    front.api.reply(r"POST /v1/sandboxes", 404, {"error": {"code": "snapshot_not_found", "message": "no snapshot"}})
+    held.release.set()
+    assert finish(t, box)[0] == 404  # the old fork's own answer
+    front.api.replies.clear()
+    held.release.set()
+    status, headers, _out = fork(front)
+    assert status == 200
+    assert receipt_of(headers)["statement"]["snapshot_receipt_sha256"] == replacement["receipt_sha256"]
+    assert_idle(front.ledger)
 
 
 def test_a_machine_answer_snapshot_not_found_to_a_fork_drops_the_entry(front) -> None:
