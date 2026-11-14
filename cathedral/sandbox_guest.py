@@ -1308,6 +1308,11 @@ class DockerGuestProvider:
         self._built_images: dict[str, str] = {}  # content_hash -> tag
         self._build_locks: dict[str, threading.Lock] = {}  # tag -> lock; one build per tag
         self._build_locks_guard = threading.Lock()
+        # Anonymous pulls run once per image at a time (AB#534). A waiter whose
+        # generation moved while it waited reuses that pull instead of pulling.
+        self._pull_locks: dict[str, threading.Lock] = {}
+        self._pull_gen: dict[str, int] = {}
+        self._pull_guard = threading.Lock()
         # GC state. A sandbox id in _doomed has a "deleting" record and a container
         # that is not yet confirmed gone. Only one drain runs at a time.
         self._owner = os.environ.get("CATHEDRAL_SANDBOX_OWNER", "").strip() or "default"
@@ -1824,12 +1829,16 @@ class DockerGuestProvider:
         # One inspect answers both "is it here" and "what is it" on a cache hit.
         inspected = {} if refresh else self._client.image_inspect(image)
         if not inspected.get("Id"):
-            self._client.ensure_image(
-                image,
-                registry_auth=registry_auth,
-                refresh=refresh,
-                mirror=self._registry_mirror,
-            )
+            if registry_auth is not None:
+                # Each caller's credentials must reach the registry: never shared.
+                self._client.ensure_image(
+                    image,
+                    registry_auth=registry_auth,
+                    refresh=refresh,
+                    mirror=self._registry_mirror,
+                )
+            else:
+                self._pull_anonymous_once(image, refresh=refresh)
             # Record the marker right after the pull and before any inspect, so a
             # failed inspect after a pull still leaves it set.
             if registry_auth is not None:
@@ -1837,6 +1846,25 @@ class DockerGuestProvider:
                 _save_auth_pulled(self._auth_pulled)
             inspected = self._client.image_inspect(image)
         return inspected
+
+    def _pull_anonymous_once(self, image: str, *, refresh: bool) -> None:
+        """Singleflight for anonymous pulls of *image* (AB#534).
+
+        A burst of cold creates for one image runs one docker pull; the others
+        wait and reuse it. An anonymous pull that succeeded proves anyone may
+        fetch the image, so sharing it does not weaken the per-caller check in
+        _authorize_image. A failed pull is not shared: the next waiter pulls.
+        """
+        with self._pull_guard:
+            lock = self._pull_locks.setdefault(image, threading.Lock())
+            before = self._pull_gen.get(image, 0)
+        with lock:
+            with self._pull_guard:
+                if self._pull_gen.get(image, 0) != before:
+                    return
+            self._client.ensure_image(image, refresh=refresh, mirror=self._registry_mirror)
+            with self._pull_guard:
+                self._pull_gen[image] = before + 1
 
     def _start_guest(
         self, doc: dict[str, Any], request: CreateSandboxRequest, owner: str | None = None
