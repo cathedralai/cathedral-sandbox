@@ -182,6 +182,13 @@ sed -e 's/\r$//' -n -e 's/^data: \{0,1\}//p' "$work/raw" | grep -v '^\[DONE\]$' 
 if jq -e 'select(.error != null)' "$work/chunks" >/dev/null 2>&1; then
   fail "the stream carried an error: $(jq -c 'select(.error != null) | .error' "$work/chunks" | head -c 300)"
 fi
+# A 200 response can close after partial output. Require both the model's
+# terminal choice and the SSE terminator before publishing signed timings.
+if ! sed 's/\r$//' "$work/raw" | grep -Eq '^data: ?\[DONE\]$' ||
+   ! jq -s -e '[.[] | .choices[0].finish_reason? | strings | select(length > 0)] | length > 0' \
+     "$work/chunks" >/dev/null; then
+  fail "the stream is incomplete (no final choice or [DONE])"
+fi
 jq -s -j '[.[] | ((.choices // [])[0].delta.content // empty) | strings] | join("")' "$work/chunks" >"$work/answer"
 jq -s -c '[.[] | .timings | objects] | last // empty' "$work/chunks" >"$work/timings"
 [ -s "$work/timings" ] || fail "the stream carried no timings"
