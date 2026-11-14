@@ -2326,7 +2326,8 @@ func main() {
 	if err := b.loadRuntimeHotels(); err != nil {
 		log.Printf("runtime hotels not loaded: %v", err)
 	}
-	b.loadCaps() // after the runtime hotels, or their probe results are dropped
+	b.loadCaps()          // after the runtime hotels, or their probe results are dropped
+	b.resumeNativeExecs() // after every hotel is known: re-attach execs that ran across the restart (AB#756)
 	saved := make(chan struct{})
 	go func() {
 		b.saveLoop(ctx)
@@ -2357,6 +2358,7 @@ func main() {
 	go func() {
 		sig := <-stop
 		log.Printf("%s: stopping, saving client state", sig)
+		b.stopNativeResume() // re-attach loops end now; the next broker picks them up
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
