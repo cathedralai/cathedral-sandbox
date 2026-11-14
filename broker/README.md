@@ -11,7 +11,7 @@ The broker does four things:
 | Scatter | `POST /v1/sandboxes` (also `count` up to 10,000) | Picks a hotel at random, with weight = free rooms. Each hotel has a fixed number of creates in flight (`concurrency`). If a hotel answers 429, the broker tries another hotel. If no hotel has a free room, it answers 429 `no_free_rooms`. If all matching hotels are down or draining, it answers 503 `hotels_unavailable`. |
 | Gather | `GET /v1/sandboxes`, `GET /v1/quota`, `GET /v1/usage`, `DELETE /v1/sandboxes?label=` | Asks all hotels in parallel and merges the answers. A guest sees only its own rooms. |
 | Route | `/v1/sandboxes/<hotel>.<id>/...` | Sends exec, files, tar, heartbeat, delete and the other room calls to the hotel that has the room. |
-| Show | `/<guest>/live` | Live view: one tile per hotel, one square per room, live counters. |
+| Show | `/<guest>/live` | Live view: one tile per hotel, one square per room, live counters. Private: open with the view token or a share link (`POST /v1/live/shares`). |
 
 Room ids are `<hotel id>.<hotel room id>`. The broker adds the label
 `broker_guest=<guest>` to each room it creates, and filters on it.
@@ -582,6 +582,34 @@ to the page and to its data stream (`/<guest>/live/events`, server-sent
 events, 1 per second) needs that cookie. A wrong token and an unknown guest
 both get 401. The page shows hotel names, threads and RAM from the config,
 never addresses. Squares of other guests are grey. The page lists only the hotels that guest may use (the same rule as its capacity view), plus any hotel where it still owns a room. `rooms_all` and `deleting_all` are sent only for a hotel where the guest owns a room.
+
+### Share links (AB#584)
+
+No live view is public. To drop people into a run, the guest mints a share
+link for that run with its own key and sends the link instead of the view
+token:
+
+```
+POST   /v1/live/shares        {"ttl_s": 14400, "label": "scale run 3"}  -> 201 {id, label, url, created_at, expires_at}
+GET    /v1/live/shares        -> {shares: [{id, label, created_at, expires_at}]}
+DELETE /v1/live/shares/<id>   -> 204
+```
+
+- `url` is a path, `/<guest>/live?share=<token>`; put the broker's public
+  host in front of it. The token is shown once, in that answer only.
+- `ttl_s` is 60 to 604800 seconds (default 4 hours). `label` is optional,
+  one line of at most 80 bytes. A guest can hold 50 unexpired links.
+- Opening the link sets an HttpOnly `bvs_<guest>` cookie that ends with
+  the link and redirects to `/<guest>/live`, so the token leaves the
+  address bar (it stays in that browser's history until the link ends).
+- The link shows the same view as the view token: that guest's hotels and
+  rooms only. A link for one guest never opens another. It works for a
+  guest with no view token.
+- Every page and stream request rechecks the link. A revoke or expiry
+  closes the page on the next request and ends an open stream within a
+  second.
+- The broker keeps only sha256 of each token, in memory. A broker restart
+  ends every link.
 
 ## Run
 

@@ -296,6 +296,10 @@ type broker struct {
 	// tombs is guest id -> recent deletes by label, which also catch creates
 	// in flight (inflight.go). Guarded by b.mu.
 	tombs map[string][]tombstone
+
+	// shares is sha256(share token) -> live view share link (live_share.go).
+	// In memory only. Guarded by b.mu.
+	shares map[string]*liveShare
 }
 
 // A hotel counts as answering while its last good health answer is younger than okWindow.
@@ -384,7 +388,7 @@ func loadBroker(path string) (*broker, error) {
 	default:
 		return nil, fmt.Errorf(`config: sealed_admission %q: the top-level value can only be "on" (or absent)`, c.SealedAdmission)
 	}
-	b := &broker{cfg: c, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), nexec: newNativeExecs(), started: time.Now()}
+	b := &broker{cfg: c, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), nexec: newNativeExecs(), shares: map[string]*liveShare{}, started: time.Now()}
 	var optedIn []string // require_attestation hotels, for one deprecation line
 	for _, hc := range c.Hotels {
 		if err := validateSealedAdmission(hc); err != nil {
@@ -1923,19 +1927,49 @@ func (b *broker) syncLoop(ctx context.Context, h *hotel) {
 
 // ---------------------------------------------------------------- live view
 
-func (b *broker) viewGuest(r *http.Request, guestID string) (*guestState, string) {
+// viewAuth is how a live view request got in.
+type viewAuth struct {
+	freshView  string     // ?token= view token to move into the bv_ cookie
+	freshShare string     // ?share= token to move into the bvs_ cookie
+	shareHash  string     // set when a share link let the request in; the stream rechecks it
+	share      *liveShare // that link
+	triedShare bool       // a share link or cookie was offered and did not work
+}
+
+// viewGuest checks the view token (?token= or the bv_<guest> cookie) and then
+// a share link (?share= or the bvs_<guest> cookie, AB#584). A share link works
+// for a guest with no view token.
+func (b *broker) viewGuest(r *http.Request, guestID string) (*guestState, viewAuth) {
+	var a viewAuth
 	g := b.guests[guestID]
-	if g == nil || g.cfg.ViewTokenSHA256 == "" {
-		return nil, ""
+	if g == nil {
+		return nil, a
 	}
-	want := []byte(strings.ToLower(g.cfg.ViewTokenSHA256))
-	if t := r.URL.Query().Get("token"); t != "" && subtle.ConstantTimeCompare([]byte(sha(t)), want) == 1 {
-		return g, t
+	if g.cfg.ViewTokenSHA256 != "" {
+		want := []byte(strings.ToLower(g.cfg.ViewTokenSHA256))
+		if t := r.URL.Query().Get("token"); t != "" && subtle.ConstantTimeCompare([]byte(sha(t)), want) == 1 {
+			a.freshView = t
+			return g, a
+		}
+		if c, err := r.Cookie("bv_" + guestID); err == nil && subtle.ConstantTimeCompare([]byte(sha(c.Value)), want) == 1 {
+			return g, a
+		}
 	}
-	if c, err := r.Cookie("bv_" + guestID); err == nil && subtle.ConstantTimeCompare([]byte(sha(c.Value)), want) == 1 {
-		return g, ""
+	if t := r.URL.Query().Get("share"); t != "" {
+		a.triedShare = true
+		if s := b.shareFor(sha(t), guestID); s != nil {
+			a.freshShare, a.shareHash, a.share = t, sha(t), s
+			return g, a
+		}
 	}
-	return nil, ""
+	if c, err := r.Cookie(liveShareCookiePfx + guestID); err == nil && c.Value != "" {
+		a.triedShare = true
+		if s := b.shareFor(sha(c.Value), guestID); s != nil {
+			a.shareHash, a.share = sha(c.Value), s
+			return g, a
+		}
+	}
+	return nil, a
 }
 
 // writeSignIn answers 401 with a form that asks for the view token. The form posts the token in the body,
@@ -1989,13 +2023,23 @@ func (b *broker) handleLive(w http.ResponseWriter, r *http.Request, guestID, tai
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Frame-Options", "DENY")
-	g, fresh := b.viewGuest(r, guestID)
+	g, a := b.viewGuest(r, guestID)
 	if g == nil {
-		writeSignIn(w, guestID, "")
+		msg := ""
+		if a.triedShare {
+			msg = "This share link has ended or was revoked. Ask the person who sent it for a new one."
+		}
+		writeSignIn(w, guestID, msg)
 		return
 	}
-	if fresh != "" {
-		b.setViewCookie(w, guestID, fresh)
+	if a.freshView != "" {
+		b.setViewCookie(w, guestID, a.freshView)
+		http.Redirect(w, r, "/"+guestID+"/live", http.StatusSeeOther)
+		return
+	}
+	if a.freshShare != "" {
+		// Move the token out of the address bar and into a cookie that ends with the link.
+		b.setShareCookie(w, guestID, a.freshShare, a.share.Expires)
 		http.Redirect(w, r, "/"+guestID+"/live", http.StatusSeeOther)
 		return
 	}
@@ -2005,7 +2049,7 @@ func (b *broker) handleLive(w http.ResponseWriter, r *http.Request, guestID, tai
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'")
 		_, _ = w.Write(liveHTML)
 	case "live/events":
-		b.stream(w, r, g)
+		b.stream(w, r, g, a.shareHash)
 	default:
 		http.NotFound(w, r)
 	}
@@ -2093,7 +2137,9 @@ func seenAge(t, now time.Time) float64 {
 	return float64(now.Sub(t).Milliseconds()) / 1000
 }
 
-func (b *broker) stream(w http.ResponseWriter, r *http.Request, g *guestState) {
+// stream sends a snapshot each second. shareHash is set when a share link let
+// the request in: the stream ends once that link is revoked or expires.
+func (b *broker) stream(w http.ResponseWriter, r *http.Request, g *guestState, shareHash string) {
 	fl, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "no streaming", 500)
@@ -2104,6 +2150,9 @@ func (b *broker) stream(w http.ResponseWriter, r *http.Request, g *guestState) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for {
+		if shareHash != "" && b.shareFor(shareHash, g.cfg.ID) == nil {
+			return
+		}
 		data, _ := json.Marshal(b.snapshot(g))
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
 			return
@@ -2218,6 +2267,8 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 				return
 			}
 			b.handleSecrets(w, r, g, name)
+		case p == "/v1/live/shares" || strings.HasPrefix(p, "/v1/live/shares/"):
+			b.handleLiveShares(w, r, g, strings.TrimPrefix(strings.TrimPrefix(p, "/v1/live/shares"), "/"))
 		case p == "/v1/broker/hotels" && r.Method == "GET":
 			b.handleHotels(w, g)
 		case p == "/v1/broker/capacity" && r.Method == "GET":
