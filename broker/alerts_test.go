@@ -571,6 +571,192 @@ func TestWebhookGiveUpThenSyncRetries(t *testing.T) {
 
 // TestContinuedDowntimeAfterFullQueueFirstOpsDrop: hotel stays down while the
 // ops alert waits out a full queue, then delivers on the next sync.
+// TestStaleMissCallbackAfterRecovery: a POST for miss streak A must not mark
+// streak B sent if A's delivery completes after health recovered and B's job
+// gave up (AB#330 HOLD3).
+func TestStaleMissCallbackAfterRecovery(t *testing.T) {
+	oldAtt, oldBackoff := alertPostMaxAttempts, alertPostBackoff
+	alertPostMaxAttempts = 3
+	alertPostBackoff = time.Millisecond
+	t.Cleanup(func() { alertPostMaxAttempts, alertPostBackoff = oldAtt, oldBackoff })
+
+	tc := newChain(t)
+	a := tc.b.alerts
+	a.opsChat = "-100200"
+	setHotel(tc, "a", func(h *hotel) { h.cfg.AlertChatID = "4242" })
+	syncNow(tc, "a")
+
+	var mu sync.Mutex
+	var opPosts int
+	holdFirst := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	failB := true
+	a.post = func(_ context.Context, m alertMsg) error {
+		if m.ChatID != "4242" {
+			return nil
+		}
+		mu.Lock()
+		opPosts++
+		n := opPosts
+		mu.Unlock()
+		if n == 1 {
+			close(holdFirst)
+			<-releaseFirst
+			return nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if failB {
+			return errors.New("status 503")
+		}
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { a.run(ctx); close(done) }()
+
+	setHealthFail(tc, "a", true)
+	syncNow(tc, "a") // streak A: operator alert queued
+	select {
+	case <-holdFirst:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first operator POST did not start")
+	}
+
+	setHealthFail(tc, "a", false)
+	syncNow(tc, "a") // recovery ends streak A
+	setHealthFail(tc, "a", true)
+	syncNow(tc, "a") // streak B: second alert queued
+
+	close(releaseFirst) // streak A POST succeeds with a stale callback
+
+	wait := func(fn func(*hotel) bool) {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			var ok bool
+			setHotel(tc, "a", func(h *hotel) { ok = fn(h) })
+			if ok {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatal("wait timed out")
+	}
+	wait(func(h *hotel) bool { return !h.alerts.missInflight }) // streak B gave up
+
+	var missSent bool
+	setHotel(tc, "a", func(h *hotel) { missSent = h.alerts.missSent })
+	if missSent {
+		t.Fatal("streak A delivery marked streak B sent")
+	}
+
+	failB = false
+	syncNow(tc, "a") // streak B still unhealthy: must enqueue again
+	wait(func(h *hotel) bool { return h.alerts.missSent })
+
+	mu.Lock()
+	delivered := opPosts
+	mu.Unlock()
+	if delivered < 2 {
+		t.Fatalf("want a delivery for streak B, operator POSTs=%d", delivered)
+	}
+	cancel()
+	<-done
+}
+
+// TestStaleDropCallbackAfterRecovery: same race for ops drop episodes.
+func TestStaleDropCallbackAfterRecovery(t *testing.T) {
+	oldAtt, oldBackoff := alertPostMaxAttempts, alertPostBackoff
+	alertPostMaxAttempts = 3
+	alertPostBackoff = time.Millisecond
+	t.Cleanup(func() { alertPostMaxAttempts, alertPostBackoff = oldAtt, oldBackoff })
+
+	tc := newChain(t)
+	a := tc.b.alerts
+	a.opsChat = "-100200"
+	syncNow(tc, "a")
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+
+	var mu sync.Mutex
+	var opsPosts int
+	holdFirst := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	failB := true
+	a.post = func(_ context.Context, m alertMsg) error {
+		if m.ChatID != "-100200" {
+			return nil
+		}
+		mu.Lock()
+		opsPosts++
+		n := opsPosts
+		mu.Unlock()
+		if n == 1 {
+			close(holdFirst)
+			<-releaseFirst
+			return nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if failB {
+			return errors.New("status 503")
+		}
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { a.run(ctx); close(done) }()
+
+	alertGoDown(tc, "a")
+	syncNow(tc, "a") // episode A
+	select {
+	case <-holdFirst:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first ops POST did not start")
+	}
+
+	setHealthFail(tc, "a", false)
+	syncNow(tc, "a") // hotel up: episode A ends
+	alertGoDown(tc, "a")
+	syncNow(tc, "a") // episode B
+
+	close(releaseFirst)
+
+	wait := func(fn func(*hotel) bool) {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			var ok bool
+			setHotel(tc, "a", func(h *hotel) { ok = fn(h) })
+			if ok {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatal("wait timed out")
+	}
+	wait(func(h *hotel) bool { return !h.alerts.dropInflight })
+
+	var dropSent bool
+	setHotel(tc, "a", func(h *hotel) { dropSent = h.alerts.dropSent })
+	if dropSent {
+		t.Fatal("episode A delivery marked episode B sent")
+	}
+
+	failB = false
+	syncNow(tc, "a")
+	wait(func(h *hotel) bool { return h.alerts.dropSent })
+
+	mu.Lock()
+	delivered := opsPosts
+	mu.Unlock()
+	if delivered < 2 {
+		t.Fatalf("want a delivery for episode B, ops POSTs=%d", delivered)
+	}
+	cancel()
+	<-done
+}
+
 func TestContinuedDowntimeAfterFullQueueFirstOpsDrop(t *testing.T) {
 	tc := newChain(t)
 	a := tc.b.alerts

@@ -79,9 +79,11 @@ type alerter struct {
 type hotelAlerts struct {
 	missSent     bool      // operator alert delivered for the current miss streak
 	missInflight bool      // operator alert queued or POST in progress
+	missGen      uint64    // bumps when the miss streak ends; stale POST callbacks ignore
 	operatorLast time.Time // last operator alert delivery
 	dropSent     bool      // ops alert delivered for the current down episode
 	dropInflight bool      // ops alert queued or POST in progress
+	dropGen      uint64    // bumps when the down episode ends; stale POST callbacks ignore
 	opsLast      time.Time // last ops alert delivery
 }
 
@@ -254,13 +256,19 @@ func (b *broker) alertHealth(h *hotel, herr error, hadHealth bool) {
 	if herr == nil {
 		st.missSent = false
 		st.missInflight = false
+		st.missGen++
 	} else if hadHealth && !st.missSent && !st.missInflight {
 		if st.operatorLast.IsZero() || now.Sub(st.operatorLast) >= alertCooldown {
 			chat := h.alertChat()
 			text := fmt.Sprintf("Cathedral: %s missed a heartbeat (no /room/health answer for %s). Check the machine.",
 				hotelAlertName(h), now.Sub(h.lastOK).Round(time.Second))
+			gen := st.missGen
 			onOK := func() {
 				b.mu.Lock()
+				if st.missGen != gen {
+					b.mu.Unlock()
+					return
+				}
 				st.missSent = true
 				st.missInflight = false
 				st.operatorLast = a.now()
@@ -268,6 +276,10 @@ func (b *broker) alertHealth(h *hotel, herr error, hadHealth bool) {
 			}
 			onFail := func() {
 				b.mu.Lock()
+				if st.missGen != gen {
+					b.mu.Unlock()
+					return
+				}
 				st.missInflight = false
 				b.mu.Unlock()
 			}
@@ -286,6 +298,7 @@ func (b *broker) alertHealth(h *hotel, herr error, hadHealth bool) {
 	if h.ok {
 		st.dropSent = false
 		st.dropInflight = false
+		st.dropGen++
 		return
 	}
 	if !st.dropSent && !st.dropInflight {
@@ -295,8 +308,13 @@ func (b *broker) alertHealth(h *hotel, herr error, hadHealth bool) {
 			return
 		}
 		text := fmt.Sprintf("Cathedral: %s is down with %d customer rooms or creates on it.", hotelAlertName(h), load)
+		gen := st.dropGen
 		onOK := func() {
 			b.mu.Lock()
+			if st.dropGen != gen {
+				b.mu.Unlock()
+				return
+			}
 			st.dropSent = true
 			st.dropInflight = false
 			st.opsLast = a.now()
@@ -304,6 +322,10 @@ func (b *broker) alertHealth(h *hotel, herr error, hadHealth bool) {
 		}
 		onFail := func() {
 			b.mu.Lock()
+			if st.dropGen != gen {
+				b.mu.Unlock()
+				return
+			}
 			st.dropInflight = false
 			b.mu.Unlock()
 		}
