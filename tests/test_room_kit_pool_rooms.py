@@ -604,20 +604,22 @@ def test_a_pool_create_signed_while_a_later_bulk_delete_is_still_pending_gets_no
     assert_idle(front.ledger)
 
 
-def _claim_with_the_room_removed_during_it(front: Front):
-    """Hold the claim's lifetime call, really remove the room by a bulk delete, return the claim thread."""
+def _claim_with_lifetime_held(front: Front):
+    """Hold the claim's lifetime call so another request can race it."""
     front.api.new_ids = ["sbx_x"]
     assert front.create(POOL_TEAM)[0] == 200
     held = front.api.hold(rf"POST /v1/sandboxes/sbx_x/lifetime")
     t, box = in_thread(claim, front, "sbx_x")
     held.wait_entered()
-    assert front.call("DELETE", BULK)[0] == 200
-    assert "sbx_x" not in front.api.rooms
     return held, t, box
 
 
-def test_a_claim_whose_lifetime_call_succeeds_after_a_bulk_delete_removed_the_room_is_signed_200(front) -> None:
-    held, t, box = _claim_with_the_room_removed_during_it(front)
+def test_bulk_delete_cannot_remove_a_room_during_its_claim(front) -> None:
+    held, t, box = _claim_with_lifetime_held(front)
+    status, headers, out = front.call("DELETE", BULK)
+    assert status == 409 and code(out) == "bulk_delete_claim_busy"
+    assert "X-Room-Receipt" not in headers
+    assert "sbx_x" in front.api.rooms
     held.release.set()
     status, headers, out = finish(t, box)
     assert status == 200 and json.loads(out)["status"] == "claimed"
@@ -626,9 +628,24 @@ def test_a_claim_whose_lifetime_call_succeeds_after_a_bulk_delete_removed_the_ro
     assert_idle(front.ledger)
 
 
-def test_a_claim_whose_lifetime_call_fails_after_a_bulk_delete_removed_the_room_is_signed_and_breaks_it(front) -> None:
+def test_claim_refuses_while_a_bulk_delete_is_in_flight(front) -> None:
+    room = pool_room(front, labels={"cathedral_pool": "1", "team": "a"})
+    held = front.api.hold(r"DELETE /v1/sandboxes")
+    t, box = in_thread(front.call, "DELETE", BULK)
+    held.wait_entered()
+    status, headers, out = claim(front, room)
+    assert status == 409 and code(out) == "pool_bulk_delete_busy"
+    assert "X-Room-Receipt" not in headers
+    assert front.api.count(rf"POST /v1/sandboxes/{room}/lifetime") == 0
+    held.release.set()
+    assert finish(t, box)[0] == 200
+    assert room not in front.api.rooms
+    assert_idle(front.ledger)
+
+
+def test_a_failed_lifetime_call_is_signed_and_breaks_the_pool_room(front) -> None:
     front.api.reply(r"POST /v1/sandboxes/sbx_x/lifetime", 404, {"error": {"code": "sandbox_not_found"}})
-    held, t, box = _claim_with_the_room_removed_during_it(front)
+    held, t, box = _claim_with_lifetime_held(front)
     held.release.set()
     status, headers, out = finish(t, box)
     assert status == 409 and code(out) == "pool_claim_failed"
@@ -637,9 +654,9 @@ def test_a_claim_whose_lifetime_call_fails_after_a_bulk_delete_removed_the_room_
     assert_idle(front.ledger)
 
 
-def test_a_claim_whose_lifetime_answer_is_lost_after_a_bulk_delete_is_signed_502_and_breaks_the_room(front) -> None:
+def test_a_claim_whose_lifetime_answer_is_lost_is_signed_502_and_breaks_the_room(front) -> None:
     front.api.drop(r"POST /v1/sandboxes/sbx_x/lifetime")
-    held, t, box = _claim_with_the_room_removed_during_it(front)
+    held, t, box = _claim_with_lifetime_held(front)
     held.release.set()
     status, headers, out = finish(t, box)
     assert status == 409 and code(out) == "pool_claim_failed"

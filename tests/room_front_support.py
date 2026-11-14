@@ -306,11 +306,13 @@ def assert_idle(ledger) -> None:
         with ledger.lock:
             if (not getattr(ledger, "in_flight", {}) and not getattr(ledger, "busy", set())
                     and not getattr(ledger, "touched", set()) and not getattr(ledger, "creates_in_flight", 0)
-                    and not getattr(ledger, "overflow", False) and not getattr(ledger, "bulk_in_flight", 0)):
+                    and not getattr(ledger, "overflow", False) and not getattr(ledger, "bulk_in_flight", 0)
+                    and not getattr(ledger, "claims_in_flight", 0)):
                 return
         time.sleep(0.01)
     with ledger.lock:
         assert getattr(ledger, "in_flight", {}) == {}, "an in-flight count leaked"
+        assert getattr(ledger, "claims_in_flight", 0) == 0, "a claim count leaked"
         assert getattr(ledger, "busy", set()) == set(), "a token stayed held"
         assert getattr(ledger, "touched", set()) == set(), "the touched set was not cleared"
         assert getattr(ledger, "creates_in_flight", 0) == 0, "a create stayed counted"
