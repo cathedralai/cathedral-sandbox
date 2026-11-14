@@ -260,7 +260,7 @@ Callers: _reconcile_locked.
 
 ### pause, unpause (757-773)
 Purpose: `docker pause|unpause` (30 s); nonzero -> 502.
-Callers: freeze, thaw, snapshot.
+Callers: freeze, thaw, snapshot (which always attempts the unpause after a pause).
 
 ### commit (775-787)
 Purpose: `docker commit <cid> <image>` (300 s) then `image inspect {{.Id}}`;
@@ -490,17 +490,25 @@ Purpose: _in_work then the inner host-side implementation (O_NOFOLLOW chain,
 B38 fixed). API writes count against disk_gib; room writes do not (B40).
 Callers: server routes.
 
-### snapshot (1557-1592)
-Purpose: inner snapshot first (tar of host /work into <base>/<snap>.tar.gz
-under the inner lock, store cap 1000 per hotel, named get-or-create); if the
-snapshot is new and the guest is live, `docker commit` to
-cathedral-snap-<snap>:latest (not paused: tar and commit are two instants);
-on commit failure delete the inner record; record sizes (image, layer,
-archive) into the record and the operation.
-Trusts: /work fits on the volume twice (B40 class); the 1000 store is shared
-by every tenant of a shared hotel.
-Side effects: tar file, docker image (kept until delete_snapshot or forever,
-H6).
+### snapshot (line numbers are of the 22e7824 read; the entry describes AB#604)
+Purpose: one capture taken at one moment. Overlay rooms (tunables with a runsc
+overlay) are refused 422 snapshot_overlay_unsupported. The inner provider
+reserves the snapshot id and name under its lock (second capture of the room or
+of the name: 409 snapshot_in_progress; the name from another room after the
+capture is done: 409 snapshot_name_taken; store full by count or bytes: 429
+snapshot_store_sold_out), and from then on file and tar PUT, freeze and thaw of
+that room are refused 409 snapshot_in_progress. The capture waits, up to 30 s,
+for writes, freezes and thaws already in flight (503 snapshot_writes_pending).
+A running room is then paused, /work is tarred (outside the lock, stopped at
+the byte cap and at a 900 s deadline), the room is committed to
+cathedral-snap-<snap>:latest, and the room is unpaused on every exit path. A
+room that was already paused stays paused. An unpause that fails leaves the
+room reported "frozen" and owed: the sweep retries it. The hash of the tar is
+taken after the unpause. The record (id, source room, tar digest, size, image
+id) is written once, in one step with the guest's image map. A capture with no
+guest or no committed image is an error (409 snapshot_image_missing).
+Trusts: /work and the layer fit on the volume; the store caps are per machine.
+Side effects: tar file, docker image (kept until delete_snapshot or expiry).
 Callers: server snapshot route.
 
 ### _snapshot_sizes, list_snapshots (1594-1618)
