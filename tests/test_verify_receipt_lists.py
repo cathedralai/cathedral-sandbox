@@ -1832,3 +1832,95 @@ def test_a_malformed_attestation_is_named_as_input_and_not_as_an_internal_error(
     assert "Traceback" not in err and code == 1
     assert out == {"verdict": "FAIL", "reason": "the attestation is not an object with a binding object and a "
                                                 "binding_sha256 string"}
+
+
+# ---- the attestation members that are decoded or split later are checked as input, in every mode
+
+BAD_KERNEL_CMDLINES = {"true": True, "a number": 7, "a float": 1.5, "a list": [1], "an object": {"x": 1}}
+
+
+def _key_text(raw_length: int) -> str:
+    import base64
+
+    return base64.b64encode(b"k" * raw_length).decode()
+
+
+BAD_RECEIPT_KEYS = {"not base64": "x", "empty": "", "31 bytes": _key_text(31), "33 bytes": _key_text(33),
+                    "a number": 5, "null": None}
+KERNEL_REASON = "the attestation's binding kernel_cmdline is not a string"
+KEY_REASON = "the attestation's binding receipt_key is not base64 of a 32-byte key"
+REPORT_REASON = "the attestation's report_b64 is not base64"
+
+
+def _edited_attestation(edit) -> bytes:
+    gen = _generator()
+    attestation = json.loads(json.dumps(gen.Pack(gen.read_amd()).attestation))
+    edit(attestation)
+    return gen.pretty(attestation)
+
+
+def _attestation_fault(tmp_path: Path, mode: str, edit) -> tuple[int, dict, str]:
+    """The same faulty attestation through the receipts file, a receipt header, and a one-shot file."""
+    import base64
+
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    if mode == "run":
+        files, args = gen.make_run(pack, bundle_edit=edit)
+        for name, data in files.items():
+            (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / name).write_bytes(data)
+        code, out, err = _run_cli(*[a.replace("{dir}", str(tmp_path)) for a in args])
+        return code, json.loads(out), err
+    receipts = _room(gen, pack, "ordinary", 99, {})
+    text = _edited_attestation(edit)
+    if mode == "file":
+        return _list_mode_raw(tmp_path, json.dumps({"receipts": receipts}).encode(), attestation_text=text)
+    headers = tuple(base64.urlsafe_b64encode(gen.canonical(rc)).decode() for rc in receipts)
+    return _list_mode_raw(tmp_path, headers=headers, attestation_text=text)
+
+
+@pytest.mark.parametrize("mode", ["file", "header", "run"])
+@pytest.mark.parametrize("kind", sorted(BAD_KERNEL_CMDLINES))
+def test_a_kernel_cmdline_that_is_not_a_string_is_named_input_in_every_mode(kind, mode, tmp_path) -> None:
+    value = BAD_KERNEL_CMDLINES[kind]
+    code, out, err = _attestation_fault(
+        tmp_path, mode, (lambda b: b["attestation"]["binding"].update(kernel_cmdline=value)) if mode == "run"
+        else (lambda a: a["binding"].update(kernel_cmdline=value)))
+    assert "Traceback" not in err, err[-300:]
+    assert code == 1 and out == {"verdict": "FAIL", "reason": ("check 1: " if mode == "run" else "") + KERNEL_REASON}, out
+
+
+@pytest.mark.parametrize("mode", ["file", "header", "run"])
+@pytest.mark.parametrize("kind", sorted(BAD_RECEIPT_KEYS))
+def test_a_receipt_key_that_is_not_32_bytes_of_base64_is_named_input_in_every_mode(kind, mode, tmp_path) -> None:
+    value = BAD_RECEIPT_KEYS[kind]
+    if mode == "run":
+        edit = lambda b: b["attestation"]["binding"].update(receipt_key_ed25519_b64=value)
+    else:
+        edit = lambda a: a["binding"].update(receipt_key_ed25519_b64=value)
+    code, out, err = _attestation_fault(tmp_path, mode, edit)
+    assert "Traceback" not in err, err[-300:]
+    reason = ("the attestation's binding has no receipt_key string" if value is None or value == 5 else KEY_REASON)
+    assert code == 1 and out == {"verdict": "FAIL", "reason": ("check 1: " if mode == "run" else "") + reason}, out
+
+
+@pytest.mark.parametrize("mode", ["file", "header", "run"])
+@pytest.mark.parametrize("value", ["x", "abc", "***"], ids=["one char", "bad padding", "not base64"])
+def test_a_report_that_is_not_base64_is_named_input_in_every_mode(value, mode, tmp_path) -> None:
+    if mode == "run":
+        edit = lambda b: b["attestation"].update(report_b64=value)
+    else:
+        edit = lambda a: a.update(report_b64=value)
+    code, out, err = _attestation_fault(tmp_path, mode, edit)
+    assert "Traceback" not in err, err[-300:]
+    assert code == 1 and out == {"verdict": "FAIL", "reason": ("check 1: " if mode == "run" else "") + REPORT_REASON}, out
+
+
+def test_every_honest_pack_case_still_passes_the_attestation_checks() -> None:
+    good = sorted((PACK / "good").iterdir())
+    assert len(good) >= 79
+    for folder in good:
+        case = json.loads((folder / "case.json").read_text())
+        code, out, err = _run_cli(*[a.replace("{dir}", str(folder)) for a in case["args"]])
+        assert code == 0 and "Traceback" not in err and json.loads(out)["verdict"] == "PASS", folder.name
