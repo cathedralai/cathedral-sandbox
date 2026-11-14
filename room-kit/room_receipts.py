@@ -2865,7 +2865,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             receipt = ledger.sign({
                 "action": "exec",
-                "target": f"{self.command} {self.path}",
+                "target": f"{self.command} {api_request_path(self.path)[1]}",
                 "sandbox_id": room,
                 "customer_request_sha256": sha(body),
                 # As for every exec: sha256 of the command the room ran, here the opened one.

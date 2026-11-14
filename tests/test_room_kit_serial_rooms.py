@@ -191,6 +191,22 @@ def test_api_request_path_drops_semicolon_params() -> None:
     assert rr.route_kind("PATCH", path) == "other"
 
 
+def test_file_receipt_target_keeps_the_query_that_selects_the_file(front) -> None:
+    room = serial_room(front)
+    targets = []
+    for name in ("a", "b"):
+        status, headers, _out = front.call("PUT", f"/v1/sandboxes/{room}/files?path=%2Fwork%2F{name}", b"x")
+        assert status == 200
+        statement = receipt_of(headers)["statement"]
+        assert statement["sandbox_id"] == room
+        targets.append(statement["target"])
+    assert targets == [
+        f"PUT /v1/sandboxes/{room}/files?path=%2Fwork%2Fa",
+        f"PUT /v1/sandboxes/{room}/files?path=%2Fwork%2Fb",
+    ]
+    assert_idle(front.ledger)
+
+
 @pytest.mark.parametrize("method,tail", [
     ("POST", "/terminals"), ("PUT", "/directories"), ("POST", "/snapshot"), ("POST", "/expose"),
     ("POST", "/terminals/t1/input"), ("DELETE", "/processes/1"), ("PUT", "/tar"),
