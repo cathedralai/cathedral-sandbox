@@ -239,6 +239,45 @@ Rejected:
 - Customer export and import of workspaces: product work; a later phase for
   customers who want their own copies.
 
+## Synced volumes: signed generation chain (AB#395, phase 1 contract)
+
+Status: protocol and tests only (`cathedral/volume_chain.py`,
+`tests/test_ab395_volume_chain.py`). Nothing runs on a hotel. It is in the
+cathedral package, not `room-kit/`, so the measured guest does not change until
+a deliberate pin move.
+
+A synced volume is an encrypted restic repo that one sealed guest writes and
+another may restore. Storage and hosts are not trusted, so its history is a
+chain of Ed25519-signed statements, each signed over a fixed label plus its
+canonical JSON (a room receipt signed by the same key is never a commit):
+
+- **volume** (registry): its digest is the parent of generation 1.
+- **lease** (registry): one write lease per volume, to one boot. It names the
+  boot's `receipt_key_ed25519_b64`, the binding digest and the measurement.
+  The registry grants only to a sealed binding whose SNP report the verifier
+  already checked. Renewal by the same key keeps `lease_id` and `lease_seq`; a
+  reboot is a new key, so a new lease once the old one ends or is released.
+- **commit** (lease holder's receipt key): restic repo id and snapshot id at
+  generation head + 1 on top of the head digest. The registry accepts it only
+  from the current, unexpired lease (Decision 6, 4 Nov). An exact resend of
+  the head commit returns the same head.
+- **head** (registry): signed on every accept.
+
+Restore checks the whole chain against a registry-signed head: links,
+generations, lease order (each new lease starts at the head it was granted on,
+with a higher `lease_seq`) and every signature. A prefix short of the head, or
+a commit a former holder signed after its lease ended, is refused. The
+restoring guest must fetch the head from the registry over an authenticated
+channel, not from storage: an older signed head with its matching prefix would
+otherwise pass. Lease expiry is not checked at restore time.
+
+Not in this phase: the pinned restic and the volume agent, the guest route by
+which the agent gets a commit signed by the receipt key (and who may call it),
+volume-key-install through key release (AB#392), per-mount storage sub-tokens
+(prefix, IP, expiry, no delete) on Hippius (AB#394), the control plane's
+persistent registry, and the live proof: a workspace written on one sealed
+hotel restores on another host.
+
 ## Still not covered
 
 - **Integrity and freshness (tracked separately, see AB#396).** XTS has no
@@ -246,7 +285,8 @@ Rejected:
   data blocks: the host can corrupt sectors (the guest reads garbage) or put
   back an older copy of the whole disk, and the guest does not notice.
   dm-integrity or AEAD would catch corruption, not an old copy; a generation
-  counter is needed for rollback.
+  counter is needed for rollback. For volumes synced off the machine, the
+  signed generation chain below (AB#395) is that counter.
 - **Availability.** The host can delete `data.raw`. There is no backup and
   no replica.
 - **The hotel API.** On a config hotel the host holds the hotel key and can
