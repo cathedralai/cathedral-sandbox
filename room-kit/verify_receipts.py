@@ -1584,7 +1584,8 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     need(isinstance(certs, dict) and all(isinstance(certs.get(k), str) for k in ("vcek", "ask", "ark")),
          "check 1: the file holds no AMD certificates (amd_certs)")
     try:
-        attestation_out = verify_attestation(att, trust["measurements"], None, "", trust["ark_sha256"], False, certs)
+        attestation_out = verify_attestation(att, trust["measurements"], trust.get("product"), "", trust["ark_sha256"],
+                                             False, certs)
         chain_out = verify_receipts(att, receipts, None)
     except Fail as exc:
         raise Fail(f"check 1: {exc}") from exc
@@ -1895,7 +1896,7 @@ def run_mode(a) -> int:
             held[path] = read_file(value, "the output file")
         caller = {"context": context, "run_id": a.run_id, "input_hashes": hashes, "output_bytes": held}
         out = verify_oneshot(bundle, recipe, {"measurements": list(dict.fromkeys(measurements)),
-                                              "ark_sha256": a.ark_sha256}, caller)
+                                              "ark_sha256": a.ark_sha256, "product": a.product}, caller)
         print(json.dumps(out, indent=1))
         return 0
     except (KeyError, TypeError, AttributeError, IndexError, ValueError, OverflowError, RecursionError):
