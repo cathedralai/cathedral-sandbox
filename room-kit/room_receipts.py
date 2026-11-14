@@ -2559,9 +2559,8 @@ class Handler(BaseHTTPRequestHandler):
             # them (urlparse drops a ";params" suffix, then the raw path), and decoded too; any
             # other path, flag on or off, passes as before.
             return self.reply(404, b'{"error":{"code":"route_not_found","message":"no such route"}}')
-        # Matched on the path the API routes on (urlparse drops a ";params" suffix), so no
-        # spelling of a signed route reaches the API unsigned.
-        path = api_path
+        # `path` is already the path the API routes on (api_request_path drops a ";params" suffix above),
+        # so no spelling of a signed route reaches the API unsigned.
         action = next((a for meth, pat, a in SIGNED if meth == self.command and pat.match(path)), None)
         if action and body and action not in OPAQUE_BODY:
             # A JSON escape of a lone surrogate parses, but cannot be encoded
