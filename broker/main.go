@@ -118,6 +118,12 @@ type config struct {
 	// catalog images on it, and prefer hotels that hold a create's image.
 	// The scratch disk of a sealed hotel is wiped every boot (AB#532).
 	PrewarmCatalog bool `json:"prewarm_catalog"`
+	// PrewarmCatalogHotels narrows prewarm_catalog to these hotel ids, for a
+	// one-hotel canary. Empty: every hotel. Each id must be a hotel in hotels
+	// (the config file), and the list needs prewarm_catalog on. Unlike
+	// terminal_hotels, an id that is not known yet is refused: a typo would
+	// leave the canary cold and its measurement would say nothing.
+	PrewarmCatalogHotels []string `json:"prewarm_catalog_hotels,omitempty"`
 	// OperatorKeySHA256 is the SHA-256 of the operator key. It allows hotel
 	// join, change and leave at runtime (hotels.go). Empty: no operator routes.
 	OperatorKeySHA256 string `json:"operator_key_sha256"`
@@ -415,6 +421,14 @@ func loadBroker(path string) (*broker, error) {
 		h := newHotel(hc, strings.TrimSpace(string(k)))
 		if err := b.addHotel(h); err != nil {
 			return nil, err
+		}
+	}
+	if len(c.PrewarmCatalogHotels) > 0 && !c.PrewarmCatalog {
+		return nil, errors.New("config: prewarm_catalog_hotels needs \"prewarm_catalog\": true (the list only narrows it)")
+	}
+	for _, id := range c.PrewarmCatalogHotels {
+		if b.hotelByID(id) == nil {
+			return nil, fmt.Errorf("config: prewarm_catalog_hotels entry %q is not a hotel in hotels", id)
 		}
 	}
 	if len(optedIn) > 0 {
@@ -1830,7 +1844,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			log.Printf("hotel %s down: %s", h.cfg.ID, h.lastErr)
 		}
 	}
-	if cameUp && b.cfg.PrewarmCatalog {
+	if cameUp && b.prewarms(h) {
 		go b.prewarmHotel(h)
 	}
 	if herr == nil {
