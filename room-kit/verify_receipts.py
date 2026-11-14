@@ -92,6 +92,8 @@ caller expects, in eight checks. The AMD certificates come from the file (amd_ce
      reported as receipt_only; the end marker put carries the hash of no bytes.
   8. the request in the file equals the recipe (image, command, env, cwd, user, size, timeout, network, outputs,
      input paths and hashes, context) and holds no key that is not a request field.
+max_spend_usd is a JSON integer of at least 1 or a decimal string such as "0.50" (greater than zero, at most six
+decimals); never a JSON float, and the recipe and the file must hold it in the same form.
 The recipe (cathedral_oneshot_recipe_v1) is strict: a member the checker does not know, at any level, is
 refused. request must hold image, command, env, size, timeout_seconds, network, outputs, inputs and
 max_spend_usd (env and inputs may be empty); cwd, user and image_id are optional, and must agree between the
@@ -1219,6 +1221,9 @@ PATH_SEGMENT_RE = re.compile(r"[A-Za-z0-9._-]+")
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 USER_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_-]*[$]?|[0-9]+")
 MODE_RE = re.compile(r"[0-7]{3,4}")
+# max_spend_usd as a string: digits, an optional point and 1 to 6 more digits (a run costs cents, so a fraction is
+# sent as text, never as a float); the value must also be greater than zero.
+MAX_SPEND_RE = re.compile(r"(0|[1-9][0-9]*)(\.[0-9]{1,6})?")
 INPUT_PREFIX, OUTPUT_PREFIX = "/work/in/", "/work/out/"
 
 
@@ -1299,9 +1304,13 @@ def request_limits(req: dict, prefix: str) -> None:
         need(len(user) <= USER_MAX, f"{prefix}user must be at most {USER_MAX} characters")
         need(USER_RE.fullmatch(user) is not None, f"{prefix}user must be digits only, or a name of letters, digits, "
                                                   "_ and - that starts with a letter or _ and may end in $")
-    for key in ("timeout_seconds", "max_spend_usd"):
-        if key in req:
-            need(_is_int(req[key]), f"{prefix}{key} must be an integer")
+    if "timeout_seconds" in req:
+        need(_is_int(req["timeout_seconds"]), f"{prefix}timeout_seconds must be an integer")
+    if "max_spend_usd" in req:
+        spend = req["max_spend_usd"]
+        ok = (spend >= 1 if _is_int(spend) else
+              isinstance(spend, str) and MAX_SPEND_RE.fullmatch(spend) is not None and spend.strip("0.") != "")
+        need(ok, f"{prefix}max_spend_usd must be an integer of at least 1 or a decimal string greater than zero")
     if "image_id" in req:
         need(isinstance(req["image_id"], str) and IMAGE_DIGEST_RE.fullmatch(req["image_id"]) is not None,
              f"{prefix}image_id must be sha256: and 64 lower-case hex")
@@ -1382,7 +1391,6 @@ def load_recipe(doc) -> dict:
     for key in ("cwd", "user"):
         if key in req:
             _typed(req, key, "a string", lambda v: isinstance(v, str))
-    _typed(req, "max_spend_usd", "an integer", _is_int)
     if "image_id" in req:
         _typed(req, "image_id", "sha256: and 64 lower-case hex",
                lambda v: isinstance(v, str) and IMAGE_DIGEST_RE.fullmatch(v) is not None)
