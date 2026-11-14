@@ -49,6 +49,7 @@ type fakeHotel struct {
 	attestGuest   []string         // X-Cathedral-Guest of POST /room/attest
 	roomDeletes   []string         // room ids of DELETE /v1/sandboxes/{id}
 	bulkDeletes   [][]string       // label filters of DELETE /v1/sandboxes
+	bulkClaimBusy int              // positive: refuse this many bulk deletes; negative: always refuse
 	// getStatus overrides GET /v1/sandboxes/{id} when set (e.g. 409 while deleting).
 	getStatus map[string]int
 	// attestation is the body of GET /room/attestation (admission_test.go); nil: 404.
@@ -159,6 +160,13 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"sandboxes": out})
 	case p == "/v1/sandboxes" && r.Method == "DELETE":
 		f.bulkDeletes = append(f.bulkDeletes, r.URL.Query()["label"])
+		if f.bulkClaimBusy != 0 {
+			if f.bulkClaimBusy > 0 {
+				f.bulkClaimBusy--
+			}
+			writeErr(w, 409, "bulk_delete_claim_busy", "a room claim is running")
+			return
+		}
 		kept := f.rooms[:0]
 		for _, rm := range f.rooms {
 			labels, _ := rm["labels"].(map[string]any)

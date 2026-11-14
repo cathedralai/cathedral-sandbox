@@ -1728,6 +1728,7 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 	b.mu.Unlock()
 	q.Add("label", guestLabel+"="+g.cfg.ID)
 	res := map[string]int{}
+	claimBusy := false
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
@@ -1737,17 +1738,53 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
-			status, _, _, err := h.do(r.Context(), "DELETE", "/v1/sandboxes", q, nil, 30*time.Minute)
-			if err != nil {
-				status = 502
-			}
+			status, busy := bulkDeleteFromHotel(r.Context(), h, q)
 			mu.Lock()
 			res[h.cfg.ID] = status
+			claimBusy = claimBusy || busy
 			mu.Unlock()
 		}(h)
 	}
 	wg.Wait()
+	if claimBusy {
+		writeJSON(w, 409, map[string]any{"error": map[string]string{
+			"code": "bulk_delete_claim_busy", "message": "a room claim is running; retry the bulk delete",
+		}, "hotels": res})
+		return
+	}
 	writeJSON(w, 200, map[string]any{"hotels": res})
+}
+
+// A claim's lifetime call is bounded at the hotel. Retry only its explicit
+// refusal; another 409 can mean a permanent problem and must keep its status.
+func bulkDeleteFromHotel(ctx context.Context, h *hotel, q url.Values) (int, bool) {
+	deadline := time.Now().Add(12 * time.Second)
+	sawClaimBusy := false
+	for {
+		status, _, body, err := h.do(ctx, "DELETE", "/v1/sandboxes", q, nil, 30*time.Minute)
+		if err != nil {
+			if sawClaimBusy && ctx.Err() != nil {
+				return 409, true
+			}
+			return 502, false
+		}
+		if status != 409 || errCodeOf(body) != "bulk_delete_claim_busy" {
+			return status, false
+		}
+		sawClaimBusy = true
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 409, true
+		}
+		wait := min(100*time.Millisecond, remaining)
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return 409, true
+		case <-timer.C:
+		}
+	}
 }
 
 // ---------------------------------------------------------------- stats
