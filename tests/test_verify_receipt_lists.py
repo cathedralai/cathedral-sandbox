@@ -871,7 +871,7 @@ def test_the_exchange_file_with_reasons_in_not_proven_still_passes(tmp_path) -> 
 
 def test_digit_runs_and_depth_are_counted_on_the_raw_text() -> None:
     vr = _load_checker()
-    assert vr.json_shape('{"a": 12345, "b": "99999999", "c": [1.25e10]}') == (2, 8)
+    assert vr.json_shape('{"a": 12345, "b": "99999999", "c": [1.25e10]}') == (2, 7)
     assert vr.json_shape("[" * 7 + "1" * 300 + "]" * 7) == (7, 300)
     assert vr.json_shape("[true, false, null]") == (1, 1)          # the e of true and false is one character
     what = "holds a number literal of more than 100 characters"

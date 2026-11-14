@@ -1014,10 +1014,11 @@ def fetch_chain(broker: str, hotel: str, key: str) -> dict:
 JSON_MAX_DEPTH = 64
 
 
-# The longest run of digits a number in a read document may have. Python 3.11 and later refuse an integer of
-# more than 4,300 digits and earlier versions do not, so a fixed bound, counted on the raw text, keeps the answer
-# the same on every version. No number the run mode reads comes near it.
-JSON_MAX_DIGITS = 100
+# The longest number literal a read document may hold, counted on the raw text over the whole token: sign, digits,
+# point and exponent. Python 3.11 and later refuse an integer of more than 4,300 digits and earlier versions do
+# not, so a fixed bound keeps the answer the same on every version. No number run mode reads comes near it.
+JSON_MAX_NUMBER_CHARS = 100
+NUMBER_CHARS = frozenset("0123456789+-.eE")
 
 
 class Unreadable(Fail):
@@ -1025,7 +1026,10 @@ class Unreadable(Fail):
 
 
 def json_shape(text: str) -> tuple[int, int]:
-    """(the deepest nesting of [ and {, the longest run of digits outside strings) of a JSON text.
+    """(the deepest nesting of [ and {, the longest number token outside strings) of a JSON text.
+
+    A number token is a run of digits, signs, points and the letters e and E (the e of true and false counts as a
+    run of one).
 
     Characters inside strings are skipped (an escaped quote and an escaped backslash are handled); the walk is a
     loop, not a recursion."""
@@ -1040,7 +1044,7 @@ def json_shape(text: str) -> tuple[int, int]:
             elif ch == '"':
                 in_string = False
             continue
-        if "0" <= ch <= "9":
+        if ch in NUMBER_CHARS:
             run += 1
             longest = max(longest, run)
             continue
@@ -1082,9 +1086,9 @@ def strict_json(raw: bytes, prefix: str, what: str, plural: bool = False, floats
         deepest, longest = json_shape(text)
         if deepest > JSON_MAX_DEPTH:
             raise Unreadable(f"{prefix}: {what} {'nest' if plural else 'nests'} too deeply to read")
-        if longest > JSON_MAX_DIGITS:
-            raise Unreadable(f"{prefix}: {what} {'hold' if plural else 'holds'} a number of more than "
-                             f"{JSON_MAX_DIGITS} digits")
+        if longest > JSON_MAX_NUMBER_CHARS:
+            raise Unreadable(f"{prefix}: {what} {'hold' if plural else 'holds'} a number literal of more than "
+                             f"{JSON_MAX_NUMBER_CHARS} characters")
     try:
         return json.loads(raw, object_pairs_hook=pairs, parse_float=float if floats else refuse, parse_constant=refuse)
     except RecursionError as exc:
@@ -1144,8 +1148,6 @@ def _allow_entry(entry) -> str:
     if value.count(":") == 1 and not value.startswith("[") and "/" not in value:
         host_part, port_part = value.rsplit(":", 1)
         if port_part.isdigit():
-            if len(port_part) > 5:
-                bad()  # also keeps a long digit run from reaching int(), which some Pythons refuse
             port = int(port_part)
             if not 1 <= port <= 65535:
                 bad()
@@ -1521,6 +1523,13 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
     need(isinstance(bundle["not_proven"], list) and all(isinstance(r, str) for r in bundle["not_proven"]),
          "check 1: not_proven is not a list of strings")
     need("inline_outputs" in bundle, "check 1: the file has no inline_outputs")
+    if "exec_response_b64" in bundle:  # decided before any hash is compared
+        try:
+            ok = isinstance(bundle["exec_response_b64"], str) and base64.b64decode(bundle["exec_response_b64"],
+                                                                                    validate=True) is not None
+        except ValueError:
+            ok = False
+        need(ok, "check 1: exec_response_b64 is not a string of valid base64")
 
     # 1. attestation, AMD chain, measurement, every receipt's signature, one binding
     att, certs, receipts = bundle.get("attestation"), bundle.get("amd_certs"), bundle.get("receipts")
