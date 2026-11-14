@@ -36,7 +36,7 @@ GENERATOR = FIXTURES / "generate.py"
 # sha256 of snapshot_fork_v1.json. Filled in when the generator exists (step two of CS-3).
 FIXTURE_SHA256 = "4b57e2329e5a7588f9869e9e63a4ccd58e35c13e4dc4b15b1746f9ed542483b0"
 # sha256 of the receipts a fixed scripted run of the old actions makes on main (see scripted_old_actions).
-OLD_ACTIONS_SHA256 = "5e48a051f02c9ba0d898ae5a8491bfae6e369c198cc088efa14b1074a2400d1c"
+OLD_ACTIONS_SHA256 = "1bbacb44f99c04319eff0ff209c64ee4d483c8536740408c2ecd7c4ee7d4d103"
 
 SERIAL = {"image": "repo/app:1", "labels": {"cathedral_serial": "1"}}
 SNAP_MEMBERS = ["snapshot_id", "snapshot_image_id", "snapshot_work_archive_sha256", "snapshot_size_bytes",
@@ -749,6 +749,35 @@ def test_any_other_machine_answer_to_a_fork_keeps_the_entry(front, status, error
     assert fork(front)[0] == 200
 
 
+# ---------------------------------------------------------------- the exec result store (main's AB#536)
+
+def _kept_exec(front: Front, room_id: str, handle: str = "cd" * 16) -> bytes:
+    status, _h, _out = front.call("POST", f"/v1/sandboxes/{room_id}/exec", {"cmd": ["true"]},
+                                  {"X-Room-Exec-Handle": handle})
+    assert status == 200
+    status, _h, out = front.call("GET", f"/v1/sandboxes/{room_id}/exec/result?handle={handle}")
+    assert status == 200
+    return out
+
+
+def test_a_fork_starts_with_none_of_its_source_s_kept_exec_results(front) -> None:
+    a = room(front)
+    _kept_exec(front, a)
+    snapshot_ok(front, a)
+    _status, _headers, out = fork(front)
+    b = json.loads(out)["id"]
+    status, _headers, out = front.call("GET", f"/v1/sandboxes/{b}/exec/result?handle=" + "cd" * 16)
+    assert status == 404 and code(out) == "exec_unknown"
+
+
+def test_a_snapshot_of_a_room_leaves_that_room_s_kept_exec_results_as_they_were(front) -> None:
+    a = room(front)
+    before = _kept_exec(front, a)
+    snapshot_ok(front, a)
+    status, _headers, after = front.call("GET", f"/v1/sandboxes/{a}/exec/result?handle=" + "cd" * 16)
+    assert status == 200 and after == before
+
+
 # ---------------------------------------------------------------- serial rooms
 
 def test_a_serial_room_takes_a_snapshot_as_a_signed_request_in_its_turn(front) -> None:
@@ -834,6 +863,10 @@ def scripted_old_actions(front: Front, monkeypatch) -> bytes:
     assert front.create({"image": "repo/app:1", "snapshot_id": ""})[0] == 422
     front.api.replies.clear()
     assert front.exec("sbx_pin_1", "echo hi")[0] == 200
+    # An exec kept under a handle signs the same receipt; reading the kept answer is the front's own and signs nothing.
+    assert front.call("POST", "/v1/sandboxes/sbx_pin_1/exec", {"cmd": ["true"]},
+                      {"X-Room-Exec-Handle": "ab" * 16})[0] == 200
+    assert front.call("GET", "/v1/sandboxes/sbx_pin_1/exec/result?handle=" + "ab" * 16)[0] == 200
     front.api.reply(r"POST /v1/sandboxes/sbx_pin_2/exec", 500, {"error": {"code": "boom", "message": "x"}})
     assert front.exec("sbx_pin_2", "false")[0] == 500
     front.api.replies.clear()
@@ -848,7 +881,7 @@ def scripted_old_actions(front: Front, monkeypatch) -> bytes:
 
 def test_actions_other_than_snapshot_and_fork_make_the_same_bytes_as_main(front, monkeypatch) -> None:
     out = scripted_old_actions(front, monkeypatch)
-    assert out.count(b"\n") == 13
+    assert out.count(b"\n") == 14
     assert hashlib.sha256(out).hexdigest() == OLD_ACTIONS_SHA256
 
 
