@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import socket
+import threading
 import time
 
 import pytest
@@ -304,7 +305,9 @@ def test_a_bulk_delete_connection_close_answer_trickling_past_the_bound_is_uncer
     front.api.new_ids = ["sbx_x"]
     assert front.create(POOL_TEAM)[0] == 200
     front.api.trickle_raw(r"DELETE /v1/sandboxes", 0.6, "HTTP/1.1 200 OK", "close_body")
+    started = time.monotonic()
     status, _headers, out = front.call("DELETE", BULK)
+    assert time.monotonic() - started < 1.5, "the bulk delete was answered after its bound"
     assert status == 502 and code(out) == "hotel_api_no_answer"
     assert "sbx_x" in front.ledger.unknown
     assert_idle(front.ledger)
@@ -347,3 +350,85 @@ def test_a_waiting_bulk_delete_that_loses_the_ledger_lock_is_refused_unsent_at_i
     assert status == 409 and code(out) == "bulk_delete_claim_busy" and took < 1.5
     assert front.api.count(r"DELETE /v1/sandboxes") == 0
     assert_idle(front.ledger)
+
+
+# ---------------------------------------------------------------- expiry does not depend on the timer thread, or on the connect
+
+class NeverFires:
+    """A timer that never runs: the deadline must hold without it."""
+
+    def __init__(self, *_a, **_k) -> None:
+        self.daemon = False
+
+    def start(self) -> None:
+        pass
+
+    def cancel(self) -> None:
+        pass
+
+
+def test_a_claim_answered_after_its_bound_is_expired_even_if_the_timer_never_runs(front, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "TIMER", NeverFires, raising=False)
+    monkeypatch.setattr(rr, "CLAIM_WAIT_SECONDS", 0.6)
+    front.api.new_ids = ["sbx_x"]
+    assert front.create(POOL_TEAM)[0] == 200
+    front.api.trickle(r"POST /v1/sandboxes/sbx_x/lifetime", 0.3)  # three pieces: 0.9 s, each read under the bound
+    status, headers, out = claim(front, "sbx_x")
+    assert status == 409 and code(out) == "pool_claim_failed" and receipt_of(headers)["statement"]["status"] == 502
+    assert_idle(front.ledger)
+
+
+def test_a_bulk_answered_after_its_bound_is_expired_even_if_the_timer_never_runs(front, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "TIMER", NeverFires, raising=False)
+    monkeypatch.setattr(rr, "BULK_FORWARD_SECONDS", 0.6)
+    front.api.new_ids = ["sbx_x"]
+    assert front.create(POOL_TEAM)[0] == 200
+    front.api.trickle(r"DELETE /v1/sandboxes", 0.3)
+    status, _headers, out = front.call("DELETE", BULK)
+    assert status == 502 and code(out) == "hotel_api_no_answer"
+    assert "sbx_x" in front.ledger.unknown
+    assert_idle(front.ledger)
+
+
+def test_the_connect_gets_only_the_time_that_is_left(front) -> None:
+    import http.client
+
+    seen: list[float] = []
+
+    def create_connection(address, timeout=None, source_address=None):
+        seen.append(timeout)
+        raise OSError("no route")
+
+    conn = http.client.HTTPConnection("127.0.0.1", 9, timeout=1800)
+    conn._create_connection = create_connection
+    with pytest.raises(OSError):
+        rr.run_within(conn, 0.5, lambda: None)
+    assert seen and seen[0] is not None and seen[0] <= 0.5, f"the connect was given {seen}"
+
+
+def test_a_bulk_connection_does_not_keep_its_long_read_timeout_past_the_bulks_bound(front, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "TIMER", NeverFires, raising=False)  # only the socket timeout can end the wait
+    monkeypatch.setattr(rr, "BULK_FORWARD_SECONDS", 0.8)
+    front.api.new_ids = ["sbx_x"]
+    assert front.create(POOL_TEAM)[0] == 200
+    held = front.api.hold(r"DELETE /v1/sandboxes")
+    threading.Timer(3, held.release.set).start()
+    started = time.monotonic()
+    status, _headers, out = front.call("DELETE", BULK)
+    took = time.monotonic() - started
+    held.release.set()
+    assert status == 502 and code(out) == "hotel_api_no_answer" and took < 1.6, (status, took)
+    assert_idle(front.ledger)
+
+
+# ---------------------------------------------------------------- a bulk delete is not admitted after its bound
+
+def test_a_bulk_delete_whose_bound_has_passed_is_not_started_by_a_free_lock(front) -> None:
+    ledger = front.ledger
+    assert ledger.bulk_arrive(1.0)
+    state = ledger.bulk_try_start(0.2, time.monotonic() - 0.1)  # its thread was paused past the deadline
+    with ledger.lock:
+        in_flight, pending = ledger.bulk_in_flight, ledger.bulk_pending
+    assert state != "started" and in_flight == 0 and pending == 1, (state, in_flight, pending)
+    ledger.bulk_abandon()
+    assert_idle(ledger)
