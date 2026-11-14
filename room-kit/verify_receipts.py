@@ -62,6 +62,14 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      output says the room is closed to its last action. room_end needs a
      reason. The output's chain.room_numbering lists each room and says what
      the numbering shows and what it does not.
+ 11. pre-made rooms: a create with pool: true is receipt 1 of its room, is not
+     serial and names no sandbox link. Receipt 2 is a claim (target
+     POST /v1/sandboxes/<room>/claim, a lower-case UUID cathedral_sandbox_id, a
+     positive lifetime_seconds, pooled_from the create's receipt hash), which
+     needs numbered receipts. The claim's id is the room's link, so
+     --cathedral-sandbox finds it; an unclaimed room, a retired one and a room
+     whose claim failed name no link. A failed delete leaves the room's state
+     unknown, not retired. The output's pool_rooms gives each state.
 
 Not checked here (by design, today): that the measurement is an approved image.
 Image approval is a signed policy release; that is a later step.
@@ -480,10 +488,93 @@ def room_tunables(receipts: list[dict]) -> dict:
     return out
 
 
+POOL_CLAIM_PROVES = (
+    "Nothing ran in this room before the claim except the machine's own main process, and no request reached it "
+    "through the front. This rests on the rules of the measured front, so it holds only for the measurements you "
+    "allowed.")
+POOL_CHECKED = "pool rooms: each claim is receipt 2 of its room and names the create it was made from"
+
+
+def _check_pool_rooms(receipts: list[dict]) -> dict[str, dict]:
+    """Pre-made rooms: receipt 1 is a pool create, receipt 2 is the claim made from it.
+
+    The claim's sandbox id is the room's link, so every part of the pair is checked here, by the code
+    that hands the link out. Entries keep the room and link under underscore keys for room_links."""
+    groups = room_groups(receipts)
+    out: dict[str, dict] = {}
+    for (bsha, room), rcs in groups.items():
+        for rc in rcs:
+            st = rc["statement"]
+            where = f"room {room}: receipt {st.get('sequence')}"
+            if "pool" in st:
+                need(isinstance(st["pool"], bool), f"{where}: pool is not a boolean")
+                if st["pool"]:
+                    need(st.get("action") == "create" and _succeeded(st),
+                         f"{where}: pool is set on a receipt that is not a successful create")
+                    need(st.get("serial") is not True, f"{where}: a pool create cannot also be serial")
+                    need("cathedral_sandbox_id" not in st, f"{where}: a pool create names a sandbox link")
+        pool_creates = [rc for rc in rcs if rc["statement"].get("pool") is True]
+        claims = [rc for rc in rcs if rc["statement"].get("action") == "claim"]
+        for rc in claims:
+            need(pool_creates, f"room {room}: receipt {rc['statement'].get('sequence')}: "
+                               "a claim in a room that was not made as a pool room")
+        if not pool_creates:
+            continue
+        need(len(pool_creates) == 1, f"room {room}: a pool room has one create")
+        create = pool_creates[0]
+        numbered = all(_has_numbering(rc["statement"]) for rc in rcs)
+        if claims:
+            first = claims[0]["statement"]
+            need(numbered, f"room {room}: receipt {first.get('sequence')}: a claim needs numbered receipts: "
+                           "cannot show nothing sits between create and claim")
+            ordered = check_room_chain(room, rcs)
+        else:
+            ordered = sorted(rcs, key=lambda rc: rc["statement"].get("sequence"))
+        need(ordered[0] is create, f"room {room}: a pool create must be receipt 1 of its room")
+        entry = {"state": "unclaimed", "pooled_from": create["receipt_sha256"], "_room": room}
+        if claims:
+            for rc in claims:
+                need(rc is ordered[1] if len(ordered) > 1 else False,
+                     f"room {room}: receipt {rc['statement'].get('sequence')}: a claim must be receipt 2 of a pool room")
+            st = ordered[1]["statement"]
+            where = f"room {room}: receipt {st.get('sequence')}"
+            need(st.get("target") == f"POST /v1/sandboxes/{room}/claim",
+                 f"{where}: the claim's target is not POST /v1/sandboxes/{room}/claim")
+            need(st.get("pooled_from") == create["receipt_sha256"],
+                 f"{where}: pooled_from is not the pool create's receipt hash")
+            if _succeeded(st):
+                linked = st.get("cathedral_sandbox_id")
+                need(isinstance(linked, str) and SANDBOX_LINK_RE.fullmatch(linked) is not None,
+                     f"{where}: cathedral_sandbox_id is not a lower-case UUID")
+                need(_is_int(st.get("lifetime_seconds")) and st["lifetime_seconds"] > 0,
+                     f"{where}: lifetime_seconds is not a positive integer")
+                entry.update(state="claimed", proves=[POOL_CLAIM_PROVES], _link=linked)
+            else:
+                entry["state"] = "closed"
+        elif len(ordered) > 1:
+            # A room deleted before any claim is retired. Anything else at receipt 2 is a request that
+            # reached the room with no claim.
+            second = ordered[1]["statement"]
+            need(second.get("action") == "delete",
+                 f"room {room}: receipt {second.get('sequence')}: receipt 2 of a pool room is not a claim")
+            # A signed failed delete records the attempt, not removal. The
+            # room may still exist, so neither retired nor unclaimed is proven.
+            entry["state"] = "retired" if _succeeded(second) else "unknown"
+        out[room_key(groups, bsha, room)] = entry
+    return out
+
+
+def pool_rooms(receipts: list[dict]) -> dict[str, dict]:
+    """Room id -> {state, pooled_from} for each pre-made room; failed delete leaves state unknown."""
+    return {key: {k: v for k, v in entry.items() if not k.startswith("_")}
+            for key, entry in _check_pool_rooms(receipts).items()}
+
+
 def room_links(receipts: list[dict]) -> dict:
     """Room id -> the Cathedral sandbox id its signed successful create receipt names (AB#389).
 
-    Receipts from guests before AB#389 carry no cathedral_sandbox_id: their rooms are not listed."""
+    Receipts from guests before AB#389 carry no cathedral_sandbox_id: their rooms are not listed.
+    A pre-made room is linked by its claim, after the pair is checked (_check_pool_rooms)."""
     out: dict[str, str] = {}
     for rc in receipts:
         st = rc["statement"]
@@ -494,6 +585,9 @@ def room_links(receipts: list[dict]) -> dict:
              f"receipt {st['sequence']}: cathedral_sandbox_id is not a lower-case UUID")
         if st.get("sandbox_id") and 200 <= int(st.get("status") or 0) < 300:
             out[st["sandbox_id"]] = linked
+    for entry in _check_pool_rooms(receipts).values():
+        if entry.get("_link"):
+            out[entry["_room"]] = entry["_link"]
     return out
 
 
@@ -575,18 +669,29 @@ def check_serial_room(room: str, ordered: list[dict]) -> None:
         need(st.get("status") != 502, f"{where}: a lost answer (status 502) in a serial room")
 
 
-def room_numbering(receipts: list[dict], list_doc: dict | None = None) -> dict:
-    """Per-room numbering and serial rooms (the receipts' room_sequence, serial and room_end fields).
-
-    A room whose receipts all carry the numbering fields is checked in full. A room with some of them
-    gets a warning and no claim; a room with none is left as it was. Returns the rooms that were
-    checked and the warnings. list_doc is a per-room list answer: its room_head and count are checked."""
+def room_groups(receipts: list[dict]) -> dict[tuple[str, str], list[dict]]:
+    """Receipts by (binding, room id). A room id can come back under another key, with its own numbers."""
     groups: dict[tuple[str, str], list[dict]] = {}
     for rc in receipts:
         st = rc["statement"]
         room = st.get("sandbox_id")
         if isinstance(room, str) and room:
             groups.setdefault((str(st.get("binding_sha256")), room), []).append(rc)
+    return groups
+
+
+def room_key(groups: dict, bsha: str, room: str) -> str:
+    """The room id, or the room id and its binding when two bindings both name it."""
+    return room if sum(1 for _, r in groups if r == room) == 1 else f"{room}@{bsha[:12]}"
+
+
+def room_numbering(receipts: list[dict], list_doc: dict | None = None) -> dict:
+    """Per-room numbering and serial rooms (the receipts' room_sequence, serial and room_end fields).
+
+    A room whose receipts all carry the numbering fields is checked in full. A room with some of them
+    gets a warning and no claim; a room with none is left as it was. Returns the rooms that were
+    checked and the warnings. list_doc is a per-room list answer: its room_head and count are checked."""
+    groups = room_groups(receipts)
     rooms: dict[str, dict] = {}
     warnings: list[str] = []
     for (bsha, room), rcs in groups.items():
@@ -630,8 +735,7 @@ def room_numbering(receipts: list[dict], list_doc: dict | None = None) -> dict:
         if ends:
             entry["ended"] = {"reason": ends[-1]["reason"]}
         # The same room id under two bindings has two chains: name them apart.
-        key = room if sum(1 for _, r in groups if r == room) == 1 else f"{room}@{bsha[:12]}"
-        rooms[key] = entry
+        rooms[room_key(groups, bsha, room)] = entry
     if list_doc is not None and "room_head" in list_doc:
         need(len(groups) <= 1, f"the list names a room_head but holds receipts of {len(groups)} rooms")
         if not groups:
@@ -914,6 +1018,9 @@ def main() -> int:
             checked += "; " + NUMBERED_CHECKED
         for warning in numbering["warnings"]:
             checked += "; " + warning
+        pools = pool_rooms(receipts)
+        if pools:
+            checked += "; " + POOL_CHECKED
         # Sealed archives have no SNP report. Signature checks on those receipts
         # are useful, but they must not turn an overall attested PASS into a claim
         # that every receipt's binding was SNP-proven (AB#381 HOLD).
@@ -937,6 +1044,8 @@ def main() -> int:
             out["not_proven"] = [
                 "archived sealed bindings have no SNP report; receipt signatures checked, attestation not proven"
             ]
+        if pools:
+            out["pool_rooms"] = pools
         if a.cathedral_sandbox:
             rooms = sorted(room for room, linked in out["room_links"].items() if linked == a.cathedral_sandbox)
             need(rooms, f"no successful create receipt names Cathedral sandbox {a.cathedral_sandbox}")
