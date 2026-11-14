@@ -97,6 +97,7 @@ def test_an_unknown_room_is_cleared_by_a_delete_that_succeeded(front) -> None:
     front.api.new_ids = ["sbx_x"]
     assert front.create(POOL_TEAM)[0] == 200
     lost_bulk(front)
+    assert "sbx_x" in front.ledger.unknown  # marked before the clearing action
     assert front.delete("sbx_x")[0] == 200
     status, _headers, out = claim(front, "sbx_x")
     assert status == 409 and code(out) == "pool_room_gone"
@@ -108,6 +109,7 @@ def test_an_unknown_room_is_cleared_when_the_room_ends(front) -> None:
     front.api.new_ids = ["sbx_x"]
     assert front.create(POOL_TEAM)[0] == 200
     release = lost_bulk(front)
+    assert "sbx_x" in front.ledger.unknown  # marked before the clearing action
     release.set()
     wait_for(lambda: "sbx_x" not in front.api.rooms, "the bulk delete never ran")
     front.server.look_all()
@@ -236,4 +238,112 @@ def test_a_bulk_delete_the_machine_does_not_answer_within_the_bound_is_cut_and_u
     assert status == 502 and code(out) == "hotel_api_no_answer" and took < 1.6
     assert receipt_of(headers)["statement"]["status"] == 502
     assert "sbx_x" in front.ledger.unknown
+    assert_idle(front.ledger)
+
+
+# ---------------------------------------------------------------- the replay's check comes after its GET
+
+def test_a_replay_whose_room_is_marked_while_its_get_is_in_flight_is_refused(front) -> None:
+    front.api.new_ids = ["sbx_x"]
+    assert front.create(POOL_TEAM)[0] == 200
+    assert claim(front, "sbx_x")[0] == 200
+    held = front.api.hold(r"GET /v1/sandboxes/sbx_x")
+    t, box = in_thread(claim, front, "sbx_x")  # the replay: the mark is clear, its GET starts and waits
+    held.wait_entered()
+    release = front.api.lose_bulk()
+    assert front.call("DELETE", BULK)[0] == 502  # an uncertain bulk delete marks the room meanwhile
+    assert "sbx_x" in front.ledger.unknown
+    held.release.set()  # the GET now answers 200
+    status, headers, out = finish(t, box)
+    release.set()
+    assert status == 409 and code(out) == "pool_room_unknown" and "X-Room-Receipt" not in headers
+    assert_idle(front.ledger)
+
+
+# ---------------------------------------------------------------- expiry is decided by the timer, not by what was parsed
+
+def test_a_claim_whose_headers_trickle_past_the_bound_is_cut_and_signed_502(front, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "CLAIM_WAIT_SECONDS", 1.0)
+    front.api.new_ids = ["sbx_x"]
+    assert front.create(POOL_TEAM)[0] == 200
+    front.api.trickle_raw(r"POST /v1/sandboxes/sbx_x/lifetime", 0.6, "HTTP/1.1 200 OK", "headers")
+    started = time.monotonic()
+    status, headers, out = claim(front, "sbx_x")
+    assert time.monotonic() - started < 1.5
+    assert status == 409 and code(out) == "pool_claim_failed" and receipt_of(headers)["statement"]["status"] == 502
+    assert_idle(front.ledger)
+
+
+def test_a_bulk_delete_whose_headers_trickle_past_the_bound_is_cut_and_uncertain(front, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "BULK_FORWARD_SECONDS", 1.0)
+    front.api.new_ids = ["sbx_x"]
+    assert front.create(POOL_TEAM)[0] == 200
+    front.api.trickle_raw(r"DELETE /v1/sandboxes", 0.6, "HTTP/1.1 204 No Content", "headers")
+    started = time.monotonic()
+    status, headers, out = front.call("DELETE", BULK)
+    assert time.monotonic() - started < 1.5
+    assert status == 502 and code(out) == "hotel_api_no_answer" and receipt_of(headers)["statement"]["status"] == 502
+    assert "sbx_x" in front.ledger.unknown
+    assert_idle(front.ledger)
+
+
+def test_a_connection_close_answer_whose_body_trickles_past_the_bound_is_cut_and_signed_502(front, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "CLAIM_WAIT_SECONDS", 1.0)
+    front.api.new_ids = ["sbx_x"]
+    assert front.create(POOL_TEAM)[0] == 200
+    front.api.trickle_raw(r"POST /v1/sandboxes/sbx_x/lifetime", 0.6, "HTTP/1.1 200 OK", "close_body")
+    started = time.monotonic()
+    status, headers, out = claim(front, "sbx_x")
+    assert time.monotonic() - started < 1.5
+    assert status == 409 and code(out) == "pool_claim_failed" and receipt_of(headers)["statement"]["status"] == 502
+    assert_idle(front.ledger)
+
+
+def test_a_bulk_delete_connection_close_answer_trickling_past_the_bound_is_uncertain(front, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "BULK_FORWARD_SECONDS", 1.0)
+    front.api.new_ids = ["sbx_x"]
+    assert front.create(POOL_TEAM)[0] == 200
+    front.api.trickle_raw(r"DELETE /v1/sandboxes", 0.6, "HTTP/1.1 200 OK", "close_body")
+    status, _headers, out = front.call("DELETE", BULK)
+    assert status == 502 and code(out) == "hotel_api_no_answer"
+    assert "sbx_x" in front.ledger.unknown
+    assert_idle(front.ledger)
+
+
+# ---------------------------------------------------------------- a stuck signer does not stretch a bulk delete's wait
+
+def test_a_bulk_delete_that_cannot_get_the_ledger_lock_in_time_is_refused_unsent(front, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "BULK_CLAIM_WAIT_SECONDS", 0.6)
+    front.ledger.lock.acquire()  # a signer whose receipt write blocks while it holds the lock
+    try:
+        started = time.monotonic()
+        status, _headers, out = front.call("DELETE", BULK)
+        took = time.monotonic() - started
+    finally:
+        front.ledger.lock.release()
+    assert status == 409 and code(out) == "bulk_delete_claim_busy" and took < 1.6
+    assert front.api.count(r"DELETE /v1/sandboxes") == 0
+    assert_idle(front.ledger)
+
+
+def test_a_waiting_bulk_delete_that_loses_the_ledger_lock_is_refused_unsent_at_its_bound(front, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "BULK_CLAIM_WAIT_SECONDS", 0.8)
+    front.api.new_ids = ["sbx_x"]
+    assert front.create(POOL_TEAM)[0] == 200
+    held = front.api.hold(r"POST /v1/sandboxes/sbx_x/lifetime")
+    c, cbox = in_thread(claim, front, "sbx_x")
+    held.wait_entered()
+    t, box = in_thread(front.call, "DELETE", BULK)
+    wait_for(lambda: front.ledger.bulk_pending == 1, "the bulk delete never reached the front")
+    front.ledger.lock.acquire()  # a stuck signer takes the lock while the bulk delete waits for the claim
+    try:
+        started = time.monotonic()
+        status, _headers, out = finish(t, box)
+        took = time.monotonic() - started
+    finally:
+        front.ledger.lock.release()
+    held.release.set()
+    finish(c, cbox)
+    assert status == 409 and code(out) == "bulk_delete_claim_busy" and took < 1.5
+    assert front.api.count(r"DELETE /v1/sandboxes") == 0
     assert_idle(front.ledger)

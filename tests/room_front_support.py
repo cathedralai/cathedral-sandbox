@@ -47,6 +47,7 @@ class FakeApi:
         self.answer_holds: list[Hold] = []
         self.lost_bulks: list[threading.Event] = []
         self.trickles: list[tuple[re.Pattern, float]] = []
+        self.raw_trickles: list[tuple[re.Pattern, float, str, str]] = []
         self.new_ids: list[str] = []
         self.counter = 0
         self.holds: list[tuple[re.Pattern, Hold]] = []
@@ -78,6 +79,12 @@ class FakeApi:
     def trickle(self, pattern: str, gap: float) -> None:
         """Answer the matching request in three pieces with *gap* seconds between them."""
         self.trickles.append((re.compile(pattern), gap))
+
+    def trickle_raw(self, pattern: str, gap: float, status_line: str, mode: str) -> None:
+        """Answer the matching request byte-wise slowly. mode "headers": the headers arrive one at a time, *gap*
+        seconds apart, and the Content-Length last. mode "close_body": the headers (Connection: close, no length)
+        arrive at once and the body in three pieces, *gap* apart, then the connection closes."""
+        self.raw_trickles.append((re.compile(pattern), gap, status_line, mode))
 
     def hold_create_answers(self) -> Hold:
         """Hold each create after the API made the room and before it answers."""
@@ -141,6 +148,9 @@ class FakeApi:
         for rx, gap in self.trickles:
             if rx.fullmatch(line):
                 return self._send_slowly(h, gap)
+        for rx, gap, status_line, mode in self.raw_trickles:
+            if rx.fullmatch(line):
+                return self._send_raw_slowly(h, gap, status_line, mode)
         for rx, status, out in self.replies:
             if rx.fullmatch(line):
                 return self._send(h, status, out)
@@ -188,6 +198,37 @@ class FakeApi:
         with self.lock:
             self.rooms.difference_update(targets)
         self._send(h, 200, b"{}")
+
+    @staticmethod
+    def _send_raw_slowly(h, gap: float, status_line: str, mode: str) -> None:
+        w = h.wfile
+        h.close_connection = True
+        body = b'{"expires_at": "2030-01-01T00:00:00+00:00", "ttl_seconds": 600}'
+        try:
+            if mode == "headers":
+                w.write(f"{status_line}\r\n".encode())
+                w.flush()
+                for header in ("Content-Type: application/json", "X-Pad-One: 1", "X-Pad-Two: 2"):
+                    time.sleep(gap)
+                    w.write(f"{header}\r\n".encode())
+                    w.flush()
+                time.sleep(gap)
+                w.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+            else:
+                w.write(f"{status_line}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n".encode())
+                w.flush()
+                third = len(body) // 3
+                for piece in (body[:third], body[third:2 * third], body[2 * third:]):
+                    time.sleep(gap)
+                    w.write(piece)
+                    w.flush()
+            w.flush()
+        except OSError:
+            pass  # the front cut the connection
+        try:
+            h.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     @staticmethod
     def _send_slowly(h, gap: float) -> None:
