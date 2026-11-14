@@ -1063,6 +1063,16 @@ class DockerClient:
                 f"docker unpause failed: {(result.stderr or result.stdout or '')[:200]}",
             )
 
+    def engine_status(self, container_id: str) -> str:
+        """The container's engine status ("running", "paused", "exited", ...), or "gone" when it does not exist.
+        Raises 502 when the engine cannot be read."""
+        result = self.run(["docker", "inspect", "--format", "{{.State.Status}}", container_id], timeout=15.0)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        if "no such" in (result.stderr or "").lower():
+            return "gone"
+        raise SandboxOpError("docker_inspect_failed", 502, f"docker inspect failed: {(result.stderr or '')[:200]}")
+
     def commit(self, container_id: str, image_name: str, *, blank_env: Iterable[str] = ()) -> str:
         # `--change "ENV NAME="` leaves the name in the image with an empty value. It does not remove it.
         changes = [arg for name in blank_env for arg in ("--change", f"ENV {name}=")]
@@ -1316,8 +1326,11 @@ class DockerGuestProvider:
         self._default_image = default_image
         self._guests: dict[str, GuestRecord] = {}
         self._snapshot_images: dict[str, str] = {}
-        self._unpause_owed: dict[str, str] = {}  # room id -> container id: a capture left it paused
-        self._unpause_failures: dict[str, int] = {}
+        # Reconcile state, all under self._inner._lock (see _converge): room id -> what the engine last said.
+        self._reconcile_pending: dict[str, bool | None] = {}
+        self._reconcile_failures: dict[str, int] = {}
+        self._reconciling: set[str] = set()
+        self._lifecycle_locks: dict[str, threading.Lock] = {}
         self._pending_image_rm: dict[str, int] = {}  # snapshot image -> failed removals, retried each sweep
         self._snapshot_meta: dict[str, dict[str, Any]] = {}  # snapshot id -> sizes and image
         self._snapshot_owners: dict[str, str] = {}  # snapshot id -> owner_id (AB#650)
@@ -2352,12 +2365,21 @@ class DockerGuestProvider:
             room_alive=room_alive,
         )
 
+    @staticmethod
+    def _refuse_probe_on_paused(code: int, err: str) -> None:
+        """A probe the engine refused because the room is paused or stopped says nothing about the image:
+        it must not be cached as "no bash" or "no timeout tool". The caller retries when the room runs."""
+        low = (err or "").lower()
+        if code != 0 and ("is paused" in low or "is not running" in low):
+            raise SandboxOpError("sandbox_paused", 409, "the room is paused or stopped; try again when it runs", retry_after=5)
+
     def _has_bash(self, guest: GuestRecord) -> bool:
         """True when the guest image can run ``bash``. Probe once; the probe has no side effect."""
         if guest.has_bash is None:
-            code, _, _, _ = self._client.exec(
+            code, _, err, _ = self._client.exec(
                 guest.container_id, ["bash", "-c", ":"], cwd=None, env={}, timeout_seconds=20, stdin=None
             )
+            self._refuse_probe_on_paused(code, err)
             guest.has_bash = code == 0
         return guest.has_bash
 
@@ -2370,9 +2392,10 @@ class DockerGuestProvider:
             return guest.timeout_form
         form = "none"
         for name, probe in (("gnu", ["timeout", "5", "true"]), ("busybox", ["timeout", "-t", "5", "true"])):
-            code, _, _, _ = self._client.exec(
+            code, _, err, _ = self._client.exec(
                 guest.container_id, probe, cwd=None, env={}, timeout_seconds=20, stdin=None
             )
+            self._refuse_probe_on_paused(code, err)
             if code == 0:
                 form = name
                 break
@@ -2516,8 +2539,24 @@ class DockerGuestProvider:
             if guest is None:
                 # No guest, no image: a tar alone is not a snapshot a fork could start.
                 raise SandboxOpError("snapshot_image_missing", 409, f"sandbox {sandbox_id} has no guest to commit")
-            self._inner.wait_for_api_writes(capture)  # also waits for freezes and thaws already admitted
-            was_frozen = self._inner.is_frozen(sandbox_id)  # read after the wait: nothing can change it now
+            self._inner.wait_for_api_writes(capture)  # also waits for freezes, thaws and reconciles in flight
+            # Nothing else can touch the room's run state now. A marked room is reconciled first, inside
+            # this capture's admission (the other choice, refusing, would leave a marked room uncapturable
+            # until a sweep came by); if it cannot be, the capture is refused, retryable.
+            if sandbox_id in self.pending_reconciles():
+                try:
+                    self._converge(sandbox_id, guest)
+                except SandboxOpError as exc:
+                    raise SandboxOpError(
+                        "snapshot_reconcile_failed", 503, f"room {sandbox_id} could not be brought to its run state: {exc}",
+                        retry_after=5,
+                    ) from exc
+            engine_state = self._read_state(guest)  # the engine decides whether to pause, not the record
+            if engine_state not in ("running", "paused"):
+                raise SandboxOpError(
+                    "snapshot_room_state_unknown", 503, f"room {sandbox_id} is {engine_state or 'unreadable'}; try again", retry_after=5
+                )
+            was_frozen = engine_state == "paused"
             pause_attempted = False
             try:
                 if not was_frozen:
@@ -2572,8 +2611,107 @@ class DockerGuestProvider:
         finally:
             self._inner.abort_snapshot(capture)
 
-    # An unpause of a container that is not paused, not running, or gone has nothing left to do.
+    # ---- reconcile: read the engine, converge to what the customer asked for (AB#604)
+    # The customer's freeze and thaw set the desired run state (the record's "frozen" or "running").
+    # A capture never changes it. After an engine pause or unpause whose result is not certain, the room
+    # is marked "reconcile needed" (_reconcile_pending, room id -> what the engine last said: True paused,
+    # False not paused, None unread). Nothing is assumed. A reconcile reads the container, then pauses or
+    # unpauses to match the desired state. It is a lifecycle operation: it takes the same per-room admission
+    # as freeze, thaw and writes (never during a capture; a capture waits for it) and the per-room lifecycle
+    # lock (never crossing a customer freeze or thaw). All of this state is read and written under the
+    # provider lock; no engine call is made under it.
     _BENIGN_UNPAUSE = ("is not paused", "is not running", "no such container")
+    _BENIGN_PAUSE = ("is already paused",)
+
+    def _lifecycle_lock(self, sandbox_id: str) -> threading.Lock:
+        with self._inner._lock:  # noqa: SLF001
+            return self._lifecycle_locks.setdefault(sandbox_id, threading.Lock())
+
+    def _read_state(self, guest: GuestRecord) -> str | None:
+        """The container's engine status ("running", "paused", "exited", "gone"), None when unreadable."""
+        try:
+            return self._client.engine_status(guest.container_id)
+        except SandboxOpError:
+            return None
+
+    def _set_mark(self, sandbox_id: str, paused: bool | None) -> int:
+        with self._inner._lock:  # noqa: SLF001
+            self._reconcile_pending[sandbox_id] = paused
+            self._reconcile_failures[sandbox_id] = self._reconcile_failures.get(sandbox_id, 0) + 1
+            return self._reconcile_failures[sandbox_id]
+
+    def _clear_mark(self, sandbox_id: str) -> None:
+        with self._inner._lock:  # noqa: SLF001
+            self._reconcile_pending.pop(sandbox_id, None)
+            self._reconcile_failures.pop(sandbox_id, None)
+
+    def _note_uncertain(self, sandbox_id: str, guest: GuestRecord, action: str, exc: Exception) -> None:
+        """An engine pause or unpause whose result is not certain: mark the room, read what the engine says."""
+        state = self._read_state(guest)
+        count = self._set_mark(sandbox_id, None if state is None else state == "paused")
+        print(
+            f"cathedral-sandbox: {action} of room {sandbox_id} failed ({count}, reconcile needed, engine says "
+            f"{state or 'unreadable'}): {exc}",
+            file=sys.stderr, flush=True,
+        )
+
+    def _converge(self, sandbox_id: str, guest: GuestRecord) -> None:
+        """Read the container and make it match the desired run state. The caller holds the room's
+        admission (so no capture or customer call runs) and its lifecycle lock."""
+        state = self._read_state(guest)
+        if state is None:
+            raise SandboxOpError("reconcile_unreadable", 503, f"cannot read the state of room {sandbox_id}", retry_after=5)
+        if state in ("gone", "exited", "dead"):
+            self._clear_mark(sandbox_id)  # nothing left to pause or unpause
+            return
+        paused = state == "paused"
+        desired_frozen = self._inner.is_frozen(sandbox_id)
+        try:
+            if paused and not desired_frozen:
+                self._client.unpause(guest.container_id)
+            elif not paused and desired_frozen:
+                self._client.pause(guest.container_id)
+        except SandboxOpError as exc:
+            action = "unpause" if paused else "pause"
+            benign = self._BENIGN_UNPAUSE if paused else self._BENIGN_PAUSE
+            if not any(m in str(exc).lower() for m in benign):
+                self._note_uncertain(sandbox_id, guest, action, exc)
+                raise
+        self._clear_mark(sandbox_id)
+
+    def _reconcile_room(self, sandbox_id: str) -> bool:
+        """Reconcile one room if it is marked. True when it converged. A room in a capture, or already
+        being reconciled, is left for the next sweep."""
+        with self._inner._lock:  # noqa: SLF001
+            if sandbox_id not in self._reconcile_pending or sandbox_id in self._reconciling:
+                return False
+            self._reconciling.add(sandbox_id)
+        try:
+            guest = self._guests.get(sandbox_id)
+            if guest is None:
+                self._clear_mark(sandbox_id)  # the room is gone: nothing to reconcile
+                return False
+            try:
+                with self._inner.room_op(sandbox_id):
+                    with self._lifecycle_lock(sandbox_id):
+                        self._converge(sandbox_id, guest)
+            except SandboxOpError as exc:
+                if exc.code in ("sandbox_not_found", "sandbox_deleting"):
+                    self._clear_mark(sandbox_id)
+                return False
+            return True
+        finally:
+            with self._inner._lock:  # noqa: SLF001
+                self._reconciling.discard(sandbox_id)
+
+    def pending_reconciles(self) -> dict[str, bool | None]:
+        """Room id -> what the engine last said (True paused, False not paused, None unread), for marked rooms."""
+        with self._inner._lock:  # noqa: SLF001
+            return dict(self._reconcile_pending)
+
+    def _reconcile_pending_rooms(self) -> None:
+        for sandbox_id in list(self.pending_reconciles()):
+            self._reconcile_room(sandbox_id)
 
     def _remove_snapshot_image(self, image: str) -> bool:
         """Remove a snapshot's image. A removal that fails while the image is still there (a fork
@@ -2594,50 +2732,17 @@ class DockerGuestProvider:
             self._remove_snapshot_image(image)
 
     def _unpause_after_capture(self, guest: GuestRecord, sandbox_id: str, *, strict: bool) -> None:
-        """Run the room again after a capture. A failure that leaves the room paused is recorded as
-        owed: the room is reported frozen (the truth), the sweep retries, and the error goes out when
-        the capture has no other error to report (strict)."""
+        """Run the room again after the capture's pause. An unpause of a container that is not paused, not
+        running or gone has nothing left to do. Any other failure leaves the result unknown: the room is
+        marked for reconcile (and the error goes out when the capture has no other error to report)."""
         try:
             self._client.unpause(guest.container_id)
         except SandboxOpError as exc:
             if any(m in str(exc).lower() for m in self._BENIGN_UNPAUSE) or self._guests.get(sandbox_id) is None:
                 return
-            self._owe_unpause(sandbox_id, guest.container_id, exc)
+            self._note_uncertain(sandbox_id, guest, "unpause", exc)
             if strict:
                 raise
-
-    def _owe_unpause(self, sandbox_id: str, container_id: str, exc: Exception) -> None:
-        """The unpause failed: the room is paused under a record that must not say running."""
-        first = sandbox_id not in self._unpause_owed
-        self._unpause_owed[sandbox_id] = container_id
-        self._unpause_failures[sandbox_id] = self._unpause_failures.get(sandbox_id, 0) + 1
-        self._inner.mark_frozen(sandbox_id)
-        print(
-            f"cathedral-sandbox: unpause of room {sandbox_id} failed "
-            f"({self._unpause_failures[sandbox_id]}, {'owed' if first else 'still owed'}): {exc}",
-            file=sys.stderr, flush=True,
-        )
-
-    def pending_unpauses(self) -> dict[str, str]:
-        """Room id -> container id for rooms a capture left paused and the sweep must still unpause."""
-        return dict(self._unpause_owed)
-
-    def _retry_unpauses(self) -> None:
-        for sandbox_id, container_id in list(self._unpause_owed.items()):
-            guest = self._guests.get(sandbox_id)
-            if guest is None or guest.container_id != container_id:
-                self._unpause_owed.pop(sandbox_id, None)  # the room is gone
-                self._unpause_failures.pop(sandbox_id, None)
-                continue
-            try:
-                self._client.unpause(container_id)
-            except SandboxOpError as exc:
-                if not any(m in str(exc).lower() for m in self._BENIGN_UNPAUSE):
-                    self._owe_unpause(sandbox_id, container_id, exc)
-                    continue
-            self._unpause_owed.pop(sandbox_id, None)
-            self._unpause_failures.pop(sandbox_id, None)
-            self._inner.mark_running(sandbox_id)
 
     def _snapshot_sizes(self, snap_id: str, image_name: str, base_image: str, work_archive_bytes: int) -> dict[str, Any]:
         """Sizes of one snapshot, in bytes.
@@ -2795,21 +2900,33 @@ class DockerGuestProvider:
 
     def freeze(self, sandbox_id: str) -> dict[str, Any]:
         # Counted as in flight for the length of the call: a capture waits for it, and a new one is
-        # refused while a capture runs, so a freeze cannot land in the middle of the capture's pause.
-        with self._inner.room_op(sandbox_id):
+        # refused while a capture runs. The lifecycle lock keeps it from crossing a reconcile.
+        with self._inner.room_op(sandbox_id), self._lifecycle_lock(sandbox_id):
             guest = self._guests.get(sandbox_id)
             if guest is not None:
-                self._client.pause(guest.container_id)
-            self._unpause_owed.pop(sandbox_id, None)  # the caller's own freeze: no debt to repay
-            return self._inner.freeze(sandbox_id, admitted=True)
+                try:
+                    self._client.pause(guest.container_id)
+                except SandboxOpError as exc:
+                    if not any(m in str(exc).lower() for m in self._BENIGN_PAUSE):  # already paused is the wish
+                        self._note_uncertain(sandbox_id, guest, "pause", exc)
+                        raise
+            doc = self._inner.freeze(sandbox_id, admitted=True)
+            self._clear_mark(sandbox_id)  # the container is paused and the customer wants it so
+            return doc
 
     def thaw(self, sandbox_id: str) -> dict[str, Any]:
-        with self._inner.room_op(sandbox_id):
+        with self._inner.room_op(sandbox_id), self._lifecycle_lock(sandbox_id):
             guest = self._guests.get(sandbox_id)
-            doc = self._inner.thaw(sandbox_id, admitted=True)
             if guest is not None:
-                self._client.unpause(guest.container_id)
-            self._unpause_owed.pop(sandbox_id, None)
+                try:
+                    self._client.unpause(guest.container_id)
+                except SandboxOpError as exc:
+                    if not any(m in str(exc).lower() for m in self._BENIGN_UNPAUSE):
+                        # Not certain, so the record keeps saying what the customer last asked for.
+                        self._note_uncertain(sandbox_id, guest, "unpause", exc)
+                        raise
+            doc = self._inner.thaw(sandbox_id, admitted=True)
+            self._clear_mark(sandbox_id)
             return doc
 
     def delete(self, sandbox_id: str) -> None:
@@ -3083,7 +3200,7 @@ class DockerGuestProvider:
         # sweep; collecting it here left its container and policy behind.
         self._inner.sweep_tombstones()
         self._gc_snapshot_images()
-        self._retry_unpauses()
+        self._reconcile_pending_rooms()
         self._retry_image_removals()
         return marked
 
@@ -3228,7 +3345,13 @@ class DockerGuestProvider:
         return argv, overlay
 
     def get(self, sandbox_id: str) -> dict[str, Any]:
-        return self._with_tunables(self._inner.get(sandbox_id))
+        doc = self._with_tunables(self._inner.get(sandbox_id))
+        with self._inner._lock:  # noqa: SLF001
+            seen = self._reconcile_pending.get(sandbox_id)
+        if seen is not None:
+            # A room marked for reconcile reports what the engine last said, not what was asked for.
+            doc = {**doc, "state": "frozen" if seen else "running"}
+        return doc
 
     def wait(self, sandbox_id: str, timeout_seconds: int) -> dict[str, Any]:
         return self._with_tunables(self._inner.wait(sandbox_id, timeout_seconds))
