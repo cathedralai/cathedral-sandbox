@@ -1924,3 +1924,12 @@ def test_every_honest_pack_case_still_passes_the_attestation_checks() -> None:
         case = json.loads((folder / "case.json").read_text())
         code, out, err = _run_cli(*[a.replace("{dir}", str(folder)) for a in case["args"]])
         assert code == 0 and "Traceback" not in err and json.loads(out)["verdict"] == "PASS", folder.name
+
+
+@pytest.mark.parametrize("status", [503, "503", None])
+def test_failed_pool_delete_does_not_prove_the_room_was_retired(status) -> None:
+    vr = _load_checker()
+    receipts = _case_receipts("good/pool_room_retired_unclaimed")
+    receipts[-1]["statement"]["status"] = status
+    assert vr.pool_rooms(receipts)["pool-1"]["state"] == "unknown"
+    assert vr.room_links(receipts) == {}

@@ -24,6 +24,7 @@ reference and is not treated as an isolation boundary.
 
 from __future__ import annotations
 
+import base64
 import os
 import shutil
 import signal
@@ -84,6 +85,10 @@ class SandboxOpError(Exception):
         self.retry_after = retry_after
 
 
+# AB#534: how stale a room's disk_bytes may be in a list answer.
+_DISK_LIST_MAX_AGE = 10.0
+
+
 @dataclass
 class _Sandbox:
     id: str
@@ -113,6 +118,10 @@ class _Sandbox:
     container_stdout: bytearray = field(default_factory=bytearray)
     container_stderr: bytearray = field(default_factory=bytearray)
     exposed: dict[int, str] = field(default_factory=dict)
+    # Last measured size of root (AB#534). Reads use this; the walk itself runs
+    # outside the provider lock so a big /work never stalls other calls.
+    disk_bytes: int = 0
+    disk_bytes_at: float | None = None  # time.monotonic() when that walk started
 
 
 class SandboxProvider(Protocol):
@@ -165,13 +174,17 @@ class SandboxProvider(Protocol):
     def mint_access_ticket(self, sandbox_id: str, *, ttl_sec: int | None = None) -> dict[str, Any]: ...
     def consume_access_ticket(self, sandbox_id: str, ticket: str) -> None: ...
     def create_terminal(
-        self, sandbox_id: str, *, cols: int | None = None, rows: int | None = None
+        self, sandbox_id: str, *, cols: int | None = None, rows: int | None = None, mode: str | None = None
     ) -> dict[str, Any]: ...
     def list_terminals(self, sandbox_id: str) -> list[dict[str, Any]]: ...
     def delete_terminal(self, sandbox_id: str, terminal_id: str) -> None: ...
     def connect_terminal(self, sandbox_id: str, terminal_id: str, *, ticket: str) -> dict[str, Any]: ...
-    def terminal_write(self, sandbox_id: str, terminal_id: str, data: str) -> dict[str, Any]: ...
+    def terminal_write(self, sandbox_id: str, terminal_id: str, data: str | bytes) -> dict[str, Any]: ...
     def terminal_read(self, sandbox_id: str, terminal_id: str) -> dict[str, Any]: ...
+    def terminal_read_wait(self, sandbox_id: str, terminal_id: str, timeout: float) -> dict[str, Any]: ...
+    def terminal_resize(
+        self, sandbox_id: str, terminal_id: str, cols: int | None, rows: int | None
+    ) -> dict[str, Any]: ...
     def publish_template(
         self,
         sandbox_id: str,
@@ -239,6 +252,8 @@ class InMemorySandboxProvider:
         # Agent IDE interactive (G4–G6): tickets, terminals, published templates.
         self._tickets: dict[str, agent_ux.AccessTicket] = {}
         self._terminals: dict[str, dict[str, agent_ux.TerminalSession]] = {}
+        # Wakes terminal_read_wait when PTY output lands or a terminal ends.
+        self._terminal_output = threading.Condition(self._lock)
         self._templates: dict[str, agent_ux.SandboxTemplate] = {}
         # Per-request tenant context (thread-local) — set by authorize().
         self._ctx = threading.local()
@@ -342,6 +357,29 @@ class InMemorySandboxProvider:
             if p.is_file():
                 total += p.stat().st_size
         return total
+
+    def _refresh_disk(self, sandboxes: Iterable[_Sandbox], max_age: float) -> None:
+        """Re-measure rooms whose cached size is older than *max_age* seconds.
+
+        Call WITHOUT ``self._lock`` (AB#534): the walk covers the room's /work,
+        which can hold many files. A room deleted mid-walk is skipped, and a
+        walk never overwrites a result from a walk that started later.
+        """
+        for sandbox in sandboxes:
+            started = time.monotonic()
+            seen = sandbox.disk_bytes_at
+            if seen is not None and started - seen < max_age:
+                continue
+            try:
+                size = self._disk_bytes(sandbox)
+            except OSError:
+                continue
+            with self._lock:
+                if self._sandboxes.get(sandbox.id) is not sandbox:
+                    continue
+                if sandbox.disk_bytes_at is None or sandbox.disk_bytes_at < started:
+                    sandbox.disk_bytes = size
+                    sandbox.disk_bytes_at = started
 
     def _assert_disk_room(
         self, sandbox: _Sandbox, *, extra_bytes: int, replacing: str | None
@@ -541,6 +579,9 @@ class InMemorySandboxProvider:
     # ------------------------------------------------------------------ §3.1 read / wait
     def get(self, sandbox_id: str) -> dict[str, Any]:
         with self._lock:
+            sandbox = self._require_active(sandbox_id)
+        self._refresh_disk([sandbox], max_age=0.0)
+        with self._lock:
             return self._get_doc(self._require_active(sandbox_id))
 
     def wait(self, sandbox_id: str, timeout_seconds: int) -> dict[str, Any]:
@@ -561,7 +602,7 @@ class InMemorySandboxProvider:
         metrics = Metrics(
             cpu_seconds=round(sandbox.cpu_seconds, 3),
             memory_peak_bytes=sandbox.memory_peak_bytes,
-            disk_bytes=self._disk_bytes(sandbox),
+            disk_bytes=sandbox.disk_bytes,
             network_bytes=sandbox.network_bytes,
             started_at=sandbox.started_at,
             deleted_at=sandbox.deleted_at,
@@ -909,6 +950,8 @@ class InMemorySandboxProvider:
             self._retain_logs(sandbox)
             shutil.rmtree(sandbox.root, ignore_errors=True)
             del self._sandboxes[sandbox_id]
+            terms = self._pop_terminals_locked(sandbox_id)
+        self._close_ptys(terms)
 
     def _retain_logs(self, sandbox: _Sandbox) -> None:
         """§3.13/§3.18: snapshot the log record so it survives the deleted sandbox for 24 h."""
@@ -1041,7 +1084,9 @@ class InMemorySandboxProvider:
             sandbox.state = "deleting"
             sandbox.deleted_at = _now()
             self._retain_logs(sandbox)
-            return True
+            terms = self._pop_terminals_locked(sandbox_id)
+        self._close_ptys(terms)
+        return True
 
     def finish_delete(self, sandbox_id: str) -> None:
         """Drop a record after its guest is confirmed gone. Idempotent."""
@@ -1063,18 +1108,28 @@ class InMemorySandboxProvider:
     def list(self, *, labels: Iterable[str], state: str | None) -> list[dict[str, Any]]:
         want = _parse_label_filters(labels)
         caller = self._caller_key()
+
+        def matches(sandbox: _Sandbox) -> bool:
+            if caller is not None and sandbox.api_key is not None and sandbox.api_key != caller:
+                return False
+            if sandbox.state == "deleting":
+                return False
+            if state and sandbox.state != state:
+                return False
+            return all(sandbox.labels.get(k) == v for k, v in want.items())
+
         with self._lock:
-            out = []
-            for sandbox in self._sandboxes.values():
-                if caller is not None and sandbox.api_key is not None and sandbox.api_key != caller:
-                    continue
-                if sandbox.state == "deleting":
-                    continue
-                if state and sandbox.state != state:
-                    continue
-                if all(sandbox.labels.get(k) == v for k, v in want.items()):
-                    out.append(self._get_doc(sandbox))
-            return out
+            picked = [s for s in self._sandboxes.values() if matches(s)]
+        # Sizes are re-measured outside the lock, at most every
+        # _DISK_LIST_MAX_AGE seconds per room (the broker lists every 2 s).
+        self._refresh_disk(picked, max_age=_DISK_LIST_MAX_AGE)
+        with self._lock:
+            # Re-check: a room may be gone or changed while the lock was free.
+            return [
+                self._get_doc(s)
+                for s in picked
+                if self._sandboxes.get(s.id) is s and matches(s)
+            ]
 
     def bulk_delete(self, labels: Iterable[str]) -> int:
         want = _parse_label_filters(labels)
@@ -1220,8 +1275,22 @@ class InMemorySandboxProvider:
         rec.consumed = True
 
     def create_terminal(
-        self, sandbox_id: str, *, cols: int | None = None, rows: int | None = None
+        self,
+        sandbox_id: str,
+        *,
+        cols: int | None = None,
+        rows: int | None = None,
+        mode: str | None = None,
+        spawn: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
+        mode = mode or "line"
+        if mode not in agent_ux.TERMINAL_MODES:
+            raise SandboxOpError("invalid_terminal_mode", 400, f"mode must be one of {', '.join(agent_ux.TERMINAL_MODES)}")
+        if mode == "pty" and spawn is None:
+            # This reference provider runs commands on the hotel itself; a
+            # shell here would not be in the room (B154). Only a runtime that
+            # keeps rooms in containers passes a spawn.
+            raise SandboxOpError("terminal_mode_unsupported", 422, "this runtime has no PTY terminals; use mode line")
         with self._lock:
             self._require_running(sandbox_id)
             try:
@@ -1234,6 +1303,8 @@ class InMemorySandboxProvider:
                 cols=c,
                 rows=r,
                 started_at=agent_ux.utc_now(),
+                mode=mode,
+                spawn=spawn if mode == "pty" else None,
             )
             self._terminals.setdefault(sandbox_id, {})[term.id] = term
             return term.to_document()
@@ -1242,6 +1313,21 @@ class InMemorySandboxProvider:
         with self._lock:
             self._require_active(sandbox_id)
             return [t.to_document() for t in self._terminals.get(sandbox_id, {}).values()]
+
+    def _close_ptys(self, terms: Iterable[agent_ux.TerminalSession]) -> None:
+        """Hang up PTY processes. Call without the provider lock held."""
+        for term in terms:
+            if term.pty is not None:
+                term.pty.close()
+
+    def _pop_terminals_locked(self, sandbox_id: str) -> list[agent_ux.TerminalSession]:
+        bag = self._terminals.pop(sandbox_id, {})
+        for term in bag.values():
+            term.exited = True
+            if term.exit_code is None:
+                term.exit_code = 0
+        self._terminal_output.notify_all()
+        return list(bag.values())
 
     def delete_terminal(self, sandbox_id: str, terminal_id: str) -> None:
         with self._lock:
@@ -1253,12 +1339,14 @@ class InMemorySandboxProvider:
             term.exited = True
             term.exit_code = 0
             del bag[terminal_id]
+            self._terminal_output.notify_all()
+        self._close_ptys([term])
 
     def connect_terminal(self, sandbox_id: str, terminal_id: str, *, ticket: str) -> dict[str, Any]:
         """Consume a single-use access ticket and mark the terminal connected (G4).
 
-        Full WebSocket PTY framing can ride this handshake; the reference provider
-        exposes REST write/read after connect for deterministic tests.
+        A line terminal runs each typed line as an exec. A PTY terminal starts
+        its shell in the room here, once, after the ticket is spent.
         """
         with self._lock:
             self._require_running(sandbox_id)
@@ -1267,16 +1355,131 @@ class InMemorySandboxProvider:
             if term is None or term.exited:
                 raise SandboxOpError("terminal_not_found", 404, f"no terminal {terminal_id}")
             term.connected = True
-            term.output.extend(b"[cathedral] terminal connected\n")
-            return {
-                "terminal_id": terminal_id,
-                "connected": True,
-                "transport": "websocket+rest",
-                "ws_path": f"/v1/sandboxes/{sandbox_id}/terminals/{terminal_id}/ws",
-                "note": "Prefer WebSocket /ws with X-Cathedral-Access-Ticket (query tickets disabled); REST write/read remain for tests.",
-            }
+            ws_path = f"/v1/sandboxes/{sandbox_id}/terminals/{terminal_id}/ws"
+            if term.mode != "pty":
+                term.output.extend(b"[cathedral] terminal connected\n")
+                return {
+                    "terminal_id": terminal_id,
+                    "connected": True,
+                    "transport": "websocket+rest",
+                    "ws_path": ws_path,
+                    "note": "Prefer WebSocket /ws with X-Cathedral-Access-Ticket (query tickets disabled); REST write/read remain for tests.",
+                }
+            start = term.pty is None and not term.spawning
+            if start:
+                term.spawning = True
+            cols, rows, spawn = term.cols, term.rows, term.spawn
+        doc = {
+            "terminal_id": terminal_id,
+            "connected": True,
+            "mode": "pty",
+            "transport": "websocket+rest",
+            "ws_path": ws_path,
+            "note": "WebSocket: binary frames are raw bytes both ways; text frames carry JSON control "
+            '{"type":"resize","cols":N,"rows":N} or {"type":"input","data":"..."}.',
+        }
+        if not start:
+            return doc
+        # Spawn outside the lock: the process start must not hold up the hotel,
+        # and the reader thread takes the lock for every chunk.
+        try:
+            handle = spawn(
+                cols,
+                rows,
+                lambda chunk: self._terminal_output_arrived(sandbox_id, terminal_id, chunk),
+                lambda code: self._terminal_exited(sandbox_id, terminal_id, code),
+            )
+        except Exception as exc:
+            with self._lock:
+                term.spawning = False
+                term.exited = True
+                term.exit_code = -1
+                self._terminal_output.notify_all()
+            raise SandboxOpError("terminal_spawn_failed", 502, f"could not start the terminal shell: {exc}") from exc
+        with self._lock:
+            term.pty = handle
+            term.spawning = False
+            gone = self._terminals.get(sandbox_id, {}).get(terminal_id) is not term
+        if gone:
+            # Deleted while it was starting.
+            handle.close()
+        return doc
+
+    def _terminal_output_arrived(self, sandbox_id: str, terminal_id: str, chunk: bytes) -> None:
+        with self._lock:
+            term = self._terminals.get(sandbox_id, {}).get(terminal_id)
+            if term is None:
+                return
+            term.output.extend(chunk)
+            over = len(term.output) - agent_ux.TERMINAL_OUTPUT_CAP
+            if over > 0:
+                del term.output[:over]
+                term.output_dropped += over
+            self._terminal_output.notify_all()
+
+    def _terminal_exited(self, sandbox_id: str, terminal_id: str, code: int) -> None:
+        with self._lock:
+            term = self._terminals.get(sandbox_id, {}).get(terminal_id)
+            if term is None:
+                return
+            term.exited = True
+            term.exit_code = code
+            self._terminal_output.notify_all()
+
+    def terminal_resize(self, sandbox_id: str, terminal_id: str, cols: int | None, rows: int | None) -> dict[str, Any]:
+        with self._lock:
+            self._require_running(sandbox_id)
+            term = self._terminals.get(sandbox_id, {}).get(terminal_id)
+            if term is None or term.exited:
+                raise SandboxOpError("terminal_not_found", 404, f"no terminal {terminal_id}")
+            try:
+                c, r = agent_ux.validate_terminal_size(cols, rows)
+            except ValueError as exc:
+                raise SandboxOpError("invalid_terminal_size", 400, str(exc)) from exc
+            term.cols, term.rows = c, r
+            handle = term.pty
+        if handle is not None:
+            handle.resize(c, r)
+        return {"terminal_id": terminal_id, "cols": c, "rows": r}
 
     def terminal_write(
+        self,
+        sandbox_id: str,
+        terminal_id: str,
+        data: str | bytes,
+        *,
+        executor: Callable[[str, ExecRequest], ExecResult] | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            self._require_running(sandbox_id)
+            term = self._terminals.get(sandbox_id, {}).get(terminal_id)
+            if term is None or term.exited:
+                raise SandboxOpError("terminal_not_found", 404, f"no terminal {terminal_id}")
+            if not term.connected:
+                raise SandboxOpError("terminal_not_connected", 409, "connect with an access ticket first")
+            pty_handle = term.pty if term.mode == "pty" else None
+            is_pty = term.mode == "pty"
+        if is_pty:
+            raw = data if isinstance(data, bytes) else data.encode("utf-8", errors="replace")
+            if len(raw) > agent_ux.TERMINAL_INPUT_MAX:
+                raise SandboxOpError(
+                    "terminal_input_too_large", 413, f"at most {agent_ux.TERMINAL_INPUT_MAX} bytes per write"
+                )
+            if pty_handle is None:
+                raise SandboxOpError("terminal_not_connected", 409, "the terminal shell is still starting")
+            # Raw bytes, no newline added: keys, ctrl-C and escape sequences go
+            # to the shell as typed. Written outside the lock: a full PTY
+            # buffer must not stall the hotel.
+            try:
+                pty_handle.write(raw)
+            except (BrokenPipeError, OSError) as exc:
+                raise SandboxOpError("terminal_exited", 409, "the terminal shell has exited") from exc
+            return {"written": len(raw), "pending": False}
+        if isinstance(data, bytes):
+            data = data.decode("utf-8", errors="replace")
+        return self._terminal_write_line(sandbox_id, terminal_id, data, executor=executor)
+
+    def _terminal_write_line(
         self,
         sandbox_id: str,
         terminal_id: str,
@@ -1333,13 +1536,38 @@ class InMemorySandboxProvider:
             term = self._terminals.get(sandbox_id, {}).get(terminal_id)
             if term is None:
                 raise SandboxOpError("terminal_not_found", 404, f"no terminal {terminal_id}")
-            data = bytes(term.output)
-            term.output.clear()
-            return {
-                "terminal_id": terminal_id,
-                "data": data.decode("utf-8", errors="replace"),
-                "exited": term.exited,
-            }
+            return self._drain_terminal_locked(term)
+
+    def _drain_terminal_locked(self, term: agent_ux.TerminalSession) -> dict[str, Any]:
+        data = bytes(term.output)
+        term.output.clear()
+        doc: dict[str, Any] = {
+            "terminal_id": term.id,
+            "data": data.decode("utf-8", errors="replace"),
+            "exited": term.exited,
+        }
+        if term.mode == "pty":
+            # PTY output is bytes: a chunk can split a utf-8 character or
+            # carry binary. data_b64 is exact; data is a readable view.
+            doc["data_b64"] = base64.b64encode(data).decode("ascii")
+            doc["output_dropped"] = term.output_dropped
+            if term.exited:
+                doc["exit_code"] = term.exit_code
+        return doc
+
+    def terminal_read_wait(self, sandbox_id: str, terminal_id: str, timeout: float) -> dict[str, Any]:
+        """Like terminal_read, but wait up to *timeout* seconds for output or exit."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._lock:
+            while True:
+                self._require_active(sandbox_id)
+                term = self._terminals.get(sandbox_id, {}).get(terminal_id)
+                if term is None:
+                    raise SandboxOpError("terminal_not_found", 404, f"no terminal {terminal_id}")
+                left = deadline - time.monotonic()
+                if term.output or term.exited or left <= 0:
+                    return self._drain_terminal_locked(term)
+                self._terminal_output.wait(left)
 
     def publish_template(
         self,
