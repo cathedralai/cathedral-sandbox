@@ -646,3 +646,20 @@ def test_a_claim_whose_lifetime_answer_is_lost_after_a_bulk_delete_is_signed_502
     assert receipt_of(headers)["statement"]["status"] == 502
     assert "sbx_x" in front.ledger.broken
     assert_idle(front.ledger)
+
+
+def test_a_params_suffix_on_the_path_is_read_as_the_api_reads_it_by_the_claim_and_the_pool_gate(front) -> None:
+    room = pool_room(front)
+    base = f"/v1/sandboxes/{room}"
+    # The gate sees the same route the API would run, so a suffix does not reach an unclaimed room.
+    status, _headers, out = front.call("POST", base + "/exec;x", {"cmd": ["true"]})
+    assert status == 409 and code(out) == "pool_room_unclaimed"
+    status, headers, _out = front.call("GET", base + "/claim;x")
+    assert status == 405 and headers["Allow"] == "POST"
+    assert front.api.count(r".*/exec") == 0
+    status, headers, out = front.call("POST", base + "/claim;x", {"cathedral_sandbox_id": CID, "lifetime_seconds": 60})
+    assert status == 200 and json.loads(out)["status"] == "claimed"
+    statement = receipt_of(headers)["statement"]
+    assert statement["action"] == "claim" and statement["target"] == f"POST {base}/claim"
+    assert room not in front.ledger.pool
+    assert_idle(front.ledger)
