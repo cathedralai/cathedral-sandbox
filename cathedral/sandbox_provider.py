@@ -84,6 +84,10 @@ class SandboxOpError(Exception):
         self.retry_after = retry_after
 
 
+# AB#534: how stale a room's disk_bytes may be in a list answer.
+_DISK_LIST_MAX_AGE = 10.0
+
+
 @dataclass
 class _Sandbox:
     id: str
@@ -113,6 +117,10 @@ class _Sandbox:
     container_stdout: bytearray = field(default_factory=bytearray)
     container_stderr: bytearray = field(default_factory=bytearray)
     exposed: dict[int, str] = field(default_factory=dict)
+    # Last measured size of root (AB#534). Reads use this; the walk itself runs
+    # outside the provider lock so a big /work never stalls other calls.
+    disk_bytes: int = 0
+    disk_bytes_at: float | None = None  # time.monotonic() when that walk started
 
 
 class SandboxProvider(Protocol):
@@ -343,6 +351,29 @@ class InMemorySandboxProvider:
                 total += p.stat().st_size
         return total
 
+    def _refresh_disk(self, sandboxes: Iterable[_Sandbox], max_age: float) -> None:
+        """Re-measure rooms whose cached size is older than *max_age* seconds.
+
+        Call WITHOUT ``self._lock`` (AB#534): the walk covers the room's /work,
+        which can hold many files. A room deleted mid-walk is skipped, and a
+        walk never overwrites a result from a walk that started later.
+        """
+        for sandbox in sandboxes:
+            started = time.monotonic()
+            seen = sandbox.disk_bytes_at
+            if seen is not None and started - seen < max_age:
+                continue
+            try:
+                size = self._disk_bytes(sandbox)
+            except OSError:
+                continue
+            with self._lock:
+                if self._sandboxes.get(sandbox.id) is not sandbox:
+                    continue
+                if sandbox.disk_bytes_at is None or sandbox.disk_bytes_at < started:
+                    sandbox.disk_bytes = size
+                    sandbox.disk_bytes_at = started
+
     def _assert_disk_room(
         self, sandbox: _Sandbox, *, extra_bytes: int, replacing: str | None
     ) -> None:
@@ -541,6 +572,9 @@ class InMemorySandboxProvider:
     # ------------------------------------------------------------------ §3.1 read / wait
     def get(self, sandbox_id: str) -> dict[str, Any]:
         with self._lock:
+            sandbox = self._require_active(sandbox_id)
+        self._refresh_disk([sandbox], max_age=0.0)
+        with self._lock:
             return self._get_doc(self._require_active(sandbox_id))
 
     def wait(self, sandbox_id: str, timeout_seconds: int) -> dict[str, Any]:
@@ -561,7 +595,7 @@ class InMemorySandboxProvider:
         metrics = Metrics(
             cpu_seconds=round(sandbox.cpu_seconds, 3),
             memory_peak_bytes=sandbox.memory_peak_bytes,
-            disk_bytes=self._disk_bytes(sandbox),
+            disk_bytes=sandbox.disk_bytes,
             network_bytes=sandbox.network_bytes,
             started_at=sandbox.started_at,
             deleted_at=sandbox.deleted_at,
@@ -1063,18 +1097,28 @@ class InMemorySandboxProvider:
     def list(self, *, labels: Iterable[str], state: str | None) -> list[dict[str, Any]]:
         want = _parse_label_filters(labels)
         caller = self._caller_key()
+
+        def matches(sandbox: _Sandbox) -> bool:
+            if caller is not None and sandbox.api_key is not None and sandbox.api_key != caller:
+                return False
+            if sandbox.state == "deleting":
+                return False
+            if state and sandbox.state != state:
+                return False
+            return all(sandbox.labels.get(k) == v for k, v in want.items())
+
         with self._lock:
-            out = []
-            for sandbox in self._sandboxes.values():
-                if caller is not None and sandbox.api_key is not None and sandbox.api_key != caller:
-                    continue
-                if sandbox.state == "deleting":
-                    continue
-                if state and sandbox.state != state:
-                    continue
-                if all(sandbox.labels.get(k) == v for k, v in want.items()):
-                    out.append(self._get_doc(sandbox))
-            return out
+            picked = [s for s in self._sandboxes.values() if matches(s)]
+        # Sizes are re-measured outside the lock, at most every
+        # _DISK_LIST_MAX_AGE seconds per room (the broker lists every 2 s).
+        self._refresh_disk(picked, max_age=_DISK_LIST_MAX_AGE)
+        with self._lock:
+            # Re-check: a room may be gone or changed while the lock was free.
+            return [
+                self._get_doc(s)
+                for s in picked
+                if self._sandboxes.get(s.id) is s and matches(s)
+            ]
 
     def bulk_delete(self, labels: Iterable[str]) -> int:
         want = _parse_label_filters(labels)
