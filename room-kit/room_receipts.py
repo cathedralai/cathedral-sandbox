@@ -793,8 +793,11 @@ class SealedSecrets:
         if held is not None:
             self.tracked -= len(held[1])
 
-    def retire(self, room: str) -> None:
+    def retire(self, room: str, incarnation_of=None) -> None:
         """A delete of the room passed this front: drop its entries and anything a racing write left.
+
+        incarnation_of(room) is asked under the lock: a room that has a live incarnation again was made
+        again after the delete was signed, and what the front holds for it is not this delete's to drop.
 
         The API dropped the directory before it answered the delete, but a
         write that renamed into it meanwhile makes that rmtree fail
@@ -805,6 +808,8 @@ class SealedSecrets:
         if not SECRETS_ROOM_RE.fullmatch(room):
             return  # never a path outside the root: "..", "." and anything with a slash do not match
         with self.lock:
+            if incarnation_of is not None and incarnation_of(room) is not None:
+                return
             self.forget(room)
             shutil.rmtree(os.path.join(self.root, room), ignore_errors=True)
 
@@ -985,9 +990,13 @@ class SealedEnv:
         """Caller holds the lock."""
         self.rooms.pop(room, None)
 
-    def retire(self, room: str) -> None:
-        """A delete of the room passed this front; the room API dropped the overlay with the room."""
+    def retire(self, room: str, incarnation_of=None) -> None:
+        """A delete of the room passed this front; the room API dropped the overlay with the room.
+
+        A room with a live incarnation again (made again since) keeps its entry."""
         with self.lock:
+            if incarnation_of is not None and incarnation_of(room) is not None:
+                return
             self.forget(room)
 
     def sweep(self, incarnation_of, room_present, now: float) -> None:
@@ -1240,9 +1249,11 @@ class SealedExec:
         seen[ephemeral] = issued_at
         self.tracked += 1
 
-    def retire(self, room: str) -> None:
-        """A delete of the room passed this front."""
+    def retire(self, room: str, incarnation_of=None) -> None:
+        """A delete of the room passed this front. A room with a live incarnation again keeps its entries."""
         with self.lock:
+            if incarnation_of is not None and incarnation_of(room) is not None:
+                return
             self.forget(room)
 
     def sweep(self, incarnation_of, now: float) -> None:
@@ -2188,6 +2199,26 @@ class Ledger:
             else:
                 self.in_flight.pop(room, None)
 
+    def _room_gone(self, room: str) -> None:
+        """A signed delete or room_end ends the room's incarnation and every mark kept for it. Caller holds self.lock."""
+        self.incarnations.pop(room, None)
+        self.serial.discard(room)
+        self.broken.discard(room)
+
+    def end_room(self, room: str, incarnation: str, status: int, reason: str, result_sha256: str) -> dict | None:
+        """Sign room_end for *room* if it is still the incarnation that was looked at and nothing is in flight for it.
+
+        One locked step, so two looks sign one end, and a room made again since the look is never ended.
+        """
+        with self.lock:
+            if self.incarnations.get(room) != incarnation or self.in_flight.get(room):
+                return None
+            return self._sign_locked({
+                "action": "room_end", "target": None, "sandbox_id": room,
+                "room_create_receipt_sha256": incarnation, "status": status, "reason": reason,
+                "result_sha256": result_sha256,
+            })
+
     def sign(self, fields: dict, create: dict | None = None) -> dict:
         with self.lock:
             return self._sign_locked(fields, create)
@@ -2230,9 +2261,9 @@ class Ledger:
                     if statement.get("serial"):
                         self.serial.add(room)
                 elif action == "delete":
-                    self.incarnations.pop(room, None)
-                    self.serial.discard(room)
-                    self.broken.discard(room)
+                    self._room_gone(room)
+            if action == "room_end":
+                self._room_gone(room)
         self.store.write(canonical(receipt) + b"\n")
         return receipt
 
@@ -2305,9 +2336,10 @@ EXEC_RESULT_FRONT_FAILED = b'{"error":{"code":"hotel_api_no_answer","message":"t
 
 
 class _ExecEntry:
-    __slots__ = ("body", "ctype", "done_at", "event", "headers", "status")
+    __slots__ = ("body", "ctype", "done_at", "event", "headers", "incarnation", "status")
 
-    def __init__(self):
+    def __init__(self, incarnation: str | None = None):
+        self.incarnation = incarnation  # the incarnation of the room that ran it: only that room is served it
         self.event = threading.Event()
         self.done_at: float | None = None
         self.status = 0
@@ -2344,7 +2376,13 @@ class ExecResults:
         done = [(e.done_at, k) for k, e in self.entries.items() if e.done_at is not None and k != but]
         return min(done)[1] if done else None
 
-    def begin(self, room: str, handle: str) -> str:
+    @staticmethod
+    def _mine(e: _ExecEntry, room: str, incarnation_of) -> bool:
+        """The entry belongs to the room's live incarnation. Asked under self.lock (lock order: this store, then the
+        ledger, as for the sealed stores). Without incarnation_of every entry counts."""
+        return incarnation_of is None or e.incarnation == incarnation_of(room)
+
+    def begin(self, room: str, handle: str, incarnation: str | None = None) -> str:
         """'tracked', 'busy' (a running exec holds this handle) or 'full' (run it untracked)."""
         key = (room, handle)
         with self.lock:
@@ -2358,7 +2396,7 @@ class ExecResults:
                 if old is None:
                     return "full"
                 self._drop(old)
-            self.entries[key] = _ExecEntry()
+            self.entries[key] = _ExecEntry(incarnation)
             return "tracked"
 
     def finish(self, room: str, handle: str, status: int, headers: dict, body: bytes, ctype: str) -> None:
@@ -2382,35 +2420,63 @@ class ExecResults:
                 self._drop(old)
             e.event.set()
 
-    def get(self, room: str, handle: str, wait: float) -> _ExecEntry | None:
+    def get(self, room: str, handle: str, wait: float, incarnation_of=None) -> _ExecEntry | None:
         key = (room, handle)
         with self.lock:
             self._prune(time.monotonic())
             e = self.entries.get(key)
+            if e is not None and not self._mine(e, room, incarnation_of):
+                e = None  # an earlier incarnation's, or the room has ended: never served
         if e is None:
             return None
         if e.done_at is None and wait > 0:
             e.event.wait(wait)
         with self.lock:
-            return e if self.entries.get(key) is e else None
+            return e if self.entries.get(key) is e and self._mine(e, room, incarnation_of) else None
 
-    def drop(self, room: str, handle: str) -> str:
+    def drop(self, room: str, handle: str, incarnation_of=None) -> str:
         """'dropped', 'running' (never dropped) or 'unknown'."""
         key = (room, handle)
         with self.lock:
             e = self.entries.get(key)
-            if e is None:
+            if e is None or not self._mine(e, room, incarnation_of):
                 return "unknown"
             if e.done_at is None:
                 return "running"
             self._drop(key)
             return "dropped"
 
-    def forget_room(self, room: str) -> None:
-        """A deleted room's finished answers go; a running one is stored when it ends and ages out."""
+    def forget_room(self, room: str, incarnation_of=None) -> None:
+        """An ended room's finished answers go; a running one is stored when it ends and ages out.
+
+        With incarnation_of, the answers of a live incarnation of the room (made again since the delete or
+        room_end was signed) stay: only the others go."""
         with self.lock:
-            for key in [k for k, e in self.entries.items() if k[0] == room and e.done_at is not None]:
+            live = incarnation_of(room) if incarnation_of is not None else None
+            for key in [k for k, e in self.entries.items()
+                        if k[0] == room and e.done_at is not None and (live is None or e.incarnation != live)]:
                 self._drop(key)
+
+
+def retire_room(ledger: "Ledger", room: str, exec_results: "ExecResults | None" = None) -> None:
+    """Drop what the front keeps for a room whose incarnation a signed delete or room_end ended.
+
+    A room made again since (it has a live incarnation) keeps its own: each store asks under its lock, store first and
+    the ledger second (the exec results included).
+
+    A window remains: a create signed after a store's check and before that store's cleanup finishes. It can
+    only affect the front's own bookkeeping, and the files a store removes, for a room the API has deleted or
+    is deleting (a deleting container can still be running), because a create that returns an existing id
+    returns the room the API recorded earlier. A delete answered with a non-2xx status schedules no retire:
+    the room keeps its incarnation until a later delete or room_end ends it."""
+    if ledger.secrets is not None:
+        ledger.secrets.retire(room, ledger.room_incarnation)
+    if ledger.sealed_exec is not None:
+        ledger.sealed_exec.retire(room, ledger.room_incarnation)
+    if ledger.sealed_env is not None:
+        ledger.sealed_env.retire(room, ledger.room_incarnation)
+    if exec_results is not None:
+        exec_results.forget_room(room, ledger.room_incarnation)
 
 
 def room_of(path: str) -> str | None:
@@ -2613,6 +2679,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and m:
             if not self.authorized():
                 return self.reply(401, b'{"error":"unauthorized"}')
+            try:
+                self.server.look_one(m["id"])
+            except Exception:  # noqa: BLE001 a look that fails must not fail the read
+                traceback.print_exc()
             with ledger.lock:
                 page = [ledger.chain[i] for i in ledger.by_room.get(m["id"], [])]
             # count and room_head are read with the page, so a reader can hold the list against them.
@@ -2705,7 +2775,7 @@ class Handler(BaseHTTPRequestHandler):
             handle = self.headers.get(EXEC_HANDLE_HEADER, "")
             if not EXEC_HANDLE.fullmatch(handle):
                 return self.reply(400, b'{"error":{"code":"invalid_request","message":"X-Room-Exec-Handle must be 32 lowercase hex characters"}}')
-            started = self.server.exec_results.begin(room, handle)
+            started = self.server.exec_results.begin(room, handle, ledger.room_incarnation(room))
             if started == "busy":
                 # Never replace a running exec's entry: its broker would read another command's answer.
                 return self.reply(409, b'{"error":{"code":"exec_handle_in_use","message":"a running exec holds this handle; nothing was started"}}')
@@ -2741,15 +2811,9 @@ class Handler(BaseHTTPRequestHandler):
                     # overlay set under the old one comes off before the room is used again.
                     ledger.reconcile_sealed_env(self.env_apply)
                 deleted = re.match("^" + ROOM + "$", path) if action == "delete" and 200 <= status < 300 else None
-                if deleted and ledger.secrets is not None:
-                    # After the receipt, which ends the room's incarnation: no write lands from here on.
-                    ledger.secrets.retire(deleted["id"])
-                if deleted and ledger.sealed_exec is not None:
-                    ledger.sealed_exec.retire(deleted["id"])
-                if deleted and ledger.sealed_env is not None:
-                    ledger.sealed_env.retire(deleted["id"])
                 if deleted:
-                    self.server.exec_results.forget_room(deleted["id"])
+                    # After the receipt, which ends the room's incarnation: no write lands from here on.
+                    retire_room(ledger, deleted["id"], self.server.exec_results)
             ctype = next((v for k, v in headers if k.lower() == "content-type"), "application/json")
             passthrough = {k: v for k, v in headers if k.lower() not in HOP and k.lower() != "content-type"}
             if track is not None:
@@ -2769,7 +2833,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(400, b'{"error":{"code":"invalid_request","message":"handle must be 32 lowercase hex characters"}}')
         results: ExecResults = self.server.exec_results
         if self.command == "DELETE":
-            outcome = results.drop(room, handle)
+            outcome = results.drop(room, handle, self.server.ledger.room_incarnation)
             if outcome == "running":
                 return self.reply(409, b'{"error":{"code":"exec_running","message":"the exec is still running"}}')
             if outcome == "unknown":
@@ -2782,7 +2846,7 @@ class Handler(BaseHTTPRequestHandler):
         if not 0 <= wait <= EXEC_RESULT_MAX_WAIT:
             return self.reply(400, canonical({"error": {"code": "invalid_request",
                                                         "message": f"wait must be 0 to {EXEC_RESULT_MAX_WAIT}"}}))
-        e = results.get(room, handle, wait)
+        e = results.get(room, handle, wait, self.server.ledger.room_incarnation)
         if e is None:
             return self.reply(404, b'{"error":{"code":"exec_unknown","message":"this hotel does not hold an exec with this handle"}}')
         if e.done_at is None:
@@ -3260,7 +3324,9 @@ class Server(ThreadingHTTPServer):
     request_queue_size = 1024
 
     def __init__(self, addr, ledger, api_port, health_port, api_key, docker_sock, attest_per_minute=30, *,
-                 attestation_only=False):
+                 attestation_only=False, look_seconds=None):
+        self._stop_look = threading.Event()
+        self.look_thread = None
         super().__init__(addr, Handler)
         self.attest_per_minute = max(1, int(attest_per_minute))
         self.ledger, self.api_port, self.health_port, self.api_key = ledger, api_port, health_port, api_key
@@ -3272,6 +3338,85 @@ class Server(ThreadingHTTPServer):
         self.health: tuple[int, bytes | None, float] = (503, None, 0.0)
         if not attestation_only:
             threading.Thread(target=self.health_loop, daemon=True).start()
+            if look_seconds is not None:
+                self.look_thread = threading.Thread(target=self.look_loop, args=(look_seconds,), daemon=True,
+                                                    name="room-look")
+                self.look_thread.start()
+
+    def server_close(self) -> None:
+        self._stop_look.set()
+        super().server_close()
+
+    def look_loop(self, seconds: float) -> None:
+        """Look for rooms the API no longer has, every *seconds*, until the server closes."""
+        while not self._stop_look.wait(seconds):
+            try:
+                self.look_all()
+            except Exception:  # noqa: BLE001 one failed look must not end the loop
+                traceback.print_exc()
+
+    def api_get(self, path: str, timeout: float) -> tuple[int, bytes] | None:
+        """One GET to the room API with the front's own key; None when it gave no answer."""
+        c = http.client.HTTPConnection("127.0.0.1", self.api_port, timeout=timeout)
+        try:
+            c.request("GET", path, headers={"Authorization": "Bearer " + self.api_key.decode()})
+            r = c.getresponse()
+            return r.status, r.read()
+        except (http.client.HTTPException, OSError):
+            return None
+        finally:
+            c.close()
+
+    def look_all(self) -> None:
+        """End each live room the API no longer lists.
+
+        The table is copied before the list is asked for, so a room made while the answer was on its way is
+        not in the copy and is never ended by this look. A failed list or an unexpected answer ends nothing.
+        """
+        with self.ledger.lock:
+            live = dict(self.ledger.incarnations)
+        if not live:
+            return
+        listed = self.api_get("/v1/sandboxes", 60)
+        if listed is None or listed[0] != 200:
+            return
+        try:
+            rooms = json.loads(listed[1])["sandboxes"]
+            present = {doc["id"] for doc in rooms}
+        except (ValueError, RecursionError, KeyError, TypeError):
+            return
+        for room, incarnation in live.items():
+            if room not in present:
+                self.look_at(room, incarnation)
+
+    def look_one(self, room: str) -> None:
+        """The same look for one room: one GET, no list. Run before a read of the room's receipts."""
+        with self.ledger.lock:
+            incarnation = self.ledger.incarnations.get(room)
+        if incarnation is not None:
+            self.look_at(room, incarnation)
+
+    def look_at(self, room: str, incarnation: str) -> None:
+        """Ask the API for one room and sign room_end when it says the room is gone or going.
+
+        Only 404 sandbox_not_found and 409 sandbox_deleting end a room: any other answer proves nothing. A room
+        with a request in flight is left to that request's own receipt.
+        """
+        with self.ledger.lock:
+            if self.ledger.in_flight.get(room):
+                return
+        got = self.api_get(f"/v1/sandboxes/{room}", 30)
+        if got is None:
+            return
+        status, out = got
+        try:
+            reason = json.loads(out)["error"]["code"]
+        except (ValueError, RecursionError, KeyError, TypeError):
+            return
+        if (status, reason) not in ((404, "sandbox_not_found"), (409, "sandbox_deleting")):
+            return
+        if self.ledger.end_room(room, incarnation, status, reason, sha(out)) is not None:
+            retire_room(self.ledger, room, self.exec_results)
 
     def health_loop(self) -> None:
         """Build the health answer once a second, off the request path."""
@@ -3386,14 +3531,15 @@ def main() -> int:
               "to bind the key", flush=True)
     else:
         print(f"room-receipts: binding {ledger.binding_sha256} level hotel", flush=True)
+    look = float(env.get("ROOM_LOOK_SECONDS", "15"))  # 0 turns the look off
     args = (ledger, int(env.get("ROOM_API_PORT", "18090")), int(env.get("ROOM_HEALTH_PORT", "18091")), api_key,
             env.get("ROOM_DOCKER_SOCK", "/run/pool-room/docker.sock"), int(env.get("ROOM_ATTEST_PER_MINUTE", "30")))
     if miner is None:
-        srv = Server((host, int(port)), *args)
+        srv = Server((host, int(port)), *args, look_seconds=look or None)
         srv.serve_forever()
         return 0
     tls_host, tls_port = env["ROOM_RECEIPTS_TLS_LISTEN"].rsplit(":", 1)
-    tls = TLSServer((tls_host, int(tls_port)), *args, tls_context=miner.tls_context(store))
+    tls = TLSServer((tls_host, int(tls_port)), *args, tls_context=miner.tls_context(store), look_seconds=look or None)
     plain = Server((host, int(port)), *args, attestation_only=True)
     threading.Thread(target=plain.serve_forever, daemon=True).start()
     print(f"room-receipts: miner hotel: HTTPS {tls_host}:{tls_port} tls_spki_sha256 {miner.tls_spki_sha256}; "
