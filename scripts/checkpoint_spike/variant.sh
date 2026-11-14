@@ -20,13 +20,13 @@ $CB --root /run/ckspike-runsc $CF run -bundle "$B" -detach "$NAME" >"$B/out.log"
 for i in $(seq 1 600); do [ -f "$B/work/ready" ] && break; sleep 0.5; done
 sleep 2
 [ -n "${GUEST_PRE:-}" ] && $CB --root /run/ckspike-runsc $CF exec "$NAME" /bin/sh -c "$GUEST_PRE"
-t1=$(date +%s.%N); $CB --root /run/ckspike-runsc $CF checkpoint ${CKPT_EXTRA:-} -image-path "$IMG" "$NAME"; rc=$?
+rc=0; t1=$(date +%s.%N); $CB --root /run/ckspike-runsc $CF checkpoint ${CKPT_EXTRA:-} -image-path "$IMG" "$NAME" || rc=$?
 echo "ckpt_rc=$rc ckpt_s=$(echo "$(date +%s.%N)-$t1"|bc) img_bytes=$(du -sb "$IMG"|cut -f1)"
 if [ "$rc" -ne 0 ]; then echo "checkpoint failed"; cat "$B/out.log"; exit "$rc"; fi
 $CB --root /run/ckspike-runsc $CF delete -force "$NAME" 2>/dev/null
 N0=$(wc -l < "$B/work/state.log")
 ( cd "$B" && eval "$BETWEEN" )
-t3=$(date +%s.%N); $RB --root /run/ckspike-runsc $RF restore -bundle "$B" -image-path "$IMG" -detach "$NAME" >>"$B/out.log" 2>&1 </dev/null; rrc=$?
+rrc=0; t3=$(date +%s.%N); $RB --root /run/ckspike-runsc $RF restore -bundle "$B" -image-path "$IMG" -detach "$NAME" >>"$B/out.log" 2>&1 </dev/null || rrc=$?
 echo "restore_rc=$rrc restore_s=$(echo "$(date +%s.%N)-$t3"|bc)"
 if [ "$rrc" -ne 0 ]; then echo "restore failed"; cat "$B/out.log"; exit "$rrc"; fi
 sleep 4; echo "new log lines after restore: $(( $(wc -l < "$B/work/state.log") - N0 ))"; tail -2 "$B/work/state.log"; tail -3 "$B/out.log"

@@ -24,7 +24,7 @@ CG=$(find /sys/fs/cgroup/ckspike -maxdepth 1 -name "$NAME" | head -1)
 MEMCUR=$(cat "$CG/memory.current" 2>/dev/null || echo NA)
 [ -n "${BUMP:-}" ] && echo $((MEM*2))G > "$CG/memory.max"
 grep -E "^(max|oom|high)" "$CG/memory.events" | tr "\n" " "; echo
-t1=$(now); $R checkpoint -image-path "$IMG" -compression "$COMP" ${CKPT_EXTRA:-} "$NAME"; rc=$?; t2=$(now)
+rc=0; t1=$(now); $R checkpoint -image-path "$IMG" -compression "$COMP" ${CKPT_EXTRA:-} "$NAME" || rc=$?; t2=$(now)
 if [ "$rc" -ne 0 ]; then echo "checkpoint failed rc=$rc"; cat "$B/out.log"; exit "$rc"; fi
 grep -E "^(max|oom|high)" "$CG/memory.events" 2>/dev/null | tr "\n" " "; echo
 SZ=$(du -sb "$IMG" | cut -f1)
@@ -33,7 +33,7 @@ $R delete -force "$NAME" 2>/dev/null
 sync; echo 3 > /proc/sys/vm/drop_caches
 sleep 3
 PRELINES=$(wc -l < "$B/work/state.log")
-t3=$(now); $R restore -bundle "$B" -image-path "$IMG" -detach "$NAME" >>"$B/out.log" 2>&1 </dev/null; rrc=$?; t4=$(now)
+rrc=0; t3=$(now); $R restore -bundle "$B" -image-path "$IMG" -detach "$NAME" >>"$B/out.log" 2>&1 </dev/null || rrc=$?; t4=$(now)
 if [ "$rrc" -ne 0 ]; then echo "restore failed rc=$rrc"; cat "$B/out.log"; exit "$rrc"; fi
 for i in $(seq 1 600); do [ "$(wc -l < "$B/work/state.log")" -gt "$PRELINES" ] && break; sleep 0.05; done
 t5=$(now)
