@@ -1681,6 +1681,40 @@ def run_form_cases(pack: Pack) -> None:
             run_case(pack, "bad", f"run_form_depth_{depth}_{name}",
                      f"The {name.replace('_', ' ')} is a list nested {depth} levels deep.", {"reason": reason},
                      **{knob: (lambda raw, d=depth: nested(d))})
+    # An unpaired surrogate is refused on the raw text, in a key or a value, in every form (after depth and number
+    # length, before the parse).
+    surrogate = {
+        "high_alone": b"\\ud800", "low_alone": b"\\udc00", "low_before_high": b"\\udc00\\ud800",
+        "high_then_other_escape": b"\\ud800\\u0041", "high_then_plain_char": b"\\ud800x",
+        "high_then_high": b"\\ud800\\ud800", "raw_utf8_bytes": b"\xed\xa0\x80"}
+    holds = {"one_shot_file": "the one-shot file", "recipe": "the recipe", "context_file": "the context file"}
+    for form, payload in surrogate.items():
+        for where, raw in (("value", b'{"k": "' + payload + b'"}'), ("key", b'{"' + payload + b'": 1}')):
+            run_case(pack, "bad", f"run_form_surrogate_{form}_in_a_{where}_of_the_context_file",
+                     f"The context file holds an unpaired surrogate ({form.replace('_', ' ')}) in a {where}.",
+                     {"reason": "inputs: the context file holds an unpaired surrogate"},
+                     context_raw=lambda _raw, r=raw: r)
+    utf16 = b"\xff\xfe" + '{"k": "\ud800"}'.encode("utf-16-le", "surrogatepass")
+    run_case(pack, "bad", "run_form_surrogate_unpaired_utf16_unit_in_the_context_file",
+             "The context file is UTF-16 text with a lone surrogate unit.",
+             {"reason": "inputs: the context file holds an unpaired surrogate"}, context_raw=lambda _raw: utf16)
+    run_case(pack, "bad", "run_form_surrogate_in_the_one_shot_file", "The one-shot file holds a lone surrogate escape.",
+             {"reason": "inputs: the one-shot file holds an unpaired surrogate"},
+             bundle_raw=lambda _raw: b'{"k": "\\ud800"}')
+    run_case(pack, "bad", "run_form_surrogate_in_the_recipe", "The recipe holds a lone surrogate escape.",
+             {"reason": "inputs: the recipe holds an unpaired surrogate"}, recipe_raw=lambda _raw: b'{"k": "\\ud800"}')
+    run_case(pack, "bad", "run_form_surrogate_and_repeated_key", "A context with a repeated key and a lone surrogate: "
+             "the surrogate is reported.", {"reason": "inputs: the context file holds an unpaired surrogate"},
+             context_raw=lambda _raw: b'{"a": 1, "a": "\\ud800"}')
+    run_case(pack, "bad", "run_form_surrogate_and_long_number", "A context with a number literal of 101 characters "
+             "and a lone surrogate: the number is reported.",
+             {"reason": "inputs: the context file holds a number literal of more than 100 characters"},
+             context_raw=lambda _raw: b'{"a": ' + b"1" * 101 + b', "b": "\\ud800"}')
+    run_case(pack, "good", "run_form_surrogate_pair_escaped", "A context string written as an escaped surrogate "
+             "pair is the one character it stands for.", {}, truth_context={"k": "\U0001F600"},
+             context_raw=lambda _raw: b'{"k": "\\ud83d\\ude00"}')
+    run_case(pack, "good", "run_form_surrogate_literal_backslash", "A backslash followed by ud800 is text, not an "
+             "escape.", {}, truth_context={"k": "\\ud800"})
     run_case(pack, "good", "run_form_brackets_in_a_string", "A context string of 4,000 opening brackets is a string, "
              "not nesting.", {}, truth_context={"k": "[" * 4000})
     run_case(pack, "good", "run_form_brackets_and_quotes_in_a_string", "A context string with quotes, backslashes and "
