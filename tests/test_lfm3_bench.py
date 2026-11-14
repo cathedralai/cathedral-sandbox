@@ -200,6 +200,21 @@ def test_stream_without_finish_reason_fails(room):
     assert done.returncode == 1 and "incomplete" in done.stderr and "lfm3-bench {" not in done.stdout
 
 
+def test_done_before_final_choice_and_timings_fails(room):
+    FakeServer.chunks = [delta(None, role="assistant"), delta("partial"), "data: [DONE]",
+                         {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                          "timings": TIMINGS}]
+    done = bench(room, "--index", "0", canon(["p"]))
+    assert done.returncode == 1 and "incomplete" in done.stderr and "lfm3-bench {" not in done.stdout
+
+
+def test_malformed_chunk_before_done_fails(room):
+    FakeServer.chunks = [delta(None, role="assistant"), delta("partial"),
+                         "data: {bad json", *normal_stream()[3:]]
+    done = bench(room, "--index", "0", canon(["p"]))
+    assert done.returncode == 1 and "malformed" in done.stderr and "lfm3-bench {" not in done.stdout
+
+
 def test_stream_without_a_token_fails(room):
     FakeServer.chunks = [delta(None, role="assistant"), "data: [DONE]"]
     done = bench(room, "--index", "0", canon(["p"]))
