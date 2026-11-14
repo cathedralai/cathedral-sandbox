@@ -793,7 +793,7 @@ class SealedSecrets:
         if held is not None:
             self.tracked -= len(held[1])
 
-    def retire(self, room: str) -> None:
+    def retire(self, room: str, ended_incarnation: str | None = None) -> None:
         """A delete of the room passed this front: drop its entries and anything a racing write left.
 
         The API dropped the directory before it answered the delete, but a
@@ -805,6 +805,9 @@ class SealedSecrets:
         if not SECRETS_ROOM_RE.fullmatch(room):
             return  # never a path outside the root: "..", "." and anything with a slash do not match
         with self.lock:
+            held = self.rooms.get(room)
+            if ended_incarnation is not None and held is not None and held[0] != ended_incarnation:
+                return  # a new create and secret write landed after the old room ended
             self.forget(room)
             shutil.rmtree(os.path.join(self.root, room), ignore_errors=True)
 
@@ -985,9 +988,12 @@ class SealedEnv:
         """Caller holds the lock."""
         self.rooms.pop(room, None)
 
-    def retire(self, room: str) -> None:
+    def retire(self, room: str, ended_incarnation: str | None = None) -> None:
         """A delete of the room passed this front; the room API dropped the overlay with the room."""
         with self.lock:
+            held = self.rooms.get(room)
+            if ended_incarnation is not None and held is not None and held[0] != ended_incarnation:
+                return
             self.forget(room)
 
     def sweep(self, incarnation_of, room_present, now: float) -> None:
@@ -1240,9 +1246,12 @@ class SealedExec:
         seen[ephemeral] = issued_at
         self.tracked += 1
 
-    def retire(self, room: str) -> None:
+    def retire(self, room: str, ended_incarnation: str | None = None) -> None:
         """A delete of the room passed this front."""
         with self.lock:
+            held = self.rooms.get(room)
+            if ended_incarnation is not None and held is not None and held[0] != ended_incarnation:
+                return
             self.forget(room)
 
     def sweep(self, incarnation_of, now: float) -> None:
@@ -2309,14 +2318,14 @@ HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrad
        "proxy-authenticate", "content-length", "host"}
 
 
-def retire_room(ledger: "Ledger", room: str) -> None:
+def retire_room(ledger: "Ledger", room: str, ended_incarnation: str | None = None) -> None:
     """Drop what the front keeps for a room whose incarnation a signed delete or room_end ended."""
     if ledger.secrets is not None:
-        ledger.secrets.retire(room)
+        ledger.secrets.retire(room, ended_incarnation)
     if ledger.sealed_exec is not None:
-        ledger.sealed_exec.retire(room)
+        ledger.sealed_exec.retire(room, ended_incarnation)
     if ledger.sealed_env is not None:
-        ledger.sealed_env.retire(room)
+        ledger.sealed_env.retire(room, ended_incarnation)
 
 
 def room_of(path: str) -> str | None:
@@ -3198,7 +3207,7 @@ class Server(ThreadingHTTPServer):
         if (status, reason) not in ((404, "sandbox_not_found"), (409, "sandbox_deleting")):
             return
         if self.ledger.end_room(room, incarnation, status, reason, sha(out)) is not None:
-            retire_room(self.ledger, room)
+            retire_room(self.ledger, room, incarnation)
 
     def health_loop(self) -> None:
         """Build the health answer once a second, off the request path."""

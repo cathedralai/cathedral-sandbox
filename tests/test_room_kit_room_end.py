@@ -12,7 +12,7 @@ import threading
 import time
 
 import pytest
-from room_front_support import Front, assert_idle, finish, in_thread, receipt_of
+from room_front_support import Front, assert_idle, finish, in_thread, receipt_of, rr
 
 SERIAL = {"image": "repo/app:1", "labels": {"cathedral_serial": "1"}}
 
@@ -28,7 +28,7 @@ class Retired:
     def __init__(self) -> None:
         self.rooms: list[str] = []
 
-    def retire(self, room: str) -> None:
+    def retire(self, room: str, _ended_incarnation: str | None = None) -> None:
         self.rooms.append(room)
 
 
@@ -76,6 +76,49 @@ def test_a_room_end_drops_the_serial_mark(front) -> None:
     front.server.look_all()
     assert room not in front.ledger.serial and room not in front.ledger.broken
     assert_idle(front.ledger)
+
+
+def test_a_room_end_cannot_retire_a_new_incarnation(front, tmp_path, monkeypatch) -> None:
+    room, old_incarnation = make_room(front)
+    front.ledger.secrets = rr.SealedSecrets(str(tmp_path / "sealed"))
+    front.ledger.sealed_exec = rr.SealedExec()
+    front.ledger.sealed_env = rr.SealedEnv()
+    front.api.rooms.discard(room)
+
+    entered, release = threading.Event(), threading.Event()
+    original_retire = rr.retire_room
+
+    def held_retire(*args):
+        entered.set()
+        assert release.wait(5)
+        return original_retire(*args)
+
+    monkeypatch.setattr(rr, "retire_room", held_retire)
+    look, result = in_thread(front.server.look_one, room)
+    assert entered.wait(5), "room_end never reached retirement"
+    assert front.ledger.room_incarnation(room) is None
+    front.api.new_ids.append(room)
+    status, headers, _out = front.create()
+    assert status == 200
+    new_incarnation = receipt_of(headers)["receipt_sha256"]
+    assert new_incarnation != old_incarnation
+
+    marker = tmp_path / "sealed" / room / "new-secret"
+    marker.parent.mkdir(parents=True)
+    marker.write_bytes(b"new")
+    front.ledger.secrets.rooms[room] = (new_incarnation, {})
+    front.ledger.sealed_exec.rooms[room] = (new_incarnation, {"new": 1})
+    front.ledger.sealed_exec.tracked = 1
+    front.ledger.sealed_env.rooms[room] = (new_incarnation, object())
+
+    release.set()
+    finish(look, result)
+    assert len(ends(front, room)) == 1
+    assert front.ledger.room_incarnation(room) == new_incarnation
+    assert marker.read_bytes() == b"new"
+    assert front.ledger.secrets.rooms[room][0] == new_incarnation
+    assert front.ledger.sealed_exec.rooms[room][0] == new_incarnation
+    assert front.ledger.sealed_env.rooms[room][0] == new_incarnation
 
 
 def test_an_api_restart_ends_every_room(front) -> None:
