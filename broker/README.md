@@ -474,8 +474,8 @@ receive this policy document.
 
 | Route (operator key) | What it does |
 |---|---|
-| `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey`, `reserved_for`, `lent_from`, `lent_report_id` and `admission` (with `report_id` once attested). |
-| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?, "require_attestation"?}`. A miner hotel must set `"sealed": true` and use HTTPS with attested guest TLS; the broker pins that key before its first keyed call. `"verify": false` is refused for miners (409 `guest_tls_required`). For operator hotels, the broker calls `GET /v1/status` with the key and checks attestation for sealed hotels; `"verify": false` skips both for an unsealed hotel and is refused for a sealed one (400 `verify_required`). `"sealed_admission": "off"` is refused at join (400 `invalid_hotel`): a joined hotel is always gated. An unsealed join cannot claim `labels.sealed=true` or set `require_attestation`. `miner_hotkey` (SS58) adds `miner=true` and `miner_hotkey` labels, which a PATCH cannot remove. |
+| `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey`, `reserved_for`, `lent_from`, `lent_report_id`, `admission` (with `report_id` once attested) and `commitment` (null, or the declaration with its delivery; see Capacity commitment). |
+| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?, "require_attestation"?, "commitment"?}`. A miner hotel must set `"sealed": true` and use HTTPS with attested guest TLS; the broker pins that key before its first keyed call. `"verify": false` is refused for miners (409 `guest_tls_required`). For operator hotels, the broker calls `GET /v1/status` with the key and checks attestation for sealed hotels; `"verify": false` skips both for an unsealed hotel and is refused for a sealed one (400 `verify_required`). `"sealed_admission": "off"` is refused at join (400 `invalid_hotel`): a joined hotel is always gated. An unsealed join cannot claim `labels.sealed=true` or set `require_attestation`. `miner_hotkey` (SS58) adds `miner=true` and `miner_hotkey` labels, which a PATCH cannot remove. `commitment` is for miner hotels only (see Capacity commitment). |
 | `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). An unsealed runtime hotel cannot gain the sealed label. `lend: true` lends a reserved sealed hotel to the pool; `reserved_for` on a lent hotel reclaims it (see Lend and reclaim). |
 
 | `DELETE /v1/broker/hotels/<id>` | Removes a runtime hotel that has no rooms. Drain it first. `?forget_rooms=true` (operator key only, miner hotels only): when the hotel is drained, has been down for 10 minutes and has no create in flight, it asks the old guest once more on its attested key (an answer refuses and starts the 10 minutes again), writes the rooms' `deleted` tombstones to disk, removes the hotel from the runtime list, and only then releases the rooms. A failed write answers 500 and leaves every room, client id and tombstone as before. Otherwise 409 `forget_refused` with the reason. |
@@ -486,6 +486,59 @@ cannot be removed at runtime. Runtime join, PATCH and leave return
 `state_write_failed` if `hotels.json` cannot be saved. A failed join cannot
 take rooms; a failed PATCH restores the previous values, and a failed leave
 keeps the hotel and its key.
+
+### Capacity commitment
+
+A miner hotel declares at join the slots it commits and the hours per UTC
+day it keeps them up: `"commitment": {"slots": 8, "daily_hours": 20}`. The
+broker config field `miner_min_commitment` (for example `{"slots": 4,
+"daily_hours": 12}`) is the floor, and it is published to miners as
+`admission_policy.miner_min_commitment` in the capacity view (null: none).
+The checks run before the broker calls the hotel, and a refused join stores
+nothing:
+
+| Join | Answer |
+|---|---|
+| `slots` below 1, `daily_hours` not in (0, 24], or `slots` above the join's `max_slots` | 400 `invalid_commitment` |
+| a commitment on a hotel without `miner_hotkey` | 400 `invalid_commitment` |
+| a miner without a commitment while a floor is set | 422 `commitment_required` |
+| a miner below the floor in `slots` or `daily_hours` | 422 `commitment_below_minimum` |
+
+Without a floor a commitment is optional. The floor governs new joins: a
+hotel restored after a restart keeps the commitment it joined with. A config
+file hotel cannot carry a commitment (miner hotels join at runtime).
+
+The sync loop measures delivery against the declaration per UTC day:
+`hours_up` (up, admitted, not drained), `hours_at_commitment` (of that, the
+time it offered at least the committed slots) and `slot_hours` (offered
+slots over time, capped at the committed slots). Offered slots are the
+hotel's reported slots this tick, capped by `max_slots`, so an operator
+`max_slots` below the commitment shows as a shortfall. A gap of more than 40
+s between ticks is not credited. A day is `met` when `hours_at_commitment`
+reaches `daily_hours`. `since` is the first tick of the day: the join day
+and the day of a broker restart are partial. The counters are in memory and
+restart with the broker. Each closed day is logged once
+(`hotel <id> commitment <day>: ...`).
+
+Testnet example (broker with `"miner_min_commitment": {"slots": 4,
+"daily_hours": 12}`; values are illustrative, not a recorded run):
+
+```sh
+# Below the floor: refused, nothing stored.
+curl -s -X POST "$BROKER/v1/broker/hotels" -H "Authorization: Bearer $ENROLL_KEY" \
+  -d '{"id": "miner-a", "api": "https://miner-a:8443", "health": "https://miner-a:8443",
+       "key": "'"$HOTEL_KEY"'", "sealed": true, "miner_hotkey": "'"$HOTKEY"'",
+       "commitment": {"slots": 2, "daily_hours": 20}}'
+# {"error": {"code": "commitment_below_minimum", "message": "commitment of 2 slots for 20 hours a day is below the minimum of 4 slots for 12 hours a day"}}
+
+# At or above the floor: 201, and the hotel document reads back the delivery.
+curl -s "$BROKER/v1/broker/hotels/miner-a" -H "Authorization: Bearer $ENROLL_KEY" | jq .commitment
+# {"slots": 8, "daily_hours": 20,
+#  "today": {"day": "2026-11-14", "since": "2026-11-14T00:00:02Z", "hours_up": 9.5,
+#            "hours_at_commitment": 9.25, "slot_hours": 75.8, "slot_hours_committed": 160, "met": false},
+#  "previous_day": {"day": "2026-11-13", "since": "2026-11-13T15:02:11Z", "hours_up": 8.97,
+#                   "hours_at_commitment": 8.97, "slot_hours": 71.76, "slot_hours_committed": 160, "met": false}}
+```
 
 ### Admission of sealed hotels
 
@@ -553,6 +606,7 @@ Config (all optional):
 |---|---|
 | `sealed_measurements` | A gated hotel's measurement must be in this list. Empty: every gated hotel is refused. |
 | `miner_hotkey_caps` | Operator-approved map from miner SS58 hotkey to maximum joined hotels. Missing hotkeys are refused. The broker counts all joined hotels for a hotkey, including pending or draining ones, and refuses the next join at the cap. Changing a cap requires a config restart; the broker has no cap hot reload yet. |
+| `miner_min_commitment` | `{"slots", "daily_hours"}`: the floor a miner join's commitment must meet (see Capacity commitment). Absent or zero: a commitment is optional. Changing it requires a restart. |
 | `miner_max_hotels` | Operator-approved maximum joined miner hotels across all hotkeys. Zero refuses miner joins. Pending and draining hotels count; the next join is refused with `miner_global_cap_reached`. The approved founding cut is 64; configure it explicitly before enabling enrollment. Changing it requires a restart. |
 | `sealed_host_data` | Its HOST_DATA must be in this list. A dedicated sealed machine (one owner, `SEALED_OWNER_PUBKEY_FILE`) has its own HOST_DATA, which names the owner key: add that value (the sealed install prints it). On `POST /v1/sandboxes` the broker passes `X-Cathedral-Owner-Signature` and `X-Cathedral-Owner-Timestamp` to the hotel unchanged; the machine checks them (`room-kit/sealed/README.md`, "Dedicated machine"). Its 403 `owner_signature_*` does not rest the hotel. |
 | `attest_ttl_seconds`, `attest_every_seconds` | As above. |
