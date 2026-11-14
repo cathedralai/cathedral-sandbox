@@ -146,6 +146,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import hashlib
 import http.client
 import ipaddress
@@ -601,7 +602,9 @@ def verify_receipts(att: dict, receipts: list[dict], head: str | None = None) ->
             need(prev == by_seq[seq - 1]["receipt_sha256"], f"receipt {seq} does not link to receipt {seq - 1}")
             links += 1
     seqs = sorted(by_seq)
-    contiguous = bool(seqs) and seqs == list(range(seqs[0], seqs[-1] + 1))
+    # Neighbours only: the span between two sequence numbers is never built, so the work follows the number of
+    # receipts and not the size of the numbers.
+    contiguous = bool(seqs) and all(b == a + 1 for a, b in itertools.pairwise(seqs))
     if head is not None and not seqs:  # a fresh hotel: the head is the binding itself
         need(head == bsha, "the chain is empty but the head is not the binding")
     elif head is not None:  # a whole chain (GET .../receipts from 0): no gap, ends at the head
@@ -643,6 +646,7 @@ def _check_pool_rooms(receipts: list[dict]) -> dict[str, dict]:
     The claim's sandbox id is the room's link, so every part of the pair is checked here, by the code
     that hands the link out. Entries keep the room and link under underscore keys for room_links."""
     groups = room_groups(receipts)
+    binding_counts = collections.Counter(room for _, room in groups)
     out: dict[str, dict] = {}
     for (bsha, room), rcs in groups.items():
         for rc in rcs:
@@ -700,7 +704,7 @@ def _check_pool_rooms(receipts: list[dict]) -> dict[str, dict]:
             need(second.get("action") == "delete",
                  f"room {room}: receipt {second.get('sequence')}: receipt 2 of a pool room is not a claim")
             entry["state"] = "retired"
-        out[room_key(groups, bsha, room)] = entry
+        out[room_key(binding_counts, bsha, room)] = entry
     return out
 
 
@@ -783,8 +787,9 @@ def check_room_chain(room: str, rcs: list[dict], in_order: bool = False) -> list
         need(given == sorted(given), f"room {room}: the receipts are not in the order of their room numbers")
     ordered = sorted(rcs, key=lambda rc: rc["statement"]["room_sequence"])
     seqs = [rc["statement"]["room_sequence"] for rc in ordered]
+    counts = collections.Counter(seqs)
     for n in seqs:
-        need(seqs.count(n) == 1, f"room {room}: room_sequence {n} appears more than once")
+        need(counts[n] == 1, f"room {room}: room_sequence {n} appears more than once")
     need(seqs[0] == 1, f"room {room}: room_sequence does not start at 1 (first is {seqs[0]})")
     for before, after in itertools.pairwise(seqs):
         need(after == before + 1, f"room {room}: room_sequence jumps from {before} to {after}: a receipt is missing")
@@ -823,9 +828,10 @@ def room_groups(receipts: list[dict]) -> dict[tuple[str, str], list[dict]]:
     return groups
 
 
-def room_key(groups: dict, bsha: str, room: str) -> str:
-    """The room id, or the room id and its binding when two bindings both name it."""
-    return room if sum(1 for _, r in groups if r == room) == 1 else f"{room}@{bsha[:12]}"
+def room_key(counts: collections.Counter, bsha: str, room: str) -> str:
+    """The room id, or the room id and its binding when two bindings both name it. counts is the number of
+    bindings that name each room id, made once per list (Counter(room for _, room in groups))."""
+    return room if counts[room] == 1 else f"{room}@{bsha[:12]}"
 
 
 def room_numbering(receipts: list[dict], list_doc: dict | None = None) -> dict:
@@ -835,6 +841,7 @@ def room_numbering(receipts: list[dict], list_doc: dict | None = None) -> dict:
     gets a warning and no claim; a room with none is left as it was. Returns the rooms that were
     checked and the warnings. list_doc is a per-room list answer: its room_head and count are checked."""
     groups = room_groups(receipts)
+    binding_counts = collections.Counter(room for _, room in groups)
     rooms: dict[str, dict] = {}
     warnings: list[str] = []
     for (bsha, room), rcs in groups.items():
@@ -878,7 +885,7 @@ def room_numbering(receipts: list[dict], list_doc: dict | None = None) -> dict:
         if ends:
             entry["ended"] = {"reason": ends[-1]["reason"]}
         # The same room id under two bindings has two chains: name them apart.
-        rooms[room_key(groups, bsha, room)] = entry
+        rooms[room_key(binding_counts, bsha, room)] = entry
     if list_doc is not None and "count" in list_doc:
         # An integer as written: in Python a boolean equals 0 or 1 and 0.0 equals 0, which other tools do not mirror.
         need(_is_int(list_doc["count"]), "the list's count is not an integer")
