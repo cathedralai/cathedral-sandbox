@@ -309,6 +309,22 @@ them, listed or not. Everything else answers 403 `terminals_disabled` and the
 message says why. The default is an empty list: no hotel. The broker refuses
 unknown config keys, so set the key only after the broker binary knows it.
 
+A WebSocket handshake on `GET /v1/sandboxes/<id>/terminals/<tid>/ws` (AB#405)
+passes the same gates, then the broker opens the same handshake to the room's
+hotel with the hotel key and pumps raw bytes both ways after the hotel's 101.
+Only `Sec-WebSocket-Key`, `Sec-WebSocket-Version`, `Sec-WebSocket-Protocol` and
+`X-Cathedral-Access-Ticket` go to the hotel; the guest's key, cookies and
+extension offers do not. The hotel checks and spends the ticket. Before any
+hotel call the broker refuses a handshake that cannot open: no key or a version
+other than 13 (400 `invalid_websocket`), a `ticket` query parameter (401
+`ticket_query_forbidden`), no ticket in the header or a `cathedral.ticket.*`
+subprotocol (401 `access_ticket_invalid`), or the client-compat path (501
+`websocket_unsupported`). A hotel refusal is relayed with its status and code; a
+hotel 101 with a wrong accept is a 502 `hotel_bad_handshake` (the ticket is
+spent by then). A socket with no bytes either way for 15 minutes is closed; the
+hotel's own 600 s idle close normally comes first. The broker must be reached
+over HTTP/1.1 for this route (an h2 or h2c proxy in front hides the Upgrade).
+
 ## Room network policy
 
 A create takes `"network": {"mode": "internet" | "deny_all" | "allowlist", "allow": [...]}`.
@@ -634,6 +650,29 @@ Config (all optional):
 `admission.state` in the hotel document and the catalog is `admitted`,
 `pending` or `refused` (with `reason`). `GET /v1/broker/hotels` (guest key) lists all
 hotels with labels and free rooms.
+
+## Alerts
+
+- First missed heartbeat: the first `/room/health` call that fails after a
+  hotel has answered health once sends `[OPERATOR-ALERT]` to the hotel's
+  `alert_chat_id` (the miner operator). One per miss streak; the streak ends
+  at the next good health answer. A late health while room calls still answer
+  counts as a miss.
+- Customer-affecting drop: a hotel that was up goes down while it holds guest
+  rooms, queued or in-flight creates. `[OPS-ALERT]` goes to
+  `alerts.ops_chat_id`. One per down episode.
+- Each audience also waits 10 minutes between two alerts about one hotel, so
+  a flapping hotel does not spam.
+- Delivery: `"alerts": {"webhook_url_file": "<file with the https URL>",
+  "ops_chat_id": "<chat>"}`. The URL is a Telegram
+  `https://api.telegram.org/bot<token>/sendMessage`; the broker POSTs
+  `{"chat_id", "text"}`, never logs the URL, and logs a failed delivery by
+  kind only. Without a URL or a chat the alert is a log line only.
+- `alert_chat_id` (a Telegram chat id or `@channel`) is set in a config file
+  hotel's entry, in a join body, or by an operator `PATCH` of a joined hotel.
+  The miner enrollment key cannot change it. It is not in any hotel document.
+- An alert names the hotel id, name and miner hotkey, how long health has
+  been missing and a room count. No guest, room id, label, image or key.
 
 ## Secrets
 

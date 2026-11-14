@@ -1,0 +1,24 @@
+{
+ "args": [
+  "--oneshot",
+  "{dir}/bundle.json",
+  "--recipe",
+  "{dir}/recipe.json",
+  "--context",
+  "{dir}/context.json",
+  "--ark-sha256",
+  "2f0cd3780ee3b0ce55c3e76ccd7f23727bca28326bb24cb8b7588ed2f78b3bc5",
+  "--expected-measurement",
+  "9b148da6715f6a68fd6314d9015f54413c261a0b1b25075b568e0b5106687a2b434d7661f26d036700090ca1917a9ed1",
+  "--input-sha256",
+  "/work/in/a=7d3f9b6284c6f36e77b425cac882e8fbbcc97a4727ec20790853076d0f463453",
+  "--output-file",
+  "/work/out/result.json={dir}/outputs/result.json"
+ ],
+ "description": "One step past the form rule input_path_twice: duplicate.",
+ "expect": {
+  "exit_code": 1,
+  "reason": "recipe: an input path is given twice",
+  "verdict": "FAIL"
+ }
+}
