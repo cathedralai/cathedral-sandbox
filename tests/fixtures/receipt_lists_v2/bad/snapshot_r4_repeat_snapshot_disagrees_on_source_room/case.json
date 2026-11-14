@@ -1,0 +1,17 @@
+{
+ "args": [
+  "--attestation",
+  "{dir}/attestation_doc.json",
+  "--receipts",
+  "{dir}/receipts.json",
+  "--skip-amd",
+  "--expected-measurement",
+  "9b148da6715f6a68fd6314d9015f54413c261a0b1b25075b568e0b5106687a2b434d7661f26d036700090ca1917a9ed1"
+ ],
+ "description": "One snapshot id signed by two rooms in one binding.",
+ "expect": {
+  "exit_code": 1,
+  "reason": "snapshot snap_0123456789ab: receipt 3 and receipt 4 disagree on the source room",
+  "verdict": "FAIL"
+ }
+}

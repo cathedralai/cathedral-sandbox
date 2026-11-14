@@ -1,0 +1,52 @@
+{
+ "head": "bef576fbbc70b22ee559dbfded7d9078e98f94ec22960b2daeada2bcc2acbe81",
+ "receipts": [
+  {
+   "receipt_sha256": "1a2affc6bb1ccb701e52ee4c264bf5bebcbd921ed91d86971b24e67ef38e42a1",
+   "signature_b64": "VZ4fw7Zk9O9CoP9Q4W0OowP/AtJw6pdUCC6sSQPURFa8uSzZYOeTRl9FMlRHiaP+n/BTeWnOqlvedwSazdHBDA==",
+   "statement": {
+    "action": "create",
+    "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
+    "command_sha256": null,
+    "customer_request_sha256": "ad1b9de910513527b407147d7a05569066c1a50cceaba3e118df6b13f49e749c",
+    "hotel": "pack-hotel",
+    "image": null,
+    "image_digest": null,
+    "issued_at": 1700000001,
+    "operation_id": "6a7098ee-602f-b0f8-a645-46d9f49c5eeb",
+    "previous_receipt_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
+    "result_sha256": "400a936d0ac7637324413df9aaf2067ff68468e602a5446af1e454878b5bad1e",
+    "room_previous_receipt_sha256": null,
+    "room_sequence": 1,
+    "sandbox_id": "room-a",
+    "schema": "cathedral_sealed_hotel_receipt_v1",
+    "sequence": 1,
+    "status": 200,
+    "target": "POST /v1/sandboxes/room-a/create"
+   }
+  },
+  {
+   "receipt_sha256": "bef576fbbc70b22ee559dbfded7d9078e98f94ec22960b2daeada2bcc2acbe81",
+   "signature_b64": "yXXYDw0GY0qvYkWlyHsOPEWbG2nH/7MhHhbyimeWHxqSxcfN1N6wxQemRmPW84M3+MViYHkttFs2tpEtDoMGAA==",
+   "statement": {
+    "action": "snapshot_delete",
+    "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
+    "command_sha256": null,
+    "customer_request_sha256": "ff14e14c208d414590558c2e333a73da13828df7df2988dacc7f817e6aa5f995",
+    "hotel": "pack-hotel",
+    "image": null,
+    "image_digest": null,
+    "issued_at": 1700000002,
+    "operation_id": "81b3464a-8f46-451e-e17b-915979a074b9",
+    "previous_receipt_sha256": "1a2affc6bb1ccb701e52ee4c264bf5bebcbd921ed91d86971b24e67ef38e42a1",
+    "result_sha256": "096e929abe31157e5a522fecfe1333bb96b3252e9ee74923b6e9027206c4d068",
+    "sandbox_id": null,
+    "schema": "cathedral_sealed_hotel_receipt_v1",
+    "sequence": 2,
+    "snapshot_id": "snap_0123456789ab",
+    "status": 200,
+    "target": "DELETE /v1/snapshots/snap_0123456789ab"
+   }
+  }
+ ]
+}

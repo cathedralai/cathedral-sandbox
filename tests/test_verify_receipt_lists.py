@@ -1933,3 +1933,209 @@ def test_failed_pool_delete_does_not_prove_the_room_was_retired(status) -> None:
     receipts[-1]["statement"]["status"] = status
     assert vr.pool_rooms(receipts)["pool-1"]["state"] == "unknown"
     assert vr.room_links(receipts) == {}
+
+
+# ---------------------------------------------------------------- check 11: snapshot and fork edges (AB#604 CS-4)
+# The pack cases named snapshot_rN_* are run by test_pack_case_gives_its_stated_answer above. N is the rule of the
+# work package: 1 shapes, 2 content hash recomputes, 3 scope by binding (below, in memory: two bindings in one list
+# need a broker archive on the command line), 4 repeats agree, 5 a fork matches the snapshot it names, 6 a source
+# not in the list is a warning, 7 no fork after a delete, 8 the output's chain.forks, 9 the same in every mode.
+
+def _snapshot_cases(kind: str, rule: int) -> list[str]:
+    return sorted(p.name for p in (PACK / kind).iterdir() if p.name.startswith(f"snapshot_r{rule}_"))
+
+
+@pytest.mark.parametrize("rule, kinds", [(1, ("good", "bad")), (2, ("good", "bad")), (4, ("good", "bad")),
+                                         (5, ("good", "bad")), (6, ("good",)), (7, ("good", "bad"))])
+def test_every_snapshot_rule_has_its_good_and_bad_pack_cases(rule, kinds) -> None:
+    for kind in kinds:
+        assert _snapshot_cases(kind, rule), (rule, kind)
+
+
+def test_the_content_hash_is_sha256_of_the_canonical_document_of_its_two_parts() -> None:
+    import hashlib
+
+    vr, gen = _load_checker(), _generator()
+    image, archive = "sha256:" + "ab" * 32, "cd" * 32
+    doc = {"schema": "cathedral_snapshot_content_v1", "image_id": image, "work_archive_sha256": archive}
+    literal = json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    assert vr.snapshot_content_sha256(image, archive) == hashlib.sha256(literal).hexdigest() == gen.snap_content(image, archive)
+
+
+def _snapshot_edges_of(gen, pack, **kw) -> list[dict]:
+    return gen.snap_hotel(pack, **kw)[0].chain
+
+
+def test_lists_without_snapshot_receipts_print_no_forks_member() -> None:
+    for folder in sorted((PACK / "good").iterdir()):
+        if folder.name.startswith("snapshot_") and not folder.name.startswith("snapshot_r1_create_without"):
+            continue
+        _, out, code = _run_pack_case(f"good/{folder.name}")
+        assert code == 0 and "forks" not in out["chain"], folder.name
+
+
+def _rebound(gen, receipts: list[dict], bsha: str, renamed: dict | None = None) -> list[dict]:
+    """The receipts as another binding holds them: statements re-bound and hashed again. `renamed` maps an old
+    receipt hash to the new one, so a fork keeps naming the snapshot receipt of its own binding."""
+    out, renamed = [], dict(renamed or {})
+    for rc in receipts:
+        st = json.loads(json.dumps(rc["statement"]))
+        st["binding_sha256"] = bsha
+        if "snapshot_receipt_sha256" in st:
+            st["snapshot_receipt_sha256"] = renamed.get(st["snapshot_receipt_sha256"], st["snapshot_receipt_sha256"])
+        new = {"statement": st, "signature_b64": rc["signature_b64"], "receipt_sha256": gen.sha(gen.canonical(st))}
+        renamed[rc["receipt_sha256"]] = new["receipt_sha256"]
+        out.append(new)
+    return out
+
+
+def _two_bindings(gen, pack, second: dict | None = None):
+    first = _snapshot_edges_of(gen, pack, with_delete=False)
+    other_pack = gen.Pack(gen.read_amd())
+    other = _snapshot_edges_of(gen, other_pack, **(second or {"with_delete": False}))
+    return first, _rebound(gen, other, "11" * 32)
+
+
+def test_rule_3_two_bindings_may_use_one_snapshot_id_with_different_content() -> None:
+    vr, gen = _load_checker(), _generator()
+    pack = gen.Pack(gen.read_amd())
+    first, second = _two_bindings(gen, pack, {"s": {"snapshot_work_archive_sha256": "ee" * 32,
+                                                     "snapshot_content_sha256": gen.snap_content(archive="ee" * 32)},
+                                               "with_delete": False})
+    out = vr.check_snapshot_edges(first + second)
+    assert [f["in_list"] for f in out["forks"]] == [True, True]
+    assert out["forks"][0]["snapshot_content_sha256"] != out["forks"][1]["snapshot_content_sha256"]
+
+
+def test_rule_3_a_fork_whose_snapshot_receipt_is_under_another_binding_fails() -> None:
+    vr, gen = _load_checker(), _generator()
+    pack = gen.Pack(gen.read_amd())
+    first, second = _two_bindings(gen, pack)
+    fork = second[2]["statement"]
+    fork["snapshot_receipt_sha256"] = first[1]["receipt_sha256"]  # the snapshot of the first binding
+    second[2]["receipt_sha256"] = gen.sha(gen.canonical(fork))
+    with pytest.raises(vr.Fail) as caught:
+        vr.check_snapshot_edges(first + second)
+    assert str(caught.value) == f"receipt {fork['sequence']}: snapshot_receipt_sha256 names a receipt under another binding"
+
+
+def test_rule_3_a_delete_in_one_binding_does_not_bar_a_fork_in_another() -> None:
+    vr, gen = _load_checker(), _generator()
+    pack = gen.Pack(gen.read_amd())
+    first = _snapshot_edges_of(gen, pack)  # create, snapshot, fork, delete
+    other = _rebound(gen, _snapshot_edges_of(gen, gen.Pack(gen.read_amd()), with_delete=False), "11" * 32)
+    # the delete (sequence 4) of binding one comes before nothing of binding two: ids are scoped by binding
+    other[2]["statement"]["sequence"] = 9
+    other[2]["receipt_sha256"] = gen.sha(gen.canonical(other[2]["statement"]))
+    assert len(vr.check_snapshot_edges(first + other)["forks"]) == 2
+
+
+def test_rule_4_the_same_snapshot_id_in_two_bindings_may_come_from_two_rooms() -> None:
+    vr, gen = _load_checker(), _generator()
+    pack = gen.Pack(gen.read_amd())
+    first = _snapshot_edges_of(gen, pack, with_delete=False)
+    other = _rebound(gen, _snapshot_edges_of(gen, gen.Pack(gen.read_amd()), with_delete=False), "11" * 32)
+    for rc in other:
+        st = rc["statement"]
+        for member in ("sandbox_id", "snapshot_source_sandbox_id"):
+            if st.get(member) == "room-a":
+                st[member] = "room-z"
+    for rc in other:
+        rc["receipt_sha256"] = gen.sha(gen.canonical(rc["statement"]))
+    other[2]["statement"]["snapshot_receipt_sha256"] = other[1]["receipt_sha256"]
+    other[2]["receipt_sha256"] = gen.sha(gen.canonical(other[2]["statement"]))
+    assert len(vr.check_snapshot_edges(first + other)["forks"]) == 2
+
+
+def test_rule_5_the_fork_names_the_snapshot_whatever_the_order_of_the_list() -> None:
+    vr, gen = _load_checker(), _generator()
+    chain = _snapshot_edges_of(gen, gen.Pack(gen.read_amd()), with_delete=False)
+    for order in ([2, 1, 0], [1, 2, 0], [2, 0, 1]):
+        assert vr.check_snapshot_edges([chain[i] for i in order])["forks"][0]["in_list"] is True
+
+
+def test_rule_8_a_list_with_snapshot_receipts_and_no_fork_has_an_empty_forks_list() -> None:
+    vr, gen = _load_checker(), _generator()
+    pack = gen.Pack(gen.read_amd())
+    chain = _snapshot_edges_of(gen, pack, with_delete=False)[:2]
+    assert vr.check_snapshot_edges(chain) == {"forks": []}
+    assert vr.check_snapshot_edges(chain[:1]) is None  # a create alone: nothing to report
+
+
+# ---- rule 9: file mode, header mode and run mode give the same reason
+
+def _plain_chain(gen, pack, **kw) -> list[dict]:
+    return gen.snap_hotel(pack, **kw)[0].chain
+
+
+def _fork_after_delete(gen, pack) -> list[dict]:
+    h = pack.new_hotel()
+    h.sign("create", "room-a", 200)
+    snap = h.sign("snapshot", "room-a", 202, **gen.snap_fields())
+    h.sign("snapshot_delete", None, 200, **gen.delete_fields())
+    h.sign("create", "room-b", 200, **gen.fork_fields(snap))
+    return h.chain
+
+
+def _repeat_disagrees(gen, pack) -> list[dict]:
+    h = pack.new_hotel()
+    h.sign("create", "room-a", 200)
+    h.sign("snapshot", "room-a", 202, **gen.snap_fields())
+    h.sign("snapshot", "room-a", 202, **gen.snap_fields(archive="ee" * 32))
+    return h.chain
+
+
+MODE_CASES = {
+    "shape": (lambda gen, pack: _plain_chain(gen, pack, s=dict(snapshot_size_bytes=-1)),
+              "receipt 2 of the list: snapshot_size_bytes is not an integer of 0 or more"),
+    "partial members": (lambda gen, pack: _plain_chain(gen, pack, f=dict(snapshot_source_sandbox_id=gen.DEL)),
+                        "receipt 3 of the list: a create has some of its four snapshot fork members and not all"),
+    "content hash": (lambda gen, pack: _plain_chain(gen, pack, s=dict(snapshot_content_sha256="0" * 64)),
+                     "receipt 2: snapshot_content_sha256 does not recompute from snapshot_image_id and "
+                     "snapshot_work_archive_sha256"),
+    "fork names another id": (lambda gen, pack: _plain_chain(gen, pack, f=dict(snapshot_id="snap_0123456789ac"),
+                                                             with_delete=False),
+                              "receipt 3: the fork names a snapshot receipt with another snapshot_id"),
+    "repeat disagrees": (_repeat_disagrees,
+                         f"snapshot snap_0123456789ab: receipt 2 and receipt 3 disagree on snapshot_content_sha256"),
+    "fork after delete": (_fork_after_delete,
+                          "receipt 4: the fork is of snapshot snap_0123456789ab, which receipt 3 deleted before it"),
+}
+
+
+def _snapshot_fault(tmp_path: Path, mode: str, build) -> tuple[int, dict, str]:
+    import base64
+
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    receipts = build(gen, pack)
+    if mode == "run":
+        files, args = gen.make_run(pack, bundle_edit=lambda b: b.update(receipts=receipts))
+        for name, data in files.items():
+            (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / name).write_bytes(data)
+        code, out, err = _run_cli(*[a.replace("{dir}", str(tmp_path)) for a in args])
+        return code, json.loads(out), err
+    if mode == "file":
+        return _list_mode_raw(tmp_path, json.dumps({"receipts": receipts}).encode())
+    headers = tuple(base64.urlsafe_b64encode(gen.canonical(rc)).decode() for rc in receipts)
+    return _list_mode_raw(tmp_path, headers=headers)
+
+
+@pytest.mark.parametrize("mode", ["file", "header", "run"])
+@pytest.mark.parametrize("name", sorted(MODE_CASES))
+def test_rule_9_a_snapshot_fault_gets_the_same_reason_in_every_mode(name, mode, tmp_path) -> None:
+    build, reason = MODE_CASES[name]
+    code, out, err = _snapshot_fault(tmp_path, mode, build)
+    assert "Traceback" not in err, err[-300:]
+    want = ("check 1: " if mode == "run" else "") + reason
+    assert code == 1 and out == {"verdict": "FAIL", "reason": want}, out
+
+
+@pytest.mark.parametrize("mode", ["file", "header"])
+def test_rule_9_a_good_snapshot_list_names_its_fork_in_file_and_header_mode(mode, tmp_path) -> None:
+    code, out, err = _snapshot_fault(tmp_path, mode, lambda gen, pack: _plain_chain(gen, pack))
+    assert code == 0 and "Traceback" not in err, (out, err[-300:])
+    assert out["chain"]["forks"] == [{"room": "room-b", "snapshot_id": "snap_0123456789ab",
+                                      "snapshot_content_sha256": _generator().snap_content(),
+                                      "source_room": "room-a", "in_list": True}]

@@ -1,0 +1,57 @@
+{
+ "head": "869c638bc6587730cb124391cef7955ef2eb74424c289cca7b87000ff113f3b4",
+ "receipts": [
+  {
+   "receipt_sha256": "50daa2a2832216ee16115fcfc95364463a5a39ffcff10fdd01f2a6dd6548f140",
+   "signature_b64": "v9ISOGOimrE7wIamVqpgwaoKkIZ1psw1ENoKpPz9P70N5erjmoqB5G824qlynwZqVNteAooTZsS6LTliYAXuBA==",
+   "statement": {
+    "action": "snapshot_delete",
+    "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
+    "command_sha256": null,
+    "customer_request_sha256": "ad1b9de910513527b407147d7a05569066c1a50cceaba3e118df6b13f49e749c",
+    "hotel": "pack-hotel",
+    "image": null,
+    "image_digest": null,
+    "issued_at": 1700000001,
+    "operation_id": "6a7098ee-602f-b0f8-a645-46d9f49c5eeb",
+    "previous_receipt_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
+    "result_sha256": "400a936d0ac7637324413df9aaf2067ff68468e602a5446af1e454878b5bad1e",
+    "sandbox_id": null,
+    "schema": "cathedral_sealed_hotel_receipt_v1",
+    "sequence": 1,
+    "snapshot_id": "snap_0123456789ab",
+    "snapshot_source_sandbox_id": "room-a",
+    "status": 200,
+    "target": "DELETE /v1/snapshots/snap_0123456789ab"
+   }
+  },
+  {
+   "receipt_sha256": "869c638bc6587730cb124391cef7955ef2eb74424c289cca7b87000ff113f3b4",
+   "signature_b64": "2VR9jgqubUwBObyre2u0n756+gQo2O8meugkY/fGCvfCUmHQ+HvLQ/oFfY4QRF8NuryjaD8yNAThyO1bsa7xBw==",
+   "statement": {
+    "action": "create",
+    "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
+    "command_sha256": null,
+    "customer_request_sha256": "ff14e14c208d414590558c2e333a73da13828df7df2988dacc7f817e6aa5f995",
+    "hotel": "pack-hotel",
+    "image": null,
+    "image_digest": null,
+    "issued_at": 1700000002,
+    "operation_id": "81b3464a-8f46-451e-e17b-915979a074b9",
+    "previous_receipt_sha256": "50daa2a2832216ee16115fcfc95364463a5a39ffcff10fdd01f2a6dd6548f140",
+    "result_sha256": "096e929abe31157e5a522fecfe1333bb96b3252e9ee74923b6e9027206c4d068",
+    "room_previous_receipt_sha256": null,
+    "room_sequence": 1,
+    "sandbox_id": "room-b",
+    "schema": "cathedral_sealed_hotel_receipt_v1",
+    "sequence": 2,
+    "snapshot_content_sha256": "fa72dbc1dd5cf1c02d1e658ba69363df38b07199a0d5adb234d4522ed918ab70",
+    "snapshot_id": "snap_0123456789ab",
+    "snapshot_receipt_sha256": "26ec074f569cd120f4268dd33e10f6a6923883ba60641987d1bba3631b53b773",
+    "snapshot_source_sandbox_id": "room-a",
+    "status": 200,
+    "target": "POST /v1/sandboxes/room-b/create"
+   }
+  }
+ ]
+}
