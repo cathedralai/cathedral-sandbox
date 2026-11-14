@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# lfm3-bench [--max-tokens N] --index I 'PROMPTS_JSON': one timed benchmark
+# request to the model this room serves (AB#444). Prints the answer, then one
+# line:
+#   lfm3-bench {"decode_tok_s":24.1,"model_sha256":"...","ttft_ms":412,...}
+#
+# PROMPTS_JSON is the whole prompt set, a JSON array of non-empty strings, and
+# I picks the prompt this request asks. prompt_set_sha256 is the sha256 of the
+# PROMPTS_JSON argument bytes as received, so the client hashes the same bytes
+# it sends (scripts/sealed_bench.py sends compact JSON).
+#
+# Why this is evidence: Cathedral's exec receipt hashes this stdout and the
+# guest signs the argv, so a verified receipt covers the timings, the model
+# file's sha256 (hashed here, in the room, and checked against the image's
+# SHA256SUMS) and the prompt-set hash. The numbers are what llama-server and
+# this script measured; the receipt proves which room, command and image
+# produced them, not that the clock is right.
+#
+# Fields:
+#   ttft_ms       request sent to the first streamed token (content or
+#                 reasoning), measured here
+#   prompt_ms, prompt_n, prompt_tok_s   llama-server's prefill timings
+#   decode_n, decode_tok_s              llama-server's decode timings
+#   wall_ms       the whole request; hash_ms the model hashing before it
+# The prompt cache is off for the request (cache_prompt false), so repeated
+# prompts measure a full prefill each time.
+#
+# Environment: LFM3_WAIT, LFM3_TIMEOUT as lfm3-ask; LFM3_SUMS (default
+# /opt/lfm3/SHA256SUMS).
+set -euo pipefail
+
+HARNESS=lfm3-bench-1
+
+usage() {
+  echo "usage: lfm3-bench [--max-tokens N] --index I 'PROMPTS_JSON'" >&2
+  exit 2
+}
+fail() {
+  echo "lfm3-bench: $*" >&2
+  exit 1
+}
+
+if [ "${LFM3_KIND:-chat}" = decision ]; then
+  echo "lfm3-bench: $MODEL is a decision model; it has no chat request to time" >&2
+  exit 2
+fi
+
+max_tokens=${LFM3_MAX_TOKENS:-256}
+index=""
+prompts=""
+have_prompts=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h | --help) usage ;;
+    --max-tokens)
+      [ "$#" -ge 2 ] || usage
+      max_tokens=$2
+      shift 2
+      ;;
+    --index)
+      [ "$#" -ge 2 ] || usage
+      index=$2
+      shift 2
+      ;;
+    *)
+      [ "$#" -eq 1 ] || usage
+      prompts=$1
+      have_prompts=1
+      shift
+      ;;
+  esac
+done
+[ -n "$have_prompts" ] || usage
+[[ "$index" =~ ^(0|[1-9][0-9]{0,5})$ ]] || usage
+[[ "$max_tokens" =~ ^[1-9][0-9]{0,5}$ ]] || usage
+
+if ! jq -e --argjson i "$index" '
+    type == "array" and length > 0 and all(.[]; type == "string" and length > 0) and $i < length' \
+    <<<"$prompts" >/dev/null 2>&1; then
+  echo "lfm3-bench: PROMPTS_JSON must be a JSON array of non-empty strings and --index inside it" >&2
+  exit 2
+fi
+prompt_set_sha256=$(printf '%s' "$prompts" | sha256sum | cut -d' ' -f1)
+
+BASE_URL=${MODEL_BASE_URL:-http://127.0.0.1:8080/v1}
+LOG=${LFM3_LOG_DIR:-/tmp/lfm3}/server.log
+SUMS=${LFM3_SUMS:-/opt/lfm3/SHA256SUMS}
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+ms_now() { # milliseconds; EPOCHREALTIME (bash 5) needs no fork
+  local t=${EPOCHREALTIME:-}
+  if [ -z "$t" ]; then
+    date +%s%3N
+    return
+  fi
+  t=${t/[.,]/}
+  echo $((10#$t / 1000))
+}
+
+# The file the server loaded, hashed now, and the sha256 the image recorded
+# for it at build time. Either one missing or a mismatch: no result.
+hash_checked() { # path
+  local file=$1 name got want
+  [ -r "$file" ] || fail "cannot read $file"
+  name=$(basename "$file")
+  got=$(sha256sum "$file" | cut -d' ' -f1)
+  want=$(awk -v n="$name" '$2 == n || $2 == "*" n { print $1; exit }' "$SUMS" 2>/dev/null || true)
+  [ -n "$want" ] || fail "$SUMS has no entry for $name"
+  [ "$got" = "$want" ] || fail "$name hashes to $got, $SUMS says $want"
+  echo "$got"
+}
+
+ready=""
+for _ in $(seq 1 "${LFM3_WAIT:-120}"); do
+  if curl -fsS -o /dev/null "${BASE_URL%/v1}/health" 2>/dev/null; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+[ -n "$ready" ] || fail "the model server at $BASE_URL is not up (log: $LOG)"
+
+hash_started=$(ms_now)
+[ -n "${LFM3_MODEL:-}" ] || fail "LFM3_MODEL is not set"
+model_sha256=$(hash_checked "$LFM3_MODEL")
+mmproj_sha256=""
+if [ -n "${LFM3_MMPROJ:-}" ]; then
+  mmproj_sha256=$(hash_checked "$LFM3_MMPROJ")
+fi
+hash_ms=$(($(ms_now) - hash_started))
+
+# The prompt goes from the set to the body inside jq, byte for byte.
+jq -n --arg model "$MODEL" --argjson set "$prompts" --argjson i "$index" --argjson n "$max_tokens" \
+  '{model: $model, messages: [{role: "user", content: $set[$i]}], max_tokens: $n, temperature: 0,
+    stream: true, cache_prompt: false}' >"$work/body"
+
+# First token: read the stream line by line only until a chunk carries text,
+# then hand the rest to cat, so nothing forks per token while the model decodes.
+first_chunk() {
+  local line data
+  while IFS= read -r line; do
+    printf '%s\n' "$line"
+    line=${line%$'\r'}
+    case "$line" in
+      data:*) data=${line#data:} data=${data# } ;;
+      *) continue ;;
+    esac
+    [ "$data" != "[DONE]" ] || return 0
+    if jq -e '((.choices // [])[0].delta // {}) | ((.content | type) == "string" and .content != "")
+        or ((.reasoning_content | type) == "string" and .reasoning_content != "")' \
+        <<<"$data" >/dev/null 2>&1; then
+      ms_now >"$work/first"
+      cat
+      return 0
+    fi
+  done
+}
+
+started=$(ms_now)
+{
+  curl -sS -N -D "$work/hdr" --max-time "${LFM3_TIMEOUT:-600}" \
+    -H 'Content-Type: application/json' -H "Authorization: Bearer ${MODEL_API_KEY:-local}" \
+    --data-binary @"$work/body" "$BASE_URL/chat/completions" 2>"$work/curl_err"
+  echo "$?" >"$work/curl_rc"
+} | first_chunk >"$work/raw"
+finished=$(ms_now)
+
+rc=$(cat "$work/curl_rc" 2>/dev/null || echo 1)
+code=$(grep -a '^HTTP/' "$work/hdr" 2>/dev/null | tail -n 1 | cut -d' ' -f2 | tr -d '\r' || true)
+if [ "$rc" -ne 0 ] || [ "$code" != 200 ]; then
+  head -c 2000 "$work/raw" >&2 2>/dev/null || true
+  head -c 500 "$work/curl_err" >&2 2>/dev/null || true
+  fail "$BASE_URL/chat/completions answered ${code:-nothing} (curl exit $rc)"
+fi
+[ -s "$work/first" ] || fail "the stream ended with no token"
+
+# Chunks as JSON, one per line; an error chunk after a 200 is a failure.
+sed -e 's/\r$//' -n -e 's/^data: \{0,1\}//p' "$work/raw" | grep -v '^\[DONE\]$' |
+  jq -c 'select(type == "object")' >"$work/chunks" 2>/dev/null || true
+if jq -e 'select(.error != null)' "$work/chunks" >/dev/null 2>&1; then
+  fail "the stream carried an error: $(jq -c 'select(.error != null) | .error' "$work/chunks" | head -c 300)"
+fi
+jq -s -j '[.[] | ((.choices // [])[0].delta.content // empty) | strings] | join("")' "$work/chunks" >"$work/answer"
+jq -s -c '[.[] | .timings | objects] | last // empty' "$work/chunks" >"$work/timings"
+[ -s "$work/timings" ] || fail "the stream carried no timings"
+
+load_ms=null
+if [ -r "$LOG" ]; then
+  load_ms=$(awk '
+    function ms(t,   p) { split(t, p, "."); return (p[1] * 60 + p[2]) * 1000 + p[3] + p[4] / 1000 }
+    /load_model: loading model/ { a = ms($1) }
+    /server_run_i: model loaded/ { b = ms($1) }
+    END { if (a != "" && b != "") printf "%d", b - a + 0.5; else printf "null" }
+  ' "$LOG")
+fi
+
+cat "$work/answer"
+echo
+line=$(jq -c -S -n --slurpfile t "$work/timings" \
+  --arg harness "$HARNESS" --arg model "$MODEL" --arg model_file "$(basename "$LFM3_MODEL")" \
+  --arg model_sha256 "$model_sha256" --arg mmproj_sha256 "$mmproj_sha256" \
+  --arg prompt_set_sha256 "$prompt_set_sha256" \
+  --argjson prompt_index "$index" --argjson max_tokens "$max_tokens" \
+  --argjson ttft_ms "$(($(cat "$work/first") - started))" --argjson wall_ms "$((finished - started))" \
+  --argjson hash_ms "$hash_ms" --argjson load_ms "$load_ms" \
+  --argjson threads "${LFM3_THREADS:-$(nproc)}" --arg reasoning "${LFM3_REASONING:-off}" '
+  def r1: if type == "number" then (. * 10 | round) / 10 else null end;
+  $t[0] as $t
+  | {harness: $harness, model: $model, model_file: $model_file, model_sha256: $model_sha256,
+     mmproj_sha256: (if $mmproj_sha256 == "" then null else $mmproj_sha256 end),
+     prompt_set_sha256: $prompt_set_sha256, prompt_index: $prompt_index,
+     max_tokens: $max_tokens, ttft_ms: $ttft_ms, wall_ms: $wall_ms, hash_ms: $hash_ms, load_ms: $load_ms,
+     prompt_ms: ($t.prompt_ms | r1), prompt_n: $t.prompt_n, prompt_tok_s: ($t.prompt_per_second | r1),
+     decode_n: $t.predicted_n, decode_tok_s: ($t.predicted_per_second | r1),
+     threads: $threads, reasoning: $reasoning}')
+jq -e '(.prompt_tok_s | type) == "number" and (.decode_tok_s | type) == "number"' <<<"$line" >/dev/null ||
+  fail "the timings have no prompt or decode rate: $(head -c 300 "$work/timings")"
+echo "lfm3-bench $line"
