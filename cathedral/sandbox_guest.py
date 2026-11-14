@@ -1687,19 +1687,20 @@ class DockerGuestProvider:
 
     # ---- D7: only the fork call may start a snapshot's image
     _HEX_ID = re.compile(r"(?:sha256:)?([0-9a-f]{64})")
+    _NAME_ONLY = "name-only"  # a reserved snapshot image name whose id this provider does not hold
 
-    def _snapshot_image_keys(self) -> tuple[set[str], set[str]]:
-        """(committed image ids as 64 hex, image names) of every snapshot this provider holds."""
+    def _snapshot_image_keys(self) -> tuple[set[str], dict[str, str]]:
+        """(committed image ids as 64 hex, image name -> id) of every snapshot this provider holds."""
         with self._inner._lock:  # noqa: SLF001
             metas = list(self._snapshot_meta.values())
-        return (
-            {m["committed_image_id"].removeprefix("sha256:") for m in metas if m.get("committed_image_id")},
-            {m["image"] for m in metas if m.get("image")},
-        )
+        ids = {m["committed_image_id"].removeprefix("sha256:") for m in metas if m.get("committed_image_id")}
+        names = {m["image"]: m.get("committed_image_id", "") for m in metas if m.get("image")}
+        return ids, names
 
-    def _names_snapshot_image(self, ref: str | None, digest: str | None = None) -> bool:
-        """True when *ref* (id, name, tag, name@digest, a template that resolves to one, or a
-        tag on the same image) or *digest* names an image a snapshot holds."""
+    def _names_snapshot_image(self, ref: str | None, digest: str | None = None) -> str | None:
+        """The snapshot image *ref* (id, name, tag, name@digest, a template that resolves to one, or
+        another tag on the same image) or *digest* names: its id, _NAME_ONLY for a name in the reserved
+        cathedral-snap- space whose id is not known here, or None. Taken under the provider lock."""
         ids, names = self._snapshot_image_keys()
         seen: set[str] = set()
         candidates = [ref or "", digest or ""]
@@ -1713,21 +1714,31 @@ class DockerGuestProvider:
                 continue
             seen.add(cand)
             base = cand.split("@", 1)[0]
-            if cand in names or base in names or base.startswith("cathedral-snap-"):
-                return True
+            for key in (cand, base):
+                if key in names:
+                    return names[key] or self._NAME_ONLY
+            if base.startswith("cathedral-snap-"):
+                return self._NAME_ONLY
             for part in (cand, cand.split("@", 1)[-1]):
                 m = self._HEX_ID.fullmatch(part.strip().lower())
                 if m and m.group(1) in ids:
-                    return True
+                    return "sha256:" + m.group(1)
         # Another tag on the same image: the engine's own id decides (no snapshot, nothing to compare).
         if not ids:
-            return False
+            return None
         for cand in candidates[:1] + candidates[2:]:
             if cand and self._client.image_exists(cand):
                 inspected = normalize_image_id(str(self._client.image_inspect(cand).get("Id") or ""))
                 if inspected is not None and inspected.removeprefix("sha256:") in self._snapshot_image_keys()[0]:
-                    return True
-        return False
+                    return inspected
+        return None
+
+    def _owner_holds_image(self, image_id: str, owner: str) -> bool:
+        try:
+            self._image_owners.require(image_id, owner)
+        except SandboxOpError:
+            return False
+        return True
 
     def create(
         self,
@@ -1748,8 +1759,11 @@ class DockerGuestProvider:
             # Fail before any record exists. A fork never starts another image.
             self._require_snapshot_owner(request.snapshot_id, owner)
             self._snapshot_image(request.snapshot_id)
-        elif request.image is not None and self._names_snapshot_image(request.image.image, request.image.digest):
-            raise SandboxOpError("snapshot_image_fork_only", 400, "a snapshot's image starts only through a fork of that snapshot")
+        elif request.image is not None:
+            match = self._names_snapshot_image(request.image.image, request.image.digest)
+            # A caller who does not hold the image gets the ownership refusal as before; the owner gets this one.
+            if match and (match == self._NAME_ONLY or self._owner_holds_image(match, owner)):
+                raise SandboxOpError("snapshot_image_fork_only", 400, "a snapshot's image starts only through a fork of that snapshot")
         if request.workspace is not None:
             # Fail before any record exists: 404 for a workspace of another owner.
             if self._workspaces is None:
