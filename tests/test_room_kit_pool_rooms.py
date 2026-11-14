@@ -666,3 +666,25 @@ def test_a_params_suffix_on_the_path_is_read_as_the_api_reads_it_by_the_claim_an
     assert statement["action"] == "claim" and statement["target"] == f"POST {base}/claim"
     assert room not in front.ledger.pool
     assert_idle(front.ledger)
+
+
+def test_routes_added_for_terminals_and_exec_results_on_an_unclaimed_and_a_claimed_room(front) -> None:
+    room = pool_room(front)
+    base = f"/v1/sandboxes/{room}"
+    handle = "a" * 32
+    # Routed to the API on an ordinary room, so refused by the gate on an unclaimed pool room.
+    seen = len(front.api.seen)
+    for method, tail in [("POST", "/terminals/t1/resize"), ("GET", "/terminals/t1/ws")]:
+        status, _headers, out = front.call(method, base + tail, b"{}" if method == "POST" else None)
+        assert status == 409 and code(out) == "pool_room_unclaimed", (method, tail)
+    assert len(front.api.seen) == seen
+    # Answered by the front from what it kept, never reaching the API: an unclaimed room has none.
+    for method in ("GET", "DELETE"):
+        status, _headers, out = front.call(method, f"{base}/exec/result?handle={handle}")
+        assert status == 404 and code(out) == "exec_unknown", method
+    assert len(front.api.seen) == seen
+    assert claim(front, room)[0] == 200
+    # Claimed: an ordinary room, so the terminal routes are forwarded.
+    assert front.call("POST", base + "/terminals/t1/resize", b"{}")[0] == 200
+    assert front.api.count(rf"POST {base}/terminals/t1/resize") == 1
+    assert_idle(front.ledger)
