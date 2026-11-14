@@ -793,8 +793,11 @@ class SealedSecrets:
         if held is not None:
             self.tracked -= len(held[1])
 
-    def retire(self, room: str) -> None:
+    def retire(self, room: str, incarnation_of=None) -> None:
         """A delete of the room passed this front: drop its entries and anything a racing write left.
+
+        incarnation_of(room) is asked under the lock: a room that has a live incarnation again was made
+        again after the delete was signed, and what the front holds for it is not this delete's to drop.
 
         The API dropped the directory before it answered the delete, but a
         write that renamed into it meanwhile makes that rmtree fail
@@ -805,6 +808,8 @@ class SealedSecrets:
         if not SECRETS_ROOM_RE.fullmatch(room):
             return  # never a path outside the root: "..", "." and anything with a slash do not match
         with self.lock:
+            if incarnation_of is not None and incarnation_of(room) is not None:
+                return
             self.forget(room)
             shutil.rmtree(os.path.join(self.root, room), ignore_errors=True)
 
@@ -985,9 +990,13 @@ class SealedEnv:
         """Caller holds the lock."""
         self.rooms.pop(room, None)
 
-    def retire(self, room: str) -> None:
-        """A delete of the room passed this front; the room API dropped the overlay with the room."""
+    def retire(self, room: str, incarnation_of=None) -> None:
+        """A delete of the room passed this front; the room API dropped the overlay with the room.
+
+        A room with a live incarnation again (made again since) keeps its entry."""
         with self.lock:
+            if incarnation_of is not None and incarnation_of(room) is not None:
+                return
             self.forget(room)
 
     def sweep(self, incarnation_of, room_present, now: float) -> None:
@@ -1240,9 +1249,11 @@ class SealedExec:
         seen[ephemeral] = issued_at
         self.tracked += 1
 
-    def retire(self, room: str) -> None:
-        """A delete of the room passed this front."""
+    def retire(self, room: str, incarnation_of=None) -> None:
+        """A delete of the room passed this front. A room with a live incarnation again keeps its entries."""
         with self.lock:
+            if incarnation_of is not None and incarnation_of(room) is not None:
+                return
             self.forget(room)
 
     def sweep(self, incarnation_of, now: float) -> None:
@@ -2382,13 +2393,21 @@ HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrad
 
 
 def retire_room(ledger: "Ledger", room: str) -> None:
-    """Drop what the front keeps for a room whose incarnation a signed delete or room_end ended."""
+    """Drop what the front keeps for a room whose incarnation a signed delete or room_end ended.
+
+    A room made again since (it has a live incarnation) keeps its own: each store asks under its lock.
+
+    A window remains: a create signed after a store's check and before that store's cleanup finishes. It can
+    only affect the front's own bookkeeping, and the files a store removes, for a room the API has deleted or
+    is deleting (a deleting container can still be running), because a create that returns an existing id
+    returns the room the API recorded earlier. A delete answered with a non-2xx status schedules no retire:
+    the room keeps its incarnation until a later delete or room_end ends it."""
     if ledger.secrets is not None:
-        ledger.secrets.retire(room)
+        ledger.secrets.retire(room, ledger.room_incarnation)
     if ledger.sealed_exec is not None:
-        ledger.sealed_exec.retire(room)
+        ledger.sealed_exec.retire(room, ledger.room_incarnation)
     if ledger.sealed_env is not None:
-        ledger.sealed_env.retire(room)
+        ledger.sealed_env.retire(room, ledger.room_incarnation)
 
 
 def room_of(path: str) -> str | None:
