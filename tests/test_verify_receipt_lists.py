@@ -125,3 +125,24 @@ def test_serial_words_are_only_printed_when_a_serial_room_is_present() -> None:
     assert len(out["chain"]["room_numbering"]["does_not_prove"]) == 1
     _, out, _ = _run_pack_case("good/serial_room_closed_by_file_put")
     assert len(out["chain"]["room_numbering"]["does_not_prove"]) == 4
+
+
+def test_empty_per_room_list_cannot_claim_receipts_or_head() -> None:
+    vr = _load_checker()
+    with pytest.raises(vr.Fail):
+        vr.room_numbering([], {"room_head": "a" * 64, "count": 3})
+    with pytest.raises(vr.Fail):
+        vr.room_numbering([], {"room_head": None, "count": 3})
+    assert vr.room_numbering([], {"room_head": None, "count": 0}) == {"rooms": {}, "warnings": []}
+
+
+def test_one_numbering_field_is_a_warning_not_an_uncaught_error() -> None:
+    vr = _load_checker()
+    receipts = _case_receipts("good/numbered_rooms_interleaved")
+    for rc in receipts:
+        if rc["statement"]["sandbox_id"] == "room-a":
+            rc["statement"].pop("room_previous_receipt_sha256")
+    out = vr.room_numbering(receipts)
+    assert "room-a" not in out["rooms"]
+    assert "room-b" in out["rooms"]
+    assert any("room-a" in warning for warning in out["warnings"])

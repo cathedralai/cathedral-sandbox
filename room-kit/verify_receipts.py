@@ -529,6 +529,10 @@ def _has_numbering(st: dict) -> bool:
     return "room_sequence" in st or "room_previous_receipt_sha256" in st
 
 
+def _has_complete_numbering(st: dict) -> bool:
+    return "room_sequence" in st and "room_previous_receipt_sha256" in st
+
+
 def check_room_chain(room: str, rcs: list[dict]) -> list[dict]:
     """One room's numbered receipts: 1 to n, no gap, no repeat, each linked to the one before.
 
@@ -600,15 +604,17 @@ def room_numbering(receipts: list[dict], list_doc: dict | None = None) -> dict:
                 reason = st.get("reason")
                 need(isinstance(reason, str) and reason != "", f"{where}: room_end has no reason")
         flags = [_has_numbering(rc["statement"]) for rc in rcs]
+        complete = [_has_complete_numbering(rc["statement"]) for rc in rcs]
         if serial_seen:
             for rc in rcs:
                 if rc["statement"].get("serial") is True:
-                    need(all(flags), f"room {room}: receipt {rc['statement']['sequence']}: "
+                    need(all(complete), f"room {room}: receipt {rc['statement']['sequence']}: "
                                      "a serial create needs numbered receipts")
         if not any(flags):
             continue
-        if not all(flags):
-            warnings.append(f"room {room} has receipts with and without numbering: no numbering claim for it")
+        if not all(complete):
+            kind = "with and without numbering" if not all(flags) else "with incomplete numbering"
+            warnings.append(f"room {room} has receipts {kind}: no numbering claim for it")
             continue
         ordered = check_room_chain(room, rcs)
         if serial_seen:
@@ -628,9 +634,13 @@ def room_numbering(receipts: list[dict], list_doc: dict | None = None) -> dict:
         rooms[key] = entry
     if list_doc is not None and "room_head" in list_doc:
         need(len(groups) <= 1, f"the list names a room_head but holds receipts of {len(groups)} rooms")
+        if not groups:
+            need(list_doc["room_head"] is None, "an empty room list names a nonempty room_head")
+            if "count" in list_doc:
+                need(list_doc["count"] == 0, "an empty room list names a nonzero count")
         if groups:
             (_, room), rcs = next(iter(groups.items()))
-            order_key = "room_sequence" if all(_has_numbering(rc["statement"]) for rc in rcs) else "sequence"
+            order_key = "room_sequence" if all(_has_complete_numbering(rc["statement"]) for rc in rcs) else "sequence"
             last_rc = max(rcs, key=lambda rc: rc["statement"][order_key])
             need(last_rc["receipt_sha256"] == list_doc["room_head"],
                  f"room {room}: the last receipt is not the room_head the list names")
