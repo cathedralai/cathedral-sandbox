@@ -284,6 +284,16 @@ def test_a_sealed_exec_runs_in_the_room_and_only_the_client_reads_the_answer(gue
     assert receipt["receipt_sha256"] == hashlib.sha256(canonical(st)).hexdigest()
 
 
+def test_sealed_exec_receipt_target_drops_ignored_semicolon_params(guest) -> None:
+    _ledger, _api, port, client = guest
+    doc, _answer_key = client.seal()
+    status, headers, reply = _request(port, "POST", f"/v1/sandboxes/{ROOM}/sealed-exec;alias", canonical(doc))
+    assert status == 200, reply
+    statement = _receipt(headers)["statement"]
+    assert statement["sandbox_id"] == ROOM
+    assert statement["target"] == f"POST /v1/sandboxes/{ROOM}/sealed-exec"
+
+
 def test_only_the_answer_key_opens_the_answer(guest) -> None:
     _, _, port, client = guest
     doc, answer_key = client.seal()
