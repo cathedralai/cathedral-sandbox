@@ -313,6 +313,41 @@ TOOLS='[
     "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Path of the file"}}, "required": ["path"]}}}
 ]'
 
+# Audio's tool choice (AB#545). With tools offered, LFM3-Audio-2B called one for
+# every message, even "What is 2+2?" (12 of 12 that need none, 4 and 13 Nov
+# 2026): the first token was <tool_call> at 0.89 to 1.00 for every question,
+# so no sampling setting changes it, and rewording the system prompt did not
+# either. Three short example turns before the conversation do: two answered
+# without a tool, one about this machine that calls run. Measured on the pinned
+# GGUF and llama.cpp commit (local, not a sealed host, 14 Nov 2026), 14
+# questions that need no tool and 17 that do, 2 runs each: needless calls 26 of
+# 28 before, 0 of 28 after; questions that need a tool kept a call 34 of 34.
+# The tool example asks for a machine fact nobody asks about (the umask):
+# a fact in it comes back as the answer to the same question with no call
+# (an IP address answered "What is the hostname?"; a timezone and a time did
+# the same). It is a short "What X is this machine set to?" on purpose: with
+# "Is cowsay installed?" or "Is anything listening on port 8080?" instead,
+# Audio often ran hostname -I and answered the hostname with an IP address
+# (18 and 4 of 20 and 10), which fails lfm3-selftest agent; with this one it ran
+# hostname 20 of 20.
+# Sent only on rounds that offer tools, never kept in the conversation.
+case "${MODEL:-}" in
+  *audio*)
+    EXAMPLES='[
+  {"role": "user", "content": "What is 5 plus 7?"},
+  {"role": "assistant", "content": "12."},
+  {"role": "user", "content": "What umask is this machine set to?"},
+  {"role": "assistant", "content": "", "tool_calls": [{"id": "call_example", "type": "function",
+    "function": {"name": "run", "arguments": "{\"command\": \"umask\"}"}}]},
+  {"role": "tool", "tool_call_id": "call_example", "name": "run", "content": "exit code: 0\n0022\n"},
+  {"role": "assistant", "content": "It is set to 0022."},
+  {"role": "user", "content": "Say good morning in French."},
+  {"role": "assistant", "content": "Bonjour."}
+]'
+    ;;
+  *) EXAMPLES='[]' ;;
+esac
+
 chmod 700 "$DIR"
 work=$(mktemp -d)
 
@@ -554,7 +589,7 @@ build_body() { # with-tools [max-tokens] [sampling]
     --slurpfile stored "$work/user_stored" --slurpfile sent "$work/user_sent" \
     --slurpfile turn "$work/turn" --slurpfile media "$media" --slurpfile parts "$work/parts" \
     --argjson room "$CONTEXT_CHARS" --arg model "$MODEL_NAME" --argjson n "$n" \
-    --argjson tools "$TOOLS" --arg with_tools "$1" --argjson sampling "$sampling" \
+    --argjson tools "$TOOLS" --arg with_tools "$1" --argjson sampling "$sampling" --argjson examples "$EXAMPLES" \
     --arg json "$json" --argjson format "$JSON_FORMAT" --arg json_line "$JSON_LINE" --arg final_line "$FINAL_LINE" '
     def drop_turn: (.[1:] | map(.role == "user") | index(true)) as $i
       | if $i == null then [] else .[($i + 1):] end;
@@ -562,13 +597,14 @@ build_body() { # with-tools [max-tokens] [sampling]
     def attach($m): ([to_entries[] | select(.value.role == "user" and .value.media == true) | .key] | last) as $i
       | if ($m | length) == 0 or $i == null then .
         else .[$i].content = ($m + [{type: "text", text: (.[$i].content | tostring)}]) end;
-    ([{role: "system", content: $sys}] + $stored[0] + $turn[0] | tojson | length) as $fixed
+    (if $with_tools == "1" then $examples else [] end) as $ex
+    | ([{role: "system", content: $sys}] + $ex + $stored[0] + $turn[0] | tojson | length) as $fixed
     | ($hist[0] | fit($room - $fixed)
        | if ($parts[0] | length) == 0 then attach($media[0]) else . end
        | map(del(.media))) as $kept
     | {
         model: $model,
-        messages: ([{role: "system", content: ($sys + (if $json == "1" then "\n" + $json_line else "" end))}] + $kept + ($sent[0] | map(del(.media))) + $turn[0]
+        messages: ([{role: "system", content: ($sys + (if $json == "1" then "\n" + $json_line else "" end))}] + $ex + $kept + ($sent[0] | map(del(.media))) + $turn[0]
           + (if $with_tools != "1" and ($turn[0] | length) > 0 then [{role: "user", content: $final_line}] else [] end)),
         max_tokens: $n
       }

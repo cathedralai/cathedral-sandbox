@@ -222,6 +222,22 @@ def test_plain_turn_streams_start_thinking_deltas_answer(model: StreamModel, roo
     assert model.requests[0]["stream"] is True
 
 
+def test_audio_streams_with_its_example_turns_and_none_reach_stdout(model: StreamModel, room: Any) -> None:
+    # AB#545: Audio's example turns go in the request, never in an event.
+    model.replies = [{"pieces": ["Four."]}]
+    done, events = turn(room, "What is 2+2?", MODEL="lfm3-audio-2b")
+    assert done.returncode == 0 and done.stderr == b""
+    check_envelope(events)
+    assert types(events) == ["start", "thinking", "delta", "answer"] and events[-1]["text"] == "Four."
+    (body,) = model.requests
+    assert body["stream"] is True and "tools" in body
+    sent = body["messages"]
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "user", "assistant", "tool", "assistant", "user", "assistant", "user"]
+    assert sent[3]["content"] == "What umask is this machine set to?" and sent[-1]["content"] == "What is 2+2?"
+    for word in (b"0022", b"Bonjour", b"12."):
+        assert word not in done.stdout
+
+
 def test_first_words_arrive_before_the_model_finishes(model: StreamModel, room: Any) -> None:
     model.replies = [{"pieces": ["one ", "two ", "three ", "four"], "delay": 0.5}]
     proc = subprocess.Popen(
