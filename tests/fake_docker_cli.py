@@ -448,8 +448,14 @@ def main(argv):
         return 0
 
     if cmd in ("pause", "unpause"):
-        # The container's status follows the engine: pause then unpause leaves it running,
-        # and a container that is gone fails the way docker does.
+        # Answers as docker does: pause of a container that is paused or not running fails, so does
+        # unpause of one that is not paused, and a container that is gone fails.
+        left = b.get(cmd + "_fail_times", 0)
+        if left:
+            with Locked() as st:
+                st["behaviour"][cmd + "_fail_times"] = left - 1
+            print(f"Error response from daemon: {cmd} failed", file=sys.stderr)
+            return 1
         if b.get(cmd + "_fail"):
             print(f"Error response from daemon: {cmd} failed", file=sys.stderr)
             return 1
@@ -457,6 +463,16 @@ def main(argv):
             cid = find(st, argv[-1])
             if cid is None:
                 print(f"Error response from daemon: No such container: {argv[-1]}", file=sys.stderr)
+                return 1
+            status = st["containers"][cid]["status"]
+            if cmd == "pause" and status == "paused":
+                print(f"Error response from daemon: Container {cid} is already paused", file=sys.stderr)
+                return 1
+            if cmd == "pause" and status != "running":
+                print(f"Error response from daemon: Container {cid} is not running", file=sys.stderr)
+                return 1
+            if cmd == "unpause" and status != "paused":
+                print(f"Error response from daemon: Container {cid} is not paused", file=sys.stderr)
                 return 1
             st["containers"][cid]["status"] = "paused" if cmd == "pause" else "running"
         return 0
