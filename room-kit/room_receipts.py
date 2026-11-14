@@ -2323,7 +2323,13 @@ HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrad
 def retire_room(ledger: "Ledger", room: str) -> None:
     """Drop what the front keeps for a room whose incarnation a signed delete or room_end ended.
 
-    A room made again since (it has a live incarnation) keeps its own: each store asks under its lock."""
+    A room made again since (it has a live incarnation) keeps its own: each store asks under its lock.
+
+    A window remains: a create signed after a store's check and before that store's cleanup finishes. It can
+    only affect the front's own bookkeeping, and the files a store removes, for a room the API has deleted or
+    is deleting (a deleting container can still be running), because a create that returns an existing id
+    returns the room the API recorded earlier. A delete answered with a non-2xx status schedules no retire:
+    the room keeps its incarnation until a later delete or room_end ends it."""
     if ledger.secrets is not None:
         ledger.secrets.retire(room, ledger.room_incarnation)
     if ledger.sealed_exec is not None:
