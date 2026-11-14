@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -17,6 +18,9 @@ import (
 
 // AB#553: background execs on the native room-id route.
 
+// nativeHotelExecs counts hotel /exec calls that reach an execChain hotel.
+var nativeHotelExecs atomic.Int64
+
 // execChain holds every hotel exec until release is closed, then answers stdout "out-<cmd0>".
 func execChain(t *testing.T, dir string) (*testChain, func()) {
 	t.Helper()
@@ -27,6 +31,7 @@ func execChain(t *testing.T, dir string) (*testChain, func()) {
 	tc := r6Chain(t, dir, func(id string, f *fakeHotel, next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if strings.HasSuffix(r.URL.Path, "/exec") && r.Method == "POST" {
+				nativeHotelExecs.Add(1)
 				raw, _ := io.ReadAll(r.Body)
 				var req map[string]any
 				_ = json.Unmarshal(raw, &req)
@@ -43,6 +48,8 @@ func execChain(t *testing.T, dir string) (*testChain, func()) {
 			next.ServeHTTP(w, r)
 		})
 	})
+	// Last broker's background execs end and save before TempDir cleanup.
+	t.Cleanup(func() { tc.b.drainNativeExecs(5 * time.Second) })
 	t.Cleanup(release) // runs before the hotel servers close, which wait for held calls
 	return tc, release
 }
@@ -85,7 +92,7 @@ func startBG(t *testing.T, tc *testChain, key, bid, cmd string) string {
 }
 
 func TestNativeBackgroundExecStartsAndPollsToResult(t *testing.T) {
-	tc, release := execChain(t, "")
+	tc, release := execChain(t, t.TempDir())
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
 	eid := startBG(t, tc, "key1", bid, "job")
 	path := "/v1/sandboxes/" + bid + "/execs/" + eid
@@ -107,7 +114,7 @@ func TestNativeBackgroundExecStartsAndPollsToResult(t *testing.T) {
 }
 
 func TestNativeBackgroundExecScopedToOwnerAndRoom(t *testing.T) {
-	tc, release := execChain(t, "")
+	tc, release := execChain(t, t.TempDir())
 	release()
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
 	other := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
@@ -127,7 +134,7 @@ func TestNativeBackgroundExecScopedToOwnerAndRoom(t *testing.T) {
 }
 
 func TestNativeBackgroundExecRejectsBadBody(t *testing.T) {
-	tc, release := execChain(t, "")
+	tc, release := execChain(t, t.TempDir())
 	release()
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
 	for name, body := range map[string]map[string]any{
@@ -141,7 +148,7 @@ func TestNativeBackgroundExecRejectsBadBody(t *testing.T) {
 }
 
 func TestNativeBackgroundExecDeleteStopsIt(t *testing.T) {
-	tc, _ := execChain(t, "")
+	tc, _ := execChain(t, t.TempDir())
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
 	eid := startBG(t, tc, "key1", bid, "job")
 	status, _, doc := tc.rawCall(t, "key1", "DELETE", "/v1/sandboxes/"+bid+"/execs/"+eid, nil)
@@ -453,7 +460,7 @@ func TestNativeExecOrderIsByFinishTimeNotStartTime(t *testing.T) {
 func TestNativeExecEvictedEntryStillPollsWithReasonAndReceipt(t *testing.T) {
 	execBounds(t)
 	nativeExecGuestBytes = 400 // one ~300 byte result fits, two do not
-	tc, release := execChain(t, "")
+	tc, release := execChain(t, t.TempDir())
 	defer settleExecs(t, tc, release)
 	release()
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
@@ -537,7 +544,7 @@ func TestNativeExecOldStateFileLoadsAndIsPruned(t *testing.T) {
 }
 
 func TestNativeExecStopKeepsItsFinishTimeWhenTheWorkerReturnsLater(t *testing.T) {
-	tc, release := execChain(t, "")
+	tc, release := execChain(t, t.TempDir())
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
 	eid := startBG(t, tc, "key1", bid, "job")
 	n := tc.b.nexec
@@ -593,7 +600,7 @@ func TestNativeExecPrunesWithNoStateDirectory(t *testing.T) {
 func TestNativeExecRunningCapPerGuestIsExactUnderARace(t *testing.T) {
 	execBounds(t)
 	nativeExecMaxRunning = 3
-	tc, release := execChain(t, "")
+	tc, release := execChain(t, t.TempDir())
 	defer settleExecs(t, tc, release)
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
 	other := tc.room(t, "key2", map[string]any{"image": "alpine:3.20"})
@@ -701,7 +708,7 @@ func TestNativeExecBoundHoldsWhileASaveIsBlocked(t *testing.T) {
 func TestNativeExecAWaitingPollGetsAnHonestAnswerWhenLaterResultsPushItOut(t *testing.T) {
 	execBounds(t)
 	nativeExecGuestBytes = 700 // two ~300 byte results fit, the third pushes the oldest out
-	tc, release := execChain(t, "")
+	tc, release := execChain(t, t.TempDir())
 	defer settleExecs(t, tc, release)
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
 	path := "/v1/sandboxes/" + bid + "/execs/"
@@ -776,5 +783,160 @@ func TestNativeExecAWaitingPollGetsAnHonestAnswerWhenLaterResultsPushItOut(t *te
 	}
 	if evicted(newest) {
 		t.Error("the newest result was evicted")
+	}
+}
+
+// AB#733 (#450 review): a 202 is only given once the running exec is on disk.
+
+func hotelExecCalls(_ *testChain) int { return int(nativeHotelExecs.Load()) }
+
+func TestNativeBackgroundExecRefusedWhenStateCannotBeSaved(t *testing.T) {
+	dir := t.TempDir()
+	tc, release := execChain(t, dir)
+	release()
+	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+	before := hotelExecCalls(tc)
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tc.b.cfg.StateDir = filepath.Join(blocker, "state") // MkdirAll fails: a file is in the way
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+bid+"/execs", map[string]any{"cmd": []string{"job"}})
+	if status != 503 || errCode(doc) != "exec_store_unavailable" {
+		t.Fatalf("start with an unwritable state_dir: %d %v", status, doc)
+	}
+	if got := hotelExecCalls(tc); got != before {
+		t.Errorf("the hotel got %d exec calls for a refused start", got-before)
+	}
+	tc.b.nexec.mu.Lock()
+	left := len(tc.b.nexec.execs)
+	tc.b.nexec.mu.Unlock()
+	if left != 0 {
+		t.Errorf("a refused start left %d execs in memory", left)
+	}
+	tc.b.cfg.StateDir = dir
+}
+
+func TestNativeBackgroundExecRefusedWithoutStateDir(t *testing.T) {
+	tc, release := execChain(t, "")
+	release()
+	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+	before := hotelExecCalls(tc)
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+bid+"/execs", map[string]any{"cmd": []string{"job"}})
+	if status != 503 || errCode(doc) != "exec_store_unavailable" {
+		t.Fatalf("start without state_dir: %d %v", status, doc)
+	}
+	if hotelExecCalls(tc) != before {
+		t.Error("the hotel ran a command the broker could not keep")
+	}
+}
+
+func TestNativeBackgroundExecAdmissionCapKeepsEveryRunningIDOnDisk(t *testing.T) {
+	dir := t.TempDir()
+	tc, release := execChain(t, dir)
+	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+	n := tc.b.nexec
+	base := time.Now().Add(-time.Hour)
+	n.mu.Lock()
+	for i := 0; i < nativeExecMaxRunningTotal-1; i++ {
+		id := fmt.Sprintf("run-%03d", i)
+		guest := "g9" // other guests, so the per-guest running cap is not what refuses
+		if i == 0 {
+			guest = "g1"
+		}
+		n.execs[id] = &nativeExec{ID: id, Guest: guest, Room: bid, State: "running", Started: base.Add(time.Duration(i) * time.Second), done: make(chan struct{}), cancel: func() {}}
+	}
+	for i := 0; i < 20; i++ { // finished execs, newer than every running one
+		id := fmt.Sprintf("done-%03d", i)
+		at := time.Now().Add(time.Duration(i) * time.Millisecond)
+		n.execs[id] = &nativeExec{ID: id, Guest: "g1", Room: bid, State: "exited", Started: at, DoneAt: at}
+	}
+	n.mu.Unlock()
+	last := startBG(t, tc, "key1", bid, "job") // running number 256
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+bid+"/execs", map[string]any{"cmd": []string{"one-too-many"}})
+	if status != 429 || errCode(doc) != "too_many_execs" {
+		t.Fatalf("start past the running cap: %d %v", status, doc)
+	}
+	raw, _ := os.ReadFile(filepath.Join(dir, nativeExecFile))
+	var saved []map[string]any
+	_ = json.Unmarshal(raw, &saved)
+	running := map[string]bool{}
+	for _, e := range saved {
+		if e["state"] == "running" {
+			running[e["id"].(string)] = true
+		}
+	}
+	if len(running) != nativeExecMaxRunningTotal || !running["run-000"] || !running[last] {
+		t.Errorf("running ids on disk: %d (oldest kept %v, newest kept %v), want %d", len(running), running["run-000"], running[last], nativeExecMaxRunningTotal)
+	}
+	// Every accepted id comes back after a restart: lost, never 404.
+	n.mu.Lock()
+	for _, e := range n.execs {
+		if e.State == "running" && e.ID != last {
+			e.State, e.DoneAt = "exited", time.Now() // the fake ones end so drain does not wait on them
+		}
+	}
+	n.mu.Unlock()
+	tc.restart(t)
+	if status, _, doc := tc.rawCall(t, "key1", "GET", "/v1/sandboxes/"+bid+"/execs/run-000", nil); status != 200 || doc["state"] != "lost" {
+		t.Errorf("oldest running exec after restart: %d %v", status, doc)
+	}
+	release()
+}
+
+func TestNativeBackgroundExecKilledSurvivesPruneAndRestart(t *testing.T) {
+	dir := t.TempDir()
+	tc, _ := execChain(t, dir)
+	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+	eid := startBG(t, tc, "key1", bid, "job")
+	path := "/v1/sandboxes/" + bid + "/execs/" + eid
+	if status, _, doc := tc.rawCall(t, "key1", "DELETE", path, nil); status != 200 || doc["state"] != "killed" {
+		t.Fatalf("delete: %d %v", status, doc)
+	}
+	if status, _, doc := tc.rawCall(t, "key1", "GET", path, nil); status != 200 || doc["state"] != "killed" {
+		t.Fatalf("read after delete: %d %v", status, doc)
+	}
+	tc.b.drainNativeExecs(5 * time.Second)
+	tc.restart(t)
+	if status, _, doc := tc.rawCall(t, "key1", "GET", path, nil); status != 200 || doc["state"] != "killed" {
+		t.Fatalf("read after restart: %d %v", status, doc)
+	}
+}
+
+func TestNativeBackgroundExecResultReadableAfterTheRoomIsGone(t *testing.T) {
+	tc, release := execChain(t, t.TempDir())
+	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+	eid := startBG(t, tc, "key1", bid, "job")
+	release()
+	path := "/v1/sandboxes/" + bid + "/execs/" + eid
+	if _, _, doc := tc.rawCall(t, "key1", "GET", path+"?wait=10", nil); doc["state"] != "exited" {
+		t.Fatalf("not finished: %v", doc)
+	}
+	// The room leaves the broker, as a hotel sync does once the room is gone.
+	hotelID, hid, _ := strings.Cut(bid, ".")
+	h := tc.b.hotelByID(hotelID)
+	tc.b.mu.Lock()
+	tc.b.release(h, h.rooms[hid])
+	tc.b.mu.Unlock()
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+bid+"/execs", map[string]any{"cmd": []string{"x"}}); status != 404 || errCode(doc) != "sandbox_not_found" {
+		t.Errorf("start on a room that is gone: %d %v, want 404", status, doc)
+	}
+	status, hdr, doc := tc.rawCall(t, "key1", "GET", path, nil)
+	if status != 200 || doc["state"] != "exited" || doc["stdout"] != "out-job" || hdr.Get("X-Room-Receipt") != "signed-bg" {
+		t.Fatalf("read after the room is gone: %d %v", status, doc)
+	}
+	if status, _, _ := tc.rawCall(t, "key2", "GET", path, nil); status != 404 {
+		t.Errorf("other guest after the room is gone: %d", status)
+	}
+}
+
+func TestNativeBackgroundExecTakesABodyOverOneMiB(t *testing.T) {
+	tc, release := execChain(t, t.TempDir())
+	release()
+	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+	big := strings.Repeat("x", 3<<20) // a stdin the sync exec route takes
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+bid+"/execs", map[string]any{"cmd": []string{"job"}, "stdin": big})
+	if status != 202 || doc["state"] != "running" {
+		t.Fatalf("start with a 3 MiB stdin: %d %v", status, doc)
 	}
 }

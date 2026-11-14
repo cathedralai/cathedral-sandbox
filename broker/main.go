@@ -1325,6 +1325,12 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			return
 		}
 	}
+	// A background exec's result outlives its room (AB#733): read and stop it
+	// by the guest and room stored on the exec, not the live room list.
+	if strings.HasPrefix(tail, "execs/") && (r.Method == "GET" || r.Method == "DELETE") && !strings.Contains(strings.TrimPrefix(tail, "execs/"), "/") {
+		b.nativeExecPoll(w, r, g, bid, strings.TrimPrefix(tail, "execs/"))
+		return
+	}
 	hotelID, hid, ok := strings.Cut(bid, ".")
 	h := b.hotelByID(hotelID)
 	if !ok || h == nil {
