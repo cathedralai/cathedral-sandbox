@@ -110,7 +110,7 @@ For snapshots and forks, `verify_receipts.py` also reads each snapshot receipt a
 list mode, header mode and run mode alike; run mode adds the prefix `check 1: `). It recomputes
 `snapshot_content_sha256` from `snapshot_image_id` and `snapshot_work_archive_sha256`, and, when a fork's
 `snapshot_receipt_sha256` is in the list, checks that it names an earlier successful snapshot receipt in the same
-binding with the same snapshot id, content hash and source room. A fork whose snapshot receipt is not in the list is
+binding with the same snapshot id, content hash and source room, and is the first receipt to sign that snapshot. A fork whose snapshot receipt is not in the list is
 reported as `fork_source: not_in_list` in `chain.forks`, not refused. A fork after a successful delete of its
 snapshot is refused. The content hash covers the image id and the hash of the tar of `/work`; the image's layers are
 not hashed again at a fork.

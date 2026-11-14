@@ -1,5 +1,5 @@
 {
- "head": "7c6c01b158ce651959c7348f86d8cd7de3e70f741ae38985d219260a64fa3fc9",
+ "head": "b59c56d156f7bb2fd893791a6cf0c8ef5e0044b8f267ec4b9bcca434d5daf035",
  "receipts": [
   {
    "receipt_sha256": "1a2affc6bb1ccb701e52ee4c264bf5bebcbd921ed91d86971b24e67ef38e42a1",
@@ -26,8 +26,8 @@
    }
   },
   {
-   "receipt_sha256": "cb2985180c39e4225393ed879227ddb44beb3f182e28b2dcddfc14047807bbee",
-   "signature_b64": "OSeSRAM4bfZVpDu5htnbwjJgB9W4zNYR6hRq6nm0cuguRBBB8ejKa5XAEI3fkP6X5Hzi/5LEXFaMNcseCfbzAA==",
+   "receipt_sha256": "e01e4e16473f8d6205eb95e30490fc72ced589ab8e2594127b51deee66ab623b",
+   "signature_b64": "ckNTUotl25Ulm8P9amGIUwzzlv882b1JXfQgPbZ3rxbMvcyGpTOEsv03sjz7+Pj9VN5Uk8LcA3JAzCRlQbJpDg==",
    "statement": {
     "action": "snapshot",
     "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
@@ -45,7 +45,7 @@
     "sandbox_id": "room-a",
     "schema": "cathedral_sealed_hotel_receipt_v1",
     "sequence": 2,
-    "snapshot_content_sha256": "fa72dbc1dd5cf1c02d1e658ba69363df38b07199a0d5adb234d4522ed918ab70",
+    "snapshot_content_sha256": "a98b4734f1224f714338c1ddbc55c102e7671d049ef99f8d3637960464807b50",
     "snapshot_id": "snap_0123456789ab",
     "snapshot_image_id": "sha256:af033c66335b7b91a0856b427dcb4df9f309fe0dd2ecdb24c78d3c60c076a560",
     "snapshot_size_bytes": 4096,
@@ -55,8 +55,8 @@
    }
   },
   {
-   "receipt_sha256": "3bf25606c0f616bf93722ffb763090ce5939806e150a08821e3fefe3aaa3a3e8",
-   "signature_b64": "UQa7bpsCRWaehSxnvIiQngZB2wsTlpF45Z2pW2pOVOIZMR53oFDUf8AB4NgndPEoPOE/6VnJX3rbGKwrawqbDg==",
+   "receipt_sha256": "f25d96ff779b76c4e58bd8c0e04cffaea1011f2009522cdd60d02fe670d3db0c",
+   "signature_b64": "o/yaGrDlel/Bvc/u+8UPf0WaSq+eSyud3oCD0hjMR0l8xMZ/N4jrNrzgmfmQDPn3HPH4ZHZOXjCDnXjkYu91Dw==",
    "statement": {
     "action": "create",
     "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
@@ -67,24 +67,24 @@
     "image_digest": null,
     "issued_at": 1700000003,
     "operation_id": "9df30fe8-5efe-4c66-f357-27f09114eafa",
-    "previous_receipt_sha256": "cb2985180c39e4225393ed879227ddb44beb3f182e28b2dcddfc14047807bbee",
+    "previous_receipt_sha256": "e01e4e16473f8d6205eb95e30490fc72ced589ab8e2594127b51deee66ab623b",
     "result_sha256": "8820375044723d31ea806186b0a729943dfbc2f1a594579823d2f6d9e07749c0",
     "room_previous_receipt_sha256": null,
     "room_sequence": 1,
     "sandbox_id": "room-b",
     "schema": "cathedral_sealed_hotel_receipt_v1",
     "sequence": 3,
-    "snapshot_content_sha256": "fa72dbc1dd5cf1c02d1e658ba69363df38b07199a0d5adb234d4522ed918ab70",
+    "snapshot_content_sha256": "a98b4734f1224f714338c1ddbc55c102e7671d049ef99f8d3637960464807b50",
     "snapshot_id": "snap_0123456789ab",
-    "snapshot_receipt_sha256": "cb2985180c39e4225393ed879227ddb44beb3f182e28b2dcddfc14047807bbee",
+    "snapshot_receipt_sha256": "e01e4e16473f8d6205eb95e30490fc72ced589ab8e2594127b51deee66ab623b",
     "snapshot_source_sandbox_id": "room-a",
     "status": 200,
     "target": "POST /v1/sandboxes/room-b/create"
    }
   },
   {
-   "receipt_sha256": "7c6c01b158ce651959c7348f86d8cd7de3e70f741ae38985d219260a64fa3fc9",
-   "signature_b64": "YLXKrSt1FxAdddasElnySxYVczOSkL0cXRMyna0nzX7yK2ISUUX3586x4VxqAdKxZdXMpmDwLdG2Xso/l7iJBw==",
+   "receipt_sha256": "b59c56d156f7bb2fd893791a6cf0c8ef5e0044b8f267ec4b9bcca434d5daf035",
+   "signature_b64": "4VVf5gNgYUAf8vxrVV7ZDlUFm3ve7gGTj9XB9fyMDG2EWdGHLb71CNHhuOASG97bV9hy5mgrfdWRi/gxHw93Cg==",
    "statement": {
     "action": "snapshot_delete",
     "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
@@ -95,7 +95,7 @@
     "image_digest": null,
     "issued_at": 1700000004,
     "operation_id": "c2a42972-a335-57eb-7cd5-a6e8152f71ff",
-    "previous_receipt_sha256": "3bf25606c0f616bf93722ffb763090ce5939806e150a08821e3fefe3aaa3a3e8",
+    "previous_receipt_sha256": "f25d96ff779b76c4e58bd8c0e04cffaea1011f2009522cdd60d02fe670d3db0c",
     "result_sha256": "cbc48443813dad8f0918dcb489d7cf560db31473b8b1e5fa932b9394d7f7b278",
     "sandbox_id": null,
     "schema": "cathedral_sealed_hotel_receipt_v1",

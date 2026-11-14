@@ -810,6 +810,14 @@ def fail(n: int, text: str) -> dict:
 
 def run_good_cases(pack: Pack) -> None:
     run = "/run"
+    stub = pack_snapshot_stub(pack)
+    run_case(pack, "good", "run_fork_create_reports_its_fork_and_the_missing_source",
+             "The held-output run whose create is a fork of a snapshot: chain.forks names it and says its snapshot "
+             "receipt is not in the file.", {"pointers": {
+                 "/chain/forks/0/room": RUN_ROOM, "/chain/forks/0/snapshot_id": SNAP_ID,
+                 "/chain/forks/0/source_room": "room-a", "/chain/forks/0/in_list": False,
+                 "/chain/forks/0/fork_source": "not_in_list"}},
+             overrides={"create": fork_fields(stub)})
     run_case(pack, "good", "run_held_output_confirmed_exit_code",
              "A run whose result file is held by the checker, whose log is in the file, and whose exec answer confirms "
              "the exit code.", {"pointers": {
@@ -1753,7 +1761,7 @@ def fork_fields(snapshot_receipt: dict) -> dict:
     return {"snapshot_id": st.get("snapshot_id", SNAP_ID),
             "snapshot_content_sha256": st.get("snapshot_content_sha256", snap_content()),
             "snapshot_receipt_sha256": snapshot_receipt["receipt_sha256"],
-            "snapshot_source_sandbox_id": st["sandbox_id"]}
+            "snapshot_source_sandbox_id": st.get("sandbox_id", "room-a")}
 
 
 def delete_fields(snap: str = SNAP_ID, source: str | None = "room-a") -> dict:
@@ -1945,11 +1953,39 @@ def snapshot_cases(pack: Pack) -> None:
         ("delete_source_number", "A snapshot_delete whose source is a number.",
          dl(snapshot_source_sandbox_id=2), 4, "snapshot_source_sandbox_id is not a string"),
     ]
+    shapes += [
+        ("snapshot_lacks_sandbox_id", "A successful snapshot receipt with no sandbox_id.", sn(sandbox_id=DEL), 2,
+         "a snapshot receipt has no sandbox_id string"),
+        ("fork_lacks_sandbox_id", "A fork's create with no sandbox_id.", fk(sandbox_id=DEL), 3,
+         "a fork's create has no sandbox_id string"),
+        ("fork_sandbox_id_null", "A fork's create whose sandbox_id is null.", fk(sandbox_id=None), 3,
+         "a fork's create has no sandbox_id string"),
+        ("delete_lacks_sandbox_id", "A snapshot_delete with no sandbox_id member: it must be an explicit null.",
+         dl(sandbox_id=DEL), 4, "a snapshot_delete has no sandbox_id member: it must be null, not left out"),
+        ("snapshot_id_empty", "A snapshot receipt whose snapshot_id is the empty string.", sn(snapshot_id=""), 2,
+         "snapshot_id is empty"),
+        ("fork_snapshot_id_empty", "A fork whose snapshot_id is the empty string.", fk(snapshot_id=""), 3,
+         "snapshot_id is empty"),
+        ("fork_source_empty", "A fork whose source room is the empty string.", fk(snapshot_source_sandbox_id=""), 3,
+         "snapshot_source_sandbox_id is empty"),
+        ("delete_snapshot_id_empty", "A snapshot_delete whose snapshot_id is the empty string.", dl(snapshot_id=""),
+         4, "snapshot_id is empty"),
+        ("delete_source_empty", "A snapshot_delete whose source room is the empty string.",
+         dl(snapshot_source_sandbox_id=""), 4, "snapshot_source_sandbox_id is empty"),
+    ]
     for name, description, kw, i, text in shapes:
+        over = kw.get("s")
+        if over and "snapshot_content_sha256" not in over and DEL not in over.values() and (
+                "snapshot_image_id" in over or "snapshot_work_archive_sha256" in over):
+            # One fault per case: the content hash agrees with the malformed part, so rule 2 has nothing to say.
+            over["snapshot_content_sha256"] = snap_content(over.get("snapshot_image_id", SNAP_IMAGE),
+                                                           over.get("snapshot_work_archive_sha256", SNAP_ARCHIVE))
         h, *_ = snap_hotel(pack, **kw)
         bad(f"snapshot_r1_{name}", description, h, SNAP_SHAPE.format(i=i, text=text))
 
-    h, *_ = snap_hotel(pack, s_status=409, s=snap_fields(), f={}, with_delete=False)
+    h = pack.new_hotel()
+    h.sign("create", "room-a", 200)
+    h.sign("snapshot", "room-a", 409, **snap_fields())
     bad("snapshot_r1_failed_snapshot_carries_members",
         "A snapshot that did not succeed carries the five members.", h,
         SNAP_SHAPE.format(i=2, text="a snapshot receipt that did not succeed carries snapshot members"))
@@ -2043,6 +2079,24 @@ def snapshot_cases(pack: Pack) -> None:
     bad("snapshot_r1_create_that_did_not_succeed_carries_fork_members",
         "A create that failed carries the four fork members: a front adds them only to a successful create.", h,
         SNAP_SHAPE.format(i=3, text="a create that did not succeed carries snapshot fork members"))
+
+    h = pack.new_hotel()
+    h.sign("create", "room-a", 200)
+    first = h.sign("snapshot", "room-a", 202, **snap_fields())
+    h.sign("snapshot", "room-a", 202, **snap_fields())
+    h.sign("create", "room-b", 200, **fork_fields(first))
+    good("snapshot_r5_agreeing_retry_fork_names_the_first",
+         "The snapshot was signed twice with the same hash; the fork names the first receipt, as the front does.", h,
+         {forks: [FORK_ENTRY]})
+    h = pack.new_hotel()
+    h.sign("create", "room-a", 200)
+    h.sign("snapshot", "room-a", 202, **snap_fields())
+    second = h.sign("snapshot", "room-a", 202, **snap_fields())
+    h.sign("create", "room-b", 200, **fork_fields(second))
+    bad("snapshot_r5_fork_names_a_later_signing_of_the_snapshot",
+        "The snapshot was signed twice; the fork names the second receipt, but the front names the first.", h,
+        "receipt 4: the fork names a snapshot receipt that is not the first to sign that snapshot "
+        "(receipt 2 signed it first)")
 
     # ---- rule 7: a fork after a delete of the same snapshot
     h = pack.new_hotel()

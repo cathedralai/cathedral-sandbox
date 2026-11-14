@@ -1989,7 +1989,8 @@ def _snapshot_edges_of(gen, pack, **kw) -> list[dict]:
 
 def test_lists_without_snapshot_receipts_print_no_forks_member() -> None:
     for folder in sorted((PACK / "good").iterdir()):
-        if folder.name.startswith("snapshot_") and not folder.name.startswith("snapshot_r1_create_without"):
+        if "fork" in folder.name or (folder.name.startswith("snapshot_")
+                                     and not folder.name.startswith("snapshot_r1_create_without")):
             continue
         _, out, code = _run_pack_case(f"good/{folder.name}")
         assert code == 0 and "forks" not in out["chain"], folder.name
@@ -2212,3 +2213,135 @@ def test_the_shared_fixture_room_b_alone_warns_and_passes(tmp_path) -> None:
     receipts = json.loads(SHARED.read_text())["receipts"]
     code, out, _ = _shared_run(tmp_path, [receipts[2]], head=False)
     assert code == 0 and out["chain"]["forks"][0]["fork_source"] == "not_in_list"
+
+
+# ---- review 1 of CS-4: one fault per bad case, no internal error, run mode keeps the result, cost in receipts
+
+RULE_SWITCH = {1: "check_snapshot_shapes", 2: "_check_content_hashes", 4: "_check_repeats",
+               5: "_check_fork_matches_snapshot", 7: "_check_fork_not_after_delete"}
+R2_REASON = ("receipt 2: snapshot_content_sha256 does not recompute from snapshot_image_id and "
+             "snapshot_work_archive_sha256")
+FORK_ID = "receipt 3: the fork names a snapshot receipt with another snapshot_id"
+FORK_CONTENT = "receipt 3: the fork names a snapshot receipt with another snapshot_content_sha256"
+FORK_ROOM = "receipt 3: the fork names a snapshot receipt of another room than snapshot_source_sandbox_id"
+# Cases that break a second rule by their nature (a malformed copy of a member cannot also agree with the member it
+# copies): the second reason they show when their own rule is switched off.
+ALSO_BREAKS = {
+    "snapshot_r1_content_upper_case": R2_REASON, "snapshot_r1_content_short": R2_REASON,
+    "snapshot_r1_fork_snapshot_id_number": FORK_ID, "snapshot_r1_fork_snapshot_id_empty": FORK_ID,
+    "snapshot_r1_fork_content_upper_case": FORK_CONTENT,
+    "snapshot_r1_fork_source_number": FORK_ROOM, "snapshot_r1_fork_source_null": FORK_ROOM,
+    "snapshot_r1_fork_source_empty": FORK_ROOM,
+    "snapshot_r1_snapshot_lacks_id": "receipt 3: the fork names a snapshot receipt that states no snapshot",
+}
+
+
+def _outcome(vr, receipts) -> str | None:
+    """The Fail reason, None for a pass, "crash" for an error that is not a named reason."""
+    try:
+        vr.check_receipt_shapes(receipts)
+        vr.check_snapshot_edges(receipts)
+    except vr.Fail as exc:
+        return str(exc)
+    except (KeyError, TypeError, AttributeError, IndexError):
+        return "crash"
+    return None
+
+
+def _snapshot_bad_cases() -> list[str]:
+    return sorted(p.name for p in (PACK / "bad").iterdir() if p.name.startswith("snapshot_r"))
+
+
+@pytest.mark.parametrize("name", _snapshot_bad_cases())
+def test_each_snapshot_bad_case_breaks_one_rule_only(name) -> None:
+    rule = int(name.split("_")[1][1:])
+    reason = json.loads((PACK / "bad" / name / "case.json").read_text())["expect"]["reason"]
+    receipts = _case_receipts(f"bad/{name}")
+    vr = _load_checker()
+    assert _outcome(vr, receipts) == reason  # all rules on
+    for other, function in RULE_SWITCH.items():  # each other rule off in turn: still its own reason
+        if other != rule:
+            vr = _load_checker()
+            setattr(vr, function, lambda *a, **k: None)
+            assert _outcome(vr, receipts) == reason, (name, other)
+    vr = _load_checker()  # its own rule off: nothing else is wrong with it
+    setattr(vr, RULE_SWITCH[rule], lambda *a, **k: None)
+    assert _outcome(vr, receipts) in (None, "crash", ALSO_BREAKS.get(name)), name
+    if name in ALSO_BREAKS:
+        assert _outcome(vr, receipts) == ALSO_BREAKS[name]
+
+
+def _every_member_changed(receipts: list[dict]):
+    """The list again, once per member of each receipt: the member removed, null, a number, an empty string."""
+    for i, rc in enumerate(receipts):
+        for key in list(rc["statement"]):
+            for how in ("drop", None, 7, ""):
+                changed = json.loads(json.dumps(receipts))
+                if how == "drop":
+                    del changed[i]["statement"][key]
+                else:
+                    changed[i]["statement"][key] = how
+                yield f"receipt {i + 1} {key} {how!r}", changed
+
+
+def test_no_member_of_a_snapshot_list_gives_an_internal_error() -> None:
+    vr = _load_checker()
+    base = json.loads(SHARED.read_text())["receipts"]
+    for where, changed in _every_member_changed(base):
+        try:
+            vr.check_receipt_shapes(changed)
+            vr.check_snapshot_edges(changed)
+        except vr.Fail:
+            pass
+        except (KeyError, TypeError, AttributeError, IndexError) as exc:
+            pytest.fail(f"{where}: {type(exc).__name__} {exc}")
+
+
+class _Counting(dict):
+    reads = 0
+
+    def __getitem__(self, key):
+        _Counting.reads += 1
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        _Counting.reads += 1
+        return super().get(key, default)
+
+
+def test_unrelated_deletes_do_not_make_forks_cost_more_than_their_number() -> None:
+    vr = _load_checker()
+    binding, n = "b" * 64, 2000
+
+    def receipt(seq: int, **fields) -> dict:
+        st = _Counting({"binding_sha256": binding, "sequence": seq, "status": 200, "sandbox_id": None, **fields})
+        return {"statement": st, "receipt_sha256": f"{seq:064x}", "signature_b64": ""}
+
+    content = vr.snapshot_content_sha256("sha256:" + "a" * 64, "c" * 64)
+    snap = receipt(1, action="snapshot", sandbox_id="room-a", snapshot_id="snap_x", snapshot_image_id="sha256:" + "a" * 64,
+                   snapshot_work_archive_sha256="c" * 64, snapshot_size_bytes=1, snapshot_content_sha256=content)
+    deletes = [receipt(2 + i, action="snapshot_delete", snapshot_id=f"unrelated{i}") for i in range(n)]
+    forks = [receipt(2 + n + i, action="create", sandbox_id=f"fork-{i}", snapshot_id="snap_x",
+                     snapshot_content_sha256=content, snapshot_receipt_sha256=snap["receipt_sha256"],
+                     snapshot_source_sandbox_id="room-a") for i in range(n)]
+    receipts = [snap, *deletes, *forks]
+    _Counting.reads = 0
+    out = vr.check_snapshot_edges(receipts)
+    assert len(out["forks"]) == n and all(f["in_list"] for f in out["forks"])
+    assert _Counting.reads <= 40 * len(receipts), _Counting.reads  # the scan over deletes read 4,000,000
+
+
+def test_run_mode_carries_the_forks_that_list_and_header_mode_report(tmp_path) -> None:
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    stub = gen.pack_snapshot_stub(pack)
+    files, args = gen.make_run(pack, overrides={"create": gen.fork_fields(stub)})
+    for name, data in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes(data)
+    code, out, err = _run_cli(*[a.replace("{dir}", str(tmp_path)) for a in args])
+    assert code == 0 and "Traceback" not in err, out
+    receipts = json.loads((tmp_path / "bundle.json").read_text())["receipts"]
+    list_code, list_out, _ = _list_mode_raw(tmp_path, json.dumps({"receipts": receipts}).encode())
+    assert list_code == 0 and json.loads(out)["chain"]["forks"] == list_out["chain"]["forks"]
+    assert [f["fork_source"] for f in json.loads(out)["chain"]["forks"]] == ["not_in_list"]
