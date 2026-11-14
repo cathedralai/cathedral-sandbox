@@ -301,9 +301,6 @@ The broker admits the machine only if its HOST_DATA is in `sealed_host_data`
   front still remembers the snapshot. A delete is a delete request, not a
   statement that bytes are erased. A push of a snapshot to a registry is refused
   with 403 `snapshot_push_refused`, unsent.
-- A fork gets a copy of the files. It does not get the first room's sealed env,
-  secret mounts or the values of variables given at create. A secret that was
-  written into a file is a file.
 
 Routes (through the broker):
 
