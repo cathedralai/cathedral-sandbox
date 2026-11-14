@@ -1,0 +1,38 @@
+# AB#382: signed approval for sealed hotel measurements
+
+Status: proposal for engineering and security review. This PR changes no admission rule or public approval claim. The first implementation slice starts after the signed bytes and rollout order are agreed.
+
+## Problem and source map
+
+The public `approved-measurements.json` names hotels and measurements but has no signature. The console's current reader drops hotel names when it turns rows into measurement strings. Broker admission uses one `sealed_measurements` list for every hotel (`broker/main.go`, `broker/admission.go:checkAttestation`). The SNP report and binding are checked, but that proves the measured guest, not that the owner approved that build for that hotel. `room-kit/sealed/README.md` states this distinction under “Image approval.” A new release must bind the attested hotel identity to its approved measurement, be independently verifiable, and survive a reboot for historical receipts.
+
+The repository has a separate signed policy registry for TEE boxes (`cathedral/policy_registry.py`, `docs/TEE_BOX_SERVICE.md`, “The measurement list”). It already specifies Ed25519 signatures under pinned owner keys, canonical bytes, monotonic releases, expiry and revocation. It is a design and code precedent. Its TEE box profile list is not currently the sealed hotel admission policy.
+
+## Proposed contract
+
+1. The owner issues a versioned signed release with a positive monotonic release number, UTC publication and validity times, signing key ID, and an exact map from **attested hotel ID** to one or more approved 96-hex SNP measurements. Duplicate hotel IDs or measurements, unknown critical fields, malformed IDs, and an empty approved set are refused. A removed hotel is refused even when its measurement remains approved elsewhere. Two hotels may share a measurement when they run the same build.
+2. Sign canonical bytes using the registry's existing Ed25519 convention: canonical JSON of the document without `signature`, with sorted keys, ASCII escapes and no insignificant whitespace. The implementation must publish one golden byte vector and signature, and verify it in Python, Go and the customer verifier. Do not treat JSON key order in a network response as the signature input without canonicalization.
+3. The broker pins the owner public key outside the fetched release and keeps a durable high-water `(release, digest)`. It rejects unsigned, unknown-key, expired, future, older or same-number-different-digest releases. A bad update leaves the last accepted release in place only until its own validity or freshness ceiling expires; then new sealed admissions refuse. No fallback to the global `sealed_measurements` list in enforce mode.
+4. The broker selects the permitted measurements using the hotel ID in the SNP-bound `binding`, after checking REPORT_DATA, measurement, AMD chain and any miner TLS binding. The current Go `snpBinding` does not parse `hotel`, so this slice must add that field and require that it equals the broker's hotel being admitted. A mutable request/config name must not select another hotel's policy entry. Apply the same signed policy to operator and miner bootstrap, Escape nonce planting, and any direct path that currently checks `SealedMeasurements`.
+5. Publish the signed release and the separately documented owner public-key fingerprint at a stable public URL. The console preserves the hotel ID and verifies the signature and release status before saying “approved.” Provide a standalone verifier with a pinned key for customers who need independent proof. A page served from the same site as the key cannot be presented as independent trust in that site.
+6. At room creation, retain the accepted policy release number and digest with the attested binding and receipt evidence. Historical verification uses the archived signed release valid at that time, not today's mutable list. A revoked build stops **new** admissions; old receipts remain verifiable as historical evidence and show their then-current approval status.
+
+## Work packages and rollout
+
+1. **Contract and vectors:** settle whether this is a validated `sealed_hotels` extension of the existing signed registry or a separate envelope using its exact signing convention. Publish schema, key pin, golden vectors, expiry/freshness, rotation, revocation and historical rules. This is the decision gate for code.
+2. **Publisher and verifier:** generate and verify releases from reviewed hotel/build inventory. The signing key stays out of GitHub and the public site. Add offline customer verification and cross-language positive/negative vectors.
+3. **Broker shadow:** load and verify the release, persist high-water, and compare its per-hotel result with the current global list without changing admission. Count mismatches for every live hotel and direct sealed path.
+4. **Broker enforce:** use the signed per-hotel result for every sealed admission and nonce path. Refuse missing/stale policy. Stage a release containing both old and new measured builds before each re-seal, observe all hotels, then remove old approvals in a later higher release.
+5. **Public read and historical evidence:** publish the signed bytes, update the console to bind hotel and measurement, and archive releases or their verifiable bytes with room evidence. Test a receipt after a reboot and after a later revocation.
+
+## Required tests and live proof
+
+- Cross-language golden vector; changed hotel, measurement, release, validity, signature or key ID refuses. Unknown critical fields, duplicate entries, malformed hex, stale/future release and same-number equivocation refuse.
+- Two hotels sharing one measurement pass; a hotel borrowing another hotel's unique measurement refuses. A binding with a mismatched hotel ID refuses even if the report and global list otherwise pass.
+- Operator admission, miner bootstrap, Escape nonce planting and re-attestation all use the signed per-hotel result. Policy fetch outage has a bounded stale window and then fails closed. Restart preserves high-water and accepted release; rollback cannot restore an older approval.
+- Re-seal overlap admits the old build only while the signed release lists it. Historical receipt verification still succeeds after old build removal and hotel reboot, with the original policy digest.
+- On a real SNP canary: read back the signed release and key pin, a positive attestation, a negative wrong-hotel policy check, a room receipt bound to the release, and const health before and after. Roll the remaining hotels only after canary evidence.
+
+## Limits and dependencies
+
+This does not sign the guest binary, change AMD certificate verification, or make the website an independent trust root. It depends on the archive work to retain historical releases. The signed format and the location of the durable broker high-water require engineering approval before implementation. No production policy or guest image changes are part of this spec PR.
