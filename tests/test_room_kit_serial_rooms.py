@@ -160,7 +160,8 @@ def test_a_semicolon_alias_patch_cannot_bypass_the_serial_gate(front) -> None:
     # AB#384: urlparse (API) strips ";alias"; urlsplit (old front) did not, so
     # PATCH /v1/sandboxes/{id};alias skipped the serial token and mutated the room.
     room = serial_room(front)
-    seen, before = len(front.api.seen), len(front.statements(room))
+    before = len(front.statements(room))  # a read of the list looks at the room once: count after it
+    seen = len(front.api.seen)
     status, _headers, out = front.call("PATCH", f"/v1/sandboxes/{room};alias", {"labels": {"x": "y"}})
     assert status == 409 and code(out) == "room_serial_unsigned"
     assert len(front.api.seen) == seen
