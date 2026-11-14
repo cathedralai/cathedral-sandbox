@@ -1136,11 +1136,12 @@ def test_the_count_check_is_in_the_function_too() -> None:
 
 # ---- a version-2 SNP report has no CPUID fields: run mode must honour --product, as list mode does
 
-def _version_2_run(tmp_path: Path, *product_args: str) -> tuple[int, dict, str]:
-    """A run file whose chip report is version 2 (its own synthetic chain, the same binding and receipts)."""
+def _run_with_report(tmp_path: Path, product_args: tuple, version: int = 2, family: int = 0x19,
+                     model: int = 0x01) -> tuple[int, dict, str]:
+    """A run file whose chip report has the given version and CPUID (its own synthetic chain, same binding)."""
     gen = _generator()
     pack = gen.Pack(gen.read_amd())
-    amd = gen.make_amd(report_version=2)
+    amd = gen.make_amd(report_version=version, cpuid_family=family, cpuid_model=model)
     certs = json.loads(amd["source/amd/certs.json"])
     report = json.loads(amd["source/amd/report.json"])["report_b64"]
     ark = amd["source/amd/ark_sha256.txt"].decode().strip()
@@ -1156,6 +1157,77 @@ def _version_2_run(tmp_path: Path, *product_args: str) -> tuple[int, dict, str]:
         (tmp_path / name).write_bytes(data)
     code, out, err = _run_cli(*[a.replace("{dir}", str(tmp_path)) for a in args], *product_args)
     return code, json.loads(out), err
+
+
+def _version_2_run(tmp_path: Path, *product_args: str) -> tuple[int, dict, str]:
+    return _run_with_report(tmp_path, product_args, version=2)
+
+
+def _list_mode_with_report(tmp_path: Path, product_args: tuple, version: int = 2, family: int = 0x19,
+                           model: int = 0x01) -> tuple[int, dict, str]:
+    """List mode on the same kind of report; the AMD certificates are served from a cache folder, so no network."""
+    import base64
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    amd = gen.make_amd(report_version=version, cpuid_family=family, cpuid_model=model)
+    certs = {k: x509.load_der_x509_certificate(base64.b64decode(v))
+             for k, v in json.loads(amd["source/amd/certs.json"]).items()}
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    pem = serialization.Encoding.PEM
+    chain = certs["ask"].public_bytes(pem) + certs["ark"].public_bytes(pem)
+    for name in ("Milan", "Genoa"):
+        (cache / f"{name}-cert_chain.pem").write_bytes(chain)
+    (cache / f"vcek-{gen.CHIP_ID[:16]}-{gen.REPORTED_TCB.hex()}.der").write_bytes(
+        certs["vcek"].public_bytes(serialization.Encoding.DER))
+    attestation = {**pack.attestation, "report_b64": json.loads(amd["source/amd/report.json"])["report_b64"]}
+    (tmp_path / "att.json").write_bytes(gen.pretty(attestation))
+    (tmp_path / "r.json").write_text(json.dumps({"receipts": [pack.new_hotel().sign("create", "room-a", 202)]}))
+    code, out, err = _run_cli("--attestation", str(tmp_path / "att.json"), "--receipts", str(tmp_path / "r.json"),
+                              "--expected-measurement", gen.MEASUREMENT, "--ark-sha256",
+                              amd["source/amd/ark_sha256.txt"].decode().strip(), "--kds-cache", str(cache),
+                              *product_args)
+    return code, json.loads(out), err
+
+
+INSTRUCTION = "cannot tell the product from cpuid family None model None; pass --product"
+NO_LAYOUT_1A = "the report names cpuid family 26 model 1, which has no layout here"
+SCENARIOS = [
+    # (name, version, family, model, product args, expected: None for PASS, else the reason)
+    ("v3 family 0x1a, --product Milan", 3, 0x1A, 0x01, ("--product", "Milan"), NO_LAYOUT_1A),
+    ("v3 family 0x1a, --product Genoa", 3, 0x1A, 0x01, ("--product", "Genoa"), NO_LAYOUT_1A),
+    ("v3 family 0x1a, no flag", 3, 0x1A, 0x01, (), NO_LAYOUT_1A),
+    ("v3 Milan, --product Genoa", 3, 0x19, 0x01, ("--product", "Genoa"),
+     "--product Genoa: the report names the product Milan"),
+    ("v3 Milan, --product Milan", 3, 0x19, 0x01, ("--product", "Milan"), None),
+    ("v3 Milan, no flag", 3, 0x19, 0x01, (), None),
+    ("v3 Genoa, --product Milan", 3, 0x19, 0x11, ("--product", "Milan"),
+     "--product Milan: the report names the product Genoa"),
+    ("v3 Genoa, --product Genoa", 3, 0x19, 0x11, ("--product", "Genoa"), None),
+    ("v3 Milan, --product empty", 3, 0x19, 0x01, ("--product", ""), "--product : the report names the product Milan"),
+    ("v2, --product Milan", 2, 0x19, 0x01, ("--product", "Milan"), None),
+    ("v2, --product Genoa", 2, 0x19, 0x01, ("--product", "Genoa"), None),      # nothing in a v2 report can contradict it
+    ("v2, --product Rome", 2, 0x19, 0x01, ("--product", "Rome"), "only Milan and Genoa TCB layouts are handled"),
+    ("v2, no flag", 2, 0x19, 0x01, (), INSTRUCTION),
+]
+
+
+@pytest.mark.parametrize("mode", ["run", "list"])
+@pytest.mark.parametrize("name, version, family, model, product_args, reason", SCENARIOS, ids=[s[0] for s in SCENARIOS])
+def test_the_product_comes_from_the_report_and_only_a_version_2_report_takes_it_from_the_flag(
+        mode, name, version, family, model, product_args, reason, tmp_path) -> None:
+    run = _run_with_report if mode == "run" else _list_mode_with_report
+    code, out, err = run(tmp_path, product_args, version, family, model)
+    assert "Traceback" not in err, err
+    if reason is None:
+        assert code == 0 and out["verdict"] == "PASS", out
+    else:
+        prefix = "check 1: " if mode == "run" else ""
+        assert code == 1 and out == {"verdict": "FAIL", "reason": prefix + reason}, out
 
 
 def test_a_version_2_report_passes_in_run_mode_with_the_product_named(tmp_path) -> None:
@@ -1189,7 +1261,7 @@ REFUSED_WITH_ONESHOT = [
     ("--owner-pubkey", "AAAA"), ("--tls-spki-sha256", "ab" * 32), ("--require-tls", None), ("--kds-cache", "/tmp/kds"),
     ("--sandbox", "room-1"), ("--hotel", "hotel-1"), ("--operator-key-file", "/tmp/operator-key"),
     ("--save", "/tmp/save"), ("--receipt-header", "abc"),
-    ("--cathedral-sandbox", "5b7c1a2e-9d3f-4e6a-8b10-2c4d6e8f0a1b"),
+    ("--cathedral-sandbox", "5b7c1a2e-9d3f-4e6a-8b10-2c4d6e8f0a1b"), ("--key-file", "/tmp/key"),
 ]
 
 
@@ -1225,9 +1297,39 @@ def test_the_exchange_check_command_uses_no_refused_flag() -> None:
         assert not (refused - {"--skip-amd"}) & used, folder.name
 
 
-def test_list_mode_keeps_its_default_kds_cache_and_the_flags_run_mode_refuses() -> None:
+def test_list_mode_fills_in_the_default_cache_folder_only_when_the_flag_is_absent(monkeypatch, capsys) -> None:
+    """The resolved value reaches the attestation check: no network is touched."""
+    vr = _load_checker()
     folder = PACK / "good" / "numbered_rooms_interleaved"
-    code, out, err = _run_cli("--attestation", str(folder / "attestation_doc.json"), "--receipts",
-                              str(folder / "receipts.json"), "--skip-amd", "--kds-cache", "/tmp/kds-unused",
-                              "--require-sealed")
-    assert code == 0 and json.loads(out)["verdict"] == "PASS", (out, err)
+
+    def captured(cache, flag):
+        monkeypatch.setattr(vr, "verify_attestation", lambda att, m, prod, cache_dir, *rest: (_ for _ in ()).throw(
+            vr.Fail(f"captured {cache_dir}")))
+        monkeypatch.setattr(sys, "argv", ["verify_receipts.py", "--attestation", str(folder / "attestation_doc.json"),
+                                          "--receipts", str(folder / "receipts.json"), *flag])
+        assert vr.main() == 1
+        return json.loads(capsys.readouterr().out)["reason"]
+
+    import os
+
+    assert captured(None, []) == f"captured {os.path.expanduser('~/.cache/amd-kds')}"
+    assert captured(None, ["--kds-cache", "/tmp/kds-explicit"]) == "captured /tmp/kds-explicit"
+
+
+@pytest.mark.parametrize("flag", [f[0] for f in REFUSED_WITH_ONESHOT if f[1] is not None] + ["--receipts",
+                                                                                              "--attestation",
+                                                                                              "--broker", "--origin"])
+def test_run_mode_refuses_a_flag_given_as_an_empty_string(flag) -> None:
+    """Given is not the same as non-empty: an empty value is still a flag the caller passed."""
+    args = _exchange_args()
+    code, out, err = _run_cli(*args, flag, "")
+    assert code == 2 and out == "" and f"it takes no {flag}" in err, (out, err)
+
+
+@pytest.mark.parametrize("value", ["~/.cache/amd-kds", "__EXPANDED__"])
+def test_run_mode_refuses_the_kds_cache_given_with_its_old_default(value) -> None:
+    import os
+
+    value = os.path.expanduser("~/.cache/amd-kds") if value == "__EXPANDED__" else value
+    code, out, err = _run_cli(*_exchange_args(), "--kds-cache", value)
+    assert code == 2 and out == "" and "it takes no --kds-cache" in err

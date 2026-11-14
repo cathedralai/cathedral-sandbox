@@ -83,7 +83,7 @@ def signing_key():
 
 # ---------------------------------------------------------------- synthetic AMD chain
 
-def make_amd(report_version: int = 3) -> dict[str, bytes]:
+def make_amd(report_version: int = 3, cpuid_family: int = 0x19, cpuid_model: int = 0x01) -> dict[str, bytes]:
     """ARK, ASK and VCEK (RSA-PSS SHA-384, as AMD's are) and one report signed by the VCEK.
 
     report_version 2 writes a report with no CPUID fields (a checker then needs --product to know the product)."""
@@ -126,6 +126,8 @@ def make_amd(report_version: int = 3) -> dict[str, bytes]:
     if report_version != 3:
         report[0:4] = report_version.to_bytes(4, "little")
         report[0x188] = report[0x189] = 0  # the CPUID family and model exist from version 3 on
+    else:
+        report[0x188], report[0x189] = cpuid_family, cpuid_model
     r_s = decode_dss_signature(vcek_key.sign(bytes(report[:0x2A0]), ec.ECDSA(hashes.SHA384())))
     report[0x2A0:0x2A0 + 72] = r_s[0].to_bytes(72, "little")
     report[0x2E8:0x2E8 + 72] = r_s[1].to_bytes(72, "little")
