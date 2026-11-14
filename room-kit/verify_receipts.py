@@ -849,6 +849,9 @@ def room_numbering(receipts: list[dict], list_doc: dict | None = None) -> dict:
             entry["ended"] = {"reason": ends[-1]["reason"]}
         # The same room id under two bindings has two chains: name them apart.
         rooms[room_key(groups, bsha, room)] = entry
+    if list_doc is not None and "count" in list_doc:
+        # An integer as written: in Python a boolean equals 0 or 1 and 0.0 equals 0, which other tools do not mirror.
+        need(_is_int(list_doc["count"]), "the list's count is not an integer")
     if list_doc is not None and "room_head" in list_doc:
         need(len(groups) <= 1, f"the list names a room_head but holds receipts of {len(groups)} rooms")
         if not groups:
