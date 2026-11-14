@@ -130,7 +130,10 @@ def test_level1_chain_verifies_offline_without_snp(tmp_path, monkeypatch) -> Non
     assert out["chain"]["links_checked"] == 2
     assert out["chain"]["contiguous"] is True
     assert out["chain"]["first"] == 1 and out["chain"]["last"] == 2
-    assert out["checked"] == "whole chain to the head the server named"
+    assert out["checked"] == (
+        "whole chain to the head the server named; "
+        "each numbered room: its receipts run 1 to n with no gap and every link right"
+    )
 
 
 def test_tampered_level1_receipt_fails(tmp_path, monkeypatch) -> None:
@@ -280,17 +283,26 @@ printf 'wild %s\n' "$(receipts_api_upstream)"
 
 def test_guest_filtered_chain_verifies(tmp_path, monkeypatch) -> None:
     # The broker gives a guest only its own receipts, with the hotel's head.
-    # A filtered chain is a subset: each receipt is checked, not the whole chain.
+    # A filtered chain may omit another room, but must include every numbered
+    # receipt of the guest's own room, starting at room_sequence 1.
     ledger = _chain(tmp_path, monkeypatch)
+    ledger.sign({
+        "action": "create", "target": "POST /v1/sandboxes", "sandbox_id": "sbx_2", "status": 201,
+        "customer_request_sha256": "11" * 32, "command_sha256": None, "image": "alpine:3.20",
+        "image_digest": None, "result_sha256": "22" * 32,
+    })
     proc = _verify_cli(tmp_path, ledger.attestation(), {
         "binding_sha256": ledger.binding_sha256, "head": ledger.head, "filtered": True,
-        "receipts": ledger.chain[1:],
+        "receipts": ledger.chain[2:],
     })
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = json.loads(proc.stdout)
     assert out["verdict"] == "PASS"
     # The doc says it is filtered, so only each receipt was checked: say so.
-    assert out["checked"] == "each receipt; not that none are missing"
+    assert out["checked"] == (
+        "each receipt; not that none are missing; "
+        "each numbered room: its receipts run 1 to n with no gap and every link right"
+    )
 
 
 def test_fetch_chain_pages_a_filtered_chain_by_raw_offset(monkeypatch) -> None:
