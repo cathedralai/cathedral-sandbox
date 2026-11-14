@@ -47,3 +47,27 @@ func TestBulkDeleteDoesNotReportSuccessWhileClaimBusyPersists(t *testing.T) {
 		t.Fatalf("busy hotel must make bulk delete retryable, got %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestBulkDeleteDoesNotReportSuccessWhenBusyRetryFails(t *testing.T) {
+	tc := newChain(t)
+	room := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}, "labels": map[string]any{"run": "r1"}})
+	f := tc.hotels["a"]
+	f.mu.Lock()
+	f.bulkClaimBusy = 1
+	f.bulkFailAfterBusy = true
+	f.mu.Unlock()
+	status, doc := tc.call(t, "key1", "DELETE", "/v1/sandboxes?label=run=r1", nil)
+	if status != 409 || errCode(doc) != "bulk_delete_claim_busy" {
+		t.Fatalf("failed busy retry must keep cleanup retryable: %d %v", status, doc)
+	}
+	if left := hotelRooms(tc); len(left) != 1 || left["a"] != 1 {
+		t.Fatalf("failed retry unexpectedly removed room %s: %v", room, left)
+	}
+	status, doc = tc.call(t, "key1", "DELETE", "/v1/sandboxes?label=run=r1", nil)
+	if status != 200 {
+		t.Fatalf("caller retry must finish cleanup: %d %v", status, doc)
+	}
+	if left := hotelRooms(tc); len(left) != 0 {
+		t.Fatalf("caller retry left rooms behind: %v", left)
+	}
+}

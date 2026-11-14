@@ -1763,13 +1763,13 @@ func bulkDeleteFromHotel(ctx context.Context, h *hotel, q url.Values) (int, bool
 	for {
 		status, _, body, err := h.do(ctx, "DELETE", "/v1/sandboxes", q, nil, 30*time.Minute)
 		if err != nil {
-			if sawClaimBusy && ctx.Err() != nil {
+			if sawClaimBusy {
 				return 409, true
 			}
 			return 502, false
 		}
 		if status != 409 || errCodeOf(body) != "bulk_delete_claim_busy" {
-			return status, false
+			return status, sawClaimBusy && (status < 200 || status >= 300)
 		}
 		sawClaimBusy = true
 		remaining := time.Until(deadline)

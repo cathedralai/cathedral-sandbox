@@ -73,7 +73,8 @@ type fakeHotel struct {
 	// ownerScoped: list, delete and push snapshots only for the guest in the
 	// X-Cathedral-Guest header, as a hotel with per-guest ownership does
 	// (cathedral/sandbox_guest.py list_snapshots and delete_snapshot, AB#650).
-	ownerScoped bool
+	ownerScoped       bool
+	bulkFailAfterBusy bool // one transient bulk-delete failure after a claim-busy refusal
 }
 
 // snapGuestOK is whether a snapshot call may see snapshot doc d.
@@ -165,6 +166,11 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				f.bulkClaimBusy--
 			}
 			writeErr(w, 409, "bulk_delete_claim_busy", "a room claim is running")
+			return
+		}
+		if f.bulkFailAfterBusy {
+			f.bulkFailAfterBusy = false
+			writeErr(w, 503, "hotel_unavailable", "try again")
 			return
 		}
 		kept := f.rooms[:0]
