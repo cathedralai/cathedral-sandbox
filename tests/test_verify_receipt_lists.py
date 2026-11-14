@@ -1181,3 +1181,53 @@ def test_the_product_only_names_the_layout_when_the_certificates_come_with_the_f
     """The chain is the file's own, so the other known product still verifies it: --product never fetches here."""
     code, out, _ = _version_2_run(tmp_path, "--product", "Genoa")
     assert code == 0 and out["attestation"]["amd"]["product"] == "Genoa"
+
+
+# ---- run mode refuses every flag it does not act on, so no caller believes a check ran
+
+REFUSED_WITH_ONESHOT = [
+    ("--owner-pubkey", "AAAA"), ("--tls-spki-sha256", "ab" * 32), ("--require-tls", None), ("--kds-cache", "/tmp/kds"),
+    ("--sandbox", "room-1"), ("--hotel", "hotel-1"), ("--operator-key-file", "/tmp/operator-key"),
+    ("--save", "/tmp/save"), ("--receipt-header", "abc"),
+    ("--cathedral-sandbox", "5b7c1a2e-9d3f-4e6a-8b10-2c4d6e8f0a1b"),
+]
+
+
+def _exchange_args() -> list[str]:
+    case = json.loads((EXCHANGE / "case.json").read_text())
+    return [a.replace("{dir}", str(EXCHANGE)) for a in case["args"]]
+
+
+@pytest.mark.parametrize("flag, value", REFUSED_WITH_ONESHOT, ids=[f[0] for f in REFUSED_WITH_ONESHOT])
+def test_run_mode_refuses_a_flag_it_does_not_act_on(flag, value) -> None:
+    code, out, err = _run_cli(*_exchange_args(), flag, *([value] if value is not None else []))
+    assert code == 2 and out == "", (out, err)
+    assert f"--oneshot checks one file; it takes no {flag}" in err
+
+
+def test_run_mode_names_every_refused_flag_in_one_message() -> None:
+    code, out, err = _run_cli(*_exchange_args(), "--owner-pubkey", "AAAA", "--require-tls", "--hotel", "h")
+    assert code == 2 and out == ""
+    assert "--oneshot checks one file; it takes no --owner-pubkey, --require-tls, --hotel" in err
+
+
+def test_run_mode_still_accepts_require_sealed() -> None:
+    """Run mode always asks for what --require-sealed asks for, so the flag changes nothing and is accepted."""
+    code, out, err = _run_cli(*_exchange_args(), "--require-sealed")
+    assert code == 0 and json.loads(out)["verdict"] == "PASS", (out, err)
+
+
+def test_the_exchange_check_command_uses_no_refused_flag() -> None:
+    refused = {f[0] for f in REFUSED_WITH_ONESHOT} | {"--receipts", "--attestation", "--broker", "--origin"}
+    assert not refused & set(_exchange_args())
+    for folder in sorted((PACK / "good").glob("run_*")) + sorted((PACK / "bad").glob("run_*")):
+        used = set(json.loads((folder / "case.json").read_text())["args"])
+        assert not (refused - {"--skip-amd"}) & used, folder.name
+
+
+def test_list_mode_keeps_its_default_kds_cache_and_the_flags_run_mode_refuses() -> None:
+    folder = PACK / "good" / "numbered_rooms_interleaved"
+    code, out, err = _run_cli("--attestation", str(folder / "attestation_doc.json"), "--receipts",
+                              str(folder / "receipts.json"), "--skip-amd", "--kds-cache", "/tmp/kds-unused",
+                              "--require-sealed")
+    assert code == 0 and json.loads(out)["verdict"] == "PASS", (out, err)
