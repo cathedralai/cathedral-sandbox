@@ -264,12 +264,18 @@ def parse_report(r: bytes) -> dict:
     }
 
 
+# Report versions with a layout here: 2 has no CPUID fields, 3 and later have them.
+SUPPORTED_REPORT_VERSIONS = (2, 3, 4, 5)
+
+
 def product(rep: dict, override: str | None) -> str:
     """The product the report names. A report with CPUID fields (version 3 on) names its own: a family with no
     layout here fails whatever --product says, and a different --product fails. Only a version 2 report, which
-    has no CPUID fields, takes the product from --product."""
-    fam, mod = rep["cpuid_fam"], rep["cpuid_mod"]
-    if fam is None:
+    has no CPUID fields, takes the product from --product; no other version reads the flag."""
+    version, fam, mod = rep["version"], rep["cpuid_fam"], rep["cpuid_mod"]
+    if version not in SUPPORTED_REPORT_VERSIONS:
+        raise Fail(f"the report is version {version}, which has no layout here")
+    if version == 2:
         if override is not None:
             return override
         raise Fail(f"cannot tell the product from cpuid family {fam} model {mod}; pass --product")
@@ -918,6 +924,28 @@ def check_start_commands(receipts: list[dict]) -> None:
              f"receipt {st['sequence']}: start_command_sha256 does not match the start command")
 
 
+def check_receipt_shapes(receipts) -> None:
+    """Every receipt of a list is an object with a statement of the shape the list-mode checks read, so a signed
+    but malformed statement ends in a reason and not in an uncaught error."""
+    need(isinstance(receipts, list), "the receipts are not a list")
+    for i, rc in enumerate(receipts, start=1):
+        need(isinstance(rc, dict) and isinstance(rc.get("statement"), dict),
+             f"receipt {i} of the list is not an object with a statement")
+        for key in ("signature_b64", "receipt_sha256"):
+            need(isinstance(rc.get(key), str), f"receipt {i} of the list has no string {key}")
+        try:
+            base64.b64decode(rc["signature_b64"])
+        except ValueError as exc:
+            raise Fail(f"receipt {i} of the list: signature_b64 is not base64") from exc
+        st, where = rc["statement"], f"receipt {i} of the list"
+        need(_is_int(st.get("sequence")), f"{where}: sequence is not an integer")
+        need(isinstance(st.get("binding_sha256"), str), f"{where}: binding_sha256 is not a string")
+        need(isinstance(st.get("action"), str), f"{where}: action is not a string")
+        need("previous_receipt_sha256" in st, f"{where} has no previous_receipt_sha256")
+        need(st.get("status") is None or _is_int(st["status"]), f"{where}: status is not an integer")
+        need(st.get("sandbox_id") is None or isinstance(st["sandbox_id"], str), f"{where}: sandbox_id is not a string")
+
+
 def policy_timeline(receipts: list[dict]) -> dict:
     """Room id -> the signed policy events of that room, in chain order.
 
@@ -930,7 +958,16 @@ def policy_timeline(receipts: list[dict]) -> dict:
         if not room:
             continue
         policy = st.get("network_policy")
+        if policy is not None or (room in out and st["action"] == "delete"):
+            where = f"receipt {st['sequence']}"
+            need(_is_int(st.get("issued_at")), f"{where}: issued_at is not an integer")
+            need(_is_int(st.get("status")), f"{where}: status is not an integer")
         if policy is not None:
+            need(isinstance(policy, dict), f"{where}: network_policy is not an object")
+            need("mode" in policy, f"{where}: network_policy has no mode")
+            need("allow" in policy, f"{where}: network_policy has no allow")
+            need(isinstance(policy["mode"], str), f"{where}: network_policy mode is not a string")
+            need(isinstance(policy["allow"], list), f"{where}: network_policy allow is not a list")
             need(st.get("network_policy_sha256") == sha(canonical(policy)),
                  f"receipt {st['sequence']}: network_policy_sha256 does not match the policy")
             out.setdefault(room, []).append({
@@ -2019,8 +2056,13 @@ def main() -> int:
         # has gaps by design: check each receipt, not a whole chain to the head.
         whole = isinstance(doc, dict) and not doc.get("filtered") and not a.sandbox and not a.receipt_header
         head = doc.get("head") if whole else None
+        need(isinstance(receipts, list), "the receipts are not a list")
         for h in a.receipt_header:
-            receipts.append(json.loads(base64.urlsafe_b64decode(h + "=" * (-len(h) % 4))))
+            try:
+                receipts.append(json.loads(base64.urlsafe_b64decode(h + "=" * (-len(h) % 4))))
+            except ValueError as exc:
+                raise Fail("--receipt-header is not base64url JSON") from exc
+        check_receipt_shapes(receipts)
         owner = owner_key_bytes(a.owner_pubkey) if a.owner_pubkey else None
         sealed_asked = a.require_sealed or a.expected_measurement or a.ark_sha256 or a.product or owner
         if is_hotel_level(att) and sealed_asked:
@@ -2118,6 +2160,11 @@ def main() -> int:
         return 3 if verdict == "NOT PROVEN" else 0
     except Fail as exc:
         print(json.dumps({"verdict": "FAIL", "reason": str(exc)}))
+        return 1
+    except (KeyError, TypeError, AttributeError, IndexError):
+        # A member of the wrong type that no check named: a refusal, never a traceback.
+        print(json.dumps({"verdict": "FAIL", "reason": "a receipt or the attestation has a member of the wrong "
+                                                         "type or shape"}))
         return 1
 
 
