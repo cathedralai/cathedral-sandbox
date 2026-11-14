@@ -37,7 +37,7 @@ trap 'rm -rf "$work"' EXIT
 start_ns=$(date +%s%N)
 set +e
 "$LLAMA_CLI" -m "$MODEL" -p "$prompt" -st -n "$MAX_TOKENS" -t "$THREADS" -c "$CTX" \
-  --temp 0 --no-display-prompt --simple-io --reasoning "$REASONING" \
+  --temp 0 --no-escape --no-display-prompt --simple-io --reasoning "$REASONING" \
   --log-timestamps -lv 3 </dev/null >"$work/out" 2>"$work/err"
 status=$?
 set -e
@@ -61,15 +61,37 @@ stats=$(grep -o '\[ Prompt: [0-9.]* t/s | Generation: [0-9.]* t/s \]' "$work/out
 prompt_tok_s=$(echo "$stats" | awk '{ print ($3 == "" ? "unknown" : $3) }')
 gen_tok_s=$(echo "$stats" | awk '{ print ($7 == "" ? "unknown" : $7) }')
 
-# Stdout is a banner, then "> <prompt>", the answer, a blank line and the
-# stats line. Cut on the echoed prompt and on the stats line.
+# Stdout is a banner, then the echoed prompt, the answer, a blank line and the
+# stats line. Cut on the echo and on the stats line. llama-cli echoes a prompt
+# of more than 500 bytes as its first 500 bytes plus " ... (truncated)"
+# (tools/cli/cli-ui.h, user_turn::echo), so build the same echo here.
+# --no-escape keeps the echo byte for byte what was passed: by default
+# llama-cli turns \n, \t, \\ and the like in -p into the characters.
+# Bytes, not characters, so LC_ALL=C; set in a function (not by command
+# substitution, which would drop the prompt's trailing newlines).
+set_echo() {
+  local LC_ALL=C
+  echoed=$prompt
+  if [ "${#prompt}" -gt 500 ]; then
+    echoed="${prompt:0:500} ... (truncated)"
+  fi
+}
+set_echo
 text=$(cat "$work/out")
-marker=$'\n> '"$prompt"$'\n'
+marker=$'\n> '"$echoed"$'\n'
 answer=${text#*"$marker"}
 if [ "$answer" = "$text" ]; then
-  answer=$text
-else
-  answer=${answer%%$'\n\n[ Prompt:'*}
+  echo "lfm3-ask: llama-cli did not echo the prompt; printing all of its output" >&2
+fi
+answer=${answer%%$'\n\n[ Prompt:'*}
+
+# A request llama-cli cannot serve (a prompt longer than the context, say) is
+# printed as "Error: ..." on stdout with exit 0. Fail instead of passing the
+# error off as the answer.
+if [[ $answer == "Error: "* ]]; then
+  printf '%s\n' "$answer" >&2
+  echo "lfm3-ask: llama-cli could not answer (raise LFM3_CTX for long prompts)" >&2
+  exit 1
 fi
 printf '%s\n' "$answer"
 echo "lfm3-timing load_ms=$load_ms prompt_tok_s=$prompt_tok_s gen_tok_s=$gen_tok_s wall_ms=$wall_ms threads=$THREADS max_tokens=$MAX_TOKENS reasoning=$REASONING"
