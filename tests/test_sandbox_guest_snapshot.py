@@ -823,6 +823,10 @@ def _fork_root(provider, doc) -> Path:
 
 def _nothing_started(fake, provider, runs_before: int) -> None:
     assert len(fake.calls_of("run")) == runs_before
+    # No container, no record, no guest, no work folder (staging included) and no image tag for the new room.
+    assert len(fake.containers) == 1 and len(provider._guests) == 1 and len(provider._inner._sandboxes) == 1  # noqa: SLF001
+    assert [i for i in fake.state["images"] if not i.startswith("cathedral-snap-")] == ["alpine:3.20"]
+    assert not list(provider._inner._base.glob("sbx_*/.incoming"))  # noqa: SLF001
     assert provider.quota()["usage"]["resident_sandboxes"] == 1  # the source room only
     assert len([p for p in provider._inner._base.iterdir() if p.name.startswith("sbx_")]) == 1  # noqa: SLF001
 
@@ -859,7 +863,7 @@ class _SlowReader:
     """A reader that gives 64 bytes, then lets the test act, then gives the rest."""
 
     def __init__(self, path: Path, between) -> None:
-        self._fh = open(path, "rb")
+        self._fh = open(path, "rb", buffering=0)  # unbuffered: a read sees what is on disk now
         self._between = between
         self._reads = 0
 
@@ -980,7 +984,8 @@ def test_a_plain_create_from_a_snapshot_image_is_refused_in_every_form(fake, pro
     name = f"cathedral-snap-{result['snapshot_id']}:latest"
     image_id = result["committed_image_id"]
     fake.add_image("retagged:1", alias_of=name)  # another tag on the same image
-    forms = [image_id, image_id.removeprefix("sha256:"), name, f"cathedral-snap-{result['snapshot_id']}",
+    # (A bare 64-hex id is not a valid image reference: the request itself is refused as invalid_image_reference.)
+    forms = [image_id, name, f"cathedral-snap-{result['snapshot_id']}:other",
              f"cathedral-snap-{result['snapshot_id']}@{image_id}", "retagged:1"]
     runs = len(fake.calls_of("run"))
     for ref in forms:
@@ -988,10 +993,31 @@ def test_a_plain_create_from_a_snapshot_image_is_refused_in_every_form(fake, pro
             _create_image(provider, ref)
         assert (err.value.code, err.value.http_status) == ("snapshot_image_fork_only", 400), ref
     assert len(fake.calls_of("run")) == runs
-    # The image with a digest field of its own: refused too.
+
+
+def test_a_template_that_resolves_to_a_snapshot_image_is_refused(fake, provider) -> None:
+    from cathedral import agent_interactive as ux
+
+    result, _, _ = _captured(provider)
+    provider._inner._templates["sbt-tpl:v1"] = ux.SandboxTemplate(  # noqa: SLF001
+        uid="sbt-tpl:v1", name="tpl", display_name="t", description="", kind="USER", status="READY", source_sandbox_id=None,
+        image_ref=f"cathedral-snap-{result['snapshot_id']}:latest")
     with pytest.raises(SandboxOpError) as err:
-        provider.create(CreateSandboxRequest(image=ImageSource(image=name, digest=image_id), resources=RES), api_key="k", idempotency=None, body_digest="d")
+        _create_image(provider, "sbt-tpl:v1")
     assert err.value.code == "snapshot_image_fork_only"
+
+
+def test_the_id_that_will_run_is_checked_again_after_the_early_check(fake, provider, monkeypatch) -> None:
+    # A tag moved onto the snapshot's image after the first check (or a pull that took the lock's time):
+    # the Id that actually runs is compared with the snapshot images once more.
+    result, _, _ = _captured(provider)
+    fake.add_image("late:1", alias_of=f"cathedral-snap-{result['snapshot_id']}:latest")
+    monkeypatch.setattr(provider, "_names_snapshot_image", lambda *a, **k: False)
+    runs = len(fake.calls_of("run"))
+    with pytest.raises(SandboxOpError) as err:
+        _create_image(provider, "late:1")
+    assert err.value.code == "snapshot_image_fork_only"
+    assert len(fake.calls_of("run")) == runs and provider.quota()["usage"]["resident_sandboxes"] == 1
 
 
 def test_the_fork_call_still_starts_a_snapshot_image_and_an_ordinary_image_is_untouched(fake, provider) -> None:
@@ -1051,7 +1077,7 @@ def test_an_expired_snapshots_image_is_retried_too(fake, provider) -> None:
     from dataclasses import replace
 
     provider._inner._snapshots[snap_id] = (path, replace(rec, created_at=rec.created_at - timedelta(seconds=rec.ttl_seconds + 1)))  # noqa: SLF001
-    fake.set(image_rm_fail_times=1)
+    fake.set(image_rm_fail_times=2)  # the sweep's first try and its retry in the same pass both fail
     provider.sweep()
     assert image in fake.state["images"] and image in provider.pending_image_removals()
     provider.sweep()

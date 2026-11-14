@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -1061,8 +1062,10 @@ class DockerClient:
                 f"docker unpause failed: {(result.stderr or result.stdout or '')[:200]}",
             )
 
-    def commit(self, container_id: str, image_name: str) -> str:
-        result = self.run(["docker", "commit", container_id, image_name], timeout=300.0)
+    def commit(self, container_id: str, image_name: str, *, blank_env: Iterable[str] = ()) -> str:
+        # `--change "ENV NAME="` leaves the name in the image with an empty value. It does not remove it.
+        changes = [arg for name in blank_env for arg in ("--change", f"ENV {name}=")]
+        result = self.run(["docker", "commit", *changes, container_id, image_name], timeout=300.0)
         if result.returncode != 0:
             raise SandboxOpError(
                 "snapshot_failed",
@@ -1314,6 +1317,7 @@ class DockerGuestProvider:
         self._snapshot_images: dict[str, str] = {}
         self._unpause_owed: dict[str, str] = {}  # room id -> container id: a capture left it paused
         self._unpause_failures: dict[str, int] = {}
+        self._pending_image_rm: dict[str, int] = {}  # snapshot image -> failed removals, retried each sweep
         self._snapshot_meta: dict[str, dict[str, Any]] = {}  # snapshot id -> sizes and image
         self._snapshot_owners: dict[str, str] = {}  # snapshot id -> owner_id (AB#650)
         self._built_images: dict[str, str] = {}  # content_hash -> tag
@@ -1666,20 +1670,64 @@ class DockerGuestProvider:
     def _snapshot_image(self, ref: str) -> str:
         """Return the committed image of snapshot *ref*. Never fall back to another image.
 
-        Unknown snapshot: 404 snapshot_not_found. A known snapshot record with no
-        committed image on this host: 409 snapshot_image_missing.
+        Unknown snapshot: 404 snapshot_not_found. A known record whose committed image is gone
+        from this host, or has another id than the record's committed_image_id: 409
+        snapshot_corrupt (a fork must start exactly the image that was captured).
         """
         snap_id = self._resolve_snapshot(ref)
         if snap_id is None:
             raise SandboxOpError("snapshot_not_found", 404, f"no snapshot {ref} on this host")
         image = self._snapshot_images.get(snap_id)
-        if not image or not self._client.image_exists(image):
-            raise SandboxOpError(
-                "snapshot_image_missing",
-                409,
-                f"snapshot {snap_id} has no committed image on this host",
-            )
+        expected = self._snapshot_meta.get(snap_id, {}).get("committed_image_id")
+        if not image or not expected or not self._client.image_exists(image):
+            raise SandboxOpError("snapshot_corrupt", 409, f"snapshot {snap_id} has no committed image on this host")
+        if self._image_id_of(image) != expected:
+            raise SandboxOpError("snapshot_corrupt", 409, f"snapshot {snap_id}: its image is not the one that was captured")
         return image
+
+    # ---- D7: only the fork call may start a snapshot's image
+    _HEX_ID = re.compile(r"(?:sha256:)?([0-9a-f]{64})")
+
+    def _snapshot_image_keys(self) -> tuple[set[str], set[str]]:
+        """(committed image ids as 64 hex, image names) of every snapshot this provider holds."""
+        with self._inner._lock:  # noqa: SLF001
+            metas = list(self._snapshot_meta.values())
+        return (
+            {m["committed_image_id"].removeprefix("sha256:") for m in metas if m.get("committed_image_id")},
+            {m["image"] for m in metas if m.get("image")},
+        )
+
+    def _names_snapshot_image(self, ref: str | None, digest: str | None = None) -> bool:
+        """True when *ref* (id, name, tag, name@digest, a template that resolves to one, or a
+        tag on the same image) or *digest* names an image a snapshot holds."""
+        ids, names = self._snapshot_image_keys()
+        seen: set[str] = set()
+        candidates = [ref or "", digest or ""]
+        if ref:
+            with self._inner._lock:  # noqa: SLF001
+                tmpl = self._inner._templates.get(ref)  # noqa: SLF001
+            if tmpl is not None:
+                candidates.append(tmpl.image_ref)
+        for cand in candidates:
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            base = cand.split("@", 1)[0]
+            if cand in names or base in names or base.startswith("cathedral-snap-"):
+                return True
+            for part in (cand, cand.split("@", 1)[-1]):
+                m = self._HEX_ID.fullmatch(part.strip().lower())
+                if m and m.group(1) in ids:
+                    return True
+        # Another tag on the same image: the engine's own id decides (no snapshot, nothing to compare).
+        if not ids:
+            return False
+        for cand in candidates[:1] + candidates[2:]:
+            if cand and self._client.image_exists(cand):
+                inspected = normalize_image_id(str(self._client.image_inspect(cand).get("Id") or ""))
+                if inspected is not None and inspected.removeprefix("sha256:") in self._snapshot_image_keys()[0]:
+                    return True
+        return False
 
     def create(
         self,
@@ -1700,6 +1748,8 @@ class DockerGuestProvider:
             # Fail before any record exists. A fork never starts another image.
             self._require_snapshot_owner(request.snapshot_id, owner)
             self._snapshot_image(request.snapshot_id)
+        elif request.image is not None and self._names_snapshot_image(request.image.image, request.image.digest):
+            raise SandboxOpError("snapshot_image_fork_only", 400, "a snapshot's image starts only through a fork of that snapshot")
         if request.workspace is not None:
             # Fail before any record exists: 404 for a workspace of another owner.
             if self._workspaces is None:
@@ -1959,13 +2009,16 @@ class DockerGuestProvider:
         effective_owner = owner if owner is not None else owner_id(None, None)
         image = self._image_for(request)
         if request.snapshot_id is not None:
-            # Snapshot image must already be granted to the source room's owner.
+            # Snapshot image must already be granted to the source room's owner, and must be
+            # the image the record names (checked again here: the image can change between steps).
             image_id = self._image_id_of(image)
-            if image_id is None:
+            snap_id = self._resolve_snapshot(request.snapshot_id)
+            expected = self._snapshot_meta.get(snap_id or "", {}).get("committed_image_id")
+            if image_id is None or expected is None or image_id != expected:
                 raise SandboxOpError(
-                    "snapshot_image_missing",
+                    "snapshot_corrupt",
                     409,
-                    f"snapshot {request.snapshot_id} has no committed image on this host",
+                    f"snapshot {request.snapshot_id}: its image is not the one that was captured",
                 )
             self._image_owners.require(image_id, effective_owner)
         elif request.image is not None:
@@ -2008,6 +2061,10 @@ class DockerGuestProvider:
             # The grant above was made against an earlier inspect; the tag may
             # have moved to another owner's Id since. Re-check the Id that runs.
             self._image_owners.require(run_image, effective_owner)
+        if request.snapshot_id is None and run_image.removeprefix("sha256:") in self._snapshot_image_keys()[0]:
+            # D7 again, on the Id that will run, after every step that pulled, built or waited:
+            # whatever name got here (image, template, build, default), a snapshot's image starts only by fork.
+            raise SandboxOpError("snapshot_image_fork_only", 400, "a snapshot's image starts only through a fork of that snapshot")
         room_tunables = self._tunables_for(request, image, dind)
         work = Path(self._inner._sandboxes[sandbox_id].root) / "work"  # noqa: SLF001
         name = f"cathedral-{sandbox_id}"
@@ -2453,7 +2510,9 @@ class DockerGuestProvider:
                     self._client.pause(guest.container_id)
                 size = self._inner.write_snapshot_archive(capture)
                 commit_attempted = True
-                self._client.commit(guest.container_id, image_name)
+                self._client.commit(
+                    guest.container_id, image_name, **({"blank_env": capture.env_names} if capture.env_names else {})
+                )
                 image_id = self._image_id_of(image_name)
                 if image_id is None:
                     raise SandboxOpError("snapshot_image_missing", 409, f"snapshot {snap_id} has no docker id after commit")
@@ -2493,13 +2552,31 @@ class DockerGuestProvider:
                 except Exception:  # noqa: BLE001  cleanup must not hide the first error
                     pass
             if commit_attempted:
-                self._client.run(["docker", "image", "rm", image_name], timeout=60.0)
+                self._remove_snapshot_image(image_name)
             raise
         finally:
             self._inner.abort_snapshot(capture)
 
     # An unpause of a container that is not paused, not running, or gone has nothing left to do.
     _BENIGN_UNPAUSE = ("is not paused", "is not running", "no such container")
+
+    def _remove_snapshot_image(self, image: str) -> bool:
+        """Remove a snapshot's image. A removal that fails while the image is still there (a fork
+        still runs from it) is kept in _pending_image_rm and retried by every sweep until it is gone."""
+        result = self._client.run(["docker", "image", "rm", image], timeout=60.0)
+        if result.returncode != 0 and self._client.image_exists(image):
+            self._pending_image_rm[image] = self._pending_image_rm.get(image, 0) + 1
+            return False
+        self._pending_image_rm.pop(image, None)
+        return True
+
+    def pending_image_removals(self) -> dict[str, int]:
+        """Image name -> failed removal attempts, for images a sweep still has to remove."""
+        return dict(self._pending_image_rm)
+
+    def _retry_image_removals(self) -> None:
+        for image in list(self._pending_image_rm):
+            self._remove_snapshot_image(image)
 
     def _unpause_after_capture(self, guest: GuestRecord, sandbox_id: str, *, strict: bool) -> None:
         """Run the room again after a capture. A failure that leaves the room paused is recorded as
@@ -2585,26 +2662,32 @@ class DockerGuestProvider:
         return filtered
 
     def delete_snapshot(self, snapshot_id: str, *, owner: str | None = None) -> bool:
+        return self.delete_snapshot_ex(snapshot_id, owner=owner)[0]
+
+    def delete_snapshot_ex(self, snapshot_id: str, *, owner: str | None = None) -> tuple[bool, bool]:
+        """(deleted, image_removal_pending). The record goes at once; an image that could not be
+        removed is retried by the sweep and reported here."""
         snap_id = self._resolve_snapshot(snapshot_id) or snapshot_id
         if owner is not None:
             recorded = self._snapshot_owners.get(snap_id)
             if recorded is None or recorded != owner:
-                return False
+                return False, False
         existed = self._inner.delete_snapshot(snapshot_id)
         if not existed:
             # Unknown to the caller, or another key's: the image stays with
             # its record. One whose record expired meanwhile loses its image
             # in the next sweep.
-            return False
+            return False, False
         self._snapshot_meta.pop(snap_id, None)
         self._snapshot_owners.pop(snap_id, None)
         image = self._snapshot_images.pop(snap_id, None)
+        removed = True
         if image:
             image_id = self._image_id_of(image)
             if image_id is not None and owner is not None:
                 self._image_owners.drop_owner(image_id, owner)
-            self._client.run(["docker", "image", "rm", image], timeout=60.0)
-        return existed
+            removed = self._remove_snapshot_image(image)
+        return True, not removed
 
     def push_snapshot(
         self,
@@ -2986,6 +3069,7 @@ class DockerGuestProvider:
         self._inner.sweep_tombstones()
         self._gc_snapshot_images()
         self._retry_unpauses()
+        self._retry_image_removals()
         return marked
 
     def _gc_snapshot_images(self) -> None:
@@ -2996,7 +3080,7 @@ class DockerGuestProvider:
             # Chosen under the same hold as `live`: a snapshot published a moment later is not in the list.
             doomed = [(sid, image) for sid, image in self._snapshot_images.items() if sid not in live]
         for sid, image in doomed:
-            self._client.run(["docker", "image", "rm", image], timeout=60.0)
+            self._remove_snapshot_image(image)  # a failure stays in _pending_image_rm
             with self._inner._lock:  # noqa: SLF001
                 if sid not in self._inner._snapshots:  # noqa: SLF001
                     self._snapshot_images.pop(sid, None)

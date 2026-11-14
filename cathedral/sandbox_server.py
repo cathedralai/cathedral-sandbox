@@ -638,8 +638,16 @@ class SandboxApplication:
 
     def delete_snapshot(self, *, id, headers, api_key, **_):
         owner = self._owner(headers, api_key) if getattr(self.provider, "takes_owner", False) else None
-        existed = self.provider.delete_snapshot(id, owner=owner)
-        return Response.json(200, {"deleted": existed}) if existed else Response.error(404, "snapshot_not_found", f"no snapshot {id}")
+        detailed = getattr(self.provider, "delete_snapshot_ex", None)
+        pending = False
+        if detailed is not None:
+            existed, pending = detailed(id, owner=owner)
+        else:
+            existed = self.provider.delete_snapshot(id, owner=owner)
+        if not existed:
+            return Response.error(404, "snapshot_not_found", f"no snapshot {id}")
+        # image_removal appears only when the machine could not remove the image yet; a clean delete is unchanged.
+        return Response.json(200, {"deleted": True, **({"image_removal": "pending"} if pending else {})})
 
     # ------------------------------------------------------------------ §3.4 lifecycle
     def heartbeat(self, *, id, body, **_):

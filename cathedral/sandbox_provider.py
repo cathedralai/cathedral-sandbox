@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import os
 import shutil
 import signal
@@ -37,6 +38,7 @@ import tempfile
 import threading
 import time
 import uuid
+import zlib
 
 try:  # resource is POSIX-only (Linux/macOS); metrics degrade to 0 elsewhere.
     import resource
@@ -159,6 +161,31 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _open_snapshot_archive(path: Path):
+    """Open a stored snapshot tar for reading. A seam: tests replace it. A fork opens it once."""
+    return open(path, "rb")
+
+
+class _HashingReader:
+    """Pass bytes through and hash every byte read, so what is unpacked is what is hashed."""
+
+    def __init__(self, fh) -> None:
+        self._fh = fh
+        self._digest = hashlib.sha256()
+
+    def read(self, n: int = -1) -> bytes:
+        data = self._fh.read(n)
+        self._digest.update(data)
+        return data
+
+    def drain(self) -> None:
+        while self.read(1 << 20):
+            pass
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
+
+
 @dataclass
 class SnapshotCapture:
     """One capture in progress: the reserved id, the room, and where its tar goes (AB#604)."""
@@ -175,6 +202,7 @@ class SnapshotCapture:
     max_bytes: int  # one snapshot at most the room's disk_gib
     was_frozen: bool
     store_limited: bool = False  # max_bytes came from the store's remaining room, not the room's disk
+    env_names: tuple[str, ...] = ()  # create-time variables of the room, blanked in the commit
     done: bool = False
 
 
@@ -590,7 +618,8 @@ class InMemorySandboxProvider:
                              if r.name == request.snapshot_id and self._snapshot_visible(sid)), None)
                 if snap is not None:
                     snap = self._snapshots[snap[0]]
-            if snap is None:
+            if snap is None or self._snapshot_expired(snap[1]):
+                # An expired snapshot is refused here, not left for the sweep: 404 like an unknown one.
                 raise SandboxOpError("snapshot_not_found", 404, f"no snapshot {request.snapshot_id}")
         else:
             snap = None
@@ -607,14 +636,25 @@ class InMemorySandboxProvider:
                     f"image {ref!r} is not in CATHEDRAL_SANDBOX_IMAGE_ALLOWLIST",
                 )
         created: list[_Sandbox] = []
-        for _ in range(request.count):
-            sandbox = self._materialize(request, now, api_key, image_id, snap)
-            created.append(sandbox)
+        try:
+            for _ in range(request.count):
+                sandbox = self._materialize(request, now, api_key, image_id, snap)
+                created.append(sandbox)
+        except BaseException:
+            # One failed fork fails the batch: no record and no folder of it is left.
+            for sandbox in created:
+                self._sandboxes.pop(sandbox.id, None)
+                shutil.rmtree(sandbox.root, ignore_errors=True)
+            raise
         self._create_times_by_key.setdefault(rate_key, []).extend(now for _ in created)
         self._create_times.extend(now for _ in created)
         if len(created) == 1:
             return self._get_doc(created[0])
         return {"sandboxes": [self._get_doc(s) for s in created], "count": len(created)}
+
+    @staticmethod
+    def _snapshot_expired(rec: SnapshotRecord) -> bool:
+        return rec.created_at is not None and _now() - rec.created_at >= timedelta(seconds=rec.ttl_seconds)
 
     def _image_id_for(self, request: CreateSandboxRequest) -> str | None:
         if request.build is not None:
@@ -660,7 +700,11 @@ class InMemorySandboxProvider:
         root.mkdir(parents=True, exist_ok=True)
         (root / "work").mkdir(exist_ok=True)
         if snap is not None:
-            self._unpack_snapshot(snap[0], root)
+            try:
+                self._unpack_snapshot(snap[0], root, self._snapshot_digest(snap[1].snapshot_id))
+            except BaseException:
+                shutil.rmtree(root, ignore_errors=True)
+                raise
         sandbox = _Sandbox(
             id=sid,
             root=root,
@@ -1062,6 +1106,7 @@ class InMemorySandboxProvider:
                 snapshot_id=snap_id, sandbox_id=sandbox_id, path=self._base / f"{snap_id}.tar.gz", work=sandbox.root / "work",
                 ttl_seconds=ttl_seconds, name=name or None, labels=dict(labels or {}), api_key=sandbox.api_key,
                 name_key=name_key, max_bytes=min(each, left), store_limited=left < each, was_frozen=sandbox.state == "frozen",
+                env_names=tuple(sorted(sandbox.env)),
             )
             self._captures[sandbox_id] = capture  # from here new API writes to the room answer 409
             if name_key is not None:
@@ -1224,9 +1269,57 @@ class InMemorySandboxProvider:
             Path(meta[0]).unlink(missing_ok=True)
             return True
 
-    def _unpack_snapshot(self, tar_path: Path, root: Path) -> None:
-        with tarfile.open(tar_path, "r:gz") as tf:
-            _safe_extract(tf, root / "work")
+    def _snapshot_digest(self, snapshot_id: str) -> str | None:
+        stored = self._snapshot_capture.get(snapshot_id)
+        return stored["result"].get("work_archive_sha256") if stored else None
+
+    def _unpack_snapshot(self, tar_path: Path, root: Path, expected_sha256: str | None) -> None:
+        """Unpack a stored tar into root/work in one pass over one open file (AB#604).
+
+        The bytes that are unpacked are the bytes that are hashed. The files land in a staging
+        folder inside root; it becomes /work only when the digest at the end equals the record's.
+        Any read error or mismatch is 409 snapshot_corrupt, and the caller removes the whole root.
+        """
+        corrupt = SandboxOpError("snapshot_corrupt", 409, "the stored snapshot does not match its digest")
+        if not expected_sha256:
+            raise corrupt
+        staging = root / ".incoming"
+        staging.mkdir()
+        try:
+            reader = _HashingReader(_open_snapshot_archive(tar_path))
+            try:
+                with tarfile.open(fileobj=reader, mode="r|gz") as tf:
+                    for member in tf:
+                        _check_member(member)
+                        try:
+                            tf.extract(member, path=staging, filter="data")
+                        except TypeError:  # Python < 3.12 without filter=: links were refused above
+                            if member.issym() or member.islnk():
+                                raise SandboxOpError("unsafe_tar", 400, "symlink/hardlink members require Python 3.12+ filter=data") from None
+                            tf.extract(member, path=staging)
+                reader.drain()  # the rest of the file, so the digest covers every byte
+            except SandboxOpError as exc:
+                if exc.code != "unsafe_tar":
+                    raise
+                # An unsafe member is the caller's fault only when the bytes are the captured ones.
+                try:
+                    reader.drain()
+                except OSError:
+                    pass
+                if reader.hexdigest() != expected_sha256:
+                    raise corrupt from exc
+                raise
+            except (tarfile.TarError, EOFError, zlib.error, OSError, ValueError) as exc:
+                raise corrupt from exc
+            finally:
+                getattr(reader._fh, "close", lambda: None)()  # noqa: SLF001
+            if reader.hexdigest() != expected_sha256:
+                raise corrupt
+            work = root / "work"
+            work.rmdir()
+            os.replace(staging, work)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
 
     # ------------------------------------------------------------------ §3.4 lifecycle / GC
     def heartbeat(self, sandbox_id: str, ttl_seconds: int | None) -> dict[str, Any]:
@@ -2094,6 +2187,17 @@ def provider_from_environment(
         enforce_disk=enforce_disk,
         runtime_label=runtime_label,
     )
+
+
+def _check_member(member: tarfile.TarInfo) -> None:
+    """The same path and link refusals as _safe_extract, for one member of a streamed tar."""
+    name = member.name
+    if name.startswith("/") or ".." in Path(name).parts:
+        raise SandboxOpError("unsafe_tar", 400, f"tar member escapes target: {name}")
+    if member.issym() or member.islnk():
+        link = member.linkname or ""
+        if link.startswith("/") or ".." in Path(link).parts:
+            raise SandboxOpError("unsafe_tar", 400, f"tar link escapes target: {name} -> {link}")
 
 
 def _safe_extract(tf: tarfile.TarFile, target: Path) -> None:

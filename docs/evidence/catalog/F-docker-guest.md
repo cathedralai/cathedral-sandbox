@@ -503,6 +503,8 @@ Side effects: tar file, docker image (kept until delete_snapshot or forever,
 H6).
 Callers: server snapshot route.
 
+What a fork gets (AB#604): A fork gets a copy of the files. It does not get the first room's sealed env, secret mounts or the values of variables given at create. A secret that was written into a file is a file.
+
 ### _snapshot_sizes, list_snapshots (1594-1618)
 Purpose: byte accounting; list from the inner store plus sizes.
 
