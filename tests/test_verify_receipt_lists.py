@@ -871,9 +871,9 @@ def test_the_exchange_file_with_reasons_in_not_proven_still_passes(tmp_path) -> 
 
 def test_digit_runs_and_depth_are_counted_on_the_raw_text() -> None:
     vr = _load_checker()
-    assert vr.json_shape('{"a": 12345, "b": "99999999", "c": [1.25e10]}') == (2, 7)
-    assert vr.json_shape("[" * 7 + "1" * 300 + "]" * 7) == (7, 300)
-    assert vr.json_shape("[true, false, null]") == (1, 1)          # the e of true and false is one character
+    assert vr.json_shape('{"a": 12345, "b": "99999999", "c": [1.25e10]}') == (2, 7, False)
+    assert vr.json_shape("[" * 7 + "1" * 300 + "]" * 7) == (7, 300, False)
+    assert vr.json_shape("[true, false, null]") == (1, 1, False)   # the e of true and false is one character
     what = "holds a number literal of more than 100 characters"
     for token in ("1" * 101, "9" * 50 + "." + "9" * 51, "1e" + "0" * 99, "-" + "1" * 49 + "e+" + "0" * 50,
                   "0." + "0" * 99, "1" * 100 + "e5"):
@@ -928,3 +928,77 @@ def test_the_reference_assembler_refuses_a_caller_value_of_the_wrong_type_or_sha
     _rewrite(case / "caller" / "post_body.json", edit)
     with pytest.raises((AssertionError, ValueError)):
         assemble_bundle(case)
+
+
+SURROGATE_FORMS = {
+    "high alone": "\\ud800", "low alone": "\\udc00", "low before high": "\\udc00\\ud800",
+    "high then other escape": "\\ud800\\u0041", "high then plain char": "\\ud800x", "high then high": "\\ud800\\ud800",
+    "high upper case hex": "\\uD83D", "raw utf-8 bytes": "RAW8", "raw utf-16 unit": "RAW16",
+}
+DOCUMENT_KINDS = {"bundle.json": "the one-shot file", "recipe.json": "the recipe", "context.json": "the context file"}
+
+
+def _surrogate_document(form: str, where: str) -> bytes:
+    payload = SURROGATE_FORMS[form]
+    if payload == "RAW16":
+        return b"\xff\xfe" + ('{"k": "\ud800"}' if where == "value" else '{"\ud800": 1}').encode("utf-16-le",
+                                                                                                    "surrogatepass")
+    body = b"\xed\xa0\x80" if payload == "RAW8" else payload.encode()
+    return b'{"k": "' + body + b'"}' if where == "value" else b'{"' + body + b'": 1}'
+
+
+@pytest.mark.parametrize("where", ["value", "key"])
+@pytest.mark.parametrize("form", sorted(SURROGATE_FORMS))
+@pytest.mark.parametrize("name", sorted(DOCUMENT_KINDS))
+def test_an_unpaired_surrogate_is_refused_with_one_reason_in_every_document(name, form, where, tmp_path) -> None:
+    import shutil
+
+    folder = PACK / "good" / "run_held_output_confirmed_exit_code"
+    case = json.loads((folder / "case.json").read_text())
+    work = tmp_path / "case"
+    shutil.copytree(folder, work)
+    (work / name).write_bytes(_surrogate_document(form, where))
+    code, out, err = _run_cli(*[a.replace("{dir}", str(work)) for a in case["args"]])
+    assert "Traceback" not in err and code == 1, (out, err)
+    assert json.loads(out)["reason"] == f"inputs: {DOCUMENT_KINDS[name]} holds an unpaired surrogate"
+
+
+@pytest.mark.parametrize("text", ['{"k": "\\ud83d\\ude00"}', '{"k": "\\uD83D\\uDE00"}', '{"\\ud83d\\ude00": 1}',
+                                  '{"k": "\\\\ud800"}', '{"k": "\\\\\\\\ud800 \\ud83d\\ude00"}',
+                                  '{"k": "\U0001F600"}', '{"k": "\\ud7ff \\ue000"}', '["\\ud83d\\ude00\\ud83d\\ude00"]'])
+def test_a_proper_pair_and_a_literal_backslash_are_accepted(text) -> None:
+    vr = _load_checker()
+    assert vr.json_shape(text)[2] is False
+    assert vr.strict_json(text.encode(), "p", "x") is not None
+
+
+def test_a_proper_pair_in_utf_16_is_accepted_and_a_deep_lone_surrogate_is_refused() -> None:
+    vr = _load_checker()
+    assert vr.strict_json(b"\xff\xfe" + '{"k": "\U0001F600"}'.encode("utf-16-le"), "p", "x") == {"k": "\U0001F600"}
+    with pytest.raises(vr.Fail, match="x holds an unpaired surrogate"):
+        vr.strict_json(b'{"a": [{"b": [{"\\ud800": 1}]}]}', "p", "x")
+    with pytest.raises(vr.Fail, match="x holds an unpaired surrogate"):
+        vr.strict_json(b'[[[["ok", "\\udc00"]]]]', "p", "x")
+
+
+@pytest.mark.parametrize("name", sorted(DOCUMENT_KINDS))
+def test_the_order_of_faults_is_depth_number_length_surrogate_then_the_parse(name, tmp_path) -> None:
+    import shutil
+
+    folder = PACK / "good" / "run_held_output_confirmed_exit_code"
+    case = json.loads((folder / "case.json").read_text())
+    what = DOCUMENT_KINDS[name]
+    documents = [
+        (b'{"a": 1, "a": "\\ud800"}', f"inputs: {what} holds an unpaired surrogate"),             # surrogate, then key
+        (b'{"a": 1.5, "b": "\\ud800"}', f"inputs: {what} holds an unpaired surrogate"),           # then float
+        (b'{"a": ' + b"1" * 101 + b', "b": "\\ud800"}', f"inputs: {what} holds a number literal of more than "
+                                                          "100 characters"),
+        (b"[" * 65 + b'"\\ud800"' + b"]" * 65, f"inputs: {what} nests too deeply to read"),
+        (b"[" * 65 + b"1" * 101 + b"]" * 65, f"inputs: {what} nests too deeply to read"),
+    ]
+    for i, (raw, reason) in enumerate(documents):
+        work = tmp_path / f"case{i}"
+        shutil.copytree(folder, work)
+        (work / name).write_bytes(raw)
+        code, out, err = _run_cli(*[a.replace("{dir}", str(work)) for a in case["args"]])
+        assert code == 1 and "Traceback" not in err and json.loads(out)["reason"] == reason, (i, out)
