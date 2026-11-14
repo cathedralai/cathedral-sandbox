@@ -2,7 +2,7 @@
  "create": {
   "broker_guest": "guest-1",
   "image_id": "sha256:aae1a0b67cd0da30a034563ef9ea0665cb1ccb289ee21e54edead462f531b112",
-  "ttl_seconds": 300
+  "ttl_seconds": 660
  },
  "file_modes": {
   "context": "644",
@@ -36,7 +36,7 @@
   },
   "outputs": [
    {
-    "max_bytes": 1048576,
+    "max_bytes": 65536,
     "optional": false,
     "path": "/work/out/result.json"
    },

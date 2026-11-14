@@ -6,7 +6,7 @@
    "memory_gib": 2,
    "vcpu": 1
   },
-  "ttl_seconds": 300
+  "ttl_seconds": 660
  },
  "file_modes": {
   "context": "644",
@@ -40,7 +40,7 @@
   },
   "outputs": [
    {
-    "max_bytes": 1048576,
+    "max_bytes": 65536,
     "optional": false,
     "path": "/work/out/result.json"
    },

@@ -20,7 +20,7 @@
  "description": "The create bytes hold a number with a decimal point.",
  "expect": {
   "exit_code": 1,
-  "reason": "check 4: the create bytes hold the number 300.0, which is not an integer",
+  "reason": "check 4: the create bytes hold the number 660.0, which is not an integer",
   "verdict": "FAIL"
  }
 }

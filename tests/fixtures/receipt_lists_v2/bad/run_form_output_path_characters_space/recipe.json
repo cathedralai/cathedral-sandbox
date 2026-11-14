@@ -1,7 +1,7 @@
 {
  "create": {
   "broker_guest": "guest-1",
-  "ttl_seconds": 300
+  "ttl_seconds": 660
  },
  "file_modes": {
   "context": "644",

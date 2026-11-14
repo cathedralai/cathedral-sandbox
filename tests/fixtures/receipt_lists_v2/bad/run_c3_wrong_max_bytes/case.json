@@ -20,7 +20,7 @@
  "description": "A get with a larger max_bytes than the recipe's.",
  "expect": {
   "exit_code": 1,
-  "reason": "check 3: receipt 6 is file_get GET /v1/sandboxes/run-room-1/files?max_bytes=2097152&path=%2Fwork%2Fout%2Fresult.json, the recipe needs file_get GET /v1/sandboxes/run-room-1/files?max_bytes=1048576&path=%2Fwork%2Fout%2Fresult.json",
+  "reason": "check 3: receipt 6 is file_get GET /v1/sandboxes/run-room-1/files?max_bytes=131072&path=%2Fwork%2Fout%2Fresult.json, the recipe needs file_get GET /v1/sandboxes/run-room-1/files?max_bytes=65536&path=%2Fwork%2Fout%2Fresult.json",
   "verdict": "FAIL"
  }
 }
