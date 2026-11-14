@@ -83,6 +83,12 @@ type hotelConfig struct {
 	// TLSSPKISHA256 is derived from a miner hotel's verified SNP binding at
 	// join and persisted for safe reconnect after a broker restart.
 	TLSSPKISHA256 string `json:"tls_spki_sha256,omitempty"`
+	// GuestTLS (AB#378): a sealed hotel reached only over the TLS key its
+	// guest made and named in its attested binding, with the hotel key
+	// installed in the guest (hotel_key_source "install"), as a miner hotel
+	// is. The broker verifies the key without sending the hotel key and pins
+	// it (miner_tls.go syncGuestPin); a config file never names the pin.
+	GuestTLS bool `json:"guest_tls,omitempty"`
 }
 
 type guestConfig struct {
@@ -144,6 +150,11 @@ type config struct {
 	SealedHostData     []string `json:"sealed_host_data,omitempty"`     // non-empty: its HOST_DATA must be one of these
 	AttestTTLSeconds   float64  `json:"attest_ttl_seconds,omitempty"`   // a pass is good this long (default 600)
 	AttestEverySeconds float64  `json:"attest_every_seconds,omitempty"` // check a passed hotel again this often (default 60)
+	// RequireSealedGuestTLS (AB#378): every sealed hotel is reached only over
+	// its attested guest TLS key. A sealed config hotel must set "guest_tls":
+	// true, and a sealed join must pass the keyless HTTPS bootstrap. Off by
+	// default until every sealed hotel runs a guest that installs its key.
+	RequireSealedGuestTLS bool `json:"require_sealed_guest_tls,omitempty"`
 	// AMDVerifier runs room-kit/verify_receipts.py on a sealed hotel's
 	// attestation to check the AMD chain (amd_chain.go). Required for miner hotels.
 	AMDVerifier *amdVerifierConfig `json:"amd_verifier,omitempty"`
@@ -200,9 +211,12 @@ type hotel struct {
 	key       string
 	client    *http.Client
 	ctl       *http.Client // sync loop and hotel documents
-	tlsPinErr error        // non-nil: miner calls must not send the hotel key
-	cfgMu     sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.ReservedFor, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
-	sem       chan struct{}
+	tlsPinErr error        // non-nil: guest TLS calls must not send the hotel key
+	// guestPin is the verified guest TLS SPKI (miner_tls.go); nil: none yet.
+	// Read on every TLS handshake, so atomic.
+	guestPin atomic.Pointer[[sha256.Size]byte]
+	cfgMu    sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.ReservedFor, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
+	sem      chan struct{}
 
 	// Guarded by broker.mu.
 	slots        int
@@ -219,6 +233,9 @@ type hotel struct {
 	downSince    time.Time       // when ok last went false; zero while ok
 	lastAnswer   atomic.Int64    // unix ns of the last room call the hotel answered (status < 500)
 	healthMs     float64         // duration of the last /room/health call
+	pinCheckedAt time.Time       // last keyless guest TLS check (syncGuestPin)
+	pinErr       string          // why the last guest TLS check failed; "" after a pin
+	pinChip      string          // CHIP_ID of the pinned guest TLS key's binding; a re-pin must match it
 	// healthRuntime: the room runtime the hotel last reported in /room/health
 	// ("runsc"...), or "" when it reported none. Atomic because isolationDoc
 	// reads it with or without b.mu held.
@@ -396,6 +413,9 @@ func loadBroker(path string) (*broker, error) {
 		if hc.RequireAttestation && !hc.Sealed {
 			return nil, fmt.Errorf("config: hotel %q: require_attestation needs \"sealed\": true", hc.ID)
 		}
+		if err := validateGuestTLS(hc, c.RequireSealedGuestTLS); err != nil {
+			return nil, err
+		}
 		if hc.RequireAttestation {
 			optedIn = append(optedIn, hc.ID)
 		}
@@ -500,13 +520,8 @@ func (h *hotel) doBase(ctx context.Context, base, method, path string, query url
 // doHeaders is doBase with extra request headers (the guest id of
 // guestcalls.go).
 func (h *hotel) doHeaders(ctx context.Context, base, method, path string, query url.Values, body []byte, timeout time.Duration, extra http.Header) (int, http.Header, []byte, error) {
-	if h.cfg.MinerHotkey != "" {
-		if h.tlsPinErr != nil {
-			return 0, nil, nil, h.tlsPinErr
-		}
-		if !strings.HasPrefix(base, "https://") {
-			return 0, nil, nil, errors.New("miner hotel API requires attested HTTPS")
-		}
+	if err := h.keyedCallErr(base); err != nil {
+		return 0, nil, nil, err
 	}
 	u := base + path
 	if len(query) > 0 {
@@ -540,13 +555,8 @@ func (h *hotel) doHeaders(ctx context.Context, base, method, path string, query 
 }
 
 func (h *hotel) getJSON(ctx context.Context, base, path string, query url.Values, v any) error {
-	if h.cfg.MinerHotkey != "" {
-		if h.tlsPinErr != nil {
-			return h.tlsPinErr
-		}
-		if !strings.HasPrefix(base, "https://") {
-			return errors.New("miner hotel API requires attested HTTPS")
-		}
+	if err := h.keyedCallErr(base); err != nil {
+		return err
 	}
 	u := base + path
 	if len(query) > 0 {
@@ -1769,6 +1779,7 @@ type healthDoc struct {
 }
 
 func (b *broker) syncHotel(ctx context.Context, h *hotel) {
+	b.syncGuestPin(ctx, h) // a guest_tls hotel: no keyed call before its TLS key is verified
 	var hd healthDoc
 	t0 := time.Now()
 	herr := h.getJSON(ctx, h.cfg.Health, "/room/health", nil, &hd)
