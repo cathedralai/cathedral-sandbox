@@ -33,7 +33,7 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "snapshot_fork_v1"
 FIXTURE = FIXTURES / "snapshot_fork_v1.json"
 GENERATOR = FIXTURES / "generate.py"
 # sha256 of snapshot_fork_v1.json. Filled in when the generator exists (step two of CS-3).
-FIXTURE_SHA256 = "to-be-pinned-when-the-generator-is-written"
+FIXTURE_SHA256 = "4b57e2329e5a7588f9869e9e63a4ccd58e35c13e4dc4b15b1746f9ed542483b0"
 # sha256 of the receipts a fixed scripted run of the old actions makes on main (see scripted_old_actions).
 OLD_ACTIONS_SHA256 = "fad368fc68779bfb7ce563ccf6e0a8b7dc55c4c0b88ef109d06fd4610834e2c9"
 
@@ -232,17 +232,15 @@ def test_a_2xx_answer_with_no_usable_result_object_is_unsigned_502(front, raw) -
     assert members(receipt_of(headers)["statement"]) == {}
 
 
-def test_a_snapshot_the_machine_never_answered_gets_no_receipt_and_no_fork(front) -> None:
+def test_a_snapshot_the_machine_never_answered_is_a_502_receipt_with_no_member_and_no_fork(front) -> None:
+    # As for every lost answer on this front: 502 hotel_api_no_answer, and the receipt records the failure.
     a = room(front)
     machine_says(front, 202, answer())
     front.api.drop(rf"POST /v1/sandboxes/{a}/snapshot")
-    try:
-        front.call("POST", f"/v1/sandboxes/{a}/snapshot", {})
-    except OSError:
-        pass
-    except Exception:  # noqa: BLE001 http.client.HTTPException: the connection closed with no answer
-        pass
-    assert chain_actions(front) == ["create"]  # signed after the action ends: nothing yet ended well
+    status, headers, out = front.call("POST", f"/v1/sandboxes/{a}/snapshot", {})
+    st = receipt_of(headers)["statement"]
+    assert status == 502 and code(out) == "hotel_api_no_answer"
+    assert st["action"] == "snapshot" and st["status"] == 502 and members(st) == {}
     assert fork(front)[0] == 404
     assert_idle(front.ledger)
 
