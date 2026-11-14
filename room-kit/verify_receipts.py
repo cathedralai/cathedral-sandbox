@@ -634,7 +634,7 @@ def _check_pool_rooms(receipts: list[dict]) -> dict[str, dict]:
             continue
         need(len(pool_creates) == 1, f"room {room}: a pool room has one create")
         create = pool_creates[0]
-        numbered = all(_has_numbering(rc["statement"]) for rc in rcs)
+        numbered = all(_has_complete_numbering(rc["statement"]) for rc in rcs)
         if claims:
             first = claims[0]["statement"]
             need(numbered, f"room {room}: receipt {first.get('sequence')}: a claim needs numbered receipts: "
@@ -1598,7 +1598,7 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
         st = rc["statement"]
         need(st.get("sandbox_id") == room, f"check 2: receipt {st['sequence']} names room {st.get('sandbox_id')}, "
                                            f"not {room}")
-    need(all(_has_numbering(rc["statement"]) for rc in receipts),
+    need(all(_has_complete_numbering(rc["statement"]) for rc in receipts),
          f"check 2: room {room}: the receipts are not numbered (room_sequence)")
     try:
         ordered = check_room_chain(room, receipts, in_order=True)
