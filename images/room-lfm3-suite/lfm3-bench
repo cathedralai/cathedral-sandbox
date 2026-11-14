@@ -176,11 +176,28 @@ if [ "$rc" -ne 0 ] || [ "$code" != 200 ]; then
 fi
 [ -s "$work/first" ] || fail "the stream ended with no token"
 
-# Chunks as JSON, one per line; an error chunk after a 200 is a failure.
-sed -e 's/\r$//' -n -e 's/^data: \{0,1\}//p' "$work/raw" | grep -v '^\[DONE\]$' |
-  jq -c 'select(type == "object")' >"$work/chunks" 2>/dev/null || true
+# Chunks as JSON, one per line. The final choice and timings must arrive
+# before [DONE]; data after it, a second terminator or malformed data fails.
+if ! awk '
+    { sub(/\r$/, "") }
+    /^data: ?\[DONE\]$/ { if (done) exit 1; done = 1; next }
+    /^data:/ { if (done) exit 1; sub(/^data: ?/, ""); print; next }
+    /^$/ { next }
+    /^:/ { if (done) exit 1; next }
+    { exit 1 }
+    END { if (!done) exit 1 }
+  ' "$work/raw" | jq -c 'if type == "object" then . else error("non-object chunk") end' \
+      >"$work/chunks" 2>/dev/null; then
+  fail "the stream is incomplete or malformed"
+fi
 if jq -e 'select(.error != null)' "$work/chunks" >/dev/null 2>&1; then
   fail "the stream carried an error: $(jq -c 'select(.error != null) | .error' "$work/chunks" | head -c 300)"
+fi
+# A 200 response can close after partial output. Require the model's final
+# choice before publishing signed timings. The parser above required [DONE].
+if ! jq -s -e '[.[] | .choices[0].finish_reason? | strings | select(length > 0)] | length > 0' \
+     "$work/chunks" >/dev/null; then
+  fail "the stream is incomplete (no final choice or [DONE])"
 fi
 jq -s -j '[.[] | ((.choices // [])[0].delta.content // empty) | strings] | join("")' "$work/chunks" >"$work/answer"
 jq -s -c '[.[] | .timings | objects] | last // empty' "$work/chunks" >"$work/timings"
