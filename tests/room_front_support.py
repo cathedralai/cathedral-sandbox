@@ -137,6 +137,9 @@ class FakeApi:
                 return self._send(h, 200, json.dumps({"id": room}).encode())
             return self._send(h, 404, b'{"error":{"code":"sandbox_not_found","message":"no such room"}}')
         if re.fullmatch(r"POST /v1/sandboxes/[^/]+/lifetime", line):
+            room = path.split("/")[3]
+            if room not in rooms_now:
+                return self._send(h, 404, b'{"error":{"code":"sandbox_not_found","message":"no such room"}}')
             return self._send(h, 200, json.dumps({"expires_at": self._stamp(self.expires_in)}).encode())
         if re.fullmatch(r"POST /v1/sandboxes/[^/]+/exec", line):
             return self._send(h, 200, b'{"exit_code":0}')

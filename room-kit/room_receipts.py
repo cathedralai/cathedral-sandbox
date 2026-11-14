@@ -2123,7 +2123,9 @@ class Ledger:
         request. A busy room is refused at once, never waited on.
         """
         with self.lock:
-            if kind == "claim" and self.bulk_in_flight:
+            # A completed claim only replays its stored answer. It cannot run a
+            # lifetime call, so it does not race a bulk delete.
+            if kind == "claim" and room not in self.claimed and self.bulk_in_flight:
                 return None, (409, "pool_bulk_delete_busy", "a bulk delete is running; retry the claim")
             token = False
             if room in self.broken:
@@ -2147,11 +2149,11 @@ class Ledger:
                 self._touch(room)
             if token:
                 self.busy.add(room)
-            if kind == "claim":
+            if kind == "claim" and room not in self.claimed:
                 self.claims_in_flight += 1
             self.in_flight[room] = self.in_flight.get(room, 0) + 1
             return Turn(room, token, len(self.by_room.get(room, [])), room in self.serial, nonread,
-                        kind == "claim"), None
+                        kind == "claim" and room not in self.claimed), None
 
     def _touch(self, room: str) -> None:
         """Remember a non-read request for an id with no create receipt while a create is pending. Caller holds self.lock."""

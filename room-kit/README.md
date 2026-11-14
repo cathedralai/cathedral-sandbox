@@ -230,7 +230,10 @@ gets 409 `pool_room_claimed`. A delete meanwhile gets 409 `room_busy`.
 While any claim is in flight, a bulk delete by label is refused before it
 reaches the API with 409 `bulk_delete_claim_busy`. A claim arriving during a
 bulk delete gets 409 `pool_bulk_delete_busy` before its lifetime call. Both
-requests can be retried when the other finishes.
+requests can be retried when the other finishes. A repeat claim for the same
+sandbox id replays its stored answer even during a bulk delete, without another
+lifetime call. A slow bulk delete can hold new claims for minutes; callers
+should retry or use an ordinary create while it runs.
 Other refusals: 405 for any method but POST (checked before the gate), 400 `claim_request_invalid`, 409
 `pool_room_stale`, `pool_room_gone`, `room_not_pool`, `pool_room_used`,
 `pool_room_expiring`.
