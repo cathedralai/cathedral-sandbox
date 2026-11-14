@@ -885,19 +885,6 @@ class InMemorySandboxProvider:
             sandbox = self._sandboxes.get(sandbox_id)
             return sandbox is not None and sandbox.state == "frozen"
 
-    def mark_frozen(self, sandbox_id: str) -> None:
-        """Record that the room's container is paused though no one asked (an unpause is owed)."""
-        with self._lock:
-            sandbox = self._sandboxes.get(sandbox_id)
-            if sandbox is not None and sandbox.state == "running":
-                sandbox.state = "frozen"
-
-    def mark_running(self, sandbox_id: str) -> None:
-        with self._lock:
-            sandbox = self._sandboxes.get(sandbox_id)
-            if sandbox is not None and sandbox.state == "frozen":
-                sandbox.state = "running"
-
     def _end_api_write(self, sandbox_id: str) -> None:
         with self._lock:
             left = self._writes_in_flight.get(sandbox_id, 0) - 1
