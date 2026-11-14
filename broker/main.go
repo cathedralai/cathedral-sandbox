@@ -266,6 +266,7 @@ type guestState struct {
 
 type broker struct {
 	cfg              config
+	terminalWSIdle   time.Duration // idle close of a terminal socket; 0: defaultTerminalWSIdle (terminal_ws.go)
 	mu               sync.Mutex
 	hset             atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
 	hotelsMu         sync.Mutex               // serialises joins and leaves
@@ -1279,6 +1280,13 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		writeErr(w, 404, "sandbox_not_found", "no sandbox "+bid)
 		return
 	}
+	// A terminal WebSocket goes to the hotel as a raw byte pump (terminal_ws.go),
+	// after the allowlist and ownership checks above. A plain GET on the same
+	// path takes the normal route below.
+	if isWebSocketUpgrade(r) && terminalWSTail(tail) {
+		b.proxyTerminalWS(w, r, h, hid, bid, tail)
+		return
+	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 256<<20+1))
 	if len(body) > 256<<20 {
 		// Forwarding the first 256 MiB would write a short file and answer 200.
@@ -2259,6 +2267,25 @@ func (c *countingWriter) Flush() {
 	}
 }
 
+// Unwrap lets http.ResponseController reach the server's writer, so the
+// terminal WebSocket can hijack the connection (terminal_ws.go).
+func (c *countingWriter) Unwrap() http.ResponseWriter { return c.ResponseWriter }
+
+// handler is the broker as served: ServeHTTP plus the 429 counter.
+func (b *broker) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cw := &countingWriter{ResponseWriter: w, status: 200}
+		b.ServeHTTP(cw, r)
+		if cw.status == 429 && r.URL.Path == "/v1/sandboxes" && r.Method == "POST" {
+			if g := b.guestFromKey(r); g != nil {
+				b.mu.Lock()
+				g.rejected++
+				b.mu.Unlock()
+			}
+		}
+	})
+}
+
 func main() {
 	cfgPath := flag.String("config", "/etc/thin-broker/config.json", "private config file")
 	printDigest := flag.Bool("print-catalog-digest", false, "print the compiled-in catalog digest and exit; reads no config (AB#546 swap check)")
@@ -2293,17 +2320,7 @@ func main() {
 	for _, h := range b.hotelList() {
 		b.startSync(ctx, h)
 	}
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cw := &countingWriter{ResponseWriter: w, status: 200}
-		b.ServeHTTP(cw, r)
-		if cw.status == 429 && r.URL.Path == "/v1/sandboxes" && r.Method == "POST" {
-			if g := b.guestFromKey(r); g != nil {
-				b.mu.Lock()
-				g.rejected++
-				b.mu.Unlock()
-			}
-		}
-	})
+	handler := b.handler()
 	// No WriteTimeout: an exec may run for hours. IdleTimeout closes kept-alive
 	// connections that send nothing, so they cannot pile up to the fd limit.
 	srv := &http.Server{Addr: b.cfg.Listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
