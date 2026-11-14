@@ -1361,6 +1361,21 @@ def run_second_review_cases(pack: Pack) -> None:
          bundle_edit=put(b64(deep), "exec_response_b64"))
     bad("run_exec_answer_matched_and_deep", "An exec answer that is the signed one, nested past the limit.",
         fail(6, "the exec answer nests too deeply to read"), exec_answer=b"[" * 100 + b"]" * 100)
+    for case, token in (("point", b"9" * 50 + b"." + b"9" * 51), ("exponent", b"1e" + b"0" * 99),
+                        ("signed_exponent", b"-" + b"1" * 49 + b"e+" + b"0" * 50)):
+        bad(f"run_exec_answer_matched_long_token_{case}", "A signed exec answer holding a number literal of 101 "
+            "characters.", fail(6, "the exec answer holds a number literal of more than 100 characters"),
+            exec_answer=b'{"exit_code":0,"meta":' + token + b"}")
+    good("run_exec_answer_matched_token_100_characters", "A signed exec answer holding a number literal of exactly 100 "
+         "characters.", {"pointers": {"/run/exit_code/status": "confirmed", "/run/exit_code/value": 0}},
+         exec_answer=b'{"exit_code":0,"meta":' + b"9" * 49 + b"." + b"9" * 50 + b"}")
+    for case, value in (("null", None), ("number", 3), ("object", {}), ("list", []), ("boolean", False),
+                        ("not_base64", "***"), ("padding_broken", "abc")):
+        bad(f"run_shape_exec_response_{case}", f"exec_response_b64 is {case.replace('_', ' ')}.",
+            {"reason": "check 1: exec_response_b64 is not a string of valid base64"},
+            bundle_edit=put(value, "exec_response_b64"))
+    good("run_shape_exec_response_absent", "exec_response_b64 is left out: the exit code is not confirmed.",
+         {"pointers": {"/run/exit_code/status": "not confirmed"}}, exec_response="unconfirmed")
     good("run_exec_answer_matched_and_shallow", "An exec answer that is the signed one and is read.",
          {"pointers": {"/run/exit_code/status": "confirmed", "/run/exit_code/value": 3}},
          exec_answer=canonical({"exit_code": 3}))
@@ -1566,7 +1581,10 @@ def build_form_rules():
             ("one_more", _knobs(max_spend_usd=1000000000000), "recipe: " + MAX_SPEND_RULE),
             ("long_integer_literal", {"recipe_raw": lambda raw: raw.replace(
                 b'"max_spend_usd": "0.50"', b'"max_spend_usd": 1' + b"0" * 5000)},
-             "inputs: the recipe holds a number of more than 100 digits")]),
+             "inputs: the recipe holds a number literal of more than 100 characters"),
+            ("long_decimal_literal", {"recipe_raw": lambda raw: raw.replace(
+                b'"max_spend_usd": "0.50"', b'"max_spend_usd": ' + b"9" * 50 + b"." + b"9" * 51)},
+             "inputs: the recipe holds a number literal of more than 100 characters")]),
         ("max_spend_twelve_digit_string", _knobs(max_spend_usd="999999999999.999999"), [
             ("thirteen_digits", _knobs(max_spend_usd="1000000000000"), "recipe: " + MAX_SPEND_RULE),
             ("double_zero_whole", _knobs(max_spend_usd="00.50"), "recipe: " + MAX_SPEND_RULE),
