@@ -573,6 +573,7 @@ def owner_signed_creates(receipts: list[dict], owner: bytes) -> int:
 
 
 def verify_receipts(att: dict, receipts: list[dict], head: str | None = None) -> dict:
+    check_receipt_shapes(receipts)  # every member the checks below read, before any ordering or link logic
     binding = att["binding"]
     bsha = att["binding_sha256"]
     hotel = is_hotel_level(att)
@@ -955,8 +956,32 @@ def check_receipt_shapes(receipts) -> None:
         need(isinstance(st.get("binding_sha256"), str), f"{where}: binding_sha256 is not a string")
         need(isinstance(st.get("action"), str), f"{where}: action is not a string")
         need("previous_receipt_sha256" in st, f"{where} has no previous_receipt_sha256")
+        need(st["previous_receipt_sha256"] is None or isinstance(st["previous_receipt_sha256"], str),
+             f"{where}: previous_receipt_sha256 is not a string or null")
         need(st.get("status") is None or _is_int(st["status"]), f"{where}: status is not an integer")
         need(st.get("sandbox_id") is None or isinstance(st["sandbox_id"], str), f"{where}: sandbox_id is not a string")
+
+
+def check_attestation_shape(att) -> None:
+    """The attestation document has the members the verifier reads, so a malformed one is named as input."""
+    need(isinstance(att, dict) and isinstance(att.get("binding"), dict) and isinstance(att.get("binding_sha256"), str),
+         "the attestation is not an object with a binding object and a binding_sha256 string")
+    binding = att["binding"]
+    need(isinstance(binding.get("receipt_key_ed25519_b64"), str), "the attestation's binding has no receipt_key string")
+    if not is_hotel_level(att):
+        need(isinstance(att.get("report_b64"), str), "the attestation has no report_b64 string")
+        for key in ("measurement", "chip_id", "reported_tcb", "policy", "host_data"):
+            need(isinstance(binding.get(key), str), f"the attestation's binding has no {key} string")
+
+
+def read_document(path: str, what: str):
+    """A file list mode reads, under the same raw-text limits as run mode."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as exc:
+        raise Fail(f"inputs: cannot read {what} {path}") from exc
+    return load_json_bounded(raw, "inputs", f"the {what}")
 
 
 def policy_timeline(receipts: list[dict]) -> dict:
@@ -996,7 +1021,7 @@ def policy_timeline(receipts: list[dict]) -> dict:
 def get(url: str, key: str) -> dict:
     req = urllib.request.Request(url, headers={"Authorization": "Bearer " + key})
     with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.loads(resp.read())
+        return load_json_bounded(resp.read(), "inputs", "the broker's answer")
 
 
 def fetch_archived_binding(broker: str, operator_key: str, binding_sha256: str) -> dict:
@@ -1161,6 +1186,38 @@ def json_depth(text: str) -> int:
     return json_shape(text)[0]
 
 
+class NotJson(Fail):
+    """A document that is not JSON at all."""
+
+
+def check_json_limits(raw: bytes, prefix: str, what: str, plural: bool = False) -> None:
+    """The raw-text limits every document is read under, in a fixed order: nesting, number length, an unpaired
+    surrogate. Decided before any parse, so the answer is the same on every Python."""
+    try:
+        text = raw.decode(json.detect_encoding(raw), "surrogatepass")
+    except (UnicodeDecodeError, LookupError):
+        return  # not decodable: the parse says so
+    deepest, longest, unpaired = json_shape(text)
+    if deepest > JSON_MAX_DEPTH:
+        raise Unreadable(f"{prefix}: {what} {'nest' if plural else 'nests'} too deeply to read")
+    if longest > JSON_MAX_NUMBER_CHARS:
+        raise Unreadable(f"{prefix}: {what} {'hold' if plural else 'holds'} a number literal of more than "
+                         f"{JSON_MAX_NUMBER_CHARS} characters")
+    if unpaired:
+        raise Unreadable(f"{prefix}: {what} {'hold' if plural else 'holds'} an unpaired surrogate")
+
+
+def load_json_bounded(raw: bytes, prefix: str, what: str, plural: bool = False):
+    """JSON read under the raw-text limits, with no other change of meaning (list mode's documents)."""
+    check_json_limits(raw, prefix, what, plural)
+    try:
+        return json.loads(raw)
+    except RecursionError as exc:
+        raise Unreadable(f"{prefix}: {what} {'nest' if plural else 'nests'} too deeply to read") from exc
+    except ValueError as exc:
+        raise NotJson(f"{prefix}: {what} {'are' if plural else 'is'} not JSON") from exc
+
+
 def strict_json(raw: bytes, prefix: str, what: str, plural: bool = False, floats: bool = False):
     """Parse JSON the way the Go checker does: a repeated key, at any level, and a non-integer number are refused.
 
@@ -1175,19 +1232,7 @@ def strict_json(raw: bytes, prefix: str, what: str, plural: bool = False, floats
     def refuse(text):
         raise Fail(f"{prefix}: {what} {'hold' if plural else 'holds'} the number {text}, which is not an integer")
 
-    try:
-        text = raw.decode(json.detect_encoding(raw), "surrogatepass")
-    except (UnicodeDecodeError, LookupError):
-        text = None  # not decodable: the parse below says so
-    if text is not None:
-        deepest, longest, unpaired = json_shape(text)
-        if deepest > JSON_MAX_DEPTH:
-            raise Unreadable(f"{prefix}: {what} {'nest' if plural else 'nests'} too deeply to read")
-        if longest > JSON_MAX_NUMBER_CHARS:
-            raise Unreadable(f"{prefix}: {what} {'hold' if plural else 'holds'} a number literal of more than "
-                             f"{JSON_MAX_NUMBER_CHARS} characters")
-        if unpaired:
-            raise Unreadable(f"{prefix}: {what} {'hold' if plural else 'holds'} an unpaired surrogate")
+    check_json_limits(raw, prefix, what, plural)
     try:
         return json.loads(raw, object_pairs_hook=pairs, parse_float=float if floats else refuse, parse_constant=refuse)
     except RecursionError as exc:
@@ -2047,9 +2092,10 @@ def main() -> int:
         if a.origin:
             answers, peer_spki = fetch_origin(a.origin, ["/room/attestation", "/room/hotel-key-install-key"])
             need(answers[0][0] == 200, f"GET /room/attestation answered {answers[0][0]}")
-            att = json.loads(answers[0][1])
-            install_doc = json.loads(answers[1][1]) if answers[1][0] == 200 else None
-            doc = json.load(open(a.receipts)) if a.receipts else []
+            att = load_json_bounded(answers[0][1], "inputs", "the attestation answer")
+            install_doc = (load_json_bounded(answers[1][1], "inputs", "the install key answer")
+                           if answers[1][0] == 200 else None)
+            doc = read_document(a.receipts, "receipts file") if a.receipts else []
         elif a.broker:
             key = open(a.key_file).read().strip()
             att = get(f"{a.broker}/v1/hotels/{a.hotel}/attestation", key)
@@ -2062,8 +2108,11 @@ def main() -> int:
                 json.dump(att, open(os.path.join(a.save, "attestation.json"), "w"), indent=1)
                 json.dump(doc, open(os.path.join(a.save, "receipts.json"), "w"), indent=1)
         else:
-            att = json.load(open(a.attestation))
-            doc = json.load(open(a.receipts)) if a.receipts else []
+            att = read_document(a.attestation, "attestation file")
+            doc = read_document(a.receipts, "receipts file") if a.receipts else []
+        check_attestation_shape(att)
+        need(isinstance(doc, (list, dict)), "the receipts document is not a list or an object with receipts")
+        need(isinstance(doc, list) or "receipts" in doc, "the receipts document has no receipts")
         receipts = doc["receipts"] if isinstance(doc, dict) else doc
         # A guest's chain from the broker is filtered to its own rooms, so it
         # has gaps by design: check each receipt, not a whole chain to the head.
@@ -2072,7 +2121,12 @@ def main() -> int:
         need(isinstance(receipts, list), "the receipts are not a list")
         for h in a.receipt_header:
             try:
-                receipts.append(json.loads(base64.urlsafe_b64decode(h + "=" * (-len(h) % 4))))
+                header = base64.urlsafe_b64decode(h + "=" * (-len(h) % 4))
+                receipts.append(load_json_bounded(header, "inputs", "a receipt header"))
+            except NotJson as exc:
+                raise Fail("--receipt-header is not base64url JSON") from exc
+            except Unreadable:
+                raise
             except ValueError as exc:
                 raise Fail("--receipt-header is not base64url JSON") from exc
         check_receipt_shapes(receipts)
@@ -2174,10 +2228,10 @@ def main() -> int:
     except Fail as exc:
         print(json.dumps({"verdict": "FAIL", "reason": str(exc)}))
         return 1
-    except (KeyError, TypeError, AttributeError, IndexError):
-        # A member of the wrong type that no check named: a refusal, never a traceback.
-        print(json.dumps({"verdict": "FAIL", "reason": "a receipt or the attestation has a member of the wrong "
-                                                         "type or shape"}))
+    except (KeyError, TypeError, AttributeError, IndexError) as exc:
+        # Reading and shaping of every input is checked above and ends in a named reason. What reaches here is a
+        # defect of this program, and it says so. MemoryError, SystemExit and KeyboardInterrupt are not caught.
+        print(json.dumps({"verdict": "FAIL", "reason": f"internal error: {type(exc).__name__}"}))
         return 1
 
 
