@@ -263,7 +263,19 @@ read-write when its create has `"workspace": "<name>"` (or
   (`CATHEDRAL_WORKSPACE_HELPER_IMAGE`, default `alpine:3.20`) under the room
   runtime, with no network. The API never follows a path inside a workspace.
 - Limits: `CATHEDRAL_WORKSPACE_MAX_PER_OWNER` (default 10) and
-  `CATHEDRAL_WORKSPACE_MAX_VERSIONS` (default 20). There is no byte quota yet.
+  `CATHEDRAL_WORKSPACE_MAX_VERSIONS` (default 20). Bytes:
+  `ROOM_WORKSPACE_MAX_BYTES` (default 10 GiB) caps each workspace's data
+  (what rooms write) with an xfs project quota. A write past it fails with
+  ENOSPC in the room. Versions are copies of the data, bounded by the version
+  count. The workspace volume must be xfs with `prjquota`, or workspaces are
+  off (503 `workspaces_unavailable`). A workspace made before the quota
+  mounts uncapped (the API cannot re-tag files rooms made as root) and the
+  API logs it.
+- Room `/work`: each room's directory is capped at its `disk_gib` with an xfs
+  project quota, set before the room starts (`CATHEDRAL_SANDBOX_WORK_QUOTA=1`).
+  A room that fills `/work` gets ENOSPC. A create whose cap cannot be set
+  fails 503 `work_quota_unavailable`. The API unit holds `CAP_SYS_ADMIN` for
+  this only.
 - Sealed hotels: off by default. `SEALED_ROOM_WORKSPACES=1` in `sealed.env`
   turns them on. Without a data disk the workspaces are on the dm-crypt
   scratch whose key is made at boot in guest memory, so a workspace lives

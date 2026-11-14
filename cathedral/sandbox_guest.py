@@ -60,6 +60,7 @@ from cathedral.start_commands import (
     start_command_sha256,
 )
 from cathedral.sandbox_workspaces import WorkspaceStore
+from cathedral.sandbox_quota import GIB, ROOM_IDS, QuotaUnavailable, XfsProjectQuota, pick_id
 from cathedral.sandbox_owner import owner_hash, owner_id
 from cathedral.sandbox_provider import (
     InMemorySandboxProvider,
@@ -1322,6 +1323,13 @@ class DockerGuestProvider:
         self._egress = EgressClient.from_env()
         # Persistent workspaces (#305). None: CATHEDRAL_WORKSPACE_ROOT is unset.
         self._workspaces = WorkspaceStore.from_env(self._client)
+        # Byte quota on each room's directory, so /work cannot fill the data
+        # volume (AB#396). The kit turns it on; the create fails without it.
+        self._work_quota = (
+            XfsProjectQuota() if os.environ.get("CATHEDRAL_SANDBOX_WORK_QUOTA", "").strip() == "1" else None
+        )
+        self._work_quota_ids: dict[str, tuple[int, Path]] = {}  # sandbox_id -> (project id, base dir)
+        self._work_quota_lock = threading.Lock()
         # Per-guest image ownership (AB#650 Gate S.1). Fail closed when metadata
         # is missing: a local image with no grant cannot start.
         self._image_owners = ImageOwnerStore()
@@ -1971,6 +1979,7 @@ class DockerGuestProvider:
             self._image_owners.require(run_image, effective_owner)
         room_tunables = self._tunables_for(request, image, dind)
         work = Path(self._inner._sandboxes[sandbox_id].root) / "work"  # noqa: SLF001
+        self._limit_work(sandbox_id, work.parent, request.resources.disk_gib)
         name = f"cathedral-{sandbox_id}"
         entrypoint, image_default, start_command = self._resolve_start(
             request, dind=dind, inspected=inspected,
@@ -2060,6 +2069,46 @@ class DockerGuestProvider:
             prime = "done" if self._client.prime_image(image) else "failed"
         view = room_view(request.tunables, runtime=runtime, runtime_args=args, image_prime=prime)
         return runtime, docker_run_args(request.tunables), view
+
+    def _limit_work(self, sandbox_id: str, room_dir: Path, disk_gib: int) -> None:
+        """Cap the room's directory (its /work and its resolv.conf) at disk_gib.
+
+        Before the container starts, so no write escapes it. A room that writes
+        past the cap gets ENOSPC. disk_gib 0 sets no cap, as for the overlay
+        root. A cap that cannot be set fails the create: a room with no cap
+        can fill the hotel's data volume.
+        """
+        if self._work_quota is None or disk_gib <= 0:
+            return
+        with self._work_quota_lock:
+            in_use = {pid for pid, _ in self._work_quota_ids.values()}
+            project = pick_id(ROOM_IDS, in_use, seed=sandbox_id.removeprefix("sbx_"))
+            self._work_quota_ids[sandbox_id] = (project, room_dir.parent)
+        try:
+            self._work_quota.assign(room_dir, project, int(disk_gib) * GIB)
+        except QuotaUnavailable as exc:
+            with self._work_quota_lock:
+                self._work_quota_ids.pop(sandbox_id, None)
+            raise SandboxOpError(
+                "work_quota_unavailable",
+                503,
+                f"the hotel could not cap this room's /work: {exc}; nothing started",
+                retry_after=30,
+            ) from None
+
+    def _finish_delete(self, sandbox_id: str) -> None:
+        """Drop the record (and its directory), then the room's /work cap."""
+        self._inner.finish_delete(sandbox_id)
+        with self._work_quota_lock:
+            held = self._work_quota_ids.pop(sandbox_id, None)
+        if held is None or self._work_quota is None:
+            return
+        try:
+            self._work_quota.clear(held[1], held[0])
+        except QuotaUnavailable as exc:
+            # The directory is gone, so the id charges nothing; only a stale
+            # limit record stays.
+            print(f"cathedral-sandbox quota: clear for {sandbox_id} failed: {exc}", file=sys.stderr, flush=True)
 
     def _release_pending(self, sandbox_id: str) -> None:
         with self._doomed_lock:
@@ -2666,7 +2715,7 @@ class DockerGuestProvider:
         if guest is None:
             cid = self._find_labeled_container(sandbox_id)
             if cid is None:
-                self._inner.finish_delete(sandbox_id)
+                self._finish_delete(sandbox_id)
                 return True
             with self._doomed_lock:
                 self._doomed[sandbox_id] = cid
@@ -2692,7 +2741,7 @@ class DockerGuestProvider:
             self._net_pool.release(network)
         if workspace is not None:
             self._release_workspace(sandbox_id, workspace)
-        self._inner.finish_delete(sandbox_id)
+        self._finish_delete(sandbox_id)
 
     def _release_workspace(self, sandbox_id: str, workspace: tuple[str, str, str, bool]) -> None:
         """The room container is gone: free the workspace, then version it if asked.
