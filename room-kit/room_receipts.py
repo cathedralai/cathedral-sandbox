@@ -2218,13 +2218,6 @@ class Ledger:
         with self.lock:
             self.captures.pop(token, None)
 
-    def forget_snapshot(self, snapshot_id: str, receipt_sha256: str) -> None:
-        """Drop the entry only if it is still the one a fork was admitted against (a replacement stays)."""
-        with self.lock:
-            held = self.snapshots.get(snapshot_id)
-            if held is not None and held["receipt_sha256"] == receipt_sha256:
-                del self.snapshots[snapshot_id]
-
     def sign_snapshot(self, fields: dict, refused: dict, record: dict, token: int = 0) -> tuple[dict, bool]:
         """Sign a snapshot receipt and remember the snapshot, in one locked step: (receipt, signed).
 
@@ -2870,9 +2863,6 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:  # noqa: BLE001 the action ran: answer, and say the receipt is missing
                     traceback.print_exc()
                     extra["X-Room-Receipt-Error"] = type(exc).__name__
-                if fork is not None and status == 404 and self.machine_error_code(out) == "snapshot_not_found":
-                    # The machine no longer has it (expiry, its own delete): stop offering it.
-                    ledger.forget_snapshot(fork["snapshot_id"], fork["receipt_sha256"])
                 if action == "create" and 200 <= status < 300 and ledger.sealed_env is not None:
                     # A create answered again for a room the API kept moves its incarnation: an
                     # overlay set under the old one comes off before the room is used again.
@@ -2926,14 +2916,6 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, b'{"state":"running"}', {EXEC_STATE_HEADER: "running"})
         # The bytes and receipt of the original answer, so its result_sha256 still checks. Not signed again.
         return self.reply(e.status, e.body, {**e.headers, EXEC_STATE_HEADER: "done"}, e.ctype)
-
-    @staticmethod
-    def machine_error_code(out: bytes) -> str | None:
-        try:
-            code = json.loads(out)["error"]["code"]
-        except (ValueError, TypeError, KeyError, RecursionError):
-            return None
-        return code if isinstance(code, str) else None
 
     @staticmethod
     def fork_snapshot_id(body: bytes | None) -> str | None:
