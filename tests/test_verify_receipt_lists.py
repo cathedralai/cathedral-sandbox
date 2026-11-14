@@ -1682,7 +1682,7 @@ def test_a_sequence_that_is_not_an_integer_is_refused_with_a_reason_in_both_mode
 
 
 def test_the_reviewers_input_a_fractional_first_sequence_with_a_wrong_predecessor_fails_in_run_mode(tmp_path) -> None:
-    code, out, err = _run_mode_resigned(
+    code, out, _err = _run_mode_resigned(
         tmp_path, 0, lambda st: st.update(sequence=1.5, previous_receipt_sha256="wrong"))
     assert code == 1 and out == {"verdict": "FAIL",
                                  "reason": "check 1: receipt 1 of the list: sequence is not an integer"}
@@ -1774,7 +1774,7 @@ def test_list_mode_refuses_an_attestation_file_over_a_limit_with_that_limit(limi
 
 
 def test_a_deep_policy_in_a_small_receipt_is_refused_before_anything_is_printed(tmp_path) -> None:
-    code, out, err = _list_mode_raw(tmp_path, _doc_with(b'{"allow": ' + b"[" * 13000 + b"]" * 13000 + b"}"))
+    code, out, _err = _list_mode_raw(tmp_path, _doc_with(b'{"allow": ' + b"[" * 13000 + b"]" * 13000 + b"}"))
     assert code == 1 and out["reason"] == "inputs: the receipts file nests too deeply to read"
 
 
