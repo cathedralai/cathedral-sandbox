@@ -1486,6 +1486,13 @@ def build_form_rules():
            "recipe: an output max_bytes must be at least 1"),
           ("negative", _outs({"path": "/work/out/x", "max_bytes": -1, "optional": False}),
            "recipe: an output max_bytes must be at least 1")]),
+        ("ttl_is_timeout_plus_margin", {"truth_edit": lambda r: r["create"].update(ttl_seconds=660)}, [
+            ("one_second_short", {"truth_edit": lambda r: r["create"].update(ttl_seconds=659)},
+             "recipe: create.ttl_seconds must be timeout_seconds + 600"),
+            ("one_second_over", {"truth_edit": lambda r: r["create"].update(ttl_seconds=661)},
+             "recipe: create.ttl_seconds must be timeout_seconds + 600"),
+            ("the_old_value", {"truth_edit": lambda r: r["create"].update(ttl_seconds=300)},
+             "recipe: create.ttl_seconds must be timeout_seconds + 600")]),
         ("max_spend_integer", _knobs(max_spend_usd=1), []),
         ("max_spend_small_decimal", _knobs(max_spend_usd="0.000001"), []),
         ("max_spend_long_decimal", _knobs(max_spend_usd="100.123456"), []),
