@@ -227,16 +227,25 @@ answers 200 with the receipt. Any other result signs the claim with its status,
 breaks the room (delete only) and answers 409 `pool_claim_failed`: one try per
 room. The same id claiming again gets the stored answer and receipt; another id
 gets 409 `pool_room_claimed`. A delete meanwhile gets 409 `room_busy`.
-While any claim is in flight, a bulk delete by label is refused before it
-reaches the API with 409 `bulk_delete_claim_busy`. A claim arriving during a
-bulk delete gets 409 `pool_bulk_delete_busy` before its lifetime call. Both
-requests can be retried when the other finishes.
+A bulk delete by label names no room until the API runs it, so it never runs
+beside a claim. One that arrives while a claim is in flight waits for the
+claim to end, for at most 15 seconds (the lifetime call's own 10 second wait
+plus 5), then runs. If a claim is still in flight after that, the bulk delete
+is answered 409 `bulk_delete_claim_busy`, not forwarded, and a line goes to
+stderr. A caller that leaves while its bulk delete waits ends the wait and
+nothing is forwarded. While a bulk delete is waiting or running, a new claim
+is refused with 409 `pool_bulk_delete_busy` before its lifetime call, so the
+wait cannot be starved, and the API then creates a cold room. A claim for a
+room that is already claimed by the same sandbox id is answered from the stored
+answer and receipt at any time. A bulk delete can run for as long as the API
+takes, and every new claim in that time falls back to a cold create.
 Other refusals: 405 for any method but POST (checked before the gate), 400 `claim_request_invalid`, 409
 `pool_room_stale`, `pool_room_gone`, `room_not_pool`, `pool_room_used`,
 `pool_room_expiring`.
 
-Limit: a bulk delete by label names no room, so one in flight blocks claims
-for every room, even if its label would not match that room. A room it removes ends with a
+Limit: a bulk delete by label names no room, so while one waits or runs it
+refuses new claims for every room, even if its label would not match that
+room. A room it removes ends with a
 `room_end` receipt at a later look, and any create whose pending time it
 overlaps gets no `pool` flag.
 
