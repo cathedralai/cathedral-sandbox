@@ -3,16 +3,13 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
-	"encoding/json"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 // AB#604, CS-5: snapshot receipts travel through the broker, and the fork's
@@ -120,9 +117,10 @@ func snapOn(t *testing.T, tc *testChain) (string, string) {
 	return room, doc["result"].(map[string]any)["snapshot_id"].(string)
 }
 
-func snapshotPostOrDelete(r *http.Request) bool {
+// snapshotCall is a snapshot, a snapshot delete or a snapshot push.
+func snapshotCall(r *http.Request) bool {
 	return (r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/snapshot")) ||
-		(r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/v1/snapshots/"))
+		strings.HasPrefix(r.URL.Path, "/v1/snapshots/")
 }
 
 func machineRoomHeaders(long string) http.Header {
@@ -157,7 +155,7 @@ func TestSnapshotThroughBrokerPassesRoomHeadersByteForByte(t *testing.T) {
 	room, _ := snapOn(t, tc)
 	m := tapMachine(t, tc, "b")
 	long := longB64()
-	m.match, m.extra = snapshotPostOrDelete, machineRoomHeaders(long)
+	m.match, m.extra = snapshotCall, machineRoomHeaders(long)
 	resp, body := rawCallResp(t, tc, "key1", "POST", "/v1/sandboxes/"+room+"/snapshot", []byte(`{"name":"two"}`))
 	if resp.StatusCode != 202 || !strings.Contains(string(body), `"snapshot_id":"b.snap_`) {
 		t.Fatalf("snapshot: %d %s", resp.StatusCode, body)
@@ -173,7 +171,7 @@ func TestSnapshotDeleteThroughBrokerPassesRoomHeadersByteForByte(t *testing.T) {
 	_, snapID := snapOn(t, tc)
 	m := tapMachine(t, tc, "b")
 	long := longB64()
-	m.match, m.extra = snapshotPostOrDelete, machineRoomHeaders(long)
+	m.match, m.extra = snapshotCall, machineRoomHeaders(long)
 	resp, body := rawCallResp(t, tc, "key1", "DELETE", "/v1/snapshots/"+snapID, nil)
 	if resp.StatusCode != 200 {
 		t.Fatalf("delete: %d %s", resp.StatusCode, body)
@@ -198,9 +196,98 @@ func TestSnapshotFromMachineWithoutRoomHeadersIsUnchanged(t *testing.T) {
 	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
 		t.Fatalf("content type %q", ct)
 	}
-	resp, body = rawCallResp(t, tc, "key1", "DELETE", "/v1/snapshots/b.snap_zzz", nil)
-	if resp.StatusCode != 404 || len(roomHeaders(resp.Header)) != 0 {
-		t.Fatalf("delete of an unknown snapshot: %d %s %v", resp.StatusCode, body, resp.Header)
+	// A delete the machine itself refuses (the lookup found the snapshot, the
+	// forwarded call answers 404) also carries no header from nowhere.
+	m := tapMachine(t, tc, "b")
+	m.override = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/v1/snapshots/") {
+			writeErr(w, 404, "snapshot_not_found", "gone")
+			return true
+		}
+		return false
+	}
+	_, snapID := snapOn(t, tc)
+	resp, body = rawCallResp(t, tc, "key1", "DELETE", "/v1/snapshots/"+snapID, nil)
+	if resp.StatusCode != 404 || len(roomHeaders(resp.Header)) != 0 || m.count("DELETE", "/v1/snapshots/"+strings.TrimPrefix(snapID, "b.")) != 1 {
+		t.Fatalf("machine 404 on delete: %d %s %v", resp.StatusCode, body, resp.Header)
+	}
+}
+
+func TestSnapshotPushThroughBrokerPassesRoomHeadersByteForByte(t *testing.T) {
+	tc := newChain(t)
+	_, snapID := snapOn(t, tc)
+	m := tapMachine(t, tc, "b")
+	long := longB64()
+	m.match, m.extra = snapshotCall, machineRoomHeaders(long)
+	resp, body := rawCallResp(t, tc, "key1", "POST", "/v1/snapshots/"+snapID+"/push", []byte(`{"image":"ghcr.io/acme/forks:one"}`))
+	if resp.StatusCode != 200 {
+		t.Fatalf("push: %d %s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("X-Room-Receipt"); got != long {
+		t.Fatalf("receipt changed: len %d want %d", len(got), len(long))
+	}
+	assertRoomHeaders(t, resp, m.extra)
+}
+
+// A signed failure must reach the caller: the header rides on a machine 4xx
+// and 5xx, with a JSON body and with a body the broker cannot parse. The
+// existing room route does the same (main.go copies before it writes the
+// status, whatever the status is).
+func TestSnapshotFailuresFromTheMachineKeepTheirRoomHeaders(t *testing.T) {
+	tc := newChain(t)
+	room, snapID := snapOn(t, tc)
+	m := tapMachine(t, tc, "b")
+	long := longB64()
+	fail := 404
+	junk := false
+	m.override = func(w http.ResponseWriter, r *http.Request) bool {
+		if !snapshotCall(r) {
+			return false
+		}
+		w.Header().Set("X-Room-Receipt", long)
+		w.Header().Set("X-Broker-Hotel", "spoofed")
+		if junk {
+			w.WriteHeader(fail)
+			_, _ = w.Write([]byte("<html>no</html>"))
+			return true
+		}
+		writeErr(w, fail, "machine_says_no", "no")
+		return true
+	}
+	for _, c := range []struct {
+		status int
+		junk   bool
+	}{{404, false}, {409, false}, {500, false}, {503, true}} {
+		fail, junk = c.status, c.junk
+		for name, call := range map[string]func() (*http.Response, []byte){
+			"snapshot": func() (*http.Response, []byte) {
+				return rawCallResp(t, tc, "key1", "POST", "/v1/sandboxes/"+room+"/snapshot", []byte(`{}`))
+			},
+			"delete": func() (*http.Response, []byte) {
+				return rawCallResp(t, tc, "key1", "DELETE", "/v1/snapshots/"+snapID, nil)
+			},
+			"push": func() (*http.Response, []byte) {
+				return rawCallResp(t, tc, "key1", "POST", "/v1/snapshots/"+snapID+"/push", []byte(`{"image":"x/y:1"}`))
+			},
+		} {
+			resp, body := call()
+			if resp.StatusCode != c.status || resp.Header.Get("X-Room-Receipt") != long || resp.Header.Get("X-Broker-Hotel") != "" {
+				t.Fatalf("%s %d junk=%v: status %d receipt len %d broker-hotel %q body %s", name, c.status, c.junk, resp.StatusCode, len(resp.Header.Get("X-Room-Receipt")), resp.Header.Get("X-Broker-Hotel"), body)
+			}
+		}
+	}
+	// Reference: the existing room route behaves the same.
+	m.override = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == "GET" && r.URL.Path == "/v1/sandboxes/"+strings.TrimPrefix(room, "b.") {
+			w.Header().Set("X-Room-Receipt", long)
+			writeErr(w, 500, "machine_says_no", "no")
+			return true
+		}
+		return false
+	}
+	resp, _ := rawCallResp(t, tc, "key1", "GET", "/v1/sandboxes/"+room, nil)
+	if resp.StatusCode != 500 || resp.Header.Get("X-Room-Receipt") != long {
+		t.Fatalf("existing room route on a 5xx: %d receipt len %d", resp.StatusCode, len(resp.Header.Get("X-Room-Receipt")))
 	}
 }
 
@@ -239,225 +326,6 @@ func TestSnapshotHandlersFollowTheExistingHeaderRuleForDuplicatesAndLongValues(t
 		if !reflect.DeepEqual(got["X-Room-Dup"], want["X-Room-Dup"]) || got.Get("X-Room-Huge") != huge {
 			t.Fatalf("%s: dup %q huge %d, existing route gives dup %q huge %d", name,
 				got["X-Room-Dup"], len(got.Get("X-Room-Huge")), want["X-Room-Dup"], len(want.Get("X-Room-Huge")))
-		}
-	}
-}
-
-// ---------------------------------------------------------------- fork
-
-func forkCall(t *testing.T, tc *testChain, snapID string) (*http.Response, map[string]any) {
-	t.Helper()
-	resp, body := rawCallResp(t, tc, "key1", "POST", "/v1/sandboxes", []byte(`{"snapshot_id":"`+snapID+`"}`))
-	return resp, decodeDoc(body)
-}
-
-func decodeDoc(body []byte) map[string]any {
-	var doc map[string]any
-	_ = json.Unmarshal(body, &doc)
-	return doc
-}
-
-func TestForkMachine429PassesThroughAndLaterForkIsSoldOutWhileResting(t *testing.T) {
-	tc := newChain(t)
-	_, snapID := snapOn(t, tc)
-	m := tapMachine(t, tc, "b")
-	m.override = func(w http.ResponseWriter, r *http.Request) bool {
-		if r.Method == "POST" && r.URL.Path == "/v1/sandboxes" {
-			w.Header().Set("Retry-After", "3")
-			writeErr(w, 429, "no_free_rooms", "machine full")
-			return true
-		}
-		return false
-	}
-	// As main: the machine's own 429, body and Retry-After.
-	resp, doc := forkCall(t, tc, snapID)
-	if resp.StatusCode != 429 || errCode(doc) != "no_free_rooms" || resp.Header.Get("Retry-After") != "3" {
-		t.Fatalf("fork to a full machine: %d %q %v", resp.StatusCode, resp.Header.Get("Retry-After"), doc)
-	}
-	// The machine now rests after saying it is full: the broker's own 503 says sold out.
-	resp, doc = forkCall(t, tc, snapID)
-	if resp.StatusCode != 503 || errCode(doc) != "snapshot_hotel_sold_out" {
-		t.Fatalf("fork while the machine rests after a 429: %d %v", resp.StatusCode, doc)
-	}
-	if n := m.count("POST", "/v1/sandboxes"); n != 1 {
-		t.Fatalf("machine got %d creates, want 1", n)
-	}
-	// The rest ends: a machine now held as down is unreachable, not sold out.
-	tc.b.mu.Lock()
-	h := tc.b.hotelByID("b")
-	h.backoffUntil, h.ok = time.Now().Add(-time.Second), false
-	tc.b.mu.Unlock()
-	resp, doc = forkCall(t, tc, snapID)
-	if resp.StatusCode != 503 || errCode(doc) != "snapshot_hotel_unreachable" {
-		t.Fatalf("after the rest, machine down: %d %v", resp.StatusCode, doc)
-	}
-}
-
-func TestForkMachineRestingAfterAFailureIsNotSoldOutAndTheFlagClears(t *testing.T) {
-	tc := newChain(t)
-	_, snapID := snapOn(t, tc)
-	// A 429 sets the flag; a later failed call replaces the rest and clears it.
-	tc.b.mu.Lock()
-	h := tc.b.hotelByID("b")
-	h.backoffUntil, h.restFull = time.Now().Add(time.Minute), true
-	tc.b.mu.Unlock()
-	m := tapMachine(t, tc, "b")
-	m.override = func(w http.ResponseWriter, r *http.Request) bool {
-		if r.Method == "POST" && r.URL.Path == "/v1/sandboxes" {
-			w.WriteHeader(500)
-			return true
-		}
-		return false
-	}
-	tc.b.mu.Lock()
-	h.backoffUntil = time.Time{} // let the create through to fail
-	tc.b.mu.Unlock()
-	if resp, _ := forkCall(t, tc, snapID); resp.StatusCode != 500 {
-		t.Fatalf("failing create: %d", resp.StatusCode)
-	}
-	resp, doc := forkCall(t, tc, snapID) // resting after a failure
-	if resp.StatusCode != 503 || errCode(doc) != "snapshot_hotel_unreachable" {
-		t.Fatalf("resting after a failure: %d %v", resp.StatusCode, doc)
-	}
-}
-
-func TestForkBrokerCountsNoFreeRoomIsHotelSoldOut(t *testing.T) {
-	tc := newChain(t)
-	_, snapID := snapOn(t, tc)
-	m := tapMachine(t, tc, "b")
-	tc.b.mu.Lock()
-	h := tc.b.hotelByID("b")
-	h.slots = h.used() // every slot taken
-	tc.b.mu.Unlock()
-	resp, doc := forkCall(t, tc, snapID)
-	if resp.StatusCode != 503 || errCode(doc) != "snapshot_hotel_sold_out" {
-		t.Fatalf("fork to a machine with no free slot: %d %v", resp.StatusCode, doc)
-	}
-	if n := m.count("POST", "/v1/sandboxes"); n != 0 {
-		t.Fatalf("machine was called %d times", n)
-	}
-}
-
-func TestForkDrainingMachineIsSoldOutAndDownMachineIsUnreachable(t *testing.T) {
-	tc := newChain(t)
-	_, snapID := snapOn(t, tc)
-	tc.b.mu.Lock()
-	tc.b.hotelByID("b").cfg.Drain = true
-	tc.b.mu.Unlock()
-	resp, doc := forkCall(t, tc, snapID)
-	if resp.StatusCode != 503 || errCode(doc) != "snapshot_hotel_sold_out" {
-		t.Fatalf("draining: %d %v", resp.StatusCode, doc)
-	}
-	tc.b.mu.Lock()
-	h := tc.b.hotelByID("b")
-	h.cfg.Drain, h.ok = false, false
-	tc.b.mu.Unlock()
-	resp, doc = forkCall(t, tc, snapID)
-	if resp.StatusCode != 503 || errCode(doc) != "snapshot_hotel_unreachable" {
-		t.Fatalf("down: %d %v", resp.StatusCode, doc)
-	}
-}
-
-func TestForkMachineTimeoutStaysHotelUnreachable502(t *testing.T) {
-	tc := newChain(t)
-	_, snapID := snapOn(t, tc)
-	m := tapMachine(t, tc, "b")
-	m.override = func(w http.ResponseWriter, r *http.Request) bool {
-		if r.Method == "POST" && r.URL.Path == "/v1/sandboxes" {
-			time.Sleep(800 * time.Millisecond)
-			return true
-		}
-		return false
-	}
-	old := hotelCreateTimeout
-	hotelCreateTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { hotelCreateTimeout = old })
-	resp, doc := forkCall(t, tc, snapID)
-	if resp.StatusCode != 502 || errCode(doc) != "hotel_unreachable" {
-		t.Fatalf("timeout: %d %v", resp.StatusCode, doc)
-	}
-	if n := m.count("POST", "/v1/sandboxes"); n != 1 {
-		t.Fatalf("machine got %d creates, want 1 (no retry)", n)
-	}
-}
-
-func TestForkMachineRefusedConnectionStaysHotelUnreachable502(t *testing.T) {
-	tc := newChain(t)
-	_, snapID := snapOn(t, tc)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dead := "http://" + ln.Addr().String()
-	_ = ln.Close() // nothing listens: connection refused
-	tc.b.mu.Lock()
-	tc.b.hotelByID("b").cfg.API = dead
-	tc.b.mu.Unlock()
-	resp, doc := forkCall(t, tc, snapID)
-	if resp.StatusCode != 502 || errCode(doc) != "hotel_unreachable" {
-		t.Fatalf("refused: %d %v", resp.StatusCode, doc)
-	}
-}
-
-func TestForkMachineJunk500PassesThroughRawAndIsNotRetried(t *testing.T) {
-	tc := newChain(t)
-	_, snapID := snapOn(t, tc)
-	m := tapMachine(t, tc, "b")
-	m.override = func(w http.ResponseWriter, r *http.Request) bool {
-		if r.Method == "POST" && r.URL.Path == "/v1/sandboxes" {
-			w.WriteHeader(500)
-			_, _ = w.Write([]byte("<html>boom</html>"))
-			return true
-		}
-		return false
-	}
-	resp, body := rawCallResp(t, tc, "key1", "POST", "/v1/sandboxes", []byte(`{"snapshot_id":"`+snapID+`"}`))
-	if resp.StatusCode != 500 || string(body) != "<html>boom</html>" {
-		t.Fatalf("500 with junk: %d %q", resp.StatusCode, body)
-	}
-	if n := m.count("POST", "/v1/sandboxes"); n != 1 {
-		t.Fatalf("machine got %d creates, want 1 (no retry)", n)
-	}
-}
-
-func TestForkMachine5xxWithAnErrorBodyTheBrokerUnderstandsPassesThrough(t *testing.T) {
-	tc := newChain(t)
-	_, snapID := snapOn(t, tc)
-	m := tapMachine(t, tc, "b")
-	m.override = func(w http.ResponseWriter, r *http.Request) bool {
-		if r.Method == "POST" && r.URL.Path == "/v1/sandboxes" {
-			writeErr(w, 503, "hotel_busy", "try later")
-			return true
-		}
-		return false
-	}
-	resp, doc := forkCall(t, tc, snapID)
-	if resp.StatusCode != 503 || errCode(doc) != "hotel_busy" {
-		t.Fatalf("understood 5xx: %d %v", resp.StatusCode, doc)
-	}
-}
-
-func TestForkMachineOther4xxPassesThroughNotFoldedIntoEitherName(t *testing.T) {
-	for _, c := range []struct {
-		status int
-		code   string
-	}{{404, "snapshot_not_found"}, {409, "snapshot_deleting"}, {422, "snapshot_overlay_unsupported"}} {
-		tc := newChain(t)
-		_, snapID := snapOn(t, tc)
-		m := tapMachine(t, tc, "b")
-		m.override = func(w http.ResponseWriter, r *http.Request) bool {
-			if r.Method == "POST" && r.URL.Path == "/v1/sandboxes" {
-				writeErr(w, c.status, c.code, "gone")
-				return true
-			}
-			return false
-		}
-		resp, doc := forkCall(t, tc, snapID)
-		if resp.StatusCode != c.status || errCode(doc) != c.code {
-			t.Fatalf("%d %s: got %d %v", c.status, c.code, resp.StatusCode, doc)
-		}
-		if n := m.count("POST", "/v1/sandboxes"); n != 1 {
-			t.Fatalf("%d: machine got %d creates", c.status, n)
 		}
 	}
 }

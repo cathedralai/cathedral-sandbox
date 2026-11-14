@@ -160,28 +160,10 @@ func (b *broker) noRoom(pl placement) createResult {
 			"the hotel that holds this workspace has no free room or does not answer; retry later")}
 	}
 	if pl.only != nil {
-		return b.snapshotNoRoom(pl.only)
+		return createResult{status: 503, header: http.Header{"Retry-After": {"5"}}, doc: errDoc("snapshot_hotel_unavailable",
+			"the hotel that holds this snapshot has no free room or does not answer; retry later, or push the snapshot to a registry and create from the image")}
 	}
 	return b.noRoomReason(pl)
-}
-
-// snapshotNoRoom is the 503 for a fork whose snapshot's hotel cannot be
-// picked. It names the broker's own reason: sold out when the hotel is up and
-// takes no new room (no free slot, draining, or resting after it answered 429),
-// unreachable otherwise (held as down, or resting after a failed call, or not
-// admitted yet). The status and Retry-After are the ones this answer always had.
-func (b *broker) snapshotNoRoom(h *hotel) createResult {
-	b.mu.Lock()
-	now := time.Now()
-	resting := now.Before(h.backoffUntil)
-	soldOut := h.ok && (h.drain() || (resting && h.restFull) ||
-		(!resting && b.admitted(h, now) && !b.awaitsRoomCheck(h) && b.freeFor(h) <= 0))
-	b.mu.Unlock()
-	code, msg := "snapshot_hotel_unreachable", "the hotel that holds this snapshot does not answer; retry later, or push the snapshot to a registry and create from the image"
-	if soldOut {
-		code, msg = "snapshot_hotel_sold_out", "the hotel that holds this snapshot has no free room; retry later, or push the snapshot to a registry and create from the image"
-	}
-	return createResult{status: 503, header: http.Header{"Retry-After": {"5"}}, doc: errDoc(code, msg)}
 }
 
 // noRoomReason distinguishes "hotels down" from "hotels full" so a dead hotel
