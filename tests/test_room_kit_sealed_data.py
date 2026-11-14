@@ -311,7 +311,7 @@ def test_a_blank_disk_gets_one_luks2_volume_with_xfs_mounted_safely(disk) -> Non
                 "--pbkdf pbkdf2", "--keyfile-size 32"):
         assert opt in fmt[0]
     assert disk.calls("mkfs.xfs") == [f"mkfs.xfs -f -q {disk.map}"]
-    assert disk.calls("mount") == [f"mount -t xfs -o nosuid,nodev,noexec,noatime {disk.map} {disk.mnt}"]
+    assert disk.calls("mount") == [f"mount -t xfs -o nosuid,nodev,noexec,noatime,prjquota {disk.map} {disk.mnt}"]
     assert json.loads((disk.state / "token").read_text())["fs"] == "xfs"
     assert (disk.mnt / "workspaces").is_dir() and (disk.mnt / "hotel").is_dir()
     assert oct((disk.mnt / "workspaces").stat().st_mode & 0o777) == "0o700"

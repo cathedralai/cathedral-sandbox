@@ -24,6 +24,8 @@ reference and is not treated as an isolation boundary.
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import os
 import shutil
 import signal
@@ -82,6 +84,23 @@ class SandboxOpError(Exception):
         self.code = code
         self.http_status = http_status
         self.retry_after = retry_after
+
+
+@contextlib.contextmanager
+def _disk_full_is_413(sandbox: "_Sandbox"):
+    """A write that hits the room's xfs cap (AB#396) or a full volume is a 413, not a 500.
+
+    The pre-check sums file sizes; the cap counts allocated blocks, so a write
+    that passed it can still run out.
+    """
+    try:
+        yield
+    except OSError as exc:
+        if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+            raise SandboxOpError(
+                "disk_quota_exceeded", 413, f"write would exceed disk_gib={sandbox.resources.disk_gib}"
+            ) from None
+        raise
 
 
 @dataclass
@@ -701,13 +720,14 @@ class InMemorySandboxProvider:
             self._touch(sandbox)
             self._assert_disk_room(sandbox, extra_bytes=len(data), replacing=path)
         self._host(sandbox, path)
-        fd = _open_beneath(sandbox.root, path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, make_dirs=True)
-        with os.fdopen(fd, "wb") as fh:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise SandboxOpError("not_a_file", 400, f"{path} is not a regular file")
-            fh.write(data)
-            if mode is not None:
-                os.fchmod(fd, mode)
+        with _disk_full_is_413(sandbox):
+            fd = _open_beneath(sandbox.root, path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, make_dirs=True)
+            with os.fdopen(fd, "wb") as fh:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise SandboxOpError("not_a_file", 400, f"{path} is not a regular file")
+                fh.write(data)
+                if mode is not None:
+                    os.fchmod(fd, mode)
 
     def read_file(self, sandbox_id: str, spec: FileGet) -> tuple[bytes, int]:
         with self._lock:
@@ -743,7 +763,7 @@ class InMemorySandboxProvider:
         target.mkdir(parents=True, exist_ok=True)
         import io
 
-        with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as tf:
+        with _disk_full_is_413(sandbox), tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as tf:
             _safe_extract(tf, target)
         with self._lock:
             sandbox = self._require_active(sandbox_id)

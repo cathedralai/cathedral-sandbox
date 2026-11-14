@@ -24,6 +24,7 @@ CATHEDRAL_ALLOW_PRIVILEGED_DIND=${ROOM_ALLOW_DIND:-0}
 CATHEDRAL_API_URL=http://127.0.0.1:$ROOM_API_PORT
 CATHEDRAL_SANDBOX_OWNER=$ROOM_ID
 CATHEDRAL_SANDBOX_SWEEP_STALE_BASES=1
+CATHEDRAL_SANDBOX_WORK_QUOTA=1
 CATHEDRAL_SANDBOX_PULL_POLICY=missing
 CATHEDRAL_SANDBOX_GC_PARALLELISM=${ROOM_GC_PARALLELISM:-16}
 ROOM_CREATES_PER_MINUTE=${ROOM_CREATES_PER_MINUTE:-100}
@@ -34,6 +35,8 @@ EOV
   # nosuid,nodev,noexec.
   if [ "${ROOM_WORKSPACES:-0}" = 1 ]; then
     echo "CATHEDRAL_WORKSPACE_ROOT=$ROOM_DATA_DIR/workspaces"
+    # Byte cap on each workspace data dir (AB#396).
+    echo "CATHEDRAL_WORKSPACE_MAX_BYTES=${ROOM_WORKSPACE_MAX_BYTES:-10737418240}"
     # Sealed data volume (sealed/README.md): let the API say in a workspace answer
     # whether it survives a restart, from the boot-time status sealed-data.sh wrote.
     if [ -n "${ROOM_WORKSPACES_SOURCE:-}" ]; then
