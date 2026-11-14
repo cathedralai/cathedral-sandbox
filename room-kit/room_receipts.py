@@ -2060,6 +2060,9 @@ class Ledger:
         # A bulk delete by label names no room, so it cannot be matched to a pending create. One that is in
         # flight at any moment while a create is pending withholds every flag (it sets overflow, at both ends).
         self.bulk_in_flight = 0
+        # A bulk delete does not name its rooms until the API runs it. Keep it and claims mutually exclusive so
+        # a delayed successful lifetime answer cannot hand over a room the bulk delete already removed.
+        self.claims_in_flight = 0
         # Pre-made rooms: pool maps an unclaimed room to its expires_at (epoch); claimed maps a claimed room to
         # (the sandbox id it was claimed for, the answer sent, the claim receipt) so a repeat gets the same answer.
         self.pool: dict[str, float] = {}
@@ -2120,6 +2123,8 @@ class Ledger:
         request. A busy room is refused at once, never waited on.
         """
         with self.lock:
+            if kind == "claim" and self.bulk_in_flight:
+                return None, (409, "pool_bulk_delete_busy", "a bulk delete is running; retry the claim")
             token = False
             if room in self.broken:
                 if kind != "delete":
@@ -2142,8 +2147,11 @@ class Ledger:
                 self._touch(room)
             if token:
                 self.busy.add(room)
+            if kind == "claim":
+                self.claims_in_flight += 1
             self.in_flight[room] = self.in_flight.get(room, 0) + 1
-            return Turn(room, token, len(self.by_room.get(room, [])), room in self.serial, nonread), None
+            return Turn(room, token, len(self.by_room.get(room, [])), room in self.serial, nonread,
+                        kind == "claim"), None
 
     def _touch(self, room: str) -> None:
         """Remember a non-read request for an id with no create receipt while a create is pending. Caller holds self.lock."""
@@ -2160,11 +2168,14 @@ class Ledger:
             if self.bulk_in_flight:
                 self.overflow = True
 
-    def begin_bulk(self) -> None:
+    def begin_bulk(self) -> bool:
         with self.lock:
+            if self.claims_in_flight:
+                return False
             self.bulk_in_flight += 1
             if self.creates_in_flight:
                 self.overflow = True
+            return True
 
     def end_bulk(self) -> None:
         with self.lock:
@@ -2183,6 +2194,8 @@ class Ledger:
         """End a turn: break a serial room that lost an answer or left an action unsigned, free the token, lower the count."""
         with self.lock:
             room = turn.room
+            if turn.claim:
+                self.claims_in_flight -= 1
             if turn.nonread:
                 self._touch(room)  # it may have run while a create was pending, though it entered before
             if turn.token and (room in self.serial or room in self.pool):
@@ -2450,12 +2463,13 @@ def parse_expires_at(value, now: float) -> float | None:
 class Turn:
     """One authorized request between Ledger.enter and Ledger.leave."""
 
-    __slots__ = ("room", "token", "receipts_before", "serial", "nonread", "called", "lost")
+    __slots__ = ("room", "token", "receipts_before", "serial", "nonread", "claim", "called", "lost")
 
     def __init__(self, room: str, token: bool, receipts_before: int, serial: bool = False,
-                 nonread: bool = False) -> None:
+                 nonread: bool = False, claim: bool = False) -> None:
         self.room, self.token, self.receipts_before, self.serial = room, token, receipts_before, serial
         self.nonread = nonread  # not a read: it may change the room
+        self.claim = claim
         self.called = False  # a request went to the API
         self.lost = False  # the API gave no answer
 
@@ -2710,7 +2724,9 @@ class Handler(BaseHTTPRequestHandler):
                 ledger.begin_create()
                 self.create_open = True
             elif action == "bulk_delete" and self.authorized():
-                ledger.begin_bulk()
+                if not ledger.begin_bulk():
+                    return self.reply(409, canonical({"error": {"code": "bulk_delete_claim_busy",
+                                                               "message": "a room claim is running; retry the bulk delete"}}))
                 self.bulk_open = True
             # Forward the canonical path (no ";params") so gate, receipt and API agree.
             status, headers, out = self.upstream(
