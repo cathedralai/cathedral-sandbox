@@ -18,7 +18,7 @@ import threading
 import time
 
 import pytest
-from room_front_support import AUTH, Front, assert_idle, finish, in_thread, receipt_of
+from room_front_support import AUTH, Front, assert_idle, finish, in_thread, receipt_of, rr
 
 SERIAL = {"image": "repo/app:1", "labels": {"cathedral_serial": "1"}}
 
@@ -154,6 +154,41 @@ def test_the_plain_heartbeat_and_lifetime_routes_are_refused(front) -> None:
         assert status == 409 and code(out) == "room_serial_unsigned", (method, path)
     assert len(front.api.seen) == seen
     assert_idle(front.ledger)
+
+
+def test_a_semicolon_alias_patch_cannot_bypass_the_serial_gate(front) -> None:
+    # AB#384: urlparse (API) strips ";alias"; urlsplit (old front) did not, so
+    # PATCH /v1/sandboxes/{id};alias skipped the serial token and mutated the room.
+    room = serial_room(front)
+    seen, before = len(front.api.seen), len(front.statements(room))
+    status, _headers, out = front.call("PATCH", f"/v1/sandboxes/{room};alias", {"labels": {"x": "y"}})
+    assert status == 409 and code(out) == "room_serial_unsigned"
+    assert len(front.api.seen) == seen
+    assert len(front.statements(room)) == before
+    assert_idle(front.ledger)
+
+
+def test_a_semicolon_alias_delete_names_the_real_room(front) -> None:
+    # DELETE with ";alias" must gate and sign under the real room id, not the alias spelling.
+    room = serial_room(front)
+    status, headers, _out = front.call("DELETE", f"/v1/sandboxes/{room};alias")
+    assert status == 200
+    statement = receipt_of(headers)["statement"]
+    assert statement["action"] == "delete"
+    assert statement["sandbox_id"] == room
+    assert ";alias" not in statement["target"]
+    assert room not in front.ledger.serial
+    assert all(";alias" not in (s.get("sandbox_id") or "") for s in front.statements(room))
+    assert_idle(front.ledger)
+
+
+def test_api_request_path_drops_semicolon_params() -> None:
+    path, forward = rr.api_request_path("/v1/sandboxes/sbx_1;alias?x=1")
+    assert path == "/v1/sandboxes/sbx_1"
+    assert forward == "/v1/sandboxes/sbx_1?x=1"
+    assert rr.room_of(path) == "sbx_1"
+    assert rr.room_of("/v1/sandboxes/sbx_1;alias") == "sbx_1;alias"  # callers must pass urlparse path
+    assert rr.route_kind("PATCH", path) == "other"
 
 
 @pytest.mark.parametrize("method,tail", [

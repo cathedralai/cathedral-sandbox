@@ -2290,7 +2290,12 @@ HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrad
 
 
 def room_of(path: str) -> str | None:
-    """The room id a request path names, or None for a path with no room."""
+    """The room id a request path names, or None for a path with no room.
+
+    *path* must be the API's path form (``urlparse(...).path``), which drops a
+    ``;params`` suffix. ``urlsplit`` keeps that suffix in the path and would
+    make ``sbx_1;alias`` look like another room (AB#384).
+    """
     m = ROOM_PATH.match(path)
     return m["id"] if m else None
 
@@ -2304,6 +2309,18 @@ def route_kind(method: str, path: str) -> str:
     if any(meth == method and pat.match(path) for meth, pat in READS):
         return "read"
     return "other"
+
+
+def api_request_path(raw_target: str) -> tuple[str, str]:
+    """Path and query as the room API sees them (urlparse drops ``;params``).
+
+    Returns ``(path, forward)`` where *forward* is path plus ``?query`` when
+    present — the spelling passed to the upstream API.
+    """
+    parsed = urlparse(raw_target)
+    path = parsed.path
+    forward = path + (f"?{parsed.query}" if parsed.query else "")
+    return path, forward
 
 
 class Turn:
@@ -2445,7 +2462,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(411, b'{"error":"length_required"}')
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else (b"" if self.command in ("POST", "PUT", "PATCH") else None)
-        path = urlsplit(self.path).path
+        # Same path form as cathedral/sandbox_server.dispatch (urlparse): a
+        # ";alias" suffix must not bypass the serial gate or mis-name a receipt.
+        path, forward_path = api_request_path(self.path)
         ledger: Ledger = self.server.ledger
         if self.command == "GET" and path == "/room/attestation":
             return self.reply(200, canonical(ledger.attestation()))
@@ -2454,7 +2473,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and path == "/room/receipts":
             if not self.authorized():
                 return self.reply(401, b'{"error":"unauthorized"}')
-            q = parse_qs(urlsplit(self.path).query)
+            q = parse_qs(urlparse(self.path).query)
             try:
                 after, limit = int(q.get("after", ["0"])[0]), min(int(q.get("limit", ["1000"])[0]), 10000)
             except ValueError:
@@ -2521,8 +2540,7 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             # Opened here; only the opened overlay goes on, inside the guest, to the room API.
             return self.handle_sealed_env(ledger, m["id"], body)
-        api_path = urlparse(self.path).path
-        if any(route.match(p) for route in INTERNAL_API_ROUTES for p in (api_path, unquote(api_path))):
+        if any(route.match(p) for route in INTERNAL_API_ROUTES for p in (path, unquote(path))):
             # The room API's sealed exec route runs an exec that leaves no history or log, and
             # its env-sealed route sets a room's env from an envelope this front opened; neither
             # is a signed route here: no caller may reach them. Matched as the API matches
@@ -2560,8 +2578,9 @@ class Handler(BaseHTTPRequestHandler):
             elif action == "bulk_delete" and self.authorized():
                 ledger.begin_bulk()
                 self.bulk_open = True
+            # Forward the canonical path (no ";params") so gate, receipt and API agree.
             status, headers, out = self.upstream(
-                self.server.api_port, body,
+                self.server.api_port, body, path=forward_path,
                 **({"timeout": plain_exec_wait(body)} if action == "exec" else {}))
         extra = {}
         if action and self.authorized():
@@ -2981,7 +3000,8 @@ class Handler(BaseHTTPRequestHandler):
                 start_command_sha256 = sha(canonical(start_command))
         return {
             "action": action,
-            "target": f"{self.command} {self.path}",
+            # *path* is the API form (urlparse); never the raw client target with ";params".
+            "target": f"{self.command} {path}",
             "sandbox_id": sandbox if isinstance(sandbox, str) else None,
             "customer_request_sha256": sha(body or b""),
             "command_sha256": sha(canonical(command)) if command is not None else None,
