@@ -17,6 +17,13 @@ TERMINAL_COLS_DEFAULT = 80
 TERMINAL_ROWS_DEFAULT = 24
 TERMINAL_DIM_MIN = 1
 TERMINAL_DIM_MAX = 1000
+# "line" runs each typed line as its own exec (the original console); "pty"
+# is a real interactive shell on a pseudo terminal in the room (AB#405).
+TERMINAL_MODES = ("line", "pty")
+# A PTY terminal keeps at most this much unread output; older bytes drop
+# first and are counted in output_dropped, so a reader knows it has a gap.
+TERMINAL_OUTPUT_CAP = 1 << 20
+TERMINAL_INPUT_MAX = 64 * 1024
 _TEMPLATE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
@@ -90,6 +97,13 @@ class TerminalSession:
     output: bytearray = field(default_factory=bytearray)
     input_buf: bytearray = field(default_factory=bytearray)
     connected: bool = False
+    mode: str = "line"
+    # PTY mode: spawn(cols, rows, on_output, on_exit) returns the running
+    # process handle (agent_pty.PtyProcess or a test double).
+    spawn: Any = field(default=None, repr=False)
+    pty: Any = field(default=None, repr=False)
+    spawning: bool = False
+    output_dropped: int = 0
 
     def to_document(self) -> dict[str, Any]:
         doc: dict[str, Any] = {
@@ -99,7 +113,10 @@ class TerminalSession:
             "started_at": self.started_at.isoformat().replace("+00:00", "Z"),
             "exited": self.exited,
             "connected": self.connected,
+            "mode": self.mode,
         }
+        if self.mode == "pty":
+            doc["output_dropped"] = self.output_dropped
         if self.exited:
             doc["exit_code"] = self.exit_code
         return doc
