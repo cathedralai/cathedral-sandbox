@@ -2586,7 +2586,7 @@ class Handler(BaseHTTPRequestHandler):
         if action and self.authorized():
             try:
                 extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(ledger.sign(
-                    {**self.fields(action, path, body, status, out), **owner_fields},
+                    {**self.fields(action, path, body, status, out, target_path=forward_path), **owner_fields},
                     **({"create": create_ask} if create_ask else {})))).decode()
             except Exception as exc:  # noqa: BLE001 the action ran: answer, and say the receipt is missing
                 traceback.print_exc()
@@ -2968,7 +2968,8 @@ class Handler(BaseHTTPRequestHandler):
             "ok": True, "window_id": window_id, "path": path, "encrypted": encrypted,
         }), extra)
 
-    def fields(self, action: str, path: str, body: bytes | None, status: int, out: bytes) -> dict:
+    def fields(self, action: str, path: str, body: bytes | None, status: int, out: bytes,
+               *, target_path: str | None = None) -> dict:
         req = {}
         try:
             req = json.loads(body) if body else {}
@@ -2998,10 +2999,11 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(raw_start, list) and all(isinstance(part, str) for part in raw_start):
                 start_command = raw_start
                 start_command_sha256 = sha(canonical(start_command))
+        receipt_path = target_path if target_path is not None else path
         return {
             "action": action,
-            # *path* is the API form (urlparse); never the raw client target with ";params".
-            "target": f"{self.command} {path}",
+            # *receipt_path* is path plus query (urlparse drops ``;params``); never the raw client target.
+            "target": f"{self.command} {receipt_path}",
             "sandbox_id": sandbox if isinstance(sandbox, str) else None,
             "customer_request_sha256": sha(body or b""),
             "command_sha256": sha(canonical(command)) if command is not None else None,
