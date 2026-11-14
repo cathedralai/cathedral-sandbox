@@ -1025,25 +1025,51 @@ class Unreadable(Fail):
     """A document run mode refuses to read because of its nesting or a number's length."""
 
 
-def json_shape(text: str) -> tuple[int, int]:
-    """(the deepest nesting of [ and {, the longest number token outside strings) of a JSON text.
+HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+SURROGATE_CODE_POINT_RE = re.compile("[\ud800-\udfff]")
+
+
+def _hex4(text: str, at: int) -> int | None:
+    digits = text[at:at + 4]
+    return int(digits, 16) if len(digits) == 4 and set(digits) <= HEX_DIGITS else None
+
+
+def json_shape(text: str) -> tuple[int, int, bool]:
+    """(the deepest nesting of [ and {, the longest number token, whether an unpaired surrogate is in the text),
+    all decided on the raw text before any parse.
 
     A number token is a run of digits, signs, points and the letters e and E (the e of true and false counts as a
-    run of one).
-
-    Characters inside strings are skipped (an escaped quote and an escaped backslash are handled); the walk is a
-    loop, not a recursion."""
+    run of one). An unpaired surrogate is a surrogate code point in the decoded text, or a \\uXXXX escape of a high
+    surrogate not followed at once by an escape of a low one, or of a low one not preceded by a high one; a
+    backslash followed by ud800 (an escaped backslash, then text) is not an escape. Characters inside strings are
+    skipped for nesting and numbers; the walk is a loop, not a recursion."""
     depth = deepest = run = longest = 0
-    in_string = escaped = False
-    for ch in text:
+    unpaired = SURROGATE_CODE_POINT_RE.search(text) is not None
+    in_string = False
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
         if in_string:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
+            if ch == "\\":
+                code = _hex4(text, i + 2) if text[i + 1:i + 2] == "u" else None
+                if code is None:
+                    i += 2  # any other escape, an escaped quote and an escaped backslash among them
+                    continue
+                if 0xD800 <= code <= 0xDBFF:
+                    low = _hex4(text, i + 8) if text[i + 6:i + 8] == "\\u" else None
+                    if low is not None and 0xDC00 <= low <= 0xDFFF:
+                        i += 12  # a proper pair
+                        continue
+                    unpaired = True
+                elif 0xDC00 <= code <= 0xDFFF:
+                    unpaired = True
+                i += 6
+                continue
+            if ch == '"':
                 in_string = False
+            i += 1
             continue
+        i += 1
         if ch in NUMBER_CHARS:
             run += 1
             longest = max(longest, run)
@@ -1056,7 +1082,7 @@ def json_shape(text: str) -> tuple[int, int]:
             deepest = max(deepest, depth)
         elif ch in "]}":
             depth -= 1
-    return deepest, longest
+    return deepest, longest, unpaired
 
 
 def json_depth(text: str) -> int:
@@ -1083,12 +1109,14 @@ def strict_json(raw: bytes, prefix: str, what: str, plural: bool = False, floats
     except (UnicodeDecodeError, LookupError):
         text = None  # not decodable: the parse below says so
     if text is not None:
-        deepest, longest = json_shape(text)
+        deepest, longest, unpaired = json_shape(text)
         if deepest > JSON_MAX_DEPTH:
             raise Unreadable(f"{prefix}: {what} {'nest' if plural else 'nests'} too deeply to read")
         if longest > JSON_MAX_NUMBER_CHARS:
             raise Unreadable(f"{prefix}: {what} {'hold' if plural else 'holds'} a number literal of more than "
                              f"{JSON_MAX_NUMBER_CHARS} characters")
+        if unpaired:
+            raise Unreadable(f"{prefix}: {what} {'hold' if plural else 'holds'} an unpaired surrogate")
     try:
         return json.loads(raw, object_pairs_hook=pairs, parse_float=float if floats else refuse, parse_constant=refuse)
     except RecursionError as exc:
