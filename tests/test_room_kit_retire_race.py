@@ -54,12 +54,12 @@ def hold_retire(monkeypatch):
     entered, release, real = threading.Event(), threading.Event(), rr.retire_room
     first = []
 
-    def slow(ledger, room):
+    def slow(ledger, room, *rest):
         if not first:
             first.append(1)
             entered.set()
             assert release.wait(30)
-        return real(ledger, room)
+        return real(ledger, room, *rest)
 
     monkeypatch.setattr(rr, "retire_room", slow)
     return entered, release
