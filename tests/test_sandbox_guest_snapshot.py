@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -185,7 +186,7 @@ def _bytes_writer(fake: FakeDocker, payload: bytes = b"the tar bytes the fake pr
                   entered: threading.Event | None = None):
     """A stand-in for the /work archive writer: it logs a TAR marker among the docker calls."""
 
-    def write(src: Path, dest: Path) -> None:
+    def write(src: Path, dest: Path, **kw) -> None:
         fake.mark("TAR")
         if entered is not None:
             entered.set()
