@@ -94,6 +94,8 @@ caller expects, in eight checks. The AMD certificates come from the file (amd_ce
      input paths and hashes, context) and holds no key that is not a request field.
 max_spend_usd is a JSON integer of at least 1 or a decimal string such as "0.50" (greater than zero, at most six
 decimals); never a JSON float, and the recipe and the file must hold it in the same form.
+create.ttl_seconds must be timeout_seconds plus the room margin (600, room_margin_seconds in
+broker/oneshot_create_keys.json).
 The recipe (cathedral_oneshot_recipe_v1) is strict: a member the checker does not know, at any level, is
 refused. request must hold image, command, env, size, timeout_seconds, network, outputs, inputs and
 max_spend_usd (env and inputs may be empty); cwd, user and image_id are optional, and must agree between the
@@ -170,6 +172,9 @@ ONESHOT_SIZES = {
     "sealed-4x8": {"vcpu": 4, "memory_gib": 8, "disk_gib": 10},
     "sealed-8x16": {"vcpu": 8, "memory_gib": 16, "disk_gib": 10},
 }
+# A one-shot room lives for the timeout plus this margin, so a caller can write the recipe's create.ttl_seconds
+# without asking (broker/oneshot_create_keys.json, room_margin_seconds).
+ONESHOT_ROOM_MARGIN_SECONDS = 600
 ROOM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 FILE_MODE_RE = re.compile(r"^[0-7]{3,4}$")
@@ -1428,6 +1433,9 @@ def load_recipe(doc) -> dict:
     for mode in [i["mode"] for i in inputs] + [modes.get("context", "644"), modes.get("end_marker", "644")]:
         need(isinstance(mode, str) and FILE_MODE_RE.fullmatch(mode) is not None,
              "recipe: a file mode is not an octal string")
+    need(_is_int(create["ttl_seconds"]) and _is_int(req["timeout_seconds"])
+         and create["ttl_seconds"] == req["timeout_seconds"] + ONESHOT_ROOM_MARGIN_SECONDS,
+         f"recipe: create.ttl_seconds must be timeout_seconds + {ONESHOT_ROOM_MARGIN_SECONDS}")
     policy = network_policy(req["network"])
     return {"request": req, "create": create, "outputs": outputs, "inputs": inputs, "network_policy": policy, "context_mode": modes.get("context", "644"),
             "end_mode": modes.get("end_marker", "644")}

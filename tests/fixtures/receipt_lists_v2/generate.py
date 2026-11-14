@@ -622,10 +622,10 @@ def base_recipe() -> dict:
             "image": IMAGE_REF, "command": ["python", RUN_PATH], "env": {"MODE": "check"}, "cwd": "/work",
             "size": "sealed-1x2", "timeout_seconds": 60, "network": {"mode": "deny_all", "allow": []},
             "image_id": IMAGE_ID, "max_spend_usd": "0.50",
-            "outputs": [{"path": RESULT_PATH, "max_bytes": 1048576, "optional": False},
+            "outputs": [{"path": RESULT_PATH, "max_bytes": 65536, "optional": False},
                         {"path": LOG_PATH, "max_bytes": 65536, "optional": True}],
             "inputs": [{"path": RUN_PATH, "mode": "755"}, {"path": DATA_PATH, "mode": "644"}]},
-        "create": {"ttl_seconds": 300, "broker_guest": "guest-1"},
+        "create": {"ttl_seconds": None, "broker_guest": "guest-1"},  # None: the timeout plus the room margin
         "file_modes": {"context": "644", "end_marker": "644"}}
 
 
@@ -661,6 +661,10 @@ def step(role: str, action: str, target: str, status: int = 200, **fields) -> di
     return {"role": role, "action": action, "target": target, "status": status, "fields": fields}
 
 
+def _plain_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, overrides=None, steps_edit=None,
              drop=(), create_body=None, exec_body=None, bundle_edit=None, args_edit=None, absent=(),
              held=(RESULT_PATH,), inline=(LOG_PATH,), held_bytes=None, caller_hashes=None, exec_response="confirmed",
@@ -670,9 +674,16 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
     recipe = base_recipe()
     if truth_edit:
         truth_edit(recipe)
+    margin = json.loads((HERE.parents[2] / "broker" / "oneshot_create_keys.json").read_text())["room_margin_seconds"]
+    if recipe["create"]["ttl_seconds"] is None:
+        recipe["create"]["ttl_seconds"] = recipe["request"]["timeout_seconds"] + margin
     checker_recipe = json.loads(json.dumps(recipe))
     if recipe_edit:
         recipe_edit(checker_recipe)
+        if (checker_recipe["create"]["ttl_seconds"] == recipe["create"]["ttl_seconds"]
+                and checker_recipe["request"].get("timeout_seconds") != recipe["request"]["timeout_seconds"]
+                and _plain_int(checker_recipe["request"].get("timeout_seconds"))):
+            checker_recipe["create"]["ttl_seconds"] = checker_recipe["request"]["timeout_seconds"] + margin
     req, cr, modes = recipe["request"], recipe["create"], recipe["file_modes"]
     ctx = CONTEXT if truth_context is None else truth_context
     outputs_bytes = {o["path"]: (None if o["path"] in absent else fb.get(o["path"], b"output\n"))
@@ -982,8 +993,8 @@ def run_bad_cases(pack: Pack) -> None:
     bad("run_c3_wrong_path", "An input put to another path.",
         fail(3, f"receipt 3 is file_put {other_path}, the recipe needs file_put {in0}"),
         overrides={"in0": {"target": other_path}})
-    get0 = get_target(RUN_ROOM, 1048576, RESULT_PATH)
-    big = get_target(RUN_ROOM, 2097152, RESULT_PATH)
+    get0 = get_target(RUN_ROOM, 65536, RESULT_PATH)
+    big = get_target(RUN_ROOM, 131072, RESULT_PATH)
     bad("run_c3_wrong_max_bytes", "A get with a larger max_bytes than the recipe's.",
         fail(3, f"receipt 6 is file_get {big}, the recipe needs file_get {get0}"), overrides={"get0": {"target": big}})
     other_exec = "POST /v1/sandboxes/other-room/exec"
@@ -1063,8 +1074,8 @@ def run_bad_cases(pack: Pack) -> None:
     bad("run_c4_duplicate_key", "The create bytes repeat a key.", fail(4, "the create bytes repeat the key 'image'"),
         create_body=lambda body: dup)
     bad("run_c4_float", "The create bytes hold a number with a decimal point.",
-        fail(4, "the create bytes hold the number 300.0, which is not an integer"),
-        create_body=lambda body: canonical(body).replace(b'"ttl_seconds":300', b'"ttl_seconds":300.0'))
+        fail(4, "the create bytes hold the number 660.0, which is not an integer"),
+        create_body=lambda body: canonical(body).replace(b'"ttl_seconds":660', b'"ttl_seconds":660.0'))
 
     # ---- check 5: the context and the inputs
     bad("run_c5_context_put_status", "The put of the context failed.",
@@ -1097,7 +1108,8 @@ def run_bad_cases(pack: Pack) -> None:
     bad("run_c6_env", "The exec's environment is not the recipe's.", fail(6, "the exec's env is not the recipe's"),
         recipe_edit=lambda r: r["request"].update(env={"MODE": "other"}))
     bad("run_c6_timeout", "The exec's timeout is not the recipe's.", fail(6, "the exec's timeout_seconds is not the recipe's"),
-        recipe_edit=lambda r: r["request"].update(timeout_seconds=61))
+        recipe_edit=lambda r: r["request"].update(timeout_seconds=61),
+        create_body=lambda body: {**body, "ttl_seconds": 661})  # the create follows the recipe's lifetime
     bad("run_c6_cwd", "The exec's cwd is not the recipe's.", fail(6, "the exec's cwd is not the recipe's"),
         recipe_edit=lambda r: r["request"].update(cwd="/other"))
 
@@ -1663,13 +1675,17 @@ One good run, the way the API sees it. The same directory is copied byte for byt
 neither side may change it alone: this checker's test says `expected/bundle.json` passes, and the API's test builds
 the file from `machine/` and `caller/` and must get the same file.
 
-- `machine/`: what the machine and the broker give the API, one file per call in call order. `NN_<call>.header` is
-  the `X-Room-Receipt` header text (base64url of the canonical receipt JSON, with padding); `NN_<call>.response` is
-  the answer body the API keeps. `create_request.b64` is the create bytes the broker hands back (base64 text);
-  `exec_request.json` is the exec bytes the API sent; `hotel_attestation_answer.json` is the hotel's attestation
+- `machine/`: the answers as the broker hands them to the API (the API talks to the broker; the folder keeps its
+  name), one file per call in call order. `NN_<call>.header` is the `X-Room-Receipt` header text (base64url of the
+  canonical receipt JSON, with padding). `NN_<call>.response` is the answer body the API keeps; the first is the
+  broker's 202 create document (`id` with the hotel prefix, `hotel`, `isolation`, and `create_request_b64`, the
+  create bytes, which the broker returns when asked with `X-Broker-Return-Create-Request: 1`; that member is the one
+  source of the create bytes). `exec_request.json` is the exec bytes the API sent; `hotel_attestation_answer.json` is the hotel's attestation
   answer; `amd/vcek_der.bin` is the VCEK as DER and `amd/cert_chain_pem.txt` is the chain as AMD's key server
   returns it (the ASK, then the ARK, as PEM).
-- `caller/`: the POST body (with `content_b64`), the API's 202 answer, the recipe, the context file and the input.
+- `caller/`: the POST body (with `content_b64`), the API's 202 answer (`oneshot_id`, `state`, `status_url`,
+  `reserved_usd`), the recipe (its `create.ttl_seconds` is the timeout plus 600), the context file and the input.
+  Outputs stay at or under 65,536 bytes: this version keeps them inline.
 - `expected/bundle.json`: the one-shot file in the shapes of spec G4 5.5, in canonical JSON.
   `expected/check.json`: what `verify_receipts.py` prints for it (the command is in `case.json`).
 - The run has one input, a context, one inline output, an exec answer, an env of one entry, a decimal-string
@@ -1689,29 +1705,37 @@ def build_exchange(amd: dict[str, bytes]) -> dict[str, bytes]:
     from cryptography.hazmat.primitives import serialization
 
     pack = Pack(amd)
-    create_answer, put_answer = canonical({"id": RUN_ROOM, "state": "running"}), canonical({"written": True})
+    hotel_answer = {"id": RUN_ROOM, "state": "running",
+                    "network": {"mode": "deny_all", "policy": {"mode": "deny_all", "allow": []}}}
+    put_answer = canonical({"written": True})
 
     def edit(r):
         r["request"].pop("cwd")
         r["request"]["inputs"] = [{"path": RUN_PATH, "mode": "755"}]
-        r["request"]["outputs"] = [{"path": RESULT_PATH, "max_bytes": 1048576, "optional": False}]
+        r["request"]["outputs"] = [{"path": RESULT_PATH, "max_bytes": 65536, "optional": False}]
 
     def answered(answer):
         return {"result_sha256": sha(answer)}
 
     made, _ = make_run(pack, truth_edit=edit, held=(), inline=(RESULT_PATH,), overrides={
-        "create": answered(create_answer), "context": answered(put_answer), "in0": answered(put_answer),
+        "create": answered(canonical(hotel_answer)), "context": answered(put_answer), "in0": answered(put_answer),
         "end": answered(put_answer)})
     bundle = json.loads(made["bundle.json"])
     bundle["not_proven"] = []
     labels = ["create", "context_put", "input_put", "exec", "get_output", "end_marker_put"]
-    answers = [create_answer, put_answer, put_answer, base64.b64decode(bundle["exec_response_b64"]),
+    # The broker's 202 document: the hotel's answer with the broker's members around it (broker/main.go: the id
+    # gets the hotel prefix, then hotel and isolation, and create_request_b64 when the header asks for it).
+    broker_answer = {**hotel_answer, "id": f"pack-hotel.{RUN_ROOM}", "hotel": "pack-hotel",
+                     "isolation": {"hotel_sealed": True, "hotel_tee": "amd_sev_snp", "room_runtime": "runsc",
+                                   "attested_per_room": False, "network_mode": "deny_all",
+                                   "attestation_of_host": "/v1/hotels/pack-hotel/attestation"},
+                     "create_request_b64": bundle["create_request_b64"]}
+    answers = [canonical(broker_answer), put_answer, put_answer, base64.b64decode(bundle["exec_response_b64"]),
                FILE_BYTES[RESULT_PATH], put_answer]
     files: dict[str, bytes] = {}
     for i, (label, rc, answer) in enumerate(zip(labels, bundle["receipts"], answers), start=1):
         files[f"machine/{i:02d}_{label}.header"] = base64.urlsafe_b64encode(canonical(rc))
         files[f"machine/{i:02d}_{label}.response"] = answer
-    files["machine/create_request.b64"] = bundle["create_request_b64"].encode()
     files["machine/exec_request.json"] = base64.b64decode(bundle["exec_request_b64"])
     files["machine/hotel_attestation_answer.json"] = canonical(bundle["attestation"])
     certs = {k: x509.load_der_x509_certificate(base64.b64decode(v)) for k, v in pack.certs.items()}
@@ -1722,7 +1746,9 @@ def build_exchange(amd: dict[str, bytes]) -> dict[str, bytes]:
     post = {k: v for k, v in bundle["request"].items() if k != "inputs"}
     post["inputs"] = [{**i, "content_b64": b64(FILE_BYTES[i["path"]])} for i in bundle["request"]["inputs"]]
     files["caller/post_body.json"] = pretty(post)
-    files["caller/response_202.json"] = pretty({"id": RUN_ID, "status_url": f"/v1/oneshots/{RUN_ID}"})
+    files["caller/response_202.json"] = pretty({"oneshot_id": RUN_ID, "state": "accepted",
+                                                         "status_url": f"/v1/oneshots/{RUN_ID}",
+                                                         "reserved_usd": "0.50"})
     files["caller/recipe.json"] = made["recipe.json"]
     files["caller/context.json"] = made["context.json"]
     files["caller/inputs/run.py"] = FILE_BYTES[RUN_PATH]
