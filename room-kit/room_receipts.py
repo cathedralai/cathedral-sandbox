@@ -2317,7 +2317,131 @@ READS = [  # (method, path pattern)
 TOUCHED_CAP = 4096
 HEX64 = re.compile(r"[0-9a-fA-F]{128}")
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
-       "proxy-authenticate", "content-length", "host"}
+       "proxy-authenticate", "content-length", "host", "x-room-exec-handle"}
+
+# Exec result memory (AB#756). The broker's background exec path sends its own exec handle in
+# EXEC_HANDLE_HEADER; for those execs only, the front keeps the answer it signed, so a broker that
+# restarted while the command ran reads it back with GET .../exec/result?handle= and drops it with
+# DELETE once saved. Plain execs without the header are not kept. The header never reaches the API.
+EXEC_HANDLE_HEADER = "X-Room-Exec-Handle"
+EXEC_STATE_HEADER = "X-Room-Exec-State"
+EXEC_HANDLE = re.compile(r"[0-9a-f]{32}")
+EXEC_RESULT_ROUTE = re.compile("^" + ROOM + r"/exec/result$")
+EXEC_RESULT_KEEP_SECONDS = 3600  # a finished answer nobody dropped ages out after this
+EXEC_RESULT_MAX = 256  # answers kept, running and finished
+EXEC_RESULT_MAX_BYTES = 64 << 20  # body bytes of finished answers kept
+EXEC_RESULT_MAX_WAIT = 25  # seconds one read may wait for a running exec
+# What a kept exec ends with when the front failed between the API call and the store.
+EXEC_RESULT_FRONT_FAILED = b'{"error":{"code":"hotel_api_no_answer","message":"the front failed before it kept the answer; the request may have run"}}'
+
+
+class _ExecEntry:
+    __slots__ = ("body", "ctype", "done_at", "event", "headers", "status")
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.done_at: float | None = None
+        self.status = 0
+        self.headers: dict = {}
+        self.body = b""
+        self.ctype = "application/json"
+
+
+class ExecResults:
+    """The answers of kept execs, by (room, handle). Bounded by count, bytes and age.
+
+    A running entry is never evicted or replaced: a second exec with a running entry's handle is
+    refused, and with the table full of running entries a new exec runs untracked.
+    """
+
+    def __init__(self, keep: float = EXEC_RESULT_KEEP_SECONDS, max_entries: int = EXEC_RESULT_MAX,
+                 max_bytes: int = EXEC_RESULT_MAX_BYTES):
+        self.keep, self.max_entries, self.max_bytes = keep, max_entries, max_bytes
+        self.lock = threading.Lock()
+        self.entries: dict[tuple[str, str], _ExecEntry] = {}
+        self.bytes = 0
+
+    def _drop(self, key) -> None:
+        e = self.entries.pop(key, None)
+        if e is not None and e.done_at is not None:
+            self.bytes -= len(e.body)
+
+    def _prune(self, now: float) -> None:
+        for key, e in list(self.entries.items()):
+            if e.done_at is not None and now - e.done_at > self.keep:
+                self._drop(key)
+
+    def _oldest_done(self, but=None):
+        done = [(e.done_at, k) for k, e in self.entries.items() if e.done_at is not None and k != but]
+        return min(done)[1] if done else None
+
+    def begin(self, room: str, handle: str) -> str:
+        """'tracked', 'busy' (a running exec holds this handle) or 'full' (run it untracked)."""
+        key = (room, handle)
+        with self.lock:
+            self._prune(time.monotonic())
+            e = self.entries.get(key)
+            if e is not None and e.done_at is None:
+                return "busy"
+            self._drop(key)
+            while len(self.entries) >= self.max_entries:
+                old = self._oldest_done()
+                if old is None:
+                    return "full"
+                self._drop(old)
+            self.entries[key] = _ExecEntry()
+            return "tracked"
+
+    def finish(self, room: str, handle: str, status: int, headers: dict, body: bytes, ctype: str) -> None:
+        key = (room, handle)
+        with self.lock:
+            e = self.entries.get(key)
+            if e is None or e.done_at is not None:
+                return
+            if len(body) > self.max_bytes:
+                # Too large to keep: forgotten, so a re-attach reads exec_unknown, not a cut answer.
+                self.entries.pop(key, None)
+                e.event.set()
+                return
+            e.status, e.headers, e.body, e.ctype = status, dict(headers), body, ctype
+            e.done_at = time.monotonic()
+            self.bytes += len(body)
+            while self.bytes > self.max_bytes:
+                old = self._oldest_done(but=key)
+                if old is None:
+                    break
+                self._drop(old)
+            e.event.set()
+
+    def get(self, room: str, handle: str, wait: float) -> _ExecEntry | None:
+        key = (room, handle)
+        with self.lock:
+            self._prune(time.monotonic())
+            e = self.entries.get(key)
+        if e is None:
+            return None
+        if e.done_at is None and wait > 0:
+            e.event.wait(wait)
+        with self.lock:
+            return e if self.entries.get(key) is e else None
+
+    def drop(self, room: str, handle: str) -> str:
+        """'dropped', 'running' (never dropped) or 'unknown'."""
+        key = (room, handle)
+        with self.lock:
+            e = self.entries.get(key)
+            if e is None:
+                return "unknown"
+            if e.done_at is None:
+                return "running"
+            self._drop(key)
+            return "dropped"
+
+    def forget_room(self, room: str) -> None:
+        """A deleted room's finished answers go; a running one is stored when it ends and ages out."""
+        with self.lock:
+            for key in [k for k, e in self.entries.items() if k[0] == room and e.done_at is not None]:
+                self._drop(key)
 
 
 def retire_room(ledger: "Ledger", room: str) -> None:
@@ -2574,6 +2698,13 @@ class Handler(BaseHTTPRequestHandler):
                 # The API behind accepts the internal key the front adds, so the
                 # front is the gate for every call it passes on.
                 return self.reply(401, b'{"error":"unauthorized"}')
+        m = EXEC_RESULT_ROUTE.match(path)
+        if m and self.command in ("GET", "DELETE"):
+            # Answered here, before the serial gate: it reads (or drops) what this front kept and
+            # never reaches the API.
+            if not self.authorized():
+                return self.reply(401, b'{"error":"unauthorized"}')
+            return self.handle_exec_result(m["id"])
         room = room_of(path)
         if room and self.authorized():
             # Callers without the key are not counted: they never hold a token, and the API refuses them.
@@ -2622,39 +2753,90 @@ class Handler(BaseHTTPRequestHandler):
             problem, create_ask = self.reserved_label_check(body)
             if problem is not None:
                 return self.reply(400, canonical({"error": {"code": problem[0], "message": problem[1]}}))
-        if refusal is not None:
-            status, headers, out = 403, [], refusal
-        else:
-            if action == "create" and self.authorized():
-                ledger.begin_create()
-                self.create_open = True
-            elif action == "bulk_delete" and self.authorized():
-                ledger.begin_bulk()
-                self.bulk_open = True
-            # Forward the canonical path (no ";params") so gate, receipt and API agree.
-            status, headers, out = self.upstream(
-                self.server.api_port, body, path=forward_path,
-                **({"timeout": plain_exec_wait(body)} if action == "exec" else {}))
-        extra = {}
-        if action and self.authorized():
-            try:
-                extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(ledger.sign(
-                    {**self.fields(action, path, body, status, out, target_path=forward_path), **owner_fields},
-                    **({"create": create_ask} if create_ask else {})))).decode()
-            except Exception as exc:  # noqa: BLE001 the action ran: answer, and say the receipt is missing
-                traceback.print_exc()
-                extra["X-Room-Receipt-Error"] = type(exc).__name__
-            if action == "create" and 200 <= status < 300 and ledger.sealed_env is not None:
-                # A create answered again for a room the API kept moves its incarnation: an
-                # overlay set under the old one comes off before the room is used again.
-                ledger.reconcile_sealed_env(self.env_apply)
-            deleted = re.match("^" + ROOM + "$", path) if action == "delete" and 200 <= status < 300 else None
-            if deleted:
-                # After the receipt, which ends the room's incarnation: no write lands from here on.
-                retire_room(ledger, deleted["id"])
-        ctype = next((v for k, v in headers if k.lower() == "content-type"), "application/json")
-        passthrough = {k: v for k, v in headers if k.lower() not in HOP and k.lower() != "content-type"}
-        return self.reply(status, out, {**passthrough, **extra}, ctype)
+        track = None
+        if refusal is None and action == "exec" and self.authorized() and EXEC_HANDLE_HEADER in self.headers:
+            handle = self.headers.get(EXEC_HANDLE_HEADER, "")
+            if not EXEC_HANDLE.fullmatch(handle):
+                return self.reply(400, b'{"error":{"code":"invalid_request","message":"X-Room-Exec-Handle must be 32 lowercase hex characters"}}')
+            started = self.server.exec_results.begin(room, handle)
+            if started == "busy":
+                # Never replace a running exec's entry: its broker would read another command's answer.
+                return self.reply(409, b'{"error":{"code":"exec_handle_in_use","message":"a running exec holds this handle; nothing was started"}}')
+            if started == "tracked":
+                track = (room, handle)
+            # "full": the exec runs untracked; a re-attach reads exec_unknown.
+        kept = False
+        try:
+            if refusal is not None:
+                status, headers, out = 403, [], refusal
+            else:
+                if action == "create" and self.authorized():
+                    ledger.begin_create()
+                    self.create_open = True
+                elif action == "bulk_delete" and self.authorized():
+                    ledger.begin_bulk()
+                    self.bulk_open = True
+                # Forward the canonical path (no ";params") so gate, receipt and API agree.
+                status, headers, out = self.upstream(
+                    self.server.api_port, body, path=forward_path,
+                    **({"timeout": plain_exec_wait(body)} if action == "exec" else {}))
+            extra = {}
+            if action and self.authorized():
+                try:
+                    extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(ledger.sign(
+                        {**self.fields(action, path, body, status, out, target_path=forward_path), **owner_fields},
+                        **({"create": create_ask} if create_ask else {})))).decode()
+                except Exception as exc:  # noqa: BLE001 the action ran: answer, and say the receipt is missing
+                    traceback.print_exc()
+                    extra["X-Room-Receipt-Error"] = type(exc).__name__
+                if action == "create" and 200 <= status < 300 and ledger.sealed_env is not None:
+                    # A create answered again for a room the API kept moves its incarnation: an
+                    # overlay set under the old one comes off before the room is used again.
+                    ledger.reconcile_sealed_env(self.env_apply)
+                deleted = re.match("^" + ROOM + "$", path) if action == "delete" and 200 <= status < 300 else None
+                if deleted:
+                    # After the receipt, which ends the room's incarnation: no write lands from here on.
+                    retire_room(ledger, deleted["id"])
+                    self.server.exec_results.forget_room(deleted["id"])
+            ctype = next((v for k, v in headers if k.lower() == "content-type"), "application/json")
+            passthrough = {k: v for k, v in headers if k.lower() not in HOP and k.lower() != "content-type"}
+            if track is not None:
+                self.server.exec_results.finish(*track, status, {**passthrough, **extra}, out, ctype)
+                kept = True
+            return self.reply(status, out, {**passthrough, **extra}, ctype)
+        finally:
+            if track is not None and not kept:
+                # Whatever went wrong after the mark, the entry ends: a running entry is never evicted.
+                self.server.exec_results.finish(*track, 502, {}, EXEC_RESULT_FRONT_FAILED, "application/json")
+
+    def handle_exec_result(self, room: str):
+        """GET: a kept exec's answer (running, or the signed answer as it was) by handle. DELETE: drop it."""
+        q = parse_qs(urlsplit(self.path).query)
+        handle = (q.get("handle") or [""])[0]
+        if not EXEC_HANDLE.fullmatch(handle):
+            return self.reply(400, b'{"error":{"code":"invalid_request","message":"handle must be 32 lowercase hex characters"}}')
+        results: ExecResults = self.server.exec_results
+        if self.command == "DELETE":
+            outcome = results.drop(room, handle)
+            if outcome == "running":
+                return self.reply(409, b'{"error":{"code":"exec_running","message":"the exec is still running"}}')
+            if outcome == "unknown":
+                return self.reply(404, b'{"error":{"code":"exec_unknown","message":"no kept exec with this handle"}}')
+            return self.reply(200, b'{"dropped":true}')
+        try:
+            wait = int((q.get("wait") or ["0"])[0])
+        except ValueError:
+            wait = -1
+        if not 0 <= wait <= EXEC_RESULT_MAX_WAIT:
+            return self.reply(400, canonical({"error": {"code": "invalid_request",
+                                                        "message": f"wait must be 0 to {EXEC_RESULT_MAX_WAIT}"}}))
+        e = results.get(room, handle, wait)
+        if e is None:
+            return self.reply(404, b'{"error":{"code":"exec_unknown","message":"this hotel does not hold an exec with this handle"}}')
+        if e.done_at is None:
+            return self.reply(200, b'{"state":"running"}', {EXEC_STATE_HEADER: "running"})
+        # The bytes and receipt of the original answer, so its result_sha256 still checks. Not signed again.
+        return self.reply(e.status, e.body, {**e.headers, EXEC_STATE_HEADER: "done"}, e.ctype)
 
     def reserved_label_check(self, body: bytes | None) -> tuple[tuple[str, str] | None, dict | None]:
         """(refusal, ask) for a create. The ask says what the create requested, for the signing step.
@@ -3134,6 +3316,7 @@ class Server(ThreadingHTTPServer):
         self.ledger, self.api_port, self.health_port, self.api_key = ledger, api_port, health_port, api_key
         self.docker_sock = docker_sock
         self.attestation_only = attestation_only
+        self.exec_results = ExecResults()
         self._digests: dict[str, str | None] = {}
         self.health_lock = threading.Lock()
         self.health: tuple[int, bytes | None, float] = (503, None, 0.0)

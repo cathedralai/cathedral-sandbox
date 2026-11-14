@@ -391,3 +391,58 @@ def test_dind_env_rejects_malformed_entry(fake: FakeDocker, monkeypatch) -> None
     monkeypatch.setenv("CATHEDRAL_DIND_ENV", "NOEQUALS")
     with pytest.raises(ValueError):
         DockerGuestProvider()
+
+
+# ---------------------------------------------------------------- AB#534: pull singleflight
+def _burst(provider, ref: str | ImageSource, n: int) -> list[BaseException | None]:
+    import threading
+
+    errors: list[BaseException | None] = [None] * n
+
+    def one(i: int) -> None:
+        try:
+            source = ref if isinstance(ref, ImageSource) else ImageSource(image=ref)
+            request = CreateSandboxRequest(image=source, resources=Resources(vcpu=1, memory_gib=1, disk_gib=5))
+            provider.create(request, api_key="k", idempotency=None, body_digest=str(i))
+        except BaseException as exc:  # noqa: BLE001
+            errors[i] = exc
+
+    threads = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    return errors
+
+
+def test_cold_burst_of_one_image_pulls_once(fake: FakeDocker) -> None:
+    fake.set(pull_delay=0.5)
+    provider = DockerGuestProvider()
+    try:
+        assert _burst(provider, "acme/cold:1", 4) == [None] * 4
+        assert fake.calls_of("pull") == [["pull", "acme/cold:1"]]
+    finally:
+        provider.close()
+
+
+def test_credentialed_burst_still_pulls_per_caller(fake: FakeDocker) -> None:
+    fake.set(pull_delay=0.2)
+    provider = DockerGuestProvider()
+    try:
+        auth = {"username": "u", "password": "p"}
+        image = ImageSource(image="ghcr.io/acme/private:1", registry_auth=auth)
+        assert _burst(provider, image, 3) == [None] * 3
+        assert len(fake.calls_of("pull")) == 3
+    finally:
+        provider.close()
+
+
+def test_a_failed_pull_is_not_shared(fake: FakeDocker) -> None:
+    fake.set(pull_delay=0.2, pull_fail=["acme/missing:1"])
+    provider = DockerGuestProvider()
+    try:
+        errors = _burst(provider, "acme/missing:1", 3)
+        assert all(isinstance(e, SandboxOpError) and e.code == "image_pull_failed" for e in errors)
+        assert len(fake.calls_of("pull")) == 3
+    finally:
+        provider.close()

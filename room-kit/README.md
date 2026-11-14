@@ -106,6 +106,20 @@ health does not say `sealed`. Verify a chain offline with
 `verify_receipts.py`: signature, link to the previous receipt, and head. A
 level 1 chain has no SNP report.
 
+`verify_receipts.py --oneshot FILE` checks one one-shot run's file offline (run mode). It takes `--recipe`,
+`--context` or `--no-context`, `--run-id`, `--input-sha256`, `--input-file`, `--output-file`,
+`--expected-measurement`, `--allowed-measurements`, `--ark-sha256`, `--product` and `--require-sealed`. The other
+flags of the list-mode commands (`--receipts`, `--attestation`, `--broker`, `--origin`, `--key-file`,
+`--operator-key-file`, `--hotel`, `--sandbox`, `--receipt-header`, `--cathedral-sandbox`, `--save`,
+`--owner-pubkey`, `--tls-spki-sha256`, `--require-tls`, `--kds-cache`) are usage errors with exit 2, even with an
+empty value. `--skip-amd` is a failed check 1 (exit 1), and `--help` exits 0. Without `--oneshot`, the run-mode flags
+(`--allowed-measurements`, `--recipe`, `--run-id`, `--context`, `--no-context`, `--input-sha256`, `--input-file`,
+`--output-file`, and an empty `--oneshot`) are usage errors with exit 2: list mode reads none of them. `--product` names the product only
+for a version 2 report, which has no CPUID fields; no other version reads the flag, a version 0, 1 or above 5
+report fails, a report with CPUID fields names its own product, a family with no layout fails, and a different
+`--product` fails. The owner check and the guest TLS key check are list-mode
+checks that run mode does not do. The module's header documents the eight checks. Both modes name an attestation whose `kernel_cmdline` is not a string, whose receipt key is not base64 of 32 bytes, or whose `report_b64` is not base64 as an input fault, with the same reason (run mode adds the prefix `check 1: `).
+
 Sealed SNP receipts are a separate path and stay opt-in. `install.sh --sealed`
 builds a guest that sets `ROOM_RECEIPTS=1` and its own listen address. Inside
 that guest, when the TSM provider is `sev_guest`, the same process keeps the

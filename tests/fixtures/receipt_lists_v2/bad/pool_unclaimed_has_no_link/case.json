@@ -1,0 +1,19 @@
+{
+ "args": [
+  "--attestation",
+  "{dir}/attestation_doc.json",
+  "--receipts",
+  "{dir}/receipts.json",
+  "--skip-amd",
+  "--expected-measurement",
+  "9b148da6715f6a68fd6314d9015f54413c261a0b1b25075b568e0b5106687a2b434d7661f26d036700090ca1917a9ed1",
+  "--cathedral-sandbox",
+  "5b7c1a2e-9d3f-4e6a-8b10-2c4d6e8f0a1b"
+ ],
+ "description": "An unclaimed pre-made room never matches a sandbox id.",
+ "expect": {
+  "exit_code": 1,
+  "reason": "no successful create receipt names Cathedral sandbox 5b7c1a2e-9d3f-4e6a-8b10-2c4d6e8f0a1b",
+  "verdict": "FAIL"
+ }
+}
