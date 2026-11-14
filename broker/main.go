@@ -1877,7 +1877,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			log.Printf("hotel %s down: %s", h.cfg.ID, h.lastErr)
 		}
 	}
-	b.alertHealth(h, herr, hadHealth, wasOK)
+	b.alertHealth(h, herr, hadHealth)
 	if cameUp && b.cfg.PrewarmCatalog {
 		go b.prewarmHotel(h)
 	}

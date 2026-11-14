@@ -35,8 +35,11 @@ func captureAlerts(t *testing.T, tc *testChain, opsChat string) (func() []alertM
 		var out []alertMsg
 		for {
 			select {
-			case m := <-a.queue:
-				out = append(out, m)
+			case job := <-a.queue:
+				out = append(out, job.msg)
+				if job.onSuccess != nil {
+					job.onSuccess()
+				}
 			default:
 				return out
 			}
@@ -228,7 +231,7 @@ func TestAlertWebhookPostsChatAndTextAndNeverLogsTheURL(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
 		go func() { a.run(ctx); close(done) }()
-		a.send("OPS-ALERT", "-100200", "hello")
+		a.send("OPS-ALERT", "-100200", "hello", nil, nil)
 		deadline := time.Now().Add(5 * time.Second)
 		for {
 			mu.Lock()
@@ -334,7 +337,7 @@ func TestFullQueueKeepsMissRetryable(t *testing.T) {
 	a.opsChat = "-100200"
 	// Fill the queue so the next send drops.
 	for i := 0; i < alertQueueSize; i++ {
-		a.queue <- alertMsg{ChatID: "fill", Text: "x"}
+		a.queue <- alertJob{msg: alertMsg{ChatID: "fill", Text: "x"}}
 	}
 	setHotel(tc, "a", func(h *hotel) { h.cfg.AlertChatID = "4242" })
 	syncNow(tc, "a")
@@ -358,8 +361,11 @@ drained:
 	var got []alertMsg
 	for {
 		select {
-		case m := <-a.queue:
-			got = append(got, m)
+		case job := <-a.queue:
+			got = append(got, job.msg)
+			if job.onSuccess != nil {
+				job.onSuccess()
+			}
 		default:
 			goto done
 		}
@@ -370,7 +376,63 @@ done:
 	}
 	setHotel(tc, "a", func(h *hotel) { missSent = h.alerts.missSent })
 	if !missSent {
-		t.Fatal("missSent still false after a successful queue")
+		t.Fatal("missSent still false after delivery")
+	}
+}
+
+// TestFullQueueKeepsOpsDropRetryable: a saturated queue on the first
+// customer-affecting down must still deliver ops once the queue has room,
+// even though the hotel is no longer transitioning (wasOK false).
+func TestFullQueueKeepsOpsDropRetryable(t *testing.T) {
+	tc := newChain(t)
+	a := tc.b.alerts
+	a.post = func(context.Context, alertMsg) error { return nil }
+	a.opsChat = "-100200"
+	for i := 0; i < alertQueueSize; i++ {
+		a.queue <- alertJob{msg: alertMsg{ChatID: "fill", Text: "x"}}
+	}
+	syncNow(tc, "a")
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+	alertGoDown(tc, "a")
+	syncNow(tc, "a")
+	var dropSent, dropInflight bool
+	setHotel(tc, "a", func(h *hotel) {
+		dropSent = h.alerts.dropSent
+		dropInflight = h.alerts.dropInflight
+	})
+	if dropSent || dropInflight {
+		t.Fatalf("ops drop consumed on full queue: sent=%v inflight=%v", dropSent, dropInflight)
+	}
+	for {
+		select {
+		case <-a.queue:
+		default:
+			goto drained
+		}
+	}
+drained:
+	syncNow(tc, "a") // still down: must queue ops despite wasOK false
+	var ops []alertMsg
+	for {
+		select {
+		case job := <-a.queue:
+			if job.msg.ChatID == "-100200" {
+				ops = append(ops, job.msg)
+				if job.onSuccess != nil {
+					job.onSuccess()
+				}
+			}
+		default:
+			goto done
+		}
+	}
+done:
+	if len(ops) != 1 || !strings.Contains(ops[0].Text, "is down with") {
+		t.Fatalf("ops retry after queue drain: %+v", ops)
+	}
+	setHotel(tc, "a", func(h *hotel) { dropSent = h.alerts.dropSent })
+	if !dropSent {
+		t.Fatal("dropSent still false after delivery")
 	}
 }
 
@@ -430,5 +492,128 @@ func TestWebhookFailureRetriesThenDelivers(t *testing.T) {
 	}
 	if op != 1 || ops != 1 {
 		t.Fatalf("want one operator and one ops delivery after recovery, got op=%d ops=%d posts=%+v", op, ops, posts)
+	}
+}
+
+// TestWebhookGiveUpThenSyncRetries: when POST fails through the whole retry
+// window the streak stays unconsumed and a later sync can enqueue again once
+// the webhook answers.
+func TestWebhookGiveUpThenSyncRetries(t *testing.T) {
+	oldAtt, oldBackoff := alertPostMaxAttempts, alertPostBackoff
+	alertPostMaxAttempts = 3
+	alertPostBackoff = time.Millisecond
+	t.Cleanup(func() { alertPostMaxAttempts, alertPostBackoff = oldAtt, oldBackoff })
+
+	tc := newChain(t)
+	fail := true
+	a := tc.b.alerts
+	a.opsChat = "-100200"
+	var mu sync.Mutex
+	var posts []alertMsg
+	a.post = func(_ context.Context, m alertMsg) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if fail {
+			return errors.New("status 503")
+		}
+		posts = append(posts, m)
+		return nil
+	}
+	setHotel(tc, "a", func(h *hotel) { h.cfg.AlertChatID = "4242" })
+	syncNow(tc, "a")
+	setHealthFail(tc, "a", true)
+	syncNow(tc, "a")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { a.run(ctx); close(done) }()
+	waitGiveUp := func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			var inflight bool
+			setHotel(tc, "a", func(h *hotel) { inflight = h.alerts.missInflight })
+			if !inflight {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatal("missInflight still true after POST give-up window")
+	}
+	waitGiveUp()
+	var missSent bool
+	setHotel(tc, "a", func(h *hotel) { missSent = h.alerts.missSent })
+	if missSent {
+		t.Fatal("missSent set after POST give-up without delivery")
+	}
+
+	fail = false
+	syncNow(tc, "a")
+	waitGiveUp()
+	cancel()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	var op int
+	for _, m := range posts {
+		if m.ChatID == "4242" {
+			op++
+		}
+	}
+	if op != 1 {
+		t.Fatalf("want one operator delivery after sync retry, got %d posts=%+v", op, posts)
+	}
+	setHotel(tc, "a", func(h *hotel) { missSent = h.alerts.missSent })
+	if !missSent {
+		t.Fatal("missSent still false after delivery")
+	}
+}
+
+// TestContinuedDowntimeAfterFullQueueFirstOpsDrop: hotel stays down while the
+// ops alert waits out a full queue, then delivers on the next sync.
+func TestContinuedDowntimeAfterFullQueueFirstOpsDrop(t *testing.T) {
+	tc := newChain(t)
+	a := tc.b.alerts
+	a.post = func(context.Context, alertMsg) error { return nil }
+	a.opsChat = "-100200"
+	syncNow(tc, "a")
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+	for i := 0; i < alertQueueSize; i++ {
+		a.queue <- alertJob{msg: alertMsg{ChatID: "fill", Text: "x"}}
+	}
+	alertGoDown(tc, "a")
+	syncNow(tc, "a")
+	syncNow(tc, "a") // still down, queue still full: no consume
+	var dropSent bool
+	setHotel(tc, "a", func(h *hotel) { dropSent = h.alerts.dropSent })
+	if dropSent {
+		t.Fatal("dropSent set while queue full and hotel still down")
+	}
+	for {
+		select {
+		case <-a.queue:
+		default:
+			goto drained
+		}
+	}
+drained:
+	syncNow(tc, "a")
+	var ops int
+	for {
+		select {
+		case job := <-a.queue:
+			if job.msg.ChatID == "-100200" {
+				ops++
+				if job.onSuccess != nil {
+					job.onSuccess()
+				}
+			}
+		default:
+			goto done
+		}
+	}
+done:
+	if ops != 1 {
+		t.Fatalf("want one ops alert after continued downtime, got %d", ops)
 	}
 }
