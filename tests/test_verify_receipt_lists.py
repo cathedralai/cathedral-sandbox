@@ -991,8 +991,7 @@ def test_the_order_of_faults_is_depth_number_length_surrogate_then_the_parse(nam
     documents = [
         (b'{"a": 1, "a": "\\ud800"}', f"inputs: {what} holds an unpaired surrogate"),             # surrogate, then key
         (b'{"a": 1.5, "b": "\\ud800"}', f"inputs: {what} holds an unpaired surrogate"),           # then float
-        (b'{"a": ' + b"1" * 101 + b', "b": "\\ud800"}', f"inputs: {what} holds a number literal of more than "
-                                                          "100 characters"),
+        (b'{"a": ' + b"1" * 101 + b', "b": "\\ud800"}', f"inputs: {what} holds a number literal of more than 100 characters"),
         (b"[" * 65 + b'"\\ud800"' + b"]" * 65, f"inputs: {what} nests too deeply to read"),
         (b"[" * 65 + b"1" * 101 + b"]" * 65, f"inputs: {what} nests too deeply to read"),
     ]
