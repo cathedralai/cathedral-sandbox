@@ -1257,6 +1257,13 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			return
 		}
 	}
+	// The hotel's own desktop routes stay closed on every hotel: the broker
+	// forwards plain requests, never a WebSocket, and the availability
+	// answer names the hotel's internal address. A desktop runs over exec.
+	if tail == "desktop" || strings.HasPrefix(tail, "desktop/") {
+		writeErr(w, 403, "desktop_disabled", "room desktop routes are disabled on every hotel; drive a desktop over exec")
+		return
+	}
 	// The tail goes to the hotel as part of its path. A dot segment would
 	// climb out of this room if anything between us and the hotel normalized it.
 	for _, seg := range strings.Split(tail, "/") {
