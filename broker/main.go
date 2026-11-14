@@ -1748,7 +1748,7 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 	wg.Wait()
 	if claimBusy {
 		writeJSON(w, 409, map[string]any{"error": map[string]string{
-			"code": "bulk_delete_claim_busy", "message": "a room claim is running; retry the bulk delete",
+			"code": "bulk_delete_claim_busy", "message": "bulk deletion may be incomplete after a room claim; retry it",
 		}, "hotels": res})
 		return
 	}
