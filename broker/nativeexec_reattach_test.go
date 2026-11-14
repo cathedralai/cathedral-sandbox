@@ -73,7 +73,6 @@ func frontKey(hotelID, path, handle string) string {
 }
 
 func (ff *fakeFront) exec(w http.ResponseWriter, r *http.Request, hotelID string) {
-	ff.execs.Add(1)
 	raw, _ := io.ReadAll(r.Body)
 	var req map[string]any
 	_ = json.Unmarshal(raw, &req)
@@ -85,6 +84,9 @@ func (ff *fakeFront) exec(w http.ResponseWriter, r *http.Request, hotelID string
 		ff.entries[frontKey(hotelID, r.URL.Path, handle)] = e
 		ff.mu.Unlock()
 	}
+	// Counted once the entry is stored, so a test that waits on the count
+	// also sees the entry.
+	ff.execs.Add(1)
 	<-ff.gate // the command runs on when the caller goes away
 	cmd, _ := req["cmd"].([]any)
 	name, _ := cmd[0].(string)
@@ -208,13 +210,35 @@ func crashRestart(t *testing.T, tc *testChain) {
 	tc.restart(t)
 }
 
-func startBGToken(t *testing.T, tc *testChain, bid, cmd, token string, timeout int) string {
+// startBGToken starts a background exec and returns once the front holds it.
+// A 202 only means the broker saved its entry; the hotel call runs on in a
+// goroutine. A restart before that call arrives is a real outcome (the hotel
+// never got the command, so re-attach reports hotel_lost_exec), but the
+// tests here measure a command already running in the hotel.
+func startBGToken(t *testing.T, tc *testChain, ff *fakeFront, bid, cmd, token string, timeout int) string {
 	t.Helper()
 	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+bid+"/execs", map[string]any{"cmd": []string{cmd}, "timeout_seconds": timeout, "spill_token": token})
 	if status != 202 || doc["state"] != "running" {
 		t.Fatalf("start: %d %v", status, doc)
 	}
-	return doc["exec_id"].(string)
+	eid := doc["exec_id"].(string)
+	tc.b.nexec.mu.Lock()
+	handle := tc.b.nexec.execs[eid].Handle
+	tc.b.nexec.mu.Unlock()
+	waitFor(t, "the front to hold exec "+cmd, func() bool { return ff.holds(handle) })
+	return eid
+}
+
+// holds reports whether the front has an entry for this handle.
+func (ff *fakeFront) holds(handle string) bool {
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
+	for k := range ff.entries {
+		if strings.HasSuffix(k, "|"+handle) {
+			return true
+		}
+	}
+	return false
 }
 
 func tokenN(i int) string { return fmt.Sprintf("%032x", i+1) }
@@ -232,7 +256,7 @@ func TestNativeExecReattachAfterRestartReturnsRealResult(t *testing.T) {
 	fastResume(t)
 	tc, ff := frontChain(t, t.TempDir())
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
-	eid := startBGToken(t, tc, bid, "job", tokenN(0), 600)
+	eid := startBGToken(t, tc, ff, bid, "job", tokenN(0), 600)
 	path := "/v1/sandboxes/" + bid + "/execs/" + eid
 	crashRestart(t, tc)
 	if status, _, doc := tc.rawCall(t, "key1", "GET", path+"?wait=1", nil); status != 200 || doc["state"] != "running" {
@@ -268,7 +292,7 @@ func TestNativeExecReattachHotelLostExecIsLost(t *testing.T) {
 	fastResume(t)
 	tc, ff := frontChain(t, t.TempDir())
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
-	eid := startBGToken(t, tc, bid, "job", tokenN(0), 600)
+	eid := startBGToken(t, tc, ff, bid, "job", tokenN(0), 600)
 	ff.mu.Lock()
 	ff.forget = true // the front restarted: its memory is gone
 	ff.mu.Unlock()
@@ -286,7 +310,7 @@ func TestNativeExecRestartDuringReattach(t *testing.T) {
 	fastResume(t)
 	tc, ff := frontChain(t, t.TempDir())
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
-	eid := startBGToken(t, tc, bid, "job", tokenN(0), 600)
+	eid := startBGToken(t, tc, ff, bid, "job", tokenN(0), 600)
 	path := "/v1/sandboxes/" + bid + "/execs/" + eid
 	crashRestart(t, tc)
 	waitFor(t, "the second broker to read the hotel", func() bool { return ff.reads.Load() >= 1 })
@@ -311,8 +335,8 @@ func TestNativeExecReattachSameSpillTokenKeepsEachResult(t *testing.T) {
 	tc, ff := frontChain(t, t.TempDir())
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
 	tok := tokenN(7)
-	a := startBGToken(t, tc, bid, "alpha", tok, 600)
-	b := startBGToken(t, tc, bid, "beta", tok, 600)
+	a := startBGToken(t, tc, ff, bid, "alpha", tok, 600)
+	b := startBGToken(t, tc, ff, bid, "beta", tok, 600)
 	crashRestart(t, tc)
 	ff.release()
 	for id, name := range map[string]string{a: "alpha", b: "beta"} {
@@ -327,7 +351,7 @@ func TestNativeExecReattachDoneReplayOf502IsHotelError(t *testing.T) {
 	fastResume(t)
 	tc, ff := frontChain(t, t.TempDir())
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
-	eid := startBGToken(t, tc, bid, "job", tokenN(0), 600)
+	eid := startBGToken(t, tc, ff, bid, "job", tokenN(0), 600)
 	ff.mu.Lock()
 	ff.status = 502 // the room API did not answer the exec itself
 	ff.mu.Unlock()
@@ -347,7 +371,7 @@ func TestNativeExecReattachTransientErrorsKeepItRunning(t *testing.T) {
 	fastResume(t)
 	tc, ff := frontChain(t, t.TempDir())
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
-	eid := startBGToken(t, tc, bid, "job", tokenN(0), 600)
+	eid := startBGToken(t, tc, ff, bid, "job", tokenN(0), 600)
 	ff.mu.Lock()
 	ff.transient = 3
 	ff.mu.Unlock()
@@ -367,7 +391,7 @@ func TestNativeExecReattachDeadlineEndsAnUnreachableHotel(t *testing.T) {
 	nativeExecResumeGrace = 300 * time.Millisecond
 	tc, ff := frontChain(t, t.TempDir())
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
-	eid := startBGToken(t, tc, bid, "job", tokenN(0), 1)
+	eid := startBGToken(t, tc, ff, bid, "job", tokenN(0), 1)
 	ff.mu.Lock()
 	ff.transient = 1 << 30
 	ff.mu.Unlock()
@@ -384,7 +408,7 @@ func TestNativeExecReattachRunningAnswersStopAtTheDeadlineAndAreSpaced(t *testin
 	nativeExecResumeGap = 200 * time.Millisecond
 	tc, ff := frontChain(t, t.TempDir())
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
-	eid := startBGToken(t, tc, bid, "job", tokenN(0), 1)
+	eid := startBGToken(t, tc, ff, bid, "job", tokenN(0), 1)
 	ff.mu.Lock()
 	ff.never = true // a front that answers running at once, whatever the wait
 	ff.mu.Unlock()
@@ -421,7 +445,7 @@ func TestNativeExecReattachDeleteDuringResumeIsKilled(t *testing.T) {
 	fastResume(t)
 	tc, ff := frontChain(t, t.TempDir())
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
-	eid := startBGToken(t, tc, bid, "job", tokenN(0), 600)
+	eid := startBGToken(t, tc, ff, bid, "job", tokenN(0), 600)
 	path := "/v1/sandboxes/" + bid + "/execs/" + eid
 	crashRestart(t, tc)
 	waitFor(t, "a resume read", func() bool { return ff.reads.Load() >= 1 })
@@ -438,7 +462,7 @@ func TestNativeExecStopEndsResumeAtOnceAndKeepsItRunning(t *testing.T) {
 	fastResume(t)
 	tc, ff := frontChain(t, t.TempDir())
 	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
-	eid := startBGToken(t, tc, bid, "job", tokenN(0), 600)
+	eid := startBGToken(t, tc, ff, bid, "job", tokenN(0), 600)
 	crashRestart(t, tc)
 	waitFor(t, "a resume read", func() bool { return ff.reads.Load() >= 1 })
 	start := time.Now()
