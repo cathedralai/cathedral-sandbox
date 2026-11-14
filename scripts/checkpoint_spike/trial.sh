@@ -1,9 +1,13 @@
 #!/bin/bash
 # trial.sh NAME FILL_GIB MEM_GIB [COMPRESSION] [EXTRA_RUNSC_FLAGS]
-set -u
+set -eu
 NAME=$1 FILL=$2 MEM=$3 COMP=${4:-none} EXTRA=${5:-}
 S=$(cd "$(dirname "$0")" && pwd); RUNS=${RUNS:-/var/tmp/ckspike}
-B=$RUNS/$NAME IMG=${IMGROOT:-$RUNS}/$NAME-img
+# shellcheck source=scratch.sh
+. "$S/scratch.sh"
+ckspike_require_name "$NAME"
+B=$(ckspike_under_root "$RUNS" "$RUNS/$NAME" "bundle")
+IMG=$(ckspike_under_root "${IMGROOT:-$RUNS}" "${IMGROOT:-$RUNS}/$NAME-img" "image")
 R="runsc --root /run/ckspike-runsc --platform=systrap --overlay2=none --net-raw $EXTRA"
 bash "$S/net.sh" down; bash "$S/net.sh" up >/dev/null
 echo "load: $(cut -d" " -f1-3 /proc/loadavg)"
@@ -21,6 +25,7 @@ MEMCUR=$(cat "$CG/memory.current" 2>/dev/null || echo NA)
 [ -n "${BUMP:-}" ] && echo $((MEM*2))G > "$CG/memory.max"
 grep -E "^(max|oom|high)" "$CG/memory.events" | tr "\n" " "; echo
 t1=$(now); $R checkpoint -image-path "$IMG" -compression "$COMP" ${CKPT_EXTRA:-} "$NAME"; rc=$?; t2=$(now)
+if [ "$rc" -ne 0 ]; then echo "checkpoint failed rc=$rc"; cat "$B/out.log"; exit "$rc"; fi
 grep -E "^(max|oom|high)" "$CG/memory.events" 2>/dev/null | tr "\n" " "; echo
 SZ=$(du -sb "$IMG" | cut -f1)
 LASTPRE=$(tail -1 "$B/work/state.log")
@@ -29,6 +34,7 @@ sync; echo 3 > /proc/sys/vm/drop_caches
 sleep 3
 PRELINES=$(wc -l < "$B/work/state.log")
 t3=$(now); $R restore -bundle "$B" -image-path "$IMG" -detach "$NAME" >>"$B/out.log" 2>&1 </dev/null; rrc=$?; t4=$(now)
+if [ "$rrc" -ne 0 ]; then echo "restore failed rc=$rrc"; cat "$B/out.log"; exit "$rrc"; fi
 for i in $(seq 1 600); do [ "$(wc -l < "$B/work/state.log")" -gt "$PRELINES" ] && break; sleep 0.05; done
 t5=$(now)
 touch "$B/work/touch"; for i in $(seq 1 1200); do [ -f "$B/work/touch" ] || break; sleep 0.05; done
