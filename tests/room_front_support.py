@@ -137,6 +137,8 @@ class FakeApi:
                 return self._send(h, 200, json.dumps({"id": room}).encode())
             return self._send(h, 404, b'{"error":{"code":"sandbox_not_found","message":"no such room"}}')
         if re.fullmatch(r"POST /v1/sandboxes/[^/]+/lifetime", line):
+            if line.split("/")[3] not in rooms_now:
+                return self._send(h, 404, b'{"error":{"code":"sandbox_not_found","message":"no such room"}}')
             return self._send(h, 200, json.dumps({"expires_at": self._stamp(self.expires_in)}).encode())
         if re.fullmatch(r"POST /v1/sandboxes/[^/]+/exec", line):
             return self._send(h, 200, b'{"exit_code":0}')
@@ -307,12 +309,13 @@ def assert_idle(ledger) -> None:
             if (not getattr(ledger, "in_flight", {}) and not getattr(ledger, "busy", set())
                     and not getattr(ledger, "touched", set()) and not getattr(ledger, "creates_in_flight", 0)
                     and not getattr(ledger, "overflow", False) and not getattr(ledger, "bulk_in_flight", 0)
-                    and not getattr(ledger, "claims_in_flight", 0)):
+                    and not getattr(ledger, "claims_in_flight", 0) and not getattr(ledger, "bulk_pending", 0)):
                 return
         time.sleep(0.01)
     with ledger.lock:
         assert getattr(ledger, "in_flight", {}) == {}, "an in-flight count leaked"
         assert getattr(ledger, "claims_in_flight", 0) == 0, "a claim count leaked"
+        assert getattr(ledger, "bulk_pending", 0) == 0, "a waiting or running bulk delete stayed counted"
         assert getattr(ledger, "busy", set()) == set(), "a token stayed held"
         assert getattr(ledger, "touched", set()) == set(), "the touched set was not cleared"
         assert getattr(ledger, "creates_in_flight", 0) == 0, "a create stayed counted"

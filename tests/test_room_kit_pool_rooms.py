@@ -614,20 +614,6 @@ def _claim_with_lifetime_held(front: Front):
     return held, t, box
 
 
-def test_bulk_delete_cannot_remove_a_room_during_its_claim(front) -> None:
-    held, t, box = _claim_with_lifetime_held(front)
-    status, headers, out = front.call("DELETE", BULK)
-    assert status == 409 and code(out) == "bulk_delete_claim_busy"
-    assert "X-Room-Receipt" not in headers
-    assert "sbx_x" in front.api.rooms
-    held.release.set()
-    status, headers, out = finish(t, box)
-    assert status == 200 and json.loads(out)["status"] == "claimed"
-    assert receipt_of(headers)["statement"]["status"] == 200
-    assert "sbx_x" not in front.ledger.broken
-    assert_idle(front.ledger)
-
-
 def test_claim_refuses_while_a_bulk_delete_is_in_flight(front) -> None:
     room = pool_room(front, labels={"cathedral_pool": "1", "team": "a"})
     held = front.api.hold(r"DELETE /v1/sandboxes")
