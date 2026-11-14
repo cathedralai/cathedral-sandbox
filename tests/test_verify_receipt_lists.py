@@ -1335,6 +1335,27 @@ def test_run_mode_refuses_a_flag_given_as_an_empty_string(flag) -> None:
     assert code == 2 and out == "" and f"it takes no {flag}" in err, (out, err)
 
 
+RUN_MODE_ONLY = [
+    ("--allowed-measurements", "/tmp/allowed.json"), ("--recipe", "/tmp/recipe.json"), ("--run-id", "run-1"),
+    ("--context", "/tmp/context.json"), ("--no-context", None), ("--input-sha256", "in.txt=" + "ab" * 32),
+    ("--input-file", "in.txt=/tmp/in.txt"), ("--output-file", "out.txt=/tmp/out.txt"), ("--oneshot", ""),
+]
+
+
+@pytest.mark.parametrize("flag, value", RUN_MODE_ONLY, ids=[f[0] for f in RUN_MODE_ONLY])
+def test_list_mode_refuses_a_run_mode_flag(flag, value, tmp_path) -> None:
+    """A run-mode flag no list check reads would be a PASS without its check (an unsealed chain passed with
+    --allowed-measurements), so list mode refuses it as a usage error."""
+    folder = PACK.parent / "old_lists" / "cases" / "hotel_level1_list"
+    allowed = tmp_path / "allowed.json"
+    allowed.write_text('["00"]')
+    value = str(allowed) if flag == "--allowed-measurements" else value
+    code, out, err = _run_cli("--attestation", str(folder / "attestation_doc.json"),
+                              "--receipts", str(folder / "receipts.json"), flag, *([value] if value is not None else []))
+    assert code == 2 and out == "", (out, err)
+    assert f"list mode takes no {flag}" in err
+
+
 @pytest.mark.parametrize("value", ["~/.cache/amd-kds", "__EXPANDED__"])
 def test_run_mode_refuses_the_kds_cache_given_with_its_old_default(value) -> None:
     import os
