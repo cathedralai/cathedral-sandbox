@@ -233,8 +233,8 @@ def test_audio_streams_with_its_example_turns_and_none_reach_stdout(model: Strea
     assert body["stream"] is True and "tools" in body
     sent = body["messages"]
     assert [m["role"] for m in sent] == ["system", "user", "assistant", "user", "assistant", "tool", "assistant", "user", "assistant", "user"]
-    assert sent[3]["content"] == "Is cowsay installed on this machine?" and sent[-1]["content"] == "What is 2+2?"
-    for word in (b"cowsay", b"Bonjour", b"12."):
+    assert sent[3]["content"] == "What umask is this machine set to?" and sent[-1]["content"] == "What is 2+2?"
+    for word in (b"0022", b"Bonjour", b"12."):
         assert word not in done.stdout
 
 

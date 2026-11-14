@@ -312,11 +312,11 @@ FINAL_LINE = "Now answer my message in text, without tools."
 AUDIO_EXAMPLES = [
     {"role": "user", "content": "What is 5 plus 7?"},
     {"role": "assistant", "content": "12."},
-    {"role": "user", "content": "Is cowsay installed on this machine?"},
+    {"role": "user", "content": "What umask is this machine set to?"},
     {"role": "assistant", "content": "", "tool_calls": [{"id": "call_example", "type": "function",
-     "function": {"name": "run", "arguments": '{"command": "command -v cowsay"}'}}]},
-    {"role": "tool", "tool_call_id": "call_example", "name": "run", "content": "exit code: 1\n"},
-    {"role": "assistant", "content": "No, cowsay is not installed here."},
+     "function": {"name": "run", "arguments": '{"command": "umask"}'}}]},
+    {"role": "tool", "tool_call_id": "call_example", "name": "run", "content": "exit code: 0\n0022\n"},
+    {"role": "assistant", "content": "It is set to 0022."},
     {"role": "user", "content": "Say good morning in French."},
     {"role": "assistant", "content": "Bonjour."},
 ]
@@ -339,7 +339,7 @@ def test_audio_gets_example_turns_before_the_conversation_and_keeps_none(fake: F
         {"role": "user", "content": "What is 2+2?"}, {"role": "assistant", "content": "4."},
         {"role": "user", "content": "And 3+3?"}, {"role": "assistant", "content": "6."}]
     shown = room("--history", MODEL=AUDIO).stdout
-    assert "cowsay" not in shown and "Bonjour" not in shown
+    assert "0022" not in shown and "Bonjour" not in shown
 
 
 @pytest.mark.parametrize("model", ["lfm3-omni-2b", "lfm3-vl-2b"])

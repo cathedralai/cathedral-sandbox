@@ -184,7 +184,7 @@ for check in "${checks[@]}"; do
           exit 1
         fi
         # lfm3-agent's example turns for Audio (AB#545) must not come back as the answer.
-        if grep -Eq '^(12\.|Bonjour\.)$|cowsay' <<<"$out"; then
+        if grep -Eq '^(12\.|Bonjour\.)$|0022' <<<"$out"; then
           echo "FAIL $check: the answer repeats an example turn"
           exit 1
         fi

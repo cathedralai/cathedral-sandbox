@@ -214,12 +214,16 @@ kinds of room:
   at 0.89 to 1.00 whatever the question, so neither sampling nor a reworded
   system prompt changed it. In Audio rooms a round that offers tools starts
   with three fixed example turns after the system prompt: a sum and a
-  translation answered in text, and "Is cowsay installed on this machine?"
+  translation answered in text, and "What umask is this machine set to?"
   answered with `run`. They are not kept in the conversation, never shown,
   count against the 4,000-character budget, and are not sent with
-  `--no-tools`, `--json` or the last round. The tool example names a program
-  nobody asks about: an example with a real fact (an IP address) came back as
-  Audio's answer to "What is the hostname?" with no call.
+  `--no-tools`, `--json` or the last round. Local eval (pinned GGUF and
+  llama.cpp, 14 no-tool and 17 tool questions, 2 runs): needless calls 26/28
+  before, 0/28 after; tool questions kept a call 34/34. The tool example
+  holds a fact nobody asks about: a fact there (an IP address, a timezone)
+  came back as Audio's answer to the matching question with no call. An
+  example about an installed program or an open port made Audio answer
+  "What is the hostname?" with `hostname -I` and an IP address.
 - **JSON.** `--json` sends a JSON schema (an object or an array) as
   `response_format`, which llama-server turns into a grammar, plus one system
   line asking for valid JSON with no comments, and no tools. The grammar fixes

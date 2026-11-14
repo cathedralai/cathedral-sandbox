@@ -319,22 +319,28 @@ TOOLS='[
 # so no sampling setting changes it, and rewording the system prompt did not
 # either. Three short example turns before the conversation do: two answered
 # without a tool, one about this machine that calls run. Measured on the pinned
-# GGUF and llama.cpp commit (local, not a sealed host), the first token was
-# right for 30 of 30 questions (6 and 8 that need no tool, 8 and 8 that do; the
-# second sets were not used to pick the examples). The tool example is about a
-# program nobody asks for, because a reusable fact in it leaked: with an IP
-# address there, Audio answered the hostname with that address and no call.
+# GGUF and llama.cpp commit (local, not a sealed host, 14 Nov 2026), 14
+# questions that need no tool and 17 that do, 2 runs each: needless calls 26 of
+# 28 before, 0 of 28 after; questions that need a tool kept a call 34 of 34.
+# The tool example asks for a machine fact nobody asks about (the umask):
+# a fact in it comes back as the answer to the same question with no call
+# (an IP address answered "What is the hostname?"; a timezone and a time did
+# the same). It is a short "What X is this machine set to?" on purpose: with
+# "Is cowsay installed?" or "Is anything listening on port 8080?" instead,
+# Audio often ran hostname -I and answered the hostname with an IP address
+# (18 and 4 of 20 and 10), which fails lfm3-selftest agent; with this one it ran
+# hostname 20 of 20.
 # Sent only on rounds that offer tools, never kept in the conversation.
 case "${MODEL:-}" in
   *audio*)
     EXAMPLES='[
   {"role": "user", "content": "What is 5 plus 7?"},
   {"role": "assistant", "content": "12."},
-  {"role": "user", "content": "Is cowsay installed on this machine?"},
+  {"role": "user", "content": "What umask is this machine set to?"},
   {"role": "assistant", "content": "", "tool_calls": [{"id": "call_example", "type": "function",
-    "function": {"name": "run", "arguments": "{\"command\": \"command -v cowsay\"}"}}]},
-  {"role": "tool", "tool_call_id": "call_example", "name": "run", "content": "exit code: 1\n"},
-  {"role": "assistant", "content": "No, cowsay is not installed here."},
+    "function": {"name": "run", "arguments": "{\"command\": \"umask\"}"}}]},
+  {"role": "tool", "tool_call_id": "call_example", "name": "run", "content": "exit code: 0\n0022\n"},
+  {"role": "assistant", "content": "It is set to 0022."},
   {"role": "user", "content": "Say good morning in French."},
   {"role": "assistant", "content": "Bonjour."}
 ]'
