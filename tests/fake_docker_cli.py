@@ -128,6 +128,9 @@ def main(argv):
         return 0
 
     if cmd == "commit":
+        if b.get("commit_fail"):
+            print("Error response from daemon: commit failed", file=sys.stderr)
+            return 1
         with Locked() as st:
             if find(st, argv[-2]) is None:
                 print(f"Error response from daemon: No such container: {argv[-2]}", file=sys.stderr)
@@ -444,7 +447,21 @@ def main(argv):
             return 1
         return 0
 
-    if cmd in ("exec", "inspect", "network", "pause", "unpause"):
+    if cmd in ("pause", "unpause"):
+        # The container's status follows the engine: pause then unpause leaves it running,
+        # and a container that is gone fails the way docker does.
+        if b.get(cmd + "_fail"):
+            print(f"Error response from daemon: {cmd} failed", file=sys.stderr)
+            return 1
+        with Locked() as st:
+            cid = find(st, argv[-1])
+            if cid is None:
+                print(f"Error response from daemon: No such container: {argv[-1]}", file=sys.stderr)
+                return 1
+            st["containers"][cid]["status"] = "paused" if cmd == "pause" else "running"
+        return 0
+
+    if cmd in ("exec", "inspect", "network"):
         return 0
 
     print(f"fake docker: unsupported command {argv}", file=sys.stderr)
@@ -523,6 +540,19 @@ class FakeDocker:
     @property
     def calls(self) -> list[list[str]]:
         return self._load()["calls"]
+
+    def mark(self, name: str) -> None:
+        """Put a marker in the call log, so a test can order its own steps (for example a tar) among docker calls."""
+        state = self._load()
+        state["calls"].append([name])
+        self._save(state)
+
+    def status_of(self, sandbox_id: str) -> str | None:
+        """The engine status ("running", "paused", "exited") of a room's container, None when gone."""
+        for c in self._load()["containers"].values():
+            if c["labels"].get("cathedral.sandbox.id") == sandbox_id:
+                return c["status"]
+        return None
 
     def calls_of(self, *prefix: str) -> list[list[str]]:
         return [c for c in self.calls if c[: len(prefix)] == list(prefix)]

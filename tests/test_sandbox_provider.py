@@ -491,7 +491,7 @@ def test_snapshot_store_full_returns_429() -> None:
         p.snapshot(sid, ttl_seconds=60)
         with pytest.raises(SandboxOpError) as ei:
             p.snapshot(sid, ttl_seconds=60)
-        assert ei.value.http_status == 429 and ei.value.code == "snapshot_quota"
+        assert ei.value.http_status == 429 and ei.value.code == "snapshot_store_sold_out"
     finally:
         p.close()
 
