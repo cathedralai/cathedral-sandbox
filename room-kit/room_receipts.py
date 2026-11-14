@@ -2275,6 +2275,8 @@ SIGNED = [  # (method, path pattern, action)
     ("POST", re.compile(r"^/v1/sandboxes$"), "create"),
     ("POST", re.compile("^" + ROOM + r"/exec$"), "exec"),
     ("POST", re.compile("^" + ROOM + r"/processes$"), "process_start"),
+    ("POST", re.compile("^" + ROOM + r"/snapshot$"), "snapshot"),
+    ("DELETE", re.compile(r"^/v1/snapshots/(?P<id>[^/]+)$"), "snapshot_delete"),
     ("DELETE", re.compile("^" + ROOM + r"$"), "delete"),
     ("PUT", re.compile("^" + ROOM + r"/network$"), "network_set"),
     ("POST", re.compile("^" + ROOM + r"/network$"), "network_set"),
@@ -2282,8 +2284,6 @@ SIGNED = [  # (method, path pattern, action)
     ("DELETE", re.compile(r"^/v1/sandboxes$"), "bulk_delete"),
     ("PUT", re.compile("^" + ROOM + r"/files$"), "file_put"),
     ("GET", re.compile("^" + ROOM + r"/files$"), "file_get"),
-    ("POST", re.compile("^" + ROOM + r"/snapshot$"), "snapshot"),
-    ("DELETE", re.compile(r"^/v1/snapshots/(?P<id>[^/]+)$"), "snapshot_delete"),
 ]
 # Dedicated machine: the requests that start code need the owner signature.
 # A build runs Dockerfile steps in the guest, and the broker sends builds to
@@ -2614,6 +2614,9 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             # Opened here; only the opened overlay goes on, inside the guest, to the room API.
             return self.handle_sealed_env(ledger, m["id"], body)
+        if self.command == "POST" and SNAPSHOT_PUSH.match(path) and self.authorized():
+            # A sealed machine does not push a snapshot to a registry: unsent, unsigned.
+            return self.reply(403, b'{"error":{"code":"snapshot_push_refused","message":"a sealed machine does not push a snapshot"}}')
         if any(route.match(p) for route in INTERNAL_API_ROUTES for p in (path, unquote(path))):
             # The room API's sealed exec route runs an exec that leaves no history or log, and
             # its env-sealed route sets a room's env from an envelope this front opened; neither
@@ -2621,9 +2624,6 @@ class Handler(BaseHTTPRequestHandler):
             # them (urlparse drops a ";params" suffix, then the raw path), and decoded too; any
             # other path, flag on or off, passes as before.
             return self.reply(404, b'{"error":{"code":"route_not_found","message":"no such route"}}')
-        if self.command == "POST" and SNAPSHOT_PUSH.match(path) and self.authorized():
-            # A sealed machine does not push a snapshot to a registry: unsent, unsigned.
-            return self.reply(403, b'{"error":{"code":"snapshot_push_refused","message":"a sealed machine does not push a snapshot"}}')
         action = next((a for meth, pat, a in SIGNED if meth == self.command and pat.match(path)), None)
         if action and body:
             # A JSON escape of a lone surrogate parses, but cannot be encoded
