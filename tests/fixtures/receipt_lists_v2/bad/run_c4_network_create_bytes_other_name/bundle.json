@@ -256,7 +256,7 @@
     "sha256": "492d5ea496056f1a6a6592241032fab764c321596317930b4fa0e1e8bc3b7470"
    }
   ],
-  "max_spend_usd": 5,
+  "max_spend_usd": "0.50",
   "network": {
    "allow": [
     "example.org"

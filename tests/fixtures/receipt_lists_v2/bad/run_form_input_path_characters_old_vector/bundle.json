@@ -225,7 +225,7 @@
     "sha256": "95a9e4d5ed309110aace7294e8bbfe16b80174390dcce8a98dc264f9b9480bc4"
    }
   ],
-  "max_spend_usd": 5,
+  "max_spend_usd": "0.50",
   "network": {
    "allow": [],
    "mode": "deny_all"

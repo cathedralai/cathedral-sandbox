@@ -56,7 +56,7 @@
     "path": "/work/in/f8.bin"
    }
   ],
-  "max_spend_usd": 5,
+  "max_spend_usd": "0.50",
   "network": {
    "allow": [],
    "mode": "deny_all"

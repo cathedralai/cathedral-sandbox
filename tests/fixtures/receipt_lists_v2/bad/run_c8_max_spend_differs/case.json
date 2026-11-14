@@ -17,7 +17,7 @@
   "--output-file",
   "/work/out/result.json={dir}/outputs/result.json"
  ],
- "description": "The recipe's max_spend_usd is 1; the file says 5.",
+ "description": "The recipe's max_spend_usd is 1; the file says the string 0.50.",
  "expect": {
   "exit_code": 1,
   "reason": "check 8: the request in the file differs from the recipe in max_spend_usd",

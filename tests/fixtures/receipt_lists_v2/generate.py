@@ -621,7 +621,7 @@ def base_recipe() -> dict:
         "request": {
             "image": IMAGE_REF, "command": ["python", RUN_PATH], "env": {"MODE": "check"}, "cwd": "/work",
             "size": "sealed-1x2", "timeout_seconds": 60, "network": {"mode": "deny_all", "allow": []},
-            "image_id": IMAGE_ID, "max_spend_usd": 5,
+            "image_id": IMAGE_ID, "max_spend_usd": "0.50",
             "outputs": [{"path": RESULT_PATH, "max_bytes": 1048576, "optional": False},
                         {"path": LOG_PATH, "max_bytes": 65536, "optional": True}],
             "inputs": [{"path": RUN_PATH, "mode": "755"}, {"path": DATA_PATH, "mode": "644"}]},
@@ -1236,7 +1236,7 @@ def run_hardening_cases(pack: Pack) -> None:
     bad("run_c8_outputs_not_a_list", "The file's outputs is a number.",
         fail(8, "the request in the file differs from the recipe in outputs"),
         bundle_edit=lambda b: b["request"].update(outputs=123))
-    bad("run_c8_max_spend_differs", "The recipe's max_spend_usd is 1; the file says 5.",
+    bad("run_c8_max_spend_differs", "The recipe's max_spend_usd is 1; the file says the string 0.50.",
         fail(8, "the request in the file differs from the recipe in max_spend_usd"),
         recipe_edit=lambda r: r["request"].update(max_spend_usd=1))
 
@@ -1412,6 +1412,7 @@ _IMG = "images.example.test/"
 _DIGEST = "@sha256:" + "a" * 64
 USER_FORM = ("recipe: user must be digits only, or a name of letters, digits, _ and - that starts with a letter or _ "
              "and may end in $")
+MAX_SPEND_RULE = "max_spend_usd must be an integer of at least 1 or a decimal string greater than zero"
 IN_PATH = "an input path"
 OUT_PATH = "an output path"
 
@@ -1485,6 +1486,29 @@ def build_form_rules():
            "recipe: an output max_bytes must be at least 1"),
           ("negative", _outs({"path": "/work/out/x", "max_bytes": -1, "optional": False}),
            "recipe: an output max_bytes must be at least 1")]),
+        ("max_spend_integer", _knobs(max_spend_usd=1), []),
+        ("max_spend_small_decimal", _knobs(max_spend_usd="0.000001"), []),
+        ("max_spend_long_decimal", _knobs(max_spend_usd="100.123456"), []),
+        ("max_spend_whole_string", _knobs(max_spend_usd="12"), []),
+        ("max_spend_form", _knobs(max_spend_usd="0.50"), [
+            ("zero", _knobs(max_spend_usd=0), "recipe: " + MAX_SPEND_RULE),
+            ("negative", _knobs(max_spend_usd=-1), "recipe: " + MAX_SPEND_RULE),
+            ("boolean", _knobs(max_spend_usd=True), "recipe: " + MAX_SPEND_RULE),
+            ("zero_string", _knobs(max_spend_usd="0"), "recipe: " + MAX_SPEND_RULE),
+            ("zero_point_zero", _knobs(max_spend_usd="0.0"), "recipe: " + MAX_SPEND_RULE),
+            ("zero_point_six_zeros", _knobs(max_spend_usd="0.000000"), "recipe: " + MAX_SPEND_RULE),
+            ("leading_point", _knobs(max_spend_usd=".5"), "recipe: " + MAX_SPEND_RULE),
+            ("trailing_point", _knobs(max_spend_usd="1."), "recipe: " + MAX_SPEND_RULE),
+            ("exponent", _knobs(max_spend_usd="1e3"), "recipe: " + MAX_SPEND_RULE),
+            ("plus_sign", _knobs(max_spend_usd="+1"), "recipe: " + MAX_SPEND_RULE),
+            ("leading_space", _knobs(max_spend_usd=" 1"), "recipe: " + MAX_SPEND_RULE),
+            ("trailing_newline", _knobs(max_spend_usd="1\n"), "recipe: " + MAX_SPEND_RULE),
+            ("leading_zero", _knobs(max_spend_usd="01"), "recipe: " + MAX_SPEND_RULE),
+            ("seven_decimals", _knobs(max_spend_usd="1.1234567"), "recipe: " + MAX_SPEND_RULE),
+            ("empty", _knobs(max_spend_usd=""), "recipe: " + MAX_SPEND_RULE),
+            ("a_float", _knobs(max_spend_usd=1.5), "inputs: the recipe holds the number 1.5, which is not an integer"),
+            ("string_in_the_recipe_integer_in_the_file", {**_knobs(max_spend_usd="1"), **_file_side(max_spend_usd=1)},
+             "check 8: the request in the file differs from the recipe in max_spend_usd")]),
         ("context_depth", {"truth_context": {"a": _nest(31)}}, [
             ("33_levels", {"truth_context": {"a": _nest(32)}}, "inputs: context nests deeper than 32 levels"),
             ("40_levels", {"truth_context": {"a": _nest(39)}}, "inputs: context nests deeper than 32 levels"),
@@ -1509,8 +1533,7 @@ def build_form_rules():
              "check 8: the file's request: image_id must be sha256: and 64 lower-case hex"),
             ("timeout_is_a_boolean", _file_side(timeout_seconds=True),
              "check 8: the file's request: timeout_seconds must be an integer"),
-            ("max_spend_is_a_boolean", _file_side(max_spend_usd=True),
-             "check 8: the file's request: max_spend_usd must be an integer")]),
+            ("max_spend_is_a_boolean", _file_side(max_spend_usd=True), "check 8: the file's request: " + MAX_SPEND_RULE)]),
         ("network_name_label_newline", _knobs(network={"mode": "allowlist", "allow": ["a.org"]}), [
             ("inner_newline", _knobs(network={"mode": "allowlist", "allow": ["a\n.org"]}),
              "recipe: network allow entry 'a\\n.org' is not a valid allowlist entry")]),
