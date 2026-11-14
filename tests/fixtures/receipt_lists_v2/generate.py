@@ -123,8 +123,8 @@ def make_amd(report_version: int = 3, cpuid_family: int = 0x19, cpuid_model: int
         ("1.3.6.1.4.1.3704.1.3.3", spl(tcb[6])), ("1.3.6.1.4.1.3704.1.3.8", spl(tcb[7]))])
     der = serialization.Encoding.DER
     report = bytearray(shared_attestation(b"")["report_unsigned"])
-    if report_version != 3:
-        report[0:4] = report_version.to_bytes(4, "little")
+    report[0:4] = report_version.to_bytes(4, "little")
+    if report_version < 3:
         report[0x188] = report[0x189] = 0  # the CPUID family and model exist from version 3 on
     else:
         report[0x188], report[0x189] = cpuid_family, cpuid_model
@@ -219,6 +219,8 @@ class Hotel:
             statement["room_sequence"] = n
             statement["room_previous_receipt_sha256"] = self.room_head.get(room)
         statement.update(fields)
+        for key in [k for k, v in statement.items() if v is DEL]:
+            del statement[key]  # DEL leaves the field out of the signed statement
         receipt = {"statement": statement, "signature_b64": b64(self.pack.key.sign(canonical(statement))),
                    "receipt_sha256": sha(canonical(statement))}
         self.head = receipt["receipt_sha256"]
@@ -734,7 +736,7 @@ def make_run(pack: Pack, *, truth_edit=None, recipe_edit=None, context=None, ove
             if key in ("action", "target", "status"):
                 target[key] = value
             elif value is DEL:
-                target["fields"].pop(key, None)
+                target["fields"][key] = DEL
             else:
                 target["fields"][key] = value
     if steps_edit:

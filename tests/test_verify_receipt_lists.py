@@ -1209,6 +1209,15 @@ SCENARIOS = [
      "--product Milan: the report names the product Genoa"),
     ("v3 Genoa, --product Genoa", 3, 0x19, 0x11, ("--product", "Genoa"), None),
     ("v3 Milan, --product empty", 3, 0x19, 0x01, ("--product", ""), "--product : the report names the product Milan"),
+    # the flag is read only for a report of exactly version 2
+    *[(f"v{v}, {flag_name}", v, 0x19, 0x01, flag, f"the report is version {v}, which has no layout here")
+      for v in (0, 1, 6) for flag_name, flag in (("--product Milan", ("--product", "Milan")),
+                                                 ("--product Genoa", ("--product", "Genoa")), ("no flag", ()))],
+    *[(f"v{v} Milan, {name}", v, 0x19, 0x01, flag, reason)
+      for v in (4, 5) for name, flag, reason in (("--product Milan", ("--product", "Milan"), None),
+                                                  ("no flag", (), None),
+                                                  ("--product Genoa", ("--product", "Genoa"),
+                                                   "--product Genoa: the report names the product Milan"))],
     ("v2, --product Milan", 2, 0x19, 0x01, ("--product", "Milan"), None),
     ("v2, --product Genoa", 2, 0x19, 0x01, ("--product", "Genoa"), None),      # nothing in a v2 report can contradict it
     ("v2, --product Rome", 2, 0x19, 0x01, ("--product", "Rome"), "only Milan and Genoa TCB layouts are handled"),
@@ -1333,3 +1342,161 @@ def test_run_mode_refuses_the_kds_cache_given_with_its_old_default(value) -> Non
     value = os.path.expanduser("~/.cache/amd-kds") if value == "__EXPANDED__" else value
     code, out, err = _run_cli(*_exchange_args(), "--kds-cache", value)
     assert code == 2 and out == "" and "it takes no --kds-cache" in err
+
+
+# ---- a signed receipt whose network_policy or issued_at is malformed ends in a reason, never a traceback
+
+POLICY_OK = {"mode": "deny_all", "allow": []}
+POLICY_FAULTS = {
+    "policy has no mode": ({"allow": []}, "network_policy has no mode"),
+    "policy has no allow": ({"mode": "deny_all"}, "network_policy has no allow"),
+    "policy is a string": ("deny_all", "network_policy is not an object"),
+    "policy is a list": (["deny_all"], "network_policy is not an object"),
+    "mode is not a string": ({"mode": 5, "allow": []}, "network_policy mode is not a string"),
+    "allow is not a list": ({"mode": "deny_all", "allow": "x"}, "network_policy allow is not a list"),
+}
+ISSUED_FAULTS = {"issued_at is missing": "DEL", "issued_at is null": None, "issued_at is text": "7",
+                 "issued_at is a boolean": True, "issued_at is a float": 7.5}
+
+
+def _policy_fields(policy) -> dict:
+    gen = _generator()
+    return {"network_policy": policy, "network_policy_sha256": gen.sha(gen.canonical(policy))}
+
+
+def _room(gen, pack, kind: str, fault_at: int, extra: dict) -> list[dict]:
+    """A signed room list of one kind (ordinary, serial or pre-made) where receipt `fault_at` carries `extra`."""
+    hotel = pack.new_hotel()
+    room = "pool-1" if kind == "pre-made" else "room-a"
+    steps = {"ordinary": [("create", 202, {}), ("network_set", 200, {}), ("exec", 200, {}), ("delete", 200, {})],
+             "serial": [("create", 202, {"serial": True}), ("network_set", 200, {}), ("exec", 200, {}),
+                        ("delete", 200, {})],
+             "pre-made": [("create", 202, {"pool": True}), ("claim", 200, {}), ("exec", 200, {}),
+                          ("delete", 200, {})]}[kind]
+    receipts = []
+    for i, (action, status, fields) in enumerate(steps):
+        fields = dict(fields)
+        if action == "claim":
+            fields.update(gen.claim_fields(receipts[0]))
+        if action in ("create", "network_set", "claim"):
+            fields.update(_policy_fields(POLICY_OK))
+        if i == fault_at:
+            fields.update(extra)
+        receipts.append(hotel.sign(action, room, status, **fields))
+    return receipts
+
+
+def _list_mode_with(tmp_path: Path, receipts: list[dict], transport: str, kind: str) -> tuple[int, str, str]:
+    import base64
+
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    (tmp_path / "att.json").write_bytes(gen.pretty(pack.attestation))
+    args = ["--attestation", str(tmp_path / "att.json"), "--skip-amd", "--expected-measurement", gen.MEASUREMENT]
+    if kind == "pre-made":
+        args += ["--cathedral-sandbox", gen.CLAIM_ID]
+    if transport == "list":
+        (tmp_path / "r.json").write_text(json.dumps({"receipts": receipts}))
+        args += ["--receipts", str(tmp_path / "r.json")]
+    else:
+        for rc in receipts:
+            args += ["--receipt-header", base64.urlsafe_b64encode(gen.canonical(rc)).decode()]
+    return _run_cli(*args)
+
+
+def _positions(kind: str) -> list[int]:
+    return [0, 1, 3]            # the create, the network_set or claim, and the delete
+
+
+@pytest.mark.parametrize("transport", ["list", "header"])
+@pytest.mark.parametrize("kind", ["ordinary", "serial", "pre-made"])
+@pytest.mark.parametrize("fault", sorted(POLICY_FAULTS))
+def test_a_malformed_network_policy_is_a_reason_on_any_receipt_that_carries_one(fault, kind, transport,
+                                                                                tmp_path) -> None:
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    policy, reason = POLICY_FAULTS[fault]
+    for at in (0, 1):
+        receipts = _room(gen, pack, kind, at, _policy_fields(policy))
+        code, out, err = _list_mode_with(tmp_path, receipts, transport, kind)
+        assert "Traceback" not in err, err
+        assert code == 1 and json.loads(out) == {"verdict": "FAIL", "reason": f"receipt {at + 1}: {reason}"}, out
+
+
+@pytest.mark.parametrize("transport", ["list", "header"])
+@pytest.mark.parametrize("kind", ["ordinary", "serial", "pre-made"])
+@pytest.mark.parametrize("fault", sorted(ISSUED_FAULTS))
+def test_a_receipt_in_a_policy_timeline_without_an_integer_issued_at_is_a_reason(fault, kind, transport,
+                                                                                 tmp_path) -> None:
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    value = gen.DEL if ISSUED_FAULTS[fault] == "DEL" else ISSUED_FAULTS[fault]
+    for at in _positions(kind):
+        receipts = _room(gen, pack, kind, at, {"issued_at": value})
+        code, out, err = _list_mode_with(tmp_path, receipts, transport, kind)
+        assert "Traceback" not in err, err
+        assert code == 1 and json.loads(out) == {"verdict": "FAIL",
+                                                  "reason": f"receipt {at + 1}: issued_at is not an integer"}, out
+
+
+@pytest.mark.parametrize("field", ["signature_b64", "receipt_sha256", "statement"])
+def test_a_receipt_object_that_lacks_a_member_is_a_reason_in_list_mode(field, tmp_path) -> None:
+    gen = _generator()
+    receipts = _room(gen, gen.Pack(gen.read_amd()), "ordinary", 99, {})
+    receipts[1].pop(field)
+    code, out, err = _list_mode_with(tmp_path, receipts, "list", "ordinary")
+    assert "Traceback" not in err and code == 1 and json.loads(out)["verdict"] == "FAIL", (out, err)
+
+
+@pytest.mark.parametrize("edit", [
+    lambda st: st.update(sequence="2"), lambda st: st.pop("sequence"), lambda st: st.update(binding_sha256=7),
+    lambda st: st.update(action=["exec"]), lambda st: st.pop("action"), lambda st: st.update(status="200"),
+    lambda st: st.update(sandbox_id=["room-a"]), lambda st: st.pop("previous_receipt_sha256"),
+], ids=["sequence-text", "sequence-missing", "binding-number", "action-list", "action-missing", "status-text",
+        "sandbox-list", "previous-missing"])
+def test_a_signed_statement_of_the_wrong_shape_is_a_reason_not_a_traceback_in_list_mode(edit, tmp_path) -> None:
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    receipts = _room(gen, pack, "ordinary", 99, {})
+    statement = receipts[2]["statement"]
+    edit(statement)
+    receipts[2]["receipt_sha256"] = gen.sha(gen.canonical(statement))
+    receipts[2]["signature_b64"] = gen.b64(pack.key.sign(gen.canonical(statement)))
+    code, out, err = _list_mode_with(tmp_path, receipts, "list", "ordinary")
+    assert "Traceback" not in err and code == 1 and json.loads(out)["verdict"] == "FAIL", (out, err)
+
+
+def test_a_receipt_header_that_is_not_base64url_json_is_a_reason(tmp_path) -> None:
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    (tmp_path / "att.json").write_bytes(gen.pretty(pack.attestation))
+    for header in ("***", "e30", "bm90LWpzb24"):
+        code, out, err = _run_cli("--attestation", str(tmp_path / "att.json"), "--skip-amd", "--receipt-header", header)
+        assert "Traceback" not in err and code == 1 and json.loads(out)["verdict"] == "FAIL", (header, out, err)
+
+
+def _run_mode_with_create(tmp_path: Path, extra: dict) -> tuple[int, dict, str]:
+    gen = _generator()
+    files, args = gen.make_run(gen.Pack(gen.read_amd()), overrides={"create": extra})
+    for name, data in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes(data)
+    code, out, err = _run_cli(*[a.replace("{dir}", str(tmp_path)) for a in args])
+    return code, json.loads(out), err
+
+
+@pytest.mark.parametrize("fault", sorted(POLICY_FAULTS))
+def test_run_mode_refuses_a_malformed_network_policy_on_the_create_with_a_reason(fault, tmp_path) -> None:
+    policy, _ = POLICY_FAULTS[fault]
+    code, out, err = _run_mode_with_create(tmp_path, _policy_fields(policy))
+    assert "Traceback" not in err and code == 1 and out["verdict"] == "FAIL", out
+    assert out["reason"] == "check 4: the signed network rule is not the recipe's"
+
+
+@pytest.mark.parametrize("fault", sorted(ISSUED_FAULTS))
+def test_run_mode_refuses_a_create_without_an_integer_issued_at_with_a_reason(fault, tmp_path) -> None:
+    gen = _generator()
+    value = gen.DEL if ISSUED_FAULTS[fault] == "DEL" else ISSUED_FAULTS[fault]
+    code, out, err = _run_mode_with_create(tmp_path, {"issued_at": value})
+    assert "Traceback" not in err and code == 1, (out, err)
+    assert out == {"verdict": "FAIL", "reason": "receipt 1: issued_at is not an integer"}
