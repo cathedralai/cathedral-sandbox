@@ -121,7 +121,9 @@ not hashed again at a fork.
 flags of the list-mode commands (`--receipts`, `--attestation`, `--broker`, `--origin`, `--key-file`,
 `--operator-key-file`, `--hotel`, `--sandbox`, `--receipt-header`, `--cathedral-sandbox`, `--save`,
 `--owner-pubkey`, `--tls-spki-sha256`, `--require-tls`, `--kds-cache`) are usage errors with exit 2, even with an
-empty value. `--skip-amd` is a failed check 1 (exit 1), and `--help` exits 0. `--product` names the product only
+empty value. `--skip-amd` is a failed check 1 (exit 1), and `--help` exits 0. Without `--oneshot`, the run-mode flags
+(`--allowed-measurements`, `--recipe`, `--run-id`, `--context`, `--no-context`, `--input-sha256`, `--input-file`,
+`--output-file`, and an empty `--oneshot`) are usage errors with exit 2: list mode reads none of them. `--product` names the product only
 for a version 2 report, which has no CPUID fields; no other version reads the flag, a version 0, 1 or above 5
 report fails, a report with CPUID fields names its own product, a family with no layout fails, and a different
 `--product` fails. The owner check and the guest TLS key check are list-mode

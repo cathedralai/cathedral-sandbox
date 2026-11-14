@@ -97,7 +97,9 @@ changes nothing: run mode always requires an SEV-SNP attestation). These flags a
 --receipts, --attestation, --broker, --origin, --key-file, --operator-key-file, --hotel, --sandbox,
 --receipt-header, --cathedral-sandbox, --save, --owner-pubkey, --tls-spki-sha256, --require-tls and --kds-cache,
 whether given with a value, an empty value or the old default. --skip-amd is a failed check 1 (exit 1). --help
-exits 0. The owner check (--owner-pubkey) and the guest TLS key check (--tls-spki-sha256, --require-tls) are
+exits 0. Without --oneshot (list mode), the run-mode flags are usage errors with exit 2:
+--allowed-measurements, --recipe, --run-id, --context, --no-context, --input-sha256, --input-file, --output-file,
+and --oneshot given empty. The owner check (--owner-pubkey) and the guest TLS key check (--tls-spki-sha256, --require-tls) are
 list-mode checks; run mode does not do them.
 --product: a report with CPUID fields (version 3 on) names its own product. A family with no layout fails whatever
 --product says, and a --product that names another product than the report fails. Only a version 2 report, which
@@ -2253,6 +2255,15 @@ def main() -> int:
         if clash:
             ap.error(f"--oneshot checks one file; it takes no {', '.join(clash)}")
         return run_mode(a)
+    # List mode refuses every run-mode flag for the same reason: --allowed-measurements read by no list check
+    # would be a PASS with no measurement compared. An empty --oneshot is a run-mode flag given, not list mode.
+    clash = [flag for flag, value in (
+        ("--oneshot", a.oneshot), ("--allowed-measurements", a.allowed_measurements), ("--recipe", a.recipe),
+        ("--run-id", a.run_id), ("--context", a.context), ("--no-context", a.no_context),
+        ("--input-sha256", a.input_sha256), ("--input-file", a.input_file), ("--output-file", a.output_file))
+        if value is not None and value is not False and value != []]
+    if clash:
+        ap.error(f"these flags are for run mode (--oneshot FILE); list mode takes no {', '.join(clash)}")
     if a.kds_cache is None:
         a.kds_cache = os.path.expanduser("~/.cache/amd-kds")
     if a.broker and not a.hotel:
