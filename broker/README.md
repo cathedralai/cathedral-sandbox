@@ -280,6 +280,24 @@ not keep it: the broker deletes the room and tries the next eligible hotel,
 without resting the first. With none left the answer is 409
 `tunables_unavailable`.
 
+## The exact create bytes
+
+A single native `POST /v1/sandboxes` with the request header
+`X-Broker-Return-Create-Request: 1` adds `create_request_b64` to its 202
+answer: the standard base64 of the exact bytes the broker sent to the hotel
+that started the room. Those bytes include the broker's labels
+(`broker_guest`, `broker_batch`) and its normal form of `network`, and none of
+the broker-only fields (`hotels`, `sealed`, `count`). A retry on another
+hotel, a queue move or a tunables reap sends the same bytes, so pair them with
+the `X-Room-Receipt` of the same 202. With `count` above 1 the broker answers
+400 `create_request_batch_unsupported` and starts nothing. A failed create has
+no key. The compat route ignores the header, and a broker without this feature
+ignores it too, so a missing key means "not supported". The keys a one-shot
+create may hold are listed in `oneshot_create_keys.json`, which a test checks
+against the broker's output. The same file holds `sizes`: the `resources`
+object a one-shot create carries for each sealed size name, so the receipt
+checker and the caller read one table.
+
 ## Room terminals
 
 Room terminal routes (`/v1/sandboxes/<id>/terminals` and below) reach a hotel

@@ -17,6 +17,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	_ "embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -720,7 +721,16 @@ type createResult struct {
 	// lost: hotels that got the create but never answered. Each may hold a
 	// room this guest does not know about; handleCreate reaps them.
 	lost []*hotel
+	// sent: the create bytes the hotel that answered 202 received. createOne
+	// sends one slice on every attempt, so these are the bytes of any retry
+	// too; handleCreate returns them when the caller asks (returnCreateHeader).
+	sent []byte
 }
+
+// returnCreateHeader asks a native single create to answer with the exact
+// bytes sent to the hotel, as create_request_b64. A header, not a body field:
+// a body field would have to be removed before the bytes are marshaled.
+const returnCreateHeader = "X-Broker-Return-Create-Request"
 
 // batchLabel marks every room of one create request, so the rooms a hotel
 // started for a request whose answer was lost can be found and removed.
@@ -883,7 +893,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			}
 			hdrs.Set("X-Broker-Queue-Ms", strconv.FormatFloat(ms(queue), 'f', 1, 64))
 			hdrs.Set("X-Broker-Hotel-Ms", strconv.FormatFloat(ms(call), 'f', 1, 64))
-			return finish(createResult{status: 202, header: hdrs, doc: doc})
+			return finish(createResult{status: 202, header: hdrs, doc: doc, sent: body})
 		case err == nil && status == 429:
 			h.release(rm)
 			h.rejected++
@@ -1173,6 +1183,11 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, 400, "invalid_count", "count must be between 1 and 10000")
 		return
 	}
+	wantBytes := r.Header.Get(returnCreateHeader) == "1"
+	if wantBytes && count != 1 {
+		writeErr(w, 400, "create_request_batch_unsupported", "the create bytes can be returned for a single create only (count 1)")
+		return
+	}
 	pl, perr := b.placementFor(r.Context(), g, payload)
 	if perr != nil {
 		writeErr(w, perr.status, perr.code, perr.msg)
@@ -1186,6 +1201,9 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	}
 	results := b.createMany(withOwnerHeaders(r.Context(), r), g, payload, count, tRecv, pl)
 	if count == 1 {
+		if wantBytes && results[0].status == 202 && results[0].doc != nil {
+			results[0].doc["create_request_b64"] = base64.StdEncoding.EncodeToString(results[0].sent)
+		}
 		b.finishCreate(w, results[0], tRecv)
 		return
 	}
