@@ -212,8 +212,10 @@ def test_failed_and_lost_bulk_deletes_release_the_guard(front) -> None:
     front.api.replies.clear()
     front.api.drop(r"DELETE /v1/sandboxes", times=1)
     assert front.call("DELETE", BULK)[0] == 502
-    assert_idle(front.ledger)
-    assert claim(front, room)[0] == 200
+    assert_idle(front.ledger)  # the guard is released either way
+    # The outcome of both is uncertain, so the room is not claimable; a room made afterwards is.
+    assert code(claim(front, room)[2]) == "pool_room_unknown"
+    assert claim(front, pool_room(front, labels=TEAM_B))[0] == 200
     assert_idle(front.ledger)
 
 
@@ -247,8 +249,12 @@ def test_a_claim_whose_client_left_is_still_waited_for_by_a_bulk_delete(front) -
     held.release.set()
     assert finish(t, box)[0] == 200
     assert_idle(front.ledger)
-    status, _headers, out = claim(front, "sbx_x")  # the claim was signed and stored: a replay gets it
-    assert status == 200 and json.loads(out)["status"] == "claimed"
+    # The claim was signed (200) before the bulk delete ran and removed the room, so a replay now finds it gone.
+    with front.ledger.lock:
+        statuses = [front.ledger.chain[i]["statement"]["status"] for i in front.ledger.by_room["sbx_x"]
+                    if front.ledger.chain[i]["statement"]["action"] == "claim"]
+    assert statuses == [200]
+    assert code(claim(front, "sbx_x")[2]) == "pool_room_gone"
 
 
 def test_a_bulk_delete_entirely_before_the_claim_leaves_the_claim_refused(front) -> None:

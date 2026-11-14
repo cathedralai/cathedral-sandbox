@@ -207,3 +207,33 @@ def test_a_caller_that_leaves_just_before_the_last_claim_ends_forwards_nothing(f
     time.sleep(0.3)
     assert front.api.count(r"DELETE /v1/sandboxes") == 0, "the bulk delete was forwarded for a caller that had left"
     assert_idle(front.ledger)
+
+
+def test_a_claimed_room_marked_unknown_is_used_as_before(front) -> None:
+    front.api.new_ids = ["sbx_x"]
+    assert front.create(POOL_TEAM)[0] == 200
+    assert claim(front, "sbx_x")[0] == 200
+    lost_bulk(front)
+    assert "sbx_x" in front.ledger.unknown
+    status, headers, _out = front.exec("sbx_x")
+    assert status == 200 and receipt_of(headers)["statement"]["action"] == "exec"
+    status, headers, _out = front.get_file("sbx_x")
+    assert status == 200 and receipt_of(headers)["statement"]["action"] == "file_get"
+    status, headers, _out = front.put("sbx_x")
+    assert status == 200 and receipt_of(headers)["statement"]["action"] == "file_put"
+    assert_idle(front.ledger)
+
+
+def test_a_bulk_delete_the_machine_does_not_answer_within_the_bound_is_cut_and_uncertain(front, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "BULK_FORWARD_SECONDS", 0.8)
+    front.api.new_ids = ["sbx_x"]
+    assert front.create(POOL_TEAM)[0] == 200
+    held = front.api.hold(r"DELETE /v1/sandboxes")
+    started = time.monotonic()
+    status, headers, out = front.call("DELETE", BULK)
+    took = time.monotonic() - started
+    held.release.set()
+    assert status == 502 and code(out) == "hotel_api_no_answer" and took < 1.6
+    assert receipt_of(headers)["statement"]["status"] == 502
+    assert "sbx_x" in front.ledger.unknown
+    assert_idle(front.ledger)

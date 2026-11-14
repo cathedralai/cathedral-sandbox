@@ -218,36 +218,77 @@ room, `/wait`) only; every other route, the sealed handlers included, is
 refused with 409 `pool_room_unclaimed`.
 
 `POST /v1/sandboxes/<id>/claim` with exactly `{"cathedral_sandbox_id": <lower-case
-UUID>, "lifetime_seconds": 1..172800}` binds the room. It needs: an unclaimed pool
-room this boot has the create receipt of, a list holding the create alone, and
-at least 300 s before the room's `expires_at`. It sets the lifetime through the
-API (10 s wait) and signs `claim` (`cathedral_sandbox_id`, `lifetime_seconds`,
-`pooled_from` = the create receipt's hash, `status`, `expires_at`). Success
+UUID>, "lifetime_seconds": 1..172800}` binds the room. A fresh claim needs: an
+unclaimed pool room this boot has the create receipt of, not marked unknown
+(below), a list holding the create alone, and at least 300 s before the room's
+`expires_at`. It sets the lifetime through the API and signs `claim`
+(`cathedral_sandbox_id`, `lifetime_seconds`, `pooled_from` = the create
+receipt's hash, `status`, `expires_at`). The lifetime call has one total
+deadline of 10 seconds on a monotonic clock (not a timeout per read); when it
+is hit the claim is signed with status 502, as for any lost answer. Success
 answers 200 with the receipt. Any other result signs the claim with its status,
 breaks the room (delete only) and answers 409 `pool_claim_failed`: one try per
-room. The same id claiming again gets the stored answer and receipt; another id
-gets 409 `pool_room_claimed`. A delete meanwhile gets 409 `room_busy`.
-A bulk delete by label names no room until the API runs it, so it never runs
-beside a claim. One that arrives while a claim is in flight waits for the
-claim to end, for at most 15 seconds (the lifetime call's own 10 second wait
-plus 5), then runs. If a claim is still in flight after that, the bulk delete
-is answered 409 `bulk_delete_claim_busy`, not forwarded, and a line goes to
-stderr. A caller that leaves while its bulk delete waits ends the wait and
-nothing is forwarded. While a bulk delete is waiting or running, a new claim
-is refused with 409 `pool_bulk_delete_busy` before its lifetime call, so the
-wait cannot be starved, and the API then creates a cold room. A claim for a
-room that is already claimed by the same sandbox id is answered from the stored
-answer and receipt at any time. A bulk delete can run for as long as the API
-takes, and every new claim in that time falls back to a cold create.
-Other refusals: 405 for any method but POST (checked before the gate), 400 `claim_request_invalid`, 409
-`pool_room_stale`, `pool_room_gone`, `room_not_pool`, `pool_room_used`,
+room. Another sandbox id gets 409 `pool_room_claimed`. A delete meanwhile gets
+409 `room_busy`.
+
+A replay is the same sandbox id claiming a claimed room again. It makes no
+lifetime call and signs nothing new. The front first does one GET of the room
+(the same 10 second total deadline). 200 from the API and the room not marked
+unknown: the stored answer and receipt. 404 or 409: 409 `pool_room_gone`. A 5xx
+or no answer, or a room marked unknown: 409 `pool_room_unknown`. A claim leaves
+the room's labels alone, so a bulk delete can remove a claimed room; this keeps
+a stored 200 from being replayed for a room that is gone.
+
+**Bulk delete and claims.** A bulk delete by label names no room until the API
+runs it, so it never runs beside a claim.
+- A bulk delete that arrives while a claim is in flight waits for it for at most
+  15 seconds from its arrival (monotonic deadline; the claim's own lifetime call
+  is cut at 10 seconds in all). If a claim is still in flight after that, the
+  caller gets 409 `bulk_delete_claim_busy`, nothing is forwarded, and a line
+  goes to stderr.
+- Once forwarded, the front waits for its answer for at most 300 seconds in all.
+  When that is hit the caller gets 502 `hotel_api_no_answer` and the signed
+  `bulk_delete` receipt says status 502.
+- While a bulk delete is waiting or running, a fresh claim is refused with 409
+  `pool_bulk_delete_busy` before its lifetime call, so the wait cannot be
+  starved, and the API then creates a cold room. Every fresh claim in that time
+  is refused, and a bulk delete can run for as long as the API takes. A replay
+  is not a fresh claim and is answered as above at any time.
+- A caller that leaves while its bulk delete waits ends the wait and nothing is
+  forwarded. The front looks every 0.2 seconds and once more right before
+  forwarding. On the TLS port of a miner hotel a disconnect is not detected: the
+  bulk delete is forwarded.
+
+**An uncertain bulk delete.** Certain means a 2xx, or a 4xx, which the machine
+sends only before it acts (authentication, the label filter; once it starts
+removing rooms it raises no 4xx). Uncertain means any 5xx, no answer, a broken
+or unreadable answer, and the front's own 300 second deadline. The machine keeps
+running a bulk delete the front stopped waiting for, and it picks its targets
+once, when it starts. So after an uncertain one, before the guard clears, the
+front marks every pool room it knows, unclaimed or claimed, as unknown. Unknown
+changes two things only: a fresh claim on the room gets 409
+`pool_room_unknown`, and a stored claim answer is not replayed (409
+`pool_room_unknown`). Every other request on the room, a claimed room in use
+included, behaves and is signed as before. A 2xx delete of the room, or its
+`room_end`, clears the mark, and nothing else does. A pool room made after the
+bulk delete ended is not marked.
+
+Other refusals: 405 for any method but POST (checked before the gate), 400
+`claim_request_invalid`, 409 `pool_room_stale` (no create receipt this boot),
+`pool_room_gone` (the room has ended, was deleted, or a replay finds it gone),
+`pool_room_unknown` (see above), `room_not_pool`, `pool_room_used`,
 `pool_room_expiring`.
 
-Limit: a bulk delete by label names no room, so while one waits or runs it
-refuses new claims for every room, even if its label would not match that
-room. A room it removes ends with a
-`room_end` receipt at a later look, and any create whose pending time it
-overlaps gets no `pool` flag.
+Limits:
+- A bulk delete by label names no room, so while one waits or runs it refuses
+  fresh claims for every room, even if its label would not match that room. A
+  room it removes ends with a `room_end` receipt at a later look. A create that
+  overlaps a bulk delete while it runs gets no `pool` flag; one that overlaps
+  only its waiting still can.
+- The machine picks a bulk delete's targets under a provider lock when it
+  starts. If that lock stalls for longer than the front's wait, a bulk delete
+  the front gave up on could still reach a pool room made after the front gave
+  up.
 
 ### Fresh report over caller data (sealed only)
 

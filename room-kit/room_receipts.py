@@ -2081,6 +2081,10 @@ class Ledger:
         # already claimed room never calls the API, so it is answered either way.
         self.claims_in_flight = 0
         self.bulk_pending = 0
+        # Pool rooms (unclaimed or claimed) the front cannot vouch for after a bulk delete whose outcome was not
+        # certain. It changes two things only: a new claim on the room, and the replay of a stored claim answer.
+        # A 2xx delete or a room_end of the room clears it.
+        self.unknown: set[str] = set()
         # Pre-made rooms: pool maps an unclaimed room to its expires_at (epoch); claimed maps a claimed room to
         # (the sandbox id it was claimed for, the answer sent, the claim receipt) so a repeat gets the same answer.
         self.pool: dict[str, float] = {}
@@ -2204,6 +2208,11 @@ class Ledger:
                 self.overflow = True
             return True
 
+    def mark_pool_unknown(self) -> None:
+        """A bulk delete ended without a certain answer: mark every pool room the front knows. Before the guard clears."""
+        with self.lock:
+            self.unknown |= set(self.pool) | set(self.claimed)
+
     def bulk_abandon(self) -> None:
         """A bulk delete that never ran (refused, or its caller left) stops counting."""
         with self.lock:
@@ -2252,6 +2261,7 @@ class Ledger:
         self.broken.discard(room)
         self.pool.pop(room, None)
         self.claimed.pop(room, None)
+        self.unknown.discard(room)
 
     def end_room(self, room: str, incarnation: str, status: int, reason: str, result_sha256: str) -> dict | None:
         """Sign room_end for *room* if it is still the incarnation that was looked at and nothing is in flight for it.
@@ -2284,6 +2294,8 @@ class Ledger:
                 return None, ("pool_room_stale", "this front has no receipt for the room"), None
             if room not in self.incarnations:
                 return None, ("pool_room_gone", "the room has ended"), None
+            if room in self.unknown:
+                return None, ("pool_room_unknown", "a bulk delete that may have removed it did not finish cleanly"), None
             if room not in self.pool:
                 return None, ("room_not_pool", "this room is not a pre-made room"), None
             if len(history) != 1:
@@ -2402,6 +2414,42 @@ CLAIM_WAIT_SECONDS = 10
 # its answer. The wait checks every BULK_POLL_SECONDS whether the caller is still there.
 BULK_CLAIM_WAIT_SECONDS = CLAIM_WAIT_SECONDS + 5
 BULK_POLL_SECONDS = 0.2
+# The front forwards a bulk delete and waits for its answer for at most this long, in total (monotonic clock). After
+# that the caller gets 502 hotel_api_no_answer and the bulk delete counts as uncertain: the machine keeps running it.
+BULK_FORWARD_SECONDS = 300
+
+
+def bulk_outcome_is_certain(status: int) -> bool:
+    """Whether a bulk delete's answer says what it did.
+
+    Certain: a 2xx (it ran to its end) or a 4xx (the machine sends one only before it acts: authentication, the
+    label filter; once it starts removing rooms it raises no 4xx). Uncertain: any 5xx, no answer, a broken or
+    unreadable answer, and the front's own deadline, all of which reach here as 5xx or 502. The machine keeps
+    running a bulk delete the front stopped waiting for, and it picks its targets once, when it starts.
+    """
+    return 200 <= status < 300 or 400 <= status < 500
+
+
+def run_within(conn: http.client.HTTPConnection, seconds: float, call):
+    """Run call() on *conn* and cut the connection when *seconds* of monotonic time have passed in all.
+
+    A socket timeout counts each read on its own, so a slow trickle of bytes never trips it; this bounds the
+    whole call. A cut connection raises OSError or HTTPException from call(), as a lost answer does.
+    """
+    def cut() -> None:
+        try:
+            if conn.sock is not None:
+                conn.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    timer = threading.Timer(seconds, cut)
+    timer.daemon = True
+    timer.start()
+    try:
+        return call()
+    finally:
+        timer.cancel()
 CLAIM_LIFETIME_MAX = 172800
 EXPIRES_MAX_SECONDS = 48 * 3600 + 60
 # What an unclaimed pool room lets through unsigned: reads of the room's record.
@@ -2593,6 +2641,9 @@ class Handler(BaseHTTPRequestHandler):
                 return False
         self.bulk_wait_open = False
         self.bulk_open = True
+        if self.client_gone():  # once more, right before it is forwarded (the wake-up may have come late)
+            self.close_connection = True
+            return False
         return True
 
     def release_turn(self) -> None:
@@ -2635,7 +2686,7 @@ class Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(raw[7:].strip().encode(), self.server.api_key)
 
     def upstream(self, port: int, body: bytes | None, *, method: str | None = None, path: str | None = None,
-                 extra: dict | None = None, timeout: float = 1800):
+                 extra: dict | None = None, timeout: float = 1800, deadline: float | None = None):
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
         if extra:
             headers = {k: v for k, v in headers.items() if k.lower() not in {e.lower() for e in extra}}
@@ -2653,11 +2704,16 @@ class Handler(BaseHTTPRequestHandler):
             # sent twice: a fresh connection (no stale keep-alive) and no
             # retry. A lost answer is a 502, and the receipt records it. On a serial room every
             # request is sent once, so one receipt stands for exactly one request at the API.
-            c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
-            try:
+            c = http.client.HTTPConnection("127.0.0.1", port,
+                                           timeout=timeout if deadline is None else min(timeout, deadline))
+
+            def call():
                 c.request(method, path, body=body, headers=headers)
                 r = c.getresponse()
                 return r.status, r.getheaders(), r.read()
+
+            try:
+                return call() if deadline is None else run_within(c, deadline, call)
             except (http.client.HTTPException, OSError):
                 if self.turn is not None:
                     self.turn.lost = True
@@ -2821,7 +2877,10 @@ class Handler(BaseHTTPRequestHandler):
             # Forward the canonical path (no ";params") so gate, receipt and API agree.
             status, headers, out = self.upstream(
                 self.server.api_port, body, path=forward_path,
-                **({"timeout": plain_exec_wait(body)} if action == "exec" else {}))
+                **({"timeout": plain_exec_wait(body)} if action == "exec" else {}),
+                **({"deadline": BULK_FORWARD_SECONDS} if action == "bulk_delete" else {}))
+            if self.bulk_open and not bulk_outcome_is_certain(status):
+                ledger.mark_pool_unknown()  # before the reply releases the guard
         extra = {}
         if create_ask and create_ask.get("pool"):
             # The API's own answer says when the room's limit falls; the claim's time-left rule reads it.
@@ -3071,6 +3130,22 @@ class Handler(BaseHTTPRequestHandler):
             extra["X-Room-Receipt-Error"] = "sign_failed"
         return self.reply(200, canonical(out), extra)
 
+    def replay_refusal(self, ledger: "Ledger", room: str) -> tuple[str, str] | None:
+        """Why a stored claim answer must not be replayed, or None. One GET of the room, bounded as the claim is.
+
+        A claim leaves the room's labels alone, so a bulk delete can remove a claimed room: the stored 200 is
+        replayed only while the room is there and not marked unknown.
+        """
+        with ledger.lock:
+            if room in ledger.unknown:
+                return ("pool_room_unknown", "a bulk delete that may have removed the room did not finish cleanly")
+        got = self.server.api_get(f"/v1/sandboxes/{room}", CLAIM_WAIT_SECONDS, total=CLAIM_WAIT_SECONDS)
+        if got is not None and got[0] == 200:
+            return None
+        if got is not None and got[0] in (404, 409):
+            return ("pool_room_gone", "the room is not there")
+        return ("pool_room_unknown", "the room could not be looked at")
+
     def handle_claim(self, ledger: "Ledger", room: str, body: bytes | None):
         """POST /v1/sandboxes/<room>/claim {"cathedral_sandbox_id", "lifetime_seconds"}: bind a pre-made room to a sandbox.
 
@@ -3098,6 +3173,9 @@ class Handler(BaseHTTPRequestHandler):
                                                          "and lifetime_seconds (1 to 172800)")
         stored, refusal, create_sha = ledger.claim_check(room, cid, time.time())
         if stored is not None:
+            replay_refusal = self.replay_refusal(ledger, room)
+            if replay_refusal is not None:
+                return refuse(409, *replay_refusal)
             status, answer_body, receipt = stored
             return self.reply(status, answer_body, {"X-Room-Receipt": base64.urlsafe_b64encode(canonical(receipt)).decode()})
         if refusal is not None:
@@ -3106,7 +3184,7 @@ class Handler(BaseHTTPRequestHandler):
             status, _headers, out = self.upstream(
                 self.server.api_port, canonical({"ttl_seconds": lifetime}), method="POST",
                 path=f"/v1/sandboxes/{room}/lifetime", extra={"Content-Type": "application/json"},
-                timeout=CLAIM_WAIT_SECONDS)
+                timeout=CLAIM_WAIT_SECONDS, deadline=CLAIM_WAIT_SECONDS)
             try:
                 result = json.loads(out)
             except (ValueError, RecursionError):
@@ -3432,13 +3510,19 @@ class Server(ThreadingHTTPServer):
             except Exception:  # noqa: BLE001 one failed look must not end the loop
                 traceback.print_exc()
 
-    def api_get(self, path: str, timeout: float) -> tuple[int, bytes] | None:
-        """One GET to the room API with the front's own key; None when it gave no answer."""
+    def api_get(self, path: str, timeout: float, total: float | None = None) -> tuple[int, bytes] | None:
+        """One GET to the room API with the front's own key; None when it gave no answer.
+
+        *timeout* bounds each read; *total*, when given, bounds the whole call."""
         c = http.client.HTTPConnection("127.0.0.1", self.api_port, timeout=timeout)
-        try:
+
+        def call():
             c.request("GET", path, headers={"Authorization": "Bearer " + self.api_key.decode()})
             r = c.getresponse()
             return r.status, r.read()
+
+        try:
+            return call() if total is None else run_within(c, total, call)
         except (http.client.HTTPException, OSError):
             return None
         finally:
