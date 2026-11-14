@@ -83,8 +83,10 @@ def signing_key():
 
 # ---------------------------------------------------------------- synthetic AMD chain
 
-def make_amd() -> dict[str, bytes]:
-    """ARK, ASK and VCEK (RSA-PSS SHA-384, as AMD's are) and one report signed by the VCEK."""
+def make_amd(report_version: int = 3) -> dict[str, bytes]:
+    """ARK, ASK and VCEK (RSA-PSS SHA-384, as AMD's are) and one report signed by the VCEK.
+
+    report_version 2 writes a report with no CPUID fields (a checker then needs --product to know the product)."""
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
@@ -121,6 +123,9 @@ def make_amd() -> dict[str, bytes]:
         ("1.3.6.1.4.1.3704.1.3.3", spl(tcb[6])), ("1.3.6.1.4.1.3704.1.3.8", spl(tcb[7]))])
     der = serialization.Encoding.DER
     report = bytearray(shared_attestation(b"")["report_unsigned"])
+    if report_version != 3:
+        report[0:4] = report_version.to_bytes(4, "little")
+        report[0x188] = report[0x189] = 0  # the CPUID family and model exist from version 3 on
     r_s = decode_dss_signature(vcek_key.sign(bytes(report[:0x2A0]), ec.ECDSA(hashes.SHA384())))
     report[0x2A0:0x2A0 + 72] = r_s[0].to_bytes(72, "little")
     report[0x2E8:0x2E8 + 72] = r_s[1].to_bytes(72, "little")

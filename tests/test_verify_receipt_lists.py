@@ -1132,3 +1132,52 @@ def test_the_count_check_is_in_the_function_too() -> None:
         with pytest.raises(vr.Fail, match="the list's count is not an integer"):
             vr.room_numbering([], {"room_head": None, "count": bad})
     assert vr.room_numbering([], {"count": 7}) == {"rooms": {}, "warnings": []}
+
+
+# ---- a version-2 SNP report has no CPUID fields: run mode must honour --product, as list mode does
+
+def _version_2_run(tmp_path: Path, *product_args: str) -> tuple[int, dict, str]:
+    """A run file whose chip report is version 2 (its own synthetic chain, the same binding and receipts)."""
+    gen = _generator()
+    pack = gen.Pack(gen.read_amd())
+    amd = gen.make_amd(report_version=2)
+    certs = json.loads(amd["source/amd/certs.json"])
+    report = json.loads(amd["source/amd/report.json"])["report_b64"]
+    ark = amd["source/amd/ark_sha256.txt"].decode().strip()
+
+    def edit(bundle):
+        bundle["attestation"]["report_b64"] = report
+        bundle["amd_certs"] = certs
+
+    files, args = gen.make_run(pack, bundle_edit=edit)
+    args[args.index("--ark-sha256") + 1] = ark
+    for name, data in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes(data)
+    code, out, err = _run_cli(*[a.replace("{dir}", str(tmp_path)) for a in args], *product_args)
+    return code, json.loads(out), err
+
+
+def test_a_version_2_report_passes_in_run_mode_with_the_product_named(tmp_path) -> None:
+    code, out, err = _version_2_run(tmp_path, "--product", "Milan")
+    assert "Traceback" not in err and code == 0 and out["verdict"] == "PASS", out
+    assert out["attestation"]["amd"]["product"] == "Milan" and out["attestation"]["report_version"] == 2
+
+
+def test_a_version_2_report_without_the_product_fails_with_the_instruction(tmp_path) -> None:
+    code, out, err = _version_2_run(tmp_path)
+    assert "Traceback" not in err and code == 1
+    assert out == {"verdict": "FAIL", "reason": "check 1: cannot tell the product from cpuid family None model None; "
+                                                "pass --product"}
+
+
+def test_a_version_2_report_with_a_product_that_has_no_layout_fails(tmp_path) -> None:
+    code, out, err = _version_2_run(tmp_path, "--product", "Rome")
+    assert "Traceback" not in err and code == 1
+    assert out == {"verdict": "FAIL", "reason": "check 1: only Milan and Genoa TCB layouts are handled"}
+
+
+def test_the_product_only_names_the_layout_when_the_certificates_come_with_the_file(tmp_path) -> None:
+    """The chain is the file's own, so the other known product still verifies it: --product never fetches here."""
+    code, out, _ = _version_2_run(tmp_path, "--product", "Genoa")
+    assert code == 0 and out["attestation"]["amd"]["product"] == "Genoa"
