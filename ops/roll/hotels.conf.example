@@ -1,0 +1,8 @@
+# Copy to hotels.conf (untracked, see .gitignore) or point ROLL_HOTELS_CONF at your own file.
+# Real host addresses never go in this public repo. Addresses below are RFC 5737 documentation addresses.
+# id host dir flags (comma list: escape = contest hotel, const = const's hotel)
+hotel-a   203.0.113.10 /srv/sealed-hotel-a   -
+hotel-b   203.0.113.10 /srv/sealed-hotel-b   -
+hotel-c   203.0.113.10 /srv/sealed-hotel     const
+hotel-d   198.51.100.20 /srv/sealed-hotel-d  escape
+hotel-e   198.51.100.20 /srv/sealed-hotel-e  -

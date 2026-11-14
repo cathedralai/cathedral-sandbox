@@ -4,7 +4,7 @@
 // removes hotels with the operator key (config "operator_key_sha256"):
 //
 //	GET    /v1/broker/hotels/<id>   the hotel document with its admission state
-//	POST   /v1/broker/hotels        {id, name, api, health, key, concurrency, labels, threads, ram_gib, sealed, max_slots, reserved_for, miner_hotkey, require_attestation}
+//	POST   /v1/broker/hotels        {id, name, api, health, key, concurrency, labels, threads, ram_gib, sealed, max_slots, reserved_for, miner_hotkey, require_attestation, commitment}
 //	PATCH  /v1/broker/hotels/<id>   {drain, labels, reserved_for, max_slots, lend}  (reserved_for null: back to the pool; lend and reclaim: lend.go)
 
 //	DELETE /v1/broker/hotels/<id>   (only a hotel with no rooms; drain it first)
@@ -399,6 +399,12 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		writeErr(w, 400, "invalid_hotel", `lent_from and lent_report_id are set by PATCH {"lend": true}, not at join`)
 		return
 	}
+	if err := b.checkJoinCommitment(hc); err != nil {
+		var ce errCommitment
+		errors.As(err, &ce)
+		writeErr(w, ce.status, ce.code, ce.msg)
+		return
+	}
 	if b.cfg.StateDir == "" {
 		writeErr(w, 409, "no_state_dir", "set state_dir in the config to add hotels at runtime")
 		return
@@ -755,7 +761,8 @@ func (b *broker) hotelDoc(h *hotel) map[string]any {
 	now := time.Now()
 	return map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime,
 		"reserved_for": reserved, "lent_from": lent, "lent_report_id": lentReport, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
-		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now)}
+		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now),
+		"commitment": b.commitmentDoc(h)}
 }
 
 func (b *broker) guestExists(id string) bool {

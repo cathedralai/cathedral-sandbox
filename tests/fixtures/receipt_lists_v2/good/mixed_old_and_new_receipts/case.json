@@ -1,0 +1,20 @@
+{
+ "args": [
+  "--attestation",
+  "{dir}/attestation_doc.json",
+  "--receipts",
+  "{dir}/receipts.json",
+  "--skip-amd",
+  "--expected-measurement",
+  "9b148da6715f6a68fd6314d9015f54413c261a0b1b25075b568e0b5106687a2b434d7661f26d036700090ca1917a9ed1"
+ ],
+ "description": "One room whose first receipts have no numbering fields and a later one does: a warning, no numbering claim for that room. Another room is numbered in full.",
+ "expect": {
+  "exit_code": 0,
+  "pointers": {
+   "/chain/room_numbering/rooms/room-new/receipts": 2,
+   "/checked": "whole chain to the head the server named; each numbered room: its receipts run 1 to n with no gap and every link right; room room-old has receipts with and without numbering: no numbering claim for it"
+  },
+  "verdict": "PASS"
+ }
+}
