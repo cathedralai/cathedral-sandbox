@@ -2041,7 +2041,8 @@ class Ledger:
 
     def _open_store(self, store: str) -> None:
         self.lock = threading.Lock()
-        self.idle = threading.Condition(self.lock)  # signalled when the last claim in flight ends
+        self.claims_zero = threading.Event()  # set while no claim is in flight; waited on without the lock
+        self.claims_zero.set()
         self.attest_lock = threading.Lock()
         # Fresh-report slots keyed by guest id (X-Cathedral-Guest). A shared
         # hotel serves many guests; a per-hotel counter let one guest starve
@@ -2172,6 +2173,7 @@ class Ledger:
                 self.busy.add(room)
             if new_claim:
                 self.claims_in_flight += 1
+                self.claims_zero.clear()
             self.in_flight[room] = self.in_flight.get(room, 0) + 1
             return Turn(room, token, len(self.by_room.get(room, [])), room in self.serial, nonread,
                         new_claim), None
@@ -2191,22 +2193,35 @@ class Ledger:
             if self.bulk_in_flight:
                 self.overflow = True
 
-    def bulk_arrive(self) -> None:
-        """A bulk delete reached the front: from now on a new claim is refused, so the wait cannot be starved."""
-        with self.lock:
-            self.bulk_pending += 1
+    def bulk_arrive(self, timeout: float) -> bool:
+        """A bulk delete reached the front: from now on a new claim is refused, so the wait cannot be starved.
 
-    def bulk_try_start(self, wait: float) -> bool:
-        """Start the bulk delete when no claim is in flight, else wait up to *wait* seconds for one to end."""
-        with self.idle:
-            if self.claims_in_flight:
-                self.idle.wait(wait)
-            if self.claims_in_flight:
-                return False
-            self.bulk_in_flight += 1
-            if self.creates_in_flight:
-                self.overflow = True
-            return True
+        The lock is taken for at most *timeout* seconds: a signer whose receipt write blocks holds it, and the
+        bulk delete's wait must keep its own bound. False: not counted."""
+        if not self.lock.acquire(timeout=max(0.0, timeout)):
+            return False
+        try:
+            self.bulk_pending += 1
+        finally:
+            self.lock.release()
+        return True
+
+    def bulk_try_start(self, wait: float, until: float) -> str:
+        """started, waiting (a claim is in flight; waited up to *wait* seconds for it) or lock (not taken by *until*).
+
+        *until* is a time.monotonic() deadline. The wait for a claim to end holds no lock."""
+        if not self.lock.acquire(timeout=max(0.0, until - time.monotonic())):
+            return "lock"
+        try:
+            if not self.claims_in_flight:
+                self.bulk_in_flight += 1
+                if self.creates_in_flight:
+                    self.overflow = True
+                return "started"
+        finally:
+            self.lock.release()
+        self.claims_zero.wait(max(0.0, min(wait, until - time.monotonic())))
+        return "waiting"
 
     def mark_pool_unknown(self) -> None:
         """A bulk delete ended without a certain answer: mark every pool room the front knows. Before the guard clears."""
@@ -2239,7 +2254,7 @@ class Ledger:
             if turn.claim:
                 self.claims_in_flight -= 1
                 if not self.claims_in_flight:
-                    self.idle.notify_all()
+                    self.claims_zero.set()
             if turn.nonread:
                 self._touch(room)  # it may have run while a create was pending, though it entered before
             if turn.token and (room in self.serial or room in self.pool):
@@ -2409,6 +2424,8 @@ POOL_CREATE_KEYS = frozenset({"image", "resources", "network", "labels", "ttl_se
 # limit (which acts a while after it) cannot reach a claimed room. The lifetime call waits at most CLAIM_WAIT.
 POOL_CLAIM_MARGIN_SECONDS = 300
 CLAIM_WAIT_SECONDS = 10
+CLAIM_LIFETIME_MAX = 172800
+EXPIRES_MAX_SECONDS = 48 * 3600 + 60
 # A bulk delete that arrives while a claim is in flight waits for it. A claim ends within its lifetime call, which
 # waits at most CLAIM_WAIT_SECONDS (the upstream timeout in handle_claim), plus a margin for signing it and storing
 # its answer. The wait checks every BULK_POLL_SECONDS whether the caller is still there.
@@ -2431,27 +2448,42 @@ def bulk_outcome_is_certain(status: int) -> bool:
 
 
 def run_within(conn: http.client.HTTPConnection, seconds: float, call):
-    """Run call() on *conn* and cut the connection when *seconds* of monotonic time have passed in all.
+    """Run call() on *conn*, which must not be connected yet, and give up when *seconds* have passed in all.
 
-    A socket timeout counts each read on its own, so a slow trickle of bytes never trips it; this bounds the
-    whole call. A cut connection raises OSError or HTTPException from call(), as a lost answer does.
+    A socket timeout counts each read on its own, so a slow trickle of bytes never trips it. This bounds the
+    whole call on a monotonic clock. The timer sets an expired flag and cuts the connection's socket, and that
+    socket is kept here, because an answer with Connection: close detaches it from *conn* while its body is
+    still being read. Expiry is decided by the flag alone, never by what was parsed: a cut during the headers
+    can read as a complete short answer. After call() the flag is checked first, and an expired call raises
+    TimeoutError (an OSError), as a lost answer does.
     """
+    expired = threading.Event()
+    sockets: list = []
+
     def cut() -> None:
-        try:
-            if conn.sock is not None:
-                conn.sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
+        expired.set()
+        for sock in list(sockets):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     timer = threading.Timer(seconds, cut)
     timer.daemon = True
     timer.start()
     try:
-        return call()
+        conn.connect()
+        sockets.append(conn.sock)
+        if expired.is_set():
+            raise TimeoutError("the deadline passed before the request was sent")
+        result = call()
     finally:
         timer.cancel()
-CLAIM_LIFETIME_MAX = 172800
-EXPIRES_MAX_SECONDS = 48 * 3600 + 60
+    if expired.is_set():
+        raise TimeoutError("the answer came after the deadline")
+    return result
+
+
 # What an unclaimed pool room lets through unsigned: reads of the room's record.
 RECORD_READS = [
     ("GET", re.compile("^" + ROOM + r"$")),
@@ -2621,24 +2653,35 @@ class Handler(BaseHTTPRequestHandler):
         """Count the bulk delete, wait for the claims in flight, and start it. False: it is answered or dropped here.
 
         A new claim is refused from the moment the bulk delete is counted. If the caller leaves, nothing is
-        forwarded. If a claim is still in flight after BULK_CLAIM_WAIT_SECONDS (it should not be), the bulk delete
-        is refused with 409 bulk_delete_claim_busy and a log line.
+        forwarded. If a claim is still in flight after BULK_CLAIM_WAIT_SECONDS (it should not be), or the ledger
+        lock cannot be taken within that time (a signer is stuck on its receipt write), the bulk delete is refused
+        with 409 bulk_delete_claim_busy, not forwarded, and a log line. The wait has one monotonic deadline.
         """
-        ledger.bulk_arrive()
-        self.bulk_wait_open = True
         deadline = time.monotonic() + BULK_CLAIM_WAIT_SECONDS
-        while not ledger.bulk_try_start(BULK_POLL_SECONDS):
+
+        def refuse(why: str) -> bool:
+            print(f"room-receipts: bulk delete refused: {why} after {BULK_CLAIM_WAIT_SECONDS} s", file=sys.stderr,
+                  flush=True)
+            # Written before the guard is released: releasing takes the ledger lock, which may be the stuck one.
+            self.reply(409, canonical({"error": {"code": "bulk_delete_claim_busy",
+                                                  "message": "a room claim is still running; retry the bulk delete"}}),
+                       release=False)
+            return False
+
+        if not ledger.bulk_arrive(deadline - time.monotonic()):
+            return refuse("the ledger lock was not free")
+        self.bulk_wait_open = True
+        while True:
+            state = ledger.bulk_try_start(BULK_POLL_SECONDS, deadline)
+            if state == "started":
+                break
             if self.client_gone():
                 self.close_connection = True
                 return False
+            if state == "lock":
+                return refuse("the ledger lock was not free")
             if time.monotonic() >= deadline:
-                with ledger.lock:
-                    claims = ledger.claims_in_flight
-                print(f"room-receipts: bulk delete refused: {claims} claim(s) still in flight after "
-                      f"{BULK_CLAIM_WAIT_SECONDS} s", file=sys.stderr, flush=True)
-                self.reply(409, canonical({"error": {"code": "bulk_delete_claim_busy",
-                                                      "message": "a room claim is still running; retry the bulk delete"}}))
-                return False
+                return refuse(f"{ledger.claims_in_flight} claim(s) still in flight")
         self.bulk_wait_open = False
         self.bulk_open = True
         if self.client_gone():  # once more, right before it is forwarded (the wake-up may have come late)
@@ -2663,10 +2706,12 @@ class Handler(BaseHTTPRequestHandler):
             self.server.ledger.bulk_abandon()
 
     # -- helpers
-    def reply(self, status: int, body: bytes, headers: dict | None = None, ctype="application/json"):
+    def reply(self, status: int, body: bytes, headers: dict | None = None, ctype="application/json",
+              release: bool = True):
         # The turn ends after the receipt is signed and before the answer is written, so a caller that
         # sends its next request on seeing this answer finds the room free.
-        self.release_turn()
+        if release:
+            self.release_turn()
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -2704,8 +2749,7 @@ class Handler(BaseHTTPRequestHandler):
             # sent twice: a fresh connection (no stale keep-alive) and no
             # retry. A lost answer is a 502, and the receipt records it. On a serial room every
             # request is sent once, so one receipt stands for exactly one request at the API.
-            c = http.client.HTTPConnection("127.0.0.1", port,
-                                           timeout=timeout if deadline is None else min(timeout, deadline))
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
 
             def call():
                 c.request(method, path, body=body, headers=headers)
@@ -3141,6 +3185,12 @@ class Handler(BaseHTTPRequestHandler):
                 return ("pool_room_unknown", "a bulk delete that may have removed the room did not finish cleanly")
         got = self.server.api_get(f"/v1/sandboxes/{room}", CLAIM_WAIT_SECONDS, total=CLAIM_WAIT_SECONDS)
         if got is not None and got[0] == 200:
+            # A bulk delete that ended uncertainly may have marked the room while the GET was in flight.
+            with ledger.lock:
+                if room in ledger.unknown:
+                    return ("pool_room_unknown", "a bulk delete that may have removed the room did not finish cleanly")
+                if room not in ledger.claimed:
+                    return ("pool_room_gone", "the room is not claimed any more")
             return None
         if got is not None and got[0] in (404, 409):
             return ("pool_room_gone", "the room is not there")

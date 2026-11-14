@@ -224,31 +224,40 @@ unclaimed pool room this boot has the create receipt of, not marked unknown
 `expires_at`. It sets the lifetime through the API and signs `claim`
 (`cathedral_sandbox_id`, `lifetime_seconds`, `pooled_from` = the create
 receipt's hash, `status`, `expires_at`). The lifetime call has one total
-deadline of 10 seconds on a monotonic clock (not a timeout per read); when it
-is hit the claim is signed with status 502, as for any lost answer. Success
-answers 200 with the receipt. Any other result signs the claim with its status,
+deadline of 10 seconds on a monotonic clock, not a timeout per read. A timer
+sets an expired flag and cuts the connection, including one whose headers or
+body are still arriving, and the flag alone decides: whatever was parsed, an
+expired call is treated as no answer. The caller then gets 409
+`pool_claim_failed` and the signed claim says status 502, as for any lost
+answer. Success answers 200 with the receipt. Any other result signs the claim with its status,
 breaks the room (delete only) and answers 409 `pool_claim_failed`: one try per
 room. Another sandbox id gets 409 `pool_room_claimed`. A delete meanwhile gets
 409 `room_busy`.
 
 A replay is the same sandbox id claiming a claimed room again. It makes no
 lifetime call and signs nothing new. The front first does one GET of the room
-(the same 10 second total deadline). 200 from the API and the room not marked
-unknown: the stored answer and receipt. 404 or 409: 409 `pool_room_gone`. A 5xx
-or no answer, or a room marked unknown: 409 `pool_room_unknown`. A claim leaves
-the room's labels alone, so a bulk delete can remove a claimed room; this keeps
-a stored 200 from being replayed for a room that is gone.
+(a 10 second total deadline, as above). 200 from the API, and the room not
+marked unknown when the GET has returned (the mark is read under the ledger
+lock after the GET, so a mark set while it was in flight counts): the stored
+answer and receipt. 404 or 409: 409 `pool_room_gone`. A 5xx, no answer, the
+deadline, or a room marked unknown: 409 `pool_room_unknown`. A replay is a
+check at that moment that the room exists. It does not protect against a delete
+that lands a moment later. A claim leaves the room's labels alone, so a bulk
+delete can remove a claimed room, and this keeps a stored 200 from being
+replayed for a room that is already gone.
 
 **Bulk delete and claims.** A bulk delete by label names no room until the API
 runs it, so it never runs beside a claim.
 - A bulk delete that arrives while a claim is in flight waits for it for at most
-  15 seconds from its arrival (monotonic deadline; the claim's own lifetime call
-  is cut at 10 seconds in all). If a claim is still in flight after that, the
-  caller gets 409 `bulk_delete_claim_busy`, nothing is forwarded, and a line
-  goes to stderr.
-- Once forwarded, the front waits for its answer for at most 300 seconds in all.
-  When that is hit the caller gets 502 `hotel_api_no_answer` and the signed
-  `bulk_delete` receipt says status 502.
+  15 seconds from its arrival (one monotonic deadline; the claim's own lifetime
+  call is cut at 10 seconds in all). The wait takes the ledger lock with the
+  time that is left. If a claim is still in flight at 15 seconds, or the lock
+  could not be taken in time, the caller gets 409 `bulk_delete_claim_busy`,
+  nothing is forwarded, and a line goes to stderr.
+- Once forwarded, the front waits for its answer for at most 300 seconds in all
+  (monotonic, expired flag as for the claim). When that is hit the caller gets
+  502 `hotel_api_no_answer`, the signed `bulk_delete` receipt says status 502,
+  and the bulk delete counts as uncertain.
 - While a bulk delete is waiting or running, a fresh claim is refused with 409
   `pool_bulk_delete_busy` before its lifetime call, so the wait cannot be
   starved, and the API then creates a cold room. Every fresh claim in that time
@@ -280,6 +289,15 @@ Other refusals: 405 for any method but POST (checked before the gate), 400
 `pool_room_expiring`.
 
 Limits:
+- A request that signs a receipt holds the ledger lock while the receipt is
+  written. If storage blocks there, requests waiting for that lock wait with it,
+  the signing step of a claim included, and so do the releases at the end of
+  every request. Only the bulk delete's own wait is bounded against this, by
+  taking the lock with a timeout. The front never holds the ledger lock across a
+  call to the API.
+- Any holder of the machine's bearer key can send bulk deletes one after another
+  and keep fresh claims refused. There is no throttle for bulk deletes; the API
+  side then answers those claims as sold out.
 - A bulk delete by label names no room, so while one waits or runs it refuses
   fresh claims for every room, even if its label would not match that room. A
   room it removes ends with a `room_end` receipt at a later look. A create that
