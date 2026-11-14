@@ -270,6 +270,7 @@ type hotel struct {
 	baselineTry    time.Time
 	leaving        bool               // a leave passed its empty check; no new rooms (hotels.go)
 	stop           context.CancelFunc // stops the sync loop when the hotel leaves
+	syncDone       chan struct{}      // closed when the sync loop has returned: its last step is stored
 	alerts         hotelAlerts        // missed heartbeat and drop alerts sent (alerts.go)
 }
 
@@ -1990,6 +1991,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 }
 
 func (b *broker) syncLoop(ctx context.Context, h *hotel) {
+	defer close(h.syncDone)
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
 	for {

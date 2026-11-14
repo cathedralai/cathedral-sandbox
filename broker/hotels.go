@@ -250,7 +250,7 @@ func (b *broker) dropHotelIf(id string, expected *hotel) bool {
 // startSync runs the sync loop of h until the hotel leaves.
 func (b *broker) startSync(ctx context.Context, h *hotel) {
 	ctx, cancel := context.WithCancel(ctx)
-	h.stop = cancel
+	h.stop, h.syncDone = cancel, make(chan struct{})
 	go b.syncLoop(ctx, h)
 }
 
@@ -489,7 +489,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	// The stop function is set before the hotel is in the set, so a leave
 	// that races this join reads it set.
 	ctx, cancel := context.WithCancel(context.Background())
-	h.stop = cancel
+	h.stop, h.syncDone = cancel, make(chan struct{})
 	// Add first, then write the key: of two joins with one id, only the
 	// one that is added writes the key file. The hotel joins "leaving" (no
 	// rooms) until the chip check below, made once it is in the set: of two
