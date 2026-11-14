@@ -1814,6 +1814,9 @@
   "bad/snapshot_r1_content_upper_case/attestation_doc.json": "bc1ed043d4191edf50f11565805a6c81654bfbde1c89bcaeafbaf357684e3167",
   "bad/snapshot_r1_content_upper_case/case.json": "b96a0e7a7e1697a92163566a1afef1b522d5422c4ec604213e209734a22736a3",
   "bad/snapshot_r1_content_upper_case/receipts.json": "0b4de87378747e200c5cb1950cc4cc1c1412aeaf493d04a775825dfd1ecb227e",
+  "bad/snapshot_r1_create_that_did_not_succeed_carries_fork_members/attestation_doc.json": "bc1ed043d4191edf50f11565805a6c81654bfbde1c89bcaeafbaf357684e3167",
+  "bad/snapshot_r1_create_that_did_not_succeed_carries_fork_members/case.json": "dea4eef4cc3848c4ea0d4b2e9a3672b69c56b6d04a373149a60936c506a1466c",
+  "bad/snapshot_r1_create_that_did_not_succeed_carries_fork_members/receipts.json": "530f496b4c1bf7cf745c64538b2ce61b8afa2b9a5365eb9bc92f933863e2125f",
   "bad/snapshot_r1_delete_lacks_snapshot_id/attestation_doc.json": "bc1ed043d4191edf50f11565805a6c81654bfbde1c89bcaeafbaf357684e3167",
   "bad/snapshot_r1_delete_lacks_snapshot_id/case.json": "2e7b73fbb2586149b5d8c61ee4bf9cb6f4410a72a070a2335a590356292c6838",
   "bad/snapshot_r1_delete_lacks_snapshot_id/receipts.json": "fbb4ad21c517f517492f9a5f0ac3acdd340327ef1a9f0285dbd221b0cd3eaf7d",
@@ -1916,6 +1919,9 @@
   "bad/snapshot_r5_fork_names_a_receipt_that_is_not_a_snapshot/attestation_doc.json": "bc1ed043d4191edf50f11565805a6c81654bfbde1c89bcaeafbaf357684e3167",
   "bad/snapshot_r5_fork_names_a_receipt_that_is_not_a_snapshot/case.json": "dccb78820f81b3005e7eb4abc3990aaa80eacf4892779f6ada3e8cd7b8e8216c",
   "bad/snapshot_r5_fork_names_a_receipt_that_is_not_a_snapshot/receipts.json": "3818c4f824af29252c6d4668a50942c9d3ff4ef397607a7a61f5c2a1ccd457bc",
+  "bad/snapshot_r5_fork_names_a_snapshot_receipt_that_states_no_snapshot/attestation_doc.json": "bc1ed043d4191edf50f11565805a6c81654bfbde1c89bcaeafbaf357684e3167",
+  "bad/snapshot_r5_fork_names_a_snapshot_receipt_that_states_no_snapshot/case.json": "4c0f5b87f85fe732eefd95d461bc2b711f8a5e238c1c4b0ea573b793c731f386",
+  "bad/snapshot_r5_fork_names_a_snapshot_receipt_that_states_no_snapshot/receipts.json": "70ce5d060d577cb40608385824aa8775b62fdb5a5f370139758e8ad5a7d41a3d",
   "bad/snapshot_r5_fork_names_another_content_hash/attestation_doc.json": "bc1ed043d4191edf50f11565805a6c81654bfbde1c89bcaeafbaf357684e3167",
   "bad/snapshot_r5_fork_names_another_content_hash/case.json": "bf6a4ad8bae9354e62d05af99356af33ca0fe7c07e172b91624902fac4e62652",
   "bad/snapshot_r5_fork_names_another_content_hash/receipts.json": "4415d275d557e0c05b55586384f887c89cdf92117fd744148ca37f04fe9f346c",
@@ -2371,6 +2377,9 @@
   "good/snapshot_r1_failed_snapshot_carries_no_members/attestation_doc.json": "bc1ed043d4191edf50f11565805a6c81654bfbde1c89bcaeafbaf357684e3167",
   "good/snapshot_r1_failed_snapshot_carries_no_members/case.json": "4d127bf240fc03c009f7483ded0dded36ad139f351479f8ebe9850a66d561a18",
   "good/snapshot_r1_failed_snapshot_carries_no_members/receipts.json": "0aaa47ec31bc01dfb73f82749037d34ae301231f746936a10776c0c1529bac3f",
+  "good/snapshot_r1_successful_snapshot_without_members_passes_shapes/attestation_doc.json": "bc1ed043d4191edf50f11565805a6c81654bfbde1c89bcaeafbaf357684e3167",
+  "good/snapshot_r1_successful_snapshot_without_members_passes_shapes/case.json": "00c54b8214446a119a9c8f44d7c971b67c2aeb244064b5fe4bbfad386dd383cc",
+  "good/snapshot_r1_successful_snapshot_without_members_passes_shapes/receipts.json": "0ea9d2d5297269261d1b6d885fc3961ff385a942efc0bbc24804f8b3249804e5",
   "good/snapshot_r2_content_hash_recomputes_for_each_snapshot/attestation_doc.json": "bc1ed043d4191edf50f11565805a6c81654bfbde1c89bcaeafbaf357684e3167",
   "good/snapshot_r2_content_hash_recomputes_for_each_snapshot/case.json": "39d9105494aa2ad8956f5fd7d374953acaf263d048c39924859ffb859f8aa83f",
   "good/snapshot_r2_content_hash_recomputes_for_each_snapshot/receipts.json": "6c6dd1b6bfe3327cf8f74fb4c954d5e343fc2c7fc6e73ffd1bd0e96b70cf48a2",
@@ -2403,5 +2412,5 @@
   "source/trust.json": "ba26cab8bfe820365a2629fb3a59d631fcfb2c9fb458d5554bfd9009f879570e"
  },
  "root_rule": "sha256 of '<path> <sha256>' lines, sorted by path, MANIFEST.json excluded",
- "root_sha256": "f58b5e2a773407b1a962d6611457daeed5e0a62ff49d66191ec135422fa57307"
+ "root_sha256": "0ada9e840e612a4449d836bd60dfff6d8719450e1f5ebf74426f1c995824bde2"
 }

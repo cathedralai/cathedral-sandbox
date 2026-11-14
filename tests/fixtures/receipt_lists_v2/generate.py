@@ -1792,7 +1792,7 @@ def snapshot_cases(pack: Pack) -> None:
         hotel_case(pack, "bad", name, description, doc(h, receipts, headed), {"reason": reason})
 
     forks = "/chain/forks"
-    h, snap, fork, dele = snap_hotel(pack)
+    h, snap, *_ = snap_hotel(pack)
     good("snapshot_r1_basic_fork",
          "Room A is snapshotted, room B is a fork of it, the snapshot is deleted: one fork edge, found in the list.",
          h, {forks: [FORK_ENTRY]})
@@ -1833,13 +1833,13 @@ def snapshot_cases(pack: Pack) -> None:
     good("snapshot_r4_repeat_snapshot_agrees",
          "The same snapshot signed twice by its room, with the same content hash: no disagreement.", h, {forks: []})
 
-    h, snap, fork, dele = snap_hotel(pack, with_delete=False)
+    h, *_ = snap_hotel(pack, with_delete=False)
     out_of_place = [h.chain[2], h.chain[0], h.chain[1]]
     good("snapshot_r5_order_is_by_signed_sequence_not_by_place_in_the_list",
          "The fork's receipt stands first in the list file; the snapshot it names has the lower sequence, so it "
          "comes earlier.", h, {forks: [FORK_ENTRY]}, receipts=out_of_place)
 
-    h, snap, fork, dele = snap_hotel(pack, with_delete=False)
+    h, snap, *_ = snap_hotel(pack, with_delete=False)
     h.sign("create", "room-c", 200, **fork_fields(snap))
     good("snapshot_r5_two_forks_of_one_snapshot",
          "Two rooms forked from one snapshot give two edges.", h,
@@ -1870,13 +1870,13 @@ def snapshot_cases(pack: Pack) -> None:
 
     # ---- rule 1: shapes, before anything else
     def sn(**kw):
-        return dict(s=kw)
+        return {"s": kw}
 
     def fk(**kw):
-        return dict(f=kw)
+        return {"f": kw}
 
     def dl(**kw):
-        return dict(d=kw)
+        return {"d": kw}
 
     shapes = [
         ("snapshot_id_not_string", "A snapshot receipt whose snapshot_id is a number.", sn(snapshot_id=7), 2,
@@ -1934,7 +1934,7 @@ def snapshot_cases(pack: Pack) -> None:
          "snapshot_id is not a string"),
         ("fork_content_upper_case", "A fork's snapshot_content_sha256 in upper case.",
          fk(snapshot_content_sha256=snap_content().upper()), 3, "snapshot_content_sha256 is not 64 lower-case hex"),
-        ("delete_names_a_room", "A snapshot_delete with a sandbox_id.", dict(d={"sandbox_id": "room-a"}), 4,
+        ("delete_names_a_room", "A snapshot_delete with a sandbox_id.", {"d": {"sandbox_id": "room-a"}}, 4,
          "a snapshot_delete has a sandbox_id: it must be null"),
         ("delete_lacks_snapshot_id", "A snapshot_delete with no snapshot_id.", dl(snapshot_id=DEL), 4,
          "snapshot_id is not a string"),
@@ -1955,12 +1955,12 @@ def snapshot_cases(pack: Pack) -> None:
         SNAP_SHAPE.format(i=2, text="a snapshot receipt that did not succeed carries snapshot members"))
 
     # ---- rule 2: the content hash recomputes
-    h, *_ = snap_hotel(pack, s=dict(snapshot_content_sha256="0" * 64), f=dict(snapshot_content_sha256="0" * 64))
+    h, *_ = snap_hotel(pack, s={"snapshot_content_sha256": "0" * 64}, f={"snapshot_content_sha256": "0" * 64})
     bad("snapshot_r2_content_hash_does_not_recompute",
         "The snapshot's content hash is not the hash of its image id and work archive hash.", h,
         "receipt 2: snapshot_content_sha256 does not recompute from snapshot_image_id and "
         "snapshot_work_archive_sha256")
-    h, *_ = snap_hotel(pack, s=dict(snapshot_image_id="sha256:" + "b" * 64))
+    h, *_ = snap_hotel(pack, s={"snapshot_image_id": "sha256:" + "b" * 64})
     bad("snapshot_r2_image_id_changed_after_hashing",
         "The image id was changed and the old content hash kept.", h,
         "receipt 2: snapshot_content_sha256 does not recompute from snapshot_image_id and "
@@ -1985,13 +1985,13 @@ def snapshot_cases(pack: Pack) -> None:
 
     # ---- rule 5: the fork matches the snapshot it names
     other_hash = hashlib.sha256(b"archive 2").hexdigest()
-    h, *_ = snap_hotel(pack, f=dict(snapshot_id="snap_0123456789ac"), with_delete=False)
+    h, *_ = snap_hotel(pack, f={"snapshot_id": "snap_0123456789ac"}, with_delete=False)
     bad("snapshot_r5_fork_names_another_snapshot_id", "The fork's snapshot_id is not the named snapshot's.", h,
         "receipt 3: the fork names a snapshot receipt with another snapshot_id")
-    h, *_ = snap_hotel(pack, f=dict(snapshot_content_sha256=snap_content(archive=other_hash)), with_delete=False)
+    h, *_ = snap_hotel(pack, f={"snapshot_content_sha256": snap_content(archive=other_hash)}, with_delete=False)
     bad("snapshot_r5_fork_names_another_content_hash", "The fork's content hash is not the named snapshot's.", h,
         "receipt 3: the fork names a snapshot receipt with another snapshot_content_sha256")
-    h, *_ = snap_hotel(pack, f=dict(snapshot_source_sandbox_id="room-z"), with_delete=False)
+    h, *_ = snap_hotel(pack, f={"snapshot_source_sandbox_id": "room-z"}, with_delete=False)
     bad("snapshot_r5_fork_names_another_source_room",
         "The fork's source room is not the room that signed the named snapshot.", h,
         "receipt 3: the fork names a snapshot receipt of another room than snapshot_source_sandbox_id")
@@ -2023,6 +2023,27 @@ def snapshot_cases(pack: Pack) -> None:
         early, "receipt 2: the fork names a snapshot receipt that does not come before it",
         receipts=[late_snap, early_fork], headed=False)
 
+    h = pack.new_hotel()
+    h.sign("create", "room-a", 200)
+    bare = h.sign("snapshot", "room-a", 202)
+    h.sign("create", "room-b", 200, **fork_fields(bare))
+    bad("snapshot_r5_fork_names_a_snapshot_receipt_that_states_no_snapshot",
+        "A snapshot receipt with no snapshot members (a front without this change signs one) can never be a fork's "
+        "source.", h, "receipt 3: the fork names a snapshot receipt that states no snapshot")
+    h = pack.new_hotel()
+    h.sign("create", "room-a", 200)
+    h.sign("snapshot", "room-a", 202)
+    good("snapshot_r1_successful_snapshot_without_members_passes_shapes",
+         "A successful snapshot receipt with none of the five members is an honest receipt of a front that signs "
+         "snapshot as a plain action.", h, {forks: []})
+    h = pack.new_hotel()
+    h.sign("create", "room-a", 200)
+    snap = h.sign("snapshot", "room-a", 202, **snap_fields())
+    h.sign("create", "room-b", 409, **fork_fields(snap))
+    bad("snapshot_r1_create_that_did_not_succeed_carries_fork_members",
+        "A create that failed carries the four fork members: a front adds them only to a successful create.", h,
+        SNAP_SHAPE.format(i=3, text="a create that did not succeed carries snapshot fork members"))
+
     # ---- rule 7: a fork after a delete of the same snapshot
     h = pack.new_hotel()
     h.sign("create", "room-a", 200)
@@ -2042,7 +2063,7 @@ def snapshot_cases(pack: Pack) -> None:
         f"receipt 4: the fork is of snapshot {SNAP_ID}, which receipt 3 deleted before it")
     h = pack.new_hotel()
     h.sign("snapshot_delete", None, 200, **delete_fields())
-    h.sign("create", "room-b", 200, **{**fork_fields(pack_snapshot_stub(pack))})
+    h.sign("create", "room-b", 200, **fork_fields(pack_snapshot_stub(pack)))
     bad("snapshot_r7_fork_after_delete_when_the_snapshot_receipt_is_not_in_the_list",
         "The snapshot's receipt is in another list; the delete and the fork are here.", h,
         f"receipt 2: the fork is of snapshot {SNAP_ID}, which receipt 1 deleted before it")

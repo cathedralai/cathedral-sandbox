@@ -2086,18 +2086,18 @@ def _repeat_disagrees(gen, pack) -> list[dict]:
 
 
 MODE_CASES = {
-    "shape": (lambda gen, pack: _plain_chain(gen, pack, s=dict(snapshot_size_bytes=-1)),
+    "shape": (lambda gen, pack: _plain_chain(gen, pack, s={"snapshot_size_bytes": -1}),
               "receipt 2 of the list: snapshot_size_bytes is not an integer of 0 or more"),
-    "partial members": (lambda gen, pack: _plain_chain(gen, pack, f=dict(snapshot_source_sandbox_id=gen.DEL)),
+    "partial members": (lambda gen, pack: _plain_chain(gen, pack, f={"snapshot_source_sandbox_id": gen.DEL}),
                         "receipt 3 of the list: a create has some of its four snapshot fork members and not all"),
-    "content hash": (lambda gen, pack: _plain_chain(gen, pack, s=dict(snapshot_content_sha256="0" * 64)),
-                     "receipt 2: snapshot_content_sha256 does not recompute from snapshot_image_id and "
-                     "snapshot_work_archive_sha256"),
-    "fork names another id": (lambda gen, pack: _plain_chain(gen, pack, f=dict(snapshot_id="snap_0123456789ac"),
+    "content hash": (lambda gen, pack: _plain_chain(gen, pack, s={"snapshot_content_sha256": "0" * 64}),
+                     ("receipt 2: snapshot_content_sha256 does not recompute from snapshot_image_id and "
+                      "snapshot_work_archive_sha256")),
+    "fork names another id": (lambda gen, pack: _plain_chain(gen, pack, f={"snapshot_id": "snap_0123456789ac"},
                                                              with_delete=False),
                               "receipt 3: the fork names a snapshot receipt with another snapshot_id"),
     "repeat disagrees": (_repeat_disagrees,
-                         f"snapshot snap_0123456789ab: receipt 2 and receipt 3 disagree on snapshot_content_sha256"),
+                         "snapshot snap_0123456789ab: receipt 2 and receipt 3 disagree on snapshot_content_sha256"),
     "fork after delete": (_fork_after_delete,
                           "receipt 4: the fork is of snapshot snap_0123456789ab, which receipt 3 deleted before it"),
 }
@@ -2139,3 +2139,55 @@ def test_rule_9_a_good_snapshot_list_names_its_fork_in_file_and_header_mode(mode
     assert out["chain"]["forks"] == [{"room": "room-b", "snapshot_id": "snap_0123456789ab",
                                       "snapshot_content_sha256": _generator().snap_content(),
                                       "source_room": "room-a", "in_list": True}]
+
+
+# ---- the pair test: the receipts front's own fixture (copied byte for byte from AB#604 CS-3) through this checker
+SHARED = ROOT / "tests" / "fixtures" / "snapshot_fork_v1" / "snapshot_fork_v1.json"
+SHARED_SHA256 = "4b57e2329e5a7588f9869e9e63a4ccd58e35c13e4dc4b15b1746f9ed542483b0"
+
+
+def _shared_run(tmp_path: Path, receipts=None, head=True) -> tuple[int, dict, str]:
+    doc = json.loads(SHARED.read_text())
+    (tmp_path / "attestation_doc.json").write_text(json.dumps(doc["attestation"]))
+    body = {"receipts": doc["receipts"] if receipts is None else receipts}
+    if head:
+        body["head"] = doc["head"]
+    (tmp_path / "receipts.json").write_text(json.dumps(body))
+    code, out, err = _run_cli(*[a.replace("{dir}", str(tmp_path)) for a in doc["args"]])
+    return code, json.loads(out), err
+
+
+def test_the_shared_fixture_is_the_one_the_front_made() -> None:
+    import hashlib
+
+    assert hashlib.sha256(SHARED.read_bytes()).hexdigest() == SHARED_SHA256
+
+
+def test_the_shared_fixture_passes_and_names_one_fork_found_in_the_list(tmp_path) -> None:
+    code, out, err = _shared_run(tmp_path)
+    assert code == 0 and out["verdict"] == "PASS", (out, err[-300:])
+    snap = json.loads(SHARED.read_text())["receipts"][1]["statement"]
+    assert out["chain"]["forks"] == [{
+        "room": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d", "snapshot_id": "snap_0123456789ab",
+        "snapshot_content_sha256": snap["snapshot_content_sha256"],
+        "source_room": "0f1e2d3c-4b5a-4968-8776-655443322110", "in_list": True}]
+
+
+@pytest.mark.parametrize("order", [[3, 2, 1, 0], [1, 3, 0, 2], [2, 0, 3, 1]])
+def test_the_shared_fixture_in_another_list_order_gives_the_same_forks(order, tmp_path) -> None:
+    receipts = json.loads(SHARED.read_text())["receipts"]
+    code, out, _ = _shared_run(tmp_path, [receipts[i] for i in order])
+    assert code == 0 and out["chain"]["forks"][0]["in_list"] is True and len(out["chain"]["forks"]) == 1
+
+
+def test_the_shared_fixture_without_the_snapshot_receipt_warns_and_passes(tmp_path) -> None:
+    receipts = json.loads(SHARED.read_text())["receipts"]
+    code, out, _ = _shared_run(tmp_path, [receipts[0], receipts[2], receipts[3]], head=False)
+    assert code == 0 and out["verdict"] == "PASS"
+    assert [(f["in_list"], f.get("fork_source")) for f in out["chain"]["forks"]] == [(False, "not_in_list")]
+
+
+def test_the_shared_fixture_room_b_alone_warns_and_passes(tmp_path) -> None:
+    receipts = json.loads(SHARED.read_text())["receipts"]
+    code, out, _ = _shared_run(tmp_path, [receipts[2]], head=False)
+    assert code == 0 and out["chain"]["forks"][0]["fork_source"] == "not_in_list"
