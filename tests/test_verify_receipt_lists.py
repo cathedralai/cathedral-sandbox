@@ -2217,7 +2217,7 @@ def test_the_shared_fixture_room_b_alone_warns_and_passes(tmp_path) -> None:
 
 # ---- review 1 of CS-4: one fault per bad case, no internal error, run mode keeps the result, cost in receipts
 
-RULE_SWITCH = {1: "check_snapshot_shapes", 2: "_check_content_hashes", 4: "_check_repeats",
+RULE_SWITCH = {1: "_check_snapshot_forms", 2: "_check_content_hashes", 4: "_check_repeats",
                5: "_check_fork_matches_snapshot", 7: "_check_fork_not_after_delete"}
 R2_REASON = ("receipt 2: snapshot_content_sha256 does not recompute from snapshot_image_id and "
              "snapshot_work_archive_sha256")
@@ -2232,19 +2232,25 @@ ALSO_BREAKS = {
     "snapshot_r1_fork_content_upper_case": FORK_CONTENT,
     "snapshot_r1_fork_source_number": FORK_ROOM, "snapshot_r1_fork_source_null": FORK_ROOM,
     "snapshot_r1_fork_source_empty": FORK_ROOM,
-    "snapshot_r1_snapshot_lacks_id": "receipt 3: the fork names a snapshot receipt that states no snapshot",
+}
+# Faults of presence: a member the later checks read is missing. The presence guard is not a rule that can be
+# switched off (without it the graph code would read a gap), so these cases keep their own reason with the form
+# checks off.
+PRESENCE_CASES = {
+    "snapshot_r1_snapshot_lacks_id", "snapshot_r1_snapshot_lacks_image_id", "snapshot_r1_snapshot_lacks_content",
+    "snapshot_r1_snapshot_lacks_sandbox_id", "snapshot_r1_fork_lacks_source", "snapshot_r1_fork_lacks_receipt_hash",
+    "snapshot_r1_fork_lacks_content", "snapshot_r1_fork_lacks_sandbox_id", "snapshot_r1_delete_lacks_sandbox_id",
+    "snapshot_r1_delete_lacks_snapshot_id",
 }
 
 
 def _outcome(vr, receipts) -> str | None:
-    """The Fail reason, None for a pass, "crash" for an error that is not a named reason."""
+    """The Fail reason, or None for a pass. Any other exception is an error of the test."""
     try:
         vr.check_receipt_shapes(receipts)
         vr.check_snapshot_edges(receipts)
     except vr.Fail as exc:
         return str(exc)
-    except (KeyError, TypeError, AttributeError, IndexError):
-        return "crash"
     return None
 
 
@@ -2266,9 +2272,9 @@ def test_each_snapshot_bad_case_breaks_one_rule_only(name) -> None:
             assert _outcome(vr, receipts) == reason, (name, other)
     vr = _load_checker()  # its own rule off: nothing else is wrong with it
     setattr(vr, RULE_SWITCH[rule], lambda *a, **k: None)
-    assert _outcome(vr, receipts) in (None, "crash", ALSO_BREAKS.get(name)), name
-    if name in ALSO_BREAKS:
-        assert _outcome(vr, receipts) == ALSO_BREAKS[name]
+    # its own rule off: it passes (that rule was its only fault), or it gives the one second reason pinned for it
+    want = reason if name in PRESENCE_CASES else ALSO_BREAKS.get(name)
+    assert _outcome(vr, receipts) == want, name
 
 
 def _every_member_changed(receipts: list[dict]):

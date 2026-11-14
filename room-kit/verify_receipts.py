@@ -825,16 +825,35 @@ def _check_snapshot_member(st: dict, name: str, where: str) -> None:
              f"{where}: {name} is not 64 lower-case hex")
 
 
-def check_snapshot_shapes(st: dict, where: str) -> None:
-    """The snapshot members of one statement, by action. Members that are absent are left out, never null."""
+def _check_snapshot_presence(st: dict, where: str) -> None:
+    """Which snapshot members a statement carries, and that none the later checks read is missing. Kept apart from
+    the forms so that the form checks can be switched off in a test without the graph code reading a gap."""
+    action = st["action"]
+    if action == "snapshot":
+        present = [m for m in SNAPSHOT_MEMBERS if m in st]
+        if _succeeded(st) and present:
+            need(len(present) == len(SNAPSHOT_MEMBERS),
+                 f"{where}: a snapshot receipt has some of its five snapshot members and not all")
+            need("sandbox_id" in st, f"{where}: a snapshot receipt has no sandbox_id string")
+    elif action == "create":
+        present = [m for m in FORK_MEMBERS if m in st]
+        if present and _succeeded(st):
+            need(len(present) == len(FORK_MEMBERS),
+                 f"{where}: a create has some of its four snapshot fork members and not all")
+            need("sandbox_id" in st, f"{where}: a fork's create has no sandbox_id string")
+    elif action == "snapshot_delete":
+        need("sandbox_id" in st, f"{where}: a snapshot_delete has no sandbox_id member: it must be null, not left out")
+        need("snapshot_id" in st, f"{where}: snapshot_id is not a string")
+
+
+def _check_snapshot_forms(st: dict, where: str) -> None:
+    """The form of each snapshot member, and which statements may carry them. Absent members are left out, never null."""
     action = st["action"]
     if action == "snapshot":
         present = [m for m in SNAPSHOT_MEMBERS if m in st]
         if not _succeeded(st):
             need(not present, f"{where}: a snapshot receipt that did not succeed carries snapshot members")
         elif present:
-            need(len(present) == len(SNAPSHOT_MEMBERS),
-                 f"{where}: a snapshot receipt has some of its five snapshot members and not all")
             for name in SNAPSHOT_MEMBERS:
                 _check_snapshot_member(st, name, where)
             need(isinstance(st.get("sandbox_id"), str), f"{where}: a snapshot receipt has no sandbox_id string")
@@ -842,17 +861,20 @@ def check_snapshot_shapes(st: dict, where: str) -> None:
         present = [m for m in FORK_MEMBERS if m in st]
         if present:
             need(_succeeded(st), f"{where}: a create that did not succeed carries snapshot fork members")
-            need(len(present) == len(FORK_MEMBERS),
-                 f"{where}: a create has some of its four snapshot fork members and not all")
             for name in FORK_MEMBERS:
                 _check_snapshot_member(st, name, where)
             need(isinstance(st.get("sandbox_id"), str), f"{where}: a fork's create has no sandbox_id string")
     elif action == "snapshot_delete":
-        need("sandbox_id" in st, f"{where}: a snapshot_delete has no sandbox_id member: it must be null, not left out")
         need(st["sandbox_id"] is None, f"{where}: a snapshot_delete has a sandbox_id: it must be null")
         _check_snapshot_member(st, "snapshot_id", where)
         if "snapshot_source_sandbox_id" in st:
             _check_snapshot_member(st, "snapshot_source_sandbox_id", where)
+
+
+def check_snapshot_shapes(st: dict, where: str) -> None:
+    """The snapshot members of one statement, by action: presence first, then form."""
+    _check_snapshot_presence(st, where)
+    _check_snapshot_forms(st, where)
 
 
 # Check 11 is made of small rules, each its own function so that a test can switch one off and see that every
