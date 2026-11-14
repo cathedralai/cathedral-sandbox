@@ -79,9 +79,11 @@ type alerter struct {
 type hotelAlerts struct {
 	missSent     bool      // operator alert delivered for the current miss streak
 	missInflight bool      // operator alert queued or POST in progress
+	missEpoch    uint64    // changes when the miss streak ends
 	operatorLast time.Time // last operator alert delivery
 	dropSent     bool      // ops alert delivered for the current down episode
 	dropInflight bool      // ops alert queued or POST in progress
+	dropEpoch    uint64    // changes when the down episode ends
 	opsLast      time.Time // last ops alert delivery
 }
 
@@ -252,6 +254,7 @@ func (b *broker) alertHealth(h *hotel, herr error, hadHealth bool) {
 	now := a.now()
 	st := &h.alerts
 	if herr == nil {
+		st.missEpoch++
 		st.missSent = false
 		st.missInflight = false
 	} else if hadHealth && !st.missSent && !st.missInflight {
@@ -259,16 +262,21 @@ func (b *broker) alertHealth(h *hotel, herr error, hadHealth bool) {
 			chat := h.alertChat()
 			text := fmt.Sprintf("Cathedral: %s missed a heartbeat (no /room/health answer for %s). Check the machine.",
 				hotelAlertName(h), now.Sub(h.lastOK).Round(time.Second))
+			epoch := st.missEpoch
 			onOK := func() {
 				b.mu.Lock()
-				st.missSent = true
-				st.missInflight = false
-				st.operatorLast = a.now()
+				if st.missEpoch == epoch && st.missInflight {
+					st.missSent = true
+					st.missInflight = false
+					st.operatorLast = a.now()
+				}
 				b.mu.Unlock()
 			}
 			onFail := func() {
 				b.mu.Lock()
-				st.missInflight = false
+				if st.missEpoch == epoch {
+					st.missInflight = false
+				}
 				b.mu.Unlock()
 			}
 			if a.send("OPERATOR-ALERT", chat, text, onOK, onFail) {
@@ -284,6 +292,7 @@ func (b *broker) alertHealth(h *hotel, herr error, hadHealth bool) {
 		}
 	}
 	if h.ok {
+		st.dropEpoch++
 		st.dropSent = false
 		st.dropInflight = false
 		return
@@ -295,16 +304,21 @@ func (b *broker) alertHealth(h *hotel, herr error, hadHealth bool) {
 			return
 		}
 		text := fmt.Sprintf("Cathedral: %s is down with %d customer rooms or creates on it.", hotelAlertName(h), load)
+		epoch := st.dropEpoch
 		onOK := func() {
 			b.mu.Lock()
-			st.dropSent = true
-			st.dropInflight = false
-			st.opsLast = a.now()
+			if st.dropEpoch == epoch && st.dropInflight {
+				st.dropSent = true
+				st.dropInflight = false
+				st.opsLast = a.now()
+			}
 			b.mu.Unlock()
 		}
 		onFail := func() {
 			b.mu.Lock()
-			st.dropInflight = false
+			if st.dropEpoch == epoch {
+				st.dropInflight = false
+			}
 			b.mu.Unlock()
 		}
 		if a.send("OPS-ALERT", a.opsChat, text, onOK, onFail) {

@@ -617,3 +617,75 @@ done:
 		t.Fatalf("want one ops alert after continued downtime, got %d", ops)
 	}
 }
+
+// A delivery from an old outage must not consume a newer outage's alerts.
+func TestStaleAlertCallbacksDoNotConsumeNewOutage(t *testing.T) {
+	for _, oldOutcome := range []string{"success", "give_up"} {
+		t.Run(oldOutcome, func(t *testing.T) {
+			tc := newChain(t)
+			a := tc.b.alerts
+			a.post = func(context.Context, alertMsg) error { return nil }
+			a.opsChat = "-100200"
+			setHotel(tc, "a", func(h *hotel) {
+				h.cfg.AlertChatID = "4242"
+				h.lastOK = time.Now()
+			})
+			change := func(up bool) {
+				setHotel(tc, "a", func(h *hotel) {
+					h.ok = up
+					h.creating = 1 // an ops alert has a customer-facing create
+					var err error
+					if !up {
+						err = errors.New("health failed")
+					}
+					tc.b.alertHealth(h, err, true)
+				})
+			}
+			take := func() []alertJob {
+				t.Helper()
+				var jobs []alertJob
+				for {
+					select {
+					case job := <-a.queue:
+						jobs = append(jobs, job)
+					default:
+						return jobs
+					}
+				}
+			}
+			change(false)
+			old := take()
+			if len(old) != 2 {
+				t.Fatalf("first outage queued %d alerts, want two", len(old))
+			}
+			change(true)
+			change(false)
+			current := take()
+			if len(current) != 2 {
+				t.Fatalf("second outage queued %d alerts, want two", len(current))
+			}
+			for _, job := range old {
+				if oldOutcome == "success" {
+					job.onSuccess() // old POST completes after the new outage starts
+				} else {
+					job.onGiveUp() // old retry window ends after the new outage starts
+				}
+			}
+			var missInflight, dropInflight bool
+			setHotel(tc, "a", func(h *hotel) {
+				missInflight, dropInflight = h.alerts.missInflight, h.alerts.dropInflight
+			})
+			if !missInflight || !dropInflight {
+				t.Fatal("stale callback changed the new outage's inflight state")
+			}
+			for _, job := range current {
+				job.onGiveUp() // new POST fails through its retry window
+			}
+			change(false)
+			retry := take()
+			if len(retry) != 2 {
+				t.Fatalf("new outage queued %d retries after stale callback, want two", len(retry))
+			}
+		})
+	}
+}
