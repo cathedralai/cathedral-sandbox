@@ -2207,12 +2207,15 @@ class Ledger:
         return True
 
     def bulk_try_start(self, wait: float, until: float) -> str:
-        """started, waiting (a claim is in flight; waited up to *wait* seconds for it) or lock (not taken by *until*).
+        """started, waiting (a claim is in flight; waited up to *wait* seconds for it), lock (not taken by *until*)
+        or late (*until* had passed once the lock was taken).
 
         *until* is a time.monotonic() deadline. The wait for a claim to end holds no lock."""
         if not self.lock.acquire(timeout=max(0.0, until - time.monotonic())):
             return "lock"
         try:
+            if time.monotonic() >= until:
+                return "late"  # its bound passed while the thread was paused: no counter changes
             if not self.claims_in_flight:
                 self.bulk_in_flight += 1
                 if self.creates_in_flight:
@@ -2447,16 +2450,22 @@ def bulk_outcome_is_certain(status: int) -> bool:
     return 200 <= status < 300 or 400 <= status < 500
 
 
+TIMER = threading.Timer  # the deadline timer; a test can replace it to show the deadline holds without it
+
+
 def run_within(conn: http.client.HTTPConnection, seconds: float, call):
     """Run call() on *conn*, which must not be connected yet, and give up when *seconds* have passed in all.
 
     A socket timeout counts each read on its own, so a slow trickle of bytes never trips it. This bounds the
     whole call on a monotonic clock. The timer sets an expired flag and cuts the connection's socket, and that
     socket is kept here, because an answer with Connection: close detaches it from *conn* while its body is
-    still being read. Expiry is decided by the flag alone, never by what was parsed: a cut during the headers
-    can read as a complete short answer. After call() the flag is checked first, and an expired call raises
-    TimeoutError (an OSError), as a lost answer does.
+    still being read. Expiry is never decided by what was parsed (a cut during the headers can read as a
+    complete short answer), and not by the timer thread alone either: after call() the flag is checked first,
+    then the monotonic clock itself, so an answer that arrives late is expired even if the timer thread was
+    delayed. An expired call raises TimeoutError (an OSError), as a lost answer does. The connect and every read
+    get the time that is left as their timeout, so neither outlives the deadline.
     """
+    deadline_at = time.monotonic() + seconds
     expired = threading.Event()
     sockets: list = []
 
@@ -2468,10 +2477,11 @@ def run_within(conn: http.client.HTTPConnection, seconds: float, call):
             except OSError:
                 pass
 
-    timer = threading.Timer(seconds, cut)
+    timer = TIMER(seconds, cut)
     timer.daemon = True
     timer.start()
     try:
+        conn.timeout = max(0.001, min(conn.timeout or seconds, deadline_at - time.monotonic()))
         conn.connect()
         sockets.append(conn.sock)
         if expired.is_set():
@@ -2479,7 +2489,7 @@ def run_within(conn: http.client.HTTPConnection, seconds: float, call):
         result = call()
     finally:
         timer.cancel()
-    if expired.is_set():
+    if expired.is_set() or time.monotonic() > deadline_at:
         raise TimeoutError("the answer came after the deadline")
     return result
 
@@ -2678,8 +2688,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.client_gone():
                 self.close_connection = True
                 return False
-            if state == "lock":
-                return refuse("the ledger lock was not free")
+            if state in ("lock", "late"):
+                return refuse("the ledger lock was not free in time")
             if time.monotonic() >= deadline:
                 return refuse(f"{ledger.claims_in_flight} claim(s) still in flight")
         self.bulk_wait_open = False

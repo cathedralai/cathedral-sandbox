@@ -226,8 +226,11 @@ unclaimed pool room this boot has the create receipt of, not marked unknown
 receipt's hash, `status`, `expires_at`). The lifetime call has one total
 deadline of 10 seconds on a monotonic clock, not a timeout per read. A timer
 sets an expired flag and cuts the connection, including one whose headers or
-body are still arriving, and the flag alone decides: whatever was parsed, an
-expired call is treated as no answer. The caller then gets 409
+body are still arriving. Expiry is also checked against the monotonic clock
+itself after the call, so an answer that arrives after the bound counts as
+expired even if the timer thread ran late, and whatever was parsed, an expired
+call is treated as no answer. The connect and every read get the time that is
+left as their timeout. The caller then gets 409
 `pool_claim_failed` and the signed claim says status 502, as for any lost
 answer. Success answers 200 with the receipt. Any other result signs the claim with its status,
 breaks the room (delete only) and answers 409 `pool_claim_failed`: one try per
@@ -251,11 +254,14 @@ runs it, so it never runs beside a claim.
 - A bulk delete that arrives while a claim is in flight waits for it for at most
   15 seconds from its arrival (one monotonic deadline; the claim's own lifetime
   call is cut at 10 seconds in all). The wait takes the ledger lock with the
-  time that is left. If a claim is still in flight at 15 seconds, or the lock
+  time that is left, and the deadline is checked again under the lock before
+  the bulk delete starts, so a thread that was paused past it is refused and no
+  counter changes. If a claim is still in flight at 15 seconds, or the lock
   could not be taken in time, the caller gets 409 `bulk_delete_claim_busy`,
   nothing is forwarded, and a line goes to stderr.
 - Once forwarded, the front waits for its answer for at most 300 seconds in all
-  (monotonic, expired flag as for the claim). When that is hit the caller gets
+  (monotonic, with the expired flag and the clock check as for the claim, and
+  the connect and reads limited to the time left). When that is hit the caller gets
   502 `hotel_api_no_answer`, the signed `bulk_delete` receipt says status 502,
   and the bulk delete counts as uncertain.
 - While a bulk delete is waiting or running, a fresh claim is refused with 409
@@ -265,8 +271,9 @@ runs it, so it never runs beside a claim.
   is not a fresh claim and is answered as above at any time.
 - A caller that leaves while its bulk delete waits ends the wait and nothing is
   forwarded. The front looks every 0.2 seconds and once more right before
-  forwarding. On the TLS port of a miner hotel a disconnect is not detected: the
-  bulk delete is forwarded.
+  forwarding. The look does not run while the request waits for the ledger lock.
+  On the TLS port of a miner hotel a disconnect is not detected: the bulk
+  delete is forwarded.
 
 **An uncertain bulk delete.** Certain means a 2xx, or a 4xx, which the machine
 sends only before it acts (authentication, the label filter; once it starts
