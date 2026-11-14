@@ -68,7 +68,8 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      positive lifetime_seconds, pooled_from the create's receipt hash), which
      needs numbered receipts. The claim's id is the room's link, so
      --cathedral-sandbox finds it; an unclaimed room, a retired one and a room
-     whose claim failed name no link. The output's pool_rooms gives each state.
+     whose claim failed name no link. A failed delete leaves the room's state
+     unknown, not retired. The output's pool_rooms gives each state.
 
 Not checked here (by design, today): that the measurement is an approved image.
 Image approval is a signed policy release; that is a later step.
@@ -556,13 +557,15 @@ def _check_pool_rooms(receipts: list[dict]) -> dict[str, dict]:
             second = ordered[1]["statement"]
             need(second.get("action") == "delete",
                  f"room {room}: receipt {second.get('sequence')}: receipt 2 of a pool room is not a claim")
-            entry["state"] = "retired"
+            # A signed failed delete records the attempt, not removal. The
+            # room may still exist, so neither retired nor unclaimed is proven.
+            entry["state"] = "retired" if _succeeded(second) else "unknown"
         out[room_key(groups, bsha, room)] = entry
     return out
 
 
 def pool_rooms(receipts: list[dict]) -> dict[str, dict]:
-    """Room id -> {state, pooled_from} for each pre-made room: claimed, closed, unclaimed or retired."""
+    """Room id -> {state, pooled_from} for each pre-made room; failed delete leaves state unknown."""
     return {key: {k: v for k, v in entry.items() if not k.startswith("_")}
             for key, entry in _check_pool_rooms(receipts).items()}
 

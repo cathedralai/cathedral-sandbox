@@ -166,3 +166,12 @@ def test_pool_rooms_function_reports_states_and_stays_empty_without_a_pool_creat
     assert states == {"pool_room_claimed": "claimed", "pool_room_unclaimed": "unclaimed",
                       "pool_room_claim_failed": "closed", "pool_room_retired_unclaimed": "retired"}
     assert vr.pool_rooms(_case_receipts("good/numbered_rooms_interleaved")) == {}
+
+
+@pytest.mark.parametrize("status", [503, "503", None])
+def test_failed_pool_delete_does_not_prove_the_room_was_retired(status) -> None:
+    vr = _load_checker()
+    receipts = _case_receipts("good/pool_room_retired_unclaimed")
+    receipts[-1]["statement"]["status"] = status
+    assert vr.pool_rooms(receipts)["pool-1"]["state"] == "unknown"
+    assert vr.room_links(receipts) == {}
