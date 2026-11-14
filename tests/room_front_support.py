@@ -369,6 +369,10 @@ class Front:
         self.server.shutdown()
         self.server.server_close()
         self.api.stop()
+        try:
+            self.ledger.store.close()  # the chain file: one descriptor per front, or they add up across the suite
+        except (OSError, ValueError):
+            pass
 
 
 def receipt_of(headers: dict) -> dict:
