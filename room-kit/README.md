@@ -106,6 +106,12 @@ health does not say `sealed`. Verify a chain offline with
 `verify_receipts.py`: signature, link to the previous receipt, and head. A
 level 1 chain has no SNP report.
 
+`verify_receipts.py --oneshot FILE` checks one one-shot run's file offline (run mode). It takes `--recipe`,
+`--context` or `--no-context`, `--run-id`, `--input-sha256`, `--input-file`, `--output-file`,
+`--expected-measurement`, `--allowed-measurements`, `--ark-sha256`, `--product` and `--require-sealed`; any other
+flag is refused with exit 2. The owner check and the guest TLS key check are list-mode checks that run mode does
+not do. The module's header documents the eight checks.
+
 Sealed SNP receipts are a separate path and stay opt-in. `install.sh --sealed`
 builds a guest that sets `ROOM_RECEIPTS=1` and its own listen address. Inside
 that guest, when the TSM provider is `sev_guest`, the same process keeps the

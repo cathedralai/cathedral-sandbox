@@ -73,6 +73,11 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
 Run mode (--oneshot FILE, a cathedral_oneshot_bundle_v1) checks one run's file offline against what the
 caller expects, in eight checks. The AMD certificates come from the file (amd_certs) and must match
 --ark-sha256, which run mode requires; --skip-amd is refused. Any missing input is a FAIL, never a guess.
+Run mode takes --oneshot, --recipe, --context or --no-context, --run-id, --input-sha256, --input-file,
+--output-file, --expected-measurement, --allowed-measurements, --ark-sha256, --product and --require-sealed (which
+changes nothing: run mode always requires an SEV-SNP attestation). Every other flag is refused with exit 2. The
+owner check (--owner-pubkey) and the guest TLS key check (--tls-spki-sha256, --require-tls) are list-mode checks;
+run mode does not do them.
   1. attestation, AMD chain, measurement (--expected-measurement, repeatable, or --allowed-measurements FILE),
      every receipt's signature, one binding.
   2. the room's receipts run 1 to m with every link right, receipt 1 is the create and says serial: true,
@@ -1937,9 +1942,11 @@ def main() -> int:
     ap.add_argument("--ark-sha256", action="append",
                     help="pin the AMD ARK certificate (sha256 of its DER); repeat to accept any of several")
     ap.add_argument("--product", help="Milan or Genoa (default: from the report)")
-    ap.add_argument("--kds-cache", default=os.path.expanduser("~/.cache/amd-kds"))
+    ap.add_argument("--kds-cache", help="list mode: where fetched AMD certificates are cached "
+                                        "(default ~/.cache/amd-kds)")
     ap.add_argument("--skip-amd", action="store_true", help="skip the AMD chain (offline smoke test only)")
-    ap.add_argument("--require-sealed", action="store_true", help="fail unless the hotel answers an SEV-SNP binding")
+    ap.add_argument("--require-sealed", action="store_true",
+                    help="fail unless the hotel answers an SEV-SNP binding (run mode accepts it: it always asks for one)")
     ap.add_argument("--owner-pubkey", help="base64 Ed25519 public key: fail unless this is a dedicated machine of this owner")
     ap.add_argument("--save", help="with --broker: write the fetched attestation and receipts here")
     ap.add_argument("--tls-spki-sha256", help="SPKI sha256 of the TLS peer that served the attestation; "
@@ -1951,11 +1958,19 @@ def main() -> int:
                                                 "receipt names it")
     a = ap.parse_args()
     if a.oneshot:
-        clash = [flag for flag, value in (("--receipts", a.receipts), ("--attestation", a.attestation),
-                                          ("--broker", a.broker), ("--origin", a.origin)) if value]
+        # Every flag run mode does not act on is refused, so no caller believes a check ran that did not.
+        # --require-sealed is accepted: run mode always requires an SEV-SNP attestation.
+        clash = [flag for flag, value in (
+            ("--receipts", a.receipts), ("--attestation", a.attestation), ("--broker", a.broker),
+            ("--origin", a.origin), ("--owner-pubkey", a.owner_pubkey), ("--tls-spki-sha256", a.tls_spki_sha256),
+            ("--require-tls", a.require_tls), ("--kds-cache", a.kds_cache), ("--sandbox", a.sandbox),
+            ("--hotel", a.hotel), ("--operator-key-file", a.operator_key_file), ("--save", a.save),
+            ("--receipt-header", a.receipt_header), ("--cathedral-sandbox", a.cathedral_sandbox)) if value]
         if clash:
             ap.error(f"--oneshot checks one file; it takes no {', '.join(clash)}")
         return run_mode(a)
+    if a.kds_cache is None:
+        a.kds_cache = os.path.expanduser("~/.cache/amd-kds")
     if a.broker and not a.hotel:
         ap.error("--hotel is required with --broker (no default: a wrong hotel is a wrong chain)")
     if a.origin and (a.broker or a.attestation or a.tls_spki_sha256):
