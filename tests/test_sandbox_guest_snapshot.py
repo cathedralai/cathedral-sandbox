@@ -1381,3 +1381,82 @@ def test_the_aborted_captures_tar_is_removed_outside_the_provider_lock(fake, pro
         provider.snapshot(sid)
     assert owned and not any(owned)
     assert not list(provider._inner._base.glob("snap_*"))  # noqa: SLF001
+
+
+# ======================================================================== main's terminal and exec code against a capture
+class _StubPty:
+    """Stands in for agent_pty.PtyProcess: a host process of `docker exec -it`, which lives in the room's container."""
+
+    def __init__(self) -> None:
+        self.writes: list[bytes] = []
+        self.sizes: list[tuple[int, int]] = []
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+
+    def resize(self, cols: int, rows: int) -> None:
+        self.sizes.append((cols, rows))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_terminal_routes_do_not_touch_the_room_and_survive_a_capture(fake, provider, monkeypatch) -> None:
+    # Main's terminals (line and PTY) run inside the room's container: paused with it, resumed with it.
+    # None of them writes /work from the host, so none is counted in flight or refused. The session
+    # records and the host-side PTY process are not touched by the pause.
+    sid = _source(provider)
+    stub = _StubPty()
+    inner = provider._inner
+    line_id = provider.create_terminal(sid)["id"]
+    pty_id = inner.create_terminal(sid, mode="pty", spawn=lambda c, r, on_output, on_exit: stub)["id"]
+    for tid in (line_id, pty_id):
+        provider.connect_terminal(sid, tid, ticket=provider.mint_access_ticket(sid)["ticket"])
+    assert stub.closed is False
+    gate, entered = threading.Event(), threading.Event()
+    monkeypatch.setattr(sandbox_provider, "_write_work_archive", _bytes_writer(fake, gate=gate, entered=entered))
+    worker = threading.Thread(target=lambda: provider.snapshot(sid), daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(10)  # the room is paused, the tar is running
+        done: list = []
+
+        def during() -> None:
+            provider.terminal_write(sid, pty_id, b"ls\n")
+            provider.terminal_resize(sid, pty_id, 100, 30)
+            provider.terminal_write(sid, line_id, "echo hi\n")
+            done.append(provider.create_terminal(sid)["id"])
+            done.append(len(provider.list_terminals(sid)))
+
+        t = threading.Thread(target=during, daemon=True)
+        t.start()
+        t.join(10)
+        assert not t.is_alive() and len(done) == 2, "a terminal call hung or failed during the capture"
+    finally:
+        gate.set()
+        worker.join(10)
+    assert stub.writes == [b"ls\n"] and stub.sizes == [(100, 30)] and stub.closed is False
+    ids = {t["id"] for t in provider.list_terminals(sid)}
+    assert {line_id, pty_id} <= ids  # both sessions survived, none marked exited by the pause
+    assert not any(t.get("exited") for t in provider.list_terminals(sid))
+    assert fake.status_of(sid) == "running"
+
+
+def test_kept_exec_results_are_untouched_by_a_capture_and_are_not_in_the_tar(fake, provider, tmp_path) -> None:
+    # The kept (spill) results are in the process's memory under (room, token), read through a virtual
+    # /work/.cathedral-spill path: never a file under the room's /work, so never in a snapshot.
+    from cathedral import exec_spill
+
+    sid = _source(provider)
+    token = "ab" * 16
+    spill = exec_spill.open_spill(sid, token, 1024)
+    spill.add("stdout", b"kept")
+    result = _snapshot(provider, sid)
+    path, _ = provider._inner._snapshots[result["snapshot_id"]]  # noqa: SLF001
+    import tarfile as _tf
+
+    with _tf.open(path) as tf:
+        assert not [n for n in tf.getnames() if "cathedral-spill" in n]
+    assert exec_spill.read_spill(sid, token, "stdout") == b"kept"  # still there after the capture
+    exec_spill.close_spill(sid, token)
