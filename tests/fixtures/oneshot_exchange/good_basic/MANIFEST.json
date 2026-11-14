@@ -1,0 +1,32 @@
+{
+ "files": {
+  "README.md": "67dc336fa095b6fa54d024e43cbcfbc67cb5b94ebf7aeb61e6134d1b6390e338",
+  "caller/context.json": "a58c8e25a1ca24b16e4e0bcc4fb9d4d4d73540b0d7aeb5a97d0461c847fa6125",
+  "caller/inputs/run.py": "ad64355106bb158b020ecf9702be48f7730fc091dd4bb6a2f092b40393495b3d",
+  "caller/post_body.json": "ce09153b9d540c3eeecedf7226ebdfeacd392718913ed76a60a80f5f9a2b7f1e",
+  "caller/recipe.json": "62b40fe4128bbb832cc712d2dce92e346b8b8bfbefffd1146849726326330b6f",
+  "caller/response_202.json": "cc818d30fd4c88cc066ea4e89f894745355ddd65db21ca0e9fa6f39b7e1a1aaf",
+  "case.json": "fd376a7964491eefeb206e08514378c2426ad6ea8cd26c7d02201ee5a81f6658",
+  "expected/bundle.json": "de592690d62a06eeaf6db8b11d48e91fd72baf84132f7f4259f5d5979ef8646c",
+  "expected/check.json": "bc308d3993820d9fc8a70b65e2698e5624c5c7a994d9adf10b94b83a1f0c4ec6",
+  "machine/01_create.header": "3f78122fa0fb11c4429ae5c5d98f0ed85fdf7719a2c76122142aa0047455f68e",
+  "machine/01_create.response": "3c67b05ad6628c43e78349f1c4224f174ae5c21af3bde925c8c445a045ad8733",
+  "machine/02_context_put.header": "a5fe5dffbfed0d2d389f3cef15aafb3f56d67928cc3b3b31b768de425d31001c",
+  "machine/02_context_put.response": "8af2b1089bfcc644a5b2fc46c42e330d7bae14eae8f187acf40e5347638e8ee8",
+  "machine/03_input_put.header": "8cb2420666718c43e04c29eb839164d94195f97416967b6952a0aa0ddee68981",
+  "machine/03_input_put.response": "8af2b1089bfcc644a5b2fc46c42e330d7bae14eae8f187acf40e5347638e8ee8",
+  "machine/04_exec.header": "94070d6e45c0513099523458482bc65f3bfbdd9f2af5e7f5fe0ac4f0f9f30709",
+  "machine/04_exec.response": "834bd866d4de57d467f58d46ba410997908d107c3e81e4e8857b94199e1ea5c3",
+  "machine/05_get_output.header": "c75bfb5031e6a8c34f4b9a2d21639201f72edb23bda342fa80120be057810a51",
+  "machine/05_get_output.response": "e5f1eb4d806641698a35efe20e098efd20d7d57a9b90ee69079d5bb650920726",
+  "machine/06_end_marker_put.header": "87ea04707aef922db67d53e9b79777c9a7ed987a229ec94406af6952b936d26f",
+  "machine/06_end_marker_put.response": "8af2b1089bfcc644a5b2fc46c42e330d7bae14eae8f187acf40e5347638e8ee8",
+  "machine/amd/cert_chain_pem.txt": "8ac87e006ff2fe33a0f3612026f01561709bdbf06617203de297dadffb31a239",
+  "machine/amd/vcek_der.bin": "917a93811e7a3397a88bd746c2345829cd534540f52f9d778cdb93c57195b59e",
+  "machine/create_request.b64": "1986652f829e119cb3a1d90fb0ff7e83340a970f2fea7dc467ba3ebcb23964a1",
+  "machine/exec_request.json": "fc2a56663606b394076d34041bc0621cf2680d3954fe3415dddcaf887a7aafba",
+  "machine/hotel_attestation_answer.json": "509f2feaf64213c18e95640421713efbbd791df9a4fd2a3feb78127c73e0deff"
+ },
+ "root_rule": "sha256 of '<path> <sha256>' lines, sorted by path, MANIFEST.json excluded",
+ "root_sha256": "d0d1f0e0a9a246209315f4cf215b9847d1571753e659786b6ff6515749fdfbcc"
+}

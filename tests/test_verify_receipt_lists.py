@@ -602,7 +602,7 @@ def assemble_bundle(case: Path) -> dict:
     import re
 
     machine, caller = case / "machine", case / "caller"
-    b64 = lambda raw: base64.b64encode(raw).decode()  # noqa: E731
+    b64 = lambda raw: base64.b64encode(raw).decode()
     receipts = [json.loads(base64.urlsafe_b64decode(p.read_text())) for p in sorted(machine.glob("[0-9][0-9]_*.header"))]
     pem = (machine / "amd" / "cert_chain_pem.txt").read_text()
     blocks = re.findall(r"-----BEGIN CERTIFICATE-----\n(.*?)\n-----END CERTIFICATE-----", pem, re.DOTALL)

@@ -17,7 +17,7 @@ The root hash is the sha256 of the lines "<path> <sha256>\\n" over all files exc
 sorted by path. A checker that copies this folder records that hash and refreshes the copy when it changes.
 
 Usage:
-  generate.py            write every file
+  generate.py            write every file (and the exchange case, tests/fixtures/oneshot_exchange/good_basic)
   generate.py --check    rebuild in memory, fail on any file that differs, is missing or is extra, and
                          re-verify the synthetic AMD chain with the checker (verify_amd, from the bundle's
                          certificates)
@@ -1647,6 +1647,103 @@ def verify_amd_material(files: dict[str, bytes]) -> None:
         raise SystemExit(f"the checker does not accept the synthetic chain: {exc}") from None
 
 
+# ---------------------------------------------------------------- the exchange case
+
+EXCHANGE = HERE.parent / "oneshot_exchange" / "good_basic"
+EXCHANGE_README = """# One-shot exchange case: good_basic
+
+One good run, the way the API sees it. The same directory is copied byte for byte into the API repository, and
+neither side may change it alone: this checker's test says `expected/bundle.json` passes, and the API's test builds
+the file from `machine/` and `caller/` and must get the same file.
+
+- `machine/`: what the machine and the broker give the API, one file per call in call order. `NN_<call>.header` is
+  the `X-Room-Receipt` header text (base64url of the canonical receipt JSON, with padding); `NN_<call>.response` is
+  the answer body the API keeps. `create_request.b64` is the create bytes the broker hands back (base64 text);
+  `exec_request.json` is the exec bytes the API sent; `hotel_attestation_answer.json` is the hotel's attestation
+  answer; `amd/vcek_der.bin` is the VCEK as DER and `amd/cert_chain_pem.txt` is the chain as AMD's key server
+  returns it (the ASK, then the ARK, as PEM).
+- `caller/`: the POST body (with `content_b64`), the API's 202 answer, the recipe, the context file and the input.
+- `expected/bundle.json`: the one-shot file in the shapes of spec G4 5.5, in canonical JSON.
+  `expected/check.json`: what `verify_receipts.py` prints for it (the command is in `case.json`).
+- The run has one input, a context, one inline output, an exec answer, an env of one entry, a decimal-string
+  `max_spend_usd`, and no `cwd` and no `user` (absent, never null).
+
+The files are made by `tests/fixtures/receipt_lists_v2/generate.py`; `generate.py --check` rebuilds them byte for byte.
+`MANIFEST.json` holds the sha256 of every other file and a root hash over the sorted `path hash` lines.
+"""
+
+
+def build_exchange(amd: dict[str, bytes]) -> dict[str, bytes]:
+    """The files of the exchange case, by path under the case folder."""
+    import subprocess
+    import tempfile
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
+    pack = Pack(amd)
+    create_answer, put_answer = canonical({"id": RUN_ROOM, "state": "running"}), canonical({"written": True})
+
+    def edit(r):
+        r["request"].pop("cwd")
+        r["request"]["inputs"] = [{"path": RUN_PATH, "mode": "755"}]
+        r["request"]["outputs"] = [{"path": RESULT_PATH, "max_bytes": 1048576, "optional": False}]
+
+    def answered(answer):
+        return {"result_sha256": sha(answer)}
+
+    made, _ = make_run(pack, truth_edit=edit, held=(), inline=(RESULT_PATH,), overrides={
+        "create": answered(create_answer), "context": answered(put_answer), "in0": answered(put_answer),
+        "end": answered(put_answer)})
+    bundle = json.loads(made["bundle.json"])
+    bundle["not_proven"] = []
+    labels = ["create", "context_put", "input_put", "exec", "get_output", "end_marker_put"]
+    answers = [create_answer, put_answer, put_answer, base64.b64decode(bundle["exec_response_b64"]),
+               FILE_BYTES[RESULT_PATH], put_answer]
+    files: dict[str, bytes] = {}
+    for i, (label, rc, answer) in enumerate(zip(labels, bundle["receipts"], answers), start=1):
+        files[f"machine/{i:02d}_{label}.header"] = base64.urlsafe_b64encode(canonical(rc))
+        files[f"machine/{i:02d}_{label}.response"] = answer
+    files["machine/create_request.b64"] = bundle["create_request_b64"].encode()
+    files["machine/exec_request.json"] = base64.b64decode(bundle["exec_request_b64"])
+    files["machine/hotel_attestation_answer.json"] = canonical(bundle["attestation"])
+    certs = {k: x509.load_der_x509_certificate(base64.b64decode(v)) for k, v in pack.certs.items()}
+    pem, der = serialization.Encoding.PEM, serialization.Encoding.DER
+    files["machine/amd/vcek_der.bin"] = certs["vcek"].public_bytes(der)
+    files["machine/amd/cert_chain_pem.txt"] = certs["ask"].public_bytes(pem) + certs["ark"].public_bytes(pem)
+    recipe = json.loads(made["recipe.json"])["request"]
+    post = {k: v for k, v in bundle["request"].items() if k != "inputs"}
+    post["inputs"] = [{**i, "content_b64": b64(FILE_BYTES[i["path"]])} for i in bundle["request"]["inputs"]]
+    files["caller/post_body.json"] = pretty(post)
+    files["caller/response_202.json"] = pretty({"id": RUN_ID, "status_url": f"/v1/oneshots/{RUN_ID}"})
+    files["caller/recipe.json"] = made["recipe.json"]
+    files["caller/context.json"] = made["context.json"]
+    files["caller/inputs/run.py"] = FILE_BYTES[RUN_PATH]
+    files["expected/bundle.json"] = canonical(bundle)
+    assert recipe["max_spend_usd"] == bundle["request"]["max_spend_usd"]
+    args = ["--oneshot", "{dir}/expected/bundle.json", "--recipe", "{dir}/caller/recipe.json", "--context",
+            "{dir}/caller/context.json", "--ark-sha256", pack.ark, "--expected-measurement", MEASUREMENT,
+            "--input-file", f"{RUN_PATH}={{dir}}/caller/inputs/run.py"]
+    files["case.json"] = pretty({"description": "One good run, as the API sees it, and the file it must build.",
+                                 "args": args, "expect": {"exit_code": 0, "verdict": "PASS"}})
+    with tempfile.TemporaryDirectory() as tmp:
+        for path, data in files.items():
+            (Path(tmp) / path).parent.mkdir(parents=True, exist_ok=True)
+            (Path(tmp) / path).write_bytes(data)
+        proc = subprocess.run([sys.executable, str(CHECKER), *[a.replace("{dir}", tmp) for a in args]],
+                              capture_output=True, check=False)
+    if proc.returncode != 0:
+        raise SystemExit("the exchange run does not pass the checker: " + proc.stdout.decode())
+    files["expected/check.json"] = proc.stdout
+    files["README.md"] = EXCHANGE_README.encode()
+    lines = "".join(f"{p} {sha(d)}\n" for p, d in sorted(files.items()))
+    files["MANIFEST.json"] = pretty({"files": {p: sha(d) for p, d in sorted(files.items())},
+                                     "root_sha256": sha(lines.encode()),
+                                     "root_rule": "sha256 of '<path> <sha256>' lines, sorted by path, "
+                                                  "MANIFEST.json excluded"})
+    return files
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--check", action="store_true")
@@ -1661,6 +1758,7 @@ def main() -> int:
         return 0
     amd = read_amd()
     files = build(amd)
+    exchange = build_exchange(amd)
     if a.check:
         verify_amd_material(files)
         bad = []
@@ -1673,10 +1771,16 @@ def main() -> int:
         bad += [f"extra file: {p}" for p in sorted(on_disk - set(files))]
         if (HERE / "MANIFEST.json").read_bytes() != files["MANIFEST.json"]:
             bad.append("differs or missing: MANIFEST.json")
+        for path, data in exchange.items():
+            target = EXCHANGE / path
+            if not target.is_file() or target.read_bytes() != data:
+                bad.append(f"differs or missing: oneshot_exchange/good_basic/{path}")
+        held = {p.relative_to(EXCHANGE).as_posix() for p in EXCHANGE.rglob("*") if p.is_file()}
+        bad += [f"extra file: oneshot_exchange/good_basic/{p}" for p in sorted(held - set(exchange))]
         if bad:
             print("\n".join(bad))
             return 1
-        print(f"ok: {len(files)} files rebuilt byte for byte")
+        print(f"ok: {len(files)} files rebuilt byte for byte, and {len(exchange)} of the exchange case")
         return 0
     for path in sorted(on_disk_case_dirs()):
         for f in sorted(path.rglob("*"), reverse=True):
@@ -1686,6 +1790,15 @@ def main() -> int:
                 f.rmdir()  # an emptied case folder must not outlive its case
     for path, data in files.items():
         target = HERE / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    for f in sorted(EXCHANGE.rglob("*"), reverse=True) if EXCHANGE.is_dir() else []:
+        if f.is_file():
+            f.unlink()
+        elif f.is_dir():
+            f.rmdir()
+    for path, data in exchange.items():
+        target = EXCHANGE / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
     return 0
