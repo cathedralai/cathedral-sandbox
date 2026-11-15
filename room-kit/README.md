@@ -303,6 +303,10 @@ included, behaves and is signed as before. A 2xx delete of the room, or its
 `room_end`, clears the mark, and nothing else does. A pool room made after the
 bulk delete ended is not marked.
 
+At start the front lists pool-labelled rooms the API still has that this boot
+never created and marks each unclaimed one stale: every route but delete, claim
+and record reads is refused with 409 `pool_room_stale` until the room is deleted.
+
 Other refusals: 405 for any method but POST (checked before the gate), 400
 `claim_request_invalid`, 409 `pool_room_stale` (no create receipt this boot),
 `pool_room_gone` (the room has ended, was deleted, or a replay finds it gone),

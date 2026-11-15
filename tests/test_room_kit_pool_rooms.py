@@ -271,6 +271,32 @@ def test_a_claim_after_a_front_restart_is_stale(tmp_path, monkeypatch, front) ->
     assert front.api.count(r".*/lifetime") == 0
 
 
+def test_an_unclaimed_pool_room_surviving_a_restart_is_fail_closed(tmp_path, monkeypatch, front) -> None:
+    room = pool_room(front)
+    ledger = rr.Ledger("room-b", str(tmp_path / "second"))
+    server = rr.Server(("127.0.0.1", 0), ledger, front.api.server.server_address[1], 1, KEY, "/nonexistent.sock")
+    assert room in ledger.pool_stale
+    seen = len(front.api.seen)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        port = server.server_address[1]
+        hdrs = {"Authorization": "Bearer " + KEY.decode(), "Content-Type": "application/json"}
+        for method, path, body in [
+            ("POST", f"/v1/sandboxes/{room}/exec", json.dumps({"cmd": ["true"]}).encode()),
+            ("PUT", f"/v1/sandboxes/{room}/files?path=%2Fwork%2Fa", b"x"),
+            ("POST", f"/v1/sandboxes/{room}/terminals", b"{}"),
+        ]:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            c.request(method, path, body=body, headers=hdrs)
+            r = c.getresponse()
+            assert r.status == 409 and code(r.read()) == "pool_room_stale", (method, path)
+            c.close()
+        assert len(front.api.seen) == seen
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_a_claim_after_the_room_ended_is_gone(front) -> None:
     room = pool_room(front)
     front.api.rooms.discard(room)

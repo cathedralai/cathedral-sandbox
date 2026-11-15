@@ -2090,6 +2090,8 @@ class Ledger:
         # (the sandbox id it was claimed for, the answer sent, the claim receipt) so a repeat gets the same answer.
         self.pool: dict[str, float] = {}
         self.claimed: dict[str, tuple[str, bytes, dict]] = {}
+        # Unclaimed pool rooms the API still has but this boot never signed a create for: closed until delete.
+        self.pool_stale: set[str] = set()
         self.head = self.binding_sha256
         os.makedirs(store, mode=0o700, exist_ok=True)
         self.store = open(os.path.join(store, f"chain-{self.binding['boot_id']}.jsonl"), "ab", buffering=0)
@@ -2159,6 +2161,11 @@ class Ledger:
                     token = True
                 elif kind not in ("read", "record_read"):
                     return None, (409, "room_serial_unsigned", "a serial room accepts signed requests and reads only")
+            elif room in self.pool_stale:
+                if kind in ("delete", "claim"):
+                    token = True
+                elif kind != "record_read":
+                    return None, (409, "pool_room_stale", "this front has no receipt for the room")
             elif room in self.pool:
                 if kind in ("delete", "claim"):
                     token = True
@@ -2260,7 +2267,7 @@ class Ledger:
                     self.claims_zero.set()
             if turn.nonread:
                 self._touch(room)  # it may have run while a create was pending, though it entered before
-            if turn.token and (room in self.serial or room in self.pool):
+            if turn.token and (room in self.serial or room in self.pool or room in self.pool_stale):
                 signed = len(self.by_room.get(room, [])) > turn.receipts_before
                 if turn.lost or (turn.called and not signed):
                     self.broken.add(room)
@@ -2279,7 +2286,15 @@ class Ledger:
         self.broken.discard(room)
         self.pool.pop(room, None)
         self.claimed.pop(room, None)
+        self.pool_stale.discard(room)
         self.unknown.discard(room)
+
+    def note_pool_stale(self, rooms: set[str]) -> None:
+        """Unclaimed pool rooms left by a prior boot: fail closed until deleted. Caller holds no lock."""
+        if not rooms:
+            return
+        with self.lock:
+            self.pool_stale.update(rooms)
 
     def end_room(self, room: str, incarnation: str, status: int, reason: str, result_sha256: str) -> dict | None:
         """Sign room_end for *room* if it is still the incarnation that was looked at and nothing is in flight for it.
@@ -3756,6 +3771,32 @@ class Server(ThreadingHTTPServer):
                 self.look_thread = threading.Thread(target=self.look_loop, args=(look_seconds,), daemon=True,
                                                     name="room-look")
                 self.look_thread.start()
+            self.collect_surviving_pool_rooms()
+
+    def collect_surviving_pool_rooms(self) -> None:
+        """Mark unclaimed pool rooms the API kept across a front restart; nothing else is accepted on them."""
+        listed = self.api_get(f"/v1/sandboxes?label={POOL_LABEL}=1", 60)
+        if listed is None or listed[0] != 200:
+            return
+        try:
+            docs = json.loads(listed[1])["sandboxes"]
+        except (ValueError, RecursionError, KeyError, TypeError):
+            return
+        stale: set[str] = set()
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            room = doc.get("id")
+            labels = doc.get("labels")
+            if not (isinstance(room, str) and isinstance(labels, dict)):
+                continue
+            if labels.get(POOL_LABEL) != "1" or SANDBOX_LINK_LABEL in labels:
+                continue
+            with self.ledger.lock:
+                if room in self.ledger.incarnations:
+                    continue
+            stale.add(room)
+        self.ledger.note_pool_stale(stale)
 
     def server_close(self) -> None:
         self._stop_look.set()

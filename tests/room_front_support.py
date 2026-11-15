@@ -161,7 +161,17 @@ class FakeApi:
         if line == "GET /v1/sandboxes":
             if self.list_body is not None:
                 return self._send(h, self.list_status, self.list_body)
-            return self._send(h, self.list_status, json.dumps({"sandboxes": [{"id": r} for r in rooms_now]}).encode())
+            from urllib.parse import parse_qs, urlsplit
+
+            wanted = [item.split("=", 1) for item in parse_qs(urlsplit(h.path).query).get("label", [])]
+            with self.lock:
+                docs = []
+                for room in rooms_now:
+                    labels = self.labels.get(room, {})
+                    if wanted and not all(len(kv) == 2 and str(labels.get(kv[0])) == kv[1] for kv in wanted):
+                        continue
+                    docs.append({"id": room, "labels": labels})
+            return self._send(h, self.list_status, json.dumps({"sandboxes": docs}).encode())
         m = re.fullmatch(r"(GET|DELETE) /v1/sandboxes/([^/]+)", line)
         if m:
             room = m[2]
