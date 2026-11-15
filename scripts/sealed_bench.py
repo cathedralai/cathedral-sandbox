@@ -62,6 +62,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -82,6 +83,32 @@ class BenchError(Exception):
     pass
 
 
+class _NoKeyRedirect(urllib.request.HTTPRedirectHandler):
+    def _refuse(self, req, response, headers):
+        try:
+            location = headers.get("Location") or headers.get("URI")
+            target = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, location))
+            if target.scheme not in ("http", "https") or not target.hostname:
+                raise ValueError("unsupported redirect target")
+            host, port = target.hostname, target.port
+            if not re.fullmatch(r"[A-Za-z0-9.:-]+", host):
+                raise ValueError("unsafe redirect host")
+            message = f"redirect refused to {host}:{port}" if port is not None else f"redirect refused to {host}"
+        except (TypeError, ValueError, UnicodeError):
+            message = "redirect refused"
+        finally:
+            response.close()
+        raise BenchError(message)
+
+    def http_error_301(self, req, response, code, message, headers):
+        self._refuse(req, response, headers)
+
+    http_error_302 = http_error_301
+    http_error_303 = http_error_301
+    http_error_307 = http_error_301
+    http_error_308 = http_error_301
+
+
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -99,7 +126,7 @@ class Api:
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+            with urllib.request.build_opener(_NoKeyRedirect()).open(req, timeout=timeout or self.timeout) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
             raise BenchError(f"{method} {path} failed: HTTP {exc.code}") from exc
