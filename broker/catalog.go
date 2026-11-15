@@ -4,8 +4,7 @@
 // "template": "<name>" maps to the template's image and size, the same
 // path Harbor and ctcli already use for room-1x4 / room-2x8 / room-4x16.
 //
-// LFM3 names and images match cathedralai/cathedral sandbox_models/catalog.py. Suite digests
-// from cathedral-sandbox #361 (each proven sealed on prod at 2 vCPU / 4 GiB, 29 Oct 2026);
+// LFM3 names and images match the API's SEALED_SUITE catalog.
 // All six are the main 3339b9f builds (publish run 43467170286, 13 Nov 2026): lfm3-agent
 // --events streaming chat events (#440, ADO 541) and the static Go chat gateway (#478, ADO 539)
 // on top of per-model sampling and the loop guard (#392, ADO 523), liquid --speak one sentence
@@ -13,8 +12,8 @@
 // --json for Audio (ADO 547) and --swa-full with sampled answers for Omni (ADO 549, 550).
 // Each image must be prefetched on c46-sealed-2, nc-sealed-2 and nc-sealed-3 before this pin
 // ships in a broker (ADO 732).
-// A suite model is sealed ready only once its image is prefetched on every shared sealed hotel
-// (all six: c46-sealed-2, nc-sealed-2, nc-sealed-3, 6 of 6 each, 29 Oct 2026 11:40Z).
+// The sealed-ready flag below requires readback of each exact pinned digest on every shared
+// sealed hotel before the broker with these pins is deployed. The 29 Oct prefetch covered old pins.
 // LFM templates are sealed-only (AMD SEV-SNP). A pending sealed offer refuses
 // every create. There is no unsealed path and no Standard path.
 package main
