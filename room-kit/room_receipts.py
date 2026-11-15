@@ -2089,11 +2089,13 @@ class Ledger:
         # Pre-made rooms: pool maps an unclaimed room to its expires_at (epoch); claimed maps a claimed room to
         # (the sandbox id it was claimed for, the answer sent, the claim receipt) so a repeat gets the same answer.
         self.pool: dict[str, float] = {}
+        self.pool_created_at: dict[str, str] = {}
         self.claimed: dict[str, tuple[str, bytes, dict]] = {}
         # Unclaimed pool rooms the API still has but this boot never signed a create for: closed until delete.
         self.pool_stale: set[str] = set()
         self.head = self.binding_sha256
         os.makedirs(store, mode=0o700, exist_ok=True)
+        self.store_dir = store
         self.store = open(os.path.join(store, f"chain-{self.binding['boot_id']}.jsonl"), "ab", buffering=0)
         with open(os.path.join(store, f"attestation-{self.binding['boot_id']}.json"), "w") as f:
             json.dump(self.attestation(), f)
@@ -2285,9 +2287,65 @@ class Ledger:
         self.serial.discard(room)
         self.broken.discard(room)
         self.pool.pop(room, None)
+        self.pool_created_at.pop(room, None)
         self.claimed.pop(room, None)
         self.pool_stale.discard(room)
         self.unknown.discard(room)
+        try:
+            os.unlink(self._pool_claim_path(room))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # A stale marker alone never opens a room: recovery also matches its creation time.
+            traceback.print_exc()
+
+    def _pool_claim_path(self, room: str) -> str:
+        return os.path.join(self.store_dir, f"pool-claim-{sha(room.encode())}.json")
+
+    def _persist_pool_claim(self, room: str, cathedral_id: str, answer: dict, receipt: dict) -> None:
+        """Commit the signed claim before the front sends 200. Caller holds self.lock."""
+        created_at = self.pool_created_at[room]
+        record = {"room": room, "cathedral_sandbox_id": cathedral_id,
+                  "created_at": created_at, "boot_id": self.binding["boot_id"],
+                  "answer": answer, "receipt": receipt}
+        target = self._pool_claim_path(room)
+        temporary = target + f".{uuid.uuid4().hex}.tmp"
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(canonical(record))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, target)
+            directory = os.open(self.store_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def recovered_pool_claim(self, room: str, created_at: str) -> tuple[str, bytes, dict] | None:
+        """Read a claim made by an earlier front in this guest boot, bound to this API room incarnation."""
+        try:
+            with open(self._pool_claim_path(room), "rb") as f:
+                record = json.load(f)
+            receipt = record["receipt"]
+            statement = receipt["statement"]
+            if (record["room"] != room or record["created_at"] != created_at
+                    or record["boot_id"] != self.binding["boot_id"]
+                    or statement["action"] != "claim" or statement["sandbox_id"] != room
+                    or type(statement["status"]) is not int or not 200 <= statement["status"] < 300
+                    or statement["cathedral_sandbox_id"] != record["cathedral_sandbox_id"]
+                    or receipt["receipt_sha256"] != sha(canonical(statement))
+                    or record["answer"]["cathedral_sandbox_id"] != record["cathedral_sandbox_id"]):
+                return None
+            return record["cathedral_sandbox_id"], canonical(record["answer"]), receipt
+        except (OSError, ValueError, TypeError, KeyError, RecursionError):
+            return None
 
     def note_pool_stale(self, rooms: set[str]) -> None:
         """Unclaimed pool rooms left by a prior boot: fail closed until deleted. Caller holds no lock."""
@@ -2347,7 +2405,13 @@ class Ledger:
             receipt = self._sign_locked(fields)
             status = receipt["statement"]["status"]
             if isinstance(status, int) and 200 <= status < 300:
+                try:
+                    self._persist_pool_claim(room, fields["cathedral_sandbox_id"], answer, receipt)
+                except (OSError, KeyError):
+                    self.broken.add(room)
+                    raise
                 self.pool.pop(room, None)
+                self.pool_created_at.pop(room, None)
                 self.claimed[room] = (fields["cathedral_sandbox_id"], canonical(answer), receipt)
             else:
                 self.broken.add(room)
@@ -2382,7 +2446,7 @@ class Ledger:
             if create.get("serial") and fresh:
                 statement["serial"] = True
             elif create.get("pool") and fresh and statement.get("network_policy") == DENY_ALL \
-                    and isinstance(create.get("expires_at"), float):
+                    and isinstance(create.get("expires_at"), float) and isinstance(create.get("created_at"), str):
                 statement["pool"] = True
         receipt = {"statement": statement, "signature_b64": b64(self.key.sign(canonical(statement))),
                    "receipt_sha256": sha(canonical(statement))}
@@ -2400,6 +2464,7 @@ class Ledger:
                         self.serial.add(room)
                     if statement.get("pool"):
                         self.pool[room] = create["expires_at"]
+                        self.pool_created_at[room] = create["created_at"]
                 elif action == "delete":
                     self._room_gone(room)
             if action == "room_end":
@@ -3033,6 +3098,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_exec_result(m["id"])
         room = room_of(path)
         if room and self.authorized():
+            if not self.server.pool_scan_ready:
+                return self.reply(503, canonical({"error": {"code": "pool_state_unknown",
+                                                          "message": "room state is being checked; retry shortly"}}))
             # Callers without the key are not counted: they never hold a token, and the API refuses them.
             self.turn, refusal = ledger.enter(room, route_kind(self.command, path))
             if refusal is not None:
@@ -3116,10 +3184,14 @@ class Handler(BaseHTTPRequestHandler):
             if create_ask and create_ask.get("pool"):
                 # The API's own answer says when the room's limit falls; the claim's time-left rule reads it.
                 try:
-                    expiry = json.loads(out).get("expires_at")
+                    result = json.loads(out)
+                    expiry = result.get("expires_at")
+                    created_at = result.get("created_at")
                 except (ValueError, RecursionError, AttributeError):
                     expiry = None
-                create_ask = {**create_ask, "expires_at": parse_expires_at(expiry, time.time())}
+                    created_at = None
+                create_ask = {**create_ask, "expires_at": parse_expires_at(expiry, time.time()),
+                              "created_at": created_at}
             if action and self.authorized():
                 try:
                     extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(ledger.sign(
@@ -3753,7 +3825,7 @@ class Server(ThreadingHTTPServer):
     request_queue_size = 1024
 
     def __init__(self, addr, ledger, api_port, health_port, api_key, docker_sock, attest_per_minute=30, *,
-                 attestation_only=False, look_seconds=None):
+                 attestation_only=False, look_seconds=None, pool_scan=True):
         self._stop_look = threading.Event()
         self.look_thread = None
         super().__init__(addr, Handler)
@@ -3765,38 +3837,60 @@ class Server(ThreadingHTTPServer):
         self._digests: dict[str, str | None] = {}
         self.health_lock = threading.Lock()
         self.health: tuple[int, bytes | None, float] = (503, None, 0.0)
+        self.pool_scan_ready = attestation_only or not pool_scan
         if not attestation_only:
             threading.Thread(target=self.health_loop, daemon=True).start()
             if look_seconds is not None:
                 self.look_thread = threading.Thread(target=self.look_loop, args=(look_seconds,), daemon=True,
                                                     name="room-look")
                 self.look_thread.start()
-            self.collect_surviving_pool_rooms()
+            if pool_scan and not self.collect_surviving_pool_rooms():
+                threading.Thread(target=self.pool_scan_loop, daemon=True, name="pool-restart-scan").start()
 
-    def collect_surviving_pool_rooms(self) -> None:
-        """Mark unclaimed pool rooms the API kept across a front restart; nothing else is accepted on them."""
+    def pool_scan_loop(self) -> None:
+        """Retry a failed startup list without accepting an unknown pool room meanwhile."""
+        while not self._stop_look.wait(5):
+            if self.pool_scan_ready:
+                return
+            if self.collect_surviving_pool_rooms():
+                return
+
+    def collect_surviving_pool_rooms(self) -> bool:
+        """Classify surviving pool rooms before room traffic can pass through this front."""
         listed = self.api_get(f"/v1/sandboxes?label={POOL_LABEL}=1", 60)
         if listed is None or listed[0] != 200:
-            return
+            return False
         try:
             docs = json.loads(listed[1])["sandboxes"]
         except (ValueError, RecursionError, KeyError, TypeError):
-            return
+            return False
+        if not isinstance(docs, list):
+            return False
         stale: set[str] = set()
+        recovered: dict[str, tuple[str, bytes, dict]] = {}
         for doc in docs:
             if not isinstance(doc, dict):
-                continue
+                return False
             room = doc.get("id")
             labels = doc.get("labels")
             if not (isinstance(room, str) and isinstance(labels, dict)):
-                continue
-            if labels.get(POOL_LABEL) != "1" or SANDBOX_LINK_LABEL in labels:
-                continue
+                return False
+            if labels.get(POOL_LABEL) != "1":
+                return False
             with self.ledger.lock:
                 if room in self.ledger.incarnations:
                     continue
+            created_at = doc.get("created_at")
+            claim = self.ledger.recovered_pool_claim(room, created_at) if isinstance(created_at, str) else None
+            if claim is not None:
+                recovered[room] = claim
+                continue
             stale.add(room)
-        self.ledger.note_pool_stale(stale)
+        with self.ledger.lock:
+            self.ledger.pool_stale.update(stale)
+            self.ledger.claimed.update(recovered)
+            self.pool_scan_ready = True
+        return True
 
     def server_close(self) -> None:
         self._stop_look.set()

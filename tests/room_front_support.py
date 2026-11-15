@@ -44,6 +44,7 @@ class FakeApi:
         self.seen: list[tuple[str, str, bytes]] = []
         self.rooms: set[str] = set()
         self.labels: dict[str, dict] = {}
+        self.created_at: dict[str, str] = {}
         self.answer_holds: list[Hold] = []
         self.lost_bulks: list[threading.Event] = []
         self.trickles: list[tuple[re.Pattern, float]] = []
@@ -170,7 +171,7 @@ class FakeApi:
                     labels = self.labels.get(room, {})
                     if wanted and not all(len(kv) == 2 and str(labels.get(kv[0])) == kv[1] for kv in wanted):
                         continue
-                    docs.append({"id": room, "labels": labels})
+                    docs.append({"id": room, "labels": labels, "created_at": self.created_at.get(room)})
             return self._send(h, self.list_status, json.dumps({"sandboxes": docs}).encode())
         m = re.fullmatch(r"(GET|DELETE) /v1/sandboxes/([^/]+)", line)
         if m:
@@ -183,7 +184,7 @@ class FakeApi:
                 status, out = self.get_replies[room]
                 return self._send(h, status, out)
             if room in rooms_now:
-                return self._send(h, 200, json.dumps({"id": room}).encode())
+                return self._send(h, 200, json.dumps({"id": room, "created_at": self.created_at.get(room)}).encode())
             return self._send(h, 404, b'{"error":{"code":"sandbox_not_found","message":"no such room"}}')
         if re.fullmatch(r"POST /v1/sandboxes/[^/]+/lifetime", line):
             if line.split("/")[3] not in rooms_now:
@@ -264,10 +265,11 @@ class FakeApi:
             room = self.new_ids.pop(0) if self.new_ids else f"sbx_{self.counter}"
             self.rooms.add(room)
             self.labels[room] = labels if isinstance(labels, dict) else {}
+            self.created_at[room] = self._stamp(0)
         for hold in list(self.answer_holds):
             hold.entered.set()
             hold.release.wait(30)
-        doc = {"id": room}
+        doc = {"id": room, "created_at": self.created_at[room]}
         if self.network_policy is not None:
             doc["network"] = {"policy": self.network_policy}
         if not self.omit_expires:
@@ -325,6 +327,9 @@ class Front:
         self.ledger = rr.Ledger("room-a", str(tmp_path))
         self.server = rr.Server(("127.0.0.1", 0), self.ledger, self.api.server.server_address[1], 1, KEY,
                                 "/nonexistent.sock", **server_kwargs)
+        # The front's startup pool inventory is not a customer request.
+        with self.api.lock:
+            self.api.seen.clear()
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.port = self.server.server_address[1]
 

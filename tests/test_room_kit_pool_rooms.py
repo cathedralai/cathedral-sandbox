@@ -297,6 +297,94 @@ def test_an_unclaimed_pool_room_surviving_a_restart_is_fail_closed(tmp_path, mon
         server.server_close()
 
 
+@pytest.mark.parametrize("bad_list", [503, b'{"sandboxes":{}}', b'{"sandboxes":[{"id":"sbx_x"}]}'])
+def test_a_failed_startup_list_closes_room_traffic_until_a_valid_retry(tmp_path, front, bad_list) -> None:
+    room = pool_room(front)
+    if isinstance(bad_list, int):
+        front.api.list_status = bad_list
+    else:
+        front.api.list_body = bad_list
+    ledger = rr.Ledger("room-b", str(tmp_path / "second"))
+    server = rr.Server(("127.0.0.1", 0), ledger, front.api.server.server_address[1], 1, KEY, "/nonexistent.sock")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        assert not server.pool_scan_ready
+        seen = len(front.api.seen)
+        c = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+        c.request("POST", f"/v1/sandboxes/{room}/exec", body=b'{"cmd":["true"]}',
+                  headers={"Authorization": "Bearer " + KEY.decode()})
+        r = c.getresponse()
+        assert r.status == 503 and code(r.read()) == "pool_state_unknown"
+        c.close()
+        assert len(front.api.seen) == seen
+        front.api.list_status = 200
+        front.api.list_body = None
+        assert server.collect_surviving_pool_rooms()
+        assert server.pool_scan_ready and room in ledger.pool_stale
+        c = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+        c.request("POST", f"/v1/sandboxes/{room}/exec", body=b'{"cmd":["true"]}',
+                  headers={"Authorization": "Bearer " + KEY.decode()})
+        r = c.getresponse()
+        assert r.status == 409 and code(r.read()) == "pool_room_stale"
+        c.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_claimed_pool_room_and_its_claim_answer_survive_a_front_restart(tmp_path, front) -> None:
+    room = pool_room(front)
+    first = claim(front, room)
+    assert first[0] == 200
+    ledger = rr.Ledger("room-b", str(tmp_path))
+    server = rr.Server(("127.0.0.1", 0), ledger, front.api.server.server_address[1], 1, KEY, "/nonexistent.sock")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        assert server.pool_scan_ready and room in ledger.claimed and room not in ledger.pool_stale
+        seen = front.api.count(rf"POST /v1/sandboxes/{room}/lifetime")
+        c = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+        c.request("POST", f"/v1/sandboxes/{room}/claim",
+                  body=json.dumps({"cathedral_sandbox_id": CID, "lifetime_seconds": 600}),
+                  headers={"Authorization": "Bearer " + KEY.decode()})
+        r = c.getresponse()
+        assert r.status == 200 and r.read() == first[2]
+        c.close()
+        assert front.api.count(rf"POST /v1/sandboxes/{room}/lifetime") == seen
+        c = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+        c.request("POST", f"/v1/sandboxes/{room}/exec", body=b'{"cmd":["true"]}',
+                  headers={"Authorization": "Bearer " + KEY.decode()})
+        r = c.getresponse()
+        assert r.status == 200, r.read()
+        c.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_claim_marker_for_an_older_room_incarnation_does_not_open_a_new_room(tmp_path, front) -> None:
+    room = pool_room(front)
+    assert claim(front, room)[0] == 200
+    front.api.created_at[room] = front.api._stamp(10)
+    ledger = rr.Ledger("room-b", str(tmp_path))
+    server = rr.Server(("127.0.0.1", 0), ledger, front.api.server.server_address[1], 1, KEY, "/nonexistent.sock")
+    try:
+        assert room in ledger.pool_stale and room not in ledger.claimed
+    finally:
+        server.server_close()
+
+
+def test_claim_marker_write_failure_never_returns_a_successful_claim(front, monkeypatch) -> None:
+    room = pool_room(front)
+
+    def fail(*_args):
+        raise OSError("marker unavailable")
+
+    monkeypatch.setattr(front.ledger, "_persist_pool_claim", fail)
+    status, _headers, out = claim(front, room)
+    assert status == 409 and code(out) == "pool_claim_failed"
+    assert room in front.ledger.broken and room not in front.ledger.claimed
+
+
 def test_a_claim_after_the_room_ended_is_gone(front) -> None:
     room = pool_room(front)
     front.api.rooms.discard(room)
