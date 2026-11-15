@@ -10,3 +10,5 @@ Contract:
 4. No new customer-visible 200 can be sent when marker persistence fails. Existing claim and bulk-delete serialization remains in force.
 
 Verification: fake API list failure/recovery, claimed room restart and replay, marker mismatch, persisted marker write failure, existing pool/serial suites, Python 3.11/3.12 CI. No live guest or re-seal in this PR.
+
+Review HOLD discovered after the first draft: `Ledger` makes a new Ed25519 receipt key and binding on every front process start, resets its in-memory chain, appends to the old `chain-{boot_id}.jsonl`, and overwrites `attestation-{boot_id}.json`. The marker can replay an old claim receipt while the live attestation names a different key; subsequent receipts for that room start at sequence 1 under the new binding. The marker is not enough to prove or continue the old claim. Do not merge this draft until receipt-chain and attestation continuity are designed and tested, or the recovery policy is explicitly narrowed to fail closed. A same-boot two-Ledger reproduction found different bindings, an empty new chain, and the same append path.
