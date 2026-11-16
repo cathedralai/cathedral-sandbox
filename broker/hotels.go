@@ -444,9 +444,15 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 			writeErr(w, 422, "attestation_failed", "the miner guest TLS attestation did not pass: "+err.Error())
 			return
 		}
-		hc.TLSSPKISHA256 = peerSPKI
 		var bd snpBinding
 		_ = json.Unmarshal(attestationBinding(rawAtt), &bd)
+		// A non-miner guest must be this hotel's: a re-pin after a reboot requires the
+		// same name, so a mismatch accepted here would strand the hotel later.
+		if hc.MinerHotkey == "" && bd.Hotel != hc.ID {
+			writeErr(w, 422, "attestation_failed", "the attested guest is hotel \""+bd.Hotel+"\", not \""+hc.ID+"\"")
+			return
+		}
+		hc.TLSSPKISHA256 = peerSPKI
 		joinChip = bd.ChipID
 	}
 	if hc.Name == "" {

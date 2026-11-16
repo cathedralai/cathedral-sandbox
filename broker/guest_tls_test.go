@@ -465,3 +465,20 @@ func TestRequireSealedGuestTLSSkipsPlainRuntimeHotelsOnRestart(t *testing.T) {
 		t.Fatal("plain sealed runtime hotel restored with require_sealed_guest_tls on")
 	}
 }
+
+// A guest TLS join whose id differs from the attested hotel name is refused
+// before any keyed call, since a later re-pin would refuse it forever.
+func TestGuestTLSJoinRefusesAnAttestedNameThatIsNotTheHotelID(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	g := newGuestTLSServer(t, guestTLSKey)
+	g.attest("different", attestOpts{chip: 51})
+	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+		"id": "joined", "api": g.srv.URL, "key": guestTLSKey, "sealed": true, "guest_tls": true,
+	})
+	if status != 422 || errCode(doc) != "attestation_failed" {
+		t.Fatalf("mismatched id join: %d %v", status, doc)
+	}
+	if tc.b.hotelByID("joined") != nil || g.keyedOn(g.spki()) != 0 {
+		t.Fatal("mismatched join left a hotel or sent the key")
+	}
+}
