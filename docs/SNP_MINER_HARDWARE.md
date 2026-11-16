@@ -5,12 +5,14 @@ hotel, what one slot costs on each, and whether Cathedral's admission code
 accepts it today. Prices were read from public pages on 2026-11-13. They change
 often; recheck before you buy.
 
-Two kinds of row, never mixed:
+Every row below is a quote or an unproven report. No provider is proven: this
+repository holds no dated SNP attestation report or admission receipt that binds
+a physical host to a provider.
 
-- **Proven**: Cathedral has run an admitted SNP guest on that provider's
-  hardware, with evidence in this repository.
 - **Quote**: a public list price. Nobody at Cathedral has booted an SNP guest
   on it. "SNP" in a quote row only repeats what the provider's page says.
+- **Operating, admission unproven**: Cathedral or a miner runs SNP guests there,
+  but the evidence here does not bind the host to an accepted report.
 
 ## 1. What the admission policy requires of the hardware
 
@@ -48,13 +50,13 @@ Disk can also cap it: plan at least `slots * 10 GiB / 0.7` of data disk. Cost pe
 slot is the monthly list price divided by slots. Rows keep the provider's
 currency; there is no FX conversion. Setup fees are listed, not spread.
 
-## 3. Proven
+## 3. Operating, admission unproven
 
-| Provider | Hardware | Evidence | Price paid |
-| --- | --- | --- | --- |
-| Cherry Servers | Genoa SNP hosts running Cathedral's operator sealed hotels (`nc-sealed`, and `c46-sealed` on another chip) | Live broker hotel list on 2026-10-23 shows `nc-sealed (SEV-SNP)` beside "New Cherry" ([baseline](evidence/BROKER_ISOLATION_BASELINE_20261023T173448Z.md)); `broker/admission.go` names both chips; Cherry is the launch owner's Genoa SNP host ([ownership](CATHEDRAL_ROOT_AND_IMAGE_OWNERSHIP.md)) | Not recorded in this repository. The exact Cherry plan and SKU are not recorded either |
+| Provider | Hardware | What the repository shows | Missing | Price paid |
+| --- | --- | --- | --- | --- |
+| Cherry Servers | Genoa SNP hosts behind Cathedral's operator sealed hotels (`nc-sealed`, and `c46-sealed` on another chip) | The 2026-10-23 broker hotel list shows `nc-sealed (SEV-SNP)` beside "New Cherry" ([baseline](evidence/BROKER_ISOLATION_BASELINE_20261023T173448Z.md)); `broker/admission.go` names both chips; Cherry is the launch owner's host ([ownership](CATHEDRAL_ROOT_AND_IMAGE_OWNERSHIP.md)) | A dated accepted SNP report or admission receipt that binds the physical Cherry host to the hotel. The baseline has a hotel name and a create response only; the ownership doc is a ceremony checklist | Not recorded in this repository. The exact Cherry plan and SKU are not recorded either |
 
-Running but not proven for admission:
+Also running, also unproven:
 
 - **Contabo**: hosts the SN94 SNP miner ([review rounds](evidence/REVIEW_ROUNDS_2026-10-23.md)).
   This repository records neither its CPU generation nor an SN94 admission, and
@@ -66,7 +68,7 @@ Running but not proven for admission:
 
 | Provider | Plan | CPU (gen) | Sockets | Threads | RAM | List price / month | Slots | Per slot / month | SNP on the page | Admissible today |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Cherry Servers | AMD EPYC 9354P | 9354P (Genoa) | 1 | 64 | 192 GB | $642.33 ($545.98 annual) | 62 | $10.36 | Not stated | Yes, if BIOS has SNP on (same provider as the proven row) |
+| Cherry Servers | AMD EPYC 9354P | 9354P (Genoa) | 1 | 64 | 192 GB | $642.33 ($545.98 annual) | 62 | $10.36 | Not stated | Likely, if BIOS has SNP on (Cherry hosts operate Cathedral hotels, admission unproven) |
 | Hetzner | AX162 | 9454P (Genoa) | 1 | 96 | 128 GB base | from EUR 319.00 + EUR 304 setup | 56 | EUR 5.70 | Not stated; BIOS access not offered on the page | Unknown: needs SNP enabled by support |
 | Contabo | Genoa 24 | 9224 (Genoa) | Not stated | 48 | Not stated | EUR 239.00, no setup | at most 46 | at least EUR 5.20 | Not stated | Unknown; 2P-capable SKU |
 | Latitude.sh | rs4.metal.xlarge | 9554P (Genoa) | 1 | 128 | 1.5 TB | from $2,779.67 | 126 | $22.06 | "SEV-SNP attestation" | Likely; the only page that names SNP |
@@ -91,5 +93,6 @@ onedollarvps-com.pages.dev/pricing/vultr-pricing for Vultr.
    populated socket, and SEV firmware and microcode versions.
 2. Rent one box, boot a guest, and run the
    [observed HTTPS and SAT test](AMD_SEV_SNP_FRIEND_TEST.md#run-the-observed-https-and-sat-test).
-3. Move the row to Proven only with the transcript, the date and the price
-   paid.
+3. Mark a row proven only with a dated accepted SNP report or admission
+   receipt that binds the host, plus the date and the price paid. Add the
+   Proven section back at that point, starting with Cherry.

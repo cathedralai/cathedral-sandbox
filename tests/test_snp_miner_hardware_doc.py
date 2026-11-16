@@ -18,10 +18,13 @@ def _doc() -> str:
     return DOC.read_text(encoding="utf-8")
 
 
-def test_list_is_dated_and_separates_proven_from_quotes() -> None:
+def test_list_is_dated_and_claims_no_proven_provider() -> None:
     text = _doc()
     assert re.search(r"^# SNP miner hardware list \(\d{4}-\d{2}-\d{2}\)$", text, re.M)
-    assert "## 3. Proven" in text
+    assert "## 3. Operating, admission unproven" in text
+    # No provider is proven until a dated SNP report or admission receipt binds a host.
+    assert "## 3. Proven" not in text
+    assert "(same provider as the proven row)" not in text
     assert "## 4. Quotes" in text
     assert "—" not in text
 
