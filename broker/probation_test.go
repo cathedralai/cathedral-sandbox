@@ -121,6 +121,7 @@ func TestProbationRefusesJustUnderTheMinimumAndStartsANewWindow(t *testing.T) {
 	t0 := time.Now().Add(time.Hour)
 	tc.b.mu.Lock()
 	h.prob.lastSample = time.Time{}
+	h.prob.observed, h.prob.up = 0, 0 // real-time ticks before stopLoops may have counted time (slow under -race)
 	tc.b.mu.Unlock()
 	// 98.999 s up of 100 s: one millisecond under the minimum.
 	if !steps(tc, h, t0, sample{0, true}, sample{98999 * time.Millisecond, true}, sample{100 * time.Second, false}) {
@@ -153,6 +154,7 @@ func TestProbationNeedsTheWholeWindowEvenAtFullUptime(t *testing.T) {
 	t0 := time.Now().Add(time.Hour)
 	tc.b.mu.Lock()
 	h.prob.lastSample = time.Time{}
+	h.prob.observed, h.prob.up = 0, 0 // real-time ticks before stopLoops may have counted time (slow under -race)
 	tc.b.mu.Unlock()
 	if steps(tc, h, t0, sample{0, true}, sample{99999 * time.Millisecond, true}) || !h.inProbation() {
 		t.Fatal("graduated before the window was observed")
