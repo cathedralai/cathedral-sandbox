@@ -297,7 +297,8 @@ func (b *broker) isMinerEnroller(r *http.Request) bool {
 }
 
 // isOperatorReader is true for the read-only operator key. ServeHTTP checks
-// it on one route only (GET /v1/broker/capacity); every other route ignores it.
+// it on two read routes only (GET /v1/broker/capacity and GET
+// /v1/broker/miner-exits); every other route ignores it.
 func (b *broker) isOperatorReader(r *http.Request) bool {
 	want := strings.ToLower(b.cfg.OperatorReadKeySHA256)
 	a := r.Header.Get("Authorization")
@@ -403,6 +404,9 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	case hc.RequireAttestation && !hc.Sealed:
 		writeErr(w, 400, "invalid_hotel", "require_attestation needs a sealed hotel")
 		return
+	case hc.GuestTLS && !hc.Sealed:
+		writeErr(w, 400, "invalid_hotel", "guest_tls needs a sealed hotel")
+		return
 	case hc.SealedAdmission == sealedAdmissionOff:
 		writeErr(w, 400, "invalid_hotel", `sealed_admission "off" is only for an operator hotel in the config file; a joined hotel is always gated`)
 		return
@@ -441,12 +445,16 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	if hc.RequireAttestation {
 		b.noteRequireAttestation(hc.ID)
 	}
-	if hc.MinerHotkey != "" {
+	// A miner hotel, a "guest_tls" hotel and, with require_sealed_guest_tls,
+	// every sealed hotel join over the guest's attested TLS key (AB#378).
+	var joinChip string // CHIP_ID of the verified join binding; a later re-pin must stay on it
+	if hc.MinerHotkey != "" || (hc.Sealed && (hc.GuestTLS || b.cfg.RequireSealedGuestTLS)) {
 		if hc.TLSSPKISHA256 != "" || (req.Verify != nil && !*req.Verify) ||
 			!strings.HasPrefix(hc.API, "https://") || !strings.HasPrefix(hc.Health, "https://") {
-			writeErr(w, 409, "guest_tls_required", "miner join needs verified guest HTTPS; the broker derives its TLS pin from attestation")
+			writeErr(w, 409, "guest_tls_required", "this join needs verified guest HTTPS; the broker derives its TLS pin from attestation")
 			return
 		}
+		hc.GuestTLS = hc.GuestTLS || hc.MinerHotkey == ""
 		// This request has no bearer key. Verify that the observed TLS key is
 		// committed by the AMD-verified SNP report before constructing a hotel
 		// client that holds the key supplied in the join body.
@@ -459,7 +467,16 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 			writeErr(w, 422, "attestation_failed", "the miner guest TLS attestation did not pass: "+err.Error())
 			return
 		}
+		var bd snpBinding
+		_ = json.Unmarshal(attestationBinding(rawAtt), &bd)
+		// A non-miner guest must be this hotel's: a re-pin after a reboot requires the
+		// same name, so a mismatch accepted here would strand the hotel later.
+		if hc.MinerHotkey == "" && bd.Hotel != hc.ID {
+			writeErr(w, 422, "attestation_failed", "the attested guest is hotel \""+bd.Hotel+"\", not \""+hc.ID+"\"")
+			return
+		}
 		hc.TLSSPKISHA256 = peerSPKI
+		joinChip = bd.ChipID
 	}
 	if hc.Name == "" {
 		hc.Name = hc.ID
@@ -474,6 +491,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	}
 	h := newHotel(hc, req.Key)
 	h.runtime = true
+	h.pinChip = joinChip
 	if req.Verify == nil || *req.Verify {
 		var st map[string]any
 		if err := h.getJSON(r.Context(), hc.API, "/v1/status", nil, &st); err != nil {
@@ -872,6 +890,12 @@ func (b *broker) loadRuntimeHotelList() error {
 	for _, hc := range list {
 		if hc.MinerHotkey != "" && hc.TLSSPKISHA256 == "" {
 			log.Printf("runtime miner hotel %s skipped: no attested TLS pin", hc.ID)
+			continue
+		}
+		// A sealed hotel that joined before require_sealed_guest_tls was turned
+		// on would otherwise get the hotel key over its configured address.
+		if b.cfg.RequireSealedGuestTLS && hc.Sealed && !hc.GuestTLS && hc.MinerHotkey == "" {
+			log.Printf("runtime hotel %s skipped: require_sealed_guest_tls is on and it joined without guest TLS; remove and re-add it", hc.ID)
 			continue
 		}
 		k, err := os.ReadFile(hc.KeyFile)
