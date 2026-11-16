@@ -66,6 +66,9 @@ var digestPin = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 // catalogTemplates is the catalog in listing order. Room sizes stay first so
 // existing Harbor clients keep seeing them at the front.
 //
+// Any change here also updates broker/catalog.digest (go run . -print-catalog-digest >
+// catalog.digest); swaps refuse a binary whose catalog differs from it (AB#546).
+//
 // LFM rollout order (publish, then pin the digest, then flip Sealed to ready):
 // 1.7B, VL, Omni, d1, Audio, d1-Omni, Base.
 var catalogTemplates = []catalogTemplate{

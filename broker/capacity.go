@@ -344,6 +344,7 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 			"miner_hotkey_caps":    b.cfg.MinerHotkeyCaps,
 			"miner_max_hotels":     b.cfg.MinerMaxHotels,
 			"miner_tls_pin":        true,
+			"miner_min_commitment": b.cfg.MinerMinCommitment, // null: a commitment is optional
 			// Room caps (placement.go, AB#335); 0 is off.
 			"miner_max_rooms_per_hotkey": b.cfg.MinerMaxRoomsPerHotkey,
 			"miner_pool_share":           b.cfg.MinerPoolShare,
