@@ -160,6 +160,9 @@ func (b *broker) forgetAndLeave(w http.ResponseWriter, h *hotel, id string) {
 // answersOnPin reports whether anything answers h's health URL on h's pinned
 // connections. A refused handshake (another key, or no guest) is no answer.
 func (h *hotel) answersOnPin() bool {
+	if h.keyedCallErr(h.cfg.Health) != nil {
+		return false // no verified pin: the hotel key is not sent
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "GET", h.cfg.Health+"/room/health", nil)
