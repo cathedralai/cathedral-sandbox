@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,3 +99,19 @@ def test_checksum_step_copes_with_nested_fixture_directories(tmp_path) -> None:
     done = subprocess.run([shutil.which("bash"), "-c", "set -e; cd \"$1\" && " + step.group(1), "_", str(tmp_path)], capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
     assert "test/chat-events/plain.json" in (tmp_path / "SHA256SUMS").read_text()
+
+
+def test_suite_builds_the_chat_gateway_static_and_tested() -> None:
+    # AB#539: a static Go binary, not an interpreter in the room.
+    text = (SUITE / "Dockerfile").read_text(encoding="utf-8")
+    assert re.search(r"^ARG GOLANG_IMAGE=golang:[0-9.]+-bookworm@sha256:[0-9a-f]{64}$", text, re.M)
+    stage = text.split("AS gateway\n", 1)[1].split("\nFROM ", 1)[0]
+    assert "CGO_ENABLED=0" in stage
+    assert "COPY test/chat-events /src/test/chat-events" in stage
+    assert stage.index("go test") < stage.index("go build")
+    assert "! ldd /out/lfm3-gateway" in stage
+    final = text.rsplit("\nFROM ${DEBIAN_IMAGE}\n", 1)[1]
+    assert "COPY --from=gateway /out/lfm3-gateway /usr/local/bin/lfm3-gateway" in final
+    assert "! ldd /usr/local/bin/lfm3-gateway" in final
+    apt = re.search(r"apt-get install -y --no-install-recommends ([^\n]*)", final)
+    assert apt and "python" not in apt.group(1)

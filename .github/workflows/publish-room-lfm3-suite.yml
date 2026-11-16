@@ -265,6 +265,7 @@ jobs:
         env:
           IMAGE_REF: ${{ steps.pin.outputs.image_ref }}
           KIND: ${{ matrix.kind }}
+          NAME: ${{ matrix.name }}
         run: |
           set -euo pipefail
           docker pull --quiet "$IMAGE_REF"
@@ -307,6 +308,41 @@ jobs:
             contract="chat/completions: ${answer}"
             printf '%s\n' "$contract"
             grep -Eiq '\b(4|four)\b' <<< "$answer"
+          fi
+          # The chat gateway (AB#539): chat models that are not base serve the
+          # Polaris runtime contract on 127.0.0.1:8642. One streamed turn must
+          # end with the finish chunk and data: [DONE], with no error event.
+          if [[ "$KIND" == chat && "$NAME" != *-base ]]; then
+            docker exec smoke curl -fsS -o /dev/null http://127.0.0.1:8642/health
+            stream="$(docker exec smoke curl -fsSN --max-time 300 http://127.0.0.1:8642/v1/chat/completions \
+              -H "Content-Type: application/json" \
+              -d '{"stream": true, "messages": [{"role": "user", "content": "What is 2+2? Answer in one word."}]}')"
+            if grep -q '^event: error' <<< "$stream" || ! grep -qx 'data: \[DONE\]' <<< "$stream"; then
+              printf '%s\n' "$stream" | tail -n 20
+              docker exec smoke tail -n 40 /tmp/lfm3/gateway.log || true
+              echo "::error::the chat gateway did not finish a streamed turn"
+              exit 1
+            fi
+            contract="${contract}
+          gateway: $(grep -c '^data: {' <<< "$stream") chunks, then [DONE]"
+            # lfm3-bench (AB#444): one streamed, timed request. Its last line must
+            # carry a first-token time, both rates and the model sha256 the
+            # image's SHA256SUMS records.
+            bench="$(docker exec smoke lfm3-bench --max-tokens 64 --index 0 '["What is 2+2? Answer in one word."]')" || {
+              printf '%s\n' "$bench"
+              echo "::error::lfm3-bench failed"
+              exit 1
+            }
+            bench_line="$(grep '^lfm3-bench {' <<< "$bench" | tail -n 1)"
+            if ! jq -e '(.ttft_ms | type) == "number" and (.decode_tok_s | type) == "number"
+                and (.prompt_tok_s | type) == "number" and (.model_sha256 | test("^[0-9a-f]{64}$"))' \
+                <<< "${bench_line#lfm3-bench }" > /dev/null; then
+              printf '%s\n' "$bench"
+              echo "::error::lfm3-bench printed no usable result line"
+              exit 1
+            fi
+            contract="${contract}
+          ${bench_line}"
           fi
           mem="$(docker stats --no-stream --format '{{.MemUsage}}' smoke)"
           sums="$(docker exec smoke cat /opt/lfm3/SHA256SUMS)"
