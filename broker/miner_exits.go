@@ -188,7 +188,9 @@ func (b *broker) pruneMinerExits(now time.Time) {
 		kept = append(kept, e)
 	}
 	if over := len(kept) - minerExitMax; over > 0 {
-		kept = kept[over:]
+		// Shift down in place: re-slicing would leave the kept tail inside
+		// the range cleared below.
+		kept = append(kept[:0], kept[over:]...)
 	}
 	for i := len(kept); i < len(b.minerExits); i++ {
 		b.minerExits[i] = nil

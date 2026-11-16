@@ -251,4 +251,12 @@ func TestPruneMinerExits(t *testing.T) {
 	if len(b.minerExits) != minerExitMax || !b.minerExits[0].DownAt.Equal(now.Add(time.Duration(10-2000)*time.Second)) {
 		t.Fatalf("global cap: %d records, first %v", len(b.minerExits), b.minerExits[0].DownAt)
 	}
+	for i, e := range b.minerExits {
+		if e == nil {
+			t.Fatalf("global cap left a nil record at %d", i)
+		}
+	}
+	if got := len(b.minerExitsSnapshot()); got != minerExitMax {
+		t.Fatalf("snapshot after the global cap: %d records", got)
+	}
 }
