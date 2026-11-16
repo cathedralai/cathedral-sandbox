@@ -84,6 +84,7 @@ Each guest in the config can have limits (`guests.go`):
 | `default_sealed` | `true`: a create with no hotel choice goes to sealed hotels only. The guest gets an unsealed room only when the create says `"sealed": false`, names hotels with `"hotels"`, or excludes sealed hotels with `"exclude_hotel_labels"`. A fork goes to the hotel of its snapshot. |
 | `hotels` | The hotel ids the guest may use. Absent: all hotels. Other hotels are not in the guest's hotel list, and a create that names one gets 409 `unknown_hotel`. |
 | `policy` | Hotels by selector, in order: `prefer`, `allow`, `deny`. Replaces `hotels` and `default_sealed`. See "Guest policy and capacity catalog". |
+| `own_hosts_only` | `true`: every create of the guest stays on Cathedral's own hotels, never a miner hotel (the same rule as the create flag `"own_hosts_only": true`), even when its `policy` opts into miner hotels. A create cannot turn it off. Miner hotels also leave the guest's capacity catalog. For reserved customers (const). |
 | `ops` | `true`: the guest may run `POST /v1/broker/probe` and reset the counters with `POST /v1/broker/stats`. Other guests get 403. |
 
 The limits apply to the native routes and to the client (Harbor, ctcli)
@@ -95,7 +96,7 @@ limits without a restart:
 | Route (operator key) | What it does |
 |---|---|
 | `GET /v1/broker/guests` | Every guest with its limits and active rooms. No key hashes. |
-| `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed`, `hotels` and `policy` (`"policy": null` removes it). `max_rooms: 0` and `hotels: []` get 400: in config they mean 1,000 rooms and every non-miner hotel. A bad policy gets 400 `invalid_policy`. |
+| `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed`, `hotels`, `policy` (`"policy": null` removes it) and `own_hosts_only`. `max_rooms: 0` and `hotels: []` get 400: in config they mean 1,000 rooms and every non-miner hotel. A bad policy gets 400 `invalid_policy`. |
 
 A runtime change stays in memory. A restart goes back to the config file.
 
@@ -119,6 +120,7 @@ with no config edit.
 | `prefer` | Tried first. |
 | `allow` | Tried only when no preferred hotel has a free room. |
 | `deny` | Never used. Wins over `prefer`, `allow` and named `hotels`. |
+| `miner_probation` | `true`: the guest sends test traffic, so its `miner=true` opt-in also reaches miner hotels on probation (`miner_probation_seconds`). Without it a guest reaches graduated miner hotels only. Needs a `prefer` or `allow` selector with the label `miner=true`. |
 
 - A create with no hotel choice goes to a preferred hotel while one has a
   free room, else to an allowed hotel. Inside a tier the pick is the usual
@@ -147,6 +149,31 @@ is full, never `nc-sealed`, at most 10 rooms:
  "policy": {"prefer": [{"class": "sealed"}], "allow": [{"class": "unsealed"}],
             "deny": [{"hotel": "nc-sealed"}]}}
 ```
+
+### Placement policy for miner hotels (AB#336)
+
+- Reserved customers stay on Cathedral hosts. A broker guest such as const
+  sets `"own_hosts_only": true` in its guest config. A customer on the
+  shared Polaris guest (Reliquary) gets `"own_hosts_only": true` on each
+  create from the API.
+- The shared pool uses graduated miner hotels first and falls back to the
+  own fleet. A miner in probation has no `graduated=true` label, so no
+  selector opts into it:
+
+```json
+"policy": {
+  "prefer": [{"label": {"miner": "true", "graduated": "true"}}],
+  "allow":  [{"class": "sealed"}]
+}
+```
+
+- The operator adds `graduated=true` to the hotel labels at graduation
+  (AB#334). An operator label PATCH replaces the whole label map, so send the
+  other labels with it. A miner cannot set its own labels: the enroller join
+  and PATCH refuse labels. A hotel that leaves and joins again comes back
+  without the label, so it is back in probation.
+- A policy replaces the guest's `hotels` list: check what `{"class":
+  "sealed"}` reaches before setting it on a live guest.
 
 ### Reserved hotels
 
@@ -676,6 +703,8 @@ Config (all optional):
 | `miner_hotkey_caps` | Operator-approved map from miner SS58 hotkey to maximum joined hotels. Missing hotkeys are refused. The broker counts all joined hotels for a hotkey, including pending or draining ones, and refuses the next join at the cap. Changing a cap requires a config restart; the broker has no cap hot reload yet. |
 | `miner_min_commitment` | `{"slots", "daily_hours"}`: the floor a miner join's commitment must meet (see Capacity commitment). Absent or zero: a commitment is optional. Changing it requires a restart. |
 | `miner_max_hotels` | Operator-approved maximum joined miner hotels across all hotkeys. Zero refuses miner joins. Pending and draining hotels count; the next join is refused with `miner_global_cap_reached`. The approved founding cut is 64; configure it explicitly before enabling enrollment. Changing it requires a restart. |
+| `miner_probation_seconds` | Miner probation (AB#334, `probation.go`). 0 or absent: off. Otherwise a joined miner hotel takes test traffic only until the broker has observed it for this many seconds; it graduates to the shared pool when it was up (health, fresh attestation, not draining) for at least `miner_probation_min_uptime_pct` of that time, else a new window starts. Only a guest whose policy opts in to `miner=true` and sets `"miner_probation": true` reaches a hotel on probation. State is in `state_dir/miner-probation.json`; turning it on for the first time (no file) grandfathers the miner hotels already serving. Hotels and capacity entries show a `probation` object. A miner hotel off probation (or every miner hotel, with probation off) carries the computed label `graduated=true`; a stored `graduated` label is ignored while on probation. |
+| `miner_probation_min_uptime_pct` | Minimum verified uptime to graduate, in percent, (0, 100]. Absent or 0: 99. Exactly the minimum graduates. |
 | `miner_max_rooms_per_hotkey` | Room cap per miner hotkey across all its hotels (rooms in use, creating or queued). 0 or absent: no cap. A hotkey at the cap gets no new room; its hotels show `free_rooms: 0`. |
 | `miner_pool_share` | Share of the shared pool that miner hotels may hold, between 0 and 1 (exclusive). 0 or absent: no cap. Miner rooms on unreserved hotels stay at or under `share / (1 - share)` times the slots of our own unreserved sealed hotels, so a full pool is at most that share miner. The cap is checked when a create is placed; rooms already placed are never moved. The operator capacity view shows both values under `admission_policy` and, with a share set, `miner_pool` (`own_slots`, `miner_room_cap`, `miner_rooms`). A create refused only by a cap counts the hotel as `full` and adds `miner_capped` to the reason. |
 | `sealed_host_data` | Its HOST_DATA must be in this list. A dedicated sealed machine (one owner, `SEALED_OWNER_PUBKEY_FILE`) has its own HOST_DATA, which names the owner key: add that value (the sealed install prints it). On `POST /v1/sandboxes` the broker passes `X-Cathedral-Owner-Signature` and `X-Cathedral-Owner-Timestamp` to the hotel unchanged; the machine checks them (`room-kit/sealed/README.md`, "Dedicated machine"). Its 403 `owner_signature_*` does not rest the hotel. |

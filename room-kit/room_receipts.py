@@ -2318,6 +2318,7 @@ ROOM = r"/v1/sandboxes/(?P<id>[^/]+)"
 SIGNED = [  # (method, path pattern, action)
     ("POST", re.compile(r"^/v1/sandboxes$"), "create"),
     ("POST", re.compile("^" + ROOM + r"/exec$"), "exec"),
+    ("POST", re.compile("^" + ROOM + r"/exec/cancel$"), "exec_cancel"),
     ("POST", re.compile("^" + ROOM + r"/processes$"), "process_start"),
     ("DELETE", re.compile("^" + ROOM + r"$"), "delete"),
     ("PUT", re.compile("^" + ROOM + r"/network$"), "network_set"),
@@ -3283,6 +3284,9 @@ class Handler(BaseHTTPRequestHandler):
         policy = self.network_policy(action, status, res)
         tunables = self.room_tunables(action, status, res)
         link = self.sandbox_link(action, req)
+        # AB#406: the exec token's hash ties a cancel receipt to the exec receipt it stopped.
+        # Only when the body names a token, so an exec without one signs what it always signed.
+        token = req.get("spill_token") if action in ("exec", "exec_cancel") and isinstance(req, dict) else None
         start_command = None
         start_command_sha256 = None
         if action == "create" and isinstance(res, dict) and 200 <= status < 300:
@@ -3315,6 +3319,7 @@ class Handler(BaseHTTPRequestHandler):
             # Create: the Cathedral sandbox id the request's labels name (AB#389). Read from
             # the request as this guest received it, so customer_request_sha256 covers it too.
             **({"cathedral_sandbox_id": link} if link else {}),
+            **({"exec_token_sha256": sha(token.encode())} if isinstance(token, str) and token else {}),
             **({"start_command": start_command, "start_command_sha256": start_command_sha256}
                if action == "create" else {}),
         }
