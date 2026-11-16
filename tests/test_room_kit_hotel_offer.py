@@ -32,9 +32,9 @@ ALICE_SEED = "0xe5be9a5092b81bca64be81d212e7f2f9eba183bb7a90954f7b76361f6edb5c0a
 ALICE_SS58 = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 CHIP = "01" * 64
 SPKI = "cd" * 32
-ORIGIN = "https://8.8.4.1:9443"
+ORIGIN = "https://8.8.8.8:9443"
 GOLDEN_MACHINE = "8ea2d4956f571ef1ee3aed269302d8e38e0ab431f499b8f44410a02829e0ef77"
-GOLDEN_OFFER_ID = "sha256:d89a52829b32111ebda028b80b145cd852e5c32574dcd2ed215029507ba41885"
+GOLDEN_OFFER_ID = "sha256:3de35e143914ee331b7454b07f6817e944188c0cb58cf93a38d701d4424d5a2c"
 
 
 def attestation(*, binding_changes=None, family=0x19, model=0x11, report_data=None, chip=CHIP):
@@ -93,14 +93,14 @@ def test_offer_golden_vector_and_signature():
 
 def test_each_field_changes_the_offer_id():
     base = build()["offer_id"]
-    for change in ({"sequence": 8}, {"withdraw": True}, {"origin": "https://8.8.4.2:9443"},
+    for change in ({"sequence": 8}, {"withdraw": True}, {"origin": "https://1.1.1.1:9443"},
                    {"binding_sha256": "ac" * 32}, {"netuid": 95}, {"network": "test"}):
         assert build(**change)["offer_id"] != base
 
 
-@pytest.mark.parametrize("origin", ["http://8.8.4.1:9443", "https://10.0.0.5:9443", "https://miner.example:9443",
-                                    "https://8.8.4.1", "https://8.8.4.1:9443/x", "https://u:p@8.8.4.1:9443",
-                                    " https://8.8.4.1:9443"])
+@pytest.mark.parametrize("origin", ["http://8.8.8.8:9443", "https://10.0.0.5:9443", "https://miner.example:9443",
+                                    "https://8.8.8.8", "https://8.8.8.8:9443/x", "https://u:p@8.8.8.8:9443",
+                                    " https://8.8.8.8:9443"])
 def test_origin_refusals(origin):
     with pytest.raises(ho.OfferError):
         ho.check_origin(origin)
