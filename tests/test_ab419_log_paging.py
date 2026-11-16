@@ -290,8 +290,9 @@ def test_entrypoint_cut_stream_sets_more_and_the_next_read_continues() -> None:
     page = entrypoint_log_page(out, err, (True, False), (0, 0, 0, 0), running=True)
     assert page["more"] is True and page["truncated"] is False
     assert page["stdout"] == "o1\no2\n" and page["stderr"] == "e1\ne5\n"
-    assert page["next_cursor"] == f"{base + 2}:1:{base + 5}:1"
-    # The next read (docker --since base+2, the earlier stream) returns the rest.
+    # stdout's next read starts at its cut line, not at o2 again.
+    assert page["next_cursor"] == f"{base + 3}:0:{base + 5}:1"
+    # The next read (docker --since base+3, the earlier stream) returns the rest.
     out2 = line(base + 2, "o2") + line(base + 3, "o3-cut-line")
     nxt = entrypoint_log_page(out2, line(base + 5, "e5"), (False, False), parse_entrypoint_cursor(page["next_cursor"]))
     assert nxt["stdout"] == "o3-cut-line\n" and nxt["stderr"] == "" and nxt["more"] is False
@@ -300,8 +301,10 @@ def test_entrypoint_cut_stream_sets_more_and_the_next_read_continues() -> None:
 def test_entrypoint_cut_inside_a_partial_stamp_drops_the_stamp_piece() -> None:
     stamp = "2025-11-13T02:13:20.000000000Z"
     out = f"{stamp} {'a' * 20}{stamp[:9]}"  # cut nine bytes into the next partial's stamp
-    page = entrypoint_log_page(out, "", (True, False), (0, 0, 0, 0))
+    t0 = 1_763_000_000 * SEC
+    page = entrypoint_log_page(out, "", (True, False), (t0, 0, t0, 0))
     assert page["stdout"] == "a" * 20 and page["truncated"] is True
+    assert page["next_cursor"].startswith(f"{t0 + 1}:0:")
 
 
 def test_server_passes_entrypoint_cursor_and_rejects_a_bad_one() -> None:
@@ -329,14 +332,17 @@ def test_entrypoint_line_longer_than_a_read_does_not_stall(fake, guest, monkeypa
     fake.add_log(cid, "stdout", "next\n", T0 + 5)
 
     first = guest.logs(sid, entrypoint_cursor="")["entrypoint"]
+    # The first read moves to the long line; the next starts at it.
+    assert first["stdout"] == "" and first["more"] is True
+    second = guest.logs(sid, entrypoint_cursor=first["next_cursor"])["entrypoint"]
     # --since cannot start inside a line, so what was read of it comes back once,
     # marked truncated, and the read after goes on past it.
-    assert first["stdout"] == "a" * 20 + "b" * 18
-    assert first["truncated"] is True and first["more"] is True
-    second = guest.logs(sid, entrypoint_cursor=first["next_cursor"])["entrypoint"]
-    assert second["stdout"] == "next\n" and second["truncated"] is False and second["more"] is False
+    assert second["stdout"] == "a" * 20 + "b" * 18
+    assert second["truncated"] is True and second["more"] is True
     third = guest.logs(sid, entrypoint_cursor=second["next_cursor"])["entrypoint"]
-    assert third["stdout"] == ""
+    assert third["stdout"] == "next\n" and third["truncated"] is False and third["more"] is False
+    fourth = guest.logs(sid, entrypoint_cursor=third["next_cursor"])["entrypoint"]
+    assert fourth["stdout"] == ""
 
 
 def test_entrypoint_keeps_a_stamp_the_room_wrote_itself(fake, guest) -> None:
@@ -372,3 +378,47 @@ def test_entrypoint_a_lagging_stream_does_not_cut_the_other_streams_line(fake, g
         if not page["more"]:
             break
     assert out == "started\n" and err == expected
+
+
+def _page_all(guest, sid: str, rounds: int = 40) -> tuple[str, str, bool]:
+    cursor, out, err, truncated = "", "", "", False
+    for _ in range(rounds):
+        page = guest.logs(sid, entrypoint_cursor=cursor)["entrypoint"]
+        out += page["stdout"]
+        err += page["stderr"]
+        truncated = truncated or page["truncated"]
+        cursor = page["next_cursor"]
+        if not page["more"]:
+            return out, err, truncated
+    raise AssertionError(f"paging did not finish: {cursor}")
+
+
+def test_entrypoint_two_lines_over_a_read_together_are_not_cut(fake, guest, monkeypatch) -> None:
+    import cathedral.sandbox_guest as sandbox_guest
+
+    # Each line fits a read; two together do not. The read after the cut starts
+    # at the cut line, not at the line already returned.
+    monkeypatch.setattr(sandbox_guest, "ENTRYPOINT_LOG_PAGE", 200)
+    sid = _room(guest)
+    cid = _cid(guest, sid)
+    lines = ["X" * 80 + "\n", "Y" * 80 + "\n", "z\n"]
+    for i, line in enumerate(lines):
+        fake.add_log(cid, "stdout", line, T0 + 10 * i)
+    out, _, truncated = _page_all(guest, sid)
+    assert out == "".join(lines) and truncated is False
+
+
+@pytest.mark.parametrize("size", [137, 138, 148, 167, 168])
+def test_entrypoint_cap_inside_the_next_stamp_does_not_stall(fake, guest, monkeypatch, size: int) -> None:
+    import cathedral.sandbox_guest as sandbox_guest
+
+    # 31-byte stamp + size + newline leaves the 200-byte cap inside the next
+    # line's stamp (or right after its space).
+    monkeypatch.setattr(sandbox_guest, "ENTRYPOINT_LOG_PAGE", 200)
+    sid = _room(guest)
+    cid = _cid(guest, sid)
+    lines = ["X" * size + "\n", "short\n", "end\n"]
+    for i, line in enumerate(lines):
+        fake.add_log(cid, "stdout", line, T0 + 10 * i)
+    out, _, truncated = _page_all(guest, sid)
+    assert out == "".join(lines) and truncated is False

@@ -1401,18 +1401,33 @@ def _entrypoint_stream_page(
             skip -= 1
             continue
         kept.append((ns, line))
+    next_place = (since, seen)
     if kept:
         last = kept[-1][0]
-        count = sum(1 for ns, _ in kept if ns == last) + (seen if last == since else 0)
-        return "".join(line for _, line in kept), (last, count), False, False
-    if cut and held is not None and held[0] >= since and read_since == since:
-        # The read started at this stream's place and its first new line is
-        # longer than a read. Its parts share one time, so --since cannot start
-        # inside it: return what was read and move past it. A read that started
-        # earlier (the other stream is behind) spent the cap on lines already
-        # returned, so the line waits for a read from this stream's place.
-        return held[1], (held[0] + 1, 0), True, False
-    return "", (since, seen), False, not cut and held is None
+        next_place = (last, sum(1 for ns, _ in kept if ns == last) + (seen if last == since else 0))
+    if held is not None and held[0] > next_place[0]:
+        # Stamps only rise within a stream, so nothing of it lies between the
+        # last line returned and the held one. The next read starts at the held
+        # line and does not spend its cap on lines already returned.
+        next_place = (held[0], 0)
+    if kept:
+        return "".join(line for _, line in kept), next_place, False, False
+    if not cut:
+        return "", next_place, False, held is None
+    if read_since != since:
+        # The other stream is behind and the read started at its place: the cap
+        # went on lines already returned. Wait for a read from this stream's place.
+        return "", next_place, False, False
+    if held is not None and held[0] == since:
+        # The read started at this line and still holds nothing but it, so it is
+        # longer than a read. Its parts share one time and --since cannot start
+        # inside it: return what was read and move past it.
+        return held[1], (since + 1, 0), True, False
+    if held is None:
+        # The cap fell inside the next line's stamp or right after a line already
+        # returned: that next line is later than the lines read, so step past them.
+        return "", (since + 1, 0), False, False
+    return "", next_place, False, False
 
 
 def entrypoint_log_page(
