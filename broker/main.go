@@ -154,6 +154,11 @@ type config struct {
 	// MinerMaxHotels is the operator-approved maximum across all miner hotkeys.
 	// Zero refuses miner joins; pending and draining hotels count.
 	MinerMaxHotels int `json:"miner_max_hotels,omitempty"`
+	// MinerProbationSeconds: a joined miner hotel takes test traffic only
+	// for this long (observed time) and graduates to the shared pool at
+	// MinerProbationMinUptimePct verified uptime (probation.go). 0: off.
+	MinerProbationSeconds      float64 `json:"miner_probation_seconds,omitempty"`
+	MinerProbationMinUptimePct float64 `json:"miner_probation_min_uptime_pct,omitempty"`
 	// Room caps on miner hotels (placement.go, AB#335). Both are off at 0.
 	// MinerMaxRoomsPerHotkey caps the rooms of one miner hotkey across all
 	// its hotels. MinerPoolShare (0 < x < 1) caps the rooms on miner hotels
@@ -284,7 +289,9 @@ type hotel struct {
 	moved           int       // creates that left this hotel's queue for another hotel
 	runtime         bool      // joined at runtime (hotels.go), not from the config file
 	adm             admission // attestation gate of a joined sealed hotel (admission.go)
-	delivery        delivery  // delivered capacity against the commitment (commitment.go)
+	prob            probation // miner probation (probation.go)
+	probationOn     atomic.Bool
+	delivery        delivery // delivered capacity against the commitment (commitment.go)
 	// roomsUnchecked: loaded at start and no room list has answered since. A
 	// reserved hotel takes no rooms until one has passed the fail-closed
 	// check (lend.go). baselineTry: last REPORT_ID fetch for an unknown
@@ -318,6 +325,8 @@ type broker struct {
 	stateSaveMu      sync.Mutex               // one client-state save at a time, snapshot through rename (state.go)
 	guests           map[string]*guestState
 	capsOnDisk       map[string]map[string]any // probe results read from state_dir at start
+	probationFileMu  sync.Mutex                // serializes miner-probation.json writes (probation.go)
+	probationSavedAt time.Time                 // guarded by mu
 	lendsOnDisk      map[string]lendEntry      // lend state of hotels not in the config file now (lend.go); guarded by mu
 	byKey            map[string]*guestState    // sha256(key) -> guest
 	byUUID           map[string]*room
@@ -421,6 +430,9 @@ func loadBroker(path string) (*broker, error) {
 	}
 	if c.MinerMaxHotels < 0 {
 		return nil, errors.New("config: miner_max_hotels must be positive when miner hotels are allowed")
+	}
+	if err := validateProbationConfig(c); err != nil {
+		return nil, err
 	}
 	if c.MinerMaxRoomsPerHotkey < 0 {
 		return nil, errors.New("config: miner_max_rooms_per_hotkey must be 0 (no cap) or more")
@@ -1887,6 +1899,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		} `json:"sandboxes"`
 	}
 	lerr := h.getJSON(ctx, h.cfg.API, "/v1/sandboxes", nil, &list)
+	defer b.sampleProbation(h) // registered first, so it runs last: after the health and attestation steps
 	defer b.fillLentBaseline(ctx, h, herr == nil)
 	defer b.syncAdmission(ctx, h, herr == nil) // after the health state below is stored
 	forced := false                            // the fail-closed check below made the hotel lent: save it once b.mu is free

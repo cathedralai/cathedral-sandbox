@@ -56,6 +56,10 @@ type guestPolicy struct {
 	Prefer []selector `json:"prefer"`
 	Allow  []selector `json:"allow"`
 	Deny   []selector `json:"deny"`
+	// MinerProbation: the guest sends test traffic, so its miner opt-in
+	// also reaches miner hotels on probation (probation.go). Without it a
+	// guest reaches graduated miner hotels only.
+	MinerProbation bool `json:"miner_probation,omitempty"`
 }
 
 // hotelClass is "sealed" for a hotel with the sealed label (a sealed hotel
@@ -117,9 +121,26 @@ func (p *guestPolicy) minerOptIn(h *hotel) bool {
 	if p == nil {
 		return false
 	}
+	// A miner hotel on probation takes test traffic only (probation.go).
+	if h.inProbation() && !p.MinerProbation {
+		return false
+	}
 	for _, list := range [][]selector{p.Prefer, p.Allow} {
 		for _, s := range list {
 			if s.Label["miner"] == "true" && s.matches(h) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// selectsMinerLabel reports whether a prefer or allow selector opts in to
+// miner hotels (label miner=true), as minerOptIn requires.
+func (p *guestPolicy) selectsMinerLabel() bool {
+	for _, list := range [][]selector{p.Prefer, p.Allow} {
+		for _, s := range list {
+			if s.Label["miner"] == "true" {
 				return true
 			}
 		}
@@ -154,6 +175,9 @@ func validSelectors(field string, list []selector) error {
 func (p *guestPolicy) validate() error {
 	if len(p.Prefer)+len(p.Allow) == 0 {
 		return fmt.Errorf("policy must have at least one prefer or allow selector")
+	}
+	if p.MinerProbation && !p.selectsMinerLabel() {
+		return fmt.Errorf("policy.miner_probation needs a prefer or allow selector with the label miner=true")
 	}
 	for _, f := range []struct {
 		name string
@@ -229,11 +253,15 @@ func (b *broker) capacityDoc(e capacityEntry, now time.Time, mb *minerBudget) ma
 	if r := h.reservedFor(); r != "" {
 		reserved = r
 	}
-	return map[string]any{
+	d := map[string]any{
 		"id": h.cfg.ID, "class": hotelClass(h), "labels": labels, "up": h.ok, "drain": h.drain(),
 		"free_rooms": b.admissibleFreeIn(h, now, mb), "source": e.source, "down_since": downSince(h),
 		"reserved_for": reserved, "slots": h.slots, "admission": b.admissionDoc(h, now),
 	}
+	if p := b.probationDoc(h); p != nil {
+		d["probation"] = p
+	}
+	return d
 }
 
 // classTotals is one class line of the catalog: hotels, how many take rooms
@@ -344,7 +372,10 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 			"miner_hotkey_caps":    b.cfg.MinerHotkeyCaps,
 			"miner_max_hotels":     b.cfg.MinerMaxHotels,
 			"miner_tls_pin":        true,
-			"miner_min_commitment": b.cfg.MinerMinCommitment, // null: a commitment is optional
+			// Miner probation (probation.go): 0 is off.
+			"miner_probation_seconds":        b.cfg.MinerProbationSeconds,
+			"miner_probation_min_uptime_pct": float64(b.probationMinBP()) / 100,
+			"miner_min_commitment":           b.cfg.MinerMinCommitment, // null: a commitment is optional
 			// Room caps (placement.go, AB#335); 0 is off.
 			"miner_max_rooms_per_hotkey": b.cfg.MinerMaxRoomsPerHotkey,
 			"miner_pool_share":           b.cfg.MinerPoolShare,
