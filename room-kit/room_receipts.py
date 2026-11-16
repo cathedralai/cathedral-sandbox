@@ -2053,11 +2053,12 @@ class Ledger:
         # for it, until a 2xx snapshot_delete is signed. Guarded by self.lock, like every table here, and never
         # held across a call to the room API, so the lock order of this file does not change.
         self.snapshots: dict[str, dict] = {}
-        # Snapshot ids whose 2xx snapshot_delete this boot signed. Such an id is never signed as a snapshot again
-        # and never forked, so per binding a fork always names the first snapshot receipt of its id and no fork
-        # follows the delete of its id (the offline checker's rules). Never evicted: forgetting an id would let it
-        # back. Once it holds SNAPSHOT_DELETED_CAP ids, new snapshots are refused unsent until the front restarts;
-        # a delete that already ran is still recorded, so the set may pass the cap. Guarded by self.lock.
+        # Snapshot ids whose 2xx snapshot_delete this boot signed, or that SNAPSHOT_MAP_CAP pushed out. Such an
+        # id is never signed as a snapshot again and never forked, so per binding a fork always names the first
+        # snapshot receipt of its id and no fork follows the delete of its id (the offline checker's rules).
+        # Never evicted: forgetting an id would let it back. Once it holds SNAPSHOT_DELETED_CAP ids, new
+        # snapshots are refused unsent until the front restarts; a delete that already ran is still recorded,
+        # so the set may pass the cap. Guarded by self.lock.
         self.deleted_snapshots: set[str] = set()
         # Forks and snapshot deletes in flight, per snapshot id: a delete of an id with a fork in flight, and a
         # fork of an id with a delete in flight, are refused unsent, so a fork receipt never follows the delete
@@ -2306,7 +2307,11 @@ class Ledger:
             receipt = self._sign_locked(fields)
             if held is None:
                 while len(self.snapshots) >= SNAPSHOT_MAP_CAP:
-                    del self.snapshots[next(iter(self.snapshots))]
+                    # An id lost to the cap is treated as deleted: signing it again would not be its first
+                    # receipt, which the offline checker requires of every fork's source.
+                    evicted = next(iter(self.snapshots))
+                    del self.snapshots[evicted]
+                    self.deleted_snapshots.add(evicted)
                 self.snapshots[record["snapshot_id"]] = {
                     "content": record["snapshot_content_sha256"], "source": record["source"],
                     "receipt_sha256": receipt["receipt_sha256"]}
@@ -2408,6 +2413,8 @@ SNAPSHOT_DELETE_IN_FLIGHT_BODY = (b'{"error":{"code":"snapshot_delete_in_flight"
                                   b'running; nothing was sent"}}')
 SNAPSHOT_FORK_IN_FLIGHT_BODY = (b'{"error":{"code":"snapshot_fork_in_flight","message":"a fork of this snapshot is running; '
                                 b'retry the delete when it ends"}}')
+SNAPSHOT_NAME_REFUSED_BODY = (b'{"error":{"code":"snapshot_name_invalid","message":"a snapshot name may not have the shape '
+                              b'of a snapshot id (snap_...); nothing was sent"}}')
 SNAPSHOT_SOLD_OUT_BODY = (b'{"error":{"code":"snapshots_sold_out","message":"snapshots on this machine are sold out until '
                           b'its receipts front restarts"}}')
 SNAPSHOT_UNSIGNED_BODY = (b'{"error":{"code":"snapshot_unsigned","message":"the machine answer did not name a complete '
@@ -2938,8 +2945,13 @@ class Handler(BaseHTTPRequestHandler):
             if problem is not None:
                 return self.reply(400, canonical({"error": {"code": problem[0], "message": problem[1]}}))
         fork = None
-        if refusal is None and action == "snapshot" and self.authorized() and ledger.snapshots_sold_out():
-            return self.reply(503, SNAPSHOT_SOLD_OUT_BODY)
+        if refusal is None and action == "snapshot" and self.authorized():
+            if self.snapshot_name_is_id_shaped(body):
+                # The machine resolves a fork's snapshot_id as an id, then as a name. A snapshot named like an id
+                # could stand in for that id once it expires, and the fork would be signed as the first one.
+                return self.reply(400, SNAPSHOT_NAME_REFUSED_BODY)
+            if ledger.snapshots_sold_out():
+                return self.reply(503, SNAPSHOT_SOLD_OUT_BODY)
         if refusal is None and action == "create" and self.authorized():
             fork_id = self.fork_snapshot_id(body)
             if fork_id is not None:
@@ -3045,6 +3057,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, b'{"state":"running"}', {EXEC_STATE_HEADER: "running"})
         # The bytes and receipt of the original answer, so its result_sha256 still checks. Not signed again.
         return self.reply(e.status, e.body, {**e.headers, EXEC_STATE_HEADER: "done"}, e.ctype)
+
+    @staticmethod
+    def snapshot_name_is_id_shaped(body: bytes | None) -> bool:
+        """Whether a snapshot request names its snapshot with a string shaped like a snapshot id."""
+        try:
+            doc = json.loads(body or b"")
+        except (ValueError, RecursionError):
+            return False
+        name = doc.get("name") if isinstance(doc, dict) else None
+        return isinstance(name, str) and SNAPSHOT_ID_RE.fullmatch(name) is not None
 
     @staticmethod
     def fork_snapshot_id(body: bytes | None) -> str | None:

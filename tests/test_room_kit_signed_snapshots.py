@@ -1170,3 +1170,49 @@ def test_the_fixture_holds_the_attestation_and_the_four_receipts_linked_as_the_p
     for earlier, later in zip(doc["receipts"], doc["receipts"][1:]):
         assert later["statement"]["previous_receipt_sha256"] == earlier["receipt_sha256"]
     assert doc["receipts"][0]["statement"]["previous_receipt_sha256"] == doc["attestation"]["binding_sha256"]
+
+
+# ---------------------------------------------------------------- exact-head review, 16 Nov
+def test_a_snapshot_named_like_a_snapshot_id_is_400_unsent_unsigned(front) -> None:
+    # The machine resolves a fork's snapshot_id as an id, then as a name. Schedule from the review: A (ttl 1) is
+    # signed as snap_aaa; C, named "snap_aaa", is signed as snap_ccc; A expires; a fork of snap_aaa would be built
+    # from C under A's signed fields. The front refuses the name, so C is never made.
+    a = room(front)
+    first = snapshot_ok(front, a, "snap_aaaaaaaaaaaa")
+    sent = front.api.count(rf"POST /v1/sandboxes/{a}/snapshot")
+    status, headers, out = snapshot(front, a, "snap_cccccccccccc", body={"name": "snap_aaaaaaaaaaaa"})
+    assert status == 400 and code(out) == "snapshot_name_invalid" and "X-Room-Receipt" not in headers
+    assert front.api.count(rf"POST /v1/sandboxes/{a}/snapshot") == sent
+    assert [s for s in chain_actions(front) if s == "snapshot"] == ["snapshot"]
+    assert receipt_of(fork(front, "snap_aaaaaaaaaaaa")[1])["statement"]["snapshot_receipt_sha256"] == first["receipt_sha256"]
+
+
+@pytest.mark.parametrize("name", ["warm", "snap-1", "snap_", "Snap_abc", "snap_a b"])
+def test_a_snapshot_name_not_shaped_like_an_id_is_forwarded_as_before(front, name) -> None:
+    a = room(front)
+    status, _headers, _out = snapshot(front, a, body={"name": name})
+    assert status == 202
+
+
+def test_an_id_pushed_out_by_the_record_cap_is_never_signed_again(front, monkeypatch) -> None:
+    # A re-signed evicted id would not be the first receipt of that id, which the offline checker requires.
+    monkeypatch.setattr(rr, "SNAPSHOT_MAP_CAP", 1)
+    a = room(front)
+    snapshot_ok(front, a, "snap_000000000001")
+    snapshot_ok(front, a, "snap_000000000002")  # pushes 1 out
+    status, headers, out = snapshot(front, a, "snap_000000000001")
+    assert status == 502 and code(out) == "snapshot_unsigned" and members(receipt_of(headers)["statement"]) == {}
+    assert fork(front, "snap_000000000001")[0] == 404
+    assert fork(front, "snap_000000000002")[0] == 200
+
+
+def test_a_fork_of_an_id_in_the_deleted_set_is_404_even_if_the_record_still_held_it(front) -> None:
+    # Defence in depth: admit_fork checks the deleted set itself, not only the record.
+    a = room(front)
+    snapshot_ok(front, a)
+    with front.ledger.lock:
+        front.ledger.deleted_snapshots.add(SNAP)
+    sent = front.api.count(r"POST /v1/sandboxes")
+    status, headers, out = fork(front)
+    assert status == 404 and code(out) == "snapshot_not_found" and "X-Room-Receipt" not in headers
+    assert front.api.count(r"POST /v1/sandboxes") == sent

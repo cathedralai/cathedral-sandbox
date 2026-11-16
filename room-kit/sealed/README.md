@@ -309,6 +309,12 @@ The broker admits the machine only if its HOST_DATA is in `sealed_host_data`
   of that id is in flight is 409 `snapshot_fork_in_flight`, and a fork while a
   delete of it is in flight is 409 `snapshot_delete_in_flight`, both unsent and
   unsigned. Retry after the other ends.
+- A snapshot request whose `name` has the shape of a snapshot id (`snap_` and
+  letters or digits) is refused 400 `snapshot_name_invalid`, unsent. The machine
+  resolves a fork's `snapshot_id` as an id and then as a name, so such a name
+  could stand in for an expired id under that id's signed receipt. Forking by
+  name is not possible through this front at all: only ids it signed are known.
+- An id pushed out of the 4,096-entry record counts as deleted for the boot.
 - The front keeps up to 65,536 deleted ids per boot. When full, new snapshots
   are refused 503 `snapshots_sold_out`, unsent, until the front restarts; a
   delete that already ran is still recorded past that number.
