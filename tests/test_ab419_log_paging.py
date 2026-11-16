@@ -194,11 +194,11 @@ def test_entrypoint_lines_at_the_same_nanosecond_are_not_repeated_or_lost(fake, 
     fake.add_log(cid, "stdout", "a\n", T0)
     fake.add_log(cid, "stderr", "e1\n", T0)
     first = guest.logs(sid, entrypoint_cursor="")["entrypoint"]
-    assert first["next_cursor"] == f"{T0}:1:1"
+    assert first["next_cursor"] == f"{T0}:1:{T0}:1"
     fake.add_log(cid, "stdout", "b\n", T0)  # same ns as the cursor
     second = guest.logs(sid, entrypoint_cursor=first["next_cursor"])["entrypoint"]
     assert second["stdout"] == "b\n" and second["stderr"] == ""
-    assert second["next_cursor"] == f"{T0}:2:1"
+    assert second["next_cursor"] == f"{T0}:2:{T0}:1"
 
 
 def test_entrypoint_log_is_not_read_without_a_cursor(fake, guest) -> None:
@@ -213,26 +213,30 @@ def test_entrypoint_partial_last_line_waits_while_running(fake, guest) -> None:
     sid = _room(guest)
     cid = _cid(guest, sid)
     fake.add_log(cid, "stdout", "whole\n", T0)
-    fake.add_log(cid, "stdout", "part", T0 + 1)
+    # docker writes a partial only when its 16 KiB buffer fills; the rest of the
+    # line follows later with the same stamp.
+    head = "x" * 16 * 1024
+    fake.add_log(cid, "stdout", head, T0 + 1)
+    fake.add_log(cid, "stderr", "other stream\n", T0 + 2)
     first = guest.logs(sid, entrypoint_cursor="")["entrypoint"]
     assert first["stdout"] == "whole\n"
-    # docker prints the rest of the line with a new timestamp once it arrives.
-    fake.add_log(cid, "stdout", "-rest\n", T0 + 2)
+    # The other stream is not held back by stdout's unfinished line.
+    assert first["stderr"] == "other stream\n"
+    fake.add_log(cid, "stdout", "-rest\n", T0 + 1)
     second = guest.logs(sid, entrypoint_cursor=first["next_cursor"])["entrypoint"]
-    assert second["stdout"] == "part-rest\n"
+    assert second["stdout"] == head + "-rest\n" and second["stderr"] == ""
 
 
 def test_entrypoint_long_line_split_by_docker_is_joined(fake, guest) -> None:
     sid = _room(guest)
     cid = _cid(guest, sid)
-    # json-file keeps a line over 16 KiB as partial messages; docker logs prints
-    # each with its own stamp and no newline between them.
-    fake.add_log(cid, "stdout", "aaa", T0)
-    fake.add_log(cid, "stdout", "bbb", T0 + 1)
-    fake.add_log(cid, "stdout", "ccc\n", T0 + 2)
+    # json-file keeps a line over 16 KiB as partial messages with one shared
+    # stamp; docker logs prints each with it and no newline between them.
+    long_line = "".join(c * 16 * 1024 for c in "abc") + "end\n"
+    fake.add_long_line(cid, "stdout", long_line, T0)
     fake.add_log(cid, "stdout", "next\n", T0 + 3)
     first = guest.logs(sid, entrypoint_cursor="")["entrypoint"]
-    assert first["stdout"] == "aaabbbccc\nnext\n"
+    assert first["stdout"] == long_line + "next\n"
     fake.add_log(cid, "stdout", "last\n", T0 + 4)
     second = guest.logs(sid, entrypoint_cursor=first["next_cursor"])["entrypoint"]
     assert second["stdout"] == "last\n"
@@ -280,17 +284,24 @@ def test_entrypoint_cut_stream_sets_more_and_the_next_read_continues() -> None:
         return f"2025-11-13T02:13:20.{ns % SEC:09d}Z {text}\n"
 
     base = 1_763_000_000 * SEC
-    # stdout hit the cap mid line at ns 3; stderr has a line at ns 5 that must wait.
+    # stdout hit the cap mid line at ns 3; stderr is whole and goes on to ns 5.
     out = line(base + 1, "o1") + line(base + 2, "o2") + "2025-11-13T02:13:20.000000003Z o3-cu"
     err = line(base + 1, "e1") + line(base + 5, "e5")
-    page = entrypoint_log_page(out, err, (True, False), (0, 0, 0), running=True)
-    assert page["more"] is True
-    assert page["stdout"] == "o1\no2\n" and page["stderr"] == "e1\n"
-    assert page["next_cursor"] == f"{base + 2}:1:0"
-    # The next read (docker --since base+2) returns the lines from there.
+    page = entrypoint_log_page(out, err, (True, False), (0, 0, 0, 0), running=True)
+    assert page["more"] is True and page["truncated"] is False
+    assert page["stdout"] == "o1\no2\n" and page["stderr"] == "e1\ne5\n"
+    assert page["next_cursor"] == f"{base + 2}:1:{base + 5}:1"
+    # The next read (docker --since base+2, the earlier stream) returns the rest.
     out2 = line(base + 2, "o2") + line(base + 3, "o3-cut-line")
     nxt = entrypoint_log_page(out2, line(base + 5, "e5"), (False, False), parse_entrypoint_cursor(page["next_cursor"]))
-    assert nxt["stdout"] == "o3-cut-line\n" and nxt["stderr"] == "e5\n" and nxt["more"] is False
+    assert nxt["stdout"] == "o3-cut-line\n" and nxt["stderr"] == "" and nxt["more"] is False
+
+
+def test_entrypoint_cut_inside_a_partial_stamp_drops_the_stamp_piece() -> None:
+    stamp = "2025-11-13T02:13:20.000000000Z"
+    out = f"{stamp} {'a' * 20}{stamp[:9]}"  # cut nine bytes into the next partial's stamp
+    page = entrypoint_log_page(out, "", (True, False), (0, 0, 0, 0))
+    assert page["stdout"] == "a" * 20 and page["truncated"] is True
 
 
 def test_server_passes_entrypoint_cursor_and_rejects_a_bad_one() -> None:
@@ -309,26 +320,23 @@ def test_server_passes_entrypoint_cursor_and_rejects_a_bad_one() -> None:
 def test_entrypoint_line_longer_than_a_read_does_not_stall(fake, guest, monkeypatch) -> None:
     import cathedral.sandbox_guest as sandbox_guest
 
-    # Each partial prints as a 31-byte stamp and 20 bytes: a 100-byte read holds
-    # one whole partial and the start of the next.
+    # Partials print as a 31-byte stamp and 20 bytes, all with one stamp: a
+    # 100-byte read holds the first partial and most of the second.
     monkeypatch.setattr(sandbox_guest, "ENTRYPOINT_LOG_PAGE", 100)
     sid = _room(guest)
     cid = _cid(guest, sid)
-    parts = [c * 20 for c in "abcde"]
-    for i, part in enumerate(parts):
-        fake.add_log(cid, "stdout", part + ("\n" if i == len(parts) - 1 else ""), T0 + i)
+    fake.add_long_line(cid, "stdout", "".join(c * 20 for c in "abcde") + "\n", T0, chunk=20)
     fake.add_log(cid, "stdout", "next\n", T0 + 5)
 
-    cursor, out = "", ""
-    for _ in range(20):
-        page = guest.logs(sid, entrypoint_cursor=cursor)["entrypoint"]
-        out += page["stdout"]
-        cursor = page["next_cursor"]
-        if not page["more"]:
-            break
-    assert out == "".join(parts) + "\nnext\n"
-    again = guest.logs(sid, entrypoint_cursor=cursor)["entrypoint"]
-    assert again["stdout"] == ""
+    first = guest.logs(sid, entrypoint_cursor="")["entrypoint"]
+    # --since cannot start inside a line, so what was read of it comes back once,
+    # marked truncated, and the read after goes on past it.
+    assert first["stdout"] == "a" * 20 + "b" * 18
+    assert first["truncated"] is True and first["more"] is True
+    second = guest.logs(sid, entrypoint_cursor=first["next_cursor"])["entrypoint"]
+    assert second["stdout"] == "next\n" and second["truncated"] is False and second["more"] is False
+    third = guest.logs(sid, entrypoint_cursor=second["next_cursor"])["entrypoint"]
+    assert third["stdout"] == ""
 
 
 def test_entrypoint_keeps_a_stamp_the_room_wrote_itself(fake, guest) -> None:

@@ -1298,48 +1298,21 @@ def _read_room_log_page(path: Path, offset: int, limit: int) -> dict[str, Any]:
 # most this many bytes of each stream; ``more`` says there is more to read.
 ENTRYPOINT_LOG_PAGE = 4 * 1024 * 1024
 _DOCKER_LOG_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$")
-_ENTRYPOINT_CURSOR = re.compile(r"^(\d{1,20}):(\d{1,9}):(\d{1,9})$")
-# The stamp docker writes before each message (RFC3339NanoFixed in UTC). A message
-# without a newline (a json-file partial: a line over 16 KiB, or a last line not
-# yet ended) is followed on the same output line by the next message's stamp.
-_DOCKER_PARTIAL_STAMP = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z) ")
+_ENTRYPOINT_CURSOR = re.compile(r"^(\d{1,20}):(\d{1,9}):(\d{1,20}):(\d{1,9})$")
 
 
-def _partial_segments(ns: int, text: str) -> list[tuple[int, str]]:
-    """(ns, text) of each json-file partial message in one output line of docker logs.
+def parse_entrypoint_cursor(cursor: str | None) -> tuple[int, int, int, int]:
+    """(stdout ns, stdout lines at it read, stderr ns, stderr lines at it read) of a cursor.
 
-    A stamp in the text is docker's only when it is later than the stamp before
-    it: docker stamps a message after the room wrote it, so a stamp the room put
-    in its own line is not later than that line's.
-    """
-    segments: list[tuple[int, str]] = []
-    start, pos, last = ns, 0, ns
-    for match in _DOCKER_PARTIAL_STAMP.finditer(text):
-        stamp = _docker_log_ns(match.group(1))
-        if stamp is None or stamp <= last:
-            continue
-        segments.append((start, text[pos:match.start()]))
-        start, pos, last = stamp, match.end(), stamp
-    segments.append((start, text[pos:]))
-    return segments
-
-
-def _join_partials(ns: int, text: str) -> str:
-    """One logical line from docker's partial messages: drop the stamps docker put between them."""
-    return "".join(part for _, part in _partial_segments(ns, text))
-
-
-def parse_entrypoint_cursor(cursor: str | None) -> tuple[int, int, int]:
-    """(unix ns, stdout lines, stderr lines at that ns already read) of an entrypoint cursor.
-
-    "" reads from the start of what the daemon kept.
+    Each stream keeps its own place, so one stream's unfinished line does not
+    hold back the other. "" reads from the start of what the daemon kept.
     """
     if cursor is None or cursor == "":
-        return 0, 0, 0
+        return 0, 0, 0, 0
     match = _ENTRYPOINT_CURSOR.match(cursor) if isinstance(cursor, str) else None
     if match is None:
         raise SandboxOpError("invalid_request", 400, "entrypoint_cursor must be empty or a next_cursor this API returned")
-    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+    return int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4))
 
 
 def _docker_log_ns(stamp: str) -> int | None:
@@ -1358,19 +1331,34 @@ def _docker_log_ns(stamp: str) -> int | None:
     return whole * 1_000_000_000 + int((frac or "").ljust(9, "0"))
 
 
+def _join_partials(stamp: str, rest: str, *, cut: bool = False) -> str:
+    """One logical line from docker's partial messages.
+
+    The daemon keeps a line over 16 KiB as partial messages that all carry the
+    first one's time (moby daemon/logger/copier.go, partialTS), and docker logs
+    prints each with that stamp and no newline between them. So the line's own
+    stamp inside its text is docker's, and is dropped. A cut line may end inside
+    one of those stamps; that piece is dropped too.
+    """
+    marker = stamp + " "
+    text = rest.replace(marker, "")
+    if cut:
+        for size in range(len(marker) - 1, 0, -1):
+            if text.endswith(marker[:size]):
+                return text[:-size]
+    return text
+
+
 def _docker_log_lines(
     text: str, cut: bool, hold_partial: bool
-) -> tuple[list[tuple[int, str]], int | None, list[tuple[int, str]]]:
-    """(ns, line) of each whole line of one stream, the stream's horizon, and its held tail.
+) -> tuple[list[tuple[int, str]], tuple[int, str] | None]:
+    """(ns, line) of each whole line of one stream, and its held last line (ns, text).
 
     A stream cut at the read cap ends in a cut line, and a running room's last
-    line may lack its newline yet: docker prints the rest of that line later
-    after a new timestamp, so a read that counted the first part would skip the
-    rest. Such a last line is held back as its partial segments, and the horizon
-    is its time: no line of either stream after it is returned, so the next read
-    starts at or before it. A line with no timestamp prefix (not something docker
-    writes) belongs to the line before it. A line docker kept as partial messages
-    is joined back into one, timed by its first part.
+    line may lack its newline yet (docker prints the rest later, with the same
+    stamp). Such a last line is held: it is not returned as a line, so the next
+    read starts at or before it. A line with no timestamp prefix (not something
+    docker writes) belongs to the line before it.
     """
     parts = text.split("\n")
     tail = parts.pop()  # "" when the text ends in a newline
@@ -1382,113 +1370,81 @@ def _docker_log_lines(
             if lines:
                 lines[-1] = (lines[-1][0], lines[-1][1] + part + "\n")
             continue
-        lines.append((ns, _join_partials(ns, rest) + "\n"))
-    horizon = None
-    held: list[tuple[int, str]] = []
+        lines.append((ns, _join_partials(stamp, rest) + "\n"))
+    held = None
     if tail:
         stamp, sep, rest = tail.partition(" ")
         ns = _docker_log_ns(stamp) if sep else None
-        if cut or hold_partial:
-            if ns is not None:
-                horizon = ns
-                held = _partial_segments(ns, rest)
-            else:
-                horizon = lines[-1][0] if lines else -1
+        if ns is not None and (cut or hold_partial):
+            held = (ns, _join_partials(stamp, rest, cut=cut))
         elif ns is not None:
-            lines.append((ns, _join_partials(ns, rest)))
-        elif lines:
+            lines.append((ns, _join_partials(stamp, rest)))
+        elif lines and not (cut or hold_partial):
             lines[-1] = (lines[-1][0], lines[-1][1] + tail)
-    elif cut:
-        horizon = lines[-1][0] if lines else -1
-    return lines, horizon, held
+    return lines, held
+
+
+def _entrypoint_stream_page(
+    text: str, cut: bool, hold_partial: bool, since: int, seen: int
+) -> tuple[str, tuple[int, int], bool, bool]:
+    """(new text, next (ns, lines at ns), truncated, idle) of one stream after its cursor.
+
+    Idle: the read holds all of this stream and nothing of it is new or held.
+    """
+    lines, held = _docker_log_lines(text, cut, hold_partial)
+    skip = seen
+    kept: list[tuple[int, str]] = []
+    for ns, line in lines:
+        if ns < since:
+            continue
+        if ns == since and skip > 0:
+            skip -= 1
+            continue
+        kept.append((ns, line))
+    if kept:
+        last = kept[-1][0]
+        count = sum(1 for ns, _ in kept if ns == last) + (seen if last == since else 0)
+        return "".join(line for _, line in kept), (last, count), False, False
+    if cut and held is not None and held[0] >= since:
+        # The stream's next line is longer than a read. Its parts share one time,
+        # so --since cannot start inside it: return what was read and move past it.
+        return held[1], (held[0] + 1, 0), True, False
+    return "", (since, seen), False, not cut and held is None
 
 
 def entrypoint_log_page(
     stdout: str,
     stderr: str,
     cut: tuple[bool, bool],
-    cursor: tuple[int, int, int],
+    cursor: tuple[int, int, int, int],
     *,
     running: bool = True,
 ) -> dict[str, Any]:
     """The lines after *cursor* from one ``docker logs --timestamps --since`` read.
 
     docker logs has no byte offset (json-file rotates its files), so the cursor
-    is a time and, per stream, how many lines at that time the read before
+    is, per stream, a time and how many lines at that time the read before
     returned: ``--since`` is inclusive, so those come back and are dropped here.
-
-    One line longer than a read (ENTRYPOINT_LOG_PAGE) would hold every read at
-    its start. When a cut leaves nothing new, the read returns that line's whole
-    partial messages and moves the cursor to the first one it did not return.
+    The read itself starts at the earlier of the two times.
     """
-    since_ns = cursor[0]
-    streams = [
-        _docker_log_lines(stdout, cut[0], running),
-        _docker_log_lines(stderr, cut[1], running),
-    ]
-
-    def pick(limit: int | None, *, before: bool, with_held: bool) -> list[list[tuple[int, str]]]:
-        fresh: list[list[tuple[int, str]]] = []
-        for index, (lines, _, held) in enumerate(streams):
-            items = list(lines)
-            if with_held and cut[index] and held:
-                head = [part for ns, part in held if limit is None or ns < limit]
-                if head:
-                    items.append((held[0][0], "".join(head)))
-            seen = cursor[1 + index]
-            kept: list[tuple[int, str]] = []
-            for ns, line in items:
-                if ns < since_ns:
-                    continue
-                if ns == since_ns and seen > 0:
-                    seen -= 1
-                    continue
-                if limit is not None and (ns >= limit if before else ns > limit):
-                    break
-                kept.append((ns, line))
-            fresh.append(kept)
-        return fresh
-
-    def page(fresh: list[list[tuple[int, str]]], next_cursor: str, more: bool) -> dict[str, Any]:
-        return {
-            "stdout": "".join(line for _, line in fresh[0]),
-            "stderr": "".join(line for _, line in fresh[1]),
-            "next_cursor": next_cursor,
-            # A stream hit the read cap: read again from next_cursor for the rest.
-            "more": more,
-        }
-
-    horizons = [h for _, h, _ in streams if h is not None]
-    fresh = pick(min(horizons) if horizons else None, before=False, with_held=False)
-    last = max((kept[-1][0] for kept in fresh if kept), default=None)
-    if last is not None:
-        counts = [
-            sum(1 for ns, _ in kept if ns == last) + (cursor[1 + i] if last == since_ns else 0)
-            for i, kept in enumerate(fresh)
-        ]
-        return page(fresh, f"{last}:{counts[0]}:{counts[1]}", any(cut))
-    unchanged = f"{cursor[0]}:{cursor[1]}:{cursor[2]}"
-    if not any(cut):
-        return page(fresh, unchanged, False)
-    # Nothing new and a stream was cut: its last line is longer than a read.
-    # A cut stream can return its held line up to its last partial (the one the
-    # cap cut); a stream holding an unfinished line waits for it.
-    stops: list[tuple[int, bool]] = []
-    for index, (_, horizon, held) in enumerate(streams):
-        if horizon is None:
-            continue
-        if cut[index] and len(held) >= 2:
-            stops.append((held[-1][0], True))
-        else:
-            stops.append((horizon, bool(cut[index])))
-    limit, forced = min(stops)
-    if limit <= since_ns:
-        if not forced:
-            return page(fresh, unchanged, True)
-        # One partial message bigger than a read (docker writes 16 KiB ones):
-        # return what was read of it and give up the rest rather than stall.
-        limit = since_ns + 1
-    return page(pick(limit, before=True, with_held=True), f"{limit}:0:0", True)
+    out, out_next, out_cut, out_idle = _entrypoint_stream_page(stdout, cut[0], running, cursor[0], cursor[1])
+    err, err_next, err_cut, err_idle = _entrypoint_stream_page(stderr, cut[1], running, cursor[2], cursor[3])
+    # The read starts at the earlier stream's place. A stream with nothing new
+    # moves up to the other one's, so a quiet stream does not make every read
+    # start over from its last line.
+    if out_idle and err_next[0] > out_next[0]:
+        out_next = (err_next[0], 0)
+    if err_idle and out_next[0] > err_next[0]:
+        err_next = (out_next[0], 0)
+    return {
+        "stdout": out,
+        "stderr": err,
+        "next_cursor": f"{out_next[0]}:{out_next[1]}:{err_next[0]}:{err_next[1]}",
+        # A stream hit the read cap: read again from next_cursor for the rest.
+        "more": any(cut),
+        # A line longer than a read came back cut; the rest of it is not readable.
+        "truncated": out_cut or err_cut,
+    }
 
 
 def _sweep_stale_bases(own: Path) -> None:
@@ -2622,7 +2578,7 @@ class DockerGuestProvider:
             return {**doc, "entrypoint": page}
         try:
             code, out, err, cut = self._client.entrypoint_logs(
-                guest.container_id, since_ns=cursor[0], cap=ENTRYPOINT_LOG_PAGE
+                guest.container_id, since_ns=min(cursor[0], cursor[2]), cap=ENTRYPOINT_LOG_PAGE
             )
         except SandboxOpError as exc:
             code, err = -1, str(exc)

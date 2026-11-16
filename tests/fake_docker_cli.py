@@ -536,6 +536,13 @@ class FakeDocker:
         state["containers"][cid].setdefault("logs", []).append([ns, stream, text])
         self._save(state)
 
+    def add_long_line(self, cid: str, stream: str, text: str, ns: int, chunk: int = 16 * 1024) -> None:
+        """One line as the daemon keeps a long one (AB#419): partial messages of
+        *chunk* bytes, all with the first one's time (moby copier.go partialTS)."""
+        data = text.encode()
+        for start in range(0, len(data), chunk):
+            self.add_log(cid, stream, data[start:start + chunk].decode(), ns)
+
     @property
     def state(self) -> dict[str, Any]:
         return self._load()
