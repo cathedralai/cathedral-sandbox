@@ -21,8 +21,10 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Mapping
@@ -47,6 +49,11 @@ from cathedral.sandbox_owner import guest_from, owner_hash, owner_id
 from cathedral.sandbox_provider import InMemorySandboxProvider, SandboxOpError, SandboxProvider
 
 JSON = "application/json"
+# A PTY WebSocket closes after this long with no frame from the client
+# (pings count); the API's idle sweep ends the terminal itself (AB#405).
+PTY_WS_IDLE_SECONDS = 600.0
+# Largest unparsed input a PTY WebSocket buffers (one frame, in effect).
+PTY_WS_MAX_FRAME = 64 * 1024 + 16
 REAPER_INTERVAL_DEFAULT_SECONDS = 30.0
 
 
@@ -298,6 +305,7 @@ class SandboxApplication:
         self._add("POST", s + r"/(?P<id>[^/]+)/terminals/(?P<tid>[^/]+)/connect", self.connect_terminal)
         self._add("POST", s + r"/(?P<id>[^/]+)/terminals/(?P<tid>[^/]+)/input", self.terminal_write)
         self._add("GET", s + r"/(?P<id>[^/]+)/terminals/(?P<tid>[^/]+)/output", self.terminal_read)
+        self._add("POST", s + r"/(?P<id>[^/]+)/terminals/(?P<tid>[^/]+)/resize", self.terminal_resize)
         self._add("POST", s + r"/(?P<id>[^/]+)/publish", self.publish_template)
         self._add("GET", s + r"/(?P<id>[^/]+)/desktop", self.desktop)
         self._add("GET", s + r"/(?P<id>[^/]+)/logs", self.logs)
@@ -706,10 +714,16 @@ class SandboxApplication:
 
     def create_terminal(self, *, id, body, **_):
         payload = self._json(body)
-        return Response.json(
-            201,
-            self.provider.create_terminal(id, cols=payload.get("cols"), rows=payload.get("rows")),
-        )
+        kwargs: dict[str, Any] = {"cols": payload.get("cols"), "rows": payload.get("rows")}
+        if payload.get("mode") is not None:
+            # line (default) or pty (AB#405). Only sent on when asked, so a
+            # provider without PTY terminals keeps its old signature.
+            kwargs["mode"] = str(payload.get("mode"))
+        return Response.json(201, self.provider.create_terminal(id, **kwargs))
+
+    def terminal_resize(self, *, id, tid, body, **_):
+        payload = self._json(body)
+        return Response.json(200, self.provider.terminal_resize(id, tid, payload.get("cols"), payload.get("rows")))
 
     def list_terminals(self, *, id, **_):
         return Response.json(200, self.provider.list_terminals(id))
@@ -893,6 +907,7 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/sandboxes/{id}/terminals/{tid}/connect", "post", "Connect terminal with ticket", "Agent IDE G4"),
     ("/v1/sandboxes/{id}/terminals/{tid}/input", "post", "Write terminal input", "Agent IDE G4 REST PTY"),
     ("/v1/sandboxes/{id}/terminals/{tid}/output", "get", "Read terminal output", "Agent IDE G4 REST PTY"),
+    ("/v1/sandboxes/{id}/terminals/{tid}/resize", "post", "Resize terminal", "AB#405; PTY mode resizes the room's tty"),
     ("/v1/sandboxes/{id}/terminals/{tid}/ws", "get", "Terminal WebSocket PTY", "Agent IDE G4; Upgrade + ticket"),
     ("/v1/sandboxes/{id}/publish", "post", "Publish template from sandbox", "Agent IDE G6"),
     ("/v1/sandboxes/{id}/desktop", "get", "Desktop availability", "Agent IDE G5; gated"),
@@ -1129,13 +1144,16 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             # Consume ticket + mark connected (same gate as REST connect).
-            self.app.provider.connect_terminal(sandbox_id, terminal_id, ticket=ticket)
+            connected = self.app.provider.connect_terminal(sandbox_id, terminal_id, ticket=ticket)
         except SandboxOpError as exc:
             self._ws_fail(exc.http_status, exc.code, str(exc))
             return
         protocol = f"cathedral.ticket.{ticket}"
         self.wfile.write(ws.handshake_response(key, protocol=protocol))
         self.wfile.flush()
+        if connected.get("mode") == "pty":
+            self._ws_pty_pump(sandbox_id, terminal_id, ws)
+            return
         # Push any buffered output (connect banner).
         try:
             out = self.app.provider.terminal_read(sandbox_id, terminal_id)
@@ -1189,6 +1207,137 @@ class _Handler(BaseHTTPRequestHandler):
                     break
         except (TimeoutError, BrokenPipeError, ConnectionResetError, OSError):
             pass
+
+    def _ws_pty_pump(self, sandbox_id: str, terminal_id: str, ws) -> None:
+        """Full duplex bytes between a WebSocket and a PTY terminal (AB#405).
+
+        Server to client: binary frames of raw terminal output as it arrives,
+        then a close frame naming why the session ended. Client to server:
+        binary frames are raw input; text frames are JSON control,
+        {"type":"resize","cols":N,"rows":N} or {"type":"input","data":"..."}.
+        """
+        import select
+        import struct
+        import threading
+
+        send_lock = threading.Lock()
+        stop = threading.Event()
+        closed = {"sent": False}
+
+        def send(payload: bytes, opcode: int) -> bool:
+            with send_lock:
+                if closed["sent"]:
+                    return False
+                try:
+                    self.wfile.write(ws.encode_frame(payload, opcode=opcode))
+                    self.wfile.flush()
+                except OSError:
+                    closed["sent"] = True
+                    stop.set()
+                    return False
+                if opcode == ws.OP_CLOSE:
+                    closed["sent"] = True
+                return True
+
+        def close(code: int, reason: str) -> None:
+            send(struct.pack("!H", code) + reason.encode("ascii", "replace")[:120], ws.OP_CLOSE)
+            stop.set()
+
+        def pump_output() -> None:
+            while not stop.is_set():
+                try:
+                    out = self.app.provider.terminal_read_wait(sandbox_id, terminal_id, 0.5)
+                except SandboxOpError as exc:
+                    close(1000, exc.code)
+                    break
+                data = base64.b64decode(out.get("data_b64") or "") if "data_b64" in out else (out.get("data") or "").encode()
+                if data and not send(data, ws.OP_BINARY):
+                    break
+                if out.get("exited"):
+                    close(1000, "terminal_exited")
+                    break
+            # Wake the receive loop so the handler returns.
+            try:
+                self.connection.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+
+        # recv only runs after select says ready; this bounds a send to a
+        # client that stopped reading.
+        self.connection.settimeout(120.0)
+        sender = threading.Thread(target=pump_output, name="cathedral-pty-ws", daemon=True)
+        sender.start()
+        buf = bytearray()
+        last_heard = time.monotonic()
+        try:
+            while not stop.is_set():
+                # Blocking socket, select for idle: a socket timeout would also
+                # cut the sender's writes off mid-frame.
+                ready, _, _ = select.select([self.connection], [], [], 1.0)
+                if not ready:
+                    if time.monotonic() - last_heard > PTY_WS_IDLE_SECONDS:
+                        close(1000, "idle")
+                    continue
+                chunk = self.connection.recv(65536)
+                if not chunk:
+                    break
+                last_heard = time.monotonic()
+                buf.extend(chunk)
+                frames, buf = ws.decode_frames(buf)
+                if len(buf) > PTY_WS_MAX_FRAME:
+                    # What is left is one unfinished frame larger than any
+                    # single input write may be.
+                    close(1009, "terminal_input_too_large")
+                    break
+                for opcode, payload in frames:
+                    if opcode == ws.OP_CLOSE:
+                        close(1000, "client_close")
+                        break
+                    if opcode == ws.OP_PING:
+                        send(payload, ws.OP_PONG)
+                        continue
+                    if opcode == ws.OP_PONG:
+                        continue
+                    data: bytes | None = None
+                    if opcode == ws.OP_BINARY:
+                        data = payload
+                    elif opcode == ws.OP_TEXT:
+                        try:
+                            msg = json.loads(payload.decode("utf-8"))
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            msg = None
+                        if not isinstance(msg, dict):
+                            close(1003, "invalid_control_frame")
+                            break
+                        kind = msg.get("type")
+                        try:
+                            if kind == "resize":
+                                self.app.provider.terminal_resize(sandbox_id, terminal_id, msg.get("cols"), msg.get("rows"))
+                            elif kind == "input" and isinstance(msg.get("data"), str):
+                                data = msg["data"].encode("utf-8")
+                            else:
+                                close(1003, "invalid_control_frame")
+                                break
+                        except SandboxOpError as exc:
+                            if exc.http_status == 400:
+                                continue  # a bad size is the client's mistake, not the session's end
+                            close(1000, exc.code)
+                            break
+                    else:
+                        # Fragmented messages are not part of this protocol.
+                        close(1003, "unsupported_frame")
+                        break
+                    if data:
+                        try:
+                            self.app.provider.terminal_write(sandbox_id, terminal_id, data)
+                        except SandboxOpError as exc:
+                            close(1000, exc.code)
+                            break
+        except OSError:
+            pass
+        finally:
+            stop.set()
+            sender.join(timeout=2.0)
 
     def _ws_desktop(self, sandbox_id: str, ticket: str | None, key: str, ws, agent_rfb) -> None:
         import os as _os

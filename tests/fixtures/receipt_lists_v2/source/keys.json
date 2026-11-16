@@ -1,0 +1,4 @@
+{
+ "note": "test data: the private key is derived from a public label and signs nothing real",
+ "receipt_key_ed25519_b64": "KdL55bi0NFR22TuJRXjIdiHdbnZmYh3LwFsaq3mEDtU="
+}
