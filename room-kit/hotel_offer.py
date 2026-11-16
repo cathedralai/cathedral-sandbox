@@ -28,6 +28,7 @@ py-sr25519-bindings==0.2.2); the guest does not need it.
 
 Usage:
   hotel_offer.py --origin https://203.0.113.9:9443 --hotkey-file ~/.bittensor/wallets/w/hotkeys/h
+  hotel_offer.py --origin https://203.0.113.9:9443 --attestation-url https://10.200.0.2:18443 --hotkey-file h
   hotel_offer.py --attestation att.json --origin https://203.0.113.9:9443 --hotkey-file h \\
       --post https://api.example/v1/cathedral/snp/hotel-offers
   hotel_offer.py ... --withdraw     # take the hotel off the roster's offers
@@ -125,6 +126,25 @@ def check_origin(origin: str) -> str:
             or not address.is_global):
         raise OfferError("origin must be https://<public ip>:<port>, a public address, no path")
     return origin
+
+
+def check_fetch_url(url: str) -> str:
+    """Where to read the attestation from: https://<ip>:<port>, no path. Any address, private included.
+
+    On a miner using sealed/host-net.sh the host cannot reach its own public
+    address (the forward is PREROUTING only), so the fetch address is the guest's
+    (https://<guest ip>:<SEALED_MINER_TLS_PORT>) while the offer advertises the public origin.
+    """
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+        ipaddress.ip_address(parsed.hostname or "")
+    except ValueError:
+        raise OfferError("attestation URL must be https://<ip>:<port>") from None
+    if (url != url.strip() or not url.isascii() or parsed.scheme != "https" or parsed.username is not None
+            or parsed.password is not None or parsed.query or parsed.fragment or parsed.path or not port):
+        raise OfferError("attestation URL must be https://<ip>:<port>, no path")
+    return url
 
 
 def fetch_attestation(origin: str, timeout: float = 10.0):
@@ -239,15 +259,18 @@ def post(url: str, document: dict, timeout: float = 20.0) -> str:
             return f"HTTP {response.status} {response.read(65536).decode('utf-8', 'replace')}"
     except urllib.error.HTTPError as exc:
         # 422 carries the refusal reason (a short code), which is what the miner needs.
-        return f"HTTP {exc.code} {exc.read(65536).decode('utf-8', 'replace')}"
+        # It is raised, not returned, so a rejected offer exits non-zero for scripts.
+        raise OfferError(f"the API refused the offer: HTTP {exc.code} {exc.read(65536).decode('utf-8', 'replace')}") from None
     except OSError as exc:
         raise OfferError(f"cannot POST to {url}: {type(exc).__name__}") from None
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Sign and print or POST a cathedral_hotel_offer_v1.")
-    ap.add_argument("--origin", required=True, help="public hotel origin, https://<ip>:<port>; also fetched unless --attestation")
+    ap.add_argument("--origin", required=True, help="public hotel origin, https://<ip>:<port>; also fetched unless --attestation or --attestation-url")
     ap.add_argument("--attestation", help="JSON saved from GET /room/attestation (skips the fetch and the TLS key check)")
+    ap.add_argument("--attestation-url", help="fetch from this https://<ip>:<port> instead of --origin; on a host using "
+                    "sealed/host-net.sh use the guest address https://<guest ip>:<SEALED_MINER_TLS_PORT>")
     ap.add_argument("--hotkey-file", required=True)
     ap.add_argument("--network", default="finney")
     ap.add_argument("--netuid", type=int, default=94)
@@ -261,7 +284,7 @@ def main(argv=None) -> int:
             with open(a.attestation, "rb") as handle:
                 attestation, peer = json.loads(handle.read(ATTESTATION_MAX_BYTES + 1)), None
         else:
-            attestation, peer = fetch_attestation(origin)
+            attestation, peer = fetch_attestation(check_fetch_url(a.attestation_url) if a.attestation_url else origin)
         binding_sha256, machine, _ = check_attestation(attestation, peer_spki=peer)
         now = int(time.time())
         sequence = now if a.sequence is None else a.sequence
