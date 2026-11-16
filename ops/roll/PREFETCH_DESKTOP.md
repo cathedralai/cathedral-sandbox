@@ -15,7 +15,7 @@ makes every hotel pull all catalog images. Not done here.
 
 ## Pin
 
-Image: `ghcr.io/cathedralai/cathedral-desktop@sha256:e128515e1cf4c7648a50412832a1b5418ac002da4a2a5b118adf75d643840014`
+Image: `ghcr.io/cathedralai/cathedral-desktop@sha256:e128515e1cf4c7648a50412832a1b5418ac002da4a2b5b118adf75d643840014`
 
 It must equal Railway Polaris Cloud / production `CATHEDRAL_DESKTOP_IMAGE`
 and the digest on the live catalogue Desktop entry. Check before the step.
@@ -31,7 +31,7 @@ then update this file in the same PR that changes the pin.
    operator key.
 
        POST $BROKER/v1/images/prefetch
-       {"images": ["ghcr.io/cathedralai/cathedral-desktop@sha256:e128515e1cf4c7648a50412832a1b5418ac002da4a2a5b118adf75d643840014"]}
+       {"images": ["ghcr.io/cathedralai/cathedral-desktop@sha256:e128515e1cf4c7648a50412832a1b5418ac002da4a2b5b118adf75d643840014"]}
 
    Answer is 202 with a `prefetch_id`.
 3. Poll `GET $BROKER/v1/images/prefetch/<prefetch_id>` until the job is done.
