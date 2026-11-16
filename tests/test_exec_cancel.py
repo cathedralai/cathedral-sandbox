@@ -422,6 +422,30 @@ def test_a_cancel_that_beats_the_pid_file_waits_for_it_instead_of_answering_unsu
         provider.close()
 
 
+def test_an_exec_that_ends_during_the_pid_file_wait_is_finished_before_cancel_not_unsupported(fake, tmp_path, monkeypatch):
+    release = tmp_path / "release"
+    fake.set(timeout_form="busybox", exec_rules=[{"contains": "hold-marker", "wait_for": str(release), "exit": 0}])
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+
+        def helper_never_appears(guest, entry, token, sig, pgid, **kw):
+            release.write_text("x")  # the command ends on its own while the cancel looks for the pid file
+            deadline = time.time() + 5
+            while not entry.done.is_set() and time.time() < deadline:
+                time.sleep(0.02)
+            return exec_cancel.NO_PID_FILE, ""
+
+        monkeypatch.setattr(provider, "_signal_exec_group", helper_never_appears)
+        t, out = _start(provider, sid, ExecRequest(cmd=["sh", "-c", "hold-marker"], timeout_seconds=300, spill_token=TOKEN))
+        _wait_running(TOKEN, sid)
+        assert provider.cancel_exec(sid, TOKEN) == "finished_before_cancel"
+        t.join(5)
+        assert out[0].cancelled is False
+    finally:
+        provider.close()
+
+
 def test_cancel_of_an_exec_that_ended_on_its_own_says_so(fake):
     fake.set(timeout_form="gnu", exec_rules=[{"contains": "quick-marker", "exit": 0}])
     provider = DockerGuestProvider()

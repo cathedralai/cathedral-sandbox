@@ -2321,6 +2321,11 @@ class DockerGuestProvider:
         while rc == exec_cancel.NO_PID_FILE and time.monotonic() < pid_file_until and not entry.done.is_set():
             time.sleep(exec_cancel.POLL_SECONDS)
             rc, out = self._signal_exec_group(guest, entry, token, "TERM", None)
+        if rc in (exec_cancel.NO_PID_FILE, exec_cancel.REFUSED) and entry.done.is_set():
+            # The exec ended on its own while the first signal was being tried: say so, never unsupported or refused.
+            held = registry.result(sandbox_id, token)
+            if held is not None:
+                return "already_stopped" if held == "cancelled" else "finished_before_cancel"
         if rc == exec_cancel.NO_PID_FILE:
             return "unsupported"
         # A guard refusal on the first signal means nothing was sent: not progress.
