@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Placement policy (AB#336): reserved customers stay on Cathedral's own
@@ -35,6 +36,7 @@ func graduate(tc *testChain, id string) {
 		}
 		labels["graduated"] = "true"
 		h.cfg.Labels = labels
+		h.graduate(time.Now(), false) // a miner on probation ignores the label (probation.go)
 	})
 }
 
@@ -143,7 +145,9 @@ func TestReservedGuestWithOwnFleetDownGetsNoMinerHotel(t *testing.T) {
 // full or down.
 func TestSharedPoolUsesGraduatedMinersThenOwnFleet(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinGradMiner(t, tc, "m1", 3, map[string]string{"graduated": "true"}, 1)
+	setProbationConfig(t, tc, 100, 0) // probation on: a miner joins without the graduated label (probation.go)
+	joinGradMiner(t, tc, "m1", 3, nil, 1)
+	graduate(tc, "m1")
 	joinGradMiner(t, tc, "m2", 50, nil, 2) // probation: no graduated label
 	guestPatch(t, tc, map[string]any{"policy": sharedPoolPolicy})
 
