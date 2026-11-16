@@ -47,7 +47,8 @@ def front(tmp_path, monkeypatch):
     api = ThreadingHTTPServer(("127.0.0.1", 0), Api)
     threading.Thread(target=api.serve_forever, daemon=True).start()
     ledger = rr.Ledger("room-a", str(tmp_path))
-    server = rr.Server(("127.0.0.1", 0), ledger, api.server_address[1], 1, KEY, "/nonexistent.sock")
+    # This API only answers POST; pool restart recovery has its own suite.
+    server = rr.Server(("127.0.0.1", 0), ledger, api.server_address[1], 1, KEY, "/nonexistent.sock", pool_scan=False)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield server.server_address[1], seen, mode, ledger
     server.shutdown()
