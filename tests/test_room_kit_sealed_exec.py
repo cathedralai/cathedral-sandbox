@@ -122,7 +122,7 @@ class Api:
 
 
 def _front(ledger, api_port: int):
-    server = rr.Server(("127.0.0.1", 0), ledger, api_port, 1, KEY, "/nonexistent.sock")
+    server = rr.Server(("127.0.0.1", 0), ledger, api_port, 1, KEY, "/nonexistent.sock", pool_scan=False)
     Thread(target=server.serve_forever, daemon=True).start()
     return server.server_address[1]
 
@@ -282,6 +282,16 @@ def test_a_sealed_exec_runs_in_the_room_and_only_the_client_reads_the_answer(gue
     key = Ed25519PublicKey.from_public_bytes(base64.b64decode(ledger.binding["receipt_key_ed25519_b64"]))
     key.verify(base64.b64decode(receipt["signature_b64"]), canonical(st))
     assert receipt["receipt_sha256"] == hashlib.sha256(canonical(st)).hexdigest()
+
+
+def test_sealed_exec_receipt_target_drops_ignored_semicolon_params(guest) -> None:
+    _ledger, _api, port, client = guest
+    doc, _answer_key = client.seal()
+    status, headers, reply = _request(port, "POST", f"/v1/sandboxes/{ROOM}/sealed-exec;alias", canonical(doc))
+    assert status == 200, reply
+    statement = _receipt(headers)["statement"]
+    assert statement["sandbox_id"] == ROOM
+    assert statement["target"] == f"POST /v1/sandboxes/{ROOM}/sealed-exec"
 
 
 def test_only_the_answer_key_opens_the_answer(guest) -> None:

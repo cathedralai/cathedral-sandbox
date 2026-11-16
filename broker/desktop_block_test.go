@@ -108,3 +108,30 @@ func TestRoomDesktopRoutesAreRefusedOnMinerHotels(t *testing.T) {
 		t.Errorf("exec on miner: %d %v", code, doc)
 	}
 }
+
+// AB#121 after AB#405: the broker now pumps a terminal WebSocket, but a real
+// handshake on /desktop/ws, even on a terminal-allowlisted hotel, still gets
+// 403 desktop_disabled and never reaches the hotel, while the terminal
+// handshake on the same room still opens.
+func TestRoomDesktopWebSocketHandshakeIsRefused(t *testing.T) {
+	hotel := &termWSHotel{serve: echoBytes}
+	_, room, srv := termWSChain(t, hotel)
+
+	_, _, resp := termWSDial(t, srv, "/v1/sandboxes/"+room+"/desktop/ws", nil, "")
+	doc := termErrBody(t, resp)
+	if resp.StatusCode != http.StatusForbidden || errCode(doc) != "desktop_disabled" {
+		t.Fatalf("desktop ws handshake: %d %v, want 403 desktop_disabled", resp.StatusCode, doc)
+	}
+	if got := hotel.headers(); len(got) != 0 {
+		t.Fatalf("hotel received %d handshakes for the desktop route, want 0", len(got))
+	}
+
+	_, _, resp = termWSDial(t, srv, "/v1/sandboxes/"+room+"/terminals/t1/ws", nil, "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("terminal ws handshake: %d, want 101", resp.StatusCode)
+	}
+	if got := hotel.headers(); len(got) != 1 {
+		t.Fatalf("hotel received %d handshakes, want 1 (the terminal)", len(got))
+	}
+}

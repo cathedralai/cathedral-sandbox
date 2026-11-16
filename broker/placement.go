@@ -13,10 +13,25 @@
 //     slot moves to another eligible hotel that has a free room and less
 //     than half the expected wait. Otherwise it keeps waiting. It may move
 //     back to a hotel it left earlier.
+//
+// Room caps on miner hotels (AB#335). Both are off unless configured:
+//   - miner_max_rooms_per_hotkey: the rooms (in use, creating or queued) of
+//     one miner hotkey across all its hotels stay at or under the cap.
+//   - miner_pool_share s (0 < s < 1): the rooms on miner hotels in the shared
+//     pool (not reserved, not leaving) stay at or under s/(1-s) times the
+//     slots of our own sealed pool hotels. With the pool full, miners then
+//     hold at most share s of its rooms. The cap follows our fleet's slots,
+//     not its load, so miners still take their share on an idle pool.
+//
+// The caps hold when a create is placed: pick reads the counts and the
+// create joins the queue in one b.mu hold. A later change to our own slots
+// (a reserve, a drain of max_slots) can leave miners over the share; their
+// rooms stay, and no new miner room is placed until they are under it.
 package main
 
 import (
 	"context"
+	"math"
 	"time"
 )
 
@@ -50,6 +65,92 @@ func (b *broker) freeFor(h *hotel) int {
 		return 0
 	}
 	return h.slots - h.used()
+}
+
+// minerBudget is how many more rooms the miner caps allow, read at one
+// moment under b.mu. A nil *minerBudget is no cap.
+type minerBudget struct {
+	poolLeft   int            // rooms miner hotels in the shared pool may still take; -1: no share cap
+	hotkeyLeft map[string]int // rooms each hotkey may still take; nil: no per-hotkey cap
+	// For the operator readback.
+	ownPoolSlots, poolCap, poolMinerRooms int
+}
+
+func (b *broker) minerCapsOn() bool {
+	return b.cfg.MinerMaxRoomsPerHotkey > 0 || b.cfg.MinerPoolShare > 0
+}
+
+// inMinerPool reports whether h is in the shared pool the share counts.
+func inMinerPool(h *hotel) bool { return h.reservedFor() == "" && !h.leaving }
+
+// minerBudgetNow reads the counts the miner caps need, or nil when no cap is
+// configured. It walks the hotel list once. Caller holds b.mu.
+func (b *broker) minerBudgetNow() *minerBudget {
+	if !b.minerCapsOn() {
+		return nil
+	}
+	mb := &minerBudget{poolLeft: -1}
+	if b.cfg.MinerMaxRoomsPerHotkey > 0 {
+		mb.hotkeyLeft = map[string]int{}
+	}
+	for _, h := range b.hotelList() {
+		k := h.cfg.MinerHotkey
+		switch {
+		case k != "":
+			if mb.hotkeyLeft != nil {
+				if _, ok := mb.hotkeyLeft[k]; !ok {
+					mb.hotkeyLeft[k] = b.cfg.MinerMaxRoomsPerHotkey
+				}
+				mb.hotkeyLeft[k] -= h.used()
+			}
+			if inMinerPool(h) {
+				mb.poolMinerRooms += h.used()
+			}
+		case inMinerPool(h) && hotelClass(h) == classSealed:
+			mb.ownPoolSlots += h.slots
+		}
+	}
+	for k, v := range mb.hotkeyLeft {
+		if v < 0 {
+			mb.hotkeyLeft[k] = 0
+		}
+	}
+	if s := b.cfg.MinerPoolShare; s > 0 {
+		// m <= s * (own + m)  <=>  m <= s/(1-s) * own. The small term keeps
+		// a share like 0.2 of 4 slots from rounding 1.0 down to 0.
+		mb.poolCap = int(math.Floor(s/(1-s)*float64(mb.ownPoolSlots) + 1e-9))
+		mb.poolLeft = max(mb.poolCap-mb.poolMinerRooms, 0)
+	}
+	return mb
+}
+
+// limit is how many more rooms the caps allow on h, or -1 for no cap.
+func (mb *minerBudget) limit(h *hotel) int {
+	if mb == nil || h.cfg.MinerHotkey == "" {
+		return -1
+	}
+	l := -1
+	if mb.hotkeyLeft != nil {
+		l = mb.hotkeyLeft[h.cfg.MinerHotkey]
+	}
+	if mb.poolLeft >= 0 && inMinerPool(h) && (l < 0 || mb.poolLeft < l) {
+		l = mb.poolLeft
+	}
+	return l
+}
+
+// consume takes n rooms on h from the budget, so a sum over hotels (the
+// catalog's class totals) does not count one cap more than once.
+func (mb *minerBudget) consume(h *hotel, n int) {
+	if mb == nil || h.cfg.MinerHotkey == "" || n <= 0 {
+		return
+	}
+	if mb.hotkeyLeft != nil {
+		mb.hotkeyLeft[h.cfg.MinerHotkey] = max(mb.hotkeyLeft[h.cfg.MinerHotkey]-n, 0)
+	}
+	if mb.poolLeft >= 0 && inMinerPool(h) {
+		mb.poolLeft = max(mb.poolLeft-n, 0)
+	}
 }
 
 func (b *broker) maxQueueWait() time.Duration {
@@ -147,12 +248,18 @@ func (b *broker) waitSlot(ctx context.Context, g *guestState, h *hotel, pl place
 			if pl.policy != nil && pl.tier == "" && pl.policy.tier(h) == tierPrefer {
 				mpl.tier = tierPrefer
 			}
-			if alt := b.pick(map[*hotel]bool{h: true}, mpl); alt != nil && alt.expectedWait(1) < h.expectedWait(0)/2 {
-				h.queued--
+			// The create is counted on h while pick reads the miner caps;
+			// take it off h first, so a move between two miner hotels is
+			// not refused for a room the create already holds.
+			waitHere := h.expectedWait(0)
+			h.queued--
+			if alt := b.pick(map[*hotel]bool{h: true}, mpl); alt != nil && alt.expectedWait(1) < waitHere/2 {
 				alt.queued++
 				h.moved++
 				tried[alt] = true
 				h = alt
+			} else {
+				h.queued++
 			}
 			b.mu.Unlock()
 			timer = time.After(limit)
