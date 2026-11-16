@@ -284,7 +284,8 @@ def _sealed_front(tmp_path, monkeypatch, api_answer: dict):
     monkeypatch.setattr(rr, "read", lambda path, default="": "boot-1" if "boot_id" in path else default)
     monkeypatch.setattr(rr.Server, "health_loop", lambda self: None)
     ledger = rr.Ledger("sealed-1", str(tmp_path))
-    front = rr.Server(("127.0.0.1", 0), ledger, api.server_address[1], 1, b"k" * 32, "/nonexistent.sock")
+    # This fake API has no list route; the receipt test does not exercise pool recovery.
+    front = rr.Server(("127.0.0.1", 0), ledger, api.server_address[1], 1, b"k" * 32, "/nonexistent.sock", pool_scan=False)
     monkeypatch.setattr(front, "image_digest", lambda ref: None)
     threading.Thread(target=front.serve_forever, daemon=True).start()
     return front, api, ledger
