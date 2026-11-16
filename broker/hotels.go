@@ -275,7 +275,8 @@ func (b *broker) isMinerEnroller(r *http.Request) bool {
 }
 
 // isOperatorReader is true for the read-only operator key. ServeHTTP checks
-// it on one route only (GET /v1/broker/capacity); every other route ignores it.
+// it on two read routes only (GET /v1/broker/capacity and GET
+// /v1/broker/miner-exits); every other route ignores it.
 func (b *broker) isOperatorReader(r *http.Request) bool {
 	want := strings.ToLower(b.cfg.OperatorReadKeySHA256)
 	a := r.Header.Get("Authorization")
