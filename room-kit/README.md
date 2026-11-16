@@ -437,6 +437,31 @@ from `versions.lock`. It fails at the end unless the API answers
 `GET /v1/status` with 200 for its own key; "done" is never printed over a
 hotel that answers nobody.
 
+## Miner hotel offer
+
+A miner hotel (`install.sh --sealed` with `SEALED_MINER=1`, see `sealed/README.md`) joins only after the miner signs an
+offer with the hotkey. `hotel_offer.py` runs on the miner host (not in the guest), reads the guest's own
+`GET /room/attestation`, and builds `cathedral_hotel_offer_v1`:
+
+```
+pip install py-sr25519-bindings==0.2.2 cryptography
+python3 hotel_offer.py --origin https://<public ip>:<SEALED_MINER_PUBLIC_PORT> --hotkey-file <hotkey>
+python3 hotel_offer.py --origin ... --hotkey-file <hotkey> --post https://<api>/v1/cathedral/snp/hotel-offers
+```
+
+- `--hotkey-file` is a plaintext Bittensor hotkey file (`secretSeed`) or a file holding the 32-byte seed as hex,
+  mode 600. An encrypted keyfile is refused.
+- Before signing it checks that `binding_sha256` is the digest of the binding, that the SNP report commits to the
+  binding, that the binding's chip is the report's chip, and that the TLS key that answered is the key in the
+  binding. `machine_id` comes from the report's CPU generation and CHIP_ID, as the roster computes it.
+- `--sequence` must grow with every offer for the machine (default: unix time). `--withdraw` withdraws the offer.
+  `--network` and `--netuid` default to `finney` and 94. An offer is good for the age window the API sets, so
+  sign a new one after each guest boot (a new boot is a new binding).
+- Without `--post` it prints the offer. A 422 answer carries the API's reason code. The offer grants nothing: the
+  API fetches the attestation itself and checks the TLS key, the AMD chain, the published measurement and the
+  roster machine.
+- Not covered here: the signed update channel for a miner hotel, and a miner-side view of offer status.
+
 ## What the kit installs
 
 | Item | Location |
