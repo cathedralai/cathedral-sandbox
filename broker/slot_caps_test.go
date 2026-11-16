@@ -44,6 +44,7 @@ func capsBroker(t *testing.T, own int, miners []string, slots int) *broker {
 			h.runtime, h.cfg.Sealed, h.cfg.MinerHotkey = true, true, k
 			h.cfg.Labels = map[string]string{"sealed": "true", "miner": "true", "miner_hotkey": k}
 			h.adm.attestedAt = time.Now()
+			h.guestPin.Store(&[32]byte{1}) // a miner is admitted only with a verified guest TLS pin (AB#378)
 		})
 	}
 	return b
