@@ -502,8 +502,15 @@ for writes, freezes and thaws already in flight (503 snapshot_writes_pending).
 A running room is then paused, /work is tarred (outside the lock, stopped at
 the byte cap and at a 900 s deadline), the room is committed to
 cathedral-snap-<snap>:latest, and the room is unpaused on every exit path. A
-room that was already paused stays paused. An unpause that fails leaves the
-room reported "frozen" and owed: the sweep retries it. The hash of the tar is
+room that was already paused stays paused. The engine, not the record, decides
+whether to pause: the capture reads the container first. The customer's freeze
+and thaw set the desired run state; a capture never changes it. After a pause or
+unpause whose result is not certain (a timeout, an error) the room is marked
+"reconcile needed": the sweep reads the container and pauses or unpauses it to
+match the desired state, through the same per-room admission as freeze and thaw
+(never during a capture, and a capture waits for it, or reconciles the room
+first inside its own admission). A marked room reports what the engine last said.
+The hash of the tar is
 taken after the unpause. The record (id, source room, tar digest, size, image
 id) is written once, in one step with the guest's image map. A capture with no
 guest or no committed image is an error (409 snapshot_image_missing).
