@@ -274,8 +274,9 @@ otherwise pass. Lease expiry is not checked at restore time.
 
 Not in this phase: the pinned restic and the volume agent, the guest route by
 which the agent gets a commit signed by the receipt key (and who may call it),
-volume-key-install through key release (AB#392), per-mount storage sub-tokens
-(prefix, IP, expiry, no delete) on Hippius (AB#394), the control plane's
+volume-key-install through key release (AB#392), the storage gateway that calls
+the sub-token check (cathedral/volume_subtoken.py: prefix, IP, expiry, no delete;
+the token and its check are built, enforcement on Hippius (AB#394) is not), the control plane's
 persistent registry, and the live proof: a workspace written on one sealed
 hotel restores on another host.
 
