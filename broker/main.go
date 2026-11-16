@@ -87,6 +87,9 @@ type hotelConfig struct {
 	// Commitment: the slots and daily hours a miner hotel declares at join
 	// (commitment.go). Nil: none declared.
 	Commitment *capacityCommitment `json:"commitment,omitempty"`
+	// AlertChatID: the miner operator's Telegram chat for the first missed
+	// heartbeat of this hotel (alerts.go). Empty: a log line only.
+	AlertChatID string `json:"alert_chat_id,omitempty"`
 }
 
 type guestConfig struct {
@@ -122,6 +125,12 @@ type config struct {
 	// catalog images on it, and prefer hotels that hold a create's image.
 	// The scratch disk of a sealed hotel is wiped every boot (AB#532).
 	PrewarmCatalog bool `json:"prewarm_catalog"`
+	// PrewarmCatalogHotels narrows prewarm_catalog to these hotel ids, for a
+	// one-hotel canary. Empty: every hotel. Each id must be a hotel in hotels
+	// (the config file), and the list needs prewarm_catalog on. Unlike
+	// terminal_hotels, an id that is not known yet is refused: a typo would
+	// leave the canary cold and its measurement would say nothing.
+	PrewarmCatalogHotels []string `json:"prewarm_catalog_hotels,omitempty"`
 	// OperatorKeySHA256 is the SHA-256 of the operator key. It allows hotel
 	// join, change and leave at runtime (hotels.go). Empty: no operator routes.
 	OperatorKeySHA256 string `json:"operator_key_sha256"`
@@ -164,6 +173,9 @@ type config struct {
 	// Room terminal routes reach only these hotels. Empty: no hotel. A miner
 	// hotel never gets them, listed or not (terminalsRefused).
 	TerminalHotels []string `json:"terminal_hotels,omitempty"`
+	// Alerts: where the missed heartbeat and customer drop alerts go
+	// (alerts.go). Absent: log lines only.
+	Alerts *alertsConfig `json:"alerts,omitempty"`
 }
 
 func (b *broker) maxExec() int {
@@ -258,6 +270,7 @@ type hotel struct {
 	baselineTry    time.Time
 	leaving        bool               // a leave passed its empty check; no new rooms (hotels.go)
 	stop           context.CancelFunc // stops the sync loop when the hotel leaves
+	alerts         hotelAlerts        // missed heartbeat and drop alerts sent (alerts.go)
 }
 
 type guestState struct {
@@ -274,6 +287,7 @@ type guestState struct {
 
 type broker struct {
 	cfg              config
+	terminalWSIdle   time.Duration // idle close of a terminal socket; 0: defaultTerminalWSIdle (terminal_ws.go)
 	mu               sync.Mutex
 	hset             atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
 	hotelsMu         sync.Mutex               // serialises joins and leaves
@@ -288,6 +302,7 @@ type broker struct {
 	nexec            *nativeExecs // background execs on the native route (nativeexec.go)
 	prefetch         prefetchJobs
 	started          time.Time
+	alerts           *alerter // missed heartbeat and drop alerts (alerts.go)
 	// requireAttestationNoted logs the require_attestation deprecation once
 	// per broker, from the config file or a join (admission.go).
 	requireAttestationNoted sync.Once
@@ -395,7 +410,11 @@ func loadBroker(path string) (*broker, error) {
 	default:
 		return nil, fmt.Errorf(`config: sealed_admission %q: the top-level value can only be "on" (or absent)`, c.SealedAdmission)
 	}
-	b := &broker{cfg: c, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), nexec: newNativeExecs(), started: time.Now()}
+	alerts, err := newAlerter(c.Alerts)
+	if err != nil {
+		return nil, err
+	}
+	b := &broker{cfg: c, alerts: alerts, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), nexec: newNativeExecs(), started: time.Now()}
 	var optedIn []string // require_attestation hotels, for one deprecation line
 	for _, hc := range c.Hotels {
 		if err := validateSealedAdmission(hc); err != nil {
@@ -419,6 +438,9 @@ func loadBroker(path string) (*broker, error) {
 		if strings.Contains(hc.ID, ".") || hc.ID == "" {
 			return nil, fmt.Errorf("hotel id %q: must be non-empty and have no dot", hc.ID)
 		}
+		if !validAlertChat(hc.AlertChatID) {
+			return nil, fmt.Errorf("config: hotel %q: alert_chat_id must be a Telegram chat id (digits) or @channel", hc.ID)
+		}
 		k, err := os.ReadFile(hc.KeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("hotel %s key: %w", hc.ID, err)
@@ -429,6 +451,14 @@ func loadBroker(path string) (*broker, error) {
 		h := newHotel(hc, strings.TrimSpace(string(k)))
 		if err := b.addHotel(h); err != nil {
 			return nil, err
+		}
+	}
+	if len(c.PrewarmCatalogHotels) > 0 && !c.PrewarmCatalog {
+		return nil, errors.New("config: prewarm_catalog_hotels needs \"prewarm_catalog\": true (the list only narrows it)")
+	}
+	for _, id := range c.PrewarmCatalogHotels {
+		if b.hotelByID(id) == nil {
+			return nil, fmt.Errorf("config: prewarm_catalog_hotels entry %q is not a hotel in hotels", id)
 		}
 	}
 	if len(optedIn) > 0 {
@@ -1296,6 +1326,12 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			return
 		}
 	}
+	// A background exec's result outlives its room (AB#733): read and stop it
+	// by the guest and room stored on the exec, not the live room list.
+	if strings.HasPrefix(tail, "execs/") && (r.Method == "GET" || r.Method == "DELETE") && !strings.Contains(strings.TrimPrefix(tail, "execs/"), "/") {
+		b.nativeExecPoll(w, r, g, bid, strings.TrimPrefix(tail, "execs/"))
+		return
+	}
 	hotelID, hid, ok := strings.Cut(bid, ".")
 	h := b.hotelByID(hotelID)
 	if !ok || h == nil {
@@ -1308,6 +1344,13 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	b.mu.Unlock()
 	if !owned {
 		writeErr(w, 404, "sandbox_not_found", "no sandbox "+bid)
+		return
+	}
+	// A terminal WebSocket goes to the hotel as a raw byte pump (terminal_ws.go),
+	// after the allowlist and ownership checks above. A plain GET on the same
+	// path takes the normal route below.
+	if isWebSocketUpgrade(r) && terminalWSTail(tail) {
+		b.proxyTerminalWS(w, r, h, hid, bid, tail)
 		return
 	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 256<<20+1))
@@ -1833,6 +1876,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		h.lastErr = err.Error()
 	}
 	h.listOK = lerr == nil
+	hadHealth := !h.lastOK.IsZero()
 	if herr == nil {
 		h.lastOK, h.healthMs = now, healthMs
 	}
@@ -1861,7 +1905,8 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			log.Printf("hotel %s down: %s", h.cfg.ID, h.lastErr)
 		}
 	}
-	if cameUp && b.cfg.PrewarmCatalog {
+	b.alertHealth(h, herr, hadHealth)
+	if cameUp && b.prewarms(h) {
 		go b.prewarmHotel(h)
 	}
 	offered := h.slots // health late: the slots placement still uses
@@ -2295,6 +2340,25 @@ func (c *countingWriter) Flush() {
 	}
 }
 
+// Unwrap lets http.ResponseController reach the server's writer, so the
+// terminal WebSocket can hijack the connection (terminal_ws.go).
+func (c *countingWriter) Unwrap() http.ResponseWriter { return c.ResponseWriter }
+
+// handler is the broker as served: ServeHTTP plus the 429 counter.
+func (b *broker) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cw := &countingWriter{ResponseWriter: w, status: 200}
+		b.ServeHTTP(cw, r)
+		if cw.status == 429 && r.URL.Path == "/v1/sandboxes" && r.Method == "POST" {
+			if g := b.guestFromKey(r); g != nil {
+				b.mu.Lock()
+				g.rejected++
+				b.mu.Unlock()
+			}
+		}
+	})
+}
+
 func main() {
 	cfgPath := flag.String("config", "/etc/thin-broker/config.json", "private config file")
 	printDigest := flag.Bool("print-catalog-digest", false, "print the compiled-in catalog digest and exit; reads no config (AB#546 swap check)")
@@ -2320,26 +2384,18 @@ func main() {
 	if err := b.loadRuntimeHotels(); err != nil {
 		log.Printf("runtime hotels not loaded: %v", err)
 	}
-	b.loadCaps() // after the runtime hotels, or their probe results are dropped
+	b.loadCaps()          // after the runtime hotels, or their probe results are dropped
+	b.resumeNativeExecs() // after every hotel is known: re-attach execs that ran across the restart (AB#756)
 	saved := make(chan struct{})
 	go func() {
 		b.saveLoop(ctx)
 		close(saved)
 	}()
+	go b.alerts.run(ctx)
 	for _, h := range b.hotelList() {
 		b.startSync(ctx, h)
 	}
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cw := &countingWriter{ResponseWriter: w, status: 200}
-		b.ServeHTTP(cw, r)
-		if cw.status == 429 && r.URL.Path == "/v1/sandboxes" && r.Method == "POST" {
-			if g := b.guestFromKey(r); g != nil {
-				b.mu.Lock()
-				g.rejected++
-				b.mu.Unlock()
-			}
-		}
-	})
+	handler := b.handler()
 	// No WriteTimeout: an exec may run for hours. IdleTimeout closes kept-alive
 	// connections that send nothing, so they cannot pile up to the fd limit.
 	srv := &http.Server{Addr: b.cfg.Listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
@@ -2351,6 +2407,7 @@ func main() {
 	go func() {
 		sig := <-stop
 		log.Printf("%s: stopping, saving client state", sig)
+		b.stopNativeResume() // re-attach loops end now; the next broker picks them up
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
