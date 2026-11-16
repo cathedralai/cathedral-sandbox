@@ -345,3 +345,30 @@ def test_entrypoint_keeps_a_stamp_the_room_wrote_itself(fake, guest) -> None:
     own = "2025-11-13T02:13:19.000000000Z INFO started\n"  # earlier than docker's stamp
     fake.add_log(cid, "stdout", own, T0)
     assert guest.logs(sid, entrypoint_cursor="")["entrypoint"]["stdout"] == own
+
+
+def test_entrypoint_a_lagging_stream_does_not_cut_the_other_streams_line(fake, guest, monkeypatch) -> None:
+    import cathedral.sandbox_guest as sandbox_guest
+
+    # The read starts at the earlier stream's place, so the stream ahead reads
+    # its old lines again and its cap can land inside an ordinary new line.
+    monkeypatch.setattr(sandbox_guest, "ENTRYPOINT_LOG_PAGE", 200)
+    sid = _room(guest)
+    cid = _cid(guest, sid)
+    fake.add_log(cid, "stdout", "started\n", T0)
+    expected = ""
+    for i in range(20):
+        line = f"err line {i:03d} padding\n"
+        expected += line
+        fake.add_log(cid, "stderr", line, T0 + 10 + i)
+
+    cursor, out, err = "", "", ""
+    for _ in range(60):
+        page = guest.logs(sid, entrypoint_cursor=cursor)["entrypoint"]
+        assert page["truncated"] is False
+        out += page["stdout"]
+        err += page["stderr"]
+        cursor = page["next_cursor"]
+        if not page["more"]:
+            break
+    assert out == "started\n" and err == expected

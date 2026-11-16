@@ -1385,7 +1385,7 @@ def _docker_log_lines(
 
 
 def _entrypoint_stream_page(
-    text: str, cut: bool, hold_partial: bool, since: int, seen: int
+    text: str, cut: bool, hold_partial: bool, since: int, seen: int, read_since: int
 ) -> tuple[str, tuple[int, int], bool, bool]:
     """(new text, next (ns, lines at ns), truncated, idle) of one stream after its cursor.
 
@@ -1405,9 +1405,12 @@ def _entrypoint_stream_page(
         last = kept[-1][0]
         count = sum(1 for ns, _ in kept if ns == last) + (seen if last == since else 0)
         return "".join(line for _, line in kept), (last, count), False, False
-    if cut and held is not None and held[0] >= since:
-        # The stream's next line is longer than a read. Its parts share one time,
-        # so --since cannot start inside it: return what was read and move past it.
+    if cut and held is not None and held[0] >= since and read_since == since:
+        # The read started at this stream's place and its first new line is
+        # longer than a read. Its parts share one time, so --since cannot start
+        # inside it: return what was read and move past it. A read that started
+        # earlier (the other stream is behind) spent the cap on lines already
+        # returned, so the line waits for a read from this stream's place.
         return held[1], (held[0] + 1, 0), True, False
     return "", (since, seen), False, not cut and held is None
 
@@ -1427,8 +1430,13 @@ def entrypoint_log_page(
     returned: ``--since`` is inclusive, so those come back and are dropped here.
     The read itself starts at the earlier of the two times.
     """
-    out, out_next, out_cut, out_idle = _entrypoint_stream_page(stdout, cut[0], running, cursor[0], cursor[1])
-    err, err_next, err_cut, err_idle = _entrypoint_stream_page(stderr, cut[1], running, cursor[2], cursor[3])
+    read_since = min(cursor[0], cursor[2])
+    out, out_next, out_cut, out_idle = _entrypoint_stream_page(
+        stdout, cut[0], running, cursor[0], cursor[1], read_since
+    )
+    err, err_next, err_cut, err_idle = _entrypoint_stream_page(
+        stderr, cut[1], running, cursor[2], cursor[3], read_since
+    )
     # The read starts at the earlier stream's place. A stream with nothing new
     # moves up to the other one's, so a quiet stream does not make every read
     # start over from its last line.
