@@ -49,7 +49,7 @@ func execChain(t *testing.T, dir string) (*testChain, func()) {
 		})
 	})
 	// Last broker's background execs end and save before TempDir cleanup.
-	t.Cleanup(func() { tc.b.drainNativeExecs(5 * time.Second) })
+	t.Cleanup(func() { tc.b.stopNativeResume(); tc.b.drainNativeExecs(5 * time.Second) })
 	t.Cleanup(release) // runs before the hotel servers close, which wait for held calls
 	return tc, release
 }
@@ -187,7 +187,9 @@ func TestNativeBackgroundExecRunningAtRestartIsLostWithReason(t *testing.T) {
 	eid := startBG(t, tc, "key1", bid, "job")
 	old := tc.b
 	tc.restart(t)
-	status, _, doc := tc.rawCall(t, "key1", "GET", "/v1/sandboxes/"+bid+"/execs/"+eid, nil)
+	// The hotel here has no re-attach route (an old front): 404 route_not_found
+	// ends the re-attach with today's reason. The wait covers the async read.
+	status, _, doc := tc.rawCall(t, "key1", "GET", "/v1/sandboxes/"+bid+"/execs/"+eid+"?wait=10", nil)
 	if status != 200 || doc["state"] != "lost" || doc["reason"] != "broker_restarted" {
 		t.Fatalf("after restart: %d %v", status, doc)
 	}

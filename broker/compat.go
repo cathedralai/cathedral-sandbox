@@ -176,12 +176,25 @@ func (b *broker) hotelExec(ctx context.Context, rm *room, body map[string]any, t
 
 // hotelExecH is hotelExec with the hotel's response headers (the signed receipt).
 func (b *broker) hotelExecH(ctx context.Context, rm *room, body map[string]any, timeout int) (int, http.Header, map[string]any, error) {
+	return b.hotelExecKept(ctx, rm, body, timeout, nil)
+}
+
+// clampExecTimeout is the time limit the hotel exec runs under.
+func (b *broker) clampExecTimeout(timeout int) int {
 	if max := b.maxExec(); timeout <= 0 || timeout > max {
-		timeout = max
+		return max
 	}
+	return timeout
+}
+
+// hotelExecKept is hotelExecH with extra request headers: the native exec path
+// sends its exec handle, so the receipts front keeps the answer for a broker
+// that restarts while the command runs (AB#756).
+func (b *broker) hotelExecKept(ctx context.Context, rm *room, body map[string]any, timeout int, extra http.Header) (int, http.Header, map[string]any, error) {
+	timeout = b.clampExecTimeout(timeout)
 	body["timeout_seconds"] = timeout
 	raw, _ := json.Marshal(body)
-	status, hdr, out, err := rm.h.do(ctx, "POST", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/exec", nil, raw, time.Duration(timeout+60)*time.Second)
+	status, hdr, out, err := rm.h.doHeaders(ctx, rm.h.cfg.API, "POST", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/exec", nil, raw, time.Duration(timeout+60)*time.Second, extra)
 	if err != nil {
 		return 0, nil, nil, err
 	}

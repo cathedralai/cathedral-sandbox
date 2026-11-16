@@ -467,6 +467,7 @@ func (tc *testChain) start(t *testing.T) {
 	for _, h := range b.hotelList() {
 		h.ok, h.slots = true, 100
 	}
+	b.resumeNativeExecs()
 	tc.b = b
 	tc.srv = httptest.NewServer(b)
 	t.Cleanup(tc.srv.Close)

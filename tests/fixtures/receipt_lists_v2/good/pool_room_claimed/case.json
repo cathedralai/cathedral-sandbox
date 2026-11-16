@@ -15,7 +15,7 @@
   "exit_code": 0,
   "pointers": {
    "/pool_rooms/pool-1/pooled_from": "9eb4fec6aa95656224194845f31a523e7d2d5f814857c4a253ed6824651bcbbb",
-   "/pool_rooms/pool-1/proves/0": "Nothing ran in this room before the claim except the machine's own main process, and no request reached it through the front. This rests on the rules of the measured front, so it holds only for the measurements you allowed.",
+   "/pool_rooms/pool-1/shows/0": "Nothing ran in this room before the claim except the machine's own main process, and no request reached it through the front. This rests on the rules of the measured front, so it holds only for the measurements you allowed.",
    "/pool_rooms/pool-1/state": "claimed",
    "/room_links/pool-1": "5b7c1a2e-9d3f-4e6a-8b10-2c4d6e8f0a1b",
    "/sandbox_link/rooms/0": "pool-1"
