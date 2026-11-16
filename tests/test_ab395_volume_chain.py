@@ -122,6 +122,46 @@ def test_exact_resend_of_head_commit_returns_same_head(world):
     assert registry.accept(doc) == head
 
 
+def test_resend_of_head_commit_after_lease_expiry_returns_same_head(world):
+    clock, registry, _, holder, lease = world
+    doc = commit_next(registry, holder, lease, "s1")
+    head = registry.accept(doc)
+    clock.t += 601
+    assert registry.accept(doc) == head
+    # A new commit on the expired lease is still refused.
+    refused("lease_expired", registry.accept, commit_next(registry, holder, lease, "s2"))
+
+
+def test_resend_of_head_commit_after_handover_returns_same_head(world):
+    clock, registry, _, holder, lease = world
+    doc = commit_next(registry, holder, lease, "s1")
+    head = registry.accept(doc)
+    clock.t += 601
+    registry.grant("vol-1", binding(Ed25519PrivateKey.generate(), "bb" * 48))
+    assert registry.accept(doc) == head
+    refused("lease_not_current", registry.accept, commit_next(registry, holder, lease, "s2"))
+
+
+def test_resend_after_head_moved_on_is_refused(world):
+    clock, registry, _, holder, lease = world
+    doc = commit_next(registry, holder, lease, "s1")
+    registry.accept(doc)
+    clock.t += 601
+    second = Ed25519PrivateKey.generate()
+    lease2 = registry.grant("vol-1", binding(second, "bb" * 48))
+    registry.accept(commit_next(registry, second, lease2, "s2"))
+    refused("lease_not_current", registry.accept, doc)
+
+
+def test_forged_resend_of_head_commit_is_refused(world):
+    clock, registry, _, holder, lease = world
+    doc = commit_next(registry, holder, lease, "s1")
+    registry.accept(doc)
+    clock.t += 601
+    forged = vc.sign_statement(Ed25519PrivateKey.generate(), doc["statement"])
+    refused("signature_not_lease_holder", registry.accept, forged)
+
+
 def test_tampered_commit_is_refused(world):
     _, registry, _, holder, lease = world
     doc = commit_next(registry, holder, lease, "s1")

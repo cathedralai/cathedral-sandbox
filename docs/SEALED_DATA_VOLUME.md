@@ -260,7 +260,8 @@ canonical JSON (a room receipt signed by the same key is never a commit):
 - **commit** (lease holder's receipt key): restic repo id and snapshot id at
   generation head + 1 on top of the head digest. The registry accepts it only
   from the current, unexpired lease (Decision 6, 4 Nov). An exact resend of
-  the head commit returns the same head.
+  the head commit returns the same head, even after its lease expired or was
+  handed over, so a holder that lost the answer learns its write landed.
 - **head** (registry): signed on every accept.
 
 Restore checks the whole chain against a registry-signed head: links,

@@ -279,7 +279,9 @@ class VolumeRegistry:
         """Accept one commit at head + 1 from the current lease holder. Returns the new signed head.
 
         An exact resend of the commit already at the head returns the same head, so a
-        holder that lost the answer can tell success from losing a race.
+        holder that lost the answer can tell success from losing a race. That replay
+        is checked against the commit's own lease, so it holds after the lease has
+        expired, been released or been handed over, as long as the head has not moved.
         """
         if not isinstance(commit_doc, dict) or not isinstance(commit_doc.get("statement"), dict):
             raise VolumeRefused("malformed")
@@ -289,6 +291,14 @@ class VolumeRegistry:
         with self.lock:
             volume = self._volume(commit.get("volume_id"))
             lease = _check_signed(commit.get("lease"), LEASE_SCHEMA, [self.public_b64], "lease_not_signed_by_registry")
+            # Authenticate against the embedded lease first, so a resend of the
+            # accepted head commit is answered even after that lease expired or
+            # was handed over: the holder must be able to learn its write landed.
+            _check_signed(commit_doc, COMMIT_SCHEMA, [lease.get("holder_receipt_key_ed25519_b64")],
+                          "signature_not_lease_holder")
+            digest = statement_sha256(commit_doc)
+            if digest == volume.head_sha256:
+                return volume.head_doc
             current = volume.lease
             if current is None or lease.get("volume_id") != commit["volume_id"] or any(
                 lease.get(k) != current.statement[k]
@@ -297,11 +307,6 @@ class VolumeRegistry:
                 raise VolumeRefused("lease_not_current")
             if not self._live(current):
                 raise VolumeRefused("lease_expired")
-            _check_signed(commit_doc, COMMIT_SCHEMA, [current.statement["holder_receipt_key_ed25519_b64"]],
-                          "signature_not_lease_holder")
-            digest = statement_sha256(commit_doc)
-            if digest == volume.head_sha256:
-                return volume.head_doc
             generation = commit.get("generation")
             if type(generation) is not int or generation != volume.generation + 1:
                 raise VolumeRefused("generation_not_next")
