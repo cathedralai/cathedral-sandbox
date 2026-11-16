@@ -75,6 +75,9 @@ type fakeHotel struct {
 	// (cathedral/sandbox_guest.py list_snapshots and delete_snapshot, AB#650).
 	ownerScoped       bool
 	bulkFailAfterBusy bool // one transient bulk-delete failure after a claim-busy refusal
+	// upgrade answers WebSocket handshakes when set (terminal_ws_test.go). It
+	// runs without f.mu so it may hijack and hold the connection.
+	upgrade http.HandlerFunc
 }
 
 // snapGuestOK is whether a snapshot call may see snapshot doc d.
@@ -87,6 +90,13 @@ func (f *fakeHotel) snapGuestOK(r *http.Request, d map[string]any) bool {
 }
 
 func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if f.upgrade != nil && strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		f.mu.Lock()
+		f.calls = append(f.calls, r.Method+" "+r.URL.RequestURI())
+		f.mu.Unlock()
+		f.upgrade(w, r)
+		return
+	}
 	body, _ := io.ReadAll(r.Body)
 	var req map[string]any
 	_ = json.Unmarshal(body, &req)
@@ -471,6 +481,7 @@ func (tc *testChain) start(t *testing.T) {
 	for _, h := range b.hotelList() {
 		h.ok, h.slots = true, 100
 	}
+	b.resumeNativeExecs()
 	tc.b = b
 	tc.srv = httptest.NewServer(b)
 	t.Cleanup(tc.srv.Close)

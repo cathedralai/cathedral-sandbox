@@ -12,10 +12,10 @@
  "expect": {
   "exit_code": 0,
   "pointers": {
-   "/chain/room_numbering/proves/0": "Every request on a signed route that named the room and reached it through the front before the last receipt was signed is in this list, in the order it ran, and none was still running.",
    "/chain/room_numbering/rooms/room-s/alive_at_last_action": true,
    "/chain/room_numbering/rooms/room-s/closed_to": "file_put",
-   "/chain/room_numbering/rooms/room-s/serial": true
+   "/chain/room_numbering/rooms/room-s/serial": true,
+   "/chain/room_numbering/shows/0": "Every request on a signed route that named the room and reached it through the front before the last receipt was signed is in this list, in the order it ran, and none was still running."
   },
   "verdict": "PASS"
  }

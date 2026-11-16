@@ -309,6 +309,22 @@ them, listed or not. Everything else answers 403 `terminals_disabled` and the
 message says why. The default is an empty list: no hotel. The broker refuses
 unknown config keys, so set the key only after the broker binary knows it.
 
+A WebSocket handshake on `GET /v1/sandboxes/<id>/terminals/<tid>/ws` (AB#405)
+passes the same gates, then the broker opens the same handshake to the room's
+hotel with the hotel key and pumps raw bytes both ways after the hotel's 101.
+Only `Sec-WebSocket-Key`, `Sec-WebSocket-Version`, `Sec-WebSocket-Protocol` and
+`X-Cathedral-Access-Ticket` go to the hotel; the guest's key, cookies and
+extension offers do not. The hotel checks and spends the ticket. Before any
+hotel call the broker refuses a handshake that cannot open: no key or a version
+other than 13 (400 `invalid_websocket`), a `ticket` query parameter (401
+`ticket_query_forbidden`), no ticket in the header or a `cathedral.ticket.*`
+subprotocol (401 `access_ticket_invalid`), or the client-compat path (501
+`websocket_unsupported`). A hotel refusal is relayed with its status and code; a
+hotel 101 with a wrong accept is a 502 `hotel_bad_handshake` (the ticket is
+spent by then). A socket with no bytes either way for 15 minutes is closed; the
+hotel's own 600 s idle close normally comes first. The broker must be reached
+over HTTP/1.1 for this route (an h2 or h2c proxy in front hides the Upgrade).
+
 ## Room network policy
 
 A create takes `"network": {"mode": "internet" | "deny_all" | "allowlist", "allow": [...]}`.

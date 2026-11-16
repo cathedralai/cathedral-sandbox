@@ -1,7 +1,12 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 )
 
 // AB#532: a hotel that holds a catalog image is preferred for a create of that
@@ -133,5 +138,118 @@ func TestCompatCreateFallsBackToColdWhenWarmIsFull(t *testing.T) {
 	setHotel(tc, "b", func(h *hotel) { h.slots = 0 })
 	if got := compatWarmCreates(t, tc, 5); got["c"] != 5 {
 		t.Fatalf("want all 5 on cold hotel c, got %v", got)
+	}
+}
+
+// withPrewarm writes prewarm_catalog and prewarm_catalog_hotels into the
+// chain's config and restarts the broker over the same hotels.
+func withPrewarm(t *testing.T, tc *testChain, on bool, hotels ...string) {
+	t.Helper()
+	if err := writePrewarm(tc, on, hotels); err != nil {
+		t.Fatal(err)
+	}
+	tc.start(t)
+}
+
+func writePrewarm(tc *testChain, on bool, hotels []string) error {
+	raw, err := os.ReadFile(tc.cfgPath)
+	if err != nil {
+		return err
+	}
+	var cfg config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return err
+	}
+	cfg.PrewarmCatalog, cfg.PrewarmCatalogHotels = on, hotels
+	raw, _ = json.Marshal(cfg)
+	return os.WriteFile(tc.cfgPath, raw, 0o600)
+}
+
+// comeUp takes hotels b and c down and runs one sync step on each, so each
+// has an up edge. Hotel a (sealed) stays out of it.
+func comeUp(tc *testChain) {
+	for _, id := range []string{"a", "b", "c"} {
+		setHotel(tc, id, func(h *hotel) { h.ok = false })
+	}
+	syncNow(tc, "b")
+	syncNow(tc, "c")
+}
+
+const prefetchCall = "POST /v1/images/prefetch"
+
+// AB#532 option B: prewarm_catalog_hotels limits the pull to the hotels it
+// names; the others take no prefetch and hold nothing warm.
+func TestPrewarmHotelsListLimitsThePullToNamedHotels(t *testing.T) {
+	tc := newChain(t)
+	withPrewarm(t, tc, true, "b")
+	comeUp(tc)
+	waitFor(t, "prefetch on hotel b", func() bool { return callsTo(tc.hotels["b"], prefetchCall) > 0 })
+	waitFor(t, "alpine:3.20 warm on b", func() bool {
+		tc.b.mu.Lock()
+		defer tc.b.mu.Unlock()
+		return tc.b.hotelByID("b").warm[warmImage]
+	})
+	time.Sleep(200 * time.Millisecond) // a pull on c would run in the background
+	if n := callsTo(tc.hotels["c"], prefetchCall); n != 0 {
+		t.Fatalf("hotel c is not in prewarm_catalog_hotels but got %d prefetch calls", n)
+	}
+	tc.b.mu.Lock()
+	cWarm := len(tc.b.hotelByID("c").warm)
+	tc.b.mu.Unlock()
+	if cWarm != 0 {
+		t.Fatalf("hotel c holds %d warm images", cWarm)
+	}
+}
+
+// An empty prewarm_catalog_hotels keeps the broker-wide behaviour: every
+// hotel that comes up pulls.
+func TestPrewarmHotelsEmptyPullsOnEveryHotel(t *testing.T) {
+	tc := newChain(t)
+	withPrewarm(t, tc, true)
+	if len(tc.b.cfg.PrewarmCatalogHotels) != 0 {
+		t.Fatalf("default prewarm_catalog_hotels: %v", tc.b.cfg.PrewarmCatalogHotels)
+	}
+	comeUp(tc)
+	for _, id := range []string{"b", "c"} {
+		waitFor(t, "prefetch on hotel "+id, func() bool { return callsTo(tc.hotels[id], prefetchCall) > 0 })
+	}
+}
+
+// The flag off still pulls nowhere, list or not.
+func TestPrewarmFlagOffPullsNowhere(t *testing.T) {
+	tc := newChain(t)
+	withPrewarm(t, tc, false)
+	comeUp(tc)
+	for _, id := range []string{"b", "c"} {
+		if tc.b.prewarms(tc.b.hotelByID(id)) {
+			t.Fatalf("flag off: hotel %s would prewarm", id)
+		}
+	}
+}
+
+// Config load refuses an id that is not a hotel in the config file, and a
+// list without prewarm_catalog on; a list of known hotels loads.
+func TestPrewarmHotelsConfigRefusesUnknownIDs(t *testing.T) {
+	for _, c := range []struct {
+		on     bool
+		hotels []string
+	}{
+		{true, []string{"nc-sealed-3"}}, // not a hotel in this config
+		{true, []string{"b", "nope"}},
+		{true, []string{""}},
+		{false, []string{"b"}}, // the list alone would do nothing
+	} {
+		tc := newChain(t)
+		if err := writePrewarm(tc, c.on, c.hotels); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadBroker(tc.cfgPath); err == nil || !strings.Contains(err.Error(), "prewarm_catalog_hotels") {
+			t.Errorf("prewarm_catalog %v, hotels %q: err %v, want a prewarm_catalog_hotels refusal", c.on, c.hotels, err)
+		}
+	}
+	tc := newChain(t)
+	withPrewarm(t, tc, true, "b", "c")
+	if !slices.Equal(tc.b.cfg.PrewarmCatalogHotels, []string{"b", "c"}) {
+		t.Errorf("loaded prewarm_catalog_hotels %v", tc.b.cfg.PrewarmCatalogHotels)
 	}
 }
