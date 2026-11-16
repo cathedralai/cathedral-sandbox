@@ -437,7 +437,7 @@ def test_a_shared_machine_has_no_gate(tmp_path, monkeypatch) -> None:
     api = ThreadingHTTPServer(("127.0.0.1", 0), Api)
     threading.Thread(target=api.serve_forever, daemon=True).start()
     ledger = Machine(tmp_path, monkeypatch, owner=False).ledger()
-    server = rr.Server(("127.0.0.1", 0), ledger, api.server_address[1], 1, API_KEY, "/nonexistent.sock")
+    server = rr.Server(("127.0.0.1", 0), ledger, api.server_address[1], 1, API_KEY, "/nonexistent.sock", pool_scan=False)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         status, _doc, hdrs = _post(server.server_address[1], "/v1/sandboxes", _broker_form(GUEST_CREATE))
