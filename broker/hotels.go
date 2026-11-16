@@ -424,6 +424,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	}
 	// A miner hotel, a "guest_tls" hotel and, with require_sealed_guest_tls,
 	// every sealed hotel join over the guest's attested TLS key (AB#378).
+	var joinChip string // CHIP_ID of the verified join binding; a later re-pin must stay on it
 	if hc.MinerHotkey != "" || (hc.Sealed && (hc.GuestTLS || b.cfg.RequireSealedGuestTLS)) {
 		if hc.TLSSPKISHA256 != "" || (req.Verify != nil && !*req.Verify) ||
 			!strings.HasPrefix(hc.API, "https://") || !strings.HasPrefix(hc.Health, "https://") {
@@ -444,6 +445,9 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 			return
 		}
 		hc.TLSSPKISHA256 = peerSPKI
+		var bd snpBinding
+		_ = json.Unmarshal(attestationBinding(rawAtt), &bd)
+		joinChip = bd.ChipID
 	}
 	if hc.Name == "" {
 		hc.Name = hc.ID
@@ -458,6 +462,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	}
 	h := newHotel(hc, req.Key)
 	h.runtime = true
+	h.pinChip = joinChip
 	if req.Verify == nil || *req.Verify {
 		var st map[string]any
 		if err := h.getJSON(r.Context(), hc.API, "/v1/status", nil, &st); err != nil {
@@ -838,6 +843,12 @@ func (b *broker) loadRuntimeHotels() error {
 	for _, hc := range list {
 		if hc.MinerHotkey != "" && hc.TLSSPKISHA256 == "" {
 			log.Printf("runtime miner hotel %s skipped: no attested TLS pin", hc.ID)
+			continue
+		}
+		// A sealed hotel that joined before require_sealed_guest_tls was turned
+		// on would otherwise get the hotel key over its configured address.
+		if b.cfg.RequireSealedGuestTLS && hc.Sealed && !hc.GuestTLS && hc.MinerHotkey == "" {
+			log.Printf("runtime hotel %s skipped: require_sealed_guest_tls is on and it joined without guest TLS; remove and re-add it", hc.ID)
 			continue
 		}
 		k, err := os.ReadFile(hc.KeyFile)

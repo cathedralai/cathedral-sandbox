@@ -403,3 +403,65 @@ func TestSealedJoinTakesTheGuestTLSBootstrapWhenRequired(t *testing.T) {
 		t.Fatalf("typed pin at join: %d %v", status, doc)
 	}
 }
+
+// A guest_tls hotel that joined at runtime is pinned to the chip of its join
+// binding, so its first re-pin after a reboot cannot move to another chip.
+func TestJoinedGuestTLSHotelRepinStaysOnItsJoinChip(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	g := newGuestTLSServer(t, guestTLSKey)
+	g.attest("joined", attestOpts{chip: 51})
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+		"id": "joined", "api": g.srv.URL, "key": guestTLSKey, "sealed": true, "guest_tls": true,
+	}); status != 201 {
+		t.Fatalf("join: %d %v", status, doc)
+	}
+	h := tc.b.hotelByID("joined")
+	first := h.pinHex()
+	g.rotate()
+	second := g.spki()
+	g.attest("joined", attestOpts{chip: 52})
+	expirePin(tc, h)
+	tc.b.syncHotel(context.Background(), h)
+	if h.pinHex() != first || g.keyedOn(second) != 0 {
+		t.Fatalf("pin moved to another chip: %q keyed=%d", h.pinHex(), g.keyedOn(second))
+	}
+	g.attest("joined", attestOpts{chip: 51})
+	expirePin(tc, h)
+	tc.b.syncHotel(context.Background(), h)
+	if h.pinHex() != second {
+		t.Fatalf("same-chip re-pin refused: %q", h.pinHex())
+	}
+}
+
+// Turning require_sealed_guest_tls on must not leave a sealed hotel that
+// joined before it reachable with the hotel key over its configured address.
+func TestRequireSealedGuestTLSSkipsPlainRuntimeHotelsOnRestart(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	_, plain := newOperatorHotel(t, 1, snpAttestation(t, attestOpts{chip: 50}))
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+		"id": "plain", "api": plain, "key": guestTLSKey, "sealed": true,
+	}); status != 201 {
+		t.Fatalf("plain sealed join before the switch: %d %v", status, doc)
+	}
+	tc.start(t)
+	if tc.b.hotelByID("plain") == nil {
+		t.Fatal("restart without the switch dropped the hotel")
+	}
+	raw, err := os.ReadFile(tc.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.RequireSealedGuestTLS = true
+	raw, _ = json.Marshal(cfg)
+	if err := os.WriteFile(tc.cfgPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tc.start(t)
+	if tc.b.hotelByID("plain") != nil {
+		t.Fatal("plain sealed runtime hotel restored with require_sealed_guest_tls on")
+	}
+}
