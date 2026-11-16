@@ -11,6 +11,8 @@
 set -euo pipefail
 # shellcheck disable=SC1090
 source "${2:?sealed.env}"
+# shellcheck disable=SC1091
+source "$(dirname "$(readlink -f "$0")")/guest-constants.sh"
 TAP=$SEALED_TAP
 FWD=SEALED-${TAP^^}-FWD
 IN=SEALED-${TAP^^}-IN

@@ -1,0 +1,11 @@
+{
+  "args": [
+    "hi"
+  ],
+  "env": {
+    "MODEL": "d1-2b",
+    "LFM3_KIND": "decision"
+  },
+  "exit": 2,
+  "replies": []
+}

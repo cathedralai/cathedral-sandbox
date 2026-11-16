@@ -251,7 +251,7 @@ questing and resolute, Debian trixie ovmf file list.
 | `-no-user-config -nodefaults` | No | Device set, not launch data. Removes the default NIC, VGA, floppy, CD. |
 | `-name sealed-<name>` | No | Process label. |
 | `-enable-kvm` | No | Accelerator. |
-| `-cpu $SEALED_CPU_MODEL` (EPYC-v4) | Partly | Every VMSA is measured and its EDX reset value is the CPUID signature of the model. EPYC-v4 = family 0x17 model 1 stepping 2 (0x800F12), the same for EPYC, EPYC-v1, v2, v3, IBPB (sev-snp-measure vcpu_types.py L29 to L34). Feature flags are not measured. The guest sees a Naples feature set (no AVX-512 and the like). |
+| `-cpu $SEALED_CPU_MODEL` (EPYC-Genoa-v1; EPYC-v4 for a baseline hotel) | Partly | Every VMSA is measured and its EDX reset value is the CPUID signature of the model. EPYC-v4 = family 0x17 model 1 stepping 2 (0x800F12), the same for EPYC, EPYC-v1, v2, v3, IBPB; EPYC-Genoa-v1 = family 25 model 17 stepping 0 (sev-snp-measure vcpu_types.py). Feature flags are not measured. With EPYC-Genoa-v1 the guest sees a Zen 4 feature set including AVX-512; with EPYC-v4 it sees a Naples set (no AVX-512). |
 | `-smp $SEALED_VCPUS` | Yes | One VMSA page per vCPU is measured; `--vcpus` must match. Default topology is N sockets of one core. |
 | `-m ${SEALED_MEM_GIB}G` | No | Memory size is not launch data; discovered by firmware and kernel. |
 | `-machine q35,confidential-guest-support=sev0,memory-backend=ram1` | No | Machine type is hardware layout; the VMSA reset state is architectural. |

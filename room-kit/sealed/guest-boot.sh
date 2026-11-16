@@ -17,6 +17,22 @@
 set -euo pipefail
 log() { echo "[sealed-hotel] $*"; }
 
+# Hotel name: from QEMU fw_cfg (host-provided, not measured, one fingerprint per
+# build). It is echoed into the attested binding by the receipts service. A
+# missing or malformed name stops the boot: no silent default hotel.
+read_hotel_name() {
+  local f=$1 name=""
+  for _ in $(seq 30); do [ -r "$f" ] && break; sleep 1; done
+  [ -r "$f" ] || { log "no hotel name in fw_cfg (opt/cathedral/hotel-name); refusing to start"; return 1; }
+  name=$(cat "$f")
+  [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,58}$ ]] || { log "hotel name in fw_cfg is not valid (want ^[a-z0-9][a-z0-9-]{0,58}$); refusing to start"; return 1; }
+  printf '%s' "$name"
+}
+ROOM_HOTEL_NAME=$(read_hotel_name /sys/firmware/qemu_fw_cfg/by_name/opt/cathedral/hotel-name/raw)
+export ROOM_HOTEL_NAME
+hostname "room-$ROOM_HOTEL_NAME"
+log "hotel $ROOM_HOTEL_NAME"
+
 DEV=/dev/disk/by-id/virtio-sealed-scratch
 for _ in $(seq 60); do [ -b "$DEV" ] && break; sleep 1; done
 [ -b "$DEV" ] || { log "no scratch disk"; exit 1; }

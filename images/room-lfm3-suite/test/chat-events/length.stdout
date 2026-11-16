@@ -1,0 +1,4 @@
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":1,"type":"start","model":"lfm3-vl-2b","tools":true}
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":2,"type":"thinking","round":1,"phase":"working"}
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":3,"type":"delta","round":1,"text":"This reply was cut"}
+{"version":1,"turn_id":"0b8f3c9e-5d1a-4f6e-9a7b-2c4d6e8f0a1b","seq":4,"type":"answer","text":"This reply was cut","stop_reason":"length","rounds":1,"tool_calls":0}

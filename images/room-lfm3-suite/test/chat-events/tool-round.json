@@ -1,0 +1,29 @@
+{
+  "args": [
+    "what is in the room"
+  ],
+  "replies": [
+    {
+      "pieces": [
+        "Let me look."
+      ],
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "run",
+          "arguments": {
+            "command": "echo hello"
+          }
+        }
+      ]
+    },
+    {
+      "pieces": [
+        "It says ",
+        "hello."
+      ]
+    }
+  ],
+  "env": {},
+  "exit": 0
+}

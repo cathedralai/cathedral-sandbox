@@ -494,7 +494,9 @@ func guestSnapshot(g *guestState, h *hotel, doc map[string]any) {
 // hotelSnapshots lists the guest's snapshots on one hotel.
 func (b *broker) hotelSnapshots(ctx context.Context, g *guestState, h *hotel) ([]map[string]any, error) {
 	q := url.Values{"label": {guestLabel + "=" + g.cfg.ID}}
-	status, _, out, err := h.do(ctx, "GET", "/v1/snapshots", q, nil, 30*time.Second)
+	// The hotel lists a snapshot only to the guest that owns it (AB#650), by
+	// the guest header; without it a fork of a ready snapshot is not found (AB#604).
+	status, _, out, err := h.doGuest(ctx, g, "GET", "/v1/snapshots", q, nil, 30*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -668,7 +670,8 @@ func (b *broker) handleSnapshot(w http.ResponseWriter, r *http.Request, g *guest
 		timeout = 30 * time.Minute
 		arg = body
 	}
-	status, _, out, err := h.do(r.Context(), r.Method, path, nil, arg, timeout)
+	// Delete and push are owner-scoped on the hotel too (AB#650).
+	status, _, out, err := h.doGuest(r.Context(), g, r.Method, path, nil, arg, timeout)
 	if err != nil {
 		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
 		return

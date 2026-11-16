@@ -49,6 +49,21 @@ def find(state, ref):
     return None
 
 
+def image_id_for(ref, b):
+    """Same Id inspect would return for ref (default hash or override / alias)."""
+    import hashlib
+    ids = b.get("image_ids") or {}
+    aliases = b.get("image_aliases") or {}
+    image_id = ids.get(ref)
+    if not image_id:
+        image_id = "sha256:" + hashlib.sha256(ref.encode()).hexdigest()
+    if ref in aliases and aliases[ref] in ids:
+        image_id = ids[aliases[ref]]
+    elif ref in aliases:
+        image_id = "sha256:" + hashlib.sha256(aliases[ref].encode()).hexdigest()
+    return image_id
+
+
 def main(argv):
     with Locked() as st:
         st["calls"].append(argv)
@@ -86,17 +101,7 @@ def main(argv):
             present = ref in st["images"]
             # Distinct immutable ids per ref so ownership tests can prove an
             # ID-based boundary (AB#650). Operators may override via behaviour.
-            ids = b.get("image_ids") or {}
-            image_id = ids.get(ref)
-            if not image_id:
-                import hashlib
-                image_id = "sha256:" + hashlib.sha256(ref.encode()).hexdigest()
-            aliases = b.get("image_aliases") or {}
-            # Aliases resolve to another ref's id (retag / secondary name).
-            if ref in aliases and aliases[ref] in (ids or {}):
-                image_id = ids[aliases[ref]]
-            elif ref in aliases:
-                image_id = "sha256:" + hashlib.sha256(aliases[ref].encode()).hexdigest()
+            image_id = image_id_for(ref, b)
         if not present:
             print(f"Error: No such image: {ref}", file=sys.stderr)
             return 1
@@ -108,7 +113,12 @@ def main(argv):
             digests = b.get("image_digests", {}).get(ref)
             if digests is None:
                 digests = [ref + "@sha256:" + "cd" * 32]
-            print(json.dumps({"Id": image_id, "Size": size, "RepoDigests": digests}))
+            cfg = (b.get("image_configs") or {}).get(ref, {})
+            config = {
+                "Entrypoint": cfg.get("Entrypoint"),
+                "Cmd": cfg.get("Cmd"),
+            }
+            print(json.dumps({"Id": image_id, "Size": size, "RepoDigests": digests, "Config": config}))
         return 0
 
     if cmd == "image" and argv[1] == "rm":
@@ -261,7 +271,11 @@ def main(argv):
                 return 125
             cid = uuid.uuid4().hex + uuid.uuid4().hex
             fail = "--storage-opt" in argv and b.get("reject_storage_opt")
-            fail = fail or any(img in argv for img in b.get("run_fail_images", []))
+            # Match the tag or its inspected Id — docker run is pinned to Id (AB#709).
+            fail = fail or any(
+                img in argv or image_id_for(img, b) in argv
+                for img in b.get("run_fail_images", [])
+            )
             net_name = argv[argv.index("--network") + 1] if "--network" in argv else "bridge"
             nets = st.setdefault("networks", {"bridge": {"containers": []}})
             net_error = None
@@ -477,6 +491,24 @@ class FakeDocker:
     def set_image_id(self, ref: str, image_id: str) -> None:
         state = self._load()
         state.setdefault("behaviour", {}).setdefault("image_ids", {})[ref] = image_id
+        self._save(state)
+
+    def set_image_config(
+        self,
+        ref: str,
+        *,
+        entrypoint: list[str] | None = None,
+        cmd: list[str] | None = None,
+        repo_digest: str | None = None,
+    ) -> None:
+        state = self._load()
+        behaviour = state.setdefault("behaviour", {})
+        behaviour.setdefault("image_configs", {})[ref] = {
+            "Entrypoint": entrypoint,
+            "Cmd": cmd,
+        }
+        if repo_digest is not None:
+            behaviour.setdefault("image_digests", {})[ref] = [repo_digest]
         self._save(state)
 
     def add_container(self, cid: str, *, name: str, labels: dict[str, str]) -> None:

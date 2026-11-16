@@ -119,6 +119,28 @@ lfm3-timing load_ms=812 prompt_tok_s=118.0 gen_tok_s=52.8 wall_ms=1530 threads=2
 Over HTTP, a picture is an `image_url` part with a data URI and a clip an
 `input_audio` part (base64 WAV or MP3), in `/v1/chat/completions`.
 
+### Benchmark: `lfm3-bench` (AB#444)
+
+`lfm3-bench` times one streamed request from a prompt set and prints the
+answer, then one JSON line. `scripts/sealed_bench.py` runs it in a fresh sealed
+room, once per prompt, and checks each line against a Cathedral exec receipt.
+
+```sh
+lfm3-bench --max-tokens 256 --index 0 '["What is 2+2?","Name three rivers."]'
+```
+
+```
+lfm3-bench {"decode_n":64,"decode_tok_s":24.1,"hash_ms":2100,"harness":"lfm3-bench-1","load_ms":812,"max_tokens":256,"mmproj_sha256":"...","model":"lfm3-omni-2b","model_file":"LFM3-Omni-2B-Q4_K_M.gguf","model_sha256":"9f8d...","prompt_index":0,"prompt_ms":120.4,"prompt_n":14,"prompt_set_sha256":"...","prompt_tok_s":116.3,"reasoning":"off","threads":2,"ttft_ms":412,"wall_ms":3100}
+```
+
+- `ttft_ms` is measured in the room, from sending the request to the first
+  streamed token. The rates and `prompt_ms` are llama-server's own timings.
+- `model_sha256` (and `mmproj_sha256`) are hashed in the room on every call and
+  must match `/opt/lfm3/SHA256SUMS`, or there is no result.
+- `prompt_set_sha256` is the sha256 of the prompt-set argument bytes.
+- The prompt cache is off for the request, so each call is a full prefill.
+- Not for decision models (d1).
+
 ### Talk to it: `lfm3-agent`
 
 `lfm3-ask` is one question with no memory. `lfm3-agent` is the harness for a
@@ -153,6 +175,48 @@ apostrophe, `?` or `*`: `liquid "what's in /work?"`. The greeting's
 attachment example follows `MODEL`: `--image` in VL and Omni rooms, `--audio`
 in Audio rooms.
 
+### Chat events: `--events` (AB#541, AB#542)
+
+`liquid --events --turn <uuid> "message"` writes the turn as chat events for
+the console instead of text, and streams the model (`stream: true` to
+llama-server) so words arrive as they are written. One ASCII JSON object per
+line on stdout: `start`, `thinking`, `delta`, `tool_call`, `tool_result`, then
+exactly one `answer` or `error`. Each line carries `version`, `turn_id` and a
+`seq` from 1. Tool events show a redacted one-line summary, status, exit code,
+duration and output size, never raw arguments, output, env or keys. Nothing
+else goes to stdout, and stderr gets at most one line after an `error`. The
+`--json`, `--speak`, `--history` and `--reset` options are refused with
+`bad_request` in this mode, and without the flag nothing changes. The contract
+is `AB#542` (liquid chat stream contract v1); its room-side conformance
+fixtures are in `test/chat-events/` (`<name>.json` scripts a fake model,
+`<name>.stdout` is the expected stdout, with `duration_ms` set to 0).
+
+### Chat gateway: `lfm3-gateway` (AB#539)
+
+Chat rooms (not base, not d1) also serve the chat contract Polaris agents
+speak, on `127.0.0.1:8642` only: `POST /v1/chat/completions` and `GET
+/health`. `lfm3-serve` starts it; `LFM3_GATEWAY=off` leaves it out. It is one
+static Go binary (`gateway/`, standard library only), so the room gains no
+interpreter. Each request is one turn of `lfm3-agent --events`, with the last
+user message on stdin; the room keeps the conversation, as it does for the
+console. The events become OpenAI `chat.completion.chunk` frames over SSE,
+`event: hermes.tool.progress` for each tool start and end (the redacted
+summary as `arguments`, `output` always empty), a finish chunk, then
+`data: [DONE]`. A failed turn ends with `event: error` and no `[DONE]`.
+Redaction stays in `lfm3-agent`, so the console and Polaris see the same safe
+fields.
+
+- `/health`: 200 once llama-server is up, 503 while it loads.
+- One turn at a time; a second request gets 429. A console turn and a gateway
+  turn queue on lfm3-agent's lock.
+- `stream: false` returns the final `answer` text. With `stream: true`, text
+  already streamed stays: a tool round's narration is kept (a new round starts
+  a new paragraph), and repeats cut by the loop guard are not taken back.
+- `LFM3_GATEWAY_TOKEN`, if set, is required as a Bearer token. The room runs
+  with network none, so by default the gateway is open on loopback only.
+- `liquid --events` still calls lfm3-agent directly; the console wire does not
+  change.
+
 `liquid` and `lfm3-agent` refuse with exit 2 and a one-line pointer in two
 kinds of room:
 
@@ -167,6 +231,21 @@ kinds of room:
   file). Each call is printed on stderr as it runs (`$ ls -la`); the output
   the model reads is cut at 2,000 characters. At most 4 tool rounds a
   message, then the model must answer. `--no-tools` answers without them.
+- **Audio's tool choice (AB#545).** Offered tools, LFM3-Audio-2B called one
+  for every message, even "What is 2+2?": its first token was `<tool_call>`
+  at 0.89 to 1.00 whatever the question, so neither sampling nor a reworded
+  system prompt changed it. In Audio rooms a round that offers tools starts
+  with three fixed example turns after the system prompt: a sum and a
+  translation answered in text, and "What umask is this machine set to?"
+  answered with `run`. They are not kept in the conversation, never shown,
+  count against the 4,000-character budget, and are not sent with
+  `--no-tools`, `--json` or the last round. Local eval (pinned GGUF and
+  llama.cpp, 14 no-tool and 17 tool questions, 2 runs): needless calls 26/28
+  before, 0/28 after; tool questions kept a call 34/34. The tool example
+  holds a fact nobody asks about: a fact there (an IP address, a timezone)
+  came back as Audio's answer to the matching question with no call. An
+  example about an installed program or an open port made Audio answer
+  "What is the hostname?" with `hostname -I` and an IP address.
 - **JSON.** `--json` sends a JSON schema (an object or an array) as
   `response_format`, which llama-server turns into a grammar, plus one system
   line asking for valid JSON with no comments, and no tools. The grammar fixes

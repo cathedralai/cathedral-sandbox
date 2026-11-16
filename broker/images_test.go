@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -21,6 +22,9 @@ type fakeHotel struct {
 	t             *testing.T
 	mu            sync.Mutex
 	creates       []map[string]any
+	createBodies  [][]byte                  // the exact bytes of every create, as received
+	failFirst     *int32                    // shared countdown: while above zero a create answers 503 (create_request_bytes_test.go)
+	receiptTag    string                    // appended to the X-Room-Receipt of a create, to tell hotels apart
 	authFail      bool                      // answer creates 401, like a hotel whose API key changed
 	pullOutage    bool                      // answer creates 502 image_pull_failed for a registry outage
 	calls         []string                  // "METHOD /path?query" of every request
@@ -69,9 +73,32 @@ type fakeHotel struct {
 	execCancelPaths  []string
 	execCancelBodies [][]byte
 	execCancelAnswer []byte
+	// ownerScoped: list, delete and push snapshots only for the guest in the
+	// X-Cathedral-Guest header, as a hotel with per-guest ownership does
+	// (cathedral/sandbox_guest.py list_snapshots and delete_snapshot, AB#650).
+	ownerScoped bool
+	// upgrade answers WebSocket handshakes when set (terminal_ws_test.go). It
+	// runs without f.mu so it may hijack and hold the connection.
+	upgrade http.HandlerFunc
+}
+
+// snapGuestOK is whether a snapshot call may see snapshot doc d.
+func (f *fakeHotel) snapGuestOK(r *http.Request, d map[string]any) bool {
+	if !f.ownerScoped {
+		return true
+	}
+	labels, _ := d["labels"].(map[string]any)
+	return labels[guestLabel] == r.Header.Get(guestHeader)
 }
 
 func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if f.upgrade != nil && strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		f.mu.Lock()
+		f.calls = append(f.calls, r.Method+" "+r.URL.RequestURI())
+		f.mu.Unlock()
+		f.upgrade(w, r)
+		return
+	}
 	body, _ := io.ReadAll(r.Body)
 	var req map[string]any
 	_ = json.Unmarshal(body, &req)
@@ -88,6 +115,11 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.mu.Lock()
 		}
 		f.creates = append(f.creates, req)
+		f.createBodies = append(f.createBodies, body)
+		if f.failFirst != nil && atomic.AddInt32(f.failFirst, -1) >= 0 {
+			writeErr(w, 503, "hotel_busy", "try another hotel")
+			return
+		}
 		if req["image"] == "nosuch/x:1" {
 			writeErr(w, 502, "image_pull_failed", "docker pull failed for nosuch/x:1: Error response from daemon: pull access denied for nosuch/x, repository does not exist")
 			return
@@ -115,7 +147,7 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.n++
 		id := fmt.Sprintf("sbx_%d", f.n)
 		f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": req["labels"]})
-		w.Header().Set("X-Room-Receipt", "signed-create")
+		w.Header().Set("X-Room-Receipt", "signed-create"+f.receiptTag)
 		out := map[string]any{"id": id, "state": "running", "snapshot_id": req["snapshot_id"]}
 		if t, ok := req["tunables"]; ok && t != nil && f.appliesTunables {
 			raw, _ := json.Marshal(t)
@@ -298,7 +330,7 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		out := []map[string]any{}
 		for _, d := range f.snaps {
 			labels, _ := d["labels"].(map[string]any)
-			if labels[k] == v {
+			if labels[k] == v && f.snapGuestOK(r, d) {
 				cp := map[string]any{}
 				for kk, vv := range d {
 					cp[kk] = vv
@@ -309,10 +341,18 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"snapshots": out})
 	case strings.HasPrefix(p, "/v1/snapshots/") && strings.HasSuffix(p, "/push"):
 		sid := strings.TrimSuffix(strings.TrimPrefix(p, "/v1/snapshots/"), "/push")
+		if d, ok := f.snaps[sid]; !ok || !f.snapGuestOK(r, d) {
+			writeErr(w, 404, "snapshot_not_found", "no snapshot "+sid)
+			break
+		}
 		f.pushes = append(f.pushes, req)
 		writeJSON(w, 200, map[string]any{"snapshot_id": sid, "image": req["image"], "includes_work": false})
 	case strings.HasPrefix(p, "/v1/snapshots/") && r.Method == "DELETE":
 		sid := strings.TrimPrefix(p, "/v1/snapshots/")
+		if d, ok := f.snaps[sid]; !ok || !f.snapGuestOK(r, d) {
+			writeErr(w, 404, "snapshot_not_found", "no snapshot "+sid)
+			break
+		}
 		delete(f.snaps, sid)
 		f.deleted = append(f.deleted, sid)
 		writeJSON(w, 200, map[string]any{"deleted": true})
@@ -431,12 +471,14 @@ func (tc *testChain) start(t *testing.T) {
 	if err := b.loadCompat(); err != nil {
 		t.Fatal(err)
 	}
+	b.loadNativeExecs()
 	if err := b.loadRuntimeHotels(); err != nil {
 		t.Fatal(err)
 	}
 	for _, h := range b.hotelList() {
 		h.ok, h.slots = true, 100
 	}
+	b.resumeNativeExecs()
 	tc.b = b
 	tc.srv = httptest.NewServer(b)
 	t.Cleanup(tc.srv.Close)
@@ -602,6 +644,41 @@ func TestSnapshotListPushAndDeleteThroughTheBroker(t *testing.T) {
 	// After a push, a create from the image goes to any hotel.
 	if status, _ := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "ghcr.io/acme/forks:one"}); status != 202 {
 		t.Fatalf("create from pushed image: %d", status)
+	}
+}
+
+// AB#604: a hotel with per-guest snapshot ownership lists, deletes and
+// pushes a snapshot only for the guest named in X-Cathedral-Guest. Without
+// that header the broker finds no snapshot, so a fork of a ready snapshot
+// answered 404 snapshot_not_found and the API marked it snapshot_lost.
+func TestSnapshotCallsCarryTheGuestToOwnerScopedHotel(t *testing.T) {
+	tc := newChain(t)
+	for _, f := range tc.hotels {
+		f.ownerScoped = true
+	}
+	room := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	_, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+room+"/snapshot", map[string]any{"name": "keep"})
+	snapID := doc["result"].(map[string]any)["snapshot_id"].(string)
+
+	status, doc := tc.call(t, "key1", "GET", "/v1/snapshots", nil)
+	if list, _ := doc["snapshots"].([]any); status != 200 || len(list) != 1 {
+		t.Fatalf("list: %d %v", status, doc)
+	}
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"snapshot_id": snapID}); status != 202 {
+		t.Fatalf("fork of a ready snapshot: %d %v", status, doc)
+	}
+	if status, doc := tc.call(t, "key1", "POST", "/v1/snapshots/"+snapID+"/push", map[string]any{"image": "ghcr.io/acme/forks:keep"}); status != 200 {
+		t.Fatalf("push: %d %v", status, doc)
+	}
+	// Another guest still finds nothing.
+	if status, _ := tc.call(t, "key2", "DELETE", "/v1/snapshots/"+snapID, nil); status != 404 {
+		t.Fatalf("foreign delete: %d", status)
+	}
+	if status, doc := tc.call(t, "key1", "DELETE", "/v1/snapshots/"+snapID, nil); status != 200 {
+		t.Fatalf("delete: %d %v", status, doc)
+	}
+	if len(tc.hotels["b"].deleted) != 1 {
+		t.Fatalf("hotel delete not called")
 	}
 }
 

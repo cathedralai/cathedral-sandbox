@@ -35,6 +35,8 @@ from cathedral.sandbox_server import SandboxApplication
 from tests.fake_docker_cli import FakeDocker, install
 
 TOKEN = "ab" * 16
+PGID = "4242"
+PGID_LINE = f"pgid={PGID}\n"
 OTHER = "cd" * 16
 
 
@@ -278,7 +280,8 @@ def test_cancel_stops_the_exec_and_names_it_cancelled(fake, tmp_path, form):
     fake.set(
         timeout_form=form,
         exec_rules=[
-            {"contains": f"{form} TERM", "append": str(release), "exit": 0},
+            {"contains": f"{form} TERM", "append": str(release), "stdout": PGID_LINE, "exit": 0},
+            {"contains": f"{form} PROBE", "stdout": "empty\n", "exit": 0},
             {"contains": "hold-marker", "stdout": "partial", "wait_for": str(release), "exit": 143},
         ],
     )
@@ -308,8 +311,9 @@ def test_the_hotel_sends_kill_itself_when_term_is_ignored(fake, tmp_path):
     fake.set(
         timeout_form="busybox",
         exec_rules=[
-            {"contains": "busybox TERM", "exit": 0},
-            {"contains": "busybox KILL", "append": str(release), "exit": 0},
+            {"contains": "busybox TERM", "stdout": PGID_LINE, "exit": 0},
+            {"contains": "busybox KILL", "append": str(release), "stdout": "sent\n", "exit": 0},
+            {"contains": "busybox PROBE", "stdout": "empty\n", "exit": 0},
             {"contains": "hold-marker", "wait_for": str(release), "exit": 137},
         ],
     )
@@ -322,7 +326,9 @@ def test_the_hotel_sends_kill_itself_when_term_is_ignored(fake, tmp_path):
         t.join(5)
         assert out[0].cancelled is True and out[0].exit_code == 137
         assert len(_guest_calls(fake, "busybox TERM")) == 1
-        assert len(_guest_calls(fake, "busybox KILL")) == 1
+        (kill,) = _guest_calls(fake, "busybox KILL")
+        # The escalation names the group TERM validated: it never reads the pid file again.
+        assert kill[kill.index("sh"):][4:] == [exec_cancel.pid_file(TOKEN), "busybox", "KILL", PGID]
     finally:
         provider.close()
 
@@ -558,3 +564,278 @@ def test_refused_answer_fields_and_no_kill_call(fake, tmp_path):
         t.join(5)
     finally:
         provider.close()
+
+
+# ---------------------------------------------------------------- AB#731: group completion, atomic signal, tombstone, delayed arrival
+
+def _group_call(pidfile, group, sig, form="busybox"):
+    return subprocess.run(
+        ["sh", "-c", exec_cancel.KILL_SCRIPT, "sh", str(pidfile), form, sig, str(group)],
+        capture_output=True, text=True, timeout=20,
+    )
+
+
+def _members(group):
+    return subprocess.run(["pgrep", "-g", str(group)], capture_output=True).stdout.split()
+
+
+def test_first_signal_prints_the_validated_group_id(tmp_path):
+    proc = _leader("sh", "-c", "sleep 60")
+    time.sleep(0.2)
+    pidfile = tmp_path / "p"
+    pidfile.write_text(str(proc.pid))
+    out = subprocess.run(["sh", "-c", exec_cancel.KILL_SCRIPT, "sh", str(pidfile), "busybox", "TERM"],
+                         capture_output=True, text=True, timeout=20)
+    assert out.returncode == 0
+    assert exec_cancel.parse_pgid(out.stdout) == str(proc.pid)
+    assert _dead(proc)
+
+
+def test_a_child_that_ignores_term_outlives_its_leader_and_the_group_kill_still_reaches_it(tmp_path):
+    # The leader exits on TERM, its same-group child ignores TERM (the HOLD finding): the exec call
+    # would return, the old hotel said `stopped` and never sent KILL.
+    proc = _leader("sh", "-c", "(trap '' TERM; exec sleep 60) & wait")
+    time.sleep(0.3)
+    pidfile = tmp_path / "p"
+    pidfile.write_text(str(proc.pid))
+    first = subprocess.run(["sh", "-c", exec_cancel.KILL_SCRIPT, "sh", str(pidfile), "busybox", "TERM"],
+                           capture_output=True, text=True, timeout=20)
+    group = exec_cancel.parse_pgid(first.stdout)
+    assert first.returncode == 0 and group == str(proc.pid)
+    assert _dead(proc)
+    time.sleep(0.2)
+    assert _members(group), "the child must still run after the leader exited"
+    # The pid file guard can no longer pass: the leader is gone.
+    assert _kill(pidfile, "busybox", "KILL") == exec_cancel.REFUSED
+    assert _group_call(pidfile, group, "PROBE").stdout.strip() == "alive"
+    killed = _group_call(pidfile, group, "KILL")
+    assert killed.returncode == 0 and killed.stdout.strip() == "sent"
+    time.sleep(0.3)
+    assert _members(group) == []
+    assert _group_call(pidfile, group, "PROBE").stdout.strip() == "empty"
+
+
+def test_group_mode_signals_nothing_for_an_empty_group_and_refuses_a_bad_group_id(tmp_path, bystander):
+    pidfile = tmp_path / "p"
+    done = subprocess.Popen(["true"], start_new_session=True)
+    done.wait()
+    empty = _group_call(pidfile, done.pid, "KILL")
+    assert (empty.returncode, empty.stdout.strip()) == (0, "empty")
+    for bad in ("1", "0", "abc", "-5", "9" * 40):
+        assert _group_call(pidfile, bad, "KILL").returncode == exec_cancel.REFUSED
+    assert bystander.poll() is None
+
+
+def test_group_mode_does_not_read_the_pid_file(tmp_path, bystander):
+    # A customer who rewrites the pid file after the first signal cannot redirect the escalation.
+    pidfile = tmp_path / "p"
+    pidfile.write_text(str(bystander.pid))
+    out = _group_call(pidfile, "999999", "KILL")
+    assert out.stdout.strip() == "empty"
+    assert bystander.poll() is None
+
+
+def test_stopped_is_not_claimed_while_a_child_of_the_group_still_runs(fake, tmp_path):
+    release = tmp_path / "release"
+    fake.set(
+        timeout_form="busybox",
+        exec_rules=[
+            # TERM ends the leader (the exec call returns) but the group stays alive until KILL.
+            {"contains": "busybox TERM", "append": str(release), "stdout": PGID_LINE, "exit": 0},
+            {"contains": "busybox KILL", "stdout": "sent\n", "exit": 0},
+            {"contains": "busybox PROBE", "stdout": "alive\n", "exit": 0},
+            {"contains": "hold-marker", "wait_for": str(release), "exit": 143},
+        ],
+    )
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        t, out = _start(provider, sid, ExecRequest(cmd=["sh", "-c", "hold-marker"], timeout_seconds=300, spill_token=TOKEN))
+        _wait_running(TOKEN, sid)
+        assert provider.cancel_exec(sid, TOKEN) == "signalled"
+        t.join(5)
+        assert out[0].cancelled is True
+        # TERM, then the hotel's own KILL of the group by id, even though the exec call had returned.
+        assert len(_guest_calls(fake, "busybox TERM")) == 1
+        (kill,) = _guest_calls(fake, "busybox KILL")
+        assert kill[kill.index("sh"):][4:] == [exec_cancel.pid_file(TOKEN), "busybox", "KILL", PGID]
+    finally:
+        provider.close()
+
+
+def test_stopped_once_the_exec_returned_and_the_group_is_empty_after_kill(fake, tmp_path):
+    release = tmp_path / "release"
+    killed = tmp_path / "killed"
+    fake.set(
+        timeout_form="busybox",
+        exec_rules=[
+            {"contains": "busybox TERM", "append": str(release), "stdout": PGID_LINE, "exit": 0},
+            {"contains": "busybox KILL", "append": str(killed), "stdout": "sent\n", "exit": 0},
+            {"contains": "busybox PROBE", "stdout": "empty\n", "exit": 0},
+            {"contains": "hold-marker", "wait_for": str(release), "exit": 143},
+        ],
+    )
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        t, _ = _start(provider, sid, ExecRequest(cmd=["sh", "-c", "hold-marker"], timeout_seconds=300, spill_token=TOKEN))
+        _wait_running(TOKEN, sid)
+        assert provider.cancel_exec(sid, TOKEN) == "stopped"
+        t.join(5)
+        assert _guest_calls(fake, "busybox KILL") == []
+    finally:
+        provider.close()
+
+
+def test_a_failed_term_signal_still_escalates_to_kill_by_group(fake, tmp_path):
+    release = tmp_path / "release"
+    fake.set(
+        timeout_form="busybox",
+        exec_rules=[
+            {"contains": "busybox TERM", "stdout": PGID_LINE, "exit": exec_cancel.SIGNAL_FAILED},
+            {"contains": "busybox KILL", "append": str(release), "stdout": "sent\n", "exit": 0},
+            {"contains": "busybox PROBE", "stdout": "empty\n", "exit": 0},
+            {"contains": "hold-marker", "wait_for": str(release), "exit": 137},
+        ],
+    )
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        t, out = _start(provider, sid, ExecRequest(cmd=["sh", "-c", "hold-marker"], timeout_seconds=300, spill_token=TOKEN))
+        _wait_running(TOKEN, sid)
+        assert provider.cancel_exec(sid, TOKEN) == "stopped"
+        t.join(5)
+        assert out[0].cancelled is True
+        assert len(_guest_calls(fake, "busybox KILL")) == 1
+    finally:
+        provider.close()
+
+
+def test_a_natural_finish_during_a_refused_signal_is_stored_as_finished():
+    reg = exec_cancel.ExecRegistry()
+    assert reg.begin("s", TOKEN, None, "u", "busybox")
+    entry = reg.entry("s", TOKEN)
+    reg.signal_begin(entry)  # the guard is running in the room
+    outcome = []
+    t = threading.Thread(target=lambda: outcome.append(reg.finish("s", TOKEN)))
+    t.start()
+    time.sleep(0.2)
+    assert t.is_alive(), "finish must wait for the signal attempt to settle"
+    assert reg.result("s", TOKEN) is None
+    reg.signal_end(entry, sent=False)  # the guard refused
+    t.join(5)
+    assert outcome == [False]
+    assert reg.result("s", TOKEN) == "finished"
+
+
+def test_a_natural_finish_during_a_delivered_signal_is_stored_as_cancelled():
+    reg = exec_cancel.ExecRegistry()
+    reg.begin("s", TOKEN, None, "u", "busybox")
+    entry = reg.entry("s", TOKEN)
+    reg.signal_begin(entry)
+    outcome = []
+    t = threading.Thread(target=lambda: outcome.append(reg.finish("s", TOKEN)))
+    t.start()
+    time.sleep(0.1)
+    reg.signal_end(entry, sent=True)
+    t.join(5)
+    assert outcome == [True]
+    assert reg.result("s", TOKEN) == "cancelled"
+
+
+def test_a_refused_second_signal_does_not_undo_a_delivered_first_one():
+    reg = exec_cancel.ExecRegistry()
+    reg.begin("s", TOKEN, None, "u", "busybox")
+    entry = reg.entry("s", TOKEN)
+    reg.signal_begin(entry)
+    reg.signal_end(entry, sent=True)
+    reg.signal_begin(entry)
+    reg.signal_end(entry, sent=False)
+    assert reg.finish("s", TOKEN) is True
+
+
+def test_a_cancel_and_a_start_never_both_win(monkeypatch):
+    # Before, lookup and insert were three lock takes: a start between them ran the command after
+    # the cancel answered cancelled_before_start. Both orders over many interleavings.
+    for n in range(300):
+        reg = exec_cancel.ExecRegistry()
+        token = f"{n:032x}"
+        results = {}
+        gate = threading.Barrier(2)
+
+        def start():
+            gate.wait()
+            results["started"] = reg.begin("s", token, None, "u", "busybox")
+
+        def cancel():
+            gate.wait()
+            results["cancel"] = reg.cancel_lookup("s", token)[0]
+
+        threads = [threading.Thread(target=start), threading.Thread(target=cancel)]
+        [t.start() for t in threads]
+        [t.join(5) for t in threads]
+        if results["started"]:
+            assert results["cancel"] == "running"
+        else:
+            assert results["cancel"] == "tombstoned"
+
+
+# Delayed arrival: the API claims at t=0 and sends launch_by = 60; a cancel at t=10 beats the exec.
+CLAIM = 1_000_000.0
+SENT_LAUNCH_BY = int(CLAIM) + 60
+
+
+def _at(monkeypatch, t):
+    monkeypatch.setattr(exec_cancel.time, "time", lambda: CLAIM + t)
+
+
+def test_tombstone_outlives_the_latest_admissible_start():
+    assert exec_cancel.LAUNCH_CLOCK_ALLOWANCE_SECONDS == 30
+    assert exec_cancel.TOMBSTONE_SECONDS == 300
+    latest_start = 60 + exec_cancel.LAUNCH_CLOCK_ALLOWANCE_SECONDS
+    assert latest_start == 90
+    # A cancel cannot precede the claim, so it expires after claim + 300, past claim + 90 and past
+    # the API lost bound (timeout + 180 s, at least 181 s).
+    assert exec_cancel.TOMBSTONE_SECONDS > latest_start
+    assert exec_cancel.TOMBSTONE_SECONDS > 181
+
+
+@pytest.mark.parametrize("arrival", [89, 90, 200, 299, 309, 310, 350])
+def test_an_exec_arriving_after_a_cancel_at_t10_never_starts(monkeypatch, arrival):
+    reg = exec_cancel.ExecRegistry()
+    _at(monkeypatch, 10)
+    assert reg.cancel_lookup("s", TOKEN)[0] == "tombstoned"
+    _at(monkeypatch, arrival)
+    try:
+        started = reg.begin("s", TOKEN, SENT_LAUNCH_BY, "u", "busybox")
+    except SandboxOpError as exc:
+        assert exc.code == "exec_launch_expired"
+        started = False
+    assert started is False
+
+
+def test_no_arrival_time_starts_an_exec_whose_cancel_came_first(monkeypatch):
+    for cancel_at in (0, 10, 45, 89):
+        for arrival in range(0, 700, 7):
+            if arrival < cancel_at:
+                continue
+            reg = exec_cancel.ExecRegistry()
+            _at(monkeypatch, cancel_at)
+            reg.cancel_lookup("s", TOKEN)
+            _at(monkeypatch, arrival)
+            try:
+                assert reg.begin("s", TOKEN, SENT_LAUNCH_BY, "u", "busybox") is False
+            except SandboxOpError:
+                pass
+
+
+@pytest.mark.parametrize("arrival,starts", [(0, True), (60, True), (89, True), (90, True), (91, False), (200, False)])
+def test_an_exec_with_no_cancel_starts_up_to_claim_plus_90_and_not_after(monkeypatch, arrival, starts):
+    reg = exec_cancel.ExecRegistry()
+    _at(monkeypatch, arrival)
+    if starts:
+        assert reg.begin("s", TOKEN, SENT_LAUNCH_BY, "u", "busybox") is True
+    else:
+        with pytest.raises(SandboxOpError) as err:
+            reg.begin("s", TOKEN, SENT_LAUNCH_BY, "u", "busybox")
+        assert (err.value.code, err.value.http_status) == ("exec_launch_expired", 409)
