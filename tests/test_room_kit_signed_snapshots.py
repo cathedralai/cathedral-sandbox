@@ -112,6 +112,12 @@ def code(out: bytes) -> str:
     return json.loads(out)["error"]["code"]
 
 
+def assert_no_snapshot_hold(ledger) -> None:
+    """No fork and no snapshot delete is still counted in flight."""
+    with ledger.lock:
+        assert ledger.forks_in_flight == {} and ledger.snapshot_deletes_in_flight == {}
+
+
 def chain_actions(front: Front) -> list[str]:
     with front.ledger.lock:
         return [r["statement"]["action"] for r in front.ledger.chain]
@@ -395,6 +401,32 @@ def test_two_forks_of_one_snapshot_each_name_the_same_snapshot_receipt(front) ->
     assert {s["snapshot_receipt_sha256"] for s in got} == {snap["receipt_sha256"]}
 
 
+def test_each_fork_gets_its_own_create_receipt_naming_the_first_signed_snapshot_receipt(front) -> None:
+    # Toby (16 Nov): each fork needs a new receipt. Both forks name the same, first, snapshot receipt.
+    a = room(front)
+    snap = snapshot_ok(front, a)
+    snapshot_ok(front, a)  # a repeat that agrees: signed, but forks keep naming the first
+    forks = []
+    for _ in range(2):
+        status, headers, _out = fork(front)
+        assert status == 200
+        forks.append(receipt_of(headers))
+    s = snap["statement"]
+    assert s["action"] == "snapshot" and s["sandbox_id"] == a
+    for rc in forks:
+        st = rc["statement"]
+        assert st["action"] == "create"
+        assert members(st) == {"snapshot_id": SNAP, "snapshot_content_sha256": s["snapshot_content_sha256"],
+                               "snapshot_receipt_sha256": snap["receipt_sha256"],
+                               "snapshot_source_sandbox_id": s["sandbox_id"]}
+        assert st["snapshot_content_sha256"] == content_sha(s["snapshot_image_id"], s["snapshot_work_archive_sha256"])
+        assert st["binding_sha256"] == s["binding_sha256"] and st["sequence"] > s["sequence"]
+        assert st["room_sequence"] == 1 and st["room_previous_receipt_sha256"] is None
+    one, two = (rc["statement"] for rc in forks)
+    assert forks[0]["receipt_sha256"] != forks[1]["receipt_sha256"]
+    assert one["sandbox_id"] != two["sandbox_id"] and a not in (one["sandbox_id"], two["sandbox_id"])
+
+
 def test_a_fork_of_a_snapshot_this_front_has_no_receipt_for_is_404_snapshot_not_found_unsent_unsigned(front) -> None:
     room(front)
     before = len(front.api.seen)
@@ -486,13 +518,18 @@ def test_snapshot_delete_then_fork_is_404_snapshot_not_found(front) -> None:
     assert len(front.api.seen) == before
 
 
-def test_a_snapshot_that_is_snapshotted_again_after_its_delete_is_remembered_afresh(front) -> None:
+def test_a_snapshot_of_an_id_deleted_this_boot_is_502_unsigned_and_a_fork_of_it_is_404_unsent(front) -> None:
+    # The offline checker takes the first snapshot receipt of an id as the fork source and fails any fork after
+    # the id's delete, so the front never signs that id as a snapshot again.
     a = room(front)
     snapshot_ok(front, a)
-    snapshot_delete(front)
-    again = snapshot_ok(front, a)
-    _status, headers, _out = fork(front)
-    assert receipt_of(headers)["statement"]["snapshot_receipt_sha256"] == again["receipt_sha256"]
+    assert snapshot_delete(front)[0] == 200
+    status, headers, out = snapshot(front, a)
+    assert status == 502 and code(out) == "snapshot_unsigned" and members(receipt_of(headers)["statement"]) == {}
+    sent = front.api.count(r"POST /v1/sandboxes")
+    status, headers, out = fork(front)
+    assert status == 404 and code(out) == "snapshot_not_found" and "X-Room-Receipt" not in headers
+    assert front.api.count(r"POST /v1/sandboxes") == sent
 
 
 def test_pushing_a_snapshot_is_403_snapshot_push_refused_unsent_unsigned(front) -> None:
@@ -580,25 +617,30 @@ def test_the_machine_s_own_409_snapshot_in_progress_is_passed_on_and_signed_with
     assert status == 409 and code(out) == "snapshot_in_progress" and st["status"] == 409 and members(st) == {}
 
 
-def test_a_fork_racing_a_snapshot_delete_the_fork_sent_before_the_delete_ended_names_its_source(front) -> None:
-    # The map is read and changed only under the ledger lock, never across the machine call. A fork that
-    # passed the lookup keeps what it read; a fork asked after the delete is signed is refused.
+def test_a_snapshot_delete_while_a_fork_of_it_is_in_flight_is_409_unsent_unsigned(front) -> None:
+    # A delete admitted while a fork runs could be signed before the fork, putting a fork after the delete.
     a = room(front)
     snap = snapshot_ok(front, a)
     held = front.api.hold(r"POST /v1/sandboxes")
     t, box = in_thread(fork, front)
     held.wait_entered()
-    assert snapshot_delete(front)[0] == 200
-    assert fork(front)[0] == 404
+    front.api.replies.clear()
+    front.api.reply(r"DELETE /v1/snapshots/[^/]+", 200, {"deleted": True})
+    status, headers, out = front.call("DELETE", f"/v1/snapshots/{SNAP}")
+    assert status == 409 and code(out) == "snapshot_fork_in_flight" and "X-Room-Receipt" not in headers
+    assert front.api.count(r"DELETE /v1/snapshots/[^/]+") == 0
     held.release.set()
     status, headers, _out = finish(t, box)
     st = receipt_of(headers)["statement"]
     assert status == 200 and st["snapshot_receipt_sha256"] == snap["receipt_sha256"]
-    assert chain_actions(front) == ["create", "snapshot", "snapshot_delete", "create"]
+    assert front.call("DELETE", f"/v1/snapshots/{SNAP}")[0] == 200  # the fork ended: the delete goes through
+    assert chain_actions(front) == ["create", "snapshot", "create", "snapshot_delete"]
     assert_idle(front.ledger)
+    assert_no_snapshot_hold(front.ledger)
 
 
-def test_a_fork_racing_a_snapshot_delete_the_snapshot_is_forgotten_only_when_the_delete_is_answered(front) -> None:
+def test_a_fork_while_a_delete_of_its_snapshot_is_in_flight_is_409_unsent_unsigned(front) -> None:
+    # The entry is dropped only when the delete is signed; a fork admitted before that could be signed after it.
     a = room(front)
     snapshot_ok(front, a)
     front.api.replies.clear()
@@ -606,11 +648,34 @@ def test_a_fork_racing_a_snapshot_delete_the_snapshot_is_forgotten_only_when_the
     held = front.api.hold(r"DELETE /v1/snapshots/[^/]+")
     t, box = in_thread(front.call, "DELETE", f"/v1/snapshots/{SNAP}")
     held.wait_entered()
-    assert fork(front)[0] == 200  # the delete has not ended: the snapshot is still known
+    sent = front.api.count(r"POST /v1/sandboxes")
+    status, headers, out = fork(front)
+    assert status == 409 and code(out) == "snapshot_delete_in_flight" and "X-Room-Receipt" not in headers
+    assert front.api.count(r"POST /v1/sandboxes") == sent
     held.release.set()
     assert finish(t, box)[0] == 200
     assert fork(front)[0] == 404
+    assert chain_actions(front) == ["create", "snapshot", "snapshot_delete"]
     assert_idle(front.ledger)
+    assert_no_snapshot_hold(front.ledger)
+
+
+def test_a_failed_snapshot_delete_gives_its_hold_back_so_a_fork_works_after_it(front) -> None:
+    a = room(front)
+    snapshot_ok(front, a)
+    assert snapshot_delete(front, status=500, body={"error": {"code": "x", "message": "y"}})[0] == 500
+    assert fork(front)[0] == 200
+    assert_no_snapshot_hold(front.ledger)
+
+
+def test_a_percent_encoded_delete_is_held_and_recorded_under_the_decoded_id(front) -> None:
+    a = room(front)
+    snapshot_ok(front, a)
+    front.api.replies.clear()
+    front.api.reply(r"DELETE /v1/snapshots/[^/]+", 200, {"deleted": True})
+    status, headers, _out = front.call("DELETE", "/v1/snapshots/snap%5F0123456789ab")
+    assert status == 200 and receipt_of(headers)["statement"]["snapshot_id"] == SNAP
+    assert fork(front)[0] == 404
 
 
 def test_a_capture_answer_that_arrives_after_its_snapshot_was_deleted_is_502_and_the_entry_stays_gone(front) -> None:
@@ -633,12 +698,30 @@ def test_a_capture_answer_that_arrives_after_its_snapshot_was_deleted_is_502_and
     assert_idle(front.ledger)
 
 
-def test_a_capture_begun_after_the_delete_is_remembered_even_though_the_id_was_deleted_before(front) -> None:
+def test_a_capture_begun_after_the_delete_is_still_refused_because_the_id_was_deleted_this_boot(front) -> None:
     a = room(front)
     snapshot_ok(front, a)
     snapshot_delete(front)
-    again = snapshot_ok(front, a)
-    assert receipt_of(fork(front)[1])["statement"]["snapshot_receipt_sha256"] == again["receipt_sha256"]
+    status, _headers, out = snapshot(front, a)
+    assert status == 502 and code(out) == "snapshot_unsigned"
+    assert fork(front)[0] == 404
+
+
+def test_when_the_deleted_record_is_full_a_snapshot_is_503_sold_out_unsent_unsigned(front, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "SNAPSHOT_DELETED_CAP", 2)
+    a = room(front)
+    for sid in ("snap_000000000001", "snap_000000000002"):
+        snapshot_ok(front, a, sid)
+        assert snapshot_delete(front, sid)[0] == 200
+    sent = front.api.count(rf"POST /v1/sandboxes/{a}/snapshot")
+    status, headers, out = snapshot(front, a, "snap_000000000003")
+    assert status == 503 and code(out) == "snapshots_sold_out" and "X-Room-Receipt" not in headers
+    assert front.api.count(rf"POST /v1/sandboxes/{a}/snapshot") == sent
+    # A delete that ran is still recorded past the cap, and is signed.
+    status, headers, _out = snapshot_delete(front, "snap_000000000009")
+    assert status == 200 and receipt_of(headers)["statement"]["action"] == "snapshot_delete"
+    with front.ledger.lock:
+        assert len(front.ledger.deleted_snapshots) == 3
 
 
 def test_the_map_caps_are_a_module_constant_of_4096() -> None:
@@ -661,7 +744,7 @@ def test_the_snapshot_map_evicts_the_oldest_first_and_a_fork_of_an_evicted_one_i
 
 
 def test_a_delete_during_a_capture_wins_however_many_other_deletes_follow(front, monkeypatch) -> None:
-    # The in-flight capture is tracked directly, so no cap on anything can let the deleted id come back.
+    # Deleted ids are never evicted, so no cap on the snapshot map can let the deleted id come back.
     monkeypatch.setattr(rr, "SNAPSHOT_MAP_CAP", 2)
     a, b = room(front), room(front)
 
@@ -689,7 +772,7 @@ def test_a_delete_during_a_capture_wins_however_many_other_deletes_follow(front,
     assert_idle(front.ledger)
 
 
-def test_a_delete_marks_every_capture_in_flight_and_only_those(front) -> None:
+def test_a_delete_of_another_id_leaves_a_capture_in_flight_alone(front) -> None:
     a, b = room(front), room(front)
     front.api.replies.clear()
     front.api.reply(rf"POST /v1/sandboxes/{a}/snapshot", 202, answer())
@@ -705,24 +788,23 @@ def test_a_delete_marks_every_capture_in_flight_and_only_those(front) -> None:
 
 
 def test_a_late_not_found_leaves_the_entry_alone(front) -> None:
-    # The second review's schedule. Its premise (a machine 404 may remove an entry, so it must not remove a
-    # replacement) is gone: a machine answer to a fork never changes the record, so the replacement stays.
+    # A machine answer to a fork never changes the record: a fork answered 404 late leaves the entry, and the
+    # next fork names the same first receipt. (A delete cannot run while that fork is in flight.)
     a = room(front)
-    snapshot_ok(front, a)
+    first = snapshot_ok(front, a)
     held = front.api.hold(r"POST /v1/sandboxes")
-    t, box = in_thread(fork, front)  # admitted against the first X
+    t, box = in_thread(fork, front)
     held.wait_entered()
-    assert snapshot_delete(front)[0] == 200
-    replacement = snapshot_ok(front, a)  # a new X, a new receipt
+    assert snapshot_delete(front)[0] == 409  # refused while the fork runs
     front.api.reply(r"POST /v1/sandboxes", 404, {"error": {"code": "snapshot_not_found", "message": "no snapshot"}})
     held.release.set()
-    assert finish(t, box)[0] == 404  # the old fork's own answer
+    assert finish(t, box)[0] == 404  # the fork's own answer
     front.api.replies.clear()
-    held.release.set()
     status, headers, _out = fork(front)
     assert status == 200
-    assert receipt_of(headers)["statement"]["snapshot_receipt_sha256"] == replacement["receipt_sha256"]
+    assert receipt_of(headers)["statement"]["snapshot_receipt_sha256"] == first["receipt_sha256"]
     assert_idle(front.ledger)
+    assert_no_snapshot_hold(front.ledger)
 
 
 def test_another_guest_s_denied_fork_is_a_machine_404_and_the_owner_s_next_fork_still_works(front) -> None:

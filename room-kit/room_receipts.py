@@ -2053,11 +2053,17 @@ class Ledger:
         # for it, until a 2xx snapshot_delete is signed. Guarded by self.lock, like every table here, and never
         # held across a call to the room API, so the lock order of this file does not change.
         self.snapshots: dict[str, dict] = {}
-        # Captures in flight: token -> ids whose delete was signed since that capture began. A capture whose
-        # answer names one of them is not remembered (the delete won), however many deletes came after. The id is
-        # known only from the answer, so a delete marks every capture then in flight. Guarded by self.lock.
-        self.captures: dict[int, set[str]] = {}
-        self.capture_next = 0
+        # Snapshot ids whose 2xx snapshot_delete this boot signed. Such an id is never signed as a snapshot again
+        # and never forked, so per binding a fork always names the first snapshot receipt of its id and no fork
+        # follows the delete of its id (the offline checker's rules). Never evicted: forgetting an id would let it
+        # back. Once it holds SNAPSHOT_DELETED_CAP ids, new snapshots are refused unsent until the front restarts;
+        # a delete that already ran is still recorded, so the set may pass the cap. Guarded by self.lock.
+        self.deleted_snapshots: set[str] = set()
+        # Forks and snapshot deletes in flight, per snapshot id: a delete of an id with a fork in flight, and a
+        # fork of an id with a delete in flight, are refused unsent, so a fork receipt never follows the delete
+        # receipt of its snapshot. Guarded by self.lock.
+        self.forks_in_flight: dict[str, int] = {}
+        self.snapshot_deletes_in_flight: dict[str, int] = {}
         # Serial rooms (all guarded by self.lock). in_flight counts the authorized requests between enter and
         # leave; busy is the per-room token (taken without waiting, so nothing queues and nothing can deadlock),
         # always a subset of the in_flight keys; serial holds the rooms whose create was signed serial; broken the
@@ -2238,31 +2244,64 @@ class Ledger:
             held = self.snapshots.get(snapshot_id)
             return dict(held) if held is not None else None
 
-    def begin_snapshot(self) -> int:
-        """Register a capture in flight; the token is passed to sign_snapshot and end_capture."""
+    def snapshots_sold_out(self) -> bool:
+        """Whether the deleted-id record is full, so a new snapshot is refused before it is sent."""
         with self.lock:
-            self.capture_next += 1
-            self.captures[self.capture_next] = set()
-            return self.capture_next
+            return len(self.deleted_snapshots) >= SNAPSHOT_DELETED_CAP
 
-    def end_capture(self, token: int) -> None:
+    def admit_fork(self, snapshot_id: str) -> tuple[dict | None, tuple[int, bytes] | None]:
+        """(entry, refusal) for a fork, in one locked step: the record lookup, the deleted check, the count.
+
+        On success the fork is counted in flight; the caller gives it back with end_fork(). Refusals are sent
+        unsent and unsigned: 404 for an id this boot never signed or has deleted, 409 while a delete of it runs.
+        """
         with self.lock:
-            self.captures.pop(token, None)
+            held = self.snapshots.get(snapshot_id)
+            if held is None or snapshot_id in self.deleted_snapshots:
+                return None, (404, SNAPSHOT_NOT_FOUND_BODY)
+            if self.snapshot_deletes_in_flight.get(snapshot_id):
+                return None, (409, SNAPSHOT_DELETE_IN_FLIGHT_BODY)
+            self.forks_in_flight[snapshot_id] = self.forks_in_flight.get(snapshot_id, 0) + 1
+            return dict(held), None
 
-    def sign_snapshot(self, fields: dict, refused: dict, record: dict, token: int = 0) -> tuple[dict, bool]:
+    def end_fork(self, snapshot_id: str) -> None:
+        with self.lock:
+            left = self.forks_in_flight.get(snapshot_id, 0) - 1
+            if left > 0:
+                self.forks_in_flight[snapshot_id] = left
+            else:
+                self.forks_in_flight.pop(snapshot_id, None)
+
+    def admit_snapshot_delete(self, snapshot_id: str) -> bool:
+        """Count a snapshot delete in flight, unless a fork of that id is in flight (then False: refuse it)."""
+        with self.lock:
+            if self.forks_in_flight.get(snapshot_id):
+                return False
+            self.snapshot_deletes_in_flight[snapshot_id] = self.snapshot_deletes_in_flight.get(snapshot_id, 0) + 1
+            return True
+
+    def end_snapshot_delete(self, snapshot_id: str) -> None:
+        with self.lock:
+            left = self.snapshot_deletes_in_flight.get(snapshot_id, 0) - 1
+            if left > 0:
+                self.snapshot_deletes_in_flight[snapshot_id] = left
+            else:
+                self.snapshot_deletes_in_flight.pop(snapshot_id, None)
+
+    def sign_snapshot(self, fields: dict, refused: dict, record: dict) -> tuple[dict, bool]:
         """Sign a snapshot receipt and remember the snapshot, in one locked step: (receipt, signed).
 
         An id already held for another source room or other content is not signed: *refused* (status 502, no
         snapshot member) is signed instead and the held entry stays. A repeat that agrees is signed and the
-        first receipt stays the one forks name. An id whose delete was signed after this capture began (*token*
-        is the token from Ledger.begin_snapshot()) is not signed either: the delete won.
+        first receipt stays the one forks name. An id whose delete this boot signed is not signed either, at any
+        time: the delete won, and a later receipt for that id would not be the first.
         """
         with self.lock:
+            if record["snapshot_id"] in self.deleted_snapshots:
+                return self._sign_locked(refused), False
             held = self.snapshots.get(record["snapshot_id"])
             if held is not None and (held["content"] != record["snapshot_content_sha256"]
                                      or held["source"] != record["source"]):
-                return self._sign_locked(refused), False
-            if record["snapshot_id"] in self.captures.get(token, ()):
                 return self._sign_locked(refused), False
             receipt = self._sign_locked(fields)
             if held is None:
@@ -2317,8 +2356,7 @@ class Ledger:
         if ok and statement.get("action") == "snapshot_delete" and isinstance(statement.get("snapshot_id"), str):
             gone = statement["snapshot_id"]
             self.snapshots.pop(gone, None)
-            for marked in self.captures.values():
-                marked.add(gone)
+            self.deleted_snapshots.add(gone)
         self.store.write(canonical(receipt) + b"\n")
         return receipt
 
@@ -2361,10 +2399,25 @@ SNAPSHOT_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 # At most this many snapshots are remembered, oldest first out. Eviction fails
 # closed: a fork of a snapshot that is no longer remembered is refused unsent (404 snapshot_not_found).
 SNAPSHOT_MAP_CAP = 4096
+# At most this many deleted ids are held before new snapshots are refused (503, unsent) until the front restarts.
+SNAPSHOT_DELETED_CAP = 65536
 SNAPSHOT_PUSH = re.compile(r"^/v1/snapshots/[^/]+/push$")
 SNAPSHOT_DELETE_PATH = re.compile(r"^/v1/snapshots/(?P<id>[^/]+)$")
+SNAPSHOT_NOT_FOUND_BODY = b'{"error":{"code":"snapshot_not_found","message":"no such snapshot"}}'
+SNAPSHOT_DELETE_IN_FLIGHT_BODY = (b'{"error":{"code":"snapshot_delete_in_flight","message":"a delete of this snapshot is '
+                                  b'running; nothing was sent"}}')
+SNAPSHOT_FORK_IN_FLIGHT_BODY = (b'{"error":{"code":"snapshot_fork_in_flight","message":"a fork of this snapshot is running; '
+                                b'retry the delete when it ends"}}')
+SNAPSHOT_SOLD_OUT_BODY = (b'{"error":{"code":"snapshots_sold_out","message":"snapshots on this machine are sold out until '
+                          b'its receipts front restarts"}}')
 SNAPSHOT_UNSIGNED_BODY = (b'{"error":{"code":"snapshot_unsigned","message":"the machine answer did not name a complete '
                           b'snapshot, so no snapshot receipt was signed"}}')
+
+
+def snapshot_delete_id(path: str) -> str | None:
+    """The snapshot id a DELETE /v1/snapshots/{id} names, percent-decoded as the room API reads it."""
+    m = SNAPSHOT_DELETE_PATH.match(path)
+    return unquote(m["id"]) if m else None
 
 
 def snapshot_record(out: bytes, room: str) -> dict | None:
@@ -2648,13 +2701,15 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     turn: Turn | None = None
-    capture_token: int | None = None  # a snapshot capture in flight (Ledger.captures)
+    fork_hold: str | None = None  # the snapshot id of a fork in flight (Ledger.forks_in_flight)
+    snapshot_delete_hold: str | None = None  # the snapshot id of a delete in flight (Ledger.snapshot_deletes_in_flight)
     create_open = False  # a create was forwarded and its receipt is not yet signed
     bulk_open = False  # a bulk delete was forwarded and has not been answered
 
     def handle_one_request(self):
         self.turn = None
-        self.capture_token = None
+        self.fork_hold = None
+        self.snapshot_delete_hold = None
         self.create_open = False
         self.bulk_open = False
         try:
@@ -2664,9 +2719,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def release_turn(self) -> None:
         """Give back the request's count and token, and its place among the creates in flight. Safe to call twice."""
-        token, self.capture_token = self.capture_token, None
-        if token is not None:
-            self.server.ledger.end_capture(token)
+        fork, self.fork_hold = self.fork_hold, None
+        if fork is not None:
+            self.server.ledger.end_fork(fork)
+        deleting, self.snapshot_delete_hold = self.snapshot_delete_hold, None
+        if deleting is not None:
+            self.server.ledger.end_snapshot_delete(deleting)
         turn, self.turn = self.turn, None
         if turn is not None:
             self.server.ledger.leave(turn)
@@ -2880,17 +2938,24 @@ class Handler(BaseHTTPRequestHandler):
             if problem is not None:
                 return self.reply(400, canonical({"error": {"code": problem[0], "message": problem[1]}}))
         fork = None
-        began = 0
-        if refusal is None and action == "snapshot" and self.authorized():
-            began = self.capture_token = ledger.begin_snapshot()
+        if refusal is None and action == "snapshot" and self.authorized() and ledger.snapshots_sold_out():
+            return self.reply(503, SNAPSHOT_SOLD_OUT_BODY)
         if refusal is None and action == "create" and self.authorized():
             fork_id = self.fork_snapshot_id(body)
             if fork_id is not None:
-                fork = ledger.snapshot_entry(fork_id)
-                if fork is None:
-                    # No receipt of this boot names it: refused unsent and unsigned, as a restart leaves it.
-                    return self.reply(404, b'{"error":{"code":"snapshot_not_found","message":"no such snapshot"}}')
+                # No receipt of this boot names it (or its delete was signed, or runs now): refused unsent and
+                # unsigned, as a restart leaves it.
+                fork, problem = ledger.admit_fork(fork_id)
+                if problem is not None:
+                    return self.reply(*problem)
+                self.fork_hold = fork_id
                 fork["snapshot_id"] = fork_id
+        if refusal is None and action == "snapshot_delete" and self.authorized():
+            deleting = snapshot_delete_id(path)
+            if deleting is not None:
+                if not ledger.admit_snapshot_delete(deleting):
+                    return self.reply(409, SNAPSHOT_FORK_IN_FLIGHT_BODY)
+                self.snapshot_delete_hold = deleting
         track = None
         if refusal is None and action == "exec" and self.authorized() and EXEC_HANDLE_HEADER in self.headers:
             handle = self.headers.get(EXEC_HANDLE_HEADER, "")
@@ -2923,7 +2988,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     if action == "snapshot":
                         receipt, status, headers, out = self.sign_snapshot(ledger, path, forward_path, body, status,
-                                                                           headers, out, owner_fields, began)
+                                                                           headers, out, owner_fields)
                     else:
                         receipt = ledger.sign(
                             {**self.fields(action, path, body, status, out, target_path=forward_path, fork=fork),
@@ -2992,7 +3057,7 @@ class Handler(BaseHTTPRequestHandler):
         return value if isinstance(value, str) and value else None
 
     def sign_snapshot(self, ledger: "Ledger", path: str, forward_path: str, body: bytes | None, status: int,
-                      headers, out: bytes, owner_fields: dict, began: int = 0):
+                      headers, out: bytes, owner_fields: dict):
         """Sign a snapshot action: (receipt, status, headers, out) with the answer the caller now gets.
 
         A 2xx answer that does not name a complete snapshot for this room is answered 502 snapshot_unsigned
@@ -3009,7 +3074,7 @@ class Handler(BaseHTTPRequestHandler):
                      **owner_fields}
         refused = {**self.fields("snapshot", path, body, 502, SNAPSHOT_UNSIGNED_BODY, target_path=forward_path),
                    **owner_fields}
-        receipt, signed = ledger.sign_snapshot(ok_fields, refused, record, began)
+        receipt, signed = ledger.sign_snapshot(ok_fields, refused, record)
         if not signed:
             status, headers, out = 502, [], SNAPSHOT_UNSIGNED_BODY
         return receipt, status, headers, out
@@ -3421,9 +3486,9 @@ class Handler(BaseHTTPRequestHandler):
                                 "snapshot_receipt_sha256": fork["receipt_sha256"],
                                 "snapshot_source_sandbox_id": fork["source"]}
         elif action == "snapshot_delete":
-            deleted = SNAPSHOT_DELETE_PATH.match(path)
-            snapshot_members = {"snapshot_id": deleted["id"]} if deleted else {}
-            held = self.server.ledger.snapshot_entry(deleted["id"]) if deleted else None
+            deleted = snapshot_delete_id(path)
+            snapshot_members = {"snapshot_id": deleted} if deleted is not None else {}
+            held = self.server.ledger.snapshot_entry(deleted) if deleted is not None else None
             if held is not None:
                 snapshot_members["snapshot_source_sandbox_id"] = held["source"]
         return {**snapshot_members,

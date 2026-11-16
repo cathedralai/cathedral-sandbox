@@ -301,6 +301,17 @@ The broker admits the machine only if its HOST_DATA is in `sealed_host_data`
   front still remembers the snapshot. A delete is a delete request, not a
   statement that bytes are erased. A push of a snapshot to a registry is refused
   with 403 `snapshot_push_refused`, unsent.
+- Once a 2xx `snapshot_delete` is signed, that id is dead for the rest of the
+  boot: a snapshot answer naming it is 502 `snapshot_unsigned` and a fork of it
+  is 404, unsent. So every fork names the first snapshot receipt of its id and
+  no fork follows the delete of its id, as the offline checker requires.
+- A fork and a delete of the same snapshot never overlap: a delete while a fork
+  of that id is in flight is 409 `snapshot_fork_in_flight`, and a fork while a
+  delete of it is in flight is 409 `snapshot_delete_in_flight`, both unsent and
+  unsigned. Retry after the other ends.
+- The front keeps up to 65,536 deleted ids per boot. When full, new snapshots
+  are refused 503 `snapshots_sold_out`, unsent, until the front restarts; a
+  delete that already ran is still recorded past that number.
 
 Routes (through the broker):
 
