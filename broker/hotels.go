@@ -4,7 +4,7 @@
 // removes hotels with the operator key (config "operator_key_sha256"):
 //
 //	GET    /v1/broker/hotels/<id>   the hotel document with its admission state
-//	POST   /v1/broker/hotels        {id, name, api, health, key, concurrency, labels, threads, ram_gib, sealed, max_slots, reserved_for, miner_hotkey, require_attestation}
+//	POST   /v1/broker/hotels        {id, name, api, health, key, concurrency, labels, threads, ram_gib, sealed, max_slots, reserved_for, miner_hotkey, require_attestation, commitment}
 //	PATCH  /v1/broker/hotels/<id>   {drain, labels, reserved_for, max_slots, lend}  (reserved_for null: back to the pool; lend and reclaim: lend.go)
 
 //	DELETE /v1/broker/hotels/<id>   (only a hotel with no rooms; drain it first)
@@ -395,8 +395,17 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	case hc.MaxSlots < 0:
 		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
 		return
+	case !validAlertChat(hc.AlertChatID):
+		writeErr(w, 400, "invalid_hotel", "alert_chat_id must be a Telegram chat id (digits) or @channel")
+		return
 	case hc.LentFrom != "" || hc.LentReportID != "":
 		writeErr(w, 400, "invalid_hotel", `lent_from and lent_report_id are set by PATCH {"lend": true}, not at join`)
+		return
+	}
+	if err := b.checkJoinCommitment(hc); err != nil {
+		var ce errCommitment
+		errors.As(err, &ce)
+		writeErr(w, ce.status, ce.code, ce.msg)
 		return
 	}
 	if b.cfg.StateDir == "" {
@@ -562,15 +571,16 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		Drain       *bool             `json:"drain"`
 		MaxSlots    *int              `json:"max_slots"` // per-hotel room cap; 0: the hotel's own slots
 		Labels      map[string]string `json:"labels"`
-		ReservedFor json.RawMessage   `json:"reserved_for"` // a guest id, or null to release; on a lent hotel, the reclaim (lend.go)
-		Lend        *bool             `json:"lend"`         // true: lend the reserved hotel to the pool (lend.go)
+		ReservedFor json.RawMessage   `json:"reserved_for"`  // a guest id, or null to release; on a lent hotel, the reclaim (lend.go)
+		Lend        *bool             `json:"lend"`          // true: lend the reserved hotel to the pool (lend.go)
+		AlertChatID *string           `json:"alert_chat_id"` // the miner operator's alert chat; "" clears (alerts.go)
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if json.Unmarshal(raw, &req) != nil {
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
 	}
-	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0 || req.Lend != nil) {
+	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0 || req.Lend != nil || req.AlertChatID != nil) {
 		writeErr(w, 403, "enroller_scope", "miner enrollment may only set drain=true")
 		return
 	}
@@ -580,6 +590,15 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	}
 	if req.MaxSlots != nil && *req.MaxSlots < 0 {
 		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
+		return
+	}
+	if req.AlertChatID != nil && !validAlertChat(*req.AlertChatID) {
+		writeErr(w, 400, "invalid_hotel", "alert_chat_id must be a Telegram chat id (digits) or @channel")
+		return
+	}
+	if req.AlertChatID != nil && !h.runtime {
+		// A config file hotel's PATCH is not saved: the chat would be lost on restart.
+		writeErr(w, 409, "hotel_in_config", "hotel "+id+" is in the config file; set alert_chat_id there")
 		return
 	}
 	if h.runtime && !h.cfg.Sealed && req.Labels["sealed"] == "true" {
@@ -641,6 +660,9 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	if reserve != nil && !lc.reclaim { // a reclaim set reserved_for in applyLend
 		h.cfg.ReservedFor = *reserve
 	}
+	if req.AlertChatID != nil {
+		h.cfg.AlertChatID = *req.AlertChatID
+	}
 	h.cfgMu.Unlock()
 	var err error
 	switch {
@@ -658,6 +680,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		h.cfg.ReservedFor = oldCfg.ReservedFor
 		h.cfg.LentFrom = oldCfg.LentFrom
 		h.cfg.LentReportID = oldCfg.LentReportID
+		h.cfg.AlertChatID = oldCfg.AlertChatID
 		h.cfgMu.Unlock()
 		b.mu.Unlock()
 		writeErr(w, 500, "state_write_failed", "cannot keep the hotel update; nothing changed")
@@ -755,7 +778,8 @@ func (b *broker) hotelDoc(h *hotel) map[string]any {
 	now := time.Now()
 	return map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime,
 		"reserved_for": reserved, "lent_from": lent, "lent_report_id": lentReport, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
-		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now)}
+		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now),
+		"commitment": b.commitmentDoc(h)}
 }
 
 func (b *broker) guestExists(id string) bool {
