@@ -8,9 +8,11 @@ Nothing below is a measurement.
 
 Omni, VL and Audio, each on the two sealed room sizes, with
 `scripts/sealed_bench.py` (harness `sealed-bench-2`, in-room `lfm3-bench-1`,
-AB#444). Three runs per cell. Each run is one sealed sandbox, one exec per
-prompt, the sandbox evidence bundle, and an offline `ctcli receipt verify`
-PASS before the script exits 0.
+AB#444). One call per cell creates one sealed sandbox and repeats the prompt
+set 3 times inside it (`--runs 3`), so each cell has 3 repeats x 3 prompts = 9
+samples. The call also fetches the sandbox evidence bundle, deletes the
+sandbox, and passes only on an offline `ctcli receipt verify` PASS. Each cell
+is reported as the median with the min to max range of its 9 samples.
 
 | Template | Room |
 |---|---|
