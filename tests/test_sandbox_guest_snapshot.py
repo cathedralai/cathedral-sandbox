@@ -8,6 +8,8 @@ Defects from run 5 (2026-10-20):
 
 from __future__ import annotations
 
+import datetime as _dt
+
 import hashlib
 import importlib.util
 import json
@@ -1956,6 +1958,25 @@ def test_an_ordinary_create_whose_image_became_a_snapshot_image_while_it_started
     assert provider.quota()["usage"]["resident_sandboxes"] == 0
 
 
+def test_a_fork_of_an_expired_id_never_starts_the_snapshot_named_that_id(fake, provider) -> None:
+    # AB#604 review schedule, through create(): A is snapshotted and signed as A; C is snapshotted under the NAME
+    # of A's id; A expires. A fork of A's id must be 404, never a room built from C.
+    import dataclasses
+
+    first, _, _ = _captured(provider)
+    a = first["snapshot_id"]
+    c = _snapshot(provider, _source(provider), name=a)["snapshot_id"]
+    assert c != a
+    path, rec = provider._inner._snapshots[a]  # noqa: SLF001
+    provider._inner._snapshots[a] = (path, dataclasses.replace(rec, created_at=rec.created_at - _dt.timedelta(days=30)))  # noqa: SLF001
+    runs = len(fake.calls_of("run"))
+    with pytest.raises(SandboxOpError) as err:
+        _fork(provider, a)
+    assert (err.value.code, err.value.http_status) == ("snapshot_not_found", 404)
+    assert len(fake.calls_of("run")) == runs
+    assert provider._resolve_snapshot(a) is None  # noqa: SLF001
+
+
 def test_lookups_after_the_first_resolution_are_by_id_and_never_match_a_name(fake, provider) -> None:
     first, _, _ = _captured(provider)
     gone = first["snapshot_id"]
@@ -1966,7 +1987,9 @@ def test_lookups_after_the_first_resolution_are_by_id_and_never_match_a_name(fak
         provider._pin_snapshot(gone)  # noqa: SLF001
     assert err.value.code == "snapshot_not_found"
     assert provider._snapshot_by_id(gone) is None  # noqa: SLF001
-    assert provider._resolve_snapshot(gone) == other["snapshot_id"]  # noqa: SLF001  only the first resolution reads names
+    with pytest.raises(SandboxOpError) as err:
+        _fork(provider, gone)  # through create(): the id-shaped reference is never read as a name
+    assert err.value.code == "snapshot_not_found"
 
 
 # ---------------------------------------------------------------- H9: the fork's environment as the engine builds it
@@ -1989,3 +2012,56 @@ def test_without_the_blanking_the_engine_model_shows_the_value_leak(fake, provid
     result, _, _ = _captured(provider, env={"API_TOKEN": "s3cret", "MODE": "x"})
     env = _env_of(fake, _fork(provider, result["snapshot_id"])["id"])
     assert env["MODE"] == "x" and env["API_TOKEN"] == "s3cret"
+
+
+class _FakeEgress:
+    def __init__(self) -> None:
+        self.forgotten: list[str] = []
+
+    def apply(self, container_id, sandbox_id, policy, owner_key):
+        return {"policy": {"mode": "deny_all", "allow": []}, "policy_sha256": "0" * 64}
+
+    def forget(self, container_id) -> None:
+        self.forgotten.append(container_id)
+
+
+class _FakeNetPool:
+    dns: tuple[str, ...] = ()
+
+    def __init__(self) -> None:
+        self.held: list[str] = []
+        self.released: list[str | None] = []
+
+    def ensure(self, client) -> None:
+        pass
+
+    def acquire(self) -> str:
+        self.held.append("bridge")
+        return "bridge"
+
+    def release(self, network) -> None:
+        self.released.append(network)
+
+
+def test_a_late_refusal_forgets_the_egress_entry_and_gives_the_network_back(fake, provider, monkeypatch) -> None:
+    result, _, _ = _captured(provider)
+    snap_id = result["snapshot_id"]
+    egress, pool = _FakeEgress(), _FakeNetPool()
+    monkeypatch.setattr(provider, "_egress", egress)
+    monkeypatch.setattr(provider, "_net_pool", pool)
+    started: list[str] = []
+    real = provider._start_container  # noqa: SLF001
+
+    def start(*args, **kwargs):
+        cid = real(*args, **kwargs)
+        started.append(cid)
+        provider.delete_snapshot(snap_id)
+        return cid
+
+    monkeypatch.setattr(provider, "_start_container", start)
+    with pytest.raises(SandboxOpError) as err:
+        _fork(provider, snap_id)
+    assert err.value.code == "snapshot_corrupt"
+    assert egress.forgotten == started and len(started) == 1
+    assert pool.released == ["bridge"]
+    assert provider._net_pending == {}  # noqa: SLF001

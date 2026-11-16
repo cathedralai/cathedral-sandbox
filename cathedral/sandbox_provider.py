@@ -29,6 +29,7 @@ import contextlib
 import hashlib
 import io
 import os
+import re
 import shutil
 import signal
 import stat
@@ -92,6 +93,14 @@ class SandboxOpError(Exception):
 # AB#604: per-machine cap on stored snapshot bytes (/work archives plus committed layers).
 # The operator sets it with CATHEDRAL_SANDBOX_SNAPSHOT_MAX_BYTES; this is the default.
 DEFAULT_MAX_SNAPSHOT_BYTES = 100 << 30
+# The shape of a snapshot id (this provider mints "snap_" + 12 hex; the receipts front signs ids of this shape).
+# A fork whose reference has this shape is looked up by id only, never by name: a snapshot whose NAME equals an
+# id that expired or went must not be started under that id (AB#604).
+SNAPSHOT_ID_SHAPE = re.compile(r"snap_[0-9A-Za-z]{1,64}")
+
+
+def looks_like_snapshot_id(ref: str) -> bool:
+    return bool(SNAPSHOT_ID_SHAPE.fullmatch(ref))
 # AB#604: how long a capture waits for API writes already in flight before it gives up.
 SNAPSHOT_WRITE_WAIT_SECONDS = 30.0
 # AB#604: how long the /work tar may run before the capture fails and the room runs again.
@@ -682,9 +691,9 @@ class InMemorySandboxProvider:
             snap = self._snapshots.get(request.snapshot_id)
             if snap is not None and not self._snapshot_visible(request.snapshot_id):
                 snap = None  # another key's snapshot: as good as absent
-            if snap is None:
+            if snap is None and not looks_like_snapshot_id(request.snapshot_id):
                 # §3.5: a fork may name the snapshot instead of its id
-                # (Harbor CreateSandboxFromSnapshotParams(snapshot=name)).
+                # (Harbor CreateSandboxFromSnapshotParams(snapshot=name)). Never for an id-shaped reference.
                 snap = next(((sid, r) for sid, (_, r) in self._snapshots.items()
                              if r.name == request.snapshot_id and self._snapshot_visible(sid)), None)
                 if snap is not None:

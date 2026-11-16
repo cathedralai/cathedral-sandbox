@@ -68,6 +68,7 @@ from cathedral.sandbox_provider import (
     SandboxOpError,
     _parse_label_filters,
     _render_cmd,
+    looks_like_snapshot_id,
     provider_from_environment,
 )
 
@@ -1697,6 +1698,9 @@ class DockerGuestProvider:
             expired = self._inner._snapshot_expired  # noqa: SLF001
             if ref in snapshots and visible(ref) and not expired(snapshots[ref][1]):
                 return ref
+            if looks_like_snapshot_id(ref):
+                # An id-shaped reference is an id only: a name equal to a gone or expired id is not followed.
+                return None
             for sid, (_, rec) in snapshots.items():
                 if rec.name == ref and visible(sid) and not expired(rec):
                     return sid
