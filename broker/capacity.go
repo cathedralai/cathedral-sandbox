@@ -325,6 +325,7 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 			"miner_hotkey_caps":    b.cfg.MinerHotkeyCaps,
 			"miner_max_hotels":     b.cfg.MinerMaxHotels,
 			"miner_tls_pin":        true,
+			"miner_min_commitment": b.cfg.MinerMinCommitment, // null: a commitment is optional
 		}
 	}
 	writeJSON(w, 200, doc)
