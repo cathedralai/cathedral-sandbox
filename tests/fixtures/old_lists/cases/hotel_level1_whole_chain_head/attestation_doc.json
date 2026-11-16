@@ -1,0 +1,11 @@
+{
+ "binding": {
+  "boot_id": "boot-1",
+  "hotel": "h1",
+  "level": "hotel",
+  "receipt_key_ed25519_b64": "zRJi8QelYr8QsXwU473l109GOfCldG/KC0Vjs6eN5Iw=",
+  "schema": "cathedral_hotel_binding_v1"
+ },
+ "binding_sha256": "e15a571b541f506c3b6d6534a0b7772b1971c4eb31b1f4d222d383a5027acd2b",
+ "report_b64": ""
+}

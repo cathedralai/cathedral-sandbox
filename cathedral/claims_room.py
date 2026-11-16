@@ -53,6 +53,7 @@ from cathedral.claims_evidence import (
     verify_claims_evidence,
     write_claims_pack,
 )
+from cathedral.no_redirect import NoRedirect
 
 CLAIMS_ROOM_POLICY_SCHEMA = "cathedral_claims_room_policy_v1"
 CLAIMS_RUN_SCHEMA = "cathedral_claims_run_v1"
@@ -119,7 +120,7 @@ class HttpBrokerTransport:
         for key, value in headers.items():
             req.add_header(key, value)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
+            with urllib.request.build_opener(NoRedirect()).open(req, timeout=timeout) as response:
                 return response.status, dict(response.headers), response.read()
         except urllib.error.HTTPError as exc:
             return exc.code, dict(exc.headers or {}), exc.read()

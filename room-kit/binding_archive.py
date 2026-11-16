@@ -12,9 +12,40 @@ import hashlib
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+class RedirectRefused(OSError):
+    pass
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def _refuse(self, req, response, headers):
+        try:
+            location = headers.get("Location") or headers.get("URI")
+            target = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, location))
+            if target.scheme not in ("http", "https") or not target.hostname:
+                raise ValueError("unsupported redirect target")
+            host, port = target.hostname, target.port
+            if not re.fullmatch(r"[A-Za-z0-9.:-]+", host):
+                raise ValueError("unsafe redirect host")
+            message = f"redirect refused to {host}:{port}" if port is not None else f"redirect refused to {host}"
+        except (TypeError, ValueError, UnicodeError):
+            message = "redirect refused"
+        finally:
+            response.close()
+        raise RedirectRefused(message)
+
+    def http_error_301(self, req, response, code, message, headers):
+        self._refuse(req, response, headers)
+
+    http_error_302 = http_error_301
+    http_error_303 = http_error_301
+    http_error_307 = http_error_301
+    http_error_308 = http_error_301
 
 
 def canonical(document) -> bytes:
@@ -44,7 +75,7 @@ def fetch_archived_binding(broker: str, sha: str, operator_key: str, *, opener=N
     """``GET /v1/broker/bindings/<sha>`` with the operator bearer key."""
     url = broker.rstrip("/") + "/v1/broker/bindings/" + sha.lower()
     req = urllib.request.Request(url, headers={"Authorization": "Bearer " + operator_key.strip()})
-    open_fn = opener or urllib.request.urlopen
+    open_fn = opener or urllib.request.build_opener(NoRedirect()).open
     try:
         with open_fn(req, timeout=60) as resp:
             raw = resp.read()
@@ -52,6 +83,8 @@ def fetch_archived_binding(broker: str, sha: str, operator_key: str, *, opener=N
         if exc.code == 404:
             raise ValueError(f"no archived binding with hash {sha[:16]}...") from exc
         raise ValueError(f"broker binding archive answered {exc.code}") from exc
+    except RedirectRefused as exc:
+        raise ValueError(str(exc)) from exc
     return parse_archived_binding(raw, sha)
 
 

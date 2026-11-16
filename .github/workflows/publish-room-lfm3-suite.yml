@@ -325,6 +325,24 @@ jobs:
             fi
             contract="${contract}
           gateway: $(grep -c '^data: {' <<< "$stream") chunks, then [DONE]"
+            # lfm3-bench (AB#444): one streamed, timed request. Its last line must
+            # carry a first-token time, both rates and the model sha256 the
+            # image's SHA256SUMS records.
+            bench="$(docker exec smoke lfm3-bench --max-tokens 64 --index 0 '["What is 2+2? Answer in one word."]')" || {
+              printf '%s\n' "$bench"
+              echo "::error::lfm3-bench failed"
+              exit 1
+            }
+            bench_line="$(grep '^lfm3-bench {' <<< "$bench" | tail -n 1)"
+            if ! jq -e '(.ttft_ms | type) == "number" and (.decode_tok_s | type) == "number"
+                and (.prompt_tok_s | type) == "number" and (.model_sha256 | test("^[0-9a-f]{64}$"))' \
+                <<< "${bench_line#lfm3-bench }" > /dev/null; then
+              printf '%s\n' "$bench"
+              echo "::error::lfm3-bench printed no usable result line"
+              exit 1
+            fi
+            contract="${contract}
+          ${bench_line}"
           fi
           mem="$(docker stats --no-stream --format '{{.MemUsage}}' smoke)"
           sums="$(docker exec smoke cat /opt/lfm3/SHA256SUMS)"
