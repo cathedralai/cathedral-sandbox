@@ -146,6 +146,13 @@ def main(argv):
                 return 1
             if argv[-1] not in st["images"]:
                 st["images"].append(argv[-1])
+            # The image keeps the container's environment; each --change "ENV NAME=" sets NAME to empty.
+            env = dict(st["containers"][find(st, argv[-2])].get("env") or {})
+            for i, part in enumerate(argv):
+                if part == "--change" and argv[i + 1].startswith("ENV "):
+                    name, _, value = argv[i + 1][4:].partition("=")
+                    env[name] = value
+            st.setdefault("image_env", {})[argv[-1]] = env
         return 0
 
     if cmd == "push":
@@ -303,7 +310,18 @@ def main(argv):
             # exit_at_once: {argv token: exit code}. The container starts and
             # its entrypoint ends at once; docker run -d still prints the id.
             exited = next((code for tok, code in b.get("exit_at_once", {}).items() if tok in argv), None)
+            # The environment a process in the container sees: the image's own, then each -e over it.
+            image_env = st.get("image_env", {})
+            env = {}
+            for ref, kept in image_env.items():
+                if ref in argv or image_id_for(ref, b) in argv:
+                    env = dict(kept)
+            for i, part in enumerate(argv):
+                if part == "-e":
+                    name, _, value = argv[i + 1].partition("=")
+                    env[name] = value
             st["containers"][cid] = {
+                "env": env,
                 "name": name,
                 "labels": labels,
                 "status": "created" if fail else ("exited" if exited is not None else "running"),

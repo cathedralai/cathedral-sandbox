@@ -1910,3 +1910,82 @@ def test_an_image_removal_that_times_out_is_still_queued_for_the_sweep(fake, pro
     assert deleted is True and pending is True and image in provider.pending_image_removals()
     provider.sweep()
     assert image not in fake.state["images"] and provider.pending_image_removals() == {}
+
+
+# ---------------------------------------------------------------- AB#604 re-review: checked again after the start
+def _late(provider, monkeypatch, after_start) -> None:
+    """Run *after_start* right after docker run returns, as a delete or a publish racing the start would."""
+    real = provider._start_container  # noqa: SLF001
+
+    def start(*args, **kwargs):
+        container_id = real(*args, **kwargs)
+        after_start(kwargs)
+        return container_id
+
+    monkeypatch.setattr(provider, "_start_container", start)
+
+
+def test_a_snapshot_deleted_while_the_fork_starts_is_409_and_the_started_container_is_removed(fake, provider, monkeypatch) -> None:
+    result, _, _ = _captured(provider)
+    snap_id = result["snapshot_id"]
+    _late(provider, monkeypatch, lambda _kw: provider.delete_snapshot(snap_id))
+    runs = len(fake.calls_of("run"))
+    with pytest.raises(SandboxOpError) as err:
+        _fork(provider, snap_id)
+    assert (err.value.code, err.value.http_status) == ("snapshot_corrupt", 409)
+    assert len(fake.calls_of("run")) == runs + 1  # it did start, then went
+    assert len(fake.containers) == 1 and len(provider._guests) == 1  # noqa: SLF001  the source room only
+    assert provider.quota()["usage"]["resident_sandboxes"] == 1
+
+
+def test_an_ordinary_create_whose_image_became_a_snapshot_image_while_it_started_is_refused_and_removed(fake, provider, monkeypatch) -> None:
+    fake.add_image("plain:1")
+    published: set[str] = set()
+    real_keys = provider._snapshot_image_keys  # noqa: SLF001
+
+    def keys():
+        ids, names = real_keys()
+        return ids | published, names
+
+    monkeypatch.setattr(provider, "_snapshot_image_keys", keys)
+    _late(provider, monkeypatch, lambda kw: published.add(kw["image"].removeprefix("sha256:")))
+    with pytest.raises(SandboxOpError) as err:
+        _create_image(provider, "plain:1")
+    assert (err.value.code, err.value.http_status) == ("snapshot_image_fork_only", 400)
+    assert fake.containers == {} and provider._guests == {}  # noqa: SLF001
+    assert provider.quota()["usage"]["resident_sandboxes"] == 0
+
+
+def test_lookups_after_the_first_resolution_are_by_id_and_never_match_a_name(fake, provider) -> None:
+    first, _, _ = _captured(provider)
+    gone = first["snapshot_id"]
+    other = _snapshot(provider, _source(provider), name=gone)  # a second snapshot whose NAME is the first one's id
+    assert other["snapshot_id"] != gone
+    provider.delete_snapshot(gone)
+    with pytest.raises(SandboxOpError) as err:
+        provider._pin_snapshot(gone)  # noqa: SLF001
+    assert err.value.code == "snapshot_not_found"
+    assert provider._snapshot_by_id(gone) is None  # noqa: SLF001
+    assert provider._resolve_snapshot(gone) == other["snapshot_id"]  # noqa: SLF001  only the first resolution reads names
+
+
+# ---------------------------------------------------------------- H9: the fork's environment as the engine builds it
+def _env_of(fake, room_id: str) -> dict:
+    return next(c["env"] for c in fake.state["containers"].values() if c["labels"].get("cathedral.sandbox.id") == room_id)
+
+
+def test_the_fork_sees_its_own_values_and_blank_values_for_the_first_rooms_create_time_variables(fake, provider) -> None:
+    result, _, _ = _captured(provider, env={"API_TOKEN": "s3cret", "MODE": "x"})
+    req = CreateSandboxRequest(snapshot_id=result["snapshot_id"], resources=RES, env={"API_TOKEN": "fork-own"})
+    env = _env_of(fake, provider.create(req, api_key="k", idempotency=None, body_digest="f")["id"])
+    assert env["API_TOKEN"] == "fork-own" and env["MODE"] == ""
+    assert "s3cret" not in env.values() and "x" not in env.values()
+
+
+def test_without_the_blanking_the_engine_model_shows_the_value_leak(fake, provider, monkeypatch) -> None:
+    # Control: the model above is not just reading argv. With the --change list dropped, the image keeps MODE=x.
+    real = provider._client.commit  # noqa: SLF001
+    monkeypatch.setattr(provider._client, "commit", lambda cid, name, blank_env=(): real(cid, name))  # noqa: SLF001
+    result, _, _ = _captured(provider, env={"API_TOKEN": "s3cret", "MODE": "x"})
+    env = _env_of(fake, _fork(provider, result["snapshot_id"])["id"])
+    assert env["MODE"] == "x" and env["API_TOKEN"] == "s3cret"

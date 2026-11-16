@@ -1486,8 +1486,9 @@ class DockerGuestProvider:
         return normalize_image_id(str(inspected.get("Id") or ""))
 
     def _require_snapshot_owner(self, snapshot_ref: str, owner: str) -> None:
-        """Refuse a fork of another guest's snapshot on the same hotel key."""
-        snap_id = self._resolve_snapshot(snapshot_ref)
+        """Refuse a fork of another guest's snapshot on the same hotel key. *snapshot_ref* is a snapshot id,
+        resolved once by the caller; it is looked up by id only."""
+        snap_id = self._snapshot_by_id(snapshot_ref)
         if snap_id is None:
             # Inner visibility (per api_key) still answers snapshot_not_found.
             return
@@ -1701,13 +1702,24 @@ class DockerGuestProvider:
                     return sid
         return None
 
+    def _snapshot_by_id(self, snap_id: str) -> str | None:
+        """*snap_id* when it names a visible, unexpired snapshot by id; never matched against names, so a name
+        can not redirect a lookup that already resolved to an id."""
+        with self._inner._lock:  # noqa: SLF001
+            snapshots = self._inner._snapshots  # noqa: SLF001
+            if snap_id in snapshots and self._inner._snapshot_visible(snap_id) \
+                    and not self._inner._snapshot_expired(snapshots[snap_id][1]):  # noqa: SLF001
+                return snap_id
+        return None
+
     def _pin_snapshot(self, ref: str) -> "_ForkPin":
-        """Resolve snapshot *ref* ONCE and verify its image. The pin carries the snapshot id, the stored
-        entry and the verified image id; a fork starts from the pin, never from a name or a tag.
+        """Look up snapshot id *ref* (by id only; the caller resolved any name once) and verify its image.
+        The pin carries the snapshot id, the stored entry and the verified image id; a fork starts from the
+        pin, never from a name or a tag.
 
         Unknown or expired: 404 snapshot_not_found. A record whose committed image is gone from this host,
         or has another id than the record's committed_image_id: 409 snapshot_corrupt."""
-        snap_id = self._resolve_snapshot(ref)
+        snap_id = self._snapshot_by_id(ref)
         if snap_id is None:
             raise SandboxOpError("snapshot_not_found", 404, f"no snapshot {ref} on this host")
         with self._inner._lock:  # noqa: SLF001
@@ -1721,6 +1733,18 @@ class DockerGuestProvider:
         if self._image_id_of(image) != expected:
             raise SandboxOpError("snapshot_corrupt", 409, f"snapshot {snap_id}: its image is not the one that was captured")
         return _ForkPin(snap_id, image, expected, entry)
+
+    def _snapshot_changed_during_start(
+        self, request: CreateSandboxRequest, pin: "_ForkPin | None", run_image: str
+    ) -> SandboxOpError | None:
+        """The refusal for a container that started from a snapshot whose standing changed meanwhile, or None."""
+        if pin is not None:
+            if not self._pin_still_holds(pin):
+                return SandboxOpError("snapshot_corrupt", 409, f"snapshot {pin.snap_id} changed during the fork")
+            return None
+        if request.snapshot_id is None and run_image.removeprefix("sha256:") in self._snapshot_image_keys()[0]:
+            return SandboxOpError("snapshot_image_fork_only", 400, "a snapshot's image starts only through a fork of that snapshot")
+        return None
 
     def _pin_still_holds(self, pin: "_ForkPin") -> bool:
         with self._inner._lock:  # noqa: SLF001
@@ -2193,6 +2217,16 @@ class DockerGuestProvider:
             self._client.remove_confirmed(container_id, timeout=self._rm_timeout)
             self._release_pending(sandbox_id)
             raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
+        late = self._snapshot_changed_during_start(request, pin, run_image)
+        if late is not None:
+            # docker run ran outside the provider lock, so a check before it leaves a window: a snapshot deleted
+            # or replaced (fork), or published for this image (ordinary create), while the container started.
+            # Checked again now that it runs, before it is registered; cleaned up as an egress failure is.
+            self._client.remove_confirmed(container_id, timeout=self._rm_timeout)
+            if attach and self._egress is not None:
+                self._egress.forget(container_id)
+            self._release_pending(sandbox_id)
+            raise late
         with self._doomed_lock:
             self._net_pending.pop(sandbox_id, None)
         self._guests[sandbox_id] = GuestRecord(
@@ -2883,10 +2917,13 @@ class DockerGuestProvider:
         Any host can then start rooms from *image*. The image holds the root
         file system only. /work is a bind mount and is not in the image.
         """
+        # Resolved once (an id or a name); every later lookup is by that id.
+        snap_id = self._resolve_snapshot(snapshot_id)
+        if snap_id is None:
+            raise SandboxOpError("snapshot_not_found", 404, f"no snapshot {snapshot_id} on this host")
         if owner is not None:
-            self._require_snapshot_owner(snapshot_id, owner)
-        local = self._snapshot_image(snapshot_id)
-        snap_id = self._resolve_snapshot(snapshot_id) or snapshot_id
+            self._require_snapshot_owner(snap_id, owner)
+        local = self._snapshot_image(snap_id)
         digest = self._client.push(local, image, registry_auth=registry_auth)
         if image != local:
             # Untag: a local copy under the registry name would start for any
