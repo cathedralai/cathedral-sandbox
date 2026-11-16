@@ -2315,6 +2315,12 @@ class DockerGuestProvider:
         deadline = time.monotonic() + exec_cancel.CANCEL_WINDOW_SECONDS
         # The first signal goes through the pid file guard and names the process group.
         rc, out = self._signal_exec_group(guest, entry, token, "TERM", None)
+        # A cancel that wins the start by a few ms can come before the wrapper wrote the pid file. The
+        # exec is registered as wrapped, so give the file a short chance before answering unsupported.
+        pid_file_until = time.monotonic() + exec_cancel.PID_FILE_WAIT_SECONDS
+        while rc == exec_cancel.NO_PID_FILE and time.monotonic() < pid_file_until and not entry.done.is_set():
+            time.sleep(exec_cancel.POLL_SECONDS)
+            rc, out = self._signal_exec_group(guest, entry, token, "TERM", None)
         if rc == exec_cancel.NO_PID_FILE:
             return "unsupported"
         # A guard refusal on the first signal means nothing was sent: not progress.

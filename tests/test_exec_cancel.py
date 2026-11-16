@@ -390,6 +390,38 @@ def test_a_real_timeout_exit_143_is_not_a_cancel(fake):
         provider.close()
 
 
+def test_a_cancel_that_beats_the_pid_file_waits_for_it_instead_of_answering_unsupported(fake, tmp_path, monkeypatch):
+    release = tmp_path / "release"
+    fake.set(
+        timeout_form="busybox",
+        exec_rules=[
+            {"contains": "busybox TERM", "append": str(release), "stdout": PGID_LINE, "exit": 0},
+            {"contains": "busybox PROBE", "stdout": "empty\n", "exit": 0},
+            {"contains": "hold-marker", "wait_for": str(release), "exit": 143},
+        ],
+    )
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        real = provider._signal_exec_group
+        misses = []
+
+        def late_pid_file(guest, entry, token, sig, pgid, **kw):
+            if sig == "TERM" and len(misses) < 2:
+                misses.append(1)
+                return exec_cancel.NO_PID_FILE, ""
+            return real(guest, entry, token, sig, pgid, **kw)
+
+        monkeypatch.setattr(provider, "_signal_exec_group", late_pid_file)
+        t, out = _start(provider, sid, ExecRequest(cmd=["sh", "-c", "hold-marker"], timeout_seconds=300, spill_token=TOKEN))
+        _wait_running(TOKEN, sid)
+        assert provider.cancel_exec(sid, TOKEN) == "stopped"
+        t.join(5)
+        assert len(misses) == 2 and out[0].cancelled is True
+    finally:
+        provider.close()
+
+
 def test_cancel_of_an_exec_that_ended_on_its_own_says_so(fake):
     fake.set(timeout_form="gnu", exec_rules=[{"contains": "quick-marker", "exit": 0}])
     provider = DockerGuestProvider()

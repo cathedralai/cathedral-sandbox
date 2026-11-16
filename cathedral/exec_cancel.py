@@ -35,6 +35,8 @@ LAUNCH_CLOCK_ALLOWANCE_SECONDS = 30
 SIGNAL_SETTLE_SECONDS = 25.0
 # How often the hotel looks at the exec call and the process group while a cancel is in progress.
 POLL_SECONDS = 0.1
+# A cancel that arrives before the start wrapper wrote its pid file retries for this long.
+PID_FILE_WAIT_SECONDS = 1.0
 
 # Exit codes of KILL_SCRIPT. 0 means the signal went out.
 REFUSED = 3
