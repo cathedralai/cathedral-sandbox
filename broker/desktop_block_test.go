@@ -7,7 +7,9 @@ import (
 )
 
 // desktopRoutes are the hotel's room desktop routes, REST and WebSocket.
-var desktopRoutes = []string{"/desktop", "/desktop/ws"}
+// The ";params" forms reach the hotel's /desktop route too (its router drops
+// ";params" from the last segment), so the broker refuses them as well.
+var desktopRoutes = []string{"/desktop", "/desktop/ws", "/desktop;x", "/desktop;", "/desktop%3Bx", "/desktop;x/ws"}
 
 // desktopCalls lists the desktop requests hotel id received.
 func desktopCalls(tc *testChain, id string) []string {

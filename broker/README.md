@@ -365,6 +365,9 @@ One policy for every hotel in the pool, sealed or shared, operator or miner:
 | `/access-tickets` | every hotel | passed to the hotel |
 | `/processes/<pid>/attach` | every hotel | passed to the hotel, which refuses it |
 
+- Both gates key on the first path segment after the room id with any
+  `;params` removed, because the hotel's router drops `;params` from the last
+  segment: `/desktop;x` and `/terminals;x` are refused like the bare names.
 - The broker upgrades a WebSocket only on `/terminals/<tid>/ws` (above). Any
   other ticketed WebSocket route that reaches a hotel arrives as a plain GET,
   so a ticket minted through `/access-tickets` opens no other stream through

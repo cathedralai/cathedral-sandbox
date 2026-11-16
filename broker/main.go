@@ -1352,9 +1352,14 @@ func isMinerHotel(h *hotel) bool {
 
 func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestState, rest string) {
 	bid, tail, _ := strings.Cut(rest, "/")
+	// The gates below key on the first tail segment without any ";params":
+	// the hotel's router (urlparse) drops ";params" from the last segment, so
+	// "desktop;x" or "terminals;x" reaches the same hotel route as the bare name.
+	gate, _, _ := strings.Cut(tail, "/")
+	gate, _, _ = strings.Cut(gate, ";")
 	// Room terminals open only on hotels known to run a package where a
 	// terminal line goes through the runtime's exec (B154).
-	if tail == "terminals" || strings.HasPrefix(tail, "terminals/") {
+	if gate == "terminals" {
 		if why := b.terminalsRefused(bid); why != "" {
 			writeErr(w, 403, "terminals_disabled", why)
 			return
@@ -1364,7 +1369,7 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	// pumps a WebSocket only for terminals (terminal_ws.go), and the
 	// availability answer names the hotel's internal address. A desktop runs
 	// over exec. This sits before the WebSocket branch below on purpose.
-	if tail == "desktop" || strings.HasPrefix(tail, "desktop/") {
+	if gate == "desktop" {
 		writeErr(w, 403, "desktop_disabled", "room desktop routes are disabled on every hotel; drive a desktop over exec")
 		return
 	}
