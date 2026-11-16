@@ -195,3 +195,71 @@ def test_cli_signs_nothing_when_a_check_fails(tmp_path, capsys):
     assert ho.main(["--origin", ORIGIN, "--attestation", str(att), "--hotkey-file", key]) == 1
     captured = capsys.readouterr()
     assert captured.out == "" and "REPORT_DATA" in captured.err and ALICE_SEED[2:] not in captured.err
+
+
+def _serve(status, body):
+    import http.server
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(status)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+@pytest.mark.parametrize("status,body,code", [(200, b'{"ok":true}', 0), (422, b"machine_not_on_roster", 1)])
+def test_cli_post_exit_status_follows_the_api_answer(tmp_path, capsys, status, body, code):
+    att = tmp_path / "att.json"
+    att.write_text(json.dumps(attestation()))
+    key = write(tmp_path, ALICE_SEED)
+    server = _serve(status, body)
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/v1/cathedral/snp/hotel-offers"
+        rc = ho.main(["--origin", ORIGIN, "--attestation", str(att), "--hotkey-file", key, "--post", url])
+    finally:
+        server.shutdown()
+    captured = capsys.readouterr()
+    assert rc == code
+    if code:
+        assert f"HTTP {status} machine_not_on_roster" in captured.err and captured.out == ""
+    else:
+        assert f"HTTP {status}" in captured.out
+
+
+@pytest.mark.parametrize("url", ["https://10.200.0.2:18443", "https://[fd00::2]:18443"])
+def test_fetch_url_accepts_a_private_guest_address(url):
+    assert ho.check_fetch_url(url) == url
+
+
+@pytest.mark.parametrize("url", ["http://10.200.0.2:18443", "https://10.200.0.2", "https://host.example:18443",
+                                 "https://10.200.0.2:18443/room/attestation", "https://u@10.200.0.2:18443"])
+def test_fetch_url_refusals(url):
+    with pytest.raises(ho.OfferError, match="attestation URL"):
+        ho.check_fetch_url(url)
+
+
+def test_cli_fetches_from_the_guest_url_and_advertises_the_public_origin(tmp_path, capsys, monkeypatch):
+    fetched = []
+
+    def fake_fetch(url):
+        fetched.append(url)
+        return attestation(), SPKI
+
+    monkeypatch.setattr(ho, "fetch_attestation", fake_fetch)
+    key = write(tmp_path, ALICE_SEED)
+    assert ho.main(["--origin", ORIGIN, "--attestation-url", "https://10.200.0.2:18443", "--hotkey-file", key]) == 0
+    assert fetched == ["https://10.200.0.2:18443"]
+    assert json.loads(capsys.readouterr().out)["api"] == ORIGIN
+    fetched.clear()
+    assert ho.main(["--origin", ORIGIN, "--hotkey-file", key]) == 0
+    assert fetched == [ORIGIN]
+    assert ho.main(["--origin", ORIGIN, "--attestation-url", "http://10.200.0.2:18443", "--hotkey-file", key]) == 1

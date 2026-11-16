@@ -449,6 +449,12 @@ python3 hotel_offer.py --origin https://<public ip>:<SEALED_MINER_PUBLIC_PORT> -
 python3 hotel_offer.py --origin ... --hotkey-file <hotkey> --post https://<api>/v1/cathedral/snp/hotel-offers
 ```
 
+- On a miner using `sealed/host-net.sh` the host cannot reach its own public address, so fetch from the guest:
+  add `--attestation-url https://<guest ip>:<SEALED_MINER_TLS_PORT>` (the offer still advertises `--origin`; the
+  TLS key check still applies). Or pass the attestation the installer saved, `--attestation <SEALED_DIR>/run/attestation.json`
+  (read from the guest over plain HTTP on the tap, so the TLS key check is skipped; the API checks it).
+- A refused offer (for example the 422 reason code) is printed to stderr and the command exits 1; only an accepted
+  offer exits 0.
 - `--hotkey-file` is a plaintext Bittensor hotkey file (`secretSeed`) or a file holding the 32-byte seed as hex,
   mode 600. An encrypted keyfile is refused.
 - Before signing it checks that `binding_sha256` is the digest of the binding, that the SNP report commits to the
@@ -457,7 +463,7 @@ python3 hotel_offer.py --origin ... --hotkey-file <hotkey> --post https://<api>/
 - `--sequence` must grow with every offer for the machine (default: unix time). `--withdraw` withdraws the offer.
   `--network` and `--netuid` default to `finney` and 94. An offer is good for the age window the API sets, so
   sign a new one after each guest boot (a new boot is a new binding).
-- Without `--post` it prints the offer. A 422 answer carries the API's reason code. The offer grants nothing: the
+- Without `--post` it prints the offer. The offer grants nothing: the
   API fetches the attestation itself and checks the TLS key, the AMD chain, the published measurement and the
   roster machine.
 - Not covered here: the signed update channel for a miner hotel, and a miner-side view of offer status.
