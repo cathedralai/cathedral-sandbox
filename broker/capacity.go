@@ -356,6 +356,7 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 			// Miner probation (probation.go): 0 is off.
 			"miner_probation_seconds":        b.cfg.MinerProbationSeconds,
 			"miner_probation_min_uptime_pct": float64(b.probationMinBP()) / 100,
+			"miner_min_commitment":           b.cfg.MinerMinCommitment, // null: a commitment is optional
 		}
 	}
 	writeJSON(w, 200, doc)

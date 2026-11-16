@@ -1,0 +1,135 @@
+{
+ "archived_binding": {
+  "args": [
+   "--broker",
+   "{broker}",
+   "--key-file",
+   "{dir}/guest_key.txt",
+   "--operator-key-file",
+   "{dir}/operator_key.txt",
+   "--hotel",
+   "h1",
+   "--skip-amd"
+  ],
+  "broker": true
+ },
+ "archived_binding_no_operator_key": {
+  "args": [
+   "--attestation",
+   "{dir}/attestation_doc.json",
+   "--receipts",
+   "{dir}/receipts.json",
+   "--skip-amd"
+  ]
+ },
+ "hotel_level1_chain_with_gap": {
+  "args": [
+   "--attestation",
+   "{dir}/attestation_doc.json",
+   "--receipts",
+   "{dir}/receipts.json"
+  ]
+ },
+ "hotel_level1_filtered_chain": {
+  "args": [
+   "--attestation",
+   "{dir}/attestation_doc.json",
+   "--receipts",
+   "{dir}/receipts.json"
+  ]
+ },
+ "hotel_level1_list": {
+  "args": [
+   "--attestation",
+   "{dir}/attestation_doc.json",
+   "--receipts",
+   "{dir}/receipts.json"
+  ]
+ },
+ "hotel_level1_whole_chain_head": {
+  "args": [
+   "--attestation",
+   "{dir}/attestation_doc.json",
+   "--receipts",
+   "{dir}/receipts.json"
+  ]
+ },
+ "hotel_level1_wrong_head": {
+  "args": [
+   "--attestation",
+   "{dir}/attestation_doc.json",
+   "--receipts",
+   "{dir}/receipts.json"
+  ]
+ },
+ "policy_timeline": {
+  "args": [
+   "--attestation",
+   "{dir}/attestation_doc.json",
+   "--receipts",
+   "{dir}/receipts.json",
+   "--skip-amd",
+   "--expected-measurement",
+   "abababababababababababababababababababababababababababababababababababababababababababababababab"
+  ]
+ },
+ "sandbox_link_found": {
+  "args": [
+   "--attestation",
+   "{dir}/attestation_doc.json",
+   "--receipts",
+   "{dir}/receipts.json",
+   "--skip-amd",
+   "--expected-measurement",
+   "abababababababababababababababababababababababababababababababababababababababababababababababab",
+   "--cathedral-sandbox",
+   "0f1e2d3c-4b5a-4968-8776-655443322110"
+  ]
+ },
+ "sandbox_link_not_found": {
+  "args": [
+   "--attestation",
+   "{dir}/attestation_doc.json",
+   "--receipts",
+   "{dir}/receipts.json",
+   "--skip-amd",
+   "--expected-measurement",
+   "abababababababababababababababababababababababababababababababababababababababababababababababab",
+   "--cathedral-sandbox",
+   "11111111-2222-4333-8444-555555555555"
+  ]
+ },
+ "sealed_skip_amd": {
+  "args": [
+   "--attestation",
+   "{dir}/attestation_doc.json",
+   "--receipts",
+   "{dir}/receipts.json",
+   "--skip-amd",
+   "--expected-measurement",
+   "abababababababababababababababababababababababababababababababababababababababababababababababab"
+  ]
+ },
+ "sealed_whole_chain_head": {
+  "args": [
+   "--attestation",
+   "{dir}/attestation_doc.json",
+   "--receipts",
+   "{dir}/receipts.json",
+   "--skip-amd",
+   "--expected-measurement",
+   "abababababababababababababababababababababababababababababababababababababababababababababababab"
+  ]
+ },
+ "sealed_wrong_measurement": {
+  "args": [
+   "--attestation",
+   "{dir}/attestation_doc.json",
+   "--receipts",
+   "{dir}/receipts.json",
+   "--skip-amd",
+   "--expected-measurement",
+   "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  ]
+ }
+}

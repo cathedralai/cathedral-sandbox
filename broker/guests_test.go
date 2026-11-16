@@ -2,8 +2,10 @@ package main
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -208,6 +210,60 @@ func TestGuestsCannotReachEachOthersRooms(t *testing.T) {
 		if s.(map[string]any)["id"] == theirs {
 			t.Fatalf("g1 list shows g2's room")
 		}
+	}
+}
+
+func TestFileMutationsForwardOnlyForTheRoomOwner(t *testing.T) {
+	tc := newChain(t)
+	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+	var hotelCalls atomic.Int32
+	hotel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hotelCalls.Add(1)
+		if r.URL.Query().Get("path") != "/work/demo" {
+			t.Errorf("hotel path = %q", r.URL.Query().Get("path"))
+		}
+		_, tail, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/v1/sandboxes/"), "/")
+		switch r.Method + " /" + tail {
+		case "PUT /directories":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"path":"/work/demo","created":true}`))
+		case "DELETE /entries":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"code":"directory_not_empty"}}`))
+		default:
+			t.Errorf("unexpected hotel request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(hotel.Close)
+	tc.b.hotelByID(hotelOf(id)).cfg.API = hotel.URL
+	for _, req := range []struct{ method, tail string }{
+		{"PUT", "directories"}, {"DELETE", "entries"},
+	} {
+		status, _, err := rawCall(tc, "key2", "", req.method, "/v1/sandboxes/"+id+"/"+req.tail+"?path=/work/demo", nil)
+		if err != nil || status != http.StatusNotFound {
+			t.Fatalf("foreign guest %s: status %d, err %v", req.tail, status, err)
+		}
+	}
+	if hotelCalls.Load() != 0 {
+		t.Fatalf("foreign guest reached hotel %d times", hotelCalls.Load())
+	}
+	for _, req := range []struct {
+		method, tail string
+		want         int
+		body         string
+	}{
+		{"PUT", "directories", 200, `{"path":"/work/demo","created":true}`},
+		{"DELETE", "entries", 409, `{"error":{"code":"directory_not_empty"}}`},
+	} {
+		status, raw, err := rawCall(tc, "key1", "", req.method, "/v1/sandboxes/"+id+"/"+req.tail+"?path=/work/demo", nil)
+		if err != nil || status != req.want || string(raw) != req.body {
+			t.Fatalf("owner %s: status %d, body %s, err %v", req.tail, status, raw, err)
+		}
+	}
+	if hotelCalls.Load() != 2 {
+		t.Fatalf("owner reached hotel %d times, want 2", hotelCalls.Load())
 	}
 }
 
