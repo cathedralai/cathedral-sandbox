@@ -87,3 +87,53 @@ def test_the_image_saves_the_warm_cache_for_chat_models_only() -> None:
     assert '"${LFM3_KIND}" = chat' in run and '"${MODEL_NAME%-base}" = "${MODEL_NAME}"' in run
     # The model settings the room boots with are in place before the cache is saved.
     assert dockerfile.index("ENV LFM3_MODEL=") < dockerfile.index(step)
+
+
+def _serve_with_gateway(tmp_path: Path, *command: str, **env: str) -> str:
+    """Run lfm3-serve beside a stand-in lfm3-gateway; return the agent path it was given, or ""."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    shutil.copy(SERVE, bin_dir / "lfm3-serve")
+    (bin_dir / "llama-server").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (bin_dir / "lfm3-agent").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (bin_dir / "lfm3-gateway").write_text(f'#!/usr/bin/env bash\necho "$LFM3_GATEWAY_AGENT" > {tmp_path}/gateway-agent\n')
+    for name in ("lfm3-serve", "llama-server", "lfm3-agent", "lfm3-gateway"):
+        (bin_dir / name).chmod(0o755)
+    run_env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "LFM3_MODEL": "/opt/lfm3/model.gguf",
+        "LFM3_THREADS": "2",
+        "LFM3_LOG_DIR": str(tmp_path / "log"),
+        **env,
+    }
+    out = subprocess.run(["bash", str(bin_dir / "lfm3-serve"), *command], env=run_env, capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    marker = tmp_path / "gateway-agent"
+    if _wait_for(marker):
+        return marker.read_text().strip()
+    return ""
+
+
+@pytest.mark.parametrize("command", [("true",), ()], ids=["with a command", "foreground"])
+def test_chat_models_start_the_chat_gateway_with_the_room_agent(tmp_path: Path, command: tuple[str, ...]) -> None:
+    agent = _serve_with_gateway(tmp_path, *command, MODEL="lfm3-omni-2b", LFM3_KIND="chat")
+    assert agent == str(tmp_path / "bin" / "lfm3-agent")
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"MODEL": "lfm3-1.7b-base", "LFM3_KIND": "chat"},
+        {"MODEL": "lfm3-d1-1b", "LFM3_KIND": "decision"},
+        {"MODEL": "lfm3-omni-2b", "LFM3_KIND": "chat", "LFM3_GATEWAY": "off"},
+    ],
+    ids=["base", "decision", "off"],
+)
+def test_no_chat_gateway_without_a_chat_harness_or_when_off(tmp_path: Path, env: dict[str, str]) -> None:
+    assert _serve_with_gateway(tmp_path, "true", **env) == ""
+
+
+def test_the_image_build_warms_the_cache_without_the_gateway() -> None:
+    prewarm = (SERVE.parent / "lfm3-prewarm").read_text(encoding="utf-8")
+    line = next(line for line in prewarm.splitlines() if line.rstrip().endswith("lfm3-serve >\"$tmp/server.log\" 2>&1 &"))
+    assert "LFM3_GATEWAY=off" in line

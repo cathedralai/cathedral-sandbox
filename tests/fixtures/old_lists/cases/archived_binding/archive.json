@@ -1,0 +1,13 @@
+{
+ "7f3b60768f24e231124cd39c1f870068f43b318cbb67955f144f5566c6279624": {
+  "boot_id": "boot-old",
+  "chip_id": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+  "host_data": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+  "hotel": "h1",
+  "measurement": "abababababababababababababababababababababababababababababababababababababababababababababababab",
+  "policy": "0x30000",
+  "receipt_key_ed25519_b64": "mUXR1deBVJC+os/sLVFRHN6Uu1+E5B8QOoMPbQrMn9s=",
+  "reported_tcb": "0101010101010101",
+  "schema": "cathedral_sealed_hotel_binding_v1"
+ }
+}
