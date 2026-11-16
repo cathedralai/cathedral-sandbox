@@ -169,6 +169,7 @@ import re
 import ssl
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from urllib.parse import quote_plus, urlencode, urlsplit
 
@@ -253,6 +254,32 @@ def sha(data: bytes) -> str:
 
 class Fail(Exception):
     pass
+
+
+class _NoKeyRedirect(urllib.request.HTTPRedirectHandler):
+    def _refuse(self, req, response, headers):
+        try:
+            location = headers.get("Location") or headers.get("URI")
+            target = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, location))
+            if target.scheme not in ("http", "https") or not target.hostname:
+                raise ValueError("unsupported redirect target")
+            host, port = target.hostname, target.port
+            if not re.fullmatch(r"[A-Za-z0-9.:-]+", host):
+                raise ValueError("unsafe redirect host")
+            message = f"redirect refused to {host}:{port}" if port is not None else f"redirect refused to {host}"
+        except (TypeError, ValueError, UnicodeError):
+            message = "redirect refused"
+        finally:
+            response.close()
+        raise Fail(message)
+
+    def http_error_301(self, req, response, code, message, headers):
+        self._refuse(req, response, headers)
+
+    http_error_302 = http_error_301
+    http_error_303 = http_error_301
+    http_error_307 = http_error_301
+    http_error_308 = http_error_301
 
 
 def need(cond, msg):
@@ -1046,7 +1073,7 @@ def policy_timeline(receipts: list[dict]) -> dict:
 
 def get(url: str, key: str) -> dict:
     req = urllib.request.Request(url, headers={"Authorization": "Bearer " + key})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.build_opener(_NoKeyRedirect()).open(req, timeout=60) as resp:
         return load_json_bounded(resp.read(), "inputs", "the broker's answer")
 
 
