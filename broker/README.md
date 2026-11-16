@@ -60,6 +60,7 @@ before it calls the hotel.
 | `"exclude_hotel_labels": {"sealed": "true"}` | No hotel with any pair. |
 | `"placement": "require"` | The default. A create that names hotels uses only those hotels. |
 | `"placement": "prefer"` | Try the named hotels first. If all of them are down, full or fail the create, use another hotel of the same class: sealed for sealed, unsealed for unsealed. The other label rules and the guest's hotel list still apply. A sealed create falls back only when the guest has its own hotel list. A fork and a mix of sealed and unsealed hotels never fall back. The answer has `"placement_fallback": true` and the header `X-Broker-Fallback: true`. |
+| `"own_hosts_only": true` | Only Cathedral's own hotels: never a miner hotel (one with `miner_hotkey`, the label `miner=true`, or an id that starts with `miner-`), even when the guest policy opts into miner hotels. It holds on every retry, `"prefer"` fallback and queue move. With no own hotel left the create gets the usual 409, 429 or 503. A fork or workspace whose hotel is a miner hotel gets 409. `false` or absent: no limit. Any other value: 400 `invalid_hotel_selection`. |
 
 Hotel labels come from the `labels` object of each hotel in the config.
 `GET /v1/broker/hotels` lists hotel ids, labels and free rooms. When no
@@ -486,7 +487,8 @@ still applies. Scoped joins require guest HTTPS and keyless SNP attestation.
 
 `operator_read_key_sha256` is a read-only operator key for dashboards such as
 the admin fleet feed. It allows `GET /v1/broker/capacity` with the operator
-view (every hotel and the admission policy) and no other route: it cannot
+view (every hotel and the admission policy) and `GET /v1/broker/miner-exits`,
+and no other route: it cannot
 read hotel documents, join, change or leave hotels, read or change guests, or
 open rooms. The digest must differ from the operator key, the miner
 enrollment key, and every guest key or view token.
@@ -509,10 +511,11 @@ receive this policy document.
 | Route (operator key) | What it does |
 |---|---|
 | `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey`, `reserved_for`, `lent_from`, `lent_report_id`, `admission` (with `report_id` once attested) and `commitment` (null, or the declaration with its delivery; see Capacity commitment). |
-| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?, "require_attestation"?, "commitment"?}`. A miner hotel must set `"sealed": true` and use HTTPS with attested guest TLS; the broker pins that key before its first keyed call. `"verify": false` is refused for miners (409 `guest_tls_required`). For operator hotels, the broker calls `GET /v1/status` with the key and checks attestation for sealed hotels; `"verify": false` skips both for an unsealed hotel and is refused for a sealed one (400 `verify_required`). `"sealed_admission": "off"` is refused at join (400 `invalid_hotel`): a joined hotel is always gated. An unsealed join cannot claim `labels.sealed=true` or set `require_attestation`. `miner_hotkey` (SS58) adds `miner=true` and `miner_hotkey` labels, which a PATCH cannot remove. `commitment` is for miner hotels only (see Capacity commitment). |
+| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?, "require_attestation"?, "guest_tls"?, "commitment"?}`. A sealed hotel with `"guest_tls": true`, or any sealed hotel when `require_sealed_guest_tls` is on, joins like a miner hotel: HTTPS, attested guest TLS pinned before the first keyed call, 409 `guest_tls_required` otherwise. A miner hotel must set `"sealed": true` and use HTTPS with attested guest TLS; the broker pins that key before its first keyed call. `"verify": false` is refused for miners (409 `guest_tls_required`). For operator hotels, the broker calls `GET /v1/status` with the key and checks attestation for sealed hotels; `"verify": false` skips both for an unsealed hotel and is refused for a sealed one (400 `verify_required`). `"sealed_admission": "off"` is refused at join (400 `invalid_hotel`): a joined hotel is always gated. An unsealed join cannot claim `labels.sealed=true` or set `require_attestation`. `miner_hotkey` (SS58) adds `miner=true` and `miner_hotkey` labels, which a PATCH cannot remove. `commitment` is for miner hotels only (see Capacity commitment). |
 | `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). An unsealed runtime hotel cannot gain the sealed label. `lend: true` lends a reserved sealed hotel to the pool; `reserved_for` on a lent hotel reclaims it (see Lend and reclaim). |
 
 | `DELETE /v1/broker/hotels/<id>` | Removes a runtime hotel that has no rooms. Drain it first. `?forget_rooms=true` (operator key only, miner hotels only): when the hotel is drained, has been down for 10 minutes and has no create in flight, it asks the old guest once more on its attested key (an answer refuses and starts the 10 minutes again), writes the rooms' `deleted` tombstones to disk, removes the hotel from the runtime list, and only then releases the rooms. A failed write answers 500 and leaves every room, client id and tombstone as before. Otherwise 409 `forget_refused` with the reason. |
+| `GET /v1/broker/miner-exits` | Also for the read-only operator key. Miner hotels that went down holding customer rooms, oldest first: `hotel`, `miner_hotkey`, `down_at`, `drained_at_down`, `ended` (`up` when the same guest answered again, `forgotten` after a forget, absent while down), `ended_at`, `rooms_checked` and `rooms` (`id`, `uuid`, `guest`, `lost`: null until known, then whether the room was gone when the hotel came back; every room of a forgotten exit is lost). `?since=<RFC 3339>` keeps records that went down at or after that time. Kept in the client state file for 8 days, at most 50 per hotel and 1,000 in all. It is the input for forfeiting the miner's delivered hours for that window (AB#329); the broker itself forfeits and re-creates nothing. `drained_at_down` is not proof of notice: the miner's enroll key can set drain. |
 
 The broker keeps runtime hotels in `state_dir/hotels.json` and their keys in
 `state_dir/hotel-keys/<id>.key` (mode 0600). A hotel from the config file
@@ -627,6 +630,37 @@ otherwise. The top-level `"sealed_admission": "off"`, which ungated joined
 operator hotels, now stops the broker from loading the config; `"on"` and
 absent load.
 
+Guest TLS for config hotels (AB#378). `"guest_tls": true` on a sealed
+hotel's config entry makes the broker reach it the way it reaches a miner
+hotel: only over the TLS key the guest made and named in its attested
+binding (`tls_spki_sha256`), with the hotel key installed inside the guest
+(`hotel_key_source: "install"`), so the host never holds it.
+
+- The guest must be built in that mode (`SEALED_MINER=1`, see
+  `room-kit/sealed/README.md`). Both `api` and `health` must be its
+  `https://` port: the plain ports answer `GET /room/attestation` only.
+- The broker never takes the pin from the config file (`tls_spki_sha256`
+  there is refused). The sync loop fetches the attestation without the hotel
+  key, runs the miner join check on it (measurement allowlist, binding,
+  REPORT_DATA, AMD chain, the TLS peer is the key the binding names, key
+  installed in the guest), checks that the binding names this hotel id, and
+  then pins the key. Until then no call carries the hotel key and the hotel
+  is not admitted. `sealed_measurements` and `amd_verifier` are required.
+- After a reboot the guest has a new key. While the hotel does not answer
+  on its pin, the sync loop asks again every 5 s and accepts a new key only
+  after the same check, for the same hotel id and the same chip as the key
+  it replaces. Moving a hotel to another machine needs a broker restart.
+- The hotel key must be installed in the guest (`POST /room/hotel-key`)
+  before the hotel answers keyed calls, and again after every reboot (the
+  guest keeps it in memory). Until then the hotel is down (401).
+- `"require_sealed_guest_tls": true` (top level, default off) makes this
+  every sealed hotel: a sealed config entry without `"guest_tls": true`
+  stops the config from loading, and a sealed join must pass the same
+  keyless HTTPS check (409 `guest_tls_required` otherwise). Turn it on only
+  after every sealed hotel runs a guest-TLS guest.
+- A config file with either field does not load on an older broker
+  (unknown field): roll back the config with the binary.
+
 `"require_attestation": true` was the config hotel's opt-in before AB#596.
 It still loads (and needs `"sealed": true`), but is redundant: the broker
 logs one deprecation line naming the hotels that set it. Remove it after
@@ -642,8 +676,11 @@ Config (all optional):
 | `miner_hotkey_caps` | Operator-approved map from miner SS58 hotkey to maximum joined hotels. Missing hotkeys are refused. The broker counts all joined hotels for a hotkey, including pending or draining ones, and refuses the next join at the cap. Changing a cap requires a config restart; the broker has no cap hot reload yet. |
 | `miner_min_commitment` | `{"slots", "daily_hours"}`: the floor a miner join's commitment must meet (see Capacity commitment). Absent or zero: a commitment is optional. Changing it requires a restart. |
 | `miner_max_hotels` | Operator-approved maximum joined miner hotels across all hotkeys. Zero refuses miner joins. Pending and draining hotels count; the next join is refused with `miner_global_cap_reached`. The approved founding cut is 64; configure it explicitly before enabling enrollment. Changing it requires a restart. |
+| `miner_max_rooms_per_hotkey` | Room cap per miner hotkey across all its hotels (rooms in use, creating or queued). 0 or absent: no cap. A hotkey at the cap gets no new room; its hotels show `free_rooms: 0`. |
+| `miner_pool_share` | Share of the shared pool that miner hotels may hold, between 0 and 1 (exclusive). 0 or absent: no cap. Miner rooms on unreserved hotels stay at or under `share / (1 - share)` times the slots of our own unreserved sealed hotels, so a full pool is at most that share miner. The cap is checked when a create is placed; rooms already placed are never moved. The operator capacity view shows both values under `admission_policy` and, with a share set, `miner_pool` (`own_slots`, `miner_room_cap`, `miner_rooms`). A create refused only by a cap counts the hotel as `full` and adds `miner_capped` to the reason. |
 | `sealed_host_data` | Its HOST_DATA must be in this list. A dedicated sealed machine (one owner, `SEALED_OWNER_PUBKEY_FILE`) has its own HOST_DATA, which names the owner key: add that value (the sealed install prints it). On `POST /v1/sandboxes` the broker passes `X-Cathedral-Owner-Signature` and `X-Cathedral-Owner-Timestamp` to the hotel unchanged; the machine checks them (`room-kit/sealed/README.md`, "Dedicated machine"). Its 403 `owner_signature_*` does not rest the hotel. |
 | `attest_ttl_seconds`, `attest_every_seconds` | As above. |
+| `require_sealed_guest_tls` | Top level, default false. Every sealed hotel must be reached over its attested guest TLS key (above). Per hotel entry: `"guest_tls": true` (sealed, `https://` api and health, not with `sealed_admission: "off"`). |
 | `sealed_admission` | Top level: `"on"` or absent; `"off"` is refused. Per hotel entry: `"gate"` (default) or `"off"`, the ops escape for one operator hotel (above). |
 | `amd_verifier` | `{"command": ["python3", "/opt/room-kit/verify_receipts.py"], "ark_sha256": "<AMD ARK DER sha256>", "kds_cache"?: "<dir>", "timeout_seconds"?: 120}`. `ark_sha256` is one pin or a list (one per product: Milan, Genoa, Turin; values in `amd_chain.go`); the verifier passes if the report's product chain has any listed ARK, in one run. The host needs Python with `cryptography` and HTTPS to `kdsintf.amd.com` (or a filled KDS cache). |
 
