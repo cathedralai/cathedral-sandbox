@@ -304,3 +304,36 @@ def test_server_passes_entrypoint_cursor_and_rejects_a_bad_one() -> None:
         assert r.status == 200 and "entrypoint" not in json.loads(r.body)
     finally:
         provider.close()
+
+
+def test_entrypoint_line_longer_than_a_read_does_not_stall(fake, guest, monkeypatch) -> None:
+    import cathedral.sandbox_guest as sandbox_guest
+
+    # Each partial prints as a 31-byte stamp and 20 bytes: a 100-byte read holds
+    # one whole partial and the start of the next.
+    monkeypatch.setattr(sandbox_guest, "ENTRYPOINT_LOG_PAGE", 100)
+    sid = _room(guest)
+    cid = _cid(guest, sid)
+    parts = [c * 20 for c in "abcde"]
+    for i, part in enumerate(parts):
+        fake.add_log(cid, "stdout", part + ("\n" if i == len(parts) - 1 else ""), T0 + i)
+    fake.add_log(cid, "stdout", "next\n", T0 + 5)
+
+    cursor, out = "", ""
+    for _ in range(20):
+        page = guest.logs(sid, entrypoint_cursor=cursor)["entrypoint"]
+        out += page["stdout"]
+        cursor = page["next_cursor"]
+        if not page["more"]:
+            break
+    assert out == "".join(parts) + "\nnext\n"
+    again = guest.logs(sid, entrypoint_cursor=cursor)["entrypoint"]
+    assert again["stdout"] == ""
+
+
+def test_entrypoint_keeps_a_stamp_the_room_wrote_itself(fake, guest) -> None:
+    sid = _room(guest)
+    cid = _cid(guest, sid)
+    own = "2025-11-13T02:13:19.000000000Z INFO started\n"  # earlier than docker's stamp
+    fake.add_log(cid, "stdout", own, T0)
+    assert guest.logs(sid, entrypoint_cursor="")["entrypoint"]["stdout"] == own
