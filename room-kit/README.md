@@ -106,6 +106,20 @@ health does not say `sealed`. Verify a chain offline with
 `verify_receipts.py`: signature, link to the previous receipt, and head. A
 level 1 chain has no SNP report.
 
+`verify_receipts.py --oneshot FILE` checks one one-shot run's file offline (run mode). It takes `--recipe`,
+`--context` or `--no-context`, `--run-id`, `--input-sha256`, `--input-file`, `--output-file`,
+`--expected-measurement`, `--allowed-measurements`, `--ark-sha256`, `--product` and `--require-sealed`. The other
+flags of the list-mode commands (`--receipts`, `--attestation`, `--broker`, `--origin`, `--key-file`,
+`--operator-key-file`, `--hotel`, `--sandbox`, `--receipt-header`, `--cathedral-sandbox`, `--save`,
+`--owner-pubkey`, `--tls-spki-sha256`, `--require-tls`, `--kds-cache`) are usage errors with exit 2, even with an
+empty value. `--skip-amd` is a failed check 1 (exit 1), and `--help` exits 0. Without `--oneshot`, the run-mode flags
+(`--allowed-measurements`, `--recipe`, `--run-id`, `--context`, `--no-context`, `--input-sha256`, `--input-file`,
+`--output-file`, and an empty `--oneshot`) are usage errors with exit 2: list mode reads none of them. `--product` names the product only
+for a version 2 report, which has no CPUID fields; no other version reads the flag, a version 0, 1 or above 5
+report fails, a report with CPUID fields names its own product, a family with no layout fails, and a different
+`--product` fails. The owner check and the guest TLS key check are list-mode
+checks that run mode does not do. The module's header documents the eight checks. Both modes name an attestation whose `kernel_cmdline` is not a string, whose receipt key is not base64 of 32 bytes, or whose `report_b64` is not base64 as an input fault, with the same reason (run mode adds the prefix `check 1: `).
+
 Sealed SNP receipts are a separate path and stay opt-in. `install.sh --sealed`
 builds a guest that sets `ROOM_RECEIPTS=1` and its own listen address. Inside
 that guest, when the TSM provider is `sev_guest`, the same process keeps the
@@ -114,6 +128,90 @@ sealed binding (`cathedral_sealed_hotel_binding_v1`), the SNP report, and
 does not enter that path.
 
 `ROOM_HOTEL_NAME` empty means the installer uses `ROOM_ID`.
+
+### Receipt numbers per room
+
+Every statement that names a room carries `room_sequence` (1, 2, 3 for that
+room id under this boot's key) and `room_previous_receipt_sha256` (null for the
+first). A room id used again continues its numbers. A bulk delete names no room
+and takes no number. A retried sealed secret returns its stored receipt and
+takes no new number.
+
+`GET /v1/sandboxes/<id>/receipts` answers with `count` (how many receipts the
+room holds) and `room_head` (the `receipt_sha256` of the last one, null when
+there are none) beside the receipts. A list numbered 1 to `count`, linked, with
+that head, holds every receipt the room had when it was read. An action still
+running, or signed after the read, is not in it.
+
+A create that asks for more than one room (`count` other than the integer 1)
+is refused with 400 `create_count_refused`, unsent and unsigned, so each room's
+list holds its own create.
+
+### Serial rooms
+
+A create whose labels carry `cathedral_serial` = `"1"` makes a serial room: one
+signed request at a time, so the order of its receipts is the order things ran.
+
+- The label value must be the string `1`, and not set together with
+  `cathedral_pool`: 400 `reserved_label_invalid`. A serial create carries no
+  `Idempotency-Key` header (an empty one counts): 400 `idempotency_key_refused`.
+- The create receipt carries `serial: true` when it is the room's receipt 1, no
+  request for that room id was in flight when it was signed, and no non-read
+  request for that room's id was in flight at any moment between the create
+  being sent and its receipt being signed (an unsigned write counts, and so
+  does a request the API refused). Otherwise the room is an ordinary room. The
+  front remembers such ids only while a create is pending; the set holds at
+  most 4,096 ids, and a further id that has to be remembered withholds every
+  flag until the pending creates end.
+- A second signed request while one runs is refused at once with 409
+  `room_busy` and is not sent on. The turn ends after the receipt is signed and
+  before the answer is written.
+- Reads (GET of the room, `/wait`, `/logs`, `/stat`, `/tar`, `/desktop`,
+  `/terminals`, a process's `/logs`, `sealed-secrets`, `sealed-env`, `/entries`)
+  pass without a token and leave no receipt. Every other route that is not a
+  signed route or a delete, the front's own sealed secrets and sealed exec
+  included, is refused with 409 `room_serial_unsigned`.
+- On a serial room each request is sent to the API once, a read or a signed
+  GET included (an ordinary room retries a GET whose answer was lost). A read
+  whose answer is lost answers 502, signs nothing and does not break the room
+  (a read holds no token). A signed request or a delete that reached the API
+  and was not answered is signed as a 502, and a signed request whose receipt
+  could not be signed leaves none: either breaks the room.
+- Once a room is broken, every request that names it, a read included, gets
+  409 `room_broken` and is not sent on, except a delete. The room's receipt
+  list (`GET /v1/sandboxes/<id>/receipts`) is answered before that and can
+  still be read. A 2xx delete ends the room and every mark kept for it.
+- Limit: a bulk delete by label (`DELETE /v1/sandboxes?label=...`) names no
+  room and is not held back by a busy serial room, so clean-up by label keeps
+  working. A room it removes ends with a `room_end` receipt at a later look,
+  and any create whose pending time it overlaps gets no flag.
+- Limit: routes that name no room are not room requests. They are not held
+  back by a serial room and are not in its list. That covers secrets (`PUT`
+  and `DELETE /v1/secrets/<name>` change what the later outbound requests of
+  a room whose network policy references that secret carry), workspaces (a
+  room that mounts a shared workspace can be changed through another room of
+  the same owner that mounts it), and listing calls (`GET /v1/sandboxes` and
+  `GET /v1/quota` run the API's own expiry collection). A serial room that
+  needs its list to be everything that could change it mounts no shared
+  workspace and references no hotel secret.
+
+An ordinary room runs requests side by side, as before.
+
+### Receipts when a room ends without a request
+
+The front keeps a table of live rooms (a room enters with its 2xx create and
+leaves with a 2xx delete or a `room_end`). Every `ROOM_LOOK_SECONDS` (default
+15, 0 turns it off) it copies the table, asks the room API for its list, and
+for each copied room the list lacks asks for that one room. Only 404
+`sandbox_not_found` and 409 `sandbox_deleting` end a room: one `room_end`
+receipt with `status`, `reason` (the API's code), `result_sha256` and
+`room_create_receipt_sha256`, which ends the room's incarnation as a delete
+does. A room with a request in flight, a room made after the copy, a failed
+list and any other answer end nothing. A read of one room's receipts first
+looks at that room, with one GET.
+
+Limits: only rooms the front signed a create for; after a front restart the
+table is empty and no end is signed for earlier rooms.
 
 ### Fresh report over caller data (sealed only)
 
