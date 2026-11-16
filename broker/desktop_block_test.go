@@ -137,3 +137,52 @@ func TestRoomDesktopWebSocketHandshakeIsRefused(t *testing.T) {
 		t.Fatalf("hotel received %d handshakes, want 1 (the terminal)", len(got))
 	}
 }
+
+// AB#121 review: a decoded ? or # in the tail would become a query or
+// fragment at the hotel and reach /desktop or /terminals past the gates. The
+// broker refuses it with 400 invalid_path before any hotel call, on the native
+// and the client path.
+func TestRoomPathWithEncodedQueryOrFragmentIsRefused(t *testing.T) {
+	tc := newChain(t)
+	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
+	tails := []struct{ method, tail string }{
+		{"GET", "/desktop%3F"},
+		{"GET", "/desktop%23"},
+		{"GET", "/desktop%3F/ws"},
+		{"POST", "/terminals%3F"},
+		{"GET", "/terminals%23x"},
+		{"POST", "/exec%3Fx"},
+	}
+	for _, c := range tails {
+		code, doc := tc.call(t, "key1", c.method, "/v1/sandboxes/"+id+c.tail, nil)
+		if code != http.StatusBadRequest || errCode(doc) != "invalid_path" {
+			t.Errorf("%s %s: %d %v, want 400 invalid_path", c.method, c.tail, code, doc)
+		}
+	}
+	if got := desktopCalls(tc, "a"); len(got) > 0 {
+		t.Errorf("hotel a received desktop calls %v", got)
+	}
+	if got := terminalCalls(tc, "a"); len(got) > 0 {
+		t.Errorf("hotel a received terminal calls %v", got)
+	}
+
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4"}), nil)
+	if status != 200 && status != 201 && status != 202 {
+		t.Fatalf("client create: %d %v", status, doc)
+	}
+	uuid, _ := doc["id"].(string)
+	tc.b.mu.Lock()
+	hotelID := tc.b.byUUID[uuid].h.cfg.ID
+	tc.b.mu.Unlock()
+	for _, tail := range []string{"/desktop%3F", "/desktop%23", "/terminals%3F"} {
+		if status, doc := tc.clientCall(t, "GET", "/v1/sandboxes/"+uuid+tail, nil, nil); status != http.StatusBadRequest {
+			t.Errorf("client GET %s: %d %v, want 400", tail, status, doc)
+		}
+	}
+	if got := desktopCalls(tc, hotelID); len(got) > 0 {
+		t.Errorf("hotel %s received desktop calls %v", hotelID, got)
+	}
+	if got := terminalCalls(tc, hotelID); len(got) > 0 {
+		t.Errorf("hotel %s received terminal calls %v", hotelID, got)
+	}
+}

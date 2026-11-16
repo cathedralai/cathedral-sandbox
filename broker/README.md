@@ -368,6 +368,8 @@ One policy for every hotel in the pool, sealed or shared, operator or miner:
 - Both gates key on the first path segment after the room id with any
   `;params` removed, because the hotel's router drops `;params` from the last
   segment: `/desktop;x` and `/terminals;x` are refused like the bare names.
+  A room path with an encoded `?` or `#` (`%3F`, `%23`) is 400 `invalid_path`
+  before either gate: it would become a query or fragment at the hotel.
 - The broker upgrades a WebSocket only on `/terminals/<tid>/ws` (above). Any
   other ticketed WebSocket route that reaches a hotel arrives as a plain GET,
   so a ticket minted through `/access-tickets` opens no other stream through

@@ -1352,6 +1352,14 @@ func isMinerHotel(h *hotel) bool {
 
 func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestState, rest string) {
 	bid, tail, _ := strings.Cut(rest, "/")
+	// The tail is decoded and goes to the hotel by string concatenation, so a
+	// decoded "?" or "#" would turn the rest into a query or fragment there and
+	// slip past the gates below ("desktop%3F" reaches the hotel's /desktop).
+	// No hotel route works with one, so refuse it before any gate.
+	if strings.ContainsAny(tail, "?#") {
+		writeErr(w, 400, "invalid_path", "a sandbox path cannot contain an encoded ? or #")
+		return
+	}
 	// The gates below key on the first tail segment without any ";params":
 	// the hotel's router (urlparse) drops ";params" from the last segment, so
 	// "desktop;x" or "terminals;x" reaches the same hotel route as the bare name.
