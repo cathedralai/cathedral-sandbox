@@ -359,7 +359,8 @@ func TestProbationSurvivesRestartAndARejoinStartsFresh(t *testing.T) {
 	if tc.b.hotelByID("m1").inProbation() {
 		t.Fatal("graduation lost on restart")
 	}
-	if p := probationOf(t, tc, "m2"); !tc.b.hotelByID("m2").inProbation() || p["observed_s"] != float64(40) {
+	// The restarted sync loop may sample a few real milliseconds before the read.
+	if p := probationOf(t, tc, "m2"); !tc.b.hotelByID("m2").inProbation() || !observedAbout(p, 40) {
 		t.Fatalf("probation progress lost on restart: %v", p)
 	}
 
@@ -498,4 +499,10 @@ func TestProbationConfigAndPolicyValidation(t *testing.T) {
 	if ap["miner_probation_seconds"] != float64(0) || ap["miner_probation_min_uptime_pct"] != float64(99) {
 		t.Fatalf("admission_policy: %v", ap)
 	}
+}
+
+// observedAbout reports whether the observed_s of a probation document is in [want, want+1).
+func observedAbout(p map[string]any, want float64) bool {
+	got, ok := p["observed_s"].(float64)
+	return ok && got >= want && got < want+1
 }
