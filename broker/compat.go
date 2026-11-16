@@ -561,6 +561,13 @@ func (b *broker) compatSetNetwork(w http.ResponseWriter, r *http.Request, rm *ro
 		compatErr(w, 400, nerr.code, nerr.msg, 0)
 		return
 	}
+	// Credential references (host, header, secret name) go to the hotel as
+	// sent: the hotel validates them against the allowlist and resolves the
+	// secret for the room's owner (sandbox_api.normalize_credentials).
+	// Dropping them here made the API answer 502 credentials_not_applied.
+	if creds, ok := req["credentials"]; ok && creds != nil {
+		net["credentials"] = creds
+	}
 	body, _ := json.Marshal(net)
 	status, hdr, out, err := rm.h.do(r.Context(), "PUT", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/network", nil, body, 2*time.Minute)
 	if err != nil {
