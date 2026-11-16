@@ -84,6 +84,9 @@ type hotelConfig struct {
 	// TLSSPKISHA256 is derived from a miner hotel's verified SNP binding at
 	// join and persisted for safe reconnect after a broker restart.
 	TLSSPKISHA256 string `json:"tls_spki_sha256,omitempty"`
+	// DrainNotice: the miner's signed planned-maintenance notice, set by
+	// PATCH {"drain": true, "drain_notice": ...} (drain_notice.go).
+	DrainNotice *drainNoticeRecord `json:"drain_notice,omitempty"`
 	// GuestTLS (AB#378): a sealed hotel reached only over the TLS key its
 	// guest made and named in its attested binding, with the hotel key
 	// installed in the guest (hotel_key_source "install"), as a miner hotel
@@ -245,7 +248,7 @@ type hotel struct {
 	// guestPin is the verified guest TLS SPKI (miner_tls.go); nil: none yet.
 	// Read on every TLS handshake, so atomic.
 	guestPin atomic.Pointer[[sha256.Size]byte]
-	cfgMu    sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.ReservedFor, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
+	cfgMu    sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.DrainNotice, cfg.ReservedFor, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
 	sem      chan struct{}
 
 	// Guarded by broker.mu.
