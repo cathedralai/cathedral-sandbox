@@ -308,6 +308,121 @@ def test_other_models_are_not_checked(fake: FakeModel, room: Any) -> None:
 
 FINAL_LINE = "Now answer my message in text, without tools."
 
+# Audio's example turns (AB#545): sent before the conversation on rounds that offer tools.
+AUDIO_EXAMPLES = [
+    {"role": "user", "content": "What is 5 plus 7?"},
+    {"role": "assistant", "content": "12."},
+    {"role": "user", "content": "What umask is this machine set to?"},
+    {"role": "assistant", "content": "", "tool_calls": [{"id": "call_example", "type": "function",
+     "function": {"name": "run", "arguments": '{"command": "umask"}'}}]},
+    {"role": "tool", "tool_call_id": "call_example", "name": "run", "content": "exit code: 0\n0022\n"},
+    {"role": "assistant", "content": "It is set to 0022."},
+    {"role": "user", "content": "Say good morning in French."},
+    {"role": "assistant", "content": "Bonjour."},
+]
+AUDIO = "lfm3-audio-2b"
+
+
+def test_audio_gets_example_turns_before_the_conversation_and_keeps_none(fake: FakeModel, room: Any) -> None:
+    fake.replies = [answer("4."), answer("6.")]
+    assert room("What is 2+2?", MODEL=AUDIO).returncode == 0
+    out = room("And 3+3?", MODEL=AUDIO)
+    assert out.returncode == 0 and out.stdout.strip() == "6."
+    first, second = fake.requests
+    assert "tools" in first and messages(first)[0]["role"] == "system"
+    assert messages(first)[1:] == AUDIO_EXAMPLES + [{"role": "user", "content": "What is 2+2?"}]
+    assert messages(second)[1:] == AUDIO_EXAMPLES + [
+        {"role": "user", "content": "What is 2+2?"}, {"role": "assistant", "content": "4."},
+        {"role": "user", "content": "And 3+3?"}]
+    # Never part of the conversation.
+    assert history(room) == [
+        {"role": "user", "content": "What is 2+2?"}, {"role": "assistant", "content": "4."},
+        {"role": "user", "content": "And 3+3?"}, {"role": "assistant", "content": "6."}]
+    shown = room("--history", MODEL=AUDIO).stdout
+    assert "0022" not in shown and "Bonjour" not in shown
+
+
+@pytest.mark.parametrize("model", ["lfm3-omni-2b", "lfm3-vl-2b"])
+def test_other_models_get_no_example_turns(fake: FakeModel, room: Any, model: str) -> None:
+    fake.replies = [answer("4.")]
+    assert room("What is 2+2?", MODEL=model).returncode == 0
+    assert messages(fake.requests[0])[1:] == [{"role": "user", "content": "What is 2+2?"}]
+
+
+@pytest.mark.parametrize("flag", ["--no-tools", "--json"])
+def test_audio_sends_no_examples_without_tools(fake: FakeModel, room: Any, flag: str) -> None:
+    fake.replies = [answer('{"a": 1}')]
+    assert room(flag, "Give me an answer.", MODEL=AUDIO).returncode == 0
+    body = fake.requests[0]
+    assert "tools" not in body and messages(body)[1:] == [{"role": "user", "content": "Give me an answer."}]
+
+
+def test_audio_examples_are_on_tool_rounds_only_and_the_tool_turn_follows_them(fake: FakeModel, room: Any) -> None:
+    fake.replies = [tool_call("run", {"command": "true"}), answer("Done.")]
+    out = room("--system", "Answer in French.", "Keep going.", MODEL=AUDIO, LFM3_AGENT_STEPS="1")
+    assert out.returncode == 0 and out.stdout.strip() == "Done."
+    call, final = fake.requests
+    # A system prompt set by hand still gets them: they are about when to use a tool.
+    assert messages(call)[0]["content"] == "Answer in French."
+    assert messages(call)[1:] == AUDIO_EXAMPLES + [{"role": "user", "content": "Keep going."}]
+    # The last round offers no tools, so it carries no examples and ends with the ask for text.
+    assert "tools" not in final and messages(final)[-1] == {"role": "user", "content": FINAL_LINE}
+    assert not any(m in messages(final) for m in AUDIO_EXAMPLES)
+    assert [m["role"] for m in messages(final)] == ["system", "user", "assistant", "tool", "user"]
+
+
+def test_audio_examples_are_kept_when_old_turns_are_dropped(fake: FakeModel, room: Any) -> None:
+    # The examples count against the context size like the system prompt: they
+    # stay, and older turns go sooner.
+    filler = "x" * 400
+    fake.replies = [answer("one"), answer("two"), answer("three")]
+    env = {"MODEL": AUDIO, "LFM3_AGENT_CONTEXT_CHARS": "1300"}
+    assert room("--system", "Be brief.", f"first {filler}", **env).returncode == 0
+    for n in ("second", "third"):
+        assert room(f"{n} {filler}", **env).returncode == 0
+    sent = messages(fake.requests[2])
+    assert sent[1:1 + len(AUDIO_EXAMPLES)] == AUDIO_EXAMPLES
+    assert [m["content"].split(" ")[0] for m in sent[1 + len(AUDIO_EXAMPLES):]] == ["third"]
+    # Without tools the same size keeps one earlier turn.
+    fake.replies = [answer("four")]
+    assert room("--no-tools", f"fourth {filler}", **env).returncode == 0
+    assert [m["content"].split(" ")[0] for m in messages(fake.requests[3])[1:]] == ["third", "three", "fourth"]
+
+
+def test_audio_clip_stays_on_its_own_message_after_the_examples(fake: FakeModel, room: Any, tmp_path: Path) -> None:
+    clip = tmp_path / "clip.wav"
+    clip.write_bytes(b"RIFFfakeWAVE")
+    fake.replies = [answer("The train to Paris leaves at nine."), answer("Nine.")]
+    assert room("--audio", str(clip), MODEL=AUDIO).returncode == 0
+    sent = messages(fake.requests[0])
+    assert sent[1:-1] == AUDIO_EXAMPLES
+    assert sent[-1]["content"][0]["type"] == "input_audio"
+    # A follow-up sends the clip again on the turn that brought it, not on an example.
+    assert room("When?", MODEL=AUDIO).returncode == 0
+    later = messages(fake.requests[1])
+    assert later[1:1 + len(AUDIO_EXAMPLES)] == AUDIO_EXAMPLES
+    assert later[1 + len(AUDIO_EXAMPLES)]["content"][0]["type"] == "input_audio"
+    assert later[-1] == {"role": "user", "content": "When?"}
+    assert "media" not in json.dumps(later)
+
+
+def test_audio_check_and_reply_read_the_same_prompt(fake: FakeModel, room: Any) -> None:
+    # With answer sampling set by hand Audio also checks first; both carry the examples.
+    fake.replies = [answer("Hi.")]
+    assert room("Hello.", MODEL=AUDIO, LFM3_AGENT_ANSWER_SAMPLING='{"temperature": 0.5, "top_k": 40}').returncode == 0
+    (check,), (reply,) = fake.checks, fake.requests
+    assert messages(check) == messages(reply)
+    assert messages(reply)[1:-1] == AUDIO_EXAMPLES
+
+
+def test_audio_warm_reads_the_examples_into_the_cache(fake: FakeModel, room: Any) -> None:
+    assert room("--warm", MODEL=AUDIO).returncode == 0
+    fake.replies = [answer("Hello.")]
+    assert room("What can you do?", MODEL=AUDIO).returncode == 0
+    warm, first = fake.requests
+    assert messages(warm)[:-1] == messages(first)[:-1]
+    assert messages(warm)[1:-1] == AUDIO_EXAMPLES
+
 
 def test_the_last_round_after_tools_asks_for_text_and_does_not_keep_the_ask(fake: FakeModel, room: Any) -> None:
     fake.replies = [tool_call("run", {"command": "true"}), tool_call("run", {"command": "true"}), answer("Done.")]
@@ -488,7 +603,11 @@ def test_json_asks_the_server_for_json_with_no_tools(fake: FakeModel, room: Any)
     later = fake.requests[1]
     assert "response_format" not in later and "tools" in later
     assert JSON_LINE not in messages(later)[0]["content"]
-    assert [m["content"] for m in messages(later)[1:]] == ["list 2 fruits", '["apple", "pear"]', "which is green"]
+    # Audio's example turns (AB#545) come first on a round with tools, then the conversation.
+    assert messages(later)[1:1 + len(AUDIO_EXAMPLES)] == AUDIO_EXAMPLES
+    assert [m["content"] for m in messages(later)[1 + len(AUDIO_EXAMPLES):]] == [
+        "list 2 fruits", '["apple", "pear"]', "which is green"]
+    assert all(m.get("content") != "12." for m in messages(body))
 
 
 def test_a_json_answer_that_parses_is_never_cut(fake: FakeModel, room: Any) -> None:
