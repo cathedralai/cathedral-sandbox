@@ -1,0 +1,52 @@
+{
+ "attestation": {
+  "binding_sha256": "2aeb30b90baa809d26b00247579a931cbf506b63de82e012ba685c760b0f2f5f",
+  "measurement": "abababababababababababababababababababababababababababababababababababababababababababababababab",
+  "chip_id": "cdcdcdcdcdcdcdcd...",
+  "policy": "0x30000",
+  "host_data": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+  "report_version": 3,
+  "kernel_cmdline": "",
+  "archived_chains": [
+   {
+    "receipts": 1,
+    "signatures_ok": 1,
+    "links_checked": 1,
+    "contiguous": true,
+    "first": 1,
+    "last": 1,
+    "actions": {
+     "create": 1
+    },
+    "binding_sha256": "7f3b60768f24e231124cd39c1f870068f43b318cbb67955f144f5566c6279624"
+   }
+  ]
+ },
+ "chain": {
+  "receipts": 2,
+  "signatures_ok": 2,
+  "bindings": [
+   "2aeb30b90baa809d26b00247579a931cbf506b63de82e012ba685c760b0f2f5f",
+   "7f3b60768f24e231124cd39c1f870068f43b318cbb67955f144f5566c6279624"
+  ],
+  "live": {
+   "receipts": 1,
+   "signatures_ok": 1,
+   "links_checked": 1,
+   "contiguous": true,
+   "first": 1,
+   "last": 1,
+   "actions": {
+    "create": 1
+   }
+  }
+ },
+ "policy_timeline": {},
+ "room_tunables": {},
+ "room_links": {},
+ "verdict": "NOT PROVEN",
+ "checked": "each receipt; not that none are missing; archived sealed bindings verify signatures only (NOT PROVEN for attestation)",
+ "not_proven": [
+  "archived sealed bindings have no SNP report; receipt signatures checked, attestation not proven"
+ ]
+}

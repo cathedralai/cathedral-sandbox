@@ -17,6 +17,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	_ "embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -86,6 +87,12 @@ type hotelConfig struct {
 	// DrainNotice: the miner's signed planned-maintenance notice, set by
 	// PATCH {"drain": true, "drain_notice": ...} (drain_notice.go).
 	DrainNotice *drainNoticeRecord `json:"drain_notice,omitempty"`
+	// Commitment: the slots and daily hours a miner hotel declares at join
+	// (commitment.go). Nil: none declared.
+	Commitment *capacityCommitment `json:"commitment,omitempty"`
+	// AlertChatID: the miner operator's Telegram chat for the first missed
+	// heartbeat of this hotel (alerts.go). Empty: a log line only.
+	AlertChatID string `json:"alert_chat_id,omitempty"`
 }
 
 type guestConfig struct {
@@ -121,6 +128,12 @@ type config struct {
 	// catalog images on it, and prefer hotels that hold a create's image.
 	// The scratch disk of a sealed hotel is wiped every boot (AB#532).
 	PrewarmCatalog bool `json:"prewarm_catalog"`
+	// PrewarmCatalogHotels narrows prewarm_catalog to these hotel ids, for a
+	// one-hotel canary. Empty: every hotel. Each id must be a hotel in hotels
+	// (the config file), and the list needs prewarm_catalog on. Unlike
+	// terminal_hotels, an id that is not known yet is refused: a typo would
+	// leave the canary cold and its measurement would say nothing.
+	PrewarmCatalogHotels []string `json:"prewarm_catalog_hotels,omitempty"`
 	// OperatorKeySHA256 is the SHA-256 of the operator key. It allows hotel
 	// join, change and leave at runtime (hotels.go). Empty: no operator routes.
 	OperatorKeySHA256 string `json:"operator_key_sha256"`
@@ -138,6 +151,9 @@ type config struct {
 	// MinerMaxHotels is the operator-approved maximum across all miner hotkeys.
 	// Zero refuses miner joins; pending and draining hotels count.
 	MinerMaxHotels int `json:"miner_max_hotels,omitempty"`
+	// MinerMinCommitment is the floor a miner join's commitment must meet
+	// (commitment.go). Nil or zero: a commitment is optional.
+	MinerMinCommitment *capacityCommitment `json:"miner_min_commitment,omitempty"`
 	// Admission of sealed hotels (admission.go). The top-level
 	// SealedAdmission loads only as absent or "on": the gate cannot be
 	// turned off for every hotel or for joined hotels. The ops escape is
@@ -160,6 +176,9 @@ type config struct {
 	// Room terminal routes reach only these hotels. Empty: no hotel. A miner
 	// hotel never gets them, listed or not (terminalsRefused).
 	TerminalHotels []string `json:"terminal_hotels,omitempty"`
+	// Alerts: where the missed heartbeat and customer drop alerts go
+	// (alerts.go). Absent: log lines only.
+	Alerts *alertsConfig `json:"alerts,omitempty"`
 }
 
 func (b *broker) maxExec() int {
@@ -245,6 +264,7 @@ type hotel struct {
 	moved           int       // creates that left this hotel's queue for another hotel
 	runtime         bool      // joined at runtime (hotels.go), not from the config file
 	adm             admission // attestation gate of a joined sealed hotel (admission.go)
+	delivery        delivery  // delivered capacity against the commitment (commitment.go)
 	// roomsUnchecked: loaded at start and no room list has answered since. A
 	// reserved hotel takes no rooms until one has passed the fail-closed
 	// check (lend.go). baselineTry: last REPORT_ID fetch for an unknown
@@ -253,6 +273,7 @@ type hotel struct {
 	baselineTry    time.Time
 	leaving        bool               // a leave passed its empty check; no new rooms (hotels.go)
 	stop           context.CancelFunc // stops the sync loop when the hotel leaves
+	alerts         hotelAlerts        // missed heartbeat and drop alerts sent (alerts.go)
 }
 
 type guestState struct {
@@ -269,6 +290,7 @@ type guestState struct {
 
 type broker struct {
 	cfg              config
+	terminalWSIdle   time.Duration // idle close of a terminal socket; 0: defaultTerminalWSIdle (terminal_ws.go)
 	mu               sync.Mutex
 	hset             atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
 	hotelsMu         sync.Mutex               // serialises joins and leaves
@@ -283,6 +305,7 @@ type broker struct {
 	nexec            *nativeExecs // background execs on the native route (nativeexec.go)
 	prefetch         prefetchJobs
 	started          time.Time
+	alerts           *alerter // missed heartbeat and drop alerts (alerts.go)
 	// requireAttestationNoted logs the require_attestation deprecation once
 	// per broker, from the config file or a join (admission.go).
 	requireAttestationNoted sync.Once
@@ -375,6 +398,9 @@ func loadBroker(path string) (*broker, error) {
 	if c.MinerMaxHotels < 0 {
 		return nil, errors.New("config: miner_max_hotels must be positive when miner hotels are allowed")
 	}
+	if err := validateMinCommitment(c.MinerMinCommitment); err != nil {
+		return nil, err
+	}
 	for _, id := range c.TerminalHotels {
 		if id == "" || strings.Contains(id, ".") {
 			return nil, fmt.Errorf("config: terminal_hotels entry %q must be a hotel id (non-empty, no dot)", id)
@@ -387,7 +413,11 @@ func loadBroker(path string) (*broker, error) {
 	default:
 		return nil, fmt.Errorf(`config: sealed_admission %q: the top-level value can only be "on" (or absent)`, c.SealedAdmission)
 	}
-	b := &broker{cfg: c, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), nexec: newNativeExecs(), started: time.Now()}
+	alerts, err := newAlerter(c.Alerts)
+	if err != nil {
+		return nil, err
+	}
+	b := &broker{cfg: c, alerts: alerts, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), nexec: newNativeExecs(), started: time.Now()}
 	var optedIn []string // require_attestation hotels, for one deprecation line
 	for _, hc := range c.Hotels {
 		if err := validateSealedAdmission(hc); err != nil {
@@ -395,6 +425,9 @@ func loadBroker(path string) (*broker, error) {
 		}
 		if hc.MinerHotkey != "" {
 			return nil, fmt.Errorf("config: miner hotel %q must join with attested guest TLS", hc.ID)
+		}
+		if hc.Commitment != nil {
+			return nil, fmt.Errorf("config: hotel %q: only a miner hotel declares a commitment, and miner hotels join at runtime", hc.ID)
 		}
 		if hc.RequireAttestation && !hc.Sealed {
 			return nil, fmt.Errorf("config: hotel %q: require_attestation needs \"sealed\": true", hc.ID)
@@ -408,6 +441,9 @@ func loadBroker(path string) (*broker, error) {
 		if strings.Contains(hc.ID, ".") || hc.ID == "" {
 			return nil, fmt.Errorf("hotel id %q: must be non-empty and have no dot", hc.ID)
 		}
+		if !validAlertChat(hc.AlertChatID) {
+			return nil, fmt.Errorf("config: hotel %q: alert_chat_id must be a Telegram chat id (digits) or @channel", hc.ID)
+		}
 		k, err := os.ReadFile(hc.KeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("hotel %s key: %w", hc.ID, err)
@@ -418,6 +454,14 @@ func loadBroker(path string) (*broker, error) {
 		h := newHotel(hc, strings.TrimSpace(string(k)))
 		if err := b.addHotel(h); err != nil {
 			return nil, err
+		}
+	}
+	if len(c.PrewarmCatalogHotels) > 0 && !c.PrewarmCatalog {
+		return nil, errors.New("config: prewarm_catalog_hotels needs \"prewarm_catalog\": true (the list only narrows it)")
+	}
+	for _, id := range c.PrewarmCatalogHotels {
+		if b.hotelByID(id) == nil {
+			return nil, fmt.Errorf("config: prewarm_catalog_hotels entry %q is not a hotel in hotels", id)
 		}
 	}
 	if len(optedIn) > 0 {
@@ -710,7 +754,16 @@ type createResult struct {
 	// lost: hotels that got the create but never answered. Each may hold a
 	// room this guest does not know about; handleCreate reaps them.
 	lost []*hotel
+	// sent: the create bytes the hotel that answered 202 received. createOne
+	// sends one slice on every attempt, so these are the bytes of any retry
+	// too; handleCreate returns them when the caller asks (returnCreateHeader).
+	sent []byte
 }
+
+// returnCreateHeader asks a native single create to answer with the exact
+// bytes sent to the hotel, as create_request_b64. A header, not a body field:
+// a body field would have to be removed before the bytes are marshaled.
+const returnCreateHeader = "X-Broker-Return-Create-Request"
 
 // batchLabel marks every room of one create request, so the rooms a hotel
 // started for a request whose answer was lost can be found and removed.
@@ -873,7 +926,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			}
 			hdrs.Set("X-Broker-Queue-Ms", strconv.FormatFloat(ms(queue), 'f', 1, 64))
 			hdrs.Set("X-Broker-Hotel-Ms", strconv.FormatFloat(ms(call), 'f', 1, 64))
-			return finish(createResult{status: 202, header: hdrs, doc: doc})
+			return finish(createResult{status: 202, header: hdrs, doc: doc, sent: body})
 		case err == nil && status == 429:
 			h.release(rm)
 			h.rejected++
@@ -1163,6 +1216,11 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, 400, "invalid_count", "count must be between 1 and 10000")
 		return
 	}
+	wantBytes := r.Header.Get(returnCreateHeader) == "1"
+	if wantBytes && count != 1 {
+		writeErr(w, 400, "create_request_batch_unsupported", "the create bytes can be returned for a single create only (count 1)")
+		return
+	}
 	pl, perr := b.placementFor(r.Context(), g, payload)
 	if perr != nil {
 		writeErr(w, perr.status, perr.code, perr.msg)
@@ -1176,6 +1234,9 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	}
 	results := b.createMany(withOwnerHeaders(r.Context(), r), g, payload, count, tRecv, pl)
 	if count == 1 {
+		if wantBytes && results[0].status == 202 && results[0].doc != nil {
+			results[0].doc["create_request_b64"] = base64.StdEncoding.EncodeToString(results[0].sent)
+		}
 		b.finishCreate(w, results[0], tRecv)
 		return
 	}
@@ -1268,6 +1329,12 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			return
 		}
 	}
+	// A background exec's result outlives its room (AB#733): read and stop it
+	// by the guest and room stored on the exec, not the live room list.
+	if strings.HasPrefix(tail, "execs/") && (r.Method == "GET" || r.Method == "DELETE") && !strings.Contains(strings.TrimPrefix(tail, "execs/"), "/") {
+		b.nativeExecPoll(w, r, g, bid, strings.TrimPrefix(tail, "execs/"))
+		return
+	}
 	hotelID, hid, ok := strings.Cut(bid, ".")
 	h := b.hotelByID(hotelID)
 	if !ok || h == nil {
@@ -1280,6 +1347,13 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	b.mu.Unlock()
 	if !owned {
 		writeErr(w, 404, "sandbox_not_found", "no sandbox "+bid)
+		return
+	}
+	// A terminal WebSocket goes to the hotel as a raw byte pump (terminal_ws.go),
+	// after the allowlist and ownership checks above. A plain GET on the same
+	// path takes the normal route below.
+	if isWebSocketUpgrade(r) && terminalWSTail(tail) {
+		b.proxyTerminalWS(w, r, h, hid, bid, tail)
 		return
 	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 256<<20+1))
@@ -1805,6 +1879,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		h.lastErr = err.Error()
 	}
 	h.listOK = lerr == nil
+	hadHealth := !h.lastOK.IsZero()
 	if herr == nil {
 		h.lastOK, h.healthMs = now, healthMs
 	}
@@ -1833,14 +1908,18 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			log.Printf("hotel %s down: %s", h.cfg.ID, h.lastErr)
 		}
 	}
-	if cameUp && b.cfg.PrewarmCatalog {
+	b.alertHealth(h, herr, hadHealth)
+	if cameUp && b.prewarms(h) {
 		go b.prewarmHotel(h)
 	}
-	if herr == nil {
+	offered := h.slots // health late: the slots placement still uses
+	slotsTrusted := herr == nil
+	if slotsTrusted {
 		slots := hd.Slots
 		if h.cfg.MaxSlots > 0 && slots > h.cfg.MaxSlots {
 			slots = h.cfg.MaxSlots
 		}
+		offered = max(slots, 0) // this tick's answer, even 0, which resize ignores
 		h.resize(slots)
 		if hd.Live.CPU != nil {
 			h.cpuPct = *hd.Live.CPU
@@ -1859,6 +1938,8 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		h.apiRunning = int(quota.Usage["running_sandboxes"] + quota.Usage["frozen_sandboxes"])
 		h.apiDeleting = int(quota.Usage["deleting_sandboxes"])
 	}
+	// Slot delivery credits only a trusted health report this tick (AB#331).
+	b.recordDelivery(h, offered, now, slotsTrusted) // before the room list return: a failed list does not stop the count
 	if lerr != nil {
 		return
 	}
@@ -2262,6 +2343,25 @@ func (c *countingWriter) Flush() {
 	}
 }
 
+// Unwrap lets http.ResponseController reach the server's writer, so the
+// terminal WebSocket can hijack the connection (terminal_ws.go).
+func (c *countingWriter) Unwrap() http.ResponseWriter { return c.ResponseWriter }
+
+// handler is the broker as served: ServeHTTP plus the 429 counter.
+func (b *broker) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cw := &countingWriter{ResponseWriter: w, status: 200}
+		b.ServeHTTP(cw, r)
+		if cw.status == 429 && r.URL.Path == "/v1/sandboxes" && r.Method == "POST" {
+			if g := b.guestFromKey(r); g != nil {
+				b.mu.Lock()
+				g.rejected++
+				b.mu.Unlock()
+			}
+		}
+	})
+}
+
 func main() {
 	cfgPath := flag.String("config", "/etc/thin-broker/config.json", "private config file")
 	printDigest := flag.Bool("print-catalog-digest", false, "print the compiled-in catalog digest and exit; reads no config (AB#546 swap check)")
@@ -2287,26 +2387,18 @@ func main() {
 	if err := b.loadRuntimeHotels(); err != nil {
 		log.Printf("runtime hotels not loaded: %v", err)
 	}
-	b.loadCaps() // after the runtime hotels, or their probe results are dropped
+	b.loadCaps()          // after the runtime hotels, or their probe results are dropped
+	b.resumeNativeExecs() // after every hotel is known: re-attach execs that ran across the restart (AB#756)
 	saved := make(chan struct{})
 	go func() {
 		b.saveLoop(ctx)
 		close(saved)
 	}()
+	go b.alerts.run(ctx)
 	for _, h := range b.hotelList() {
 		b.startSync(ctx, h)
 	}
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cw := &countingWriter{ResponseWriter: w, status: 200}
-		b.ServeHTTP(cw, r)
-		if cw.status == 429 && r.URL.Path == "/v1/sandboxes" && r.Method == "POST" {
-			if g := b.guestFromKey(r); g != nil {
-				b.mu.Lock()
-				g.rejected++
-				b.mu.Unlock()
-			}
-		}
-	})
+	handler := b.handler()
 	// No WriteTimeout: an exec may run for hours. IdleTimeout closes kept-alive
 	// connections that send nothing, so they cannot pile up to the fd limit.
 	srv := &http.Server{Addr: b.cfg.Listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
@@ -2318,6 +2410,7 @@ func main() {
 	go func() {
 		sig := <-stop
 		log.Printf("%s: stopping, saving client state", sig)
+		b.stopNativeResume() // re-attach loops end now; the next broker picks them up
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
