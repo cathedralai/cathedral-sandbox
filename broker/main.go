@@ -157,6 +157,17 @@ type config struct {
 	// MinerMaxHotels is the operator-approved maximum across all miner hotkeys.
 	// Zero refuses miner joins; pending and draining hotels count.
 	MinerMaxHotels int `json:"miner_max_hotels,omitempty"`
+	// MinerProbationSeconds: a joined miner hotel takes test traffic only
+	// for this long (observed time) and graduates to the shared pool at
+	// MinerProbationMinUptimePct verified uptime (probation.go). 0: off.
+	MinerProbationSeconds      float64 `json:"miner_probation_seconds,omitempty"`
+	MinerProbationMinUptimePct float64 `json:"miner_probation_min_uptime_pct,omitempty"`
+	// Room caps on miner hotels (placement.go, AB#335). Both are off at 0.
+	// MinerMaxRoomsPerHotkey caps the rooms of one miner hotkey across all
+	// its hotels. MinerPoolShare (0 < x < 1) caps the rooms on miner hotels
+	// in the shared sealed pool at that share of the pool when it is full.
+	MinerMaxRoomsPerHotkey int     `json:"miner_max_rooms_per_hotkey,omitempty"`
+	MinerPoolShare         float64 `json:"miner_pool_share,omitempty"`
 	// MinerMinCommitment is the floor a miner join's commitment must meet
 	// (commitment.go). Nil or zero: a commitment is optional.
 	MinerMinCommitment *capacityCommitment `json:"miner_min_commitment,omitempty"`
@@ -281,7 +292,9 @@ type hotel struct {
 	moved           int       // creates that left this hotel's queue for another hotel
 	runtime         bool      // joined at runtime (hotels.go), not from the config file
 	adm             admission // attestation gate of a joined sealed hotel (admission.go)
-	delivery        delivery  // delivered capacity against the commitment (commitment.go)
+	prob            probation // miner probation (probation.go)
+	probationOn     atomic.Bool
+	delivery        delivery // delivered capacity against the commitment (commitment.go)
 	// roomsUnchecked: loaded at start and no room list has answered since. A
 	// reserved hotel takes no rooms until one has passed the fail-closed
 	// check (lend.go). baselineTry: last REPORT_ID fetch for an unknown
@@ -315,6 +328,8 @@ type broker struct {
 	stateSaveMu      sync.Mutex               // one client-state save at a time, snapshot through rename (state.go)
 	guests           map[string]*guestState
 	capsOnDisk       map[string]map[string]any // probe results read from state_dir at start
+	probationFileMu  sync.Mutex                // serializes miner-probation.json writes (probation.go)
+	probationSavedAt time.Time                 // guarded by mu
 	lendsOnDisk      map[string]lendEntry      // lend state of hotels not in the config file now (lend.go); guarded by mu
 	byKey            map[string]*guestState    // sha256(key) -> guest
 	byUUID           map[string]*room
@@ -339,6 +354,10 @@ type broker struct {
 	// tombs is guest id -> recent deletes by label, which also catch creates
 	// in flight (inflight.go). Guarded by b.mu.
 	tombs map[string][]tombstone
+
+	// minerExits: miner hotels that went down holding customer rooms
+	// (miner_exits.go). Guarded by b.mu.
+	minerExits []*minerExit
 }
 
 // A hotel counts as answering while its last good health answer is younger than okWindow.
@@ -414,6 +433,15 @@ func loadBroker(path string) (*broker, error) {
 	}
 	if c.MinerMaxHotels < 0 {
 		return nil, errors.New("config: miner_max_hotels must be positive when miner hotels are allowed")
+	}
+	if err := validateProbationConfig(c); err != nil {
+		return nil, err
+	}
+	if c.MinerMaxRoomsPerHotkey < 0 {
+		return nil, errors.New("config: miner_max_rooms_per_hotkey must be 0 (no cap) or more")
+	}
+	if c.MinerPoolShare != 0 && !(c.MinerPoolShare > 0 && c.MinerPoolShare < 1) {
+		return nil, errors.New("config: miner_pool_share must be 0 (no cap) or between 0 and 1, exclusive")
 	}
 	if err := validateMinCommitment(c.MinerMinCommitment); err != nil {
 		return nil, err
@@ -677,21 +705,22 @@ func (h *hotel) used() int { return len(h.rooms) + h.creating + h.queued }
 // candidate only when no preferred hotel has a free room (capacity.go).
 // Caller holds b.mu.
 func (b *broker) pick(exclude map[*hotel]bool, pl placement) *hotel {
+	mb := b.minerBudgetNow() // the miner caps (placement.go), read once
 	if pl.policy != nil && pl.tier == "" {
 		for _, t := range []string{tierPrefer, tierAllow} {
 			tp := pl
 			tp.tier = t
-			if h := b.pickIn(exclude, tp); h != nil {
+			if h := b.pickIn(exclude, tp, mb); h != nil {
 				return h
 			}
 		}
 		return nil
 	}
-	return b.pickIn(exclude, pl)
+	return b.pickIn(exclude, pl, mb)
 }
 
 // pickIn is pick inside one candidate set.
-func (b *broker) pickIn(exclude map[*hotel]bool, pl placement) *hotel {
+func (b *broker) pickIn(exclude map[*hotel]bool, pl placement, mb *minerBudget) *hotel {
 	now := time.Now()
 	hotels := b.hotelList()
 	total := 0.0
@@ -700,7 +729,7 @@ func (b *broker) pickIn(exclude map[*hotel]bool, pl placement) *hotel {
 		if exclude[h] || !pl.allows(h) {
 			continue
 		}
-		if f := b.admissibleFree(h, now); f > 0 {
+		if f := b.admissibleFreeIn(h, now, mb); f > 0 {
 			weight[i] = h.weight(f)
 			total += weight[i]
 		}
@@ -1873,6 +1902,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		} `json:"sandboxes"`
 	}
 	lerr := h.getJSON(ctx, h.cfg.API, "/v1/sandboxes", nil, &list)
+	defer b.sampleProbation(h) // registered first, so it runs last: after the health and attestation steps
 	defer b.fillLentBaseline(ctx, h, herr == nil)
 	defer b.syncAdmission(ctx, h, herr == nil) // after the health state below is stored
 	forced := false                            // the fail-closed check below made the hotel lent: save it once b.mu is free
@@ -1912,6 +1942,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	case h.downSince.IsZero():
 		h.downSince = now
 		b.hotelWentDown(h)
+		b.noteMinerDown(h, now)
 		// A hotel that comes back must pass attestation again: it may have
 		// rebooted into another binding.
 		h.adm.attestedAt, h.adm.checkedAt = time.Time{}, time.Time{}
@@ -1920,6 +1951,9 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		}
 	}
 	b.alertHealth(h, herr, hadHealth)
+	if cameUp {
+		b.noteMinerUp(h, now)
+	}
 	if cameUp && b.prewarms(h) {
 		go b.prewarmHotel(h)
 	}
@@ -1973,6 +2007,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		b.register(rm)
 		h.place(rm)
 	}
+	b.checkMinerExitRooms(h, seen)
 	var deleting []*room
 	for hid, rm := range h.rooms {
 		if !seen[hid] && rm.state == stRunning && now.Sub(rm.since) > 5*time.Second {
@@ -2238,6 +2273,10 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(p, "/v1/broker/bindings/") && r.Method == "GET" && b.isOperator(r) {
 		b.handleBindingGet(w, strings.TrimPrefix(p, "/v1/broker/bindings/")) // operator key only
+		return
+	}
+	if p == "/v1/broker/miner-exits" && r.Method == "GET" && (b.isOperator(r) || b.isOperatorReader(r)) {
+		b.handleMinerExits(w, r) // miner hotels that went down with customer rooms
 		return
 	}
 	if p == "/v1/broker/guests" || strings.HasPrefix(p, "/v1/broker/guests/") {

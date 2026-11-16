@@ -155,3 +155,25 @@ def test_a_signing_failure_still_answers_the_caller(front, monkeypatch) -> None:
     assert status == 200 and json.loads(out) == {"exit_code": 0}
     assert "X-Room-Receipt" not in headers and headers.get("X-Room-Receipt-Error") == "RuntimeError"
     assert len(seen) == 1
+
+
+def test_exec_cancel_is_signed_and_both_exec_statements_carry_the_token_hash(front) -> None:
+    # AB#406: a customer matches the cancel receipt to the exec receipt by sha256 of the exec token.
+    import hashlib
+
+    port, _seen, _mode, _ledger = front
+    token = "ab" * 16
+    want = hashlib.sha256(token.encode()).hexdigest()
+    status, headers, _out = _post(port, "/v1/sandboxes/sbx_1/exec/cancel", json.dumps({"spill_token": token}).encode())
+    assert status == 200
+    st = _receipt(headers)["statement"]
+    assert st["action"] == "exec_cancel" and st["sandbox_id"] == "sbx_1" and st["exec_token_sha256"] == want
+    _status, headers, _out = _post(port, "/v1/sandboxes/sbx_1/exec", json.dumps({"cmd": ["true"], "spill_token": token}).encode())
+    st = _receipt(headers)["statement"]
+    assert st["action"] == "exec" and st["exec_token_sha256"] == want
+
+
+def test_an_exec_without_a_token_keeps_its_statement_unchanged(front) -> None:
+    port, _seen, _mode, _ledger = front
+    _status, headers, _out = _post(port, "/v1/sandboxes/sbx_1/exec", json.dumps({"cmd": ["true"]}).encode())
+    assert "exec_token_sha256" not in _receipt(headers)["statement"]
