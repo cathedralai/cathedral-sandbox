@@ -374,6 +374,8 @@ class Front:
         self.server.shutdown()
         self.server.server_close()
         self.api.stop()
+        # Each Ledger holds its chain file open; a suite of fronts would otherwise run past FD_SETSIZE.
+        self.ledger.close()
 
 
 def receipt_of(headers: dict) -> dict:

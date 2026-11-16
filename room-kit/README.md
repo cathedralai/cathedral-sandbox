@@ -303,12 +303,49 @@ included, behaves and is signed as before. A 2xx delete of the room, or its
 `room_end`, clears the mark, and nothing else does. A pool room made after the
 bulk delete ended is not marked.
 
-At start the front lists pool-labelled rooms the API still has that this boot
-never created and marks each unclaimed one stale: every route but delete, claim
-and record reads is refused with 409 `pool_room_stale` until the room is deleted.
+**A front restart.** A restart of the front in the same guest boot (a crash
+under `Restart=on-failure`) makes a new receipt key and binding. A receipt is
+only ever served under the binding that signed it: the new front never signs,
+replays or continues a claim made before it.
+- At start the front lists the pool-labelled rooms the API still has that it
+  never created. Until a list is read and parsed, every authorized room request,
+  create and bulk delete gets 503 `pool_state_unknown`; the list is retried every
+  5 seconds.
+- An unclaimed room from before the restart is stale: never claimable, and every
+  route but delete, claim and record reads is refused with 409
+  `pool_room_stale`. The keeper deletes it; its create's `ttl_seconds` ends it
+  anyway.
+- A room claimed before the restart keeps working as an ordinary room. Each
+  successful claim writes a root-only marker (room, sandbox id, the API room's
+  `created_at`, boot id, binding and claim receipt hash; no answer, no receipt)
+  before the 200. A marker that matches the listed room, its creation time and
+  this boot marks the room claimed-before. Its later receipts are signed under
+  the new binding and numbered from 1, a separate (binding, room) group to the
+  checker. A claim on it is refused and signs nothing: 409 `pool_room_claimed`
+  for another sandbox id; for the same id 409 `pool_room_stale` while the new
+  front has signed nothing for the room, and 409 `pool_room_gone` once it has.
+- The claim's proof is receipts 1 and 2 under the earlier binding, plus that
+  binding's attestation. The broker archives bindings, not receipts or SNP
+  reports, so the caller must keep receipts 1 and 2 and the attestation it took
+  at claim (`POST /room/attest` with a fresh nonce). Receipts 3 to n signed
+  between the claim and the restart are no longer served after it, as for any
+  ordinary room. The front keeps each binding's chain and attestation in its own
+  file (`chain-<boot_id>-<binding_sha256[:16]>.jsonl`,
+  `attestation-<boot_id>-<binding_sha256[:16]>.json`), so a restart never
+  appends to or overwrites the earlier ones.
+
+**Pool sizing.** A front restart, planned (a roll) or not (a crash), loses
+every unclaimed pool room on that hotel. Size each lane so that the unclaimed
+rooms on its other hotels cover peak claims for one refill period: broker
+re-attest of the new binding, the keeper tick that retires rooms whose create
+names an old binding, and the starts that refill the pool. A lane served by one
+hotel has no such cover: after a restart every claim there falls back until
+the keeper refills. A miss falls back to a cold create, so undersizing costs
+speed, never proof.
 
 Other refusals: 405 for any method but POST (checked before the gate), 400
 `claim_request_invalid`, 409 `pool_room_stale` (no create receipt this boot),
+`pool_room_claimed` (claimed for another sandbox, before or after a restart),
 `pool_room_gone` (the room has ended, was deleted, or a replay finds it gone),
 `pool_room_unknown` (see above), `room_not_pool`, `pool_room_used`,
 `pool_room_expiring`.

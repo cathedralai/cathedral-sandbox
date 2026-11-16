@@ -2093,12 +2093,22 @@ class Ledger:
         self.claimed: dict[str, tuple[str, bytes, dict]] = {}
         # Unclaimed pool rooms the API still has but this boot never signed a create for: closed until delete.
         self.pool_stale: set[str] = set()
+        # Pool rooms an earlier front process of this boot claimed (room -> the sandbox id it was claimed for), read
+        # from the claim marker at the startup scan. They run as ordinary rooms; their claim receipt is under the
+        # earlier binding and is never served or signed again here.
+        self.claimed_before: dict[str, str] = {}
         self.head = self.binding_sha256
         os.makedirs(store, mode=0o700, exist_ok=True)
         self.store_dir = store
-        self.store = open(os.path.join(store, f"chain-{self.binding['boot_id']}.jsonl"), "ab", buffering=0)
-        with open(os.path.join(store, f"attestation-{self.binding['boot_id']}.json"), "w") as f:
+        # Named by boot and binding: a front restart in the same boot makes a new key and binding, and must not
+        # append to the earlier chain or overwrite the earlier attestation (its SNP report proves the earlier key).
+        stem = f"{self.binding['boot_id']}-{self.binding_sha256[:16]}"
+        self.store = open(os.path.join(store, f"chain-{stem}.jsonl"), "ab", buffering=0)
+        with open(os.path.join(store, f"attestation-{stem}.json"), "w") as f:
             json.dump(self.attestation(), f)
+
+    def close(self) -> None:
+        self.store.close()
 
     def attestation(self) -> dict:
         doc = {"binding": self.binding, "binding_sha256": self.binding_sha256}
@@ -2289,6 +2299,7 @@ class Ledger:
         self.pool.pop(room, None)
         self.pool_created_at.pop(room, None)
         self.claimed.pop(room, None)
+        self.claimed_before.pop(room, None)
         self.pool_stale.discard(room)
         self.unknown.discard(room)
         try:
@@ -2302,12 +2313,15 @@ class Ledger:
     def _pool_claim_path(self, room: str) -> str:
         return os.path.join(self.store_dir, f"pool-claim-{sha(room.encode())}.json")
 
-    def _persist_pool_claim(self, room: str, cathedral_id: str, answer: dict, receipt: dict) -> None:
-        """Commit the signed claim before the front sends 200. Caller holds self.lock."""
+    def _persist_pool_claim(self, room: str, cathedral_id: str, receipt: dict) -> None:
+        """Record that the room was claimed, before the front sends 200. Caller holds self.lock.
+
+        The record classifies the room for a later front process of this boot; it holds no answer and no receipt,
+        so nothing signed under this binding can be served again under another."""
         created_at = self.pool_created_at[room]
         record = {"room": room, "cathedral_sandbox_id": cathedral_id,
                   "created_at": created_at, "boot_id": self.binding["boot_id"],
-                  "answer": answer, "receipt": receipt}
+                  "binding_sha256": self.binding_sha256, "claim_receipt_sha256": receipt["receipt_sha256"]}
         target = self._pool_claim_path(room)
         temporary = target + f".{uuid.uuid4().hex}.tmp"
         try:
@@ -2328,22 +2342,18 @@ class Ledger:
             except FileNotFoundError:
                 pass
 
-    def recovered_pool_claim(self, room: str, created_at: str) -> tuple[str, bytes, dict] | None:
-        """Read a claim made by an earlier front in this guest boot, bound to this API room incarnation."""
+    def recovered_pool_claim(self, room: str, created_at: str) -> str | None:
+        """The sandbox id an earlier front in this guest boot claimed this API room incarnation for, or None."""
         try:
             with open(self._pool_claim_path(room), "rb") as f:
                 record = json.load(f)
-            receipt = record["receipt"]
-            statement = receipt["statement"]
+            cid = record["cathedral_sandbox_id"]
             if (record["room"] != room or record["created_at"] != created_at
                     or record["boot_id"] != self.binding["boot_id"]
-                    or statement["action"] != "claim" or statement["sandbox_id"] != room
-                    or type(statement["status"]) is not int or not 200 <= statement["status"] < 300
-                    or statement["cathedral_sandbox_id"] != record["cathedral_sandbox_id"]
-                    or receipt["receipt_sha256"] != sha(canonical(statement))
-                    or record["answer"]["cathedral_sandbox_id"] != record["cathedral_sandbox_id"]):
+                    or record["binding_sha256"] == self.binding_sha256
+                    or not isinstance(cid, str) or not SANDBOX_LINK_RE.fullmatch(cid)):
                 return None
-            return record["cathedral_sandbox_id"], canonical(record["answer"]), receipt
+            return cid
         except (OSError, ValueError, TypeError, KeyError, RecursionError):
             return None
 
@@ -2380,6 +2390,10 @@ class Ledger:
                 if held[0] == cathedral_id:
                     return (200, held[1], held[2]), None, None
                 return None, ("pool_room_claimed", "this room is claimed for another sandbox"), None
+            before = self.claimed_before.get(room)
+            if before is not None and before != cathedral_id:
+                # Claimed by an earlier front process for another sandbox: the caller must not touch it.
+                return None, ("pool_room_claimed", "this room is claimed for another sandbox"), None
             history = self.by_room.get(room, [])
             if not history:
                 return None, ("pool_room_stale", "this front has no receipt for the room"), None
@@ -2406,7 +2420,7 @@ class Ledger:
             status = receipt["statement"]["status"]
             if isinstance(status, int) and 200 <= status < 300:
                 try:
-                    self._persist_pool_claim(room, fields["cathedral_sandbox_id"], answer, receipt)
+                    self._persist_pool_claim(room, fields["cathedral_sandbox_id"], receipt)
                 except (OSError, KeyError):
                     self.broken.add(room)
                     raise
@@ -3097,10 +3111,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(401, b'{"error":"unauthorized"}')
             return self.handle_exec_result(m["id"])
         room = room_of(path)
+        if not self.server.pool_scan_ready and self.authorized() and (
+                room or (self.command in ("POST", "DELETE") and path == "/v1/sandboxes")):
+            # Until the startup list is read no room traffic passes, and no create or bulk delete either: a pool
+            # room made now could be listed by the scan as one this front never signed.
+            return self.reply(503, canonical({"error": {"code": "pool_state_unknown",
+                                                      "message": "room state is being checked; retry shortly"}}))
         if room and self.authorized():
-            if not self.server.pool_scan_ready:
-                return self.reply(503, canonical({"error": {"code": "pool_state_unknown",
-                                                          "message": "room state is being checked; retry shortly"}}))
             # Callers without the key are not counted: they never hold a token, and the API refuses them.
             self.turn, refusal = ledger.enter(room, route_kind(self.command, path))
             if refusal is not None:
@@ -3867,7 +3884,7 @@ class Server(ThreadingHTTPServer):
         if not isinstance(docs, list):
             return False
         stale: set[str] = set()
-        recovered: dict[str, tuple[str, bytes, dict]] = {}
+        recovered: dict[str, str] = {}
         for doc in docs:
             if not isinstance(doc, dict):
                 return False
@@ -3888,7 +3905,7 @@ class Server(ThreadingHTTPServer):
             stale.add(room)
         with self.ledger.lock:
             self.ledger.pool_stale.update(stale)
-            self.ledger.claimed.update(recovered)
+            self.ledger.claimed_before.update(recovered)
             self.pool_scan_ready = True
         return True
 

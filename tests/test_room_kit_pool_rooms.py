@@ -254,47 +254,66 @@ def test_a_claim_of_a_room_with_no_receipt_this_boot_is_stale(front) -> None:
     assert status == 409 and code(out) == "pool_room_stale"
 
 
-def test_a_claim_after_a_front_restart_is_stale(tmp_path, monkeypatch, front) -> None:
+class Restarted:
+    """A second front process in the same guest boot: a new Ledger (new key and binding) on the same API."""
+
+    def __init__(self, front: Front, store, serve: bool = True) -> None:
+        self.ledger = rr.Ledger("room-b", str(store))
+        self.server = rr.Server(("127.0.0.1", 0), self.ledger, front.api.server.server_address[1], 1, KEY,
+                                "/nonexistent.sock")
+        self.served = serve
+        if serve:
+            threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def call(self, method: str, path: str, body: bytes | dict | None = None):
+        if isinstance(body, dict):
+            body = json.dumps(body).encode()
+        c = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        try:
+            c.request(method, path, body=body, headers={"Authorization": "Bearer " + KEY.decode(),
+                                                        "Content-Type": "application/json"})
+            r = c.getresponse()
+            return r.status, dict(r.getheaders()), r.read()
+        finally:
+            c.close()
+
+    def claim(self, room: str, cid: str = CID, lifetime: int = 600):
+        return self.call("POST", f"/v1/sandboxes/{room}/claim", {"cathedral_sandbox_id": cid, "lifetime_seconds": lifetime})
+
+    def close(self) -> None:
+        if self.served:
+            self.server.shutdown()
+        self.server.server_close()
+        self.ledger.close()
+
+
+def test_a_claim_after_a_front_restart_is_stale(tmp_path, front) -> None:
     room = pool_room(front)
-    ledger = rr.Ledger("room-b", str(tmp_path / "second"))
-    server = rr.Server(("127.0.0.1", 0), ledger, front.api.server.server_address[1], 1, KEY, "/nonexistent.sock")
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    second = Restarted(front, tmp_path / "second")
     try:
-        c = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
-        c.request("POST", f"/v1/sandboxes/{room}/claim", body=json.dumps({"cathedral_sandbox_id": CID, "lifetime_seconds": 60}),
-                  headers={"Authorization": "Bearer " + KEY.decode()})
-        r = c.getresponse()
-        assert r.status == 409 and code(r.read()) == "pool_room_stale"
+        status, _h, out = second.claim(room, lifetime=60)
+        assert status == 409 and code(out) == "pool_room_stale"
     finally:
-        server.shutdown()
-        server.server_close()
+        second.close()
     assert front.api.count(r".*/lifetime") == 0
 
 
-def test_an_unclaimed_pool_room_surviving_a_restart_is_fail_closed(tmp_path, monkeypatch, front) -> None:
+def test_an_unclaimed_pool_room_surviving_a_restart_is_fail_closed(tmp_path, front) -> None:
     room = pool_room(front)
-    ledger = rr.Ledger("room-b", str(tmp_path / "second"))
-    server = rr.Server(("127.0.0.1", 0), ledger, front.api.server.server_address[1], 1, KEY, "/nonexistent.sock")
-    assert room in ledger.pool_stale
-    seen = len(front.api.seen)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    second = Restarted(front, tmp_path / "second")
     try:
-        port = server.server_address[1]
-        hdrs = {"Authorization": "Bearer " + KEY.decode(), "Content-Type": "application/json"}
+        assert room in second.ledger.pool_stale
+        seen = len(front.api.seen)
         for method, path, body in [
             ("POST", f"/v1/sandboxes/{room}/exec", json.dumps({"cmd": ["true"]}).encode()),
             ("PUT", f"/v1/sandboxes/{room}/files?path=%2Fwork%2Fa", b"x"),
             ("POST", f"/v1/sandboxes/{room}/terminals", b"{}"),
         ]:
-            c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-            c.request(method, path, body=body, headers=hdrs)
-            r = c.getresponse()
-            assert r.status == 409 and code(r.read()) == "pool_room_stale", (method, path)
-            c.close()
+            status, _h, out = second.call(method, path, body)
+            assert status == 409 and code(out) == "pool_room_stale", (method, path)
         assert len(front.api.seen) == seen
     finally:
-        server.shutdown()
-        server.server_close()
+        second.close()
 
 
 @pytest.mark.parametrize("bad_list", [503, b'{"sandboxes":{}}', b'{"sandboxes":[{"id":"sbx_x"}]}'])
@@ -304,73 +323,117 @@ def test_a_failed_startup_list_closes_room_traffic_until_a_valid_retry(tmp_path,
         front.api.list_status = bad_list
     else:
         front.api.list_body = bad_list
-    ledger = rr.Ledger("room-b", str(tmp_path / "second"))
-    server = rr.Server(("127.0.0.1", 0), ledger, front.api.server.server_address[1], 1, KEY, "/nonexistent.sock")
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    second = Restarted(front, tmp_path / "second")
     try:
-        assert not server.pool_scan_ready
+        assert not second.server.pool_scan_ready
         seen = len(front.api.seen)
-        c = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
-        c.request("POST", f"/v1/sandboxes/{room}/exec", body=b'{"cmd":["true"]}',
-                  headers={"Authorization": "Bearer " + KEY.decode()})
-        r = c.getresponse()
-        assert r.status == 503 and code(r.read()) == "pool_state_unknown"
-        c.close()
+        status, _h, out = second.call("POST", f"/v1/sandboxes/{room}/exec", b'{"cmd":["true"]}')
+        assert status == 503 and code(out) == "pool_state_unknown"
         assert len(front.api.seen) == seen
         front.api.list_status = 200
         front.api.list_body = None
-        assert server.collect_surviving_pool_rooms()
-        assert server.pool_scan_ready and room in ledger.pool_stale
-        c = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
-        c.request("POST", f"/v1/sandboxes/{room}/exec", body=b'{"cmd":["true"]}',
-                  headers={"Authorization": "Bearer " + KEY.decode()})
-        r = c.getresponse()
-        assert r.status == 409 and code(r.read()) == "pool_room_stale"
-        c.close()
+        assert second.server.collect_surviving_pool_rooms()
+        assert second.server.pool_scan_ready and room in second.ledger.pool_stale
+        status, _h, out = second.call("POST", f"/v1/sandboxes/{room}/exec", b'{"cmd":["true"]}')
+        assert status == 409 and code(out) == "pool_room_stale"
     finally:
-        server.shutdown()
-        server.server_close()
+        second.close()
 
 
-def test_a_claimed_pool_room_and_its_claim_answer_survive_a_front_restart(tmp_path, front) -> None:
+def test_no_create_or_bulk_delete_passes_while_the_startup_list_is_unread(tmp_path, front) -> None:
+    # A pool room made before the list is read could be listed as one this front never signed, and end up both
+    # stale and claimable. Creates and bulk deletes wait for the list like room traffic does.
+    front.api.list_status = 503
+    second = Restarted(front, tmp_path / "second")
+    try:
+        assert not second.server.pool_scan_ready
+        seen = len(front.api.seen)
+        status, _h, out = second.call("POST", "/v1/sandboxes", POOL)
+        assert status == 503 and code(out) == "pool_state_unknown"
+        status, _h, out = second.call("DELETE", "/v1/sandboxes?label=cathedral_pool%3D1")
+        assert status == 503 and code(out) == "pool_state_unknown"
+        assert len(front.api.seen) == seen
+        _status, _h, out = second.call("GET", "/v1/sandboxes")
+        assert b"pool_state_unknown" not in out  # a list read is not a create; the API answers it
+        front.api.list_status = 200
+        assert second.server.collect_surviving_pool_rooms()
+        status, headers, out = second.call("POST", "/v1/sandboxes", POOL)
+        assert status == 200 and receipt_of(headers)["statement"]["pool"] is True
+        room = json.loads(out)["id"]
+        assert room in second.ledger.pool and room not in second.ledger.pool_stale
+    finally:
+        second.close()
+
+
+def test_a_claimed_pool_room_keeps_working_after_a_restart_and_its_claim_is_never_replayed(tmp_path, front) -> None:
     room = pool_room(front)
     first = claim(front, room)
     assert first[0] == 200
-    ledger = rr.Ledger("room-b", str(tmp_path))
-    server = rr.Server(("127.0.0.1", 0), ledger, front.api.server.server_address[1], 1, KEY, "/nonexistent.sock")
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    second = Restarted(front, tmp_path)
     try:
-        assert server.pool_scan_ready and room in ledger.claimed and room not in ledger.pool_stale
-        seen = front.api.count(rf"POST /v1/sandboxes/{room}/lifetime")
-        c = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
-        c.request("POST", f"/v1/sandboxes/{room}/claim",
-                  body=json.dumps({"cathedral_sandbox_id": CID, "lifetime_seconds": 600}),
-                  headers={"Authorization": "Bearer " + KEY.decode()})
-        r = c.getresponse()
-        assert r.status == 200 and r.read() == first[2]
-        c.close()
-        assert front.api.count(rf"POST /v1/sandboxes/{room}/lifetime") == seen
-        c = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
-        c.request("POST", f"/v1/sandboxes/{room}/exec", body=b'{"cmd":["true"]}',
-                  headers={"Authorization": "Bearer " + KEY.decode()})
-        r = c.getresponse()
-        assert r.status == 200, r.read()
-        c.close()
+        ledger = second.ledger
+        assert second.server.pool_scan_ready and room not in ledger.pool_stale
+        assert room not in ledger.claimed and ledger.claimed_before == {room: CID}
+        lifetimes = front.api.count(rf"POST /v1/sandboxes/{room}/lifetime")
+        # Same id, nothing signed for the room yet under the new binding: stale, and no receipt of either binding.
+        status, headers, out = second.claim(room)
+        assert status == 409 and code(out) == "pool_room_stale" and "X-Room-Receipt" not in headers
+        # Another id: claimed, so the caller's keeper quarantines the room instead of deleting a customer's room.
+        status, headers, out = second.claim(room, OTHER)
+        assert status == 409 and code(out) == "pool_room_claimed" and "X-Room-Receipt" not in headers
+        # The room runs as an ordinary room under the new binding, numbered from 1.
+        status, headers, _out = second.call("POST", f"/v1/sandboxes/{room}/exec", b'{"cmd":["true"]}')
+        assert status == 200
+        st = receipt_of(headers)["statement"]
+        assert st["binding_sha256"] == ledger.binding_sha256 != front.ledger.binding_sha256
+        assert st["room_sequence"] == 1 and st["action"] == "exec"
+        # After a receipt under the new binding the same id is told the room is gone, never handed the old claim.
+        status, headers, out = second.claim(room)
+        assert status == 409 and code(out) == "pool_room_gone" and "X-Room-Receipt" not in headers
+        status, _h, out = second.claim(room, OTHER)
+        assert status == 409 and code(out) == "pool_room_claimed"
+        assert front.api.count(rf"POST /v1/sandboxes/{room}/lifetime") == lifetimes
+        assert not any(rc["statement"]["action"] == "claim" for rc in ledger.chain)
     finally:
-        server.shutdown()
-        server.server_close()
+        second.close()
+
+
+def test_a_restart_keeps_the_earlier_chain_and_attestation_files(tmp_path, front) -> None:
+    room = pool_room(front)
+    assert claim(front, room)[0] == 200
+    files = {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.name.startswith(("chain-", "attestation-"))}
+    assert len(files) == 2
+    second = Restarted(front, tmp_path, serve=False)
+    try:
+        after = {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.name.startswith(("chain-", "attestation-"))}
+        assert len(after) == 4
+        assert {name: after[name] for name in files} == files
+        attestation = next(n for n in files if n.startswith("attestation-"))
+        assert json.loads(files[attestation])["binding_sha256"] == front.ledger.binding_sha256
+    finally:
+        second.close()
+
+
+def test_the_claim_marker_holds_no_answer_and_no_receipt(tmp_path, front) -> None:
+    room = pool_room(front)
+    status, headers, _out = claim(front, room)
+    assert status == 200
+    record = json.loads(open(front.ledger._pool_claim_path(room), "rb").read())
+    assert set(record) == {"room", "cathedral_sandbox_id", "created_at", "boot_id", "binding_sha256",
+                           "claim_receipt_sha256"}
+    assert record["claim_receipt_sha256"] == receipt_of(headers)["receipt_sha256"]
+    assert record["binding_sha256"] == front.ledger.binding_sha256
 
 
 def test_a_claim_marker_for_an_older_room_incarnation_does_not_open_a_new_room(tmp_path, front) -> None:
     room = pool_room(front)
     assert claim(front, room)[0] == 200
     front.api.created_at[room] = front.api._stamp(10)
-    ledger = rr.Ledger("room-b", str(tmp_path))
-    server = rr.Server(("127.0.0.1", 0), ledger, front.api.server.server_address[1], 1, KEY, "/nonexistent.sock")
+    second = Restarted(front, tmp_path, serve=False)
     try:
-        assert room in ledger.pool_stale and room not in ledger.claimed
+        assert room in second.ledger.pool_stale and room not in second.ledger.claimed_before
     finally:
-        server.server_close()
+        second.close()
 
 
 def test_claim_marker_write_failure_never_returns_a_successful_claim(front, monkeypatch) -> None:
