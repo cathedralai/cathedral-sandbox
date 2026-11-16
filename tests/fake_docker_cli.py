@@ -427,6 +427,28 @@ def main(argv):
         print((f"false {c.get('exit_code') or 0}" if c.get("status") == "exited" else "true 0") + extra)
         return 0
 
+    if cmd == "logs":
+        # AB#419: docker logs --timestamps [--since sec.nanos] <cid>. --since is
+        # inclusive, as the daemon's json-file reader is. Lines are
+        # [ns, stream, text]; text carries its own newline (none for a partial).
+        with Locked() as st:
+            cid = find(st, argv[-1])
+            c = st["containers"].get(cid) if cid else None
+        if c is None or b.get("logs_fail"):
+            print(f"Error response from daemon: No such container: {argv[-1]}", file=sys.stderr)
+            return 1
+        since = 0
+        if "--since" in argv:
+            sec, _, frac = argv[argv.index("--since") + 1].partition(".")
+            since = int(sec) * 1_000_000_000 + int(frac.ljust(9, "0"))
+        for ns, stream, text in c.get("logs", []):
+            if ns < since:
+                continue
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ns // 1_000_000_000))
+            out = sys.stdout if stream == "stdout" else sys.stderr
+            out.write(f"{stamp}.{ns % 1_000_000_000:09d}Z {text}")
+        return 0
+
     if cmd == "save":
         with Locked() as st:
             st.setdefault("saved", []).append(argv[-1])
@@ -506,6 +528,12 @@ class FakeDocker:
     def add_container(self, cid: str, *, name: str, labels: dict[str, str]) -> None:
         state = self._load()
         state["containers"][cid] = {"name": name, "labels": labels, "status": "running", "argv": []}
+        self._save(state)
+
+    def add_log(self, cid: str, stream: str, text: str, ns: int) -> None:
+        """Append one entrypoint log line (AB#419) as the daemon would keep it."""
+        state = self._load()
+        state["containers"][cid].setdefault("logs", []).append([ns, stream, text])
         self._save(state)
 
     @property

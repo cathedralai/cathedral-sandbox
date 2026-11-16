@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -68,6 +69,8 @@ from cathedral.sandbox_provider import (
     _parse_label_filters,
     _render_cmd,
     provider_from_environment,
+    read_log_page,
+    validated_log_page,
 )
 
 
@@ -994,6 +997,28 @@ class DockerClient:
                 return None
             time.sleep(ROOM_DEATH_POLL_SECONDS)
 
+    def entrypoint_logs(self, container_id: str, *, since_ns: int, cap: int) -> tuple[int, str, str, tuple[bool, bool]]:
+        """(rc, stdout, stderr, (stdout cut, stderr cut)) of ``docker logs --timestamps``.
+
+        Each stream keeps at most *cap* bytes; a cut stream says so. ``since_ns``
+        0 reads from the start of what the daemon kept.
+        """
+        argv = ["docker", "logs", "--timestamps"]
+        if since_ns > 0:
+            argv += ["--since", f"{since_ns // 1_000_000_000}.{since_ns % 1_000_000_000:09d}"]
+        argv.append(container_id)
+        raw: dict[str, bytearray] = {"out": bytearray(), "err": bytearray()}
+        result = self.run(
+            argv, timeout=30.0, output_cap=cap,
+            on_stdout=raw["out"].extend, on_stderr=raw["err"].extend,
+        )
+        # The hooks see at most cap bytes of each stream. A stream of exactly cap
+        # bytes reads as cut too: its last line waits for the next read, none is lost.
+        cut = (len(raw["out"]) >= cap, len(raw["err"]) >= cap)
+        out = raw["out"].decode("utf-8", "replace")
+        err = raw["err"].decode("utf-8", "replace")
+        return result.returncode, out, err, cut
+
     def remove(self, container_id: str) -> None:
         """Best-effort removal. The result is not checked; use remove_confirmed for GC."""
         self.run(["docker", "rm", "-f", container_id], timeout=60.0)
@@ -1247,7 +1272,12 @@ def _in_work(path: str) -> str:
 
 
 def _read_room_log(path: Path) -> str:
-    """Read a process log from the room's /work without following a symlink.
+    """The first EXEC_OUTPUT_CAP bytes of a process log in the room's /work."""
+    return _read_room_log_page(path, 0, EXEC_OUTPUT_CAP)["logs"]
+
+
+def _read_room_log_page(path: Path, offset: int, limit: int) -> dict[str, Any]:
+    """One page of a process log from the room's /work, without following a symlink.
 
     The room can write /work, so it can swap its log for a link to a host file
     (the hotel API key). O_NOFOLLOW refuses that; a FIFO or device reads empty.
@@ -1255,11 +1285,149 @@ def _read_room_log(path: Path) -> str:
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
-        return ""
+        return read_log_page(None, 0, offset, limit)
     with os.fdopen(fd, "rb") as fh:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return ""
-        return fh.read(EXEC_OUTPUT_CAP).decode("utf-8", errors="replace")
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return read_log_page(None, 0, offset, limit)
+        return read_log_page(fh, st.st_size, offset, limit)
+
+
+# The room container's own log (AB#419): what its entrypoint writes to stdout and
+# stderr, kept by the daemon (json-file on a room kit host). One read returns at
+# most this many bytes of each stream; ``more`` says there is more to read.
+ENTRYPOINT_LOG_PAGE = 4 * 1024 * 1024
+_DOCKER_LOG_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$")
+_ENTRYPOINT_CURSOR = re.compile(r"^(\d{1,20}):(\d{1,9}):(\d{1,9})$")
+# The stamp docker writes before each message (RFC3339NanoFixed in UTC). A message
+# without a newline (a json-file partial: a line over 16 KiB, or a last line not
+# yet ended) is followed on the same output line by the next message's stamp.
+_DOCKER_PARTIAL_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z ")
+
+
+def _join_partials(text: str) -> str:
+    """One logical line from docker's partial messages: drop the stamps docker put between them."""
+    return _DOCKER_PARTIAL_STAMP.sub(lambda m: "" if _docker_log_ns(m.group(0)[:-1]) is not None else m.group(0), text)
+
+
+def parse_entrypoint_cursor(cursor: str | None) -> tuple[int, int, int]:
+    """(unix ns, stdout lines, stderr lines at that ns already read) of an entrypoint cursor.
+
+    "" reads from the start of what the daemon kept.
+    """
+    if cursor is None or cursor == "":
+        return 0, 0, 0
+    match = _ENTRYPOINT_CURSOR.match(cursor) if isinstance(cursor, str) else None
+    if match is None:
+        raise SandboxOpError("invalid_request", 400, "entrypoint_cursor must be empty or a next_cursor this API returned")
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def _docker_log_ns(stamp: str) -> int | None:
+    """Unix ns of a ``docker logs --timestamps`` prefix (RFC 3339 with up to 9 fraction digits)."""
+    match = _DOCKER_LOG_TS.match(stamp)
+    if match is None:
+        return None
+    base, frac, zone = match.groups()
+    try:
+        whole = int(datetime.strptime(base, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp())
+    except ValueError:
+        return None
+    if zone != "Z":
+        sign = 1 if zone[0] == "+" else -1
+        whole -= sign * (int(zone[1:3]) * 3600 + int(zone[4:6]) * 60)
+    return whole * 1_000_000_000 + int((frac or "").ljust(9, "0"))
+
+
+def _docker_log_lines(text: str, cut: bool, hold_partial: bool) -> tuple[list[tuple[int, str]], int | None]:
+    """(ns, line) of each whole line of one stream, and the stream's horizon.
+
+    A stream cut at the read cap ends in a cut line, and a running room's last
+    line may lack its newline yet: docker prints the rest of that line later
+    after a new timestamp, so a read that counted the first part would skip the
+    rest. Such a last line is left out, and the horizon is its time: no line of
+    either stream after it is returned, so the next read starts at or before it.
+    A line with no timestamp prefix (not something docker writes) belongs to the
+    line before it. A line docker kept as partial messages is joined back into
+    one, timed by its first part.
+    """
+    parts = text.split("\n")
+    tail = parts.pop()  # "" when the text ends in a newline
+    lines: list[tuple[int, str]] = []
+    for part in parts:
+        stamp, sep, rest = part.partition(" ")
+        ns = _docker_log_ns(stamp) if sep else None
+        if ns is None:
+            if lines:
+                lines[-1] = (lines[-1][0], lines[-1][1] + part + "\n")
+            continue
+        lines.append((ns, _join_partials(rest) + "\n"))
+    horizon = None
+    if tail:
+        stamp, sep, rest = tail.partition(" ")
+        ns = _docker_log_ns(stamp) if sep else None
+        if cut or hold_partial:
+            horizon = ns if ns is not None else (lines[-1][0] if lines else -1)
+        elif ns is not None:
+            lines.append((ns, _join_partials(rest)))
+        elif lines:
+            lines[-1] = (lines[-1][0], lines[-1][1] + tail)
+    elif cut:
+        horizon = lines[-1][0] if lines else -1
+    return lines, horizon
+
+
+def entrypoint_log_page(
+    stdout: str,
+    stderr: str,
+    cut: tuple[bool, bool],
+    cursor: tuple[int, int, int],
+    *,
+    running: bool = True,
+) -> dict[str, Any]:
+    """The lines after *cursor* from one ``docker logs --timestamps --since`` read.
+
+    docker logs has no byte offset (json-file rotates its files), so the cursor
+    is a time and, per stream, how many lines at that time the read before
+    returned: ``--since`` is inclusive, so those come back and are dropped here.
+    """
+    since_ns = cursor[0]
+    streams = [
+        _docker_log_lines(stdout, cut[0], running),
+        _docker_log_lines(stderr, cut[1], running),
+    ]
+    horizons = [h for _, h in streams if h is not None]
+    limit = min(horizons) if horizons else None
+    fresh: list[list[tuple[int, str]]] = []
+    for index, (lines, _) in enumerate(streams):
+        seen = cursor[1 + index]
+        kept: list[tuple[int, str]] = []
+        for ns, line in lines:
+            if ns < since_ns:
+                continue
+            if ns == since_ns and seen > 0:
+                seen -= 1
+                continue
+            if limit is not None and ns > limit:
+                break
+            kept.append((ns, line))
+        fresh.append(kept)
+    last = max((kept[-1][0] for kept in fresh if kept), default=None)
+    if last is None:
+        next_cursor = f"{cursor[0]}:{cursor[1]}:{cursor[2]}"
+    else:
+        counts = [
+            sum(1 for ns, _ in kept if ns == last) + (cursor[1 + i] if last == since_ns else 0)
+            for i, kept in enumerate(fresh)
+        ]
+        next_cursor = f"{last}:{counts[0]}:{counts[1]}"
+    return {
+        "stdout": "".join(line for _, line in fresh[0]),
+        "stderr": "".join(line for _, line in fresh[1]),
+        "next_cursor": next_cursor,
+        # A stream hit the read cap: read again from next_cursor for the rest.
+        "more": any(cut),
+    }
 
 
 def _sweep_stale_bases(own: Path) -> None:
@@ -2353,7 +2521,62 @@ class DockerGuestProvider:
         guest = self._guests.get(sandbox_id)
         if guest is None or process_id not in guest.guest_processes:
             return self._inner.process_logs(sandbox_id, process_id)
+        self._require_process_owner(sandbox_id)
         return _read_room_log(guest.guest_processes[process_id])
+
+    def _require_process_owner(self, sandbox_id: str) -> None:
+        """The caller owns the room: the in-memory record's owner check (AB#419)."""
+        with self._inner._lock:  # noqa: SLF001
+            self._inner._require_active(sandbox_id)  # noqa: SLF001
+
+    def process_logs_page(
+        self, sandbox_id: str, process_id: str, *, offset: int | None = None, limit: int | None = None
+    ) -> dict[str, Any]:
+        """One page of a background process's log from a byte offset (AB#419)."""
+        guest = self._guests.get(sandbox_id)
+        if guest is None or process_id not in guest.guest_processes:
+            return self._inner.process_logs_page(sandbox_id, process_id, offset=offset, limit=limit)
+        offset, limit = validated_log_page(offset, limit)
+        self._require_process_owner(sandbox_id)
+        return {"process_id": process_id, **_read_room_log_page(guest.guest_processes[process_id], offset, limit)}
+
+    def logs(self, sandbox_id: str, *, entrypoint_cursor: str | None = None) -> dict[str, Any]:
+        """§3.13 logs plus the room's entrypoint log from *entrypoint_cursor* (AB#419).
+
+        The record and its owner check are the in-memory provider's. A room
+        whose container is gone (deleted, tombstone) has no entrypoint read.
+        """
+        cursor = parse_entrypoint_cursor(entrypoint_cursor) if entrypoint_cursor is not None else None
+        doc = self._inner.logs(sandbox_id)
+        guest = self._guests.get(sandbox_id)
+        if cursor is None or guest is None or doc.get("state") == "deleted":
+            # Asked for only: docker logs reads the whole kept log on each call.
+            return doc
+        page: dict[str, Any] = {"cursor": entrypoint_cursor}
+        if self._secrets_root is not None:
+            # A hotel with customer-sealed secrets keeps the room's own output from
+            # whoever holds the hotel key, as it keeps sealed exec output
+            # (docs/SEALED_COMMANDS.md): the entrypoint can read /run/secrets.
+            page["error"] = "entrypoint_log_withheld: this hotel keeps sealed rooms' output to the room"
+            return {**doc, "entrypoint": page}
+        try:
+            code, out, err, cut = self._client.entrypoint_logs(
+                guest.container_id, since_ns=cursor[0], cap=ENTRYPOINT_LOG_PAGE
+            )
+        except SandboxOpError as exc:
+            code, err = -1, str(exc)
+        if code != 0:
+            # The exec record is still worth answering; say why there is no entrypoint
+            # log (a room started with --log-driver none has none to read).
+            page["error"] = (err.strip().splitlines() or ["docker logs failed"])[-1][:300]
+            return {**doc, "entrypoint": page}
+        running = True
+        if (out and not out.endswith("\n")) or (err and not err.endswith("\n")):
+            # A last line without its newline is whole only once the room has stopped.
+            state = self._client.container_state(guest.container_id)
+            running = state is None or state[0]
+        page.update(entrypoint_log_page(out, err, cut, cursor, running=running))
+        return {**doc, "entrypoint": page}
 
     def stop_process(self, sandbox_id: str, process_id: str) -> None:
         guest = self._guests.get(sandbox_id)
