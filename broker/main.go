@@ -334,6 +334,7 @@ type broker struct {
 	byKey            map[string]*guestState    // sha256(key) -> guest
 	byUUID           map[string]*room
 	compat           *compatState
+	answers          *answerPool  // bytes of hotel exec answers being read on the compat routes (AB#752)
 	nexec            *nativeExecs // background execs on the native route (nativeexec.go)
 	prefetch         prefetchJobs
 	started          time.Time
@@ -462,7 +463,7 @@ func loadBroker(path string) (*broker, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &broker{cfg: c, alerts: alerts, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), nexec: newNativeExecs(), started: time.Now()}
+	b := &broker{cfg: c, alerts: alerts, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), answers: newAnswerPool(), nexec: newNativeExecs(), started: time.Now()}
 	var optedIn []string // require_attestation hotels, for one deprecation line
 	for _, hc := range c.Hotels {
 		if err := validateSealedAdmission(hc); err != nil {
@@ -595,8 +596,28 @@ func (h *hotel) doBase(ctx context.Context, base, method, path string, query url
 // doHeaders is doBase with extra request headers (the guest id of
 // guestcalls.go).
 func (h *hotel) doHeaders(ctx context.Context, base, method, path string, query url.Values, body []byte, timeout time.Duration, extra http.Header) (int, http.Header, []byte, error) {
+	status, hdr, out, _, err := h.doHeadersMax(ctx, base, method, path, query, body, timeout, extra, answerRead{})
+	return status, hdr, out, err
+}
+
+// errAnswerTooLarge is a hotel answer longer than its caller reads (AB#752).
+var errAnswerTooLarge = errors.New("the hotel answer is over its size limit")
+
+// answerRead bounds one answer read (AB#752): at most maxBytes (0: no limit),
+// and, with a pool, only once the answer's size is reserved in it for owner.
+type answerRead struct {
+	maxBytes int64
+	pool     *answerPool
+	owner    string
+}
+
+// doHeadersMax is doHeaders under an answerRead. A longer answer is an error,
+// never a cut-off body to parse. The release it returns gives the reserved
+// bytes back; the caller calls it once it no longer holds the body.
+func (h *hotel) doHeadersMax(ctx context.Context, base, method, path string, query url.Values, body []byte, timeout time.Duration, extra http.Header, lim answerRead) (int, http.Header, []byte, func(), error) {
+	noop := func() {}
 	if err := h.keyedCallErr(base); err != nil {
-		return 0, nil, nil, err
+		return 0, nil, nil, noop, err
 	}
 	u := base + path
 	if len(query) > 0 {
@@ -606,7 +627,7 @@ func (h *hotel) doHeaders(ctx context.Context, base, method, path string, query 
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, u, bytes.NewReader(body))
 	if err != nil {
-		return 0, nil, nil, err
+		return 0, nil, nil, noop, err
 	}
 	for k, v := range extra {
 		req.Header[k] = v
@@ -617,16 +638,47 @@ func (h *hotel) doHeaders(ctx context.Context, base, method, path string, query 
 	}
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return 0, nil, nil, err
+		return 0, nil, nil, noop, err
 	}
 	defer resp.Body.Close()
-	out, err := io.ReadAll(resp.Body)
+	var reader io.Reader = resp.Body
+	release := noop
+	if lim.maxBytes > 0 {
+		if resp.ContentLength > lim.maxBytes {
+			return 0, nil, nil, noop, errAnswerTooLarge
+		}
+		reader = io.LimitReader(resp.Body, lim.maxBytes+1)
+		if lim.pool != nil {
+			size := lim.maxBytes // no length given: the most it may be
+			if resp.ContentLength >= 0 {
+				size = resp.ContentLength
+			}
+			if release, err = lim.pool.reserve(ctx, lim.owner, size); err != nil {
+				return 0, nil, nil, noop, err
+			}
+		}
+	}
+	var out []byte
+	if lim.maxBytes > 0 && resp.ContentLength >= 0 {
+		// One buffer of the stated length: ReadAll would grow to about twice it.
+		out = make([]byte, resp.ContentLength)
+		_, err = io.ReadFull(reader, out)
+	} else {
+		out, err = io.ReadAll(reader)
+	}
+	if err != nil {
+		release() // the caller gets no body to hold
+		release = noop
+	} else if lim.maxBytes > 0 && int64(len(out)) > lim.maxBytes {
+		release()
+		return 0, nil, nil, noop, errAnswerTooLarge
+	}
 	if err == nil && resp.StatusCode < 500 {
 		// The hotel answers room calls. syncHotel keeps it "answering" while
 		// these continue, even when its health endpoint is slow under load.
 		h.lastAnswer.Store(time.Now().UnixNano())
 	}
-	return resp.StatusCode, resp.Header, out, err
+	return resp.StatusCode, resp.Header, out, release, err
 }
 
 func (h *hotel) getJSON(ctx context.Context, base, path string, query url.Values, v any) error {
