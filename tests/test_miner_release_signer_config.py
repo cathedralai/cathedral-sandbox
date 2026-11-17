@@ -162,6 +162,14 @@ def test_the_private_key_path_still_needs_a_key_id(world):
     assert result.returncode != 0 and "needs a key id" in result.stderr
 
 
+def test_purpose_with_a_private_key_is_refused(world):
+    result = _canary(
+        world, "--private-key", str(world["pem"]), "--signing-key-id", "canary-1", "--purpose", "miner_canary",
+        check=False,
+    )
+    assert result.returncode != 0 and "--purpose applies only to --signer-config" in result.stderr
+
+
 def test_private_key_and_signer_config_are_exclusive(world):
     result = _canary(
         world, "--private-key", str(world["pem"]), "--signer-config", str(world["config"]), check=False
@@ -337,3 +345,12 @@ def test_the_docs_announce_the_committed_root_digest_and_key():
         serialization.Encoding.Raw, serialization.PublicFormat.Raw
     )
     assert public.hex() == COMMITTED_CANARY_PUBLIC_HEX
+    card = (REPO_ROOT / "docs" / "keys" / f"{COMMITTED_CANARY_KEY_ID}.md").read_text()
+    for value in (
+        COMMITTED_CANARY_PUBLIC_HEX,
+        "sha256:" + hashlib.sha256(bytes.fromhex(COMMITTED_CANARY_PUBLIC_HEX)).hexdigest(),
+        hashlib.sha256(_committed_root()).hexdigest(),
+        "2026-11-17T15:59:33Z",
+        "2027-02-15T00:00:00Z",
+    ):
+        assert value in card

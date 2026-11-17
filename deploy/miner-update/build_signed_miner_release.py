@@ -156,6 +156,8 @@ def _open_signer(arguments: argparse.Namespace, channel: str, *, key_id: str | N
     if arguments.private_key is not None:
         if key_id is None:
             _fail("--private-key needs a key id")
+        if arguments.purpose is not None:
+            _fail("--purpose applies only to --signer-config")
         return _PrivateKeySigner(key_id, _load_private_key(Path(arguments.private_key)))
     purpose = arguments.purpose or PURPOSE_BY_CHANNEL[channel]
     try:

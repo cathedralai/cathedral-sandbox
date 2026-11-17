@@ -49,8 +49,14 @@ key, a compromise means a new bootstrap on every host, as for the validator.
 
 The file's SHA-256, the value `--keys-sha256` pins, is
 `4e91dec00701f7cc579a43012ae12a6a3e26bebb005f5460b8f8b0b57fa06976`.
-The public key is also in `docs/keys/miner-canary-local-1.pub.pem`. Check the
+The public key is also in `docs/keys/miner-canary-local-1.pub.pem`, with its
+fingerprint and window in `docs/keys/miner-canary-local-1.md`. Check the
 digest against the release announcement, not only against this page.
+
+- **Window (advisory).** `not_before` 2026-11-17T15:59:33Z, planned retire
+  date 2027-02-15T00:00:00Z. The trust root carries no time window, so hosts
+  trust the key until a signed release drops it or a re-bootstrap. A canary
+  release that drops or rotates it must ship before that date (AB#799).
 
 - **Where the private key is.** On the Cathedral ops server, under a
   root-only directory (mode 700), as an encrypted PKCS#8 PEM (mode 600) with
@@ -78,7 +84,7 @@ digest against the release announcement, not only against this page.
   the `miner_canary` entry of the signer config to `aws_kms`; no code
   changes. A later release, signed by the KMS key, drops
   `miner-canary-local-1`, which every host then revokes for good. Last, the
-  local key and passphrase files are shredded.
+  local key and passphrase files are shredded. Tracked in AB#799.
 
 A network attacker cannot forge a record or make an updater crash. It can deny
 updates, and six checks without a verified record page. The fallback judges
