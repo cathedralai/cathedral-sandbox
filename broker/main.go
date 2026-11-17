@@ -110,7 +110,11 @@ type guestConfig struct {
 	NextKeySHA256   string `json:"next_key_sha256,omitempty"`
 	ViewTokenSHA256 string `json:"view_token_sha256"` // token for /<id>/live
 	Ops             bool   `json:"ops"`               // may run the probe and reset the broker counters
-	guestLimits            // max_rooms, max_creates_per_minute, default_sealed, hotels (guests.go)
+	// LiveShares lets this guest mint share links to its live view (AB#584).
+	// Off unless set: with it off, /v1/live/shares answers 403 and no share
+	// link or cookie opens the view.
+	LiveShares  bool `json:"live_shares,omitempty"`
+	guestLimits      // max_rooms, max_creates_per_minute, default_sealed, hotels (guests.go)
 }
 
 type config struct {
@@ -2272,6 +2276,9 @@ func (b *broker) viewGuest(r *http.Request, guestID string) (*guestState, viewAu
 		if c, err := r.Cookie("bv_" + guestID); err == nil && subtle.ConstantTimeCompare([]byte(sha(c.Value)), want) == 1 {
 			return g, a
 		}
+	}
+	if !g.cfg.LiveShares {
+		return nil, a
 	}
 	if t := r.URL.Query().Get("share"); t != "" {
 		a.triedShare = true

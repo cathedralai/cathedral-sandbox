@@ -9,6 +9,16 @@ import (
 	"time"
 )
 
+// newShareChain is newChain with share links turned on for g1 and g2.
+func newShareChain(t *testing.T) *testChain {
+	t.Helper()
+	tc := newChain(t)
+	for _, id := range []string{"g1", "g2"} {
+		tc.b.guests[id].cfg.LiveShares = true
+	}
+	return tc
+}
+
 func noRedirect() *http.Client {
 	return &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
@@ -54,7 +64,7 @@ func getWith(t *testing.T, tc *testChain, path string, c *http.Cookie) int {
 }
 
 func TestLiveShareLinkOpensTheGuestView(t *testing.T) {
-	tc := newChain(t)
+	tc := newShareChain(t)
 	doc := mintShare(t, tc, "key1", map[string]any{"ttl_s": 600, "label": "scale run 1"})
 	link, _ := doc["url"].(string)
 	if !strings.HasPrefix(link, "/g1/live?share=bvs_") || doc["label"] != "scale run 1" || doc["id"] == nil {
@@ -87,7 +97,7 @@ func TestLiveShareLinkOpensTheGuestView(t *testing.T) {
 }
 
 func TestLiveShareWorksForAGuestWithoutAViewToken(t *testing.T) {
-	tc := newChain(t) // g2 has no view token
+	tc := newShareChain(t) // g2 has no view token
 	if code := getWith(t, tc, "/g2/live", nil); code != 401 {
 		t.Fatalf("g2 before: %d", code)
 	}
@@ -103,7 +113,7 @@ func TestLiveShareWorksForAGuestWithoutAViewToken(t *testing.T) {
 }
 
 func TestLiveShareForOneGuestDoesNotOpenAnother(t *testing.T) {
-	tc := newChain(t)
+	tc := newShareChain(t)
 	doc := mintShare(t, tc, "key1", nil)
 	token := strings.TrimPrefix(doc["url"].(string), "/g1/live?share=")
 	if code := getWith(t, tc, "/g2/live?share="+token, nil); code != 401 {
@@ -119,7 +129,7 @@ func TestLiveShareForOneGuestDoesNotOpenAnother(t *testing.T) {
 }
 
 func TestLiveShareRevokeClosesTheViewAndTheStream(t *testing.T) {
-	tc := newChain(t)
+	tc := newShareChain(t)
 	doc := mintShare(t, tc, "key1", map[string]any{"label": "demo"})
 	c := openShare(t, tc, doc["url"].(string))
 	id := doc["id"].(string)
@@ -164,7 +174,7 @@ func TestLiveShareRevokeClosesTheViewAndTheStream(t *testing.T) {
 }
 
 func TestLiveShareExpires(t *testing.T) {
-	tc := newChain(t)
+	tc := newShareChain(t)
 	doc := mintShare(t, tc, "key1", map[string]any{"ttl_s": 60})
 	c := openShare(t, tc, doc["url"].(string))
 	tc.b.mu.Lock()
@@ -190,7 +200,7 @@ func TestLiveShareExpires(t *testing.T) {
 }
 
 func TestLiveShareListValidationAndCap(t *testing.T) {
-	tc := newChain(t)
+	tc := newShareChain(t)
 	for _, body := range []any{
 		map[string]any{"ttl_s": 0},
 		map[string]any{"ttl_s": 59},
@@ -228,5 +238,30 @@ func TestLiveShareListValidationAndCap(t *testing.T) {
 				t.Fatalf("list leaks a token: %v", m)
 			}
 		}
+	}
+}
+
+func TestLiveShareIsOffUnlessConfigured(t *testing.T) {
+	tc := newChain(t) // live_shares not set for any guest
+	for _, m := range []struct{ method, path string }{{"POST", "/v1/live/shares"}, {"GET", "/v1/live/shares"}, {"DELETE", "/v1/live/shares/lsh_x"}} {
+		if code, doc := tc.call(t, "key1", m.method, m.path, nil); code != 403 || doc["error"] == nil {
+			t.Fatalf("%s %s with live_shares off: %d %v", m.method, m.path, code, doc)
+		}
+	}
+	// A link already in the table (as if minted before the flag went off)
+	// opens nothing while the flag is off, by query or by cookie.
+	token := "bvs_" + strings.Repeat("ab", 32)
+	tc.b.mu.Lock()
+	tc.b.shares[sha(token)] = &liveShare{ID: "lsh_off", Guest: "g2", Created: time.Now(), Expires: time.Now().Add(time.Hour)}
+	tc.b.mu.Unlock()
+	if code := getWith(t, tc, "/g2/live?share="+token, nil); code != 401 {
+		t.Fatalf("share query with live_shares off: %d", code)
+	}
+	if code := getWith(t, tc, "/g2/live", &http.Cookie{Name: "bvs_g2", Value: token}); code != 401 {
+		t.Fatalf("share cookie with live_shares off: %d", code)
+	}
+	tc.b.guests["g2"].cfg.LiveShares = true
+	if code := getWith(t, tc, "/g2/live", &http.Cookie{Name: "bvs_g2", Value: token}); code != 200 {
+		t.Fatalf("same cookie with live_shares on: %d", code)
 	}
 }

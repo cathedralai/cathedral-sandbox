@@ -77,6 +77,10 @@ func (b *broker) shareFor(hash, guestID string) *liveShare {
 // handleLiveShares serves POST and GET /v1/live/shares and DELETE /v1/live/shares/<id>.
 func (b *broker) handleLiveShares(w http.ResponseWriter, r *http.Request, g *guestState, id string) {
 	w.Header().Set("Cache-Control", "no-store")
+	if !g.cfg.LiveShares {
+		writeErr(w, 403, "live_shares_off", "share links are off for this guest (live_shares in the broker config)")
+		return
+	}
 	switch {
 	case id == "" && r.Method == "POST":
 		b.mintShare(w, r, g)
