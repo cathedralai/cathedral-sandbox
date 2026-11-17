@@ -1056,8 +1056,11 @@ def test_startup_rollback_refusal_never_becomes_accepted(tmp_path, monkeypatch):
         def set(self):
             self.finished = True
 
-        def wait(self, _seconds):
+        def wait(self, _seconds=None):
+            # Match threading.Event.wait(timeout=None); a required arg leaked
+            # TypeError into later tests' captured stderr under Python 3.11.
             self.finished = True
+
 
     class RefusingMetadata:
         def attribute(self, _name):
@@ -1332,7 +1335,10 @@ def test_primary_only_mode_refuses_cross_mode_acknowledgements(capsys, monkeypat
     ]
     for command in refused_commands:
         assert publisher.main(command) == 2
-        report = json.loads(capsys.readouterr().err)
+        # Ignore stray stderr from other tests' leftover HTTP server threads.
+        err = capsys.readouterr().err
+        line = next(ln for ln in reversed(err.splitlines()) if ln.startswith("{"))
+        report = json.loads(line)
         assert report["status"] == "REFUSED"
         assert report["cloud_write_state"] == "NONE_CONFIRMED"
         assert "acknowledgement does not match" in report["error"]

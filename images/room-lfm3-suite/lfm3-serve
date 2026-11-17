@@ -10,6 +10,10 @@
 # starts in the background and logs to $LFM3_LOG_DIR/server.log (default
 # /tmp/lfm3). Its /health answers 200 once the model is loaded.
 #
+#   lfm3-gateway on 127.0.0.1:8642 (chat models, not base): the Polaris
+#   runtime chat contract, POST /v1/chat/completions with SSE and GET /health,
+#   in front of lfm3-agent (AB#539). It logs to $LFM3_LOG_DIR/gateway.log.
+#
 # Environment:
 #   LFM3_THREADS     CPU threads (default: all cores)
 #   LFM3_SERVER_CTX  context size in tokens (default 4096, 8192 for d1)
@@ -21,6 +25,7 @@
 #   LFM3_BATCH       d1 only: batch and micro-batch size (default 4096). A
 #                    question is read in one batch; a picture takes at most
 #                    half of it.
+#   LFM3_GATEWAY     off: no chat gateway (lfm3-prewarm sets it at build)
 set -euo pipefail
 
 args=(
@@ -60,17 +65,36 @@ if [ "${LFM3_KIND:-chat}" = chat ] && [ -d "$slot_dir" ]; then
   args+=(--slot-save-path "$slot_dir")
 fi
 
+log_dir=${LFM3_LOG_DIR:-/tmp/lfm3}
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# The chat gateway answers 503 on /health until llama-server is up, so it can
+# start first. A decision or base model has no chat harness behind it.
+start_gateway() {
+  [ "${LFM3_GATEWAY:-on}" != off ] || return 0
+  [ "${LFM3_KIND:-chat}" = chat ] || return 0
+  [[ "${MODEL:-}" != *-base ]] || return 0
+  local gateway agent=$here/lfm3-agent
+  gateway=$here/lfm3-gateway
+  if [ ! -x "$gateway" ]; then
+    gateway=$(command -v lfm3-gateway) || return 0
+  fi
+  [ -x "$agent" ] || agent=lfm3-agent
+  # The model server matters more than the gateway: never fail on its log.
+  mkdir -p "$log_dir" 2>/dev/null || return 0
+  LFM3_GATEWAY_AGENT=${LFM3_GATEWAY_AGENT:-$agent} "$gateway" >>"$log_dir/gateway.log" 2>&1 </dev/null &
+}
+start_gateway
+
 if [ "$#" -eq 0 ]; then
   exec llama-server "${args[@]}"
 fi
 
-log_dir=${LFM3_LOG_DIR:-/tmp/lfm3}
 mkdir -p "$log_dir"
 llama-server "${args[@]}" >"$log_dir/server.log" 2>&1 &
 # Read lfm3-agent's system prompt and tools into the cache once, so the first
 # liquid in a new room starts from it (about 4 s on 2 CPUs otherwise).
 if [ "${LFM3_KIND:-chat}" = chat ] && [[ "${MODEL:-}" != *-base ]]; then
-  here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   agent=$here/lfm3-agent
   [ -x "$agent" ] || agent=lfm3-agent
   "$agent" --warm >"$log_dir/warm.log" 2>&1 </dev/null &

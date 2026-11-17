@@ -710,7 +710,7 @@ def test_build_puts_both_tools_in_the_measured_initrd_and_the_switch_in_room_env
     text = (SEALED / "build-guest.sh").read_text()
     assert 'install -m 0755 "$KIT/sealed/sealed-data.sh" "$R/usr/local/sbin/sealed-data.sh"' in text
     assert 'install -m 0755 "$KIT/sealed/sealed_data_key.py" "$R/usr/local/sbin/sealed_data_key.py"' in text
-    room_env = text[text.index('cat > "$R/opt/room-kit/room.env" <<EOF'):text.index("ROOM_HOTEL_NAME=$SEALED_NAME")]
+    room_env = text[text.index('cat > "$R/opt/room-kit/room.env" <<EOF'):text.index("# ROOM_HOTEL_NAME is not set here")]
     assert "ROOM_WORKSPACES_SOURCE=$DATA_WS\n" in room_env
     assert text.index("DATA_WS=/srv/sealed-data/workspaces") < text.index("mmdebstrap")
     for pkg in ("cryptsetup-bin", "xfsprogs", "dmsetup", "python3"):
@@ -810,6 +810,7 @@ def _roll(host: FakeHost, *, token_launch_id: str | None, choice: str | None = N
     def run(script, *args, env=None):
         (sealed / "launch-guest.sh").write_text((host.kit / "sealed" / "launch-guest.sh").read_text())
         (sealed / "launch-guest.sh").chmod(0o755)
+        (sealed / "guest-constants.sh").write_text((host.kit / "sealed" / "guest-constants.sh").read_text())
         (sealed / "sealed.env").write_text((host.tmp / "sealed.env").read_text())
         (sealed / "images" / "20260102T000000Z" / "manifest.json").write_bytes(MANIFEST)
         (sealed / "data.raw").write_bytes(OWNER)

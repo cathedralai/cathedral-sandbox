@@ -29,6 +29,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
 
+from cathedral.no_redirect import NoRedirect
+
 
 class Transport(Protocol):
     """The one operation the SDK needs: perform an HTTP request, return the response."""
@@ -77,7 +79,7 @@ class HttpTransport:
         for key, value in headers.items():
             req.add_header(key, value)
         try:
-            with urllib.request.urlopen(req) as response:  # noqa: S310 - fixed local/hosted base URL
+            with urllib.request.build_opener(NoRedirect()).open(req) as response:
                 return response.status, dict(response.headers), response.read()
         except urllib.error.HTTPError as exc:  # 4xx/5xx still carry a JSON error body
             return exc.code, dict(exc.headers or {}), exc.read()

@@ -290,7 +290,9 @@ def test_readme_is_a_short_mission_first_miner_entrypoint() -> None:
     assert "Bittensor SN94" in readme
     assert '<img src="docs/assets/cathedral-mark.png"' in readme
     assert "## Contents" in readme
-    assert "Cathedral&ensp;turns" in readme
+    assert "<em>Cathedral turns" in readme
+    # Normal word spacing: a wide space between every word reads as broken.
+    assert "&ensp;" not in readme.split("</em>")[0]
     assert "There is no self-serve sealed capacity" in readme
     assert "Cathedral does not own" in readme
     assert "The Escape Room is open" in readme

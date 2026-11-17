@@ -132,6 +132,58 @@ def test_list_shows_a_link_as_a_link(app, tmp_path) -> None:
     assert [e["type"] for e in entries if e["name"] == "l"] == ["symlink"]
 
 
+def test_recursive_delete_handles_a_tree_deeper_than_the_recursion_limit(app) -> None:
+    import os
+    import sys
+
+    sid = _create(app)
+    _call(app, "POST", sid, "mkdir", "/work/deep")
+    depth = sys.getrecursionlimit() + 200
+    fd = os.open(_root(app, sid) / "work" / "deep", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for _ in range(depth):
+            os.mkdir("d", dir_fd=fd)
+            nxt = os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    finally:
+        os.close(fd)
+    r = _call(app, "DELETE", sid, "files", "/work/deep", "&recursive=1")
+    assert r.status == 200, r.body
+    assert not (_root(app, sid) / "work" / "deep").exists()
+
+
+def test_list_skips_an_entry_removed_during_the_scan(app, monkeypatch) -> None:
+    import os
+
+    sid = _create(app)
+    _call(app, "POST", sid, "mkdir", "/work/a")
+    app.dispatch("PUT", f"/v1/sandboxes/{sid}/files?path=/work/a/keep.txt", AUTH, b"x")
+    app.dispatch("PUT", f"/v1/sandboxes/{sid}/files?path=/work/a/gone.txt", AUTH, b"x")
+    real_scandir = os.scandir
+
+    class Racy:
+        def __init__(self, it):
+            self.it = it
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self.it.close()
+
+        def __iter__(self):
+            for entry in self.it:
+                if entry.name == "gone.txt":
+                    entry = type("E", (), {"name": entry.name, "stat": lambda self, follow_symlinks=False: (_ for _ in ()).throw(FileNotFoundError())})()
+                yield entry
+
+    monkeypatch.setattr(os, "scandir", lambda fd: Racy(real_scandir(fd)))
+    r = _call(app, "GET", sid, "list", "/work/a")
+    assert r.status == 200, r.body
+    assert [e["name"] for e in json.loads(r.body)["entries"]] == ["keep.txt"]
+
+
 def test_guest_provider_confines_to_work() -> None:
     from cathedral.sandbox_guest import _in_work
     from cathedral.sandbox_provider import SandboxOpError

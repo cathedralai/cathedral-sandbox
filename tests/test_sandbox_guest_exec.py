@@ -152,6 +152,7 @@ def test_file_paths_outside_work_are_refused(fake: FakeDocker, path: str) -> Non
             lambda: provider.write_tar(sid, path, b""),
             lambda: provider.read_tar(sid, TarGet(path=path)),
             lambda: provider.stat(sid, path),
+            lambda: provider.list_directory(sid, path),
         ]
         for call in calls:
             with pytest.raises(SandboxOpError) as err:
@@ -160,6 +161,7 @@ def test_file_paths_outside_work_are_refused(fake: FakeDocker, path: str) -> Non
         provider.write_file(sid, "/work/ok.txt", b"hi", None)
         assert provider.read_file(sid, FileGet(path="/work/ok.txt"))[0] == b"hi"
         assert provider.stat(sid, "/work").is_dir
+        assert {entry["name"] for entry in provider.list_directory(sid, "/work")} >= {"ok.txt"}
     finally:
         provider.close()
 

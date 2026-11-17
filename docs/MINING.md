@@ -1,6 +1,6 @@
 <p align="center"><img src="assets/cathedral-mark.png" alt="Cathedral" width="112"></p>
 <h1 align="center">Mining Cathedral</h1>
-<p align="center"><em>Cathedral&ensp;turns&ensp;independently&ensp;operated&ensp;machines&ensp;into&ensp;a&ensp;verifiable&ensp;compute&ensp;network</em></p>
+<p align="center"><em>Cathedral turns independently operated machines into a verifiable compute network</em></p>
 <p align="center"><sub>27 October 2026</sub></p>
 
 ## Contents

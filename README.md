@@ -1,6 +1,6 @@
 <p align="center"><img src="docs/assets/cathedral-mark.png" alt="Cathedral" width="112"></p>
 <h1 align="center">Cathedral Sandbox</h1>
-<p align="center"><em>Cathedral&ensp;turns&ensp;independently&ensp;operated&ensp;machines&ensp;into&ensp;a&ensp;verifiable&ensp;compute&ensp;network</em></p>
+<p align="center"><em>Cathedral turns independently operated machines into a verifiable compute network</em></p>
 <p align="center"><sub>12 November 2026</sub></p>
 
 > [!IMPORTANT]

@@ -31,6 +31,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from cathedral import exec_cancel
+from cathedral.agent_pty import PtyProcess
 from cathedral.exec_spill import StreamSpill, close_spill, open_spill, read_spill, spill_path_parts
 from cathedral.sandbox_api import (
     CreateSandboxRequest,
@@ -47,10 +49,18 @@ from cathedral.sandbox_api import (
     SandboxContractError,
     StatResult,
     StatusReport,
+    validated_env_overlay,
     TarGet,
 )
 from cathedral.sandbox_egress import EgressClient
 from cathedral.sandbox_image_owners import ImageOwnerStore, normalize_image_id, refuse_shared_hotel_build
+from cathedral.start_commands import (
+    StartCommandsError,
+    image_config_argv,
+    image_digest_for_allowlist,
+    load_start_commands,
+    start_command_sha256,
+)
 from cathedral.sandbox_workspaces import WorkspaceStore
 from cathedral.sandbox_owner import owner_hash, owner_id
 from cathedral.sandbox_provider import (
@@ -344,6 +354,8 @@ class GuestRecord:
     timeout_form: str | None = None
     # Whether the image can run ``bash``. None: not probed yet.
     has_bash: bool | None = None
+    # Whether the image can run ``sh`` (the cancel wrapper needs it). None: not probed yet.
+    has_sh: bool | None = None
     # (owner, name, path, version_on_delete) of the mounted workspace (#305).
     workspace: tuple[str, str, str, bool] | None = None
     # Owner of the room (sandbox_owner.owner_id). The egress proxy reads the
@@ -351,6 +363,11 @@ class GuestRecord:
     owner: str | None = None
     # Per-room tunables the room started under (room_tunables.room_view), or None.
     tunables: dict[str, Any] | None = None
+    # AB#709: argv the hotel started when start:image was used; None for sleep infinity.
+    start_command: tuple[str, ...] | None = None
+    # AB#414: the room's env overlay, set after create only through a sealed envelope
+    # the receipts front opened. Merged under each exec's own env; never in a doc or log.
+    env_overlay: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 # A room's exec output, process log and the API's own log record are capped
@@ -726,6 +743,7 @@ class DockerClient:
         run_args: Iterable[str] = (),
         default_runtime: str = "",
         secrets_dir: Path | None = None,
+        image_default: bool = False,
     ) -> str:
         """Start one room. ``default_runtime`` is the daemon's default OCI runtime,
         the room's runtime when no ``--runtime`` is passed."""
@@ -804,6 +822,8 @@ class DockerClient:
             argv.extend(["-e", f"{key}={value}"])
         if dind:
             argv.extend([image, "dockerd-entrypoint.sh", "dockerd", *self.dind.dockerd_args])
+        elif image_default:
+            argv.append(image)
         elif entrypoint:
             argv.append(image)
             argv.extend(list(entrypoint))
@@ -1292,6 +1312,11 @@ class DockerGuestProvider:
         self._built_images: dict[str, str] = {}  # content_hash -> tag
         self._build_locks: dict[str, threading.Lock] = {}  # tag -> lock; one build per tag
         self._build_locks_guard = threading.Lock()
+        # Anonymous pulls run once per image at a time (AB#534). A waiter whose
+        # generation moved while it waited reuses that pull instead of pulling.
+        self._pull_locks: dict[str, threading.Lock] = {}
+        self._pull_gen: dict[str, int] = {}
+        self._pull_guard = threading.Lock()
         # GC state. A sandbox id in _doomed has a "deleting" record and a container
         # that is not yet confirmed gone. Only one drain runs at a time.
         self._owner = os.environ.get("CATHEDRAL_SANDBOX_OWNER", "").strip() or "default"
@@ -1329,6 +1354,15 @@ class DockerGuestProvider:
         # Images pulled with registry credentials. A create of one of these always
         # pulls, so the registry still checks the caller's credentials.
         self._auth_pulled: set[str] = _load_auth_pulled()
+        try:
+            self._start_commands = load_start_commands()
+        except StartCommandsError as exc:
+            raise SandboxOpError(
+                "runtime_unavailable",
+                503,
+                f"the hotel's start-command allowlist is unusable: {exc}",
+                retry_after=30,
+            ) from exc
         if not self._client.info_ok():
             raise SandboxOpError(
                 "runtime_unavailable",
@@ -1443,7 +1477,26 @@ class DockerGuestProvider:
             # Preserve credential rechecks for private images and pull-policy always.
             if registry_auth is not None or image in self._auth_pulled or self._pull_policy == "always":
                 self._ensure_image(image, registry_auth=registry_auth, refresh=True)
+                # Refresh may land a newer Id under the same tag; grant that Id
+                # so the post-authorize require() on the run Id can pass.
+                refreshed = self._image_id_of(image)
+                if refreshed is None:
+                    raise SandboxOpError(
+                        "image_pull_failed", 502, f"image {image} has no docker id after pull"
+                    )
+                if refreshed != local_id:
+                    if self._image_owners.provenance(refreshed) in ("snapshot", "build") and not self._image_owners.owns(
+                        refreshed, owner
+                    ):
+                        raise SandboxOpError(
+                            "image_not_owned",
+                            403,
+                            "this guest cannot use that image on this hotel",
+                        )
+                    self._image_owners.grant(refreshed, owner, provenance="registry", ref=image)
+                    return refreshed
             return local_id
+
         if self._looks_like_image_id(image):
             raise SandboxOpError(
                 "image_not_owned",
@@ -1697,6 +1750,12 @@ class DockerGuestProvider:
         if guest.workspace is not None:
             enriched["workspace"] = {"name": guest.workspace[1], "path": guest.workspace[2],
                                      "version_on_delete": guest.workspace[3]}
+        if guest.start_command is not None:
+            enriched["start_command"] = list(guest.start_command)
+            enriched["start_command_sha256"] = start_command_sha256(guest.start_command)
+        else:
+            enriched["start_command"] = None
+            enriched["start_command_sha256"] = None
         net = dict(enriched.get("network") or {"mode": guest.network_mode, "allow": []})
         net.update(self._policy_doc(guest))
         enriched["network"] = net
@@ -1731,6 +1790,40 @@ class DockerGuestProvider:
             return False
         return mode == "internet" or self._egress is not None
 
+    def _resolve_start(
+        self,
+        request: CreateSandboxRequest,
+        *,
+        dind: bool,
+        inspected: Mapping[str, Any],
+    ) -> tuple[tuple[str, ...] | None, bool, tuple[str, ...] | None]:
+        """Return (docker entrypoint argv, image_default, receipt start_command)."""
+        if dind:
+            if request.start_image:
+                raise SandboxOpError(
+                    "start_unsupported_image",
+                    400,
+                    'start: "image" is not allowed for DinD images',
+                )
+            return None, False, None
+        if request.start_image:
+            argv = image_config_argv(dict(inspected))
+            if argv is None:
+                raise SandboxOpError(
+                    "start_command_unavailable",
+                    400,
+                    "this image has no ENTRYPOINT or CMD in its config",
+                )
+            digest = image_digest_for_allowlist(dict(inspected))
+            if digest is None or not self._start_commands.allows(digest, argv):
+                raise SandboxOpError(
+                    "start_command_not_allowed",
+                    400,
+                    "this image's start command is not on the hotel allowlist",
+                )
+            return None, True, argv
+        return tuple(request.entrypoint), False, None
+
     def _ensure_image(
         self, image: str, *, registry_auth: Mapping[str, str] | None = None, refresh: bool = False
     ) -> dict[str, Any]:
@@ -1740,12 +1833,16 @@ class DockerGuestProvider:
         # One inspect answers both "is it here" and "what is it" on a cache hit.
         inspected = {} if refresh else self._client.image_inspect(image)
         if not inspected.get("Id"):
-            self._client.ensure_image(
-                image,
-                registry_auth=registry_auth,
-                refresh=refresh,
-                mirror=self._registry_mirror,
-            )
+            if registry_auth is not None:
+                # Each caller's credentials must reach the registry: never shared.
+                self._client.ensure_image(
+                    image,
+                    registry_auth=registry_auth,
+                    refresh=refresh,
+                    mirror=self._registry_mirror,
+                )
+            else:
+                self._pull_anonymous_once(image, refresh=refresh)
             # Record the marker right after the pull and before any inspect, so a
             # failed inspect after a pull still leaves it set.
             if registry_auth is not None:
@@ -1753,6 +1850,25 @@ class DockerGuestProvider:
                 _save_auth_pulled(self._auth_pulled)
             inspected = self._client.image_inspect(image)
         return inspected
+
+    def _pull_anonymous_once(self, image: str, *, refresh: bool) -> None:
+        """Singleflight for anonymous pulls of *image* (AB#534).
+
+        A burst of cold creates for one image runs one docker pull; the others
+        wait and reuse it. An anonymous pull that succeeded proves anyone may
+        fetch the image, so sharing it does not weaken the per-caller check in
+        _authorize_image. A failed pull is not shared: the next waiter pulls.
+        """
+        with self._pull_guard:
+            lock = self._pull_locks.setdefault(image, threading.Lock())
+            before = self._pull_gen.get(image, 0)
+        with lock:
+            with self._pull_guard:
+                if self._pull_gen.get(image, 0) != before:
+                    return
+            self._client.ensure_image(image, refresh=refresh, mirror=self._registry_mirror)
+            with self._pull_guard:
+                self._pull_gen[image] = before + 1
 
     def _start_guest(
         self, doc: dict[str, Any], request: CreateSandboxRequest, owner: str | None = None
@@ -1869,10 +1985,28 @@ class DockerGuestProvider:
                 "digest": request.build.content_hash,
             }
         dind = is_dind_image(image)
+        inspected = self._client.image_inspect(image)
+        # Pin docker run to the inspected Id. Allowlist / start:image decisions
+        # were made against this inspect; running the mutable tag would race a
+        # retag between inspect and create (AB#709 HOLD).
+        run_image = normalize_image_id(str(inspected.get("Id") or ""))
+        if run_image is None:
+            # Fail closed: falling back to the mutable tag would reopen the race.
+            raise SandboxOpError(
+                "image_id_unavailable",
+                409,
+                f"image {image} has no valid immutable Id on this host; nothing started",
+            )
+        if request.image is not None:
+            # The grant above was made against an earlier inspect; the tag may
+            # have moved to another owner's Id since. Re-check the Id that runs.
+            self._image_owners.require(run_image, effective_owner)
         room_tunables = self._tunables_for(request, image, dind)
         work = Path(self._inner._sandboxes[sandbox_id].root) / "work"  # noqa: SLF001
         name = f"cathedral-{sandbox_id}"
-        entrypoint = None if dind else (tuple(request.entrypoint) if request.entrypoint else ("sleep", "infinity"))
+        entrypoint, image_default, start_command = self._resolve_start(
+            request, dind=dind, inspected=inspected,
+        )
         network = None
         attach = self._attach_for(request.network.mode)
         if self._net_pool is not None and attach:
@@ -1882,8 +2016,8 @@ class DockerGuestProvider:
                 self._net_pending[sandbox_id] = network
         try:
             container_id = self._start_container(
-                request, sandbox_id=sandbox_id, image=image, name=name, work=work, dind=dind,
-                entrypoint=entrypoint, network=network, attach=attach,
+                request, sandbox_id=sandbox_id, image=run_image, name=name, work=work, dind=dind,
+                entrypoint=entrypoint, image_default=image_default, network=network, attach=attach,
                 mounts=[(workspace[4], workspace[2])] if workspace is not None else (),
                 tunables=room_tunables,
                 secrets_dir=self._secrets_dir(sandbox_id),
@@ -1906,9 +2040,11 @@ class DockerGuestProvider:
                 if exited is not None:
                     # The daemon found no running container: the entrypoint
                     # ended at once. That is the request's fault, not ours.
+                    which = f"start command {list(start_command)!r}" if start_command else "entrypoint"
                     raise SandboxOpError(
                         "entrypoint_exited", 400,
-                        f"the room's entrypoint ended at once with exit code {exited}; a room needs a long-running entrypoint",
+                        f"the room's {which} ended at once with exit code {exited}; "
+                        "a room needs a long-running start process",
                     ) from exc
                 raise
         if not self._inner.has_record(sandbox_id):
@@ -1933,6 +2069,7 @@ class DockerGuestProvider:
             workspace=workspace[:4] if workspace is not None else None,
             owner=owner,
             tunables=room_tunables[2] if room_tunables is not None else None,
+            start_command=start_command,
         )
         return self._after_start(doc, sandbox_id, container_id, dind)
 
@@ -1972,7 +2109,8 @@ class DockerGuestProvider:
         work: Path,
         dind: bool,
         entrypoint: tuple[str, ...] | None,
-        network: str | None,
+        image_default: bool = False,
+        network: str | None = None,
         attach: bool | None = None,
         mounts: Iterable[tuple[Path, str]] = (),
         tunables: tuple[str, list[str], dict[str, Any]] | None = None,
@@ -1996,6 +2134,7 @@ class DockerGuestProvider:
             dind=dind,
             use_kata=self._use_kata,
             entrypoint=entrypoint,
+            image_default=image_default,
             workdir=request.workdir,
             user=request.user,
             labels={LABEL_OWNER: self._owner, LABEL_SANDBOX_ID: sandbox_id},
@@ -2057,14 +2196,32 @@ class DockerGuestProvider:
                     "or run the command without a limit.",
                 )
             wrapped = argv
+        token = request.spill_token
+        run_argv = wrapped
+        registered = False
+        if token:
+            # A start that carries a token can be cancelled (AB#406). The wrapper writes the
+            # pid of the process that becomes the command; an image with no sh runs unwrapped
+            # and its cancel answers `unsupported`.
+            wrap = self._has_sh(guest)
+            registered = exec_cancel.registry.begin(
+                sandbox_id, token, request.launch_by, request.user, ("gnu" if form == "gnu" else "busybox") if wrap else None
+            )
+            if not registered:
+                return ExecResult(
+                    exit_code=143, stdout="", stderr="cancelled before it started\n", duration_ms=0, timed_out=False, cancelled=True
+                )
+            if wrap:
+                run_argv = ["sh", "-c", exec_cancel.WRAP_SCRIPT, "sh", exec_cancel.pid_file(token), *wrapped]
+        cancelled = False
         t0 = time.perf_counter()
         spill = open_spill(sandbox_id, request.spill_token, EXEC_OUTPUT_CAP) if request.spill_token else None
         try:
             code, out, err, timed_out = self._client.exec(
                 guest.container_id,
-                wrapped,
+                run_argv,
                 cwd=cwd,
-                env={**dict(request.env)},
+                env={**guest.env_overlay, **dict(request.env)},
                 timeout_seconds=timeout_seconds + 15 if wrapped is not argv else timeout_seconds,
                 stdin=request.stdin,
                 user=request.user,
@@ -2073,6 +2230,8 @@ class DockerGuestProvider:
         finally:
             if request.spill_token:
                 close_spill(sandbox_id, request.spill_token)
+            if registered:
+                cancelled = exec_cancel.registry.finish(sandbox_id, token)
         # The command's own time, before any look at the container below.
         elapsed = time.perf_counter() - t0
         # A room that outgrows its memory limit can still be killed whole by
@@ -2098,6 +2257,9 @@ class DockerGuestProvider:
         killed_early = code == 137 and elapsed < timeout_seconds
         if not oom_killed and not killed_early and code in {124, 137, 143}:
             timed_out = True
+        if cancelled:
+            # Our own TERM or KILL ended it: a cancel, never a timeout.
+            timed_out = False
         duration_ms = int(elapsed * 1000)
         with self._inner._lock:  # noqa: SLF001
             sandbox = self._inner._require_active(sandbox_id)  # noqa: SLF001
@@ -2132,7 +2294,113 @@ class DockerGuestProvider:
             truncated=truncated,
             oom_killed=oom_killed,
             room_alive=room_alive,
+            cancelled=cancelled,
         )
+
+    def cancel_exec(self, sandbox_id: str, token: str) -> str:
+        """Stop the exec that started with ``token``. The answer is a word, see AB#406 spec 3.1."""
+        with self._inner._lock:  # noqa: SLF001
+            self._inner._require_active(sandbox_id)  # noqa: SLF001
+        guest = self._guests.get(sandbox_id)
+        registry = exec_cancel.registry
+        # One lock hold decides running, ended or not seen yet, so a start cannot slip in between.
+        kind, found = registry.cancel_lookup(sandbox_id, token)
+        if kind == "result":
+            return "already_stopped" if found == "cancelled" else "finished_before_cancel"
+        if kind == "tombstoned":
+            return "cancelled_before_start"
+        entry = found
+        if guest is None or entry.form is None:
+            return "unsupported"
+        deadline = time.monotonic() + exec_cancel.CANCEL_WINDOW_SECONDS
+        # The first signal goes through the pid file guard and names the process group.
+        rc, out = self._signal_exec_group(guest, entry, token, "TERM", None)
+        # A cancel that wins the start by a few ms can come before the wrapper wrote the pid file. The
+        # exec is registered as wrapped, so give the file a short chance before answering unsupported.
+        pid_file_until = time.monotonic() + exec_cancel.PID_FILE_WAIT_SECONDS
+        while rc == exec_cancel.NO_PID_FILE and time.monotonic() < pid_file_until and not entry.done.is_set():
+            time.sleep(exec_cancel.POLL_SECONDS)
+            rc, out = self._signal_exec_group(guest, entry, token, "TERM", None)
+        if rc in (exec_cancel.NO_PID_FILE, exec_cancel.REFUSED) and entry.done.is_set():
+            # The exec ended on its own while the first signal was being tried: say so, never unsupported or refused.
+            held = registry.result(sandbox_id, token)
+            if held is not None:
+                return "already_stopped" if held == "cancelled" else "finished_before_cancel"
+        if rc == exec_cancel.NO_PID_FILE:
+            return "unsupported"
+        # A guard refusal on the first signal means nothing was sent: not progress.
+        if rc == exec_cancel.REFUSED:
+            return "refused"
+        pgid = exec_cancel.parse_pgid(out)
+        if pgid is None:
+            # The signal may have gone out but no group was named, so nothing can be confirmed empty.
+            return "signalled"
+        # The group id stays valid across the escalation: the leader may be gone and its children not.
+        term_until = min(time.monotonic() + exec_cancel.TERM_WAIT_SECONDS, deadline)
+        if self._wait_group_stopped(guest, entry, token, pgid, term_until):
+            return "stopped"
+        # TERM did not end the exec or its children: KILL the whole group. A KILL that fails is not
+        # reported as sent, but the group is still watched until the window closes.
+        self._signal_exec_group(guest, entry, token, "KILL", pgid)
+        if self._wait_group_stopped(guest, entry, token, pgid, deadline):
+            return "stopped"
+        return "signalled"
+
+    def _wait_group_stopped(self, guest: GuestRecord, entry: Any, token: str, pgid: str, until: float) -> bool:
+        """True once the exec call returned and no process of its group is left, before ``until``."""
+        while True:
+            entry.done.wait(max(0.0, min(exec_cancel.POLL_SECONDS, until - time.monotonic())))
+            if entry.done.is_set() and self._group_empty(guest, entry, token, pgid):
+                return True
+            if time.monotonic() >= until:
+                return False
+
+    def _group_empty(self, guest: GuestRecord, entry: Any, token: str, pgid: str) -> bool:
+        rc, out = self._signal_exec_group(guest, entry, token, "PROBE", pgid, count=False)
+        return rc == 0 and out.strip() == "empty"
+
+    def _signal_exec_group(
+        self, guest: GuestRecord, entry: Any, token: str, sig: str, pgid: str | None, *, count: bool = True
+    ) -> tuple[int, str]:
+        """Run KILL_SCRIPT in the room: (exit code, stdout). ``count``: a signal that went out marks the exec cancelled.
+
+        The signal is registered before it is sent and settled after the guard answered, so a natural
+        finish in between waits for the answer instead of guessing (ExecRegistry.finish).
+        """
+        registry = exec_cancel.registry
+        if count:
+            registry.signal_begin(entry)
+        sent = False
+        try:
+            try:
+                code, out, _, timed_out = self._client.exec(
+                    guest.container_id,
+                    ["sh", "-c", exec_cancel.KILL_SCRIPT, "sh", exec_cancel.pid_file(token), entry.form, sig, *([pgid] if pgid else [])],
+                    cwd=None,
+                    env={},
+                    timeout_seconds=20,
+                    stdin=None,
+                    user=entry.user,
+                )
+            except SandboxOpError:
+                return exec_cancel.SIGNAL_FAILED, ""
+            if timed_out and code != 0:
+                return exec_cancel.SIGNAL_FAILED, ""
+            # The guard passed and kill returned 0: `sent` in group mode, a pgid line on the first call.
+            sent = code == 0 and sig != "PROBE" and out.strip() != "empty"
+            return code, out
+        finally:
+            if count:
+                registry.signal_end(entry, sent)
+
+    def _has_sh(self, guest: GuestRecord) -> bool:
+        """True when the guest image can run ``sh``. Probe once; the probe has no side effect."""
+        if guest.has_sh is None:
+            code, _, _, _ = self._client.exec(
+                guest.container_id, ["sh", "-c", ":"], cwd=None, env={}, timeout_seconds=20, stdin=None
+            )
+            guest.has_sh = code == 0
+        return guest.has_sh
 
     def _has_bash(self, guest: GuestRecord) -> bool:
         """True when the guest image can run ``bash``. Probe once; the probe has no side effect."""
@@ -2161,6 +2429,26 @@ class DockerGuestProvider:
         guest.timeout_form = form
         return form
 
+    def set_env_overlay(self, sandbox_id: str, env: Mapping[str, str]) -> list[str]:
+        """Replace the room's env overlay (AB#414). Returns the names set, never a value.
+
+        Only the receipts front calls this, with an overlay it opened from a sealed
+        envelope, and only a hotel with sealed secrets has that front in place
+        (CATHEDRAL_SEALED_SECRETS_DIR); elsewhere the route would carry values in
+        the clear past the host, so it is refused. Each later exec and process
+        start gets it under its own env; running processes keep what they had.
+        """
+        if self._secrets_root is None:
+            raise SandboxOpError("env_overlay_not_supported", 501, "this hotel does not take a sealed env overlay")
+        overlay = validated_env_overlay(env)
+        with self._inner._lock:  # noqa: SLF001
+            self._inner._require_active(sandbox_id)  # noqa: SLF001
+            guest = self._guests.get(sandbox_id)
+            if guest is None:
+                raise SandboxOpError("sandbox_not_found", 404, f"sandbox {sandbox_id} not found")
+            guest.env_overlay = overlay
+        return sorted(overlay)
+
     def start_process(self, sandbox_id: str, request: ExecRequest) -> ProcessHandle:
         guest = self._guests.get(sandbox_id)
         if guest is None:
@@ -2175,7 +2463,7 @@ class DockerGuestProvider:
             guest.container_id,
             starter,
             cwd=request.cwd or "/work",
-            env={**dict(request.env)},
+            env={**guest.env_overlay, **dict(request.env)},
             timeout_seconds=30,
             stdin=None,
             detach=True,
@@ -2238,6 +2526,15 @@ class DockerGuestProvider:
 
     def write_tar(self, sandbox_id: str, path: str, tarball: bytes) -> None:
         self._inner.write_tar(sandbox_id, _in_work(path), tarball)
+
+    def list_directory(self, sandbox_id: str, path: str) -> list[dict[str, str]]:
+        return self._inner.list_directory(sandbox_id, _in_work(path))
+
+    def make_directory(self, sandbox_id: str, path: str) -> bool:
+        return self._inner.make_directory(sandbox_id, _in_work(path))
+
+    def remove_entry(self, sandbox_id: str, path: str) -> bool:
+        return self._inner.remove_entry(sandbox_id, _in_work(path))
 
     def read_tar(self, sandbox_id: str, spec: TarGet) -> bytes:
         _in_work(spec.path)
@@ -2821,10 +3118,56 @@ class DockerGuestProvider:
             self._inner._images[ref] = entry  # noqa: SLF001
         return entry
 
-    def terminal_write(self, sandbox_id: str, terminal_id: str, data: str) -> dict[str, Any]:
+    def terminal_write(self, sandbox_id: str, terminal_id: str, data: str | bytes) -> dict[str, Any]:
         # The inner provider keeps the terminal's buffers; each complete line
         # runs through this provider's exec, in the room's container (B154).
+        # A PTY terminal writes raw bytes to its docker exec -it instead.
         return self._inner.terminal_write(sandbox_id, terminal_id, data, executor=self.exec)
+
+    def create_terminal(
+        self,
+        sandbox_id: str,
+        *,
+        cols: int | None = None,
+        rows: int | None = None,
+        mode: str | None = None,
+    ) -> dict[str, Any]:
+        if mode != "pty":
+            return self._inner.create_terminal(sandbox_id, cols=cols, rows=rows, mode=mode)
+        guest = self._guests.get(sandbox_id)
+        if guest is None:
+            # No container (yet, or any more): the inner provider answers
+            # with its own state error, or refuses PTY for want of a room.
+            return self._inner.create_terminal(sandbox_id, cols=cols, rows=rows, mode=mode)
+        # Probe the shell now, not at connect: connect holds the provider
+        # lock and the probe is a docker exec.
+        argv, overlay = self._terminal_command(guest)
+
+        def spawn(c: int, r: int, on_output, on_exit) -> PtyProcess:
+            return _spawn_room_terminal(argv, overlay, cols=c, rows=r, on_output=on_output, on_exit=on_exit)
+
+        return self._inner.create_terminal(sandbox_id, cols=cols, rows=rows, mode=mode, spawn=spawn)
+
+    def _terminal_command(self, guest: GuestRecord) -> tuple[list[str], dict[str, str]]:
+        """docker exec -it argv for an interactive login shell in the room, and the overlay it gets.
+
+        The overlay is the customer's, so it must never reach the hotel's own
+        docker client (DOCKER_HOST, DOCKER_CONFIG, HTTPS_PROXY would steer it).
+        _spawn_room_terminal hands it to the container through --env-file,
+        which keeps its values off both the client env and the process list.
+        """
+        overlay = {k: v for k, v in guest.env_overlay.items() if k != "TERM"}
+        for key, value in overlay.items():
+            # An env file is one KEY=VALUE per line, and docker drops a trailing CR.
+            if "\n" in value or "\r" in value:
+                raise SandboxOpError(
+                    "terminal_env_unsupported",
+                    422,
+                    f"the value of {key} holds a line break, which a PTY terminal cannot pass; use mode line",
+                )
+        shell = "bash" if self._has_bash(guest) else "sh"
+        argv = ["docker", "exec", "-it", "-w", "/work", "-e", "TERM=xterm-256color", guest.container_id, shell, "-l"]
+        return argv, overlay
 
     def get(self, sandbox_id: str) -> dict[str, Any]:
         return self._with_tunables(self._inner.get(sandbox_id))
@@ -2880,6 +3223,52 @@ class DockerGuestProvider:
         self._remove_many(refs)
         self._guests.clear()
         self._inner.close()
+
+
+def _spawn_room_terminal(
+    argv: list[str],
+    overlay: Mapping[str, str],
+    *,
+    cols: int,
+    rows: int,
+    on_output: Callable[[bytes], None],
+    on_exit: Callable[[int], None],
+) -> PtyProcess:
+    """Start a room terminal's docker exec -it with the hotel's own env only.
+
+    The overlay goes in a 0600 env file in a private temp dir, named on the argv
+    by path. The docker client reads it before it calls the daemon, so the file
+    goes at the first output or at exit, whichever comes first.
+    """
+    if not overlay:
+        return PtyProcess(argv, cols=cols, rows=rows, on_output=on_output, on_exit=on_exit)
+    env_dir = tempfile.mkdtemp(prefix="cathedral-pty-env-")
+    removed = False
+
+    def remove_env_file() -> None:
+        nonlocal removed
+        if not removed:
+            removed = True
+            shutil.rmtree(env_dir, ignore_errors=True)
+
+    def output(chunk: bytes) -> None:
+        remove_env_file()
+        on_output(chunk)
+
+    def exited(code: int) -> None:
+        remove_env_file()
+        on_exit(code)
+
+    try:
+        env_file = os.path.join(env_dir, "env")
+        fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.writelines(f"{key}={value}\n" for key, value in overlay.items())
+        full = [*argv[:3], "--env-file", env_file, *argv[3:]]
+        return PtyProcess(full, cols=cols, rows=rows, on_output=output, on_exit=exited)
+    except BaseException:
+        remove_env_file()
+        raise
 
 
 def shlex_quote(value: str) -> str:
