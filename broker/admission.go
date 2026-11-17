@@ -41,8 +41,15 @@
 // (a new binding comes only with a reboot), so a KDS outage does not refuse
 // a hotel that already passed with its binding.
 //
-// Guest TLS: only a miner hotel binds the broker's TLS channel to its
-// attestation (tls_spki_sha256, miner_tls.go). An operator hotel is reached
+// Guest TLS: a miner hotel, and a sealed hotel with "guest_tls": true
+// (AB#378), bind the broker's TLS channel to their attestation
+// (tls_spki_sha256, miner_tls.go): the broker sends the hotel key only to the
+// TLS key the AMD-verified binding names, and the binding must say the hotel
+// key was installed inside the guest (hotel_key_source "install"), so the
+// host never held it. A "guest_tls" hotel is pinned by the sync loop and
+// re-pinned after a reboot, both after the full check; a miner hotel is
+// pinned at its join. "require_sealed_guest_tls": true makes this every
+// sealed hotel. Without it an operator hotel without "guest_tls" is reached
 // over its configured address as before.
 //
 // One miner hotel per chip: a miner hotel whose report carries the CHIP_ID of
@@ -200,8 +207,8 @@ func (b *broker) admitted(h *hotel, now time.Time) bool {
 	if h.cfg.MinerHotkey != "" && !h.cfg.Sealed {
 		return false
 	}
-	if h.cfg.MinerHotkey != "" && h.tlsPinErr != nil {
-		return false
+	if h.guestTLS() && (h.tlsPinErr != nil || h.guestPin.Load() == nil) {
+		return false // no verified guest TLS key: no hotel key goes there
 	}
 	if h.runtime && !h.cfg.Sealed && h.labels()["sealed"] == "true" {
 		return false
@@ -289,8 +296,10 @@ func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, err
 	if err != nil {
 		return res, err
 	}
-	if h.cfg.MinerHotkey != "" {
-		if err := verifyMinerTLSBinding(att.Binding, h.cfg.TLSSPKISHA256); err != nil {
+	// Every guest TLS hotel (a miner, or "guest_tls"): the binding must name
+	// the key this broker pinned, and say the hotel key was installed.
+	if h.guestTLS() {
+		if err := verifyMinerTLSBinding(att.Binding, h.pinHex()); err != nil {
 			return admission{}, err
 		}
 	}
@@ -319,6 +328,7 @@ func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, err
 
 // snpBinding is the part of a sealed hotel's binding the broker compares.
 type snpBinding struct {
+	Hotel          string `json:"hotel"`
 	Level          string `json:"level"`
 	Measurement    string `json:"measurement"`
 	ChipID         string `json:"chip_id"`
@@ -334,10 +344,10 @@ type snpBinding struct {
 func verifyMinerTLSBinding(rawBinding []byte, peerSPKI string) error {
 	var bd snpBinding
 	if json.Unmarshal(rawBinding, &bd) != nil || len(peerSPKI) != 64 || bd.TLSSPKISHA256 != peerSPKI {
-		return errors.New("miner guest TLS key does not match its SNP binding")
+		return errors.New("guest TLS key does not match its SNP binding")
 	}
 	if bd.HotelKeySource != "install" {
-		return errors.New("miner hotel key was not installed inside the guest")
+		return errors.New("hotel key was not installed inside the guest")
 	}
 	return nil
 }
@@ -346,7 +356,7 @@ func verifyMinerTLSBinding(rawBinding []byte, peerSPKI string) error {
 // constructs any client that holds the hotel key.
 func (b *broker) verifyMinerBootstrap(ctx context.Context, raw []byte, peerSPKI string) error {
 	if len(b.cfg.SealedMeasurements) == 0 {
-		return errors.New("a miner hotel needs a nonempty sealed_measurements allowlist")
+		return errors.New("a guest TLS hotel needs a nonempty sealed_measurements allowlist")
 	}
 	var att struct {
 		Binding    json.RawMessage `json:"binding"`
@@ -354,7 +364,7 @@ func (b *broker) verifyMinerBootstrap(ctx context.Context, raw []byte, peerSPKI 
 		Report     string          `json:"report_b64"`
 	}
 	if json.Unmarshal(raw, &att) != nil {
-		return errors.New("miner attestation is not JSON")
+		return errors.New("guest attestation is not JSON")
 	}
 	if _, err := verifyAttestation(att.Binding, att.BindingSHA, att.Report, b.cfg.SealedMeasurements, b.cfg.SealedHostData); err != nil {
 		return err
@@ -363,7 +373,7 @@ func (b *broker) verifyMinerBootstrap(ctx context.Context, raw []byte, peerSPKI 
 		return err
 	}
 	if b.cfg.AMDVerifier == nil {
-		return errors.New("a miner hotel needs the AMD chain check")
+		return errors.New("a guest TLS hotel needs the AMD chain check")
 	}
 	_, err := b.verifyAMDChain(ctx, raw)
 	return err
