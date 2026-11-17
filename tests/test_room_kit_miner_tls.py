@@ -119,7 +119,8 @@ class Upstream:
 
 def _miner_front(ledger, upstream: Upstream, tmp_path, tls_context=None):
     ctx = tls_context or ledger.miner.tls_context(str(tmp_path / "store"))
-    tls = rr.TLSServer(("127.0.0.1", 0), ledger, upstream.port, 1, INTERNAL, "/nonexistent.sock", tls_context=ctx)
+    tls = rr.TLSServer(("127.0.0.1", 0), ledger, upstream.port, 1, INTERNAL, "/nonexistent.sock",
+                       tls_context=ctx, pool_scan=False)
     Thread(target=tls.serve_forever, daemon=True).start()
     plain = rr.Server(("127.0.0.1", 0), ledger, upstream.port, 1, INTERNAL, "/nonexistent.sock", attestation_only=True)
     Thread(target=plain.serve_forever, daemon=True).start()
@@ -488,7 +489,7 @@ def test_install_refusals_over_https_change_nothing(tmp_path, monkeypatch) -> No
 def test_a_config_hotel_front_passes_its_key_through_and_has_no_install_routes(tmp_path, monkeypatch) -> None:
     ledger, _ = _ledger(tmp_path, monkeypatch, miner=False)
     upstream = Upstream()
-    server = rr.Server(("127.0.0.1", 0), ledger, upstream.port, 1, INTERNAL, "/nonexistent.sock")
+    server = rr.Server(("127.0.0.1", 0), ledger, upstream.port, 1, INTERNAL, "/nonexistent.sock", pool_scan=False)
     Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
     status, _ = _http(port, "GET", "/v1/status", key=INTERNAL)

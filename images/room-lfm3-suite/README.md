@@ -119,6 +119,28 @@ lfm3-timing load_ms=812 prompt_tok_s=118.0 gen_tok_s=52.8 wall_ms=1530 threads=2
 Over HTTP, a picture is an `image_url` part with a data URI and a clip an
 `input_audio` part (base64 WAV or MP3), in `/v1/chat/completions`.
 
+### Benchmark: `lfm3-bench` (AB#444)
+
+`lfm3-bench` times one streamed request from a prompt set and prints the
+answer, then one JSON line. `scripts/sealed_bench.py` runs it in a fresh sealed
+room, once per prompt, and checks each line against a Cathedral exec receipt.
+
+```sh
+lfm3-bench --max-tokens 256 --index 0 '["What is 2+2?","Name three rivers."]'
+```
+
+```
+lfm3-bench {"decode_n":64,"decode_tok_s":24.1,"hash_ms":2100,"harness":"lfm3-bench-1","load_ms":812,"max_tokens":256,"mmproj_sha256":"...","model":"lfm3-omni-2b","model_file":"LFM3-Omni-2B-Q4_K_M.gguf","model_sha256":"9f8d...","prompt_index":0,"prompt_ms":120.4,"prompt_n":14,"prompt_set_sha256":"...","prompt_tok_s":116.3,"reasoning":"off","threads":2,"ttft_ms":412,"wall_ms":3100}
+```
+
+- `ttft_ms` is measured in the room, from sending the request to the first
+  streamed token. The rates and `prompt_ms` are llama-server's own timings.
+- `model_sha256` (and `mmproj_sha256`) are hashed in the room on every call and
+  must match `/opt/lfm3/SHA256SUMS`, or there is no result.
+- `prompt_set_sha256` is the sha256 of the prompt-set argument bytes.
+- The prompt cache is off for the request, so each call is a full prefill.
+- Not for decision models (d1).
+
 ### Talk to it: `lfm3-agent`
 
 `lfm3-ask` is one question with no memory. `lfm3-agent` is the harness for a
@@ -209,6 +231,21 @@ kinds of room:
   file). Each call is printed on stderr as it runs (`$ ls -la`); the output
   the model reads is cut at 2,000 characters. At most 4 tool rounds a
   message, then the model must answer. `--no-tools` answers without them.
+- **Audio's tool choice (AB#545).** Offered tools, LFM3-Audio-2B called one
+  for every message, even "What is 2+2?": its first token was `<tool_call>`
+  at 0.89 to 1.00 whatever the question, so neither sampling nor a reworded
+  system prompt changed it. In Audio rooms a round that offers tools starts
+  with three fixed example turns after the system prompt: a sum and a
+  translation answered in text, and "What umask is this machine set to?"
+  answered with `run`. They are not kept in the conversation, never shown,
+  count against the 4,000-character budget, and are not sent with
+  `--no-tools`, `--json` or the last round. Local eval (pinned GGUF and
+  llama.cpp, 14 no-tool and 17 tool questions, 2 runs): needless calls 26/28
+  before, 0/28 after; tool questions kept a call 34/34. The tool example
+  holds a fact nobody asks about: a fact there (an IP address, a timezone)
+  came back as Audio's answer to the matching question with no call. An
+  example about an installed program or an open port made Audio answer
+  "What is the hostname?" with `hostname -I` and an IP address.
 - **JSON.** `--json` sends a JSON schema (an object or an array) as
   `response_format`, which llama-server turns into a grammar, plus one system
   line asking for valid JSON with no comments, and no tools. The grammar fixes
