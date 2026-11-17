@@ -161,6 +161,9 @@ case "$*" in
   "route show "*) for r in ${FAKE_ROUTED:-}; do [ "$r" = "$3" ] && echo "$3 dev other0 scope link"; done ;;
   "link show "*) for l in ${FAKE_LINKS:-}; do [ "$l" = "$3" ] && exit 0; done; exit 1 ;;
   "-o link show type bridge") for l in ${FAKE_BRIDGES:-}; do echo "7: $l: <BROADCAST,MULTICAST,UP> mtu 1500"; done ;;
+  # FAKE_IP_ADDRS: "dev=cidr dev=cidr", the host's IPv4 addresses (sealed link clash and running guest).
+  "-4 -o addr show") for x in ${FAKE_IP_ADDRS:-}; do echo "3: ${x%%=*}    inet ${x#*=} scope global ${x%%=*}"; done ;;
+  "-4 -o addr show dev "*) for x in ${FAKE_IP_ADDRS:-}; do [ "${x%%=*}" = "$6" ] && echo "3: $6    inet ${x#*=} scope global $6"; done ;;
 esac
 exit 0""",
 }
@@ -783,6 +786,78 @@ def test_host_net_check_restores_missing_rules_and_leaves_present_ones(host: Fak
     assert "iptables -I FORWARD 1 -m comment --comment sealed-hotel:sealed-1 -j SEALED-SNP0-FWD" in host.calls("iptables")
 
 
+def test_host_net_up_uses_the_hotels_own_link(host: FakeHost) -> None:
+    # AB#432: a second guest on the host keeps its own /30 from sealed.env.
+    proc = _run_host_net(host, "up", {"SEALED_TAP": "snp1", "SEALED_HOST_IP": "10.215.0.5", "SEALED_GUEST_IP": "10.215.0.6"},
+                         FAKE_IP_ADDRS="eth0=203.0.113.10/24 snp0=10.215.0.1/30 snp1=10.215.0.5/30 snp2=10.215.0.9/30")
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert "ip addr replace 10.215.0.5/30 dev snp1" in host.calls("ip")
+    ipt = host.calls("iptables")
+    assert "iptables -A SEALED-SNP1-FWD -i snp1 -s 10.215.0.6 -j ACCEPT" in ipt
+    assert "iptables -t nat -A POSTROUTING -s 10.215.0.6/32 ! -o snp1 -m comment --comment sealed-hotel:sealed-1 -j MASQUERADE" in ipt
+
+
+@pytest.mark.parametrize("action", ["up", "clash"])
+@pytest.mark.parametrize("held", ["snp0=10.215.0.1/30", "br9=10.215.0.0/24", "snp0=10.215.0.2/32"])
+def test_host_net_refuses_a_link_another_interface_holds(host: FakeHost, action: str, held: str) -> None:
+    # The kit default 10.215.0.1/.2 on a second Frankfurt guest would share snp0's /30.
+    proc = _run_host_net(host, action, {"SEALED_TAP": "snp1"}, FAKE_IP_ADDRS=f"eth0=203.0.113.10/24 {held}")
+    assert proc.returncode == 1
+    assert f"{held.split('=')[0]} already holds {held.split('=')[1]}" in proc.stderr
+    assert "SEALED_HOST_IP and SEALED_GUEST_IP" in proc.stderr
+    assert not host.calls("iptables") and not [c for c in host.calls("ip") if "addr replace" in c or "tuntap" in c]
+
+
+def test_host_net_refuses_to_move_the_link_of_a_running_guest(host: FakeHost) -> None:
+    # c46-sealed-2 runs on 10.231.78.5/.6; a sealed.env naming another pair must not
+    # cut the running guest's NAT (the check timer would run "up" with the new pair).
+    link = {"SEALED_TAP": "snpc46s1", "SEALED_HOST_IP": "10.231.78.13", "SEALED_GUEST_IP": "10.231.78.14"}
+    for action in ("clash", "up", "check"):
+        proc = _run_host_net(host, action, link, FAKE_IP_ADDRS="snpc46s1=10.231.78.5/30")
+        assert proc.returncode == 1, action
+        assert "snpc46s1 holds 10.231.78.5/30 but sealed.env names 10.231.78.13/30" in proc.stderr
+        assert "retarget any broker tunnel to 10.231.78.14:18090" in proc.stderr
+        assert not [c for c in host.calls("iptables") if " -A " in c or " -I " in c or " -F " in c], action
+        assert not [c for c in host.calls("ip") if "addr replace" in c], action
+
+
+def _sibling_unit(host: FakeHost, name: str, **sealed: str) -> None:
+    env = host.tmp / f"{name}.env"
+    env.write_text("".join(f"{k}={v}\n" for k, v in {"SEALED_NAME": name, **sealed}.items()))
+    unit = host.root / "etc" / "systemd" / "system" / f"room-sealed-{name}.service"
+    unit.write_text(f"[Service]\nExecStartPre=/srv/x/host-net.sh up {env}\nExecStart=/srv/x/launch-guest.sh {env}\n")
+
+
+def test_host_net_refuses_the_link_a_stopped_sibling_hotel_is_set_to(host: FakeHost) -> None:
+    # A stopped guest has no tap, but its unit still names its pair (the kit default here).
+    _sibling_unit(host, "nc-sealed")
+    _sibling_unit(host, "nc-sealed-3", SEALED_HOST_IP="10.215.0.9", SEALED_GUEST_IP="10.215.0.10")
+    proc = _run_host_net(host, "clash", {"SEALED_TAP": "snp1"})
+    assert proc.returncode == 1
+    assert "room-sealed-nc-sealed.service is set to 10.215.0.1/30" in proc.stderr
+    proc = _run_host_net(host, "clash", {"SEALED_TAP": "snp1", "SEALED_HOST_IP": "10.215.0.5", "SEALED_GUEST_IP": "10.215.0.6"})
+    assert proc.returncode == 0, proc.stderr
+    # The hotel's own unit is not a sibling.
+    _sibling_unit(host, "sealed-1", SEALED_HOST_IP="10.215.0.5", SEALED_GUEST_IP="10.215.0.6")
+    proc = _run_host_net(host, "clash", {"SEALED_TAP": "snp1", "SEALED_HOST_IP": "10.215.0.5", "SEALED_GUEST_IP": "10.215.0.6"})
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_host_net_down_still_removes_the_tap_with_a_bad_link(host: FakeHost) -> None:
+    proc = _run_host_net(host, "down", {"SEALED_HOST_IP": "10.215.0.4", "SEALED_GUEST_IP": "10.215.0.5"})
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert host.calls("ip link del") == ["ip link del snp0"]
+    proc = _run_host_net(host, "up", {"SEALED_HOST_IP": "10.215.0.4", "SEALED_GUEST_IP": "10.215.0.5"})
+    assert proc.returncode == 1 and "one /30" in proc.stderr
+
+
+def test_host_net_clash_passes_for_a_free_link(host: FakeHost) -> None:
+    proc = _run_host_net(host, "clash", {"SEALED_TAP": "snp1", "SEALED_HOST_IP": "10.215.0.5", "SEALED_GUEST_IP": "10.215.0.6"},
+                         FAKE_IP_ADDRS="snp0=10.215.0.1/30 snp1=10.215.0.5/30 snp2=10.215.0.9/30")
+    assert proc.returncode == 0, proc.stderr
+    assert not host.calls("iptables")
+
+
 # ---------------------------------------------------------------- install-sealed.sh
 
 def test_sealed_install_on_a_host_without_snp_refuses_at_the_first_check(host: FakeHost) -> None:
@@ -838,6 +913,11 @@ def test_sealed_restart_with_live_rooms_is_refused_unless_overridden(host: FakeH
     assert "measurement matches the build" in proc.stdout and "done." in proc.stdout
     assert (host.tmp / "sealed" / "run" / "attestation.json").exists()
     assert list((images / "20260102T000000Z").glob("attestation-*.json"))
+
+
+def test_sealed_install_checks_the_link_before_the_build() -> None:
+    text = (KIT / "sealed" / "install-sealed.sh").read_text()
+    assert text.index('"$KIT/sealed/host-net.sh" clash "$ENV_FILE"') < text.index('"$KIT/sealed/build-guest.sh" "$ENV_FILE"')
 
 
 def test_sealed_hotel_api_that_does_not_answer_refuses_the_restart(host: FakeHost) -> None:
