@@ -31,6 +31,13 @@ Private keys must be encrypted PEM (the passphrase is read from
 CATHEDRAL_MINER_RELEASE_PASSPHRASE). Records live at most 14 days and may not
 be issued more than 300 seconds in the future: the same rules the host
 enforces. Output files are never overwritten.
+
+Instead of --private-key, trust-entry, canary and stable take
+--signer-config PATH: a cathedral.signer config (local_file or aws_kms
+backend). The purpose defaults to miner_canary or miner_stable for the
+channel; --purpose overrides it. The configured key_id is the signing key id,
+and for canary and stable the configured key must equal the key the bundle's
+trust root lists under that id for the channel.
 """
 
 from __future__ import annotations
@@ -46,7 +53,7 @@ import time
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT))
@@ -74,8 +81,10 @@ from cathedral.miner_release import (  # noqa: E402
     split_image,
     strict_json,
 )
+from cathedral.signer import Signer, SignerError, signer_from_config  # noqa: E402
 
 PASSPHRASE_ENV = "CATHEDRAL_MINER_RELEASE_PASSPHRASE"
+PURPOSE_BY_CHANNEL = {"canary": "miner_canary", "stable": "miner_stable"}
 
 
 def _fail(message: str) -> None:
@@ -112,10 +121,63 @@ def _load_private_key(path: Path) -> Ed25519PrivateKey:
     return key
 
 
-def _public_hex(key: Ed25519PrivateKey) -> str:
-    return key.public_key().public_bytes(
-        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
-    ).hex()
+class _PrivateKeySigner:
+    """The --private-key path, behind the same interface as cathedral.signer."""
+
+    def __init__(self, key_id: str, key: Ed25519PrivateKey) -> None:
+        self.key_id = key_id
+        self._key = key
+
+    def public_key_raw(self) -> bytes:
+        return self._key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
+        )
+
+    def sign(self, message: bytes) -> bytes:
+        return self._key.sign(message)
+
+
+def _public_hex(signer: Signer) -> str:
+    try:
+        return signer.public_key_raw().hex()
+    except SignerError as exc:
+        _fail(f"the signer refused: {exc}")
+
+
+def _open_signer(arguments: argparse.Namespace, channel: str, *, key_id: str | None, pinned_for=None) -> Signer:
+    """The signer named on the command line: --private-key or --signer-config.
+
+    ``pinned_for`` is a trust root (key id to TrustedKey). When given, the
+    configured key must be the one that root lists under its key id for
+    ``channel``, and an aws_kms backend is pinned to that public key before it
+    signs.
+    """
+
+    if arguments.private_key is not None:
+        if key_id is None:
+            _fail("--private-key needs a key id")
+        return _PrivateKeySigner(key_id, _load_private_key(Path(arguments.private_key)))
+    purpose = arguments.purpose or PURPOSE_BY_CHANNEL[channel]
+    try:
+        signer = signer_from_config(arguments.signer_config, purpose)
+    except SignerError as exc:
+        _fail(f"the signer config refused: {exc}")
+    if key_id is not None and key_id != signer.key_id:
+        _fail(f"--signing-key-id {key_id} is not the configured key {signer.key_id} for {purpose}")
+    if pinned_for is not None:
+        entry = pinned_for.get(signer.key_id)
+        if entry is None or channel not in entry.channels:
+            _fail(
+                f"the bundle's trust root does not let {signer.key_id} sign {channel}; every host "
+                "probe would refuse this release"
+            )
+        try:
+            signer = signer_from_config(arguments.signer_config, purpose, pinned_public_key=entry.public_key)
+            # A KMS backend checks its key against the pin here, before anything is signed.
+            signer.public_key_raw()
+        except SignerError as exc:
+            _fail(f"the signer config refused: {exc}")
+    return signer
 
 
 def _write_new(path: Path, payload: bytes) -> None:
@@ -127,8 +189,17 @@ def _write_new(path: Path, payload: bytes) -> None:
     path.chmod(0o644)
 
 
-def _sign(body: dict[str, object], key: Ed25519PrivateKey) -> bytes:
-    signature = key.sign(signed_bytes(body))
+def _sign(body: dict[str, object], signer: Signer) -> bytes:
+    message = signed_bytes(body)
+    try:
+        signature = signer.sign(message)
+    except SignerError as exc:
+        _fail(f"the signer refused: {exc}")
+    # Never emit a signature that does not verify under the key we announced.
+    try:
+        Ed25519PublicKey.from_public_bytes(signer.public_key_raw()).verify(signature, message)
+    except Exception:
+        _fail("the signature does not verify under the signer's public key")
     document = dict(body)
     document["signature"] = {
         "algorithm": "ed25519",
@@ -170,7 +241,7 @@ def _window(arguments: argparse.Namespace) -> tuple[int, int]:
     return issued, expires
 
 
-def _emit(payload: bytes, arguments: argparse.Namespace, key: Ed25519PrivateKey, trusted) -> int:
+def _emit(payload: bytes, arguments: argparse.Namespace, key: Signer, trusted) -> int:
     document = strict_json(payload, label="signed record")
     verified = parse_miner_release(
         payload,
@@ -196,7 +267,7 @@ def _emit(payload: bytes, arguments: argparse.Namespace, key: Ed25519PrivateKey,
                 "tree_sha256": verified.bundle.tree_sha256,
                 "signed_sha256": verified.signed_sha256,
                 "signing_key_id": verified.signing_key_id,
-                "public_key_sha256": "sha256:" + hashlib.sha256(bytes.fromhex(_public_hex(key))).hexdigest(),
+                "public_key_sha256": "sha256:" + hashlib.sha256(key.public_key_raw()).hexdigest(),
                 "expires_unix": verified.expires_unix,
                 "out": str(arguments.out),
             },
@@ -208,11 +279,13 @@ def _emit(payload: bytes, arguments: argparse.Namespace, key: Ed25519PrivateKey,
 
 
 def command_trust_entry(arguments: argparse.Namespace) -> int:
-    key = _load_private_key(Path(arguments.private_key))
     channels = [channel.strip() for channel in arguments.channels.split(",") if channel.strip()]
     if not channels or any(channel not in CHANNELS for channel in channels):
         _fail("--channels must list canary and/or stable")
-    print(json.dumps({arguments.key_id: {"public_key_hex": _public_hex(key), "channels": channels}}, indent=2))
+    if arguments.signer_config is not None and arguments.purpose is None and len(channels) != 1:
+        _fail("--signer-config with more than one channel needs --purpose")
+    key = _open_signer(arguments, channels[0], key_id=arguments.key_id)
+    print(json.dumps({key.key_id: {"public_key_hex": _public_hex(key), "channels": channels}}, indent=2))
     return 0
 
 
@@ -248,8 +321,11 @@ def command_bundle(arguments: argparse.Namespace) -> int:
 
 def command_canary(arguments: argparse.Namespace) -> int:
     product = product_by_name(arguments.product)
-    key = _load_private_key(Path(arguments.private_key))
+    if arguments.private_key is not None:
+        key = _open_signer(arguments, "canary", key_id=arguments.signing_key_id)
     bundle = _Bundle(Path(arguments.bundle_archive))
+    if arguments.private_key is None:
+        key = _open_signer(arguments, "canary", key_id=arguments.signing_key_id, pinned_for=bundle.trust)
     if bundle.profile.runtime_contract != product.runtime_contract:
         _fail("the bundle's launcher is for another product")
     try:
@@ -259,7 +335,7 @@ def command_canary(arguments: argparse.Namespace) -> int:
         _fail(str(exc))
     if repository != bundle.profile.image_repository:
         _fail("the image is not in the repository the bundle's launcher requires")
-    bundle.require_key(arguments.signing_key_id, _public_hex(key), "canary")
+    bundle.require_key(key.key_id, _public_hex(key), "canary")
     _announce_trust("canary hosts will trust", (bundle.tree / TREE_TRUST_ROOT).read_bytes(), bundle.trust)
     issued, expires = _window(arguments)
     body = {
@@ -282,7 +358,7 @@ def command_canary(arguments: argparse.Namespace) -> int:
                 "tree_sha256": bundle.tree_sha256,
             },
         },
-        "signing_key_id": arguments.signing_key_id,
+        "signing_key_id": key.key_id,
     }
     return _emit(_sign(body, key), arguments, key, bundle.trust)
 
@@ -308,7 +384,8 @@ def _rebuild(product_name: str, trust_path: Path) -> str:
 
 
 def command_stable(arguments: argparse.Namespace) -> int:
-    key = _load_private_key(Path(arguments.private_key))
+    if arguments.private_key is not None:
+        key = _open_signer(arguments, "stable", key_id=arguments.signing_key_id)
     bundle = _Bundle(Path(arguments.bundle_archive))
     raw = Path(arguments.promote).read_bytes()
     document = strict_json(raw, label="canary record")
@@ -343,7 +420,9 @@ def command_stable(arguments: argparse.Namespace) -> int:
         bundle.tree_sha256,
     ):
         _fail("--bundle-archive is not the canary's bundle")
-    bundle.require_key(arguments.signing_key_id, _public_hex(key), "stable")
+    if arguments.private_key is None:
+        key = _open_signer(arguments, "stable", key_id=arguments.signing_key_id, pinned_for=bundle.trust)
+    bundle.require_key(key.key_id, _public_hex(key), "stable")
     issued, expires = _window(arguments)
     body = {
         "schema": MINER_RELEASE_SCHEMA,
@@ -371,9 +450,18 @@ def command_stable(arguments: argparse.Namespace) -> int:
                 "tree_sha256": canary.bundle.tree_sha256,
             },
         },
-        "signing_key_id": arguments.signing_key_id,
+        "signing_key_id": key.key_id,
     }
     return _emit(_sign(body, key), arguments, key, bundle.trust)
+
+
+def _add_key_source(parser: argparse.ArgumentParser) -> None:
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--private-key", default=None, help="encrypted PEM; passphrase from " + PASSPHRASE_ENV)
+    source.add_argument("--signer-config", default=None, help="cathedral.signer JSON config")
+    parser.add_argument(
+        "--purpose", default=None, help="signer config purpose (default miner_canary or miner_stable)"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -381,8 +469,8 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
 
     entry = commands.add_parser("trust-entry")
-    entry.add_argument("--private-key", required=True)
-    entry.add_argument("--key-id", required=True)
+    _add_key_source(entry)
+    entry.add_argument("--key-id", default=None, help="required with --private-key; must match the config")
     entry.add_argument("--channels", required=True)
 
     bundle = commands.add_parser("bundle")
@@ -392,8 +480,10 @@ def main(argv: list[str] | None = None) -> int:
 
     for name in ("canary", "stable"):
         signer = commands.add_parser(name)
-        signer.add_argument("--private-key", required=True)
-        signer.add_argument("--signing-key-id", required=True)
+        _add_key_source(signer)
+        signer.add_argument(
+            "--signing-key-id", default=None, help="required with --private-key; must match the config"
+        )
         signer.add_argument("--bundle-archive", required=True)
         signer.add_argument("--sequence", required=True, type=int)
         signer.add_argument("--lifetime-seconds", required=True, type=int)

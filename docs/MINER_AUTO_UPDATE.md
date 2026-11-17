@@ -39,6 +39,47 @@ What limits that:
 What does not limit it: there is no threshold or quorum. With a single stable
 key, a compromise means a new bootstrap on every host, as for the validator.
 
+## Committed trust root: local interim custody (November 2026)
+
+`deploy/miner-update/release-keys.json` lists one key:
+
+| Key id | Channels | Public key (hex) | Fingerprint |
+|---|---|---|---|
+| `miner-canary-local-1` | `canary` | `a805f5e29a058372d51122e9c5b2554c97e485199c7273a6966d6c838296d1e1` | `sha256:4bb720a31355306392d9545a42873501c11dad8e663664be086efcac6e4237f0` |
+
+The file's SHA-256, the value `--keys-sha256` pins, is
+`4e91dec00701f7cc579a43012ae12a6a3e26bebb005f5460b8f8b0b57fa06976`.
+The public key is also in `docs/keys/miner-canary-local-1.pub.pem`. Check the
+digest against the release announcement, not only against this page.
+
+- **Where the private key is.** On the Cathedral ops server, under a
+  root-only directory (mode 700), as an encrypted PKCS#8 PEM (mode 600) with
+  its passphrase in a separate mode 600 file. It is never on a miner, in CI,
+  in git or in a log. Signing goes through `cathedral/signer.py`
+  (`local_file` backend), selected by a root-only signer config.
+- **No stable key yet.** The stable key is created directly in AWS KMS
+  (`miner-stable-kms-1`), not next to the canary key. Until then only canary
+  hosts can enrol: the bootstrap refuses `--channel stable` with this root
+  ("no key in the trust root may sign the stable channel").
+- **What root on the ops server can do.** Root on that server, or anyone
+  with a copy of the PEM and its passphrase file, can sign any canary
+  release, and so run any code as root on every canary host within about an
+  hour. The encryption guards a copy of the PEM alone, not root on the
+  server. There is no HSM, no quorum and no hardware audit log in this phase.
+  It cannot reach stable hosts: the key is trusted for canary only.
+- **Recovery after a compromise.** Sign a release whose trust root drops
+  the key with another key trusted for canary, if one exists and the
+  attacker has not already raised the sequence. Otherwise re-bootstrap every
+  canary host from a revision whose committed root drops it.
+- **Move to AWS KMS.** Create `miner-canary-kms-1` and `miner-stable-kms-1`
+  in KMS (`ECC_NIST_EDWARDS25519`, `SIGN_VERIFY`). A canary release signed by
+  `miner-canary-local-1` adds both KMS keys to `release-keys.json` (see "Key
+  rotation and revocation"); hosts move their trust set forward. Then switch
+  the `miner_canary` entry of the signer config to `aws_kms`; no code
+  changes. A later release, signed by the KMS key, drops
+  `miner-canary-local-1`, which every host then revokes for good. Last, the
+  local key and passphrase files are shredded.
+
 A network attacker cannot forge a record or make an updater crash. It can deny
 updates, and six checks without a verified record page. The fallback judges
 the bytes the current updater fetched, so serving each updater different
@@ -401,6 +442,32 @@ every key you revoked.
 Run `deploy/miner-update/build_signed_miner_release.py` on the machine that
 holds the keys. Never run it in CI or on a miner.
 
+**Signer config.** `trust-entry`, `canary` and `stable` take either
+`--private-key PEM` (passphrase in `CATHEDRAL_MINER_RELEASE_PASSPHRASE`) or
+`--signer-config PATH`, a `cathedral/signer.py` config. With a config, the
+purpose is `miner_canary` for canary and `miner_stable` for stable
+(`--purpose` overrides), the signing key id is the configured `key_id`, and
+`--signing-key-id`, if given, must equal it. The configured key must be the
+key the bundle's trust root lists under that id for the channel; an `aws_kms`
+backend is pinned to that public key before it signs. So the move to KMS is a
+config change:
+
+```json
+{"miner_canary": {"backend": "local_file", "key_id": "miner-canary-local-1",
+  "path": "/root/.../miner-canary-local-1.pem",
+  "passphrase_path": "/root/.../miner-canary-local-1.passphrase"}}
+```
+
+```bash
+python deploy/miner-update/build_signed_miner_release.py canary \
+  --signer-config /root/.../signers.json \
+  --product snp-miner --network <network> --netuid <netuid> \
+  --image ghcr.io/cathedralai/<repository>@sha256:<64 hex> --state-schema 2 \
+  --bundle-archive out/<archive> --bundle-url https://<host>/<archive> \
+  --version <version> --sequence <next canary sequence> \
+  --lifetime-seconds 604800 --out canary.json
+```
+
 **Keys.** Give canary and stable separate keys. Keep them encrypted at rest.
 The signer refuses an unencrypted key.
 
@@ -473,7 +540,9 @@ record keeps running what it has and reports `refused`.
 ## Rollout
 
 1. The key holders generate the canary and stable keys and commit
-   `deploy/miner-update/release-keys.json`. No key is committed yet.
+   `deploy/miner-update/release-keys.json`. Done for canary only: the local
+   interim key `miner-canary-local-1` (see "Committed trust root"). The
+   stable key waits for AWS KMS.
 2. Build and publish images from this commit, so they carry the state-schema
    label. Or sign the image each host already runs: the updater takes that
    over unlabelled, with one restart, and the rollback is always allowed.
