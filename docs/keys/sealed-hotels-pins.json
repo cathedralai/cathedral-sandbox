@@ -1,0 +1,11 @@
+{
+  "keys": {
+    "sealed-hotels-local-1": {
+      "algorithm": "ed25519",
+      "not_after": "2027-02-15T00:00:00Z",
+      "not_before": "2026-11-17T15:59:33Z",
+      "public_key_hex": "fce2eb94433c0d0766be0c9c186de252e7fa99d6956ff1850f3159af6002e358"
+    }
+  },
+  "schema": "cathedral_sealed_hotels_pins_v1"
+}

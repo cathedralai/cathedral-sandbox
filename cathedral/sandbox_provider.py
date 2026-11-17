@@ -78,6 +78,69 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# One page of a process log (AB#419). The API holds a page in memory, so a page
+# is capped like exec output.
+LOG_PAGE_CAP = 16 * 1024 * 1024
+
+
+def utf8_page_end(chunk: bytes) -> int:
+    """Length of *chunk* cut back to a UTF-8 character boundary.
+
+    A page that ended inside a character would decode to a replacement mark on
+    both sides of the cut. When the tail is not the start of a valid character
+    (invalid bytes, or no lead byte within reach), keep the whole chunk so a read
+    always makes progress.
+    """
+    n = len(chunk)
+    for back in range(1, min(4, n) + 1):
+        b = chunk[n - back]
+        if b < 0x80:
+            return n
+        if b >= 0xC0:
+            need = 2 if b < 0xE0 else 3 if b < 0xF0 else 4
+            if back >= need:
+                return n
+            return n - back if n - back > 0 else n
+    return n
+
+
+def validated_log_page(offset: Any, limit: Any) -> tuple[int, int]:
+    """(offset, limit) of a process log read; offset 0 and the cap by default."""
+    if offset is None:
+        offset = 0
+    if limit is None:
+        limit = LOG_PAGE_CAP
+    if type(offset) is not int or offset < 0:
+        raise SandboxContractError("invalid_request", "offset must be a whole number of bytes, 0 or more")
+    if type(limit) is not int or not 1 <= limit <= LOG_PAGE_CAP:
+        raise SandboxContractError("invalid_request", f"limit must be from 1 to {LOG_PAGE_CAP} bytes")
+    return offset, limit
+
+
+def read_log_page(fh: Any, size: int, offset: int, limit: int) -> dict[str, Any]:
+    """Read one page of an open log file: bytes [offset, offset + limit) cut to a character.
+
+    ``next_offset`` is the byte offset to pass back for the bytes after this page,
+    so a second read returns only what the first did not.
+    """
+    if offset >= size:
+        chunk = b""
+    else:
+        fh.seek(offset)
+        chunk = fh.read(min(limit, size - offset))
+        # Also at the end of the file: a writer may be mid character, and the
+        # next read returns that character whole.
+        chunk = chunk[: utf8_page_end(chunk)]
+    next_offset = offset + len(chunk)
+    return {
+        "logs": chunk.decode("utf-8", "replace"),
+        "offset": offset,
+        "next_offset": next_offset,
+        "size": size,
+        "more": next_offset < size,
+    }
+
+
 class SandboxOpError(Exception):
     """A provider refusal with an HTTP status the server can map directly."""
 
@@ -162,6 +225,9 @@ class SandboxProvider(Protocol):
     def stat(self, sandbox_id: str, path: str) -> StatResult: ...
     def start_process(self, sandbox_id: str, request: ExecRequest) -> ProcessHandle: ...
     def process_logs(self, sandbox_id: str, process_id: str) -> str: ...
+    def process_logs_page(
+        self, sandbox_id: str, process_id: str, *, offset: int | None = None, limit: int | None = None
+    ) -> dict[str, Any]: ...
     def stop_process(self, sandbox_id: str, process_id: str) -> None: ...
     def snapshot(self, sandbox_id: str, *, ttl_seconds: int | None = None, name: str | None = None, labels: dict[str, str] | None = None) -> str: ...
     def list_snapshots(self, labels: Iterable[str] = (), *, owner: str | None = None) -> list[dict[str, Any]]: ...
@@ -189,7 +255,7 @@ class SandboxProvider(Protocol):
     def quota(self) -> dict[str, Any]: ...
     def usage(self, *, group_by: str | None, labels: Iterable[str]) -> dict[str, Any]: ...
     def status(self) -> dict[str, Any]: ...
-    def logs(self, sandbox_id: str) -> dict[str, Any]: ...
+    def logs(self, sandbox_id: str, *, entrypoint_cursor: str | None = None) -> dict[str, Any]: ...
     def get_operation(self, operation_id: str) -> dict[str, Any]: ...
     def sweep(self) -> int: ...
     def freeze(self, sandbox_id: str) -> dict[str, Any]: ...
@@ -745,6 +811,24 @@ class InMemorySandboxProvider:
                 raise SandboxOpError("process_not_found", 404, f"no process {process_id}")
             return entry[1].read_bytes().decode("utf-8", "replace") if entry[1].exists() else ""
 
+    def process_logs_page(
+        self, sandbox_id: str, process_id: str, *, offset: int | None = None, limit: int | None = None
+    ) -> dict[str, Any]:
+        """One page of a background process's log from a byte offset (AB#419)."""
+        offset, limit = validated_log_page(offset, limit)
+        with self._lock:
+            sandbox = self._require_active(sandbox_id)
+            entry = sandbox.processes.get(process_id)
+            if entry is None:
+                raise SandboxOpError("process_not_found", 404, f"no process {process_id}")
+            path = entry[1]
+        try:
+            with open(path, "rb") as fh:
+                page = read_log_page(fh, os.fstat(fh.fileno()).st_size, offset, limit)
+        except FileNotFoundError:
+            page = read_log_page(None, 0, offset, limit)
+        return {"process_id": process_id, **page}
+
     def stop_process(self, sandbox_id: str, process_id: str) -> None:
         with self._lock:
             sandbox = self._require_active(sandbox_id)
@@ -1098,8 +1182,12 @@ class InMemorySandboxProvider:
             "retained_until": sandbox.deleted_at + timedelta(hours=api.PROCESS_LOG_RETENTION_HOURS),
         }
 
-    def logs(self, sandbox_id: str) -> dict[str, Any]:
-        """§3.13: container stdout/stderr + exec history, retained 24 h after delete."""
+    def logs(self, sandbox_id: str, *, entrypoint_cursor: str | None = None) -> dict[str, Any]:
+        """§3.13: container stdout/stderr + exec history, retained 24 h after delete.
+
+        ``entrypoint_cursor`` is for a guest provider's entrypoint log (AB#419); a
+        sandbox here has no container, so it is not read.
+        """
         with self._lock:
             sandbox = self._sandboxes.get(sandbox_id)
             if sandbox is not None and sandbox.state != "deleted":
