@@ -39,7 +39,7 @@ RUN cmake -S /src -B /build -DCMAKE_BUILD_TYPE=Release \
       -DGGML_OPENMP=ON \
       -DLLAMA_OPENSSL=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
       -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
-    && cmake --build /build --target llama-cli -j"$(nproc)"
+    && cmake --build /build --target llama-cli llama-server llama-bench -j"$(nproc)"
 
 # The sapphirerapids variant uses Intel AMX. A CPU that reports AMX but does
 # not let the process enable it (a container, a sandbox) kills llama-cli with
@@ -50,7 +50,7 @@ RUN cmake -S /src -B /build -DCMAKE_BUILD_TYPE=Release \
 # A build that lost its CPU variants would still link and then run on the
 # slowest fallback, so fail here if the variants a Genoa host picks are absent.
 RUN mkdir -p /opt/llama/bin /opt/lfm3/licenses \
-    && cp -a /build/bin/llama-cli /build/bin/*.so* /opt/llama/bin/ \
+    && cp -a /build/bin/llama-cli /build/bin/llama-server /build/bin/llama-bench /build/bin/*.so* /opt/llama/bin/ \
     && cp /src/LICENSE /opt/lfm3/licenses/llama.cpp-LICENSE \
     && rm -f /opt/llama/bin/libggml-cpu-sapphirerapids.so \
     && ls /opt/llama/bin/libggml-cpu*.so \
@@ -75,8 +75,10 @@ LABEL org.opencontainers.image.title="Cathedral room: LFM3-1.7B" \
       org.cathedral.lfm3.gguf="LFM3-1.7B-Q4_K_M.gguf" \
       org.cathedral.lfm3.gguf-sha256="3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4"
 
+# curl and python are for the sealed benchmark (AB#763): it drives
+# llama-server over 127.0.0.1 and times llama-bench inside the room.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 libstdc++6 \
+    && apt-get install -y --no-install-recommends curl libgomp1 libstdc++6 python3 python-is-python3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/llama /opt/llama
@@ -84,9 +86,18 @@ COPY --from=build /opt/lfm3 /opt/lfm3
 COPY NOTICE /opt/lfm3/NOTICE
 COPY lfm3-ask /usr/local/bin/lfm3-ask
 # The libraries must resolve from /opt/llama/bin alone: the build tree is gone here.
+# Smoke check (AB#763): every tool the sealed benchmark needs is on PATH and
+# runs, or the build fails.
 RUN chmod 0755 /usr/local/bin/lfm3-ask \
-    && ln -s /opt/llama/bin/llama-cli /usr/local/bin/llama-cli \
+    && for tool in llama-cli llama-server llama-bench; do \
+         ln -s /opt/llama/bin/$tool /usr/local/bin/$tool \
+         && ! ldd /opt/llama/bin/$tool | grep 'not found' || exit 1; \
+       done \
     && chmod -R a+rX /opt/llama /opt/lfm3 \
-    && ! ldd /opt/llama/bin/llama-cli | grep 'not found'
+    && llama-cli --version \
+    && llama-server --version \
+    && llama-bench --help >/dev/null \
+    && python --version && python3 -c 'import json, urllib.request' \
+    && curl --version
 
 ENV LFM3_MODEL=/opt/lfm3/LFM3-1.7B-Q4_K_M.gguf
