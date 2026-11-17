@@ -69,6 +69,10 @@ type fakeHotel struct {
 	sealedExecPaths  []string
 	sealedExecBodies [][]byte
 	sealedExecAnswer []byte
+	// Cancel of a background exec (POST /v1/sandboxes/{id}/exec/cancel, AB#406).
+	execCancelPaths  []string
+	execCancelBodies [][]byte
+	execCancelAnswer []byte
 	// ownerScoped: list, delete and push snapshots only for the guest in the
 	// X-Cathedral-Guest header, as a hotel with per-guest ownership does
 	// (cathedral/sandbox_guest.py list_snapshots and delete_snapshot, AB#650).
@@ -291,6 +295,13 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Room-Receipt", "signed-sealed-exec")
 		w.WriteHeader(200)
 		_, _ = w.Write(f.sealedExecAnswer)
+	case strings.HasSuffix(p, "/exec/cancel") && r.Method == "POST":
+		f.execCancelPaths = append(f.execCancelPaths, p)
+		f.execCancelBodies = append(f.execCancelBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Room-Receipt", "signed-exec-cancel")
+		w.WriteHeader(200)
+		_, _ = w.Write(f.execCancelAnswer)
 	case strings.HasSuffix(p, "/exec") && r.Method == "POST":
 		f.execs = append(f.execs, req)
 		w.Header().Set("X-Room-Receipt", "signed-exec")
