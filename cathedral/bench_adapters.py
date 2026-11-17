@@ -57,6 +57,11 @@ def _measured_harbor_report(summary: Any) -> bool:
     names = [trial.get("task") for trial in trials]
     if any(not isinstance(name, str) for name in names) or set(names) != HARBOR_TB_TASKS:
         return False
+    sandbox_ids = [trial.get("sandbox_id") for trial in trials]
+    if any(not isinstance(sandbox_id, str) or not sandbox_id.strip() for sandbox_id in sandbox_ids):
+        return False
+    if len(set(sandbox_ids)) != len(trials):
+        return False
     expected_failures = []
     for trial in trials:
         exit_code = trial.get("exit_code")

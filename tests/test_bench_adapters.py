@@ -38,6 +38,7 @@ def test_harbor_index_honest_without_summary():
 def measured_summary():
     trials = [{
         "task": task,
+        "sandbox_id": f"sbx_{task}",
         "cost_estimated": False,
         "cost_usd": "0.01",
         "running_seconds": "3.5",
@@ -99,6 +100,12 @@ def test_harbor_index_rejects_incomplete_or_contradictory_reports():
     malformed_task = measured_summary()
     malformed_task["trials"][0]["task"] = []
     variants.append(malformed_task)
+    duplicate_sandbox = measured_summary()
+    duplicate_sandbox["trials"][0]["sandbox_id"] = duplicate_sandbox["trials"][1]["sandbox_id"]
+    variants.append(duplicate_sandbox)
+    missing_sandbox = measured_summary()
+    missing_sandbox["trials"][0].pop("sandbox_id")
+    variants.append(missing_sandbox)
     for variant in variants:
         mapped = harbor_index_from_terminal_bench_summary(deepcopy(variant))
         assert mapped["measured"] is False
