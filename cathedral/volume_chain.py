@@ -291,13 +291,13 @@ class VolumeRegistry:
             _not_shredded(volume)
             return volume.head_doc
 
-    def issue_prune_token(self, volume_id: str, *, prefix: str, source_ip: str, ttl_seconds: int) -> dict:
+    def issue_prune_token(self, volume_id: str, *, source_ip: str, ttl_seconds: int) -> dict:
         """A delete-scoped prune token for the control plane's prune runner (AB#398). Also valid after a shred."""
         from cathedral import volume_subtoken  # imports this module
 
         with self.lock:
             self._volume(volume_id)
-        return volume_subtoken.issue_prune(self.key, volume_id=volume_id, prefix=prefix, source_ip=source_ip,
+        return volume_subtoken.issue_prune(self.key, volume_id=volume_id, source_ip=source_ip,
                                            ttl_seconds=ttl_seconds, now=self.now)
 
     def log_entries(self) -> list[dict]:

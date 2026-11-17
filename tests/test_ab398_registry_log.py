@@ -265,7 +265,7 @@ def prune_call(registry, token, **kw):
 
 
 def prune_token(registry, **kw):
-    args = dict(prefix=PREFIX, source_ip=RUNNER_IP, ttl_seconds=300)
+    args = dict(source_ip=RUNNER_IP, ttl_seconds=300)
     args.update(kw)
     return registry.issue_prune_token("vol-1", **args)
 
@@ -302,16 +302,22 @@ def test_prune_token_limits(world):
     refused("op_not_allowed", prune_call, registry, token, op="head")
     forged = {**token, "statement": {**token["statement"], "prefix": "volumes/"}}
     refused("bad_signature", prune_call, registry, forged)
-    foreign = st.issue_prune(Ed25519PrivateKey.generate(), volume_id="vol-1", prefix=PREFIX,
+    foreign = st.issue_prune(Ed25519PrivateKey.generate(), volume_id="vol-1",
                              source_ip=RUNNER_IP, ttl_seconds=60, now=lambda: T0)
     refused("bad_signature", prune_call, registry, foreign)
-    refused("volume_unknown", registry.issue_prune_token, "vol-9", prefix=PREFIX, source_ip=RUNNER_IP,
-            ttl_seconds=60)
+    refused("volume_unknown", registry.issue_prune_token, "vol-9", source_ip=RUNNER_IP, ttl_seconds=60)
     refused("bad_ttl", prune_token, registry, ttl_seconds=0)
-    refused("bad_prefix", prune_token, registry, prefix="volumes/vol-1")
-    refused("prefix_not_volume", prune_token, registry, prefix="volumes/vol-2/")
-    refused("prefix_not_volume", prune_token, registry, prefix="volumes/vol-1/data/")
-    refused("prefix_not_volume", prune_token, registry, prefix="volumes/xvol-1/")
+    assert token["statement"]["prefix"] == PREFIX
+
+
+def test_prune_token_never_covers_another_volume(world):
+    _, registry, *_ = world
+    registry.create("volumes", "customer-2")  # a volume named like the root
+    token = registry.issue_prune_token("volumes", source_ip=RUNNER_IP, ttl_seconds=60)
+    assert token["statement"]["prefix"] == "volumes/volumes/"
+    refused("outside_prefix", prune_call, registry, token, key=PREFIX + "data/ab/abcd")
+    for bad in ("", "a/b", None):
+        refused("bad_volume_id", st.volume_prefix, bad)
 
 
 def test_prune_token_still_issued_after_shred(world):

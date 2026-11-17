@@ -38,6 +38,16 @@ ALLOWED_OPS = ("get", "put", "list")
 PRUNE_SCHEMA = "cathedral_volume_prune_token_v1"
 PRUNE_LABEL = b"cathedral.volume-prune-token.v1\n"
 PRUNE_OPS = ("delete", "get", "list", "put")
+# A prune token's prefix is built here, never taken from the caller, so a delete
+# token for one volume can never cover another volume's repo.
+VOLUME_ROOT = "volumes/"
+
+
+def volume_prefix(volume_id: str) -> str:
+    """The storage prefix of a volume's restic repo: volumes/<volume_id>/."""
+    if not isinstance(volume_id, str) or not volume_id or "/" in volume_id:
+        raise VolumeRefused("bad_volume_id")
+    return _check_prefix(VOLUME_ROOT + volume_id + "/")
 MAX_TTL_SECONDS = 3600
 MAX_PREFIX_LENGTH = 512
 
@@ -120,21 +130,17 @@ def authorize(token: dict, registry_public_b64: str, *, op: str, key: str, sourc
                   op=op, key=key, source_ip=source_ip, now=now)
 
 
-def issue_prune(registry_key: Ed25519PrivateKey, *, volume_id: str, prefix: str, source_ip: str,
+def issue_prune(registry_key: Ed25519PrivateKey, *, volume_id: str, source_ip: str,
                 ttl_seconds: int, now: Callable[[], float] = time.time) -> dict:
     """Sign a prune token for the control plane's prune runner. The caller has checked the volume exists."""
-    if not isinstance(volume_id, str) or not volume_id or len(volume_id) > MAX_PREFIX_LENGTH:
-        raise VolumeRefused("bad_volume_id")
-    # The prefix must be this volume's own: its last segment is the volume id.
-    if _check_prefix(prefix)[:-1].split("/")[-1] != volume_id:
-        raise VolumeRefused("prefix_not_volume")
+    prefix = volume_prefix(volume_id)
     if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool) or ttl_seconds <= 0:
         raise VolumeRefused("bad_ttl")
     issued_at = int(now())
     statement = {
         "schema": PRUNE_SCHEMA,
         "volume_id": volume_id,
-        "prefix": _check_prefix(prefix),
+        "prefix": prefix,
         "source_ip": _check_ip(source_ip),
         "ops": list(PRUNE_OPS),
         "issued_at": issued_at,

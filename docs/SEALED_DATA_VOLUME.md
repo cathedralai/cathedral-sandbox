@@ -495,12 +495,17 @@ Registry wiring:
   collide with them: a labelled message starts with `c`, canonical JSON with `{`.
 - Prune token `cathedral_volume_prune_token_v1`
   (`volume_subtoken.issue_prune`, `VolumeRegistry.issue_prune_token`,
-  `authorize_prune`): its own label, never issued against a lease, bound to a
-  prefix whose last segment is the volume id, the prune runner's address and at most one hour. It is the only
+  `authorize_prune`): its own label, never issued against a lease, bound to
+  `volumes/<volume_id>/` (built from the volume id, never taken from the
+  caller, so it cannot cover another volume), the prune runner's address and at most one hour. It is the only
   token that carries `delete`; it also carries get, put and list, because restic
   prune reads packs and writes index and lock files. The guest sub-token
   (`authorize`) never allows delete, and neither token passes the other's check.
   It is still issued after a shred, so the data can be cleaned up.
+
+A volume with no accepted commit cannot be shredded yet (`nothing_to_shred`):
+the log format has no shred entry without a head. Packs a guest uploaded before
+its first commit was accepted are left to prune.
 
 Still open for AB#398: the commit every N minutes with a receipt (needs the
 guest volume agent and pinned restic, AB#789), the customer-held root key mode
