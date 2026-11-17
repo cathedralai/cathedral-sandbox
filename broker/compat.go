@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -78,6 +79,7 @@ type compatImage struct {
 type compatExec struct {
 	ID     string
 	room   string // uuid
+	guest  string // the guest that started it: the bounds count per guest (AB#752)
 	done   chan struct{}
 	cancel context.CancelFunc
 	result map[string]any
@@ -175,9 +177,15 @@ func (b *broker) hotelExec(ctx context.Context, rm *room, body map[string]any, t
 }
 
 // hotelExecH is hotelExec with the hotel's response headers (the signed receipt).
+// It reads at most execAnswerMaxBytes of the answer (AB#752).
 func (b *broker) hotelExecH(ctx context.Context, rm *room, body map[string]any, timeout int) (int, http.Header, map[string]any, error) {
-	return b.hotelExecKept(ctx, rm, body, timeout, nil)
+	return b.hotelExecRead(ctx, rm, body, timeout, nil, answerRead{maxBytes: execAnswerMaxBytes, pool: b.answers, owner: rm.guest})
 }
+
+// execAnswerMaxBytes bounds one hotel exec answer read by the compat routes:
+// two output streams, each capped at execOutputCapBytes by the hotel, at most
+// six bytes of JSON each (a \uXXXX escape), plus 1 MiB for the rest.
+var execAnswerMaxBytes int64 = 2*6*execOutputCapBytes + 1<<20
 
 // clampExecTimeout is the time limit the hotel exec runs under.
 func (b *broker) clampExecTimeout(timeout int) int {
@@ -191,15 +199,23 @@ func (b *broker) clampExecTimeout(timeout int) int {
 // sends its exec handle, so the receipts front keeps the answer for a broker
 // that restarts while the command runs (AB#756).
 func (b *broker) hotelExecKept(ctx context.Context, rm *room, body map[string]any, timeout int, extra http.Header) (int, http.Header, map[string]any, error) {
+	return b.hotelExecRead(ctx, rm, body, timeout, extra, answerRead{})
+}
+
+// hotelExecRead is hotelExecKept under an answerRead (doHeadersMax).
+func (b *broker) hotelExecRead(ctx context.Context, rm *room, body map[string]any, timeout int, extra http.Header, lim answerRead) (int, http.Header, map[string]any, error) {
 	timeout = b.clampExecTimeout(timeout)
 	body["timeout_seconds"] = timeout
 	raw, _ := json.Marshal(body)
-	status, hdr, out, err := rm.h.doHeaders(ctx, rm.h.cfg.API, "POST", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/exec", nil, raw, time.Duration(timeout+60)*time.Second, extra)
+	status, hdr, out, release, err := rm.h.doHeadersMax(ctx, rm.h.cfg.API, "POST", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/exec", nil, raw, time.Duration(timeout+60)*time.Second, extra, lim)
 	if err != nil {
 		return 0, nil, nil, err
 	}
 	var doc map[string]any
 	_ = json.Unmarshal(out, &doc)
+	// The decoded output is no larger than the answer it came from, and the
+	// callers clip it (clipExecDoc) before they keep or send it.
+	release()
 	return status, hdr, doc, nil
 }
 
@@ -726,7 +742,7 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	case tail == "network" && (r.Method == "PUT" || r.Method == "POST" || r.Method == "PATCH"):
 		b.compatSetNetwork(w, r, rm, id)
 	case tail == "execs" && r.Method == "POST":
-		b.compatIdem(w, r, g, func(w http.ResponseWriter, raw []byte) { b.compatExecStart(w, rm, id, raw) })
+		b.compatIdem(w, r, g, func(w http.ResponseWriter, raw []byte) { b.compatExecStart(w, g, rm, id, raw) })
 	case strings.HasPrefix(tail, "execs/"):
 		b.compatExecPoll(w, r, id, strings.TrimPrefix(tail, "execs/"))
 	case tail == "files" && r.Method == "PUT":
@@ -883,15 +899,16 @@ func compatExecBody(raw []byte, maxExec int) (map[string]any, int, error) {
 	return body, timeout, nil
 }
 
-func (b *broker) compatExecStart(w http.ResponseWriter, rm *room, roomUUID string, raw []byte) {
+func (b *broker) compatExecStart(w http.ResponseWriter, g *guestState, rm *room, roomUUID string, raw []byte) {
 	body, timeout, err := compatExecBody(raw, b.maxExec())
 	if err != nil {
 		compatErr(w, 400, "invalid_exec", err.Error(), 0)
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	ex := &compatExec{ID: newUUID(), room: roomUUID, done: make(chan struct{}), cancel: cancel, state: "running"}
+	ex := &compatExec{ID: newUUID(), room: roomUUID, guest: g.cfg.ID, done: make(chan struct{}), cancel: cancel, state: "running"}
 	b.compat.mu.Lock()
+	b.compat.pruneExecsLocked(time.Now())
 	b.compat.execs[ex.ID] = ex
 	b.compat.mu.Unlock()
 	go func() {
@@ -902,16 +919,20 @@ func (b *broker) compatExecStart(w http.ResponseWriter, rm *room, roomUUID strin
 		ex.doneAt = time.Now()
 		switch {
 		case ex.state == "killed":
+		case errors.Is(herr, errAnswerTooLarge):
+			ex.state, ex.result = "lost", map[string]any{"message": "the hotel answer was over the size the broker reads"}
 		case herr != nil:
 			ex.state, ex.result = "lost", map[string]any{"message": "the hotel did not answer"}
 		case status != 200:
 			ex.state, ex.result = "lost", map[string]any{"message": fmt.Sprintf("hotel answered %d", status)}
 		default:
+			clipExecDoc(doc) // each stream at most execOutputCapBytes, as the sync exec answers
 			ex.state, ex.result = "exited", doc
 			if t, _ := doc["timed_out"].(bool); t {
 				ex.state = "timed_out"
 			}
 		}
+		b.compat.pruneExecsLocked(ex.doneAt)
 	}()
 	writeJSON(w, 202, map[string]any{"exec_id": ex.ID, "state": "running"})
 }
@@ -928,6 +949,7 @@ func (b *broker) compatExecPoll(w http.ResponseWriter, r *http.Request, roomUUID
 		b.compat.mu.Lock()
 		if ex.state == "running" {
 			ex.state = "killed"
+			ex.doneAt = time.Now() // the bounds count a stopped exec as finished from here
 			ex.result = map[string]any{"message": "stopped on request; the command may run on inside the room until its timeout"}
 		}
 		b.compat.mu.Unlock()

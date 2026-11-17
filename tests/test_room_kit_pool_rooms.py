@@ -874,6 +874,31 @@ def test_a_params_suffix_on_the_path_is_read_as_the_api_reads_it_by_the_claim_an
     assert_idle(front.ledger)
 
 
+def test_an_encoded_pool_room_id_cannot_bypass_the_unclaimed_gate(front) -> None:
+    room = pool_room(front)
+    encoded = "%73" + room[1:]
+    seen = len(front.api.seen)
+    status, headers, out = front.call("POST", f"/v1/sandboxes/{encoded}/exec", {"cmd": ["true"]})
+    assert status == 400 and code(out) == "non_canonical_room_id"
+    assert "X-Room-Receipt" not in headers and len(front.api.seen) == seen
+    assert room in front.ledger.pool
+    assert_idle(front.ledger)
+
+
+def test_an_encoded_stale_pool_room_id_cannot_bypass_the_restart_gate(tmp_path, front) -> None:
+    room = pool_room(front)
+    second = Restarted(front, tmp_path / "second")
+    try:
+        assert room in second.ledger.pool_stale
+        seen = len(front.api.seen)
+        encoded = "%73" + room[1:]
+        status, headers, out = second.call("POST", f"/v1/sandboxes/{encoded}/exec", b'{"cmd":["true"]}')
+        assert status == 400 and code(out) == "non_canonical_room_id"
+        assert "X-Room-Receipt" not in headers and len(front.api.seen) == seen
+    finally:
+        second.close()
+
+
 def test_routes_added_for_terminals_and_exec_results_on_an_unclaimed_and_a_claimed_room(front) -> None:
     room = pool_room(front)
     base = f"/v1/sandboxes/{room}"

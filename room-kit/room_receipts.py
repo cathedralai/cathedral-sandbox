@@ -3085,6 +3085,11 @@ class Handler(BaseHTTPRequestHandler):
         # Same path form as cathedral/sandbox_server.dispatch (urlparse): a
         # ";alias" suffix must not bypass the serial gate or mis-name a receipt.
         path, forward_path = api_request_path(self.path)
+        room = room_of(path)
+        if room is not None and unquote(room) != room:
+            # The room API decodes route parameters after matching. A different spelling would miss this
+            # front's pool/serial marks, then reach the same room after the API decodes it.
+            return self.reply(400, b'{"error":{"code":"non_canonical_room_id","message":"room id must use its canonical spelling"}}')
         ledger: Ledger = self.server.ledger
         if self.command == "GET" and path == "/room/attestation":
             return self.reply(200, canonical(ledger.attestation()))
@@ -3155,7 +3160,6 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return self.reply(401, b'{"error":"unauthorized"}')
             return self.handle_exec_result(m["id"])
-        room = room_of(path)
         if not self.server.pool_scan_ready and self.authorized() and (
                 room or (self.command in ("POST", "DELETE") and path == "/v1/sandboxes")):
             # Until the startup list is read no room traffic passes, and no create or bulk delete either: a pool
