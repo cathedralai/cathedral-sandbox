@@ -6,8 +6,8 @@ older head, or rewriting the log) is visible to anyone who kept an earlier copy
 or checkpoint. A crypto-shred is a terminal log entry plus a signed receipt;
 after it, `check_restore` refuses the volume.
 
-Pure functions only: no I/O, no publishing, no wiring. The volume agent, the
-commit timer, the lease and the scoped tokens come from AB#395. The
+Pure functions only: no I/O, no publishing. VolumeRegistry (volume_chain.py)
+appends to it on every accepted head and on a shred. The
 `commit_receipt_sha256` field binds an entry to the 395 commit receipt (the
 one signed by the lease holder); this module treats it as an opaque digest.
 """
