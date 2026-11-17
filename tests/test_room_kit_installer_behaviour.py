@@ -777,6 +777,7 @@ def test_host_net_up_orders_the_guest_rules_and_down_removes_them(host: FakeHost
 
 
 def test_host_net_check_restores_missing_rules_and_leaves_present_ones(host: FakeHost) -> None:
+    (host.state / "active-units").write_text("room-sealed-sealed-1.service\n")
     proc = _run_host_net(host, "check", FAKE_IPTABLES_RULES="present")
     assert proc.returncode == 0 and proc.stdout == ""
     assert not [c for c in host.calls("iptables") if " -A " in c or " -I " in c], "present rules were rewritten"
@@ -812,6 +813,7 @@ def test_host_net_refuses_to_move_the_link_of_a_running_guest(host: FakeHost) ->
     # c46-sealed-2 runs on 10.231.78.5/.6; a sealed.env naming another pair must not
     # cut the running guest's NAT (the check timer would run "up" with the new pair).
     link = {"SEALED_TAP": "snpc46s1", "SEALED_HOST_IP": "10.231.78.13", "SEALED_GUEST_IP": "10.231.78.14"}
+    (host.state / "active-units").write_text("room-sealed-sealed-1.service\n")
     for action in ("clash", "up", "check"):
         proc = _run_host_net(host, action, link, FAKE_IP_ADDRS="snpc46s1=10.231.78.5/30")
         assert proc.returncode == 1, action
@@ -821,11 +823,37 @@ def test_host_net_refuses_to_move_the_link_of_a_running_guest(host: FakeHost) ->
         assert not [c for c in host.calls("ip") if "addr replace" in c], action
 
 
-def _sibling_unit(host: FakeHost, name: str, **sealed: str) -> None:
-    env = host.tmp / f"{name}.env"
-    env.write_text("".join(f"{k}={v}\n" for k, v in {"SEALED_NAME": name, **sealed}.items()))
-    unit = host.root / "etc" / "systemd" / "system" / f"room-sealed-{name}.service"
-    unit.write_text(f"[Service]\nExecStartPre=/srv/x/host-net.sh up {env}\nExecStart=/srv/x/launch-guest.sh {env}\n")
+def _sibling_unit(host: FakeHost, name: str, env: Path | None = None, **sealed: str) -> None:
+    """A guest unit and its -net check unit, as install-sealed.sh writes them."""
+    if env is None:
+        env = host.tmp / f"{name}.env"
+        env.write_text("".join(f"{k}={v}\n" for k, v in {"SEALED_NAME": name, **sealed}.items()))
+    units = host.root / "etc" / "systemd" / "system"
+    (units / f"room-sealed-{name}.service").write_text(
+        f"[Service]\nExecStartPre=/srv/x/host-net.sh up {env}\nExecStart=/srv/x/launch-guest.sh {env}\n")
+    (units / f"room-sealed-{name}-net.service").write_text(f"[Service]\nExecStart=/srv/x/host-net.sh check {env}\n")
+
+
+def test_host_net_does_not_count_the_hotels_own_units_as_siblings(host: FakeHost) -> None:
+    # Spec review: room-sealed-<name>-net.service names the hotel's own sealed.env. Matching
+    # it would refuse every start of every hotel after install wrote the units.
+    link = {"SEALED_TAP": "snp1", "SEALED_HOST_IP": "10.215.0.5", "SEALED_GUEST_IP": "10.215.0.6"}
+    env = host.sealed_env(**link)
+    _sibling_unit(host, "sealed-1", env=env)
+    _sibling_unit(host, "renamed-copy", env=env)  # same sealed.env under another unit name
+    for action in ("clash", "up"):
+        proc = host.run(host.kit / "sealed" / "host-net.sh", action, str(env),
+                        env={"FAKE_IP_ADDRS": "snp0=10.215.0.1/30 snp1=10.215.0.5/30"})
+        assert proc.returncode == 0, (action, proc.stderr[-2000:])
+    assert "ip addr replace 10.215.0.5/30 dev snp1" in host.calls("ip")
+
+
+def test_host_net_check_leaves_a_stopped_guests_link_down(host: FakeHost) -> None:
+    # The -net timer runs every minute. After "systemctl stop" (a link move) it must not
+    # bring the old tap and NAT back, or install refuses the move it was asked to make.
+    proc = _run_host_net(host, "check")
+    assert proc.returncode == 0 and "restoring" not in proc.stderr
+    assert not host.calls("iptables") and not [c for c in host.calls("ip") if "addr replace" in c or "tuntap" in c]
 
 
 def test_host_net_refuses_the_link_a_stopped_sibling_hotel_is_set_to(host: FakeHost) -> None:
@@ -843,10 +871,14 @@ def test_host_net_refuses_the_link_a_stopped_sibling_hotel_is_set_to(host: FakeH
     assert proc.returncode == 0, proc.stderr
 
 
-def test_host_net_down_still_removes_the_tap_with_a_bad_link(host: FakeHost) -> None:
-    proc = _run_host_net(host, "down", {"SEALED_HOST_IP": "10.215.0.4", "SEALED_GUEST_IP": "10.215.0.5"})
+@pytest.mark.parametrize("link", [{"SEALED_HOST_IP": "10.215.0.4", "SEALED_GUEST_IP": "10.215.0.5"},
+                                  {"SEALED_HOST_IP": "10.215.0.5"}, {"SEALED_GUEST_IP": "10.215.0.6"}])
+def test_host_net_down_still_removes_the_tap_with_a_bad_link(host: FakeHost, link: dict[str, str]) -> None:
+    proc = _run_host_net(host, "down", link)
     assert proc.returncode == 0, proc.stderr[-3000:]
     assert host.calls("ip link del") == ["ip link del snp0"]
+    if len(link) == 1:
+        return
     proc = _run_host_net(host, "up", {"SEALED_HOST_IP": "10.215.0.4", "SEALED_GUEST_IP": "10.215.0.5"})
     assert proc.returncode == 1 and "one /30" in proc.stderr
 
@@ -975,6 +1007,7 @@ def test_host_net_miner_forwards_one_public_port_to_the_guest_https_port(host: F
             "--comment sealed-hotel:sealed-1 -j DNAT --to-destination 10.215.0.2:18443")
     assert dnat in ipt
     # The fake lists 5 rules per chain: enough for a config hotel, too few for a miner hotel (7).
+    (host.state / "active-units").write_text("room-sealed-sealed-1.service\n")
     proc = _run_host_net(host, "check", MINER, FAKE_IPTABLES_RULES="present")
     assert proc.returncode == 0 and "were missing; restoring" in proc.stderr
     assert any(c.startswith("iptables -t nat -C PREROUTING -p tcp --dport 9443") for c in host.calls("iptables"))

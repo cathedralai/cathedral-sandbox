@@ -14,6 +14,7 @@ source "${2:?sealed.env}"
 # A bad link stops every action but "down", which must still remove the tap.
 # shellcheck disable=SC1091
 source "$(dirname "$(readlink -f "$0")")/guest-constants.sh" || [ "${1:-}" = down ] || exit 1
+ENV=$2
 TAP=$SEALED_TAP
 FWD=SEALED-${TAP^^}-FWD
 IN=SEALED-${TAP^^}-IN
@@ -31,7 +32,8 @@ RULES=5; [ "$MINER" = 1 ] && RULES=7
 # - a /30 another sealed hotel unit on this host is set to use (stopped or not),
 # - a move of this hotel's own link while its guest runs (its tap holds another
 #   address): the running guest would lose its NAT. Drain, stop the unit (its
-#   stop removes the old link), retarget any broker tunnel, then start.
+#   stop removes the old link; "check" leaves a stopped guest's link down),
+#   retarget any broker tunnel, then install.
 link_clash() {
   local net dev cidr a p unit env other
   net=$(( $(sealed_ip_int "$SEALED_HOST_IP") - 1 ))
@@ -48,10 +50,12 @@ link_clash() {
       return 1
     fi
   done < <(ip -4 -o addr show)
+  # Only guest units (ExecStart launch-guest.sh), not the -net check units, and
+  # not this hotel's own (same unit name or the same sealed.env).
   for unit in "${ROOM_DESTDIR:-}"/etc/systemd/system/room-sealed-*.service; do
     [ -f "$unit" ] && [ "$unit" != "${ROOM_DESTDIR:-}/etc/systemd/system/room-sealed-$SEALED_NAME.service" ] || continue
-    env=$(sed -n 's/^ExecStart=.* \([^ ]*\)$/\1/p' "$unit" | head -1)
-    [ -r "$env" ] || continue
+    env=$(sed -n 's/^ExecStart=[^ ]*\/launch-guest\.sh \([^ ]*\)$/\1/p' "$unit" | head -1)
+    [ -n "$env" ] && [ -r "$env" ] && ! [ "$env" -ef "$ENV" ] || continue
     other=$(bash -c 'set +eu; source "$1" >/dev/null 2>&1; echo "${SEALED_HOST_IP:-10.215.0.1}"' _ "$env")
     a=$(sealed_ip_int "$other") || continue
     if sealed_cidr_overlap "$net" 30 "$(( a - 1 ))" 30; then
@@ -98,6 +102,11 @@ up)
   fi
   ;;
 check)
+  # A stopped guest needs no link: do not bring its tap back (a link move is
+  # drain, stop, edit sealed.env, install). Only the timer runs "check".
+  if command -v systemctl >/dev/null && ! systemctl is-active -q "room-sealed-$SEALED_NAME.service"; then
+    exit 0
+  fi
   # Put the rules back when a firewall reload took them (idempotent "up").
   if iptables -C FORWARD -m comment --comment "$TAG" -j "$FWD" 2>/dev/null \
      && iptables -C INPUT -m comment --comment "$TAG" -j "$IN" 2>/dev/null \

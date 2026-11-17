@@ -11,14 +11,18 @@
 # defaults share one measurement per build. The MAC follows sealed.env as
 # before #467, so an older image started by a newer launch-guest.sh (a
 # rollback) still finds its uplink. DNS stays an image constant.
-if { [ -n "${SEALED_HOST_IP:-}" ] && [ -z "${SEALED_GUEST_IP:-}" ]; } || { [ -z "${SEALED_HOST_IP:-}" ] && [ -n "${SEALED_GUEST_IP:-}" ]; }; then
-  echo "sealed: set both SEALED_HOST_IP and SEALED_GUEST_IP in sealed.env, or neither (default 10.215.0.1 and 10.215.0.2)" >&2
-  return 1
-fi
+SEALED_LINK_HALF=0
+if [ -n "${SEALED_HOST_IP:-}" ] && [ -z "${SEALED_GUEST_IP:-}" ]; then SEALED_LINK_HALF=1; fi
+if [ -z "${SEALED_HOST_IP:-}" ] && [ -n "${SEALED_GUEST_IP:-}" ]; then SEALED_LINK_HALF=1; fi
+# Defaults first, so a caller that goes on after a refusal (host-net.sh down) has values.
 SEALED_HOST_IP=${SEALED_HOST_IP:-10.215.0.1}
 SEALED_GUEST_IP=${SEALED_GUEST_IP:-10.215.0.2}
 SEALED_GUEST_MAC=${SEALED_GUEST_MAC:-52:54:00:5e:a1:ed}
 SEALED_DNS="1.1.1.1 8.8.8.8"
+if [ "$SEALED_LINK_HALF" = 1 ]; then
+  echo "sealed: set both SEALED_HOST_IP and SEALED_GUEST_IP in sealed.env, or neither (default 10.215.0.1 and 10.215.0.2)" >&2
+  return 1
+fi
 
 # The pair must be the two usable addresses of one private /30 (host first),
 # and the /30 must not overlap a network the guest uses inside: the Docker
