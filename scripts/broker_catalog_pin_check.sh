@@ -38,7 +38,14 @@ ALLOW=${ALLOW_CATALOG_DIGEST:-}
 
 # Expected: main's committed digest after a fresh fetch from the real repository.
 url=$(git -C "$REPO" remote get-url origin 2>/dev/null) || refuse "$REPO has no origin remote"
-[[ "$url" =~ [:/]cathedralai/cathedral-sandbox(\.git)?/?$ ]] || refuse "origin is $url, not cathedralai/cathedral-sandbox"
+if [[ "$url" =~ ^https://([A-Za-z0-9._~%:-]+@)?github\.com/cathedralai/cathedral-sandbox(\.git)?/?$ ]] ||
+   [[ "$url" =~ ^git@github\.com:cathedralai/cathedral-sandbox(\.git)?$ ]] ||
+   [[ "$url" =~ ^ssh://git@github\.com/cathedralai/cathedral-sandbox(\.git)?/?$ ]]; then
+  :
+else
+  # Do not echo the remote: its userinfo may contain a token.
+  refuse "origin is not github.com/cathedralai/cathedral-sandbox"
+fi
 git -C "$REPO" fetch -q origin +refs/heads/main:refs/remotes/origin/main 2>&1 || refuse "could not fetch main; a stale origin/main could pass an old catalog"
 MAIN_SHA=$(git -C "$REPO" rev-parse --short origin/main) || refuse "no origin/main"
 EXPECTED=$(git -C "$REPO" show origin/main:broker/catalog.digest 2>/dev/null | tr -d '\r\n') || true

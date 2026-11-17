@@ -4,8 +4,8 @@
 // removes hotels with the operator key (config "operator_key_sha256"):
 //
 //	GET    /v1/broker/hotels/<id>   the hotel document with its admission state
-//	POST   /v1/broker/hotels        {id, name, api, health, key, concurrency, labels, threads, ram_gib, sealed, max_slots, reserved_for, miner_hotkey, require_attestation}
-//	PATCH  /v1/broker/hotels/<id>   {drain, labels, reserved_for, max_slots, lend}  (reserved_for null: back to the pool; lend and reclaim: lend.go)
+//	POST   /v1/broker/hotels        {id, name, api, health, key, concurrency, labels, threads, ram_gib, sealed, max_slots, reserved_for, miner_hotkey, require_attestation, commitment}
+//	PATCH  /v1/broker/hotels/<id>   {drain, drain_notice, labels, reserved_for, max_slots, lend}  (reserved_for null: back to the pool; lend and reclaim: lend.go; drain_notice: drain_notice.go)
 
 //	DELETE /v1/broker/hotels/<id>   (only a hotel with no rooms; drain it first)
 //
@@ -103,10 +103,31 @@ func fixedLabels(hc hotelConfig, labels map[string]string) map[string]string {
 }
 
 // labels and drain read the fields an operator PATCH may change at any time.
+// A miner hotel also carries the computed label graduated=true once it is off
+// probation (probation.go; with probation off, at once), so a shared-pool
+// policy can select graduated miners by label. A stored "graduated" label is
+// dropped while the hotel is on probation: the label cannot be set by hand.
 func (h *hotel) labels() map[string]string {
 	h.cfgMu.RLock()
-	defer h.cfgMu.RUnlock()
-	return h.cfg.Labels
+	l := h.cfg.Labels
+	h.cfgMu.RUnlock()
+	if h.cfg.MinerHotkey == "" {
+		return l
+	}
+	on := h.inProbation()
+	if (on && l["graduated"] == "") || (!on && l["graduated"] == "true") {
+		return l
+	}
+	out := make(map[string]string, len(l)+1)
+	for k, v := range l {
+		out[k] = v
+	}
+	if on {
+		delete(out, "graduated")
+	} else {
+		out["graduated"] = "true"
+	}
+	return out
 }
 
 // reservedFor is the guest the hotel is reserved for, or "" for a pool hotel.
@@ -141,6 +162,7 @@ func (b *broker) addHotelWithCapCheck(h *hotel, checkCaps bool) error {
 	if h.caps == nil && b.capsOnDisk[h.cfg.ID] != nil { // a runtime hotel keeps its probe results
 		h.caps = b.capsOnDisk[h.cfg.ID]
 	}
+	b.initProbation(h)
 	b.mu.Unlock()
 	b.hotelsMu.Lock()
 	defer b.hotelsMu.Unlock()
@@ -275,7 +297,8 @@ func (b *broker) isMinerEnroller(r *http.Request) bool {
 }
 
 // isOperatorReader is true for the read-only operator key. ServeHTTP checks
-// it on one route only (GET /v1/broker/capacity); every other route ignores it.
+// it on two read routes only (GET /v1/broker/capacity and GET
+// /v1/broker/miner-exits); every other route ignores it.
 func (b *broker) isOperatorReader(r *http.Request) bool {
 	want := strings.ToLower(b.cfg.OperatorReadKeySHA256)
 	a := r.Header.Get("Authorization")
@@ -381,6 +404,9 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	case hc.RequireAttestation && !hc.Sealed:
 		writeErr(w, 400, "invalid_hotel", "require_attestation needs a sealed hotel")
 		return
+	case hc.GuestTLS && !hc.Sealed:
+		writeErr(w, 400, "invalid_hotel", "guest_tls needs a sealed hotel")
+		return
 	case hc.SealedAdmission == sealedAdmissionOff:
 		writeErr(w, 400, "invalid_hotel", `sealed_admission "off" is only for an operator hotel in the config file; a joined hotel is always gated`)
 		return
@@ -395,8 +421,20 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	case hc.MaxSlots < 0:
 		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
 		return
+	case !validAlertChat(hc.AlertChatID):
+		writeErr(w, 400, "invalid_hotel", "alert_chat_id must be a Telegram chat id (digits) or @channel")
+		return
 	case hc.LentFrom != "" || hc.LentReportID != "":
 		writeErr(w, 400, "invalid_hotel", `lent_from and lent_report_id are set by PATCH {"lend": true}, not at join`)
+		return
+	case hc.DrainNotice != nil:
+		writeErr(w, 400, "invalid_hotel", `drain_notice is set by PATCH {"drain": true, "drain_notice": ...}, not at join`)
+		return
+	}
+	if err := b.checkJoinCommitment(hc); err != nil {
+		var ce errCommitment
+		errors.As(err, &ce)
+		writeErr(w, ce.status, ce.code, ce.msg)
 		return
 	}
 	if b.cfg.StateDir == "" {
@@ -410,12 +448,16 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	if hc.RequireAttestation {
 		b.noteRequireAttestation(hc.ID)
 	}
-	if hc.MinerHotkey != "" {
+	// A miner hotel, a "guest_tls" hotel and, with require_sealed_guest_tls,
+	// every sealed hotel join over the guest's attested TLS key (AB#378).
+	var joinChip string // CHIP_ID of the verified join binding; a later re-pin must stay on it
+	if hc.MinerHotkey != "" || (hc.Sealed && (hc.GuestTLS || b.cfg.RequireSealedGuestTLS)) {
 		if hc.TLSSPKISHA256 != "" || (req.Verify != nil && !*req.Verify) ||
 			!strings.HasPrefix(hc.API, "https://") || !strings.HasPrefix(hc.Health, "https://") {
-			writeErr(w, 409, "guest_tls_required", "miner join needs verified guest HTTPS; the broker derives its TLS pin from attestation")
+			writeErr(w, 409, "guest_tls_required", "this join needs verified guest HTTPS; the broker derives its TLS pin from attestation")
 			return
 		}
+		hc.GuestTLS = hc.GuestTLS || hc.MinerHotkey == ""
 		// This request has no bearer key. Verify that the observed TLS key is
 		// committed by the AMD-verified SNP report before constructing a hotel
 		// client that holds the key supplied in the join body.
@@ -428,7 +470,16 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 			writeErr(w, 422, "attestation_failed", "the miner guest TLS attestation did not pass: "+err.Error())
 			return
 		}
+		var bd snpBinding
+		_ = json.Unmarshal(attestationBinding(rawAtt), &bd)
+		// A non-miner guest must be this hotel's: a re-pin after a reboot requires the
+		// same name, so a mismatch accepted here would strand the hotel later.
+		if hc.MinerHotkey == "" && bd.Hotel != hc.ID {
+			writeErr(w, 422, "attestation_failed", "the attested guest is hotel \""+bd.Hotel+"\", not \""+hc.ID+"\"")
+			return
+		}
 		hc.TLSSPKISHA256 = peerSPKI
+		joinChip = bd.ChipID
 	}
 	if hc.Name == "" {
 		hc.Name = hc.ID
@@ -443,6 +494,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	}
 	h := newHotel(hc, req.Key)
 	h.runtime = true
+	h.pinChip = joinChip
 	if req.Verify == nil || *req.Verify {
 		var st map[string]any
 		if err := h.getJSON(r.Context(), hc.API, "/v1/status", nil, &st); err != nil {
@@ -542,6 +594,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		writeErr(w, 500, "state_write_failed", "cannot keep the runtime hotel list")
 		return
 	}
+	b.saveProbationLogged() // a rejoin under an old id must not inherit its saved probation
 	go b.syncLoop(ctx, h)
 	writeJSON(w, 201, b.hotelDoc(h))
 }
@@ -562,17 +615,39 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		Drain       *bool             `json:"drain"`
 		MaxSlots    *int              `json:"max_slots"` // per-hotel room cap; 0: the hotel's own slots
 		Labels      map[string]string `json:"labels"`
-		ReservedFor json.RawMessage   `json:"reserved_for"` // a guest id, or null to release; on a lent hotel, the reclaim (lend.go)
-		Lend        *bool             `json:"lend"`         // true: lend the reserved hotel to the pool (lend.go)
+		ReservedFor json.RawMessage   `json:"reserved_for"`  // a guest id, or null to release; on a lent hotel, the reclaim (lend.go)
+		Lend        *bool             `json:"lend"`          // true: lend the reserved hotel to the pool (lend.go)
+		DrainNotice json.RawMessage   `json:"drain_notice"`  // a signed planned-maintenance notice; needs drain=true (drain_notice.go)
+		AlertChatID *string           `json:"alert_chat_id"` // the miner operator's alert chat; "" clears (alerts.go)
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if json.Unmarshal(raw, &req) != nil {
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
 	}
-	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0 || req.Lend != nil) {
-		writeErr(w, 403, "enroller_scope", "miner enrollment may only set drain=true")
+	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0 || req.Lend != nil || req.AlertChatID != nil) {
+		writeErr(w, 403, "enroller_scope", "miner enrollment may only set drain=true, with or without a drain_notice")
 		return
+	}
+	var notice *drainNotice
+	if len(req.DrainNotice) > 0 && string(req.DrainNotice) != "null" {
+		if h.cfg.MinerHotkey == "" {
+			writeErr(w, 400, "invalid_drain_notice", "a drain_notice is only for a miner hotel")
+			return
+		}
+		if req.Drain == nil || !*req.Drain {
+			writeErr(w, 400, "invalid_drain_notice", "a drain_notice needs drain=true in the same request")
+			return
+		}
+		n, err := parseDrainNotice(req.DrainNotice)
+		if err == nil {
+			err = checkDrainNotice(n, h, time.Now())
+		}
+		if err != nil {
+			writeErr(w, 400, "invalid_drain_notice", err.Error())
+			return
+		}
+		notice = &n
 	}
 	if req.Drain != nil && !*req.Drain && b.minerOverCap(h) {
 		writeErr(w, 409, "miner_cap_reached", "hotel is outside the current miner admission caps")
@@ -580,6 +655,15 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	}
 	if req.MaxSlots != nil && *req.MaxSlots < 0 {
 		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
+		return
+	}
+	if req.AlertChatID != nil && !validAlertChat(*req.AlertChatID) {
+		writeErr(w, 400, "invalid_hotel", "alert_chat_id must be a Telegram chat id (digits) or @channel")
+		return
+	}
+	if req.AlertChatID != nil && !h.runtime {
+		// A config file hotel's PATCH is not saved: the chat would be lost on restart.
+		writeErr(w, 409, "hotel_in_config", "hotel "+id+" is in the config file; set alert_chat_id there")
 		return
 	}
 	if h.runtime && !h.cfg.Sealed && req.Labels["sealed"] == "true" {
@@ -620,6 +704,23 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	}
 	h.cfgMu.Lock()
 	oldCfg := h.cfg
+	// A resent notice (same notice_id) keeps its first received_at, so a
+	// retry cannot shorten its lead. A new notice may not replace one whose
+	// window is still open.
+	var newNotice *drainNoticeRecord
+	if notice != nil {
+		cur := h.cfg.DrainNotice
+		switch {
+		case cur != nil && cur.Notice.NoticeID == notice.NoticeID:
+		case cur != nil && time.Now().Unix() < cur.Notice.Until:
+			h.cfgMu.Unlock()
+			b.mu.Unlock()
+			writeErr(w, 409, "drain_notice_active", fmt.Sprintf("hotel %s has an open maintenance window until %d", h.cfg.ID, cur.Notice.Until))
+			return
+		default:
+			newNotice = &drainNoticeRecord{Notice: *notice, ReceivedAt: time.Now().Unix()}
+		}
+	}
 	// The lend or reclaim is checked again under the locks pick takes, and
 	// the other fields apply only when it passes.
 	if e := lc.applyLend(h); e != nil {
@@ -630,6 +731,12 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	}
 	if req.Drain != nil {
 		h.cfg.Drain = *req.Drain
+		if !*req.Drain {
+			h.cfg.DrainNotice = nil // the operator ended the maintenance
+		}
+	}
+	if newNotice != nil {
+		h.cfg.DrainNotice = newNotice
 	}
 	if req.Labels != nil {
 		// The sealed and miner labels stay: guests select and deny by them.
@@ -641,9 +748,19 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	if reserve != nil && !lc.reclaim { // a reclaim set reserved_for in applyLend
 		h.cfg.ReservedFor = *reserve
 	}
+	if req.AlertChatID != nil {
+		h.cfg.AlertChatID = *req.AlertChatID
+	}
 	h.cfgMu.Unlock()
 	var err error
+	if newNotice != nil {
+		// The log line goes first: it is the record that outlives the hotel.
+		// If the hotel save then fails, the PATCH fails and the line stays as
+		// evidence that the miner sent the notice at received_at.
+		err = b.appendDrainNotice(*newNotice)
+	}
 	switch {
+	case err != nil:
 	case lc.lend || lc.reclaim:
 		err = b.saveLendStateLocked(h) // the lend state must survive a restart (lend.go)
 	case h.runtime:
@@ -653,11 +770,13 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		log.Printf("hotel %s update not saved: %v", h.cfg.ID, err)
 		h.cfgMu.Lock()
 		h.cfg.Drain = oldCfg.Drain
+		h.cfg.DrainNotice = oldCfg.DrainNotice
 		h.cfg.Labels = oldCfg.Labels
 		h.cfg.MaxSlots = oldCfg.MaxSlots
 		h.cfg.ReservedFor = oldCfg.ReservedFor
 		h.cfg.LentFrom = oldCfg.LentFrom
 		h.cfg.LentReportID = oldCfg.LentReportID
+		h.cfg.AlertChatID = oldCfg.AlertChatID
 		h.cfgMu.Unlock()
 		b.mu.Unlock()
 		writeErr(w, 500, "state_write_failed", "cannot keep the hotel update; nothing changed")
@@ -735,6 +854,7 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller, forget b
 		h.stop()
 	}
 	_ = os.Remove(h.cfg.KeyFile)
+	b.saveProbationLogged()
 	w.WriteHeader(204)
 }
 
@@ -753,9 +873,14 @@ func (b *broker) hotelDoc(h *hotel) map[string]any {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := time.Now()
-	return map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime,
+	d := map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime,
 		"reserved_for": reserved, "lent_from": lent, "lent_report_id": lentReport, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
-		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now)}
+		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now),
+		"commitment": b.commitmentDoc(h), "drain_notice": h.drainNotice()}
+	if p := b.probationDoc(h); p != nil {
+		d["probation"] = p
+	}
+	return d
 }
 
 func (b *broker) guestExists(id string) bool {
@@ -788,9 +913,21 @@ func (b *broker) saveRuntimeHotelsLocked() error {
 	return os.Rename(tmp, filepath.Join(b.cfg.StateDir, runtimeHotelsFile))
 }
 
-// loadRuntimeHotels adds the hotels that joined at runtime before a restart.
-// The caller starts their sync loops.
+// loadRuntimeHotels adds the hotels that joined at runtime before a restart,
+// with their miner probation state (probation.go). The caller starts their
+// sync loops.
 func (b *broker) loadRuntimeHotels() error {
+	if err := b.loadRuntimeHotelList(); err != nil {
+		return err
+	}
+	if err := b.loadProbation(); err != nil {
+		// Fail closed: the restored miner hotels stay on probation (fresh).
+		log.Printf("miner probation state not loaded: %v", err)
+	}
+	return nil
+}
+
+func (b *broker) loadRuntimeHotelList() error {
 	if b.cfg.StateDir == "" {
 		return nil
 	}
@@ -808,6 +945,12 @@ func (b *broker) loadRuntimeHotels() error {
 	for _, hc := range list {
 		if hc.MinerHotkey != "" && hc.TLSSPKISHA256 == "" {
 			log.Printf("runtime miner hotel %s skipped: no attested TLS pin", hc.ID)
+			continue
+		}
+		// A sealed hotel that joined before require_sealed_guest_tls was turned
+		// on would otherwise get the hotel key over its configured address.
+		if b.cfg.RequireSealedGuestTLS && hc.Sealed && !hc.GuestTLS && hc.MinerHotkey == "" {
+			log.Printf("runtime hotel %s skipped: require_sealed_guest_tls is on and it joined without guest TLS; remove and re-add it", hc.ID)
 			continue
 		}
 		k, err := os.ReadFile(hc.KeyFile)
