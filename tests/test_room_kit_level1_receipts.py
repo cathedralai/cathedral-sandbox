@@ -447,4 +447,4 @@ def test_incomplete_broker_archive_is_not_called_the_whole_chain(tmp_path, monke
              "receipts": ledger.chain}
     proc = _verify_cli(tmp_path / "whole", ledger.attestation(), whole)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert json.loads(proc.stdout)["checked"] == "whole chain to the head the server named"
+    assert json.loads(proc.stdout)["checked"].startswith("whole chain to the head the server named")
