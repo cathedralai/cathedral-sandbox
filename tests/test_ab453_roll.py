@@ -190,17 +190,9 @@ def test_refuses_when_rooms_not_zero(env):
 
 def test_full_apply_drains_installs_admits_undrains(env):
     e, fake, home = env
-    # the broker shows the new build once the install ran: switch the capacity view up front, since
-    # the preflight needs CUR admitted and the admission wait needs NEW; the fake serves a sequence
-    seq = [capacity(CUR), capacity(CUR, drain=True), capacity(NEW, drain=True)]
-    (fake / "capacity.seq").write_text("\n".join(seq))
-    (fake / "capacity.json").write_text(seq[0])
-    wrapper = fake.parent / "bin" / "curl"
-    body = wrapper.read_text().replace(
-        '*/v1/broker/capacity) cat "$F/capacity.json" ;;',
-        '*/v1/broker/capacity) n=$(cat "$F/n" 2>/dev/null || echo 0); echo $((n+1)) > "$F/n"; '
-        'sed -n "$((n>2?3:n+1))p" "$F/capacity.seq" ;;')
-    wrapper.write_text(body)
+    # apply reads capacity once in preflight (CUR admitted), then again after install (NEW admitted).
+    # drain does not re-read capacity on the happy path; a middle drained/CUR view only shifts NEW later.
+    serve_capacity(fake, [capacity(CUR), capacity(NEW, drain=True)])
     r = run(e, "apply", HOTEL)
     assert r.returncode == 0, r.stdout + r.stderr
     c = calls(fake)

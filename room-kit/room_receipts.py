@@ -98,6 +98,14 @@ window, and one outside the window is refused. The receipt is an exec receipt
 that signs sha256 of the plaintext command, as for any exec, and the sha256 of
 both envelopes, which is how the client knows the answer is the guest's.
 
+Guest ingress key (ROOM_GUEST_INGRESS=1, sealed only; AB#422). The front
+makes, at start and in memory, a P-256 TLS key for customer Preview URLs and
+names its SPKI sha256 in the binding (guest_ingress.tls_spki_sha256), so the
+boot's REPORT_DATA commits to it. It is not the miner hotel's control-plane
+TLS key (tls_spki_sha256). Nothing serves on it yet: the certificate (AB#423),
+the host DNAT to the guest and the signed expose come next. Flag off: the
+binding is byte for byte what it was.
+
 Dedicated sealed machine (one owner). The host launches the guest with the
 owner's Ed25519 public key and the manifest digest in fw_cfg, and with
 HOST_DATA = sha256("cathedral-dedicated-v1\\0" || manifest sha256 || owner key).
@@ -123,7 +131,9 @@ import http.client
 import json
 import os
 import re
+import select
 import shutil
+import socket
 import ssl
 import stat
 import subprocess
@@ -793,8 +803,11 @@ class SealedSecrets:
         if held is not None:
             self.tracked -= len(held[1])
 
-    def retire(self, room: str) -> None:
+    def retire(self, room: str, incarnation_of=None) -> None:
         """A delete of the room passed this front: drop its entries and anything a racing write left.
+
+        incarnation_of(room) is asked under the lock: a room that has a live incarnation again was made
+        again after the delete was signed, and what the front holds for it is not this delete's to drop.
 
         The API dropped the directory before it answered the delete, but a
         write that renamed into it meanwhile makes that rmtree fail
@@ -805,6 +818,8 @@ class SealedSecrets:
         if not SECRETS_ROOM_RE.fullmatch(room):
             return  # never a path outside the root: "..", "." and anything with a slash do not match
         with self.lock:
+            if incarnation_of is not None and incarnation_of(room) is not None:
+                return
             self.forget(room)
             shutil.rmtree(os.path.join(self.root, room), ignore_errors=True)
 
@@ -985,9 +1000,13 @@ class SealedEnv:
         """Caller holds the lock."""
         self.rooms.pop(room, None)
 
-    def retire(self, room: str) -> None:
-        """A delete of the room passed this front; the room API dropped the overlay with the room."""
+    def retire(self, room: str, incarnation_of=None) -> None:
+        """A delete of the room passed this front; the room API dropped the overlay with the room.
+
+        A room with a live incarnation again (made again since) keeps its entry."""
         with self.lock:
+            if incarnation_of is not None and incarnation_of(room) is not None:
+                return
             self.forget(room)
 
     def sweep(self, incarnation_of, room_present, now: float) -> None:
@@ -1240,9 +1259,11 @@ class SealedExec:
         seen[ephemeral] = issued_at
         self.tracked += 1
 
-    def retire(self, room: str) -> None:
-        """A delete of the room passed this front."""
+    def retire(self, room: str, incarnation_of=None) -> None:
+        """A delete of the room passed this front. A room with a live incarnation again keeps its entries."""
         with self.lock:
+            if incarnation_of is not None and incarnation_of(room) is not None:
+                return
             self.forget(room)
 
     def sweep(self, incarnation_of, now: float) -> None:
@@ -1318,6 +1339,35 @@ def make_tls_identity(hotel: str) -> tuple[bytes, bytes, str]:
             .sign(key, hashes.SHA256()))
     key_pem = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
     return cert.public_bytes(Encoding.PEM), key_pem, spki_sha256(key.public_key())
+
+
+INGRESS_SCHEMA = "cathedral_guest_ingress_v1"
+
+
+def guest_ingress_wanted() -> bool:
+    """ROOM_GUEST_INGRESS=1. Unset or any other value: off."""
+    return os.environ.get("ROOM_GUEST_INGRESS") == "1"
+
+
+class GuestIngress:
+    """The per-boot TLS key for customer Preview URLs (AB#422). Memory only.
+
+    Made here, inside the guest, so the host never holds it. The binding names
+    its SPKI sha256 (binding_fields), so the boot's SNP report commits to it,
+    and a client that pins that value knows the TLS session ends in this guest.
+    The certificate is self-issued for now; a publicly trusted one for the same
+    key waits on AB#423. Kept apart from MinerHotel's key: that one is the
+    control plane's channel, this one faces customers.
+    """
+
+    def __init__(self, hotel: str):
+        self.cert_pem, self._key_pem, self.tls_spki_sha256 = make_tls_identity(hotel)
+
+    def __repr__(self) -> str:
+        return f"GuestIngress(tls_spki_sha256={self.tls_spki_sha256})"
+
+    def binding_fields(self) -> dict:
+        return {"guest_ingress": {"schema": INGRESS_SCHEMA, "tls_spki_sha256": self.tls_spki_sha256}}
 
 
 class InstallRefused(Exception):
@@ -1468,8 +1518,11 @@ class Ledger:
     """The receipt key, the binding and the chain of this boot."""
 
     def __init__(self, hotel: str, store: str, miner: MinerHotel | None = None,
-                 secrets: SealedSecrets | None = None, sealed_exec: SealedExec | None = None):
+                 secrets: SealedSecrets | None = None, sealed_exec: SealedExec | None = None,
+                 ingress: GuestIngress | None = None):
         self.miner = miner
+        # Like the secrets key, the ingress key means something only under an SNP report.
+        self.ingress = ingress
         # A secrets or sealed exec key means something only under an SNP report: level 1 drops both below.
         self.secrets = secrets
         self.sealed_exec = sealed_exec
@@ -1486,6 +1539,7 @@ class Ledger:
             self.secrets = None
             self.sealed_exec = None
             self.sealed_env = None
+            self.ingress = None
             self._init_hotel(hotel, store)
         # Runtime guest key. Not in the binding: adding it there would change
         # REPORT_DATA. Authenticated by an Ed25519 signature over the plant-key
@@ -1554,6 +1608,9 @@ class Ledger:
         if self.sealed_exec is not None:
             # The same rule for the sealed exec key: one added key, only with its flag on.
             self.binding.update(self.sealed_exec.binding_fields())
+        if self.ingress is not None:
+            # The same rule for the guest ingress key (AB#422).
+            self.binding.update(self.ingress.binding_fields())
         if owner is not None:
             # Enough to recompute HOST_DATA from published fields:
             # sha256(domain || manifest_sha256 || owner key) == host_data.
@@ -2028,6 +2085,8 @@ class Ledger:
 
     def _open_store(self, store: str) -> None:
         self.lock = threading.Lock()
+        self.claims_zero = threading.Event()  # set while no claim is in flight; waited on without the lock
+        self.claims_zero.set()
         self.attest_lock = threading.Lock()
         # Fresh-report slots keyed by guest id (X-Cathedral-Guest). A shared
         # hotel serves many guests; a per-hotel counter let one guest starve
@@ -2038,11 +2097,62 @@ class Ledger:
         # Room id -> receipt_sha256 of its last successful create receipt, until a
         # successful delete of the room is signed (sealed secrets bind to it).
         self.incarnations: dict[str, str] = {}
+        # Serial rooms (all guarded by self.lock). in_flight counts the authorized requests between enter and
+        # leave; busy is the per-room token (taken without waiting, so nothing queues and nothing can deadlock),
+        # always a subset of the in_flight keys; serial holds the rooms whose create was signed serial; broken the
+        # rooms that lost or never signed an action. Marks go when a 2xx delete is signed.
+        self.in_flight: dict[str, int] = {}
+        self.busy: set[str] = set()
+        self.serial: set[str] = set()
+        self.broken: set[str] = set()
+        # The flag of a serial or pool create needs that nothing ran in the room before the create was signed. The
+        # in-flight count sees a request still running; touched sees one that finished without a receipt (an
+        # unsigned write, or a request the API refused): a non-read request for an id with no create receipt is
+        # recorded at enter and again at leave when a create is pending at that moment, so any request whose
+        # life overlapped the time between a create being sent and its receipt being signed is in it.
+        # creates_in_flight counts the creates forwarded and not yet signed; when it returns to zero touched is
+        # cleared, since a request that ended before any create was pending cannot have run in a room whose
+        # create was not yet sent. overflow withholds every flag while touched is full.
+        self.creates_in_flight = 0
+        self.touched: set[str] = set()
+        self.overflow = False
+        # A bulk delete by label names no room, so it cannot be matched to a pending create. One that is in
+        # flight at any moment while a create is pending withholds every flag (it sets overflow, at both ends).
+        self.bulk_in_flight = 0
+        # A bulk delete does not name its rooms until the API runs it. Keep it and claims mutually exclusive so
+        # a delayed successful lifetime answer cannot hand over a room the bulk delete already removed: a bulk
+        # delete waits for the claims in flight (claims_in_flight) and then runs; bulk_pending counts the bulk
+        # deletes that are waiting or running, and a new claim is refused while there is one. A repeat claim of an
+        # already claimed room never calls the API, so it is answered either way.
+        self.claims_in_flight = 0
+        self.bulk_pending = 0
+        # Pool rooms (unclaimed or claimed) the front cannot vouch for after a bulk delete whose outcome was not
+        # certain. It changes two things only: a new claim on the room, and the replay of a stored claim answer.
+        # A 2xx delete or a room_end of the room clears it.
+        self.unknown: set[str] = set()
+        # Pre-made rooms: pool maps an unclaimed room to its expires_at (epoch); claimed maps a claimed room to
+        # (the sandbox id it was claimed for, the answer sent, the claim receipt) so a repeat gets the same answer.
+        self.pool: dict[str, float] = {}
+        self.pool_created_at: dict[str, str] = {}
+        self.claimed: dict[str, tuple[str, bytes, dict]] = {}
+        # Unclaimed pool rooms the API still has but this boot never signed a create for: closed until delete.
+        self.pool_stale: set[str] = set()
+        # Pool rooms an earlier front process of this boot claimed (room -> the sandbox id it was claimed for), read
+        # from the claim marker at the startup scan. They run as ordinary rooms; their claim receipt is under the
+        # earlier binding and is never served or signed again here.
+        self.claimed_before: dict[str, str] = {}
         self.head = self.binding_sha256
         os.makedirs(store, mode=0o700, exist_ok=True)
-        self.store = open(os.path.join(store, f"chain-{self.binding['boot_id']}.jsonl"), "ab", buffering=0)
-        with open(os.path.join(store, f"attestation-{self.binding['boot_id']}.json"), "w") as f:
+        self.store_dir = store
+        # Named by boot and binding: a front restart in the same boot makes a new key and binding, and must not
+        # append to the earlier chain or overwrite the earlier attestation (its SNP report proves the earlier key).
+        stem = f"{self.binding['boot_id']}-{self.binding_sha256[:16]}"
+        self.store = open(os.path.join(store, f"chain-{stem}.jsonl"), "ab", buffering=0)
+        with open(os.path.join(store, f"attestation-{stem}.json"), "w") as f:
             json.dump(self.attestation(), f)
+
+    def close(self) -> None:
+        self.store.close()
 
     def attestation(self) -> dict:
         doc = {"binding": self.binding, "binding_sha256": self.binding_sha256}
@@ -2087,27 +2197,338 @@ class Ledger:
         with self.lock:
             return self.incarnations.get(room)
 
-    def sign(self, fields: dict) -> dict:
+    def enter(self, room: str, kind: str) -> tuple[Turn | None, tuple[int, str, str] | None]:
+        """Admit one authorized request for *room*: (turn, None), or (None, (status, code, message)).
+
+        One locked step checks the room's marks, takes the token when the room needs one and counts the
+        request. A busy room is refused at once, never waited on.
+        """
         with self.lock:
-            statement = {"schema": self.receipt_schema, "binding_sha256": self.binding_sha256, "hotel": self.hotel,
-                         "operation_id": str(uuid.uuid4()), "sequence": len(self.chain) + 1,
-                         "previous_receipt_sha256": self.head, "issued_at": int(time.time()), **fields}
-            receipt = {"statement": statement, "signature_b64": b64(self.key.sign(canonical(statement))),
-                       "receipt_sha256": sha(canonical(statement))}
-            self.head = receipt["receipt_sha256"]
-            self.chain.append(receipt)
-            room = statement.get("sandbox_id")
-            if room:
-                self.by_room.setdefault(room, []).append(len(self.chain) - 1)
-                status, action = statement.get("status"), statement.get("action")
-                if isinstance(status, int) and 200 <= status < 300:
-                    # The same rule as create_receipt(): the last successful create names the room.
-                    if action == "create":
-                        self.incarnations[room] = receipt["receipt_sha256"]
-                    elif action == "delete":
-                        self.incarnations.pop(room, None)
-            self.store.write(canonical(receipt) + b"\n")
+            new_claim = kind == "claim" and room not in self.claimed
+            if new_claim and self.bulk_pending:
+                return None, (409, "pool_bulk_delete_busy", "a bulk delete is waiting or running; the room is not handed over")
+            token = False
+            if room in self.broken:
+                if kind != "delete":
+                    return None, (409, "room_broken", "this room lost an answer; only a delete is accepted")
+                token = True
+            elif room in self.serial:
+                if kind in ("signed", "delete"):
+                    token = True
+                elif kind not in ("read", "record_read"):
+                    return None, (409, "room_serial_unsigned", "a serial room accepts signed requests and reads only")
+            elif room in self.pool_stale:
+                if kind in ("delete", "claim"):
+                    token = True
+                elif kind != "record_read":
+                    return None, (409, "pool_room_stale", "this front has no receipt for the room")
+            elif room in self.pool:
+                if kind in ("delete", "claim"):
+                    token = True
+                elif kind != "record_read":
+                    return None, (409, "pool_room_unclaimed", "this room is not claimed yet")
+            if token and room in self.busy:
+                return None, (409, "room_busy", "this room is running another request")
+            nonread = kind not in ("read", "record_read")
+            if nonread:
+                self._touch(room)
+            if token:
+                self.busy.add(room)
+            if new_claim:
+                self.claims_in_flight += 1
+                self.claims_zero.clear()
+            self.in_flight[room] = self.in_flight.get(room, 0) + 1
+            return Turn(room, token, len(self.by_room.get(room, [])), room in self.serial, nonread,
+                        new_claim), None
+
+    def _touch(self, room: str) -> None:
+        """Remember a non-read request for an id with no create receipt while a create is pending. Caller holds self.lock."""
+        if not self.creates_in_flight or room in self.by_room or room in self.touched:
+            return
+        if len(self.touched) >= TOUCHED_CAP:
+            self.overflow = True  # a further id has to be remembered and does not fit
+        else:
+            self.touched.add(room)
+
+    def begin_create(self) -> None:
+        with self.lock:
+            self.creates_in_flight += 1
+            if self.bulk_in_flight:
+                self.overflow = True
+
+    def bulk_arrive(self, timeout: float) -> bool:
+        """A bulk delete reached the front: from now on a new claim is refused, so the wait cannot be starved.
+
+        The lock is taken for at most *timeout* seconds: a signer whose receipt write blocks holds it, and the
+        bulk delete's wait must keep its own bound. False: not counted."""
+        if not self.lock.acquire(timeout=max(0.0, timeout)):
+            return False
+        try:
+            self.bulk_pending += 1
+        finally:
+            self.lock.release()
+        return True
+
+    def bulk_try_start(self, wait: float, until: float) -> str:
+        """started, waiting (a claim is in flight; waited up to *wait* seconds for it), lock (not taken by *until*)
+        or late (*until* had passed once the lock was taken).
+
+        *until* is a time.monotonic() deadline. The wait for a claim to end holds no lock."""
+        if not self.lock.acquire(timeout=max(0.0, until - time.monotonic())):
+            return "lock"
+        try:
+            if time.monotonic() >= until:
+                return "late"  # its bound passed while the thread was paused: no counter changes
+            if not self.claims_in_flight:
+                self.bulk_in_flight += 1
+                if self.creates_in_flight:
+                    self.overflow = True
+                return "started"
+        finally:
+            self.lock.release()
+        self.claims_zero.wait(max(0.0, min(wait, until - time.monotonic())))
+        return "waiting"
+
+    def mark_pool_unknown(self) -> None:
+        """A bulk delete ended without a certain answer: mark every pool room the front knows. Before the guard clears."""
+        with self.lock:
+            self.unknown |= set(self.pool) | set(self.claimed)
+
+    def bulk_abandon(self) -> None:
+        """A bulk delete that never ran (refused, or its caller left) stops counting."""
+        with self.lock:
+            self.bulk_pending = max(0, self.bulk_pending - 1)
+
+    def end_bulk(self) -> None:
+        with self.lock:
+            self.bulk_in_flight = max(0, self.bulk_in_flight - 1)
+            self.bulk_pending = max(0, self.bulk_pending - 1)
+            if self.creates_in_flight:
+                self.overflow = True
+
+    def end_create(self) -> None:
+        with self.lock:
+            self.creates_in_flight = max(0, self.creates_in_flight - 1)
+            if not self.creates_in_flight:
+                self.touched.clear()
+                self.overflow = False
+
+    def leave(self, turn: Turn) -> None:
+        """End a turn: break a serial room that lost an answer or left an action unsigned, free the token, lower the count."""
+        with self.lock:
+            room = turn.room
+            if turn.claim:
+                self.claims_in_flight -= 1
+                if not self.claims_in_flight:
+                    self.claims_zero.set()
+            if turn.nonread:
+                self._touch(room)  # it may have run while a create was pending, though it entered before
+            if turn.token and (room in self.serial or room in self.pool or room in self.pool_stale):
+                signed = len(self.by_room.get(room, [])) > turn.receipts_before
+                if turn.lost or (turn.called and not signed):
+                    self.broken.add(room)
+            if turn.token:
+                self.busy.discard(room)
+            left = self.in_flight.get(room, 0) - 1
+            if left > 0:
+                self.in_flight[room] = left
+            else:
+                self.in_flight.pop(room, None)
+
+    def _room_gone(self, room: str) -> None:
+        """A signed delete or room_end ends the room's incarnation and every mark kept for it. Caller holds self.lock."""
+        self.incarnations.pop(room, None)
+        self.serial.discard(room)
+        self.broken.discard(room)
+        self.pool.pop(room, None)
+        self.pool_created_at.pop(room, None)
+        self.claimed.pop(room, None)
+        self.claimed_before.pop(room, None)
+        self.pool_stale.discard(room)
+        self.unknown.discard(room)
+        try:
+            os.unlink(self._pool_claim_path(room))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # A stale marker alone never opens a room: recovery also matches its creation time.
+            traceback.print_exc()
+
+    def _pool_claim_path(self, room: str) -> str:
+        return os.path.join(self.store_dir, f"pool-claim-{sha(room.encode())}.json")
+
+    def _persist_pool_claim(self, room: str, cathedral_id: str, receipt: dict) -> None:
+        """Record that the room was claimed, before the front sends 200. Caller holds self.lock.
+
+        The record classifies the room for a later front process of this boot; it holds no answer and no receipt,
+        so nothing signed under this binding can be served again under another."""
+        created_at = self.pool_created_at[room]
+        record = {"room": room, "cathedral_sandbox_id": cathedral_id,
+                  "created_at": created_at, "boot_id": self.binding["boot_id"],
+                  "binding_sha256": self.binding_sha256, "claim_receipt_sha256": receipt["receipt_sha256"]}
+        target = self._pool_claim_path(room)
+        temporary = target + f".{uuid.uuid4().hex}.tmp"
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(canonical(record))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, target)
+            directory = os.open(self.store_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def recovered_pool_claim(self, room: str, created_at: str) -> str | None:
+        """The sandbox id an earlier front in this guest boot claimed this API room incarnation for, or None."""
+        try:
+            with open(self._pool_claim_path(room), "rb") as f:
+                record = json.load(f)
+            cid = record["cathedral_sandbox_id"]
+            if (record["room"] != room or record["created_at"] != created_at
+                    or record["boot_id"] != self.binding["boot_id"]
+                    or record["binding_sha256"] == self.binding_sha256
+                    or not isinstance(cid, str) or not SANDBOX_LINK_RE.fullmatch(cid)):
+                return None
+            return cid
+        except (OSError, ValueError, TypeError, KeyError, RecursionError):
+            return None
+
+    def note_pool_stale(self, rooms: set[str]) -> None:
+        """Unclaimed pool rooms left by a prior boot: fail closed until deleted. Caller holds no lock."""
+        if not rooms:
+            return
+        with self.lock:
+            self.pool_stale.update(rooms)
+
+    def end_room(self, room: str, incarnation: str, status: int, reason: str, result_sha256: str) -> dict | None:
+        """Sign room_end for *room* if it is still the incarnation that was looked at and nothing is in flight for it.
+
+        One locked step, so two looks sign one end, and a room made again since the look is never ended.
+        """
+        with self.lock:
+            if self.incarnations.get(room) != incarnation or self.in_flight.get(room):
+                return None
+            return self._sign_locked({
+                "action": "room_end", "target": None, "sandbox_id": room,
+                "room_create_receipt_sha256": incarnation, "status": status, "reason": reason,
+                "result_sha256": result_sha256,
+            })
+
+    def claim_check(self, room: str, cathedral_id: str, now: float) -> tuple[tuple[int, bytes, dict] | None, tuple[str, str] | None, str | None]:
+        """What a claim of *room* may do now: (stored answer, refusal, create receipt hash).
+
+        A stored answer (status, body, receipt) is for the same sandbox id claiming again. Otherwise exactly
+        one of refusal (code, message) or the hash of the room's create receipt is set. One locked step.
+        """
+        with self.lock:
+            held = self.claimed.get(room)
+            if held is not None:
+                if held[0] == cathedral_id:
+                    return (200, held[1], held[2]), None, None
+                return None, ("pool_room_claimed", "this room is claimed for another sandbox"), None
+            before = self.claimed_before.get(room)
+            if before is not None and before != cathedral_id:
+                # Claimed by an earlier front process for another sandbox: the caller must not touch it.
+                return None, ("pool_room_claimed", "this room is claimed for another sandbox"), None
+            history = self.by_room.get(room, [])
+            if not history:
+                return None, ("pool_room_stale", "this front has no receipt for the room"), None
+            if room not in self.incarnations:
+                return None, ("pool_room_gone", "the room has ended"), None
+            if room in self.unknown:
+                return None, ("pool_room_unknown", "a bulk delete that may have removed it did not finish cleanly"), None
+            if room not in self.pool:
+                return None, ("room_not_pool", "this room is not a pre-made room"), None
+            if len(history) != 1:
+                return None, ("pool_room_used", "the room has receipts besides its create"), None
+            if now > self.pool[room] - POOL_CLAIM_MARGIN_SECONDS:
+                return None, ("pool_room_expiring", "the room is too close to its time limit"), None
+            return None, None, self.chain[history[0]]["receipt_sha256"]
+
+    def sign_claim(self, room: str, fields: dict, answer: dict) -> dict:
+        """Sign the claim and, when its lifetime call succeeded, open the room: one locked step.
+
+        A 2xx claim clears the pool mark and stores the answer for a repeat. Any other ends the room's one
+        try: the room is broken, so only a delete is accepted from then on.
+        """
+        with self.lock:
+            receipt = self._sign_locked(fields)
+            status = receipt["statement"]["status"]
+            if isinstance(status, int) and 200 <= status < 300:
+                try:
+                    self._persist_pool_claim(room, fields["cathedral_sandbox_id"], receipt)
+                except (OSError, KeyError):
+                    self.broken.add(room)
+                    raise
+                self.pool.pop(room, None)
+                self.pool_created_at.pop(room, None)
+                self.claimed[room] = (fields["cathedral_sandbox_id"], canonical(answer), receipt)
+            else:
+                self.broken.add(room)
             return receipt
+
+    def sign(self, fields: dict, create: dict | None = None) -> dict:
+        with self.lock:
+            return self._sign_locked(fields, create)
+
+    def _sign_locked(self, fields: dict, create: dict | None = None) -> dict:
+        """Sign and append one receipt. The caller holds self.lock.
+
+        *create* is what the create request asked for. A 2xx create that asked for a serial room is signed
+        serial only as the room's receipt 1 with no request in flight for it, so no request ran in the room
+        before the flag.
+        """
+        statement = {"schema": self.receipt_schema, "binding_sha256": self.binding_sha256, "hotel": self.hotel,
+                     "operation_id": str(uuid.uuid4()), "sequence": len(self.chain) + 1,
+                     "previous_receipt_sha256": self.head, "issued_at": int(time.time()), **fields}
+        named = fields.get("sandbox_id")
+        if isinstance(named, str) and named:
+            # A room's own count and link, taken after **fields so no statement field can set them. A
+            # list that holds every number from 1 shows that no receipt of that room is missing from it.
+            earlier = self.by_room.get(named, [])
+            statement["room_sequence"] = len(earlier) + 1
+            statement["room_previous_receipt_sha256"] = self.chain[earlier[-1]]["receipt_sha256"] if earlier else None
+        status = statement.get("status")
+        ok = isinstance(status, int) and 200 <= status < 300
+        if create and ok and statement.get("action") == "create" and isinstance(named, str) and named:
+            fresh = not self.in_flight.get(named) and named not in self.by_room \
+                and named not in self.touched and not self.overflow
+            if create.get("serial") and fresh:
+                statement["serial"] = True
+            elif create.get("pool") and fresh and statement.get("network_policy") == DENY_ALL \
+                    and isinstance(create.get("expires_at"), float) and isinstance(create.get("created_at"), str):
+                statement["pool"] = True
+        receipt = {"statement": statement, "signature_b64": b64(self.key.sign(canonical(statement))),
+                   "receipt_sha256": sha(canonical(statement))}
+        self.head = receipt["receipt_sha256"]
+        self.chain.append(receipt)
+        room = statement.get("sandbox_id")
+        if room:
+            self.by_room.setdefault(room, []).append(len(self.chain) - 1)
+            action = statement.get("action")
+            if ok:
+                # The same rule as create_receipt(): the last successful create names the room.
+                if action == "create":
+                    self.incarnations[room] = receipt["receipt_sha256"]
+                    if statement.get("serial"):
+                        self.serial.add(room)
+                    if statement.get("pool"):
+                        self.pool[room] = create["expires_at"]
+                        self.pool_created_at[room] = create["created_at"]
+                elif action == "delete":
+                    self._room_gone(room)
+            if action == "room_end":
+                self._room_gone(room)
+        self.store.write(canonical(receipt) + b"\n")
+        return receipt
 
 
 # ---------------------------------------------------------------- proxy
@@ -2116,6 +2537,7 @@ ROOM = r"/v1/sandboxes/(?P<id>[^/]+)"
 SIGNED = [  # (method, path pattern, action)
     ("POST", re.compile(r"^/v1/sandboxes$"), "create"),
     ("POST", re.compile("^" + ROOM + r"/exec$"), "exec"),
+    ("POST", re.compile("^" + ROOM + r"/exec/cancel$"), "exec_cancel"),
     ("POST", re.compile("^" + ROOM + r"/processes$"), "process_start"),
     ("DELETE", re.compile("^" + ROOM + r"$"), "delete"),
     ("PUT", re.compile("^" + ROOM + r"/network$"), "network_set"),
@@ -2132,9 +2554,342 @@ OWNER_GATED = [  # (method, path pattern, action in the signed message)
     ("POST", re.compile(r"^/v1/sandboxes$"), "create"),
     ("POST", re.compile(r"^/v1/images/build$"), "build"),
 ]
+# Serial rooms. A create that carries SERIAL_LABEL = "1" makes a room that runs one signed request at a
+# time, so the order of its receipts is the order things ran. The labels are ours: the API refuses them
+# from customers.
+SERIAL_LABEL = "cathedral_serial"
+POOL_LABEL = "cathedral_pool"
+CLAIM_ROUTE = re.compile("^" + ROOM + r"/claim$")
+DENY_ALL = {"mode": "deny_all", "allow": []}  # the network a pool room is made with, in the form the broker sends
+POOL_CREATE_KEYS = frozenset({"image", "resources", "network", "labels", "ttl_seconds"})
+# A claim is let in only this long before the room's own limit, so the API's clean-up of a room past its
+# limit (which acts a while after it) cannot reach a claimed room. The lifetime call waits at most CLAIM_WAIT.
+POOL_CLAIM_MARGIN_SECONDS = 300
+CLAIM_WAIT_SECONDS = 10
+CLAIM_LIFETIME_MAX = 172800
+EXPIRES_MAX_SECONDS = 48 * 3600 + 60
+# A bulk delete that arrives while a claim is in flight waits for it. A claim ends within its lifetime call, which
+# waits at most CLAIM_WAIT_SECONDS (the upstream timeout in handle_claim), plus a margin for signing it and storing
+# its answer. The wait checks every BULK_POLL_SECONDS whether the caller is still there.
+BULK_CLAIM_WAIT_SECONDS = CLAIM_WAIT_SECONDS + 5
+BULK_POLL_SECONDS = 0.2
+# The front forwards a bulk delete and waits for its answer for at most this long, in total (monotonic clock). After
+# that the caller gets 502 hotel_api_no_answer and the bulk delete counts as uncertain: the machine keeps running it.
+BULK_FORWARD_SECONDS = 300
+
+
+def bulk_outcome_is_certain(status: int) -> bool:
+    """Whether a bulk delete's answer says what it did.
+
+    Certain: a 2xx (it ran to its end) or a 4xx (the machine sends one only before it acts: authentication, the
+    label filter; once it starts removing rooms it raises no 4xx). Uncertain: any 5xx, no answer, a broken or
+    unreadable answer, and the front's own deadline, all of which reach here as 5xx or 502. The machine keeps
+    running a bulk delete the front stopped waiting for, and it picks its targets once, when it starts.
+    """
+    return 200 <= status < 300 or 400 <= status < 500
+
+
+TIMER = threading.Timer  # the deadline timer; a test can replace it to show the deadline holds without it
+
+
+def run_within(conn: http.client.HTTPConnection, seconds: float, call):
+    """Run call() on *conn*, which must not be connected yet, and give up when *seconds* have passed in all.
+
+    A socket timeout counts each read on its own, so a slow trickle of bytes never trips it. This bounds the
+    whole call on a monotonic clock. The timer sets an expired flag and cuts the connection's socket, and that
+    socket is kept here, because an answer with Connection: close detaches it from *conn* while its body is
+    still being read. Expiry is never decided by what was parsed (a cut during the headers can read as a
+    complete short answer), and not by the timer thread alone either: after call() the flag is checked first,
+    then the monotonic clock itself, so an answer that arrives late is expired even if the timer thread was
+    delayed. An expired call raises TimeoutError (an OSError), as a lost answer does. The connect and every read
+    get the time that is left as their timeout, so neither outlives the deadline.
+    """
+    deadline_at = time.monotonic() + seconds
+    expired = threading.Event()
+    sockets: list = []
+
+    def cut() -> None:
+        expired.set()
+        for sock in list(sockets):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    timer = TIMER(seconds, cut)
+    timer.daemon = True
+    timer.start()
+    try:
+        conn.timeout = max(0.001, min(conn.timeout or seconds, deadline_at - time.monotonic()))
+        conn.connect()
+        sockets.append(conn.sock)
+        if expired.is_set():
+            raise TimeoutError("the deadline passed before the request was sent")
+        result = call()
+    finally:
+        timer.cancel()
+    if expired.is_set() or time.monotonic() > deadline_at:
+        raise TimeoutError("the answer came after the deadline")
+    return result
+
+
+# What an unclaimed pool room lets through unsigned: reads of the room's record.
+RECORD_READS = [
+    ("GET", re.compile("^" + ROOM + r"$")),
+    ("POST", re.compile("^" + ROOM + r"/wait$")),
+]
+ROOM_PATH = re.compile(r"^/v1/sandboxes/(?P<id>[^/]+)(?:/|$)")
+# What a serial room lets through unsigned: requests that read the room and change nothing. A route on no
+# list here is refused, so a route added later is closed until it is listed. A terminal's output is not a
+# read: reading it clears its buffer.
+READS = [  # (method, path pattern)
+    ("GET", re.compile("^" + ROOM + r"$")),
+    ("POST", re.compile("^" + ROOM + r"/wait$")),
+    ("GET", re.compile("^" + ROOM + r"/logs$")),
+    ("GET", re.compile("^" + ROOM + r"/stat$")),
+    ("GET", re.compile("^" + ROOM + r"/tar$")),
+    ("GET", re.compile("^" + ROOM + r"/desktop$")),
+    ("GET", re.compile("^" + ROOM + r"/terminals$")),
+    ("GET", re.compile("^" + ROOM + r"/processes/[^/]+/logs$")),
+    ("GET", re.compile("^" + ROOM + r"/sealed-secrets$")),
+    ("GET", re.compile("^" + ROOM + r"/sealed-env$")),
+    ("GET", re.compile("^" + ROOM + r"/entries$")),
+]
+# Room ids the front forwarded a non-read request for while it held no create receipt for them and a create
+# was in flight (see Ledger.touched). Past this many, no create is flagged until the creates end.
+TOUCHED_CAP = 4096
 HEX64 = re.compile(r"[0-9a-fA-F]{128}")
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
-       "proxy-authenticate", "content-length", "host"}
+       "proxy-authenticate", "content-length", "host", "x-room-exec-handle"}
+
+# Exec result memory (AB#756). The broker's background exec path sends its own exec handle in
+# EXEC_HANDLE_HEADER; for those execs only, the front keeps the answer it signed, so a broker that
+# restarted while the command ran reads it back with GET .../exec/result?handle= and drops it with
+# DELETE once saved. Plain execs without the header are not kept. The header never reaches the API.
+EXEC_HANDLE_HEADER = "X-Room-Exec-Handle"
+EXEC_STATE_HEADER = "X-Room-Exec-State"
+EXEC_HANDLE = re.compile(r"[0-9a-f]{32}")
+EXEC_RESULT_ROUTE = re.compile("^" + ROOM + r"/exec/result$")
+EXEC_RESULT_KEEP_SECONDS = 3600  # a finished answer nobody dropped ages out after this
+EXEC_RESULT_MAX = 256  # answers kept, running and finished
+EXEC_RESULT_MAX_BYTES = 64 << 20  # body bytes of finished answers kept
+EXEC_RESULT_MAX_WAIT = 25  # seconds one read may wait for a running exec
+# What a kept exec ends with when the front failed between the API call and the store.
+EXEC_RESULT_FRONT_FAILED = b'{"error":{"code":"hotel_api_no_answer","message":"the front failed before it kept the answer; the request may have run"}}'
+
+
+class _ExecEntry:
+    __slots__ = ("body", "ctype", "done_at", "event", "headers", "incarnation", "status")
+
+    def __init__(self, incarnation: str | None = None):
+        self.incarnation = incarnation  # the incarnation of the room that ran it: only that room is served it
+        self.event = threading.Event()
+        self.done_at: float | None = None
+        self.status = 0
+        self.headers: dict = {}
+        self.body = b""
+        self.ctype = "application/json"
+
+
+class ExecResults:
+    """The answers of kept execs, by (room, handle). Bounded by count, bytes and age.
+
+    A running entry is never evicted or replaced: a second exec with a running entry's handle is
+    refused, and with the table full of running entries a new exec runs untracked.
+    """
+
+    def __init__(self, keep: float = EXEC_RESULT_KEEP_SECONDS, max_entries: int = EXEC_RESULT_MAX,
+                 max_bytes: int = EXEC_RESULT_MAX_BYTES):
+        self.keep, self.max_entries, self.max_bytes = keep, max_entries, max_bytes
+        self.lock = threading.Lock()
+        self.entries: dict[tuple[str, str], _ExecEntry] = {}
+        self.bytes = 0
+
+    def _drop(self, key) -> None:
+        e = self.entries.pop(key, None)
+        if e is not None and e.done_at is not None:
+            self.bytes -= len(e.body)
+
+    def _prune(self, now: float) -> None:
+        for key, e in list(self.entries.items()):
+            if e.done_at is not None and now - e.done_at > self.keep:
+                self._drop(key)
+
+    def _oldest_done(self, but=None):
+        done = [(e.done_at, k) for k, e in self.entries.items() if e.done_at is not None and k != but]
+        return min(done)[1] if done else None
+
+    @staticmethod
+    def _mine(e: _ExecEntry, room: str, incarnation_of) -> bool:
+        """The entry belongs to the room's live incarnation. Asked under self.lock (lock order: this store, then the
+        ledger, as for the sealed stores). Without incarnation_of every entry counts."""
+        return incarnation_of is None or e.incarnation == incarnation_of(room)
+
+    def begin(self, room: str, handle: str, incarnation: str | None = None) -> str:
+        """'tracked', 'busy' (a running exec holds this handle) or 'full' (run it untracked)."""
+        key = (room, handle)
+        with self.lock:
+            self._prune(time.monotonic())
+            e = self.entries.get(key)
+            if e is not None and e.done_at is None:
+                return "busy"
+            self._drop(key)
+            while len(self.entries) >= self.max_entries:
+                old = self._oldest_done()
+                if old is None:
+                    return "full"
+                self._drop(old)
+            self.entries[key] = _ExecEntry(incarnation)
+            return "tracked"
+
+    def finish(self, room: str, handle: str, status: int, headers: dict, body: bytes, ctype: str) -> None:
+        key = (room, handle)
+        with self.lock:
+            e = self.entries.get(key)
+            if e is None or e.done_at is not None:
+                return
+            if len(body) > self.max_bytes:
+                # Too large to keep: forgotten, so a re-attach reads exec_unknown, not a cut answer.
+                self.entries.pop(key, None)
+                e.event.set()
+                return
+            e.status, e.headers, e.body, e.ctype = status, dict(headers), body, ctype
+            e.done_at = time.monotonic()
+            self.bytes += len(body)
+            while self.bytes > self.max_bytes:
+                old = self._oldest_done(but=key)
+                if old is None:
+                    break
+                self._drop(old)
+            e.event.set()
+
+    def get(self, room: str, handle: str, wait: float, incarnation_of=None) -> _ExecEntry | None:
+        key = (room, handle)
+        with self.lock:
+            self._prune(time.monotonic())
+            e = self.entries.get(key)
+            if e is not None and not self._mine(e, room, incarnation_of):
+                e = None  # an earlier incarnation's, or the room has ended: never served
+        if e is None:
+            return None
+        if e.done_at is None and wait > 0:
+            e.event.wait(wait)
+        with self.lock:
+            return e if self.entries.get(key) is e and self._mine(e, room, incarnation_of) else None
+
+    def drop(self, room: str, handle: str, incarnation_of=None) -> str:
+        """'dropped', 'running' (never dropped) or 'unknown'."""
+        key = (room, handle)
+        with self.lock:
+            e = self.entries.get(key)
+            if e is None or not self._mine(e, room, incarnation_of):
+                return "unknown"
+            if e.done_at is None:
+                return "running"
+            self._drop(key)
+            return "dropped"
+
+    def forget_room(self, room: str, incarnation_of=None) -> None:
+        """An ended room's finished answers go; a running one is stored when it ends and ages out.
+
+        With incarnation_of, the answers of a live incarnation of the room (made again since the delete or
+        room_end was signed) stay: only the others go."""
+        with self.lock:
+            live = incarnation_of(room) if incarnation_of is not None else None
+            for key in [k for k, e in self.entries.items()
+                        if k[0] == room and e.done_at is not None and (live is None or e.incarnation != live)]:
+                self._drop(key)
+
+
+def retire_room(ledger: "Ledger", room: str, exec_results: "ExecResults | None" = None) -> None:
+    """Drop what the front keeps for a room whose incarnation a signed delete or room_end ended.
+
+    A room made again since (it has a live incarnation) keeps its own: each store asks under its lock, store first and
+    the ledger second (the exec results included).
+
+    A window remains: a create signed after a store's check and before that store's cleanup finishes. It can
+    only affect the front's own bookkeeping, and the files a store removes, for a room the API has deleted or
+    is deleting (a deleting container can still be running), because a create that returns an existing id
+    returns the room the API recorded earlier. A delete answered with a non-2xx status schedules no retire:
+    the room keeps its incarnation until a later delete or room_end ends it."""
+    if ledger.secrets is not None:
+        ledger.secrets.retire(room, ledger.room_incarnation)
+    if ledger.sealed_exec is not None:
+        ledger.sealed_exec.retire(room, ledger.room_incarnation)
+    if ledger.sealed_env is not None:
+        ledger.sealed_env.retire(room, ledger.room_incarnation)
+    if exec_results is not None:
+        exec_results.forget_room(room, ledger.room_incarnation)
+
+
+def room_of(path: str) -> str | None:
+    """The room id a request path names, or None for a path with no room.
+
+    *path* must be the API's path form (``urlparse(...).path``), which drops a
+    ``;params`` suffix. ``urlsplit`` keeps that suffix in the path and would
+    make ``sbx_1;alias`` look like another room (AB#384).
+    """
+    m = ROOM_PATH.match(path)
+    return m["id"] if m else None
+
+
+def route_kind(method: str, path: str) -> str:
+    """How the gate sees a request that names a room.
+
+    delete, claim, signed (a row of SIGNED), record_read (the reads an unclaimed pool room allows), read, or
+    other (anything on no list).
+    """
+    if method == "DELETE" and re.match("^" + ROOM + "$", path):
+        return "delete"
+    if method == "POST" and CLAIM_ROUTE.match(path):
+        return "claim"
+    if any(meth == method and pat.match(path) for meth, pat, _action in SIGNED):
+        return "signed"
+    if any(meth == method and pat.match(path) for meth, pat in RECORD_READS):
+        return "record_read"
+    if any(meth == method and pat.match(path) for meth, pat in READS):
+        return "read"
+    return "other"
+
+
+def api_request_path(raw_target: str) -> tuple[str, str]:
+    """Path and query as the room API sees them (urlparse drops ``;params``).
+
+    Returns ``(path, forward)`` where *forward* is path plus ``?query`` when
+    present — the spelling passed to the upstream API.
+    """
+    parsed = urlparse(raw_target)
+    path = parsed.path
+    forward = path + (f"?{parsed.query}" if parsed.query else "")
+    return path, forward
+
+
+def parse_expires_at(value, now: float) -> float | None:
+    """The epoch of the API's expires_at (an ISO time with an offset), or None unless it lies in (now, now + 48 h + 60 s]."""
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        return None
+    epoch = moment.timestamp()
+    return epoch if now < epoch <= now + EXPIRES_MAX_SECONDS else None
+
+
+class Turn:
+    """One authorized request between Ledger.enter and Ledger.leave."""
+
+    __slots__ = ("room", "token", "receipts_before", "serial", "nonread", "claim", "called", "lost")
+
+    def __init__(self, room: str, token: bool, receipts_before: int, serial: bool = False,
+                 nonread: bool = False, claim: bool = False) -> None:
+        self.room, self.token, self.receipts_before, self.serial = room, token, receipts_before, serial
+        self.nonread = nonread  # not a read: it may change the room
+        self.claim = claim
+        self.called = False  # a request went to the API
+        self.lost = False  # the API gave no answer
 
 
 class Upstreams(threading.local):
@@ -2157,8 +2912,96 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # no request logs
         pass
 
+    turn: Turn | None = None
+    create_open = False  # a create was forwarded and its receipt is not yet signed
+    bulk_open = False  # a bulk delete was forwarded and has not been answered
+    bulk_wait_open = False  # a bulk delete is counted as pending and has not started
+
+    def handle_one_request(self):
+        self.turn = None
+        self.create_open = False
+        self.bulk_open = False
+        self.bulk_wait_open = False
+        try:
+            super().handle_one_request()
+        finally:
+            self.release_turn()
+
+    def client_gone(self) -> bool:
+        """True when the caller closed its connection (a pipelined next request is data, not a close)."""
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+        except ValueError:
+            return False  # a TLS socket takes no peek flags: the wait runs to its bound
+        except BlockingIOError:
+            return False
+        except OSError:
+            return True
+
+    def hold_bulk_for_claims(self, ledger: "Ledger") -> bool:
+        """Count the bulk delete, wait for the claims in flight, and start it. False: it is answered or dropped here.
+
+        A new claim is refused from the moment the bulk delete is counted. If the caller leaves, nothing is
+        forwarded. If a claim is still in flight after BULK_CLAIM_WAIT_SECONDS (it should not be), or the ledger
+        lock cannot be taken within that time (a signer is stuck on its receipt write), the bulk delete is refused
+        with 409 bulk_delete_claim_busy, not forwarded, and a log line. The wait has one monotonic deadline.
+        """
+        deadline = time.monotonic() + BULK_CLAIM_WAIT_SECONDS
+
+        def refuse(why: str) -> bool:
+            print(f"room-receipts: bulk delete refused: {why} after {BULK_CLAIM_WAIT_SECONDS} s", file=sys.stderr,
+                  flush=True)
+            # Written before the guard is released: releasing takes the ledger lock, which may be the stuck one.
+            self.reply(409, canonical({"error": {"code": "bulk_delete_claim_busy",
+                                                  "message": "a room claim is still running; retry the bulk delete"}}),
+                       release=False)
+            return False
+
+        if not ledger.bulk_arrive(deadline - time.monotonic()):
+            return refuse("the ledger lock was not free")
+        self.bulk_wait_open = True
+        while True:
+            state = ledger.bulk_try_start(BULK_POLL_SECONDS, deadline)
+            if state == "started":
+                break
+            if self.client_gone():
+                self.close_connection = True
+                return False
+            if state in ("lock", "late"):
+                return refuse("the ledger lock was not free in time")
+            if time.monotonic() >= deadline:
+                return refuse(f"{ledger.claims_in_flight} claim(s) still in flight")
+        self.bulk_wait_open = False
+        self.bulk_open = True
+        if self.client_gone():  # once more, right before it is forwarded (the wake-up may have come late)
+            self.close_connection = True
+            return False
+        return True
+
+    def release_turn(self) -> None:
+        """Give back the request's count and token, and its place among the creates in flight. Safe to call twice."""
+        turn, self.turn = self.turn, None
+        if turn is not None:
+            self.server.ledger.leave(turn)
+        if self.create_open:
+            self.create_open = False
+            self.server.ledger.end_create()
+        if self.bulk_open:
+            self.bulk_open = False
+            self.bulk_wait_open = False
+            self.server.ledger.end_bulk()
+        elif self.bulk_wait_open:
+            self.bulk_wait_open = False
+            self.server.ledger.bulk_abandon()
+
     # -- helpers
-    def reply(self, status: int, body: bytes, headers: dict | None = None, ctype="application/json"):
+    def reply(self, status: int, body: bytes, headers: dict | None = None, ctype="application/json",
+              release: bool = True):
+        # The turn ends after the receipt is signed and before the answer is written, so a caller that
+        # sends its next request on seeing this answer finds the room free.
+        if release:
+            self.release_turn()
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -2178,7 +3021,7 @@ class Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(raw[7:].strip().encode(), self.server.api_key)
 
     def upstream(self, port: int, body: bytes | None, *, method: str | None = None, path: str | None = None,
-                 extra: dict | None = None, timeout: float = 1800):
+                 extra: dict | None = None, timeout: float = 1800, deadline: float | None = None):
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
         if extra:
             headers = {k: v for k, v in headers.items() if k.lower() not in {e.lower() for e in extra}}
@@ -2189,16 +3032,25 @@ class Handler(BaseHTTPRequestHandler):
             headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
             headers["Authorization"] = "Bearer " + self.server.api_key.decode()
         method, path = method or self.command, path or self.path
-        if method not in ("GET", "HEAD"):
+        if self.turn is not None:
+            self.turn.called = True
+        if method not in ("GET", "HEAD") or (self.turn is not None and self.turn.serial):
             # A write may have run before its answer was lost, so it is never
             # sent twice: a fresh connection (no stale keep-alive) and no
-            # retry. A lost answer is a 502, and the receipt records it.
+            # retry. A lost answer is a 502, and the receipt records it. On a serial room every
+            # request is sent once, so one receipt stands for exactly one request at the API.
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
-            try:
+
+            def call():
                 c.request(method, path, body=body, headers=headers)
                 r = c.getresponse()
                 return r.status, r.getheaders(), r.read()
+
+            try:
+                return call() if deadline is None else run_within(c, deadline, call)
             except (http.client.HTTPException, OSError):
+                if self.turn is not None:
+                    self.turn.lost = True
                 return 502, [], b'{"error":{"code":"hotel_api_no_answer","message":"the API did not answer; the request may have run"}}'
             finally:
                 c.close()
@@ -2230,7 +3082,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(411, b'{"error":"length_required"}')
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else (b"" if self.command in ("POST", "PUT", "PATCH") else None)
-        path = urlsplit(self.path).path
+        # Same path form as cathedral/sandbox_server.dispatch (urlparse): a
+        # ";alias" suffix must not bypass the serial gate or mis-name a receipt.
+        path, forward_path = api_request_path(self.path)
         ledger: Ledger = self.server.ledger
         if self.command == "GET" and path == "/room/attestation":
             return self.reply(200, canonical(ledger.attestation()))
@@ -2239,7 +3093,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and path == "/room/receipts":
             if not self.authorized():
                 return self.reply(401, b'{"error":"unauthorized"}')
-            q = parse_qs(urlsplit(self.path).query)
+            q = parse_qs(urlparse(self.path).query)
             try:
                 after, limit = int(q.get("after", ["0"])[0]), min(int(q.get("limit", ["1000"])[0]), 10000)
             except ValueError:
@@ -2255,9 +3109,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and m:
             if not self.authorized():
                 return self.reply(401, b'{"error":"unauthorized"}')
+            try:
+                self.server.look_one(m["id"])
+            except Exception:  # noqa: BLE001 a look that fails must not fail the read
+                traceback.print_exc()
             with ledger.lock:
                 page = [ledger.chain[i] for i in ledger.by_room.get(m["id"], [])]
+            # count and room_head are read with the page, so a reader can hold the list against them.
             return self.reply(200, canonical({"sandbox_id": m["id"], "binding_sha256": ledger.binding_sha256,
+                                              "count": len(page),
+                                              "room_head": page[-1]["receipt_sha256"] if page else None,
                                               "receipts": page}))
         if path == "/room/health":
             # Served from the cache that health_loop fills. No upstream call,
@@ -2284,6 +3145,29 @@ class Handler(BaseHTTPRequestHandler):
                 # The API behind accepts the internal key the front adds, so the
                 # front is the gate for every call it passes on.
                 return self.reply(401, b'{"error":"unauthorized"}')
+        if CLAIM_ROUTE.match(path) and self.command != "POST":
+            # Checked before the gate, so an unclaimed room answers a wrong method as every room does.
+            return self.reply(405, b'{"error":{"code":"method_not_allowed","message":"method not allowed"}}', {"Allow": "POST"})
+        m = EXEC_RESULT_ROUTE.match(path)
+        if m and self.command in ("GET", "DELETE"):
+            # Answered here, before the serial gate: it reads (or drops) what this front kept and
+            # never reaches the API.
+            if not self.authorized():
+                return self.reply(401, b'{"error":"unauthorized"}')
+            return self.handle_exec_result(m["id"])
+        room = room_of(path)
+        if not self.server.pool_scan_ready and self.authorized() and (
+                room or (self.command in ("POST", "DELETE") and path == "/v1/sandboxes")):
+            # Until the startup list is read no room traffic passes, and no create or bulk delete either: a pool
+            # room made now could be listed by the scan as one this front never signed.
+            return self.reply(503, canonical({"error": {"code": "pool_state_unknown",
+                                                      "message": "room state is being checked; retry shortly"}}))
+        if room and self.authorized():
+            # Callers without the key are not counted: they never hold a token, and the API refuses them.
+            self.turn, refusal = ledger.enter(room, route_kind(self.command, path))
+            if refusal is not None:
+                status, code, message = refusal
+                return self.reply(status, canonical({"error": {"code": code, "message": message}}))
         m = SECRETS_ROUTE.match(path)
         if m:
             # Never passed to the API: the envelope stops here, opened or refused.
@@ -2296,8 +3180,10 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             # Opened here; only the opened overlay goes on, inside the guest, to the room API.
             return self.handle_sealed_env(ledger, m["id"], body)
-        api_path = urlparse(self.path).path
-        if any(route.match(p) for route in INTERNAL_API_ROUTES for p in (api_path, unquote(api_path))):
+        m = CLAIM_ROUTE.match(path)
+        if m:
+            return self.handle_claim(ledger, m["id"], body)
+        if any(route.match(p) for route in INTERNAL_API_ROUTES for p in (path, unquote(path))):
             # The room API's sealed exec route runs an exec that leaves no history or log, and
             # its env-sealed route sets a room's env from an envelope this front opened; neither
             # is a signed route here: no caller may reach them. Matched as the API matches
@@ -2317,35 +3203,160 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 pass  # not JSON: the API answers
         refusal, owner_fields = self.owner_gate(ledger, body)
-        if refusal is not None:
-            status, headers, out = 403, [], refusal
-        else:
-            status, headers, out = self.upstream(
-                self.server.api_port, body,
-                **({"timeout": plain_exec_wait(body)} if action == "exec" else {}))
-        extra = {}
-        if action and self.authorized():
-            try:
-                extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(ledger.sign(
-                    {**self.fields(action, path, body, status, out), **owner_fields}))).decode()
-            except Exception as exc:  # noqa: BLE001 the action ran: answer, and say the receipt is missing
-                traceback.print_exc()
-                extra["X-Room-Receipt-Error"] = type(exc).__name__
-            if action == "create" and 200 <= status < 300 and ledger.sealed_env is not None:
-                # A create answered again for a room the API kept moves its incarnation: an
-                # overlay set under the old one comes off before the room is used again.
-                ledger.reconcile_sealed_env(self.env_apply)
-            deleted = re.match("^" + ROOM + "$", path) if action == "delete" and 200 <= status < 300 else None
-            if deleted and ledger.secrets is not None:
-                # After the receipt, which ends the room's incarnation: no write lands from here on.
-                ledger.secrets.retire(deleted["id"])
-            if deleted and ledger.sealed_exec is not None:
-                ledger.sealed_exec.retire(deleted["id"])
-            if deleted and ledger.sealed_env is not None:
-                ledger.sealed_env.retire(deleted["id"])
-        ctype = next((v for k, v in headers if k.lower() == "content-type"), "application/json")
-        passthrough = {k: v for k, v in headers if k.lower() not in HOP and k.lower() != "content-type"}
-        return self.reply(status, out, {**passthrough, **extra}, ctype)
+        if refusal is None and action == "create" and self.asks_for_other_than_one_room(body):
+            # One create, one room, so each room's list holds its own create. Refused unsent and unsigned,
+            # as the surrogate refusal above is.
+            return self.reply(400, b'{"error":{"code":"create_count_refused","message":"a create makes one room"}}')
+        create_ask = None
+        if refusal is None and action == "create":
+            problem, create_ask = self.reserved_label_check(body)
+            if problem is not None:
+                return self.reply(400, canonical({"error": {"code": problem[0], "message": problem[1]}}))
+        track = None
+        if refusal is None and action == "exec" and self.authorized() and EXEC_HANDLE_HEADER in self.headers:
+            handle = self.headers.get(EXEC_HANDLE_HEADER, "")
+            if not EXEC_HANDLE.fullmatch(handle):
+                return self.reply(400, b'{"error":{"code":"invalid_request","message":"X-Room-Exec-Handle must be 32 lowercase hex characters"}}')
+            started = self.server.exec_results.begin(room, handle, ledger.room_incarnation(room))
+            if started == "busy":
+                # Never replace a running exec's entry: its broker would read another command's answer.
+                return self.reply(409, b'{"error":{"code":"exec_handle_in_use","message":"a running exec holds this handle; nothing was started"}}')
+            if started == "tracked":
+                track = (room, handle)
+            # "full": the exec runs untracked; a re-attach reads exec_unknown.
+        kept = False
+        try:
+            if refusal is not None:
+                status, headers, out = 403, [], refusal
+            else:
+                if action == "create" and self.authorized():
+                    ledger.begin_create()
+                    self.create_open = True
+                elif action == "bulk_delete" and self.authorized():
+                    if not self.hold_bulk_for_claims(ledger):
+                        return
+                # Forward the canonical path (no ";params") so gate, receipt and API agree.
+                status, headers, out = self.upstream(
+                    self.server.api_port, body, path=forward_path,
+                    **({"timeout": plain_exec_wait(body)} if action == "exec" else {}),
+                    **({"deadline": BULK_FORWARD_SECONDS} if action == "bulk_delete" else {}))
+                if self.bulk_open and not bulk_outcome_is_certain(status):
+                    ledger.mark_pool_unknown()  # before the reply releases the guard
+            extra = {}
+            if create_ask and create_ask.get("pool"):
+                # The API's own answer says when the room's limit falls; the claim's time-left rule reads it.
+                try:
+                    result = json.loads(out)
+                    expiry = result.get("expires_at")
+                    created_at = result.get("created_at")
+                except (ValueError, RecursionError, AttributeError):
+                    expiry = None
+                    created_at = None
+                create_ask = {**create_ask, "expires_at": parse_expires_at(expiry, time.time()),
+                              "created_at": created_at}
+            if action and self.authorized():
+                try:
+                    extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(ledger.sign(
+                        {**self.fields(action, path, body, status, out, target_path=forward_path), **owner_fields},
+                        **({"create": create_ask} if create_ask else {})))).decode()
+                except Exception as exc:  # noqa: BLE001 the action ran: answer, and say the receipt is missing
+                    traceback.print_exc()
+                    extra["X-Room-Receipt-Error"] = type(exc).__name__
+                if action == "create" and 200 <= status < 300 and ledger.sealed_env is not None:
+                    # A create answered again for a room the API kept moves its incarnation: an
+                    # overlay set under the old one comes off before the room is used again.
+                    ledger.reconcile_sealed_env(self.env_apply)
+                deleted = re.match("^" + ROOM + "$", path) if action == "delete" and 200 <= status < 300 else None
+                if deleted:
+                    # After the receipt, which ends the room's incarnation: no write lands from here on.
+                    retire_room(ledger, deleted["id"], self.server.exec_results)
+            ctype = next((v for k, v in headers if k.lower() == "content-type"), "application/json")
+            passthrough = {k: v for k, v in headers if k.lower() not in HOP and k.lower() != "content-type"}
+            if track is not None:
+                self.server.exec_results.finish(*track, status, {**passthrough, **extra}, out, ctype)
+                kept = True
+            return self.reply(status, out, {**passthrough, **extra}, ctype)
+        finally:
+            if track is not None and not kept:
+                # Whatever went wrong after the mark, the entry ends: a running entry is never evicted.
+                self.server.exec_results.finish(*track, 502, {}, EXEC_RESULT_FRONT_FAILED, "application/json")
+
+    def handle_exec_result(self, room: str):
+        """GET: a kept exec's answer (running, or the signed answer as it was) by handle. DELETE: drop it."""
+        q = parse_qs(urlsplit(self.path).query)
+        handle = (q.get("handle") or [""])[0]
+        if not EXEC_HANDLE.fullmatch(handle):
+            return self.reply(400, b'{"error":{"code":"invalid_request","message":"handle must be 32 lowercase hex characters"}}')
+        results: ExecResults = self.server.exec_results
+        if self.command == "DELETE":
+            outcome = results.drop(room, handle, self.server.ledger.room_incarnation)
+            if outcome == "running":
+                return self.reply(409, b'{"error":{"code":"exec_running","message":"the exec is still running"}}')
+            if outcome == "unknown":
+                return self.reply(404, b'{"error":{"code":"exec_unknown","message":"no kept exec with this handle"}}')
+            return self.reply(200, b'{"dropped":true}')
+        try:
+            wait = int((q.get("wait") or ["0"])[0])
+        except ValueError:
+            wait = -1
+        if not 0 <= wait <= EXEC_RESULT_MAX_WAIT:
+            return self.reply(400, canonical({"error": {"code": "invalid_request",
+                                                        "message": f"wait must be 0 to {EXEC_RESULT_MAX_WAIT}"}}))
+        e = results.get(room, handle, wait, self.server.ledger.room_incarnation)
+        if e is None:
+            return self.reply(404, b'{"error":{"code":"exec_unknown","message":"this hotel does not hold an exec with this handle"}}')
+        if e.done_at is None:
+            return self.reply(200, b'{"state":"running"}', {EXEC_STATE_HEADER: "running"})
+        # The bytes and receipt of the original answer, so its result_sha256 still checks. Not signed again.
+        return self.reply(e.status, e.body, {**e.headers, EXEC_STATE_HEADER: "done"}, e.ctype)
+
+    def reserved_label_check(self, body: bytes | None) -> tuple[tuple[str, str] | None, dict | None]:
+        """(refusal, ask) for a create. The ask says what the create requested, for the signing step.
+
+        The serial label must be the string "1", alone (not with the pool label). A serial create always
+        makes a new room, so it carries no Idempotency-Key.
+        """
+        try:
+            doc = json.loads(body or b"")
+        except (ValueError, RecursionError):
+            return None, None
+        labels = doc.get("labels") if isinstance(doc, dict) else None
+        if not isinstance(labels, dict):
+            return None, None
+        if SERIAL_LABEL not in labels:
+            return self.pool_create_check(doc, labels) if POOL_LABEL in labels else (None, None)
+        if labels[SERIAL_LABEL] != "1" or type(labels[SERIAL_LABEL]) is not str or POOL_LABEL in labels:
+            return ("reserved_label_invalid", f"{SERIAL_LABEL} must be the string 1 and not set with {POOL_LABEL}"), None
+        if self.headers.get_all("Idempotency-Key") is not None:
+            return ("idempotency_key_refused", "a serial room is made without an Idempotency-Key"), None
+        return None, {"serial": True}
+
+    def pool_create_check(self, doc: dict, labels: dict) -> tuple[tuple[str, str] | None, dict | None]:
+        """The rules of a pre-made room's create. The room runs nothing at create but the machine's own main process."""
+        invalid = ("pool_create_invalid", "a pool create has an image, resources, the deny_all network, labels and "
+                                          "ttl_seconds, and nothing else")
+        if labels[POOL_LABEL] != "1" or type(labels[POOL_LABEL]) is not str:
+            return ("reserved_label_invalid", f"{POOL_LABEL} must be the string 1"), None
+        if self.headers.get_all("Idempotency-Key") is not None:
+            return ("idempotency_key_refused", "a pool room is made without an Idempotency-Key"), None
+        if SANDBOX_LINK_LABEL in labels or not set(doc) <= POOL_CREATE_KEYS:
+            return invalid, None
+        if not set(doc) == POOL_CREATE_KEYS:
+            return invalid, None
+        image, resources, ttl = doc["image"], doc["resources"], doc["ttl_seconds"]
+        if not isinstance(image, str) or not image or not isinstance(resources, dict) or not resources:
+            return invalid, None
+        if type(ttl) is not int or ttl < 1 or doc["network"] != DENY_ALL:
+            return invalid, None
+        return None, {"pool": True}
+
+    @staticmethod
+    def asks_for_other_than_one_room(body: bytes | None) -> bool:
+        try:
+            doc = json.loads(body or b"")
+        except (ValueError, RecursionError):
+            return False  # not JSON: the API answers
+        return isinstance(doc, dict) and "count" in doc and not (type(doc["count"]) is int and doc["count"] == 1)
 
     def owner_gate(self, ledger: "Ledger", body: bytes | None) -> tuple[bytes | None, dict]:
         """Dedicated machine: (403 body, {}) for a gated request without a
@@ -2520,6 +3531,92 @@ class Handler(BaseHTTPRequestHandler):
             extra["X-Room-Receipt-Error"] = "sign_failed"
         return self.reply(200, canonical(out), extra)
 
+    def replay_refusal(self, ledger: "Ledger", room: str) -> tuple[str, str] | None:
+        """Why a stored claim answer must not be replayed, or None. One GET of the room, bounded as the claim is.
+
+        A claim leaves the room's labels alone, so a bulk delete can remove a claimed room: the stored 200 is
+        replayed only while the room is there and not marked unknown.
+        """
+        with ledger.lock:
+            if room in ledger.unknown:
+                return ("pool_room_unknown", "a bulk delete that may have removed the room did not finish cleanly")
+        got = self.server.api_get(f"/v1/sandboxes/{room}", CLAIM_WAIT_SECONDS, total=CLAIM_WAIT_SECONDS)
+        if got is not None and got[0] == 200:
+            # A bulk delete that ended uncertainly may have marked the room while the GET was in flight.
+            with ledger.lock:
+                if room in ledger.unknown:
+                    return ("pool_room_unknown", "a bulk delete that may have removed the room did not finish cleanly")
+                if room not in ledger.claimed:
+                    return ("pool_room_gone", "the room is not claimed any more")
+            return None
+        if got is not None and got[0] in (404, 409):
+            return ("pool_room_gone", "the room is not there")
+        return ("pool_room_unknown", "the room could not be looked at")
+
+    def handle_claim(self, ledger: "Ledger", room: str, body: bytes | None):
+        """POST /v1/sandboxes/<room>/claim {"cathedral_sandbox_id", "lifetime_seconds"}: bind a pre-made room to a sandbox.
+
+        The gate holds the room's token, so no delete and no second claim runs beside this one. One try per
+        room: if the lifetime call does not succeed the claim is signed as failed and the room is broken.
+        """
+        if self.command != "POST":
+            return self.reply(405, b'{"error":{"code":"method_not_allowed","message":"method not allowed"}}', {"Allow": "POST"})
+        if not self.authorized():
+            return self.reply(401, b'{"error":"unauthorized"}')
+
+        def refuse(status: int, code: str, message: str, extra: dict | None = None):
+            return self.reply(status, canonical({"error": {"code": code, "message": message}}), extra)
+
+        try:
+            doc = json.loads(body or b"")
+        except (ValueError, RecursionError):
+            doc = None
+        cid = doc.get("cathedral_sandbox_id") if isinstance(doc, dict) else None
+        lifetime = doc.get("lifetime_seconds") if isinstance(doc, dict) else None
+        if not (isinstance(doc, dict) and set(doc) == {"cathedral_sandbox_id", "lifetime_seconds"}
+                and isinstance(cid, str) and SANDBOX_LINK_RE.fullmatch(cid)
+                and type(lifetime) is int and 1 <= lifetime <= CLAIM_LIFETIME_MAX):
+            return refuse(400, "claim_request_invalid", "the body is exactly cathedral_sandbox_id (a lower-case UUID) "
+                                                         "and lifetime_seconds (1 to 172800)")
+        stored, refusal, create_sha = ledger.claim_check(room, cid, time.time())
+        if stored is not None:
+            replay_refusal = self.replay_refusal(ledger, room)
+            if replay_refusal is not None:
+                return refuse(409, *replay_refusal)
+            status, answer_body, receipt = stored
+            return self.reply(status, answer_body, {"X-Room-Receipt": base64.urlsafe_b64encode(canonical(receipt)).decode()})
+        if refusal is not None:
+            return refuse(409, *refusal)
+        try:
+            status, _headers, out = self.upstream(
+                self.server.api_port, canonical({"ttl_seconds": lifetime}), method="POST",
+                path=f"/v1/sandboxes/{room}/lifetime", extra={"Content-Type": "application/json"},
+                timeout=CLAIM_WAIT_SECONDS, deadline=CLAIM_WAIT_SECONDS)
+            try:
+                result = json.loads(out)
+            except (ValueError, RecursionError):
+                result = None
+            expires = result.get("expires_at") if isinstance(result, dict) else None
+            expires = expires if isinstance(expires, str) else None
+            answer = {"sandbox_id": room, "cathedral_sandbox_id": cid, "lifetime_seconds": lifetime,
+                      "pooled_from": create_sha, "expires_at": expires, "status": "claimed"}
+            receipt = ledger.sign_claim(room, {
+                "action": "claim", "target": f"POST /v1/sandboxes/{room}/claim", "sandbox_id": room,
+                "customer_request_sha256": sha(body or b""), "cathedral_sandbox_id": cid,
+                "lifetime_seconds": lifetime, "pooled_from": create_sha, "status": status,
+                "result_sha256": sha(out), "expires_at": expires}, answer)
+        except BaseException:
+            # The lifetime call may have run: the room must not be left open to a second try.
+            with ledger.lock:
+                ledger.broken.add(room)
+            traceback.print_exc()
+            return refuse(409, "pool_claim_failed", "the claim could not be recorded; delete the room",
+                          {"X-Room-Receipt-Error": "sign_failed"})
+        header = {"X-Room-Receipt": base64.urlsafe_b64encode(canonical(receipt)).decode()}
+        if 200 <= status < 300:
+            return self.reply(200, canonical(answer), header)
+        return refuse(409, "pool_claim_failed", "the room's lifetime could not be set; delete the room", header)
+
     def handle_sealed_exec(self, ledger: "Ledger", room: str, body: bytes | None):
         """POST: open one customer-sealed exec, run it in the room, seal the room API's answer back.
 
@@ -2578,7 +3675,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             receipt = ledger.sign({
                 "action": "exec",
-                "target": f"{self.command} {self.path}",
+                "target": f"{self.command} {api_request_path(self.path)[1]}",
                 "sandbox_id": room,
                 "customer_request_sha256": sha(body),
                 # As for every exec: sha256 of the command the room ran, here the opened one.
@@ -2681,7 +3778,8 @@ class Handler(BaseHTTPRequestHandler):
             "ok": True, "window_id": window_id, "path": path, "encrypted": encrypted,
         }), extra)
 
-    def fields(self, action: str, path: str, body: bytes | None, status: int, out: bytes) -> dict:
+    def fields(self, action: str, path: str, body: bytes | None, status: int, out: bytes,
+               *, target_path: str | None = None) -> dict:
         req = {}
         try:
             req = json.loads(body) if body else {}
@@ -2704,6 +3802,9 @@ class Handler(BaseHTTPRequestHandler):
         policy = self.network_policy(action, status, res)
         tunables = self.room_tunables(action, status, res)
         link = self.sandbox_link(action, req)
+        # AB#406: the exec token's hash ties a cancel receipt to the exec receipt it stopped.
+        # Only when the body names a token, so an exec without one signs what it always signed.
+        token = req.get("spill_token") if action in ("exec", "exec_cancel") and isinstance(req, dict) else None
         start_command = None
         start_command_sha256 = None
         if action == "create" and isinstance(res, dict) and 200 <= status < 300:
@@ -2711,9 +3812,11 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(raw_start, list) and all(isinstance(part, str) for part in raw_start):
                 start_command = raw_start
                 start_command_sha256 = sha(canonical(start_command))
+        receipt_path = target_path if target_path is not None else path
         return {
             "action": action,
-            "target": f"{self.command} {self.path}",
+            # *receipt_path* is path plus query (urlparse drops ``;params``); never the raw client target.
+            "target": f"{self.command} {receipt_path}",
             "sandbox_id": sandbox if isinstance(sandbox, str) else None,
             "customer_request_sha256": sha(body or b""),
             "command_sha256": sha(canonical(command)) if command is not None else None,
@@ -2734,6 +3837,7 @@ class Handler(BaseHTTPRequestHandler):
             # Create: the Cathedral sandbox id the request's labels name (AB#389). Read from
             # the request as this guest received it, so customer_request_sha256 covers it too.
             **({"cathedral_sandbox_id": link} if link else {}),
+            **({"exec_token_sha256": sha(token.encode())} if isinstance(token, str) and token else {}),
             **({"start_command": start_command, "start_command_sha256": start_command_sha256}
                if action == "create" else {}),
         }
@@ -2787,17 +3891,153 @@ class Server(ThreadingHTTPServer):
     request_queue_size = 1024
 
     def __init__(self, addr, ledger, api_port, health_port, api_key, docker_sock, attest_per_minute=30, *,
-                 attestation_only=False):
+                 attestation_only=False, look_seconds=None, pool_scan=True):
+        self._stop_look = threading.Event()
+        self.look_thread = None
         super().__init__(addr, Handler)
         self.attest_per_minute = max(1, int(attest_per_minute))
         self.ledger, self.api_port, self.health_port, self.api_key = ledger, api_port, health_port, api_key
         self.docker_sock = docker_sock
         self.attestation_only = attestation_only
+        self.exec_results = ExecResults()
         self._digests: dict[str, str | None] = {}
         self.health_lock = threading.Lock()
         self.health: tuple[int, bytes | None, float] = (503, None, 0.0)
+        self.pool_scan_ready = attestation_only or not pool_scan
         if not attestation_only:
             threading.Thread(target=self.health_loop, daemon=True).start()
+            if look_seconds is not None:
+                self.look_thread = threading.Thread(target=self.look_loop, args=(look_seconds,), daemon=True,
+                                                    name="room-look")
+                self.look_thread.start()
+            if pool_scan and not self.collect_surviving_pool_rooms():
+                threading.Thread(target=self.pool_scan_loop, daemon=True, name="pool-restart-scan").start()
+
+    def pool_scan_loop(self) -> None:
+        """Retry a failed startup list without accepting an unknown pool room meanwhile."""
+        while not self._stop_look.wait(5):
+            if self.pool_scan_ready:
+                return
+            if self.collect_surviving_pool_rooms():
+                return
+
+    def collect_surviving_pool_rooms(self) -> bool:
+        """Classify surviving pool rooms before room traffic can pass through this front."""
+        listed = self.api_get(f"/v1/sandboxes?label={POOL_LABEL}=1", 60)
+        if listed is None or listed[0] != 200:
+            return False
+        try:
+            docs = json.loads(listed[1])["sandboxes"]
+        except (ValueError, RecursionError, KeyError, TypeError):
+            return False
+        if not isinstance(docs, list):
+            return False
+        stale: set[str] = set()
+        recovered: dict[str, str] = {}
+        for doc in docs:
+            if not isinstance(doc, dict):
+                return False
+            room = doc.get("id")
+            labels = doc.get("labels")
+            if not (isinstance(room, str) and isinstance(labels, dict)):
+                return False
+            if labels.get(POOL_LABEL) != "1":
+                return False
+            with self.ledger.lock:
+                if room in self.ledger.incarnations:
+                    continue
+            created_at = doc.get("created_at")
+            claim = self.ledger.recovered_pool_claim(room, created_at) if isinstance(created_at, str) else None
+            if claim is not None:
+                recovered[room] = claim
+                continue
+            stale.add(room)
+        with self.ledger.lock:
+            self.ledger.pool_stale.update(stale)
+            self.ledger.claimed_before.update(recovered)
+            self.pool_scan_ready = True
+        return True
+
+    def server_close(self) -> None:
+        self._stop_look.set()
+        super().server_close()
+
+    def look_loop(self, seconds: float) -> None:
+        """Look for rooms the API no longer has, every *seconds*, until the server closes."""
+        while not self._stop_look.wait(seconds):
+            try:
+                self.look_all()
+            except Exception:  # noqa: BLE001 one failed look must not end the loop
+                traceback.print_exc()
+
+    def api_get(self, path: str, timeout: float, total: float | None = None) -> tuple[int, bytes] | None:
+        """One GET to the room API with the front's own key; None when it gave no answer.
+
+        *timeout* bounds each read; *total*, when given, bounds the whole call."""
+        c = http.client.HTTPConnection("127.0.0.1", self.api_port, timeout=timeout)
+
+        def call():
+            c.request("GET", path, headers={"Authorization": "Bearer " + self.api_key.decode()})
+            r = c.getresponse()
+            return r.status, r.read()
+
+        try:
+            return call() if total is None else run_within(c, total, call)
+        except (http.client.HTTPException, OSError):
+            return None
+        finally:
+            c.close()
+
+    def look_all(self) -> None:
+        """End each live room the API no longer lists.
+
+        The table is copied before the list is asked for, so a room made while the answer was on its way is
+        not in the copy and is never ended by this look. A failed list or an unexpected answer ends nothing.
+        """
+        with self.ledger.lock:
+            live = dict(self.ledger.incarnations)
+        if not live:
+            return
+        listed = self.api_get("/v1/sandboxes", 60)
+        if listed is None or listed[0] != 200:
+            return
+        try:
+            rooms = json.loads(listed[1])["sandboxes"]
+            present = {doc["id"] for doc in rooms}
+        except (ValueError, RecursionError, KeyError, TypeError):
+            return
+        for room, incarnation in live.items():
+            if room not in present:
+                self.look_at(room, incarnation)
+
+    def look_one(self, room: str) -> None:
+        """The same look for one room: one GET, no list. Run before a read of the room's receipts."""
+        with self.ledger.lock:
+            incarnation = self.ledger.incarnations.get(room)
+        if incarnation is not None:
+            self.look_at(room, incarnation)
+
+    def look_at(self, room: str, incarnation: str) -> None:
+        """Ask the API for one room and sign room_end when it says the room is gone or going.
+
+        Only 404 sandbox_not_found and 409 sandbox_deleting end a room: any other answer proves nothing. A room
+        with a request in flight is left to that request's own receipt.
+        """
+        with self.ledger.lock:
+            if self.ledger.in_flight.get(room):
+                return
+        got = self.api_get(f"/v1/sandboxes/{room}", 30)
+        if got is None:
+            return
+        status, out = got
+        try:
+            reason = json.loads(out)["error"]["code"]
+        except (ValueError, RecursionError, KeyError, TypeError):
+            return
+        if (status, reason) not in ((404, "sandbox_not_found"), (409, "sandbox_deleting")):
+            return
+        if self.ledger.end_room(room, incarnation, status, reason, sha(out)) is not None:
+            retire_room(self.ledger, room, self.exec_results)
 
     def health_loop(self) -> None:
         """Build the health answer once a second, off the request path."""
@@ -2886,8 +4126,10 @@ def main() -> int:
     store = env.get("ROOM_RECEIPTS_DIR", "/run/room-receipts")
     secrets = SealedSecrets(env.get("ROOM_SEALED_SECRETS_DIR") or DEFAULT_SECRETS_DIR) if sealed_secrets_wanted() else None
     sealed_exec = SealedExec() if sealed_exec_wanted() else None
+    ingress = GuestIngress(env["ROOM_HOTEL_NAME"]) if guest_ingress_wanted() else None
     try:
-        ledger = Ledger(env["ROOM_HOTEL_NAME"], store, miner=miner, secrets=secrets, sealed_exec=sealed_exec)
+        ledger = Ledger(env["ROOM_HOTEL_NAME"], store, miner=miner, secrets=secrets, sealed_exec=sealed_exec,
+                        ingress=ingress)
     except OwnerBindingError as exc:
         # Fail closed: nothing listens, so the broker sees the hotel down.
         # The console is the guest serial port, the one log the host operator can read.
@@ -2907,19 +4149,25 @@ def main() -> int:
                   f"room directories under {ledger.secrets.root}", flush=True)
         if ledger.sealed_exec is not None:
             print(f"room-receipts: sealed commands on: key {ledger.sealed_exec.public_b64} in the binding", flush=True)
-    elif secrets is not None or sealed_exec is not None:
-        print("room-receipts: ROOM_SEALED_SECRETS=1 and ROOM_SEALED_EXEC=1 are ignored: level 1 has no SNP report "
+        if ledger.ingress is not None:
+            print(f"room-receipts: guest ingress key on: tls_spki_sha256 {ledger.ingress.tls_spki_sha256} "
+                  "in the binding (nothing serves on it yet)", flush=True)
+    elif secrets is not None or sealed_exec is not None or ingress is not None:
+        flags = [name for name, box in (("ROOM_SEALED_SECRETS", secrets), ("ROOM_SEALED_EXEC", sealed_exec),
+                                        ("ROOM_GUEST_INGRESS", ingress)) if box is not None]
+        print(f"room-receipts: {' and '.join(f'{f}=1' for f in flags)} ignored: level 1 has no SNP report "
               "to bind the key", flush=True)
     else:
         print(f"room-receipts: binding {ledger.binding_sha256} level hotel", flush=True)
+    look = float(env.get("ROOM_LOOK_SECONDS", "15"))  # 0 turns the look off
     args = (ledger, int(env.get("ROOM_API_PORT", "18090")), int(env.get("ROOM_HEALTH_PORT", "18091")), api_key,
             env.get("ROOM_DOCKER_SOCK", "/run/pool-room/docker.sock"), int(env.get("ROOM_ATTEST_PER_MINUTE", "30")))
     if miner is None:
-        srv = Server((host, int(port)), *args)
+        srv = Server((host, int(port)), *args, look_seconds=look or None)
         srv.serve_forever()
         return 0
     tls_host, tls_port = env["ROOM_RECEIPTS_TLS_LISTEN"].rsplit(":", 1)
-    tls = TLSServer((tls_host, int(tls_port)), *args, tls_context=miner.tls_context(store))
+    tls = TLSServer((tls_host, int(tls_port)), *args, tls_context=miner.tls_context(store), look_seconds=look or None)
     plain = Server((host, int(port)), *args, attestation_only=True)
     threading.Thread(target=plain.serve_forever, daemon=True).start()
     print(f"room-receipts: miner hotel: HTTPS {tls_host}:{tls_port} tls_spki_sha256 {miner.tls_spki_sha256}; "

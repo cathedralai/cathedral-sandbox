@@ -42,7 +42,7 @@ def _commit_digest(work: Path, digest: str) -> None:
 
 @pytest.fixture
 def repos(tmp_path: Path) -> tuple[Path, Path]:
-    """(upstream work tree, operator clone). Upstream path ends in cathedralai/cathedral-sandbox.git."""
+    """(upstream work tree, operator clone). Only fetch is redirected to the local fixture."""
     origin = tmp_path / "cathedralai" / "cathedral-sandbox.git"
     origin.parent.mkdir()
     _git("init", "-q", "--bare", "-b", "main", str(origin))
@@ -51,6 +51,7 @@ def repos(tmp_path: Path) -> tuple[Path, Path]:
     _commit_digest(up, NEW)
     op = tmp_path / "operator"
     _git("clone", "-q", str(origin), str(op))
+    _git("remote", "set-url", "origin", "https://github.com/cathedralai/cathedral-sandbox.git", cwd=op)
     return up, op
 
 
@@ -67,7 +68,23 @@ def _binary_that_prints(tmp_path: Path, digest: str) -> Path:
 
 
 def _run(*args: str | Path, allow: str | None = None) -> subprocess.CompletedProcess[str]:
-    env = {"PATH": "/usr/bin:/bin", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    repo = Path(args[1])
+    shim_dir = repo.parent / "git-shim"
+    shim_dir.mkdir(exist_ok=True)
+    shim = shim_dir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = -C ] && [ \"$3\" = fetch ]; then\n"
+        "  printf x >> \"$FETCH_MARKER\"\n"
+        "  exec /usr/bin/git -C \"$2\" fetch -q \"$FIXTURE_ORIGIN\" \"$6\"\n"
+        "fi\n"
+        "exec /usr/bin/git \"$@\"\n"
+    )
+    shim.chmod(0o755)
+    env = {"PATH": f"{shim_dir}:/usr/bin:/bin", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_CONFIG_SYSTEM": "/dev/null",
+           "FIXTURE_ORIGIN": str(repo.parent / "cathedralai" / "cathedral-sandbox.git"),
+           "FETCH_MARKER": str(repo.parent / "fetch.marker")}
     if allow is not None:
         env["ALLOW_CATALOG_DIGEST"] = allow
     return subprocess.run([BASH, str(CHECK), *map(str, args)], env=env, capture_output=True, text=True, timeout=60)
@@ -185,7 +202,66 @@ def test_origin_must_be_cathedral_sandbox(tmp_path, repos):
     _, op = repos
     _git("remote", "set-url", "origin", str(tmp_path / "fork" / "cathedral-sandbox-fork.git"), cwd=op)
     r = _run("binary", op, _binary_that_prints(tmp_path, NEW), "-print-catalog-digest")
-    assert r.returncode == 1 and "not cathedralai/cathedral-sandbox" in r.stdout
+    assert r.returncode == 1 and "not github.com/cathedralai/cathedral-sandbox" in r.stdout
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/cathedralai/cathedral-sandbox",
+    "https://github.com/cathedralai/cathedral-sandbox.git",
+    "https://github.com/cathedralai/cathedral-sandbox/",
+    "https://token:password@github.com/cathedralai/cathedral-sandbox.git",
+    "git@github.com:cathedralai/cathedral-sandbox",
+    "git@github.com:cathedralai/cathedral-sandbox.git",
+    "ssh://git@github.com/cathedralai/cathedral-sandbox",
+    "ssh://git@github.com/cathedralai/cathedral-sandbox.git/",
+])
+def test_exact_github_origin_forms_pass(tmp_path, repos, url):
+    _, op = repos
+    _git("remote", "set-url", "origin", url, cwd=op)
+    answer = _run("binary", op, _binary_that_prints(tmp_path, NEW), "-print-catalog-digest")
+    assert answer.returncode == 0, answer.stdout + answer.stderr
+    assert (tmp_path / "fetch.marker").exists()
+
+
+@pytest.mark.parametrize("url", [
+    "https://attacker.example/cathedralai/cathedral-sandbox.git",
+    "https://github.com.attacker.example/cathedralai/cathedral-sandbox.git",
+    "https://github.com@attacker.example/cathedralai/cathedral-sandbox.git",
+    "https://attacker.example?@github.com/cathedralai/cathedral-sandbox.git",
+    "https://attacker.example#@github.com/cathedralai/cathedral-sandbox.git",
+    "http://github.com/cathedralai/cathedral-sandbox.git",
+    "https://github.com/another-owner/cathedral-sandbox.git",
+    "https://github.com/cathedralai/another-repo.git",
+    "/mirror/cathedralai/cathedral-sandbox.git",
+    "git@github.com:cathedralai/cathedral-sandbox.git/",
+])
+def test_other_origins_refuse_before_fetch_or_binary(tmp_path, repos, url):
+    _, op = repos
+    _git("remote", "set-url", "origin", url, cwd=op)
+    ran = tmp_path / "binary-ran"
+    binary = _fake_binary(tmp_path, f"touch {ran}; echo {NEW}")
+    answer = _run("binary", op, binary, "-print-catalog-digest")
+    assert answer.returncode == 1
+    assert "origin is not github.com" in answer.stdout
+    assert not (tmp_path / "fetch.marker").exists()
+    assert not ran.exists()
+
+
+def test_instead_of_rewrite_to_another_host_is_refused(tmp_path, repos):
+    _, op = repos
+    _git("config", "url.https://attacker.example/.insteadOf", "https://github.com/", cwd=op)
+    answer = _run("binary", op, _binary_that_prints(tmp_path, NEW), "-print-catalog-digest")
+    assert answer.returncode == 1
+    assert not (tmp_path / "fetch.marker").exists()
+
+
+def test_refusal_does_not_log_remote_userinfo(tmp_path, repos):
+    _, op = repos
+    _git("remote", "set-url", "origin",
+         "https://SENTINEL_TOKEN@attacker.example/cathedralai/cathedral-sandbox.git", cwd=op)
+    answer = _run("binary", op, _binary_that_prints(tmp_path, NEW), "-print-catalog-digest")
+    assert answer.returncode == 1
+    assert "SENTINEL_TOKEN" not in answer.stdout + answer.stderr
 
 
 def test_main_without_a_catalog_digest_refuses(tmp_path, repos):
