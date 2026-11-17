@@ -1,0 +1,11 @@
+{
+  "keys": {
+    "sealed-hotels-golden-test": {
+      "algorithm": "ed25519",
+      "not_after": "2027-11-01T00:00:00Z",
+      "not_before": "2026-11-01T00:00:00Z",
+      "public_key_hex": "031972914d0e8083fd17c99f5f780f425e314e1c8a765595b5cfd0d3d5c31ae6"
+    }
+  },
+  "schema": "cathedral_sealed_hotels_pins_v1"
+}

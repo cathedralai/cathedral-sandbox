@@ -3,7 +3,8 @@
 // The scratch disk of a sealed hotel is wiped every boot, so the first create
 // of a catalog image there pulls it and holds a create slot (up to 12 minutes).
 // With config prewarm_catalog on, a hotel that comes up pulls the live catalog
-// images, and pickIn prefers a hotel that holds the create's image. The
+// images, and pickIn prefers a hotel that holds the create's image. A non-empty
+// prewarm_catalog_hotels limits the pull to the hotels it names. The
 // preference only narrows the candidates that already have a free room. It
 // never removes capacity: when no warm hotel has room, cold hotels serve.
 package main
@@ -11,6 +12,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"time"
 )
 
@@ -19,6 +21,15 @@ import (
 func (b *broker) hotelWentDown(h *hotel) {
 	h.warm = nil
 	h.warmGen++
+}
+
+// prewarms reports whether h pulls the catalog images when it comes up:
+// prewarm_catalog is on and prewarm_catalog_hotels is empty or names h.
+func (b *broker) prewarms(h *hotel) bool {
+	if !b.cfg.PrewarmCatalog {
+		return false
+	}
+	return len(b.cfg.PrewarmCatalogHotels) == 0 || slices.Contains(b.cfg.PrewarmCatalogHotels, h.cfg.ID)
 }
 
 // prewarmHotel pulls each distinct live catalog image on h, one at a time, and

@@ -72,7 +72,7 @@ def _get(port: int) -> dict:
     return body
 
 
-def _chain(tmp_path: Path, monkeypatch):
+def _chain(tmp_path: Path, monkeypatch, other_room_first: bool = False):
     monkeypatch.setattr(rr, "tsm_provider", lambda: None)
 
     def no_snp(_data: bytes) -> bytes:
@@ -80,6 +80,13 @@ def _chain(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(rr, "snp_report", no_snp)
     ledger = rr.Ledger("room-a", str(tmp_path))
+    if other_room_first:
+        # Another guest's room, signed first: a broker filter for this guest drops it whole.
+        ledger.sign({
+            "action": "create", "target": "POST /v1/sandboxes", "sandbox_id": "sbx_0", "status": 201,
+            "customer_request_sha256": "11" * 32, "command_sha256": None, "image": "alpine:3.20",
+            "image_digest": None, "result_sha256": "22" * 32,
+        })
     ledger.sign({
         "action": "create", "target": "POST /v1/sandboxes", "sandbox_id": "sbx_1", "status": 201,
         "customer_request_sha256": "aa" * 32, "command_sha256": None, "image": "alpine:3.20",
@@ -130,7 +137,9 @@ def test_level1_chain_verifies_offline_without_snp(tmp_path, monkeypatch) -> Non
     assert out["chain"]["links_checked"] == 2
     assert out["chain"]["contiguous"] is True
     assert out["chain"]["first"] == 1 and out["chain"]["last"] == 2
-    assert out["checked"] == "whole chain to the head the server named"
+    # The front numbers each room's receipts, so the checker also reports the per-room numbering.
+    assert out["checked"] == ("whole chain to the head the server named; each numbered room: its receipts run 1 to n "
+                              "with no gap and every link right")
 
 
 def test_tampered_level1_receipt_fails(tmp_path, monkeypatch) -> None:
@@ -280,8 +289,9 @@ printf 'wild %s\n' "$(receipts_api_upstream)"
 
 def test_guest_filtered_chain_verifies(tmp_path, monkeypatch) -> None:
     # The broker gives a guest only its own receipts, with the hotel's head.
-    # A filtered chain is a subset: each receipt is checked, not the whole chain.
-    ledger = _chain(tmp_path, monkeypatch)
+    # A filtered chain is a subset of the hotel's chain: each receipt is checked, not the whole chain.
+    # The filter keeps whole rooms, so each room's own numbers are still complete and are checked.
+    ledger = _chain(tmp_path, monkeypatch, other_room_first=True)
     proc = _verify_cli(tmp_path, ledger.attestation(), {
         "binding_sha256": ledger.binding_sha256, "head": ledger.head, "filtered": True,
         "receipts": ledger.chain[1:],
@@ -290,7 +300,22 @@ def test_guest_filtered_chain_verifies(tmp_path, monkeypatch) -> None:
     out = json.loads(proc.stdout)
     assert out["verdict"] == "PASS"
     # The doc says it is filtered, so only each receipt was checked: say so.
-    assert out["checked"] == "each receipt; not that none are missing"
+    assert out["checked"] == ("each receipt; not that none are missing; each numbered room: its receipts run 1 to n "
+                              "with no gap and every link right")
+
+
+def test_a_filtered_chain_that_lacks_a_rooms_first_receipt_fails(tmp_path, monkeypatch) -> None:
+    # A room's receipts carry their own numbers. A list that holds receipt 2 of a room without receipt 1
+    # is missing a receipt of that room, filtered or not.
+    ledger = _chain(tmp_path, monkeypatch)
+    proc = _verify_cli(tmp_path, ledger.attestation(), {
+        "binding_sha256": ledger.binding_sha256, "head": ledger.head, "filtered": True,
+        "receipts": ledger.chain[1:],
+    })
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["verdict"] == "FAIL"
+    assert out["reason"] == "room sbx_1: room_sequence does not start at 1 (first is 2)"
 
 
 def test_fetch_chain_pages_a_filtered_chain_by_raw_offset(monkeypatch) -> None:

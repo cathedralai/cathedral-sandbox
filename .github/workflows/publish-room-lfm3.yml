@@ -2,12 +2,18 @@ name: Publish room LFM3-1.7B image
 
 # Builds images/room-lfm3 (llama.cpp + Liquid AI LFM3-1.7B Q4_K_M, CPU only)
 # and pushes ghcr.io/cathedralai/room-lfm3-1.7b:sha-<commit>. The launch pin
-# for Polaris is the digest this run prints in its summary.
+# for Polaris is the digest this run prints in its summary. A pull request
+# that touches the image builds it without pushing and runs the same smoke
+# checks, so a broken image fails before merge.
 
 on:
   push:
     branches:
       - main
+    paths:
+      - .github/workflows/publish-room-lfm3.yml
+      - images/room-lfm3/**
+  pull_request:
     paths:
       - .github/workflows/publish-room-lfm3.yml
       - images/room-lfm3/**
@@ -24,6 +30,47 @@ env:
   IMAGE_PATH: ghcr.io/cathedralai/room-lfm3-1.7b
 
 jobs:
+  build-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          version: v0.36.1
+          driver-opts: >-
+            image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+
+      # Not pushed: the Dockerfile's own smoke check runs during the build.
+      - name: Build linux/amd64 image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ./images/room-lfm3
+          file: ./images/room-lfm3/Dockerfile
+          platforms: linux/amd64
+          pull: true
+          push: false
+          load: true
+          tags: room-lfm3-check:pr
+
+      - name: Smoke test the built image
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$(docker run --rm --network none room-lfm3-check:pr lfm3-ask 'What is 2+2? Answer in one word.')"
+          printf '%s\n' "$output"
+          grep -Eiq '\b(4|four)\b' <<< "$output"
+          ./images/room-lfm3/smoke-tools.sh room-lfm3-check:pr
+
   publish:
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
@@ -149,6 +196,7 @@ jobs:
           grep -Eiq '\b(4|four)\b' <<< "$output"
           grep -Eq '^lfm3-timing load_ms=[0-9]+ prompt_tok_s=[0-9.]+ gen_tok_s=[0-9.]+ ' <<< "$output"
           docker run --rm "$IMAGE_REF" sh -c 'test -s /opt/lfm3/LICENSE && test -s /opt/lfm3/NOTICE'
+          ./images/room-lfm3/smoke-tools.sh "$IMAGE_REF"
           {
             echo
             echo '```'
