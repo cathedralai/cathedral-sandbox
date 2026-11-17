@@ -475,9 +475,12 @@ Registry wiring:
   volume's chain, so `verify_chain` alone passes; `check_restore` refuses it.
 - `VolumeRegistry.shred(volume_id, key_id=..., destroy_key=...)`, under the
   registry lock: checks the volume has a committed head and is not shredded,
-  checks `key_id`, builds the shred entry, ends the lease and freezes the volume
-  (`shred_pending`: grant, accept and head refuse), then calls
-  `destroy_key(key_id)`. Only when that returns `True` does it log the shred and
+  checks `key_id` is the volume's key (recorded by `create(..., key_id=...)` or
+  `bind_key`, set once; otherwise `key_not_bound` or `shred_key_mismatch`),
+  builds the shred entry, ends the lease and freezes the volume
+  (`shred_pending`, with the pending `key_id`: grant, accept and head refuse,
+  and a retry with another `key_id` refuses `shred_key_mismatch`), then calls
+  `destroy_key(volume_id, key_id)`. Only when that returns `True` does it log the shred and
   return a signed `cathedral_volume_shred_receipt_v1`. When the key service
   refuses or its answer is lost, nothing is logged and the volume stays frozen,
   since the key may already be gone; retrying `shred` finishes it. After a
@@ -486,8 +489,8 @@ Registry wiring:
 - The receipt attests that the key service confirmed destroying `key_id`.
   `destroy_key` is the key release service's call (AB#392, not built); it must
   raise on an unknown key and be idempotent (an already destroyed key returns
-  `True`), so a retry after a lost answer succeeds. Binding `key_id` to the
-  volume is its job.
+  `True`), so a retry after a lost answer succeeds. It is given `volume_id` too
+  and must refuse a key that is not that volume's.
 - Provisional until Fred decides who holds the log key: the registry signs the
   shred receipt with its own key, `signing_key_id` `registry:<first 16 hex of
   sha256(public key)>`. That receipt is Ed25519 over canonical JSON with no

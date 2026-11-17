@@ -39,7 +39,7 @@ def world():
     clock = Clock()
     key = Ed25519PrivateKey.generate()
     registry = vc.VolumeRegistry(key, now=clock, lease_seconds=600)
-    volume_doc = registry.create("vol-1", "customer-1")
+    volume_doc = registry.create("vol-1", "customer-1", key_id="vk:vol-1")
     holder = Ed25519PrivateKey.generate()
     lease = registry.grant("vol-1", binding(holder))
     return clock, registry, volume_doc, holder, lease
@@ -67,7 +67,7 @@ class KeyService:
         self.result = result
         self.error = error
 
-    def __call__(self, key_id: str):
+    def __call__(self, volume_id: str, key_id: str):
         self.calls.append(key_id)
         if self.error is not None:
             raise self.error
@@ -238,11 +238,11 @@ def test_lost_key_service_answer_then_idempotent_retry(world):
     registry.accept(commit_next(registry, holder, lease, "s1"))
     destroyed: set[str] = set()
 
-    def lossy(key_id):
+    def lossy(volume_id, key_id):
         destroyed.add(key_id)
         raise TimeoutError("answer lost")
 
-    def idempotent(key_id):
+    def idempotent(volume_id, key_id):
         destroyed.add(key_id)  # already gone counts as gone
         return True
 
@@ -253,6 +253,74 @@ def test_lost_key_service_answer_then_idempotent_retry(world):
     with pytest.raises(vl.VolumeLogError, match="volume_shredded"):
         vl.check_restore(registry.log_entries(), volume_id="vol-1", generation=1,
                          manifest_sha256=receipt["final_manifest_sha256"])
+
+
+def test_shred_refuses_another_volumes_key(world):
+    _, registry, _, holder, lease = world
+    registry.accept(commit_next(registry, holder, lease, "s1"))
+    registry.create("vol-2", "customer-2", key_id="vk:vol-2")
+    other_holder = Ed25519PrivateKey.generate()
+    other_lease = registry.grant("vol-2", binding(other_holder))
+    head = registry.head("vol-2")["statement"]
+    registry.accept(vc.make_commit(other_holder, other_lease, generation=1, parent_sha256=head["head_sha256"],
+                                   restic_repo_id="repo-2", restic_snapshot_id="t1"))
+    before = registry.log_entries()
+    keys = KeyService()
+    refused("shred_key_mismatch", registry.shred, "vol-1", key_id="vk:vol-2", destroy_key=keys)
+    assert keys.calls == []
+    assert registry.log_entries() == before
+    # Neither volume froze: vol-2 keeps serving its head and vol-1 can still be shredded with its own key.
+    assert registry.head("vol-2")["statement"]["generation"] == 1
+    receipt = registry.shred("vol-1", key_id="vk:vol-1", destroy_key=keys)
+    assert receipt["key_id"] == "vk:vol-1"
+    assert keys.calls == ["vk:vol-1"]
+
+
+def test_destroy_key_is_told_the_volume(world):
+    _, registry, _, holder, lease = world
+    registry.accept(commit_next(registry, holder, lease, "s1"))
+    seen = []
+
+    def keys(volume_id, key_id):
+        seen.append((volume_id, key_id))
+        return True
+
+    registry.shred("vol-1", key_id="vk:vol-1", destroy_key=keys)
+    assert seen == [("vol-1", "vk:vol-1")]
+
+
+def test_shred_without_a_bound_key_never_touches_a_key(world):
+    _, registry, *_ = world
+    registry.create("vol-2", "customer-2")
+    holder = Ed25519PrivateKey.generate()
+    lease = registry.grant("vol-2", binding(holder))
+    head = registry.head("vol-2")["statement"]
+    registry.accept(vc.make_commit(holder, lease, generation=1, parent_sha256=head["head_sha256"],
+                                   restic_repo_id="repo-2", restic_snapshot_id="t1"))
+    keys = KeyService()
+    refused("key_not_bound", registry.shred, "vol-2", key_id="vk:vol-2", destroy_key=keys)
+    assert keys.calls == []
+    registry.bind_key("vol-2", "vk:vol-2")
+    registry.bind_key("vol-2", "vk:vol-2")  # same key again is fine
+    refused("key_already_bound", registry.bind_key, "vol-2", "vk:other")
+    refused("key_already_bound", registry.bind_key, "vol-1", "vk:other")
+    assert registry.shred("vol-2", key_id="vk:vol-2", destroy_key=keys)["key_id"] == "vk:vol-2"
+
+
+def test_lost_answer_retry_with_another_key_id_is_refused(world):
+    _, registry, _, holder, lease = world
+    registry.accept(commit_next(registry, holder, lease, "s1"))
+
+    def lossy(volume_id, key_id):
+        raise TimeoutError("answer lost")
+
+    refused("key_not_destroyed", registry.shred, "vol-1", key_id="vk:vol-1", destroy_key=lossy)
+    keys = KeyService()
+    refused("shred_key_mismatch", registry.shred, "vol-1", key_id="vk:something-else", destroy_key=keys)
+    assert keys.calls == []
+    refused("shred_pending", registry.head, "vol-1")
+    receipt = registry.shred("vol-1", key_id="vk:vol-1", destroy_key=keys)
+    assert receipt["key_id"] == "vk:vol-1"
 
 
 # --- prune token --------------------------------------------------------------
