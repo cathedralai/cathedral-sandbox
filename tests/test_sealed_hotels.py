@@ -498,3 +498,12 @@ def test_publisher_refuses_lost_state_restart_and_bad_state_types(publisher_env)
         state.write_text(json.dumps({**document, "last_release": 5}))
     assert _run(base).returncode == 0
     assert json.loads(state.read_text())["last_release"] == 6
+
+
+def test_publisher_refuses_unknown_inventory_fields(publisher_env) -> None:
+    hotels = copy.deepcopy(golden.HOTELS)
+    hotels["golden-hotel-a"]["disabled"] = True
+    publisher_env["inventory"].write_text(json.dumps({"hotels": hotels}))
+    refused = _run([*publisher_env["base"], "--init-state", "--release", "1"])
+    assert refused.returncode != 0 and "exactly chip_id and measurements" in refused.stderr
+    assert not publisher_env["state"].exists()

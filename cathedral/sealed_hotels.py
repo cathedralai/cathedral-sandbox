@@ -414,8 +414,10 @@ def build_unsigned(
         "hotels": {},
     }
     for hotel_id, entry in hotels.items():
-        if not isinstance(entry, Mapping) or not isinstance(entry.get("measurements"), list):
-            raise SealedHotelsError(f"hotel {hotel_id!r} entry must have a measurements list")
+        if not isinstance(entry, Mapping) or frozenset(entry) != _HOTEL_KEYS:
+            raise SealedHotelsError(f"hotel {hotel_id!r} entry must have exactly chip_id and measurements")
+        if not isinstance(entry["measurements"], list):
+            raise SealedHotelsError(f"hotel {hotel_id!r} measurements must be a non-empty list")
         document["hotels"][hotel_id] = {  # type: ignore[index]
             "chip_id": entry.get("chip_id"),
             "measurements": list(entry["measurements"]),
