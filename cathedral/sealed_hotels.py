@@ -54,7 +54,7 @@ _SIGNATURE_KEYS = frozenset({"algorithm", "value_base64"})
 _PIN_FILE_KEYS = frozenset({"schema", "keys"})
 _PIN_KEYS = frozenset({"algorithm", "public_key_hex", "not_before", "not_after"})
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
-_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_TIME_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 _CHIP_ID_RE = re.compile(r"^[0-9a-f]{128}$")
 _MEASUREMENT_RE = re.compile(r"^[0-9a-f]{96}$")
 _PUBLIC_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -339,6 +339,8 @@ def verify_envelope(
         raise SealedHotelsError("generated_at must precede valid_until")
     if generated_at > wall_clock + MAX_FUTURE_SKEW:
         raise SealedHotelsError("generated_at is in the future")
+    if historical_at is not None and not generated_at <= check_time <= wall_clock:
+        raise SealedHotelsError("historical time must lie between generated_at and now")
     if not pin.contains(generated_at):
         raise SealedHotelsError(f"key {key_id!r} pin window does not contain generated_at")
     if not pin.contains(check_time):

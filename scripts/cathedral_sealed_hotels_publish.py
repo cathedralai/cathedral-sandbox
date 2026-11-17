@@ -19,7 +19,8 @@ network.
 Durable state (the last release number and digest) lives outside the
 repository, mode 600, written atomically with a directory sync, so a release
 number is never reused with another digest. A missing state file is an error
-unless ``--init-state`` is given for the very first release. The next release
+unless ``--init-state`` is given together with an explicit ``--release N``
+above every release ever published (``--release 1`` for the very first one). The next release
 number is the recorded one plus 1; ``--release N`` may only go higher.
 
 Outputs (never overwritten): ``<out-dir>/release-<N>.json`` (exact signed
@@ -34,6 +35,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -80,6 +82,11 @@ def read_state(path: Path) -> dict[str, object] | None:
         _fail(f"state {path} is corrupt ({exc}); never reset it silently")
     if frozenset(state) != _STATE_KEYS or state["schema"] != STATE_SCHEMA:
         _fail(f"state {path} has the wrong schema or fields; never reset it silently")
+    release = state["last_release"]
+    if isinstance(release, bool) or not isinstance(release, int) or release < 1:
+        _fail(f"state {path} last_release is not a positive integer; never reset it silently")
+    if not isinstance(state["last_digest"], str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", state["last_digest"]):
+        _fail(f"state {path} last_digest is malformed; never reset it silently")
     return state
 
 
@@ -128,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pins", required=True, type=Path)
     parser.add_argument("--inventory", required=True, type=Path)
     parser.add_argument("--state", required=True, type=Path)
-    parser.add_argument("--init-state", action="store_true", help="create the state for release 1 only")
+    parser.add_argument("--init-state", action="store_true", help="create missing state; needs --release above every release ever published")
     parser.add_argument("--release", type=int, help="explicit release number, above the recorded one")
     parser.add_argument("--lifetime-hours", type=int, default=24)
     parser.add_argument("--out-dir", required=True, type=Path)
@@ -160,6 +167,10 @@ def main(argv: list[str] | None = None) -> int:
             _fail(f"no publisher state at {args.state}; pass --init-state only for the first release")
         if state is not None and args.init_state:
             _fail("--init-state given but publisher state already exists")
+        if state is None and args.release is None:
+            # Lost state must never silently restart at 1: the operator names a
+            # release above every release ever published.
+            _fail("--init-state needs an explicit --release above every release ever published")
         last_release = int(state["last_release"]) if state else 0
         release = args.release if args.release is not None else last_release + 1
         if release <= last_release:

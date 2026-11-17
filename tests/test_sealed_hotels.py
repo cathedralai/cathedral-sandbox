@@ -416,7 +416,7 @@ def test_publisher_signs_and_keeps_durable_state(publisher_env) -> None:
     base, state, out = publisher_env["base"], publisher_env["state"], publisher_env["out"]
     first_refused = _run(base)
     assert first_refused.returncode != 0 and "--init-state" in first_refused.stderr
-    first = _run([*base, "--init-state"])
+    first = _run([*base, "--init-state", "--release", "1"])
     assert first.returncode == 0, first.stderr
     summary = json.loads(first.stdout)
     assert summary["release"] == 1
@@ -430,7 +430,7 @@ def test_publisher_signs_and_keeps_durable_state(publisher_env) -> None:
     assert recorded["last_release"] == 1 and recorded["last_digest"] == "sha256:" + digest_hex
     assert os.stat(state).st_mode & 0o777 == 0o600
 
-    assert _run([*base, "--init-state"]).returncode != 0
+    assert _run([*base, "--init-state", "--release", "1"]).returncode != 0
     second = _run(base)
     assert second.returncode == 0, second.stderr
     assert json.loads(second.stdout)["release"] == 2
@@ -441,7 +441,7 @@ def test_publisher_signs_and_keeps_durable_state(publisher_env) -> None:
 
 def test_publisher_refuses_corrupt_state_and_state_in_repo(publisher_env) -> None:
     base, state = publisher_env["base"], publisher_env["state"]
-    assert _run([*base, "--init-state"]).returncode == 0
+    assert _run([*base, "--init-state", "--release", "1"]).returncode == 0
     state.write_text("{}")
     state.chmod(0o600)
     corrupt = _run(base)
@@ -458,7 +458,7 @@ def test_publisher_refuses_bad_inventory_and_oversized_release(publisher_env) ->
     bad = copy.deepcopy(golden.HOTELS)
     bad["golden-hotel-a"]["chip_id"] = "0" * 128
     inventory.write_text(json.dumps({"hotels": bad}))
-    refused = _run([*base, "--init-state"])
+    refused = _run([*base, "--init-state", "--release", "1"])
     assert refused.returncode != 0 and "all zero" in refused.stderr
     assert not publisher_env["state"].exists()
     many = {
@@ -466,6 +466,35 @@ def test_publisher_refuses_bad_inventory_and_oversized_release(publisher_env) ->
         for i in range(12)
     }
     inventory.write_text(json.dumps({"hotels": many}))
-    too_big = _run([*base, "--init-state"])
+    too_big = _run([*base, "--init-state", "--release", "1"])
     assert too_big.returncode != 0 and "4096" in too_big.stderr
     assert not publisher_env["state"].exists()
+
+
+def test_non_ascii_digits_in_times_refuse() -> None:
+    fullwidth = "２０２６-11-17T12:00:00Z"
+    _both_refuse(_mutated(lambda d: d.__setitem__("generated_at", fullwidth)), match="canonical UTC")
+
+
+def test_historical_time_must_follow_generated_at_and_precede_now() -> None:
+    backdated = _mutated(lambda d: d.__setitem__("valid_from", "2026-11-17T06:00:00Z"))
+    verify_envelope(backdated, PINS, now=VERIFY_AT, historical_at=datetime(2026, 11, 17, 13, tzinfo=UTC))
+    _both_refuse(backdated, at=datetime(2026, 11, 17, 7, tzinfo=UTC), match="between generated_at and now")
+    _both_refuse(GOLDEN, now=VERIFY_AT, at=datetime(2026, 11, 17, 19, tzinfo=UTC), match="between generated_at and now")
+
+
+def test_publisher_refuses_lost_state_restart_and_bad_state_types(publisher_env) -> None:
+    base, state = publisher_env["base"], publisher_env["state"]
+    implicit = _run([*base, "--init-state"])
+    assert implicit.returncode != 0 and "explicit --release" in implicit.stderr
+    assert not state.exists()
+    assert _run([*base, "--init-state", "--release", "5"]).returncode == 0
+    assert json.loads(state.read_text())["last_release"] == 5
+    for bad in ('"5"', "true", "0"):
+        document = json.loads(state.read_text())
+        state.write_text(state.read_text().replace(f'"last_release": {document["last_release"]}', f'"last_release": {bad}'))
+        refused = _run(base)
+        assert refused.returncode != 0 and "positive integer" in refused.stderr, bad
+        state.write_text(json.dumps({**document, "last_release": 5}))
+    assert _run(base).returncode == 0
+    assert json.loads(state.read_text())["last_release"] == 6

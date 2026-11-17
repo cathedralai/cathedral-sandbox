@@ -58,7 +58,7 @@ MAX_AGE = timedelta(hours=24)
 MAX_FUTURE_SKEW = timedelta(minutes=5)
 TOP_LEVEL = {"schema", "release", "generated_at", "valid_from", "valid_until", "key_id", "hotels", "signature"}
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
-TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+TIME_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 CHIP_RE = re.compile(r"^[0-9a-f]{128}$")
 MEASUREMENT_RE = re.compile(r"^[0-9a-f]{96}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -199,6 +199,8 @@ def verify(data: bytes, pins: dict, now: datetime, at: datetime | None = None) -
         raise Refused("generated_at must precede valid_until")
     if generated_at > now + MAX_FUTURE_SKEW:
         raise Refused("generated_at is in the future")
+    if at is not None and not generated_at <= at <= now:
+        raise Refused("historical time must lie between generated_at and now")
     if not not_before <= generated_at <= not_after:
         raise Refused(f"key {key_id!r} pin window does not contain generated_at")
     if not not_before <= check_time <= not_after:
@@ -247,7 +249,12 @@ def verify(data: bytes, pins: dict, now: datetime, at: datetime | None = None) -
 def check_previous(result: dict, previous_release: int | None, previous_digest: str | None) -> None:
     if previous_release is None and previous_digest is None:
         return
-    if previous_release is None or previous_digest is None or not DIGEST_RE.fullmatch(previous_digest):
+    if (
+        previous_release is None
+        or previous_release < 1
+        or previous_digest is None
+        or not DIGEST_RE.fullmatch(previous_digest)
+    ):
         raise Refused("give both --previous-release and --previous-digest sha256:<64 hex>")
     if result["release"] < previous_release:
         raise Refused(f"rollback refused: release {result['release']} is below previous {previous_release}")
