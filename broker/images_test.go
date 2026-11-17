@@ -83,6 +83,11 @@ type fakeHotel struct {
 	// front of it that fails after the room exists.
 	createFail           int
 	createFailAfterStart bool
+	// labelListFail: answer a room list with a label filter (the broker's
+	// orphan reap) with this status. roomDeleteFail: answer a room delete
+	// with this status and keep the room (AB#338).
+	labelListFail  int
+	roomDeleteFail int
 	// upgrade answers WebSocket handshakes when set (terminal_ws_test.go). It
 	// runs without f.mu so it may hijack and hold the connection.
 	upgrade http.HandlerFunc
@@ -169,6 +174,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 202, out)
 	case p == "/v1/sandboxes" && r.Method == "GET":
+		if f.labelListFail != 0 && len(r.URL.Query()["label"]) > 0 {
+			writeErr(w, f.labelListFail, "list_failed", "the hotel could not list its rooms")
+			return
+		}
 		// Like a hotel: every "label" filter must match.
 		out := []map[string]any{}
 		for _, rm := range f.rooms {
@@ -415,6 +424,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(p, "/v1/sandboxes/") && strings.Count(p, "/") == 3 && r.Method == "DELETE":
 		id := strings.TrimPrefix(p, "/v1/sandboxes/")
 		f.roomDeletes = append(f.roomDeletes, id)
+		if f.roomDeleteFail != 0 {
+			writeErr(w, f.roomDeleteFail, "delete_failed", "the hotel could not remove the room")
+			return
+		}
 		for i, rm := range f.rooms {
 			if rm["id"] == id {
 				f.rooms = append(f.rooms[:i], f.rooms[i+1:]...)

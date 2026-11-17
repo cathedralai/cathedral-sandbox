@@ -304,6 +304,18 @@ type hotel struct {
 	leaving        bool               // a leave passed its empty check; no new rooms (hotels.go)
 	stop           context.CancelFunc // stops the sync loop when the hotel leaves
 	alerts         hotelAlerts        // missed heartbeat and drop alerts sent (alerts.go)
+	// unreaped: create requests (by batch id) whose rooms on this hotel were
+	// not confirmed removed after the hotel failed the create. The sync loop
+	// keeps those rooms out of the guest's rooms and retries their removal
+	// until a list shows none left (AB#338).
+	unreaped map[string]*unreapedBatch
+}
+
+// unreapedBatch is one create request's leftover rooms on a hotel.
+type unreapedBatch struct {
+	guest string
+	keep  map[string]bool // room ids the request did receive: never reaped
+	busy  bool            // a removal pass is running
 }
 
 type guestState struct {
@@ -1134,7 +1146,25 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 		}
 	}
 	for h := range lost {
-		b.reapOrphans(h, g, batchID, keep[h])
+		if b.reapOrphans(h, g, batchID, keep[h]) {
+			continue
+		}
+		// The failed hotel may still run a room of this request: the guest
+		// is told, and the room stays recorded for the reaper (never adopted
+		// as the guest's room) until its removal is confirmed.
+		log.Printf("create of guest %s: rooms on failed hotel %s (batch %s) not confirmed removed; recorded for the reaper", g.cfg.ID, h.cfg.ID, batchID)
+		for i := range results {
+			if !slices.Contains(results[i].lost, h) {
+				continue
+			}
+			if results[i].header == nil {
+				results[i].header = http.Header{}
+			}
+			results[i].header.Add("X-Broker-Orphan-Cleanup", "pending; hotel="+h.cfg.ID)
+			if results[i].doc != nil {
+				results[i].doc["orphan_cleanup"] = map[string]any{"state": "pending", "hotel": h.cfg.ID}
+			}
+		}
 	}
 	return results
 }
@@ -1142,63 +1172,88 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 // reapOrphans removes the rooms of one create request that hotel h started
 // although its answer never reached the broker. keep holds the hotel room
 // ids this request did receive on h. The first pass runs before the guest
-// gets its answer; later passes retry in the background.
-func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[string]bool) {
-	pass := func(timeout time.Duration) bool {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		q := url.Values{}
-		q.Add("label", batchLabel+"="+batchID)
-		q.Add("label", guestLabel+"="+g.cfg.ID)
-		status, _, out, err := h.do(ctx, "GET", "/v1/sandboxes", q, nil, timeout)
-		if err != nil || status != 200 {
-			return false
-		}
-		var list struct {
-			Sandboxes []struct {
-				ID     string         `json:"id"`
-				Labels map[string]any `json:"labels"`
-			} `json:"sandboxes"`
-		}
-		if json.Unmarshal(out, &list) != nil {
-			return false
-		}
-		ok := true
-		for _, s := range list.Sandboxes {
-			if keep[s.ID] {
-				continue
-			}
-			// A hotel that ignores the label filter (a miner hotel is
-			// third-party code) must not get another request's rooms deleted.
-			if s.Labels[batchLabel] != batchID || s.Labels[guestLabel] != g.cfg.ID {
-				continue
-			}
-			st, _, _, derr := h.do(ctx, "DELETE", "/v1/sandboxes/"+url.PathEscape(s.ID), nil, nil, timeout)
-			if derr != nil || (st != 204 && st != 404) {
-				ok = false
-				continue
-			}
-			b.mu.Lock()
-			if rm := h.rooms[s.ID]; rm != nil { // the sync loop adopted it meanwhile
-				b.release(h, rm)
-			}
-			b.mu.Unlock()
-			log.Printf("orphan room %s.%s of guest %s removed (create answer lost)", h.cfg.ID, s.ID, g.cfg.ID)
-		}
-		return ok
+// gets its answer and its result is returned: true only when h confirmed
+// every such room gone. Otherwise the request is recorded in h.unreaped and
+// later passes retry in the background, then from the sync loop.
+func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[string]bool) bool {
+	if b.reapPass(h, g.cfg.ID, batchID, keep, 3*time.Second) {
+		return true
 	}
-	if pass(3 * time.Second) {
-		return
+	b.mu.Lock()
+	if h.unreaped == nil {
+		h.unreaped = map[string]*unreapedBatch{}
 	}
+	ub := &unreapedBatch{guest: g.cfg.ID, keep: keep, busy: true}
+	h.unreaped[batchID] = ub
+	b.mu.Unlock()
 	go func() {
 		for _, wait := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second} {
 			time.Sleep(wait)
-			if pass(10 * time.Second) {
+			if b.reapPass(h, g.cfg.ID, batchID, keep, 10*time.Second) {
+				b.reaped(h, batchID)
 				return
 			}
 		}
-		log.Printf("orphan rooms of guest %s on hotel %s (batch %s) could not be reaped; the sync loop will list them", g.cfg.ID, h.cfg.ID, batchID)
+		b.mu.Lock()
+		ub.busy = false
+		b.mu.Unlock()
+		log.Printf("orphan rooms of guest %s on hotel %s (batch %s) could not be reaped yet; the sync loop retries", g.cfg.ID, h.cfg.ID, batchID)
 	}()
+	return false
+}
+
+// reaped clears a recorded request once its rooms on h are confirmed gone.
+func (b *broker) reaped(h *hotel, batchID string) {
+	b.mu.Lock()
+	delete(h.unreaped, batchID)
+	b.mu.Unlock()
+	log.Printf("orphan rooms on hotel %s (batch %s) confirmed removed", h.cfg.ID, batchID)
+}
+
+// reapPass lists the rooms of one create request on h and deletes those the
+// request did not receive. True when the list and every delete succeeded.
+func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]bool, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	q := url.Values{}
+	q.Add("label", batchLabel+"="+batchID)
+	q.Add("label", guestLabel+"="+guestID)
+	status, _, out, err := h.do(ctx, "GET", "/v1/sandboxes", q, nil, timeout)
+	if err != nil || status != 200 {
+		return false
+	}
+	var list struct {
+		Sandboxes []struct {
+			ID     string         `json:"id"`
+			Labels map[string]any `json:"labels"`
+		} `json:"sandboxes"`
+	}
+	if json.Unmarshal(out, &list) != nil {
+		return false
+	}
+	ok := true
+	for _, s := range list.Sandboxes {
+		if keep[s.ID] {
+			continue
+		}
+		// A hotel that ignores the label filter (a miner hotel is
+		// third-party code) must not get another request's rooms deleted.
+		if s.Labels[batchLabel] != batchID || s.Labels[guestLabel] != guestID {
+			continue
+		}
+		st, _, _, derr := h.do(ctx, "DELETE", "/v1/sandboxes/"+url.PathEscape(s.ID), nil, nil, timeout)
+		if derr != nil || (st != 204 && st != 404) {
+			ok = false
+			continue
+		}
+		b.mu.Lock()
+		if rm := h.rooms[s.ID]; rm != nil { // the sync loop adopted it meanwhile
+			b.release(h, rm)
+		}
+		b.mu.Unlock()
+		log.Printf("orphan room %s.%s of guest %s removed (create answer lost)", h.cfg.ID, s.ID, guestID)
+	}
+	return ok
 }
 
 // createHasTunables: the create body carries a non-null "tunables" object.
@@ -2075,8 +2130,19 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		return
 	}
 	seen := make(map[string]bool, len(list.Sandboxes))
+	leftover := map[string]bool{} // recorded unreaped requests that still list a room
 	for _, s := range list.Sandboxes {
 		seen[s.ID] = true
+		// A room a failed create left behind is not the guest's room: the
+		// guest got its room elsewhere or an error. It is never adopted (or
+		// billed) under the guest label; it waits for its removal.
+		if ub := h.unreaped[s.Labels[batchLabel]]; ub != nil && ub.guest == s.Labels[guestLabel] && !ub.keep[s.ID] {
+			leftover[s.Labels[batchLabel]] = true
+			if rm := h.rooms[s.ID]; rm != nil { // adopted before the request was recorded
+				b.release(h, rm)
+			}
+			continue
+		}
 		if rm := h.rooms[s.ID]; rm != nil {
 			if rm.state == stDeleting && !rm.deleteSent {
 				// A list that missed the room (built before its create landed)
@@ -2092,6 +2158,25 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		h.rooms[s.ID] = rm
 		b.register(rm)
 		h.place(rm)
+	}
+	for batchID, ub := range h.unreaped {
+		switch {
+		case ub.busy:
+		case !leftover[batchID]:
+			delete(h.unreaped, batchID) // the hotel lists none of its rooms
+			log.Printf("orphan rooms on hotel %s (batch %s) no longer listed", h.cfg.ID, batchID)
+		default:
+			ub.busy = true
+			go func() {
+				ok := b.reapPass(h, ub.guest, batchID, ub.keep, 10*time.Second)
+				b.mu.Lock()
+				ub.busy = false
+				b.mu.Unlock()
+				if ok {
+					b.reaped(h, batchID)
+				}
+			}()
+		}
 	}
 	b.checkMinerExitRooms(h, seen)
 	var deleting []*room
