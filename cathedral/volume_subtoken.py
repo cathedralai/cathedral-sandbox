@@ -125,6 +125,9 @@ def issue_prune(registry_key: Ed25519PrivateKey, *, volume_id: str, prefix: str,
     """Sign a prune token for the control plane's prune runner. The caller has checked the volume exists."""
     if not isinstance(volume_id, str) or not volume_id or len(volume_id) > MAX_PREFIX_LENGTH:
         raise VolumeRefused("bad_volume_id")
+    # The prefix must be this volume's own: its last segment is the volume id.
+    if _check_prefix(prefix)[:-1].split("/")[-1] != volume_id:
+        raise VolumeRefused("prefix_not_volume")
     if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool) or ttl_seconds <= 0:
         raise VolumeRefused("bad_ttl")
     issued_at = int(now())

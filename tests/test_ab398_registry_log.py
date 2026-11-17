@@ -185,8 +185,15 @@ def test_nothing_moves_after_shred(world):
         holder, lease, generation=3, parent_sha256=vc.statement_sha256(commits[-1]),
         restic_repo_id="repo-1", restic_snapshot_id="s3"))
     refused("volume_shredded", registry.grant, "vol-1", binding(holder))
-    refused("volume_shredded", registry.shred, "vol-1", key_id="vk:vol-1", destroy_key=KeyService())
+    refused("volume_shredded", registry.shred, "vol-1", key_id="vk:other", destroy_key=KeyService())
     assert registry.log_entries() == log
+
+
+def test_shred_resend_returns_the_same_receipt(world):
+    registry, *_, receipt = shredded_world(world)
+    keys = KeyService()
+    assert registry.shred("vol-1", key_id="vk:vol-1", destroy_key=keys) == receipt
+    assert keys.calls == []
 
 
 def test_bad_key_id_never_touches_the_key(world):
@@ -207,18 +214,45 @@ def test_volume_with_no_commit_has_nothing_to_shred(world):
 
 @pytest.mark.parametrize("keys", [KeyService(error=RuntimeError("unknown key")), KeyService(result=None),
                                   KeyService(result=1)])
-def test_key_service_refusal_logs_nothing_and_a_retry_works(world, keys):
+def test_key_service_refusal_logs_nothing_freezes_and_a_retry_finishes(world, keys):
     _, registry, _, holder, lease = world
-    registry.accept(commit_next(registry, holder, lease, "s1"))
+    first = commit_next(registry, holder, lease, "s1")
+    registry.accept(first)
     before = registry.log_entries()
     refused("key_not_destroyed", registry.shred, "vol-1", key_id="vk:vol-1", destroy_key=keys)
     assert registry.log_entries() == before
-    # The lease ended before the key was touched; the volume is still live and the holder re-grants.
-    refused("lease_expired", registry.accept, commit_next(registry, holder, lease, "s2"))
-    lease2 = registry.grant("vol-1", binding(holder))
-    registry.accept(commit_next(registry, holder, lease2, "s2"))
+    # The key may already be gone, so nothing may move until the shred finishes.
+    second = vc.make_commit(holder, lease, generation=2, parent_sha256=vc.statement_sha256(first),
+                            restic_repo_id="repo-1", restic_snapshot_id="s2")
+    refused("shred_pending", registry.accept, second)
+    refused("shred_pending", registry.accept, first)
+    refused("shred_pending", registry.grant, "vol-1", binding(holder))
+    refused("shred_pending", registry.head, "vol-1")
     receipt = registry.shred("vol-1", key_id="vk:vol-1", destroy_key=KeyService())
-    assert receipt["final_generation"] == 2
+    assert receipt["final_generation"] == 1
+    vl.verify_shred_receipt(receipt, public_keys_by_id=log_keys(registry), entries=registry.log_entries())
+
+
+def test_lost_key_service_answer_then_idempotent_retry(world):
+    _, registry, _, holder, lease = world
+    registry.accept(commit_next(registry, holder, lease, "s1"))
+    destroyed: set[str] = set()
+
+    def lossy(key_id):
+        destroyed.add(key_id)
+        raise TimeoutError("answer lost")
+
+    def idempotent(key_id):
+        destroyed.add(key_id)  # already gone counts as gone
+        return True
+
+    refused("key_not_destroyed", registry.shred, "vol-1", key_id="vk:vol-1", destroy_key=lossy)
+    assert destroyed == {"vk:vol-1"}
+    refused("shred_pending", registry.grant, "vol-1", binding(holder))
+    receipt = registry.shred("vol-1", key_id="vk:vol-1", destroy_key=idempotent)
+    with pytest.raises(vl.VolumeLogError, match="volume_shredded"):
+        vl.check_restore(registry.log_entries(), volume_id="vol-1", generation=1,
+                         manifest_sha256=receipt["final_manifest_sha256"])
 
 
 # --- prune token --------------------------------------------------------------
@@ -275,6 +309,9 @@ def test_prune_token_limits(world):
             ttl_seconds=60)
     refused("bad_ttl", prune_token, registry, ttl_seconds=0)
     refused("bad_prefix", prune_token, registry, prefix="volumes/vol-1")
+    refused("prefix_not_volume", prune_token, registry, prefix="volumes/vol-2/")
+    refused("prefix_not_volume", prune_token, registry, prefix="volumes/vol-1/data/")
+    refused("prefix_not_volume", prune_token, registry, prefix="volumes/xvol-1/")
 
 
 def test_prune_token_still_issued_after_shred(world):

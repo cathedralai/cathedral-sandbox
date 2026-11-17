@@ -171,6 +171,8 @@ class _Volume:
     lease: _Lease | None = None
     head_commit_sha256: str | None = None
     shredded: bool = False
+    shred_pending: bool = False
+    shred_receipt: dict | None = None
 
 
 class VolumeRegistry:
@@ -364,17 +366,25 @@ class VolumeRegistry:
     def shred(self, volume_id: str, *, key_id: str, destroy_key: Callable[[str], object]) -> dict:
         """Crypto-shred a volume: destroy its key, log a terminal shred entry, return a signed receipt.
 
-        destroy_key is the key service's call (AB#392); it must raise on an unknown key and
-        return True only once the key is gone. The receipt attests that the key service
-        confirmed destroying key_id; binding key_id to the volume is the key service's job.
-        Everything is checked and the log entry built before the key is touched, and the
-        lease ends first, so no commit can land on a destroyed key and a destroyed key
-        always gets its receipt. Held under the lock throughout. If the key service
-        refuses, nothing is logged, the volume stays live and its holder re-grants.
+        destroy_key is the key service's call (AB#392). It must raise on an unknown key,
+        be idempotent (a key it already destroyed counts as destroyed) and return True
+        only once the key is gone; any other return is a refusal. The receipt attests
+        that the key service confirmed destroying key_id; binding key_id to the volume
+        is the key service's job.
+
+        Everything is checked and the log entry built before the key is touched. The
+        lease ends and the volume freezes (shred_pending: no grant, accept or head)
+        before destroy_key runs, and stays frozen if the key service refuses or the
+        answer is lost, so no commit can land on a key that may be gone. Retrying shred
+        finishes it. A resend after success, with the same key_id, returns the same
+        receipt. Held under the lock throughout.
         """
         with self.lock:
             volume = self._volume(volume_id)
-            _not_shredded(volume)
+            if volume.shredded:
+                if volume.shred_receipt is not None and volume.shred_receipt["key_id"] == key_id:
+                    return volume.shred_receipt
+                raise VolumeRefused("volume_shredded")
             if volume.generation < 1 or volume.head_commit_sha256 is None:
                 raise VolumeRefused("nothing_to_shred")
             if not isinstance(key_id, str) or not volume_log.KEY_ID_RE.fullmatch(key_id):
@@ -389,23 +399,29 @@ class VolumeRegistry:
                 raise VolumeRefused("log_refused") from None
             if volume.lease is not None:
                 volume.lease.released = True
+            volume.shred_pending = True
             try:
                 destroyed = destroy_key(key_id)
             except Exception:
                 destroyed = False
             if destroyed is not True:
                 raise VolumeRefused("key_not_destroyed")
-            self.log = extended
-            volume.shredded = True
-            return volume_log.sign_shred_receipt(
-                self.log, volume_id=volume_id, key_id=key_id, shredded_at=shredded_at,
+            receipt = volume_log.sign_shred_receipt(
+                extended, volume_id=volume_id, key_id=key_id, shredded_at=shredded_at,
                 signing_key_id=self.log_signing_key_id,
                 private_key=self.key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption()))
+            self.log = extended
+            volume.shredded = True
+            volume.shred_pending = False
+            volume.shred_receipt = receipt
+            return receipt
 
 
 def _not_shredded(volume: _Volume) -> None:
     if volume.shredded:
         raise VolumeRefused("volume_shredded")
+    if volume.shred_pending:
+        raise VolumeRefused("shred_pending")
 
 
 def manifest_sha256(commit: dict) -> str:

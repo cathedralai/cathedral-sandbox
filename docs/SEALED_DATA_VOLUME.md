@@ -475,15 +475,19 @@ Registry wiring:
   volume's chain, so `verify_chain` alone passes; `check_restore` refuses it.
 - `VolumeRegistry.shred(volume_id, key_id=..., destroy_key=...)`, under the
   registry lock: checks the volume has a committed head and is not shredded,
-  checks `key_id`, builds the shred entry, ends the lease, then calls
+  checks `key_id`, builds the shred entry, ends the lease and freezes the volume
+  (`shred_pending`: grant, accept and head refuse), then calls
   `destroy_key(key_id)`. Only when that returns `True` does it log the shred and
   return a signed `cathedral_volume_shred_receipt_v1`. When the key service
-  refuses, nothing is logged, the volume stays live and the holder re-grants.
-  After a shred, grant, accept (including a resend), head and a second shred
-  refuse `volume_shredded`.
+  refuses or its answer is lost, nothing is logged and the volume stays frozen,
+  since the key may already be gone; retrying `shred` finishes it. After a
+  shred, grant, accept (including a resend) and head refuse `volume_shredded`;
+  `shred` again with the same `key_id` returns the same receipt.
 - The receipt attests that the key service confirmed destroying `key_id`.
   `destroy_key` is the key release service's call (AB#392, not built); it must
-  raise on an unknown key. Binding `key_id` to the volume is its job.
+  raise on an unknown key and be idempotent (an already destroyed key returns
+  `True`), so a retry after a lost answer succeeds. Binding `key_id` to the
+  volume is its job.
 - Provisional until Fred decides who holds the log key: the registry signs the
   shred receipt with its own key, `signing_key_id` `registry:<first 16 hex of
   sha256(public key)>`. That receipt is Ed25519 over canonical JSON with no
@@ -491,8 +495,8 @@ Registry wiring:
   collide with them: a labelled message starts with `c`, canonical JSON with `{`.
 - Prune token `cathedral_volume_prune_token_v1`
   (`volume_subtoken.issue_prune`, `VolumeRegistry.issue_prune_token`,
-  `authorize_prune`): its own label, never issued against a lease, bound to the
-  volume prefix, the prune runner's address and at most one hour. It is the only
+  `authorize_prune`): its own label, never issued against a lease, bound to a
+  prefix whose last segment is the volume id, the prune runner's address and at most one hour. It is the only
   token that carries `delete`; it also carries get, put and list, because restic
   prune reads packs and writes index and lock files. The guest sub-token
   (`authorize`) never allows delete, and neither token passes the other's check.
