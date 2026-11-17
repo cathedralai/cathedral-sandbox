@@ -1,0 +1,1 @@
+{"verdict": "FAIL", "reason": "some receipts name an earlier binding than the attestation's; pass --broker and --operator-key-file to load archived bindings"}

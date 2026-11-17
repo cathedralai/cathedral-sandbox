@@ -856,6 +856,50 @@ def _validated_env(env: Mapping[str, object]) -> dict[str, str]:
     return dict(env)
 
 
+# A room's env overlay (AB#414): set after create through a sealed envelope that the
+# receipts front opens (room-kit/room_receipts.py, sealed-env), merged into every exec
+# and process start. The front checks the same rules; these hold at the API too.
+ENV_OVERLAY_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+ENV_OVERLAY_MAX_NAMES = 64
+ENV_OVERLAY_MAX_BYTES = 64 * 1024  # names and values, UTF-8
+# PATH and the loader's variables decide which timeout and shell every exec runs: an
+# overlay that set them would break each command the API wraps, not just the customer's.
+ENV_OVERLAY_RESERVED = ("PATH",)
+ENV_OVERLAY_RESERVED_PREFIXES = ("LD_",)
+
+
+def env_overlay_problem(env: object) -> str | None:
+    """None when *env* is a usable overlay, else a short reason that never names a value."""
+    if not isinstance(env, Mapping):
+        return "env must be an object"
+    if len(env) > ENV_OVERLAY_MAX_NAMES:
+        return f"at most {ENV_OVERLAY_MAX_NAMES} names"
+    size = 0
+    for name, value in env.items():
+        if not isinstance(name, str) or not ENV_OVERLAY_NAME_RE.fullmatch(name):
+            return "a name must match [A-Za-z_][A-Za-z0-9_]{0,127}"
+        if name in ENV_OVERLAY_RESERVED or name.startswith(ENV_OVERLAY_RESERVED_PREFIXES):
+            return f"{name} is reserved"
+        if not isinstance(value, str):
+            return f"the value of {name} must be a string"
+        try:
+            raw = value.encode("utf-8")
+        except UnicodeEncodeError:
+            return f"the value of {name} is not UTF-8"
+        if b"\0" in raw:
+            return f"the value of {name} holds a NUL byte"
+        size += len(name) + len(raw)
+    if size > ENV_OVERLAY_MAX_BYTES:
+        return f"names and values exceed {ENV_OVERLAY_MAX_BYTES} bytes"
+    return None
+
+
+def validated_env_overlay(env: object) -> dict[str, str]:
+    problem = env_overlay_problem(env)
+    _require(problem is None, "invalid_env", problem or "")
+    return dict(env)  # type: ignore[arg-type]
+
+
 def _validated_abs_path(path: str, code: str = "invalid_path") -> str:
     _require(
         isinstance(path, str) and path.startswith("/") and ".." not in path.split("/"),
@@ -888,6 +932,10 @@ class ExecRequest:
     # runs, for a follow client to read through the files route. Absent on a
     # sync exec. 32 lowercase hex characters.
     spill_token: str | None = None
+    # Epoch seconds after which the API no longer wants this exec to start (AB#406). The
+    # hotel refuses a later start, so a cancel that came first cannot be undone by a slow
+    # dispatch. Absent from an older API.
+    launch_by: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.cmd, str):
@@ -917,6 +965,12 @@ class ExecRequest:
                 "invalid_exec",
                 "spill_token must be 32 lowercase hex characters",
             )
+        if self.launch_by is not None:
+            _require(
+                isinstance(self.launch_by, int) and not isinstance(self.launch_by, bool) and self.launch_by > 0,
+                "invalid_exec",
+                "launch_by must be a positive integer of epoch seconds",
+            )
 
     @property
     def is_shell(self) -> bool:
@@ -943,6 +997,10 @@ class ExecResult:
     # the caller the room itself is gone and later execs will fail.
     oom_killed: bool = False
     room_alive: bool = True
+    # True only when the hotel sent a cancel signal that passed its pid file guard and the
+    # exec call then returned (AB#406). Never inferred from the exit code: a BusyBox timeout
+    # also exits 143.
+    cancelled: bool = False
 
     def to_document(self) -> Mapping[str, object]:
         doc: dict[str, object] = {
@@ -957,6 +1015,8 @@ class ExecResult:
             doc["oom_killed"] = True
         if not self.room_alive:
             doc["room_alive"] = False
+        if self.cancelled:
+            doc["cancelled"] = True
         return MappingProxyType(doc)
 
 

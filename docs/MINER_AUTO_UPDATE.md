@@ -479,7 +479,10 @@ record keeps running what it has and reports `refused`.
    over unlabelled, with one restart, and the rollback is always allowed.
 3. Bootstrap one TDX host and one SNP host, install the page hook, and enable
    the timer. Record the signed record, the key fingerprints, `status` before
-   and after, and the journal.
+   and after, and the journal. `deploy/miner-update/rehearse_miner_update.py`
+   rehearses this capture on a scratch root with throwaway keys, plus a
+   bad-signature and a rolled-back-sequence negative control, so the live run
+   has the same shape. It is not the live E2E and commits no trust root.
 4. Real releases then go canary first, then stable.
 
 ## Limits

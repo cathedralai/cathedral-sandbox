@@ -16,6 +16,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from cathedral.no_redirect import NoRedirect, RedirectRefused
+
 # The public edge refuses generic HTTP library user agents.
 USER_AGENT = "cathedral-conformance/0.1"
 
@@ -60,11 +62,14 @@ def urllib_transport(method: str, url: str, headers: dict[str, str], body: bytes
     request = urllib.request.Request(url, data=body, method=method, headers=headers)
     started = time.monotonic()
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as reply:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=timeout) as reply:
             data = reply.read()
             return Response(reply.status, dict(reply.headers), data, time.monotonic() - started)
     except urllib.error.HTTPError as exc:
         return Response(exc.code, dict(exc.headers or {}), exc.read(), time.monotonic() - started)
+    except RedirectRefused as exc:
+        return Response(0, {"X-Cathedral-Transport-Error": "redirect"}, str(exc).encode(),
+                        time.monotonic() - started)
     except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
         # No answer: status 0, so a check reports it instead of crashing the run.
         return Response(0, {}, str(exc).encode(), time.monotonic() - started)
@@ -110,6 +115,8 @@ class Api:
         view: dict = {}
         while True:
             reply = self.get_sandbox(sandbox_id)
+            if reply.headers.get("X-Cathedral-Transport-Error") == "redirect":
+                return {"state": "failed", "error": reply.data.decode()}, self.clock() - started
             if reply.ok:
                 view = reply.json() or {}
                 if view.get("state") == "running" or view.get("state") in TERMINAL_STATES:

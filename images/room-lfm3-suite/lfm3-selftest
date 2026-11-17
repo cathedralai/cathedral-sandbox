@@ -183,6 +183,11 @@ for check in "${checks[@]}"; do
           echo "FAIL $check: no answer, or raw tool-call markup"
           exit 1
         fi
+        # lfm3-agent's example turns for Audio (AB#545) must not come back as the answer.
+        if grep -Eq '^(12\.|Bonjour\.)$|0022' <<<"$out"; then
+          echo "FAIL $check: the answer repeats an example turn"
+          exit 1
+        fi
         if [ -n "$ask" ] && ! grep -Eiq 'paris' <<<"$out"; then
           echo "FAIL $check: the answer does not hold \"Paris\""
           exit 1
