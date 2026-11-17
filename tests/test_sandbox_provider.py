@@ -583,3 +583,50 @@ def test_files_api_does_not_follow_a_link_swapped_in_after_the_check(provider: I
     with pytest.raises(SandboxOpError):
         provider.write_file(sid, "/work/sub/api.key", b"overwrite", None)
     assert (outside / "api.key").read_bytes() == b"SECRET"
+
+
+# ------------------------------------------------------------------ AB#534 disk walk outside the lock
+def _walks_unlocked(provider: InMemorySandboxProvider, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    walked: list[str] = []
+    real = provider._disk_bytes
+
+    def spy(sandbox):
+        assert not provider._lock._is_owned(), "disk walk ran under the provider lock"
+        walked.append(sandbox.id)
+        return real(sandbox)
+
+    monkeypatch.setattr(provider, "_disk_bytes", spy)
+    return walked
+
+
+def test_list_and_get_walk_disk_outside_the_lock(provider: InMemorySandboxProvider, monkeypatch) -> None:
+    a, b = _sid(provider), _sid(provider)
+    walked = _walks_unlocked(provider, monkeypatch)
+    assert {d["id"] for d in provider.list(labels=[], state=None)} == {a, b}
+    provider.get(a)
+    assert sorted(walked) == sorted([a, b, a])
+
+
+def test_list_reuses_a_recent_size_and_get_is_fresh(provider: InMemorySandboxProvider, monkeypatch) -> None:
+    sid = _sid(provider)
+    walked = _walks_unlocked(provider, monkeypatch)
+    provider.list(labels=[], state=None)
+    provider.write_file(sid, "/work/a.bin", b"x" * 4096, None)
+    provider.list(labels=[], state=None)
+    assert walked == [sid]  # second list inside the max age: no walk
+    assert provider.get(sid)["metrics"]["disk_bytes"] >= 4096
+    assert provider.list(labels=[], state=None)[0]["metrics"]["disk_bytes"] >= 4096
+
+
+def test_list_skips_a_room_deleted_during_the_walk(provider: InMemorySandboxProvider, monkeypatch) -> None:
+    a, b = _sid(provider), _sid(provider)
+    real = provider._disk_bytes
+
+    def delete_b_mid_walk(sandbox):
+        if sandbox.id == a:
+            provider.delete(b)
+            provider.finish_delete(b)
+        return real(sandbox)
+
+    monkeypatch.setattr(provider, "_disk_bytes", delete_b_mid_walk)
+    assert [d["id"] for d in provider.list(labels=[], state=None)] == [a]

@@ -1,0 +1,50 @@
+{
+ "head": "db99a2c0fdf7b15d69ae9527a0e66ed2ff450d650cfca1550f3e0f10ea9c98ae",
+ "receipts": [
+  {
+   "receipt_sha256": "7ab6d06f38e9519b07908a1dc2b3157f8f68e15cd109ba89f2c79a9edf2c0a84",
+   "signature_b64": "sRijCzEzDCkHkM44U5EWJZwXiyOcsjjEORsp2SCs8t1Oan9xnGbrh1OU2DEth9JCrVvgaVa687Y5EOzcfQPODw==",
+   "statement": {
+    "action": "create",
+    "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
+    "command_sha256": null,
+    "customer_request_sha256": "ad1b9de910513527b407147d7a05569066c1a50cceaba3e118df6b13f49e749c",
+    "hotel": "pack-hotel",
+    "image": null,
+    "image_digest": null,
+    "issued_at": 1700000001,
+    "operation_id": "6a7098ee-602f-b0f8-a645-46d9f49c5eeb",
+    "previous_receipt_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
+    "result_sha256": "400a936d0ac7637324413df9aaf2067ff68468e602a5446af1e454878b5bad1e",
+    "sandbox_id": "room-a",
+    "schema": "cathedral_sealed_hotel_receipt_v1",
+    "sequence": 1,
+    "serial": true,
+    "status": 202,
+    "target": "POST /v1/sandboxes/room-a/create"
+   }
+  },
+  {
+   "receipt_sha256": "db99a2c0fdf7b15d69ae9527a0e66ed2ff450d650cfca1550f3e0f10ea9c98ae",
+   "signature_b64": "iymMclnejg0fkgLNlUj3MCRjiA8khYzh+8iaZCiCRD+kT2S5aosB71N3/anheyoaKceYzouw+YKvQSW2A5mzBA==",
+   "statement": {
+    "action": "exec",
+    "binding_sha256": "ad87f20f4ae6948df08746e143a5c7f1429bea6c26557596cc98057f5bbf1a27",
+    "command_sha256": null,
+    "customer_request_sha256": "ff14e14c208d414590558c2e333a73da13828df7df2988dacc7f817e6aa5f995",
+    "hotel": "pack-hotel",
+    "image": null,
+    "image_digest": null,
+    "issued_at": 1700000002,
+    "operation_id": "81b3464a-8f46-451e-e17b-915979a074b9",
+    "previous_receipt_sha256": "7ab6d06f38e9519b07908a1dc2b3157f8f68e15cd109ba89f2c79a9edf2c0a84",
+    "result_sha256": "096e929abe31157e5a522fecfe1333bb96b3252e9ee74923b6e9027206c4d068",
+    "sandbox_id": "room-a",
+    "schema": "cathedral_sealed_hotel_receipt_v1",
+    "sequence": 2,
+    "status": 200,
+    "target": "POST /v1/sandboxes/room-a/exec"
+   }
+  }
+ ]
+}
