@@ -213,6 +213,163 @@ looks at that room, with one GET.
 Limits: only rooms the front signed a create for; after a front restart the
 table is empty and no end is signed for earlier rooms.
 
+### Pre-made rooms
+
+A create whose labels carry `cathedral_pool` = `"1"` makes a pre-made room. It
+holds exactly five keys, all present: `image` (a non-empty string),
+`resources` (a non-empty object), `network` (exactly
+`{"mode":"deny_all","allow":[]}`), `labels` (without `cathedral_sandbox_id` or
+`cathedral_serial`) and `ttl_seconds` (a positive integer, not a boolean), and
+carries no `Idempotency-Key`: otherwise 400 `pool_create_invalid`,
+`reserved_label_invalid` or `idempotency_key_refused`. Its create receipt carries
+`pool: true` when it is the room's receipt 1, nothing was in flight for it, no
+request other than a read was forwarded for that id while the create was
+pending, the API's answer shows `deny_all`, and its `expires_at` has an offset
+and falls after now and no later than 48 hours and 60 seconds from now.
+
+An unclaimed room accepts delete, claim and reads of its record (GET of the
+room, `/wait`) only; every other route, the sealed handlers included, is
+refused with 409 `pool_room_unclaimed`.
+
+`POST /v1/sandboxes/<id>/claim` with exactly `{"cathedral_sandbox_id": <lower-case
+UUID>, "lifetime_seconds": 1..172800}` binds the room. A fresh claim needs: an
+unclaimed pool room this boot has the create receipt of, not marked unknown
+(below), a list holding the create alone, and at least 300 s before the room's
+`expires_at`. It sets the lifetime through the API and signs `claim`
+(`cathedral_sandbox_id`, `lifetime_seconds`, `pooled_from` = the create
+receipt's hash, `status`, `expires_at`). The lifetime call has one total
+deadline of 10 seconds on a monotonic clock, not a timeout per read. A timer
+sets an expired flag and cuts the connection, including one whose headers or
+body are still arriving. Expiry is also checked against the monotonic clock
+itself after the call, so an answer that arrives after the bound counts as
+expired even if the timer thread ran late, and whatever was parsed, an expired
+call is treated as no answer. The connect and every read get the time that is
+left as their timeout. The caller then gets 409
+`pool_claim_failed` and the signed claim says status 502, as for any lost
+answer. Success answers 200 with the receipt. Any other result signs the claim with its status,
+breaks the room (delete only) and answers 409 `pool_claim_failed`: one try per
+room. Another sandbox id gets 409 `pool_room_claimed`. A delete meanwhile gets
+409 `room_busy`.
+
+A replay is the same sandbox id claiming a claimed room again. It makes no
+lifetime call and signs nothing new. The front first does one GET of the room
+(a 10 second total deadline, as above). 200 from the API, and the room not
+marked unknown when the GET has returned (the mark is read under the ledger
+lock after the GET, so a mark set while it was in flight counts): the stored
+answer and receipt. 404 or 409: 409 `pool_room_gone`. A 5xx, no answer, the
+deadline, or a room marked unknown: 409 `pool_room_unknown`. A replay is a
+check at that moment that the room exists. It does not protect against a delete
+that lands a moment later. A claim leaves the room's labels alone, so a bulk
+delete can remove a claimed room, and this keeps a stored 200 from being
+replayed for a room that is already gone.
+
+**Bulk delete and claims.** A bulk delete by label names no room until the API
+runs it, so it never runs beside a claim.
+- A bulk delete that arrives while a claim is in flight waits for it for at most
+  15 seconds from its arrival (one monotonic deadline; the claim's own lifetime
+  call is cut at 10 seconds in all). The wait takes the ledger lock with the
+  time that is left, and the deadline is checked again under the lock before
+  the bulk delete starts, so a thread that was paused past it is refused and no
+  counter changes. If a claim is still in flight at 15 seconds, or the lock
+  could not be taken in time, the caller gets 409 `bulk_delete_claim_busy`,
+  nothing is forwarded, and a line goes to stderr.
+- Once forwarded, the front waits for its answer for at most 300 seconds in all
+  (monotonic, with the expired flag and the clock check as for the claim, and
+  the connect and reads limited to the time left). When that is hit the caller gets
+  502 `hotel_api_no_answer`, the signed `bulk_delete` receipt says status 502,
+  and the bulk delete counts as uncertain.
+- While a bulk delete is waiting or running, a fresh claim is refused with 409
+  `pool_bulk_delete_busy` before its lifetime call, so the wait cannot be
+  starved, and the API then creates a cold room. Every fresh claim in that time
+  is refused, and a bulk delete can run for as long as the API takes. A replay
+  is not a fresh claim and is answered as above at any time.
+- A caller that leaves while its bulk delete waits ends the wait and nothing is
+  forwarded. The front looks every 0.2 seconds and once more right before
+  forwarding. The look does not run while the request waits for the ledger lock.
+  On the TLS port of a miner hotel a disconnect is not detected: the bulk
+  delete is forwarded.
+
+**An uncertain bulk delete.** Certain means a 2xx, or a 4xx, which the machine
+sends only before it acts (authentication, the label filter; once it starts
+removing rooms it raises no 4xx). Uncertain means any 5xx, no answer, a broken
+or unreadable answer, and the front's own 300 second deadline. The machine keeps
+running a bulk delete the front stopped waiting for, and it picks its targets
+once, when it starts. So after an uncertain one, before the guard clears, the
+front marks every pool room it knows, unclaimed or claimed, as unknown. Unknown
+changes two things only: a fresh claim on the room gets 409
+`pool_room_unknown`, and a stored claim answer is not replayed (409
+`pool_room_unknown`). Every other request on the room, a claimed room in use
+included, behaves and is signed as before. A 2xx delete of the room, or its
+`room_end`, clears the mark, and nothing else does. A pool room made after the
+bulk delete ended is not marked.
+
+**A front restart.** A restart of the front in the same guest boot (a crash
+under `Restart=on-failure`) makes a new receipt key and binding. A receipt is
+only ever served under the binding that signed it: the new front never signs,
+replays or continues a claim made before it.
+- At start the front lists the pool-labelled rooms the API still has that it
+  never created. Until a list is read and parsed, every authorized room request,
+  create and bulk delete gets 503 `pool_state_unknown`; the list is retried every
+  5 seconds.
+- An unclaimed room from before the restart is stale: never claimable, and every
+  route but delete, claim and record reads is refused with 409
+  `pool_room_stale`. The keeper deletes it; its create's `ttl_seconds` ends it
+  anyway.
+- A room claimed before the restart keeps working as an ordinary room. Each
+  successful claim writes a root-only marker (room, sandbox id, the API room's
+  `created_at`, boot id, binding and claim receipt hash; no answer, no receipt)
+  before the 200. A marker that matches the listed room, its creation time and
+  this boot marks the room claimed-before. Its later receipts are signed under
+  the new binding and numbered from 1, a separate (binding, room) group to the
+  checker. A claim on it is refused and signs nothing: 409 `pool_room_claimed`
+  for another sandbox id; for the same id 409 `pool_room_stale` while the new
+  front has signed nothing for the room, and 409 `pool_room_gone` once it has.
+- The claim's proof is receipts 1 and 2 under the earlier binding, plus that
+  binding's attestation. The broker archives bindings, not receipts or SNP
+  reports, so the caller must keep receipts 1 and 2 and the attestation it took
+  at claim (`POST /room/attest` with a fresh nonce). Receipts 3 to n signed
+  between the claim and the restart are no longer served after it, as for any
+  ordinary room. The front keeps each binding's chain and attestation in its own
+  file (`chain-<boot_id>-<binding_sha256[:16]>.jsonl`,
+  `attestation-<boot_id>-<binding_sha256[:16]>.json`), so a restart never
+  appends to or overwrites the earlier ones.
+
+**Pool sizing.** A front restart, planned (a roll) or not (a crash), loses
+every unclaimed pool room on that hotel. Size each lane so that the unclaimed
+rooms on its other hotels cover peak claims for one refill period: broker
+re-attest of the new binding, the keeper tick that retires rooms whose create
+names an old binding, and the starts that refill the pool. A lane served by one
+hotel has no such cover: after a restart every claim there falls back until
+the keeper refills. A miss falls back to a cold create, so undersizing costs
+speed, never proof.
+
+Other refusals: 405 for any method but POST (checked before the gate), 400
+`claim_request_invalid`, 409 `pool_room_stale` (no create receipt this boot),
+`pool_room_claimed` (claimed for another sandbox, before or after a restart),
+`pool_room_gone` (the room has ended, was deleted, or a replay finds it gone),
+`pool_room_unknown` (see above), `room_not_pool`, `pool_room_used`,
+`pool_room_expiring`.
+
+Limits:
+- A request that signs a receipt holds the ledger lock while the receipt is
+  written. If storage blocks there, requests waiting for that lock wait with it,
+  the signing step of a claim included, and so do the releases at the end of
+  every request. Only the bulk delete's own wait is bounded against this, by
+  taking the lock with a timeout. The front never holds the ledger lock across a
+  call to the API.
+- Any holder of the machine's bearer key can send bulk deletes one after another
+  and keep fresh claims refused. There is no throttle for bulk deletes; the API
+  side then answers those claims as sold out.
+- A bulk delete by label names no room, so while one waits or runs it refuses
+  fresh claims for every room, even if its label would not match that room. A
+  room it removes ends with a `room_end` receipt at a later look. A create that
+  overlaps a bulk delete while it runs gets no `pool` flag; one that overlaps
+  only its waiting still can.
+- The machine picks a bulk delete's targets under a provider lock when it
+  starts. If that lock stalls for longer than the front's wait, a bulk delete
+  the front gave up on could still reach a pool room made after the front gave
+  up.
+
 ### Fresh report over caller data (sealed only)
 
 `POST /room/attest` on the receipt front asks the processor for a new SNP
@@ -436,6 +593,37 @@ wait; a restart would end them), or when a pinned download's checksum differs
 from `versions.lock`. It fails at the end unless the API answers
 `GET /v1/status` with 200 for its own key; "done" is never printed over a
 hotel that answers nobody.
+
+## Miner hotel offer
+
+A miner hotel (`install.sh --sealed` with `SEALED_MINER=1`, see `sealed/README.md`) joins only after the miner signs an
+offer with the hotkey. `hotel_offer.py` runs on the miner host (not in the guest), reads the guest's own
+`GET /room/attestation`, and builds `cathedral_hotel_offer_v1`:
+
+```
+pip install py-sr25519-bindings==0.2.2 cryptography
+python3 hotel_offer.py --origin https://<public ip>:<SEALED_MINER_PUBLIC_PORT> --hotkey-file <hotkey>
+python3 hotel_offer.py --origin ... --hotkey-file <hotkey> --post https://<api>/v1/cathedral/snp/hotel-offers
+```
+
+- On a miner using `sealed/host-net.sh` the host cannot reach its own public address, so fetch from the guest:
+  add `--attestation-url https://<guest ip>:<SEALED_MINER_TLS_PORT>` (the offer still advertises `--origin`; the
+  TLS key check still applies). Or pass the attestation the installer saved, `--attestation <SEALED_DIR>/run/attestation.json`
+  (read from the guest over plain HTTP on the tap, so the TLS key check is skipped; the API checks it).
+- A refused offer (for example the 422 reason code) is printed to stderr and the command exits 1; only an accepted
+  offer exits 0.
+- `--hotkey-file` is a plaintext Bittensor hotkey file (`secretSeed`) or a file holding the 32-byte seed as hex,
+  mode 600. An encrypted keyfile is refused.
+- Before signing it checks that `binding_sha256` is the digest of the binding, that the SNP report commits to the
+  binding, that the binding's chip is the report's chip, and that the TLS key that answered is the key in the
+  binding. `machine_id` comes from the report's CPU generation and CHIP_ID, as the roster computes it.
+- `--sequence` must grow with every offer for the machine (default: unix time). `--withdraw` withdraws the offer.
+  `--network` and `--netuid` default to `finney` and 94. An offer is good for the age window the API sets, so
+  sign a new one after each guest boot (a new boot is a new binding).
+- Without `--post` it prints the offer. The offer grants nothing: the
+  API fetches the attestation itself and checks the TLS key, the AMD chain, the published measurement and the
+  roster machine.
+- Not covered here: the signed update channel for a miner hotel, and a miner-side view of offer status.
 
 ## What the kit installs
 

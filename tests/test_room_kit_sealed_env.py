@@ -121,7 +121,7 @@ class Api:
 
 
 def _front(ledger, api_port: int) -> int:
-    server = rr.Server(("127.0.0.1", 0), ledger, api_port, 1, KEY, "/nonexistent.sock")
+    server = rr.Server(("127.0.0.1", 0), ledger, api_port, 1, KEY, "/nonexistent.sock", pool_scan=False)
     Thread(target=server.serve_forever, daemon=True).start()
     return server.server_address[1]
 

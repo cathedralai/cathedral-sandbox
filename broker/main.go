@@ -84,6 +84,15 @@ type hotelConfig struct {
 	// TLSSPKISHA256 is derived from a miner hotel's verified SNP binding at
 	// join and persisted for safe reconnect after a broker restart.
 	TLSSPKISHA256 string `json:"tls_spki_sha256,omitempty"`
+	// DrainNotice: the miner's signed planned-maintenance notice, set by
+	// PATCH {"drain": true, "drain_notice": ...} (drain_notice.go).
+	DrainNotice *drainNoticeRecord `json:"drain_notice,omitempty"`
+	// GuestTLS (AB#378): a sealed hotel reached only over the TLS key its
+	// guest made and named in its attested binding, with the hotel key
+	// installed in the guest (hotel_key_source "install"), as a miner hotel
+	// is. The broker verifies the key without sending the hotel key and pins
+	// it (miner_tls.go syncGuestPin); a config file never names the pin.
+	GuestTLS bool `json:"guest_tls,omitempty"`
 	// Commitment: the slots and daily hours a miner hotel declares at join
 	// (commitment.go). Nil: none declared.
 	Commitment *capacityCommitment `json:"commitment,omitempty"`
@@ -148,6 +157,17 @@ type config struct {
 	// MinerMaxHotels is the operator-approved maximum across all miner hotkeys.
 	// Zero refuses miner joins; pending and draining hotels count.
 	MinerMaxHotels int `json:"miner_max_hotels,omitempty"`
+	// MinerProbationSeconds: a joined miner hotel takes test traffic only
+	// for this long (observed time) and graduates to the shared pool at
+	// MinerProbationMinUptimePct verified uptime (probation.go). 0: off.
+	MinerProbationSeconds      float64 `json:"miner_probation_seconds,omitempty"`
+	MinerProbationMinUptimePct float64 `json:"miner_probation_min_uptime_pct,omitempty"`
+	// Room caps on miner hotels (placement.go, AB#335). Both are off at 0.
+	// MinerMaxRoomsPerHotkey caps the rooms of one miner hotkey across all
+	// its hotels. MinerPoolShare (0 < x < 1) caps the rooms on miner hotels
+	// in the shared sealed pool at that share of the pool when it is full.
+	MinerMaxRoomsPerHotkey int     `json:"miner_max_rooms_per_hotkey,omitempty"`
+	MinerPoolShare         float64 `json:"miner_pool_share,omitempty"`
 	// MinerMinCommitment is the floor a miner join's commitment must meet
 	// (commitment.go). Nil or zero: a commitment is optional.
 	MinerMinCommitment *capacityCommitment `json:"miner_min_commitment,omitempty"`
@@ -160,6 +180,11 @@ type config struct {
 	SealedHostData     []string `json:"sealed_host_data,omitempty"`     // non-empty: its HOST_DATA must be one of these
 	AttestTTLSeconds   float64  `json:"attest_ttl_seconds,omitempty"`   // a pass is good this long (default 600)
 	AttestEverySeconds float64  `json:"attest_every_seconds,omitempty"` // check a passed hotel again this often (default 60)
+	// RequireSealedGuestTLS (AB#378): every sealed hotel is reached only over
+	// its attested guest TLS key. A sealed config hotel must set "guest_tls":
+	// true, and a sealed join must pass the keyless HTTPS bootstrap. Off by
+	// default until every sealed hotel runs a guest that installs its key.
+	RequireSealedGuestTLS bool `json:"require_sealed_guest_tls,omitempty"`
 	// AMDVerifier runs room-kit/verify_receipts.py on a sealed hotel's
 	// attestation to check the AMD chain (amd_chain.go). Required for miner hotels.
 	AMDVerifier *amdVerifierConfig `json:"amd_verifier,omitempty"`
@@ -219,9 +244,12 @@ type hotel struct {
 	key       string
 	client    *http.Client
 	ctl       *http.Client // sync loop and hotel documents
-	tlsPinErr error        // non-nil: miner calls must not send the hotel key
-	cfgMu     sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.ReservedFor, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
-	sem       chan struct{}
+	tlsPinErr error        // non-nil: guest TLS calls must not send the hotel key
+	// guestPin is the verified guest TLS SPKI (miner_tls.go); nil: none yet.
+	// Read on every TLS handshake, so atomic.
+	guestPin atomic.Pointer[[sha256.Size]byte]
+	cfgMu    sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.DrainNotice, cfg.ReservedFor, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
+	sem      chan struct{}
 
 	// Guarded by broker.mu.
 	slots        int
@@ -238,6 +266,9 @@ type hotel struct {
 	downSince    time.Time       // when ok last went false; zero while ok
 	lastAnswer   atomic.Int64    // unix ns of the last room call the hotel answered (status < 500)
 	healthMs     float64         // duration of the last /room/health call
+	pinCheckedAt time.Time       // last keyless guest TLS check (syncGuestPin)
+	pinErr       string          // why the last guest TLS check failed; "" after a pin
+	pinChip      string          // CHIP_ID of the pinned guest TLS key's binding; a re-pin must match it
 	// healthRuntime: the room runtime the hotel last reported in /room/health
 	// ("runsc"...), or "" when it reported none. Atomic because isolationDoc
 	// reads it with or without b.mu held.
@@ -261,7 +292,9 @@ type hotel struct {
 	moved           int       // creates that left this hotel's queue for another hotel
 	runtime         bool      // joined at runtime (hotels.go), not from the config file
 	adm             admission // attestation gate of a joined sealed hotel (admission.go)
-	delivery        delivery  // delivered capacity against the commitment (commitment.go)
+	prob            probation // miner probation (probation.go)
+	probationOn     atomic.Bool
+	delivery        delivery // delivered capacity against the commitment (commitment.go)
 	// roomsUnchecked: loaded at start and no room list has answered since. A
 	// reserved hotel takes no rooms until one has passed the fail-closed
 	// check (lend.go). baselineTry: last REPORT_ID fetch for an unknown
@@ -295,6 +328,8 @@ type broker struct {
 	stateSaveMu      sync.Mutex               // one client-state save at a time, snapshot through rename (state.go)
 	guests           map[string]*guestState
 	capsOnDisk       map[string]map[string]any // probe results read from state_dir at start
+	probationFileMu  sync.Mutex                // serializes miner-probation.json writes (probation.go)
+	probationSavedAt time.Time                 // guarded by mu
 	lendsOnDisk      map[string]lendEntry      // lend state of hotels not in the config file now (lend.go); guarded by mu
 	byKey            map[string]*guestState    // sha256(key) -> guest
 	byUUID           map[string]*room
@@ -319,6 +354,10 @@ type broker struct {
 	// tombs is guest id -> recent deletes by label, which also catch creates
 	// in flight (inflight.go). Guarded by b.mu.
 	tombs map[string][]tombstone
+
+	// minerExits: miner hotels that went down holding customer rooms
+	// (miner_exits.go). Guarded by b.mu.
+	minerExits []*minerExit
 }
 
 // A hotel counts as answering while its last good health answer is younger than okWindow.
@@ -395,6 +434,15 @@ func loadBroker(path string) (*broker, error) {
 	if c.MinerMaxHotels < 0 {
 		return nil, errors.New("config: miner_max_hotels must be positive when miner hotels are allowed")
 	}
+	if err := validateProbationConfig(c); err != nil {
+		return nil, err
+	}
+	if c.MinerMaxRoomsPerHotkey < 0 {
+		return nil, errors.New("config: miner_max_rooms_per_hotkey must be 0 (no cap) or more")
+	}
+	if c.MinerPoolShare != 0 && !(c.MinerPoolShare > 0 && c.MinerPoolShare < 1) {
+		return nil, errors.New("config: miner_pool_share must be 0 (no cap) or between 0 and 1, exclusive")
+	}
 	if err := validateMinCommitment(c.MinerMinCommitment); err != nil {
 		return nil, err
 	}
@@ -428,6 +476,9 @@ func loadBroker(path string) (*broker, error) {
 		}
 		if hc.RequireAttestation && !hc.Sealed {
 			return nil, fmt.Errorf("config: hotel %q: require_attestation needs \"sealed\": true", hc.ID)
+		}
+		if err := validateGuestTLS(hc, c.RequireSealedGuestTLS); err != nil {
+			return nil, err
 		}
 		if hc.RequireAttestation {
 			optedIn = append(optedIn, hc.ID)
@@ -544,13 +595,8 @@ func (h *hotel) doBase(ctx context.Context, base, method, path string, query url
 // doHeaders is doBase with extra request headers (the guest id of
 // guestcalls.go).
 func (h *hotel) doHeaders(ctx context.Context, base, method, path string, query url.Values, body []byte, timeout time.Duration, extra http.Header) (int, http.Header, []byte, error) {
-	if h.cfg.MinerHotkey != "" {
-		if h.tlsPinErr != nil {
-			return 0, nil, nil, h.tlsPinErr
-		}
-		if !strings.HasPrefix(base, "https://") {
-			return 0, nil, nil, errors.New("miner hotel API requires attested HTTPS")
-		}
+	if err := h.keyedCallErr(base); err != nil {
+		return 0, nil, nil, err
 	}
 	u := base + path
 	if len(query) > 0 {
@@ -584,13 +630,8 @@ func (h *hotel) doHeaders(ctx context.Context, base, method, path string, query 
 }
 
 func (h *hotel) getJSON(ctx context.Context, base, path string, query url.Values, v any) error {
-	if h.cfg.MinerHotkey != "" {
-		if h.tlsPinErr != nil {
-			return h.tlsPinErr
-		}
-		if !strings.HasPrefix(base, "https://") {
-			return errors.New("miner hotel API requires attested HTTPS")
-		}
+	if err := h.keyedCallErr(base); err != nil {
+		return err
 	}
 	u := base + path
 	if len(query) > 0 {
@@ -664,21 +705,22 @@ func (h *hotel) used() int { return len(h.rooms) + h.creating + h.queued }
 // candidate only when no preferred hotel has a free room (capacity.go).
 // Caller holds b.mu.
 func (b *broker) pick(exclude map[*hotel]bool, pl placement) *hotel {
+	mb := b.minerBudgetNow() // the miner caps (placement.go), read once
 	if pl.policy != nil && pl.tier == "" {
 		for _, t := range []string{tierPrefer, tierAllow} {
 			tp := pl
 			tp.tier = t
-			if h := b.pickIn(exclude, tp); h != nil {
+			if h := b.pickIn(exclude, tp, mb); h != nil {
 				return h
 			}
 		}
 		return nil
 	}
-	return b.pickIn(exclude, pl)
+	return b.pickIn(exclude, pl, mb)
 }
 
 // pickIn is pick inside one candidate set.
-func (b *broker) pickIn(exclude map[*hotel]bool, pl placement) *hotel {
+func (b *broker) pickIn(exclude map[*hotel]bool, pl placement, mb *minerBudget) *hotel {
 	now := time.Now()
 	hotels := b.hotelList()
 	total := 0.0
@@ -687,7 +729,7 @@ func (b *broker) pickIn(exclude map[*hotel]bool, pl placement) *hotel {
 		if exclude[h] || !pl.allows(h) {
 			continue
 		}
-		if f := b.admissibleFree(h, now); f > 0 {
+		if f := b.admissibleFreeIn(h, now, mb); f > 0 {
 			weight[i] = h.weight(f)
 			total += weight[i]
 		}
@@ -1310,13 +1352,34 @@ func isMinerHotel(h *hotel) bool {
 
 func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestState, rest string) {
 	bid, tail, _ := strings.Cut(rest, "/")
+	// The tail is decoded and goes to the hotel by string concatenation, so a
+	// decoded "?" or "#" would turn the rest into a query or fragment there and
+	// slip past the gates below ("desktop%3F" reaches the hotel's /desktop).
+	// No hotel route works with one, so refuse it before any gate.
+	if strings.ContainsAny(tail, "?#") {
+		writeErr(w, 400, "invalid_path", "a sandbox path cannot contain an encoded ? or #")
+		return
+	}
+	// The gates below key on the first tail segment without any ";params":
+	// the hotel's router (urlparse) drops ";params" from the last segment, so
+	// "desktop;x" or "terminals;x" reaches the same hotel route as the bare name.
+	gate, _, _ := strings.Cut(tail, "/")
+	gate, _, _ = strings.Cut(gate, ";")
 	// Room terminals open only on hotels known to run a package where a
 	// terminal line goes through the runtime's exec (B154).
-	if tail == "terminals" || strings.HasPrefix(tail, "terminals/") {
+	if gate == "terminals" {
 		if why := b.terminalsRefused(bid); why != "" {
 			writeErr(w, 403, "terminals_disabled", why)
 			return
 		}
+	}
+	// The hotel's own desktop routes stay closed on every hotel: the broker
+	// pumps a WebSocket only for terminals (terminal_ws.go), and the
+	// availability answer names the hotel's internal address. A desktop runs
+	// over exec. This sits before the WebSocket branch below on purpose.
+	if gate == "desktop" {
+		writeErr(w, 403, "desktop_disabled", "room desktop routes are disabled on every hotel; drive a desktop over exec")
+		return
 	}
 	// The tail goes to the hotel as part of its path. A dot segment would
 	// climb out of this room if anything between us and the hotel normalized it.
@@ -1843,6 +1906,7 @@ type healthDoc struct {
 }
 
 func (b *broker) syncHotel(ctx context.Context, h *hotel) {
+	b.syncGuestPin(ctx, h) // a guest_tls hotel: no keyed call before its TLS key is verified
 	var hd healthDoc
 	t0 := time.Now()
 	herr := h.getJSON(ctx, h.cfg.Health, "/room/health", nil, &hd)
@@ -1859,6 +1923,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		} `json:"sandboxes"`
 	}
 	lerr := h.getJSON(ctx, h.cfg.API, "/v1/sandboxes", nil, &list)
+	defer b.sampleProbation(h) // registered first, so it runs last: after the health and attestation steps
 	defer b.fillLentBaseline(ctx, h, herr == nil)
 	defer b.syncAdmission(ctx, h, herr == nil) // after the health state below is stored
 	forced := false                            // the fail-closed check below made the hotel lent: save it once b.mu is free
@@ -1898,6 +1963,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	case h.downSince.IsZero():
 		h.downSince = now
 		b.hotelWentDown(h)
+		b.noteMinerDown(h, now)
 		// A hotel that comes back must pass attestation again: it may have
 		// rebooted into another binding.
 		h.adm.attestedAt, h.adm.checkedAt = time.Time{}, time.Time{}
@@ -1906,6 +1972,9 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		}
 	}
 	b.alertHealth(h, herr, hadHealth)
+	if cameUp {
+		b.noteMinerUp(h, now)
+	}
 	if cameUp && b.prewarms(h) {
 		go b.prewarmHotel(h)
 	}
@@ -1959,6 +2028,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		b.register(rm)
 		h.place(rm)
 	}
+	b.checkMinerExitRooms(h, seen)
 	var deleting []*room
 	for hid, rm := range h.rooms {
 		if !seen[hid] && rm.state == stRunning && now.Sub(rm.since) > 5*time.Second {
@@ -2224,6 +2294,10 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(p, "/v1/broker/bindings/") && r.Method == "GET" && b.isOperator(r) {
 		b.handleBindingGet(w, strings.TrimPrefix(p, "/v1/broker/bindings/")) // operator key only
+		return
+	}
+	if p == "/v1/broker/miner-exits" && r.Method == "GET" && (b.isOperator(r) || b.isOperatorReader(r)) {
+		b.handleMinerExits(w, r) // miner hotels that went down with customer rooms
 		return
 	}
 	if p == "/v1/broker/guests" || strings.HasPrefix(p, "/v1/broker/guests/") {

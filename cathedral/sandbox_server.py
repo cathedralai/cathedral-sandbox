@@ -271,6 +271,7 @@ class SandboxApplication:
         self._add("PATCH", s + r"/(?P<id>[^/]+)", self.patch_sandbox)
         self._add("POST", s + r"/(?P<id>[^/]+)/wait", self.wait)
         self._add("POST", s + r"/(?P<id>[^/]+)/exec", self.exec_)
+        self._add("POST", s + r"/(?P<id>[^/]+)/exec/cancel", self.exec_cancel)
         # The receipts front's own route for an exec it opened from a sealed envelope (AB#417);
         # the front refuses it to every caller. An API without it answers 404 and runs nothing.
         self._add("POST", s + r"/(?P<id>[^/]+)/exec-sealed", self.exec_sealed)
@@ -286,6 +287,9 @@ class SandboxApplication:
         self._add("POST", s + r"/(?P<id>[^/]+)/processes/(?P<pid>[^/]+)/attach", self.attach_unsupported)
         self._add("PUT", s + r"/(?P<id>[^/]+)/files", self.put_file)
         self._add("GET", s + r"/(?P<id>[^/]+)/files", self.get_file)
+        self._add("GET", s + r"/(?P<id>[^/]+)/entries", self.list_directory)
+        self._add("DELETE", s + r"/(?P<id>[^/]+)/entries", self.remove_entry)
+        self._add("PUT", s + r"/(?P<id>[^/]+)/directories", self.make_directory)
         self._add("PUT", s + r"/(?P<id>[^/]+)/tar", self.put_tar)
         self._add("GET", s + r"/(?P<id>[^/]+)/tar", self.get_tar)
         self._add("GET", s + r"/(?P<id>[^/]+)/stat", self.stat)
@@ -528,9 +532,27 @@ class SandboxApplication:
             stdin=payload.get("stdin"),
             sealed=sealed,
             spill_token=payload.get("spill_token"),
+            launch_by=payload.get("launch_by"),
         )
         result = self.provider.exec(id, req)
         return Response.json(200, result.to_document())
+
+    def exec_cancel(self, *, id, body, **_):
+        """Stop the exec that started with this spill_token (AB#406).
+
+        The answer names no room, so the receipts front's result_sha256 can be checked
+        against these bytes after the broker rewrites ids in other answers.
+        """
+        token = self._json(body).get("spill_token")
+        if not api.spill_token_ok(token):
+            raise api.SandboxContractError("invalid_exec", "spill_token must be 32 lowercase hex characters")
+        cancel = getattr(self.provider, "cancel_exec", None)
+        result = cancel(id, token) if callable(cancel) else "unsupported"
+        answer = {"result": result, "token_sha256": hashlib.sha256(token.encode()).hexdigest()}
+        if result == "refused":
+            # The pid file failed the guard and no signal was sent. A repeat may succeed.
+            answer.update(reason="pid_file_invalid", cancelled=False, retryable=True)
+        return Response.json(200, answer)
 
     def exec_sealed(self, *, id, body, **_):
         """An exec as /exec runs it, with its command and output kept out of the history and the log."""
@@ -596,6 +618,18 @@ class SandboxApplication:
         path = _require_param(query, "path")
         self.provider.write_tar(id, path, body)
         return Response.json(200, {"path": path, "extracted": True})
+
+    def list_directory(self, *, id, query, **_):
+        path = _require_param(query, "path")
+        return Response.json(200, {"path": path, "entries": self.provider.list_directory(id, path)})
+
+    def make_directory(self, *, id, query, **_):
+        path = _require_param(query, "path")
+        return Response.json(200, {"path": path, "created": self.provider.make_directory(id, path)})
+
+    def remove_entry(self, *, id, query, **_):
+        path = _require_param(query, "path")
+        return Response.json(200, {"path": path, "deleted": self.provider.remove_entry(id, path)})
 
     def get_tar(self, *, id, query, **_):
         path = _require_param(query, "path")
@@ -889,6 +923,9 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/sandboxes/{id}/processes/{pid}/attach", "post", "Attach to a process", "§3.2; not supported (501)"),
     ("/v1/sandboxes/{id}/files", "put", "Write a file", "§3.3"),
     ("/v1/sandboxes/{id}/files", "get", "Read a file", "§3.3; Range → 206"),
+    ("/v1/sandboxes/{id}/entries", "get", "List directory entries", "AB#409; max 1000"),
+    ("/v1/sandboxes/{id}/entries", "delete", "Delete one plain file or empty directory", "AB#409; no recursive delete"),
+    ("/v1/sandboxes/{id}/directories", "put", "Create one directory", "AB#409; parent must exist"),
     ("/v1/sandboxes/{id}/tar", "put", "Write a tar archive", "§3.3"),
     ("/v1/sandboxes/{id}/tar", "get", "Read a tar archive", "§3.3"),
     ("/v1/sandboxes/{id}/stat", "get", "Stat a path", "§3.3"),
