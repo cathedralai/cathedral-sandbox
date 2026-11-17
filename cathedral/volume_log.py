@@ -40,8 +40,8 @@ ZERO_SHA256 = "sha256:" + "0" * 64
 MAX_INT = 2**53 - 1  # exact in a browser and in JSON readers that use doubles
 
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-_VOLUME_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-_KEY_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+VOLUME_ID_RE = _VOLUME_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+KEY_ID_RE = _KEY_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
 
 _ENTRY_FIELDS = frozenset(

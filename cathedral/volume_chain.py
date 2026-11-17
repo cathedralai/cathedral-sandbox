@@ -38,12 +38,15 @@ import json
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat
+
+from cathedral import volume_log
 
 VOLUME_SCHEMA = "cathedral_volume_v1"
 LEASE_SCHEMA = "cathedral_volume_lease_v1"
@@ -166,6 +169,8 @@ class _Volume:
     head_doc: dict
     lease_seq: int = 0
     lease: _Lease | None = None
+    head_commit_sha256: str | None = None
+    shredded: bool = False
 
 
 class VolumeRegistry:
@@ -179,9 +184,17 @@ class VolumeRegistry:
         self.lease_seconds = lease_seconds
         self.lock = threading.Lock()
         self.volumes: dict[str, _Volume] = {}
+        # AB#398: every accepted head and every shred, in order (volume_log format).
+        # In memory like the rest of this contract; where it is published is open.
+        self.log: list[dict] = []
+        self.log_signing_key_id = "registry:" + sha(self.key.public_key().public_bytes(
+            Encoding.Raw, PublicFormat.Raw))[:16]
 
     def _t(self) -> int:
         return int(self.now())
+
+    def _iso(self) -> str:
+        return datetime.fromtimestamp(self._t(), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def _head(self, volume_id: str, generation: int, head_sha256: str, lease: dict | None) -> dict:
         return sign_statement(self.key, {
@@ -197,6 +210,8 @@ class VolumeRegistry:
     def create(self, volume_id: str, owner: str) -> dict:
         """Create a volume. Returns the signed volume statement; its digest is the parent of generation 1."""
         _ident(volume_id, "bad_volume_id")
+        if not volume_log.VOLUME_ID_RE.fullmatch(volume_id):
+            raise VolumeRefused("bad_volume_id")  # the head log could not record it
         _ident(owner, "bad_owner")
         with self.lock:
             if volume_id in self.volumes:
@@ -234,6 +249,7 @@ class VolumeRegistry:
         binding_sha256 = sha(canonical(binding))
         with self.lock:
             volume = self._volume(volume_id)
+            _not_shredded(volume)
             now = self._t()
             current = volume.lease
             if self._live(current):
@@ -269,7 +285,22 @@ class VolumeRegistry:
 
     def head(self, volume_id: str) -> dict:
         with self.lock:
-            return self._volume(volume_id).head_doc
+            volume = self._volume(volume_id)
+            _not_shredded(volume)
+            return volume.head_doc
+
+    def issue_prune_token(self, volume_id: str, *, prefix: str, source_ip: str, ttl_seconds: int) -> dict:
+        """A delete-scoped prune token for the control plane's prune runner (AB#398). Also valid after a shred."""
+        from cathedral import volume_subtoken  # imports this module
+
+        with self.lock:
+            self._volume(volume_id)
+        return volume_subtoken.issue_prune(self.key, volume_id=volume_id, prefix=prefix, source_ip=source_ip,
+                                           ttl_seconds=ttl_seconds, now=self.now)
+
+    def log_entries(self) -> list[dict]:
+        with self.lock:
+            return [dict(entry) for entry in self.log]
 
     def volume(self, volume_id: str) -> dict:
         with self.lock:
@@ -290,6 +321,7 @@ class VolumeRegistry:
             raise VolumeRefused("wrong_schema")
         with self.lock:
             volume = self._volume(commit.get("volume_id"))
+            _not_shredded(volume)
             lease = _check_signed(commit.get("lease"), LEASE_SCHEMA, [self.public_b64], "lease_not_signed_by_registry")
             # Authenticate against the embedded lease first, so a resend of the
             # accepted head commit is answered even after that lease expired or
@@ -314,10 +346,76 @@ class VolumeRegistry:
                 raise VolumeRefused("parent_not_head")
             _ident(commit.get("restic_repo_id"), "bad_restic_repo_id")
             _ident(commit.get("restic_snapshot_id"), "bad_restic_snapshot_id")
+            # Build the log entry before moving the head, so a refused append leaves both unchanged.
+            try:
+                extended = volume_log.append_entry(
+                    self.log, kind=volume_log.KIND_HEAD, volume_id=commit["volume_id"], generation=generation,
+                    manifest_sha256=manifest_sha256(commit), commit_receipt_sha256="sha256:" + digest,
+                    logged_at=self._iso())
+            except volume_log.VolumeLogError:
+                raise VolumeRefused("log_refused") from None
+            self.log = extended
             volume.generation = generation
             volume.head_sha256 = digest
+            volume.head_commit_sha256 = "sha256:" + digest
             volume.head_doc = self._head(commit["volume_id"], generation, digest, current.statement)
             return volume.head_doc
+
+    def shred(self, volume_id: str, *, key_id: str, destroy_key: Callable[[str], object]) -> dict:
+        """Crypto-shred a volume: destroy its key, log a terminal shred entry, return a signed receipt.
+
+        destroy_key is the key service's call (AB#392); it must raise on an unknown key and
+        return True only once the key is gone. The receipt attests that the key service
+        confirmed destroying key_id; binding key_id to the volume is the key service's job.
+        Everything is checked and the log entry built before the key is touched, and the
+        lease ends first, so no commit can land on a destroyed key and a destroyed key
+        always gets its receipt. Held under the lock throughout. If the key service
+        refuses, nothing is logged, the volume stays live and its holder re-grants.
+        """
+        with self.lock:
+            volume = self._volume(volume_id)
+            _not_shredded(volume)
+            if volume.generation < 1 or volume.head_commit_sha256 is None:
+                raise VolumeRefused("nothing_to_shred")
+            if not isinstance(key_id, str) or not volume_log.KEY_ID_RE.fullmatch(key_id):
+                raise VolumeRefused("bad_key_id")
+            shredded_at = self._iso()
+            try:
+                extended = volume_log.append_entry(
+                    self.log, kind=volume_log.KIND_SHRED, volume_id=volume_id, generation=volume.generation,
+                    manifest_sha256=volume_log.verify_log(self.log)[volume_id].manifest_sha256,
+                    commit_receipt_sha256=volume.head_commit_sha256, logged_at=shredded_at)
+            except (volume_log.VolumeLogError, KeyError):
+                raise VolumeRefused("log_refused") from None
+            if volume.lease is not None:
+                volume.lease.released = True
+            try:
+                destroyed = destroy_key(key_id)
+            except Exception:
+                destroyed = False
+            if destroyed is not True:
+                raise VolumeRefused("key_not_destroyed")
+            self.log = extended
+            volume.shredded = True
+            return volume_log.sign_shred_receipt(
+                self.log, volume_id=volume_id, key_id=key_id, shredded_at=shredded_at,
+                signing_key_id=self.log_signing_key_id,
+                private_key=self.key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption()))
+
+
+def _not_shredded(volume: _Volume) -> None:
+    if volume.shredded:
+        raise VolumeRefused("volume_shredded")
+
+
+def manifest_sha256(commit: dict) -> str:
+    """The head log's manifest digest of a commit statement: the restic repo and snapshot it names.
+
+    A restoring guest recomputes it from the head commit verify_chain returns and passes it
+    to volume_log.check_restore.
+    """
+    return "sha256:" + sha(canonical({"restic_repo_id": commit["restic_repo_id"],
+                                      "restic_snapshot_id": commit["restic_snapshot_id"]}))
 
 
 def verify_chain(volume_doc: dict, commits: list[dict], head_doc: dict, registry_keys: Iterable[str]) -> dict | None:

@@ -8,8 +8,12 @@ on every request. A sub-token is limited to:
 - one source address (the host the guest boots on),
 - one expiry, never later than the lease it was issued from,
 - read, write and list. Delete is not an operation here at all, so a stolen
-  token or a compromised guest cannot erase history (restic prune runs from the
-  control plane with its own credentials).
+  token or a compromised guest cannot erase history.
+
+Prune (AB#398) runs from the control plane, never in the guest, with a separate
+prune token: its own schema and label, never issued against a lease, bound to the
+prune runner's address. It is the only token that carries delete. restic prune also
+reads packs and writes index and lock files, so it carries get, put and list too.
 
 The token is signed with the registry key over a fixed label, so it is never a
 valid lease, commit or head (volume_chain.py) and the reverse.
@@ -31,6 +35,9 @@ from cathedral.volume_chain import LEASE_SCHEMA, VolumeRefused, _public_key, b64
 SUBTOKEN_SCHEMA = "cathedral_volume_subtoken_v1"
 LABEL = b"cathedral.volume-subtoken.v1\n"
 ALLOWED_OPS = ("get", "put", "list")
+PRUNE_SCHEMA = "cathedral_volume_prune_token_v1"
+PRUNE_LABEL = b"cathedral.volume-prune-token.v1\n"
+PRUNE_OPS = ("delete", "get", "list", "put")
 MAX_TTL_SECONDS = 3600
 MAX_PREFIX_LENGTH = 512
 
@@ -81,27 +88,64 @@ def issue(registry_key: Ed25519PrivateKey, lease_doc: dict, *, prefix: str, sour
     }
 
 
-def authorize(token: dict, registry_public_b64: str, *, op: str, key: str, source_ip: str,
-              now: Callable[[], float] = time.time) -> dict:
-    """Return the token statement when this request is allowed; raise VolumeRefused otherwise."""
+def _check(token: dict, registry_public_b64: str, *, schema: str, label: bytes, allowed_ops: tuple[str, ...],
+           op: str, key: str, source_ip: str, now: Callable[[], float]) -> dict:
     if not isinstance(token, dict) or not isinstance(token.get("statement"), dict):
         raise VolumeRefused("malformed")
     statement = token["statement"]
-    if statement.get("schema") != SUBTOKEN_SCHEMA:
+    if statement.get("schema") != schema:
         raise VolumeRefused("wrong_schema")
     if token.get("signer_ed25519_b64") != registry_public_b64:
         raise VolumeRefused("bad_signature")
     try:
         signature = base64.b64decode(token.get("signature_b64", ""), validate=True)
-        _public_key(registry_public_b64).verify(signature, LABEL + canonical(statement))
+        _public_key(registry_public_b64).verify(signature, label + canonical(statement))
     except (TypeError, ValueError, binascii.Error, InvalidSignature, VolumeRefused):
         raise VolumeRefused("bad_signature") from None
     if now() >= statement["expires_at"]:
         raise VolumeRefused("token_expired")
-    if op not in ALLOWED_OPS or op not in statement["ops"]:
+    if op not in allowed_ops or op not in statement["ops"]:
         raise VolumeRefused("op_not_allowed")
     if _check_ip(source_ip) != statement["source_ip"]:
         raise VolumeRefused("wrong_source_ip")
     if not isinstance(key, str) or not key.startswith(statement["prefix"]) or ".." in key.split("/"):
         raise VolumeRefused("outside_prefix")
     return statement
+
+
+def authorize(token: dict, registry_public_b64: str, *, op: str, key: str, source_ip: str,
+              now: Callable[[], float] = time.time) -> dict:
+    """A guest sub-token request. Return the token statement when allowed; raise VolumeRefused otherwise."""
+    return _check(token, registry_public_b64, schema=SUBTOKEN_SCHEMA, label=LABEL, allowed_ops=ALLOWED_OPS,
+                  op=op, key=key, source_ip=source_ip, now=now)
+
+
+def issue_prune(registry_key: Ed25519PrivateKey, *, volume_id: str, prefix: str, source_ip: str,
+                ttl_seconds: int, now: Callable[[], float] = time.time) -> dict:
+    """Sign a prune token for the control plane's prune runner. The caller has checked the volume exists."""
+    if not isinstance(volume_id, str) or not volume_id or len(volume_id) > MAX_PREFIX_LENGTH:
+        raise VolumeRefused("bad_volume_id")
+    if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool) or ttl_seconds <= 0:
+        raise VolumeRefused("bad_ttl")
+    issued_at = int(now())
+    statement = {
+        "schema": PRUNE_SCHEMA,
+        "volume_id": volume_id,
+        "prefix": _check_prefix(prefix),
+        "source_ip": _check_ip(source_ip),
+        "ops": list(PRUNE_OPS),
+        "issued_at": issued_at,
+        "expires_at": issued_at + min(ttl_seconds, MAX_TTL_SECONDS),
+    }
+    return {
+        "statement": statement,
+        "signer_ed25519_b64": public_b64(registry_key),
+        "signature_b64": b64(registry_key.sign(PRUNE_LABEL + canonical(statement))),
+    }
+
+
+def authorize_prune(token: dict, registry_public_b64: str, *, op: str, key: str, source_ip: str,
+                    now: Callable[[], float] = time.time) -> dict:
+    """A prune runner request, the only path that may delete. Raise VolumeRefused otherwise."""
+    return _check(token, registry_public_b64, schema=PRUNE_SCHEMA, label=PRUNE_LABEL, allowed_ops=PRUNE_OPS,
+                  op=op, key=key, source_ip=source_ip, now=now)
