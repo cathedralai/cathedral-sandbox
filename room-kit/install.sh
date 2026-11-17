@@ -385,6 +385,10 @@ KillMode=mixed
 LimitNOFILE=1048576
 TasksMax=infinity
 NoNewPrivileges=yes
+# Only to set the xfs project limit that caps each room's /work and each
+# workspace (AB#396). The API already drives the room docker daemon.
+AmbientCapabilities=CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_SYS_ADMIN
 ProtectSystem=full
 PrivateTmp=yes
 ReadWritePaths=$ROOM_DATA_DIR/work $ROOM_DATA_DIR/image-owners /var/lib/pool-room
