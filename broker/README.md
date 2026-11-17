@@ -353,6 +353,39 @@ spent by then). A socket with no bytes either way for 15 minutes is closed; the
 hotel's own 600 s idle close normally comes first. The broker must be reached
 over HTTP/1.1 for this route (an h2 or h2c proxy in front hides the Upgrade).
 
+## Room desktop and streams
+
+One policy for every hotel in the pool, sealed or shared, operator or miner:
+
+| Path | Who gets it | What the broker answers |
+|------|-------------|-------------------------|
+| `exec`, `processes` | every hotel | passed to the hotel; a sealed hotel signs a receipt |
+| PTY: `/terminals` and below, incl. `/terminals/<tid>/ws` | operator hotels in `terminal_hotels` only (see Room terminals) | passed to the hotel (a WebSocket handshake on `/terminals/<tid>/ws` is pumped as raw bytes); elsewhere 403 `terminals_disabled` |
+| Desktop: `/desktop` and below, incl. `/desktop/ws` | no hotel | 403 `desktop_disabled`, before the hotel or the room lookup, WebSocket handshake or not |
+| `/access-tickets` | every hotel | passed to the hotel |
+| `/processes/<pid>/attach` | every hotel | passed to the hotel, which refuses it |
+
+- Both gates key on the first path segment after the room id with any
+  `;params` removed, because the hotel's router drops `;params` from the last
+  segment: `/desktop;x` and `/terminals;x` are refused like the bare names.
+  A room path with an encoded `?` or `#` (`%3F`, `%23`) is 400 `invalid_path`
+  before either gate: it would become a query or fragment at the hotel.
+- The broker upgrades a WebSocket only on `/terminals/<tid>/ws` (above). Any
+  other ticketed WebSocket route that reaches a hotel arrives as a plain GET,
+  so a ticket minted through `/access-tickets` opens no other stream through
+  the broker.
+- The hotel's `/desktop` answer names the hotel's own address in `ws_url`.
+  The broker keeps it from guests for that reason too.
+- A desktop in a room runs over exec: the Desktop template starts
+  `desktop-up` with an exec, and a computer-use agent drives it with
+  receipted exec (cathedral-desktop). This gate does not close that path,
+  nor `/expose` and `/ports/<port>/http`, which reach any server the room
+  runs, a desktop web server included.
+- Opening the desktop routes needs the terminal WebSocket pump extended to
+  `/desktop/ws` and an allowlist of hotels whose kit runs the desktop through
+  the runtime, like `terminal_hotels`. Neither exists, so there is no config
+  key.
+
 ## Room network policy
 
 A create takes `"network": {"mode": "internet" | "deny_all" | "allowlist", "allow": [...]}`.
