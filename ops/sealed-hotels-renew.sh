@@ -26,6 +26,9 @@
 #   CLOUDFLARE_API_TOKEN_FILE     file holding an API token with Workers KV Storage:Edit
 #   CLOUDFLARE_API_BASE           (default https://api.cloudflare.com/client/v4)
 #   PYTHON                        interpreter with the cryptography package (default python3)
+#   SEALED_HOTELS_LOCK            run lock (default <state>.renew.lock), held from signing to readback
+#   SEALED_HOTELS_READBACK_TRIES  KV readback attempts (default 19, 10 s apart: 3 minutes,
+#                                 since KV can serve stale reads for 60 s or more)
 #
 # Usage: sealed-hotels-renew.sh [--no-upload]
 #   --no-upload  sign and verify only (rehearsal). It still consumes a release number.
@@ -67,6 +70,14 @@ esac
 # Never create state here: a lost state file must stop renewal, not restart at 1.
 [ -f "$STATE" ] || die "no publisher state at $STATE; the first release is made by hand with --init-state"
 mkdir -p "$OUT_DIR"
+
+# One renewal at a time, from signing through KV readback. The publisher's own
+# lock covers signing only; without this, a manual run overlapping the timer
+# could pass the KV check for release N, pause, and overwrite release N+1.
+LOCK="${SEALED_HOTELS_LOCK:-$STATE.renew.lock}"
+command -v flock >/dev/null || die "flock is not installed"
+exec 9>>"$LOCK"
+flock --nonblock 9 || die "another renewal holds $LOCK"
 
 # Check the upload configuration before signing, so a broken setup does not burn
 # release numbers every 6 hours.
@@ -168,13 +179,15 @@ code="$(cf_curl --request PUT --header 'Content-Type: application/json' \
 
 # Verify the outcome, not the status code: the stored bytes must be the signed bytes.
 want="${digest#sha256:}"
-for attempt in 1 2 3 4 5 6; do
+tries="${SEALED_HOTELS_READBACK_TRIES:-19}"
+[[ "$tries" =~ ^[1-9][0-9]*$ ]] || die "SEALED_HOTELS_READBACK_TRIES is not a positive number"
+for ((attempt = 1; attempt <= tries; attempt++)); do
   code="$(cf_curl --output "$work/readback.json" --write-out '%{http_code}' "$kv_url")" || code=000
   if [ "$code" = 200 ] && [ "$(sha256sum "$work/readback.json" | cut -d' ' -f1)" = "$want" ]; then
     log "KV $KV_KEY holds release $release"
     printf '{"release": %s, "digest": "%s", "uploaded": true}\n' "$release" "$digest"
     exit 0
   fi
-  [ "$attempt" = 6 ] || sleep "${SEALED_HOTELS_READBACK_DELAY:-10}"
+  [ "$attempt" = "$tries" ] || sleep "${SEALED_HOTELS_READBACK_DELAY:-10}"
 done
 die "KV readback does not match release $release (last HTTP $code)"

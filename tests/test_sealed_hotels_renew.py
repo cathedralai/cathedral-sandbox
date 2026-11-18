@@ -39,6 +39,9 @@ class FakeKV:
         self.value: bytes | None = None
         self.requests: list[tuple[str, str, str | None]] = []
         self.put_status = 200
+        # GETs after a PUT that still answer the previous value (KV staleness).
+        self.stale_gets = 0
+        self._previous: bytes | None = None
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -73,7 +76,13 @@ class FakeKV:
             def do_GET(self) -> None:
                 if not self._authorized():
                     return
-                if kv.value is None:
+                if kv.stale_gets > 0 and self.command == "GET" and kv._previous is not kv.value:
+                    kv.stale_gets -= 1
+                    if kv._previous is None:
+                        self._reply(404, b'{"success":false,"errors":[{"code":10009}]}')
+                    else:
+                        self._reply(200, kv._previous)
+                elif kv.value is None:
                     self._reply(404, b'{"success":false,"errors":[{"code":10009}]}')
                 else:
                     self._reply(200, kv.value)
@@ -83,6 +92,7 @@ class FakeKV:
                     return
                 body = self.rfile.read(int(self.headers["Content-Length"]))
                 if kv.put_status == 200:
+                    kv._previous = kv.value
                     kv.value = body
                 self._reply(kv.put_status, b'{"success":true}')
 
@@ -293,6 +303,42 @@ def test_failed_kv_write_fails_the_run(renew) -> None:
     assert result.returncode != 0 and "KV write answered HTTP 500" in result.stderr
     _no_token(result)
     assert renew["kv"].value is None
+
+
+def test_overlapping_run_refuses_before_signing(renew) -> None:
+    # A run holding the lock (here: this test) blocks a second run before it
+    # signs, so it cannot burn a release number or upload over a newer one.
+    import fcntl
+
+    lock = Path(str(renew["state"]) + ".renew.lock")
+    with open(lock, "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = _run(renew["env"])
+    assert result.returncode != 0 and "another renewal holds" in result.stderr
+    _no_token(result)
+    assert _last_release(renew["state"]) == 1
+    assert renew["kv"].requests == [] and renew["kv"].value is None
+    # Lock released: the next run proceeds normally.
+    after = _run(renew["env"])
+    assert after.returncode == 0, after.stderr
+    assert _last_release(renew["state"]) == 2
+
+
+def test_delayed_kv_visibility_is_waited_out(renew) -> None:
+    # KV can answer the old value for a while after a successful PUT.
+    renew["kv"].stale_gets = 5
+    result = _run(renew["env"])
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["uploaded"] is True
+    assert [m for m, _, _ in renew["kv"].requests].count("GET") == 1 + 6
+
+
+def test_readback_gives_up_after_configured_tries(renew) -> None:
+    renew["kv"].stale_gets = 100
+    env = dict(renew["env"], SEALED_HOTELS_READBACK_TRIES="3")
+    result = _run(env)
+    assert result.returncode != 0 and "KV readback does not match" in result.stderr
+    assert [m for m, _, _ in renew["kv"].requests].count("GET") == 1 + 3
 
 
 def _directives(path: Path) -> dict[str, list[str]]:
