@@ -3069,6 +3069,14 @@ class DockerGuestProvider:
             if not any(m in str(exc).lower() for m in benign):
                 self._note_uncertain(sandbox_id, guest, action, exc)
                 raise
+            # Docker says "is not paused" for a container that stopped since the read: read it again.
+            after = self._read_state(guest)
+            if after is None:
+                self._note_uncertain(sandbox_id, guest, action, exc)
+                raise
+            if after in self._ENDED:
+                self._note_ended(sandbox_id)
+                return
         self._clear_mark(sandbox_id)
 
     def _reconcile_room(self, sandbox_id: str) -> bool:
@@ -3112,8 +3120,16 @@ class DockerGuestProvider:
         try:
             self._client.unpause(guest.container_id)
         except SandboxOpError as exc:
-            if any(m in str(exc).lower() for m in self._BENIGN_UNPAUSE) or self._guests.get(sandbox_id) is None:
+            if self._guests.get(sandbox_id) is None:
                 return
+            if any(m in str(exc).lower() for m in self._BENIGN_UNPAUSE):
+                # Nothing left to unpause, but the room may have stopped during the capture: say so.
+                state = self._read_state(guest)
+                if state in self._ENDED:
+                    self._note_ended(sandbox_id)
+                    return
+                if state is not None:
+                    return
             self._note_uncertain(sandbox_id, guest, "unpause", exc)
             if strict:
                 raise

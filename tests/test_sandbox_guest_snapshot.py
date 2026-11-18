@@ -966,6 +966,37 @@ def test_a_marked_room_that_exits_before_the_sweep_stays_failed_after_it(fake, p
     assert provider.get(sid)["state"] == "failed"
 
 
+def _unpause_finds_it_stopped(fake, provider, sid: str) -> None:
+    """The container stops between the engine read and the unpause: Docker then says "is not paused"."""
+    def unpause(container_id):
+        _end_container(fake, sid)
+        raise SandboxOpError("docker_unpause_failed", 502, f"Error response from daemon: Container {container_id} is not paused")
+
+    provider._client.unpause = unpause  # noqa: SLF001
+
+
+def test_a_reconcile_whose_room_stops_before_the_unpause_says_failed(fake, provider) -> None:
+    sid = _source(provider)
+    fake.set(unpause_fail_times=2)
+    with pytest.raises(SandboxOpError):
+        provider.snapshot(sid)
+    assert fake.status_of(sid) == "paused"
+    _unpause_finds_it_stopped(fake, provider, sid)
+    provider.sweep()
+    assert provider.pending_reconciles() == {}
+    assert provider.get(sid)["state"] == "failed"
+
+
+def test_a_capture_whose_room_stops_before_the_unpause_says_failed(fake, provider) -> None:
+    sid = _source(provider)
+    _unpause_finds_it_stopped(fake, provider, sid)
+    try:
+        provider.snapshot(sid)
+    except SandboxOpError:
+        pass  # whether the capture itself is kept is not this test's business
+    assert provider.get(sid)["state"] == "failed"
+
+
 def test_a_thaw_of_a_room_whose_container_stopped_is_refused_and_says_failed(fake, provider) -> None:
     sid = _source(provider)
     provider.freeze(sid)
