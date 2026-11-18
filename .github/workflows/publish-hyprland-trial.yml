@@ -47,6 +47,7 @@ jobs:
             command -v hyprctl
             command -v wayvnc
             command -v vncdo
+            command -v timeout
             command -v foot
             test -x /usr/local/bin/hyprland-trial-probe
             Hyprland --version
