@@ -37,3 +37,9 @@ scripts/tee_box_snp_e2e/central_access_materials/*.json
 .idea/
 .vscode/
 .DS_Store
+
+# Real hotel table (host addresses); see ops/roll/hotels.conf.example
+ops/roll/hotels.conf
+
+# Published public keys only (never private keys).
+!docs/keys/*.pub.pem

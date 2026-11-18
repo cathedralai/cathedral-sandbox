@@ -185,6 +185,12 @@ def test_secret_limit(app, monkeypatch) -> None:
     assert call(app, "PUT", "/v1/secrets/THREE", B, {"value": "3"})[0] == 200  # per owner
 
 
+@pytest.mark.parametrize("raw,want", [(None, 64), ("4096", 4096), ("0", 64), ("70000", 64), ("x", 64)])
+def test_secrets_per_owner_from_env(raw, want) -> None:
+    env = {} if raw is None else {"ROOM_SECRETS_PER_OWNER": raw}
+    assert eg.secrets_per_owner(env) == want
+
+
 def test_no_egress_daemon_means_501(fake) -> None:
     provider = DockerGuestProvider()
     app = SandboxApplication(provider)

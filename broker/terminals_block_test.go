@@ -19,6 +19,9 @@ var terminalRoutes = []struct{ method, tail string }{
 	{"GET", "/terminals/t1/output"},
 	{"GET", "/terminals/t1/ws"},
 	{"DELETE", "/terminals/t1"},
+	// The hotel's router drops ";params" from the last segment (AB#121 review).
+	{"GET", "/terminals;x"},
+	{"POST", "/terminals;x/t1/input"},
 }
 
 // withTerminalHotels writes terminal_hotels into the chain's config and

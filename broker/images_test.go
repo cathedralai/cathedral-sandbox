@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -21,6 +22,9 @@ type fakeHotel struct {
 	t             *testing.T
 	mu            sync.Mutex
 	creates       []map[string]any
+	createBodies  [][]byte                  // the exact bytes of every create, as received
+	failFirst     *int32                    // shared countdown: while above zero a create answers 503 (create_request_bytes_test.go)
+	receiptTag    string                    // appended to the X-Room-Receipt of a create, to tell hotels apart
 	authFail      bool                      // answer creates 401, like a hotel whose API key changed
 	pullOutage    bool                      // answer creates 502 image_pull_failed for a registry outage
 	calls         []string                  // "METHOD /path?query" of every request
@@ -65,10 +69,28 @@ type fakeHotel struct {
 	sealedExecPaths  []string
 	sealedExecBodies [][]byte
 	sealedExecAnswer []byte
+	// Cancel of a background exec (POST /v1/sandboxes/{id}/exec/cancel, AB#406).
+	execCancelPaths  []string
+	execCancelBodies [][]byte
+	execCancelAnswer []byte
 	// ownerScoped: list, delete and push snapshots only for the guest in the
 	// X-Cathedral-Guest header, as a hotel with per-guest ownership does
 	// (cathedral/sandbox_guest.py list_snapshots and delete_snapshot, AB#650).
 	ownerScoped bool
+
+	// createFail: answer creates with this status and no room id (AB#338).
+	// createFailAfterStart: start the room first, as a hotel or a proxy in
+	// front of it that fails after the room exists.
+	createFail           int
+	createFailAfterStart bool
+	// labelListFail: answer a room list with a label filter (the broker's
+	// orphan reap) with this status. roomDeleteFail: answer a room delete
+	// with this status and keep the room (AB#338).
+	labelListFail  int
+	roomDeleteFail int
+	// upgrade answers WebSocket handshakes when set (terminal_ws_test.go). It
+	// runs without f.mu so it may hijack and hold the connection.
+	upgrade http.HandlerFunc
 }
 
 // snapGuestOK is whether a snapshot call may see snapshot doc d.
@@ -81,6 +103,13 @@ func (f *fakeHotel) snapGuestOK(r *http.Request, d map[string]any) bool {
 }
 
 func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if f.upgrade != nil && strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		f.mu.Lock()
+		f.calls = append(f.calls, r.Method+" "+r.URL.RequestURI())
+		f.mu.Unlock()
+		f.upgrade(w, r)
+		return
+	}
 	body, _ := io.ReadAll(r.Body)
 	var req map[string]any
 	_ = json.Unmarshal(body, &req)
@@ -97,6 +126,11 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.mu.Lock()
 		}
 		f.creates = append(f.creates, req)
+		f.createBodies = append(f.createBodies, body)
+		if f.failFirst != nil && atomic.AddInt32(f.failFirst, -1) >= 0 {
+			writeErr(w, 503, "hotel_busy", "try another hotel")
+			return
+		}
 		if req["image"] == "nosuch/x:1" {
 			writeErr(w, 502, "image_pull_failed", "docker pull failed for nosuch/x:1: Error response from daemon: pull access denied for nosuch/x, repository does not exist")
 			return
@@ -107,6 +141,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if f.authFail {
 			writeErr(w, 401, "unauthorized", "bad hotel key")
+			return
+		}
+		if f.createFail != 0 && !f.createFailAfterStart {
+			writeErr(w, f.createFail, "create_failed", "the hotel could not start the room")
 			return
 		}
 		if nw, ok := req["network"].(map[string]any); ok && nw["mode"] == "allowlist" {
@@ -124,7 +162,11 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.n++
 		id := fmt.Sprintf("sbx_%d", f.n)
 		f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": req["labels"]})
-		w.Header().Set("X-Room-Receipt", "signed-create")
+		if f.createFail != 0 {
+			writeErr(w, f.createFail, "create_failed", "the room started but the answer is an error")
+			return
+		}
+		w.Header().Set("X-Room-Receipt", "signed-create"+f.receiptTag)
 		out := map[string]any{"id": id, "state": "running", "snapshot_id": req["snapshot_id"]}
 		if t, ok := req["tunables"]; ok && t != nil && f.appliesTunables {
 			raw, _ := json.Marshal(t)
@@ -132,6 +174,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 202, out)
 	case p == "/v1/sandboxes" && r.Method == "GET":
+		if f.labelListFail != 0 && len(r.URL.Query()["label"]) > 0 {
+			writeErr(w, f.labelListFail, "list_failed", "the hotel could not list its rooms")
+			return
+		}
 		// Like a hotel: every "label" filter must match.
 		out := []map[string]any{}
 		for _, rm := range f.rooms {
@@ -272,6 +318,13 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Room-Receipt", "signed-sealed-exec")
 		w.WriteHeader(200)
 		_, _ = w.Write(f.sealedExecAnswer)
+	case strings.HasSuffix(p, "/exec/cancel") && r.Method == "POST":
+		f.execCancelPaths = append(f.execCancelPaths, p)
+		f.execCancelBodies = append(f.execCancelBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Room-Receipt", "signed-exec-cancel")
+		w.WriteHeader(200)
+		_, _ = w.Write(f.execCancelAnswer)
 	case strings.HasSuffix(p, "/exec") && r.Method == "POST":
 		f.execs = append(f.execs, req)
 		w.Header().Set("X-Room-Receipt", "signed-exec")
@@ -371,6 +424,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(p, "/v1/sandboxes/") && strings.Count(p, "/") == 3 && r.Method == "DELETE":
 		id := strings.TrimPrefix(p, "/v1/sandboxes/")
 		f.roomDeletes = append(f.roomDeletes, id)
+		if f.roomDeleteFail != 0 {
+			writeErr(w, f.roomDeleteFail, "delete_failed", "the hotel could not remove the room")
+			return
+		}
 		for i, rm := range f.rooms {
 			if rm["id"] == id {
 				f.rooms = append(f.rooms[:i], f.rooms[i+1:]...)
@@ -448,6 +505,7 @@ func (tc *testChain) start(t *testing.T) {
 	for _, h := range b.hotelList() {
 		h.ok, h.slots = true, 100
 	}
+	b.resumeNativeExecs()
 	tc.b = b
 	tc.srv = httptest.NewServer(b)
 	t.Cleanup(tc.srv.Close)

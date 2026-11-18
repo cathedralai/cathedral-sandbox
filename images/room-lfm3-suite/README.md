@@ -35,25 +35,27 @@ here. Spoken answers are: `liquid --speak` in Audio and Omni rooms (below).
 
 ## Pins and sealed proof
 
-All six are published from commit `3339b9f` (run 43467170286, 13 Nov
-2026): `lfm3-agent --events` streaming chat events (#440, ADO 541) and the
-static Go chat gateway (#478, ADO 539), on top of per-model sampling, the
-loop guard and tool-call markup parsed (#392, ADO 523), `liquid --speak` one
-sentence per `/tts` request with its blocking `speak` gate (#407, ADO 552),
-the warm cache saved in the image (#403, #405), `liquid --json` and greedy
-plus frequency penalty 0.3 for Audio (ADO 547) and `--swa-full` with answers
-sampled after a greedy tool check for Omni (ADO 549, 550). Run
-summaries have the commit tags. All six packages are public; anonymous pull
+Base, VL, Omni, d1 and d1-Omni are published from commit `01f56b8` (#392:
+per-model sampling, the loop guard, tool-call markup parsed; run
+41887832793). Audio and Omni are published from commit `f9f9a19` (#407, run
+41970923674): `liquid --speak`, one sentence per `/tts` request, with its
+blocking `speak` gate (ADO 552) and
+the warm cache saved in the image (#403, #405), on top of `liquid --json` and
+greedy plus frequency penalty 0.3 for Audio (ADO 547) and `--swa-full` with
+answers sampled after a greedy tool check for Omni (ADO 549, 550). Run
+summaries have the commit tags. Audio moved to the `62686dd` build (#506, run
+43862309556: example turns so it stops calling a tool for every message, AB#545).
+All six packages are public; anonymous pull
 checked.
 
 | Model | Pin |
 |---|---|
-| `lfm3-1.7b-base` | `ghcr.io/cathedralai/room-lfm3-1.7b-base@sha256:b48013ae60249c18cc756d6b449e3320ec63e5861dd0e3cb87c38be11e775e08` |
-| `lfm3-vl-2b` | `ghcr.io/cathedralai/room-lfm3-vl-2b@sha256:d787ed7937cf0b1dad424bb614fd655ccd66ec635d21ac85f72d7a6f77c6583d` |
-| `lfm3-audio-2b` | `ghcr.io/cathedralai/room-lfm3-audio-2b@sha256:b91ef21e68d17fbafcdc2b2eb9d195f02c00a9b5325c7711680eaf1b2d0df336` |
-| `lfm3-omni-2b` | `ghcr.io/cathedralai/room-lfm3-omni-2b@sha256:4fc6e0682a2f563c5e0fb862c7a4968cdfd509a4d7bc73fee860c3592d214b41` |
-| `d1-2b` | `ghcr.io/cathedralai/room-d1-2b@sha256:4aed662bc5292e6c8813fefb178a471630d6122994b0cb2e4371f2439e18895f` |
-| `d1-omni-2b` | `ghcr.io/cathedralai/room-d1-omni-2b@sha256:57f9038bf8198e6a9fa52e37260a48b56ddf6b6a89c83dbf84b9b74838168cfd` |
+| `lfm3-1.7b-base` | `ghcr.io/cathedralai/room-lfm3-1.7b-base@sha256:810911016ac6ea1ddeba1bba4dc157e0c3d4252201e64d3279876e57dce344a8` |
+| `lfm3-vl-2b` | `ghcr.io/cathedralai/room-lfm3-vl-2b@sha256:ef5c553961e5a6d9eba616fe4f5b2d68d46ec996f651e2011e5a09ae67f9cdc1` |
+| `lfm3-audio-2b` | `ghcr.io/cathedralai/room-lfm3-audio-2b@sha256:4f9ab1457d67d8fba8c9890a612c81ad4274e5f83ea1903becafc5c51a14d5f9` |
+| `lfm3-omni-2b` | `ghcr.io/cathedralai/room-lfm3-omni-2b@sha256:df5cea815abd5ba5be781c07558dc72dc45a1334c5b97d0b5a93a907bc9911d6` |
+| `d1-2b` | `ghcr.io/cathedralai/room-d1-2b@sha256:f95d88c7144642328fe85bd7f52e95e434979e64a220550fac3d0e965aca35c6` |
+| `d1-omni-2b` | `ghcr.io/cathedralai/room-d1-omni-2b@sha256:3cb800de3d2f9bfcc69d24ab2fc659fc51eb7ed3aae2abe46d46a23f10b57abd` |
 
 The converted `LFM3-1.7B-Base-Q4_K_M.gguf` in that image has sha256
 `d4c9ebb5aa08999083bf939042087b6379547c5729163ce556902d8c06111fd5`.
@@ -118,6 +120,28 @@ lfm3-timing load_ms=812 prompt_tok_s=118.0 gen_tok_s=52.8 wall_ms=1530 threads=2
 
 Over HTTP, a picture is an `image_url` part with a data URI and a clip an
 `input_audio` part (base64 WAV or MP3), in `/v1/chat/completions`.
+
+### Benchmark: `lfm3-bench` (AB#444)
+
+`lfm3-bench` times one streamed request from a prompt set and prints the
+answer, then one JSON line. `scripts/sealed_bench.py` runs it in a fresh sealed
+room, once per prompt, and checks each line against a Cathedral exec receipt.
+
+```sh
+lfm3-bench --max-tokens 256 --index 0 '["What is 2+2?","Name three rivers."]'
+```
+
+```
+lfm3-bench {"decode_n":64,"decode_tok_s":24.1,"hash_ms":2100,"harness":"lfm3-bench-1","load_ms":812,"max_tokens":256,"mmproj_sha256":"...","model":"lfm3-omni-2b","model_file":"LFM3-Omni-2B-Q4_K_M.gguf","model_sha256":"9f8d...","prompt_index":0,"prompt_ms":120.4,"prompt_n":14,"prompt_set_sha256":"...","prompt_tok_s":116.3,"reasoning":"off","threads":2,"ttft_ms":412,"wall_ms":3100}
+```
+
+- `ttft_ms` is measured in the room, from sending the request to the first
+  streamed token. The rates and `prompt_ms` are llama-server's own timings.
+- `model_sha256` (and `mmproj_sha256`) are hashed in the room on every call and
+  must match `/opt/lfm3/SHA256SUMS`, or there is no result.
+- `prompt_set_sha256` is the sha256 of the prompt-set argument bytes.
+- The prompt cache is off for the request, so each call is a full prefill.
+- Not for decision models (d1).
 
 ### Talk to it: `lfm3-agent`
 
@@ -209,6 +233,21 @@ kinds of room:
   file). Each call is printed on stderr as it runs (`$ ls -la`); the output
   the model reads is cut at 2,000 characters. At most 4 tool rounds a
   message, then the model must answer. `--no-tools` answers without them.
+- **Audio's tool choice (AB#545).** Offered tools, LFM3-Audio-2B called one
+  for every message, even "What is 2+2?": its first token was `<tool_call>`
+  at 0.89 to 1.00 whatever the question, so neither sampling nor a reworded
+  system prompt changed it. In Audio rooms a round that offers tools starts
+  with three fixed example turns after the system prompt: a sum and a
+  translation answered in text, and "What umask is this machine set to?"
+  answered with `run`. They are not kept in the conversation, never shown,
+  count against the 4,000-character budget, and are not sent with
+  `--no-tools`, `--json` or the last round. Local eval (pinned GGUF and
+  llama.cpp, 14 no-tool and 17 tool questions, 2 runs): needless calls 26/28
+  before, 0/28 after; tool questions kept a call 34/34. The tool example
+  holds a fact nobody asks about: a fact there (an IP address, a timezone)
+  came back as Audio's answer to the matching question with no call. An
+  example about an installed program or an open port made Audio answer
+  "What is the hostname?" with `hostname -I` and an IP address.
 - **JSON.** `--json` sends a JSON schema (an object or an array) as
   `response_format`, which llama-server turns into a grammar, plus one system
   line asking for valid JSON with no comments, and no tools. The grammar fixes
