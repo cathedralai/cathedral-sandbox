@@ -346,7 +346,7 @@ hotel restores on another host.
      the guest), restarts `room-sealed-<name>.service`, waits for a new
      `boot_id`, and checks: the same measurement and HOST_DATA, health `open`,
      `persistent` true, the same `key_id`, the workspace listed, a new room
-     reading the marker and the 20,000 lines back. On the host it counts the
+     reading the marker and the 20,000 lines back (sha256 of the whole file). On the host it counts the
      marker in the allocated extents of `data.raw` and `scratch.raw` (must be
      0), checks the LUKS2 magic and samples the entropy of the written sectors
      after the header. It deletes its rooms and the workspace (unless
@@ -484,6 +484,7 @@ boots, and reads health. Verdicts:
 | `locked` or `broken` | SAFE, `verify_header()` not exercised: cryptsetup refused the edited header itself |
 | `new`, `open` or `unknown`, or persistent true | FAIL: the guest used the edited volume |
 | `absent`, `nokey` or `error` | FAIL, inconclusive: no data disk, no key, or cryptsetup below the floor, so the edited header was never tried |
+| any state, but the measurement or HOST_DATA changed | FAIL, inconclusive: another build has another key, so `locked` says nothing |
 
 It then stops the guest again and requires the hash of `data.raw` to be
 unchanged (no mkfs, no write). The paste carries the `[sealed-data]` serial
@@ -492,7 +493,7 @@ lines, which show the branch the guest took. `--target keyslot` edits key slot
 decrypts the key, so `locked` is expected with or without the 2.8.1 refusal).
 There `locked` is PASS, `broken` is SAFE, and any other state is FAIL.
 Every run that got as far as saving the header ends with a `Restore:` line,
-including one whose `--start-cmd` failed.
+including one whose `--start-cmd` failed or that was interrupted.
 Restore with `sealed_data_proof.py edit-header data.raw --restore <backup>`.
 `edit-header` alone edits or restores a header in place (both copies,
 checksums recomputed; it refuses anything but two equal, valid sha256 LUKS2

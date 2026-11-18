@@ -106,6 +106,9 @@ class FakeHotel:
         self.leak_to = None        # (file name, offset): write the marker in clear on the host disk
         self.write_on_boot = False
         self.force_state = None    # report this storage state after boot, whatever the header says
+        self.corrupt_bulk = False  # one byte of bulk.txt changed, line count kept
+        self.measurement = "fa3c" * 24
+        self.after_measurement = None
         self.next_id = 0
         hotel = self
 
@@ -159,6 +162,8 @@ class FakeHotel:
             self.state = self.after_state
         if self.force_state:
             self.state = self.force_state
+        if self.after_measurement:
+            self.measurement = self.after_measurement
         if self.after_key_id:
             self.key_id = self.after_key_id
         if self.lose_data or self.state not in ("new", "open"):
@@ -181,7 +186,7 @@ class FakeHotel:
             if not self.up:
                 return h.send(503, {"error": "down"})
             if path == "/room/attestation" and method == "GET":
-                return h.send(200, {"binding": {"boot_id": f"boot-{self.boot}", "measurement": "fa3c" * 24,
+                return h.send(200, {"binding": {"boot_id": f"boot-{self.boot}", "measurement": self.measurement,
                                                 "host_data": "8013" * 16}})
             if h.headers.get("Authorization") != f"Bearer {KEY}":
                 return h.send(401, {"error": "unauthorized"})
@@ -250,7 +255,8 @@ class FakeHotel:
             return {"exit_code": 0, "stdout": f"{mark[0]}\n20000\n968890\n", "stderr": ""}
         if "marker" not in ws:
             return {"exit_code": 1, "stdout": "", "stderr": "cat: can't open '/workspace/marker.txt'"}
-        return {"exit_code": 0, "stdout": f"{ws['marker']}\n{ws['lines']}\nscratch-copy-gone\n", "stderr": ""}
+        bulk = sdp.bulk_sha256(ws["marker"] + ("X" if self.corrupt_bulk else ""))
+        return {"exit_code": 0, "stdout": f"{ws['marker']}\n{bulk}\nscratch-copy-gone\n", "stderr": ""}
 
     def close(self):
         self.server.shutdown()
@@ -318,6 +324,13 @@ def test_restart_not_open_after_restart_fails(hotel_dir, hotel, capsys):
     assert "**FAIL** 10. workspace listed" in out
     assert "workspace_not_found" in out  # a locked volume: the old workspace is gone this boot
     assert hotel.rooms == {}
+
+
+def test_restart_changed_bulk_content_fails(hotel_dir, hotel, capsys):
+    env, _ = hotel_dir
+    hotel.corrupt_bulk = True
+    rc, out, _ = run_restart(env, hotel, capsys)
+    assert rc == 1 and "**FAIL** 11. new room reads the marker" in out
 
 
 def test_restart_key_id_changed_fails(hotel_dir, hotel, capsys):
@@ -471,6 +484,29 @@ def test_null_cipher_other_refusals(hotel_dir, hotel, capsys, target, state, ok)
     rc, out, _ = run_null(env, hotel, capsys, "--throwaway", "--target", target)
     assert rc == (1 if ok is False else 0), out
     assert ("**FAIL** 8." in out) == (ok is False)
+
+
+def test_null_cipher_locked_from_another_build_is_inconclusive(hotel_dir, hotel, capsys):
+    env, _ = hotel_dir
+    hotel.force_state = "locked"
+    hotel.after_measurement = "beef" * 24
+    rc, out, _ = run_null(env, hotel, capsys, "--throwaway")
+    assert rc == 1 and "**FAIL** 8. workspaces_storage `locked`" in out and "different build" in out
+    assert "Restore: `" in out
+
+
+def test_null_cipher_interrupt_still_prints_restore(hotel_dir, hotel, capsys, monkeypatch):
+    env, d = hotel_dir
+
+    def interrupted(*_a, **_k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sdp.Proof, "wait_new_boot", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        run_null(env, hotel, capsys, "--throwaway")
+    out = capsys.readouterr().out
+    backup = next(d.glob("data.raw.luks-header-*"))
+    assert f"--restore {backup}" in out and "interrupted" in out
 
 
 def test_null_cipher_failed_start_still_prints_restore(hotel_dir, hotel, capsys):

@@ -561,11 +561,12 @@ def cmd_restart(args) -> int:
         names = [w.get("name") for w in (doc or {}).get("workspaces", []) if isinstance(w, dict)]
         r.step("10. workspace listed after restart", name in names, f"HTTP {code}")
         rid = p.create_room(name)
-        out = p.exec_(rid, "cat /workspace/marker.txt; grep -c line /workspace/bulk.txt; "
+        out = p.exec_(rid, "cat /workspace/marker.txt; sha256sum /workspace/bulk.txt | cut -c1-64; "
                            "test -e /root/scratch-copy.txt && echo scratch-copy-present || echo scratch-copy-gone")
         got = (out.get("stdout") or "").split()
-        ok = len(got) >= 2 and got[0] == marker and got[1] == str(BULK_LINES)
-        r.step("11. new room reads the marker and 20,000 lines back", ok,
+        # The whole file, byte for byte: a line count would not see a changed byte inside a line.
+        ok = len(got) >= 2 and got[0] == marker and got[1] == bulk_sha256(marker)
+        r.step("11. new room reads the marker and 20,000 lines back (sha256 of bulk.txt matches)", ok,
                f"room `{rid}`, read `{' '.join(got)[:160]}`")
         r.step("12. room deleted", p.delete_room(rid), rid)
         if not args.keep_workspace:
@@ -607,6 +608,11 @@ def host_checks(p: Proof, needle: bytes) -> None:
                f"sector {meta['segments']['0'].get('sector_size')}, key slots {sorted(meta.get('keyslots', {}))}")
     except (Luks2Error, KeyError) as exc:
         r.step("data.raw LUKS2 header", None, f"not read: {exc}")
+
+
+def bulk_sha256(marker: str) -> str:
+    """sha256 of the bulk.txt the restart proof's room writes (echo "<marker> line $i" for each i)."""
+    return hashlib.sha256("".join(f"{marker} line {i}\n" for i in range(BULK_LINES)).encode()).hexdigest()
 
 
 def size_text(n: int) -> str:
@@ -685,12 +691,20 @@ def cmd_null_cipher(args) -> int:
     os.chmod(backup, 0o600)
     r.step("3. header saved", True, f"`{backup}` ({len(area)} bytes)")
     # From here on the volume may be on the edited header: every exit must carry the restore command.
+    restore = f"Restore: `{os.path.abspath(__file__)} edit-header {data} --restore {backup}`, then `{start}`."
     try:
         _null_cipher_after_backup(p, r, data, start, stop, before)
     except Exception as exc:  # noqa: BLE001 (report and still print the restore line)
         r.step("aborted", False, f"{type(exc).__name__}: {exc}")
+    except BaseException:  # Ctrl-C or exit: the volume may be on the edited header, so say how to put it back
+        r.add("")
+        r.add("Result: **FAIL** (interrupted)")
+        r.add(restore)
+        sys.stdout.write(r.text())
+        sys.stdout.flush()
+        raise
     r.add("")
-    r.add(f"Restore: `{os.path.abspath(__file__)} edit-header {data} --restore {backup}`, then `{start}`.")
+    r.add(restore)
     return finish(r)
 
 
@@ -711,6 +725,10 @@ def _null_cipher_after_backup(p, r, data: Path, start: str, stop: str, before: d
     if r.step("7. new boot answers", bool(after and st2), f"in {time.monotonic() - t0:.0f} s"):
         state = st2.get("state")
         ok, why = null_cipher_verdict(args.target, state, st2.get("persistent"))
+        # Another build gets another key and reports locked whatever the header says: only the same build counts.
+        if not all(after.get(k) == before.get(k) for k in ("measurement", "host_data")):
+            ok, why = False, ("INCONCLUSIVE: a different build booted (measurement or host_data changed), so its key "
+                              "differs and the state says nothing about the edited header")
         r.step(f"8. workspaces_storage `{state}`, persistent {st2.get('persistent')}", ok, why)
         r.add(f"    detail: `{st2.get('detail')}`")
         for ln in p.serial_lines(6):
