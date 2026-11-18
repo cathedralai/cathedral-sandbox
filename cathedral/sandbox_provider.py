@@ -649,6 +649,7 @@ class InMemorySandboxProvider:
         for sandbox in d.sandboxes:
             sandbox.state = "running"
             sandbox.started_at = d.now
+            self._touch(sandbox)  # the unpack may have outlasted a short idle window
         if len(d.sandboxes) == 1:
             return self._get_doc(d.sandboxes[0])
         return {"sandboxes": [self._get_doc(s) for s in d.sandboxes], "count": len(d.sandboxes)}
@@ -1360,7 +1361,11 @@ class InMemorySandboxProvider:
         staging = root / ".incoming"
         staging.mkdir()
         try:
-            reader = _HashingReader(_open_snapshot_archive(tar_path), limit=expected_bytes)
+            try:
+                archive = _open_snapshot_archive(tar_path)
+            except OSError as exc:  # deleted or swept after the fork was admitted
+                raise corrupt from exc
+            reader = _HashingReader(archive, limit=expected_bytes)
             members_total = 0
             try:
                 with tarfile.open(fileobj=reader, mode="r|gz") as tf:
@@ -1535,8 +1540,11 @@ class InMemorySandboxProvider:
         if sandbox.state in ("deleted", "deleting"):
             return False
         past_ttl = api.is_collectable(now, deadline_at=api.gc_deadline(sandbox.expires_at), last_heartbeat_at=None)
+        # A room still "creating" (a fork unpacking with no lock held) is not idle; its idle window
+        # starts when it runs.
         idle_expired = (
-            sandbox.idle_timeout_seconds is not None
+            sandbox.state != "creating"
+            and sandbox.idle_timeout_seconds is not None
             and sandbox.last_activity_at is not None
             and (now - sandbox.last_activity_at) >= timedelta(seconds=sandbox.idle_timeout_seconds)
         )

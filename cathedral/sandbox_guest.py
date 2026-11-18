@@ -1350,6 +1350,9 @@ class DockerGuestProvider:
         self._lifecycle_locks: dict[str, threading.Lock] = {}
         self._fork_pins: dict[str, _ForkPin] = {}  # new room id -> the pin its fork starts from
         self._pending_image_rm: dict[str, int] = {}  # snapshot image -> failed removals, retried each sweep
+        # Snapshot image -> committed id, from the record's drop until the image is gone (under the provider
+        # lock). D7 keeps refusing a plain create from it: a room started from it would keep the image in use.
+        self._doomed_image_ids: dict[str, str] = {}
         self._snapshot_meta: dict[str, dict[str, Any]] = {}  # snapshot id -> sizes and image
         self._snapshot_owners: dict[str, str] = {}  # snapshot id -> owner_id (AB#650)
         self._built_images: dict[str, str] = {}  # content_hash -> tag
@@ -1769,6 +1772,7 @@ class DockerGuestProvider:
         """(committed image ids as 64 hex, image name -> id) of every snapshot this provider holds."""
         with self._inner._lock:  # noqa: SLF001
             metas = list(self._snapshot_meta.values())
+            metas += [{"image": image, "committed_image_id": iid} for image, iid in self._doomed_image_ids.items()]
         ids = {m["committed_image_id"].removeprefix("sha256:") for m in metas if m.get("committed_image_id")}
         names = {m["image"]: m.get("committed_image_id", "") for m in metas if m.get("image")}
         return ids, names
@@ -2820,7 +2824,15 @@ class DockerGuestProvider:
             self._pending_image_rm[image] = self._pending_image_rm.get(image, 0) + 1
             return False
         self._pending_image_rm.pop(image, None)
+        with self._inner._lock:  # noqa: SLF001
+            self._doomed_image_ids.pop(image, None)
         return True
+
+    def _doom_image_locked(self, snap_id: str) -> None:
+        """Provider lock held, before the snapshot's meta goes: keep its image id refused until it is removed."""
+        meta = self._snapshot_meta.get(snap_id) or {}
+        if meta.get("image") and meta.get("committed_image_id"):
+            self._doomed_image_ids[meta["image"]] = meta["committed_image_id"]
 
     def pending_image_removals(self) -> dict[str, int]:
         """Image name -> failed removal attempts, for images a sweep still has to remove."""
@@ -2897,6 +2909,8 @@ class DockerGuestProvider:
             # its record. One whose record expired meanwhile loses its image
             # in the next sweep.
             return False, False
+        with self._inner._lock:  # noqa: SLF001
+            self._doom_image_locked(snap_id)
         self._snapshot_meta.pop(snap_id, None)
         self._snapshot_owners.pop(snap_id, None)
         image = self._snapshot_images.pop(snap_id, None)
@@ -3313,6 +3327,8 @@ class DockerGuestProvider:
             live = set(self._inner._snapshots)  # noqa: SLF001
             # Chosen under the same hold as `live`: a snapshot published a moment later is not in the list.
             doomed = [(sid, image) for sid, image in self._snapshot_images.items() if sid not in live]
+            for sid, _ in doomed:
+                self._doom_image_locked(sid)
         for sid, image in doomed:
             self._remove_snapshot_image(image)  # a failure stays in _pending_image_rm
             with self._inner._lock:  # noqa: SLF001

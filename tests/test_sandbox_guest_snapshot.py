@@ -2065,3 +2065,69 @@ def test_a_late_refusal_forgets_the_egress_entry_and_gives_the_network_back(fake
     assert egress.forgotten == started and len(started) == 1
     assert pool.released == ["bridge"]
     assert provider._net_pending == {}  # noqa: SLF001
+
+
+# ---------------------------------------------------------------- AB#604 review of 7b07baa (Codex, Bugbot)
+def test_a_deleted_snapshots_image_stays_fork_only_until_it_is_removed(fake, provider) -> None:
+    # The record goes at once, but a failed `docker image rm` leaves the image: a plain create from its id
+    # must still be refused, or the new room keeps the image in use and the removal never finishes.
+    result, _, _ = _captured(provider)
+    snap_id, image, image_id = result["snapshot_id"], f"cathedral-snap-{result['snapshot_id']}:latest", result["committed_image_id"]
+    fake.set(image_rm_fail_times=1)
+    assert provider.delete_snapshot_ex(snap_id) == (True, True)
+    runs = len(fake.calls_of("run"))
+    for ref in (image_id, image):
+        with pytest.raises(SandboxOpError) as err:
+            _create_image(provider, ref)
+        assert err.value.code == "snapshot_image_fork_only", ref
+    assert len(fake.calls_of("run")) == runs
+    provider.sweep()
+    assert image not in fake.state["images"] and provider.pending_image_removals() == {}
+    assert provider._doomed_image_ids == {}  # noqa: SLF001
+
+
+def test_an_expired_snapshots_image_stays_fork_only_until_it_is_removed(fake, provider) -> None:
+    from dataclasses import replace
+
+    result, path, _ = _captured(provider)
+    snap_id, image_id = result["snapshot_id"], result["committed_image_id"]
+    _, rec = provider._inner._snapshots[snap_id]  # noqa: SLF001
+    provider._inner._snapshots[snap_id] = (path, replace(rec, created_at=rec.created_at - timedelta(seconds=rec.ttl_seconds + 1)))  # noqa: SLF001
+    fake.set(image_rm_fail_times=2)
+    provider.sweep()
+    with pytest.raises(SandboxOpError) as err:
+        _create_image(provider, image_id)
+    assert err.value.code == "snapshot_image_fork_only"
+
+
+def test_a_snapshot_archive_gone_before_the_fork_opens_it_is_409_not_500(fake, provider, monkeypatch) -> None:
+    result, _, _ = _captured(provider)
+    resident = provider.quota()["usage"]["resident_sandboxes"]
+
+    def gone(path):
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(sandbox_provider, "_open_snapshot_archive", gone)
+    with pytest.raises(SandboxOpError) as err:
+        _fork(provider, result["snapshot_id"])
+    assert (err.value.code, err.value.http_status) == ("snapshot_corrupt", 409)
+    assert provider.quota()["usage"]["resident_sandboxes"] == resident
+
+
+def test_a_fork_room_is_not_idle_collected_while_it_unpacks(fake, provider, monkeypatch) -> None:
+    result, _, _ = _captured(provider)
+    seen: list[list[str]] = []
+
+    def stale_then_check():
+        # The unpack outlasts the idle window: every creating room looks idle for an hour.
+        with provider._inner._lock:  # noqa: SLF001
+            for sb in provider._inner._sandboxes.values():  # noqa: SLF001
+                if sb.state == "creating":
+                    sb.last_activity_at = sb.last_activity_at - timedelta(hours=1)
+        seen.append(provider._inner.collectable_ids())  # noqa: SLF001
+
+    monkeypatch.setattr(sandbox_provider, "_open_snapshot_archive", lambda p: _SlowReader(p, stale_then_check))
+    req = CreateSandboxRequest(snapshot_id=result["snapshot_id"], resources=RES, idle_timeout_seconds=60)
+    doc = provider.create(req, api_key="k", idempotency=None, body_digest="idle-fork")
+    assert seen == [[]]
+    assert doc["id"] not in provider._inner.collectable_ids()  # noqa: SLF001  its idle window starts when it runs
