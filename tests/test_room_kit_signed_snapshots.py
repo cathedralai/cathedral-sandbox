@@ -465,12 +465,12 @@ def test_an_ordinary_create_carries_no_source_members(front) -> None:
     assert members(receipt_of(headers)["statement"]) == {}
 
 
-def test_a_fork_that_carries_the_pool_label_is_400_reserved_label_invalid_unsent_unsigned(front) -> None:
+def test_a_fork_that_carries_the_pool_label_is_400_pool_create_invalid_unsent_unsigned(front) -> None:
     a = room(front)
     snapshot_ok(front, a)
     before = len(front.api.seen)
     status, headers, out = fork(front, labels={"cathedral_pool": "1"})
-    assert status == 400 and code(out) == "reserved_label_invalid" and "X-Room-Receipt" not in headers
+    assert status == 400 and code(out) == "pool_create_invalid" and "X-Room-Receipt" not in headers
     assert len(front.api.seen) == before
     # the same label on an ordinary create is not this rule's business: it passes as on main
     pool = {"image": "repo/app@sha256:" + "a" * 64, "resources": {"cpu": 1}, "network": {"mode": "deny_all", "allow": []},

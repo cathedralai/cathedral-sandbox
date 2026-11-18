@@ -297,7 +297,7 @@ The broker admits the machine only if its HOST_DATA is in `sealed_host_data`
   The fork's room starts its own numbering at 1. A fork of a snapshot this
   front did not sign since it started (for example after a restart) is refused
   unsent with 404 `snapshot_not_found`; a fork that carries the `cathedral_pool`
-  label is refused with 400 `reserved_label_invalid`.
+  label is refused by the pre-made room rule, 400 `pool_create_invalid`.
 - `DELETE /v1/snapshots/<id>` is signed as `snapshot_delete`, with a null
   `sandbox_id` and `snapshot_id`; `snapshot_source_sandbox_id` is there when the
   front still remembers the snapshot. A delete is a delete request, not a

@@ -3597,9 +3597,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, RecursionError):
             return None, None
         labels = doc.get("labels") if isinstance(doc, dict) else None
-        if isinstance(doc, dict) and isinstance(doc.get("snapshot_id"), str) and doc["snapshot_id"] \
-                and isinstance(labels, dict) and POOL_LABEL in labels:
-            return ("reserved_label_invalid", f"a fork is never pre-made: {POOL_LABEL} is refused"), None
+        # A fork that carries the pool label is refused by pool_create_check: snapshot_id is not a pool create key.
         if not isinstance(labels, dict):
             return None, None
         if SERIAL_LABEL not in labels:
