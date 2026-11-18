@@ -1,0 +1,15 @@
+{
+  "args": [
+    "go"
+  ],
+  "replies": [
+    {
+      "pieces": [
+        "This reply was cut"
+      ],
+      "finish": "length"
+    }
+  ],
+  "env": {},
+  "exit": 0
+}

@@ -5,6 +5,9 @@
 # With ROOM_WORKSPACES=1, $ROOM_DATA_DIR/workspaces is a bind mount of itself
 # with nosuid,nodev,noexec (#305). Rooms write there; the host never runs or
 # opens a device from it. The API refuses workspaces without these options.
+# ROOM_WORKSPACES_SOURCE: bind that directory instead, when it is on a mount of
+# its own (a sealed guest's persistent data volume). When it is missing or on
+# the root file system, workspaces stay on the data volume, as without it.
 set -euo pipefail
 # shellcheck disable=SC1090
 source "${2:?room.env}"
@@ -23,7 +26,12 @@ case "${1:?up|down}" in
     if [ "${ROOM_WORKSPACES:-0}" = 1 ]; then
       WS=$ROOM_DATA_DIR/workspaces
       mkdir -p "$WS"
-      mountpoint -q "$WS" || mount --bind "$WS" "$WS"
+      SRC=${ROOM_WORKSPACES_SOURCE:-}
+      if [ -n "$SRC" ] && { [ ! -d "$SRC" ] || [ "$(findmnt -n -o TARGET --target "$SRC")" = / ]; }; then
+        echo "room-data: $SRC is not on a volume of its own; workspaces stay on $ROOM_DATA_DIR" >&2
+        SRC=""
+      fi
+      mountpoint -q "$WS" || mount --bind "${SRC:-$WS}" "$WS"
       mount -o remount,bind,nosuid,nodev,noexec "$WS"
     fi
     ;;

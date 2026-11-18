@@ -26,8 +26,11 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from urllib.parse import quote
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
+
+from cathedral.no_redirect import NoRedirect
 
 
 class Transport(Protocol):
@@ -77,7 +80,7 @@ class HttpTransport:
         for key, value in headers.items():
             req.add_header(key, value)
         try:
-            with urllib.request.urlopen(req) as response:  # noqa: S310 - fixed local/hosted base URL
+            with urllib.request.build_opener(NoRedirect()).open(req) as response:
                 return response.status, dict(response.headers), response.read()
         except urllib.error.HTTPError as exc:  # 4xx/5xx still carry a JSON error body
             return exc.code, dict(exc.headers or {}), exc.read()
@@ -234,6 +237,15 @@ class SandboxClient:
         doc = self._json("GET", f"/v1/sandboxes/{sandbox_id}/processes/{process_id}/logs", None, headers=self._headers())
         return doc["logs"]
 
+    def process_logs_page(
+        self, sandbox_id: str, process_id: str, *, offset: int = 0, limit: int | None = None
+    ) -> dict[str, Any]:
+        """One page of a process log from a byte offset; pass back next_offset for the bytes after it."""
+        query = f"?offset={int(offset)}" + (f"&limit={int(limit)}" if limit is not None else "")
+        return self._json(
+            "GET", f"/v1/sandboxes/{sandbox_id}/processes/{process_id}/logs{query}", None, headers=self._headers()
+        )
+
     def stop_process(self, sandbox_id: str, process_id: str) -> None:
         self._call("DELETE", f"/v1/sandboxes/{sandbox_id}/processes/{process_id}", headers=self._headers(), expect_json=False)
 
@@ -301,8 +313,11 @@ class SandboxClient:
         return self._json("GET", f"/v1/images/{ref}", None, headers=self._headers())
 
     # ------------------------------------------------------------------ §3.13 logs / usage / status
-    def logs(self, sandbox_id: str) -> dict[str, Any]:
-        return self._json("GET", f"/v1/sandboxes/{sandbox_id}/logs", None, headers=self._headers())
+    def logs(self, sandbox_id: str, *, entrypoint_cursor: str | None = None) -> dict[str, Any]:
+        """§3.13 logs; on a guest hotel also the entrypoint log after *entrypoint_cursor*
+        ("" for the start, then each answer's entrypoint.next_cursor)."""
+        query = f"?entrypoint_cursor={quote(entrypoint_cursor, safe='')}" if entrypoint_cursor is not None else ""
+        return self._json("GET", f"/v1/sandboxes/{sandbox_id}/logs{query}", None, headers=self._headers())
 
     def quota(self) -> dict[str, Any]:
         return self._json("GET", "/v1/quota", None, headers=self._headers())

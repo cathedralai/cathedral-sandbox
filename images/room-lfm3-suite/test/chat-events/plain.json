@@ -1,0 +1,18 @@
+{
+  "args": [
+    "hi there"
+  ],
+  "replies": [
+    {
+      "pieces": [
+        "Hel",
+        "lo ",
+        "from ",
+        "the ",
+        "room."
+      ]
+    }
+  ],
+  "env": {},
+  "exit": 0
+}

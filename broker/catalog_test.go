@@ -123,7 +123,7 @@ func TestLFM3SuiteCatalogIsSealedOnlyAndGHCR(t *testing.T) {
 		"lfm3-vl-2b":     pinnedImage("ghcr.io/cathedralai/room-lfm3-vl-2b", "sha256:ef5c553961e5a6d9eba616fe4f5b2d68d46ec996f651e2011e5a09ae67f9cdc1"),
 		"lfm3-omni-2b":   pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:df5cea815abd5ba5be781c07558dc72dc45a1334c5b97d0b5a93a907bc9911d6"),
 		"d1-2b":          pinnedImage("ghcr.io/cathedralai/room-d1-2b", "sha256:f95d88c7144642328fe85bd7f52e95e434979e64a220550fac3d0e965aca35c6"),
-		"lfm3-audio-2b":  pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:78c2c7d7b6d577c48da6254be23764c5a2be97f4cd2cbe5a7988bb4b4c64a1f5"),
+		"lfm3-audio-2b":  pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:4f9ab1457d67d8fba8c9890a612c81ad4274e5f83ea1903becafc5c51a14d5f9"),
 		"d1-omni-2b":     pinnedImage("ghcr.io/cathedralai/room-d1-omni-2b", "sha256:3cb800de3d2f9bfcc69d24ab2fc659fc51eb7ed3aae2abe46d46a23f10b57abd"),
 		"lfm3-1.7b-base": pinnedImage("ghcr.io/cathedralai/room-lfm3-1.7b-base", "sha256:810911016ac6ea1ddeba1bba4dc157e0c3d4252201e64d3279876e57dce344a8"),
 	}
@@ -136,8 +136,8 @@ func TestLFM3SuiteCatalogIsSealedOnlyAndGHCR(t *testing.T) {
 		if !tpl.SealedOnly || tpl.Sealed != wantSealed || !tpl.Live {
 			t.Fatalf("%s: sealed_only=%v sealed=%s live=%v", name, tpl.SealedOnly, tpl.Sealed, tpl.Live)
 		}
-		if name != "lfm3-1.7b" && (tpl.CPU != 2 || tpl.MemoryGiB != 4 || tpl.Rate != "0.035") {
-			t.Fatalf("%s must use the sealed 2 vCPU / 4 GiB shape at $0.035: %+v", name, tpl)
+		if name != "lfm3-1.7b" && (tpl.CPU != 2 || tpl.MemoryGiB != 4) {
+			t.Fatalf("%s must use the sealed 2 vCPU / 4 GiB shape: %+v", name, tpl)
 		}
 		if tpl.Image != image {
 			t.Fatalf("%s image %q want %q", name, tpl.Image, image)
@@ -314,4 +314,27 @@ func errMessage(doc map[string]any) string {
 	}
 	msg, _ = doc["message"].(string)
 	return msg
+}
+
+// The price lives in the API's sealed size rule (AB#308). The broker catalog
+// must not carry a second, disagreeing rate.
+func TestCatalogPayloadCarriesNoRate(t *testing.T) {
+	tc := newChain(t)
+	_, cat := tc.clientCall(t, "GET", "/v1/sandboxes/catalog", nil, nil)
+	byName := catalogByName(t, cat)
+	if len(byName) == 0 {
+		t.Fatal("catalog returned no templates")
+	}
+	for name, tpl := range byName {
+		for _, key := range []string{"hourly_rate_usd", "rate"} {
+			if _, ok := tpl[key]; ok {
+				t.Fatalf("%s: catalog template carries %q", name, key)
+			}
+		}
+	}
+	for _, view := range catalogTemplateViews() {
+		if _, ok := view.(map[string]any)["hourly_rate_usd"]; ok {
+			t.Fatal("catalogView carries hourly_rate_usd")
+		}
+	}
 }

@@ -10,6 +10,7 @@ import pytest
 
 from cathedral.sandbox_api import CreateSandboxRequest, ExecRequest, ImageSource, Resources
 from cathedral.sandbox_guest import DockerGuestProvider
+from cathedral.sandbox_provider import SandboxOpError
 from tests.fake_docker_cli import FakeDocker, install
 
 
@@ -151,6 +152,7 @@ def test_file_paths_outside_work_are_refused(fake: FakeDocker, path: str) -> Non
             lambda: provider.write_tar(sid, path, b""),
             lambda: provider.read_tar(sid, TarGet(path=path)),
             lambda: provider.stat(sid, path),
+            lambda: provider.list_directory(sid, path),
         ]
         for call in calls:
             with pytest.raises(SandboxOpError) as err:
@@ -159,6 +161,7 @@ def test_file_paths_outside_work_are_refused(fake: FakeDocker, path: str) -> Non
         provider.write_file(sid, "/work/ok.txt", b"hi", None)
         assert provider.read_file(sid, FileGet(path="/work/ok.txt"))[0] == b"hi"
         assert provider.stat(sid, "/work").is_dir
+        assert {entry["name"] for entry in provider.list_directory(sid, "/work")} >= {"ok.txt"}
     finally:
         provider.close()
 
@@ -252,5 +255,39 @@ def test_137_at_the_limit_is_still_a_timeout(fake: FakeDocker) -> None:
         sid = _room(provider)
         result = provider.exec(sid, ExecRequest(cmd=["sh", "-c", "slow-marker"], timeout_seconds=1))
         assert result.exit_code == 137 and result.timed_out is True
+    finally:
+        provider.close()
+
+
+def test_timed_command_is_refused_when_the_image_has_no_timeout_program(fake: FakeDocker, tmp_path) -> None:
+    """AB#458: no timeout program means the limit cannot stop the command in the room.
+
+    The refusal comes before the command starts, so nothing runs and nothing is billed.
+    """
+    log = tmp_path / "appended.txt"
+    fake.set(timeout_form="none", exec_rules=[{"contains": "limit-marker", "append": str(log), "exit": 0}])
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        with pytest.raises(SandboxOpError) as err:
+            provider.exec(sid, ExecRequest(cmd=["sh", "-c", "echo limit-marker"], timeout_seconds=30))
+        assert err.value.code == "exec_timeout_unsupported"
+        assert err.value.http_status == 422
+        assert "timeout" in str(err.value)
+        assert _guest_execs(fake, "limit-marker") == []
+        assert not log.exists()
+    finally:
+        provider.close()
+
+
+@pytest.mark.parametrize("form", ["gnu", "busybox"])
+def test_timed_command_still_runs_when_the_image_has_a_timeout_program(fake: FakeDocker, form: str) -> None:
+    fake.set(timeout_form=form, exec_rules=[{"contains": "limit-marker", "stdout": "ok", "exit": 0}])
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        result = provider.exec(sid, ExecRequest(cmd=["sh", "-c", "echo limit-marker"], timeout_seconds=30))
+        assert result.exit_code == 0
+        assert len(_guest_execs(fake, "limit-marker")) == 1
     finally:
         provider.close()

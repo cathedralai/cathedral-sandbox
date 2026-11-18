@@ -37,7 +37,19 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # Pinned 2026-11-11 (second pin of the day) to 0b396fa: main after #430, the image owner store fix found
 # by the nc-sealed-3 canary (table in a directory the API user owns, no grant kept after a failed write,
 # writability check at start; AB#650). Same make-dist.sh; the 3d107e9 tarball rebuilds to its pinned sha.
-CATHEDRAL_COMMIT=0b396fa
-CATHEDRAL_TARBALL=dist/cathedral-0b396fa.tar.gz
-CATHEDRAL_TARBALL_SHA256=6b2bf2cd3dffcfa3781cad1d76facbcc5e50cac74e0793a6e0832b223456c252
+# Pinned 2026-11-12 to 0245e8d: main after #432 (expose answers 501 on a guest hotel, AB#488),
+# #437 (guest API over HTTP/1.1 keepalive, chunked bodies refused, AB#534), #439 (a timed command
+# is refused when the image has no timeout program, AB#458) and #413 (workspace source for the
+# sealed data volume, AB#598; off unless SEALED_DATA_GIB > 0). Same make-dist.sh; the 0b396fa
+# tarball rebuilds to its pinned sha 6b2bf2cd... with the same tool.
+# Pinned 2026-11-13 to 400892e: main after #455 (allowlisted image start commands for sealed rooms,
+# AB#709) and #457 (docker run pinned to the inspected image Id, AB#709). Same make-dist.sh; the
+# 0245e8d tarball rebuilds to its pinned sha 22fd4d0e... with the same tool.
+# Pinned 2026-11-16 to 87f01a6: main after #475 (guest File Manager listing and mutations, AB#409),
+# #494 (guest-made ingress TLS key named in the binding, AB#422; off unless SEALED_*GUEST_INGRESS=1)
+# and #442 (background exec cancel inside the room, AB#406). Same make-dist.sh; the 400892e tarball
+# rebuilds to its pinned sha 88f93fee... with the same tool.
+CATHEDRAL_COMMIT=87f01a6
+CATHEDRAL_TARBALL=dist/cathedral-87f01a6.tar.gz
+CATHEDRAL_TARBALL_SHA256=2519214162c174745135d56daf2a2d910dbb0a4bccb735e76c517387e0d9ae4b
 PROBE_IMAGE=alpine:3.20

@@ -104,7 +104,7 @@ python3 "$KIT/assess.py" --data-dir "$ROOM_DATA_DIR" --room-socket "$SOCK" --out
 log "assess: $ROOM_ETC/machine.json"
 
 # Resolved copy of the config (values only, no comments) for units and health.
-ROOM_KEYS="ROOM_TLS ROOM_REGISTRY_MIRRORS ROOM_ID ROOM_HOSTNAME ROOM_ACME_EMAIL ROOM_CUSTOMER ROOM_REGION API_PROFILE ROOM_API_PORT ROOM_HEALTH_PORT ROOM_PUBLIC_PORT ROOM_DATA_DIR ROOM_DATA_DEVICE ROOM_DATA_IMG ROOM_DATA_SIZE_GB ROOM_BRIDGE ROOM_BRIDGE_CIDR ROOM_DNS ROOM_RUNSC_FLAGS ROOM_ALLOW_DIND ROOM_CREATES_PER_MINUTE ROOM_GC_PARALLELISM ROOM_DIND_DOCKERD_ARGS ROOM_DIND_ENV ROOM_BRIDGE_PORT_CAP ROOM_NETS ROOM_NETS_POOL ROOM_NET_SIZE ROOM_NET_BRIDGE_PREFIX SHAPE_VCPU SHAPE_MEM_GIB SHAPE_DISK_GIB RESERVE_RAM_PCT RESERVE_THREADS DISK_MAX_FILL_PCT CPU_OVERCOMMIT MEM_OVERCOMMIT DISK_OVERCOMMIT ROOM_MAX_SLOTS ROOM_RECEIPTS ROOM_RECEIPTS_LISTEN ROOM_HOTEL_NAME ROOM_EGRESS ROOM_WORKSPACES ROOM_SECRETS_PERSIST ROOM_ESCAPE ROOM_ESCAPE_ALLOW_PLAINTEXT ROOM_SEALED_SECRETS ROOM_SEALED_EXEC"
+ROOM_KEYS="ROOM_TLS ROOM_REGISTRY_MIRRORS ROOM_ID ROOM_HOSTNAME ROOM_ACME_EMAIL ROOM_CUSTOMER ROOM_REGION API_PROFILE ROOM_API_PORT ROOM_HEALTH_PORT ROOM_PUBLIC_PORT ROOM_DATA_DIR ROOM_DATA_DEVICE ROOM_DATA_IMG ROOM_DATA_SIZE_GB ROOM_BRIDGE ROOM_BRIDGE_CIDR ROOM_DNS ROOM_RUNSC_FLAGS ROOM_ALLOW_DIND ROOM_CREATES_PER_MINUTE ROOM_GC_PARALLELISM ROOM_DIND_DOCKERD_ARGS ROOM_DIND_ENV ROOM_BRIDGE_PORT_CAP ROOM_NETS ROOM_NETS_POOL ROOM_NET_SIZE ROOM_NET_BRIDGE_PREFIX SHAPE_VCPU SHAPE_MEM_GIB SHAPE_DISK_GIB RESERVE_RAM_PCT RESERVE_THREADS DISK_MAX_FILL_PCT CPU_OVERCOMMIT MEM_OVERCOMMIT DISK_OVERCOMMIT ROOM_MAX_SLOTS ROOM_RECEIPTS ROOM_RECEIPTS_LISTEN ROOM_HOTEL_NAME ROOM_EGRESS ROOM_WORKSPACES ROOM_SECRETS_PERSIST ROOM_SECRETS_PER_OWNER ROOM_ESCAPE ROOM_ESCAPE_ALLOW_PLAINTEXT ROOM_SEALED_SECRETS ROOM_SEALED_EXEC ROOM_GUEST_INGRESS ROOM_WORKSPACES_SOURCE"
 write_room_env() {
   for k in $ROOM_KEYS; do printf '%s="%s"\n' "$k" "${!k:-}"; done > "$ROOM_ETC/room.env"
   chmod 0644 "$ROOM_ETC/room.env"
@@ -385,6 +385,10 @@ KillMode=mixed
 LimitNOFILE=1048576
 TasksMax=infinity
 NoNewPrivileges=yes
+# Only to set the xfs project limit that caps each room's /work and each
+# workspace (AB#396). The API already drives the room docker daemon.
+AmbientCapabilities=CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_SYS_ADMIN
 ProtectSystem=full
 PrivateTmp=yes
 ReadWritePaths=$ROOM_DATA_DIR/work $ROOM_DATA_DIR/image-owners /var/lib/pool-room
@@ -495,6 +499,13 @@ cat >> "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF
 Environment=ROOM_SEALED_EXEC=1
 EOF
 fi
+if [ "${ROOM_GUEST_INGRESS:-0}" = 1 ]; then
+# Guest ingress key (AB#422): the front makes the Preview URL TLS key in the
+# guest and names it in the binding. Off: the unit is as before.
+cat >> "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF
+Environment=ROOM_GUEST_INGRESS=1
+EOF
+fi
 cat >> "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF
 ExecStart=$ROOM_OPT/venv/bin/python $ROOM_OPT/bin/room_receipts.py
 Restart=on-failure
@@ -535,8 +546,12 @@ https://$ROOM_HOSTNAME:$ROOM_PUBLIC_PORT {
 		reverse_proxy $ROOM_API_UPSTREAM {
 			flush_interval -1
 			transport http {
-				read_timeout 15m
-				write_timeout 15m
+				# Why 4h15m: the broker caps one exec at 14400 s (4 h) and holds the request
+				# open for that long, plus a 120 s margin. A transport read_timeout or
+				# write_timeout below 14400 + 120 s = 14520 s cuts long held exec requests.
+				# 4h15m = 15300 s covers the cap and the margin. (AB#725)
+				read_timeout 4h15m
+				write_timeout 4h15m
 			}
 		}
 	}

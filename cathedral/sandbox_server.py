@@ -21,8 +21,10 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Mapping
@@ -47,6 +49,11 @@ from cathedral.sandbox_owner import guest_from, owner_hash, owner_id
 from cathedral.sandbox_provider import InMemorySandboxProvider, SandboxOpError, SandboxProvider
 
 JSON = "application/json"
+# A PTY WebSocket closes after this long with no frame from the client
+# (pings count); the API's idle sweep ends the terminal itself (AB#405).
+PTY_WS_IDLE_SECONDS = 600.0
+# Largest unparsed input a PTY WebSocket buffers (one frame, in effect).
+PTY_WS_MAX_FRAME = 64 * 1024 + 16
 REAPER_INTERVAL_DEFAULT_SECONDS = 30.0
 
 
@@ -130,6 +137,11 @@ def _create_request(payload: dict[str, Any]) -> CreateSandboxRequest:
         ImageSource(image=payload["image"]) if payload.get("image") else None
     )
     build = BuildSpec(**payload["build"]) if isinstance(payload.get("build"), dict) else None
+    start = payload.get("start")
+    if start is not None and start != "image":
+        raise api.SandboxContractError("invalid_start", 'start must be "image" when set')
+    if start == "image" and "entrypoint" in payload:
+        raise api.SandboxContractError("start_conflict", 'send either start: "image" or entrypoint, not both')
     entrypoint = tuple(payload["entrypoint"]) if payload.get("entrypoint") else ("sleep", "infinity")
     kwargs: dict[str, Any] = {
         "resources": resources,
@@ -147,6 +159,7 @@ def _create_request(payload: dict[str, Any]) -> CreateSandboxRequest:
         "count": payload.get("count", 1),
         "workspace": api.WorkspaceSpec.parse(payload.get("workspace")),
         "tunables": payload.get("tunables"),
+        "start_image": start == "image",
     }
     return CreateSandboxRequest(**kwargs)
 
@@ -258,9 +271,13 @@ class SandboxApplication:
         self._add("PATCH", s + r"/(?P<id>[^/]+)", self.patch_sandbox)
         self._add("POST", s + r"/(?P<id>[^/]+)/wait", self.wait)
         self._add("POST", s + r"/(?P<id>[^/]+)/exec", self.exec_)
+        self._add("POST", s + r"/(?P<id>[^/]+)/exec/cancel", self.exec_cancel)
         # The receipts front's own route for an exec it opened from a sealed envelope (AB#417);
         # the front refuses it to every caller. An API without it answers 404 and runs nothing.
         self._add("POST", s + r"/(?P<id>[^/]+)/exec-sealed", self.exec_sealed)
+        # The receipts front's own route for an env overlay it opened from a sealed envelope
+        # (AB#414); the front refuses it to every caller, as it does exec-sealed.
+        self._add("PUT", s + r"/(?P<id>[^/]+)/env-sealed", self.set_env_sealed)
         self._add("POST", s + r"/(?P<id>[^/]+)/heartbeat", self.heartbeat)
         self._add("POST", s + r"/(?P<id>[^/]+)/lifetime", self.heartbeat)
         self._add("PATCH", s + r"/(?P<id>[^/]+)/lifetime", self.heartbeat)
@@ -270,6 +287,9 @@ class SandboxApplication:
         self._add("POST", s + r"/(?P<id>[^/]+)/processes/(?P<pid>[^/]+)/attach", self.attach_unsupported)
         self._add("PUT", s + r"/(?P<id>[^/]+)/files", self.put_file)
         self._add("GET", s + r"/(?P<id>[^/]+)/files", self.get_file)
+        self._add("GET", s + r"/(?P<id>[^/]+)/entries", self.list_directory)
+        self._add("DELETE", s + r"/(?P<id>[^/]+)/entries", self.remove_entry)
+        self._add("PUT", s + r"/(?P<id>[^/]+)/directories", self.make_directory)
         self._add("PUT", s + r"/(?P<id>[^/]+)/tar", self.put_tar)
         self._add("GET", s + r"/(?P<id>[^/]+)/tar", self.get_tar)
         self._add("GET", s + r"/(?P<id>[^/]+)/stat", self.stat)
@@ -289,6 +309,7 @@ class SandboxApplication:
         self._add("POST", s + r"/(?P<id>[^/]+)/terminals/(?P<tid>[^/]+)/connect", self.connect_terminal)
         self._add("POST", s + r"/(?P<id>[^/]+)/terminals/(?P<tid>[^/]+)/input", self.terminal_write)
         self._add("GET", s + r"/(?P<id>[^/]+)/terminals/(?P<tid>[^/]+)/output", self.terminal_read)
+        self._add("POST", s + r"/(?P<id>[^/]+)/terminals/(?P<tid>[^/]+)/resize", self.terminal_resize)
         self._add("POST", s + r"/(?P<id>[^/]+)/publish", self.publish_template)
         self._add("GET", s + r"/(?P<id>[^/]+)/desktop", self.desktop)
         self._add("GET", s + r"/(?P<id>[^/]+)/logs", self.logs)
@@ -511,13 +532,41 @@ class SandboxApplication:
             stdin=payload.get("stdin"),
             sealed=sealed,
             spill_token=payload.get("spill_token"),
+            launch_by=payload.get("launch_by"),
         )
         result = self.provider.exec(id, req)
         return Response.json(200, result.to_document())
 
+    def exec_cancel(self, *, id, body, **_):
+        """Stop the exec that started with this spill_token (AB#406).
+
+        The answer names no room, so the receipts front's result_sha256 can be checked
+        against these bytes after the broker rewrites ids in other answers.
+        """
+        token = self._json(body).get("spill_token")
+        if not api.spill_token_ok(token):
+            raise api.SandboxContractError("invalid_exec", "spill_token must be 32 lowercase hex characters")
+        cancel = getattr(self.provider, "cancel_exec", None)
+        result = cancel(id, token) if callable(cancel) else "unsupported"
+        answer = {"result": result, "token_sha256": hashlib.sha256(token.encode()).hexdigest()}
+        if result == "refused":
+            # The pid file failed the guard and no signal was sent. A repeat may succeed.
+            answer.update(reason="pid_file_invalid", cancelled=False, retryable=True)
+        return Response.json(200, answer)
+
     def exec_sealed(self, *, id, body, **_):
         """An exec as /exec runs it, with its command and output kept out of the history and the log."""
         return self.exec_(id=id, body=body, sealed=True)
+
+    def set_env_sealed(self, *, id, body, **_):
+        """Replace the room's env overlay with the one the front opened. Answers names, never values."""
+        payload = self._json(body)
+        env = api.validated_env_overlay(payload.get("env") if isinstance(payload, dict) else None)
+        setter = getattr(self.provider, "set_env_overlay", None)
+        if not callable(setter):
+            return Response.error(501, "env_overlay_not_supported", "this runtime has no env overlay")
+        names = setter(id, env)
+        return Response.json(200, {"sandbox_id": id, "names": names})
 
     def start_process(self, *, id, body, **_):
         payload = self._json(body)
@@ -526,7 +575,19 @@ class SandboxApplication:
         handle = self.provider.start_process(id, req)
         return Response.json(202, {"process_id": handle.process_id, "running": handle.running})
 
-    def process_logs(self, *, id, pid, **_):
+    def process_logs(self, *, id, pid, query, **_):
+        """A process log from ?offset= (bytes, default 0), at most ?limit= bytes (AB#419).
+
+        The answer's next_offset is the offset of the next read: it returns only
+        bytes this one did not.
+        """
+        offset = _int_param(query, "offset")
+        limit = _int_param(query, "limit")
+        pager = getattr(self.provider, "process_logs_page", None)
+        if callable(pager):
+            return Response.json(200, pager(id, pid, offset=offset, limit=limit))
+        if offset or limit is not None:
+            return Response.error(501, "log_paging_not_supported", "this runtime reads a process log whole")
         return Response.json(200, {"process_id": pid, "logs": self.provider.process_logs(id, pid)})
 
     def stop_process(self, *, id, pid, **_):
@@ -569,6 +630,18 @@ class SandboxApplication:
         path = _require_param(query, "path")
         self.provider.write_tar(id, path, body)
         return Response.json(200, {"path": path, "extracted": True})
+
+    def list_directory(self, *, id, query, **_):
+        path = _require_param(query, "path")
+        return Response.json(200, {"path": path, "entries": self.provider.list_directory(id, path)})
+
+    def make_directory(self, *, id, query, **_):
+        path = _require_param(query, "path")
+        return Response.json(200, {"path": path, "created": self.provider.make_directory(id, path)})
+
+    def remove_entry(self, *, id, query, **_):
+        path = _require_param(query, "path")
+        return Response.json(200, {"path": path, "deleted": self.provider.remove_entry(id, path)})
 
     def get_tar(self, *, id, query, **_):
         path = _require_param(query, "path")
@@ -687,10 +760,16 @@ class SandboxApplication:
 
     def create_terminal(self, *, id, body, **_):
         payload = self._json(body)
-        return Response.json(
-            201,
-            self.provider.create_terminal(id, cols=payload.get("cols"), rows=payload.get("rows")),
-        )
+        kwargs: dict[str, Any] = {"cols": payload.get("cols"), "rows": payload.get("rows")}
+        if payload.get("mode") is not None:
+            # line (default) or pty (AB#405). Only sent on when asked, so a
+            # provider without PTY terminals keeps its old signature.
+            kwargs["mode"] = str(payload.get("mode"))
+        return Response.json(201, self.provider.create_terminal(id, **kwargs))
+
+    def terminal_resize(self, *, id, tid, body, **_):
+        payload = self._json(body)
+        return Response.json(200, self.provider.terminal_resize(id, tid, payload.get("cols"), payload.get("rows")))
 
     def list_terminals(self, *, id, **_):
         return Response.json(200, self.provider.list_terminals(id))
@@ -741,7 +820,12 @@ class SandboxApplication:
         return Response.json(200, self.provider.desktop(id))
 
     # ------------------------------------------------------------------ §3.13 logs
-    def logs(self, *, id, **_):
+    def logs(self, *, id, query, **_):
+        # ?entrypoint_cursor= is the entrypoint.next_cursor of the read before (AB#419).
+        # Present (even empty) asks for the entrypoint log; empty reads from the start.
+        cursor = (query.get("entrypoint_cursor") or [None])[0]
+        if cursor is not None:
+            return Response.json(200, self.provider.logs(id, entrypoint_cursor=cursor))
         return Response.json(200, self.provider.logs(id))
 
     # ------------------------------------------------------------------ §3.9 images
@@ -830,6 +914,17 @@ class SandboxApplication:
         return Response.json(200, openapi_document(base_url=base))
 
 
+def _int_param(query: Mapping[str, list[str]], name: str) -> int | None:
+    """A whole-number query parameter, None when absent."""
+    values = query.get(name)
+    if not values or values[0] == "":
+        return None
+    raw = values[0]
+    if not raw.isascii() or not raw.isdigit() or len(raw) > 18:
+        raise api.SandboxContractError("invalid_request", f"query parameter '{name}' must be a whole number")
+    return int(raw)
+
+
 def _require_param(query: Mapping[str, list[str]], name: str) -> str:
     values = query.get(name)
     if not values:
@@ -851,11 +946,14 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/sandboxes/{id}/lifetime", "post", "Extend lifetime (alias)", "§3.1"),
     ("/v1/sandboxes/{id}/lifetime", "patch", "Extend lifetime (PATCH alias)", "§3.1"),
     ("/v1/sandboxes/{id}/processes", "post", "Start a background process", "§3.2"),
-    ("/v1/sandboxes/{id}/processes/{pid}/logs", "get", "Background-process logs", "§3.2; Range supported"),
+    ("/v1/sandboxes/{id}/processes/{pid}/logs", "get", "Background-process logs", "§3.2; ?offset= and ?limit= bytes, answers next_offset (AB#419)"),
     ("/v1/sandboxes/{id}/processes/{pid}", "delete", "Stop a background process", "§3.2"),
     ("/v1/sandboxes/{id}/processes/{pid}/attach", "post", "Attach to a process", "§3.2; not supported (501)"),
     ("/v1/sandboxes/{id}/files", "put", "Write a file", "§3.3"),
     ("/v1/sandboxes/{id}/files", "get", "Read a file", "§3.3; Range → 206"),
+    ("/v1/sandboxes/{id}/entries", "get", "List directory entries", "AB#409; max 1000"),
+    ("/v1/sandboxes/{id}/entries", "delete", "Delete one plain file or empty directory", "AB#409; no recursive delete"),
+    ("/v1/sandboxes/{id}/directories", "put", "Create one directory", "AB#409; parent must exist"),
     ("/v1/sandboxes/{id}/tar", "put", "Write a tar archive", "§3.3"),
     ("/v1/sandboxes/{id}/tar", "get", "Read a tar archive", "§3.3"),
     ("/v1/sandboxes/{id}/stat", "get", "Stat a path", "§3.3"),
@@ -874,13 +972,14 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/sandboxes/{id}/terminals/{tid}/connect", "post", "Connect terminal with ticket", "Agent IDE G4"),
     ("/v1/sandboxes/{id}/terminals/{tid}/input", "post", "Write terminal input", "Agent IDE G4 REST PTY"),
     ("/v1/sandboxes/{id}/terminals/{tid}/output", "get", "Read terminal output", "Agent IDE G4 REST PTY"),
+    ("/v1/sandboxes/{id}/terminals/{tid}/resize", "post", "Resize terminal", "AB#405; PTY mode resizes the room's tty"),
     ("/v1/sandboxes/{id}/terminals/{tid}/ws", "get", "Terminal WebSocket PTY", "Agent IDE G4; Upgrade + ticket"),
     ("/v1/sandboxes/{id}/publish", "post", "Publish template from sandbox", "Agent IDE G6"),
     ("/v1/sandboxes/{id}/desktop", "get", "Desktop availability", "Agent IDE G5; gated"),
     ("/v1/sandboxes/{id}/desktop/ws", "get", "Desktop RFB WebSocket", "Agent IDE G5; ticket + CATHEDRAL_AGENT_DESKTOP=1"),
     ("/v1/sandbox-templates", "get", "List sandbox templates", "Agent IDE G6"),
     ("/v1/sandbox-templates/{uid}", "get", "Get sandbox template", "Agent IDE G6"),
-    ("/v1/sandboxes/{id}/logs", "get", "Container + exec logs", "§3.13; kept 24 h after delete"),
+    ("/v1/sandboxes/{id}/logs", "get", "Container + exec logs", "§3.13; kept 24 h after delete; entrypoint log from ?entrypoint_cursor= (AB#419)"),
     ("/v1/snapshots", "get", "List snapshots", "§3.5"),
     ("/v1/snapshots/{id}", "delete", "Delete a snapshot", "§3.5"),
     ("/v1/snapshots/{id}/push", "post", "Push a snapshot image to a registry", "§3.5"),
@@ -996,6 +1095,13 @@ _ERROR_SCHEMA: dict[str, Any] = {
 # ------------------------------------------------------------------ stdlib listener
 class _Handler(BaseHTTPRequestHandler):
     app: SandboxApplication
+    # Keepalive: a caller reuses one connection instead of paying a new TCP
+    # connect per call. Safe only because _send and _ws_fail always set
+    # Content-Length.
+    protocol_version = "HTTP/1.1"
+    # An idle kept-alive connection holds a thread; free it after a minute.
+    # The websocket handlers set their own longer timeout.
+    timeout = 60
 
     def _run(self, method: str) -> None:
         try:
@@ -1003,10 +1109,18 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError:
             length = -1
         if length < 0 or length > MAX_BODY_BYTES:
-            # Refuse before reading: the body stays on the wire and the
-            # connection closes (HTTP/1.0, no keep-alive).
+            # Refuse before reading: the body stays on the wire, so the
+            # connection must close or those bytes would be parsed as the next
+            # request.
             self.close_connection = True
             resp = Response.error(413, "request_too_large", f"the request body is over {MAX_BODY_BYTES} bytes")
+            resp.headers["Connection"] = "close"
+        elif self.headers.get("Transfer-Encoding"):
+            # Only Content-Length bodies are read. A chunked body would be left
+            # on the wire and parsed as the next request.
+            self.close_connection = True
+            resp = Response.error(400, "chunked_not_supported", "send a Content-Length body, not Transfer-Encoding")
+            resp.headers["Connection"] = "close"
         else:
             body = self.rfile.read(length) if length else b""
             resp = self.app.dispatch(method, self.path, dict(self.headers), body)
@@ -1023,6 +1137,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if (self.headers.get("Upgrade") or "").lower() == "websocket":
+            # The socket is not HTTP after this, whatever the handler did.
+            self.close_connection = True
             self._handle_websocket()
             return
         self._run("GET")
@@ -1093,13 +1209,16 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             # Consume ticket + mark connected (same gate as REST connect).
-            self.app.provider.connect_terminal(sandbox_id, terminal_id, ticket=ticket)
+            connected = self.app.provider.connect_terminal(sandbox_id, terminal_id, ticket=ticket)
         except SandboxOpError as exc:
             self._ws_fail(exc.http_status, exc.code, str(exc))
             return
         protocol = f"cathedral.ticket.{ticket}"
         self.wfile.write(ws.handshake_response(key, protocol=protocol))
         self.wfile.flush()
+        if connected.get("mode") == "pty":
+            self._ws_pty_pump(sandbox_id, terminal_id, ws)
+            return
         # Push any buffered output (connect banner).
         try:
             out = self.app.provider.terminal_read(sandbox_id, terminal_id)
@@ -1153,6 +1272,137 @@ class _Handler(BaseHTTPRequestHandler):
                     break
         except (TimeoutError, BrokenPipeError, ConnectionResetError, OSError):
             pass
+
+    def _ws_pty_pump(self, sandbox_id: str, terminal_id: str, ws) -> None:
+        """Full duplex bytes between a WebSocket and a PTY terminal (AB#405).
+
+        Server to client: binary frames of raw terminal output as it arrives,
+        then a close frame naming why the session ended. Client to server:
+        binary frames are raw input; text frames are JSON control,
+        {"type":"resize","cols":N,"rows":N} or {"type":"input","data":"..."}.
+        """
+        import select
+        import struct
+        import threading
+
+        send_lock = threading.Lock()
+        stop = threading.Event()
+        closed = {"sent": False}
+
+        def send(payload: bytes, opcode: int) -> bool:
+            with send_lock:
+                if closed["sent"]:
+                    return False
+                try:
+                    self.wfile.write(ws.encode_frame(payload, opcode=opcode))
+                    self.wfile.flush()
+                except OSError:
+                    closed["sent"] = True
+                    stop.set()
+                    return False
+                if opcode == ws.OP_CLOSE:
+                    closed["sent"] = True
+                return True
+
+        def close(code: int, reason: str) -> None:
+            send(struct.pack("!H", code) + reason.encode("ascii", "replace")[:120], ws.OP_CLOSE)
+            stop.set()
+
+        def pump_output() -> None:
+            while not stop.is_set():
+                try:
+                    out = self.app.provider.terminal_read_wait(sandbox_id, terminal_id, 0.5)
+                except SandboxOpError as exc:
+                    close(1000, exc.code)
+                    break
+                data = base64.b64decode(out.get("data_b64") or "") if "data_b64" in out else (out.get("data") or "").encode()
+                if data and not send(data, ws.OP_BINARY):
+                    break
+                if out.get("exited"):
+                    close(1000, "terminal_exited")
+                    break
+            # Wake the receive loop so the handler returns.
+            try:
+                self.connection.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+
+        # recv only runs after select says ready; this bounds a send to a
+        # client that stopped reading.
+        self.connection.settimeout(120.0)
+        sender = threading.Thread(target=pump_output, name="cathedral-pty-ws", daemon=True)
+        sender.start()
+        buf = bytearray()
+        last_heard = time.monotonic()
+        try:
+            while not stop.is_set():
+                # Blocking socket, select for idle: a socket timeout would also
+                # cut the sender's writes off mid-frame.
+                ready, _, _ = select.select([self.connection], [], [], 1.0)
+                if not ready:
+                    if time.monotonic() - last_heard > PTY_WS_IDLE_SECONDS:
+                        close(1000, "idle")
+                    continue
+                chunk = self.connection.recv(65536)
+                if not chunk:
+                    break
+                last_heard = time.monotonic()
+                buf.extend(chunk)
+                frames, buf = ws.decode_frames(buf)
+                if len(buf) > PTY_WS_MAX_FRAME:
+                    # What is left is one unfinished frame larger than any
+                    # single input write may be.
+                    close(1009, "terminal_input_too_large")
+                    break
+                for opcode, payload in frames:
+                    if opcode == ws.OP_CLOSE:
+                        close(1000, "client_close")
+                        break
+                    if opcode == ws.OP_PING:
+                        send(payload, ws.OP_PONG)
+                        continue
+                    if opcode == ws.OP_PONG:
+                        continue
+                    data: bytes | None = None
+                    if opcode == ws.OP_BINARY:
+                        data = payload
+                    elif opcode == ws.OP_TEXT:
+                        try:
+                            msg = json.loads(payload.decode("utf-8"))
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            msg = None
+                        if not isinstance(msg, dict):
+                            close(1003, "invalid_control_frame")
+                            break
+                        kind = msg.get("type")
+                        try:
+                            if kind == "resize":
+                                self.app.provider.terminal_resize(sandbox_id, terminal_id, msg.get("cols"), msg.get("rows"))
+                            elif kind == "input" and isinstance(msg.get("data"), str):
+                                data = msg["data"].encode("utf-8")
+                            else:
+                                close(1003, "invalid_control_frame")
+                                break
+                        except SandboxOpError as exc:
+                            if exc.http_status == 400:
+                                continue  # a bad size is the client's mistake, not the session's end
+                            close(1000, exc.code)
+                            break
+                    else:
+                        # Fragmented messages are not part of this protocol.
+                        close(1003, "unsupported_frame")
+                        break
+                    if data:
+                        try:
+                            self.app.provider.terminal_write(sandbox_id, terminal_id, data)
+                        except SandboxOpError as exc:
+                            close(1000, exc.code)
+                            break
+        except OSError:
+            pass
+        finally:
+            stop.set()
+            sender.join(timeout=2.0)
 
     def _ws_desktop(self, sandbox_id: str, ticket: str | None, key: str, ws, agent_rfb) -> None:
         import os as _os
@@ -1244,9 +1494,9 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class _Server(ThreadingHTTPServer):
-    # Every call is a new connection (HTTP/1.0, no keep-alive). The stdlib listen
-    # backlog is 5 on Python 3.11 to 3.14, so a burst of calls overflows it: the
-    # kernel drops the connection attempt and the caller retries 1 s later.
+    # The stdlib listen backlog is 5 on Python 3.11 to 3.14, so a burst of new
+    # connections overflows it: the kernel drops the connection attempt and the
+    # caller retries 1 s later.
     # room_receipts.py's front sets the same value for the same reason.
     request_queue_size = 1024
 

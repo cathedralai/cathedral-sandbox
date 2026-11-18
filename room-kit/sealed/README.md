@@ -17,7 +17,7 @@ sudo ./install.sh --sealed sealed.env
 
 1. **Assess.** It checks that SEV-SNP is on (`kvm_amd sev_snp=Y`, `/dev/sev`),
    that the hotel key file exists, and that the host keeps
-   `SEALED_MIN_HOST_FREE_GIB` free after the scratch disk is full.
+   `SEALED_MIN_HOST_FREE_GIB` free after the scratch and data disks are full.
 2. **Host packages.** QEMU with `sev-snp-guest`, OVMF (AmdSev build),
    mmdebstrap, zstd, cpio, python3-venv.
 3. **Build** (`build-guest.sh`). It makes three files:
@@ -31,7 +31,7 @@ sudo ./install.sh --sealed sealed.env
    - `host-net.sh up`: a tap device with a /30, NAT to the internet, own
      iptables chains only.
    - `launch-guest.sh`: QEMU with `kernel-hashes=on`, the scratch disk, the
-     tap link and the hotel key in fw_cfg.
+     data disk (`SEALED_DATA_GIB` > 0), the tap link and the hotel key in fw_cfg.
 5. **Check.** Before the restart it refuses to go on while the running guest
    has rooms (`SEALED_RESTART_WITH_ROOMS=1` overrides). It waits for
    `GET /room/attestation` from the guest and compares the measurement in
@@ -44,9 +44,46 @@ Inside the guest, `sealed-hotel.service` runs at every boot:
 
 1. It encrypts the scratch disk with dm-crypt (plain, AES-XTS-512) and a random
    key from the guest's `/dev/urandom`. The key exists only in guest memory.
-2. It reads the hotel key from fw_cfg.
-3. It runs `install.sh` with the guest `room.env` (`ROOM_RECEIPTS=1`). This
+   Docker, the room file systems and `/work` live there; all of it ends at
+   the next boot.
+2. With a data disk (`SEALED_DATA_GIB` > 0, which needs
+   `SEALED_ROOM_WORKSPACES=1`), `sealed-data.sh` opens the persistent data
+   volume: LUKS2 (AES-XTS-512) with a key the AMD secure processor derives
+   for this chip, this measurement and this policy, mixed with HOST_DATA
+   (`sealed_data_key.py`). Workspaces live there and outlive a restart of the
+   same build. A new build cannot open it (see "Data volume" below).
+3. It reads the hotel key from fw_cfg.
+4. It runs `install.sh` with the guest `room.env` (`ROOM_RECEIPTS=1`). This
    is the same installer as on an unsealed hotel.
+
+### Data volume
+
+Design, threat model, upgrade path and the proof on an SNP host:
+[docs/SEALED_DATA_VOLUME.md](../../docs/SEALED_DATA_VOLUME.md).
+
+- Boot states (health `workspaces_storage`, the serial log `[sealed-data]`):
+  `new`, `open`, `locked` (a volume this build cannot open), `tampered` (the
+  header is not our layout), `broken` (including an existing volume with no `fs: xfs` token),
+  `absent`, `nokey`, `error`. In every state but `new` and `open`, this boot
+  keeps workspaces on the scratch disk.
+- After open, the guest verifies the LUKS2 header (cipher, sector size, key
+  slot) and refuses a null-cipher edit; it needs cryptsetup 2.8.1 or newer.
+- The guest formats only a blank disk (every byte zero, read whole at the
+  first boot); any other non-LUKS content, such as damaged LUKS2 signatures or
+  a zeroed header over a payload, is `broken` and left untouched. mkfs runs only in the
+  same boot that proved the disk blank, ran luksFormat and opened the new volume; an
+  existing volume with no `fs: xfs` token is `broken`, whatever `blkid` says. If a
+  first boot stopped before the token was written, the next boot is `broken`: the
+  operator removes `$SEALED_DIR/data.raw` and boots again. To start empty, stop the guest and remove `$SEALED_DIR/data.raw`.
+- A roll to a new launch identity: `install.sh --sealed` stops unless a one-line
+  choice is in `$SEALED_DIR/data-on-new-build`: `reset` (the old volume becomes
+  `data.raw.prev`, restored on any failure until the measurement checks; refuses
+  to overwrite an existing `data.raw.prev` without `SEALED_DATA_OVERWRITE_PREV=1`)
+  or `keep` (leave it; the new build runs with workspaces on the scratch disk).
+- A miner hotel keeps its guest-internal API key on the volume, so workspace
+  owners (a hash of that key) are the same after a restart.
+- The `/v1/workspaces` answer carries `persistent` on a sealed hotel: false when
+  the volume did not open, so a customer sees that a restart would drop it.
 
 ## What the measurement covers
 
@@ -60,6 +97,9 @@ Inside the guest, `sealed-hotel.service` runs at every boot:
 | Debug access | Yes | `cathedral.debug=0/1` in the command line |
 | Files the kit downloads at boot (gVisor, uv, Python, Caddy, the pinned API wheel set) | No, but pinned | The installer refuses a file whose sha256 or sha512 differs from `versions.lock` and `requirements.lock`, which are in the measured initrd |
 | Room images (for example `alpine:3.20`) | No | Pulled at create. The receipt records the image reference and the image id |
+| Hotel name | No | QEMU fw_cfg `opt/cathedral/hotel-name`, checked against `^[a-z0-9][a-z0-9-]{0,58}$`; the guest refuses to start without it. The receipts front puts it in the attested binding (REPORT_DATA covers the binding). Two hotels of one build share one measurement |
+| Host IP, guest IP, guest MAC | Yes | `SEALED_HOST_IP` / `SEALED_GUEST_IP` / `SEALED_GUEST_MAC` in `sealed.env`, default 10.215.0.1, 10.215.0.2, 52:54:00:5e:a1:ed (`guest-constants.sh`). One /30 per guest, so several guests fit one host; the installer refuses a /30 another interface or sealed hotel on the host uses, and a move of a running guest's link. A hotel with its own values has its own measurement, the same at every rebuild of one kit; `manifest.json` names the IP pair (`link`) when it is not the default. Hotels on the defaults share one measurement per build |
+| DNS | Yes, as an image constant | `guest-constants.sh`; the same on every host, not read from `sealed.env` |
 | Hotel API key | No | Config hotel: fw_cfg. It authenticates the broker. The host gives it, so the host can call the API too; each create, exec, process start, network change and delete gets a receipt. Miner hotel: never from the host (see "Miner hotel") |
 | Miner hotel settings (`ROOM_MINER`, TLS port, install signers) | Yes | In the guest `room.env`, and the HTTPS port rule in the guest firewall; only when `SEALED_MINER=1` |
 | HOST_DATA | No (host chooses it at launch; the chip signs it and nobody can change it after) | Shared machine: the sha256 of `manifest.json`, so a report names the build it claims. Dedicated machine: also the owner key (see "Dedicated machine") |
@@ -69,7 +109,9 @@ Inside the guest, `sealed-hotel.service` runs at every boot:
 
 - It cannot read room memory or the receipt key. SEV-SNP encrypts guest memory.
 - It cannot read room data on disk. The scratch disk is encrypted with a key
-  from inside the guest.
+  from inside the guest, made at each boot. The data volume is encrypted with
+  a key that only this build on this chip can make; the host holds only
+  ciphertext and the LUKS2 header.
 - It cannot log in. A production build has no SSH, no console login and no
   getty. `cathedral.debug=1` (a debug build) adds root SSH from the host on
   the tap link, and the measurement shows it.
@@ -89,7 +131,8 @@ keeps the key and the traffic from the host; see "Miner hotel"):
   start a room or an image build that the owner did not sign (see below).
 
 The host still controls availability: it can stop the guest, drop the
-network, or refuse the scratch disk.
+network, or refuse the scratch disk. It can also delete, corrupt or roll back
+the data disk: XTS has no integrity and the volume has no freshness check.
 
 ## Dedicated machine (one owner)
 
@@ -217,8 +260,9 @@ The broker admits the machine only if its HOST_DATA is in `sealed_host_data`
   HOST_DATA, kernel command line, kit and API commits.
 - It asks the AMD secure processor for a report with
   `REPORT_DATA = sha256(canonical(binding)) || 32 zero bytes`.
-- For each create, exec, background process start, delete and network
-  policy switch, it signs a statement. The statement has the same core fields as the staging lane:
+- For each create, exec, background process start, delete, network
+  policy switch, file read/write (`GET`/`PUT` …/files), tar read/write (`GET`/`PUT` …/tar), background
+  process stop, snapshot, freeze, thaw and expose, it signs a statement. The statement has the same core fields as the staging lane:
   `operation_id`, `action`, `target`, `customer_request_sha256`,
   `command_sha256`, `result_sha256`, `sequence`, `previous_receipt_sha256`,
   `issued_at`. It adds `hotel`, `sandbox_id`, `image`, `image_digest`,
@@ -431,15 +475,33 @@ attestation and the install key, and checks:
 With a saved attestation, use `--tls-spki-sha256 <peer SPKI sha256>`, or
 `--require-tls` to fail a binding that names no TLS key.
 
-### Still open (broker)
+### Config hotel on guest TLS (AB#378)
 
-- **TLS pin.** The broker must reach miner hotels over HTTPS pinned to the
-  attested `tls_spki_sha256`, check it on every connection, refuse `http://`
-  miner APIs, and re-admit the hotel when the binding changes. Until then,
-  #365 refuses scoped miner joins with `guest_tls_required` before it sends
-  the key.
-- **Admission checks.** For miner hotels, the broker's admission must require
-  `tls_spki_sha256` and `hotel_key_source: "install"`, and pass
+Nothing in this mode is miner specific: `ROOM_MINER=1` turns on the guest TLS
+key, the install key and the installed hotel key. A config (operator) hotel
+uses it to keep the hotel key off the host too:
+
+1. Build and install with `SEALED_MINER=1` and
+   `SEALED_HOTEL_KEY_INSTALL_SIGNERS`; no `SEALED_API_KEY_FILE`. The host
+   never holds the hotel key, and a key in fw_cfg is ignored.
+2. In the broker config entry set `"sealed": true, "guest_tls": true` and
+   point `api` and `health` at the guest's `https://` port. The broker pins
+   the attested key (`broker/README.md`, "Guest TLS for config hotels").
+3. Install the hotel key the broker's `key_file` holds with
+   `POST /room/hotel-key`, signed by an install signer, after every boot.
+4. `install-sealed.sh` cannot count rooms (no key on the host): drain the
+   hotel before a restart and set `SEALED_RESTART_WITH_ROOMS=1`.
+
+### Still open
+
+- **Installer for config hotels.** Who signs the `POST /room/hotel-key`
+  envelope for a config hotel (the control plane, as for miners in #1588, or
+  an ops tool beside the broker key file) is not decided.
+- **fw_cfg hotel key.** The config-hotel path that reads the hotel key from
+  fw_cfg (`guest-boot.sh`, `launch-guest.sh`, `install-sealed.sh`) goes once
+  every config hotel runs guest TLS. It is a measured change: a re-seal.
+- **`amd_verifier` TLS flag.** The broker checks `tls_spki_sha256` and
+  `hotel_key_source` itself (`verifyMinerTLSBinding`); it does not yet pass
   `--tls-spki-sha256 <peer>` to the `amd_verifier` command.
 - **`admission_policy`.** The broker must report it in operator capacity
   (#1588 checklist).
@@ -451,7 +513,7 @@ sudo systemctl disable --now room-sealed-<name>-net.timer # or it puts the host 
 sudo systemctl disable --now room-sealed-<name>.service   # stops the guest, removes the host link rules
 sudo rm -f /etc/systemd/system/room-sealed-<name>.service /etc/systemd/system/room-sealed-<name>-net.{service,timer}
 sudo systemctl daemon-reload
-sudo rm -rf $SEALED_DIR                                    # images, scratch disk, venv
+sudo rm -rf $SEALED_DIR                                    # images, scratch and data disks, venv
 ```
 
 Remove the hotel from the broker config. The apt packages stay.

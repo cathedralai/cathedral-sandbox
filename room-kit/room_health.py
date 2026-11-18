@@ -3,7 +3,8 @@
 
 GET /room/health (Bearer = the room API key) returns:
 room id, API profile, runtime, kernel isolation proof, machine summary,
-slots, sandboxes running, free slots, live host memory and disk use.
+slots, sandboxes running, free slots, live host memory and disk use, and on a
+sealed guest with a persistent data volume where workspaces live now.
 
 The server binds 127.0.0.1 only. Caddy exposes it on 443 at /room/health.
 `room_health.py --once` prints the same JSON and exits (a CLI health command).
@@ -34,6 +35,8 @@ _live: dict = {"cpu_pct": None, "containers": None, "containers_at": None}
 # sends these bytes, so the answer stays fast when the host CPU is full.
 _doc: dict = {"body": None, "at": 0.0}
 _files: dict = {}  # path -> (mtime, parsed); room.env, machine.json and size.json change only on install
+# Written once per boot by the sealed guest's sealed-data.sh (sealed/README.md).
+SEALED_DATA_STATUS = Path(os.environ.get("ROOM_SEALED_DATA_STATUS", "/run/sealed-data.status"))
 
 
 def run(argv: list[str], timeout: float = 60) -> tuple[int, str]:
@@ -119,6 +122,22 @@ def _parse_env(text: str) -> dict:
     return {k: v.strip().strip('"') for k, v in env.items()}
 
 
+def workspaces_storage(env: dict, status: Path | None = None) -> dict | None:
+    """Sealed data volume state, when the build has one (ROOM_WORKSPACES_SOURCE).
+
+    persistent false: the volume is not open (locked, absent, ...), so this
+    boot keeps workspaces on the scratch disk and they end at the next boot.
+    """
+    if env.get("ROOM_WORKSPACES") != "1" or not env.get("ROOM_WORKSPACES_SOURCE"):
+        return None
+    path = SEALED_DATA_STATUS if status is None else status
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {"state": "unknown", "persistent": False, "key_id": None, "detail": f"no readable {path}"}
+    return {k: doc.get(k) for k in ("state", "persistent", "key_id", "detail")}
+
+
 def document() -> dict:
     env = _cached(ETC / "room.env", _parse_env)
     machine = _cached(ETC / "machine.json", json.loads)
@@ -164,6 +183,7 @@ def document() -> dict:
             "room_data_used_pct": round(100 * du.used / du.total, 1),
             "host_root_used_pct": round(100 * root.used / root.total, 1),
         },
+        "workspaces_storage": workspaces_storage(env),
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 

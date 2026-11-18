@@ -1,0 +1,11 @@
+{
+  "args": [
+    "hi"
+  ],
+  "env": {
+    "LFM3_WAIT": "1"
+  },
+  "server_down": true,
+  "exit": 1,
+  "replies": []
+}
