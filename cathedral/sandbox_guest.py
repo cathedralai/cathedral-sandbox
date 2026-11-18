@@ -1539,6 +1539,9 @@ class DockerGuestProvider:
         self._reconcile_pending: dict[str, str | None] = {}
         self._reconcile_failures: dict[str, int] = {}
         self._reconciling: set[str] = set()
+        # Rooms whose container a reconcile or a thaw found exited, dead or gone: GET says "failed" from
+        # then on, never what the customer last asked for.
+        self._ended_rooms: set[str] = set()
         self._lifecycle_locks: dict[str, threading.Lock] = {}
         self._snapshot_meta: dict[str, dict[str, Any]] = {}  # snapshot id -> sizes and image
         self._snapshot_owners: dict[str, str] = {}  # snapshot id -> owner_id (AB#650)
@@ -3020,6 +3023,15 @@ class DockerGuestProvider:
             self._reconcile_failures[sandbox_id] = self._reconcile_failures.get(sandbox_id, 0) + 1
             return self._reconcile_failures[sandbox_id]
 
+    _ENDED = ("gone", "exited", "dead")
+
+    def _note_ended(self, sandbox_id: str) -> None:
+        """The engine says the room's container is not there to run: no reconcile is owed, and GET says failed."""
+        with self._inner._lock:  # noqa: SLF001
+            self._reconcile_pending.pop(sandbox_id, None)
+            self._reconcile_failures.pop(sandbox_id, None)
+            self._ended_rooms.add(sandbox_id)
+
     def _clear_mark(self, sandbox_id: str) -> None:
         with self._inner._lock:  # noqa: SLF001
             self._reconcile_pending.pop(sandbox_id, None)
@@ -3041,8 +3053,8 @@ class DockerGuestProvider:
         state = self._read_state(guest)
         if state is None:
             raise SandboxOpError("reconcile_unreadable", 503, f"cannot read the state of room {sandbox_id}", retry_after=5)
-        if state in ("gone", "exited", "dead"):
-            self._clear_mark(sandbox_id)  # nothing left to pause or unpause
+        if state in self._ENDED:
+            self._note_ended(sandbox_id)  # nothing left to pause or unpause
             return
         paused = state == "paused"
         desired_frozen = self._inner.is_frozen(sandbox_id)
@@ -3281,6 +3293,17 @@ class DockerGuestProvider:
                         # Not certain, so the record keeps saying what the customer last asked for.
                         self._note_uncertain(sandbox_id, guest, "unpause", exc)
                         raise
+                    # Docker says "is not paused" for a stopped container too: read the engine before
+                    # calling the room running.
+                    state = self._read_state(guest)
+                    if state is None:
+                        self._note_uncertain(sandbox_id, guest, "unpause", exc)
+                        raise
+                    if state in self._ENDED:
+                        self._note_ended(sandbox_id)
+                        raise SandboxOpError(
+                            "sandbox_not_running", 409, f"sandbox {sandbox_id} has stopped and cannot be thawed"
+                        ) from exc
             doc = self._inner.thaw(sandbox_id, admitted=True)
             self._clear_mark(sandbox_id)
             return doc
@@ -3294,6 +3317,8 @@ class DockerGuestProvider:
         provider alone when a labeled container may still be running.
         """
         guest = self._guests.get(sandbox_id)
+        with self._inner._lock:  # noqa: SLF001
+            self._ended_rooms.discard(sandbox_id)
         if guest is not None:
             for process_id in list(guest.guest_processes):
                 try:
@@ -3703,6 +3728,9 @@ class DockerGuestProvider:
         doc = self._with_tunables(self._inner.get(sandbox_id))
         with self._inner._lock:  # noqa: SLF001
             marked = sandbox_id in self._reconcile_pending
+            ended = sandbox_id in self._ended_rooms
+        if ended:
+            return {**doc, "state": "failed"}
         if marked:
             # A room marked for reconcile reports what the engine says now, not what was asked for and
             # not a status read earlier. Unreadable is an error, never a guess; a container that is not
