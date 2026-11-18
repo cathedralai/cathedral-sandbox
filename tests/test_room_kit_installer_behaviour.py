@@ -953,6 +953,43 @@ def test_host_net_miner_with_ingress_keeps_both_ways_in(host: FakeHost) -> None:
     assert INGRESS_DNAT in ipt and any("--dport 9443" in c and "PREROUTING" in c for c in ipt)
 
 
+# What `iptables -t nat -S` prints for the ingress forward an earlier `up` made.
+STALE_INGRESS = ('-A PREROUTING -p tcp -m tcp --dport 443 -m addrtype --dst-type LOCAL -m comment '
+                 '--comment "sealed-hotel:sealed-1" -j DNAT --to-destination 10.215.0.2:8443')
+STALE_INGRESS_DELETE = ("iptables -t nat -D PREROUTING -p tcp -m tcp --dport 443 -m addrtype --dst-type LOCAL "
+                        "-m comment --comment sealed-hotel:sealed-1 -j DNAT --to-destination 10.215.0.2:8443")
+OTHER_DNAT = '-A PREROUTING -p tcp -m tcp --dport 80 -m comment --comment "someone else" -j DNAT --to-destination 10.0.0.9:80'
+
+
+def test_host_net_down_removes_the_ingress_forward_after_the_flag_is_turned_off(host: FakeHost) -> None:
+    proc = _run_host_net(host, "up", INGRESS)
+    assert proc.returncode == 0 and INGRESS_DNAT in host.calls("iptables")
+    # sealed.env edited to ingress off, then down: the forward made by up must still go.
+    proc = _run_host_net(host, "down", None, FAKE_IPTABLES_TAGGED_nat=STALE_INGRESS + "\n" + OTHER_DNAT)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    ipt = host.calls("iptables")
+    assert STALE_INGRESS_DELETE in ipt
+    assert not [c for c in ipt if "someone else" in c and " -D " in c], "another owner's rule was deleted"
+
+
+def test_host_net_check_and_up_drop_a_forward_the_config_no_longer_wants(host: FakeHost) -> None:
+    # Ingress off now, but the old 443 forward is still on the host: check must not call that healthy.
+    proc = _run_host_net(host, "check", None, FAKE_IPTABLES_RULES="present", FAKE_IPTABLES_TAGGED_nat=STALE_INGRESS)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert "were missing; restoring" in proc.stderr
+    assert STALE_INGRESS_DELETE in host.calls("iptables")
+    assert not [c for c in host.calls("iptables") if " -A PREROUTING" in c]
+
+
+def test_host_net_up_replaces_a_forward_whose_public_port_was_edited(host: FakeHost) -> None:
+    proc = _run_host_net(host, "up", {**INGRESS, "SEALED_INGRESS_PUBLIC_PORT": "8444"}, FAKE_IPTABLES_TAGGED_nat=STALE_INGRESS)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    ipt = host.calls("iptables")
+    added = INGRESS_DNAT.replace("--dport 443", "--dport 8444")
+    assert STALE_INGRESS_DELETE in ipt and added in ipt
+    assert ipt.index(STALE_INGRESS_DELETE) < ipt.index(added)
+
+
 def test_host_net_ingress_refuses_clashing_ports_but_down_still_runs(host: FakeHost) -> None:
     for bad in ({"SEALED_INGRESS_TLS_PORT": "18090"}, {"SEALED_INGRESS_TLS_PORT": "70000"},
                 {"SEALED_INGRESS_PUBLIC_PORT": "0"}, {**MINER, "SEALED_INGRESS_PUBLIC_PORT": "9443"},

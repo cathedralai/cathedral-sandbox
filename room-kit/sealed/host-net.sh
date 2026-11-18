@@ -34,6 +34,19 @@ RULES=5
 [ "$MINER" = 1 ] && RULES=$((RULES + 2))
 [ "$INGRESS" = 1 ] && RULES=$((RULES + 2))
 
+# Every PREROUTING rule this hotel owns carries $TAG. Find them by tag, not by the
+# current flags and ports: sealed.env may have changed since "up" (ingress
+# turned off, a public port edited), and the old forward must still go.
+tagged_dnat() { { iptables -t nat -S 2>/dev/null | grep -F -- "--comment \"$TAG\"" | grep -- '^-A PREROUTING ' || true; }; }
+purge_dnat() {
+  tagged_dnat | sed 's/^-A /-D /' | while read -r rule; do
+    eval "iptables -t nat $rule" 2>/dev/null || true
+  done
+}
+WANT_DNAT=0
+[ "$MINER" = 1 ] && WANT_DNAT=$((WANT_DNAT + 1))
+[ "$INGRESS" = 1 ] && WANT_DNAT=$((WANT_DNAT + 1))
+
 port_ok() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$1" -le 65535 ]; }
 if [ "$INGRESS" = 1 ] && [ "${1:-}" != down ]; then
   # Checked on up and check only: a bad edit must not keep "down" from removing rules.
@@ -78,6 +91,7 @@ up)
   iptables -C INPUT -m comment --comment "$TAG" -j "$IN" 2>/dev/null || iptables -I INPUT 1 -m comment --comment "$TAG" -j "$IN"
   iptables -t nat -C POSTROUTING -s "$SEALED_GUEST_IP/32" ! -o "$TAP" -m comment --comment "$TAG" -j MASQUERADE 2>/dev/null \
     || iptables -t nat -A POSTROUTING -s "$SEALED_GUEST_IP/32" ! -o "$TAP" -m comment --comment "$TAG" -j MASQUERADE
+  purge_dnat  # drop forwards a previous config left (feature off, port edited) before adding the current ones
   if [ "$MINER" = 1 ]; then
     iptables -t nat -C PREROUTING "${DNAT[@]}" 2>/dev/null || iptables -t nat -A PREROUTING "${DNAT[@]}"
   fi
@@ -92,6 +106,7 @@ check)
      && iptables -t nat -C POSTROUTING -s "$SEALED_GUEST_IP/32" ! -o "$TAP" -m comment --comment "$TAG" -j MASQUERADE 2>/dev/null \
      && { [ "$MINER" != 1 ] || iptables -t nat -C PREROUTING "${DNAT[@]}" 2>/dev/null; } \
      && { [ "$INGRESS" != 1 ] || iptables -t nat -C PREROUTING "${INGRESS_DNAT[@]}" 2>/dev/null; } \
+     && [ "$(tagged_dnat | grep -c -- '-A')" = "$WANT_DNAT" ] \
      && [ "$(iptables -S "$FWD" 2>/dev/null | grep -c -- '-A')" -ge "$RULES" ]; then
     exit 0
   fi
@@ -108,6 +123,7 @@ down)
   if [ "$INGRESS" = 1 ]; then
     iptables -t nat -D PREROUTING "${INGRESS_DNAT[@]}" 2>/dev/null || true
   fi
+  purge_dnat  # whatever the flags say now
   iptables -F "$FWD" 2>/dev/null && iptables -X "$FWD" 2>/dev/null || true
   iptables -F "$IN" 2>/dev/null && iptables -X "$IN" 2>/dev/null || true
   ip link del "$TAP" 2>/dev/null || true
