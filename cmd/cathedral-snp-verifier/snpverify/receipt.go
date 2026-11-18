@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -81,8 +82,10 @@ func validateReceipt(rc Receipt) error {
 			return fail(CodeReceiptMalformed, "statement %s must be %s", f.key, f.kind.describe())
 		}
 	}
-	return nil
+	return checkSnapshotShapes(st, fmt.Sprintf("receipt %d", mustSequence(st)))
 }
+
+func mustSequence(st map[string]any) int64 { n, _ := sequenceOf(st); return n }
 
 type fieldKind int
 
@@ -158,46 +161,56 @@ func DecodeReceiptHeader(b64 string) (Receipt, error) {
 // filtered chain has gaps by design); it is empty otherwise. A "head" or
 // "filtered" of the wrong type is an error, never a skipped check.
 func ParseReceipts(data []byte) (receipts []Receipt, head string, err error) {
+	receipts, head, _, err = ParseReceiptsDocument(data)
+	return receipts, head, err
+}
+
+// ParseReceiptsDocument is ParseReceipts that also returns the document's count and
+// room_head when it is an object, for the per-room list checks (nil for a plain list).
+func ParseReceiptsDocument(data []byte) (receipts []Receipt, head string, list *ListDoc, err error) {
 	v, err := ParseKeepingNumbers(data)
 	if err != nil {
-		return nil, "", fail(CodeBadInput, "receipts: %v", err)
+		return nil, "", nil, fail(CodeBadInput, "receipts: %v", err)
 	}
-	var list []any
+	var listItems []any
 	switch d := v.(type) {
 	case map[string]any:
 		l, ok := d["receipts"].([]any)
 		if !ok {
-			return nil, "", fail(CodeReceiptMalformed, "receipts document has no receipts list")
+			return nil, "", nil, fail(CodeReceiptMalformed, "receipts document has no receipts list")
 		}
-		list = l
+		listItems = l
+		list = &ListDoc{}
+		list.Count, list.HasCount = d["count"]
+		list.RoomHead, list.HasRoomHead = d["room_head"]
 		filtered := false
 		if raw, present := d["filtered"]; present {
 			if filtered, ok = raw.(bool); !ok {
-				return nil, "", fail(CodeReceiptMalformed, "receipts document filtered is not a boolean")
+				return nil, "", nil, fail(CodeReceiptMalformed, "receipts document filtered is not a boolean")
 			}
 		}
 		if raw, present := d["head"]; present {
 			h, ok := raw.(string)
 			if !ok || h == "" {
-				return nil, "", fail(CodeReceiptMalformed, "receipts document head is not a non-empty string")
+				return nil, "", nil, fail(CodeReceiptMalformed, "receipts document head is not a non-empty string")
 			}
 			if !filtered {
 				head = h
 			}
 		}
 	case []any:
-		list = d
+		listItems = d
 	default:
-		return nil, "", fail(CodeReceiptMalformed, "receipts document is neither an object nor a list")
+		return nil, "", nil, fail(CodeReceiptMalformed, "receipts document is neither an object nor a list")
 	}
-	for _, e := range list {
+	for _, e := range listItems {
 		rc, err := receiptFromValue(e)
 		if err != nil {
-			return nil, "", err
+			return nil, "", nil, err
 		}
 		receipts = append(receipts, rc)
 	}
-	return receipts, head, nil
+	return receipts, head, list, nil
 }
 
 func sequenceOf(st map[string]any) (int64, bool) {

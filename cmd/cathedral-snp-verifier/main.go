@@ -135,12 +135,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	var receipts []snpverify.Receipt
 	docHead := ""
+	var listDoc *snpverify.ListDoc
 	if *recFile != "" {
 		recData, err := read(*recFile)
 		if err != nil {
 			return failed(err)
 		}
-		if receipts, docHead, err = snpverify.ParseReceipts(recData); err != nil {
+		if receipts, docHead, listDoc, err = snpverify.ParseReceiptsDocument(recData); err != nil {
 			return failed(err)
 		}
 	}
@@ -157,10 +158,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		wantHead = docHead
 	}
 
-	all, err := snpverify.VerifyAll(att, receipts, wantHead, snpverify.Options{
+	all, err := snpverify.VerifyAllWithList(att, receipts, wantHead, snpverify.Options{
 		ExpectedMeasurements: measurements, RequireMeasurement: *requireMeasurement, Product: *product,
 		ARK: ark, ASK: ask, VCEK: vcek, ARKPins: pins,
-	})
+	}, listDoc)
 	if err != nil {
 		return failed(err)
 	}
@@ -168,6 +169,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	checked := "each receipt; not that none are missing"
 	if wantHead != "" {
 		checked = "whole chain to the head the server named"
+	}
+	for _, c := range all.Checked {
+		checked += "; " + c
 	}
 	n := chain.Receipts
 	measChecked, recChecked := len(measurements) > 0, len(receipts) > 0

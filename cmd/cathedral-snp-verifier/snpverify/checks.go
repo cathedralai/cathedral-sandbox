@@ -19,6 +19,8 @@ type AllResult struct {
 	PolicyTimeline map[string][]PolicyEvent `json:"policy_timeline"`
 	RoomTunables   map[string]string        `json:"room_tunables"`
 	RoomLinks      map[string]string        `json:"room_links"`
+	// Checked names the optional checks that found something to check in this list.
+	Checked []string `json:"-"`
 }
 
 // PolicyEvent is one signed policy event of a room, in chain order.
@@ -36,6 +38,12 @@ type PolicyEvent struct {
 // attestation, guest TLS fields, receipts, network policy, tunables, sandbox
 // links. Call this, not the parts, so no check is forgotten.
 func VerifyAll(att Attestation, receipts []Receipt, head string, opts Options) (AllResult, error) {
+	return VerifyAllWithList(att, receipts, head, opts, nil)
+}
+
+// VerifyAllWithList is VerifyAll for a receipts document that is an object: list is
+// its count and room_head, which the per-room checks compare with the receipts.
+func VerifyAllWithList(att Attestation, receipts []Receipt, head string, opts Options, list *ListDoc) (AllResult, error) {
 	var out AllResult
 	var err error
 	if out.Attestation, err = VerifyAttestation(att, opts); err != nil {
@@ -44,7 +52,21 @@ func VerifyAll(att Attestation, receipts []Receipt, head string, opts Options) (
 	if err = verifyGuestTLS(att); err != nil {
 		return out, err
 	}
+	if err = verifyGuestIngress(att); err != nil {
+		return out, err
+	}
 	if out.Chain, err = VerifyReceipts(att, receipts, head); err != nil {
+		return out, err
+	}
+	if err = checkSnapshotEdges(receipts); err != nil {
+		return out, err
+	}
+	numbered, err := checkRoomNumbering(receipts, list)
+	if err != nil {
+		return out, err
+	}
+	poolLinks, pools, err := checkPoolRooms(receipts)
+	if err != nil {
 		return out, err
 	}
 	if out.PolicyTimeline, err = policyTimeline(receipts); err != nil {
@@ -55,6 +77,15 @@ func VerifyAll(att Attestation, receipts []Receipt, head string, opts Options) (
 	}
 	if out.RoomLinks, err = roomLinks(receipts); err != nil {
 		return out, err
+	}
+	for room, link := range poolLinks { // a pre-made room is linked by its claim
+		out.RoomLinks[room] = link
+	}
+	if numbered > 0 {
+		out.Checked = append(out.Checked, "each numbered room: its receipts run 1 to n with no gap and every link right")
+	}
+	if pools > 0 {
+		out.Checked = append(out.Checked, "pool rooms: each claim is receipt 2 of its room and names the create it was made from")
 	}
 	return out, nil
 }
@@ -93,30 +124,48 @@ func policyTimeline(receipts []Receipt) (map[string][]PolicyEvent, error) {
 		}
 		seq, _ := sequenceOf(st)
 		action, _ := st["action"].(string)
-		issued, hasIssued := st["issued_at"]
-		status, hasStatus := st["status"]
-		if policy := st["network_policy"]; policy != nil {
-			sum, err := sha256Canonical(policy)
-			if err != nil {
-				return nil, fail(CodeNetworkPolicyMismatch, "receipt %d: network_policy: %v", seq, err)
-			}
-			if stored, _ := st["network_policy_sha256"].(string); stored != sum {
-				return nil, fail(CodeNetworkPolicyMismatch, "receipt %d: network_policy_sha256 does not match the policy", seq)
-			}
-			obj := policy.(map[string]any) // an object, by the receipt type rules
-			mode, hasMode := obj["mode"]
-			allow, hasAllow := obj["allow"]
-			if !hasIssued || !hasStatus || !hasMode || !hasAllow {
-				return nil, fail(CodeNetworkPolicyMismatch, "receipt %d: policy event is missing issued_at, status, mode or allow", seq)
-			}
-			out[room] = append(out[room], PolicyEvent{Sequence: seq, IssuedAt: issued, Action: action, Status: status,
-				Mode: mode, Allow: allow, PolicySHA256: sum})
-		} else if _, known := out[room]; known && action == "delete" {
-			if !hasIssued || !hasStatus {
-				return nil, fail(CodeNetworkPolicyMismatch, "receipt %d: delete event is missing issued_at or status", seq)
-			}
-			out[room] = append(out[room], PolicyEvent{Sequence: seq, IssuedAt: issued, Action: "delete", Status: status})
+		issued := st["issued_at"]
+		status := st["status"]
+		policy := st["network_policy"]
+		_, known := out[room]
+		if policy == nil && !(known && action == "delete") {
+			continue
 		}
+		// Python needs both to be integers (not null) before it reads either event.
+		if !isInt64(issued) {
+			return nil, fail(CodeNetworkPolicyMismatch, "receipt %d: issued_at is not an integer", seq)
+		}
+		if !isInt64(status) {
+			return nil, fail(CodeNetworkPolicyMismatch, "receipt %d: status is not an integer", seq)
+		}
+		if policy == nil {
+			out[room] = append(out[room], PolicyEvent{Sequence: seq, IssuedAt: issued, Action: "delete", Status: status})
+			continue
+		}
+		obj := policy.(map[string]any) // an object, by the receipt type rules
+		mode, hasMode := obj["mode"]
+		allow, hasAllow := obj["allow"]
+		if !hasMode {
+			return nil, fail(CodeNetworkPolicyMismatch, "receipt %d: network_policy has no mode", seq)
+		}
+		if !hasAllow {
+			return nil, fail(CodeNetworkPolicyMismatch, "receipt %d: network_policy has no allow", seq)
+		}
+		if _, ok := mode.(string); !ok {
+			return nil, fail(CodeNetworkPolicyMismatch, "receipt %d: network_policy mode is not a string", seq)
+		}
+		if _, ok := allow.([]any); !ok {
+			return nil, fail(CodeNetworkPolicyMismatch, "receipt %d: network_policy allow is not a list", seq)
+		}
+		sum, err := sha256Canonical(policy)
+		if err != nil {
+			return nil, fail(CodeNetworkPolicyMismatch, "receipt %d: network_policy: %v", seq, err)
+		}
+		if stored, _ := st["network_policy_sha256"].(string); stored != sum {
+			return nil, fail(CodeNetworkPolicyMismatch, "receipt %d: network_policy_sha256 does not match the policy", seq)
+		}
+		out[room] = append(out[room], PolicyEvent{Sequence: seq, IssuedAt: issued, Action: action, Status: status,
+			Mode: mode, Allow: allow, PolicySHA256: sum})
 	}
 	return out, nil
 }
@@ -220,6 +269,24 @@ func isHex64Lower(s string) bool {
 		}
 	}
 	return true
+}
+
+// verifyGuestIngress is verify_guest_ingress(att) with its defaults: a binding with no
+// guest_ingress passes; one that names it must be a cathedral_guest_ingress_v1 object
+// with a 64 lower-case hex TLS key (AB#422).
+func verifyGuestIngress(att Attestation) error {
+	ingress := att.Binding["guest_ingress"]
+	if ingress == nil {
+		return nil
+	}
+	obj, ok := ingress.(map[string]any)
+	if !ok || obj["schema"] != "cathedral_guest_ingress_v1" {
+		return fail(CodeGuestTLSMalformed, "binding guest_ingress is not a cathedral_guest_ingress_v1 object")
+	}
+	if tls, ok := obj["tls_spki_sha256"].(string); !ok || !isHex64Lower(tls) {
+		return fail(CodeGuestTLSMalformed, "binding guest_ingress.tls_spki_sha256 is not 64 lower-case hex")
+	}
+	return nil
 }
 
 // verifyGuestTLS is verify_guest_tls(att) with its defaults (no peer SPKI, not
