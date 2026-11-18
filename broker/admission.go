@@ -314,7 +314,10 @@ func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, err
 	known := h.adm.amd != nil && h.adm.amdBinding == res.bindingSHA
 	prev := h.adm.amd
 	b.mu.Unlock()
-	if !known {
+	// With a firmware floor, the check reads TCB bytes from this exact report.
+	// A binding can stay unchanged across reports, so the binding-keyed AMD
+	// cache cannot authenticate those bytes or the report signature.
+	if !known || b.cfg.MinGenoaSNPSPL > 0 {
 		if prev, err = b.verifyAMDChain(ctx, raw); err != nil {
 			return admission{}, err
 		}
