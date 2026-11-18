@@ -1,0 +1,66 @@
+{
+ "attestation": {
+  "level": "hotel",
+  "binding_sha256": "e15a571b541f506c3b6d6534a0b7772b1971c4eb31b1f4d222d383a5027acd2b",
+  "hotel": "h1"
+ },
+ "chain": {
+  "receipts": 5,
+  "signatures_ok": 5,
+  "links_checked": 5,
+  "contiguous": true,
+  "first": 1,
+  "last": 5,
+  "actions": {
+   "create": 2,
+   "exec": 1,
+   "network_set": 1,
+   "delete": 1
+  }
+ },
+ "policy_timeline": {
+  "r1": [
+   {
+    "sequence": 1,
+    "issued_at": 1700000001,
+    "action": "create",
+    "status": 202,
+    "mode": "deny_all",
+    "allow": [],
+    "policy_sha256": "b1dad3cb08025f5fd7a1c2419631a24729952344bc0d9cc898afa04e92415f68"
+   },
+   {
+    "sequence": 5,
+    "issued_at": 1700000005,
+    "action": "delete",
+    "status": 200
+   }
+  ],
+  "r2": [
+   {
+    "sequence": 2,
+    "issued_at": 1700000002,
+    "action": "create",
+    "status": 202,
+    "mode": "allowlist",
+    "allow": [
+     "example.org"
+    ],
+    "policy_sha256": "6dff0b993512de82e8754ba5c8d53f59f69a170e984a9fbd9345befa20e8272f"
+   },
+   {
+    "sequence": 4,
+    "issued_at": 1700000004,
+    "action": "network_set",
+    "status": 200,
+    "mode": "deny_all",
+    "allow": [],
+    "policy_sha256": "b1dad3cb08025f5fd7a1c2419631a24729952344bc0d9cc898afa04e92415f68"
+   }
+  ]
+ },
+ "room_tunables": {},
+ "room_links": {},
+ "verdict": "PASS",
+ "checked": "whole chain to the head the server named"
+}

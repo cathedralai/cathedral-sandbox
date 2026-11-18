@@ -1,0 +1,24 @@
+{
+ "args": [
+  "--oneshot",
+  "{dir}/bundle.json",
+  "--recipe",
+  "{dir}/recipe.json",
+  "--context",
+  "{dir}/context.json",
+  "--ark-sha256",
+  "2f0cd3780ee3b0ce55c3e76ccd7f23727bca28326bb24cb8b7588ed2f78b3bc5",
+  "--input-sha256",
+  "/work/in/run.py=ad64355106bb158b020ecf9702be48f7730fc091dd4bb6a2f092b40393495b3d",
+  "--input-sha256",
+  "/work/in/data.csv=492d5ea496056f1a6a6592241032fab764c321596317930b4fa0e1e8bc3b7470",
+  "--output-file",
+  "/work/out/result.json={dir}/outputs/result.json"
+ ],
+ "description": "No allowed measurement.",
+ "expect": {
+  "exit_code": 1,
+  "reason": "inputs: run mode needs --expected-measurement or --allowed-measurements",
+  "verdict": "FAIL"
+ }
+}

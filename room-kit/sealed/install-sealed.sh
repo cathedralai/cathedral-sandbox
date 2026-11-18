@@ -36,6 +36,10 @@ fi
 if [ -n "${SEALED_OWNER_PUBKEY_FILE:-}" ]; then
   [ "$(stat -c %s "$SEALED_OWNER_PUBKEY_FILE" 2>/dev/null)" = 32 ] || { echo "SEALED_OWNER_PUBKEY_FILE $SEALED_OWNER_PUBKEY_FILE must hold the 32 raw bytes of an Ed25519 public key" >&2; exit 1; }
 fi
+# Several guests on one host (AB#432): a /30 another interface or hotel uses,
+# or a move of this hotel's link while its guest runs, stops here: before the
+# 10 to 20 minute build and before any installed file changes.
+"$KIT/sealed/host-net.sh" clash "$ENV_FILE" || exit 1
 mkdir -p "$SEALED_DIR/images" "$SEALED_DIR/run"
 FREE_GIB=$(( $(df -B1 --output=avail "$SEALED_DIR" | tail -1) / 1073741824 ))
 HAVE_GIB=0; [ -f "$SEALED_DIR/scratch.raw" ] && HAVE_GIB=$(( $(du -B1 "$SEALED_DIR/scratch.raw" | cut -f1) / 1073741824 ))

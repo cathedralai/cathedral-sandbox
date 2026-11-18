@@ -90,6 +90,7 @@ func joinWithRoom(t *testing.T, tc *testChain, id string, g *rebootingGuest) (*h
 	}); status != 201 {
 		t.Fatalf("join: %d %v", status, doc)
 	}
+	stopSyncLoop(t, tc, id) // goDown ages the hotel: no loop step may land after that
 	syncNow(tc, id)
 	admitNow(t, tc, id)
 	optInMiner(t, tc, "g1")
