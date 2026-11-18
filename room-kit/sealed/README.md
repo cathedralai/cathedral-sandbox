@@ -121,11 +121,11 @@ What the host of a config hotel can do besides availability (a miner hotel
 keeps the key and the traffic from the host; see "Miner hotel"):
 
 - It holds the hotel API key, so it can create rooms, run commands and read
-  files through the API. Create (a fork is a create), exec, process start,
-  network change, delete, bulk delete, file read and write, snapshot and
-  snapshot delete pass the signing front and get a receipt. Tar, stat, wait,
-  process logs and process stop do not: the host can read or plant a file in
-  a room with no receipt.
+  files through the API. Create (a fork is a create), exec, process start
+  and stop, network change, delete, bulk delete, file and tar read and write,
+  freeze, thaw, expose, snapshot and snapshot delete pass the signing front
+  and get a receipt. Stat, wait and process logs do not: the host can read a
+  file's metadata or a process log in a room with no receipt.
 - The broker reaches the API over plain HTTP on the tap link. The host can
   read that traffic (commands, outputs, files) without leaving a receipt.
 - On a dedicated machine the host still holds the hotel key, but it cannot

@@ -2567,7 +2567,14 @@ class Ledger:
             if held is not None and (held["content"] != record["snapshot_content_sha256"]
                                      or held["source"] != record["source"]):
                 return self._sign_locked(refused), False
-            receipt = self._sign_locked(fields)
+            try:
+                receipt = self._sign_locked(fields)
+            except BaseException:
+                # The receipt may be in the chain already (the store write comes last) but is not recorded
+                # here, so a later receipt for this id would not be its first: treat the id as deleted.
+                if held is None:
+                    self.deleted_snapshots.add(record["snapshot_id"])
+                raise
             if held is None:
                 while len(self.snapshots) >= SNAPSHOT_MAP_CAP:
                     # An id lost to the cap is treated as deleted: signing it again would not be its first

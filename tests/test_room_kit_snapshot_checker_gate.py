@@ -8,11 +8,12 @@ fork after the delete must not.
 from __future__ import annotations
 
 import copy
+import json
 import importlib.util
 
 import pytest
 from room_front_support import KIT, Front, receipt_of, rr
-from test_room_kit_signed_snapshots import SNAP, content_sha, fork, room, snapshot_delete, snapshot_ok
+from test_room_kit_signed_snapshots import SNAP, content_sha, fork, room, snapshot, snapshot_delete, snapshot_ok
 
 _spec = importlib.util.spec_from_file_location("verify_receipts_snapshot_gate", KIT / "verify_receipts.py")
 vr = importlib.util.module_from_spec(_spec)
@@ -85,3 +86,35 @@ def test_a_fork_re_signed_after_the_delete_is_refused_by_the_checker(front) -> N
     vr.verify_receipts(front.ledger.attestation(), forged)  # the signatures and the chain are good
     with pytest.raises(vr.Fail, match="deleted before it"):
         vr.check_snapshot_edges(forged)
+
+
+def test_a_snapshot_whose_receipt_write_failed_is_never_signed_again_and_the_chain_passes(front) -> None:
+    # The receipt is in the chain before its disk write. If that write fails, the front does not hold the
+    # snapshot, so a repeat would be signed as if it were the first: the id is treated as deleted instead.
+    a = room(front)
+    real = front.ledger.store
+
+    class FailOnce:
+        def __init__(self) -> None:
+            self.fail = True
+
+        def write(self, data: bytes):
+            if self.fail:
+                self.fail = False
+                raise OSError(28, "No space left on device")
+            return real.write(data)
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    front.ledger.store = FailOnce()
+    status, headers, _out = snapshot(front, a)
+    assert status == 202 and dict(headers).get("X-Room-Receipt-Error") == "OSError"
+    with front.ledger.lock:
+        assert SNAP in front.ledger.deleted_snapshots and SNAP not in front.ledger.snapshots
+    status, headers, out = snapshot(front, a)  # the repeat: the machine's get-or-create answers the same id
+    assert status == 502 and json.loads(out)["error"]["code"] == "snapshot_unsigned"
+    sent = front.api.count(r"POST /v1/sandboxes")
+    assert fork(front)[0] == 404 and front.api.count(r"POST /v1/sandboxes") == sent
+    edges = check(front, chain(front))
+    assert edges["forks"] == []
