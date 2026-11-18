@@ -476,7 +476,7 @@ def test_null_cipher_check_not_run_is_inconclusive_fail(hotel_dir, hotel, capsys
     assert "Result: **FAIL**" in out and "Restore: `" in out
 
 
-@pytest.mark.parametrize("target,state,ok", [("segment", "locked", None), ("segment", "broken", None),
+@pytest.mark.parametrize("target,state,ok", [("segment", "locked", True), ("segment", "broken", False),
                                              ("keyslot", "broken", None), ("keyslot", "tampered", False)])
 def test_null_cipher_other_refusals(hotel_dir, hotel, capsys, target, state, ok):
     env, _ = hotel_dir
@@ -484,6 +484,10 @@ def test_null_cipher_other_refusals(hotel_dir, hotel, capsys, target, state, ok)
     rc, out, _ = run_null(env, hotel, capsys, "--throwaway", "--target", target)
     assert rc == (1 if ok is False else 0), out
     assert ("**FAIL** 8." in out) == (ok is False)
+    if target == "segment" and state == "locked":
+        assert "**PASS** 8." in out and "cryptsetup refused to activate" in out
+    if target == "segment" and state == "broken":
+        assert "INCONCLUSIVE" in out
 
 
 def test_null_cipher_locked_from_another_build_is_inconclusive(hotel_dir, hotel, capsys):

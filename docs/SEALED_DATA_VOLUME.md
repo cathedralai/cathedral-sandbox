@@ -481,7 +481,8 @@ boots, and reads health. Verdicts:
 | State after the boot | Verdict |
 |---|---|
 | `tampered`, persistent false | PASS: `verify_header()` refused the header |
-| `locked` or `broken` | SAFE, `verify_header()` not exercised: cryptsetup refused the edited header itself |
+| `locked`, persistent false | PASS: cryptsetup refused to activate the edited volume |
+| `broken`, persistent false | FAIL, inconclusive: `broken` can also come from a disk read or mount error before cryptsetup evaluates the header |
 | `new`, `open` or `unknown`, or persistent true | FAIL: the guest used the edited volume |
 | `absent`, `nokey` or `error` | FAIL, inconclusive: no data disk, no key, or cryptsetup below the floor, so the edited header was never tried |
 | any state, but the measurement or HOST_DATA changed | FAIL, inconclusive: another build has another key, so `locked` says nothing |

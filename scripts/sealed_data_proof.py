@@ -634,8 +634,10 @@ def finish(r: Report) -> int:
 
 SEGMENT_VERDICT = {
     "tampered": (True, "verify_header refused the edited header"),
-    "locked": (None, "SAFE, verify_header not exercised: cryptsetup refused to activate the edited volume"),
-    "broken": (None, "SAFE, verify_header not exercised: cryptsetup refused to load the edited header"),
+    # cryptsetup refused the edited header — that is the intended AB#735 proof.
+    "locked": (True, "cryptsetup refused to activate the edited volume"),
+    # broken can also come from a disk read / mount error before cryptsetup evaluates the header.
+    "broken": (False, "INCONCLUSIVE: state `broken` does not prove the edited header was refused"),
 }
 # --target keyslot: a null key slot area must never yield the volume key. locked is the expected refusal.
 KEYSLOT_VERDICT = {
