@@ -2097,6 +2097,7 @@ class Ledger:
         # Room id -> receipt_sha256 of its last successful create receipt, until a
         # successful delete of the room is signed (sealed secrets bind to it).
         self.incarnations: dict[str, str] = {}
+        self.lives: dict[str, str] = {}  # room id -> the create receipt that began its current life
         # Serial rooms (all guarded by self.lock). in_flight counts the authorized requests between enter and
         # leave; busy is the per-room token (taken without waiting, so nothing queues and nothing can deadlock),
         # always a subset of the in_flight keys; serial holds the rooms whose create was signed serial; broken the
@@ -2191,6 +2192,11 @@ class Ledger:
                 if st.get("action") == "create" and 200 <= int(st.get("status") or 0) < 300:
                     return self.chain[i]
         return None
+
+    def room_life(self, room: str) -> str | None:
+        """The create receipt that began the room's current life: unchanged by a create answered again."""
+        with self.lock:
+            return self.lives.get(room)
 
     def room_incarnation(self, room: str) -> str | None:
         """receipt_sha256 of the room's last successful create receipt, or None once a delete of it is signed."""
@@ -2338,6 +2344,7 @@ class Ledger:
     def _room_gone(self, room: str) -> None:
         """A signed delete or room_end ends the room's incarnation and every mark kept for it. Caller holds self.lock."""
         self.incarnations.pop(room, None)
+        self.lives.pop(room, None)
         self.serial.discard(room)
         self.broken.discard(room)
         self.pool.pop(room, None)
@@ -2517,6 +2524,11 @@ class Ledger:
             if ok:
                 # The same rule as create_receipt(): the last successful create names the room.
                 if action == "create":
+                    if room not in self.incarnations:
+                        # A new life of the room id: its first create since a signed delete or room_end. A create
+                        # answered again while the room lives is a new incarnation (the sealed stores treat it
+                        # so) but the same life, which is what kept exec results belong to.
+                        self.lives[room] = receipt["receipt_sha256"]
                     self.incarnations[room] = receipt["receipt_sha256"]
                     if statement.get("serial"):
                         self.serial.add(room)
@@ -2679,10 +2691,10 @@ EXEC_RESULT_FRONT_FAILED = b'{"error":{"code":"hotel_api_no_answer","message":"t
 
 
 class _ExecEntry:
-    __slots__ = ("body", "ctype", "done_at", "event", "headers", "incarnation", "status")
+    __slots__ = ("body", "ctype", "done_at", "event", "headers", "life", "status")
 
-    def __init__(self, incarnation: str | None = None):
-        self.incarnation = incarnation  # the incarnation of the room that ran it: only that room is served it
+    def __init__(self, life: str | None = None):
+        self.life = life  # the life of the room that ran it: only that life is served it
         self.event = threading.Event()
         self.done_at: float | None = None
         self.status = 0
@@ -2720,12 +2732,12 @@ class ExecResults:
         return min(done)[1] if done else None
 
     @staticmethod
-    def _mine(e: _ExecEntry, room: str, incarnation_of) -> bool:
-        """The entry belongs to the room's live incarnation. Asked under self.lock (lock order: this store, then the
-        ledger, as for the sealed stores). Without incarnation_of every entry counts."""
-        return incarnation_of is None or e.incarnation == incarnation_of(room)
+    def _mine(e: _ExecEntry, room: str, life_of) -> bool:
+        """The entry belongs to the room's current life. Asked under self.lock (lock order: this store, then the
+        ledger, as for the sealed stores). Without life_of every entry counts."""
+        return life_of is None or e.life == life_of(room)
 
-    def begin(self, room: str, handle: str, incarnation: str | None = None) -> str:
+    def begin(self, room: str, handle: str, life: str | None = None) -> str:
         """'tracked', 'busy' (a running exec holds this handle) or 'full' (run it untracked)."""
         key = (room, handle)
         with self.lock:
@@ -2739,7 +2751,7 @@ class ExecResults:
                 if old is None:
                     return "full"
                 self._drop(old)
-            self.entries[key] = _ExecEntry(incarnation)
+            self.entries[key] = _ExecEntry(life)
             return "tracked"
 
     def finish(self, room: str, handle: str, status: int, headers: dict, body: bytes, ctype: str) -> None:
@@ -2763,41 +2775,41 @@ class ExecResults:
                 self._drop(old)
             e.event.set()
 
-    def get(self, room: str, handle: str, wait: float, incarnation_of=None) -> _ExecEntry | None:
+    def get(self, room: str, handle: str, wait: float, life_of=None) -> _ExecEntry | None:
         key = (room, handle)
         with self.lock:
             self._prune(time.monotonic())
             e = self.entries.get(key)
-            if e is not None and not self._mine(e, room, incarnation_of):
-                e = None  # an earlier incarnation's, or the room has ended: never served
+            if e is not None and not self._mine(e, room, life_of):
+                e = None  # an earlier life's, or the room has ended: never served
         if e is None:
             return None
         if e.done_at is None and wait > 0:
             e.event.wait(wait)
         with self.lock:
-            return e if self.entries.get(key) is e and self._mine(e, room, incarnation_of) else None
+            return e if self.entries.get(key) is e and self._mine(e, room, life_of) else None
 
-    def drop(self, room: str, handle: str, incarnation_of=None) -> str:
+    def drop(self, room: str, handle: str, life_of=None) -> str:
         """'dropped', 'running' (never dropped) or 'unknown'."""
         key = (room, handle)
         with self.lock:
             e = self.entries.get(key)
-            if e is None or not self._mine(e, room, incarnation_of):
+            if e is None or not self._mine(e, room, life_of):
                 return "unknown"
             if e.done_at is None:
                 return "running"
             self._drop(key)
             return "dropped"
 
-    def forget_room(self, room: str, incarnation_of=None) -> None:
+    def forget_room(self, room: str, life_of=None) -> None:
         """An ended room's finished answers go; a running one is stored when it ends and ages out.
 
-        With incarnation_of, the answers of a live incarnation of the room (made again since the delete or
+        With life_of, the answers of a live life of the room (made again since the delete or
         room_end was signed) stay: only the others go."""
         with self.lock:
-            live = incarnation_of(room) if incarnation_of is not None else None
+            live = life_of(room) if life_of is not None else None
             for key in [k for k, e in self.entries.items()
-                        if k[0] == room and e.done_at is not None and (live is None or e.incarnation != live)]:
+                        if k[0] == room and e.done_at is not None and (live is None or e.life != live)]:
                 self._drop(key)
 
 
@@ -2819,7 +2831,7 @@ def retire_room(ledger: "Ledger", room: str, exec_results: "ExecResults | None" 
     if ledger.sealed_env is not None:
         ledger.sealed_env.retire(room, ledger.room_incarnation)
     if exec_results is not None:
-        exec_results.forget_room(room, ledger.room_incarnation)
+        exec_results.forget_room(room, ledger.room_life)
 
 
 def room_of(path: str) -> str | None:
@@ -3221,7 +3233,7 @@ class Handler(BaseHTTPRequestHandler):
             handle = self.headers.get(EXEC_HANDLE_HEADER, "")
             if not EXEC_HANDLE.fullmatch(handle):
                 return self.reply(400, b'{"error":{"code":"invalid_request","message":"X-Room-Exec-Handle must be 32 lowercase hex characters"}}')
-            started = self.server.exec_results.begin(room, handle, ledger.room_incarnation(room))
+            started = self.server.exec_results.begin(room, handle, ledger.room_life(room))
             if started == "busy":
                 # Never replace a running exec's entry: its broker would read another command's answer.
                 return self.reply(409, b'{"error":{"code":"exec_handle_in_use","message":"a running exec holds this handle; nothing was started"}}')
@@ -3293,7 +3305,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(400, b'{"error":{"code":"invalid_request","message":"handle must be 32 lowercase hex characters"}}')
         results: ExecResults = self.server.exec_results
         if self.command == "DELETE":
-            outcome = results.drop(room, handle, self.server.ledger.room_incarnation)
+            outcome = results.drop(room, handle, self.server.ledger.room_life)
             if outcome == "running":
                 return self.reply(409, b'{"error":{"code":"exec_running","message":"the exec is still running"}}')
             if outcome == "unknown":
@@ -3306,7 +3318,7 @@ class Handler(BaseHTTPRequestHandler):
         if not 0 <= wait <= EXEC_RESULT_MAX_WAIT:
             return self.reply(400, canonical({"error": {"code": "invalid_request",
                                                         "message": f"wait must be 0 to {EXEC_RESULT_MAX_WAIT}"}}))
-        e = results.get(room, handle, wait, self.server.ledger.room_incarnation)
+        e = results.get(room, handle, wait, self.server.ledger.room_life)
         if e is None:
             return self.reply(404, b'{"error":{"code":"exec_unknown","message":"this hotel does not hold an exec with this handle"}}')
         if e.done_at is None:
