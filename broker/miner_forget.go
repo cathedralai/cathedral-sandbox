@@ -137,6 +137,7 @@ func (b *broker) forgetAndLeave(w http.ResponseWriter, h *hotel, id string) {
 	for _, byHotel := range b.guestRooms {
 		delete(byHotel, id)
 	}
+	b.noteMinerForgotten(id, time.Now())
 	b.mu.Unlock()
 	b.compat.mu.Lock()
 	for eid, ex := range b.compat.execs { // results of a forgotten room have no reader
@@ -153,6 +154,7 @@ func (b *broker) forgetAndLeave(w http.ResponseWriter, h *hotel, id string) {
 		h.stop()
 	}
 	_ = os.Remove(h.cfg.KeyFile)
+	b.saveProbationLogged()
 	log.Printf("hotel %s: the operator forgot %d rooms of a dead miner guest and the hotel left", id, n)
 	w.WriteHeader(204)
 }
@@ -160,6 +162,9 @@ func (b *broker) forgetAndLeave(w http.ResponseWriter, h *hotel, id string) {
 // answersOnPin reports whether anything answers h's health URL on h's pinned
 // connections. A refused handshake (another key, or no guest) is no answer.
 func (h *hotel) answersOnPin() bool {
+	if h.keyedCallErr(h.cfg.Health) != nil {
+		return false // no verified pin: the hotel key is not sent
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "GET", h.cfg.Health+"/room/health", nil)

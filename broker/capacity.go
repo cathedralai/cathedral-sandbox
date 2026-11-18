@@ -56,6 +56,10 @@ type guestPolicy struct {
 	Prefer []selector `json:"prefer"`
 	Allow  []selector `json:"allow"`
 	Deny   []selector `json:"deny"`
+	// MinerProbation: the guest sends test traffic, so its miner opt-in
+	// also reaches miner hotels on probation (probation.go). Without it a
+	// guest reaches graduated miner hotels only.
+	MinerProbation bool `json:"miner_probation,omitempty"`
 }
 
 // hotelClass is "sealed" for a hotel with the sealed label (a sealed hotel
@@ -117,9 +121,26 @@ func (p *guestPolicy) minerOptIn(h *hotel) bool {
 	if p == nil {
 		return false
 	}
+	// A miner hotel on probation takes test traffic only (probation.go).
+	if h.inProbation() && !p.MinerProbation {
+		return false
+	}
 	for _, list := range [][]selector{p.Prefer, p.Allow} {
 		for _, s := range list {
 			if s.Label["miner"] == "true" && s.matches(h) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// selectsMinerLabel reports whether a prefer or allow selector opts in to
+// miner hotels (label miner=true), as minerOptIn requires.
+func (p *guestPolicy) selectsMinerLabel() bool {
+	for _, list := range [][]selector{p.Prefer, p.Allow} {
+		for _, s := range list {
+			if s.Label["miner"] == "true" {
 				return true
 			}
 		}
@@ -155,6 +176,9 @@ func (p *guestPolicy) validate() error {
 	if len(p.Prefer)+len(p.Allow) == 0 {
 		return fmt.Errorf("policy must have at least one prefer or allow selector")
 	}
+	if p.MinerProbation && !p.selectsMinerLabel() {
+		return fmt.Errorf("policy.miner_probation needs a prefer or allow selector with the label miner=true")
+	}
 	for _, f := range []struct {
 		name string
 		list []selector
@@ -172,10 +196,24 @@ func (p *guestPolicy) validate() error {
 // capacity catalog both use it, so the catalog never lists a hotel with free
 // rooms that the placer would refuse. Caller holds b.mu.
 func (b *broker) admissibleFree(h *hotel, now time.Time) int {
+	var mb *minerBudget
+	if h.cfg.MinerHotkey != "" {
+		mb = b.minerBudgetNow()
+	}
+	return b.admissibleFreeIn(h, now, mb)
+}
+
+// admissibleFreeIn is admissibleFree with the miner caps (placement.go) read
+// once by the caller; mb nil is no cap. Caller holds b.mu.
+func (b *broker) admissibleFreeIn(h *hotel, now time.Time, mb *minerBudget) int {
 	if !h.ok || h.leaving || h.drain() || now.Before(h.backoffUntil) || !b.admitted(h, now) || b.awaitsRoomCheck(h) {
 		return 0
 	}
-	if f := b.freeFor(h); f > 0 {
+	f := b.freeFor(h)
+	if l := mb.limit(h); l >= 0 && l < f {
+		f = l
+	}
+	if f > 0 {
 		return f
 	}
 	return 0
@@ -205,7 +243,7 @@ func (b *broker) capacityEntries() []capacityEntry {
 	return out
 }
 
-func (b *broker) capacityDoc(e capacityEntry, now time.Time) map[string]any {
+func (b *broker) capacityDoc(e capacityEntry, now time.Time, mb *minerBudget) map[string]any {
 	h := e.h
 	labels := h.labels()
 	if labels == nil {
@@ -215,11 +253,15 @@ func (b *broker) capacityDoc(e capacityEntry, now time.Time) map[string]any {
 	if r := h.reservedFor(); r != "" {
 		reserved = r
 	}
-	return map[string]any{
+	d := map[string]any{
 		"id": h.cfg.ID, "class": hotelClass(h), "labels": labels, "up": h.ok, "drain": h.drain(),
-		"free_rooms": b.admissibleFree(h, now), "source": e.source, "down_since": downSince(h),
+		"free_rooms": b.admissibleFreeIn(h, now, mb), "source": e.source, "down_since": downSince(h),
 		"reserved_for": reserved, "slots": h.slots, "admission": b.admissionDoc(h, now),
 	}
+	if p := b.probationDoc(h); p != nil {
+		d["probation"] = p
+	}
+	return d
 }
 
 // classTotals is one class line of the catalog: hotels, how many take rooms
@@ -235,8 +277,9 @@ type classTotals struct {
 	FreeRooms int `json:"free_rooms"`
 }
 
-// addTotals adds h to the class totals. Caller holds b.mu.
-func (b *broker) addTotals(t map[string]*classTotals, e capacityEntry, now time.Time) {
+// addTotals adds h to the class totals. It takes h's free rooms from mb, so
+// the totals never count one miner cap twice. Caller holds b.mu.
+func (b *broker) addTotals(t map[string]*classTotals, e capacityEntry, now time.Time, mb *minerBudget) {
 	h := e.h
 	c := t[hotelClass(h)]
 	c.Hotels++
@@ -255,7 +298,9 @@ func (b *broker) addTotals(t map[string]*classTotals, e capacityEntry, now time.
 		c.Placeable++
 	}
 	c.Slots += h.slots
-	c.FreeRooms += b.admissibleFree(h, now)
+	f := b.admissibleFreeIn(h, now, mb)
+	mb.consume(h, f)
+	c.FreeRooms += f
 }
 
 var tierRank = map[string]int{tierPrefer: 0, tierAllow: 1, "hotels": 2}
@@ -268,27 +313,29 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 	out := []map[string]any{}
 	var guest map[string]any
 	totals := map[string]*classTotals{classSealed: {}, classUnsealed: {}}
+	// docs: what one hotel can take now; sum: a budget the totals use up.
+	docs, sum := b.minerBudgetNow(), b.minerBudgetNow()
 	for _, e := range b.capacityEntries() {
 		if minerOnly && e.h.cfg.MinerHotkey == "" {
 			continue
 		}
 		if g == nil {
-			d := b.capacityDoc(e, now)
+			d := b.capacityDoc(e, now, docs)
 			var lent any // operator view only: a guest never sees whose hotel it is
 			if l := e.h.lentFrom(); l != "" {
 				lent = l
 			}
 			d["lent_from"] = lent
 			out = append(out, d)
-			b.addTotals(totals, e, now)
+			b.addTotals(totals, e, now, sum)
 			continue
 		}
 		t := g.tierOf(e.h)
-		if t == "" {
+		if t == "" || (g.limits.OwnHostsOnly && isMinerHotel(e.h)) { // placement skips it too (scope)
 			continue
 		}
-		b.addTotals(totals, e, now)
-		d := b.capacityDoc(e, now)
+		b.addTotals(totals, e, now, sum)
+		d := b.capacityDoc(e, now, docs)
 		d["tier"] = t
 		out = append(out, d)
 	}
@@ -325,6 +372,16 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 			"miner_hotkey_caps":    b.cfg.MinerHotkeyCaps,
 			"miner_max_hotels":     b.cfg.MinerMaxHotels,
 			"miner_tls_pin":        true,
+			// Miner probation (probation.go): 0 is off.
+			"miner_probation_seconds":        b.cfg.MinerProbationSeconds,
+			"miner_probation_min_uptime_pct": float64(b.probationMinBP()) / 100,
+			"miner_min_commitment":           b.cfg.MinerMinCommitment, // null: a commitment is optional
+			// Room caps (placement.go, AB#335); 0 is off.
+			"miner_max_rooms_per_hotkey": b.cfg.MinerMaxRoomsPerHotkey,
+			"miner_pool_share":           b.cfg.MinerPoolShare,
+		}
+		if docs != nil && b.cfg.MinerPoolShare > 0 {
+			doc["miner_pool"] = map[string]any{"own_slots": docs.ownPoolSlots, "miner_room_cap": docs.poolCap, "miner_rooms": docs.poolMinerRooms}
 		}
 	}
 	writeJSON(w, 200, doc)

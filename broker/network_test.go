@@ -97,6 +97,41 @@ func TestClientSwitchesNetworkLive(t *testing.T) {
 	}
 }
 
+// Credential references reach the hotel unchanged; the hotel validates
+// them. Before AB#624 the broker rebuilt the body from mode and allow only.
+func TestClientNetworkSwitchForwardsCredentials(t *testing.T) {
+	tc := newChain(t)
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4", "network": "deny_all"}), nil)
+	if status != 201 {
+		t.Fatalf("create: %d %v", status, doc)
+	}
+	id := doc["id"].(string)
+	creds := []map[string]any{{"host": "api.example.com", "header": "authorization", "secret": "example-token"}}
+	status, doc = tc.clientCall(t, "PUT", "/v1/sandboxes/"+id+"/network", mustMarshal(map[string]any{"mode": "allowlist", "allow": []string{"api.example.com"}, "credentials": creds}), nil)
+	if status != 200 {
+		t.Fatalf("switch: %d %v", status, doc)
+	}
+	status, doc = tc.clientCall(t, "PUT", "/v1/sandboxes/"+id+"/network", mustMarshal(map[string]any{"mode": "deny_all"}), nil)
+	if status != 200 {
+		t.Fatalf("switch back: %d %v", status, doc)
+	}
+	var sent []map[string]any
+	for _, f := range tc.hotels {
+		sent = append(sent, f.networks...)
+	}
+	if len(sent) != 2 {
+		t.Fatalf("hotel got %v", sent)
+	}
+	got, _ := json.Marshal(sent[0]["credentials"])
+	want, _ := json.Marshal(creds)
+	if string(got) != string(want) {
+		t.Fatalf("credentials: got %s want %s", got, want)
+	}
+	if _, ok := sent[1]["credentials"]; ok {
+		t.Fatalf("a change without credentials must not send the field: %v", sent[1])
+	}
+}
+
 // A native guest switches with PUT on the broker room id; the signed receipt
 // header of a sealed hotel passes through.
 func TestNativeSwitchPassesThroughWithReceipt(t *testing.T) {
