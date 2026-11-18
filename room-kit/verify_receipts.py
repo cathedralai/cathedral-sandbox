@@ -70,7 +70,11 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      --cathedral-sandbox finds it; an unclaimed room, a retired one and a room
      whose claim failed name no link. A failed delete leaves the room's state
      unknown, not retired. The output's pool_rooms gives each state.
- 12. snapshots and forks, inside one binding. A successful snapshot receipt
+ 12. guest ingress (AB#422): a sealed binding that names guest_ingress must
+     name a cathedral_guest_ingress_v1 object with a well-formed
+     tls_spki_sha256: the key Preview URLs will be served with, made in the
+     guest. The output reports it; nothing serves on it yet.
+ 13. snapshots and forks, inside one binding. A successful snapshot receipt
      names snapshot_id, snapshot_image_id (sha256: and 64 hex),
      snapshot_work_archive_sha256, snapshot_size_bytes and
      snapshot_content_sha256, together or not at all; a snapshot that did not
@@ -190,6 +194,7 @@ import re
 import ssl
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from urllib.parse import quote_plus, urlencode, urlsplit
 
@@ -274,6 +279,32 @@ def sha(data: bytes) -> str:
 
 class Fail(Exception):
     pass
+
+
+class _NoKeyRedirect(urllib.request.HTTPRedirectHandler):
+    def _refuse(self, req, response, headers):
+        try:
+            location = headers.get("Location") or headers.get("URI")
+            target = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, location))
+            if target.scheme not in ("http", "https") or not target.hostname:
+                raise ValueError("unsupported redirect target")
+            host, port = target.hostname, target.port
+            if not re.fullmatch(r"[A-Za-z0-9.:-]+", host):
+                raise ValueError("unsafe redirect host")
+            message = f"redirect refused to {host}:{port}" if port is not None else f"redirect refused to {host}"
+        except (TypeError, ValueError, UnicodeError):
+            message = "redirect refused"
+        finally:
+            response.close()
+        raise Fail(message)
+
+    def http_error_301(self, req, response, code, message, headers):
+        self._refuse(req, response, headers)
+
+    http_error_302 = http_error_301
+    http_error_303 = http_error_301
+    http_error_307 = http_error_301
+    http_error_308 = http_error_301
 
 
 def need(cond, msg):
@@ -489,6 +520,35 @@ def verify_guest_tls(att: dict, peer_spki_sha256: str | None = None, require: bo
     return {"tls_spki_sha256": tls, "peer_checked": peer_spki_sha256 is not None,
             "hotel_key_install_x25519_b64": base64.b64encode(install).decode(),
             "hotel_key_install_signers_ed25519_b64": signers, "hotel_key_source": "install"}
+
+
+INGRESS_SCHEMA = "cathedral_guest_ingress_v1"
+
+
+def verify_guest_ingress(att: dict, peer_spki_sha256: str | None = None, require: bool = False) -> dict | None:
+    """The guest ingress key a sealed binding names (room_receipts.GuestIngress, AB#422).
+
+    The binding is covered by REPORT_DATA, so the key it names was made in the
+    guest. peer_spki_sha256 is the SPKI sha256 of the TLS peer that served a
+    Preview URL: equal means that session ended in the guest. Returns None for
+    a binding with no ingress key. A level 1 binding has no SNP report, so
+    nothing it names is attested.
+    """
+    binding = att["binding"]
+    need(not is_hotel_level(att), "a level 1 binding has no attested guest ingress key")
+    ingress = binding.get("guest_ingress")
+    if ingress is None:
+        need(not require and peer_spki_sha256 is None,
+             "the binding names no guest ingress key: a Preview URL's TLS is not attested")
+        return None
+    need(isinstance(ingress, dict) and ingress.get("schema") == INGRESS_SCHEMA,
+         "binding guest_ingress is not a cathedral_guest_ingress_v1 object")
+    tls = ingress.get("tls_spki_sha256")
+    need(isinstance(tls, str) and HEX64.fullmatch(tls) is not None,
+         "binding guest_ingress.tls_spki_sha256 is not 64 lower-case hex")
+    if peer_spki_sha256 is not None:
+        need(peer_spki_sha256.lower() == tls, "the Preview URL peer is not the key the binding names (the host answered?)")
+    return {"schema": INGRESS_SCHEMA, "tls_spki_sha256": tls, "peer_checked": peer_spki_sha256 is not None}
 
 
 def verify_install_key(doc: dict, att: dict) -> str:
@@ -1251,7 +1311,7 @@ def policy_timeline(receipts: list[dict]) -> dict:
 
 def get(url: str, key: str) -> dict:
     req = urllib.request.Request(url, headers={"Authorization": "Bearer " + key})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.build_opener(_NoKeyRedirect()).open(req, timeout=60) as resp:
         return load_json_bounded(resp.read(), "inputs", "the broker's answer")
 
 
@@ -2410,6 +2470,9 @@ def main() -> int:
                     need(install_doc is not None, "the hotel did not answer GET /room/hotel-key-install-key")
                     guest_tls["install_key_checked"] = verify_install_key(install_doc, att) is not None
                 attestation_out["guest_tls"] = guest_tls
+            guest_ingress = verify_guest_ingress(att)
+            if guest_ingress is not None:
+                attestation_out["guest_ingress"] = guest_ingress
             if owner is not None:
                 attestation_out["owner"] = verify_owner(att, owner)
                 attestation_out["owner"]["signed_creates"] = owner_signed_creates(live_receipts, owner)
