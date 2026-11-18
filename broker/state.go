@@ -140,11 +140,7 @@ func (b *broker) saveCompat() error {
 		}
 		st.Tombs[u] = savedTomb{BID: t.bid, At: t.at}
 	}
-	for id, ex := range b.compat.execs { // a finished result (up to 32 MiB) is kept execKeep
-		if !ex.doneAt.IsZero() && now.Sub(ex.doneAt) > execKeep {
-			delete(b.compat.execs, id)
-		}
-	}
+	b.compat.pruneExecsLocked(now) // execKeep and the memory bounds (AB#752)
 	for id, img := range b.compat.images {
 		st.Images[id] = img
 	}

@@ -2,6 +2,11 @@ package main
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -193,4 +198,224 @@ func TestQueuedCreateDoesNotMoveForASmallGain(t *testing.T) {
 		t.Fatalf("moved %d times between equal hotels", moved)
 	}
 	_ = a
+}
+
+// ---------------------------------------------------------------- create failover (AB#338)
+
+// failOnMiner joins sealed miner hotel m1 for guest g1, makes its creates
+// fail with status (after starting the room when afterStart), and creates
+// one room on m1 or b. The policy puts m1 in the prefer tier, so m1 is asked
+// first and b is the failover.
+func failOnMiner(t *testing.T, status int, afterStart bool) (*testChain, int, map[string]any) {
+	t.Helper()
+	tc := newChainState(t, t.TempDir())
+	optInMiner(t, tc, "g1")
+	m := joinMiner(t, tc, "m1", true, 5, nil)
+	m.mu.Lock()
+	m.createFail, m.createFailAfterStart = status, afterStart
+	m.mu.Unlock()
+	st, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"m1", "b"}})
+	return tc, st, doc
+}
+
+// oneBilledRoom checks the no-double-charge property after a failover: the
+// guest got one 202, owns one room, the quota counts one running room, and
+// the failed hotel holds no room of the guest, also after its next sync
+// (which would otherwise adopt an orphan under the guest label and bill it).
+// wantFailed is m1's failure count: 1 for an error answer, 0 for a 2xx.
+func oneBilledRoom(t *testing.T, tc *testChain, doc map[string]any, wantFailed int) {
+	t.Helper()
+	if !strings.HasPrefix(doc["id"].(string), "b.") || doc["hotel"] != "b" {
+		t.Fatalf("room %v on hotel %v; want the failover hotel b", doc["id"], doc["hotel"])
+	}
+	if n, nb := creates(tc, "m1"), creates(tc, "b"); n != 1 || nb != 1 {
+		t.Fatalf("create calls: m1 %d, b %d; want one each (one retry on another hotel)", n, nb)
+	}
+	syncNow(tc, "m1")
+	syncNow(tc, "b")
+	_, list := tc.call(t, "key1", "GET", "/v1/sandboxes", nil)
+	_, q := tc.call(t, "key1", "GET", "/v1/quota", nil)
+	running := q["guest"].(map[string]any)["running_sandboxes"]
+	if list["count"] != 1.0 || running != 1.0 {
+		t.Fatalf("one 202, but the guest lists %v rooms (%v) and quota says %v running; want 1", list["count"], list["sandboxes"], running)
+	}
+	m := tc.hotels["m1"]
+	m.mu.Lock()
+	left := len(m.rooms)
+	m.mu.Unlock()
+	tc.b.mu.Lock()
+	created, failed := tc.b.guests["g1"].created, tc.b.hotelByID("m1").failed
+	tc.b.mu.Unlock()
+	if left != 0 || created != 1 {
+		t.Fatalf("m1 still holds %d rooms, guest created count %d; want 0 and 1", left, created)
+	}
+	if failed != wantFailed {
+		t.Fatalf("m1 failed count %d; want %d", failed, wantFailed)
+	}
+}
+
+// A miner hotel that cannot start the room: the create moves to a healthy
+// hotel in the same request, and m1 is asked for no delete (it has nothing).
+func TestMinerCreateFailureFailsOverToAnotherHotel(t *testing.T) {
+	tc, status, doc := failOnMiner(t, 500, false)
+	if status != 202 {
+		t.Fatalf("create with miner m1 failing: %d %v", status, doc)
+	}
+	oneBilledRoom(t, tc, doc, 1)
+	if n := callsTo(tc.hotels["m1"], "DELETE /v1/sandboxes/"); n != 0 {
+		t.Fatalf("m1 got %d room deletes; want 0", n)
+	}
+}
+
+// A miner hotel (or a proxy in front of it) that started the room and then
+// answered an error, or answered 2xx with no room id: the create still moves
+// to another hotel, and the room m1 started is removed before the guest gets
+// its answer, so the guest is not billed for two rooms.
+func TestMinerCreateFailureAfterTheRoomStartedIsReaped(t *testing.T) {
+	for _, status := range []int{500, 504, 200} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			tc, st, doc := failOnMiner(t, status, true)
+			if st != 202 {
+				t.Fatalf("create with miner m1 failing after start: %d %v", st, doc)
+			}
+			if n := callsTo(tc.hotels["m1"], "DELETE /v1/sandboxes/"); n != 1 {
+				t.Fatalf("m1 got %d room deletes before the answer; want 1, for the room it started", n)
+			}
+			wantFailed := 1
+			if status == 200 {
+				wantFailed = 0 // the broker rests a hotel on errors only
+			}
+			oneBilledRoom(t, tc, doc, wantFailed)
+		})
+	}
+}
+
+// The reap trusts a room's own labels, not the hotel's label filter: a hotel
+// that ignores the filter must not get another request's room deleted.
+func TestReapKeepsRoomsOfOtherRequestsWhenTheHotelIgnoresTheFilter(t *testing.T) {
+	tc := newChain(t)
+	other := tc.room(t, "key2", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	hb := tc.b.hotelByID("b")
+	upstream := hb.cfg.API
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if r.Method == "GET" && r.URL.Path == "/v1/sandboxes" {
+			r.URL.RawQuery = "" // the hotel lists every room it holds
+		}
+		status, hdr, out := forwardTo(upstream, r, body)
+		passThrough(w, status, hdr, out)
+	}))
+	t.Cleanup(proxy.Close)
+	hb.cfg.API = proxy.URL
+	tc.hotels["b"].mu.Lock()
+	tc.hotels["b"].createFail, tc.hotels["b"].createFailAfterStart = 500, true
+	tc.hotels["b"].mu.Unlock()
+	setHotel(tc, "c", func(h *hotel) { h.ok = false }) // b is the only hotel: the create fails there
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}})
+	if status != 500 {
+		t.Fatalf("create on a failing b: %d %v", status, doc)
+	}
+	if n := callsTo(tc.hotels["b"], "DELETE /v1/sandboxes/"); n != 1 {
+		t.Fatalf("b got %d room deletes; want 1, for the failed create's room only", n)
+	}
+	if st, d := tc.call(t, "key2", "GET", "/v1/sandboxes/"+other, nil); st != 200 {
+		t.Fatalf("guest g2's room %s after g1's reap: %d %v", other, st, d)
+	}
+}
+
+// A failed hotel whose orphan reap is not confirmed (its labelled room list
+// or its room delete fails): the guest gets its room on b and is told the
+// cleanup on m1 is pending, the room m1 still runs is never adopted (and
+// billed) as the guest's room, and it is removed once m1 answers again.
+func TestFailoverWithUnconfirmedReapRecordsTheOrphan(t *testing.T) {
+	for name, fail := range map[string]func(f *fakeHotel, status int){
+		"list":   func(f *fakeHotel, status int) { f.labelListFail = status },
+		"delete": func(f *fakeHotel, status int) { f.roomDeleteFail = status },
+	} {
+		t.Run(name, func(t *testing.T) {
+			tc := newChainState(t, t.TempDir())
+			optInMiner(t, tc, "g1")
+			joinMiner(t, tc, "m1", true, 5, nil)
+			m := tc.hotels["m1"]
+			m.mu.Lock()
+			m.createFail, m.createFailAfterStart = 500, true
+			fail(m, 500)
+			m.mu.Unlock()
+			st, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"m1", "b"}})
+			if st != 202 || doc["hotel"] != "b" {
+				t.Fatalf("create with m1 failing: %d %v; want a room on b", st, doc)
+			}
+			oc, _ := doc["orphan_cleanup"].(map[string]any)
+			if oc["state"] != "pending" || oc["hotel"] != "m1" {
+				t.Fatalf("orphan_cleanup %v; want pending on m1: the guest must be told", doc["orphan_cleanup"])
+			}
+			m.mu.Lock()
+			left := len(m.rooms)
+			m.mu.Unlock()
+			if left != 1 {
+				t.Fatalf("m1 holds %d rooms; want the 1 it started, the reap failed", left)
+			}
+			syncNow(tc, "m1")
+			syncNow(tc, "b")
+			// The guest's list asks the hotels live, so it may still show the
+			// leftover room; the broker's own count must not take it as the
+			// guest's room.
+			_, q := tc.call(t, "key1", "GET", "/v1/quota", nil)
+			tc.b.mu.Lock()
+			adopted := len(tc.b.hotelByID("m1").rooms)
+			tc.b.mu.Unlock()
+			if running := q["guest"].(map[string]any)["running_sandboxes"]; running != 1.0 || adopted != 0 {
+				t.Fatalf("quota %v running, m1 rooms adopted %d; want 1 and 0: m1's leftover room is not the guest's", running, adopted)
+			}
+			m.mu.Lock()
+			fail(m, 0)
+			m.mu.Unlock()
+			waitReaped(t, tc, "m1")
+		})
+	}
+}
+
+// After the background retries give up, the sync loop retries the removal
+// of a recorded request and keeps its room out of the guest's rooms.
+func TestSyncLoopRetriesARecordedOrphan(t *testing.T) {
+	tc := newChain(t)
+	f := tc.hotels["b"]
+	f.mu.Lock()
+	f.rooms = append(f.rooms, map[string]any{"id": "sbx_orphan", "state": "running", "labels": map[string]any{guestLabel: "g1", batchLabel: "batch-1"}})
+	f.mu.Unlock()
+	h := tc.b.hotelByID("b")
+	tc.b.mu.Lock()
+	h.unreaped = map[string]*unreapedBatch{"batch-1": {guest: "g1"}}
+	tc.b.mu.Unlock()
+	syncNow(tc, "b")
+	tc.b.mu.Lock()
+	adopted := h.rooms["sbx_orphan"] != nil
+	tc.b.mu.Unlock()
+	if adopted {
+		t.Fatal("the sync loop adopted a recorded orphan as the guest's room")
+	}
+	waitReaped(t, tc, "b")
+}
+
+// waitReaped waits until hotel id holds no rooms and has no recorded
+// unreaped request.
+func waitReaped(t *testing.T, tc *testChain, id string) {
+	t.Helper()
+	f, h := tc.hotels[id], tc.b.hotelByID(id)
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		syncNow(tc, id)
+		f.mu.Lock()
+		left := len(f.rooms)
+		f.mu.Unlock()
+		tc.b.mu.Lock()
+		pending := len(h.unreaped)
+		tc.b.mu.Unlock()
+		if left == 0 && pending == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("hotel %s still holds %d rooms, %d unreaped requests", id, left, pending)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }

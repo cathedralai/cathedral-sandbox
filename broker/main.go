@@ -110,7 +110,11 @@ type guestConfig struct {
 	NextKeySHA256   string `json:"next_key_sha256,omitempty"`
 	ViewTokenSHA256 string `json:"view_token_sha256"` // token for /<id>/live
 	Ops             bool   `json:"ops"`               // may run the probe and reset the broker counters
-	guestLimits            // max_rooms, max_creates_per_minute, default_sealed, hotels (guests.go)
+	// LiveShares lets this guest mint share links to its live view (AB#584).
+	// Off unless set: with it off, /v1/live/shares answers 403 and no share
+	// link or cookie opens the view.
+	LiveShares  bool `json:"live_shares,omitempty"`
+	guestLimits      // max_rooms, max_creates_per_minute, default_sealed, hotels (guests.go)
 }
 
 type config struct {
@@ -303,7 +307,20 @@ type hotel struct {
 	baselineTry    time.Time
 	leaving        bool               // a leave passed its empty check; no new rooms (hotels.go)
 	stop           context.CancelFunc // stops the sync loop when the hotel leaves
+	syncDone       chan struct{}      // closed when the sync loop has returned: its last step is stored
 	alerts         hotelAlerts        // missed heartbeat and drop alerts sent (alerts.go)
+	// unreaped: create requests (by batch id) whose rooms on this hotel were
+	// not confirmed removed after the hotel failed the create. The sync loop
+	// keeps those rooms out of the guest's rooms and retries their removal
+	// until a list shows none left (AB#338).
+	unreaped map[string]*unreapedBatch
+}
+
+// unreapedBatch is one create request's leftover rooms on a hotel.
+type unreapedBatch struct {
+	guest string
+	keep  map[string]bool // room ids the request did receive: never reaped
+	busy  bool            // a removal pass is running
 }
 
 type guestState struct {
@@ -334,6 +351,7 @@ type broker struct {
 	byKey            map[string]*guestState    // sha256(key) -> guest
 	byUUID           map[string]*room
 	compat           *compatState
+	answers          *answerPool  // bytes of hotel exec answers being read on the compat routes (AB#752)
 	nexec            *nativeExecs // background execs on the native route (nativeexec.go)
 	prefetch         prefetchJobs
 	started          time.Time
@@ -358,6 +376,10 @@ type broker struct {
 	// minerExits: miner hotels that went down holding customer rooms
 	// (miner_exits.go). Guarded by b.mu.
 	minerExits []*minerExit
+
+	// shares is sha256(share token) -> live view share link (live_share.go).
+	// In memory only. Guarded by b.mu.
+	shares map[string]*liveShare
 }
 
 // A hotel counts as answering while its last good health answer is younger than okWindow.
@@ -462,7 +484,7 @@ func loadBroker(path string) (*broker, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &broker{cfg: c, alerts: alerts, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), nexec: newNativeExecs(), started: time.Now()}
+	b := &broker{cfg: c, alerts: alerts, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), answers: newAnswerPool(), nexec: newNativeExecs(), shares: map[string]*liveShare{}, started: time.Now()}
 	var optedIn []string // require_attestation hotels, for one deprecation line
 	for _, hc := range c.Hotels {
 		if err := validateSealedAdmission(hc); err != nil {
@@ -595,8 +617,28 @@ func (h *hotel) doBase(ctx context.Context, base, method, path string, query url
 // doHeaders is doBase with extra request headers (the guest id of
 // guestcalls.go).
 func (h *hotel) doHeaders(ctx context.Context, base, method, path string, query url.Values, body []byte, timeout time.Duration, extra http.Header) (int, http.Header, []byte, error) {
+	status, hdr, out, _, err := h.doHeadersMax(ctx, base, method, path, query, body, timeout, extra, answerRead{})
+	return status, hdr, out, err
+}
+
+// errAnswerTooLarge is a hotel answer longer than its caller reads (AB#752).
+var errAnswerTooLarge = errors.New("the hotel answer is over its size limit")
+
+// answerRead bounds one answer read (AB#752): at most maxBytes (0: no limit),
+// and, with a pool, only once the answer's size is reserved in it for owner.
+type answerRead struct {
+	maxBytes int64
+	pool     *answerPool
+	owner    string
+}
+
+// doHeadersMax is doHeaders under an answerRead. A longer answer is an error,
+// never a cut-off body to parse. The release it returns gives the reserved
+// bytes back; the caller calls it once it no longer holds the body.
+func (h *hotel) doHeadersMax(ctx context.Context, base, method, path string, query url.Values, body []byte, timeout time.Duration, extra http.Header, lim answerRead) (int, http.Header, []byte, func(), error) {
+	noop := func() {}
 	if err := h.keyedCallErr(base); err != nil {
-		return 0, nil, nil, err
+		return 0, nil, nil, noop, err
 	}
 	u := base + path
 	if len(query) > 0 {
@@ -606,7 +648,7 @@ func (h *hotel) doHeaders(ctx context.Context, base, method, path string, query 
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, u, bytes.NewReader(body))
 	if err != nil {
-		return 0, nil, nil, err
+		return 0, nil, nil, noop, err
 	}
 	for k, v := range extra {
 		req.Header[k] = v
@@ -617,16 +659,47 @@ func (h *hotel) doHeaders(ctx context.Context, base, method, path string, query 
 	}
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return 0, nil, nil, err
+		return 0, nil, nil, noop, err
 	}
 	defer resp.Body.Close()
-	out, err := io.ReadAll(resp.Body)
+	var reader io.Reader = resp.Body
+	release := noop
+	if lim.maxBytes > 0 {
+		if resp.ContentLength > lim.maxBytes {
+			return 0, nil, nil, noop, errAnswerTooLarge
+		}
+		reader = io.LimitReader(resp.Body, lim.maxBytes+1)
+		if lim.pool != nil {
+			size := lim.maxBytes // no length given: the most it may be
+			if resp.ContentLength >= 0 {
+				size = resp.ContentLength
+			}
+			if release, err = lim.pool.reserve(ctx, lim.owner, size); err != nil {
+				return 0, nil, nil, noop, err
+			}
+		}
+	}
+	var out []byte
+	if lim.maxBytes > 0 && resp.ContentLength >= 0 {
+		// One buffer of the stated length: ReadAll would grow to about twice it.
+		out = make([]byte, resp.ContentLength)
+		_, err = io.ReadFull(reader, out)
+	} else {
+		out, err = io.ReadAll(reader)
+	}
+	if err != nil {
+		release() // the caller gets no body to hold
+		release = noop
+	} else if lim.maxBytes > 0 && int64(len(out)) > lim.maxBytes {
+		release()
+		return 0, nil, nil, noop, errAnswerTooLarge
+	}
 	if err == nil && resp.StatusCode < 500 {
 		// The hotel answers room calls. syncHotel keeps it "answering" while
 		// these continue, even when its health endpoint is slow under load.
 		h.lastAnswer.Store(time.Now().UnixNano())
 	}
-	return resp.StatusCode, resp.Header, out, err
+	return resp.StatusCode, resp.Header, out, release, err
 }
 
 func (h *hotel) getJSON(ctx context.Context, base, path string, query url.Values, v any) error {
@@ -998,9 +1071,16 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 				h.failed++
 				h.backoffUntil = time.Now().Add(hotelFailBackoff)
 			}
-			if err != nil {
-				// The hotel may have started the room before the answer was lost.
+			// The hotel may hold a room it did not report: its answer was
+			// lost, or it (or a proxy in front of it, as on a miner hotel)
+			// failed after the room started. Its rooms of this request are
+			// reaped before the guest gets an answer, so a create that moves
+			// on to another hotel never leaves a second billed room. A 4xx or
+			// the guest's own image fault is a refusal: no room was started.
+			if err != nil || ((status < 400 || status >= 500) && !guestImage) {
 				lost = append(lost, h)
+			}
+			if err != nil {
 				last = createResult{status: 502, doc: map[string]any{"error": map[string]string{"code": "hotel_unreachable", "message": "hotel " + h.cfg.ID + " did not answer"}}}
 			} else {
 				last = createResult{status: status, body: out, header: http.Header{"X-Broker-Hotel": {h.cfg.ID}}}
@@ -1075,7 +1155,25 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 		}
 	}
 	for h := range lost {
-		b.reapOrphans(h, g, batchID, keep[h])
+		if b.reapOrphans(h, g, batchID, keep[h]) {
+			continue
+		}
+		// The failed hotel may still run a room of this request: the guest
+		// is told, and the room stays recorded for the reaper (never adopted
+		// as the guest's room) until its removal is confirmed.
+		log.Printf("create of guest %s: rooms on failed hotel %s (batch %s) not confirmed removed; recorded for the reaper", g.cfg.ID, h.cfg.ID, batchID)
+		for i := range results {
+			if !slices.Contains(results[i].lost, h) {
+				continue
+			}
+			if results[i].header == nil {
+				results[i].header = http.Header{}
+			}
+			results[i].header.Add("X-Broker-Orphan-Cleanup", "pending; hotel="+h.cfg.ID)
+			if results[i].doc != nil {
+				results[i].doc["orphan_cleanup"] = map[string]any{"state": "pending", "hotel": h.cfg.ID}
+			}
+		}
 	}
 	return results
 }
@@ -1083,57 +1181,88 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 // reapOrphans removes the rooms of one create request that hotel h started
 // although its answer never reached the broker. keep holds the hotel room
 // ids this request did receive on h. The first pass runs before the guest
-// gets its answer; later passes retry in the background.
-func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[string]bool) {
-	pass := func(timeout time.Duration) bool {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		q := url.Values{}
-		q.Add("label", batchLabel+"="+batchID)
-		q.Add("label", guestLabel+"="+g.cfg.ID)
-		status, _, out, err := h.do(ctx, "GET", "/v1/sandboxes", q, nil, timeout)
-		if err != nil || status != 200 {
-			return false
-		}
-		var list struct {
-			Sandboxes []struct {
-				ID string `json:"id"`
-			} `json:"sandboxes"`
-		}
-		if json.Unmarshal(out, &list) != nil {
-			return false
-		}
-		ok := true
-		for _, s := range list.Sandboxes {
-			if keep[s.ID] {
-				continue
-			}
-			st, _, _, derr := h.do(ctx, "DELETE", "/v1/sandboxes/"+url.PathEscape(s.ID), nil, nil, timeout)
-			if derr != nil || (st != 204 && st != 404) {
-				ok = false
-				continue
-			}
-			b.mu.Lock()
-			if rm := h.rooms[s.ID]; rm != nil { // the sync loop adopted it meanwhile
-				b.release(h, rm)
-			}
-			b.mu.Unlock()
-			log.Printf("orphan room %s.%s of guest %s removed (create answer lost)", h.cfg.ID, s.ID, g.cfg.ID)
-		}
-		return ok
+// gets its answer and its result is returned: true only when h confirmed
+// every such room gone. Otherwise the request is recorded in h.unreaped and
+// later passes retry in the background, then from the sync loop.
+func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[string]bool) bool {
+	if b.reapPass(h, g.cfg.ID, batchID, keep, 3*time.Second) {
+		return true
 	}
-	if pass(3 * time.Second) {
-		return
+	b.mu.Lock()
+	if h.unreaped == nil {
+		h.unreaped = map[string]*unreapedBatch{}
 	}
+	ub := &unreapedBatch{guest: g.cfg.ID, keep: keep, busy: true}
+	h.unreaped[batchID] = ub
+	b.mu.Unlock()
 	go func() {
 		for _, wait := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second} {
 			time.Sleep(wait)
-			if pass(10 * time.Second) {
+			if b.reapPass(h, g.cfg.ID, batchID, keep, 10*time.Second) {
+				b.reaped(h, batchID)
 				return
 			}
 		}
-		log.Printf("orphan rooms of guest %s on hotel %s (batch %s) could not be reaped; the sync loop will list them", g.cfg.ID, h.cfg.ID, batchID)
+		b.mu.Lock()
+		ub.busy = false
+		b.mu.Unlock()
+		log.Printf("orphan rooms of guest %s on hotel %s (batch %s) could not be reaped yet; the sync loop retries", g.cfg.ID, h.cfg.ID, batchID)
 	}()
+	return false
+}
+
+// reaped clears a recorded request once its rooms on h are confirmed gone.
+func (b *broker) reaped(h *hotel, batchID string) {
+	b.mu.Lock()
+	delete(h.unreaped, batchID)
+	b.mu.Unlock()
+	log.Printf("orphan rooms on hotel %s (batch %s) confirmed removed", h.cfg.ID, batchID)
+}
+
+// reapPass lists the rooms of one create request on h and deletes those the
+// request did not receive. True when the list and every delete succeeded.
+func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]bool, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	q := url.Values{}
+	q.Add("label", batchLabel+"="+batchID)
+	q.Add("label", guestLabel+"="+guestID)
+	status, _, out, err := h.do(ctx, "GET", "/v1/sandboxes", q, nil, timeout)
+	if err != nil || status != 200 {
+		return false
+	}
+	var list struct {
+		Sandboxes []struct {
+			ID     string         `json:"id"`
+			Labels map[string]any `json:"labels"`
+		} `json:"sandboxes"`
+	}
+	if json.Unmarshal(out, &list) != nil {
+		return false
+	}
+	ok := true
+	for _, s := range list.Sandboxes {
+		if keep[s.ID] {
+			continue
+		}
+		// A hotel that ignores the label filter (a miner hotel is
+		// third-party code) must not get another request's rooms deleted.
+		if s.Labels[batchLabel] != batchID || s.Labels[guestLabel] != guestID {
+			continue
+		}
+		st, _, _, derr := h.do(ctx, "DELETE", "/v1/sandboxes/"+url.PathEscape(s.ID), nil, nil, timeout)
+		if derr != nil || (st != 204 && st != 404) {
+			ok = false
+			continue
+		}
+		b.mu.Lock()
+		if rm := h.rooms[s.ID]; rm != nil { // the sync loop adopted it meanwhile
+			b.release(h, rm)
+		}
+		b.mu.Unlock()
+		log.Printf("orphan room %s.%s of guest %s removed (create answer lost)", h.cfg.ID, s.ID, guestID)
+	}
+	return ok
 }
 
 // createHasTunables: the create body carries a non-null "tunables" object.
@@ -1351,6 +1480,7 @@ func isMinerHotel(h *hotel) bool {
 }
 
 func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestState, rest string) {
+	tRecv := time.Now()
 	bid, tail, _ := strings.Cut(rest, "/")
 	// The tail is decoded and goes to the hotel by string concatenation, so a
 	// decoded "?" or "#" would turn the rest into a query or fragment there and
@@ -1458,7 +1588,15 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	if r.Method != "GET" && r.Method != "DELETE" {
 		bodyArg = body
 	}
+	tDispatch := time.Now()
 	status, hdr, out, err := h.do(r.Context(), r.Method, path, r.URL.Query(), bodyArg, timeout)
+	// AB#741: the same split as a create (X-Broker-Queue-Ms, X-Broker-Hotel-Ms) on
+	// every answer that went to the hotel, failures included, so a burst of execs
+	// can be split into broker and hotel time per request. Here the "queue" is the
+	// broker's own time before the hotel call (reading the body, the room lookup);
+	// this path has no wait slot. An answer without them was refused by the broker
+	// before the hotel was asked.
+	setBrokerTiming(w.Header(), h.cfg.ID, tDispatch.Sub(tRecv), time.Since(tDispatch))
 	if err != nil {
 		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
 		return
@@ -1498,6 +1636,14 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	}
 	w.WriteHeader(status)
 	_, _ = w.Write(out)
+}
+
+// setBrokerTiming names the hotel and splits the broker's time into the wait
+// before the hotel call (queue) and the hotel call itself, in milliseconds.
+func setBrokerTiming(dst http.Header, hotelID string, queue, call time.Duration) {
+	dst.Set("X-Broker-Hotel", hotelID)
+	dst.Set("X-Broker-Queue-Ms", strconv.FormatFloat(ms(queue), 'f', 1, 64))
+	dst.Set("X-Broker-Hotel-Ms", strconv.FormatFloat(ms(call), 'f', 1, 64))
 }
 
 // copyRoomHeaders passes the hotel's X-Room-* headers (for example the signed
@@ -2014,8 +2160,19 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		return
 	}
 	seen := make(map[string]bool, len(list.Sandboxes))
+	leftover := map[string]bool{} // recorded unreaped requests that still list a room
 	for _, s := range list.Sandboxes {
 		seen[s.ID] = true
+		// A room a failed create left behind is not the guest's room: the
+		// guest got its room elsewhere or an error. It is never adopted (or
+		// billed) under the guest label; it waits for its removal.
+		if ub := h.unreaped[s.Labels[batchLabel]]; ub != nil && ub.guest == s.Labels[guestLabel] && !ub.keep[s.ID] {
+			leftover[s.Labels[batchLabel]] = true
+			if rm := h.rooms[s.ID]; rm != nil { // adopted before the request was recorded
+				b.release(h, rm)
+			}
+			continue
+		}
 		if rm := h.rooms[s.ID]; rm != nil {
 			if rm.state == stDeleting && !rm.deleteSent {
 				// A list that missed the room (built before its create landed)
@@ -2031,6 +2188,25 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		h.rooms[s.ID] = rm
 		b.register(rm)
 		h.place(rm)
+	}
+	for batchID, ub := range h.unreaped {
+		switch {
+		case ub.busy:
+		case !leftover[batchID]:
+			delete(h.unreaped, batchID) // the hotel lists none of its rooms
+			log.Printf("orphan rooms on hotel %s (batch %s) no longer listed", h.cfg.ID, batchID)
+		default:
+			ub.busy = true
+			go func() {
+				ok := b.reapPass(h, ub.guest, batchID, ub.keep, 10*time.Second)
+				b.mu.Lock()
+				ub.busy = false
+				b.mu.Unlock()
+				if ok {
+					b.reaped(h, batchID)
+				}
+			}()
+		}
 	}
 	b.checkMinerExitRooms(h, seen)
 	var deleting []*room
@@ -2064,6 +2240,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 }
 
 func (b *broker) syncLoop(ctx context.Context, h *hotel) {
+	defer close(h.syncDone)
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
 	for {
@@ -2078,19 +2255,52 @@ func (b *broker) syncLoop(ctx context.Context, h *hotel) {
 
 // ---------------------------------------------------------------- live view
 
-func (b *broker) viewGuest(r *http.Request, guestID string) (*guestState, string) {
+// viewAuth is how a live view request got in.
+type viewAuth struct {
+	freshView  string     // ?token= view token to move into the bv_ cookie
+	freshShare string     // ?share= token to move into the bvs_ cookie
+	shareHash  string     // set when a share link let the request in; the stream rechecks it
+	share      *liveShare // that link
+	triedShare bool       // a share link or cookie was offered and did not work
+}
+
+// viewGuest checks the view token (?token= or the bv_<guest> cookie) and then
+// a share link (?share= or the bvs_<guest> cookie, AB#584). A share link works
+// for a guest with no view token.
+func (b *broker) viewGuest(r *http.Request, guestID string) (*guestState, viewAuth) {
+	var a viewAuth
 	g := b.guests[guestID]
-	if g == nil || g.cfg.ViewTokenSHA256 == "" {
-		return nil, ""
+	if g == nil {
+		return nil, a
 	}
-	want := []byte(strings.ToLower(g.cfg.ViewTokenSHA256))
-	if t := r.URL.Query().Get("token"); t != "" && subtle.ConstantTimeCompare([]byte(sha(t)), want) == 1 {
-		return g, t
+	if g.cfg.ViewTokenSHA256 != "" {
+		want := []byte(strings.ToLower(g.cfg.ViewTokenSHA256))
+		if t := r.URL.Query().Get("token"); t != "" && subtle.ConstantTimeCompare([]byte(sha(t)), want) == 1 {
+			a.freshView = t
+			return g, a
+		}
+		if c, err := r.Cookie("bv_" + guestID); err == nil && subtle.ConstantTimeCompare([]byte(sha(c.Value)), want) == 1 {
+			return g, a
+		}
 	}
-	if c, err := r.Cookie("bv_" + guestID); err == nil && subtle.ConstantTimeCompare([]byte(sha(c.Value)), want) == 1 {
-		return g, ""
+	if !g.cfg.LiveShares {
+		return nil, a
 	}
-	return nil, ""
+	if t := r.URL.Query().Get("share"); t != "" {
+		a.triedShare = true
+		if s := b.shareFor(sha(t), guestID); s != nil {
+			a.freshShare, a.shareHash, a.share = t, sha(t), s
+			return g, a
+		}
+	}
+	if c, err := r.Cookie(liveShareCookiePfx + guestID); err == nil && c.Value != "" {
+		a.triedShare = true
+		if s := b.shareFor(sha(c.Value), guestID); s != nil {
+			a.shareHash, a.share = sha(c.Value), s
+			return g, a
+		}
+	}
+	return nil, a
 }
 
 // writeSignIn answers 401 with a form that asks for the view token. The form posts the token in the body,
@@ -2144,13 +2354,23 @@ func (b *broker) handleLive(w http.ResponseWriter, r *http.Request, guestID, tai
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Frame-Options", "DENY")
-	g, fresh := b.viewGuest(r, guestID)
+	g, a := b.viewGuest(r, guestID)
 	if g == nil {
-		writeSignIn(w, guestID, "")
+		msg := ""
+		if a.triedShare {
+			msg = "This share link has ended or was revoked. Ask the person who sent it for a new one."
+		}
+		writeSignIn(w, guestID, msg)
 		return
 	}
-	if fresh != "" {
-		b.setViewCookie(w, guestID, fresh)
+	if a.freshView != "" {
+		b.setViewCookie(w, guestID, a.freshView)
+		http.Redirect(w, r, "/"+guestID+"/live", http.StatusSeeOther)
+		return
+	}
+	if a.freshShare != "" {
+		// Move the token out of the address bar and into a cookie that ends with the link.
+		b.setShareCookie(w, guestID, a.freshShare, a.share.Expires)
 		http.Redirect(w, r, "/"+guestID+"/live", http.StatusSeeOther)
 		return
 	}
@@ -2160,7 +2380,7 @@ func (b *broker) handleLive(w http.ResponseWriter, r *http.Request, guestID, tai
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'")
 		_, _ = w.Write(liveHTML)
 	case "live/events":
-		b.stream(w, r, g)
+		b.stream(w, r, g, a.shareHash)
 	default:
 		http.NotFound(w, r)
 	}
@@ -2248,7 +2468,9 @@ func seenAge(t, now time.Time) float64 {
 	return float64(now.Sub(t).Milliseconds()) / 1000
 }
 
-func (b *broker) stream(w http.ResponseWriter, r *http.Request, g *guestState) {
+// stream sends a snapshot each second. shareHash is set when a share link let
+// the request in: the stream ends once that link is revoked or expires.
+func (b *broker) stream(w http.ResponseWriter, r *http.Request, g *guestState, shareHash string) {
 	fl, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "no streaming", 500)
@@ -2259,6 +2481,9 @@ func (b *broker) stream(w http.ResponseWriter, r *http.Request, g *guestState) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for {
+		if shareHash != "" && b.shareFor(shareHash, g.cfg.ID) == nil {
+			return
+		}
 		data, _ := json.Marshal(b.snapshot(g))
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
 			return
@@ -2382,6 +2607,8 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 				return
 			}
 			b.handleSecrets(w, r, g, name)
+		case p == "/v1/live/shares" || strings.HasPrefix(p, "/v1/live/shares/"):
+			b.handleLiveShares(w, r, g, strings.TrimPrefix(strings.TrimPrefix(p, "/v1/live/shares"), "/"))
 		case p == "/v1/broker/hotels" && r.Method == "GET":
 			b.handleHotels(w, g)
 		case p == "/v1/broker/capacity" && r.Method == "GET":
